@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/orientable",
+  "textures": {
+    "front": "kibicomputers:block/screen_3_front",
+    "side": "kibicomputers:block/screen_side",
+    "top": "kibicomputers:block/screen_side"
+  }
+}
