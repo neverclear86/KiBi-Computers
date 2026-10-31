@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import run.endive.runtime.ExportFunction
 import run.endive.runtime.GlobalFactory
 import run.endive.runtime.GlobalInstance
 import run.endive.runtime.HostFunction
@@ -260,6 +261,10 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
 private class EndiveWasmInstance(override val module: EndiveWasmModule, private val config: WasmInstanceConfig) : WasmInstance {
     private var raw: Instance? = null
     private var memoryWrapper: WasmMemory? = null
+    private var closed = false
+
+    /** export の関数（名前ごとに1回だけ引く） */
+    private val exportFunctions = HashMap<String, ExportFunction>()
 
     fun attach(instance: Instance) {
         raw = instance
@@ -270,7 +275,10 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         if (raw == null && instance != null) attach(instance)
     }
 
-    private fun instance(): Instance = checkNotNull(raw) { "インスタンスがまだできていない" }
+    private fun instance(): Instance {
+        check(!closed) { "閉じたインスタンス" }
+        return checkNotNull(raw) { "インスタンスがまだできていない" }
+    }
 
     override val memory: WasmMemory? get() = memoryWrapper
 
@@ -293,8 +301,10 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     override fun call(name: String, vararg args: Long): LongArray {
         val type = requireNotNull(module.exportedFunctionType(name)) { "関数 $name は export されていない" }
         require(args.size == type.params.size) { "関数 $name の引数は ${type.params.size} 個（${args.size} 個渡された）" }
+        check(!closed) { "閉じたインスタンス" }
+        val function = exportFunctions.getOrPut(name) { instance().export(name) }
         val result = try {
-            instance().export(name).apply(*args)
+            function.apply(*args)
         } catch (e: Throwable) {
             rethrow(e)
         }
@@ -302,6 +312,9 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     }
 
     override fun close() {
+        if (closed) return
+        closed = true
+        exportFunctions.clear()
         raw?.close()
     }
 }
