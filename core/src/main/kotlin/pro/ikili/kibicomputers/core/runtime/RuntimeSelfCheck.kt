@@ -1,10 +1,10 @@
 package pro.ikili.kibicomputers.core.runtime
 
-import com.dylibso.chicory.runtime.Instance
-import com.dylibso.chicory.wasm.Parser
+import run.endive.runtime.Instance
+import run.endive.wasm.Parser
 
 /**
- * WASMランタイム（Chicory）が読み込めて実行できるかを確かめる最小のチェック。
+ * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
  *
  * 起動時のログ出力と、開発環境・配布 jar で依存が正しく同梱されているかの確認に使う。
  */
