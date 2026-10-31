@@ -48,4 +48,4 @@ JDK 21（と、`core` 用の JDK 17）が必要です。見つからない場合
 
 ## ライセンス / License
 
-未定（MIT または Apache 2.0 を予定）。 / To be decided (MIT or Apache 2.0).
+[MIT License](LICENSE)
