@@ -37,6 +37,9 @@ public constructor(width: Int, height: Int) {
     private var foregrounds: IntArray
     private var backgrounds: IntArray
 
+    /** 描画命令の記録先（画面の同期 #140）。見ているプレイヤーがいる間だけ [ScreenSyncSender] がつなぐ。 */
+    internal var log: DrawLog? = null
+
     init {
         val n = Rects.area(width, height)
         codePoints = IntArray(n).also { it.fill(BLANK) }
@@ -66,6 +69,14 @@ public constructor(width: Int, height: Int) {
         checkCodePoint(codePoint)
         revision++
         if (x !in 0 until width || y !in 0 until height) return
+        log?.record {
+            byte(SyncOps.TEXT_SET)
+            uint(x)
+            uint(y)
+            uint(codePoint)
+            rgb(foreground)
+            rgb(background)
+        }
         val i = y * width + x
         codePoints[i] = codePoint
         foregrounds[i] = foreground and RGB_MASK
@@ -83,6 +94,10 @@ public constructor(width: Int, height: Int) {
         val fg = foreground and RGB_MASK
         val bg = background and RGB_MASK
         val inRow = y in 0 until height
+        // 画面の内側に書いた文字だけを、書いた順に記録する（再生では同じ位置から書けば同じになる）
+        val log = log?.takeIf { inRow && !it.overflow }
+        var first = -1
+        var count = 0
         var cx = x.toLong()
         var i = 0
         while (i < text.length) {
@@ -90,11 +105,25 @@ public constructor(width: Int, height: Int) {
             i += Character.charCount(c)
             if (inRow && cx in 0 until width) {
                 val k = y * width + cx.toInt()
-                codePoints[k] = if (c in Character.MIN_SURROGATE.code..Character.MAX_SURROGATE.code) REPLACEMENT else c
+                val cp = if (c in Character.MIN_SURROGATE.code..Character.MAX_SURROGATE.code) REPLACEMENT else c
+                codePoints[k] = cp
                 foregrounds[k] = fg
                 backgrounds[k] = bg
+                if (first < 0) first = cx.toInt()
+                count++
             }
             cx++
+        }
+        if (log != null && count > 0) {
+            log.record {
+                byte(SyncOps.TEXT_WRITE)
+                uint(first)
+                uint(y)
+                rgb(fg)
+                rgb(bg)
+                uint(count)
+                for (k in y * width + first until y * width + first + count) uint(codePoints[k])
+            }
         }
         return cx.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong()).toInt()
     }
@@ -113,7 +142,20 @@ public constructor(width: Int, height: Int) {
         val x0 = Rects.start(x, width)
         val x1 = Rects.end(x, w, width)
         if (x0 >= x1) return
-        for (row in Rects.start(y, height) until Rects.end(y, h, height)) {
+        val y0 = Rects.start(y, height)
+        val y1 = Rects.end(y, h, height)
+        if (y0 >= y1) return
+        log?.record {
+            byte(SyncOps.TEXT_FILL)
+            uint(x0)
+            uint(y0)
+            uint(x1 - x0)
+            uint(y1 - y0)
+            uint(codePoint)
+            rgb(fg)
+            rgb(bg)
+        }
+        for (row in y0 until y1) {
             val from = row * width + x0
             val to = row * width + x1
             codePoints.fill(codePoint, from, to)
@@ -130,6 +172,15 @@ public constructor(width: Int, height: Int) {
      */
     public fun copy(x: Int, y: Int, w: Int, h: Int, dx: Int, dy: Int) {
         revision++
+        log?.record {
+            byte(SyncOps.TEXT_COPY)
+            sint(x)
+            sint(y)
+            sint(w)
+            sint(h)
+            sint(dx)
+            sint(dy)
+        }
         Rects.copy(arrayOf(codePoints, foregrounds, backgrounds), width, height, x, y, w, h, dx, dy)
     }
 
@@ -148,7 +199,12 @@ public constructor(width: Int, height: Int) {
     public fun resize(newWidth: Int, newHeight: Int) {
         Rects.area(newWidth, newHeight)
         revision++
-        codePoints = Rects.resize(codePoints, width, height, newWidth, newHeight, BLANK)
+        log?.record {
+            byte(SyncOps.TEXT_RESIZE)
+            uint(newWidth)
+            uint(newHeight)
+        }
+        codePoints =Rects.resize(codePoints, width, height, newWidth, newHeight, BLANK)
         foregrounds = Rects.resize(foregrounds, width, height, newWidth, newHeight, DEFAULT_FOREGROUND)
         backgrounds = Rects.resize(backgrounds, width, height, newWidth, newHeight, DEFAULT_BACKGROUND)
         width = newWidth
@@ -168,6 +224,46 @@ public constructor(width: Int, height: Int) {
         foregrounds.copyInto(it.foregrounds)
         backgrounds.copyInto(it.backgrounds)
     }
+
+    /** 画面全体（キーフレーム）を書く。大きさに続けて、各セルの文字・前景色・背景色を左上から並べる。 */
+    internal fun writeSnapshot(out: SyncWriter) {
+        out.uint(width)
+        out.uint(height)
+        for (i in codePoints.indices) {
+            out.uint(codePoints[i])
+            out.rgb(foregrounds[i])
+            out.rgb(backgrounds[i])
+        }
+    }
+
+    /** [writeSnapshot] で書いた画面全体を読み込む。大きさが違えば合わせる。 */
+    internal fun readSnapshot(input: SyncReader) {
+        val w = input.uint()
+        val h = input.uint()
+        val n = Rects.area(w, h)
+        // 1セルは少なくとも 7 バイトなので、足りなければ大きさを変える前に壊れたデータとして扱う
+        require(input.remaining.toLong() >= n.toLong() * 7) { "text snapshot is truncated" }
+        val cps = IntArray(n)
+        val fgs = IntArray(n)
+        val bgs = IntArray(n)
+        for (i in 0 until n) {
+            val cp = input.uint()
+            checkCodePoint(cp)
+            cps[i] = cp
+            fgs[i] = input.rgb()
+            bgs[i] = input.rgb()
+        }
+        revision++
+        width = w
+        height = h
+        codePoints = cps
+        foregrounds = fgs
+        backgrounds = bgs
+    }
+
+    /** [writeSnapshot] が書く大きさの目安（バイト）。 */
+    internal val snapshotSize: Int
+        get() = codePoints.size * 8 + 10
 
     private fun index(x: Int, y: Int): Int {
         Rects.checkIndex(x, y, width, height)
