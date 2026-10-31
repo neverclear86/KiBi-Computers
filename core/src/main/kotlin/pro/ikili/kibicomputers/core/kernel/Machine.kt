@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
@@ -110,6 +111,9 @@ public class Machine internal constructor(
 
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
+
+    /** 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ。カーネルロックの中で使う） */
+    internal val vfs = Vfs(kernel.mounts)
 
     /** 待ち手の表（実行時だけ） */
     internal val registry = WaitRegistry()

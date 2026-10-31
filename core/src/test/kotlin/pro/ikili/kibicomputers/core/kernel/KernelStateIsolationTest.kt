@@ -8,6 +8,10 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -65,6 +69,12 @@ class KernelStateIsolationTest {
         process.wait = listOf(WaitKey(id, WaitCondition.READABLE))
         state.processes.add(process)
         state.fuel = -5
+        // VFS: マウントの表は KernelState に、ファイルシステムは Vfs（実行時）に置く
+        val vfs = Vfs(state.mounts)
+        vfs.mount(VfsPath.parse("/disk"), TestMemoryFileSystem(), readOnly = false, source = "disk:1")
+        val file = vfs.open(VfsPath.parse("/disk/a"), OpenOptions(write = true, create = true))
+        vfs.write(file, "xy".toByteArray(), 0, 2)
+        process.handles.insert(HandleEntry(state.objects.add(file)))
         walk(state, "state", IdentityHashMap())
     }
 
