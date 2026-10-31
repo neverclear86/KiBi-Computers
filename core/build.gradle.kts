@@ -55,6 +55,11 @@ kibiWasm {
         sources.from("src/test/wasm/hello_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // WASI p1 の fd_* をカーネルの上で確かめるプログラム（#70）
+    module("fd-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/fd_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

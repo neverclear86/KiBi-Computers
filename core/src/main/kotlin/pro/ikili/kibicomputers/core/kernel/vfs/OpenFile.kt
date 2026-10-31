@@ -56,9 +56,13 @@ internal class OpenFile(
     val readable: Boolean,
     /** 書ける */
     val writable: Boolean,
-    /** 書くときは常に終わりに足す */
-    val append: Boolean,
+    /** 書くときは常に終わりに足す（開いたときの値） */
+    append: Boolean,
 ) : KernelObject() {
+    /** 書くときは常に終わりに足す。開いた後に変えられる（WASI p1 の `fd_fdstat_set_flags`、POSIX の `fcntl(F_SETFL)`） */
+    var append: Boolean = append
+        internal set
+
     /** 読み書きの位置（バイト） */
     var position: Long = 0
         internal set
