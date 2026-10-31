@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
+import java.util.Properties
 
 // Minecraft に依存しないコア。1.20.1（Java 17）でも動かすため Java 17 をターゲットにする。
 plugins {
@@ -30,6 +31,8 @@ dependencies {
     api(libs.endive.runtime)
     api(libs.endive.wasm)
 
+    // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
+    testImplementation(libs.endive.wasi)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
@@ -52,4 +55,42 @@ kibiWasm {
         sources.from("src/test/wasm/hello_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+}
+
+// Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる
+val luaProps = Properties().apply {
+    rootProject.file("gradle/lua.properties").reader(Charsets.UTF_8).use(::load)
+}
+val luaVersion: String = luaProps.getProperty("version")
+val luaSource = kibiWasm.sourceArchive("lua") {
+    url = "https://www.lua.org/ftp/lua-$luaVersion.tar.gz"
+    sha256 = luaProps.getProperty("sha256")
+}
+kibiWasm.module("lua") {
+    // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない
+    sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c") } })
+    sources.from("src/main/wasm/lua/kibi_wasi.c")
+    includeDirs.from("src/main/wasm/lua")
+    compilerArgs.addAll(
+        "-O2",
+        "-s",
+        // os.execute などの扱い（ソースは書き換えない）
+        "-include",
+        "kibi_wasi.h",
+        // liolib.c の tmpfile は kibi_wasi.c で補うので、wasi-libc の「WASI にない」の警告を出さない
+        "-Wno-deprecated-declarations",
+        // Lua のエラー処理（setjmp/longjmp）を WASM の例外処理（exnref）で実装する。Endive は exnref に対応している
+        "-mexception-handling",
+        "-mllvm",
+        "-wasm-enable-sjlj",
+        "-mllvm",
+        "-wasm-use-legacy-eh=false",
+        // lua.c は signal、os.clock は clock を使う。wasi-libc のエミュレーションを使う
+        "-D_WASI_EMULATED_SIGNAL",
+        "-D_WASI_EMULATED_PROCESS_CLOCKS",
+        "-lwasi-emulated-signal",
+        "-lwasi-emulated-process-clocks",
+        // C のスタック（仮の値）。Lua の C 呼び出しの深さ（LUAI_MAXCCALLS = 200）に足りる大きさにする
+        "-Wl,-z,stack-size=1048576",
+    )
 }

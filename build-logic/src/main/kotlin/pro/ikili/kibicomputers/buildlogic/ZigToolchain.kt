@@ -1,26 +1,14 @@
 package pro.ikili.kibicomputers.buildlogic
 
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.gradle.api.GradleException
 import org.gradle.api.logging.Logger
-import org.tukaani.xz.XZInputStream
-import java.io.BufferedInputStream
 import java.io.File
-import java.io.InputStream
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
-import java.nio.file.attribute.PosixFilePermission
-import java.security.DigestInputStream
-import java.security.MessageDigest
 import java.util.Properties
-import java.util.zip.ZipInputStream
 
 /**
  * 使う Zig の配布物。`gradle/zig.properties` で固定したバージョンと、実行中の OS・CPU に合うアーカイブを指す。
@@ -105,19 +93,19 @@ internal object ZigInstaller {
                 val staging = root.resolve("$name.staging")
                 try {
                     logger.lifecycle("Zig ${dist.version} (${dist.platform}) を ${dist.url} から取得します")
-                    download(dist, archive)
-                    deleteRecursively(staging)
+                    Archives.download(dist.url, dist.sha256, archive, "Zig")
+                    Archives.deleteRecursively(staging)
                     Files.createDirectories(staging)
-                    if (dist.url.endsWith(".zip")) extractZip(archive, staging) else extractTarXz(archive, staging)
+                    if (dist.url.endsWith(".zip")) Archives.extractZip(archive, staging) else Archives.extractTarXz(archive, staging)
                     if (!Files.isRegularFile(staging.resolve(dist.executableName))) {
                         throw GradleException("展開した Zig に ${dist.executableName} がありません: ${dist.url}")
                     }
-                    deleteRecursively(installDir)
+                    Archives.deleteRecursively(installDir)
                     Files.move(staging, installDir, StandardCopyOption.ATOMIC_MOVE)
                     Files.writeString(installDir.resolve(MARKER), dist.sha256)
                 } finally {
                     Files.deleteIfExists(archive)
-                    deleteRecursively(staging)
+                    Archives.deleteRecursively(staging)
                 }
             }
         }
@@ -129,94 +117,5 @@ internal object ZigInstaller {
         return Files.isRegularFile(marker) &&
             Files.readString(marker).trim() == dist.sha256 &&
             Files.isRegularFile(installDir.resolve(dist.executableName))
-    }
-
-    private fun download(dist: ZigDistribution, target: Path) {
-        val client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build()
-        val request = HttpRequest.newBuilder(URI.create(dist.url))
-            .header("User-Agent", "kibicomputers-build")
-            .GET()
-            .build()
-        val response = client.send(request, HttpResponse.BodyHandlers.ofInputStream())
-        if (response.statusCode() != 200) {
-            response.body().close()
-            throw GradleException("Zig の取得に失敗しました（HTTP ${response.statusCode()}）: ${dist.url}")
-        }
-        val digest = MessageDigest.getInstance("SHA-256")
-        DigestInputStream(response.body(), digest).use { input ->
-            Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING)
-        }
-        val actual = digest.digest().joinToString("") { "%02x".format(it) }
-        if (actual != dist.sha256) {
-            throw GradleException(
-                "Zig のアーカイブの SHA-256 が合いません: ${dist.url}\n  期待: ${dist.sha256}\n  実際: $actual",
-            )
-        }
-    }
-
-    /** 先頭のディレクトリ（`zig-<platform>-<version>/`）を取り除いた相対パス。取り除くと空なら null。 */
-    private fun stripFirst(entryName: String): String? =
-        entryName.replace('\\', '/').substringAfter('/', "").trimEnd('/').ifEmpty { null }
-
-    private fun resolveInside(dir: Path, relative: String): Path {
-        val path = dir.resolve(relative).normalize()
-        if (!path.startsWith(dir)) throw GradleException("アーカイブに不正なパスがあります: $relative")
-        return path
-    }
-
-    private fun extractZip(archive: Path, dir: Path) {
-        ZipInputStream(BufferedInputStream(Files.newInputStream(archive))).use { zip ->
-            while (true) {
-                val entry = zip.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
-                val path = resolveInside(dir, relative)
-                if (entry.isDirectory) {
-                    Files.createDirectories(path)
-                } else {
-                    writeFile(zip, path)
-                }
-            }
-        }
-    }
-
-    private fun extractTarXz(archive: Path, dir: Path) {
-        TarArchiveInputStream(XZInputStream(BufferedInputStream(Files.newInputStream(archive)))).use { tar ->
-            while (true) {
-                val entry = tar.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
-                val path = resolveInside(dir, relative)
-                when {
-                    entry.isDirectory -> Files.createDirectories(path)
-                    entry.isSymbolicLink -> {
-                        Files.createDirectories(path.parent)
-                        Files.createSymbolicLink(path, Path.of(entry.linkName))
-                    }
-                    entry.isFile -> {
-                        writeFile(tar, path)
-                        if (entry.mode and "111".toInt(8) != 0) makeExecutable(path)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun writeFile(input: InputStream, path: Path) {
-        Files.createDirectories(path.parent)
-        Files.newOutputStream(path).use { input.copyTo(it) }
-    }
-
-    private fun makeExecutable(path: Path) {
-        runCatching {
-            val perms = Files.getPosixFilePermissions(path) + setOf(
-                PosixFilePermission.OWNER_EXECUTE,
-                PosixFilePermission.GROUP_EXECUTE,
-                PosixFilePermission.OTHERS_EXECUTE,
-            )
-            Files.setPosixFilePermissions(path, perms)
-        }
-    }
-
-    private fun deleteRecursively(path: Path) {
-        if (Files.exists(path)) path.toFile().deleteRecursively()
     }
 }
