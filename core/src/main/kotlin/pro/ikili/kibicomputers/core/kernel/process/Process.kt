@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel.process
 
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleTable
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 
 /** プロセスの動き方。どちらを使うかは ABI 層が決める（#63・#72・#73）。 */
@@ -67,7 +68,16 @@ internal class Process(
     val moduleHash: ModuleHash,
     /** 燃料を計測しないプロセス（テスト専用） */
     val unmetered: Boolean,
+    /** 引数（argv。最初の要素はプログラムの名前）。作った後は変わらない（#45） */
+    val args: List<String> = emptyList(),
+    /** 環境変数（名前 → 値。並びを保つ）。作った後は変わらない（#45） */
+    val env: Map<String, String> = emptyMap(),
+    /** 作業ディレクトリ（VFS の絶対パス。#45） */
+    cwd: VfsPath = VfsPath.ROOT,
 ) {
+    /** 作業ディレクトリ（VFS の絶対パス）。変えるのは `ProcessContext.changeDirectory` */
+    var cwd: VfsPath = cwd
+
     /** 状態 */
     var state: ProcessState = ProcessState.CREATED
 

@@ -10,8 +10,11 @@ import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.Process
+import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
+import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRunner
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
@@ -21,12 +24,17 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileType
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -256,12 +264,18 @@ public class Machine internal constructor(
      * プロセスを作る（#45・#49 が使う）。Process を `CREATED` で表に足し、型に応じて専用スレッドを作る（BLOCKING）か、
      * CPU の待ち行列に入れる（WAIT_POINT）。インスタンスはここでは作らない。カーネルロックを自分で取る（中から呼んでもよい）。
      *
-     * @param parentPid 0 は親なし（init）。0 以外は、表にある pid でなければ [IllegalArgumentException]
+     * 引数・環境変数・作業ディレクトリ・fd は [options] で決める（[SpawnOptions]）。どれも表を変える前に確かめ、
+     * 失敗したら何も変えない。
+     *
+     * @param parentPid 0 は親なし（init）。0 以外は、表にある、終わっていないプロセスの pid でなければ [IllegalArgumentException]
      * @return 割り当てた pid
-     * @throws IllegalArgumentException 燃料を計測しないモジュールで `allowUnmetered` が `false`、または親がない
+     * @throws IllegalArgumentException 燃料を計測しないモジュールで `allowUnmetered` が `false`、または親がない・終わっている
+     * @throws FsException 引数・環境変数が正しくない（`INVAL`）・大きすぎる（`TOOBIG`）、作業ディレクトリがない（`NOENT`）・
+     *   ディレクトリでない（`NOTDIR`）、渡す fd が開いていない・範囲外（`BADF`）
      * @throws ResourceLimitException プロセスの上限・ブロッキング型の上限を超えた
      * @throws IllegalStateException マシンが STOPPING・CRASHED、またはスケジューラが閉じている
      */
+    @Throws(FsException::class)
     internal fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions = SpawnOptions(), parentPid: Int = 0): Int {
         lock.lock()
         try {
@@ -269,18 +283,21 @@ public class Machine internal constructor(
             check(stateValue != MachineState.STOPPING && stateValue != MachineState.CRASHED) { "マシンは $stateValue" }
             val metered = program.module.isFuelMetered
             require(metered || options.allowUnmetered) { "燃料を計測しないモジュールはプロセスにできない" }
-            require(parentPid == 0 || parentPid in kernel.processes) { "親のプロセス $parentPid がない" }
+            val parent = parentLocked(parentPid)
             if (kernel.processes.liveCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")
-            val stdio = resolveStdioLocked(options.stdio, if (parentPid == 0) null else kernel.processes[parentPid])
+            val env = options.env ?: parent?.env ?: emptyMap()
+            ProcessArgs.check(options.args, env)
+            val cwd = resolveCwdLocked(options.cwd, parent)
+            val fdEntries = resolveFdsLocked(options, parent)
             val kind = driver.kind
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
             }
             val pid = kernel.processes.allocatePid()
-            val process = Process(pid, parentPid, kind, program.hash, !metered)
+            val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
             kernel.processes.add(process)
             val fds = FdTable(process, kernel.objects, wakeSink)
-            stdio.forEachIndexed { fd, entry -> if (entry != null) fds.installAt(fd, entry) }
+            for ((fd, entry) in fdEntries) fds.installAt(fd, entry)
             val rt = ProcessRuntime(this, process, program, driver)
             runner.initRuntime(rt)
             runtimes[pid] = rt
@@ -300,23 +317,98 @@ public class Machine internal constructor(
     }
 
     /**
-     * 標準入出力の割り当てを、fd 0/1/2 に入れるエントリにする（参照はまだ増やさない）。表は変えない（コンソールは作ることがある）。
-     * 親の fd が開いていなければ `BADF`、オブジェクトがなければ [IllegalArgumentException]
+     * VFS の実行ファイル [path] を読み込んで、プロセスを作る（#45）。ドライバーは [drivers] が、読み込んだ [Program] から作る。
+     *
+     * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
+     * - 普通のファイルでなければ `ACCES`、[MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
+     * - `options.args` が空なら、argv を [path] の文字列1つにする
+     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
+     *
+     * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。
      */
-    private fun resolveStdioLocked(spec: StdioSpec, parent: Process?): List<HandleEntry?> = listOf(STDIN, STDOUT, STDERR).map { fd ->
-        when (val source = spec.source(fd)) {
-            StdioSource.Inherit -> if (parent == null) consoleEntryLocked(fd) else parent.handles[fd]
-            is StdioSource.ParentFd -> {
-                val p = requireNotNull(parent) { "親のないプロセスに親の fd は渡せない" }
-                p.handles[source.fd] ?: fsError(Errno.BADF, "親の fd ${source.fd} は開いていない")
-            }
-            is StdioSource.Object -> {
-                require(kernel.objects[source.objectId] != null) { "オブジェクト ${source.objectId} がない" }
-                HandleEntry(source.objectId, rights = source.rights)
-            }
-            StdioSource.Console -> consoleEntryLocked(fd)
-            StdioSource.Closed -> null
+    @Throws(FsException::class)
+    internal fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions(), parentPid: Int = 0): Int {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
+        val bytes = lock.withLockValue { readExecutableLocked(path, parentLocked(parentPid)) }
+        val program = try {
+            Program.load(scheduler.options.runtime, bytes)
+        } catch (e: WasmLoadException) {
+            fsError(Errno.NOEXEC, "$path は WASM として読めない: ${e.message}")
         }
+        val driver = drivers.create(program)
+        val argv = options.args.ifEmpty { listOf(path) }
+        return spawn(program, driver, options.copy(args = argv), parentPid)
+    }
+
+    /** [pid] の子の pid（ゾンビを含む。割り当ての順） */
+    internal fun children(pid: Int): List<Int> = lock.withLockValue { kernel.processes.childrenOf(pid) }
+
+    /** 親のプロセス（0 なら `null`）。ない・終わっているなら [IllegalArgumentException] */
+    private fun parentLocked(parentPid: Int): Process? {
+        if (parentPid == 0) return null
+        val parent = requireNotNull(kernel.processes[parentPid]) { "親のプロセス $parentPid がない" }
+        require(!parent.state.isTerminal) { "親のプロセス $parentPid は終わっている" }
+        return parent
+    }
+
+    /** 作業ディレクトリを決める。指定がなければ親と同じ（親がなければ `/`。確かめない）。指定があれば、ディレクトリか確かめる */
+    private fun resolveCwdLocked(text: String?, parent: Process?): VfsPath {
+        val base = parent?.cwd ?: VfsPath.ROOT
+        if (text == null) return base
+        val path = VfsPath.resolve(base, text)
+        if (vfs.stat(path).type != FileType.DIRECTORY) fsError(Errno.NOTDIR, "$path はディレクトリではない")
+        return path
+    }
+
+    /** 実行ファイルの中身を読む（カーネルロックの中） */
+    private fun readExecutableLocked(text: String, parent: Process?): ByteArray {
+        val path = VfsPath.resolve(parent?.cwd ?: VfsPath.ROOT, text)
+        val stat = vfs.stat(path)
+        if (stat.type != FileType.REGULAR_FILE) fsError(Errno.ACCES, "$path は普通のファイルではない")
+        if (stat.size > MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 $MAX_EXECUTABLE_BYTES）")
+        val file = vfs.open(path, OpenOptions(read = true), VfsPath.hasTrailingSlash(text))
+        val out = ByteArrayOutputStream(stat.size.toInt())
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = vfs.read(file, buf, 0, buf.size)
+            if (n <= 0) break
+            out.write(buf, 0, n)
+            if (out.size() > MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（上限 $MAX_EXECUTABLE_BYTES）")
+        }
+        return out.toByteArray()
+    }
+
+    /**
+     * fd 0/1/2（[SpawnOptions.stdio]）と fd 3 以降（[SpawnOptions.fds]）の割り当てを、入れるエントリにする（参照はまだ増やさない）。
+     * 表は変えない（コンソールは作ることがある）。親の fd が開いていない・範囲外なら `BADF`、オブジェクトがなければ [IllegalArgumentException]
+     */
+    private fun resolveFdsLocked(options: SpawnOptions, parent: Process?): Map<Int, HandleEntry> {
+        val out = LinkedHashMap<Int, HandleEntry>()
+        for (fd in listOf(STDIN, STDOUT, STDERR)) resolveFdLocked(fd, options.stdio.source(fd), parent)?.let { out[fd] = it }
+        for ((fd, source) in options.fds.entries.sortedBy { it.key }) {
+            if (fd <= STDERR || fd >= DEFAULT_HANDLE_LIMIT) fsError(Errno.BADF, "fd $fd は渡せない（3 以上 $DEFAULT_HANDLE_LIMIT 未満）")
+            resolveFdLocked(fd, source, parent)?.let { out[fd] = it }
+        }
+        return out
+    }
+
+    /** fd [fd] の割り当て1つ。割り当てないなら `null` */
+    private fun resolveFdLocked(fd: Int, source: StdioSource, parent: Process?): HandleEntry? = when (source) {
+        StdioSource.Inherit -> when {
+            parent != null -> parent.handles[fd]
+            fd <= STDERR -> consoleEntryLocked(fd)
+            else -> null
+        }
+        is StdioSource.ParentFd -> {
+            val p = requireNotNull(parent) { "親のないプロセスに親の fd は渡せない" }
+            p.handles[source.fd] ?: fsError(Errno.BADF, "親の fd ${source.fd} は開いていない")
+        }
+        is StdioSource.Object -> {
+            require(kernel.objects[source.objectId] != null) { "オブジェクト ${source.objectId} がない" }
+            HandleEntry(source.objectId, rights = source.rights)
+        }
+        StdioSource.Console -> consoleEntryLocked(fd)
+        StdioSource.Closed -> null
     }
 
     private fun consoleEntryLocked(fd: Int): HandleEntry {
@@ -658,6 +750,9 @@ public class Machine internal constructor(
         internal const val MAX_PENDING_BEEPS: Int = 8
 
         /** コンソールの入力のバッファ（仮の値。確定は #60・#251） */
+        /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
+        internal const val MAX_EXECUTABLE_BYTES: Int = 16 * 1024 * 1024
+
         internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
 
         /** コンソールの出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #60・#251） */

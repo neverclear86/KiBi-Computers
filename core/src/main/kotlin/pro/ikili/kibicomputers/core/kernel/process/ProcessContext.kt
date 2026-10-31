@@ -5,7 +5,9 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
@@ -28,6 +30,42 @@ internal fun interface KernelHostFunction {
 internal interface ProcessContext {
     /** このプロセスの pid */
     val pid: Int
+
+    /** 親の pid（親がなければ 0） */
+    val parentPid: Int
+
+    /** 引数（argv。最初の要素はプログラムの名前。作った後は変わらない。#45） */
+    val args: List<String>
+
+    /** 環境変数（名前 → 値。並びを保つ。作った後は変わらない。#45） */
+    val env: Map<String, String>
+
+    /** 作業ディレクトリ（VFS の絶対パス。#45）。どのスレッドから読んでもよい */
+    val cwd: VfsPath
+
+    /**
+     * 作業ディレクトリを [path] に変える（`chdir`）。相対パスは今の作業ディレクトリから辿る。
+     * なければ `NOENT`、ディレクトリでなければ `NOTDIR`。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class)
+    fun changeDirectory(path: String)
+
+    /**
+     * このプロセスを親にして、読み込み済みの [program] からプロセスを作る（`Machine.spawn`。[SpawnOptions] の既定は親から引き継ぐ）。
+     * カーネルロックを持たずに呼ぶ。戻り値は子の pid
+     */
+    @Throws(FsException::class)
+    fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions = SpawnOptions()): Int
+
+    /**
+     * このプロセスを親にして、VFS の実行ファイル [path]（相対パスは作業ディレクトリから）からプロセスを作る（`Machine.exec`）。
+     * WASM の読み込みに時間がかかる（その間 CPU を持ったまま）。カーネルロックを持たずに呼ぶ。戻り値は子の pid
+     */
+    @Throws(FsException::class)
+    fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): Int
+
+    /** このプロセスの子の pid（ゾンビを含む。割り当ての順） */
+    fun children(): List<Int>
 
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
     val instance: WasmInstance

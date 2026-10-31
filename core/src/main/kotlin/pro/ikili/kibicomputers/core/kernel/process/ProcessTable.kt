@@ -19,6 +19,9 @@ internal class ProcessTable(val limit: Int) {
     /** 表にあるすべてのプロセス（pid の割り当ての順） */
     fun all(): Collection<Process> = table.values
 
+    /** 親が [pid] のプロセスの pid（割り当ての順。ゾンビを含む） */
+    fun childrenOf(pid: Int): List<Int> = table.values.filter { it.parentPid == pid }.map { it.pid }
+
     /** 終わっていないプロセスの数 */
     fun liveCount(): Int = table.values.count { !it.state.isTerminal }
 
