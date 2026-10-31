@@ -3,6 +3,7 @@
 //
 // 本体のビルドには含めない独立したビルド。実行はリポジトリのルートから:
 //   ./gradlew -p poc/component-model :bench:run
+//   ./gradlew -p poc/component-model :bench:runP1Adapter   （#261: p1 モジュールを直接 / アダプタで動かす比較）
 //
 // endive-cm は Maven Central に出ていない（999-SNAPSHOT）ので、固定したコミットのソースを
 // GitHub から取ってきて、各モジュールをそのままサブプロジェクトとしてビルドする。
