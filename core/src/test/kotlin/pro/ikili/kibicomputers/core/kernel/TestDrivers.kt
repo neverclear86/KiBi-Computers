@@ -52,8 +52,8 @@ internal class Harness(
     executor: ExecutorService? = null,
     workerIdleMillis: Long = 30_000,
 ) : AutoCloseable {
-    val scheduler = MachineScheduler(schedulerConfig, SchedulerInternals(executor, workerIdleMillis))
     val runtime = FakeWasmRuntime()
+    val scheduler = MachineScheduler(schedulerConfig, SchedulerInternals(executor, workerIdleMillis, runtime))
     private var counter = 0
 
     /** 通知の記録（tick() の中で配られたもの） */

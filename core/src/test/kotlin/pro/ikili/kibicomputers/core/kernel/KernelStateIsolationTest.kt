@@ -64,7 +64,10 @@ class KernelStateIsolationTest {
         val stream = ByteStream(64)
         val id = state.objects.add(stream)
         stream.write("data".toByteArray(), 0, 4, WakeSink.NONE)
-        val process = Process(1, 0, ProcessKind.WAIT_POINT, ModuleHash.of(byteArrayOf(1, 2, 3)), false)
+        val process = Process(
+            1, 0, ProcessKind.WAIT_POINT, ModuleHash.of(byteArrayOf(1, 2, 3)), false,
+            args = arrayListOf("prog", "-x"), env = linkedMapOf("HOME" to "/home"), cwd = VfsPath.parse("/disk"),
+        )
         process.handles.insert(HandleEntry(id))
         process.wait = listOf(WaitKey(id, WaitCondition.READABLE))
         state.processes.add(process)

@@ -4,6 +4,8 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
+import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -262,6 +264,8 @@ internal class SchedulerInternals(
     val executor: ExecutorService? = null,
     /** 仕事のないワーカーが終わるまでの時間（仮に 30 秒） */
     val workerIdleMillis: Long = 30_000,
+    /** 実行ファイル（`Machine.exec`）を読み込むランタイム（テストではダミーにする） */
+    val runtime: WasmRuntime = EndiveRuntime(),
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */

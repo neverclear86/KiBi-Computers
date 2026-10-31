@@ -6,7 +6,11 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.ThreadWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
@@ -477,6 +481,28 @@ internal class ProcessRunner(private val machine: Machine) {
 
     private inner class Context(private val rt: ProcessRuntime) : ProcessContext {
         override val pid: Int get() = rt.pid
+
+        override val parentPid: Int get() = rt.process.parentPid
+
+        override val args: List<String> get() = rt.process.args
+
+        override val env: Map<String, String> get() = rt.process.env
+
+        override val cwd: VfsPath get() = lock.withLockValue { rt.process.cwd }
+
+        override fun changeDirectory(path: String) = lock.withLockValue {
+            val target = VfsPath.resolve(rt.process.cwd, path)
+            if (machine.vfs.stat(target).type != FileType.DIRECTORY) fsError(Errno.NOTDIR, "$target はディレクトリではない")
+            rt.process.cwd = target
+        }
+
+        override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =
+            machine.spawn(program, driver, options, rt.pid)
+
+        override fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): Int =
+            machine.exec(path, drivers, options, rt.pid)
+
+        override fun children(): List<Int> = machine.children(rt.pid)
 
         override val instance: WasmInstance
             get() = lock.withLockValue { rt.firstInstance ?: throw IllegalStateException("インスタンスはまだない（LOADING）") }
