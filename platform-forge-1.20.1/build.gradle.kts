@@ -92,6 +92,7 @@ dependencies {
 
 tasks.jar {
     from(core.sourceSets.main.get().output)
+    from(rootProject.file("LICENSE")) { rename { "LICENSE_$modId" } }
 }
 
 tasks.withType<ProcessResources>().configureEach {
