@@ -17,3 +17,4 @@ junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 moddev = { id = "net.neoforged.moddev", version.ref = "moddev" }
+moddev-legacyforge = { id = "net.neoforged.moddev.legacyforge", version.ref = "moddev" }

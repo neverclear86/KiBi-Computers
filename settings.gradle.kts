@@ -16,3 +16,4 @@ include(":core")
 
 // バージョンごとの接続層
 include(":platform-neoforge-1.21.1")
+include(":platform-forge-1.20.1")

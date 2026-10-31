@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # core は Java 17、NeoForge 1.21.1 は Java 21 のツールチェーンを使う
+      # core と Forge 1.20.1 は Java 17、NeoForge 1.21.1 は Java 21 のツールチェーンを使う
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -31,6 +31,9 @@ jobs:
       # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）
       - name: GameTest (NeoForge 1.21.1)
         run: ./gradlew :platform-neoforge-1.21.1:runGameTestServer --console=plain
+
+      - name: GameTest (Forge 1.20.1)
+        run: ./gradlew :platform-forge-1.20.1:runGameTestServer --console=plain
 
       - uses: actions/upload-artifact@v7
         with:

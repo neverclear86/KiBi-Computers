@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.jvm) apply false
     alias(libs.plugins.moddev) apply false
+    alias(libs.plugins.moddev.legacyforge) apply false
 }
 
 val modVersion = providers.gradleProperty("mod_version").get()
