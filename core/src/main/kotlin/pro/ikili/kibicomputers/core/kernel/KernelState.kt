@@ -30,5 +30,12 @@ internal class KernelState(maxProcesses: Int) {
     /** コンソールの出力の `ByteStream` のオブジェクトID（まだ作っていなければ 0）。tick ごとに接続層へ配る（#58） */
     var consoleOutputId: Int = 0
 
-    // 時計・乱数の状態は #64・#69 で足す
+    /**
+     * マシンの単調時計（WASI の `MONOTONIC`）の、環境の `MachineClock.monotonicNanos` との差（ナノ秒。#69）。
+     * マシンの単調時計 = `monotonicNanos() + これ`。マシンを作ったときに、マシンの単調時計が 0 になるように決める。
+     * 戻したとき（#81）は、保存した時点の値から続くように決め直す
+     */
+    var monotonicOffsetNanos: Long = 0
+
+    // タイマーの状態は #64 で足す。乱数は環境（`EntropySource`）から取るだけで、状態を持たない（#69）
 }

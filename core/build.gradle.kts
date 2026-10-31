@@ -60,6 +60,11 @@ kibiWasm {
         sources.from("src/test/wasm/fd_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // WASI p1 の args・environ・clock・random・sched_yield・proc_exit を確かめるプログラム（#69）
+    module("basic-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/basic_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

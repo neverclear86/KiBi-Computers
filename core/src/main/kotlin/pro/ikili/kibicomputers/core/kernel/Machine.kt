@@ -130,7 +130,9 @@ public class Machine internal constructor(
     internal val lock = ReentrantLock()
 
     /** カーネルの状態（保存の対象） */
-    internal val kernel = KernelState(config.maxProcesses)
+    internal val kernel = KernelState(config.maxProcesses).also {
+        it.monotonicOffsetNanos = -environment.clock.monotonicNanos()
+    }
 
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)

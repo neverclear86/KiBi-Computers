@@ -19,6 +19,12 @@ internal object P1 {
     const val FILETYPE_DIRECTORY: Int = 3
     const val FILETYPE_REGULAR_FILE: Int = 4
 
+    // ---- clockid（u32） ----
+    const val CLOCK_REALTIME: Int = 0
+    const val CLOCK_MONOTONIC: Int = 1
+    const val CLOCK_PROCESS_CPUTIME: Int = 2
+    const val CLOCK_THREAD_CPUTIME: Int = 3
+
     // ---- fdflags（u16） ----
     const val FDFLAGS_APPEND: Int = 1
     const val FDFLAGS_DSYNC: Int = 2
