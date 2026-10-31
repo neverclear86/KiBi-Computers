@@ -26,6 +26,13 @@ public constructor(width: Int, height: Int) {
     public var height: Int = height
         private set
 
+    /**
+     * 書き込みのたびに増える番号。内容を変えうる操作（画面の外への書き込みも含む）を呼ぶと必ず増える。
+     * 描画側（#139）が、前に描いたときから変わったかを安く調べるのに使う。
+     */
+    public var revision: Long = 0
+        private set
+
     private var codePoints: IntArray
     private var foregrounds: IntArray
     private var backgrounds: IntArray
@@ -57,6 +64,7 @@ public constructor(width: Int, height: Int) {
     @Throws(IllegalArgumentException::class)
     public fun set(x: Int, y: Int, codePoint: Int, foreground: Int, background: Int) {
         checkCodePoint(codePoint)
+        revision++
         if (x !in 0 until width || y !in 0 until height) return
         val i = y * width + x
         codePoints[i] = codePoint
@@ -71,6 +79,7 @@ public constructor(width: Int, height: Int) {
      * @return 最後に書いた文字の次の x 座標（`x + コードポイントの数`）。画面の外に出た分も数える
      */
     public fun write(x: Int, y: Int, text: String, foreground: Int, background: Int): Int {
+        revision++
         val fg = foreground and RGB_MASK
         val bg = background and RGB_MASK
         val inRow = y in 0 until height
@@ -98,6 +107,7 @@ public constructor(width: Int, height: Int) {
     @Throws(IllegalArgumentException::class)
     public fun fill(x: Int, y: Int, w: Int, h: Int, codePoint: Int, foreground: Int, background: Int) {
         checkCodePoint(codePoint)
+        revision++
         val fg = foreground and RGB_MASK
         val bg = background and RGB_MASK
         val x0 = Rects.start(x, width)
@@ -119,6 +129,7 @@ public constructor(width: Int, height: Int) {
      * 写し先にならなかったセルは元のまま残るので、スクロールで空いた行は呼ぶ側が [fill] で消す。
      */
     public fun copy(x: Int, y: Int, w: Int, h: Int, dx: Int, dy: Int) {
+        revision++
         Rects.copy(arrayOf(codePoints, foregrounds, backgrounds), width, height, x, y, w, h, dx, dy)
     }
 
@@ -136,6 +147,7 @@ public constructor(width: Int, height: Int) {
     @Throws(IllegalArgumentException::class)
     public fun resize(newWidth: Int, newHeight: Int) {
         Rects.area(newWidth, newHeight)
+        revision++
         codePoints = Rects.resize(codePoints, width, height, newWidth, newHeight, BLANK)
         foregrounds = Rects.resize(foregrounds, width, height, newWidth, newHeight, DEFAULT_FOREGROUND)
         backgrounds = Rects.resize(backgrounds, width, height, newWidth, newHeight, DEFAULT_BACKGROUND)

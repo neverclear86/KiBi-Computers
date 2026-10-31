@@ -22,6 +22,13 @@ public constructor(width: Int, height: Int) {
     public var height: Int = height
         private set
 
+    /**
+     * 書き込みのたびに増える番号。内容を変えうる操作（画面の外への書き込みも含む）を呼ぶと必ず増える。
+     * 描画側（#139）が、前に描いたときから変わったかを安く調べるのに使う。
+     */
+    public var revision: Long = 0
+        private set
+
     private var pixels: IntArray = IntArray(Rects.area(width, height))
 
     /** `(x, y)` のピクセルの色（`0xRRGGBB`）。 */
@@ -33,12 +40,14 @@ public constructor(width: Int, height: Int) {
 
     /** `(x, y)` のピクセルを [rgb] にする。画面の外なら何もしない。 */
     public fun set(x: Int, y: Int, rgb: Int) {
+        revision++
         if (x !in 0 until width || y !in 0 until height) return
         pixels[y * width + x] = rgb and RGB_MASK
     }
 
     /** 矩形 `(x, y, w, h)` を [rgb] で塗る。画面の外の部分は無視する。 */
     public fun fill(x: Int, y: Int, w: Int, h: Int, rgb: Int) {
+        revision++
         val c = rgb and RGB_MASK
         val x0 = Rects.start(x, width)
         val x1 = Rects.end(x, w, width)
@@ -55,6 +64,7 @@ public constructor(width: Int, height: Int) {
      * 写し先にならなかったピクセルは元のまま残る。
      */
     public fun copy(x: Int, y: Int, w: Int, h: Int, dx: Int, dy: Int) {
+        revision++
         Rects.copy(arrayOf(pixels), width, height, x, y, w, h, dx, dy)
     }
 
@@ -68,6 +78,7 @@ public constructor(width: Int, height: Int) {
     @Throws(IllegalArgumentException::class, IndexOutOfBoundsException::class)
     public fun setPixels(x: Int, y: Int, w: Int, h: Int, src: IntArray, offset: Int, stride: Int) {
         checkImage(w, h, src.size, offset, stride)
+        revision++
         val x0 = Rects.start(x, width)
         val x1 = Rects.end(x, w, width)
         if (x0 >= x1) return
@@ -99,6 +110,7 @@ public constructor(width: Int, height: Int) {
     /** 画面全体を [rgb] で塗る。 */
     @JvmOverloads
     public fun clear(rgb: Int = DEFAULT_COLOR) {
+        revision++
         pixels.fill(rgb and RGB_MASK)
     }
 
@@ -110,6 +122,7 @@ public constructor(width: Int, height: Int) {
     @Throws(IllegalArgumentException::class)
     public fun resize(newWidth: Int, newHeight: Int) {
         Rects.area(newWidth, newHeight)
+        revision++
         pixels = Rects.resize(pixels, width, height, newWidth, newHeight, DEFAULT_COLOR)
         width = newWidth
         height = newHeight

@@ -3,8 +3,10 @@ package pro.ikili.kibicomputers.neoforge
 import com.mojang.logging.LogUtils
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
+import pro.ikili.kibicomputers.neoforge.client.KiBiClient
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import net.neoforged.fml.common.Mod
+import net.neoforged.fml.loading.FMLEnvironment
 import org.slf4j.Logger
 import thedarkcolour.kotlinforforge.neoforge.forge.MOD_BUS
 
@@ -19,6 +21,8 @@ object KiBiComputersNeoForge {
             .onSuccess { LOGGER.info("WASM runtime self-check passed (1 + 2 = {})", it) }
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
         KiBiBlocks.register(MOD_BUS)
+        // クライアントのクラスは、クライアントでだけ読み込む
+        if (FMLEnvironment.dist.isClient) KiBiClient.register(MOD_BUS)
         startDevDriver()
     }
 

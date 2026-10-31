@@ -28,6 +28,8 @@ import net.minecraft.world.phys.Vec3
 import net.neoforged.fml.loading.FMLEnvironment
 import org.lwjgl.glfw.GLFW
 import pro.ikili.kibicomputers.devdriver.DevDriverServer
+import pro.ikili.kibicomputers.core.display.CharWidth
+import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.devdriver.DevRequest
 import pro.ikili.kibicomputers.devdriver.DevResponse
 import java.nio.file.Files
@@ -69,6 +71,7 @@ object DevDriver {
             "POST /use" -> onMain { use(body) }
             "POST /close" -> onMain { mc().setScreen(null); ok() }
             "POST /screenshot" -> onMain { screenshot(body) }
+            "POST /screen" -> onMain { screen(body) }
             // クライアントを正常に終了する（このクライアントだけを閉じる）
             "POST /quit" -> onMain { mc().stop(); ok() }
             else -> DevResponse.error(404, "unknown endpoint: ${request.method} ${request.path}")
@@ -251,5 +254,34 @@ object DevDriver {
         Screenshot.grab(mc.gameDirectory, name, mc.mainRenderTarget) {}
         val path = mc.gameDirectory.toPath().resolve("screenshots").resolve(name).toAbsolutePath().normalize()
         return ok { addProperty("path", path.toString()) }
+    }
+
+    // クライアント側の画面ブロックのバッファに直接書く（画面の同期 #140 ができるまで、描画 #139 を確かめるため）。
+    // lines: 上の行から書く文字列、fg/bg: 色、clear: 先に消すか、pattern: "gradient" でピクセル画面にグラデーションを描く
+    private fun screen(body: JsonObject): DevResponse {
+        val level = mc().level ?: return DevResponse.error(409, "not in a world")
+        val pos = BlockPos(body.get("x").asInt, body.get("y").asInt, body.get("z").asInt)
+        val be = level.getBlockEntity(pos) as? ScreenBlockEntity ?: return DevResponse.error(404, "no screen at $pos")
+        val fg = body.get("fg")?.asInt ?: 0xFFFFFF
+        val bg = body.get("bg")?.asInt ?: 0x000000
+        if (body.get("clear")?.asBoolean != false) be.text.clear()
+        val col = body.get("col")?.asInt ?: 0
+        val row = body.get("row")?.asInt ?: 0
+        // 全角の文字は2セルに描かれるので、右隣のセルに空白を置く
+        body.getAsJsonArray("lines")?.forEachIndexed { i, line ->
+            var x = col
+            line.asString.codePoints().forEach { cp ->
+                be.text.set(x, row + i, cp, fg, bg)
+                if (CharWidth.isWide(cp)) be.text.set(x + 1, row + i, ' '.code, fg, bg)
+                x += CharWidth.of(cp)
+            }
+        }
+        if (body.get("pattern")?.asString == "gradient") {
+            val p = be.pixels ?: return DevResponse.error(409, "this screen has no pixels")
+            for (y in 0 until p.height) {
+                for (x in 0 until p.width) p.set(x, y, ((x * 255 / p.width) shl 16) or ((y * 255 / p.height) shl 8) or 0x40)
+            }
+        }
+        return ok { addProperty("width", be.text.width); addProperty("height", be.text.height) }
     }
 }

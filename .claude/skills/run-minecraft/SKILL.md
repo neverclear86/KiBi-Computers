@@ -49,6 +49,7 @@ M=.claude/skills/run-minecraft/scripts/mc.sh   # mc.sh <1.21.1|1.20.1> <endpoint
    | `close` | - | 画面を閉じる |
    | `screenshot` | `{"name":"my-check.png"}` | Minecraft の描画から撮る（前面に出さない）。返ったパスの画像を Read で見る |
    | `quit` | - | このクライアントを正常に終了する |
+   | `screen` | `{"x":0,"y":-60,"z":0,"lines":["hello","こんにちは"],"fg":16777215,"bg":0}`（`pattern: "gradient"` でピクセル画面にグラデーション） | クライアント側の画面ブロックのバッファに直接書く（1.21.1 だけ。画面の同期 #140 ができるまでの描画の確認用） |
 
 5. ログも確認する:
    ```bash
