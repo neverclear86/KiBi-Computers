@@ -470,6 +470,8 @@ class FuelAccountTest {
             eventually { m.stateOf(pid).isTerminal }
             assertEquals(listOf<Any>(true, true, before - 1, 0L, 0L), observed.get())
             assertState(ProcessState.CRASHED, m, pid)
+            // 状態を CRASHED にしてから、ロックの外で許可を返すので、返るまで待つ
+            eventually { permits.availablePermits() >= before }
             assertEquals(before, permits.availablePermits(), "許可は1回だけ返る")
         }
     }

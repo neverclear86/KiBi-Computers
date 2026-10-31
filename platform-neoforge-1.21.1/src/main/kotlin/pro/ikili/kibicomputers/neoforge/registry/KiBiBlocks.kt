@@ -15,7 +15,10 @@ import net.neoforged.neoforge.registries.DeferredHolder
 import net.neoforged.neoforge.registries.DeferredItem
 import net.neoforged.neoforge.registries.DeferredRegister
 import pro.ikili.kibicomputers.core.KiBiComputers
+import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.display.ScreenTier
+import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
+import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 
@@ -28,7 +31,7 @@ object KiBiBlocks {
 
     /** ティアごとの画面ブロック（`screen_1`〜`screen_3`）。ティアの順に並ぶ。 */
     val SCREENS: Map<ScreenTier, DeferredBlock<ScreenBlock>> = ScreenTier.entries.associateWith { tier ->
-        BLOCKS.registerBlock("screen_${tier.level}", { ScreenBlock(tier, it) }, screenProperties())
+        BLOCKS.registerBlock("screen_${tier.level}", { ScreenBlock(tier, it) }, machineProperties())
     }
 
     /** 画面ブロックのアイテム。 */
@@ -44,12 +47,32 @@ object KiBiBlocks {
             BlockEntityType.Builder.of(::ScreenBlockEntity, *blocks).build(null)
         }
 
+    /** ティアごとのケースブロック（`case_1`〜`case_3`、#121）。ティアの順に並ぶ。 */
+    val CASES: Map<CaseTier, DeferredBlock<CaseBlock>> = CaseTier.entries.associateWith { tier ->
+        BLOCKS.registerBlock("case_${tier.level}", { CaseBlock(tier, it) }, machineProperties())
+    }
+
+    /** ケースブロックのアイテム。 */
+    val CASE_ITEMS: Map<CaseTier, DeferredItem<BlockItem>> =
+        CASES.mapValues { (_, block) -> ITEMS.registerSimpleBlockItem(block) }
+
+    /** すべてのティアのケースブロックで共通のブロックエンティティ。 */
+    val CASE_BLOCK_ENTITY: DeferredHolder<BlockEntityType<*>, BlockEntityType<CaseBlockEntity>> =
+        BLOCK_ENTITY_TYPES.register("case") { ->
+            val blocks = CASES.values.map { it.get() }.toTypedArray()
+            @Suppress("NULLABILITY_MISMATCH_BASED_ON_JAVA_ANNOTATIONS")
+            BlockEntityType.Builder.of(::CaseBlockEntity, *blocks).build(null)
+        }
+
     /** MOD のクリエイティブタブ。 */
     val TAB: DeferredHolder<CreativeModeTab, CreativeModeTab> = CREATIVE_TABS.register("main") { ->
         CreativeModeTab.builder()
             .title(Component.translatable("itemGroup.${KiBiComputers.MOD_ID}"))
             .icon { ItemStack(SCREEN_ITEMS.getValue(ScreenTier.COLOR).get()) }
-            .displayItems { _, output -> SCREEN_ITEMS.values.forEach { output.accept(it.get()) } }
+            .displayItems { _, output ->
+                CASE_ITEMS.values.forEach { output.accept(it.get()) }
+                SCREEN_ITEMS.values.forEach { output.accept(it.get()) }
+            }
             .build()
     }
 
@@ -61,8 +84,8 @@ object KiBiBlocks {
         CREATIVE_TABS.register(modBus)
     }
 
-    // 硬さは仮の値（#251 で確定）。鉄ブロックより柔らかく、ツルハシで壊す
-    private fun screenProperties(): BlockBehaviour.Properties =
+    // 画面とケースで共通。硬さは仮の値（#251 で確定）。鉄ブロックより柔らかく、ツルハシで壊す
+    private fun machineProperties(): BlockBehaviour.Properties =
         BlockBehaviour.Properties.of()
             .mapColor(MapColor.METAL)
             .strength(2.0f, 6.0f)
