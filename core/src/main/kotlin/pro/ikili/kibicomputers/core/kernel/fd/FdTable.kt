@@ -104,6 +104,12 @@ internal class FdTable(
         if (old != null) objects.release(old.objectId, sink)
     }
 
+    /** [fd] のフラグ（[HandleEntry.flags]。意味は ABI 層が決める）を [flags] にする。参照の数は変えない。開いていなければ `BADF` */
+    fun setFlags(fd: Int, flags: Long) {
+        val e = entry(fd)
+        handles.insertAt(fd, e.copy(flags = flags))
+    }
+
     /** [fd] を閉じる。開いていなければ `BADF` */
     fun close(fd: Int) {
         val e = handles.remove(fd) ?: fsError(Errno.BADF, "fd $fd は開いていない")

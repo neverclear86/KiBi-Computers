@@ -4,6 +4,8 @@ package pro.ikili.kibicomputers.core.kernel.vfs
 internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : FileSystem {
     private class Node(val id: Long, val type: FileType) {
         var data = ByteArray(0)
+        var accessedNanos = 0L
+        var modifiedNanos = 0L
         val children = sortedMapOf<String, Long>()
     }
 
@@ -34,7 +36,13 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
 
     private fun node(id: Long): Node = nodes[id] ?: fsError(Errno.STALE)
 
-    private fun statOf(n: Node) = FileStat(n.id, n.type, if (n.type == FileType.REGULAR_FILE) n.data.size.toLong() else 0)
+    private fun statOf(n: Node) = FileStat(
+        n.id,
+        n.type,
+        if (n.type == FileType.REGULAR_FILE) n.data.size.toLong() else 0,
+        accessedNanos = n.accessedNanos,
+        modifiedNanos = n.modifiedNanos,
+    )
 
     override fun stat(path: VfsPath): FileStat = statOf(find(path))
 
@@ -101,6 +109,12 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         val n = node(node)
         if (n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         return n.children.map { (name, id) -> DirEntry(name, nodes[id]!!.type, id) }
+    }
+
+    override fun setTimes(node: Long, accessedNanos: Long?, modifiedNanos: Long?) {
+        val n = node(node)
+        if (accessedNanos != null) n.accessedNanos = accessedNanos
+        if (modifiedNanos != null) n.modifiedNanos = modifiedNanos
     }
 
     override fun sync(node: Long) {

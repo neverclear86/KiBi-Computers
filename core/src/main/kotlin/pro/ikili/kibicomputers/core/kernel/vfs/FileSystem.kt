@@ -88,6 +88,14 @@ internal interface FileSystem {
     /** ディレクトリ [node] の中身。ディレクトリでなければ `NOTDIR` */
     fun readDirectory(node: Long): List<DirEntry>
 
+    /**
+     * [node] の時刻を変える。`null` の時刻は変えない（時刻はエポックからのナノ秒）。
+     * 既定は `NOTSUP`（時刻を持たない・変えられないファイルシステム）
+     */
+    fun setTimes(node: Long, accessedNanos: Long?, modifiedNanos: Long?) {
+        fsError(Errno.NOTSUP, "時刻を変えられないファイルシステム")
+    }
+
     /** [node] の中身を記憶装置へ書き出す（既定は何もしない） */
     fun sync(node: Long) {}
 }

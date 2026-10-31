@@ -188,6 +188,17 @@ internal class Vfs(
         fsOf(file).setSize(file.node, size)
     }
 
+    /**
+     * 時刻を変える（`null` は変えない）。書く権利は要らない（POSIX の `futimens` と同じ）。
+     * 読み取り専用のマウントと、マウントの祖先のディレクトリ（どの FS にもない）は `ROFS`
+     */
+    fun setTimes(file: OpenFile, accessedNanos: Long?, modifiedNanos: Long?) {
+        if (file.mountId == 0) fsError(Errno.ROFS)
+        val fs = fsOf(file)
+        if (mounts[file.mountId]!!.readOnly || fs.readOnly) fsError(Errno.ROFS)
+        fs.setTimes(file.node, accessedNanos, modifiedNanos)
+    }
+
     /** 書き出す */
     fun sync(file: OpenFile) {
         if (file.mountId == 0) return
