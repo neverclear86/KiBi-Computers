@@ -132,7 +132,11 @@ class StdioTest {
                 StepResult.Exit(0)
             })
             // 燃料を入れて、tick を呼ばずに走らせる: バッファがいっぱいになったところで待つ
-            m.lock.withLockValue { m.kernel.fuel = m.config.fuelPerTick }
+            // プロセスのスレッドが先に燃料待ちに入っていることがあるので、燃料待ちも起こす（起こさないと CI で止まる）
+            m.lock.withLockValue {
+                m.kernel.fuel = m.config.fuelPerTick
+                m.wakeFuelWaitersLocked()
+            }
             eventually { m.stateOf(pid) == ProcessState.WAITING_EVENT }
             assertEquals(0, host.size())
             h.tickUntil { m.stateOf(pid).isTerminal && host.size() == total }
