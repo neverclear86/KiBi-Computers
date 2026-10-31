@@ -26,3 +26,4 @@ include(":platform-forge-1.20.1")
 // 技術検証（PoC）の測定用コード。MOD の jar には入れない
 include(":poc:screen-sync")
 include(":poc:endive-bench")
+include(":poc:exec-thread")
