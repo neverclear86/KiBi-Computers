@@ -17,6 +17,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Chicory](https://
 | `core/` | Minecraft 非依存のコア（WASMランタイム、カーネル、VFS、状態保存など）。Java 17 ターゲット |
 | `platform-neoforge-1.21.1/` | 1.21.1 / NeoForge の接続層（ブロック、GUI、ネットワークなど）。Java 21 |
 | `platform-forge-1.20.1/` | 1.20.1 / Forge の接続層。Java 17。ModDevGradle の Legacy Forge プラグイン、KFF 4.x |
+| `dev-driver/` | 開発クライアントを外から操作する HTTP の口（MC 非依存の部分）。各接続層の `src/dev/` が MC 側の操作を実装する。開発環境でだけ読み込み、jar には入れない |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
 | `platform-*/gradle.properties` | Minecraft・ローダー・KFF のバージョン |
 | `gradle.properties` | MOD ID、名前、バージョン、グループ |
@@ -112,7 +113,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 ## 素材と見た目の確認
 
 - テクスチャ・モデル・GUI の画像は、エージェントがプログラムで仮素材を作る。仮素材を追加したら、#250 の「仮素材の一覧」に追記する。
-- GUI・描画は開発クライアントのスクリーンショットで確かめる（`run-minecraft` スキル）。クライアントの自動操作（#252）ができるまでは、操作が要る確認を PR の「確認できなかったこと」に書く。
+- GUI・描画・入力は、開発クライアントを自動操作して確かめる（`run-minecraft` スキル。ワールド作成、コマンド、キー・文字入力、クリック、ブロックの右クリック、スクリーンショット）。それでも確かめられなかったことは、PR の「確認できなかったこと」に書く。
 
 ## 開発フロー（#242）
 

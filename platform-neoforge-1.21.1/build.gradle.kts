@@ -13,6 +13,7 @@ fun prop(name: String): String = property(name) as String
 val modId = prop("mod_id")
 val core = project(":core")
 val mcVersion = prop("minecraft_version")
+val devDriver = project(":dev-driver")
 
 base.archivesName = "$modId-neoforge-$mcVersion"
 
@@ -23,8 +24,16 @@ kotlin {
     compilerOptions.jvmTarget = JvmTarget.JVM_21
 }
 
+// 開発環境でだけ読み込むコード（クライアントの自動操作の口など）。jar には入れない
+val dev: SourceSet = sourceSets.create("dev") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
 neoForge {
     version = prop("neoforge_version")
+    // バージョンを決めたあとでないと呼べない
+    addModdingDependenciesTo(dev)
 
     parchment {
         minecraftVersion = mcVersion
@@ -38,6 +47,9 @@ neoForge {
         }
         register("client") {
             client()
+            // 開発クライアントの自動操作の口（#252）。ポートは既定で自動、実際の番号は run/dev-driver.port に書く
+            systemProperty("kibicomputers.devDriver.port", providers.gradleProperty("devDriverPort").getOrElse("0"))
+            systemProperty("kibicomputers.devDriver.portFile", file("run/dev-driver.port").absolutePath)
         }
         register("server") {
             server()
@@ -61,6 +73,8 @@ neoForge {
         register(modId) {
             sourceSet(sourceSets.main.get())
             sourceSet(core.sourceSets.main.get())
+            sourceSet(dev)
+            sourceSet(devDriver.sourceSets.main.get())
         }
     }
 }
@@ -72,6 +86,8 @@ sourceSets.main {
 dependencies {
     // core は MOD の一部として jar に直接入れるので、ここではコンパイル時だけ参照する
     compileOnly(project(":core"))
+    "devCompileOnly"(project(":core"))
+    "devCompileOnly"(project(":dev-driver"))
 
     implementation("thedarkcolour:kotlinforforge-neoforge:${prop("kff_version")}")
 
@@ -82,6 +98,11 @@ dependencies {
         // 開発環境の実行時クラスパスにも載せる（Kotlin DSL では型安全アクセサが生成されないので文字列で指定）
         "additionalRuntimeClasspath"(lib)
     }
+}
+
+// dev ソースセットも build でコンパイルする（jar には入れない）
+tasks.build {
+    dependsOn(dev.classesTaskName)
 }
 
 tasks.jar {
