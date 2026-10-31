@@ -16,6 +16,9 @@ internal class HandleTable<E : Any>(val limit: Int) {
     var size: Int = 0
         private set
 
+    /** 空き番号がない（[insert] が -1 を返す） */
+    val isFull: Boolean get() = size >= limit
+
     /** いちばん小さい空き番号に [entry] を入れ、その番号を返す。満杯なら -1 */
     fun insert(entry: E): Int {
         for (i in slots.indices) {
@@ -72,7 +75,21 @@ internal class HandleTable<E : Any>(val limit: Int) {
 }
 
 /**
- * プロセスのハンドル表のエントリ（保存の対象）。オブジェクトIDと、ハンドル固有の情報（権限、フラグ）を持つ。
- * 中身の意味は ABI 層が決める（#58・#265）。
+ * プロセスのハンドル表のエントリ（保存の対象）。オブジェクトIDと、ハンドル固有の情報（権利、フラグ）を持つ。
+ *
+ * [rights] はカーネルが見る（[HandleRights]。fd の読み書きで確かめる。#58）。[flags] の意味は ABI 層が決める
+ * （p1 の `fdflags` など。#72・#265）。複製（dup）は両方を写す。
  */
-internal data class HandleEntry(val objectId: Int, val flags: Long = 0)
+internal data class HandleEntry(val objectId: Int, val flags: Long = 0, val rights: Int = HandleRights.ALL)
+
+/** [HandleEntry.rights] のビット */
+internal object HandleRights {
+    /** 読める */
+    const val READ: Int = 1
+
+    /** 書ける */
+    const val WRITE: Int = 2
+
+    /** 読み書きできる（オブジェクトの側の権利は別に確かめる。`OpenFile` の読む・書くなど） */
+    const val ALL: Int = READ or WRITE
+}

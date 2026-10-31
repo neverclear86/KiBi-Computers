@@ -1,5 +1,15 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.fd.STDERR
+import pro.ikili.kibicomputers.core.kernel.fd.STDIN
+import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
+import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.io.WriteResult
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -10,8 +20,13 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -117,6 +132,22 @@ public class Machine internal constructor(
 
     /** 待ち手の表（実行時だけ） */
     internal val registry = WaitRegistry()
+
+    /**
+     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの出力に書かれたら、次の tick で配るよう印を付ける。
+     * カーネルの中でオブジェクトの状態を変えるときは、[registry] ではなくこれを使う
+     */
+    internal val wakeSink: WakeSink = object : WakeSink {
+        override fun wake(key: WaitKey) {
+            registry.wake(key)
+            if (key.condition == WaitCondition.READABLE && key.objectId != 0 && key.objectId == kernel.consoleOutputId) markConsoleDirty()
+        }
+
+        override fun wakeObject(objectId: Int) = registry.wakeObject(objectId)
+    }
+
+    /** コンソールの出力に、まだ配っていないバイトがあるかもしれない */
+    private val consoleDirty = AtomicBoolean(false)
 
     /** pid → 実行時だけのもの */
     internal val runtimes = HashMap<Int, ProcessRuntime>()
@@ -240,6 +271,7 @@ public class Machine internal constructor(
             require(metered || options.allowUnmetered) { "燃料を計測しないモジュールはプロセスにできない" }
             require(parentPid == 0 || parentPid in kernel.processes) { "親のプロセス $parentPid がない" }
             if (kernel.processes.liveCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")
+            val stdio = resolveStdioLocked(options.stdio, if (parentPid == 0) null else kernel.processes[parentPid])
             val kind = driver.kind
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
@@ -247,6 +279,8 @@ public class Machine internal constructor(
             val pid = kernel.processes.allocatePid()
             val process = Process(pid, parentPid, kind, program.hash, !metered)
             kernel.processes.add(process)
+            val fds = FdTable(process, kernel.objects, wakeSink)
+            stdio.forEachIndexed { fd, entry -> if (entry != null) fds.installAt(fd, entry) }
             val rt = ProcessRuntime(this, process, program, driver)
             runner.initRuntime(rt)
             runtimes[pid] = rt
@@ -263,6 +297,68 @@ public class Machine internal constructor(
         } finally {
             lock.unlock()
         }
+    }
+
+    /**
+     * 標準入出力の割り当てを、fd 0/1/2 に入れるエントリにする（参照はまだ増やさない）。表は変えない（コンソールは作ることがある）。
+     * 親の fd が開いていなければ `BADF`、オブジェクトがなければ [IllegalArgumentException]
+     */
+    private fun resolveStdioLocked(spec: StdioSpec, parent: Process?): List<HandleEntry?> = listOf(STDIN, STDOUT, STDERR).map { fd ->
+        when (val source = spec.source(fd)) {
+            StdioSource.Inherit -> if (parent == null) consoleEntryLocked(fd) else parent.handles[fd]
+            is StdioSource.ParentFd -> {
+                val p = requireNotNull(parent) { "親のないプロセスに親の fd は渡せない" }
+                p.handles[source.fd] ?: fsError(Errno.BADF, "親の fd ${source.fd} は開いていない")
+            }
+            is StdioSource.Object -> {
+                require(kernel.objects[source.objectId] != null) { "オブジェクト ${source.objectId} がない" }
+                HandleEntry(source.objectId, rights = source.rights)
+            }
+            StdioSource.Console -> consoleEntryLocked(fd)
+            StdioSource.Closed -> null
+        }
+    }
+
+    private fun consoleEntryLocked(fd: Int): HandleEntry {
+        ensureConsoleLocked()
+        return if (fd == STDIN) {
+            HandleEntry(kernel.consoleInputId, rights = HandleRights.READ)
+        } else {
+            HandleEntry(kernel.consoleOutputId, rights = HandleRights.WRITE)
+        }
+    }
+
+    /** コンソールの入力・出力の `ByteStream` を、なければ作る（カーネルが参照を1つずつ持ち、閉じない） */
+    internal fun ensureConsoleLocked() {
+        if (kernel.consoleInputId == 0) kernel.consoleInputId = kernel.objects.add(ByteStream(CONSOLE_INPUT_BYTES))
+        if (kernel.consoleOutputId == 0) kernel.consoleOutputId = kernel.objects.add(ByteStream(CONSOLE_OUTPUT_BYTES))
+    }
+
+    /**
+     * コンソールの入力に [bytes] を足す（キーボードからの入力。TTY の行編集は #60）。どのスレッドから呼んでもよい。
+     * 空きの分だけ書き、書けたバイト数を返す（空きがなければ 0）
+     */
+    internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Int = lock.withLockValue {
+        ensureConsoleLocked()
+        val input = kernel.objects[kernel.consoleInputId] as ByteStream
+        when (val r = input.write(bytes, offset, length, wakeSink)) {
+            is WriteResult.Bytes -> r.count
+            else -> 0
+        }
+    }
+
+    private fun markConsoleDirty() {
+        if (consoleDirty.compareAndSet(false, true) && queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
+    }
+
+    /** コンソールの出力にたまったバイトを取り出す（書き手を起こす）。なければ `null` */
+    private fun drainConsoleOutput(): ByteArray? = lock.withLockValue {
+        val id = kernel.consoleOutputId
+        val stream = (if (id == 0) null else kernel.objects[id] as? ByteStream) ?: return@withLockValue null
+        if (stream.available == 0) return@withLockValue null
+        val out = ByteArray(stream.available)
+        stream.read(out, 0, out.size, wakeSink)
+        out
     }
 
     internal fun runtime(pid: Int): ProcessRuntime? = lock.withLockValue { runtimes[pid] }
@@ -459,6 +555,9 @@ public class Machine internal constructor(
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
         var console: ByteArrayOutputStream? = null
+        if (consoleDirty.getAndSet(false)) {
+            drainConsoleOutput()?.let { bytes -> console = ByteArrayOutputStream().also { it.write(bytes, 0, bytes.size) } }
+        }
         while (true) {
             val n = notifications.poll() ?: break
             if (n is HostNotification.Console) {
@@ -557,6 +656,12 @@ public class Machine internal constructor(
 
         /** 配っていないビープの上限（仮の値） */
         internal const val MAX_PENDING_BEEPS: Int = 8
+
+        /** コンソールの入力のバッファ（仮の値。確定は #60・#251） */
+        internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
+
+        /** コンソールの出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #60・#251） */
+        internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
     }
 }
 

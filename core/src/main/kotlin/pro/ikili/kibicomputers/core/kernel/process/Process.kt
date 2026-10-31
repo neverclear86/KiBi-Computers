@@ -50,7 +50,7 @@ internal enum class ProcessState {
     val isTerminal: Boolean get() = this == EXITED || this == CRASHED || this == KILLED
 }
 
-/** ハンドル表の上限（仮の値。確定は #58・#251） */
+/** ハンドル表の上限（仮の値。確定は #251）。fd の数の上限（超えると `MFILE`）を兼ねる */
 internal const val DEFAULT_HANDLE_LIMIT: Int = 256
 
 /**
@@ -77,6 +77,6 @@ internal class Process(
     /** 待っている [WaitKey] の並び（待っていなければ `null`） */
     var wait: List<WaitKey>? = null
 
-    /** ハンドル表（p1 の fd 表・resource の表は ABI 層がここに置く。#58・#265） */
+    /** ハンドル表（fd 表。0/1/2 は標準入出力。操作は `FdTable` を通す。Component Model の resource の表は #265） */
     val handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
 }

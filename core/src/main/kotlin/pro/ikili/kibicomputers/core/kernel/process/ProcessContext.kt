@@ -5,7 +5,9 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
@@ -59,6 +61,12 @@ internal interface ProcessContext {
 
     /** カーネルの状態（カーネルロックの中で使う） */
     val kernel: KernelState
+
+    /** マシンの VFS（カーネルロックの中で使う） */
+    val vfs: Vfs
+
+    /** 状態を変えるオブジェクトの操作に渡す、待ち手への知らせ口（カーネルロックの中で使う） */
+    val wakeSink: WakeSink
 
     /** カーネルロックの中で [block] を実行する */
     fun <T> withKernelLock(block: () -> T): T

@@ -5,10 +5,13 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.ThreadWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -463,6 +466,8 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         rt.instances.clear()
         rt.fuelHolder = null
+        // fd をすべて閉じる（ゾンビは fd を持たない。#58）
+        FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
         // 親への知らせは #46
         machine.checkAllDoneLocked()
@@ -480,6 +485,10 @@ internal class ProcessRunner(private val machine: Machine) {
             get() = lock.withLockValue { rt.fuelHolder ?: throw IllegalStateException("インスタンスはまだない（LOADING）") }
 
         override val kernel: KernelState get() = machine.kernel
+
+        override val vfs: Vfs get() = machine.vfs
+
+        override val wakeSink: WakeSink get() = machine.wakeSink
 
         override fun <T> withKernelLock(block: () -> T): T = lock.withLockValue(block)
 
