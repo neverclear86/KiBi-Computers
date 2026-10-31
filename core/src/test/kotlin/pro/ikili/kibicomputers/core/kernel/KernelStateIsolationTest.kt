@@ -1,0 +1,83 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.fail
+import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
+import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
+import pro.ikili.kibicomputers.core.kernel.process.Process
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import java.lang.reflect.Modifier
+import java.util.IdentityHashMap
+
+/**
+ * [KernelState] の下が、番号・列挙・バイト列（と、それをまとめるカーネルのクラス・コレクション）だけでできていることを、
+ * リフレクションでたどって確かめる（実行時だけのものを参照したらここで気づく）。
+ */
+class KernelStateIsolationTest {
+    private val allowedLeaf = setOf(
+        String::class.java, java.lang.Integer::class.java, java.lang.Long::class.java, java.lang.Boolean::class.java,
+        java.lang.Byte::class.java, java.lang.Short::class.java, java.lang.Character::class.java,
+    )
+
+    private fun walk(value: Any?, path: String, seen: IdentityHashMap<Any, Unit>) {
+        if (value == null) return
+        if (seen.containsKey(value)) return
+        seen[value] = Unit
+        val c = value.javaClass
+        when {
+            c.isPrimitive || c in allowedLeaf || c.isEnum || (c.superclass?.isEnum == true) -> return
+            value is ByteArray || value is IntArray || value is LongArray -> return
+            value is Array<*> -> value.forEachIndexed { i, v -> walk(v, "$path[$i]", seen) }
+            value is Map<*, *> -> value.forEach { (k, v) ->
+                walk(k, "$path{key}", seen)
+                walk(v, "$path[$k]", seen)
+            }
+            value is Collection<*> -> value.forEachIndexed { i, v -> walk(v, "$path[$i]", seen) }
+            c.name.startsWith("pro.ikili.kibicomputers.core.kernel.") -> {
+                if (value is WakeSink) fail("$path が WakeSink を参照している")
+                var k: Class<*>? = c
+                while (k != null && k != Any::class.java) {
+                    for (f in k.declaredFields) {
+                        if (Modifier.isStatic(f.modifiers)) continue
+                        f.isAccessible = true
+                        walk(f.get(value), "$path.${f.name}", seen)
+                    }
+                    k = k.superclass
+                }
+            }
+            else -> fail("$path が書き出せない型 ${c.name} を参照している")
+        }
+    }
+
+    @Test
+    fun `KernelStateの下は実行時だけのものを参照しない`() {
+        val state = KernelState(8)
+        val stream = ByteStream(64)
+        val id = state.objects.add(stream)
+        stream.write("data".toByteArray(), 0, 4, WakeSink.NONE)
+        val process = Process(1, 0, ProcessKind.WAIT_POINT, ModuleHash.of(byteArrayOf(1, 2, 3)), false)
+        process.handles.insert(HandleEntry(id))
+        process.wait = listOf(WaitKey(id, WaitCondition.READABLE))
+        state.processes.add(process)
+        state.fuel = -5
+        walk(state, "state", IdentityHashMap())
+    }
+
+    @Test
+    fun `動いたマシンのKernelStateも実行時だけのものを参照しない`() {
+        Harness().use { h ->
+            val machine = h.machine()
+            val program = h.program(emptyModule())
+            val pid = machine.spawnTest(program, TestDriver(ProcessKind.WAIT_POINT) { pro.ikili.kibicomputers.core.kernel.process.StepResult.Exit(0) })
+            h.scheduler.tick()
+            eventually { machine.stateOf(pid).isTerminal }
+            machine.lock.withLockValue { walk(machine.kernel, "kernel", IdentityHashMap()) }
+            assertTrue(true)
+        }
+    }
+}

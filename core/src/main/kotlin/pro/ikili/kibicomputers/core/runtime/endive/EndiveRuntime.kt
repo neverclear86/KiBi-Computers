@@ -24,6 +24,7 @@ import run.endive.runtime.HostFunction
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
 import run.endive.runtime.TrapException
+import run.endive.runtime.WasmInterruptedException
 import run.endive.wasm.InvalidException
 import run.endive.wasm.MalformedException
 import run.endive.wasm.Parser
@@ -118,6 +119,8 @@ private fun rethrow(e: Throwable): Nothing {
     throw when (e) {
         is WasmException -> e
         is StackOverflowError -> WasmTrapException(WasmTrapKind.STACK_OVERFLOW, "呼び出しが深すぎる", e)
+        // Thread.interrupt で止められた（#43。カーネルの stop が使う）
+        is WasmInterruptedException -> WasmTrapException(WasmTrapKind.INTERRUPTED, "実行しているスレッドが割り込まれた", e)
         is EndiveWasmException -> WasmTrapException(WasmTrapKind.UNCAUGHT_EXCEPTION, "捕まえられていない WASM の例外", e)
         is WasmEngineException -> WasmTrapException(trapKind(e.message.orEmpty()), e.message ?: e.toString(), e)
         else -> e
@@ -235,7 +238,7 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
         } catch (e: UninstantiableException) {
             // start 関数のトラップは Endive が UninstantiableException に包むので、トラップとして投げ直す
             val cause = e.cause
-            if (cause != null && (hostThrowable(cause) != null || cause is TrapException || cause is EndiveWasmException || cause is StackOverflowError)) rethrow(cause)
+            if (cause != null && (hostThrowable(cause) != null || cause is TrapException || cause is WasmInterruptedException || cause is EndiveWasmException || cause is StackOverflowError)) rethrow(cause)
             throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
         } catch (e: InvalidException) {
             throw WasmLoadException("WASM の検証に通らない: ${e.message}", e)

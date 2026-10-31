@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
@@ -13,10 +14,34 @@ import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmRuntimeContractTest
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 
 class EndiveRuntimeTest : WasmRuntimeContractTest() {
     override val runtime: WasmRuntime = EndiveRuntime()
+
+    @Test
+    fun `割り込むとINTERRUPTEDのトラップで止まる`() {
+        val bytes = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/fib.wasm")).use { it.readBytes() }
+        val instance = runtime.load(bytes).instantiate(WasmInstanceConfig.EMPTY)
+        val error = java.util.concurrent.atomic.AtomicReference<Throwable>()
+        val started = java.util.concurrent.CountDownLatch(1)
+        val thread = Thread {
+            started.countDown()
+            try {
+                instance.call("fib", 0x7fffffff)
+            } catch (t: Throwable) {
+                error.set(t)
+            }
+        }
+        thread.start()
+        started.await()
+        Thread.sleep(50)
+        thread.interrupt()
+        thread.join(10_000)
+        val e = error.get()
+        assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED, "$e")
+    }
 
     @Test
     fun `燃料のimportとexportの片方しかないモジュールは読み込まない`() {

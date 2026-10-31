@@ -52,6 +52,9 @@ public enum class WasmTrapKind {
     /** WASM の例外（`throw`）が誰にも捕まえられずに外に出た */
     UNCAUGHT_EXCEPTION,
 
+    /** 実行しているスレッドが割り込まれた（`Thread.interrupt`）。カーネルがプロセスを止めるときに使う（#43） */
+    INTERRUPTED,
+
     /** その他 */
     OTHER,
 }

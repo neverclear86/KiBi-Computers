@@ -1,0 +1,310 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
+import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
+import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+
+/**
+ * コンピューター（[Machine]）を動かすスケジューラ。サーバーに1つ。接続層がサーバーの起動で作り、停止で [close] する（#43）。
+ *
+ * - 同時に WASM を実行するマシンの数は、公平なセマフォで [SchedulerConfig.maxConcurrentMachines] までに抑える
+ * - [tick] はメインスレッドから毎 tick 呼ぶ。tick の番号を進め、通知のあるマシンだけ [MachineHost] に配る。台数によらない
+ * - 保存の前に [pauseAll] で全マシンを止める
+ *
+ * スレッド: [tick] はメインスレッドから呼ぶ。ほかはどのスレッドから呼んでもよい（[awaitTermination] はカーネルのスレッドから呼べない）。
+ */
+public class MachineScheduler internal constructor(
+    /** 設定 */
+    public val config: SchedulerConfig,
+    internal val options: SchedulerInternals,
+) : AutoCloseable {
+    /** [config] の設定でスケジューラを作る。ディスパッチャーのスレッドが動き始める */
+    @JvmOverloads
+    public constructor(config: SchedulerConfig = SchedulerConfig.DEFAULT) : this(config, SchedulerInternals())
+
+    internal val permits = Semaphore(config.maxConcurrentMachines, true)
+    private val tickCounter = AtomicLong()
+    private val machines = ConcurrentHashMap<Long, Machine>()
+    private val nextMachineId = AtomicLong(1)
+    private val notifyQueue = ConcurrentLinkedQueue<Machine>()
+    private val blockingCount = AtomicInteger()
+
+    /** ブロッキング型の専用スレッド（終わるのを待つため） */
+    internal val dedicatedThreads: MutableSet<Thread> = Collections.newSetFromMap(ConcurrentHashMap())
+
+    internal val workers = WorkerPool(config.threadStackBytes, options.workerIdleMillis, options.executor)
+    internal val dispatcher = Dispatcher<Machine>(config.threadStackBytes) { machine -> machine.dispatchFuelWaiters() }
+
+    internal val hooks = KernelTestHooks()
+
+    private val pauseLock = ReentrantLock()
+    private val pauseCondition = pauseLock.newCondition()
+    private var paused = false
+    private var activeCount = 0
+
+    @Volatile
+    private var closed = false
+
+    /** 許可を取った回数（数え口） */
+    internal val permitAcquisitions = AtomicLong()
+
+    /** [tick] が通知を配ったマシンの数の合計（数え口） */
+    internal val tickVisitedMachines = AtomicLong()
+
+    /** `stop()` が送った割り込みの数（数え口） */
+    internal val interruptsSent = AtomicLong()
+
+    init {
+        dispatcher.start()
+    }
+
+    /** 今の tick の番号 */
+    internal val now: Long get() = tickCounter.get()
+
+    internal val isClosed: Boolean get() = closed
+
+    /** 一時停止の印（カーネルロックの中から読む） */
+    internal val isPaused: Boolean get() = pauseLock.withLockValue { paused }
+
+    /** 一時停止の数えに入っているプロセスの数（テスト用） */
+    internal val activeProcesses: Int get() = pauseLock.withLockValue { activeCount }
+
+    /** ブロッキング型のプロセスの数 */
+    internal val blockingProcesses: Int get() = blockingCount.get()
+
+    /** マシンを作る（まだ何も動かない。起動は #49）。[close] の後は [IllegalStateException] */
+    public fun createMachine(host: MachineHost, config: MachineConfig): Machine {
+        check(!closed) { "スケジューラは閉じている" }
+        val machine = Machine(this, nextMachineId.getAndIncrement(), host, config)
+        machines[machine.id] = machine
+        if (closed) {
+            machines.remove(machine.id)
+            throw IllegalStateException("スケジューラは閉じている")
+        }
+        return machine
+    }
+
+    /**
+     * メインスレッドから毎 tick 呼ぶ。tick の番号を進めてディスパッチャーに知らせ、
+     * 通知のあるマシンだけ [MachineHost] に配る。台数によらない（通知の数にだけ比例する）。
+     */
+    public fun tick() {
+        tickCounter.incrementAndGet()
+        dispatcher.signal()
+        val batch = ArrayList<Machine>()
+        while (true) batch += notifyQueue.poll() ?: break
+        tickVisitedMachines.addAndGet(batch.size.toLong())
+        for (machine in batch) machine.deliverNotifications()
+    }
+
+    /**
+     * 全マシンを一時停止する。実行中のプロセスがなくなったら返す。返した [PauseHandle] の `close()` で再開する。
+     *
+     * 止まるまでの上限は、実行中のプロセスが手持ちの燃料（最大で `fuelPerTick`）を使い切るまで。
+     * 時間内に止まらなければ、一時停止を解いてから [TimeoutException] を投げる（燃料を計測しないプロセスが計算中なら必ずこれになる）。
+     *
+     * @throws IllegalStateException もう一時停止している
+     */
+    @Throws(TimeoutException::class, InterruptedException::class)
+    public fun pauseAll(timeoutMillis: Long): PauseHandle {
+        pauseLock.withLockValue {
+            check(!paused) { "もう一時停止している" }
+            paused = true
+        }
+        val handle = object : PauseHandle {
+            private val done = AtomicBoolean(false)
+
+            override fun close() {
+                if (done.compareAndSet(false, true)) unpause()
+            }
+        }
+        try {
+            pauseLock.lockInterruptibly()
+            try {
+                var remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
+                while (activeCount > 0) {
+                    if (remaining <= 0) throw TimeoutException("${timeoutMillis} ms のうちに止まらなかった（実行中 $activeCount）")
+                    remaining = pauseCondition.awaitNanos(remaining)
+                }
+            } finally {
+                pauseLock.unlock()
+            }
+        } catch (t: Throwable) {
+            handle.close()
+            throw t
+        }
+        return handle
+    }
+
+    private fun unpause() {
+        pauseLock.withLockValue { paused = false }
+        dispatcher.signal()
+    }
+
+    /** 全マシンの `stop()` を呼び、新しいマシンを断り、ディスパッチャーとワーカーを閉じる。待たずに返す */
+    override fun close() {
+        if (closed) return
+        closed = true
+        machines.values.forEach { it.stop() }
+        dispatcher.close()
+        workers.shutdown()
+    }
+
+    /**
+     * プロセスのスレッド・ワーカー・ディスパッチャーがすべて終わるまで待つ。終わったら `true`。
+     *
+     * @throws IllegalStateException カーネルのスレッドから呼んだ（自分を待ってデッドロックするため）
+     */
+    @Throws(InterruptedException::class)
+    public fun awaitTermination(timeoutMillis: Long): Boolean {
+        check(!KernelThread.isCurrent()) { "カーネルのスレッドからは呼べない" }
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
+        fun remainingMillis(): Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(0)
+        for (machine in machines.values.toList()) {
+            if (!machine.awaitTermination(remainingMillis())) return false
+        }
+        for (t in dedicatedThreads.toList()) {
+            t.join(remainingMillis().coerceAtLeast(1))
+            if (t.isAlive) return false
+        }
+        if (!closed) return false
+        dispatcher.thread.join(remainingMillis().coerceAtLeast(1))
+        if (dispatcher.thread.isAlive) return false
+        return workers.awaitTermination(remainingMillis())
+    }
+
+    // ---- カーネルの内部 ----
+
+    internal fun removeMachine(machine: Machine) {
+        machines.remove(machine.id)
+    }
+
+    internal fun enqueueNotify(machine: Machine) {
+        notifyQueue.add(machine)
+    }
+
+    /** ブロッキング型のプロセスの枠を1つ取る。上限なら `false` */
+    internal fun tryReserveBlocking(): Boolean {
+        while (true) {
+            val n = blockingCount.get()
+            if (n >= config.maxBlockingProcesses) return false
+            if (blockingCount.compareAndSet(n, n + 1)) return true
+        }
+    }
+
+    internal fun releaseBlocking() {
+        blockingCount.decrementAndGet()
+    }
+
+    /** 一時停止でなければ、[rt] を実行中に数えて `true`。カーネルロックの中から呼ぶ（このロックは末端） */
+    internal fun tryActivate(rt: ProcessRuntime): Boolean = pauseLock.withLockValue {
+        if (paused) return@withLockValue false
+        if (!rt.active) {
+            rt.active = true
+            activeCount++
+        }
+        true
+    }
+
+    /** [rt] を実行中の数えから外す */
+    internal fun deactivate(rt: ProcessRuntime) {
+        if (!rt.active) return
+        pauseLock.withLockValue {
+            if (!rt.active) return@withLockValue
+            rt.active = false
+            activeCount--
+            if (activeCount == 0) pauseCondition.signalAll()
+        }
+    }
+}
+
+/** テスト用の内部の設定 */
+internal class SchedulerInternals(
+    /** ワーカーのプールの代わりに使う Executor（テストで1本だけのワーカーにする） */
+    val executor: ExecutorService? = null,
+    /** 仕事のないワーカーが終わるまでの時間（仮に 30 秒） */
+    val workerIdleMillis: Long = 30_000,
+)
+
+/** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */
+public fun interface PauseHandle : AutoCloseable {
+    /** 一時停止を解く */
+    override fun close()
+}
+
+/**
+ * [MachineScheduler] の設定。[builder] で作る。値はどれも仮の値（確定は #251）。
+ *
+ * ```java
+ * SchedulerConfig config = SchedulerConfig.builder().maxConcurrentMachines(2).build();
+ * ```
+ */
+public class SchedulerConfig private constructor(builder: Builder) {
+    /** 同時に WASM を実行するマシンの数の上限（仮: CPU のスレッド数の半分。最低 1） */
+    public val maxConcurrentMachines: Int = builder.maxConcurrentMachines
+
+    /** カーネルのスレッド（専用スレッドとワーカー）のスタックの大きさ（仮: 16 MiB）。予約するだけで、使った分しかメモリを取らない */
+    public val threadStackBytes: Long = builder.threadStackBytes
+
+    /** サーバー全体のブロッキング型プロセスの数（= 専用スレッドの数）の上限（仮: 2,048） */
+    public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
+
+    /** [SchedulerConfig] を組み立てる。 */
+    public class Builder internal constructor() {
+        internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+        internal var threadStackBytes: Long = 16L * 1024 * 1024
+        internal var maxBlockingProcesses: Int = 2048
+
+        /** 同時に WASM を実行するマシンの数の上限（1 以上） */
+        public fun maxConcurrentMachines(value: Int): Builder = apply {
+            require(value >= 1) { "maxConcurrentMachines は 1 以上" }
+            maxConcurrentMachines = value
+        }
+
+        /** スレッドのスタックの大きさ（バイト。1 以上） */
+        public fun threadStackBytes(value: Long): Builder = apply {
+            require(value >= 1) { "threadStackBytes は 1 以上" }
+            threadStackBytes = value
+        }
+
+        /** ブロッキング型プロセスの数の上限（0 以上） */
+        public fun maxBlockingProcesses(value: Int): Builder = apply {
+            require(value >= 0) { "maxBlockingProcesses は 0 以上" }
+            maxBlockingProcesses = value
+        }
+
+        /** 設定を作る。 */
+        public fun build(): SchedulerConfig = SchedulerConfig(this)
+    }
+
+    public companion object {
+        /** 既定の設定 */
+        @JvmField
+        public val DEFAULT: SchedulerConfig = Builder().build()
+
+        /** 設定を組み立て始める。 */
+        @JvmStatic
+        public fun builder(): Builder = Builder()
+    }
+}
+
+private inline fun <T> ReentrantLock.withLockValue(block: () -> T): T {
+    lock()
+    try {
+        return block()
+    } finally {
+        unlock()
+    }
+}
