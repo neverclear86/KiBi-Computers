@@ -9,6 +9,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Chicory](https://
 - **仕様と作業の一次情報は GitHub Issues。** 企画書はリポジトリに入っていない。仕様で迷ったら、該当 Issue → 親 Epic → `decision` ラベルの Issue の順に読む。
 - 対応バージョン: Minecraft 1.21.1 / NeoForge（メイン）と 1.20.1 / Forge（#222 配下。今は雛形のみ）。
 - **WASI は p1・p2・p3 に対応し、Component Model も扱う**（#257、Epic #259）。カーネルの土台（fd・イベント待ち・stream）は1つにし、p1・p2・p3 はその上の薄い層にする。独自拡張は WIT（`kibi:*` パッケージ）で定義し、p1 向けには同じ機能を import としても出す。
+- **用語**: コンピューターにつながる周辺機器（画面、ディスクドライブ、レッドストーンI/O など）は「デバイス」（コードは `Device`）と呼ぶ（#271）。「コンポーネント」は WASM の Component Model のものだけを指す。
 - **全バージョンを `main` の1ブランチで扱う**（#16）。バージョンごとのブランチは作らず、`platform-<ローダー>-<MC>` サブプロジェクトを並べる。
 
 ## 構成
