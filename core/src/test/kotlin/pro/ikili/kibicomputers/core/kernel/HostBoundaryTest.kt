@@ -240,6 +240,8 @@ class HostBoundaryTest {
             val m = h.machine()
             val waiting = m.spawnTest(h.program(spinForever()), runDriver())
             eventually { m.state == MachineState.RUNNING }
+            // stop() の割り込みの前のフックは、スレッドが登録されたプロセスにだけ呼ばれる。登録を待ってから止める
+            eventually { m.rt(waiting).thread != null }
             var ran = false
             val pending = m.submitHostCall { ran = true }
             // STOPPING の間に出された呼び出し（stop() の中のフックで、同じスレッドから出す）
