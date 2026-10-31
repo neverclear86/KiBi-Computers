@@ -4,12 +4,12 @@ moddev = "2.0.148"
 
 # Minecraft / ローダー固有のバージョンは各 platform-* の gradle.properties に置く
 
-chicory = "1.7.5"
+endive = "1.2.0"
 junit = "6.1.3"
 
 [libraries]
-chicory-runtime = { module = "com.dylibso.chicory:runtime", version.ref = "chicory" }
-chicory-wasm = { module = "com.dylibso.chicory:wasm", version.ref = "chicory" }
+endive-runtime = { module = "run.endive:runtime", version.ref = "endive" }
+endive-wasm = { module = "run.endive:wasm", version.ref = "endive" }
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }

@@ -98,7 +98,7 @@ dependencies {
     modImplementation("thedarkcolour:kotlinforforge:${prop("kff_version")}")
 
     // MOD ではない外部ライブラリは Jar-in-Jar で同梱する
-    for (lib in listOf(libs.chicory.runtime, libs.chicory.wasm)) {
+    for (lib in listOf(libs.endive.runtime, libs.endive.wasm)) {
         jarJar(lib)
         implementation(lib)
         // 開発環境の実行時クラスパスにも載せる（Kotlin DSL では型安全アクセサが生成されないので文字列で指定）

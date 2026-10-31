@@ -26,8 +26,8 @@ kotlin {
 }
 
 dependencies {
-    api(libs.chicory.runtime)
-    api(libs.chicory.wasm)
+    api(libs.endive.runtime)
+    api(libs.endive.wasm)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)

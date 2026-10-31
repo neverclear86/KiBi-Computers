@@ -4,7 +4,7 @@ AIエージェント（Claude Code など）と人間の開発者向けの作業
 
 ## プロジェクト
 
-KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Chicory](https://github.com/dylibso/chicory)）で動く、OpenComputers 寄りのコンピューター MOD。本体は Kotlin で書き、[Kotlin for Forge](https://github.com/thedarkcolour/KotlinForForge)（KFF）に依存する。
+KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://github.com/bytecodealliance/endive)。Chicory の後継）で動く、OpenComputers 寄りのコンピューター MOD。本体は Kotlin で書き、[Kotlin for Forge](https://github.com/thedarkcolour/KotlinForForge)（KFF）に依存する。
 
 - **仕様と作業の一次情報は GitHub Issues。** 企画書はリポジトリに入っていない。仕様で迷ったら、該当 Issue → 親 Epic → `decision` ラベルの Issue の順に読む。
 - 対応バージョン: Minecraft 1.21.1 / NeoForge（メイン）と 1.20.1 / Forge（#222 配下。今は雛形のみ）。
