@@ -7,6 +7,9 @@ moddev = "2.0.148"
 endive = "1.2.0"
 junit = "6.1.3"
 
+# #26 Endive の性能測定（poc/endive-bench）でだけ使う。MOD には入れない
+jffi = "1.4.3"
+
 # build-logic（WASM のビルド）で使う。Zig 本体のバージョンは gradle/zig.properties
 commons-compress = "1.28.0"
 xz = "1.10"
@@ -15,6 +18,12 @@ xz = "1.10"
 endive-runtime = { module = "run.endive:runtime", version.ref = "endive" }
 endive-wasm = { module = "run.endive:wasm", version.ref = "endive" }
 endive-wasi = { module = "run.endive:wasi", version.ref = "endive" }
+endive-compiler = { module = "run.endive:compiler", version.ref = "endive" }
+endive-build-time-compiler = { module = "run.endive:build-time-compiler", version.ref = "endive" }
+endive-redline-build-time-compiler = { module = "run.endive:redline-build-time-compiler-experimental", version.ref = "endive" }
+endive-redline-runner = { module = "run.endive:redline-runner-experimental", version.ref = "endive" }
+endive-redline-runner-jffi = { module = "run.endive:redline-runner-jffi-experimental", version.ref = "endive" }
+jffi = { module = "com.github.jnr:jffi", version.ref = "jffi" }
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
