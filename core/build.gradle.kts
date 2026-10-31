@@ -5,6 +5,7 @@ import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 plugins {
     `java-library`
     alias(libs.plugins.kotlin.jvm)
+    id("kibicomputers.wasm")
 }
 
 java {
@@ -36,4 +37,19 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+// テスト用の WASM（#9）。zig cc でビルドし、テストのリソースに入れる
+kibiWasm {
+    // WASI を使わない最小のモジュール。ランタイムで実行して結果を確かめる
+    module("fib", sourceSet = "test") {
+        sources.from("src/test/wasm/fib.c")
+        target = "wasm32-freestanding"
+        compilerArgs.addAll("-O2", "-s", "-nostdlib", "-Wl,--no-entry", "-Wl,--export=fib")
+    }
+    // wasi-libc をリンクする WASI p1 のプログラム（lua.wasm などと同じビルドの形）
+    module("hello-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/hello_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }

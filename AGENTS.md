@@ -20,7 +20,9 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `platform-neoforge-1.21.1/` | 1.21.1 / NeoForge の接続層（ブロック、GUI、ネットワークなど）。Java 21 |
 | `platform-forge-1.20.1/` | 1.20.1 / Forge の接続層。Java 17。ModDevGradle の Legacy Forge プラグイン、KFF 4.x |
 | `dev-driver/` | 開発クライアントを外から操作する HTTP の口（MC 非依存の部分）。各接続層の `src/dev/` が MC 側の操作を実装する。開発環境でだけ読み込み、jar には入れない |
+| `build-logic/` | ビルド用の Gradle プラグイン（included build）。`kibicomputers.wasm` は C を `zig cc` で WASM にビルドし、ソースセットのリソースに入れる |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
+| `gradle/zig.properties` | WASM のビルドに使う Zig のバージョンと、配布アーカイブの SHA-256 |
 | `platform-*/gradle.properties` | Minecraft・ローダー・KFF のバージョン |
 | `gradle.properties` | MOD ID、名前、バージョン、グループ |
 
@@ -143,6 +145,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 ## つまずきやすい点
 
+- WASM のビルドに使う Zig は、初回のビルドで Gradle が公式配布から取得し、SHA-256 を確かめて `~/.gradle/kibicomputers/zig/` に置く（ネットワークが要る）。Zig を上げるときは `gradle/zig.properties` のバージョンと全 OS 分のハッシュを書き換える。テスト用の WASM のソースは `core/src/test/wasm/`。
 - `platform-*/build.gradle.kts` でサブプロジェクトの `gradle.properties` を読むときは `property(name)` を使う（`providers.gradleProperty` はルートの値しか読まない）。
 - リポジトリはルート `build.gradle.kts` の `subprojects {}` で宣言している（ModDevGradle がプロジェクト側にリポジトリを足すため、settings 側の宣言は無視される）。
 - 1.20.1（Forge）は 1.21.1 と細部が違う: GameTest の構造物は `data/kibicomputers/structures/`（複数形）に置く。データを読ませるには `pack.mcmeta` が必要。`mods.toml` は `META-INF/mods.toml` で、依存の指定は `mandatory = true`。jar は `reobfJar` で SRG 名に変換される。
