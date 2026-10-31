@@ -103,6 +103,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - `main` から `issue-<番号>-<短い英語名>` のブランチを切り、PR で `main` に入れる。`main` への直接 push と force push はしない。
 - コミットメッセージは英語の命令形（例: `Add VFS path normalization`）。PR の本文と Issue のコメントは日本語。
 - PR 本文に `Closes #<番号>` を書く。Issue の一部だけ済んだときは `Refs #<番号>` にし、済んだ項目を Issue のチェックリストに反映する。
+- **依存のある PR や、1つのタスクを複数の PR に分けるときは、GitHub の Stacked PRs にする**（`gh stack` 拡張。`gh` 2.90 以上）。下の PR のブランチの上に次のブランチを作り、`gh stack submit`（PR がまだないとき）か `gh stack link <下のPR> <上のPR>`（PR が開いているとき）でスタックとして紐づける。下の PR がマージされたら `gh stack sync` で残りを追従させる。base を別の PR のブランチに向けただけの PR は、スタックとは見なされない。
 - 企画書、秘密情報、`run/` 以下の生成物はコミットしない。
 
 ## リリースとバージョン
