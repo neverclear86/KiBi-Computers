@@ -1,0 +1,36 @@
+modLoader = "kotlinforforge"
+loaderVersion = "${kff_version_range}"
+license = "${mod_license}"
+issueTrackerURL = "https://github.com/neverclear86/KiBi-Computers/issues"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${mod_version}"
+displayName = "${mod_name}"
+displayURL = "https://github.com/neverclear86/KiBi-Computers"
+authors = "${mod_authors}"
+description = '''
+WASMで動く、部品を組み立てて作るコンピューターMOD。
+Assemble computers and robots from parts, and program them in Lua, Rust, Zig, C and more via WebAssembly.
+'''
+
+[[dependencies.${mod_id}]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neoforge_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${mod_id}]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${mod_id}]]
+modId = "kotlinforforge"
+type = "required"
+versionRange = "${kff_version_range}"
+ordering = "NONE"
+side = "BOTH"
