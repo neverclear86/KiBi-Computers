@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew *)",
+      "PowerShell(.\\gradlew.bat *)",
+      "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File .claude/skills/run-minecraft/scripts/*)",
+      "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
+      "Bash(git branch*)", "Bash(git switch *)", "Bash(git add *)", "Bash(git mv *)",
+      "Bash(git commit *)", "Bash(git fetch*)", "Bash(git pull --ff-only*)",
+      "Bash(git worktree *)",
+      "Bash(git push -u origin issue-*)", "Bash(git push origin issue-*)",
+      "Bash(gh issue *)", "Bash(gh pr *)", "Bash(gh run *)",
+      "Bash(gh api repos/neverclear86/KiBi-Computers/*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push * --force*)",
+      "Bash(git reset --hard*)", "Bash(gh repo delete*)", "Bash(gh issue delete*)"
+    ]
+  }
+}

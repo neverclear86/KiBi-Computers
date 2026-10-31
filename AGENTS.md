@@ -95,6 +95,29 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - PR 本文に `Closes #<番号>` を書く。Issue の一部だけ済んだときは `Refs #<番号>` にし、済んだ項目を Issue のチェックリストに反映する。
 - 企画書、秘密情報、`run/` 以下の生成物はコミットしない。
 
+## 開発フロー（#242）
+
+保存済みの Claude Code Workflow `issue-to-pr`（`.claude/workflows/issue-to-pr.js`）で回す。
+
+1. 選択: 「依存: #n」が閉じていて、未決の `decision` に左右されない Issue を選ぶ。同時に最大3件（`window`）、同じ area は同時に1件まで。
+2. プラン（システムコールの ABI、保存形式、公開 API に関わる Issue だけ）: プランを Issue に投稿し、レビューを受ける。`decision` で決まっていない設計の選択を含むなら、人の判断を求めて止まる。
+3. 実装ループ: `.worktrees/issue-<番号>` の worktree で、`build` と両バージョンの GameTest が通るまで直し、PR を作る。
+4. CI: 落ちたら最大2回直す。
+5. レビュー: 正しさ・ルール違反のレビュー（公開 API の変更があれば Java 相互運用のレビューも）→ 別のエージェントが指摘を検証 → must を直す。最大2ラウンド。
+6. マージ（`merge: true` のときだけ）: 1件ずつ直列に、main を取り込んだ結果で `build` と GameTest を通してから squash マージする。
+7. 報告: PR に結果をコメントし、worktree を片付ける。
+
+最終確認の段階は置かない（Issue が小さく、機械的な確認は CI が受け持つため）。
+
+| 段階 | モデル |
+| --- | --- |
+| プラン、実装、レビュー、指摘の検証、2回目の修正 | Opus（medium。プランのレビューは high） |
+| 選択、1回目の修正、Java 相互運用レビュー、マージ | Sonnet |
+| CI 待ち、報告 | Haiku |
+
+- `main` はブランチ保護されている（PR 必須、CI の `build` が通らないとマージできない、force push 禁止。管理者も対象）。
+- 自動マージを既定にするかは #242 で決める。それまでは `merge: true` を付けたときだけマージする。
+
 ## つまずきやすい点
 
 - `platform-*/build.gradle.kts` でサブプロジェクトの `gradle.properties` を読むときは `property(name)` を使う（`providers.gradleProperty` はルートの値しか読まない）。

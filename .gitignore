@@ -30,3 +30,6 @@ Thumbs.db
 
 # Claude Code (per-user settings)
 .claude/settings.local.json
+
+# Worktrees made by the issue-to-pr workflow
+.worktrees/
