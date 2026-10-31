@@ -59,10 +59,17 @@ internal class Harness(
     /** 通知の記録（tick() の中で配られたもの） */
     val events: MutableList<Pair<Long, MachineState>> = java.util.Collections.synchronizedList(ArrayList())
 
-    fun machine(fuelPerTick: Long = 100, maxProcesses: Int = 64, host: MachineHost? = null): Machine =
+    fun machine(
+        fuelPerTick: Long = 100,
+        maxProcesses: Int = 64,
+        host: MachineHost? = null,
+        maxHostCallsPerTick: Int = 64,
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+    ): Machine =
         scheduler.createMachine(
             host ?: MachineHost { m, s, _ -> events += m.id to s },
-            MachineConfig.builder().fuelPerTick(fuelPerTick).maxProcesses(maxProcesses).build(),
+            MachineConfig.builder().fuelPerTick(fuelPerTick).maxProcesses(maxProcesses).maxHostCallsPerTick(maxHostCallsPerTick).build(),
+            environment,
         )
 
     /** Fake のモジュールを読み込んだ [Program] にする */

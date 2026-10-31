@@ -13,7 +13,7 @@
 - スレッドは WASM のスタックがあるあいだだけ持つ。ブロッキング型は専用スレッド（サーバー全体の上限あり）、待機点型は共有のワーカーで step を動かし、待機点と step の境目ではスレッドを持たない
 - 燃料の正はマシンの `KernelState.fuel`。CPU を取るときに遅延補充し（tick ごとに配るのと同じ値の閉じた式）、`tick()` は台数によらない
 - 停止は `Thread.interrupt` に頼る。割り込みはスレッドの登録をカーネルロックの中で確かめてから、同じロックの中で送る
-- `core.kernel` で `public` にするのは接続層が使う `MachineScheduler`・`SchedulerConfig`・`PauseHandle`・`Machine`・`MachineConfig`・`MachineState`・`MachineHost` だけ。`pro.ikili.kibicomputers.api` には何も足さない
+- `core.kernel` で `public` にするのは接続層が使う `MachineScheduler`・`SchedulerConfig`・`PauseHandle`・`Machine`・`MachineConfig`・`MachineState`・`MachineHost` だけ（#44 で `MachineEnvironment`・`MachineClock`・`EntropySource`・`DiskResolver` を足した。ADR 0044）。`pro.ikili.kibicomputers.api` には何も足さない
 
 ## 構造
 
@@ -99,6 +99,8 @@ ADR 0027 は「実行中のコンピューター1台に1スレッド」だった
 送るのも外すのも同じロックの中なので、割り込みはそのプロセスの step の中でしか効かず、別のマシンの step に持ち越されない（`ThreadPoolExecutor` が仕事の始めに印を消す処理には頼らない）。WASM が終わった後・登録を外す前に届いた割り込みは、登録を外す同じロックの中で停止の印を見て `KILLED` にする。
 
 ## MC 側との境界（#44 の前提）
+
+#44 で足したもの（環境、コンソール出力・ビープ、メインスレッドでのホスト呼び出し、デバイスの変化の知らせ）は ADR 0044 に書いた。
 
 - 接続層 → カーネル: `tick()`（毎 tick）、`createMachine`、`Machine.stop()`・`close()`、`pauseAll()`、`awaitTermination`
 - カーネル → 接続層: `MachineHost.onStateChanged`。`tick()` の中でメインスレッドから、ロック・CPU・許可を持たずに呼ぶ。状態の変化はマシンごとの通知の列に積み、通知のあるマシンだけを `tick()` が配る

@@ -39,6 +39,7 @@ public class MachineScheduler internal constructor(
     private val machines = ConcurrentHashMap<Long, Machine>()
     private val nextMachineId = AtomicLong(1)
     private val notifyQueue = ConcurrentLinkedQueue<Machine>()
+    private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
     private val blockingCount = AtomicInteger()
 
     /** ブロッキング型の専用スレッド（終わるのを待つため） */
@@ -84,10 +85,22 @@ public class MachineScheduler internal constructor(
     /** ブロッキング型のプロセスの数 */
     internal val blockingProcesses: Int get() = blockingCount.get()
 
-    /** マシンを作る（まだ何も動かない。起動は #49）。[close] の後は [IllegalStateException] */
-    public fun createMachine(host: MachineHost, config: MachineConfig): Machine {
+    /**
+     * マシンを作る（まだ何も動かない。起動は #49）。
+     *
+     * @param host カーネルからの通知を受ける口
+     * @param config マシンの設定
+     * @param environment 時計・乱数・ディスク・保存先（#44）
+     * @throws IllegalStateException [close] の後
+     */
+    @JvmOverloads
+    public fun createMachine(
+        host: MachineHost,
+        config: MachineConfig,
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+    ): Machine {
         check(!closed) { "スケジューラは閉じている" }
-        val machine = Machine(this, nextMachineId.getAndIncrement(), host, config)
+        val machine = Machine(this, nextMachineId.getAndIncrement(), host, config, environment)
         machines[machine.id] = machine
         if (closed) {
             machines.remove(machine.id)
@@ -98,7 +111,9 @@ public class MachineScheduler internal constructor(
 
     /**
      * メインスレッドから毎 tick 呼ぶ。tick の番号を進めてディスパッチャーに知らせ、
-     * 通知のあるマシンだけ [MachineHost] に配る。台数によらない（通知の数にだけ比例する）。
+     * 通知のあるマシンだけ [MachineHost] に配る。続けて、ホスト呼び出し（ワールド操作など）を待つマシンだけ、
+     * その呼び出しをこのスレッドで実行する（1台あたり [MachineConfig.maxHostCallsPerTick] まで。残りは次の tick）。
+     * 台数によらない（通知と呼び出しの数にだけ比例する）。
      */
     public fun tick() {
         tickCounter.incrementAndGet()
@@ -107,6 +122,13 @@ public class MachineScheduler internal constructor(
         while (true) batch += notifyQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
         for (machine in batch) machine.deliverNotifications()
+        batch.clear()
+        while (true) batch += hostCallQueue.poll() ?: break
+        tickVisitedMachines.addAndGet(batch.size.toLong())
+        for (machine in batch) {
+            // 残ったマシンは次の tick へ（この tick の中では入れ直さない）
+            if (machine.runHostCalls()) hostCallQueue.add(machine)
+        }
     }
 
     /**
@@ -193,6 +215,10 @@ public class MachineScheduler internal constructor(
 
     internal fun enqueueNotify(machine: Machine) {
         notifyQueue.add(machine)
+    }
+
+    internal fun enqueueHostCalls(machine: Machine) {
+        hostCallQueue.add(machine)
     }
 
     /** ブロッキング型のプロセスの枠を1つ取る。上限なら `false` */

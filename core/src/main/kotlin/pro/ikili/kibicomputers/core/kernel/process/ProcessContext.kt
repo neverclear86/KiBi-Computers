@@ -1,6 +1,9 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
+import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
@@ -74,6 +77,25 @@ internal interface ProcessContext {
 
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)
+
+    // ---- 接続層との境界（#44） ----
+
+    /** マシンが動く環境（時計、乱数、ディスク、保存先）。どのスレッドから使ってもよい */
+    val environment: MachineEnvironment
+
+    /**
+     * [call] を次の `tick()` の中でメインスレッドから実行し、その結果を待つ（[awaitHost] と同じく、待つ間は CPU と許可を返す）。
+     * ワールド・デバイスに触る処理はこれで行う。[call] の例外は、CPU を取り直してから投げる。
+     * マシンを止めたときは [ProcessKilledException]（実行していない呼び出しは実行しない）
+     */
+    @Throws(ProcessKilledException::class)
+    fun <T> callOnMainThread(call: HostCall<T>): T
+
+    /** コンソール（画面）へ出力する（[MachineHost.onConsoleOutput]）。上限を超えて捨てた分があれば `false` */
+    fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean
+
+    /** ビープを鳴らす（[MachineHost.onBeep]）。捨てたら `false` */
+    fun beep(frequencyHz: Int, durationMillis: Int): Boolean
 }
 
 /** 作っている途中の記録（実行時だけ。[ProcessRuntime.loading]） */
