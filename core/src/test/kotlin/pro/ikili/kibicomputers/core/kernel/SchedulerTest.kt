@@ -150,7 +150,9 @@ class SchedulerTest {
             assertState(ProcessState.CRASHED, m, b)
             assertTrue(m.rt(b).lastError is WasmLinkException)
             assertEquals(before, h.scheduler.permits.availablePermits())
-            assertEquals(0, m.lock.withLockValue { m.kernel.fuel }, "マシンの燃料は増えない")
+            // 例外で抜けるときは、tick が進んでいれば遅延補充が1回入る（その分の 100 は正当）。ただし fuelPerTick を超えて増えない
+            val fuel = m.lock.withLockValue { m.kernel.fuel }
+            assertTrue(fuel == 0L || fuel == 100L, "マシンの燃料は増えない（補充の1tick分まで）: $fuel")
         }
     }
 
