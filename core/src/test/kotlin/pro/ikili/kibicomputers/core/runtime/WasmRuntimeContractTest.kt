@@ -260,4 +260,13 @@ abstract class WasmRuntimeContractTest {
             }
         }
     }
+
+    @Test
+    fun `閉じたインスタンスは呼べず2回閉じてもよい`() {
+        val instance = instantiate(TestModules.ADD)
+        assertEquals(3L, instance.call("add", 1, 2)[0])
+        instance.close()
+        assertThrows<IllegalStateException> { instance.call("add", 1, 2) }
+        instance.close()
+    }
 }

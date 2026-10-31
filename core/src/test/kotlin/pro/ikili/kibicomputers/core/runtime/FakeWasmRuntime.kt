@@ -131,13 +131,18 @@ internal class FakeInstance(override val module: FakeModule, private val config:
 
     fun run(function: FakeFunction, args: LongArray): LongArray = function.run(FakeContext(this), args)
 
+    private var closed = false
+
     override fun call(name: String, vararg args: Long): LongArray {
+        check(!closed) { "閉じたインスタンス" }
         val (type, function) = requireNotNull(module.functions[name]) { "関数 $name は export されていない" }
         require(args.size == type.params.size) { "関数 $name の引数は ${type.params.size} 個（${args.size} 個渡された）" }
         return run(function, args)
     }
 
-    override fun close() {}
+    override fun close() {
+        closed = true
+    }
 }
 
 /** ByteArray のメモリ。上限は 16 ページ。 */

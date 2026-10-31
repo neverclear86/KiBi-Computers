@@ -73,12 +73,13 @@ public interface WasmInstance : AutoCloseable {
      * ホストの関数（[WasmHostFunction]）や燃料切れの処理（[WasmFuelHandler]）が投げた例外は、包まずにそのまま外に出る。
      *
      * @throws IllegalArgumentException その名前の関数が export されていない
+     * @throws IllegalStateException インスタンスを閉じた後に呼んだ
      * @throws WasmTrapException 実行がトラップした
      */
     @Throws(WasmTrapException::class)
     public fun call(name: String, vararg args: Long): LongArray
 
-    /** インスタンスを捨てる。以後は使えない。 */
+    /** インスタンスを捨てる。以後 [call] は [IllegalStateException] になる。2回呼んでもよい。 */
     override fun close()
 }
 
