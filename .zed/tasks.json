@@ -1,0 +1,89 @@
+// Zed のタスク（コマンドパレットの「task: spawn」から実行する）。
+// ./gradlew は PowerShell では gradlew.bat、bash などでは gradlew として動く。
+[
+  {
+    "label": "ビルドと単体テスト",
+    "command": "./gradlew",
+    "args": ["build"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "core の単体テスト",
+    "command": "./gradlew",
+    "args": [":core:test"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "GameTest（両バージョン）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runGameTestServer", ":platform-forge-1.20.1:runGameTestServer"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "GameTest（1.21.1 NeoForge）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runGameTestServer"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "GameTest（1.20.1 Forge）",
+    "command": "./gradlew",
+    "args": [":platform-forge-1.20.1:runGameTestServer"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "クライアント起動（1.21.1 NeoForge）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runClient"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "クライアント起動（1.20.1 Forge）",
+    "command": "./gradlew",
+    "args": [":platform-forge-1.20.1:runClient"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    // ポート 5005 でデバッガの接続を待ってから起動する（IntelliJ の「Remote JVM Debug」などで接続する）
+    "label": "クライアント起動・デバッガ待ち（1.21.1 NeoForge）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runClient", "--debug-jvm"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "クライアント起動・デバッガ待ち（1.20.1 Forge）",
+    "command": "./gradlew",
+    "args": [":platform-forge-1.20.1:runClient", "--debug-jvm"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "サーバー起動（1.21.1 NeoForge）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runServer"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "サーバー起動（1.20.1 Forge）",
+    "command": "./gradlew",
+    "args": [":platform-forge-1.20.1:runServer"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "データ生成（1.21.1 NeoForge）",
+    "command": "./gradlew",
+    "args": [":platform-neoforge-1.21.1:runData"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "jar を作る（両バージョン）",
+    "command": "./gradlew",
+    "args": ["assemble"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  }
+]

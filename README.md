@@ -43,6 +43,11 @@ JDK 21 と JDK 17 が必要です。見つからない場合は Gradle が自動
 ./gradlew :platform-neoforge-1.21.1:runClient
 ```
 
+### エディタ / Editors
+
+- **IntelliJ IDEA**（無料版で十分）: このフォルダを Gradle プロジェクトとして開くと、`runClient` などの実行構成が自動で作られる。Minecraft 本体のコードを読む・デバッガを使うときに向いている。
+- **Zed**: `.zed/tasks.json` に、ビルド・テスト・GameTest・各バージョンのクライアント／サーバー起動などのタスクがある（コマンドパレットの `task: spawn`）。「デバッガ待ち」のタスクはポート 5005 で接続を待つので、IntelliJ の Remote JVM Debug などから接続する。
+
 ## 開発の進め方 / Development
 
 タスクと決めるべきことは [Issues](https://github.com/neverclear86/KiBi-Computers/issues) で管理しています。機能ごとの Epic（`epic` ラベル）の下に、1タスク単位のサブ issue があります。
