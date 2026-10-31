@@ -7,6 +7,7 @@ import pro.ikili.kibicomputers.neoforge.client.KiBiClient
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.loading.FMLEnvironment
 import org.slf4j.Logger
@@ -23,6 +24,7 @@ object KiBiComputersNeoForge {
             .onSuccess { LOGGER.info("WASM runtime self-check passed (1 + 2 = {})", it) }
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
         KiBiBlocks.register(MOD_BUS)
+        KiBiMenus.register(MOD_BUS)
         ScreenSync.register(MOD_BUS)
         ServerMachines.register()
         // クライアントのクラスは、クライアントでだけ読み込む

@@ -1,0 +1,19 @@
+{
+  "variants": {
+    "facing=north": {
+      "model": "kibicomputers:block/case_3"
+    },
+    "facing=east": {
+      "model": "kibicomputers:block/case_3",
+      "y": 90
+    },
+    "facing=south": {
+      "model": "kibicomputers:block/case_3",
+      "y": 180
+    },
+    "facing=west": {
+      "model": "kibicomputers:block/case_3",
+      "y": 270
+    }
+  }
+}
