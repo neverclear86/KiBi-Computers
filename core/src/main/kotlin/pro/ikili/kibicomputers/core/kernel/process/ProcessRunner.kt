@@ -1,7 +1,9 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.ThreadWaiter
@@ -649,6 +651,19 @@ internal class ProcessRunner(private val machine: Machine) {
             @Suppress("UNCHECKED_CAST")
             return value as T
         }
+
+        override val environment: MachineEnvironment get() = machine.environment
+
+        override fun <T> callOnMainThread(call: HostCall<T>): T {
+            checkThread()
+            // 止められたプロセスは、メインスレッドでの処理を出さない（マシンが STOPPED に戻った後でも）
+            if (lock.withLockValue { rt.killed }) throw ProcessKilledException()
+            return awaitHost(machine.submitHostCall(call))
+        }
+
+        override fun writeConsole(bytes: ByteArray, offset: Int, length: Int): Boolean = machine.writeConsole(bytes, offset, length)
+
+        override fun beep(frequencyHz: Int, durationMillis: Int): Boolean = machine.beep(frequencyHz, durationMillis)
 
         override fun chargeFuel(amount: Long) {
             if (rt.process.unmetered) return

@@ -11,9 +11,13 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
 /** マシンの状態 */
@@ -31,17 +35,6 @@ public enum class MachineState {
     CRASHED,
 }
 
-/** カーネル → 接続層の口。#44 で足していく。 */
-public fun interface MachineHost {
-    /**
-     * マシンの状態が変わった。[MachineScheduler.tick] の中で、メインスレッドから呼ばれる。
-     * 呼ばれるとき、カーネルはロックも CPU も許可も持っていない。中から `stop()`・`close()`・`createMachine` を呼んでよい。
-     *
-     * @param cause [MachineState.CRASHED] になったときの原因。それ以外は `null`
-     */
-    public fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?)
-}
-
 /**
  * マシンの設定。[builder] で作る。値はどれも仮の値（確定は #47・#251）。
  */
@@ -52,10 +45,14 @@ public class MachineConfig private constructor(builder: Builder) {
     /** 終わっていないプロセスの数の上限（仮: 64） */
     public val maxProcesses: Int = builder.maxProcesses
 
+    /** 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ */
+    public val maxHostCallsPerTick: Int = builder.maxHostCallsPerTick
+
     /** [MachineConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var fuelPerTick: Long = 1_000_000
         internal var maxProcesses: Int = 64
+        internal var maxHostCallsPerTick: Int = 64
 
         /** 1 tick に配る燃料（1 以上） */
         public fun fuelPerTick(value: Long): Builder = apply {
@@ -67,6 +64,12 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun maxProcesses(value: Int): Builder = apply {
             require(value >= 1) { "maxProcesses は 1 以上" }
             maxProcesses = value
+        }
+
+        /** 1 tick に実行するホスト呼び出しの数の上限（1 以上） */
+        public fun maxHostCallsPerTick(value: Int): Builder = apply {
+            require(value >= 1) { "maxHostCallsPerTick は 1 以上" }
+            maxHostCallsPerTick = value
         }
 
         /** 設定を作る。 */
@@ -96,6 +99,8 @@ public class Machine internal constructor(
     internal val host: MachineHost,
     /** 設定 */
     public val config: MachineConfig,
+    /** 動く環境（時計、乱数、ディスク、保存先。#44） */
+    public val environment: MachineEnvironment,
 ) : AutoCloseable {
     /** カーネルロック。持ったまま待たない・WASM を呼ばない・[MachineHost] を呼ばない */
     internal val lock = ReentrantLock()
@@ -127,8 +132,23 @@ public class Machine internal constructor(
 
     private val terminated = lock.newCondition()
 
-    private val notifications = ConcurrentLinkedQueue<Pair<MachineState, Throwable?>>()
+    private val notifications = ConcurrentLinkedQueue<HostNotification>()
     private val queuedForNotify = AtomicBoolean(false)
+
+    /** 配っていないコンソール出力のバイト数と、ビープの数（上限を超えた分は捨てる） */
+    private val pendingConsoleBytes = AtomicLong()
+    private val pendingBeeps = AtomicInteger()
+
+    /** 捨てたコンソール出力のバイト数・ビープの数（数え口） */
+    internal val droppedConsoleBytes = AtomicLong()
+    internal val droppedBeeps = AtomicLong()
+
+    /** メインスレッドで実行するのを待つホスト呼び出し（カーネルロック） */
+    private val hostCalls = ArrayDeque<PendingHostCall<*>>()
+    private val queuedForHostCalls = AtomicBoolean(false)
+
+    /** つながっているデバイスが変わった回数（実行時だけ。#63・#65 がイベントにする） */
+    private val devicesGenerationCounter = AtomicLong()
 
     /** 状態 */
     public val state: MachineState get() = stateValue
@@ -176,6 +196,15 @@ public class Machine internal constructor(
             if (t.isAlive) return false
         }
         return true
+    }
+
+    /**
+     * つながっているデバイスが変わった（つながった・外れた）ことを知らせる（接続層 → カーネル）。
+     * どのスレッドから呼んでもよい。待たずに返す。何が変わったかは、カーネルがホスト呼び出しで接続層に尋ねる
+     * （デバイスの識別子と呼び出し方は #65。イベントとしてプロセスに届けるのは #63）
+     */
+    public fun notifyDevicesChanged() {
+        devicesGenerationCounter.incrementAndGet()
     }
 
     /** `stop()` してスケジューラから外す。待たずに返す */
@@ -271,6 +300,7 @@ public class Machine internal constructor(
             }
             // スレッドがまだ登録されていないブロッキング型は、登録のときに印を見て終わる
         }
+        cancelHostCallsLocked()
         checkAllDoneLocked()
     }
 
@@ -367,22 +397,188 @@ public class Machine internal constructor(
     private fun setStateLocked(state: MachineState, cause: Throwable?) {
         if (stateValue == state) return
         stateValue = state
-        notifications.add(state to cause)
+        postNotification(HostNotification.StateChanged(state, cause))
+    }
+
+    private fun postNotification(n: HostNotification) {
+        notifications.add(n)
         if (queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
     }
 
-    /** `tick()` の中で、メインスレッドから通知を配る（ロックの外） */
+    // ---- カーネル → 接続層（#44） ----
+
+    /** つながっているデバイスが変わった回数 */
+    internal val devicesGeneration: Long get() = devicesGenerationCounter.get()
+
+    /**
+     * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
+     * 配っていない分が [MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
+     * 書き手を待たせる流量の制御は、ABI 層が `ByteStream` で行う（#58・#60）
+     */
+    internal fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean {
+        require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
+        if (length == 0) return true
+        var accepted: Int
+        while (true) {
+            val pending = pendingConsoleBytes.get()
+            accepted = (MAX_PENDING_CONSOLE_BYTES - pending).coerceIn(0, length.toLong()).toInt()
+            if (accepted == 0 || pendingConsoleBytes.compareAndSet(pending, pending + accepted)) break
+        }
+        if (accepted < length) droppedConsoleBytes.addAndGet((length - accepted).toLong())
+        if (accepted > 0) postNotification(HostNotification.Console(bytes.copyOfRange(offset, offset + accepted)))
+        return accepted == length
+    }
+
+    /**
+     * ビープを鳴らす（次の `tick()` で [MachineHost.onBeep] に渡す）。値は範囲に丸める。どのスレッドから呼んでもよい。
+     * 配っていないビープが [MAX_PENDING_BEEPS] あるなら捨てて `false`
+     */
+    internal fun beep(frequencyHz: Int, durationMillis: Int): Boolean {
+        while (true) {
+            val n = pendingBeeps.get()
+            if (n >= MAX_PENDING_BEEPS) {
+                droppedBeeps.incrementAndGet()
+                return false
+            }
+            if (pendingBeeps.compareAndSet(n, n + 1)) break
+        }
+        postNotification(
+            HostNotification.Beep(
+                frequencyHz.coerceIn(MIN_BEEP_FREQUENCY_HZ, MAX_BEEP_FREQUENCY_HZ),
+                durationMillis.coerceIn(1, MAX_BEEP_DURATION_MILLIS),
+            ),
+        )
+        return true
+    }
+
+    /** `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる */
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
+        var console: ByteArrayOutputStream? = null
         while (true) {
-            val (state, cause) = notifications.poll() ?: break
-            try {
-                host.onStateChanged(this, state, cause)
-            } catch (t: Throwable) {
-                // 接続層の例外はほかのマシンに伝えない
+            val n = notifications.poll() ?: break
+            if (n is HostNotification.Console) {
+                pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
+                val out = console ?: ByteArrayOutputStream().also { console = it }
+                out.write(n.bytes, 0, n.bytes.size)
+                continue
+            }
+            console?.let { out ->
+                console = null
+                safely { host.onConsoleOutput(this, out.toByteArray()) }
+            }
+            when (n) {
+                is HostNotification.StateChanged -> safely { host.onStateChanged(this, n.state, n.cause) }
+                is HostNotification.Beep -> {
+                    pendingBeeps.decrementAndGet()
+                    safely { host.onBeep(this, n.frequencyHz, n.durationMillis) }
+                }
+                is HostNotification.Console -> Unit
             }
         }
+        console?.let { out -> safely { host.onConsoleOutput(this, out.toByteArray()) } }
     }
+
+    private inline fun safely(block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            // 接続層の例外はほかのマシン・後の通知に伝えない
+        }
+    }
+
+    // ---- メインスレッドでのホスト呼び出し（#44） ----
+
+    /**
+     * [call] を次の `tick()` の中でメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
+     * 残りは次の tick へ、出した順に）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
+     * マシンが止めている途中・止まった（CRASHED）とき、スケジューラが閉じているときは、[ProcessKilledException] で終えた future を返す。
+     * 実行する前にマシンを止めたときも、同じ例外で終える（実行しない）
+     */
+    internal fun <T> submitHostCall(call: HostCall<T>): CompletableFuture<T> {
+        val future = CompletableFuture<T>()
+        lock.lock()
+        try {
+            if (stateValue == MachineState.STOPPING || stateValue == MachineState.CRASHED || scheduler.isClosed) {
+                future.completeExceptionally(ProcessKilledException())
+                return future
+            }
+            hostCalls.addLast(PendingHostCall(call, future))
+        } finally {
+            lock.unlock()
+        }
+        if (queuedForHostCalls.compareAndSet(false, true)) scheduler.enqueueHostCalls(this)
+        return future
+    }
+
+    /** `tick()` の中で、メインスレッドからホスト呼び出しを実行する（ロックの外）。まだ残っていれば `true` */
+    internal fun runHostCalls(): Boolean {
+        var ran = 0
+        while (ran < config.maxHostCallsPerTick) {
+            val pending = lock.withLockValue { hostCalls.removeFirstOrNull() } ?: break
+            ran++
+            pending.run()
+        }
+        return lock.withLockValue {
+            val remains = hostCalls.isNotEmpty()
+            // 空だと確かめたのと同じロックの中で印を下ろす（submitHostCall の追加と取り違えない）
+            if (!remains) queuedForHostCalls.set(false)
+            remains
+        }
+    }
+
+    /** 実行を待つホスト呼び出しの数（テスト用） */
+    internal val pendingHostCalls: Int get() = lock.withLockValue { hostCalls.size }
+
+    private fun cancelHostCallsLocked() {
+        while (true) {
+            val pending = hostCalls.removeFirstOrNull() ?: break
+            // future に後続の処理はつながっていない（待つのはプロセスのスレッドの get() だけ）ので、ロックの中で終えてよい
+            pending.future.completeExceptionally(ProcessKilledException())
+        }
+    }
+
+    public companion object {
+        /** ビープの周波数の下限（Hz） */
+        public const val MIN_BEEP_FREQUENCY_HZ: Int = 20
+
+        /** ビープの周波数の上限（Hz） */
+        public const val MAX_BEEP_FREQUENCY_HZ: Int = 20_000
+
+        /** ビープの長さの上限（ミリ秒。仮の値） */
+        public const val MAX_BEEP_DURATION_MILLIS: Int = 5_000
+
+        /** 配っていないコンソール出力の上限（バイト。仮の値） */
+        internal const val MAX_PENDING_CONSOLE_BYTES: Long = 64L * 1024
+
+        /** 配っていないビープの上限（仮の値） */
+        internal const val MAX_PENDING_BEEPS: Int = 8
+    }
+}
+
+/** メインスレッドで実行する処理（ワールド操作、デバイスの呼び出しなど）。[Machine.submitHostCall] に渡す */
+internal fun interface HostCall<T> {
+    fun run(): T
+}
+
+private class PendingHostCall<T>(val call: HostCall<T>, val future: CompletableFuture<T>) {
+    fun run() {
+        if (future.isDone) return
+        try {
+            future.complete(call.run())
+        } catch (t: Throwable) {
+            future.completeExceptionally(t)
+        }
+    }
+}
+
+/** マシンごとの通知の列の要素 */
+private sealed class HostNotification {
+    class StateChanged(val state: MachineState, val cause: Throwable?) : HostNotification()
+
+    class Console(val bytes: ByteArray) : HostNotification()
+
+    class Beep(val frequencyHz: Int, val durationMillis: Int) : HostNotification()
 }
 
 private inline fun <T> ReentrantLock.withLockValue(block: () -> T): T {
