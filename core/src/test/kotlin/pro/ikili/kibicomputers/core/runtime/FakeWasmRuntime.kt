@@ -31,8 +31,23 @@ class FakeContext internal constructor(private val instance: FakeInstance) {
     /** import した関数を呼ぶ（ホストの関数の例外はそのまま出る）。 */
     fun callImport(module: String, name: String, vararg args: Long): LongArray = instance.callImport(module, name, args)
 
-    /** 命令を [count] 個実行したことにして、燃料を減らす。計測しないモジュールでは何もしない。 */
+    /**
+     * 命令を [count] 個実行したことにして、燃料を減らす。計測しないモジュールでは燃料は減らさない。
+     * Endive をまねて、スレッドが割り込まれていれば [WasmTrapKind.INTERRUPTED] のトラップを投げる。
+     */
     fun step(count: Long = 1) = instance.step(count)
+
+    /**
+     * 挿入されたコードのまね（ADR 0028 のローカル）: 残りをローカル変数に写して命令を [count] 個実行し、最後にグローバルへ書き戻す。
+     * 燃料切れの処理には、ローカルの残りを渡す（グローバルは古いまま）。[trapAtEnd] なら、書き戻さずにトラップする。
+     */
+    fun spinLocal(count: Long, trapAtEnd: Boolean = false) = instance.spinLocal(count, trapAtEnd)
+
+    /** 燃料切れの処理を、グローバルに触れずに直接呼ぶ（残り [remaining]）。戻り値は新しい残り */
+    fun callFuelHandler(remaining: Long): Long = instance.callFuelHandler(remaining)
+
+    /** このインスタンス */
+    val self: WasmInstance get() = instance
 
     /** WASM の中からメモリを読む。範囲外はトラップ。 */
     fun loadU8(address: Int): Int = try {
@@ -98,6 +113,7 @@ class FakeModule private constructor(
 }
 
 internal class FakeInstance(override val module: FakeModule, private val config: WasmInstanceConfig) : WasmInstance {
+    @Volatile
     private var fuelValue: Long = 0
 
     override val memory: WasmMemory? = module.memoryPages?.let { pages ->
@@ -114,13 +130,35 @@ internal class FakeInstance(override val module: FakeModule, private val config:
             fuelValue = value
         }
 
+    private fun checkInterrupt() {
+        if (Thread.currentThread().isInterrupted) throw WasmTrapException(WasmTrapKind.INTERRUPTED, "ダミー: 割り込まれた")
+    }
+
     fun step(count: Long) {
+        checkInterrupt()
         if (!module.isFuelMetered) return
         fuelValue -= count
         if (fuelValue < 0) {
             val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
             fuelValue = handler.onFuelExhausted(this, fuelValue)
         }
+    }
+
+    fun spinLocal(count: Long, trapAtEnd: Boolean) {
+        var local = if (module.isFuelMetered) fuelValue else 0
+        for (i in 0 until count) {
+            checkInterrupt()
+            if (!module.isFuelMetered) continue
+            local -= 1
+            if (local < 0) local = callFuelHandler(local)
+        }
+        if (trapAtEnd) throw WasmTrapException(WasmTrapKind.UNREACHABLE, "ダミー: 書き戻さずにトラップ")
+        if (module.isFuelMetered) fuelValue = local
+    }
+
+    fun callFuelHandler(remaining: Long): Long {
+        val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
+        return handler.onFuelExhausted(this, remaining)
     }
 
     fun callImport(moduleName: String, name: String, args: LongArray): LongArray {
