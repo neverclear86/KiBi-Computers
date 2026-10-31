@@ -20,6 +20,17 @@ dependencies {
     // 検証（wasm-tools validate）を使う場合の依存の大きさも測る
     implementation(project(":cm-wasm-tools"))
     implementation("com.fasterxml.jackson.core:jackson-databind:2.22.4")
+    // #28 で決めた燃料の計測（コードの挿入）がコンポーネントの中で使えるか
+    implementation(libs.endive.compiler)
+}
+
+// #28 の PoC の挿入処理（FuelInjector）をそのまま使う
+val copyFuelInjector by tasks.registering(Copy::class) {
+    from("../../fuel-metering/src/main/kotlin/pro/ikili/kibicomputers/poc/fuel/FuelInjector.kt")
+    into(layout.buildDirectory.dir("fuel-src/pro/ikili/kibicomputers/poc/fuel"))
+}
+kotlin.sourceSets.main {
+    kotlin.srcDir(copyFuelInjector.map { layout.buildDirectory.dir("fuel-src").get() })
 }
 
 application {

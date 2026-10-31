@@ -9,6 +9,10 @@ import run.endive.cm.tools.ComponentValidate
 import run.endive.cm.tools.ComponentValidateException
 import run.endive.cm.types.WasmComponent
 import run.endive.cm.wasi.p2.WasiPreview2
+import run.endive.compiler.InterpreterFallback
+import run.endive.compiler.MachineFactoryCompiler
+import run.endive.cm.runtime.ComponentLinker
+import pro.ikili.kibicomputers.poc.fuel.FuelInjector
 import run.endive.runtime.Instance
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -20,10 +24,12 @@ import java.util.concurrent.atomic.AtomicLong
 //
 // 1. Java 17 で動くか
 // 2. 実際のツールチェーン（Rust wasm32-wasip2）のコンポーネントが動くか、その時間
-// 3. 燃料計測: コアインスタンスの Builder を差し替えて、命令数を数えられるか・上限で止められるか
+// 3. 燃料計測: コアインスタンスの Builder を差し替えて命令数を数えられるか・上限で止められるか。
+//    #28 で決めた計測コードの挿入がコンポーネントの中で使えるか。ランタイムコンパイラ（#29）で動くか
 // 4. 中断: スレッド割り込みで、待機中（wasi:io/poll）のゲストを止められるか
 // 5. 状態の取り出し: 実行後にコアインスタンスの線形メモリに手が届くか
-// 6. 依存の大きさ
+// 6. 非同期（p3 の土台になる canon: async lift、task.return、stream、waitable-set）に対応しているか
+// 7. 依存の大きさ
 
 private const val SPEC = ".rs.json"
 
@@ -75,16 +81,24 @@ fun main() {
     }
     println("上限 $limit 命令で実行: ${describe(stopped)}")
 
-    // 命令ごとのコールバックの重さ（types.rs は計算が多め）
-    val types = parse(ComponentCorpus.readBytes("types.rs.wasm"), validate = false)
-    val plain = median { run(types, ComponentStore()) }
-    val listened = median {
-        val n = AtomicLong()
-        run(types, ComponentStore.withCoreInstances { m ->
-            Instance.builder(m).withUnsafeExecutionListener { _, _ -> n.incrementAndGet() }
+    // 燃料は #28 で「読み込み時に WASM へ計測コードを挿入する」（A）に決まっている。
+    // コンポーネントの中のコアモジュールに挿入して動かせるか
+    val injected = rewriteCoreModules(ComponentCorpus.readBytes("hello-stdout.rs.wasm")) {
+        FuelInjector.inject(it).bytes
+    }
+    val injectedRun = runCatching { run(parse(injected, validate = false), ComponentStore()) }
+    println("計測コードを挿入したコンポーネント（kibi.fuel の import が増える）: ${describe(injectedRun)}")
+
+    println()
+    println("== 3b. ランタイムコンパイラ（#29 の決定）でコアモジュールを動かす")
+    val compiledRun = runCatching {
+        run(hello, ComponentStore.withCoreInstances { m ->
+            Instance.builder(MachineFactoryCompiler.builder(m).withInterpreterFallback(InterpreterFallback.WARN).compileModule())
         })
     }
-    println("types.rs 実行時間の中央値: リスナーなし=%.2fms あり=%.2fms".format(plain, listened))
+    println("hello-stdout をコンパイラで実行: ${describe(compiledRun)}")
+    val interpMs = median { run(hello, ComponentStore()) }
+    println("hello-stdout 実行時間の中央値（インタプリタ）: %.2fms".format(interpMs))
 
     println()
     println("== 4. 中断（待機中のゲストへのスレッド割り込み）")
@@ -116,7 +130,20 @@ fun main() {
     }
 
     println()
-    println("== 6. 依存の大きさ（実行時クラスパスの jar）")
+    println("== 6. 非同期（WASI p3 の土台）: canon の対応状況")
+    for ((label, wat) in AsyncProbes.all) {
+        val result = runCatching {
+            val component = parse(Wat.toWasm(wat), validate = false)
+            ComponentStore().use { store ->
+                val instance = ComponentLinker.builder().build().instantiate(store, component)
+                instance.export("run").apply().toList()
+            }
+        }
+        println("%-28s %s".format(label, describe(result)))
+    }
+
+    println()
+    println("== 7. 依存の大きさ（実行時クラスパスの jar）")
     val jars = System.getProperty("java.class.path").split(File.pathSeparator).map(::File).filter { it.isFile }
     val groups = linkedMapOf<String, Long>()
     for (jar in jars) {
@@ -243,7 +270,13 @@ private fun describe(result: Result<*>): String =
         { "最後まで実行（戻り値 $it）" },
         { e ->
             var c: Throwable? = e
-            val chain = buildList { while (c != null) { add(c!!.javaClass.simpleName + ": " + c!!.message); c = c!!.cause } }
+            val chain = buildList {
+                while (true) {
+                    val t = c ?: break
+                    add(t.javaClass.simpleName + ": " + t.message?.lineSequence()?.firstOrNull())
+                    c = t.cause
+                }
+            }
             "停止 ← ${chain.joinToString(" ← ")}"
         },
     )

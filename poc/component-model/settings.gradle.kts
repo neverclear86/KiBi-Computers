@@ -57,6 +57,17 @@ if (!endiveCmDir.resolve("pom.xml").isFile) {
     }
 }
 
+// endive-cm は Windows で WIT のパッケージディレクトリを読めない（相対パスを toString() で
+// 仮想 FS に渡すので、`deps\x.wit` という1つのファイル名になる）。測定のために手元で直す。
+// 上流への報告・修正の候補（#260 の結果に記録）
+run {
+    val witInput = endiveCmDir.resolve("wasm-tools/src/main/java/run/endive/cm/tools/WitInput.java")
+    val before = "target.resolve(source.relativize(path).toString())"
+    val after = "target.resolve(source.relativize(path).toString().replace(source.getFileSystem().getSeparator(), \"/\"))"
+    val text = witInput.readText()
+    if (text.contains(before)) witInput.writeText(text.replace(before, after))
+}
+
 // endive-cm のモジュール（Maven のディレクトリ構成のまま使う）
 val endiveCmModules = listOf(
     "types",

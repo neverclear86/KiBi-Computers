@@ -68,4 +68,11 @@ subprojects {
             add("annotationProcessor", project(":cm-bindgen-processor"))
         }
     }
+    if (name == "cm-wasi-p2") {
+        // bindgen-processor は WIT をクラスパスから読む。Maven と違い Gradle は resources を
+        // コンパイル前のクラス出力に置かないので、resources のディレクトリをクラスパスに足す
+        tasks.named<JavaCompile>("compileJava") {
+            classpath += files("src/main/resources")
+        }
+    }
 }
