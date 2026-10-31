@@ -15,7 +15,7 @@ gh issue list --state open --label poc --limit 100 --json number,title,labels
 gh issue list --state open --label task --label "scope: v1" --limit 100 --json number,title,labels
 ```
 
-次をすべて満たすものから選ぶ。**`poc`（#25 配下）を優先する**（順番は #26 → #27・#28・#29 → #30・#31）。PoC がないときは Epic 番号が小さい順（基盤 → ランタイム → カーネル…）。
+次をすべて満たすものから選ぶ。**`poc`（#25 配下）を優先する**（順番は #26 → #27・#28・#29 → #30・#31、Component Model は #260 → #261）。PoC がないときは Epic 番号が小さい順（基盤 → ランタイム → カーネル…）。
 
 - `task` か `poc` である（`decision` はエージェントが決めないので選ばない。`epic` も選ばない）
 - 本文の「依存: #n」がすべて閉じている
