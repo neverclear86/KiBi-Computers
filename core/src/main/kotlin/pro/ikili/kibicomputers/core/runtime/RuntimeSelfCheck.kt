@@ -1,7 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime
 
-import run.endive.runtime.Instance
-import run.endive.wasm.Parser
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 
 /**
  * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
@@ -27,10 +26,9 @@ public object RuntimeSelfCheck {
     /** WASMの `add` 関数で [a] + [b] を計算して返す。 */
     @JvmStatic
     public fun add(a: Int, b: Int): Int {
-        val module = Parser.parse(ADD_MODULE)
-        val instance = Instance.builder(module).build()
-        val result = instance.export("add").apply(a.toLong(), b.toLong())
-        return result[0].toInt()
+        // ランタイムの抽象（#34）を通して呼ぶ
+        val module = EndiveRuntime().load(ADD_MODULE)
+        return module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("add", a.toLong(), b.toLong())[0].toInt() }
     }
 
     /** ランタイムが動くなら `true`。例外は呼び出し側に伝えず `false` を返す。 */
