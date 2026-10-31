@@ -28,11 +28,9 @@ jobs:
       - name: Build and test
         run: ./gradlew build --console=plain
 
-      # 開発環境で MOD を読み込み、WASMランタイムが動くことを確認する
-      - name: Smoke test (NeoForge 1.21.1 data run)
-        run: |
-          ./gradlew :platform-neoforge-1.21.1:runData --console=plain | tee rundata.log
-          grep -q "WASM runtime self-check passed" rundata.log
+      # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）
+      - name: GameTest (NeoForge 1.21.1)
+        run: ./gradlew :platform-neoforge-1.21.1:runGameTestServer --console=plain
 
       - uses: actions/upload-artifact@v7
         with:
