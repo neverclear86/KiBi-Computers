@@ -7,7 +7,7 @@ Closes #
 ## 確認したこと
 
 - [ ] `./gradlew build`
-- [ ] `./gradlew :platform-neoforge-1.21.1:runGameTestServer`（`platform-*` を変えたとき）
+- [ ] `runGameTestServer`（1.21.1 / 1.20.1。`platform-*` か `core` を変えたとき）
 - [ ] 開発クライアントでの確認（GUI・描画を変えたとき）
 - [ ] Java からの利用テスト（公開 API を変えたとき）
 

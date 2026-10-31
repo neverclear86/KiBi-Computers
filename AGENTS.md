@@ -7,7 +7,8 @@ AIエージェント（Claude Code など）と人間の開発者向けの作業
 KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Chicory](https://github.com/dylibso/chicory)）で動く、OpenComputers 寄りのコンピューター MOD。本体は Kotlin で書き、[Kotlin for Forge](https://github.com/thedarkcolour/KotlinForForge)（KFF）に依存する。
 
 - **仕様と作業の一次情報は GitHub Issues。** 企画書はリポジトリに入っていない。仕様で迷ったら、該当 Issue → 親 Epic → `decision` ラベルの Issue の順に読む。
-- 対応バージョン: まず Minecraft 1.21.1 / NeoForge（メイン）。次に 1.20.1 / Forge（#222 配下、未着手）。
+- 対応バージョン: Minecraft 1.21.1 / NeoForge（メイン）と 1.20.1 / Forge（#222 配下。今は雛形のみ）。
+- **全バージョンを `main` の1ブランチで扱う**（#16）。バージョンごとのブランチは作らず、`platform-<ローダー>-<MC>` サブプロジェクトを並べる。
 
 ## 構成
 
@@ -15,11 +16,12 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Chicory](https://
 | --- | --- |
 | `core/` | Minecraft 非依存のコア（WASMランタイム、カーネル、VFS、状態保存など）。Java 17 ターゲット |
 | `platform-neoforge-1.21.1/` | 1.21.1 / NeoForge の接続層（ブロック、GUI、ネットワークなど）。Java 21 |
+| `platform-forge-1.20.1/` | 1.20.1 / Forge の接続層。Java 17。ModDevGradle の Legacy Forge プラグイン、KFF 4.x |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
 | `platform-*/gradle.properties` | Minecraft・ローダー・KFF のバージョン |
 | `gradle.properties` | MOD ID、名前、バージョン、グループ |
 
-パッケージは `pro.ikili.kibicomputers.<モジュール>`（`core`、`neoforge` など）。
+パッケージは `pro.ikili.kibicomputers.<モジュール>`（`core`、`neoforge`、`forge` など）。他 MOD 向けの公開 API は `pro.ikili.kibicomputers.api` 以下に置く（#17）。
 
 ## コマンド
 
@@ -29,26 +31,27 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | --- | --- |
 | ビルドと単体テスト | `./gradlew build` |
 | core の単体テストだけ | `./gradlew :core:test` |
-| ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer` |
+| ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
 
-- 起動ログは `platform-neoforge-1.21.1/run/logs/latest.log`。起動すると `WASM runtime self-check passed` が出る。
-- CI（`.github/workflows/build.yml`）は `build` と `runGameTestServer` を実行する。
+- 起動ログは `platform-*/run/logs/latest.log`。起動すると `WASM runtime self-check passed` が出る。
+- CI（`.github/workflows/build.yml`）は `build` と、両バージョンの `runGameTestServer` を実行する。
 
 ## 完了の条件
 
 変更を「できた」と言う前に、次を満たす。
 
 1. `./gradlew build` が通る。
-2. `platform-*` を触ったら `runGameTestServer` も通る。
+2. `platform-*` を触ったら、そのバージョンの `runGameTestServer` も通る。`core` を触ったら両バージョンで通す。
 3. 新しい振る舞いにはテストを付ける。Minecraft に依存しないものは `core` の単体テスト（JUnit 5）、依存するものは GameTest。
 4. 見た目や操作に関わる変更（GUI、描画）は、開発クライアントで確認する。確認できなかったときは、PR にそう書く。
 
 ## アーキテクチャのルール
 
 - **`core` に Minecraft・ローダーのクラスを持ち込まない。** ゲーム側の情報が要るときは、`core` にインターフェースを置き、`platform-*` で実装する。
-- **`platform-*` は薄く保つ。** ロジックは `core` に置き、接続層はブロック・アイテム・GUI・パケットなどの登録と橋渡しに留める。1.20.1 Forge 版でも同じ `core` を使うため。
+- **`platform-*` は薄く保つ。** ロジックは `core` に置き、接続層はブロック・アイテム・GUI・パケットなどの登録と橋渡しに留める。接続層はバージョンごとに書く（#16 で決定。共通化のための共通モジュールやプリプロセッサは使わない）ので、厚くなるほど重複が増える。
+- 機能を足すときは、まず 1.21.1 NeoForge で作り、1.20.1 への移植は #224 の配下で行う。
 - **`core` は Kotlin 2.2 の API 範囲で書く。** 1.20.1 用の KFF 4.x が同梱する Kotlin が 2.2 系のため、`apiVersion`/`languageVersion` を 2.2 に固定している。それより新しい標準ライブラリ API はコンパイルエラーになる。
 - 新しい実行時ライブラリを追加するときは、`core` の `api`/`implementation` に加えて、`platform-*` の `jarJar` と `"additionalRuntimeClasspath"` にも追加する（開発環境の実行時に見えなくなるため）。
 
@@ -56,6 +59,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 本体は Kotlin だが、他 MOD から使う公開 API は Java から自然に使えなければならない（#6）。
 
+- 公開 API は `pro.ikili.kibicomputers.api` 以下に置く。MC 非依存のものは `core`、MC 依存のものは各接続層の `...api` パッケージ。将来、API だけの jar（`-api`）を別に出す。
 - `core` は `explicitApi()` が有効。公開するものには `public` と型を明示し、それ以外は `internal`/`private` にする。
 - object・companion の関数は `@JvmStatic`、定数は `const val`、公開フィールドは `@JvmField`。
 - デフォルト引数を持つ公開関数・コンストラクターには `@JvmOverloads`。
@@ -95,4 +99,5 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 - `platform-*/build.gradle.kts` でサブプロジェクトの `gradle.properties` を読むときは `property(name)` を使う（`providers.gradleProperty` はルートの値しか読まない）。
 - リポジトリはルート `build.gradle.kts` の `subprojects {}` で宣言している（ModDevGradle がプロジェクト側にリポジトリを足すため、settings 側の宣言は無視される）。
+- 1.20.1（Forge）は 1.21.1 と細部が違う: GameTest の構造物は `data/kibicomputers/structures/`（複数形）に置く。データを読ませるには `pack.mcmeta` が必要。`mods.toml` は `META-INF/mods.toml` で、依存の指定は `mandatory = true`。jar は `reobfJar` で SRG 名に変換される。
 - GameTest はクラスに `@GameTestHolder(KiBiComputers.MOD_ID)` と `@PrefixGameTestTemplate(false)`、メソッドに `@JvmStatic` と `@GameTest(template = "empty")` を付ける。`empty` は `data/kibicomputers/structure/empty.nbt`（空の 3x3x3）。例: `platform-neoforge-1.21.1/src/main/kotlin/pro/ikili/kibicomputers/neoforge/gametest/SmokeGameTests.kt`。

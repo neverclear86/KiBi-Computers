@@ -11,10 +11,11 @@ argument-hint: "[issue番号]"
 ## 0. 着手する Issue を選ぶ（番号が指定されていないとき）
 
 ```bash
+gh issue list --state open --label poc --limit 100 --json number,title,labels
 gh issue list --state open --label task --label "scope: v1" --limit 100 --json number,title,labels
 ```
 
-次をすべて満たすものから、Epic 番号が小さい順（基盤 → ランタイム → カーネル…）に選ぶ。
+次をすべて満たすものから選ぶ。**`poc`（#25 配下）を優先する**（順番は #26 → #27・#28・#29 → #30・#31）。PoC がないときは Epic 番号が小さい順（基盤 → ランタイム → カーネル…）。
 
 - `task` か `poc` である（`decision` はエージェントが決めないので選ばない）
 - 本文の「依存: #n」がすべて閉じている
@@ -31,6 +32,7 @@ gh api repos/neverclear86/KiBi-Computers/issues/<番号>/parent --jq '.number'  
 ```
 
 - 親 Epic と、本文で参照されている Issue（依存先、関連する `decision`）も読む。
+- PoC は「測って結果を書く」までが範囲。結果・比較表・推奨方式を Issue にコメントし、測定用のコードは `poc/` 以下などにまとめて PR にする。方式の決定は人に任せる。
 - 仕様が Issue から読み取れない、または未決の `decision` に左右されるときは、**実装しない。** 論点・選択肢・推奨を Issue にコメントして、ユーザーに判断を求めて止まる。
 
 ## 2. ブランチ
@@ -48,7 +50,8 @@ git switch -c issue-<番号>-<短い英語名>
 - 確認:
   ```bash
   ./gradlew build
-  ./gradlew :platform-neoforge-1.21.1:runGameTestServer   # platform-* を触ったとき
+  ./gradlew :platform-neoforge-1.21.1:runGameTestServer   # platform-* か core を触ったとき
+  ./gradlew :platform-forge-1.20.1:runGameTestServer      # core か 1.20.1 を触ったとき
   ```
 - GUI や描画を変えたら `run-minecraft` スキルで開発クライアントを起動し、スクリーンショットで確認する。
 

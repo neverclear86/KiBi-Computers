@@ -5,7 +5,7 @@ description: KiBi Computers を開発環境の Minecraft（NeoForge 1.21.1）で
 
 # Minecraft で動かして確かめる
 
-作業ディレクトリはリポジトリのルートとする。ログは `platform-neoforge-1.21.1/run/logs/latest.log`。
+作業ディレクトリはリポジトリのルートとする。以下は 1.21.1 の例。1.20.1 は `platform-neoforge-1.21.1` を `platform-forge-1.20.1` に置き換える。ログは `platform-*/run/logs/latest.log`。
 
 ## GameTest（ヘッドレス。まずはこれ）
 

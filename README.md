@@ -13,7 +13,7 @@
 | Minecraft | Loader | 状態 / Status |
 | --- | --- | --- |
 | 1.21.1 | NeoForge | 開発中（メイン） / In development (primary) |
-| 1.20.1 | Forge | 予定 / Planned |
+| 1.20.1 | Forge | 開発中（雛形のみ） / In development (skeleton) |
 
 [Kotlin for Forge](https://github.com/thedarkcolour/KotlinForForge) が必要です。 / Requires Kotlin for Forge.
 
@@ -23,12 +23,13 @@
 | --- | --- |
 | `core` | Minecraft に依存しないコア（WASMランタイム、カーネル、VFS、状態保存など）。Java 17 ターゲット |
 | `platform-neoforge-1.21.1` | Minecraft 1.21.1 / NeoForge の接続層。Java 21 |
+| `platform-forge-1.20.1` | Minecraft 1.20.1 / Forge の接続層。Java 17 |
 
 本体は Kotlin で書いていますが、公開 API は Java からも自然に使えるようにしています。
 
 ## ビルド / Building
 
-JDK 21（と、`core` 用の JDK 17）が必要です。見つからない場合は Gradle が自動でダウンロードします。
+JDK 21 と JDK 17 が必要です。見つからない場合は Gradle が自動でダウンロードします。
 
 ```bash
 ./gradlew build
