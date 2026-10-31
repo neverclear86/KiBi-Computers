@@ -23,6 +23,24 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     /** 文字画面のバッファ。 */
     val text: TextBuffer = tier.createTextBuffer()
 
+    private val lazyPixels = lazy { if (tier.supportsPixels) tier.createPixelBuffer() else null }
+
     /** ピクセル画面のバッファ。ピクセル描画できないティアでは null。大きいので最初に使うときに作る。 */
-    val pixels: PixelBuffer? by lazy { if (tier.supportsPixels) tier.createPixelBuffer() else null }
+    val pixels: PixelBuffer? by lazyPixels
+
+    /** ピクセル画面のバッファをもう作ったか。まだなら描画（#139）はピクセルの層を描かない。 */
+    val hasPixels: Boolean
+        get() = lazyPixels.isInitialized() && lazyPixels.value != null
+
+    /**
+     * クライアントの描画が持つ資源（ピクセル画面のテクスチャなど）。サーバーでは常に null。
+     * ブロックエンティティが消えるときに閉じる。
+     */
+    var renderCache: AutoCloseable? = null
+
+    override fun setRemoved() {
+        super.setRemoved()
+        renderCache?.close()
+        renderCache = null
+    }
 }

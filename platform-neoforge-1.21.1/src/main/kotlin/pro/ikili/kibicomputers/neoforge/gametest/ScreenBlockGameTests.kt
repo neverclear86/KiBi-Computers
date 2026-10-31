@@ -8,6 +8,7 @@ import net.minecraft.world.InteractionHand
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.GameType
+import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.Rotation
 import net.minecraft.world.level.storage.loot.LootParams
 import net.minecraft.world.level.storage.loot.parameters.LootContextParams
@@ -81,6 +82,22 @@ object ScreenBlockGameTests {
                 "$tier screen should drop itself but dropped $drops",
             )
         }
+        helper.succeed()
+    }
+
+    /** ピクセルのバッファは使うまで作らず、描画の資源はブロックを壊すと閉じる（#139）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun screenReleasesRenderCacheWhenRemoved(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.PIXEL).get())
+        val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
+        helper.assertFalse(be.hasPixels, "pixel buffer should not be created until used")
+        helper.assertTrue(be.pixels != null && be.hasPixels, "pixel buffer should exist once used")
+        var closed = false
+        be.renderCache = AutoCloseable { closed = true }
+        helper.setBlock(POS, Blocks.AIR)
+        helper.assertTrue(closed, "render cache should be closed when the screen is removed")
+        helper.assertTrue(be.renderCache == null, "render cache should be cleared when the screen is removed")
         helper.succeed()
     }
 }
