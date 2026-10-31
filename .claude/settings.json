@@ -12,7 +12,8 @@
       "Bash(git push -u origin issue-*)", "Bash(git push origin issue-*)",
       "Bash(gh issue *)", "Bash(gh pr *)", "Bash(gh run *)",
       "Bash(gh api repos/neverclear86/KiBi-Computers/*)",
-      "Bash(gh stack *)"
+      "Bash(gh stack *)",
+      "Bash(./gradlew -p poc/component-model *)"
     ],
     "deny": [
       "Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push * --force*)",
