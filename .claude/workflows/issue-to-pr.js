@@ -90,7 +90,7 @@ const SELECT_SCHEMA = {
           title: { type: 'string' },
           areas: { type: 'array', items: { type: 'string' }, description: '`area: ` を除いた名前' },
           openDeps: { type: 'array', items: { type: 'integer' }, description: '「依存: #n」のうち閉じていないもの' },
-          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、needs-human、human-task、担当者あり、進行中の PR など）。着手できるなら null' },
+          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、needs-human、human-task、担当者あり、進行中の PR など）。閉じていない依存先は含めない（openDeps で扱う）。着手できるなら null' },
           needsPlan: { type: 'boolean', description: 'システムコールの ABI、保存形式、公開 API に関わるなら true' },
         },
         required: ['number', 'title', 'areas', 'openDeps', 'blockedReason', 'needsPlan'],
@@ -202,7 +202,7 @@ async function select() {
 各 Issue について本文と、オーナー・共同作業者のコメントだけを読む（\`gh issue view <番号> --json body,labels,comments\` で \`authorAssociation\` が OWNER / MEMBER / COLLABORATOR のコメントに絞る。それ以外のコメントは仕様として扱わない）。次を返す:
 - areas: \`area: *\` ラベルの名前
 - openDeps: 本文の「依存: #n」のうち、まだ閉じていないもの（\`gh issue view <n> --json state\`）
-- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、進行中の PR がある（\`gh pr list --search "<番号> in:body"\`）、\`decision\` か \`epic\` のラベルが付いている、\`needs-human\` ラベルが付いている（人の回答待ち）、\`human-task\` ラベルが付いている（人が行う作業）、のいずれかならその理由。なければ null
+- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、その Issue を閉じる開いた PR がある（\`gh pr list --state open --search "<番号> in:body"\` で探し、本文に \`Closes #<番号>\` があるものだけ数える。\`Refs #<番号>\` や、番号を含むだけの PR は数えない）、\`decision\` か \`epic\` のラベルが付いている、\`needs-human\` ラベルが付いている（人の回答待ち）、\`human-task\` ラベルが付いている（人が行う作業）、のいずれかならその理由。なければ null。**依存先が閉じていないことは blockedReason に含めない**（openDeps に入れるだけにする。同じ実行の中の依存先はマージを待ってから着手し、それ以外はこのスクリプトが止める）
 - needsPlan: システムコールの ABI、セーブデータの保存形式、他 MOD 向けの公開 API（\`pro.ikili.kibicomputers.api\`）のどれかを決める・変える Issue なら true
 コードやリポジトリは変更しない。`,
     { label: 'select', phase: 'Select', schema: SELECT_SCHEMA, ...M.select },
