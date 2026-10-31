@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.neoforge.client.KiBiClient
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.loading.FMLEnvironment
@@ -23,6 +24,7 @@ object KiBiComputersNeoForge {
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
         KiBiBlocks.register(MOD_BUS)
         ScreenSync.register(MOD_BUS)
+        ServerMachines.register()
         // クライアントのクラスは、クライアントでだけ読み込む
         if (FMLEnvironment.dist.isClient) KiBiClient.register(MOD_BUS)
         startDevDriver()
