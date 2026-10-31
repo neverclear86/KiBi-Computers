@@ -17,8 +17,9 @@ gh issue list --state open --label task --label "scope: v1" --limit 100 --json n
 
 次をすべて満たすものから選ぶ。**`poc`（#25 配下）を優先する**（順番は #26 → #27・#28・#29 → #30・#31）。PoC がないときは Epic 番号が小さい順（基盤 → ランタイム → カーネル…）。
 
-- `task` か `poc` である（`decision` はエージェントが決めないので選ばない）
+- `task` か `poc` である（`decision` はエージェントが決めないので選ばない。`epic` も選ばない）
 - 本文の「依存: #n」がすべて閉じている
+- `needs-human` ラベルが付いていない
 - 担当者（assignee）がいない
 - 進行中の PR がない（`gh pr list --search "<番号> in:body"`）
 
@@ -66,7 +67,7 @@ git switch -c issue-<番号>-<短い英語名>
   gh pr create --title "<英語のタイトル>" --body-file <本文ファイル>
   ```
   本文は `.github/pull_request_template.md` の形で、日本語で書く。全部済んだなら `Closes #<番号>`、一部なら `Refs #<番号>` にし、残りを書く。
-- PR は自分でマージしない。CI の結果を確認して報告する（`gh pr checks`）。
+- マージは `issue-to-pr` ワークフローの役割。スキルだけで進めたときは、CI の結果（`gh pr checks`）を確認して報告し、マージしてよいかユーザーに聞く。
 
 ## 5. 途中で見つけたこと
 
