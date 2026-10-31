@@ -31,6 +31,9 @@ public constructor(width: Int, height: Int) {
 
     private var pixels: IntArray = IntArray(Rects.area(width, height))
 
+    /** 描画命令の記録先（画面の同期 #140）。見ているプレイヤーがいる間だけ [ScreenSyncSender] がつなぐ。 */
+    internal var log: DrawLog? = null
+
     /** `(x, y)` のピクセルの色（`0xRRGGBB`）。 */
     @Throws(IndexOutOfBoundsException::class)
     public fun get(x: Int, y: Int): Int {
@@ -42,6 +45,12 @@ public constructor(width: Int, height: Int) {
     public fun set(x: Int, y: Int, rgb: Int) {
         revision++
         if (x !in 0 until width || y !in 0 until height) return
+        log?.record {
+            byte(SyncOps.PIXEL_SET)
+            uint(x)
+            uint(y)
+            rgb(rgb)
+        }
         pixels[y * width + x] = rgb and RGB_MASK
     }
 
@@ -52,7 +61,18 @@ public constructor(width: Int, height: Int) {
         val x0 = Rects.start(x, width)
         val x1 = Rects.end(x, w, width)
         if (x0 >= x1) return
-        for (row in Rects.start(y, height) until Rects.end(y, h, height)) {
+        val y0 = Rects.start(y, height)
+        val y1 = Rects.end(y, h, height)
+        if (y0 >= y1) return
+        log?.record {
+            byte(SyncOps.PIXEL_FILL)
+            uint(x0)
+            uint(y0)
+            uint(x1 - x0)
+            uint(y1 - y0)
+            rgb(c)
+        }
+        for (row in y0 until y1) {
             pixels.fill(c, row * width + x0, row * width + x1)
         }
     }
@@ -65,6 +85,15 @@ public constructor(width: Int, height: Int) {
      */
     public fun copy(x: Int, y: Int, w: Int, h: Int, dx: Int, dy: Int) {
         revision++
+        log?.record {
+            byte(SyncOps.PIXEL_COPY)
+            sint(x)
+            sint(y)
+            sint(w)
+            sint(h)
+            sint(dx)
+            sint(dy)
+        }
         Rects.copy(arrayOf(pixels), width, height, x, y, w, h, dx, dy)
     }
 
@@ -82,10 +111,24 @@ public constructor(width: Int, height: Int) {
         val x0 = Rects.start(x, width)
         val x1 = Rects.end(x, w, width)
         if (x0 >= x1) return
-        for (row in Rects.start(y, height) until Rects.end(y, h, height)) {
+        val y0 = Rects.start(y, height)
+        val y1 = Rects.end(y, h, height)
+        if (y0 >= y1) return
+        for (row in y0 until y1) {
             val from = offset + (row - y) * stride + (x0 - x)
             val to = row * width
             for (col in x0 until x1) pixels[to + col] = src[from + col - x0] and RGB_MASK
+        }
+        // 画面の内側に切り取った部分だけを、書いたあとの値で記録する
+        log?.record {
+            byte(SyncOps.PIXEL_IMAGE)
+            uint(x0)
+            uint(y0)
+            uint(x1 - x0)
+            uint(y1 - y0)
+            for (row in y0 until y1) {
+                for (col in x0 until x1) rgb(pixels[row * width + col])
+            }
         }
     }
 
@@ -111,6 +154,10 @@ public constructor(width: Int, height: Int) {
     @JvmOverloads
     public fun clear(rgb: Int = DEFAULT_COLOR) {
         revision++
+        log?.record {
+            byte(SyncOps.PIXEL_CLEAR)
+            rgb(rgb)
+        }
         pixels.fill(rgb and RGB_MASK)
     }
 
@@ -123,6 +170,11 @@ public constructor(width: Int, height: Int) {
     public fun resize(newWidth: Int, newHeight: Int) {
         Rects.area(newWidth, newHeight)
         revision++
+        log?.record {
+            byte(SyncOps.PIXEL_RESIZE)
+            uint(newWidth)
+            uint(newHeight)
+        }
         pixels = Rects.resize(pixels, width, height, newWidth, newHeight, DEFAULT_COLOR)
         width = newWidth
         height = newHeight
@@ -134,6 +186,31 @@ public constructor(width: Int, height: Int) {
 
     /** 同じ内容の、独立したバッファを作る。 */
     public fun copyOf(): PixelBuffer = PixelBuffer(width, height).also { pixels.copyInto(it.pixels) }
+
+    /** 画面全体（キーフレーム）を書く。大きさに続けて、各ピクセルの色を左上から並べる。 */
+    internal fun writeSnapshot(out: SyncWriter) {
+        out.uint(width)
+        out.uint(height)
+        for (c in pixels) out.rgb(c)
+    }
+
+    /** [writeSnapshot] で書いた画面全体を読み込む。大きさが違えば合わせる。 */
+    internal fun readSnapshot(input: SyncReader) {
+        val w = input.uint()
+        val h = input.uint()
+        val n = Rects.area(w, h)
+        require(input.remaining.toLong() >= n.toLong() * 3) { "pixel snapshot is truncated" }
+        val px = IntArray(n)
+        for (i in 0 until n) px[i] = input.rgb()
+        revision++
+        width = w
+        height = h
+        pixels = px
+    }
+
+    /** [writeSnapshot] が書く大きさの目安（バイト）。 */
+    internal val snapshotSize: Int
+        get() = pixels.size * 3 + 10
 
     public companion object {
         /** 既定の色（黒）。 */

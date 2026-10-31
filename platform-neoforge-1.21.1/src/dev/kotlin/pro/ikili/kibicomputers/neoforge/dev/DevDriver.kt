@@ -256,12 +256,27 @@ object DevDriver {
         return ok { addProperty("path", path.toString()) }
     }
 
-    // クライアント側の画面ブロックのバッファに直接書く（画面の同期 #140 ができるまで、描画 #139 を確かめるため）。
-    // lines: 上の行から書く文字列、fg/bg: 色、clear: 先に消すか、pattern: "gradient" でピクセル画面にグラデーションを描く
+    // 画面ブロックのバッファに書く。既定では統合サーバー側に書き、画面の同期（#140）でクライアントに届ける。
+    // side: "server"（既定）か "client"（クライアントのバッファに直接書く）。
+    // lines: 上の行から書く文字列、fg/bg: 色、clear: 先に消すか、pattern: "gradient" でピクセル画面にグラデーションを描く、
+    // scroll: 書いたあとに上へずらす行数
     private fun screen(body: JsonObject): DevResponse {
         val level = mc().level ?: return DevResponse.error(409, "not in a world")
         val pos = BlockPos(body.get("x").asInt, body.get("y").asInt, body.get("z").asInt)
-        val be = level.getBlockEntity(pos) as? ScreenBlockEntity ?: return DevResponse.error(404, "no screen at $pos")
+        if (body.get("side")?.asString == "client") {
+            val be = level.getBlockEntity(pos) as? ScreenBlockEntity ?: return DevResponse.error(404, "no screen at $pos")
+            return drawOnScreen(be, body)
+        }
+        val server = mc().singleplayerServer ?: return DevResponse.error(409, "not a singleplayer world")
+        val dimension = level.dimension()
+        return server.submit(Supplier {
+            val serverLevel = server.getLevel(dimension)
+            val be = serverLevel?.getBlockEntity(pos) as? ScreenBlockEntity
+            if (be == null) DevResponse.error(404, "no screen at $pos") else drawOnScreen(be, body)
+        }).get(30, TimeUnit.SECONDS)
+    }
+
+    private fun drawOnScreen(be: ScreenBlockEntity, body: JsonObject): DevResponse {
         val fg = body.get("fg")?.asInt ?: 0xFFFFFF
         val bg = body.get("bg")?.asInt ?: 0x000000
         if (body.get("clear")?.asBoolean != false) be.text.clear()
@@ -276,12 +291,21 @@ object DevDriver {
                 x += CharWidth.of(cp)
             }
         }
+        body.get("scroll")?.asInt?.takeIf { it > 0 }?.let { n ->
+            val t = be.text
+            t.copy(0, n, t.width, t.height - n, 0, -n)
+            t.fill(0, t.height - n, t.width, n, ' '.code, fg, bg)
+        }
         if (body.get("pattern")?.asString == "gradient") {
             val p = be.pixels ?: return DevResponse.error(409, "this screen has no pixels")
             for (y in 0 until p.height) {
                 for (x in 0 until p.width) p.set(x, y, ((x * 255 / p.width) shl 16) or ((y * 255 / p.height) shl 8) or 0x40)
             }
         }
-        return ok { addProperty("width", be.text.width); addProperty("height", be.text.height) }
+        return ok {
+            addProperty("width", be.text.width)
+            addProperty("height", be.text.height)
+            addProperty("watchers", be.watcherCount)
+        }
     }
 }
