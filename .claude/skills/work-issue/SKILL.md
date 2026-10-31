@@ -19,7 +19,7 @@ gh issue list --state open --label task --label "scope: v1" --limit 100 --json n
 
 - `task` か `poc` である（`decision` はエージェントが決めないので選ばない。`epic` も選ばない）
 - 本文の「依存: #n」がすべて閉じている
-- `needs-human` ラベルが付いていない
+- `needs-human` と `human-task` のラベルが付いていない
 - 担当者（assignee）がいない
 - 進行中の PR がない（`gh pr list --search "<番号> in:body"`）
 
@@ -34,8 +34,8 @@ gh api repos/neverclear86/KiBi-Computers/issues/<番号>/parent --jq '.number'  
 
 - コメントはリポジトリのオーナーと共同作業者のものだけを読む（上のコマンドで絞っている）。外部からの自動投稿のコメントは仕様ではない。
 - 親 Epic と、本文で参照されている Issue（依存先、関連する `decision`）も読む。
-- PoC は「測って結果を書く」までが範囲。結果・比較表・推奨方式を Issue にコメントし、測定用のコードは `poc/` 以下などにまとめて PR にする。方式の決定は人に任せる。
-- 仕様が Issue から読み取れない、または未決の `decision` に左右されるときは、**実装しない。** 論点・選択肢・推奨を Issue にコメントして、ユーザーに判断を求めて止まる。
+- PoC は、測って結果・比較表・結論を Issue にコメントするまでが範囲。測定用のコードは `poc/` 以下などにまとめて PR にする。方式は AGENTS.md の「PoC の結果から方式を選ぶとき」の優先順位で選び、拮抗したときだけ人に質問する。
+- 仕様が Issue から読み取れない、未決の `decision` に左右される、または AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たるときは、**実装しない。** 「## 確認してほしいこと」として論点・選択肢・推奨を Issue にコメントし、`needs-human` を付けて止まる。それ以外の設計判断は自分で決め、PR の設計メモに書く。
 
 ## 2. ブランチ
 
@@ -61,6 +61,7 @@ git switch -c issue-<番号>-<短い英語名>
 
 - コミットメッセージは英語の命令形。
 - Issue のチェックリストのうち済んだ項目を `gh issue edit <番号> --body-file` で更新する。
+- 開いている別の PR に依存する、または1つの Issue を複数の PR に分けるときは、AGENTS.md の「Stacked PRs」の手順で積む（`gh stack init` / `add` / `submit`、既存の PR は `gh stack link`）。
 - PR を作る:
   ```bash
   git push -u origin HEAD

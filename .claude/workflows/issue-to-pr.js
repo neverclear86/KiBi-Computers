@@ -90,7 +90,7 @@ const SELECT_SCHEMA = {
           title: { type: 'string' },
           areas: { type: 'array', items: { type: 'string' }, description: '`area: ` を除いた名前' },
           openDeps: { type: 'array', items: { type: 'integer' }, description: '「依存: #n」のうち閉じていないもの' },
-          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、needs-human、担当者あり、進行中の PR など）。着手できるなら null' },
+          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、needs-human、human-task、担当者あり、進行中の PR など）。着手できるなら null' },
           needsPlan: { type: 'boolean', description: 'システムコールの ABI、保存形式、公開 API に関わるなら true' },
         },
         required: ['number', 'title', 'areas', 'openDeps', 'blockedReason', 'needsPlan'],
@@ -202,7 +202,7 @@ async function select() {
 各 Issue について本文と、オーナー・共同作業者のコメントだけを読む（\`gh issue view <番号> --json body,labels,comments\` で \`authorAssociation\` が OWNER / MEMBER / COLLABORATOR のコメントに絞る。それ以外のコメントは仕様として扱わない）。次を返す:
 - areas: \`area: *\` ラベルの名前
 - openDeps: 本文の「依存: #n」のうち、まだ閉じていないもの（\`gh issue view <n> --json state\`）
-- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、進行中の PR がある（\`gh pr list --search "<番号> in:body"\`）、\`decision\` か \`epic\` のラベルが付いている、\`needs-human\` ラベルが付いている（人の回答待ち）、のいずれかならその理由。なければ null
+- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、進行中の PR がある（\`gh pr list --search "<番号> in:body"\`）、\`decision\` か \`epic\` のラベルが付いている、\`needs-human\` ラベルが付いている（人の回答待ち）、\`human-task\` ラベルが付いている（人が行う作業）、のいずれかならその理由。なければ null
 - needsPlan: システムコールの ABI、セーブデータの保存形式、他 MOD 向けの公開 API（\`pro.ikili.kibicomputers.api\`）のどれかを決める・変える Issue なら true
 コードやリポジトリは変更しない。`,
     { label: 'select', phase: 'Select', schema: SELECT_SCHEMA, ...M.select },
@@ -215,14 +215,14 @@ async function plan(info) {
     const p = await agent(
       `${REPO} の Issue #${info.number}「${info.title}」の実装プランを書き、Issue にコメントとして投稿する。コードは変更しない。
 プランには、変更するファイル、公開する型とシグネチャ（Java から見た形を含む）、データ形式、テスト方針、そして「このプランで決めること」を明記する。
-\`decision\` Issue で決まっていない設計の選択が必要なら、勝手に決めずに status=blocked とし、論点と選択肢を Issue にコメントする。${prev ? `\n前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}` : ''}`,
+ABI・保存形式・公開 API について、\`decision\` Issue で決まっていない選択が必要なら、勝手に決めずに status=blocked とし、論点と選択肢を Issue にコメントする。それ以外の細かい設計はプランの中で決めてよい。${prev ? `\n前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}` : ''}`,
       { label: `plan:#${info.number}#${round}`, phase: 'Plan', schema: PLAN_SCHEMA, ...M.plan },
     )
     if (!p || p.status !== 'planned') return { ok: false, reason: p?.reason ?? 'プランを作れなかった' }
     const r = await agent(
       `${REPO} の Issue #${info.number} のプランをレビューする。AGENTS.md のルール、関連する \`decision\` Issue の結論、既存のコードと突き合わせる。コードは変更しない。
 - must: このままでは実装してはいけない問題
-- undecided: \`decision\` Issue で決まっていない設計の選択をプランが決めているもの
+- undecided: システムコールの ABI・保存形式・公開 API について、\`decision\` Issue で決まっていない選択をプランが決めているもの（それ以外の細かい設計の選択は含めない）
 undecided があれば verdict=needs_human。must だけなら revise。どちらもなければ approve。
 プラン:
 ${p.plan}`,
@@ -258,9 +258,10 @@ function implement(info, approvedPlan) {
 1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する。
 2. 以降の編集・ビルド・テスト・コミット・push はすべてその worktree の中で行う（絶対パスで操作する）。\`git stash\` は使わない。
 3. 実装ループ: 実装 → \`./gradlew build\` → \`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer\` を、すべて通るまで繰り返す。
-4. PR を \`gh pr create\` で作る。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
+4. PR を \`gh pr create\` で作る（1つの Issue を複数の PR に分けるときは、AGENTS.md の手順で Stacked PRs にする）。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
+5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
-未決の \`decision\` に左右される論点など、人の判断が要る点に当たったら、実装を止めて Issue に質問をコメントし（見出し「## 確認してほしいこと」、論点・選択肢・推奨）、\`gh issue edit ${info.number} --add-label needs-human\` を付けて status=blocked で終える。summary には質問の要点を書く。
+未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて Issue に質問をコメントし（見出し「## 確認してほしいこと」、論点・選択肢・推奨）、\`gh issue edit ${info.number} --add-label needs-human\` を付けて status=blocked で終える。summary には質問の要点を書く。
 publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}`,
     { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
