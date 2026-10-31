@@ -91,6 +91,17 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - PR 本文に `Closes #<番号>` を書く。Issue の一部だけ済んだときは `Refs #<番号>` にし、済んだ項目を Issue のチェックリストに反映する。
 - 企画書、秘密情報、`run/` 以下の生成物はコミットしない。
 
+## 開発フロー（#242）
+
+1. 実装: Issue ごとに `.worktrees/issue-<番号>` の worktree で実装・テストし、PR を作る。
+2. CI: PR の CI を待つ。落ちたら直して待ち直す。
+3. レビュー: CI が通ったら、レビューエージェント（正しさ・ルール違反の確認と、Java 相互運用の確認）が見て、指摘を別のエージェントが検証する。
+4. 修正: 確かな指摘を直し、CI からやり直す。
+5. 報告: PR に結果をコメントする。
+
+- `main` はブランチ保護されている（PR 必須、CI の `build` が通らないとマージできない、force push 禁止。管理者も対象）。
+- マージは今は人が行う。自動マージにするかは #242 で決める。
+
 ## つまずきやすい点
 
 - `platform-*/build.gradle.kts` でサブプロジェクトの `gradle.properties` を読むときは `property(name)` を使う（`providers.gradleProperty` はルートの値しか読まない）。
