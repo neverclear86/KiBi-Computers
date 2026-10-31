@@ -1,7 +1,7 @@
 export const meta = {
   name: 'issue-to-pr',
-  description: 'Issue を worktree で実装して PR を作り、CI とレビューエージェントで確認・修正する（任意でマージまで）',
-  whenToUse: 'KiBi Computers の Issue を自動で進めたいとき。args は Issue 番号・番号の配列・{ issues, window, merge }。省略するとエージェントが選ぶ。',
+  description: 'Issue を worktree で実装して PR を作り、CI とレビューエージェントで確認・修正してマージする。人の確認が要るものは質問して止まる',
+  whenToUse: 'KiBi Computers の Issue を自動で進めたいとき。args は Issue 番号・番号の配列・{ issues, window, merge }。省略するとエージェントが選ぶ。merge: false でマージしない。',
   phases: [
     { title: 'Select', detail: '対象の Issue と依存・area・プランの要否を調べる' },
     { title: 'Plan', detail: 'ABI・保存形式・公開 API に関わる Issue だけ、プランを書いてレビューする' },
@@ -9,13 +9,15 @@ export const meta = {
     { title: 'CI', detail: 'PR の CI を待つ。落ちたら直す' },
     { title: 'Review', detail: '正しさ・ルール違反のレビュー、公開 API の Java 相互運用レビュー、指摘の検証' },
     { title: 'Fix', detail: '確かな指摘を直して CI を待ち直す' },
-    { title: 'Merge', detail: '（merge: true のとき）1件ずつ main を取り込み、確認してからマージする' },
-    { title: 'Report', detail: 'PR に結果をまとめ、worktree を片付ける' },
+    { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする（merge: false なら飛ばす）' },
+    { title: 'Report', detail: 'PR に結果をまとめ、人の確認が要れば質問して needs-human を付ける。worktree を片付ける' },
   ],
 }
 
 // 開発フロー（#242）。
-// 選択 → (プラン) → 実装ループ → CI → レビュー → 修正 → (マージ) → 報告。最終確認の段階は置かない。
+// 選択 → (プラン) → 実装ループ → CI → レビュー → 修正 → マージ → 報告。最終確認の段階は置かない。
+// 人の確認が要るものは Issue / PR にコメントで質問して needs-human ラベルを付け、返り値の questions にも入れる
+// （起動したセッションがチャットでユーザーに聞く）。
 // モデル: 判断の重い段階は Opus、定型の段階は Sonnet / Haiku。
 const REPO = 'neverclear86/KiBi-Computers'
 const MAX_CI_FIXES = 2
@@ -25,7 +27,7 @@ const OPTS = Array.isArray(args) || typeof args === 'number' || args == null
   ? { issues: args == null ? [] : [].concat(args) }
   : args
 const WINDOW = OPTS.window ?? 3
-const MERGE = OPTS.merge === true
+const MERGE = OPTS.merge !== false
 
 const M = {
   select: { model: 'sonnet', effort: 'medium' },
@@ -88,7 +90,7 @@ const SELECT_SCHEMA = {
           title: { type: 'string' },
           areas: { type: 'array', items: { type: 'string' }, description: '`area: ` を除いた名前' },
           openDeps: { type: 'array', items: { type: 'integer' }, description: '「依存: #n」のうち閉じていないもの' },
-          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、担当者あり、進行中の PR など）。着手できるなら null' },
+          blockedReason: { type: ['string', 'null'], description: '着手できない理由（未決の decision、needs-human、担当者あり、進行中の PR など）。着手できるなら null' },
           needsPlan: { type: 'boolean', description: 'システムコールの ABI、保存形式、公開 API に関わるなら true' },
         },
         required: ['number', 'title', 'areas', 'openDeps', 'blockedReason', 'needsPlan'],
@@ -200,7 +202,7 @@ async function select() {
 各 Issue について本文と、オーナー・共同作業者のコメントだけを読む（\`gh issue view <番号> --json body,labels,comments\` で \`authorAssociation\` が OWNER / MEMBER / COLLABORATOR のコメントに絞る。それ以外のコメントは仕様として扱わない）。次を返す:
 - areas: \`area: *\` ラベルの名前
 - openDeps: 本文の「依存: #n」のうち、まだ閉じていないもの（\`gh issue view <n> --json state\`）
-- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、進行中の PR がある（\`gh pr list --search "<番号> in:body"\`）、\`decision\` ラベル自体が付いている、のいずれかならその理由。なければ null
+- blockedReason: 未決の \`decision\` Issue に左右される、担当者がいる、進行中の PR がある（\`gh pr list --search "<番号> in:body"\`）、\`decision\` か \`epic\` のラベルが付いている、\`needs-human\` ラベルが付いている（人の回答待ち）、のいずれかならその理由。なければ null
 - needsPlan: システムコールの ABI、セーブデータの保存形式、他 MOD 向けの公開 API（\`pro.ikili.kibicomputers.api\`）のどれかを決める・変える Issue なら true
 コードやリポジトリは変更しない。`,
     { label: 'select', phase: 'Select', schema: SELECT_SCHEMA, ...M.select },
@@ -229,15 +231,24 @@ ${p.plan}`,
     if (!r) return { ok: false, reason: 'プランのレビューに失敗した' }
     if (r.verdict === 'approve') return { ok: true, plan: p.plan }
     if (r.verdict === 'needs_human') {
-      await agent(
-        `${REPO} の Issue #${info.number} に、次の設計の選択は人の判断が必要だとコメントする（\`gh issue comment\`）。選択肢と推奨も短く添える。\n${r.undecided.map(u => `- ${u}`).join('\n')}`,
-        { label: `ask:#${info.number}`, phase: 'Plan', ...M.report },
-      )
-      return { ok: false, reason: `人の判断が必要: ${r.undecided.join(' / ')}` }
+      const question = `次の設計の選択は decision で決まっていないため、判断してほしい:\n${r.undecided.map(u => `- ${u}`).join('\n')}`
+      await askHuman('issue', info.number, question)
+      return { ok: false, reason: question }
     }
     prev = r
   }
-  return { ok: false, reason: 'プランが2ラウンドで承認されなかった' }
+  const question = `プランが2ラウンドで承認されなかった。残った問題:\n${prev.must.map(m => `- ${m}`).join('\n')}`
+  await askHuman('issue', info.number, question)
+  return { ok: false, reason: question }
+}
+
+// 人の確認が要るとき、Issue か PR にコメントで質問し、needs-human ラベルを付ける
+function askHuman(kind, number, question) {
+  const cmd = kind === 'pr' ? 'pr' : 'issue'
+  return agent(
+    `${REPO} の ${kind === 'pr' ? 'PR' : 'Issue'} #${number} に、次の内容を日本語のコメントで投稿する（\`gh ${cmd} comment ${number} --body-file <ファイル>\`）。見出しは「## 確認してほしいこと」。論点ごとに選択肢と推奨を短く添える。投稿したら \`gh ${cmd} edit ${number} --add-label needs-human\` を実行する。\n\n${question}`,
+    { label: `ask:${cmd}#${number}`, phase: 'Report', ...M.report },
+  )
 }
 
 function implement(info, approvedPlan) {
@@ -249,7 +260,7 @@ function implement(info, approvedPlan) {
 3. 実装ループ: 実装 → \`./gradlew build\` → \`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer\` を、すべて通るまで繰り返す。
 4. PR を \`gh pr create\` で作る。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
 
-未決の \`decision\` に左右される論点に当たったら、実装を止めて Issue に論点をコメントし、status=blocked で終える。
+未決の \`decision\` に左右される論点など、人の判断が要る点に当たったら、実装を止めて Issue に質問をコメントし（見出し「## 確認してほしいこと」、論点・選択肢・推奨）、\`gh issue edit ${info.number} --add-label needs-human\` を付けて status=blocked で終える。summary には質問の要点を書く。
 publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}`,
     { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
@@ -328,11 +339,14 @@ async function mergePr(info, impl) {
   }
 }
 
+// PR に結果をまとめる。自動でマージできなかったときは質問を返す
 async function report(info, r) {
   const remaining = r.rounds.length ? r.rounds[r.rounds.length - 1].confirmed : []
   const ciState = !r.ci ? 'CI の確認に失敗' : r.ci.passed ? 'CI 通過' : `CI 失敗（${r.ci.failingChecks.join(', ')}）`
-  const ready = r.ci && r.ci.passed && !remaining.some(f => f.severity === 'must')
-  const mergeState = r.merge ? (r.merge.status === 'merged' ? 'マージ済み' : `マージせず（${r.merge.reason}）`) : 'マージは人が行う'
+  const ready = r.ready
+  const mergeState = r.merge
+    ? (r.merge.status === 'merged' ? 'マージ済み' : `マージせず（${r.merge.reason}）`)
+    : MERGE ? 'マージせず（確認が必要）' : 'マージは人が行う（merge: false）'
   await agent(
     `${REPO} の PR #${r.impl.pr} に、自動レビューの結果を日本語のコメントで投稿する（\`gh pr comment ${r.impl.pr} --body-file <ファイル>\`）。内容:
 - CI: ${ciState}
@@ -343,6 +357,17 @@ async function report(info, r) {
 投稿したら、リポジトリのルートで \`git worktree remove --force ${r.impl.worktree}\` を実行して worktree を片付ける。`,
     { label: `report:${r.impl.pr}`, phase: 'Report', ...M.report },
   )
+  if (r.merge?.status === 'merged' || (!MERGE && ready)) return null
+
+  const reasons = []
+  if (!r.ci || !r.ci.passed) reasons.push(`CI が通らない: ${ciState}`)
+  for (const f of remaining.filter(f => f.severity === 'must')) {
+    reasons.push(`レビューの指摘が直らなかった: ${f.file}:${f.line ?? '-'} ${f.problem}`)
+  }
+  if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
+  const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
+  await askHuman('pr', r.impl.pr, question)
+  return question
 }
 
 // ---- 1 Issue の流れ ----
@@ -365,13 +390,14 @@ async function runIssue(info) {
     let approvedPlan = null
     if (info.needsPlan) {
       const p = await plan(info)
-      if (!p.ok) return { issue: info.number, status: 'blocked', reason: p.reason }
+      if (!p.ok) return { issue: info.number, status: 'needs_human', reason: p.reason, question: p.reason }
       approvedPlan = p.plan
     }
 
     const impl = await implement(info, approvedPlan)
     if (!impl || impl.status !== 'pr_opened' || !impl.pr) {
-      return { issue: info.number, status: 'blocked', reason: impl?.summary ?? '実装の段階が失敗した' }
+      const reason = impl?.summary ?? '実装の段階が失敗した'
+      return { issue: info.number, status: impl ? 'needs_human' : 'failed', reason, question: impl ? reason : null }
     }
 
     const tag = `#${info.number}`
@@ -397,7 +423,7 @@ ${toFix.map((f, i) => `${i + 1}. ${f.file}:${f.line ?? '-'} ${f.problem}`).join(
     const merge = MERGE && ready ? await mergePr(info, impl) : null
 
     const result = { impl, ci, rounds, merge }
-    await report(info, result)
+    const question = await report(info, { ...result, ready })
     return {
       issue: info.number,
       status: merge?.status === 'merged' ? 'merged' : ready ? 'ready' : 'needs_human',
@@ -407,6 +433,7 @@ ${toFix.map((f, i) => `${i + 1}. ${f.file}:${f.line ?? '-'} ${f.problem}`).join(
       reviewRounds: rounds.length,
       remainingFindings: remaining,
       mergeReason: merge?.reason ?? null,
+      question,
     }
   } finally {
     for (const a of areas.reverse()) areaLock(a).release()
@@ -439,7 +466,10 @@ const results = await parallel(infos.map(info => async () => {
   return r
 }))
 
+const finished = results.filter(Boolean)
 return {
-  results: results.filter(Boolean),
+  results: finished,
+  // 起動したセッションは、これをチャットでユーザーに聞く
+  questions: finished.filter(r => r.question).map(r => ({ issue: r.issue, pr: r.pr ?? null, question: r.question })),
   skipped: (selected?.issues ?? []).filter(i => i.blockedReason),
 }
