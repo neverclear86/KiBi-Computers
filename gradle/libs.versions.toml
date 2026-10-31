@@ -14,6 +14,7 @@ xz = "1.10"
 [libraries]
 endive-runtime = { module = "run.endive:runtime", version.ref = "endive" }
 endive-wasm = { module = "run.endive:wasm", version.ref = "endive" }
+endive-wasi = { module = "run.endive:wasi", version.ref = "endive" }
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }

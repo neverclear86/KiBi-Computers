@@ -22,6 +22,8 @@ import javax.inject.Inject
  * }
  * ```
  *
+ * 外部の C のソース（Lua など）は [WasmExtension.sourceArchive] で取得して `sources` に渡す。
+ *
  * Zig のバージョンとハッシュはルートの `gradle/zig.properties` で固定し、
  * 取得した Zig は `<Gradle ホーム>/kibicomputers/zig/` に置く（CI はここをキャッシュする）。
  */
@@ -69,5 +71,22 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
             resources.srcDir(task)
         }
         return task
+    }
+
+    /**
+     * C のソースのアーカイブを取得・展開するタスク `download<Name>Source` を登録する。
+     *
+     * 展開先は `build/sources/<name>/`。取得したアーカイブは `<Gradle ホーム>/kibicomputers/downloads/` に置く
+     * （CI はここをキャッシュする）。[module] の `sources` に、このタスクの `outputDir` から渡す。
+     */
+    fun sourceArchive(name: String, action: Action<SourceArchive>): TaskProvider<SourceArchive> {
+        val taskName = "download" + name.split('-', '_').joinToString("") { it.replaceFirstChar(Char::uppercaseChar) } + "Source"
+        return project.tasks.register(taskName, SourceArchive::class.java) {
+            group = "build"
+            description = "Downloads and extracts the $name sources."
+            downloadsDir.set(project.gradle.gradleUserHomeDir.resolve("kibicomputers/downloads"))
+            outputDir.convention(project.layout.buildDirectory.dir("sources/$name"))
+            action.execute(this)
+        }
     }
 }

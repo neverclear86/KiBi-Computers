@@ -31,6 +31,12 @@ jobs:
           path: ~/.gradle/kibicomputers/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/zig.properties') }}
 
+      # WASM にビルドする C のソース（Lua など。gradle/lua.properties で固定。#91）。Gradle が取得して ~/.gradle/kibicomputers/downloads に置く
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/downloads
+          key: wasm-sources-${{ hashFiles('gradle/lua.properties') }}
+
       - name: Build and test
         run: ./gradlew build --console=plain
 
