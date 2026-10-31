@@ -23,8 +23,12 @@ import java.io.ByteArrayOutputStream
  *
  * 残りの置き場所（[Storage]）:
  * - [Storage.GLOBAL]: 引くたびにグローバルを読み書きする（単純）
- * - [Storage.LOCAL]: 関数の中ではローカル変数に写して引き、呼び出し・戻る前にだけグローバルに書き戻す。
- *   呼び出しから戻った後と、例外を捕まえた先ではグローバルから読み直す
+ * - [Storage.LOCAL]: 関数の中ではローカル変数に写して引き、呼び出し・戻る・例外を投げる前にだけグローバルに書き戻す。
+ *   呼び出しから戻った後はグローバルから読み直す。
+ *   ただし `try_table` を含む関数は、この方式にせず [Storage.GLOBAL] で数える。例外を捕まえた先は、通常の実行
+ *   （`try_table` の本体が最後まで進んだとき、`loop` への `br` など）でも通るので、そこで読み直すと
+ *   ローカルに引いた分を捨ててしまう（終わらないループを止められなくなる）。例外で着いたときだけ読み直す方法は
+ *   WASM にないので、そういう関数はグローバルを正にする（呼ばれた先の分も、投げる前の書き戻しも、常に合う）
  *
  * import の関数を1つ足すので、定義済みの関数の番号が1つずれる。`call`・`return_call`・`ref.func`、
  * export、start、要素セグメント、グローバルの初期値の番号を付け替える。名前のカスタムセクションは捨てる。
@@ -205,10 +209,16 @@ object FuelInjector {
         bodyStart: Int,
         bodyEnd: Int,
         instructions: List<AnnotatedInstruction>,
-        ctx: BodyContext,
+        requested: BodyContext,
         out: Sink,
     ): BodyStats {
         val first = instructions.first().address()
+        // try_table を含む関数は、ローカルに写さずグローバルで数える（理由は [FuelInjector] の KDoc）
+        val ctx = if (requested.storage == Storage.LOCAL && instructions.any { it.opcode() == OpCode.TRY_TABLE }) {
+            BodyContext(requested.costModel, requested.fuelFunc, requested.global, requested.remap, Storage.GLOBAL, requested.local)
+        } else {
+            requested
+        }
         val cached = ctx.storage == Storage.LOCAL
         if (cached) {
             // ローカル変数の宣言に (1, i64) を足す
@@ -228,36 +238,6 @@ object FuelInjector {
         segStart[0] = true
         for (i in 0 until n - 1) if (instructions[i].opcode() in SEGMENT_END) segStart[i + 1] = true
 
-        // 例外を捕まえた先（try_table の catch の飛び先）。そこではグローバルから読み直す。
-        // ブロックなら end の後、loop なら先頭に飛ぶ。印は「この命令の直後で読み直す」
-        val reloadAfter = BooleanArray(n)
-        if (cached) {
-            val open = ArrayList<Int>() // 開いているブロックの命令の番号
-            for (i in 0 until n) {
-                val ins = instructions[i]
-                when (ins.opcode()) {
-                    OpCode.TRY_TABLE -> {
-                        for (c in ins.catches()) {
-                            // catch のラベルは try_table の外側から数える。関数そのもの（open の外）なら戻るだけなので不要
-                            val label = c.label()
-                            if (label < open.size) reloadAfter[open[open.size - 1 - label]] = true
-                        }
-                        open.add(i)
-                    }
-                    OpCode.BLOCK, OpCode.LOOP, OpCode.IF -> open.add(i)
-                    OpCode.END -> if (open.isNotEmpty()) {
-                        val b = open.removeAt(open.size - 1)
-                        // ブロック（loop 以外）は end の後に着く。印を end に移す
-                        if (reloadAfter[b] && instructions[b].opcode() != OpCode.LOOP) {
-                            reloadAfter[b] = false
-                            reloadAfter[i] = true
-                        }
-                    }
-                    else -> Unit
-                }
-            }
-        }
-
         var checks = 0
         var charges = 0
         var maxUnchecked = 0L
@@ -266,7 +246,7 @@ object FuelInjector {
         for (i in 0 until n) {
             val ins = instructions[i]
             val op = ins.opcode()
-            if (cached && (i == 0 || reloadAfter[i - 1])) out.loadLocal(ctx)
+            if (cached && i == 0) out.loadLocal(ctx)
             if (segStart[i]) {
                 var j = i
                 var cost = 0L

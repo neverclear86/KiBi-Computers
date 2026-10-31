@@ -140,5 +140,52 @@ class FuelMeteringTest {
         }
     }
 
+    /** 関数 `f`（型 `() -> ()`）1つだけを export する WASM。[body] は命令の並び（最後の `end` は含めない） */
+    private fun moduleOf(vararg body: Int): ByteArray {
+        val code = byteArrayOf(0x00) + body.map { it.toByte() }.toByteArray() + byteArrayOf(0x0B) // ローカルなし、end
+        fun section(id: Int, content: ByteArray) = byteArrayOf(id.toByte(), content.size.toByte()) + content
+        return byteArrayOf(0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00) +
+            section(1, byteArrayOf(1, 0x60, 0, 0)) +
+            section(3, byteArrayOf(1, 0)) +
+            section(7, byteArrayOf(1, 1, 'f'.code.toByte(), 0x00, 0)) +
+            section(10, byteArrayOf(1, code.size.toByte()) + code)
+    }
+
+    @Test
+    fun `例外の飛び先が loop でも、通常の実行で燃料を捨てず、終わらないループを止める`() {
+        // loop $l (try_table (catch_all $l) end) br $l end
+        val spin = moduleOf(0x03, 0x40, 0x1F, 0x40, 0x01, 0x02, 0x00, 0x0B, 0x0C, 0x00, 0x0B)
+        for (runtime in Runtime.entries) for (metering in listOf(Metering.INJECTED, Metering.INJECTED_GLOBAL)) {
+            val meter = FuelMeter { throw OutOfFuel() }
+            meter.start(1_000_000)
+            val instance = Engine(spin, runtime, metering).newInstance(meter)
+            // 止まらない実装でもテストが固まらないよう、デーモンのスレッドで動かして待つ
+            var error: Throwable? = null
+            val worker = Thread { error = runCatching { instance.export("f").apply() }.exceptionOrNull() }
+            worker.isDaemon = true
+            worker.start()
+            worker.join(20_000)
+            assertTrue(!worker.isAlive, "$runtime $metering: 燃料切れで止まらない")
+            assertTrue(generateSequence(error) { it.cause }.any { it is OutOfFuel }, "$runtime $metering: $error")
+        }
+    }
+
+    @Test
+    fun `例外の飛び先が block でも、通常の実行で引いた燃料を読み直しで捨てない`() {
+        // block $b (try_table (catch_all $b) nop nop nop end) nop nop end
+        val work = moduleOf(0x02, 0x40, 0x1F, 0x40, 0x01, 0x02, 0x00, 0x01, 0x01, 0x01, 0x0B, 0x01, 0x01, 0x0B)
+        for (runtime in Runtime.entries) {
+            val used = listOf(Metering.INJECTED, Metering.INJECTED_GLOBAL).map { metering ->
+                val engine = Engine(work, runtime, metering)
+                val meter = FuelMeter().also { it.start(unlimited) }
+                val instance = engine.newInstance(meter)
+                instance.export("f").apply()
+                engine.used(instance, meter)
+            }
+            assertTrue(used[1] > 0, "$runtime")
+            assertEquals(used[1], used[0], "$runtime: ローカルでもグローバルと同じ燃料")
+        }
+    }
+
     class OutOfFuel : RuntimeException("燃料切れ")
 }

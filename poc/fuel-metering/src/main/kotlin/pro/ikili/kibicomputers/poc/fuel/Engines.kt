@@ -93,14 +93,19 @@ class FuelMeter(var onExhausted: Refuel = Refuel { it }) {
 }
 
 /** 1つのモジュールを、1つの実行方式・計測方式で動かす準備をしたもの。 */
-class Engine(val wasm: Wasm, val runtime: Runtime, val metering: Metering) {
+class Engine private constructor(private val bytes: ByteArray, val wasm: Wasm?, val runtime: Runtime, val metering: Metering) {
+    constructor(wasm: Wasm, runtime: Runtime, metering: Metering) : this(wasm.bytes, wasm, runtime, metering)
+
+    /** テスト用に、バイト列そのものから作る（[runLua] は使えない） */
+    constructor(bytes: ByteArray, runtime: Runtime, metering: Metering) : this(bytes, null, runtime, metering)
+
     val injected: Boolean get() = metering == Metering.INJECTED || metering == Metering.INJECTED_GLOBAL
 
     private val module = Parser.parse(
         when (metering) {
-            Metering.INJECTED -> FuelInjector.inject(wasm.bytes, FuelInjector.Storage.LOCAL).bytes
-            Metering.INJECTED_GLOBAL -> FuelInjector.inject(wasm.bytes, FuelInjector.Storage.GLOBAL).bytes
-            else -> wasm.bytes
+            Metering.INJECTED -> FuelInjector.inject(bytes, FuelInjector.Storage.LOCAL).bytes
+            Metering.INJECTED_GLOBAL -> FuelInjector.inject(bytes, FuelInjector.Storage.GLOBAL).bytes
+            else -> bytes
         },
     )
 
