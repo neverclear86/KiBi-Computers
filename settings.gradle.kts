@@ -1,4 +1,6 @@
 pluginManagement {
+    // WASM のビルド（Zig）などのビルド用プラグイン
+    includeBuild("build-logic")
     repositories {
         gradlePluginPortal()
         maven("https://maven.neoforged.net/releases") { name = "NeoForged" }

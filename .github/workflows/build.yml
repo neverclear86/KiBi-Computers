@@ -25,6 +25,12 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v6
 
+      # WASM のビルドに使う Zig（gradle/zig.properties で固定。#9）。Gradle が初回に取得して ~/.gradle/kibicomputers/zig に置く
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/zig.properties') }}
+
       - name: Build and test
         run: ./gradlew build --console=plain
 
