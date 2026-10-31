@@ -22,6 +22,7 @@ import run.endive.runtime.GlobalInstance
 import run.endive.runtime.HostFunction
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
+import run.endive.runtime.TrapException
 import run.endive.wasm.InvalidException
 import run.endive.wasm.MalformedException
 import run.endive.wasm.Parser
@@ -231,6 +232,9 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
         } catch (e: UnlinkableException) {
             throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
         } catch (e: UninstantiableException) {
+            // start 関数のトラップは Endive が UninstantiableException に包むので、トラップとして投げ直す
+            val cause = e.cause
+            if (cause != null && (hostThrowable(cause) != null || cause is TrapException || cause is EndiveWasmException || cause is StackOverflowError)) rethrow(cause)
             throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
         } catch (e: InvalidException) {
             throw WasmLoadException("WASM の検証に通らない: ${e.message}", e)

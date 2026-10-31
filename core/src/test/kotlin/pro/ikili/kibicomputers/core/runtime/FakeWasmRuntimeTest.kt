@@ -65,4 +65,10 @@ class FakeWasmRuntimeTest : WasmRuntimeContractTest() {
                 .start { c, _ -> c.callImport("env", "started") }
                 .build(),
         )
+        .define(
+            TestModules.START_TRAP,
+            FakeModule.builder()
+                .start { c, _ -> c.trap(WasmTrapKind.UNREACHABLE) }
+                .build(),
+        )
 }

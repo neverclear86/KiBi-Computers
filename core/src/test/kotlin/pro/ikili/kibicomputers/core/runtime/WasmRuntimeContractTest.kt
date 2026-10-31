@@ -172,6 +172,18 @@ abstract class WasmRuntimeContractTest {
     }
 
     @Test
+    fun `start関数がトラップするとインスタンスを作るときWasmTrapException`() {
+        val e = assertThrows<WasmTrapException> { instantiate(TestModules.START_TRAP) }
+        assertEquals(WasmTrapKind.UNREACHABLE, e.kind)
+    }
+
+    @Test
+    fun `start関数の中のホストの関数の例外はインスタンスを作るときそのまま出る`() {
+        val config = WasmInstanceConfig.builder().hostFunction("env", "started", WasmFunctionType.EMPTY) { _, _ -> throw HostError() }.build()
+        assertThrows<HostError> { instantiate(TestModules.START, config) }
+    }
+
+    @Test
     fun `燃料を計測するモジュールは燃料の名前を隠す`() {
         val module = runtime.load(TestModules.FUEL)
         assertTrue(module.isFuelMetered)

@@ -81,6 +81,12 @@ object TestModules {
         build()
     }
 
+    /** start 関数が unreachable でトラップする */
+    val START_TRAP: ByteArray = WasmBinary().run {
+        start(func(emptyList(), emptyList(), code(0x00)))
+        build()
+    }
+
     /** WASM でないバイト列 */
     val MALFORMED: ByteArray = "not a wasm module".toByteArray()
 
