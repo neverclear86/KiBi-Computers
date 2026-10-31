@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
@@ -41,4 +42,6 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
 internal class SpawnOptions(
     /** 燃料を計測しないモジュールを動かす。テスト専用（同梱の WASM は #36・#92、プレイヤーの WASM は #29 で挿入済みになる） */
     val allowUnmetered: Boolean = false,
+    /** 標準入出力（fd 0/1/2）の割り当て。既定は親から引き継ぐ（親がなければコンソール） */
+    val stdio: StdioSpec = StdioSpec.INHERIT,
 )
