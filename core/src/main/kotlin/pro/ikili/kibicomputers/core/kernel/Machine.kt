@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRunner
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.ProgramLoadBusyException
 import pro.ikili.kibicomputers.core.kernel.process.Shebang
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
@@ -535,6 +536,10 @@ public class Machine private constructor(
      *   コンパイル用のスレッドで行う（#37）。同じ中身・同じ読み込み方の WASM は、読み込んだ結果をサーバー全体で共有する
      *   （[pro.ikili.kibicomputers.core.kernel.process.ProgramCache]）。読み込みが終わっていなければ [await] で待つ
      *   （プロセスからの呼び出しは、CPU と許可を返して待つ）。重いので、メインスレッドからは呼ばない
+     * - 読み込みの待ち行列はマシンごとに分けて巡回する（#363）。このマシンの読み込み中・待ち行列にある読み込みが上限
+     *   （[pro.ikili.kibicomputers.core.kernel.process.ProgramCache.DEFAULT_MAX_PENDING_PER_OWNER]）に達していたら `AGAIN`。
+     *   待つのをやめたら（止められた・起動の取り消し）、ほかに待つ側がなく、まだ始まっていない読み込みは取り消す。
+     *   最近 WASM として読めなかったものは、読み込み直さずに `NOEXEC`
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
      */
@@ -554,18 +559,26 @@ public class Machine private constructor(
             val limits = scheduler.options.moduleLimits
             val metered = scheduler.options.meterExecutables
             val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
-            val future = scheduler.programs.load(executable.bytes, metered, waitImports) { bytes ->
+            val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
                 if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
             }
-            // 共有しているものがあれば、待たずに（CPU と許可を持ったまま）使う
-            when {
-                future.isDone -> awaitProgram(future, null)
-                await != null -> await(future)
-                // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
-                else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
+            try {
+                // 共有しているものがあれば、待たずに（CPU と許可を持ったまま）使う
+                when {
+                    future.isDone -> awaitProgram(future, null)
+                    await != null -> await(future)
+                    // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
+                    else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
+                }
+            } catch (e: Throwable) {
+                // 待つのをやめた（止められた・起動の取り消し）。ほかに待つ側がなく、まだ始まっていなければ読み込まない（#363）
+                future.cancel(false)
+                throw e
             }
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
+        } catch (e: ProgramLoadBusyException) {
+            fsError(Errno.AGAIN, "${executable.path} を読み込めない: ${e.message}")
         }
         val driver = drivers.create(program)
         return spawn(program, driver, options.copy(args = executable.args), parentPid, asInit)
