@@ -28,6 +28,12 @@ internal interface TerminalListener {
  * 色は [maxColors]（画面と GPU の色数の低い方）に合わせて丸める（[TerminalColors]）。
  * 代替画面（エディタ用）に入っている間は、元の画面の中身を写しとして持ち、出るときに [buffer] に書き戻す。
  *
+ * 続けて来たスクロール（LF・`ESC [ S` など、同じ領域を上へ送るもの）は、[buffer] に書く前にまとめて1回の写しにする
+ * （領域の高さ以上なら消すだけにする。#357）。[buffer] には、[write] から戻るまでに必ず書く。
+ *
+ * 処理の重さは「触ったセルの数」（書いた・消した・写したセル。読んだバイトも1つずつ数える）で [cost] に数える。
+ * [write] に上限を渡すと、上限に届いたところで読むのを止める（続きは次の [write] に渡す）。
+ *
  * 状態は番号・真偽・配列だけで持つ。スレッドセーフではない。
  *
  * @param buffer 書き込む先。外から大きさを変えてもよい（次の [write] で合わせる）
@@ -128,17 +134,47 @@ internal class AnsiTerminal(
     private var runFg = 0
     private var runBg = 0
 
+    // まだバッファに写していない、続けて来た上へのスクロール（行 scrollFrom〜scrollBottom を scrollLines 行。#357）
+    private var scrollLines = 0
+    private var scrollFrom = 0
+    private var scrollBottom = 0
+    private var scrollFg = 0
+    private var scrollBg = 0
+
+    /** 最後の [write] で触ったセルの数（読んだバイトの数を含む）。上限を渡して書くときの目安。 */
+    var cost: Long = 0
+        private set
+
     init {
         resolveColors()
     }
 
     /** UTF-8 のバイト列 [bytes] の [offset] から [length] バイトを解釈して書く。 */
     fun write(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset) {
+        write(bytes, offset, length, Long.MAX_VALUE)
+    }
+
+    /**
+     * [write] と同じだが、触ったセルの数（[cost]）が [budget] に届いたら、そこで読むのを止める。
+     * 1つの操作の途中では止めないので、[cost] は [budget] を1回の操作（画面の大きさ程度）の分まで超えうる。
+     * [budget] が正なら、少なくとも1バイトは読む。
+     *
+     * @return 読んだバイト数。残りは次に（同じ続きから）渡す
+     */
+    fun write(bytes: ByteArray, offset: Int, length: Int, budget: Long): Int {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "range out of bounds" }
+        cost = 0
         syncSize()
-        for (i in offset until offset + length) decode(bytes[i].toInt() and 0xFF)
+        var i = offset
+        val end = offset + length
+        while (i < end && cost < budget) {
+            cost++
+            decode(bytes[i++].toInt() and 0xFF)
+        }
         flushRun()
+        flushScroll()
         publishCursor()
+        return i - offset
     }
 
     /** 文字列 [text] を UTF-8 にして [write] する。 */
@@ -149,6 +185,8 @@ internal class AnsiTerminal(
 
     /** 画面の大きさを変える（[buffer] の大きさを変え、スクロール領域を画面全体に戻す）。 */
     fun resize(columns: Int, rows: Int) {
+        flushRun()
+        flushScroll()
         buffer.resize(columns, rows)
         syncSize()
         publishCursor()
@@ -584,6 +622,8 @@ internal class AnsiTerminal(
         }
         if (insertMode) {
             flushRun()
+            flushScroll()
+            cost += columns - cursorX
             buffer.copy(cursorX, cursorY, columns - cursorX - width, 1, width, 0)
         }
         appendRun(cursorX, cursorY, cp)
@@ -622,6 +662,8 @@ internal class AnsiTerminal(
 
     private fun flushRun() {
         if (runCells == 0) return
+        flushScroll()
+        cost += runCells
         // 全角の文字の右半分に書くときは、左の全角の文字を消す（描画で右半分が隠れないように）
         if (runX > 0 && runX - 1 < buffer.width && runY < buffer.height) {
             val left = buffer.getCodePoint(runX - 1, runY)
@@ -713,11 +755,17 @@ internal class AnsiTerminal(
     private fun fillRow(y: Int, from: Int, to: Int) {
         val x0 = from.coerceIn(0, columns)
         val x1 = to.coerceIn(0, columns)
-        if (x0 < x1) buffer.fill(x0, y, x1 - x0, 1, TextBuffer.BLANK, eraseFg, eraseBg)
+        if (x0 >= x1) return
+        flushScroll()
+        cost += x1 - x0
+        buffer.fill(x0, y, x1 - x0, 1, TextBuffer.BLANK, eraseFg, eraseBg)
     }
 
     private fun fillRows(from: Int, to: Int) {
-        if (from < to) buffer.fill(0, from, columns, to - from, TextBuffer.BLANK, eraseFg, eraseBg)
+        if (from >= to) return
+        flushScroll()
+        cost += (to - from).toLong() * columns
+        buffer.fill(0, from, columns, to - from, TextBuffer.BLANK, eraseFg, eraseBg)
     }
 
     private fun eraseInDisplay(n: Int) {
@@ -746,6 +794,8 @@ internal class AnsiTerminal(
 
     private fun insertChars(n: Int) {
         val count = minOf(n, columns - cursorX)
+        flushScroll()
+        cost += columns - cursorX
         buffer.copy(cursorX, cursorY, columns - cursorX - count, 1, count, 0)
         fillRow(cursorY, cursorX, cursorX + count)
         wrapPending = false
@@ -753,6 +803,8 @@ internal class AnsiTerminal(
 
     private fun deleteChars(n: Int) {
         val count = minOf(n, columns - cursorX)
+        flushScroll()
+        cost += columns - cursorX
         buffer.copy(cursorX + count, cursorY, columns - cursorX - count, 1, -count, 0)
         fillRow(cursorY, columns - count, columns)
         wrapPending = false
@@ -776,19 +828,42 @@ internal class AnsiTerminal(
 
     private fun scrollDown(n: Int) = scrollRegionDown(top, n)
 
-    // 行 from〜bottom を n 行上へずらし、下に空いた行を消す
+    // 行 from〜bottom を n 行上へずらし、下に空いた行を消す。すぐには写さず、続けて来た分とまとめる（#357）
     private fun scrollRegionUp(from: Int, n: Int) {
         val height = bottom - from + 1
-        val count = minOf(n, height)
-        if (count < height) buffer.copy(0, from + count, columns, height - count, 0, -count)
-        fillRows(bottom - count + 1, bottom + 1)
+        if (scrollLines > 0 && (from != scrollFrom || bottom != scrollBottom || eraseFg != scrollFg || eraseBg != scrollBg)) {
+            flushScroll()
+        }
+        if (scrollLines == 0) {
+            scrollFrom = from
+            scrollBottom = bottom
+            scrollFg = eraseFg
+            scrollBg = eraseBg
+        }
+        // 領域の高さ以上は、全部を消すのと同じ
+        scrollLines = (scrollLines.toLong() + n).coerceAtMost(height.toLong()).toInt()
+    }
+
+    // まとめておいた上へのスクロールを、1回の写しと消去でバッファに書く
+    private fun flushScroll() {
+        val count = scrollLines
+        if (count == 0) return
+        scrollLines = 0
+        val height = scrollBottom - scrollFrom + 1
+        cost += height.toLong() * columns
+        if (count < height) buffer.copy(0, scrollFrom + count, columns, height - count, 0, -count)
+        buffer.fill(0, scrollBottom - count + 1, columns, count, TextBuffer.BLANK, scrollFg, scrollBg)
     }
 
     // 行 from〜bottom を n 行下へずらし、上に空いた行を消す
     private fun scrollRegionDown(from: Int, n: Int) {
         val height = bottom - from + 1
         val count = minOf(n, height)
-        if (count < height) buffer.copy(0, from, columns, height - count, 0, count)
+        if (count < height) {
+            flushScroll()
+            cost += (height - count).toLong() * columns
+            buffer.copy(0, from, columns, height - count, 0, count)
+        }
         fillRows(from, from + count)
     }
 
@@ -804,6 +879,8 @@ internal class AnsiTerminal(
     private fun alignmentTest() {
         top = 0
         bottom = rows - 1
+        flushScroll()
+        cost += columns.toLong() * rows
         buffer.fill(0, 0, columns, rows, 'E'.code, TextBuffer.DEFAULT_FOREGROUND, TextBuffer.DEFAULT_BACKGROUND)
         cursorX = 0
         cursorY = 0
@@ -843,6 +920,8 @@ internal class AnsiTerminal(
 
     private fun enterAlternate() {
         if (alternateScreen) return
+        flushScroll()
+        cost += columns.toLong() * rows
         savedMain = buffer.copyOf()
         fillRows(0, rows)
     }
@@ -855,6 +934,8 @@ internal class AnsiTerminal(
 
     // 写しの中身を、同じ色が続くセルをまとめて書き戻す（描画命令の記録を小さくするため）
     private fun restoreBuffer(from: TextBuffer) {
+        flushScroll()
+        cost += columns.toLong() * rows
         val sb = StringBuilder()
         for (y in 0 until minOf(rows, from.height)) {
             var x = 0
@@ -900,6 +981,9 @@ internal class AnsiTerminal(
         cursorX = 0
         cursorY = 0
         state = GROUND
+        // 画面全体を消すので、まとめておいたスクロールは写さずに捨てる
+        scrollLines = 0
+        cost += columns.toLong() * rows
         buffer.clear()
     }
 
@@ -907,6 +991,8 @@ internal class AnsiTerminal(
     private fun syncSize() {
         if (buffer.width == columns && buffer.height == rows) return
         flushRun()
+        // まとめておいたスクロールは write の終わりに必ず書くので、ふつうはここでは残っていない
+        flushScroll()
         columns = buffer.width
         rows = buffer.height
         top = 0
