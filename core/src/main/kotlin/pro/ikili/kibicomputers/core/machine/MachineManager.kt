@@ -171,7 +171,7 @@ public class MachineManager<K : Any> internal constructor(
     override fun close() {
         if (closed) return
         closed = true
-        for (key in entries.keys.toList()) {
+        for (key in ArrayList(entries.keys)) {
             entries.remove(key)?.let { stopEntry(it) }
         }
         scheduler.close()
