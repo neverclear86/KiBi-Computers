@@ -33,6 +33,8 @@ application {
 
 // C だけの最小の reactor（例外処理なし。いちばん簡単な場合の基準）
 kibiWasm.module("waiter") {
+    // 測ったときと同じ Zig の既定のスタック（16 MiB）。kibicomputers.wasm の既定（#334）を使わない
+    stackSize = 16 * 1024 * 1024
     sources.from("src/main/wasm/waiter.c")
     compilerArgs.addAll("-O2", "-s", "-mexec-model=reactor", "-Wl,--export=poc_step")
 }
@@ -62,7 +64,8 @@ kibiWasm.module("lua_host") {
         "-D_WASI_EMULATED_PROCESS_CLOCKS",
         "-lwasi-emulated-signal",
         "-lwasi-emulated-process-clocks",
-        "-Wl,-z,stack-size=1048576",
+        // core は stackSize（#334）で指定している
+        "-Wl,-z,stack-size=262144",
         // ここまで core と同じ。以下は reactor 用
         "-mexec-model=reactor",
         "-Wl,--export=poc_alloc,--export=poc_load,--export=poc_resume",

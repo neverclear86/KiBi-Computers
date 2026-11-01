@@ -84,6 +84,31 @@ class LuaWasmTest {
     }
 
     @Test
+    fun `Cのスタックを深く使う処理は、小さいスタックでもLuaのエラーになり、落ちない`() {
+        // C のスタックは 256 KiB（#334）。LUAI_MAXCCALLS（200）の深さまで、C のスタックが足りること
+        val script = """
+            local function nest(n) if n == 0 then return 0 end return select(2, pcall(nest, n - 1)) + 1 end
+            print(nest(150))
+            local function deep() return pcall(deep) end
+            print(pcall(deep))
+            local src = string.rep("(", 180) .. "1" .. string.rep(")", 180)
+            print(load("return " .. src)())
+            print(pcall(load, "return " .. string.rep("(", 1000) .. "1" .. string.rep(")", 1000)))
+            local s = string.rep("a", 150)
+            print(#s:gsub("a", function(c) return (c:gsub("a", function(d) return d .. d end)) end))
+            print(select(2, pcall(string.rep, "x", 100, string.rep(",", 10))):len())
+        """.trimIndent()
+        val r = lua("-e", script)
+        assertEquals(0, r.exitCode, r.stderr)
+        val lines = r.stdout.lines()
+        assertEquals("150", lines[0], r.stdout)
+        assertTrue("stack overflow" in lines[1], r.stdout)
+        assertEquals("1", lines[2], r.stdout)
+        assertTrue(lines[3].startsWith("true	nil	") || lines[3].startsWith("false	"), r.stdout)
+        assertEquals("300", lines[4], r.stdout)
+    }
+
+    @Test
     fun `捕まえないエラーはstderrに出て終了コード1になる`() {
         val r = lua("-e", "error('uncaught')")
         assertEquals(1, r.exitCode)

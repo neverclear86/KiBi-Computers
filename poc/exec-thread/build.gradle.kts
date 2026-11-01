@@ -29,6 +29,8 @@ application {
 
 // 負荷の WASM（WASI なし）。燃料とワールド操作はホストの import
 kibiWasm.module("work") {
+    // 測ったときと同じ Zig の既定のスタック（16 MiB）。kibicomputers.wasm の既定（#334）を使わない
+    stackSize = 16 * 1024 * 1024
     sources.from("src/main/wasm/work.c")
     target = "wasm32-freestanding"
     compilerArgs.addAll(
