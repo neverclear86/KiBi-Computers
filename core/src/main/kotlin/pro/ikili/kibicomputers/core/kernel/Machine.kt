@@ -271,10 +271,12 @@ public class Machine private constructor(
     private var consoleHold: ConsoleHoldListener? = null
 
     /**
-     * 止めている間に配らなかったコンソールの出力。書いた順に並べ、`null` は TTY の出力の印（TTY から取り出すのは再開したとき）。
-     * TTY の印は [consoleDirty] を下ろさずに持つので、多くても1つ。メインスレッドだけで読み書きする
+     * 止めている間に配らなかったコンソールの出力（[HostNotification.Console] と、TTY の出力の印 [HostNotification.TtyOutput]）。
+     * 書いた順に並べる。TTY から取り出すのは再開したとき。TTY の印は [consoleDirty] を下ろさずに持つので、多くても1つ
+     * （印の後に TTY に書いた分は、カーネルのメッセージの目印 [HostNotification.Console.ttyMark] で前後を分ける。#381）。
+     * メインスレッドだけで読み書きする
      */
-    private var deferredConsole: ArrayList<ByteArray?>? = null
+    private var deferredConsole: ArrayList<HostNotification>? = null
 
     /** 配っていないコンソール出力のバイト数と、ビープの数（上限を超えた分は捨てる） */
     private val pendingConsoleBytes = AtomicLong()
@@ -1326,7 +1328,8 @@ public class Machine private constructor(
      * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
      * 配っていない分（CR LF にした後のバイト数）が [MachineLimits.MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
-     * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）
+     * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）。
+     * TTY の出力との前後を保つため、カーネルロックの中で、その時点の TTY の出力の位置を目印に付けて積む（#381）
      */
     internal fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
@@ -1335,7 +1338,7 @@ public class Machine private constructor(
     }
 
     /** LF を CR LF にした [bytes] を通知の列に積む（上限を超える分は捨てる） */
-    private fun postConsole(bytes: ByteArray): Boolean {
+    private fun postConsole(bytes: ByteArray): Boolean = lock.withLockValue {
         val length = bytes.size
         var accepted: Int
         while (true) {
@@ -1344,8 +1347,13 @@ public class Machine private constructor(
             if (accepted == 0 || pendingConsoleBytes.compareAndSet(pending, pending + accepted)) break
         }
         if (accepted < length) droppedConsoleBytes.addAndGet((length - accepted).toLong())
-        if (accepted > 0) postNotification(HostNotification.Console(if (accepted == length) bytes else bytes.copyOf(accepted)))
-        return accepted == length
+        if (accepted > 0) {
+            // 目印と列の位置を、TTY の印（markConsoleDirty。TTY に書くときにカーネルロックの中で積む）とそろえる
+            val tty = kernel.consoleTtyId.let { if (it == 0) null else kernel.objects[it] as? Tty }
+            val chunk = if (accepted == length) bytes else bytes.copyOf(accepted)
+            postNotification(HostNotification.Console(chunk, tty, tty?.outputWritten ?: 0L))
+        }
+        accepted == length
     }
 
     /** [bytes] の範囲を写し、LF を CR LF にする（ONLCR と同じ） */
@@ -1388,45 +1396,24 @@ public class Machine private constructor(
     /**
      * `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる。
      *
-     * TTY の出力は、たまった最初のときに通知の列へ印（[HostNotification.TtyOutput]）を積む。印のところで TTY から取り出して、
-     * 前後の通知と書いた順に並べる（起動のログ → init の出力 → init の終了のメッセージ → RUNNING など）
+     * TTY の出力は、たまった最初のときに通知の列へ印（[HostNotification.TtyOutput]）を積む。印より後は、TTY から取り出して、
+     * 前後の通知と書いた順に並べる（起動のログ → init の出力 → init の終了のメッセージ → RUNNING など）。カーネルのメッセージの前では、
+     * そのメッセージを書いた時点までに TTY に書いた分だけを取り出す（[HostNotification.Console.ttyMark]。#381）
      */
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
-        var console: ByteArrayOutputStream? = null
-        fun appendConsole(bytes: ByteArray) {
-            (console ?: ByteArrayOutputStream().also { console = it }).write(bytes, 0, bytes.size)
-        }
+        val out = ConsoleCollector()
         // 止めている相手に、新しい tick になったことを知らせる（続きを処理して、追いつけば止めるのをやめる）
         consoleHold?.let { safely { it.resume() } }
-        if (consoleHold == null) resumeDeferredConsole(::appendConsole)
+        if (consoleHold == null) resumeDeferredConsole(out)
         while (true) {
             val n = notifications.poll() ?: break
-            if (n is HostNotification.Console) {
-                if (consoleHold != null) {
-                    // 止めている間は、書いた順に取っておく（配っていないバイト数は、配るまで減らさない）
-                    deferConsole(n.bytes)
-                    continue
-                }
-                pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
-                appendConsole(n.bytes)
+            if (n is HostNotification.Console || n === HostNotification.TtyOutput) {
+                // 止めている間は、書いた順に取っておく（配っていないバイト数は、配るまで減らさない。TTY の印は下ろさない）
+                if (consoleHold != null) deferConsole(n) else out.add(n)
                 continue
             }
-            if (n === HostNotification.TtyOutput) {
-                if (consoleHold != null) {
-                    // 印を下ろさずに取っておく。TTY の出力がたまったままになり、書き手は空くまで待つ
-                    deferConsole(null)
-                    continue
-                }
-                // 印を下ろしてから取り出す（取り出した後の出力は、新しい印で次に配る）
-                consoleDirty.set(false)
-                drainConsoleOutput()?.let(::appendConsole)
-                continue
-            }
-            console?.let { out ->
-                console = null
-                safely { host.onConsoleOutput(this, out.toByteArray()) }
-            }
+            out.flush()
             when (n) {
                 is HostNotification.StateChanged -> safely { host.onStateChanged(this, n.state, n.cause) }
                 is HostNotification.Beep -> {
@@ -1443,10 +1430,64 @@ public class Machine private constructor(
             }
         }
         // 通知の中で止めるのをやめた（つなぎを外したなど）なら、取っておいた分もここで配る
-        if (consoleHold == null) resumeDeferredConsole(::appendConsole)
-        console?.let { out -> safely { host.onConsoleOutput(this, out.toByteArray()) } }
+        if (consoleHold == null) resumeDeferredConsole(out)
+        out.flush()
         // 止めている間は、毎 tick 回ってくる（止めている台だけ。待っている台の負荷は増えない）
         if (consoleHold != null) requestNotify()
+    }
+
+    /**
+     * 1回の通知で配るコンソール出力を、書いた順にまとめる（メインスレッドだけで使う）。
+     * TTY の印を見たら、TTY から取り出すのを、次のカーネルのメッセージの前（その目印まで）か、ほかの通知の前・終わり（全部）まで遅らせる
+     */
+    private inner class ConsoleCollector {
+        private var bytes: ByteArrayOutputStream? = null
+
+        // TTY の印を見て、まだ全部は取り出していない
+        private var ttyPending = false
+
+        fun add(n: HostNotification) {
+            if (n === HostNotification.TtyOutput) {
+                // 印を下ろしてから取り出す（下ろした後の出力は、新しい印で積まれる）
+                consoleDirty.set(false)
+                ttyPending = true
+                return
+            }
+            n as HostNotification.Console
+            if (ttyPending) drainTtyBefore(n)?.let(::append)
+            pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
+            append(n.bytes)
+        }
+
+        /** たまった分を [host] に渡す（TTY の残りも取り出す） */
+        fun flush() {
+            if (ttyPending) {
+                ttyPending = false
+                drainConsoleOutput()?.let(::append)
+            }
+            val b = bytes ?: return
+            bytes = null
+            safely { host.onConsoleOutput(this@Machine, b.toByteArray()) }
+        }
+
+        private fun append(b: ByteArray) {
+            (bytes ?: ByteArrayOutputStream().also { bytes = it }).write(b, 0, b.size)
+        }
+    }
+
+    /**
+     * カーネルのメッセージ [message] を書いた時点までにコンソールの TTY に書いた分を取り出す（書き手を起こす）。なければ `null`。
+     * TTY が替わっていたら（状態を読み込んだなど）全部取り出す
+     */
+    private fun drainTtyBefore(message: HostNotification.Console): ByteArray? = lock.withLockValue {
+        val id = kernel.consoleTtyId
+        val tty = (if (id == 0) null else kernel.objects[id] as? Tty) ?: return@withLockValue null
+        when {
+            // 書いたときは TTY がなかった（それより前の TTY の出力はない）
+            message.tty == null -> null
+            message.tty === tty -> tty.drainOutput(wakeSink, message.ttyMark)
+            else -> tty.drainOutput(wakeSink)
+        }
     }
 
     /**
@@ -1475,23 +1516,15 @@ public class Machine private constructor(
         if (queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
     }
 
-    private fun deferConsole(bytes: ByteArray?) {
-        (deferredConsole ?: ArrayList<ByteArray?>().also { deferredConsole = it }).add(bytes)
+    private fun deferConsole(n: HostNotification) {
+        (deferredConsole ?: ArrayList<HostNotification>().also { deferredConsole = it }).add(n)
     }
 
-    /** 止めている間に取っておいた出力を、書いた順に [append] へ渡す */
-    private inline fun resumeDeferredConsole(append: (ByteArray) -> Unit) {
+    /** 止めている間に取っておいた出力を、書いた順に [out] へ渡す */
+    private fun resumeDeferredConsole(out: ConsoleCollector) {
         val deferred = deferredConsole ?: return
         deferredConsole = null
-        for (bytes in deferred) {
-            if (bytes == null) {
-                consoleDirty.set(false)
-                drainConsoleOutput()?.let(append)
-            } else {
-                pendingConsoleBytes.addAndGet(-bytes.size.toLong())
-                append(bytes)
-            }
-        }
+        for (n in deferred) out.add(n)
     }
 
     private inline fun safely(block: () -> Unit) {
@@ -1677,7 +1710,11 @@ internal fun interface ConsoleHoldListener {
 private sealed class HostNotification {
     class StateChanged(val state: MachineState, val cause: Throwable?) : HostNotification()
 
-    class Console(val bytes: ByteArray) : HostNotification()
+    /**
+     * カーネルのメッセージ。[tty] は書いたときのコンソールの TTY（なければ `null`）、[ttyMark] はそのときの
+     * [Tty.outputWritten]（TTY の出力との前後の目印。#381）
+     */
+    class Console(val bytes: ByteArray, val tty: Tty?, val ttyMark: Long) : HostNotification()
 
     /** コンソールの TTY に出力がたまった印（取り出すのは配るとき。列の中の位置が、書いた順の目印になる） */
     data object TtyOutput : HostNotification()

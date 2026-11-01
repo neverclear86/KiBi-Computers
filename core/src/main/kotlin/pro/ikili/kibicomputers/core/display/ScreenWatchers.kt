@@ -158,11 +158,17 @@ public constructor(
         return true
     }
 
-    /** [player] を見ている人から外す（ログアウトしたときなど）。 */
+    /**
+     * [player] を見ている人から外し、最後に画面全体を送った tick も忘れる。
+     * ログアウトしたとき、リスポーンでプレイヤーのオブジェクトが替わったとき、ディメンションを移ったとき
+     * （クライアントの画面は作り直されるので、戻ってきたら間隔を待たずに画面全体を送る）に呼ぶ。
+     * 外したオブジェクトへの参照は残らない。
+     */
     public fun remove(player: P) {
         watchers.remove(player)
         fresh.remove(player)
         deferred.remove(player)
+        lastKeyframe.remove(player)
     }
 
     /** 見ている人をすべて外す（画面が消えたときなど）。 */
