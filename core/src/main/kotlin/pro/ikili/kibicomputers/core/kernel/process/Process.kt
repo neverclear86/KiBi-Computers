@@ -6,7 +6,10 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.util.EnumSet
 
-/** プロセスの動き方。どちらを使うかは ABI 層が決める（#63・#72・#73）。 */
+/**
+ * プロセスの動き方。どちらを使うかは ABI 層が決める（#63・#72・#73）。
+ * p1 の `poll_oneoff`（#72、ADR 0072）は、`BLOCKING` ならそろうまで止まり、`WAIT_POINT` なら待たずに `AGAIN`（待ちに入る形は #329）
+ */
 internal enum class ProcessKind {
     /** ホスト関数の中でスレッドを止めて待つ（p1 の `_start`、p2 の同期呼び出し）。待っている間は保存できない */
     BLOCKING,

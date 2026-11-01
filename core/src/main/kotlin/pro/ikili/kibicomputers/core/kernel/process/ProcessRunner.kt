@@ -503,6 +503,9 @@ internal class ProcessRunner(private val machine: Machine) {
     // ---- ProcessContext ----
 
     private inner class Context(private val rt: ProcessRuntime) : ProcessContext {
+        /** [openWaitTimer] で作って、まだ閉じていない一時的なタイマーのオブジェクトID（実行時だけ。カーネルロックの中で使う。最初に使うときに作る） */
+        private var waitTimerIds: HashSet<Int>? = null
+
         override val pid: Int get() = rt.pid
 
         override val parentPid: Int get() = rt.process.parentPid
@@ -616,25 +619,41 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun timerWaitKey(handle: Int): WaitKey = lock.withLockValue { WaitKey(timerLocked(handle).id, WaitCondition.READABLE) }
 
+        override fun openWaitTimer(deadlineNanos: Long): WaitKey = lock.withLockValue {
+            val objects = machine.kernel.objects
+            val timer = Timer()
+            val id = objects.add(timer)
+            try {
+                machine.armTimerLocked(timer, deadlineNanos, 0)
+            } catch (t: Throwable) {
+                objects.release(id, machine.wakeSink)
+                throw t
+            }
+            (waitTimerIds ?: HashSet<Int>(4).also { waitTimerIds = it }) += id
+            WaitKey(id, WaitCondition.READABLE)
+        }
+
+        override fun resetWaitTimer(key: WaitKey, deadlineNanos: Long) = lock.withLockValue {
+            require(waitTimerIds?.contains(key.objectId) == true) { "一時的なタイマーではない: $key" }
+            val timer = machine.kernel.objects[key.objectId] as Timer
+            machine.armTimerLocked(timer, deadlineNanos, 0)
+        }
+
+        override fun closeWaitTimer(key: WaitKey) = lock.withLockValue {
+            val ids = waitTimerIds ?: return@withLockValue
+            if (!ids.remove(key.objectId)) return@withLockValue
+            if (ids.isEmpty()) waitTimerIds = null
+            machine.kernel.objects.release(key.objectId, machine.wakeSink)
+        }
+
         override fun sleep(nanos: Long) {
             checkThread()
             if (nanos <= 0) return
-            val key = lock.withLockValue {
-                val objects = machine.kernel.objects
-                val timer = Timer()
-                val id = objects.add(timer)
-                try {
-                    machine.armTimerLocked(timer, saturatingAdd(machine.monotonicNanosLocked(), nanos), 0)
-                } catch (t: Throwable) {
-                    objects.release(id, machine.wakeSink)
-                    throw t
-                }
-                WaitKey(id, WaitCondition.READABLE)
-            }
+            val key = openWaitTimer(saturatingAdd(monotonicNanos(), nanos))
             try {
                 block(listOf(key))
             } finally {
-                lock.withLockValue { machine.kernel.objects.release(key.objectId, machine.wakeSink) }
+                closeWaitTimer(key)
             }
         }
 

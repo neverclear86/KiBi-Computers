@@ -170,7 +170,26 @@ internal interface ProcessContext {
     fun timerWaitKey(handle: Int): WaitKey
 
     /**
-     * ブロッキング型だけ: [nanos] の間、[block] で止まる（0 以下ならすぐ返る）。ハンドル表を使わない一時的なタイマーで待つ。
+     * ハンドル表を使わない一時的なタイマーを作り、単調時計の期限 [deadlineNanos] に設定して、その `READABLE` の key を返す
+     * （p1 の `poll_oneoff` の時計、[sleep]。#72）。呼んだ側が必ず [closeWaitTimer] で閉じる。
+     * マシンの動いているタイマーが上限なら [ResourceLimitException]（そのときは何も残さない）
+     */
+    @Throws(ResourceLimitException::class)
+    fun openWaitTimer(deadlineNanos: Long): WaitKey
+
+    /**
+     * [openWaitTimer] のタイマー [key] を期限 [deadlineNanos] に設定し直す（鳴った回数は 0 に戻る）。
+     * 鳴った後で予定が外れていて、マシンの動いているタイマーが上限なら [ResourceLimitException]。
+     * [key] が一時的なタイマーでなければ [IllegalArgumentException]
+     */
+    @Throws(ResourceLimitException::class)
+    fun resetWaitTimer(key: WaitKey, deadlineNanos: Long)
+
+    /** [openWaitTimer] のタイマー [key] を閉じる（予定も取り消す）。もう閉じていれば何もしない */
+    fun closeWaitTimer(key: WaitKey)
+
+    /**
+     * ブロッキング型だけ: [nanos] の間、[block] で止まる（0 以下ならすぐ返る）。ハンドル表を使わない一時的なタイマー（[openWaitTimer]）で待つ。
      * マシンの動いているタイマーが上限なら [ResourceLimitException]
      */
     @Throws(ProcessKilledException::class, ResourceLimitException::class)

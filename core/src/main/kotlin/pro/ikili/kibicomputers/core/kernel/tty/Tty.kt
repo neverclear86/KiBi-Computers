@@ -104,6 +104,9 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     /** 配っていない出力のバイト数 */
     val outputAvailable: Int get() = output.length
 
+    /** 出力に今書ける空き（バイト。p1 の `poll_oneoff` の `nbytes`。#72） */
+    val outputFree: Int get() = outputSpace.coerceAtLeast(0)
+
     /** 確保しているバッファの合計（テスト用） */
     internal val allocatedBytes: Int get() = input.allocatedBytes + line.allocatedBytes + output.allocatedBytes
 

@@ -33,6 +33,17 @@ internal object P1 {
     const val CLOCK_PROCESS_CPUTIME: Int = 2
     const val CLOCK_THREAD_CPUTIME: Int = 3
 
+    // ---- eventtype（u8） ----
+    const val EVENTTYPE_CLOCK: Int = 0
+    const val EVENTTYPE_FD_READ: Int = 1
+    const val EVENTTYPE_FD_WRITE: Int = 2
+
+    // ---- subclockflags（u16） ----
+    const val SUBCLOCKFLAGS_ABSTIME: Int = 1
+
+    // ---- eventrwflags（u16） ----
+    const val EVENTRWFLAGS_FD_READWRITE_HANGUP: Int = 1
+
     // ---- fdflags（u16） ----
     const val FDFLAGS_APPEND: Int = 1
     const val FDFLAGS_DSYNC: Int = 2
@@ -139,6 +150,19 @@ internal object P1 {
     /** `dirent`: d_next（u64）@0、d_ino（u64）@8、d_namlen（u32）@16、d_type（u8）@20。この後に名前（NUL なし）が続く */
     const val DIRENT_SIZE: Int = 24
 
+    /**
+     * `subscription`（align 8）: userdata（u64）@0、tag（u8。eventtype）@8、中身 @16。
+     * clock のとき: id（u32）@16、timeout（u64）@24、precision（u64）@32、flags（u16。subclockflags）@40。
+     * fd_read・fd_write のとき: file_descriptor（u32）@16
+     */
+    const val SUBSCRIPTION_SIZE: Int = 48
+
+    /**
+     * `event`（align 8）: userdata（u64）@0、error（u16。errno）@8、type（u8。eventtype）@10、
+     * fd_readwrite.nbytes（u64）@16、fd_readwrite.flags（u16。eventrwflags）@24
+     */
+    const val EVENT_SIZE: Int = 32
+
     /** VFS の種類を p1 の filetype にする */
     fun fileType(type: FileType): Int = when (type) {
         FileType.UNKNOWN -> FILETYPE_UNKNOWN
@@ -217,6 +241,26 @@ internal object P1 {
     /** [b] の [at] に、リトルエンディアンで [v] を書く */
     fun putI64(b: ByteArray, at: Int, v: Long) {
         for (i in 0 until 8) b[at + i] = (v ushr (8 * i)).toByte()
+    }
+
+    /** [b] の [at] から、リトルエンディアンの i64 を読む */
+    fun getI64(b: ByteArray, at: Int): Long {
+        var v = 0L
+        for (i in 0 until 8) v = v or ((b[at + i].toLong() and 0xff) shl (8 * i))
+        return v
+    }
+
+    /** [b] の [at] から、リトルエンディアンの i32 を読む */
+    fun getI32(b: ByteArray, at: Int): Int {
+        var v = 0
+        for (i in 0 until 4) v = v or ((b[at + i].toInt() and 0xff) shl (8 * i))
+        return v
+    }
+
+    /** [b] の [at] に、リトルエンディアンで [v]（下位 16 ビット）を書く */
+    fun putI16(b: ByteArray, at: Int, v: Int) {
+        b[at] = v.toByte()
+        b[at + 1] = (v ushr 8).toByte()
     }
 
     /** [b] の [at] に、リトルエンディアンで [v] を書く */
