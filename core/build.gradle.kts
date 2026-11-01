@@ -104,3 +104,15 @@ kibiWasm.module("lua") {
         "-Wl,-z,stack-size=1048576",
     )
 }
+
+// テスト用の同梱イメージ（#55）。src/test/images/sample/ を zip にして、テストのリソース `/kibicomputers/images/sample.zip` に入れる
+val zipTestImage = tasks.register<Zip>("zipTestImage") {
+    from("src/test/images/sample")
+    archiveFileName = "sample.zip"
+    destinationDirectory = layout.buildDirectory.dir("generated/images/test/kibicomputers/images")
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+sourceSets.test {
+    resources.srcDir(files(layout.buildDirectory.dir("generated/images/test")) { builtBy(zipTestImage) })
+}
