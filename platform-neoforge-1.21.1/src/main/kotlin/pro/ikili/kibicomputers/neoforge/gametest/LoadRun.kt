@@ -18,10 +18,14 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import java.lang.management.ManagementFactory
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.locks.LockSupport
 
 /** 負荷試験の段階。 */
+/** 負荷試験で打つ人（偽物） */
+private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
+
 internal enum class LoadPhase(val label: String) {
     /** 何も置いていない（並べる範囲のチャンクは読み込んである）。比べる基準 */
     EMPTY("何もない"),
@@ -437,7 +441,7 @@ internal class LoadRun(
     private fun type(c: Computer, line: String) {
         val events = listOf(KeyboardEvent.Text(line), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
         for (packet in KeyboardEventCodec.encode(events)) {
-            if (c.keyboard.receive(packet, level.gameTime) < 0) fail("the keyboard rejected the input")
+            if (c.keyboard.receive(LOAD_TYPIST, packet) < 0) fail("the keyboard rejected the input")
         }
     }
 

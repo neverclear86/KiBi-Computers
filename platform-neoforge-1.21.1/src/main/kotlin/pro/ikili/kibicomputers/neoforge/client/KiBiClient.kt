@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.neoforge.client
 
 import net.minecraft.client.Minecraft
+import net.minecraft.core.BlockPos
 import net.neoforged.bus.api.IEventBus
 import net.neoforged.neoforge.client.event.EntityRenderersEvent
 import net.neoforged.neoforge.client.event.RegisterMenuScreensEvent
@@ -14,8 +15,15 @@ object KiBiClient {
     fun register(modBus: IEventBus) {
         modBus.addListener(::registerRenderers)
         modBus.addListener(::registerScreens)
-        KeyboardInput.clientOpener = KeyboardInput.ClientOpener { keyboard, screen ->
-            Minecraft.getInstance().setScreen(KeyboardInputScreen(keyboard, screen))
+        KeyboardInput.clientHooks = object : KeyboardInput.ClientHooks {
+            override fun open(session: Int, keyboard: BlockPos, screen: BlockPos?) {
+                Minecraft.getInstance().setScreen(KeyboardInputScreen(session, keyboard, screen))
+            }
+
+            override fun closed(session: Int) {
+                val open = Minecraft.getInstance().screen as? KeyboardInputScreen ?: return
+                if (open.session == session) open.closedByServer()
+            }
         }
     }
 

@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.network.codec.ByteBufCodecs
 import net.minecraft.network.codec.StreamCodec
+import net.minecraft.network.protocol.PacketFlow
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload
 import net.minecraft.resources.ResourceLocation
 import net.minecraft.server.level.ServerPlayer
@@ -18,12 +19,13 @@ import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
+import java.util.Optional
 
 /**
- * クライアントからサーバーへの、キーボードの入力（#142）。[pos] はキーボードの位置（プレイヤーのいるディメンション）、
- * [data] は [KeyboardEventCodec] の形の入力の並び。
+ * クライアントからサーバーへの、キーボードの入力（#142）。[session] は入力のセッションの番号（[KeyboardOpenPayload] で届いたもの）、
+ * [data] は [KeyboardEventCodec] の形の入力の並び。どのキーボードへの入力かは、サーバーがセッションから決める（#360）。
  */
-class KeyboardInputPayload(val pos: BlockPos, val data: ByteArray) : CustomPacketPayload {
+class KeyboardInputPayload(val session: Int, val data: ByteArray) : CustomPacketPayload {
     override fun type(): CustomPacketPayload.Type<KeyboardInputPayload> = TYPE
 
     companion object {
@@ -33,7 +35,7 @@ class KeyboardInputPayload(val pos: BlockPos, val data: ByteArray) : CustomPacke
 
         @JvmField
         val STREAM_CODEC: StreamCodec<ByteBuf, KeyboardInputPayload> = StreamCodec.composite(
-            BlockPos.STREAM_CODEC, KeyboardInputPayload::pos,
+            ByteBufCodecs.VAR_INT, KeyboardInputPayload::session,
             ByteBufCodecs.byteArray(KeyboardEventCodec.MAX_PACKET_BYTES), KeyboardInputPayload::data,
             ::KeyboardInputPayload,
         )
@@ -41,12 +43,52 @@ class KeyboardInputPayload(val pos: BlockPos, val data: ByteArray) : CustomPacke
 }
 
 /**
- * キーボードの入力の接続層（#142）。パケットの登録とサーバーでの受け取り、画面の隣のキーボード探し、
- * クライアントで入力 GUI を開く口を持つ。
+ * サーバーからクライアントへの、入力 GUI を開く指示（#360）。サーバーが入力のセッション [session] を作ったときに送る。
+ * [keyboard] はキーボードの位置、[screen] は右クリックした画面（キーボードを直接右クリックしたなら null）。
+ */
+class KeyboardOpenPayload(val session: Int, val keyboard: BlockPos, val screen: Optional<BlockPos>) : CustomPacketPayload {
+    override fun type(): CustomPacketPayload.Type<KeyboardOpenPayload> = TYPE
+
+    companion object {
+        @JvmField
+        val TYPE: CustomPacketPayload.Type<KeyboardOpenPayload> =
+            CustomPacketPayload.Type(ResourceLocation.fromNamespaceAndPath(KiBiComputers.MOD_ID, "keyboard_open"))
+
+        @JvmField
+        val STREAM_CODEC: StreamCodec<ByteBuf, KeyboardOpenPayload> = StreamCodec.composite(
+            ByteBufCodecs.VAR_INT, KeyboardOpenPayload::session,
+            BlockPos.STREAM_CODEC, KeyboardOpenPayload::keyboard,
+            ByteBufCodecs.optional(BlockPos.STREAM_CODEC), KeyboardOpenPayload::screen,
+            ::KeyboardOpenPayload,
+        )
+    }
+}
+
+/**
+ * 入力のセッション [session] を閉じた知らせ（#360。両方向）。クライアントは GUI を閉じたときに、
+ * サーバーはセッションを閉じたとき（離れすぎた、キーボードが壊れたなど）に送る。
+ */
+class KeyboardClosePayload(val session: Int) : CustomPacketPayload {
+    override fun type(): CustomPacketPayload.Type<KeyboardClosePayload> = TYPE
+
+    companion object {
+        @JvmField
+        val TYPE: CustomPacketPayload.Type<KeyboardClosePayload> =
+            CustomPacketPayload.Type(ResourceLocation.fromNamespaceAndPath(KiBiComputers.MOD_ID, "keyboard_close"))
+
+        @JvmField
+        val STREAM_CODEC: StreamCodec<ByteBuf, KeyboardClosePayload> =
+            ByteBufCodecs.VAR_INT.map(::KeyboardClosePayload, KeyboardClosePayload::session)
+    }
+}
+
+/**
+ * キーボードの入力の接続層（#142）。パケットの登録、画面の隣のキーボード探し、クライアントの GUI への口を持つ。
+ * サーバーでの入力の受け取りは [KeyboardSessions]（#360）。
  */
 object KeyboardInput {
     /** ネットワークのプロトコルの版。[KeyboardEventCodec] の形や [pro.ikili.kibicomputers.core.input.Key] の並びを変えたら上げる。 */
-    private const val PROTOCOL_VERSION = "1"
+    private const val PROTOCOL_VERSION = "2"
 
     /**
      * 入力を受け付ける距離のゆとり（ブロックの数）。プレイヤーがブロックに手の届く距離に、これを足した範囲で受け付ける。
@@ -54,28 +96,51 @@ object KeyboardInput {
      */
     const val REACH_SLACK: Double = 4.0
 
-    /** クライアントで入力 GUI を開く口。サーバーのクラスからクライアントのクラスを読み込まないために、クライアントの初期化で入れる。 */
-    fun interface ClientOpener {
-        /** キーボード [keyboard] への入力 GUI を開く。[screen] は右クリックした画面（キーボードを直接右クリックしたなら null）。 */
-        fun open(keyboard: BlockPos, screen: BlockPos?)
+    /** クライアントの入力 GUI への口。サーバーのクラスからクライアントのクラスを読み込まないために、クライアントの初期化で入れる。 */
+    interface ClientHooks {
+        /**
+         * サーバーが作ったセッション [session] で、キーボード [keyboard] への入力 GUI を開く。
+         * [screen] は右クリックした画面（キーボードを直接右クリックしたなら null）。
+         */
+        fun open(session: Int, keyboard: BlockPos, screen: BlockPos?)
+
+        /** サーバーがセッション [session] を閉じた。そのセッションの GUI が開いていれば閉じる。 */
+        fun closed(session: Int)
     }
 
     @Volatile
-    var clientOpener: ClientOpener? = null
+    var clientHooks: ClientHooks? = null
 
     /** MOD のイベントバスに登録する。MOD の初期化で1回だけ呼ぶ。 */
     fun register(modBus: IEventBus) {
         modBus.addListener(::registerPayloads)
+        KeyboardSessions.register()
     }
 
     private fun registerPayloads(event: RegisterPayloadHandlersEvent) {
         event.registrar(PROTOCOL_VERSION)
             .playToServer(KeyboardInputPayload.TYPE, KeyboardInputPayload.STREAM_CODEC, ::onInput)
+            .playToClient(KeyboardOpenPayload.TYPE, KeyboardOpenPayload.STREAM_CODEC, ::onOpen)
+            .playBidirectional(KeyboardClosePayload.TYPE, KeyboardClosePayload.STREAM_CODEC, ::onClose)
     }
 
-    /** クライアントで、入力 GUI を開く。 */
-    fun openOnClient(keyboard: BlockPos, screen: BlockPos?) {
-        clientOpener?.open(keyboard, screen)
+    // メインスレッドで呼ばれる（ペイロードの処理の既定）
+    private fun onInput(payload: KeyboardInputPayload, context: IPayloadContext) {
+        val player = context.player() as? ServerPlayer ?: return
+        KeyboardSessions.receive(player, payload)
+    }
+
+    private fun onOpen(payload: KeyboardOpenPayload, context: IPayloadContext) {
+        clientHooks?.open(payload.session, payload.keyboard, payload.screen.orElse(null))
+    }
+
+    private fun onClose(payload: KeyboardClosePayload, context: IPayloadContext) {
+        if (context.flow() == PacketFlow.SERVERBOUND) {
+            val player = context.player() as? ServerPlayer ?: return
+            KeyboardSessions.closeFromClient(player, payload.session)
+        } else {
+            clientHooks?.closed(payload.session)
+        }
     }
 
     /** [player] がキーボード [pos] に入力できる距離にいるか。 */
@@ -122,24 +187,5 @@ object KeyboardInput {
         val candidates = Direction.entries.map { keyboardPos.relative(it) } +
             Direction.Plane.HORIZONTAL.map { keyboardPos.above().relative(it) }
         return candidates.firstOrNull { level.isLoaded(it) && findKeyboard(level, it) == keyboardPos }
-    }
-
-    // サーバー: メインスレッドで呼ばれる
-    private fun onInput(payload: KeyboardInputPayload, context: IPayloadContext) {
-        val player = context.player() as? ServerPlayer ?: return
-        receive(player, payload)
-    }
-
-    /**
-     * [player] から届いた [payload] を、キーボードに渡す。届く距離にない、キーボードがない、などのときは捨てる。
-     *
-     * @return 配った入力の数。捨てたなら -1
-     */
-    fun receive(player: ServerPlayer, payload: KeyboardInputPayload): Int {
-        val level = player.serverLevel()
-        val pos = payload.pos
-        if (!level.isLoaded(pos) || !canReach(player, pos)) return -1
-        val keyboard = level.getBlockEntity(pos) as? KeyboardBlockEntity ?: return -1
-        return keyboard.receive(payload.data, level.gameTime)
     }
 }

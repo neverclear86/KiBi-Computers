@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.util.UUID
 
 /** テスト用コンピューターの仮の結線（#307）の GameTest。 */
 @GameTestHolder(KiBiComputers.MOD_ID)
@@ -79,7 +80,7 @@ object TestComputerGameTests {
                 helper.assertTrue(text.any { it == ">" }, "prompt should be shown: $text")
                 val events = listOf(KeyboardEvent.Text("print(1+1)"), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
                 for (packet in KeyboardEventCodec.encode(events)) {
-                    helper.assertTrue(keyboard.receive(packet, helper.level.gameTime) == 2, "keyboard should accept the input")
+                    helper.assertTrue(keyboard.receive(UUID(0, 1), packet) == 2, "keyboard should accept the input")
                 }
                 typed = true
             }
@@ -106,5 +107,41 @@ object TestComputerGameTests {
             helper.assertTrue(machine.state == MachineState.RUNNING, "init should start")
             helper.setBlock(CASE, Blocks.AIR)
         }
+    }
+
+    /**
+     * 1つのキーボードは、最初につないだケースだけが持つ（#360）。隣に置いた2台目のケースには、入力が届かない。
+     * 1台目が切れたあとに入れ直した2台目は、つなげる。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun secondCaseDoesNotTakeTheKeyboard(helper: GameTestHelper) {
+        val (first, _, keyboard) = build(helper)
+        // 2台目: キーボードの東隣のケースと、その上の画面
+        val secondPos = KEYBOARD.east()
+        helper.setBlock(secondPos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
+        helper.setBlock(
+            secondPos.above(),
+            KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+        )
+        val second = helper.getBlockEntity<CaseBlockEntity>(secondPos)
+        for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
+            second.parts.setStackInSlot(second.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
+        }
+        helper.assertTrue(first.pressPowerButton() == ComputerStatus.RUNNING, "first case should be running")
+        helper.assertTrue(second.pressPowerButton() == ComputerStatus.RUNNING, "second case should be running")
+        helper.assertTrue(first.wiring.connectedKeyboard === keyboard, "the first case should take the keyboard")
+        helper.assertTrue(second.wiring.connectedKeyboard == null, "the second case should not take the keyboard")
+        helper.assertTrue(keyboard.owner === first.wiring, "the keyboard should deliver only to the first case")
+        // 1台目を切ると空く。2台目を入れ直すとつながる
+        first.pressPowerButton()
+        helper.assertTrue(keyboard.owner == null, "turning the first case off should free the keyboard")
+        second.pressPowerButton()
+        helper.assertTrue(second.pressPowerButton() == ComputerStatus.RUNNING, "second case should restart")
+        helper.assertTrue(second.wiring.connectedKeyboard === keyboard, "the restarted second case should take the free keyboard")
+        second.pressPowerButton()
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.setBlock(secondPos, Blocks.AIR)
+        helper.succeed()
     }
 }

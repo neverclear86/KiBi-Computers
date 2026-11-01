@@ -5,6 +5,7 @@ import com.mojang.serialization.MapCodec
 import com.mojang.serialization.codecs.RecordCodecBuilder
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.context.BlockPlaceContext
@@ -22,6 +23,7 @@ import net.minecraft.world.level.block.state.properties.DirectionProperty
 import net.minecraft.world.phys.BlockHitResult
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
+import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
 
 /**
  * 画面ブロック（#136）。ティアごとに別のブロックとして登録する。
@@ -59,7 +61,8 @@ class ScreenBlock(val tier: ScreenTier, properties: BlockBehaviour.Properties) :
         hitResult: BlockHitResult,
     ): InteractionResult {
         val keyboard = KeyboardInput.findKeyboard(level, pos) ?: return InteractionResult.PASS
-        if (level.isClientSide) KeyboardInput.openOnClient(keyboard, pos)
+        // GUI はサーバーが開く（#360）
+        if (player is ServerPlayer) KeyboardSessions.open(player, keyboard, pos)
         return InteractionResult.sidedSuccess(level.isClientSide)
     }
 
