@@ -1,0 +1,9 @@
+#!/bin/lua -i
+-- テスト用の /sbin/init（#307 の仮の結線、#315）。同梱イメージ testboot に入れる。
+-- 標準OS（#98）ができたら置き換える。
+--
+-- シバンで /bin/lua（lua.wasm）を `-i` 付きで起動する（#93）。Lua はこのスクリプトを実行してから、
+-- 対話型の REPL（#96）に入る。行編集と履歴は TTY（#60）が行う。
+-- REPL を Ctrl+D か os.exit() で終えると init が終わり、マシンは止まる。
+print("KiBi test init: Lua REPL")
+print("Ctrl+D or os.exit() to stop")

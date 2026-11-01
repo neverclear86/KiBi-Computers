@@ -18,7 +18,7 @@ import java.time.Duration
 import java.util.Collections
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** テスト用コンピューターの仮の結線（#307）: 同梱イメージ testboot からの起動と、[MachineConsole] */
+/** テスト用コンピューターの仮の結線（#307）: 同梱イメージ testboot（init は Lua の REPL。#315）からの起動と、[MachineConsole] */
 class TestComputerTest {
     private val limit = Duration.ofSeconds(60)
 
@@ -54,10 +54,10 @@ class TestComputerTest {
         }
 
     @Test
-    fun `testbootのinitが画面に出し、打った行を返し、exitで止まる`() = timeout(limit) {
+    fun `testbootのinitがLuaのREPLを出し、打った式を評価し、os_exitで止まる`() = timeout(limit) {
         val manager = MachineManager<String>()
         try {
-            val screen = TextBuffer(40, 10)
+            val screen = TextBuffer(60, 12)
             val console = MachineConsole(screen, 2)
             val host = ToScreen(console)
             val case = ComputerCase<String>(CaseTier.BASIC, host)
@@ -68,21 +68,25 @@ class TestComputerTest {
 
             manager.tickUntil({ "プロンプトが出ない: ${lines(screen)} ${host.failures}" }) { lines(screen).contains(">") }
             assertEquals("kibi: booting from disk ${testBootDisk}", lines(screen)[0])
-            assertTrue(lines(screen).contains("KiBi test init"), "${lines(screen)}")
+            assertTrue(lines(screen)[1].startsWith("Lua 5.4"), "Lua のバナー: ${lines(screen)}")
+            assertTrue(lines(screen).contains("KiBi test init: Lua REPL"), "${lines(screen)}")
 
             // キーボードの入力: 文字と Enter。KeyUp は何も送らない
-            assertEquals(5, console.keyboardInput(KeyboardEvent.Text("hello")))
+            assertEquals(10, console.keyboardInput(KeyboardEvent.Text("print(1+1)")))
             assertEquals(0, console.keyboardInput(KeyboardEvent.KeyUp(Key.ENTER, 0)))
             assertEquals(1, console.keyboardInput(KeyboardEvent.KeyDown(Key.ENTER, 0, false)))
-            manager.tickUntil({ "返ってこない: ${lines(screen)}" }) { lines(screen).contains("echo: hello") }
-            assertTrue(lines(screen).contains("> hello"), "TTY のエコー: ${lines(screen)}")
+            manager.tickUntil({ "結果が出ない: ${lines(screen)}" }) { lines(screen).contains("2") }
+            assertTrue(lines(screen).contains("> print(1+1)"), "TTY のエコー: ${lines(screen)}")
 
-            // 次のプロンプトが出てから打つ（先に打つと、エコーがプロンプトより前に出て、行の並びが変わる）
-            manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).contains(">") }
-            console.keyboardInput(KeyboardEvent.Paste("exit\n"))
-            manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) {
-                machine.state == MachineState.STOPPED && lines(screen).any { it.endsWith("bye") }
-            }
+            // 式はそのまま値が出る。次のプロンプトが出てから打つ（先に打つと、エコーがプロンプトより前に出て、行の並びが変わる）
+            manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).last { it.isNotEmpty() } == ">" }
+            console.keyboardInput(KeyboardEvent.Paste("6*7\n"))
+            manager.tickUntil({ "式の値が出ない: ${lines(screen)}" }) { lines(screen).contains("42") }
+
+            // os.exit() で REPL（init）が終わり、マシンが止まる
+            manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).last { it.isNotEmpty() } == ">" }
+            console.keyboardInput(KeyboardEvent.Paste("os.exit()\n"))
+            manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) { machine.state == MachineState.STOPPED }
             assertTrue(host.failures.isEmpty(), "${host.failures}")
 
             // 画面を消して、つなぎを外す

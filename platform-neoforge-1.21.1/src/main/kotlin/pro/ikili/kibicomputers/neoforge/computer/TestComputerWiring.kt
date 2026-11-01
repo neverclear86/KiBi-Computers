@@ -84,7 +84,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     companion object {
         /**
-         * テスト用コンピューターの起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は、入力した行をそのまま返す。
+         * テスト用コンピューターの起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は Lua の REPL（#315）。
          * 標準OS（#98）と起動部品（#99）ができたら置き換える
          */
         const val TEST_BOOT_DISK: String = BootConfig.IMAGE_DISK_PREFIX + "testboot"

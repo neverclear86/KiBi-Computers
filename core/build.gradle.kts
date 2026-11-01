@@ -100,7 +100,7 @@ val luaSource = kibiWasm.sourceArchive("lua") {
     url = "https://www.lua.org/ftp/lua-$luaVersion.tar.gz"
     sha256 = luaProps.getProperty("sha256")
 }
-kibiWasm.module("lua") {
+val compileLua = kibiWasm.module("lua") {
     // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない
     sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c") } })
     sources.from("src/main/wasm/lua/kibi_wasi.c")
@@ -142,17 +142,13 @@ sourceSets.test {
 }
 
 // テスト用コンピューターの同梱イメージ testboot（#307 の仮の結線。標準OS #98 ができたら置き換える）。
-// init.c を WASM にビルドし、`/sbin/init` として zip に入れて、core のリソース `/kibicomputers/images/testboot.zip` にする。
-// WASM の単体は jar に入れないので、リソースを持たないだけのソースセットに出力する
-val testbootParts: SourceSet = sourceSets.create("testbootParts")
-val compileTestbootInit = kibiWasm.module("testboot-init", sourceSet = testbootParts.name) {
-    sources.from("src/main/wasm/testboot/init.c")
-    compilerArgs.addAll("-O2", "-s")
-}
+// src/main/images/testboot/（`/sbin/init` は Lua のスクリプト）に、lua.wasm を `/bin/lua` として足して zip にし、
+// core のリソース `/kibicomputers/images/testboot.zip` にする（#315）
 val zipTestbootImage = tasks.register<Zip>("zipTestbootImage") {
-    from(compileTestbootInit.flatMap { it.outputDir }) {
-        include("kibicomputers/wasm/testboot-init.wasm")
-        eachFile { path = "sbin/init" }
+    from("src/main/images/testboot")
+    from(compileLua.flatMap { it.outputDir }) {
+        include("kibicomputers/wasm/lua.wasm")
+        eachFile { path = "bin/lua" }
         includeEmptyDirs = false
     }
     archiveFileName = "testboot.zip"
