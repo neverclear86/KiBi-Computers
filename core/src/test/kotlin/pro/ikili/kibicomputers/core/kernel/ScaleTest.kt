@@ -58,6 +58,33 @@ class ScaleTest {
     }
 
     @Test
+    fun `1000台がタイマーを待つ間はスレッドを持たず、期限を待つスレッドはKiBi-timerの1本だけ`() = timeout(Duration.ofSeconds(60)) {
+        Harness(workerIdleMillis = 200).use { h ->
+            val program = h.program(emptyModule())
+            val machines = (1..1000).map { h.machine(fuelPerTick = 1000) }
+            val pids = machines.map { m ->
+                val handle = AtomicInteger(-1)
+                m.spawnTest(
+                    program,
+                    TestDriver(ProcessKind.WAIT_POINT, onResume = { ctx, ready ->
+                        if (ctx.readTimer(handle.get()) == 0L) StepResult.Wait(ready) else StepResult.Exit(0)
+                    }) { ctx ->
+                        handle.set(ctx.createTimer())
+                        ctx.setTimer(handle.get(), 1_500_000_000L)
+                        StepResult.Wait(listOf(ctx.timerWaitKey(handle.get())))
+                    },
+                )
+            }
+            h.scheduler.tick()
+            eventually(30_000, "全部が待ちに入らない") { machines.indices.all { machines[it].stateOf(pids[it]).let { s -> s == ProcessState.WAITING_EVENT || s.isTerminal } } }
+            assertTrue(kernelThreadNames("KiBi-m").isEmpty())
+            assertEquals(1, kernelThreadNames("KiBi-timer").size)
+            eventually(30_000, "全部が鳴って終わらない") { machines.indices.all { machines[it].stateOf(pids[it]) == ProcessState.EXITED } }
+            assertTrue(machines.all { m -> m.lock.withLockValue { m.timers.scheduledCount } == 0 })
+        }
+    }
+
+    @Test
     fun `1000台がイベントキューを待っている間はスレッドを持たず、tickは見ず、全台に出すと全台がresumeされる`() = timeout(Duration.ofSeconds(60)) {
         Harness(workerIdleMillis = 200).use { h ->
             val program = h.program(emptyModule())

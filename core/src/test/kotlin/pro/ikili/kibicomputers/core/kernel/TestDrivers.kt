@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
@@ -55,11 +56,13 @@ internal class Harness(
     workerIdleMillis: Long = 30_000,
     /** `Machine.exec` が読み込むランタイム。`null` ならダミーの [runtime] を使い、燃料の計測コードは挿入しない */
     execRuntime: WasmRuntime? = null,
+    /** タイマーの期限を待つ口（`null` なら本物のスレッド `KiBi-timer`） */
+    timers: TimerService? = null,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null, timers = timers),
     )
     private var counter = 0
 

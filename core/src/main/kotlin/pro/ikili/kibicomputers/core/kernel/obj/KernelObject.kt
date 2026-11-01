@@ -57,6 +57,11 @@ internal class ObjectTable {
 
     operator fun get(id: Int): KernelObject? = entries?.get(id)?.obj
 
+    /** 表にあるオブジェクトをすべて渡す（ID の順は決めない。中で表を変えない） */
+    fun forEachObject(action: (KernelObject) -> Unit) {
+        entries?.values?.forEach { action(it.obj) }
+    }
+
     /** 参照カウント（テスト用）。なければ 0 */
     fun refCount(id: Int): Int = entries?.get(id)?.refCount ?: 0
 
