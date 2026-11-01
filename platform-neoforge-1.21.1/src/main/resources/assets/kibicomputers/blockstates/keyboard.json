@@ -1,0 +1,19 @@
+{
+  "variants": {
+    "facing=north": {
+      "model": "kibicomputers:block/keyboard"
+    },
+    "facing=east": {
+      "model": "kibicomputers:block/keyboard",
+      "y": 90
+    },
+    "facing=south": {
+      "model": "kibicomputers:block/keyboard",
+      "y": 180
+    },
+    "facing=west": {
+      "model": "kibicomputers:block/keyboard",
+      "y": 270
+    }
+  }
+}

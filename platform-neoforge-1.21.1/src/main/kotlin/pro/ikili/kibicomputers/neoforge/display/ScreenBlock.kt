@@ -5,7 +5,10 @@ import com.mojang.serialization.MapCodec
 import com.mojang.serialization.codecs.RecordCodecBuilder
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.world.InteractionResult
+import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.context.BlockPlaceContext
+import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.EntityBlock
 import net.minecraft.world.level.block.HorizontalDirectionalBlock
@@ -16,12 +19,15 @@ import net.minecraft.world.level.block.state.BlockBehaviour
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.StateDefinition
 import net.minecraft.world.level.block.state.properties.DirectionProperty
+import net.minecraft.world.phys.BlockHitResult
 import pro.ikili.kibicomputers.core.display.ScreenTier
+import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 
 /**
  * 画面ブロック（#136）。ティアごとに別のブロックとして登録する。
  *
  * 正面（[FACING]）は置いたプレイヤーの方を向く。画面の中身は [ScreenBlockEntity] が持つ。
+ * キーボードがつながっていれば（[KeyboardInput.findKeyboard]）、右クリックでそのキーボードへの入力 GUI を開く（#142）。
  */
 class ScreenBlock(val tier: ScreenTier, properties: BlockBehaviour.Properties) : Block(properties), EntityBlock {
     init {
@@ -44,6 +50,18 @@ class ScreenBlock(val tier: ScreenTier, properties: BlockBehaviour.Properties) :
         state.rotate(mirror.getRotation(state.getValue(FACING)))
 
     override fun newBlockEntity(pos: BlockPos, state: BlockState): BlockEntity = ScreenBlockEntity(pos, state)
+
+    override fun useWithoutItem(
+        state: BlockState,
+        level: Level,
+        pos: BlockPos,
+        player: Player,
+        hitResult: BlockHitResult,
+    ): InteractionResult {
+        val keyboard = KeyboardInput.findKeyboard(level, pos) ?: return InteractionResult.PASS
+        if (level.isClientSide) KeyboardInput.openOnClient(keyboard, pos)
+        return InteractionResult.sidedSuccess(level.isClientSide)
+    }
 
     companion object {
         /** 画面の正面の向き（水平の4方向）。 */

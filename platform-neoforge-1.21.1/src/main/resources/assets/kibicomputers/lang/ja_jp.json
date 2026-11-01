@@ -23,5 +23,9 @@
   "gui.kibicomputers.part.memory.short": "RAM",
   "gui.kibicomputers.part.storage.short": "HDD",
   "gui.kibicomputers.part.boot.short": "ROM",
-  "gui.kibicomputers.part.expansion.short": "CARD"
+  "gui.kibicomputers.part.expansion.short": "CARD",
+  "block.kibicomputers.keyboard": "キーボード",
+  "gui.kibicomputers.keyboard.title": "キーボード",
+  "gui.kibicomputers.keyboard.hint": "キーボードで入力中 - Shift+Esc でやめる",
+  "gui.kibicomputers.keyboard.close": "閉じる"
 }
