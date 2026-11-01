@@ -30,8 +30,28 @@ class LuaWasmTest {
         module = Parser.parse(bytes!!)
     }
 
-    /** `lua <args>` を実行する。 */
+    /**
+     * `lua <args>` を実行する。カーネルのワーカーと同じ 16 MiB のスタックのスレッドで動かす
+     * （インタプリタは WASM の呼び出しごとに JVM のスタックを使う。テストのスレッドの既定の大きさでは、JIT の具合によって
+     * 深い呼び出しの途中で足りなくなることがあった。#341）
+     */
     private fun lua(vararg args: String, stdin: String = ""): Result {
+        var result: Result? = null
+        var failure: Throwable? = null
+        val thread = Thread(null, {
+            try {
+                result = luaOnCurrentThread(args, stdin)
+            } catch (e: Throwable) {
+                failure = e
+            }
+        }, "lua-wasm-test", 16L * 1024 * 1024)
+        thread.start()
+        thread.join()
+        failure?.let { throw it }
+        return result!!
+    }
+
+    private fun luaOnCurrentThread(args: Array<out String>, stdin: String): Result {
         val stdout = ByteArrayOutputStream()
         val stderr = ByteArrayOutputStream()
         val options = WasiOptions.builder()

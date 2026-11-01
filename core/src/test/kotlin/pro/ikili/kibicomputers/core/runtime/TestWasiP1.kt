@@ -18,9 +18,9 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
     private val stdinBytes = stdin.toByteArray(Charsets.UTF_8)
     private var stdinPos = 0
 
-    /** [module] の WASI の import をすべてつないだ設定。 */
-    fun config(module: WasmModule): WasmInstanceConfig {
-        val builder = WasmInstanceConfig.builder()
+    /** [module] の WASI の import をすべてつないだ設定。[configure] でほかの設定（燃料など）を足せる */
+    fun config(module: WasmModule, configure: WasmInstanceConfig.Builder.() -> Unit = {}): WasmInstanceConfig {
+        val builder = WasmInstanceConfig.builder().apply(configure)
         for (imp in module.imports) {
             if (imp.module != MODULE || imp.kind != WasmExternKind.FUNCTION) continue
             val type = imp.functionType!!

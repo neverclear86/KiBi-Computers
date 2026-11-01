@@ -104,6 +104,11 @@ kibiWasm {
         sources.from("src/test/wasm/poll_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // WASI p1 の cwd を PWD から合わせる起動処理（#332）を確かめるプログラム
+    module("cwd-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/cwd_wasi.c", "src/main/wasm/common/kibi_cwd.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // 待機点への変換（#329）を確かめる、fgets で待つ CLI。深い再帰の底で待つ版のため、C のスタックを大きくする
     module("prompt-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/prompt_wasi.c")
@@ -125,6 +130,8 @@ val compileLua = kibiWasm.module("lua") {
     // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない
     sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c") } })
     sources.from("src/main/wasm/lua/kibi_wasi.c")
+    // 起動時に PWD（カーネルの cwd）へ chdir する（#332）
+    sources.from("src/main/wasm/common/kibi_cwd.c")
     includeDirs.from("src/main/wasm/lua")
     compilerArgs.addAll(
         "-O2",
