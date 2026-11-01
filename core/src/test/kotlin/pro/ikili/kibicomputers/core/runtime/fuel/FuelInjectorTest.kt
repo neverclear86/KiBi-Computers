@@ -123,6 +123,78 @@ class FuelInjectorTest {
     }
 
     @Test
+    fun `失敗したmemory_growは燃料を引かず、次も動き続ける`() {
+        val (_, grow0) = run("grow", 0)
+        for (pages in listOf(-1L, 1L shl 20)) {
+            val (result, used) = run("grow", pages)
+            assertEquals(-1L, result, "memory.grow($pages) は失敗する")
+            assertEquals(grow0, used, "memory.grow($pages) の燃料")
+        }
+        // 1 tick 分を小分けに配る。失敗した grow が借りを作るなら、燃料切れの通知が出て次の呼び出しも動かない
+        var exhausted = 0
+        val handler = WasmFuelHandler { _, remaining ->
+            exhausted++
+            remaining + 10_000
+        }
+        instance(10_000, handler).use { inst ->
+            repeat(3) { assertEquals(-1L, inst.call("grow", -1).single()) }
+            assertTrue(inst.fuel > 0, "失敗した grow の後の残り ${inst.fuel}")
+            assertEquals(run("fib", 10).first, inst.call("fib", 10).single())
+        }
+        assertEquals(0, exhausted, "失敗した grow で燃料切れになった")
+    }
+
+    @Test
+    fun `table_growは増えた要素の数だけ引き、失敗したら引かない`() {
+        // grow(n) = table.grow 0 (ref.null func, n)
+        val wasm = WasmBinary().run {
+            table(1)
+            exportFunc("grow", func(listOf(I32), listOf(I32), code(0xd0, 0x70, 0x20, 0, 0xfc, 0x0f, 0)))
+            build()
+        }
+        val module = runtime.load(FuelInjector.inject(wasm).bytes)
+        fun grow(n: Long): Pair<Long, Long> {
+            val initial = 1L shl 40
+            module.instantiate(WasmInstanceConfig.builder().fuel(initial, null).build()).use { inst ->
+                return inst.call("grow", n).single() to initial - inst.fuel
+            }
+        }
+        val (_, used0) = grow(0)
+        val (old, used5) = grow(5)
+        assertEquals(1L, old)
+        assertEquals(5L shr FuelCosts.TABLE_ELEMENTS_SHIFT, used5 - used0)
+        val (failed, usedFailed) = grow(-1)
+        assertEquals(-1L, failed, "table.grow(0xFFFFFFFF) は失敗する")
+        assertEquals(used0, usedFailed)
+    }
+
+    @Test
+    fun `グローバルのセクションを作るときはtagのセクションの後に置く`() {
+        // 型 ()->() と、それを使う tag が 1 つだけのモジュール（グローバルはない）
+        val wasm = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00) +
+            byteArrayOf(0x01, 0x04, 0x01, 0x60, 0x00, 0x00) +
+            byteArrayOf(0x0d, 0x03, 0x01, 0x00, 0x00)
+        val out = FuelInjector.inject(wasm).bytes
+        val ids = ArrayList<Int>()
+        var pos = 8
+        while (pos < out.size) {
+            ids += out[pos++].toInt()
+            var size = 0
+            var shift = 0
+            while (true) {
+                val b = out[pos++].toInt() and 0xFF
+                size = size or ((b and 0x7F) shl shift)
+                if (b and 0x80 == 0) break
+                shift += 7
+            }
+            pos += size
+        }
+        // 仕様の順: 型(1)・import(2)・tag(13)・グローバル(6)・export(7)
+        assertEquals(listOf(1, 2, 13, 6, 7), ids)
+        assertTrue(runtime.load(out).isFuelMetered)
+    }
+
+    @Test
     fun `末尾呼び出しの番号を付け替え、深い相互再帰も動く`() {
         val ops = Parser.parse(fuelWasm).codeSection().functionBodies().flatMap { it.instructions() }.map { it.opcode() }.toSet()
         assertTrue(OpCode.RETURN_CALL in ops && OpCode.MEMORY_FILL in ops && OpCode.MEMORY_COPY in ops, "テスト用の WASM に使いたい命令がない: $ops")
