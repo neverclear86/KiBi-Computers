@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.computer
 
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
@@ -51,8 +52,13 @@ public enum class ComputerError {
  *
  * @param K マシンのキー（[MachineManager] と同じ）
  * @property tier ケースのティア
+ * @param events マシンからの通知（状態、コンソールの出力、ビープ、起動の失敗、再起動）をそのまま受け取る相手。
+ *   ケース自身の処理（CRASHED でエラーにする）の後に呼ぶ。`null` なら渡さない（再起動の求めは、既定どおり前回の設定で起動し直す）
  */
-public class ComputerCase<K : Any>(public val tier: CaseTier) {
+public class ComputerCase<K : Any> @JvmOverloads constructor(
+    public val tier: CaseTier,
+    private val events: MachineHost? = null,
+) {
     private val slot = MachineSlot<K>()
 
     /** 今の状態 */
@@ -70,7 +76,29 @@ public class ComputerCase<K : Any>(public val tier: CaseTier) {
     /** 動いているマシン。動いていなければ `null` */
     public val machine: Machine? get() = slot.machine
 
-    private val host = MachineHost { machine, state, _ -> onMachineStateChanged(machine, state) }
+    private val host = object : MachineHost {
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
+            onMachineStateChanged(machine, state)
+            events?.onStateChanged(machine, state, cause)
+        }
+
+        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+            events?.onConsoleOutput(machine, bytes)
+        }
+
+        override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
+            events?.onBeep(machine, frequencyHz, durationMillis)
+        }
+
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            events?.onBootFailed(machine, failure, detail)
+        }
+
+        override fun onRebootRequested(machine: Machine) {
+            val e = events
+            if (e != null) e.onRebootRequested(machine) else super.onRebootRequested(machine)
+        }
+    }
 
     /**
      * 電源ボタン: 動いていれば [turnOff]、そうでなければ [turnOn]。

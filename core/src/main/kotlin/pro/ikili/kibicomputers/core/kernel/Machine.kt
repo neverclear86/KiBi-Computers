@@ -565,7 +565,8 @@ public class Machine internal constructor(
     internal val consoleSizeGeneration: Long get() = lock.withLockValue { consoleTtyLocked().sizeGeneration }
 
     private fun markConsoleDirty() {
-        if (consoleDirty.compareAndSet(false, true) && queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
+        // 通知の列に印を積んで、TTY の出力の順番を、ほかの通知（カーネルのメッセージなど）との前後で決める
+        if (consoleDirty.compareAndSet(false, true)) postNotification(HostNotification.TtyOutput)
     }
 
     /** コンソールの TTY にたまった出力を取り出す（書き手を起こす）。なければ `null` */
@@ -883,19 +884,29 @@ public class Machine internal constructor(
         return true
     }
 
-    /** `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる */
+    /**
+     * `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる。
+     *
+     * TTY の出力は、たまった最初のときに通知の列へ印（[HostNotification.TtyOutput]）を積む。印のところで TTY から取り出して、
+     * 前後の通知と書いた順に並べる（起動のログ → init の出力 → init の終了のメッセージ → RUNNING など）
+     */
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
         var console: ByteArrayOutputStream? = null
-        if (consoleDirty.getAndSet(false)) {
-            drainConsoleOutput()?.let { bytes -> console = ByteArrayOutputStream().also { it.write(bytes, 0, bytes.size) } }
+        fun appendConsole(bytes: ByteArray) {
+            (console ?: ByteArrayOutputStream().also { console = it }).write(bytes, 0, bytes.size)
         }
         while (true) {
             val n = notifications.poll() ?: break
             if (n is HostNotification.Console) {
                 pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
-                val out = console ?: ByteArrayOutputStream().also { console = it }
-                out.write(n.bytes, 0, n.bytes.size)
+                appendConsole(n.bytes)
+                continue
+            }
+            if (n === HostNotification.TtyOutput) {
+                // 印を下ろしてから取り出す（取り出した後の出力は、新しい印で次に配る）
+                consoleDirty.set(false)
+                drainConsoleOutput()?.let(::appendConsole)
                 continue
             }
             console?.let { out ->
@@ -914,7 +925,7 @@ public class Machine internal constructor(
                     val go = lock.withLockValue { rebootNotified.also { rebootNotified = false } }
                     if (go) safely { host.onRebootRequested(this) }
                 }
-                is HostNotification.Console -> Unit
+                is HostNotification.Console, HostNotification.TtyOutput -> Unit
             }
         }
         console?.let { out -> safely { host.onConsoleOutput(this, out.toByteArray()) } }
@@ -1045,6 +1056,9 @@ private sealed class HostNotification {
     class StateChanged(val state: MachineState, val cause: Throwable?) : HostNotification()
 
     class Console(val bytes: ByteArray) : HostNotification()
+
+    /** コンソールの TTY に出力がたまった印（取り出すのは配るとき。列の中の位置が、書いた順の目印になる） */
+    data object TtyOutput : HostNotification()
 
     class Beep(val frequencyHz: Int, val durationMillis: Int) : HostNotification()
 

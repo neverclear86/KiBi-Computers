@@ -28,7 +28,7 @@ internal class KernelTestHooks {
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null
 
-    /** 起動ディスクを開く口の差し替え（`null` なら既定の [BootVolumeOpener.NONE]） */
+    /** 起動ディスクを開く口の差し替え（`null` なら既定の [BootVolumeOpener.DEFAULT]） */
     @Volatile
     var bootVolumes: BootVolumeOpener? = null
 

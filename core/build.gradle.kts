@@ -116,3 +116,26 @@ val zipTestImage = tasks.register<Zip>("zipTestImage") {
 sourceSets.test {
     resources.srcDir(files(layout.buildDirectory.dir("generated/images/test")) { builtBy(zipTestImage) })
 }
+
+// テスト用コンピューターの同梱イメージ testboot（#307 の仮の結線。標準OS #98 ができたら置き換える）。
+// init.c を WASM にビルドし、`/sbin/init` として zip に入れて、core のリソース `/kibicomputers/images/testboot.zip` にする。
+// WASM の単体は jar に入れないので、リソースを持たないだけのソースセットに出力する
+val testbootParts: SourceSet = sourceSets.create("testbootParts")
+val compileTestbootInit = kibiWasm.module("testboot-init", sourceSet = testbootParts.name) {
+    sources.from("src/main/wasm/testboot/init.c")
+    compilerArgs.addAll("-O2", "-s")
+}
+val zipTestbootImage = tasks.register<Zip>("zipTestbootImage") {
+    from(compileTestbootInit.flatMap { it.outputDir }) {
+        include("kibicomputers/wasm/testboot-init.wasm")
+        eachFile { path = "sbin/init" }
+        includeEmptyDirs = false
+    }
+    archiveFileName = "testboot.zip"
+    destinationDirectory = layout.buildDirectory.dir("generated/images/main/kibicomputers/images")
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+sourceSets.main {
+    resources.srcDir(files(layout.buildDirectory.dir("generated/images/main")) { builtBy(zipTestbootImage) })
+}

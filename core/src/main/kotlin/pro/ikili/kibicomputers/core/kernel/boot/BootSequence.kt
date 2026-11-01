@@ -26,7 +26,7 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 途中で取り消されたら、マウントを外して何も知らせずに終える。
  */
 internal class BootSequence(private val machine: Machine, private val config: BootConfig) {
-    private val opener: BootVolumeOpener get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.NONE
+    private val opener: BootVolumeOpener get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.DEFAULT
 
     fun run() {
         try {
@@ -45,7 +45,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             }
             machine.writeConsoleLine("kibi: booting from disk $diskId")
             machine.scheduler.hooks.beforeInitExec?.invoke(machine)
-            startInit()
+            startInit(volume)
         } catch (e: BootCancelledException) {
             machine.endBoot(null, "")
         } catch (t: Throwable) {
@@ -82,8 +82,10 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         false
     }
 
-    private fun startInit() {
+    private fun startInit(volume: BootVolume) {
         val options = SpawnOptions(
+            // 同梱イメージのプログラムは、燃料の計測（#38）がまだ入っていなくても動かす（#307 の仮の扱い）
+            allowUnmetered = volume.bundled,
             stdio = StdioSpec.CONSOLE,
             args = listOf(BootConfig.INIT_PATH),
             env = emptyMap(),

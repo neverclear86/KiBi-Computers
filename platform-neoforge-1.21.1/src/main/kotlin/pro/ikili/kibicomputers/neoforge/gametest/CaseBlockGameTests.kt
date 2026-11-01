@@ -98,7 +98,8 @@ object CaseBlockGameTests {
         helper.assertTrue(menu.status == ComputerStatus.ERROR, "status should be ERROR but was ${menu.status}")
         helper.assertTrue(menu.error == ComputerError.MISSING_PARTS, "error should be MISSING_PARTS but was ${menu.error}")
         helper.assertTrue(
-            menu.missingParts == listOf(PartKind.CPU, PartKind.MEMORY, PartKind.STORAGE, PartKind.BOOT),
+            // 起動部品は、仮の結線（#307）で挿さっているとみなす
+            menu.missingParts == listOf(PartKind.CPU, PartKind.MEMORY, PartKind.STORAGE),
             "missing parts were ${menu.missingParts}",
         )
         helper.assertTrue(ServerMachines.current!![MachineKey.of(helper.level, helper.absolutePos(POS))] == null, "no machine should be created")
