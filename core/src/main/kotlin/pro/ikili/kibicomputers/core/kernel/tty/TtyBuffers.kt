@@ -53,6 +53,12 @@ internal class TtyBytes(private val limit: Int) {
         return out
     }
 
+    /** 中身の写し（取り除かない） */
+    fun toByteArray(): ByteArray {
+        if (length == 0) return ByteArray(0)
+        return buffer!!.copyOfRange(head, head + length)
+    }
+
     /** 後ろから [n] バイトを取り除く */
     fun dropLast(n: Int) {
         require(n in 0..length) { "範囲外: $n" }

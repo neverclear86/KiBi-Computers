@@ -16,6 +16,17 @@
 #define lua_tmpnam(b, e) { (void)(b); e = -1; }
 
 /*
+ * 対話型の REPL（lua.c の doREPL。#96）。
+ * - 引数なしで起動したとき、標準入力が端末なら REPL、そうでなければ標準入力をスクリプトとして読む。
+ *   端末かどうかは wasi-libc の isatty（fd_fdstat_get の種類が CHARACTER_DEVICE）で見る
+ * - 行編集と履歴はカーネルの TTY（canonical モード）が受け持つので、lua_readline は標準の fgets のまま
+ * - 1行の上限は TTY の1行の上限（4095 バイト＋改行）にそろえる
+ */
+int isatty(int fd);
+#define lua_stdin_is_tty() isatty(0)
+#define LUA_MAXINPUT 4097
+
+/*
  * io.popen は LUA_USE_POSIX を定義しないので、Lua 標準の "'popen' not supported" になる。
  * package.loadlib・C のモジュールは LUA_USE_DLOPEN を定義しないので使えない。
  * io.tmpfile は kibi_wasi.c で失敗を返す。

@@ -428,4 +428,120 @@ class TtyTest {
         t.out()
         assertEquals(0, t.allocatedBytes)
     }
+
+    // ---- 履歴とエスケープシーケンス（#96） ----
+
+    private val up = "\u001b[A"
+    private val down = "\u001b[B"
+
+    @Test
+    fun `上下の矢印で確定した行を呼び戻し、いちばん新しいものの次は呼び戻す前の行に戻る`() {
+        val t = tty()
+        t.type("one\ntwo\n")
+        t.readText()
+        t.readText()
+        t.out()
+        assertEquals(2, t.historyCount)
+        t.type("dr")
+        t.out()
+        t.type(up)
+        assertEquals("\b \b\b \btwo", t.out())
+        t.type(up)
+        assertEquals("\b \b\b \b\b \bone", t.out())
+        // いちばん古いものより前はない: BEL を鳴らして行はそのまま
+        t.type(up)
+        assertEquals("\u0007", t.out())
+        t.type(down + down)
+        assertEquals("\b \b\b \b\b \btwo\b \b\b \b\b \bdr", t.out())
+        // 呼び戻していなければ、下の矢印は何もしない
+        t.type(down)
+        assertEquals("", t.out())
+        t.type("\u0015" + up + "!\n")
+        assertEquals("two!\n", t.readText())
+        assertEquals(3, t.historyCount)
+    }
+
+    @Test
+    fun `空の行・直前と同じ行・エコーしていない行は履歴に残さない`() {
+        val t = tty()
+        t.type("\na\na\n")
+        assertEquals(1, t.historyCount)
+        t.setMode(TtyMode.COOKED.with(TtyMode.ECHO, false), sink)
+        t.type("secret\n")
+        assertEquals(1, t.historyCount)
+        // エコーしていなければ呼び戻さない（シーケンスは読み捨てる）
+        t.type(up + "\n")
+        while (t.readText() is String) Unit
+        t.setMode(TtyMode.COOKED, sink)
+        t.out()
+        t.type(up + "\n")
+        assertEquals("a\r\n", t.out())
+        assertEquals("a\n", t.readText())
+    }
+
+    @Test
+    fun `履歴は行の数とバイト数の上限を超えたら古いものから捨てる`() {
+        val t = tty()
+        repeat(Tty.HISTORY_MAX_ENTRIES + 5) {
+            t.type("line$it\n")
+            t.readText()
+        }
+        assertEquals(Tty.HISTORY_MAX_ENTRIES, t.historyCount)
+        val h = TtyHistory(10, 8)
+        h.add("abcd".toByteArray())
+        h.add("efgh".toByteArray())
+        h.add("ij".toByteArray())
+        assertEquals(2, h.count)
+        assertEquals("efgh", String(h[0]))
+        h.add(ByteArray(9))
+        assertEquals(2, h.count)
+    }
+
+    @Test
+    fun `呼び戻した行が入力の上限に入らなければBELを鳴らして行はそのまま`() {
+        val t = tty(input = 8)
+        t.type("abcdef\n")
+        t.type(up)
+        assertEquals("abcdef\r\n\u0007", t.out())
+        assertEquals("abcdef\n", t.readText())
+        t.type(up)
+        assertEquals("abcdef", t.out())
+    }
+
+    @Test
+    fun `canonicalでは矢印などのシーケンスを行に入れず、ESCの後が別の文字ならESCを入れる`() {
+        val t = tty()
+        t.type("a\u001b[1;5Cb\u001bOPc\u001b[3~d\u001bxe\n")
+        assertEquals("abcd\u001bxe\n", t.readText())
+        // 1回の入力の境目をまたいでも同じ
+        t.type("\u001b")
+        t.type("[")
+        t.type("D")
+        t.type("z\n")
+        assertEquals("z\n", t.readText())
+        // 途中の制御文字はシーケンスをやめて普通に扱う
+        t.type("\u001b[\n")
+        assertEquals("\n", t.readText())
+    }
+
+    @Test
+    fun `非canonicalではシーケンスもそのまま読める`() {
+        val t = tty()
+        t.setMode(cbreak, sink)
+        t.type(up)
+        assertEquals(up, t.readText())
+    }
+
+    @Test
+    fun `Ctrl+Cは呼び戻しとシーケンスの途中をやめ、最後に閉じたら履歴を捨てる`() {
+        val t = tty()
+        t.type("x\n")
+        t.readText()
+        t.type("\u001b[")
+        t.typeBytes(byteArrayOf(0x03))
+        t.type("A\n")
+        assertEquals("A\n", t.readText())
+        t.onLastClose(sink)
+        assertEquals(0, t.historyCount)
+    }
 }

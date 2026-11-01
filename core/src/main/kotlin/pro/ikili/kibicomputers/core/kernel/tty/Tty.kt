@@ -17,6 +17,8 @@ import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
  * - 出力: プロセスが書いたバイト（[write]）とエコーをためる。`nlToCrNl` なら LF を CR LF にする。たまったことは
  *   [WakeSink.outputPending] で知らせ（待ち手は起こさない）、tick ごとに [drainOutput] で取り出す
  * - Ctrl+C・Ctrl+\ は [TtyInputResult.signals] で返す。画面の大きさ（[size]）とその世代（[sizeGeneration]）も持つ
+ * - canonical では、エコーしているときに確定した行を履歴に残し、上下の矢印（`ESC [ A`・`ESC [ B`）で編集中の行に呼び戻す（#96）。
+ *   ほかの `ESC [` と `ESC O` のシーケンスは行に入れずに読み捨てる
  *
  * 状態はどれも番号・真偽・バイト列（保存の対象。書き出す形は #82）。カーネルロックの中で使う。
  *
@@ -68,6 +70,19 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     /** 出力の今の桁（出力した CR・LF・BS・タブ・文字の幅で数える） */
     private var column = 0
 
+    /** 入力の履歴（canonical のとき。#96） */
+    private val history = TtyHistory(HISTORY_MAX_ENTRIES, HISTORY_MAX_BYTES)
+
+    /** 呼び戻している履歴の位置（-1 = 呼び戻していない） */
+    private var historyCursor = -1
+
+    /** 履歴を呼び戻す前の編集中の行（呼び戻していなければ `null`） */
+    private var historyDraft: ByteArray? = null
+
+    /** canonical の入力のエスケープシーケンスの読み途中（[ESC_NONE] など）と、CSI のパラメーターのバイト数 */
+    private var escState = ESC_NONE
+    private var escLength = 0
+
     /** 出力の UTF-8 の途中の文字（桁の数え用）: 組み立て中のコードポイントと、残りの続きのバイト数 */
     private var outCodePoint = 0
     private var outRemaining = 0
@@ -91,6 +106,9 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
     /** 確保しているバッファの合計（テスト用） */
     internal val allocatedBytes: Int get() = input.allocatedBytes + line.allocatedBytes + output.allocatedBytes
+
+    /** 履歴の行の数（テスト用） */
+    internal val historyCount: Int get() = history.count
 
     private val readable: Boolean get() = input.length > 0 || lines.count > 0
 
@@ -124,13 +142,18 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                 input.clear()
                 lines.clear()
                 line.clear()
+                resetLineState()
                 flushed = true
                 echoChar(b)
                 echoChar(LF)
                 (signals ?: ArrayList<TtySignal>(1).also { signals = it }) += if (b == CTRL_C) TtySignal.INTERRUPT else TtySignal.QUIT
                 continue
             }
-            if (mode.canonical) canonicalInput(b) else rawInput(b)
+            if (mode.canonical) {
+                if (!escapeInput(b)) canonicalInput(b)
+            } else {
+                rawInput(b)
+            }
         }
         if (readable && (!wasReadable || flushed)) sink.wake(WaitKey(id, WaitCondition.READABLE))
         if (outputAdded) sink.outputPending(id)
@@ -201,6 +224,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
             input.addAll(line)
             line.clear()
             lines.clear()
+            resetLineState()
         } else if (!old.canonical && mode.canonical) {
             lines.clear()
             if (input.length > 0) lines.add(input.length)
@@ -223,6 +247,8 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         lines.clear()
         line.clear()
         output.clear()
+        history.clear()
+        resetLineState()
     }
 
     // ---- 入力 ----
@@ -236,6 +262,8 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                     return
                 }
                 val n = line.length + 1
+                if (mode.echo) history.add(line.toByteArray())
+                resetLineState()
                 input.addAll(line)
                 input.add(LF.toByte())
                 line.clear()
@@ -262,6 +290,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                     input.addAll(line)
                     line.clear()
                     lines.add(n)
+                    resetLineState()
                 }
             }
             else -> {
@@ -274,6 +303,121 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                 echoChar(b)
             }
         }
+    }
+
+    /**
+     * canonical の入力のエスケープシーケンス（#96）。使ったら `true`、[canonicalInput] で普通に扱うなら `false`。
+     *
+     * - `ESC [` … 終わりのバイト（0x40〜0x7E）: `A` は履歴の前、`B` は履歴の次。ほかは読み捨てる。パラメーター（修飾キー）は見ない
+     * - `ESC O` ＋1バイト: 同じ（`A`・`B` だけを使う）
+     * - ESC の後が `[`・`O` でなければ、ESC を行に入れて、そのバイトは普通に扱う（Alt+キー）
+     * - 途中に制御文字が来たら、シーケンスをやめて、そのバイトは普通に扱う
+     */
+    private fun escapeInput(b: Int): Boolean {
+        when (escState) {
+            ESC_NONE -> {
+                if (b != ESC) return false
+                escState = ESC_START
+                return true
+            }
+            ESC_START -> {
+                escState = ESC_NONE
+                return when (b) {
+                    LEFT_BRACKET -> {
+                        escState = ESC_CSI
+                        escLength = 0
+                        true
+                    }
+                    LETTER_O -> {
+                        escState = ESC_SS3
+                        true
+                    }
+                    else -> {
+                        canonicalInput(ESC)
+                        escapeInput(b)
+                    }
+                }
+            }
+            ESC_CSI -> return when (b) {
+                in 0x20..0x3F -> {
+                    if (++escLength > MAX_CSI_PARAM_BYTES) escState = ESC_NONE
+                    true
+                }
+                in 0x40..0x7E -> {
+                    escState = ESC_NONE
+                    escapeFinal(b)
+                    true
+                }
+                else -> {
+                    escState = ESC_NONE
+                    false
+                }
+            }
+            else -> { // ESC_SS3
+                escState = ESC_NONE
+                if (b !in 0x40..0x7E) return false
+                escapeFinal(b)
+                return true
+            }
+        }
+    }
+
+    private fun escapeFinal(b: Int) {
+        when (b) {
+            LETTER_A -> historyPrevious()
+            LETTER_B -> historyNext()
+        }
+    }
+
+    /** 1つ前（古いほう）の履歴を呼び戻す。エコーしていなければ何もしない */
+    private fun historyPrevious() {
+        if (!mode.echo || history.count == 0) return
+        val next = if (historyCursor < 0) history.count - 1 else historyCursor - 1
+        if (next < 0) {
+            echoBytes(BEL)
+            return
+        }
+        val draft = if (historyCursor < 0) line.toByteArray() else historyDraft
+        if (!replaceLine(history[next])) return
+        historyDraft = draft
+        historyCursor = next
+    }
+
+    /** 1つ後（新しいほう）の履歴を呼び戻す。いちばん新しい履歴の次は、呼び戻す前の行に戻る */
+    private fun historyNext() {
+        if (!mode.echo || historyCursor < 0) return
+        val next = historyCursor + 1
+        val back = next >= history.count
+        if (!replaceLine(if (back) historyDraft ?: EMPTY else history[next])) return
+        if (back) {
+            historyCursor = -1
+            historyDraft = null
+        } else {
+            historyCursor = next
+        }
+    }
+
+    /** 編集中の行を [bytes] に置き換える（消してからエコーする）。入らなければ BEL を鳴らして `false` */
+    private fun replaceLine(bytes: ByteArray): Boolean {
+        if (input.length + bytes.size > inputCapacity - 1 || bytes.size > MAX_LINE_BYTES) {
+            echoBytes(BEL)
+            return false
+        }
+        eraseTo(0)
+        for (x in bytes) {
+            if (line.length == 0) lineStartColumn = column
+            line.add(x)
+            echoChar(x.toInt() and 0xFF)
+        }
+        return true
+    }
+
+    /** 行ごとの状態（履歴の呼び戻し・エスケープシーケンスの読み途中）を戻す */
+    private fun resetLineState() {
+        historyCursor = -1
+        historyDraft = null
+        escState = ESC_NONE
+        escLength = 0
     }
 
     private fun rawInput(b: Int) {
@@ -434,6 +578,20 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
         const val TAB_WIDTH: Int = 8
 
+        /** 履歴の上限（行の数とバイト数。仮の値。確定は #251） */
+        const val HISTORY_MAX_ENTRIES: Int = 32
+        const val HISTORY_MAX_BYTES: Int = 4096
+
+        /** CSI のパラメーターの長さの上限（超えたらシーケンスをやめる） */
+        private const val MAX_CSI_PARAM_BYTES = 16
+
+        private const val ESC_NONE = 0
+        private const val ESC_START = 1
+        private const val ESC_CSI = 2
+        private const val ESC_SS3 = 3
+
+        private val EMPTY = ByteArray(0)
+
         private const val CTRL_C = 0x03
         private const val CTRL_D = 0x04
         private const val BEL = 0x07
@@ -443,8 +601,13 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         private const val CR = 0x0D
         private const val CTRL_U = 0x15
         private const val CTRL_W = 0x17
+        private const val ESC = 0x1B
         private const val CTRL_BACKSLASH = 0x1C
         private const val SPACE = 0x20
+        private const val LETTER_A = 0x41
+        private const val LETTER_B = 0x42
+        private const val LETTER_O = 0x4F
+        private const val LEFT_BRACKET = 0x5B
         private const val CARET = 0x5E
         private const val DEL = 0x7F
 
