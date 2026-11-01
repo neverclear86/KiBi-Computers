@@ -32,6 +32,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 
@@ -409,6 +410,10 @@ internal class ProcessRunner(private val machine: Machine) {
         check(builder.asyncStack == null) { "ABI 層は builder.asyncStack を呼ばない（退避先はカーネルが設定する）" }
         // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
         builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
+        // テーブル（#361）: 要素数の上限は読み込みの上限と同じ値にし、要素の分はメモリと同じくプロセスと RAM に数える
+        check(builder.tableBudget == null && builder.maxTableElements == Int.MAX_VALUE) { "ABI 層は builder.tableLimit を呼ばない（テーブルの上限はカーネルが設定する）" }
+        val maxTableElements = (scheduler.options.moduleLimits ?: ModuleLimits.DEFAULT).maxTableElements
+        builder.tableLimit(maxTableElements, rt.memory)
     }
 
     /** プロセスの始まり: LOADING で configure → 燃料の設定 → instantiate */

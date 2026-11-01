@@ -192,6 +192,23 @@ public interface WasmMemoryBudget {
 }
 
 /**
+ * テーブルの確保を数える相手（#361）。[WasmInstanceConfig.Builder.tableLimit] で渡す。
+ *
+ * ランタイムは、テーブルを作るとき（最初の要素数）と増やすとき（`table.grow`）に、要素数 × 要素1つのバイト数を
+ * [tryReserveBytes] で数え、インスタンスを閉じたとき（作るのに失敗したときも）に、まとめて [releaseBytes] で返す。
+ * 増やすのに失敗したら数えない。スレッドの約束は [WasmMemoryBudget] と同じ。
+ *
+ * カーネルの外に出す必要がまだないので、`internal` にしてある（カーネルの [pro.ikili.kibicomputers.core.kernel.ProcessMemory] が実装する）。
+ */
+internal interface WasmTableBudget {
+    /** [bytes] バイト（1 以上）を確保してよければ、数えて `true`。だめなら何も数えずに `false` */
+    fun tryReserveBytes(bytes: Long): Boolean
+
+    /** [tryReserveBytes] で確保した分のうち [bytes] バイト（1 以上）を返す */
+    fun releaseBytes(bytes: Long)
+}
+
+/**
  * ホストの関数（システムコールなど）。
  *
  * 投げた例外は、WASM の中では捕まえられず、[WasmInstance.call] からそのまま外に出る。
