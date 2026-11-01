@@ -133,6 +133,17 @@ class HostBoundaryTest {
     }
 
     @Test
+    fun `カーネルのメッセージもLFをCR LFにして配る`() = timeout(limit) {
+        Harness().use { h ->
+            val host = RecordingHost()
+            val m = h.machine(host = host)
+            assertTrue(m.writeConsole("xa\nb\n".toByteArray(), 1, 4))
+            h.scheduler.tick()
+            assertEquals("a\r\nb\r\n", synchronized(host.console) { host.console.toString(Charsets.UTF_8) })
+        }
+    }
+
+    @Test
     fun `配っていない出力が上限を超えた分は捨てる`() = timeout(limit) {
         Harness().use { h ->
             val host = RecordingHost()

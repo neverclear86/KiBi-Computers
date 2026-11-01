@@ -61,7 +61,7 @@
 - 入力（4 KiB。仮の値）: `Machine.offerConsoleInput`（internal）で足す。接続層からキー入力を渡す口と行編集は #60
 - たまった出力・入力はカーネルの状態なので、保存の対象になる
 - `Machine.wakeSink` は `WaitRegistry` を包み、コンソールの出力の READABLE を見る。カーネルの中でオブジェクトの状態を変えるときは、これを渡す
-- TTY（#60）ができたら、`Console` の中身を TTY のオブジェクトに置き換える
+- **#60 で、入出力2つの `ByteStream` を TTY のオブジェクト `Tty` 1つ（`KernelState.consoleTtyId`）に置き換えた（ADR 0060）。** この節の ID・知らせ方は ADR 0060 が正
 
 ## 保存（#81・#82 への申し送り）
 

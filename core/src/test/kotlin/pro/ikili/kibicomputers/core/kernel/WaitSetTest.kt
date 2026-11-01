@@ -109,4 +109,16 @@ class WaitSetTest {
         assertEquals(2, q.wakes)
         assertEquals(listOf(readable(a)), wq.readyKeys(objects))
     }
+
+    @Test
+    fun `outputPendingは待ち手を起こさない`() {
+        val a = stream()
+        val r = CountingWaiter()
+        val w = CountingWaiter()
+        WaitSet.register(registry, objects, listOf(readable(a)), r)
+        WaitSet.register(registry, objects, listOf(writable(a)), w)
+        registry.outputPending(a.id)
+        assertEquals(0, r.wakes)
+        assertEquals(0, w.wakes)
+    }
 }

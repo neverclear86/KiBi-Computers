@@ -17,6 +17,9 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
+import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
@@ -24,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -92,16 +96,17 @@ class StdioTest {
             m.lock.withLockValue {
                 assertEquals(
                     mapOf(
-                        0 to HandleEntry(m.kernel.consoleInputId, rights = HandleRights.READ),
-                        1 to HandleEntry(m.kernel.consoleOutputId, rights = HandleRights.WRITE),
-                        2 to HandleEntry(m.kernel.consoleOutputId, rights = HandleRights.WRITE),
+                        0 to HandleEntry(m.kernel.consoleTtyId, rights = HandleRights.READ),
+                        1 to HandleEntry(m.kernel.consoleTtyId, rights = HandleRights.WRITE),
+                        2 to HandleEntry(m.kernel.consoleTtyId, rights = HandleRights.WRITE),
                     ),
                     entries,
                 )
             }
             h.tickUntil { m.stateOf(pid) == ProcessState.WAITING_EVENT && host.text() == "hello err " }
-            assertEquals(3, m.offerConsoleInput("abc".toByteArray()))
-            h.tickUntil { m.stateOf(pid).isTerminal && host.text() == "hello err got:abc" }
+            // 行編集を通る: b を消して c、CR は LF になって行が確定する。エコーも出力に届く
+            assertEquals(5, m.offerConsoleInput("ab\u007fc\r".toByteArray()))
+            h.tickUntil { m.stateOf(pid).isTerminal && host.text() == "hello err ab\b \bc\r\ngot:ac\r\n" }
             assertEquals(
                 listOf(IoResult.Bytes(6), IoResult.Bytes(4), IoResult.Error(Errno.BADF), IoResult.Error(Errno.BADF), IoResult.Bytes(3)),
                 results.toList(),
@@ -110,9 +115,84 @@ class StdioTest {
             // 終わったプロセスは fd を持たず、コンソールはカーネルの参照だけが残る
             assertTrue(m.entries(pid).isEmpty())
             m.lock.withLockValue {
-                assertEquals(1, m.kernel.objects.refCount(m.kernel.consoleInputId))
-                assertEquals(1, m.kernel.objects.refCount(m.kernel.consoleOutputId))
+                assertEquals(1, m.kernel.objects.refCount(m.kernel.consoleTtyId))
             }
+        }
+    }
+
+    @Test
+    fun `Ctrl+Cは入力がいっぱいでもシグナルの受け口に届く`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val got = Collections.synchronizedList(ArrayList<Pair<TtySignal, Int>>())
+            m.ttySignalHandler = TtySignalHandler { machine, signal, fg ->
+                assertTrue(machine.lock.isHeldByCurrentThread, "カーネルロックの中で呼ぶ")
+                got += signal to fg
+            }
+            m.lock.withLockValue { m.consoleTtyLocked().foregroundPid = 7 }
+            val full = ByteArray(Machine.CONSOLE_INPUT_BYTES + 10) { 'x'.code.toByte() }
+            assertEquals(Machine.CONSOLE_INPUT_BYTES - 1, m.offerConsoleInput(full))
+            assertEquals(2, m.offerConsoleInput(byteArrayOf(0x03, 0x1C)))
+            assertEquals(listOf(TtySignal.INTERRUPT to 7, TtySignal.QUIT to 7), got.toList())
+            m.lock.withLockValue { assertEquals(0, m.consoleTtyLocked().editingLength) }
+        }
+    }
+
+    @Test
+    fun `fd 0を待つ待機点型のプロセスは出力やエコーでは起こされない`() = timeout(limit) {
+        Harness().use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(host = host)
+            val steps = AtomicInteger()
+            val reader = m.spawnTest(h.program(emptyModule()), TestDriver(ProcessKind.WAIT_POINT) { ctx ->
+                steps.incrementAndGet()
+                when (val r = FdIo.read(ctx, 0, ByteArray(16), 0, 16)) {
+                    is IoResult.WouldBlock -> StepResult.Wait(listOf(r.key))
+                    else -> StepResult.Exit(0)
+                }
+            })
+            h.tickUntil { m.stateOf(reader) == ProcessState.WAITING_EVENT }
+            val before = steps.get()
+            val writer = m.spawnTest(h.program(emptyModule()), TestDriver(ProcessKind.BLOCKING) { ctx ->
+                write(ctx, 1, "out\n")
+                StepResult.Exit(0)
+            })
+            h.tickUntil { m.stateOf(writer).isTerminal && host.text() == "out\r\n" }
+            // 行の途中のエコーだけ（行は確定しない）
+            m.offerConsoleInput("ab".toByteArray())
+            h.tickUntil { host.text() == "out\r\nab" }
+            repeat(3) { h.scheduler.tick() }
+            assertEquals(before, steps.get(), "出力・エコーで読み手が起きた")
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(reader))
+            // 行が確定したら起きる
+            m.offerConsoleInput("\n".toByteArray())
+            h.tickUntil { m.stateOf(reader).isTerminal }
+        }
+    }
+
+    @Test
+    fun `resizeConsoleで大きさと世代が変わり、待っているプロセスは起こされない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val steps = AtomicInteger()
+            val reader = m.spawnTest(h.program(emptyModule()), TestDriver(ProcessKind.WAIT_POINT) { ctx ->
+                steps.incrementAndGet()
+                when (val r = FdIo.read(ctx, 0, ByteArray(16), 0, 16)) {
+                    is IoResult.WouldBlock -> StepResult.Wait(listOf(r.key))
+                    else -> StepResult.Exit(0)
+                }
+            })
+            h.tickUntil { m.stateOf(reader) == ProcessState.WAITING_EVENT }
+            val before = steps.get()
+            assertEquals(TtySize(Tty.DEFAULT_COLUMNS, Tty.DEFAULT_ROWS), m.consoleSize)
+            assertEquals(0, m.consoleSizeGeneration)
+            m.resizeConsole(120, 40)
+            m.resizeConsole(120, 40)
+            assertEquals(TtySize(120, 40), m.consoleSize)
+            assertEquals(1, m.consoleSizeGeneration)
+            assertThrows<IllegalArgumentException> { m.resizeConsole(0, 10) }
+            repeat(3) { h.scheduler.tick() }
+            assertEquals(before, steps.get())
         }
     }
 

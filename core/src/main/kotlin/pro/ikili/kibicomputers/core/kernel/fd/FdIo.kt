@@ -7,6 +7,7 @@ import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
@@ -31,7 +32,7 @@ internal sealed interface IoResult {
 }
 
 /**
- * fd を通した読み書き。fd が指すオブジェクトの種類（`ByteStream`、`OpenFile`）で振り分ける。ABI 層（p1 の `fd_read`・`fd_write`、
+ * fd を通した読み書き。fd が指すオブジェクトの種類（`ByteStream`、`Tty`、`OpenFile`）で振り分ける。ABI 層（p1 の `fd_read`・`fd_write`、
  * p2 の stream）はこれを使い、[IoResult] を自分の ABI の値に直す。
  *
  * fd の権利（[HandleRights]）がなければ `BADF`。読み書きを持たない種類のオブジェクトは `INVAL`。
@@ -80,6 +81,11 @@ internal object FdIo {
                     ReadResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.READABLE))
                     ReadResult.Eof -> IoResult.Eof
                 }
+                is Tty -> when (val r = obj.read(dst, off, len, sink)) {
+                    is ReadResult.Bytes -> IoResult.Bytes(r.count)
+                    ReadResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.READABLE))
+                    ReadResult.Eof -> IoResult.Eof
+                }
                 is OpenFile -> {
                     val n = vfs.read(obj, dst, off, len)
                     if (n == 0 && len > 0) IoResult.Eof else IoResult.Bytes(n)
@@ -101,6 +107,11 @@ internal object FdIo {
             if (entry.rights and HandleRights.WRITE == 0) return IoResult.Error(Errno.BADF)
             when (val obj = table.objectOf(fd)) {
                 is ByteStream -> when (val r = obj.write(src, off, len, sink)) {
+                    is WriteResult.Bytes -> IoResult.Bytes(r.count)
+                    WriteResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.WRITABLE))
+                    WriteResult.Closed -> IoResult.Error(Errno.PIPE)
+                }
+                is Tty -> when (val r = obj.write(src, off, len, sink)) {
                     is WriteResult.Bytes -> IoResult.Bytes(r.count)
                     WriteResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.WRITABLE))
                     WriteResult.Closed -> IoResult.Error(Errno.PIPE)

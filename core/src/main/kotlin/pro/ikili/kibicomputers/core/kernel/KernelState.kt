@@ -24,11 +24,11 @@ internal class KernelState(maxProcesses: Int) {
     /** マシンの燃料の残り（`fuelPerTick` 以下。負なら行き過ぎた分）。燃料の正 */
     var fuel: Long = 0
 
-    /** コンソールの入力の `ByteStream` のオブジェクトID（まだ作っていなければ 0）。カーネルが参照を1つ持つ（#58） */
-    var consoleInputId: Int = 0
-
-    /** コンソールの出力の `ByteStream` のオブジェクトID（まだ作っていなければ 0）。tick ごとに接続層へ配る（#58） */
-    var consoleOutputId: Int = 0
+    /**
+     * コンソールの `Tty` のオブジェクトID（まだ作っていなければ 0）。カーネルが参照を1つ持ち、閉じない（#58・#60）。
+     * 出力は tick ごとに接続層へ配る
+     */
+    var consoleTtyId: Int = 0
 
     /**
      * マシンの単調時計（WASI の `MONOTONIC`）の、環境の `MachineClock.monotonicNanos` との差（ナノ秒。#69）。
