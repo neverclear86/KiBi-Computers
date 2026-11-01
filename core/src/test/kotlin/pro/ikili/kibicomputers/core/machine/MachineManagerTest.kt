@@ -227,7 +227,8 @@ class MachineManagerTest {
         }
     }
 
-    @Test
+    // 閉じる最中にマシンが一覧から外れても落ちないことを、繰り返して確かめる
+    @org.junit.jupiter.api.RepeatedTest(100)
     fun `閉じると全マシンを止め、新しいマシンを断る`() = timeout(limit) {
         Harness().use { h ->
             val manager = h.manager()

@@ -424,8 +424,9 @@ public class Machine private constructor(
      *
      * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
      * - 普通のファイルでなければ `ACCES`、[MachineLimits.MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
+     * - 読み込むときに燃料の計測コードを挿入する（#38）。計測の名前（`kibi.fuel`・`kibi_fuel`）をすでに使っている WASM も `NOEXEC`
      * - `options.args` が空なら、argv を [path] の文字列1つにする
-     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
+     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（挿入・パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
      */
@@ -440,7 +441,8 @@ public class Machine private constructor(
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
         val bytes = lock.withLockValue { readExecutableLocked(path, parentLocked(parentPid)) }
         val program = try {
-            Program.load(scheduler.options.runtime, bytes)
+            val runtime = scheduler.options.runtime
+            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes) else Program.load(runtime, bytes)
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "$path は WASM として読めない: ${e.message}")
         }

@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -51,9 +52,14 @@ internal class Harness(
     schedulerConfig: SchedulerConfig = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).build(),
     executor: ExecutorService? = null,
     workerIdleMillis: Long = 30_000,
+    /** `Machine.exec` が読み込むランタイム。`null` ならダミーの [runtime] を使い、燃料の計測コードは挿入しない */
+    execRuntime: WasmRuntime? = null,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
-    val scheduler = MachineScheduler.create(schedulerConfig, SchedulerInternals(executor, workerIdleMillis, runtime))
+    val scheduler = MachineScheduler.create(
+        schedulerConfig,
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null),
+    )
     private var counter = 0
 
     /** 通知の記録（tick() の中で配られたもの） */

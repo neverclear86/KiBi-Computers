@@ -202,10 +202,11 @@ public class MachineScheduler private constructor(
         check(!KernelThread.isCurrent()) { "カーネルのスレッドからは呼べない" }
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
         fun remainingMillis(): Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(0)
-        for (machine in machines.values.toList()) {
+        // ConcurrentHashMap の values.toList() は、size を読んだ後に要素が減ると NoSuchElementException になる。toArray で写す
+        for (machine in ArrayList(machines.values)) {
             if (!machine.awaitTermination(remainingMillis())) return false
         }
-        for (t in dedicatedThreads.toList()) {
+        for (t in ArrayList(dedicatedThreads)) {
             t.join(remainingMillis().coerceAtLeast(1))
             if (t.isAlive) return false
         }
@@ -272,6 +273,8 @@ internal class SchedulerInternals(
     val workerIdleMillis: Long = 30_000,
     /** 実行ファイル（`Machine.exec`）を読み込むランタイム（テストではダミーにする） */
     val runtime: WasmRuntime = EndiveRuntime(),
+    /** `Machine.exec` で読み込むときに燃料の計測コードを挿入する（#38）。ダミーのランタイムで、本物の WASM でないバイト列を使うテストでは `false` */
+    val meterExecutables: Boolean = true,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */

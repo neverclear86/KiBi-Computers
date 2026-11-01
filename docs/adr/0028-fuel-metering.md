@@ -89,6 +89,14 @@ AGENTS.md の優先順位（TPS → 状態保存 → 単純さ → 速度）で�
 - **挿入するコードを小さく保つ。** JVM の JIT の上限（8,000 バイトのメソッド）を超えると遅くなる。分岐のないセグメントが続くところでは引く処理をまとめる、など。挿入の前後で関数ごとの大きさを確かめるテストを置く
 - 対応する WASM の機能: 例外処理（`try_table`・`throw`）は Lua の `pcall` で確かめた。末尾呼び出し（`return_call`）と GC の提案の分岐命令（`br_on_*`）は書き換えの対象にしてあるが、使う WASM で確かめていない。初期値の式を持つテーブルは断る。実装では、これらのテスト用の WASM を用意する
 
+### 実装（#38）
+
+- 挿入は `core` の `pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector`（内部のもの）。PoC の方式（ローカルに写す。`try_table` を含む関数はグローバル）をそのまま使う
+- `Machine.exec` が、VFS から読んだ実行ファイルに必ず挿入してから読み込む（同梱イメージの init も含む）。`kibi.fuel` を import する・`kibi_fuel` を export する WASM は `NOEXEC` で断る。ビルド時に挿入した同梱の WASM を通す口は、#36・#92 で足す
+- 挿入するコードを小さくする工夫: `block`・`try_table` に入るところは分岐の行き先にならないので、前のセグメントと引く処理をまとめる。lua.wasm のコードは 281,080 → 451,592 バイト（+61%。PoC は +67%）
+- 重み（仮。確定は #251）: 命令 1 つで 1。`memory.copy`・`memory.fill`・`memory.init` は 8 バイトごとに 1、`table.copy`・`table.fill`・`table.init`・`table.grow` は 1 要素ごとに 1、`memory.grow` は 1 ページごとに 8,192 を足す（`FuelCosts`）
+- テスト用の WASM（`core/src/test/wasm/fuel.c`）で、一括メモリ命令と末尾呼び出し（`return_call`）を確かめた。例外処理は lua.wasm の `pcall` で確かめた。GC の提案の分岐命令（`br_on_*`）は、使う WASM がまだないので確かめていない
+
 ### 測っていないこと
 
 - ビルド時AOT。ランタイムコンパイラと同じコードを出す（#26）ので、燃料と速さは同じになる見込み

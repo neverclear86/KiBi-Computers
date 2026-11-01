@@ -4,13 +4,8 @@ import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 
-/**
- * 起動ディスクとして開いたファイルシステム（実行時だけ）。
- *
- * @property bundled MOD に同梱したイメージ（#55）。中のプログラムは MOD が用意したものなので、
- *   燃料の計測（#38）がまだ入っていなくても init として動かす（#307 の仮の扱い。#38 で計測を入れたら外す）
- */
-internal class BootVolume(val fs: FileSystem, val readOnly: Boolean, val bundled: Boolean = false)
+/** 起動ディスクとして開いたファイルシステム（実行時だけ）。 */
+internal class BootVolume(val fs: FileSystem, val readOnly: Boolean)
 
 /**
  * ディスクの識別子から、起動に使うファイルシステムを開く口（#49）。ワーカーのスレッドから、カーネルロックを持たずに呼ぶ。
@@ -37,7 +32,7 @@ internal fun interface BootVolumeOpener {
             } catch (e: java.io.IOException) {
                 null
             }
-            fs?.let { BootVolume(it, readOnly = true, bundled = true) }
+            fs?.let { BootVolume(it, readOnly = true) }
         }
     }
 }
