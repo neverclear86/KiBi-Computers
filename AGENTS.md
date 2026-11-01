@@ -39,6 +39,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | ビルドと単体テスト | `./gradlew build` |
 | core の単体テストだけ | `./gradlew :core:test` |
 | ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
+| ゲーム内の多数台の負荷試験（手順と結果は `docs/load-test.md`） | `./gradlew :platform-neoforge-1.21.1:runLoadTestServer -PloadTestCounts=1000` |
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
 

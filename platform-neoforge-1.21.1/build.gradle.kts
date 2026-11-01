@@ -57,6 +57,15 @@ neoForge {
         }
         register("gameTestServer") {
             type = "gameTestServer"
+            // CI のランナー（2コア）と同じ条件で試すときは -PgameTestProcessors=2（JVM に見せるコア数を絞る）
+            providers.gradleProperty("gameTestProcessors").orNull?.let { jvmArgument("-XX:ActiveProcessorCount=$it") }
+        }
+        // ゲームの中での多数台の負荷試験（#345。docs/load-test.md）。測定用のテストだけを動かす。
+        // 台数は -PloadTestCounts=100,500,1000 で渡す（既定は 1000）。初回のコンパイルを測るため、台数ごとに起動し直すとよい
+        register("loadTestServer") {
+            type = "gameTestServer"
+            systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
+            systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
         }
         register("data") {
             data()
