@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
 import pro.ikili.kibicomputers.core.display.terminal.TerminalListener
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.TerminalKeyEncoder
+import pro.ikili.kibicomputers.core.kernel.ConsoleHoldListener
 import pro.ikili.kibicomputers.core.kernel.Machine
 
 /**
@@ -15,6 +16,8 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  * - キーボードの入力（[KeyboardEvent]）を [keyboardInput] に渡すと、端末のバイト列にして（[TerminalKeyEncoder]）
  *   マシンのコンソールの TTY に流す
  * - 端末からの応答（カーソル位置の問い合わせへの答えなど）も、TTY に流す
+ * - 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
+ *   （TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間は、上限なしで全部処理する
  *
  * 正式には、隣接デバイスの接続（#129）と、画面・キーボードのデバイス（#65・#66）で置き換える。
  *
@@ -41,19 +44,111 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
         },
     )
 
+    /** 1 tick に処理するセルの数の上限（#357。仮の値。確定は #251）。テストで変える */
+    internal var cellsPerTick: Long = DEFAULT_CELLS_PER_TICK
+
+    // 処理しきれずに取っておいた出力（backlog[backlogStart until backlogEnd]）
+    private var backlog = EMPTY
+    private var backlogStart = 0
+    private var backlogEnd = 0
+
+    // 今の tick（マシンのスケジューラーの tick）に、まだ処理してよいセルの数
+    private var budgetTick = Long.MIN_VALUE
+    private var budgetLeft = 0L
+
+    // 出力を止めているマシン
+    private var held: Machine? = null
+
+    private val holdListener = ConsoleHoldListener { pump() }
+
     /**
      * 入力と端末の応答を流す先のマシン。`null` なら入力を捨てる。
      * 入れると、マシンのコンソールの大きさを [screen] の大きさに合わせる。
      */
     public var machine: Machine? = null
         set(value) {
+            if (field !== value) release()
             field = value
             value?.resizeConsole(screen.width, screen.height)
+            if (backlogEnd > backlogStart) pump()
         }
 
-    /** コンソールの出力 [bytes]（TTY を通った UTF-8 のバイト列）を、端末として解釈して [screen] に書く。 */
+    /**
+     * コンソールの出力 [bytes]（TTY を通った UTF-8 のバイト列）を、端末として解釈して [screen] に書く。
+     * この tick の上限を超えた分は取っておき、次の tick から書く（書いた順は変えない）。
+     */
     public fun write(bytes: ByteArray) {
-        terminal.write(bytes)
+        if (bytes.isEmpty()) return
+        append(bytes)
+        pump()
+        // 渡された配列は呼ぶ側が使い回すかもしれないので、残りを取っておくときは写す
+        if (backlog === bytes) {
+            backlog = bytes.copyOfRange(backlogStart, backlogEnd)
+            backlogStart = 0
+            backlogEnd = backlog.size
+        }
+    }
+
+    /** 処理しきれずに取っておいた出力のバイト数（#357） */
+    internal val backlogBytes: Int get() = backlogEnd - backlogStart
+
+    /** 最後に処理したマシンの tick で使ったセルの数（#357。テスト用） */
+    internal val cellsUsedThisTick: Long get() = cellsPerTick - budgetLeft
+
+    private fun append(bytes: ByteArray) {
+        val pending = backlogEnd - backlogStart
+        if (pending == 0) {
+            backlog = bytes
+            backlogStart = 0
+            backlogEnd = bytes.size
+            return
+        }
+        val joined = ByteArray(pending + bytes.size)
+        backlog.copyInto(joined, 0, backlogStart, backlogEnd)
+        bytes.copyInto(joined, pending)
+        backlog = joined
+        backlogStart = 0
+        backlogEnd = joined.size
+    }
+
+    // 取っておいた出力を、この tick の上限まで書く。残ればマシンの出力を止め、なくなれば止めるのをやめる
+    private fun pump() {
+        val m = machine
+        if (m == null) {
+            terminal.write(backlog, backlogStart, backlogEnd - backlogStart)
+            clearBacklog()
+            return
+        }
+        val tick = m.scheduler.now
+        if (tick != budgetTick) {
+            budgetTick = tick
+            budgetLeft = cellsPerTick
+        }
+        while (backlogEnd > backlogStart && budgetLeft > 0) {
+            backlogStart += terminal.write(backlog, backlogStart, backlogEnd - backlogStart, budgetLeft)
+            budgetLeft -= terminal.cost
+        }
+        if (backlogEnd > backlogStart) {
+            if (held !== m) {
+                release()
+                held = m
+            }
+            m.holdConsoleOutput(holdListener)
+        } else {
+            clearBacklog()
+            release()
+        }
+    }
+
+    private fun clearBacklog() {
+        backlog = EMPTY
+        backlogStart = 0
+        backlogEnd = 0
+    }
+
+    private fun release() {
+        held?.releaseConsoleOutput()
+        held = null
     }
 
     /**
@@ -70,8 +165,20 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
 
     /** 端末を最初の状態に戻し、画面を消す（電源を入れ直したときなど）。 */
     public fun reset() {
+        clearBacklog()
+        release()
         terminal.reset()
     }
 
     override fun toString(): String = "MachineConsole(${screen.width}x${screen.height}, $machine)"
+
+    internal companion object {
+        /**
+         * 1 tick に処理するセルの数の上限の既定値（仮の値。確定は #251）。いちばん大きい画面（160x50）の全体を 8 回書き換えられる。
+         * 普通の出力は1 tick で終わり、1行送りの連打のような出力でも、1台の1 tick の処理は画面 8 枚分で止まる
+         */
+        const val DEFAULT_CELLS_PER_TICK: Long = 160L * 50 * 8
+
+        private val EMPTY = ByteArray(0)
+    }
 }

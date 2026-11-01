@@ -259,6 +259,18 @@ public class Machine private constructor(
     private val notifications = ConcurrentLinkedQueue<HostNotification>()
     private val queuedForNotify = AtomicBoolean(false)
 
+    /**
+     * コンソールの出力を止めている相手（#357。画面の処理が追いつかないとき [holdConsoleOutput] で止める）。
+     * `null` なら止めていない。メインスレッドだけで読み書きする
+     */
+    private var consoleHold: ConsoleHoldListener? = null
+
+    /**
+     * 止めている間に配らなかったコンソールの出力。書いた順に並べ、`null` は TTY の出力の印（TTY から取り出すのは再開したとき）。
+     * TTY の印は [consoleDirty] を下ろさずに持つので、多くても1つ。メインスレッドだけで読み書きする
+     */
+    private var deferredConsole: ArrayList<ByteArray?>? = null
+
     /** 配っていないコンソール出力のバイト数と、ビープの数（上限を超えた分は捨てる） */
     private val pendingConsoleBytes = AtomicLong()
     private val pendingBeeps = AtomicInteger()
@@ -1336,14 +1348,27 @@ public class Machine private constructor(
         fun appendConsole(bytes: ByteArray) {
             (console ?: ByteArrayOutputStream().also { console = it }).write(bytes, 0, bytes.size)
         }
+        // 止めている相手に、新しい tick になったことを知らせる（続きを処理して、追いつけば止めるのをやめる）
+        consoleHold?.let { safely { it.resume() } }
+        if (consoleHold == null) resumeDeferredConsole(::appendConsole)
         while (true) {
             val n = notifications.poll() ?: break
             if (n is HostNotification.Console) {
+                if (consoleHold != null) {
+                    // 止めている間は、書いた順に取っておく（配っていないバイト数は、配るまで減らさない）
+                    deferConsole(n.bytes)
+                    continue
+                }
                 pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
                 appendConsole(n.bytes)
                 continue
             }
             if (n === HostNotification.TtyOutput) {
+                if (consoleHold != null) {
+                    // 印を下ろさずに取っておく。TTY の出力がたまったままになり、書き手は空くまで待つ
+                    deferConsole(null)
+                    continue
+                }
                 // 印を下ろしてから取り出す（取り出した後の出力は、新しい印で次に配る）
                 consoleDirty.set(false)
                 drainConsoleOutput()?.let(::appendConsole)
@@ -1368,7 +1393,56 @@ public class Machine private constructor(
                 is HostNotification.Console, HostNotification.TtyOutput -> Unit
             }
         }
+        // 通知の中で止めるのをやめた（つなぎを外したなど）なら、取っておいた分もここで配る
+        if (consoleHold == null) resumeDeferredConsole(::appendConsole)
         console?.let { out -> safely { host.onConsoleOutput(this, out.toByteArray()) } }
+        // 止めている間は、毎 tick 回ってくる（止めている台だけ。待っている台の負荷は増えない）
+        if (consoleHold != null) requestNotify()
+    }
+
+    /**
+     * コンソールの出力を配るのを止める（#357）。メインスレッドから呼ぶ。止めている間は、TTY の出力を取り出さないので、
+     * TTY がいっぱいになると書き手（プロセス）は待つ。カーネルのメッセージも、書いた順に取っておく。
+     * 止めている間、毎 tick の通知の始めに [listener] の `resume` を呼ぶ。[releaseConsoleOutput] で、取っておいた分を
+     * 次の通知で（`resume` の中で止めるのをやめたなら、その tick のうちに）書いた順に配る。
+     * すでに止めていれば、知らせる先を [listener] に替える
+     */
+    internal fun holdConsoleOutput(listener: ConsoleHoldListener) {
+        consoleHold = listener
+        requestNotify()
+    }
+
+    /** [holdConsoleOutput] で止めたのをやめる。メインスレッドから呼ぶ。止めていなければ何もしない */
+    internal fun releaseConsoleOutput() {
+        if (consoleHold == null) return
+        consoleHold = null
+        if (deferredConsole != null) requestNotify()
+    }
+
+    /** コンソールの出力を止めているか（#357）。メインスレッドから呼ぶ */
+    internal val consoleOutputHeld: Boolean get() = consoleHold != null
+
+    private fun requestNotify() {
+        if (queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
+    }
+
+    private fun deferConsole(bytes: ByteArray?) {
+        (deferredConsole ?: ArrayList<ByteArray?>().also { deferredConsole = it }).add(bytes)
+    }
+
+    /** 止めている間に取っておいた出力を、書いた順に [append] へ渡す */
+    private inline fun resumeDeferredConsole(append: (ByteArray) -> Unit) {
+        val deferred = deferredConsole ?: return
+        deferredConsole = null
+        for (bytes in deferred) {
+            if (bytes == null) {
+                consoleDirty.set(false)
+                drainConsoleOutput()?.let(append)
+            } else {
+                pendingConsoleBytes.addAndGet(-bytes.size.toLong())
+                append(bytes)
+            }
+        }
     }
 
     private inline fun safely(block: () -> Unit) {
@@ -1542,6 +1616,12 @@ private class PendingHostCall<T>(
             future.completeExceptionally(t)
         }
     }
+}
+
+/** コンソールの出力を止めている相手（#357。[Machine.holdConsoleOutput]） */
+internal fun interface ConsoleHoldListener {
+    /** 止めている間、毎 tick の通知の始めにメインスレッドから呼ぶ。追いついたら中で [Machine.releaseConsoleOutput] を呼んでよい */
+    fun resume()
 }
 
 /** マシンごとの通知の列の要素 */
