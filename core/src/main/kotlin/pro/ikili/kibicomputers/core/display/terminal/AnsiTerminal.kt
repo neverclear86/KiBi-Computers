@@ -138,6 +138,7 @@ internal class AnsiTerminal(
         syncSize()
         for (i in offset until offset + length) decode(bytes[i].toInt() and 0xFF)
         flushRun()
+        publishCursor()
     }
 
     /** 文字列 [text] を UTF-8 にして [write] する。 */
@@ -150,6 +151,7 @@ internal class AnsiTerminal(
     fun resize(columns: Int, rows: Int) {
         buffer.resize(columns, rows)
         syncSize()
+        publishCursor()
     }
 
     /** 端末を最初の状態に戻す（RIS と同じ。画面を消し、代替画面から出る）。 */
@@ -157,6 +159,12 @@ internal class AnsiTerminal(
         syncSize()
         flushRun()
         fullReset()
+        publishCursor()
+    }
+
+    // カーソルの位置と表示を、バッファに写す（画面の同期で、入力 GUI の描画 #348 に届く）
+    private fun publishCursor() {
+        buffer.setCursor(cursorX, cursorY, cursorVisible)
     }
 
     // ---- UTF-8 ----

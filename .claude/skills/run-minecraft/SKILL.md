@@ -38,15 +38,17 @@ M=.claude/skills/run-minecraft/scripts/mc.sh   # mc.sh <1.21.1|1.20.1> <endpoint
 
    | endpoint | JSON | 内容 |
    | --- | --- | --- |
-   | `status` | - | 画面のクラス名・タイトル、ワールドにいるか、座標、GUI の大きさ |
+   | `status` | - | 画面のクラス名・タイトル、ワールドにいるか、座標、照準の先のブロック（`target`）、GUI の大きさ |
    | `widgets` | - | 開いている画面のボタンや入力欄（文字列・位置・入力欄の値） |
    | `command` | `{"command":"setblock ~2 ~ ~ minecraft:stone"}` | プレイヤーとして権限4でコマンドを実行し、出力を返す |
    | `use` | `{"x":0,"y":-60,"z":0,"face":"up"}` | ブロックを右クリックする（GUI を開く） |
+   | `rightclick` | - | 照準の先を、本物の右クリック（使うキー）と同じ経路で右クリックする（1.21.1 だけ）。照準は `command` の `tp @s <x> <y> <z> <yaw> <pitch>` で向けてから、`status` の `target` で確かめる（`use` は照準を通らないので、当たり判定の不具合は再現しない） |
    | `key` | `{"key":"e"}`（`escape`、`enter`、`left.shift` など。`keyCode`、`action: press/release` も可） | キーを押して離す |
    | `type` | `{"text":"こんにちは"}` | 開いている画面に文字を入力する（IME で確定した文字と同じ経路） |
    | `click` | `{"widget":"Done"}` か `{"index":0}` か `{"x":10,"y":20}` | GUI 座標でクリックする |
    | `scroll` | `{"x":200,"y":120,"amount":-1}` | スクロールする |
    | `close` | - | 画面を閉じる |
+   | `leave` | - | ワールドを保存して出る（タイトル画面に戻る。1.21.1 だけ）。同じ名前で `world` を呼ぶと入り直す |
    | `screenshot` | `{"name":"my-check.png"}` | Minecraft の描画から撮る（前面に出さない）。返ったパスの画像を Read で見る |
    | `quit` | - | このクライアントを正常に終了する |
    | `screen` | `{"x":0,"y":-60,"z":0,"lines":["hello","こんにちは"],"fg":16777215,"bg":0}`（`pattern: "gradient"` でピクセル画面にグラデーション） | クライアント側の画面ブロックのバッファに直接書く（1.21.1 だけ。画面の同期 #140 ができるまでの描画の確認用） |

@@ -28,7 +28,7 @@ object ScreenSync {
     private val LOGGER = LogUtils.getLogger()
 
     /** ネットワークのプロトコルの版。描画命令の形式を変えたら上げる。 */
-    private const val PROTOCOL_VERSION = "1"
+    private const val PROTOCOL_VERSION = "2"
 
     /** サーバーで読み込まれている画面。 */
     internal val serverScreens: MutableSet<ScreenBlockEntity> = Collections.newSetFromMap(IdentityHashMap())

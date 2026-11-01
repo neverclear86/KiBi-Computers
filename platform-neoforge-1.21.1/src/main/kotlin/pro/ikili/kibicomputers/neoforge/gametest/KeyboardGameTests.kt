@@ -5,16 +5,22 @@ import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.InteractionHand
+import net.minecraft.world.ItemInteractionResult
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.level.ClipContext
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.storage.loot.LootParams
 import net.minecraft.world.level.storage.loot.parameters.LootContextParams
+import net.minecraft.world.phys.BlockHitResult
+import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
+import net.minecraft.world.phys.shapes.CollisionContext
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
+import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyModifiers
@@ -53,6 +59,74 @@ object KeyboardGameTests {
             .withOptionalParameter(LootContextParams.BLOCK_ENTITY, helper.getBlockEntity<KeyboardBlockEntity>(POS))
         val drops = state.getDrops(params)
         helper.assertTrue(drops.size == 1 && drops[0].`is`(block.asItem()), "keyboard should drop itself but dropped $drops")
+        helper.succeed()
+    }
+
+    /**
+     * 照準は、キーボードのあるブロックの床のどこを指しても、キーボードに当たる（#348）。
+     * 見た目どおりの小さな形だと、置いた直後の照準（手前の端）が下のブロックに当たり、右クリックで GUI が開かなかった。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardIsTargetedAcrossItsWholeFloor(helper: GameTestHelper) {
+        helper.setBlock(POS.below(), Blocks.STONE)
+        for (facing in Direction.Plane.HORIZONTAL) {
+            helper.setBlock(POS, KiBiBlocks.KEYBOARD.get().defaultBlockState().setValue(KeyboardBlock.FACING, facing))
+            val abs = helper.absolutePos(POS)
+            for (dx in listOf(0.05, 0.5, 0.95)) {
+                for (dz in listOf(0.05, 0.5, 0.95)) {
+                    // 斜め上の手前から、床の点を狙う（テストの範囲の外に出ないよう近くから）
+                    val target = Vec3(abs.x + dx, abs.y + 0.01, abs.z + dz)
+                    val eye = target.add(0.0, 0.5, -0.5)
+                    val to = target.add(target.subtract(eye).normalize().scale(0.5))
+                    val hit = helper.level.clip(ClipContext(eye, to, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, CollisionContext.empty()))
+                    helper.assertTrue(
+                        hit.type == HitResult.Type.BLOCK && hit.blockPos == abs,
+                        "aiming at ($dx, $dz) facing $facing should hit the keyboard but hit ${hit.blockPos} ${hit.type}",
+                    )
+                }
+            }
+        }
+        // 右クリックすると使った扱いになる（手に何か持っていても、ブロックの右クリックに回る）
+        val player = helper.makeMockPlayer(GameType.CREATIVE)
+        player.setItemInHand(InteractionHand.MAIN_HAND, ItemStack(Items.STONE))
+        val abs = helper.absolutePos(POS)
+        val state = helper.getBlockState(POS)
+        val hit = BlockHitResult(Vec3.atCenterOf(abs), Direction.UP, abs, false)
+        val itemResult = state.useItemOn(player.mainHandItem, helper.level, player, InteractionHand.MAIN_HAND, hit)
+        helper.assertTrue(
+            itemResult == ItemInteractionResult.PASS_TO_DEFAULT_BLOCK_INTERACTION,
+            "holding an item should fall through to the block interaction but was $itemResult",
+        )
+        val result = state.useWithoutItem(helper.level, player, hit)
+        helper.assertTrue(result.consumesAction(), "right-clicking the keyboard should be handled but was $result")
+        helper.succeed()
+    }
+
+    /** 入力 GUI に出す画面: 隣のケースの画面（テスト用コンピューター）か、このキーボードを見つける画面。なければ null。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardFindsItsScreen(helper: GameTestHelper) {
+        val keyboard = BlockPos(1, 1, 2)
+        helper.setBlock(keyboard, KiBiBlocks.KEYBOARD.get())
+        val absKeyboard = helper.absolutePos(keyboard)
+        fun find() = KeyboardInput.findScreen(helper.level, absKeyboard)
+        helper.assertTrue(find() == null, "no screen yet")
+        // 机の上のキーボード: 画面は1つ上の段で、正面がキーボードの方
+        val screen = BlockPos(1, 2, 1)
+        helper.setBlock(screen, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH))
+        helper.assertTrue(find() == helper.absolutePos(screen), "screen above in front should be found but was ${find()}")
+        // 背を向けた画面は、このキーボードを見つけないが、隣にあるので見つける
+        helper.setBlock(screen, Blocks.AIR)
+        val back = BlockPos(1, 1, 1)
+        helper.setBlock(back, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.NORTH))
+        helper.assertTrue(find() == helper.absolutePos(back), "adjacent screen should be found but was ${find()}")
+        helper.setBlock(back, Blocks.AIR)
+        // テスト用コンピューター: キーボードの隣のケースの、上の画面
+        helper.setBlock(back, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
+        val caseScreen = BlockPos(1, 2, 1)
+        helper.setBlock(caseScreen, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH))
+        helper.assertTrue(find() == helper.absolutePos(caseScreen), "the case's screen should be found but was ${find()}")
         helper.succeed()
     }
 

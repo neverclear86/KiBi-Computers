@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.neoforge.input
 
 import io.netty.buffer.ByteBuf
 import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
 import net.minecraft.network.codec.ByteBufCodecs
 import net.minecraft.network.codec.StreamCodec
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload
@@ -14,6 +15,8 @@ import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent
 import net.neoforged.neoforge.network.handling.IPayloadContext
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
+import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
+import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 
 /**
@@ -100,6 +103,25 @@ object KeyboardInput {
             screenPos.relative(facing.opposite),
         )
         return candidates.firstOrNull { level.isLoaded(it) && level.getBlockEntity(it) is KeyboardBlockEntity }
+    }
+
+    /**
+     * キーボード [keyboardPos] の入力が届く画面を探す（入力 GUI に画面の中身を出すため。#348）。見つからなければ null。
+     *
+     * 1. キーボードの隣のケースの画面（テスト用コンピューターの仮の結線 #307 と同じ探し方。そちらが入力を受け取るので先に見る）
+     * 2. [findKeyboard] でこのキーボードを見つける、近くの画面（キーボードの隣か、1つ上の段の隣）
+     *
+     * 正式な結線（#129）ができたら、つながったコンピューターの画面に置き換える。
+     */
+    fun findScreen(level: Level, keyboardPos: BlockPos): BlockPos? {
+        for (direction in Direction.entries) {
+            val pos = keyboardPos.relative(direction)
+            if (!level.isLoaded(pos) || level.getBlockState(pos).block !is CaseBlock) continue
+            TestComputerWiring.findScreen(level, pos)?.let { return it.blockPos }
+        }
+        val candidates = Direction.entries.map { keyboardPos.relative(it) } +
+            Direction.Plane.HORIZONTAL.map { keyboardPos.above().relative(it) }
+        return candidates.firstOrNull { level.isLoaded(it) && findKeyboard(level, it) == keyboardPos }
     }
 
     // サーバー: メインスレッドで呼ばれる

@@ -238,6 +238,28 @@ class ScreenSyncTest {
     }
 
     @Test
+    fun `cursor is synced by commands and keyframes`() {
+        val server = Screen(10, 4)
+        val sender = ScreenSyncSender(server.text)
+        server.text.setCursor(3, 2, true)
+        val client = Client(10, 4)
+        client.receive(sender.flush(hasWatchers = false, hasNewWatchers = true).forNewWatchers)
+        assertEquals(Triple(3, 2, true), client.screen.text.cursor())
+
+        server.text.setCursor(9, 0, false)
+        val next = sender.flush(hasWatchers = true, hasNewWatchers = false)
+        assertFalse(isKeyframe(next.forWatchers))
+        client.receive(next.forWatchers)
+        assertEquals(Triple(9, 0, false), client.screen.text.cursor())
+
+        // 同じ位置に置き直しても送らない
+        server.text.setCursor(9, 0, false)
+        assertTrue(sender.flush(hasWatchers = true, hasNewWatchers = false).isEmpty)
+    }
+
+    private fun TextBuffer.cursor() = Triple(cursorX, cursorY, cursorVisible)
+
+    @Test
     fun `rejects invalid settings`() {
         assertThrows<IllegalArgumentException> { ScreenSyncSender(TextBuffer(1, 1), bytesPerSecond = 0) }
         assertThrows<IllegalArgumentException> { ScreenSyncSender(TextBuffer(1, 1), maxFragmentSize = 1) }

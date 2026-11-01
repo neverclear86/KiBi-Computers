@@ -33,6 +33,18 @@ public constructor(width: Int, height: Int) {
     public var revision: Long = 0
         private set
 
+    /** カーソルの列（0 から）。画面の外を指していてもよい（描く側が画面の内側のときだけ描く）。 */
+    public var cursorX: Int = 0
+        private set
+
+    /** カーソルの行（0 から）。画面の外を指していてもよい。 */
+    public var cursorY: Int = 0
+        private set
+
+    /** カーソルを表示するか。既定では表示しない（端末として書く側 [setCursor] で表示する）。 */
+    public var cursorVisible: Boolean = false
+        private set
+
     private var codePoints: IntArray
     private var foregrounds: IntArray
     private var backgrounds: IntArray
@@ -184,6 +196,28 @@ public constructor(width: Int, height: Int) {
         Rects.copy(arrayOf(codePoints, foregrounds, backgrounds), width, height, x, y, w, h, dx, dy)
     }
 
+    /**
+     * カーソルを列 [x]・行 [y] に置き、表示するか [visible] を決める。前と同じなら何もしない。
+     * セルの中身は変えない（カーソルを描くのは描画側。#348 の入力 GUI など）。
+     *
+     * @throws IllegalArgumentException 位置が負のとき
+     */
+    @Throws(IllegalArgumentException::class)
+    public fun setCursor(x: Int, y: Int, visible: Boolean) {
+        require(x >= 0 && y >= 0) { "cursor position must not be negative: ($x, $y)" }
+        if (x == cursorX && y == cursorY && visible == cursorVisible) return
+        revision++
+        log?.record {
+            byte(SyncOps.TEXT_CURSOR)
+            uint(x)
+            uint(y)
+            byte(if (visible) 1 else 0)
+        }
+        cursorX = x
+        cursorY = y
+        cursorVisible = visible
+    }
+
     /** 画面全体を空白にする。 */
     @JvmOverloads
     public fun clear(foreground: Int = DEFAULT_FOREGROUND, background: Int = DEFAULT_BACKGROUND) {
@@ -211,7 +245,7 @@ public constructor(width: Int, height: Int) {
         height = newHeight
     }
 
-    /** 大きさとすべてのセルが [other] と同じか。 */
+    /** 大きさとすべてのセルが [other] と同じか。カーソルは比べない。 */
     public fun contentEquals(other: TextBuffer): Boolean = width == other.width &&
         height == other.height &&
         codePoints.contentEquals(other.codePoints) &&
@@ -223,9 +257,12 @@ public constructor(width: Int, height: Int) {
         codePoints.copyInto(it.codePoints)
         foregrounds.copyInto(it.foregrounds)
         backgrounds.copyInto(it.backgrounds)
+        it.cursorX = cursorX
+        it.cursorY = cursorY
+        it.cursorVisible = cursorVisible
     }
 
-    /** 画面全体（キーフレーム）を書く。大きさに続けて、各セルの文字・前景色・背景色を左上から並べる。 */
+    /** 画面全体（キーフレーム）を書く。大きさに続けて、各セルの文字・前景色・背景色を左上から並べ、最後にカーソルを書く。 */
     internal fun writeSnapshot(out: SyncWriter) {
         out.uint(width)
         out.uint(height)
@@ -234,6 +271,9 @@ public constructor(width: Int, height: Int) {
             out.rgb(foregrounds[i])
             out.rgb(backgrounds[i])
         }
+        out.uint(cursorX)
+        out.uint(cursorY)
+        out.byte(if (cursorVisible) 1 else 0)
     }
 
     /** [writeSnapshot] で書いた画面全体を読み込む。大きさが違えば合わせる。 */
@@ -253,17 +293,23 @@ public constructor(width: Int, height: Int) {
             fgs[i] = input.rgb()
             bgs[i] = input.rgb()
         }
+        val cx = input.uint()
+        val cy = input.uint()
+        val visible = input.byte() == 1
         revision++
         width = w
         height = h
         codePoints = cps
         foregrounds = fgs
         backgrounds = bgs
+        cursorX = cx
+        cursorY = cy
+        cursorVisible = visible
     }
 
     /** [writeSnapshot] が書く大きさの目安（バイト）。 */
     internal val snapshotSize: Int
-        get() = codePoints.size * 8 + 10
+        get() = codePoints.size * 8 + 21
 
     private fun index(x: Int, y: Int): Int {
         Rects.checkIndex(x, y, width, height)
