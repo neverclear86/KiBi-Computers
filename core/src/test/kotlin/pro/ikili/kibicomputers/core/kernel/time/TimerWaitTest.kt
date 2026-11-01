@@ -242,7 +242,8 @@ class TimerWaitTest {
             })
             mh.h.tickUntilTrue { m.stateOf(pid).isTerminal }
             assertEquals(7 * ms, seen.get().first)
-            assertTrue(seen.get().second >= 4)
+            // spawn 直後のディスパッチャーが次の tick より先に走ることがあるので、下限は 3（マシンを作ってからの tick 数）
+            assertTrue(seen.get().second >= 3)
         }
     }
 
