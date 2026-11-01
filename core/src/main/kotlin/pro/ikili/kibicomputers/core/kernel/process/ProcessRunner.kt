@@ -8,6 +8,10 @@ import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.time.Timer
+import pro.ikili.kibicomputers.core.kernel.time.TimerLimits
+import pro.ikili.kibicomputers.core.kernel.time.saturatingAdd
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -585,6 +589,61 @@ internal class ProcessRunner(private val machine: Machine) {
             return table.objectOf(handle) as? EventQueue ?: fsError(Errno.BADF, "fd $handle はイベントキューではない")
         }
 
+        override fun monotonicNanos(): Long = machine.monotonicNanos()
+
+        override fun uptimeTicks(): Long = machine.uptimeTicks()
+
+        override fun createTimer(eventQueue: Int?, tag: Long): Int = lock.withLockValue {
+            val queueId = if (eventQueue == null) {
+                0
+            } else {
+                val q = eventQueueLocked(eventQueue)
+                if (!q.filter.accepts(TIMER_EVENT_PROBE)) fsError(Errno.INVAL, "fd $eventQueue のキューは ${TimerLimits.EVENT_TYPE} を受け取らない")
+                q.id
+            }
+            FdTable(rt.process, machine.kernel.objects, machine.wakeSink).open(Timer(queueId, tag), HandleRights.READ)
+        }
+
+        override fun setTimer(handle: Int, time: Long, intervalNanos: Long, absolute: Boolean) = lock.withLockValue {
+            val timer = timerLocked(handle)
+            val deadline = if (absolute) time else saturatingAdd(machine.monotonicNanosLocked(), time.coerceAtLeast(0))
+            machine.armTimerLocked(timer, deadline, intervalNanos)
+        }
+
+        override fun cancelTimer(handle: Int) = lock.withLockValue { machine.disarmTimerLocked(timerLocked(handle)) }
+
+        override fun readTimer(handle: Int): Long = lock.withLockValue { machine.readTimerLocked(timerLocked(handle)) }
+
+        override fun timerWaitKey(handle: Int): WaitKey = lock.withLockValue { WaitKey(timerLocked(handle).id, WaitCondition.READABLE) }
+
+        override fun sleep(nanos: Long) {
+            checkThread()
+            if (nanos <= 0) return
+            val key = lock.withLockValue {
+                val objects = machine.kernel.objects
+                val timer = Timer()
+                val id = objects.add(timer)
+                try {
+                    machine.armTimerLocked(timer, saturatingAdd(machine.monotonicNanosLocked(), nanos), 0)
+                } catch (t: Throwable) {
+                    objects.release(id, machine.wakeSink)
+                    throw t
+                }
+                WaitKey(id, WaitCondition.READABLE)
+            }
+            try {
+                block(listOf(key))
+            } finally {
+                lock.withLockValue { machine.kernel.objects.release(key.objectId, machine.wakeSink) }
+            }
+        }
+
+        private fun timerLocked(handle: Int): Timer {
+            val table = FdTable(rt.process, machine.kernel.objects, machine.wakeSink)
+            table.entry(handle)
+            return table.objectOf(handle) as? Timer ?: fsError(Errno.BADF, "fd $handle はタイマーではない")
+        }
+
         override val instance: WasmInstance
             get() = lock.withLockValue { rt.firstInstance ?: throw IllegalStateException("インスタンスはまだない（LOADING）") }
 
@@ -803,3 +862,6 @@ private inline fun <T> java.util.concurrent.locks.ReentrantLock.withLockValue(bl
         unlock()
     }
 }
+
+/** キューのフィルターが `timer` を受け取るか確かめるためのイベント */
+private val TIMER_EVENT_PROBE = KernelEvent(TimerLimits.EVENT_TYPE)

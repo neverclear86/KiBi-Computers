@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
@@ -33,6 +34,13 @@ import pro.ikili.kibicomputers.core.kernel.process.Shebang
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
+import pro.ikili.kibicomputers.core.kernel.time.ClockSnapshot
+import pro.ikili.kibicomputers.core.kernel.time.MachineTimers
+import pro.ikili.kibicomputers.core.kernel.time.TimeJump
+import pro.ikili.kibicomputers.core.kernel.time.Timer
+import pro.ikili.kibicomputers.core.kernel.time.TimerLimits
+import pro.ikili.kibicomputers.core.kernel.time.TimerService
+import pro.ikili.kibicomputers.core.kernel.time.saturatingSub
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
@@ -182,8 +190,11 @@ public class Machine private constructor(
 
     /** カーネルの状態（保存の対象） */
     internal val kernel = KernelState(config.maxProcesses).also {
-        it.monotonicOffsetNanos = -environment.clock.monotonicNanos()
+        it.clocks.start(environment.clock, scheduler.now)
     }
+
+    /** タイマーの期限の予定（実行時だけ。#64、ADR 0064） */
+    internal val timers: MachineTimers = MachineTimers(scheduler.timerService) { timerId, generation -> onTimerDue(timerId, generation) }
 
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
@@ -209,6 +220,8 @@ public class Machine private constructor(
         override fun outputPending(objectId: Int) {
             if (objectId != 0 && objectId == kernel.consoleTtyId) markConsoleDirty()
         }
+
+        override fun timerClosed(objectId: Int) = timers.cancel(objectId)
     }
 
     /**
@@ -400,6 +413,10 @@ public class Machine private constructor(
     /** `stop()` してスケジューラから外す。待たずに返す */
     override fun close() {
         stop()
+        lock.withLockValue {
+            closedValue = true
+            timers.cancelAll()
+        }
         scheduler.removeMachine(this)
     }
 
@@ -749,6 +766,108 @@ public class Machine private constructor(
         return fd
     }
 
+    // ---- 時計・タイマー（#64、ADR 0064） ----
+
+    /** [close] した（カーネルロック）。この後はタイマーの予定を入れない */
+    private var closedValue = false
+
+    /** マシンの単調時計（ナノ秒。マシンを作ったときが 0）。カーネルロックの中で呼ぶ */
+    internal fun monotonicNanosLocked(): Long = kernel.clocks.monotonicNanos(environment.clock)
+
+    /** マシンの単調時計。どのスレッドから呼んでもよい（カーネルロックを短く取る） */
+    internal fun monotonicNanos(): Long = lock.withLockValue { monotonicNanosLocked() }
+
+    /** 起動からの経過（tick）。どのスレッドから呼んでもよい */
+    internal fun uptimeTicks(): Long = lock.withLockValue { kernel.clocks.uptimeTicks(scheduler.now) }
+
+    /**
+     * タイマー [timer]（オブジェクト表に入っていること）を、単調時計の [deadline] に鳴るように設定する（[interval] が正なら繰り返す）。
+     * カーネルロックの中で呼ぶ。[interval] が負か、正で `MIN_INTERVAL_NANOS` 未満なら `INVAL`。
+     * 予定を入れていないタイマーを足すと、マシンの動いているタイマーの数が上限を超えるなら [ResourceLimitException]
+     */
+    @Throws(FsException::class, ResourceLimitException::class)
+    internal fun armTimerLocked(timer: Timer, deadline: Long, interval: Long) {
+        if (interval < 0 || (interval in 1 until TimerLimits.MIN_INTERVAL_NANOS)) {
+            fsError(Errno.INVAL, "繰り返しの間隔は 0 か ${TimerLimits.MIN_INTERVAL_NANOS} ns 以上（$interval）")
+        }
+        if (!timers.isScheduled(timer.id) && timers.scheduledCount >= TimerLimits.MAX_ARMED_TIMERS) {
+            throw ResourceLimitException("動いているタイマーの数が上限（${TimerLimits.MAX_ARMED_TIMERS}）")
+        }
+        timer.arm(deadline, interval)
+        scheduleTimerLocked(timer)
+    }
+
+    /** タイマー [timer] を止める（数えた回数も 0 に戻す）。カーネルロックの中で呼ぶ */
+    internal fun disarmTimerLocked(timer: Timer) {
+        timer.disarm()
+        timers.cancel(timer.id)
+    }
+
+    /**
+     * タイマー [timer] の鳴った回数を取り出して 0 に戻す。止めておいた繰り返しのタイマー（[MachineTimers]）は、
+     * ここで過ぎた回をまとめて数えてから取り出し、次の期限の予定を入れ直す。カーネルロックの中で呼ぶ
+     */
+    internal fun readTimerLocked(timer: Timer): Long {
+        if (timer.armed && !timers.isScheduled(timer.id)) timer.expire(monotonicNanosLocked(), wakeSink)
+        val n = timer.read()
+        if (timer.armed && !timers.isScheduled(timer.id)) scheduleTimerLocked(timer)
+        return n
+    }
+
+    /** [timer] の今の期限に予定を入れる（期限を過ぎていればすぐ）。カーネルロックの中で呼ぶ */
+    private fun scheduleTimerLocked(timer: Timer) {
+        if (closedValue || !timer.armed) {
+            timers.cancel(timer.id)
+            return
+        }
+        timers.schedule(timer.id, timer.generation, saturatingSub(timer.deadlineNanos, monotonicNanosLocked()))
+    }
+
+    /** 期限の予定が来た（[TimerService] のスレッドから）。カーネルロックを短く取って、タイマーを鳴らす */
+    private fun onTimerDue(timerId: Int, generation: Long): Unit = lock.withLockValue {
+        val timer = kernel.objects[timerId] as? Timer
+        if (timer == null || timer.generation != generation) return@withLockValue
+        if (!timer.armed) {
+            timers.forget(timerId)
+            return@withLockValue
+        }
+        val now = monotonicNanosLocked()
+        val count = timer.expire(now, wakeSink)
+        if (count > 0 && timer.sendsEvents) deliverTimerEventLocked(timer, count)
+        // 読まれていない繰り返しのタイマー（イベントを出さないもの）は、読まれるまで予定を入れない
+        if (timer.armed && (timer.sendsEvents || timer.expirations == 0L)) {
+            scheduleTimerLocked(timer)
+        } else {
+            timers.forget(timerId)
+        }
+    }
+
+    /** [timer] のイベント（`timer`。値は tag と回数）を、そのキューにだけ入れる。キューが閉じていれば捨てる */
+    private fun deliverTimerEventLocked(timer: Timer, count: Long) {
+        val queue = kernel.objects[timer.eventQueueId] as? EventQueue ?: return
+        // イベントで知らせた回数は読んだことにする（数えた回数は READABLE のためだけに残さない）
+        timer.read()
+        val event = KernelEvent(TimerLimits.EVENT_TYPE, "", listOf(EventValue.I64(timer.eventTag), EventValue.I64(count)))
+        kernel.events.deliverTo(queue, event, kernel.objects, wakeSink)
+    }
+
+    /** 今の時計の値（保存に書き出す。#81）。どのスレッドから呼んでもよい */
+    internal fun captureClocks(): ClockSnapshot = lock.withLockValue { kernel.clocks.snapshot(environment.clock, scheduler.now) }
+
+    /**
+     * [snapshot] の時点から単調時計と経過時間が続くように決め直し、動いているタイマーの予定を入れ直す（復元。#81）。
+     * タイマーの期限は単調時計で持つので、止まっていた間の分は進まない（残りの時間から続く）。
+     * 実時間とゲーム内時間がどれだけ飛んだかを返す（イベントにするのは #87）。どのスレッドから呼んでもよい
+     */
+    internal fun restoreClocks(snapshot: ClockSnapshot): TimeJump = lock.withLockValue {
+        val jump = kernel.clocks.restore(snapshot, environment.clock, scheduler.now)
+        timers.cancelAll()
+        kernel.objects.forEachObject { obj ->
+            if (obj is Timer && obj.armed && (obj.sendsEvents || obj.expirations == 0L)) scheduleTimerLocked(obj)
+        }
+        jump
+    }
+
     internal fun runtime(pid: Int): ProcessRuntime? = lock.withLockValue { runtimes[pid] }
 
     internal fun processState(pid: Int): ProcessState? = lock.withLockValue { kernel.processes[pid]?.state }
@@ -1015,6 +1134,8 @@ public class Machine private constructor(
             if (process.objectId != 0 && kernel.objects[process.objectId] != null) kernel.objects.release(process.objectId, wakeSink)
         }
         kernel.processes.reset()
+        // 起動からの経過を 0 に戻す（ADR 0064）
+        kernel.clocks.resetUptime(scheduler.now)
         // 閉じたイベントキューの ID を索引から外す（ADR 0063）
         kernel.events.sweep(kernel.objects)
         initPid = 0

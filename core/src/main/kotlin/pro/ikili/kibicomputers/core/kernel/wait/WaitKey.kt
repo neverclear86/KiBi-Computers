@@ -1,6 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.wait
 
-/** 待てる条件。種類は後続の Issue で足す（タイマー #64、イベントキュー #63 など）。 */
+/** 待てる条件。種類は後続の Issue で足す（タイマーとイベントキューは READABLE を使う）。 */
 internal enum class WaitCondition {
     /** 読める（読めるバイトがある、または書く側が閉じた） */
     READABLE,
@@ -39,6 +39,12 @@ internal interface WakeSink {
      * 既定は何もしない（[pro.ikili.kibicomputers.core.kernel.Machine] の知らせ口だけが、コンソールの出力を配る印を付ける）
      */
     fun outputPending(objectId: Int) {}
+
+    /**
+     * タイマー [objectId] が閉じられた（参照カウント 0。#64）。実行時の側が期限の予定を取り消す。
+     * 既定は何もしない（[pro.ikili.kibicomputers.core.kernel.Machine] の知らせ口だけが取り消す）
+     */
+    fun timerClosed(objectId: Int) {}
 
     companion object {
         /** 待ち手のないところ（テスト、復元の途中）用。何もしない */

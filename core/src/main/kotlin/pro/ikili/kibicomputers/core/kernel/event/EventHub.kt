@@ -97,6 +97,18 @@ internal class EventHub(
         return delivered
     }
 
+    /**
+     * 種類の索引を通さずに、[queue] だけへ [event] を入れる（タイマーのイベント。#64）。マシン全体の溜めている量の上限は
+     * [post] と同じく守り、超えるなら入れずに `drop` する。入れられたら `true`
+     */
+    fun deliverTo(queue: EventQueue, event: KernelEvent, objects: ObjectTable, sink: WakeSink): Boolean {
+        if (pendingBytes(objects).toLong() + event.footprint > maxPendingBytes) {
+            queue.drop(sink)
+            return false
+        }
+        return queue.offer(event, sink)
+    }
+
     /** 索引の場所に合う `EventQueue` でない ID を外す（件数は索引の ID の数に比例する） */
     fun sweep(objects: ObjectTable) {
         val ids = queues ?: return

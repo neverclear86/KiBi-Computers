@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
  *
  * 時計:
  * - `REALTIME`: 環境の実時間（`MachineClock.realtimeNanos`）
- * - `MONOTONIC`: マシンの単調時計（[guestMonotonicNanos]。マシンを作ったときが 0）
+ * - `MONOTONIC`: マシンの単調時計（[guestMonotonicNanos]。マシンを作ったときが 0。ADR 0064）
  * - `PROCESS_CPUTIME`・`THREAD_CPUTIME`: このプロセスの p1 の層を作ってからの単調時計の経過（CPU を使った時間ではなく、
  *   待っていた時間も含む。p1 のプロセスはスレッドが1つなので、2つは同じ）
  * - 分解能はどれも [CLOCK_RESOLUTION_NANOS]。`precision` は使わない
@@ -90,10 +90,7 @@ internal class WasiP1Basic(private val ctx: ProcessContext) {
     }
 
     /** マシンの単調時計（ナノ秒。マシンを作ったときが 0。負にはしない） */
-    private fun guestMonotonicNanos(): Long {
-        val offset = ctx.withKernelLock { ctx.kernel.monotonicOffsetNanos }
-        return maxOf(0L, ctx.environment.clock.monotonicNanos() + offset)
-    }
+    private fun guestMonotonicNanos(): Long = ctx.monotonicNanos()
 
     // ---- 乱数 ----
 

@@ -130,6 +130,52 @@ internal interface ProcessContext {
     @Throws(FsException::class, ProcessKilledException::class)
     fun awaitEvents(handle: Int, max: Int = Int.MAX_VALUE): EventBatch
 
+    // ---- 時計・タイマー（#64、ADR 0064。WASM に見せる形は #72・#73・#264・#266） ----
+
+    /** マシンの単調時計（ナノ秒。マシンを作ったときが 0。保存・復元をまたいでも続く。WASI の `MONOTONIC`） */
+    fun monotonicNanos(): Long
+
+    /** 起動からの経過（tick。起動したときが 0。マシンが動いていた tick だけを数える） */
+    fun uptimeTicks(): Long
+
+    /**
+     * タイマーを作って自分のハンドル表に入れ、ハンドル番号を返す（読む権利だけ。止まった状態で作る）。
+     * [eventQueue] がイベントキューのハンドルなら、鳴るたびにそのキューへ `timer` のイベント（値は `I64(tag)`・`I64(回数)`）を入れる
+     * （そのときは [readTimer] は 0 を返し、`READABLE` にもならない）。
+     * [eventQueue] がイベントキューでない・読めないなら `FsException(BADF)`、キューが `timer` を受け取らないなら `FsException(INVAL)`、
+     * ハンドル表が満杯なら `FsException(MFILE)`
+     */
+    @Throws(FsException::class)
+    fun createTimer(eventQueue: Int? = null, tag: Long = 0): Int
+
+    /**
+     * タイマー [handle] を設定する。[absolute] なら [time] は単調時計の期限、そうでなければ今からの時間（ナノ秒。0 以下ならすぐ鳴る）。
+     * [intervalNanos] が正なら、その後は間隔ごとに繰り返す。設定し直すと、数えた回数は 0 に戻る。
+     * [handle] がタイマーでなければ `FsException(BADF)`、[intervalNanos] が負か `MIN_INTERVAL_NANOS` 未満の正なら `FsException(INVAL)`、
+     * マシンの動いているタイマーが上限なら [ResourceLimitException]
+     */
+    @Throws(FsException::class, ResourceLimitException::class)
+    fun setTimer(handle: Int, time: Long, intervalNanos: Long = 0, absolute: Boolean = false)
+
+    /** タイマー [handle] を止める（数えた回数も 0 に戻す）。エラーは [setTimer] と同じ */
+    @Throws(FsException::class)
+    fun cancelTimer(handle: Int)
+
+    /** タイマー [handle] が前回から鳴った回数を取り出し、0 に戻す。待たない。エラーは [setTimer] と同じ */
+    @Throws(FsException::class)
+    fun readTimer(handle: Int): Long
+
+    /** タイマー [handle] の `READABLE`（鳴った回数が 1 以上）の [WaitKey]。待機点型は `StepResult.Wait` に入れて待つ */
+    @Throws(FsException::class)
+    fun timerWaitKey(handle: Int): WaitKey
+
+    /**
+     * ブロッキング型だけ: [nanos] の間、[block] で止まる（0 以下ならすぐ返る）。ハンドル表を使わない一時的なタイマーで待つ。
+     * マシンの動いているタイマーが上限なら [ResourceLimitException]
+     */
+    @Throws(ProcessKilledException::class, ResourceLimitException::class)
+    fun sleep(nanos: Long)
+
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
     val instance: WasmInstance
 

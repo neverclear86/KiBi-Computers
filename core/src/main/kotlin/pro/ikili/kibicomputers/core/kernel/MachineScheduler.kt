@@ -4,6 +4,8 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
+import pro.ikili.kibicomputers.core.kernel.time.ExecutorTimerService
+import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -38,6 +40,9 @@ public class MachineScheduler private constructor(
     public constructor(config: SchedulerConfig = SchedulerConfig.DEFAULT) : this(config, SchedulerInternals())
 
     internal companion object {
+        /** `KiBi-timer` のスタック（タイマーを鳴らすだけなので小さくてよい） */
+        private const val TIMER_STACK_BYTES: Long = 1L * 1024 * 1024
+
         /** 内部の設定（テスト用の差し替え）を付けてスケジューラを作る。 */
         @JvmSynthetic
         internal fun create(config: SchedulerConfig, options: SchedulerInternals): MachineScheduler = MachineScheduler(config, options)
@@ -58,6 +63,9 @@ public class MachineScheduler private constructor(
     internal val dispatcher = Dispatcher<Machine>(config.threadStackBytes) { machine -> machine.dispatchFuelWaiters() }
 
     internal val hooks = KernelTestHooks()
+
+    /** タイマーの期限を待つ口（#64、ADR 0064。既定はスレッド `KiBi-timer` 1本） */
+    internal val timerService: TimerService = options.timers ?: ExecutorTimerService(TIMER_STACK_BYTES)
 
     private val pauseLock = ReentrantLock()
     private val pauseCondition = pauseLock.newCondition()
@@ -190,6 +198,7 @@ public class MachineScheduler private constructor(
         closed = true
         machines.values.forEach { it.stop() }
         dispatcher.close()
+        timerService.close()
         workers.shutdown()
     }
 
@@ -214,6 +223,7 @@ public class MachineScheduler private constructor(
         if (!closed) return false
         dispatcher.thread.join(remainingMillis().coerceAtLeast(1))
         if (dispatcher.thread.isAlive) return false
+        if (!timerService.awaitTermination(remainingMillis())) return false
         return workers.awaitTermination(remainingMillis())
     }
 
@@ -278,6 +288,8 @@ internal class SchedulerInternals(
     val meterExecutables: Boolean = true,
     /** `Machine.exec` で読み込む WASM の構造と時間の上限（#40）。`null` なら確かめない（本物の WASM でないバイト列を使うテスト） */
     val moduleLimits: ModuleLimits? = ModuleLimits.DEFAULT,
+    /** タイマーの期限を待つ口（テストでは時計を手で進めるもの）。`null` なら [ExecutorTimerService] */
+    val timers: TimerService? = null,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */

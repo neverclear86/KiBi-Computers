@@ -102,6 +102,15 @@ class KernelStateIsolationTest {
         val values = listOf(EventValue.I64(1), EventValue.F64(0.5), EventValue.Bool(true), EventValue.Text("a"), EventValue.Bytes(byteArrayOf(1)))
         repeat(5) { state.events.post(KernelEvent("key", "keyboard:1", values), state.objects, WakeSink.NONE) }
         process.handles.insert(HandleEntry(queue.id))
+        // タイマー: 鳴った回数を持つ繰り返しのタイマーと、イベントを出すタイマー、時計（#64）
+        val timer = pro.ikili.kibicomputers.core.kernel.time.Timer()
+        state.objects.add(timer)
+        timer.arm(10, 50_000_000)
+        timer.expire(200_000_000, WakeSink.NONE)
+        val eventTimer = pro.ikili.kibicomputers.core.kernel.time.Timer(queue.id, 7)
+        state.objects.add(eventTimer)
+        eventTimer.arm(1_000, 0)
+        state.clocks.start(MachineClock.SYSTEM, 5)
         walk(state, "state", IdentityHashMap())
     }
 
