@@ -40,6 +40,12 @@ class FuelMeteringTest {
         condition()
     }
 
+    /** 1 tick 分の燃料を配ってから、tick を進めずに燃料切れで止まるのを待つ（毎回 tick すると、遅い環境では止まった瞬間を見逃す） */
+    private fun Harness.awaitFuelWait(machine: Machine, pid: Int, message: String) {
+        scheduler.tick()
+        eventually(30_000, message) { machine.stateOf(pid) == ProcessState.WAITING_FUEL }
+    }
+
     private fun Harness.ticks(n: Int) = repeat(n) {
         scheduler.tick()
         Thread.sleep(1)
@@ -100,7 +106,7 @@ class FuelMeteringTest {
                 }
             }
             val pid = m.exec("/bin/fuel", drivers)
-            h.tickUntil("燃料切れで待たない") { m.stateOf(pid) == ProcessState.WAITING_FUEL }
+            h.awaitFuelWait(m, pid, "燃料切れで待たない")
             h.ticks(20)
             assertFalse(m.stateOf(pid).isTerminal)
             // 手持ちを使い切っては待つので、マシンの燃料は 1 tick の配分を超えない
@@ -128,7 +134,7 @@ class FuelMeteringTest {
 
             // 終わらない pcall のループ
             val forever = m.exec("/bin/lua", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lua", "-e", "while true do pcall(error, 'x') end"), stdio = stdio))
-            h.tickUntil("燃料切れで待たない") { m.stateOf(forever) == ProcessState.WAITING_FUEL }
+            h.awaitFuelWait(m, forever, "燃料切れで待たない")
             h.ticks(10)
             assertFalse(m.stateOf(forever).isTerminal)
             m.stop()
