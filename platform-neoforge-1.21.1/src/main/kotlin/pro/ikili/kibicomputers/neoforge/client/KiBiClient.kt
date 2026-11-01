@@ -1,10 +1,12 @@
 package pro.ikili.kibicomputers.neoforge.client
 
+import net.minecraft.client.Minecraft
 import net.neoforged.bus.api.IEventBus
 import net.neoforged.neoforge.client.event.ClientTickEvent
 import net.neoforged.neoforge.client.event.EntityRenderersEvent
 import net.neoforged.neoforge.client.event.RegisterMenuScreensEvent
 import net.neoforged.neoforge.common.NeoForge
+import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
 
@@ -15,6 +17,9 @@ object KiBiClient {
         modBus.addListener(::registerRenderers)
         modBus.addListener(::registerScreens)
         NeoForge.EVENT_BUS.addListener<ClientTickEvent.Post>(ClientScreenWatcher::onClientTick)
+        KeyboardInput.clientOpener = KeyboardInput.ClientOpener { keyboard, screen ->
+            Minecraft.getInstance().setScreen(KeyboardInputScreen(keyboard, screen))
+        }
     }
 
     private fun registerRenderers(event: EntityRenderersEvent.RegisterRenderers) {

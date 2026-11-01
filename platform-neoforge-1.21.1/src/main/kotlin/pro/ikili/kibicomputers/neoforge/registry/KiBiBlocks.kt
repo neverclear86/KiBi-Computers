@@ -21,6 +21,8 @@ import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
+import pro.ikili.kibicomputers.neoforge.input.KeyboardBlock
+import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 
 /** ブロック・アイテム・ブロックエンティティ・クリエイティブタブの登録。 */
 object KiBiBlocks {
@@ -64,6 +66,20 @@ object KiBiBlocks {
             BlockEntityType.Builder.of(::CaseBlockEntity, *blocks).build(null)
         }
 
+    /** キーボードブロック（#142）。 */
+    val KEYBOARD: DeferredBlock<KeyboardBlock> =
+        BLOCKS.registerBlock("keyboard", ::KeyboardBlock, machineProperties().noOcclusion())
+
+    /** キーボードブロックのアイテム。 */
+    val KEYBOARD_ITEM: DeferredItem<BlockItem> = ITEMS.registerSimpleBlockItem(KEYBOARD)
+
+    /** キーボードブロックのブロックエンティティ。 */
+    val KEYBOARD_BLOCK_ENTITY: DeferredHolder<BlockEntityType<*>, BlockEntityType<KeyboardBlockEntity>> =
+        BLOCK_ENTITY_TYPES.register("keyboard") { ->
+            @Suppress("NULLABILITY_MISMATCH_BASED_ON_JAVA_ANNOTATIONS")
+            BlockEntityType.Builder.of(::KeyboardBlockEntity, KEYBOARD.get()).build(null)
+        }
+
     /** MOD のクリエイティブタブ。 */
     val TAB: DeferredHolder<CreativeModeTab, CreativeModeTab> = CREATIVE_TABS.register("main") { ->
         CreativeModeTab.builder()
@@ -72,6 +88,7 @@ object KiBiBlocks {
             .displayItems { _, output ->
                 CASE_ITEMS.values.forEach { output.accept(it.get()) }
                 SCREEN_ITEMS.values.forEach { output.accept(it.get()) }
+                output.accept(KEYBOARD_ITEM.get())
             }
             .build()
     }
@@ -84,7 +101,7 @@ object KiBiBlocks {
         CREATIVE_TABS.register(modBus)
     }
 
-    // 画面とケースで共通。硬さは仮の値（#251 で確定）。鉄ブロックより柔らかく、ツルハシで壊す
+    // 画面・ケース・キーボードで共通。硬さは仮の値（#251 で確定）。鉄ブロックより柔らかく、ツルハシで壊す
     private fun machineProperties(): BlockBehaviour.Properties =
         BlockBehaviour.Properties.of()
             .mapColor(MapColor.METAL)

@@ -1,0 +1,22 @@
+{
+  "parent": "minecraft:block/block",
+  "textures": {
+    "particle": "kibicomputers:block/keyboard_side",
+    "top": "kibicomputers:block/keyboard_top",
+    "side": "kibicomputers:block/keyboard_side"
+  },
+  "elements": [
+    {
+      "from": [1, 0, 4],
+      "to": [15, 2, 12],
+      "faces": {
+        "up": { "uv": [1, 4, 15, 12], "texture": "#top", "rotation": 180 },
+        "down": { "uv": [1, 4, 15, 12], "texture": "#side", "cullface": "down" },
+        "north": { "uv": [1, 14, 15, 16], "texture": "#side" },
+        "south": { "uv": [1, 14, 15, 16], "texture": "#side" },
+        "west": { "uv": [4, 14, 12, 16], "texture": "#side" },
+        "east": { "uv": [4, 14, 12, 16], "texture": "#side" }
+      }
+    }
+  ]
+}

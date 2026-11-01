@@ -23,5 +23,9 @@
   "gui.kibicomputers.part.memory.short": "RAM",
   "gui.kibicomputers.part.storage.short": "HDD",
   "gui.kibicomputers.part.boot.short": "ROM",
-  "gui.kibicomputers.part.expansion.short": "CARD"
+  "gui.kibicomputers.part.expansion.short": "CARD",
+  "block.kibicomputers.keyboard": "Keyboard",
+  "gui.kibicomputers.keyboard.title": "Keyboard",
+  "gui.kibicomputers.keyboard.hint": "Typing on the keyboard - Shift+Esc to stop",
+  "gui.kibicomputers.keyboard.close": "Close"
 }
