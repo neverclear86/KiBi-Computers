@@ -44,6 +44,12 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
     /** 線形メモリの確保を数える相手（#39）。`null` なら数えない */
     public val memoryBudget: WasmMemoryBudget? = builder.memoryBudget
 
+    /**
+     * 待機点への変換をかけたモジュールが退避する値の置き場所（#329）。変換したモジュール（[WasmModule.isAsyncified]）では必須で、
+     * `null` のままインスタンスを作ると [WasmLinkException]。変換していないモジュールでは使わない
+     */
+    public val asyncStack: WasmAsyncStack? = builder.asyncStack
+
     /** [module].[name] のホストの関数。なければ `null` */
     public fun hostImport(module: String, name: String): WasmHostImport? = hostImports.firstOrNull { it.module == module && it.name == name }
 
@@ -54,6 +60,7 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal var fuelHandler: WasmFuelHandler? = null
         internal var maxMemoryPages: Int = WasmMemory.MAX_PAGES
         internal var memoryBudget: WasmMemoryBudget? = null
+        internal var asyncStack: WasmAsyncStack? = null
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
@@ -85,6 +92,11 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
             require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
             maxMemoryPages = maxPages
             memoryBudget = budget
+        }
+
+        /** 待機点への変換をかけたモジュールが退避する値の置き場所を決める（#329。[WasmInstanceConfig.asyncStack]）。 */
+        public fun asyncStack(stack: WasmAsyncStack?): Builder = apply {
+            asyncStack = stack
         }
 
         /** 設定を作る。 */

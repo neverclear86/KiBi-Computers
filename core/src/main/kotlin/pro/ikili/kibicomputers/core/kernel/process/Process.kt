@@ -8,13 +8,16 @@ import java.util.EnumSet
 
 /**
  * プロセスの動き方。どちらを使うかは ABI 層が決める（#63・#72・#73）。
- * p1 の `poll_oneoff`（#72、ADR 0072）は、`BLOCKING` ならそろうまで止まり、`WAIT_POINT` なら待たずに `AGAIN`（待ちに入る形は #329）
+ * p1 のコマンド（`_start`）は、読み込み時の待機点への変換（#329、ADR 0316）ができれば `WAIT_POINT`、断られたら `BLOCKING`
  */
 internal enum class ProcessKind {
-    /** ホスト関数の中でスレッドを止めて待つ（p1 の `_start`、p2 の同期呼び出し）。待っている間は保存できない */
+    /** ホスト関数の中でスレッドを止めて待つ（変換を断った p1 の `_start`、p2 の同期呼び出し）。待っている間は保存できない */
     BLOCKING,
 
-    /** export から戻って待つ（reactor、p3 のコールバック方式）。待っている間は保存できる */
+    /**
+     * export から戻って待つ（変換した p1 の `_start`、reactor、p3 のコールバック方式）。待っている間は保存できる。
+     * 変換した p1 は、止まりうる import の中で巻き戻して `_start` から戻り、起こされたら巻き直して `_start` を呼び直す
+     */
     WAIT_POINT,
 }
 
@@ -102,6 +105,21 @@ internal class Process(
 
     /** 待っている [WaitKey] の並び（待っていなければ `null`） */
     var wait: List<WaitKey>? = null
+
+    /**
+     * 待機点への変換をかけたプロセスが、巻き戻しで退避した値（#329。変換していないプロセスは `null`）。
+     * 空でなければ、再開は巻き直しから（状態のグローバルは、待っている間は常に `NORMAL`）
+     */
+    var asyncStack: AsyncStack? = null
+
+    /** 巻き戻しで待っている呼び出しを、やり直すときに要る値（#329。待っている間だけ `null` でない） */
+    var asyncWait: AsyncWait? = null
+
+    /**
+     * `openWaitTimer` で開いて、まだ閉じていない一時的なタイマーのオブジェクトID（#329）。一時的なタイマーの持ち主はここだけ。
+     * 不変条件: [asyncWait] のタイマーは、ここに入っている
+     */
+    val waitTimers: WaitTimerSet = WaitTimerSet()
 
     /** ハンドル表（fd 表。0/1/2 は標準入出力。操作は `FdTable` を通す。Component Model の resource の表は #265） */
     val handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)

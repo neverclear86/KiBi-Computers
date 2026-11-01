@@ -70,6 +70,8 @@ class FakeModule private constructor(
     override val isFuelMetered: Boolean,
     internal val start: FakeFunction?,
 ) : WasmModule {
+    override val isAsyncified: Boolean get() = false
+
     override val exports: List<WasmExportDescriptor> = functions.map { (name, f) -> WasmExportDescriptor(name, WasmExternKind.FUNCTION, f.first) } +
         listOfNotNull(memoryPages?.let { WasmExportDescriptor("memory", WasmExternKind.MEMORY, null) })
 
@@ -135,6 +137,10 @@ internal class FakeInstance(override val module: FakeModule, private val config:
             check(module.isFuelMetered) { "燃料を計測しないモジュール" }
             fuelValue = value
         }
+
+    override var asyncState: WasmAsyncState
+        get() = throw IllegalStateException("待機点への変換をかけていないモジュール")
+        set(_) = throw IllegalStateException("待機点への変換をかけていないモジュール")
 
     private fun checkInterrupt() {
         if (Thread.currentThread().isInterrupted) throw WasmTrapException(WasmTrapKind.INTERRUPTED, "ダミー: 割り込まれた")

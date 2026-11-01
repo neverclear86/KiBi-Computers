@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
@@ -8,6 +9,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -125,5 +127,63 @@ class LuaReplTest {
             assertEquals(ProcessState.EXITED, m.stateOf(pid))
             assertEquals("42\n", m.readOutput(output))
         }
+    }
+
+    /**
+     * REPL に [inputs] を1つずつ渡し（それぞれ、プロンプトが出て入力を待つまで進めてから）、最後の入力で終わるまで動かす。
+     * コンソールの出力・終了コード・動き方を返す。[asyncify] が `false` なら待機点への変換をかけずに `BLOCKING` で動かす
+     */
+    private fun runRepl(asyncify: Boolean, inputs: List<String>, check: (Harness, Machine, Int) -> Unit = { _, _, _ -> }): Triple<String, Int?, ProcessKind> =
+        Harness(execRuntime = EndiveRuntime(), asyncify = asyncify).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host)
+            m.installLua()
+            val pid = m.exec("/bin/lua", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lua")))
+            for ((i, input) in inputs.withIndex()) {
+                h.tickUntil("入力を待たない（${i}番目の前）: ${host.text()}") { host.text().endsWith("> ") && m.stateOf(pid) == ProcessState.WAITING_EVENT }
+                if (i == 0) check(h, m, pid)
+                m.offerConsoleInput(input.toByteArray())
+                if (i < inputs.lastIndex) {
+                    val mark = host.text().length
+                    h.tickUntil("入力を読まない") { host.text().length > mark && !(m.stateOf(pid) == ProcessState.WAITING_EVENT && host.text().endsWith(input.trimEnd('\r'))) }
+                }
+            }
+            h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
+            val process = m.lock.withLockValue { m.kernel.processes[pid]!! }
+            Triple(host.text(), process.exitCode, process.kind)
+        }
+
+    @Test
+    fun `REPLは待機点型で動き、待っている間スレッドを持たず、出力がブロッキングと一致する`() = timeout(limit) {
+        val inputs = listOf(
+            "x = io.read()\rhello\r",
+            "print(x, #x)\r",
+            "print(pcall(error, 'e1'))\r",
+            "error('boom')\r",
+            "co = coroutine.wrap(function(a) local b = coroutine.yield(a + 1) return b * 2 end)\r",
+            "print(co(1), co(5))\r",
+            "local t = {} for i = 1, 50 do t[i] = i * i end print(table.concat(t, ',', 45))\r",
+            "os.exit(3)\r",
+        )
+        val (async, asyncCode, asyncKind) = runRepl(true, inputs) { h, m, pid ->
+            // 入力を待っている間: スレッドを持たず、専用スレッドもブロッキング型の枠も使わない。退避した値がある
+            eventually(5_000, "スレッドが外れない") { m.rt(pid).thread == null }
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty())
+            assertEquals(0, h.scheduler.blockingProcesses)
+            assertTrue(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncStack!!.size } > 0)
+            assertTrue(m.isAtWaitPoint)
+            assertNull(m.rt(pid).program.asyncRejection)
+        }
+        val (blocking, blockingCode, blockingKind) = runRepl(false, inputs)
+        assertEquals(ProcessKind.WAIT_POINT, asyncKind)
+        assertEquals(ProcessKind.BLOCKING, blockingKind)
+        assertEquals(3, asyncCode)
+        assertEquals(blocking, async)
+        assertEquals(blockingCode, asyncCode)
+        assertTrue(async.contains("hello\t5"), async)
+        assertTrue(async.contains("false\te1"), async)
+        assertTrue(async.contains("boom"), async)
+        assertTrue(async.contains("2\t10"), async)
+        assertTrue(async.contains("2025,2116,2209,2304,2401,2500"), async)
     }
 }

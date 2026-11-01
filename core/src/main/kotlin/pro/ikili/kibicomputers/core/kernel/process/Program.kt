@@ -6,6 +6,8 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.asyncify.Asyncify
+import pro.ikili.kibicomputers.core.runtime.asyncify.AsyncifyUnsupported
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -32,8 +34,12 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
     }
 }
 
-/** 読み込んだモジュールと、その識別子の組。 */
-internal class Program private constructor(val hash: ModuleHash, val module: WasmModule) {
+/**
+ * 読み込んだモジュールと、その識別子の組。
+ *
+ * [asyncRejection] は、待機点への変換（#329）を断った理由（変換を試みて断ったときだけ。ログとテスト用）。
+ */
+internal class Program private constructor(val hash: ModuleHash, val module: WasmModule, val asyncRejection: String? = null) {
     companion object {
         /**
          * [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない）。
@@ -54,16 +60,29 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
          * [bytes] に燃料の計測コードを挿入してから（[FuelInjector]、#38）[runtime] に読み込ませる。識別子は挿入した後のバイト列から作る。
          * すでに計測の名前を使っている WASM などは [WasmLoadException] で断る。重いので、メインスレッドでは呼ばない。
          *
-         * [limits] があれば、挿入する前に構造の上限を確かめ、挿入・パース・検証の全体で時間の上限を守る（#40）
+         * [limits] があれば、挿入する前に構造の上限を確かめ、変換・挿入・パース・検証の全体で時間の上限を守る（#40）
+         *
+         * [waitImports] が空でなければ、挿入の前に待機点への変換（[Asyncify]、#329）をかける。順番は
+         * 「構造の上限の確認 → 変換 → 燃料の計測コードの挿入 → パースと検証」。変換できない作りなら変換せずに続け、理由を
+         * [Program.asyncRejection] に入れる。予約した名前（`kibi.async_push` など）を使っている WASM は [WasmLoadException] で断る
          */
         @Throws(WasmLoadException::class)
-        fun loadMetered(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null): Program {
+        fun loadMetered(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null, waitImports: Set<String> = emptySet()): Program {
             val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
             if (limits != null) ModulePrescan.check(bytes, limits, deadline)
-            val injected = FuelInjector.inject(bytes) { deadline?.check("燃料の計測コードの挿入") }.bytes
+            var source = bytes
+            var rejection: String? = null
+            if (waitImports.isNotEmpty()) {
+                try {
+                    source = Asyncify.transform(bytes, waitImports) { deadline?.check("待機点への変換") }.bytes
+                } catch (e: AsyncifyUnsupported) {
+                    rejection = e.message ?: "変換できない"
+                }
+            }
+            val injected = FuelInjector.inject(source) { deadline?.check("燃料の計測コードの挿入") }.bytes
             val module = runtime.load(injected)
             deadline?.check("パースと検証")
-            return Program(ModuleHash.of(injected), module)
+            return Program(ModuleHash.of(injected), module, rejection)
         }
     }
 }
@@ -104,6 +123,12 @@ internal data class SpawnOptions(
 
 /** 実行ファイルの [Program] から、そのプロセスの [ProcessDriver] を作る（ABI 層。p1 か Component Model かを見分ける）。 */
 internal fun interface ProcessDriverFactory {
+    /**
+     * 待機点への変換（#329）で止まりうるとみなす import（`"<module>.<name>"`）。空なら変換しない。
+     * カーネルは ABI の名前を直接知らないまま、どの import で止まるかをここから受け取る（`Machine.exec` が `Program.loadMetered` に渡す）
+     */
+    val waitImports: Set<String> get() = emptySet()
+
     /** [program] を動かすドライバーを作る。動かせない形なら `FsException(NOEXEC)` を投げる */
     @Throws(FsException::class)
     fun create(program: Program): ProcessDriver

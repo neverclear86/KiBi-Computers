@@ -40,6 +40,15 @@ public interface WasmModule {
     public val isFuelMetered: Boolean
 
     /**
+     * 待機点への変換（asyncify。#329）をかけたモジュールなら `true`。
+     *
+     * 変換したモジュールは、[WasmAsync.IMPORT_MODULE] の [WasmAsync.PUSH]・[WasmAsync.POP] を import し、
+     * [WasmAsync.STATE_EXPORT] を export する。この3つはインスタンスを作るときにランタイムがつなぐので、
+     * [imports] と [exports] には出さない。インスタンスを作るときは [WasmInstanceConfig.asyncStack] が要る。
+     */
+    public val isAsyncified: Boolean
+
+    /**
      * インスタンスを作る。モジュールに start 関数があれば、燃料を設定した後に実行する。
      *
      * @throws WasmLinkException import が足りない、型が合わない、またはデータ・要素のセグメントが範囲に収まらない
@@ -66,6 +75,17 @@ public interface WasmInstance : AutoCloseable {
      * @throws IllegalStateException 燃料を計測しないモジュール（[WasmModule.isFuelMetered] が `false`）
      */
     public var fuel: Long
+
+    /**
+     * 待機点への変換の状態（#329）。ホストの関数の中から読み書きしてよい。
+     *
+     * 止まりうる import の中で [WasmAsyncState.UNWINDING] にして戻ると、変換したコードが WASM のスタックを
+     * [WasmInstanceConfig.asyncStack] に退避して export の呼び出しから戻る。[WasmAsyncState.REWINDING] にして同じ export を
+     * 呼び直すと、退避した値を戻しながら止まった import まで進む（そこで呼ばれた側が [WasmAsyncState.NORMAL] に戻す）。
+     *
+     * @throws IllegalStateException 変換していないモジュール（[WasmModule.isAsyncified] が `false`）
+     */
+    public var asyncState: WasmAsyncState
 
     /**
      * export された関数 [name] を呼ぶ。引数と戻り値の表し方は [WasmValueType] を見る。
@@ -210,4 +230,55 @@ public object WasmFuel {
     /** 燃料切れを知らせる import の型 */
     @JvmField
     public val IMPORT_TYPE: WasmFunctionType = WasmFunctionType.of(listOf(WasmValueType.I64), listOf(WasmValueType.I64))
+}
+
+/** 待機点への変換をかけたモジュールの状態（#329）。状態のグローバルの値は、この並びの順に 0・1・2 */
+public enum class WasmAsyncState {
+    /** ふつうに実行している */
+    NORMAL,
+
+    /** 巻き戻し中（WASM のスタックを退避しながら、export の呼び出しから戻っている） */
+    UNWINDING,
+
+    /** 巻き直し中（退避した値を戻しながら、止まった呼び出しまで進んでいる） */
+    REWINDING,
+}
+
+/**
+ * 待機点への変換をかけたモジュールが、巻き戻しで退避する値の置き場所（#329）。[WasmInstanceConfig.Builder.asyncStack] で渡す。
+ *
+ * 値は後入れ先出し（巻き戻しは内側の関数から積み、巻き直しは外側の関数から取り出す）。
+ *
+ * スレッド: WASM の実行の中（インスタンスを使っているスレッド）から呼ばれるので、待たない・WASM を呼ばない。
+ * 投げた例外は、[WasmInstance.call] からそのまま外に出る（実行を止める）。
+ */
+public interface WasmAsyncStack {
+    /** 退避する値 [value] を1つ積む。上限を超えたら例外を投げる（実行を止める） */
+    public fun push(value: Long)
+
+    /** 最後に積んだ値を取り出す。空なら例外を投げる */
+    public fun pop(): Long
+}
+
+/** 待機点への変換をかけたモジュールが使う名前（#329）。カーネルの内部のもので、プレイヤーには見せない。 */
+public object WasmAsync {
+    /** 退避の import のモジュール名（燃料の [WasmFuel.IMPORT_MODULE] と同じ予約の空間） */
+    public const val IMPORT_MODULE: String = "kibi"
+
+    /** 値を1つ積む import の名前。型は [PUSH_TYPE] */
+    public const val PUSH: String = "async_push"
+
+    /** 値を1つ取り出す import の名前。型は [POP_TYPE] */
+    public const val POP: String = "async_pop"
+
+    /** 状態（[WasmAsyncState] の順番）を入れる、可変の i32 のグローバルの export 名 */
+    public const val STATE_EXPORT: String = "kibi_async_state"
+
+    /** [PUSH] の型 `(i64) -> ()` */
+    @JvmField
+    public val PUSH_TYPE: WasmFunctionType = WasmFunctionType.of(listOf(WasmValueType.I64), emptyList())
+
+    /** [POP] の型 `() -> (i64)` */
+    @JvmField
+    public val POP_TYPE: WasmFunctionType = WasmFunctionType.of(emptyList(), listOf(WasmValueType.I64))
 }

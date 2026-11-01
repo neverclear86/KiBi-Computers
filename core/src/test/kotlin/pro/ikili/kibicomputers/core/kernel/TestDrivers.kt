@@ -58,11 +58,13 @@ internal class Harness(
     execRuntime: WasmRuntime? = null,
     /** タイマーの期限を待つ口（`null` なら本物のスレッド `KiBi-timer`） */
     timers: TimerService? = null,
+    /** `Machine.exec` で待機点への変換をかける（#329）。`false` なら p1 のコマンドを `BLOCKING` で動かす */
+    asyncify: Boolean = true,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null, timers = timers),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null, timers = timers, asyncifyExecutables = asyncify),
     )
     private var counter = 0
 

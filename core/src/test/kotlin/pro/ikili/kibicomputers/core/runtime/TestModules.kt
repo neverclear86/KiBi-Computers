@@ -96,6 +96,20 @@ object TestModules {
     }
 
     /** WASM でないバイト列 */
+    /**
+     * 待機点への変換（#329）をかけたモジュール。import `w.wait() -> i32`（止まりうる）、export `run() = wait() + 1`。
+     * 変換の名前（[WasmAsync]）はランタイムがつなぐ
+     */
+    val ASYNC_WAIT: ByteArray by lazy {
+        val bytes = WasmBinary().run {
+            val wait = importFunc("w", "wait", emptyList(), listOf(I32))
+            mutableI64Global(0)
+            exportFunc("run", func(emptyList(), listOf(I32), code(0x10, wait, 0x41, 1, 0x6a)))
+            build()
+        }
+        pro.ikili.kibicomputers.core.runtime.asyncify.Asyncify.transform(bytes, setOf("w.wait")).bytes
+    }
+
     val MALFORMED: ByteArray = "not a wasm module".toByteArray()
 
     val TWICE_TYPE: WasmFunctionType = WasmFunctionType.of(listOf(WasmValueType.I32), listOf(WasmValueType.I32))

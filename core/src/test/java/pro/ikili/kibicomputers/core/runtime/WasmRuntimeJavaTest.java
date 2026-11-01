@@ -3,9 +3,13 @@ package pro.ikili.kibicomputers.core.runtime;
 import org.junit.jupiter.api.Test;
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -66,5 +70,52 @@ class WasmRuntimeJavaTest {
             assertEquals(2, instance.getMemory().grow(1));
         }
         assertEquals(0, used[0]);
+    }
+
+    @Test
+    void asyncifiedModule() {
+        WasmModule module = new EndiveRuntime().load(TestModules.INSTANCE.getASYNC_WAIT());
+        assertTrue(module.isAsyncified());
+        assertFalse(new EndiveRuntime().load(TestModules.INSTANCE.getHOST()).isAsyncified());
+        Deque<Long> saved = new ArrayDeque<>();
+        WasmAsyncStack stack = new WasmAsyncStack() {
+            @Override
+            public void push(long value) {
+                saved.push(value);
+            }
+
+            @Override
+            public long pop() {
+                return saved.pop();
+            }
+        };
+        WasmFunctionType waitType = WasmFunctionType.of(List.of(), List.of(WasmValueType.I32));
+        WasmInstanceConfig config = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", waitType, (instance, args) -> {
+                if (instance.getAsyncState() == WasmAsyncState.REWINDING) {
+                    instance.setAsyncState(WasmAsyncState.NORMAL);
+                    return new long[] {41};
+                }
+                instance.setAsyncState(WasmAsyncState.UNWINDING);
+                return new long[] {0};
+            })
+            .asyncStack(stack)
+            .build();
+        assertEquals(stack, config.getAsyncStack());
+        try (WasmInstance instance = module.instantiate(config)) {
+            instance.call("run");
+            assertEquals(WasmAsyncState.UNWINDING, instance.getAsyncState());
+            assertFalse(saved.isEmpty());
+            instance.setAsyncState(WasmAsyncState.REWINDING);
+            assertEquals(42L, instance.call("run")[0]);
+            assertEquals(WasmAsyncState.NORMAL, instance.getAsyncState());
+        }
+        assertEquals("kibi", WasmAsync.IMPORT_MODULE);
+        assertEquals("async_push", WasmAsync.PUSH);
+        assertEquals("async_pop", WasmAsync.POP);
+        assertEquals("kibi_async_state", WasmAsync.STATE_EXPORT);
+        assertEquals(List.of(WasmValueType.I64), WasmAsync.PUSH_TYPE.getParams());
+        assertEquals(List.of(WasmValueType.I64), WasmAsync.POP_TYPE.getResults());
+        assertEquals(2, WasmAsyncState.valueOf("REWINDING").ordinal());
     }
 }

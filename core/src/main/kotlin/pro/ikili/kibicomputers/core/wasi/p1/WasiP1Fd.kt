@@ -22,11 +22,17 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
  * 各関数は p1 の `errno` の値を返す（成功は 0）。ゲストのメモリの範囲外は、読み書きの前に確かめて `FAULT` にする
  * （一部を読み書きしてから失敗して、データを失うことがないように）。
  *
- * - [blocking] が `true`（`BLOCKING` のプロセス）なら、ストリームの読み書きはそろうまで `ctx.block` で待つ。
- *   fd に `NONBLOCK`（[HandleEntry.flags] に p1 の `fdflags` のビットで持つ）があるか、[blocking] が `false` なら `AGAIN`
+ * - [wait] が [P1Wait.BLOCK]（`BLOCKING` のプロセス）なら、ストリームの読み書きはそろうまで `ctx.block` で待つ。
+ *   [P1Wait.UNWIND]（待機点への変換をかけたプロセス。#329）なら、巻き戻して待つ（[WasiP1Suspend]）。`fd_read` は読む前に戻るので、
+ *   やり直しはもう一度読むだけ。`fd_write` は1バイトも書けないときだけ巻き戻し、少しでも書けたらその数を返す（p1 では一部だけ書いてよく、
+ *   wasi-libc は残りを書き直す。途中まで書いた分の状態を持たずに済む）。インスタンスを作っている途中は巻き戻せないので `ctx.block` で待つ。
+ *   fd に `NONBLOCK`（[HandleEntry.flags] に p1 の `fdflags` のビットで持つ）があるか、[wait] が [P1Wait.NONE] なら `AGAIN`
  * - 燃料: 呼び出しごとに [CALL_FUEL]、読み書きしたバイト [BYTES_PER_FUEL] ごとに 1（仮の値。確定は #251）
  */
-internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: Boolean) {
+internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wait, private val suspend: WasiP1Suspend) {
+    /** 1回の読み書きの待ち方 */
+    private enum class Style { BLOCK, UNWIND, NONE }
+
     // ---- 読み書き ----
 
     /** `fd_read(fd, iovs, iovs_len, nread*)` */
@@ -37,7 +43,11 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
         val n = when (val r = readStream(fd, buf)) {
             is IoResult.Bytes -> r.count
             IoResult.Eof -> 0
-            is IoResult.WouldBlock -> return Errno.AGAIN.code
+            is IoResult.WouldBlock -> {
+                if (style(fd) != Style.UNWIND) return Errno.AGAIN.code
+                suspend.unwind(listOf(r.key), null)
+                return 0
+            }
             is IoResult.Error -> return r.errno.code
         }
         vec.scatter(memory, buf, n)
@@ -57,17 +67,24 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
             memory.writeI32(nwrittenPtr, 0)
             return 0
         }
-        val wait = shouldWait(fd)
+        val style = style(fd)
         var done = 0
         while (done < buf.size) {
-            val r = if (wait) FdIo.writeBlocking(ctx, fd, buf, done, buf.size - done) else FdIo.write(ctx, fd, buf, done, buf.size - done)
+            val r = if (style == Style.BLOCK) FdIo.writeBlocking(ctx, fd, buf, done, buf.size - done) else FdIo.write(ctx, fd, buf, done, buf.size - done)
             when (r) {
                 is IoResult.Bytes -> done += r.count
-                is IoResult.WouldBlock -> if (done == 0) return Errno.AGAIN.code else break
+                is IoResult.WouldBlock -> {
+                    if (done > 0) break
+                    if (style != Style.UNWIND) return Errno.AGAIN.code
+                    // 1バイトも書けない: 巻き戻して待つ（やり直しは最初から書き直す）
+                    suspend.unwind(listOf(r.key), null)
+                    return 0
+                }
                 is IoResult.Error -> if (done == 0) return r.errno.code else break
                 IoResult.Eof -> break
             }
-            if (!wait) break
+            // 待たない fd は1回だけ。巻き戻す fd は、書ける分だけ書いてから返す
+            if (style == Style.NONE) break
         }
         memory.writeI32(nwrittenPtr, done)
         chargeBytes(done)
@@ -369,7 +386,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
             val err = checkRight(fd, HandleRights.READ)
             return if (err != 0) IoResult.Error(Errno.ofCode(err)!!) else IoResult.Bytes(0)
         }
-        return if (shouldWait(fd)) FdIo.readBlocking(ctx, fd, buf, 0, buf.size) else FdIo.read(ctx, fd, buf, 0, buf.size)
+        return if (style(fd) == Style.BLOCK) FdIo.readBlocking(ctx, fd, buf, 0, buf.size) else FdIo.read(ctx, fd, buf, 0, buf.size)
     }
 
     /** [fd] が開いていて、権利 [right] を持つか（errno。持てば 0） */
@@ -377,11 +394,15 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
         errno { if (table().entry(fd).rights and right == 0) fsError(Errno.BADF) }
     }
 
-    /** ストリームの読み書きで待つか（`BLOCKING` のプロセスで、fd に `NONBLOCK` がない） */
-    private fun shouldWait(fd: Int): Boolean {
-        if (!blocking) return false
-        val flags = ctx.withKernelLock { ctx.kernel.processes[ctx.pid]?.handles?.get(fd)?.flags } ?: return true
-        return flags and P1.FDFLAGS_NONBLOCK.toLong() == 0L
+    /**
+     * ストリームの読み書きの待ち方。fd に `NONBLOCK` があるか [P1Wait.NONE] なら待たない。
+     * [P1Wait.UNWIND] でも、巻き戻せないとき（インスタンスを作っている途中）は `ctx.block` で待つ
+     */
+    private fun style(fd: Int): Style {
+        if (wait == P1Wait.NONE) return Style.NONE
+        val flags = ctx.withKernelLock { ctx.kernel.processes[ctx.pid]?.handles?.get(fd)?.flags }
+        if (flags != null && flags and P1.FDFLAGS_NONBLOCK.toLong() != 0L) return Style.NONE
+        return if (wait == P1Wait.UNWIND && suspend.canUnwind()) Style.UNWIND else Style.BLOCK
     }
 
     private fun table(): FdTable = FdTable(checkNotNull(ctx.kernel.processes[ctx.pid]), ctx.kernel.objects, ctx.wakeSink)

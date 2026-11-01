@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
@@ -97,6 +98,15 @@ internal object WasiP1 {
         Fn("path_unlink_file", type(I32, I32, I32)) { f, m, a -> f.path.unlinkFile(m, a[0].i(), a[1].i(), a[2].i()) },
     )
 
+    /** 止まりうる関数の名前（ストリームの読み書きと `poll_oneoff`。#329） */
+    private val WAIT_NAMES: Set<String> = setOf("fd_read", "fd_write", "poll_oneoff")
+
+    /**
+     * 待機点への変換（#329）で止まりうるとみなす import（`"<module>.<name>"`）。`fd_write` は、パイプがいっぱいのときに `AGAIN` を返すと
+     * wasi-libc がエラーとして扱いデータを失うので入れる。`sched_yield` は待ちではないので入れない
+     */
+    val WAIT_IMPORTS: Set<String> = WAIT_NAMES.map { "${P1.MODULE}.$it" }.toSet()
+
     /** 実装している関数の名前 */
     val implemented: Set<String> = FUNCTIONS.map { it.name }.toSet() + PROC_EXIT
 
@@ -142,17 +152,29 @@ internal object WasiP1 {
     /**
      * p1 のホスト関数を [builder] に登録する（`ProcessDriver.configure` の中から）。
      * [module] を渡すと、それが import する p1 の関数のうち、まだ実装していないものに `NOSYS` を返す仮の関数をつなぐ。
-     * [blocking] は、ストリームの読み書きと `poll_oneoff` で待つか（`BLOCKING` のプロセス）
+     * [blocking] は、ストリームの読み書きと `poll_oneoff` で待つか（`BLOCKING` のプロセス。`false` なら待たずに `AGAIN`）
      */
     fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, blocking: Boolean) {
+        register(ctx, builder, module, if (blocking) P1Wait.BLOCK else P1Wait.NONE)
+    }
+
+    /**
+     * p1 のホスト関数を [builder] に登録する。[wait] は、ストリームの読み書きと `poll_oneoff` の待ち方。
+     * 戻り値は、止まりうる import の入口と出口の処理（[P1Wait.UNWIND] のとき、ドライバーが巻き戻しを受け取るのに使う）
+     */
+    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, wait: P1Wait): WasiP1Suspend {
         val basic = WasiP1Basic(ctx)
-        val impl = Impl(WasiP1Fd(ctx, blocking), WasiP1Path(ctx), basic, WasiP1Poll(ctx, basic, blocking))
+        val suspend = WasiP1Suspend(ctx)
+        val impl = Impl(WasiP1Fd(ctx, wait, suspend), WasiP1Path(ctx), basic, WasiP1Poll(ctx, basic, wait, suspend))
         for (fn in FUNCTIONS) {
+            val waits = wait == P1Wait.UNWIND && fn.name in WAIT_NAMES
             builder.hostFunction(
                 P1.MODULE,
                 fn.name,
                 fn.type,
                 ctx.hostFunction { c, caller, args ->
+                    // 巻き直して着いたなら、ここで NORMAL に戻す（燃料を引くより前。巻き直しも普通の呼び出しとして数える）
+                    if (waits) suspend.enter(caller)
                     c.chargeFuel(WasiP1Fd.CALL_FUEL)
                     val memory = caller.memory
                     val errno = if (memory == null) {
@@ -180,7 +202,7 @@ internal object WasiP1 {
                 throw WasiP1Exit(args[0].toInt())
             },
         )
-        if (module == null) return
+        if (module == null) return suspend
         for (imp in module.imports) {
             if (imp.module != P1.MODULE || imp.kind != WasmExternKind.FUNCTION || imp.name in implemented) continue
             val type = imp.functionType ?: continue
@@ -193,33 +215,57 @@ internal object WasiP1 {
                 },
             )
         }
+        return suspend
     }
 }
 
 /**
- * p1 のコマンド（`_start` を export するモジュール）を `BLOCKING` で動かすドライバー。
+ * p1 のコマンド（`_start` を export するモジュール）を動かすドライバー。
  *
- * `_start` から戻ったら終了コード 0。`proc_exit(rval)` が呼ばれたら、そこで抜けて終了コード `rval`
+ * 読み込み時に待機点への変換（#329）をかけたモジュール（[WasmModule.isAsyncified]）は `WAIT_POINT` で動かす。
+ * 止まりうる import の中で巻き戻すと `_start` から戻るので、状態が巻き戻し中なら `NORMAL` に戻して `StepResult.Wait` にする。
+ * 起こされたら、状態を巻き直し中にして `_start` を呼び直す。変換を断ったモジュールは `BLOCKING` で動かす。
+ *
+ * `_start` から（巻き戻しでなく）戻ったら終了コード 0。`proc_exit(rval)` が呼ばれたら、そこで抜けて終了コード `rval`
  * （wasi-libc は `main` が 0 以外を返したときと `exit()` で呼ぶ）。
  * `proc_exit` を `_start` の外（モジュールの start 関数の中）で呼ぶと、例外で抜けたものとして `CRASHED` になる。
  */
 internal class WasiP1Driver(private val module: WasmModule) : ProcessDriver {
-    override val kind: ProcessKind get() = ProcessKind.BLOCKING
+    override val kind: ProcessKind = if (module.isAsyncified) ProcessKind.WAIT_POINT else ProcessKind.BLOCKING
+
+    /** 止まりうる import の入口と出口の処理（[configure] で作る） */
+    private var suspend: WasiP1Suspend? = null
 
     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
-        WasiP1.register(ctx, builder, module, blocking = true)
+        suspend = WasiP1.register(ctx, builder, module, if (module.isAsyncified) P1Wait.UNWIND else P1Wait.BLOCK)
     }
 
-    override fun start(ctx: ProcessContext): StepResult {
-        return try {
-            ctx.instance.call(START)
-            StepResult.Exit(0)
+    override fun start(ctx: ProcessContext): StepResult = run(ctx)
+
+    override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
+        check(kind == ProcessKind.WAIT_POINT) { "BLOCKING のドライバーは resume しない" }
+        ctx.instance.asyncState = WasmAsyncState.REWINDING
+        return run(ctx)
+    }
+
+    private fun run(ctx: ProcessContext): StepResult {
+        val instance = ctx.instance
+        try {
+            instance.call(START)
         } catch (e: WasiP1Exit) {
-            StepResult.Exit(e.code)
+            return StepResult.Exit(e.code)
+        }
+        if (!module.isAsyncified) return StepResult.Exit(0)
+        return when (instance.asyncState) {
+            WasmAsyncState.NORMAL -> StepResult.Exit(0)
+            WasmAsyncState.UNWINDING -> {
+                instance.asyncState = WasmAsyncState.NORMAL
+                StepResult.Wait(checkNotNull(suspend).takePendingKeys())
+            }
+            // 止まった呼び出しに着かずに戻った: 巻き直しが食い違った
+            WasmAsyncState.REWINDING -> throw IllegalStateException("巻き直しが止まった呼び出しに着かずに _start から戻った")
         }
     }
-
-    override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult = throw IllegalStateException("BLOCKING のドライバーは resume しない")
 
     companion object {
         /** コマンドの入口 */

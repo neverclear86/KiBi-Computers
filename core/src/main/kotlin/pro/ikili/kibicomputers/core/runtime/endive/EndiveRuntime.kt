@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
+import pro.ikili.kibicomputers.core.runtime.WasmAsync
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmException
 import pro.ikili.kibicomputers.core.runtime.WasmExportDescriptor
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
@@ -170,6 +172,12 @@ internal fun committedPages(memory: WasmMemory): Int {
     return (lazy as? LazyMemory)?.committedPages ?: memory.pages
 }
 
+/** 戻り値のないホストの関数の戻り値 */
+private val NO_VALUES = LongArray(0)
+
+/** 状態のグローバルの値 → 状態 */
+private val ASYNC_STATES: Array<WasmAsyncState> = WasmAsyncState.values()
+
 /** ホストの関数が投げた例外を、Endive の中を通す間だけ包む。外に出るときに外す。 */
 private class HostThrowable(val original: Throwable) : RuntimeException(null, original, false, false)
 
@@ -265,6 +273,8 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
 
     /** 燃料の残りを入れるグローバルの番号。計測しないなら -1 */
     private val fuelGlobalIndex: Int
+
+    override val isAsyncified: Boolean
     override val imports: List<WasmImportDescriptor>
     override val exports: List<WasmExportDescriptor>
 
@@ -302,8 +312,23 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
             throw WasmLoadException("グローバルの import には対応していない")
         }
         fuelGlobalIndex = if (fuelExport != null) exportSection.let { es -> (0 until es.exportCount()).map(es::getExport).first { it.name() == WasmFuel.EXPORT_GLOBAL }.index() } else -1
-        imports = rawImports.filter { it !== fuelImport }
-        exports = rawExports.filter { it !== fuelExport }
+        // 待機点への変換（#329）: import 2つと状態のグローバルの export は、そろっていて型が合うときだけ
+        val pushImport = rawImports.firstOrNull { it.module == WasmAsync.IMPORT_MODULE && it.name == WasmAsync.PUSH }
+        val popImport = rawImports.firstOrNull { it.module == WasmAsync.IMPORT_MODULE && it.name == WasmAsync.POP }
+        val stateExport = rawExports.firstOrNull { it.name == WasmAsync.STATE_EXPORT }
+        val asyncParts = listOfNotNull(pushImport, popImport, stateExport).size
+        if (asyncParts != 0 && asyncParts != 3) {
+            throw WasmLoadException("待機点への変換の import・export の一部しかない")
+        }
+        if (asyncParts == 3) {
+            if (pushImport!!.functionType != WasmAsync.PUSH_TYPE || popImport!!.functionType != WasmAsync.POP_TYPE || stateExport!!.kind != WasmExternKind.GLOBAL) {
+                throw WasmLoadException("待機点への変換の import・export の型が違う")
+            }
+        }
+        isAsyncified = asyncParts == 3
+        val hidden = listOfNotNull(fuelImport, fuelExport, pushImport, popImport, stateExport)
+        imports = rawImports.filter { imp -> hidden.none { it === imp } }
+        exports = rawExports.filter { exp -> hidden.none { it === exp } }
     }
 
     private fun functionTypeOf(index: Int): FunctionType = if (index < importFunctionTypes.size) {
@@ -325,6 +350,17 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
             val type = imp.functionType!!
             if (isFuelMetered && imp.module == WasmFuel.IMPORT_MODULE && imp.name == WasmFuel.IMPORT_NAME) {
                 values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> longArrayOf(wrapper.fuelExhausted(args[0])) })
+                continue
+            }
+            if (isAsyncified && imp.module == WasmAsync.IMPORT_MODULE && (imp.name == WasmAsync.PUSH || imp.name == WasmAsync.POP)) {
+                val stack = config.asyncStack ?: throw WasmLinkException("待機点への変換をかけたモジュールに asyncStack がない")
+                values.addFunction(
+                    if (imp.name == WasmAsync.PUSH) {
+                        hostFunction(imp.module, imp.name, type, wrapper) { args -> stack.push(args[0]); NO_VALUES }
+                    } else {
+                        hostFunction(imp.module, imp.name, type, wrapper) { longArrayOf(stack.pop()) }
+                    },
+                )
                 continue
             }
             val host = config.hostImport(imp.module, imp.name) ?: throw WasmLinkException("import がない: $imp")
@@ -423,6 +459,17 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         set(value) {
             check(module.isFuelMetered) { "燃料を計測しないモジュール" }
             instance().exports().global(WasmFuel.EXPORT_GLOBAL).setValue(value)
+        }
+
+    override var asyncState: WasmAsyncState
+        get() {
+            check(module.isAsyncified) { "待機点への変換をかけていないモジュール" }
+            val v = instance().exports().global(WasmAsync.STATE_EXPORT).getValue().toInt()
+            return ASYNC_STATES.getOrNull(v) ?: throw IllegalStateException("待機点への変換の状態が壊れている: $v")
+        }
+        set(value) {
+            check(module.isAsyncified) { "待機点への変換をかけていないモジュール" }
+            instance().exports().global(WasmAsync.STATE_EXPORT).setValue(value.ordinal.toLong())
         }
 
     fun fuelExhausted(remaining: Long): Long {

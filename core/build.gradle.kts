@@ -99,6 +99,12 @@ kibiWasm {
         sources.from("src/test/wasm/poll_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 待機点への変換（#329）を確かめる、fgets で待つ CLI。深い再帰の底で待つ版のため、C のスタックを大きくする
+    module("prompt-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/prompt_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+        stackSize = 4 * 1024 * 1024
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる
