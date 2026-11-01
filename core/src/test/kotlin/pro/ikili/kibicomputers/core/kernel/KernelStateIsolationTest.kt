@@ -8,6 +8,8 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
@@ -78,6 +80,14 @@ class KernelStateIsolationTest {
         val file = vfs.open(VfsPath.parse("/disk/a"), OpenOptions(write = true, create = true))
         vfs.write(file, "xy".toByteArray(), 0, 2)
         process.handles.insert(HandleEntry(state.objects.add(file)))
+        // TTY: 行の途中・たまった入力と出力・変えた大きさ
+        val tty = Tty(64, 64)
+        state.consoleTtyId = state.objects.add(tty)
+        tty.input("done\npart".toByteArray(), 0, 9, WakeSink.NONE)
+        tty.write("out\n".toByteArray(), 0, 4, WakeSink.NONE)
+        tty.resize(TtySize(40, 12))
+        tty.foregroundPid = 1
+        process.handles.insert(HandleEntry(tty.id))
         walk(state, "state", IdentityHashMap())
     }
 

@@ -3,11 +3,11 @@ package pro.ikili.kibicomputers.core.wasi.p1
 import pro.ikili.kibicomputers.core.kernel.fd.FdIo
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.IoResult
-import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -383,11 +383,8 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
         }
     }
 
-    /** ファイル以外の種類。コンソールは端末なので `CHARACTER_DEVICE`（wasi-libc の `isatty` が真になる）。ほかは `UNKNOWN` */
-    private fun streamFileType(obj: KernelObject): Int {
-        val k = ctx.kernel
-        return if (obj is ByteStream && (obj.id == k.consoleInputId || obj.id == k.consoleOutputId)) P1.FILETYPE_CHARACTER_DEVICE else P1.FILETYPE_UNKNOWN
-    }
+    /** ファイル以外の種類。TTY（コンソール）は端末なので `CHARACTER_DEVICE`（wasi-libc の `isatty` が真になる）。ほかは `UNKNOWN` */
+    private fun streamFileType(obj: KernelObject): Int = if (obj is Tty) P1.FILETYPE_CHARACTER_DEVICE else P1.FILETYPE_UNKNOWN
 
     /** 読む。待つ fd なら、少しでも読めるまで待つ。長さ 0 なら fd と権利を確かめるだけ */
     private fun readStream(fd: Int, buf: ByteArray): IoResult {

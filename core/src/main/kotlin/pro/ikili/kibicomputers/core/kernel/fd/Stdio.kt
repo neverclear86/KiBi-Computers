@@ -11,7 +11,7 @@ internal sealed interface StdioSource {
     /** オブジェクト [objectId] を [rights] で割り当てる（参照を1つ増やす。呼び出し側の参照はそのまま） */
     data class Object(val objectId: Int, val rights: Int) : StdioSource
 
-    /** マシンのコンソール（入力は fd 0、出力は fd 1・2。TTY ができたら #60 で置き換える） */
+    /** マシンのコンソールの TTY（fd 0 は読む側、fd 1・2 は書く側。#60） */
     data object Console : StdioSource
 
     /** 割り当てない（閉じたまま） */

@@ -28,6 +28,12 @@ internal interface WakeSink {
     /** オブジェクト [objectId] の条件すべてがそろったかもしれない（閉じられたときなど） */
     fun wakeObject(objectId: Int)
 
+    /**
+     * オブジェクト [objectId] に、ホストへ配る出力がたまった（待ち手は起こさない。#60）。バイトを積むたびに呼ぶ。
+     * 既定は何もしない（[pro.ikili.kibicomputers.core.kernel.Machine] の知らせ口だけが、コンソールの出力を配る印を付ける）
+     */
+    fun outputPending(objectId: Int) {}
+
     companion object {
         /** 待ち手のないところ（テスト、復元の途中）用。何もしない */
         val NONE: WakeSink = object : WakeSink {

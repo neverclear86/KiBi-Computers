@@ -6,8 +6,6 @@ import pro.ikili.kibicomputers.core.kernel.fd.STDIN
 import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
-import pro.ikili.kibicomputers.core.kernel.io.ByteStream
-import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
@@ -23,6 +21,9 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
+import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -30,7 +31,6 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
-import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -144,17 +144,22 @@ public class Machine internal constructor(
     internal val registry = WaitRegistry()
 
     /**
-     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの出力に書かれたら、次の tick で配るよう印を付ける。
+     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの TTY に出力がたまったら、次の tick で配るよう印を付ける。
      * カーネルの中でオブジェクトの状態を変えるときは、[registry] ではなくこれを使う
      */
     internal val wakeSink: WakeSink = object : WakeSink {
-        override fun wake(key: WaitKey) {
-            registry.wake(key)
-            if (key.condition == WaitCondition.READABLE && key.objectId != 0 && key.objectId == kernel.consoleOutputId) markConsoleDirty()
-        }
+        override fun wake(key: WaitKey) = registry.wake(key)
 
         override fun wakeObject(objectId: Int) = registry.wakeObject(objectId)
+
+        override fun outputPending(objectId: Int) {
+            if (objectId != 0 && objectId == kernel.consoleTtyId) markConsoleDirty()
+        }
     }
+
+    /** コンソールの TTY のシグナル（Ctrl+C など）の受け口。既定は何もしない（強制終了につなぐのは #46） */
+    @Volatile
+    internal var ttySignalHandler: TtySignalHandler = TtySignalHandler { _, _, _ -> }
 
     /** コンソールの出力に、まだ配っていないバイトがあるかもしれない */
     private val consoleDirty = AtomicBoolean(false)
@@ -414,45 +419,58 @@ public class Machine internal constructor(
     }
 
     private fun consoleEntryLocked(fd: Int): HandleEntry {
-        ensureConsoleLocked()
-        return if (fd == STDIN) {
-            HandleEntry(kernel.consoleInputId, rights = HandleRights.READ)
-        } else {
-            HandleEntry(kernel.consoleOutputId, rights = HandleRights.WRITE)
-        }
+        val id = consoleTtyLocked().id
+        return HandleEntry(id, rights = if (fd == STDIN) HandleRights.READ else HandleRights.WRITE)
     }
 
-    /** コンソールの入力・出力の `ByteStream` を、なければ作る（カーネルが参照を1つずつ持ち、閉じない） */
+    /** コンソールの `Tty` を、なければ作る（カーネルが参照を1つ持ち、閉じない） */
     internal fun ensureConsoleLocked() {
-        if (kernel.consoleInputId == 0) kernel.consoleInputId = kernel.objects.add(ByteStream(CONSOLE_INPUT_BYTES))
-        if (kernel.consoleOutputId == 0) kernel.consoleOutputId = kernel.objects.add(ByteStream(CONSOLE_OUTPUT_BYTES))
+        if (kernel.consoleTtyId == 0) kernel.consoleTtyId = kernel.objects.add(Tty(CONSOLE_INPUT_BYTES, CONSOLE_OUTPUT_BYTES))
+    }
+
+    /** コンソールの `Tty`（なければ作る） */
+    internal fun consoleTtyLocked(): Tty {
+        ensureConsoleLocked()
+        return kernel.objects[kernel.consoleTtyId] as Tty
     }
 
     /**
-     * コンソールの入力に [bytes] を足す（キーボードからの入力。TTY の行編集は #60）。どのスレッドから呼んでもよい。
-     * 空きの分だけ書き、書けたバイト数を返す（空きがなければ 0）
+     * コンソールの TTY にキー入力 [bytes] を渡す（キーボードから）。どのスレッドから呼んでもよい。
+     * TTY がモードに従って全部処理し（行編集、エコー、Ctrl+C）、受け付けたバイト数（あふれて捨てた分を除く）を返す。
+     * Ctrl+C などのシグナルは、カーネルロックの中で、起きた順に [ttySignalHandler] に渡す
      */
     internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Int = lock.withLockValue {
-        ensureConsoleLocked()
-        val input = kernel.objects[kernel.consoleInputId] as ByteStream
-        when (val r = input.write(bytes, offset, length, wakeSink)) {
-            is WriteResult.Bytes -> r.count
-            else -> 0
+        require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
+        val tty = consoleTtyLocked()
+        val r = tty.input(bytes, offset, length, wakeSink)
+        if (r.signals.isNotEmpty()) {
+            val handler = ttySignalHandler
+            for (s in r.signals) handler.onSignal(this, s, tty.foregroundPid)
         }
+        length - r.dropped
     }
+
+    /** コンソールの画面の大きさを変える（画面のデバイスから。#65・#66）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException] */
+    internal fun resizeConsole(columns: Int, rows: Int) {
+        val size = TtySize(columns, rows)
+        lock.withLockValue { consoleTtyLocked().resize(size) }
+    }
+
+    /** コンソールの画面の大きさ */
+    internal val consoleSize: TtySize get() = lock.withLockValue { consoleTtyLocked().size }
+
+    /** コンソールの画面の大きさが変わった回数 */
+    internal val consoleSizeGeneration: Long get() = lock.withLockValue { consoleTtyLocked().sizeGeneration }
 
     private fun markConsoleDirty() {
         if (consoleDirty.compareAndSet(false, true) && queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
     }
 
-    /** コンソールの出力にたまったバイトを取り出す（書き手を起こす）。なければ `null` */
+    /** コンソールの TTY にたまった出力を取り出す（書き手を起こす）。なければ `null` */
     private fun drainConsoleOutput(): ByteArray? = lock.withLockValue {
-        val id = kernel.consoleOutputId
-        val stream = (if (id == 0) null else kernel.objects[id] as? ByteStream) ?: return@withLockValue null
-        if (stream.available == 0) return@withLockValue null
-        val out = ByteArray(stream.available)
-        stream.read(out, 0, out.size, wakeSink)
-        out
+        val id = kernel.consoleTtyId
+        val tty = (if (id == 0) null else kernel.objects[id] as? Tty) ?: return@withLockValue null
+        tty.drainOutput(wakeSink)
     }
 
     internal fun runtime(pid: Int): ProcessRuntime? = lock.withLockValue { runtimes[pid] }
@@ -606,12 +624,19 @@ public class Machine internal constructor(
 
     /**
      * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
-     * 配っていない分が [MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
-     * 書き手を待たせる流量の制御は、ABI 層が `ByteStream` で行う（#58・#60）
+     * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
+     * 配っていない分（CR LF にした後のバイト数）が [MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
+     * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）
      */
     internal fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
         if (length == 0) return true
+        return postConsole(nlToCrNl(bytes, offset, length))
+    }
+
+    /** LF を CR LF にした [bytes] を通知の列に積む（上限を超える分は捨てる） */
+    private fun postConsole(bytes: ByteArray): Boolean {
+        val length = bytes.size
         var accepted: Int
         while (true) {
             val pending = pendingConsoleBytes.get()
@@ -619,8 +644,23 @@ public class Machine internal constructor(
             if (accepted == 0 || pendingConsoleBytes.compareAndSet(pending, pending + accepted)) break
         }
         if (accepted < length) droppedConsoleBytes.addAndGet((length - accepted).toLong())
-        if (accepted > 0) postNotification(HostNotification.Console(bytes.copyOfRange(offset, offset + accepted)))
+        if (accepted > 0) postNotification(HostNotification.Console(if (accepted == length) bytes else bytes.copyOf(accepted)))
         return accepted == length
+    }
+
+    /** [bytes] の範囲を写し、LF を CR LF にする（ONLCR と同じ） */
+    private fun nlToCrNl(bytes: ByteArray, offset: Int, length: Int): ByteArray {
+        var lf = 0
+        for (i in offset until offset + length) if (bytes[i] == LF_BYTE) lf++
+        if (lf == 0) return bytes.copyOfRange(offset, offset + length)
+        val out = ByteArray(length + lf)
+        var j = 0
+        for (i in offset until offset + length) {
+            val b = bytes[i]
+            if (b == LF_BYTE) out[j++] = CR_BYTE
+            out[j++] = b
+        }
+        return out
     }
 
     /**
@@ -751,15 +791,27 @@ public class Machine internal constructor(
         /** 配っていないビープの上限（仮の値） */
         internal const val MAX_PENDING_BEEPS: Int = 8
 
-        /** コンソールの入力のバッファ（仮の値。確定は #60・#251） */
         /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
         internal const val MAX_EXECUTABLE_BYTES: Int = 16 * 1024 * 1024
 
+        /** コンソールの TTY の入力の上限（読める入力＋編集中の行。仮の値。確定は #251） */
         internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
 
-        /** コンソールの出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #60・#251） */
+        /** コンソールの TTY の出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #251） */
         internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
+
+        private const val LF_BYTE: Byte = 0x0A
+        private const val CR_BYTE: Byte = 0x0D
     }
+}
+
+/**
+ * コンソールの TTY のシグナル（Ctrl+C・Ctrl+\）の受け口（#60）。[Machine.ttySignalHandler] に入れる。
+ * カーネルロックの中で、キー入力を渡したスレッドから呼ばれる
+ */
+internal fun interface TtySignalHandler {
+    /** [signal] が起きた。[foregroundPid] は TTY の前にいるプロセス（0 = なし。終わっていることもある） */
+    fun onSignal(machine: Machine, signal: TtySignal, foregroundPid: Int)
 }
 
 /** メインスレッドで実行する処理（ワールド操作、デバイスの呼び出しなど）。[Machine.submitHostCall] に渡す */
