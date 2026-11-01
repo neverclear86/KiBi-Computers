@@ -71,4 +71,12 @@ class FakeWasmRuntimeTest : WasmRuntimeContractTest() {
                 .start { c, _ -> c.trap(WasmTrapKind.UNREACHABLE) }
                 .build(),
         )
+        .define(
+            TestModules.GROW,
+            FakeModule.builder()
+                .memory(2)
+                .export("grow", i32) { c, a -> longArrayOf(c.self.memory!!.grow(a[0].toInt()).toLong()) }
+                .export("size", WasmFunctionType.of(emptyList(), listOf(I32))) { c, _ -> longArrayOf(c.self.memory!!.pages.toLong()) }
+                .build(),
+        )
 }

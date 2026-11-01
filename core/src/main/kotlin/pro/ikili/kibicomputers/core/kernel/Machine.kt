@@ -38,6 +38,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -75,11 +76,31 @@ public class MachineConfig private constructor(builder: Builder) {
     /** 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ */
     public val maxHostCallsPerTick: Int = builder.maxHostCallsPerTick
 
+    /**
+     * コンピューター全体の RAM（バイト。#39）。全プロセスの線形メモリの合計の上限で、64 KiB（1 ページ）単位に切り捨てて使う。
+     * 仮: 32 MiB（RAM のアイテムで変わる。#123。wasi-libc の既定のスタックが 16 MiB なので、それより大きくしている）
+     */
+    public val memoryBytes: Long = builder.memoryBytes
+
+    /**
+     * 1 プロセスの線形メモリの合計の上限（バイト。#39）。64 KiB 単位に切り捨てて使う。
+     * 仮: [memoryBytes] と同じ（1つのプロセスが RAM をすべて使ってよい）
+     */
+    public val maxProcessMemoryBytes: Long = builder.maxProcessMemoryBytes ?: builder.memoryBytes
+
+    /** RAM のページ数 */
+    internal val memoryPages: Int get() = pagesOf(memoryBytes)
+
+    /** 1 プロセスのページ数の上限 */
+    internal val maxProcessMemoryPages: Int get() = pagesOf(maxProcessMemoryBytes)
+
     /** [MachineConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var fuelPerTick: Long = 1_000_000
         internal var maxProcesses: Int = 64
         internal var maxHostCallsPerTick: Int = 64
+        internal var memoryBytes: Long = 32L * 1024 * 1024
+        internal var maxProcessMemoryBytes: Long? = null
 
         /** 1 tick に配る燃料（1 以上） */
         public fun fuelPerTick(value: Long): Builder = apply {
@@ -99,11 +120,26 @@ public class MachineConfig private constructor(builder: Builder) {
             maxHostCallsPerTick = value
         }
 
+        /** コンピューター全体の RAM（バイト。1 ページ = 64 KiB 以上） */
+        public fun memoryBytes(value: Long): Builder = apply {
+            require(value >= WasmMemory.PAGE_SIZE) { "memoryBytes は ${WasmMemory.PAGE_SIZE} 以上" }
+            memoryBytes = value
+        }
+
+        /** 1 プロセスの線形メモリの上限（バイト。1 ページ = 64 KiB 以上）。設定しなければ [memoryBytes] と同じ */
+        public fun maxProcessMemoryBytes(value: Long): Builder = apply {
+            require(value >= WasmMemory.PAGE_SIZE) { "maxProcessMemoryBytes は ${WasmMemory.PAGE_SIZE} 以上" }
+            maxProcessMemoryBytes = value
+        }
+
         /** 設定を作る。 */
         public fun build(): MachineConfig = MachineConfig(this)
     }
 
     public companion object {
+        /** バイト数をページ数にする（切り捨て。32 ビットのメモリの上限まで） */
+        private fun pagesOf(bytes: Long): Int = minOf(bytes / WasmMemory.PAGE_SIZE, WasmMemory.MAX_PAGES.toLong()).toInt()
+
         /** 既定の設定 */
         @JvmField
         public val DEFAULT: MachineConfig = Builder().build()
@@ -139,6 +175,9 @@ public class Machine private constructor(
 
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
+
+    /** 線形メモリの使用量（RAM。#39） */
+    internal val memoryAccount = MemoryAccount(config.memoryPages)
 
     /** 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ。カーネルロックの中で使う） */
     internal val vfs = Vfs(kernel.mounts)

@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
@@ -391,8 +392,12 @@ internal class ProcessRunner(private val machine: Machine) {
 
     // ---- インスタンスを作る ----
 
-    private fun checkNoFuel(builder: WasmInstanceConfig.Builder) {
+    /** ABI 層の設定を確かめ、カーネルが決めるもの（燃料以外。メモリの上限）を設定する */
+    private fun applyKernelLimits(rt: ProcessRuntime, builder: WasmInstanceConfig.Builder) {
         check(builder.initialFuel == 0L && builder.fuelHandler == null) { "ABI 層は builder.fuel を呼ばない（燃料はカーネルが設定する）" }
+        check(builder.memoryBudget == null && builder.maxMemoryPages == WasmMemory.MAX_PAGES) { "ABI 層は builder.memoryLimit を呼ばない（メモリの上限はカーネルが設定する）" }
+        // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
+        builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
     }
 
     /** プロセスの始まり: LOADING で configure → 燃料の設定 → instantiate */
@@ -404,7 +409,7 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         val builder = WasmInstanceConfig.builder()
         rt.driver.configure(rt.context, builder)
-        checkNoFuel(builder)
+        applyKernelLimits(rt, builder)
         if (!rt.process.unmetered) builder.fuel(grant, rt.fuelHandler)
         val instance = rt.program.module.instantiate(builder.build())
         lock.withLockValue {
@@ -555,7 +560,7 @@ internal class ProcessRunner(private val machine: Machine) {
             require(module.isFuelMetered == !rt.process.unmetered) { "燃料の計測の有無がプロセスと違うモジュール" }
             val builder = WasmInstanceConfig.builder()
             configurer.configure(builder)
-            checkNoFuel(builder)
+            applyKernelLimits(rt, builder)
             val r = lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
                 val holder = rt.fuelHolder!!

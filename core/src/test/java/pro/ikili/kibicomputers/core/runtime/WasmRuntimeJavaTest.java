@@ -40,4 +40,31 @@ class WasmRuntimeJavaTest {
         WasmHostImport host = new WasmHostImport("env", "f", WasmFunctionType.EMPTY, (instance, args) -> new long[0]);
         assertEquals("env", host.getModule());
     }
+
+    @Test
+    void memoryLimit() {
+        int[] used = {0};
+        WasmMemoryBudget budget = new WasmMemoryBudget() {
+            @Override
+            public boolean tryReserve(int pages) {
+                if (used[0] + pages > 3) return false;
+                used[0] += pages;
+                return true;
+            }
+
+            @Override
+            public void release(int pages) {
+                used[0] -= pages;
+            }
+        };
+        WasmInstanceConfig config = WasmInstanceConfig.builder().memoryLimit(WasmMemory.MAX_PAGES, budget).build();
+        assertEquals(WasmMemory.MAX_PAGES, config.getMaxMemoryPages());
+        WasmModule module = new EndiveRuntime().load(TestModules.INSTANCE.getGROW());
+        try (WasmInstance instance = module.instantiate(config)) {
+            assertEquals(2, used[0]);
+            assertEquals(-1, instance.getMemory().grow(2));
+            assertEquals(2, instance.getMemory().grow(1));
+        }
+        assertEquals(0, used[0]);
+    }
 }

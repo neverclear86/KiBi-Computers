@@ -51,6 +51,9 @@ class KernelJavaTest {
         MachineConfig machine = MachineConfig.builder().fuelPerTick(500).maxProcesses(8).build();
         assertEquals(500, machine.getFuelPerTick());
         assertEquals(8, machine.getMaxProcesses());
+        MachineConfig memory = MachineConfig.builder().memoryBytes(8L << 20).maxProcessMemoryBytes(4L << 20).build();
+        assertEquals(8L << 20, memory.getMemoryBytes());
+        assertEquals(4L << 20, memory.getMaxProcessMemoryBytes());
 
         MachineScheduler defaults = new MachineScheduler();
         try {
