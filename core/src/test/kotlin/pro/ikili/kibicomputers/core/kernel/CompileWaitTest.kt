@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -225,6 +226,59 @@ class CompileWaitTest {
         // 読み込みは続き、終われば共有される（子は作らない）
         gate.countDown()
         eventually { h.scheduler.programs.loadingCount == 0 }
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `1台の読み込みが上限に達したらexecはAGAINになり、別の台の読み込みは受け付ける`() = env {
+        val limit = ProgramCache.DEFAULT_MAX_PENDING_PER_OWNER
+        val m = h.machine(fuelPerTick = 1_000_000)
+        val files = (0..limit).map { "/bin/p$it" to exe() }
+        m.mountRoot(*files.toTypedArray())
+        val outs = files.map { AtomicReference<Any>() }
+        val pids = files.indices.take(limit).map { i -> m.spawnTest(h.program(emptyModule()), execer(files[i].first, outs[i])) }
+        tickUntil { h.scheduler.programs.loadingCount == limit && pids.all { m.stateOf(it) == ProcessState.WAITING_HOST } }
+        // 上限を超えた分は待たずに AGAIN
+        val over = m.spawnTest(h.program(emptyModule()), execer(files[limit].first, outs[limit]))
+        tickUntil { m.stateOf(over).isTerminal }
+        assertEquals(Errno.AGAIN, (outs[limit].get() as FsException).errno)
+        // 別の台は受け付ける
+        val other = h.machine(fuelPerTick = 1_000_000)
+        other.mountRoot("/bin/q" to exe())
+        val otherOut = AtomicReference<Any>()
+        val otherPid = other.spawnTest(h.program(emptyModule()), execer("/bin/q", otherOut))
+        tickUntil { other.stateOf(otherPid) == ProcessState.WAITING_HOST }
+        assertEquals(limit + 1, h.scheduler.programs.loadingCount)
+        gate.countDown()
+        tickUntil { pids.all { m.stateOf(it).isTerminal } && other.stateOf(otherPid).isTerminal }
+        assertTrue(outs.take(limit).all { it.get() is Int }, outs.toString())
+        assertTrue(otherOut.get() is Int)
+        m.stop()
+        other.stop()
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(other.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `execの読み込みを待つプロセスが止められたら、始まっていない読み込みは取り消す`() = env {
+        val m = h.machine(fuelPerTick = 1_000_000)
+        m.mountRoot("/bin/x" to exe(), "/bin/y" to exe())
+        val outA = AtomicReference<Any>()
+        val outB = AtomicReference<Any>()
+        val a = m.spawnTest(h.program(emptyModule()), execer("/bin/x", outA))
+        tickUntil { loading.size == 1 }
+        val b = m.spawnTest(h.program(emptyModule()), execer("/bin/y", outB))
+        tickUntil { m.stateOf(b) == ProcessState.WAITING_HOST && h.scheduler.programs.loadingCount == 2 }
+        m.lock.withLockValue { m.killLocked(b, KillSignal.KILL) }
+        tickUntil("止まらない") { m.stateOf(b).isTerminal }
+        // 待ち行列にあった /bin/y の読み込みは外れる
+        eventually { h.scheduler.programs.loadingCount == 1 }
+        gate.countDown()
+        tickUntil { m.stateOf(a).isTerminal }
+        eventually { h.scheduler.programs.loadingCount == 0 }
+        assertEquals(1L, h.scheduler.programs.loads.get())
+        assertEquals(1, loading.size)
         m.stop()
         assertTrue(m.awaitTermination(5_000))
     }
