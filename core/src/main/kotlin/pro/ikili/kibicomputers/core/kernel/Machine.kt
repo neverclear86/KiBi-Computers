@@ -761,20 +761,42 @@ public class Machine private constructor(
 
     /**
      * プロセス [process] が終わった（`ProcessRunner.finishLocked` から。カーネルロックの中）。
-     * init が `stop()`・再起動によらずに終わったら、コンソールに書いて、残りのプロセスをすべて止める
+     *
+     * - init が `stop()`・再起動によらずに終わったら、コンソールに書いて、残りのプロセスをすべて止める
+     * - init でないプロセスが例外で `CRASHED` になったら、理由をコンソールに書く（#41）。ほかのプロセスはそのまま
+     *
+     * @param crashReason `CRASHED` の理由（[crashReason][pro.ikili.kibicomputers.core.kernel.process.crashReason]）。それ以外は `null`
      */
-    internal fun onProcessFinishedLocked(process: Process) {
-        if (initPid == 0 || process.pid != initPid || process.parentPid != 0) return
-        initPid = 0
+    internal fun onProcessFinishedLocked(process: Process, crashReason: String?) {
+        val isInit = initPid != 0 && process.pid == initPid && process.parentPid == 0
+        if (isInit) initPid = 0
         // STOPPING（stop()・reboot()）と CRASHED（カーネルの不整合）では何も言わない
         if (stateValue != MachineState.RUNNING) return
+        if (!isInit) {
+            if (process.state == ProcessState.CRASHED) writeConsoleLine("kibi: ${processLabel(process)} crashed: ${crashReason ?: "unknown"}")
+            return
+        }
         val message = when (process.state) {
             ProcessState.EXITED -> "kibi: init exited with code ${process.exitCode}"
-            ProcessState.CRASHED -> "kibi: init crashed"
+            ProcessState.CRASHED -> "kibi: init crashed: ${crashReason ?: "unknown"}"
             else -> "kibi: init was killed"
         }
         writeConsoleLine(message)
         if (kernel.processes.liveCount() > 0) stopLocked(null)
+    }
+
+    /** コンソールのメッセージでプロセスを指す名前（`argv[0] (pid n)`。引数がなければ `pid n`） */
+    private fun processLabel(process: Process): String {
+        val name = process.args.firstOrNull()?.takeIf { it.isNotEmpty() }?.let(::sanitizeForConsole)
+        return if (name == null) "pid ${process.pid}" else "$name (pid ${process.pid})"
+    }
+
+    /** 制御文字を `?` にし、長すぎれば切る（プレイヤーが決めた名前で端末を操作させない） */
+    private fun sanitizeForConsole(s: String): String {
+        val cleaned = buildString {
+            for (c in s) append(if (Character.isISOControl(c)) '?' else c)
+        }
+        return if (cleaned.length <= MAX_LABEL_CHARS) cleaned else cleaned.take(MAX_LABEL_CHARS) + "..."
     }
 
     /** 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中） */
@@ -1053,6 +1075,9 @@ public class Machine private constructor(
 
         /** 起動の始めに、前のスレッドを待つときの見直しの間隔 */
         private const val BOOT_WAIT_NANOS: Long = 10_000_000
+
+        /** コンソールのメッセージに出すプロセスの名前の最大の文字数 */
+        private const val MAX_LABEL_CHARS: Int = 64
 
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D

@@ -231,7 +231,7 @@ class BootTest {
         val cases = listOf(
             exitingInit(null) to "kibi: init exited with code 0",
             exitingInit(3) to "kibi: init exited with code 3",
-            trappingInit() to "kibi: init crashed",
+            trappingInit() to "kibi: init crashed: unreachable executed",
         )
         for ((i, case) in cases.withIndex()) {
             val (module, message) = case

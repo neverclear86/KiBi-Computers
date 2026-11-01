@@ -16,7 +16,14 @@ class WasmBinary {
     private val globals = mutableListOf<ByteArray>()
     private val data = mutableListOf<Pair<Int, ByteArray>>()
     private var memoryPages: Int? = null
+    private var tableSize: Int? = null
     private var start: Int? = null
+
+    /** 関数の型の番号（`call_indirect` に使う）。なければ足す */
+    fun typeIndex(params: List<Int>, results: List<Int>): Int = type(params, results)
+
+    /** funcref のテーブル（要素は空）を1つ足す */
+    fun table(size: Int) = apply { tableSize = size }
 
     private fun type(params: List<Int>, results: List<Int>): Int {
         val t = params to results
@@ -67,6 +74,7 @@ class WasmBinary {
             section(out, 2, vec(imports.map { (m, n, t) -> name(m) + name(n) + byteArrayOf(0x00) + uleb(t.toLong()) }))
         }
         if (functions.isNotEmpty()) section(out, 3, vec(functions.map { uleb(it.first.toLong()) }))
+        tableSize?.let { section(out, 4, vec(listOf(byteArrayOf(0x70, 0x00) + uleb(it.toLong())))) }
         memoryPages?.let { section(out, 5, vec(listOf(byteArrayOf(0x00) + uleb(it.toLong())))) }
         if (globals.isNotEmpty()) section(out, 6, vec(globals))
         if (exports.isNotEmpty()) section(out, 7, vec(exports.map { (n, k, i) -> name(n) + byteArrayOf(k.toByte()) + uleb(i.toLong()) }))
