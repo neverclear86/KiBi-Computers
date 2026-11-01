@@ -348,7 +348,9 @@ internal object FuelInjector {
             val leaves = when (op) {
                 in CALLS, in EXITS -> true
                 // 関数そのもののラベルへの分岐は、戻るのと同じ
-                OpCode.BR, OpCode.BR_IF -> ins.operand(0).toInt() == depth
+                OpCode.BR, OpCode.BR_IF, OpCode.BR_ON_NULL, OpCode.BR_ON_NON_NULL -> ins.operand(0).toInt() == depth
+                // br_on_cast 系は、オペランドの先頭がフラグで、ラベルは 2 番目
+                OpCode.BR_ON_CAST, OpCode.BR_ON_CAST_FAIL -> ins.operand(1).toInt() == depth
                 // オペランドの並びに個数も入るが、余分に書き戻すだけなので害はない
                 OpCode.BR_TABLE -> ins.operands().any { it.toInt() == depth }
                 OpCode.END -> i == n - 1

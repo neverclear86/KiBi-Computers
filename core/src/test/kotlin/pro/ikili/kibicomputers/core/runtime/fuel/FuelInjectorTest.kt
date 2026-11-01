@@ -7,6 +7,9 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.TestModules
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
+import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.I32
+import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.code
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
@@ -147,6 +150,34 @@ class FuelInjectorTest {
             assertEquals(995L, seen, "ホストの関数から見た残り")
             assertEquals(500L, inst.fuel, "ホストの関数が書いた残りを読み直し、export から戻る前に書き戻す")
         }
+    }
+
+    @Test
+    fun `関数のラベルへのbr_on_nullで抜けても、使った燃料を書き戻す`() {
+        // work(n): n 回ループしてから ref.null → br_on_null 0（関数のラベル）で抜ける。run(n) = work(n) を呼ぶだけ
+        val wasm = WasmBinary().run {
+            val work = func(
+                listOf(I32), emptyList(),
+                code(
+                    0x03, 0x40,
+                    0x20, 0, 0x41, 1, 0x6b, 0x22, 0, 0x0d, 0,
+                    0x0b,
+                    0xd0, 0x70, 0xd5, 0, 0x1a,
+                ),
+            )
+            exportFunc("run", func(listOf(I32), emptyList(), code(0x20, 0, 0x10, work)))
+            build()
+        }
+        val module = runtime.load(FuelInjector.inject(wasm).bytes)
+        fun used(n: Long): Long {
+            val initial = 1L shl 40
+            module.instantiate(WasmInstanceConfig.builder().fuel(initial, null).build()).use { inst ->
+                inst.call("run", n)
+                return initial - inst.fuel
+            }
+        }
+        // ループ 1 周が 1 以上の燃料を使うので、callee の分が返金されていれば差は出ない
+        assertTrue(used(1_000) - used(10) >= 990, "呼んだ先の燃料が書き戻されていない")
     }
 
     @Test
