@@ -48,6 +48,20 @@ class KernelJavaTest {
         assertEquals(10, config.getMaxBlockingProcesses());
         assertTrue(SchedulerConfig.DEFAULT.getMaxConcurrentMachines() >= 1);
 
+        // 実行ファイルの読み込みと共有（#37）
+        SchedulerConfig programs = SchedulerConfig.builder()
+                .compilerThreads(2)
+                .programCacheEntries(8)
+                .programCacheBytes(4L << 20)
+                .build();
+        assertEquals(2, programs.getCompilerThreads());
+        assertEquals(8, programs.getProgramCacheEntries());
+        assertEquals(4L << 20, programs.getProgramCacheBytes());
+        assertEquals(1, SchedulerConfig.DEFAULT.getCompilerThreads());
+        assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().compilerThreads(0));
+        assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().programCacheEntries(0));
+        assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().programCacheBytes(0));
+
         MachineConfig machine = MachineConfig.builder().fuelPerTick(500).maxProcesses(8).build();
         assertEquals(500, machine.getFuelPerTick());
         assertEquals(8, machine.getMaxProcesses());

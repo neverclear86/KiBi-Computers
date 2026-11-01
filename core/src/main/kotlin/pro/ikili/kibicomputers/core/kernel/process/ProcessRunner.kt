@@ -544,7 +544,8 @@ internal class ProcessRunner(private val machine: Machine) {
             machine.spawn(program, driver, options, rt.pid)
 
         override fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): Int =
-            machine.exec(path, drivers, options, rt.pid)
+            // 読み込み（コンパイル）を待つ間は、CPU と許可を返す（#37。ADR 0029）
+            machine.exec(path, drivers, options, rt.pid) { future -> awaitHost(future) }
 
         override fun children(): List<Int> = machine.children(rt.pid)
 

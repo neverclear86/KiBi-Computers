@@ -52,7 +52,7 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
             val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
             if (limits != null) ModulePrescan.check(copy, limits, deadline)
             val module = runtime.load(copy)
-            deadline?.check("パースと検証")
+            deadline?.check("パース・検証・コンパイル")
             return Program(ModuleHash.of(copy), module)
         }
 
@@ -81,7 +81,7 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
             }
             val injected = FuelInjector.inject(source) { deadline?.check("燃料の計測コードの挿入") }.bytes
             val module = runtime.load(injected)
-            deadline?.check("パースと検証")
+            deadline?.check("パース・検証・コンパイル")
             return Program(ModuleHash.of(injected), module, rejection)
         }
     }

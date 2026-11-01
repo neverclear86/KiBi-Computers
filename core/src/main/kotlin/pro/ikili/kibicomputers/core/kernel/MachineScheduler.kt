@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
@@ -63,6 +64,12 @@ public class MachineScheduler private constructor(
     internal val dispatcher = Dispatcher<Machine>(config.threadStackBytes) { machine -> machine.dispatchFuelWaiters() }
 
     internal val hooks = KernelTestHooks()
+
+    /** 実行ファイルの読み込み（変換・挿入・パース・コンパイル）を行うスレッド（#37。[SchedulerConfig.compilerThreads] 本まで） */
+    private val compilerExecutor = ProgramCache.compilerExecutor(config.compilerThreads, config.threadStackBytes)
+
+    /** 読み込んだ実行ファイルの共有（#37。`Machine.exec` が使う） */
+    internal val programs: ProgramCache = ProgramCache(config.programCacheEntries, config.programCacheBytes, compilerExecutor)
 
     /** タイマーの期限を待つ口（#64、ADR 0064。既定はスレッド `KiBi-timer` 1本） */
     internal val timerService: TimerService = options.timers ?: ExecutorTimerService(TIMER_STACK_BYTES)
@@ -200,6 +207,7 @@ public class MachineScheduler private constructor(
         dispatcher.close()
         timerService.close()
         workers.shutdown()
+        compilerExecutor.shutdownNow()
     }
 
     /**
@@ -317,11 +325,29 @@ public class SchedulerConfig private constructor(builder: Builder) {
     /** サーバー全体のブロッキング型プロセスの数（= 専用スレッドの数）の上限（仮: 2,048） */
     public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
 
+    /**
+     * 実行ファイルの読み込み（燃料の計測コードの挿入・パース・コンパイル）を行うスレッドの数（仮: 1。#37）。
+     * 優先度を下げたスレッドで、仕事がなければ終わる
+     */
+    public val compilerThreads: Int = builder.compilerThreads
+
+    /**
+     * 読み込んだ実行ファイルのうち、どのマシンも使っていなくても残しておく数（仮: 32。#37）。
+     * 使っているものは数によらず共有する。1 つで Metaspace を約 1.3 MB（lua.wasm）使う
+     */
+    public val programCacheEntries: Int = builder.programCacheEntries
+
+    /** [programCacheEntries] で残すものの、WASM のバイト数の合計の上限（仮: 32 MiB。#37） */
+    public val programCacheBytes: Long = builder.programCacheBytes
+
     /** [SchedulerConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
         internal var threadStackBytes: Long = 16L * 1024 * 1024
         internal var maxBlockingProcesses: Int = 2048
+        internal var compilerThreads: Int = 1
+        internal var programCacheEntries: Int = 32
+        internal var programCacheBytes: Long = 32L * 1024 * 1024
 
         /** 同時に WASM を実行するマシンの数の上限（1 以上） */
         public fun maxConcurrentMachines(value: Int): Builder = apply {
@@ -339,6 +365,24 @@ public class SchedulerConfig private constructor(builder: Builder) {
         public fun maxBlockingProcesses(value: Int): Builder = apply {
             require(value >= 0) { "maxBlockingProcesses は 0 以上" }
             maxBlockingProcesses = value
+        }
+
+        /** 実行ファイルを読み込むスレッドの数（1 以上） */
+        public fun compilerThreads(value: Int): Builder = apply {
+            require(value >= 1) { "compilerThreads は 1 以上" }
+            compilerThreads = value
+        }
+
+        /** 使われていなくても残す、読み込んだ実行ファイルの数（1 以上） */
+        public fun programCacheEntries(value: Int): Builder = apply {
+            require(value >= 1) { "programCacheEntries は 1 以上" }
+            programCacheEntries = value
+        }
+
+        /** 使われていなくても残す、読み込んだ実行ファイルのバイト数の合計（1 以上） */
+        public fun programCacheBytes(value: Long): Builder = apply {
+            require(value >= 1) { "programCacheBytes は 1 以上" }
+            programCacheBytes = value
         }
 
         /** 設定を作る。 */
