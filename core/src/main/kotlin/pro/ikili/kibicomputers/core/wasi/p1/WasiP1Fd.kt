@@ -184,23 +184,12 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
     /** `fd_filestat_get(fd, filestat*)` */
     fun filestatGet(memory: WasmMemory, fd: Int, bufPtr: Int): Int {
         if (!P1.inBounds(memory, bufPtr, P1.FILESTAT_SIZE.toLong())) return Errno.FAULT.code
-        val out = ByteArray(P1.FILESTAT_SIZE)
-        locked(fd) { _, obj ->
+        val out = locked(fd) { _, obj ->
             when (obj) {
-                is OpenFile -> {
-                    val st = ctx.vfs.stat(obj)
-                    putI64(out, 0, st.device)
-                    putI64(out, 8, st.node)
-                    out[16] = P1.fileType(st.type).toByte()
-                    putI64(out, 24, st.linkCount)
-                    putI64(out, 32, st.size)
-                    putI64(out, 40, st.accessedNanos)
-                    putI64(out, 48, st.modifiedNanos)
-                    putI64(out, 56, st.changedNanos)
-                }
-                else -> {
-                    out[16] = streamFileType(obj).toByte()
-                    putI64(out, 24, 1)
+                is OpenFile -> P1.filestat(ctx.vfs.stat(obj))
+                else -> ByteArray(P1.FILESTAT_SIZE).also {
+                    it[16] = streamFileType(obj).toByte()
+                    putI64(it, 24, 1)
                 }
             }
         }
@@ -221,21 +210,9 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
 
     /** `fd_filestat_set_times(fd, atim, mtim, fst_flags)` */
     fun filestatSetTimes(fd: Int, atim: Long, mtim: Long, fstFlags: Int): Int {
-        val known = P1.FSTFLAGS_ATIM or P1.FSTFLAGS_ATIM_NOW or P1.FSTFLAGS_MTIM or P1.FSTFLAGS_MTIM_NOW
-        if (fstFlags and known.inv() != 0) return Errno.INVAL.code
-        if (fstFlags and P1.FSTFLAGS_ATIM != 0 && fstFlags and P1.FSTFLAGS_ATIM_NOW != 0) return Errno.INVAL.code
-        if (fstFlags and P1.FSTFLAGS_MTIM != 0 && fstFlags and P1.FSTFLAGS_MTIM_NOW != 0) return Errno.INVAL.code
-        val now = if (fstFlags and (P1.FSTFLAGS_ATIM_NOW or P1.FSTFLAGS_MTIM_NOW) != 0) ctx.environment.clock.realtimeNanos() else 0L
-        val a = when {
-            fstFlags and P1.FSTFLAGS_ATIM != 0 -> atim
-            fstFlags and P1.FSTFLAGS_ATIM_NOW != 0 -> now
-            else -> null
-        }
-        val m = when {
-            fstFlags and P1.FSTFLAGS_MTIM != 0 -> mtim
-            fstFlags and P1.FSTFLAGS_MTIM_NOW != 0 -> now
-            else -> null
-        }
+        val times = P1.times(fstFlags, atim, mtim) { ctx.environment.clock.realtimeNanos() }
+        val a = times.accessedNanos
+        val m = times.modifiedNanos
         locked(fd) { _, obj ->
             if (obj !is OpenFile) fsError(Errno.NOTSUP)
             if (a != null || m != null) ctx.vfs.setTimes(obj, a, m)
@@ -487,12 +464,8 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val blocking: B
         /** 燃料 1 あたりの読み書きのバイト数（仮の値。確定は #251） */
         const val BYTES_PER_FUEL: Long = 64
 
-        private fun putI64(b: ByteArray, at: Int, v: Long) {
-            for (i in 0 until 8) b[at + i] = (v ushr (8 * i)).toByte()
-        }
+        private fun putI64(b: ByteArray, at: Int, v: Long) = P1.putI64(b, at, v)
 
-        private fun putI32(b: ByteArray, at: Int, v: Int) {
-            for (i in 0 until 4) b[at + i] = (v ushr (8 * i)).toByte()
-        }
+        private fun putI32(b: ByteArray, at: Int, v: Int) = P1.putI32(b, at, v)
     }
 }

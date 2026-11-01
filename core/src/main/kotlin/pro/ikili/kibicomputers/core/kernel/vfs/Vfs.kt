@@ -118,6 +118,19 @@ internal class Vfs(
         src.fs.rename(src.relative, dst.relative)
     }
 
+    /**
+     * [path] の時刻を変える（`null` は変えない。両方 `null` なら、あるか確かめるだけ）。規則は開いたファイルの [setTimes] と同じで、
+     * 読み取り専用のマウントと、マウントの祖先のディレクトリ（どの FS にもない）は `ROFS`
+     */
+    fun setTimes(path: VfsPath, accessedNanos: Long?, modifiedNanos: Long?) {
+        val st = stat(path)
+        if (accessedNanos == null && modifiedNanos == null) return
+        val loc = locate(path)
+        if (loc == null || st.device == 0L) fsError(Errno.ROFS, "マウントの祖先のディレクトリは変えられない")
+        if (loc.readOnly) fsError(Errno.ROFS)
+        loc.fs.setTimes(st.node, accessedNanos, modifiedNanos)
+    }
+
     // ---- 開いたファイルの操作 ----
 
     /** 今の位置から読み、位置を進める。読めた数を返す（終わりなら 0） */

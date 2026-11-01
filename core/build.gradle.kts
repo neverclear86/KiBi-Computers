@@ -79,6 +79,11 @@ kibiWasm {
         sources.from("src/test/wasm/fd_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // WASI p1 の path_* と preopen を確かめるプログラム（#71）
+    module("path-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/path_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // WASI p1 の args・environ・clock・random・sched_yield・proc_exit を確かめるプログラム（#69）
     module("basic-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/basic_wasi.c")

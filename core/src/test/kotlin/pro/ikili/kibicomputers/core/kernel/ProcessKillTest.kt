@@ -84,7 +84,7 @@ class ProcessKillTest {
     fun `計算中の子をkillできる`() = killWhile(child = { runDriver() }, childProgram = { it.program(spinForever()) }, reached = { it == ProcessState.RUNNING || it == ProcessState.WAITING_FUEL })
 
     @Test
-    fun `燃料待ちの子をkillできる`() = killWhile(fuelPerTick = 5, child = { runDriver() }, childProgram = { it.program(spinForever(sleepMillis = 1)) }, reached = { it == ProcessState.WAITING_FUEL })
+    fun `燃料待ちの子をkillできる`() = killWhile(fuelPerTick = 5, child = { runDriver() }, childProgram = { it.program(spinForever()) }, reached = { it == ProcessState.WAITING_FUEL })
 
     @Test
     fun `blockで待っている子をkillできる`() = killWhile(child = { gated(Gate(it)) }, reached = { it == ProcessState.WAITING_EVENT })

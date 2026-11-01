@@ -227,7 +227,7 @@ class WasiP1FdTest {
             val module = forwarding(
                 "fd_fdstat_get", "fd_filestat_get", "fd_prestat_get", "fd_prestat_dir_name", "fd_readdir", "fd_seek", "fd_tell",
                 "fd_filestat_set_size", "fd_filestat_set_times", "fd_allocate", "fd_fdstat_set_rights",
-                extra = mapOf("path_open" to PATH_OPEN),
+                extra = mapOf("sock_accept" to SOCK_ACCEPT),
             )
             val opts = SpawnOptions(
                 stdio = StdioSpec.CLOSED,
@@ -285,15 +285,14 @@ class WasiP1FdTest {
                 assertEquals(Errno.NOTDIR.code, call("fd_readdir", 4, 1000, 4096, 0, 300))
 
                 // まだない関数は NOSYS
-                assertEquals(Errno.NOSYS.code, call("path_open", 3, 0, 0, 0, 0, 0, 0, 0, 0))
+                assertEquals(Errno.NOSYS.code, call("sock_accept", 3, 0, 0))
             }
         }
     }
 
     private companion object {
         val I32 = WasmValueType.I32
-        val I64 = WasmValueType.I64
-        val PATH_OPEN: WasmFunctionType = WasmFunctionType.of(listOf(I32, I32, I32, I32, I32, I64, I64, I32, I32), listOf(I32))
+        val SOCK_ACCEPT: WasmFunctionType = WasmFunctionType.of(listOf(I32, I32, I32), listOf(I32))
     }
 
     /** dirent の並びを（名前、d_next）にする。途中で切れたものは含めない */

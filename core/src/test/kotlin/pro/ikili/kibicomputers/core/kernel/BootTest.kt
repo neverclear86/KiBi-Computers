@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
@@ -177,6 +178,14 @@ class BootTest {
         assertEquals(ProcessKind.BLOCKING, init.kind)
         val console = m.lock.withLockValue { m.kernel.consoleTtyId }
         for (fd in listOf(STDIN, STDOUT, STDERR)) assertEquals(console, init.handles[fd]!!.objectId, "fd $fd はコンソール")
+        // fd 3 は preopen の `/`（#71）
+        m.lock.withLockValue {
+            val root = m.kernel.objects[init.handles[3]!!.objectId] as OpenFile
+            assertTrue(root.isDirectory)
+            assertEquals(VfsPath.ROOT, root.path)
+            assertEquals(1, m.kernel.objects.refCount(root.id))
+        }
+        assertEquals(setOf(0, 1, 2, 3), init.handles.entries().keys)
         assertEquals(listOf("/" to "disk:b"), mounts())
         assertEquals("kibi: booting from disk b\n", host.console.toString())
         assertFalse(m.boot(bootDisks("b")), "動いている間は起動しない")

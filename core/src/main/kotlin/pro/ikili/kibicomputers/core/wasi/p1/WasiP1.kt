@@ -19,8 +19,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 /**
  * WASI p1（`wasi_snapshot_preview1`）の層（ADR 0261 の A）。カーネルの土台の上に、p1 のホスト関数を並べる。
  *
- * 今あるのは `fd_*`（#70）と、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）。
- * `path_*` は #71、`poll_oneoff` は #72 で足す。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
+ * 今あるのは `fd_*`（#70）、`path_*`（#71。[WasiP1Path]）と、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）。
+ * `poll_oneoff` は #72 で足す。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
  * まだない関数をモジュールが import していれば、`NOSYS` を返す仮の関数をつなぐ（リンクが通るように）。
  */
 internal object WasiP1 {
@@ -30,7 +30,7 @@ internal object WasiP1 {
     private fun type(vararg params: WasmValueType): WasmFunctionType = WasmFunctionType.of(params.toList(), listOf(I32))
 
     /** プロセスごとの実装 */
-    private class Impl(val fd: WasiP1Fd, val basic: WasiP1Basic)
+    private class Impl(val fd: WasiP1Fd, val path: WasiP1Path, val basic: WasiP1Basic)
 
     /** 関数1つ: 名前、型、本体（p1 の errno を返す） */
     private class Fn(val name: String, val type: WasmFunctionType, val body: (Impl, WasmMemory, LongArray) -> Int)
@@ -72,6 +72,28 @@ internal object WasiP1 {
         Fn("fd_sync", type(I32)) { f, _, a -> f.fd.sync(a[0].i()) },
         Fn("fd_tell", type(I32, I32)) { f, m, a -> f.fd.tell(m, a[0].i(), a[1].i()) },
         Fn("fd_write", type(I32, I32, I32, I32)) { f, m, a -> f.fd.write(m, a[0].i(), a[1].i(), a[2].i(), a[3].i()) },
+        Fn("path_create_directory", type(I32, I32, I32)) { f, m, a -> f.path.createDirectory(m, a[0].i(), a[1].i(), a[2].i()) },
+        Fn("path_filestat_get", type(I32, I32, I32, I32, I32)) { f, m, a ->
+            f.path.filestatGet(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i())
+        },
+        Fn("path_filestat_set_times", type(I32, I32, I32, I32, I64, I64, I32)) { f, m, a ->
+            f.path.filestatSetTimes(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4], a[5], a[6].i() and 0xffff)
+        },
+        Fn("path_link", type(I32, I32, I32, I32, I32, I32, I32)) { f, m, a ->
+            f.path.link(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i(), a[5].i(), a[6].i())
+        },
+        Fn("path_open", type(I32, I32, I32, I32, I32, I64, I64, I32, I32)) { f, m, a ->
+            f.path.open(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i() and 0xffff, a[5], a[6], a[7].i() and 0xffff, a[8].i())
+        },
+        Fn("path_readlink", type(I32, I32, I32, I32, I32, I32)) { f, m, a ->
+            f.path.readlink(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i(), a[5].i())
+        },
+        Fn("path_remove_directory", type(I32, I32, I32)) { f, m, a -> f.path.removeDirectory(m, a[0].i(), a[1].i(), a[2].i()) },
+        Fn("path_rename", type(I32, I32, I32, I32, I32, I32)) { f, m, a ->
+            f.path.rename(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i(), a[5].i())
+        },
+        Fn("path_symlink", type(I32, I32, I32, I32, I32)) { f, m, a -> f.path.symlink(m, a[0].i(), a[1].i(), a[2].i(), a[3].i(), a[4].i()) },
+        Fn("path_unlink_file", type(I32, I32, I32)) { f, m, a -> f.path.unlinkFile(m, a[0].i(), a[1].i(), a[2].i()) },
     )
 
     /** 実装している関数の名前 */
@@ -122,7 +144,7 @@ internal object WasiP1 {
      * [blocking] は、ストリームの読み書きで待つか（`BLOCKING` のプロセス）
      */
     fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, blocking: Boolean) {
-        val impl = Impl(WasiP1Fd(ctx, blocking), WasiP1Basic(ctx))
+        val impl = Impl(WasiP1Fd(ctx, blocking), WasiP1Path(ctx), WasiP1Basic(ctx))
         for (fn in FUNCTIONS) {
             builder.hostFunction(
                 P1.MODULE,

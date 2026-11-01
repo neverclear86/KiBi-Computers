@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
@@ -19,6 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -309,6 +311,92 @@ class ProcessSpawnTest {
             h.tickUntil { m.stateOf(pid).isTerminal }
             assertState(ProcessState.EXITED, m, pid)
             assertEquals(listOf<Any>("/a", "/a/b", "/a", Errno.NOENT, Errno.NOTDIR, "/a"), results.toList())
+        }
+    }
+
+    @Test
+    fun `ディレクトリをpreopenとして渡せる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            m.mountRoot("/a", "/a/b")
+            m.writeFile("/a/f", byteArrayOf(1))
+            val program = h.program(emptyModule())
+            val parent = m.spawn(program, m.waiter(), SpawnOptions(cwd = "/a", fds = mapOf(3 to StdioSource.Directory("/"), 5 to StdioSource.Directory("a"))))
+            m.lock.withLockValue {
+                val handles = m.kernel.processes[parent]!!.handles
+                val root = m.kernel.objects[handles[3]!!.objectId] as OpenFile
+                val b = m.kernel.objects[handles[5]!!.objectId] as OpenFile
+                assertTrue(root.isDirectory && b.isDirectory)
+                assertEquals(VfsPath.ROOT, root.path)
+                assertEquals(VfsPath.parse("/a"), b.path, "親がなければ `/` から辿る（cwd ではない）")
+                assertEquals(HandleRights.READ, handles[3]!!.rights)
+                assertEquals(1, m.kernel.objects.refCount(root.id))
+                assertEquals(1, m.kernel.objects.refCount(b.id))
+            }
+            // 子では親の作業ディレクトリから辿る
+            val child = m.spawn(program, m.waiter(), SpawnOptions(fds = mapOf(3 to StdioSource.Directory("b"), 4 to StdioSource.Inherit)), parent)
+            m.lock.withLockValue {
+                val handles = m.kernel.processes[child]!!.handles
+                assertEquals(VfsPath.parse("/a/b"), (m.kernel.objects[handles[3]!!.objectId] as OpenFile).path)
+                assertEquals(null, handles[4])
+            }
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+            h.tickUntil("終わったプロセスのディレクトリが表に残る") {
+                m.lock.withLockValue { (0 until m.kernel.objects.nextObjectId).none { m.kernel.objects[it] is OpenFile } }
+            }
+        }
+    }
+
+    @Test
+    fun `preopenのディレクトリがない・ディレクトリでないなら失敗し、オブジェクトを残さない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            m.mountRoot("/a")
+            m.writeFile("/a/f", byteArrayOf(1))
+            val program = h.program(emptyModule())
+            val parent = m.spawn(program, m.waiter())
+            val (size, next) = m.lock.withLockValue { m.kernel.objects.size to m.kernel.objects.nextObjectId }
+            val processes = m.processCount()
+            assertErrno(Errno.NOENT) { m.spawn(program, m.waiter(), SpawnOptions(fds = mapOf(3 to StdioSource.Directory("/none")))) }
+            assertErrno(Errno.NOTDIR) { m.spawn(program, m.waiter(), SpawnOptions(fds = mapOf(3 to StdioSource.Directory("/a/f")))) }
+            // ほかの fd が BADF で失敗したときも、先に開いたディレクトリは表に足さない
+            assertErrno(Errno.BADF) {
+                m.spawn(program, m.waiter(), SpawnOptions(fds = mapOf(3 to StdioSource.Directory("/"), 4 to StdioSource.ParentFd(9))), parent)
+            }
+            // waiter() は待つためのストリームを1つ表に足すので、その分だけ増える
+            m.lock.withLockValue {
+                assertEquals(size + 3, m.kernel.objects.size)
+                assertEquals(next + 3, m.kernel.objects.nextObjectId)
+                assertTrue((0 until m.kernel.objects.nextObjectId).none { m.kernel.objects[it] is OpenFile }, "OpenFile が残っている")
+            }
+            assertEquals(processes, m.processCount())
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `ブロッキング型の上限でspawnが失敗したら、preopenのオブジェクトを残さない`() = timeout(limit) {
+        Harness(SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(1).build()).use { h ->
+            val m = h.machine()
+            m.mountRoot("/a")
+            val program = h.program(emptyModule())
+            val running = m.waiter()
+            val stream = m.waiter()
+            m.spawn(program, running)
+            val (size, next) = m.lock.withLockValue { m.kernel.objects.size to m.kernel.objects.nextObjectId }
+            val processes = m.processCount()
+            assertThrows<ResourceLimitException> {
+                m.spawn(program, stream, SpawnOptions(fds = mapOf(3 to StdioSource.Directory("/"))))
+            }
+            m.lock.withLockValue {
+                assertEquals(size, m.kernel.objects.size)
+                assertEquals(next, m.kernel.objects.nextObjectId, "表に足していない")
+            }
+            assertEquals(processes, m.processCount())
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
         }
     }
 

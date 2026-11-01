@@ -37,6 +37,9 @@ internal class FdTable(
     /** 開いている fd の数 */
     val size: Int get() = handles.size
 
+    /** 空き番号がない（[open]・[install] が `MFILE` になる） */
+    val isFull: Boolean get() = handles.isFull
+
     /** [fd] のエントリ。開いていなければ `BADF` */
     fun entry(fd: Int): HandleEntry = handles[fd] ?: fsError(Errno.BADF, "fd $fd は開いていない")
 
