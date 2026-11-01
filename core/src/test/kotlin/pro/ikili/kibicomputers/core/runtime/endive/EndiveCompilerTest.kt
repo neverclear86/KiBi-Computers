@@ -4,6 +4,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
+import pro.ikili.kibicomputers.core.runtime.TestWasiP1
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.asyncify.Asyncify
@@ -43,14 +46,61 @@ class EndiveCompilerTest {
     }
 
     @Test
-    fun `燃料の計測をかけたlua_wasmはコンパイルし、待機点への変換もかけるとコンパイルできずインタプリタで動かす`() {
+    fun `燃料の計測と待機点への変換をかけたlua_wasmもコンパイルする`() {
         val lua = resource("lua.wasm")
         assertTrue(isCompiled(EndiveRuntime().load(FuelInjector.inject(lua).bytes)))
-        // 両方かけると luaV_execute が JVM のメソッドの上限を超え（ASM が落ちる）、例外処理を使うモジュールなので
-        // 関数ごとに混ぜず、全体をインタプリタで動かす（#37 で見つけた）
+        // exec と同じ順（挿入 → 変換）なら、luaV_execute が JVM のメソッドの上限に収まる（#341）
+        val module = EndiveRuntime().load(Instrumentation.apply(lua, WasiP1.WAIT_IMPORTS))
+        assertTrue(isCompiled(module))
+        assertTrue(module.isAsyncified && module.isFuelMetered)
+    }
+
+    @Test
+    fun `逆の順（変換 → 挿入）だとlua_wasmはコンパイルできず、モジュール全体をインタプリタで動かす`() {
+        // 変換で足した細かい if の分だけ燃料のセグメントが増え、luaV_execute が JVM のメソッドの上限を超える（ASM が落ちる）。
+        // 例外処理を使うモジュールなので、関数ごとに混ぜず全体をインタプリタにする（#37 で見つけた）
+        val lua = resource("lua.wasm")
         val module = EndiveRuntime().load(FuelInjector.inject(Asyncify.transform(lua, WasiP1.WAIT_IMPORTS).bytes).bytes)
         assertFalse(isCompiled(module))
         assertTrue(module.isAsyncified && module.isFuelMetered)
+    }
+
+    @Test
+    fun `燃料の計測と待機点への変換をかけたlua_wasmを、コンパイルしたコードで動かせる`() {
+        // コルーチン（例外処理を使う）と、止まりうる fd_write を通る。関数ごとにインタプリタと混ぜたときは 2 だけになった（#341）
+        val lua = Instrumentation.apply(resource("lua.wasm"), WasiP1.WAIT_IMPORTS)
+        val script = "local co = coroutine.wrap(function(a) local b = coroutine.yield(a + 1) return b * 2 end) print(co(1), co(5))"
+        val compiled = runLua(EndiveRuntime(compile = true), lua, script)
+        assertEquals("2\t10\n", compiled.first)
+    }
+
+    /** `lua -e <script>` を動かし、(標準出力, 使った燃料) を返す。止まりうる import で巻き戻すことはしない */
+    private fun runLua(runtime: EndiveRuntime, bytes: ByteArray, script: String): Pair<String, Long> {
+        val module = runtime.load(bytes)
+        val wasi = TestWasiP1(listOf("lua", "-e", script))
+        val initial = 1_000_000_000L
+        val config = wasi.config(module) {
+            fuel(initial, null)
+            asyncStack(
+                object : WasmAsyncStack {
+                    override fun push(value: Long) = throw AssertionError("巻き戻さないので積まない")
+
+                    override fun pop(): Long = throw AssertionError("巻き戻さないので取り出さない")
+                },
+            )
+        }
+        val used = module.instantiate(config).use { instance ->
+            val code = try {
+                instance.call("_start")
+                0
+            } catch (e: TestWasiP1.Exit) {
+                e.code
+            }
+            assertEquals(0, code, wasi.stderr.toString(Charsets.UTF_8))
+            initial - instance.fuel
+        }
+        assertTrue(used > 0)
+        return wasi.stdout.toString(Charsets.UTF_8) to used
     }
 
     @Test

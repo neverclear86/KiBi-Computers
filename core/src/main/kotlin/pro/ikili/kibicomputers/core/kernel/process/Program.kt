@@ -3,12 +3,11 @@ package pro.ikili.kibicomputers.core.kernel.process
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
-import pro.ikili.kibicomputers.core.runtime.asyncify.Asyncify
 import pro.ikili.kibicomputers.core.runtime.asyncify.AsyncifyUnsupported
-import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
@@ -53,13 +52,13 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
         }
 
         /**
-         * [bytes] に燃料の計測コードを挿入してから（[FuelInjector]、#38）[runtime] に読み込ませる。識別子は挿入した後のバイト列から作る。
+         * [bytes] に燃料の計測コードを挿入してから（`FuelInjector`、#38）[runtime] に読み込ませる。識別子は挿入した後のバイト列から作る。
          * すでに計測の名前を使っている WASM などは [WasmLoadException] で断る。重いので、メインスレッドでは呼ばない。
          *
          * [limits] があれば、挿入する前に構造の上限を確かめ、変換・挿入・パース・検証の全体で時間の上限を守る（#40）
          *
-         * [waitImports] が空でなければ、挿入の前に待機点への変換（[Asyncify]、#329）をかける。順番は
-         * 「構造の上限の確認 → 変換 → 燃料の計測コードの挿入 → パースと検証」。変換できない作り（v128 のローカル、末尾呼び出しなど）は、
+         * [waitImports] が空でなければ、挿入の後に待機点への変換（`Asyncify`、#329）をかける。順番は
+         * 「構造の上限の確認 → 燃料の計測コードの挿入 → 変換 → パースと検証」（理由は [Instrumentation]。#341）。変換できない作り（v128 のローカル、末尾呼び出しなど）は、
          * 変換せずに（`BLOCKING` のプロセスとして）読み込むことはせず、[WasmLoadException] で断る（#364・#367）。
          * そのときの原因（`cause`）は [AsyncifyUnsupported] で、どの命令・どの機能で断ったかは [unsuspendableReason] で取り出せる。
          * 予約した名前（`kibi.async_push` など）を使っている WASM も [WasmLoadException] で断る
@@ -68,15 +67,11 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
         fun loadMetered(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null, waitImports: Set<String> = emptySet()): Program {
             val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
             if (limits != null) ModulePrescan.check(bytes, limits, deadline)
-            var source = bytes
-            if (waitImports.isNotEmpty()) {
-                try {
-                    source = Asyncify.transform(bytes, waitImports) { deadline?.check("待機点への変換") }.bytes
-                } catch (e: AsyncifyUnsupported) {
-                    throw WasmLoadException("待機点に変換できない: ${e.message ?: "理由不明"}", e)
-                }
+            val injected = try {
+                Instrumentation.apply(bytes, waitImports) { stage -> deadline?.check(stage) }
+            } catch (e: AsyncifyUnsupported) {
+                throw WasmLoadException("待機点に変換できない: ${e.message ?: "理由不明"}", e)
             }
-            val injected = FuelInjector.inject(source) { deadline?.check("燃料の計測コードの挿入") }.bytes
             val module = runtime.load(injected)
             deadline?.check("パース・検証・コンパイル")
             return Program(ModuleHash.of(injected), module)

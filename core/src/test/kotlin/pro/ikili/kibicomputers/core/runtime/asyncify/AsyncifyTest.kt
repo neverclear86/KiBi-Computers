@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
@@ -16,7 +17,6 @@ import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
-import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 
 /** 読み込み時の待機点への変換（#329）と、変換したモジュールを Endive で動かす境界 */
@@ -52,7 +52,7 @@ class AsyncifyTest {
             val r = Asyncify.transform(resource(name), WasiP1.WAIT_IMPORTS)
             assertTrue(r.instrumented > 0 && r.instrumented < r.functions, "$name: ${r.instrumented} / ${r.functions}")
             assertTrue(r.sites > 0)
-            val module = EndiveRuntime().load(FuelInjector.inject(r.bytes).bytes)
+            val module = EndiveRuntime().load(Instrumentation.apply(resource(name), WasiP1.WAIT_IMPORTS))
             assertTrue(module.isAsyncified, name)
             assertTrue(module.isFuelMetered, name)
             assertTrue(module.imports.none { it.module == WasmAsync.IMPORT_MODULE }, "$name: ${module.imports}")
@@ -95,6 +95,43 @@ class AsyncifyTest {
             assertEquals(WasmAsyncState.NORMAL, instance.asyncState)
             assertEquals(2, calls)
         }
+    }
+
+    @Test
+    fun `挿入してから変換すると、巻き戻して巻き直しても燃料は巻き戻さないときと同じだけ引く`() {
+        // 燃料を引くコードは if (state == NORMAL) の中に入るので、巻き直しの間は引かない。変換が足したコードも数えない（#341）
+        val module = EndiveRuntime().load(Instrumentation.apply(waitModule(), setOf("w.wait")))
+        assertTrue(module.isAsyncified && module.isFuelMetered)
+        val initial = 1_000_000L
+        fun used(suspend: Boolean): Long {
+            val stack = Stack()
+            val config = WasmInstanceConfig.builder()
+                .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { instance, _ ->
+                    if (!suspend || instance.asyncState == WasmAsyncState.REWINDING) {
+                        instance.asyncState = WasmAsyncState.NORMAL
+                        longArrayOf(41)
+                    } else {
+                        instance.asyncState = WasmAsyncState.UNWINDING
+                        longArrayOf(0)
+                    }
+                }
+                .asyncStack(stack)
+                .fuel(initial, null)
+                .build()
+            return module.instantiate(config).use { instance ->
+                instance.call("run")
+                if (suspend) {
+                    assertEquals(WasmAsyncState.UNWINDING, instance.asyncState)
+                    instance.asyncState = WasmAsyncState.REWINDING
+                }
+                assertArrayEquals(longArrayOf(42), instance.call("run"))
+                initial - instance.fuel
+            }
+        }
+        val plain = used(false)
+        assertTrue(plain > 0)
+        // 巻き戻さないときは run を2回呼んでいるので、1回分は半分
+        assertEquals(plain / 2, used(true))
     }
 
     @Test

@@ -2,7 +2,7 @@ package pro.ikili.kibicomputers.core.runtime
 
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
-import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 
 /**
  * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
@@ -34,8 +34,8 @@ public object RuntimeSelfCheck {
     }
 
     /**
-     * 同梱の `lua.wasm`（大きいモジュール）に燃料の計測コードを挿入して読み込み、ランタイムコンパイラでコンパイルできた
-     * （インタプリタに切り替わらなかった）なら `true`（#344）。
+     * 同梱の `lua.wasm`（大きいモジュール）に、`exec` と同じく燃料の計測コードの挿入と p1 の待機点への変換をかけて読み込み、
+     * ランタイムコンパイラでコンパイルできた（インタプリタに切り替わらなかった）なら `true`（#344・#341）。
      *
      * コンパイラは実行時の ASM でクラスを作るので、ローダーが同梱する ASM の版によっては大きい関数で落ち、
      * 黙ってインタプリタに切り替わる（ログに警告が出るだけ）。それを GameTest で確かめるために使う。重い（1 秒ほど）。
@@ -48,7 +48,7 @@ public object RuntimeSelfCheck {
     public fun compilesBundledLua(): Boolean {
         val lua = checkNotNull(RuntimeSelfCheck::class.java.getResourceAsStream(LUA_RESOURCE)) { "$LUA_RESOURCE が同梱されていない" }
             .use { it.readBytes() }
-        return isCompiled(EndiveRuntime().load(FuelInjector.inject(lua).bytes))
+        return isCompiled(EndiveRuntime().load(Instrumentation.apply(lua, WasiP1.WAIT_IMPORTS)))
     }
 
     private const val LUA_RESOURCE: String = "/kibicomputers/wasm/lua.wasm"
