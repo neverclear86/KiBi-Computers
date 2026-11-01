@@ -15,7 +15,7 @@ import net.minecraft.world.level.block.state.BlockState
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
-import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.computer.MachineSpecs
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -56,8 +56,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     fun pressPowerButton(): ComputerStatus {
         val level = level as? ServerLevel ?: return computer.status
         val before = computer.machine
-        // マシンの設定は CPU・RAM から決める（#122・#123）。今は既定の値
-        val status = computer.pressPowerButton(ServerMachines.current, MachineKey.of(level, blockPos), installedForBoot, true, MachineConfig.DEFAULT)
+        // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
+        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val status = computer.pressPowerButton(ServerMachines.current, MachineKey.of(level, blockPos), installedForBoot, true, config)
         val machine = computer.machine
         if (machine == null) {
             wiring.disconnect()

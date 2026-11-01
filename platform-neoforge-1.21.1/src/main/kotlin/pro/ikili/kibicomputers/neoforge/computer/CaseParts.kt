@@ -11,6 +11,7 @@ import net.minecraft.world.item.ItemStack
 import net.neoforged.neoforge.items.ItemStackHandler
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.InstalledPartTiers
 import pro.ikili.kibicomputers.core.computer.InstalledParts
 import pro.ikili.kibicomputers.core.computer.PartKind
 
@@ -25,6 +26,9 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 class CaseParts(val tier: CaseTier, private val onChanged: Runnable = Runnable {}) : ItemStackHandler(tier.slotCount) {
     /** 部品の挿さり具合（`core` に渡す） */
     val installed: InstalledParts = InstalledParts { slot -> !getStackInSlot(slot).isEmpty }
+
+    /** 挿さっている部品のティア（`core` の [pro.ikili.kibicomputers.core.computer.MachineSpecs] に渡す）。部品のアイテムでなければ `null` */
+    val tiers: InstalledPartTiers = InstalledPartTiers { slot -> (getStackInSlot(slot).item as? ComputerPartItem)?.tier }
 
     override fun getSlotLimit(slot: Int): Int = 1
 

@@ -28,5 +28,13 @@
   "gui.kibicomputers.keyboard.title": "Keyboard",
   "gui.kibicomputers.keyboard.hint": "Typing on the keyboard - Shift+Esc to stop",
   "gui.kibicomputers.keyboard.close": "Close",
-  "gui.kibicomputers.keyboard.no_screen": "No screen is connected to this keyboard"
+  "gui.kibicomputers.keyboard.no_screen": "No screen is connected to this keyboard",
+  "item.kibicomputers.creative_cpu": "Creative CPU",
+  "item.kibicomputers.creative_memory": "Creative RAM",
+  "item.kibicomputers.creative_storage": "Creative Disk",
+  "item.kibicomputers.creative_boot": "Creative Boot ROM",
+  "item.kibicomputers.creative_case": "Creative Computer Case (All Parts)",
+  "tooltip.kibicomputers.part.cpu": "Fuel per tick: %s",
+  "tooltip.kibicomputers.part.memory": "Capacity: %s MiB",
+  "tooltip.kibicomputers.part.creative": "For testing (creative only)"
 }
