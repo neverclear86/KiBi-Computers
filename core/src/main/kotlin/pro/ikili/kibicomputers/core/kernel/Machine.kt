@@ -25,6 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRunner
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.Shebang
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
@@ -482,6 +483,10 @@ public class Machine private constructor(
      * - 読み込む前に構造の上限（関数・ローカル変数・テーブルの要素の数など）を確かめ、挿入・パース・検証に時間の上限を設ける
      *   （#40。[pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits]）。超えたら `NOEXEC`。import の確認はドライバー（[drivers]）がする
      * - `options.args` が空なら、argv を [path] の文字列1つにする
+     * - 先頭が `#!` のファイル（シバン付きのスクリプト。#93）は、その行のインタプリタを代わりに読み込む（解釈は [Shebang]）。
+     *   argv は `[インタプリタ, (シバンの引数), スクリプトの絶対パス, 元の argv[1..]]` にする（Linux と同じ並び。
+     *   スクリプトのパスは、WASI に作業ディレクトリがないので絶対パスで渡す）。インタプリタのパスの相対パスも親の作業ディレクトリから辿る。
+     *   インタプリタもシバン付きならさらにたどり、[Shebang.MAX_DEPTH] 回を超えたら `LOOP`。拡張子は見ない
      * - ファイルを読むのはカーネルロックの中、WASM の読み込み（挿入・パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
@@ -495,17 +500,51 @@ public class Machine private constructor(
         asInit: Boolean = false,
     ): Int {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
-        val bytes = lock.withLockValue { readExecutableLocked(path, parentLocked(parentPid)) }
+        val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
         val program = try {
             val runtime = scheduler.options.runtime
             val limits = scheduler.options.moduleLimits
+            val bytes = executable.bytes
             if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes, limits) else Program.load(runtime, bytes, limits)
         } catch (e: WasmLoadException) {
-            fsError(Errno.NOEXEC, "$path は WASM として読めない: ${e.message}")
+            fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
         }
         val driver = drivers.create(program)
-        val argv = options.args.ifEmpty { listOf(path) }
-        return spawn(program, driver, options.copy(args = argv), parentPid, asInit)
+        return spawn(program, driver, options.copy(args = executable.args), parentPid, asInit)
+    }
+
+    /** 読み込む WASM（[path] はそのファイル。シバンをたどった後ならインタプリタ）と、プロセスに渡す argv */
+    private class Executable(val path: VfsPath, val bytes: ByteArray, val args: List<String>)
+
+    /** 実行ファイルの中身。WASM（ほかの形も、読み込むときに断る）か、シバン付きのスクリプト */
+    private sealed interface ExecutableContent {
+        class Binary(val bytes: ByteArray) : ExecutableContent
+
+        class Script(val line: Shebang.Line) : ExecutableContent
+    }
+
+    /** [text] を読み、シバンがあればインタプリタへたどる（カーネルロックの中。#93） */
+    private fun loadExecutableLocked(text: String, args: List<String>, parent: Process?): Executable {
+        val base = parent?.cwd ?: VfsPath.ROOT
+        var target = text
+        var argv = args
+        repeat(Shebang.MAX_DEPTH + 1) {
+            val path = VfsPath.resolve(base, target)
+            when (val content = readExecutableLocked(path, VfsPath.hasTrailingSlash(target))) {
+                is ExecutableContent.Binary -> return Executable(path, content.bytes, argv)
+                is ExecutableContent.Script -> {
+                    val line = content.line
+                    argv = buildList {
+                        add(line.interpreter)
+                        line.arg?.let { add(it) }
+                        add(path.toString())
+                        addAll(argv.drop(1))
+                    }
+                    target = line.interpreter
+                }
+            }
+        }
+        fsError(Errno.LOOP, "$text のシバンをたどる回数が上限（${Shebang.MAX_DEPTH}）を超えた")
     }
 
     /** [pid] の子の pid（ゾンビを含む。割り当ての順） */
@@ -528,22 +567,36 @@ public class Machine private constructor(
         return path
     }
 
-    /** 実行ファイルの中身を読む（カーネルロックの中） */
-    private fun readExecutableLocked(text: String, parent: Process?): ByteArray {
-        val path = VfsPath.resolve(parent?.cwd ?: VfsPath.ROOT, text)
+    /**
+     * 実行ファイル [path] の中身を読む（カーネルロックの中）。先頭が `#!` なら、シバンの行だけを読んで [ExecutableContent.Script] を返す
+     * （スクリプトには [MachineLimits.MAX_EXECUTABLE_BYTES] の上限をかけない）
+     */
+    private fun readExecutableLocked(path: VfsPath, trailingSlash: Boolean): ExecutableContent {
         val stat = vfs.stat(path)
         if (stat.type != FileType.REGULAR_FILE) fsError(Errno.ACCES, "$path は普通のファイルではない")
-        if (stat.size > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
-        val file = vfs.open(path, OpenOptions(read = true), VfsPath.hasTrailingSlash(text))
-        val out = ByteArrayOutputStream(stat.size.toInt())
-        val buf = ByteArray(64 * 1024)
-        while (true) {
-            val n = vfs.read(file, buf, 0, buf.size)
+        val file = vfs.open(path, OpenOptions(read = true), trailingSlash)
+        // 先頭（シバンの行の上限まで）を読んで、スクリプトか見分ける
+        val head = ByteArray(Shebang.MAX_LINE_BYTES)
+        var headLength = 0
+        while (headLength < head.size) {
+            val n = vfs.read(file, head, headLength, head.size - headLength)
             if (n <= 0) break
-            out.write(buf, 0, n)
-            if (out.size() > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
+            headLength += n
         }
-        return out.toByteArray()
+        Shebang.parse(head, headLength)?.let { return ExecutableContent.Script(it) }
+        if (stat.size > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
+        val out = ByteArrayOutputStream(maxOf(stat.size.toInt(), headLength))
+        out.write(head, 0, headLength)
+        if (headLength == head.size) {
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = vfs.read(file, buf, 0, buf.size)
+                if (n <= 0) break
+                out.write(buf, 0, n)
+                if (out.size() > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
+            }
+        }
+        return ExecutableContent.Binary(out.toByteArray())
     }
 
     /** 割り当てる fd 1つ。表にあるオブジェクト（[Existing]）か、まだ表に足していないもの（[NewObject]） */
