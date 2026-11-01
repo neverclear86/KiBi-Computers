@@ -29,6 +29,9 @@ import java.util.concurrent.atomic.AtomicLong
  *   待ち行列が FIFO でも、何を読み込むかは取り出すときに巡回で決まる
  * - 持ち主ごとに、読み込み中・待ち行列にある読み込みの数を [maxPendingPerOwner] までにする。超えたら [ProgramLoadBusyException]
  *   の失敗をすぐに返す（`Machine.exec` は `AGAIN` にする）。数えるのは自分が始めた読み込みだけで、ほかの台の読み込みに相乗りしたものは数えない
+ * - 読み込みの持ち主が待つのをやめたら（その持ち主の future がすべて取り消されたら）、持ち主の数から外す（#383）。
+ *   始まる前で、相乗りした台が残っていれば、残った台のうち最も早く頼んだ台を新しい持ち主にし、その台の列の末尾に移して
+ *   その台の数に入れる（その台の数が一時的に上限を超えることもある）。始まっていれば持ち主のない読み込みとして最後まで読み込む
  * - [load] が返す future は呼び出しごとに別のもの。待つのをやめたら `cancel` する。待つ側がすべていなくなった読み込みは、
  *   始まる前なら待ち行列から外して読み込まない（始まっていれば最後まで読み込み、結果は共有する）
  * - 読み込みが [WasmLoadException] で失敗したら、そのキーを [failureTtlNanos] の間（最大 [maxFailures] 個）覚え、
@@ -72,13 +75,22 @@ internal class ProgramCache(
     private class Ref(val key: Key, program: Program, queue: ReferenceQueue<Program>) : WeakReference<Program>(program, queue)
 
     /** 読み込み1つ（待ち行列にあるか、読み込み中） */
-    private class Job(val key: Key, val owner: Long, val bytes: ByteArray, val loader: (ByteArray) -> Program) {
-        /** 待つ側に返した future（呼び出しごと） */
-        val waiters = ArrayList<CompletableFuture<Program>>(1)
+    private class Job(val key: Key, owner: Long, val bytes: ByteArray, val loader: (ByteArray) -> Program) {
+        /**
+         * 数に入れている持ち主（始まっていなければ、この持ち主の列にある）。持ち主が待つのをやめて、始まった後なら `null`
+         * （どの持ち主の数にも入れない。#383）
+         */
+        var owner: Long? = owner
+
+        /** 待つ側に返した future（呼び出しごと。頼んだ順）と、頼んだ持ち主 */
+        val waiters = ArrayList<Waiter>(1)
 
         /** 読み込みを始めた */
         var started = false
     }
+
+    /** 待つ側1つ */
+    private class Waiter(val ticket: CompletableFuture<Program>, val owner: Long)
 
     /** 覚えている失敗 */
     private class Failure(val cause: Throwable, val expiresAt: Long)
@@ -144,7 +156,7 @@ internal class ProgramCache(
             val existing = loading[key]
             if (existing != null) {
                 // 相乗りする（持ち主の数には数えない）
-                existing.waiters += ticket
+                existing.waiters += Waiter(ticket, owner)
                 job = existing
             } else {
                 if (closed) return CompletableFuture.failedFuture(closedException(null))
@@ -153,12 +165,10 @@ internal class ProgramCache(
                     return CompletableFuture.failedFuture(ProgramLoadBusyException("読み込みを待つ実行ファイルが多すぎる（上限 $maxPendingPerOwner）"))
                 }
                 job = Job(key, owner, bytes, loader)
-                job.waiters += ticket
+                job.waiters += Waiter(ticket, owner)
                 loading[key] = job
                 pendingByOwner[owner] = pending + 1
-                val ownerQueue = queues.getOrPut(owner) { ArrayDeque() }
-                if (ownerQueue.isEmpty()) ring.addLast(owner)
-                ownerQueue.addLast(job)
+                enqueueLocked(owner, job)
                 created = true
             }
         }
@@ -170,7 +180,7 @@ internal class ProgramCache(
             val waiters = synchronized(lock) {
                 if (job.started || loading[key] !== job) return ticket
                 dropLocked(job)
-                job.waiters.toList()
+                job.waiters.map { it.ticket }
             }
             val failure = closedException(e)
             for (waiter in waiters) waiter.completeExceptionally(failure)
@@ -178,23 +188,58 @@ internal class ProgramCache(
         return ticket
     }
 
-    /** 待つ側が1つ減った。誰も待たず、まだ始まっていなければ、待ち行列から外す */
+    /**
+     * 待つ側が1つ減った。誰も待たず、まだ始まっていなければ、待ち行列から外す。
+     * 持ち主が待たなくなったら、持ち主の数から外し、始まっていなければ残った台に移す（#383）
+     */
     private fun onCancelled(job: Job, ticket: CompletableFuture<Program>) {
         synchronized(lock) {
-            job.waiters.remove(ticket)
-            if (job.waiters.isEmpty() && !job.started && loading[job.key] === job) dropLocked(job)
+            job.waiters.removeAll { it.ticket === ticket }
+            // 終わった・close() で外れたものは、もう数に入っていない
+            if (loading[job.key] !== job) return
+            if (job.waiters.isEmpty() && !job.started) {
+                dropLocked(job)
+                return
+            }
+            val owner = job.owner ?: return
+            if (job.waiters.any { it.owner == owner }) return
+            releaseOwnerLocked(owner)
+            if (job.started) {
+                job.owner = null
+            } else {
+                dequeueLocked(owner, job)
+                // 残った台のうち、最も早く頼んだ台に移す
+                val next = job.waiters.first().owner
+                job.owner = next
+                pendingByOwner[next] = (pendingByOwner[next] ?: 0) + 1
+                enqueueLocked(next, job)
+            }
         }
     }
 
     /** 始まっていない [job] を、待ち行列と数から外す */
     private fun dropLocked(job: Job) {
         loading.remove(job.key)
-        releaseOwnerLocked(job.owner)
-        val ownerQueue = queues[job.owner] ?: return
+        val owner = job.owner ?: return
+        job.owner = null
+        releaseOwnerLocked(owner)
+        dequeueLocked(owner, job)
+    }
+
+    /** [owner] の列の末尾に [job] を入れる（列が空なら巡回にも入れる） */
+    private fun enqueueLocked(owner: Long, job: Job) {
+        val ownerQueue = queues.getOrPut(owner) { ArrayDeque() }
+        if (ownerQueue.isEmpty()) ring.addLast(owner)
+        ownerQueue.addLast(job)
+    }
+
+    /** [owner] の列から [job] を外す（列が空になれば巡回からも外す） */
+    private fun dequeueLocked(owner: Long, job: Job) {
+        val ownerQueue = queues[owner] ?: return
         ownerQueue.remove(job)
         if (ownerQueue.isEmpty()) {
-            queues.remove(job.owner)
-            ring.remove(job.owner)
+            queues.remove(owner)
+            ring.remove(owner)
         }
     }
 
@@ -226,7 +271,8 @@ internal class ProgramCache(
             // close() が先に外して失敗させていれば、結果は覚えない
             if (loading[job.key] === job) {
                 loading.remove(job.key)
-                releaseOwnerLocked(job.owner)
+                job.owner?.let { releaseOwnerLocked(it) }
+                job.owner = null
             }
             if (!closed) {
                 result.fold(
@@ -237,7 +283,7 @@ internal class ProgramCache(
                     { e -> if (e is WasmLoadException) rememberFailureLocked(job.key, e) },
                 )
             }
-            job.waiters.toList()
+            job.waiters.map { it.ticket }
         }
         result.fold({ p -> waiters.forEach { it.complete(p) } }, { e -> waiters.forEach { it.completeExceptionally(e) } })
         // 読み込みの失敗が VM のエラーなら、このスレッドでも投げる（握りつぶさない）
@@ -272,7 +318,7 @@ internal class ProgramCache(
         val pending: List<CompletableFuture<Program>>
         synchronized(lock) {
             closed = true
-            pending = loading.values.flatMap { it.waiters }
+            pending = loading.values.flatMap { job -> job.waiters.map { it.ticket } }
             loading.clear()
             queues.clear()
             ring.clear()
@@ -285,6 +331,9 @@ internal class ProgramCache(
 
     /** 読み込み中・待ち行列にある数（テスト用） */
     val loadingCount: Int get() = synchronized(lock) { loading.size }
+
+    /** [owner] の数に入っている、読み込み中・待ち行列にある読み込みの数（テスト用） */
+    fun pendingOf(owner: Long): Int = synchronized(lock) { pendingByOwner[owner] ?: 0 }
 
     private fun closedException(cause: Throwable?) = IllegalStateException("WASM を読み込むスレッドが止まっている", cause)
 

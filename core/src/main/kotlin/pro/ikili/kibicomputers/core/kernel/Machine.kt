@@ -560,6 +560,7 @@ public class Machine private constructor(
      * - 読み込みの待ち行列はマシンごとに分けて巡回する（#363）。このマシンの読み込み中・待ち行列にある読み込みが上限
      *   （[pro.ikili.kibicomputers.core.kernel.process.ProgramCache.DEFAULT_MAX_PENDING_PER_OWNER]）に達していたら `AGAIN`。
      *   待つのをやめたら（止められた・起動の取り消し）、ほかに待つ側がなく、まだ始まっていない読み込みは取り消す。
+     *   ほかの台が相乗りしていても、このマシンの数からは外す（#383。始まっていない読み込みは相乗りした台の数に移る）。
      *   最近 WASM として読めなかったものは、読み込み直さずに `NOEXEC`
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
