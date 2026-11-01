@@ -307,4 +307,51 @@ class TimerWaitTest {
             assertEquals(0, mh.timers.pending)
         }
     }
+
+    @Test
+    fun `一時的なタイマーの口は、作る・設定し直す・閉じるができ、上限なら何も残さない`() = timeout(limit) {
+        manual { mh ->
+            val m = mh.machine()
+            fun timerObjects(): Int {
+                var n = 0
+                m.lock.withLockValue { m.kernel.objects.forEachObject { if (it is Timer) n++ } }
+                return n
+            }
+            val failure = AtomicReference<Throwable>()
+            val driver = TestDriver(ProcessKind.WAIT_POINT) { ctx ->
+                try {
+                    val key = ctx.openWaitTimer(ctx.monotonicNanos() + 100 * ms)
+                    assertEquals(1, m.lock.withLockValue { m.timers.scheduledCount })
+                    ctx.resetWaitTimer(key, ctx.monotonicNanos() + 50 * ms)
+                    assertEquals(1, m.lock.withLockValue { m.timers.scheduledCount }, "設定し直しは数えない")
+                    mh.timers.advance(50 * ms)
+                    assertTrue(ctx.withKernelLock { ctx.kernel.objects[key.objectId]!!.isReady(key.condition) })
+                    // 鳴った後に設定し直すと、回数は 0 に戻る
+                    ctx.resetWaitTimer(key, ctx.monotonicNanos() + 50 * ms)
+                    assertFalse(ctx.withKernelLock { ctx.kernel.objects[key.objectId]!!.isReady(key.condition) })
+                    ctx.closeWaitTimer(key)
+                    ctx.closeWaitTimer(key)
+                    assertEquals(0, m.lock.withLockValue { m.timers.scheduledCount })
+                    assertEquals(0, timerObjects())
+                    // ハンドル表のタイマーは、一時的なタイマーとしては扱えない
+                    val handle = ctx.createTimer()
+                    assertThrows<IllegalArgumentException> { ctx.resetWaitTimer(ctx.timerWaitKey(handle), 0) }
+                    ctx.closeWaitTimer(ctx.timerWaitKey(handle))
+                    assertEquals(1, timerObjects(), "ハンドル表のタイマーは閉じない")
+                    repeat(TimerLimits.MAX_ARMED_TIMERS) { ctx.setTimer(ctx.createTimer(), 1_000 * ms) }
+                    val before = timerObjects()
+                    assertThrows<ResourceLimitException> { ctx.openWaitTimer(ctx.monotonicNanos() + 100 * ms) }
+                    assertEquals(before, timerObjects(), "上限のときは何も残さない")
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+                StepResult.Exit(0)
+            }
+            val pid = m.spawnTest(mh.h.program(emptyModule()), driver)
+            mh.h.tickUntilTrue { m.stateOf(pid).isTerminal }
+            failure.get()?.let { throw it }
+            assertEquals(0, m.exited(pid))
+            assertEquals(0, mh.timers.pending)
+        }
+    }
 }

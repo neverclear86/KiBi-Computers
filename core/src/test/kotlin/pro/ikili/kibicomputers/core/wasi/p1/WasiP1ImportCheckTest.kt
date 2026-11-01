@@ -48,10 +48,11 @@ class WasiP1ImportCheckTest {
 
     @Test
     fun `p1の関数だけをimportするモジュールは通る`() {
-        // poll_oneoff はまだ実装していない（NOSYS の仮の関数をつなぐ）が、仕様にある名前なので通す
+        // sock_accept はまだ実装していない（NOSYS の仮の関数をつなぐ）が、仕様にある名前なので通す
+        val sockAccept = Triple(P1.MODULE, "sock_accept", listOf(I32, I32, I32) to listOf(I32))
         val pollOneoff = Triple(P1.MODULE, "poll_oneoff", listOf(I32, I32, I32, I32) to listOf(I32))
         val pathOpen = Triple(P1.MODULE, "path_open", listOf(I32, I32, I32, I32, I32, 0x7e, 0x7e, I32, I32) to listOf(I32))
-        assertDoesNotThrow { WasiP1.checkImports(load(command(fdWrite, pollOneoff, pathOpen))) }
+        assertDoesNotThrow { WasiP1.checkImports(load(command(fdWrite, pollOneoff, pathOpen, sockAccept))) }
         assertDoesNotThrow { WasiP1.checkImports(load(command())) }
     }
 
@@ -68,6 +69,8 @@ class WasiP1ImportCheckTest {
     @Test
     fun `型の違う実装済みの関数は断る`() {
         assertNoexec(load(command(Triple(P1.MODULE, "fd_write", listOf(I32) to listOf(I32)))), "型が違う")
+        // poll_oneoff は #72 で実装したので、型も確かめる
+        assertNoexec(load(command(Triple(P1.MODULE, "poll_oneoff", listOf(I32, I32, I32) to listOf(I32)))), "poll_oneoff")
     }
 
     @Test

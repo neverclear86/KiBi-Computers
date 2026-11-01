@@ -24,8 +24,8 @@ internal class WasiP1Basic(private val ctx: ProcessContext) {
     /** 環境変数を `名前=値` の UTF-8 にしたもの（作った後は変わらない） */
     private val envBytes: List<ByteArray> by lazy { ctx.env.map { (k, v) -> "$k=$v".toByteArray(Charsets.UTF_8) } }
 
-    /** `PROCESS_CPUTIME`・`THREAD_CPUTIME` の起点（マシンの単調時計） */
-    private val startNanos: Long = guestMonotonicNanos()
+    /** `PROCESS_CPUTIME`・`THREAD_CPUTIME` の起点（マシンの単調時計）。`poll_oneoff` の絶対時刻の写しにも使う（[WasiP1Poll]） */
+    internal val startNanos: Long = guestMonotonicNanos()
 
     // ---- 引数・環境変数 ----
 

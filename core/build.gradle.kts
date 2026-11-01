@@ -89,6 +89,11 @@ kibiWasm {
         sources.from("src/test/wasm/basic_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // WASI p1 の poll_oneoff（poll・nanosleep・clock_nanosleep）を確かめるプログラム（#72）
+    module("poll-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/poll_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

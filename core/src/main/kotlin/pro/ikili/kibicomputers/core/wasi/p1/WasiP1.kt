@@ -19,8 +19,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 /**
  * WASI p1（`wasi_snapshot_preview1`）の層（ADR 0261 の A）。カーネルの土台の上に、p1 のホスト関数を並べる。
  *
- * 今あるのは `fd_*`（#70）、`path_*`（#71。[WasiP1Path]）と、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）。
- * `poll_oneoff` は #72 で足す。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
+ * 今あるのは `fd_*`（#70）、`path_*`（#71。[WasiP1Path]）、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）と、
+ * `poll_oneoff`（#72。[WasiP1Poll]）。`sock_*` はまだない。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
  * まだない関数をモジュールが import していれば、`NOSYS` を返す仮の関数をつなぐ（リンクが通るように）。
  */
 internal object WasiP1 {
@@ -30,7 +30,7 @@ internal object WasiP1 {
     private fun type(vararg params: WasmValueType): WasmFunctionType = WasmFunctionType.of(params.toList(), listOf(I32))
 
     /** プロセスごとの実装 */
-    private class Impl(val fd: WasiP1Fd, val path: WasiP1Path, val basic: WasiP1Basic)
+    private class Impl(val fd: WasiP1Fd, val path: WasiP1Path, val basic: WasiP1Basic, val poll: WasiP1Poll)
 
     /** 関数1つ: 名前、型、本体（p1 の errno を返す） */
     private class Fn(val name: String, val type: WasmFunctionType, val body: (Impl, WasmMemory, LongArray) -> Int)
@@ -51,6 +51,7 @@ internal object WasiP1 {
         Fn("clock_time_get", type(I32, I64, I32)) { f, m, a -> f.basic.clockTimeGet(m, a[0].i(), a[2].i()) },
         Fn("random_get", type(I32, I32)) { f, m, a -> f.basic.randomGet(m, a[0].i(), a[1].i()) },
         Fn("sched_yield", type()) { f, _, _ -> f.basic.schedYield() },
+        Fn("poll_oneoff", type(I32, I32, I32, I32)) { f, m, a -> f.poll.pollOneoff(m, a[0].i(), a[1].i(), a[2].i(), a[3].i()) },
         Fn("fd_advise", type(I32, I64, I64, I32)) { f, _, a -> f.fd.advise(a[0].i(), a[1], a[2], a[3].i()) },
         Fn("fd_allocate", type(I32, I64, I64)) { f, _, a -> f.fd.allocate(a[0].i(), a[1], a[2]) },
         Fn("fd_close", type(I32)) { f, _, a -> f.fd.close(a[0].i()) },
@@ -141,10 +142,11 @@ internal object WasiP1 {
     /**
      * p1 のホスト関数を [builder] に登録する（`ProcessDriver.configure` の中から）。
      * [module] を渡すと、それが import する p1 の関数のうち、まだ実装していないものに `NOSYS` を返す仮の関数をつなぐ。
-     * [blocking] は、ストリームの読み書きで待つか（`BLOCKING` のプロセス）
+     * [blocking] は、ストリームの読み書きと `poll_oneoff` で待つか（`BLOCKING` のプロセス）
      */
     fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, blocking: Boolean) {
-        val impl = Impl(WasiP1Fd(ctx, blocking), WasiP1Path(ctx), WasiP1Basic(ctx))
+        val basic = WasiP1Basic(ctx)
+        val impl = Impl(WasiP1Fd(ctx, blocking), WasiP1Path(ctx), basic, WasiP1Poll(ctx, basic, blocking))
         for (fn in FUNCTIONS) {
             builder.hostFunction(
                 P1.MODULE,

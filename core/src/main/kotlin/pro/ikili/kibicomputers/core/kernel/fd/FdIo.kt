@@ -31,6 +31,18 @@ internal sealed interface IoResult {
     data class Error(val errno: Errno) : IoResult
 }
 
+/** fd の待ちの判定（[FdIo.pollLocked] の結果） */
+internal sealed interface FdReadiness {
+    /** そろっている。[nbytes] は読める・書けるバイト数の目安（バイトでないものは 1）、[hangup] はパイプの相手側が閉じた */
+    data class Ready(val nbytes: Long, val hangup: Boolean = false) : FdReadiness
+
+    /** まだ。[key] がそろったら判定し直す */
+    data class Pending(val key: WaitKey) : FdReadiness
+
+    /** 待てない（開いていない・権利がない fd は `BADF`、その条件を待てない種類は `INVAL`） */
+    data class Error(val errno: Errno) : FdReadiness
+}
+
 /**
  * fd を通した読み書き。fd が指すオブジェクトの種類（`ByteStream`、`Tty`、`OpenFile`）で振り分ける。ABI 層（p1 の `fd_read`・`fd_write`、
  * p2 の stream）はこれを使い、[IoResult] を自分の ABI の値に直す。
@@ -64,6 +76,53 @@ internal object FdIo {
             val r = write(ctx, fd, src, off, len)
             if (r !is IoResult.WouldBlock) return r
             ctx.block(listOf(r.key))
+        }
+    }
+
+    /**
+     * カーネルロックの中で、プロセス [pid] の fd [fd] が [condition]（`READABLE` か `WRITABLE`）でそろっているか判定する（#72、ADR 0072）。
+     * 何も取り出さない（キューのイベントもタイマーの回数も残る）。p1 の `poll_oneoff`、p2 の `pollable`、p3 の waitable-set が使う。
+     *
+     * - fd が開いていない、fd にその権利（[HandleRights]）がない: `BADF`
+     * - パイプ（[ByteStream]）: 読みは読めるバイト（`nbytes`）、書きは空き。相手側が閉じていれば `hangup`
+     * - コンソール（[Tty]）: 読みは今読めるバイト、書きは出力の空き
+     * - ファイル・ディレクトリ（[OpenFile]）: 常にそろう（POSIX の `poll` と同じ）。ファイルの読みは残りのバイト、ほかは 0
+     * - そのほかの待てる種類（イベントキュー、タイマー）: [pro.ikili.kibicomputers.core.kernel.obj.KernelObject.isReady] で、`nbytes` は 1
+     * - その条件を待てない種類: `INVAL`
+     */
+    fun pollLocked(kernel: KernelState, vfs: Vfs, pid: Int, fd: Int, condition: WaitCondition): FdReadiness {
+        require(condition == WaitCondition.READABLE || condition == WaitCondition.WRITABLE) { "fd で待てる条件ではない: $condition" }
+        val reading = condition == WaitCondition.READABLE
+        val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
+        // 判定は状態を変えないので、知らせ口は使わない
+        val table = FdTable(process, kernel.objects, WakeSink.NONE)
+        return try {
+            val entry = table.entry(fd)
+            if (entry.rights and (if (reading) HandleRights.READ else HandleRights.WRITE) == 0) return FdReadiness.Error(Errno.BADF)
+            when (val obj = table.objectOf(fd)) {
+                is ByteStream -> when {
+                    !obj.isReady(condition) -> FdReadiness.Pending(WaitKey(obj.id, condition))
+                    reading -> FdReadiness.Ready(obj.available.toLong(), hangup = obj.writeClosed)
+                    obj.readClosed -> FdReadiness.Ready(0, hangup = true)
+                    else -> FdReadiness.Ready((obj.capacity - obj.available).toLong())
+                }
+                is Tty -> when {
+                    !obj.isReady(condition) -> FdReadiness.Pending(WaitKey(obj.id, condition))
+                    reading -> FdReadiness.Ready(obj.inputAvailable.toLong())
+                    else -> FdReadiness.Ready(obj.outputFree.toLong())
+                }
+                is OpenFile -> when {
+                    obj.isDirectory || !reading -> FdReadiness.Ready(0)
+                    else -> FdReadiness.Ready(maxOf(0L, vfs.stat(obj).size - obj.position))
+                }
+                else -> when {
+                    !obj.canWait(condition) -> FdReadiness.Error(Errno.INVAL)
+                    obj.isReady(condition) -> FdReadiness.Ready(1)
+                    else -> FdReadiness.Pending(WaitKey(obj.id, condition))
+                }
+            }
+        } catch (e: FsException) {
+            FdReadiness.Error(e.errno)
         }
     }
 
