@@ -234,7 +234,14 @@ class BootTest {
             val consoleAt = host.log.indexOfFirst { it.startsWith("console:") }
             val failedAt = host.log.indexOf("bootFailed:$failure")
             assertTrue(consoleAt in 0 until failedAt, "コンソール → onBootFailed の順: ${host.log}")
-            assertTrue(host.console.endsWith("$message\n"), "$config: ${host.console}")
+            assertTrue(host.console.contains("$message\n"), "$config: ${host.console}")
+            if (failure == BootFailure.INIT_NOT_EXECUTABLE) {
+                // 実行できない理由を次の行に出す（#367）
+                val last = host.console.toString().trimEnd('\n').substringAfterLast('\n')
+                assertTrue(last.startsWith("kibi: ") && last != message, "$config: ${host.console}")
+            } else {
+                assertTrue(host.console.endsWith("$message\n"), "$config: ${host.console}")
+            }
             assertEquals(MachineState.STOPPED, m.state)
             assertEquals(emptyList<String>(), host.states(), "$config: 状態は変わらない")
             assertEquals(emptyList<Pair<String, String>>(), mounts(), "$config: マウントを残さない")

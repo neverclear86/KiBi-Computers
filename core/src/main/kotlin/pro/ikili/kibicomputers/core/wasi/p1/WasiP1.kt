@@ -224,7 +224,7 @@ internal object WasiP1 {
  *
  * 読み込み時に待機点への変換（#329）をかけたモジュール（[WasmModule.isAsyncified]）は `WAIT_POINT` で動かす。
  * 止まりうる import の中で巻き戻すと `_start` から戻るので、状態が巻き戻し中なら `NORMAL` に戻して `StepResult.Wait` にする。
- * 起こされたら、状態を巻き直し中にして `_start` を呼び直す。変換を断ったモジュールは `BLOCKING` で動かす。
+ * 起こされたら、状態を巻き直し中にして `_start` を呼び直す。変換をかけずに読み込んだモジュール（テストの設定。変換できない作りは `Machine.exec` が断る）は `BLOCKING` で動かす。
  *
  * `_start` から（巻き戻しでなく）戻ったら終了コード 0。`proc_exit(rval)` が呼ばれたら、そこで抜けて終了コード `rval`
  * （wasi-libc は `main` が 0 以外を返したときと `exit()` で呼ぶ）。

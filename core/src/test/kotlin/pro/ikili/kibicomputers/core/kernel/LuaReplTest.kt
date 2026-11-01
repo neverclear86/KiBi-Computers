@@ -1,7 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
@@ -172,7 +171,7 @@ class LuaReplTest {
             assertEquals(0, h.scheduler.blockingProcesses)
             assertTrue(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncStack!!.size } > 0)
             assertTrue(m.isAtWaitPoint)
-            assertNull(m.rt(pid).program.asyncRejection)
+            assertTrue(m.rt(pid).program.module.isAsyncified)
         }
         val (blocking, blockingCode, blockingKind) = runRepl(false, inputs)
         assertEquals(ProcessKind.WAIT_POINT, asyncKind)
