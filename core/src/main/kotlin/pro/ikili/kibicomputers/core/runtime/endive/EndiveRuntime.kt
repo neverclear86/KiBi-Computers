@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
@@ -30,6 +31,7 @@ import run.endive.runtime.GlobalInstance
 import run.endive.runtime.HostFunction
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
+import run.endive.runtime.TableInstance
 import run.endive.runtime.TrapException
 import run.endive.runtime.WasmInterruptedException
 import run.endive.wasm.InvalidException
@@ -42,6 +44,8 @@ import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
 import run.endive.wasm.types.MemoryLimits
+import run.endive.wasm.types.Table
+import run.endive.wasm.types.TableLimits
 import run.endive.wasm.types.ValType
 import run.endive.runtime.Memory as EndiveMemory
 import run.endive.runtime.WasmException as EndiveWasmException
@@ -59,6 +63,9 @@ import run.endive.wasm.WasmModule as EndiveModule
  * [WasmInstanceConfig.memoryBudget] があれば `grow` を数える包み（[BudgetedMemory]）をかぶせて守る。
  * 共有しないメモリは、書き込んだページだけ JVM のメモリを確保する（[LazyMemory]、#334）。
  * 上限と RAM は宣言したページ数（最初のページ数と `grow` の合計）で数え、確保したページ数では数えない。
+ *
+ * テーブル（#361）も同じように、作るときに要素数の上限を縮め（[WasmInstanceConfig.maxTableElements]）、
+ * [WasmInstanceConfig.tableBudget] があれば、要素数 × 要素1つのバイト数を数える（[BudgetedTable]）。
  */
 public class EndiveRuntime internal constructor(
     /** `false` ならコンパイルせずインタプリタで動かす（テストで、インタプリタとの結果を比べるため） */
@@ -171,7 +178,7 @@ public class EndiveRuntime internal constructor(
     }
 }
 
-/** メモリの上限のせいでメモリを作れない。Endive の中を通す間だけ使い、[WasmLinkException] にして投げ直す。 */
+/** メモリ・テーブルの上限のせいで作れない（#39・#361）。Endive の中を通す間だけ使い、[WasmLinkException] にして投げ直す。 */
 private class MemoryLimitFailure(message: String) : RuntimeException(message, null, false, false)
 
 /**
@@ -211,6 +218,91 @@ private class BudgetedMemory(
         if (reserved > 0) budget.release(reserved)
         reserved = -1
     }
+}
+
+/**
+ * 要素数の上限を縮め、確保を [budget] で数える Endive のテーブル（#361）。
+ *
+ * Endive のテーブルは `table.grow` のたびに配列を丸ごと確保し直すので、増やす前に上限と [budget] を確かめ、
+ * 断られたら Endive に渡さずに -1 を返す（失敗した grow は数えない。#335 と同じ）。
+ * [reserved] は [budget] から確保したバイト数。インスタンスを閉じたときに [releaseAll] で返す。
+ */
+private class BudgetedTable(
+    table: Table,
+    initValue: Int,
+    private val budget: WasmTableBudget?,
+    private val elementBytes: Long,
+    private var reserved: Long,
+) : TableInstance(table, initValue) {
+    override fun grow(size: Int, value: Int, instance: Instance?): Int = counted(size) { super.grow(size, value, instance) }
+
+    override fun growWithRef(size: Int, refValue: Any?, instance: Instance?): Int = counted(size) { super.growWithRef(size, refValue, instance) }
+
+    @Synchronized
+    private fun counted(size: Int, grow: () -> Int): Int {
+        // 0 は今の大きさを返すだけ。負（符号なしで 2^31 以上）は Endive が -1 を返す
+        if (size <= 0) return grow()
+        if (size().toLong() + size > limits().max()) return -1
+        val bytes = size * elementBytes
+        val counting = budget != null && reserved >= 0
+        if (counting && !budget!!.tryReserveBytes(bytes)) return -1
+        val previous = try {
+            grow()
+        } catch (t: Throwable) {
+            if (counting) budget!!.releaseBytes(bytes)
+            throw t
+        }
+        if (!counting) return previous
+        if (previous < 0) {
+            budget!!.releaseBytes(bytes)
+            return -1
+        }
+        reserved += bytes
+        return previous
+    }
+
+    /** 確保した分をすべて返す。以後 `grow` は数えない（閉じたインスタンスのテーブル）。2回呼んでもよい */
+    @Synchronized
+    fun releaseAll() {
+        if (reserved > 0) budget?.releaseBytes(reserved)
+        reserved = -1
+    }
+}
+
+/**
+ * テーブルの要素1つが使う JVM のメモリ（バイト。#361）の見積もり。Endive は要素ごとに `int`（4）と
+ * インスタンスへの参照（圧縮しない参照で 8）を持ち、GC の参照のテーブルはさらに値の参照（8）を持つ。
+ */
+private fun tableElementBytes(table: Table): Long = if (table.elementType().isObjectRef()) 20L else 12L
+
+/**
+ * [config] の上限で Endive のテーブルを作る（#361）。数えるテーブルは [created] に足す。
+ *
+ * Endive の [TableInstance] は、`grow` のたびにモジュールの [Table] の要素数を書き換える。同じモジュールから作る
+ * ほかのインスタンスに響かないように、インスタンスごとに [Table] を作り直し、そのときに上限を縮める。
+ * 最初の要素数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
+ */
+private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig, created: MutableList<BudgetedTable>): TableInstance {
+    val limits = table.limits()
+    val initial = limits.min()
+    val max = minOf(limits.max(), config.maxTableElements.toLong())
+    if (initial > max) {
+        throw MemoryLimitFailure("テーブルの最初の要素数 $initial が上限 $max を超える")
+    }
+    val own = Table(table.elementType(), TableLimits(initial, max, limits.shared()), table.initialize())
+    val budget = config.tableBudget
+    val elementBytes = tableElementBytes(table)
+    val initialBytes = initial * elementBytes
+    if (budget != null && initialBytes > 0 && !budget.tryReserveBytes(initialBytes)) {
+        throw MemoryLimitFailure("テーブルの最初の $initial 要素を確保できない（RAM が足りない）")
+    }
+    val reserved = if (budget != null) initialBytes else 0L
+    return try {
+        BudgetedTable(own, initValue, budget, elementBytes, reserved)
+    } catch (t: Throwable) {
+        if (budget != null && initialBytes > 0) budget.releaseBytes(initialBytes)
+        throw t
+    }.also { created += it }
 }
 
 /**
@@ -471,16 +563,21 @@ private class EndiveWasmModule(val module: EndiveModule, private val compiled: C
         // 数えるメモリ（作るのに失敗したら、確保した分を返す）
         val memories = ArrayList<BudgetedMemory>(1)
         wrapper.budgetedMemories = memories
+        // 数えるテーブル（#361。同じく、失敗したら返す）
+        val tables = ArrayList<BudgetedTable>(1)
+        wrapper.budgetedTables = tables
         val instance = try {
             // withStart(false): export の `_start` は呼ばない（start セクションの関数は build の中で実行される）
             (if (compiled != null) Instance.builder(compiled) else Instance.builder(module))
                 .withImportValues(values.build())
                 .withGlobalFactory(globals)
                 .withMemoryFactory { limits -> createMemory(limits, config, memories) }
+                .withTableFactory { table, initValue -> createTable(table, initValue, config, tables) }
                 .withStart(false)
                 .build()
         } catch (e: Throwable) {
             memories.forEach { it.releaseAll() }
+            tables.forEach { it.releaseAll() }
             translateInstantiateFailure(e)
         }
         wrapper.attach(instance)
@@ -523,6 +620,9 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
 
     /** 数えるメモリ（閉じたときに確保した分を返す） */
     var budgetedMemories: List<BudgetedMemory> = emptyList()
+
+    /** 数えるテーブル（#361。閉じたときに確保した分を返す） */
+    var budgetedTables: List<BudgetedTable> = emptyList()
 
     /** export の関数（名前ごとに1回だけ引く） */
     private val exportFunctions = HashMap<String, ExportFunction>()
@@ -591,6 +691,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
             raw?.close()
         } finally {
             budgetedMemories.forEach { it.releaseAll() }
+            budgetedTables.forEach { it.releaseAll() }
         }
     }
 }

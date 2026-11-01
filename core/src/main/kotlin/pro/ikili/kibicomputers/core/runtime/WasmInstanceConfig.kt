@@ -45,6 +45,15 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
     public val memoryBudget: WasmMemoryBudget? = builder.memoryBudget
 
     /**
+     * テーブル1つの要素数の上限（#361）。モジュールが宣言した上限（なければ Endive の上限の 1,000 万）より小さければ、
+     * こちらが上限になる。既定は [Int.MAX_VALUE]（ランタイムの上限のまま）
+     */
+    internal val maxTableElements: Int = builder.maxTableElements
+
+    /** テーブルの確保を数える相手（#361）。`null` なら数えない */
+    internal val tableBudget: WasmTableBudget? = builder.tableBudget
+
+    /**
      * 待機点への変換をかけたモジュールが退避する値の置き場所（#329）。変換したモジュール（[WasmModule.isAsyncified]）では必須で、
      * `null` のままインスタンスを作ると [WasmLinkException]。変換していないモジュールでは使わない
      */
@@ -61,6 +70,8 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal var maxMemoryPages: Int = WasmMemory.MAX_PAGES
         internal var memoryBudget: WasmMemoryBudget? = null
         internal var asyncStack: WasmAsyncStack? = null
+        internal var maxTableElements: Int = Int.MAX_VALUE
+        internal var tableBudget: WasmTableBudget? = null
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
@@ -92,6 +103,22 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
             require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
             maxMemoryPages = maxPages
             memoryBudget = budget
+        }
+
+        /**
+         * テーブルの上限を決める（#361）。
+         *
+         * 最初の要素数が [maxElements] を超える、または [budget] が最初の要素の分を確保させないときは、
+         * インスタンスを作るときに [WasmLinkException] になる。実行中の `table.grow` は、[maxElements] を超えるか
+         * [budget] が断ると失敗する（-1 を返す。トラップではない）。
+         *
+         * @param maxElements テーブル1つあたりの要素数の上限（0 以上）
+         * @param budget 確保を数える相手。`null` なら数えない
+         */
+        internal fun tableLimit(maxElements: Int, budget: WasmTableBudget?): Builder = apply {
+            require(maxElements >= 0) { "maxElements は 0 以上: $maxElements" }
+            maxTableElements = maxElements
+            tableBudget = budget
         }
 
         /** 待機点への変換をかけたモジュールが退避する値の置き場所を決める（#329。[WasmInstanceConfig.asyncStack]）。 */

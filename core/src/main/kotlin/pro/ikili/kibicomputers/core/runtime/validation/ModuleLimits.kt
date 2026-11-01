@@ -7,7 +7,8 @@ package pro.ikili.kibicomputers.core.runtime.validation
  * ランタイムに渡す前（[ModulePrescan]）に断る。数の上限は、V8 や wasmtime が使う上限より小さめにしてある
  * （1,000 台のコンピューターが同時に読み込んでも困らない大きさ）。
  *
- * 線形メモリのページ数は、ここではなくインスタンスを作るときに #39 の上限で守る。
+ * 線形メモリのページ数は、ここではなくインスタンスを作るときに #39 の上限で守る。テーブルの要素の分も、
+ * インスタンスを作るときに RAM に数える（#361）。
  */
 internal class ModuleLimits(
     /** モジュールのバイト数 */
@@ -24,7 +25,10 @@ internal class ModuleLimits(
     val maxLocalsPerFunction: Int = 50_000,
     /** 定義するテーブルの数 */
     val maxTables: Int = 16,
-    /** テーブル1つの最初の要素数 */
+    /**
+     * テーブル1つの要素数。読み込むときは最初の要素数を確かめ、カーネルはインスタンスを作るときに、
+     * これを `table.grow` で増やせる上限にもする（#361。宣言した上限がこれより大きければ縮める）
+     */
     val maxTableElements: Int = 100_000,
     /** 定義するメモリの数 */
     val maxMemories: Int = 1,
