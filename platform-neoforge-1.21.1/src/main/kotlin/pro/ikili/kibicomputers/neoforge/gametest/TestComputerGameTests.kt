@@ -29,6 +29,12 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object TestComputerGameTests {
+    /**
+     * 起動を待つ tick 数の上限。GameTest のサーバーは待たずに tick を進めるので、lua.wasm の読み込み
+     * （燃料の計測コードの挿入・検証）と Lua の起動が終わる前に、普通の上限（100 tick）を使い切ってしまう
+     */
+    private const val BOOT_TIMEOUT_TICKS = 2400
+
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)
     private val KEYBOARD = BlockPos(1, 1, 2)
@@ -55,10 +61,10 @@ object TestComputerGameTests {
         return Triple(case, helper.getBlockEntity(SCREEN), helper.getBlockEntity(KEYBOARD))
     }
 
-    /** 電源を入れると同梱イメージの init が動いて画面に出し、キーボードで打った行が返ってくる。 */
+    /** 電源を入れると同梱イメージの init（Lua の REPL。#315）が動いて画面に出し、キーボードで打った式の結果が出る。 */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600)
-    fun typedLineIsEchoedOnScreen(helper: GameTestHelper) {
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun typedLuaExpressionIsEvaluatedOnScreen(helper: GameTestHelper) {
         val (case, screen, keyboard) = build(helper)
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         helper.assertTrue(case.wiring.connectedScreen === screen, "the adjacent screen should be connected")
@@ -68,16 +74,16 @@ object TestComputerGameTests {
         helper.succeedWhen {
             val text = lines(screen.text)
             if (!typed) {
-                helper.assertTrue(text.any { it.startsWith("KiBi test init") }, "init banner should be shown: $text")
+                helper.assertTrue(text.any { it == "KiBi test init: Lua REPL" }, "init banner should be shown: $text")
                 helper.assertTrue(text.any { it == ">" }, "prompt should be shown: $text")
-                val events = listOf(KeyboardEvent.Text("hello"), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                val events = listOf(KeyboardEvent.Text("print(1+1)"), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
                 for (packet in KeyboardEventCodec.encode(events)) {
                     helper.assertTrue(keyboard.receive(packet, helper.level.gameTime) == 2, "keyboard should accept the input")
                 }
                 typed = true
             }
-            helper.assertTrue(text.any { it == "> hello" }, "typed line should be echoed by the TTY: $text")
-            helper.assertTrue(text.any { it == "echo: hello" }, "init should answer the line: $text")
+            helper.assertTrue(text.any { it == "> print(1+1)" }, "typed line should be echoed by the TTY: $text")
+            helper.assertTrue(text.any { it == "2" }, "Lua should print the result: $text")
             helper.assertTrue(machine.state == MachineState.RUNNING, "machine should keep running")
             case.pressPowerButton()
             helper.assertTrue(case.wiring.connectedKeyboard == null, "turning off should disconnect the keyboard")
@@ -87,7 +93,7 @@ object TestComputerGameTests {
 
     /** 画面がなくても起動し、キーボードはつながない。 */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun bootsWithoutScreen(helper: GameTestHelper) {
         val (case, _, _) = build(helper)
         helper.setBlock(SCREEN, Blocks.AIR)
