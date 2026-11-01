@@ -224,6 +224,7 @@ internal object WasiP1 {
  *
  * 読み込み時に待機点への変換（#329）をかけたモジュール（[WasmModule.isAsyncified]）は `WAIT_POINT` で動かす。
  * 止まりうる import の中で巻き戻すと `_start` から戻るので、状態が巻き戻し中なら `NORMAL` に戻して `StepResult.Wait` にする。
+ * 止まりうる関数の中で燃料が切れて巻き戻したとき（#339。`ctx.takeFuelUnwind()`）は `StepResult.WaitFuel` にする。
  * 起こされたら、状態を巻き直し中にして `_start` を呼び直す。変換をかけずに読み込んだモジュール（テストの設定。変換できない作りは `Machine.exec` が断る）は `BLOCKING` で動かす。
  *
  * `_start` から（巻き戻しでなく）戻ったら終了コード 0。`proc_exit(rval)` が呼ばれたら、そこで抜けて終了コード `rval`
@@ -260,7 +261,13 @@ internal class WasiP1Driver(private val module: WasmModule) : ProcessDriver {
             WasmAsyncState.NORMAL -> StepResult.Exit(0)
             WasmAsyncState.UNWINDING -> {
                 instance.asyncState = WasmAsyncState.NORMAL
-                StepResult.Wait(checkNotNull(suspend).takePendingKeys())
+                val s = checkNotNull(suspend)
+                if (ctx.takeFuelUnwind()) {
+                    check(!s.hasPendingKeys) { "燃料切れと入力待ちの巻き戻しが重なった" }
+                    StepResult.WaitFuel
+                } else {
+                    StepResult.Wait(s.takePendingKeys())
+                }
             }
             // 止まった呼び出しに着かずに戻った: 巻き直しが食い違った
             WasmAsyncState.REWINDING -> throw IllegalStateException("巻き直しが止まった呼び出しに着かずに _start から戻った")

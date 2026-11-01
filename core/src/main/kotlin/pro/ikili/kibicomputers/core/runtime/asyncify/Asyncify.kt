@@ -45,6 +45,14 @@ internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
  * 1つの関数が巻き戻しで積む値の並び: 退避するローカル（i32・f32・f64 は 64 ビットに広げる。参照型は null だけで、
  * null でなければ trap）、最後に「どの呼び出しで止まったか」の番号。内側の関数から順に積み、巻き直しは外側から順に取り出す。
  *
+ * 燃料切れの待ち点化（#339。[transform] の `yieldImport`）: 止まりうる関数の中の `yieldImport`（燃料切れの `kibi.fuel`）の呼び出しも
+ * 待ち点にし、呼び先を [WasmAsync.FUEL]（`kibi.async_fuel`）に書き換える。`yieldImport` は止まりうる関数の判定には使わない
+ * （燃料の確かめはすべての関数にあるので、使うと全関数が変換されてしまう）。止まりうる関数でない関数の呼び出しはそのまま残す。
+ * [WasmAsync.FUEL] の import は `async_pop` の後に足すので、そのとき定義済みの関数の番号は3つずれる。
+ *
+ * 変換が足すコード（退避・復元・状態の確かめ）は燃料を数えない（#341 と同じ。#339 で数える形を試したが、
+ * かえって燃料 1 あたりの CPU 時間が増えたのでやめた。ADR 0329 の「燃料切れの待ち点化」）。
+ *
  * 名前のカスタムセクションは捨てる（燃料の計測コードの挿入と同じ）。
  */
 internal object Asyncify {
@@ -58,6 +66,7 @@ internal object Asyncify {
      * @property codeBefore コードセクションの大きさ（変換前）
      * @property codeAfter 同じく変換後
      * @property maxLocals 変換した関数の、退避するローカル変数の数の最大
+     * @property yieldSites 待ち点にした燃料切れの呼び出しの数（`yieldImport` がないときは 0。[sites] に含む）
      */
     class Result(
         val bytes: ByteArray,
@@ -67,30 +76,41 @@ internal object Asyncify {
         val codeBefore: Int,
         val codeAfter: Int,
         val maxLocals: Int,
+        val yieldSites: Int,
     )
+
+    private fun parse(wasm: ByteArray): WasmModule = try {
+        Parser.parse(wasm)
+    } catch (e: RuntimeException) {
+        throw WasmLoadException("WASM として読めない: ${e.message}", e)
+    } catch (e: StackOverflowError) {
+        throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
+    }
 
     /**
      * [wasm] を変換する。[waitImports] は止まりうる import（`"<module>.<name>"`）。重いので（lua.wasm で約 100 ms）、メインスレッドでは呼ばない。
      *
      * [checkpoint] は関数の本体を1つ書き換えるごとに呼ぶ（検証の時間の上限。#40）。投げた [WasmLoadException] はそのまま外に出る。
      *
+     * [yieldImport]（`"<module>.<name>"`）があれば、止まりうる関数の中のその呼び出しも待ち点にし、[WasmAsync.FUEL] の呼び出しに書き換える（#339）。
+     * その import の型は `(i64) -> (i64)` でなければならない。モジュールがその import を持たなければ、何もしない。
+     *
      * @throws AsyncifyUnsupported 変換できない作り（SIMD、GC・型付きの参照型、止まりうる関数の中の末尾呼び出し、
      *   止まりうる構造の中の、引数を持つブロックや複数の結果を持つブロック、関数でない import など）。変換せずに動かす
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)
-    fun transform(wasm: ByteArray, waitImports: Set<String>, checkpoint: () -> Unit = {}): Result {
-        val module = try {
-            Parser.parse(wasm)
-        } catch (e: RuntimeException) {
-            throw WasmLoadException("WASM として読めない: ${e.message}", e)
-        } catch (e: StackOverflowError) {
-            throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
-        }
+    fun transform(
+        wasm: ByteArray,
+        waitImports: Set<String>,
+        yieldImport: String? = null,
+        checkpoint: () -> Unit = {},
+    ): Result {
+        val module = parse(wasm)
         checkpoint()
         checkReserved(module)
         return try {
-            Transformer(wasm, module, waitImports, checkpoint).run()
+            Transformer(wasm, module, waitImports, yieldImport, checkpoint).run()
         } catch (e: WasmLoadException) {
             throw e
         } catch (e: AsyncifyUnsupported) {
@@ -107,7 +127,7 @@ internal object Asyncify {
         val imports = module.importSection()
         for (i in 0 until imports.importCount()) {
             val imp = imports.getImport(i)
-            if (imp.module() == WasmAsync.IMPORT_MODULE && (imp.name() == WasmAsync.PUSH || imp.name() == WasmAsync.POP)) {
+            if (imp.module() == WasmAsync.IMPORT_MODULE && (imp.name() == WasmAsync.PUSH || imp.name() == WasmAsync.POP || imp.name() == WasmAsync.FUEL)) {
                 throw WasmLoadException("${imp.module()}.${imp.name()} は予約された import")
             }
         }
@@ -178,6 +198,7 @@ private class Transformer(
     private val wasm: ByteArray,
     private val module: WasmModule,
     private val asyncImports: Set<String>,
+    yieldImport: String?,
     private val checkpoint: () -> Unit,
 ) {
     private val importedFuncs: Int
@@ -195,6 +216,18 @@ private class Transformer(
     private val popFunc: Int
     private val stateGlobal: Int
 
+    /** 燃料切れの import（`yieldImport`）の番号。なければ -1 */
+    private val yieldFunc: Int
+
+    /** 足す [WasmAsync.FUEL] の import の番号（[yieldFunc] がなければ -1） */
+    private val asyncFuelFunc: Int
+
+    /** [yieldFunc] の型の番号（足す import に使う） */
+    private val yieldType: Int
+
+    /** 定義済みの関数の番号のずれ（足す import の数） */
+    private val shift: Int
+
     init {
         val types = module.typeSection()
         for (i in 0 until types.typeCount()) {
@@ -203,14 +236,25 @@ private class Transformer(
         }
         val imports = module.importSection()
         var nf = 0
+        var yf = -1
+        var yt = -1
         for (i in 0 until imports.importCount()) {
             val imp = imports.getImport(i)
             if (imp !is FunctionImport) throw AsyncifyUnsupported("関数でない import には対応していない: ${imp.module()}.${imp.name()}")
-            if ("${imp.module()}.${imp.name()}" in asyncImports) asyncFuncs += nf
+            val full = "${imp.module()}.${imp.name()}"
+            if (full in asyncImports) asyncFuncs += nf
+            if (full == yieldImport) {
+                val s = typeSigs[imp.typeIndex()]
+                if (s.params != listOf(I64) || s.results != listOf(I64)) throw AsyncifyUnsupported("$full の型が燃料切れの import と違う")
+                yf = nf
+                yt = imp.typeIndex()
+            }
             funcSigs += typeSigs[imp.typeIndex()]
             nf++
         }
         importedFuncs = nf
+        yieldFunc = if (yf in asyncFuncs) -1 else yf
+        yieldType = yt
         val fs = module.functionSection()
         for (i in 0 until fs.functionCount()) funcSigs += typeSigs[fs.getFunctionType(i)]
         val gs = module.globalSection()
@@ -220,6 +264,8 @@ private class Transformer(
         module.tagSection().ifPresent { tags -> tags.types().forEach { tagSigs += typeSigs[it.typeIdx()] } }
         pushFunc = importedFuncs
         popFunc = importedFuncs + 1
+        asyncFuelFunc = if (yieldFunc >= 0) importedFuncs + 2 else -1
+        shift = if (yieldFunc >= 0) 3 else 2
         stateGlobal = globalTypes.size
     }
 
@@ -228,7 +274,7 @@ private class Transformer(
 
     private fun indirectMaySuspend(typeIdx: Int): Boolean = typeSigs[typeIdx].let { it.params to it.results } in suspendTypes
 
-    private fun remap(idx: Long): Long = if (idx >= importedFuncs) idx + 2 else idx
+    private fun remap(idx: Long): Long = if (idx >= importedFuncs) idx + shift else idx
 
     private fun bodies(): List<List<AnnotatedInstruction>> =
         (0 until module.codeSection().functionBodyCount()).map { module.codeSection().getFunctionBody(it).instructions() }
@@ -272,6 +318,7 @@ private class Transformer(
         var instrumented = 0
         var sites = 0
         var maxLocals = 0
+        var yieldSites = 0
         fun emit(id: Int, body: Sink) {
             out.u8(id)
             out.leb(body.size().toLong())
@@ -294,10 +341,13 @@ private class Transformer(
                 2 -> {
                     val n = r.leb()
                     val body = Sink()
-                    body.leb(n + 2)
+                    body.leb(n + shift)
                     body.bytes(wasm, r.pos, s.end - r.pos)
                     body.name(WasmAsync.IMPORT_MODULE); body.name(WasmAsync.PUSH); body.u8(0); body.leb(newTypePush)
                     body.name(WasmAsync.IMPORT_MODULE); body.name(WasmAsync.POP); body.u8(0); body.leb(newTypePush + 1)
+                    if (asyncFuelFunc >= 0) {
+                        body.name(WasmAsync.IMPORT_MODULE); body.name(WasmAsync.FUEL); body.u8(0); body.leb(yieldType)
+                    }
                     emit(2, body)
                 }
                 6 -> {
@@ -342,10 +392,12 @@ private class Transformer(
                         checkpoint()
                         val fn = Sink()
                         if (f in suspendable) {
-                            val stats = FunctionRewriter(f, bodies[i], start, end).rewrite(fn)
+                            val rw = FunctionRewriter(f, bodies[i], start, end)
+                            val stats = rw.rewrite(fn)
                             instrumented++
                             sites += stats.first
                             maxLocals = maxOf(maxLocals, stats.second)
+                            yieldSites += rw.yieldSites
                         } else {
                             copyPlainFunction(bodies[i], start, end, fn)
                         }
@@ -360,7 +412,9 @@ private class Transformer(
                 else -> emit(s.id, Sink().also { it.bytes(wasm, s.start, s.end - s.start) })
             }
         }
-        return Asyncify.Result(out.toByteArray(), bodies.size, instrumented, sites, codeBefore, codeAfter, maxLocals)
+        return Asyncify.Result(
+            out.toByteArray(), bodies.size, instrumented, sites, codeBefore, codeAfter, maxLocals, yieldSites,
+        )
     }
 
     private class Section(val id: Int, val start: Int, val end: Int)
@@ -463,6 +517,10 @@ private class Transformer(
         private val endOf = java.util.IdentityHashMap<AnnotatedInstruction, Int>()
         private var siteCount = 0
         private val kLocal: Int
+
+        /** 待ち点にした燃料切れの呼び出しの数 */
+        var yieldSites = 0
+            private set
 
         init {
             localTypes += sig.params
@@ -585,10 +643,12 @@ private class Transformer(
             }
         }
 
+        private fun isYieldCall(ins: AnnotatedInstruction): Boolean = yieldFunc >= 0 && ins.opcode() == OpCode.CALL && ins.operand(0).toInt() == yieldFunc
+
         // --- 判定 ---
 
         private fun isSuspendCall(ins: AnnotatedInstruction): Boolean = when (ins.opcode()) {
-            OpCode.CALL -> ins.operand(0).toInt() in suspendable
+            OpCode.CALL -> ins.operand(0).toInt() in suspendable || isYieldCall(ins)
             OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins.operand(0).toInt())
             OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("末尾呼び出しには対応していない") else false
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
@@ -891,7 +951,11 @@ private class Transformer(
             for (a in args) {
                 out.u8(0x20); out.leb(a)
             }
-            if (ins.opcode() == OpCode.CALL) {
+            if (isYieldCall(ins)) {
+                // 止まりうる関数の中の燃料切れ: 巻き戻せる燃料切れの import を呼ぶ（#339）
+                out.u8(0x10); out.leb(asyncFuelFunc)
+                yieldSites++
+            } else if (ins.opcode() == OpCode.CALL) {
                 out.u8(0x10); out.leb(remap(ins.operand(0)))
             } else {
                 out.bytes(wasm, ins.address(), endOf[ins]!! - ins.address())

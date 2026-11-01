@@ -115,6 +115,11 @@ kibiWasm {
         compilerArgs.addAll("-O2", "-s")
         stackSize = 4 * 1024 * 1024
     }
+    // 燃料切れの待ち点化（#339）を確かめる、計算を続ける CLI
+    module("fuel-spin-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/fuel_spin_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

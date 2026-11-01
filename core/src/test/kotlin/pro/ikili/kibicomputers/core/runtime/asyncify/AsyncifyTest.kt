@@ -11,12 +11,15 @@ import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
+import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 
 /** 読み込み時の待機点への変換（#329）と、変換したモジュールを Endive で動かす境界 */
@@ -99,7 +102,7 @@ class AsyncifyTest {
 
     @Test
     fun `挿入してから変換すると、巻き戻して巻き直しても燃料は巻き戻さないときと同じだけ引く`() {
-        // 燃料を引くコードは if (state == NORMAL) の中に入るので、巻き直しの間は引かない。変換が足したコードも数えない（#341）
+        // 燃料を引くコードは if (state == NORMAL) の中に入るので、巻き直しの間は引かない（#341）。
         val module = EndiveRuntime().load(Instrumentation.apply(waitModule(), setOf("w.wait")))
         assertTrue(module.isAsyncified && module.isFuelMetered)
         val initial = 1_000_000L
@@ -216,5 +219,111 @@ class AsyncifyTest {
             Asyncify.transform(resource("prompt-wasi.wasm"), WasiP1.WAIT_IMPORTS) { throw WasmLoadException("時間の上限") }
         }
         assertEquals("時間の上限", e.message)
+    }
+
+    /**
+     * `w.wait() -> i32` を呼んでから、その値の回数だけ回る loop（止まりうる関数 `run` の中）と、
+     * 50 回まわる葉の関数 `leaf`（止まりうる関数を呼ばない）を通る `run() -> i32`。戻り値は 7
+     */
+    private fun loopModule(): ByteArray {
+        val b = WasmBinary()
+        val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
+        b.mutableI64Global(0)
+        // (local.get 0) が 0 になるまで 1 ずつ減らす loop
+        val countDown = WasmBinary.code(0x02, 0x40, 0x03, 0x40, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B)
+        val leaf = b.func(listOf(i32), listOf(i32), countDown + WasmBinary.code(0x41, 7))
+        val run = b.func(
+            emptyList(),
+            listOf(i32),
+            WasmBinary.code(0x10, wait, 0x21, 0) + countDown + WasmBinary.code(0x41, 50, 0x10, leaf),
+            locals = listOf(i32),
+        )
+        b.exportFunc("run", run)
+        return b.build()
+    }
+
+    /** 燃料切れの処理: 巻き戻せるところでは巻き戻し、巻き直しで着いたら [refill] を返す。巻き戻せないところでは [refill] を返す */
+    private class FuelCounter(val refill: Long) : WasmFuelHandler {
+        var blocking = 0
+        var unwinds = 0
+        var arrivals = 0
+
+        override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
+            blocking++
+            return refill
+        }
+
+        override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long {
+            if (instance.asyncState == WasmAsyncState.REWINDING) {
+                arrivals++
+                instance.asyncState = WasmAsyncState.NORMAL
+                return instance.fuel
+            }
+            unwinds++
+            instance.asyncState = WasmAsyncState.UNWINDING
+            return remaining
+        }
+    }
+
+    private fun loopConfig(handler: WasmFuelHandler, stack: Stack, initial: Long): WasmInstanceConfig = WasmInstanceConfig.builder()
+        .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(100) }
+        .asyncStack(stack)
+        .fuel(initial, handler)
+        .build()
+
+    @Test
+    fun `止まりうる関数の中の燃料切れだけを待ち点にし、巻き戻して巻き直すと続きから動く`() {
+        val applied = Instrumentation.applyDetailed(loopModule(), setOf("w.wait"))
+        assertTrue(applied.fuelYield)
+        val r = Asyncify.transform(FuelInjector.inject(loopModule()).bytes, setOf("w.wait"), "kibi.fuel")
+        // run の入口と loop の先頭の2つ（葉の関数の中のものはそのまま）
+        assertEquals(2, r.yieldSites)
+        assertEquals(1, r.instrumented)
+        val module = EndiveRuntime().load(applied.bytes)
+        assertTrue(module.isAsyncified && module.isFuelMetered)
+        assertTrue(module.imports.none { it.module == WasmAsync.IMPORT_MODULE }, "${module.imports}")
+
+        // run の loop の途中で燃料が切れるようにする（100 回まわると数百の燃料を使う）
+        val handler = FuelCounter(refill = 1_000_000)
+        val stack = Stack()
+        module.instantiate(loopConfig(handler, stack, initial = 100)).use { instance ->
+            instance.call("run")
+            assertEquals(WasmAsyncState.UNWINDING, instance.asyncState)
+            assertEquals(1, handler.unwinds)
+            assertTrue(stack.values.isNotEmpty())
+            instance.asyncState = WasmAsyncState.REWINDING
+            instance.fuel = 1_000_000
+            assertArrayEquals(longArrayOf(7), instance.call("run"))
+            assertEquals(WasmAsyncState.NORMAL, instance.asyncState)
+            assertEquals(1, handler.arrivals)
+            assertTrue(stack.values.isEmpty())
+        }
+
+        // 葉の関数の中で切れたときは、巻き戻さない口が呼ばれる（毎回 1 だけ補充して、何度も切れるようにする）
+        val leafOnly = FuelCounter(refill = 1)
+        val noUnwind = object : WasmFuelHandler {
+            override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = leafOnly.onFuelExhausted(instance, remaining)
+
+            override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long {
+                leafOnly.unwinds++
+                return 1
+            }
+        }
+        module.instantiate(loopConfig(noUnwind, Stack(), initial = 1)).use { instance ->
+            assertArrayEquals(longArrayOf(7), instance.call("run"))
+        }
+        assertTrue(leafOnly.blocking > 0, "葉の関数で切れていない: blocking=${leafOnly.blocking} unwinds=${leafOnly.unwinds}")
+        assertTrue(leafOnly.unwinds > 0, "止まりうる関数で切れていない")
+    }
+
+    @Test
+    fun `kibi_async_fuelは予約した名前で、変換して燃料も計測したモジュールだけが持てる`() {
+        val importsFuel = WasmBinary().apply {
+            importFunc(WasmAsync.IMPORT_MODULE, WasmAsync.FUEL, listOf(WasmBinary.I64), listOf(WasmBinary.I64))
+            mutableI64Global(0)
+            exportFunc("f", func(emptyList(), emptyList(), ByteArray(0)))
+        }.build()
+        assertThrows<WasmLoadException> { Asyncify.transform(importsFuel, emptySet()) }
+        assertThrows<WasmLoadException> { EndiveRuntime().load(importsFuel) }
     }
 }

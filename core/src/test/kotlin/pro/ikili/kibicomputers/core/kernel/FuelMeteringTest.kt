@@ -40,10 +40,22 @@ class FuelMeteringTest {
         condition()
     }
 
-    /** 1 tick 分の燃料を配ってから、tick を進めずに燃料切れで止まるのを待つ（毎回 tick すると、遅い環境では止まった瞬間を見逃す） */
+    /**
+     * 1 tick 分の燃料を配ってから、tick を進めずに燃料切れで止まるのを待つ（毎回 tick すると、遅い環境では止まった瞬間を見逃す）。
+     * スレッドを持って待つ（`WAITING_FUEL`）か、変換したプロセスが巻き戻して、スレッドを持たずに燃料待ちの列にいる（#339）
+     */
     private fun Harness.awaitFuelWait(machine: Machine, pid: Int, message: String) {
         scheduler.tick()
-        eventually(30_000, message) { machine.stateOf(pid) == ProcessState.WAITING_FUEL }
+        eventually(30_000, message) {
+            when (machine.stateOf(pid)) {
+                ProcessState.WAITING_FUEL -> true
+                ProcessState.RUNNABLE -> machine.lock.withLockValue {
+                    val rt = machine.rt(pid)
+                    rt.thread == null && rt.waitSet == null && rt.process.asyncStack?.isEmpty == false
+                }
+                else -> false
+            }
+        }
     }
 
     private fun Harness.ticks(n: Int) = repeat(n) {

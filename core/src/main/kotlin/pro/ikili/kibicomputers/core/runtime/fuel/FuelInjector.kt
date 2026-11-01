@@ -29,6 +29,12 @@ internal object FuelCosts {
      * `memory.grow`・`table.grow` は、実行した後に実際に増えた分だけを引く（失敗して -1 を返したら 0。#335）
      */
     const val MEMORY_GROW_PAGE_SHIFT: Int = 13
+
+    /**
+     * 燃料切れで巻き戻して待つとき（#339）の、退避した値 1 つあたりの燃料（積む・取り出すの分）。
+     * 巻き戻した時点で、退避した値の数 × これを、マシンの燃料から引く
+     */
+    const val ASYNC_VALUE: Long = 2
 }
 
 /**

@@ -28,7 +28,10 @@ internal interface ProcessDriver {
     /** プロセスのスレッドで呼ばれる。`BLOCKING` は終わるまで戻らない（待ちは `ctx.block`）。`WAIT_POINT` は待つところで戻る */
     fun start(ctx: ProcessContext): StepResult
 
-    /** `WAIT_POINT` だけ。待っていた条件がそろったら、プロセスのスレッドで呼ばれる。[ready] は空でない */
+    /**
+     * `WAIT_POINT` だけ。待っていた条件がそろったら、プロセスのスレッドで呼ばれる。[ready] は空でない。
+     * [StepResult.WaitFuel] の後（燃料が補充されて再開する）だけは、[ready] は空
+     */
     fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult
 }
 
@@ -36,6 +39,12 @@ internal interface ProcessDriver {
 internal sealed interface StepResult {
     /** [keys] のどれかがそろうまで待つ（`WAIT_POINT` だけ）。[keys] は空でない */
     data class Wait(val keys: List<WaitKey>) : StepResult
+
+    /**
+     * 燃料が補充されるまで、スレッドを持たずに待つ（`WAIT_POINT` だけ。止まりうる関数の中の燃料切れで巻き戻した。#339）。
+     * 補充されたら、`resume(ctx, emptyList())` で続きから動かす
+     */
+    data object WaitFuel : StepResult
 
     /** 終了コード [code] で終わる */
     data class Exit(val code: Int) : StepResult
