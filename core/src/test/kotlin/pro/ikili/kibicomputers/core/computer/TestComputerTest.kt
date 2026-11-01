@@ -74,8 +74,12 @@ class TestComputerTest {
             manager.tickUntil({ "返ってこない: ${lines(screen)}" }) { lines(screen).contains("echo: hello") }
             assertTrue(lines(screen).contains("> hello"), "TTY のエコー: ${lines(screen)}")
 
+            // 次のプロンプトが出てから打つ（先に打つと、エコーがプロンプトより前に出て、行の並びが変わる）
+            manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).contains(">") }
             console.keyboardInput(KeyboardEvent.Paste("exit\n"))
-            manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) { machine.state == MachineState.STOPPED && lines(screen).contains("bye") }
+            manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) {
+                machine.state == MachineState.STOPPED && lines(screen).any { it.endsWith("bye") }
+            }
             assertTrue(host.failures.isEmpty(), "${host.failures}")
 
             // 画面を消して、つなぎを外す
