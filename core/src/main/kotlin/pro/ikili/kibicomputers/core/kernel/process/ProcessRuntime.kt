@@ -31,6 +31,9 @@ internal class ProcessRuntime(
     @Volatile
     var killed: Boolean = false
 
+    /** 止めたシグナル（`stop()` で止めたなら `null`。最初のものを残す。カーネルロックの中で書く。#46） */
+    var killSignal: KillSignal? = null
+
     /** マシンの CPU を持っている（プロセスのスレッドだけが読み書きする） */
     var holdsCpu: Boolean = false
 

@@ -106,6 +106,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         WaitCondition.READABLE -> readable
         // LF は CR LF の2バイトになるので、2バイト空いていれば必ず1バイトは書ける
         WaitCondition.WRITABLE -> outputSpace >= 2
+        else -> false
     }
 
     /** 接続層からのキー入力。モードに従って全部処理する（途中で止めない）。エコーは出力に積む */

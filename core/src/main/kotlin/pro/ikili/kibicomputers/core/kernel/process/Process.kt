@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleTable
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import java.util.EnumSet
 
 /** プロセスの動き方。どちらを使うかは ABI 層が決める（#63・#72・#73）。 */
 internal enum class ProcessKind {
@@ -61,7 +62,7 @@ internal class Process(
     /** 自分の pid */
     val pid: Int,
     /** 親の pid（init の親は 0） */
-    val parentPid: Int,
+    parentPid: Int,
     /** 動き方 */
     val kind: ProcessKind,
     /** インスタンスを作ったモジュールの識別子（#30 の結論 4） */
@@ -75,6 +76,12 @@ internal class Process(
     /** 作業ディレクトリ（VFS の絶対パス。#45） */
     cwd: VfsPath = VfsPath.ROOT,
 ) {
+    /** 親の pid（親なしは 0）。親が先に終わったら 0 に付け替える（#46） */
+    var parentPid: Int = parentPid
+
+    /** このプロセスの `ProcessObject` のオブジェクトID（表に入れる前・テストで直接作ったものは 0。#46） */
+    var objectId: Int = 0
+
     /** 作業ディレクトリ（VFS の絶対パス）。変えるのは `ProcessContext.changeDirectory` */
     var cwd: VfsPath = cwd
 
@@ -83,6 +90,12 @@ internal class Process(
 
     /** 終了コード（終わっていなければ `null`） */
     var exitCode: Int? = null
+
+    /** シグナルで `KILLED` になったときのシグナル（マシンの停止・終わっていなければ `null`。#46） */
+    var termSignal: KillSignal? = null
+
+    /** 無視するシグナル（[KillSignal.KILL] は入らない。子には引き継がない。#46） */
+    val ignoredSignals: MutableSet<KillSignal> = EnumSet.noneOf(KillSignal::class.java)
 
     /** 待っている [WaitKey] の並び（待っていなければ `null`） */
     var wait: List<WaitKey>? = null

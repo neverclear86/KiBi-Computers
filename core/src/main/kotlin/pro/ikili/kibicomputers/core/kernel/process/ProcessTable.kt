@@ -3,10 +3,15 @@ package pro.ikili.kibicomputers.core.kernel.process
 /**
  * pid → [Process] の表（保存の対象）。pid は 1 から割り当て、使い終わった番号はすぐには使い回さない。
  *
- * 終わったプロセス（ゾンビ）も、刈り取る（#46）まで表に残る。上限 [limit] は終わっていないプロセスの数に掛ける。
+ * 終わったプロセス（ゾンビ）も、刈り取るまで表に残る（#46、ADR 0046）。上限 [limit] は、終わっていないプロセスと、
+ * 親のいるゾンビの合計に掛ける（[limitedCount]）。親のないゾンビは誰も刈り取らないので、[orphanZombies] に終わった順に並べ、
+ * 表が大きくなったらカーネルが古い順に刈り取る。
  */
 internal class ProcessTable(val limit: Int) {
     private val table = LinkedHashMap<Int, Process>()
+
+    /** 親のないゾンビの pid（終わった順。表から作り直せる） */
+    private val orphans = LinkedHashSet<Int>()
 
     /** 次に割り当てる pid */
     var nextPid: Int = 1
@@ -16,6 +21,9 @@ internal class ProcessTable(val limit: Int) {
 
     operator fun contains(pid: Int): Boolean = table.containsKey(pid)
 
+    /** 表にあるプロセスの数（ゾンビを含む） */
+    val size: Int get() = table.size
+
     /** 表にあるすべてのプロセス（pid の割り当ての順） */
     fun all(): Collection<Process> = table.values
 
@@ -24,6 +32,17 @@ internal class ProcessTable(val limit: Int) {
 
     /** 終わっていないプロセスの数 */
     fun liveCount(): Int = table.values.count { !it.state.isTerminal }
+
+    /** 上限に数えるプロセスの数（終わっていないプロセス＋親のいるゾンビ） */
+    fun limitedCount(): Int = table.values.count { !it.state.isTerminal || it.parentPid != 0 }
+
+    /** 親のないゾンビの pid（終わった順） */
+    val orphanZombies: Collection<Int> get() = orphans
+
+    /** [pid]（親のないゾンビ）を、親のないゾンビの並びの最後に足す */
+    fun addOrphanZombie(pid: Int) {
+        orphans.add(pid)
+    }
 
     /** 空いている pid を割り当てる */
     fun allocatePid(): Int {
@@ -39,13 +58,17 @@ internal class ProcessTable(val limit: Int) {
         table[process.pid] = process
     }
 
-    /** 刈り取る（#46） */
-    fun remove(pid: Int): Process? = table.remove(pid)
+    /** 表から外す（刈り取り。`ProcessObject` の後片付けは呼び出し側） */
+    fun remove(pid: Int): Process? {
+        orphans.remove(pid)
+        return table.remove(pid)
+    }
 
     /** 終わったプロセス（ゾンビ）をすべて外し、pid を 1 から振り直す（起動のとき。#49）。終わっていないプロセスがあれば [IllegalStateException] */
     fun reset() {
         check(liveCount() == 0) { "終わっていないプロセスがある" }
         table.clear()
+        orphans.clear()
         nextPid = 1
     }
 }

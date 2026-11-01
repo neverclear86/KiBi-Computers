@@ -482,7 +482,11 @@ internal class ProcessRunner(private val machine: Machine) {
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
-        // 親への知らせは #46。init なら、マシンを止める（#49）
+        // まだ実行していないホスト呼び出しを取り消す（ふつうは 0 件。#46）
+        machine.cancelHostCallsLocked(process.pid)
+        // 終わりを記録し、親へ知らせ、子を付け替える（#46）
+        machine.lifecycle.onFinishedLocked(rt)
+        // init なら、マシンを止める（#49）
         machine.onProcessFinishedLocked(process, rt.crashReason)
         machine.checkAllDoneLocked()
     }
@@ -513,6 +517,37 @@ internal class ProcessRunner(private val machine: Machine) {
             machine.exec(path, drivers, options, rt.pid)
 
         override fun children(): List<Int> = machine.children(rt.pid)
+
+        override fun tryReap(selector: ChildSelector): ReapResult = lock.withLockValue { machine.lifecycle.tryReapLocked(rt.pid, selector) }
+
+        override fun childExitKeys(selector: ChildSelector): List<WaitKey> =
+            lock.withLockValue { machine.lifecycle.childExitKeysLocked(rt.pid, selector) }
+
+        override fun waitChild(selector: ChildSelector): ReapResult {
+            checkThread()
+            while (true) {
+                val (result, keys) = lock.withLockValue {
+                    val r = machine.lifecycle.tryReapLocked(rt.pid, selector)
+                    r to (if (r == ReapResult.Running) machine.lifecycle.childExitKeysLocked(rt.pid, selector) else emptyList())
+                }
+                if (result != ReapResult.Running) return result
+                // 確かめてから block で登録するまでに終わっても、条件は残る（EXITED・CHILD_EXITED）ので取りこぼさない
+                block(keys)
+            }
+        }
+
+        override fun kill(pid: Int, signal: KillSignal): KillResult {
+            val result = lock.withLockValue { machine.killLocked(pid, signal) }
+            if (pid == rt.pid && result == KillResult.DELIVERED) throw ProcessKilledException()
+            return result
+        }
+
+        override fun setSignalIgnored(signal: KillSignal, ignored: Boolean) {
+            require(signal.ignorable) { "$signal は無視できない" }
+            lock.withLockValue {
+                if (ignored) rt.process.ignoredSignals.add(signal) else rt.process.ignoredSignals.remove(signal)
+            }
+        }
 
         override val instance: WasmInstance
             get() = lock.withLockValue { rt.firstInstance ?: throw IllegalStateException("インスタンスはまだない（LOADING）") }
@@ -701,9 +736,9 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun <T> callOnMainThread(call: HostCall<T>): T {
             checkThread()
-            // 止められたプロセスは、メインスレッドでの処理を出さない（マシンが STOPPED に戻った後でも）
-            if (lock.withLockValue { rt.killed }) throw ProcessKilledException()
-            return awaitHost(machine.submitHostCall(call))
+            // 止められたプロセスは、メインスレッドでの処理を出さない（マシンが STOPPED に戻った後でも）。
+            // 止められたかの確かめと列への積み込みは、submitHostCall の同じロックの中で行う（#46）
+            return awaitHost(machine.submitHostCall(rt.pid, call))
         }
 
         override fun writeConsole(bytes: ByteArray, offset: Int, length: Int): Boolean = machine.writeConsole(bytes, offset, length)

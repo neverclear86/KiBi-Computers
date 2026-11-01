@@ -12,11 +12,15 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
+import pro.ikili.kibicomputers.core.kernel.process.KillResult
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessLifecycle
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRunner
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -71,7 +75,7 @@ public class MachineConfig private constructor(builder: Builder) {
     /** 1 tick に配る燃料。1回に渡す燃料の上限でもある（仮: 1 tick 約 2 ms 相当） */
     public val fuelPerTick: Long = builder.fuelPerTick
 
-    /** 終わっていないプロセスの数の上限（仮: 64） */
+    /** プロセスの数の上限（終わっていないプロセスと、親が刈り取っていないゾンビの合計。仮: 64。#46） */
     public val maxProcesses: Int = builder.maxProcesses
 
     /** 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ */
@@ -200,9 +204,12 @@ public class Machine private constructor(
         }
     }
 
-    /** コンソールの TTY のシグナル（Ctrl+C など）の受け口。既定は何もしない（強制終了につなぐのは #46） */
+    /**
+     * コンソールの TTY のシグナル（Ctrl+C など）の受け口。既定は、TTY の前のプロセスに `INTERRUPT`・`QUIT` を送る
+     * （前のプロセスがない・終わっている・init なら何もしない。#46、ADR 0046）。テストで差し替える
+     */
     @Volatile
-    internal var ttySignalHandler: TtySignalHandler = TtySignalHandler { _, _, _ -> }
+    internal var ttySignalHandler: TtySignalHandler = DEFAULT_TTY_SIGNAL_HANDLER
 
     /** コンソールの出力に、まだ配っていないバイトがあるかもしれない */
     private val consoleDirty = AtomicBoolean(false)
@@ -211,6 +218,9 @@ public class Machine private constructor(
     internal val runtimes = HashMap<Int, ProcessRuntime>()
 
     internal val runner = ProcessRunner(this)
+
+    /** 終わりの記録・刈り取り・シグナル（#46） */
+    internal val lifecycle = ProcessLifecycle(this)
 
     /** マシンの CPU */
     internal val cpu = MachineCpu { rt -> scheduler.workers.execute { runner.runStep(rt) } }
@@ -265,7 +275,7 @@ public class Machine private constructor(
     /** 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す） */
     private var rebootNotified = false
 
-    /** 前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
+    /** 刈り取ったプロセス・前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
     private val retiredThreads = ArrayList<Thread>()
 
     /** 状態 */
@@ -423,7 +433,7 @@ public class Machine private constructor(
             val metered = program.module.isFuelMetered
             require(metered || options.allowUnmetered) { "燃料を計測しないモジュールはプロセスにできない" }
             val parent = parentLocked(parentPid)
-            if (kernel.processes.liveCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")
+            if (kernel.processes.limitedCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")
             val env = options.env ?: parent?.env ?: emptyMap()
             ProcessArgs.check(options.args, env)
             val cwd = resolveCwdLocked(options.cwd, parent)
@@ -432,9 +442,11 @@ public class Machine private constructor(
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
             }
+            reapOrphanZombiesLocked()
             val pid = kernel.processes.allocatePid()
             val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
             kernel.processes.add(process)
+            process.objectId = kernel.objects.add(ProcessObject(pid))
             if (asInit) {
                 initPid = pid
                 bootingValue = false
@@ -648,22 +660,75 @@ public class Machine private constructor(
         }
         for (rt in runtimes.values.toList()) {
             if (rt.process.state.isTerminal) continue
-            rt.killed = true
-            val thread = rt.thread
-            if (thread != null) {
-                scheduler.hooks.stopBeforeInterrupt?.invoke(this, rt.pid)
-                scheduler.interruptsSent.incrementAndGet()
-                thread.interrupt()
-            } else if (rt.process.kind == ProcessKind.WAIT_POINT) {
-                // スレッドを持たないプロセスは、その場で終える
-                cpu.removeThreadless(rt)
-                runner.finishLocked(rt, ProcessState.KILLED, null)
-            }
-            // スレッドがまだ登録されていないブロッキング型は、登録のときに印を見て終わる
+            killRuntimeLocked(rt, null)
         }
+        // 取りこぼし（すでに終わったプロセスが残した分など）を防ぐため、残りもすべて取り消す
         cancelHostCallsLocked()
         checkAllDoneLocked()
     }
+
+    /**
+     * プロセス1つを止める（[stopLocked] と、シグナルの [ProcessLifecycle.killLocked] から。カーネルロックの中）。
+     * 停止の印を立て、まだ実行していないホスト呼び出しを取り消し、スレッドがあれば割り込む。スレッドのない待機点型はその場で終える。
+     * スレッドがまだ登録されていないブロッキング型は、登録のときに印を見て終わる。
+     *
+     * @param signal 止めたシグナル（`stop()` なら `null`）。すでに止めているときは、最初のものを残す
+     */
+    internal fun killRuntimeLocked(rt: ProcessRuntime, signal: KillSignal?) {
+        if (rt.process.state.isTerminal) return
+        if (!rt.killed) rt.killSignal = signal
+        rt.killed = true
+        cancelHostCallsLocked(rt.pid)
+        val thread = rt.thread
+        if (thread != null) {
+            scheduler.hooks.stopBeforeInterrupt?.invoke(this, rt.pid)
+            scheduler.interruptsSent.incrementAndGet()
+            thread.interrupt()
+        } else if (rt.process.kind == ProcessKind.WAIT_POINT) {
+            // スレッドを持たないプロセスは、その場で終える
+            cpu.removeThreadless(rt)
+            runner.finishLocked(rt, ProcessState.KILLED, null)
+        }
+    }
+
+    /** [pid] にシグナルを送る（[ProcessLifecycle.killLocked]）。カーネルロックの中で呼ぶ */
+    internal fun killLocked(pid: Int, signal: KillSignal): KillResult = lifecycle.killLocked(pid, signal)
+
+    /** [pid] が今の起動の init か（カーネルロックの中） */
+    internal fun isInitLocked(pid: Int): Boolean = initPid != 0 && pid == initPid
+
+    /**
+     * 終わったプロセス [pid] を刈り取る（#46）。表と実行時の部分から外し、カーネルが持つ `ProcessObject` の参照を返す。
+     * 専用スレッドがまだ生きていれば [retiredThreads] に足し、同時に終わったスレッドを外す（再起動しなくても増え続けない）。
+     * カーネルロックの中で呼ぶ。表にないか、終わっていなければ何もしない
+     */
+    internal fun reapLocked(pid: Int) {
+        val process = kernel.processes[pid] ?: return
+        if (!process.state.isTerminal) return
+        kernel.processes.remove(pid)
+        val rt = runtimes.remove(pid)
+        if (rt != null) {
+            fuelWaiters.remove(rt)
+            rt.dedicatedThread?.let { if (it.isAlive) retiredThreads += it }
+        }
+        retiredThreads.removeAll { !it.isAlive }
+        lifecycle.onReapedLocked(process)
+    }
+
+    /**
+     * 表（ゾンビを含む）が `maxProcesses` × 2 に達していたら、親のないゾンビを古い順に刈り取って空ける
+     * （仮の値。確定は #251）。カーネルロックの中で呼ぶ
+     */
+    private fun reapOrphanZombiesLocked() {
+        val cap = config.maxProcesses.toLong() * ORPHAN_ZOMBIE_TABLE_FACTOR
+        while (kernel.processes.size >= cap) {
+            val oldest = kernel.processes.orphanZombies.firstOrNull() ?: break
+            reapLocked(oldest)
+        }
+    }
+
+    /** 専用スレッドのうち、まだ終わっていないかもしれないものの数（テスト用） */
+    internal val retiredThreadCount: Int get() = lock.withLockValue { retiredThreads.size }
 
     /** マシンの不整合: マシンを CRASHED にして、投げる例外を返す。カーネルロックの中で呼ぶ */
     internal fun inconsistencyLocked(message: String): KernelInconsistencyException {
@@ -829,6 +894,10 @@ public class Machine private constructor(
         retiredThreads.removeAll { !it.isAlive }
         runtimes.clear()
         fuelWaiters.removeAll { it.process.state.isTerminal }
+        // 前の起動のゾンビの ProcessObject を返す（#46）
+        for (process in kernel.processes.all()) {
+            if (process.objectId != 0 && kernel.objects[process.objectId] != null) kernel.objects.release(process.objectId, wakeSink)
+        }
         kernel.processes.reset()
         initPid = 0
         unmountAllLocked()
@@ -1012,17 +1081,21 @@ public class Machine private constructor(
      * [call] を次の `tick()` の中でメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
      * 残りは次の tick へ、出した順に）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
      * マシンが止めている途中・止まった（CRASHED）とき、スケジューラが閉じているときは、[ProcessKilledException] で終えた future を返す。
-     * 実行する前にマシンを止めたときも、同じ例外で終える（実行しない）
+     * 実行する前にマシンを止めたときも、同じ例外で終える（実行しない）。
+     *
+     * [pid] は出したプロセス（0 = プロセスでない。テスト・カーネル）。そのプロセスが止められている・終わっていれば、
+     * 同じロックの中で確かめて積まずに断る。積んだ後にそのプロセスを止めたら、実行する前のものを取り消す（#46）
      */
-    internal fun <T> submitHostCall(call: HostCall<T>): CompletableFuture<T> {
+    internal fun <T> submitHostCall(pid: Int, call: HostCall<T>): CompletableFuture<T> {
         val future = CompletableFuture<T>()
         lock.lock()
         try {
-            if (stateValue == MachineState.STOPPING || stateValue == MachineState.CRASHED || scheduler.isClosed) {
+            val stopped = pid != 0 && runtimes[pid].let { it == null || it.killed || it.process.state.isTerminal }
+            if (stopped || stateValue == MachineState.STOPPING || stateValue == MachineState.CRASHED || scheduler.isClosed) {
                 future.completeExceptionally(ProcessKilledException())
                 return future
             }
-            hostCalls.addLast(PendingHostCall(call, future))
+            hostCalls.addLast(PendingHostCall(pid, call, future))
         } finally {
             lock.unlock()
         }
@@ -1057,6 +1130,14 @@ public class Machine private constructor(
         }
     }
 
+    /** プロセス [pid] が出して、まだ実行していないホスト呼び出しを取り消す（ほかのプロセスの分は順番を変えずに残す。#46） */
+    internal fun cancelHostCallsLocked(pid: Int) {
+        if (hostCalls.isEmpty()) return
+        hostCalls.removeAll { pending ->
+            (pending.pid == pid).also { if (it) pending.future.completeExceptionally(ProcessKilledException()) }
+        }
+    }
+
     public companion object {
         /** ビープの周波数の下限（Hz） */
         public const val MIN_BEEP_FREQUENCY_HZ: Int = 20
@@ -1076,6 +1157,20 @@ public class Machine private constructor(
             config: MachineConfig,
             environment: MachineEnvironment,
         ): Machine = Machine(scheduler, id, host, config, environment)
+
+        /** 親のないゾンビを刈り取り始める、表の大きさの `maxProcesses` に対する倍率（仮の値。確定は #251） */
+        private const val ORPHAN_ZOMBIE_TABLE_FACTOR: Int = 2
+
+        /** 既定の TTY のシグナルの受け口: 前のプロセスに送る（結果は捨てる） */
+        private val DEFAULT_TTY_SIGNAL_HANDLER = TtySignalHandler { machine, signal, foregroundPid ->
+            if (foregroundPid != 0) {
+                val kill = when (signal) {
+                    TtySignal.INTERRUPT -> KillSignal.INTERRUPT
+                    TtySignal.QUIT -> KillSignal.QUIT
+                }
+                machine.killLocked(foregroundPid, kill)
+            }
+        }
 
         /** 起動の始めに、前のスレッドを待つときの見直しの間隔 */
         private const val BOOT_WAIT_NANOS: Long = 10_000_000
@@ -1123,7 +1218,12 @@ internal fun interface HostCall<T> {
     fun run(): T
 }
 
-private class PendingHostCall<T>(val call: HostCall<T>, val future: CompletableFuture<T>) {
+private class PendingHostCall<T>(
+    /** 出したプロセス（0 = プロセスでない） */
+    val pid: Int,
+    val call: HostCall<T>,
+    val future: CompletableFuture<T>,
+) {
     fun run() {
         if (future.isDone) return
         try {

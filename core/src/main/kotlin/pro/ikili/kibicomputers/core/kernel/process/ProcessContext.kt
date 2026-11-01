@@ -67,6 +67,37 @@ internal interface ProcessContext {
     /** このプロセスの子の pid（ゾンビを含む。割り当ての順） */
     fun children(): List<Int>
 
+    // ---- 終了待ち・シグナル（#46、ADR 0046。WASM に見せる形は #74） ----
+
+    /**
+     * 終わった子を1つ刈り取る。待たない（WNOHANG 相当）。[ChildSelector.Any] は pid の割り当ての順でいちばん古い、終わった子。
+     * 刈り取った子は表から消える。待つ子がいない・自分の子でなければ [ReapResult.NoChild]、終わっていなければ [ReapResult.Running]
+     */
+    fun tryReap(selector: ChildSelector): ReapResult
+
+    /**
+     * [selector] の子の終わりを待つための key（[ChildSelector.Pid] → その子の `EXITED`、[ChildSelector.Any] → 自分の `CHILD_EXITED`）。
+     * 待つ子がいなければ空。待機点型は `StepResult.Wait` で、ブロッキング型は [block] で待ち、起きたら [tryReap] する
+     */
+    fun childExitKeys(selector: ChildSelector): List<WaitKey>
+
+    /**
+     * ブロッキング型だけ: 終わった子を刈り取るまで待つ（[tryReap] が `Running` なら [block] で待ち直す）。
+     * [ReapResult.Running] は返さない
+     */
+    @Throws(ProcessKilledException::class)
+    fun waitChild(selector: ChildSelector): ReapResult
+
+    /**
+     * [pid] に [signal] を送る。待たずに返す（止まったことは終了待ちで知る）。マシンの中のどのプロセスにも送れるが、init には送れない
+     * （[KillResult.NOT_PERMITTED]）。自分に送って止まるときは [ProcessKilledException] を投げる
+     */
+    @Throws(ProcessKilledException::class)
+    fun kill(pid: Int, signal: KillSignal): KillResult
+
+    /** 自分が [signal] を無視するか決める。子には引き継がない。[KillSignal.KILL] は [IllegalArgumentException] */
+    fun setSignalIgnored(signal: KillSignal, ignored: Boolean)
+
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
     val instance: WasmInstance
 
@@ -132,7 +163,9 @@ internal interface ProcessContext {
     /**
      * [call] を次の `tick()` の中でメインスレッドから実行し、その結果を待つ（[awaitHost] と同じく、待つ間は CPU と許可を返す）。
      * ワールド・デバイスに触る処理はこれで行う。[call] の例外は、CPU を取り直してから投げる。
-     * マシンを止めたときは [ProcessKilledException]（実行していない呼び出しは実行しない）
+     * マシンを止めたとき・このプロセスを止めたとき（[kill]、Ctrl+C）は [ProcessKilledException]（実行していない呼び出しは実行しない）。
+     * 取り消すのはまだ列にあるものだけで、メインスレッドがもう実行し始めた呼び出しは最後まで実行する
+     * （途中で止めるとワールドが半端な状態になるため。結果は捨てる）
      */
     @Throws(ProcessKilledException::class)
     fun <T> callOnMainThread(call: HostCall<T>): T
