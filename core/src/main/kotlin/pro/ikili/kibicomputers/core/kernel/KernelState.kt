@@ -36,6 +36,12 @@ internal class KernelState(maxProcesses: Int) {
     var consoleTtyId: Int = 0
 
     /**
+     * 今の起動の init の pid（0 = いない）。起動の手順が init を作ったときに入れ、init が終わったとき・次の起動の始めに 0 に戻す（#49・#365）。
+     * 戻したマシンでも init を見分けられるよう、保存の対象に置く（init が終わったらマシンを止める、init にはシグナルを送れない）
+     */
+    var initPid: Int = 0
+
+    /**
      * マシンの時計（単調時計・起動からの経過。#64、ADR 0064）。WASI の `MONOTONIC`（#69）はこの単調時計。
      * 中のずれは今の JVM の時計と tick の番号に対する値なので、保存（#81）は `KernelClocks.snapshot` を書き出す。
      * タイマーそのものはオブジェクト表の `Timer`。乱数は環境（`EntropySource`）から取るだけで、状態を持たない（#69）

@@ -466,4 +466,86 @@ class BootTest {
         assertEquals(listOf("/" to "disk:d"), mounts())
         assertEquals("kibi: /tmp not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
     }
+
+    private fun Env.initPid(): Int = m.lock.withLockValue { m.kernel.initPid }
+
+    @Test
+    fun `起動の途中は待機点にせず、作ったinitのpidをKernelStateに置く`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.isAtWaitPoint, "起動していない止まったマシンは待機点")
+        assertEquals(0, initPid())
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            reached.countDown()
+            release.await()
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        // プロセスは0個で、マウントの途中だが、待機点ではない
+        assertEquals(emptyList<Int>(), pids())
+        assertFalse(m.isAtWaitPoint, "起動の途中は待機点にしない")
+        assertEquals(0, initPid())
+        release.countDown()
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting }
+        assertEquals(1, initPid())
+
+        m.stop()
+        tickUntil { m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(m.isAtWaitPoint, "stop() で止まったマシンは待機点")
+    }
+
+    @Test
+    fun `initが終わるとinitPidを0に戻し、止まったマシンは待機点`() = env {
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertEquals(0, initPid())
+        assertTrue(m.isAtWaitPoint)
+    }
+
+    @Test
+    fun `再起動の求めから再起動するまでは待機点にしない`() = env {
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(m.isAtWaitPoint)
+        // STOPPED でプロセスもスレッドもないので、すぐ通知を積む（配るのは次の tick）
+        assertTrue(m.reboot())
+        assertEquals(MachineState.STOPPED, m.state)
+        assertFalse(m.isAtWaitPoint, "通知を配るまでは待機点にしない（ここで保存すると再起動が消える）")
+        tickUntil { host.reboots.get() == 1 && Regex("init exited").findAll(host.console).count() == 2 && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(m.isAtWaitPoint, "再起動が済んで止まったマシンは待機点")
+        assertEquals(0, initPid())
+    }
+
+    @Test
+    fun `動いているinitの再起動を待つ間は待機点にせず、次の起動のinitのpidを置く`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        val firstInit = process(1)!!
+        assertEquals(1, initPid())
+        assertTrue(m.reboot())
+        assertFalse(m.isAtWaitPoint, "再起動を求めてから止まるまでは待機点にしない")
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting }
+        assertTrue(process(1) !== firstInit)
+        assertEquals(1, initPid(), "次の起動の init の pid")
+    }
+
+    @Test
+    fun `initかどうかはKernelStateのinitPidで決める`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        assertEquals(KillResult.NOT_PERMITTED, m.lock.withLockValue { m.killLocked(1, KillSignal.KILL) })
+        m.lock.withLockValue { m.kernel.initPid = 0 }
+        assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(1, KillSignal.KILL) })
+        tickUntil { m.stateOf(1).isTerminal }
+        assertFalse(host.console.contains("init was killed"), "init とみなさないので、init の終わりとして扱わない: ${host.console}")
+    }
 }
