@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
@@ -141,6 +142,48 @@ class TotalMemoryLimitTest {
             assertEquals(3, fs.write(node, 0, byteArrayOf(1, 2, 3), 0, 3))
             assertTrue(h.scheduler.memoryAccount.usedBytes > 0)
             fs.removeFile(VfsPath.parse("/x"))
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+        }
+    }
+
+    /** `/tmp` をマウントして [bytes] バイト書く（カーネルロックの中） */
+    private fun fillTmp(m: Machine, bytes: Int) = m.lock.withLockValue {
+        assertEquals(null, m.mountTmp())
+        val file = m.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = false, write = true, create = true))
+        assertEquals(bytes, m.vfs.write(file, ByteArray(bytes), 0, bytes))
+    }
+
+    @Test
+    fun `止まったマシンの tmp は、次の起動を待たずに全体へ返す`() = timeout(limit) {
+        harness(totalPages = 6).use { h ->
+            val m = h.machine(memoryBytes = 16 * page)
+            fillTmp(m, 100)
+            assertTrue(h.scheduler.memoryAccount.usedBytes > 0)
+            m.stop()
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+            assertEquals(0L, m.memoryAccount.usedBytes)
+        }
+    }
+
+    @Test
+    fun `閉じたマシンの tmp は、プロセスが終わったら全体へ返す`() = timeout(limit) {
+        harness(totalPages = 6).use { h ->
+            val m = h.machine(memoryBytes = 16 * page)
+            val never = m.lock.withLockValue { m.kernel.objects.add(ByteStream(1)) }
+            val started = CountDownLatch(1)
+            val pid = m.spawnTest(
+                h.program(memoryModule(1)),
+                TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    started.countDown()
+                    ctx.block(listOf(WaitKey(never, WaitCondition.READABLE)))
+                    StepResult.Exit(0)
+                },
+            )
+            h.tickUntil("プロセスが始まらない") { started.count == 0L }
+            fillTmp(m, 100)
+            // チャンクのアンロードやブロックの破壊（MachineManager.stopEntry）と同じ: close() だけ呼ぶ
+            m.close()
+            h.tickUntil("プロセスが終わらない") { m.stateOf(pid).isTerminal }
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
         }
     }

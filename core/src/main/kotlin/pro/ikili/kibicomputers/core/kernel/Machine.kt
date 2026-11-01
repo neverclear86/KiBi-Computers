@@ -1126,9 +1126,18 @@ public class Machine private constructor(
         checkAllDoneLocked()
     }
 
-    /** 最後のプロセスが終わったら STOPPED にする。カーネルロックの中で呼ぶ */
+    /**
+     * 最後のプロセスが終わったら STOPPED にする。カーネルロックの中で呼ぶ。
+     *
+     * 起動の途中（[bootingValue]）でなければ、`/tmp`（RAM に数えるファイルシステム）のマウントを外して RAM を返す（#362）。
+     * ディスクなどほかのマウントは、次の起動まで残す。
+     * 次の起動を待たずに、止まったマシン・閉じたマシン（`close()` はプロセスの終わりを待たない）が
+     * サーバー全体の勘定（[MachineScheduler.memoryAccount]）を持ち続けないようにする。
+     * 起動の途中の取り消しは [endBoot] が外す。
+     */
     internal fun checkAllDoneLocked() {
         if (kernel.processes.liveCount() > 0) return
+        if (!bootingValue) unmountTmpLocked()
         if (stateValue == MachineState.RUNNING || stateValue == MachineState.STOPPING) setStateLocked(MachineState.STOPPED, null)
         if (registeredThreads == 0) {
             terminated.signalAll()
@@ -1262,6 +1271,11 @@ public class Machine private constructor(
         }
         bootCancelled = false
         maybePostRebootLocked()
+    }
+
+    /** `/tmp`（[MachineLimits.TMP_SOURCE]）のマウントを外し、中身が持つ RAM を返す（カーネルロックの中） */
+    private fun unmountTmpLocked() {
+        for (entry in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) vfs.unmount(entry.id)
     }
 
     /** マウントを深いほうからすべて外す（カーネルロックの中） */
