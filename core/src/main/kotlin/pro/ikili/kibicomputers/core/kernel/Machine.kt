@@ -523,7 +523,8 @@ public class Machine private constructor(
      * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
      * - 普通のファイルでなければ `ACCES`、[MachineLimits.MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
      * - 読み込むときに、[drivers] の止まりうる import（[ProcessDriverFactory.waitImports]）で待機点への変換をかける（#329）。
-     *   変換できない作りなら変換せずに続ける。予約した名前（`kibi.async_push` など）をすでに使っている WASM は `NOEXEC`
+     *   変換できない作り（v128 のローカル、末尾呼び出しなど）は `NOEXEC` で断り、メッセージにどの命令・どの機能かを書く（#367。
+     *   `BLOCKING` 型には落とさない）。予約した名前（`kibi.async_push` など）をすでに使っている WASM も `NOEXEC`
      * - 読み込むときに燃料の計測コードを挿入する（#38）。計測の名前（`kibi.fuel`・`kibi_fuel`）をすでに使っている WASM も `NOEXEC`
      * - 読み込む前に構造の上限（関数・ローカル変数・テーブルの要素の数など）を確かめ、挿入・パース・検証に時間の上限を設ける
      *   （#40。[pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits]）。超えたら `NOEXEC`。import の確認はドライバー（[drivers]）がする
@@ -576,6 +577,7 @@ public class Machine private constructor(
                 throw e
             }
         } catch (e: WasmLoadException) {
+            Program.unsuspendableReason(e)?.let { fsError(Errno.NOEXEC, "${executable.path} は待機点に変換できない作りなので動かせない: $it") }
             fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
         } catch (e: ProgramLoadBusyException) {
             fsError(Errno.AGAIN, "${executable.path} を読み込めない: ${e.message}")
@@ -1246,7 +1248,7 @@ public class Machine private constructor(
      * [failure] が `null`（取り消し）か、取り消されていれば何も知らせない。そうでなければコンソールに書いて [MachineHost.onBootFailed] で知らせる
      *
      * @param reason コンソールのメッセージに入れる短い英語（errno の名前など）
-     * @param detail [MachineHost.onBootFailed] に渡す理由（`null` なら [reason]）
+     * @param detail [MachineHost.onBootFailed] に渡す理由（`null` なら [reason]）。[BootFailure.INIT_NOT_EXECUTABLE] なら、コンソールにも次の行に書く
      */
     internal fun endBoot(failure: BootFailure?, reason: String, detail: String? = null): Unit = lock.withLockValue {
         if (!bootingValue) return@withLockValue
@@ -1254,6 +1256,8 @@ public class Machine private constructor(
         if (kernel.processes.liveCount() == 0) unmountAllLocked()
         if (failure != null && !bootCancelled) {
             writeConsoleLine(BootSequence.consoleMessage(failure, reason))
+            // init を実行できない理由（待機点に変換できない作りなら、どの命令・どの機能か。#367）は、次の行に出す
+            if (failure == BootFailure.INIT_NOT_EXECUTABLE && detail != null) writeConsoleLine("kibi: $detail")
             postNotification(HostNotification.BootFailed(failure, detail ?: reason))
         }
         bootCancelled = false

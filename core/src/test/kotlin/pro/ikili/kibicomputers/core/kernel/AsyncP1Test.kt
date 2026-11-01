@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -21,14 +24,18 @@ import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.time.ManualClock
 import pro.ikili.kibicomputers.core.kernel.time.ManualTimerService
 import pro.ikili.kibicomputers.core.kernel.time.Timer
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
 import java.time.Duration
+import java.util.Collections
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -138,7 +145,7 @@ class AsyncP1Test {
             val s = Session(h, h.machine(fuelPerTick = 10_000_000), emptyList())
             s.awaitPrompt()
             assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
-            assertNull(s.rt.program.asyncRejection)
+            assertTrue(s.rt.program.module.isAsyncified)
             eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
             assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
@@ -347,27 +354,78 @@ class AsyncP1Test {
     }
 
     @Test
-    fun `変換できない作りのモジュールはBLOCKINGで動き、断った理由が残る`() = timeout(limit) {
-        val program = Program.loadMetered(EndiveRuntime(), simdCommand(), null, WasiP1.WAIT_IMPORTS)
-        assertFalse(program.module.isAsyncified)
-        assertTrue(program.asyncRejection!!.contains("v128"), program.asyncRejection)
-        assertEquals(ProcessKind.BLOCKING, WasiP1Driver(program.module).kind)
+    fun `変換できない作りのモジュールは読み込みを断り、理由に断った機能が入る`() = timeout(limit) {
+        val e = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), simdCommand(), null, WasiP1.WAIT_IMPORTS) }
+        val reason = Program.unsuspendableReason(e)
+        assertNotNull(reason, "${e.message}")
+        assertTrue(reason!!.contains("v128"), reason)
+        // 変換をかけない読み込み（テストの設定）は、これまでどおり BLOCKING で動かせる
+        val unconverted = Program.loadMetered(EndiveRuntime(), simdCommand(), null)
+        assertFalse(unconverted.module.isAsyncified)
+        assertEquals(ProcessKind.BLOCKING, WasiP1Driver(unconverted.module).kind)
+        // 変換できないのでなく、WASM として読めないものは理由を持たない
+        val garbage = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), byteArrayOf(1, 2, 3), null, WasiP1.WAIT_IMPORTS) }
+        assertNull(Program.unsuspendableReason(garbage))
+    }
 
+    private fun Machine.installSimd(path: String) = lock.withLockValue {
+        vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+        val bytes = simdCommand()
+        val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
+        vfs.write(f, bytes, 0, bytes.size)
+    }
+
+    @Test
+    fun `変換できない作りのモジュールのexecはNOEXECで、プロセスもBLOCKINGの枠も使わない`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
-            m.lock.withLockValue {
-                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.installSimd("/simd")
+            val closed = SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed))
+            // 2回目は、覚えている失敗（ProgramCache）から同じ理由で断る
+            repeat(2) {
+                val e = assertThrows<FsException> { m.exec("/simd", KernelDrivers.DEFAULT, closed) }
+                assertEquals(Errno.NOEXEC, e.errno)
+                assertTrue(e.message!!.contains("待機点に変換できない") && e.message!!.contains("v128"), e.message)
+            }
+            assertEquals(emptyList<Int>(), m.lock.withLockValue { m.kernel.processes.all().map { it.pid } })
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+        }
+    }
+
+    @Test
+    fun `initが変換できない作りなら起動に失敗し、コンソールに理由を出す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val console = StringBuffer()
+            val failures = Collections.synchronizedList(ArrayList<BootFailure>())
+            val host = object : MachineHost {
+                override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+                override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+                    console.append(String(bytes, Charsets.UTF_8))
+                }
+
+                override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+                    failures += failure
+                }
+            }
+            val disk = TestMemoryFileSystem().also { fs ->
+                fs.createDirectory(VfsPath.parse("/sbin"))
                 val bytes = simdCommand()
-                val f = m.vfs.open(VfsPath.parse("/simd"), OpenOptions(read = true, write = true, create = true, truncate = true))
-                m.vfs.write(f, bytes, 0, bytes.size)
+                fs.write(fs.createFile(VfsPath.parse(BootConfig.INIT_PATH)), 0, bytes, 0, bytes.size)
             }
-            val pid = m.exec("/simd", KernelDrivers.DEFAULT, SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)))
-            assertEquals(ProcessKind.BLOCKING, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
-            eventually(30_000, "終わらない") {
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "simd") BootVolume(disk, readOnly = false) else null }
+            val m = h.machine(fuelPerTick = 10_000_000, host = host)
+            assertTrue(m.boot(BootConfig.builder().addBootDisk("simd").build()))
+            eventually(30_000, "失敗が届かない") {
                 h.scheduler.tick()
-                m.stateOf(pid).isTerminal
+                failures.isNotEmpty()
             }
-            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+            assertEquals(listOf(BootFailure.INIT_NOT_EXECUTABLE), failures.toList())
+            assertEquals(MachineState.STOPPED, m.state)
+            val text = console.toString().replace("\r\n", "\n")
+            assertTrue(text.contains("kibi: cannot start /sbin/init: NOEXEC\n"), text)
+            assertTrue(text.contains("待機点に変換できない") && text.contains("v128"), text)
         }
     }
 }

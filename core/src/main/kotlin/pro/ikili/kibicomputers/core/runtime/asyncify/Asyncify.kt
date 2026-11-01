@@ -11,9 +11,10 @@ import run.endive.wasm.types.ValType
 import java.io.ByteArrayOutputStream
 
 /**
- * 変換できない作りのモジュール（#329）。呼んだ側は変換せずに、そのまま（`BLOCKING` のプロセスとして）動かす。
+ * 変換できない作りのモジュール（#329）。`Program.loadMetered` は、これを原因にした `WasmLoadException` で読み込みを断る
+ * （`exec` は `NOEXEC`。#367）。
  *
- * [message] は断った理由（ログとテスト用）。
+ * [message] は断った理由（どの命令・どの機能か。`exec` のエラーメッセージに入る）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 

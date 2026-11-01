@@ -34,12 +34,8 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
     }
 }
 
-/**
- * 読み込んだモジュールと、その識別子の組。
- *
- * [asyncRejection] は、待機点への変換（#329）を断った理由（変換を試みて断ったときだけ。ログとテスト用）。
- */
-internal class Program private constructor(val hash: ModuleHash, val module: WasmModule, val asyncRejection: String? = null) {
+/** 読み込んだモジュールと、その識別子の組。 */
+internal class Program private constructor(val hash: ModuleHash, val module: WasmModule) {
     companion object {
         /**
          * [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない）。
@@ -63,27 +59,31 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
          * [limits] があれば、挿入する前に構造の上限を確かめ、変換・挿入・パース・検証の全体で時間の上限を守る（#40）
          *
          * [waitImports] が空でなければ、挿入の前に待機点への変換（[Asyncify]、#329）をかける。順番は
-         * 「構造の上限の確認 → 変換 → 燃料の計測コードの挿入 → パースと検証」。変換できない作りなら変換せずに続け、理由を
-         * [Program.asyncRejection] に入れる。予約した名前（`kibi.async_push` など）を使っている WASM は [WasmLoadException] で断る
+         * 「構造の上限の確認 → 変換 → 燃料の計測コードの挿入 → パースと検証」。変換できない作り（v128 のローカル、末尾呼び出しなど）は、
+         * 変換せずに（`BLOCKING` のプロセスとして）読み込むことはせず、[WasmLoadException] で断る（#364・#367）。
+         * そのときの原因（`cause`）は [AsyncifyUnsupported] で、どの命令・どの機能で断ったかは [unsuspendableReason] で取り出せる。
+         * 予約した名前（`kibi.async_push` など）を使っている WASM も [WasmLoadException] で断る
          */
         @Throws(WasmLoadException::class)
         fun loadMetered(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null, waitImports: Set<String> = emptySet()): Program {
             val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
             if (limits != null) ModulePrescan.check(bytes, limits, deadline)
             var source = bytes
-            var rejection: String? = null
             if (waitImports.isNotEmpty()) {
                 try {
                     source = Asyncify.transform(bytes, waitImports) { deadline?.check("待機点への変換") }.bytes
                 } catch (e: AsyncifyUnsupported) {
-                    rejection = e.message ?: "変換できない"
+                    throw WasmLoadException("待機点に変換できない: ${e.message ?: "理由不明"}", e)
                 }
             }
             val injected = FuelInjector.inject(source) { deadline?.check("燃料の計測コードの挿入") }.bytes
             val module = runtime.load(injected)
             deadline?.check("パース・検証・コンパイル")
-            return Program(ModuleHash.of(injected), module, rejection)
+            return Program(ModuleHash.of(injected), module)
         }
+
+        /** [e] が、待機点に変換できない作りのために [loadMetered] が断ったものなら、その理由（どの命令・どの機能か）。違えば `null` */
+        fun unsuspendableReason(e: WasmLoadException): String? = (e.cause as? AsyncifyUnsupported)?.let { it.message ?: "理由不明" }
     }
 }
 
