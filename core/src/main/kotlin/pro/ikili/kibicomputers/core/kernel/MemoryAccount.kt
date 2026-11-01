@@ -7,19 +7,31 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * マシン全体（RAM）の使用量（#39・#53）。実行時だけのもので、保存しない。
+ * RAM の使用量（#39・#53・#362）。実行時だけのもので、保存しない。
  *
  * 数えるのは、プロセスの線形メモリ（ページ単位）と、テーブル（#361）や `/tmp` などメモリ上のファイルシステムの中身（バイト単位。[tryReserveBytes]）。
- * 合計はバイトで数え、上限は RAM のページ数 × 64 KiB。
+ * 合計はバイトで数え、上限は [limitBytes]。
+ *
+ * マシンごとの勘定（上限は RAM のページ数 × 64 KiB）は、親としてサーバー全体の勘定（[MachineScheduler] に1つ。#362）を持つ。
+ * 確保は自分と親の両方に収まるときだけ数え、親で断られたら自分の分を戻す。返すときは両方から引く。
  *
  * `memory.grow` はプロセスのスレッドから、カーネルロックを持たずに呼ばれるので、ロックではなく CAS で数える。
  */
 internal class MemoryAccount(
-    /** RAM のページ数 */
-    val limitPages: Int,
+    /** 上限（バイト。0 以上） */
+    val limitBytes: Long,
+    /** 親の勘定（サーバー全体）。`null` なら親を持たない */
+    private val parent: MemoryAccount? = null,
 ) {
-    /** RAM の大きさ（バイト） */
-    val limitBytes: Long = limitPages.toLong() * WasmMemory.PAGE_SIZE
+    /** マシンの RAM の勘定（上限は [limitPages] ページ） */
+    constructor(limitPages: Int, parent: MemoryAccount? = null) : this(limitPages.toLong() * WasmMemory.PAGE_SIZE, parent)
+
+    init {
+        require(limitBytes >= 0) { "上限は 0 以上: $limitBytes" }
+    }
+
+    /** 上限のページ数（32 ビットのメモリの上限で切る） */
+    val limitPages: Int = minOf(limitBytes / WasmMemory.PAGE_SIZE, WasmMemory.MAX_PAGES.toLong()).toInt()
 
     private val usedBytesCounter = AtomicLong()
     private val linearPages = AtomicInteger()
@@ -43,21 +55,23 @@ internal class MemoryAccount(
         releaseBytes(pages.toLong() * WasmMemory.PAGE_SIZE)
     }
 
-    /** [bytes] バイト（0 以上）を確保できれば数えて `true`（テーブル、メモリ上のファイルシステムの中身など） */
+    /** [bytes] バイト（0 以上）を、自分と親の両方に収まれば数えて `true`（テーブル、メモリ上のファイルシステムの中身など） */
     fun tryReserveBytes(bytes: Long): Boolean {
         require(bytes >= 0) { "バイト数は 0 以上: $bytes" }
-        while (true) {
-            val current = usedBytesCounter.get()
-            if (bytes > limitBytes - current) return false
-            if (usedBytesCounter.compareAndSet(current, current + bytes)) return true
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return false
+        if (parent != null && !parent.tryReserveBytes(bytes)) {
+            usedBytesCounter.addAndGet(-bytes)
+            return false
         }
+        return true
     }
 
-    /** [tryReserveBytes] で確保した [bytes] バイトを返す */
+    /** [tryReserveBytes] で確保した [bytes] バイトを返す（親からも引く） */
     fun releaseBytes(bytes: Long) {
         require(bytes >= 0) { "バイト数は 0 以上: $bytes" }
         val after = usedBytesCounter.addAndGet(-bytes)
         check(after >= 0) { "RAM の使用量が負になった: $after" }
+        parent?.releaseBytes(bytes)
     }
 
     /** 1 プロセスの使用量。上限 [limitPages] と、マシン全体の両方に収まるときだけ確保する */
