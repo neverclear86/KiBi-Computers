@@ -64,6 +64,13 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     /** 配っていない出力 */
     private val output = TtyBytes(outputCapacity + ECHO_SLACK_BYTES)
 
+    /**
+     * これまでに出力に積んだバイト数（#381。取り出す位置の目印 [drainOutput] に使う）。実行時だけの値で、保存しない
+     * （読み込んだ後は 0 から数え直す）
+     */
+    var outputWritten: Long = 0
+        private set
+
     /** 編集中の行が始まった出力の桁 */
     private var lineStartColumn = 0
 
@@ -207,12 +214,19 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         return if (n == 0) WriteResult.WouldBlock else WriteResult.Bytes(n)
     }
 
-    /** たまった出力を全部取り出す。書けなかった状態から空いたら `(id, WRITABLE)` を知らせる。なければ `null` */
-    fun drainOutput(sink: WakeSink): ByteArray? {
-        if (output.length == 0) return null
+    /**
+     * たまった出力を、[outputWritten] が [upTo] だった時点までに積んだ分だけ取り出す（既定は全部）。
+     * 書けなかった状態から空いたら `(id, WRITABLE)` を知らせる。取り出すものがなければ `null`
+     */
+    fun drainOutput(sink: WakeSink, upTo: Long = Long.MAX_VALUE): ByteArray? {
+        // まだ残っている分のうち、upTo より後に積んだ分を除く
+        val later = (outputWritten - upTo).coerceIn(0L, output.length.toLong()).toInt()
+        val n = output.length - later
+        if (n <= 0) return null
         val wasBlocked = !isReady(WaitCondition.WRITABLE)
-        val bytes = output.takeAll()
-        if (wasBlocked) sink.wake(WaitKey(id, WaitCondition.WRITABLE))
+        val bytes = ByteArray(n)
+        output.take(bytes, 0, n)
+        if (wasBlocked && isReady(WaitCondition.WRITABLE)) sink.wake(WaitKey(id, WaitCondition.WRITABLE))
         return bytes
     }
 
@@ -536,6 +550,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
     private fun put(b: Int) {
         output.add(b.toByte())
+        outputWritten++
         outputAdded = true
         trackColumn(b)
     }
