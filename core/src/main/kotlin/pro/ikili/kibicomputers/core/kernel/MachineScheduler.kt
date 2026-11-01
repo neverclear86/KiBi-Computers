@@ -71,6 +71,12 @@ public class MachineScheduler private constructor(
     /** 読み込んだ実行ファイルの共有（#37。`Machine.exec` が使う） */
     internal val programs: ProgramCache = ProgramCache(config.programCacheEntries, config.programCacheBytes, compilerExecutor)
 
+    /**
+     * サーバー全体の RAM の勘定（#362。上限は [SchedulerConfig.totalMemoryBytes]）。各マシンの勘定（[Machine.memoryAccount]）の親。
+     * 全体の残りが足りなければ、どのマシンでも `memory.grow`・`/tmp` への書き込み・プロセスの生成を断る
+     */
+    internal val memoryAccount: MemoryAccount = MemoryAccount(config.totalMemoryBytes)
+
     /** タイマーの期限を待つ口（#64、ADR 0064。既定はスレッド `KiBi-timer` 1本） */
     internal val timerService: TimerService = options.timers ?: ExecutorTimerService(TIMER_STACK_BYTES)
 
@@ -345,6 +351,13 @@ public class SchedulerConfig private constructor(builder: Builder) {
     /** [programCacheEntries] で残すものの、WASM のバイト数の合計の上限（仮: 32 MiB。#37） */
     public val programCacheBytes: Long = builder.programCacheBytes
 
+    /**
+     * サーバー全体の RAM の上限（バイト。#362）。全マシンの RAM の使用量（線形メモリ・テーブル・`/tmp` の中身）の合計の上限。
+     * 超える `memory.grow` は -1、`/tmp` への書き込みは `ENOSPC`、最初のメモリを確保できないプロセスは作れない。
+     * 仮: JVM のヒープの最大値（`Runtime.maxMemory()`）の半分（確定は #251）
+     */
+    public val totalMemoryBytes: Long = builder.totalMemoryBytes ?: defaultTotalMemoryBytes()
+
     /** [SchedulerConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
@@ -353,6 +366,7 @@ public class SchedulerConfig private constructor(builder: Builder) {
         internal var compilerThreads: Int = 1
         internal var programCacheEntries: Int = 32
         internal var programCacheBytes: Long = 32L * 1024 * 1024
+        internal var totalMemoryBytes: Long? = null
 
         /** 同時に WASM を実行するマシンの数の上限（1 以上） */
         public fun maxConcurrentMachines(value: Int): Builder = apply {
@@ -390,11 +404,20 @@ public class SchedulerConfig private constructor(builder: Builder) {
             programCacheBytes = value
         }
 
+        /** サーバー全体の RAM の上限（バイト。0 以上）。設定しなければ JVM のヒープの最大値の半分 */
+        public fun totalMemoryBytes(value: Long): Builder = apply {
+            require(value >= 0) { "totalMemoryBytes は 0 以上" }
+            totalMemoryBytes = value
+        }
+
         /** 設定を作る。 */
         public fun build(): SchedulerConfig = SchedulerConfig(this)
     }
 
     public companion object {
+        /** [totalMemoryBytes] の既定: JVM のヒープの最大値の半分（仮。#251） */
+        private fun defaultTotalMemoryBytes(): Long = Runtime.getRuntime().maxMemory() / 2
+
         /** 既定の設定 */
         @JvmField
         public val DEFAULT: SchedulerConfig = Builder().build()

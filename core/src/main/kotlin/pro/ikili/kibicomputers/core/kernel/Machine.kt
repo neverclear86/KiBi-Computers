@@ -201,8 +201,8 @@ public class Machine private constructor(
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
 
-    /** 線形メモリの使用量（RAM。#39） */
-    internal val memoryAccount = MemoryAccount(config.memoryPages)
+    /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
+    internal val memoryAccount = MemoryAccount(config.memoryPages, scheduler.memoryAccount)
 
     /** 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ。カーネルロックの中で使う） */
     internal val vfs = Vfs(kernel.mounts)
