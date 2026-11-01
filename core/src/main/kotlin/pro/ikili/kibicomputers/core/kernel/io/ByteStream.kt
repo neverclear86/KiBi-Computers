@@ -64,6 +64,7 @@ internal class ByteStream(val capacity: Int) : KernelObject() {
     override fun isReady(condition: WaitCondition): Boolean = when (condition) {
         WaitCondition.READABLE -> available > 0 || writeClosed
         WaitCondition.WRITABLE -> available < capacity || readClosed
+        else -> false
     }
 
     /** 最大 [len] バイトを [dst] の [off] に読む。読めたら `(id, WRITABLE)` を知らせる */

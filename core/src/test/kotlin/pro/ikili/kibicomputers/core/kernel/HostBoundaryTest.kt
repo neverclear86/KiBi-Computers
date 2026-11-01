@@ -247,7 +247,7 @@ class HostBoundaryTest {
         Harness().use { h ->
             val m = h.machine(maxHostCallsPerTick = 2)
             val order = Collections.synchronizedList(ArrayList<Int>())
-            val futures = (1..5).map { i -> m.submitHostCall { order += i; i * 10 } }
+            val futures = (1..5).map { i -> m.submitHostCall(0) { order += i; i * 10 } }
             assertEquals(5, m.pendingHostCalls)
             h.scheduler.tick()
             assertEquals(listOf(1, 2), order.toList())
@@ -261,7 +261,7 @@ class HostBoundaryTest {
             h.scheduler.tick()
             assertEquals(before, h.scheduler.tickVisitedMachines.get())
             // 空になった後にまた出せる
-            val again = m.submitHostCall { "again" }
+            val again = m.submitHostCall(0) { "again" }
             h.scheduler.tick()
             assertEquals("again", again.get())
         }
@@ -276,10 +276,10 @@ class HostBoundaryTest {
             // stop() の割り込みの前のフックは、スレッドが登録されたプロセスにだけ呼ばれる。登録を待ってから止める
             eventually { m.rt(waiting).thread != null }
             var ran = false
-            val pending = m.submitHostCall { ran = true }
+            val pending = m.submitHostCall(0) { ran = true }
             // STOPPING の間に出された呼び出し（stop() の中のフックで、同じスレッドから出す）
             val during = AtomicReference<java.util.concurrent.CompletableFuture<Unit>>()
-            h.scheduler.hooks.stopBeforeInterrupt = { machine, _ -> during.compareAndSet(null, machine.submitHostCall { ran = true }) }
+            h.scheduler.hooks.stopBeforeInterrupt = { machine, _ -> during.compareAndSet(null, machine.submitHostCall(0) { ran = true }) }
             m.stop()
             for (f in listOf(pending, during.get())) {
                 val e = runCatching { f.get() }.exceptionOrNull()

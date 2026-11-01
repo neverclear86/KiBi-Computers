@@ -1,12 +1,18 @@
 package pro.ikili.kibicomputers.core.kernel.wait
 
-/** 待てる条件。種類は後続の Issue で足す（タイマー #64、プロセスの終了 #46、イベントキュー #63 など）。 */
+/** 待てる条件。種類は後続の Issue で足す（タイマー #64、イベントキュー #63 など）。 */
 internal enum class WaitCondition {
     /** 読める（読めるバイトがある、または書く側が閉じた） */
     READABLE,
 
     /** 書ける（空きがある、または読む側が閉じた） */
     WRITABLE,
+
+    /** プロセスが終わった（`ProcessObject`。#46） */
+    EXITED,
+
+    /** 刈り取られていない、終わった子がある（親の `ProcessObject`。#46） */
+    CHILD_EXITED,
 }
 
 /**

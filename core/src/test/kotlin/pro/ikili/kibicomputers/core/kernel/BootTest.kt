@@ -11,6 +11,8 @@ import pro.ikili.kibicomputers.core.kernel.fd.STDERR
 import pro.ikili.kibicomputers.core.kernel.fd.STDIN
 import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.process.KillResult
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -280,6 +282,7 @@ class BootTest {
         val child = m.spawnTest(h.program(spinForever()), runDriver(), parentPid = 1)
         assertEquals(2, child)
         val firstInit = process(1)!!
+        val oldObjects = listOf(firstInit.objectId, process(child)!!.objectId)
 
         assertTrue(m.reboot())
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
@@ -290,9 +293,29 @@ class BootTest {
         assertTrue(rebootAt > host.log.indexOf("state:STOPPED"), "止まってから再起動: ${host.log}")
         assertTrue(process(1) !== firstInit, "init を作り直す")
         assertEquals(listOf(1), pids(), "前の起動のゾンビは残らない")
+        m.lock.withLockValue {
+            for (id in oldObjects) assertNull(m.kernel.objects[id], "前の起動のゾンビの ProcessObject は残らない（#46）")
+        }
         assertEquals(listOf("/" to "disk:d"), mounts(), "前の起動のマウントは残らない")
         assertFalse(host.console.contains("init exited"), host.console.toString())
         assertEquals(2, Regex("booting from disk d").findAll(host.console).count())
+    }
+
+    @Test
+    fun `initにはシグナルを送れず、Ctrl+Cでも止まらない`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        for (signal in KillSignal.entries) {
+            assertEquals(KillResult.NOT_PERMITTED, m.lock.withLockValue { m.killLocked(1, signal) })
+        }
+        m.lock.withLockValue { m.consoleTtyLocked().foregroundPid = 1 }
+        m.offerConsoleInput(byteArrayOf(0x03, 0x1C))
+        tickFor(30)
+        assertEquals(MachineState.RUNNING, m.state)
+        assertTrue(!m.stateOf(1).isTerminal, "init は動き続ける")
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
     }
 
     @Test
