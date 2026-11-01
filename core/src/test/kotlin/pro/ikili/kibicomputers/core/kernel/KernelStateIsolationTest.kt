@@ -3,6 +3,10 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.fail
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
@@ -27,7 +31,7 @@ import java.util.IdentityHashMap
 class KernelStateIsolationTest {
     private val allowedLeaf = setOf(
         String::class.java, java.lang.Integer::class.java, java.lang.Long::class.java, java.lang.Boolean::class.java,
-        java.lang.Byte::class.java, java.lang.Short::class.java, java.lang.Character::class.java,
+        java.lang.Byte::class.java, java.lang.Double::class.java, java.lang.Short::class.java, java.lang.Character::class.java,
     )
 
     private fun walk(value: Any?, path: String, seen: IdentityHashMap<Any, Unit>) {
@@ -88,6 +92,16 @@ class KernelStateIsolationTest {
         tty.resize(TtySize(40, 12))
         tty.foregroundPid = 1
         process.handles.insert(HandleEntry(tty.id))
+        // イベント: 中身の入ったキュー、あふれた分、索引（#63）
+        val queue = EventQueue(EventFilter(setOf("key", "timer")), 4)
+        state.objects.add(queue)
+        state.events.subscribe(queue, state.objects)
+        val all = EventQueue(EventFilter.ALL)
+        state.objects.add(all)
+        state.events.subscribe(all, state.objects)
+        val values = listOf(EventValue.I64(1), EventValue.F64(0.5), EventValue.Bool(true), EventValue.Text("a"), EventValue.Bytes(byteArrayOf(1)))
+        repeat(5) { state.events.post(KernelEvent("key", "keyboard:1", values), state.objects, WakeSink.NONE) }
+        process.handles.insert(HandleEntry(queue.id))
         walk(state, "state", IdentityHashMap())
     }
 

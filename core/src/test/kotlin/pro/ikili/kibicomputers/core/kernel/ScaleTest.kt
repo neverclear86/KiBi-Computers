@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -52,6 +54,47 @@ class ScaleTest {
             machines[target].lock.withLockValue { streams[target].write(byteArrayOf(1), 0, 1, machines[target].registry) }
             eventually { resumes.get() == 1 && h.scheduler.workers.activeSteps.get() == 0 && machines[target].stateOf(pids[target]) == ProcessState.WAITING_EVENT }
             assertEquals(submitted + 1, h.scheduler.workers.submitted.get())
+        }
+    }
+
+    @Test
+    fun `1000台がイベントキューを待っている間はスレッドを持たず、tickは見ず、全台に出すと全台がresumeされる`() = timeout(Duration.ofSeconds(60)) {
+        Harness(workerIdleMillis = 200).use { h ->
+            val program = h.program(emptyModule())
+            val resumes = AtomicInteger()
+            val machines = (1..1000).map { h.machine(fuelPerTick = 1000) }
+            val pids = machines.map { m ->
+                var handle = -1
+                m.spawnTest(
+                    program,
+                    TestDriver(ProcessKind.WAIT_POINT, onResume = { ctx, _ ->
+                        ctx.takeEvents(handle)
+                        resumes.incrementAndGet()
+                        StepResult.Wait(listOf(ctx.eventWaitKey(handle)))
+                    }) { ctx ->
+                        handle = ctx.openEventQueue(EventFilter(setOf("ping")))
+                        StepResult.Wait(listOf(ctx.eventWaitKey(handle)))
+                    },
+                )
+            }
+            h.scheduler.tick()
+            eventually(30_000, "全部が待ちに入らない") { machines.indices.all { machines[it].stateOf(pids[it]) == ProcessState.WAITING_EVENT } }
+            assertTrue(machines.all { it.isAtWaitPoint })
+            assertTrue(kernelThreadNames("KiBi-m").isEmpty())
+            eventually { h.scheduler.workers.activeSteps.get() == 0 }
+            h.scheduler.tick()
+            val visited = h.scheduler.tickVisitedMachines.get()
+            repeat(100) { h.scheduler.tick() }
+            assertEquals(visited, h.scheduler.tickVisitedMachines.get(), "待っているだけのマシンは見ない")
+            // 種類の合わないイベントでは誰も動かない
+            val submitted = h.scheduler.workers.submitted.get()
+            machines.forEach { assertEquals(0, it.postEvent(KernelEvent("other"))) }
+            assertEquals(submitted, h.scheduler.workers.submitted.get())
+            machines.forEach { assertEquals(1, it.postEvent(KernelEvent("ping"))) }
+            eventually(30_000, "全台が resume されない: ${resumes.get()}") {
+                resumes.get() == 1000 && machines.indices.all { machines[it].stateOf(pids[it]) == ProcessState.WAITING_EVENT }
+            }
+            assertTrue(kernelThreadNames("KiBi-m").isEmpty())
         }
     }
 

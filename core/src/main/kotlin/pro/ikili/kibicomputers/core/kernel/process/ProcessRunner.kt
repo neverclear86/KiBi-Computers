@@ -5,7 +5,11 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.event.EventBatch
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
@@ -13,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
 import pro.ikili.kibicomputers.core.kernel.wait.ThreadWaiter
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -547,6 +552,37 @@ internal class ProcessRunner(private val machine: Machine) {
             lock.withLockValue {
                 if (ignored) rt.process.ignoredSignals.add(signal) else rt.process.ignoredSignals.remove(signal)
             }
+        }
+
+        override fun openEventQueue(filter: EventFilter, capacity: Int): Int =
+            lock.withLockValue { machine.openEventQueueLocked(rt.pid, filter, capacity) }
+
+        override fun takeEvents(handle: Int, max: Int): EventBatch {
+            if (max < 1) fsError(Errno.INVAL, "取り出す数は 1 以上（$max）")
+            return lock.withLockValue { eventQueueLocked(handle).take(max) }
+        }
+
+        override fun eventWaitKey(handle: Int): WaitKey = lock.withLockValue { WaitKey(eventQueueLocked(handle).id, WaitCondition.READABLE) }
+
+        override fun awaitEvents(handle: Int, max: Int): EventBatch {
+            checkThread()
+            if (max < 1) fsError(Errno.INVAL, "取り出す数は 1 以上（$max）")
+            while (true) {
+                val (batch, key) = lock.withLockValue {
+                    val q = eventQueueLocked(handle)
+                    q.take(max) to WaitKey(q.id, WaitCondition.READABLE)
+                }
+                if (!batch.isEmpty) return batch
+                // 確かめてから block で登録するまでに届いても、READABLE は残るので取りこぼさない
+                block(listOf(key))
+            }
+        }
+
+        private fun eventQueueLocked(handle: Int): EventQueue {
+            val table = FdTable(rt.process, machine.kernel.objects, machine.wakeSink)
+            val entry = table.entry(handle)
+            if (entry.rights and HandleRights.READ == 0) fsError(Errno.BADF, "fd $handle は読めない")
+            return table.objectOf(handle) as? EventQueue ?: fsError(Errno.BADF, "fd $handle はイベントキューではない")
         }
 
         override val instance: WasmInstance
