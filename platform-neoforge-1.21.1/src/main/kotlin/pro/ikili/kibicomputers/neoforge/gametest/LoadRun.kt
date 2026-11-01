@@ -445,7 +445,7 @@ internal class LoadRun(
         }
     }
 
-    // 偽物のプレイヤーを並べた範囲の真ん中に置き、[screens] を見ていることにする。送ったものは数えるだけ
+    // 偽物のプレイヤーを並べた範囲の真ん中に置く。[screens] を見るかはサーバーが距離で決める（#359）。送ったものは数えるだけ
     private fun watch(screens: List<Computer>) {
         if (screens.isEmpty()) return
         ScreenSync.transport = ScreenSync.Transport { player, payload ->
@@ -463,7 +463,7 @@ internal class LoadRun(
         player.teleportTo(center.x, center.y, center.z)
         level.chunkSource.move(player)
         watcher = player
-        for (c in screens) c.screen.watch(player)
+        for (c in screens) ScreenSyncGameTests.deliverChunks(player, c.screen.blockPos)
     }
 
     private fun forceChunks() {

@@ -34,23 +34,22 @@ class ScreenUpdatePayload(val dimension: ResourceKey<Level>, val pos: BlockPos, 
 }
 
 /**
- * クライアントからサーバーへの、画面を見はじめた・見るのをやめたという知らせ（#140）。
- * 見はじめると（[watch] が true）、サーバーはその tick の終わりに画面全体（キーフレーム）を送り、以後は描画命令を送る。
- * 画面はプレイヤーのいるディメンションのもの。
+ * クライアントからサーバーへの、「画面全体を送り直してほしい」というお願い（#140、#359）。
+ * 受け取ったデータが壊れていたときに送る。画面はプレイヤーのいるディメンションのもの。
+ *
+ * 誰に画面を送るかはサーバーが距離から決めるので、これはお願いにすぎない。サーバーは、その画面を見ている人の
+ * お願いだけを受け付け、送り直しはプレイヤーと画面の組ごとに一定の間隔に1回までにする。
  */
-data class ScreenWatchPayload(val pos: BlockPos, val watch: Boolean) : CustomPacketPayload {
-    override fun type(): CustomPacketPayload.Type<ScreenWatchPayload> = TYPE
+data class ScreenResyncPayload(val pos: BlockPos) : CustomPacketPayload {
+    override fun type(): CustomPacketPayload.Type<ScreenResyncPayload> = TYPE
 
     companion object {
         @JvmField
-        val TYPE: CustomPacketPayload.Type<ScreenWatchPayload> =
-            CustomPacketPayload.Type(ResourceLocation.fromNamespaceAndPath(KiBiComputers.MOD_ID, "screen_watch"))
+        val TYPE: CustomPacketPayload.Type<ScreenResyncPayload> =
+            CustomPacketPayload.Type(ResourceLocation.fromNamespaceAndPath(KiBiComputers.MOD_ID, "screen_resync"))
 
         @JvmField
-        val STREAM_CODEC: StreamCodec<ByteBuf, ScreenWatchPayload> = StreamCodec.composite(
-            BlockPos.STREAM_CODEC, ScreenWatchPayload::pos,
-            ByteBufCodecs.BOOL, ScreenWatchPayload::watch,
-            ::ScreenWatchPayload,
-        )
+        val STREAM_CODEC: StreamCodec<ByteBuf, ScreenResyncPayload> =
+            BlockPos.STREAM_CODEC.map(::ScreenResyncPayload, ScreenResyncPayload::pos)
     }
 }
