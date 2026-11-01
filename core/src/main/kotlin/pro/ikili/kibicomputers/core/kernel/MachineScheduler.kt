@@ -99,6 +99,12 @@ public class MachineScheduler private constructor(
     /** `stop()` が送った割り込みの数（数え口） */
     internal val interruptsSent = AtomicLong()
 
+    /** 燃料切れで巻き戻し、スレッドを持たずに燃料を待った回数（数え口。#339） */
+    internal val fuelUnwinds = AtomicLong()
+
+    /** 燃料切れで、スレッドを持ったまま燃料を待った回数（数え口。#339） */
+    internal val fuelBlockingWaits = AtomicLong()
+
     init {
         dispatcher.start()
     }

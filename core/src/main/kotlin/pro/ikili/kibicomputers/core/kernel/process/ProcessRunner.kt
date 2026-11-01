@@ -26,6 +26,8 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -51,7 +53,12 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /** 作ったばかりの [ProcessRuntime] に、燃料切れの処理と [ProcessContext] を付ける */
     fun initRuntime(rt: ProcessRuntime) {
-        rt.fuelHandler = WasmFuelHandler { instance, remaining -> onFuelExhausted(rt, instance, remaining) }
+        rt.fuelHandler = object : WasmFuelHandler {
+            override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = onFuelExhausted(rt, instance, remaining)
+
+            override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long =
+                onFuelExhaustedUnwindable(rt, instance, remaining)
+        }
         rt.context = Context(rt)
     }
 
@@ -70,6 +77,7 @@ internal class ProcessRunner(private val machine: Machine) {
             when (result) {
                 is StepResult.Exit -> exit(rt, result.code)
                 is StepResult.Wait -> throw IllegalStateException("ブロッキング型のプロセスは Wait を返せない")
+                StepResult.WaitFuel -> throw IllegalStateException("ブロッキング型のプロセスは WaitFuel を返せない")
             }
         } catch (t: Throwable) {
             exceptionExit(rt, t)
@@ -95,12 +103,18 @@ internal class ProcessRunner(private val machine: Machine) {
     private fun step(rt: ProcessRuntime) {
         hooks.beforeStepStart?.invoke(machine, rt.pid)
         val resumed = lock.withLockValue { rt.process.state != ProcessState.CREATED }
+        // 燃料切れで巻き戻して燃料を待っていた（#339）: 待つ key はなく、退避した値から巻き直す
+        var fuelResume = false
         if (resumed) {
             // 起こされたのに空なら、許可も燃料も使わずに待ち直す
             val empty = lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
-                val ws = rt.waitSet ?: throw IllegalStateException("待ちのない step")
-                if (ws.readyKeys(machine.kernel.objects).isEmpty()) {
+                val ws = rt.waitSet
+                if (ws == null) {
+                    check(rt.process.asyncStack?.isEmpty == false) { "待ちのない step" }
+                    fuelResume = true
+                    false
+                } else if (ws.readyKeys(machine.kernel.objects).isEmpty()) {
                     ws.rearm()
                     rt.process.state = ProcessState.WAITING_EVENT
                     true
@@ -122,9 +136,9 @@ internal class ProcessRunner(private val machine: Machine) {
             val observed = now
             machine.fuelAccount.refill(observed)
             val ws = rt.waitSet
-            if (resumed) ready = ws!!.readyKeys(machine.kernel.objects)
+            if (resumed && !fuelResume) ready = ws!!.readyKeys(machine.kernel.objects)
             when {
-                resumed && ready.isEmpty() -> {
+                resumed && !fuelResume && ready.isEmpty() -> {
                     ws!!.rearm()
                     rt.process.state = ProcessState.WAITING_EVENT
                     Outcome.REARM
@@ -136,7 +150,7 @@ internal class ProcessRunner(private val machine: Machine) {
                     Outcome.NO_FUEL
                 }
                 else -> {
-                    if (resumed) {
+                    if (resumed && !fuelResume) {
                         ws!!.unregister(machine.registry)
                         rt.waitSet = null
                         rt.process.wait = null
@@ -156,6 +170,8 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.driver.start(rt.context)
         } else {
             lock.withLockValue { setHolderFuelLocked(rt, grant) }
+            // 燃料待ちからなら、止まった燃料切れの呼び出しまで巻き直す（着いたところで onFuelExhaustedUnwindable が消す）
+            if (fuelResume) rt.rewindingForFuel = true
             rt.driver.resume(rt.context, ready)
         }
         while (true) {
@@ -190,8 +206,43 @@ internal class ProcessRunner(private val machine: Machine) {
                     }
                     result = rt.driver.resume(rt.context, immediate)
                 }
+                StepResult.WaitFuel -> {
+                    waitFuelUnwound(rt)
+                    return
+                }
             }
         }
+    }
+
+    /**
+     * 燃料切れで巻き戻した（[StepResult.WaitFuel]。#339）: スレッドを持たずに燃料待ちの列へ入り、許可と CPU を返す。
+     *
+     * 巻き戻し・巻き直しの費用（退避した値の数 × [FuelCosts.ASYNC_VALUE]）は、ここでマシンの燃料から引く（借りになり、後の補充で返す）。
+     * 再開のときの grant から引かないのは、費用が grant より大きいと、巻き直してすぐにまた切れて先へ進めないため
+     */
+    private fun waitFuelUnwound(rt: ProcessRuntime) {
+        lock.withLockValue {
+            if (rt.killed) throw ProcessKilledException()
+            val stack = checkNotNull(rt.process.asyncStack) { "退避先がない" }
+            check(!stack.isEmpty) { "燃料切れで巻き戻したのに退避した値がない" }
+            val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
+            holder.fuel = 0
+            rt.process.state = ProcessState.RUNNABLE
+            rt.stackActive = false
+            enqueueFuelWaitLocked(rt, threadless = true)
+            giveBackLocked(rt.fuelUnwindRemaining - stack.size.toLong() * FuelCosts.ASYNC_VALUE)
+            rt.fuelUnwindRemaining = 0
+            scheduler.deactivate(rt)
+            scheduler.fuelUnwinds.incrementAndGet()
+        }
+        releasePermitAndCpu(rt)
+    }
+
+    /** 燃料待ちの列に入れる（[threadless] ならスレッドを持たない待ち手として）。カーネルロックの中で呼ぶ */
+    private fun enqueueFuelWaitLocked(rt: ProcessRuntime, threadless: Boolean) {
+        rt.fuelReady = false
+        rt.fuelWaitThreadless = threadless
+        machine.addFuelWaiterLocked(rt)
     }
 
     /**
@@ -209,9 +260,7 @@ internal class ProcessRunner(private val machine: Machine) {
             if (grant > 0) return grant
             scheduler.deactivate(rt)
         }
-        rt.fuelReady = false
-        rt.fuelWaitThreadless = threadless
-        machine.addFuelWaiterLocked(rt)
+        enqueueFuelWaitLocked(rt, threadless)
         if (now != observedTick || (paused && !scheduler.isPaused)) scheduler.dispatcher.signal()
         return null
     }
@@ -380,10 +429,38 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.process.state = ProcessState.WAITING_FUEL
             prev
         }
+        scheduler.fuelBlockingWaits.incrementAndGet()
         releasePermitAndCpu(rt)
         val grant = acquireCpu(rt, null)!!
         lock.withLockValue { rt.process.state = previous }
         return grant
+    }
+
+    /**
+     * 止まりうる関数の中の燃料切れ（#339。`kibi.async_fuel`）。巻き戻せるなら、状態を `UNWINDING` にして戻る
+     * （`_start` まで戻ったら、ドライバーが [StepResult.WaitFuel] を返す）。
+     * 燃料待ちからの巻き直し（`REWINDING`）で呼ばれたら、止まった呼び出しに着いたので `NORMAL` に戻し、step が渡した手持ちを返す。
+     * 巻き戻せないところ（モジュールの start 関数の中）では、[onFuelExhausted] と同じくスレッドを持ったまま待つ
+     */
+    private fun onFuelExhaustedUnwindable(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
+        val unwindable = lock.withLockValue {
+            verifyInstanceLocked(rt, instance)
+            if (rt.killed) throw ProcessKilledException()
+            rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null
+        }
+        if (!unwindable) return onFuelExhausted(rt, instance, remaining)
+        if (instance.asyncState == WasmAsyncState.REWINDING) {
+            check(rt.rewindingForFuel) { "燃料待ちからでない巻き直しが、燃料切れの呼び出しに着いた" }
+            check(rt.process.asyncStack?.isEmpty != false) { "巻き直しの後に退避した値が残っている" }
+            rt.rewindingForFuel = false
+            instance.asyncState = WasmAsyncState.NORMAL
+            return lock.withLockValue { instance.fuel }
+        }
+        check(instance.asyncState == WasmAsyncState.NORMAL) { "巻き戻しの途中で燃料切れの呼び出しが走った" }
+        rt.fuelUnwound = true
+        rt.fuelUnwindRemaining = remaining
+        instance.asyncState = WasmAsyncState.UNWINDING
+        return remaining
     }
 
     /** ホスト関数・燃料切れの処理の入口の照合。違えばマシンを CRASHED にして投げる */
@@ -885,6 +962,12 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun requestShutdown() = machine.stop()
 
         override fun requestReboot(): Boolean = machine.reboot()
+
+        override fun takeFuelUnwind(): Boolean {
+            val unwound = rt.fuelUnwound
+            rt.fuelUnwound = false
+            return unwound
+        }
 
         override fun chargeFuel(amount: Long) {
             if (rt.process.unmetered) return

@@ -240,6 +240,15 @@ public fun interface WasmFuelHandler {
      * @return 新しい残り。正でなければ、次に燃料を確かめるところでまた呼ばれる。実行を止めるには例外を投げる
      */
     public fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long
+
+    /**
+     * 巻き戻せるところ（待機点への変換をかけたモジュールの、止まりうる関数の中）で燃料が切れた（#339。[WasmAsync.FUEL] の import）。
+     *
+     * [WasmInstance.asyncState] を [WasmAsyncState.UNWINDING] にして戻れば巻き戻る（戻り値は捨てられる）。
+     * [WasmAsyncState.REWINDING] のときに呼ばれたら、巻き直しが止まった呼び出しに着いた（[WasmAsyncState.NORMAL] に戻して、新しい残りを返す）。
+     * 既定は [onFuelExhausted] と同じ（巻き戻さない）
+     */
+    public fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long = onFuelExhausted(instance, remaining)
 }
 
 /** 燃料を計測するモジュールが使う名前（#28）。カーネルの内部のもので、プレイヤーには見せない。 */
@@ -311,4 +320,14 @@ public object WasmAsync {
     /** [POP] の型 `() -> (i64)` */
     @JvmField
     public val POP_TYPE: WasmFunctionType = WasmFunctionType.of(emptyList(), listOf(WasmValueType.I64))
+
+    /**
+     * 止まりうる関数の中の燃料切れを知らせる import の名前（#339）。型は [FUEL_TYPE]。
+     * 燃料を計測し、変換もしたモジュールだけが持てる。ランタイムは [WasmFuelHandler.onFuelExhaustedUnwindable] につなぐ
+     */
+    public const val FUEL: String = "async_fuel"
+
+    /** [FUEL] の型（[WasmFuel.IMPORT_TYPE] と同じ `(i64) -> (i64)`） */
+    @JvmField
+    public val FUEL_TYPE: WasmFunctionType = WasmFuel.IMPORT_TYPE
 }

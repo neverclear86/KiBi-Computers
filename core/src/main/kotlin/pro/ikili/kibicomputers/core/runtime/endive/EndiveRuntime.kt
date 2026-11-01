@@ -512,7 +512,13 @@ private class EndiveWasmModule(val module: EndiveModule, private val compiled: C
             }
         }
         isAsyncified = asyncParts == 3
-        val hidden = listOfNotNull(fuelImport, fuelExport, pushImport, popImport, stateExport)
+        // 止まりうる関数の中の燃料切れ（#339）: 燃料を計測し、変換もしたモジュールだけが持てる
+        val asyncFuelImport = rawImports.firstOrNull { it.module == WasmAsync.IMPORT_MODULE && it.name == WasmAsync.FUEL }
+        if (asyncFuelImport != null) {
+            if (!isAsyncified || !isFuelMetered) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} は燃料を計測し、待機点に変換したモジュールだけが持てる")
+            if (asyncFuelImport.functionType != WasmAsync.FUEL_TYPE) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} の型が違う")
+        }
+        val hidden = listOfNotNull(fuelImport, fuelExport, pushImport, popImport, stateExport, asyncFuelImport)
         imports = rawImports.filter { imp -> hidden.none { it === imp } }
         exports = rawExports.filter { exp -> hidden.none { it === exp } }
     }
@@ -536,6 +542,10 @@ private class EndiveWasmModule(val module: EndiveModule, private val compiled: C
             val type = imp.functionType!!
             if (isFuelMetered && imp.module == WasmFuel.IMPORT_MODULE && imp.name == WasmFuel.IMPORT_NAME) {
                 values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> longArrayOf(wrapper.fuelExhausted(args[0])) })
+                continue
+            }
+            if (isAsyncified && imp.module == WasmAsync.IMPORT_MODULE && imp.name == WasmAsync.FUEL) {
+                values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> longArrayOf(wrapper.fuelExhaustedUnwindable(args[0])) })
                 continue
             }
             if (isAsyncified && imp.module == WasmAsync.IMPORT_MODULE && (imp.name == WasmAsync.PUSH || imp.name == WasmAsync.POP)) {
@@ -669,6 +679,11 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     fun fuelExhausted(remaining: Long): Long {
         val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
         return handler.onFuelExhausted(this, remaining)
+    }
+
+    fun fuelExhaustedUnwindable(remaining: Long): Long {
+        val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
+        return handler.onFuelExhaustedUnwindable(this, remaining)
     }
 
     @Throws(WasmTrapException::class)

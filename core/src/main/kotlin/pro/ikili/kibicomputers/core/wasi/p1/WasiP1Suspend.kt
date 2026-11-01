@@ -76,6 +76,9 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
         instance.asyncState = WasmAsyncState.UNWINDING
     }
 
+    /** 巻き戻したときに記録した key がある（[takePendingKeys] の前） */
+    val hasPendingKeys: Boolean get() = pendingKeys != null
+
     /** 巻き戻したときに記録した key を取り出す（[WasiP1Driver] が `_start` から戻ったところで） */
     fun takePendingKeys(): List<WaitKey> {
         val keys = checkNotNull(pendingKeys) { "巻き戻したのに待つ key がない" }

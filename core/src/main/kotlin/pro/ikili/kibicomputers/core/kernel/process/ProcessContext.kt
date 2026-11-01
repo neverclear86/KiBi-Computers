@@ -252,6 +252,12 @@ internal interface ProcessContext {
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)
 
+    /**
+     * 今の巻き戻しが燃料切れのもの（#339。止まりうる関数の中で燃料が切れて巻き戻した）なら `true` を返し、印を消す。
+     * 待機点型のドライバーが、`UNWINDING` のまま入口から戻ったところで呼ぶ（`true` なら `StepResult.WaitFuel` を返す）
+     */
+    fun takeFuelUnwind(): Boolean
+
     // ---- 接続層との境界（#44） ----
 
     /** マシンが動く環境（時計、乱数、ディスク、保存先）。どのスレッドから使ってもよい */

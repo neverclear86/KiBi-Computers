@@ -73,6 +73,18 @@ internal class ProcessRuntime(
     /** 燃料待ちの列に、スレッドを持たない待ち手として入っている */
     var fuelWaitThreadless: Boolean = false
 
+    /**
+     * 燃料切れで巻き戻すよう頼んだ（#339）。step の中でだけ立つ（ドライバーが [ProcessContext.takeFuelUnwind] で消す）。
+     * プロセスのスレッドだけが読み書きする
+     */
+    var fuelUnwound: Boolean = false
+
+    /** [fuelUnwound] を立てたときの燃料の残り（負。行き過ぎた分）。マシンの燃料に書き戻す */
+    var fuelUnwindRemaining: Long = 0
+
+    /** 燃料待ちからの巻き直しの途中（#339）。止まった燃料切れの呼び出しに着いたら消す。プロセスのスレッドだけが読み書きする */
+    var rewindingForFuel: Boolean = false
+
     /** 燃料待ちの条件変数（カーネルロックの） */
     val fuelCondition: Condition = machine.lock.newCondition()
 
