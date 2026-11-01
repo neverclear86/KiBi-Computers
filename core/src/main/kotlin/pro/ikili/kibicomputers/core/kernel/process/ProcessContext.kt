@@ -5,6 +5,10 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
+import pro.ikili.kibicomputers.core.kernel.event.EventBatch
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -97,6 +101,34 @@ internal interface ProcessContext {
 
     /** 自分が [signal] を無視するか決める。子には引き継がない。[KillSignal.KILL] は [IllegalArgumentException] */
     fun setSignalIgnored(signal: KillSignal, ignored: Boolean)
+
+    // ---- イベント（#63、ADR 0063。WASM に見せる形は #72・#73・#266） ----
+
+    /**
+     * イベントキューを作って自分のハンドル表に入れ、ハンドル番号を返す（読む権利だけ）。[filter] の種類だけを受け取る（空ならすべて）。
+     * [capacity] が 1..`MAX_CAPACITY` の外なら `FsException(INVAL)`、マシンのキューの数が上限なら [ResourceLimitException]
+     * （errno への写し方は ABI 層。#73）、ハンドル表が満杯なら `FsException(MFILE)`
+     */
+    @Throws(FsException::class, ResourceLimitException::class)
+    fun openEventQueue(filter: EventFilter = EventFilter.ALL, capacity: Int = EventLimits.DEFAULT_CAPACITY): Int
+
+    /**
+     * イベントキュー [handle] から、待たずに最大 [max] 個取り出す（なければ空の結果）。
+     * [handle] が開いていない・イベントキューでない・読む権利がなければ `FsException(BADF)`、[max] が 1 未満なら `FsException(INVAL)`
+     */
+    @Throws(FsException::class)
+    fun takeEvents(handle: Int, max: Int = Int.MAX_VALUE): EventBatch
+
+    /** イベントキュー [handle] の `READABLE` の [WaitKey]。待機点型は `StepResult.Wait` に入れて待つ。エラーは [takeEvents] と同じ */
+    @Throws(FsException::class)
+    fun eventWaitKey(handle: Int): WaitKey
+
+    /**
+     * ブロッキング型だけ: イベントキュー [handle] にイベントが1つ以上あるか、あふれて捨てた分があるまで [block] で待ってから取り出す。
+     * 返す結果は空でない
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun awaitEvents(handle: Int, max: Int = Int.MAX_VALUE): EventBatch
 
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
     val instance: WasmInstance

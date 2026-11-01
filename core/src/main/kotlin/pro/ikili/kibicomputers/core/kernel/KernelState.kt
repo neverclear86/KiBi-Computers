@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.event.EventHub
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
 import pro.ikili.kibicomputers.core.kernel.process.ProcessTable
 import pro.ikili.kibicomputers.core.kernel.vfs.MountTable
@@ -17,6 +18,9 @@ internal class KernelState(maxProcesses: Int) {
 
     /** オブジェクトID → カーネルオブジェクト（と次に割り当てる ID） */
     val objects: ObjectTable = ObjectTable()
+
+    /** イベントの種類 → イベントキューのオブジェクトID の索引（#63、ADR 0063） */
+    val events: EventHub = EventHub()
 
     /** VFS のマウントの表（ファイルシステムそのものは実行時だけ。`Machine.vfs` が持つ。ADR 0051） */
     val mounts: MountTable = MountTable()

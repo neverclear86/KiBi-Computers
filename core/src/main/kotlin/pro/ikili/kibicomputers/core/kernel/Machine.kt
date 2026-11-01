@@ -3,6 +3,10 @@ package pro.ikili.kibicomputers.core.kernel
 import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
 import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
 import pro.ikili.kibicomputers.core.kernel.fd.STDIN
@@ -723,6 +727,28 @@ public class Machine private constructor(
         tty.drainOutput(wakeSink)
     }
 
+    /**
+     * イベントを、種類の合うイベントキューに配る（#63、ADR 0063。出す側はタイマー #64、デバイス #65・#67、入力 #143、ネットワーク #164）。
+     * どのスレッドから呼んでもよい。待たない（カーネルロックを短く取る）。一時停止中・止まったマシンでも受け付ける（キューがなければ捨てる）。
+     * 配ったキューの数を返す（あふれて捨てた分は数えない）
+     */
+    internal fun postEvent(event: KernelEvent): Int = lock.withLockValue { kernel.events.post(event, kernel.objects, wakeSink) }
+
+    /**
+     * プロセス [pid] にイベントキューを作ってハンドル表に入れ、ハンドル番号を返す（読む権利だけ）。カーネルロックの中で呼ぶ。
+     * 確かめる順は capacity（範囲外は `INVAL`）→ マシンのキューの数（[ResourceLimitException]）→ ハンドル表（満杯は `MFILE`）。
+     * 失敗したら何も残さない
+     */
+    internal fun openEventQueueLocked(pid: Int, filter: EventFilter, capacity: Int): Int {
+        if (capacity !in 1..EventLimits.MAX_CAPACITY) fsError(Errno.INVAL, "キューの件数は 1..${EventLimits.MAX_CAPACITY}（$capacity）")
+        val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
+        kernel.events.ensureCapacity(kernel.objects)
+        val queue = EventQueue(filter, capacity)
+        val fd = FdTable(process, kernel.objects, wakeSink).open(queue, HandleRights.READ)
+        kernel.events.subscribe(queue, kernel.objects)
+        return fd
+    }
+
     internal fun runtime(pid: Int): ProcessRuntime? = lock.withLockValue { runtimes[pid] }
 
     internal fun processState(pid: Int): ProcessState? = lock.withLockValue { kernel.processes[pid]?.state }
@@ -989,6 +1015,8 @@ public class Machine private constructor(
             if (process.objectId != 0 && kernel.objects[process.objectId] != null) kernel.objects.release(process.objectId, wakeSink)
         }
         kernel.processes.reset()
+        // 閉じたイベントキューの ID を索引から外す（ADR 0063）
+        kernel.events.sweep(kernel.objects)
         initPid = 0
         unmountAllLocked()
         if (kernel.consoleTtyId != 0) consoleTtyLocked().foregroundPid = 0
