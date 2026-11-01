@@ -1,6 +1,8 @@
 package pro.ikili.kibicomputers.core.runtime
 
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 
 /**
  * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
@@ -30,6 +32,26 @@ public object RuntimeSelfCheck {
         val module = EndiveRuntime().load(ADD_MODULE)
         return module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("add", a.toLong(), b.toLong())[0].toInt() }
     }
+
+    /**
+     * 同梱の `lua.wasm`（大きいモジュール）に燃料の計測コードを挿入して読み込み、ランタイムコンパイラでコンパイルできた
+     * （インタプリタに切り替わらなかった）なら `true`（#344）。
+     *
+     * コンパイラは実行時の ASM でクラスを作るので、ローダーが同梱する ASM の版によっては大きい関数で落ち、
+     * 黙ってインタプリタに切り替わる（ログに警告が出るだけ）。それを GameTest で確かめるために使う。重い（1 秒ほど）。
+     *
+     * @throws WasmLoadException 読み込めない
+     * @throws IllegalStateException `lua.wasm` が同梱されていない
+     */
+    @JvmStatic
+    @Throws(WasmLoadException::class)
+    public fun compilesBundledLua(): Boolean {
+        val lua = checkNotNull(RuntimeSelfCheck::class.java.getResourceAsStream(LUA_RESOURCE)) { "$LUA_RESOURCE が同梱されていない" }
+            .use { it.readBytes() }
+        return isCompiled(EndiveRuntime().load(FuelInjector.inject(lua).bytes))
+    }
+
+    private const val LUA_RESOURCE: String = "/kibicomputers/wasm/lua.wasm"
 
     /** ランタイムが動くなら `true`。例外は呼び出し側に伝えず `false` を返す。 */
     @JvmStatic

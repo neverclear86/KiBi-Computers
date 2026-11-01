@@ -33,6 +33,12 @@ class WasmRuntimeJavaTest {
     }
 
     @Test
+    void selfCheckCompilesBundledLua() throws WasmLoadException {
+        assertTrue(RuntimeSelfCheck.compilesBundledLua());
+        assertTrue(RuntimeSelfCheck.isWorking());
+    }
+
+    @Test
     void exceptionsAndConstants() {
         WasmTrapException trap = new WasmTrapException(WasmTrapKind.UNREACHABLE, "x");
         assertEquals(WasmTrapKind.UNREACHABLE, trap.getKind());

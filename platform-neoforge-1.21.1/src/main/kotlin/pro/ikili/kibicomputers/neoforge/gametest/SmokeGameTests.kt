@@ -37,5 +37,16 @@ object SmokeGameTests {
         helper.succeed()
     }
 
+    /**
+     * 大きいモジュール（燃料の計測コードを挿入した lua.wasm）を、ローダーが同梱する ASM でランタイムコンパイラにかけられる（#344）。
+     * 失敗すると黙ってインタプリタに切り替わり、遅くなるだけで気付けないため、ここで確かめる。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun bundledLuaWasmCompilesOnServer(helper: GameTestHelper) {
+        helper.assertTrue(RuntimeSelfCheck.compilesBundledLua(), "lua.wasm should compile with the runtime compiler (not fall back to the interpreter)")
+        helper.succeed()
+    }
+
     const val EMPTY: String = "empty"
 }
