@@ -144,6 +144,28 @@ class HostBoundaryTest {
     }
 
     @Test
+    fun `TTYの出力とカーネルのメッセージは同じtickでも書いた順に配る`() = timeout(limit) {
+        Harness().use { h ->
+            val host = RecordingHost()
+            val m = h.machine(host = host)
+            fun ttyWrite(text: String) {
+                val bytes = text.toByteArray()
+                m.lock.withLockValue { m.consoleTtyLocked().write(bytes, 0, bytes.size, m.wakeSink) }
+            }
+            // 起動のログ → init の出力 → init の終了のメッセージ、の順
+            assertTrue(m.writeConsole("boot\n".toByteArray()))
+            ttyWrite("bye\n")
+            assertTrue(m.writeConsole("exit\n".toByteArray()))
+            h.scheduler.tick()
+            assertEquals("boot\r\nbye\r\nexit\r\n", synchronized(host.console) { host.console.toString(Charsets.UTF_8) })
+            // 配った後の出力も、新しい印で次の tick に配る
+            ttyWrite("more\n")
+            h.scheduler.tick()
+            assertEquals("boot\r\nbye\r\nexit\r\nmore\r\n", synchronized(host.console) { host.console.toString(Charsets.UTF_8) })
+        }
+    }
+
+    @Test
     fun `配っていない出力が上限を超えた分は捨てる`() = timeout(limit) {
         Harness().use { h ->
             val host = RecordingHost()
