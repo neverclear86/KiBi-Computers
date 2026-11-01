@@ -1,12 +1,17 @@
 package pro.ikili.kibicomputers.core.runtime
 
+import org.jetbrains.annotations.ApiStatus
+
 /** ランタイムの抽象が投げる例外の基底。ランタイムの実装の例外は、これに包んで投げる。 */
+@ApiStatus.Internal
 public open class WasmException @JvmOverloads constructor(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 
 /** モジュールを読み込めない（WASM として壊れている、検証に通らない、対応していない機能を使う）。 */
+@ApiStatus.Internal
 public class WasmLoadException @JvmOverloads constructor(message: String, cause: Throwable? = null) : WasmException(message, cause)
 
 /** インスタンスを作れない（import が足りない、型が合わない など）。 */
+@ApiStatus.Internal
 public class WasmLinkException @JvmOverloads constructor(message: String, cause: Throwable? = null) : WasmException(message, cause)
 
 /**
@@ -15,9 +20,11 @@ public class WasmLinkException @JvmOverloads constructor(message: String, cause:
  * WASM の中の範囲外アクセスは [WasmTrapException]（[WasmTrapKind.MEMORY_OUT_OF_BOUNDS]）になる。
  * こちらはホストの関数がプレイヤーの渡したポインタを読むときのもので、カーネルはエラー（`EFAULT` など）として返せる。
  */
+@ApiStatus.Internal
 public class WasmMemoryAccessException(message: String) : WasmException(message)
 
 /** トラップの種類。どの種類にも当てはまらないものは [OTHER]。 */
+@ApiStatus.Internal
 public enum class WasmTrapKind {
     /** `unreachable` を実行した */
     UNREACHABLE,
@@ -60,6 +67,7 @@ public enum class WasmTrapKind {
 }
 
 /** WASM の実行がトラップで止まった。 */
+@ApiStatus.Internal
 public class WasmTrapException @JvmOverloads constructor(
     /** トラップの種類 */
     public val kind: WasmTrapKind,

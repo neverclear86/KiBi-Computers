@@ -1,10 +1,13 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * [ScreenWatchers] が、プレイヤーの位置を調べたり、フラグメントを送ったりするときの口（#359）。接続層が実装する。
  *
  * @param P プレイヤーの型（接続層の `ServerPlayer` など）。同じプレイヤーは同じオブジェクトで表す
  */
+@ApiStatus.Internal
 public interface ScreenSyncHost<P : Any> {
     /**
      * 新しく見はじめるかもしれないプレイヤー（画面と同じディメンションにいる人など）。
@@ -30,6 +33,7 @@ public interface ScreenSyncHost<P : Any> {
  *
  * @param P プレイヤーの型
  */
+@ApiStatus.Internal
 public class ScreenSyncTraffic<P : Any> {
     private class Counter {
         var bytes = 0L
@@ -93,6 +97,7 @@ public class ScreenSyncTraffic<P : Any> {
  * @param resyncIntervalTicks 画面全体を送り直す最短の間隔（tick）。仮の値（確定は #251）
  * @param scanIntervalTicks 見はじめる人を探す間隔（tick）
  */
+@ApiStatus.Internal
 public class ScreenWatchers<P : Any>
 @JvmOverloads
 @Throws(IllegalArgumentException::class)

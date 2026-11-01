@@ -1,6 +1,9 @@
 package pro.ikili.kibicomputers.core.runtime
 
+import org.jetbrains.annotations.ApiStatus
+
 /** ホストの関数を1つ、import の名前に結び付けたもの。 */
+@ApiStatus.Internal
 public class WasmHostImport(
     /** import のモジュール名 */
     public val module: String,
@@ -25,6 +28,7 @@ public class WasmHostImport(
  *     .build();
  * ```
  */
+@ApiStatus.Internal
 public class WasmInstanceConfig private constructor(builder: Builder) {
     /** ホストの関数 */
     public val hostImports: List<WasmHostImport> = builder.hostImports.toList()

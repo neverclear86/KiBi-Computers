@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * キーボードのキー（#142）。物理的なキーの位置を表す（US 配列での名前）。打った文字は [KeyboardEvent.Text] で別に送る。
  *
@@ -7,6 +9,7 @@ package pro.ikili.kibicomputers.core.input
  * プログラムから見えるキーの番号（イベントの ABI）は、イベントキュー（#63）で決める。ここでの並び（[ordinal]）は
  * キーボードの通信（[KeyboardEventCodec]）でだけ使う。並びを変えたら、通信のプロトコルの版を上げる。
  */
+@ApiStatus.Internal
 public enum class Key {
     UNKNOWN,
 
@@ -57,6 +60,7 @@ public enum class Key {
 /**
  * キーを押したときの修飾キーの状態（ビットの組）。ビットの値は GLFW の `GLFW_MOD_*` と同じにしてある。
  */
+@ApiStatus.Internal
 public object KeyModifiers {
     public const val NONE: Int = 0
     public const val SHIFT: Int = 0x01

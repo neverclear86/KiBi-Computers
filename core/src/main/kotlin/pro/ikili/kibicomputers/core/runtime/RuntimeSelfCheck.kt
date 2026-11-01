@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
@@ -9,6 +10,7 @@ import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
  *
  * 起動時のログ出力と、開発環境・配布 jar で依存が正しく同梱されているかの確認に使う。
  */
+@ApiStatus.Internal
 public object RuntimeSelfCheck {
     /**
      * `(module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))`

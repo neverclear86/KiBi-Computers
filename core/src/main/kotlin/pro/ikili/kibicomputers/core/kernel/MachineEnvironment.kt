@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
 import java.nio.file.Path
 import java.security.SecureRandom
 
@@ -9,6 +10,7 @@ import java.security.SecureRandom
  * **どのスレッドから呼ばれてもよいように作る。** プロセスのスレッド（システムコールの中）から呼ばれるため、
  * ワールドを直接読まない。ゲーム内時間は、接続層が tick ごとに `volatile` のフィールドなどに写しておき、それを返す。
  */
+@ApiStatus.Internal
 public interface MachineClock {
     /** 実時間。UNIX エポックからのナノ秒 */
     public fun realtimeNanos(): Long
@@ -42,6 +44,7 @@ public interface MachineClock {
  *
  * どのスレッドから呼ばれてもよいように作る。暗号に使える質を求める（プログラムが鍵を作るため）。
  */
+@ApiStatus.Internal
 public fun interface EntropySource {
     /** [bytes] を乱数で埋める */
     public fun fill(bytes: ByteArray)
@@ -67,6 +70,7 @@ public fun interface EntropySource {
  *
  * どのスレッドから呼ばれてもよいように作る。ディレクトリを作るのはカーネルの側（#52）。
  */
+@ApiStatus.Internal
 public fun interface DiskResolver {
     /** [diskId] のディスクの中身を置くディレクトリ。知らない識別子なら `null` */
     public fun resolve(diskId: String): Path?
@@ -92,6 +96,7 @@ public fun interface DiskResolver {
  *         .build();
  * ```
  */
+@ApiStatus.Internal
 public class MachineEnvironment private constructor(builder: Builder) {
     /** 時計 */
     public val clock: MachineClock = builder.clock

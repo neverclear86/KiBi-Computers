@@ -48,7 +48,7 @@ git switch -c issue-<番号>-<短い英語名>
 
 - `AGENTS.md` のアーキテクチャのルール（`core` に Minecraft を持ち込まない、Kotlin 2.2 API、Java 相互運用）に従う。
 - テストを先に、または同時に書く。Minecraft 非依存なら `core` の JUnit 5、依存するなら GameTest。
-- 公開 API を足したら `core/src/test/java/` に Java からの利用テストを足し、`java-api-reviewer` サブエージェントにレビューさせる。
+- `api`（`pro.ikili.kibicomputers.api`）の宣言を足したら `core/src/test/java/` に Java からの利用テストを足し、`java-api-reviewer` サブエージェントにレビューさせる。`api` 以外のトップレベルの `public` には `@ApiStatus.Internal` を付ける（#366。Java のテストは要らない）。
 - 確認:
   ```bash
   ./gradlew build

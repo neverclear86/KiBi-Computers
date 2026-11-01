@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.computer
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
 import pro.ikili.kibicomputers.core.display.terminal.TerminalListener
@@ -33,6 +34,7 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  * @property screen 書き込む文字画面
  * @param maxColors 画面の色数（2・16・256 など）
  */
+@ApiStatus.Internal
 public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
     private val terminal = AnsiTerminal(
         screen,

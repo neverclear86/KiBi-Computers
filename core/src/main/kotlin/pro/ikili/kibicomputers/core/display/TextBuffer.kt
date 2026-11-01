@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 文字画面のバッファ。幅 [width]・高さ [height] の文字セルを持つ。
  *
@@ -15,6 +17,7 @@ package pro.ikili.kibicomputers.core.display
  *
  * スレッドセーフではない。
  */
+@ApiStatus.Internal
 public class TextBuffer
 @Throws(IllegalArgumentException::class)
 public constructor(width: Int, height: Int) {

@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * カーネル → 接続層の口（#44）。[MachineScheduler.createMachine] に渡す。
  *
@@ -9,6 +11,7 @@ package pro.ikili.kibicomputers.core.kernel
  *
  * [onStateChanged] だけが必須。ほかは何もしない既定の実装を持つ（Java からはラムダでも、クラスでも実装できる）。
  */
+@ApiStatus.Internal
 public fun interface MachineHost {
     /**
      * マシンの状態が変わった。停止（[MachineState.STOPPED]・[MachineState.CRASHED]）もここで知らせる。

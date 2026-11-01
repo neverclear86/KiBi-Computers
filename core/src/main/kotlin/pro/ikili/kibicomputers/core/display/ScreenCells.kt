@@ -1,10 +1,13 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 文字画面のバッファを描くときの、セルのまとめ方（#139）。描画そのものは接続層が行う。
  *
  * 描く数を減らすため、背景は同じ色が横に続くセルを1つの矩形にまとめ、文字は描くものがあるセルだけを返す。
  */
+@ApiStatus.Internal
 public object ScreenCells {
     private const val RGB_MASK = 0xFFFFFF
     private const val IDEOGRAPHIC_SPACE = 0x3000
@@ -59,12 +62,14 @@ public object ScreenCells {
 }
 
 /** [ScreenCells.forEachBackgroundRun] が渡す、同じ背景色が横に続くセルの並び。 */
+@ApiStatus.Internal
 public fun interface BackgroundRunConsumer {
     /** 行 [y] の、列 [x] から [length] セルが背景色 [rgb]（`0xRRGGBB`）。 */
     public fun accept(x: Int, y: Int, length: Int, rgb: Int)
 }
 
 /** [ScreenCells.forEachGlyph] が渡す、描く文字のあるセル。 */
+@ApiStatus.Internal
 public fun interface GlyphConsumer {
     /** 列 [x]・行 [y] から [cells] セル分（1 か 2）に、文字 [codePoint] を前景色 [foreground]（`0xRRGGBB`）で描く。 */
     public fun accept(x: Int, y: Int, codePoint: Int, foreground: Int, cells: Int)

@@ -32,6 +32,9 @@ dependencies {
     api(libs.endive.wasm)
     // プレイヤーの WASM はランタイムコンパイラで動かす（#29 の決定、#37）。ASM が要る（MC ではローダーが持つものを使う）
     implementation(libs.endive.compiler)
+    // `pro.ikili.kibicomputers.api` 以外の public には `@ApiStatus.Internal` を付ける（#366）。
+    // 注釈は実行時に要らない（Minecraft も同じものを持つ）。使う側の IDE が警告を出せるよう、コンパイル時には見せる
+    compileOnlyApi(libs.jetbrains.annotations)
 
     // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
     testImplementation(libs.endive.wasi)

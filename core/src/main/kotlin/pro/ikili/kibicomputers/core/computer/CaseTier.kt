@@ -1,10 +1,13 @@
 package pro.ikili.kibicomputers.core.computer
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * ケースの部品スロットの種類（#121）。スロットには、その種類の部品だけを挿せる。
  *
  * @property required コンピューターを起動するのに、この種類の部品が1つ以上いるか
  */
+@ApiStatus.Internal
 public enum class PartKind(@JvmField public val required: Boolean) {
     /** CPU（#122） */
     CPU(true),
@@ -26,6 +29,7 @@ public enum class PartKind(@JvmField public val required: Boolean) {
  * スロットの番号ごとに、部品が挿さっているか（[CaseTier.missingRequired] に渡す）。
  * 接続層はケースの持ち物から答える。
  */
+@ApiStatus.Internal
 public fun interface InstalledParts {
     /** スロット [slot]（0 から [CaseTier.slotCount] 未満）に部品が挿さっていれば `true` */
     public fun isInstalled(slot: Int): Boolean
@@ -39,6 +43,7 @@ public fun interface InstalledParts {
  *
  * @property level ティアの番号（1〜3）
  */
+@ApiStatus.Internal
 public enum class CaseTier(
     @JvmField public val level: Int,
     cpu: Int,

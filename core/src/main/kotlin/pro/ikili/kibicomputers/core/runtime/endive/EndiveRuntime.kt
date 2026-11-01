@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmException
@@ -67,6 +68,7 @@ import run.endive.wasm.WasmModule as EndiveModule
  * テーブル（#361）も同じように、作るときに要素数の上限を縮め（[WasmInstanceConfig.maxTableElements]）、
  * [WasmInstanceConfig.tableBudget] があれば、要素数 × 要素1つのバイト数を数える（[BudgetedTable]）。
  */
+@ApiStatus.Internal
 public class EndiveRuntime internal constructor(
     /** `false` ならコンパイルせずインタプリタで動かす（テストで、インタプリタとの結果を比べるため） */
     private val compile: Boolean,

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.machine
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -21,6 +22,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
  *
  * スレッド: メインスレッドから呼ぶ。
  */
+@ApiStatus.Internal
 public class MachineSlot<K : Any> {
     private var manager: MachineManager<K>? = null
     private var key: K? = null

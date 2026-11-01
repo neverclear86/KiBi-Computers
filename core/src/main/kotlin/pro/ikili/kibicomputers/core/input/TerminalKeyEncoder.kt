@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 
@@ -17,6 +18,7 @@ import java.nio.charset.StandardCharsets
  *   （打った文字が [KeyboardEvent.Text] で届く）
  * - キーを離したこと（[KeyboardEvent.KeyUp]）は何も作らない
  */
+@ApiStatus.Internal
 public object TerminalKeyEncoder {
     private const val ESC = 0x1B
 

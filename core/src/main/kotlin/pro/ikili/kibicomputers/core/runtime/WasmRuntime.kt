@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * WASM のランタイム（#34）。カーネルは特定のランタイムではなく、この抽象を通して WASM を動かす。
  *
@@ -9,6 +11,7 @@ package pro.ikili.kibicomputers.core.runtime
  * スレッド: [load] とモジュールの [WasmModule.instantiate] は、どのスレッドから呼んでもよい。
  * 1つの [WasmInstance] は、同時に1つのスレッドからだけ使う。
  */
+@ApiStatus.Internal
 public interface WasmRuntime {
     /** ログに出す名前（例: `endive`） */
     public val name: String
@@ -23,6 +26,7 @@ public interface WasmRuntime {
 }
 
 /** 読み込んだモジュール。何度でもインスタンスを作れる。 */
+@ApiStatus.Internal
 public interface WasmModule {
     /** モジュールが求める import（宣言の順） */
     public val imports: List<WasmImportDescriptor>
@@ -60,6 +64,7 @@ public interface WasmModule {
 }
 
 /** モジュールのインスタンス。線形メモリ・グローバル・テーブルなど、実行の状態を持つ。 */
+@ApiStatus.Internal
 public interface WasmInstance : AutoCloseable {
     /** 元のモジュール */
     public val module: WasmModule
@@ -108,6 +113,7 @@ public interface WasmInstance : AutoCloseable {
  *
  * 範囲の外を読み書きすると [WasmMemoryAccessException] を投げる。
  */
+@ApiStatus.Internal
 public interface WasmMemory {
     /** 今のページ数（1 ページ = [PAGE_SIZE] バイト） */
     public val pages: Int
@@ -180,6 +186,7 @@ public interface WasmMemory {
  * スレッド: どのスレッドから呼ばれてもよいように作る（別々のインスタンスが、別々のスレッドから同時に呼ぶ）。
  * WASM の実行の中から呼ばれるので、待たない・WASM を呼ばない。
  */
+@ApiStatus.Internal
 public interface WasmMemoryBudget {
     /**
      * [pages] ページ（1 以上）を確保してよければ、確保した分として数えて `true` を返す。
@@ -214,6 +221,7 @@ internal interface WasmTableBudget {
  * 投げた例外は、WASM の中では捕まえられず、[WasmInstance.call] からそのまま外に出る。
  * 実行を止める（終了、tick の待ちでの中断など）には例外を投げる。
  */
+@ApiStatus.Internal
 public fun interface WasmHostFunction {
     /**
      * @param instance 呼び出したインスタンス。メモリと燃料を読み書きできる
@@ -224,6 +232,7 @@ public fun interface WasmHostFunction {
 }
 
 /** 燃料切れのときに呼ばれる処理（#28・#27）。 */
+@ApiStatus.Internal
 public fun interface WasmFuelHandler {
     /**
      * @param instance 燃料が切れたインスタンス
@@ -234,6 +243,7 @@ public fun interface WasmFuelHandler {
 }
 
 /** 燃料を計測するモジュールが使う名前（#28）。カーネルの内部のもので、プレイヤーには見せない。 */
+@ApiStatus.Internal
 public object WasmFuel {
     /** 燃料切れを知らせる import のモジュール名。型は `(i64 残り) -> (i64 新しい残り)` */
     public const val IMPORT_MODULE: String = "kibi"
@@ -250,6 +260,7 @@ public object WasmFuel {
 }
 
 /** 待機点への変換をかけたモジュールの状態（#329）。状態のグローバルの値は、この並びの順に 0・1・2 */
+@ApiStatus.Internal
 public enum class WasmAsyncState {
     /** ふつうに実行している */
     NORMAL,
@@ -269,6 +280,7 @@ public enum class WasmAsyncState {
  * スレッド: WASM の実行の中（インスタンスを使っているスレッド）から呼ばれるので、待たない・WASM を呼ばない。
  * 投げた例外は、[WasmInstance.call] からそのまま外に出る（実行を止める）。
  */
+@ApiStatus.Internal
 public interface WasmAsyncStack {
     /** 退避する値 [value] を1つ積む。上限を超えたら例外を投げる（実行を止める） */
     public fun push(value: Long)
@@ -278,6 +290,7 @@ public interface WasmAsyncStack {
 }
 
 /** 待機点への変換をかけたモジュールが使う名前（#329）。カーネルの内部のもので、プレイヤーには見せない。 */
+@ApiStatus.Internal
 public object WasmAsync {
     /** 退避の import のモジュール名（燃料の [WasmFuel.IMPORT_MODULE] と同じ予約の空間） */
     public const val IMPORT_MODULE: String = "kibi"

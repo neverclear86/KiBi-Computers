@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.computer
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 
 /**
@@ -11,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
  * @property cpuFuelPerTick この CPU の 1 tick の燃料（[MachineConfig.fuelPerTick]）
  * @property memoryBytes この RAM 1 つの容量（バイト。[MachineConfig.memoryBytes] に足し込む）
  */
+@ApiStatus.Internal
 public enum class PartTier(
     @JvmField public val cpuFuelPerTick: Long,
     @JvmField public val memoryBytes: Long,
@@ -26,6 +28,7 @@ public enum class PartTier(
  * スロットの番号ごとに、挿さっている部品のティア（[MachineSpecs.configOf] に渡す）。
  * 接続層はケースの持ち物から答える。
  */
+@ApiStatus.Internal
 public fun interface InstalledPartTiers {
     /**
      * スロット [slot]（0 から [CaseTier.slotCount] 未満）に挿さっている部品のティア。
@@ -35,6 +38,7 @@ public fun interface InstalledPartTiers {
 }
 
 /** 挿さっている部品から、マシンの設定（[MachineConfig]）を決める（#347。正式な式は #122・#123）。 */
+@ApiStatus.Internal
 public object MachineSpecs {
     /**
      * ケース [caseTier] に挿さっている部品 [parts] から、マシンの設定を作る。

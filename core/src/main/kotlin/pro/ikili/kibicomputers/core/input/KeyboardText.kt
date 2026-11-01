@@ -1,8 +1,11 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * キーボードから送る文字列の検査と整形（#142）。
  */
+@ApiStatus.Internal
 public object KeyboardText {
     /** 1回の貼り付けで送る UTF-8 のバイト数の上限（仮の値。#251 で確定）。超えた分は捨てる。 */
     public const val MAX_PASTE_BYTES: Int = KeyboardEventCodec.MAX_TEXT_BYTES
@@ -83,6 +86,7 @@ public object KeyboardText {
  *
  * Minecraft の画面は、BMP の外の文字（絵文字など）を2つの `char` に分けて渡すので、つなぎ直すのに使う。
  */
+@ApiStatus.Internal
 public class Utf16Joiner {
     private var high: Char? = null
 

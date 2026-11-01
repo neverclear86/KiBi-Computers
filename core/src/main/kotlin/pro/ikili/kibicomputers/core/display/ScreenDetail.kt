@@ -1,10 +1,13 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 画面をどこまで細かく描くか（#139）。遠くの画面は文字が読めないので、文字を省いて描画の負荷を下げる。
  *
  * 距離のしきい値は仮の値（#251 で確定）。
  */
+@ApiStatus.Internal
 public enum class ScreenDetail {
     /** 背景・ピクセル・文字をすべて描く。 */
     FULL,

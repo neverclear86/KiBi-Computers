@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
@@ -31,6 +32,7 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * スレッド: [tick] はメインスレッドから呼ぶ。ほかはどのスレッドから呼んでもよい（[awaitTermination] はカーネルのスレッドから呼べない）。
  */
+@ApiStatus.Internal
 public class MachineScheduler private constructor(
     /** 設定 */
     public val config: SchedulerConfig,
@@ -314,6 +316,7 @@ internal class SchedulerInternals(
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */
+@ApiStatus.Internal
 public fun interface PauseHandle : AutoCloseable {
     /** 一時停止を解く */
     override fun close()
@@ -326,6 +329,7 @@ public fun interface PauseHandle : AutoCloseable {
  * SchedulerConfig config = SchedulerConfig.builder().maxConcurrentMachines(2).build();
  * ```
  */
+@ApiStatus.Internal
 public class SchedulerConfig private constructor(builder: Builder) {
     /** 同時に WASM を実行するマシンの数の上限（仮: CPU のスレッド数の半分。最低 1） */
     public val maxConcurrentMachines: Int = builder.maxConcurrentMachines
