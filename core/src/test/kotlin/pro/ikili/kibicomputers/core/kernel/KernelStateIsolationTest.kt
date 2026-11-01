@@ -1,8 +1,11 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.fail
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
@@ -21,6 +24,8 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import pro.ikili.kibicomputers.core.runtime.FakeModule
+import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import java.lang.reflect.Modifier
 import java.util.IdentityHashMap
 
@@ -78,6 +83,7 @@ class KernelStateIsolationTest {
         process.wait = listOf(WaitKey(id, WaitCondition.READABLE))
         state.processes.add(process)
         state.fuel = -5
+        state.initPid = 1
         // VFS: マウントの表は KernelState に、ファイルシステムは Vfs（実行時）に置く
         val vfs = Vfs(state.mounts)
         vfs.mount(VfsPath.parse("/disk"), TestMemoryFileSystem(), readOnly = false, source = "disk:1")
@@ -124,6 +130,41 @@ class KernelStateIsolationTest {
             eventually { machine.stateOf(pid).isTerminal }
             machine.lock.withLockValue { walk(machine.kernel, "kernel", IdentityHashMap()) }
             assertTrue(true)
+        }
+    }
+
+    @Test
+    fun `起動したマシンのKernelStateはinitのpidを持ち、実行時だけのものを参照しない`() {
+        Harness().use { h ->
+            val disk = TestMemoryFileSystem()
+            disk.createDirectory(VfsPath.parse("/sbin"))
+            val exe = "isolation-init".toByteArray()
+            val node = disk.createFile(VfsPath.parse(BootConfig.INIT_PATH))
+            disk.write(node, 0, exe, 0, exe.size)
+            h.runtime.define(
+                exe,
+                FakeModule.builder()
+                    .fuelMetered()
+                    .export("_start", WasmFunctionType.of(emptyList(), emptyList())) { ctx, _ ->
+                        while (true) {
+                            ctx.step(1)
+                            Thread.sleep(1)
+                        }
+                        @Suppress("UNREACHABLE_CODE")
+                        LongArray(0)
+                    }
+                    .build(),
+            )
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+            val machine = h.machine()
+            assertTrue(machine.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+            eventually { h.scheduler.tick(); machine.state == MachineState.RUNNING && !machine.isBooting }
+            machine.lock.withLockValue {
+                assertNotEquals(0, machine.kernel.initPid)
+                walk(machine.kernel, "kernel", IdentityHashMap())
+            }
+            machine.stop()
+            assertTrue(machine.awaitTermination(5_000))
         }
     }
 }

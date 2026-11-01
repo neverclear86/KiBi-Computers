@@ -14,7 +14,7 @@
 - init が `stop()`・再起動によらずに終わったら、コンソールに書いて残りのプロセスをすべて止め、`STOPPED` にする。自動では再起動しない（すぐ落ちる init で起動を繰り返さないため）
 - 再起動は「すべて止まってから `MachineHost.onRebootRequested` を知らせる」形。既定の実装は前回の `BootConfig` で `boot` する。接続層は上書きして、その時点のディスクで設定を作り直せる
 - 起動の失敗は、固定の英語のコンソールのメッセージと `MachineHost.onBootFailed` の両方で知らせる（コンソールが先）
-- 足す状態はどれも実行時だけ。`KernelState`（保存の対象）は変えない
+- init の pid は `KernelState.initPid`（保存の対象）に置く（#365）。ほかに足す状態はどれも実行時だけ。起動の途中・再起動の待ちの間は `Machine.isAtWaitPoint` を `false` にして、保存しない
 
 ## 公開するもの（`pro.ikili.kibicomputers.core.kernel`。接続層向け）
 
@@ -79,9 +79,12 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 
 ## データ形式
 
-- `KernelState`（保存の対象）は変えない。マウントの表は今のまま（`source` に `disk:<識別子>`）
-- 足したものはどれも実行時だけ: init の pid、最後の `BootConfig`、起動中・取り消し・再起動の求めの印、前の起動の専用スレッド（`awaitTermination` で待つ）
-- #81 への申し送り: 戻したマシンでは、親のない pid 1 を init とみなして init の pid を決め直す。起動の途中・再起動の求めの途中は保存しない（プロセスがないので、戻したら止まったマシンとして扱い、接続層がもう一度 `boot` する）
+- `KernelState`（保存の対象）に `initPid` を足す（#365。0 = init がいない、それ以外 = init の pid）。バイト形式は #82。マウントの表は今のまま（`source` に `disk:<識別子>`）
+- ほかに足したものはどれも実行時だけ: 最後の `BootConfig`、起動中・取り消し・再起動の求め（`rebootRequested`・`rebootNotified`）の印、前の起動の専用スレッド（`awaitTermination` で待つ）
+- #81 への申し送り:
+  - init の pid は `KernelState.initPid` に保存する（戻したマシンでも、init が終わったら止める・init にシグナルを送れない、が続く）
+  - 起動の途中・再起動の途中（`reboot()` を受け付けてから `onRebootRequested` を呼ぶまで）は保存しない。この間は `isAtWaitPoint` が `false`
+  - 戻したマシンでは、接続層が `BootConfig` を渡し直す（`lastBootConfig` を決め直す）。渡し直すまでは `reboot()` が `false` を返す。渡し直す口の形は #81 で決める。`BootConfig` は保存しない（その時点のワールドで作り直すほうが正しい）
 
 ## 今の制限
 
