@@ -7,6 +7,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
 import java.security.MessageDigest
 
 /**
@@ -32,21 +35,35 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
 /** 読み込んだモジュールと、その識別子の組。 */
 internal class Program private constructor(val hash: ModuleHash, val module: WasmModule) {
     companion object {
-        /** [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない） */
+        /**
+         * [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない）。
+         *
+         * [limits] があれば、読み込む前に構造の上限を確かめ、時間の上限を守る（#40。[ModulePrescan]・[LoadDeadline]）
+         */
         @Throws(WasmLoadException::class)
-        fun load(runtime: WasmRuntime, bytes: ByteArray): Program {
+        fun load(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null): Program {
             val copy = bytes.copyOf()
-            return Program(ModuleHash.of(copy), runtime.load(copy))
+            val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
+            if (limits != null) ModulePrescan.check(copy, limits, deadline)
+            val module = runtime.load(copy)
+            deadline?.check("パースと検証")
+            return Program(ModuleHash.of(copy), module)
         }
 
         /**
          * [bytes] に燃料の計測コードを挿入してから（[FuelInjector]、#38）[runtime] に読み込ませる。識別子は挿入した後のバイト列から作る。
-         * すでに計測の名前を使っている WASM などは [WasmLoadException] で断る。重いので、メインスレッドでは呼ばない
+         * すでに計測の名前を使っている WASM などは [WasmLoadException] で断る。重いので、メインスレッドでは呼ばない。
+         *
+         * [limits] があれば、挿入する前に構造の上限を確かめ、挿入・パース・検証の全体で時間の上限を守る（#40）
          */
         @Throws(WasmLoadException::class)
-        fun loadMetered(runtime: WasmRuntime, bytes: ByteArray): Program {
-            val injected = FuelInjector.inject(bytes).bytes
-            return Program(ModuleHash.of(injected), runtime.load(injected))
+        fun loadMetered(runtime: WasmRuntime, bytes: ByteArray, limits: ModuleLimits? = null): Program {
+            val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
+            if (limits != null) ModulePrescan.check(bytes, limits, deadline)
+            val injected = FuelInjector.inject(bytes) { deadline?.check("燃料の計測コードの挿入") }.bytes
+            val module = runtime.load(injected)
+            deadline?.check("パースと検証")
+            return Program(ModuleHash.of(injected), module)
         }
     }
 }

@@ -73,18 +73,25 @@ internal object FuelInjector {
         val sizesAfter: IntArray,
     )
 
-    /** [wasm] に計測コードを挿入する。重いので（lua.wasm で数十 ms）、メインスレッドでは呼ばない */
+    /**
+     * [wasm] に計測コードを挿入する。重いので（lua.wasm で数十 ms）、メインスレッドでは呼ばない。
+     *
+     * [checkpoint] は関数の本体を1つ書き換えるごとに呼ぶ（検証の時間の上限。#40）。投げた [WasmLoadException] はそのまま外に出る
+     */
     @Throws(WasmLoadException::class)
-    fun inject(wasm: ByteArray): Result = try {
-        injectUnchecked(wasm)
+    fun inject(wasm: ByteArray, checkpoint: () -> Unit = {}): Result = try {
+        injectUnchecked(wasm, checkpoint)
     } catch (e: WasmLoadException) {
         throw e
     } catch (e: Exception) {
         throw WasmLoadException("燃料の計測コードを挿入できない: ${e.message}", e)
+    } catch (e: StackOverflowError) {
+        throw WasmLoadException("燃料の計測コードを挿入できない: 入れ子が深すぎる", e)
     }
 
-    private fun injectUnchecked(wasm: ByteArray): Result {
+    private fun injectUnchecked(wasm: ByteArray, checkpoint: () -> Unit): Result {
         val module = Parser.parse(wasm)
+        checkpoint()
         val importSection = module.importSection()
         for (i in 0 until importSection.importCount()) {
             val imp = importSection.getImport(i)
@@ -218,6 +225,7 @@ internal object FuelInjector {
                         body.leb(fn.size().toLong())
                         body.append(fn)
                         r.pos = bodyEnd
+                        checkpoint()
                     }
                     emit(s.id, body)
                 }

@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -275,6 +276,8 @@ internal class SchedulerInternals(
     val runtime: WasmRuntime = EndiveRuntime(),
     /** `Machine.exec` で読み込むときに燃料の計測コードを挿入する（#38）。ダミーのランタイムで、本物の WASM でないバイト列を使うテストでは `false` */
     val meterExecutables: Boolean = true,
+    /** `Machine.exec` で読み込む WASM の構造と時間の上限（#40）。`null` なら確かめない（本物の WASM でないバイト列を使うテスト） */
+    val moduleLimits: ModuleLimits? = ModuleLimits.DEFAULT,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */
