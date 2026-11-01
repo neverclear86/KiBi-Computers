@@ -201,6 +201,32 @@ class VfsTest {
     }
 
     @Test
+    fun `パスで時刻を変える`() {
+        val (vfs, _) = vfsWithRoot()
+        vfs.writeText("/f", "x")
+        vfs.setTimes(p("/f"), 10, 20)
+        assertEquals(10L, vfs.stat(p("/f")).accessedNanos)
+        assertEquals(20L, vfs.stat(p("/f")).modifiedNanos)
+        vfs.setTimes(p("/f"), null, 30)
+        assertEquals(10L, vfs.stat(p("/f")).accessedNanos)
+        assertEquals(30L, vfs.stat(p("/f")).modifiedNanos)
+        assertErrno(Errno.NOENT) { vfs.setTimes(p("/none"), 1, 1) }
+        // マウントの位置はマウントした FS の根。祖先（どの FS にもない）は ROFS
+        val inner = TestMemoryFileSystem()
+        vfs.mount(p("/a/b"), inner, readOnly = false, source = "inner")
+        vfs.setTimes(p("/a/b"), 5, 6)
+        assertEquals(6L, vfs.stat(p("/a/b")).modifiedNanos)
+        assertErrno(Errno.ROFS) { vfs.setTimes(p("/a"), 1, 1) }
+        vfs.setTimes(p("/a"), null, null)
+        // 読み取り専用のマウント
+        val image = TestMemoryFileSystem()
+        image.createFile(p("/prog"))
+        vfs.mount(p("/ro"), image, readOnly = true, source = "image")
+        assertErrno(Errno.ROFS) { vfs.setTimes(p("/ro/prog"), 1, 1) }
+        vfs.setTimes(p("/ro/prog"), null, null)
+    }
+
+    @Test
     fun `外したマウントの開いたファイルはIO`() {
         val (vfs, _) = vfsWithRoot()
         val m = vfs.mount(p("/disk"), TestMemoryFileSystem(), readOnly = false, source = "disk:1")

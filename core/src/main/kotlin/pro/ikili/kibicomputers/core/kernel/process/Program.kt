@@ -90,11 +90,17 @@ internal data class SpawnOptions(
     val cwd: String? = null,
     /**
      * fd 3 以降に割り当てるもの（fd → 割り当て）。標準入出力と同じ [StdioSource] で指定する。
-     * [StdioSource.Inherit] は親の同じ番号（親がない・閉じていれば割り当てない）、[StdioSource.Console] はコンソールの出力。
+     * [StdioSource.Inherit] は親の同じ番号（親がない・閉じていれば割り当てない）、[StdioSource.Console] はコンソールの出力、
+     * [StdioSource.Directory] はディレクトリ（WASI の preopen。[ROOT_PREOPEN]）。
      * fd が 3 未満・上限以上なら `BADF`
      */
     val fds: Map<Int, StdioSource> = emptyMap(),
-)
+) {
+    companion object {
+        /** fd 3 に根 `/` を preopen として置く（WASI p1 のプログラムがパスで辿る起点。#71）。起動の手順が init に渡す */
+        val ROOT_PREOPEN: Map<Int, StdioSource> = mapOf(3 to StdioSource.Directory("/"))
+    }
+}
 
 /** 実行ファイルの [Program] から、そのプロセスの [ProcessDriver] を作る（ABI 層。p1 か Component Model かを見分ける）。 */
 internal fun interface ProcessDriverFactory {

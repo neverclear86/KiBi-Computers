@@ -1,7 +1,15 @@
 package pro.ikili.kibicomputers.core.wasi.p1
 
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileStat
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 
 /**
  * WASI p1（`wasi_snapshot_preview1`）の値と構造体の配置。値は WASI p1 の witx（`typenames.witx`）のとおり。
@@ -46,6 +54,18 @@ internal object P1 {
     const val FSTFLAGS_ATIM_NOW: Int = 2
     const val FSTFLAGS_MTIM: Int = 4
     const val FSTFLAGS_MTIM_NOW: Int = 8
+
+    const val FSTFLAGS_ALL: Int = FSTFLAGS_ATIM or FSTFLAGS_ATIM_NOW or FSTFLAGS_MTIM or FSTFLAGS_MTIM_NOW
+
+    // ---- oflags（u16） ----
+    const val OFLAGS_CREAT: Int = 1
+    const val OFLAGS_DIRECTORY: Int = 2
+    const val OFLAGS_EXCL: Int = 4
+    const val OFLAGS_TRUNC: Int = 8
+    const val OFLAGS_ALL: Int = OFLAGS_CREAT or OFLAGS_DIRECTORY or OFLAGS_EXCL or OFLAGS_TRUNC
+
+    // ---- lookupflags（u32） ----
+    const val LOOKUPFLAGS_SYMLINK_FOLLOW: Int = 1
 
     // ---- preopentype（u8） ----
     const val PREOPENTYPE_DIR: Int = 0
@@ -133,4 +153,74 @@ internal object P1 {
     /** [memory] の [address]（符号なし）から [length] バイトが範囲の中か */
     fun inBounds(memory: WasmMemory, address: Int, length: Long): Boolean =
         length >= 0 && u32(address.toLong()) + length <= memory.byteSize
+
+    /** `filestat`（[FILESTAT_SIZE] バイト）の中身。`fd_filestat_get` と `path_filestat_get` が使う */
+    fun filestat(st: FileStat): ByteArray {
+        val out = ByteArray(FILESTAT_SIZE)
+        putI64(out, 0, st.device)
+        putI64(out, 8, st.node)
+        out[16] = fileType(st.type).toByte()
+        putI64(out, 24, st.linkCount)
+        putI64(out, 32, st.size)
+        putI64(out, 40, st.accessedNanos)
+        putI64(out, 48, st.modifiedNanos)
+        putI64(out, 56, st.changedNanos)
+        return out
+    }
+
+    /** 変える時刻（`null` は変えない） */
+    class Times(val accessedNanos: Long?, val modifiedNanos: Long?)
+
+    /**
+     * `fstflags` と時刻を、変える時刻にする。`*_NOW` は [now] の時刻（使うときだけ呼ぶ）。
+     * 知らないビットと、`ATIM` と `ATIM_NOW`（`MTIM` も）を一緒に使うと `INVAL`
+     */
+    @Throws(FsException::class)
+    fun times(fstFlags: Int, atim: Long, mtim: Long, now: () -> Long): Times {
+        if (fstFlags and FSTFLAGS_ALL.inv() != 0) fsError(Errno.INVAL)
+        if (fstFlags and FSTFLAGS_ATIM != 0 && fstFlags and FSTFLAGS_ATIM_NOW != 0) fsError(Errno.INVAL)
+        if (fstFlags and FSTFLAGS_MTIM != 0 && fstFlags and FSTFLAGS_MTIM_NOW != 0) fsError(Errno.INVAL)
+        val nowNanos = if (fstFlags and (FSTFLAGS_ATIM_NOW or FSTFLAGS_MTIM_NOW) != 0) now() else 0L
+        val a = when {
+            fstFlags and FSTFLAGS_ATIM != 0 -> atim
+            fstFlags and FSTFLAGS_ATIM_NOW != 0 -> nowNanos
+            else -> null
+        }
+        val m = when {
+            fstFlags and FSTFLAGS_MTIM != 0 -> mtim
+            fstFlags and FSTFLAGS_MTIM_NOW != 0 -> nowNanos
+            else -> null
+        }
+        return Times(a, m)
+    }
+
+    /**
+     * ゲストのメモリの `(ptr, len)` のパスの文字列（NUL 終端なし）を読む。
+     * [len] が [VfsPath.MAX_PATH_BYTES] を超えればメモリを読まずに `NAMETOOLONG`、範囲外なら `FAULT`、UTF-8 として壊れていれば `ILSEQ`
+     */
+    @Throws(FsException::class)
+    fun readPath(memory: WasmMemory, ptr: Int, len: Int): String {
+        val n = u32(len.toLong())
+        if (n > VfsPath.MAX_PATH_BYTES) fsError(Errno.NAMETOOLONG, "パスが長すぎる")
+        if (!inBounds(memory, ptr, n)) fsError(Errno.FAULT)
+        val bytes = memory.read(ptr, n.toInt())
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        return try {
+            decoder.decode(ByteBuffer.wrap(bytes)).toString()
+        } catch (_: CharacterCodingException) {
+            fsError(Errno.ILSEQ, "パスが UTF-8 ではない")
+        }
+    }
+
+    /** [b] の [at] に、リトルエンディアンで [v] を書く */
+    fun putI64(b: ByteArray, at: Int, v: Long) {
+        for (i in 0 until 8) b[at + i] = (v ushr (8 * i)).toByte()
+    }
+
+    /** [b] の [at] に、リトルエンディアンで [v] を書く */
+    fun putI32(b: ByteArray, at: Int, v: Int) {
+        for (i in 0 until 4) b[at + i] = (v ushr (8 * i)).toByte()
+    }
 }

@@ -34,6 +34,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -412,7 +413,8 @@ public class Machine private constructor(
      * @return 割り当てた pid
      * @throws IllegalArgumentException 燃料を計測しないモジュールで `allowUnmetered` が `false`、または親がない・終わっている
      * @throws FsException 引数・環境変数が正しくない（`INVAL`）・大きすぎる（`TOOBIG`）、作業ディレクトリがない（`NOENT`）・
-     *   ディレクトリでない（`NOTDIR`）、渡す fd が開いていない・範囲外（`BADF`）
+     *   ディレクトリでない（`NOTDIR`）、渡す fd が開いていない・範囲外（`BADF`）、preopen（[StdioSource.Directory]）の
+     *   ディレクトリがない（`NOENT`）・ディレクトリでない（`NOTDIR`）
      * @throws ResourceLimitException プロセスの上限・ブロッキング型の上限を超えた
      * @throws IllegalStateException マシンが STOPPING・CRASHED、またはスケジューラが閉じている
      */
@@ -451,8 +453,7 @@ public class Machine private constructor(
                 initPid = pid
                 bootingValue = false
             }
-            val fds = FdTable(process, kernel.objects, wakeSink)
-            for ((fd, entry) in fdEntries) fds.installAt(fd, entry)
+            installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
             val rt = ProcessRuntime(this, process, program, driver)
             runner.initRuntime(rt)
             runtimes[pid] = rt
@@ -544,12 +545,23 @@ public class Machine private constructor(
         return out.toByteArray()
     }
 
+    /** 割り当てる fd 1つ。表にあるオブジェクト（[Existing]）か、まだ表に足していないもの（[NewObject]） */
+    private sealed interface PendingFd {
+        /** 表にあるオブジェクトのエントリ（参照はまだ増やさない） */
+        class Existing(val entry: HandleEntry) : PendingFd
+
+        /** まだ表にない [obj]。[installFdsLocked] が表に足してから割り当てる */
+        class NewObject(val obj: OpenFile, val rights: Int) : PendingFd
+    }
+
     /**
-     * fd 0/1/2（[SpawnOptions.stdio]）と fd 3 以降（[SpawnOptions.fds]）の割り当てを、入れるエントリにする（参照はまだ増やさない）。
-     * 表は変えない（コンソールは作ることがある）。親の fd が開いていない・範囲外なら `BADF`、オブジェクトがなければ [IllegalArgumentException]
+     * fd 0/1/2（[SpawnOptions.stdio]）と fd 3 以降（[SpawnOptions.fds]）の割り当てを決める（参照はまだ増やさない）。
+     * 表は変えない（コンソールは作ることがある。preopen のディレクトリは開くだけで、表に足すのは [installFdsLocked]）。
+     * 親の fd が開いていない・範囲外なら `BADF`、preopen のディレクトリがない・ディレクトリでないなら `NOENT`・`NOTDIR`、
+     * オブジェクトがなければ [IllegalArgumentException]
      */
-    private fun resolveFdsLocked(options: SpawnOptions, parent: Process?): Map<Int, HandleEntry> {
-        val out = LinkedHashMap<Int, HandleEntry>()
+    private fun resolveFdsLocked(options: SpawnOptions, parent: Process?): Map<Int, PendingFd> {
+        val out = LinkedHashMap<Int, PendingFd>()
         for (fd in listOf(STDIN, STDOUT, STDERR)) resolveFdLocked(fd, options.stdio.source(fd), parent)?.let { out[fd] = it }
         for ((fd, source) in options.fds.entries.sortedBy { it.key }) {
             if (fd <= STDERR || fd >= DEFAULT_HANDLE_LIMIT) fsError(Errno.BADF, "fd $fd は渡せない（3 以上 $DEFAULT_HANDLE_LIMIT 未満）")
@@ -559,22 +571,46 @@ public class Machine private constructor(
     }
 
     /** fd [fd] の割り当て1つ。割り当てないなら `null` */
-    private fun resolveFdLocked(fd: Int, source: StdioSource, parent: Process?): HandleEntry? = when (source) {
+    private fun resolveFdLocked(fd: Int, source: StdioSource, parent: Process?): PendingFd? = when (source) {
         StdioSource.Inherit -> when {
-            parent != null -> parent.handles[fd]
-            fd <= STDERR -> consoleEntryLocked(fd)
+            parent != null -> parent.handles[fd]?.let { PendingFd.Existing(it) }
+            fd <= STDERR -> PendingFd.Existing(consoleEntryLocked(fd))
             else -> null
         }
         is StdioSource.ParentFd -> {
             val p = requireNotNull(parent) { "親のないプロセスに親の fd は渡せない" }
-            p.handles[source.fd] ?: fsError(Errno.BADF, "親の fd ${source.fd} は開いていない")
+            PendingFd.Existing(p.handles[source.fd] ?: fsError(Errno.BADF, "親の fd ${source.fd} は開いていない"))
         }
         is StdioSource.Object -> {
             require(kernel.objects[source.objectId] != null) { "オブジェクト ${source.objectId} がない" }
-            HandleEntry(source.objectId, rights = source.rights)
+            PendingFd.Existing(HandleEntry(source.objectId, rights = source.rights))
         }
-        StdioSource.Console -> consoleEntryLocked(fd)
+        is StdioSource.Directory -> {
+            // OpenFile はファイルシステムを参照せず、閉じる処理も要らないので、表に足す前に捨てても何も漏れない
+            val path = VfsPath.resolve(parent?.cwd ?: VfsPath.ROOT, source.path)
+            PendingFd.NewObject(vfs.open(path, OpenOptions(read = true, directory = true)), HandleRights.READ)
+        }
+        StdioSource.Console -> PendingFd.Existing(consoleEntryLocked(fd))
         StdioSource.Closed -> null
+    }
+
+    /**
+     * [pending] を [fds] に割り当てる。[PendingFd.NewObject] は割り当ての直前に表に足し（参照 1）、割り当てで参照 2 にしてから、
+     * 最後に作ったときの参照を必ず返す。成功すれば fd の参照だけが残り、途中で失敗すれば 0 になって表から消える
+     */
+    private fun installFdsLocked(fds: FdTable, pending: Map<Int, PendingFd>) {
+        val created = ArrayList<Int>()
+        try {
+            for ((fd, p) in pending) {
+                val entry = when (p) {
+                    is PendingFd.Existing -> p.entry
+                    is PendingFd.NewObject -> HandleEntry(kernel.objects.add(p.obj).also { created += it }, rights = p.rights)
+                }
+                fds.installAt(fd, entry)
+            }
+        } finally {
+            for (id in created) kernel.objects.release(id, wakeSink)
+        }
     }
 
     private fun consoleEntryLocked(fd: Int): HandleEntry {

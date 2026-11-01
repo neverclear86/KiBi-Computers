@@ -14,6 +14,12 @@ internal sealed interface StdioSource {
     /** マシンのコンソールの TTY（fd 0 は読む側、fd 1・2 は書く側。#60） */
     data object Console : StdioSource
 
+    /**
+     * ディレクトリ [path] を、読む権利で開いて割り当てる（WASI の preopen 用。#71）。相対パスは親の作業ディレクトリ
+     * （親がなければ `/`）から辿る。ない・ディレクトリでなければ、プロセスを作るのが `NOENT`・`NOTDIR` で失敗する
+     */
+    data class Directory(val path: String) : StdioSource
+
     /** 割り当てない（閉じたまま） */
     data object Closed : StdioSource
 }

@@ -76,6 +76,5 @@
 
 ## 決めないこと
 
-- `path_*` と preopen の構成: #71。`poll_oneoff`: #72。args・clock・`proc_exit`: #69
-- `DSYNC`・`RSYNC`・`SYNC` の扱い（`path_open` の `fdflags` と合わせて #71）
+- `poll_oneoff`: #72。args・clock・`proc_exit`: #69（`path_*`・preopen の構成・`path_open` の `DSYNC` などは #71 で決めた。ADR 0071）
 - デバイスファイル（`/dev/null` など）の種類と読み書き: #54。パイプ: #59

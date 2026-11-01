@@ -88,6 +88,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             args = listOf(BootConfig.INIT_PATH),
             env = emptyMap(),
             cwd = "/",
+            fds = SpawnOptions.ROOT_PREOPEN,
         )
         try {
             machine.exec(BootConfig.INIT_PATH, KernelDrivers.DEFAULT, options, parentPid = 0, asInit = true)
