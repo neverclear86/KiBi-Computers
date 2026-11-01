@@ -557,6 +557,8 @@ internal class AnsiTerminal(
         if (wrapPending) {
             wrapPending = false
             if (autoWrap) {
+                // スクロールの前に、この行に溜めた文字を書き出す
+                flushRun()
                 cursorX = 0
                 lineFeed()
             }
@@ -565,6 +567,7 @@ internal class AnsiTerminal(
             if (autoWrap) {
                 // 右端の1セルには入らないので、空けたまま次の行へ
                 appendRun(cursorX, cursorY, TextBuffer.BLANK)
+                flushRun()
                 cursorX = 0
                 lineFeed()
             } else {

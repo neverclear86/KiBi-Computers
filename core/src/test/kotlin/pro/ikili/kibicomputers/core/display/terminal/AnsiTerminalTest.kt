@@ -84,6 +84,28 @@ class AnsiTerminalTest {
     }
 
     @Test
+    fun `auto wrap at bottom scrolls after flushing the full row`() {
+        val t = term(w = 4, h = 3)
+        // 最下行に着いた状態で、折り返しを含む文字列を1回の write で送る
+        t.write("1\r\n2\r\n")
+        t.write("abcde")
+        assertEquals("2", t.row(0))
+        assertEquals("abcd", t.row(1))
+        assertEquals("e", t.row(2))
+        assertEquals(1 to 2, t.cursor())
+    }
+
+    @Test
+    fun `wide char wrap at bottom scrolls after flushing the full row`() {
+        val t = term(w = 4, h = 3)
+        t.write("1\r\n2\r\n")
+        t.write("abcあ")
+        assertEquals("2", t.row(0))
+        assertEquals("abc", t.row(1))
+        assertEquals('あ'.code, t.buffer.getCodePoint(0, 2))
+    }
+
+    @Test
     fun `cursor movement sequences`() {
         val t = term()
         t.write("\u001b[3;5H")
