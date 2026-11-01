@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.neoforge.input
 import com.mojang.serialization.MapCodec
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.context.BlockPlaceContext
@@ -25,7 +26,7 @@ import net.minecraft.world.phys.shapes.VoxelShape
 /**
  * キーボードブロック（#142）。床に置く薄いブロックで、正面（[FACING]）は置いたプレイヤーの方を向く。
  *
- * 右クリックすると、このキーボードへの入力 GUI（`client/KeyboardInputScreen`）を開く。
+ * 右クリックすると、サーバーが入力のセッションを作り（[KeyboardSessions]）、このキーボードへの入力 GUI（`client/KeyboardInputScreen`）を開かせる。
  * 隣の画面を右クリックしても開く（[KeyboardInput.findKeyboard]）。受け取った入力は [KeyboardBlockEntity] が配る。
  */
 class KeyboardBlock(properties: BlockBehaviour.Properties) : Block(properties), EntityBlock {
@@ -70,7 +71,8 @@ class KeyboardBlock(properties: BlockBehaviour.Properties) : Block(properties), 
         player: Player,
         hitResult: BlockHitResult,
     ): InteractionResult {
-        if (level.isClientSide) KeyboardInput.openOnClient(pos, null)
+        // GUI はサーバーが開く（#360）。保護 MOD が右クリックを取り消したら、ここに来ないので開かない
+        if (player is ServerPlayer) KeyboardSessions.open(player, pos, null)
         return InteractionResult.sidedSuccess(level.isClientSide)
     }
 

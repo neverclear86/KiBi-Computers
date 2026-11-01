@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.input
 
+import java.util.UUID
+
 /**
  * キーボードから届く入力の1つ（#142）。キーの押し下げ・離し（キーコード）と、打った文字を別々に送る。
  *
@@ -37,8 +39,15 @@ public sealed class KeyboardEvent {
 
 /**
  * キーボードからの入力を受け取る相手。キーボードのブロックに登録し、サーバーのメインスレッドで呼ばれる。
+ *
+ * 1つのキーボードにつながる相手は1つだけ（#360）。
  */
 public fun interface KeyboardListener {
-    /** [event] が届いた。 */
-    public fun onKeyboardEvent(event: KeyboardEvent)
+    /**
+     * [event] が届いた。
+     *
+     * @param typist 打ったプレイヤー（入力のセッション [KeyboardSession] を開いた人）の UUID。
+     *   プロセスに渡すかどうかは ABI の論点なので、#63・#326 で決める
+     */
+    public fun onKeyboardEvent(typist: UUID, event: KeyboardEvent)
 }

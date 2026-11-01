@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.neoforge.gametest
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
+import net.minecraft.gametest.framework.GameTestAssertException
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.ItemInteractionResult
@@ -33,7 +34,9 @@ import pro.ikili.kibicomputers.neoforge.input.KeyboardBlock
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInputPayload
+import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.util.UUID
 
 /** キーボードブロックと入力（#142）の GameTest。 */
 @GameTestHolder(KiBiComputers.MOD_ID)
@@ -164,16 +167,36 @@ object KeyboardGameTests {
         helper.succeed()
     }
 
-    /** 届いたパケットを読んで、登録した相手に配る。端末向けのバイト列にもできる。 */
+    /** 打った人と入力の組 */
+    private data class Typed(val typist: UUID, val event: KeyboardEvent)
+
+    private fun listen(keyboard: KeyboardBlockEntity, into: MutableList<Typed>): KeyboardListener {
+        val listener = KeyboardListener { typist, event -> into += Typed(typist, event) }
+        keyboard.claim(listener)
+        return listener
+    }
+
+    private fun packet(vararg events: KeyboardEvent): ByteArray = KeyboardEventCodec.encode(events.toList()).single()
+
+    /**
+     * 右クリックがサーバーに届くと、入力のセッションを開く（#360）。セッションから届いたパケットを読んで、打った人を付けて配る。
+     * 端末向けのバイト列にもできる。GUI を閉じると、押したままのキーの離しを合成する。
+     */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
-    fun keyboardDeliversInputFromNearbyPlayer(helper: GameTestHelper) {
+    fun keyboardDeliversInputFromSession(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.KEYBOARD.get())
         val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(POS)
-        val received = ArrayList<KeyboardEvent>()
-        keyboard.addListener(KeyboardListener { received += it })
+        val received = ArrayList<Typed>()
+        listen(keyboard, received)
         val player = helper.makeMockServerPlayerInLevel()
         player.moveTo(Vec3.atCenterOf(helper.absolutePos(POS.east())))
+        val abs = helper.absolutePos(POS)
+        val hit = BlockHitResult(Vec3.atCenterOf(abs), Direction.UP, abs, false)
+        val result = helper.getBlockState(POS).useWithoutItem(helper.level, player, hit)
+        helper.assertTrue(result.consumesAction(), "right-click should be handled but was $result")
+        val session = KeyboardSessions.sessionOf(player) ?: throw GameTestAssertException("right-click should open a session")
+        helper.assertTrue(session.typist == player.uuid, "the session should belong to the player")
         val events = listOf(
             KeyboardEvent.KeyDown(Key.H, KeyModifiers.NONE, false),
             KeyboardEvent.Text("hé日本"),
@@ -182,43 +205,152 @@ object KeyboardGameTests {
             KeyboardEvent.Paste("a\nb"),
             KeyboardEvent.KeyDown(Key.ENTER, KeyModifiers.NONE, false),
         )
-        val data = KeyboardEventCodec.encode(events).single()
-        val n = KeyboardInput.receive(player, KeyboardInputPayload(helper.absolutePos(POS), data))
+        val n = KeyboardSessions.receive(player, KeyboardInputPayload(session.id, packet(*events.toTypedArray())))
         helper.assertTrue(n == events.size, "all events should be delivered but was $n")
-        helper.assertTrue(received == events, "listener should receive the events in order but got $received")
-        val bytes = String(TerminalKeyEncoder.encodeAll(received), Charsets.UTF_8)
+        helper.assertTrue(received == events.map { Typed(player.uuid, it) }, "listener should receive the events in order but got $received")
+        val bytes = String(TerminalKeyEncoder.encodeAll(received.map { it.event }), Charsets.UTF_8)
         helper.assertTrue(bytes == "hé日本\u0003a\rb\r", "terminal bytes were ${bytes.toByteArray().toList()}")
+        // GUI を閉じると、押したままのキー（C と Enter）の離しを合成する
+        received.clear()
+        KeyboardSessions.closeFromClient(player, session.id)
+        helper.assertTrue(KeyboardSessions.sessionOf(player) == null, "closing should end the session")
+        helper.assertTrue(
+            received.map { it.event } == listOf(KeyboardEvent.KeyUp(Key.C, KeyModifiers.NONE), KeyboardEvent.KeyUp(Key.ENTER, KeyModifiers.NONE)),
+            "held keys should be released on close but got $received",
+        )
+        KeyboardSessions.loggedOut(player)
         helper.succeed()
     }
 
-    /** 遠いプレイヤー・壊れたパケット・キーボードでない位置への入力は捨てる。量の上限を超えた分も捨てる。 */
+    /**
+     * セッションのないパケット・番号の違うパケット・閉じたセッションのパケットは捨てる（#360）。遠いプレイヤーや、
+     * キーボードでない位置には、セッションを開かない。壊れたパケットも捨てる。
+     */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
-    fun keyboardRejectsInvalidInput(helper: GameTestHelper) {
+    fun keyboardRejectsInputWithoutSession(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.KEYBOARD.get())
         val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(POS)
-        var count = 0
-        keyboard.addListener(KeyboardListener { count++ })
+        val received = ArrayList<Typed>()
+        listen(keyboard, received)
         val abs = helper.absolutePos(POS)
-        val data = KeyboardEventCodec.encode(listOf(KeyboardEvent.Text("x"))).single()
+        val data = packet(KeyboardEvent.Text("x"))
         val player = helper.makeMockServerPlayerInLevel()
-        // 遠い
-        player.moveTo(Vec3.atCenterOf(abs).add(0.0, 0.0, 30.0))
-        helper.assertTrue(KeyboardInput.receive(player, KeyboardInputPayload(abs, data)) == -1, "far player should be rejected")
         player.moveTo(Vec3.atCenterOf(abs.east()))
+        // セッションなし（GUI をクライアントだけで開いた、パケットを直接送った）
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(1, data)) == -1, "input without a session should be rejected")
+        // キーボードでない位置には開かない
+        helper.assertTrue(KeyboardSessions.open(player, abs.above(), null) == null, "a session to a non-keyboard should not open")
+        // 遠いと開かない
+        player.moveTo(Vec3.atCenterOf(abs).add(0.0, 0.0, 30.0))
+        helper.assertTrue(KeyboardSessions.open(player, abs, null) == null, "a far player should not open a session")
+        player.moveTo(Vec3.atCenterOf(abs.east()))
+        val session = KeyboardSessions.open(player, abs, null) ?: throw GameTestAssertException("a near player should open a session")
+        // 番号が違う
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session.id + 1, data)) == -1, "a wrong session id should be rejected")
         // 壊れている
-        helper.assertTrue(KeyboardInput.receive(player, KeyboardInputPayload(abs, byteArrayOf(9))) == -1, "malformed should be rejected")
-        // キーボードでない
-        helper.assertTrue(
-            KeyboardInput.receive(player, KeyboardInputPayload(abs.above(), data)) == -1,
-            "input to a non-keyboard should be rejected",
-        )
-        helper.assertTrue(count == 0, "nothing should be delivered but $count were")
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session.id, byteArrayOf(9))) == -1, "malformed should be rejected")
+        // ほかのプレイヤーは、人のセッションの番号を使えない
+        val other = helper.makeMockServerPlayerInLevel()
+        other.moveTo(Vec3.atCenterOf(abs.west()))
+        helper.assertTrue(KeyboardSessions.receive(other, KeyboardInputPayload(session.id, data)) == -1, "another player's session should be rejected")
+        helper.assertTrue(received.isEmpty(), "nothing should be delivered but got $received")
+        // 閉じたあとに届いた古いパケット
+        KeyboardSessions.closeFromClient(player, session.id)
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session.id, data)) == -1, "a closed session should be rejected")
+        helper.assertTrue(received.isEmpty(), "nothing should be delivered but got $received")
+        KeyboardSessions.loggedOut(player)
+        KeyboardSessions.loggedOut(other)
+        helper.succeed()
+    }
+
+    /** 受け取る量の上限は、プレイヤーとキーボードの組ごと（#360）。1人が使い切っても、ほかの人の入力は通る。開き直しても戻らない。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardBudgetIsPerPlayer(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.KEYBOARD.get())
+        val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(POS)
+        listen(keyboard, ArrayList())
+        val abs = helper.absolutePos(POS)
+        val flooder = helper.makeMockServerPlayerInLevel()
+        flooder.moveTo(Vec3.atCenterOf(abs.east()))
+        val typist = helper.makeMockServerPlayerInLevel()
+        typist.moveTo(Vec3.atCenterOf(abs.west()))
+        val flood = KeyboardSessions.open(flooder, abs, null) ?: throw GameTestAssertException("flooder should open a session")
+        val typing = KeyboardSessions.open(typist, abs, null) ?: throw GameTestAssertException("typist should open a session")
         // 同じ tick に送りすぎると、上限を超えた分は捨てる
-        val big = KeyboardEventCodec.encode(listOf(KeyboardEvent.Paste("y".repeat(KeyboardEventCodec.MAX_TEXT_BYTES)))).single()
+        val big = packet(KeyboardEvent.Paste("y".repeat(KeyboardEventCodec.MAX_TEXT_BYTES)))
         var accepted = 0
-        repeat(10) { if (KeyboardInput.receive(player, KeyboardInputPayload(abs, big)) > 0) accepted++ }
+        repeat(10) { if (KeyboardSessions.receive(flooder, KeyboardInputPayload(flood.id, big)) > 0) accepted++ }
         helper.assertTrue(accepted in 1..9, "budget should accept some and reject the rest but accepted $accepted")
+        helper.assertTrue(KeyboardSessions.receive(typist, KeyboardInputPayload(typing.id, big)) > 0, "another player's input should still be accepted")
+        // 開き直しても、使い切った分は戻らない
+        val reopened = KeyboardSessions.open(flooder, abs, null) ?: throw GameTestAssertException("flooder should reopen")
+        helper.assertTrue(reopened.id != flood.id, "reopening should make a new session")
+        helper.assertTrue(KeyboardSessions.receive(flooder, KeyboardInputPayload(reopened.id, big)) == -1, "reopening should not refill the budget")
+        KeyboardSessions.loggedOut(flooder)
+        KeyboardSessions.loggedOut(typist)
+        helper.succeed()
+    }
+
+    /** 届く距離を外れたら、セッションを閉じ、押したままのキーの離しを合成する（#360）。ログアウト・キーボードが壊れたときも閉じる。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun sessionClosesWhenPlayerLeaves(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.KEYBOARD.get())
+        val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(POS)
+        val received = ArrayList<Typed>()
+        listen(keyboard, received)
+        val abs = helper.absolutePos(POS)
+        val player = helper.makeMockServerPlayerInLevel()
+        player.moveTo(Vec3.atCenterOf(abs.east()))
+        val session = KeyboardSessions.open(player, abs, null) ?: throw GameTestAssertException("should open a session")
+        val down = KeyboardEvent.KeyDown(Key.A, KeyModifiers.NONE, false)
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session.id, packet(down))) == 1, "input should be accepted")
+        // 離れる
+        player.moveTo(Vec3.atCenterOf(abs).add(0.0, 0.0, 30.0))
+        KeyboardSessions.tick()
+        helper.assertTrue(KeyboardSessions.sessionOf(player) == null, "leaving should close the session")
+        helper.assertTrue(
+            received == listOf(Typed(player.uuid, down), Typed(player.uuid, KeyboardEvent.KeyUp(Key.A, KeyModifiers.NONE))),
+            "the held key should be released but got $received",
+        )
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session.id, packet(down))) == -1, "input after leaving should be rejected")
+        // ログアウト
+        player.moveTo(Vec3.atCenterOf(abs.east()))
+        val again = KeyboardSessions.open(player, abs, null) ?: throw GameTestAssertException("should reopen")
+        received.clear()
+        KeyboardSessions.receive(player, KeyboardInputPayload(again.id, packet(KeyboardEvent.KeyDown(Key.B, KeyModifiers.NONE, false))))
+        KeyboardSessions.loggedOut(player)
+        helper.assertTrue(KeyboardSessions.sessionOf(player) == null, "logging out should close the session")
+        helper.assertTrue(
+            received.lastOrNull() == Typed(player.uuid, KeyboardEvent.KeyUp(Key.B, KeyModifiers.NONE)),
+            "logging out should release keys but got $received",
+        )
+        // キーボードが壊れたら閉じる
+        helper.assertTrue(KeyboardSessions.open(player, abs, null) != null, "should reopen")
+        helper.setBlock(POS, Blocks.AIR)
+        KeyboardSessions.tick()
+        helper.assertTrue(KeyboardSessions.sessionOf(player) == null, "breaking the keyboard should close the session")
+        KeyboardSessions.loggedOut(player)
+        helper.succeed()
+    }
+
+    /** 1つのキーボードにつながる相手は1つだけ（#360）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardHasSingleOwner(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.KEYBOARD.get())
+        val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(POS)
+        val first = KeyboardListener { _, _ -> }
+        val second = KeyboardListener { _, _ -> }
+        helper.assertTrue(keyboard.claim(first), "the first listener should be connected")
+        helper.assertTrue(keyboard.claim(first), "claiming again should keep it")
+        helper.assertTrue(!keyboard.claim(second), "the second listener should be refused")
+        keyboard.release(second)
+        helper.assertTrue(keyboard.owner === first, "releasing someone else should not change the owner")
+        keyboard.release(first)
+        helper.assertTrue(keyboard.claim(second), "after release, another listener can connect")
         helper.succeed()
     }
 }
