@@ -1,10 +1,15 @@
 package pro.ikili.kibicomputers.neoforge.registry
 
+import net.minecraft.core.HolderLookup
+import net.minecraft.core.component.DataComponents
 import net.minecraft.core.registries.Registries
+import net.minecraft.nbt.CompoundTag
 import net.minecraft.network.chat.Component
 import net.minecraft.world.item.BlockItem
 import net.minecraft.world.item.CreativeModeTab
+import net.minecraft.world.item.Item
 import net.minecraft.world.item.ItemStack
+import net.minecraft.world.item.Rarity
 import net.minecraft.world.level.block.SoundType
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.block.state.BlockBehaviour
@@ -16,9 +21,13 @@ import net.neoforged.neoforge.registries.DeferredItem
 import net.neoforged.neoforge.registries.DeferredRegister
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.CaseParts
+import pro.ikili.kibicomputers.neoforge.computer.ComputerPartItem
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlock
@@ -66,6 +75,22 @@ object KiBiBlocks {
             BlockEntityType.Builder.of(::CaseBlockEntity, *blocks).build(null)
         }
 
+    /** 部品の種類（拡張カードを除く）。部品のアイテムがある種類 */
+    private val PART_KINDS: List<PartKind> = PartKind.entries.filter { it != PartKind.EXPANSION }
+
+    /**
+     * 部品のアイテム（#347）。ティアごと・種類ごとに `<ティア>_<種類>`（例: `creative_cpu`）で登録する。
+     * 今は検証用のクリエイティブのティアだけ（正式なティアは #122〜#125）。
+     */
+    val PARTS: Map<PartTier, Map<PartKind, DeferredItem<ComputerPartItem>>> = PartTier.entries.associateWith { tier ->
+        PART_KINDS.associateWith { kind ->
+            ITEMS.registerItem(ComputerPartItem.idOf(kind, tier), { ComputerPartItem(kind, tier, it) }, partProperties(tier))
+        }
+    }
+
+    /** ティア [tier]・種類 [kind] の部品のアイテム */
+    fun part(tier: PartTier, kind: PartKind): ComputerPartItem = PARTS.getValue(tier).getValue(kind).get()
+
     /** キーボードブロック（#142）。 */
     val KEYBOARD: DeferredBlock<KeyboardBlock> =
         BLOCKS.registerBlock("keyboard", ::KeyboardBlock, machineProperties().noOcclusion())
@@ -85,8 +110,10 @@ object KiBiBlocks {
         CreativeModeTab.builder()
             .title(Component.translatable("itemGroup.${KiBiComputers.MOD_ID}"))
             .icon { ItemStack(SCREEN_ITEMS.getValue(ScreenTier.COLOR).get()) }
-            .displayItems { _, output ->
+            .displayItems { params, output ->
                 CASE_ITEMS.values.forEach { output.accept(it.get()) }
+                output.accept(creativeCase(params.holders()))
+                PARTS.values.forEach { parts -> parts.values.forEach { output.accept(it.get()) } }
                 SCREEN_ITEMS.values.forEach { output.accept(it.get()) }
                 output.accept(KEYBOARD_ITEM.get())
             }
@@ -100,6 +127,30 @@ object KiBiBlocks {
         BLOCK_ENTITY_TYPES.register(modBus)
         CREATIVE_TABS.register(modBus)
     }
+
+    /**
+     * 検証用のクリエイティブのケース（#347）: いちばん上のティアのケースに、起動に要る種類のスロットをすべて
+     * クリエイティブの部品で埋めたもの。置くとすぐ電源を入れられる。ケースのブロックは同じで、
+     * 部品はブロックエンティティのデータ（[DataComponents.BLOCK_ENTITY_DATA]）として持つ。
+     */
+    fun creativeCase(registries: HolderLookup.Provider): ItemStack {
+        val tier = CaseTier.entries.last()
+        val parts = CaseParts(tier)
+        for (slot in 0 until tier.slotCount) {
+            val kind = tier.kindOf(slot)
+            if (kind in PART_KINDS) parts.setStackInSlot(slot, ItemStack(part(PartTier.CREATIVE, kind)))
+        }
+        val tag = CompoundTag()
+        tag.put(CaseBlockEntity.PARTS_TAG, parts.serializeNBT(registries))
+        val stack = ItemStack(CASE_ITEMS.getValue(tier).get())
+        BlockItem.setBlockEntityData(stack, CASE_BLOCK_ENTITY.get(), tag)
+        stack.set(DataComponents.ITEM_NAME, Component.translatable("item.${KiBiComputers.MOD_ID}.creative_case"))
+        stack.set(DataComponents.RARITY, Rarity.EPIC)
+        return stack
+    }
+
+    private fun partProperties(tier: PartTier): Item.Properties =
+        Item.Properties().stacksTo(1).rarity(if (tier == PartTier.CREATIVE) Rarity.EPIC else Rarity.COMMON)
 
     // 画面・ケース・キーボードで共通。硬さは仮の値（#251 で確定）。鉄ブロックより柔らかく、ツルハシで壊す
     private fun machineProperties(): BlockBehaviour.Properties =

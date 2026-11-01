@@ -28,5 +28,13 @@
   "gui.kibicomputers.keyboard.title": "キーボード",
   "gui.kibicomputers.keyboard.hint": "キーボードで入力中 - Shift+Esc でやめる",
   "gui.kibicomputers.keyboard.close": "閉じる",
-  "gui.kibicomputers.keyboard.no_screen": "このキーボードにつながった画面がありません"
+  "gui.kibicomputers.keyboard.no_screen": "このキーボードにつながった画面がありません",
+  "item.kibicomputers.creative_cpu": "クリエイティブCPU",
+  "item.kibicomputers.creative_memory": "クリエイティブRAM",
+  "item.kibicomputers.creative_storage": "クリエイティブディスク",
+  "item.kibicomputers.creative_boot": "クリエイティブ起動ROM",
+  "item.kibicomputers.creative_case": "クリエイティブコンピューターケース（部品入り）",
+  "tooltip.kibicomputers.part.cpu": "1 tick の燃料: %s",
+  "tooltip.kibicomputers.part.memory": "容量: %s MiB",
+  "tooltip.kibicomputers.part.creative": "検証用（クリエイティブ専用）"
 }
