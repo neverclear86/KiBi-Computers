@@ -44,6 +44,24 @@ class EndiveRuntimeTest : WasmRuntimeContractTest() {
     }
 
     @Test
+    fun `テーブルと変換のトラップの種類が分かる`() {
+        val bytes = WasmBinary().run {
+            table(1)
+            val void = typeIndex(emptyList(), emptyList())
+            // ind(i): テーブルの i 番目を call_indirect で呼ぶ
+            exportFunc("ind", func(listOf(I32), emptyList(), code(0x20, 0, 0x11, void, 0x00)))
+            // conv(): NaN の f32 を i32.trunc_f32_s
+            exportFunc("conv", func(emptyList(), listOf(I32), code(0x43, 0x00, 0x00, 0xc0, 0x7f, 0xa8)))
+            build()
+        }
+        runtime.load(bytes).instantiate(WasmInstanceConfig.EMPTY).use { instance ->
+            assertEquals(WasmTrapKind.INDIRECT_CALL, assertThrows<WasmTrapException> { instance.call("ind", 0) }.kind)
+            assertEquals(WasmTrapKind.TABLE_OUT_OF_BOUNDS, assertThrows<WasmTrapException> { instance.call("ind", 5) }.kind)
+            assertEquals(WasmTrapKind.INVALID_CONVERSION, assertThrows<WasmTrapException> { instance.call("conv") }.kind)
+        }
+    }
+
+    @Test
     fun `燃料のimportとexportの片方しかないモジュールは読み込まない`() {
         val onlyImport = WasmBinary().run {
             val fuel = importFunc(WasmFuel.IMPORT_MODULE, WasmFuel.IMPORT_NAME, listOf(I64), listOf(I64))

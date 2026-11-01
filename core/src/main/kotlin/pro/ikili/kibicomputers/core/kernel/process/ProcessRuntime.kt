@@ -77,6 +77,9 @@ internal class ProcessRuntime(
     @Volatile
     var lastError: Throwable? = null
 
+    /** 例外で `CRASHED` になったときの理由（コンソールに出す短い英語。#41）。カーネルロックの中で書く */
+    var crashReason: String? = null
+
     /** このプロセスの燃料切れの処理（カーネルが作る） */
     lateinit var fuelHandler: WasmFuelHandler
 

@@ -438,7 +438,10 @@ internal class ProcessRunner(private val machine: Machine) {
         releasePermitAndCpu(rt)
     }
 
-    /** 例外で抜けたとき: グローバルを読まず、マシンの燃料に何も書き戻さない。CPU を持っているときだけ遅延補充する */
+    /**
+     * 例外で抜けたとき: グローバルを読まず、マシンの燃料に何も書き戻さない。CPU を持っているときだけ遅延補充する。
+     * WASM のトラップも JVM の例外も、このプロセスだけを `CRASHED`（停止の印があれば `KILLED`）で終える（#41）
+     */
     private fun exceptionExit(rt: ProcessRuntime, t: Throwable) {
         rt.lastError = t
         lock.lock()
@@ -448,6 +451,7 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.loading = null
             if (!rt.process.state.isTerminal) {
                 val state = if (rt.killed) ProcessState.KILLED else ProcessState.CRASHED
+                if (state == ProcessState.CRASHED) rt.crashReason = crashReason(t)
                 finishLocked(rt, state, null)
             }
         } finally {
@@ -479,7 +483,7 @@ internal class ProcessRunner(private val machine: Machine) {
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
         // 親への知らせは #46。init なら、マシンを止める（#49）
-        machine.onProcessFinishedLocked(process)
+        machine.onProcessFinishedLocked(process, rt.crashReason)
         machine.checkAllDoneLocked()
     }
 
