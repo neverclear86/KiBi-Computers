@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
@@ -28,22 +29,39 @@ class WasiP1PollProgramTest {
         Program.load(EndiveRuntime(), bytes!!)
     }
 
+    /** 同じプログラムに待機点への変換（#329）をかけたもの。`WAIT_POINT` で動き、巻き戻して待つ */
+    private val asyncProgram: Program by lazy {
+        val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/poll-wasi.wasm")!!.use { it.readBytes() }
+        Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS)
+    }
+
     @Test
-    fun `wasi-libcのpollとnanosleepとclock_nanosleepがpoll_oneoffを通って動く`() = timeout(Duration.ofSeconds(60)) {
+    fun `wasi-libcのpollとnanosleepとclock_nanosleepがpoll_oneoffを通って動く`() = run(program)
+
+    @Test
+    fun `待機点への変換をかけても、pollとnanosleepとclock_nanosleepが巻き戻して待って動く`() {
+        assertEquals(ProcessKind.WAIT_POINT, WasiP1Driver(asyncProgram.module).kind)
+        run(asyncProgram)
+    }
+
+    private fun run(program: Program) = timeout(Duration.ofSeconds(60)) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
             val (input, output) = m.lock.withLockValue {
                 ByteStream(64).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
             }
             val options = SpawnOptions(
-                allowUnmetered = true,
+                allowUnmetered = !program.module.isFuelMetered,
                 args = listOf("poll-wasi"),
                 stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed),
             )
             val pid = m.spawn(program, WasiP1Driver(program.module), options)
 
             // 標準入力が空なので、poll で待つ
-            eventually(20_000, "poll で待たない") { m.stateOf(pid) == ProcessState.WAITING_EVENT || m.stateOf(pid).isTerminal }
+            eventually(20_000, "poll で待たない") {
+                h.scheduler.tick()
+                m.stateOf(pid) == ProcessState.WAITING_EVENT || m.stateOf(pid).isTerminal
+            }
             m.lock.withLockValue {
                 (m.kernel.objects[input] as ByteStream).write("ping\n".toByteArray(), 0, 5, m.wakeSink)
                 Unit

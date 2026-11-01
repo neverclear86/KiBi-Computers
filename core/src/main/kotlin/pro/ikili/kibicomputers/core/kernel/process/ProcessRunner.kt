@@ -25,6 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -405,6 +406,7 @@ internal class ProcessRunner(private val machine: Machine) {
     private fun applyKernelLimits(rt: ProcessRuntime, builder: WasmInstanceConfig.Builder) {
         check(builder.initialFuel == 0L && builder.fuelHandler == null) { "ABI 層は builder.fuel を呼ばない（燃料はカーネルが設定する）" }
         check(builder.memoryBudget == null && builder.maxMemoryPages == WasmMemory.MAX_PAGES) { "ABI 層は builder.memoryLimit を呼ばない（メモリの上限はカーネルが設定する）" }
+        check(builder.asyncStack == null) { "ABI 層は builder.asyncStack を呼ばない（退避先はカーネルが設定する）" }
         // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
         builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
     }
@@ -420,6 +422,18 @@ internal class ProcessRunner(private val machine: Machine) {
         rt.driver.configure(rt.context, builder)
         applyKernelLimits(rt, builder)
         if (!rt.process.unmetered) builder.fuel(grant, rt.fuelHandler)
+        if (rt.program.module.isAsyncified) {
+            // 退避した値はカーネルの状態（Process）に置く（#329）。WASM の実行の中から、このプロセスのスレッドだけが触る
+            val stack = AsyncStack()
+            lock.withLockValue { rt.process.asyncStack = stack }
+            builder.asyncStack(
+                object : WasmAsyncStack {
+                    override fun push(value: Long) = stack.push(value)
+
+                    override fun pop(): Long = stack.pop()
+                },
+            )
+        }
         val instance = rt.program.module.instantiate(builder.build())
         lock.withLockValue {
             val frame = rt.loading!!
@@ -490,6 +504,12 @@ internal class ProcessRunner(private val machine: Machine) {
         rt.fuelHolder = null
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
+        // 一時的なタイマーを閉じる（持ち主は process.waitTimers だけ。待機点型で kill されたときなど。#329）。
+        // 後から来た closeWaitTimer は集合にないので何もしない（同じ ID が別のオブジェクトに使い回されていても閉じない）
+        process.waitTimers.forEach { machine.kernel.objects.release(it, machine.wakeSink) }
+        process.waitTimers.clear()
+        process.asyncWait = null
+        process.asyncStack?.clear()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
         // まだ実行していないホスト呼び出しを取り消す（ふつうは 0 件。#46）
         machine.cancelHostCallsLocked(process.pid)
@@ -502,10 +522,8 @@ internal class ProcessRunner(private val machine: Machine) {
 
     // ---- ProcessContext ----
 
+    /** プロセスごとの口。状態は持たない（一時的なタイマーの持ち主は [Process.waitTimers]。#329） */
     private inner class Context(private val rt: ProcessRuntime) : ProcessContext {
-        /** [openWaitTimer] で作って、まだ閉じていない一時的なタイマーのオブジェクトID（実行時だけ。カーネルロックの中で使う。最初に使うときに作る） */
-        private var waitTimerIds: HashSet<Int>? = null
-
         override val pid: Int get() = rt.pid
 
         override val parentPid: Int get() = rt.process.parentPid
@@ -629,20 +647,18 @@ internal class ProcessRunner(private val machine: Machine) {
                 objects.release(id, machine.wakeSink)
                 throw t
             }
-            (waitTimerIds ?: HashSet<Int>(4).also { waitTimerIds = it }) += id
+            rt.process.waitTimers.add(id)
             WaitKey(id, WaitCondition.READABLE)
         }
 
         override fun resetWaitTimer(key: WaitKey, deadlineNanos: Long) = lock.withLockValue {
-            require(waitTimerIds?.contains(key.objectId) == true) { "一時的なタイマーではない: $key" }
+            require(rt.process.waitTimers.contains(key.objectId)) { "一時的なタイマーではない: $key" }
             val timer = machine.kernel.objects[key.objectId] as Timer
             machine.armTimerLocked(timer, deadlineNanos, 0)
         }
 
         override fun closeWaitTimer(key: WaitKey) = lock.withLockValue {
-            val ids = waitTimerIds ?: return@withLockValue
-            if (!ids.remove(key.objectId)) return@withLockValue
-            if (ids.isEmpty()) waitTimerIds = null
+            if (!rt.process.waitTimers.remove(key.objectId)) return@withLockValue
             machine.kernel.objects.release(key.objectId, machine.wakeSink)
         }
 
@@ -711,6 +727,7 @@ internal class ProcessRunner(private val machine: Machine) {
                 check(rt.fuelHolder != null) { "最初のインスタンスがまだない" }
             }
             require(module.isFuelMetered == !rt.process.unmetered) { "燃料の計測の有無がプロセスと違うモジュール" }
+            require(!module.isAsyncified) { "待機点への変換をかけたモジュールは、最初のインスタンスにしかできない" }
             val builder = WasmInstanceConfig.builder()
             configurer.configure(builder)
             applyKernelLimits(rt, builder)

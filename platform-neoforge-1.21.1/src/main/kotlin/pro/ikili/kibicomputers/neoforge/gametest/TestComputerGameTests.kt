@@ -31,9 +31,10 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 object TestComputerGameTests {
     /**
      * 起動を待つ tick 数の上限。GameTest のサーバーは待たずに tick を進めるので、lua.wasm の読み込み
-     * （燃料の計測コードの挿入・検証）と Lua の起動が終わる前に、普通の上限（100 tick）を使い切ってしまう
+     * （待機点への変換・燃料の計測コードの挿入・検証。#329）と Lua の起動が終わる前に、普通の上限（100 tick）を使い切ってしまう。
+     * 温まっていない JVM で複数のテストが同時に読み込むと、読み込みだけで数秒かかる
      */
-    private const val BOOT_TIMEOUT_TICKS = 2400
+    private const val BOOT_TIMEOUT_TICKS = 12_000
 
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)

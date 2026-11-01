@@ -500,6 +500,8 @@ public class Machine private constructor(
      *
      * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
      * - 普通のファイルでなければ `ACCES`、[MachineLimits.MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
+     * - 読み込むときに、[drivers] の止まりうる import（[ProcessDriverFactory.waitImports]）で待機点への変換をかける（#329）。
+     *   変換できない作りなら変換せずに続ける。予約した名前（`kibi.async_push` など）をすでに使っている WASM は `NOEXEC`
      * - 読み込むときに燃料の計測コードを挿入する（#38）。計測の名前（`kibi.fuel`・`kibi_fuel`）をすでに使っている WASM も `NOEXEC`
      * - 読み込む前に構造の上限（関数・ローカル変数・テーブルの要素の数など）を確かめ、挿入・パース・検証に時間の上限を設ける
      *   （#40。[pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits]）。超えたら `NOEXEC`。import の確認はドライバー（[drivers]）がする
@@ -526,7 +528,8 @@ public class Machine private constructor(
             val runtime = scheduler.options.runtime
             val limits = scheduler.options.moduleLimits
             val bytes = executable.bytes
-            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes, limits) else Program.load(runtime, bytes, limits)
+            val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
+            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
         }

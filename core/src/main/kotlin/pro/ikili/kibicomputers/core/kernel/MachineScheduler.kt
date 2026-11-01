@@ -286,6 +286,8 @@ internal class SchedulerInternals(
     val runtime: WasmRuntime = EndiveRuntime(),
     /** `Machine.exec` で読み込むときに燃料の計測コードを挿入する（#38）。ダミーのランタイムで、本物の WASM でないバイト列を使うテストでは `false` */
     val meterExecutables: Boolean = true,
+    /** `Machine.exec` で読み込むときに待機点への変換をかける（#329）。テストで、同じプログラムをブロッキングで動かして比べるときは `false` */
+    val asyncifyExecutables: Boolean = true,
     /** `Machine.exec` で読み込む WASM の構造と時間の上限（#40）。`null` なら確かめない（本物の WASM でないバイト列を使うテスト） */
     val moduleLimits: ModuleLimits? = ModuleLimits.DEFAULT,
     /** タイマーの期限を待つ口（テストでは時計を手で進めるもの）。`null` なら [ExecutorTimerService] */

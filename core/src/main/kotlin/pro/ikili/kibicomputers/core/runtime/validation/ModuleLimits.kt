@@ -53,8 +53,11 @@ internal class ModuleLimits(
         /** モジュールのバイト数の既定の上限（16 MiB。実行ファイルの大きさの上限と同じ） */
         const val DEFAULT_MAX_BYTES: Int = 16 * 1024 * 1024
 
-        /** 検証の時間の既定の上限（2 秒。lua.wasm の検証は数十〜百数十 ms） */
-        const val DEFAULT_TIME_LIMIT_NANOS: Long = 2_000_000_000L
+        /**
+         * 検証の時間の既定の上限（8 秒。仮の値、確定は #251）。lua.wasm の読み込み（待機点への変換・燃料の計測コードの挿入・
+         * パースと検証。#329）は、温まった JVM で約 0.6 秒、温まっていない JVM で 4 台を同時に読み込むと 1 台あたり約 3 秒かかる
+         */
+        const val DEFAULT_TIME_LIMIT_NANOS: Long = 8_000_000_000L
 
         /** 既定の上限 */
         val DEFAULT: ModuleLimits = ModuleLimits()
