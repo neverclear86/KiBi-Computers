@@ -18,7 +18,9 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  *   マシンのコンソールの TTY に流す
  * - 端末からの応答（カーソル位置の問い合わせへの答えなど）も、TTY に流す
  * - 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
- *   （TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間は、上限なしで全部処理する
+ *   （TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間に [write] したものは、上限なしで全部処理する
+ * - 取っておいた分があるときにマシンを外すと（[machine] を `null` にする。電源を切ったときなど）、その tick の残りの上限まで書き、
+ *   残りは捨てる（#381）。画面が外れたときは [discardOutput] で、書かずに捨てる。別のマシンに替えたときは、そのまま続きを書く
  *
  * 正式には、隣接デバイスの接続（#129）と、画面・キーボードのデバイス（#65・#66）で置き換える。
  *
@@ -63,13 +65,25 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
 
     private val holdListener = ConsoleHoldListener { pump() }
 
+    /** 取っておいた出力のうち、書かずに捨てたバイト数（#381。マシンを外したときなど。数え口） */
+    internal var droppedBytes: Long = 0
+        private set
+
     /**
      * 入力と端末の応答を流す先のマシン。`null` なら入力を捨てる。
      * 入れると、マシンのコンソールの大きさを [screen] の大きさに合わせる。
+     * 取っておいた出力があるときに `null` にすると、外したマシンのその tick の残りの上限まで書き、残りは捨てる（#381）。
+     * 別のマシンに替えたときは、取っておいた分を、替えた先のマシンの tick の上限で書き続ける
      */
     public var machine: Machine? = null
         set(value) {
-            if (field !== value) release()
+            val old = field
+            if (old !== value) release()
+            if (value == null && old != null && backlogEnd > backlogStart) {
+                // 外したマシンの tick の上限は守る。続きを書く tick がもうないので、残りは捨てる
+                writeWithinBudget(old)
+                discardOutput()
+            }
             field = value
             value?.resizeConsole(screen.width, screen.height)
             if (backlogEnd > backlogStart) pump()
@@ -121,15 +135,7 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
             clearBacklog()
             return
         }
-        val tick = m.scheduler.now
-        if (tick != budgetTick) {
-            budgetTick = tick
-            budgetLeft = cellsPerTick
-        }
-        while (backlogEnd > backlogStart && budgetLeft > 0) {
-            backlogStart += terminal.write(backlog, backlogStart, backlogEnd - backlogStart, budgetLeft)
-            budgetLeft -= terminal.cost
-        }
+        writeWithinBudget(m)
         if (backlogEnd > backlogStart) {
             if (held !== m) {
                 release()
@@ -140,6 +146,29 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
             clearBacklog()
             release()
         }
+    }
+
+    // 取っておいた出力を、マシン m の今の tick の上限まで書く
+    private fun writeWithinBudget(m: Machine) {
+        val tick = m.scheduler.now
+        if (tick != budgetTick) {
+            budgetTick = tick
+            budgetLeft = cellsPerTick
+        }
+        while (backlogEnd > backlogStart && budgetLeft > 0) {
+            backlogStart += terminal.write(backlog, backlogStart, backlogEnd - backlogStart, budgetLeft)
+            budgetLeft -= terminal.cost
+        }
+    }
+
+    /**
+     * 取っておいた出力（[write] で上限を超えた分）を、書かずに捨てる（#381）。画面が外れたときなど、もう見えない画面に書かないために使う。
+     * マシンの出力を止めていたら、止めるのをやめる（マシンに取ってある分は、そのまま配られる）
+     */
+    public fun discardOutput() {
+        droppedBytes += backlogEnd - backlogStart
+        clearBacklog()
+        release()
     }
 
     private fun clearBacklog() {

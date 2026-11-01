@@ -59,10 +59,14 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         machine.boot(BOOT_CONFIG)
     }
 
-    /** 電源が切れた・ケースが消える。画面とキーボードから外す（画面の中身はそのまま残す）。 */
+    /**
+     * 電源が切れた・ケースが消える・画面が外れた。画面とキーボードから外す（画面の中身はそのまま残す）。
+     * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）
+     */
     fun disconnect() {
         keyboard?.release(this)
         keyboard = null
+        if (screen?.isRemoved == true) console?.discardOutput()
         screen = null
         console?.machine = null
         console = null
