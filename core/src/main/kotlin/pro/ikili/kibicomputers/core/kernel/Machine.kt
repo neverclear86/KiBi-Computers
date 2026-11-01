@@ -284,6 +284,13 @@ public class Machine private constructor(
     @Volatile
     private var bootCancelled = false
 
+    /**
+     * 起動の取り消しを、init の読み込み（コンパイル）を待つ起動の手順に伝える（#344）。[boot] で作り直し、[stopLocked] で終える。
+     * カーネルロックの中で書く
+     */
+    @Volatile
+    private var bootCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+
     /** 起動した init の pid（0 = いない）。init が終わったら 0 に戻す */
     private var initPid = 0
 
@@ -327,6 +334,7 @@ public class Machine private constructor(
             if (scheduler.isClosed || stateValue != MachineState.STOPPED || bootingValue) return false
             bootingValue = true
             bootCancelled = false
+            bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
             lastBootConfigValue = config
@@ -525,7 +533,7 @@ public class Machine private constructor(
         options: SpawnOptions = SpawnOptions(),
         parentPid: Int = 0,
         asInit: Boolean = false,
-        await: (CompletableFuture<Program>) -> Program = ::awaitProgram,
+        await: ((CompletableFuture<Program>) -> Program)? = null,
     ): Int {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
         val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
@@ -538,7 +546,12 @@ public class Machine private constructor(
                 if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
             }
             // 共有しているものがあれば、待たずに（CPU と許可を持ったまま）使う
-            if (future.isDone) awaitProgram(future) else await(future)
+            when {
+                future.isDone -> awaitProgram(future, null)
+                await != null -> await(future)
+                // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
+                else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
+            }
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
         }
@@ -546,8 +559,20 @@ public class Machine private constructor(
         return spawn(program, driver, options.copy(args = executable.args), parentPid, asInit)
     }
 
-    /** 読み込みの終わりをこのスレッドで待つ（起動の手順など、許可を持たないスレッド）。読み込みの例外はそのまま投げる */
-    private fun awaitProgram(future: CompletableFuture<Program>): Program = try {
+    /**
+     * 読み込みの終わりをこのスレッドで待つ（起動の手順など、許可を持たないスレッド）。読み込みの例外はそのまま投げる。
+     * [cancel] が先に終わったら、待つのをやめて [BootCancelledException] を投げる（読み込みは続き、終われば共有される）
+     */
+    private fun awaitProgram(future: CompletableFuture<Program>, cancel: CompletableFuture<Unit>?): Program = try {
+        if (cancel != null) {
+            // anyOf の失敗（読み込みの失敗）は、下の future.get() で同じ例外として投げ直す
+            try {
+                CompletableFuture.anyOf(future, cancel).get()
+            } catch (e: ExecutionException) {
+                // 何もしない
+            }
+            if (!future.isDone) throw BootCancelledException()
+        }
         future.get()
     } catch (e: ExecutionException) {
         throw e.cause ?: e
@@ -906,7 +931,11 @@ public class Machine private constructor(
 
     /** 停止（[crash] があればマシンの不整合）。カーネルロックの中で呼ぶ */
     internal fun stopLocked(crash: Throwable?) {
-        if (bootingValue) bootCancelled = true
+        if (bootingValue) {
+            bootCancelled = true
+            // 後続（init の読み込みを待つ anyOf）は、待っているスレッドを起こすだけなので、ロックの中で終えてよい
+            bootCancelSignal.complete(Unit)
+        }
         if (crash != null) {
             if (crashCause == null) {
                 crashCause = crash

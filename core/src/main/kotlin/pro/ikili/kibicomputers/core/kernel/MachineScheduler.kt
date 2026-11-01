@@ -199,7 +199,10 @@ public class MachineScheduler private constructor(
         dispatcher.signal()
     }
 
-    /** 全マシンの `stop()` を呼び、新しいマシンを断り、ディスパッチャーとワーカーを閉じる。待たずに返す */
+    /**
+     * 全マシンの `stop()` を呼び、新しいマシンを断り、ディスパッチャーとワーカーを閉じる。待たずに返す。
+     * 実行ファイルの読み込み（コンパイル）を待っている起動・プロセスも、読み込みの終わりを待たずに戻る（#344）
+     */
     override fun close() {
         if (closed) return
         closed = true
@@ -207,6 +210,8 @@ public class MachineScheduler private constructor(
         dispatcher.close()
         timerService.close()
         workers.shutdown()
+        // 読み込みを待つ起動・プロセスを戻すため、捨てる読み込みの future も失敗させる（#344）
+        programs.close()
         compilerExecutor.shutdownNow()
     }
 
