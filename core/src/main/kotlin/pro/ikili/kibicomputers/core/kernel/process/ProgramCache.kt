@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicLong
  *   （構造の上限とランタイムはスケジューラごとに決まっているので、キーに入れない）
  * - 読み込みは [executor]（コンパイル用のスレッド）で行う。同じキーを同時に頼まれたら、1回だけ読み込んで待ち合わせる
  * - 失敗した読み込みは覚えない（次に頼まれたら読み込み直す）
+ * - [close] の後は読み込まない。読み込み中・待ち行列にあったものの future も、その場で失敗させる（#344。待つ側を止めないため）
  * - 保持: 最近使った [maxEntries] 個（かつ重さの合計が [maxWeight] まで）を強い参照で持つ。あふれたら、最も長く使っていないものから
  *   強い参照を外す。外したものも、どこかのプロセスがまだ使っていれば（弱い参照が生きていれば）同じものを返す。
  *   使っているマシンがなくなれば GC で回収され、Metaspace も戻る。動いている WASM の数そのものは制限しない
@@ -62,6 +63,9 @@ internal class ProgramCache(
     private val alive = HashMap<Key, Ref>()
     private val queue = ReferenceQueue<Program>()
 
+    /** [close] した */
+    private var closed = false
+
     /** 実際に読み込んだ回数（数え口。テスト用） */
     val loads: AtomicLong = AtomicLong()
 
@@ -86,6 +90,7 @@ internal class ProgramCache(
                 return CompletableFuture.completedFuture(program)
             }
             loading[key]?.let { return it }
+            if (closed) return CompletableFuture.failedFuture(closedException(null))
             future = CompletableFuture()
             loading[key] = future
         }
@@ -97,8 +102,9 @@ internal class ProgramCache(
                 Result.failure(t)
             }
             synchronized(lock) {
-                loading.remove(key)
-                result.getOrNull()?.let { program ->
+                // close() が先に外して失敗させていれば、結果は覚えない
+                if (loading[key] === future) loading.remove(key)
+                if (!closed) result.getOrNull()?.let { program ->
                     alive[key] = Ref(key, program, queue)
                     retainLocked(key, program, bytes.size.toLong())
                 }
@@ -110,11 +116,32 @@ internal class ProgramCache(
         try {
             executor.execute(task)
         } catch (e: RejectedExecutionException) {
-            synchronized(lock) { loading.remove(key) }
-            future.completeExceptionally(IllegalStateException("WASM を読み込むスレッドが止まっている", e))
+            synchronized(lock) { if (loading[key] === future) loading.remove(key) }
+            future.completeExceptionally(closedException(e))
         }
         return future
     }
+
+    /**
+     * 閉じる（スケジューラの停止。#344）。読み込み中・待ち行列にあるものの future を [IllegalStateException] で失敗させ、
+     * この後の [load] も同じ失敗にする（共有しているもので済むときは、それを返す）。読み込み中の [loader] は止めない
+     * （終わっても結果は覚えない）。2回呼んでもよい
+     */
+    fun close() {
+        val pending: List<CompletableFuture<Program>>
+        synchronized(lock) {
+            closed = true
+            pending = loading.values.toList()
+            loading.clear()
+        }
+        // 後続の処理（anyOf など）はロックの外で動かす
+        for (future in pending) future.completeExceptionally(closedException(null))
+    }
+
+    /** 読み込み中の数（テスト用） */
+    val loadingCount: Int get() = synchronized(lock) { loading.size }
+
+    private fun closedException(cause: Throwable?) = IllegalStateException("WASM を読み込むスレッドが止まっている", cause)
 
     /** 強い参照で持つ。あふれたら古いものから外す（最新の 1 つは残す） */
     private fun retainLocked(key: Key, program: Program, weight: Long) {

@@ -13,10 +13,17 @@ class FakeWasmRuntime : WasmRuntime {
 
     override val name: String get() = "fake"
 
-    /** [bytes] を読み込んだら [module] になるようにする。 */
-    fun define(bytes: ByteArray, module: FakeModule): FakeWasmRuntime = apply { definitions[key(bytes)] = module }
+    /** 読み込みのたびに、読み込む前に呼ぶ（読み込みを止めておくテスト用。#344） */
+    @Volatile
+    var beforeLoad: ((ByteArray) -> Unit)? = null
 
-    override fun load(bytes: ByteArray): WasmModule = definitions[key(bytes)] ?: throw WasmLoadException("ダミーのランタイムに登録されていない WASM")
+    /** [bytes] を読み込んだら [module] になるようにする。 */
+    fun define(bytes: ByteArray, module: FakeModule): FakeWasmRuntime = apply { synchronized(definitions) { definitions[key(bytes)] = module } }
+
+    override fun load(bytes: ByteArray): WasmModule {
+        beforeLoad?.invoke(bytes)
+        return synchronized(definitions) { definitions[key(bytes)] } ?: throw WasmLoadException("ダミーのランタイムに登録されていない WASM")
+    }
 
     private fun key(bytes: ByteArray): String = Base64.getEncoder().encodeToString(bytes)
 }
