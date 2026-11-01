@@ -45,6 +45,7 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
      *
      * タスク `compile<Name>Wasm` を作り、`<resourceDir>/<name>.wasm` に出力して、
      * [sourceSet] のリソースに加える（クラスパスから `/<resourceDir>/<name>.wasm` で読める）。
+     * C のスタックは、指定がなければ [ZigCcWasm.DEFAULT_STACK_SIZE]（[ZigCcWasm.stackSize]）。
      */
     @JvmOverloads
     fun module(
@@ -63,6 +64,7 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
             toolchainsDir.set(gradleHome)
             zigCacheDir.set(gradleHome.resolve("zig-cache"))
             target.convention("wasm32-wasi")
+            stackSize.convention(ZigCcWasm.DEFAULT_STACK_SIZE)
             outputPath.convention("$resourceDir/$name.wasm")
             outputDir.convention(project.layout.buildDirectory.dir("generated/wasm/$name"))
             action.execute(this)

@@ -49,6 +49,8 @@ import run.endive.wasm.WasmModule as EndiveModule
  *
  * メモリの上限（#39）は、Endive のメモリを作るときに上限を縮め（[WasmInstanceConfig.maxMemoryPages]）、
  * [WasmInstanceConfig.memoryBudget] があれば `grow` を数える包み（[BudgetedMemory]）をかぶせて守る。
+ * 共有しないメモリは、書き込んだページだけ JVM のメモリを確保する（[LazyMemory]、#334）。
+ * 上限と RAM は宣言したページ数（最初のページ数と `grow` の合計）で数え、確保したページ数では数えない。
  */
 public class EndiveRuntime : WasmRuntime {
     override val name: String get() = NAME
@@ -94,7 +96,7 @@ private class MemoryLimitFailure(message: String) : RuntimeException(message, nu
  * [reserved] は [budget] から確保したページ数。インスタンスを閉じたときに [releaseAll] で返す。
  */
 private class BudgetedMemory(
-    private val inner: EndiveMemory,
+    val inner: EndiveMemory,
     private val budget: WasmMemoryBudget,
     private var reserved: Int,
 ) : EndiveMemory by inner {
@@ -139,19 +141,33 @@ private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, creat
         throw MemoryLimitFailure("メモリの最初のページ数 $initial が上限 $max を超える")
     }
     val budget = config.memoryBudget
-    if (budget == null) {
-        return ByteBufferMemory(if (max == limits.maximumPages()) limits else MemoryLimits(initial, max, limits.shared()))
-    }
+    if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))
     if (initial > 0 && !budget.tryReserve(initial)) {
         throw MemoryLimitFailure("メモリの最初の $initial ページを確保できない（RAM が足りない）")
     }
     val inner = try {
-        ByteBufferMemory(MemoryLimits(initial, max, limits.shared()))
+        newMemory(MemoryLimits(initial, max, limits.shared()))
     } catch (t: Throwable) {
         if (initial > 0) budget.release(initial)
         throw t
     }
     return BudgetedMemory(inner, budget, initial).also { created += it }
+}
+
+/**
+ * Endive のメモリを作る。共有しないメモリは、書き込んだページだけ確保する [LazyMemory]（#334）。
+ * 共有メモリは Endive の [ByteBufferMemory]（最初のページをすべて確保する）。
+ */
+private fun newMemory(limits: MemoryLimits): EndiveMemory = if (limits.shared()) ByteBufferMemory(limits) else LazyMemory(limits)
+
+/**
+ * [memory] のうち、JVM のメモリを確保したページ数（#334。テストと計測用）。
+ * 書き込んだページだけ確保するメモリでなければ、宣言したページ数を返す。
+ */
+internal fun committedPages(memory: WasmMemory): Int {
+    val inner = (memory as? EndiveWasmMemory)?.raw ?: return memory.pages
+    val lazy = (inner as? BudgetedMemory)?.inner ?: inner
+    return (lazy as? LazyMemory)?.committedPages ?: memory.pages
 }
 
 /** ホストの関数が投げた例外を、Endive の中を通す間だけ包む。外に出るときに外す。 */
@@ -441,6 +457,8 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
 }
 
 private class EndiveWasmMemory(private val memory: EndiveMemory) : WasmMemory {
+    val raw: EndiveMemory get() = memory
+
     override val pages: Int get() = memory.pages()
 
     override fun grow(deltaPages: Int): Int = try {

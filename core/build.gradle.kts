@@ -40,6 +40,11 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
+    providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
+        systemProperty("kibi.luaReplMachines", it)
+        maxHeapSize = "4g"
+    }
 }
 
 // テスト用の WASM（#9）。zig cc でビルドし、テストのリソースに入れる
@@ -129,9 +134,9 @@ val compileLua = kibiWasm.module("lua") {
         "-D_WASI_EMULATED_PROCESS_CLOCKS",
         "-lwasi-emulated-signal",
         "-lwasi-emulated-process-clocks",
-        // C のスタック（仮の値）。Lua の C 呼び出しの深さ（LUAI_MAXCCALLS = 200）に足りる大きさにする
-        "-Wl,-z,stack-size=1048576",
     )
+    // C のスタック（仮の値。#334）。Lua の C 呼び出しの深さ（LUAI_MAXCCALLS = 200）に足りる大きさにする
+    stackSize = 256 * 1024
 }
 
 // テスト用の同梱イメージ（#55）。src/test/images/sample/ を zip にして、テストのリソース `/kibicomputers/images/sample.zip` に入れる

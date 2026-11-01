@@ -58,6 +58,15 @@ abstract class ZigCcWasm @Inject constructor(
     @get:Input
     abstract val target: Property<String>
 
+    /**
+     * C のスタックの大きさ（バイト。`-Wl,-z,stack-size=` で渡す）。
+     *
+     * Zig の既定は 16 MiB で、wasi-libc のプログラムは最初のメモリにその分を宣言する（#334）。
+     * [WasmExtension.module] の既定は [DEFAULT_STACK_SIZE]。[compilerArgs] にも `stack-size` を書いたら、そちらが後なので勝つ。
+     */
+    @get:Input
+    abstract val stackSize: Property<Int>
+
     /** `zig cc` に渡すほかの引数（`-O2`、`-Wl,--export=...` など）。 */
     @get:Input
     abstract val compilerArgs: ListProperty<String>
@@ -82,6 +91,7 @@ abstract class ZigCcWasm @Inject constructor(
         execOperations.exec {
             executable = zig.absolutePath
             args("cc", "-target", target.get())
+            args("-Wl,-z,stack-size=${stackSize.get()}")
             args(compilerArgs.get())
             includeDirs.forEach { args("-I", it.absolutePath) }
             args("-o", output.absolutePath)
@@ -89,5 +99,10 @@ abstract class ZigCcWasm @Inject constructor(
             environment("ZIG_GLOBAL_CACHE_DIR", zigCacheDir.get().asFile.absolutePath)
             environment("ZIG_LOCAL_CACHE_DIR", localCache.absolutePath)
         }
+    }
+
+    companion object {
+        /** [stackSize] の既定（64 KiB。仮の値。#334）。wasm-ld の既定と同じ */
+        const val DEFAULT_STACK_SIZE: Int = 64 * 1024
     }
 }
