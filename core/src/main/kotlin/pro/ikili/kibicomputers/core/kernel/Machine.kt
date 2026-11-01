@@ -1,5 +1,8 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
+import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
 import pro.ikili.kibicomputers.core.kernel.fd.STDIN
@@ -200,6 +203,31 @@ public class Machine internal constructor(
     /** つながっているデバイスが変わった回数（実行時だけ。#63・#65 がイベントにする） */
     private val devicesGenerationCounter = AtomicLong()
 
+    // ---- 起動（#49）。どれも実行時だけで、保存しない（カーネルロック） ----
+
+    /** 起動の手順が動いている（受け付けてから init を作るか、失敗・取り消しで終わるまで） */
+    @Volatile
+    private var bootingValue = false
+
+    /** 起動の途中で `stop()`・`reboot()` された */
+    @Volatile
+    private var bootCancelled = false
+
+    /** 起動した init の pid（0 = いない）。init が終わったら 0 に戻す */
+    private var initPid = 0
+
+    @Volatile
+    private var lastBootConfigValue: BootConfig? = null
+
+    /** 再起動を求められ、プロセスがすべて止まるのを待っている */
+    private var rebootRequested = false
+
+    /** 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す） */
+    private var rebootNotified = false
+
+    /** 前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
+    private val retiredThreads = ArrayList<Thread>()
+
     /** 状態 */
     public val state: MachineState get() = stateValue
 
@@ -207,13 +235,68 @@ public class Machine internal constructor(
     public val isAtWaitPoint: Boolean
         get() = lock.withLockValue { kernel.processes.all().all { isAtWaitPointLocked(it) } }
 
+    /** 起動の手順が動いている（[boot] を受け付けてから、init を作るか、失敗・取り消しで終わるまで） */
+    public val isBooting: Boolean get() = bootingValue
+
+    /** 最後に受け付けた [boot] の設定（[reboot] と、[MachineHost.onRebootRequested] の既定の実装が使う）。まだなければ `null` */
+    public val lastBootConfig: BootConfig? get() = lastBootConfigValue
+
+    /**
+     * 起動する（#49）。どのスレッドから呼んでもよい。待たずに返す（ディスクを探し、`/sbin/init` を読み込むのはワーカーのスレッド）。
+     *
+     * 起動部品がない・起動ディスクがない・init がない・動かせないときは、コンソールにメッセージを書いて
+     * [MachineHost.onBootFailed] で知らせ、マシンは [MachineState.STOPPED] のまま。init を作れたら [MachineState.RUNNING] になる。
+     * init が自分で終わったら、ほかのプロセスもすべて止めて [MachineState.STOPPED] にする（自動では再起動しない）。
+     *
+     * @return 受け付けたら `true`。[MachineState.STOPPED] でない、起動の途中、スケジューラが閉じているなら `false`
+     */
+    public fun boot(config: BootConfig): Boolean {
+        lock.lock()
+        try {
+            if (scheduler.isClosed || stateValue != MachineState.STOPPED || bootingValue) return false
+            bootingValue = true
+            bootCancelled = false
+            rebootRequested = false
+            rebootNotified = false
+            lastBootConfigValue = config
+        } finally {
+            lock.unlock()
+        }
+        scheduler.workers.execute { BootSequence(this, config).run() }
+        return true
+    }
+
+    /**
+     * 再起動する（#49）。動いていれば [stop] と同じく止め、プロセスがすべて終わって [MachineState.STOPPED] になったら、
+     * 次の `tick()` で [MachineHost.onRebootRequested] を呼ぶ（既定の実装は [lastBootConfig] で [boot] する）。
+     * 起動の途中なら、それを取り消してから同じようにする。どのスレッドから呼んでもよい。待たずに返す。
+     * 求めた後に [stop] すると、再起動を取り消す。
+     *
+     * @return 受け付けたら `true`。一度も [boot] していない、[MachineState.CRASHED]、スケジューラが閉じているなら `false`
+     */
+    public fun reboot(): Boolean {
+        lock.lock()
+        try {
+            if (lastBootConfigValue == null || scheduler.isClosed || stateValue == MachineState.CRASHED) return false
+            rebootRequested = true
+            stopLocked(null)
+            maybePostRebootLocked()
+            return true
+        } finally {
+            lock.unlock()
+        }
+    }
+
     /**
      * 停止の印を立て、プロセスのスレッドに割り込んで、待たずに返す。どのスレッドから呼んでもよい
      * （メインスレッド、`onStateChanged` の中、そのマシンのプロセスのホスト関数の中も含む）。2回呼んでもよい。
+     * 起動の途中なら取り消し、求めた再起動（[reboot]）も取り消す。
      */
     public fun stop() {
         lock.lock()
         try {
+            rebootRequested = false
+            rebootNotified = false
             stopLocked(null)
         } finally {
             lock.unlock()
@@ -237,7 +320,7 @@ public class Machine internal constructor(
                 if (remaining <= 0) return false
                 terminated.awaitNanos(remaining)
             }
-            threads = runtimes.values.mapNotNull { it.dedicatedThread }
+            threads = runtimes.values.mapNotNull { it.dedicatedThread } + retiredThreads
         } finally {
             lock.unlock()
         }
@@ -275,6 +358,7 @@ public class Machine internal constructor(
      * 失敗したら何も変えない。
      *
      * @param parentPid 0 は親なし（init）。0 以外は、表にある、終わっていないプロセスの pid でなければ [IllegalArgumentException]
+     * @param asInit 起動の手順（#49）が init を作る。起動が取り消されていれば [BootCancelledException]。作れたら init として覚え、起動の手順を終える
      * @return 割り当てた pid
      * @throws IllegalArgumentException 燃料を計測しないモジュールで `allowUnmetered` が `false`、または親がない・終わっている
      * @throws FsException 引数・環境変数が正しくない（`INVAL`）・大きすぎる（`TOOBIG`）、作業ディレクトリがない（`NOENT`）・
@@ -283,9 +367,17 @@ public class Machine internal constructor(
      * @throws IllegalStateException マシンが STOPPING・CRASHED、またはスケジューラが閉じている
      */
     @Throws(FsException::class)
-    internal fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions = SpawnOptions(), parentPid: Int = 0): Int {
+    internal fun spawn(
+        program: Program,
+        driver: ProcessDriver,
+        options: SpawnOptions = SpawnOptions(),
+        parentPid: Int = 0,
+        asInit: Boolean = false,
+    ): Int {
         lock.lock()
         try {
+            // 起動の init: 取り消されていれば作らない（stop() と取り違えないよう、表を変えるのと同じロックの中で確かめる）
+            if (asInit && (!bootingValue || bootCancelled)) throw BootCancelledException()
             check(!scheduler.isClosed) { "スケジューラは閉じている" }
             check(stateValue != MachineState.STOPPING && stateValue != MachineState.CRASHED) { "マシンは $stateValue" }
             val metered = program.module.isFuelMetered
@@ -303,6 +395,10 @@ public class Machine internal constructor(
             val pid = kernel.processes.allocatePid()
             val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
             kernel.processes.add(process)
+            if (asInit) {
+                initPid = pid
+                bootingValue = false
+            }
             val fds = FdTable(process, kernel.objects, wakeSink)
             for ((fd, entry) in fdEntries) fds.installAt(fd, entry)
             val rt = ProcessRuntime(this, process, program, driver)
@@ -331,10 +427,16 @@ public class Machine internal constructor(
      * - `options.args` が空なら、argv を [path] の文字列1つにする
      * - ファイルを読むのはカーネルロックの中、WASM の読み込み（パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
      *
-     * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。
+     * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
      */
     @Throws(FsException::class)
-    internal fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions(), parentPid: Int = 0): Int {
+    internal fun exec(
+        path: String,
+        drivers: ProcessDriverFactory,
+        options: SpawnOptions = SpawnOptions(),
+        parentPid: Int = 0,
+        asInit: Boolean = false,
+    ): Int {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
         val bytes = lock.withLockValue { readExecutableLocked(path, parentLocked(parentPid)) }
         val program = try {
@@ -344,7 +446,7 @@ public class Machine internal constructor(
         }
         val driver = drivers.create(program)
         val argv = options.args.ifEmpty { listOf(path) }
-        return spawn(program, driver, options.copy(args = argv), parentPid)
+        return spawn(program, driver, options.copy(args = argv), parentPid, asInit)
     }
 
     /** [pid] の子の pid（ゾンビを含む。割り当ての順） */
@@ -489,6 +591,7 @@ public class Machine internal constructor(
 
     /** 停止（[crash] があればマシンの不整合）。カーネルロックの中で呼ぶ */
     internal fun stopLocked(crash: Throwable?) {
+        if (bootingValue) bootCancelled = true
         if (crash != null) {
             if (crashCause == null) {
                 crashCause = crash
@@ -603,7 +706,102 @@ public class Machine internal constructor(
     internal fun checkAllDoneLocked() {
         if (kernel.processes.liveCount() > 0) return
         if (stateValue == MachineState.RUNNING || stateValue == MachineState.STOPPING) setStateLocked(MachineState.STOPPED, null)
-        if (registeredThreads == 0) terminated.signalAll()
+        if (registeredThreads == 0) {
+            terminated.signalAll()
+            maybePostRebootLocked()
+        }
+    }
+
+    // ---- 起動・init の終わり・再起動（#49） ----
+
+    /** 起動の途中で取り消された */
+    internal val isBootCancelled: Boolean get() = bootCancelled
+
+    /**
+     * プロセス [process] が終わった（`ProcessRunner.finishLocked` から。カーネルロックの中）。
+     * init が `stop()`・再起動によらずに終わったら、コンソールに書いて、残りのプロセスをすべて止める
+     */
+    internal fun onProcessFinishedLocked(process: Process) {
+        if (initPid == 0 || process.pid != initPid || process.parentPid != 0) return
+        initPid = 0
+        // STOPPING（stop()・reboot()）と CRASHED（カーネルの不整合）では何も言わない
+        if (stateValue != MachineState.RUNNING) return
+        val message = when (process.state) {
+            ProcessState.EXITED -> "kibi: init exited with code ${process.exitCode}"
+            ProcessState.CRASHED -> "kibi: init crashed"
+            else -> "kibi: init was killed"
+        }
+        writeConsoleLine(message)
+        if (kernel.processes.liveCount() > 0) stopLocked(null)
+    }
+
+    /** 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中） */
+    private fun maybePostRebootLocked() {
+        if (!rebootRequested || bootingValue || stateValue != MachineState.STOPPED) return
+        if (kernel.processes.liveCount() > 0 || registeredThreads > 0) return
+        rebootRequested = false
+        rebootNotified = true
+        postNotification(HostNotification.RebootRequested)
+    }
+
+    /**
+     * 起動の手順の始め（ワーカーのスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、
+     * マウントをすべて外す（コンソールの TTY は残す）。取り消されたら `false`
+     */
+    internal fun beginBoot(): Boolean = lock.withLockValue {
+        try {
+            while (registeredThreads > 0 && !bootCancelled && !scheduler.isClosed) terminated.awaitNanos(BOOT_WAIT_NANOS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return@withLockValue false
+        }
+        if (bootCancelled || scheduler.isClosed) return@withLockValue false
+        check(kernel.processes.liveCount() == 0) { "起動の前に終わっていないプロセスがある" }
+        for (rt in runtimes.values) rt.dedicatedThread?.let { retiredThreads += it }
+        retiredThreads.removeAll { !it.isAlive }
+        runtimes.clear()
+        fuelWaiters.removeAll { it.process.state.isTerminal }
+        kernel.processes.reset()
+        initPid = 0
+        unmountAllLocked()
+        if (kernel.consoleTtyId != 0) consoleTtyLocked().foregroundPid = 0
+        true
+    }
+
+    /** 起動ディスク [diskId] の [volume] を `/` にマウントする（ワーカーのスレッドから）。取り消されていれば何もせず `false` */
+    internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean = lock.withLockValue {
+        if (bootCancelled) return@withLockValue false
+        vfs.mount(VfsPath.ROOT, volume.fs, volume.readOnly, "$DISK_SOURCE_PREFIX$diskId")
+        true
+    }
+
+    /**
+     * 起動の手順を、init を作らずに終える（ワーカーのスレッドから）。マウントを外す。
+     * [failure] が `null`（取り消し）か、取り消されていれば何も知らせない。そうでなければコンソールに書いて [MachineHost.onBootFailed] で知らせる
+     *
+     * @param reason コンソールのメッセージに入れる短い英語（errno の名前など）
+     * @param detail [MachineHost.onBootFailed] に渡す理由（`null` なら [reason]）
+     */
+    internal fun endBoot(failure: BootFailure?, reason: String, detail: String? = null): Unit = lock.withLockValue {
+        if (!bootingValue) return@withLockValue
+        bootingValue = false
+        if (kernel.processes.liveCount() == 0) unmountAllLocked()
+        if (failure != null && !bootCancelled) {
+            writeConsoleLine(BootSequence.consoleMessage(failure, reason))
+            postNotification(HostNotification.BootFailed(failure, detail ?: reason))
+        }
+        bootCancelled = false
+        maybePostRebootLocked()
+    }
+
+    /** マウントを深いほうからすべて外す（カーネルロックの中） */
+    private fun unmountAllLocked() {
+        for (entry in kernel.mounts.entries.sortedByDescending { it.point.depth }) vfs.unmount(entry.id)
+    }
+
+    /** カーネルのメッセージを1行、コンソールに書く（改行を足す） */
+    internal fun writeConsoleLine(line: String) {
+        writeConsole((line + "\n").toByteArray(Charsets.UTF_8))
     }
 
     private fun setStateLocked(state: MachineState, cause: Throwable?) {
@@ -710,6 +908,12 @@ public class Machine internal constructor(
                     pendingBeeps.decrementAndGet()
                     safely { host.onBeep(this, n.frequencyHz, n.durationMillis) }
                 }
+                is HostNotification.BootFailed -> safely { host.onBootFailed(this, n.failure, n.detail) }
+                HostNotification.RebootRequested -> {
+                    // 積んだ後に stop() されたら、再起動しない
+                    val go = lock.withLockValue { rebootNotified.also { rebootNotified = false } }
+                    if (go) safely { host.onRebootRequested(this) }
+                }
                 is HostNotification.Console -> Unit
             }
         }
@@ -800,6 +1004,12 @@ public class Machine internal constructor(
         /** コンソールの TTY の出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #251） */
         internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
 
+        /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
+        internal const val DISK_SOURCE_PREFIX: String = "disk:"
+
+        /** 起動の始めに、前のスレッドを待つときの見直しの間隔 */
+        private const val BOOT_WAIT_NANOS: Long = 10_000_000
+
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D
     }
@@ -837,6 +1047,10 @@ private sealed class HostNotification {
     class Console(val bytes: ByteArray) : HostNotification()
 
     class Beep(val frequencyHz: Int, val durationMillis: Int) : HostNotification()
+
+    class BootFailed(val failure: BootFailure, val detail: String) : HostNotification()
+
+    data object RebootRequested : HostNotification()
 }
 
 private inline fun <T> ReentrantLock.withLockValue(block: () -> T): T {

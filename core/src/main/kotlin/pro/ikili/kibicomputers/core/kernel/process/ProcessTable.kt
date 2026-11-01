@@ -41,4 +41,11 @@ internal class ProcessTable(val limit: Int) {
 
     /** 刈り取る（#46） */
     fun remove(pid: Int): Process? = table.remove(pid)
+
+    /** 終わったプロセス（ゾンビ）をすべて外し、pid を 1 から振り直す（起動のとき。#49）。終わっていないプロセスがあれば [IllegalStateException] */
+    fun reset() {
+        check(liveCount() == 0) { "終わっていないプロセスがある" }
+        table.clear()
+        nextPid = 1
+    }
 }

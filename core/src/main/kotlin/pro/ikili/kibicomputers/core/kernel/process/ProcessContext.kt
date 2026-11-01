@@ -142,6 +142,15 @@ internal interface ProcessContext {
 
     /** ビープを鳴らす（[MachineHost.onBeep]）。捨てたら `false` */
     fun beep(frequencyHz: Int, durationMillis: Int): Boolean
+
+    /**
+     * マシンを止める（`Machine.stop`。#49）。このプロセスも止められるので、この後のホスト関数・待ちは [ProcessKilledException] になる。
+     * WASM から呼ぶシステムコールの形は #306
+     */
+    fun requestShutdown()
+
+    /** マシンを再起動する（`Machine.reboot`。#49）。受け付けたら `true`（一度も起動していなければ `false`）。システムコールの形は #306 */
+    fun requestReboot(): Boolean
 }
 
 /** 作っている途中の記録（実行時だけ。[ProcessRuntime.loading]） */

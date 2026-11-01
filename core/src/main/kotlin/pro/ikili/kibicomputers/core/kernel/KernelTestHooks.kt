@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+
 /**
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
@@ -25,4 +27,12 @@ internal class KernelTestHooks {
     /** `stop()` で、登録を確かめた後・割り込みを送る前（カーネルロックの中） */
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null
+
+    /** 起動ディスクを開く口の差し替え（`null` なら既定の [BootVolumeOpener.NONE]） */
+    @Volatile
+    var bootVolumes: BootVolumeOpener? = null
+
+    /** 起動の手順で、ディスクを探し終えて init を作る前（ロックの外。ワーカーのスレッド） */
+    @Volatile
+    var beforeInitExec: ((Machine) -> Unit)? = null
 }
