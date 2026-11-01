@@ -50,6 +50,25 @@ kibiWasm {
         target = "wasm32-freestanding"
         compilerArgs.addAll("-O2", "-s", "-nostdlib", "-Wl,--no-entry", "-Wl,--export=fib")
     }
+    // 燃料の計測（#38）を確かめるモジュール。一括メモリ命令と末尾呼び出しを出す
+    module("fuel", sourceSet = "test") {
+        sources.from("src/test/wasm/fuel.c")
+        target = "wasm32-freestanding"
+        compilerArgs.addAll(
+            "-O2",
+            "-s",
+            "-nostdlib",
+            "-mbulk-memory",
+            "-mtail-call",
+            "-Wl,--no-entry",
+            "-Wl,--export=fib",
+            "-Wl,--export=forever",
+            "-Wl,--export=fill",
+            "-Wl,--export=copy",
+            "-Wl,--export=grow",
+            "-Wl,--export=is_even",
+        )
+    }
     // wasi-libc をリンクする WASI p1 のプログラム（lua.wasm などと同じビルドの形）
     module("hello-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/hello_wasi.c")

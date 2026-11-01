@@ -45,7 +45,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             }
             machine.writeConsoleLine("kibi: booting from disk $diskId")
             machine.scheduler.hooks.beforeInitExec?.invoke(machine)
-            startInit(volume)
+            startInit()
         } catch (e: BootCancelledException) {
             machine.endBoot(null, "")
         } catch (t: Throwable) {
@@ -82,10 +82,8 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         false
     }
 
-    private fun startInit(volume: BootVolume) {
+    private fun startInit() {
         val options = SpawnOptions(
-            // 同梱イメージのプログラムは、燃料の計測（#38）がまだ入っていなくても動かす（#307 の仮の扱い）
-            allowUnmetered = volume.bundled,
             stdio = StdioSpec.CONSOLE,
             args = listOf(BootConfig.INIT_PATH),
             env = emptyMap(),

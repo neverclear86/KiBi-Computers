@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import java.security.MessageDigest
 
 /**
@@ -37,6 +38,16 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
             val copy = bytes.copyOf()
             return Program(ModuleHash.of(copy), runtime.load(copy))
         }
+
+        /**
+         * [bytes] に燃料の計測コードを挿入してから（[FuelInjector]、#38）[runtime] に読み込ませる。識別子は挿入した後のバイト列から作る。
+         * すでに計測の名前を使っている WASM などは [WasmLoadException] で断る。重いので、メインスレッドでは呼ばない
+         */
+        @Throws(WasmLoadException::class)
+        fun loadMetered(runtime: WasmRuntime, bytes: ByteArray): Program {
+            val injected = FuelInjector.inject(bytes).bytes
+            return Program(ModuleHash.of(injected), runtime.load(injected))
+        }
     }
 }
 
@@ -47,7 +58,7 @@ internal class Program private constructor(val hash: ModuleHash, val module: Was
  * 引数・環境変数の検査と上限は [ProcessArgs]。
  */
 internal data class SpawnOptions(
-    /** 燃料を計測しないモジュールを動かす。テスト専用（同梱の WASM は #36・#92、プレイヤーの WASM は #29 で挿入済みになる） */
+    /** 燃料を計測しないモジュールを動かす。テスト専用（`Machine.exec` は読み込むときに計測コードを挿入する。#38） */
     val allowUnmetered: Boolean = false,
     /** 標準入出力（fd 0/1/2）の割り当て。既定は親から引き継ぐ（親がなければコンソール） */
     val stdio: StdioSpec = StdioSpec.INHERIT,
