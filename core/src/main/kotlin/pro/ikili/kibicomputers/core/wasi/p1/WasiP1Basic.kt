@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 
 /**
@@ -9,6 +10,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
  * `proc_exit` は [WasiP1Exit] を投げて、ドライバー（[WasiP1Driver]）が終了コードにする。
  *
  * 各関数は p1 の `errno` の値を返す（成功は 0）。ゲストのメモリの範囲外は、書く前に確かめて `FAULT` にする。
+ *
+ * 環境変数（ADR 0332）: `environ_*` は、プロセスの環境変数に `PWD=<カーネルの cwd>` を必ず含めて見せる（[p1Environment]）。
+ * p1 にはカーネルの cwd を読む関数がなく、wasi-libc は cwd を自分の中だけで持つ（初めは `/`）ので、プログラムが
+ * 起動時に `PWD` へ `chdir` して合わせる（このリポジトリの C のプログラムは `kibi_cwd.c`）。
  *
  * 時計:
  * - `REALTIME`: 環境の実時間（`MachineClock.realtimeNanos`）
@@ -21,8 +26,13 @@ internal class WasiP1Basic(private val ctx: ProcessContext) {
     /** 引数を UTF-8 にしたもの（作った後は変わらない） */
     private val argBytes: List<ByteArray> by lazy { ctx.args.map { it.toByteArray(Charsets.UTF_8) } }
 
-    /** 環境変数を `名前=値` の UTF-8 にしたもの（作った後は変わらない） */
-    private val envBytes: List<ByteArray> by lazy { ctx.env.map { (k, v) -> "$k=$v".toByteArray(Charsets.UTF_8) } }
+    /**
+     * 環境変数を `名前=値` の UTF-8 にしたもの（作った後は変わらない）。`PWD` は最初に読んだ時点のカーネルの cwd
+     * （p1 の中から cwd を変える方法はないので、起動後は変わらない）
+     */
+    private val envBytes: List<ByteArray> by lazy {
+        p1Environment(ctx.env, ctx.cwd).map { (k, v) -> "$k=$v".toByteArray(Charsets.UTF_8) }
+    }
 
     /** `PROCESS_CPUTIME`・`THREAD_CPUTIME` の起点（マシンの単調時計）。`poll_oneoff` の絶対時刻の写しにも使う（[WasiP1Poll]） */
     internal val startNanos: Long = guestMonotonicNanos()
@@ -117,6 +127,29 @@ internal class WasiP1Basic(private val ctx: ProcessContext) {
     fun schedYield(): Int = 0
 
     companion object {
+        /** p1 の環境変数で、カーネルの cwd を伝える名前 */
+        const val PWD: String = "PWD"
+
+        /**
+         * p1 に見せる環境変数の並び。[env] に `PWD` があればその位置で値を [cwd] に置き換え、なければ最後に足す。
+         * [env] 自体（`Process.env`。保存される）は変えない。`PWD` の分は環境変数の大きさの上限（ADR 0045）に数えない
+         */
+        fun p1Environment(env: Map<String, String>, cwd: VfsPath): List<Pair<String, String>> {
+            val pwd = cwd.toString()
+            val out = ArrayList<Pair<String, String>>(env.size + 1)
+            var replaced = false
+            for ((k, v) in env) {
+                if (k == PWD) {
+                    out += k to pwd
+                    replaced = true
+                } else {
+                    out += k to v
+                }
+            }
+            if (!replaced) out += PWD to pwd
+            return out
+        }
+
         /** 時計の分解能（ナノ秒） */
         const val CLOCK_RESOLUTION_NANOS: Long = 1_000
 
