@@ -1,8 +1,8 @@
 package pro.ikili.kibicomputers.neoforge.display
 
 import net.minecraft.core.BlockPos
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
-import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import pro.ikili.kibicomputers.core.display.PixelBuffer
@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.display.ScreenSyncReceiver
 import pro.ikili.kibicomputers.core.display.ScreenSyncSender
 import pro.ikili.kibicomputers.core.display.ScreenSyncTarget
 import pro.ikili.kibicomputers.core.display.ScreenTier
+import pro.ikili.kibicomputers.core.display.ScreenWatchers
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 
@@ -32,7 +33,7 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     private val lazyPixels = lazy {
         val p = if (tier.supportsPixels) tier.createPixelBuffer() else null
         // 作った tick の描画から記録する
-        sender?.pixels = p
+        sender.pixels = p
         p
     }
 
@@ -49,10 +50,10 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
      */
     var renderCache: AutoCloseable? = null
 
-    // サーバー: 同期の送り手と、見ているプレイヤー
-    private var sender: ScreenSyncSender? = null
-    private val watchers = LinkedHashSet<ServerPlayer>()
-    private val newWatchers = LinkedHashSet<ServerPlayer>()
+    // サーバー: 同期の送り手と、見ているプレイヤー（誰が見ているかは距離からサーバーが決める。#359）
+    private val sender = ScreenSyncSender(text)
+    private val watchers = ScreenWatchers<ServerPlayer>()
+    private val host by lazy { ScreenSync.Host(this) }
 
     // クライアント: 同期の受け手
     private val receiver by lazy { ScreenSyncReceiver() }
@@ -65,66 +66,45 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         override fun pixelsIfCreated(): PixelBuffer? = if (hasPixels) this@ScreenBlockEntity.pixels else null
     }
 
-    /** クライアントの、見ている（同期を受けている）か。`client/ClientScreenWatcher` が使う。 */
-    var clientWatching: Boolean = false
-
     /** サーバーで、この画面を見ているプレイヤーの数（新しく見に来て、まだ送っていない人も含む）。 */
     val watcherCount: Int
-        get() = watchers.size + newWatchers.size
+        get() = watchers.count
+
+    /** サーバーで、[player] がこの画面を見ているか。 */
+    fun isWatchedBy(player: ServerPlayer): Boolean = watchers.isWatching(player)
 
     override fun onLoad() {
         super.onLoad()
         val level = level ?: return
-        if (level.isClientSide) ScreenSync.clientScreens.add(this) else ScreenSync.serverScreens.add(this)
+        if (!level.isClientSide) ScreenSync.serverScreens.add(this)
     }
 
     override fun setRemoved() {
         super.setRemoved()
         ScreenSync.serverScreens.remove(this)
-        ScreenSync.clientScreens.remove(this)
         watchers.clear()
-        newWatchers.clear()
         renderCache?.close()
         renderCache = null
     }
 
-    /** サーバー: [player] が見はじめた。この tick の終わりに画面全体を送る。もう見ていれば送り直す。 */
-    fun watch(player: ServerPlayer) {
-        watchers.remove(player)
-        newWatchers.add(player)
+    /**
+     * サーバー: [player] からの「画面全体を送り直してほしい」というお願い。見ている人のものだけ受け付け、
+     * 送り直しはプレイヤーと画面の組ごとに一定の間隔に1回までにする（[ScreenWatchers.requestResync]）。
+     */
+    fun requestResync(player: ServerPlayer) {
+        val level = level ?: return
+        watchers.requestResync(player, level.gameTime)
     }
 
-    /** サーバー: [player] が見るのをやめた。 */
-    fun unwatch(player: ServerPlayer) {
+    /** サーバー: [player] を見ている人から外す（ログアウトしたとき）。 */
+    fun forget(player: ServerPlayer) {
         watchers.remove(player)
-        newWatchers.remove(player)
     }
 
-    /** サーバー: tick の終わりに呼ぶ。見ている人がいれば、その tick の分を送る。 */
-    fun syncTick(transport: ScreenSync.Transport) {
-        if (watchers.isEmpty() && newWatchers.isEmpty() && sender?.isRecording != true) return
-        val chunk = ChunkPos(blockPos)
-        val gone = { p: ServerPlayer -> p.hasDisconnected() || p.level() !== level || !p.chunkTrackingView.contains(chunk) }
-        watchers.removeIf { gone(it) }
-        newWatchers.removeIf { gone(it) }
-        val sender = sender ?: ScreenSyncSender(text).also {
-            it.pixels = if (hasPixels) pixels else null
-            sender = it
-        }
-        val flush = sender.flush(watchers.isNotEmpty(), newWatchers.isNotEmpty())
-        val dimension = level?.dimension()
-        if (!flush.isEmpty && dimension != null) {
-            for (fragment in flush.forWatchers) {
-                val payload = ScreenUpdatePayload(dimension, blockPos, fragment)
-                for (p in watchers) transport.send(p, payload)
-            }
-            for (fragment in flush.forNewWatchers) {
-                val payload = ScreenUpdatePayload(dimension, blockPos, fragment)
-                for (p in newWatchers) transport.send(p, payload)
-            }
-        }
-        watchers.addAll(newWatchers)
-        newWatchers.clear()
+    /** サーバー: tick の終わりに呼ぶ。見ている人を距離から決め直し、その tick の分を送る。 */
+    fun syncTick() {
+        val level = level as? ServerLevel ?: return
+        watchers.tick(level.gameTime, sender, host, ScreenSync.traffic)
     }
 
     /**
@@ -137,10 +117,5 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         true
     } catch (e: IllegalArgumentException) {
         false
-    }
-
-    /** クライアント: 見るのをやめたときに、受け取り途中のフラグメントを捨てる。 */
-    fun resetSync() {
-        receiver.reset()
     }
 }
