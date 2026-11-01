@@ -31,6 +31,9 @@ import java.util.IdentityHashMap
  * 2. 見ている人がいる画面だけ、その tick の分を送る。新しく見に来た人には画面全体（キーフレーム）を送る
  * 3. クライアントは受け取った分を画面バッファに再生する。壊れたデータを受け取ったら、[ScreenResyncPayload] で
  *    送り直しをお願いする。サーバーは、送り直しをプレイヤーと画面の組ごとに一定の間隔に1回までにする
+ *
+ * 見ている人と送信量の勘定は `ServerPlayer` のオブジェクトで数える。ログアウトしたとき、リスポーンで
+ * オブジェクトが替わったとき（[PlayerEvent.Clone]）、ディメンションを移ったときに外す（#382）。
  */
 object ScreenSync {
     private val LOGGER = LogUtils.getLogger()
@@ -62,6 +65,8 @@ object ScreenSync {
         modBus.addListener(::registerPayloads)
         NeoForge.EVENT_BUS.addListener(::onServerTick)
         NeoForge.EVENT_BUS.addListener(::onLogout)
+        NeoForge.EVENT_BUS.addListener(::onClone)
+        NeoForge.EVENT_BUS.addListener(::onChangedDimension)
     }
 
     private fun registerPayloads(event: RegisterPayloadHandlersEvent) {
@@ -78,6 +83,28 @@ object ScreenSync {
 
     private fun onLogout(event: PlayerEvent.PlayerLoggedOutEvent) {
         val player = event.entity as? ServerPlayer ?: return
+        forget(player)
+    }
+
+    // リスポーン（End からの帰還も含む）では ServerPlayer が新しいオブジェクトに替わり、古い方のログアウトは来ない。
+    // 古い方への参照を残さないよう、ここで外す。新しい方は、画面のチャンクが届いてから見はじめ、画面全体を受け取る
+    private fun onClone(event: PlayerEvent.Clone) {
+        val original = event.original as? ServerPlayer ?: return
+        if (original === event.entity) return
+        forget(original)
+    }
+
+    // ディメンションを移ると、クライアントのレベルは作り直される。元のディメンションの画面の見ている人から外し、
+    // 戻ってきたら間隔を待たずに画面全体を送れるようにする。勘定は同じプレイヤーのものなので残す
+    private fun onChangedDimension(event: PlayerEvent.PlayerChangedDimensionEvent) {
+        val player = event.entity as? ServerPlayer ?: return
+        for (screen in serverScreens) {
+            if (screen.level?.dimension() == event.from) screen.forget(player)
+        }
+    }
+
+    /** [player] を、すべての画面の見ている人と、送信量の勘定から外す（ログアウトしたとき、リスポーンで替わった古いオブジェクト）。 */
+    internal fun forget(player: ServerPlayer) {
         for (screen in serverScreens) screen.forget(player)
         traffic.forget(player)
     }
@@ -93,13 +120,34 @@ object ScreenSync {
      * （見ているかは、サーバーが距離から決めたもの）。
      */
     fun requestResync(player: ServerPlayer, payload: ScreenResyncPayload) {
+        handleResync(player, payload)
+    }
+
+    /** [requestResync] で、お願いをどこで捨てたか、画面に渡したか。GameTest で確かめるためのもの。 */
+    internal enum class ResyncOutcome {
+        /** 見るのをやめる距離より遠いので、ブロックエンティティを探さずに捨てた。 */
+        TOO_FAR,
+
+        /** 読み込まれていない（またはワールドの高さの外の）座標なので、捨てた。 */
+        NOT_LOADED,
+
+        /** その座標に画面がないので、捨てた。 */
+        NO_SCREEN,
+
+        /** 画面に渡した（見ていない人のお願いは、画面が無視する）。 */
+        FORWARDED,
+    }
+
+    internal fun handleResync(player: ServerPlayer, payload: ScreenResyncPayload): ResyncOutcome {
         val level = player.serverLevel()
         val pos = payload.pos
         // 遠すぎるものは、ブロックエンティティを探すまでもなく捨てる
         val stop = ScreenWatchers.DEFAULT_START_DISTANCE + ScreenWatchers.DEFAULT_HYSTERESIS
-        if (Vec3.atCenterOf(pos).distanceToSqr(player.eyePosition) > stop * stop) return
-        if (!level.isLoaded(pos)) return
-        (level.getBlockEntity(pos) as? ScreenBlockEntity)?.requestResync(player)
+        if (Vec3.atCenterOf(pos).distanceToSqr(player.eyePosition) > stop * stop) return ResyncOutcome.TOO_FAR
+        if (!level.isLoaded(pos)) return ResyncOutcome.NOT_LOADED
+        val screen = level.getBlockEntity(pos) as? ScreenBlockEntity ?: return ResyncOutcome.NO_SCREEN
+        screen.requestResync(player)
+        return ResyncOutcome.FORWARDED
     }
 
     /**
@@ -113,7 +161,10 @@ object ScreenSync {
         override fun candidates(): Iterable<ServerPlayer> = (screen.level as? ServerLevel)?.players() ?: emptyList()
 
         override fun distanceSquared(player: ServerPlayer): Double {
-            if (player.hasDisconnected() || player.level() !== screen.level) return Double.POSITIVE_INFINITY
+            // isRemoved: リスポーンで替わった古いオブジェクトなど（念のため。ふつうは onClone で外れている）
+            if (player.hasDisconnected() || player.isRemoved || player.level() !== screen.level) {
+                return Double.POSITIVE_INFINITY
+            }
             if (!player.chunkTrackingView.contains(chunk) || player.connection.chunkSender.isPending(chunk.toLong())) {
                 return Double.POSITIVE_INFINITY
             }
