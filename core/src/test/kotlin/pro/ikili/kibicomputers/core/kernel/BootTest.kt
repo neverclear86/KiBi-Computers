@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
@@ -18,8 +19,12 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.vfs.FileType
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
@@ -186,7 +191,7 @@ class BootTest {
             assertEquals(1, m.kernel.objects.refCount(root.id))
         }
         assertEquals(setOf(0, 1, 2, 3), init.handles.entries().keys)
-        assertEquals(listOf("/" to "disk:b"), mounts())
+        assertEquals(listOf("/" to "disk:b", "/tmp" to "tmp"), mounts())
         assertEquals("kibi: booting from disk b\n", host.console.toString())
         assertFalse(m.boot(bootDisks("b")), "動いている間は起動しない")
 
@@ -305,7 +310,7 @@ class BootTest {
         m.lock.withLockValue {
             for (id in oldObjects) assertNull(m.kernel.objects[id], "前の起動のゾンビの ProcessObject は残らない（#46）")
         }
-        assertEquals(listOf("/" to "disk:d"), mounts(), "前の起動のマウントは残らない")
+        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp"), mounts(), "前の起動のマウントは残らない")
         assertFalse(host.console.contains("init exited"), host.console.toString())
         assertEquals(2, Regex("booting from disk d").findAll(host.console).count())
     }
@@ -421,5 +426,37 @@ class BootTest {
         assertEquals(1, host.reboots.get())
         assertFalse(host.console.contains("init exited"), host.console.toString())
         assertEquals(ProcessState.KILLED, m.stateOf(1))
+    }
+
+    @Test
+    fun `tmpは起動ごとに空でマウントし、中身はRAMに数え、再起動で返す`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        val tmpFile = VfsPath.parse("/tmp/a.txt")
+        m.lock.withLockValue {
+            val f = m.vfs.open(tmpFile, OpenOptions(read = true, write = true, create = true))
+            val bytes = "hello".toByteArray()
+            assertEquals(bytes.size, m.vfs.write(f, bytes, 0, bytes.size))
+        }
+        assertTrue(m.memoryAccount.usedBytes >= TmpFileSystem.CHUNK_BYTES, "/tmp の中身を RAM に数える")
+
+        assertTrue(m.reboot())
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
+        m.lock.withLockValue {
+            assertThrows<FsException> { m.vfs.stat(tmpFile) }
+            assertEquals(FileType.DIRECTORY, m.vfs.stat(VfsPath.parse("/tmp")).type)
+        }
+        assertEquals(0L, m.memoryAccount.usedBytes, "前の起動の /tmp の分は返す")
+    }
+
+    @Test
+    fun `根のtmpがファイルならマウントせずに起動を続ける`() = env {
+        val disk = disks.withInit("d", exe(foreverInit()))
+        disk.createFile(VfsPath.parse("/tmp"))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:d"), mounts())
+        assertEquals("kibi: /tmp not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
     }
 }

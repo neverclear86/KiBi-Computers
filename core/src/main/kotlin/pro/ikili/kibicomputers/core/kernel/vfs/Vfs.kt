@@ -33,10 +33,10 @@ internal class Vfs(
         return entry
     }
 
-    /** マウント [id] を外す。開いているファイルは、この後の操作が `IO` になる */
+    /** マウント [id] を外す。開いているファイルは、この後の操作が `IO` になる。ファイルシステムには [FileSystem.onUnmounted] で知らせる */
     fun unmount(id: Int): MountEntry {
         val entry = mounts.remove(id)
-        fileSystems.remove(id)
+        fileSystems.remove(id)?.onUnmounted()
         return entry
     }
 

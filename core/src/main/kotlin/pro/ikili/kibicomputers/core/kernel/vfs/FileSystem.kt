@@ -98,4 +98,10 @@ internal interface FileSystem {
 
     /** [node] の中身を記憶装置へ書き出す（既定は何もしない） */
     fun sync(node: Long) {}
+
+    /**
+     * [Vfs.unmount] で外された（既定は何もしない）。メモリ上のファイルシステム（`/tmp`）は、ここで中身を捨てて RAM を返す。
+     * 同じファイルシステムを別の場所にマウントし直すことはない前提
+     */
+    fun onUnmounted() {}
 }

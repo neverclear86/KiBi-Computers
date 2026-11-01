@@ -36,6 +36,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
@@ -949,6 +950,20 @@ public class Machine private constructor(
     }
 
     /**
+     * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（ワーカーのスレッドから、根のマウントの後）。
+     * 根のディスクの `/tmp` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）
+     */
+    internal fun mountTmp(): Errno? = lock.withLockValue {
+        val fs = TmpFileSystem(memoryAccount) { environment.clock.realtimeNanos() }
+        try {
+            vfs.mount(MachineLimits.TMP_PATH, fs, readOnly = false, source = MachineLimits.TMP_SOURCE)
+            null
+        } catch (e: FsException) {
+            e.errno
+        }
+    }
+
+    /**
      * 起動の手順を、init を作らずに終える（ワーカーのスレッドから）。マウントを外す。
      * [failure] が `null`（取り消し）か、取り消されていれば何も知らせない。そうでなければコンソールに書いて [MachineHost.onBootFailed] で知らせる
      *
@@ -1238,6 +1253,12 @@ internal object MachineLimits {
 
     /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
     internal const val DISK_SOURCE_PREFIX: String = "disk:"
+
+    /** `/tmp`（メモリ上のファイルシステム。#53）のマウントの `source` */
+    internal const val TMP_SOURCE: String = "tmp"
+
+    /** `/tmp` をマウントする場所 */
+    internal val TMP_PATH: VfsPath = VfsPath.parse("/tmp")
 }
 
 /**
