@@ -78,6 +78,10 @@ class FakeModule private constructor(
             val host = config.hostImport(imp.module, imp.name) ?: throw WasmLinkException("import がない: $imp")
             if (host.type != imp.functionType) throw WasmLinkException("import の型が違う: $imp に $host")
         }
+        memoryPages?.let { pages ->
+            if (pages > minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages)) throw WasmLinkException("ダミー: メモリの最初のページ数が上限を超える")
+            if (pages > 0 && config.memoryBudget?.tryReserve(pages) == false) throw WasmLinkException("ダミー: メモリを確保できない")
+        }
         val instance = FakeInstance(this, config)
         if (isFuelMetered) instance.fuel = config.initialFuel
         start?.let { instance.run(it, LongArray(0)) }
@@ -116,9 +120,11 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     @Volatile
     private var fuelValue: Long = 0
 
-    override val memory: WasmMemory? = module.memoryPages?.let { pages ->
-        FakeMemory(pages).also { m -> module.data.forEach { (offset, bytes) -> m.write(offset, bytes) } }
+    private val fakeMemory: FakeMemory? = module.memoryPages?.let { pages ->
+        FakeMemory(pages, minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages), config.memoryBudget).also { m -> module.data.forEach { (offset, bytes) -> m.write(offset, bytes) } }
     }
+
+    override val memory: WasmMemory? get() = fakeMemory
 
     override var fuel: Long
         get() {
@@ -179,21 +185,35 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     }
 
     override fun close() {
+        if (closed) return
         closed = true
+        fakeMemory?.releaseAll()
     }
 }
 
-/** ByteArray のメモリ。上限は 16 ページ。 */
-internal class FakeMemory(initialPages: Int) : WasmMemory {
+/** ByteArray のメモリ。上限は [maxPages]（16 ページまで）。[budget] があれば、確保を数える（最初の分は作る側が数える）。 */
+internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAGES, private val budget: WasmMemoryBudget? = null) : WasmMemory {
     private var bytes = ByteArray(initialPages * WasmMemory.PAGE_SIZE)
+
+    /** [budget] から確保したページ数 */
+    private var reserved = if (budget != null) initialPages else 0
 
     override val pages: Int get() = bytes.size / WasmMemory.PAGE_SIZE
 
     override fun grow(deltaPages: Int): Int {
         val old = pages
-        if (deltaPages < 0 || old + deltaPages > MAX_PAGES) return -1
+        if (deltaPages < 0 || old + deltaPages > maxPages) return -1
+        if (deltaPages > 0 && budget != null) {
+            if (!budget.tryReserve(deltaPages)) return -1
+            reserved += deltaPages
+        }
         bytes = bytes.copyOf((old + deltaPages) * WasmMemory.PAGE_SIZE)
         return old
+    }
+
+    fun releaseAll() {
+        if (reserved > 0) budget?.release(reserved)
+        reserved = 0
     }
 
     private fun check(address: Int, length: Int): Int {

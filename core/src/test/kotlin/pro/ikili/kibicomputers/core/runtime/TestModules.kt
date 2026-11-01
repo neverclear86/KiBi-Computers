@@ -87,6 +87,14 @@ object TestModules {
         build()
     }
 
+    /** 2 ページのメモリ。export `grow(n) -> 前のページ数`（memory.grow）・`size() -> ページ数`（memory.size） */
+    val GROW: ByteArray = WasmBinary().run {
+        memory(2)
+        exportFunc("grow", func(listOf(I32), listOf(I32), code(0x20, 0, 0x40, 0)))
+        exportFunc("size", func(emptyList(), listOf(I32), code(0x3f, 0)))
+        build()
+    }
+
     /** WASM でないバイト列 */
     val MALFORMED: ByteArray = "not a wasm module".toByteArray()
 

@@ -12,11 +12,13 @@ import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
+import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import run.endive.runtime.ByteBufferMemory
 import run.endive.runtime.ExportFunction
 import run.endive.runtime.GlobalFactory
 import run.endive.runtime.GlobalInstance
@@ -34,6 +36,7 @@ import run.endive.wasm.WasmEngineException
 import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
+import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.ValType
 import run.endive.runtime.Memory as EndiveMemory
 import run.endive.runtime.WasmException as EndiveWasmException
@@ -42,8 +45,10 @@ import run.endive.wasm.WasmModule as EndiveModule
 /**
  * Endive による [WasmRuntime]。
  *
- * 今はインタプリタで動かす。ランタイムコンパイラ（#29 の決定）と読み込みの共有は #37、
- * 燃料の計測コードの挿入は #38、メモリの上限は #39 で足す。
+ * 今はインタプリタで動かす。ランタイムコンパイラ（#29 の決定）と読み込みの共有は #37 で足す。
+ *
+ * メモリの上限（#39）は、Endive のメモリを作るときに上限を縮め（[WasmInstanceConfig.maxMemoryPages]）、
+ * [WasmInstanceConfig.memoryBudget] があれば `grow` を数える包み（[BudgetedMemory]）をかぶせて守る。
  */
 public class EndiveRuntime : WasmRuntime {
     override val name: String get() = NAME
@@ -69,6 +74,75 @@ public class EndiveRuntime : WasmRuntime {
         /** ランタイムの名前 */
         public const val NAME: String = "endive"
     }
+}
+
+/** メモリの上限のせいでメモリを作れない。Endive の中を通す間だけ使い、[WasmLinkException] にして投げ直す。 */
+private class MemoryLimitFailure(message: String) : RuntimeException(message, null, false, false)
+
+/**
+ * `grow` を [budget] で数える Endive のメモリ（#39）。ほかの操作は [inner] にそのまま渡す。
+ *
+ * [reserved] は [budget] から確保したページ数。インスタンスを閉じたときに [releaseAll] で返す。
+ */
+private class BudgetedMemory(
+    private val inner: EndiveMemory,
+    private val budget: WasmMemoryBudget,
+    private var reserved: Int,
+) : EndiveMemory by inner {
+    @Synchronized
+    override fun grow(size: Int): Int {
+        // 0 は今の大きさを返すだけ。負（符号なしで 2^31 以上）は Endive が -1 を返す
+        if (size <= 0 || reserved < 0) return inner.grow(size)
+        val current = inner.pages()
+        if (current.toLong() + size > inner.maximumPages()) return -1
+        if (!budget.tryReserve(size)) return -1
+        val previous = try {
+            inner.grow(size)
+        } catch (t: Throwable) {
+            budget.release(size)
+            throw t
+        }
+        if (previous < 0) {
+            budget.release(size)
+            return -1
+        }
+        reserved += size
+        return previous
+    }
+
+    /** 確保した分をすべて返す。以後 `grow` は数えない（閉じたインスタンスのメモリ）。2回呼んでもよい */
+    @Synchronized
+    fun releaseAll() {
+        if (reserved > 0) budget.release(reserved)
+        reserved = -1
+    }
+}
+
+/**
+ * [config] の上限で Endive のメモリを作る（#39）。数えるメモリは [created] に足す。
+ *
+ * 最初のページ数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
+ */
+private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<BudgetedMemory>): EndiveMemory {
+    val initial = limits.initialPages()
+    val max = minOf(limits.maximumPages(), config.maxMemoryPages)
+    if (initial > max) {
+        throw MemoryLimitFailure("メモリの最初のページ数 $initial が上限 $max を超える")
+    }
+    val budget = config.memoryBudget
+    if (budget == null) {
+        return ByteBufferMemory(if (max == limits.maximumPages()) limits else MemoryLimits(initial, max, limits.shared()))
+    }
+    if (initial > 0 && !budget.tryReserve(initial)) {
+        throw MemoryLimitFailure("メモリの最初の $initial ページを確保できない（RAM が足りない）")
+    }
+    val inner = try {
+        ByteBufferMemory(MemoryLimits(initial, max, limits.shared()))
+    } catch (t: Throwable) {
+        if (initial > 0) budget.release(initial)
+        throw t
+    }
+    return BudgetedMemory(inner, budget, initial).also { created += it }
 }
 
 /** ホストの関数が投げた例外を、Endive の中を通す間だけ包む。外に出るときに外す。 */
@@ -108,6 +182,17 @@ private fun hostThrowable(e: Throwable): Throwable? {
     var depth = 0
     while (cur != null && depth++ < 32) {
         if (cur is HostThrowable) return cur.original
+        cur = cur.cause
+    }
+    return null
+}
+
+/** メモリの上限のせいで作れなかったなら、その例外を返す。 */
+private fun memoryLimitFailure(e: Throwable): MemoryLimitFailure? {
+    var cur: Throwable? = e
+    var depth = 0
+    while (cur != null && depth++ < 32) {
+        if (cur is MemoryLimitFailure) return cur
         cur = cur.cause
     }
     return null
@@ -230,23 +315,40 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
             val value = if (globalIndex++ == fuelIndex) config.initialFuel else low
             GlobalInstance(value, high, type, mutability)
         }
+        // 数えるメモリ（作るのに失敗したら、確保した分を返す）
+        val memories = ArrayList<BudgetedMemory>(1)
+        wrapper.budgetedMemories = memories
         val instance = try {
             // withStart(false): export の `_start` は呼ばない（start セクションの関数は build の中で実行される）
-            Instance.builder(module).withImportValues(values.build()).withGlobalFactory(globals).withStart(false).build()
-        } catch (e: UnlinkableException) {
-            throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
-        } catch (e: UninstantiableException) {
-            // start 関数のトラップは Endive が UninstantiableException に包むので、トラップとして投げ直す
-            val cause = e.cause
-            if (cause != null && (hostThrowable(cause) != null || cause is TrapException || cause is WasmInterruptedException || cause is EndiveWasmException || cause is StackOverflowError)) rethrow(cause)
-            throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
-        } catch (e: InvalidException) {
-            throw WasmLoadException("WASM の検証に通らない: ${e.message}", e)
+            Instance.builder(module)
+                .withImportValues(values.build())
+                .withGlobalFactory(globals)
+                .withMemoryFactory { limits -> createMemory(limits, config, memories) }
+                .withStart(false)
+                .build()
         } catch (e: Throwable) {
-            rethrow(e)
+            memories.forEach { it.releaseAll() }
+            translateInstantiateFailure(e)
         }
         wrapper.attach(instance)
         return wrapper
+    }
+
+    /** インスタンスを作るときの例外を、この抽象の例外にして投げる。 */
+    private fun translateInstantiateFailure(e: Throwable): Nothing {
+        hostThrowable(e)?.let { throw it }
+        memoryLimitFailure(e)?.let { throw WasmLinkException("インスタンスを作れない: ${it.message}", it) }
+        when (e) {
+            is UnlinkableException -> throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
+            is UninstantiableException -> {
+                // start 関数のトラップは Endive が UninstantiableException に包むので、トラップとして投げ直す
+                val cause = e.cause
+                if (cause != null && (cause is TrapException || cause is WasmInterruptedException || cause is EndiveWasmException || cause is StackOverflowError)) rethrow(cause)
+                throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
+            }
+            is InvalidException -> throw WasmLoadException("WASM の検証に通らない: ${e.message}", e)
+            else -> rethrow(e)
+        }
     }
 
     private fun hostFunction(moduleName: String, name: String, type: WasmFunctionType, wrapper: EndiveWasmInstance, body: (LongArray) -> LongArray): HostFunction =
@@ -265,6 +367,9 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     private var raw: Instance? = null
     private var memoryWrapper: WasmMemory? = null
     private var closed = false
+
+    /** 数えるメモリ（閉じたときに確保した分を返す） */
+    var budgetedMemories: List<BudgetedMemory> = emptyList()
 
     /** export の関数（名前ごとに1回だけ引く） */
     private val exportFunctions = HashMap<String, ExportFunction>()
@@ -318,7 +423,11 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         if (closed) return
         closed = true
         exportFunctions.clear()
-        raw?.close()
+        try {
+            raw?.close()
+        } finally {
+            budgetedMemories.forEach { it.releaseAll() }
+        }
     }
 }
 

@@ -21,6 +21,7 @@ public class WasmHostImport(
  * WasmInstanceConfig config = WasmInstanceConfig.builder()
  *     .hostFunction("env", "log", type, (instance, args) -> new long[0])
  *     .fuel(10_000, (instance, remaining) -> remaining + 10_000)
+ *     .memoryLimit(256, budget)
  *     .build();
  * ```
  */
@@ -34,6 +35,15 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
     /** 燃料切れのときの処理。`null` なら、燃料切れで [WasmTrapException]（[WasmTrapKind.FUEL_EXHAUSTED]）になる */
     public val fuelHandler: WasmFuelHandler? = builder.fuelHandler
 
+    /**
+     * 線形メモリ1つあたりのページ数の上限（#39）。モジュールが宣言した上限より小さければ、こちらが上限になる。
+     * 既定は [WasmMemory.MAX_PAGES]（WASM の 32 ビットのメモリの上限。制限なし）
+     */
+    public val maxMemoryPages: Int = builder.maxMemoryPages
+
+    /** 線形メモリの確保を数える相手（#39）。`null` なら数えない */
+    public val memoryBudget: WasmMemoryBudget? = builder.memoryBudget
+
     /** [module].[name] のホストの関数。なければ `null` */
     public fun hostImport(module: String, name: String): WasmHostImport? = hostImports.firstOrNull { it.module == module && it.name == name }
 
@@ -42,6 +52,8 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal val hostImports = mutableListOf<WasmHostImport>()
         internal var initialFuel: Long = 0
         internal var fuelHandler: WasmFuelHandler? = null
+        internal var maxMemoryPages: Int = WasmMemory.MAX_PAGES
+        internal var memoryBudget: WasmMemoryBudget? = null
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
@@ -57,6 +69,22 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         public fun fuel(initial: Long, handler: WasmFuelHandler?): Builder = apply {
             initialFuel = initial
             fuelHandler = handler
+        }
+
+        /**
+         * 線形メモリの上限を決める（#39）。
+         *
+         * 最初のページ数が [maxPages] を超える、または [budget] が最初のページ数を確保させないときは、
+         * インスタンスを作るときに [WasmLinkException] になる。実行中の `memory.grow`（と [WasmMemory.grow]）は、
+         * [maxPages] を超えるか [budget] が断ると失敗する（-1 を返す。トラップではない）。
+         *
+         * @param maxPages メモリ1つあたりのページ数の上限（0〜[WasmMemory.MAX_PAGES]）
+         * @param budget 確保を数える相手。`null` なら数えない
+         */
+        public fun memoryLimit(maxPages: Int, budget: WasmMemoryBudget?): Builder = apply {
+            require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
+            maxMemoryPages = maxPages
+            memoryBudget = budget
         }
 
         /** 設定を作る。 */

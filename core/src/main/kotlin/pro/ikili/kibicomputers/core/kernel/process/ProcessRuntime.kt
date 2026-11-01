@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.ProcessMemory
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -41,6 +42,9 @@ internal class ProcessRuntime(
 
     /** WASM のスタックがある（step の途中、専用スレッドが動いている間）。待機点かの判定に使う */
     var stackActive: Boolean = false
+
+    /** 線形メモリの使用量（#39。すべてのインスタンスの合計。インスタンスを閉じると減る） */
+    val memory: ProcessMemory = machine.memoryAccount.process(machine.config.maxProcessMemoryPages)
 
     /** 作ったインスタンス（作った順） */
     val instances: MutableList<WasmInstance> = ArrayList(1)

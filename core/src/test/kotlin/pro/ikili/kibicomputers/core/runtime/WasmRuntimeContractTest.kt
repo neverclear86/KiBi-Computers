@@ -269,4 +269,84 @@ abstract class WasmRuntimeContractTest {
         assertThrows<IllegalStateException> { instance.call("add", 1, 2) }
         instance.close()
     }
+
+    /** 合計 [limit] ページまで確保させる、数えるだけの相手 */
+    private class CountingBudget(private val limit: Int) : WasmMemoryBudget {
+        var used = 0
+        var reserveCalls = 0
+
+        override fun tryReserve(pages: Int): Boolean {
+            reserveCalls++
+            if (used + pages > limit) return false
+            used += pages
+            return true
+        }
+
+        override fun release(pages: Int) {
+            used -= pages
+            check(used >= 0) { "返しすぎ" }
+        }
+    }
+
+    private fun limitConfig(maxPages: Int, budget: WasmMemoryBudget?) = WasmInstanceConfig.builder().memoryLimit(maxPages, budget).build()
+
+    @Test
+    fun `memoryの上限を超えるmemory_growは失敗し-1を返す`() {
+        instantiate(TestModules.GROW, limitConfig(4, null)).use { instance ->
+            assertEquals(2L, instance.call("grow", 2)[0])
+            assertEquals(-1, instance.call("grow", 1)[0].toInt())
+            assertEquals(4L, instance.call("size")[0])
+            // ホストから増やしても同じ上限
+            assertEquals(-1, instance.memory!!.grow(1))
+            assertEquals(4, instance.memory!!.pages)
+            assertEquals(4L, instance.call("grow", 0)[0])
+        }
+    }
+
+    @Test
+    fun `最初のページ数がmemoryの上限を超えるとWasmLinkException`() {
+        assertThrows<WasmLinkException> { instantiate(TestModules.GROW, limitConfig(1, null)) }
+    }
+
+    @Test
+    fun `memory_growは確保を数える相手に断られると失敗し閉じると返す`() {
+        val budget = CountingBudget(5)
+        val module = runtime.load(TestModules.GROW)
+        val a = module.instantiate(limitConfig(WasmMemory.MAX_PAGES, budget))
+        assertEquals(2, budget.used)
+        module.instantiate(limitConfig(WasmMemory.MAX_PAGES, budget)).use { b ->
+            assertEquals(4, budget.used)
+            // 2 つのインスタンスの合計が 5 ページまで
+            assertEquals(-1, b.call("grow", 2)[0].toInt())
+            assertEquals(4, budget.used)
+            assertEquals(2L, b.call("grow", 1)[0])
+            assertEquals(5, budget.used)
+            assertEquals(-1, a.memory!!.grow(1))
+            assertEquals(2, a.memory!!.pages)
+            // 0 ページの grow は数えない
+            val calls = budget.reserveCalls
+            assertEquals(2L, a.call("grow", 0)[0])
+            assertEquals(calls, budget.reserveCalls)
+        }
+        assertEquals(2, budget.used)
+        a.close()
+        assertEquals(0, budget.used)
+        a.close()
+        assertEquals(0, budget.used)
+    }
+
+    @Test
+    fun `最初のページを確保できないとWasmLinkExceptionで何も数えない`() {
+        val budget = CountingBudget(1)
+        assertThrows<WasmLinkException> { instantiate(TestModules.GROW, limitConfig(WasmMemory.MAX_PAGES, budget)) }
+        assertEquals(0, budget.used)
+    }
+
+    @Test
+    fun `memoryの上限の引数を確かめる`() {
+        assertThrows<IllegalArgumentException> { WasmInstanceConfig.builder().memoryLimit(-1, null) }
+        assertThrows<IllegalArgumentException> { WasmInstanceConfig.builder().memoryLimit(WasmMemory.MAX_PAGES + 1, null) }
+        assertEquals(WasmMemory.MAX_PAGES, WasmInstanceConfig.EMPTY.maxMemoryPages)
+        assertNull(WasmInstanceConfig.EMPTY.memoryBudget)
+    }
 }

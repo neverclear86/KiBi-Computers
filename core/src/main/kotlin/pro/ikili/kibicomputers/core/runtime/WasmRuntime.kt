@@ -95,7 +95,10 @@ public interface WasmMemory {
     /** 今の大きさ（バイト） */
     public val byteSize: Long get() = pages.toLong() * PAGE_SIZE
 
-    /** [deltaPages] ページ増やし、増やす前のページ数を返す。増やせないときは -1。 */
+    /**
+     * [deltaPages] ページ増やし、増やす前のページ数を返す。増やせないとき（上限を超える、
+     * [WasmMemoryBudget] が断る。#39）は -1。
+     */
     public fun grow(deltaPages: Int): Int
 
     /** [address] から [length] バイトを [dst] の [dstOffset] に読む。 */
@@ -141,7 +144,31 @@ public interface WasmMemory {
     public companion object {
         /** 1 ページの大きさ（64 KiB） */
         public const val PAGE_SIZE: Int = 65536
+
+        /** 32 ビットの線形メモリのページ数の上限（4 GiB） */
+        public const val MAX_PAGES: Int = 65536
     }
+}
+
+/**
+ * 線形メモリの確保を数える相手（#39）。[WasmInstanceConfig.Builder.memoryLimit] で渡す。
+ *
+ * ランタイムは、メモリを作るとき（最初のページ数）と増やすとき（`memory.grow`）に [tryReserve] を呼び、
+ * インスタンスを閉じたとき（作るのに失敗したときも）に、確保した分をまとめて [release] で返す。
+ * 複数のインスタンスで1つを共有して、合計を制限してよい（カーネルはプロセスごと・マシンごとに数える）。
+ *
+ * スレッド: どのスレッドから呼ばれてもよいように作る（別々のインスタンスが、別々のスレッドから同時に呼ぶ）。
+ * WASM の実行の中から呼ばれるので、待たない・WASM を呼ばない。
+ */
+public interface WasmMemoryBudget {
+    /**
+     * [pages] ページ（1 以上）を確保してよければ、確保した分として数えて `true` を返す。
+     * だめなら何も数えずに `false` を返す。
+     */
+    public fun tryReserve(pages: Int): Boolean
+
+    /** [tryReserve] で確保した分のうち [pages] ページ（1 以上）を返す。 */
+    public fun release(pages: Int)
 }
 
 /**
