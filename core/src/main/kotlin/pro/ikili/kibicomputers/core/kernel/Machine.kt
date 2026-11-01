@@ -201,8 +201,8 @@ public class Machine private constructor(
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
 
-    /** 線形メモリの使用量（RAM。#39） */
-    internal val memoryAccount = MemoryAccount(config.memoryPages)
+    /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
+    internal val memoryAccount = MemoryAccount(config.memoryPages, scheduler.memoryAccount)
 
     /** 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ。カーネルロックの中で使う） */
     internal val vfs = Vfs(kernel.mounts)
@@ -287,9 +287,12 @@ public class Machine private constructor(
     /** つながっているデバイスが変わった回数（実行時だけ。#63・#65 がイベントにする） */
     private val devicesGenerationCounter = AtomicLong()
 
-    // ---- 起動（#49）。どれも実行時だけで、保存しない（カーネルロック） ----
+    // ---- 起動（#49）。どれも実行時だけで、保存しない（カーネルロック）。init の pid は [KernelState.initPid]（保存の対象。#365） ----
 
-    /** 起動の手順が動いている（受け付けてから init を作るか、失敗・取り消しで終わるまで） */
+    /**
+     * 起動の手順が動いている（受け付けてから init を作るか、失敗・取り消しで終わるまで）。
+     * 実行時だけの値。立っている間は [isAtWaitPoint] が `false` なので、起動の途中の状態は保存されない（#365）
+     */
     @Volatile
     private var bootingValue = false
 
@@ -304,16 +307,17 @@ public class Machine private constructor(
     @Volatile
     private var bootCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
 
-    /** 起動した init の pid（0 = いない）。init が終わったら 0 に戻す */
-    private var initPid = 0
-
+    /** 最後に受け付けた [boot] の設定。実行時だけの値（戻したマシンでは、接続層が渡し直す。ADR 0049・#81） */
     @Volatile
     private var lastBootConfigValue: BootConfig? = null
 
-    /** 再起動を求められ、プロセスがすべて止まるのを待っている */
+    /** 再起動を求められ、プロセスがすべて止まるのを待っている。実行時だけの値。立っている間は [isAtWaitPoint] が `false`（#365） */
     private var rebootRequested = false
 
-    /** 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す） */
+    /**
+     * 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す）。実行時だけの値。
+     * この間はプロセスが0個の [MachineState.STOPPED] だが、ここで保存すると再起動が消えるので、[isAtWaitPoint] は `false`（#365）
+     */
     private var rebootNotified = false
 
     /** 刈り取ったプロセス・前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
@@ -322,9 +326,19 @@ public class Machine private constructor(
     /** 状態 */
     public val state: MachineState get() = stateValue
 
-    /** 全プロセスが待機点にいる（または1つもない）なら `true`（#81 の判定の土台） */
+    /**
+     * 保存してよい待機点にいるなら `true`（#81 の判定の土台）。次をすべて満たすとき:
+     *
+     * - 起動の手順が動いていない（[isBooting] でない）
+     * - 再起動を求められて待っていない（[reboot] を受け付けてから、[MachineHost.onRebootRequested] を呼ぶまで）
+     * - 全プロセスが待機点にいる（または1つもない）
+     *
+     * 起動中・再起動の待ちの印は実行時だけの値で保存しないので、その間は待機点にしない（#365）。
+     */
     public val isAtWaitPoint: Boolean
-        get() = lock.withLockValue { kernel.processes.all().all { isAtWaitPointLocked(it) } }
+        get() = lock.withLockValue {
+            !bootingValue && !rebootRequested && !rebootNotified && kernel.processes.all().all { isAtWaitPointLocked(it) }
+        }
 
     /** 起動の手順が動いている（[boot] を受け付けてから、init を作るか、失敗・取り消しで終わるまで） */
     public val isBooting: Boolean get() = bootingValue
@@ -495,7 +509,7 @@ public class Machine private constructor(
             kernel.processes.add(process)
             process.objectId = kernel.objects.add(ProcessObject(pid))
             if (asInit) {
-                initPid = pid
+                kernel.initPid = pid
                 bootingValue = false
             }
             installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
@@ -1008,7 +1022,7 @@ public class Machine private constructor(
     internal fun killLocked(pid: Int, signal: KillSignal): KillResult = lifecycle.killLocked(pid, signal)
 
     /** [pid] が今の起動の init か（カーネルロックの中） */
-    internal fun isInitLocked(pid: Int): Boolean = initPid != 0 && pid == initPid
+    internal fun isInitLocked(pid: Int): Boolean = kernel.initPid != 0 && pid == kernel.initPid
 
     /**
      * 終わったプロセス [pid] を刈り取る（#46）。表と実行時の部分から外し、カーネルが持つ `ProcessObject` の参照を返す。
@@ -1126,9 +1140,18 @@ public class Machine private constructor(
         checkAllDoneLocked()
     }
 
-    /** 最後のプロセスが終わったら STOPPED にする。カーネルロックの中で呼ぶ */
+    /**
+     * 最後のプロセスが終わったら STOPPED にする。カーネルロックの中で呼ぶ。
+     *
+     * 起動の途中（[bootingValue]）でなければ、`/tmp`（RAM に数えるファイルシステム）のマウントを外して RAM を返す（#362）。
+     * ディスクなどほかのマウントは、次の起動まで残す。
+     * 次の起動を待たずに、止まったマシン・閉じたマシン（`close()` はプロセスの終わりを待たない）が
+     * サーバー全体の勘定（[MachineScheduler.memoryAccount]）を持ち続けないようにする。
+     * 起動の途中の取り消しは [endBoot] が外す。
+     */
     internal fun checkAllDoneLocked() {
         if (kernel.processes.liveCount() > 0) return
+        if (!bootingValue) unmountTmpLocked()
         if (stateValue == MachineState.RUNNING || stateValue == MachineState.STOPPING) setStateLocked(MachineState.STOPPED, null)
         if (registeredThreads == 0) {
             terminated.signalAll()
@@ -1150,8 +1173,8 @@ public class Machine private constructor(
      * @param crashReason `CRASHED` の理由（[crashReason][pro.ikili.kibicomputers.core.kernel.process.crashReason]）。それ以外は `null`
      */
     internal fun onProcessFinishedLocked(process: Process, crashReason: String?) {
-        val isInit = initPid != 0 && process.pid == initPid && process.parentPid == 0
-        if (isInit) initPid = 0
+        val isInit = kernel.initPid != 0 && process.pid == kernel.initPid && process.parentPid == 0
+        if (isInit) kernel.initPid = 0
         // STOPPING（stop()・reboot()）と CRASHED（カーネルの不整合）では何も言わない
         if (stateValue != MachineState.RUNNING) return
         if (!isInit) {
@@ -1216,7 +1239,7 @@ public class Machine private constructor(
         kernel.clocks.resetUptime(scheduler.now)
         // 閉じたイベントキューの ID を索引から外す（ADR 0063）
         kernel.events.sweep(kernel.objects)
-        initPid = 0
+        kernel.initPid = 0
         unmountAllLocked()
         if (kernel.consoleTtyId != 0) consoleTtyLocked().foregroundPid = 0
         true
@@ -1262,6 +1285,11 @@ public class Machine private constructor(
         }
         bootCancelled = false
         maybePostRebootLocked()
+    }
+
+    /** `/tmp`（[MachineLimits.TMP_SOURCE]）のマウントを外し、中身が持つ RAM を返す（カーネルロックの中） */
+    private fun unmountTmpLocked() {
+        for (entry in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) vfs.unmount(entry.id)
     }
 
     /** マウントを深いほうからすべて外す（カーネルロックの中） */

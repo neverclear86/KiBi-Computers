@@ -60,7 +60,7 @@ ADR 0058 で残した「0/1/2 以外の fd を子に渡す方法」は、`SpawnO
 
 - `Process.cwd` は VFS の絶対パス。`ProcessContext.changeDirectory`（`chdir`）で変える。ディレクトリでなければ `NOTDIR`、なければ `NOENT`
 - 作業ディレクトリのディレクトリが後で消えても追わない（POSIX と同じく、次に辿るときに `NOENT` になる）
-- WASI p1 には cwd がない（preopen からの相対）。p1 の libc が使う `PWD` などとの合わせ方は #72 で決める
+- WASI p1 には cwd がない（preopen からの相対）。p1 の libc が使う `PWD` との合わせ方は #332（ADR 0332。p1 の `environ_*` が `PWD=<cwd>` を含める）
 
 ## 保存（#81・#82 への申し送り）
 

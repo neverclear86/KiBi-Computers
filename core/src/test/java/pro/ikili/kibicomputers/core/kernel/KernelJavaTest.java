@@ -60,6 +60,12 @@ class KernelJavaTest {
         assertEquals(1, SchedulerConfig.DEFAULT.getCompilerThreads());
         assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().compilerThreads(0));
         assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().programCacheEntries(0));
+
+        // サーバー全体の RAM の上限（#362）
+        SchedulerConfig total = SchedulerConfig.builder().totalMemoryBytes(64L << 20).build();
+        assertEquals(64L << 20, total.getTotalMemoryBytes());
+        assertEquals(Runtime.getRuntime().maxMemory() / 2, SchedulerConfig.DEFAULT.getTotalMemoryBytes());
+        assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().totalMemoryBytes(-1));
         assertThrows(IllegalArgumentException.class, () -> SchedulerConfig.builder().programCacheBytes(0));
 
         MachineConfig machine = MachineConfig.builder().fuelPerTick(500).maxProcesses(8).build();

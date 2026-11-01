@@ -16,6 +16,8 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -96,18 +98,50 @@ class WasiP1BasicTest {
                 assertEquals("prog", mem.cString(300))
                 assertEquals("é", mem.cString(305))
 
+                // 最後に PWD=<カーネルの cwd> が足される（#332）
                 assertEquals(0, call("environ_sizes_get", 100, 104))
-                assertEquals(2, mem.readI32(100))
-                assertEquals(4 + 3, mem.readI32(104))
+                assertEquals(3, mem.readI32(100))
+                assertEquals(4 + 3 + 6, mem.readI32(104))
                 assertEquals(0, call("environ_get", 400, 500))
                 assertEquals("A=1", mem.cString(mem.readI32(400)))
                 assertEquals("B=", mem.cString(mem.readI32(404)))
+                assertEquals("PWD=/", mem.cString(mem.readI32(408)))
 
                 // 範囲外は書かずに FAULT
                 assertEquals(Errno.FAULT.code, call("args_get", 200, 65536 - 4))
                 assertEquals(Errno.FAULT.code, call("args_sizes_get", 65536 - 2, 104))
             }
         }
+    }
+
+    @Test
+    fun `PWDはカーネルのcwdにし、渡されていればその位置で置き換える`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            m.lock.withLockValue {
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                m.vfs.createDirectory(VfsPath.parse("/home"))
+            }
+            val module = forwarding("environ_sizes_get", "environ_get")
+            val opts = SpawnOptions(env = linkedMapOf("A" to "1", "PWD" to "/wrong", "B" to "2"), cwd = "/home")
+            runToEnd(h, m, module, opts) { mem, call ->
+                assertEquals(0, call("environ_sizes_get", 100, 104))
+                assertEquals(3, mem.readI32(100))
+                assertEquals(4 + 10 + 4, mem.readI32(104))
+                assertEquals(0, call("environ_get", 400, 500))
+                assertEquals("A=1", mem.cString(mem.readI32(400)))
+                assertEquals("PWD=/home", mem.cString(mem.readI32(404)))
+                assertEquals("B=2", mem.cString(mem.readI32(408)))
+            }
+        }
+    }
+
+    @Test
+    fun `p1Environmentは呼び出し元の環境変数を変えない`() {
+        val env = linkedMapOf("PWD" to "/x", "Z" to "z")
+        assertEquals(listOf("PWD" to "/a/b", "Z" to "z"), WasiP1Basic.p1Environment(env, VfsPath.parse("/a/b")))
+        assertEquals(mapOf("PWD" to "/x", "Z" to "z"), env)
+        assertEquals(listOf("PWD" to "/"), WasiP1Basic.p1Environment(emptyMap(), VfsPath.ROOT))
     }
 
     @Test
