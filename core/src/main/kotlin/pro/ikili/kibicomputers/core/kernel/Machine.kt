@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
 import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
@@ -71,6 +72,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
 /** マシンの状態 */
+@ApiStatus.Internal
 public enum class MachineState {
     /** 動いているプロセスがない */
     STOPPED,
@@ -88,6 +90,7 @@ public enum class MachineState {
 /**
  * マシンの設定。[builder] で作る。値はどれも仮の値（確定は #47・#251）。
  */
+@ApiStatus.Internal
 public class MachineConfig private constructor(builder: Builder) {
     /** 1 tick に配る燃料。1回に渡す燃料の上限でもある（仮: 1 tick 約 2 ms 相当） */
     public val fuelPerTick: Long = builder.fuelPerTick
@@ -177,6 +180,7 @@ public class MachineConfig private constructor(builder: Builder) {
  *
  * カーネルの状態（プロセス表、オブジェクト表、燃料）はマシンごとの1つのロック（カーネルロック）で守る。
  */
+@ApiStatus.Internal
 public class Machine private constructor(
     internal val scheduler: MachineScheduler,
     /** スケジューラの中の番号（保存しない。実行時だけ） */

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
 import java.util.UUID
 
 /**
@@ -15,6 +16,7 @@ import java.util.UUID
  * @property typist 打つプレイヤーの UUID
  * @property budget 受け取る量の上限
  */
+@ApiStatus.Internal
 public class KeyboardSession @JvmOverloads constructor(
     public val id: Int,
     public val typist: UUID,

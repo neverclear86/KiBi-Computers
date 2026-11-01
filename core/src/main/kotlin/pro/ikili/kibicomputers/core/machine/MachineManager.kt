@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.machine
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
@@ -12,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /** マシンを手放す理由（[MachineManager.release]）。 */
+@ApiStatus.Internal
 public enum class MachineReleaseReason {
     /** ブロックが壊された・置き換えられた（もう戻らない） */
     REMOVED,
@@ -28,6 +30,7 @@ public enum class MachineReleaseReason {
  *
  * [MachineManager.tick] の中など、メインスレッドから呼ばれる。中で投げた例外は捨てる。
  */
+@ApiStatus.Internal
 public fun interface MachineErrorListener {
     /**
      * @param message 何が起きたか（どのマシンかを含む）
@@ -64,6 +67,7 @@ public fun interface MachineErrorListener {
  *
  * @param K マシンのキー。`equals`・`hashCode` を持ち、変わらない値にする
  */
+@ApiStatus.Internal
 public class MachineManager<K : Any> internal constructor(
     /** マシンを動かすスケジューラ（保存の前の [MachineScheduler.pauseAll] などに使う） */
     public val scheduler: MachineScheduler,

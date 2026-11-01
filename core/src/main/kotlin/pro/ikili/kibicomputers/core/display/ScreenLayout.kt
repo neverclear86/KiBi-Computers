@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 画面の中身を、ブロックの正面にどう並べるか（#139）。
  *
@@ -15,6 +17,7 @@ package pro.ikili.kibicomputers.core.display
  * @property offsetX 正面の左端から中身の左端までの長さ（ブロックの単位）
  * @property offsetY 正面の上端から中身の上端までの長さ（ブロックの単位）
  */
+@ApiStatus.Internal
 public class ScreenLayout private constructor(
     @JvmField public val columns: Int,
     @JvmField public val rows: Int,

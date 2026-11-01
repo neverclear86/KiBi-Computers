@@ -8,7 +8,8 @@ tools: Read, Grep, Glob, Bash
 
 ## 対象
 
-`git diff main...HEAD` で変更された `public`（または `explicitApi()` 下で公開になっている）宣言。主に `core/src/main/kotlin/` 以下。
+`git diff main...HEAD` で変更された、`pro.ikili.kibicomputers.api` 以下の `public` な宣言（`core/src/main/kotlin/` と各接続層）。
+`api` 以外の `public`（`@ApiStatus.Internal` が付いた内部の型、#366）は Java からの使いやすさを問わないので、対象にしない。`api` 以外の新しいトップレベルの `public` に `@ApiStatus.Internal` がないときだけ指摘する。
 
 ## 確認すること
 
@@ -18,7 +19,7 @@ tools: Read, Grep, Glob, Bash
 - 例外を投げる関数に `@Throws` があるか。
 - Java から見た名前が不自然でないか（`getX`/`isX`、トップレベル関数のファイルクラス名 `XxxKt` が公開 API に出ていないか。出るなら `@file:JvmName`）。
 - null 許容性が意図どおりか（Java 側ではプラットフォーム型にならず、`@Nullable` 相当として見えるか）。
-- 公開 API を足したのに `core/src/test/java/` に Java からの利用テストがない場合は指摘する。
+- `api` の宣言を足したのに `core/src/test/java/` に Java からの利用テストがない場合は指摘する。
 - `core` に Minecraft・ローダーのクラスが入っていないか、Kotlin 2.2 より新しい API を使っていないか（ビルドで検出されるが、念のため）。
 
 必要なら `./gradlew :core:compileKotlin` のあと、`javap -p` で生成クラスのシグネチャを確かめてよい。

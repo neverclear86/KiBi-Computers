@@ -68,12 +68,14 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 本体は Kotlin だが、他 MOD から使う公開 API は Java から自然に使えなければならない（#6）。
 
 - 公開 API は `pro.ikili.kibicomputers.api` 以下に置く。MC 非依存のものは `core`、MC 依存のものは各接続層の `...api` パッケージ。将来、API だけの jar（`-api`）を別に出す。
+- **`api` 以外は内部。** `core` の `api` 以外のトップレベルの `public` な宣言（接続層から使うために `public` にしたもの）には、`@ApiStatus.Internal`（`org.jetbrains.annotations`）を付ける（#366）。付け忘れは `core` の `InternalMarkerTest` が落とす。`api` の宣言には付けない。
 - `core` は `explicitApi()` が有効。公開するものには `public` と型を明示し、それ以外は `internal`/`private` にする。
+- 以下のルールは `api` の宣言に向けたもの。内部の型は接続層（Kotlin）から使うので、Java から自然に使えるかは問わない（既存の `@JvmStatic` などは外さなくてよい）。
 - object・companion の関数は `@JvmStatic`、定数は `const val`、公開フィールドは `@JvmField`。
 - デフォルト引数を持つ公開関数・コンストラクターには `@JvmOverloads`。
 - 公開 API に `suspend` 関数、value class、Kotlin の関数型（`(A) -> B`）を出さない。コールバックは `fun interface` にする。
 - 例外を投げる公開関数には `@Throws` を付ける。
-- 公開 API を足したら、`core/src/test/java/` に Java から呼ぶテストを足す（コンパイルできることが検査になる）。
+- `api` の宣言を足したら、`core/src/test/java/` に Java から呼ぶテストを足す（コンパイルできることが検査になる）。内部の型には Java のテストを足さない。今ある内部の型の Java テスト（`*JavaTest.java`）は振る舞いの確認も兼ねるので残すが、内部の型を変えて合わなくなったら、Kotlin のテストに移すか消してよい。
 
 ## コードスタイル
 

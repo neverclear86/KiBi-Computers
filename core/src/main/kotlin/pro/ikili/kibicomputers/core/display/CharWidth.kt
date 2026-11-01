@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 文字画面で1つの文字が何セル分の幅で描かれるか（#139）。
  *
@@ -9,6 +11,7 @@ package pro.ikili.kibicomputers.core.display
  * 文字画面のバッファ（[TextBuffer]）は1セルに1コードポイントを持つ。全角の文字は、そのセルと右隣のセルの2つ分に
  * 描かれ、右隣のセルの文字は描かれない（背景色だけが描かれる）。書き込む側は、全角の文字の右隣のセルに空白を置く。
  */
+@ApiStatus.Internal
 public object CharWidth {
     // 全角の範囲（始まりと終わり。どちらも含む）。昇順に並べる
     private val WIDE = intArrayOf(

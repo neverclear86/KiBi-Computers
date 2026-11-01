@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * ランタイムの境界で扱う WASM の値の型。
  *
@@ -12,6 +14,7 @@ package pro.ikili.kibicomputers.core.runtime
  * 参照型・`v128` はホストの関数の境界に出さない（カーネルのシステムコールは数値だけを使う）。
  * それらを使う関数は、型を [UNSUPPORTED] として見せる。
  */
+@ApiStatus.Internal
 public enum class WasmValueType {
     I32,
     I64,
@@ -23,6 +26,7 @@ public enum class WasmValueType {
 }
 
 /** 関数の型（引数と戻り値の型の並び）。 */
+@ApiStatus.Internal
 public class WasmFunctionType(params: List<WasmValueType>, results: List<WasmValueType>) {
     /** 引数の型 */
     public val params: List<WasmValueType> = params.toList()
@@ -48,6 +52,7 @@ public class WasmFunctionType(params: List<WasmValueType>, results: List<WasmVal
 }
 
 /** import・export されるものの種類。 */
+@ApiStatus.Internal
 public enum class WasmExternKind {
     FUNCTION,
     TABLE,
@@ -61,6 +66,7 @@ public enum class WasmExternKind {
  *
  * @property functionType [kind] が [WasmExternKind.FUNCTION] のときの型。それ以外は `null`
  */
+@ApiStatus.Internal
 public class WasmImportDescriptor(
     public val module: String,
     public val name: String,
@@ -83,6 +89,7 @@ public class WasmImportDescriptor(
  *
  * @property functionType [kind] が [WasmExternKind.FUNCTION] のときの型。それ以外は `null`
  */
+@ApiStatus.Internal
 public class WasmExportDescriptor(
     public val name: String,
     public val kind: WasmExternKind,

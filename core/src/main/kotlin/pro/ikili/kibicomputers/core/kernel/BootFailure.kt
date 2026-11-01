@@ -1,6 +1,9 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
+
 /** 起動の失敗の種類（[MachineHost.onBootFailed]。#49） */
+@ApiStatus.Internal
 public enum class BootFailure {
     /** 起動部品が挿さっていない */
     NO_FIRMWARE,

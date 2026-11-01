@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
 import java.util.UUID
 
 /**
@@ -8,6 +9,7 @@ import java.util.UUID
  * 文字（[Text]）は、キーボードの配列・Shift・IME（日本語入力の確定）を通したあとのもの。
  * 1回のキーの押し下げから、[KeyDown] と [Text] の両方が届くことがある（Ctrl などを押しているときは [Text] は来ない）。
  */
+@ApiStatus.Internal
 public sealed class KeyboardEvent {
     /**
      * キーを押した。押し続けたときの繰り返しなら [repeat] が true。
@@ -42,6 +44,7 @@ public sealed class KeyboardEvent {
  *
  * 1つのキーボードにつながる相手は1つだけ（#360）。
  */
+@ApiStatus.Internal
 public fun interface KeyboardListener {
     /**
      * [event] が届いた。

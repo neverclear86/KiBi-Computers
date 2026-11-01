@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * サーバー側の、1つの画面の同期（#140、ADR 0031 の B+K）。
  *
@@ -18,6 +20,7 @@ package pro.ikili.kibicomputers.core.display
  * @param bytesPerSecond 1画面あたりの送信量の上限（バイト/秒）。仮の値（確定は #20・#251）
  * @param maxFragmentSize 1つのフラグメントの最大の大きさ（バイト）
  */
+@ApiStatus.Internal
 public class ScreenSyncSender
 @JvmOverloads
 @Throws(IllegalArgumentException::class)
@@ -171,6 +174,7 @@ public constructor(
  * @property forWatchers 前から見ているプレイヤー全員に送るもの。空なら送らない
  * @property forNewWatchers この tick に新しく見に来たプレイヤー全員に送るもの（キーフレーム）。空なら送らない
  */
+@ApiStatus.Internal
 public class ScreenSyncFlush(
     @JvmField public val forWatchers: List<ByteArray>,
     @JvmField public val forNewWatchers: List<ByteArray>,
@@ -187,6 +191,7 @@ public class ScreenSyncFlush(
 }
 
 /** [ScreenSyncReceiver] が受け取った内容を書き込む先（クライアントの画面）。 */
+@ApiStatus.Internal
 public interface ScreenSyncTarget {
     /** 文字画面のバッファ。 */
     public val text: TextBuffer
@@ -204,6 +209,7 @@ public interface ScreenSyncTarget {
  *
  * スレッドセーフではない。
  */
+@ApiStatus.Internal
 public class ScreenSyncReceiver {
     private var pending: SyncWriter? = null
 

@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * キーボードが受け取る入力の量の上限（トークンバケット、#142）。クライアントから大量のパケットを送られても、
  * サーバーの処理が増えすぎないようにする。キーボードごとに1つ持つ。
@@ -11,6 +13,7 @@ package pro.ikili.kibicomputers.core.input
  * @param refillPerTick 1 tick ごとに戻る量
  * @throws IllegalArgumentException [capacity] が正でないか、[refillPerTick] が負のとき
  */
+@ApiStatus.Internal
 public class KeyboardInputBudget @JvmOverloads @Throws(IllegalArgumentException::class) constructor(
     public val capacity: Int = DEFAULT_CAPACITY,
     public val refillPerTick: Int = DEFAULT_REFILL_PER_TICK,

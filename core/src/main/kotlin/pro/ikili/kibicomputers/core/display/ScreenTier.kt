@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 画面ブロックのティア。ティアで、その画面が出せる最大の解像度・色数と、ピクセル描画の可否が決まる（#136）。
  *
@@ -15,6 +17,7 @@ package pro.ikili.kibicomputers.core.display
  * @property maxPixelWidth ピクセル画面の最大の幅。ピクセル描画できないティアでは 0
  * @property maxPixelHeight ピクセル画面の最大の高さ。ピクセル描画できないティアでは 0
  */
+@ApiStatus.Internal
 public enum class ScreenTier(
     @JvmField public val level: Int,
     @JvmField public val maxColumns: Int,

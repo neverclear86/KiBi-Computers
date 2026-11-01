@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.input
 
+import org.jetbrains.annotations.ApiStatus
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -21,6 +22,7 @@ import java.nio.charset.StandardCharsets
  * 可変長の整数は LEB128。サーバーは [decode] で読み、形が崩れたもの・上限を超えたものは丸ごと捨てる。
  * 通信の中だけで使う形で、セーブデータには書かない。
  */
+@ApiStatus.Internal
 public object KeyboardEventCodec {
     /** 1つのパケットのバイト数の上限。 */
     public const val MAX_PACKET_BYTES: Int = 16 * 1024

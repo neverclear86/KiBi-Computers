@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * ピクセル画面のバッファ。幅 [width]・高さ [height] のピクセルを持つ。
  *
@@ -11,6 +13,7 @@ package pro.ikili.kibicomputers.core.display
  *
  * スレッドセーフではない。
  */
+@ApiStatus.Internal
 public class PixelBuffer
 @Throws(IllegalArgumentException::class)
 public constructor(width: Int, height: Int) {

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.computer
 
+import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
@@ -9,6 +10,7 @@ import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
 
 /** コンピューター（ケース）の状態。GUI の状態表示に出す（#121）。 */
+@ApiStatus.Internal
 public enum class ComputerStatus {
     /** 電源が切れている */
     OFF,
@@ -24,6 +26,7 @@ public enum class ComputerStatus {
 }
 
 /** [ComputerStatus.ERROR] の理由。 */
+@ApiStatus.Internal
 public enum class ComputerError {
     /** 起動に要る部品が挿さっていない（どれかは [ComputerCase.missingParts]） */
     MISSING_PARTS,
@@ -55,6 +58,7 @@ public enum class ComputerError {
  * @param events マシンからの通知（状態、コンソールの出力、ビープ、起動の失敗、再起動）をそのまま受け取る相手。
  *   ケース自身の処理（CRASHED でエラーにする）の後に呼ぶ。`null` なら渡さない（再起動の求めは、既定どおり前回の設定で起動し直す）
  */
+@ApiStatus.Internal
 public class ComputerCase<K : Any> @JvmOverloads constructor(
     public val tier: CaseTier,
     private val events: MachineHost? = null,

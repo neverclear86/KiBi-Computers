@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.jetbrains.annotations.ApiStatus
+
 /**
  * 起動の設定（接続層 → カーネル。#49）。[Machine.boot] に渡す。[builder] で作る。
  *
@@ -11,6 +13,7 @@ package pro.ikili.kibicomputers.core.kernel
  * machine.boot(config);
  * ```
  */
+@ApiStatus.Internal
 public class BootConfig private constructor(builder: Builder) {
     /** 起動部品が挿さっているか（中身は #99 で足す） */
     public val isFirmwarePresent: Boolean = builder.firmwarePresent
