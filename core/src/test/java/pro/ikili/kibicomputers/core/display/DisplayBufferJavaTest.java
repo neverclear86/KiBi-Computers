@@ -23,6 +23,10 @@ class DisplayBufferJavaTest {
         assertEquals(3, b.getHeight());
         assertEquals(0x0000FF, b.getBackground(0, 0));
         assertEquals(TextBuffer.BLANK, b.copyOf().getCodePoint(0, 0));
+        b.setCursor(2, 1, true);
+        assertEquals(2, b.getCursorX());
+        assertEquals(1, b.getCursorY());
+        assertEquals(true, b.getCursorVisible());
     }
 
     @Test

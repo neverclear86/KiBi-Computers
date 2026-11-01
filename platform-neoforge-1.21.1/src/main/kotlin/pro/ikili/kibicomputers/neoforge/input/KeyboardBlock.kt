@@ -48,8 +48,18 @@ class KeyboardBlock(properties: BlockBehaviour.Properties) : Block(properties), 
     override fun mirror(state: BlockState, mirror: Mirror): BlockState =
         state.rotate(mirror.getRotation(state.getValue(FACING)))
 
+    // 照準の当たり（輪郭）は、ブロックの床全体にする（#348）。キーボードの見た目は奥行きが半分しかないので、
+    // 見た目どおりの形だと、置いた直後の照準（手前の端）が下のブロックに当たり、右クリックしても GUI が開かなかった
     override fun getShape(state: BlockState, level: BlockGetter, pos: BlockPos, context: CollisionContext): VoxelShape =
-        if (state.getValue(FACING).axis == Direction.Axis.X) SHAPE_X else SHAPE_Z
+        OUTLINE
+
+    // ぶつかる形は見た目に合わせる
+    override fun getCollisionShape(
+        state: BlockState,
+        level: BlockGetter,
+        pos: BlockPos,
+        context: CollisionContext,
+    ): VoxelShape = if (state.getValue(FACING).axis == Direction.Axis.X) SHAPE_X else SHAPE_Z
 
     override fun newBlockEntity(pos: BlockPos, state: BlockState): BlockEntity = KeyboardBlockEntity(pos, state)
 
@@ -75,5 +85,8 @@ class KeyboardBlock(properties: BlockBehaviour.Properties) : Block(properties), 
         // 幅 14・奥行き 8・高さ 2（ピクセル）。モデル（models/block/keyboard.json）と合わせる
         private val SHAPE_Z: VoxelShape = box(1.0, 0.0, 4.0, 15.0, 2.0, 12.0)
         private val SHAPE_X: VoxelShape = box(4.0, 0.0, 1.0, 12.0, 2.0, 15.0)
+
+        // 照準の当たり: 床全体で、高さはキーボードと同じ
+        private val OUTLINE: VoxelShape = box(0.0, 0.0, 0.0, 16.0, 2.0, 16.0)
     }
 }

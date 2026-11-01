@@ -1,6 +1,5 @@
 package pro.ikili.kibicomputers.neoforge.client
 
-import com.mojang.blaze3d.platform.NativeImage
 import com.mojang.blaze3d.vertex.PoseStack
 import com.mojang.blaze3d.vertex.VertexConsumer
 import com.mojang.math.Axis
@@ -11,7 +10,6 @@ import net.minecraft.client.renderer.MultiBufferSource
 import net.minecraft.client.renderer.RenderType
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer
 import net.minecraft.client.renderer.blockentity.BlockEntityRendererProvider
-import net.minecraft.client.renderer.texture.DynamicTexture
 import net.minecraft.network.chat.Style
 import net.minecraft.resources.ResourceLocation
 import net.minecraft.util.FormattedCharSequence
@@ -25,7 +23,6 @@ import pro.ikili.kibicomputers.core.display.ScreenLayout
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 画面ブロックの正面に、画面バッファの中身を描く（#139）。
@@ -113,12 +110,7 @@ class ScreenRenderer(context: BlockEntityRendererProvider.Context) : BlockEntity
         w: Float,
         h: Float,
     ) {
-        val texture = (be.renderCache as? PixelTexture)?.takeIf { it.fits(pixels) }
-            ?: PixelTexture(pixels.width, pixels.height).also {
-                be.renderCache?.close()
-                be.renderCache = it
-            }
-        texture.update(pixels)
+        val texture = PixelTexture.forScreen(be, pixels)
         val consumer = bufferSource.getBuffer(RenderType.text(texture.location))
         consumer.addVertex(pose, 0f, 0f, Z_PIXELS).setColor(-1).setUv(0f, 0f).setLight(LightTexture.FULL_BRIGHT)
         consumer.addVertex(pose, 0f, h, Z_PIXELS).setColor(-1).setUv(0f, 1f).setLight(LightTexture.FULL_BRIGHT)
@@ -146,57 +138,20 @@ class ScreenRenderer(context: BlockEntityRendererProvider.Context) : BlockEntity
         return toCamera.x * facing.stepX + toCamera.z * facing.stepZ > 0
     }
 
-    /** ピクセル画面のテクスチャ。中身が変わったときだけ送り直す。 */
-    private class PixelTexture(val width: Int, val height: Int) : AutoCloseable {
-        val location: ResourceLocation = ResourceLocation.fromNamespaceAndPath(
-            KiBiComputers.MOD_ID, "dynamic/screen_${NEXT_ID.incrementAndGet()}",
-        )
-        private val texture = DynamicTexture(NativeImage(width, height, false))
-        private val row = IntArray(width)
-        private var revision = -1L
-
-        init {
-            Minecraft.getInstance().textureManager.register(location, texture)
-        }
-
-        fun fits(pixels: PixelBuffer): Boolean = pixels.width == width && pixels.height == height
-
-        fun update(pixels: PixelBuffer) {
-            if (pixels.revision == revision) return
-            revision = pixels.revision
-            val image = texture.pixels ?: return
-            for (y in 0 until height) {
-                pixels.getPixels(0, y, width, 1, row, 0, width)
-                for (x in 0 until width) {
-                    // 0xRRGGBB を NativeImage の ABGR にする
-                    val rgb = row[x]
-                    val abgr = OPAQUE or ((rgb and 0xFF) shl 16) or (rgb and 0xFF00) or ((rgb shr 16) and 0xFF)
-                    image.setPixelRGBA(x, y, abgr)
-                }
-            }
-            texture.upload()
-        }
-
-        override fun close() {
-            Minecraft.getInstance().textureManager.release(location)
-        }
-    }
-
-    private companion object {
-        /** 画面に使うフォント（`assets/kibicomputers/font/terminal.json`）。 */
+    internal companion object {
+        /** 画面に使うフォント（`assets/kibicomputers/font/terminal.json`）。入力 GUI（[KeyboardInputScreen]）も使う。 */
         val FONT: ResourceLocation = ResourceLocation.fromNamespaceAndPath(KiBiComputers.MOD_ID, "terminal")
         val STYLE: Style = Style.EMPTY.withFont(FONT)
-        val NEXT_ID = AtomicInteger()
 
-        const val OPAQUE = 0xFF000000.toInt()
+        private const val OPAQUE = 0xFF000000.toInt()
 
         // ブロックの面から少し浮かせて、面と重ならないようにする（ブロックの単位）
-        const val FACE_OFFSET = 0.002f
+        private const val FACE_OFFSET = 0.002f
 
         // 層ごとの手前へのずれ（フォントの単位。scale を掛けるとブロックの単位になる）
-        const val Z_BASE = 0f
-        const val Z_PIXELS = 0.25f
-        const val Z_BACKGROUND = 0.5f
-        const val Z_GLYPH = 0.75f
+        private const val Z_BASE = 0f
+        private const val Z_PIXELS = 0.25f
+        private const val Z_BACKGROUND = 0.5f
+        private const val Z_GLYPH = 0.75f
     }
 }

@@ -39,6 +39,7 @@ internal object SyncOps {
     const val TEXT_FILL = 3
     const val TEXT_COPY = 4
     const val TEXT_RESIZE = 5
+    const val TEXT_CURSOR = 6
 
     const val PIXEL_SET = 16
     const val PIXEL_FILL = 17

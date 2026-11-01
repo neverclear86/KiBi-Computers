@@ -32,6 +32,18 @@ class AnsiTerminalTest {
     private fun AnsiTerminal.cursor(): Pair<Int, Int> = cursorX to cursorY
 
     @Test
+    fun `publishes cursor to the buffer`() {
+        val t = term()
+        assertFalse(t.buffer.cursorVisible)
+        t.write("ab\r\ncd")
+        assertEquals(Triple(2, 1, true), Triple(t.buffer.cursorX, t.buffer.cursorY, t.buffer.cursorVisible))
+        t.write("\u001b[?25l\u001b[4;5H")
+        assertEquals(Triple(4, 3, false), Triple(t.buffer.cursorX, t.buffer.cursorY, t.buffer.cursorVisible))
+        t.reset()
+        assertEquals(Triple(0, 0, true), Triple(t.buffer.cursorX, t.buffer.cursorY, t.buffer.cursorVisible))
+    }
+
+    @Test
     fun `prints text and handles CR LF`() {
         val t = term()
         t.write("ab\r\ncd")

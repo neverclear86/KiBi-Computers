@@ -26,6 +26,25 @@ class TextBufferTest {
     }
 
     @Test
+    fun `カーソルは置いた位置を覚え変わったときだけ版が上がりcopyOfにも写る`() {
+        val b = TextBuffer(4, 2)
+        assertEquals(false, b.cursorVisible)
+        val r0 = b.revision
+        b.setCursor(3, 1, true)
+        assertEquals(3, b.cursorX)
+        assertEquals(1, b.cursorY)
+        assertEquals(true, b.cursorVisible)
+        val r1 = b.revision
+        assertTrue(r1 > r0)
+        b.setCursor(3, 1, true)
+        assertEquals(r1, b.revision)
+        val c = b.copyOf()
+        assertEquals(3, c.cursorX)
+        assertEquals(true, c.cursorVisible)
+        assertThrows<IllegalArgumentException> { b.setCursor(-1, 0, true) }
+    }
+
+    @Test
     fun `大きさが正でないと作れない`() {
         assertThrows<IllegalArgumentException> { TextBuffer(0, 1) }
         assertThrows<IllegalArgumentException> { TextBuffer(1, -1) }

@@ -27,5 +27,6 @@
   "block.kibicomputers.keyboard": "Keyboard",
   "gui.kibicomputers.keyboard.title": "Keyboard",
   "gui.kibicomputers.keyboard.hint": "Typing on the keyboard - Shift+Esc to stop",
-  "gui.kibicomputers.keyboard.close": "Close"
+  "gui.kibicomputers.keyboard.close": "Close",
+  "gui.kibicomputers.keyboard.no_screen": "No screen is connected to this keyboard"
 }

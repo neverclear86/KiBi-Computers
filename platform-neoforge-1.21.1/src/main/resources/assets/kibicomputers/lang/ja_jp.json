@@ -27,5 +27,6 @@
   "block.kibicomputers.keyboard": "キーボード",
   "gui.kibicomputers.keyboard.title": "キーボード",
   "gui.kibicomputers.keyboard.hint": "キーボードで入力中 - Shift+Esc でやめる",
-  "gui.kibicomputers.keyboard.close": "閉じる"
+  "gui.kibicomputers.keyboard.close": "閉じる",
+  "gui.kibicomputers.keyboard.no_screen": "このキーボードにつながった画面がありません"
 }

@@ -5,10 +5,12 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.mojang.blaze3d.platform.InputConstants
 import com.mojang.logging.LogUtils
+import net.minecraft.client.KeyMapping
 import net.minecraft.client.Minecraft
 import net.minecraft.client.Screenshot
 import net.minecraft.client.gui.components.AbstractWidget
 import net.minecraft.client.gui.components.EditBox
+import net.minecraft.client.gui.screens.TitleScreen
 import net.minecraft.client.tutorial.TutorialSteps
 import net.minecraft.commands.CommandSource
 import net.minecraft.core.BlockPos
@@ -24,6 +26,7 @@ import net.minecraft.world.level.WorldDataConfiguration
 import net.minecraft.world.level.levelgen.WorldOptions
 import net.minecraft.world.level.levelgen.presets.WorldPresets
 import net.minecraft.world.phys.BlockHitResult
+import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
 import net.neoforged.fml.loading.FMLEnvironment
 import org.lwjgl.glfw.GLFW
@@ -69,7 +72,9 @@ object DevDriver {
             "POST /click" -> onMain { click(body) }
             "POST /scroll" -> onMain { scroll(body) }
             "POST /use" -> onMain { use(body) }
+            "POST /rightclick" -> onMain { rightClick() }
             "POST /close" -> onMain { mc().setScreen(null); ok() }
+            "POST /leave" -> onMain { leave() }
             "POST /screenshot" -> onMain { screenshot(body) }
             "POST /screen" -> onMain { screen(body) }
             // クライアントを正常に終了する（このクライアントだけを閉じる）
@@ -112,6 +117,14 @@ object DevDriver {
                 addProperty("x", p.x)
                 addProperty("y", p.y)
                 addProperty("z", p.z)
+            }
+            // 照準の先（右クリックの対象）
+            when (val hit = mc.hitResult) {
+                is BlockHitResult -> if (hit.type != HitResult.Type.MISS) {
+                    addProperty("target", "block ${hit.blockPos.x} ${hit.blockPos.y} ${hit.blockPos.z} ${hit.direction}")
+                }
+                null -> Unit
+                else -> addProperty("target", hit.type.toString())
             }
             addProperty("guiWidth", window.guiScaledWidth)
             addProperty("guiHeight", window.guiScaledHeight)
@@ -245,6 +258,25 @@ object DevDriver {
         val hit = BlockHitResult(Vec3.atCenterOf(pos), face, pos, false)
         val result = gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit)
         return ok { addProperty("result", result.toString()) }
+    }
+
+    // ワールドを保存して出る（タイトル画面に戻る）。同じ名前で world を呼ぶと、保存したワールドに入り直す
+    private fun leave(): DevResponse {
+        val mc = mc()
+        val level = mc.level ?: return DevResponse.error(409, "not in a world")
+        level.disconnect()
+        mc.disconnect()
+        mc.setScreen(TitleScreen())
+        return ok { addProperty("note", "poll /status until screen is TitleScreen") }
+    }
+
+    // 照準の先を、本物の右クリック（使うキー）と同じ経路で右クリックする。向きは command の `tp @s ... facing ...` で変える
+    private fun rightClick(): DevResponse {
+        val mc = mc()
+        if (mc.player == null) return DevResponse.error(409, "no player")
+        if (mc.screen != null) return DevResponse.error(409, "a screen is open")
+        KeyMapping.click(mc.options.keyUse.key)
+        return ok { addProperty("note", "handled on the next client tick; poll /status") }
     }
 
     // Minecraft 自身の描画からスクリーンショットを撮る（ウィンドウを前面に出さない）

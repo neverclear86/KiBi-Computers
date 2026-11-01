@@ -290,6 +290,7 @@ public class ScreenSyncReceiver {
             )
             SyncOps.TEXT_COPY -> text.copy(input.sint(), input.sint(), input.sint(), input.sint(), input.sint(), input.sint())
             SyncOps.TEXT_RESIZE -> text.resize(input.uint(), input.uint())
+            SyncOps.TEXT_CURSOR -> text.setCursor(input.uint(), input.uint(), input.byte() == 1)
             else -> pixelCommand(op, input, target)
         }
     }
