@@ -170,17 +170,17 @@ class HostBoundaryTest {
         Harness().use { h ->
             val host = RecordingHost()
             val m = h.machine(host = host)
-            val max = Machine.MAX_PENDING_CONSOLE_BYTES.toInt()
+            val max = MachineLimits.MAX_PENDING_CONSOLE_BYTES.toInt()
             assertTrue(m.writeConsole(ByteArray(max - 10) { 'a'.code.toByte() }))
             assertFalse(m.writeConsole(ByteArray(30) { 'b'.code.toByte() }))
             assertEquals(20, m.droppedConsoleBytes.get())
             assertFalse(m.writeConsole(byteArrayOf(1)))
-            repeat(Machine.MAX_PENDING_BEEPS) { assertTrue(m.beep(440, 10)) }
+            repeat(MachineLimits.MAX_PENDING_BEEPS) { assertTrue(m.beep(440, 10)) }
             assertFalse(m.beep(440, 10))
             assertEquals(1, m.droppedBeeps.get())
             h.scheduler.tick()
             assertEquals(max, synchronized(host.console) { host.console.size() })
-            assertEquals(Machine.MAX_PENDING_BEEPS, host.log.count { it.startsWith("beep:") })
+            assertEquals(MachineLimits.MAX_PENDING_BEEPS, host.log.count { it.startsWith("beep:") })
             // 配った後はまた積める
             assertTrue(m.writeConsole(ByteArray(max)))
             assertTrue(m.beep(440, 10))

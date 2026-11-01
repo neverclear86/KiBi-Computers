@@ -22,6 +22,9 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class TestComputerTest {
     private val limit = Duration.ofSeconds(60)
 
+    /** 同梱イメージ testboot の起動ディスク */
+    private val testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot"
+
     private fun lines(text: TextBuffer): List<String> = (0 until text.height).map { y ->
         val sb = StringBuilder()
         for (x in 0 until text.width) sb.appendCodePoint(text.getCodePoint(x, y))
@@ -61,10 +64,10 @@ class TestComputerTest {
             assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "pc", { true }, true, MachineConfig.DEFAULT))
             val machine = case.machine!!
             console.machine = machine
-            assertTrue(machine.boot(BootConfig.builder().addBootDisk("missing").addBootDisk(BootConfig.TEST_BOOT_DISK).build()))
+            assertTrue(machine.boot(BootConfig.builder().addBootDisk("missing").addBootDisk(testBootDisk).build()))
 
             manager.tickUntil({ "プロンプトが出ない: ${lines(screen)} ${host.failures}" }) { lines(screen).contains(">") }
-            assertEquals("kibi: booting from disk ${BootConfig.TEST_BOOT_DISK}", lines(screen)[0])
+            assertEquals("kibi: booting from disk ${testBootDisk}", lines(screen)[0])
             assertTrue(lines(screen).contains("KiBi test init"), "${lines(screen)}")
 
             // キーボードの入力: 文字と Enter。KeyUp は何も送らない

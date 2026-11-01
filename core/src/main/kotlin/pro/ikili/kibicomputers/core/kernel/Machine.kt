@@ -119,7 +119,7 @@ public class MachineConfig private constructor(builder: Builder) {
  *
  * カーネルの状態（プロセス表、オブジェクト表、燃料）はマシンごとの1つのロック（カーネルロック）で守る。
  */
-public class Machine internal constructor(
+public class Machine private constructor(
     internal val scheduler: MachineScheduler,
     /** スケジューラの中の番号（保存しない。実行時だけ） */
     public val id: Long,
@@ -423,7 +423,7 @@ public class Machine internal constructor(
      * VFS の実行ファイル [path] を読み込んで、プロセスを作る（#45）。ドライバーは [drivers] が、読み込んだ [Program] から作る。
      *
      * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
-     * - 普通のファイルでなければ `ACCES`、[MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
+     * - 普通のファイルでなければ `ACCES`、[MachineLimits.MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
      * - `options.args` が空なら、argv を [path] の文字列1つにする
      * - ファイルを読むのはカーネルロックの中、WASM の読み込み（パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
      *
@@ -474,7 +474,7 @@ public class Machine internal constructor(
         val path = VfsPath.resolve(parent?.cwd ?: VfsPath.ROOT, text)
         val stat = vfs.stat(path)
         if (stat.type != FileType.REGULAR_FILE) fsError(Errno.ACCES, "$path は普通のファイルではない")
-        if (stat.size > MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 $MAX_EXECUTABLE_BYTES）")
+        if (stat.size > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
         val file = vfs.open(path, OpenOptions(read = true), VfsPath.hasTrailingSlash(text))
         val out = ByteArrayOutputStream(stat.size.toInt())
         val buf = ByteArray(64 * 1024)
@@ -482,7 +482,7 @@ public class Machine internal constructor(
             val n = vfs.read(file, buf, 0, buf.size)
             if (n <= 0) break
             out.write(buf, 0, n)
-            if (out.size() > MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（上限 $MAX_EXECUTABLE_BYTES）")
+            if (out.size() > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
         }
         return out.toByteArray()
     }
@@ -527,7 +527,7 @@ public class Machine internal constructor(
 
     /** コンソールの `Tty` を、なければ作る（カーネルが参照を1つ持ち、閉じない） */
     internal fun ensureConsoleLocked() {
-        if (kernel.consoleTtyId == 0) kernel.consoleTtyId = kernel.objects.add(Tty(CONSOLE_INPUT_BYTES, CONSOLE_OUTPUT_BYTES))
+        if (kernel.consoleTtyId == 0) kernel.consoleTtyId = kernel.objects.add(Tty(MachineLimits.CONSOLE_INPUT_BYTES, MachineLimits.CONSOLE_OUTPUT_BYTES))
     }
 
     /** コンソールの `Tty`（なければ作る） */
@@ -772,7 +772,7 @@ public class Machine internal constructor(
     /** 起動ディスク [diskId] の [volume] を `/` にマウントする（ワーカーのスレッドから）。取り消されていれば何もせず `false` */
     internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean = lock.withLockValue {
         if (bootCancelled) return@withLockValue false
-        vfs.mount(VfsPath.ROOT, volume.fs, volume.readOnly, "$DISK_SOURCE_PREFIX$diskId")
+        vfs.mount(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
         true
     }
 
@@ -824,7 +824,7 @@ public class Machine internal constructor(
     /**
      * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
-     * 配っていない分（CR LF にした後のバイト数）が [MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
+     * 配っていない分（CR LF にした後のバイト数）が [MachineLimits.MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
      * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）
      */
     internal fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean {
@@ -839,7 +839,7 @@ public class Machine internal constructor(
         var accepted: Int
         while (true) {
             val pending = pendingConsoleBytes.get()
-            accepted = (MAX_PENDING_CONSOLE_BYTES - pending).coerceIn(0, length.toLong()).toInt()
+            accepted = (MachineLimits.MAX_PENDING_CONSOLE_BYTES - pending).coerceIn(0, length.toLong()).toInt()
             if (accepted == 0 || pendingConsoleBytes.compareAndSet(pending, pending + accepted)) break
         }
         if (accepted < length) droppedConsoleBytes.addAndGet((length - accepted).toLong())
@@ -864,12 +864,12 @@ public class Machine internal constructor(
 
     /**
      * ビープを鳴らす（次の `tick()` で [MachineHost.onBeep] に渡す）。値は範囲に丸める。どのスレッドから呼んでもよい。
-     * 配っていないビープが [MAX_PENDING_BEEPS] あるなら捨てて `false`
+     * 配っていないビープが [MachineLimits.MAX_PENDING_BEEPS] あるなら捨てて `false`
      */
     internal fun beep(frequencyHz: Int, durationMillis: Int): Boolean {
         while (true) {
             val n = pendingBeeps.get()
-            if (n >= MAX_PENDING_BEEPS) {
+            if (n >= MachineLimits.MAX_PENDING_BEEPS) {
                 droppedBeeps.incrementAndGet()
                 return false
             }
@@ -1000,23 +1000,15 @@ public class Machine internal constructor(
         /** ビープの長さの上限（ミリ秒。仮の値） */
         public const val MAX_BEEP_DURATION_MILLIS: Int = 5_000
 
-        /** 配っていないコンソール出力の上限（バイト。仮の値） */
-        internal const val MAX_PENDING_CONSOLE_BYTES: Long = 64L * 1024
-
-        /** 配っていないビープの上限（仮の値） */
-        internal const val MAX_PENDING_BEEPS: Int = 8
-
-        /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
-        internal const val MAX_EXECUTABLE_BYTES: Int = 16 * 1024 * 1024
-
-        /** コンソールの TTY の入力の上限（読める入力＋編集中の行。仮の値。確定は #251） */
-        internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
-
-        /** コンソールの TTY の出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #251） */
-        internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
-
-        /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
-        internal const val DISK_SOURCE_PREFIX: String = "disk:"
+        /** マシンを作る（[MachineScheduler.createMachine] から呼ぶ）。 */
+        @JvmSynthetic
+        internal fun create(
+            scheduler: MachineScheduler,
+            id: Long,
+            host: MachineHost,
+            config: MachineConfig,
+            environment: MachineEnvironment,
+        ): Machine = Machine(scheduler, id, host, config, environment)
 
         /** 起動の始めに、前のスレッドを待つときの見直しの間隔 */
         private const val BOOT_WAIT_NANOS: Long = 10_000_000
@@ -1024,6 +1016,27 @@ public class Machine internal constructor(
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D
     }
+}
+
+/** マシンの内部の上限など（公開 API の外） */
+internal object MachineLimits {
+    /** 配っていないコンソール出力の上限（バイト。仮の値） */
+    internal const val MAX_PENDING_CONSOLE_BYTES: Long = 64L * 1024
+
+    /** 配っていないビープの上限（仮の値） */
+    internal const val MAX_PENDING_BEEPS: Int = 8
+
+    /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
+    internal const val MAX_EXECUTABLE_BYTES: Int = 16 * 1024 * 1024
+
+    /** コンソールの TTY の入力の上限（読める入力＋編集中の行。仮の値。確定は #251） */
+    internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
+
+    /** コンソールの TTY の出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #251） */
+    internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
+
+    /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
+    internal const val DISK_SOURCE_PREFIX: String = "disk:"
 }
 
 /**

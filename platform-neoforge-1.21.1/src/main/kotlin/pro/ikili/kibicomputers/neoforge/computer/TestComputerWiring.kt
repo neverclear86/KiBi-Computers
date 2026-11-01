@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
  * テスト用コンピューターの仮の結線（#307）。ケース1つにつき1つ持ち、サーバーでだけ使う。
  *
  * - 起動部品は挿さっているとみなす（[withBootPart]）。置き換え先: 起動部品のアイテム #125、ファームウェア #99
- * - 起動ディスクは同梱イメージ（[BootConfig.TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
+ * - 起動ディスクは同梱イメージ（[TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
  *   コンソールの出力を画面に、キーボードの入力をコンソールに流す（[MachineConsole]）。動いている間に置いた・壊したものは見ない。
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
@@ -83,8 +83,14 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     companion object {
+        /**
+         * テスト用コンピューターの起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は、入力した行をそのまま返す。
+         * 標準OS（#98）と起動部品（#99）ができたら置き換える
+         */
+        const val TEST_BOOT_DISK: String = BootConfig.IMAGE_DISK_PREFIX + "testboot"
+
         /** 仮の起動の設定: 起動部品あり、起動ディスクは同梱イメージ testboot */
-        val BOOT_CONFIG: BootConfig = BootConfig.builder().firmwarePresent(true).addBootDisk(BootConfig.TEST_BOOT_DISK).build()
+        val BOOT_CONFIG: BootConfig = BootConfig.builder().firmwarePresent(true).addBootDisk(TEST_BOOT_DISK).build()
 
         /** 起動部品（#125）のスロットは、挿さっているとみなす */
         fun withBootPart(tier: CaseTier, parts: InstalledParts): InstalledParts =

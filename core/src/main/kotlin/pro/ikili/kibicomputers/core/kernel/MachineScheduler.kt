@@ -27,7 +27,7 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * スレッド: [tick] はメインスレッドから呼ぶ。ほかはどのスレッドから呼んでもよい（[awaitTermination] はカーネルのスレッドから呼べない）。
  */
-public class MachineScheduler internal constructor(
+public class MachineScheduler private constructor(
     /** 設定 */
     public val config: SchedulerConfig,
     internal val options: SchedulerInternals,
@@ -35,6 +35,12 @@ public class MachineScheduler internal constructor(
     /** [config] の設定でスケジューラを作る。ディスパッチャーのスレッドが動き始める */
     @JvmOverloads
     public constructor(config: SchedulerConfig = SchedulerConfig.DEFAULT) : this(config, SchedulerInternals())
+
+    internal companion object {
+        /** 内部の設定（テスト用の差し替え）を付けてスケジューラを作る。 */
+        @JvmSynthetic
+        internal fun create(config: SchedulerConfig, options: SchedulerInternals): MachineScheduler = MachineScheduler(config, options)
+    }
 
     internal val permits = Semaphore(config.maxConcurrentMachines, true)
     private val tickCounter = AtomicLong()
@@ -102,7 +108,7 @@ public class MachineScheduler internal constructor(
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
     ): Machine {
         check(!closed) { "スケジューラは閉じている" }
-        val machine = Machine(this, nextMachineId.getAndIncrement(), host, config, environment)
+        val machine = Machine.create(this, nextMachineId.getAndIncrement(), host, config, environment)
         machines[machine.id] = machine
         if (closed) {
             machines.remove(machine.id)
