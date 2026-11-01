@@ -24,7 +24,10 @@ internal object FuelCosts {
     /** `table.copy`・`table.fill`・`table.init`・`table.grow`: 要素の数を右にこれだけずらした分（1 要素で 1） */
     const val TABLE_ELEMENTS_SHIFT: Int = 0
 
-    /** `memory.grow`: 増やすページ数を左にこれだけずらした分（1 ページ = 64 KiB を `memory.fill` したのと同じ 8,192） */
+    /**
+     * `memory.grow`: 増えたページ数を左にこれだけずらした分（1 ページ = 64 KiB を `memory.fill` したのと同じ 8,192）。
+     * `memory.grow`・`table.grow` は、実行した後に実際に増えた分だけを引く（失敗して -1 を返したら 0。#335）
+     */
     const val MEMORY_GROW_PAGE_SHIFT: Int = 13
 }
 
@@ -42,6 +45,7 @@ internal object FuelCosts {
  * - 残りが負かを確かめて [WasmFuel.IMPORT_NAME] を呼ぶのは、関数の入口と `loop` の先頭だけ。
  *   終わらない実行は必ずどちらかを通るので、確かめる間に実行される命令は関数 1 つの長さで抑えられる
  * - 長さに比例する命令（[FuelCosts]）は、その命令の直前で、スタックの一番上にある長さを読んで引く
+ *   （上限は設けない）。`memory.grow`・`table.grow` だけは、命令の後で実際に増えた分を引く（失敗したら引かない）
  *
  * 残りの置き場所: 関数の中ではローカル変数に写し、ほかの関数を呼ぶ前・戻る前・例外を投げる前にグローバルへ書き戻し、
  * 呼び出しから戻った後にグローバルから読み直す。ホストの関数（システムコール）は、呼ばれている間にグローバルを読み書きして燃料を課せる。
@@ -130,7 +134,7 @@ internal object FuelInjector {
         }
 
         // セクションの並び順を保ったまま、無いセクション（型・import・グローバル・export）は決まった位置に作る
-        val order = listOf(SEC_TYPE, SEC_IMPORT, 3, SEC_TABLE, 5, SEC_GLOBAL, 13, SEC_EXPORT, SEC_START, SEC_ELEMENT, 12, SEC_CODE, 11)
+        val order = listOf(SEC_TYPE, SEC_IMPORT, 3, SEC_TABLE, 5, SEC_TAG, SEC_GLOBAL, SEC_EXPORT, SEC_START, SEC_ELEMENT, 12, SEC_CODE, 11)
         val created = HashSet<Int>()
         fun insertMissingBefore(id: Int) {
             val pos = if (id == Int.MAX_VALUE) Int.MAX_VALUE else order.indexOf(id)
@@ -257,7 +261,7 @@ internal object FuelInjector {
 
     /**
      * 長さに比例する命令と、長さを燃料にする変換（正なら右シフト、負なら左シフトの量）。
-     * どれもスタックの一番上が長さ（i32）。Endive は memory64・table64 に対応していないので、i32 だけを扱う
+     * どれもスタックの一番上が長さ（i32）で、命令の前に引く。Endive は memory64・table64 に対応していないので、i32 だけを扱う
      */
     private val BULK: Map<OpCode, Int> = mapOf(
         OpCode.MEMORY_COPY to FuelCosts.MEMORY_BYTES_SHIFT,
@@ -266,8 +270,15 @@ internal object FuelInjector {
         OpCode.TABLE_COPY to FuelCosts.TABLE_ELEMENTS_SHIFT,
         OpCode.TABLE_FILL to FuelCosts.TABLE_ELEMENTS_SHIFT,
         OpCode.TABLE_INIT to FuelCosts.TABLE_ELEMENTS_SHIFT,
-        OpCode.TABLE_GROW to FuelCosts.TABLE_ELEMENTS_SHIFT,
+    )
+
+    /**
+     * 大きさを増やす命令と、増えた分を燃料にする変換（[BULK] と同じ向き）。失敗すると -1 を返して何も増えないので、
+     * 命令の前に大きさを控え、後で増えた分（失敗なら 0）だけを引く（#335）
+     */
+    private val GROW: Map<OpCode, Int> = mapOf(
         OpCode.MEMORY_GROW to -FuelCosts.MEMORY_GROW_PAGE_SHIFT,
+        OpCode.TABLE_GROW to FuelCosts.TABLE_ELEMENTS_SHIFT,
     )
 
     private class BodyContext(
@@ -298,7 +309,7 @@ internal object FuelInjector {
         val first = instructions.first().address()
         // try_table を含む関数は、ローカルに写さずグローバルで数える（理由は ADR 0028）
         ctx.cached = instructions.none { it.opcode() == OpCode.TRY_TABLE }
-        val hasBulk = instructions.any { it.opcode() in BULK }
+        val hasBulk = instructions.any { it.opcode() in BULK || it.opcode() in GROW }
         var next = ctx.firstNewLocal
         if (ctx.cached) ctx.fuelLocal = next++
         if (hasBulk) ctx.lengthLocal = next
@@ -352,6 +363,7 @@ internal object FuelInjector {
             }
 
             BULK[op]?.let { shift -> out.chargeLength(ctx, shift) }
+            if (op in GROW) out.saveSize(ctx, op, ins.operand(0))
 
             val leaves = when (op) {
                 in CALLS, in EXITS -> true
@@ -378,6 +390,7 @@ internal object FuelInjector {
 
             // 呼び出しから戻ったら読み直す（呼んだ先・ホストの関数が使った分がグローバルにある）
             if (ctx.cached && op in CALLS) out.loadLocal(ctx)
+            GROW[op]?.let { shift -> out.chargeGrown(ctx, op, ins.operand(0), shift) }
 
             when (op) {
                 OpCode.BLOCK, OpCode.LOOP, OpCode.IF, OpCode.TRY_TABLE -> depth++
@@ -449,6 +462,7 @@ internal object FuelInjector {
     private const val SEC_START = 8
     private const val SEC_ELEMENT = 9
     private const val SEC_CODE = 10
+    private const val SEC_TAG = 13
 
     private class Section(val id: Int, val start: Int, val end: Int)
 
@@ -545,10 +559,44 @@ internal object FuelInjector {
         set(ctx)
     }
 
-    /** スタックの一番上の長さ（i32。そのまま残す）を [shift] で燃料にして引く: `fuel -= u64(len) >> shift`（負なら `<< -shift`） */
+    /** スタックの一番上の長さ（i32。そのまま残す）を [shift] で燃料にして引く（[chargeSaved]） */
     private fun Sink.chargeLength(ctx: BodyContext, shift: Int) {
         u8(0x22) // local.tee
         leb(ctx.lengthLocal.toLong())
+        chargeSaved(ctx, shift)
+    }
+
+    /** `memory.size`・`table.size` で、[op] が増やすメモリ・テーブル [index] の今の大きさを積む */
+    private fun Sink.size(op: OpCode, index: Long) {
+        if (op == OpCode.MEMORY_GROW) {
+            u8(0x3F) // memory.size
+        } else {
+            u8(0xFC)
+            leb(16) // table.size
+        }
+        leb(index)
+    }
+
+    /** `memory.grow`・`table.grow` の前: 今の大きさを控える（スタックはそのまま） */
+    private fun Sink.saveSize(ctx: BodyContext, op: OpCode, index: Long) {
+        size(op, index)
+        u8(0x21) // local.set
+        leb(ctx.lengthLocal.toLong())
+    }
+
+    /** `memory.grow`・`table.grow` の後: 増えた分（失敗なら 0）を [shift] で燃料にして引く（スタックの戻り値はそのまま） */
+    private fun Sink.chargeGrown(ctx: BodyContext, op: OpCode, index: Long, shift: Int) {
+        size(op, index)
+        u8(0x20) // local.get
+        leb(ctx.lengthLocal.toLong())
+        u8(0x6B) // i32.sub
+        u8(0x21) // local.set
+        leb(ctx.lengthLocal.toLong())
+        chargeSaved(ctx, shift)
+    }
+
+    /** 控えた長さ `len`（i32、符号なし）を [shift] で燃料にして引く: `fuel -= u64(len) >> shift`（負なら `<< -shift`） */
+    private fun Sink.chargeSaved(ctx: BodyContext, shift: Int) {
         get(ctx)
         u8(0x20) // local.get
         leb(ctx.lengthLocal.toLong())
