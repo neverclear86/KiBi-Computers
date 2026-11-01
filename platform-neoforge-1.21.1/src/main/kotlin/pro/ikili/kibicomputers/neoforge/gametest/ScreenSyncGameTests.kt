@@ -7,11 +7,14 @@ import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ClientInformation
 import net.minecraft.server.level.ServerPlayer
+import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.HumanoidArm
 import net.minecraft.world.entity.player.ChatVisiblity
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.portal.DimensionTransition
+import net.minecraft.world.phys.Vec3
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -272,6 +275,106 @@ object ScreenSyncGameTests {
                 cleanUp(helper, player)
             }
             .thenSucceed()
+    }
+
+    /** ログアウトすると、すべての画面の見ている人と、送信量の勘定から外れる（#382）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun logoutForgetsPlayerOnAllScreens(helper: GameTestHelper) {
+        val other = POS.west()
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
+        helper.setBlock(other, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
+        val a = helper.getBlockEntity<ScreenBlockEntity>(POS)
+        val b = helper.getBlockEntity<ScreenBlockEntity>(other)
+        val (player, _) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(a.isWatchedBy(player) && b.isWatchedBy(player), "the player should watch both screens")
+                helper.assertTrue(ScreenSync.traffic.bytesSent(player) > 0, "sent bytes should be counted")
+            }
+            .thenExecute {
+                // PlayerList.remove が PlayerLoggedOutEvent を出す
+                cleanUp(helper, player)
+                helper.assertTrue(!a.isWatchedBy(player) && !b.isWatchedBy(player), "logout should drop the player from all screens")
+                helper.assertTrue(ScreenSync.traffic.bytesSent(player) == 0L, "logout should drop the player's traffic")
+                helper.assertTrue(ScreenSync.traffic.keyframesSent(player) == 0L, "logout should drop the player's keyframes")
+            }
+            .thenSucceed()
+    }
+
+    /** リスポーンで ServerPlayer が替わると、古いオブジェクトは見ている人と勘定から外れる（#382）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun respawnForgetsOldPlayerObject(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
+        val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
+        val (player, client) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(be.isWatchedBy(player), "the player should be watching")
+                helper.assertTrue(ScreenSync.traffic.bytesSent(player) > 0, "sent bytes should be counted")
+            }
+            .thenExecute {
+                val respawned = helper.level.server.playerList.respawn(player, false, Entity.RemovalReason.KILLED)
+                clients[respawned] = client
+                clients.remove(player)
+                helper.assertTrue(respawned !== player, "respawning should create a new player object")
+                helper.assertTrue(!be.isWatchedBy(player), "the old player object should not be watching")
+                helper.assertTrue(ScreenSync.traffic.bytesSent(player) == 0L, "the old player object should not be counted")
+                helper.assertTrue(ScreenSync.traffic.keyframesSent(player) == 0L, "the old player's keyframes should be dropped")
+                cleanUp(helper, respawned)
+            }
+            .thenSucceed()
+    }
+
+    /** ディメンションを移ると、元のディメンションの画面の見ている人から外れる。勘定は残る（#382）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun changingDimensionStopsWatching(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
+        val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
+        val (player, _) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        helper.startSequence()
+            .thenWaitUntil { helper.assertTrue(be.isWatchedBy(player), "the player should be watching") }
+            .thenExecute {
+                val nether = helper.level.server.getLevel(Level.NETHER)
+                helper.assertTrue(nether != null, "the nether should exist on the test server")
+                val sent = ScreenSync.traffic.bytesSent(player)
+                val moved = player.changeDimension(
+                    DimensionTransition(nether!!, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
+                )
+                helper.assertTrue(moved === player, "a player keeps its object when changing dimension")
+                helper.assertTrue(player.level() === nether, "the player should be in the nether")
+                helper.assertTrue(!be.isWatchedBy(player), "changing dimension should stop watching at once")
+                helper.assertTrue(ScreenSync.traffic.bytesSent(player) == sent, "the traffic of the same player should stay")
+            }
+            .thenIdle(1)
+            .thenExecute {
+                helper.assertTrue(!be.isWatchedBy(player), "a player in another dimension should not start watching")
+                cleanUp(helper, player)
+            }
+            .thenSucceed()
+    }
+
+    /** 送り直しのお願いは、遠い座標や読み込まれていない座標なら、ブロックエンティティを探す前に捨てる（#382）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun resyncRequestsForFarOrUnloadedPositionsAreDroppedEarly(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
+        val (player, _) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        val abs = helper.absolutePos(POS)
+        fun outcome(pos: BlockPos) = ScreenSync.handleResync(player, ScreenResyncPayload(pos))
+        helper.assertTrue(outcome(abs) == ScreenSync.ResyncOutcome.FORWARDED, "a nearby screen should get the request")
+        helper.assertTrue(outcome(abs.east()) == ScreenSync.ResyncOutcome.NO_SCREEN, "a nearby non-screen should be dropped")
+        val far = abs.offset((STOP + 32.0).toInt(), 0, 0)
+        helper.assertTrue(outcome(far) == ScreenSync.ResyncOutcome.TOO_FAR, "a far position should be dropped first")
+        // ワールドの高さの外は読み込まれていない。プレイヤーを近くに置いて、距離では捨てられないようにする
+        val top = helper.level.maxBuildHeight
+        player.teleportTo(abs.x + 0.5, top + 1.0, abs.z + 0.5)
+        val above = BlockPos(abs.x, top + 2, abs.z)
+        helper.assertTrue(outcome(above) == ScreenSync.ResyncOutcome.NOT_LOADED, "an unloaded position should be dropped")
+        cleanUp(helper, player)
+        helper.succeed()
     }
 
     /** 同期のパケットは、ディメンション・位置・バイト列をそのまま運ぶ。 */

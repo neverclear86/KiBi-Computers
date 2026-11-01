@@ -168,6 +168,20 @@ class ScreenWatchersTest {
     }
 
     @Test
+    fun `removed player can start again without waiting for the interval`() {
+        val w = watchers(resync = 40, scan = 10)
+        val p = Player("p", 5.0)
+        host.players += p
+        w.tick(0, sender, host, traffic)
+        assertEquals(1, host.keyframes(p))
+        // ディメンションを移って戻ってきたときなど。クライアントの画面は作り直されているので、すぐに画面全体を送る
+        w.remove(p)
+        w.tick(10, sender, host, traffic)
+        assertTrue(w.isWatching(p))
+        assertEquals(2, host.keyframes(p))
+    }
+
+    @Test
     fun `traffic forget and clear`() {
         val t = ScreenSyncTraffic<String>()
         t.recordBytes("a", 10)

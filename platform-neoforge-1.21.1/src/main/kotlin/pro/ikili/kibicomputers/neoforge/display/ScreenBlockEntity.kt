@@ -96,7 +96,7 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         watchers.requestResync(player, level.gameTime)
     }
 
-    /** サーバー: [player] を見ている人から外す（ログアウトしたとき）。 */
+    /** サーバー: [player] を見ている人から外す（ログアウト、リスポーン、ディメンションの移動のとき）。 */
     fun forget(player: ServerPlayer) {
         watchers.remove(player)
     }
