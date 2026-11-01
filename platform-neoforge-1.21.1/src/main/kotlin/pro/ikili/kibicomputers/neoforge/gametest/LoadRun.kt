@@ -52,8 +52,10 @@ internal enum class LoadPhase(val label: String) {
  * @property busy 計算・出力させる台数（それぞれ）
  * @property paced 実際のサーバーと同じく 1 tick を 50 ms にそろえるか。GameTest のサーバーは待たずに tick を進めるので、
  *   そろえないと計算している台に配る燃料（tick ごと）が実際より多くなる
- * @property warmupTicks 段階が変わってから、測りはじめるまでの tick 数
+ * @property warmupTicks 段階が変わってから（[LoadPhase.OUTPUT] では、出力が出てから）、測りはじめるまでの tick 数
  * @property measureTicks 測る tick 数
+ * @property bootTimeoutTicks 全台がプロンプトを出すまで待つ上限
+ * @property outputTimeoutTicks [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまで待つ上限。出なければ失敗
  */
 internal data class LoadSettings(
     val count: Int,
@@ -62,6 +64,7 @@ internal data class LoadSettings(
     val warmupTicks: Int,
     val measureTicks: Int,
     val bootTimeoutTicks: Int = if (paced) 150_000 else 15_000,
+    val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
 )
 
 /** tick の時間の統計（ミリ秒）。 */
@@ -116,6 +119,8 @@ internal class LoadReport(
     val powerOnMillis: Double,
     /** 計算している台の電源を切るのにかかった時間（1 tick の中） */
     val powerOffMillis: Double,
+    /** [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまでの tick 数（この後から測る） */
+    val outputWaitTicks: Int,
     /** 並べる前に GC したあとのヒープ使用量 */
     val baselineHeapBytes: Long,
     val phases: List<PhaseResult>,
@@ -131,6 +136,7 @@ internal class LoadReport(
         val sb = StringBuilder()
         sb.append(String.format(Locale.ROOT, "- 台数: %d（計算・出力はそれぞれ %d 台）、tick を 50 ms にそろえる: %s\n", s.count, s.busy, s.paced))
         sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台の電源を切る: %.1f ms（それぞれ 1 tick の中）\n", placeMillis, powerOnMillis, powerOffMillis))
+        sb.append(String.format(Locale.ROOT, "- 出力させる台が全部、画面に出すまで: %d tick（ここから「一部が出力し続ける」を測る）\n", outputWaitTicks))
         sb.append(
             String.format(
                 Locale.ROOT,
@@ -186,6 +192,10 @@ internal class LoadRun(
 
     private var phase: LoadPhase? = null
     private var phaseTick = 0
+
+    /** 測りはじめの基準にする、段階の中の tick。`null` なら、まだ出力を待っている（[awaitOutput]） */
+    private var measureFrom: Int? = 0
+    private var outputWaitTicks = 0
     private var phaseStartNanos = 0L
     private var recording = false
     private var samples = LongArray(1024)
@@ -291,15 +301,36 @@ internal class LoadRun(
     }
 
     private fun steady(p: LoadPhase) {
-        if (phaseTick == settings.warmupTicks) {
+        val from = measureFrom ?: return awaitOutput()
+        val t = phaseTick - from
+        if (t == settings.warmupTicks) {
             recording = true
             countSent = true
             threads.resetPeakThreadCount()
             peakKernelThreads = 0
         }
         if (recording && phaseTick % 10 == 0) peakKernelThreads = maxOf(peakKernelThreads, kernelThreads())
-        if (phaseTick == settings.warmupTicks + settings.measureTicks) next(p)
+        if (t == settings.warmupTicks + settings.measureTicks) next(p)
     }
+
+    /**
+     * [LoadPhase.OUTPUT] のはじめ: 出力させる台が全部、画面に数字を出すまで待ってから測りはじめる。
+     * GameTest のサーバーは tick の間で待たないので、測る tick 数だけでは実時間が足りないことがある
+     * （CPU の枠が少ない環境では、10 台が順に枠を待つ。CI のランナーは2コアで枠が1つ）
+     */
+    private fun awaitOutput() {
+        if (phaseTick % 10 != 0) return
+        val waiting = outputSet.count { !showsOutput(it) }
+        if (waiting == 0) {
+            measureFrom = phaseTick
+            outputWaitTicks = phaseTick
+        } else if (phaseTick >= settings.outputTimeoutTicks) {
+            val c = outputSet.first { !showsOutput(it) }
+            fail("$waiting of ${outputSet.size} output machines showed nothing within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
+        }
+    }
+
+    private fun showsOutput(c: Computer): Boolean = lines(c.screen.text).any { line -> line.isNotEmpty() && line.all { it.isDigit() } }
 
     private fun setUp(p: LoadPhase) {
         when (p) {
@@ -348,11 +379,11 @@ internal class LoadRun(
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a computing machine stopped: ${lines(c.screen.text)}")
                 val text = lines(c.screen.text)
                 // 計算している間はプロンプトに戻らない
-                if (text.last { it.isNotEmpty() } != "> while true do end") fail("the loop should keep running: $text")
+                if (text.lastOrNull { it.isNotEmpty() } != "> while true do end") fail("the loop should keep running: $text")
             }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
-                if (lines(c.screen.text).none { line -> line.isNotEmpty() && line.all { it.isDigit() } }) fail("output should be shown: ${lines(c.screen.text)}")
+                if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
             }
         }
     }
@@ -360,6 +391,7 @@ internal class LoadRun(
     private fun enter(p: LoadPhase) {
         phase = p
         phaseTick = -1 // step() が 0 にする
+        measureFrom = if (p == LoadPhase.OUTPUT) null else 0
         phaseStartNanos = System.nanoTime()
         recording = false
         countSent = false
@@ -396,7 +428,7 @@ internal class LoadRun(
     }
 
     private fun done() {
-        val report = LoadReport(settings, placeMillis, powerOnMillis, powerOffMillis, baselineHeap, results.toList())
+        val report = LoadReport(settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList())
         cleanUp()
         onDone(report)
         helper.succeed()

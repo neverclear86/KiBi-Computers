@@ -57,7 +57,8 @@ object LoadGameTests {
      */
     private const val CI_MAX_IDLE_KERNEL_THREADS = 8
 
-    private const val CI_TIMEOUT_TICKS = 20_000
+    /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
+    private const val CI_TIMEOUT_TICKS = 30_000
     private const val MEASURE_TIMEOUT_TICKS = 200_000
 
     /** 実際のサーバーの1 tick（20 TPS） */
