@@ -58,6 +58,13 @@ neoForge {
         register("gameTestServer") {
             type = "gameTestServer"
         }
+        // ゲームの中での多数台の負荷試験（#345。docs/load-test.md）。測定用のテストだけを動かす。
+        // 台数は -PloadTestCounts=100,500,1000 で渡す（既定は 1000）。初回のコンパイルを測るため、台数ごとに起動し直すとよい
+        register("loadTestServer") {
+            type = "gameTestServer"
+            systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
+            systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
+        }
         register("data") {
             data()
             programArguments.addAll(
