@@ -67,7 +67,11 @@ class LuaReplMemoryTest {
                 Thread.sleep(1)
                 started.all { (_, host, _) -> host.text().endsWith("\r\n> ") }
             }
-            assertTrue(started.all { (m, _, pid) -> m.stateOf(pid) == ProcessState.WAITING_EVENT })
+            // プロンプトの出力は、プロセスが WAITING_EVENT に移る直前に出る。状態が移るのを待つ
+            eventually(30_000L + machines * 200L, "入力待ちにならない") {
+                h.scheduler.tick()
+                started.all { (m, _, pid) -> m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            }
             val after = usedHeap()
 
             var declared = 0L

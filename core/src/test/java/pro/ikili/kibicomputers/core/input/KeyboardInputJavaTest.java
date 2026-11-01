@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -58,11 +59,29 @@ class KeyboardInputJavaTest {
     @Test
     void listenerAsLambda() {
         List<KeyboardEvent> got = new ArrayList<>();
-        KeyboardListener listener = got::add;
-        KeyboardListener lambda = ev -> got.add(ev);
-        listener.onKeyboardEvent(new KeyboardEvent.Text("a"));
-        lambda.onKeyboardEvent(new KeyboardEvent.KeyUp(Key.B, KeyModifiers.NONE));
+        KeyboardListener lambda = (typist, ev) -> got.add(ev);
+        UUID typist = new UUID(0L, 1L);
+        lambda.onKeyboardEvent(typist, new KeyboardEvent.Text("a"));
+        lambda.onKeyboardEvent(typist, new KeyboardEvent.KeyUp(Key.B, KeyModifiers.NONE));
         assertEquals(2, got.size());
+    }
+
+    @Test
+    void sessionFromJava() {
+        UUID typist = new UUID(0L, 2L);
+        KeyboardSession defaults = new KeyboardSession(1, typist);
+        assertEquals(KeyboardInputBudget.DEFAULT_CAPACITY, defaults.getBudget().getCapacity());
+        KeyboardSession session = new KeyboardSession(2, typist, new KeyboardInputBudget(1000, 0));
+        assertEquals(2, session.getId());
+        assertEquals(typist, session.getTypist());
+        byte[] data = KeyboardEventCodec.encode(List.of(new KeyboardEvent.KeyDown(Key.A, KeyModifiers.NONE, false))).get(0);
+        List<KeyboardEvent> got = session.receive(data, 0L);
+        assertEquals(1, got.size());
+        assertTrue(session.getHeldKeys().contains(Key.A));
+        assertNull(session.receive(new byte[] {(byte) 99}, 0L));
+        assertEquals(List.of(new KeyboardEvent.KeyUp(Key.A, KeyModifiers.NONE)), session.close());
+        assertFalse(session.isOpen());
+        assertNull(session.receive(data, 0L));
     }
 
     @Test

@@ -8,6 +8,7 @@ import net.minecraft.client.gui.screens.Screen
 import net.minecraft.core.BlockPos
 import net.minecraft.client.renderer.LightTexture
 import net.minecraft.network.chat.Component
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload
 import net.minecraft.util.FormattedCharSequence
 import net.neoforged.neoforge.network.PacketDistributor
 import org.lwjgl.glfw.GLFW
@@ -24,6 +25,7 @@ import pro.ikili.kibicomputers.core.input.Utf16Joiner
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
+import pro.ikili.kibicomputers.neoforge.input.KeyboardClosePayload
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInputPayload
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -38,10 +40,12 @@ import kotlin.math.floor
  * - つながった画面の中身（文字・色・ピクセル画面・カーソル）を、ウィンドウに収まる大きさに拡大して描く（#348）。
  *   画面が見つからなければ、その旨を出す。画面の外側は暗くしない（後ろの世界が見えるように）。ゲームも止めない
  * - 送るのは client tick ごとに1回まとめて
+ * - サーバーが開いたセッション [session] でだけ開く（#360）。閉じたらサーバーに知らせる。サーバーが閉じたら閉じる
  *
+ * @param session サーバーが作った入力のセッションの番号
  * @param initialScreenPos 右クリックした画面（キーボードを直接右クリックしたなら null。そのときは [KeyboardInput.findScreen] で探す）
  */
-class KeyboardInputScreen(val keyboardPos: BlockPos, initialScreenPos: BlockPos?) :
+class KeyboardInputScreen(val session: Int, val keyboardPos: BlockPos, initialScreenPos: BlockPos?) :
     Screen(Component.translatable("$PREFIX.title")) {
 
     /** 中身を描く画面。見つからなければ null。画面が壊れたり置かれたりしたら、tick ごとに探し直す */
@@ -51,6 +55,9 @@ class KeyboardInputScreen(val keyboardPos: BlockPos, initialScreenPos: BlockPos?
     private val pending = ArrayList<KeyboardEvent>()
     private val text = StringBuilder()
     private val joiner = Utf16Joiner()
+
+    /** サーバーがセッションを閉じた（閉じたことを知らせ返さない。入力も送らない） */
+    private var closedByServer = false
 
     /** 押している（離したと送っていない）キー。GLFW のキーコードから、送ったキー */
     private val held = LinkedHashMap<Int, Key>()
@@ -247,7 +254,15 @@ class KeyboardInputScreen(val keyboardPos: BlockPos, initialScreenPos: BlockPos?
         held.clear()
         joiner.reset()
         flush()
+        if (!closedByServer) send(KeyboardClosePayload(session))
         super.removed()
+    }
+
+    /** サーバーがセッションを閉じた。GUI を閉じる（キーの離しはサーバーが合成する）。 */
+    fun closedByServer() {
+        closedByServer = true
+        pending.clear()
+        onClose()
     }
 
     private fun paste() {
@@ -267,13 +282,15 @@ class KeyboardInputScreen(val keyboardPos: BlockPos, initialScreenPos: BlockPos?
     private fun flush() {
         flushText()
         if (pending.isEmpty()) return
-        val connection = minecraft?.connection
-        if (connection != null && connection.hasChannel(KeyboardInputPayload.TYPE)) {
-            for (data in KeyboardEventCodec.encode(pending)) {
-                PacketDistributor.sendToServer(KeyboardInputPayload(keyboardPos, data))
-            }
+        if (!closedByServer) {
+            for (data in KeyboardEventCodec.encode(pending)) send(KeyboardInputPayload(session, data))
         }
         pending.clear()
+    }
+
+    private fun send(payload: CustomPacketPayload) {
+        val connection = minecraft?.connection ?: return
+        if (connection.hasChannel(payload)) PacketDistributor.sendToServer(payload)
     }
 
     private companion object {

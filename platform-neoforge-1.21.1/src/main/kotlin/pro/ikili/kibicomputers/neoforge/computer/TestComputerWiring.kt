@@ -16,6 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
+import java.util.UUID
 
 /**
  * テスト用コンピューターの仮の結線（#307）。ケース1つにつき1つ持ち、サーバーでだけ使う。
@@ -24,6 +25,7 @@ import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
  * - 起動ディスクは同梱イメージ（[TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
  *   コンソールの出力を画面に、キーボードの入力をコンソールに流す（[MachineConsole]）。動いている間に置いた・壊したものは見ない。
+ *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
@@ -51,14 +53,15 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
                 it.reset()
                 it.machine = machine
             }
-            keyboard = findKeyboard(level, casePos, screen.blockPos)?.also { it.addListener(this) }
+            // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
+            keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
         }
         machine.boot(BOOT_CONFIG)
     }
 
     /** 電源が切れた・ケースが消える。画面とキーボードから外す（画面の中身はそのまま残す）。 */
     fun disconnect() {
-        keyboard?.removeListener(this)
+        keyboard?.release(this)
         keyboard = null
         screen = null
         console?.machine = null
@@ -78,7 +81,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         console?.write(bytes)
     }
 
-    override fun onKeyboardEvent(event: KeyboardEvent) {
+    override fun onKeyboardEvent(typist: UUID, event: KeyboardEvent) {
         console?.keyboardInput(event)
     }
 
