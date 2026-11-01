@@ -18,10 +18,14 @@ public object KeyboardText {
     /**
      * クリップボードの文字列を、貼り付けで送れる形にする。改行（CR LF・CR）を LF にそろえ、タブと LF のほかの制御文字と
      * 対になっていないサロゲートを除き、UTF-8 で [maxBytes] バイトまでに切り詰める（文字の途中では切らない）。
+     *
+     * @throws IllegalArgumentException [maxBytes] が負のとき
      */
     @JvmStatic
     @JvmOverloads
+    @Throws(IllegalArgumentException::class)
     public fun sanitizePaste(raw: String, maxBytes: Int = MAX_PASTE_BYTES): String {
+        require(maxBytes >= 0) { "maxBytes must not be negative" }
         val sb = StringBuilder(minOf(raw.length, maxBytes))
         var bytes = 0
         var i = 0
@@ -55,8 +59,7 @@ public object KeyboardText {
     }
 
     /** 制御文字（C0・DEL・C1）か。 */
-    @JvmStatic
-    public fun isControl(codePoint: Int): Boolean = codePoint < 0x20 || codePoint in 0x7F..0x9F
+    internal fun isControl(codePoint: Int): Boolean = codePoint < 0x20 || codePoint in 0x7F..0x9F
 
     private fun isClean(text: String, allowLayout: Boolean): Boolean {
         var i = 0

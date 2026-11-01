@@ -9,8 +9,9 @@ package pro.ikili.kibicomputers.core.input
  *
  * @param capacity ためておける量（一度に受け取れる最大）。1回の貼り付けのパケットより大きくする
  * @param refillPerTick 1 tick ごとに戻る量
+ * @throws IllegalArgumentException [capacity] が正でないか、[refillPerTick] が負のとき
  */
-public class KeyboardInputBudget @JvmOverloads constructor(
+public class KeyboardInputBudget @JvmOverloads @Throws(IllegalArgumentException::class) constructor(
     public val capacity: Int = DEFAULT_CAPACITY,
     public val refillPerTick: Int = DEFAULT_REFILL_PER_TICK,
 ) {
@@ -30,7 +31,10 @@ public class KeyboardInputBudget @JvmOverloads constructor(
 
     /**
      * [tick] の時点で [bytes] を使う。足りなければ使わずに false を返す（そのパケットは捨てる）。
+     *
+     * @throws IllegalArgumentException [bytes] が負のとき
      */
+    @Throws(IllegalArgumentException::class)
     public fun tryConsume(bytes: Int, tick: Long): Boolean {
         require(bytes >= 0) { "bytes must not be negative" }
         refill(tick)

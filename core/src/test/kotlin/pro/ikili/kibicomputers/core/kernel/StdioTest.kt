@@ -130,8 +130,8 @@ class StdioTest {
                 got += signal to fg
             }
             m.lock.withLockValue { m.consoleTtyLocked().foregroundPid = 7 }
-            val full = ByteArray(Machine.CONSOLE_INPUT_BYTES + 10) { 'x'.code.toByte() }
-            assertEquals(Machine.CONSOLE_INPUT_BYTES - 1, m.offerConsoleInput(full))
+            val full = ByteArray(MachineLimits.CONSOLE_INPUT_BYTES + 10) { 'x'.code.toByte() }
+            assertEquals(MachineLimits.CONSOLE_INPUT_BYTES - 1, m.offerConsoleInput(full))
             assertEquals(2, m.offerConsoleInput(byteArrayOf(0x03, 0x1C)))
             assertEquals(listOf(TtySignal.INTERRUPT to 7, TtySignal.QUIT to 7), got.toList())
             m.lock.withLockValue { assertEquals(0, m.consoleTtyLocked().editingLength) }
@@ -201,7 +201,7 @@ class StdioTest {
         Harness().use { h ->
             val host = ConsoleHost()
             val m = h.machine(host = host)
-            val total = Machine.CONSOLE_OUTPUT_BYTES * 2 + 100
+            val total = MachineLimits.CONSOLE_OUTPUT_BYTES * 2 + 100
             val data = ByteArray(total) { ('a' + it % 26).code.toByte() }
             val pid = m.spawnTest(h.program(emptyModule()), TestDriver(ProcessKind.BLOCKING) { ctx ->
                 var off = 0

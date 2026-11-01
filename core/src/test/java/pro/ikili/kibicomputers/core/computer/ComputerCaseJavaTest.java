@@ -70,9 +70,9 @@ class ComputerCaseJavaTest {
         computer.turnOn(manager, "key", slot -> true, true, MachineConfig.DEFAULT);
         console.setMachine(computer.getMachine());
         assertEquals(1, console.keyboardInput(new KeyboardEvent.Text("a")));
-        BootConfig config = BootConfig.builder().addBootDisk(BootConfig.TEST_BOOT_DISK).build();
-        assertTrue(BootConfig.TEST_BOOT_DISK.startsWith(BootConfig.IMAGE_DISK_PREFIX));
-        assertEquals(List.of(BootConfig.TEST_BOOT_DISK), config.getBootDisks());
+        String testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot";
+        BootConfig config = BootConfig.builder().addBootDisk(testBootDisk).build();
+        assertEquals(List.of(testBootDisk), config.getBootDisks());
         computer.turnOff();
         assertTrue(manager.shutdown(10_000));
     }

@@ -48,15 +48,9 @@ public class BootConfig private constructor(builder: Builder) {
         /**
          * 同梱イメージ（MOD の jar に入れた読み取り専用のイメージ。#55）を表すディスクの識別子の頭。
          * `image:<名前>` は、リソース `/kibicomputers/images/<名前>.zip` のイメージを読み取り専用で開く
-         * （例: [TEST_BOOT_DISK]）。ほかの識別子は [DiskResolver] のディスク
+         * （例: `image:testboot`）。ほかの識別子は [DiskResolver] のディスク
          */
         public const val IMAGE_DISK_PREFIX: String = "image:"
-
-        /**
-         * テスト用コンピューターの起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は、入力した行をそのまま返す。
-         * #307 の仮の結線が使う。標準OS（#98）と起動部品（#99）ができたら置き換える
-         */
-        public const val TEST_BOOT_DISK: String = IMAGE_DISK_PREFIX + "testboot"
 
         /** 設定を組み立て始める。 */
         @JvmStatic
