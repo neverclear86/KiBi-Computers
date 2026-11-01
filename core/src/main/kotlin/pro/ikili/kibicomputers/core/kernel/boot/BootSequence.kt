@@ -20,7 +20,8 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  *
  * 1. 前回の残り（ゾンビ、pid、マウント）を片付ける
  * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]
- * 3. 候補のディスクを順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする
+ * 3. 候補のディスクを順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする。
+ *    続けて空の `/tmp`（メモリ上。#53）をマウントする（根の `/tmp` がディレクトリ以外ならマウントせず、コンソールに書いて続ける）
  * 4. init を pid 1 で作る（親なし、argv は `[INIT_PATH]`、環境変数なし、cwd `/`、標準入出力はコンソール）
  *
  * 途中で取り消されたら、マウントを外して何も知らせずに終える。
@@ -43,6 +44,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
                 machine.endBoot(null, "")
                 return
             }
+            machine.mountTmp()?.let { errno -> machine.writeConsoleLine("kibi: /tmp not mounted (${errno.name})") }
             machine.writeConsoleLine("kibi: booting from disk $diskId")
             machine.scheduler.hooks.beforeInitExec?.invoke(machine)
             startInit()
