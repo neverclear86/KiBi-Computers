@@ -104,6 +104,10 @@ dependencies {
         // 開発環境の実行時クラスパスにも載せる（Kotlin DSL では型安全アクセサが生成されないので文字列で指定）
         "additionalRuntimeClasspath"(lib)
     }
+    // ランタイムコンパイラ（#37）。使う ASM は、ローダーがすでに持っているもの（ゲームのレイヤーに見える）を使うので同梱しない
+    jarJar(libs.endive.compiler) { isTransitive = false }
+    implementation(libs.endive.compiler) { exclude(group = "org.ow2.asm") }
+    "additionalRuntimeClasspath"(libs.endive.compiler) { isTransitive = false }
 }
 
 // dev ソースセットも build でコンパイルする（jar には入れない）

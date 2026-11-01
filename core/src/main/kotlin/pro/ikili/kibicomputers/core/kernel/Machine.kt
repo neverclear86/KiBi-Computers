@@ -62,6 +62,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -510,7 +511,10 @@ public class Machine private constructor(
      *   argv は `[インタプリタ, (シバンの引数), スクリプトの絶対パス, 元の argv[1..]]` にする（Linux と同じ並び。
      *   スクリプトのパスは、WASI に作業ディレクトリがないので絶対パスで渡す）。インタプリタのパスの相対パスも親の作業ディレクトリから辿る。
      *   インタプリタもシバン付きならさらにたどり、[Shebang.MAX_DEPTH] 回を超えたら `LOOP`。拡張子は見ない
-     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（挿入・パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
+     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（変換・挿入・パース・検証・コンパイル）はロックの外の、
+     *   コンパイル用のスレッドで行う（#37）。同じ中身・同じ読み込み方の WASM は、読み込んだ結果をサーバー全体で共有する
+     *   （[pro.ikili.kibicomputers.core.kernel.process.ProgramCache]）。読み込みが終わっていなければ [await] で待つ
+     *   （プロセスからの呼び出しは、CPU と許可を返して待つ）。重いので、メインスレッドからは呼ばない
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
      */
@@ -521,20 +525,35 @@ public class Machine private constructor(
         options: SpawnOptions = SpawnOptions(),
         parentPid: Int = 0,
         asInit: Boolean = false,
+        await: (CompletableFuture<Program>) -> Program = ::awaitProgram,
     ): Int {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
         val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
         val program = try {
             val runtime = scheduler.options.runtime
             val limits = scheduler.options.moduleLimits
-            val bytes = executable.bytes
+            val metered = scheduler.options.meterExecutables
             val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
-            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
+            val future = scheduler.programs.load(executable.bytes, metered, waitImports) { bytes ->
+                if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
+            }
+            // 共有しているものがあれば、待たずに（CPU と許可を持ったまま）使う
+            if (future.isDone) awaitProgram(future) else await(future)
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
         }
         val driver = drivers.create(program)
         return spawn(program, driver, options.copy(args = executable.args), parentPid, asInit)
+    }
+
+    /** 読み込みの終わりをこのスレッドで待つ（起動の手順など、許可を持たないスレッド）。読み込みの例外はそのまま投げる */
+    private fun awaitProgram(future: CompletableFuture<Program>): Program = try {
+        future.get()
+    } catch (e: ExecutionException) {
+        throw e.cause ?: e
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        throw IllegalStateException("WASM の読み込みを待つ間に割り込まれた", e)
     }
 
     /** 読み込む WASM（[path] はそのファイル。シバンをたどった後ならインタプリタ）と、プロセスに渡す argv */

@@ -20,7 +20,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import run.endive.compiler.InterpreterFallback
+import run.endive.compiler.MachineFactoryCompiler
 import run.endive.runtime.ByteBufferMemory
+import run.endive.runtime.CompiledModule
 import run.endive.runtime.ExportFunction
 import run.endive.runtime.GlobalFactory
 import run.endive.runtime.GlobalInstance
@@ -47,14 +50,23 @@ import run.endive.wasm.WasmModule as EndiveModule
 /**
  * Endive による [WasmRuntime]。
  *
- * 今はインタプリタで動かす。ランタイムコンパイラ（#29 の決定）と読み込みの共有は #37 で足す。
+ * [load] でパース・検証の後に、ランタイムコンパイラで JVM のバイトコードにコンパイルする（#29 の決定 B、#37）。
+ * JVM のメソッドの上限を超える関数だけは、Endive がその関数をインタプリタで動かす（[InterpreterFallback.WARN]。ログに出る）。
+ * コンパイルの後は、関数の本体を除いたモジュール（[CompiledModule.wasmModule]）だけを持ち、パースした命令の列は捨てる
+ * （挿入後の lua.wasm で、ヒープが約 18 MB → 約 0.08 MB）。同じ WASM の読み込みの共有は、呼び出し側（カーネルの `ProgramCache`）が受け持つ。
  *
  * メモリの上限（#39）は、Endive のメモリを作るときに上限を縮め（[WasmInstanceConfig.maxMemoryPages]）、
  * [WasmInstanceConfig.memoryBudget] があれば `grow` を数える包み（[BudgetedMemory]）をかぶせて守る。
  * 共有しないメモリは、書き込んだページだけ JVM のメモリを確保する（[LazyMemory]、#334）。
  * 上限と RAM は宣言したページ数（最初のページ数と `grow` の合計）で数え、確保したページ数では数えない。
  */
-public class EndiveRuntime : WasmRuntime {
+public class EndiveRuntime internal constructor(
+    /** `false` ならコンパイルせずインタプリタで動かす（テストで、インタプリタとの結果を比べるため） */
+    private val compile: Boolean,
+) : WasmRuntime {
+    /** ランタイムコンパイラで動かすランタイムを作る */
+    public constructor() : this(true)
+
     override val name: String get() = NAME
 
     @Throws(WasmLoadException::class)
@@ -73,19 +85,89 @@ public class EndiveRuntime : WasmRuntime {
         } catch (e: StackOverflowError) {
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
-        return try {
-            EndiveWasmModule(module)
+        val interpreted = try {
+            EndiveWasmModule(module, null)
         } catch (e: WasmLoadException) {
             throw e
         } catch (e: RuntimeException) {
             // Endive の検証は export の番号の範囲などを確かめないことがある（#40 で見つけた）。ここで分かったものも断る
             throw WasmLoadException("WASM の検証に通らない: $e", e)
         }
+        if (!compile) return interpreted
+        // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
+        val compiled = compileOrNull(module) ?: return interpreted
+        // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュールとコンパイル結果だけ
+        return EndiveWasmModule(compiled.wasmModule(), compiled)
+    }
+
+    /**
+     * [module] をコンパイルする。できなければ `null`（ログに出す）。
+     *
+     * Endive のコンパイラは、JVM のメソッドの上限を超える関数をインタプリタに回す（[InterpreterFallback.WARN]）が、
+     * 上限の近くで ASM が上限超えを見分けられずに別の例外で落ちることがある（待機点への変換と燃料の計測コードを
+     * 両方かけた lua.wasm の `luaV_execute`。#37 で見つけた）。そのときは、命令の数が多い関数から順にインタプリタに回して
+     * [MAX_COMPILE_RETRIES] 回までやり直す。それでもだめ（SIMD の局所変数など、コンパイラが対応しない作り）なら `null`。
+     *
+     * ただし、例外処理（タグ）を使うモジュールでは、関数ごとにインタプリタとコンパイルしたコードを混ぜない
+     * （混ぜると、Lua のコルーチンの戻り値が欠けるなど、結果が変わった。#341）。1つでもコンパイルできない関数があれば、
+     * モジュール全体をインタプリタで動かす。
+     */
+    private fun compileOrNull(module: EndiveModule): CompiledModule? {
+        val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
+        val interpreted = LinkedHashSet<Int>()
+        var candidates: List<Int>? = null
+        var attempt = 0
+        while (true) {
+            val failure = try {
+                val builder = MachineFactoryCompiler.builder(module)
+                when {
+                    !mixable -> builder.withInterpreterFallback(InterpreterFallback.FAIL)
+                    interpreted.isEmpty() -> builder.withInterpreterFallback(InterpreterFallback.WARN)
+                    // 決めた関数をインタプリタに回すときは、ほかの関数の自動の切り替えは使えない（Endive の制約）
+                    else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
+                }
+                return builder.compileModule().also {
+                    if (interpreted.isNotEmpty()) LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない）")
+                }
+            } catch (e: RuntimeException) {
+                e
+            } catch (e: StackOverflowError) {
+                e
+            } catch (e: LinkageError) {
+                // 生成したクラスを JVM が受け付けない（VerifyError など）
+                e
+            }
+            val next = if (mixable) (candidates ?: largeFunctions(module).also { candidates = it }).firstOrNull { it !in interpreted } else null
+            if (attempt++ >= MAX_COMPILE_RETRIES || next == null) {
+                LOG.log(System.Logger.Level.WARNING, "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす: $failure")
+                return null
+            }
+            interpreted += next
+        }
     }
 
     public companion object {
         /** ランタイムの名前 */
         public const val NAME: String = "endive"
+
+        private val LOG: System.Logger = System.getLogger("kibicomputers.wasm")
+
+        /** コンパイルに失敗したとき、関数をインタプリタに回してやり直す回数 */
+        private const val MAX_COMPILE_RETRIES: Int = 3
+
+        /** やり直しでインタプリタに回す候補にする、関数の命令の数の下限（これより小さい関数は JVM のメソッドの上限に届かない） */
+        private const val LARGE_FUNCTION_INSTRUCTIONS: Int = 4096
+
+        /** 命令の数が [LARGE_FUNCTION_INSTRUCTIONS] 以上の関数の番号（import を含めた番号）。大きい順 */
+        private fun largeFunctions(module: EndiveModule): List<Int> {
+            val imported = module.importSection().count(ExternalType.FUNCTION)
+            val bodies = module.codeSection().functionBodies()
+            return bodies.indices
+                .map { it to bodies[it].instructions().size }
+                .filter { it.second >= LARGE_FUNCTION_INSTRUCTIONS }
+                .sortedByDescending { it.second }
+                .map { it.first + imported }
+        }
     }
 }
 
@@ -171,6 +253,9 @@ internal fun committedPages(memory: WasmMemory): Int {
     val lazy = (inner as? BudgetedMemory)?.inner ?: inner
     return (lazy as? LazyMemory)?.committedPages ?: memory.pages
 }
+
+/** [module] をコンパイルしたコードで動かすなら `true`（#37。テスト用） */
+internal fun isCompiled(module: WasmModule): Boolean = (module as? EndiveWasmModule)?.isCompiled ?: false
 
 /** 戻り値のないホストの関数の戻り値 */
 private val NO_VALUES = LongArray(0)
@@ -262,7 +347,14 @@ internal fun trapKind(message: String): WasmTrapKind {
     }
 }
 
-private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
+/**
+ * Endive のモジュール。[compiled] があればコンパイルしたコードで、なければインタプリタで動かす。
+ * [module] は、コンパイルしたなら関数の本体を除いたもの（[CompiledModule.wasmModule]）。
+ */
+private class EndiveWasmModule(val module: EndiveModule, private val compiled: CompiledModule?) : WasmModule {
+    /** コンパイルしたコードで動かすなら `true`（テスト用） */
+    val isCompiled: Boolean get() = compiled != null
+
     /** import の関数の型（関数の番号の順） */
     private val importFunctionTypes: List<FunctionType>
 
@@ -381,7 +473,7 @@ private class EndiveWasmModule(val module: EndiveModule) : WasmModule {
         wrapper.budgetedMemories = memories
         val instance = try {
             // withStart(false): export の `_start` は呼ばない（start セクションの関数は build の中で実行される）
-            Instance.builder(module)
+            (if (compiled != null) Instance.builder(compiled) else Instance.builder(module))
                 .withImportValues(values.build())
                 .withGlobalFactory(globals)
                 .withMemoryFactory { limits -> createMemory(limits, config, memories) }

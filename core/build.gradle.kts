@@ -30,6 +30,8 @@ kotlin {
 dependencies {
     api(libs.endive.runtime)
     api(libs.endive.wasm)
+    // プレイヤーの WASM はランタイムコンパイラで動かす（#29 の決定、#37）。ASM が要る（MC ではローダーが持つものを使う）
+    implementation(libs.endive.compiler)
 
     // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
     testImplementation(libs.endive.wasi)
