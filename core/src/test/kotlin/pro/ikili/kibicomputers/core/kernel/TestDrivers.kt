@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -58,7 +59,7 @@ internal class Harness(
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null),
     )
     private var counter = 0
 

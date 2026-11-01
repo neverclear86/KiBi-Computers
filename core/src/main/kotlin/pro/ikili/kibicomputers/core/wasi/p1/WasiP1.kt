@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -75,6 +76,41 @@ internal object WasiP1 {
 
     /** 実装している関数の名前 */
     val implemented: Set<String> = FUNCTIONS.map { it.name }.toSet() + PROC_EXIT
+
+    /**
+     * WASI p1 の関数の名前（`wasi_snapshot_preview1` の仕様にあるもの全部）。
+     * まだ実装していないものも import してよい（`NOSYS` を返す仮の関数をつなぐ）。
+     */
+    val specFunctions: Set<String> = setOf(
+        "args_get", "args_sizes_get", "environ_get", "environ_sizes_get", "clock_res_get", "clock_time_get",
+        "fd_advise", "fd_allocate", "fd_close", "fd_datasync", "fd_fdstat_get", "fd_fdstat_set_flags", "fd_fdstat_set_rights",
+        "fd_filestat_get", "fd_filestat_set_size", "fd_filestat_set_times", "fd_pread", "fd_prestat_get", "fd_prestat_dir_name",
+        "fd_pwrite", "fd_read", "fd_readdir", "fd_renumber", "fd_seek", "fd_sync", "fd_tell", "fd_write",
+        "path_create_directory", "path_filestat_get", "path_filestat_set_times", "path_link", "path_open", "path_readlink",
+        "path_remove_directory", "path_rename", "path_symlink", "path_unlink_file",
+        "poll_oneoff", "proc_exit", "proc_raise", "sched_yield", "random_get",
+        "sock_accept", "sock_recv", "sock_send", "sock_shutdown",
+    )
+
+    /**
+     * [module] の import が、p1 のプロセスに許すものだけか確かめる（#40）。だめなら `NOEXEC` の [FsException]。
+     *
+     * 許すのは `wasi_snapshot_preview1` の、仕様にある名前の関数だけ。実装している関数は型も一致しなければならない
+     * （インスタンスを作るときのリンクの失敗を、読み込みのときに分かるようにする）。
+     * メモリ・テーブル・グローバル・タグの import や、ほかのモジュール名（`env` など）は断る。
+     * 独自拡張（`kibi:*` の p1 向けの import）を足すときは、ここで許す。
+     */
+    @Throws(FsException::class)
+    fun checkImports(module: WasmModule) {
+        for (imp in module.imports) {
+            val name = "${imp.module}.${imp.name}"
+            if (imp.module != P1.MODULE) fsError(Errno.NOEXEC, "許可していない import: $name")
+            if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
+            if (imp.name !in specFunctions) fsError(Errno.NOEXEC, "WASI p1 にない関数の import: $name")
+            val expected = typeOf(imp.name) ?: continue
+            if (imp.functionType != expected) fsError(Errno.NOEXEC, "import の型が違う: $name は $expected（モジュールは ${imp.functionType}）")
+        }
+    }
 
     /** 実装している関数 [name] の型（なければ `null`） */
     fun typeOf(name: String): WasmFunctionType? =

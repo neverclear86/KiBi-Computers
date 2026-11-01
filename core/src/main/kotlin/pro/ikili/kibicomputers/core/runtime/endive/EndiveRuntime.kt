@@ -66,8 +66,17 @@ public class EndiveRuntime : WasmRuntime {
         } catch (e: RuntimeException) {
             // パーサーが壊れた入力で想定外の例外を出すことがある
             throw WasmLoadException("WASM を読み込めない: $e", e)
+        } catch (e: StackOverflowError) {
+            throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
-        return EndiveWasmModule(module)
+        return try {
+            EndiveWasmModule(module)
+        } catch (e: WasmLoadException) {
+            throw e
+        } catch (e: RuntimeException) {
+            // Endive の検証は export の番号の範囲などを確かめないことがある（#40 で見つけた）。ここで分かったものも断る
+            throw WasmLoadException("WASM の検証に通らない: $e", e)
+        }
     }
 
     public companion object {

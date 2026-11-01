@@ -39,6 +39,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -464,6 +465,8 @@ public class Machine private constructor(
      * - [path] の相対パスは、親の作業ディレクトリから辿る（親がなければ `/`）。`PATH` からは探さない（シェルの役目）
      * - 普通のファイルでなければ `ACCES`、[MachineLimits.MAX_EXECUTABLE_BYTES] を超えたら `FBIG`、WASM として読めなければ `NOEXEC`
      * - 読み込むときに燃料の計測コードを挿入する（#38）。計測の名前（`kibi.fuel`・`kibi_fuel`）をすでに使っている WASM も `NOEXEC`
+     * - 読み込む前に構造の上限（関数・ローカル変数・テーブルの要素の数など）を確かめ、挿入・パース・検証に時間の上限を設ける
+     *   （#40。[pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits]）。超えたら `NOEXEC`。import の確認はドライバー（[drivers]）がする
      * - `options.args` が空なら、argv を [path] の文字列1つにする
      * - ファイルを読むのはカーネルロックの中、WASM の読み込み（挿入・パース・検証）はロックの外。重いので、メインスレッドからは呼ばない
      *
@@ -481,7 +484,8 @@ public class Machine private constructor(
         val bytes = lock.withLockValue { readExecutableLocked(path, parentLocked(parentPid)) }
         val program = try {
             val runtime = scheduler.options.runtime
-            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes) else Program.load(runtime, bytes)
+            val limits = scheduler.options.moduleLimits
+            if (scheduler.options.meterExecutables) Program.loadMetered(runtime, bytes, limits) else Program.load(runtime, bytes, limits)
         } catch (e: WasmLoadException) {
             fsError(Errno.NOEXEC, "$path は WASM として読めない: ${e.message}")
         }
@@ -1093,7 +1097,7 @@ internal object MachineLimits {
     internal const val MAX_PENDING_BEEPS: Int = 8
 
     /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
-    internal const val MAX_EXECUTABLE_BYTES: Int = 16 * 1024 * 1024
+    internal const val MAX_EXECUTABLE_BYTES: Int = ModuleLimits.DEFAULT_MAX_BYTES
 
     /** コンソールの TTY の入力の上限（読める入力＋編集中の行。仮の値。確定は #251） */
     internal const val CONSOLE_INPUT_BYTES: Int = 4 * 1024
