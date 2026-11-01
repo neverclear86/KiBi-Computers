@@ -473,7 +473,8 @@ internal class ProcessRunner(private val machine: Machine) {
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
-        // 親への知らせは #46
+        // 親への知らせは #46。init なら、マシンを止める（#49）
+        machine.onProcessFinishedLocked(process)
         machine.checkAllDoneLocked()
     }
 
@@ -699,6 +700,10 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun writeConsole(bytes: ByteArray, offset: Int, length: Int): Boolean = machine.writeConsole(bytes, offset, length)
 
         override fun beep(frequencyHz: Int, durationMillis: Int): Boolean = machine.beep(frequencyHz, durationMillis)
+
+        override fun requestShutdown() = machine.stop()
+
+        override fun requestReboot(): Boolean = machine.reboot()
 
         override fun chargeFuel(amount: Long) {
             if (rt.process.unmetered) return

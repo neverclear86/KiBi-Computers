@@ -32,4 +32,21 @@ public fun interface MachineHost {
      * @param durationMillis 長さ（1〜[Machine.MAX_BEEP_DURATION_MILLIS] に丸めてある）
      */
     public fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {}
+
+    /**
+     * 起動（[Machine.boot]）に失敗した（#49）。マシンは [MachineState.STOPPED] のまま。
+     * コンソールには、カーネルが固定の英語のメッセージをこの通知の前に書いている。翻訳した表示が要るときは、ここで出す。
+     *
+     * @param detail 失敗の詳しい理由（ログ向け。決まった形ではない）
+     */
+    public fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {}
+
+    /**
+     * 再起動（[Machine.reboot]）を求められ、プロセスがすべて止まった（#49）。
+     * 既定の実装は、前回の設定（[Machine.lastBootConfig]）でもう一度 [Machine.boot] する。
+     * 上書きすると、その時点のディスクで [BootConfig] を作り直して起動できる（起動しないこともできる）
+     */
+    public fun onRebootRequested(machine: Machine) {
+        machine.lastBootConfig?.let { machine.boot(it) }
+    }
 }

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.machine
 
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -105,7 +106,7 @@ public class MachineManager<K : Any> internal constructor(
     public fun keys(): Set<K> = HashSet(entries.keys)
 
     /**
-     * [key] のマシンを作って一覧に入れる（まだ何も動かない。起動は #49）。
+     * [key] のマシンを作って一覧に入れる（まだ何も動かない。起動は、返したマシンの [Machine.boot]）。
      * [key] にもうマシンがあれば、それを止めて（[MachineReleaseReason.REMOVED]）置き換える。
      *
      * @param host カーネルからの通知を受ける口。包んで渡す（クラスの説明）
@@ -235,6 +236,17 @@ internal class ManagedHost<K : Any>(
     override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
         if (released) return
         guarded("onBeep") { delegate.onBeep(machine, frequencyHz, durationMillis) }
+    }
+
+    override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+        if (released) return
+        guarded("onBootFailed") { delegate.onBootFailed(machine, failure, detail) }
+    }
+
+    override fun onRebootRequested(machine: Machine) {
+        // 外した後は起動し直さない
+        if (released) return
+        guarded("onRebootRequested") { delegate.onRebootRequested(machine) }
     }
 
     private inline fun guarded(what: String, block: () -> Unit) {

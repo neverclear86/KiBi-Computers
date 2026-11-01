@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
@@ -115,6 +117,45 @@ class MachineManagerTest {
             manager.tick()
             assertEquals(listOf("console:hi"), kept.log)
             assertEquals(emptyList<String>(), gone.log)
+        }
+    }
+
+    @Test
+    fun `起動の失敗と再起動の求めを転送し、外した後は捨てる`() = timeout(limit) {
+        Harness().use { h ->
+            val errors = Errors()
+            val manager = h.manager(errors)
+            val log = Collections.synchronizedList(ArrayList<String>())
+            val host = object : MachineHost {
+                override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
+
+                override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+                    log += "failed:$failure"
+                }
+
+                override fun onRebootRequested(machine: Machine) {
+                    log += "reboot"
+                    throw IllegalStateException("reboot boom")
+                }
+            }
+            val noFirmware = BootConfig.builder().firmwarePresent(false).build()
+            val m = manager.attach("m", host, config)
+            assertTrue(m.boot(noFirmware))
+            h.tickUntil(manager) { log.contains("failed:NO_FIRMWARE") }
+            assertTrue(m.reboot())
+            h.tickUntil(manager) { log.contains("reboot") }
+            assertEquals("reboot boom", errors.errors.single().message)
+
+            // 外した後は、起動の失敗も再起動の求めも届けない（起動し直さない）
+            val gone = manager.attach("gone", host, config)
+            assertTrue(gone.boot(noFirmware))
+            eventually { !gone.isBooting }
+            manager.release("gone", MachineReleaseReason.REMOVED)
+            repeat(20) {
+                manager.tick()
+                Thread.sleep(1)
+            }
+            assertEquals(listOf("failed:NO_FIRMWARE", "reboot"), log.toList())
         }
     }
 
