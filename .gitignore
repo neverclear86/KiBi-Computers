@@ -17,6 +17,8 @@ out/
 .project
 .settings/
 bin/
+# テスト用イメージの中身（bin/ を含む）は入れる
+!core/src/test/images/**/bin/
 
 # Minecraft dev runs
 run/
