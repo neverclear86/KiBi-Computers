@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #71（task）。前提: ADR 0051（VFS の中核）、0058（fd 表と標準入出力）、0070（p1 の `fd_*`）、0261（p1 の層を直接実装する）
-- 後続: #72（`poll_oneoff`、cwd と wasi-libc の `PWD`）、#74（子プロセスへの preopen の渡し方）、#54（`/dev`）、#267・#268（p2・p3 の `wasi:filesystem`）
+- 後続: #72（`poll_oneoff`）、#332（cwd と wasi-libc の `PWD`。ADR 0332）、#74（子プロセスへの preopen の渡し方）、#54（`/dev`）、#267・#268（p2・p3 の `wasi:filesystem`）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -49,6 +49,6 @@
 ## 決めないこと
 
 - 子プロセスへの preopen の渡し方の既定: #74
-- cwd と wasi-libc の `PWD` の合わせ方: #72（ADR 0045）
+- cwd と wasi-libc の `PWD` の合わせ方: #332（ADR 0332）
 - p2・p3 の `wasi:filesystem` への写し方: #267・#268
 - デバイスファイル（`/dev`）の開き方: #54
