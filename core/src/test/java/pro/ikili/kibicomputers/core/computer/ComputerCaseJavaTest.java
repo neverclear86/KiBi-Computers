@@ -1,9 +1,14 @@
 package pro.ikili.kibicomputers.core.computer;
 
 import org.junit.jupiter.api.Test;
+import pro.ikili.kibicomputers.core.display.TextBuffer;
+import pro.ikili.kibicomputers.core.input.KeyboardEvent;
+import pro.ikili.kibicomputers.core.kernel.BootConfig;
 import pro.ikili.kibicomputers.core.kernel.MachineConfig;
+import pro.ikili.kibicomputers.core.kernel.MachineHost;
 import pro.ikili.kibicomputers.core.machine.MachineManager;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,6 +50,30 @@ class ComputerCaseJavaTest {
         computer.removed();
         assertNull(computer.getMachine());
         assertTrue(computer.getMissingParts().isEmpty());
+        assertTrue(manager.shutdown(10_000));
+    }
+
+    /** テスト用コンピューターの仮の結線（#307）の口が Java から使える */
+    @Test
+    void testComputerWiringFromJava() throws InterruptedException {
+        TextBuffer screen = new TextBuffer(20, 5);
+        MachineConsole console = new MachineConsole(screen, 16);
+        assertEquals(screen, console.getScreen());
+        assertEquals(0, console.keyboardInput(new KeyboardEvent.Text("a")));
+        console.write("hi".getBytes(StandardCharsets.UTF_8));
+        assertEquals('h', screen.getCodePoint(0, 0));
+        console.reset();
+
+        MachineHost events = (machine, state, cause) -> { };
+        MachineManager<String> manager = new MachineManager<>();
+        ComputerCase<String> computer = new ComputerCase<>(CaseTier.BASIC, events);
+        computer.turnOn(manager, "key", slot -> true, true, MachineConfig.DEFAULT);
+        console.setMachine(computer.getMachine());
+        assertEquals(1, console.keyboardInput(new KeyboardEvent.Text("a")));
+        BootConfig config = BootConfig.builder().addBootDisk(BootConfig.TEST_BOOT_DISK).build();
+        assertTrue(BootConfig.TEST_BOOT_DISK.startsWith(BootConfig.IMAGE_DISK_PREFIX));
+        assertEquals(List.of(BootConfig.TEST_BOOT_DISK), config.getBootDisks());
+        computer.turnOff();
         assertTrue(manager.shutdown(10_000));
     }
 }

@@ -883,12 +883,20 @@ public class Machine internal constructor(
         return true
     }
 
-    /** `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる */
+    /**
+     * `tick()` の中で、メインスレッドから通知を配る（ロックの外）。続いたコンソール出力は1回にまとめる。
+     *
+     * TTY の出力は、列の先頭に積まれたカーネルのメッセージ（起動のログなど）の後、ほかの通知（状態の変化など）の前に入れる。
+     * カーネルのメッセージは TTY に書く前に積まれていることが多いため（起動のログ → init の出力 → RUNNING）
+     */
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
         var console: ByteArrayOutputStream? = null
-        if (consoleDirty.getAndSet(false)) {
-            drainConsoleOutput()?.let { bytes -> console = ByteArrayOutputStream().also { it.write(bytes, 0, bytes.size) } }
+        var ttyPending = consoleDirty.getAndSet(false)
+        fun appendTty() {
+            if (!ttyPending) return
+            ttyPending = false
+            drainConsoleOutput()?.let { bytes -> (console ?: ByteArrayOutputStream().also { console = it }).write(bytes, 0, bytes.size) }
         }
         while (true) {
             val n = notifications.poll() ?: break
@@ -898,6 +906,7 @@ public class Machine internal constructor(
                 out.write(n.bytes, 0, n.bytes.size)
                 continue
             }
+            appendTty()
             console?.let { out ->
                 console = null
                 safely { host.onConsoleOutput(this, out.toByteArray()) }
@@ -917,6 +926,7 @@ public class Machine internal constructor(
                 is HostNotification.Console -> Unit
             }
         }
+        appendTty()
         console?.let { out -> safely { host.onConsoleOutput(this, out.toByteArray()) } }
     }
 

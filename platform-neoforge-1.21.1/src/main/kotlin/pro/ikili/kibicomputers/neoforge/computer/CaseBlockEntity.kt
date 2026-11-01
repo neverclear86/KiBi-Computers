@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  * - 電源ボタン（[pressPowerButton]）で、サーバーのマシン管理（[ServerMachines]）にマシンを作る・止める
  * - 動いている間に起動に要る部品を抜くと止まる
  * - チャンクのアンロード・ブロックの破壊でマシンを外す
+ * - 電源を入れると、隣の画面とキーボードにつないで同梱イメージから起動する（仮の結線。[TestComputerWiring]、#307）
  *
  * セーブデータには部品だけを書く（`Parts`）。電源の状態は書かず、読み込んだら電源が切れている（マシンの状態の保存は #81）。
  */
@@ -38,8 +39,14 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** 部品スロット */
     val parts: CaseParts = CaseParts(tier) { onPartsChanged() }
 
+    /** テスト用コンピューターの仮の結線（#307）。#129・#99 ができたら置き換える */
+    internal val wiring: TestComputerWiring = TestComputerWiring()
+
     /** 電源と状態。サーバーでだけ動く（クライアントでは常に [ComputerStatus.OFF]） */
-    val computer: ComputerCase<MachineKey> = ComputerCase(tier)
+    val computer: ComputerCase<MachineKey> = ComputerCase(tier, wiring)
+
+    // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
+    private val installedForBoot = TestComputerWiring.withBootPart(tier, parts.installed)
 
     /**
      * 電源ボタン。サーバーでだけ働く。電力の有無（#128）は、今は常にあるとして扱う。
@@ -48,24 +55,34 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     fun pressPowerButton(): ComputerStatus {
         val level = level as? ServerLevel ?: return computer.status
+        val before = computer.machine
         // マシンの設定は CPU・RAM から決める（#122・#123）。今は既定の値
-        return computer.pressPowerButton(ServerMachines.current, MachineKey.of(level, blockPos), parts.installed, true, MachineConfig.DEFAULT)
+        val status = computer.pressPowerButton(ServerMachines.current, MachineKey.of(level, blockPos), installedForBoot, true, MachineConfig.DEFAULT)
+        val machine = computer.machine
+        if (machine == null) {
+            wiring.disconnect()
+        } else if (machine !== before) {
+            wiring.connect(level, blockPos, machine)
+        }
+        return status
     }
 
     private fun onPartsChanged() {
         setChanged()
         val level = level ?: return
-        if (!level.isClientSide) computer.partsChanged(parts.installed)
+        if (!level.isClientSide && computer.partsChanged(installedForBoot)) wiring.disconnect()
     }
 
     override fun onChunkUnloaded() {
         super.onChunkUnloaded()
         computer.chunkUnloaded()
+        wiring.disconnect()
     }
 
     override fun setRemoved() {
         super.setRemoved()
         computer.removed()
+        wiring.disconnect()
     }
 
     override fun saveAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
