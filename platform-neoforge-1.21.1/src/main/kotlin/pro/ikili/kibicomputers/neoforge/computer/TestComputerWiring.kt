@@ -24,7 +24,8 @@ import java.util.UUID
  * - 起動部品は挿さっているとみなす（[withBootPart]）。置き換え先: 起動部品のアイテム #125、ファームウェア #99
  * - 起動ディスクは同梱イメージ（[TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
- *   コンソールの出力を画面に、キーボードの入力をコンソールに流す（[MachineConsole]）。動いている間に置いた・壊したものは見ない。
+ *   コンソールの出力を画面に、キーボードの入力をコンソールに流す（[MachineConsole]）。動いている間に置いたものは見ない。
+ *   つないだ画面が外れたら、画面とキーボードから外す（#397）。
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
  *
@@ -42,6 +43,12 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     /** つないだキーボード。つないでいなければ null */
     val connectedKeyboard: KeyboardBlockEntity? get() = keyboard
 
+    /** 画面につないだコンソール。つないでいなければ null（テスト用） */
+    val connectedConsole: MachineConsole? get() = console
+
+    // 画面が外れたら、出力を止めている最中でも、すぐに外して取っておいた出力を捨てる（#397）
+    private val onScreenRemoved = Runnable { disconnect() }
+
     /** 電源が入った（[machine] を作った）。隣の画面とキーボードにつなぎ、同梱イメージから起動する。 */
     fun connect(level: Level, casePos: BlockPos, machine: Machine) {
         disconnect()
@@ -49,6 +56,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         val screen = findScreen(level, casePos)
         if (screen != null) {
             this.screen = screen
+            screen.addRemovalListener(onScreenRemoved)
             console = MachineConsole(screen.text, screen.tier.maxColors).also {
                 it.reset()
                 it.machine = machine
@@ -61,12 +69,16 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     /**
      * 電源が切れた・ケースが消える・画面が外れた。画面とキーボードから外す（画面の中身はそのまま残す）。
-     * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）
+     * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）。
+     * 画面が外れたときは、画面からの知らせ（[ScreenBlockEntity.addRemovalListener]）でも呼ぶ。出力を止めている間は
+     * [onConsoleOutput] が呼ばれないので、それだけでは気付けない（#397）
      */
     fun disconnect() {
         keyboard?.release(this)
         keyboard = null
-        if (screen?.isRemoved == true) console?.discardOutput()
+        val s = screen
+        if (s?.isRemoved == true) console?.discardOutput()
+        s?.removeRemovalListener(onScreenRemoved)
         screen = null
         console?.machine = null
         console = null
