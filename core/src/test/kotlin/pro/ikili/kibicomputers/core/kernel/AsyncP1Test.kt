@@ -428,4 +428,40 @@ class AsyncP1Test {
             assertTrue(text.contains("待機点に変換できない") && text.contains("v128"), text)
         }
     }
+
+    /** 止まりうる import を使わず、v128 のローカルを持つ `_start`（止まりうる関数がないモジュール。#384） */
+    private fun computeOnlySimdCommand(): ByteArray {
+        val i32 = 0x7F
+        val b = WasmBinary()
+        b.memory(1)
+        // 1 + 2 を捨てる。v128 のローカルを1つ持つ
+        val start = b.func(emptyList(), emptyList(), WasmBinary.code(0x41, 1, 0x41, 2, 0x6A, 0x1A), locals = listOf(0x7B, i32))
+        b.exportFunc("_start", start)
+        return b.build()
+    }
+
+    @Test
+    fun `止まりうる関数がないモジュールは断らず、待機点型で専用スレッドなしに動く`() = timeout(limit) {
+        val program = Program.loadMetered(EndiveRuntime(), computeOnlySimdCommand(), null, WasiP1.WAIT_IMPORTS)
+        assertTrue(program.module.isAsyncified)
+        assertEquals(ProcessKind.WAIT_POINT, WasiP1Driver(program.module).kind)
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.lock.withLockValue {
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                val bytes = computeOnlySimdCommand()
+                val f = m.vfs.open(VfsPath.parse("/compute"), OpenOptions(read = true, write = true, create = true, truncate = true))
+                m.vfs.write(f, bytes, 0, bytes.size)
+            }
+            val closed = SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed))
+            val pid = m.exec("/compute", KernelDrivers.DEFAULT, closed)
+            assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid))
+        }
+    }
 }

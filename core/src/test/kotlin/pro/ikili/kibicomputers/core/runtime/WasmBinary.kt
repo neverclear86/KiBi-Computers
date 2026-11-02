@@ -9,7 +9,9 @@ import java.io.ByteArrayOutputStream
  */
 class WasmBinary {
     private val types = mutableListOf<Pair<List<Int>, List<Int>>>()
-    private val imports = mutableListOf<Triple<String, String, Int>>()
+    private val imports = mutableListOf<ByteArray>()
+    private var funcImports = 0
+    private var globalImports = 0
     private val functions = mutableListOf<Pair<Int, ByteArray>>()
     private val functionLocals = mutableListOf<List<Int>>()
     private val exports = mutableListOf<Triple<String, Int, Int>>()
@@ -36,15 +38,27 @@ class WasmBinary {
     /** 関数を import して、その関数の番号を返す。 */
     fun importFunc(module: String, name: String, params: List<Int>, results: List<Int>): Int {
         check(functions.isEmpty()) { "import は関数より先に足す" }
-        imports += Triple(module, name, type(params, results))
-        return imports.size - 1
+        imports += importName(module, name) + byteArrayOf(0x00) + uleb(type(params, results).toLong())
+        return funcImports++
+    }
+
+    /** メモリ（ページ数の下限が [pages]）を import する */
+    fun importMemory(module: String, name: String, pages: Int) = apply {
+        imports += importName(module, name) + byteArrayOf(0x02, 0x00) + uleb(pages.toLong())
+    }
+
+    /** 変更できない [type] のグローバルを import して、グローバルの番号を返す（import したグローバルが先に並ぶ） */
+    fun importGlobal(module: String, name: String, type: Int): Int {
+        check(globals.isEmpty()) { "import はグローバルより先に足す" }
+        imports += importName(module, name) + byteArrayOf(0x03, type.toByte(), 0x00)
+        return globalImports++
     }
 
     /** 関数を足して、その関数の番号を返す。[body] は `end` を含めない。 */
     fun func(params: List<Int>, results: List<Int>, body: ByteArray, locals: List<Int> = emptyList()): Int {
         functions += type(params, results) to body
         functionLocals += locals
-        return imports.size + functions.size - 1
+        return funcImports + functions.size - 1
     }
 
     fun exportFunc(name: String, index: Int) = apply { exports += Triple(name, 0x00, index) }
@@ -57,7 +71,7 @@ class WasmBinary {
     /** 可変の i64 のグローバルを足して、番号を返す。 */
     fun mutableI64Global(initial: Long, exportName: String? = null): Int {
         globals += byteArrayOf(I64.toByte(), 0x01, 0x42) + sleb(initial) + byteArrayOf(0x0b)
-        val index = globals.size - 1
+        val index = globalImports + globals.size - 1
         if (exportName != null) exports += Triple(exportName, 0x03, index)
         return index
     }
@@ -71,7 +85,7 @@ class WasmBinary {
         out.write(byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00))
         section(out, 1, vec(types.map { (p, r) -> byteArrayOf(0x60) + vec(p.map { byteArrayOf(it.toByte()) }) + vec(r.map { byteArrayOf(it.toByte()) }) }))
         if (imports.isNotEmpty()) {
-            section(out, 2, vec(imports.map { (m, n, t) -> name(m) + name(n) + byteArrayOf(0x00) + uleb(t.toLong()) }))
+            section(out, 2, vec(imports))
         }
         if (functions.isNotEmpty()) section(out, 3, vec(functions.map { uleb(it.first.toLong()) }))
         tableSize?.let { section(out, 4, vec(listOf(byteArrayOf(0x70, 0x00) + uleb(it.toLong())))) }
@@ -134,6 +148,8 @@ class WasmBinary {
         }
 
         private fun name(s: String): ByteArray = s.toByteArray().let { uleb(it.size.toLong()) + it }
+
+        private fun importName(module: String, field: String): ByteArray = name(module) + name(field)
 
         private fun vec(items: List<ByteArray>): ByteArray = items.fold(uleb(items.size.toLong())) { acc, b -> acc + b }
 
