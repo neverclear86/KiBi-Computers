@@ -45,10 +45,10 @@ internal object Instrumentation {
         val metered = FuelInjector.inject(wasm) { checkpoint(STAGE_FUEL) }
         if (waitImports.isEmpty()) return Applied(metered.bytes, false, null)
         return try {
-            val r = Asyncify.transform(metered.bytes, waitImports, YIELD_IMPORT) { checkpoint(STAGE_ASYNCIFY) }
+            val r = Asyncify.transform(metered.bytes, waitImports, YIELD_IMPORT, metered::originalFunc) { checkpoint(STAGE_ASYNCIFY) }
             Applied(r.bytes, true, null)
         } catch (e: AsyncifyUnsupported) {
-            val r = Asyncify.transform(metered.bytes, waitImports) { checkpoint(STAGE_ASYNCIFY) }
+            val r = Asyncify.transform(metered.bytes, waitImports, null, metered::originalFunc) { checkpoint(STAGE_ASYNCIFY) }
             Applied(r.bytes, false, e.message ?: "理由不明")
         }
     }

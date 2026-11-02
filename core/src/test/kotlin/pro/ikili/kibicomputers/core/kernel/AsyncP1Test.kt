@@ -353,6 +353,33 @@ class AsyncP1Test {
         return b.build()
     }
 
+    /**
+     * fd_read（関数 #0）と、v128 のローカルを持ち fd_read を呼ぶ export しない関数（#1）、それを呼ぶ `_start`（#2）のモジュール。
+     * 燃料の計測コードの挿入で import が1つ増えるので、挿入した後のモジュールでは #2・#3 になる
+     */
+    private fun simdHelperCommand(): ByteArray {
+        val i32 = 0x7F
+        val b = WasmBinary()
+        val fdRead = b.importFunc("wasi_snapshot_preview1", "fd_read", listOf(i32, i32, i32, i32), listOf(i32))
+        b.memory(1)
+        b.mutableI64Global(0)
+        val helper = b.func(emptyList(), emptyList(), WasmBinary.code(0x41, 0, 0x41, 0, 0x41, 0, 0x41, 16, 0x10, fdRead, 0x1A), locals = listOf(0x7B))
+        val start = b.func(emptyList(), emptyList(), WasmBinary.code(0x10, helper))
+        b.exportFunc("_start", start)
+        return b.build()
+    }
+
+    @Test
+    fun `断る理由の関数の番号は、燃料の計測コードを挿入する前の元のモジュールの番号`() = timeout(limit) {
+        val single = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), simdCommand(), null, WasiP1.WAIT_IMPORTS) }
+        val singleReason = Program.unsuspendableReason(single)!!
+        assertTrue(singleReason.contains("止まりうる関数 #1（export _start） の中"), singleReason)
+
+        val helper = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), simdHelperCommand(), null, WasiP1.WAIT_IMPORTS) }
+        val helperReason = Program.unsuspendableReason(helper)!!
+        assertTrue(helperReason.contains("止まりうる関数 #1 の中") && helperReason.contains("v128"), helperReason)
+    }
+
     @Test
     fun `変換できない作りのモジュールは読み込みを断り、理由に断った機能が入る`() = timeout(limit) {
         val e = assertThrows<WasmLoadException> { Program.loadMetered(EndiveRuntime(), simdCommand(), null, WasiP1.WAIT_IMPORTS) }

@@ -107,6 +107,9 @@ internal object Asyncify {
      * [yieldImport]（`"<module>.<name>"`）があれば、止まりうる関数の中のその呼び出しも待ち点にし、[WasmAsync.FUEL] の呼び出しに書き換える（#339）。
      * その import の型は `(i64) -> (i64)` でなければならない。モジュールがその import を持たなければ、何もしない。
      *
+     * [originalFunc] は、断る理由に書く関数の番号を、利用者の元のモジュールの番号に戻す（#398）。[wasm] が前の書き換え
+     * （燃料の計測コードの挿入）で import を足した後のものなら、その番号の対応を渡す（`FuelInjector.Result.originalFunc`）。
+     *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる呼び出しを含む、引数を持つブロックや
      *   複数の結果を持つブロックなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
@@ -118,13 +121,14 @@ internal object Asyncify {
         wasm: ByteArray,
         waitImports: Set<String>,
         yieldImport: String? = null,
+        originalFunc: (Int) -> Int = { it },
         checkpoint: () -> Unit = {},
     ): Result {
         val module = parse(wasm)
         checkpoint()
         checkReserved(module)
         return try {
-            Transformer(wasm, module, waitImports, yieldImport, checkpoint).run()
+            Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint).run()
         } catch (e: WasmLoadException) {
             throw e
         } catch (e: AsyncifyUnsupported) {
@@ -213,6 +217,7 @@ private class Transformer(
     private val module: WasmModule,
     private val asyncImports: Set<String>,
     yieldImport: String?,
+    private val originalFunc: (Int) -> Int,
     private val checkpoint: () -> Unit,
 ) {
     private val importedFuncs: Int
@@ -341,7 +346,8 @@ private class Transformer(
     fun run(): Asyncify.Result {
         val bodies = bodies()
         analyze(bodies)
-        if (suspendable.isNotEmpty()) untypedReason?.let { throw AsyncifyUnsupported("止まりうる関数があるので型を追う必要があるが、$it") }
+        // 型を追うのは、書き換える（定義済みの）止まりうる関数だけ。止まりうる import を持っていても、呼ぶ関数がなければ断らない
+        if (suspendable.any { it >= importedFuncs }) untypedReason?.let { throw AsyncifyUnsupported("止まりうる関数があるので型を追う必要があるが、$it") }
         val sections = withRequiredSections(scanSections())
         val newTypePush = module.typeSection().subTypeCount()
         val out = Sink()
@@ -458,13 +464,14 @@ private class Transformer(
         )
     }
 
-    /** エラーメッセージ用の関数の呼び方（番号と、あれば export の名前） */
+    /** エラーメッセージ用の関数の呼び方（元のモジュールの番号（[originalFunc]）と、あれば export の名前） */
     private fun describe(f: Int): String {
         val exports = module.exportSection()
         val names = (0 until exports.exportCount()).map { exports.getExport(it) }
             .filter { it.exportType() == ExternalType.FUNCTION && it.index() == f }
             .map { it.name() }
-        return if (names.isEmpty()) "#$f" else "#$f（export ${names.joinToString("、")}）"
+        val n = originalFunc(f)
+        return if (names.isEmpty()) "#$n" else "#$n（export ${names.joinToString("、")}）"
     }
 
     /** [empty] は、元のモジュールになく、足した空のセクション（[start]・[end] は使わない） */

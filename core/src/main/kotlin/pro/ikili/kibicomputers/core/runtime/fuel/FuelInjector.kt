@@ -73,6 +73,8 @@ internal object FuelInjector {
      * @property maxUnchecked 残りを確かめる間に実行されうる命令数の最大（燃料の行き過ぎの上限の目安。長さに比例する分は含まない）
      * @property sizesBefore 定義済みの関数ごとの、挿入の前の本体の大きさ（バイト）
      * @property sizesAfter 同じく挿入の後
+     * @property fuelFunc 足した [WasmFuel.IMPORT_NAME] の import の関数の番号（元の関数の import の数）。
+     *   これ以上の番号の定義済みの関数は、元のモジュールより1つ大きい
      */
     class Result(
         val bytes: ByteArray,
@@ -81,7 +83,15 @@ internal object FuelInjector {
         val maxUnchecked: Long,
         val sizesBefore: IntArray,
         val sizesAfter: IntArray,
-    )
+        val fuelFunc: Int,
+    ) {
+        /** 挿入した後の関数の番号 [index] を、元のモジュールの番号に戻す（足した import そのものは -1） */
+        fun originalFunc(index: Int): Int = when {
+            index < fuelFunc -> index
+            index == fuelFunc -> -1
+            else -> index - 1
+        }
+    }
 
     /**
      * [wasm] に計測コードを挿入する。重いので（lua.wasm で数十 ms）、メインスレッドでは呼ばない。
@@ -243,7 +253,7 @@ internal object FuelInjector {
             }
         }
         insertMissingBefore(Int.MAX_VALUE)
-        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter)
+        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter, fuelFunc)
     }
 
     private class BodyStats(val checks: Int, val charges: Int, val maxUnchecked: Long)
