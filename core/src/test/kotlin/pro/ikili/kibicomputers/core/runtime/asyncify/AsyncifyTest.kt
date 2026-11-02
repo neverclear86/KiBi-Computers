@@ -387,4 +387,144 @@ class AsyncifyTest {
         val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(b.build(), setOf("w.wait")) }
         assertTrue(e.message!!.contains("止まりうる関数 #1（export run）") && e.message!!.contains("末尾呼び出し"), e.message)
     }
+
+    // ---- 手で組み立てるモジュール（WasmBinary で書けない型・テーブル・タグ・要素） ----
+
+    private fun bytes(vararg b: Int): ByteArray = ByteArray(b.size) { b[it].toByte() }
+
+    private fun vec(items: List<ByteArray>): ByteArray = items.fold(WasmBinary.uleb(items.size.toLong())) { acc, b -> acc + b }
+
+    private fun name(s: String): ByteArray = s.toByteArray().let { WasmBinary.uleb(it.size.toLong()) + it }
+
+    /** ローカル変数のない関数の本体（[code] は `end` を含めない） */
+    private fun body(code: ByteArray): ByteArray = (bytes(0) + code + bytes(0x0B)).let { WasmBinary.uleb(it.size.toLong()) + it }
+
+    /** セクション（id と中身）を並べた順に書いたモジュール */
+    private fun module(vararg sections: Pair<Int, ByteArray>): ByteArray {
+        var out = bytes(0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00)
+        for ((id, content) in sections) out += bytes(id) + WasmBinary.uleb(content.size.toLong()) + content
+        return out
+    }
+
+    /** モジュールのセクションの id と中身を、並びの順に読む */
+    private fun sections(wasm: ByteArray): List<Pair<Int, ByteArray>> {
+        val list = ArrayList<Pair<Int, ByteArray>>()
+        var pos = 8
+        while (pos < wasm.size) {
+            val id = wasm[pos++].toInt()
+            var size = 0
+            var shift = 0
+            while (true) {
+                val b = wasm[pos++].toInt() and 0xFF
+                size = size or ((b and 0x7F) shl shift)
+                shift += 7
+                if (b and 0x80 == 0) break
+            }
+            list += id to wasm.copyOfRange(pos, pos + size)
+            pos += size
+        }
+        return list
+    }
+
+    /** `() -> i32` の型 */
+    private val typeRunI32 = bytes(0x60, 0x00, 0x01, 0x7F)
+
+    /**
+     * 型付きの参照型（`(ref 0)`・`(ref null 0)`）を [where]（`type`・`global`・`table`）に持ち、`run() -> i32` を export するモジュール。
+     * [import] なら `w.wait` を import し、[callWait] なら `run` がそれを呼ぶ（止まりうる関数になる）
+     */
+    private fun typedRefModule(where: String, import: Boolean, callWait: Boolean): ByteArray {
+        val types = mutableListOf(typeRunI32)
+        // (func (param (ref 0)))
+        if (where == "type") types += bytes(0x60, 0x01, 0x64, 0x00, 0x00)
+        val sections = mutableListOf(1 to vec(types))
+        if (import) sections += 2 to vec(listOf(name("w") + name("wait") + bytes(0x00, 0x00)))
+        sections += 3 to vec(listOf(bytes(0x00)))
+        // (table 1 (ref null 0))
+        if (where == "table") sections += 4 to vec(listOf(bytes(0x63, 0x00, 0x00, 0x01)))
+        // (global (ref null 0) (ref.null 0))
+        if (where == "global") sections += 6 to vec(listOf(bytes(0x63, 0x00, 0x00, 0xD0, 0x00, 0x0B)))
+        val run = if (import) 1 else 0
+        sections += 7 to vec(listOf(name("run") + bytes(0x00, run)))
+        sections += 10 to vec(listOf(body(if (callWait) bytes(0x10, 0x00) else bytes(0x41, 0x01))))
+        return module(*sections.toTypedArray())
+    }
+
+    @Test
+    fun `型付きの参照型は、止まりうる関数がなければ通り、あれば断る`() {
+        for (where in listOf("type", "global", "table")) {
+            // 止まりうる import がない／あっても呼ぶ関数がない: 本体を書き換えずに通す
+            for (import in listOf(false, true)) {
+                val r = Asyncify.transform(typedRefModule(where, import, callWait = false), setOf("w.wait"))
+                assertEquals(0, r.instrumented, where)
+                assertEquals(r.codeBefore, r.codeAfter, where)
+                run.endive.wasm.Parser.parse(r.bytes)
+            }
+            // 止まりうる関数がある: 型を追えないので断る
+            val e = assertThrows<AsyncifyUnsupported>(where) { Asyncify.transform(typedRefModule(where, import = true, callWait = true), setOf("w.wait")) }
+            assertTrue(e.message!!.contains("型付きの参照型") && e.message!!.contains("止まりうる関数があるので"), e.message)
+        }
+    }
+
+    @Test
+    fun `テーブルとタグのimportがあると、table_getとthrowの型はimportしたものから数える`() {
+        // 型: 0 = () -> i32、1 = (i32 i32) -> ()（import するタグ）、2 = (i64) -> ()（定義するタグ）
+        val types = vec(listOf(typeRunI32, bytes(0x60, 0x02, 0x7F, 0x7F, 0x00), bytes(0x60, 0x01, 0x7E, 0x00)))
+        val imports = vec(
+            listOf(
+                name("w") + name("wait") + bytes(0x00, 0x00), // 関数 0
+                name("env") + name("t") + bytes(0x01, 0x70, 0x00, 0x01), // テーブル 0（funcref）
+                name("env") + name("e") + bytes(0x04, 0x00, 0x01), // タグ 0（i32 i32）
+            ),
+        )
+        // run:
+        //   i32.const 0  table.get 1（定義した externref のテーブル）  call wait  drop  drop
+        //   block  call wait  i32.eqz  br_if 0  i64.const 5  throw 1（定義したタグ。引数は i64 の1つ）  end
+        //   i32.const 7
+        val code = bytes(
+            0x41, 0x00, 0x25, 0x01, 0x10, 0x00, 0x1A, 0x1A,
+            0x02, 0x40, 0x10, 0x00, 0x45, 0x0D, 0x00, 0x42, 0x05, 0x08, 0x01, 0x0B,
+            0x41, 0x07,
+        )
+        val wasm = module(
+            1 to types,
+            2 to imports,
+            3 to vec(listOf(bytes(0x00))),
+            4 to vec(listOf(bytes(0x6F, 0x00, 0x01))), // テーブル 1（externref）
+            13 to vec(listOf(bytes(0x00, 0x02))), // タグ 1（i64）
+            7 to vec(listOf(name("run") + bytes(0x00, 0x01))),
+            10 to vec(listOf(body(code))),
+        )
+        EndiveRuntime().load(wasm)
+        val r = Asyncify.transform(wasm, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertEquals(2, r.sites)
+        // 検証が通る（呼び出しをまたいで退避した externref の型と、throw で取り出す値の数が合っている）
+        assertTrue(EndiveRuntime().load(r.bytes).isAsyncified)
+    }
+
+    @Test
+    fun `足したグローバルとexportのセクションは、startと要素のセクションより前に入れる`() {
+        // 型: 0 = () -> i32、1 = () -> ()。関数: 0 = w.wait、1 = init（start）、2 = run（要素からも指す）
+        val wasm = module(
+            1 to vec(listOf(typeRunI32, bytes(0x60, 0x00, 0x00))),
+            2 to vec(listOf(name("w") + name("wait") + bytes(0x00, 0x00))),
+            3 to vec(listOf(bytes(0x01), bytes(0x00))),
+            4 to vec(listOf(bytes(0x70, 0x00, 0x01))),
+            8 to bytes(0x01),
+            // (elem (i32.const 0) func 2)
+            9 to vec(listOf(bytes(0x00, 0x41, 0x00, 0x0B, 0x01, 0x02))),
+            // init: なにもしない。run: wait() + call_indirect (type 0) 0
+            10 to vec(listOf(body(bytes()), body(bytes(0x10, 0x00, 0x41, 0x00, 0x11, 0x00, 0x00, 0x6A)))),
+        )
+        EndiveRuntime().load(wasm)
+        val r = Asyncify.transform(wasm, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        val out = sections(r.bytes)
+        assertEquals(listOf(1, 2, 3, 4, 6, 7, 8, 9, 10), out.map { it.first })
+        // 定義済みの関数の番号は、足した import 2つの分ずれる（init は 3、run は 4）
+        assertArrayEquals(bytes(0x03), out.single { it.first == 8 }.second)
+        assertArrayEquals(bytes(0x01, 0x00, 0x41, 0x00, 0x0B, 0x01, 0x04), out.single { it.first == 9 }.second)
+        assertTrue(EndiveRuntime().load(r.bytes).isAsyncified)
+    }
 }
