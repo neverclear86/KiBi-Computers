@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
+import pro.ikili.kibicomputers.core.kernel.MachineLimits
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
@@ -982,6 +983,13 @@ internal class ProcessRunner(private val machine: Machine) {
                 val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
                 holder.fuel -= amount
             }
+        }
+
+        override fun flushConsole() {
+            val cells = machine.pumpConsole()
+            if (cells <= 0 || rt.process.unmetered) return
+            // 書いた分は、手持ちがあれば払う（手持ちがない呼び出し元では払わない）
+            lock.withLockValue { rt.currentHolder?.let { it.fuel -= cells * MachineLimits.CONSOLE_FUEL_PER_CELL } }
         }
     }
 }

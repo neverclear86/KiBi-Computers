@@ -71,6 +71,7 @@ object TestComputerGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         helper.assertTrue(case.wiring.connectedScreen === screen, "the adjacent screen should be connected")
         helper.assertTrue(case.wiring.connectedKeyboard === keyboard, "the adjacent keyboard should be connected")
+        helper.assertTrue(screen.display === case.wiring.connectedConsole?.display, "the screen should mirror the machine's display device")
         val machine = case.computer.machine!!
         var typed = false
         helper.succeedWhen {
@@ -135,51 +136,52 @@ object TestComputerGameTests {
     }
 
     /**
-     * 出力を止めている最中（画面に書ききれずに取っておいた分がある間）に画面を壊すと、たまった分を書かずに捨て、
-     * 外れた画面にはもう書かない（#397）。止めている間はマシンが出力を配らないので、画面の取り外しの知らせで気付く。
+     * プログラムが出力し続けている最中（プロセスのスレッドが表示デバイスに書いている間。#355）に画面を壊すと、すぐに外し、
+     * 外れた画面（が映していた表示デバイス）にはもう書かない（#397）。
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
-    fun breakingScreenWhileOutputIsHeldDiscardsBacklog(helper: GameTestHelper) {
+    fun breakingScreenWhileFloodingStopsWritingToIt(helper: GameTestHelper) {
         val (case, screen, keyboard) = build(helper)
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         val machine = case.computer.machine!!
         val console = case.wiring.connectedConsole!!
+        helper.assertTrue(screen.display === console.display, "the screen should mirror the machine's display device")
         var typed = false
         var broken = false
-        var problem: String? = null
         var removedText: List<String> = emptyList()
         var ticksAfterBreak = 0
         helper.succeedWhen {
             if (!typed) {
-                val text = lines(screen.text)
+                val text = locked(screen) { lines(screen.text) }
                 helper.assertTrue(text.any { it == ">" }, "prompt should be shown: $text")
-                // 1行送りの間に文字を挟むと1回ごとに画面全体を写すので、1 tick の上限をすぐに超えて出力を止める（#357）
-                typeLine(helper, keyboard, "while true do io.write((\"\\27[Sx\"):rep(5000)) end")
+                typeLine(helper, keyboard, "while true do io.write((\"x\\n\"):rep(500)) end")
                 typed = true
             }
             if (!broken) {
-                helper.assertTrue(console.backlogBytes > 0, "the console should hold the output (backlog ${console.backlogBytes})")
-                val droppedBefore = console.droppedBytes
-                val backlog = console.backlogBytes
+                helper.assertTrue(locked(screen) { lines(screen.text) }.any { it == "x" }, "the program should be flooding the screen")
                 helper.setBlock(SCREEN, Blocks.AIR)
                 broken = true
-                removedText = lines(screen.text)
-                problem = when {
-                    case.wiring.connectedScreen != null -> "breaking the screen should disconnect it while the output is held"
-                    console.backlogBytes != 0 -> "the backlog should be discarded: ${console.backlogBytes}"
-                    console.droppedBytes != droppedBefore + backlog ->
-                        "the whole backlog ($backlog) should be dropped: ${console.droppedBytes - droppedBefore}"
-                    else -> null
-                }
+                helper.assertTrue(case.wiring.connectedScreen == null, "breaking the screen should disconnect it at once")
+                removedText = locked(screen) { lines(screen.text) }
             }
-            helper.assertTrue(problem == null, problem ?: "")
             // 外れた画面には、もう書かない
-            helper.assertTrue(lines(screen.text) == removedText, "the removed screen should not be written to")
+            helper.assertTrue(locked(screen) { lines(screen.text) } == removedText, "the removed screen should not be written to")
             helper.assertTrue(machine.state == MachineState.RUNNING, "machine should keep running without a screen")
             helper.assertTrue(++ticksAfterBreak > 20, "watch the removed screen for a while")
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    // 表示デバイスはプロセスのスレッドも書くので、ロックを持って読む（#355）
+    private fun <T> locked(screen: ScreenBlockEntity, block: () -> T): T {
+        val lock = screen.display.lock
+        lock.lock()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
         }
     }
 

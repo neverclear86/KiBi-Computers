@@ -7,6 +7,7 @@ import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.InstalledParts
 import pro.ikili.kibicomputers.core.computer.MachineConsole
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.display.DisplayDevice
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardListener
 import pro.ikili.kibicomputers.core.kernel.BootConfig
@@ -24,12 +25,14 @@ import java.util.UUID
  * - 起動部品は挿さっているとみなす（[withBootPart]）。置き換え先: 起動部品のアイテム #125、ファームウェア #99
  * - 起動ディスクは同梱イメージ（[TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
- *   コンソールの出力を画面に、キーボードの入力をコンソールに流す（[MachineConsole]）。動いている間に置いたものは見ない。
+ *   表示デバイス（[DisplayDevice]）を作って画面に映させ、コンソールの出力を表示デバイスに、キーボードの入力をコンソールに流す
+ *   （[MachineConsole]。プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
  *   つないだ画面が外れたら、画面とキーボードから外す（#397）。
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
+ * 表示デバイスの中身は、プロセスのスレッドも書くので、読むときはそのロックを持つ。
  */
 internal class TestComputerWiring : MachineHost, KeyboardListener {
     private var console: MachineConsole? = null
@@ -57,10 +60,10 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         if (screen != null) {
             this.screen = screen
             screen.addRemovalListener(onScreenRemoved)
-            console = MachineConsole(screen.text, screen.tier.maxColors).also {
-                it.reset()
-                it.machine = machine
-            }
+            // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。電源を入れるたびに新しく作る
+            val display = DisplayDevice.forTier(screen.tier)
+            screen.mirror(display)
+            console = MachineConsole(display).also { it.machine = machine }
             // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
             keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
         }
@@ -68,7 +71,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     /**
-     * 電源が切れた・ケースが消える・画面が外れた。画面とキーボードから外す（画面の中身はそのまま残す）。
+     * 電源が切れた・ケースが消える・画面が外れた。画面とキーボードから外す（画面は最後の表示デバイスを映したままにし、中身を残す）。
      * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）。
      * 画面が外れたときは、画面からの知らせ（[ScreenBlockEntity.addRemovalListener]）でも呼ぶ。出力を止めている間は
      * [onConsoleOutput] が呼ばれないので、それだけでは気付けない（#397）
