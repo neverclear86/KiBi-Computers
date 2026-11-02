@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -11,16 +12,21 @@ import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.FuelYieldRejectionLog
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import java.time.Duration
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -214,6 +220,97 @@ class AsyncFuelTest {
             println("Lua の燃料切れ: 巻き戻し $unwinds 回、スレッドを持って待った $blocking 回")
             assertTrue(unwinds > 0)
             assertTrue(unwinds >= blocking, "巻き戻し $unwinds 回、スレッドを持って待った $blocking 回")
+        }
+    }
+    /**
+     * 段1（燃料切れも待ち点にする）を断られ、段2（入力待ちだけ）で変換できる p1 のコマンド（#396）。
+     *
+     * `_start` は、引数を持つブロック `(block (param i32) ...)` の中で [n] 回まわる loop と、通らない `poll_oneoff` の呼び出しを持つ。
+     * `poll_oneoff` を呼びうるので `_start` は止まりうる関数になり、段1では loop の先頭の燃料の確かめが、引数を持つブロックの中の
+     * 待ち点になって断られる。段2では、そのブロックの中に待ち点がないので変換できる
+     */
+    private fun fallbackModule(n: Int): ByteArray {
+        val i32 = WasmBinary.I32
+        val b = WasmBinary()
+        val poll = b.importFunc("wasi_snapshot_preview1", "poll_oneoff", listOf(i32, i32, i32, i32), listOf(i32))
+        b.memory(1)
+        val withParam = b.typeIndex(listOf(i32), emptyList())
+        val body = WasmBinary.code(
+            0x41, WasmBinary.sleb(n.toLong()),
+            0x02, withParam, 0x21, 0, // (block (param i32) local.set 0
+            0x02, 0x40, 0x03, 0x40, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B, // 0 になるまで減らす loop
+            0x0B, // )
+            0x41, 0, 0x04, 0x40, 0x41, 0, 0x41, 0, 0x41, 0, 0x41, 0, 0x10, poll, 0x1A, 0x0B, // (if (i32.const 0) (drop (call poll_oneoff ...)))
+        )
+        b.exportFunc("_start", b.func(emptyList(), emptyList(), body, locals = listOf(i32)))
+        return b.build()
+    }
+
+    @Test
+    fun `段1を断られたモジュールは段2で変換し、燃料切れはスレッドを持って待つ待機点型として動く`() = timeout(limit) {
+        val bytes = fallbackModule(200_000)
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 50_000)
+            m.lock.withLockValue {
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                m.vfs.createDirectory(VfsPath.parse("/bin"))
+                val f = m.vfs.open(VfsPath.parse("/bin/fallback"), OpenOptions(read = true, write = true, create = true, truncate = true))
+                m.vfs.write(f, bytes, 0, bytes.size)
+            }
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)
+            val pid = m.exec("/bin/fallback", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("fallback"), stdio = stdio))
+            val program = m.rt(pid).program
+            assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
+            assertTrue(program.module.isAsyncified)
+            assertFalse(program.fuelYield)
+            assertNotNull(program.fuelYieldRejection)
+            val reason = program.fuelYieldRejection!!
+            assertTrue(reason.contains("引数を持つブロック"), reason)
+            // 読み込んだときに、理由をもうログに出している（同じモジュールではもう出さない）
+            assertFalse(FuelYieldRejectionLog.report(program.hash, reason))
+            eventually(60_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0, "燃料切れでスレッドを持って待っていない")
+            assertEquals(unwinds0, h.scheduler.fuelUnwinds.get(), "段2なのに燃料切れで巻き戻した")
+        }
+    }
+
+    @Test
+    fun `段1を断った理由のログは、同じモジュールで1回だけ出す`() {
+        val bytes = fallbackModule(123_457)
+        val hash = Program.loadMetered(EndiveRuntime(), bytes, waitImports = WasiP1.WAIT_IMPORTS).hash
+        // 1回目の読み込みで出した。読み込み直しても、もう出さない
+        assertFalse(FuelYieldRejectionLog.report(hash, "x"))
+        val again = Program.loadMetered(EndiveRuntime(), bytes, waitImports = WasiP1.WAIT_IMPORTS)
+        assertEquals(hash, again.hash)
+        assertFalse(FuelYieldRejectionLog.report(hash, "x"))
+        // 段1で変換できたモジュールは出さない
+        val yielded = Program.loadMetered(EndiveRuntime(), resource("fuel-spin-wasi.wasm"), waitImports = WasiP1.WAIT_IMPORTS)
+        assertTrue(yielded.fuelYield)
+        assertTrue(FuelYieldRejectionLog.report(yielded.hash, "テストから"))
+    }
+
+    @Test
+    fun `手持ちを渡した後にtickが進んでから巻き戻したら、その tick の補充で次の tick を待たずに再開する`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 20_000)
+            val unwound = AtomicInteger()
+            // 1回目の巻き戻しの直前に tick を進める（ディスパッチャーはこの tick の列を、巻き戻したプロセスを入れる前に見る）
+            h.scheduler.hooks.beforeFuelUnwound = { _, _ -> if (unwound.incrementAndGet() == 1) h.scheduler.tick() }
+            val s = Spin(h, m, listOf("main", "1000", "100000"))
+            assertTrue(s.rt.program.fuelYield)
+            val before = h.scheduler.fuelUnwinds.get()
+            h.scheduler.tick()
+            // 進めた tick の補充で巻き直して動き、また燃料が切れて巻き戻す（この間、テストからは tick を進めない）
+            eventually(30_000, "進めた tick の補充で再開しない") { h.scheduler.fuelUnwinds.get() - before >= 2 && s.waitingFuelThreadless() }
+            assertEquals(2, unwound.get())
+            m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
+            Unit
         }
     }
 }

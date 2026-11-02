@@ -124,4 +124,67 @@ class WasmRuntimeJavaTest {
         assertEquals(List.of(WasmValueType.I64), WasmAsync.POP_TYPE.getResults());
         assertEquals(2, WasmAsyncState.valueOf("REWINDING").ordinal());
     }
+    @Test
+    void fuelHandlerUnwindableAndAsyncFuelNames() {
+        assertEquals("async_fuel", WasmAsync.FUEL);
+        assertEquals(List.of(WasmValueType.I64), WasmAsync.FUEL_TYPE.getParams());
+        assertEquals(List.of(WasmValueType.I64), WasmAsync.FUEL_TYPE.getResults());
+        assertEquals(WasmFuel.IMPORT_TYPE, WasmAsync.FUEL_TYPE);
+
+        // asyncState を読み書きできる、変換したモジュールのインスタンス（呼び出しはしない）
+        WasmModule module = new EndiveRuntime().load(TestModules.INSTANCE.getASYNC_WAIT());
+        Deque<Long> saved = new ArrayDeque<>();
+        WasmInstanceConfig config = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(List.of(), List.of(WasmValueType.I32)), (instance, args) -> new long[] {0})
+            .asyncStack(new WasmAsyncStack() {
+                @Override
+                public void push(long value) {
+                    saved.push(value);
+                }
+
+                @Override
+                public long pop() {
+                    return saved.pop();
+                }
+            })
+            .build();
+        try (WasmInstance instance = module.instantiate(config)) {
+            // lambda の実装は、既定の onFuelExhaustedUnwindable で onFuelExhausted に回る（巻き戻さない）
+            WasmFuelHandler lambda = (i, remaining) -> remaining + 100;
+            assertEquals(90L, lambda.onFuelExhaustedUnwindable(instance, -10));
+            assertEquals(WasmAsyncState.NORMAL, instance.getAsyncState());
+
+            // 既存の書き方（onFuelExhausted だけを実装する匿名クラス）もそのままコンパイルでき、既定に回る
+            WasmFuelHandler legacy = new WasmFuelHandler() {
+                @Override
+                public long onFuelExhausted(WasmInstance i, long remaining) {
+                    return 7;
+                }
+            };
+            assertEquals(7L, legacy.onFuelExhaustedUnwindable(instance, -1));
+
+            // 巻き戻せるところの口を上書きする
+            int[] calls = {0, 0};
+            WasmFuelHandler unwinding = new WasmFuelHandler() {
+                @Override
+                public long onFuelExhausted(WasmInstance i, long remaining) {
+                    calls[0]++;
+                    return 1;
+                }
+
+                @Override
+                public long onFuelExhaustedUnwindable(WasmInstance i, long remaining) {
+                    calls[1]++;
+                    i.setAsyncState(WasmAsyncState.UNWINDING);
+                    return remaining;
+                }
+            };
+            assertEquals(-5L, unwinding.onFuelExhaustedUnwindable(instance, -5));
+            assertEquals(WasmAsyncState.UNWINDING, instance.getAsyncState());
+            assertEquals(0, calls[0]);
+            assertEquals(1, calls[1]);
+            instance.setAsyncState(WasmAsyncState.NORMAL);
+            WasmInstanceConfig.builder().fuel(0, unwinding).build();
+        }
+    }
 }

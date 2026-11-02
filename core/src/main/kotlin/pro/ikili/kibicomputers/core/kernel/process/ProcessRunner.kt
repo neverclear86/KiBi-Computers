@@ -219,14 +219,20 @@ internal class ProcessRunner(private val machine: Machine) {
      *
      * 巻き戻し・巻き直しの費用（退避した値の数 × [FuelCosts.ASYNC_VALUE]）は、ここでマシンの燃料から引く（借りになり、後の補充で返す）。
      * 再開のときの grant から引かないのは、費用が grant より大きいと、巻き直してすぐにまた切れて先へ進めないため
+     *
+     * 手持ちを渡した後に tick が進んでいたら、ディスパッチャーがその tick の列を見終えた後かもしれないので、もう一度見直させる
+     * （[tryGrantLocked] と同じ。#396）。そうしないと、スレッドを持って待つ側（その場で補充を受け取れる）より再開が最大 1 tick 遅れうる
      */
     private fun waitFuelUnwound(rt: ProcessRuntime) {
+        hooks.beforeFuelUnwound?.invoke(machine, rt.pid)
         lock.withLockValue {
             if (rt.killed) throw ProcessKilledException()
             val stack = checkNotNull(rt.process.asyncStack) { "退避先がない" }
             check(!stack.isEmpty) { "燃料切れで巻き戻したのに退避した値がない" }
             val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
             holder.fuel = 0
+            // CPU を持っている間は、最後に補充した tick が手持ちを渡した tick（FuelAccount）。giveBack で書き換わる前に読む
+            val grantedTick = machine.fuelAccount.lastRefillTick
             rt.process.state = ProcessState.RUNNABLE
             rt.stackActive = false
             enqueueFuelWaitLocked(rt, threadless = true)
@@ -234,6 +240,7 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.fuelUnwindRemaining = 0
             scheduler.deactivate(rt)
             scheduler.fuelUnwinds.incrementAndGet()
+            if (now != grantedTick) scheduler.dispatcher.signal()
         }
         releasePermitAndCpu(rt)
     }
