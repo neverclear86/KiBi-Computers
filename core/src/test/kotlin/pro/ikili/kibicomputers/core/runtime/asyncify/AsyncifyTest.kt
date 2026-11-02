@@ -71,6 +71,11 @@ class AsyncifyTest {
         assertFalse(module.isFuelMetered)
         assertEquals(listOf("w.wait"), module.imports.map { "${it.module}.${it.name}" })
         assertEquals(listOf("run"), module.exports.map { it.name })
+        assertWaitCycle(module)
+    }
+
+    /** `run` を呼んで `w.wait` で巻き戻し、巻き直して 42 が返ることを確かめる */
+    private fun assertWaitCycle(module: pro.ikili.kibicomputers.core.runtime.WasmModule) {
         var calls = 0
         val stack = Stack()
         val config = WasmInstanceConfig.builder()
@@ -325,5 +330,61 @@ class AsyncifyTest {
         }.build()
         assertThrows<WasmLoadException> { Asyncify.transform(importsFuel, emptySet()) }
         assertThrows<WasmLoadException> { EndiveRuntime().load(importsFuel) }
+    }
+
+    @Test
+    fun `止まりうる関数がないモジュールは、セクションがなくても本体を書き換えずに変換する`() {
+        // 型・import・グローバル・export のどのセクションもない（ヘッダーだけ）
+        val header = byteArrayOf(0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00)
+        val empty = Asyncify.transform(header, WasiP1.WAIT_IMPORTS)
+        assertEquals(0, empty.functions)
+        assertTrue(EndiveRuntime().load(empty.bytes).isAsyncified)
+
+        // グローバル・export のセクションがなく、止まりうる import を使わない関数だけ
+        val plain = WasmBinary().apply { func(listOf(i32), listOf(i32), WasmBinary.code(0x20, 0, 0x41, 1, 0x6A)) }.build()
+        val r = Asyncify.transform(plain, setOf("w.wait"))
+        assertEquals(1, r.functions)
+        assertEquals(0, r.instrumented)
+        assertEquals(r.codeBefore, r.codeAfter)
+        assertTrue(EndiveRuntime().load(r.bytes).isAsyncified)
+    }
+
+    @Test
+    fun `グローバルのセクションがなくても、止まりうる関数を変換して巻き戻せる`() {
+        val b = WasmBinary()
+        val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
+        b.exportFunc("run", b.func(emptyList(), listOf(i32), WasmBinary.code(0x10, wait, 0x41, 1, 0x6A)))
+        val r = Asyncify.transform(b.build(), setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertWaitCycle(EndiveRuntime().load(r.bytes))
+    }
+
+    @Test
+    fun `関数でないimportがあっても変換し、グローバルの番号はimportしたものから数える`() {
+        val b = WasmBinary()
+        b.importMemory("env", "memory", 1)
+        val g = b.importGlobal("env", "g", i32)
+        val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
+        b.mutableI64Global(0)
+        // global.get g + wait()
+        b.exportFunc("run", b.func(emptyList(), listOf(i32), WasmBinary.code(0x23, g, 0x10, wait, 0x6A)))
+        val r = Asyncify.transform(b.build(), setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        // 状態のグローバルは、import した1つと定義した1つの後（番号 2）
+        val parsed = run.endive.wasm.Parser.parse(r.bytes).exportSection()
+        val state = (0 until parsed.exportCount()).map(parsed::getExport).single { it.name() == WasmAsync.STATE_EXPORT }
+        assertEquals(2, state.index())
+        // 検証が通る（変換したコードのグローバルの型も合っている）
+        val module = EndiveRuntime().load(r.bytes)
+        assertTrue(module.isAsyncified)
+    }
+
+    @Test
+    fun `断る理由に、どの関数のどの機能かが入る`() {
+        val b = WasmBinary()
+        val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
+        b.exportFunc("run", b.func(emptyList(), listOf(i32), WasmBinary.code(0x12, wait)))
+        val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(b.build(), setOf("w.wait")) }
+        assertTrue(e.message!!.contains("止まりうる関数 #1（export run）") && e.message!!.contains("末尾呼び出し"), e.message)
     }
 }

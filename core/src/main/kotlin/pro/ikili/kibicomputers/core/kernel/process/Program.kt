@@ -71,6 +71,8 @@ internal class Program private constructor(
          * 「構造の上限の確認 → 燃料の計測コードの挿入 → 変換 → パースと検証」（理由は [Instrumentation]。#341）。変換できない作り（v128 のローカル、末尾呼び出しなど）は、
          * 変換せずに（`BLOCKING` のプロセスとして）読み込むことはせず、[WasmLoadException] で断る（#364・#367）。
          * そのときの原因（`cause`）は [AsyncifyUnsupported] で、どの命令・どの機能で断ったかは [unsuspendableReason] で取り出せる。
+         * 断るのは止まりうる関数を変換できないときだけで、止まりうる関数がない（[waitImports] を使わない）モジュールは、
+         * 関数の本体を書き換えずに待機点型として読み込む（#384）。
          * 変換は2段で試す（#339。[Instrumentation]）: 燃料切れも待ち点にする（段1。[fuelYield]）→ 断られたら入力待ちだけの待ち点（段2）→
          * それも断られたら上のとおり断る（理由は段2のもの）。
          * 予約した名前（`kibi.async_push` など）を使っている WASM も [WasmLoadException] で断る

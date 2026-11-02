@@ -5,8 +5,12 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import run.endive.wasm.Parser
 import run.endive.wasm.WasmModule
 import run.endive.wasm.types.AnnotatedInstruction
+import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
+import run.endive.wasm.types.GlobalImport
 import run.endive.wasm.types.OpCode
+import run.endive.wasm.types.TableImport
+import run.endive.wasm.types.TagImport
 import run.endive.wasm.types.ValType
 import java.io.ByteArrayOutputStream
 
@@ -14,7 +18,8 @@ import java.io.ByteArrayOutputStream
  * 変換できない作りのモジュール（#329）。`Program.loadMetered` は、これを原因にした `WasmLoadException` で読み込みを断る
  * （`exec` は `NOEXEC`。#367）。
  *
- * [message] は断った理由（どの命令・どの機能か。`exec` のエラーメッセージに入る）。
+ * [message] は断った理由（どの関数の、どの命令・どの機能か。`exec` のエラーメッセージに入る）。
+ * 止まりうる関数がないモジュールは断らない（#384）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -54,6 +59,13 @@ internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
  * かえって燃料 1 あたりの CPU 時間が増えたのでやめた。ADR 0329 の「燃料切れの待ち点化」）。
  *
  * 名前のカスタムセクションは捨てる（燃料の計測コードの挿入と同じ）。
+ *
+ * 止まりうる関数がないモジュール（止まりうる import を使わない）も、関数の本体は書き換えずに（番号の付け替えだけで）同じ形にする
+ * （#384）。足すもの（import 2つと状態のグローバル）はそろうので、カーネルは待機点型（`WAIT_POINT`）として動かせ、専用のスレッドを使わない。
+ * 止まりうる関数の中でしか使わない型の情報（型付きの参照型など）で断ることはしない。
+ *
+ * ない型・import・グローバル・export のセクションは、空のセクションとして扱う（足すものを入れる新しいセクションを作る）。
+ * import は関数・メモリ・テーブル・グローバル・タグのどれでもよい。グローバル・テーブル・タグの番号は、import したものが先に並ぶ。
  */
 internal object Asyncify {
     /**
@@ -95,8 +107,10 @@ internal object Asyncify {
      * [yieldImport]（`"<module>.<name>"`）があれば、止まりうる関数の中のその呼び出しも待ち点にし、[WasmAsync.FUEL] の呼び出しに書き換える（#339）。
      * その import の型は `(i64) -> (i64)` でなければならない。モジュールがその import を持たなければ、何もしない。
      *
-     * @throws AsyncifyUnsupported 変換できない作り（SIMD、GC・型付きの参照型、止まりうる関数の中の末尾呼び出し、
-     *   止まりうる構造の中の、引数を持つブロックや複数の結果を持つブロック、関数でない import など）。変換せずに動かす
+     * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
+     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる呼び出しを含む、引数を持つブロックや
+     *   複数の結果を持つブロックなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
+     *   止まりうる関数がないモジュールは、これでは断らない（#384）
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)
@@ -154,7 +168,7 @@ private fun code(v: ValType): Int {
     val op = v.opcode()
     // Endive は funcref などの略記を (ref null <抽象ヒープ型>) で持つ。抽象ヒープ型の番号は「略記のバイト - 0x80」
     if (op == 0x63 && v.typeIdx() < 0) return v.typeIdx() + 0x80
-    if (op == 0x63 || op == 0x64) throw AsyncifyUnsupported("型付きの参照型には対応していない")
+    if (op == 0x63 || op == 0x64) throw AsyncifyUnsupported("型付きの参照型（GC・関数参照の提案の (ref <型>)）には対応していない")
     return op
 }
 
@@ -180,7 +194,7 @@ private class TypeStack(initial: List<Int> = emptyList()) {
     }
 
     fun pop(): Int = if (types.isEmpty()) {
-        if (!unreachable) throw AsyncifyUnsupported("スタックが空なのに取り出した")
+        if (!unreachable) throw AsyncifyUnsupported("命令の型を追えない（スタックが空なのに取り出した）")
         BOT
     } else {
         types.removeAt(types.size - 1)
@@ -209,6 +223,19 @@ private class Transformer(
     private val tagSigs = ArrayList<Sig>()
     private val asyncFuncs = HashSet<Int>()
 
+    /**
+     * 型・グローバル・テーブルの型に、追えない型（型付きの参照型）があったときの理由。止まりうる関数があるときだけ断る（#384）。
+     * 止まりうる関数がなければ型は使わないので、そのまま写す
+     */
+    private var untypedReason: String? = null
+
+    private fun codeOrBot(v: ValType): Int = try {
+        code(v)
+    } catch (e: AsyncifyUnsupported) {
+        if (untypedReason == null) untypedReason = e.message
+        BOT
+    }
+
     /** 止まりうる関数（元の番号） */
     private val suspendable = HashSet<Int>()
 
@@ -232,7 +259,7 @@ private class Transformer(
         val types = module.typeSection()
         for (i in 0 until types.typeCount()) {
             val t = types.getType(i)
-            typeSigs += Sig(t.params().map(::code), t.returns().map(::code))
+            typeSigs += Sig(t.params().map(::codeOrBot), t.returns().map(::codeOrBot))
         }
         val imports = module.importSection()
         var nf = 0
@@ -240,12 +267,18 @@ private class Transformer(
         var yt = -1
         for (i in 0 until imports.importCount()) {
             val imp = imports.getImport(i)
-            if (imp !is FunctionImport) throw AsyncifyUnsupported("関数でない import には対応していない: ${imp.module()}.${imp.name()}")
+            // 関数でない import は、番号の空間（グローバル・テーブル・タグ）に先に並ぶ。メモリは型の追跡に関わらない（#384）
+            when (imp) {
+                is GlobalImport -> globalTypes += codeOrBot(imp.type())
+                is TableImport -> tableTypes += codeOrBot(imp.entryType())
+                is TagImport -> tagSigs += typeSigs[imp.tagType().typeIdx()]
+            }
+            if (imp !is FunctionImport) continue
             val full = "${imp.module()}.${imp.name()}"
             if (full in asyncImports) asyncFuncs += nf
             if (full == yieldImport) {
                 val s = typeSigs[imp.typeIndex()]
-                if (s.params != listOf(I64) || s.results != listOf(I64)) throw AsyncifyUnsupported("$full の型が燃料切れの import と違う")
+                if (s.params != listOf(I64) || s.results != listOf(I64)) throw AsyncifyUnsupported("燃料切れの import $full の型が (i64) -> (i64) でない")
                 yf = nf
                 yt = imp.typeIndex()
             }
@@ -258,9 +291,9 @@ private class Transformer(
         val fs = module.functionSection()
         for (i in 0 until fs.functionCount()) funcSigs += typeSigs[fs.getFunctionType(i)]
         val gs = module.globalSection()
-        for (i in 0 until gs.globalCount()) globalTypes += code(gs.getGlobal(i).valueType())
+        for (i in 0 until gs.globalCount()) globalTypes += codeOrBot(gs.getGlobal(i).valueType())
         val ts = module.tableSection()
-        for (i in 0 until ts.tableCount()) tableTypes += code(ts.getTable(i).elementType())
+        for (i in 0 until ts.tableCount()) tableTypes += codeOrBot(ts.getTable(i).elementType())
         module.tagSection().ifPresent { tags -> tags.types().forEach { tagSigs += typeSigs[it.typeIdx()] } }
         pushFunc = importedFuncs
         popFunc = importedFuncs + 1
@@ -308,8 +341,8 @@ private class Transformer(
     fun run(): Asyncify.Result {
         val bodies = bodies()
         analyze(bodies)
-        val sections = scanSections()
-        for (id in listOf(1, 2, 6, 7)) if (sections.none { it.id == id }) throw AsyncifyUnsupported("セクション $id がない")
+        if (suspendable.isNotEmpty()) untypedReason?.let { throw AsyncifyUnsupported("止まりうる関数があるので型を追う必要があるが、$it") }
+        val sections = withRequiredSections(scanSections())
         val newTypePush = module.typeSection().subTypeCount()
         val out = Sink()
         out.bytes(wasm, 0, 8)
@@ -326,10 +359,13 @@ private class Transformer(
         }
         for (s in sections) {
             val r = Reader(wasm, s.start, s.end)
+
+            // 足した空のセクション（[withRequiredSections]）は、要素の数が 0 で中身がない
+            fun count(): Long = if (s.empty) 0 else r.leb()
             when (s.id) {
                 0 -> if (Reader(wasm, s.start, s.end).name() != "name") emit(0, Sink().also { it.bytes(wasm, s.start, s.end - s.start) })
                 1 -> {
-                    val n = r.leb()
+                    val n = count()
                     val body = Sink()
                     body.leb(n + 2)
                     body.bytes(wasm, r.pos, s.end - r.pos)
@@ -339,7 +375,7 @@ private class Transformer(
                     emit(1, body)
                 }
                 2 -> {
-                    val n = r.leb()
+                    val n = count()
                     val body = Sink()
                     body.leb(n + shift)
                     body.bytes(wasm, r.pos, s.end - r.pos)
@@ -351,7 +387,7 @@ private class Transformer(
                     emit(2, body)
                 }
                 6 -> {
-                    val n = r.leb()
+                    val n = count()
                     val body = Sink()
                     body.leb(n + 1)
                     repeat(n.toInt()) {
@@ -363,7 +399,7 @@ private class Transformer(
                     emit(6, body)
                 }
                 7 -> {
-                    val n = r.leb()
+                    val n = count()
                     val body = Sink()
                     body.leb(n + 1)
                     repeat(n.toInt()) {
@@ -392,8 +428,13 @@ private class Transformer(
                         checkpoint()
                         val fn = Sink()
                         if (f in suspendable) {
-                            val rw = FunctionRewriter(f, bodies[i], start, end)
-                            val stats = rw.rewrite(fn)
+                            val rw: FunctionRewriter
+                            val stats = try {
+                                rw = FunctionRewriter(f, bodies[i], start, end)
+                                rw.rewrite(fn)
+                            } catch (e: AsyncifyUnsupported) {
+                                throw AsyncifyUnsupported("止まりうる関数 ${describe(f)} の中: ${e.message}").also { it.initCause(e) }
+                            }
                             instrumented++
                             sites += stats.first
                             maxLocals = maxOf(maxLocals, stats.second)
@@ -417,7 +458,33 @@ private class Transformer(
         )
     }
 
-    private class Section(val id: Int, val start: Int, val end: Int)
+    /** エラーメッセージ用の関数の呼び方（番号と、あれば export の名前） */
+    private fun describe(f: Int): String {
+        val exports = module.exportSection()
+        val names = (0 until exports.exportCount()).map { exports.getExport(it) }
+            .filter { it.exportType() == ExternalType.FUNCTION && it.index() == f }
+            .map { it.name() }
+        return if (names.isEmpty()) "#$f" else "#$f（export ${names.joinToString("、")}）"
+    }
+
+    /** [empty] は、元のモジュールになく、足した空のセクション（[start]・[end] は使わない） */
+    private class Section(val id: Int, val start: Int, val end: Int, val empty: Boolean = false)
+
+    /**
+     * 足すものを入れる型・import・グローバル・export のセクション（1・2・6・7）がなければ、空のセクションとして正しい位置に足す（#384）。
+     * セクションの並び順は 1, 2, 3, 4, 5, 13（タグ）, 6, 7, 8, 9, 12, 10, 11。カスタムセクション（0）はどこにあってもよい
+     */
+    private fun withRequiredSections(sections: List<Section>): List<Section> {
+        val order = listOf(1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 12, 10, 11)
+        fun rank(id: Int) = order.indexOf(id).let { if (it < 0) order.size else it }
+        val list = ArrayList(sections)
+        for (id in listOf(1, 2, 6, 7)) {
+            if (list.any { it.id == id }) continue
+            val at = list.indexOfFirst { it.id != 0 && rank(it.id) > rank(id) }.let { if (it < 0) list.size else it }
+            list.add(at, Section(id, 0, 0, empty = true))
+        }
+        return list
+    }
 
     private fun scanSections(): List<Section> {
         val r = Reader(wasm, 8, wasm.size)
@@ -477,7 +544,7 @@ private class Transformer(
                     r.copyValType(body)
                     exprVec()
                 }
-                else -> throw AsyncifyUnsupported("要素セグメントの形式 $flag には対応していない")
+                else -> throw AsyncifyUnsupported("知らない要素セグメントの形式（$flag）")
             }
         }
         return body
@@ -527,12 +594,12 @@ private class Transformer(
             module.codeSection().getFunctionBody(func - importedFuncs).localTypes().forEach { localTypes += code(it) }
             origLocals = localTypes.size
             for (i in list.indices) endOf[list[i]] = insEnd(list, i, bodyEnd)
-            if (localTypes.any { it == V128 }) throw AsyncifyUnsupported("v128 のローカルには対応していない")
+            if (localTypes.any { it == V128 }) throw AsyncifyUnsupported("SIMD（v128）のローカル変数には対応していない")
             kLocal = newLocal(I32)
         }
 
         private fun newLocal(t: Int): Int {
-            if (t == V128) throw AsyncifyUnsupported("v128 のローカルには対応していない")
+            if (t == V128) throw AsyncifyUnsupported("SIMD（v128）のローカル変数には対応していない")
             newLocals += t
             localTypes += t
             return localTypes.size - 1
@@ -650,9 +717,9 @@ private class Transformer(
         private fun isSuspendCall(ins: AnnotatedInstruction): Boolean = when (ins.opcode()) {
             OpCode.CALL -> ins.operand(0).toInt() in suspendable || isYieldCall(ins)
             OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins.operand(0).toInt())
-            OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("末尾呼び出しには対応していない") else false
+            OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
-                if (indirectMaySuspend(ins.operand(0).toInt())) throw AsyncifyUnsupported("末尾呼び出しには対応していない") else false
+                if (indirectMaySuspend(ins.operand(0).toInt())) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             else -> false
         }
 
@@ -676,7 +743,7 @@ private class Transformer(
                     r.pos++
                     Triple(emptyList(), emptyList(), r.pos)
                 }
-                b == 0x63 || b == 0x64 -> throw AsyncifyUnsupported("型付きの参照型には対応していない")
+                b == 0x63 || b == 0x64 -> throw AsyncifyUnsupported("型付きの参照型（GC・関数参照の提案の (ref <型>)）には対応していない")
                 b in 0x60..0x7F -> {
                     r.pos++
                     Triple(emptyList(), listOf(b), r.pos)
@@ -693,7 +760,7 @@ private class Transformer(
             when (results.size) {
                 0 -> out.u8(0x40)
                 1 -> out.u8(results[0])
-                else -> throw AsyncifyUnsupported("複数の結果を持つブロックには対応していない")
+                else -> throw AsyncifyUnsupported("止まりうる呼び出しを含む、複数の結果を持つブロック（multi-value）には対応していない")
             }
         }
 
@@ -810,7 +877,7 @@ private class Transformer(
                     st.push(I32)
                 }
                 0xFC10 -> st.push(I32)
-                else -> throw AsyncifyUnsupported("止まりうる関数の中の命令 ${ins.opcode()} には対応していない")
+                else -> throw AsyncifyUnsupported("命令 ${ins.opcode()}（SIMD・アトミック・GC などの拡張）には対応していない")
             }
         }
 
@@ -865,7 +932,7 @@ private class Transformer(
                     is Struct -> {
                         callSig = null
                         val (params, _, _) = blockSig(node.open)
-                        if (params.isNotEmpty()) throw AsyncifyUnsupported("引数を持つブロックには対応していない")
+                        if (params.isNotEmpty()) throw AsyncifyUnsupported("止まりうる呼び出しを含む、引数を持つブロック（multi-value）には対応していない")
                         consumed = if (node.open.opcode() == OpCode.IF) 1 else 0
                     }
                 }
@@ -999,7 +1066,7 @@ private class Transformer(
                             out.leb(remap(ins.operand(0)))
                         }
                         OpCode.BR_ON_NULL, OpCode.BR_ON_NON_NULL, OpCode.BR_ON_CAST, OpCode.BR_ON_CAST_FAIL ->
-                            throw AsyncifyUnsupported("${ins.opcode()} には対応していない")
+                            throw AsyncifyUnsupported("命令 ${ins.opcode()}（GC の提案）には対応していない")
                         else -> out.bytes(wasm, ins.address(), end - ins.address())
                     }
                 }
@@ -1153,7 +1220,7 @@ private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
                     out.leb(remap(leb()))
                 }
                 0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op)
-                else -> throw AsyncifyUnsupported("定数式の命令 0x%02X には対応していない".format(op))
+                else -> throw AsyncifyUnsupported("定数式の命令 0x%02X（拡張された定数式の提案）には対応していない".format(op))
             }
         }
     }
