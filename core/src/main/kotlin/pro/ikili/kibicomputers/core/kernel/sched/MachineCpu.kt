@@ -11,9 +11,13 @@ import java.util.concurrent.locks.ReentrantLock
  * 返すときに先頭へ渡す（スレッドなら起こし、スレッドを持たないものなら [onThreadlessGranted] でワーカーに渡す）。
  *
  * 中のロックは末端のロックで、持ったまま他のロックを取らない（カーネルロックの中から呼んでよい）。
- * [onThreadlessGranted] はこのロックの中で呼ぶので、ブロックしてはいけない（ワーカーへの `execute` だけ）。
+ * [onThreadlessGranted] はこのロックの中で呼ぶので、ブロックしてはいけない（許可の待ち行列に並べるだけ。#350）。
+ * [onThreadlessRevoked] は、渡した後でまだ動いていない待ち手を外すときに、同じくロックの中で呼ぶ（許可の待ち行列から外す）。
  */
-internal class MachineCpu(private val onThreadlessGranted: (ProcessRuntime) -> Unit) {
+internal class MachineCpu(
+    private val onThreadlessGranted: (ProcessRuntime) -> Unit,
+    private val onThreadlessRevoked: (ProcessRuntime) -> Unit = {},
+) {
     private class Node(val rt: ProcessRuntime, val condition: Condition?) {
         var granted = false
     }
@@ -83,7 +87,10 @@ internal class MachineCpu(private val onThreadlessGranted: (ProcessRuntime) -> U
         lock.lock()
         try {
             queue.removeAll { it.rt === rt && it.condition == null }
-            if (owner === rt) handOffLocked()
+            if (owner === rt) {
+                onThreadlessRevoked(rt)
+                handOffLocked()
+            }
         } finally {
             lock.unlock()
         }

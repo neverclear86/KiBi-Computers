@@ -31,7 +31,11 @@ internal class KernelThread(name: String, stackBytes: Long, task: Runnable) : Th
  * 待機点型のプロセスの step（インスタンスを作って `start`、または `resume`）を動かすワーカーのプール。
  *
  * 必要に応じてスレッドを作り、仕事のないスレッドは [idleMillis] で終える（コア 0、上限なし、`SynchronousQueue`）。
- * 上限を付けないのは、step の途中で燃料待ち・許可待ちのワーカーが仕事を塞いでデッドロックしないため。
+ * 上限を付けないのは、step の途中で燃料待ち・ホスト呼び出し待ちのワーカーが仕事を塞いでデッドロックしないため。
+ *
+ * step は許可（[PermitPool]）を受け取ってから渡すので、許可を持って動くワーカーは許可の数まで（#350）。
+ * step の終わりで返した許可の次の step は、[offerContinuation] で同じワーカーの続きにする
+ * （返した直後のワーカーはまだプールに戻っていないので、`execute` すると新しいスレッドができるため）。
  * テストでは [override] で1本だけのワーカーなどに差し替える。
  */
 internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: ExecutorService?) {
@@ -48,6 +52,9 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
 
     private val executor: ExecutorService = override ?: pool!!
 
+    private val inWorker = ThreadLocal.withInitial { false }
+    private val continuation = ThreadLocal<Runnable?>()
+
     /** step を動かしているワーカーの数（数え口） */
     val activeSteps: AtomicInteger = AtomicInteger()
 
@@ -60,20 +67,50 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
     /** step を渡す。ブロックしない。閉じた後なら、その場限りのスレッドで動かす（step は停止の印を見て終わる） */
     fun execute(task: Runnable) {
         submitted.incrementAndGet()
-        val wrapped = Runnable {
-            activeSteps.incrementAndGet()
-            KernelThread.markStep(true)
-            try {
-                task.run()
-            } finally {
-                KernelThread.markStep(false)
-                activeSteps.decrementAndGet()
-            }
-        }
+        val wrapped = Runnable { runLoop(task) }
         try {
             executor.execute(wrapped)
         } catch (e: RejectedExecutionException) {
             KernelThread("KiBi-worker-late-${counter.incrementAndGet()}", stack, wrapped).start()
+        }
+    }
+
+    /**
+     * 今の仕事が終わったら、続けて同じワーカーで [task] を動かす。ワーカーの中でない、またはもう続きがあるなら `false`
+     * （呼んだ側が [execute] で渡す）。今の仕事の残りは、止まる待ちに入らないこと（step の終わりにだけ使う）
+     */
+    fun offerContinuation(task: Runnable): Boolean {
+        if (!inWorker.get() || continuation.get() != null) return false
+        submitted.incrementAndGet()
+        continuation.set(task)
+        return true
+    }
+
+    private fun runLoop(first: Runnable) {
+        inWorker.set(true)
+        var current: Runnable? = first
+        try {
+            while (current != null) {
+                runOne(current)
+                current = takeContinuation()
+            }
+        } finally {
+            inWorker.set(false)
+            // 例外で抜けたときも、置かれた続き（許可を持っている）を捨てない
+            takeContinuation()?.let { execute(it) }
+        }
+    }
+
+    private fun takeContinuation(): Runnable? = continuation.get()?.also { continuation.remove() }
+
+    private fun runOne(task: Runnable) {
+        activeSteps.incrementAndGet()
+        KernelThread.markStep(true)
+        try {
+            task.run()
+        } finally {
+            KernelThread.markStep(false)
+            activeSteps.decrementAndGet()
         }
     }
 

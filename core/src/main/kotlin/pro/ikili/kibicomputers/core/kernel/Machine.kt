@@ -249,7 +249,11 @@ public class Machine private constructor(
     internal val lifecycle = ProcessLifecycle(this)
 
     /** マシンの CPU */
-    internal val cpu = MachineCpu { rt -> scheduler.workers.execute { runner.runStep(rt) } }
+    internal val cpu = MachineCpu(
+        // CPU を渡したら、許可の待ち行列に並べる。許可を受け取ってからワーカーに渡す（#350）
+        onThreadlessGranted = { rt -> scheduler.permits.submit(rt) { runner.runStep(rt) } },
+        onThreadlessRevoked = { rt -> scheduler.permits.remove(rt) },
+    )
 
     @Volatile
     private var stateValue = MachineState.STOPPED
@@ -353,7 +357,7 @@ public class Machine private constructor(
     public val lastBootConfig: BootConfig? get() = lastBootConfigValue
 
     /**
-     * 起動する（#49）。どのスレッドから呼んでもよい。待たずに返す（ディスクを探し、`/sbin/init` を読み込むのはワーカーのスレッド）。
+     * 起動する（#49）。どのスレッドから呼んでもよい。待たずに返す（ディスクを探し、`/sbin/init` を読み込むのは起動用のスレッド `KiBi-boot-*`。#350）。
      *
      * 起動部品がない・起動ディスクがない・init がない・動かせないときは、コンソールにメッセージを書いて
      * [MachineHost.onBootFailed] で知らせ、マシンは [MachineState.STOPPED] のまま。init を作れたら [MachineState.RUNNING] になる。
@@ -374,7 +378,7 @@ public class Machine private constructor(
         } finally {
             lock.unlock()
         }
-        scheduler.workers.execute { BootSequence(this, config).run() }
+        scheduler.bootExecutor.execute { BootSequence(this, config).run() }
         return true
     }
 
@@ -1221,7 +1225,7 @@ public class Machine private constructor(
     }
 
     /**
-     * 起動の手順の始め（ワーカーのスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、
+     * 起動の手順の始め（起動用のスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、
      * マウントをすべて外す（コンソールの TTY は残す）。取り消されたら `false`
      */
     internal fun beginBoot(): Boolean = lock.withLockValue {
@@ -1252,7 +1256,7 @@ public class Machine private constructor(
         true
     }
 
-    /** 起動ディスク [diskId] の [volume] を `/` にマウントする（ワーカーのスレッドから）。取り消されていれば何もせず `false` */
+    /** 起動ディスク [diskId] の [volume] を `/` にマウントする（起動用のスレッドから）。取り消されていれば何もせず `false` */
     internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean = lock.withLockValue {
         if (bootCancelled) return@withLockValue false
         vfs.mount(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
@@ -1260,7 +1264,7 @@ public class Machine private constructor(
     }
 
     /**
-     * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（ワーカーのスレッドから、根のマウントの後）。
+     * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（起動用のスレッドから、根のマウントの後）。
      * 根のディスクの `/tmp` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）
      */
     internal fun mountTmp(): Errno? = lock.withLockValue {
@@ -1274,7 +1278,7 @@ public class Machine private constructor(
     }
 
     /**
-     * 起動の手順を、init を作らずに終える（ワーカーのスレッドから）。マウントを外す。
+     * 起動の手順を、init を作らずに終える（起動用のスレッドから）。マウントを外す。
      * [failure] が `null`（取り消し）か、取り消されていれば何も知らせない。そうでなければコンソールに書いて [MachineHost.onBootFailed] で知らせる
      *
      * @param reason コンソールのメッセージに入れる短い英語（errno の名前など）

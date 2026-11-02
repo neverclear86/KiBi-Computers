@@ -16,7 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 internal class BootCancelledException : RuntimeException("起動を取り消した")
 
 /**
- * 起動の手順（#49。ADR 0049）。[Machine.boot] が受け付けた後、ワーカーのスレッドで1回だけ動く。
+ * 起動の手順（#49。ADR 0049）。[Machine.boot] が受け付けた後、起動用のスレッド（`KiBi-boot-*`。#350）で1回だけ動く。
  *
  * 1. 前回の残り（ゾンビ、pid、マウント）を片付ける
  * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]

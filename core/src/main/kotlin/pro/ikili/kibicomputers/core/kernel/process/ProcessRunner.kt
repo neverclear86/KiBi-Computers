@@ -86,9 +86,17 @@ internal class ProcessRunner(private val machine: Machine) {
         }
     }
 
-    /** 待機点型の1回の step。CPU を受け取ったワーカーで動く */
+    /**
+     * 待機点型の1回の step。CPU と許可を受け取ったワーカーで動く（許可は `PermitPool.submit` が渡す。#350）。
+     * 終わりで返した許可の次の step は、同じワーカーの続きにする（[releasePermitAndCpu] の `endOfStep`）
+     */
     fun runStep(rt: ProcessRuntime) {
-        if (!register(rt)) return
+        rt.holdsPermit = true
+        scheduler.permitAcquisitions.incrementAndGet()
+        if (!register(rt)) {
+            releasePermitAndCpu(rt, endOfStep = true)
+            return
+        }
         try {
             step(rt)
         } catch (t: Throwable) {
@@ -123,7 +131,7 @@ internal class ProcessRunner(private val machine: Machine) {
                 }
             }
             if (empty) {
-                releasePermitAndCpu(rt)
+                releasePermitAndCpu(rt, endOfStep = true)
                 return
             }
         }
@@ -162,7 +170,7 @@ internal class ProcessRunner(private val machine: Machine) {
             }
         }
         if (outcome != Outcome.GO) {
-            releasePermitAndCpu(rt)
+            releasePermitAndCpu(rt, endOfStep = true)
             return
         }
         var result = if (!resumed) {
@@ -201,7 +209,7 @@ internal class ProcessRunner(private val machine: Machine) {
                         }
                     }
                     if (immediate == null) {
-                        releasePermitAndCpu(rt)
+                        releasePermitAndCpu(rt, endOfStep = true)
                         return
                     }
                     result = rt.driver.resume(rt.context, immediate)
@@ -242,7 +250,7 @@ internal class ProcessRunner(private val machine: Machine) {
             scheduler.fuelUnwinds.incrementAndGet()
             if (now != grantedTick) scheduler.dispatcher.signal()
         }
-        releasePermitAndCpu(rt)
+        releasePermitAndCpu(rt, endOfStep = true)
     }
 
     /** 燃料待ちの列に入れる（[threadless] ならスレッドを持たない待ち手として）。カーネルロックの中で呼ぶ */
@@ -303,7 +311,7 @@ internal class ProcessRunner(private val machine: Machine) {
     private fun unregister(rt: ProcessRuntime) {
         hooks.beforeUnregister?.invoke(machine, rt.pid)
         // 念のため、持ったままのものを返す（通常の道筋ではもう返している）
-        releasePermitAndCpu(rt)
+        releasePermitAndCpu(rt, endOfStep = true)
         lock.lock()
         try {
             rt.thread = null
@@ -390,11 +398,16 @@ internal class ProcessRunner(private val machine: Machine) {
         scheduler.permitAcquisitions.incrementAndGet()
     }
 
-    /** 印が立っているものだけを、許可 → CPU の順に返す */
-    private fun releasePermitAndCpu(rt: ProcessRuntime) {
+    /**
+     * 印が立っているものだけを、許可 → CPU の順に返す。
+     *
+     * [endOfStep] は、この後に止まる待ちがなく、スレッドが仕事を終えるところ（step・専用スレッドの終わり）。
+     * ワーカーなら、許可の次の step を同じワーカーの続きにする（新しいスレッドを作らない。#350）
+     */
+    private fun releasePermitAndCpu(rt: ProcessRuntime, endOfStep: Boolean = false) {
         if (rt.holdsPermit) {
             rt.holdsPermit = false
-            scheduler.permits.release()
+            scheduler.permits.release(inline = endOfStep)
         }
         if (rt.holdsCpu) {
             rt.holdsCpu = false
@@ -547,7 +560,7 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.stackActive = false
             finishLocked(rt, ProcessState.EXITED, code)
         }
-        releasePermitAndCpu(rt)
+        releasePermitAndCpu(rt, endOfStep = true)
     }
 
     /**
@@ -569,7 +582,7 @@ internal class ProcessRunner(private val machine: Machine) {
         } finally {
             lock.unlock()
         }
-        releasePermitAndCpu(rt)
+        releasePermitAndCpu(rt, endOfStep = true)
     }
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
