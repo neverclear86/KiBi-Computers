@@ -179,6 +179,62 @@ class ProgramCacheTest {
     }
 
     @Test
+    fun `持ち主が待つのをやめたら持ち主の数から外し、相乗りした台に移す`() {
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val cache = ProgramCache(100, Long.MAX_VALUE, pool, maxPendingPerOwner = 2)
+            val gate = CountDownLatch(1)
+            val order = Collections.synchronizedList(ArrayList<Int>())
+            val tracking = { n: Int -> { b: ByteArray -> order += n; gate.await(); loader(b) } }
+            // 台 1 が 2 つ積む（1 は読み込み中、2 は待ち行列）。台 2 が両方に相乗りし、自分でも 1 つ積む
+            val running1 = cache.load(1, bytes(1), true, emptySet(), tracking(1))
+            eventually { order.isNotEmpty() }
+            val queued1 = cache.load(1, bytes(2), true, emptySet(), tracking(2))
+            val running2 = cache.load(2, bytes(1), true, emptySet(), tracking(1))
+            val own2 = cache.load(2, bytes(3), true, emptySet(), tracking(3))
+            val queued2 = cache.load(2, bytes(2), true, emptySet(), tracking(2))
+            assertEquals(2, cache.pendingOf(1))
+            assertEquals(1, cache.pendingOf(2))
+            // 台 1 が待つのをやめる（reboot など）。台 1 の数は 0 になり、待ち行列の 2 は台 2 の数に移る
+            running1.cancel(false)
+            queued1.cancel(false)
+            assertEquals(0, cache.pendingOf(1))
+            assertEquals(2, cache.pendingOf(2))
+            assertEquals(3, cache.loadingCount)
+            // 台 1 はまた上限まで頼める
+            val fresh = (4..5).map { cache.load(1, bytes(it), true, emptySet(), tracking(it)) }
+            assertEquals(2, cache.pendingOf(1))
+            gate.countDown()
+            listOf(running2, own2, queued2).forEach { it.get(10, TimeUnit.SECONDS) }
+            fresh.forEach { it.get(10, TimeUnit.SECONDS) }
+            // 移した 2 は台 2 の列の末尾（3 の後）。台 1 と台 2 を巡回する
+            assertEquals(listOf(1, 3, 4, 2, 5), order.toList())
+            assertEquals(0, cache.pendingOf(1))
+            assertEquals(0, cache.pendingOf(2))
+            assertEquals(0, cache.loadingCount)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `覚える失敗の数が上限を超えたら古いものから忘れる`() {
+        val cache = ProgramCache(4, Long.MAX_VALUE, direct, maxFailures = 2)
+        val broken = { _: ByteArray -> throw WasmLoadException("だめ") }
+        (1..3).forEach { n -> assertThrows<ExecutionException> { cache.load(1, bytes(n), true, emptySet(), broken).get() } }
+        assertEquals(3, cache.loads.get())
+        // 新しい 2 つ（2・3）は覚えているので読み込まない
+        (2..3).forEach { n -> assertThrows<ExecutionException> { cache.load(1, bytes(n), true, emptySet(), broken).get() } }
+        assertEquals(3, cache.loads.get())
+        // 最も古い 1 は忘れたので読み込み直す
+        assertThrows<ExecutionException> { cache.load(1, bytes(1), true, emptySet(), broken).get() }
+        assertEquals(4, cache.loads.get())
+        // 1 を覚え直したので、次に古い 2 を忘れた
+        assertThrows<ExecutionException> { cache.load(1, bytes(2), true, emptySet(), broken).get() }
+        assertEquals(5, cache.loads.get())
+    }
+
+    @Test
     fun `上限を超えたら古いものから外すが、使われているものは共有し続ける`() {
         val cache = ProgramCache(2, Long.MAX_VALUE, direct)
         val first = cache.load(1, bytes(1), true, emptySet(), ::loader).get()

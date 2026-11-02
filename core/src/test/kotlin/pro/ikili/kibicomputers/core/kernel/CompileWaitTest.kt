@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.FakeModule
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -90,6 +91,20 @@ class CompileWaitTest {
         fs.createDirectory(VfsPath.parse("/sbin"))
         val node = fs.createFile(VfsPath.parse(BootConfig.INIT_PATH))
         fs.write(node, 0, bytes, 0, bytes.size)
+    }
+
+    /** すぐ終わる init */
+    private fun exitingInit(): FakeModule = FakeModule.builder().fuelMetered().export("_start", VOID) { _, _ -> LongArray(0) }.build()
+
+    /** 起動の失敗を記録するホスト */
+    private class FailureHost : MachineHost {
+        val failures: MutableList<Pair<BootFailure, String>> = Collections.synchronizedList(ArrayList())
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            failures += failure to detail
+        }
     }
 
     private val exitDrivers = ProcessDriverFactory { TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) } }
@@ -279,6 +294,102 @@ class CompileWaitTest {
         eventually { h.scheduler.programs.loadingCount == 0 }
         assertEquals(1L, h.scheduler.programs.loads.get())
         assertEquals(1, loading.size)
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+    }
+    @Test
+    fun `持ち主の台が止まったら相乗りされた読み込みは数から外れ、次の起動のinitが通る`() = env {
+        val limit = ProgramCache.DEFAULT_MAX_PENDING_PER_OWNER
+        val programs = h.scheduler.programs
+        val host = FailureHost()
+        val disk = initDisk(exe(exitingInit()))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val a = h.machine(fuelPerTick = 1_000_000, host = host)
+        val b = h.machine(fuelPerTick = 1_000_000)
+        val files = (0 until limit).map { "/bin/p$it" to exe() }
+        a.mountRoot(*files.toTypedArray())
+        b.mountRoot(*files.toTypedArray())
+        // 台 A が上限まで積み、台 B が同じものを exec して全部に相乗りする
+        val pidsA = files.map { (path, _) -> a.spawnTest(h.program(emptyModule()), execer(path, AtomicReference())) }
+        tickUntil { programs.pendingOf(a.id) == limit && pidsA.all { a.stateOf(it) == ProcessState.WAITING_HOST } }
+        val outsB = files.map { AtomicReference<Any>() }
+        val pidsB = files.mapIndexed { i, (path, _) -> b.spawnTest(h.program(emptyModule()), execer(path, outsB[i])) }
+        tickUntil { pidsB.all { b.stateOf(it) == ProcessState.WAITING_HOST } }
+        assertEquals(limit, programs.loadingCount)
+        assertEquals(0, programs.pendingOf(b.id))
+        // 台 A を止める。A の数は 0 に戻り、始まっていない分は B の数に移る（読み込み中の 1 つは誰の数にも入れない）
+        a.stop()
+        tickUntil("A の数が戻らない") { a.state == MachineState.STOPPED && programs.pendingOf(a.id) == 0 }
+        assertEquals(limit - 1, programs.pendingOf(b.id))
+        assertEquals(limit, programs.loadingCount)
+        // 次の起動の init は AGAIN にならずに待ち行列に入る
+        assertTrue(a.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        tickUntil("init の読み込みが積まれない") { programs.pendingOf(a.id) == 1 }
+        gate.countDown()
+        tickUntil { !a.isBooting && pidsB.all { b.stateOf(it).isTerminal } }
+        // 起動の失敗の通知は tick() で配られる
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
+        assertTrue(outsB.all { it.get() is Int }, outsB.toString())
+        eventually { programs.loadingCount == 0 }
+        assertEquals(0, programs.pendingOf(b.id))
+        a.stop()
+        b.stop()
+        assertTrue(a.awaitTermination(5_000))
+        assertTrue(b.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `覚えた読み込みの失敗は、別の台のexecでも読み込み直さずにNOEXEC`() = env {
+        gate.countDown()
+        val bad = exe(register = false)
+        val first = h.machine(fuelPerTick = 1_000_000)
+        val second = h.machine(fuelPerTick = 1_000_000)
+        first.mountRoot("/bin/bad" to bad)
+        second.mountRoot("/bin/bad" to bad)
+        for (m in listOf(first, second)) {
+            val out = AtomicReference<Any>()
+            val pid = m.spawnTest(h.program(emptyModule()), execer("/bin/bad", out))
+            tickUntil { m.stateOf(pid).isTerminal }
+            assertEquals(Errno.NOEXEC, (out.get() as FsException).errno)
+        }
+        // 2 回目は覚えた失敗を返し、読み込まない
+        assertEquals(1L, h.scheduler.programs.loads.get())
+        assertEquals(1, loading.size)
+        first.stop()
+        second.stop()
+        assertTrue(first.awaitTermination(5_000))
+        assertTrue(second.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `台の読み込みが上限に達していたら起動のinitはAGAINで失敗し、空けばまた起動できる`() = env {
+        val limit = ProgramCache.DEFAULT_MAX_PENDING_PER_OWNER
+        val programs = h.scheduler.programs
+        val host = FailureHost()
+        val disk = initDisk(exe(exitingInit()))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine(host = host)
+        // この台の読み込みが上限まで残っている（読み込みはゲートで止まり、失敗で終わる）
+        val held = (0 until limit).map { i ->
+            programs.load(m.id, "held-$i".toByteArray(), true, emptySet()) { gate.await(); throw WasmLoadException("held") }
+        }
+        assertEquals(limit, programs.pendingOf(m.id))
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        tickUntil("起動が失敗しない") { host.failures.isNotEmpty() }
+        assertEquals(1, host.failures.size, host.failures.toString())
+        assertEquals(BootFailure.INIT_START_FAILED, host.failures[0].first)
+        assertTrue(host.failures[0].second.contains("多すぎる"), host.failures.toString())
+        assertEquals(MachineState.STOPPED, m.state)
+        // 読み込みが終われば数が空き、また起動できる
+        gate.countDown()
+        held.forEach { f -> runCatching { f.get() } }
+        eventually { programs.pendingOf(m.id) == 0 }
+        host.failures.clear()
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        tickUntil { !m.isBooting }
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
         m.stop()
         assertTrue(m.awaitTermination(5_000))
     }
