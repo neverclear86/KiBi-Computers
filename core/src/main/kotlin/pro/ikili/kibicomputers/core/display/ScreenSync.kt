@@ -119,6 +119,13 @@ public constructor(
 
     private fun keyframeSize(): Int = text.snapshotSize + (pixels?.snapshotSize ?: 0)
 
+    /** いまキーフレームを送ると、フラグメントの合計で何バイトになるか（目安）。 */
+    internal val keyframeBytes: Int
+        get() {
+            val message = keyframeSize() + 2
+            return message + (message + maxFragmentSize - 2) / (maxFragmentSize - 1)
+        }
+
     private fun encodeKeyframe(): SyncWriter {
         val out = SyncWriter(keyframeSize() + 2)
         out.byte(SyncOps.KIND_KEYFRAME)

@@ -117,6 +117,9 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     /** サーバーで、[player] がこの画面を見ているか。 */
     fun isWatchedBy(player: ServerPlayer): Boolean = watchers.isWatching(player)
 
+    /** サーバーで、[player] への同期が送信量の予算で止められていて、画面全体を送れるのを待っているか（#352）。 */
+    fun isThrottled(player: ServerPlayer): Boolean = watchers.isThrottled(player)
+
     override fun onLoad() {
         super.onLoad()
         val level = level ?: return

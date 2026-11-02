@@ -42,6 +42,7 @@ class ScreenWatchersJavaTest {
         ScreenSyncTraffic<String> traffic = new ScreenSyncTraffic<>();
         ScreenSyncSender sender = new ScreenSyncSender(new TextBuffer(4, 2));
         watchers.tick(0L, sender, host, traffic);
+        traffic.endTick();
         watchers.tick(1L, sender, host, null);
 
         assertTrue(watchers.isWatching("alice"));

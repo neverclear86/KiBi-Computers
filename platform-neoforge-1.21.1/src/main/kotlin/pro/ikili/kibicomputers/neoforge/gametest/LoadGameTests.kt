@@ -14,6 +14,8 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.display.ScreenSyncSender
+import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
@@ -119,6 +121,13 @@ object LoadGameTests {
                     "(limit ${ciMaxBootKernelThreads()})",
             )
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
+            // 1人に送る量は、見ている画面の数によらず、プレイヤーごとの予算に収まる（#352）
+            val perSecond = ScreenSyncTraffic.DEFAULT_PLAYER_BYTES_PER_SECOND.toLong()
+            val limit = perSecond * (output.tick.ticks + 2) / ScreenSyncSender.TICKS_PER_SECOND + perSecond
+            helper.assertTrue(
+                output.sentBytes <= limit,
+                "the watcher received ${output.sentBytes} bytes in ${output.tick.ticks} ticks, over the per-player budget ($limit)",
+            )
         }.start()
     }
 
