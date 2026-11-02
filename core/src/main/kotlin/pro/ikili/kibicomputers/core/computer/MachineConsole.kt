@@ -20,7 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  * - 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
  *   （TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間に [write] したものは、上限なしで全部処理する
  * - 取っておいた分があるときにマシンを外すと（[machine] を `null` にする。電源を切ったときなど）、その tick の残りの上限まで書き、
- *   残りは捨てる（#381）。画面が外れたときは [discardOutput] で、書かずに捨てる。別のマシンに替えたときは、そのまま続きを書く
+ *   残りは捨てる（#381）。画面が外れたときは [discardOutput] で、書かずに捨てる（出力を止めている最中でも。接続層が画面の取り外しで呼ぶ。#397）。別のマシンに替えたときは、そのまま続きを書く
  *
  * 正式には、隣接デバイスの接続（#129）と、画面・キーボードのデバイス（#65・#66）で置き換える。
  *
@@ -65,8 +65,8 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
 
     private val holdListener = ConsoleHoldListener { pump() }
 
-    /** 取っておいた出力のうち、書かずに捨てたバイト数（#381。マシンを外したときなど。数え口） */
-    internal var droppedBytes: Long = 0
+    /** 取っておいた出力のうち、書かずに捨てたバイト数（#381。マシンを外したとき・画面が外れたとき（#397）など。数え口） */
+    public var droppedBytes: Long = 0
         private set
 
     /**
@@ -105,8 +105,8 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
         }
     }
 
-    /** 処理しきれずに取っておいた出力のバイト数（#357） */
-    internal val backlogBytes: Int get() = backlogEnd - backlogStart
+    /** 処理しきれずに取っておいた出力のバイト数（#357）。マシンをつないでいて 0 より大きい間は、マシンの出力を止めている */
+    public val backlogBytes: Int get() = backlogEnd - backlogStart
 
     /** 最後に処理したマシンの tick で使ったセルの数（#357。テスト用） */
     internal val cellsUsedThisTick: Long get() = cellsPerTick - budgetLeft
