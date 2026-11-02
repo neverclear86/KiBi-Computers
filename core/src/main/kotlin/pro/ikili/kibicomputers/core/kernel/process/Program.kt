@@ -37,7 +37,8 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
  * 読み込んだモジュールと、その識別子の組。
  *
  * [fuelYield] は、燃料切れも待ち点にして読み込んだか（#339。[loadMetered] の段1）。[fuelYieldRejection] は、段1を断られて
- * 入力待ちだけの待ち点にした（段2）ときの、段1を断った理由（ログと調べもの用）
+ * 入力待ちだけの待ち点にした（段2）ときの、段1を断った理由（ログと調べもの用）。段2に落ちたモジュールは、止まりうる関数の中の
+ * 燃料切れでもスレッドを持ったまま燃料を待つので、読み込んだときに理由をログに出す（同じモジュールは1回だけ。[FuelYieldRejectionLog]）
  */
 internal class Program private constructor(
     val hash: ModuleHash,
@@ -74,7 +75,7 @@ internal class Program private constructor(
          * 断るのは止まりうる関数を変換できないときだけで、止まりうる関数がない（[waitImports] を使わない）モジュールは、
          * 関数の本体を書き換えずに待機点型として読み込む（#384）。
          * 変換は2段で試す（#339。[Instrumentation]）: 燃料切れも待ち点にする（段1。[fuelYield]）→ 断られたら入力待ちだけの待ち点（段2）→
-         * それも断られたら上のとおり断る（理由は段2のもの）。
+         * それも断られたら上のとおり断る（理由は段2のもの）。段2に落ちたら、段1を断った理由をログに出す（[FuelYieldRejectionLog]）。
          * 予約した名前（`kibi.async_push` など）を使っている WASM も [WasmLoadException] で断る
          */
         @Throws(WasmLoadException::class)
@@ -89,7 +90,9 @@ internal class Program private constructor(
             val injected = applied.bytes
             val module = runtime.load(injected)
             deadline?.check("パース・検証・コンパイル")
-            return Program(ModuleHash.of(injected), module, applied.fuelYield, applied.fuelYieldRejection)
+            val hash = ModuleHash.of(injected)
+            applied.fuelYieldRejection?.let { FuelYieldRejectionLog.report(hash, it) }
+            return Program(hash, module, applied.fuelYield, applied.fuelYieldRejection)
         }
 
         /** [e] が、待機点に変換できない作りのために [loadMetered] が断ったものなら、その理由（どの命令・どの機能か）。違えば `null` */
@@ -142,4 +145,36 @@ internal fun interface ProcessDriverFactory {
     /** [program] を動かすドライバーを作る。動かせない形なら `FsException(NOEXEC)` を投げる */
     @Throws(FsException::class)
     fun create(program: Program): ProcessDriver
+}
+
+/**
+ * 燃料切れを待ち点にできなかった（[Program.loadMetered] の段2に落ちた）モジュールの、段1を断った理由のログ（#396）。
+ *
+ * 段2に落ちたモジュールは、燃料待ちの間スレッドを持ち続ける（台数が多いとスレッドを使う）ので、運用の側から気付けるように出す。
+ * 同じモジュール（[ModuleHash]）では1回だけ出す。読み込みは [ProgramCache] で共有するので普通は1回だが、キャッシュから外れて
+ * 読み込み直したときにも出さないように、出したモジュールを最近の [MAX_REMEMBERED] 個まで覚えておく。
+ *
+ * スレッド: どのスレッドから呼んでもよい（読み込みのスレッドから呼ぶ）。
+ */
+internal object FuelYieldRejectionLog {
+    /** 覚えておくモジュールの数の上限（あふれたら、最も前に出したものから忘れる） */
+    const val MAX_REMEMBERED: Int = 1024
+
+    private val LOG: System.Logger = System.getLogger("kibicomputers.kernel")
+
+    private val reported = object : LinkedHashMap<ModuleHash, Unit>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ModuleHash, Unit>?): Boolean = size > MAX_REMEMBERED
+    }
+
+    /** [hash] のモジュールで段1を断った理由 [reason] をログに出す。同じモジュールでもう出していれば出さずに `false` */
+    fun report(hash: ModuleHash, reason: String): Boolean {
+        val first = synchronized(reported) { reported.put(hash, Unit) == null }
+        if (first) {
+            LOG.log(
+                System.Logger.Level.INFO,
+                "WASM モジュール $hash は燃料切れを待ち点にできないので、燃料を待つ間スレッドを持つ（入力待ちだけを待ち点にした）: $reason",
+            )
+        }
+        return first
+    }
 }

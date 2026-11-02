@@ -24,6 +24,10 @@ internal class KernelTestHooks {
     @Volatile
     var afterStepPermit: ((Machine, Int) -> Unit)? = null
 
+    /** 待機点型の step で、燃料切れで `_start` まで巻き戻した後・燃料待ちの列に入れる前（#396） */
+    @Volatile
+    var beforeFuelUnwound: ((Machine, Int) -> Unit)? = null
+
     /** `stop()` で、登録を確かめた後・割り込みを送る前（カーネルロックの中） */
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null
