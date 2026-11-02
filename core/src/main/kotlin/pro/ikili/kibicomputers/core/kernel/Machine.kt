@@ -270,9 +270,20 @@ public class Machine private constructor(
 
     /**
      * コンソールの出力を止めている相手（#357。画面の処理が追いつかないとき [holdConsoleOutput] で止める）。
-     * `null` なら止めていない。メインスレッドだけで読み書きする
+     * `null` なら止めていない。メインスレッドだけで書く（[consoleSink] があれば、そのロックの中で）。
+     * プロセスのスレッドは [pumpConsole] で、[consoleSink] のロックの中で読む（#355）
      */
+    @Volatile
     private var consoleHold: ConsoleHoldListener? = null
+
+    /**
+     * コンソールの出力を書く先（表示デバイス。#355）。あれば、コンソールの TTY に書いたプロセスが、自分のスレッドで
+     * [pumpConsole] から書く（端末の処理の重さは、そのプロセスの燃料で払う）。カーネルのメッセージと、プロセス以外が TTY に
+     * 積んだ出力（キー入力のエコーなど）は、これまでどおり [MachineHost.onConsoleOutput] でメインスレッドに配る。
+     * メインスレッドから入れ替える（`MachineConsole.machine`）
+     */
+    @Volatile
+    internal var consoleSink: ConsoleSink? = null
 
     /**
      * 止めている間に配らなかったコンソールの出力（[HostNotification.Console] と、TTY の出力の印 [HostNotification.TtyOutput]）。
@@ -837,10 +848,36 @@ public class Machine private constructor(
     }
 
     /** コンソールの TTY にたまった出力を取り出す（書き手を起こす）。なければ `null` */
-    private fun drainConsoleOutput(): ByteArray? = lock.withLockValue {
+    private fun drainConsoleOutput(): ByteArray? = lock.withLockValue { drainConsoleOutputLocked() }
+
+    private fun drainConsoleOutputLocked(): ByteArray? {
         val id = kernel.consoleTtyId
-        val tty = (if (id == 0) null else kernel.objects[id] as? Tty) ?: return@withLockValue null
-        tty.drainOutput(wakeSink)
+        val tty = (if (id == 0) null else kernel.objects[id] as? Tty) ?: return null
+        return tty.drainOutput(wakeSink)
+    }
+
+    /**
+     * コンソールの TTY にたまった出力を、呼んだスレッドで [consoleSink] に書く（#355）。コンソールの TTY に書いたプロセスの
+     * スレッドから呼ぶ（`ProcessContext.flushConsole`）。触ったセルの数（燃料で払わせる重さ）を返す。
+     *
+     * 書いた順を保つため、次のときは書かずに 0 を返す（残りはメインスレッドが [deliverNotifications] で配る）:
+     * - [consoleSink] がない、またはカーネルロックを持っている（ロックの順は「表示デバイス → カーネル」）
+     * - 配っていないカーネルのメッセージがある（その前後の TTY の出力は、メインスレッドが目印で分けて配る。#381）
+     * - メインスレッドがコンソールの出力を止めている（画面の処理が追いついていない。#357）
+     */
+    internal fun pumpConsole(): Long {
+        val sink = consoleSink ?: return 0
+        if (lock.isHeldByCurrentThread) return 0
+        sink.lock.lock()
+        try {
+            if (consoleSink !== sink) return 0
+            val bytes = lock.withLockValue {
+                if (consoleHold != null || pendingConsoleBytes.get() > 0L) null else drainConsoleOutputLocked()
+            } ?: return 0
+            return sink.write(bytes)
+        } finally {
+            sink.lock.unlock()
+        }
     }
 
     /**
@@ -1439,6 +1476,11 @@ public class Machine private constructor(
         out.flush()
         // 止めている間は、毎 tick 回ってくる（止めている台だけ。待っている台の負荷は増えない）
         if (consoleHold != null) requestNotify()
+        // TTY に残った出力を、次の tick に見直す（この tick の中では配り直さない）
+        if (recheckTtyOutput) {
+            recheckTtyOutput = false
+            if (consoleDirty.compareAndSet(false, true)) postNotification(HostNotification.TtyOutput)
+        }
     }
 
     /**
@@ -1451,7 +1493,24 @@ public class Machine private constructor(
         // TTY の印を見て、まだ全部は取り出していない
         private var ttyPending = false
 
+        // TTY から取り出してから、配り終えるまで持つ、書く先のロック（#355。その間にプロセスのスレッドが後の出力を先に書かないように）
+        private var locked: ConsoleSink? = null
+
+        private fun lockSink() {
+            if (locked != null) return
+            val sink = consoleSink ?: return
+            sink.lock.lock()
+            locked = sink
+        }
+
+        private fun unlockSink() {
+            val sink = locked ?: return
+            locked = null
+            sink.lock.unlock()
+        }
+
         fun add(n: HostNotification) {
+            lockSink()
             if (n === HostNotification.TtyOutput) {
                 // 印を下ろしてから取り出す（下ろした後の出力は、新しい印で積まれる）
                 consoleDirty.set(false)
@@ -1466,17 +1525,54 @@ public class Machine private constructor(
 
         /** たまった分を [host] に渡す（TTY の残りも取り出す） */
         fun flush() {
-            if (ttyPending) {
-                ttyPending = false
-                drainConsoleOutput()?.let(::append)
+            try {
+                if (ttyPending) {
+                    ttyPending = false
+                    // 書く先があれば、TTY の出力は書いたプロセスが自分のスレッドで書く。残ったままのものだけ取り出す（#355）
+                    (if (locked == null) drainConsoleOutput() else drainStaleConsoleOutput())?.let(::append)
+                }
+                val b = bytes ?: return
+                bytes = null
+                safely { host.onConsoleOutput(this@Machine, b.toByteArray()) }
+            } finally {
+                unlockSink()
             }
-            val b = bytes ?: return
-            bytes = null
-            safely { host.onConsoleOutput(this@Machine, b.toByteArray()) }
         }
 
         private fun append(b: ByteArray) {
             (bytes ?: ByteArrayOutputStream().also { bytes = it }).write(b, 0, b.size)
+        }
+    }
+
+    // 前の通知で見た、コンソールの TTY の出力の位置（-1 = 見ていない）。メインスレッドだけで使う（#355）
+    private var lastSeenTtyWritten = -1L
+
+    // 次の tick の通知で、TTY の出力が残ったままか見直す
+    private var recheckTtyOutput = false
+
+    /**
+     * 書く先（[consoleSink]）があるとき、コンソールの TTY に残ったままの出力を取り出す（#355）。
+     * TTY の出力は、ふつうは書いたプロセスが [pumpConsole] で自分のスレッドで書くので、メインスレッドでは書かない。
+     * 前の tick の通知から書き足されずに残っているもの（キー入力のエコー、プロセスが書けなかった分など）だけを取り出す。
+     * まだ書き足されているなら取り出さず、次の tick の通知で見直す
+     */
+    private fun drainStaleConsoleOutput(): ByteArray? = lock.withLockValue {
+        val id = kernel.consoleTtyId
+        val tty = (if (id == 0) null else kernel.objects[id] as? Tty) ?: return@withLockValue null
+        when {
+            tty.outputAvailable == 0 -> {
+                lastSeenTtyWritten = -1
+                null
+            }
+            tty.outputWritten == lastSeenTtyWritten -> {
+                lastSeenTtyWritten = -1
+                tty.drainOutput(wakeSink)
+            }
+            else -> {
+                lastSeenTtyWritten = tty.outputWritten
+                recheckTtyOutput = true
+                null
+            }
         }
     }
 
@@ -1665,6 +1761,9 @@ internal object MachineLimits {
     /** コンソールの TTY の出力のバッファ。1 tick に配る量の上限を兼ね、超えると書き手が待つ（仮の値。確定は #251） */
     internal const val CONSOLE_OUTPUT_BYTES: Int = 16 * 1024
 
+    /** 表示デバイスに書くときに、触ったセル1つあたりにプロセスが払う燃料（#355。仮の値。確定は #251） */
+    internal const val CONSOLE_FUEL_PER_CELL: Long = 1
+
     /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
     internal const val DISK_SOURCE_PREFIX: String = "disk:"
 
@@ -1703,6 +1802,18 @@ private class PendingHostCall<T>(
             future.completeExceptionally(t)
         }
     }
+}
+
+/**
+ * コンソールの出力を書く先（表示デバイス。#355、[Machine.consoleSink]）。
+ * ロックの順は「[lock] → カーネルロック」。カーネルロックを持ったまま [lock] を取らない
+ */
+internal interface ConsoleSink {
+    /** 書く先の状態を守るロック */
+    val lock: ReentrantLock
+
+    /** [lock] を持って呼ぶ。[bytes]（TTY を通ったバイト列）を端末として書き、触ったセルの数を返す */
+    fun write(bytes: ByteArray): Long
 }
 
 /** コンソールの出力を止めている相手（#357。[Machine.holdConsoleOutput]） */

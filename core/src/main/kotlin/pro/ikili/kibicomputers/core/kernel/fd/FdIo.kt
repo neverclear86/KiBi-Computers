@@ -55,9 +55,28 @@ internal object FdIo {
     fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult =
         ctx.withKernelLock { readLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, dst, off, len) }
 
-    /** 待たずに書く（カーネルロックは自分で取る） */
-    fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult =
-        ctx.withKernelLock { writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len) }
+    /**
+     * 待たずに書く（カーネルロックは自分で取る）。コンソールの TTY に書けたら、たまった出力をこのスレッドで表示デバイスに書く
+     * （[ProcessContext.flushConsole]。#355）
+     */
+    fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
+        var console = false
+        val r = ctx.withKernelLock {
+            console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
+            writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len)
+        }
+        if (console && r is IoResult.Bytes && r.count > 0) ctx.flushConsole()
+        return r
+    }
+
+    // fd [fd] がコンソールの TTY を指すか
+    private fun isConsoleLocked(kernel: KernelState, pid: Int, fd: Int): Boolean {
+        val id = kernel.consoleTtyId
+        if (id == 0) return false
+        val process = kernel.processes[pid] ?: return false
+        val entry = process.handles[fd] ?: return false
+        return entry.objectId == id
+    }
 
     /** 読めるまで待って読む（`BLOCKING` のプロセスのスレッドから）。[IoResult.WouldBlock] は返さない */
     @Throws(ProcessKilledException::class)

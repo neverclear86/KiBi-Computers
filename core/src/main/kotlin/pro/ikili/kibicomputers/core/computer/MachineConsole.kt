@@ -1,52 +1,51 @@
 package pro.ikili.kibicomputers.core.computer
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.display.DisplayDevice
 import pro.ikili.kibicomputers.core.display.TextBuffer
-import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
-import pro.ikili.kibicomputers.core.display.terminal.TerminalListener
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.TerminalKeyEncoder
 import pro.ikili.kibicomputers.core.kernel.ConsoleHoldListener
 import pro.ikili.kibicomputers.core.kernel.Machine
 
 /**
- * マシンのコンソールを、文字画面とキーボードにつなぐ（#307 の仮の結線）。
+ * マシンのコンソールを、表示デバイス（[DisplayDevice]。#355）とキーボードにつなぐ（#307 の仮の結線）。
  *
- * - コンソールの出力（[pro.ikili.kibicomputers.core.kernel.MachineHost.onConsoleOutput]）を [write] に渡すと、
- *   ANSI エスケープシーケンスを解釈して（#61）[screen] に書く
+ * - つなぐと（[machine]）、コンソールの TTY に書いたプロセスが、自分のスレッドで [display] に書く（端末の処理は燃料で払う。#355）
+ * - それ以外のコンソールの出力（カーネルのメッセージ、キー入力のエコーなど。
+ *   [pro.ikili.kibicomputers.core.kernel.MachineHost.onConsoleOutput]）を [write] に渡すと、メインスレッドで
+ *   ANSI エスケープシーケンスを解釈して（#61）[display] に書く
  * - キーボードの入力（[KeyboardEvent]）を [keyboardInput] に渡すと、端末のバイト列にして（[TerminalKeyEncoder]）
  *   マシンのコンソールの TTY に流す
  * - 端末からの応答（カーソル位置の問い合わせへの答えなど）も、TTY に流す
- * - 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
- *   （TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間に [write] したものは、上限なしで全部処理する
+ * - [write] で 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
+ *   （プロセスのスレッドからも書かない。TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間に [write] したものは、
+ *   上限なしで全部処理する
  * - 取っておいた分があるときにマシンを外すと（[machine] を `null` にする。電源を切ったときなど）、その tick の残りの上限まで書き、
  *   残りは捨てる（#381）。画面が外れたときは [discardOutput] で、書かずに捨てる（出力を止めている最中でも。接続層が画面の取り外しで呼ぶ。#397）。別のマシンに替えたときは、そのまま続きを書く
  *
  * 正式には、隣接デバイスの接続（#129）と、画面・キーボードのデバイス（#65・#66）で置き換える。
  *
- * スレッド: メインスレッドから呼ぶ（スレッドセーフではない）。
+ * スレッド: メインスレッドから呼ぶ。[display] には、そのロックを持って書く。
  *
  * ```java
- * MachineConsole console = new MachineConsole(screen.getText(), screen.getTier().maxColors);
+ * MachineConsole console = new MachineConsole(DisplayDevice.forTier(tier));
  * console.setMachine(machine);
  * console.write(bytes);              // MachineHost.onConsoleOutput から
  * console.keyboardInput(event);      // KeyboardListener から
  * ```
  *
- * @property screen 書き込む文字画面
- * @param maxColors 画面の色数（2・16・256 など）
+ * @property display 書き込む表示デバイス
  */
 @ApiStatus.Internal
-public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
-    private val terminal = AnsiTerminal(
-        screen,
-        maxColors,
-        object : TerminalListener {
-            override fun reply(bytes: ByteArray) {
-                machine?.offerConsoleInput(bytes)
-            }
-        },
-    )
+public class MachineConsole(public val display: DisplayDevice) {
+    /** 文字画面（[DisplayDevice.text]）と色数 [maxColors] で、新しい表示デバイスを作ってつなぐ（テスト用） */
+    public constructor(screen: TextBuffer, maxColors: Int) : this(DisplayDevice(screen, maxColors))
+
+    /** 書き込む文字画面（[DisplayDevice.text]） */
+    public val screen: TextBuffer get() = display.text
+
+    private val terminal get() = display.terminal
 
     /** 1 tick に処理するセルの数の上限（#357。仮の値。確定は #251）。テストで変える */
     internal var cellsPerTick: Long = DEFAULT_CELLS_PER_TICK
@@ -63,7 +62,7 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
     // 出力を止めているマシン
     private var held: Machine? = null
 
-    private val holdListener = ConsoleHoldListener { pump() }
+    private val holdListener = ConsoleHoldListener { locked { pump() } }
 
     /** 取っておいた出力のうち、書かずに捨てたバイト数（#381。マシンを外したとき・画面が外れたとき（#397）など。数え口） */
     public var droppedBytes: Long = 0
@@ -76,16 +75,24 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
      * 別のマシンに替えたときは、取っておいた分を、替えた先のマシンの tick の上限で書き続ける
      */
     public var machine: Machine? = null
-        set(value) {
+        set(value) = locked {
             val old = field
-            if (old !== value) release()
+            if (old !== value) {
+                release()
+                if (old != null && old.consoleSink === display.consoleSink) old.consoleSink = null
+            }
             if (value == null && old != null && backlogEnd > backlogStart) {
                 // 外したマシンの tick の上限は守る。続きを書く tick がもうないので、残りは捨てる
                 writeWithinBudget(old)
                 discardOutput()
             }
             field = value
-            value?.resizeConsole(screen.width, screen.height)
+            display.replyTo = value
+            if (value != null) {
+                value.resizeConsole(screen.width, screen.height)
+                // ここから、コンソールの TTY に書いたプロセスが自分のスレッドで書く（#355）
+                value.consoleSink = display.consoleSink
+            }
             if (backlogEnd > backlogStart) pump()
         }
 
@@ -93,8 +100,8 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
      * コンソールの出力 [bytes]（TTY を通った UTF-8 のバイト列）を、端末として解釈して [screen] に書く。
      * この tick の上限を超えた分は取っておき、次の tick から書く（書いた順は変えない）。
      */
-    public fun write(bytes: ByteArray) {
-        if (bytes.isEmpty()) return
+    public fun write(bytes: ByteArray): Unit = locked {
+        if (bytes.isEmpty()) return@locked
         append(bytes)
         pump()
         // 渡された配列は呼ぶ側が使い回すかもしれないので、残りを取っておくときは写す
@@ -165,7 +172,7 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
      * 取っておいた出力（[write] で上限を超えた分）を、書かずに捨てる（#381）。画面が外れたときなど、もう見えない画面に書かないために使う。
      * マシンの出力を止めていたら、止めるのをやめる（マシンに取ってある分は、そのまま配られる）
      */
-    public fun discardOutput() {
+    public fun discardOutput(): Unit = locked {
         droppedBytes += backlogEnd - backlogStart
         clearBacklog()
         release()
@@ -191,14 +198,28 @@ public class MachineConsole(public val screen: TextBuffer, maxColors: Int) {
         val m = machine ?: return 0
         val bytes = TerminalKeyEncoder.encode(event)
         if (bytes.isEmpty()) return 0
-        return m.offerConsoleInput(bytes)
+        val accepted = m.offerConsoleInput(bytes)
+        // エコーは書くプロセスがいないので、ここで書く（打った量だけなので軽い。#355）
+        m.pumpConsole()
+        return accepted
     }
 
     /** 端末を最初の状態に戻し、画面を消す（電源を入れ直したときなど）。 */
-    public fun reset() {
+    public fun reset(): Unit = locked {
         clearBacklog()
         release()
         terminal.reset()
+    }
+
+    // 表示デバイスのロックを持って [block] を実行する（ロックの順は「表示デバイス → カーネル」）
+    private inline fun <T> locked(block: () -> T): T {
+        val lock = display.lock
+        lock.lock()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
     }
 
     override fun toString(): String = "MachineConsole(${screen.width}x${screen.height}, $machine)"

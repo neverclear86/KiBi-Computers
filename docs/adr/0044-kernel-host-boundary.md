@@ -20,7 +20,7 @@
 | MC → カーネル | 保存先 | `MachineEnvironment.storageDirectory`（`Path?`） | — |
 | MC → カーネル | つながったデバイス | `Machine.notifyDevicesChanged()`（変わったことだけを知らせる） | どのスレッドからも |
 | カーネル → MC | 状態の変化（停止を含む） | `MachineHost.onStateChanged` | メインスレッド（`tick()` の中） |
-| カーネル → MC | 画面出力 | `MachineHost.onConsoleOutput` | メインスレッド（`tick()` の中） |
+| カーネル → MC | 画面出力 | `MachineHost.onConsoleOutput` | メインスレッド（`tick()` の中）。表示デバイスをつないだ後のプロセスの出力は、プロセスのスレッドが表示デバイスに書く（ADR 0355） |
 | カーネル → MC | ビープ | `MachineHost.onBeep` | メインスレッド（`tick()` の中） |
 | カーネル → MC | ワールド・デバイスの操作 | ホスト呼び出し（`ProcessContext.callOnMainThread`。内部） | メインスレッド（`tick()` の中） |
 
