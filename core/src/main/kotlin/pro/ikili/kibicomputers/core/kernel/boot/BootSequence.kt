@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.PendingExec
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
@@ -22,7 +23,8 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]
  * 3. 候補のディスクを順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする。
  *    続けて空の `/tmp`（メモリ上。#53）をマウントする（根の `/tmp` がディレクトリ以外ならマウントせず、コンソールに書いて続ける）
- * 4. init を pid 1 で作る（親なし、argv は `[INIT_PATH]`、環境変数なし、cwd `/`、標準入出力はコンソール）
+ * 4. init を pid 1 で作る（親なし、argv は `[INIT_PATH]`、環境変数なし、cwd `/`、標準入出力はコンソール）。
+ *    init の読み込み（コンパイル）の終わりは、スレッドを持たずに待つ（#358。終わったら起動用のスレッドで続ける）
  *
  * 途中で取り消されたら、マウントを外して何も知らせずに終える。
  */
@@ -84,6 +86,10 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         false
     }
 
+    /**
+     * init の読み込み（コンパイル）を始め、終わりはスレッドを持たずに待つ（#358）。読み込みが終わったら、起動用のスレッドで
+     * [finishInit] が init を作る。待つ間に起動が取り消されたら、何も知らせずに起動を終える
+     */
     private fun startInit() {
         val options = SpawnOptions(
             stdio = StdioSpec.CONSOLE,
@@ -92,21 +98,41 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             cwd = "/",
             fds = SpawnOptions.ROOT_PREOPEN,
         )
+        val pending = guarded { machine.beginExec(BootConfig.INIT_PATH, KernelDrivers.DEFAULT, options, parentPid = 0) } ?: return
+        machine.whenInitLoaded(pending) { finishInit(pending) }
+    }
+
+    /** 読み込みが終わった init を pid 1 で作る（起動用のスレッドで） */
+    private fun finishInit(pending: PendingExec) {
         try {
-            machine.exec(BootConfig.INIT_PATH, KernelDrivers.DEFAULT, options, parentPid = 0, asInit = true)
-        } catch (e: FsException) {
-            when (e.errno) {
-                Errno.NOENT -> machine.endBoot(BootFailure.NO_INIT, e.message ?: "NOENT")
-                Errno.ACCES, Errno.FBIG, Errno.NOEXEC -> machine.endBoot(BootFailure.INIT_NOT_EXECUTABLE, e.errno.name, e.message)
-                else -> machine.endBoot(BootFailure.INIT_START_FAILED, e.errno.name, e.message)
-            }
-        } catch (e: ResourceLimitException) {
-            machine.endBoot(BootFailure.INIT_START_FAILED, "resource limit", e.message)
-        } catch (e: IllegalStateException) {
-            machine.endBoot(BootFailure.INIT_START_FAILED, "machine not ready", e.message)
-        } catch (e: IllegalArgumentException) {
-            machine.endBoot(BootFailure.INIT_START_FAILED, "invalid", e.message)
+            guarded { machine.finishExec(pending, asInit = true) }
+        } catch (e: BootCancelledException) {
+            machine.endBoot(null, "")
+        } catch (t: Throwable) {
+            machine.endBoot(BootFailure.INIT_START_FAILED, "internal error", "起動の途中で例外: $t")
+            if (t is VirtualMachineError && t !is StackOverflowError) throw t
         }
+    }
+
+    /** [block] を実行する。init を作れない失敗は、知らせて起動を終え `null` を返す */
+    private fun <T : Any> guarded(block: () -> T): T? = try {
+        block()
+    } catch (e: FsException) {
+        when (e.errno) {
+            Errno.NOENT -> machine.endBoot(BootFailure.NO_INIT, e.message ?: "NOENT")
+            Errno.ACCES, Errno.FBIG, Errno.NOEXEC -> machine.endBoot(BootFailure.INIT_NOT_EXECUTABLE, e.errno.name, e.message)
+            else -> machine.endBoot(BootFailure.INIT_START_FAILED, e.errno.name, e.message)
+        }
+        null
+    } catch (e: ResourceLimitException) {
+        machine.endBoot(BootFailure.INIT_START_FAILED, "resource limit", e.message)
+        null
+    } catch (e: IllegalStateException) {
+        machine.endBoot(BootFailure.INIT_START_FAILED, "machine not ready", e.message)
+        null
+    } catch (e: IllegalArgumentException) {
+        machine.endBoot(BootFailure.INIT_START_FAILED, "invalid", e.message)
+        null
     }
 
     companion object {
