@@ -538,6 +538,43 @@ class BootTest {
     }
 
     @Test
+    fun `再起動を待つ間はプロセスがすべて終わってもスレッドの登録が残るうちは待機点にしない`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        val firstInit = process(1)!!
+        // init の専用スレッドを、プロセスが終わった後・登録を外す前で止める（通知を積む前の場面を作る）
+        val atGate = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        h.scheduler.hooks.beforeUnregister = { machine, pid ->
+            if (machine === m && pid == 1 && atGate.count > 0) {
+                atGate.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+        }
+        try {
+            assertTrue(m.reboot())
+            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            h.scheduler.hooks.beforeUnregister = null
+            tickFor(50)
+            m.lock.withLockValue {
+                assertTrue(firstInit.state.isTerminal, "init は終わっている")
+                assertEquals(0, m.kernel.processes.liveCount(), "動いているプロセスはない")
+                assertTrue(m.kernel.processes.all().all { it.state.isTerminal }, "どのプロセスも待機点の扱い")
+            }
+            assertEquals(MachineState.STOPPED, m.state)
+            assertFalse(m.isBooting)
+            assertEquals(0, host.reboots.get(), "スレッドの登録が残るので、再起動の求めはまだ積まない")
+            assertFalse(m.isAtWaitPoint, "再起動の求めを積む前は待機点にしない")
+        } finally {
+            h.scheduler.hooks.beforeUnregister = null
+            gate.countDown()
+        }
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting }
+        assertTrue(process(1) !== firstInit)
+    }
+
+    @Test
     fun `initかどうかはKernelStateのinitPidで決める`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))
