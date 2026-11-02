@@ -60,11 +60,13 @@ internal class Harness(
     timers: TimerService? = null,
     /** `Machine.exec` で待機点への変換をかける（#329）。`false` なら p1 のコマンドを `BLOCKING` で動かす */
     asyncify: Boolean = true,
+    /** スケジューラの読み込みの上限（#40）。`null` ならカーネルは [ModuleLimits.DEFAULT] の値で上限をかける */
+    moduleLimits: ModuleLimits? = if (execRuntime != null) ModuleLimits.DEFAULT else null,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = if (execRuntime != null) ModuleLimits.DEFAULT else null, timers = timers, asyncifyExecutables = asyncify),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify),
     )
     private var counter = 0
 
