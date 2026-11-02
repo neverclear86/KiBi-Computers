@@ -66,6 +66,24 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         override fun pixelsIfCreated(): PixelBuffer? = if (hasPixels) this@ScreenBlockEntity.pixels else null
     }
 
+    // サーバー: 画面が外れた（ブロックエンティティが消えた）ときに知らせる先（#397）。たいていは0〜1個なので、要るまで作らない
+    private var removalListeners: ArrayList<Runnable>? = null
+
+    /**
+     * サーバー: 画面が外れた（壊された・チャンクが読み込まれなくなったなどで、ブロックエンティティが消えた）ときに [listener] を呼ぶ（#397）。
+     * 呼ぶのは1回だけで、呼んだ後は登録を外す。メインスレッドから使う
+     */
+    internal fun addRemovalListener(listener: Runnable) {
+        (removalListeners ?: ArrayList<Runnable>(1).also { removalListeners = it }).add(listener)
+    }
+
+    /** サーバー: [addRemovalListener] で登録した [listener] を外す。登録していなければ何もしない */
+    internal fun removeRemovalListener(listener: Runnable) {
+        val ls = removalListeners ?: return
+        ls.remove(listener)
+        if (ls.isEmpty()) removalListeners = null
+    }
+
     /** サーバーで、この画面を見ているプレイヤーの数（新しく見に来て、まだ送っていない人も含む）。 */
     val watcherCount: Int
         get() = watchers.count
@@ -85,6 +103,10 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         watchers.clear()
         renderCache?.close()
         renderCache = null
+        // isRemoved が真になってから知らせる。知らせた先が登録を外しても困らないように、先に手放す
+        val listeners = removalListeners ?: return
+        removalListeners = null
+        for (l in listeners) l.run()
     }
 
     /**

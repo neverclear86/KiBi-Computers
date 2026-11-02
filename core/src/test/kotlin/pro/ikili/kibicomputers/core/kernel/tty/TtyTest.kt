@@ -373,6 +373,101 @@ class TtyTest {
         assertNull(t.drainOutput(sink))
     }
 
+    // ---- 取り出す位置の目印（drainOutput の upTo。#381・#397） ----
+
+    private fun Tty.outUpTo(upTo: Long): String? = drainOutput(sink, upTo)?.toString(Charsets.UTF_8)
+
+    @Test
+    fun `upToが今の位置と同じなら全部取り出す`() {
+        val t = tty()
+        t.writeText("abc")
+        assertEquals("abc", t.outUpTo(t.outputWritten))
+        assertEquals(0, t.outputAvailable)
+        assertNull(t.outUpTo(t.outputWritten))
+    }
+
+    @Test
+    fun `upToが今の位置より先なら全部取り出す`() {
+        val t = tty()
+        t.writeText("abc")
+        assertEquals("abc", t.outUpTo(t.outputWritten + 100))
+        assertNull(t.outUpTo(Long.MAX_VALUE))
+    }
+
+    @Test
+    fun `upToより後に積んだ分は残し、次に取り出せる`() {
+        val t = tty()
+        t.writeText("abc")
+        val mark = t.outputWritten
+        t.writeText("de")
+        assertEquals("abc", t.outUpTo(mark))
+        assertEquals(2, t.outputAvailable)
+        // 目印より前の分はもうない
+        assertNull(t.outUpTo(mark))
+        assertEquals("de", t.outUpTo(t.outputWritten))
+    }
+
+    @Test
+    fun `upToが残りの先頭より前なら、何も取り出さない`() {
+        val t = tty()
+        t.writeText("abc")
+        val early = t.outputWritten - 2
+        t.writeText("de")
+        assertEquals("a", t.outUpTo(early))
+        assertNull(t.outUpTo(early - 1), "目印より後に積んだ分だけが残っている")
+        assertEquals("bcde", t.out())
+    }
+
+    @Test
+    fun `最後に閉じて出力を消した後も、目印は消す前の位置から数える`() {
+        val t = tty()
+        t.writeText("abc")
+        val beforeClear = t.outputWritten
+        t.onLastClose(sink)
+        assertEquals(0, t.outputAvailable)
+        assertEquals(beforeClear, t.outputWritten, "消しても数え直さない")
+        assertNull(t.outUpTo(beforeClear), "消した分は取り出せない")
+        t.writeText("xy")
+        // 消す前の目印では、消した後に積んだ分を取り出さない
+        assertNull(t.outUpTo(beforeClear))
+        assertEquals("x", t.outUpTo(beforeClear + 1))
+        assertEquals("y", t.outUpTo(t.outputWritten))
+    }
+
+    @Test
+    fun `読み込んで作り直したTTYは0から数え直し、前のTTYの目印では全部取り出す`() {
+        val old = tty()
+        old.writeText("0123456789")
+        val oldMark = old.outputWritten
+        // 状態を読み込んだ後の TTY（outputWritten は保存しないので 0 から）
+        val loaded = tty()
+        assertEquals(0, loaded.outputWritten)
+        loaded.writeText("ab")
+        assertEquals(2, loaded.outputWritten)
+        assertEquals("ab", loaded.outUpTo(oldMark))
+        assertNull(loaded.outUpTo(oldMark))
+    }
+
+    @Test
+    fun `取り出した後も書けないままなら、書き手を起こさない`() {
+        val t = tty(output = 8)
+        assertEquals(WriteResult.Bytes(8), t.writeText("01234567"))
+        val mark1 = t.outputWritten - 7
+        assertFalse(t.isReady(WaitCondition.WRITABLE))
+        sink.clear()
+        // 1バイトだけ取り出しても、空きは1バイトで LF が書けない（WRITABLE は偽のまま）
+        assertEquals("0", t.outUpTo(mark1))
+        assertFalse(t.isReady(WaitCondition.WRITABLE))
+        assertTrue(sink.wakes.isEmpty(), "まだ書けないので起こさない: ${sink.wakes}")
+        // もう1バイト取り出すと書けるようになり、起こす
+        assertEquals("1", t.outUpTo(mark1 + 1))
+        assertEquals(listOf(writable(t)), sink.wakes)
+        sink.clear()
+        // 書ける状態から取り出しても、起こし直さない
+        assertEquals("234567", t.out())
+        assertTrue(sink.wakes.isEmpty(), "${sink.wakes}")
+    }
+
     @Test
     fun `空き1バイトでLFは書けず、WRITABLEも偽`() {
         val t = tty(output = 8)

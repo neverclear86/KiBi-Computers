@@ -93,6 +93,96 @@ object TestComputerGameTests {
         }
     }
 
+    /** キーボードで1行打つ（Enter まで） */
+    private fun typeLine(helper: GameTestHelper, keyboard: KeyboardBlockEntity, line: String) {
+        val events = listOf(KeyboardEvent.Text(line), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+        for (packet in KeyboardEventCodec.encode(events)) {
+            helper.assertTrue(keyboard.receive(UUID(0, 1), packet) == 2, "keyboard should accept the input")
+        }
+    }
+
+    /** 電源が入ったまま画面を壊すと、出力がなくてもすぐに画面とキーボードから外す（#397）。 */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun breakingScreenWhileRunningDisconnectsAtOnce(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        val console = case.wiring.connectedConsole!!
+        // 壊した直後に確かめたこと（succeedWhen は失敗すると次の tick にやり直すので、結果を取っておく）
+        var problem: String? = null
+        var broken = false
+        helper.succeedWhen {
+            if (!broken) {
+                val text = lines(screen.text)
+                helper.assertTrue(text.any { it == ">" }, "prompt should be shown: $text")
+                helper.setBlock(SCREEN, Blocks.AIR)
+                broken = true
+                problem = when {
+                    !screen.isRemoved -> "the screen block entity should be removed"
+                    case.wiring.connectedScreen != null -> "breaking the screen should disconnect it at once"
+                    case.wiring.connectedConsole != null -> "breaking the screen should drop the console"
+                    case.wiring.connectedKeyboard != null || keyboard.owner != null -> "breaking the screen should free the keyboard"
+                    console.backlogBytes != 0 -> "nothing should be kept for the removed screen: ${console.backlogBytes}"
+                    else -> null
+                }
+            }
+            helper.assertTrue(problem == null, problem ?: "")
+            helper.assertTrue(machine.state == MachineState.RUNNING, "machine should keep running without a screen")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * 出力を止めている最中（画面に書ききれずに取っておいた分がある間）に画面を壊すと、たまった分を書かずに捨て、
+     * 外れた画面にはもう書かない（#397）。止めている間はマシンが出力を配らないので、画面の取り外しの知らせで気付く。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun breakingScreenWhileOutputIsHeldDiscardsBacklog(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        val console = case.wiring.connectedConsole!!
+        var typed = false
+        var broken = false
+        var problem: String? = null
+        var removedText: List<String> = emptyList()
+        var ticksAfterBreak = 0
+        helper.succeedWhen {
+            if (!typed) {
+                val text = lines(screen.text)
+                helper.assertTrue(text.any { it == ">" }, "prompt should be shown: $text")
+                // 1行送りの間に文字を挟むと1回ごとに画面全体を写すので、1 tick の上限をすぐに超えて出力を止める（#357）
+                typeLine(helper, keyboard, "while true do io.write((\"\\27[Sx\"):rep(5000)) end")
+                typed = true
+            }
+            if (!broken) {
+                helper.assertTrue(console.backlogBytes > 0, "the console should hold the output (backlog ${console.backlogBytes})")
+                val droppedBefore = console.droppedBytes
+                val backlog = console.backlogBytes
+                helper.setBlock(SCREEN, Blocks.AIR)
+                broken = true
+                removedText = lines(screen.text)
+                problem = when {
+                    case.wiring.connectedScreen != null -> "breaking the screen should disconnect it while the output is held"
+                    console.backlogBytes != 0 -> "the backlog should be discarded: ${console.backlogBytes}"
+                    console.droppedBytes != droppedBefore + backlog ->
+                        "the whole backlog ($backlog) should be dropped: ${console.droppedBytes - droppedBefore}"
+                    else -> null
+                }
+            }
+            helper.assertTrue(problem == null, problem ?: "")
+            // 外れた画面には、もう書かない
+            helper.assertTrue(lines(screen.text) == removedText, "the removed screen should not be written to")
+            helper.assertTrue(machine.state == MachineState.RUNNING, "machine should keep running without a screen")
+            helper.assertTrue(++ticksAfterBreak > 20, "watch the removed screen for a while")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
     /** 画面がなくても起動し、キーボードはつながない。 */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
