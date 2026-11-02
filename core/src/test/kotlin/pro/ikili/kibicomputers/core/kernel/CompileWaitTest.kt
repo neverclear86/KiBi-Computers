@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.process.ExecWait
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -109,16 +110,55 @@ class CompileWaitTest {
 
     private val exitDrivers = ProcessDriverFactory { TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) } }
 
-    /** プロセスから [path] を exec し、結果（pid か例外）を [out] に入れて終わるドライバー */
-    private fun execer(path: String, out: AtomicReference<Any>, kind: ProcessKind = ProcessKind.BLOCKING) = TestDriver(kind) { ctx ->
-        out.set(
-            try {
-                ctx.exec(path, exitDrivers)
-            } catch (e: FsException) {
-                e
-            },
-        )
-        StepResult.Exit(0)
+    /**
+     * プロセスから [path] を exec し、結果（pid か例外）を [out] に入れて終わるドライバー。
+     * 待機点型は、読み込みの終わりをスレッドを持たずに待つ（beginExec → StepResult.Wait → finishExec。#358）
+     */
+    private fun execer(path: String, out: AtomicReference<Any>, kind: ProcessKind = ProcessKind.BLOCKING): TestDriver {
+        if (kind == ProcessKind.WAIT_POINT) {
+            val pending = AtomicReference<ExecWait>()
+            return TestDriver(
+                kind,
+                onResume = { ctx, _ ->
+                    out.set(
+                        try {
+                            ctx.finishExec(pending.get())
+                        } catch (e: FsException) {
+                            e
+                        },
+                    )
+                    StepResult.Exit(0)
+                },
+            ) { ctx ->
+                try {
+                    val w = ctx.beginExec(path, exitDrivers)
+                    pending.set(w)
+                    StepResult.Wait(listOf(w.key))
+                } catch (e: FsException) {
+                    out.set(e)
+                    StepResult.Exit(0)
+                }
+            }
+        }
+        return TestDriver(kind) { ctx ->
+            out.set(
+                try {
+                    ctx.exec(path, exitDrivers)
+                } catch (e: FsException) {
+                    e
+                },
+            )
+            StepResult.Exit(0)
+        }
+    }
+
+    /** 読み込みを待っている（ブロッキング型は WAITING_HOST、待機点型はスレッドを持たずに待機点で WAITING_EVENT） */
+    private fun Machine.awaitingLoad(pid: Int): Boolean = lock.withLockValue {
+        val rt = runtime(pid) ?: return@withLockValue false
+        when (rt.process.kind) {
+            ProcessKind.BLOCKING -> rt.process.state == ProcessState.WAITING_HOST
+            ProcessKind.WAIT_POINT -> rt.process.state == ProcessState.WAITING_EVENT && rt.thread == null && !rt.stackActive
+        }
     }
 
     @Test
@@ -145,7 +185,7 @@ class CompileWaitTest {
         val a = m.spawnTest(h.program(emptyModule()), execer("/bin/a", outA))
         val b = m.spawnTest(h.program(emptyModule()), execer("/bin/b", outB, ProcessKind.WAIT_POINT))
         tickUntil("読み込みを待たない") {
-            h.scheduler.programs.loadingCount == 5 && m.stateOf(a) == ProcessState.WAITING_HOST && m.stateOf(b) == ProcessState.WAITING_HOST
+            h.scheduler.programs.loadingCount == 5 && m.awaitingLoad(a) && m.awaitingLoad(b)
         }
         assertEquals(1, loading.size, "読み込むスレッドは 1 本")
         assertTrue(booting.all { it.isBooting })
@@ -228,7 +268,7 @@ class CompileWaitTest {
         val outB = AtomicReference<Any>()
         val a = m.spawnTest(h.program(emptyModule()), execer("/bin/x", outA))
         val b = m.spawnTest(h.program(emptyModule()), execer("/bin/y", outB, ProcessKind.WAIT_POINT))
-        tickUntil { m.stateOf(a) == ProcessState.WAITING_HOST && m.stateOf(b) == ProcessState.WAITING_HOST }
+        tickUntil { m.awaitingLoad(a) && m.awaitingLoad(b) }
         m.lock.withLockValue {
             m.killLocked(a, KillSignal.KILL)
             m.killLocked(b, KillSignal.KILL)

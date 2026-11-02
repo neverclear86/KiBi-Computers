@@ -260,7 +260,7 @@ class AsyncP1Test {
             val s = Session(h, m, listOf("sleep", "100000"))
             s.tickUntil("時計で待たない") { m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
             assertEquals(before + 1, timerCount(m))
-            assertNull(s.rt.thread)
+            eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
             m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
             s.tickUntil("止まらない") { m.stateOf(s.pid).isTerminal }
             assertEquals(ProcessState.KILLED, m.stateOf(s.pid))
@@ -317,7 +317,7 @@ class AsyncP1Test {
             s.tickUntil("書き込みで待たない") { s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
             assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
             assertTrue(s.m.lock.withLockValue { s.process.asyncStack!!.size } > 0)
-            assertNull(s.rt.thread)
+            eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
             s.tickUntil("終わらない") {
                 s.drain()
                 s.m.stateOf(s.pid).isTerminal

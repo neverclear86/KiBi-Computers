@@ -36,7 +36,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionException
 import java.util.concurrent.ExecutionException
 
 /**
@@ -611,6 +613,15 @@ internal class ProcessRunner(private val machine: Machine) {
         // 後から来た closeWaitTimer は集合にないので何もしない（同じ ID が別のオブジェクトに使い回されていても閉じない）
         process.waitTimers.forEach { machine.kernel.objects.release(it, machine.wakeSink) }
         process.waitTimers.clear()
+        // 終わりを待っているホスト側の処理を閉じる（まだ列にあるホスト呼び出しは下で取り消す。読み込みは待つのをやめる。#358）
+        if (rt.hostWaits.isNotEmpty()) {
+            val waits = rt.hostWaits.toList()
+            rt.hostWaits.clear()
+            for ((id, pending) in waits) {
+                machine.kernel.objects.release(id, machine.wakeSink)
+                if (!pending.future.isDone) pending.abandon?.invoke()
+            }
+        }
         process.asyncWait = null
         process.asyncStack?.clear()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
@@ -646,9 +657,30 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =
             machine.spawn(program, driver, options, rt.pid)
 
-        override fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): Int =
+        override fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): Int {
+            checkMayBlock("exec")
             // 読み込み（コンパイル）を待つ間は、CPU と許可を返す（#37。ADR 0029）
-            machine.exec(path, drivers, options, rt.pid) { future -> awaitHost(future) }
+            return machine.exec(path, drivers, options, rt.pid) { future -> awaitHost(future) }
+        }
+
+        override fun beginExec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): ExecWait {
+            checkThread()
+            val pending = machine.beginExec(path, drivers, options, rt.pid)
+            val wait = try {
+                watch(pending.future) { pending.future.cancel(false) }
+            } catch (t: Throwable) {
+                pending.future.cancel(false)
+                throw t
+            }
+            return ExecWait(wait, pending)
+        }
+
+        override fun finishExec(wait: ExecWait): Int {
+            checkThread()
+            // 読み込みの失敗は、machine.finishExec が errno にする
+            lock.withLockValue { takeLocked(wait.wait) }
+            return machine.finishExec(wait.pending)
+        }
 
         override fun children(): List<Int> = machine.children(rt.pid)
 
@@ -939,7 +971,7 @@ internal class ProcessRunner(private val machine: Machine) {
         }
 
         override fun <T> awaitHost(future: CompletableFuture<T>): T {
-            checkThread()
+            checkMayBlock("awaitHost")
             var previous = ProcessState.RUNNING
             lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
@@ -969,8 +1001,84 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override val environment: MachineEnvironment get() = machine.environment
 
-        override fun <T> callOnMainThread(call: HostCall<T>): T {
+        override fun <T> watchHost(future: CompletableFuture<T>): HostWait<T> {
             checkThread()
+            return watch(future, null)
+        }
+
+        override fun <T> submitHostCall(call: HostCall<T>): HostWait<T> {
+            checkThread()
+            // 止められていれば、submitHostCall が積まずに ProcessKilledException で終えた future を返す（watch が投げる）
+            val future = machine.submitHostCall(rt.pid, call)
+            return watch(future) { machine.cancelHostCallLocked(future) }
+        }
+
+        /**
+         * [future] の終わりを待つ [HostCompletion] を作る。[abandon] は、結果を受け取らずに閉じるときに（カーネルロックの中で）呼ぶ。
+         * 終わったら、終えたスレッドでカーネルロックを取り直し、印を付けて待ち手を起こす
+         */
+        private fun <T> watch(future: CompletableFuture<T>, abandon: (() -> Unit)?): HostWait<T> {
+            val key = lock.withLockValue {
+                if (rt.killed || rt.process.state.isTerminal) {
+                    abandon?.invoke()
+                    throw ProcessKilledException()
+                }
+                val id = machine.kernel.objects.add(HostCompletion())
+                rt.hostWaits[id] = PendingHostWait(future, abandon)
+                WaitKey(id, WaitCondition.READABLE)
+            }
+            future.whenComplete { _, _ ->
+                lock.withLockValue {
+                    // 閉じた後（プロセスの終わり・closeHostWait）なら何もしない
+                    if (rt.hostWaits[key.objectId]?.future !== future) return@withLockValue
+                    val obj = machine.kernel.objects[key.objectId] as HostCompletion
+                    obj.done = true
+                    machine.wakeSink.wake(key)
+                }
+            }
+            return HostWait(key, future)
+        }
+
+        /** 終わった [wait] を表から外して閉じる。カーネルロックの中で呼ぶ */
+        private fun takeLocked(wait: HostWait<*>) {
+            if (rt.killed) throw ProcessKilledException()
+            val id = wait.key.objectId
+            require(rt.hostWaits[id]?.future === wait.future) { "このプロセスの開いている待ちではない: ${wait.key}" }
+            check(wait.future.isDone) { "まだ終わっていない: ${wait.key}" }
+            rt.hostWaits.remove(id)
+            machine.kernel.objects.release(id, machine.wakeSink)
+        }
+
+        override fun <T> takeHostResult(wait: HostWait<T>): T {
+            lock.withLockValue { takeLocked(wait) }
+            return try {
+                wait.future.getNow(null)
+            } catch (e: CompletionException) {
+                throw e.cause ?: e
+            } catch (e: CancellationException) {
+                throw ProcessKilledException(e)
+            }
+        }
+
+        override fun closeHostWait(wait: HostWait<*>) = lock.withLockValue {
+            val id = wait.key.objectId
+            val pending = rt.hostWaits[id]
+            if (pending?.future !== wait.future) return@withLockValue
+            rt.hostWaits.remove(id)
+            machine.kernel.objects.release(id, machine.wakeSink)
+            if (!wait.future.isDone) pending.abandon?.invoke()
+        }
+
+        /** 止まって待つ口（block を除く）は、ブロッキング型か、作っている途中だけ（待機点型が step の途中でスレッドを持ったまま止まらない。#358） */
+        private fun checkMayBlock(name: String) {
+            checkThread()
+            lock.withLockValue {
+                check(rt.process.kind == ProcessKind.BLOCKING || rt.loading != null) { "待機点型は $name で止まらず、StepResult.Wait で待つ" }
+            }
+        }
+
+        override fun <T> callOnMainThread(call: HostCall<T>): T {
+            checkMayBlock("callOnMainThread")
             // 止められたプロセスは、メインスレッドでの処理を出さない（マシンが STOPPED に戻った後でも）。
             // 止められたかの確かめと列への積み込みは、submitHostCall の同じロックの中で行う（#46）
             return awaitHost(machine.submitHostCall(rt.pid, call))

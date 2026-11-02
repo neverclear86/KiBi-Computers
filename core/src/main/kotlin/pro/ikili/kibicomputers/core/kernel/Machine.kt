@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.KillResult
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.PendingExec
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
@@ -63,8 +64,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionException
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -589,20 +592,11 @@ public class Machine private constructor(
         asInit: Boolean = false,
         await: ((CompletableFuture<Program>) -> Program)? = null,
     ): Int {
-        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
-        val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
-        val program = try {
-            val runtime = scheduler.options.runtime
-            val limits = scheduler.options.moduleLimits
-            val metered = scheduler.options.meterExecutables
-            val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
-            val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
-                if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
-            }
+        val pending = beginExec(path, drivers, options, parentPid)
+        val future = pending.future
+        if (!future.isDone) {
             try {
-                // 共有しているものがあれば、待たずに（CPU と許可を持ったまま）使う
                 when {
-                    future.isDone -> awaitProgram(future, null)
                     await != null -> await(future)
                     // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
                     else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
@@ -610,16 +604,90 @@ public class Machine private constructor(
             } catch (e: Throwable) {
                 // 待つのをやめた（止められた・起動の取り消し）。ほかに待つ側がなく、まだ始まっていなければ読み込まない（#363）
                 future.cancel(false)
-                throw e
+                // 読み込みの失敗そのものなら、下の finishExec で errno にする
+                if (loadFailureOf(future) !== e) throw e
             }
-        } catch (e: WasmLoadException) {
-            Program.unsuspendableReason(e)?.let { fsError(Errno.NOEXEC, "${executable.path} は待機点に変換できない作りなので動かせない: $it") }
-            fsError(Errno.NOEXEC, "${executable.path} は WASM として読めない: ${e.message}")
-        } catch (e: ProgramLoadBusyException) {
-            fsError(Errno.AGAIN, "${executable.path} を読み込めない: ${e.message}")
         }
-        val driver = drivers.create(program)
-        return spawn(program, driver, options.copy(args = executable.args), parentPid, asInit)
+        return finishExec(pending, asInit)
+    }
+
+    /**
+     * [exec] の前半（#358）: 実行ファイルを読み（シバンをたどる）、読み込み（コンパイル）を始めて、待たずに返す。
+     * 読み込みが終わったら（`future` が終わったら）[finishExec] でプロセスを作る。待つのをやめるときは `future.cancel(false)`。
+     * ファイルの失敗（`NOENT`・`ACCES`・`FBIG`・`LOOP` など）はここで投げる。読み込みの失敗（`NOEXEC`・`AGAIN`）は [finishExec] で投げる。
+     * カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class)
+    internal fun beginExec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions, parentPid: Int): PendingExec {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
+        val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
+        val runtime = scheduler.options.runtime
+        val limits = scheduler.options.moduleLimits
+        val metered = scheduler.options.meterExecutables
+        val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
+        val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
+            if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
+        }
+        return PendingExec(executable.path.toString(), executable.args, drivers, options, parentPid, future)
+    }
+
+    /**
+     * [exec] の後半（#358）: 終わった読み込み [pending] からドライバーとプロセスを作る。読み込みの失敗は errno にして投げる
+     * （待機点に変換できない作り・WASM として読めない → `NOEXEC`、読み込みが多すぎる → `AGAIN`）。
+     * 読み込みが終わっていなければ [IllegalStateException]。ほかの失敗は [spawn] と同じ。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class)
+    internal fun finishExec(pending: PendingExec, asInit: Boolean = false): Int {
+        val future = pending.future
+        check(future.isDone) { "読み込みが終わっていない" }
+        val program = try {
+            awaitProgram(future, null)
+        } catch (e: WasmLoadException) {
+            Program.unsuspendableReason(e)?.let { fsError(Errno.NOEXEC, "${pending.path} は待機点に変換できない作りなので動かせない: $it") }
+            fsError(Errno.NOEXEC, "${pending.path} は WASM として読めない: ${e.message}")
+        } catch (e: ProgramLoadBusyException) {
+            fsError(Errno.AGAIN, "${pending.path} を読み込めない: ${e.message}")
+        }
+        val driver = pending.drivers.create(program)
+        return spawn(program, driver, pending.options.copy(args = pending.args), pending.parentPid, asInit)
+    }
+
+    /**
+     * 起動の init の読み込み（[pending]）の終わりを、スレッドを持たずに待つ（#358）。終わったら、起動用のスレッドで [onLoaded] を呼ぶ。
+     * 先に起動が取り消されたら（`stop()`・`reboot()`・スケジューラの停止）、読み込みを待つのをやめ（始まっていなければ読み込まない。#363）、
+     * 起動用のスレッドで何も知らせずに起動を終える。どちらか一方だけを1回呼ぶ
+     */
+    internal fun whenInitLoaded(pending: PendingExec, onLoaded: () -> Unit) {
+        val cancel = lock.withLockValue { bootCancelSignal }
+        val fired = AtomicBoolean()
+        pending.future.whenComplete { _, _ -> if (fired.compareAndSet(false, true)) runBootStep(onLoaded) }
+        cancel.whenComplete { _, _ ->
+            // stopLocked の中（カーネルロックの中）から呼ばれる。取り消しは読み込みの側のロックだけを取るので、ここで行ってよい
+            if (fired.compareAndSet(false, true)) {
+                pending.future.cancel(false)
+                runBootStep { endBoot(null, "") }
+            }
+        }
+    }
+
+    /** 起動の手順の続きを、起動用のスレッドで動かす（スケジューラが閉じて受け付けなければ、このスレッドで） */
+    private fun runBootStep(step: () -> Unit) {
+        try {
+            scheduler.bootExecutor.execute(step)
+        } catch (e: RejectedExecutionException) {
+            step()
+        }
+    }
+
+    /** 失敗で終わった（取り消しでない）[future] の例外。成功・終わっていない・取り消されたなら `null` */
+    private fun loadFailureOf(future: CompletableFuture<Program>): Throwable? {
+        if (!future.isCompletedExceptionally || future.isCancelled) return null
+        return try {
+            future.getNow(null)
+            null
+        } catch (e: CompletionException) {
+            e.cause ?: e
+        }
     }
 
     /**
@@ -1022,7 +1090,7 @@ public class Machine private constructor(
     internal fun stopLocked(crash: Throwable?) {
         if (bootingValue) {
             bootCancelled = true
-            // 後続（init の読み込みを待つ anyOf）は、待っているスレッドを起こすだけなので、ロックの中で終えてよい
+            // 後続（init の読み込みの待ち。whenInitLoaded）は、読み込みを取り消して起動用のスレッドに続きを積むだけなので、ロックの中で終えてよい
             bootCancelSignal.complete(Unit)
         }
         if (crash != null) {
@@ -1686,8 +1754,16 @@ public class Machine private constructor(
     private fun cancelHostCallsLocked() {
         while (true) {
             val pending = hostCalls.removeFirstOrNull() ?: break
-            // future に後続の処理はつながっていない（待つのはプロセスのスレッドの get() だけ）ので、ロックの中で終えてよい
+            // future の後続は、待つプロセスのスレッドの get() か、待ちのオブジェクトの印（カーネルロックを取り直すだけ。#358）なので、ロックの中で終えてよい
             pending.future.completeExceptionally(ProcessKilledException())
+        }
+    }
+
+    /** まだ実行していないホスト呼び出し [future] を取り消す（実行し始めたものはそのまま。#358）。カーネルロックの中で呼ぶ */
+    internal fun cancelHostCallLocked(future: CompletableFuture<*>) {
+        if (hostCalls.isEmpty()) return
+        hostCalls.removeAll { pending ->
+            (pending.future === future).also { if (it) pending.future.completeExceptionally(ProcessKilledException()) }
         }
     }
 
