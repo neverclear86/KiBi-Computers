@@ -133,6 +133,12 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
         machine.releaseBytes(bytes)
     }
 
+    /**
+     * あと確保できるバイト数（#370 の PoC の `ram_remaining`）。プロセスの上限とマシンの RAM のうち小さい方の残り。
+     * サーバー全体の上限（#362）は見ない
+     */
+    fun remainingBytes(): Long = maxOf(0L, minOf(limitBytes - usedBytes, machine.limitBytes - machine.usedBytes))
+
     private fun subtract(bytes: Long) {
         val after = usedBytesCounter.addAndGet(-bytes)
         check(after >= 0) { "プロセスのメモリの使用量が負になった: $after バイト" }

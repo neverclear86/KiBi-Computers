@@ -192,7 +192,7 @@ private class BudgetedMemory(
     val inner: EndiveMemory,
     private val budget: WasmMemoryBudget,
     private var reserved: Int,
-) : EndiveMemory by inner {
+) : EndiveMemory by inner, ReleasableMemory {
     @Synchronized
     override fun grow(size: Int): Int {
         // 0 は今の大きさを返すだけ。負（符号なしで 2^31 以上）は Endive が -1 を返す
@@ -216,10 +216,21 @@ private class BudgetedMemory(
 
     /** 確保した分をすべて返す。以後 `grow` は数えない（閉じたインスタンスのメモリ）。2回呼んでもよい */
     @Synchronized
-    fun releaseAll() {
+    override fun releaseAll() {
         if (reserved > 0) budget.release(reserved)
         reserved = -1
     }
+}
+
+/** インスタンスを閉じたとき（作るのに失敗したときも）に、数えた分を返すメモリ */
+private interface ReleasableMemory {
+    /** 数えた分をすべて返す。2回呼んでもよい */
+    fun releaseAll()
+}
+
+/** 書き換えた 4 KiB で数えるメモリ（#370 の PoC）を、閉じたときに返す相手として包む */
+private class WrittenRelease(val memory: WrittenPagesMemory) : ReleasableMemory {
+    override fun releaseAll() = memory.releaseAll()
 }
 
 /**
@@ -312,11 +323,16 @@ private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig
  *
  * 最初のページ数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<BudgetedMemory>): EndiveMemory {
+private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
     val initial = limits.initialPages()
     val max = minOf(limits.maximumPages(), config.maxMemoryPages)
     if (initial > max) {
         throw MemoryLimitFailure("メモリの最初のページ数 $initial が上限 $max を超える")
+    }
+    if (config.writtenMemory && !limits.shared()) {
+        // #370 の PoC: ページ数は数えず、書き換えた 4 KiB を数える
+        return WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.writtenMemoryCountsGrow)
+            .also { created += WrittenRelease(it) }
     }
     val budget = config.memoryBudget
     if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))
@@ -347,6 +363,36 @@ internal fun committedPages(memory: WasmMemory): Int {
     val lazy = (inner as? BudgetedMemory)?.inner ?: inner
     return (lazy as? LazyMemory)?.committedPages ?: memory.pages
 }
+
+/**
+ * [memory] のうち、書き換えた（RAM として数えた）4 KiB の数（#370 の PoC。テストと計測用）。
+ * 書き換えた量で数えるメモリでなければ `-1`。
+ */
+internal fun writtenChunks(memory: WasmMemory): Int =
+    ((memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory)?.writtenChunks ?: -1
+
+/**
+ * [memory] の [address] から [length] バイトを、今のうちに書き換えた分として数える（#370 の PoC の `ram_commit`）。
+ * 数えられない 4 KiB があれば `false`。書き換えた量で数えるメモリでなければ、何もせず `true`
+ */
+internal fun commitWritten(memory: WasmMemory, address: Int, length: Int): Boolean {
+    val written = (memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory ?: return true
+    return written.commitRange(address, length)
+}
+
+/** [memory] の [address] から [length] バイトを書いたら、新しく数えるバイト数（#370 の PoC）。書き換えた量で数えるメモリでなければ 0 */
+internal fun pendingWrittenBytes(memory: WasmMemory, address: Int, length: Int): Long {
+    val written = (memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory ?: return 0
+    return written.pendingBytes(address, length)
+}
+
+/** [memory] で RAM として数えたバイト数（#370 の PoC。書き換えた 4 KiB と grow で数えたページ）。なければ `-1` */
+internal fun countedBytes(memory: WasmMemory): Long =
+    ((memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory)?.countedBytes ?: -1L
+
+/** [memory] のうち、データセグメントで書いた（数えない）ROM の 4 KiB の数（#370 の PoC）。なければ `-1` */
+internal fun romChunks(memory: WasmMemory): Int =
+    ((memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory)?.romChunks ?: -1
 
 /** [module] をコンパイルしたコードで動かすなら `true`（#37。テスト用） */
 internal fun isCompiled(module: WasmModule): Boolean = (module as? EndiveWasmModule)?.isCompiled ?: false
@@ -573,7 +619,7 @@ private class EndiveWasmModule(val module: EndiveModule, private val compiled: C
             GlobalInstance(value, high, type, mutability)
         }
         // 数えるメモリ（作るのに失敗したら、確保した分を返す）
-        val memories = ArrayList<BudgetedMemory>(1)
+        val memories = ArrayList<ReleasableMemory>(1)
         wrapper.budgetedMemories = memories
         // 数えるテーブル（#361。同じく、失敗したら返す）
         val tables = ArrayList<BudgetedTable>(1)
@@ -631,7 +677,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     private var closed = false
 
     /** 数えるメモリ（閉じたときに確保した分を返す） */
-    var budgetedMemories: List<BudgetedMemory> = emptyList()
+    var budgetedMemories: List<ReleasableMemory> = emptyList()
 
     /** 数えるテーブル（#361。閉じたときに確保した分を返す） */
     var budgetedTables: List<BudgetedTable> = emptyList()

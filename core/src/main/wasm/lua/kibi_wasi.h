@@ -32,4 +32,18 @@ int isatty(int fd);
  * io.tmpfile は kibi_wasi.c で失敗を返す。
  */
 
+/*
+ * #370 の PoC: 書き換えたメモリを RAM として数えるときの、Lua のアロケーターの包み。
+ * KIBI_RAM_POC を定義したとき（テスト用の lua_rampoc.wasm）だけ使う。本番の lua.wasm は変わらない。
+ * Lua の既定のアロケーター（lauxlib.c の l_alloc）が呼ぶ realloc・free を、残りの RAM を見る包みに差し替える。
+ * 包みが NULL を返すと、Lua は緊急の GC をしてやり直し、それでもだめなら "not enough memory" のエラーにする。
+ */
+#ifdef KIBI_RAM_POC
+#include <stddef.h>
+void *kibi_poc_realloc(void *ptr, size_t size);
+void kibi_poc_free(void *ptr);
+#define realloc(p, n) kibi_poc_realloc(p, n)
+#define free(p) kibi_poc_free(p)
+#endif
+
 #endif

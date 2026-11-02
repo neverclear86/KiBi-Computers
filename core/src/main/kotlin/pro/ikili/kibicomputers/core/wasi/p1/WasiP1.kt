@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.wasi.p1
 
+import pro.ikili.kibicomputers.core.kernel.RamPoc
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -132,11 +133,17 @@ internal object WasiP1 {
      * （インスタンスを作るときのリンクの失敗を、読み込みのときに分かるようにする）。
      * メモリ・テーブル・グローバル・タグの import や、ほかのモジュール名（`env` など）は断る。
      * 独自拡張（`kibi:*` の p1 向けの import）を足すときは、ここで許す。
+     * [allowRamPoc] なら、#370 の PoC 専用の仮の import（[RamPoc]）も許す。
      */
     @Throws(FsException::class)
-    fun checkImports(module: WasmModule) {
+    fun checkImports(module: WasmModule, allowRamPoc: Boolean = false) {
         for (imp in module.imports) {
             val name = "${imp.module}.${imp.name}"
+            val poc = if (allowRamPoc && imp.module == RamPoc.MODULE) RamPoc.IMPORTS[imp.name] else null
+            if (poc != null) {
+                if (imp.functionType != poc) fsError(Errno.NOEXEC, "import の型が違う: $name は $poc（モジュールは ${imp.functionType}）")
+                continue
+            }
             if (imp.module != P1.MODULE) fsError(Errno.NOEXEC, "許可していない import: $name")
             if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
             if (imp.name !in specFunctions) fsError(Errno.NOEXEC, "WASI p1 にない関数の import: $name")

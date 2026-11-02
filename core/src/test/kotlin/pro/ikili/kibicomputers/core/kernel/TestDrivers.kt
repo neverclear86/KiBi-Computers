@@ -62,11 +62,13 @@ internal class Harness(
     asyncify: Boolean = true,
     /** スケジューラの読み込みの上限（#40）。`null` ならカーネルは [ModuleLimits.DEFAULT] の値で上限をかける */
     moduleLimits: ModuleLimits? = if (execRuntime != null) ModuleLimits.DEFAULT else null,
+    /** RAM の数え方（#370 の PoC） */
+    ramAccounting: RamAccounting = RamAccounting.DECLARED_PAGES,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, ramAccounting = ramAccounting),
     )
     private var counter = 0
 

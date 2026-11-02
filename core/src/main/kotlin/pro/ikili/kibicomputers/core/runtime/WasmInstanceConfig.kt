@@ -57,6 +57,15 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
     /** テーブルの確保を数える相手（#361）。`null` なら数えない */
     internal val tableBudget: WasmTableBudget? = builder.tableBudget
 
+    /** 共有しない線形メモリを、書き換えた 4 KiB で数える（#370 の PoC。[Builder.writtenMemoryLimit]） */
+    internal val writtenMemory: Boolean = builder.writtenMemory
+
+    /** 書き換えた 4 KiB を数える相手（#370 の PoC）。`null` なら数えない */
+    internal val writtenMemoryBudget: WasmTableBudget? = builder.writtenMemoryBudget
+
+    /** 書き換えた量で数えるとき、grow で増やしたページはページ数で数える（#370 の PoC） */
+    internal val writtenMemoryCountsGrow: Boolean = builder.writtenMemoryCountsGrow
+
     /**
      * 待機点への変換をかけたモジュールが退避する値の置き場所（#329）。変換したモジュール（[WasmModule.isAsyncified]）では必須で、
      * `null` のままインスタンスを作ると [WasmLinkException]。変換していないモジュールでは使わない
@@ -76,6 +85,9 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal var asyncStack: WasmAsyncStack? = null
         internal var maxTableElements: Int = Int.MAX_VALUE
         internal var tableBudget: WasmTableBudget? = null
+        internal var writtenMemory: Boolean = false
+        internal var writtenMemoryBudget: WasmTableBudget? = null
+        internal var writtenMemoryCountsGrow: Boolean = false
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
@@ -123,6 +135,29 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
             require(maxElements >= 0) { "maxElements は 0 以上: $maxElements" }
             maxTableElements = maxElements
             tableBudget = budget
+        }
+
+        /**
+         * 共有しない線形メモリを、書き換えた 4 KiB の数で RAM として数える（#370 の PoC。既定では使わない）。
+         * [memoryLimit] とは一緒に使えない。
+         *
+         * ページ数（最初の大きさと `memory.grow`）は RAM として数えず、[maxPages] だけを上限にする。
+         * 初めて書き込んだ 4 KiB ごとに [budget] で 4,096 バイトを数え、断られたらトラップにする。
+         * インスタンスを作るときにデータセグメントで書いた分（ROM）は数えない。数えた分は閉じるまで返さない。
+         *
+         * @param maxPages メモリ1つあたりのページ数の上限（アドレス空間の上限。0〜[WasmMemory.MAX_PAGES]）
+         * [countGrownPages] なら、`memory.grow` で増やしたページは、増やしたときにページ数（64 KiB）で数える
+         * （数えられなければ grow が -1。増やした所への書き込みは数え直さない）。
+         *
+         * @param budget 書き換えた分を数える相手。`null` なら数えない
+         */
+        internal fun writtenMemoryLimit(maxPages: Int, budget: WasmTableBudget?, countGrownPages: Boolean = false): Builder = apply {
+            require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
+            require(memoryBudget == null) { "memoryLimit と writtenMemoryLimit は一緒に使えない" }
+            maxMemoryPages = maxPages
+            writtenMemory = true
+            writtenMemoryBudget = budget
+            writtenMemoryCountsGrow = countGrownPages
         }
 
         /** 待機点への変換をかけたモジュールが退避する値の置き場所を決める（#329。[WasmInstanceConfig.asyncStack]）。 */

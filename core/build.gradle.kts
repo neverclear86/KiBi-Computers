@@ -50,6 +50,12 @@ tasks.test {
         systemProperty("kibi.luaReplMachines", it)
         maxHeapSize = "4g"
     }
+    // 書き換えたメモリだけを RAM として数える PoC の計測（#370。`-Pkibi.ramPoc` を付けたときだけ動かす。結果は標準出力）
+    if (providers.gradleProperty("kibi.ramPoc").isPresent) {
+        systemProperty("kibi.ramPoc", "true")
+        testLogging.showStandardStreams = true
+        outputs.upToDateWhen { false }
+    }
 }
 
 // テスト用の WASM（#9）。zig cc でビルドし、テストのリソースに入れる
@@ -120,6 +126,16 @@ kibiWasm {
         sources.from("src/test/wasm/fuel_spin_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 書き換えた 4 KiB で RAM を数える PoC（#370）: 残りの RAM の問い合わせ（kibi_poc.ram_remaining）を確かめるプログラム
+    module("ram-poc", sourceSet = "test") {
+        sources.from("src/test/wasm/ram_poc.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 同じ PoC の速度の比較に使う、メモリを多く書くプログラム
+    module("memwrite", sourceSet = "test") {
+        sources.from("src/test/wasm/memwrite.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる
@@ -131,7 +147,11 @@ val luaSource = kibiWasm.sourceArchive("lua") {
     url = "https://www.lua.org/ftp/lua-$luaVersion.tar.gz"
     sha256 = luaProps.getProperty("sha256")
 }
-val compileLua = kibiWasm.module("lua") {
+/**
+ * Lua 5.4 を WASI p1 向けにビルドする。[name] のモジュールを [sourceSet] のリソースに入れる。
+ * [stack] は C のスタック、[extraArgs] は追加のコンパイラーの引数（#370 の PoC の変種で使う）
+ */
+fun luaModule(name: String, sourceSet: String = "main", stack: Int = 256 * 1024, extraArgs: List<String> = emptyList()) = kibiWasm.module(name, sourceSet = sourceSet) {
     // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない
     sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c") } })
     sources.from("src/main/wasm/lua/kibi_wasi.c")
@@ -158,8 +178,18 @@ val compileLua = kibiWasm.module("lua") {
         "-lwasi-emulated-signal",
         "-lwasi-emulated-process-clocks",
     )
-    // C のスタック（仮の値。#334）。Lua の C 呼び出しの深さ（LUAI_MAXCCALLS = 200）に足りる大きさにする
-    stackSize = 256 * 1024
+    compilerArgs.addAll(extraArgs)
+    stackSize = stack
+}
+
+// C のスタック（仮の値。#334）。Lua の C 呼び出しの深さ（LUAI_MAXCCALLS = 200）に足りる大きさにする
+val compileLua = luaModule("lua")
+
+// #370 の PoC: 残りの RAM を見るアロケーターの包みを入れた Lua（テスト用）
+luaModule("lua-rampoc", sourceSet = "test", extraArgs = listOf("-DKIBI_RAM_POC"))
+// #370 の PoC の計測: C のスタックを減らした Lua（`-Pkibi.ramPoc` のときだけビルドする）
+if (providers.gradleProperty("kibi.ramPoc").isPresent) {
+    for (kib in listOf(32, 64, 128)) luaModule("lua-stack${kib}k", sourceSet = "test", stack = kib * 1024)
 }
 
 // テスト用の同梱イメージ（#55）。src/test/images/sample/ を zip にして、テストのリソース `/kibicomputers/images/sample.zip` に入れる

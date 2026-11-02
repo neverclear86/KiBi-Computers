@@ -341,6 +341,8 @@ internal class SchedulerInternals(
     val moduleLimits: ModuleLimits? = ModuleLimits.DEFAULT,
     /** タイマーの期限を待つ口（テストでは時計を手で進めるもの）。`null` なら [ExecutorTimerService] */
     val timers: TimerService? = null,
+    /** RAM の数え方（#370 の PoC。既定は今の方式） */
+    val ramAccounting: RamAccounting = RamAccounting.DECLARED_PAGES,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */

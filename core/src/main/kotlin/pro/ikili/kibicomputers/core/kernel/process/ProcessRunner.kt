@@ -6,6 +6,8 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
+import pro.ikili.kibicomputers.core.kernel.RamAccounting
+import pro.ikili.kibicomputers.core.kernel.RamPoc
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
@@ -35,6 +37,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.endive.WrittenPagesMemory
+import pro.ikili.kibicomputers.core.runtime.endive.commitWritten
+import pro.ikili.kibicomputers.core.runtime.endive.pendingWrittenBytes
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
@@ -506,8 +511,27 @@ internal class ProcessRunner(private val machine: Machine) {
         check(builder.initialFuel == 0L && builder.fuelHandler == null) { "ABI 層は builder.fuel を呼ばない（燃料はカーネルが設定する）" }
         check(builder.memoryBudget == null && builder.maxMemoryPages == WasmMemory.MAX_PAGES) { "ABI 層は builder.memoryLimit を呼ばない（メモリの上限はカーネルが設定する）" }
         check(builder.asyncStack == null) { "ABI 層は builder.asyncStack を呼ばない（退避先はカーネルが設定する）" }
-        // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
-        builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
+        val accounting = scheduler.options.ramAccounting
+        if (accounting != RamAccounting.DECLARED_PAGES) {
+            // #370 の PoC: 書き換えた 4 KiB で数える。アドレス空間の上限は仮の値。残りを問い合わせる仮の import を足す
+            builder.writtenMemoryLimit(WrittenPagesMemory.POC_MAX_PAGES, rt.memory, countGrownPages = accounting == RamAccounting.WRITTEN_4K_GROWN_PAGES)
+            if (builder.hostImports.none { it.module == RamPoc.MODULE }) {
+                val memory = rt.memory
+                builder.hostFunction(RamPoc.MODULE, RamPoc.REMAINING, RamPoc.REMAINING_TYPE) { _, _ -> longArrayOf(memory.remainingBytes()) }
+                builder.hostFunction(RamPoc.MODULE, RamPoc.COMMIT, RamPoc.COMMIT_TYPE) { instance, args ->
+                    val m = instance.memory
+                    val address = args[0].toInt()
+                    val length = args[1].toInt()
+                    val pending = if (m == null) 0L else pendingWrittenBytes(m, address, length)
+                    // 新しく数える所がなければ（解放した穴の使い回し）、残りによらず通す
+                    val ok = m != null && (pending == 0L || memory.remainingBytes() - pending >= args[2]) && commitWritten(m, address, length)
+                    longArrayOf(if (ok) 1L else 0L)
+                }
+            }
+        } else {
+            // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
+            builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
+        }
         // テーブル（#361）: 要素数の上限は読み込みの上限と同じ値にし、要素の分はメモリと同じくプロセスと RAM に数える
         check(builder.tableBudget == null && builder.maxTableElements == Int.MAX_VALUE) { "ABI 層は builder.tableLimit を呼ばない（テーブルの上限はカーネルが設定する）" }
         val maxTableElements = (scheduler.options.moduleLimits ?: ModuleLimits.DEFAULT).maxTableElements

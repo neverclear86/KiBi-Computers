@@ -25,4 +25,21 @@ internal object KernelDrivers {
             return WasiP1Driver(module)
         }
     }
+
+    /**
+     * #370 の PoC: [DEFAULT] に加えて、残りの RAM を問い合わせる仮の import（[pro.ikili.kibicomputers.core.kernel.RamPoc]）を許す。
+     * カーネルがその import を登録するのは [pro.ikili.kibicomputers.core.kernel.RamAccounting.WRITTEN_4K] のときだけなので、
+     * それ以外で使うとインスタンスを作るときにリンクに失敗する。テストと計測でだけ使う
+     */
+    val RAM_POC: ProcessDriverFactory = object : ProcessDriverFactory {
+        override val waitImports: Set<String> get() = WasiP1.WAIT_IMPORTS
+
+        override fun create(program: Program): ProcessDriver {
+            val module = program.module
+            val isCommand = module.exports.any { it.name == WasiP1Driver.START && it.kind == WasmExternKind.FUNCTION }
+            if (!isCommand) fsError(Errno.NOEXEC, "動かせる形でない（${WasiP1Driver.START} がない）")
+            WasiP1.checkImports(module, allowRamPoc = true)
+            return WasiP1Driver(module)
+        }
+    }
 }
