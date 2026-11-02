@@ -26,59 +26,6 @@ public interface ScreenSyncHost<P : Any> {
 }
 
 /**
- * プレイヤーごとの、画面の同期の送信量の勘定（#359）。サーバーに1つ置き、すべての画面の [ScreenWatchers] が書き込む。
- * プレイヤーごと・サーバー全体の送信量の予算（#352）は、この勘定の上に作る。
- *
- * スレッドセーフではない。サーバーのメインスレッドから使う。
- *
- * @param P プレイヤーの型
- */
-@ApiStatus.Internal
-public class ScreenSyncTraffic<P : Any> {
-    private class Counter {
-        var bytes = 0L
-        var keyframes = 0L
-    }
-
-    private val counters = HashMap<P, Counter>()
-
-    /** すべてのプレイヤーに送ったバイト数の合計。 */
-    public var totalBytes: Long = 0L
-        private set
-
-    /** [player] に [bytes] バイト送ったことを記録する。 */
-    public fun recordBytes(player: P, bytes: Int) {
-        counters.getOrPut(player, ::Counter).bytes += bytes
-        totalBytes += bytes
-    }
-
-    /** [player] に、見はじめ・送り直しの画面全体（キーフレーム）を1つ送ったことを記録する。 */
-    public fun recordKeyframe(player: P) {
-        counters.getOrPut(player, ::Counter).keyframes++
-    }
-
-    /** これまでに [player] に送ったバイト数。 */
-    public fun bytesSent(player: P): Long = counters[player]?.bytes ?: 0L
-
-    /**
-     * これまでに [player] に送った、見はじめ・送り直しの画面全体（キーフレーム）の数。
-     * 描画命令が多すぎて、見ている全員にキーフレームを送った tick の分は含まない。
-     */
-    public fun keyframesSent(player: P): Long = counters[player]?.keyframes ?: 0L
-
-    /** [player] の勘定を消す（ログアウトしたときなど）。 */
-    public fun forget(player: P) {
-        counters.remove(player)
-    }
-
-    /** すべての勘定を消す。 */
-    public fun clear() {
-        counters.clear()
-        totalBytes = 0L
-    }
-}
-
-/**
  * サーバー側の、1つの画面を見ているプレイヤーの集合（#359）。誰に送るかは、サーバーがプレイヤーとの距離から決める。
  *
  * - 目からの距離が [startDistance] 以内に入ったら見はじめ、[stopDistance] より遠ざかったらやめる（ヒステリシス）。
@@ -88,6 +35,9 @@ public class ScreenSyncTraffic<P : Any> {
  * - クライアントからの「送り直してほしい」（[requestResync]）は、お願いとして扱う。
  *   見ている人のものだけ受け付け、画面全体の送り直しは、プレイヤーと画面の組ごとに [resyncIntervalTicks] に1回までにする。
  *   早すぎるお願いは、間隔が空いたときに送る。見はじめるときの画面全体もこの間隔に数える。
+ * - 送信量の予算（[ScreenSyncTraffic]。#352）が足りずに、ある人へのメッセージを送れなかったら、その人は「止められた人」に
+ *   移す。止められた人には描画命令を送らず、予算の残りに画面全体が収まり、前に画面全体を送って（試して）から
+ *   [throttleRetryTicks] が過ぎていれば、画面全体を送ってみる（届いたら、見ている人に戻る）。
  *
  * スレッドセーフではない。サーバーのメインスレッドから使う。
  *
@@ -96,6 +46,7 @@ public class ScreenSyncTraffic<P : Any> {
  * @param stopDistance 見るのをやめる距離（ブロックの数）。[startDistance] 以上
  * @param resyncIntervalTicks 画面全体を送り直す最短の間隔（tick）。仮の値（確定は #251）
  * @param scanIntervalTicks 見はじめる人を探す間隔（tick）
+ * @param throttleRetryTicks 送信量の予算で止められた人に、画面全体を送ってみる最短の間隔（tick）。仮の値（確定は #251）
  */
 @ApiStatus.Internal
 public class ScreenWatchers<P : Any>
@@ -106,12 +57,14 @@ public constructor(
     private val stopDistance: Double = startDistance + DEFAULT_HYSTERESIS,
     private val resyncIntervalTicks: Int = DEFAULT_RESYNC_INTERVAL_TICKS,
     private val scanIntervalTicks: Int = DEFAULT_SCAN_INTERVAL_TICKS,
+    private val throttleRetryTicks: Int = DEFAULT_THROTTLE_RETRY_TICKS,
 ) {
     init {
         require(startDistance >= 0.0) { "startDistance must not be negative: $startDistance" }
         require(stopDistance >= startDistance) { "stopDistance must not be less than startDistance: $stopDistance" }
         require(resyncIntervalTicks >= 0) { "resyncIntervalTicks must not be negative: $resyncIntervalTicks" }
         require(scanIntervalTicks > 0) { "scanIntervalTicks must be positive: $scanIntervalTicks" }
+        require(throttleRetryTicks >= 0) { "throttleRetryTicks must not be negative: $throttleRetryTicks" }
     }
 
     private val startSquared = startDistance * startDistance
@@ -126,17 +79,23 @@ public constructor(
     // 送り直しのお願いが早すぎたので、間隔が空くのを待っている人。watchers の中の人だけ
     private val deferred = LinkedHashSet<P>()
 
+    // 送信量の予算が足りずにメッセージを送れなかったので、画面全体を送れるのを待っている人。watchers・fresh とは重ならない
+    private val throttled = LinkedHashSet<P>()
+
     // 最後に画面全体を送った tick。見るのをやめた人も、間隔が過ぎるまで覚えておく
     private val lastKeyframe = HashMap<P, Long>()
 
     private var scanned = false
 
-    /** 見ているプレイヤーの数（この tick に見はじめて、まだ送っていない人も含む）。 */
+    /** 見ているプレイヤーの数（この tick に見はじめて、まだ送っていない人と、送信量の予算で止められている人も含む）。 */
     public val count: Int
-        get() = watchers.size + fresh.size
+        get() = watchers.size + fresh.size + throttled.size
 
-    /** [player] が見ているか（この tick に見はじめて、まだ送っていない人も含む）。 */
-    public fun isWatching(player: P): Boolean = player in watchers || player in fresh
+    /** [player] が見ているか（この tick に見はじめて、まだ送っていない人と、送信量の予算で止められている人も含む）。 */
+    public fun isWatching(player: P): Boolean = player in watchers || player in fresh || player in throttled
+
+    /** [player] が、送信量の予算が足りずに止められていて、画面全体を送れるのを待っているか（#352）。 */
+    public fun isThrottled(player: P): Boolean = player in throttled
 
     /**
      * [player] からの「画面全体を送り直してほしい」というお願い（受け取ったデータが壊れていたときなど）。
@@ -146,7 +105,8 @@ public constructor(
      * @return お願いを受け付けたか（この tick の終わりか、後で送る）。見ていない人なら false
      */
     public fun requestResync(player: P, now: Long): Boolean {
-        if (player in fresh) return true
+        // 止められている人には、どのみち画面全体を送る
+        if (player in fresh || player in throttled) return true
         if (player !in watchers) return false
         if (canSendKeyframe(player, now)) {
             watchers.remove(player)
@@ -168,6 +128,7 @@ public constructor(
         watchers.remove(player)
         fresh.remove(player)
         deferred.remove(player)
+        throttled.remove(player)
         lastKeyframe.remove(player)
     }
 
@@ -176,25 +137,28 @@ public constructor(
         watchers.clear()
         fresh.clear()
         deferred.clear()
+        throttled.clear()
         lastKeyframe.clear()
     }
 
     /**
      * tick の終わりに1回呼ぶ。見ている人を決め直し、[sender] の、その tick の分を送る。
+     * [traffic] を渡したときは、すぐには送らず [traffic] に積む。すべての画面の後で [ScreenSyncTraffic.endTick] を呼ぶと送る。
      *
      * @param now いまの tick。単調に増える時計（ディメンションのゲーム時間など）
      * @param sender この画面の同期の送り手
      * @param host プレイヤーの位置を調べ、フラグメントを送る口
-     * @param traffic 送信量の勘定。null なら記録しない
+     * @param traffic 送信量の勘定と予算。null なら予算をかけずにすぐ送り、記録もしない
      */
     public fun tick(now: Long, sender: ScreenSyncSender, host: ScreenSyncHost<P>, traffic: ScreenSyncTraffic<P>?) {
         val scan = !scanned || Math.floorMod(now, scanIntervalTicks.toLong()) == 0L
-        if (!scan && watchers.isEmpty() && fresh.isEmpty() && !sender.isRecording) return
+        if (!scan && watchers.isEmpty() && fresh.isEmpty() && throttled.isEmpty() && !sender.isRecording) return
         scanned = true
 
         // 遠ざかった人・見られなくなった人を外す
         dropFarAway(watchers, host)
         dropFarAway(fresh, host)
+        dropFarAway(throttled, host)
         if (deferred.isNotEmpty()) deferred.retainAll(watchers)
 
         if (scan) {
@@ -220,19 +184,44 @@ public constructor(
             }
         }
 
+        // 送信量の予算で止められた人のうち、予算の残りに画面全体が収まり、間隔が空いた人に、画面全体を送ってみる
+        if (throttled.isNotEmpty()) {
+            val keyframeBytes = sender.keyframeBytes
+            val it = throttled.iterator()
+            while (it.hasNext()) {
+                val p = it.next()
+                val last = lastKeyframe[p]
+                if ((last == null || now - last >= throttleRetryTicks) && (traffic == null || traffic.hasBudget(p, keyframeBytes))) {
+                    it.remove()
+                    fresh.add(p)
+                }
+            }
+        }
+
         val flush = sender.flush(watchers.isNotEmpty(), fresh.isNotEmpty())
-        if (!flush.isEmpty) {
-            for (fragment in flush.forWatchers) for (p in watchers) send(host, traffic, p, fragment)
-            for (fragment in flush.forNewWatchers) for (p in fresh) send(host, traffic, p, fragment)
+        if (flush.forWatchers.isNotEmpty()) {
+            for (p in watchers) deliver(host, traffic, p, flush.forWatchers, keyframe = false)
         }
         if (flush.forNewWatchers.isNotEmpty()) {
+            // 送れなかったときも、画面全体を試した tick として数える（止められた人が毎 tick 試さないように）
             for (p in fresh) {
                 lastKeyframe[p] = now
-                traffic?.recordKeyframe(p)
+                deliver(host, traffic, p, flush.forNewWatchers, keyframe = true)
             }
         }
         watchers.addAll(fresh)
         fresh.clear()
+    }
+
+    /**
+     * [ScreenSyncTraffic.endTick] が、送信量の予算が足りずに、この画面から [player] へのメッセージを送らなかった。
+     * [player] は前に送った画面の続きを持っていないので、止められた人に移し、次は画面全体を送る。
+     */
+    internal fun onThrottled(player: P) {
+        if (watchers.remove(player)) {
+            deferred.remove(player)
+            throttled.add(player)
+        }
     }
 
     private fun canSendKeyframe(player: P, now: Long): Boolean {
@@ -244,9 +233,18 @@ public constructor(
         if (set.isNotEmpty()) set.removeIf { host.distanceSquared(it) > stopSquared }
     }
 
-    private fun send(host: ScreenSyncHost<P>, traffic: ScreenSyncTraffic<P>?, player: P, fragment: ByteArray) {
-        host.send(player, fragment)
-        traffic?.recordBytes(player, fragment.size)
+    private fun deliver(
+        host: ScreenSyncHost<P>,
+        traffic: ScreenSyncTraffic<P>?,
+        player: P,
+        fragments: List<ByteArray>,
+        keyframe: Boolean,
+    ) {
+        if (traffic == null) {
+            for (f in fragments) host.send(player, f)
+        } else {
+            traffic.enqueue(this, host, player, fragments, keyframe, host.distanceSquared(player))
+        }
     }
 
     public companion object {
@@ -264,5 +262,8 @@ public constructor(
 
         /** 見はじめる人を探す間隔の既定値（tick）。 */
         public const val DEFAULT_SCAN_INTERVAL_TICKS: Int = 10
+
+        /** 送信量の予算で止められた人に、画面全体を送ってみる最短の間隔の既定値（tick。0.5秒）。仮の値（確定は #251）。 */
+        public const val DEFAULT_THROTTLE_RETRY_TICKS: Int = 10
     }
 }

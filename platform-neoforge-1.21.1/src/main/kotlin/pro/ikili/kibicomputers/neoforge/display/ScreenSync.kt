@@ -28,7 +28,9 @@ import java.util.IdentityHashMap
  * 流れ:
  * 1. サーバーは、tick の終わり（[ServerTickEvent.Post]）に、画面ごとに、プレイヤーとの距離から見ている人を決め直す
  *    （[ScreenWatchers]。見はじめる距離とやめる距離に差を持たせる）
- * 2. 見ている人がいる画面だけ、その tick の分を送る。新しく見に来た人には画面全体（キーフレーム）を送る
+ * 2. 見ている人がいる画面だけ、その tick の分を [traffic] に積む。新しく見に来た人には画面全体（キーフレーム）を積む。
+ *    全部の画面の後で [ScreenSyncTraffic.endTick] が、プレイヤーごと・サーバー全体の送信量の予算の中で、
+ *    近い画面・変化の少ない画面から送る（#352）。送れなかった画面は、次にキーフレームを送る
  * 3. クライアントは受け取った分を画面バッファに再生する。壊れたデータを受け取ったら、[ScreenResyncPayload] で
  *    送り直しをお願いする。サーバーは、送り直しをプレイヤーと画面の組ごとに一定の間隔に1回までにする
  *
@@ -44,7 +46,7 @@ object ScreenSync {
     /** サーバーで読み込まれている画面。 */
     internal val serverScreens: MutableSet<ScreenBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
 
-    /** プレイヤーごとの、画面の同期の送信量の勘定（#359）。プレイヤーごとの予算（#352）はこの上に作る。 */
+    /** 画面の同期の、プレイヤーごとの送信量の勘定と、プレイヤーごと・サーバー全体の予算（#359、#352）。 */
     val traffic: ScreenSyncTraffic<ServerPlayer> = ScreenSyncTraffic()
 
     /** プレイヤーへの送り方。GameTest では、偽物のプレイヤーに送れないので差し替える。 */
@@ -76,9 +78,10 @@ object ScreenSync {
     }
 
     private fun onServerTick(event: ServerTickEvent.Post) {
-        if (serverScreens.isEmpty()) return
         // 送る間に画面が消えることはないが、念のため写してから回す
-        for (screen in serverScreens.toTypedArray()) screen.syncTick()
+        if (serverScreens.isNotEmpty()) for (screen in serverScreens.toTypedArray()) screen.syncTick()
+        // 積んだ分を予算の中で送り、予算を増やす（画面がなくても予算は戻す）
+        traffic.endTick()
     }
 
     private fun onLogout(event: PlayerEvent.PlayerLoggedOutEvent) {

@@ -20,6 +20,8 @@ import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.display.PixelBuffer
 import pro.ikili.kibicomputers.core.display.ScreenSyncReceiver
+import pro.ikili.kibicomputers.core.display.ScreenSyncSender
+import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenSyncTarget
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
@@ -44,9 +46,17 @@ object ScreenSyncGameTests {
     /** 偽物のプレイヤーには本物のパケットを送れないので、送ったものを受け取る「クライアント」に渡す。 */
     private val clients: MutableMap<ServerPlayer, FakeClient> = Collections.synchronizedMap(IdentityHashMap())
 
+    /** 1人で複数の画面を受け取るテストの「クライアント」。[clients] より先に見る。 */
+    private val multiClients: MutableMap<ServerPlayer, List<FakeClient>> = Collections.synchronizedMap(IdentityHashMap())
+
     private val CAPTURE = ScreenSync.Transport { player, payload ->
+        val many = multiClients[player]
         val client = clients[player]
-        if (client != null) client.receive(payload) else ScreenSync.NETWORK.send(player, payload)
+        when {
+            many != null -> for (c in many) c.receive(payload)
+            client != null -> client.receive(payload)
+            else -> ScreenSync.NETWORK.send(player, payload)
+        }
     }
 
     /**
@@ -223,6 +233,85 @@ object ScreenSyncGameTests {
                 helper.assertTrue(client.keyframes == 1, "moving around should not resend the whole screen")
                 cleanUp(helper, player)
                 helper.level.chunkSource.setViewDistance(viewDistance)
+            }
+            .thenSucceed()
+    }
+
+    /**
+     * 1人が、全画面を毎 tick 描き直す画面を2つ見ると、そのプレイヤーへの送信量はプレイヤーごとの予算に収まり、
+     * 近い画面の方が多く届く。描くのをやめると、止められた画面にも画面全体が届いて追いつく（#352）。
+     *
+     * 描き続ける画面が、ほかのテストの偽物のプレイヤーの予算を使わないように、別のバッチで（ほかのテストと並べずに）動かす。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600, batch = "screen_sync_budget")
+    fun perPlayerBudgetLimitsBusyScreens(helper: GameTestHelper) {
+        val nearPos = BlockPos(0, 1, 1)
+        val farPos = BlockPos(2, 1, 1)
+        helper.setBlock(nearPos, KiBiBlocks.SCREENS.getValue(ScreenTier.PIXEL).get())
+        helper.setBlock(farPos, KiBiBlocks.SCREENS.getValue(ScreenTier.PIXEL).get())
+        val near = helper.getBlockEntity<ScreenBlockEntity>(nearPos)
+        val far = helper.getBlockEntity<ScreenBlockEntity>(farPos)
+        ScreenSync.transport = CAPTURE
+        val player = helper.makeMockServerPlayerInLevel()
+        val nearClient = FakeClient(ScreenTier.PIXEL, helper.absolutePos(nearPos))
+        val farClient = FakeClient(ScreenTier.PIXEL, helper.absolutePos(farPos))
+        multiClients[player] = listOf(nearClient, farClient)
+        // 近い画面の西に 2 ブロック（遠い画面までは 4 ブロック）
+        val c = helper.absoluteVec(nearPos.center)
+        player.teleportTo(c.x - 2.0, c.y - player.eyeHeight, c.z)
+        helper.level.chunkSource.move(player)
+        deliverChunks(player, helper.absolutePos(nearPos))
+        deliverChunks(player, helper.absolutePos(farPos))
+
+        val traffic = ScreenSync.traffic
+        val w = ScreenTier.PIXEL.maxPixelWidth
+        val h = ScreenTier.PIXEL.maxPixelHeight
+        val image = IntArray(w * h)
+        var frame = 0
+        var bytesBefore = 0L
+        var nearBefore = 0
+        var farBefore = 0
+        val ticks = 100
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(near.isWatchedBy(player) && far.isWatchedBy(player), "the player should watch both screens")
+                helper.assertTrue(nearClient.keyframes > 0 && farClient.keyframes > 0, "both screens should be sent")
+            }
+            .thenExecute {
+                bytesBefore = traffic.bytesSent(player)
+                nearBefore = nearClient.fragments
+                farBefore = farClient.fragments
+            }
+            .thenExecuteFor(ticks) {
+                // 毎 tick 全画面の画像を描く（描画命令が画面全体の半分を超えるので、毎回キーフレームになる）
+                frame++
+                for (i in image.indices) image[i] = (i * 31 + frame * 977) and 0xFFFFFF
+                near.pixels!!.setPixels(0, 0, w, h, image, 0, w)
+                far.pixels!!.setPixels(0, 0, w, h, image, 0, w)
+            }
+            .thenExecute {
+                val sent = traffic.bytesSent(player) - bytesBefore
+                val perSecond = ScreenSyncTraffic.DEFAULT_PLAYER_BYTES_PER_SECOND.toLong()
+                // 測った tick 分の予算 + 初めの残り（1秒分）+ 余裕（1 tick のずれ）
+                val limit = perSecond * (ticks + 2) / ScreenSyncSender.TICKS_PER_SECOND + perSecond
+                helper.assertTrue(sent <= limit, "sent $sent bytes in $ticks ticks, over the per-player budget ($limit)")
+                helper.assertTrue(traffic.throttled(player) > 0, "some messages should be throttled")
+                val n = nearClient.fragments - nearBefore
+                val f = farClient.fragments - farBefore
+                helper.assertTrue(n > f, "the near screen should be sent more often: near $n, far $f")
+            }
+            .thenWaitUntil {
+                helper.assertTrue(
+                    !near.isThrottled(player) && !far.isThrottled(player),
+                    "throttled screens should get a keyframe once drawing stops",
+                )
+                helper.assertTrue(nearClient.matches(near), "the near client should catch up")
+                helper.assertTrue(farClient.matches(far), "the far client should catch up")
+            }
+            .thenExecute {
+                multiClients.remove(player)
+                helper.level.server.playerList.remove(player)
             }
             .thenSucceed()
     }
