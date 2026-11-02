@@ -62,11 +62,28 @@ internal interface ProcessContext {
     fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions = SpawnOptions()): Int
 
     /**
-     * このプロセスを親にして、VFS の実行ファイル [path]（相対パスは作業ディレクトリから）からプロセスを作る（`Machine.exec`）。
-     * WASM の読み込みに時間がかかる（その間 CPU を持ったまま）。カーネルロックを持たずに呼ぶ。戻り値は子の pid
+     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: このプロセスを親にして、VFS の実行ファイル [path]
+     * （相対パスは作業ディレクトリから）からプロセスを作る（`Machine.exec`）。WASM の読み込み（コンパイル）を待つ間は、CPU と許可を返して止まる。
+     * 待機点型は [beginExec]・[finishExec] で、スレッドを持たずに待つ（#358）。カーネルロックを持たずに呼ぶ。戻り値は子の pid
      */
-    @Throws(FsException::class)
+    @Throws(FsException::class, ProcessKilledException::class)
     fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): Int
+
+    /**
+     * [exec] の前半（#358）: 実行ファイルを読み、読み込み（コンパイル）を始めて、待たずに返す。待機点型は戻り値の `key` を
+     * `StepResult.Wait` に入れて待ち（スレッドを持たない）、そろったら [finishExec] で子を作る。やめるなら [closeHostWait] に `wait` を渡す
+     * （ほかに待つ側がなく、始まっていなければ読み込まない）。ファイルの失敗（`NOENT`・`ACCES`・`FBIG`・`LOOP` など）はここで投げ、
+     * 読み込みの失敗（`NOEXEC`・`AGAIN`）は [finishExec] で投げる。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun beginExec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): ExecWait
+
+    /**
+     * [beginExec] の後半: 読み込みが終わった [wait] から子を作り、その pid を返す（待ちのオブジェクトも閉じる）。
+     * 終わっていなければ [IllegalStateException]。失敗は [exec] と同じ。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun finishExec(wait: ExecWait): Int
 
     /** このプロセスの子の pid（ゾンビを含む。割り当ての順） */
     fun children(): List<Int>
@@ -245,9 +262,35 @@ internal interface ProcessContext {
     @Throws(ProcessKilledException::class)
     fun block(keys: List<WaitKey>): List<WaitKey>
 
-    /** 接続層での処理の結果を待つ（CPU と許可を返し、手持ちの燃料を書き戻す）。future の例外は CPU を取り直してから投げる */
+    /**
+     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: 接続層での処理の結果を待つ（CPU と許可を返し、手持ちの燃料を書き戻す）。
+     * future の例外は CPU を取り直してから投げる。待機点型は [watchHost] で、スレッドを持たずに待つ（#358）
+     */
     @Throws(ProcessKilledException::class)
     fun <T> awaitHost(future: CompletableFuture<T>): T
+
+    /**
+     * 接続層での処理 [future] の終わりを待つための、終わると `READABLE` になるオブジェクトを作る（#358。待たずに返す）。
+     * 待機点型は戻り値の `key` を `StepResult.Wait` に入れて待ち（スレッドを持たない）、そろったら [takeHostResult] で結果を受け取る。
+     * ブロッキング型は [block] で待ってもよい。止められていれば [ProcessKilledException]
+     */
+    @Throws(ProcessKilledException::class)
+    fun <T> watchHost(future: CompletableFuture<T>): HostWait<T>
+
+    /**
+     * 終わった [wait] の結果を受け取り、待ちのオブジェクトを閉じる（#358）。処理の例外はそのまま投げる
+     * （出した呼び出しが止められて取り消されたなら [ProcessKilledException]）。
+     * 終わっていなければ [IllegalStateException]、このプロセスの開いている待ちでなければ [IllegalArgumentException]
+     */
+    @Throws(ProcessKilledException::class)
+    fun <T> takeHostResult(wait: HostWait<T>): T
+
+    /**
+     * [wait] を、結果を受け取らずに閉じる（#358。待つのをやめる）。まだ実行していないホスト呼び出しは実行しない
+     * （実行し始めたものは最後まで実行し、結果は捨てる）。読み込みは、ほかに待つ側がなく始まっていなければ読み込まない。
+     * もう閉じていれば何もしない
+     */
+    fun closeHostWait(wait: HostWait<*>)
 
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)
@@ -264,7 +307,8 @@ internal interface ProcessContext {
     val environment: MachineEnvironment
 
     /**
-     * [call] を次の `tick()` の中でメインスレッドから実行し、その結果を待つ（[awaitHost] と同じく、待つ間は CPU と許可を返す）。
+     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [call] を次の `tick()` の中でメインスレッドから実行し、その結果を待つ
+     * （[awaitHost] と同じく、待つ間は CPU と許可を返す）。待機点型は [submitHostCall] で、スレッドを持たずに待つ（#358）。
      * ワールド・デバイスに触る処理はこれで行う。[call] の例外は、CPU を取り直してから投げる。
      * マシンを止めたとき・このプロセスを止めたとき（[kill]、Ctrl+C）は [ProcessKilledException]（実行していない呼び出しは実行しない）。
      * 取り消すのはまだ列にあるものだけで、メインスレッドがもう実行し始めた呼び出しは最後まで実行する
@@ -272,6 +316,16 @@ internal interface ProcessContext {
      */
     @Throws(ProcessKilledException::class)
     fun <T> callOnMainThread(call: HostCall<T>): T
+
+    /**
+     * [call] を次の `tick()` の中でメインスレッドから実行するよう出し、待たずに返す（#358。[callOnMainThread] のスレッドを持たない形）。
+     * 待機点型は戻り値の `key` を `StepResult.Wait` に入れて待ち、そろったら [takeHostResult] で結果を受け取る。
+     * 取り消しは [callOnMainThread] と同じ（止められたら、まだ列にあるものは実行しない。[closeHostWait] でも取り消す）。
+     * 止められていれば [ProcessKilledException]。
+     * 1つずつ待たずに続けて出してもよい（出した順に実行する）
+     */
+    @Throws(ProcessKilledException::class)
+    fun <T> submitHostCall(call: HostCall<T>): HostWait<T>
 
     /** コンソール（画面）へ出力する（[MachineHost.onConsoleOutput]）。上限を超えて捨てた分があれば `false` */
     fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean

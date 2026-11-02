@@ -64,6 +64,12 @@ internal class ProcessRuntime(
     /** 今の待ち */
     var waitSet: WaitSet? = null
 
+    /**
+     * 終わりを待っているホスト側の処理（#358。[HostCompletion] のオブジェクトID → 処理）。閉じていないものは、プロセスの終わりで閉じる。
+     * カーネルロックの中で読み書きする
+     */
+    val hostWaits: HashMap<Int, PendingHostWait> = HashMap()
+
     /** step の途中に起こされた（スレッドが外れたら CPU の待ち行列に入れる） */
     var pendingSchedule: Boolean = false
 
