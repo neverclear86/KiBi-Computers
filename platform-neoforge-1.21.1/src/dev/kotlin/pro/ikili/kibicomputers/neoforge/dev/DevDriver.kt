@@ -308,7 +308,18 @@ object DevDriver {
         }).get(30, TimeUnit.SECONDS)
     }
 
+    // 表示デバイスはプロセスのスレッドも書くので、ロックを持って描く（#355）
     private fun drawOnScreen(be: ScreenBlockEntity, body: JsonObject): DevResponse {
+        val lock = be.display.lock
+        lock.lock()
+        try {
+            return drawOnScreenLocked(be, body)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private fun drawOnScreenLocked(be: ScreenBlockEntity, body: JsonObject): DevResponse {
         val fg = body.get("fg")?.asInt ?: 0xFFFFFF
         val bg = body.get("bg")?.asInt ?: 0x000000
         if (body.get("clear")?.asBoolean != false) be.text.clear()
