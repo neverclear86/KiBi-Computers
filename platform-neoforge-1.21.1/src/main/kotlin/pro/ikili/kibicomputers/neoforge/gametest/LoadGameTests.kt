@@ -12,6 +12,7 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
@@ -57,6 +58,12 @@ object LoadGameTests {
      */
     private const val CI_MAX_IDLE_KERNEL_THREADS = 8
 
+    /**
+     * CI で、起動の間のカーネルのスレッドの最大の上限（#350）。台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
+     * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分
+     */
+    private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
+
     /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
     private const val CI_TIMEOUT_TICKS = 30_000
     private const val MEASURE_TIMEOUT_TICKS = 200_000
@@ -89,6 +96,7 @@ object LoadGameTests {
         val settings = LoadSettings(count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100)
         LoadRun(helper, settings) { report ->
             LOGGER.info("Load test (CI)\n{}", report.toMarkdown())
+            val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
             val compute = report.phase(LoadPhase.COMPUTE)
             val output = report.phase(LoadPhase.WATCHED)
@@ -104,6 +112,11 @@ object LoadGameTests {
                 idle.kernelThreads - idle.idleWorkerThreads <= CI_MAX_IDLE_KERNEL_THREADS,
                 "idle machines should not hold kernel threads: ${idle.kernelThreads - idle.idleWorkerThreads} busy threads " +
                     "for $CI_COUNT machines (${idle.kernelThreadNames})",
+            )
+            helper.assertTrue(
+                boot.peakKernelThreads <= ciMaxBootKernelThreads(),
+                "booting $CI_COUNT machines at once should not create a thread per machine: ${boot.peakKernelThreads} kernel threads " +
+                    "(limit ${ciMaxBootKernelThreads()})",
             )
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
         }.start()

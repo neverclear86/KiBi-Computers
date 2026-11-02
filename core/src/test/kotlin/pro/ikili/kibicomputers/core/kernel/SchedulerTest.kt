@@ -334,7 +334,7 @@ class SchedulerTest {
     }
 
     @Test
-    fun `起こされたのに空なら待ち直す（許可も燃料も使わない）`() = timeout(limit) {
+    fun `起こされたのに空なら待ち直す（燃料を使わず、許可はすぐ返す）`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1000)
             val s = stream(m)
@@ -361,7 +361,7 @@ class SchedulerTest {
             h.scheduler.tick()
             eventuallyDescribe(describe = { listOf(p, q, r).map { m.stateOf(it) to m.rt(it).lastError }.toString() }) { listOf(p, q, r).all { m.stateOf(it) == ProcessState.WAITING_EVENT } }
             eventually { h.scheduler.workers.activeSteps.get() == 0 }
-            val permits = h.scheduler.permitAcquisitions.get()
+            val permits = h.scheduler.permits.availablePermits()
             val fuel = m.lock.withLockValue { m.kernel.fuel }
             val submitted = h.scheduler.workers.submitted.get()
             // 書いてすぐ読み切る（起こされるが、動き出したときには空）
@@ -379,7 +379,8 @@ class SchedulerTest {
                 assertEquals(listOf(key), m.kernel.processes[p]!!.wait)
                 assertEquals(fuel, m.kernel.fuel)
             }
-            assertEquals(permits, h.scheduler.permitAcquisitions.get(), "許可を取らない")
+            // 許可は step を渡す前に取る（#350。許可を待つ間スレッドを持たないため）。空なら使わずに返す
+            assertEquals(permits, h.scheduler.permits.availablePermits(), "許可を返す")
             assertTrue(synchronized(resumes) { resumes.isEmpty() })
             // 次に書いたら、空でない並びで戻る
             m.lock.withLockValue { s.write(byteArrayOf(1, 2, 3), 0, 3, m.registry) }

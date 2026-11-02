@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
+import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import pro.ikili.kibicomputers.core.kernel.time.ExecutorTimerService
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
@@ -15,7 +16,8 @@ import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Semaphore
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -26,7 +28,7 @@ import java.util.concurrent.locks.ReentrantLock
 /**
  * コンピューター（[Machine]）を動かすスケジューラ。サーバーに1つ。接続層がサーバーの起動で作り、停止で [close] する（#43）。
  *
- * - 同時に WASM を実行するマシンの数は、公平なセマフォで [SchedulerConfig.maxConcurrentMachines] までに抑える
+ * - 同時に WASM を実行するマシンの数は、公平な許可（[PermitPool]）で [SchedulerConfig.maxConcurrentMachines] までに抑える
  * - [tick] はメインスレッドから毎 tick 呼ぶ。tick の番号を進め、通知のあるマシンだけ [MachineHost] に配る。台数によらない
  * - 保存の前に [pauseAll] で全マシンを止める
  *
@@ -51,7 +53,6 @@ public class MachineScheduler private constructor(
         internal fun create(config: SchedulerConfig, options: SchedulerInternals): MachineScheduler = MachineScheduler(config, options)
     }
 
-    internal val permits = Semaphore(config.maxConcurrentMachines, true)
     private val tickCounter = AtomicLong()
     private val machines = ConcurrentHashMap<Long, Machine>()
     private val nextMachineId = AtomicLong(1)
@@ -63,6 +64,25 @@ public class MachineScheduler private constructor(
     internal val dedicatedThreads: MutableSet<Thread> = Collections.newSetFromMap(ConcurrentHashMap())
 
     internal val workers = WorkerPool(config.threadStackBytes, options.workerIdleMillis, options.executor)
+
+    /**
+     * 同時に WASM を実行するマシンの数の許可（公平な FIFO。#350）。待機点型の step は、許可を受け取ってからワーカーに渡すので、
+     * 許可を待つ間はスレッドを持たない
+     */
+    internal val permits = PermitPool(config.maxConcurrentMachines, workers)
+
+    /**
+     * 起動の手順（`BootSequence`）を動かすスレッド `KiBi-boot-*`（#350。[SchedulerConfig.maxConcurrentMachines] 本まで、残りは待ち行列）。
+     * 起動の手順はコンパイルや前の起動のスレッドを待って止まるので、ワーカーとは分ける。
+     * 1,000 台を一度に起動しても、スレッドは台数分できない（メインスレッドが作るのも、この本数まで）
+     */
+    internal val bootExecutor: ThreadPoolExecutor = run {
+        val counter = AtomicInteger()
+        val n = config.maxConcurrentMachines
+        ThreadPoolExecutor(n, n, options.workerIdleMillis, TimeUnit.MILLISECONDS, LinkedBlockingQueue()) { r ->
+            KernelThread("KiBi-boot-${counter.incrementAndGet()}", config.threadStackBytes, r)
+        }.apply { allowCoreThreadTimeOut(true) }
+    }
     internal val dispatcher = Dispatcher<Machine>(config.threadStackBytes) { machine -> machine.dispatchFuelWaiters() }
 
     internal val hooks = KernelTestHooks()
@@ -224,6 +244,7 @@ public class MachineScheduler private constructor(
         dispatcher.close()
         timerService.close()
         workers.shutdown()
+        bootExecutor.shutdown()
         // 読み込みを待つ起動・プロセスを戻すため、捨てる読み込みの future も失敗させる（#344）
         programs.close()
         compilerExecutor.shutdownNow()
@@ -251,6 +272,7 @@ public class MachineScheduler private constructor(
         dispatcher.thread.join(remainingMillis().coerceAtLeast(1))
         if (dispatcher.thread.isAlive) return false
         if (!timerService.awaitTermination(remainingMillis())) return false
+        if (!bootExecutor.awaitTermination(remainingMillis(), TimeUnit.MILLISECONDS)) return false
         return workers.awaitTermination(remainingMillis())
     }
 
