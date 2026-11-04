@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -9,6 +10,7 @@ import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
@@ -26,8 +28,10 @@ class WrittenPagesMemoryTest {
     private class Budget(val limitBytes: Long) : WasmTableBudget {
         var used = 0L
 
-        override fun tryReserveBytes(bytes: Long): Boolean {
-            if (used + bytes > limitBytes) return false
+        override fun tryReserveBytes(bytes: Long): Boolean = tryReserveBytes(bytes, 0)
+
+        override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
+            if (keepBytes < 0 || keepBytes > limitBytes || used + bytes > limitBytes - keepBytes) return false
             used += bytes
             return true
         }
@@ -89,6 +93,80 @@ class WrittenPagesMemoryTest {
         // 数えたページへの書き込みはできる
         m.writeLong(chunk + 8, 5)
         assertEquals(5L, m.readLong(chunk + 8))
+    }
+
+    @Test
+    fun `commitRangeはゼロとROMの区画を1回だけ数え、ROMの中身を残す`() {
+        val module = EndiveRuntime().load(TestModules.MEMORY)
+        val budget = Budget(Long.MAX_VALUE)
+        val config = WasmInstanceConfig.builder()
+            .hostFunction("env", "print", module.imports.single().functionType!!) { _, _ -> LongArray(0) }
+            .writtenMemoryLimit(4, budget)
+            .build()
+        module.instantiate(config).use { instance ->
+            val memory = instance.memory!!
+            assertEquals(1, romChunks(memory))
+            // ROM の区画（0 番）とゼロの区画（1 番）
+            assertTrue(memory.commit(0, 2 * chunk, 0))
+            assertEquals(2, writtenChunks(memory))
+            assertEquals(2L * chunk, budget.used)
+            assertEquals("hello", String(memory.read(16, 5)))
+            // 数えた区画は数え直さず、書いても数えない
+            assertTrue(memory.commit(0, 2 * chunk, Long.MAX_VALUE))
+            memory.writeU8(16, 'j'.code)
+            memory.writeU8(chunk + 1, 1)
+            assertEquals(2, writtenChunks(memory))
+            assertEquals("jello", String(memory.read(16, 5)))
+            // 4 KiB の境目をまたぐ範囲は、かかる区画をすべて数える
+            assertTrue(memory.commit(3 * chunk - 1, 2, 0))
+            assertEquals(4, writtenChunks(memory))
+            // len = 0 は、大きさちょうどまでなら範囲内
+            assertTrue(memory.commit(page, 0, 0))
+            assertThrows<WasmMemoryAccessException> { memory.commit(page + 1, 0, 0) }
+            assertThrows<WasmMemoryAccessException> { memory.commit(page - 4, 8, 0) }
+            // 符号なしで計算する（負のアドレスは 2^31 以上）
+            assertThrows<WasmMemoryAccessException> { memory.commit(-chunk, 2 * chunk, 0) }
+            assertEquals(4, writtenChunks(memory))
+        }
+        assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `commitRangeは残りがkeep未満になるなら何も数えず、区画は後の書き込みで普通に数える`() {
+        val budget = Budget(4L * chunk)
+        val m = WrittenPagesMemory(MemoryLimits(1, 1), budget)
+        m.writeByte(0, 1)
+        // 残りは 3 区画。2 区画を数えると残り 1 区画
+        assertFalse(m.commitRange(chunk, 2 * chunk, 2L * chunk))
+        assertEquals(1, m.writtenChunks)
+        assertEquals(chunk.toLong(), budget.used)
+        // 2^63 以上の keep（負の値）は、どの上限より大きい
+        assertFalse(m.commitRange(chunk, 1, -1L))
+        // 新しく数える区画がなければ keep を見ない
+        assertTrue(m.commitRange(0, chunk, -1L))
+        // 断った区画は読み取り専用のまま。書けば普通に数える
+        m.writeByte(chunk, 1)
+        assertEquals(2, m.writtenChunks)
+        assertTrue(m.commitRange(2 * chunk, 2 * chunk, 0))
+        assertEquals(4, m.writtenChunks)
+        // 上限ちょうどまで数えた区画への書き込みはトラップしない
+        m.fill(7, 0, 4 * chunk)
+        assertEquals(4L * chunk, budget.used)
+        assertFalse(m.commitRange(4 * chunk, 1, 0))
+        assertThrows<RamExhausted> { m.writeByte(4 * chunk, 1) }
+    }
+
+    @Test
+    fun `閉じた後のcommitRangeは数えずに確保だけする`() {
+        val budget = Budget(Long.MAX_VALUE)
+        val m = WrittenPagesMemory(MemoryLimits(1, 1), budget)
+        m.releaseAll()
+        assertTrue(m.commitRange(0, page, -1L))
+        assertEquals(0, m.writtenChunks)
+        assertEquals(0L, budget.used)
+        val unbudgeted = WrittenPagesMemory(MemoryLimits(1, 1), null)
+        assertTrue(unbudgeted.commitRange(0, chunk, -1L))
+        assertEquals(1, unbudgeted.writtenChunks)
     }
 
     @Test

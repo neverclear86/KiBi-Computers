@@ -789,6 +789,14 @@ private class EndiveWasmMemory(private val memory: EndiveMemory) : WasmMemory {
         }
     }
 
+    override fun commit(address: Int, length: Int, keepBytes: Long): Boolean {
+        val end = address.toUInt().toLong() + length.toUInt().toLong()
+        if (end > byteSize) throw WasmMemoryAccessException("メモリの範囲外: ${address.toUInt()}〜$end（大きさ $byteSize）")
+        // 書き込んだ区画で数えるメモリ（#407）だけが、まだ数えていない所を持つ
+        val written = memory as? WrittenPagesMemory ?: return true
+        return written.commitRange(address, length, keepBytes)
+    }
+
     override fun readU8(address: Int): Int = memory.read(check(address, 1)).toInt() and 0xff
 
     override fun writeU8(address: Int, value: Int) = hostWrite { memory.writeByte(check(address, 1), value.toByte()) }

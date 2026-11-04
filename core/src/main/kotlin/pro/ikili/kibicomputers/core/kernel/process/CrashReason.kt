@@ -33,10 +33,21 @@ internal fun crashReason(t: Throwable): String = when (t) {
 internal fun outOfMemoryReason(limitBytes: Long): String = "out of memory (RAM limit ${formatBytes(limitBytes)})"
 
 /**
- * `memory.grow` を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文（#407）。
- * 例: `memory.grow was refused: out of memory, RAM limit 128 KiB`
+ * `memory.grow`（#407）や `kibi:memory` の `commit`（#408）を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文。
+ * どちらも断っていなければ `null`。例:
+ * - grow だけ: `memory.grow was refused: out of memory, RAM limit 128 KiB`
+ * - commit だけ: `kibi:memory commit was refused: out of memory, RAM limit 128 KiB`
+ * - 両方: `memory.grow and kibi:memory commit were refused: out of memory, RAM limit 128 KiB`
  */
-internal fun growRefusedNote(limitBytes: Long): String = "memory.grow was refused: out of memory, RAM limit ${formatBytes(limitBytes)}"
+internal fun memoryRefusedNote(growRefused: Boolean, commitRefused: Boolean, limitBytes: Long): String? {
+    val what = when {
+        growRefused && commitRefused -> "memory.grow and kibi:memory commit were refused"
+        growRefused -> "memory.grow was refused"
+        commitRefused -> "kibi:memory commit was refused"
+        else -> return null
+    }
+    return "$what: out of memory, RAM limit ${formatBytes(limitBytes)}"
+}
 
 /** バイト数を、1 MiB の倍数なら MiB、1 KiB の倍数なら KiB、そうでなければバイトで書く */
 internal fun formatBytes(bytes: Long): String = when {

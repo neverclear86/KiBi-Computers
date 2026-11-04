@@ -1,0 +1,17 @@
+package kibi:memory;
+
+/// 残りの RAM を扱う（#408。#370 で決定）。
+/// RAM は、初めて書き込んだ 4 KiB の区画の数で数える（#407）。
+///
+/// Component Model の層（Epic #259）ができるまでは、定義だけを置く（読み込む所はまだない）。
+/// p1 向けには、同じ機能をモジュール `kibi` の import（`memory_remaining`・`memory_commit`）として出している。
+/// パッケージの分け方と world は #73 で見直してよい。
+interface memory {
+    /// 残りの RAM（バイト）。プロセスの上限とマシンの RAM のうち、小さい方の残り。
+    remaining: func() -> u64;
+
+    /// [ptr, ptr+len) の区画を今のうちに数える。
+    /// 数えた後の残りが keep 未満になるなら、何も数えずに false。
+    /// 新しく数える区画がなければ true。範囲が線形メモリの外なら false。
+    commit: func(ptr: u32, len: u32, keep: u64) -> bool;
+}

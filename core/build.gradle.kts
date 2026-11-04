@@ -125,6 +125,12 @@ kibiWasm {
         sources.from("src/test/wasm/oom_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:memory（#408）の p1 の import を確かめる CLI
+    module("kibi-memory-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_memory_wasi.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる
