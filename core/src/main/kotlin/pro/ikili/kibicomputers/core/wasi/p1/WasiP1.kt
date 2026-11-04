@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
  * WASI p1（`wasi_snapshot_preview1`）の層（ADR 0261 の A）。カーネルの土台の上に、p1 のホスト関数を並べる。
  *
  * 今あるのは `fd_*`（#70）、`path_*`（#71。[WasiP1Path]）、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）と、
- * `poll_oneoff`（#72。[WasiP1Poll]）。`sock_*` はまだない。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
+ * `poll_oneoff`（#72。[WasiP1Poll]）と、独自拡張のモジュール `kibi`（#408。[WasiP1Kibi]）。`sock_*` はまだない。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
  * まだない関数をモジュールが import していれば、`NOSYS` を返す仮の関数をつなぐ（リンクが通るように）。
  */
 internal object WasiP1 {
@@ -130,13 +130,20 @@ internal object WasiP1 {
      *
      * 許すのは `wasi_snapshot_preview1` の、仕様にある名前の関数だけ。実装している関数は型も一致しなければならない
      * （インスタンスを作るときのリンクの失敗を、読み込みのときに分かるようにする）。
+     * 独自拡張（`kibi:*` の p1 向けの import。[WasiP1Kibi]。#408）は、モジュール名 `kibi` の、出している名前の関数だけを、型が一致するときに許す
+     * （`kibi` のほかの名前、カーネルの予約名の `fuel`・`async_*` などは断る）。
      * メモリ・テーブル・グローバル・タグの import や、ほかのモジュール名（`env` など）は断る。
-     * 独自拡張（`kibi:*` の p1 向けの import）を足すときは、ここで許す。
      */
     @Throws(FsException::class)
     fun checkImports(module: WasmModule) {
         for (imp in module.imports) {
             val name = "${imp.module}.${imp.name}"
+            if (imp.module == WasiP1Kibi.MODULE) {
+                if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
+                val expected = WasiP1Kibi.typeOf(imp.name) ?: fsError(Errno.NOEXEC, "許可していない import: $name")
+                if (imp.functionType != expected) fsError(Errno.NOEXEC, "import の型が違う: $name は $expected（モジュールは ${imp.functionType}）")
+                continue
+            }
             if (imp.module != P1.MODULE) fsError(Errno.NOEXEC, "許可していない import: $name")
             if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
             if (imp.name !in specFunctions) fsError(Errno.NOEXEC, "WASI p1 にない関数の import: $name")
@@ -192,6 +199,8 @@ internal object WasiP1 {
                 },
             )
         }
+        // 独自拡張（kibi:* の p1 向けの import。#408）
+        WasiP1Kibi.register(ctx, builder)
         // proc_exit: 戻らない。WasiP1Exit でゲストの呼び出しを抜ける（ドライバーが終了コードにする）
         builder.hostFunction(
             P1.MODULE,

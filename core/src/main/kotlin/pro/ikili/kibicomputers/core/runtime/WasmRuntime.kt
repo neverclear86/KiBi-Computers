@@ -167,6 +167,22 @@ public interface WasmMemory {
     @Throws(WasmMemoryAccessException::class)
     public fun writeI64(address: Int, value: Long)
 
+    /**
+     * [address] から [length] バイト（どちらも符号なし 32 ビット）の範囲を、今のうちに RAM として数える（`kibi:memory` の `commit`。#408）。
+     *
+     * 数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上として扱う）未満になるなら、何も数えずに `false`。
+     * 新しく数える所がなければ（[keepBytes] を見ずに）`true`。範囲が線形メモリの外なら [WasmMemoryAccessException]
+     * （[length] が 0 なら、[address] が大きさ以下で範囲内）。
+     *
+     * 既定は範囲を確かめて `true`（書き込んだ区画で数えないメモリには、まだ数えていない所がない）
+     */
+    @Throws(WasmMemoryAccessException::class)
+    public fun commit(address: Int, length: Int, keepBytes: Long): Boolean {
+        val end = address.toUInt().toLong() + length.toUInt().toLong()
+        if (end > byteSize) throw WasmMemoryAccessException("メモリの範囲外: ${address.toUInt()}〜$end（大きさ $byteSize）")
+        return true
+    }
+
     public companion object {
         /** 1 ページの大きさ（64 KiB） */
         public const val PAGE_SIZE: Int = 65536
@@ -210,6 +226,12 @@ public interface WasmMemoryBudget {
 internal interface WasmTableBudget {
     /** [bytes] バイト（1 以上）を確保してよければ、数えて `true`。だめなら何も数えずに `false` */
     fun tryReserveBytes(bytes: Long): Boolean
+
+    /**
+     * [tryReserveBytes] と同じだが、数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上）未満になるなら、
+     * 何も数えずに `false`（`kibi:memory` の `commit`。#408）。読みと数えるのは不可分に行う（同時に動くほかの確保と食い違わない）
+     */
+    fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean
 
     /** [tryReserveBytes] で確保した分のうち [bytes] バイト（1 以上）を返す */
     fun releaseBytes(bytes: Long)

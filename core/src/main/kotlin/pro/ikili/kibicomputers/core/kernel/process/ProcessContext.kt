@@ -17,6 +17,8 @@ import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import java.util.concurrent.CompletableFuture
@@ -291,6 +293,19 @@ internal interface ProcessContext {
      * もう閉じていれば何もしない
      */
     fun closeHostWait(wait: HostWait<*>)
+
+    // ---- RAM（#408。WASM に見せる形は `kibi:memory`） ----
+
+    /** 残りの RAM（バイト）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方。どのスレッドから呼んでもよい */
+    fun memoryRemaining(): Long
+
+    /**
+     * [memory] の [address] から [length] バイト（符号なし 32 ビット）を、今のうちに RAM として数える（[WasmMemory.commit]）。
+     * 数えた後の残りが [keepBytes]（符号なし 64 ビット）未満になるなら、何も数えずに `false`（RAM の上限で断ったとして覚え、
+     * この後に異常終了したら、メモリ不足が原因だったと表示する）。範囲外なら [WasmMemoryAccessException]（断ったとは覚えない）
+     */
+    @Throws(WasmMemoryAccessException::class)
+    fun commitMemory(memory: WasmMemory, address: Int, length: Int, keepBytes: Long): Boolean
 
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)

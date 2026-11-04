@@ -56,9 +56,15 @@ internal class MemoryAccount(
     }
 
     /** [bytes] バイト（0 以上）を、自分と親の両方に収まれば数えて `true`（テーブル、メモリ上のファイルシステムの中身など） */
-    fun tryReserveBytes(bytes: Long): Boolean {
+    fun tryReserveBytes(bytes: Long): Boolean = tryReserveBytes(bytes, 0)
+
+    /**
+     * [tryReserveBytes] と同じだが、自分の勘定では、数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上）
+     * 以上になるときだけ数える（`kibi:memory` の `commit`。#408）。親（サーバー全体）の勘定には [keepBytes] をかけない
+     */
+    fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes >= 0) { "バイト数は 0 以上: $bytes" }
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return false
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return false
         if (parent != null && !parent.tryReserveBytes(bytes)) {
             usedBytesCounter.addAndGet(-bytes)
             return false
@@ -117,10 +123,13 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
         machine.release(pages)
     }
 
-    override fun tryReserveBytes(bytes: Long): Boolean {
+    override fun tryReserveBytes(bytes: Long): Boolean = tryReserveBytes(bytes, 0)
+
+    /** プロセスとマシンのそれぞれで、数えた後の残りが [keepBytes] 以上になるときだけ数える（#408。サーバー全体には [keepBytes] をかけない） */
+    override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes > 0) { "バイト数は正: $bytes" }
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return false
-        if (!machine.tryReserveBytes(bytes)) {
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return false
+        if (!machine.tryReserveBytes(bytes, keepBytes)) {
             usedBytesCounter.addAndGet(-bytes)
             return false
         }
@@ -133,6 +142,12 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
         machine.releaseBytes(bytes)
     }
 
+    /**
+     * 残りの RAM（バイト。`kibi:memory` の `remaining`。#408）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方（0 未満にしない）。
+     * サーバー全体の勘定（#362）は入れない
+     */
+    val remainingBytes: Long get() = maxOf(0L, minOf(limitBytes - usedBytes, machine.limitBytes - machine.usedBytes))
+
     /** 数えられる上限（バイト）。プロセスの上限とマシンの RAM のうち小さい方（コンソールに出すメモリ不足の理由に使う。#407） */
     val effectiveLimitBytes: Long get() = minOf(limitBytes, machine.limitBytes)
 
@@ -142,11 +157,16 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     }
 }
 
-/** [counter] に [delta] を足して [limit] 以下に収まれば足して `true`。収まらなければ何もせず `false` */
-private fun tryAdd(counter: AtomicLong, delta: Long, limit: Long): Boolean {
+/**
+ * [counter] に [delta] を足して、[limit] まで [keep] 以上残れば足して `true`。残らなければ何もせず `false`。
+ * [keep] は符号なし 64 ビット（負の値は 2^63 以上なので、どの上限より大きい）
+ */
+private fun tryAdd(counter: AtomicLong, delta: Long, limit: Long, keep: Long = 0): Boolean {
+    if (keep < 0 || keep > limit) return false
+    val cap = limit - keep
     while (true) {
         val current = counter.get()
-        if (delta > limit - current) return false
+        if (delta > cap - current) return false
         if (counter.compareAndSet(current, current + delta)) return true
     }
 }

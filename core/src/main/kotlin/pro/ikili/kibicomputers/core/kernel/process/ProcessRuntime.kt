@@ -108,6 +108,13 @@ internal class ProcessRuntime(
     @Volatile
     var memoryGrowRefused: Boolean = false
 
+    /**
+     * `kibi:memory` の `commit` を RAM の上限で断った（#408。範囲外で断ったときは立てない）。[memoryGrowRefused] と同じく、
+     * この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。プロセスのスレッドが、ロックを持たずに書く
+     */
+    @Volatile
+    var memoryCommitRefused: Boolean = false
+
     /** このプロセスの燃料切れの処理（カーネルが作る） */
     lateinit var fuelHandler: WasmFuelHandler
 

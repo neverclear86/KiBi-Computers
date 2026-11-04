@@ -193,6 +193,44 @@ internal class WrittenPagesMemory(
         return fresh
     }
 
+    /**
+     * [address] から [length] バイト（どちらも符号なし 32 ビット）にかかる区画のうち、まだ数えていないもの（ゼロ・ROM の区画）を、
+     * 今のうちに書き換えた区画として数えて確保する（`kibi:memory` の `commit`。#408）。ROM の区画は中身を写す。
+     *
+     * 数える区画がなければ `true`（[keepBytes] を見ない）。数えた後の残りが [keepBytes]（符号なし 64 ビット）未満になるなら、
+     * 何も数えず・確保せずに `false`（区画は読み取り専用のまま。後で書けば普通に数える）。
+     * 範囲が外なら範囲外の例外（[length] が 0 なら、[address] が大きさ以下で範囲内）。
+     * 閉じた後と、[budget] がないときは、数えずに確保だけして `true`。
+     * 初めて書いたときの数え方（`commit(index)`）と同じロックで行う
+     */
+    @Synchronized
+    fun commitRange(address: Int, length: Int, keepBytes: Long): Boolean {
+        val start = address.toUInt().toLong()
+        val len = length.toUInt().toLong()
+        val size = EndiveMemory.PAGE_SIZE.toLong() * nPages
+        if (start + len > size) {
+            throw WasmRuntimeException("out of bounds memory access: attempted to access address: ${address.toUInt()} but limit is: $size and size: ${length.toUInt()}")
+        }
+        if (len == 0L) return true
+        val first = (start ushr CHUNK_SHIFT).toInt()
+        val last = ((start + len - 1) ushr CHUNK_SHIFT).toInt()
+        val table = chunks
+        var fresh = 0
+        for (i in first..last) if (table[i]!!.isReadOnly) fresh++
+        if (fresh == 0) return true
+        val counted = !released
+        if (counted && budget != null && !budget.tryReserveBytes(fresh.toLong() * CHUNK_SIZE, keepBytes)) return false
+        for (i in first..last) {
+            val chunk = table[i]!!
+            if (!chunk.isReadOnly) continue
+            val copy = newChunk()
+            if (chunk !== ZERO_CHUNK) chunk.get(0, copy.array(), 0, CHUNK_SIZE)
+            table[i] = copy
+        }
+        if (counted) writtenChunks += fresh
+        return true
+    }
+
     /** 数えた分をすべて返す。以後は数えない（閉じたインスタンスのメモリ）。2回呼んでもよい */
     @Synchronized
     fun releaseAll() {

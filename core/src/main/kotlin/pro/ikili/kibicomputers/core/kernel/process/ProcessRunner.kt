@@ -594,13 +594,18 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /**
      * `CRASHED` の理由（#41）。RAM の上限を超えた書き込みのトラップは上限を添え、`memory.grow` を RAM の上限で断った後の
-     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）
+     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）。`kibi:memory` の `commit` を断った後も同じ（#408）
      */
     private fun processCrashReason(rt: ProcessRuntime, t: Throwable): String {
         if (t is WasmTrapException && t.kind == WasmTrapKind.OUT_OF_MEMORY) return outOfMemoryReason(rt.memory.effectiveLimitBytes)
         val reason = crashReason(t)
-        return if (rt.memoryGrowRefused) "$reason (${growRefusedNote(rt.memory.effectiveLimitBytes)})" else reason
+        val note = refusedMemoryNote(rt)
+        return if (note != null) "$reason ($note)" else reason
     }
+
+    /** `memory.grow`・`kibi:memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null` */
+    private fun refusedMemoryNote(rt: ProcessRuntime): String? =
+        memoryRefusedNote(rt.memoryGrowRefused, rt.memoryCommitRefused, rt.memory.effectiveLimitBytes)
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
     fun finishLocked(rt: ProcessRuntime, state: ProcessState, exitCode: Int?) {
@@ -644,8 +649,8 @@ internal class ProcessRunner(private val machine: Machine) {
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）
         machine.lifecycle.onFinishedLocked(rt)
         // init なら、マシンを止める（#49）
-        // 0 以外の終了コードで終わったプロセスが、その前に memory.grow を RAM の上限で断られていたら、そう添える（#407）
-        val exitNote = if (state == ProcessState.EXITED && exitCode != 0 && rt.memoryGrowRefused) growRefusedNote(rt.memory.effectiveLimitBytes) else null
+        // 0 以外の終了コードで終わったプロセスが、その前に memory.grow・kibi:memory の commit を RAM の上限で断られていたら、そう添える（#407・#408）
+        val exitNote = if (state == ProcessState.EXITED && exitCode != 0) refusedMemoryNote(rt) else null
         machine.onProcessFinishedLocked(process, rt.crashReason, exitNote)
         machine.checkAllDoneLocked()
     }
@@ -1112,6 +1117,15 @@ internal class ProcessRunner(private val machine: Machine) {
             val unwound = rt.fuelUnwound
             rt.fuelUnwound = false
             return unwound
+        }
+
+        override fun memoryRemaining(): Long = rt.memory.remainingBytes
+
+        override fun commitMemory(memory: WasmMemory, address: Int, length: Int, keepBytes: Long): Boolean {
+            val committed = memory.commit(address, length, keepBytes)
+            // 範囲外は例外で抜けるので、false は RAM が理由で断ったとき
+            if (!committed) rt.memoryCommitRefused = true
+            return committed
         }
 
         override fun chargeFuel(amount: Long) {

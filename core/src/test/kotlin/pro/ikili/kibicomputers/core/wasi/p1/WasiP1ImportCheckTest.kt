@@ -74,6 +74,21 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibiのmemoryの関数は、型が一致するときだけ通る`() {
+        val remaining = Triple(WasiP1Kibi.MODULE, "memory_remaining", emptyList<Int>() to listOf(0x7e))
+        val commit = Triple(WasiP1Kibi.MODULE, "memory_commit", listOf(I32, I32, 0x7e) to listOf(I32))
+        assertDoesNotThrow { WasiP1.checkImports(load(command(fdWrite, remaining, commit))) }
+        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_remaining", emptyList<Int>() to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_commit", listOf(I32, I32, I32) to listOf(I32)))), "型が違う")
+    }
+
+    @Test
+    fun `kibiの知らない名前は断る`() {
+        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_free", listOf(I32) to listOf(I32)))), "kibi.memory_free")
+        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "async_yield", emptyList<Int>() to emptyList()))), "kibi.async_yield")
+    }
+
+    @Test
     fun `関数でないimportは断る`() {
         // (import "wasi_snapshot_preview1" "memory" (memory 1)) と `_start`
         val name = P1.MODULE.toByteArray()
