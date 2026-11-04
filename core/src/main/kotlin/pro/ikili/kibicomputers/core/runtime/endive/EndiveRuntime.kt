@@ -64,6 +64,7 @@ import run.endive.wasm.WasmModule as EndiveModule
  * [WasmInstanceConfig.memoryBudget] があれば `grow` を数える包み（[BudgetedMemory]）をかぶせて守る。
  * 共有しないメモリは、書き込んだページだけ JVM のメモリを確保する（[LazyMemory]、#334）。
  * 上限と RAM は宣言したページ数（最初のページ数と `grow` の合計）で数え、確保したページ数では数えない。
+ * [WasmInstanceConfig.writtenMemory] なら、共有しないメモリは初めて書き込んだ 4 KiB の区画の数で数える（[WrittenPagesMemory]、#407）。
  *
  * テーブル（#361）も同じように、作るときに要素数の上限を縮め（[WasmInstanceConfig.maxTableElements]）、
  * [WasmInstanceConfig.tableBudget] があれば、要素数 × 要素1つのバイト数を数える（[BudgetedTable]）。
@@ -192,7 +193,7 @@ private class BudgetedMemory(
     val inner: EndiveMemory,
     private val budget: WasmMemoryBudget,
     private var reserved: Int,
-) : EndiveMemory by inner {
+) : EndiveMemory by inner, ReleasableMemory {
     @Synchronized
     override fun grow(size: Int): Int {
         // 0 は今の大きさを返すだけ。負（符号なしで 2^31 以上）は Endive が -1 を返す
@@ -216,10 +217,21 @@ private class BudgetedMemory(
 
     /** 確保した分をすべて返す。以後 `grow` は数えない（閉じたインスタンスのメモリ）。2回呼んでもよい */
     @Synchronized
-    fun releaseAll() {
+    override fun releaseAll() {
         if (reserved > 0) budget.release(reserved)
         reserved = -1
     }
+}
+
+/** インスタンスを閉じたとき（作るのに失敗したときも）に、数えた分を返すメモリ */
+private interface ReleasableMemory {
+    /** 数えた分をすべて返す。2回呼んでもよい */
+    fun releaseAll()
+}
+
+/** 書き込んだ区画で数えるメモリ（#407）を、閉じたときに返す相手として包む */
+private class WrittenRelease(val memory: WrittenPagesMemory) : ReleasableMemory {
+    override fun releaseAll() = memory.releaseAll()
 }
 
 /**
@@ -312,11 +324,17 @@ private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig
  *
  * 最初のページ数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<BudgetedMemory>): EndiveMemory {
+private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
     val initial = limits.initialPages()
     val max = minOf(limits.maximumPages(), config.maxMemoryPages)
     if (initial > max) {
         throw MemoryLimitFailure("メモリの最初のページ数 $initial が上限 $max を超える")
+    }
+    if (config.writtenMemory) {
+        // #407: ページ数は数えず、初めて書き込んだ 4 KiB の区画を数える。共有メモリは書き込みを数えられないので作らない
+        if (limits.shared()) throw MemoryLimitFailure("共有メモリは使えない")
+        return WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
+            .also { created += WrittenRelease(it) }
     }
     val budget = config.memoryBudget
     if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))
@@ -347,6 +365,14 @@ internal fun committedPages(memory: WasmMemory): Int {
     val lazy = (inner as? BudgetedMemory)?.inner ?: inner
     return (lazy as? LazyMemory)?.committedPages ?: memory.pages
 }
+
+/** [memory] のうち、書き換えた（RAM として数えた）4 KiB の区画の数（#407。テスト用）。区画で数えるメモリでなければ `-1` */
+internal fun writtenChunks(memory: WasmMemory): Int =
+    ((memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory)?.writtenChunks ?: -1
+
+/** [memory] のうち、データセグメントで書いた（数えない）ROM の区画の数（#407。テスト用）。区画で数えるメモリでなければ `-1` */
+internal fun romChunks(memory: WasmMemory): Int =
+    ((memory as? EndiveWasmMemory)?.raw as? WrittenPagesMemory)?.romChunks ?: -1
 
 /** [module] をコンパイルしたコードで動かすなら `true`（#37。テスト用） */
 internal fun isCompiled(module: WasmModule): Boolean = (module as? EndiveWasmModule)?.isCompiled ?: false
@@ -415,6 +441,8 @@ private fun rethrow(e: Throwable): Nothing {
     hostThrowable(e)?.let { throw it }
     throw when (e) {
         is WasmException -> e
+        // 書き込んだ区画を RAM に数えられなかった（#407）
+        is RamExhausted -> outOfMemory(e)
         is StackOverflowError -> WasmTrapException(WasmTrapKind.STACK_OVERFLOW, "呼び出しが深すぎる", e)
         // Thread.interrupt で止められた（#43。カーネルの stop が使う）
         is WasmInterruptedException -> WasmTrapException(WasmTrapKind.INTERRUPTED, "実行しているスレッドが割り込まれた", e)
@@ -423,6 +451,9 @@ private fun rethrow(e: Throwable): Nothing {
         else -> e
     }
 }
+
+/** RAM の上限を超えた書き込み（[RamExhausted]）のトラップ（#407） */
+private fun outOfMemory(e: RamExhausted): WasmTrapException = WasmTrapException(WasmTrapKind.OUT_OF_MEMORY, e.message ?: "out of memory", e)
 
 /** Endive のトラップのメッセージから種類を決める。詳しい扱いは #41。 */
 internal fun trapKind(message: String): WasmTrapKind {
@@ -573,7 +604,7 @@ private class EndiveWasmModule(val module: EndiveModule, private val compiled: C
             GlobalInstance(value, high, type, mutability)
         }
         // 数えるメモリ（作るのに失敗したら、確保した分を返す）
-        val memories = ArrayList<BudgetedMemory>(1)
+        val memories = ArrayList<ReleasableMemory>(1)
         wrapper.budgetedMemories = memories
         // 数えるテーブル（#361。同じく、失敗したら返す）
         val tables = ArrayList<BudgetedTable>(1)
@@ -631,7 +662,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     private var closed = false
 
     /** 数えるメモリ（閉じたときに確保した分を返す） */
-    var budgetedMemories: List<BudgetedMemory> = emptyList()
+    var budgetedMemories: List<ReleasableMemory> = emptyList()
 
     /** 数えるテーブル（#361。閉じたときに確保した分を返す） */
     var budgetedTables: List<BudgetedTable> = emptyList()
@@ -743,18 +774,30 @@ private class EndiveWasmMemory(private val memory: EndiveMemory) : WasmMemory {
 
     override fun write(address: Int, src: ByteArray, srcOffset: Int, length: Int) {
         require(srcOffset >= 0 && srcOffset + length <= src.size) { "src の範囲外" }
-        memory.write(check(address, length), src, srcOffset, length)
+        hostWrite { memory.write(check(address, length), src, srcOffset, length) }
+    }
+
+    /**
+     * ホストの書き込み。書き込んだ区画を RAM に数えられなければ（#407）、WASM の中の書き込みと同じく
+     * [WasmTrapKind.OUT_OF_MEMORY] のトラップにする（ホストの関数から投げると、そのままプロセスを止める）
+     */
+    private inline fun hostWrite(block: () -> Unit) {
+        try {
+            block()
+        } catch (e: RamExhausted) {
+            throw outOfMemory(e)
+        }
     }
 
     override fun readU8(address: Int): Int = memory.read(check(address, 1)).toInt() and 0xff
 
-    override fun writeU8(address: Int, value: Int) = memory.writeByte(check(address, 1), value.toByte())
+    override fun writeU8(address: Int, value: Int) = hostWrite { memory.writeByte(check(address, 1), value.toByte()) }
 
     override fun readI32(address: Int): Int = memory.readInt(check(address, 4))
 
-    override fun writeI32(address: Int, value: Int) = memory.writeI32(check(address, 4), value)
+    override fun writeI32(address: Int, value: Int) = hostWrite { memory.writeI32(check(address, 4), value) }
 
     override fun readI64(address: Int): Long = memory.readLong(check(address, 8))
 
-    override fun writeI64(address: Int, value: Long) = memory.writeLong(check(address, 8), value)
+    override fun writeI64(address: Int, value: Long) = hostWrite { memory.writeLong(check(address, 8), value) }
 }

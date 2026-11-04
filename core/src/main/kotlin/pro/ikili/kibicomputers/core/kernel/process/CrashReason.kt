@@ -26,6 +26,28 @@ internal fun crashReason(t: Throwable): String = when (t) {
     else -> "internal error (${t.javaClass.simpleName.ifEmpty { t.javaClass.name }})"
 }
 
+/**
+ * RAM の上限を超えた書き込みでトラップしたときの理由（#407）。例: `out of memory (RAM limit 128 KiB)`。
+ * [limitBytes] はプロセスが数えられる上限（プロセスの上限とマシンの RAM のうち小さい方）
+ */
+internal fun outOfMemoryReason(limitBytes: Long): String = "out of memory (RAM limit ${formatBytes(limitBytes)})"
+
+/**
+ * `memory.grow` を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文（#407）。
+ * 例: `memory.grow was refused: out of memory, RAM limit 128 KiB`
+ */
+internal fun growRefusedNote(limitBytes: Long): String = "memory.grow was refused: out of memory, RAM limit ${formatBytes(limitBytes)}"
+
+/** バイト数を、1 MiB の倍数なら MiB、1 KiB の倍数なら KiB、そうでなければバイトで書く */
+internal fun formatBytes(bytes: Long): String = when {
+    bytes >= MIB && bytes % MIB == 0L -> "${bytes / MIB} MiB"
+    bytes % KIB == 0L -> "${bytes / KIB} KiB"
+    else -> "$bytes bytes"
+}
+
+private const val KIB = 1024L
+private const val MIB = 1024L * 1024
+
 /** トラップの種類ごとの文（WebAssembly の仕様のテストの文に寄せる） */
 internal fun trapReason(kind: WasmTrapKind): String = when (kind) {
     WasmTrapKind.UNREACHABLE -> "unreachable executed"
@@ -38,6 +60,7 @@ internal fun trapReason(kind: WasmTrapKind): String = when (kind) {
     WasmTrapKind.INDIRECT_CALL -> "indirect call failed"
     WasmTrapKind.NULL_REFERENCE -> "null reference"
     WasmTrapKind.FUEL_EXHAUSTED -> "out of fuel"
+    WasmTrapKind.OUT_OF_MEMORY -> "out of memory"
     WasmTrapKind.UNCAUGHT_EXCEPTION -> "uncaught exception"
     WasmTrapKind.INTERRUPTED -> "interrupted"
     WasmTrapKind.OTHER -> "trap"

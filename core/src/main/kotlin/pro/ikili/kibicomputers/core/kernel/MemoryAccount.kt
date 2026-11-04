@@ -7,9 +7,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * RAM の使用量（#39・#53・#362）。実行時だけのもので、保存しない。
+ * RAM の使用量（#39・#53・#362・#407）。実行時だけのもので、保存しない。
  *
- * 数えるのは、プロセスの線形メモリ（ページ単位）と、テーブル（#361）や `/tmp` などメモリ上のファイルシステムの中身（バイト単位。[tryReserveBytes]）。
+ * 数えるのは、プロセスの線形メモリ（カーネルのプロセスは初めて書き込んだ 4 KiB の区画。バイト単位。#407）と、テーブル（#361）や `/tmp` などメモリ上のファイルシステムの中身（バイト単位。[tryReserveBytes]）。
  * 合計はバイトで数え、上限は [limitBytes]。
  *
  * マシンごとの勘定（上限は RAM のページ数 × 64 KiB）は、親としてサーバー全体の勘定（[MachineScheduler] に1つ。#362）を持つ。
@@ -86,7 +86,7 @@ internal class MemoryAccount(
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {
     /** プロセスの上限（バイト） */
-    private val limitBytes: Long = limitPages.toLong() * WasmMemory.PAGE_SIZE
+    val limitBytes: Long = limitPages.toLong() * WasmMemory.PAGE_SIZE
 
     private val usedBytesCounter = AtomicLong()
     private val used = AtomicInteger()
@@ -132,6 +132,9 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
         subtract(bytes)
         machine.releaseBytes(bytes)
     }
+
+    /** 数えられる上限（バイト）。プロセスの上限とマシンの RAM のうち小さい方（コンソールに出すメモリ不足の理由に使う。#407） */
+    val effectiveLimitBytes: Long get() = minOf(limitBytes, machine.limitBytes)
 
     private fun subtract(bytes: Long) {
         val after = usedBytesCounter.addAndGet(-bytes)

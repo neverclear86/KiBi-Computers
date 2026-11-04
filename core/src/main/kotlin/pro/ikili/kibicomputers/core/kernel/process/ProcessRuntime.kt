@@ -101,6 +101,13 @@ internal class ProcessRuntime(
     /** 例外で `CRASHED` になったときの理由（コンソールに出す短い英語。#41）。カーネルロックの中で書く */
     var crashReason: String? = null
 
+    /**
+     * `memory.grow` を RAM の上限で断った（#407）。この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。
+     * プロセスのスレッドが、ロックを持たずに書く
+     */
+    @Volatile
+    var memoryGrowRefused: Boolean = false
+
     /** このプロセスの燃料切れの処理（カーネルが作る） */
     lateinit var fuelHandler: WasmFuelHandler
 

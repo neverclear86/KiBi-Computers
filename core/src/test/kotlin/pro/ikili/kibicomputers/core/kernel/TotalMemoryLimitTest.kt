@@ -2,7 +2,6 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -18,11 +17,13 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.FakeModule
-import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** サーバー全体の RAM の上限（#362）: 各マシンの勘定は、スケジューラの全体の勘定を親に持つ */
@@ -63,8 +64,13 @@ class TotalMemoryLimitTest {
         assertEquals(0L, total.usedBytes)
     }
 
+    /** [first] 番目から [count] 個の 4 KiB の区画に、1 バイトずつ書く（#407: 書いた区画だけを RAM に数える） */
+    private fun WasmMemory.touch(first: Int, count: Int) {
+        for (i in first until first + count) writeU8(i * 4096, 1)
+    }
+
     @Test
-    fun `全体の上限で、別のマシンのmemory_growが断られる`() = timeout(limit) {
+    fun `全体の上限で、別のマシンの書き込みとmemory_growが断られる`() = timeout(limit) {
         harness(totalPages = 6).use { h ->
             assertEquals(6 * page, h.scheduler.memoryAccount.limitBytes)
             val a = h.machine(memoryBytes = 16 * page)
@@ -72,9 +78,9 @@ class TotalMemoryLimitTest {
             val holding = CountDownLatch(1)
             val never = a.lock.withLockValue { a.kernel.objects.add(ByteStream(1)) }
             val first = a.spawnTest(
-                h.program(memoryModule(1)),
+                h.program(memoryModule(4)),
                 TestDriver(ProcessKind.BLOCKING) { ctx ->
-                    ctx.instance.memory!!.grow(3)
+                    ctx.instance.memory!!.touch(0, 64)
                     holding.countDown()
                     // メモリを持ったまま待ち続ける
                     ctx.block(listOf(WaitKey(never, WaitCondition.READABLE)))
@@ -84,45 +90,48 @@ class TotalMemoryLimitTest {
             h.tickUntil("最初のプロセスがメモリを取らない") { holding.count == 0L }
             assertEquals(4 * page, h.scheduler.memoryAccount.usedBytes)
 
-            // B の RAM（16 ページ）には余裕があっても、全体の残りは 2 ページ
-            val results = mutableListOf<Int>()
+            // B の RAM（16 ページ）には余裕があっても、全体の残りは 2 ページ（32 区画）。宣言したページ数は数えないので作れる
+            val written = AtomicInteger()
+            val growResult = AtomicInteger(0)
             val grower = b.spawnTest(
-                h.program(memoryModule(1)),
+                h.program(memoryModule(8)),
                 TestDriver(ProcessKind.BLOCKING) { ctx ->
                     val memory = ctx.instance.memory!!
-                    synchronized(results) {
-                        results += memory.grow(2)
-                        results += memory.grow(1)
+                    try {
+                        for (i in 0 until 64) {
+                            memory.touch(i, 1)
+                            written.incrementAndGet()
+                        }
+                    } catch (e: WasmTrapException) {
+                        assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind)
                     }
+                    // 全体の残りがないので、増やした所の端も数えられない
+                    growResult.set(memory.grow(1))
                     StepResult.Exit(0)
                 },
             )
             h.tickUntil("grow のプロセスが終わらない") { b.stateOf(grower).isTerminal }
             assertEquals(ProcessState.EXITED, b.stateOf(grower))
-            assertEquals(listOf(-1, 1), synchronized(results) { results.toList() })
-            assertEquals(0, b.memoryAccount.usedPages)
+            assertEquals(32, written.get())
+            assertEquals(-1, growResult.get())
             assertEquals(4 * page, h.scheduler.memoryAccount.usedBytes)
 
-            // 最初のメモリが全体に入らないプロセスは作れない
-            val big = b.spawnTest(h.program(memoryModule(3)), TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
-            h.tickUntil("3 ページのプロセスが終わらない") { b.stateOf(big).isTerminal }
-            assertEquals(ProcessState.CRASHED, b.stateOf(big))
-            assertInstanceOf(WasmLinkException::class.java, b.rt(big).lastError)
-
-            // A が終わると、全体の分が戻り、B も同じ大きさを取れる
+            // A が終わると、全体の分が戻り、B も同じだけ書ける
             a.stop()
             h.tickUntil("最初のプロセスが終わらない") { a.stateOf(first).isTerminal }
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
-            val growAfter = AtomicInteger(0)
+            val usedAgain = AtomicLong(0)
             val again = b.spawnTest(
-                h.program(memoryModule(1)),
+                h.program(memoryModule(4)),
                 TestDriver(ProcessKind.BLOCKING) { ctx ->
-                    growAfter.set(ctx.instance.memory!!.grow(3))
+                    ctx.instance.memory!!.touch(0, 64)
+                    usedAgain.set(h.scheduler.memoryAccount.usedBytes)
                     StepResult.Exit(0)
                 },
             )
             h.tickUntil("2回目が終わらない") { b.stateOf(again).isTerminal }
-            assertEquals(1, growAfter.get())
+            assertEquals(ProcessState.EXITED, b.stateOf(again))
+            assertEquals(4 * page, usedAgain.get())
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
         }
     }

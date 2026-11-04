@@ -10,7 +10,8 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
-import pro.ikili.kibicomputers.core.runtime.endive.committedPages
+import pro.ikili.kibicomputers.core.runtime.endive.romChunks
+import pro.ikili.kibicomputers.core.runtime.endive.writtenChunks
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
 import java.lang.management.ManagementFactory
@@ -36,6 +37,10 @@ class LuaReplMemoryTest {
         }
 
         fun text(): String = synchronized(out) { out.toString(Charsets.UTF_8) }
+    }
+
+    private companion object {
+        const val CHUNK = 4096L
     }
 
     private fun usedHeap(): Long {
@@ -74,22 +79,24 @@ class LuaReplMemoryTest {
             }
             val after = usedHeap()
 
+            // 確保した量 = 書き換えた区画（RAM に数える）と ROM の区画（#407。4 KiB 単位）
             var declared = 0L
             var committed = 0L
+            var written = 0L
             for ((m, _, pid) in started) {
                 val memory = m.rt(pid).instances.mapNotNull { it.memory }.single()
-                declared += memory.pages
-                committed += committedPages(memory)
+                declared += memory.pages * WasmMemory.PAGE_SIZE.toLong()
+                committed += (writtenChunks(memory) + romChunks(memory)) * CHUNK
+                written += writtenChunks(memory) * CHUNK
             }
-            val page = WasmMemory.PAGE_SIZE.toLong()
             val heapPerMachine = (after - before) / machines
             println(
-                "Lua REPL x $machines: 宣言 ${declared * page / machines / 1024} KiB/台, " +
-                    "確保 ${committed * page / machines / 1024} KiB/台, ヒープ増分 ${heapPerMachine / 1024} KiB/台（合計 ${(after - before) / 1024 / 1024} MiB）",
+                "Lua REPL x $machines: 宣言 ${declared / machines / 1024} KiB/台, 確保 ${committed / machines / 1024} KiB/台, " +
+                    "RAM（書き換え） ${written / machines / 1024} KiB/台, ヒープ増分 ${heapPerMachine / 1024} KiB/台（合計 ${(after - before) / 1024 / 1024} MiB）",
             )
             assertTrue(committed < declared, "確保 $committed / 宣言 $declared")
-            // 以前（スタック 16 MiB を全部確保）は 1 台で 16 MiB を超えていた
-            assertTrue(committed * page / machines < 4L * 1024 * 1024, "1 台あたりの確保が大きすぎる: ${committed * page / machines}")
+            // 以前（スタック 16 MiB を全部確保）は 1 台で 16 MiB を超えていた。64 KiB 単位の LazyMemory では 576 KiB 以上
+            assertTrue(committed / machines < 512L * 1024, "1 台あたりの確保が大きすぎる: ${committed / machines}")
 
             started.forEach { (m, _, _) -> m.stop() }
             eventually(30_000) {

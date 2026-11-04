@@ -58,6 +58,18 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
     internal val tableBudget: WasmTableBudget? = builder.tableBudget
 
     /**
+     * 共有しない線形メモリを、初めて書き込んだ 4 KiB の区画の数で数える（#407。[Builder.writtenMemoryLimit]）。
+     * `true` なら [maxMemoryPages] はアドレス空間の上限で、[memoryBudget] は使わない
+     */
+    internal val writtenMemory: Boolean = builder.writtenMemory
+
+    /** 書き込んだ 4 KiB の区画を数える相手（#407）。`null` なら数えない */
+    internal val writtenMemoryBudget: WasmTableBudget? = builder.writtenMemoryBudget
+
+    /** `memory.grow` を [writtenMemoryBudget] が断ったときに呼ぶ（#407。メモリ不足の表示に使う）。`null` なら呼ばない */
+    internal val onMemoryGrowRefused: Runnable? = builder.onMemoryGrowRefused
+
+    /**
      * 待機点への変換をかけたモジュールが退避する値の置き場所（#329）。変換したモジュール（[WasmModule.isAsyncified]）では必須で、
      * `null` のままインスタンスを作ると [WasmLinkException]。変換していないモジュールでは使わない
      */
@@ -76,6 +88,9 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal var asyncStack: WasmAsyncStack? = null
         internal var maxTableElements: Int = Int.MAX_VALUE
         internal var tableBudget: WasmTableBudget? = null
+        internal var writtenMemory: Boolean = false
+        internal var writtenMemoryBudget: WasmTableBudget? = null
+        internal var onMemoryGrowRefused: Runnable? = null
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
@@ -105,8 +120,33 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
          */
         public fun memoryLimit(maxPages: Int, budget: WasmMemoryBudget?): Builder = apply {
             require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
+            require(!writtenMemory) { "memoryLimit と writtenMemoryLimit は一緒に使えない" }
             maxMemoryPages = maxPages
             memoryBudget = budget
+        }
+
+        /**
+         * 線形メモリを、初めて書き込んだ 4 KiB の区画の数で RAM として数える（#407。#370 で決定）。[memoryLimit] とは一緒に使えない。
+         *
+         * - ページ数（最初の大きさと `memory.grow` で増やした大きさ）は数えず、[maxPages] だけを上限にする（アドレス空間の上限）。
+         * - 初めて書き込んだ 4 KiB ごとに [budget] で 4,096 バイトを数え、断られたらトラップ（[WasmTrapKind.OUT_OF_MEMORY]）にする。
+         * - インスタンスを作るときにデータセグメントで書いた区画（ROM）は、書き換えるまで数えない。ゼロのままの区画も数えない。
+         * - `memory.grow` は、増やした所の最初と最後の 4 KiB だけを先に数える。数えられなければ -1 にし、[onGrowRefused] を呼ぶ。
+         * - 数えた分は、インスタンスを閉じるまで返さない（解放しても減らない）。
+         *
+         * 共有メモリ（threads）を宣言したモジュールは、インスタンスを作るときに [WasmLinkException] になる。
+         *
+         * @param maxPages メモリ1つあたりのページ数の上限（0〜[WasmMemory.MAX_PAGES]）
+         * @param budget 書き込んだ区画を数える相手。`null` なら数えない
+         * @param onGrowRefused `memory.grow` を [budget] が断ったときに呼ぶ（実行しているスレッドから。ロックを持たずに）
+         */
+        internal fun writtenMemoryLimit(maxPages: Int, budget: WasmTableBudget?, onGrowRefused: Runnable? = null): Builder = apply {
+            require(maxPages in 0..WasmMemory.MAX_PAGES) { "maxPages は 0〜${WasmMemory.MAX_PAGES}: $maxPages" }
+            require(memoryBudget == null) { "memoryLimit と writtenMemoryLimit は一緒に使えない" }
+            maxMemoryPages = maxPages
+            writtenMemory = true
+            writtenMemoryBudget = budget
+            onMemoryGrowRefused = onGrowRefused
         }
 
         /**

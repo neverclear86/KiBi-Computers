@@ -82,7 +82,8 @@ class WasiP1CwdProgramTest {
             eventually(20_000, "WAIT まで進まない") {
                 h.scheduler.tick()
                 seen.append(m.drain(output))
-                seen.contains("WAIT") || m.stateOf(pid).isTerminal
+                // printf が "WAIT" と改行を別々に書くことがあるので、改行まで待つ
+                seen.contains("WAIT\n") || m.stateOf(pid).isTerminal
             }
             assertEquals("WAIT\n", seen.toString(), "プログラムの出力")
 

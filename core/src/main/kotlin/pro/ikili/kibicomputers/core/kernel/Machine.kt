@@ -105,13 +105,14 @@ public class MachineConfig private constructor(builder: Builder) {
     public val maxHostCallsPerTick: Int = builder.maxHostCallsPerTick
 
     /**
-     * コンピューター全体の RAM（バイト。#39）。全プロセスの線形メモリの合計の上限で、64 KiB（1 ページ）単位に切り捨てて使う。
+     * コンピューター全体の RAM（バイト。#39）。全プロセスの線形メモリ（初めて書き込んだ 4 KiB の区画の数。#407）などの合計の上限で、
+     * 64 KiB（1 ページ）単位に切り捨てて使う。
      * 仮: 32 MiB（RAM のアイテムで変わる。#123。wasi-libc の既定のスタックが 16 MiB なので、それより大きくしている）
      */
     public val memoryBytes: Long = builder.memoryBytes
 
     /**
-     * 1 プロセスの線形メモリの合計の上限（バイト。#39）。64 KiB 単位に切り捨てて使う。
+     * 1 プロセスの線形メモリ（書き込んだ区画。#407）の合計の上限（バイト。#39）。64 KiB 単位に切り捨てて使う。
      * 仮: [memoryBytes] と同じ（1つのプロセスが RAM をすべて使ってよい）
      */
     public val maxProcessMemoryBytes: Long = builder.maxProcessMemoryBytes ?: builder.memoryBytes
@@ -1286,19 +1287,27 @@ public class Machine private constructor(
      * - init が `stop()`・再起動によらずに終わったら、コンソールに書いて、残りのプロセスをすべて止める
      * - init でないプロセスが例外で `CRASHED` になったら、理由をコンソールに書く（#41）。ほかのプロセスはそのまま
      *
+     * - init でないプロセスが 0 以外の終了コードで終わり、[exitNote] があれば（`memory.grow` を RAM の上限で断られていた。#407）、そう書く
+     *
      * @param crashReason `CRASHED` の理由（[crashReason][pro.ikili.kibicomputers.core.kernel.process.crashReason]）。それ以外は `null`
+     * @param exitNote `EXITED` で 0 以外の終了コードのときに添える文（メモリ不足。#407）。なければ `null`
      */
-    internal fun onProcessFinishedLocked(process: Process, crashReason: String?) {
+    internal fun onProcessFinishedLocked(process: Process, crashReason: String?, exitNote: String?) {
         val isInit = kernel.initPid != 0 && process.pid == kernel.initPid && process.parentPid == 0
         if (isInit) kernel.initPid = 0
         // STOPPING（stop()・reboot()）と CRASHED（カーネルの不整合）では何も言わない
         if (stateValue != MachineState.RUNNING) return
+        val note = if (exitNote != null) " ($exitNote)" else ""
         if (!isInit) {
-            if (process.state == ProcessState.CRASHED) writeConsoleLine("kibi: ${processLabel(process)} crashed: ${crashReason ?: "unknown"}")
+            when {
+                process.state == ProcessState.CRASHED -> writeConsoleLine("kibi: ${processLabel(process)} crashed: ${crashReason ?: "unknown"}")
+                process.state == ProcessState.EXITED && exitNote != null ->
+                    writeConsoleLine("kibi: ${processLabel(process)} exited with code ${process.exitCode}$note")
+            }
             return
         }
         val message = when (process.state) {
-            ProcessState.EXITED -> "kibi: init exited with code ${process.exitCode}"
+            ProcessState.EXITED -> "kibi: init exited with code ${process.exitCode}$note"
             ProcessState.CRASHED -> "kibi: init crashed: ${crashReason ?: "unknown"}"
             else -> "kibi: init was killed"
         }
