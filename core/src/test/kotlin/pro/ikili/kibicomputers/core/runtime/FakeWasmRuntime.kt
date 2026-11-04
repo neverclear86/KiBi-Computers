@@ -89,7 +89,7 @@ class FakeModule private constructor(
         }
         memoryPages?.let { pages ->
             if (pages > minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages)) throw WasmLinkException("ダミー: メモリの最初のページ数が上限を超える")
-            if (pages > 0 && config.memoryBudget?.tryReserve(pages) == false) throw WasmLinkException("ダミー: メモリを確保できない")
+            if (!config.writtenMemory && pages > 0 && config.memoryBudget?.tryReserve(pages) == false) throw WasmLinkException("ダミー: メモリを確保できない")
         }
         val instance = FakeInstance(this, config)
         if (isFuelMetered) instance.fuel = config.initialFuel
@@ -130,7 +130,16 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     private var fuelValue: Long = 0
 
     private val fakeMemory: FakeMemory? = module.memoryPages?.let { pages ->
-        FakeMemory(pages, minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages), config.memoryBudget).also { m -> module.data.forEach { (offset, bytes) -> m.write(offset, bytes) } }
+        val max = minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages)
+        if (config.writtenMemory) {
+            // #407: データは ROM として書き、書き換えた 4 KiB の区画だけを数える
+            FakeMemory(pages, max, written = FakeWrittenCount(config.writtenMemoryBudget, config.onMemoryGrowRefused)).also { m ->
+                module.data.forEach { (offset, bytes) -> m.write(offset, bytes) }
+                m.startCounting()
+            }
+        } else {
+            FakeMemory(pages, max, config.memoryBudget).also { m -> module.data.forEach { (offset, bytes) -> m.write(offset, bytes) } }
+        }
     }
 
     override val memory: WasmMemory? get() = fakeMemory
@@ -204,9 +213,60 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     }
 }
 
-/** ByteArray のメモリ。上限は [maxPages]（16 ページまで）。[budget] があれば、確保を数える（最初の分は作る側が数える）。 */
-internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAGES, private val budget: WasmMemoryBudget? = null) : WasmMemory {
+/**
+ * 書き換えた 4 KiB の区画を数える（#407。Endive の `WrittenPagesMemory` と同じ規則のダミー）。
+ * 書き込みで数えられなければ [WasmTrapKind.OUT_OF_MEMORY] のトラップ。grow は増やした所の最初と最後の区画を数え、
+ * 数えられなければ -1 にして [onGrowRefused] を呼ぶ
+ */
+internal class FakeWrittenCount(val budget: WasmTableBudget?, val onGrowRefused: Runnable?) {
+    val written = java.util.BitSet()
+    var count = 0
+    var counting = false
+
+    /** [chunk] を書き換えた区画として数える。数えられなければトラップ */
+    fun touch(chunk: Int) {
+        if (!counting || written[chunk]) return
+        if (budget != null && !budget.tryReserveBytes(CHUNK.toLong())) throw WasmTrapException(WasmTrapKind.OUT_OF_MEMORY, "ダミー: RAM が足りない")
+        written.set(chunk)
+        count++
+    }
+
+    fun releaseAll() {
+        if (count > 0) budget?.releaseBytes(count.toLong() * CHUNK)
+        count = 0
+        counting = false
+    }
+
+    companion object {
+        const val CHUNK = 4096
+    }
+}
+
+/**
+ * ByteArray のメモリ。上限は [maxPages]（16 ページまで）。[budget] があれば、確保を数える（最初の分は作る側が数える）。
+ * [written] があれば、ページ数ではなく書き換えた 4 KiB の区画を数える（#407）
+ */
+internal class FakeMemory(
+    initialPages: Int,
+    private val maxPages: Int = MAX_PAGES,
+    private val budget: WasmMemoryBudget? = null,
+    private val written: FakeWrittenCount? = null,
+) : WasmMemory {
     private var bytes = ByteArray(initialPages * WasmMemory.PAGE_SIZE)
+
+    /** ここまでに書いた分を ROM とし、以後の書き込みを数える */
+    fun startCounting() {
+        written?.counting = true
+    }
+
+    /** 書き換えた区画の数（#407） */
+    val writtenChunks: Int get() = written?.count ?: -1
+
+    private fun touch(start: Int, length: Int) {
+        val w = written ?: return
+        if (length <= 0) return
+        for (c in (start / FakeWrittenCount.CHUNK)..((start + length - 1) / FakeWrittenCount.CHUNK)) w.touch(c)
+    }
 
     /** [budget] から確保したページ数 */
     private var reserved = if (budget != null) initialPages else 0
@@ -216,6 +276,18 @@ internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAG
     override fun grow(deltaPages: Int): Int {
         val old = pages
         if (deltaPages < 0 || old + deltaPages > maxPages) return -1
+        if (deltaPages > 0 && written != null && written.counting) {
+            val head = old * WasmMemory.PAGE_SIZE / FakeWrittenCount.CHUNK
+            val tail = (old + deltaPages) * WasmMemory.PAGE_SIZE / FakeWrittenCount.CHUNK - 1
+            val edges = if (head == tail) 1 else 2
+            if (written.budget != null && !written.budget.tryReserveBytes(edges.toLong() * FakeWrittenCount.CHUNK)) {
+                written.onGrowRefused?.run()
+                return -1
+            }
+            written.written.set(head)
+            written.written.set(tail)
+            written.count += edges
+        }
         if (deltaPages > 0 && budget != null) {
             if (!budget.tryReserve(deltaPages)) return -1
             reserved += deltaPages
@@ -227,6 +299,7 @@ internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAG
     fun releaseAll() {
         if (reserved > 0) budget?.release(reserved)
         reserved = 0
+        written?.releaseAll()
     }
 
     private fun check(address: Int, length: Int): Int {
@@ -240,13 +313,17 @@ internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAG
     }
 
     override fun write(address: Int, src: ByteArray, srcOffset: Int, length: Int) {
-        System.arraycopy(src, srcOffset, bytes, check(address, length), length)
+        val a = check(address, length)
+        touch(a, length)
+        System.arraycopy(src, srcOffset, bytes, a, length)
     }
 
     override fun readU8(address: Int): Int = bytes[check(address, 1)].toInt() and 0xff
 
     override fun writeU8(address: Int, value: Int) {
-        bytes[check(address, 1)] = value.toByte()
+        val a = check(address, 1)
+        touch(a, 1)
+        bytes[a] = value.toByte()
     }
 
     override fun readI32(address: Int): Int {
@@ -256,6 +333,7 @@ internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAG
 
     override fun writeI32(address: Int, value: Int) {
         val a = check(address, 4)
+        touch(a, 4)
         for (i in 0 until 4) bytes[a + i] = (value ushr (8 * i)).toByte()
     }
 
@@ -266,6 +344,7 @@ internal class FakeMemory(initialPages: Int, private val maxPages: Int = MAX_PAG
 
     override fun writeI64(address: Int, value: Long) {
         val a = check(address, 8)
+        touch(a, 8)
         for (i in 0 until 8) bytes[a + i] = (value ushr (8 * i)).toByte()
     }
 

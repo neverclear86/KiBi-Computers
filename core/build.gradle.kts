@@ -120,6 +120,11 @@ kibiWasm {
         sources.from("src/test/wasm/fuel_spin_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // RAM を書き換えた 4 KiB の区画で数える（#407）ことと、メモリ不足の表示を確かめる CLI
+    module("oom-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/oom_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

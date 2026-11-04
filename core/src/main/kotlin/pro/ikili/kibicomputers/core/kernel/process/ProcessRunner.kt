@@ -35,6 +35,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
@@ -506,10 +508,12 @@ internal class ProcessRunner(private val machine: Machine) {
     /** ABI 層の設定を確かめ、カーネルが決めるもの（燃料以外。メモリの上限）を設定する */
     private fun applyKernelLimits(rt: ProcessRuntime, builder: WasmInstanceConfig.Builder) {
         check(builder.initialFuel == 0L && builder.fuelHandler == null) { "ABI 層は builder.fuel を呼ばない（燃料はカーネルが設定する）" }
-        check(builder.memoryBudget == null && builder.maxMemoryPages == WasmMemory.MAX_PAGES) { "ABI 層は builder.memoryLimit を呼ばない（メモリの上限はカーネルが設定する）" }
+        check(builder.memoryBudget == null && !builder.writtenMemory && builder.maxMemoryPages == WasmMemory.MAX_PAGES) { "ABI 層は builder.memoryLimit を呼ばない（メモリの上限はカーネルが設定する）" }
         check(builder.asyncStack == null) { "ABI 層は builder.asyncStack を呼ばない（退避先はカーネルが設定する）" }
-        // メモリ1つの上限も、プロセスの上限と RAM のうち小さい方（Endive が上限の分の表を先に作るので、小さく渡す）
-        builder.memoryLimit(minOf(rt.memory.limitPages, machine.memoryAccount.limitPages), rt.memory)
+        // RAM は初めて書き込んだ 4 KiB の区画で数える（#407）。ページ数はアドレス空間の上限だけを見る。
+        // アドレス空間は RAM より大きくてよい（書かない所は数えない）。RAM がそれより大きいマシンでは RAM まで
+        val ramPages = minOf(rt.memory.limitPages, machine.memoryAccount.limitPages)
+        builder.writtenMemoryLimit(maxOf(ADDRESS_SPACE_PAGES, ramPages), rt.memory) { rt.memoryGrowRefused = true }
         // テーブル（#361）: 要素数の上限は読み込みの上限と同じ値にし、要素の分はメモリと同じくプロセスと RAM に数える
         check(builder.tableBudget == null && builder.maxTableElements == Int.MAX_VALUE) { "ABI 層は builder.tableLimit を呼ばない（テーブルの上限はカーネルが設定する）" }
         val maxTableElements = (scheduler.options.moduleLimits ?: ModuleLimits.DEFAULT).maxTableElements
@@ -579,13 +583,23 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.loading = null
             if (!rt.process.state.isTerminal) {
                 val state = if (rt.killed) ProcessState.KILLED else ProcessState.CRASHED
-                if (state == ProcessState.CRASHED) rt.crashReason = crashReason(t)
+                if (state == ProcessState.CRASHED) rt.crashReason = processCrashReason(rt, t)
                 finishLocked(rt, state, null)
             }
         } finally {
             lock.unlock()
         }
         releasePermitAndCpu(rt, endOfStep = true)
+    }
+
+    /**
+     * `CRASHED` の理由（#41）。RAM の上限を超えた書き込みのトラップは上限を添え、`memory.grow` を RAM の上限で断った後の
+     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）
+     */
+    private fun processCrashReason(rt: ProcessRuntime, t: Throwable): String {
+        if (t is WasmTrapException && t.kind == WasmTrapKind.OUT_OF_MEMORY) return outOfMemoryReason(rt.memory.effectiveLimitBytes)
+        val reason = crashReason(t)
+        return if (rt.memoryGrowRefused) "$reason (${growRefusedNote(rt.memory.effectiveLimitBytes)})" else reason
     }
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
@@ -630,7 +644,9 @@ internal class ProcessRunner(private val machine: Machine) {
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）
         machine.lifecycle.onFinishedLocked(rt)
         // init なら、マシンを止める（#49）
-        machine.onProcessFinishedLocked(process, rt.crashReason)
+        // 0 以外の終了コードで終わったプロセスが、その前に memory.grow を RAM の上限で断られていたら、そう添える（#407）
+        val exitNote = if (state == ProcessState.EXITED && exitCode != 0 && rt.memoryGrowRefused) growRefusedNote(rt.memory.effectiveLimitBytes) else null
+        machine.onProcessFinishedLocked(process, rt.crashReason, exitNote)
         machine.checkAllDoneLocked()
     }
 
@@ -1126,3 +1142,9 @@ private inline fun <T> java.util.concurrent.locks.ReentrantLock.withLockValue(bl
 
 /** キューのフィルターが `timer` を受け取るか確かめるためのイベント */
 private val TIMER_EVENT_PROBE = KernelEvent(TimerLimits.EVENT_TYPE)
+
+/**
+ * プロセスの線形メモリ1つのアドレス空間の上限（ページ数。#407）。RAM は書き込んだ区画で数えるので、RAM のティアより大きくてよい。
+ * 64 MiB（#370 の PoC と同じ）。マシンの RAM がこれより大きければ、RAM の大きさまで広げる
+ */
+internal const val ADDRESS_SPACE_PAGES: Int = 1024

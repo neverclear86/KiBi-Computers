@@ -59,6 +59,9 @@ public enum class WasmTrapKind {
     /** WASM の例外（`throw`）が誰にも捕まえられずに外に出た */
     UNCAUGHT_EXCEPTION,
 
+    /** RAM が足りない（初めて書き込んだ 4 KiB の区画を数えられなかった。#407） */
+    OUT_OF_MEMORY,
+
     /** 実行しているスレッドが割り込まれた（`Thread.interrupt`）。カーネルがプロセスを止めるときに使う（#43） */
     INTERRUPTED,
 
