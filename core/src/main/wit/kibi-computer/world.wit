@@ -3,4 +3,5 @@ package kibi:computer@0.1.0;
 /// `kibi:computer` の interface をまとめて import する world（ゲストがコンポーネントにするとき・`component embed` に使う）
 world imports {
     import memory;
+    import clock;
 }

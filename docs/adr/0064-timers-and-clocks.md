@@ -97,6 +97,7 @@ MachineScheduler
 
 - WASM から見える ABI: p1 の `poll_oneoff` の時計の購読（#72）、`kibi:*` の WIT と p1 の import（タイマー・sleep・`uptime`・ゲーム内時間を見せる形、イベントの値の写し方。#73）、p2 の `wasi:clocks`・pollable（#264）、p3（#266）
   - 追記（#73）: イベントの値の写し方は ADR 0073。タイマー（`kibi:kernel/timers`）・sleep・uptime とゲーム内時間（`kibi:computer/clock`）を見せる形は #426。現在時刻・単調時計は `wasi:clocks` のまま
+  - 追記（#426）: タイマー・sleep・uptime・ゲーム内時間を見せる形と、`timer` のイベントの値の届き方は ADR 0426
 - 保存のバイト形式（#81・#82）、復元時の「時間が飛んだ」イベントの種類と中身（#87）
 - Lua の `os.sleep`・`event` との対応（#94・#95）
 - 燃料の費用（#47・#251）、仮の値の確定（#251）

@@ -20,11 +20,14 @@ typedef struct {
     } val;
 } kibi_result_u32_t;
 
-// result<_, error-code>（2 バイト、align 1）。is_err が 0 なら成功
+// result<_, error-code>（2 バイト、align 1）。is_err が 0 なら成功（kibi_timers.h と共通。先に定義した方を使う）
+#ifndef KIBI_RESULT_UNIT_DEFINED
+#define KIBI_RESULT_UNIT_DEFINED
 typedef struct {
     uint8_t is_err;
     kibi_error_code_t err;
 } kibi_result_unit_t;
+#endif
 
 // record pipe-ends（8 バイト、align 4）
 typedef struct {
