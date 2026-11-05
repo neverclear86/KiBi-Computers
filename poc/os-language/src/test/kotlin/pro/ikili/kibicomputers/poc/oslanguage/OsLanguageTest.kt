@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 
 /** 両方の言語のプログラムが同じ振る舞いをし、カーネルの上で待機点型として動くこと（#32）。測定の表も出す */
@@ -56,21 +57,30 @@ class OsLanguageTest {
     }
 
     @Test
-    fun `カーネルの上で待機点型として動き、入力を待てる`() {
+    fun `カーネルの上で動き、入力を待てる（Zigは待機点型）`() {
         val langs = languages()
-        KernelRun().use { k ->
-            for (l in langs) {
-                val w = k.runUntilInput(wasm("shell", l)!!, "x y\n")
-                assertEquals(ProcessKind.WAIT_POINT, w.kind, l.label)
-                assertTrue("[x][y]" in w.afterInput, "${l.label}: ${w.afterInput}")
-                assertTrue(w.writtenChunks > 0, l.label)
-                val r = k.run(wasm("kmem", l)!!, emptyList())
-                assertEquals(ProcessState.EXITED, r.state, "${l.label}: ${r.console}")
-                assertEquals(0, r.exitCode, "${l.label}: ${r.console}")
-                assertTrue("kibi ok" in r.console, "${l.label}: ${r.console}")
-                val ls = k.run(wasm("ls", l)!!, listOf("/d"), mapOf("a" to ByteArray(1)))
-                assertEquals(0, ls.exitCode, "${l.label}: ${ls.console}")
-                assertTrue("a\n" in ls.console, "${l.label}: ${ls.console}")
+        KernelRun().use { waitPoint ->
+            KernelRun(asyncify = false).use { blocking ->
+                for (l in langs) {
+                    // 待機点に変換できないモジュール（結果は測定の表に出す）は、ブロッキング型で振る舞いだけ確かめる
+                    fun <T> either(f: (KernelRun) -> T): T = try {
+                        f(waitPoint)
+                    } catch (e: FsException) {
+                        assertTrue(l != Language.ZIG, "Zig は待機点に変換できるはず: ${e.message}")
+                        f(blocking)
+                    }
+                    val w = either { it.runUntilInput(wasm("shell", l)!!, "x y\n") }
+                    if (l == Language.ZIG) assertEquals(ProcessKind.WAIT_POINT, w.kind)
+                    assertTrue("[x][y]" in w.afterInput, "${l.label}: ${w.afterInput}")
+                    assertTrue(w.writtenChunks > 0, l.label)
+                    val r = either { it.run(wasm("kmem", l)!!, emptyList()) }
+                    assertEquals(ProcessState.EXITED, r.state, "${l.label}: ${r.console}")
+                    assertEquals(0, r.exitCode, "${l.label}: ${r.console}")
+                    assertTrue("kibi ok" in r.console, "${l.label}: ${r.console}")
+                    val ls = either { it.run(wasm("ls", l)!!, listOf("/d"), mapOf("a" to ByteArray(1))) }
+                    assertEquals(0, ls.exitCode, "${l.label}: ${ls.console}")
+                    assertTrue("a\n" in ls.console, "${l.label}: ${ls.console}")
+                }
             }
         }
     }

@@ -127,6 +127,7 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
             moonbitVersion.set(project.provider { moonbitDist.version })
             toolchainsDir.set(gradleHome)
             outputDir.convention(project.layout.buildDirectory.dir("generated/moonbit/$name"))
+            wasmOptSuffix.convention("-opt")
             onlyIf("kibi.moonbit か CI のときだけ MoonBit をビルドする") { enabled }
             action.execute(this)
         }

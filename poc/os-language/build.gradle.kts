@@ -49,7 +49,15 @@ kibiWasm {
     moonbit("os-language") {
         moduleDir = layout.projectDirectory.dir("src/main/moonbit")
         packages.putAll(programs.associate { "cmd/$it" to "kibicomputers/poc/os-language/$it-moonbit.wasm" })
+        // 同梱の Binaryen（moon-wasm-opt）を通した版も比べる（引数のあるブロックを外せるか、大きさ・速さが変わるか）
+        wasmOptArgs.addAll("-all", "-O2")
     }
+}
+
+// 手元では MoonBit をビルドしないので、CI がビルドした WASM（成果物 os-language-moonbit-wasm）を
+// `-Pkibi.moonbitWasmDir=<展開したディレクトリの os-language>` で読ませて測れるようにする
+providers.gradleProperty("kibi.moonbitWasmDir").orNull?.let { dir ->
+    sourceSets.main { resources.srcDir(dir) }
 }
 
 dependencies {

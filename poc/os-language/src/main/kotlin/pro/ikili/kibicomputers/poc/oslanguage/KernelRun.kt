@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.kernel.SchedulerInternals
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -22,9 +23,13 @@ import kotlin.concurrent.withLock
  * 本物のカーネル（スケジューラ・`Machine.exec`・待機点への変換・RAM の数え方）の上でプログラムを動かす（#32）。
  *
  * `Machine.exec` は、読み込むときに燃料の計測コードの挿入と待機点への変換をかける（#38・#329・#339）。
+ * [asyncify] が `false` なら変換をかけず、ブロッキング型（`BLOCKING`。待つ間スレッドを持つ）で動かす（変換できないモジュールの比較用）。
  */
-internal class KernelRun : AutoCloseable {
-    private val scheduler = MachineScheduler(SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).build())
+internal class KernelRun(asyncify: Boolean = true) : AutoCloseable {
+    private val scheduler = MachineScheduler.create(
+        SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).build(),
+        SchedulerInternals(asyncifyExecutables = asyncify),
+    )
 
     private class ConsoleHost : MachineHost {
         private val out = ByteArrayOutputStream()

@@ -54,6 +54,17 @@ abstract class MoonBuildWasm @Inject constructor(
     @get:Input
     abstract val buildArgs: ListProperty<String>
 
+    /**
+     * 空でなければ、各パッケージの `.wasm` に、同梱の `bin/moon-wasm-opt` をこの引数で（`<入力> <引数> -o <出力>`）かけたものも出す。
+     * 出力のパスは、[packages] の出力パスの `.wasm` の前に [wasmOptSuffix] を付けたもの。失敗してもビルドは止めない（警告だけ）
+     */
+    @get:Input
+    abstract val wasmOptArgs: ListProperty<String>
+
+    /** [wasmOptArgs] の出力のパスに付ける印（既定は `-opt`）。 */
+    @get:Input
+    abstract val wasmOptSuffix: Property<String>
+
     /** 出力ディレクトリ。リソースのディレクトリとしてそのまま使える。 */
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -91,6 +102,23 @@ abstract class MoonBuildWasm @Inject constructor(
             val target = out.resolve(outputPath)
             target.parentFile.mkdirs()
             file.copyTo(target, overwrite = true)
+            if (wasmOptArgs.get().isNotEmpty()) wasmOpt(home, file, out.resolve(outputPath.removeSuffix(".wasm") + wasmOptSuffix.get() + ".wasm"))
+        }
+    }
+
+    private fun wasmOpt(home: java.io.File, input: java.io.File, output: java.io.File) {
+        val exe = if (moonbitDistribution.get().moonExecutable.endsWith(".exe")) "moon-wasm-opt.exe" else "moon-wasm-opt"
+        val result = execOperations.exec {
+            executable = home.resolve("bin").resolve(exe).absolutePath
+            args(input.absolutePath)
+            args(wasmOptArgs.get())
+            args("-o", output.absolutePath)
+            environment(MoonBitInstaller.moonEnvironment(home))
+            isIgnoreExitValue = true
+        }
+        if (result.exitValue != 0) {
+            output.delete()
+            logger.warn("moon-wasm-opt が失敗した（終了コード ${result.exitValue}）: ${input.name}")
         }
     }
 }

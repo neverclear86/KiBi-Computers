@@ -47,8 +47,11 @@ internal class MiniWasi(
     fun run(module: WasmModule): Result {
         val builder = WasmInstanceConfig.builder()
         builder.fuel(INITIAL_FUEL, WasmFuelHandler { _, _ -> error("燃料を使い切った（INITIAL_FUEL を増やす）") })
+        val seen = HashSet<String>()
         for (imp in module.imports) {
             if (imp.kind != WasmExternKind.FUNCTION) continue
+            // MoonBit は同じ import（fd_write）を2回宣言することがある。ホストの関数は1つだけ登録する
+            if (!seen.add("${imp.module}.${imp.name}")) continue
             if (imp.module == "kibi" && (imp.name == "fuel" || imp.name.startsWith("async_"))) continue
             val type = imp.functionType ?: continue
             val f = function(imp.module, imp.name) ?: run {
