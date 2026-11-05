@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.fd
 
+import pro.ikili.kibicomputers.core.kernel.io.Pipes
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
@@ -68,6 +69,18 @@ internal class FdTable(
         if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
         val id = objects.add(obj)
         return install(id, rights, flags)
+    }
+
+    /**
+     * 容量 [capacity] のパイプを作り、読む端（`READ`）と書く端（`WRITE`）を小さい空き番号から順に入れて返す（`pipe`。#59）。
+     * 空き番号が2つなければ、何も作らずに `MFILE`
+     */
+    fun pipe(capacity: Int = Pipes.DEFAULT_CAPACITY): PipeFds {
+        if (handles.limit - handles.size < 2) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
+        val ids = Pipes.create(objects, capacity)
+        val read = install(ids.read, HandleRights.READ)
+        val write = install(ids.write, HandleRights.WRITE)
+        return PipeFds(read, write)
     }
 
     /** [fd] を、いちばん小さい空き番号に複製する（`dup`）。権利とフラグも写す */
@@ -139,3 +152,6 @@ internal class FdTable(
         if (fd < 0 || fd >= handles.limit) fsError(Errno.BADF, "fd $fd は範囲外（上限 ${handles.limit}）")
     }
 }
+
+/** [FdTable.pipe] で開いたパイプの fd（[read] は読む端、[write] は書く端） */
+internal data class PipeFds(val read: Int, val write: Int)

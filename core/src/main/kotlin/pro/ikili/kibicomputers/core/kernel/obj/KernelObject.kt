@@ -22,6 +22,12 @@ internal abstract class KernelObject {
 
     /** 参照カウントが 0 になった。この後 [ObjectTable] が `sink.wakeObject(id)` を呼ぶ */
     open fun onLastClose(sink: WakeSink) {}
+
+    /**
+     * 参照カウントが 0 になり、表から外れた後に呼ばれる。このオブジェクトが持っているほかのオブジェクトの参照を
+     * [objects] に返す（パイプの端が中身のストリームを持つなど。#59）
+     */
+    open fun releaseReferences(objects: ObjectTable, sink: WakeSink) {}
 }
 
 /**
@@ -71,7 +77,7 @@ internal class ObjectTable {
         e.refCount++
     }
 
-    /** 参照を1つ減らす。0 になったら `onLastClose` → `sink.wakeObject(id)` → 表から外す */
+    /** 参照を1つ減らす。0 になったら `onLastClose` → `sink.wakeObject(id)` → 表から外す → `releaseReferences` */
     fun release(id: Int, sink: WakeSink) {
         val map = entries
         val e = requireNotNull(map?.get(id)) { "オブジェクト $id がない" }
@@ -80,5 +86,6 @@ internal class ObjectTable {
         e.obj.onLastClose(sink)
         sink.wakeObject(id)
         map!!.remove(id)
+        e.obj.releaseReferences(this, sink)
     }
 }
