@@ -142,6 +142,48 @@ class MachineConsoleBudgetTest {
         }
     }
 
+    @Test
+    fun `書き手が表示デバイスに書いている最中でも、メインスレッドの tick はそのロックを待たない`() = timeout(limit) {
+        // 出力し続ける台ごとに、メインスレッドが表示デバイスのロックを待つと、その台数に比例して tick が重くなる（#351）
+        val screen = TextBuffer(40, 10)
+        boot(screen, MachineConsole.DEFAULT_CELLS_PER_TICK) { b ->
+            b.console.keyboardInput(KeyboardEvent.Paste("local i = 0 while true do i = i + 1 print(i) end\n"))
+            b.tickUntil({ "出力が出ない: ${lines(screen)}" }) { lines(screen).none { it.startsWith("> local") } }
+            // 書き手が表示デバイスに書いている最中（ロックを持ったまま）を、別のスレッドでロックを持って作る
+            val holding = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val holder = Thread {
+                b.console.display.lock.lock()
+                try {
+                    holding.countDown()
+                    release.await(30, TimeUnit.SECONDS)
+                } finally {
+                    b.console.display.lock.unlock()
+                }
+            }
+            holder.start()
+            try {
+                assertTrue(holding.await(10, TimeUnit.SECONDS))
+                // その間も、Lua は TTY に書き、TTY の印を積む（表示デバイスに書けずに待つ）
+                repeat(20) {
+                    val start = System.nanoTime()
+                    b.manager.tick()
+                    val millis = (System.nanoTime() - start) / 1_000_000
+                    assertTrue(millis < 2_000, "tick waited $millis ms for the display device lock held by a writer")
+                    LockSupport.parkNanos(5_000_000L)
+                }
+            } finally {
+                release.countDown()
+                holder.join()
+            }
+            // ロックが空けば、書き手が続きを書き、出力は止まらない
+            val before = lines(screen)
+            b.tickUntil({ "出力が続かない: ${lines(screen)}" }) { lines(screen) != before }
+            assertFalse(b.machine.consoleOutputHeld)
+            assertEquals(MachineState.RUNNING, b.machine.state)
+        }
+    }
+
     private fun flood(unit: String) {
         val screen = TextBuffer(160, 50)
         boot(screen, MachineConsole.DEFAULT_CELLS_PER_TICK) { b ->
