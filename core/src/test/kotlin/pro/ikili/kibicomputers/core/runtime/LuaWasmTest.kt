@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import run.endive.runtime.HostFunction
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
 import run.endive.wasi.WasiExitException
@@ -13,6 +14,8 @@ import run.endive.wasi.WasiOptions
 import run.endive.wasi.WasiPreview1
 import run.endive.wasm.Parser
 import run.endive.wasm.WasmModule
+import run.endive.wasm.types.FunctionType
+import run.endive.wasm.types.ValType
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
@@ -61,7 +64,12 @@ class LuaWasmTest {
             .withStderr(stderr)
             .build()
         val exitCode = WasiPreview1.builder().withOptions(options).build().use { wasi ->
-            val imports = ImportValues.builder().addFunction(*wasi.toHostFunctions()).build()
+            val imports = ImportValues.builder()
+                .addFunction(*wasi.toHostFunctions())
+                // Lua のアロケーター（#409）が呼ぶ kibi:memory（#408）。ここでは RAM の上限を持たないので、いつも足りると答える
+                .addFunction(HostFunction("kibi", "memory_remaining", FunctionType.of(listOf(), listOf(ValType.I64))) { _, _ -> longArrayOf(Long.MAX_VALUE) })
+                .addFunction(HostFunction("kibi", "memory_commit", FunctionType.of(listOf(ValType.I32, ValType.I32, ValType.I64), listOf(ValType.I32))) { _, _ -> longArrayOf(1) })
+                .build()
             try {
                 Instance.builder(module).withImportValues(imports).build()
                 0

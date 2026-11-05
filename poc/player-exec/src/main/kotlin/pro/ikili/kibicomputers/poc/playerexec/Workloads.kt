@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.poc.playerexec
 
+import pro.ikili.kibicomputers.poc.fuel.kibiMemoryStubs
 import run.endive.wasi.WasiExitException
 import run.endive.wasi.WasiOptions
 import run.endive.wasi.WasiPreview1
@@ -32,7 +33,7 @@ fun PlayerRuntime.runLua(program: Program, script: String): RunResult {
         .withRandom(Random(0))
         .build()
     WasiPreview1.builder().withOptions(options).build().use { wasi ->
-        val launch = launch(lm, wasi.toHostFunctions().toList())
+        val launch = launch(lm, wasi.toHostFunctions().toList() + kibiMemoryStubs())
         val tier = launch.tier
         val exit = try {
             launch.instance.export("_start").apply()

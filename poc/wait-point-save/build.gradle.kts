@@ -47,6 +47,7 @@ kibiWasm.module("lua_host") {
     sources.from(rootProject.file("core/src/main/wasm/lua/kibi_wasi.c"))
     sources.from("src/main/wasm/lua_host.c")
     includeDirs.from(rootProject.file("core/src/main/wasm/lua"))
+    includeDirs.from(rootProject.file("core/src/main/wasm/common"))
     includeDirs.from(luaSource.map { it.outputDir.dir("src") })
     compilerArgs.addAll(
         // ここから core と同じ

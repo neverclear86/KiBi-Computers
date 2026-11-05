@@ -7,7 +7,7 @@ import java.io.ByteArrayOutputStream
  *
  * zig cc でビルドした実際のプログラムを、ランタイムの抽象を通して動かすために使う。
  * カーネルの WASI（#259）ではない。標準入出力・引数・時計・乱数だけを持ち、ファイルや preopen はない。
- * 知らない関数は `ENOSYS` を返す。
+ * 知らない関数は `ENOSYS` を返す。`kibi:memory` の import（#408）は、いつも RAM が足りると答える。
  */
 class TestWasiP1(private val args: List<String>, stdin: String = "") {
     /** `proc_exit` で投げる。 */
@@ -22,9 +22,12 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
     fun config(module: WasmModule, configure: WasmInstanceConfig.Builder.() -> Unit = {}): WasmInstanceConfig {
         val builder = WasmInstanceConfig.builder().apply(configure)
         for (imp in module.imports) {
-            if (imp.module != MODULE || imp.kind != WasmExternKind.FUNCTION) continue
+            if (imp.kind != WasmExternKind.FUNCTION) continue
             val type = imp.functionType!!
-            builder.hostFunction(MODULE, imp.name, type, function(imp.name, type))
+            when (imp.module) {
+                MODULE -> builder.hostFunction(MODULE, imp.name, type, function(imp.name, type))
+                KIBI -> kibiFunction(imp.name)?.let { builder.hostFunction(KIBI, imp.name, type, it) }
+            }
         }
         return builder.build()
     }
@@ -60,6 +63,16 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
         }
         "proc_exit" -> WasmHostFunction { _, a -> throw Exit(a[0].toInt()) }
         else -> WasmHostFunction { _, _ -> LongArray(type.results.size).also { if (it.isNotEmpty()) it[0] = ENOSYS.toLong() } }
+    }
+
+    /**
+     * 独自拡張 `kibi:memory`（#408）。同梱の Lua のアロケーター（#409）が呼ぶ。
+     * RAM の上限は持たないので、残りは最大、commit は必ず成功と答える
+     */
+    private fun kibiFunction(name: String): WasmHostFunction? = when (name) {
+        "memory_remaining" -> WasmHostFunction { _, _ -> longArrayOf(Long.MAX_VALUE) }
+        "memory_commit" -> WasmHostFunction { _, _ -> longArrayOf(1) }
+        else -> null
     }
 
     private fun errno(body: (WasmMemory, LongArray) -> Int): WasmHostFunction = WasmHostFunction { instance, args ->
@@ -128,6 +141,7 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
 
     companion object {
         const val MODULE = "wasi_snapshot_preview1"
+        const val KIBI = "kibi"
         private const val SUCCESS = 0
         private const val EBADF = 8
         private const val ENOSYS = 52

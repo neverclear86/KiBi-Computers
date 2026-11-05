@@ -128,6 +128,12 @@ class P1Kernel(val args: List<String>, val style: WaitStyle) {
             Asyncify.POP -> { _, _ -> longArrayOf(pop()) }
             else -> null
         }
+        // 独自拡張 kibi:memory（#408）。同梱の Lua のアロケーター（#409）が呼ぶ。この PoC には RAM の上限がないので、いつも足りると答える
+        "kibi" -> when (name) {
+            "memory_remaining" -> { _, _ -> longArrayOf(Long.MAX_VALUE) }
+            "memory_commit" -> { _, _ -> longArrayOf(1) }
+            else -> null
+        }
         WASI -> when (name) {
             "fd_write" -> { inst, a -> ok(fdWrite(inst.memory(), a[0].toInt(), a[1].toInt(), a[2].toInt(), a[3].toInt())) }
             "fd_read" -> { inst, a -> ok(fdRead(inst.memory(), a[0].toInt(), a[1].toInt(), a[2].toInt(), a[3].toInt())) }

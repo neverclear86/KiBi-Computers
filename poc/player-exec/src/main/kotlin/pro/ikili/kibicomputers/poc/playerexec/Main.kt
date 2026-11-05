@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.poc.fuel.Budget
 import pro.ikili.kibicomputers.poc.fuel.FuelInjector
 import pro.ikili.kibicomputers.poc.fuel.Wasm
 import pro.ikili.kibicomputers.poc.fuel.kb
+import pro.ikili.kibicomputers.poc.fuel.kibiMemoryStubs
 import pro.ikili.kibicomputers.poc.fuel.measure
 import pro.ikili.kibicomputers.poc.fuel.ms
 import run.endive.compiler.InterpreterFallback
@@ -98,11 +99,14 @@ private fun compile(bytes: ByteArray, cache: MapCache?) {
 }
 
 /** 生成だけ測るための import（中身は使わない） */
-private fun imports(p: Program) = if (p.name.startsWith("lua")) run.endive.wasi.WasiPreview1.builder().build().toHostFunctions().toList() else emptyList()
+private fun imports(p: Program) = if (p.name.startsWith("lua")) run.endive.wasi.WasiPreview1.builder().build().toHostFunctions().toList() + kibiMemoryStubs() else emptyList()
 
 private fun importValues(bytes: ByteArray): run.endive.runtime.ImportValues {
     val b = run.endive.runtime.ImportValues.builder()
-    if (bytes.size > 100_000) b.addFunction(*run.endive.wasi.WasiPreview1.builder().build().toHostFunctions())
+    if (bytes.size > 100_000) {
+        b.addFunction(*run.endive.wasi.WasiPreview1.builder().build().toHostFunctions())
+        b.addFunction(*kibiMemoryStubs().toTypedArray())
+    }
     b.addFunction(
         run.endive.runtime.HostFunction(
             FuelInjector.IMPORT_MODULE,

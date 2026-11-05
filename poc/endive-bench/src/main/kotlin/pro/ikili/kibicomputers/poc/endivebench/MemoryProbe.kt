@@ -93,6 +93,7 @@ class MemoryProbe(
             Wasm.BENCH -> null
             Wasm.LUA -> run.endive.runtime.ImportValues.builder()
                 .addFunction(*run.endive.wasi.WasiPreview1.builder().build().toHostFunctions())
+                .addFunction(*kibiMemoryStubs().toTypedArray())
                 .build()
         }
 
