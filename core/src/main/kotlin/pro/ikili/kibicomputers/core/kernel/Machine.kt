@@ -1600,11 +1600,23 @@ public class Machine private constructor(
         // TTY から取り出してから、配り終えるまで持つ、書く先のロック（#355。その間にプロセスのスレッドが後の出力を先に書かないように）
         private var locked: ConsoleSink? = null
 
+        // TTY の印を見たが、書く先をプロセスのスレッドが書いている最中だったので、取り出すのを次の tick に回した（#351）
+        private var ttySkipped = false
+
         private fun lockSink() {
             if (locked != null) return
             val sink = consoleSink ?: return
             sink.lock.lock()
             locked = sink
+        }
+
+        // 書く先のロックを、待たずに取ってみる。書く先がない（メインスレッドで取り出して配る）なら、取れたものとする
+        private fun tryLockSink(): Boolean {
+            if (locked != null) return true
+            val sink = consoleSink ?: return true
+            if (!sink.lock.tryLock()) return false
+            locked = sink
+            return true
         }
 
         private fun unlockSink() {
@@ -1614,12 +1626,24 @@ public class Machine private constructor(
         }
 
         fun add(n: HostNotification) {
-            lockSink()
             if (n === HostNotification.TtyOutput) {
                 // 印を下ろしてから取り出す（下ろした後の出力は、新しい印で積まれる）
                 consoleDirty.set(false)
+                if (!tryLockSink()) {
+                    // プロセスのスレッドが書く先に書いている最中なら、TTY の出力はそのスレッドが書く（#355）。
+                    // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick に見直す（#351。待つと、出力し続ける台の数に比例して
+                    // メインスレッドが止まる）。この tick にカーネルのメッセージが来たら、そのときにロックを待って取り出す
+                    ttySkipped = true
+                    recheckTtyOutput = true
+                    return
+                }
                 ttyPending = true
                 return
+            }
+            lockSink()
+            if (ttySkipped) {
+                ttySkipped = false
+                ttyPending = true
             }
             n as HostNotification.Console
             if (ttyPending) drainTtyBefore(n)?.let(::append)
@@ -1630,6 +1654,7 @@ public class Machine private constructor(
         /** たまった分を [host] に渡す（TTY の残りも取り出す） */
         fun flush() {
             try {
+                ttySkipped = false
                 if (ttyPending) {
                     ttyPending = false
                     // 書く先があれば、TTY の出力は書いたプロセスが自分のスレッドで書く。残ったままのものだけ取り出す（#355）

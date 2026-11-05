@@ -155,6 +155,12 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     /** サーバー: tick の終わりに呼ぶ。見ている人を距離から決め直し、その tick の分を送る。 */
     fun syncTick() {
         val level = level as? ServerLevel ?: return
+        // 誰も見ておらず、見はじめる人を探す tick でもなければ、表示デバイスのロックを取らない。
+        // 出力し続けている画面のロックを、メインスレッドが毎 tick 奪い合わないようにする（#351）
+        if (!watchers.needsTick(level.gameTime, sender)) {
+            busyTicks = 0
+            return
+        }
         // プロセスのスレッドが書いている最中の表示デバイスから、差分を取り出す（#355）
         val d = display
         if (!d.lock.tryLock()) {

@@ -66,6 +66,10 @@ neoForge {
             type = "gameTestServer"
             systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
+            // -PloadTestJfr=<ファイル> で、JFR のプロファイルを取る（メインスレッドで重いところを探すとき。#351）
+            providers.gradleProperty("loadTestJfr").orNull?.let {
+                jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")
+            }
         }
         register("data") {
             data()

@@ -103,6 +103,31 @@ class ScreenWatchersTest {
     }
 
     @Test
+    fun `needsTick is false only between scans while nobody watches`() {
+        val w = watchers(scan = 10)
+        val p = Player("p", 20.0)
+        host.players += p
+        assertTrue(w.needsTick(3, sender), "the first tick always scans")
+        w.step(3)
+        for (t in 4L..9L) assertFalse(w.needsTick(t, sender), "nobody watches and no scan at $t")
+        assertTrue(w.needsTick(10, sender), "scan tick")
+
+        // 見はじめたら毎 tick 要る（見ている人が遠ざかったか調べ、描画命令を送る）
+        p.distance = 5.0
+        w.step(10)
+        assertTrue(w.isWatching(p))
+        assertTrue(sender.isRecording)
+        assertTrue(w.needsTick(11, sender))
+
+        // 見るのをやめた tick の後は、記録も止まり、また要らなくなる
+        p.distance = 16.0
+        w.step(11)
+        assertFalse(w.isWatching(p))
+        assertFalse(sender.isRecording)
+        assertFalse(w.needsTick(12, sender))
+    }
+
+    @Test
     fun `resync requests are limited per interval and deferred`() {
         val w = watchers(resync = 40)
         val p = Player("p", 5.0)
