@@ -41,13 +41,15 @@ internal fun interface BootVolumeOpener {
 
         /**
          * マシンの既定: `image:` の識別子は [DEFAULT]、ほかは [disks] が返すホストのディレクトリを [DiskFileSystem] として開く
-         * （なければ作る。#52）。開いたままのホストのファイルは [budget] で数える。[disks] が知らない・開けないディスクは `null`
+         * （なければ作る。#52）。容量は [disks] が返す値（[pro.ikili.kibicomputers.core.kernel.ResolvedDisk]。#124）。
+         * 開いたままのホストのファイルは [budget] で数える。[disks] が知らない・開けないディスクは `null`
          */
-        fun forDisks(disks: DiskResolver, budget: HostFileBudget, quota: DiskQuota = DiskQuota()): BootVolumeOpener = BootVolumeOpener { diskId ->
+        fun forDisks(disks: DiskResolver, budget: HostFileBudget): BootVolumeOpener = BootVolumeOpener { diskId ->
             if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX)) return@BootVolumeOpener DEFAULT.open(diskId)
-            val dir = disks.resolve(diskId) ?: return@BootVolumeOpener null
+            val disk = disks.resolve(diskId) ?: return@BootVolumeOpener null
+            val quota = DiskQuota(maxBytes = disk.capacityBytes, maxEntries = disk.maxEntries)
             val fs = try {
-                DiskFileSystem.open(dir, quota, readOnly = false, budget = budget)
+                DiskFileSystem.open(disk.directory, quota, readOnly = false, budget = budget)
             } catch (e: java.io.IOException) {
                 null
             }

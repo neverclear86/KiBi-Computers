@@ -4,6 +4,7 @@ import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.machine.MachineManager
@@ -44,7 +45,8 @@ public enum class ComputerError {
  * - 電源を入れる（[turnOn]）と、起動に要る部品（[CaseTier.missingRequired]）がそろい、電力があれば、
  *   [MachineManager] にマシンを作る（[MachineSlot]）。そろっていなければ [ComputerStatus.ERROR]、電力がなければ
  *   [ComputerStatus.NO_POWER] にして、マシンは作らない
- * - 動いている間に起動に要る部品が抜けた（[partsChanged]）・電力が尽きた（[powerLost]）ら、マシンを止める
+ * - 動いている間に起動に要る部品が抜けた・電源を入れたときにあったディスクが抜けた（[partsChanged]）・
+ *   電力が尽きた（[powerLost]）ら、マシンを止める
  * - マシンが [MachineState.CRASHED] になったら [ComputerStatus.ERROR]（[ComputerError.CRASHED]）
  * - ブロックエンティティの `onChunkUnloaded`・`setRemoved` で [chunkUnloaded]・[removed] を呼ぶ（[MachineSlot] と同じ）。
  *   どちらも状態を [ComputerStatus.OFF] にする
@@ -75,6 +77,13 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /** [ComputerError.MISSING_PARTS] のときに足りない部品の種類（[PartKind] の順）。ほかのときは空 */
     public var missingParts: List<PartKind> = emptyList()
+        private set
+
+    /**
+     * 電源を入れたときにディスクのスロットにあったディスクの識別子（[InstalledParts.diskIdAt]。#124）。
+     * [ComputerStatus.RUNNING] でなければ空。どれかが抜けたら [partsChanged] で止める
+     */
+    public var bootDiskIds: Set<String> = emptySet()
         private set
 
     /** 動いているマシン。動いていなければ `null` */
@@ -109,18 +118,20 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      *
      * @return 押した後の状態
      */
+    @JvmOverloads
     public fun pressPowerButton(
         manager: MachineManager<K>?,
         key: K,
         parts: InstalledParts,
         hasPower: Boolean,
         config: MachineConfig,
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
     ): ComputerStatus =
         if (status == ComputerStatus.RUNNING) {
             turnOff()
             status
         } else {
-            turnOn(manager, key, parts, hasPower, config)
+            turnOn(manager, key, parts, hasPower, config, environment)
         }
 
     /**
@@ -131,14 +142,17 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      * @param parts 部品の挿さり具合
      * @param hasPower 起動に足りる電力があるか（#128。今は接続層が常に `true` を渡す）
      * @param config 作るマシンの設定（CPU・RAM で変わる。#122・#123）
+     * @param environment 作るマシンの環境（挿さっているディスクの写しなど。#124）
      * @return 入れた後の状態
      */
+    @JvmOverloads
     public fun turnOn(
         manager: MachineManager<K>?,
         key: K,
         parts: InstalledParts,
         hasPower: Boolean,
         config: MachineConfig,
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
     ): ComputerStatus {
         if (status == ComputerStatus.RUNNING) return status
         val missing = tier.missingRequired(parts)
@@ -146,8 +160,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
             missing.isNotEmpty() -> fail(ComputerError.MISSING_PARTS, missing)
             !hasPower -> set(ComputerStatus.NO_POWER)
             manager == null -> fail(ComputerError.UNAVAILABLE)
-            slot.load(manager, key, host, config) == null -> fail(ComputerError.UNAVAILABLE)
-            else -> set(ComputerStatus.RUNNING)
+            slot.load(manager, key, host, config, environment) == null -> fail(ComputerError.UNAVAILABLE)
+            else -> {
+                set(ComputerStatus.RUNNING)
+                bootDiskIds = diskIds(parts)
+            }
         }
         return status
     }
@@ -159,19 +176,30 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     }
 
     /**
-     * 部品が挿された・抜かれた。動いている間に起動に要る部品がなくなったら、マシンを止めて
-     * [ComputerError.MISSING_PARTS] にする。動いていなければ何もしない（足りない部品の表示も変えない）。
+     * 部品が挿された・抜かれた。動いている間に、起動に要る部品がなくなった、または電源を入れたときにあったディスク
+     * （[bootDiskIds]）のどれかがディスクのスロットからなくなったら、マシンを止めて [ComputerError.MISSING_PARTS] にする。
+     * ディスクが抜けたときは、ほかのディスクが残っていても [missingParts] に [PartKind.STORAGE] を入れる。
+     * 同じディスクを別のディスクのスロットに挿し直したとき（識別子が残る）は止めない。
+     * 動いていなければ何もしない（足りない部品の表示も変えない）。
      *
      * @return マシンを止めたら `true`
      */
     public fun partsChanged(parts: InstalledParts): Boolean {
         if (status != ComputerStatus.RUNNING) return false
         val missing = tier.missingRequired(parts)
-        if (missing.isEmpty()) return false
+        val diskGone = bootDiskIds.isNotEmpty() && !diskIds(parts).containsAll(bootDiskIds)
+        if (missing.isEmpty() && !diskGone) return false
         slot.removed()
-        fail(ComputerError.MISSING_PARTS, missing)
+        val kinds = if (diskGone) PartKind.entries.filter { it in missing || it == PartKind.STORAGE } else missing
+        fail(ComputerError.MISSING_PARTS, kinds)
         return true
     }
+
+    /** ディスクのスロットに挿さっているディスクの識別子 */
+    private fun diskIds(parts: InstalledParts): Set<String> =
+        tier.slots.indices
+            .filter { tier.slots[it] == PartKind.STORAGE }
+            .mapNotNullTo(LinkedHashSet()) { parts.diskIdAt(it) }
 
     /**
      * 電力が尽きた（#128）。動いていればマシンを止めて [ComputerStatus.NO_POWER] にする（実行中の処理は失われる）。
@@ -208,9 +236,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         status = newStatus
         error = null
         missingParts = emptyList()
+        bootDiskIds = emptySet()
     }
 
     private fun fail(reason: ComputerError, missing: List<PartKind> = emptyList()) {
+        bootDiskIds = emptySet()
         status = ComputerStatus.ERROR
         error = reason
         missingParts = missing

@@ -24,8 +24,13 @@ import pro.ikili.kibicomputers.core.computer.PartKind
  *   ティアの数に合わせる（はみ出た分は捨てる）
  */
 class CaseParts(val tier: CaseTier, private val onChanged: Runnable = Runnable {}) : ItemStackHandler(tier.slotCount) {
-    /** 部品の挿さり具合（`core` に渡す） */
-    val installed: InstalledParts = InstalledParts { slot -> !getStackInSlot(slot).isEmpty }
+    /** 部品の挿さり具合と、ディスクのスロットのディスクの識別子（`core` に渡す） */
+    val installed: InstalledParts = object : InstalledParts {
+        override fun isInstalled(slot: Int): Boolean = !getStackInSlot(slot).isEmpty
+
+        override fun diskIdAt(slot: Int): String? =
+            if (slot in 0 until slots && tier.kindOf(slot) == PartKind.STORAGE) DiskItem.diskIdOf(getStackInSlot(slot)) else null
+    }
 
     /** 挿さっている部品のティア（`core` の [pro.ikili.kibicomputers.core.computer.MachineSpecs] に渡す）。部品のアイテムでなければ `null` */
     val tiers: InstalledPartTiers = InstalledPartTiers { slot -> (getStackInSlot(slot).item as? ComputerPartItem)?.tier }

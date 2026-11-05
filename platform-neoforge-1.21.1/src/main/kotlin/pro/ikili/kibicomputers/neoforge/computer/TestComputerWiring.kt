@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.display.DisplayDevice
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardListener
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
@@ -23,7 +24,8 @@ import java.util.UUID
  * テスト用コンピューターの仮の結線（#307）。ケース1つにつき1つ持ち、サーバーでだけ使う。
  *
  * - 起動部品は挿さっているとみなす（[withBootPart]）。置き換え先: 起動部品のアイテム #125、ファームウェア #99
- * - 起動ディスクは同梱イメージ（[TEST_BOOT_DISK]）に決め打ち。置き換え先: 標準OS #98、起動部品の設定 #99
+ * - 起動ディスクの候補は、ディスクのスロットの順のディスク（#124）、最後に同梱イメージ（[TEST_BOOT_DISK]）（[bootConfig]）。
+ *   置き換え先: 標準OS #98、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
  *   表示デバイス（[DisplayDevice]）を作って画面に映させ、コンソールの出力を表示デバイスに、キーボードの入力をコンソールに流す
  *   （[MachineConsole]。プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
@@ -49,13 +51,18 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     /** 画面につないだコンソール。つないでいなければ null（テスト用） */
     val connectedConsole: MachineConsole? get() = console
 
+    /** 今つないでいるマシンの起動の失敗（[onBootFailed]）。失敗していなければ null（テスト用） */
+    var bootFailure: BootFailure? = null
+        private set
+
     // 画面が外れたら、出力を止めている最中でも、すぐに外して取っておいた出力を捨てる（#397）
     private val onScreenRemoved = Runnable { disconnect() }
 
-    /** 電源が入った（[machine] を作った）。隣の画面とキーボードにつなぎ、同梱イメージから起動する。 */
-    fun connect(level: Level, casePos: BlockPos, machine: Machine) {
+    /** 電源が入った（[machine] を作った）。隣の画面とキーボードにつなぎ、[boot] の候補から起動する。 */
+    fun connect(level: Level, casePos: BlockPos, machine: Machine, boot: BootConfig = BOOT_CONFIG) {
         disconnect()
         this.machine = machine
+        bootFailure = null
         val screen = findScreen(level, casePos)
         if (screen != null) {
             this.screen = screen
@@ -67,7 +74,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
             // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
             keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
         }
-        machine.boot(BOOT_CONFIG)
+        machine.boot(boot)
     }
 
     /**
@@ -89,6 +96,10 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
+
+    override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+        if (machine === this.machine) bootFailure = failure
+    }
 
     override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
         if (machine !== this.machine) return
@@ -112,11 +123,18 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         const val TEST_BOOT_DISK: String = BootConfig.IMAGE_DISK_PREFIX + "testboot"
 
         /** 仮の起動の設定: 起動部品あり、起動ディスクは同梱イメージ testboot */
-        val BOOT_CONFIG: BootConfig = BootConfig.builder().firmwarePresent(true).addBootDisk(TEST_BOOT_DISK).build()
+        val BOOT_CONFIG: BootConfig = bootConfig(emptyList())
 
-        /** 起動部品（#125）のスロットは、挿さっているとみなす */
-        fun withBootPart(tier: CaseTier, parts: InstalledParts): InstalledParts =
-            InstalledParts { slot -> tier.kindOf(slot) == PartKind.BOOT || parts.isInstalled(slot) }
+        /** 仮の起動の設定: 起動部品あり、起動ディスクの候補は [disks]（ディスクのスロットの順）、最後に同梱イメージ testboot */
+        fun bootConfig(disks: List<String>): BootConfig =
+            BootConfig.builder().firmwarePresent(true).bootDisks(disks + TEST_BOOT_DISK).build()
+
+        /** 起動部品（#125）のスロットは、挿さっているとみなす。ディスクの識別子は [parts] のまま */
+        fun withBootPart(tier: CaseTier, parts: InstalledParts): InstalledParts = object : InstalledParts {
+            override fun isInstalled(slot: Int): Boolean = tier.kindOf(slot) == PartKind.BOOT || parts.isInstalled(slot)
+
+            override fun diskIdAt(slot: Int): String? = parts.diskIdAt(slot)
+        }
 
         /** ケースの隣の画面。下・上・北・南・西・東の順に見て、最初のもの */
         fun findScreen(level: Level, casePos: BlockPos): ScreenBlockEntity? =
