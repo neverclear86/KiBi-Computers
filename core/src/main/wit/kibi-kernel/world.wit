@@ -1,0 +1,7 @@
+package kibi:kernel@0.1.0;
+
+/// `kibi:kernel` の interface をまとめて import する world（ゲストがコンポーネントにするとき・`component embed` に使う）
+world imports {
+    import types;
+    import events;
+}

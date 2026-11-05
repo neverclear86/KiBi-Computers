@@ -128,10 +128,10 @@ class P1Kernel(val args: List<String>, val style: WaitStyle) {
             Asyncify.POP -> { _, _ -> longArrayOf(pop()) }
             else -> null
         }
-        // 独自拡張 kibi:memory（#408）。同梱の Lua のアロケーター（#409）が呼ぶ。この PoC には RAM の上限がないので、いつも足りると答える
-        "kibi" -> when (name) {
-            "memory_remaining" -> { _, _ -> longArrayOf(Long.MAX_VALUE) }
-            "memory_commit" -> { _, _ -> longArrayOf(1) }
+        // 独自拡張 kibi:computer/memory（#408・#73）。同梱の Lua のアロケーター（#409）が呼ぶ。この PoC には RAM の上限がないので、いつも足りると答える
+        "kibi:computer/memory@0.1.0" -> when (name) {
+            "remaining" -> { _, _ -> longArrayOf(Long.MAX_VALUE) }
+            "commit" -> { _, _ -> longArrayOf(1) }
             else -> null
         }
         WASI -> when (name) {

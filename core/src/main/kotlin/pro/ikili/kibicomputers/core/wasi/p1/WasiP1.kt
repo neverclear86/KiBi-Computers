@@ -15,13 +15,15 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 
 /**
  * WASI p1（`wasi_snapshot_preview1`）の層（ADR 0261 の A）。カーネルの土台の上に、p1 のホスト関数を並べる。
  *
  * 今あるのは `fd_*`（#70）、`path_*`（#71。[WasiP1Path]）、args・environ・clock・random・proc_exit・sched_yield（#69。[WasiP1Basic]）と、
- * `poll_oneoff`（#72。[WasiP1Poll]）と、独自拡張のモジュール `kibi`（#408。[WasiP1Kibi]）。`sock_*` はまだない。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
+ * `poll_oneoff`（#72。[WasiP1Poll]）と、独自拡張の `kibi:*` のモジュール（#408・#73。[WasiP1Kibi]）。`sock_*` はまだない。`proc_raise` は p1 でも非推奨なので足さない（`NOSYS`）。
  * まだない関数をモジュールが import していれば、`NOSYS` を返す仮の関数をつなぐ（リンクが通るように）。
  */
 internal object WasiP1 {
@@ -130,19 +132,33 @@ internal object WasiP1 {
      *
      * 許すのは `wasi_snapshot_preview1` の、仕様にある名前の関数だけ。実装している関数は型も一致しなければならない
      * （インスタンスを作るときのリンクの失敗を、読み込みのときに分かるようにする）。
-     * 独自拡張（`kibi:*` の p1 向けの import。[WasiP1Kibi]。#408）は、モジュール名 `kibi` の、出している名前の関数だけを、型が一致するときに許す
-     * （`kibi` のほかの名前、カーネルの予約名の `fuel`・`async_*` などは断る）。
+     * 独自拡張（`kibi:` で始まるモジュール。[WasiP1Kibi]。#73）は、出している関数だけを、型が一致するときに許す。版は完全一致だけ
+     * （`@0.2.0` などは断る）。`cabi_realloc` が要る関数を import するなら、モジュールが `cabi_realloc: (i32, i32, i32, i32) -> i32` を
+     * export していなければ断る。モジュール `kibi` は燃料・待機点への変換の予約の空間なので、ゲストの import は断る
+     * （#408 の旧名 `kibi.memory_*` も。今は [WasiP1Kibi.MEMORY]）。
      * メモリ・テーブル・グローバル・タグの import や、ほかのモジュール名（`env` など）は断る。
      */
     @Throws(FsException::class)
     fun checkImports(module: WasmModule) {
+        var needsRealloc: String? = null
         for (imp in module.imports) {
             val name = "${imp.module}.${imp.name}"
-            if (imp.module == WasiP1Kibi.MODULE) {
+            if (imp.module.startsWith(WasiP1Kibi.PREFIX)) {
                 if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
-                val expected = WasiP1Kibi.typeOf(imp.name) ?: fsError(Errno.NOEXEC, "許可していない import: $name")
+                if (imp.module !in WasiP1Kibi.modules) {
+                    val base = imp.module.substringBefore('@')
+                    if (WasiP1Kibi.modules.any { it.substringBefore('@') == base }) {
+                        fsError(Errno.NOEXEC, "独自拡張の版が違う: ${imp.module}（出しているのは ${WasiP1Kibi.modules.filter { it.startsWith("$base@") }}）")
+                    }
+                    fsError(Errno.NOEXEC, "許可していない import: $name")
+                }
+                val expected = WasiP1Kibi.typeOf(imp.module, imp.name) ?: fsError(Errno.NOEXEC, "許可していない import: $name")
                 if (imp.functionType != expected) fsError(Errno.NOEXEC, "import の型が違う: $name は $expected（モジュールは ${imp.functionType}）")
+                if (WasiP1Kibi.needsRealloc(imp.module, imp.name)) needsRealloc = name
                 continue
+            }
+            if (imp.module == KIBI_RESERVED && imp.name in OLD_KIBI_NAMES) {
+                fsError(Errno.NOEXEC, "旧名の import: $name（#73 で ${WasiP1Kibi.MEMORY} に改名した）")
             }
             if (imp.module != P1.MODULE) fsError(Errno.NOEXEC, "許可していない import: $name")
             if (imp.kind != WasmExternKind.FUNCTION) fsError(Errno.NOEXEC, "関数でない import は許可していない: $name（${imp.kind}）")
@@ -150,7 +166,19 @@ internal object WasiP1 {
             val expected = typeOf(imp.name) ?: continue
             if (imp.functionType != expected) fsError(Errno.NOEXEC, "import の型が違う: $name は $expected（モジュールは ${imp.functionType}）")
         }
+        if (needsRealloc != null) {
+            val ok = module.exports.any {
+                it.name == WasiP1Kibi.REALLOC && it.kind == WasmExternKind.FUNCTION && it.functionType == WasiP1Kibi.REALLOC_TYPE
+            }
+            if (!ok) fsError(Errno.NOEXEC, "$needsRealloc を import するのに ${WasiP1Kibi.REALLOC}: ${WasiP1Kibi.REALLOC_TYPE} を export していない")
+        }
     }
+
+    /** カーネルの予約のモジュール名（燃料・待機点への変換。ゲストは import できない） */
+    private const val KIBI_RESERVED: String = "kibi"
+
+    /** #408 の旧名（#73 で [WasiP1Kibi.MEMORY] に改名） */
+    private val OLD_KIBI_NAMES: Set<String> = setOf("memory_remaining", "memory_commit")
 
     /** 実装している関数 [name] の型（なければ `null`） */
     fun typeOf(name: String): WasmFunctionType? =
@@ -174,12 +202,18 @@ internal object WasiP1 {
         val suspend = WasiP1Suspend(ctx)
         val impl = Impl(WasiP1Fd(ctx, wait, suspend), WasiP1Path(ctx), basic, WasiP1Poll(ctx, basic, wait, suspend))
         for (fn in FUNCTIONS) {
-            val waits = wait == P1Wait.UNWIND && fn.name in WAIT_NAMES
+            val mayWait = fn.name in WAIT_NAMES
+            val waits = wait == P1Wait.UNWIND && mayWait
             builder.hostFunction(
                 P1.MODULE,
                 fn.name,
                 fn.type,
                 ctx.hostFunction { c, caller, args ->
+                    // ホスト関数の中から呼んだゲスト（cabi_realloc など。#73）の中では、待ち方に依らず止まりうる import を呼べない
+                    // （巻き戻せず、スレッドを持ったまま待つことになるため）。巻き直しの状態にも燃料にも触れる前に止める
+                    if (mayWait && c.inGuestCall) {
+                        throw WasmTrapException(WasmTrapKind.OTHER, "止まりうる import ${fn.name} を cabi_realloc の中で呼んだ")
+                    }
                     // 巻き直して着いたなら、ここで NORMAL に戻す（燃料を引くより前。巻き直しも普通の呼び出しとして数える）
                     if (waits) suspend.enter(caller)
                     c.chargeFuel(WasiP1Fd.CALL_FUEL)
@@ -199,7 +233,7 @@ internal object WasiP1 {
                 },
             )
         }
-        // 独自拡張（kibi:* の p1 向けの import。#408）
+        // 独自拡張（kibi:* の p1 向けの import。#408・#73）
         WasiP1Kibi.register(ctx, builder)
         // proc_exit: 戻らない。WasiP1Exit でゲストの呼び出しを抜ける（ドライバーが終了コードにする）
         builder.hostFunction(

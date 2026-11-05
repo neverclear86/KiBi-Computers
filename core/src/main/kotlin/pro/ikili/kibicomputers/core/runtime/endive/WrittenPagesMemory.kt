@@ -195,7 +195,7 @@ internal class WrittenPagesMemory(
 
     /**
      * [address] から [length] バイト（どちらも符号なし 32 ビット）にかかる区画のうち、まだ数えていないもの（ゼロ・ROM の区画）を、
-     * 今のうちに書き換えた区画として数えて確保する（`kibi:memory` の `commit`。#408）。ROM の区画は中身を写す。
+     * 今のうちに書き換えた区画として数えて確保する（`kibi:computer/memory` の `commit`。#408）。ROM の区画は中身を写す。
      *
      * 数える区画がなければ `true`（[keepBytes] を見ない）。数えた後の残りが [keepBytes]（符号なし 64 ビット）未満になるなら、
      * 何も数えず・確保せずに `false`（区画は読み取り専用のまま。後で書けば普通に数える）。

@@ -60,7 +60,7 @@ internal class MemoryAccount(
 
     /**
      * [tryReserveBytes] と同じだが、自分の勘定では、数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上）
-     * 以上になるときだけ数える（`kibi:memory` の `commit`。#408）。親（サーバー全体）の勘定には [keepBytes] をかけない
+     * 以上になるときだけ数える（`kibi:computer/memory` の `commit`。#408）。親（サーバー全体）の勘定には [keepBytes] をかけない
      */
     fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes >= 0) { "バイト数は 0 以上: $bytes" }
@@ -143,7 +143,7 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     }
 
     /**
-     * 残りの RAM（バイト。`kibi:memory` の `remaining`。#408）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方（0 未満にしない）。
+     * 残りの RAM（バイト。`kibi:computer/memory` の `remaining`。#408）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方（0 未満にしない）。
      * サーバー全体の勘定（#362）は入れない
      */
     val remainingBytes: Long get() = maxOf(0L, minOf(limitBytes - usedBytes, machine.limitBytes - machine.usedBytes))

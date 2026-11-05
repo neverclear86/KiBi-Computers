@@ -465,13 +465,14 @@ internal class ProcessRunner(private val machine: Machine) {
      * 止まりうる関数の中の燃料切れ（#339。`kibi.async_fuel`）。巻き戻せるなら、状態を `UNWINDING` にして戻る
      * （`_start` まで戻ったら、ドライバーが [StepResult.WaitFuel] を返す）。
      * 燃料待ちからの巻き直し（`REWINDING`）で呼ばれたら、止まった呼び出しに着いたので `NORMAL` に戻し、step が渡した手持ちを返す。
-     * 巻き戻せないところ（モジュールの start 関数の中）では、[onFuelExhausted] と同じくスレッドを持ったまま待つ
+     * 巻き戻せないところ（モジュールの start 関数の中、ホスト関数の中から呼んだゲストの中。#73）では、[onFuelExhausted] と同じくスレッドを持ったまま待つ
      */
     private fun onFuelExhaustedUnwindable(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
         val unwindable = lock.withLockValue {
             verifyInstanceLocked(rt, instance)
             if (rt.killed) throw ProcessKilledException()
-            rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null
+            // ホスト関数の中からゲストを呼んでいる間（#73。cabi_realloc など）は、ホスト関数の途中を巻き戻せないので待つ
+            rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
         }
         if (!unwindable) return onFuelExhausted(rt, instance, remaining)
         if (instance.asyncState == WasmAsyncState.REWINDING) {
@@ -594,7 +595,7 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /**
      * `CRASHED` の理由（#41）。RAM の上限を超えた書き込みのトラップは上限を添え、`memory.grow` を RAM の上限で断った後の
-     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）。`kibi:memory` の `commit` を断った後も同じ（#408）
+     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）。`kibi:computer/memory` の `commit` を断った後も同じ（#408）
      */
     private fun processCrashReason(rt: ProcessRuntime, t: Throwable): String {
         if (t is WasmTrapException && t.kind == WasmTrapKind.OUT_OF_MEMORY) return outOfMemoryReason(rt.memory.effectiveLimitBytes)
@@ -603,7 +604,7 @@ internal class ProcessRunner(private val machine: Machine) {
         return if (note != null) "$reason ($note)" else reason
     }
 
-    /** `memory.grow`・`kibi:memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null` */
+    /** `memory.grow`・`kibi:computer/memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null` */
     private fun refusedMemoryNote(rt: ProcessRuntime): String? =
         memoryRefusedNote(rt.memoryGrowRefused, rt.memoryCommitRefused, rt.memory.effectiveLimitBytes)
 
@@ -649,7 +650,7 @@ internal class ProcessRunner(private val machine: Machine) {
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）
         machine.lifecycle.onFinishedLocked(rt)
         // init なら、マシンを止める（#49）
-        // 0 以外の終了コードで終わったプロセスが、その前に memory.grow・kibi:memory の commit を RAM の上限で断られていたら、そう添える（#407・#408）
+        // 0 以外の終了コードで終わったプロセスが、その前に memory.grow・kibi:computer/memory の commit を RAM の上限で断られていたら、そう添える（#407・#408）
         val exitNote = if (state == ProcessState.EXITED && exitCode != 0) refusedMemoryNote(rt) else null
         machine.onProcessFinishedLocked(process, rt.crashReason, exitNote)
         machine.checkAllDoneLocked()
@@ -1127,6 +1128,18 @@ internal class ProcessRunner(private val machine: Machine) {
             if (!committed) rt.memoryCommitRefused = true
             return committed
         }
+
+        override fun <T> callGuest(block: () -> T): T {
+            checkThread()
+            rt.guestCallDepth++
+            try {
+                return block()
+            } finally {
+                rt.guestCallDepth--
+            }
+        }
+
+        override val inGuestCall: Boolean get() = rt.guestCallDepth > 0
 
         override fun chargeFuel(amount: Long) {
             if (rt.process.unmetered) return

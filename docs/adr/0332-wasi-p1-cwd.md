@@ -38,7 +38,7 @@
 
 ### p1 のプログラムの `chdir` はカーネルの cwd に反映しない
 
-- wasi-libc の `chdir` はホストを呼ばないので、反映するにはカーネルの cwd を変える独自の import（ABI）が要る。ここでは足さない（必要になれば #73・#74）
+- wasi-libc の `chdir` はホストを呼ばないので、反映するにはカーネルの cwd を変える独自の import（ABI）が要る。ここでは足さない（必要になれば #73・#74。追記（#73）: ABI の決まりは ADR 0073、import は #74 で扱う）
 - 子プロセスの cwd は、プロセス生成の import（#74）で cwd を明示して渡せば足りる（SDK が `getcwd()` を渡す）
 - **#74 への申し送り**: `cwd` を省略したときは「親のカーネルの cwd」（ADR 0045 の既定）になる。p1 の親が `chdir` した後の値ではない
 - `ProcessContext.changeDirectory` は今のまま残す（Kotlin で書くプログラムと、将来の import のため）

@@ -1,0 +1,48 @@
+package kibi:kernel@0.1.0;
+
+/// カーネルのイベント（#63。ADR 0063）を受け取るキュー（#73。ADR 0073）。
+///
+/// p1 では、`event-queue` のハンドルはカーネルの fd 番号。`poll_oneoff` の `FD_READ` で、イベントが届く（か、あふれて捨てた分がある）まで待てる。
+/// p2 の `subscribe() -> pollable`・p3 の async は `wasi:io` に依存するので、#264・#266 で別の interface として足す。
+interface events {
+    use types.{error-code};
+
+    /// イベントの値（カーネルの `EventValue`）
+    variant event-value {
+        %s64(s64),
+        %f64(f64),
+        %bool(bool),
+        text(string),
+        bytes(list<u8>),
+    }
+
+    /// イベント1つ
+    record event {
+        /// 種類（`KernelEvent.type`。1..64 バイト）
+        kind: string,
+        /// 出したもの（デバイスの識別子など。なければ ""）
+        source: string,
+        /// 値（32 個まで）
+        values: list<event-value>,
+    }
+
+    /// `take` の結果
+    record event-batch {
+        /// 取り出したイベント（古い順）
+        events: list<event>,
+        /// 前回の取り出しから、あふれて捨てた数
+        dropped: u64,
+    }
+
+    /// イベントキュー。受け取る種類を決めて開き、待たずに取り出す。
+    resource event-queue {
+        /// キューを開く。kinds が空ならすべての種類を受け取る。
+        /// kinds は 16 個まで、それぞれ 1..64 バイトの UTF-8（外れれば invalid）。
+        /// capacity を省くと既定（仮の値 64。確定は #251）。1..256 の外は invalid。
+        /// マシンのキューの数が上限なら nfile、プロセスのハンドル表が満杯なら mfile。
+        open: static func(kinds: list<string>, capacity: option<u32>) -> result<event-queue, error-code>;
+
+        /// 待たずに最大 max 個取り出す（なければ空）。max は 1 以上（0 は invalid）。キューの容量より大きければ「全部」。
+        take: func(max: u32) -> result<event-batch, error-code>;
+    }
+}

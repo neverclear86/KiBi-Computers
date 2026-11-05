@@ -33,7 +33,7 @@ internal fun crashReason(t: Throwable): String = when (t) {
 internal fun outOfMemoryReason(limitBytes: Long): String = "out of memory (RAM limit ${formatBytes(limitBytes)})"
 
 /**
- * `memory.grow`（#407）や `kibi:memory` の `commit`（#408）を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文。
+ * `memory.grow`（#407）や `kibi:computer/memory` の `commit`（#408）を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文。
  * どちらも断っていなければ `null`。例:
  * - grow だけ: `memory.grow was refused: out of memory, RAM limit 128 KiB`
  * - commit だけ: `kibi:memory commit was refused: out of memory, RAM limit 128 KiB`

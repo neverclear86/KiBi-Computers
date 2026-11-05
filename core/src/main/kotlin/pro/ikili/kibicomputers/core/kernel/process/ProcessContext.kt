@@ -294,7 +294,7 @@ internal interface ProcessContext {
      */
     fun closeHostWait(wait: HostWait<*>)
 
-    // ---- RAM（#408。WASM に見せる形は `kibi:memory`） ----
+    // ---- RAM（#408。WASM に見せる形は `kibi:computer/memory`） ----
 
     /** 残りの RAM（バイト）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方。どのスレッドから呼んでもよい */
     fun memoryRemaining(): Long
@@ -309,6 +309,15 @@ internal interface ProcessContext {
 
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)
+
+    /**
+     * ホスト関数の中からゲストの export（`cabi_realloc` など。#73）を呼ぶときに、[block] を包む。包んでいる間は [inGuestCall] が立ち、
+     * 燃料が切れても巻き戻さず（待機点型でも）、スレッドを持ったまま燃料を待つ。入れ子にしてよい。プロセスのスレッドから呼ぶ
+     */
+    fun <T> callGuest(block: () -> T): T
+
+    /** [callGuest] の中か（ホスト関数の中からゲストを呼んでいる途中か）。プロセスのスレッドから読む */
+    val inGuestCall: Boolean
 
     /**
      * コンソールの TTY に書いたとき、そのカーネルロックの中で呼ぶ（#355・#419）。この後に [flushConsole] で書くと予約し、

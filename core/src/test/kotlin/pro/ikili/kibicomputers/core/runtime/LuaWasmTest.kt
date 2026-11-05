@@ -66,9 +66,9 @@ class LuaWasmTest {
         val exitCode = WasiPreview1.builder().withOptions(options).build().use { wasi ->
             val imports = ImportValues.builder()
                 .addFunction(*wasi.toHostFunctions())
-                // Lua のアロケーター（#409）が呼ぶ kibi:memory（#408）。ここでは RAM の上限を持たないので、いつも足りると答える
-                .addFunction(HostFunction("kibi", "memory_remaining", FunctionType.of(listOf(), listOf(ValType.I64))) { _, _ -> longArrayOf(Long.MAX_VALUE) })
-                .addFunction(HostFunction("kibi", "memory_commit", FunctionType.of(listOf(ValType.I32, ValType.I32, ValType.I64), listOf(ValType.I32))) { _, _ -> longArrayOf(1) })
+                // Lua のアロケーター（#409）が呼ぶ kibi:computer/memory（#408・#73）。ここでは RAM の上限を持たないので、いつも足りると答える
+                .addFunction(HostFunction("kibi:computer/memory@0.1.0", "remaining", FunctionType.of(listOf(), listOf(ValType.I64))) { _, _ -> longArrayOf(Long.MAX_VALUE) })
+                .addFunction(HostFunction("kibi:computer/memory@0.1.0", "commit", FunctionType.of(listOf(ValType.I32, ValType.I32, ValType.I64), listOf(ValType.I32))) { _, _ -> longArrayOf(1) })
                 .build()
             try {
                 Instance.builder(module).withImportValues(imports).build()

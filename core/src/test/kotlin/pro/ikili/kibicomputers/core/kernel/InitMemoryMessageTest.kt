@@ -68,7 +68,7 @@ class InitMemoryMessageTest {
                 .fuelMetered()
                 .memory(pages)
                 .import(P1.MODULE, "proc_exit", procExitType)
-                .import(WasiP1Kibi.MODULE, "memory_commit", WasiP1Kibi.typeOf("memory_commit")!!)
+                .import(WasiP1Kibi.MEMORY, "commit", WasiP1Kibi.typeOf(WasiP1Kibi.MEMORY, "commit")!!)
                 .export("_start", VOID) { ctx, _ ->
                     ctx.step(1)
                     body(ctx, results)
@@ -130,7 +130,7 @@ class InitMemoryMessageTest {
         // 残りは 1 区画。まだ数えていない最後の区画を、その後に 1 区画残して数えようとする
         val r = bootInit(page) { ctx, results ->
             ctx.memory.touch(0, 15)
-            results += ctx.callImport(WasiP1Kibi.MODULE, "memory_commit", 15L * chunk, chunk.toLong(), chunk.toLong())[0]
+            results += ctx.callImport(WasiP1Kibi.MEMORY, "commit", 15L * chunk, chunk.toLong(), chunk.toLong())[0]
             ctx.exit(2)
         }
         assertEquals(listOf(0L), r.results, "commit は断られる")
@@ -147,7 +147,7 @@ class InitMemoryMessageTest {
         val r = bootInit(page) { ctx, results ->
             ctx.memory.touch(0, 15)
             results += ctx.memory.grow(1).toLong()
-            results += ctx.callImport(WasiP1Kibi.MODULE, "memory_commit", 15L * chunk, chunk.toLong(), chunk.toLong())[0]
+            results += ctx.callImport(WasiP1Kibi.MEMORY, "commit", 15L * chunk, chunk.toLong(), chunk.toLong())[0]
             ctx.exit(3)
         }
         assertEquals(listOf(-1L, 0L), r.results)

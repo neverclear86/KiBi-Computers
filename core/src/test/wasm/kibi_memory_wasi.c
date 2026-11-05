@@ -1,4 +1,4 @@
-// 独自拡張 kibi:memory（#408）の p1 の import を、カーネルの上で確かめるプログラム。
+// 独自拡張 kibi:computer/memory（#408・#73）の p1 の import を、カーネルの上で確かめるプログラム。
 // 使い方:
 //   kibi-memory remaining <KiB> : remaining を出し、malloc した <KiB> に書いて、もう一度出す
 //   kibi-memory commit <KiB>    : malloc した範囲を commit(p, n, 0) し、前後の remaining を出す。続けて書き、remaining が変わらないことを出す
