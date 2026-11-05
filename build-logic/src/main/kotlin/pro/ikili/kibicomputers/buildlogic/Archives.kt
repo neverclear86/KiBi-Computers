@@ -117,7 +117,8 @@ internal object Archives {
         Files.newOutputStream(path).use { input.copyTo(it) }
     }
 
-    private fun makeExecutable(path: Path) {
+    /** [path] に実行の権限を付ける（POSIX の権限を持たないファイルシステムでは何もしない）。 */
+    fun makeExecutable(path: Path) {
         runCatching {
             val perms = Files.getPosixFilePermissions(path) + setOf(
                 PosixFilePermission.OWNER_EXECUTE,

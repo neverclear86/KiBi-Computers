@@ -123,6 +123,8 @@ internal object MoonBitInstaller {
                     if (!Files.isRegularFile(bin.resolve(dist.moonExecutable))) {
                         throw GradleException("展開した MoonBit に bin/${dist.moonExecutable} がありません: ${dist.url}")
                     }
+                    // アーカイブの bin の中身は実行の権限を持たない。公式のインストーラーと同じく、全部に付ける
+                    Files.walk(bin).use { paths -> paths.filter { Files.isRegularFile(it) }.forEach(Archives::makeExecutable) }
                     // 標準ライブラリのアーカイブは core/ を先頭に持つ。lib/core に置く
                     val core = staging.resolve("lib/core")
                     Archives.deleteRecursively(core)
