@@ -14,11 +14,16 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.stateOf
+import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -31,11 +36,21 @@ class WasiP1PathProgramTest {
     }
 
     @Test
-    fun `wasi-libcのパスの操作がpathの関数を通って動く`() = timeout(Duration.ofSeconds(60)) {
+    fun `wasi-libcのパスの操作がpathの関数を通って動く`() = runPathProgram(TestMemoryFileSystem())
+
+    @Test
+    fun `ホストのディレクトリのディスクでも同じに動き、書いたものがすぐホストに見える`(@TempDir dir: Path) {
+        val fs = DiskFileSystem.open(dir.resolve("disk"))
+        runPathProgram(fs)
+        assertEquals("xyz", Files.readString(dir.resolve("disk/data/b.txt")))
+        fs.retire()
+    }
+
+    private fun runPathProgram(root: FileSystem) = timeout(Duration.ofSeconds(60)) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
             val output = run {
-                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                m.vfs.mount(VfsPath.ROOT, root, readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/data"))
                 val f = m.vfs.open(VfsPath.parse("/data/a.txt"), OpenOptions(read = true, write = true, create = true))
                 m.vfs.write(f, "abcde".toByteArray(), 0, 5)

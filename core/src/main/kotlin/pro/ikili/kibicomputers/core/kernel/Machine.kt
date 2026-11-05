@@ -50,6 +50,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
@@ -219,6 +220,9 @@ public class Machine private constructor(
     internal val vfs = Vfs(kernel.mounts) { lock.isHeldByCurrentThread }.also { v ->
         v.onDeferred = { scheduleVfsDrain() }
     }
+
+    /** このマシンが開いたままにできるホストのファイルの枠（ディスク。#52） */
+    internal val hostFiles = HostFileBudget()
 
     /** [vfs] の後で行う知らせを、起動用のスレッドに積んだか（積むのは1つだけ） */
     private val vfsDrainScheduled = AtomicBoolean()
@@ -1977,6 +1981,18 @@ internal object MachineLimits {
 
     /** `/tmp` をマウントする場所 */
     internal val TMP_PATH: VfsPath = VfsPath.parse("/tmp")
+
+    /** ホストのディレクトリのディスク（#52）1つの容量（バイト。仮の値。ディスクの種類ごとの値は #124、確定は #251） */
+    internal const val DISK_CAPACITY_BYTES: Long = 2L * 1024 * 1024
+
+    /** ディスク1つのファイル・ディレクトリの数の上限（根を除く。仮の値。確定は #251） */
+    internal const val DISK_MAX_ENTRIES: Int = 4096
+
+    /** マシン1台が開いたままにできるホストのファイルの数（#52。CC: Tweaked の既定と同じ。仮の値。確定は #251） */
+    internal const val HOST_FILES_PER_MACHINE: Int = 128
+
+    /** サーバー全体で開いたままにできるホストのファイルの数（#52。仮の値。確定は #251） */
+    internal const val HOST_FILES_TOTAL: Int = 2048
 }
 
 /**
