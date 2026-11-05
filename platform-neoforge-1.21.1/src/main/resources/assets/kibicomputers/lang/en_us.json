@@ -36,5 +36,13 @@
   "item.kibicomputers.creative_case": "Creative Computer Case (All Parts)",
   "tooltip.kibicomputers.part.cpu": "Fuel per tick: %s",
   "tooltip.kibicomputers.part.memory": "Capacity: %s MiB",
-  "tooltip.kibicomputers.part.creative": "For testing (creative only)"
+  "tooltip.kibicomputers.part.creative": "For testing (creative only)",
+  "item.kibicomputers.storage_1": "Hard Disk (Tier 1)",
+  "item.kibicomputers.storage_2": "Hard Disk (Tier 2)",
+  "item.kibicomputers.storage_3": "Hard Disk (Tier 3)",
+  "item.kibicomputers.storage_4": "Hard Disk (Tier 4)",
+  "tooltip.kibicomputers.part.storage": "Capacity: %s MiB, %s entries",
+  "tooltip.kibicomputers.disk.id": "Disk ID: %s",
+  "tooltip.kibicomputers.disk.uninitialized": "Not initialized (gets an ID when the computer turns on)",
+  "tooltip.kibicomputers.disk.invalid_id": "Invalid disk ID (ignored)"
 }

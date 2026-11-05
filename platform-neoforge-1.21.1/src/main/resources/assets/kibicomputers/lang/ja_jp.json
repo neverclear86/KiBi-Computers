@@ -36,5 +36,13 @@
   "item.kibicomputers.creative_case": "クリエイティブコンピューターケース（部品入り）",
   "tooltip.kibicomputers.part.cpu": "1 tick の燃料: %s",
   "tooltip.kibicomputers.part.memory": "容量: %s MiB",
-  "tooltip.kibicomputers.part.creative": "検証用（クリエイティブ専用）"
+  "tooltip.kibicomputers.part.creative": "検証用（クリエイティブ専用）",
+  "item.kibicomputers.storage_1": "ハードディスク（ティア1）",
+  "item.kibicomputers.storage_2": "ハードディスク（ティア2）",
+  "item.kibicomputers.storage_3": "ハードディスク（ティア3）",
+  "item.kibicomputers.storage_4": "ハードディスク（ティア4）",
+  "tooltip.kibicomputers.part.storage": "容量: %s MiB、%s 項目",
+  "tooltip.kibicomputers.disk.id": "ディスクID: %s",
+  "tooltip.kibicomputers.disk.uninitialized": "未初期化（コンピューターの電源を入れると ID が付く）",
+  "tooltip.kibicomputers.disk.invalid_id": "ディスクIDが正しくない（使わない）"
 }

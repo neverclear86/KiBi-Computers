@@ -478,7 +478,7 @@ class BootTest {
         Files.write(diskDir.resolve("sbin/init"), exe(foreverInit()))
         Files.createDirectories(dir.resolve("empty"))
         val leases = HostDiskLeases.size
-        h.scheduler.hooks.bootVolumes = BootVolumeOpener.forDisks({ id -> dir.resolve(id).takeIf { id == "d1" || id == "empty" } }, m.hostFiles)
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener.forDisks({ id -> dir.resolve(id).takeIf { id == "d1" || id == "empty" }?.let { ResolvedDisk(it, 1L shl 20, 1024) } }, m.hostFiles)
         assertTrue(m.boot(bootDisks("missing", "empty", "d1")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
         assertEquals(listOf("/" to "disk:d1", "/tmp" to "tmp"), mounts())
@@ -495,6 +495,28 @@ class BootTest {
         val e = assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/hello.txt")) }
         assertEquals(Errno.IO, e.errno, "止めたら古いカーネルからの操作は断る")
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
+    }
+
+    @Test
+    fun `ResolvedDiskの容量がディスクのFSの割り当てに効き、超える書き込みはNOSPC`(@TempDir dir: Path) = env {
+        val diskDir = Files.createDirectories(dir.resolve("d1/sbin")).parent
+        val init = exe(foreverInit())
+        Files.write(diskDir.resolve("sbin/init"), init)
+        // sbin・sbin/init・hello.txt の 3 項目分と init の中身、あと 100 バイトだけ使える
+        val capacity = init.size + 3 * 256L + 100
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener.forDisks({ id -> if (id == "d1") ResolvedDisk(diskDir, capacity, 16) else null }, m.hostFiles)
+        assertTrue(m.boot(bootDisks("d1")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        val f = m.vfs.open(VfsPath.parse("/hello.txt"), OpenOptions(read = true, write = true, create = true))
+        try {
+            m.vfs.write(f, ByteArray(100), 0, 100)
+            val e = assertThrows<FsException> { m.vfs.write(f, ByteArray(1), 0, 1) }
+            assertEquals(Errno.NOSPC, e.errno)
+        } finally {
+            m.vfs.close(f)
+        }
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
     }
 
     private fun Env.initPid(): Int = m.lock.withLockValue { m.kernel.initPid }

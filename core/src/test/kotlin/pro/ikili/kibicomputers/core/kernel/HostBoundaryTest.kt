@@ -62,7 +62,7 @@ class HostBoundaryTest {
             val env = MachineEnvironment.builder()
                 .clock(clock)
                 .entropy { it.fill(7) }
-                .disks { id -> if (id == "a") Paths.get("disk-a") else null }
+                .disks { id -> if (id == "a") ResolvedDisk(Paths.get("disk-a"), 1024, 16) else null }
                 .storageDirectory(Paths.get("save"))
                 .build()
             val m = h.machine(environment = env)
@@ -71,7 +71,7 @@ class HostBoundaryTest {
             h.tickUntil { m.stateOf(pid) == ProcessState.EXITED }
             assertSame(env, seen.get())
             assertEquals(3, env.clock.worldTicks())
-            assertEquals(Paths.get("disk-a"), env.disks.resolve("a"))
+            assertEquals(Paths.get("disk-a"), env.disks.resolve("a")?.directory)
             assertEquals(null, env.disks.resolve("b"))
             assertEquals(Paths.get("save"), env.storageDirectory)
             val bytes = ByteArray(4).also { env.entropy.fill(it) }

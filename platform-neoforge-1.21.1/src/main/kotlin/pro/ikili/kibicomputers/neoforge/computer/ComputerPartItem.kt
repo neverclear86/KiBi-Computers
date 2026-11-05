@@ -12,15 +12,16 @@ import pro.ikili.kibicomputers.core.computer.PartTier
 /**
  * ケースに挿す部品のアイテム（#347）。種類（[kind]）とティア（[tier]）で性能が決まる（[PartTier]）。
  *
- * ケースのスロットに挿せるかは、アイテムタグ（[CaseParts.tagOf]）で決まる。登録名は `<ティア>_<種類>`（[idOf]）。
- * 説明欄に性能（CPU の燃料、RAM の容量）を出す。
+ * ケースのスロットに挿せるかは、アイテムタグ（[CaseParts.tagOf]）で決まる。登録名は [idOf]。
+ * 説明欄に性能（CPU の燃料、RAM・ディスクの容量）を出す。ディスクは [DiskItem]。
  */
-class ComputerPartItem(val kind: PartKind, val tier: PartTier, properties: Properties) : Item(properties) {
+open class ComputerPartItem(val kind: PartKind, val tier: PartTier, properties: Properties) : Item(properties) {
     override fun appendHoverText(stack: ItemStack, context: TooltipContext, tooltip: MutableList<Component>, flag: TooltipFlag) {
         super.appendHoverText(stack, context, tooltip, flag)
         val line = when (kind) {
             PartKind.CPU -> Component.translatable("$TOOLTIP.cpu", tier.cpuFuelPerTick)
             PartKind.MEMORY -> Component.translatable("$TOOLTIP.memory", tier.memoryBytes / (1024 * 1024))
+            PartKind.STORAGE -> Component.translatable("$TOOLTIP.storage", tier.diskBytes / (1024 * 1024), tier.diskEntries)
             else -> null
         }
         line?.let { tooltip.add(it.withStyle(ChatFormatting.GRAY)) }
@@ -30,7 +31,8 @@ class ComputerPartItem(val kind: PartKind, val tier: PartTier, properties: Prope
     companion object {
         private const val TOOLTIP = "tooltip.${KiBiComputers.MOD_ID}.part"
 
-        /** 部品の登録名（例: `creative_cpu`） */
-        fun idOf(kind: PartKind, tier: PartTier): String = "${tier.name.lowercase()}_${kind.name.lowercase()}"
+        /** 部品の登録名。正式なティアは `<種類>_<番号>`（例: `storage_1`）、検証用は `creative_<種類>`（例: `creative_cpu`） */
+        fun idOf(kind: PartKind, tier: PartTier): String =
+            if (tier == PartTier.CREATIVE) "creative_${kind.name.lowercase()}" else "${kind.name.lowercase()}_${tier.level}"
     }
 }

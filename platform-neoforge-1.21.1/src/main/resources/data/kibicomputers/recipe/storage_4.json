@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": [
+    "MRM",
+    "RDR",
+    "MRM"
+  ],
+  "key": {
+    "M": {
+      "item": "minecraft:netherite_ingot"
+    },
+    "R": {
+      "item": "minecraft:redstone"
+    },
+    "D": {
+      "item": "kibicomputers:storage_3"
+    }
+  },
+  "result": {
+    "id": "kibicomputers:storage_4",
+    "count": 1
+  }
+}
