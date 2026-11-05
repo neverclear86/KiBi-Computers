@@ -56,18 +56,21 @@ internal object Archives {
     private fun stripFirst(entryName: String): String? =
         entryName.replace('\\', '/').substringAfter('/', "").trimEnd('/').ifEmpty { null }
 
+    private fun relativeName(entryName: String, strip: Boolean): String? =
+        if (strip) stripFirst(entryName) else entryName.replace('\\', '/').trimStart('/').trimEnd('/').ifEmpty { null }
+
     private fun resolveInside(dir: Path, relative: String): Path {
         val path = dir.resolve(relative).normalize()
         if (!path.startsWith(dir)) throw GradleException("アーカイブに不正なパスがあります: $relative")
         return path
     }
 
-    /** zip を、先頭のディレクトリを取り除いて [dir] に展開する。 */
-    fun extractZip(archive: Path, dir: Path) {
+    /** zip を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。 */
+    fun extractZip(archive: Path, dir: Path, stripFirst: Boolean = true) {
         ZipInputStream(BufferedInputStream(Files.newInputStream(archive))).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
+                val relative = relativeName(entry.name, stripFirst) ?: continue
                 val path = resolveInside(dir, relative)
                 if (entry.isDirectory) {
                     Files.createDirectories(path)
@@ -83,16 +86,16 @@ internal object Archives {
         extractTar(XZInputStream(BufferedInputStream(Files.newInputStream(archive))), dir)
     }
 
-    /** .tar.gz を、先頭のディレクトリを取り除いて [dir] に展開する。 */
-    fun extractTarGz(archive: Path, dir: Path) {
-        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir)
+    /** .tar.gz を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。 */
+    fun extractTarGz(archive: Path, dir: Path, stripFirst: Boolean = true) {
+        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir, stripFirst)
     }
 
-    private fun extractTar(input: InputStream, dir: Path) {
+    private fun extractTar(input: InputStream, dir: Path, stripFirst: Boolean = true) {
         TarArchiveInputStream(input).use { tar ->
             while (true) {
                 val entry = tar.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
+                val relative = relativeName(entry.name, stripFirst) ?: continue
                 val path = resolveInside(dir, relative)
                 when {
                     entry.isDirectory -> Files.createDirectories(path)

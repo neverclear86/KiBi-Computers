@@ -37,6 +37,12 @@ jobs:
           path: ~/.gradle/kibicomputers/downloads
           key: wasm-sources-${{ hashFiles('gradle/lua.properties') }}
 
+      # 標準 OS の言語の PoC（#32）の MoonBit（gradle/moonbit.properties で固定）。CI でだけビルドし、Gradle が取得して ~/.gradle/kibicomputers/moonbit に置く
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/moonbit
+          key: moonbit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/moonbit.properties') }}
+
       - name: Build and test
         run: ./gradlew build --console=plain
 
