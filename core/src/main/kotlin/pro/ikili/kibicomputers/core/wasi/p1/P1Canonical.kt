@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
@@ -14,12 +15,14 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
 /**
- * p1 向けの独自拡張の import（#73。ADR 0073 の Q2-B）に要る、Canonical ABI の最小限の lift・lower。
+ * p1 向けの独自拡張の import（#73。ADR 0073 の Q2-B）に要る、Canonical ABI の最小限の lift・lower（`kibi:io` は #75）。
  * Component Model の層（#264）ができたら置き換える。
  *
  * 配置は Canonical ABI どおり（リトルエンディアン、wasm32）:
  * - `list<T>`・`string`: `{ ptr: i32 @0, len: i32 @4 }`（8 / 4）
- * - `result<own<_>, error-code>`: `{ tag: u8 @0, payload @4 }`（ok ならハンドル i32、err なら判別子 u8。8 / 4）
+ * - `result<own<_>, error-code>`・`result<u32, error-code>`: `{ tag: u8 @0, payload @4 }`（ok ならハンドル・値 i32、err なら判別子 u8。8 / 4）
+ * - `result<_, error-code>`: `{ tag: u8 @0, err: u8 @1 }`（2 / 1）
+ * - `result<pipe-ends, error-code>`: `{ tag: u8 @0, ok: { read: u32 @4, write: u32 @8 } | err: u8 @4 }`（12 / 4）
  * - `result<event-batch, error-code>`: `{ tag: u8 @0, ok: { events.ptr @8, events.len @12, dropped: u64 @16 } | err: u8 @8 }`（24 / 8）
  * - `event`: `{ kind @0, source @8, values @16 }`（24 / 4）
  * - `event-value`: `{ tag: u8 @0, payload @8 }`（s64・f64 は 8 バイト、bool は u8、text・bytes は (ptr, len)。16 / 8）
@@ -36,6 +39,14 @@ internal object P1Canonical {
     /** `result<own<_>, error-code>` の大きさ・align */
     const val HANDLE_RESULT_SIZE: Int = 8
     const val HANDLE_RESULT_ALIGN: Int = 4
+
+    /** `result<_, error-code>` の大きさ・align */
+    const val UNIT_RESULT_SIZE: Int = 2
+    const val UNIT_RESULT_ALIGN: Int = 1
+
+    /** `result<pipe-ends, error-code>`（`kibi:io/pipe.create`）の大きさ・align */
+    const val PIPE_RESULT_SIZE: Int = 12
+    const val PIPE_RESULT_ALIGN: Int = 4
 
     /** `result<event-batch, error-code>` の大きさ・align */
     const val BATCH_RESULT_SIZE: Int = 24
@@ -93,6 +104,26 @@ internal object P1Canonical {
         if (handle != null) {
             memory.writeU8(retPtr, 0)
             memory.writeI32(retPtr + 4, handle)
+        } else {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 4, error)
+        }
+    }
+
+    /** `result<_, error-code>` を [retPtr] に書く。[error] が `null` なら ok（err の場所は 0 にする）、そうでなければ err（判別子） */
+    fun lowerUnitResult(memory: WasmMemory, retPtr: Int, error: Int?) {
+        checkStore(memory, retPtr, UNIT_RESULT_SIZE, UNIT_RESULT_ALIGN)
+        memory.writeU8(retPtr, if (error == null) 0 else 1)
+        memory.writeU8(retPtr + 1, error ?: 0)
+    }
+
+    /** `result<pipe-ends, error-code>` を [retPtr] に書く。[ends] が `null` なら err（[error] は判別子） */
+    fun lowerPipeResult(memory: WasmMemory, retPtr: Int, ends: PipeFds?, error: Int) {
+        checkStore(memory, retPtr, PIPE_RESULT_SIZE, PIPE_RESULT_ALIGN)
+        if (ends != null) {
+            memory.writeU8(retPtr, 0)
+            memory.writeI32(retPtr + 4, ends.read)
+            memory.writeI32(retPtr + 8, ends.write)
         } else {
             memory.writeU8(retPtr, 1)
             memory.writeU8(retPtr + 4, error)

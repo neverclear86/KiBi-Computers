@@ -38,6 +38,9 @@ dependencies {
 
     // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
     testImplementation(libs.endive.wasi)
+    // WIT（src/main/wit）を wasm-tools で解析するテスト（KibiWitParseTest。#75）。テストだけで使い、jarJar には入れない
+    testImplementation(libs.endive.wasm.tools)
+    testImplementation(libs.zerofs)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
@@ -134,6 +137,12 @@ kibiWasm {
     // 独自拡張 kibi:kernel/events（#73）の p1 の import と cabi_realloc の呼び出しを確かめる CLI
     module("kibi-events-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_events.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:io/fd・kibi:io/pipe（#75）の p1 の import を確かめる CLI
+    module("kibi-io-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_io.c")
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }

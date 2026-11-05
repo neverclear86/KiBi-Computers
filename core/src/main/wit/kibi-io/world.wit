@@ -1,0 +1,17 @@
+package kibi:io@0.1.0;
+
+/// p1 のゲスト向け（wasi:* を参照しない）。`kibi:io` の p1 の interface をまとめて import する
+world imports {
+    import fd;
+    import pipe;
+}
+
+/// p2 のゲスト向け（仮置き。ADR 0075）
+world imports-p2 {
+    import pipe-streams;
+}
+
+/// p3 のゲスト向け（仮置き。ADR 0075）
+world imports-p3 {
+    import pipe-async;
+}

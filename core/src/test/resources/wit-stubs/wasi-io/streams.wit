@@ -1,0 +1,8 @@
+// KibiWitParseTest（#75）が kibi:* の WIT を wasm-tools で解析するためだけの、wasi:io/streams の最小のスタブ。
+// 本物の WIT ではない（kibi:* が参照する型の名前だけを置く）。src/main/wit には置かない。
+package wasi:io@0.2.3;
+
+interface streams {
+    resource input-stream;
+    resource output-stream;
+}

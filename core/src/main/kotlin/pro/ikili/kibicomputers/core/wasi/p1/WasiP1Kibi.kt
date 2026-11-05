@@ -13,10 +13,11 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiIo
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
 
 /**
- * 独自拡張（`kibi:*` の WIT。`core/src/main/wit/`）を p1 のプロセスに import として出す層（#408・#73。ADR 0073）。
+ * 独自拡張（`kibi:*` の WIT。`core/src/main/wit/`）を p1 のプロセスに import として出す層（#408・#73・#75。ADR 0073・0075）。
  *
  * import は WIT から Canonical ABI の core の形そのままに導く（Q2-B）: モジュール名は `<ns>:<pkg>/<interface>@<版>`、
  * 関数名は wit-bindgen と同じ（`[static]`・`[method]`・`[resource-drop]`）。可変長の結果はゲストの `cabi_realloc` で場所を取る。
@@ -29,6 +30,11 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
  * | [EVENTS] | `[resource-drop]event-queue` | `(self: i32) -> ()` |
  * | [MEMORY] | `remaining` | `() -> i64` |
  * | [MEMORY] | `commit` | `(ptr, len: i32, keep: i64) -> i32` |
+ * | [IO_FD] | `dup` | `(fd, ret_ptr: i32) -> ()` |
+ * | [IO_FD] | `dup-to` | `(fd, to, ret_ptr: i32) -> ()` |
+ * | [IO_PIPE] | `create` | `(ret_ptr: i32) -> ()` |
+ *
+ * `kibi:io` の p2・p3 だけの interface（`pipe-streams`・`pipe-async`）は出さない（表にないので、import すると `NOEXEC`）。
  *
  * どれも待たないので、待機点への変換で止まりうる関数（[WasiP1.WAIT_IMPORTS]）には入れない。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数。
@@ -39,6 +45,12 @@ internal object WasiP1Kibi {
 
     /** `kibi:computer/memory` のモジュール名 */
     const val MEMORY: String = "kibi:computer/memory@0.1.0"
+
+    /** `kibi:io/fd` のモジュール名 */
+    const val IO_FD: String = "kibi:io/fd@0.1.0"
+
+    /** `kibi:io/pipe` のモジュール名 */
+    const val IO_PIPE: String = "kibi:io/pipe@0.1.0"
 
     /** 独自拡張のモジュール名の始まり（これで始まるモジュールは [typeOf] の表で確かめる） */
     const val PREFIX: String = "kibi:"
@@ -65,6 +77,9 @@ internal object WasiP1Kibi {
     private val NONE = LongArray(0)
 
     private fun Long.i(): Int = toInt()
+
+    /** `u32` の引数を符号なしで広げる */
+    private fun Long.u32(): Long = this and 0xffff_ffffL
 
     private fun memoryOf(caller: WasmInstance): WasmMemory =
         caller.memory ?: throw WasmTrapException(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, "線形メモリを export していない")
@@ -111,6 +126,39 @@ internal object WasiP1Kibi {
             val memory = caller.memory
             val ok = memory != null && KibiMemory.commit(ctx, memory, a[0].toInt(), a[1].toInt(), a[2])
             longArrayOf(if (ok) 1L else 0L)
+        },
+        Fn(IO_FD, "dup", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val fd = try {
+                KibiIo.dup(ctx, a[0].u32())
+            } catch (e: FsException) {
+                P1Canonical.lowerHandleResult(memory, a[1].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerHandleResult(memory, a[1].i(), fd, 0)
+            NONE
+        },
+        Fn(IO_FD, "dup-to", WasmFunctionType.of(listOf(I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                KibiIo.dupTo(ctx, a[0].u32(), a[1].u32())
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[2].i(), error)
+            NONE
+        },
+        Fn(IO_PIPE, "create", WasmFunctionType.of(listOf(I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val ends = try {
+                KibiIo.pipe(ctx)
+            } catch (e: FsException) {
+                P1Canonical.lowerPipeResult(memory, a[0].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerPipeResult(memory, a[0].i(), ends, 0)
+            NONE
         },
     )
 

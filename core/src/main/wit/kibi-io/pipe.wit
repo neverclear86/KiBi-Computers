@@ -1,0 +1,20 @@
+package kibi:io@0.1.0;
+
+/// パイプ（#59・#75。ADR 0059・0075）。p1 だけ。p2/p3 では pipe-streams・pipe-async を使う。
+/// 読む端は fd_read・poll_oneoff の FD_READ、書く端は fd_write・FD_WRITE で使う（向きの違う使い方は bad-descriptor）。
+/// 書く端をすべて閉じると読む側は残りを読んだ後に EOF、読む端をすべて閉じると書く側は pipe。
+interface pipe {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// パイプの両端の fd
+    record pipe-ends {
+        /// 読む端（権利は READ だけ）
+        read: u32,
+        /// 書く端（権利は WRITE だけ）
+        write: u32,
+    }
+
+    /// パイプを作る。バッファの大きさは既定（仮の値 4096 バイト。確定は #251）。
+    /// 両端は小さい空き番号から順に入れる。空き番号が2つなければ、何も作らずに mfile
+    create: func() -> result<pipe-ends, error-code>;
+}

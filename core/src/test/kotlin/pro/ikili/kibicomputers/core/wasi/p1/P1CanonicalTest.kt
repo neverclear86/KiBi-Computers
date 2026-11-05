@@ -8,6 +8,7 @@ import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.FakeMemory
@@ -237,5 +238,46 @@ class P1CanonicalTest {
             assertThrows<WasmTrapException> { P1Canonical.lowerBatchResult(FakeMemory(1), BumpRealloc(outside = true), 0x100, batch, 0) }.kind,
         )
         assertThrows<WasmTrapException> { P1Canonical.lowerBatchResult(FakeMemory(1), BumpRealloc(misalign = true), 0x100, batch, 0) }
+    }
+
+    // ---- kibi:io（#75） ----
+
+    @Test
+    fun `result_unitはtagが0でerrの場所も0、errなら判別子をオフセット1に書く`() {
+        assertEquals(2, P1Canonical.UNIT_RESULT_SIZE)
+        assertEquals(1, P1Canonical.UNIT_RESULT_ALIGN)
+        val m = FakeMemory(1)
+        m.write(0x101, byteArrayOf(0x55, 0x55, 0x55))
+        P1Canonical.lowerUnitResult(m, 0x101, null)
+        assertArrayEquals(byteArrayOf(0, 0, 0x55), m.read(0x101, 3))
+        P1Canonical.lowerUnitResult(m, 0x101, 7)
+        assertArrayEquals(byteArrayOf(1, 7, 0x55), m.read(0x101, 3))
+    }
+
+    @Test
+    fun `result_pipe-endsはreadをオフセット4、writeを8に書き、errなら判別子を4に書く`() {
+        assertEquals(12, P1Canonical.PIPE_RESULT_SIZE)
+        assertEquals(4, P1Canonical.PIPE_RESULT_ALIGN)
+        val m = FakeMemory(1)
+        P1Canonical.lowerPipeResult(m, 0x100, PipeFds(3, 7), 0)
+        assertEquals(0, m.readU8(0x100))
+        assertEquals(3, m.readI32(0x104))
+        assertEquals(7, m.readI32(0x108))
+        P1Canonical.lowerPipeResult(m, 0x200, null, 32)
+        assertEquals(1, m.readU8(0x200))
+        assertEquals(32, m.readU8(0x204))
+    }
+
+    @Test
+    fun `kibi_ioの結果の書き先が線形メモリの外か揃っていなければトラップ`() {
+        val m = FakeMemory(1)
+        val end = WasmMemory.PAGE_SIZE
+        fun kind(block: () -> Unit) = assertThrows<WasmTrapException> { block() }.kind
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerUnitResult(m, end - 1, null) })
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerUnitResult(m, -1, 7) })
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerPipeResult(m, end - 8, PipeFds(0, 1), 0) })
+        assertEquals(WasmTrapKind.OTHER, kind { P1Canonical.lowerPipeResult(m, 0x102, PipeFds(0, 1), 0) })
+        // 書き先の誤りでは何も書かない
+        assertEquals(0, m.readU8(0x102))
     }
 }

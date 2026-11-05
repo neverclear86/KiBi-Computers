@@ -1,0 +1,14 @@
+package kibi:io@0.1.0;
+
+/// fd の複製（#75。ADR 0075）。p1 だけ（p2/p3 では使わない）。fd はカーネルの fd 番号（p1 の fd と同じ番号）。
+/// 複製した fd は同じオブジェクトを指し、ファイルの位置やストリームの中身を共有する。権利と fd のフラグ（NONBLOCK など）も写す。
+interface fd {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// いちばん小さい空き番号に複製する（POSIX の dup）。開いていなければ bad-descriptor、表が満杯なら mfile
+    dup: func(fd: u32) -> result<u32, error-code>;
+
+    /// fd を to に複製する（POSIX の dup2）。to が開いていれば閉じてから。fd と to が同じなら、開いているか確かめるだけ。
+    /// fd が開いていない、to が範囲外なら bad-descriptor（このとき to は閉じない）
+    dup-to: func(fd: u32, to: u32) -> result<_, error-code>;
+}
