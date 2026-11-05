@@ -38,13 +38,15 @@ fun main() {
     val lua = File(requireNotNull(System.getProperty("kibi.luaWasm")) { "kibi.luaWasm がない" }).readBytes()
     val adapterFile = File(requireNotNull(System.getProperty("kibi.adapter")) { "kibi.adapter がない" })
     val adapter = adapterFile.readBytes()
+    // lua.wasm の kibi.memory_* の import（#409）を、コンポーネントの中で満たすアダプタ（#415）
+    val kibiAdapter = WasmTools.parseCore(KibiMemoryStub.ADAPTER_WAT.trimIndent())
     println("java.version=${System.getProperty("java.version")}")
     println("lua.wasm ${"%.1f".format(lua.size / 1024.0)} KiB / アダプタ ${adapterFile.name} ${"%.1f".format(adapter.size / 1024.0)} KiB")
 
     println()
     println("== 1. 包む（wasm-tools component new --adapt）")
     var component = ByteArray(0)
-    val adaptMs = (1..3).map { timeMs { component = WasmTools.adapt(lua, adapter) } }
+    val adaptMs = (1..3).map { timeMs { component = WasmTools.adapt(lua, adapter, mapOf("kibi" to kibiAdapter)) } }
     println("component new: 1回目 %.0f ms、2・3回目 %.0f / %.0f ms".format(adaptMs[0], adaptMs[1], adaptMs[2]))
     println("コンポーネント ${"%.1f".format(component.size / 1024.0)} KiB（lua.wasm より +${"%.1f".format((component.size - lua.size) / 1024.0)} KiB）")
     val validateMs = (1..3).map { timeMs { ComponentValidate.validate(ByteArrayInputStream(component), "cm-implements") } }
@@ -74,7 +76,7 @@ fun main() {
     println("== 2. インスタンス生成（_start を呼ばない。中央値）")
     val instA = median(10, 41) {
         WasiPreview1.builder().withOptions(WasiOptions.builder().build()).build().use { wasi ->
-            engineA(ImportValues.builder().addFunction(*wasi.toHostFunctions()).build())
+            engineA(p1Imports(wasi.toHostFunctions().toList()))
         }
     }
     val instB = median(10, 41) {
@@ -108,7 +110,7 @@ fun main() {
     println()
     println("== 5. 状態（実行後）")
     WasiPreview1.builder().withOptions(WasiOptions.builder().withArguments(listOf("lua", "-")).withStdin(ByteArrayInputStream(ByteArray(0))).build()).build().use { wasi ->
-        val inst = engineA(ImportValues.builder().addFunction(*wasi.toHostFunctions()).build())
+        val inst = engineA(p1Imports(wasi.toHostFunctions().toList()))
         runCatching { inst.export("_start").apply() }
         println("A: コアインスタンス 1 個、線形メモリ ${inst.memory().pages()} ページ、グローバル ${inst.globalCount()} 個（ほかはホストの fd 表）")
     }
@@ -159,7 +161,7 @@ private fun runA(engine: (ImportValues) -> Instance, script: String): Pair<Strin
                 f.handle().apply(inst, *args)
             }
         }
-        val instance = engine(ImportValues.builder().addFunction(*functions.toTypedArray()).build())
+        val instance = engine(p1Imports(functions))
         val exit = try {
             instance.export("_start").apply()
             0
@@ -170,6 +172,10 @@ private fun runA(engine: (ImportValues) -> Instance, script: String): Pair<Strin
     }
     return stdout.toString(Charsets.UTF_8) to calls
 }
+
+/** A の import: p1 のホスト関数と、kibi.memory_* の代わり（#415） */
+private fun p1Imports(wasi: List<run.endive.runtime.HostFunction>): ImportValues =
+    ImportValues.builder().addFunction(*(wasi + KibiMemoryStub.hostFunctions()).toTypedArray()).build()
 
 /** B: アダプタで包んだコンポーネントを p2 の実装で動かす。標準出力を返す */
 private fun runB(component: WasmComponent, store: ComponentStore, script: String): String {

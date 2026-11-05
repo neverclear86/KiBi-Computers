@@ -62,11 +62,17 @@ object WasmTools {
             Result(exit, out, stdout.toString(Charsets.UTF_8), stderr.toString(Charsets.UTF_8))
         }
 
-    /** p1 のモジュールを、公式の `wasi_snapshot_preview1` アダプタでコンポーネントに包む */
-    fun adapt(module: ByteArray, adapter: ByteArray): ByteArray {
+    /**
+     * p1 のモジュールを、公式の `wasi_snapshot_preview1` アダプタでコンポーネントに包む。
+     * `extraAdapters` は、ほかの import モジュール名（例: `kibi`）を満たすアダプタ（モジュール名 → コアモジュール）。
+     */
+    fun adapt(module: ByteArray, adapter: ByteArray, extraAdapters: Map<String, ByteArray> = emptyMap()): ByteArray {
+        val extraFiles = extraAdapters.entries.mapIndexed { i, (name, bytes) -> Triple(name, "adapter-$i.wasm", bytes) }
         val r = run(
-            listOf("component", "new", "{module.wasm}", "--adapt", "wasi_snapshot_preview1={adapter.wasm}", "-o", "{out.wasm}"),
-            mapOf("module.wasm" to module, "adapter.wasm" to adapter),
+            listOf("component", "new", "{module.wasm}", "--adapt", "wasi_snapshot_preview1={adapter.wasm}") +
+                extraFiles.flatMap { (name, file, _) -> listOf("--adapt", "$name={$file}") } +
+                listOf("-o", "{out.wasm}"),
+            mapOf("module.wasm" to module, "adapter.wasm" to adapter) + extraFiles.associate { (_, file, bytes) -> file to bytes },
             output = "out.wasm",
         )
         if (r.exitCode != 0 || r.output == null) throw AdaptException(r.stderr.ifBlank { r.stdout }.trim())
