@@ -24,7 +24,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 /**
  * ゲームの中での多数台の負荷試験（#345）。手順と結果は `docs/load-test.md`。
  *
- * - CI 用（[CI_COUNT] 台）: `runGameTestServer` で毎回動く。全台が起動し、待っている間と一部が計算・出力している間に
+ * - CI 用（[CI_COUNT] 台）: `runGameTestServer` で毎回動く。全台が起動し、待っている間と一部が計算・出力している間（見ていても、見ていなくても）に
  *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる
  * - 測定用: `runLoadTestServer -PloadTestCounts=100,500,1000` で動く。台数ごとに MSPT・スレッド数・ヒープ使用量をログに書く。
  *   テンプレートを名前空間 [MEASURE_NAMESPACE] のもの（`src/dev/resources`。jar には入らない）にして、
@@ -48,7 +48,7 @@ object LoadGameTests {
     private const val CI_BUSY = 10
 
     /**
-     * CI で、待っている間・計算している間の tick の平均の上限（ミリ秒）。20 TPS を保てる値。
+     * CI で、待っている間・計算している間・出力している間の tick の平均の上限（ミリ秒）。20 TPS を保てる値。
      * CI の機械の速さに左右されないよう、目標（[TARGET_TICK_MILLIS]）そのものを上限にする
      */
     private const val CI_MAX_AVG_TICK_MILLIS = 50.0
@@ -101,6 +101,7 @@ object LoadGameTests {
             val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
             val compute = report.phase(LoadPhase.COMPUTE)
+            val unwatched = report.phase(LoadPhase.OUTPUT)
             val output = report.phase(LoadPhase.WATCHED)
             helper.assertTrue(
                 idle.tick.avg < CI_MAX_AVG_TICK_MILLIS,
@@ -109,6 +110,15 @@ object LoadGameTests {
             helper.assertTrue(
                 compute.tick.avg < CI_MAX_AVG_TICK_MILLIS,
                 "ticks with $CI_BUSY computing machines should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${compute.tick}",
+            )
+            // 出力し続ける台の端末の処理は、プロセスのスレッドで行う（#355・#357）。メインスレッドは差分を送るだけ（#351）
+            helper.assertTrue(
+                unwatched.tick.avg < CI_MAX_AVG_TICK_MILLIS,
+                "ticks with $CI_BUSY machines printing to their screens should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${unwatched.tick}",
+            )
+            helper.assertTrue(
+                output.tick.avg < CI_MAX_AVG_TICK_MILLIS,
+                "ticks with $CI_BUSY watched machines printing to their screens should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${output.tick}",
             )
             helper.assertTrue(
                 idle.kernelThreads - idle.idleWorkerThreads <= CI_MAX_IDLE_KERNEL_THREADS,

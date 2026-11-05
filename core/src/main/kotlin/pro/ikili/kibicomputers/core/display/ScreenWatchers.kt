@@ -142,6 +142,21 @@ public constructor(
     }
 
     /**
+     * この tick に [tick] がすることがあるか。false なら [tick] は何もしない（見ている人がおらず、見はじめる人を探す tick でもない）。
+     *
+     * 誰も見ていない画面は、ほとんどの tick で false になる。接続層は、これが false の tick には、
+     * 画面のバッファ（プロセスのスレッドが書く表示デバイス。#355）のロックを取らずに飛ばしてよい（#351）。
+     * [sender] の状態（[ScreenSyncSender.isRecording]）だけを見るので、画面のバッファのロックは要らない。
+     *
+     * @param now いまの tick（[tick] に渡すものと同じ時計）
+     * @param sender この画面の同期の送り手（[tick] に渡すものと同じ）
+     */
+    public fun needsTick(now: Long, sender: ScreenSyncSender): Boolean =
+        isScanTick(now) || watchers.isNotEmpty() || fresh.isNotEmpty() || throttled.isNotEmpty() || sender.isRecording
+
+    private fun isScanTick(now: Long): Boolean = !scanned || Math.floorMod(now, scanIntervalTicks.toLong()) == 0L
+
+    /**
      * tick の終わりに1回呼ぶ。見ている人を決め直し、[sender] の、その tick の分を送る。
      * [traffic] を渡したときは、すぐには送らず [traffic] に積む。すべての画面の後で [ScreenSyncTraffic.endTick] を呼ぶと送る。
      *
@@ -151,8 +166,8 @@ public constructor(
      * @param traffic 送信量の勘定と予算。null なら予算をかけずにすぐ送り、記録もしない
      */
     public fun tick(now: Long, sender: ScreenSyncSender, host: ScreenSyncHost<P>, traffic: ScreenSyncTraffic<P>?) {
-        val scan = !scanned || Math.floorMod(now, scanIntervalTicks.toLong()) == 0L
-        if (!scan && watchers.isEmpty() && fresh.isEmpty() && throttled.isEmpty() && !sender.isRecording) return
+        if (!needsTick(now, sender)) return
+        val scan = isScanTick(now)
         scanned = true
 
         // 遠ざかった人・見られなくなった人を外す
