@@ -118,7 +118,7 @@ class WasiP1BasicTest {
     fun `PWDはカーネルのcwdにし、渡されていればその位置で置き換える`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
-            m.lock.withLockValue {
+            run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/home"))
             }

@@ -212,8 +212,16 @@ public class Machine private constructor(
     /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
     internal val memoryAccount = MemoryAccount(config.memoryPages, scheduler.memoryAccount)
 
-    /** 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ。カーネルロックの中で使う） */
-    internal val vfs = Vfs(kernel.mounts)
+    /**
+     * 仮想ファイルシステム（マウントの表は [kernel] の中。ファイルシステムは実行時だけ）。ファイルシステムに届く操作は
+     * カーネルロックの外で使う（#52。ADR 0052）。閉じたファイルの知らせは、起動用のスレッドでロックの外で行う
+     */
+    internal val vfs = Vfs(kernel.mounts) { lock.isHeldByCurrentThread }.also { v ->
+        v.onDeferred = { scheduleVfsDrain() }
+    }
+
+    /** [vfs] の後で行う知らせを、起動用のスレッドに積んだか（積むのは1つだけ） */
+    private val vfsDrainScheduled = AtomicBoolean()
 
     /** 待ち手の表（実行時だけ） */
     internal val registry = WaitRegistry()
@@ -232,6 +240,24 @@ public class Machine private constructor(
         }
 
         override fun timerClosed(objectId: Int) = timers.cancel(objectId)
+
+        override fun fileClosed(file: OpenFile) = vfs.releaseLater(file)
+    }
+
+    /** [vfs] の後で行う知らせ（閉じたファイル、外したファイルシステム）を、起動用のスレッドでロックの外で行う（カーネルロックの中から呼んでよい） */
+    private fun scheduleVfsDrain() {
+        if (!vfsDrainScheduled.compareAndSet(false, true)) return
+        val drain = Runnable {
+            vfsDrainScheduled.set(false)
+            vfs.drainDeferred()
+        }
+        try {
+            scheduler.bootExecutor.execute(drain)
+        } catch (e: RejectedExecutionException) {
+            // スケジューラが閉じた。ロックを持っていなければこのスレッドで行い、持っていれば次の VFS の操作に任せる
+            vfsDrainScheduled.set(false)
+            if (!lock.isHeldByCurrentThread) vfs.drainDeferred()
+        }
     }
 
     /**
@@ -487,7 +513,9 @@ public class Machine private constructor(
 
     /**
      * プロセスを作る（#45・#49 が使う）。Process を `CREATED` で表に足し、型に応じて専用スレッドを作る（BLOCKING）か、
-     * CPU の待ち行列に入れる（WAIT_POINT）。インスタンスはここでは作らない。カーネルロックを自分で取る（中から呼んでもよい）。
+     * CPU の待ち行列に入れる（WAIT_POINT）。インスタンスはここでは作らない。カーネルロックを自分で取る。
+     * 作業ディレクトリ（[SpawnOptions.cwd]）か preopen（[StdioSource.Directory]）を指定するときは、VFS をロックの外で使うので、
+     * カーネルロックを持たずに呼ぶ（持っていれば [IllegalStateException]。#52）。
      *
      * 引数・環境変数・作業ディレクトリ・fd は [options] で決める（[SpawnOptions]）。どれも表を変える前に確かめ、
      * 失敗したら何も変えない。
@@ -510,6 +538,7 @@ public class Machine private constructor(
         parentPid: Int = 0,
         asInit: Boolean = false,
     ): Int {
+        val paths = resolveSpawnPaths(options, parentPid)
         lock.lock()
         try {
             // 起動の init: 取り消されていれば作らない（stop() と取り違えないよう、表を変えるのと同じロックの中で確かめる）
@@ -522,8 +551,10 @@ public class Machine private constructor(
             if (kernel.processes.limitedCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")
             val env = options.env ?: parent?.env ?: emptyMap()
             ProcessArgs.check(options.args, env)
-            val cwd = resolveCwdLocked(options.cwd, parent)
-            val fdEntries = resolveFdsLocked(options, parent)
+            // 前もって決めた作業ディレクトリ・preopen は、親の作業ディレクトリが同じときだけ使う（親の cwd を変えるのは親自身のスレッドだけ）
+            if (paths != null && (parent?.cwd ?: VfsPath.ROOT) != paths.base) fsError(Errno.AGAIN, "親の作業ディレクトリが変わった")
+            val cwd = paths?.cwd ?: (parent?.cwd ?: VfsPath.ROOT)
+            val fdEntries = resolveFdsLocked(options, parent, paths)
             val kind = driver.kind
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
@@ -572,7 +603,7 @@ public class Machine private constructor(
      *   argv は `[インタプリタ, (シバンの引数), スクリプトの絶対パス, 元の argv[1..]]` にする（Linux と同じ並び。
      *   スクリプトのパスは、WASI に作業ディレクトリがないので絶対パスで渡す）。インタプリタのパスの相対パスも親の作業ディレクトリから辿る。
      *   インタプリタもシバン付きならさらにたどり、[Shebang.MAX_DEPTH] 回を超えたら `LOOP`。拡張子は見ない
-     * - ファイルを読むのはカーネルロックの中、WASM の読み込み（変換・挿入・パース・検証・コンパイル）はロックの外の、
+     * - ファイルを読むのはカーネルロックの外（#52）、WASM の読み込み（変換・挿入・パース・検証・コンパイル）はロックの外の、
      *   コンパイル用のスレッドで行う（#37）。同じ中身・同じ読み込み方の WASM は、読み込んだ結果をサーバー全体で共有する
      *   （[pro.ikili.kibicomputers.core.kernel.process.ProgramCache]）。読み込みが終わっていなければ [await] で待つ
      *   （プロセスからの呼び出しは、CPU と許可を返して待つ）。重いので、メインスレッドからは呼ばない
@@ -621,7 +652,9 @@ public class Machine private constructor(
     @Throws(FsException::class)
     internal fun beginExec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions, parentPid: Int): PendingExec {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま exec を呼ばない" }
-        val executable = lock.withLockValue { loadExecutableLocked(path, options.args.ifEmpty { listOf(path) }, parentLocked(parentPid)) }
+        val base = lock.withLockValue { parentLocked(parentPid)?.cwd ?: VfsPath.ROOT }
+        // 実行ファイルを読むのはロックの外（#52）
+        val executable = loadExecutable(path, options.args.ifEmpty { listOf(path) }, base)
         val runtime = scheduler.options.runtime
         val limits = scheduler.options.moduleLimits
         val metered = scheduler.options.meterExecutables
@@ -723,14 +756,13 @@ public class Machine private constructor(
         class Script(val line: Shebang.Line) : ExecutableContent
     }
 
-    /** [text] を読み、シバンがあればインタプリタへたどる（カーネルロックの中。#93） */
-    private fun loadExecutableLocked(text: String, args: List<String>, parent: Process?): Executable {
-        val base = parent?.cwd ?: VfsPath.ROOT
+    /** [text] を読み、シバンがあればインタプリタへたどる（カーネルロックの外。相対パスは [base] から。#93） */
+    private fun loadExecutable(text: String, args: List<String>, base: VfsPath): Executable {
         var target = text
         var argv = args
         repeat(Shebang.MAX_DEPTH + 1) {
             val path = VfsPath.resolve(base, target)
-            when (val content = readExecutableLocked(path, VfsPath.hasTrailingSlash(target))) {
+            when (val content = readExecutable(path, VfsPath.hasTrailingSlash(target))) {
                 is ExecutableContent.Binary -> return Executable(path, content.bytes, argv)
                 is ExecutableContent.Script -> {
                     val line = content.line
@@ -758,23 +790,46 @@ public class Machine private constructor(
         return parent
     }
 
-    /** 作業ディレクトリを決める。指定がなければ親と同じ（親がなければ `/`。確かめない）。指定があれば、ディレクトリか確かめる */
-    private fun resolveCwdLocked(text: String?, parent: Process?): VfsPath {
-        val base = parent?.cwd ?: VfsPath.ROOT
-        if (text == null) return base
-        val path = VfsPath.resolve(base, text)
-        if (vfs.stat(path).type != FileType.DIRECTORY) fsError(Errno.NOTDIR, "$path はディレクトリではない")
-        return path
+    /** [spawn] の前に VFS で決めたもの（[base] は決めたときの親の作業ディレクトリ） */
+    private class SpawnPaths(val base: VfsPath, val cwd: VfsPath, val directories: Map<Int, OpenFile>)
+
+    /**
+     * 作業ディレクトリと preopen のディレクトリを、カーネルロックの外で決める（#52）。どちらも指定がなければ `null`（VFS を使わない）。
+     * 作業ディレクトリは、指定がなければ親と同じ（親がなければ `/`。確かめない）。指定があれば、ディレクトリか確かめる
+     */
+    private fun resolveSpawnPaths(options: SpawnOptions, parentPid: Int): SpawnPaths? {
+        val sources = listOf(STDIN, STDOUT, STDERR).associateWith { options.stdio.source(it) } + options.fds
+        val directories = sources.filterValues { it is StdioSource.Directory }.mapValues { it.value as StdioSource.Directory }
+        if (options.cwd == null && directories.isEmpty()) return null
+        check(!lock.isHeldByCurrentThread) { "作業ディレクトリ・preopen を指定する spawn は、カーネルロックを持たずに呼ぶ" }
+        val base = lock.withLockValue { parentLocked(parentPid)?.cwd ?: VfsPath.ROOT }
+        val cwd = options.cwd?.let { text ->
+            val path = VfsPath.resolve(base, text)
+            if (vfs.stat(path).type != FileType.DIRECTORY) fsError(Errno.NOTDIR, "$path はディレクトリではない")
+            path
+        } ?: base
+        // OpenFile はファイルシステムを参照せず、ディレクトリは開いたことを知らせないので、表に足す前に捨てても何も漏れない
+        val opened = LinkedHashMap<Int, OpenFile>()
+        for ((fd, d) in directories) opened[fd] = vfs.open(VfsPath.resolve(base, d.path), OpenOptions(read = true, directory = true))
+        return SpawnPaths(base, cwd, opened)
     }
 
     /**
-     * 実行ファイル [path] の中身を読む（カーネルロックの中）。先頭が `#!` なら、シバンの行だけを読んで [ExecutableContent.Script] を返す
+     * 実行ファイル [path] の中身を読む（カーネルロックの外）。先頭が `#!` なら、シバンの行だけを読んで [ExecutableContent.Script] を返す
      * （スクリプトには [MachineLimits.MAX_EXECUTABLE_BYTES] の上限をかけない）
      */
-    private fun readExecutableLocked(path: VfsPath, trailingSlash: Boolean): ExecutableContent {
+    private fun readExecutable(path: VfsPath, trailingSlash: Boolean): ExecutableContent {
         val stat = vfs.stat(path)
         if (stat.type != FileType.REGULAR_FILE) fsError(Errno.ACCES, "$path は普通のファイルではない")
         val file = vfs.open(path, OpenOptions(read = true), trailingSlash)
+        try {
+            return readExecutableContent(path, stat.size, file)
+        } finally {
+            vfs.close(file)
+        }
+    }
+
+    private fun readExecutableContent(path: VfsPath, size: Long, file: OpenFile): ExecutableContent {
         // 先頭（シバンの行の上限まで）を読んで、スクリプトか見分ける
         val head = ByteArray(Shebang.MAX_LINE_BYTES)
         var headLength = 0
@@ -784,8 +839,8 @@ public class Machine private constructor(
             headLength += n
         }
         Shebang.parse(head, headLength)?.let { return ExecutableContent.Script(it) }
-        if (stat.size > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${stat.size} バイト。上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
-        val out = ByteArrayOutputStream(maxOf(stat.size.toInt(), headLength))
+        if (size > MachineLimits.MAX_EXECUTABLE_BYTES) fsError(Errno.FBIG, "$path は大きすぎる（${size} バイト。上限 ${MachineLimits.MAX_EXECUTABLE_BYTES}）")
+        val out = ByteArrayOutputStream(maxOf(size.toInt(), headLength))
         out.write(head, 0, headLength)
         if (headLength == head.size) {
             val buf = ByteArray(64 * 1024)
@@ -814,18 +869,18 @@ public class Machine private constructor(
      * 親の fd が開いていない・範囲外なら `BADF`、preopen のディレクトリがない・ディレクトリでないなら `NOENT`・`NOTDIR`、
      * オブジェクトがなければ [IllegalArgumentException]
      */
-    private fun resolveFdsLocked(options: SpawnOptions, parent: Process?): Map<Int, PendingFd> {
+    private fun resolveFdsLocked(options: SpawnOptions, parent: Process?, paths: SpawnPaths?): Map<Int, PendingFd> {
         val out = LinkedHashMap<Int, PendingFd>()
-        for (fd in listOf(STDIN, STDOUT, STDERR)) resolveFdLocked(fd, options.stdio.source(fd), parent)?.let { out[fd] = it }
+        for (fd in listOf(STDIN, STDOUT, STDERR)) resolveFdLocked(fd, options.stdio.source(fd), parent, paths)?.let { out[fd] = it }
         for ((fd, source) in options.fds.entries.sortedBy { it.key }) {
             if (fd <= STDERR || fd >= DEFAULT_HANDLE_LIMIT) fsError(Errno.BADF, "fd $fd は渡せない（3 以上 $DEFAULT_HANDLE_LIMIT 未満）")
-            resolveFdLocked(fd, source, parent)?.let { out[fd] = it }
+            resolveFdLocked(fd, source, parent, paths)?.let { out[fd] = it }
         }
         return out
     }
 
     /** fd [fd] の割り当て1つ。割り当てないなら `null` */
-    private fun resolveFdLocked(fd: Int, source: StdioSource, parent: Process?): PendingFd? = when (source) {
+    private fun resolveFdLocked(fd: Int, source: StdioSource, parent: Process?, paths: SpawnPaths?): PendingFd? = when (source) {
         StdioSource.Inherit -> when {
             parent != null -> parent.handles[fd]?.let { PendingFd.Existing(it) }
             fd <= STDERR -> PendingFd.Existing(consoleEntryLocked(fd))
@@ -840,9 +895,8 @@ public class Machine private constructor(
             PendingFd.Existing(HandleEntry(source.objectId, rights = source.rights))
         }
         is StdioSource.Directory -> {
-            // OpenFile はファイルシステムを参照せず、閉じる処理も要らないので、表に足す前に捨てても何も漏れない
-            val path = VfsPath.resolve(parent?.cwd ?: VfsPath.ROOT, source.path)
-            PendingFd.NewObject(vfs.open(path, OpenOptions(read = true, directory = true)), HandleRights.READ)
+            // 開くのはロックの外（resolveSpawnPaths）
+            PendingFd.NewObject(checkNotNull(paths?.directories?.get(fd)) { "fd $fd の preopen を前もって開いていない" }, HandleRights.READ)
         }
         StdioSource.Console -> PendingFd.Existing(consoleEntryLocked(fd))
         StdioSource.Closed -> null
@@ -1135,6 +1189,8 @@ public class Machine private constructor(
         }
         // 取りこぼし（すでに終わったプロセスが残した分など）を防ぐため、残りもすべて取り消す
         cancelHostCallsLocked()
+        // ホストのディスク（#52）は、この後の操作を断る（止まり切っていない古いスレッドが触らないように）。閉じるのはロックの外
+        vfs.revokeAll()
         checkAllDoneLocked()
     }
 
@@ -1398,20 +1454,26 @@ public class Machine private constructor(
     }
 
     /** 起動ディスク [diskId] の [volume] を `/` にマウントする（起動用のスレッドから）。取り消されていれば何もせず `false` */
-    internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean = lock.withLockValue {
-        if (bootCancelled) return@withLockValue false
-        vfs.mount(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
-        true
+    internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean {
+        // 位置の確かめ（ファイルシステムを呼ぶことがある）はロックの外、表を変えるのはロックの中（#52）
+        vfs.checkMountPoint(VfsPath.ROOT)
+        return lock.withLockValue {
+            if (bootCancelled) return@withLockValue false
+            vfs.mountLocked(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
+            true
+        }
     }
 
     /**
      * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（起動用のスレッドから、根のマウントの後）。
      * 根のディスクの `/tmp` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）
      */
-    internal fun mountTmp(): Errno? = lock.withLockValue {
+    internal fun mountTmp(): Errno? {
         val fs = TmpFileSystem(memoryAccount) { environment.clock.realtimeNanos() }
-        try {
-            vfs.mount(MachineLimits.TMP_PATH, fs, readOnly = false, source = MachineLimits.TMP_SOURCE)
+        return try {
+            // 根のディスクの /tmp の確かめ（ホストの I/O のことがある）はロックの外（#52）
+            vfs.checkMountPoint(MachineLimits.TMP_PATH)
+            lock.withLockValue { vfs.mountLocked(MachineLimits.TMP_PATH, fs, readOnly = false, source = MachineLimits.TMP_SOURCE) }
             null
         } catch (e: FsException) {
             e.errno

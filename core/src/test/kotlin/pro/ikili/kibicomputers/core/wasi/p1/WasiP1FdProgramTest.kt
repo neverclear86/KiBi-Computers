@@ -34,16 +34,16 @@ class WasiP1FdProgramTest {
     fun `wasi-libcのファイル操作がfdの関数を通って動く`() = timeout(Duration.ofSeconds(60)) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
-            val (input, output, dirId, fileId) = m.lock.withLockValue {
+            val (input, output, dirId, fileId) = run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/data"))
                 val f = m.vfs.open(VfsPath.parse("/data/a.txt"), OpenOptions(read = true, write = true, create = true))
                 m.vfs.write(f, "abcde".toByteArray(), 0, 5)
                 f.position = 0
                 val d = m.vfs.open(VfsPath.ROOT, OpenOptions(read = true))
-                val input = ByteStream(64).also { m.kernel.objects.add(it) }
-                val output = ByteStream(64 * 1024).also { m.kernel.objects.add(it) }
-                listOf(input.id, output.id, m.kernel.objects.add(d), m.kernel.objects.add(f))
+                val input = ByteStream(64).also { m.lock.withLockValue { m.kernel.objects.add(it) } }
+                val output = ByteStream(64 * 1024).also { m.lock.withLockValue { m.kernel.objects.add(it) } }
+                listOf(input.id, output.id, m.lock.withLockValue { m.kernel.objects.add(d) }, m.lock.withLockValue { m.kernel.objects.add(f) })
             }
             val options = SpawnOptions(
                 allowUnmetered = true,
@@ -71,7 +71,7 @@ class WasiP1FdProgramTest {
             assertEquals("OK\n", text, "プログラムの出力")
             assertEquals(ProcessState.EXITED, m.stateOf(pid))
             // ファイルの中身: "Zbcd" + 0 が 6 バイト + 追記の "Q"
-            val content = m.lock.withLockValue {
+            val content = run {
                 val f = m.vfs.open(VfsPath.parse("/data/a.txt"), OpenOptions(read = true))
                 val buf = ByteArray(32)
                 val n = m.vfs.read(f, buf, 0, buf.size)

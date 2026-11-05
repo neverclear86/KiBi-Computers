@@ -49,7 +49,7 @@ class KibiMemoryProgramTest {
     private fun run(vararg args: String, ramBytes: Long = 512 * kib): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
-        m.lock.withLockValue {
+        run {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
             val bytes = resource("kibi-memory-wasi.wasm")

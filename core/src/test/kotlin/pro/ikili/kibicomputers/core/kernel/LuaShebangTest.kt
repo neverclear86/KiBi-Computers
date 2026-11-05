@@ -23,7 +23,7 @@ class LuaShebangTest {
     private fun resource(name: String): ByteArray =
         requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
 
-    private fun Machine.writeFile(path: String, bytes: ByteArray) = lock.withLockValue {
+    private fun Machine.writeFile(path: String, bytes: ByteArray) = run {
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
         vfs.write(f, bytes, 0, bytes.size)
     }
@@ -31,7 +31,7 @@ class LuaShebangTest {
     private fun runScript(script: String, path: String, options: SpawnOptions): Pair<ProcessState, String> =
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
-            m.lock.withLockValue {
+            run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/bin"))
                 m.vfs.createDirectory(VfsPath.parse("/home"))

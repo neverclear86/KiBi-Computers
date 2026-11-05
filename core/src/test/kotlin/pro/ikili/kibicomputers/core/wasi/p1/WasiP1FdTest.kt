@@ -214,7 +214,7 @@ class WasiP1FdTest {
     fun `ファイルとディレクトリのfdの属性・preopen・readdir`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
-            val (dirId, fileId) = m.lock.withLockValue {
+            val (dirId, fileId) = run {
                 val fs = TestMemoryFileSystem()
                 m.vfs.mount(VfsPath.ROOT, fs, readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/data"))
@@ -222,7 +222,7 @@ class WasiP1FdTest {
                 val f = m.vfs.open(VfsPath.parse("/data/a.txt"), OpenOptions(read = true, write = true, create = true))
                 m.vfs.write(f, "hello".toByteArray(), 0, 5)
                 val d = m.vfs.open(VfsPath.parse("/data"), OpenOptions(read = true))
-                m.kernel.objects.add(d) to m.kernel.objects.add(f)
+                m.lock.withLockValue { m.kernel.objects.add(d) } to m.lock.withLockValue { m.kernel.objects.add(f) }
             }
             val module = forwarding(
                 "fd_fdstat_get", "fd_filestat_get", "fd_prestat_get", "fd_prestat_dir_name", "fd_readdir", "fd_seek", "fd_tell",

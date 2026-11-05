@@ -280,13 +280,13 @@ class WasiP1PollTest {
     @Test
     fun `ファイルとディレクトリは常にそろい、ファイルの読みは残りのバイト`() = timeout(limit) {
         env { e ->
-            val (fileId, dirId) = e.m.lock.withLockValue {
+            val (fileId, dirId) = run {
                 e.m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 val f = e.m.vfs.open(VfsPath.parse("/a.txt"), OpenOptions(read = true, write = true, create = true))
                 e.m.vfs.write(f, "abcde".toByteArray(), 0, 5)
                 f.position = 2
                 val d = e.m.vfs.open(VfsPath.ROOT, OpenOptions(read = true))
-                e.m.kernel.objects.add(f) to e.m.kernel.objects.add(d)
+                e.m.lock.withLockValue { e.m.kernel.objects.add(f) } to e.m.lock.withLockValue { e.m.kernel.objects.add(d) }
             }
             val opts = SpawnOptions(
                 stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed),

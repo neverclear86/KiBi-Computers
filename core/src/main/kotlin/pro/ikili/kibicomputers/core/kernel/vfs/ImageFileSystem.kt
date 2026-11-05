@@ -46,7 +46,7 @@ internal class ImageFileSystem private constructor(
 
     override fun removeDirectory(path: VfsPath): Unit = fsError(Errno.ROFS)
 
-    override fun rename(from: VfsPath, to: VfsPath): Unit = fsError(Errno.ROFS)
+    override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean): Unit = fsError(Errno.ROFS)
 
     override fun read(node: Long, position: Long, dst: ByteArray, off: Int, len: Int): Int {
         val e = entry(node)
@@ -61,6 +61,12 @@ internal class ImageFileSystem private constructor(
     override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int = fsError(Errno.ROFS)
 
     override fun setSize(node: Long, size: Long): Unit = fsError(Errno.ROFS)
+
+    override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written = fsError(Errno.ROFS)
+
+    override fun allocate(node: Long, size: Long): Unit = fsError(Errno.ROFS)
+
+    override fun sizeHint(node: Long): Long = byNode[node]?.stat?.size ?: 0
 
     override fun readDirectory(node: Long): List<DirEntry> {
         val e = entry(node)

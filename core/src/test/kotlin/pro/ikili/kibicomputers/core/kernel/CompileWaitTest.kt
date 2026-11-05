@@ -78,7 +78,7 @@ class CompileWaitTest {
         }
     }
 
-    private fun Machine.mountRoot(vararg files: Pair<String, ByteArray>) = lock.withLockValue {
+    private fun Machine.mountRoot(vararg files: Pair<String, ByteArray>) = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         for ((path, bytes) in files) {

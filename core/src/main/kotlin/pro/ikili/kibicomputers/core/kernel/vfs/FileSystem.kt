@@ -47,9 +47,12 @@ internal data class DirEntry(val name: String, val type: FileType, val node: Lon
  * - 開いたファイルは [node]（[FileStat.node]）で指す。VFS は開いたファイルを `(マウントの ID, node)` で覚え、
  *   開く・閉じるの対応をファイルシステムに求めない（開いたファイルの状態を保存できる値だけにするため）。
  *   ホストの資源（チャンネルなど）を開いたままにするなら、ファイルシステムの側で持ち、自分で閉じる
+ *   （[tracksOpenFiles] なら、開いた・閉じたを [retain]・[release] で知らせる。知らせのない node の操作も受け付ける）
  * - 消されたファイルの [node] を使ったら `STALE`（開いたまま消したファイルを読み続けられるかは、ファイルシステムが決める）
- * - 呼ばれるのは CPU を持つプロセスのスレッドで、マシンのカーネルロックの中。ファイルの読み書きのほかに待たない
- *   （ほかのロック・条件変数・メインスレッドを待たない）
+ * - 呼ばれるのは、マシンのカーネルロックの**外**（#52。ADR 0051・0052）。同じマシンのいくつものスレッド（プロセスのスレッド、
+ *   起動用のスレッド）から同時に呼ばれるので、ファイルシステムが自分で排他する。自分の I/O と自分の排他のほかに待たない
+ *   （ほかのマシン・メインスレッド・カーネルロックを待たない）
+ * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted] だけ。この3つは I/O をせず、すぐ返す
  */
 internal interface FileSystem {
     /** 書けないファイルシステムか（書く操作の前に VFS が `ROFS` にする） */
@@ -73,8 +76,11 @@ internal interface FileSystem {
     /** 空のディレクトリを消す。空でなければ `NOTEMPTY`、ディレクトリでなければ `NOTDIR`。根は `BUSY` */
     fun removeDirectory(path: VfsPath)
 
-    /** 名前を変える（POSIX の `rename` と同じ規則。あれば置き換える） */
-    fun rename(from: VfsPath, to: VfsPath)
+    /**
+     * 名前を変える（POSIX の `rename` と同じ規則。あれば置き換える）。
+     * [requireDirectory] なら、元がディレクトリでなければ `NOTDIR`（末尾の `/`。確かめと名前の変更を、自分の排他の中で不可分に行う）
+     */
+    fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean = false)
 
     /** [node] の [position] から最大 [len] バイトを読む。読めた数を返す（終わりなら 0） */
     fun read(node: Long, position: Long, dst: ByteArray, off: Int, len: Int): Int
@@ -84,6 +90,21 @@ internal interface FileSystem {
 
     /** [node] の大きさを [size] にする（伸ばした分は 0） */
     fun setSize(node: Long, size: Long)
+
+    /**
+     * [node] の終わりに最大 [len] バイトを足す（追記）。大きさを読んでから書くまでを不可分に行う（同時の追記が重ならない）。
+     * 書いた位置と数を返す
+     */
+    fun append(node: Long, src: ByteArray, off: Int, len: Int): Written
+
+    /** [node] が [size] より小さければ [size] まで伸ばす（0 で埋める）。大きければ何もしない（縮めない）。不可分に行う */
+    fun allocate(node: Long, size: Long)
+
+    /**
+     * [node] の大きさの目安（`poll` の `nbytes`）。カーネルロックの中から呼ばれるので、I/O をせず、長く待たない。
+     * 分からなければ 0
+     */
+    fun sizeHint(node: Long): Long
 
     /** ディレクトリ [node] の中身。ディレクトリでなければ `NOTDIR` */
     fun readDirectory(node: Long): List<DirEntry>
@@ -101,7 +122,32 @@ internal interface FileSystem {
 
     /**
      * [Vfs.unmount] で外された（既定は何もしない）。メモリ上のファイルシステム（`/tmp`）は、ここで中身を捨てて RAM を返す。
-     * 同じファイルシステムを別の場所にマウントし直すことはない前提
+     * 同じファイルシステムを別の場所にマウントし直すことはない前提。カーネルロックの中から呼ばれるので、I/O をしない
+     * （ホストの資源は [retire] で閉じる）
      */
     fun onUnmounted() {}
+
+    /**
+     * マシンが止まった（[Vfs.revokeAll]。既定は何もしない）。ホストのディレクトリを使うもの（#52）は、この後の操作を `IO` にする。
+     * カーネルロックの中から呼ばれるので、I/O をしない（ホストの資源は [retire] で閉じる）
+     */
+    fun revoke() {}
+
+    /** 開いたファイルを数えるか（`true` なら、VFS が [retain]・[release]・[retire] を呼ぶ。既定は `false`） */
+    val tracksOpenFiles: Boolean get() = false
+
+    /**
+     * 普通のファイル [node] を開いた（[Vfs.open]。[writable] は書くために開いたか）。ホストのファイルを開いたままにするもの（#52）は、
+     * ここで開く。数の上限を超えたら `MFILE`（マシン）・`NFILE`（サーバー全体）。[tracksOpenFiles] のときだけ呼ばれる
+     */
+    fun retain(node: Long, writable: Boolean) {}
+
+    /** [retain] した [node] を閉じた（最後の参照が外れた）。カーネルロックの外で呼ばれる（I/O をしてよい） */
+    fun release(node: Long) {}
+
+    /** [onUnmounted]・[revoke] の後に、カーネルロックの外で呼ばれる。ホストの資源（開いたままのファイル）を閉じる */
+    fun retire() {}
 }
+
+/** [FileSystem.append] の結果。[position] は書いた位置、[count] は書いた数 */
+internal data class Written(val position: Long, val count: Int)

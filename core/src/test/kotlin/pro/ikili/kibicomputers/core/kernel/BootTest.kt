@@ -441,7 +441,7 @@ class BootTest {
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { m.state == MachineState.RUNNING }
         val tmpFile = VfsPath.parse("/tmp/a.txt")
-        m.lock.withLockValue {
+        run {
             val f = m.vfs.open(tmpFile, OpenOptions(read = true, write = true, create = true))
             val bytes = "hello".toByteArray()
             assertEquals(bytes.size, m.vfs.write(f, bytes, 0, bytes.size))
@@ -450,7 +450,7 @@ class BootTest {
 
         assertTrue(m.reboot())
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
-        m.lock.withLockValue {
+        run {
             assertThrows<FsException> { m.vfs.stat(tmpFile) }
             assertEquals(FileType.DIRECTORY, m.vfs.stat(VfsPath.parse("/tmp")).type)
         }

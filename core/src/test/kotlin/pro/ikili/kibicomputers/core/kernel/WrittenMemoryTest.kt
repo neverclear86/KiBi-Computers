@@ -45,7 +45,7 @@ class WrittenMemoryTest {
         condition()
     }
 
-    private fun Machine.install(path: String, wasm: String) = lock.withLockValue {
+    private fun Machine.install(path: String, wasm: String) = run {
         val bytes = resource(wasm)
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
         vfs.write(f, bytes, 0, bytes.size)
@@ -55,7 +55,7 @@ class WrittenMemoryTest {
     private fun run(wasm: String, args: List<String>, ramBytes: Long): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
-        m.lock.withLockValue {
+        run {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
         }
@@ -146,7 +146,7 @@ class WrittenMemoryTest {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 256 * kib)
-            m.lock.withLockValue { m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root") }
+            run { m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root") }
             m.install("/lua", "lua.wasm")
             val pid = m.exec("/lua", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lua")))
             h.tickUntil("入力を待たない: ${host.text()}") { host.text().endsWith("> ") && m.stateOf(pid) == ProcessState.WAITING_EVENT }

@@ -247,7 +247,7 @@ internal interface ProcessContext {
     /** カーネルの状態（カーネルロックの中で使う） */
     val kernel: KernelState
 
-    /** マシンの VFS（カーネルロックの中で使う） */
+    /** マシンの VFS（ファイルシステムに届く操作はカーネルロックの外で使う。[withKernelLock] の中から呼ぶと `IllegalStateException`。#52） */
     val vfs: Vfs
 
     /** 状態を変えるオブジェクトの操作に渡す、待ち手への知らせ口（カーネルロックの中で使う） */
