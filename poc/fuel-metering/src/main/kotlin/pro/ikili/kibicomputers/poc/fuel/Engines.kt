@@ -173,7 +173,7 @@ class Engine private constructor(private val bytes: ByteArray, val wasm: Wasm?, 
             .withRandom(Random(0))
             .build()
         WasiPreview1.builder().withOptions(options).build().use { wasi ->
-            val instance = newInstance(meter, wasi.toHostFunctions().toList())
+            val instance = newInstance(meter, wasi.toHostFunctions().toList() + kibiMemoryStubs())
             val exit = try {
                 instance.export("_start").apply()
                 0

@@ -100,7 +100,7 @@ class Engine(val wasm: Wasm, val mode: Mode) {
             .withStderr(stderr)
             .build()
         WasiPreview1.builder().withOptions(options).build().use { wasi ->
-            val instance = newInstance(ImportValues.builder().addFunction(*wasi.toHostFunctions()).build())
+            val instance = newInstance(ImportValues.builder().addFunction(*wasi.toHostFunctions()).addFunction(*kibiMemoryStubs().toTypedArray()).build())
             val exit = try {
                 instance.export("_start").apply()
                 0

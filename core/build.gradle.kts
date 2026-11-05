@@ -149,6 +149,8 @@ val compileLua = kibiWasm.module("lua") {
     // 起動時に PWD（カーネルの cwd）へ chdir する（#332）
     sources.from("src/main/wasm/common/kibi_cwd.c")
     includeDirs.from("src/main/wasm/lua")
+    // アロケーターの包みが kibi:memory（#408）を呼ぶ（#409）
+    includeDirs.from("src/main/wasm/common")
     compilerArgs.addAll(
         "-O2",
         "-s",

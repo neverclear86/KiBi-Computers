@@ -32,4 +32,17 @@ int isatty(int fd);
  * io.tmpfile は kibi_wasi.c で失敗を返す。
  */
 
+/*
+ * RAM の上限で "not enough memory" にする（#409。#370 で決定。努力目標）。
+ * RAM は、初めて書き込んだ 4 KiB の区画の数で数え、上限を超える書き込みはトラップになる（#407）。
+ * Lua の既定のアロケーター（lauxlib.c の l_alloc）が呼ぶ realloc・free を、書く前に kibi:memory の commit で
+ * 数えさせる包み（kibi_wasi.c）に差し替える。包みが NULL を返すと、Lua は緊急の GC をしてやり直し、
+ * それでもだめなら "not enough memory" のエラーにする（pcall で受けられる）。
+ */
+#include <stddef.h>
+void *kibi_lua_realloc(void *ptr, size_t size);
+void kibi_lua_free(void *ptr);
+#define realloc(p, n) kibi_lua_realloc(p, n)
+#define free(p) kibi_lua_free(p)
+
 #endif

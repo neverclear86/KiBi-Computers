@@ -53,6 +53,12 @@ class MiniWasi(private val kernel: MiniKernel) {
             }
             else -> null
         }
+        // 独自拡張 kibi:memory（#408）。同梱の Lua のアロケーター（#409）が呼ぶ。この PoC には RAM の上限がないので、いつも足りると答える
+        KIBI -> when (name) {
+            "memory_remaining" -> Body { _, _ -> longArrayOf(Long.MAX_VALUE) }
+            "memory_commit" -> Body { _, _ -> longArrayOf(1) }
+            else -> null
+        }
         WASI -> when (name) {
             "fd_write" -> Body { mem, args -> ok(fdWrite(mem, args[0].toInt(), args[1].toInt(), args[2].toInt(), args[3].toInt())) }
             "fd_read" -> Body { mem, args -> ok(fdRead(mem, args[0].toInt(), args[1].toInt(), args[2].toInt(), args[3].toInt())) }
@@ -159,6 +165,7 @@ class MiniWasi(private val kernel: MiniKernel) {
     companion object {
         const val WASI = "wasi_snapshot_preview1"
         const val KIBI_POC = "kibi_poc"
+        const val KIBI = "kibi"
         const val SUCCESS = 0
         const val EBADF = 8
         const val ENOSYS = 52
