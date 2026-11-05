@@ -53,6 +53,14 @@ jobs:
       - name: GameTest (Forge 1.20.1)
         run: ./gradlew :platform-forge-1.20.1:runGameTestServer --console=plain
 
+      # 標準 OS の言語の PoC（#32）で CI がビルドした MoonBit の WASM（手元ではビルドしないので、調べるときに取り出す）
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: os-language-moonbit-wasm
+          path: poc/os-language/build/generated/moonbit/
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@v7
         with:
           name: kibicomputers-jars
