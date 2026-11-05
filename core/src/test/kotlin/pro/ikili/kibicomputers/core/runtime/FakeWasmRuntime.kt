@@ -296,6 +296,26 @@ internal class FakeMemory(
         return old
     }
 
+    /**
+     * `kibi:memory` の `commit`（#408）。[written] があれば、範囲にかかる区画のうちまだ数えていないものを、
+     * 残りが [keepBytes] 以上残るときだけまとめて数える（Endive の `WrittenPagesMemory.commitRange` と同じ規則）
+     */
+    override fun commit(address: Int, length: Int, keepBytes: Long): Boolean {
+        val start = address.toUInt().toLong()
+        val len = length.toUInt().toLong()
+        if (start + len > bytes.size) throw WasmMemoryAccessException("メモリの範囲外: $start+$len")
+        val w = written
+        if (len == 0L || w == null || !w.counting) return true
+        val first = (start / FakeWrittenCount.CHUNK).toInt()
+        val last = ((start + len - 1) / FakeWrittenCount.CHUNK).toInt()
+        val fresh = (first..last).count { !w.written[it] }
+        if (fresh == 0) return true
+        if (w.budget != null && !w.budget.tryReserveBytes(fresh.toLong() * FakeWrittenCount.CHUNK, keepBytes)) return false
+        for (i in first..last) w.written.set(i)
+        w.count += fresh
+        return true
+    }
+
     fun releaseAll() {
         if (reserved > 0) budget?.release(reserved)
         reserved = 0
