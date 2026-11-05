@@ -3,9 +3,11 @@ package pro.ikili.kibicomputers.core.kernel.fd
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.io.PipeEnd
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -44,10 +46,11 @@ internal sealed interface FdReadiness {
 }
 
 /**
- * fd を通した読み書き。fd が指すオブジェクトの種類（`ByteStream`、`Tty`、`OpenFile`）で振り分ける。ABI 層（p1 の `fd_read`・`fd_write`、
+ * fd を通した読み書き。fd が指すオブジェクトの種類（`ByteStream`、パイプの端 `PipeEnd`、`Tty`、`OpenFile`）で振り分ける。ABI 層（p1 の `fd_read`・`fd_write`、
  * p2 の stream）はこれを使い、[IoResult] を自分の ABI の値に直す。
  *
  * fd の権利（[HandleRights]）がなければ `BADF`。読み書きを持たない種類のオブジェクトは `INVAL`。
+ * パイプの端（[PipeEnd]）は中身の [ByteStream] として読み書きする。向きの違う端（読む端への書き込み、書く端からの読み）は、権利があっても `BADF`。
  * 燃料の課金はしない（ABI 層が `ctx.chargeFuel` で行う）。
  */
 internal object FdIo {
@@ -109,7 +112,8 @@ internal object FdIo {
      * 何も取り出さない（キューのイベントもタイマーの回数も残る）。p1 の `poll_oneoff`、p2 の `pollable`、p3 の waitable-set が使う。
      *
      * - fd が開いていない、fd にその権利（[HandleRights]）がない: `BADF`
-     * - パイプ（[ByteStream]）: 読みは読めるバイト（`nbytes`）、書きは空き。相手側が閉じていれば `hangup`
+     * - パイプ（[ByteStream]、[PipeEnd]）: 読みは読めるバイト（`nbytes`）、書きは空き。相手側が閉じていれば `hangup`。
+     *   向きの違うパイプの端は `BADF`
      * - コンソール（[Tty]）: 読みは今読めるバイト、書きは出力の空き
      * - ファイル・ディレクトリ（[OpenFile]）: 常にそろう（POSIX の `poll` と同じ）。ファイルの読みは残りのバイト、ほかは 0
      * - そのほかの待てる種類（イベントキュー、タイマー）: [pro.ikili.kibicomputers.core.kernel.obj.KernelObject.isReady] で、`nbytes` は 1
@@ -124,7 +128,8 @@ internal object FdIo {
         return try {
             val entry = table.entry(fd)
             if (entry.rights and (if (reading) HandleRights.READ else HandleRights.WRITE) == 0) return FdReadiness.Error(Errno.BADF)
-            when (val obj = table.objectOf(fd)) {
+            val obj = resolvePipe(kernel, table.objectOf(fd), reading) ?: return FdReadiness.Error(Errno.BADF)
+            when (obj) {
                 is ByteStream -> when {
                     !obj.isReady(condition) -> FdReadiness.Pending(WaitKey(obj.id, condition))
                     reading -> FdReadiness.Ready(obj.available.toLong(), hangup = obj.writeClosed)
@@ -159,7 +164,8 @@ internal object FdIo {
         return try {
             val entry = table.entry(fd)
             if (entry.rights and HandleRights.READ == 0) return IoResult.Error(Errno.BADF)
-            when (val obj = table.objectOf(fd)) {
+            val obj = resolvePipe(kernel, table.objectOf(fd), reading = true) ?: return IoResult.Error(Errno.BADF)
+            when (obj) {
                 is ByteStream -> when (val r = obj.read(dst, off, len, sink)) {
                     is ReadResult.Bytes -> IoResult.Bytes(r.count)
                     ReadResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.READABLE))
@@ -189,7 +195,8 @@ internal object FdIo {
         return try {
             val entry = table.entry(fd)
             if (entry.rights and HandleRights.WRITE == 0) return IoResult.Error(Errno.BADF)
-            when (val obj = table.objectOf(fd)) {
+            val obj = resolvePipe(kernel, table.objectOf(fd), reading = false) ?: return IoResult.Error(Errno.BADF)
+            when (obj) {
                 is ByteStream -> when (val r = obj.write(src, off, len, sink)) {
                     is WriteResult.Bytes -> IoResult.Bytes(r.count)
                     WriteResult.WouldBlock -> IoResult.WouldBlock(WaitKey(obj.id, WaitCondition.WRITABLE))
@@ -206,5 +213,12 @@ internal object FdIo {
         } catch (e: FsException) {
             IoResult.Error(e.errno)
         }
+    }
+
+    // パイプの端なら中身の ByteStream に置き換える。向きが違えば null（`BADF`）。ほかの種類はそのまま
+    private fun resolvePipe(kernel: KernelState, obj: KernelObject, reading: Boolean): KernelObject? {
+        if (obj !is PipeEnd) return obj
+        if (obj.reading != reading) return null
+        return checkNotNull(kernel.objects[obj.streamId] as? ByteStream) { "パイプの端 ${obj.id} の中身 ${obj.streamId} がない" }
     }
 }
