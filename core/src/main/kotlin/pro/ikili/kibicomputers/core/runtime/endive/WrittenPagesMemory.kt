@@ -407,8 +407,10 @@ internal class WrittenPagesMemory(
             val off = a and CHUNK_MASK
             val n = minOf(remaining, CHUNK_SIZE - off)
             val index = a ushr CHUNK_SHIFT
-            // ゼロの区画にゼロだけを書くなら、確保しない（データセグメントの .bss など）
-            if (chunks[index] !== ZERO_CHUNK || !isZero(data, src, n)) {
+            // ゼロの区画にゼロだけを書くなら、確保しない（データセグメントの .bss など）。
+            // ただしインスタンスを作っている途中で、前のデータセグメントが書いた ROM の区画なら書く
+            // （表はまだ ZERO_CHUNK のまま。重なるセグメントは後のものが勝つ。#413）
+            if (chunks[index] !== ZERO_CHUNK || !isZero(data, src, n) || romWriting?.containsKey(index) == true) {
                 writableChunk(index, a, n).put(off, data, src, n)
             }
             a += n
