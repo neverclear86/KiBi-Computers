@@ -14,6 +14,9 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -101,6 +104,44 @@ class MachineConsoleBudgetTest {
         flood("\\27[Sx")
     }
 
+    @Test
+    fun `TTY に書いた後で書き手のスレッドが遅れても、メインスレッドはその出力を取り出さない`() = timeout(limit) {
+        // まとめられない1行送りで、TTY の出力をメインスレッドが取り出せば、1 tick の上限を超えて止める（#419）
+        val screen = TextBuffer(160, 50)
+        boot(screen, MachineConsole.DEFAULT_CELLS_PER_TICK) { b ->
+            val armed = AtomicBoolean(false)
+            val reached = CountDownLatch(1)
+            val go = CountDownLatch(1)
+            // TTY に書いた後・表示デバイスに書く前で、書き手を1回だけ止める（書き手のスレッドが OS に後回しにされたのと同じ）
+            b.machine.scheduler.hooks.beforeConsoleFlush = { _, _ ->
+                if (armed.compareAndSet(true, false)) {
+                    reached.countDown()
+                    go.await(30, TimeUnit.SECONDS)
+                }
+            }
+            b.console.keyboardInput(KeyboardEvent.Paste("while true do io.write((\"\\27[Sx\"):rep(5000)) end\n"))
+            b.tickUntil({ "出力が出ない: ${lines(screen)}" }) { lines(screen).none { it.startsWith("> while") } }
+            armed.set(true)
+            b.tickUntil({ "書き手が止まらない" }) { reached.count == 0L }
+            try {
+                // 書き手が止まっている間に何 tick 進めても、TTY に残った出力を取り出さない（取り出せば止める）
+                repeat(10) {
+                    b.tick()
+                    assertFalse(b.machine.consoleOutputHeld, "書き手のいる出力をメインスレッドが取り出した（#419）")
+                    assertEquals(0, b.console.backlogBytes)
+                }
+            } finally {
+                go.countDown()
+            }
+            repeat(50) {
+                b.tick()
+                LockSupport.parkNanos(5_000_000L)
+                assertFalse(b.machine.consoleOutputHeld, "書き手を再開した後にメインスレッドで出力を止めた（#419）")
+            }
+            assertEquals(MachineState.RUNNING, b.machine.state)
+        }
+    }
+
     private fun flood(unit: String) {
         val screen = TextBuffer(160, 50)
         boot(screen, MachineConsole.DEFAULT_CELLS_PER_TICK) { b ->
@@ -118,9 +159,8 @@ class MachineConsoleBudgetTest {
                 if (b.machine.consoleOutputHeld) held++
                 assertTrue(b.console.backlogBytes <= 128 * 1024, "backlog ${b.console.backlogBytes}")
             }
-            // 書き手がカーネルロックを持っていた tick などは、メインスレッドが配るので、混んだ環境（CI）では数 tick は止まりうる。
-            // プロセスのスレッドで書けていなければ、ほぼ毎 tick 止まる
-            assertTrue(held < 100, "メインスレッドで出力を止めた tick が多い（#355）: $held / 300")
+            // 書き手のスレッドが遅れても（混んだ環境）、書くと予約した出力はメインスレッドが取り出さないので、一度も止めない（#419）
+            assertEquals(0, held, "メインスレッドで出力を止めた tick（#355）")
             assertEquals(MachineState.RUNNING, b.machine.state)
             // 時間は機械に左右されるので、ゆるく見る（上限がなければ1 tick に数千回、画面全体を写す）
             val avgMillis = totalNanos / 250 / 1_000_000.0

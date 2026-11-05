@@ -28,6 +28,10 @@ internal class KernelTestHooks {
     @Volatile
     var beforeFuelUnwound: ((Machine, Int) -> Unit)? = null
 
+    /** プロセスがコンソールの TTY に書いた後・自分のスレッドで表示デバイスに書く前（#419。カーネルロックの外） */
+    @Volatile
+    var beforeConsoleFlush: ((Machine, Int) -> Unit)? = null
+
     /** `stop()` で、登録を確かめた後・割り込みを送る前（カーネルロックの中） */
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null
