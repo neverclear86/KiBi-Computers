@@ -54,10 +54,17 @@ internal object Archives {
 
     /** 先頭のディレクトリ（`zig-<platform>-<version>/` など）を取り除いた相対パス。取り除くと空なら null。 */
     private fun stripFirst(entryName: String): String? =
-        entryName.replace('\\', '/').substringAfter('/', "").trimEnd('/').ifEmpty { null }
+        normalized(entryName).substringAfter('/', "").trimEnd('/').ifEmpty { null }
+
+    /** 区切りを `/` にし、先頭の `./`（MoonBit の tar など）と `/` を落とした名前 */
+    private fun normalized(entryName: String): String {
+        var name = entryName.replace('\\', '/')
+        while (name.startsWith("./") || name.startsWith("/")) name = name.removePrefix(".").removePrefix("/")
+        return name
+    }
 
     private fun relativeName(entryName: String, strip: Boolean): String? =
-        if (strip) stripFirst(entryName) else entryName.replace('\\', '/').trimStart('/').trimEnd('/').ifEmpty { null }
+        if (strip) stripFirst(entryName) else normalized(entryName).trimEnd('/').ifEmpty { null }
 
     private fun resolveInside(dir: Path, relative: String): Path {
         val path = dir.resolve(relative).normalize()
