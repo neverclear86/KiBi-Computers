@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
@@ -244,6 +245,27 @@ class WrittenPagesMemoryTest {
             assertEquals(chunk.toLong(), budget.used)
         }
         assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `重なるデータセグメントで後のものが書いた0が初期のメモリに残る`() {
+        // 16 番地に "hello" を書いた後、18 番地から 3 バイトの 0 を書くセグメント（後のものが勝つ。#413）
+        val bytes = WasmBinary().run {
+            memory(1)
+            data(16, "hello".toByteArray())
+            data(18, ByteArray(3))
+            build()
+        }
+        val module = EndiveRuntime().load(bytes)
+        val config = WasmInstanceConfig.builder()
+            .writtenMemoryLimit(4, Budget(Long.MAX_VALUE))
+            .build()
+        module.instantiate(config).use { instance ->
+            val memory = instance.memory!!
+            assertArrayEquals(byteArrayOf('h'.code.toByte(), 'e'.code.toByte(), 0, 0, 0), memory.read(16, 5))
+            assertEquals(1, romChunks(memory))
+            assertEquals(0, writtenChunks(memory))
+        }
     }
 
     @Test
