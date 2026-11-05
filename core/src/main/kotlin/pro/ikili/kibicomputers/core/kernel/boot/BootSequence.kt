@@ -29,7 +29,8 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 途中で取り消されたら、マウントを外して何も知らせずに終える。
  */
 internal class BootSequence(private val machine: Machine, private val config: BootConfig) {
-    private val opener: BootVolumeOpener get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.DEFAULT
+    private val opener: BootVolumeOpener
+        get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
 
     fun run() {
         try {
@@ -42,7 +43,14 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
                 return
             }
             val (diskId, volume) = findBootVolume() ?: return
-            if (!machine.mountBootRoot(diskId, volume)) {
+            val mounted = try {
+                machine.mountBootRoot(diskId, volume)
+            } catch (t: Throwable) {
+                volume.fs.retire()
+                throw t
+            }
+            if (!mounted) {
+                volume.fs.retire()
                 machine.endBoot(null, "")
                 return
             }
@@ -70,6 +78,8 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             } ?: continue
             opened++
             if (hasInit(volume)) return diskId to volume
+            // 選ばなかった候補は閉じる（ホストのディスクのリースを返す）
+            volume.fs.retire()
         }
         if (opened == 0) {
             machine.endBoot(BootFailure.NO_BOOT_DISK, if (config.bootDisks.isEmpty()) "起動ディスクの候補がない" else "どの候補も開けない: ${config.bootDisks}")

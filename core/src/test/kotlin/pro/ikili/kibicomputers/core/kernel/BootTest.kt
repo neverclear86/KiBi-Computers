@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
@@ -19,9 +20,11 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.HostDiskLeases
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
@@ -33,6 +36,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.wasi.p1.P1
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
@@ -441,7 +446,7 @@ class BootTest {
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { m.state == MachineState.RUNNING }
         val tmpFile = VfsPath.parse("/tmp/a.txt")
-        m.lock.withLockValue {
+        run {
             val f = m.vfs.open(tmpFile, OpenOptions(read = true, write = true, create = true))
             val bytes = "hello".toByteArray()
             assertEquals(bytes.size, m.vfs.write(f, bytes, 0, bytes.size))
@@ -450,7 +455,7 @@ class BootTest {
 
         assertTrue(m.reboot())
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
-        m.lock.withLockValue {
+        run {
             assertThrows<FsException> { m.vfs.stat(tmpFile) }
             assertEquals(FileType.DIRECTORY, m.vfs.stat(VfsPath.parse("/tmp")).type)
         }
@@ -465,6 +470,31 @@ class BootTest {
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
         assertEquals(listOf("/" to "disk:d"), mounts())
         assertEquals("kibi: /tmp not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
+    }
+
+    @Test
+    fun `ホストのディレクトリのディスクから起動し、止めたらディスクの操作を断って閉じる`(@TempDir dir: Path) = env {
+        val diskDir = Files.createDirectories(dir.resolve("d1/sbin")).parent
+        Files.write(diskDir.resolve("sbin/init"), exe(foreverInit()))
+        Files.createDirectories(dir.resolve("empty"))
+        val leases = HostDiskLeases.size
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener.forDisks({ id -> dir.resolve(id).takeIf { id == "d1" || id == "empty" } }, m.hostFiles)
+        assertTrue(m.boot(bootDisks("missing", "empty", "d1")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:d1", "/tmp" to "tmp"), mounts())
+        assertEquals(leases + 1, HostDiskLeases.size, "選ばなかった候補（empty）のリースは返す")
+        // テストのスレッド（カーネルロックの外）から読み書きすると、すぐホストに見える
+        val f = m.vfs.open(VfsPath.parse("/hello.txt"), OpenOptions(read = true, write = true, create = true))
+        assertEquals(1, m.hostFiles.inUse, "開いている間だけホストのファイルを持つ")
+        m.vfs.write(f, "hi".toByteArray(), 0, 2)
+        m.vfs.close(f)
+        assertEquals(0, m.hostFiles.inUse)
+        assertEquals("hi", Files.readString(diskDir.resolve("hello.txt")))
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+        val e = assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/hello.txt")) }
+        assertEquals(Errno.IO, e.errno, "止めたら古いカーネルからの操作は断る")
+        tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
     }
 
     private fun Env.initPid(): Int = m.lock.withLockValue { m.kernel.initPid }

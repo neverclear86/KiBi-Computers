@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel.vfs
 
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 
 /** [Vfs.open] の指定。WASI p1 の `oflags`・`fdflags` と、読み書きの権利に当たる */
 internal data class OpenOptions(
@@ -63,9 +64,19 @@ internal class OpenFile(
     var append: Boolean = append
         internal set
 
-    /** 読み書きの位置（バイト） */
+    /**
+     * 読み書きの位置（バイト）。fd から使う開いたファイルでは、カーネルロックの中でだけ読み書きする
+     * （読み書きそのものは、ロックの外で位置を渡して行う。#52）
+     */
     var position: Long = 0
         internal set
+
+    /**
+     * ファイルシステムに開いたことを知らせた（[FileSystem.retain]）。実行時だけの印で、保存しない
+     * （復元した開いたファイルは知らせないまま使う。[FileSystem.tracksOpenFiles]）
+     */
+    @Volatile
+    internal var retained: Boolean = false
 
     /** ディレクトリか */
     val isDirectory: Boolean get() = type == FileType.DIRECTORY
@@ -74,4 +85,9 @@ internal class OpenFile(
     override fun canWait(condition: WaitCondition): Boolean = !isDirectory
 
     override fun isReady(condition: WaitCondition): Boolean = !isDirectory
+
+    // ファイルシステムに閉じたことを知らせる（カーネルロックの中なので、Vfs が後でロックの外で知らせる。#52）
+    override fun onLastClose(sink: WakeSink) {
+        if (retained) sink.fileClosed(this)
+    }
 }

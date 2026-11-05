@@ -17,7 +17,7 @@ import java.util.TreeMap
  * - 時刻は [clock]（エポックからのナノ秒）。読んだ時刻（atime）は、作った時と [setTimes] だけで変える（読むたびには変えない）
  * - 保存（#82）までは実行時だけ
  *
- * マシンのカーネルロックの中で使う（ロックは持たない）。
+ * カーネルロックの外で、同じマシンのいくつものスレッドから同時に使う。中身は自分のモニター（`@Synchronized`）で守る（中は I/O のないメモリの操作だけ）。
  */
 internal class TmpFileSystem(
     private val memory: MemoryAccount,
@@ -50,24 +50,30 @@ internal class TmpFileSystem(
     private val root = Node(nextNode++, FileType.DIRECTORY, clock()).also { nodes[it.id] = it }
 
     /** このファイルシステムが RAM から確保しているバイト数 */
+    @Volatile
     var usedBytes: Long = 0
         private set
 
     /** ファイルとディレクトリの数（根を含む） */
-    val nodeCount: Int get() = nodes.size
+    val nodeCount: Int @Synchronized get() = nodes.size
 
     // ---- パスの操作 ----
 
+    @Synchronized
     override fun stat(path: VfsPath): FileStat = find(path).stat()
 
+    @Synchronized
     override fun statNode(node: Long): FileStat = node(node).stat()
 
+    @Synchronized
     override fun createFile(path: VfsPath): Long = create(path, FileType.REGULAR_FILE).id
 
+    @Synchronized
     override fun createDirectory(path: VfsPath) {
         create(path, FileType.DIRECTORY)
     }
 
+    @Synchronized
     override fun removeFile(path: VfsPath) {
         val n = find(path)
         if (n.type == FileType.DIRECTORY) fsError(Errno.ISDIR)
@@ -75,6 +81,7 @@ internal class TmpFileSystem(
         free(n, path.name)
     }
 
+    @Synchronized
     override fun removeDirectory(path: VfsPath) {
         if (path.isRoot) fsError(Errno.BUSY)
         val n = find(path)
@@ -84,9 +91,11 @@ internal class TmpFileSystem(
         free(n, path.name)
     }
 
-    override fun rename(from: VfsPath, to: VfsPath) {
+    @Synchronized
+    override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean) {
         if (from.isRoot || to.isRoot) fsError(Errno.BUSY)
         val n = find(from)
+        if (requireDirectory && n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         val dst = directoryOf(to)
         val old = dst.children!![to.name]
         if (old === n) return
@@ -100,7 +109,7 @@ internal class TmpFileSystem(
         reserve(nameCost(to.name))
         val src = directoryOf(from)
         src.children!!.remove(from.name)
-        release(nameCost(from.name))
+        releaseRam(nameCost(from.name))
         if (old != null) free(old, to.name)
         dst.children[to.name] = n
         val now = clock()
@@ -111,6 +120,7 @@ internal class TmpFileSystem(
 
     // ---- node の操作 ----
 
+    @Synchronized
     override fun read(node: Long, position: Long, dst: ByteArray, off: Int, len: Int): Int {
         val n = file(node)
         if (position < 0) fsError(Errno.INVAL)
@@ -133,6 +143,7 @@ internal class TmpFileSystem(
         return count
     }
 
+    @Synchronized
     override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int {
         val n = file(node)
         if (position < 0) fsError(Errno.INVAL)
@@ -164,6 +175,21 @@ internal class TmpFileSystem(
         return done
     }
 
+    @Synchronized
+    override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written {
+        val position = file(node).size
+        return Written(position, write(node, position, src, off, len))
+    }
+
+    @Synchronized
+    override fun allocate(node: Long, size: Long) {
+        if (file(node).size < size) setSize(node, size)
+    }
+
+    @Synchronized
+    override fun sizeHint(node: Long): Long = nodes[node]?.takeIf { it.type == FileType.REGULAR_FILE }?.size ?: 0
+
+    @Synchronized
     override fun setSize(node: Long, size: Long) {
         val n = file(node)
         if (size < 0) fsError(Errno.INVAL)
@@ -172,7 +198,7 @@ internal class TmpFileSystem(
             // 残す塊の数（端の塊は残し、切った後ろを 0 にする。後で伸ばしたときに 0 が見えるように）
             val keep = (size + CHUNK_BYTES - 1) / CHUNK_BYTES
             val dropped = chunks.tailMap(keep, true)
-            release(dropped.size.toLong() * CHUNK_BYTES)
+            releaseRam(dropped.size.toLong() * CHUNK_BYTES)
             dropped.clear()
             val tail = (size % CHUNK_BYTES).toInt()
             if (tail != 0) chunks[size / CHUNK_BYTES]?.fill(0, tail, CHUNK_BYTES)
@@ -181,12 +207,14 @@ internal class TmpFileSystem(
         touch(n, clock())
     }
 
+    @Synchronized
     override fun readDirectory(node: Long): List<DirEntry> {
         val n = node(node)
         val children = n.children ?: fsError(Errno.NOTDIR)
         return children.map { (name, child) -> DirEntry(name, child.type, child.id) }
     }
 
+    @Synchronized
     override fun setTimes(node: Long, accessedNanos: Long?, modifiedNanos: Long?) {
         val n = node(node)
         if (accessedNanos != null) n.accessedNanos = accessedNanos
@@ -195,11 +223,12 @@ internal class TmpFileSystem(
     }
 
     /** 中身をすべて捨て、RAM を返す（根だけの空のファイルシステムに戻る。node は使い回さない） */
+    @Synchronized
     override fun onUnmounted() {
         nodes.clear()
         root.children!!.clear()
         nodes[root.id] = root
-        release(usedBytes)
+        releaseRam(usedBytes)
     }
 
     // ---- 中身 ----
@@ -253,7 +282,7 @@ internal class TmpFileSystem(
         val chunks = n.chunks
         val data = if (chunks == null) 0L else chunks.size.toLong() * CHUNK_BYTES
         chunks?.clear()
-        release(NODE_COST + nameCost(name) + data)
+        releaseRam(NODE_COST + nameCost(name) + data)
     }
 
     private fun touch(n: Node, now: Long) {
@@ -266,7 +295,7 @@ internal class TmpFileSystem(
         usedBytes += bytes
     }
 
-    private fun release(bytes: Long) {
+    private fun releaseRam(bytes: Long) {
         if (bytes == 0L) return
         check(bytes <= usedBytes) { "/tmp の使用量が負になる: $usedBytes - $bytes" }
         usedBytes -= bytes

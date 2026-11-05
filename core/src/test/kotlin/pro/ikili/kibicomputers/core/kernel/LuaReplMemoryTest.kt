@@ -64,7 +64,7 @@ class LuaReplMemoryTest {
             val started = (1..machines).map {
                 val host = ConsoleHost()
                 val m = h.machine(fuelPerTick = 10_000_000, host = host)
-                m.lock.withLockValue { m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root") }
+                run { m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root") }
                 Triple(m, host, m.spawn(program, KernelDrivers.DEFAULT.create(program), SpawnOptions(args = listOf("lua"))))
             }
             eventually(30_000L + machines * 200L, "プロンプトが出ない") {

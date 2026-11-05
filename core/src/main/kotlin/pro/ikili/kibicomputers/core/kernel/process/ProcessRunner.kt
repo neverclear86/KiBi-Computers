@@ -670,10 +670,11 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override val cwd: VfsPath get() = lock.withLockValue { rt.process.cwd }
 
-        override fun changeDirectory(path: String) = lock.withLockValue {
-            val target = VfsPath.resolve(rt.process.cwd, path)
+        override fun changeDirectory(path: String) {
+            // cwd を変えるのはこのプロセスのスレッドだけ。確かめ（VFS）はロックの外（#52）
+            val target = VfsPath.resolve(lock.withLockValue { rt.process.cwd }, path)
             if (machine.vfs.stat(target).type != FileType.DIRECTORY) fsError(Errno.NOTDIR, "$target はディレクトリではない")
-            rt.process.cwd = target
+            lock.withLockValue { rt.process.cwd = target }
         }
 
         override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =

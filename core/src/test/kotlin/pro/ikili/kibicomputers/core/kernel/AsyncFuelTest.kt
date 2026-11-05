@@ -40,7 +40,7 @@ class AsyncFuelTest {
     private fun resource(name: String): ByteArray =
         requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
 
-    private fun Machine.install() = lock.withLockValue {
+    private fun Machine.install() = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         val bytes = resource("fuel-spin-wasi.wasm")
@@ -194,7 +194,7 @@ class AsyncFuelTest {
     fun `Luaの計算の燃料切れも、ほとんどは巻き戻してスレッドを持たずに待つ`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 50_000)
-            m.lock.withLockValue {
+            run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/bin"))
                 val bytes = resource("lua.wasm")
@@ -251,7 +251,7 @@ class AsyncFuelTest {
         val bytes = fallbackModule(200_000)
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 50_000)
-            m.lock.withLockValue {
+            run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/bin"))
                 val f = m.vfs.open(VfsPath.parse("/bin/fallback"), OpenOptions(read = true, write = true, create = true, truncate = true))

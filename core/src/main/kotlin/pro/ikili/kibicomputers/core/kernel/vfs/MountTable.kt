@@ -18,7 +18,7 @@ internal class MountEntry(
 )
 
 /**
- * マウントの表（保存の対象）。マシンのカーネルロックの中で使う。
+ * マウントの表（保存の対象）。マシンのカーネルロックの中で使う（ロックの外からは [Vfs] が公開する写しを読む）。
  *
  * パスは、いちばん長く一致するマウントの位置で、どのマウントに属するかを決める。
  * 1つの位置に重ねてマウントはしない（`BUSY`）。
@@ -50,6 +50,12 @@ internal class MountTable {
         if (list.any { it !== entry && it.point.startsWith(entry.point) }) fsError(Errno.BUSY, "${entry.point} の下にマウントがある")
         list.remove(entry)
         return entry
+    }
+
+    /** 今の中身の写し（[Vfs] が、カーネルロックの外から読むために公開する。写しは変えない） */
+    fun snapshot(): MountTable = MountTable().also {
+        it.list.addAll(list)
+        it.nextMountId = nextMountId
     }
 
     operator fun get(id: Int): MountEntry? = list.firstOrNull { it.id == id }

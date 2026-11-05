@@ -156,7 +156,7 @@ class TotalMemoryLimitTest {
     }
 
     /** `/tmp` をマウントして [bytes] バイト書く（カーネルロックの中） */
-    private fun fillTmp(m: Machine, bytes: Int) = m.lock.withLockValue {
+    private fun fillTmp(m: Machine, bytes: Int) = run {
         assertEquals(null, m.mountTmp())
         val file = m.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = false, write = true, create = true))
         assertEquals(bytes, m.vfs.write(file, ByteArray(bytes), 0, bytes))

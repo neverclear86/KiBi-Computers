@@ -36,7 +36,7 @@ class WasiP1CwdProgramTest {
 
     private val cwdProgram: Program by lazy { load("cwd-wasi.wasm") }
 
-    private fun Machine.setUpRoot() = lock.withLockValue {
+    private fun Machine.setUpRoot() = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/home"))
         vfs.createDirectory(VfsPath.parse("/home/user"))
@@ -51,11 +51,11 @@ class WasiP1CwdProgramTest {
         String(buf, Charsets.UTF_8)
     }
 
-    private fun Machine.readFile(path: String): String? = lock.withLockValue {
+    private fun Machine.readFile(path: String): String? = run {
         val f = try {
             vfs.open(VfsPath.parse(path), OpenOptions(read = true))
         } catch (_: FsException) {
-            return@withLockValue null
+            return@run null
         }
         val buf = ByteArray(64)
         String(buf, 0, vfs.read(f, buf, 0, buf.size), Charsets.UTF_8)
@@ -124,8 +124,8 @@ class WasiP1CwdProgramTest {
                 stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed),
                 fds = SpawnOptions.ROOT_PREOPEN,
             )
-            // 起動して、プログラムが環境変数を読む前に cwd のディレクトリを消す（ロックを持っている間、プログラムは読めない）
-            val pid = m.lock.withLockValue {
+            // 起動して、プログラムが環境変数を読む前に cwd のディレクトリを消す（待機点型は tick を進めるまで動かない）
+            val pid = run {
                 m.spawn(cwdProgram, WasiP1Driver(cwdProgram.module), options).also {
                     m.vfs.removeDirectory(VfsPath.parse("/home/user"))
                 }

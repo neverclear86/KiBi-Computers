@@ -50,7 +50,7 @@ class AsyncP1Test {
     private fun resource(name: String): ByteArray =
         requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
 
-    private fun Machine.installPrompt() = lock.withLockValue {
+    private fun Machine.installPrompt() = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         val bytes = resource("prompt-wasi.wasm")
@@ -395,7 +395,7 @@ class AsyncP1Test {
         assertNull(Program.unsuspendableReason(garbage))
     }
 
-    private fun Machine.installSimd(path: String) = lock.withLockValue {
+    private fun Machine.installSimd(path: String) = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         val bytes = simdCommand()
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
@@ -474,7 +474,7 @@ class AsyncP1Test {
         assertEquals(ProcessKind.WAIT_POINT, WasiP1Driver(program.module).kind)
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
-            m.lock.withLockValue {
+            run {
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 val bytes = computeOnlySimdCommand()
                 val f = m.vfs.open(VfsPath.parse("/compute"), OpenOptions(read = true, write = true, create = true, truncate = true))
