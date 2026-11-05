@@ -132,6 +132,23 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_ioのp1の関数は型が一致するときだけ通り、版違い・表にない関数・p2とp3のinterfaceは断る`() {
+        val dup = Triple(WasiP1Kibi.IO_FD, "dup", listOf(I32, I32) to emptyList<Int>())
+        val dupTo = Triple(WasiP1Kibi.IO_FD, "dup-to", listOf(I32, I32, I32) to emptyList<Int>())
+        val create = Triple(WasiP1Kibi.IO_PIPE, "create", listOf(I32) to emptyList<Int>())
+        // cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(dup, dupTo, create))) }
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup-to", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_PIPE, "create", emptyList<Int>() to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:io/fd@0.2.0", "dup", listOf(I32, I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:io/fd", "dup", listOf(I32, I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup3", listOf(I32, I32, I32, I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:io/pipe-streams@0.1.0", "create", listOf(I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:io/pipe-async@0.1.0", "create", listOf(I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
     fun `関数でないimportは断る`() {
         // (import "wasi_snapshot_preview1" "memory" (memory 1)) と `_start`
         val name = P1.MODULE.toByteArray()

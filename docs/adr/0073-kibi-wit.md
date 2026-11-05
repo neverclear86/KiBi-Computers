@@ -26,7 +26,9 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:kernel` | `events` | イベントキュー（resource `event-queue`） | #73 |
 | `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部） | #426 |
 | `kibi:process` | — | プロセスの生成・待機・強制終了、cwd を変える import（ADR 0332） | #74 |
-| `kibi:io` | — | パイプと fd の複製、TTY（raw モード・大きさ・前のプロセス） | #75・#427 |
+| `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
+| `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
+| `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス） | #427 |
 | `kibi:device` | — | デバイスの列挙と操作 | #77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間 | #426 |
@@ -34,6 +36,12 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:network` | — | ソケット（`wasi:sockets` で足りなければ） | #76 |
 
 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）を使い、`kibi:*` には入れない。
+
+### WIT の書き方（#75 で追記）
+
+- 識別子（interface・関数・型の名前、引数名、フィールド名、case 名）が WIT のキーワード（`from`・`use`・`type`・`stream`・`s64` など。wit-parser の字句解析のもの）に当たるなら、`%` で逃がす（`events.wit` の `%s64`）か改名する。名前は p1 の import の関数名・モジュール名に出ることがあるので、改名で済むなら改名を選ぶ（引数名は出ない）
+- 新しい WIT は `KibiWitParseTest` が wasm-tools（`wasm-tools component wit`。Endive の `run.endive:wasm-tools`。テストだけの依存）で解析・解決する。`src/main/wit/` のパッケージのディレクトリをすべて対象にするので、パッケージを足せば自動で対象になる。ほかの `kibi:*` のパッケージと、テストのリソースの `wit-stubs/`（`wasi:*` の最小のスタブ）を `deps/` に置いて解決する
+- `KibiWitTableTest` は、予約語の識別子をテキストで拾う検査（速く分かりやすく失敗させるための補助）も持つ
 
 ## p1 向けの import の導き方（Q2-B・Q3-A）
 
@@ -135,7 +143,7 @@ interface events {
 
 ## 実装
 
-- WIT: `core/src/main/wit/kibi-kernel/{types,events,world}.wit`、`core/src/main/wit/kibi-computer/{memory,world}.wit`
+- WIT: `core/src/main/wit/kibi-kernel/{types,events,world}.wit`、`core/src/main/wit/kibi-computer/{memory,world}.wit`、`core/src/main/wit/kibi-io/`（#75。ADR 0075）
 - `core.wasi.kibi.KibiErrors`（`error-code` の写し方）、`KibiEvents`（意味の部分。ABI の層に依らない）
 - `core.wasi.p1.P1Canonical`（p1 に要る Canonical ABI の最小限の lift・lower。#264 ができたら置き換える）、`WasiP1Kibi`（import の表）、`WasiP1.checkImports`（読み込みの検査）
 - `ProcessContext.callGuest`・`inGuestCall`
@@ -144,7 +152,8 @@ interface events {
 ## テスト
 
 - `KibiErrorsTest`: 判別子 + 1 = p1 の errno、`types.wit` の並びと `Errno` の並びが一致
-- `KibiWitTableTest`: p1 向けの表のモジュール名・関数名が WIT から導いたものと一致
+- `KibiWitTableTest`: p1 向けの表のモジュール名・関数名が WIT から導いたものと一致。予約語の識別子がない（#75）
+- `KibiWitParseTest`（#75）: `src/main/wit/` の全パッケージを wasm-tools で解析・解決できる。予約語の引数名・存在しない型の参照が失敗すること
 - `KibiEventsTest`: 開く・取り出す・`dropped`・フィルター、`max`・`capacity`・`kinds` の境界、`nfile`・`bad-descriptor`
 - `P1CanonicalTest`: 配置、`cabi_realloc` の呼び出しの順と align・size、上限を超えたときに中身を読まないこと、UTF-8・範囲外、書き先と `cabi_realloc` の誤りのトラップ
 - `WasiP1KibiTest`（`kibi_events.c` を Endive とカーネルで）: `poll_oneoff` で待って取り出す（待機点型・ブロッキング型、`[resource-drop]` と `fd_close`）、不正な入力、`max` の境界、`cabi_realloc` の中の燃料切れ、`cabi_realloc` の中の止まりうる import が3つの待ち方のどれでもトラップ
@@ -154,7 +163,7 @@ interface events {
 
 - タイマー・sleep・uptime・ゲーム内時間の関数の形と、`timer` のイベントの値の写し方: #426（この ADR の規則で WIT から導く）
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
-- プロセス・パイプ・ソケット・デバイス・電源・キーの押下: #74・#75・#76・#77・#306・#326
+- プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
 - p2・p3 の層（`pollable`・async、Canonical ABI の一般の実装）: #264・#266
 - 生成した束縛（wit-bindgen）: SDK #116
 - 燃料とキューの既定の容量の確定: #251
