@@ -8,7 +8,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.File
 
 /**
- * p1 向けの import の表（[WasiP1Kibi]）が、`core/src/main/wit/` の WIT からずれていないこと（#73・#75）。
+ * p1 向けの import の表（[WasiP1Kibi]）が、`core/src/main/wit/` の WIT からずれていないこと（#73・#75・#426）。
  * 完全なパーサーではなく、`package`・`interface`・`resource`・関数の名前だけを読む。
  * WIT として正しいか（解析・解決できるか）は `KibiWitParseTest` が wasm-tools で確かめる。ここの予約語の検査は、速く分かりやすく失敗させるための補助。
  */
@@ -21,7 +21,7 @@ class KibiWitTableTest {
         val pkgRe = Regex("""^\s*package\s+([a-z0-9-]+):([a-z0-9-]+)@([0-9.]+)\s*;""")
         val ifaceRe = Regex("""^\s*interface\s+([a-z0-9-]+)\s*\{""")
         val resourceRe = Regex("""^\s*resource\s+([a-z0-9-]+)\s*\{""")
-        val funcRe = Regex("""^\s*%?([a-z0-9-]+)\s*:\s*(static\s+)?func\b""")
+        val funcRe = Regex("""^\s*%?([a-z0-9-]+)\s*:\s*(static\s+)?(async\s+)?func\b""")
         val ctorRe = Regex("""^\s*constructor\s*\(""")
         for (f in files) {
             var pkg: Triple<String, String, String>? = null
@@ -66,7 +66,7 @@ class KibiWitTableTest {
     }
 
     @Test
-    fun `WITのkernel_eventsとcomputer_memoryの関数はすべてp1に出している`() {
+    fun `p1に出しているinterfaceのWITの関数はすべてp1に出している`() {
         val wit = derived().filter { it.first in WasiP1Kibi.modules }.toSet()
         assertTrue(wit.isNotEmpty())
         for (fn in wit) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
@@ -99,6 +99,53 @@ class KibiWitTableTest {
         }
         val uses = useLines(witText("kibi-io/pipe-streams.wit")).filter { "wasi:" in it }
         assertEquals(listOf("use wasi:io/streams@0.2.3.{input-stream, output-stream};"), uses)
+    }
+
+    @Test
+    fun `kibi_kernel_timersとkibi_computer_clockの関数はすべてp1に出している`() {
+        val wit = derived()
+        val timers = setOf(
+            "[static]timer.create", "[method]timer.set-after", "[method]timer.set-at", "[method]timer.cancel", "[method]timer.read", "[resource-drop]timer",
+        ).map { WasiP1Kibi.TIMERS to it }.toSet()
+        val clock = setOf("uptime-ticks", "world-ticks").map { WasiP1Kibi.CLOCK to it }.toSet()
+        assertEquals(timers, wit.filter { it.first == WasiP1Kibi.TIMERS }.toSet())
+        assertEquals(clock, wit.filter { it.first == WasiP1Kibi.CLOCK }.toSet())
+        for (fn in timers + clock) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
+    }
+
+    @Test
+    fun `kibi_kernelのp2とp3のinterfaceはWITにあり、p1には出さない`() {
+        val wit = derived()
+        val expected = mapOf(
+            "kibi:kernel/timers-poll@0.1.0" to "subscribe",
+            "kibi:kernel/events-poll@0.1.0" to "subscribe",
+            "kibi:kernel/timers-async@0.1.0" to "wait",
+            "kibi:kernel/events-async@0.1.0" to "take",
+        )
+        for ((m, f) in expected) {
+            assertTrue((m to f) in wit, "$m.$f が WIT にない（async func も読めること）")
+            assertFalse(m in WasiP1Kibi.modules, "$m を p1 に出している")
+        }
+    }
+
+    @Test
+    fun `kibi_kernelのp1とp3の部分はwasiを参照せず、p2はpipe-streamsと同じ版のwasi_io_pollのpollableだけを使う`() {
+        val world = witText("kibi-kernel/world.wit")
+        val imports = Regex("""world\s+imports\s*\{([^}]*)}""").find(world)!!.groupValues[1]
+        assertFalse("wasi:" in imports, imports)
+        for (f in listOf("types.wit", "events.wit", "timers.wit", "timers-async.wit", "events-async.wit", "world.wit")) {
+            assertFalse(useLines(witText("kibi-kernel/$f")).any { "wasi:" in it }, "$f が wasi:* を使っている")
+        }
+        assertFalse(useLines(witText("kibi-computer/clock.wit")).any { "wasi:" in it })
+        for (f in listOf("timers-poll.wit", "events-poll.wit")) {
+            val uses = useLines(witText("kibi-kernel/$f")).filter { "wasi:" in it }
+            assertEquals(listOf("use wasi:io/poll@0.2.3.{pollable};"), uses, f)
+        }
+        // pipe-streams（ADR 0075）と同じ wasi:io の版（同じゲストの中で pollable の型をそろえる。ADR 0426）
+        val ioVersion = Regex("""wasi:io/[a-z-]+@([0-9]+\.[0-9]+\.[0-9]+)""")
+        val streamsVersion = ioVersion.find(witText("kibi-io/pipe-streams.wit"))!!.groupValues[1]
+        val pollVersion = ioVersion.find(witText("kibi-kernel/timers-poll.wit"))!!.groupValues[1]
+        assertEquals(streamsVersion, pollVersion)
     }
 
     private fun useLines(text: String): List<String> =

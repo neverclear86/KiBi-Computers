@@ -1,0 +1,10 @@
+package kibi:kernel@0.1.0;
+
+/// p2 でタイマーを待つ（ADR 0426）。仮置き: interface・関数・型・`wasi:*` の版は、p2 の層 #264 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+interface timers-poll {
+    use timers.{timer};
+    use wasi:io/poll@0.2.3.{pollable};
+
+    /// 回数が 1 以上になると ready になる pollable。キューを渡して作ったタイマーは ready にならない（キューの側で待つ）
+    subscribe: func(t: borrow<timer>) -> pollable;
+}

@@ -140,6 +140,12 @@ kibiWasm {
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:kernel/timers・kibi:computer/clock（#426）の p1 の import を確かめる CLI
+    module("kibi-timers-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_timers.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // 独自拡張 kibi:io/fd・kibi:io/pipe（#75）の p1 の import を確かめる CLI
     module("kibi-io-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_io.c")

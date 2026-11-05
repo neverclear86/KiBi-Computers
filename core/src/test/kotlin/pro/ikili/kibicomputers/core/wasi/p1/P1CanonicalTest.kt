@@ -139,7 +139,41 @@ class P1CanonicalTest {
         assertErrno(Errno.INVAL) { P1Canonical.liftOptionU32(2, 0) }
     }
 
+    @Test
+    fun `optionの判別子は0と1だけを読み、ほかはnull`() {
+        assertEquals(false, P1Canonical.liftOptionDisc(0))
+        assertEquals(true, P1Canonical.liftOptionDisc(1))
+        assertNull(P1Canonical.liftOptionDisc(2))
+        assertNull(P1Canonical.liftOptionDisc(-1))
+    }
+
+    @Test
+    fun `u64の引数は2の63乗以上をLong_MAX_VALUEに頭打ちにする`() {
+        assertEquals(0L, P1Canonical.u64Arg(0))
+        assertEquals(Long.MAX_VALUE, P1Canonical.u64Arg(Long.MAX_VALUE))
+        assertEquals(Long.MAX_VALUE, P1Canonical.u64Arg(Long.MIN_VALUE))
+        assertEquals(Long.MAX_VALUE, P1Canonical.u64Arg(-1))
+    }
+
     // ---- lower ----
+
+    @Test
+    fun `result_u64はタグを0に、値と判別子を8に書き、使わない所を0にする`() {
+        val m = FakeMemory(1)
+        m.write(0x100, ByteArray(16) { 0x55 })
+        P1Canonical.lowerU64Result(m, 0x100, -2L, 0)
+        assertEquals(0, m.readU8(0x100))
+        assertArrayEquals(ByteArray(7), m.read(0x101, 7))
+        assertEquals(-2L, m.readI64(0x108))
+        m.write(0x100, ByteArray(16) { 0x55 })
+        P1Canonical.lowerU64Result(m, 0x100, null, 7)
+        assertEquals(1, m.readU8(0x100))
+        assertEquals(7, m.readU8(0x108))
+        assertArrayEquals(ByteArray(7), m.read(0x109, 7))
+        // 範囲外・align 違いはトラップ
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, assertThrows<WasmTrapException> { P1Canonical.lowerU64Result(m, WasmMemory.PAGE_SIZE - 8, 1, 0) }.kind)
+        assertThrows<WasmTrapException> { P1Canonical.lowerU64Result(m, 0x104, 1, 0) }
+    }
 
     @Test
     fun `result_ownはタグを0に、ハンドルを4に書く`() {

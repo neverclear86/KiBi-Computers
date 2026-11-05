@@ -24,14 +24,15 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | --- | --- | --- | --- |
 | `kibi:kernel` | `types` | 共通の型（`error-code`） | #73 |
 | `kibi:kernel` | `events` | イベントキュー（resource `event-queue`） | #73 |
-| `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部） | #426 |
+| `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部。ADR 0426） | #426 |
+| `kibi:kernel` | `timers-poll`・`events-poll`・`timers-async`・`events-async` | p2・p3 でタイマー・イベントキューを待つ（仮置き。ADR 0426） | #426 |
 | `kibi:process` | — | プロセスの生成・待機・強制終了、cwd を変える import（ADR 0332） | #74 |
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス） | #427 |
 | `kibi:device` | — | デバイスの列挙と操作 | #77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
-| `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間 | #426 |
+| `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | — | 電源（停止・再起動） | #306 |
 | `kibi:network` | — | ソケット（`wasi:sockets` で足りなければ） | #76 |
 
@@ -143,7 +144,7 @@ interface events {
 
 ## 実装
 
-- WIT: `core/src/main/wit/kibi-kernel/{types,events,world}.wit`、`core/src/main/wit/kibi-computer/{memory,world}.wit`、`core/src/main/wit/kibi-io/`（#75。ADR 0075）
+- WIT: `core/src/main/wit/kibi-kernel/{types,events,world}.wit`、`core/src/main/wit/kibi-computer/{memory,world}.wit`、`core/src/main/wit/kibi-io/`（#75。ADR 0075）、`kibi-kernel/timers*.wit`・`events-poll.wit`・`events-async.wit`・`kibi-computer/clock.wit`（#426。ADR 0426）
 - `core.wasi.kibi.KibiErrors`（`error-code` の写し方）、`KibiEvents`（意味の部分。ABI の層に依らない）
 - `core.wasi.p1.P1Canonical`（p1 に要る Canonical ABI の最小限の lift・lower。#264 ができたら置き換える）、`WasiP1Kibi`（import の表）、`WasiP1.checkImports`（読み込みの検査）
 - `ProcessContext.callGuest`・`inGuestCall`
@@ -162,6 +163,7 @@ interface events {
 ## 決めないこと
 
 - タイマー・sleep・uptime・ゲーム内時間の関数の形と、`timer` のイベントの値の写し方: #426（この ADR の規則で WIT から導く）
+  - 追記（#426）: ADR 0426 で決めた。`events` の p2・p3 での待ち方（`events-poll`・`events-async`。仮置き）も ADR 0426
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
 - p2・p3 の層（`pollable`・async、Canonical ABI の一般の実装）: #264・#266

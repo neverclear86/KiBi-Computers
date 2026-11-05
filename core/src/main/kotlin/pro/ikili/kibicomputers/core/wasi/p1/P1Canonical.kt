@@ -22,6 +22,7 @@ import java.nio.charset.CodingErrorAction
  * - `list<T>`・`string`: `{ ptr: i32 @0, len: i32 @4 }`（8 / 4）
  * - `result<own<_>, error-code>`・`result<u32, error-code>`: `{ tag: u8 @0, payload @4 }`（ok ならハンドル・値 i32、err なら判別子 u8。8 / 4）
  * - `result<_, error-code>`: `{ tag: u8 @0, err: u8 @1 }`（2 / 1）
+ * - `result<u64, error-code>`: `{ tag: u8 @0, ok: u64 @8 | err: u8 @8 }`（16 / 8。#426）
  * - `result<pipe-ends, error-code>`: `{ tag: u8 @0, ok: { read: u32 @4, write: u32 @8 } | err: u8 @4 }`（12 / 4）
  * - `result<event-batch, error-code>`: `{ tag: u8 @0, ok: { events.ptr @8, events.len @12, dropped: u64 @16 } | err: u8 @8 }`（24 / 8）
  * - `event`: `{ kind @0, source @8, values @16 }`（24 / 4）
@@ -43,6 +44,10 @@ internal object P1Canonical {
     /** `result<_, error-code>` の大きさ・align */
     const val UNIT_RESULT_SIZE: Int = 2
     const val UNIT_RESULT_ALIGN: Int = 1
+
+    /** `result<u64, error-code>`（`kibi:kernel/timers` の `read`）の大きさ・align */
+    const val U64_RESULT_SIZE: Int = 16
+    const val U64_RESULT_ALIGN: Int = 8
 
     /** `result<pipe-ends, error-code>`（`kibi:io/pipe.create`）の大きさ・align */
     const val PIPE_RESULT_SIZE: Int = 12
@@ -96,6 +101,28 @@ internal object P1Canonical {
         0 -> null
         1 -> u32(value)
         else -> fsError(Errno.INVAL, "option の判別子が不正（$isSome）")
+    }
+
+    /** `option<T>` の平らにした判別子。0 なら `false`（none）、1 なら `true`（some）、ほかは `null`（呼んだ側が `INVAL` にする） */
+    fun liftOptionDisc(isSome: Int): Boolean? = when (isSome) {
+        0 -> false
+        1 -> true
+        else -> null
+    }
+
+    /** `u64` の引数（core の i64 のビット列）を 0..`Long.MAX_VALUE` にする。2^63 以上（`Long` で負）は `Long.MAX_VALUE` に頭打ち */
+    fun u64Arg(v: Long): Long = if (v < 0) Long.MAX_VALUE else v
+
+    /** `result<u64, error-code>` を [retPtr] に書く。[value] が `null` なら err（[error] は判別子）。使わない所は 0 にする */
+    fun lowerU64Result(memory: WasmMemory, retPtr: Int, value: Long?, error: Int) {
+        checkStore(memory, retPtr, U64_RESULT_SIZE, U64_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(U64_RESULT_SIZE))
+        if (value != null) {
+            memory.writeI64(retPtr + 8, value)
+        } else {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 8, error)
+        }
     }
 
     /** `result<own<_>, error-code>` を [retPtr] に書く。[handle] が `null` なら err（[error] は判別子） */

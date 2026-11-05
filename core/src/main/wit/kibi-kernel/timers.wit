@@ -1,0 +1,34 @@
+package kibi:kernel@0.1.0;
+
+/// タイマー（#64・#426。ADR 0064・0426）。カーネルのイベントのしくみの一部。
+///
+/// p1 では、`timer` のハンドルはカーネルの fd 番号。鳴った回数が 1 以上の間、`poll_oneoff` の `FD_READ` で待てる。
+/// 時計は `wasi:clocks/monotonic-clock`（p1 の `clock_time_get(MONOTONIC)`）と同じで、単位はナノ秒。
+/// p2 の `pollable`・p3 の async での待ち方は、`wasi:io` に依存しないよう別の interface（`timers-poll`・`timers-async`）に置く。
+interface timers {
+    use types.{error-code};
+    use events.{event-queue};
+
+    /// タイマー。作ると止まった状態で、`set-after`・`set-at` で動かす。
+    resource timer {
+        /// 止まった状態のタイマーを作る。
+        /// events を渡すと、鳴るたびにそのキューへ種類 "timer"・出したもの ""・値 [s64(tag), s64(回数)] のイベントを入れる
+        /// （そのときは read は 0 を返し、FD_READ にもならない）。省くとイベントは出さない。
+        /// キューでなければ bad-descriptor、キューが "timer" を受け取らなければ invalid、ハンドル表が満杯なら mfile。
+        create: static func(events: option<tuple<borrow<event-queue>, s64>>) -> result<timer, error-code>;
+
+        /// 今から duration ナノ秒後に鳴らす（0 ならすぐ）。interval が 0 でなければ、その後 interval ナノ秒ごとに繰り返す。
+        /// 設定し直すと回数は 0 に戻る。interval が 0 でなく 50 ms（仮の値。#251）未満なら invalid、
+        /// マシンの動いているタイマーが上限なら nfile。2^63 以上の値は 2^63-1 として扱う。
+        set-after: func(duration: u64, interval: u64) -> result<_, error-code>;
+
+        /// 単調時計が instant（ナノ秒）になったら鳴らす（過ぎていればすぐ）。interval とエラーは set-after と同じ。
+        set-at: func(instant: u64, interval: u64) -> result<_, error-code>;
+
+        /// 止める（回数も 0 に戻す）。
+        cancel: func() -> result<_, error-code>;
+
+        /// 前回から鳴った回数を取り出して 0 に戻す。待たない。
+        read: func() -> result<u64, error-code>;
+    }
+}

@@ -1,0 +1,13 @@
+package kibi:computer@0.1.0;
+
+/// コンピューターの時計（#426。ADR 0064・0426）。
+/// 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）を使い、ここには入れない。p1・p2・p3 で同じ形（待たない）。
+///
+/// p1 向けには、ADR 0073 の規則でモジュール `kibi:computer/clock@0.1.0` の import（`uptime-ticks`・`world-ticks`）として出している。
+interface clock {
+    /// 起動からの経過（tick。1 tick = 50 ms の想定。起動したときが 0。マシンが動いていた tick だけを数え、保存・復元をまたいで続く）
+    uptime-ticks: func() -> u64;
+
+    /// ゲーム内時間（ワールドの tick。Level.getGameTime() 相当。ワールドがなければ 0）。保存・復元で飛ぶ
+    world-ticks: func() -> u64;
+}
