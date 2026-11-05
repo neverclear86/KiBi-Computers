@@ -16,7 +16,7 @@ import java.io.ByteArrayOutputStream
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** 独自拡張 `kibi:memory`（#408）の p1 の import を、WASM のプログラムから Endive とカーネルを通して確かめる */
+/** 独自拡張 `kibi:computer/memory`（#408）の p1 の import を、WASM のプログラムから Endive とカーネルを通して確かめる */
 class KibiMemoryProgramTest {
     private val limit = Duration.ofSeconds(90)
     private val kib = 1024L

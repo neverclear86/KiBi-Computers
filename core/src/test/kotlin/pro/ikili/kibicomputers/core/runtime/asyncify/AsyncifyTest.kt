@@ -58,7 +58,7 @@ class AsyncifyTest {
             val module = EndiveRuntime().load(Instrumentation.apply(resource(name), WasiP1.WAIT_IMPORTS))
             assertTrue(module.isAsyncified, name)
             assertTrue(module.isFuelMetered, name)
-            // 退避の import（kibi.async_push・async_pop）は残さない。lua.wasm は同じモジュールの kibi:memory（#408）を import する
+            // 退避の import（kibi.async_push・async_pop）は残さない。lua.wasm は kibi:computer/memory@0.1.0（#408・#73）を import する
             assertTrue(
                 module.imports.none { it.module == WasmAsync.IMPORT_MODULE && it.name in setOf(WasmAsync.PUSH, WasmAsync.POP) },
                 "$name: ${module.imports}",

@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #64（task）。前提: ADR 0043（カーネル全体の設計）、0044（MC 側との境界。`MachineClock`）、0063（イベントキュー）
-- 後続: #72（p1 の `poll_oneoff` の時計の購読）、#73（`kibi:*` の WIT と p1 の import）、#81・#82（保存）、#87（復元時の「時間が飛んだ」イベント）、#264・#266（p2 の pollable・p3 の waitable-set）、#251（仮の値の確定）
+- 後続: #72（p1 の `poll_oneoff` の時計の購読）、#73（`kibi:*` の WIT と p1 の import。ADR 0073）、#426（タイマーと時計）、#81・#82（保存）、#87（復元時の「時間が飛んだ」イベント）、#264・#266（p2 の pollable・p3 の waitable-set）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -96,6 +96,7 @@ MachineScheduler
 ## 決めないこと
 
 - WASM から見える ABI: p1 の `poll_oneoff` の時計の購読（#72）、`kibi:*` の WIT と p1 の import（タイマー・sleep・`uptime`・ゲーム内時間を見せる形、イベントの値の写し方。#73）、p2 の `wasi:clocks`・pollable（#264）、p3（#266）
+  - 追記（#73）: イベントの値の写し方は ADR 0073。タイマー（`kibi:kernel/timers`）・sleep・uptime とゲーム内時間（`kibi:computer/clock`）を見せる形は #426。現在時刻・単調時計は `wasi:clocks` のまま
 - 保存のバイト形式（#81・#82）、復元時の「時間が飛んだ」イベントの種類と中身（#87）
 - Lua の `os.sleep`・`event` との対応（#94・#95）
 - 燃料の費用（#47・#251）、仮の値の確定（#251）

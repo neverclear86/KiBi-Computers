@@ -297,7 +297,7 @@ internal class FakeMemory(
     }
 
     /**
-     * `kibi:memory` の `commit`（#408）。[written] があれば、範囲にかかる区画のうちまだ数えていないものを、
+     * `kibi:computer/memory` の `commit`（#408）。[written] があれば、範囲にかかる区画のうちまだ数えていないものを、
      * 残りが [keepBytes] 以上残るときだけまとめて数える（Endive の `WrittenPagesMemory.commitRange` と同じ規則）
      */
     override fun commit(address: Int, length: Int, keepBytes: Long): Boolean {

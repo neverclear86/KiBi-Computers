@@ -125,9 +125,15 @@ kibiWasm {
         sources.from("src/test/wasm/oom_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
-    // 独自拡張 kibi:memory（#408）の p1 の import を確かめる CLI
+    // 独自拡張 kibi:computer/memory（#408・#73）の p1 の import を確かめる CLI
     module("kibi-memory-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_memory_wasi.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:kernel/events（#73）の p1 の import と cabi_realloc の呼び出しを確かめる CLI
+    module("kibi-events-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_events.c")
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }

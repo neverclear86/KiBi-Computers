@@ -53,6 +53,7 @@
 - `BLOCKING` のプロセス（`WasiP1Driver`）で、fd に `NONBLOCK` がなければ、ストリームは `ctx.block` で待つ
 - `NONBLOCK` は `HandleEntry.flags` に p1 の `fdflags` のビット（4）で持つ（flags の意味は ABI 層が決める。ADR 0058）。POSIX と違い、fd ごと（dup した相手と共有しない）
 - `WAIT_POINT` のプロセスは待たずに `AGAIN`（p1 の reactor をどう待たせるかは #63・#72）
+  - 追記（#73）: p1 の reactor の入口は定義しない（ADR 0073）。コマンド形式の p1 は待機点への変換（ADR 0329）で待つ
 
 ### preopen
 

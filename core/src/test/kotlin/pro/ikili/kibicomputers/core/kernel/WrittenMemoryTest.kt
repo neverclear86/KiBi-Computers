@@ -133,7 +133,7 @@ class WrittenMemoryTest {
 
     @Test
     fun `LuaがRAMを超えて確保すると、not enough memoryで終わり、メモリ不足が原因だったと表示する`() = timeout(limit) {
-        // アロケーターが書く前に kibi:memory の commit で数えさせ、断られたら NULL を返す（#409）。トラップにならない
+        // アロケーターが書く前に kibi:computer/memory の commit で数えさせ、断られたら NULL を返す（#409）。トラップにならない
         val r = run("lua.wasm", listOf("lua", "-e", "print(#string.rep('x', 16 * 1024 * 1024))"), ramBytes = 8 * 1024 * kib)
         assertEquals(ProcessState.EXITED, r.state, r.console)
         assertEquals(1, r.exitCode, r.console)

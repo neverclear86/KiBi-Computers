@@ -1,0 +1,212 @@
+package pro.ikili.kibicomputers.core.wasi.p1
+
+import pro.ikili.kibicomputers.core.kernel.event.EventBatch
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+
+/**
+ * p1 向けの独自拡張の import（#73。ADR 0073 の Q2-B）に要る、Canonical ABI の最小限の lift・lower。
+ * Component Model の層（#264）ができたら置き換える。
+ *
+ * 配置は Canonical ABI どおり（リトルエンディアン、wasm32）:
+ * - `list<T>`・`string`: `{ ptr: i32 @0, len: i32 @4 }`（8 / 4）
+ * - `result<own<_>, error-code>`: `{ tag: u8 @0, payload @4 }`（ok ならハンドル i32、err なら判別子 u8。8 / 4）
+ * - `result<event-batch, error-code>`: `{ tag: u8 @0, ok: { events.ptr @8, events.len @12, dropped: u64 @16 } | err: u8 @8 }`（24 / 8）
+ * - `event`: `{ kind @0, source @8, values @16 }`（24 / 4）
+ * - `event-value`: `{ tag: u8 @0, payload @8 }`（s64・f64 は 8 バイト、bool は u8、text・bytes は (ptr, len)。16 / 8）
+ *
+ * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
+ * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
+ */
+internal object P1Canonical {
+    /** ゲストの `cabi_realloc(0, 0, align, size)`。p1 の層が `ctx.callGuest { }` の中で呼ぶ */
+    fun interface Realloc {
+        fun alloc(align: Int, size: Int): Int
+    }
+
+    /** `result<own<_>, error-code>` の大きさ・align */
+    const val HANDLE_RESULT_SIZE: Int = 8
+    const val HANDLE_RESULT_ALIGN: Int = 4
+
+    /** `result<event-batch, error-code>` の大きさ・align */
+    const val BATCH_RESULT_SIZE: Int = 24
+    const val BATCH_RESULT_ALIGN: Int = 8
+
+    /** `event` の大きさ・align */
+    const val EVENT_SIZE: Int = 24
+    const val EVENT_ALIGN: Int = 4
+
+    /** `event-value` の大きさ・align */
+    const val VALUE_SIZE: Int = 16
+    const val VALUE_ALIGN: Int = 8
+
+    /** `event-value` の判別子 */
+    const val VALUE_S64: Int = 0
+    const val VALUE_F64: Int = 1
+    const val VALUE_BOOL: Int = 2
+    const val VALUE_TEXT: Int = 3
+    const val VALUE_BYTES: Int = 4
+
+    /**
+     * `list<string>` を読む。[len] が [maxCount] を超えたら要素を読まずに `INVAL`、要素のバイト数が [maxBytes] の外なら中身を読まずに `INVAL`、
+     * 中身が正しい UTF-8 でなければ `INVAL`、配列・要素が線形メモリの外なら `FAULT`。
+     * 確かめる順は len → 配列の範囲 → 各要素について（バイト数 → 範囲 → UTF-8）。ホストが読むのは最大で maxCount × (8 + maxBytes.last) バイト
+     */
+    @Throws(FsException::class)
+    fun liftStringList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, maxBytes: IntRange): List<String> {
+        val count = u32(len)
+        if (count > maxCount) fsError(Errno.INVAL, "要素は $maxCount 個まで（$count）")
+        if (!P1.inBounds(memory, ptr, count * 8)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
+        if (count == 0L) return emptyList()
+        val out = ArrayList<String>(count.toInt())
+        for (i in 0 until count.toInt()) {
+            val base = ptr + i * 8
+            val sp = memory.readI32(base)
+            val sl = u32(memory.readI32(base + 4))
+            if (sl < maxBytes.first || sl > maxBytes.last) fsError(Errno.INVAL, "文字列は ${maxBytes.first}..${maxBytes.last} バイト（$sl）")
+            if (!P1.inBounds(memory, sp, sl)) fsError(Errno.FAULT, "文字列の範囲が線形メモリの外")
+            out += decodeUtf8(memory.read(sp, sl.toInt()))
+        }
+        return out
+    }
+
+    /** `option<u32>`（平らにした判別子と値）。値は符号なしで広げる。判別子が 0・1 でなければ `INVAL` */
+    @Throws(FsException::class)
+    fun liftOptionU32(isSome: Int, value: Int): Long? = when (isSome) {
+        0 -> null
+        1 -> u32(value)
+        else -> fsError(Errno.INVAL, "option の判別子が不正（$isSome）")
+    }
+
+    /** `result<own<_>, error-code>` を [retPtr] に書く。[handle] が `null` なら err（[error] は判別子） */
+    fun lowerHandleResult(memory: WasmMemory, retPtr: Int, handle: Int?, error: Int) {
+        checkStore(memory, retPtr, HANDLE_RESULT_SIZE, HANDLE_RESULT_ALIGN)
+        if (handle != null) {
+            memory.writeU8(retPtr, 0)
+            memory.writeI32(retPtr + 4, handle)
+        } else {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 4, error)
+        }
+    }
+
+    /**
+     * `result<event-batch, error-code>` を [retPtr] に書く。[batch] が `null` なら err（[error] は判別子）。
+     * ok なら、リストと文字列の場所を [realloc] で取ってから書く（Canonical ABI の順: 先にイベントの配列、続けて各イベントの中身）
+     */
+    fun lowerBatchResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, batch: EventBatch?, error: Int) {
+        checkStore(memory, retPtr, BATCH_RESULT_SIZE, BATCH_RESULT_ALIGN)
+        if (batch == null) {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 8, error)
+            return
+        }
+        val events = batch.events
+        val listPtr = alloc(memory, realloc, EVENT_ALIGN, events.size * EVENT_SIZE)
+        for ((i, e) in events.withIndex()) {
+            val at = listPtr + i * EVENT_SIZE
+            val (kp, kl) = lowerBytes(memory, realloc, utf8(e.type))
+            memory.writeI32(at, kp)
+            memory.writeI32(at + 4, kl)
+            val (sp, sl) = lowerBytes(memory, realloc, utf8(e.source))
+            memory.writeI32(at + 8, sp)
+            memory.writeI32(at + 12, sl)
+            val valuesPtr = alloc(memory, realloc, VALUE_ALIGN, e.values.size * VALUE_SIZE)
+            for ((j, v) in e.values.withIndex()) lowerValue(memory, realloc, valuesPtr + j * VALUE_SIZE, v)
+            memory.writeI32(at + 16, valuesPtr)
+            memory.writeI32(at + 20, e.values.size)
+        }
+        memory.writeU8(retPtr, 0)
+        memory.writeI32(retPtr + 8, listPtr)
+        memory.writeI32(retPtr + 12, events.size)
+        memory.writeI64(retPtr + 16, batch.dropped)
+    }
+
+    private fun lowerValue(memory: WasmMemory, realloc: Realloc, at: Int, v: EventValue) {
+        // 判別子の後ろの詰め物も 0 にする（ゲストが読まない所でも、前の中身を残さない）
+        memory.write(at, ByteArray(VALUE_SIZE))
+        when (v) {
+            is EventValue.I64 -> {
+                memory.writeU8(at, VALUE_S64)
+                memory.writeI64(at + 8, v.value)
+            }
+            is EventValue.F64 -> {
+                memory.writeU8(at, VALUE_F64)
+                memory.writeI64(at + 8, java.lang.Double.doubleToRawLongBits(v.value))
+            }
+            is EventValue.Bool -> {
+                memory.writeU8(at, VALUE_BOOL)
+                memory.writeU8(at + 8, if (v.value) 1 else 0)
+            }
+            is EventValue.Text -> {
+                val (p, l) = lowerBytes(memory, realloc, utf8(v.value))
+                memory.writeU8(at, VALUE_TEXT)
+                memory.writeI32(at + 8, p)
+                memory.writeI32(at + 12, l)
+            }
+            is EventValue.Bytes -> {
+                val (p, l) = lowerBytes(memory, realloc, v.toByteArray())
+                memory.writeU8(at, VALUE_BYTES)
+                memory.writeI32(at + 8, p)
+                memory.writeI32(at + 12, l)
+            }
+        }
+    }
+
+    /** [bytes] の場所を取って書き、(ptr, len) を返す */
+    private fun lowerBytes(memory: WasmMemory, realloc: Realloc, bytes: ByteArray): Pair<Int, Int> {
+        val p = alloc(memory, realloc, 1, bytes.size)
+        if (bytes.isNotEmpty()) memory.write(p, bytes)
+        return p to bytes.size
+    }
+
+    /** `cabi_realloc` で場所を取る。返した場所が線形メモリの外・align に揃っていなければトラップ */
+    private fun alloc(memory: WasmMemory, realloc: Realloc, align: Int, size: Int): Int {
+        val p = realloc.alloc(align, size)
+        if (u32(p) % align != 0L) throw WasmTrapException(WasmTrapKind.OTHER, "cabi_realloc が align $align に揃っていない場所を返した（$p）")
+        if (!P1.inBounds(memory, p, size.toLong())) throw WasmTrapException(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, "cabi_realloc が線形メモリの外を返した（$p）")
+        return p
+    }
+
+    /** 書き先 [ptr] が範囲の中で align に揃っているか確かめる（違えばトラップ） */
+    private fun checkStore(memory: WasmMemory, ptr: Int, size: Int, align: Int) {
+        if (u32(ptr) % align != 0L) throw WasmTrapException(WasmTrapKind.OTHER, "結果の書き先が align $align に揃っていない（$ptr）")
+        if (!P1.inBounds(memory, ptr, size.toLong())) throw WasmTrapException(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, "結果の書き先が線形メモリの外（$ptr）")
+    }
+
+    /** UTF-8 として読む。正しくなければ `INVAL`（置き換えない） */
+    @Throws(FsException::class)
+    private fun decodeUtf8(bytes: ByteArray): String = try {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+    } catch (e: CharacterCodingException) {
+        fsError(Errno.INVAL, "文字列が正しい UTF-8 でない")
+    }
+
+    /** UTF-8 にする。対になっていないサロゲートは U+FFFD にする */
+    fun utf8(s: String): ByteArray {
+        val encoder = Charsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPLACE)
+            .onUnmappableCharacter(CodingErrorAction.REPLACE)
+            .replaceWith(REPLACEMENT)
+        val buf = encoder.encode(CharBuffer.wrap(s))
+        return ByteArray(buf.remaining()).also { buf.get(it) }
+    }
+
+    /** U+FFFD の UTF-8 */
+    private val REPLACEMENT = byteArrayOf(0xEF.toByte(), 0xBF.toByte(), 0xBD.toByte())
+
+    private fun u32(v: Int): Long = v.toLong() and 0xffff_ffffL
+}

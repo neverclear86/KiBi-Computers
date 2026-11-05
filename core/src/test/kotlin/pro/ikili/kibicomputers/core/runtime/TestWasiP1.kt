@@ -7,7 +7,7 @@ import java.io.ByteArrayOutputStream
  *
  * zig cc でビルドした実際のプログラムを、ランタイムの抽象を通して動かすために使う。
  * カーネルの WASI（#259）ではない。標準入出力・引数・時計・乱数だけを持ち、ファイルや preopen はない。
- * 知らない関数は `ENOSYS` を返す。`kibi:memory` の import（#408）は、いつも RAM が足りると答える。
+ * 知らない関数は `ENOSYS` を返す。`kibi:computer/memory` の import（#408）は、いつも RAM が足りると答える。
  */
 class TestWasiP1(private val args: List<String>, stdin: String = "") {
     /** `proc_exit` で投げる。 */
@@ -66,12 +66,12 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
     }
 
     /**
-     * 独自拡張 `kibi:memory`（#408）。同梱の Lua のアロケーター（#409）が呼ぶ。
+     * 独自拡張 `kibi:computer/memory`（#408・#73）。同梱の Lua のアロケーター（#409）が呼ぶ。
      * RAM の上限は持たないので、残りは最大、commit は必ず成功と答える
      */
     private fun kibiFunction(name: String): WasmHostFunction? = when (name) {
-        "memory_remaining" -> WasmHostFunction { _, _ -> longArrayOf(Long.MAX_VALUE) }
-        "memory_commit" -> WasmHostFunction { _, _ -> longArrayOf(1) }
+        "remaining" -> WasmHostFunction { _, _ -> longArrayOf(Long.MAX_VALUE) }
+        "commit" -> WasmHostFunction { _, _ -> longArrayOf(1) }
         else -> null
     }
 
@@ -141,7 +141,7 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
 
     companion object {
         const val MODULE = "wasi_snapshot_preview1"
-        const val KIBI = "kibi"
+        const val KIBI = "kibi:computer/memory@0.1.0"
         private const val SUCCESS = 0
         private const val EBADF = 8
         private const val ENOSYS = 52

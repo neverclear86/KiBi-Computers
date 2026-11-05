@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 
-/** RAM の勘定の「残す量」つきの確保と、残りの RAM（`kibi:memory`。#408） */
+/** RAM の勘定の「残す量」つきの確保と、残りの RAM（`kibi:computer/memory`。#408） */
 class MemoryAccountTest {
     private val page = WasmMemory.PAGE_SIZE.toLong()
 
