@@ -1136,8 +1136,11 @@ internal class ProcessRunner(private val machine: Machine) {
             }
         }
 
+        override fun reserveConsoleFlushLocked() = machine.reserveConsolePumpLocked()
+
         override fun flushConsole() {
-            val cells = machine.pumpConsole()
+            hooks.beforeConsoleFlush?.invoke(machine, rt.pid)
+            val cells = machine.pumpConsole(reserved = true)
             if (cells <= 0 || rt.process.unmetered) return
             // 書いた分は、手持ちがあれば払う（手持ちがない呼び出し元では払わない）
             lock.withLockValue { rt.currentHolder?.let { it.fuel -= cells * MachineLimits.CONSOLE_FUEL_PER_CELL } }

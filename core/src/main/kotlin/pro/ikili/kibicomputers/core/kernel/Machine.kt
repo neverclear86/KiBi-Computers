@@ -933,20 +933,47 @@ public class Machine private constructor(
      * - [consoleSink] がない、またはカーネルロックを持っている（ロックの順は「表示デバイス → カーネル」）
      * - 配っていないカーネルのメッセージがある（その前後の TTY の出力は、メインスレッドが目印で分けて配る。#381）
      * - メインスレッドがコンソールの出力を止めている（画面の処理が追いついていない。#357）
+     *
+     * [reserved] なら、[reserveConsolePumpLocked] の予約を1つ消す（書いても書かなくても。#419）。予約は、TTY から取り出すのと
+     * 同じカーネルロックの中で消すので、書く先のロックを持つメインスレッドからは、予約が消えたときには TTY が空になっている
+     * （書かずに 0 を返したときは、残りをメインスレッドが配る）
      */
-    internal fun pumpConsole(): Long {
-        val sink = consoleSink ?: return 0
-        if (lock.isHeldByCurrentThread) return 0
-        sink.lock.lock()
+    internal fun pumpConsole(reserved: Boolean = false): Long {
+        var unreserved = !reserved
         try {
-            if (consoleSink !== sink) return 0
-            val bytes = lock.withLockValue {
-                if (consoleHold != null || pendingConsoleBytes.get() > 0L) null else drainConsoleOutputLocked()
-            } ?: return 0
-            return sink.write(bytes)
+            val sink = consoleSink ?: return 0
+            if (lock.isHeldByCurrentThread) return 0
+            sink.lock.lock()
+            try {
+                if (consoleSink !== sink) return 0
+                val bytes = lock.withLockValue {
+                    if (!unreserved) {
+                        consolePumpsReserved--
+                        unreserved = true
+                    }
+                    if (consoleHold != null || pendingConsoleBytes.get() > 0L) null else drainConsoleOutputLocked()
+                } ?: return 0
+                return sink.write(bytes)
+            } finally {
+                sink.lock.unlock()
+            }
         } finally {
-            sink.lock.unlock()
+            if (!unreserved) lock.withLockValue { consolePumpsReserved-- }
         }
+    }
+
+    /**
+     * コンソールの TTY に書いて、まだ [pumpConsole] で書いていないプロセスの数（#419。カーネルロック）。
+     * 0 より大きい間は、TTY に残った出力を書き手がいないものとして、メインスレッドが取り出さない（[drainStaleConsoleOutput]）
+     */
+    private var consolePumpsReserved = 0
+
+    /**
+     * コンソールの TTY に書いたプロセスが、この後に [pumpConsole]（`reserved = true`）で書くと予約する（#419）。
+     * TTY に書いたのと同じカーネルロックの中で呼ぶ
+     */
+    internal fun reserveConsolePumpLocked() {
+        consolePumpsReserved++
     }
 
     /**
@@ -1631,7 +1658,8 @@ public class Machine private constructor(
      * 書く先（[consoleSink]）があるとき、コンソールの TTY に残ったままの出力を取り出す（#355）。
      * TTY の出力は、ふつうは書いたプロセスが [pumpConsole] で自分のスレッドで書くので、メインスレッドでは書かない。
      * 前の tick の通知から書き足されずに残っているもの（キー入力のエコー、プロセスが書けなかった分など）だけを取り出す。
-     * まだ書き足されているなら取り出さず、次の tick の通知で見直す
+     * まだ書き足されているか、TTY に書いたプロセスがまだ書いていない（[consolePumpsReserved]。書き手のスレッドが遅れているだけ。#419）
+     * なら取り出さず、次の tick の通知で見直す
      */
     private fun drainStaleConsoleOutput(): ByteArray? = lock.withLockValue {
         val id = kernel.consoleTtyId
@@ -1639,6 +1667,11 @@ public class Machine private constructor(
         when {
             tty.outputAvailable == 0 -> {
                 lastSeenTtyWritten = -1
+                null
+            }
+            consolePumpsReserved > 0 -> {
+                lastSeenTtyWritten = -1
+                recheckTtyOutput = true
                 null
             }
             tty.outputWritten == lastSeenTtyWritten -> {

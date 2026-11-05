@@ -57,15 +57,21 @@ internal object FdIo {
 
     /**
      * 待たずに書く（カーネルロックは自分で取る）。コンソールの TTY に書けたら、たまった出力をこのスレッドで表示デバイスに書く
-     * （[ProcessContext.flushConsole]。#355）
+     * （[ProcessContext.flushConsole]。#355）。書くことは、書いたのと同じカーネルロックの中で予約する
+     * （[ProcessContext.reserveConsoleFlushLocked]。その間に、メインスレッドが書き手のいない出力として取り出さないように。#419）
      */
     fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
-        var console = false
+        var flush = false
         val r = ctx.withKernelLock {
-            console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
-            writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len)
+            val console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
+            val written = writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len)
+            if (console && written is IoResult.Bytes && written.count > 0) {
+                ctx.reserveConsoleFlushLocked()
+                flush = true
+            }
+            written
         }
-        if (console && r is IoResult.Bytes && r.count > 0) ctx.flushConsole()
+        if (flush) ctx.flushConsole()
         return r
     }
 

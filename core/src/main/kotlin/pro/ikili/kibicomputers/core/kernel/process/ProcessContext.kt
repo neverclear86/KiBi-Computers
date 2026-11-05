@@ -311,9 +311,16 @@ internal interface ProcessContext {
     fun chargeFuel(amount: Long)
 
     /**
+     * コンソールの TTY に書いたとき、そのカーネルロックの中で呼ぶ（#355・#419）。この後に [flushConsole] で書くと予約し、
+     * それまでメインスレッドが TTY の出力を「書き手がいない」として取り出さないようにする。呼んだら、ロックを放した後に必ず
+     * [flushConsole] を1回呼ぶ
+     */
+    fun reserveConsoleFlushLocked() {}
+
+    /**
      * コンソールの TTY に書いた後に呼ぶ（#355）。たまった出力を、このスレッドで表示デバイスに書き、
      * 端末の処理の重さ（触ったセルの数）を燃料で払う。表示デバイスがない・今は書けないときは何もしない（メインスレッドが配る）。
-     * カーネルロックを持って呼ばない
+     * [reserveConsoleFlushLocked] の予約を消費する。カーネルロックを持って呼ばない
      */
     fun flushConsole() {}
 
