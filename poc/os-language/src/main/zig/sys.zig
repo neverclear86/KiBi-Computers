@@ -12,10 +12,16 @@ pub extern "wasi_snapshot_preview1" fn args_sizes_get(argc: *u32, buf_size: *u32
 pub extern "wasi_snapshot_preview1" fn args_get(argv: [*][*:0]u8, buf: [*]u8) u16;
 pub extern "wasi_snapshot_preview1" fn proc_exit(code: u32) noreturn;
 
-/// 独自拡張（#408）。`[ptr, ptr+len)` を今のうちに RAM として数える。数えた後の残りが keep 未満になるなら数えずに 0
-pub extern "kibi" fn memory_commit(ptr: u32, len: u32, keep: u64) i32;
-/// 独自拡張（#408）。残りの RAM（バイト）
-pub extern "kibi" fn memory_remaining() u64;
+/// 独自拡張（#408・#73。`kibi:computer/memory@0.1.0` の `commit`）。`[ptr, ptr+len)` を今のうちに RAM として数える。数えた後の残りが keep 未満になるなら数えずに 0
+extern "kibi:computer/memory@0.1.0" fn commit(ptr: u32, len: u32, keep: u64) i32;
+pub fn memory_commit(ptr: u32, len: u32, keep: u64) i32 {
+    return commit(ptr, len, keep);
+}
+/// 独自拡張（#408・#73。`kibi:computer/memory@0.1.0` の `remaining`）。残りの RAM（バイト）
+extern "kibi:computer/memory@0.1.0" fn remaining() u64;
+pub fn memory_remaining() u64 {
+    return remaining();
+}
 
 pub const Iovec = extern struct { base: [*]const u8, len: u32 };
 

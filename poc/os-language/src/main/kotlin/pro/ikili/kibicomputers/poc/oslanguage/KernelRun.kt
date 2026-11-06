@@ -60,13 +60,12 @@ internal class KernelRun(asyncify: Boolean = true) : AutoCloseable {
 
     private fun machine(host: MachineHost, program: ByteArray, files: Map<String, ByteArray>): Machine {
         val m = scheduler.createMachine(host, MachineConfig.builder().fuelPerTick(10_000_000).memoryBytes(16L * 1024 * 1024).build())
-        m.lock.withLock {
-            m.vfs.mount(VfsPath.ROOT, TmpFileSystem(m.memoryAccount) { 0L }, readOnly = false, source = "poc:root")
-            m.vfs.createDirectory(VfsPath.parse("/bin"))
-            m.vfs.createDirectory(VfsPath.parse("/d"))
-            put(m, "/bin/prog", program)
-            for ((name, data) in files) put(m, "/d/$name", data)
-        }
+        // VFS はカーネルロックの外で呼ぶ（ADR 0052）
+        m.vfs.mount(VfsPath.ROOT, TmpFileSystem(m.memoryAccount) { 0L }, readOnly = false, source = "poc:root")
+        m.vfs.createDirectory(VfsPath.parse("/bin"))
+        m.vfs.createDirectory(VfsPath.parse("/d"))
+        put(m, "/bin/prog", program)
+        for ((name, data) in files) put(m, "/d/$name", data)
         return m
     }
 

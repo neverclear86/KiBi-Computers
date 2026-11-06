@@ -54,12 +54,12 @@ fn wasi_proc_exit(code : Int) = "wasi_snapshot_preview1" "proc_exit"
 ///|
 /// 独自拡張（#408）。`[ptr, ptr+len)` を今のうちに RAM として数える。数えた後の残りが keep 未満になるなら数えずに 0
 #unsafe_skip_stub_check
-fn kibi_memory_commit(ptr : Int, len : Int, keep : Int64) -> Int = "kibi" "memory_commit"
+fn kibi_memory_commit(ptr : Int, len : Int, keep : Int64) -> Int = "kibi:computer/memory@0.1.0" "commit"
 
 ///|
 /// 独自拡張（#408）。残りの RAM（バイト）
 #unsafe_skip_stub_check
-fn kibi_memory_remaining() -> Int64 = "kibi" "memory_remaining"
+fn kibi_memory_remaining() -> Int64 = "kibi:computer/memory@0.1.0" "remaining"
 
 ///|
 /// FixedArray[Byte] を渡すと、線形メモリのアドレス（i32）になる。そのまま返す
@@ -274,13 +274,13 @@ pub fn exit(code : Int) -> Unit {
 }
 
 ///|
-/// [buf] の `[off, off+len)` を今のうちに RAM として数える（`kibi.memory_commit`）。数えたら true
+/// [buf] の `[off, off+len)` を今のうちに RAM として数える（`kibi:computer/memory@0.1.0` の `commit`）。数えたら true
 pub fn memory_commit(buf : FixedArray[Byte], off : Int, len : Int, keep : Int64) -> Bool {
   kibi_memory_commit(address(buf, off), len, keep) == 1
 }
 
 ///|
-/// 残りの RAM（バイト。`kibi.memory_remaining`）
+/// 残りの RAM（バイト。`kibi:computer/memory@0.1.0` の `remaining`）
 pub fn memory_remaining() -> Int64 {
   kibi_memory_remaining()
 }

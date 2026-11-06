@@ -175,8 +175,8 @@ internal class MiniWasi(
             ok()
         }
         "wasi_snapshot_preview1.proc_exit" -> WasmHostFunction { _, a -> throw Exit(a[0].toInt()) }
-        "kibi.memory_commit" -> WasmHostFunction { _, _ -> longArrayOf(1) }
-        "kibi.memory_remaining" -> WasmHostFunction { _, _ -> longArrayOf(1L shl 20) }
+        "kibi:computer/memory@0.1.0.commit" -> WasmHostFunction { _, _ -> longArrayOf(1) }
+        "kibi:computer/memory@0.1.0.remaining" -> WasmHostFunction { _, _ -> longArrayOf(1L shl 20) }
         else -> null
     }
 
