@@ -9,6 +9,7 @@
 - 4 の呼び出し数は A の p1 のホスト関数を数えたもの。B では同じ数の p1 呼び出しがアダプタの中で p2 の呼び出し（Canonical ABI の lower、resource のハンドル）に変わる
 - 6 は、#73 の「p1 向けに同じ機能を core の import でも出す」形のモジュールを包めるか。最小の WAT で確かめた
 - 下の出力は #409 より前の `lua.wasm` のもの。#409 で `lua.wasm` が `kibi.memory_remaining`・`kibi.memory_commit` を import するようになったので、#415 から A はその代わりのホスト関数（いつも「足りる」と答える）を足し、B は同じ答えを返す小さなアダプタを `--adapt kibi=...` で一緒に包む（B のコアモジュールが 1 個増える）
+- #73 で、この独自 import は `kibi:computer/memory@0.1.0` の `remaining`・`commit` に改名した（ADR 0073）。A のホスト関数と B の `--adapt kibi:computer/memory@0.1.0=...` も新しい名前にし、`wasm-tools component new` がこの名前のアダプタを受け付けることを確かめた（下の出力は改名前のもの）
 - 環境: Windows 10 / AMD Ryzen 9 3950X / Amazon Corretto 17.0.12。3 の Lua の計算だけのスクリプトは ±10% ほど揺れる
 
 ```text

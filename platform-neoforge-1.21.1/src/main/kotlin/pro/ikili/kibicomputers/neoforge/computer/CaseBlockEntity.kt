@@ -16,17 +16,23 @@ import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.MachineSpecs
+import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.kernel.DiskResolver
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 
 /**
  * ケースブロックのブロックエンティティ（#121）。部品スロット（[parts]）と、電源・状態（`core` の [ComputerCase]）を持つ。
  *
  * - 電源ボタン（[pressPowerButton]）で、サーバーのマシン管理（[ServerMachines]）にマシンを作る・止める
- * - 動いている間に起動に要る部品を抜くと止まる
+ * - 動いている間に起動に要る部品・電源を入れたときにあったディスクを抜くと止まる（判断は `core` の [ComputerCase]）
+ * - 電源を入れるとき、識別子のないディスクに識別子を付け（#124）、挿さっているディスクの写しをマシンの環境に渡す
  * - チャンクのアンロード・ブロックの破壊でマシンを外す
- * - 電源を入れると、隣の画面とキーボードにつないで同梱イメージから起動する（仮の結線。[TestComputerWiring]、#307）
+ * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 同梱イメージの順に起動する（仮の結線。[TestComputerWiring]、#307）
  *
  * セーブデータには部品だけを書く（`Parts`）。電源の状態は書かず、読み込んだら電源が切れている（マシンの状態の保存は #81）。
  */
@@ -58,14 +64,54 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = MachineSpecs.configOf(tier, parts.tiers)
-        val status = computer.pressPowerButton(ServerMachines.current, MachineKey.of(level, blockPos), installedForBoot, true, config)
+        var environment = MachineEnvironment.DEFAULT
+        var boot = TestComputerWiring.BOOT_CONFIG
+        if (computer.status != ComputerStatus.RUNNING) {
+            val disks = prepareDisks()
+            environment = MachineEnvironment.builder().disks(disks.resolver).build()
+            boot = TestComputerWiring.bootConfig(disks.bootOrder)
+        }
+        val status = computer.pressPowerButton(
+            ServerMachines.current,
+            MachineKey.of(level, blockPos),
+            installedForBoot,
+            true,
+            config,
+            environment,
+        )
         val machine = computer.machine
         if (machine == null) {
             wiring.disconnect()
         } else if (machine !== before) {
-            wiring.connect(level, blockPos, machine)
+            wiring.connect(level, blockPos, machine, boot)
         }
         return status
+    }
+
+    /** 電源を入れる前のディスクの用意: 挿さっているディスクの写しと、起動の候補（ディスクのスロットの順） */
+    private class PreparedDisks(val resolver: DiskResolver, val bootOrder: List<String>)
+
+    /**
+     * ディスクのスロットの、識別子のないディスクに識別子を付け（形の正しくない値は上書きしない）、
+     * 挿さっているディスクの写し（[pro.ikili.kibicomputers.core.computer.DiskStore.snapshot]）を作る。
+     * サーバーのディスクの置き場（[WorldDisks]）がなければ、ディスクなし
+     */
+    private fun prepareDisks(): PreparedDisks {
+        val store = WorldDisks.current ?: return PreparedDisks(DiskResolver.NONE, emptyList())
+        val disks = LinkedHashMap<String, PartTier>()
+        var assigned = false
+        for (slot in 0 until tier.slotCount) {
+            if (tier.kindOf(slot) != PartKind.STORAGE) continue
+            val stack = parts.getStackInSlot(slot)
+            val item = stack.item as? DiskItem ?: continue
+            if (DiskItem.needsId(stack)) {
+                stack.set(KiBiDataComponents.DISK_ID.get(), store.newId())
+                assigned = true
+            }
+            DiskItem.diskIdOf(stack)?.let { disks.putIfAbsent(it, item.tier) }
+        }
+        if (assigned) setChanged()
+        return PreparedDisks(store.snapshot(disks), disks.keys.toList())
     }
 
     private fun onPartsChanged() {

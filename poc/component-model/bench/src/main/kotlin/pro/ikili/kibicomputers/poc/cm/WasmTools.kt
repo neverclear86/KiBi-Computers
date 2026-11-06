@@ -64,7 +64,7 @@ object WasmTools {
 
     /**
      * p1 のモジュールを、公式の `wasi_snapshot_preview1` アダプタでコンポーネントに包む。
-     * `extraAdapters` は、ほかの import モジュール名（例: `kibi`）を満たすアダプタ（モジュール名 → コアモジュール）。
+     * `extraAdapters` は、ほかの import モジュール名（例: `kibi:computer/memory@0.1.0`）を満たすアダプタ（モジュール名 → コアモジュール）。
      */
     fun adapt(module: ByteArray, adapter: ByteArray, extraAdapters: Map<String, ByteArray> = emptyMap()): ByteArray {
         val extraFiles = extraAdapters.entries.mapIndexed { i, (name, bytes) -> Triple(name, "adapter-$i.wasm", bytes) }

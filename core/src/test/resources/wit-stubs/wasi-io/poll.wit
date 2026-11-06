@@ -1,0 +1,8 @@
+package wasi:io@0.2.3;
+
+// KibiWitParseTest（#75・#426）が kibi:* の WIT を wasm-tools で解析するためだけの、wasi:io/poll の最小のスタブ。
+// 本物の WIT ではない（kibi:* が参照する型の名前だけを置く）。src/main/wit には置かない。
+// パッケージの前のコメントは1つのファイル（streams.wit）にだけ置ける（wit-parser の規則）ので、ここでは後ろに書く。
+interface poll {
+    resource pollable;
+}

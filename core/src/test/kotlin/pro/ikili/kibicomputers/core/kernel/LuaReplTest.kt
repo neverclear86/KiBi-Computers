@@ -44,7 +44,7 @@ class LuaReplTest {
         condition()
     }
 
-    private fun Machine.installLua() = lock.withLockValue {
+    private fun Machine.installLua() = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         val bytes = resource("lua.wasm")

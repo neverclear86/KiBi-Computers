@@ -5,7 +5,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 
 /**
- * 独自拡張 `kibi:memory`（#408。ABI は #370 で決定）の意味。ABI の層（p1 の import、後の Component Model）に依らない部分。
+ * 独自拡張 `kibi:computer/memory`（#408。ABI は #370 で決定）の意味。ABI の層（p1 の import、後の Component Model）に依らない部分。
  *
  * RAM は、初めて書き込んだ 4 KiB の区画の数で数える（#407）。
  * - `remaining() -> u64`: 残りの RAM（バイト）。プロセスの上限とマシンの RAM のうち、小さい方の残り

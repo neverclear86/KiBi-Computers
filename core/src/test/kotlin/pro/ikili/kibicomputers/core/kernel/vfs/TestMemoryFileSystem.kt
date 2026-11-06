@@ -1,6 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.vfs
 
-/** テスト用の、メモリ上の小さなファイルシステム（本物の `/tmp` は #53） */
+/** テスト用の、メモリ上の小さなファイルシステム（本物の `/tmp` は #53）。いくつものスレッドから使ってよい（`@Synchronized`） */
 internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : FileSystem {
     private class Node(val id: Long, val type: FileType) {
         var data = ByteArray(0)
@@ -44,22 +44,27 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         modifiedNanos = n.modifiedNanos,
     )
 
+    @Synchronized
     override fun stat(path: VfsPath): FileStat = statOf(find(path))
 
+    @Synchronized
     override fun statNode(node: Long): FileStat = statOf(node(node))
 
+    @Synchronized
     override fun createFile(path: VfsPath): Long {
         val p = parentOf(path)
         if (p.children.containsKey(path.name)) fsError(Errno.EXIST)
         return newNode(FileType.REGULAR_FILE).also { p.children[path.name] = it.id }.id
     }
 
+    @Synchronized
     override fun createDirectory(path: VfsPath) {
         val p = parentOf(path)
         if (p.children.containsKey(path.name)) fsError(Errno.EXIST)
         p.children[path.name] = newNode(FileType.DIRECTORY).id
     }
 
+    @Synchronized
     override fun removeFile(path: VfsPath) {
         val n = find(path)
         if (n.type == FileType.DIRECTORY) fsError(Errno.ISDIR)
@@ -67,6 +72,7 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         nodes.remove(n.id)
     }
 
+    @Synchronized
     override fun removeDirectory(path: VfsPath) {
         if (path.isRoot) fsError(Errno.BUSY)
         val n = find(path)
@@ -76,14 +82,17 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         nodes.remove(n.id)
     }
 
-    override fun rename(from: VfsPath, to: VfsPath) {
+    @Synchronized
+    override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean) {
         val n = find(from)
+        if (requireDirectory && n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         val dst = parentOf(to)
         dst.children[to.name]?.let { old -> nodes.remove(old) }
         parentOf(from).children.remove(from.name)
         dst.children[to.name] = n.id
     }
 
+    @Synchronized
     override fun read(node: Long, position: Long, dst: ByteArray, off: Int, len: Int): Int {
         val n = node(node)
         if (position >= n.data.size) return 0
@@ -92,6 +101,7 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         return count
     }
 
+    @Synchronized
     override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int {
         val n = node(node)
         val end = position + len
@@ -100,23 +110,41 @@ internal class TestMemoryFileSystem(override val readOnly: Boolean = false) : Fi
         return len
     }
 
+    @Synchronized
     override fun setSize(node: Long, size: Long) {
         val n = node(node)
         n.data = n.data.copyOf(size.toInt())
     }
 
+    @Synchronized
+    override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written {
+        val position = node(node).data.size.toLong()
+        return Written(position, write(node, position, src, off, len))
+    }
+
+    @Synchronized
+    override fun allocate(node: Long, size: Long) {
+        if (node(node).data.size < size) setSize(node, size)
+    }
+
+    @Synchronized
+    override fun sizeHint(node: Long): Long = nodes[node]?.data?.size?.toLong() ?: 0
+
+    @Synchronized
     override fun readDirectory(node: Long): List<DirEntry> {
         val n = node(node)
         if (n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         return n.children.map { (name, id) -> DirEntry(name, nodes[id]!!.type, id) }
     }
 
+    @Synchronized
     override fun setTimes(node: Long, accessedNanos: Long?, modifiedNanos: Long?) {
         val n = node(node)
         if (accessedNanos != null) n.accessedNanos = accessedNanos
         if (modifiedNanos != null) n.modifiedNanos = modifiedNanos
     }
 
+    @Synchronized
     override fun sync(node: Long) {
         syncCount++
     }

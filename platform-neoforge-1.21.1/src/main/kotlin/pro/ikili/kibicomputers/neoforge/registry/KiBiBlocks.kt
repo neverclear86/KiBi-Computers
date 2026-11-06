@@ -28,6 +28,7 @@ import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseParts
 import pro.ikili.kibicomputers.neoforge.computer.ComputerPartItem
+import pro.ikili.kibicomputers.neoforge.computer.DiskItem
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlock
@@ -78,17 +79,30 @@ object KiBiBlocks {
     /** 部品の種類（拡張カードを除く）。部品のアイテムがある種類 */
     private val PART_KINDS: List<PartKind> = PartKind.entries.filter { it != PartKind.EXPANSION }
 
+    /** 正式なティアでアイテムがある種類（ディスクだけ。#124。CPU・RAM・起動部品は #122・#123・#125） */
+    private val FORMAL_PART_KINDS: List<PartKind> = listOf(PartKind.STORAGE)
+
     /**
-     * 部品のアイテム（#347）。ティアごと・種類ごとに `<ティア>_<種類>`（例: `creative_cpu`）で登録する。
-     * 今は検証用のクリエイティブのティアだけ（正式なティアは #122〜#125）。
+     * 部品のアイテム（#347）。ティアごと・種類ごとに [ComputerPartItem.idOf] の名前（例: `storage_1`、`creative_cpu`）で登録する。
+     * 検証用のクリエイティブのティアはすべての種類、正式なティアはディスク（[DiskItem]）だけ。
      */
-    val PARTS: Map<PartTier, Map<PartKind, DeferredItem<ComputerPartItem>>> = PartTier.entries.associateWith { tier ->
-        PART_KINDS.associateWith { kind ->
-            ITEMS.registerItem(ComputerPartItem.idOf(kind, tier), { ComputerPartItem(kind, tier, it) }, partProperties(tier))
+    val PARTS: Map<PartTier, Map<PartKind, DeferredItem<out ComputerPartItem>>> = PartTier.entries.associateWith { tier ->
+        val kinds = if (tier == PartTier.CREATIVE) PART_KINDS else FORMAL_PART_KINDS
+        kinds.associateWith { kind ->
+            val id = ComputerPartItem.idOf(kind, tier)
+            if (kind == PartKind.STORAGE) {
+                ITEMS.registerItem(id, { DiskItem(tier, it) }, partProperties(tier))
+            } else {
+                ITEMS.registerItem(id, { ComputerPartItem(kind, tier, it) }, partProperties(tier))
+            }
         }
     }
 
-    /** ティア [tier]・種類 [kind] の部品のアイテム */
+    /**
+     * ティア [tier]・種類 [kind] の部品のアイテム。
+     *
+     * @throws NoSuchElementException その部品のアイテムがない（正式なティアの CPU など）
+     */
     fun part(tier: PartTier, kind: PartKind): ComputerPartItem = PARTS.getValue(tier).getValue(kind).get()
 
     /** キーボードブロック（#142）。 */

@@ -74,18 +74,164 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
-    fun `kibiのmemoryの関数は、型が一致するときだけ通る`() {
-        val remaining = Triple(WasiP1Kibi.MODULE, "memory_remaining", emptyList<Int>() to listOf(0x7e))
-        val commit = Triple(WasiP1Kibi.MODULE, "memory_commit", listOf(I32, I32, 0x7e) to listOf(I32))
+    fun `kibi_computer_memoryの関数は、型が一致するときだけ通る`() {
+        val remaining = Triple(WasiP1Kibi.MEMORY, "remaining", emptyList<Int>() to listOf(0x7e))
+        val commit = Triple(WasiP1Kibi.MEMORY, "commit", listOf(I32, I32, 0x7e) to listOf(I32))
         assertDoesNotThrow { WasiP1.checkImports(load(command(fdWrite, remaining, commit))) }
-        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_remaining", emptyList<Int>() to listOf(I32)))), "型が違う")
-        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_commit", listOf(I32, I32, I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.MEMORY, "remaining", emptyList<Int>() to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.MEMORY, "commit", listOf(I32, I32, I32) to listOf(I32)))), "型が違う")
     }
 
     @Test
-    fun `kibiの知らない名前は断る`() {
-        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "memory_free", listOf(I32) to listOf(I32)))), "kibi.memory_free")
-        assertNoexec(load(command(Triple(WasiP1Kibi.MODULE, "async_yield", emptyList<Int>() to emptyList()))), "kibi.async_yield")
+    fun `kibiの知らない名前と予約名は断る`() {
+        assertNoexec(load(command(Triple(WasiP1Kibi.MEMORY, "free", listOf(I32) to listOf(I32)))), "${WasiP1Kibi.MEMORY}.free")
+        assertNoexec(load(command(Triple("kibi", "memory_free", listOf(I32) to listOf(I32)))), "kibi.memory_free")
+        assertNoexec(load(command(Triple("kibi", "async_yield", emptyList<Int>() to emptyList()))), "kibi.async_yield")
+        assertNoexec(load(command(Triple("kibi:kernel/unknown@0.1.0", "f", emptyList<Int>() to emptyList()))), "許可していない")
+    }
+
+    @Test
+    fun `旧名のkibi_memoryの関数は断る`() {
+        assertNoexec(load(command(Triple("kibi", "memory_remaining", emptyList<Int>() to listOf(0x7e)))), "旧名")
+        assertNoexec(load(command(Triple("kibi", "memory_commit", listOf(I32, I32, 0x7e) to listOf(I32)))), "旧名")
+    }
+
+    @Test
+    fun `独自拡張の版が違えば断る`() {
+        assertNoexec(load(command(Triple("kibi:computer/memory@0.2.0", "remaining", emptyList<Int>() to listOf(0x7e)))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:computer/memory", "remaining", emptyList<Int>() to listOf(0x7e)))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:kernel/events@0.1.1", "[resource-drop]event-queue", listOf(I32) to emptyList()))), "版が違う")
+    }
+
+    private val open = Triple(WasiP1Kibi.EVENTS, "[static]event-queue.open", listOf(I32, I32, I32, I32, I32) to emptyList<Int>())
+    private val take = Triple(WasiP1Kibi.EVENTS, "[method]event-queue.take", listOf(I32, I32, I32) to emptyList<Int>())
+    private val drop = Triple(WasiP1Kibi.EVENTS, "[resource-drop]event-queue", listOf(I32) to emptyList<Int>())
+
+    /** [command] に、型が [params] → [results] の `cabi_realloc` の export を足したもの */
+    private fun commandWithRealloc(params: List<Int>, results: List<Int>, vararg imports: Triple<String, String, Pair<List<Int>, List<Int>>>): ByteArray =
+        WasmBinary().run {
+            for ((m, n, t) in imports) importFunc(m, n, t.first, t.second)
+            exportFunc(WasiP1Driver.START, func(emptyList(), emptyList(), code()))
+            val body = if (results.isEmpty()) code() else code(0x41, 0)
+            exportFunc(WasiP1Kibi.REALLOC, func(params, results, body))
+            build()
+        }
+
+    @Test
+    fun `kibi_kernel_eventsはcabi_reallocがあれば通り、takeはcabi_reallocがなければ断る`() {
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), open, take, drop))) }
+        // open と drop は cabi_realloc を使わない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(open, drop))) }
+        assertNoexec(load(command(open, take)), WasiP1Kibi.REALLOC)
+        // 型の違う cabi_realloc
+        assertNoexec(load(commandWithRealloc(listOf(I32, I32, I32), listOf(I32), take)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(commandWithRealloc(listOf(I32, I32, I32, I32), emptyList(), take)), WasiP1Kibi.REALLOC)
+        // 型の違う import
+        assertNoexec(load(command(Triple(WasiP1Kibi.EVENTS, "[method]event-queue.take", listOf(I32, I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.EVENTS, "[method]event-queue.peek", listOf(I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
+    fun `kibi_ioのp1の関数は型が一致するときだけ通り、版違い・表にない関数・p2とp3のinterfaceは断る`() {
+        val dup = Triple(WasiP1Kibi.IO_FD, "dup", listOf(I32, I32) to emptyList<Int>())
+        val dupTo = Triple(WasiP1Kibi.IO_FD, "dup-to", listOf(I32, I32, I32) to emptyList<Int>())
+        val create = Triple(WasiP1Kibi.IO_PIPE, "create", listOf(I32) to emptyList<Int>())
+        // cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(dup, dupTo, create))) }
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup-to", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_PIPE, "create", emptyList<Int>() to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:io/fd@0.2.0", "dup", listOf(I32, I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:io/fd", "dup", listOf(I32, I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_FD, "dup3", listOf(I32, I32, I32, I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:io/pipe-streams@0.1.0", "create", listOf(I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:io/pipe-async@0.1.0", "create", listOf(I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
+    fun `kibi_processは型が一致するときだけ通り、get-cwdはcabi_reallocが要り、版違い・p2とp3のinterfaceは断る`() {
+        val p = WasiP1Kibi.PROCESS
+        val spawn = Triple(p, "[static]process.spawn", List(13) { I32 } to emptyList<Int>())
+        val pid = Triple(p, "[method]process.pid", listOf(I32) to listOf(I32))
+        val status = Triple(p, "[method]process.status", listOf(I32, I32) to emptyList<Int>())
+        val kill = Triple(p, "[method]process.kill", listOf(I32, I32, I32) to emptyList<Int>())
+        val drop = Triple(p, "[resource-drop]process", listOf(I32) to emptyList<Int>())
+        val killPid = Triple(p, "kill-pid", listOf(I32, I32, I32) to emptyList<Int>())
+        val selfPid = Triple(p, "self-pid", emptyList<Int>() to listOf(I32))
+        val parentPid = Triple(p, "parent-pid", emptyList<Int>() to listOf(I32))
+        val ignored = Triple(p, "set-signal-ignored", listOf(I32, I32, I32) to emptyList<Int>())
+        val getCwd = Triple(p, "get-cwd", listOf(I32) to emptyList<Int>())
+        val setCwd = Triple(p, "set-cwd", listOf(I32, I32, I32) to emptyList<Int>())
+        // get-cwd 以外は cabi_realloc が要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(spawn, pid, status, kill, drop, killPid, selfPid, parentPid, ignored, setCwd))) }
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), getCwd))) }
+        assertNoexec(load(command(getCwd)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(Triple(p, "[static]process.spawn", List(12) { I32 } to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(p, "[method]process.status", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:process/process@0.2.0", "self-pid", emptyList<Int>() to listOf(I32)))), "版が違う")
+        assertNoexec(load(command(Triple(p, "fork", emptyList<Int>() to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:process/process-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:process/process-async@0.1.0", "wait", listOf(I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
+    fun `kibi_io_ttyは型が一致するときだけ通り、版違い・表にない関数は断る`() {
+        val isTty = Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32) to listOf(I32))
+        val getMode = Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32, I32) to emptyList<Int>())
+        val setMode = Triple(WasiP1Kibi.IO_TTY, "set-mode", listOf(I32, I32, I32) to emptyList<Int>())
+        val getSize = Triple(WasiP1Kibi.IO_TTY, "get-size", listOf(I32, I32) to emptyList<Int>())
+        val getFg = Triple(WasiP1Kibi.IO_TTY, "get-foreground", listOf(I32, I32) to emptyList<Int>())
+        val setFg = Triple(WasiP1Kibi.IO_TTY, "set-foreground", listOf(I32, I32, I32) to emptyList<Int>())
+        val all = listOf(isTty, getMode, setMode, getSize, getFg, setFg)
+        // cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(*all.toTypedArray()))) }
+        for (fn in all) assertEquals(false, WasiP1Kibi.needsRealloc(fn.first, fn.second), fn.second)
+        // 型が違う
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "set-mode", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-size", listOf(I32, I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-foreground", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "set-foreground", listOf(I32, I32) to emptyList()))), "型が違う")
+        // 版が違う
+        assertNoexec(load(command(Triple("kibi:io/tty@0.2.0", "is-tty", listOf(I32) to listOf(I32)))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:io/tty", "is-tty", listOf(I32) to listOf(I32)))), "版が違う")
+        // 表にない関数
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "isatty", listOf(I32) to listOf(I32)))), "許可していない")
+    }
+
+    @Test
+    fun `kibi_kernel_timersとkibi_computer_clockは型が一致するときだけ通り、版違い・表にない関数・p2とp3のinterfaceは断る`() {
+        val I64 = 0x7e
+        val create = Triple(WasiP1Kibi.TIMERS, "[static]timer.create", listOf(I32, I32, I64, I32) to emptyList<Int>())
+        val setAfter = Triple(WasiP1Kibi.TIMERS, "[method]timer.set-after", listOf(I32, I64, I64, I32) to emptyList<Int>())
+        val setAt = Triple(WasiP1Kibi.TIMERS, "[method]timer.set-at", listOf(I32, I64, I64, I32) to emptyList<Int>())
+        val cancel = Triple(WasiP1Kibi.TIMERS, "[method]timer.cancel", listOf(I32, I32) to emptyList<Int>())
+        val read = Triple(WasiP1Kibi.TIMERS, "[method]timer.read", listOf(I32, I32) to emptyList<Int>())
+        val drop = Triple(WasiP1Kibi.TIMERS, "[resource-drop]timer", listOf(I32) to emptyList<Int>())
+        val uptime = Triple(WasiP1Kibi.CLOCK, "uptime-ticks", emptyList<Int>() to listOf(I64))
+        val world = Triple(WasiP1Kibi.CLOCK, "world-ticks", emptyList<Int>() to listOf(I64))
+        // cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(create, setAfter, setAt, cancel, read, drop, uptime, world))) }
+        for (fn in listOf(create, setAfter, setAt, cancel, read, drop, uptime, world)) {
+            assertEquals(false, WasiP1Kibi.needsRealloc(fn.first, fn.second), fn.second)
+        }
+        // 型が違う
+        assertNoexec(load(command(Triple(WasiP1Kibi.TIMERS, "[static]timer.create", listOf(I32, I32, I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.TIMERS, "[method]timer.set-after", listOf(I32, I32, I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.TIMERS, "[method]timer.read", listOf(I32) to listOf(I64)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.CLOCK, "uptime-ticks", emptyList<Int>() to listOf(I32)))), "型が違う")
+        // 版が違う
+        assertNoexec(load(command(Triple("kibi:kernel/timers@0.2.0", "[resource-drop]timer", listOf(I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:computer/clock@0.1.1", "world-ticks", emptyList<Int>() to listOf(I64)))), "版が違う")
+        // 表にない関数・p2 と p3 の interface
+        assertNoexec(load(command(Triple(WasiP1Kibi.TIMERS, "[method]timer.wait", listOf(I32, I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple(WasiP1Kibi.CLOCK, "now", emptyList<Int>() to listOf(I64)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:kernel/timers-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:kernel/events-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:kernel/timers-async@0.1.0", "[async-lower]wait", listOf(I32, I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:kernel/events-async@0.1.0", "take", listOf(I32, I32, I32) to emptyList()))), "許可していない")
     }
 
     @Test
@@ -111,7 +257,7 @@ class WasiP1ImportCheckTest {
         return out
     }
 
-    private fun Machine.install(path: String, bytes: ByteArray) = lock.withLockValue {
+    private fun Machine.install(path: String, bytes: ByteArray) = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))

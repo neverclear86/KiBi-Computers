@@ -9,6 +9,7 @@ import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -54,9 +55,54 @@ internal sealed interface FdReadiness {
  * 燃料の課金はしない（ABI 層が `ctx.chargeFuel` で行う）。
  */
 internal object FdIo {
-    /** 待たずに読む（カーネルロックは自分で取る） */
-    fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult =
-        ctx.withKernelLock { readLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, dst, off, len) }
+    /**
+     * 待たずに読む（カーネルロックは自分で取る）。ファイル（[OpenFile]）は、ロックの中で位置を読み、ロックの外で読んで、
+     * ロックの中で位置を進める（ファイルシステムの I/O をロックの外で行うため。#52。ADR 0052）
+     */
+    fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult {
+        if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
+        var file: OpenFile? = null
+        var position = 0L
+        val r = ctx.withKernelLock {
+            val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.READ)
+            if (f == null) return@withKernelLock readLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, dst, off, len)
+            file = f
+            position = f.position
+            null
+        }
+        if (r != null) return r
+        val f = file!!
+        val n = try {
+            ctx.vfs.pread(f, position, dst, off, len)
+        } catch (e: FsException) {
+            return IoResult.Error(e.errno)
+        }
+        ctx.withKernelLock { f.position = position + n }
+        return if (n == 0 && len > 0) IoResult.Eof else IoResult.Bytes(n)
+    }
+
+    /** [fd] が読み・書きの権利 [right] を持つファイル（[OpenFile]）を指していれば、それ（カーネルロックの中）。ほかは `null` */
+    private fun openFileLocked(kernel: KernelState, pid: Int, fd: Int, right: Int): OpenFile? {
+        val process = kernel.processes[pid] ?: return null
+        val entry = process.handles[fd] ?: return null
+        if (entry.rights and right == 0) return null
+        return kernel.objects[entry.objectId] as? OpenFile
+    }
+
+    // ファイルへの書き込み（カーネルロックの外。位置はロックの中で読み書きする）
+    private fun writeFile(ctx: ProcessContext, file: OpenFile, position: Long, src: ByteArray, off: Int, len: Int): IoResult = try {
+        if (file.append) {
+            val w = ctx.vfs.append(file, src, off, len)
+            ctx.withKernelLock { file.position = w.position + w.count }
+            IoResult.Bytes(w.count)
+        } else {
+            val n = ctx.vfs.pwrite(file, position, src, off, len)
+            ctx.withKernelLock { file.position = position + n }
+            IoResult.Bytes(n)
+        }
+    } catch (e: FsException) {
+        IoResult.Error(e.errno)
+    }
 
     /**
      * 待たずに書く（カーネルロックは自分で取る）。コンソールの TTY に書けたら、たまった出力をこのスレッドで表示デバイスに書く
@@ -64,8 +110,17 @@ internal object FdIo {
      * （[ProcessContext.reserveConsoleFlushLocked]。その間に、メインスレッドが書き手のいない出力として取り出さないように。#419）
      */
     fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
+        if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         var flush = false
+        var file: OpenFile? = null
+        var position = 0L
         val r = ctx.withKernelLock {
+            val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.WRITE)
+            if (f != null) {
+                file = f
+                position = f.position
+                return@withKernelLock null
+            }
             val console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
             val written = writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len)
             if (console && written is IoResult.Bytes && written.count > 0) {
@@ -74,6 +129,7 @@ internal object FdIo {
             }
             written
         }
+        if (r == null) return writeFile(ctx, file!!, position, src, off, len)
         if (flush) ctx.flushConsole()
         return r
     }
@@ -115,7 +171,9 @@ internal object FdIo {
      * - パイプ（[ByteStream]、[PipeEnd]）: 読みは読めるバイト（`nbytes`）、書きは空き。相手側が閉じていれば `hangup`。
      *   向きの違うパイプの端は `BADF`
      * - コンソール（[Tty]）: 読みは今読めるバイト、書きは出力の空き
-     * - ファイル・ディレクトリ（[OpenFile]）: 常にそろう（POSIX の `poll` と同じ）。ファイルの読みは残りのバイト、ほかは 0
+     * - ファイル・ディレクトリ（[OpenFile]）: 常にそろう（POSIX の `poll` と同じ）。ファイルの読みは残りのバイトの目安（I/O をしない [Vfs.sizeHintLocked]）、ほかは 0
+     * - 子のハンドル（[ProcessObject]。#74、ADR 0074）: 読みは、子が終われば `nbytes` 0 でそろう。まだなら `(objectId, EXITED)` の key
+     *   （`ProcessLifecycle.onFinishedLocked` が起こす key と同じ）。書きは待てない（`INVAL`。権利が `READ` だけなので、ふつうはその前に `BADF`）
      * - そのほかの待てる種類（イベントキュー、タイマー）: [pro.ikili.kibicomputers.core.kernel.obj.KernelObject.isReady] で、`nbytes` は 1
      * - その条件を待てない種類: `INVAL`
      */
@@ -143,7 +201,12 @@ internal object FdIo {
                 }
                 is OpenFile -> when {
                     obj.isDirectory || !reading -> FdReadiness.Ready(0)
-                    else -> FdReadiness.Ready(maxOf(0L, vfs.stat(obj).size - obj.position))
+                    else -> FdReadiness.Ready(maxOf(0L, vfs.sizeHintLocked(obj) - obj.position))
+                }
+                is ProcessObject -> when {
+                    !reading -> FdReadiness.Error(Errno.INVAL)
+                    obj.status != null -> FdReadiness.Ready(0)
+                    else -> FdReadiness.Pending(WaitKey(obj.id, WaitCondition.EXITED))
                 }
                 else -> when {
                     !obj.canWait(condition) -> FdReadiness.Error(Errno.INVAL)
@@ -156,7 +219,10 @@ internal object FdIo {
         }
     }
 
-    /** カーネルロックの中で、プロセス [pid] の fd [fd] から読む */
+    /**
+     * カーネルロックの中で、プロセス [pid] の fd [fd] から読む。ファイル（[OpenFile]）は [vfs] でその場で読むので、
+     * カーネルロックを持たない VFS（マシンを使わないテスト）でだけ使う。プロセスからは [read] を使う
+     */
     fun readLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, pid: Int, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
@@ -187,7 +253,7 @@ internal object FdIo {
         }
     }
 
-    /** カーネルロックの中で、プロセス [pid] の fd [fd] へ書く */
+    /** カーネルロックの中で、プロセス [pid] の fd [fd] へ書く。ファイルの扱いは [readLocked] と同じ。プロセスからは [write] を使う */
     fun writeLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, pid: Int, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }

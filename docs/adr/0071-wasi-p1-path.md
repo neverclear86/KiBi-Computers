@@ -19,7 +19,7 @@
 - 基点の fd が開いていなければ `BADF`、ディレクトリの `OpenFile` でなければ `NOTDIR`
 - `lookupflags` の `SYMLINK_FOLLOW` は受け取って無視する（シンボリックリンクはない。ADR 0051）。知らないビットは `INVAL`
 - 末尾の `/` は「ディレクトリでなければ `NOTDIR`」
-- 呼び出しはすべてカーネルロックの中。失敗は `FsException` の errno
+- 基点の fd の解決はカーネルロックの中、VFS の操作はロックの外（#52。ADR 0052）。失敗は `FsException` の errno
 
 ## 関数ごとの振る舞い
 

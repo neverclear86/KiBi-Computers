@@ -4,10 +4,12 @@ import com.mojang.logging.LogUtils
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.neoforge.client.KiBiClient
+import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.loading.FMLEnvironment
@@ -24,11 +26,13 @@ object KiBiComputersNeoForge {
         runCatching { RuntimeSelfCheck.add(1, 2) }
             .onSuccess { LOGGER.info("WASM runtime self-check passed (1 + 2 = {})", it) }
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
+        KiBiDataComponents.register(MOD_BUS)
         KiBiBlocks.register(MOD_BUS)
         KiBiMenus.register(MOD_BUS)
         ScreenSync.register(MOD_BUS)
         KeyboardInput.register(MOD_BUS)
         ServerMachines.register()
+        WorldDisks.register()
         // クライアントのクラスは、クライアントでだけ読み込む
         if (FMLEnvironment.dist.isClient) KiBiClient.register(MOD_BUS)
         startDevDriver()

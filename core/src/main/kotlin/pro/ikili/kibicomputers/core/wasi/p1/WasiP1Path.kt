@@ -20,42 +20,44 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
  * - パスの文字列はゲストのメモリの `(ptr, len)`（[P1.readPath]）。範囲外のポインタは、何かを変える前に `FAULT`
  * - 末尾の `/` は「ディレクトリでなければ `NOTDIR`」
  * - `lookupflags` の `SYMLINK_FOLLOW` は受け取って無視する（シンボリックリンクはない。ADR 0051）。知らないビットは `INVAL`
+ * - 基点の fd の解決はカーネルロックの中、VFS の操作はロックの外（#52。ADR 0052）
  * - 失敗は `FsException` の errno（[WasiP1.register] が errno にする）。燃料は呼び出しごとの `CALL_FUEL` だけ（仮。確定は #251）
  */
 internal class WasiP1Path(private val ctx: ProcessContext) {
     /** `path_create_directory(fd, path, path_len)`。最後の名前が `.`・`..` なら `EXIST` */
     fun createDirectory(memory: WasmMemory, fd: Int, path: Int, pathLen: Int): Int {
         val text = P1.readPath(memory, path, pathLen)
-        ctx.withKernelLock {
-            val target = resolve(fd, text)
-            if (target.lastIsDot) fsError(Errno.EXIST)
-            ctx.vfs.createDirectory(target.path)
-        }
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        if (target.lastIsDot) fsError(Errno.EXIST)
+        ctx.vfs.createDirectory(target.path)
         return 0
     }
 
     /** `path_remove_directory(fd, path, path_len)`。最後の名前が `.` なら `INVAL`、`..` なら `NOTEMPTY`（Linux と同じ） */
     fun removeDirectory(memory: WasmMemory, fd: Int, path: Int, pathLen: Int): Int {
         val text = P1.readPath(memory, path, pathLen)
-        ctx.withKernelLock {
-            val target = resolve(fd, text)
-            when (target.lastName) {
-                "." -> fsError(Errno.INVAL)
-                ".." -> fsError(Errno.NOTEMPTY)
-            }
-            ctx.vfs.removeDirectory(target.path)
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        when (target.lastName) {
+            "." -> fsError(Errno.INVAL)
+            ".." -> fsError(Errno.NOTEMPTY)
         }
+        ctx.vfs.removeDirectory(target.path)
         return 0
     }
 
-    /** `path_unlink_file(fd, path, path_len)`。ディレクトリは `ISDIR`。末尾の `/` があり、普通のファイルなら `NOTDIR` */
+    /**
+     * `path_unlink_file(fd, path, path_len)`。ディレクトリは `ISDIR`。末尾の `/` があり、普通のファイルなら `NOTDIR`。
+     * 末尾の `/` があれば、どちらにしても消せないので、ファイルシステムの削除を呼ばない（確かめてから消すまでに、
+     * ほかのスレッドがファイルに置き換えても消さない。#52）
+     */
     fun unlinkFile(memory: WasmMemory, fd: Int, path: Int, pathLen: Int): Int {
         val text = P1.readPath(memory, path, pathLen)
-        ctx.withKernelLock {
-            val target = resolve(fd, text)
-            if (target.trailingSlash) checkDirectory(ctx.vfs.stat(target.path))
-            ctx.vfs.removeFile(target.path)
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        if (target.trailingSlash) {
+            checkDirectory(ctx.vfs.stat(target.path))
+            fsError(Errno.ISDIR)
         }
+        ctx.vfs.removeFile(target.path)
         return 0
     }
 
@@ -66,13 +68,10 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
     fun rename(memory: WasmMemory, oldFd: Int, oldPath: Int, oldLen: Int, newFd: Int, newPath: Int, newLen: Int): Int {
         val oldText = P1.readPath(memory, oldPath, oldLen)
         val newText = P1.readPath(memory, newPath, newLen)
-        ctx.withKernelLock {
-            val from = resolve(oldFd, oldText)
-            val to = resolve(newFd, newText)
-            if (from.lastIsDot || to.lastIsDot) fsError(Errno.INVAL)
-            if (from.trailingSlash || to.trailingSlash) checkDirectory(ctx.vfs.stat(from.path))
-            ctx.vfs.rename(from.path, to.path)
-        }
+        val (from, to) = ctx.withKernelLock { resolve(oldFd, oldText) to resolve(newFd, newText) }
+        if (from.lastIsDot || to.lastIsDot) fsError(Errno.INVAL)
+        // 末尾の `/` は「元がディレクトリでなければ NOTDIR」。確かめはファイルシステムの中で、名前の変更と不可分に行う（#52）
+        ctx.vfs.rename(from.path, to.path, requireDirectory = from.trailingSlash || to.trailingSlash)
         return 0
     }
 
@@ -81,12 +80,10 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
         checkLookupFlags(lookupFlags)
         val text = P1.readPath(memory, path, pathLen)
         if (!P1.inBounds(memory, bufPtr, P1.FILESTAT_SIZE.toLong())) return Errno.FAULT.code
-        val out = ctx.withKernelLock {
-            val target = resolve(fd, text)
-            val st = ctx.vfs.stat(target.path)
-            if (target.trailingSlash) checkDirectory(st)
-            P1.filestat(st)
-        }
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        val st = ctx.vfs.stat(target.path)
+        if (target.trailingSlash) checkDirectory(st)
+        val out = P1.filestat(st)
         memory.write(bufPtr, out)
         return 0
     }
@@ -96,11 +93,8 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
         checkLookupFlags(lookupFlags)
         val times = P1.times(fstFlags, atim, mtim) { ctx.environment.clock.realtimeNanos() }
         val text = P1.readPath(memory, path, pathLen)
-        ctx.withKernelLock {
-            val target = resolve(fd, text)
-            if (target.trailingSlash) checkDirectory(ctx.vfs.stat(target.path))
-            ctx.vfs.setTimes(target.path, times.accessedNanos, times.modifiedNanos)
-        }
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        ctx.vfs.setTimes(target.path, times.accessedNanos, times.modifiedNanos, requireDirectory = target.trailingSlash)
         return 0
     }
 
@@ -143,12 +137,18 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
         )
         val rights = (if (read) HandleRights.READ else 0) or (if (write) HandleRights.WRITE else 0)
         val flags = (fdflags and P1.FDFLAGS_NONBLOCK).toLong()
-        val newFd = ctx.withKernelLock {
-            val target = resolve(fd, text)
-            val table = table()
-            if (table.isFull) fsError(Errno.MFILE)
-            val file = ctx.vfs.open(target.path, options, target.trailingSlash)
-            table.open(file, rights, flags)
+        val target = ctx.withKernelLock {
+            val t = resolve(fd, text)
+            if (table().isFull) fsError(Errno.MFILE)
+            t
+        }
+        // 開くのはロックの外（#52）。fd の表を変えるのはこのプロセスのスレッドだけなので、間に満杯になることはない
+        val file = ctx.vfs.open(target.path, options, target.trailingSlash)
+        val newFd = try {
+            ctx.withKernelLock { table().open(file, rights, flags) }
+        } catch (e: Throwable) {
+            ctx.vfs.close(file)
+            throw e
         }
         memory.writeI32(fdPtr, newFd)
         return 0
@@ -158,11 +158,9 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
     fun readlink(memory: WasmMemory, fd: Int, path: Int, pathLen: Int, buf: Int, bufLen: Int, bufusedPtr: Int): Int {
         val text = P1.readPath(memory, path, pathLen)
         if (!P1.inBounds(memory, buf, P1.u32(bufLen.toLong())) || !P1.inBounds(memory, bufusedPtr, 4)) return Errno.FAULT.code
-        ctx.withKernelLock {
-            val target = resolve(fd, text)
-            val st = ctx.vfs.stat(target.path)
-            if (target.trailingSlash) checkDirectory(st)
-        }
+        val target = ctx.withKernelLock { resolve(fd, text) }
+        val st = ctx.vfs.stat(target.path)
+        if (target.trailingSlash) checkDirectory(st)
         return Errno.INVAL.code
     }
 

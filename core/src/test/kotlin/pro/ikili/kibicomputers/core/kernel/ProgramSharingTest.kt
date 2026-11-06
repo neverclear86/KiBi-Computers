@@ -22,7 +22,7 @@ class ProgramSharingTest {
         requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/lua.wasm")).use { it.readBytes() }
 
     private fun Harness.luaMachine(): Machine = machine(fuelPerTick = 10_000_000).also { m ->
-        m.lock.withLockValue {
+        run {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
             val f = m.vfs.open(VfsPath.parse("/bin/lua"), OpenOptions(read = true, write = true, create = true))

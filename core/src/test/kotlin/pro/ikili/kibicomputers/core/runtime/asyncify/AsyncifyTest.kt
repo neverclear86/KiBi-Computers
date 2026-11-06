@@ -58,7 +58,7 @@ class AsyncifyTest {
             val module = EndiveRuntime().load(Instrumentation.apply(resource(name), WasiP1.WAIT_IMPORTS))
             assertTrue(module.isAsyncified, name)
             assertTrue(module.isFuelMetered, name)
-            // 退避の import（kibi.async_push・async_pop）は残さない。lua.wasm は同じモジュールの kibi:memory（#408）を import する
+            // 退避の import（kibi.async_push・async_pop）は残さない。lua.wasm は kibi:computer/memory@0.1.0（#408・#73）を import する
             assertTrue(
                 module.imports.none { it.module == WasmAsync.IMPORT_MODULE && it.name in setOf(WasmAsync.PUSH, WasmAsync.POP) },
                 "$name: ${module.imports}",
@@ -207,14 +207,14 @@ class AsyncifyTest {
         val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(tail, setOf("w.wait")) }
         assertTrue(e.message!!.contains("末尾呼び出し"), e.message)
 
-        // 引数を持つブロックの中の止まりうる呼び出し: (block (param i32) (result i32) drop call wait)
+        // 引数を持つブロックの中の止まりうる呼び出し（(block (param i32) (result i32) drop call wait)）は変換できる（#425。AsyncifyMultiValueTest）
         val blockParam = WasmBinary().apply {
             val wait = importFunc("w", "wait", emptyList(), listOf(i32))
             val bt = typeIndex(listOf(i32), listOf(i32))
             mutableI64Global(0)
             exportFunc("run", func(emptyList(), listOf(i32), WasmBinary.code(0x41, 0, 0x02, bt, 0x1A, 0x10, wait, 0x0B)))
         }.build()
-        assertThrows<AsyncifyUnsupported> { Asyncify.transform(blockParam, setOf("w.wait")) }
+        assertEquals(1, Asyncify.transform(blockParam, setOf("w.wait")).instrumented)
 
         // 止まりうる関数を呼ばないなら、v128 のローカルがあってもよい（変換しない）
         val r = Asyncify.transform(simd, emptySet())

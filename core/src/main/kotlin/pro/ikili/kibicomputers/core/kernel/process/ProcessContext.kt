@@ -87,6 +87,45 @@ internal interface ProcessContext {
     @Throws(FsException::class, ProcessKilledException::class)
     fun finishExec(wait: ExecWait): Int
 
+    /**
+     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [exec] と同じだが、子の `ProcessObject` を指す fd（読む権利だけ）を
+     * 自分の fd 表に入れ、子の pid と一緒に返す（`kibi:process` の `[static]process.spawn`。#74、ADR 0074）。
+     * fd は子を表に足すのと同じカーネルロックの中で入れるので、子は fd が入る前に動き出さない。
+     * fd 表が満杯なら、読み込みの前と子を作る前に確かめて `MFILE`（子を作ってから断らない）。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): ProcessHandle
+
+    /**
+     * [finishExec] と同じだが、子のハンドルを自分の fd 表に入れて返す（[execWithHandle] の待機点型の後半。#74）。
+     * fd 表が満杯なら、子を作らずに `MFILE`。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun finishExecWithHandle(wait: ExecWait): ProcessHandle
+
+    /** 自分の fd 表に、子のハンドルを入れる空きがあるか確かめる（なければ `MFILE`。#74）。カーネルロックを持たずに呼ぶ */
+    @Throws(FsException::class)
+    fun checkHandleRoom()
+
+    /**
+     * 子のハンドル [fd] の終わり方（待たない。終わっていなければ `null`。#74）。終わっていて、自分がその子の親なら刈り取る
+     * （刈り取った後も同じ値を返す）。pid が使い回された別のプロセスは刈り取らない。
+     * [fd] が開いていない・子のハンドルでなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class)
+    fun processHandleStatus(fd: Int): ExitStatus?
+
+    /**
+     * 子のハンドル [fd] のプロセスに [signal] を送る（待たない。#74）。刈り取られた・pid が使い回されたなら送らずに
+     * [KillResult.ALREADY_EXITED]。ほかは [kill] と同じ。[fd] が開いていない・子のハンドルでなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun killProcessHandle(fd: Int, signal: KillSignal): KillResult
+
+    /** 子のハンドル [fd] のプロセスの pid（#74）。[fd] が開いていない・子のハンドルでなければ `FsException(BADF)` */
+    @Throws(FsException::class)
+    fun processHandlePid(fd: Int): Int
+
     /** このプロセスの子の pid（ゾンビを含む。割り当ての順） */
     fun children(): List<Int>
 
@@ -247,7 +286,7 @@ internal interface ProcessContext {
     /** カーネルの状態（カーネルロックの中で使う） */
     val kernel: KernelState
 
-    /** マシンの VFS（カーネルロックの中で使う） */
+    /** マシンの VFS（ファイルシステムに届く操作はカーネルロックの外で使う。[withKernelLock] の中から呼ぶと `IllegalStateException`。#52） */
     val vfs: Vfs
 
     /** 状態を変えるオブジェクトの操作に渡す、待ち手への知らせ口（カーネルロックの中で使う） */
@@ -294,7 +333,7 @@ internal interface ProcessContext {
      */
     fun closeHostWait(wait: HostWait<*>)
 
-    // ---- RAM（#408。WASM に見せる形は `kibi:memory`） ----
+    // ---- RAM（#408。WASM に見せる形は `kibi:computer/memory`） ----
 
     /** 残りの RAM（バイト）。プロセスの上限とマシンの RAM のそれぞれの残りのうち、小さい方。どのスレッドから呼んでもよい */
     fun memoryRemaining(): Long
@@ -309,6 +348,15 @@ internal interface ProcessContext {
 
     /** システムコールの費用を今の holder の手持ちから引く（ADR 0028）。燃料を計測しないプロセスでは何もしない */
     fun chargeFuel(amount: Long)
+
+    /**
+     * ホスト関数の中からゲストの export（`cabi_realloc` など。#73）を呼ぶときに、[block] を包む。包んでいる間は [inGuestCall] が立ち、
+     * 燃料が切れても巻き戻さず（待機点型でも）、スレッドを持ったまま燃料を待つ。入れ子にしてよい。プロセスのスレッドから呼ぶ
+     */
+    fun <T> callGuest(block: () -> T): T
+
+    /** [callGuest] の中か（ホスト関数の中からゲストを呼んでいる途中か）。プロセスのスレッドから読む */
+    val inGuestCall: Boolean
 
     /**
      * コンソールの TTY に書いたとき、そのカーネルロックの中で呼ぶ（#355・#419）。この後に [flushConsole] で書くと予約し、
@@ -371,6 +419,9 @@ internal interface ProcessContext {
     /** マシンを再起動する（`Machine.reboot`。#49）。受け付けたら `true`（一度も起動していなければ `false`）。システムコールの形は #306 */
     fun requestReboot(): Boolean
 }
+
+/** 子のハンドル（[ProcessContext.execWithHandle]）: 子の [pid] と、その `ProcessObject` を指す自分の [fd]（#74） */
+internal data class ProcessHandle(val pid: Int, val fd: Int)
 
 /** 作っている途中の記録（実行時だけ。[ProcessRuntime.loading]） */
 internal class LoadingFrame(

@@ -1,7 +1,11 @@
 package pro.ikili.kibicomputers.core.kernel.boot
 
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.DiskResolver
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskQuota
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 
 /** 起動ディスクとして開いたファイルシステム（実行時だけ）。 */
@@ -20,7 +24,7 @@ internal fun interface BootVolumeOpener {
 
         /**
          * 既定: [BootConfig.IMAGE_DISK_PREFIX] で始まる識別子を、同梱イメージ（[ImageFileSystem.bundled]）として開く。
-         * ほかの識別子は、まだ開けない（ディスク FS は #52）。名前が正しくない・イメージが壊れているときも開けない
+         * ほかの識別子は開けない（[forDisks] を使う）。名前が正しくない・イメージが壊れているときも開けない
          */
         val DEFAULT: BootVolumeOpener = BootVolumeOpener { diskId ->
             if (!diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX)) return@BootVolumeOpener null
@@ -33,6 +37,23 @@ internal fun interface BootVolumeOpener {
                 null
             }
             fs?.let { BootVolume(it, readOnly = true) }
+        }
+
+        /**
+         * マシンの既定: `image:` の識別子は [DEFAULT]、ほかは [disks] が返すホストのディレクトリを [DiskFileSystem] として開く
+         * （なければ作る。#52）。容量は [disks] が返す値（[pro.ikili.kibicomputers.core.kernel.ResolvedDisk]。#124）。
+         * 開いたままのホストのファイルは [budget] で数える。[disks] が知らない・開けないディスクは `null`
+         */
+        fun forDisks(disks: DiskResolver, budget: HostFileBudget): BootVolumeOpener = BootVolumeOpener { diskId ->
+            if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX)) return@BootVolumeOpener DEFAULT.open(diskId)
+            val disk = disks.resolve(diskId) ?: return@BootVolumeOpener null
+            val quota = DiskQuota(maxBytes = disk.capacityBytes, maxEntries = disk.maxEntries)
+            val fs = try {
+                DiskFileSystem.open(disk.directory, quota, readOnly = false, budget = budget)
+            } catch (e: java.io.IOException) {
+                null
+            }
+            fs?.let { BootVolume(it, readOnly = false) }
         }
     }
 }

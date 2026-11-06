@@ -250,7 +250,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         if (!wasReadable && readable) sink.wake(WaitKey(id, WaitCondition.READABLE))
     }
 
-    /** 画面の大きさを変える。変わったら世代を1つ進めて `true`（待ち手は起こさない。待てる形の知らせは #63） */
+    /** 画面の大きさを変える。変わったら世代を1つ進めて `true`（待ち手は起こさない。待てる形の知らせは `Machine.resizeConsole` が入れる `tty-resize` のイベント。ADR 0427） */
     fun resize(size: TtySize): Boolean {
         if (size.columns == columns && size.rows == rows) return false
         columns = size.columns

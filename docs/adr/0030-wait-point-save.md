@@ -74,4 +74,5 @@ PoC の名前（`poc_step`・`poc_load`・`poc_resume`・`poc_alloc`、import �
 - 本番の保存形式とバージョン（#81・#82・#88）、保存のタイミング（#81）
 - 圧縮と別スレッド化、差分保存（#83・#84）
 - ABI（#63・#72、WIT は #257）、本番の `lua.wasm` を reactor にするか
+  - 追記（#73）: ABI の決まりは ADR 0073。p1 の reactor の入口は定義せず、`lua.wasm` はコマンド形式のまま（イベントは `kibi:kernel/events` のキューの fd を `poll_oneoff` で待って取り出す）
 - ブロッキング型プロセスの保存時の扱い（#86）

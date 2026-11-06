@@ -38,6 +38,9 @@ dependencies {
 
     // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
     testImplementation(libs.endive.wasi)
+    // WIT（src/main/wit）を wasm-tools で解析するテスト（KibiWitParseTest。#75）。テストだけで使い、jarJar には入れない
+    testImplementation(libs.endive.wasm.tools)
+    testImplementation(libs.zerofs)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly(libs.junit.platform.launcher)
@@ -77,6 +80,23 @@ kibiWasm {
             "-Wl,--export=copy",
             "-Wl,--export=grow",
             "-Wl,--export=is_even",
+        )
+    }
+    // SIMD（v128）を含むモジュール（#424）。SIMD を使う関数だけをインタプリタで動かし、ほかはコンパイルする
+    module("simd", sourceSet = "test") {
+        sources.from("src/test/wasm/simd.c")
+        target = "wasm32-freestanding"
+        compilerArgs.addAll(
+            "-O2",
+            "-s",
+            "-nostdlib",
+            "-msimd128",
+            "-Wl,--no-entry",
+            "-Wl,--export=run",
+            "-Wl,--export=sum",
+            "-Wl,--export=fill_seq",
+            "-Wl,--export=dot4",
+            "-Wl,--export=fib",
         )
     }
     // wasi-libc をリンクする WASI p1 のプログラム（lua.wasm などと同じビルドの形）
@@ -125,9 +145,39 @@ kibiWasm {
         sources.from("src/test/wasm/oom_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
-    // 独自拡張 kibi:memory（#408）の p1 の import を確かめる CLI
+    // 独自拡張 kibi:computer/memory（#408・#73）の p1 の import を確かめる CLI
     module("kibi-memory-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_memory_wasi.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:kernel/events（#73）の p1 の import と cabi_realloc の呼び出しを確かめる CLI
+    module("kibi-events-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_events.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:kernel/timers・kibi:computer/clock（#426）の p1 の import を確かめる CLI
+    module("kibi-timers-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_timers.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:io/fd・kibi:io/pipe（#75）の p1 の import を確かめる CLI
+    module("kibi-io-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_io.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:process（#74）の p1 の import を確かめる CLI（親と子を兼ねる）
+    module("kibi-process-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_process.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 独自拡張 kibi:io/tty（#427）の p1 の import を確かめる CLI
+    module("kibi-tty-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_tty.c")
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }

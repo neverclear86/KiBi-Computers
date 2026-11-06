@@ -133,7 +133,7 @@ class WasiP1PathTest {
         }
     }
 
-    private fun Machine.setUpFiles(): Int = lock.withLockValue {
+    private fun Machine.setUpFiles(): Int = kotlin.run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/data"))
         vfs.createDirectory(VfsPath.parse("/data/sub"))
@@ -143,7 +143,7 @@ class WasiP1PathTest {
         ro.createFile(VfsPath.parse("/f"))
         vfs.mount(VfsPath.parse("/ro"), ro, readOnly = true, source = "test:ro")
         vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
-        kernel.objects.add(f)
+        lock.withLockValue { kernel.objects.add(f) }
     }
 
     private fun run(body: (Machine, ProcessContext, P) -> Unit) = timeout(limit) {
@@ -179,7 +179,7 @@ class WasiP1PathTest {
         }
     }
 
-    private fun Machine.exists(path: String): Boolean = lock.withLockValue {
+    private fun Machine.exists(path: String): Boolean = kotlin.run {
         try {
             vfs.stat(VfsPath.parse(path))
             true
@@ -188,7 +188,7 @@ class WasiP1PathTest {
         }
     }
 
-    private fun Machine.content(path: String): String = lock.withLockValue {
+    private fun Machine.content(path: String): String = kotlin.run {
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true))
         val buf = ByteArray(256)
         val n = vfs.read(f, buf, 0, buf.size)
@@ -369,7 +369,7 @@ class WasiP1PathTest {
         assertEquals(Errno.NOTDIR.code, setTimes(4, "a.txt/", 1, 1, P1.FSTFLAGS_ATIM))
         // 何も変えないときは、あるか確かめるだけ（読み取り専用でもよい）
         assertEquals(0, setTimes(3, "ro/f", 0, 0, 0))
-        assertEquals(FileType.REGULAR_FILE, m.lock.withLockValue { m.vfs.stat(VfsPath.parse("/data/a.txt")).type })
+        assertEquals(FileType.REGULAR_FILE, kotlin.run { m.vfs.stat(VfsPath.parse("/data/a.txt")).type })
         assertTrue(ctx.pid > 0)
     }
 

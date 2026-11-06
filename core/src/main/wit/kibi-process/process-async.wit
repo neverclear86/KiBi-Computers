@@ -1,0 +1,37 @@
+package kibi:process@0.1.0;
+
+/// p3 で、プロセスを作る・終わりを待つ（ADR 0074）。
+/// 仮置き: interface・関数・型・wasi:* の版は、p3 の層 #266 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+interface process-async {
+    use wasi:filesystem/types@0.3.0.{descriptor};
+    use kibi:kernel/types@0.1.0.{error-code};
+    use process.{process, spawn-options, exit-status};
+
+    /// 子に渡すもの
+    variant handle-source {
+        /// 子がこの stream から読む
+        input(stream<u8>),
+        /// 子がこの fd に書いたものを、spawned.outputs で親に読む側として返す
+        capture,
+        directory(borrow<descriptor>),
+        process(borrow<process>),
+    }
+
+    /// 子の fd 1つに当てるもの
+    record handle-assign {
+        fd: u32,
+        source: handle-source,
+    }
+
+    /// 作った子と、capture の読む側
+    record spawned {
+        process: process,
+        /// capture を書いた fd ごとの読む側（fd の昇順）
+        outputs: list<tuple<u32, stream<u8>>>,
+    }
+
+    /// process.spawn と同じ（読み込みが終わるまで待つ）。待つ間、呼んだタスクだけが止まる
+    spawn: async func(path: string, options: spawn-options, handles: list<handle-assign>) -> result<spawned, error-code>;
+    /// 終わるまで待って終わり方を返す。呼んだのが親なら刈り取る
+    wait: async func(p: borrow<process>) -> exit-status;
+}

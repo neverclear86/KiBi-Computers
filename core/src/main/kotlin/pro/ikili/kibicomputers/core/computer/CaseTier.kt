@@ -33,6 +33,13 @@ public enum class PartKind(@JvmField public val required: Boolean) {
 public fun interface InstalledParts {
     /** スロット [slot]（0 から [CaseTier.slotCount] 未満）に部品が挿さっていれば `true` */
     public fun isInstalled(slot: Int): Boolean
+
+    /**
+     * スロット [slot] に挿さっているディスクの識別子（#124。[DiskStore.isValidId] を満たすもの）。
+     * ディスクでない・識別子がない・形が正しくないなら `null`。既定は `null`（ディスクの識別子を答えない）。
+     * [ComputerCase] は、電源を入れたときにあったディスクが抜けたかをこれで見る
+     */
+    public fun diskIdAt(slot: Int): String? = null
 }
 
 /**

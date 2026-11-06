@@ -16,7 +16,7 @@ import java.io.ByteArrayOutputStream
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** 独自拡張 `kibi:memory`（#408）の p1 の import を、WASM のプログラムから Endive とカーネルを通して確かめる */
+/** 独自拡張 `kibi:computer/memory`（#408）の p1 の import を、WASM のプログラムから Endive とカーネルを通して確かめる */
 class KibiMemoryProgramTest {
     private val limit = Duration.ofSeconds(90)
     private val kib = 1024L
@@ -49,7 +49,7 @@ class KibiMemoryProgramTest {
     private fun run(vararg args: String, ramBytes: Long = 512 * kib): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
-        m.lock.withLockValue {
+        run {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
             val bytes = resource("kibi-memory-wasi.wasm")

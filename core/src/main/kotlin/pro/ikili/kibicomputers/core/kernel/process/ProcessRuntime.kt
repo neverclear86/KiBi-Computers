@@ -91,6 +91,12 @@ internal class ProcessRuntime(
     /** 燃料待ちからの巻き直しの途中（#339）。止まった燃料切れの呼び出しに着いたら消す。プロセスのスレッドだけが読み書きする */
     var rewindingForFuel: Boolean = false
 
+    /**
+     * ホスト関数の中からゲストの export を呼んでいる深さ（#73。[ProcessContext.callGuest]）。0 より大きい間の燃料切れは巻き戻さない。
+     * 実行時だけ（保存しない）。プロセスのスレッドだけが読み書きする
+     */
+    var guestCallDepth: Int = 0
+
     /** 燃料待ちの条件変数（カーネルロックの） */
     val fuelCondition: Condition = machine.lock.newCondition()
 
@@ -109,7 +115,7 @@ internal class ProcessRuntime(
     var memoryGrowRefused: Boolean = false
 
     /**
-     * `kibi:memory` の `commit` を RAM の上限で断った（#408。範囲外で断ったときは立てない）。[memoryGrowRefused] と同じく、
+     * `kibi:computer/memory` の `commit` を RAM の上限で断った（#408。範囲外で断ったときは立てない）。[memoryGrowRefused] と同じく、
      * この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。プロセスのスレッドが、ロックを持たずに書く
      */
     @Volatile

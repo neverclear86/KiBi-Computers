@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.Whence
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
@@ -97,7 +98,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
         if (!P1.inBounds(memory, nreadPtr, 4)) return Errno.FAULT.code
         if (offset < 0) return Errno.INVAL.code
         val buf = ByteArray(vec.total)
-        val n = locked(fd) { entry, obj ->
+        val n = unlocked(fd) { entry, obj ->
             if (entry.rights and HandleRights.READ == 0) fsError(Errno.BADF)
             ctx.vfs.pread(file(obj), offset, buf, 0, buf.size)
         }
@@ -113,7 +114,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
         if (!P1.inBounds(memory, nwrittenPtr, 4)) return Errno.FAULT.code
         if (offset < 0) return Errno.INVAL.code
         val buf = vec.gather(memory)
-        val n = locked(fd) { entry, obj ->
+        val n = unlocked(fd) { entry, obj ->
             if (entry.rights and HandleRights.WRITE == 0) fsError(Errno.BADF)
             ctx.vfs.pwrite(file(obj), offset, buf, 0, buf.size)
         }
@@ -133,7 +134,18 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
             P1.WHENCE_END -> Whence.END
             else -> return Errno.INVAL.code
         }
-        val pos = locked(fd) { _, obj -> ctx.vfs.seek(file(obj), offset, w) }
+        val f = unlocked(fd) { _, obj -> file(obj) }
+        if (f.isDirectory) return Errno.ISDIR.code
+        // 終わりの位置は、ロックの外で大きさを読む。位置を変えるのはロックの中
+        val end = if (w == Whence.END) ctx.vfs.size(f) else 0L
+        val pos = ctx.withKernelLock {
+            val base = when (w) {
+                Whence.SET -> 0L
+                Whence.CUR -> f.position
+                Whence.END -> end
+            }
+            Vfs.seekTarget(base, offset).also { f.position = it }
+        }
         memory.writeI64(newOffsetPtr, pos)
         return 0
     }
@@ -201,7 +213,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
     /** `fd_filestat_get(fd, filestat*)` */
     fun filestatGet(memory: WasmMemory, fd: Int, bufPtr: Int): Int {
         if (!P1.inBounds(memory, bufPtr, P1.FILESTAT_SIZE.toLong())) return Errno.FAULT.code
-        val out = locked(fd) { _, obj ->
+        val out = unlocked(fd) { _, obj ->
             when (obj) {
                 is OpenFile -> P1.filestat(ctx.vfs.stat(obj))
                 else -> ByteArray(P1.FILESTAT_SIZE).also {
@@ -217,7 +229,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
     /** `fd_filestat_set_size(fd, size)` */
     fun filestatSetSize(fd: Int, size: Long): Int {
         if (size < 0) return Errno.INVAL.code
-        locked(fd) { entry, obj ->
+        unlocked(fd) { entry, obj ->
             if (obj !is OpenFile) fsError(Errno.INVAL)
             if (entry.rights and HandleRights.WRITE == 0) fsError(Errno.BADF)
             ctx.vfs.setSize(obj, size)
@@ -230,7 +242,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
         val times = P1.times(fstFlags, atim, mtim) { ctx.environment.clock.realtimeNanos() }
         val a = times.accessedNanos
         val m = times.modifiedNanos
-        locked(fd) { _, obj ->
+        unlocked(fd) { _, obj ->
             if (obj !is OpenFile) fsError(Errno.NOTSUP)
             if (a != null || m != null) ctx.vfs.setTimes(obj, a, m)
         }
@@ -250,18 +262,19 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
     fun allocate(fd: Int, offset: Long, len: Long): Int {
         if (offset < 0 || len <= 0) return Errno.INVAL.code
         if (offset > Long.MAX_VALUE - len) return Errno.FBIG.code
-        locked(fd) { entry, obj ->
+        unlocked(fd) { entry, obj ->
             val f = file(obj)
             if (entry.rights and HandleRights.WRITE == 0) fsError(Errno.BADF)
             if (f.isDirectory) fsError(Errno.ISDIR)
-            if (ctx.vfs.stat(f).size < offset + len) ctx.vfs.setSize(f, offset + len)
+            // 伸ばすだけ（大きさを読んでから伸ばすまでを、ファイルシステムの中で不可分に行う。#52）
+            ctx.vfs.allocate(f, offset + len)
         }
         return 0
     }
 
     /** `fd_sync(fd)`・`fd_datasync(fd)` */
     fun sync(fd: Int): Int {
-        locked(fd) { _, obj ->
+        unlocked(fd) { _, obj ->
             if (obj !is OpenFile) fsError(Errno.INVAL)
             ctx.vfs.sync(obj)
         }
@@ -277,7 +290,7 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
     fun readdir(memory: WasmMemory, fd: Int, bufPtr: Int, bufLen: Int, cookie: Long, bufusedPtr: Int): Int {
         val cap = P1.u32(bufLen.toLong())
         if (!P1.inBounds(memory, bufPtr, cap) || !P1.inBounds(memory, bufusedPtr, 4)) return Errno.FAULT.code
-        val entries = locked(fd) { _, obj ->
+        val entries = unlocked(fd) { _, obj ->
             val f = file(obj)
             if (!f.isDirectory) fsError(Errno.NOTDIR)
             val parent = f.path.parent
@@ -407,10 +420,22 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
 
     private fun table(): FdTable = FdTable(checkNotNull(ctx.kernel.processes[ctx.pid]), ctx.kernel.objects, ctx.wakeSink)
 
-    /** カーネルロックの中で、[fd] のエントリとオブジェクトで [block] を実行する。失敗は [FsException] のまま投げる */
+    /** カーネルロックの中で、[fd] のエントリとオブジェクトで [block] を実行する（VFS を呼ばないもの）。失敗は [FsException] のまま投げる */
     private fun <T> locked(fd: Int, block: (HandleEntry, KernelObject) -> T): T = ctx.withKernelLock {
         val t = table()
         block(t.entry(fd), t.objectOf(fd))
+    }
+
+    /**
+     * カーネルロックの中で [fd] のエントリとオブジェクトを取り出し、ロックの外で [block] を実行する（VFS の操作。#52。ADR 0052）。
+     * 失敗は [FsException] のまま投げる。間に fd が閉じられても、取り出したオブジェクトで最後まで行う（POSIX と同じ）
+     */
+    private fun <T> unlocked(fd: Int, block: (HandleEntry, KernelObject) -> T): T {
+        val (entry, obj) = ctx.withKernelLock {
+            val t = table()
+            t.entry(fd) to t.objectOf(fd)
+        }
+        return block(entry, obj)
     }
 
     /** 位置を持つファイルでなければ `SPIPE`（ストリーム） */

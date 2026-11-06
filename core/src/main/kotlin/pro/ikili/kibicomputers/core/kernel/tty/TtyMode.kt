@@ -55,6 +55,18 @@ internal data class TtySize(val columns: Int, val rows: Int) {
     }
 }
 
+/** 画面の大きさ（[size]）と、その世代（[generation]。大きさが変わった回数）の、同じ瞬間の組（#427） */
+internal data class TtySizeInfo(val size: TtySize, val generation: Long)
+
+/** TTY のイベントの名前（#427。ADR 0427） */
+internal object TtyLimits {
+    /** 画面の大きさが変わったときのイベントの種類（[pro.ikili.kibicomputers.core.kernel.event.KernelEvent.type]） */
+    const val RESIZE_EVENT_TYPE: String = "tty-resize"
+
+    /** マシンのコンソールの TTY のイベントの出どころ（[pro.ikili.kibicomputers.core.kernel.event.KernelEvent.source]） */
+    const val CONSOLE_SOURCE: String = "console"
+}
+
 /** TTY が起こすシグナル */
 internal enum class TtySignal {
     /** Ctrl+C */

@@ -1,0 +1,18 @@
+package kibi:process@0.1.0;
+
+/// p1 のゲスト向け（wasi:* を参照しない）。kibi:process の p1 の interface を import する
+world imports {
+    import process;
+}
+
+/// p2 のゲスト向け（仮置き。ADR 0074）
+world imports-p2 {
+    import process;
+    import process-poll;
+}
+
+/// p3 のゲスト向け（仮置き。ADR 0074）
+world imports-p3 {
+    import process;
+    import process-async;
+}

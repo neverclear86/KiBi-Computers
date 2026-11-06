@@ -64,7 +64,7 @@ class FuelMeteringTest {
     }
 
     /** ルートに `/bin` だけのファイルシステムをつなぎ、[path] に [bytes] を置く（マシンごとに1回） */
-    private fun Machine.install(path: String, bytes: ByteArray) = lock.withLockValue {
+    private fun Machine.install(path: String, bytes: ByteArray) = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         vfs.createDirectory(VfsPath.parse("/bin"))
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))

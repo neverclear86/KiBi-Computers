@@ -1,5 +1,9 @@
 package pro.ikili.kibicomputers.core.kernel.wait
 
+import pro.ikili.kibicomputers.core.kernel.process.Process
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+
 /** 待てる条件。種類は後続の Issue で足す（タイマーとイベントキューは READABLE を使う）。 */
 internal enum class WaitCondition {
     /** 読める（読めるバイトがある、または書く側が閉じた） */
@@ -45,6 +49,20 @@ internal interface WakeSink {
      * 既定は何もしない（[pro.ikili.kibicomputers.core.kernel.Machine] の知らせ口だけが取り消す）
      */
     fun timerClosed(objectId: Int) {}
+
+    /**
+     * ファイルシステムに開いたことを知らせた（[OpenFile.retained]）開いたファイル [file] が閉じられた（参照カウント 0。#52）。
+     * 実行時の側が、カーネルロックの外でファイルシステムに知らせる（[pro.ikili.kibicomputers.core.kernel.vfs.Vfs.releaseLater]）。
+     * 既定は何もしない
+     */
+    fun fileClosed(file: OpenFile) {}
+
+    /**
+     * [holder] の fd 表から、子のハンドル（[obj] を指す fd）を1つ外した（`close`・`dup2`・`renumber` での上書き。#74、ADR 0074）。
+     * 参照を返す前に呼ぶ。実行時の側が、親が最後のハンドルを閉じたなら子を付け替える（`ProcessLifecycle.onProcessHandleClosedLocked`）。
+     * プロセスの終わり（`FdTable.closeAll`）では呼ばない。既定は何もしない
+     */
+    fun processHandleClosed(holder: Process, obj: ProcessObject) {}
 
     companion object {
         /** 待ち手のないところ（テスト、復元の途中）用。何もしない */

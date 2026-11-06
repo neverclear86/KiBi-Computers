@@ -65,15 +65,43 @@ public fun interface EntropySource {
 }
 
 /**
- * ディスクの実体（接続層 → カーネル。#44）。ディスクの識別子から、中身を置くホストのディレクトリを返す。
- * ディスクの FS（#52）とマウント（#56）が使う。識別子の決め方（アイテムに持たせる UUID など）は接続層が決める。
+ * ディスクの実体（[DiskResolver.resolve] の結果。#124）。中身を置くホストのディレクトリと、ディスクの容量。
+ *
+ * @property directory 中身を置くホストのディレクトリ（なければカーネルが作る。#52）
+ * @property capacityBytes 使える量（バイト。中身の大きさ＋項目ごとの管理の分）
+ * @property maxEntries ファイル・ディレクトリの数の上限（根を除く）
+ */
+@ApiStatus.Internal
+public class ResolvedDisk(
+    @JvmField public val directory: Path,
+    @JvmField public val capacityBytes: Long,
+    @JvmField public val maxEntries: Int,
+) {
+    init {
+        require(capacityBytes > 0) { "capacityBytes must be positive: $capacityBytes" }
+        require(maxEntries > 0) { "maxEntries must be positive: $maxEntries" }
+    }
+
+    override fun equals(other: Any?): Boolean =
+        other is ResolvedDisk && directory == other.directory &&
+            capacityBytes == other.capacityBytes && maxEntries == other.maxEntries
+
+    override fun hashCode(): Int = (directory.hashCode() * 31 + capacityBytes.hashCode()) * 31 + maxEntries
+
+    override fun toString(): String = "ResolvedDisk($directory, $capacityBytes bytes, $maxEntries entries)"
+}
+
+/**
+ * ディスクの実体（接続層 → カーネル。#44）。ディスクの識別子から、中身を置くホストのディレクトリと容量を返す。
+ * ディスクの FS（#52）とマウント（#56）が使う。識別子の決め方（アイテムに持たせる UUID など）は接続層が決める
+ * （ワールドのディスクは [pro.ikili.kibicomputers.core.computer.DiskStore.snapshot]。#124）。
  *
  * どのスレッドから呼ばれてもよいように作る。ディレクトリを作るのはカーネルの側（#52）。
  */
 @ApiStatus.Internal
 public fun interface DiskResolver {
-    /** [diskId] のディスクの中身を置くディレクトリ。知らない識別子なら `null` */
-    public fun resolve(diskId: String): Path?
+    /** [diskId] のディスクの実体。知らない識別子なら `null` */
+    public fun resolve(diskId: String): ResolvedDisk?
 
     public companion object {
         /** ディスクを1つも持たない */
@@ -91,7 +119,7 @@ public fun interface DiskResolver {
  * ```java
  * MachineEnvironment env = MachineEnvironment.builder()
  *         .clock(clock)
- *         .disks(id -> disksDir.resolve(id))
+ *         .disks(diskStore.snapshot(installedDisks))
  *         .storageDirectory(saveDir.resolve(machineId))
  *         .build();
  * ```

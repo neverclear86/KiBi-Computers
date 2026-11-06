@@ -12,6 +12,9 @@ jetbrains-annotations = "24.1.0"
 # #26 Endive の性能測定（poc/endive-bench）でだけ使う。MOD には入れない
 jffi = "1.4.3"
 
+# core のテストでだけ使う（WIT を wasm-tools で解析する。#75）。MOD には入れない
+zerofs = "0.1.0"
+
 # build-logic（WASM のビルド）で使う。Zig 本体のバージョンは gradle/zig.properties
 commons-compress = "1.28.0"
 xz = "1.10"
@@ -21,6 +24,8 @@ endive-runtime = { module = "run.endive:runtime", version.ref = "endive" }
 endive-wasm = { module = "run.endive:wasm", version.ref = "endive" }
 endive-wasi = { module = "run.endive:wasi", version.ref = "endive" }
 endive-compiler = { module = "run.endive:compiler", version.ref = "endive" }
+endive-wasm-tools = { module = "run.endive:wasm-tools", version.ref = "endive" }
+zerofs = { module = "io.roastedroot:zerofs", version.ref = "zerofs" }
 endive-build-time-compiler = { module = "run.endive:build-time-compiler", version.ref = "endive" }
 endive-redline-build-time-compiler = { module = "run.endive:redline-build-time-compiler-experimental", version.ref = "endive" }
 endive-redline-runner = { module = "run.endive:redline-runner-experimental", version.ref = "endive" }

@@ -63,12 +63,12 @@ class ProcessSpawnTest {
     }
 
     /** `/` にメモリのファイルシステムをつなぎ、[dirs] を作る */
-    private fun Machine.mountRoot(vararg dirs: String) = lock.withLockValue {
+    private fun Machine.mountRoot(vararg dirs: String) = run {
         vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         for (d in dirs) vfs.createDirectory(VfsPath.parse(d))
     }
 
-    private fun Machine.writeFile(path: String, bytes: ByteArray) = lock.withLockValue {
+    private fun Machine.writeFile(path: String, bytes: ByteArray) = run {
         val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
         vfs.write(f, bytes, 0, bytes.size)
     }

@@ -168,7 +168,7 @@ public interface WasmMemory {
     public fun writeI64(address: Int, value: Long)
 
     /**
-     * [address] から [length] バイト（どちらも符号なし 32 ビット）の範囲を、今のうちに RAM として数える（`kibi:memory` の `commit`。#408）。
+     * [address] から [length] バイト（どちらも符号なし 32 ビット）の範囲を、今のうちに RAM として数える（`kibi:computer/memory` の `commit`。#408）。
      *
      * 数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上として扱う）未満になるなら、何も数えずに `false`。
      * 新しく数える所がなければ（[keepBytes] を見ずに）`true`。範囲が線形メモリの外なら [WasmMemoryAccessException]
@@ -229,7 +229,7 @@ internal interface WasmTableBudget {
 
     /**
      * [tryReserveBytes] と同じだが、数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上）未満になるなら、
-     * 何も数えずに `false`（`kibi:memory` の `commit`。#408）。読みと数えるのは不可分に行う（同時に動くほかの確保と食い違わない）
+     * 何も数えずに `false`（`kibi:computer/memory` の `commit`。#408）。読みと数えるのは不可分に行う（同時に動くほかの確保と食い違わない）
      */
     fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean
 

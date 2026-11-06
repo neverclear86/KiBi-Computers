@@ -38,7 +38,7 @@ fun main() {
     val lua = File(requireNotNull(System.getProperty("kibi.luaWasm")) { "kibi.luaWasm がない" }).readBytes()
     val adapterFile = File(requireNotNull(System.getProperty("kibi.adapter")) { "kibi.adapter がない" })
     val adapter = adapterFile.readBytes()
-    // lua.wasm の kibi.memory_* の import（#409）を、コンポーネントの中で満たすアダプタ（#415）
+    // lua.wasm の kibi:computer/memory の import（#409・#73）を、コンポーネントの中で満たすアダプタ（#415）
     val kibiAdapter = WasmTools.parseCore(KibiMemoryStub.ADAPTER_WAT.trimIndent())
     println("java.version=${System.getProperty("java.version")}")
     println("lua.wasm ${"%.1f".format(lua.size / 1024.0)} KiB / アダプタ ${adapterFile.name} ${"%.1f".format(adapter.size / 1024.0)} KiB")
@@ -46,7 +46,7 @@ fun main() {
     println()
     println("== 1. 包む（wasm-tools component new --adapt）")
     var component = ByteArray(0)
-    val adaptMs = (1..3).map { timeMs { component = WasmTools.adapt(lua, adapter, mapOf("kibi" to kibiAdapter)) } }
+    val adaptMs = (1..3).map { timeMs { component = WasmTools.adapt(lua, adapter, mapOf(KibiMemoryStub.MODULE to kibiAdapter)) } }
     println("component new: 1回目 %.0f ms、2・3回目 %.0f / %.0f ms".format(adaptMs[0], adaptMs[1], adaptMs[2]))
     println("コンポーネント ${"%.1f".format(component.size / 1024.0)} KiB（lua.wasm より +${"%.1f".format((component.size - lua.size) / 1024.0)} KiB）")
     val validateMs = (1..3).map { timeMs { ComponentValidate.validate(ByteArrayInputStream(component), "cm-implements") } }
@@ -173,7 +173,7 @@ private fun runA(engine: (ImportValues) -> Instance, script: String): Pair<Strin
     return stdout.toString(Charsets.UTF_8) to calls
 }
 
-/** A の import: p1 のホスト関数と、kibi.memory_* の代わり（#415） */
+/** A の import: p1 のホスト関数と、kibi:computer/memory の代わり（#415・#73） */
 private fun p1Imports(wasi: List<run.endive.runtime.HostFunction>): ImportValues =
     ImportValues.builder().addFunction(*(wasi + KibiMemoryStub.hostFunctions()).toTypedArray()).build()
 

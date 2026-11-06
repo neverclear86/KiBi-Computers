@@ -1,0 +1,11 @@
+package kibi:io@0.1.0;
+
+/// p3 のパイプ（ADR 0075）。仮置き: interface・関数・型は、p3 の層 #266 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+/// 書く側は、呼んだ側が stream.new で作った stream<u8> の読む端を渡す。ホストはそれをカーネルのパイプに流し込み、パイプの読む端を返す。
+/// 渡した stream の書く端を閉じると、返した stream は残りを渡した後に終わる。返した stream を捨てると、ホストは渡した stream を捨てる。
+interface pipe-async {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// パイプを作る。大きさは既定（仮の値 4096 バイト。確定は #251）。マシン全体の上限なら nfile、ハンドル表が満杯なら mfile。
+    create: func(data: stream<u8>) -> result<stream<u8>, error-code>;
+}

@@ -1,0 +1,7 @@
+// KibiWitParseTest（#74）が kibi:* の WIT を wasm-tools で解析するためだけの、wasi:filesystem/types（p3）の最小のスタブ。
+// 本物の WIT ではない（kibi:* が参照する型の名前だけを置く）。src/main/wit には置かない。
+package wasi:filesystem@0.3.0;
+
+interface types {
+    resource descriptor;
+}
