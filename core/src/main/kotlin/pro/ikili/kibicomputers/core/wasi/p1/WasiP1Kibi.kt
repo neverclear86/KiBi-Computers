@@ -52,13 +52,14 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [IO_TTY] | `get-size` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_TTY] | `get-foreground` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_TTY] | `set-foreground` | `(fd, pid, ret_ptr: i32) -> ()` |
+ * | [PROCESS] | （[WasiP1KibiProcess] の表。#74） | |
  *
  * p2・p3 だけの interface（`kibi:io` の `pipe-streams`・`pipe-async`、`kibi:kernel` の `timers-poll`・`events-poll`・
- * `timers-async`・`events-async`）は出さない（表にないので、import すると `NOEXEC`）。
+ * `timers-async`・`events-async`、`kibi:process` の `process-poll`・`process-async`）は出さない（表にないので、import すると `NOEXEC`）。
  * `kibi:io/tty` の `mode`（`flags`）は下位 5 ビットだけを読む（上のビットは捨てる。Canonical ABI の lift と同じ）。
  * `u64` の時間の引数（`set-after`・`set-at`）は、2^63 以上を `Long.MAX_VALUE` に頭打ちにしてカーネルへ渡す（ADR 0426）。
  *
- * どれも待たないので、待機点への変換で止まりうる関数（[WasiP1.WAIT_IMPORTS]）には入れない。
+ * `kibi:process` の `[static]process.spawn` だけが待つ（[WasiP1.WAIT_IMPORTS]。[WasiP1KibiProcess]）。ほかは待たない。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数。
  */
 internal object WasiP1Kibi {
@@ -82,6 +83,9 @@ internal object WasiP1Kibi {
 
     /** `kibi:io/tty` のモジュール名 */
     const val IO_TTY: String = "kibi:io/tty@0.1.0"
+
+    /** `kibi:process/process` のモジュール名（[WasiP1KibiProcess]） */
+    const val PROCESS: String = WasiP1KibiProcess.MODULE
 
     /** `kibi:io/tty` の `flags mode` のフラグの数 */
     private const val TTY_MODE_FLAGS = 5
@@ -115,7 +119,7 @@ internal object WasiP1Kibi {
     /** `u32` の引数を符号なしで広げる */
     private fun Long.u32(): Long = this and 0xffff_ffffL
 
-    private fun memoryOf(caller: WasmInstance): WasmMemory =
+    fun memoryOf(caller: WasmInstance): WasmMemory =
         caller.memory ?: throw WasmTrapException(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, "線形メモリを export していない")
 
     private val FUNCTIONS: List<Fn> = listOf(
@@ -324,26 +328,31 @@ internal object WasiP1Kibi {
     }
 
     /** ゲストの `cabi_realloc(0, 0, align, size)` を、ゲストを呼んでいる印を立てて呼ぶ */
-    private fun realloc(ctx: ProcessContext, caller: WasmInstance) = P1Canonical.Realloc { align, size ->
+    fun realloc(ctx: ProcessContext, caller: WasmInstance): P1Canonical.Realloc = P1Canonical.Realloc { align, size ->
         ctx.callGuest { caller.call(REALLOC, 0L, 0L, align.toLong(), size.toLong())[0].toInt() }
     }
 
     /** 出しているモジュール名 */
-    val modules: Set<String> = FUNCTIONS.map { it.module }.toSet()
+    val modules: Set<String> = FUNCTIONS.map { it.module }.toSet() + PROCESS
 
     /** 出している関数 [module].[name] の型（なければ `null`） */
-    fun typeOf(module: String, name: String): WasmFunctionType? = find(module, name)?.type
+    fun typeOf(module: String, name: String): WasmFunctionType? =
+        if (module == PROCESS) WasiP1KibiProcess.typeOf(name) else find(module, name)?.type
 
     /** [module].[name] が `cabi_realloc` を要するか（出していない関数なら `false`） */
-    fun needsRealloc(module: String, name: String): Boolean = find(module, name)?.needsRealloc == true
+    fun needsRealloc(module: String, name: String): Boolean =
+        if (module == PROCESS) WasiP1KibiProcess.needsRealloc(name) else find(module, name)?.needsRealloc == true
 
     /** 出している関数の (モジュール名, 名前) の一覧（`KibiWitTableTest` が WIT と突き合わせる） */
-    val functions: List<Pair<String, String>> get() = FUNCTIONS.map { it.module to it.name }
+    val functions: List<Pair<String, String>> get() = FUNCTIONS.map { it.module to it.name } + WasiP1KibiProcess.names.map { PROCESS to it }
 
     private fun find(module: String, name: String): Fn? = FUNCTIONS.firstOrNull { it.module == module && it.name == name }
 
-    /** 独自拡張の関数を [builder] に登録する（`ProcessDriver.configure` の中から。[WasiP1.register] が呼ぶ） */
-    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
+    /**
+     * 独自拡張の関数を [builder] に登録する（`ProcessDriver.configure` の中から。[WasiP1.register] が呼ぶ）。
+     * [suspend]・[wait] は止まりうる `kibi:process` の `spawn` の待ち方。戻り値はこのプロセスの `kibi:process` の import
+     */
+    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, suspend: WasiP1Suspend, wait: P1Wait): WasiP1KibiProcess {
         for (fn in FUNCTIONS) {
             builder.hostFunction(
                 fn.module,
@@ -360,5 +369,6 @@ internal object WasiP1Kibi {
                 },
             )
         }
+        return WasiP1KibiProcess(ctx, suspend, wait).also { it.register(builder) }
     }
 }

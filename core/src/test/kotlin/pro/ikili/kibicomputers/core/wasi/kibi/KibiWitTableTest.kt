@@ -161,6 +161,121 @@ class KibiWitTableTest {
         assertEquals(streamsVersion, pollVersion)
     }
 
+    @Test
+    fun `kibi_processのprocessの関数はすべてp1に出し、process-pollとprocess-asyncは出さない`() {
+        val wit = derived()
+        val expected = setOf(
+            "[static]process.spawn", "[method]process.pid", "[method]process.status", "[method]process.kill", "[resource-drop]process",
+            "kill-pid", "self-pid", "parent-pid", "set-signal-ignored", "get-cwd", "set-cwd",
+        ).map { WasiP1Kibi.PROCESS to it }.toSet()
+        assertEquals(expected, wit.filter { it.first == WasiP1Kibi.PROCESS }.toSet())
+        for (fn in expected) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
+        assertTrue(WasiP1Kibi.needsRealloc(WasiP1Kibi.PROCESS, "get-cwd"))
+        assertFalse(WasiP1Kibi.needsRealloc(WasiP1Kibi.PROCESS, "[static]process.spawn"))
+        for ((m, f) in listOf("kibi:process/process-poll@0.1.0" to "subscribe", "kibi:process/process-async@0.1.0" to "wait")) {
+            assertTrue((m to f) in wit, "$m.$f が WIT にない")
+            assertFalse(m in WasiP1Kibi.modules, "$m を p1 に出している")
+        }
+    }
+
+    @Test
+    fun `kibi_processのp1の部分はwasiを参照せず、p2とp3はほかのkibiパッケージと同じ版のwasiだけを使う`() {
+        val world = witText("kibi-process/world.wit")
+        val imports = Regex("""world\s+imports\s*\{([^}]*)}""").find(world)!!.groupValues[1]
+        assertFalse("wasi:" in imports, imports)
+        assertFalse(useLines(witText("kibi-process/process.wit")).any { "wasi:" in it }, "process.wit が wasi:* を使っている")
+        assertEquals(
+            listOf(
+                "use wasi:io/poll@0.2.3.{pollable};",
+                "use wasi:io/streams@0.2.3.{input-stream, output-stream};",
+                "use wasi:filesystem/types@0.2.3.{descriptor};",
+            ),
+            useLines(witText("kibi-process/process-poll.wit")).filter { "wasi:" in it },
+        )
+        assertEquals(
+            listOf("use wasi:filesystem/types@0.3.0.{descriptor};"),
+            useLines(witText("kibi-process/process-async.wit")).filter { "wasi:" in it },
+        )
+        // process は kibi:kernel/types の error-code を使う（p1 の errno と同じ並び）
+        assertTrue("use kibi:kernel/types@0.1.0.{error-code};" in useLines(witText("kibi-process/process.wit")))
+    }
+
+    /** WIT のパッケージ（`ns:pkg@ver`）→ interface 名 → その中で定義した型の名前 */
+    private fun definedTypes(texts: List<String>): Map<String, Map<String, Set<String>>> {
+        val out = HashMap<String, HashMap<String, HashSet<String>>>()
+        val pkgRe = Regex("""^\s*package\s+([a-z0-9-]+:[a-z0-9-]+@[0-9.]+)\s*;""")
+        val ifaceRe = Regex("""^\s*interface\s+([a-z0-9-]+)\s*\{""")
+        val typeRe = Regex("""^\s*(?:enum|variant|record|flags|resource|type)\s+%?([a-z0-9-]+)""")
+        for (text in texts) {
+            var pkg: String? = null
+            var iface: String? = null
+            var depth = 0
+            for (raw in text.lines()) {
+                val line = raw.substringBefore("//")
+                pkgRe.find(line)?.let { pkg = it.groupValues[1] }
+                if (depth == 0) ifaceRe.find(line)?.let { iface = it.groupValues[1] }
+                val p = pkg
+                val i = iface
+                if (depth == 1 && p != null && i != null) typeRe.find(line)?.let { out.getOrPut(p) { HashMap() }.getOrPut(i) { HashSet() } += it.groupValues[1] }
+                depth += line.count { it == '{' } - line.count { it == '}' }
+                if (depth == 0) iface = null
+            }
+        }
+        return out
+    }
+
+    /** [text]（package 宣言のある1ファイル）の `use` の参照のうち、[types] で見つからないもの */
+    private fun unresolvedUses(text: String, types: Map<String, Map<String, Set<String>>>): List<String> {
+        val own = Regex("""(?m)^\s*package\s+([a-z0-9-]+:[a-z0-9-]+@[0-9.]+)\s*;""").find(text)!!.groupValues[1]
+        val useRe = Regex("""^use\s+(?:([a-z0-9-]+:[a-z0-9-]+)/)?([a-z0-9-]+)(@[0-9.]+)?\.\{([^}]*)}\s*;$""")
+        val out = ArrayList<String>()
+        for (u in useLines(text)) {
+            val m = useRe.find(u) ?: run {
+                out += u
+                null
+            } ?: continue
+            val ns = m.groupValues[1]
+            if (ns.startsWith("wasi:")) {
+                if (!Regex("""^[0-9]+\.[0-9]+\.[0-9]+$""").matches(m.groupValues[3].removePrefix("@"))) out += u
+                continue
+            }
+            val pkg = if (ns.isEmpty()) own else "$ns${m.groupValues[3]}"
+            val iface = types[pkg]?.get(m.groupValues[2])
+            for (name in m.groupValues[4].split(",").map { it.trim().substringBefore(" as ") }.filter { it.isNotEmpty() }) {
+                if (iface == null || name !in iface) out += "$u ($name)"
+            }
+        }
+        return out
+    }
+
+    @Test
+    fun `WITのuseの参照先のパッケージ・interface・型がsrc_main_witにある`() {
+        val texts = witFiles().map { it.readText() }
+        val types = definedTypes(texts)
+        for (f in witFiles()) {
+            assertEquals(emptyList<String>(), unresolvedUses(f.readText(), types), f.path)
+        }
+        // 誤りを見つけられること: ない型・ない interface・版の違い
+        val bad = """
+            package kibi:process@0.1.0;
+            interface x {
+                use kibi:kernel/types@0.1.0.{no-such-type};
+                use kibi:kernel/nothing@0.1.0.{error-code};
+                use kibi:kernel/types@0.9.0.{error-code};
+                use process.{exit-status, nope};
+            }
+        """.trimIndent()
+        assertEquals(4, unresolvedUses(bad, types).size, unresolvedUses(bad, types).toString())
+    }
+
+    @Test
+    fun `src_main_witにはdepsもシンボリックリンクも置かない`() {
+        val root = File("src/main/wit")
+        val all = root.walkTopDown().toList()
+        assertFalse(all.any { it.isDirectory && it.name == "deps" }, "deps/ を置いている（解決はテストの時に組み立てる）")
+        assertFalse(all.any { java.nio.file.Files.isSymbolicLink(it.toPath()) }, "シンボリックリンクを置いている")
+    }
+
     private fun useLines(text: String): List<String> =
         text.lines().map { it.substringBefore("//").trim() }.filter { it.startsWith("use ") }
 

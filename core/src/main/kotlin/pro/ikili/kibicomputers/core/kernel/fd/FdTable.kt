@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
 import pro.ikili.kibicomputers.core.kernel.process.Process
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -102,7 +103,7 @@ internal class FdTable(
         objects.retain(e.objectId)
         val old = handles[to]
         handles.insertAt(to, e)
-        if (old != null) objects.release(old.objectId, sink)
+        if (old != null) releaseRemoved(old)
         return to
     }
 
@@ -117,7 +118,7 @@ internal class FdTable(
         val old = handles[to]
         handles.remove(from)
         handles.insertAt(to, e)
-        if (old != null) objects.release(old.objectId, sink)
+        if (old != null) releaseRemoved(old)
     }
 
     /** [fd] のフラグ（[HandleEntry.flags]。意味は ABI 層が決める）を [flags] にする。参照の数は変えない。開いていなければ `BADF` */
@@ -129,10 +130,20 @@ internal class FdTable(
     /** [fd] を閉じる。開いていなければ `BADF` */
     fun close(fd: Int) {
         val e = handles.remove(fd) ?: fsError(Errno.BADF, "fd $fd は開いていない")
+        releaseRemoved(e)
+    }
+
+    /**
+     * 表から外した [e] の参照を返す。子のハンドル（[ProcessObject]）なら、その前に [WakeSink.processHandleClosed] で知らせる
+     * （閉じ方に依らず、親が最後のハンドルを閉じたら子を付け替える。#74、ADR 0074）
+     */
+    private fun releaseRemoved(e: HandleEntry) {
+        val obj = objects[e.objectId]
+        if (obj is ProcessObject) sink.processHandleClosed(process, obj)
         objects.release(e.objectId, sink)
     }
 
-    /** すべての fd を閉じる（プロセスの終わり） */
+    /** すべての fd を閉じる（プロセスの終わり。子のハンドルは知らせない: 続く `onFinishedLocked` がすべての子を付け替える） */
     fun closeAll() {
         for ((fd, e) in handles.entries()) {
             handles.remove(fd)

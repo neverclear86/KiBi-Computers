@@ -105,9 +105,11 @@ internal object WasiP1 {
 
     /**
      * 待機点への変換（#329）で止まりうるとみなす import（`"<module>.<name>"`）。`fd_write` は、パイプがいっぱいのときに `AGAIN` を返すと
-     * wasi-libc がエラーとして扱いデータを失うので入れる。`sched_yield` は待ちではないので入れない
+     * wasi-libc がエラーとして扱いデータを失うので入れる。`sched_yield` は待ちではないので入れない。
+     * `kibi:process` の `[static]process.spawn`（読み込みを待つ。#74）も入れる
      */
-    val WAIT_IMPORTS: Set<String> = WAIT_NAMES.map { "${P1.MODULE}.$it" }.toSet()
+    val WAIT_IMPORTS: Set<String> =
+        WAIT_NAMES.map { "${P1.MODULE}.$it" }.toSet() + WasiP1KibiProcess.waitNames.map { "${WasiP1KibiProcess.MODULE}.$it" }
 
     /** 実装している関数の名前 */
     val implemented: Set<String> = FUNCTIONS.map { it.name }.toSet() + PROC_EXIT
@@ -194,10 +196,10 @@ internal object WasiP1 {
     }
 
     /**
-     * p1 のホスト関数を [builder] に登録する。[wait] は、ストリームの読み書きと `poll_oneoff` の待ち方。
-     * 戻り値は、止まりうる import の入口と出口の処理（[P1Wait.UNWIND] のとき、ドライバーが巻き戻しを受け取るのに使う）
+     * p1 のホスト関数を [builder] に登録する。[wait] は、ストリームの読み書きと `poll_oneoff`・`kibi:process` の `spawn` の待ち方。
+     * 戻り値の `suspend` は止まりうる import の入口と出口の処理（[P1Wait.UNWIND] のとき、ドライバーが巻き戻しを受け取るのに使う）
      */
-    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, wait: P1Wait): WasiP1Suspend {
+    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, module: WasmModule?, wait: P1Wait): WasiP1Registration {
         val basic = WasiP1Basic(ctx)
         val suspend = WasiP1Suspend(ctx)
         val impl = Impl(WasiP1Fd(ctx, wait, suspend), WasiP1Path(ctx), basic, WasiP1Poll(ctx, basic, wait, suspend))
@@ -234,7 +236,7 @@ internal object WasiP1 {
             )
         }
         // 独自拡張（kibi:* の p1 向けの import。#408・#73）
-        WasiP1Kibi.register(ctx, builder)
+        val kibiProcess = WasiP1Kibi.register(ctx, builder, suspend, wait)
         // proc_exit: 戻らない。WasiP1Exit でゲストの呼び出しを抜ける（ドライバーが終了コードにする）
         builder.hostFunction(
             P1.MODULE,
@@ -245,7 +247,8 @@ internal object WasiP1 {
                 throw WasiP1Exit(args[0].toInt())
             },
         )
-        if (module == null) return suspend
+        val registration = WasiP1Registration(suspend, kibiProcess)
+        if (module == null) return registration
         for (imp in module.imports) {
             if (imp.module != P1.MODULE || imp.kind != WasmExternKind.FUNCTION || imp.name in implemented) continue
             val type = imp.functionType ?: continue
@@ -258,9 +261,12 @@ internal object WasiP1 {
                 },
             )
         }
-        return suspend
+        return registration
     }
 }
+
+/** [WasiP1.register] の結果: 止まりうる import の入口と出口の処理と、`kibi:process` の import（#74） */
+internal class WasiP1Registration(val suspend: WasiP1Suspend, val kibiProcess: WasiP1KibiProcess)
 
 /**
  * p1 のコマンド（`_start` を export するモジュール）を動かすドライバー。
@@ -280,8 +286,15 @@ internal class WasiP1Driver(private val module: WasmModule) : ProcessDriver {
     /** 止まりうる import の入口と出口の処理（[configure] で作る） */
     private var suspend: WasiP1Suspend? = null
 
+    /** `kibi:process` の import（[configure] で作る。テストが巻き戻しの途中の状態を見るのに使う） */
+    @Volatile
+    internal var kibiProcess: WasiP1KibiProcess? = null
+        private set
+
     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
-        suspend = WasiP1.register(ctx, builder, module, if (module.isAsyncified) P1Wait.UNWIND else P1Wait.BLOCK)
+        val r = WasiP1.register(ctx, builder, module, if (module.isAsyncified) P1Wait.UNWIND else P1Wait.BLOCK)
+        suspend = r.suspend
+        kibiProcess = r.kibiProcess
     }
 
     override fun start(ctx: ProcessContext): StepResult = run(ctx)

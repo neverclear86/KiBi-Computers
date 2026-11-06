@@ -26,7 +26,8 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:kernel` | `events` | イベントキュー（resource `event-queue`） | #73 |
 | `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部。ADR 0426） | #426 |
 | `kibi:kernel` | `timers-poll`・`events-poll`・`timers-async`・`events-async` | p2・p3 でタイマー・イベントキューを待つ（仮置き。ADR 0426） | #426 |
-| `kibi:process` | — | プロセスの生成・待機・強制終了、cwd を変える import（ADR 0332） | #74 |
+| `kibi:process` | `process` | プロセスの生成・待機・強制終了、カーネルの cwd（p1・p2・p3 で共通。ADR 0074・0332） | #74 |
+| `kibi:process` | `process-poll`・`process-async` | p2・p3 で子を待つ・ハンドルを渡して子を作る（仮置き。ADR 0074） | #74 |
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
@@ -42,6 +43,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 
 - 識別子（interface・関数・型の名前、引数名、フィールド名、case 名）が WIT のキーワード（`from`・`use`・`type`・`stream`・`s64` など。wit-parser の字句解析のもの）に当たるなら、`%` で逃がす（`events.wit` の `%s64`）か改名する。名前は p1 の import の関数名・モジュール名に出ることがあるので、改名で済むなら改名を選ぶ（引数名は出ない）
 - 新しい WIT は `KibiWitParseTest` が wasm-tools（`wasm-tools component wit`。Endive の `run.endive:wasm-tools`。テストだけの依存）で解析・解決する。`src/main/wit/` のパッケージのディレクトリをすべて対象にするので、パッケージを足せば自動で対象になる。ほかの `kibi:*` のパッケージと、テストのリソースの `wit-stubs/`（`wasi:*` の最小のスタブ）を `deps/` に置いて解決する
+- パッケージをまたぐ `use`（例: `kibi:process` から `kibi:kernel/types`）のために、`src/main/wit/` に `deps/` も symlink も置かない。参照先は `KibiWitTableTest` がテキストで確かめる（#74 で追記。ADR 0074）
 - `KibiWitTableTest` は、予約語の識別子をテキストで拾う検査（速く分かりやすく失敗させるための補助）も持つ
 
 ## p1 向けの import の導き方（Q2-B・Q3-A）

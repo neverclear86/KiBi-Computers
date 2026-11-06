@@ -1,0 +1,80 @@
+package kibi:process@0.1.0;
+
+/// プロセスの生成・待機・強制終了と作業ディレクトリ（#74。ADR 0074）。p1・p2・p3 で共通。
+/// p1 では、process のハンドルはカーネルの fd 番号。poll_oneoff の FD_READ で、終わるまで待てる。
+interface process {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// シグナル（カーネルの KillSignal。ハンドラーはなく、効き方は「無視」か「止める」だけ）
+    enum signal {
+        /// Ctrl+C
+        interrupt,
+        /// Ctrl+\
+        quit,
+        /// 普通の終了の求め（kill の既定）
+        terminate,
+        /// 無視できない
+        kill,
+    }
+
+    /// 終わり方（カーネルの ExitStatus）
+    variant exit-status {
+        /// 自分から終わった。終了コードは 32 ビットそのまま（p1 の proc_exit(u32)）
+        exited(u32),
+        /// 止められた。マシンの停止・再起動なら none
+        killed(option<signal>),
+        /// トラップ・例外で終わった
+        crashed,
+    }
+
+    /// 子の fd に何を割り当てるか
+    variant fd-source {
+        /// 親の fd n（パイプの端、preopen のディレクトリなど）。p2/p3 では 0/1/2 だけ（ほかは bad-descriptor）
+        parent(u32),
+        /// 割り当てない（閉じたまま）
+        closed,
+    }
+
+    /// 子の fd 1つの割り当て
+    record fd-assign {
+        fd: u32,
+        source: fd-source,
+    }
+
+    /// 子の作り方
+    record spawn-options {
+        /// argv（最初の要素がプログラムの名前）。空なら path の文字列1つ
+        args: list<string>,
+        /// none なら親の環境変数。some なら丸ごと置き換える（並びを保つ）
+        env: option<list<tuple<string, string>>>,
+        /// none なら親のカーネルの cwd（p1 の親が libc の chdir をした後の値ではない。ADR 0332）
+        cwd: option<string>,
+        /// fd 0/1/2 は書かなければ親から引き継ぐ。fd 3 以降は書いたものだけ（ADR 0045。preopen も明示して渡す）
+        fds: list<fd-assign>,
+    }
+
+    /// 子のプロセス。作った親がハンドルを閉じたら、子は親なしになる（終わっていれば刈り取られる）
+    resource process {
+        /// VFS の実行ファイル path（相対パスは親のカーネルの cwd から）から子を作る。読み込み（コンパイル）が終わるまで待つ
+        spawn: static func(path: string, options: spawn-options) -> result<process, error-code>;
+        /// 子の pid
+        pid: func() -> u32;
+        /// 待たずに終わり方を返す（終わっていなければ none）。親が some を受け取ったら、その子を刈り取る
+        status: func() -> result<option<exit-status>, error-code>;
+        /// シグナルを送る（待たない。止まったことは status・poll_oneoff で知る）
+        kill: func(sig: signal) -> result<_, error-code>;
+    }
+
+    /// pid を指定してシグナルを送る（kill コマンド用。ハンドルを持たない相手にも送れる）
+    kill-pid: func(pid: u32, sig: signal) -> result<_, error-code>;
+    /// 自分の pid
+    self-pid: func() -> u32;
+    /// 親の pid（親がなければ 0）
+    parent-pid: func() -> u32;
+    /// 自分がシグナルを無視するか決める（子に引き継がない）。kill は invalid
+    set-signal-ignored: func(sig: signal, ignored: bool) -> result<_, error-code>;
+    /// カーネルの cwd
+    get-cwd: func() -> string;
+    /// カーネルの cwd を変える。相対パスは今の cwd から。なければ no-entry、ディレクトリでなければ not-directory
+    set-cwd: func(path: string) -> result<_, error-code>;
+}

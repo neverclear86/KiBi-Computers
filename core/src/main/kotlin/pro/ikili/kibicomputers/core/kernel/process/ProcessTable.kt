@@ -44,6 +44,15 @@ internal class ProcessTable(val limit: Int) {
         orphans.add(pid)
     }
 
+    /**
+     * テスト専用。本体のコードから呼ばない。次に割り当てる pid を [pid] にする（pid の使い回しを作るため。#74）。
+     * [pid] が使われていれば、[allocatePid] はそれを飛ばして次へ進む。範囲外（1 未満）なら [IllegalArgumentException]
+     */
+    internal fun setNextPidForTest(pid: Int) {
+        require(pid in 1..Int.MAX_VALUE) { "pid は 1 以上（$pid）" }
+        nextPid = pid
+    }
+
     /** 空いている pid を割り当てる */
     fun allocatePid(): Int {
         while (true) {

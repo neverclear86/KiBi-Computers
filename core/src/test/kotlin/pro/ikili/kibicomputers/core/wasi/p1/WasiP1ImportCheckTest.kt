@@ -149,6 +149,32 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_processは型が一致するときだけ通り、get-cwdはcabi_reallocが要り、版違い・p2とp3のinterfaceは断る`() {
+        val p = WasiP1Kibi.PROCESS
+        val spawn = Triple(p, "[static]process.spawn", List(13) { I32 } to emptyList<Int>())
+        val pid = Triple(p, "[method]process.pid", listOf(I32) to listOf(I32))
+        val status = Triple(p, "[method]process.status", listOf(I32, I32) to emptyList<Int>())
+        val kill = Triple(p, "[method]process.kill", listOf(I32, I32, I32) to emptyList<Int>())
+        val drop = Triple(p, "[resource-drop]process", listOf(I32) to emptyList<Int>())
+        val killPid = Triple(p, "kill-pid", listOf(I32, I32, I32) to emptyList<Int>())
+        val selfPid = Triple(p, "self-pid", emptyList<Int>() to listOf(I32))
+        val parentPid = Triple(p, "parent-pid", emptyList<Int>() to listOf(I32))
+        val ignored = Triple(p, "set-signal-ignored", listOf(I32, I32, I32) to emptyList<Int>())
+        val getCwd = Triple(p, "get-cwd", listOf(I32) to emptyList<Int>())
+        val setCwd = Triple(p, "set-cwd", listOf(I32, I32, I32) to emptyList<Int>())
+        // get-cwd 以外は cabi_realloc が要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(spawn, pid, status, kill, drop, killPid, selfPid, parentPid, ignored, setCwd))) }
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), getCwd))) }
+        assertNoexec(load(command(getCwd)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(Triple(p, "[static]process.spawn", List(12) { I32 } to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(p, "[method]process.status", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:process/process@0.2.0", "self-pid", emptyList<Int>() to listOf(I32)))), "版が違う")
+        assertNoexec(load(command(Triple(p, "fork", emptyList<Int>() to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:process/process-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:process/process-async@0.1.0", "wait", listOf(I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
     fun `kibi_io_ttyは型が一致するときだけ通り、版違い・表にない関数は断る`() {
         val isTty = Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32) to listOf(I32))
         val getMode = Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32, I32) to emptyList<Int>())

@@ -1,0 +1,31 @@
+package kibi:process@0.1.0;
+
+/// p2 で、プロセスの終わりを待つ・p2 のハンドルを子に渡す（ADR 0074）。p1 では使わない。
+/// 仮置き: interface・関数・型・wasi:* の版は、p2 の層 #264 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+interface process-poll {
+    use wasi:io/poll@0.2.3.{pollable};
+    use wasi:io/streams@0.2.3.{input-stream, output-stream};
+    use wasi:filesystem/types@0.2.3.{descriptor};
+    use kibi:kernel/types@0.1.0.{error-code};
+    use process.{process, spawn-options};
+
+    /// 終わったら準備完了になる pollable。準備完了になっても刈り取らない（刈り取りは process.status）
+    subscribe: func(p: borrow<process>) -> pollable;
+
+    /// 子に渡す p2 のハンドル
+    variant handle-source {
+        input(borrow<input-stream>),
+        output(borrow<output-stream>),
+        directory(borrow<descriptor>),
+        process(borrow<process>),
+    }
+
+    /// 子の fd 1つに当てるハンドル
+    record handle-assign {
+        fd: u32,
+        source: handle-source,
+    }
+
+    /// process.spawn と同じ。options.fds の後に handles を当てる（同じ fd を両方に書いたら invalid）
+    spawn-with-handles: func(path: string, options: spawn-options, handles: list<handle-assign>) -> result<process, error-code>;
+}
