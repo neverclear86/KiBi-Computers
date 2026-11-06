@@ -22,11 +22,28 @@ class InitTest {
 
     private class ConsoleHost : MachineHost {
         private val out = StringBuffer()
+        private val partial = StringBuilder()
+
+        /** 書き終わった行と、その行が届いた時刻（System.nanoTime） */
+        val timed: MutableList<Pair<String, Long>> = java.util.Collections.synchronizedList(mutableListOf())
 
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
 
         override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
-            out.append(String(bytes, Charsets.UTF_8))
+            val s = String(bytes, Charsets.UTF_8)
+            out.append(s)
+            val now = System.nanoTime()
+            synchronized(partial) {
+                for (c in s) {
+                    if (c == '\n') {
+                        val l = partial.toString().removeSuffix("\r")
+                        if (l.isNotEmpty()) timed += l to now
+                        partial.clear()
+                    } else {
+                        partial.append(c)
+                    }
+                }
+            }
         }
 
         fun text(): String = out.toString().replace("\r\n", "\n")
@@ -49,9 +66,9 @@ class InitTest {
     }
 
     /** イメージの `/sbin/init` と [files] を置いた、書けるディスク `d` */
-    private class Disk(init: ByteArray, files: Map<String, ByteArray>) : BootVolumeOpener {
+    private class Disk(init: ByteArray, files: Map<String, ByteArray>, dirs: List<String>) : BootVolumeOpener {
         private val fs = TestMemoryFileSystem().also { fs ->
-            for (d in listOf("/sbin", "/bin", "/etc")) fs.createDirectory(VfsPath.parse(d))
+            for (d in listOf("/sbin", "/bin", "/etc") + dirs) fs.createDirectory(VfsPath.parse(d))
             for ((path, bytes) in files + (BootConfig.INIT_PATH to init)) {
                 val node = fs.createFile(VfsPath.parse(path))
                 fs.write(node, 0, bytes, 0, bytes.size)
@@ -62,10 +79,18 @@ class InitTest {
     }
 
     /** [files] を置いたディスクから起動し、[until] がそろうまで tick を回してから止める。コンソールの行を返す */
-    private fun boot(files: Map<String, ByteArray>, until: (List<String>) -> Boolean): List<String> = timeout(limit) {
+    private fun boot(files: Map<String, ByteArray>, dirs: List<String> = emptyList(), until: (List<String>) -> Boolean): List<String> =
+        bootTimed(files, dirs, until).map { it.first }
+
+    /** [boot] と同じだが、行が届いた時刻（System.nanoTime）も返す */
+    private fun bootTimed(
+        files: Map<String, ByteArray>,
+        dirs: List<String> = emptyList(),
+        until: (List<String>) -> Boolean,
+    ): List<Pair<String, Long>> = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
-            h.scheduler.hooks.bootVolumes = Disk(imageFile(BootConfig.INIT_PATH), files)
+            h.scheduler.hooks.bootVolumes = Disk(imageFile(BootConfig.INIT_PATH), files, dirs)
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 8L * 1024 * 1024)
             assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
             eventuallyDescribe(90_000, { "そろわない: ${host.text()}" }) {
@@ -80,7 +105,7 @@ class InitTest {
                 m.state == MachineState.STOPPED
             }
             assertTrue(m.awaitTermination(5_000))
-            host.lines()
+            synchronized(host.timed) { host.timed.toList() }
         }
     }
 
@@ -187,5 +212,84 @@ class InitTest {
             ),
             lines,
         )
+    }
+
+    @Test
+    fun `inittabが8KiBを超えたら、FBIGと書いて既定のbin_shで動く`() {
+        val big = "# " + "x".repeat(MAX_CONF) + "\nshell /bin/initprobe big\n"
+        val lines = boot(mapOf("/bin/sh" to probe, "/bin/initprobe" to probe, "/etc/inittab" to big.toByteArray())) { l ->
+            l.any { it.startsWith("sh ") }
+        }
+        assertTrue("init: /etc/inittab: FBIG; using the default" in lines, lines.toString())
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1" in lines, lines.toString())
+        assertTrue(lines.none { it.startsWith("big ") }, lines.toString())
+    }
+
+    @Test
+    fun `inittabが読めなければ、errnoを書いて既定のbin_shで動く`() {
+        // ディレクトリはファイルとして読めない
+        val lines = boot(mapOf("/bin/sh" to probe), dirs = listOf("/etc/inittab")) { l -> l.any { it.startsWith("sh ") } }
+        val warning = lines.single { it.startsWith("init: /etc/inittab: ") }
+        assertTrue(warning.endsWith("; using the default") && "NOENT" !in warning, lines.toString())
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1" in lines, lines.toString())
+    }
+
+    @Test
+    fun `ちょうど8192バイトのinittabは受け付ける`() {
+        val body = "shell /bin/initprobe exact\n"
+        val pad = "#" + "x".repeat(MAX_CONF - body.length - 2) + "\n"
+        val text = pad + body
+        assertEquals(MAX_CONF, text.toByteArray().size)
+        val lines = boot(mapOf("/bin/sh" to probe, "/bin/initprobe" to probe, "/etc/inittab" to text.toByteArray())) { l ->
+            l.any { it.startsWith("exact ") }
+        }
+        assertTrue(lines.none { it.startsWith("init: /etc/inittab") }, lines.toString())
+        assertTrue(lines.none { it.startsWith("sh ") }, lines.toString())
+    }
+
+    @Test
+    fun `語の数の上限を超えた行は、警告を1つだけ書いて捨てる`() {
+        val many = List(MAX_WORDS + 10) { "a" }.joinToString(" ")
+        val tab = inittab(
+            """
+            env $many
+            run /bin/initprobe $many
+            frob $many
+            run /bin/initprobe ok
+            """,
+        )
+        val lines = boot(mapOf("/bin/initprobe" to probe, tab)) { l -> l.any { it.startsWith("kibi: init exited") } }
+        val warnings = lines.filter { it.startsWith("init: /etc/inittab:") }
+        assertEquals(
+            listOf(
+                "init: /etc/inittab:1: too many words",
+                "init: /etc/inittab:2: too many words",
+                "init: /etc/inittab:3: unknown entry",
+            ),
+            warnings,
+            lines.toString(),
+        )
+        assertTrue("ok fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=2" in lines, lines.toString())
+    }
+
+    @Test
+    fun `すぐ終わるrespawnは、1秒おいてから起こし直す`() {
+        val timed = bootTimed(mapOf("/bin/initprobe" to probe, inittab("respawn /bin/initprobe quick"))) { l ->
+            l.count { it.startsWith("quick ") } >= 3
+        }
+        val times = timed.filter { it.first.startsWith("quick ") }.map { it.second }
+        // 子は書いてからすぐ終わるので、次の行までは少なくとも 1 秒（届くまでの揺れを少し見込む）
+        for (i in 1 until times.size) {
+            val gapMs = (times[i] - times[i - 1]) / 1_000_000
+            assertTrue(gapMs >= 900, "起こし直しが早すぎる: ${gapMs}ms ${timed.map { it.first }}")
+        }
+    }
+
+    private companion object {
+        /** init の inittab の大きさの上限（`os/sbin/init.zig` の MAX_CONF） */
+        const val MAX_CONF = 8192
+
+        /** init の全部の項目の語の数の上限（`os/sbin/init.zig` の MAX_WORDS） */
+        const val MAX_WORDS = 512
     }
 }

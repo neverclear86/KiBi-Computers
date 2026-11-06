@@ -1,5 +1,5 @@
 //! `head [-n 行数 | -行数] [ファイル...]`: 先頭の行（既定 10 行）を書く。
-//! ファイルが 2 つ以上なら、それぞれの前に `==> 名前 <==` を書く
+//! ファイルが 2 つ以上なら、それぞれの前に `==> 名前 <==` を書く（開けなかったファイルには書かない）
 const kibi = @import("kibi");
 const cli = kibi.cli;
 const io = kibi.io;
@@ -32,24 +32,28 @@ pub fn main() u8 {
     const files = opts.rest();
     const names: []const []const u8 = if (files.len == 0) &.{"-"} else files;
     var status: u8 = 0;
-    for (names, 0..) |f, i| {
+    var shown: usize = 0;
+    for (names) |f| {
+        // 開いてから見出しを書く（開けなければ見出しなしでエラーだけ）
+        const fd = cli.openInput(f) catch |e| {
+            cli.warnErr(f, e);
+            status = 1;
+            continue;
+        };
+        defer cli.closeInput(fd);
         if (names.len > 1) {
-            if (i > 0) io.out("\n");
+            if (shown > 0) io.out("\n");
             io.out("==> ");
             io.out(if (cli.eql(f, "-")) "standard input" else f);
             io.out(" <==\n");
         }
-        if (!head(f, lines)) status = 1;
+        shown += 1;
+        if (!head(fd, f, lines)) status = 1;
     }
     return status;
 }
 
-fn head(path: []const u8, lines: u64) bool {
-    const fd = cli.openInput(path) catch |e| {
-        cli.warnErr(path, e);
-        return false;
-    };
-    defer cli.closeInput(fd);
+fn head(fd: io.Fd, path: []const u8, lines: u64) bool {
     var left = lines;
     while (left > 0) {
         const n = io.read(fd, &buf) catch |e| {

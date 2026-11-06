@@ -205,8 +205,13 @@ pub fn rename(from: []const u8, to: []const u8) Error!void {
 /// ディレクトリの項目
 pub const Entry = struct { name: []const u8, kind: Kind, ino: u64 };
 
-/// ディレクトリの中身を順に読む（`.`・`..` は飛ばす）。[buf] は読み込みに使う領域（1 項目の名前より大きくする）
+/// ディレクトリの中身を順に読む（`.`・`..` は飛ばす）。[buf] は読み込みに使う領域で、
+/// 少なくとも `MIN_BUF`（項目の頭 24 バイト）に、いちばん長い名前を足した大きさにする。
+/// 頭より小さければ `next` は INVAL、名前が入りきらなければ NAMETOOLONG を返す
 pub const Dir = struct {
+    /// buf の最小の大きさ（WASI の dirent の頭）。名前の分はこれに足す
+    pub const MIN_BUF = @sizeOf(wasi.Dirent);
+
     fd: Fd,
     buf: []u8,
     cookie: u64 = 0,
@@ -222,6 +227,8 @@ pub const Dir = struct {
 
     /// 次の項目。もうなければ null
     pub fn next(self: *Dir) Error!?Entry {
+        // 頭が入らない buf では、いつまでも次へ進めない
+        if (self.buf.len < MIN_BUF) return error.INVAL;
         while (true) {
             if (self.pos + @sizeOf(wasi.Dirent) <= self.used) {
                 const d: *align(1) const wasi.Dirent = @ptrCast(self.buf[self.pos..].ptr);

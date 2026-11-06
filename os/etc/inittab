@@ -3,7 +3,10 @@
 # One entry per line. Words are separated by spaces or tabs (no quoting).
 # Lines starting with '#' and empty lines are ignored.
 #
-#   env NAME=VALUE        add or replace an environment variable for the programs below
+#   env NAME=VALUE        add or replace an environment variable for every program.
+#                         init reads the whole file before starting anything, so an
+#                         env line applies to entries above it too (a later env line
+#                         for the same NAME wins).
 #   run PATH [ARGS...]    run at boot, one by one, waiting for each to finish
 #   daemon PATH [ARGS...] start in the background once (no standard input)
 #   respawn PATH [ARGS...] start in the background and restart it when it ends

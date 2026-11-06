@@ -180,17 +180,13 @@ const Pos = struct {
 };
 
 /// プロンプトを書いたときの位置の動き。エスケープシーケンスは幅 0 と見る
+/// （CSI `ESC [ ... 終端`、OSC `ESC ] ... BEL か ST`、DCS などの文字列 `ESC P|X|^|_ ... ST`、ほかの `ESC 中間 終端`）
 fn measurePrompt(p: *Pos, s: []const u8) void {
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
         if (c == 0x1b) {
-            i += 1;
-            if (i < s.len and s[i] == '[') {
-                i += 1;
-                while (i < s.len and !(s[i] >= 0x40 and s[i] <= 0x7e)) i += 1;
-            }
-            i += 1;
+            i = skipEscape(s, i);
             continue;
         }
         if (c == '\n') {
@@ -218,6 +214,37 @@ fn measurePrompt(p: *Pos, s: []const u8) void {
         const cp = decode(s[i..], &n);
         p.advance(charWidth(cp));
         i += n;
+    }
+}
+
+/// [s] の [start] にある ESC から始まるエスケープシーケンスの、次の位置
+fn skipEscape(s: []const u8, start: usize) usize {
+    var i = start + 1;
+    if (i >= s.len) return i;
+    const kind = s[i];
+    i += 1;
+    switch (kind) {
+        // CSI: 引数・中間のバイトの後、0x40〜0x7e で終わる
+        '[' => {
+            while (i < s.len and !(s[i] >= 0x40 and s[i] <= 0x7e)) i += 1;
+            return @min(i + 1, s.len);
+        },
+        // OSC（BEL か ST で終わる）と、DCS・SOS・PM・APC（ST で終わる）
+        ']', 'P', 'X', '^', '_' => {
+            while (i < s.len) : (i += 1) {
+                if (s[i] == 0x07 and kind == ']') return i + 1;
+                if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '\\') return i + 2;
+            }
+            return s.len;
+        },
+        else => {
+            // `ESC 中間(0x20〜0x2f)... 終端(0x30〜0x7e)`（`ESC ( B` など）。中間がなければ 2 バイトで終わり
+            if (kind >= 0x20 and kind <= 0x2f) {
+                while (i < s.len and s[i] >= 0x20 and s[i] <= 0x2f) i += 1;
+                return @min(i + 1, s.len);
+            }
+            return i;
+        },
     }
 }
 
@@ -497,6 +524,8 @@ fn isCommandPosition(start: usize) bool {
         // 予約語は、それ自体がコマンドの位置にあるときだけ
         return isCommandPosition(j);
     };
+    // 代入（`FOO=bar cmd`）の後は、代入がコマンドの位置にあればコマンドの位置
+    if (isAssignmentWord(prev)) return isCommandPosition(j);
     return false;
 }
 
@@ -522,8 +551,11 @@ fn insertQuoted(s: []const u8, q: Quote) bool {
 }
 
 fn completeWord() void {
-    const w = currentWord();
-    const command = w.quote == .none and isCommandPosition(w.start) and !hasAssignment(w);
+    var w = currentWord();
+    // `NAME=値`・`if=値` は、`=` の後ろだけを補う（値はパスか変数）
+    const value = assignmentValue(w.text);
+    if (value) |v| w.text = v;
+    const command = value == null and w.quote == .none and isCommandPosition(w.start);
     complete.collect(w.text, command);
     if (complete.count == 0) {
         bell();
@@ -566,9 +598,22 @@ fn completeWord() void {
     listCandidates();
 }
 
-/// `NAME=値` の値を書いているところ（値はパスとして補う）
-fn hasAssignment(w: Word) bool {
-    return util.indexOf(w.text, '=') != null;
+/// 語 [text] が `前=値` の形（`前` が空でなく `/` を含まない）なら、`=` の後ろ。そうでなければ null
+fn assignmentValue(text: []const u8) ?[]const u8 {
+    const eq = util.indexOf(text, '=') orelse return null;
+    if (eq == 0 or util.indexOf(text[0..eq], '/') != null) return null;
+    return text[eq + 1 ..];
+}
+
+/// [s] がシェルの代入 `NAME=...`（NAME は英字か `_` で始まり、英数字と `_`）か
+fn isAssignmentWord(s: []const u8) bool {
+    const eq = util.indexOf(s, '=') orelse return false;
+    if (eq == 0) return false;
+    for (s[0..eq], 0..) |c, k| {
+        const alpha = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+        if (!alpha and !(k > 0 and c >= '0' and c <= '9')) return false;
+    }
+    return true;
 }
 
 /// 候補を段に並べて書き、行を出し直す
@@ -590,7 +635,9 @@ fn listCandidates() void {
             const idx = c * rows + r;
             if (idx >= complete.count) break;
             const it = complete.items[idx];
-            put(it.name);
+            // 制御文字は入力行と同じく `^X` で見せる（nameWidth の桁と合わせる）
+            var shown: Pos = .{};
+            emitLine(it.name, &shown);
             if (it.dir) putByte('/');
             const last = (c + 1) * rows + r >= complete.count;
             if (!last) {

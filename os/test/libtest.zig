@@ -1,4 +1,4 @@
-//! 共通ライブラリ `kibi`（#98）を、カーネルの上で確かめるプログラム（core のテスト `OsLibraryTest` が動かす）。
+//! 共通ライブラリ `kibi`（#98）を、カーネルの上で確かめるプログラム（core のテスト `StandardOsTest` が動かす）。
 //!
 //! `libtest <場面> [引数...]` の場面ごとに、結果を標準出力に書く。期待と違えば `FAIL: ...` を書いて 1 で終わる。
 const kibi = @import("kibi");
@@ -90,7 +90,7 @@ pub fn main() u8 {
     } else if (eql(case, "pipe")) {
         casePipe();
     } else if (eql(case, "spawn")) {
-        caseSpawn(argv[0]);
+        caseSpawn();
     } else if (eql(case, "pid")) {
         say("self ");
         num(process.selfPid());
@@ -105,6 +105,13 @@ pub fn main() u8 {
         expect("commit", kibi.memory.commit(&scratch, 0));
         expect("remaining after commit", kibi.memory.remaining() <= before);
         line("memory ok");
+    } else if (eql(case, "block")) {
+        // 標準入力が閉じるまで読み続ける（kill の場面で、先に終わらない子にする）
+        var b: [64]u8 = undefined;
+        while (true) {
+            const n = io.read(io.STDIN, &b) catch break;
+            if (n == 0) break;
+        }
     } else if (eql(case, "time")) {
         const t0 = kibi.time.monotonic() catch |e| return failWith("monotonic", e);
         kibi.time.sleep(2_000_000) catch |e| return failWith("sleep", e);
@@ -226,8 +233,12 @@ fn caseFile(dir: []const u8) void {
         if (eql(entry.name, "b.txt")) seen_b = entry.kind == .file;
         if (eql(entry.name, "c.txt")) seen_c = entry.kind == .file;
     }
-    io.close(dfd) catch {};
     expect("readdir entries", count == 2 and seen_b and seen_c);
+    // 項目の頭より小さい領域はエラーになる（読み直しを繰り返さない）
+    var tiny: [8]u8 = undefined;
+    var small = fs.Dir.init(dfd, &tiny);
+    if (small.next()) |_| fail("readdir with a tiny buffer", null) else |e| expect("tiny buffer INVAL", e == error.INVAL);
+    io.close(dfd) catch {};
 
     if (fs.rmdir("sub")) |_| fail("rmdir non-empty", null) else |e| expect("NOTEMPTY", e == error.NOTEMPTY);
     fs.unlink("sub/b.txt") catch |e| return fail("unlink b", e);
@@ -261,7 +272,7 @@ fn casePipe() void {
     line("pipe ok");
 }
 
-fn caseSpawn(self_path: []const u8) void {
+fn caseSpawn() void {
     // 終了コード
     const c = process.spawn("/bin/libtest", &.{ "libtest", "exit", "7" }, .{}) catch |e| return fail("spawn", e);
     expect("child pid", c.pid() != process.selfPid());
@@ -295,16 +306,21 @@ fn caseSpawn(self_path: []const u8) void {
     say(buf[0..n]);
     _ = d.wait() catch |e| return fail("wait env", e);
     d.release();
-    // 止める
-    const s = process.spawn("/bin/libtest", &.{ "libtest", "time" }, .{}) catch |e| return fail("spawn sleeper", e);
+    // 止める。子は標準入力（書き手をこちらが持つパイプ）を待ち続けるので、kill より先には終わらない
+    const hold = io.pipe() catch |e| return fail("pipe hold", e);
+    const s = process.spawn("/bin/libtest", &.{ "libtest", "block" }, .{
+        .fds = &.{process.FdAssign.inherit(0, hold.read)},
+    }) catch |e| return fail("spawn blocker", e);
+    io.close(hold.read) catch {};
     s.kill(.terminate) catch |e| return fail("kill", e);
     const ks = s.wait() catch |e| return fail("wait killed", e);
+    io.close(hold.write) catch {};
     switch (ks) {
         .killed => |sig| {
             say("killed ");
             line(if (sig) |x| @tagName(x) else "(machine)");
         },
-        .exited => line("killed (exited first)"),
+        .exited => fail("exited before kill", null),
         .crashed => fail("crashed", null),
     }
     s.release();
@@ -313,7 +329,6 @@ fn caseSpawn(self_path: []const u8) void {
         say("spawn missing ");
         line(kibi.errno.name(e));
     }
-    _ = self_path;
     line("spawn ok");
 }
 
