@@ -45,6 +45,7 @@ import pro.ikili.kibicomputers.core.kernel.time.TimerLimits
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.time.saturatingSub
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.tty.TtyLimits
 import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -957,10 +958,19 @@ public class Machine private constructor(
         length - r.dropped
     }
 
-    /** コンソールの画面の大きさを変える（画面のデバイスから。#65・#66）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException] */
+    /**
+     * コンソールの画面の大きさを変える（画面のデバイスから。#65・#66）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException]。
+     * 大きさが実際に変わったときだけ、同じロックの中で `tty-resize` のイベント（値は列・行・世代。ADR 0427）を入れる
+     */
     internal fun resizeConsole(columns: Int, rows: Int) {
         val size = TtySize(columns, rows)
-        lock.withLockValue { consoleTtyLocked().resize(size) }
+        lock.withLockValue {
+            val tty = consoleTtyLocked()
+            if (tty.resize(size)) {
+                val values = listOf(EventValue.I64(columns.toLong()), EventValue.I64(rows.toLong()), EventValue.I64(tty.sizeGeneration))
+                kernel.events.post(KernelEvent(TtyLimits.RESIZE_EVENT_TYPE, TtyLimits.CONSOLE_SOURCE, values), kernel.objects, wakeSink)
+            }
+        }
     }
 
     /** コンソールの画面の大きさ */

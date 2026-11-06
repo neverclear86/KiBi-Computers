@@ -4,14 +4,17 @@ package kibi:io@0.1.0;
 world imports {
     import fd;
     import pipe;
+    import tty;
 }
 
-/// p2 のゲスト向け（仮置き。ADR 0075）
+/// p2 のゲスト向け（仮置き。ADR 0075・0427）
 world imports-p2 {
     import pipe-streams;
+    import tty;
 }
 
-/// p3 のゲスト向け（仮置き。ADR 0075）
+/// p3 のゲスト向け（仮置き。ADR 0075・0427）
 world imports-p3 {
     import pipe-async;
+    import tty;
 }

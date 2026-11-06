@@ -9,6 +9,8 @@ import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
+import pro.ikili.kibicomputers.core.kernel.tty.TtySize
+import pro.ikili.kibicomputers.core.kernel.tty.TtySizeInfo
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.FakeMemory
@@ -313,5 +315,65 @@ class P1CanonicalTest {
         assertEquals(WasmTrapKind.OTHER, kind { P1Canonical.lowerPipeResult(m, 0x102, PipeFds(0, 1), 0) })
         // 書き先の誤りでは何も書かない
         assertEquals(0, m.readU8(0x102))
+    }
+
+    // ---- kibi:io/tty（#427） ----
+
+    @Test
+    fun `flagsは宣言した下位ビットだけを読み、上のビットは捨てる`() {
+        assertEquals(0, P1Canonical.liftFlags(0, 5))
+        assertEquals(0x1f, P1Canonical.liftFlags(-1, 5))
+        assertEquals(0, P1Canonical.liftFlags(0xffff_ffe0.toInt(), 5))
+        assertEquals(0x15, P1Canonical.liftFlags(0x35, 5))
+        assertEquals(1, P1Canonical.liftFlags(3, 1))
+        assertEquals(-1, P1Canonical.liftFlags(-1, 32))
+        assertThrows<IllegalArgumentException> { P1Canonical.liftFlags(0, 0) }
+        assertThrows<IllegalArgumentException> { P1Canonical.liftFlags(0, 33) }
+    }
+
+    @Test
+    fun `result_modeはタグを0に、okもerrもオフセット1に書く`() {
+        assertEquals(2, P1Canonical.U8_RESULT_SIZE)
+        assertEquals(1, P1Canonical.U8_RESULT_ALIGN)
+        val m = FakeMemory(1)
+        m.write(0x101, byteArrayOf(0x55, 0x55, 0x55))
+        P1Canonical.lowerU8Result(m, 0x101, 0x1d, 0)
+        assertArrayEquals(byteArrayOf(0, 0x1d, 0x55), m.read(0x101, 3))
+        P1Canonical.lowerU8Result(m, 0x101, null, 58)
+        assertArrayEquals(byteArrayOf(1, 58, 0x55), m.read(0x101, 3))
+    }
+
+    @Test
+    fun `result_sizeは列を8、行を12、世代を16に書き、errなら判別子を8に書き、使わない所を0にする`() {
+        assertEquals(24, P1Canonical.TTY_SIZE_RESULT_SIZE)
+        assertEquals(8, P1Canonical.TTY_SIZE_RESULT_ALIGN)
+        val m = FakeMemory(1)
+        m.write(0x100, ByteArray(32) { 0x55 })
+        P1Canonical.lowerTtySizeResult(m, 0x100, TtySizeInfo(TtySize(80, 25), 0x1_0000_0003L), 0)
+        assertEquals(0, m.readU8(0x100))
+        assertArrayEquals(ByteArray(7), m.read(0x101, 7))
+        assertEquals(80, m.readI32(0x108))
+        assertEquals(25, m.readI32(0x10c))
+        assertEquals(0x1_0000_0003L, m.readI64(0x110))
+        assertEquals(0x55, m.readU8(0x118))
+        m.write(0x100, ByteArray(24) { 0x55 })
+        P1Canonical.lowerTtySizeResult(m, 0x100, null, 7)
+        assertEquals(1, m.readU8(0x100))
+        assertEquals(7, m.readU8(0x108))
+        assertArrayEquals(ByteArray(7), m.read(0x101, 7))
+        assertArrayEquals(ByteArray(15), m.read(0x109, 15))
+    }
+
+    @Test
+    fun `kibi_io_ttyの結果の書き先が線形メモリの外か揃っていなければトラップし、何も書かない`() {
+        val m = FakeMemory(1)
+        val end = WasmMemory.PAGE_SIZE
+        fun kind(block: () -> Unit) = assertThrows<WasmTrapException> { block() }.kind
+        val info = TtySizeInfo(TtySize(1, 1), 0)
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerU8Result(m, end - 1, 1, 0) })
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerTtySizeResult(m, end - 16, info, 0) })
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerTtySizeResult(m, -8, null, 7) })
+        assertEquals(WasmTrapKind.OTHER, kind { P1Canonical.lowerTtySizeResult(m, 0x104, info, 0) })
+        assertArrayEquals(ByteArray(24), m.read(0x104, 24))
     }
 }

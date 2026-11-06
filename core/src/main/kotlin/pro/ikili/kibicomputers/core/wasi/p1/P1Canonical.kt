@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
+import pro.ikili.kibicomputers.core.kernel.tty.TtySizeInfo
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
@@ -24,6 +25,8 @@ import java.nio.charset.CodingErrorAction
  * - `result<_, error-code>`: `{ tag: u8 @0, err: u8 @1 }`（2 / 1）
  * - `result<u64, error-code>`: `{ tag: u8 @0, ok: u64 @8 | err: u8 @8 }`（16 / 8。#426）
  * - `result<pipe-ends, error-code>`: `{ tag: u8 @0, ok: { read: u32 @4, write: u32 @8 } | err: u8 @4 }`（12 / 4）
+ * - `result<mode, error-code>`（8 個までのフラグ）: `{ tag: u8 @0, ok: u8 @1 | err: u8 @1 }`（2 / 1。#427）
+ * - `result<size, error-code>`: `{ tag: u8 @0, ok: { columns: u32 @8, rows: u32 @12, generation: u64 @16 } | err: u8 @8 }`（24 / 8。#427）
  * - `result<event-batch, error-code>`: `{ tag: u8 @0, ok: { events.ptr @8, events.len @12, dropped: u64 @16 } | err: u8 @8 }`（24 / 8）
  * - `event`: `{ kind @0, source @8, values @16 }`（24 / 4）
  * - `event-value`: `{ tag: u8 @0, payload @8 }`（s64・f64 は 8 バイト、bool は u8、text・bytes は (ptr, len)。16 / 8）
@@ -52,6 +55,14 @@ internal object P1Canonical {
     /** `result<pipe-ends, error-code>`（`kibi:io/pipe.create`）の大きさ・align */
     const val PIPE_RESULT_SIZE: Int = 12
     const val PIPE_RESULT_ALIGN: Int = 4
+
+    /** `result<flags, error-code>`（フラグが 8 個まで。`kibi:io/tty.get-mode`）の大きさ・align */
+    const val U8_RESULT_SIZE: Int = 2
+    const val U8_RESULT_ALIGN: Int = 1
+
+    /** `result<size, error-code>`（`kibi:io/tty.get-size`）の大きさ・align */
+    const val TTY_SIZE_RESULT_SIZE: Int = 24
+    const val TTY_SIZE_RESULT_ALIGN: Int = 8
 
     /** `result<event-batch, error-code>` の大きさ・align */
     const val BATCH_RESULT_SIZE: Int = 24
@@ -110,6 +121,15 @@ internal object P1Canonical {
         else -> null
     }
 
+    /**
+     * `flags`（[count] 個。32 個まで）の引数（平らにした i32）。宣言した下位 [count] ビットだけを読み、上のビットは捨てる
+     * （Canonical ABI の lift と同じ。エラーにしない）
+     */
+    fun liftFlags(value: Int, count: Int): Int {
+        require(count in 1..32) { "flags は 1..32 個（$count）" }
+        return if (count == 32) value else value and ((1 shl count) - 1)
+    }
+
     /** `u64` の引数（core の i64 のビット列）を 0..`Long.MAX_VALUE` にする。2^63 以上（`Long` で負）は `Long.MAX_VALUE` に頭打ち */
     fun u64Arg(v: Long): Long = if (v < 0) Long.MAX_VALUE else v
 
@@ -119,6 +139,30 @@ internal object P1Canonical {
         memory.write(retPtr, ByteArray(U64_RESULT_SIZE))
         if (value != null) {
             memory.writeI64(retPtr + 8, value)
+        } else {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 8, error)
+        }
+    }
+
+    /**
+     * 1 バイトの ok を持つ `result<T, error-code>`（`T` は 8 個までの `flags` など）を [retPtr] に書く。
+     * [value] が `null` なら err（[error] は判別子）。ok も err もオフセット 1
+     */
+    fun lowerU8Result(memory: WasmMemory, retPtr: Int, value: Int?, error: Int) {
+        checkStore(memory, retPtr, U8_RESULT_SIZE, U8_RESULT_ALIGN)
+        memory.writeU8(retPtr, if (value == null) 1 else 0)
+        memory.writeU8(retPtr + 1, value ?: error)
+    }
+
+    /** `result<size, error-code>`（`kibi:io/tty.get-size`）を [retPtr] に書く。[info] が `null` なら err（[error] は判別子）。使わない所は 0 にする */
+    fun lowerTtySizeResult(memory: WasmMemory, retPtr: Int, info: TtySizeInfo?, error: Int) {
+        checkStore(memory, retPtr, TTY_SIZE_RESULT_SIZE, TTY_SIZE_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(TTY_SIZE_RESULT_SIZE))
+        if (info != null) {
+            memory.writeI32(retPtr + 8, info.size.columns)
+            memory.writeI32(retPtr + 12, info.size.rows)
+            memory.writeI64(retPtr + 16, info.generation)
         } else {
             memory.writeU8(retPtr, 1)
             memory.writeU8(retPtr + 8, error)
