@@ -25,6 +25,8 @@ const Node = parse.Node;
 
 /// パイプの大きさ（カーネルの既定。ADR 0059）。シェルの中で動かすもののヒアドキュメントは、これより大きくできない
 const PIPE_CAPACITY = 4096;
+/// 子を待つ間に書くもの（ヒアドキュメント・シェルの中で動かした段の出力）の数の上限。超えたら、その場で全部書く
+const MAX_PENDING = 64;
 /// 関数の呼び出しの深さの上限
 const MAX_FUNC_DEPTH = 100;
 /// 子として起こせる段の数の上限（パイプライン）
@@ -149,9 +151,13 @@ pub fn run(node: *Node) Error!void {
         .subshell => {
             const m = mem.mark();
             defer mem.release(m);
-            const child = (try startNode(node, .{})) orelse return;
+            const pm = pendingMark();
+            const child = (try startNode(node, .{})) orelse {
+                finishPending(pm);
+                return;
+            };
             var list = [_]?process.Child{child};
-            state.status = waitChildren(&list);
+            state.status = waitChildren(&list, pm);
             checkErrexit();
         },
         else => try runCompound(node),
@@ -328,11 +334,12 @@ fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_func
         return;
     }
     const env = try tempEnv(assigns);
+    const pm = pendingMark();
     var list = [_]?process.Child{spawnProgram(argv, env, &map)};
     map.afterSpawn(list[0] != null);
     map.cleanup();
     if (list[0] == null) return;
-    state.status = waitChildren(&list);
+    state.status = waitChildren(&list, pm);
 }
 
 /// `NAME=v cmd` の代入を、子の環境変数にする
@@ -594,11 +601,13 @@ const FdMap = struct {
         return buf[0..k];
     }
 
-    /// 起こした後: ヒアドキュメントを書く
+    /// 起こした後: ヒアドキュメントを、子を待つ間に書くものとして積む（[waitChildren] が少しずつ書く）。
+    /// 起こせなかったら、書く端を閉じるだけ
     fn afterSpawn(self: *FdMap, spawned: bool) void {
         for (self.hd_fd[0..self.nhd], self.hd_body[0..self.nhd]) |fd, body| {
-            if (spawned) io.writeAll(fd, body) catch {};
-            io.close(fd) catch {};
+            if (spawned) {
+                queueWrite(fd, body);
+            } else io.close(fd) catch {};
         }
         self.nhd = 0;
     }
@@ -731,6 +740,8 @@ fn spawnScript(path: []const u8, argv: []const []const u8, env: []const process.
 const Base = struct {
     stdin: Src = .inherit,
     stdout: Src = .inherit,
+    /// 外のプログラムも `( )` も、node ごとサブシェルに渡す（ヒアドキュメントを子のシェルに書かせる。後ろで動かすもの）
+    whole: bool = false,
 };
 
 /// [node] を子として起こす。単純なコマンドで外のプログラムならそのまま、ほかはサブシェルで
@@ -742,7 +753,7 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
         var argv = mem.List([]const u8).init(&mem.ast);
         // 語がない・組み込み・関数はサブシェルで（語の展開は子でもう一度行う）
         const first = s.words;
-        if (first != null and isPlainWord(first.?.text)) {
+        if (!base.whole and first != null and isPlainWord(first.?.text)) {
             const name = first.?.text;
             if (builtins.kindOf(name) == .none and vars.findFunc(name) == null) {
                 try expand.fields(s.words, &argv);
@@ -765,7 +776,7 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
     var map = FdMap{ .src = baseSrc(base) };
     defer map.cleanup();
     var target = node;
-    if (node.kind == .subshell) {
+    if (node.kind == .subshell and !base.whole) {
         // `( ... )` は中身を子に渡し、リダイレクトはここで行う（括弧ごと渡すと、子がまたサブシェルを起こす）
         if (!(try map.addRedirs(node.redirs))) {
             state.status = 1;
@@ -910,13 +921,106 @@ pub fn quoteInto(o: *mem.List(u8), s: []const u8) Error!void {
 
 // ---- 待つ ----
 
+/// 子を待つ間に書くもの。中身は残る領域（heap）に持つ
+const Pending = struct { fd: io.Fd, data: []u8, off: usize = 0, open: bool = true };
+var pending: [MAX_PENDING]Pending = undefined;
+var npending: usize = 0;
+
+/// 書くものを積んだ位置（子を起こす前に覚え、[waitChildren] に渡す）
+pub fn pendingMark() usize {
+    return npending;
+}
+
+/// [fd] に [body] を、子を待つ間に書くものとして積む（写して持つ）。積めなければ、その場で全部書いて閉じる
+fn queueWrite(fd: io.Fd, body: []const u8) void {
+    if (body.len == 0) {
+        io.close(fd) catch {};
+        return;
+    }
+    if (npending < MAX_PENDING) {
+        if (mem.heapDupe(body)) |copy| {
+            pending[npending] = .{ .fd = fd, .data = copy };
+            npending += 1;
+            return;
+        } else |_| {}
+    }
+    io.writeAll(fd, body) catch {};
+    io.close(fd) catch {};
+}
+
+/// [queueWrite] と同じだが、[data]（heapAlloc で取ったもの）をそのまま持つ
+fn queueOwned(fd: io.Fd, data: []u8) void {
+    if (data.len > 0 and npending < MAX_PENDING) {
+        pending[npending] = .{ .fd = fd, .data = data };
+        npending += 1;
+        return;
+    }
+    io.writeAll(fd, data) catch {};
+    io.close(fd) catch {};
+    mem.heapFree(data);
+}
+
+fn closePending(p: *Pending) void {
+    if (!p.open) return;
+    io.close(p.fd) catch {};
+    mem.heapFree(p.data);
+    p.open = false;
+}
+
+/// [from] から後に積んだものを片付ける（書き終わっていなければ、そこで閉じる）
+fn finishPending(from: usize) void {
+    if (from >= npending) return;
+    for (pending[from..npending]) |*p| closePending(p);
+    npending = from;
+}
+
+/// [from] から後に積んだものを、その場で全部書いて閉じる（待つ子がいないとき）
+fn flushPending(from: usize) void {
+    if (from >= npending) return;
+    for (pending[from..npending]) |*p| {
+        if (p.open) io.writeAll(p.fd, p.data[p.off..]) catch {};
+        closePending(p);
+    }
+    npending = from;
+}
+
+/// 書ける分だけ書く（パイプは空きの分だけなので止まらない）。相手が閉じた・書き終えたら閉じる
+fn pumpWrite(p: *Pending, ev: wasi.Event) void {
+    if (!p.open) return;
+    if (ev.@"error" != 0 or ev.flags & wasi.EVENT_FD_READWRITE_HANGUP != 0) return closePending(p);
+    const rest = p.data[p.off..];
+    // ファイルは nbytes が 0 でも止まらずに書ける
+    const room: usize = if (ev.nbytes > 0) @intCast(@min(ev.nbytes, rest.len)) else @min(rest.len, PIPE_CAPACITY);
+    const n = io.write(p.fd, rest[0..room]) catch return closePending(p);
+    p.off += n;
+    if (n == 0 or p.off == p.data.len) closePending(p);
+}
+
+/// 子を待つ間に読む、コマンド置換の出力
+const Sink = struct { fd: io.Fd, buf: *Buffer, done: bool = false };
+
+const SINK_TAG: u64 = 1 << 32;
+const PENDING_TAG: u64 = 2 << 32;
+const MAX_SUBS = MAX_STAGES + MAX_PENDING + 1;
+
 /// 子がすべて終わるまで待ち、最後の子の終了コードを返す（ハンドルを閉じる）。
-/// 標準入力が TTY で、このシェルが前景なら、最後の子を前景にする。どれかが Ctrl+C で止まったら残りも止める
-pub fn waitChildren(children: []?process.Child) u8 {
+/// 待つ間に、積んであるヒアドキュメントなどを少しずつ書き、[from] から後に積んだものは最後に片付ける。
+/// 標準入力が TTY で、このシェルが前景なら、子として起こした最後の段を前景にする。どれかが Ctrl+C で止まったら残りも止める
+pub fn waitChildren(children: []?process.Child, from: usize) u8 {
+    return waitIo(children, from, null) catch 2;
+}
+
+/// [waitChildren] に加えて、[sink] を書く側が閉じるまで読む。読んだものを置けなければ、子を止めて `OutOfMemory`
+fn waitIo(children: []?process.Child, from: usize, sink: ?*Sink) Error!u8 {
     var last_status: u8 = state.status;
     const last_idx = children.len - 1;
     var fg_given = false;
-    if (children[last_idx]) |c| {
+    // 最後の段がシェルの中で動いたときも、Ctrl+C が届くよう、子のうち最後のものを前景にする
+    var fg_child: ?process.Child = null;
+    for (children) |maybe| {
+        if (maybe) |c| fg_child = c;
+    }
+    if (fg_child) |c| {
         if (tty.isTty(io.STDIN)) {
             const fg = tty.getForeground(io.STDIN) catch 0;
             // 会話的なシェルは、前景がなければ自分のものとして渡す
@@ -927,10 +1031,12 @@ pub fn waitChildren(children: []?process.Child) u8 {
         }
     }
     var interrupted = false;
+    var failure: ?Error = null;
     var done: [MAX_STAGES]bool = @splat(false);
-    var subs: [MAX_STAGES]wasi.Subscription = undefined;
-    var events: [MAX_STAGES]wasi.Event = undefined;
-    while (true) {
+    var subs: [MAX_SUBS]wasi.Subscription = undefined;
+    var events: [MAX_SUBS]wasi.Event = undefined;
+    var chunk: [1024]u8 = undefined;
+    while (failure == null) {
         var n: usize = 0;
         for (children, 0..) |maybe, i| {
             const c = maybe orelse continue;
@@ -953,17 +1059,49 @@ pub fn waitChildren(children: []?process.Child) u8 {
             subs[n] = .{ .userdata = i, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = c.handle } } };
             n += 1;
         }
+        if (sink) |s| {
+            if (!s.done) {
+                subs[n] = .{ .userdata = SINK_TAG, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = s.fd } } };
+                n += 1;
+            }
+        }
+        // 書くものだけが残ったら終わる（読む側は子なので、子が終われば書けない）
         if (n == 0) break;
         if (interrupted) {
             for (children, 0..) |maybe, i| {
                 if (!done[i]) if (maybe) |c| c.kill(.interrupt) catch {};
             }
         }
+        for (pending[0..npending], 0..) |p, k| {
+            if (!p.open) continue;
+            subs[n] = .{ .userdata = PENDING_TAG + k, .tag = wasi.EVENTTYPE_FD_WRITE, .u = .{ .fd = .{ .fd = p.fd } } };
+            n += 1;
+        }
         var got: wasi.Size = 0;
         kibi.errno.check(wasi.poll_oneoff(&subs, &events, @intCast(n), &got)) catch break;
+        for (events[0..got]) |ev| {
+            if (ev.userdata >= PENDING_TAG) {
+                pumpWrite(&pending[@intCast(ev.userdata - PENDING_TAG)], ev);
+            } else if (ev.userdata == SINK_TAG) {
+                const s = sink.?;
+                const r = io.read(s.fd, &chunk) catch 0;
+                if (r == 0) {
+                    s.done = true;
+                } else s.buf.append(chunk[0..r]) catch |e| {
+                    failure = e;
+                };
+            }
+        }
+    }
+    if (failure != null) {
+        for (children, 0..) |maybe, i| {
+            if (!done[i]) if (maybe) |c| c.kill(.terminate) catch {};
+        }
     }
     for (children) |maybe| if (maybe) |c| c.release();
+    finishPending(from);
     if (fg_given) tty.setForeground(io.STDIN, process.selfPid()) catch {};
+    if (failure) |e| return e;
     if (interrupted and fg_given and !state.interactive) {
         // Ctrl+C はシェルのスクリプトごと止める
         process.killPid(process.selfPid(), .interrupt) catch {};
@@ -989,8 +1127,9 @@ fn runPipeline(first: *Node, count: usize) Error!void {
         state.status = 2;
         return;
     }
+    const pm = pendingMark();
     var children: [MAX_STAGES]?process.Child = @splat(null);
-    // シェルの中で動かす段（後で、書く端を標準出力にして動かす）
+    // シェルの中で動かす段（後で動かす。途中の段の出力は集めて、子を待つ間に書く）
     var deferred: [MAX_STAGES]?*Node = @splat(null);
     var deferred_out: [MAX_STAGES]?io.Fd = @splat(null);
     var prev_read: ?io.Fd = null;
@@ -1024,7 +1163,7 @@ fn runPipeline(first: *Node, count: usize) Error!void {
                     io.close(pp.read) catch {};
                 }
                 closeDeferred(&deferred_out);
-                _ = waitChildren(children[0..@max(i, 1)]);
+                _ = waitChildren(children[0..@max(i, 1)], pm);
                 return e;
             };
             if (prev_read) |r| io.close(r) catch {};
@@ -1036,24 +1175,36 @@ fn runPipeline(first: *Node, count: usize) Error!void {
     var last_pure_status: ?u8 = null;
     for (deferred[0..i], 0..) |d, k| {
         const dn = d orelse continue;
-        const target = deferred_out[k];
-        var saved: ?io.Fd = null;
-        if (target) |t| {
-            saved = saveFd(1);
-            io.dupTo(t, 1) catch {};
-            io.close(t) catch {};
+        if (deferred_out[k]) |t| {
+            // 途中の段: 出力を集めて、子を待つ間に少しずつ書く（パイプが埋まってもシェルが止まらない）
+            deferred_out[k] = null;
+            var buf = Buffer{};
+            const prev = capture_buf;
+            capture_buf = &buf;
+            runSimple(dn) catch {};
+            capture_buf = prev;
+            queueOwned(t, buf.take());
+        } else {
+            // 最後の段: シェルの標準出力にそのまま書く
+            runSimple(dn) catch {};
         }
-        runSimple(dn) catch {};
-        if (target != null) restoreFd(1, saved);
         if (k == count - 1) last_pure_status = state.status;
     }
     if (failed) {
-        _ = waitChildren(children[0..@max(i, 1)]);
+        _ = waitChildren(children[0..@max(i, 1)], pm);
         state.status = 2;
         return;
     }
-    const st = waitChildren(children[0..count]);
+    const st = waitChildren(children[0..count], pm);
     state.status = last_pure_status orelse st;
+}
+
+fn hasHeredoc(first: ?*parse.Redir) bool {
+    var r = first;
+    while (r) |x| : (r = x.next) {
+        if (x.op == .heredoc or x.op == .heredoc_strip) return true;
+    }
+    return false;
 }
 
 fn closeDeferred(fds: []?io.Fd) void {
@@ -1094,7 +1245,10 @@ fn runBackground(node: *Node) Error!void {
         state.status = 1;
         return;
     };
-    const child = (try startNode(node, .{ .stdin = .closed })) orelse return;
+    // ヒアドキュメントを待たずに書けるのは子を待つ間だけなので、ヒアドキュメントがあれば子のシェルに書かせる
+    const pm = pendingMark();
+    const child = (try startNode(node, .{ .stdin = .closed, .whole = hasHeredoc(node.redirs) })) orelse return;
+    flushPending(pm);
     var c = child;
     const hi = JOB_FD_BASE + @as(u32, @intCast(k));
     if (io.dupTo(c.handle, hi)) {
@@ -1227,11 +1381,13 @@ pub fn capture(cmd: []const u8) Error![]u8 {
         return buf.take();
     };
     const base = Base{ .stdout = .{ .fd = pipe.write } };
+    const pm = pendingMark();
     const child = blk: {
         if (count == 1 and only != null) {
             break :blk startNode(only.?, base) catch |e| {
                 io.close(pipe.write) catch {};
                 io.close(pipe.read) catch {};
+                finishPending(pm);
                 return e;
             };
         }
@@ -1239,24 +1395,16 @@ pub fn capture(cmd: []const u8) Error![]u8 {
         break :blk startSubshell(cmd, &map);
     };
     io.close(pipe.write) catch {};
-    var chunk: [1024]u8 = undefined;
-    while (true) {
-        const n = io.read(pipe.read, &chunk) catch break;
-        if (n == 0) break;
-        buf.append(chunk[0..n]) catch {
-            io.close(pipe.read) catch {};
-            if (child) |c| {
-                c.kill(.terminate) catch {};
-                c.release();
-            }
-            return error.OutOfMemory;
-        };
-    }
+    // 出力を読みながら、ヒアドキュメントを書く（`$(cat <<EOF ...)` で、互いに待ち合わないよう）
+    var sink = Sink{ .fd = pipe.read, .buf = &buf };
+    var list = [_]?process.Child{child};
+    const st = waitIo(&list, pm, &sink) catch |e| {
+        io.close(pipe.read) catch {};
+        mem.heapFree(buf.take());
+        return e;
+    };
     io.close(pipe.read) catch {};
-    if (child) |c| {
-        var list = [_]?process.Child{c};
-        state.status = waitChildren(&list);
-    }
+    if (child != null) state.status = st;
     subst_status = state.status;
     return buf.take();
 }

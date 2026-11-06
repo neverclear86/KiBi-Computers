@@ -18,7 +18,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * 標準 OS のシェル `/bin/sh`（#101）を、カーネルの上で動かして確かめる。
- * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`）を使う
+ * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`・`hang`）を使う
  */
 class ShellTest {
     private val limit = Duration.ofSeconds(180)
@@ -61,7 +61,7 @@ class ShellTest {
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         for (d in listOf("/bin", "/tmp", "/home", "/home/sub")) m.vfs.createDirectory(VfsPath.parse(d))
         for (name in listOf("sh", "echo", "true", "false")) m.put("/bin/$name", imageFile("/bin/$name"))
-        for (name in listOf("cat", "args", "envget", "exitwith", "errout")) m.put("/bin/$name", probe)
+        for (name in listOf("cat", "args", "envget", "exitwith", "errout", "hang")) m.put("/bin/$name", probe)
         for ((path, text) in files) m.put(path, text.toByteArray())
     }
 
@@ -392,6 +392,105 @@ class ShellTest {
                 m.stateOf(pid).isTerminal
             }
             assertTrue(host.text().contains("after 130\n"), host.text())
+        }
+    }
+
+    @Test
+    fun `パイプの大きさを超えるヒアドキュメントでも、待ち合わずに渡る`() {
+        // パイプ（4 KiB）2 つ分と cat の読み込み先を十分に超える。-c の引数には大きすぎるので、スクリプトのファイルにする
+        val body = (1..200).joinToString("\n") { i -> "line $i ".padEnd(99, 'x') }
+        val len = body.length
+        val script = "cat <<EOF | cat | cat >/tmp/o\n$body\nEOF\n" +
+            "x=${'$'}(cat /tmp/o); echo ${'$'}{#x}\n" +
+            "y=${'$'}(cat <<EOF\n$body\nEOF\n); echo ${'$'}{#y}\n" +
+            "cat <<EOF >/tmp/p &\n$body\nEOF\n" +
+            "wait; z=${'$'}(cat /tmp/p); echo ${'$'}{#z}\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals("$len\n$len\n$len\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `算術の割り算の代入`() {
+        assertOutput(
+            """
+            -9223372036854775808
+            0
+            0 1 unset
+            """,
+            """
+            x=-9223372036854775808; : ${'$'}((x/=-1)); echo ${'$'}x
+            x=-9223372036854775808; : ${'$'}((x%=-1)); echo ${'$'}x
+            echo ${'$'}((0 && (y/=0))) ${'$'}((1 || (y%=0))) ${'$'}{y:-unset}
+            """,
+        )
+        val r = sh("x=1; : \$((x/=0)); echo not reached")
+        assertTrue(r.console.contains("division by zero"), r.console)
+    }
+
+    @Test
+    fun `ドットで読むファイルの大きさ`() {
+        val files = mapOf("/home/empty" to "", "/home/big" to "#".repeat(300 * 1024) + "\n")
+        assertOutput(
+            """
+            empty 0
+            sh: .: file too large
+            big 1
+            """,
+            """
+            . /home/empty; . /home/empty; echo empty ${'$'}?
+            . /home/big; echo big ${'$'}?
+            """,
+            files,
+        )
+    }
+
+    @Test
+    fun `会話的なシェルでは、シェルの中で動かす段があってもCtrl+Cが届く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
+            root(m, emptyMap())
+            val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh"), env = mapOf("PATH" to "/bin"), fds = SpawnOptions.ROOT_PREOPEN))
+            // (打つ行, プロンプトに戻るまで Ctrl+C を送るか)
+            val steps = listOf(
+                "x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do x=${'$'}x${'$'}x; done" to false,
+                // echo の出力はパイプより大きく、hang は読まない
+                "echo \"${'$'}x\" | hang" to true,
+                "echo after ${'$'}?" to false,
+                // 最後の段がシェルの中で動く
+                "hang | echo last" to true,
+                "echo second ${'$'}?" to false,
+                "exit" to false,
+            )
+            var next = 0
+            var interrupting = false
+            var seen = 0
+            var lastSent = 0L
+            eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                val text = host.text()
+                val now = System.nanoTime()
+                val atPrompt = text.length > seen && text.endsWith("$ ")
+                when {
+                    atPrompt && next < steps.size -> {
+                        seen = text.length
+                        val (line, ctrlC) = steps[next++]
+                        m.offerConsoleInput((line + "\n").toByteArray())
+                        interrupting = ctrlC
+                    }
+                    interrupting && !atPrompt && now - lastSent > 200_000_000 -> {
+                        m.offerConsoleInput(byteArrayOf(3))
+                        lastSent = now
+                    }
+                }
+                m.stateOf(pid).isTerminal
+            }
+            val text = host.text()
+            assertTrue(text.contains("after 130\n"), text)
+            assertTrue(text.contains("last\n"), text)
+            assertTrue(text.contains("second 0\n"), text)
         }
     }
 
