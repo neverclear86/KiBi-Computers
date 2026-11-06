@@ -559,6 +559,9 @@ fn eval(args: []const []const u8) Error!u8 {
     return state.status;
 }
 
+/// `.` で読めるファイルの大きさの上限（残る領域の半分）
+const MAX_DOT_SIZE = mem.HEAP_SIZE / 2;
+
 fn dot(args: []const []const u8) Error!u8 {
     if (args.len == 0) {
         util.complain(&.{".: filename argument required"});
@@ -575,13 +578,21 @@ fn dot(args: []const []const u8) Error!u8 {
         util.complain(&.{ ".: ", args[0], ": ", kibi.errno.describe(e) });
         return 1;
     };
-    if (st.size > 1024 * 1024) {
+    // 読み込み先は変数・関数と同じ残る領域なので、その半分までにする
+    if (st.size > MAX_DOT_SIZE) {
         io.close(fd) catch {};
         return complain2(".", "file too large");
     }
-    const text = mem.heapAlloc(@intCast(st.size)) catch |e| {
+    if (st.size == 0) {
+        // 空のファイルは何もしない（長さ 0 の区画は返せないので取らない）
         io.close(fd) catch {};
-        return e;
+        state.status = 0;
+        return 0;
+    }
+    const text = mem.heapAlloc(@intCast(st.size)) catch {
+        io.close(fd) catch {};
+        util.complain(&.{ ".: ", args[0], ": not enough memory to read the file" });
+        return 1;
     };
     defer mem.heapFree(text);
     const n = io.readAll(fd, text) catch 0;

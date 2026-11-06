@@ -625,8 +625,9 @@ const Arith = struct {
                         '+' => cur +% rhs,
                         '-' => cur -% rhs,
                         '*' => cur *% rhs,
-                        '/' => if (rhs == 0) self.fail("division by zero") else @divTrunc(cur, rhs),
-                        '%' => if (rhs == 0) self.fail("division by zero") else @rem(cur, rhs),
+                        // 0 での割り算と INT64_MIN / -1 は、2 項の `/`・`%` と同じに扱う（評価しない側では誤りにしない）
+                        '/' => self.apply("/", cur, rhs),
+                        '%' => self.apply("%", cur, rhs),
                         '<' => cur << @intCast(rhs & 63),
                         '>' => cur >> @intCast(rhs & 63),
                         '&' => cur & rhs,
