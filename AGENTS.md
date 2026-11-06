@@ -24,6 +24,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `build-logic/` | ビルド用の Gradle プラグイン（included build）。`kibicomputers.wasm` は C を `zig cc` で WASM にビルドし、ソースセットのリソースに入れる |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
 | `gradle/zig.properties` | WASM のビルドに使う Zig のバージョンと、配布アーカイブの SHA-256 |
+| `gradle/moonbit.properties` | MoonBit（標準 OS の言語の PoC #32 で使う）の版と、配布アーカイブの SHA-256。MoonBit は CI か `-Pkibi.moonbit=true` のときだけビルドする |
 | `gradle/lua.properties` | `lua.wasm` にビルドする Lua のバージョンと、ソースの tar.gz の SHA-256 |
 | `platform-*/gradle.properties` | Minecraft・ローダー・KFF のバージョン |
 | `gradle.properties` | MOD ID、名前、バージョン、グループ |

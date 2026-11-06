@@ -54,7 +54,17 @@ internal object Archives {
 
     /** 先頭のディレクトリ（`zig-<platform>-<version>/` など）を取り除いた相対パス。取り除くと空なら null。 */
     private fun stripFirst(entryName: String): String? =
-        entryName.replace('\\', '/').substringAfter('/', "").trimEnd('/').ifEmpty { null }
+        normalized(entryName).substringAfter('/', "").trimEnd('/').ifEmpty { null }
+
+    /** 区切りを `/` にし、先頭の `./`（MoonBit の tar など）と `/` を落とした名前 */
+    private fun normalized(entryName: String): String {
+        var name = entryName.replace('\\', '/')
+        while (name.startsWith("./") || name.startsWith("/")) name = name.removePrefix(".").removePrefix("/")
+        return name
+    }
+
+    private fun relativeName(entryName: String, strip: Boolean): String? =
+        if (strip) stripFirst(entryName) else normalized(entryName).trimEnd('/').ifEmpty { null }
 
     private fun resolveInside(dir: Path, relative: String): Path {
         val path = dir.resolve(relative).normalize()
@@ -62,12 +72,12 @@ internal object Archives {
         return path
     }
 
-    /** zip を、先頭のディレクトリを取り除いて [dir] に展開する。 */
-    fun extractZip(archive: Path, dir: Path) {
+    /** zip を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。 */
+    fun extractZip(archive: Path, dir: Path, stripFirst: Boolean = true) {
         ZipInputStream(BufferedInputStream(Files.newInputStream(archive))).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
+                val relative = relativeName(entry.name, stripFirst) ?: continue
                 val path = resolveInside(dir, relative)
                 if (entry.isDirectory) {
                     Files.createDirectories(path)
@@ -83,16 +93,16 @@ internal object Archives {
         extractTar(XZInputStream(BufferedInputStream(Files.newInputStream(archive))), dir)
     }
 
-    /** .tar.gz を、先頭のディレクトリを取り除いて [dir] に展開する。 */
-    fun extractTarGz(archive: Path, dir: Path) {
-        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir)
+    /** .tar.gz を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。 */
+    fun extractTarGz(archive: Path, dir: Path, stripFirst: Boolean = true) {
+        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir, stripFirst)
     }
 
-    private fun extractTar(input: InputStream, dir: Path) {
+    private fun extractTar(input: InputStream, dir: Path, stripFirst: Boolean = true) {
         TarArchiveInputStream(input).use { tar ->
             while (true) {
                 val entry = tar.nextEntry ?: break
-                val relative = stripFirst(entry.name) ?: continue
+                val relative = relativeName(entry.name, stripFirst) ?: continue
                 val path = resolveInside(dir, relative)
                 when {
                     entry.isDirectory -> Files.createDirectories(path)
@@ -114,7 +124,8 @@ internal object Archives {
         Files.newOutputStream(path).use { input.copyTo(it) }
     }
 
-    private fun makeExecutable(path: Path) {
+    /** [path] に実行の権限を付ける（POSIX の権限を持たないファイルシステムでは何もしない）。 */
+    fun makeExecutable(path: Path) {
         runCatching {
             val perms = Files.getPosixFilePermissions(path) + setOf(
                 PosixFilePermission.OWNER_EXECUTE,

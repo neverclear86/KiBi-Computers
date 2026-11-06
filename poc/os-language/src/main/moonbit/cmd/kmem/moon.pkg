@@ -1,0 +1,14 @@
+import {
+  "kibi/oslang/sys",
+}
+
+pkgtype(kind: "executable")
+
+// WASI p1 のコマンドとして、線形メモリを memory の名前で出す（main は _start として出る）
+options(
+  link: {
+    "wasm": {
+      "export-memory-name": "memory",
+    },
+  },
+)
