@@ -225,21 +225,20 @@ class AsyncFuelTest {
     /**
      * 段1（燃料切れも待ち点にする）を断られ、段2（入力待ちだけ）で変換できる p1 のコマンド（#396）。
      *
-     * `_start` は、引数を持つブロック `(block (param i32) ...)` の中で [n] 回まわる loop と、通らない `poll_oneoff` の呼び出しを持つ。
-     * `poll_oneoff` を呼びうるので `_start` は止まりうる関数になり、段1では loop の先頭の燃料の確かめが、引数を持つブロックの中の
-     * 待ち点になって断られる。段2では、そのブロックの中に待ち点がないので変換できる
+     * `_start` は、SIMD の命令（`v128.const`・`i32x4.extract_lane`）を持ち [n] 回まわる loop と、通らない `poll_oneoff` の呼び出しを持つ。
+     * `poll_oneoff` を呼びうるので `_start` は止まりうる関数になり、段1では loop の先頭の燃料の確かめで loop が待ち点になり、
+     * その中の SIMD の命令の型を追えずに断られる。段2では、loop の中に待ち点がないので変換できる
+     * （#425 の前は、引数を持つブロックで断られる形にしていた。今は引数を持つブロックは変換できる）
      */
     private fun fallbackModule(n: Int): ByteArray {
         val i32 = WasmBinary.I32
         val b = WasmBinary()
         val poll = b.importFunc("wasi_snapshot_preview1", "poll_oneoff", listOf(i32, i32, i32, i32), listOf(i32))
         b.memory(1)
-        val withParam = b.typeIndex(listOf(i32), emptyList())
+        val simd = WasmBinary.code(0xFD, 0x0C, ByteArray(16), 0xFD, 0x1B, 0, 0x1A) // (drop (i32x4.extract_lane 0 (v128.const i32x4 0 0 0 0)))
         val body = WasmBinary.code(
-            0x41, WasmBinary.sleb(n.toLong()),
-            0x02, withParam, 0x21, 0, // (block (param i32) local.set 0
-            0x02, 0x40, 0x03, 0x40, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B, // 0 になるまで減らす loop
-            0x0B, // )
+            0x41, WasmBinary.sleb(n.toLong()), 0x21, 0,
+            0x02, 0x40, 0x03, 0x40, simd, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B, // 0 になるまで減らす loop
             0x41, 0, 0x04, 0x40, 0x41, 0, 0x41, 0, 0x41, 0, 0x41, 0, 0x10, poll, 0x1A, 0x0B, // (if (i32.const 0) (drop (call poll_oneoff ...)))
         )
         b.exportFunc("_start", b.func(emptyList(), emptyList(), body, locals = listOf(i32)))
@@ -267,7 +266,7 @@ class AsyncFuelTest {
             assertFalse(program.fuelYield)
             assertNotNull(program.fuelYieldRejection)
             val reason = program.fuelYieldRejection!!
-            assertTrue(reason.contains("引数を持つブロック"), reason)
+            assertTrue(reason.contains("SIMD"), reason)
             // 読み込んだときに、理由をもうログに出している（同じモジュールではもう出さない）
             assertFalse(FuelYieldRejectionLog.report(program.hash, reason))
             eventually(60_000, "終わらない") {

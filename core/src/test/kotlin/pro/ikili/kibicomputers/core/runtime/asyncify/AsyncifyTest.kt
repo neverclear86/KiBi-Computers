@@ -207,14 +207,14 @@ class AsyncifyTest {
         val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(tail, setOf("w.wait")) }
         assertTrue(e.message!!.contains("末尾呼び出し"), e.message)
 
-        // 引数を持つブロックの中の止まりうる呼び出し: (block (param i32) (result i32) drop call wait)
+        // 引数を持つブロックの中の止まりうる呼び出し（(block (param i32) (result i32) drop call wait)）は変換できる（#425。AsyncifyMultiValueTest）
         val blockParam = WasmBinary().apply {
             val wait = importFunc("w", "wait", emptyList(), listOf(i32))
             val bt = typeIndex(listOf(i32), listOf(i32))
             mutableI64Global(0)
             exportFunc("run", func(emptyList(), listOf(i32), WasmBinary.code(0x41, 0, 0x02, bt, 0x1A, 0x10, wait, 0x0B)))
         }.build()
-        assertThrows<AsyncifyUnsupported> { Asyncify.transform(blockParam, setOf("w.wait")) }
+        assertEquals(1, Asyncify.transform(blockParam, setOf("w.wait")).instrumented)
 
         // 止まりうる関数を呼ばないなら、v128 のローカルがあってもよい（変換しない）
         val r = Asyncify.transform(simd, emptySet())
