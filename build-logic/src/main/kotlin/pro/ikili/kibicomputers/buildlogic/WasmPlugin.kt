@@ -79,11 +79,12 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
      * Zig のソース（`.zig`）の WASM のモジュールを1つ登録する（#32）。
      *
      * タスク `compile<Name>Wasm`（[ZigBuildExe]）を作り、`<resourceDir>/<name>.wasm` に出力して、[sourceSet] のリソースに加える。
+     * [sourceSet] が `null` ならリソースに加えない（標準 OS のイメージに入れるプログラムなど。#98）。
      */
     @JvmOverloads
     fun zigModule(
         name: String,
-        sourceSet: String = "main",
+        sourceSet: String? = "main",
         resourceDir: String = "kibicomputers/wasm",
         action: Action<ZigBuildExe>,
     ): TaskProvider<ZigBuildExe> {
@@ -102,8 +103,10 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
             outputDir.convention(project.layout.buildDirectory.dir("generated/wasm/$name"))
             action.execute(this)
         }
-        project.extensions.getByType(SourceSetContainer::class.java).named(sourceSet) {
-            resources.srcDir(task)
+        if (sourceSet != null) {
+            project.extensions.getByType(SourceSetContainer::class.java).named(sourceSet) {
+                resources.srcDir(task)
+            }
         }
         return task
     }

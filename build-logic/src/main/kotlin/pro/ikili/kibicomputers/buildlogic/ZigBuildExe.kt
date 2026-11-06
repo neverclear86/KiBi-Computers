@@ -5,6 +5,7 @@ import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.MapProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Input
@@ -23,6 +24,7 @@ import javax.inject.Inject
  *
  * [ZigCcWasm] の Zig 版。Zig は同じく [ZigInstaller] が取得する。[root] がルートのファイルで、
  * そこから `@import` するファイルは [sources] に入れる（変わったらビルドし直すため）。
+ * 名前で `@import` するモジュール（標準 OS の共通ライブラリ `kibi` など。#98）は [modules] に渡す。
  */
 @CacheableTask
 abstract class ZigBuildExe @Inject constructor(
@@ -66,6 +68,18 @@ abstract class ZigBuildExe @Inject constructor(
     @get:Input
     abstract val stackSize: Property<Int>
 
+    /**
+     * ルートから名前で `@import("<名前>")` するモジュール（名前 → ルートのファイル）。`--dep`・`-M` で渡す。
+     * モジュールのファイルも [sources] に入れる（中身の変更は [sources] で検知し、ここは名前だけをキャッシュのキーにする）。
+     */
+    @get:Internal
+    abstract val modules: MapProperty<String, java.io.File>
+
+    /** [modules] の名前（キャッシュのキー）。 */
+    @get:Input
+    val moduleNames: List<String>
+        get() = modules.get().keys.sorted()
+
     /** `zig build-exe` に渡すほかの引数。 */
     @get:Input
     abstract val compilerArgs: ListProperty<String>
@@ -89,12 +103,22 @@ abstract class ZigBuildExe @Inject constructor(
         val localCache = temporaryDir.resolve("zig-local-cache")
         execOperations.exec {
             executable = zig.absolutePath
-            args("build-exe", root.get().asFile.absolutePath)
+            args("build-exe")
+            // -target・-O はモジュールごとの設定なので、モジュール（ルートの位置引数・-M）より前に書く
             args("-target", target.get(), "-O", optimize.get(), "-fstrip")
             args("--stack", stackSize.get().toString())
             args(compilerArgs.get())
             args("--cache-dir", localCache.absolutePath, "--global-cache-dir", zigCacheDir.get().asFile.absolutePath)
             args("-femit-bin=${output.absolutePath}")
+            val deps = modules.get().toSortedMap()
+            if (deps.isEmpty()) {
+                args(root.get().asFile.absolutePath)
+            } else {
+                // --dep は次の -M（ルート）の import の表に入る。依存のモジュールどうしは参照しない
+                for (name in deps.keys) args("--dep", name)
+                args("-Mroot=${root.get().asFile.absolutePath}")
+                for ((name, file) in deps) args("-M$name=${file.absolutePath}")
+            }
             // build-exe は作業ディレクトリに中間ファイル（.o）を書くことがあるので、一時ディレクトリで動かす
             workingDir = temporaryDir
         }
