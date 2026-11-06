@@ -25,7 +25,7 @@
 | `os/etc/` | 設定ファイル（`inittab` など。#100） | イメージの `/etc/` にそのまま |
 | `os/test/<名前>.zig` | ライブラリを確かめるプログラム | core のテストのリソース `/kibicomputers/wasm/os-<名前>.wasm` |
 
-今入れたコマンドは、パイプラインを確かめるための `echo`・`true`・`false` だけ。ほかの基本コマンドは #103。
+#98 で入れたコマンドは、パイプラインを確かめるための `echo`・`true`・`false` だけ。ほかの基本コマンドは #103（ADR 0103）。
 
 ## ビルド
 
@@ -51,6 +51,8 @@ import は自分で宣言し、構造体の配置は `comptime` で確かめる�
 | `tty.zig` | `kibi:io/tty`（モード・大きさ・前景） |
 | `memory.zig` | `kibi:computer/memory`（remaining・commit） |
 | `time.zig` | 時計と眠り（clock_time_get・poll_oneoff） |
+| `cli.zig` | コマンドの小物: オプション・知らせ・まとめて書く出力・行の読み方・パス（#103） |
+| `tree.zig` | ディレクトリの木を写す・消す（#103） |
 
 細かい決めごと:
 

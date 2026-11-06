@@ -119,6 +119,15 @@ pub fn stat(path: []const u8) Error!Stat {
     return toStat(s);
 }
 
+/// [path] の情報（最後の部分がシンボリックリンクなら、たどらずにリンクそのもの）
+pub fn lstat(path: []const u8) Error!Stat {
+    var buf: [MAX_PATH]u8 = undefined;
+    const rel = try resolve(&buf, path);
+    var s: wasi.Filestat = undefined;
+    try errno.check(wasi.path_filestat_get(ROOT, 0, rel.ptr, @intCast(rel.len), &s));
+    return toStat(s);
+}
+
 /// 開いた fd の情報
 pub fn fstat(fd: Fd) Error!Stat {
     var s: wasi.Filestat = undefined;
@@ -158,6 +167,13 @@ pub fn open(path: []const u8, flags: OpenFlags) Error!Fd {
     var fd: Fd = 0;
     try errno.check(wasi.path_open(ROOT, wasi.LOOKUP_SYMLINK_FOLLOW, rel.ptr, @intCast(rel.len), oflags, rights, wasi.RIGHTS_ALL, fdflags, &fd));
     return fd;
+}
+
+/// [path] の参照・変更の時刻を今にする（シンボリックリンクはたどる）
+pub fn touchTimes(path: []const u8) Error!void {
+    var buf: [MAX_PATH]u8 = undefined;
+    const rel = try resolve(&buf, path);
+    try errno.check(wasi.path_filestat_set_times(ROOT, wasi.LOOKUP_SYMLINK_FOLLOW, rel.ptr, @intCast(rel.len), 0, 0, wasi.FST_ATIM_NOW | wasi.FST_MTIM_NOW));
 }
 
 pub fn mkdir(path: []const u8) Error!void {

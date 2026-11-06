@@ -88,6 +88,10 @@ pub const O_DIRECTORY: u16 = 1 << 1;
 pub const O_EXCL: u16 = 1 << 2;
 pub const O_TRUNC: u16 = 1 << 3;
 
+/// fstflags_t: 時刻を今にする
+pub const FST_ATIM_NOW: u16 = 1 << 1;
+pub const FST_MTIM_NOW: u16 = 1 << 3;
+
 /// fdflags_t
 pub const FDFLAG_APPEND: u16 = 1 << 0;
 pub const FDFLAG_NONBLOCK: u16 = 1 << 2;
@@ -116,6 +120,7 @@ pub extern "wasi_snapshot_preview1" fn fd_filestat_get(fd: Fd, buf: *Filestat) u
 pub extern "wasi_snapshot_preview1" fn fd_readdir(fd: Fd, buf: [*]u8, len: Size, cookie: u64, used: *Size) u16;
 pub extern "wasi_snapshot_preview1" fn path_open(dirfd: Fd, dirflags: u32, path: [*]const u8, path_len: Size, oflags: u16, base: Rights, inheriting: Rights, fdflags: u16, fd: *Fd) u16;
 pub extern "wasi_snapshot_preview1" fn path_filestat_get(dirfd: Fd, flags: u32, path: [*]const u8, path_len: Size, buf: *Filestat) u16;
+pub extern "wasi_snapshot_preview1" fn path_filestat_set_times(dirfd: Fd, flags: u32, path: [*]const u8, path_len: Size, atim: Timestamp, mtim: Timestamp, fst_flags: u16) u16;
 pub extern "wasi_snapshot_preview1" fn path_create_directory(dirfd: Fd, path: [*]const u8, path_len: Size) u16;
 pub extern "wasi_snapshot_preview1" fn path_remove_directory(dirfd: Fd, path: [*]const u8, path_len: Size) u16;
 pub extern "wasi_snapshot_preview1" fn path_unlink_file(dirfd: Fd, path: [*]const u8, path_len: Size) u16;

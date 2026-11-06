@@ -15,5 +15,7 @@ pub const process = @import("process.zig");
 pub const tty = @import("tty.zig");
 pub const memory = @import("memory.zig");
 pub const time = @import("time.zig");
+pub const cli = @import("cli.zig");
+pub const tree = @import("tree.zig");
 
 pub const Error = errno.Error;
