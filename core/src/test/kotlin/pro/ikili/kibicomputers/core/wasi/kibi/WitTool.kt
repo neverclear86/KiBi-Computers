@@ -25,14 +25,33 @@ internal object WitTool {
         override fun isLoggable(level: Logger.Level): Boolean = false
     }
 
-    /** 終了コードと標準出力・標準エラー出力 */
-    class Result(val exitCode: Int, val stdout: String, val stderr: String)
+    /** 終了コードと標準出力・標準エラー出力。[outputs] は [run] で頼んだ、動かした後のファイルの中身（なければ入れない） */
+    class Result(val exitCode: Int, val stdout: String, val stderr: String, val outputs: Map<String, ByteArray> = emptyMap())
 
     /** 仮想 FS の作業ディレクトリ（ゲストから見たパスも同じ）。[run] の引数のパスは `work/...` で書く */
     const val WORK: String = "work"
 
-    /** [files]（`work/` からの相対パス → 中身。`/` で区切る）を置き、`wasm-tools` を [args] で動かす */
-    fun run(args: List<String>, files: Map<String, ByteArray>): Result =
+    /**
+     * WAT のテキストを WASM のバイナリにする（`wasm-tools parse`。#425 のテストで、WAT でモジュールを書くために使う）。
+     * 読めなければ [IllegalArgumentException]
+     */
+    fun wat(text: String): ByteArray {
+        val r = run(listOf("parse", "$WORK/m.wat", "-o", "$WORK/m.wasm"), mapOf("m.wat" to text.toByteArray()), listOf("m.wasm"))
+        require(r.exitCode == 0) { "WAT を読めない: ${r.stderr}" }
+        return r.outputs.getValue("m.wasm")
+    }
+
+    /** `wasm-tools validate` で、[wasm] が正しい WASM か確かめる。正しくなければ、エラー出力を返す */
+    fun validate(wasm: ByteArray, features: String = "all"): String? {
+        val r = run(listOf("validate", "--features", features, "$WORK/m.wasm"), mapOf("m.wasm" to wasm))
+        return if (r.exitCode == 0) null else r.stderr
+    }
+
+    /**
+     * [files]（`work/` からの相対パス → 中身。`/` で区切る）を置き、`wasm-tools` を [args] で動かす。
+     * [outputs]（`work/` からの相対パス）は、動かした後に読んで [Result.outputs] に入れる
+     */
+    fun run(args: List<String>, files: Map<String, ByteArray>, outputs: List<String> = emptyList()): Result =
         ZeroFs.newFileSystem(Configuration.unix().toBuilder().setAttributeViews("unix").build()).use { fs ->
             val dir = fs.getPath(WORK)
             Files.createDirectory(dir)
@@ -62,6 +81,7 @@ internal object WitTool {
                     exit = e.exitCode()
                 }
             }
-            Result(exit, stdout.toString(Charsets.UTF_8), stderr.toString(Charsets.UTF_8))
+            val read = outputs.mapNotNull { name -> dir.resolve(name).takeIf { Files.exists(it) }?.let { name to Files.readAllBytes(it) } }.toMap()
+            Result(exit, stdout.toString(Charsets.UTF_8), stderr.toString(Charsets.UTF_8), read)
         }
 }

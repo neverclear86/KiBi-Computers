@@ -39,7 +39,13 @@ internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
  * - 待ち点の間の命令の並び（ラン）は `if (state == NORMAL)` で包む。巻き直し中は飛ばされる。ランの中の分岐は、包んだ分だけ深さを足す
  * - 呼び出しは `if (state == NORMAL || k == K)` で包む（K はその関数の中の呼び出しの番号）
  * - `if` の条件は一時ローカルに入れておく。巻き直し中は戻したローカルで同じ枝に入る
- * - ブロックの最後のランは `if (result T) … else <ダミーの値> end` にする（巻き直し中に結果の型をそろえるため）
+ * - ブロックの最後のランは `if (result T…) … else <ダミーの値> end` にする（巻き直し中に結果の型をそろえるため）
+ * - 引数を持つ待ち点の構造（multi-value。#425）は、引数もほかの値と同じく一時ローカルに移しておき、構造の直前に積み直す。
+ *   構造の中では、入口で引数を専用の一時ローカルに移す（巻き直しの間も。積み直した値は戻したローカルのものなので同じになる。
+ *   巻き直しでは止まった呼び出しより前の構造も通るので、ほかと共有するローカルに書くと、生きている値を壊す）。
+ *   loop の先頭への分岐で渡された引数も、同じ入口で移る
+ * - 結果が2つ以上のブロック型（`$body` と最後のランの `if`）は、型セクションに `[] -> [T…]` の型を足して、その番号で書く。
+ *   足す型は `async_push`・`async_pop` の型の後に並ぶ（同じ型は1つにまとめる）。そのため、コードセクションを先に書き換えてから型セクションを書く
  * - `call_indirect` は、型が同じ止まりうる関数があるときだけ止まりうる、と見る
  *
  * 足すもの（名前は [WasmAsync]。カーネルと変換したコードの間の取り決めで、プログラムには見せない）:
@@ -111,8 +117,7 @@ internal object Asyncify {
      * （燃料の計測コードの挿入）で import を足した後のものなら、その番号の対応を渡す（`FuelInjector.Result.originalFunc`）。
      *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
-     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる呼び出しを含む、引数を持つブロックや
-     *   複数の結果を持つブロックなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
+     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、これでは断らない（#384）
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
@@ -349,15 +354,10 @@ private class Transformer(
         // 型を追うのは、書き換える（定義済みの）止まりうる関数だけ。止まりうる import を持っていても、呼ぶ関数がなければ断らない
         if (suspendable.any { it >= importedFuncs }) untypedReason?.let { throw AsyncifyUnsupported("止まりうる関数があるので型を追う必要があるが、$it") }
         val sections = withRequiredSections(scanSections())
-        val newTypePush = module.typeSection().subTypeCount()
+        // コードセクションを先に書き換える（multi-value のブロック型に使う型を、型セクションに足すため。#425）
+        val code = sections.firstOrNull { it.id == 10 }?.let { rewriteCode(it, bodies) }
         val out = Sink()
         out.bytes(wasm, 0, 8)
-        var codeBefore = 0
-        var codeAfter = 0
-        var instrumented = 0
-        var sites = 0
-        var maxLocals = 0
-        var yieldSites = 0
         fun emit(id: Int, body: Sink) {
             out.u8(id)
             out.leb(body.size().toLong())
@@ -373,11 +373,19 @@ private class Transformer(
                 1 -> {
                     val n = count()
                     val body = Sink()
-                    body.leb(n + 2)
+                    body.leb(n + 2 + blockTypes.size)
                     body.bytes(wasm, r.pos, s.end - r.pos)
                     // (i64) -> () と () -> (i64)
                     body.u8(0x60); body.leb(1); body.u8(I64); body.leb(0)
                     body.u8(0x60); body.leb(0); body.leb(1); body.u8(I64)
+                    // 変換で足した、multi-value のブロック型
+                    for (t in blockTypes) {
+                        body.u8(0x60)
+                        body.leb(t.params.size)
+                        t.params.forEach(body::u8)
+                        body.leb(t.results.size)
+                        t.results.forEach(body::u8)
+                    }
                     emit(1, body)
                 }
                 2 -> {
@@ -422,46 +430,74 @@ private class Transformer(
                 }
                 8 -> emit(8, Sink().also { it.leb(remap(r.leb())) })
                 9 -> emit(9, rewriteElements(r))
-                10 -> {
-                    val n = r.leb().toInt()
-                    val body = Sink()
-                    body.leb(n)
-                    for (i in 0 until n) {
-                        val size = r.leb().toInt()
-                        val start = r.pos
-                        val end = start + size
-                        val f = importedFuncs + i
-                        checkpoint()
-                        val fn = Sink()
-                        if (f in suspendable) {
-                            val rw: FunctionRewriter
-                            val stats = try {
-                                rw = FunctionRewriter(f, bodies[i], start, end)
-                                rw.rewrite(fn)
-                            } catch (e: AsyncifyUnsupported) {
-                                throw AsyncifyUnsupported("止まりうる関数 ${describe(f)} の中: ${e.message}").also { it.initCause(e) }
-                            }
-                            instrumented++
-                            sites += stats.first
-                            maxLocals = maxOf(maxLocals, stats.second)
-                            yieldSites += rw.yieldSites
-                        } else {
-                            copyPlainFunction(bodies[i], start, end, fn)
-                        }
-                        codeBefore += size
-                        codeAfter += fn.size()
-                        body.leb(fn.size())
-                        body.append(fn)
-                        r.pos = end
-                    }
-                    emit(10, body)
-                }
+                10 -> emit(10, code!!)
                 else -> emit(s.id, Sink().also { it.bytes(wasm, s.start, s.end - s.start) })
             }
         }
         return Asyncify.Result(
             out.toByteArray(), bodies.size, instrumented, sites, codeBefore, codeAfter, maxLocals, yieldSites,
         )
+    }
+
+    // 変換の集計（[rewriteCode] が数える）
+    private var codeBefore = 0
+    private var codeAfter = 0
+    private var instrumented = 0
+    private var sites = 0
+    private var maxLocals = 0
+    private var yieldSites = 0
+
+    /** 型セクションの、変換の前からある型の数。足す型の番号はこの後に続く */
+    private val typeBase = module.typeSection().subTypeCount()
+
+    /** 足す import（`async_push`・`async_pop`）の型の番号。`async_pop` は次の番号 */
+    private val newTypePush = typeBase
+
+    /** 変換で足す、複数の結果を持つブロック型（multi-value。#425）。`async_push`・`async_pop` の型の後に並ぶ */
+    private val blockTypes = ArrayList<Sig>()
+    private val blockTypeIndex = HashMap<Pair<List<Int>, List<Int>>, Int>()
+
+    /** 引数が [params]・結果が [results] のブロック型の、型の番号（まだ足していなければ足す） */
+    private fun blockTypeIdx(params: List<Int>, results: List<Int>): Int = blockTypeIndex.getOrPut(params to results) {
+        blockTypes += Sig(params, results)
+        typeBase + 2 + blockTypes.size - 1
+    }
+
+    /** コードセクションの中身を書き換える。止まりうる関数は [FunctionRewriter] で、それ以外は番号の付け替えだけ */
+    private fun rewriteCode(s: Section, bodies: List<List<AnnotatedInstruction>>): Sink {
+        val r = Reader(wasm, s.start, s.end)
+        val n = r.leb().toInt()
+        val body = Sink()
+        body.leb(n)
+        for (i in 0 until n) {
+            val size = r.leb().toInt()
+            val start = r.pos
+            val end = start + size
+            val f = importedFuncs + i
+            checkpoint()
+            val fn = Sink()
+            if (f in suspendable) {
+                val rw: FunctionRewriter
+                val stats = try {
+                    rw = FunctionRewriter(f, bodies[i], start, end)
+                    rw.rewrite(fn)
+                } catch (e: AsyncifyUnsupported) {
+                    throw AsyncifyUnsupported("止まりうる関数 ${describe(f)} の中: ${e.message}").also { it.initCause(e) }
+                }
+                instrumented++
+                sites += stats.first
+                maxLocals = maxOf(maxLocals, stats.second)
+                yieldSites += rw.yieldSites
+            } else {
+                copyPlainFunction(bodies[i], start, end, fn)
+            }
+            codeBefore += size
+            codeAfter += fn.size()
+            body.leb(fn.size())
+            body.append(fn)
+            r.pos = end
+        }
+        return body
     }
 
     /** エラーメッセージ用の関数の呼び方（元のモジュールの番号（[originalFunc]）と、あれば export の名前） */
@@ -763,11 +799,12 @@ private class Transformer(
             }
         }
 
+        /** 引数のない、結果が [results] のブロック型。結果が2つ以上なら、足した型の番号で書く（multi-value。#425） */
         private fun blockType(out: Sink, results: List<Int>) {
             when (results.size) {
                 0 -> out.u8(0x40)
                 1 -> out.u8(results[0])
-                else -> throw AsyncifyUnsupported("止まりうる呼び出しを含む、複数の結果を持つブロック（multi-value）には対応していない")
+                else -> out.sleb(blockTypeIdx(emptyList(), results).toLong())
             }
         }
 
@@ -912,10 +949,20 @@ private class Transformer(
 
         // --- 出力 ---
 
-        /** 待ち点を含むブロックの中身。入るときスタックは空。[m] は $body の中で開いている待ち点の構造の数 */
-        private fun emitSuspendBody(out: Sink, nodes: List<Node>, results: List<Int>, m: Int) {
-            var st = TypeStack()
-            var pending: List<Int> = emptyList()
+        /**
+         * 待ち点を含むブロックの中身。入るとき、スタックにはブロックの引数 [params] だけがある。[m] は $body の中で開いている待ち点の構造の数。
+         *
+         * 引数は入口で専用の一時ローカルに移す（#425）。巻き直しの間も移す（止まった呼び出しを含む構造なら、ブロックの直前に、
+         * 戻したローカルから同じ値を積んでいる。止まった呼び出しより前の構造なら、移した値は使わない）。
+         * loop の先頭への分岐で積まれた引数も、同じ入口で移す
+         */
+        private fun emitSuspendBody(out: Sink, nodes: List<Node>, results: List<Int>, m: Int, params: List<Int> = emptyList()) {
+            // 専用のローカルに（巻き直しで、止まった呼び出しより前の構造を通るときにも書かれるので、ほかと共有しない）
+            var pending: List<Int> = params.map { newLocal(it).also(dedicated::add) }
+            for (p in pending.reversed()) {
+                out.u8(0x21); out.leb(p)
+            }
+            var st = TypeStack(params)
             val run = ArrayList<Node>()
             for (node in nodes) {
                 if (st.unreachable || !hasSuspend(node)) {
@@ -938,9 +985,9 @@ private class Transformer(
                     }
                     is Struct -> {
                         callSig = null
+                        // 引数を持つブロック（multi-value）は、引数も一時ローカルに移し、ブロックの直前に積み直す（#425）
                         val (params, _, _) = blockSig(node.open)
-                        if (params.isNotEmpty()) throw AsyncifyUnsupported("止まりうる呼び出しを含む、引数を持つブロック（multi-value）には対応していない")
-                        consumed = if (node.open.opcode() == OpCode.IF) 1 else 0
+                        consumed = params.size + if (node.open.opcode() == OpCode.IF) 1 else 0
                     }
                 }
                 // 前のランを閉じる: スタックをすべて一時ローカルに移す
@@ -959,14 +1006,14 @@ private class Transformer(
                         for (a in args) {
                             out.u8(0x20); out.leb(a)
                         }
-                        val (_, res, btEnd) = blockSig(node.open)
+                        val (params, res, btEnd) = blockSig(node.open)
                         // 見出し（try_table の catch のラベルは外側から数えるので、そのままでよい）
                         val headerEnd = if (node.open.opcode() == OpCode.TRY_TABLE) endOf[node.open]!! else btEnd
                         out.bytes(wasm, node.open.address(), headerEnd - node.open.address())
-                        emitSuspendBody(out, node.body, res, m + 1)
+                        emitSuspendBody(out, node.body, res, m + 1, params)
                         if (node.els != null) {
                             out.u8(0x05)
-                            emitSuspendBody(out, node.els, res, m + 1)
+                            emitSuspendBody(out, node.els, res, m + 1, params)
                         }
                         out.u8(0x0B)
                         args.forEach(::release)
