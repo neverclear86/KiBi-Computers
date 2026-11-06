@@ -32,7 +32,8 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - 動いている間に起動に要る部品・電源を入れたときにあったディスクを抜くと止まる（判断は `core` の [ComputerCase]）
  * - 電源を入れるとき、識別子のないディスクに識別子を付け（#124）、挿さっているディスクの写しをマシンの環境に渡す
  * - チャンクのアンロード・ブロックの破壊でマシンを外す
- * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 同梱イメージの順に起動する（仮の結線。[TestComputerWiring]、#307）
+ * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 標準 OS の同梱イメージの順に起動する
+ *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる
  *
  * セーブデータには部品だけを書く（`Parts`）。電源の状態は書かず、読み込んだら電源が切れている（マシンの状態の保存は #81）。
  */
@@ -51,6 +52,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** 電源と状態。サーバーでだけ動く（クライアントでは常に [ComputerStatus.OFF]） */
     val computer: ComputerCase<MachineKey> = ComputerCase(tier, wiring)
 
+    /**
+     * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[TestComputerWiring.OS_BOOT_DISK]）。
+     * GameTest が Lua の REPL（[TestComputerWiring.TEST_BOOT_DISK]）で動かすために差し替える。保存しない
+     */
+    internal var fallbackBootDisk: String = TestComputerWiring.OS_BOOT_DISK
+
     // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
     private val installedForBoot = TestComputerWiring.withBootPart(tier, parts.installed)
 
@@ -65,11 +72,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = MachineSpecs.configOf(tier, parts.tiers)
         var environment = MachineEnvironment.DEFAULT
-        var boot = TestComputerWiring.BOOT_CONFIG
+        var boot = TestComputerWiring.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             val disks = prepareDisks()
             environment = MachineEnvironment.builder().disks(disks.resolver).build()
-            boot = TestComputerWiring.bootConfig(disks.bootOrder)
+            boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
         }
         val status = computer.pressPowerButton(
             ServerMachines.current,

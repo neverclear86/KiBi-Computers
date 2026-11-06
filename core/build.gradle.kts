@@ -291,6 +291,18 @@ osPrograms("test", "test", "kibicomputers/wasm").forEach { (name, task) ->
     task.configure { outputPath = "kibicomputers/wasm/os-$name.wasm" }
 }
 
+// イメージに入れる空のディレクトリ（#461。HDD をマウントする `/home`、RAM のファイルシステムをマウントする `/tmp`）。
+// Git は空のディレクトリを持てないので、ビルドで作る
+val osImageSkeleton = tasks.register("osImageSkeleton") {
+    val out = layout.buildDirectory.dir("generated/os-skeleton")
+    outputs.dir(out)
+    doLast {
+        val dir = out.get().asFile
+        dir.deleteRecursively()
+        for (name in listOf("home", "tmp")) dir.resolve(name).mkdirs()
+    }
+}
+
 val zipOsImage = tasks.register<Zip>("zipOsImage") {
     group = "build"
     description = "Builds the standard OS image (os.zip) from the Zig programs under os/."
@@ -305,6 +317,7 @@ val zipOsImage = tasks.register<Zip>("zipOsImage") {
     }
     // 設定ファイル（`os/etc/` → イメージの `/etc/`。#100 の `/etc/inittab` など）
     from(osDir.dir("etc")) { into("etc") }
+    from(osImageSkeleton)
     archiveFileName = "os.zip"
     destinationDirectory = layout.buildDirectory.dir("generated/images/os/kibicomputers/images")
     isPreserveFileTimestamps = false

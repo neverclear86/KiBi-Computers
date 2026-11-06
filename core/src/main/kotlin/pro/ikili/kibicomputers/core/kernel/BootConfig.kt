@@ -21,12 +21,20 @@ public class BootConfig private constructor(builder: Builder) {
     /** 起動ディスクの候補（ディスクの識別子。前ほど優先。[DiskResolver] と同じ識別子）。変更できない写し */
     public val bootDisks: List<String> = java.util.Collections.unmodifiableList(ArrayList(builder.bootDisks))
 
-    override fun toString(): String = "BootConfig(firmware=$isFirmwarePresent, disks=$bootDisks)"
+    /**
+     * 根が読み取り専用（同梱イメージなど）で起動したときに、書き込める形で `/home` にマウントするディスクの識別子（#461）。
+     * `null` ならマウントしない。根にしたディスクと同じ識別子・読み取り専用でしか開けないディスクもマウントしない。
+     * 正式な入手方法（#107・#145）がそろうまでの仮の起動経路のためのもの
+     */
+    public val homeDisk: String? = builder.homeDisk
+
+    override fun toString(): String = "BootConfig(firmware=$isFirmwarePresent, disks=$bootDisks, home=$homeDisk)"
 
     /** [BootConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var firmwarePresent: Boolean = true
         internal val bootDisks = ArrayList<String>()
+        internal var homeDisk: String? = null
 
         /** 起動部品が挿さっているか（既定 `true`） */
         public fun firmwarePresent(value: Boolean): Builder = apply { firmwarePresent = value }
@@ -39,6 +47,9 @@ public class BootConfig private constructor(builder: Builder) {
             bootDisks.clear()
             bootDisks.addAll(value)
         }
+
+        /** 根が読み取り専用のときに `/home` にマウントするディスク（[BootConfig.homeDisk]。既定 `null`） */
+        public fun homeDisk(diskId: String?): Builder = apply { homeDisk = diskId }
 
         /** 設定を作る。 */
         public fun build(): BootConfig = BootConfig(this)

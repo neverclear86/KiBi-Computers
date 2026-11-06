@@ -91,6 +91,12 @@ class InitTest {
         assertEquals(FileType.REGULAR_FILE, image.stat(VfsPath.parse(BootConfig.INIT_PATH)).type)
         val tab = imageFile("/etc/inittab").toString(Charsets.UTF_8)
         assertTrue(tab.lines().contains("shell /bin/sh"), tab)
+        assertTrue(tab.lines().contains("env HOME=/home"), tab)
+        // HDD・RAM のファイルシステムをマウントする空のディレクトリ（#461）
+        for (dir in listOf("/home", "/tmp")) {
+            assertEquals(FileType.DIRECTORY, image.stat(VfsPath.parse(dir)).type, dir)
+            assertEquals(0, image.readDirectory(image.stat(VfsPath.parse(dir)).node).size, dir)
+        }
     }
 
     @Test
@@ -106,7 +112,8 @@ class InitTest {
     @Test
     fun `イメージのinittabで、bin_shを起こす`() {
         val lines = boot(mapOf("/bin/sh" to probe, "/etc/inittab" to imageFile("/etc/inittab"))) { l -> l.any { it.startsWith("sh ") } }
-        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1" in lines, lines.toString())
+        // HOME は HDD をマウントする /home（#461）
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/home args=1" in lines, lines.toString())
     }
 
     @Test
