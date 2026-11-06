@@ -255,3 +255,54 @@ val zipTestbootImage = tasks.register<Zip>("zipTestbootImage") {
 sourceSets.main {
     resources.srcDir(files(layout.buildDirectory.dir("generated/images/main")) { builtBy(zipTestbootImage) })
 }
+
+// 標準 OS（#98。言語は Zig。ADR 0032）。ソースはリポジトリの `os/`:
+// - `os/lib/kibi/`: 共通ライブラリ（システムコールの包み）。プログラムは `@import("kibi")` で使う
+// - `os/bin/<名前>.zig` → イメージの `/bin/<名前>`、`os/sbin/<名前>.zig` → `/sbin/<名前>`（ファイルを置けば足される）
+// - `os/test/<名前>.zig`: 共通ライブラリを確かめるプログラム。テストのリソース `/kibicomputers/wasm/os-<名前>.wasm` にする
+// 全部を同梱イメージ os（core のリソース `/kibicomputers/images/os.zip`。起動ディスクの識別子は `image:os`）にまとめる。
+// OS 入りのフロッピー（#97）はこのイメージを中身にする。ビルド時 AOT（#36）は、このイメージのプログラムを変換の対象に足す
+val osDir = rootProject.layout.projectDirectory.dir("os")
+val osLibrary = osDir.dir("lib/kibi")
+val osLibrarySources = fileTree(osLibrary) { include("**/*.zig") }
+
+// `os/<dir>/` の `.zig` を1つずつ WASM にする（sourceSet が null ならリソースに入れない）
+fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir(dir).asFile
+    .listFiles { f -> f.isFile && f.name.endsWith(".zig") }.orEmpty()
+    .sortedBy { it.name }
+    .map { file ->
+        val name = file.name.removeSuffix(".zig")
+        name to kibiWasm.zigModule("os-$dir-$name", sourceSet = sourceSet, resourceDir = resourceDir) {
+            root = file
+            sources.from(osLibrarySources)
+            modules.put("kibi", osLibrary.file("kibi.zig").asFile)
+            outputPath = "$name.wasm"
+        }
+    }
+
+val osImageDirs = listOf("bin", "sbin")
+val osImagePrograms = osImageDirs.associateWith { osPrograms(it, null, "") }
+osPrograms("test", "test", "kibicomputers/wasm").forEach { (name, task) ->
+    task.configure { outputPath = "kibicomputers/wasm/os-$name.wasm" }
+}
+
+val zipOsImage = tasks.register<Zip>("zipOsImage") {
+    group = "build"
+    description = "Builds the standard OS image (os.zip) from the Zig programs under os/."
+    for ((dir, programs) in osImagePrograms) {
+        for ((name, task) in programs) {
+            from(task.flatMap { it.outputDir }) {
+                include("$name.wasm")
+                eachFile { path = "$dir/$name" }
+                includeEmptyDirs = false
+            }
+        }
+    }
+    archiveFileName = "os.zip"
+    destinationDirectory = layout.buildDirectory.dir("generated/images/os/kibicomputers/images")
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+sourceSets.main {
+    resources.srcDir(files(layout.buildDirectory.dir("generated/images/os")) { builtBy(zipOsImage) })
+}
