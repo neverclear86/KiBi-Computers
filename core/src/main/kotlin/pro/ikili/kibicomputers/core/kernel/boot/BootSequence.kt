@@ -22,7 +22,9 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 1. 前回の残り（ゾンビ、pid、マウント）を片付ける
  * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]
  * 3. 候補のディスクを順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする。
- *    続けて空の `/tmp`（メモリ上。#53）をマウントする（根の `/tmp` がディレクトリ以外ならマウントせず、コンソールに書いて続ける）
+ *    続けて空の `/tmp`（メモリ上。#53）をマウントする（根の `/tmp` がディレクトリ以外ならマウントせず、コンソールに書いて続ける）。
+ *    根が読み取り専用なら、[BootConfig.homeDisk] を書き込める形で `/home` にマウントする（#461。開けない・読み取り専用・
+ *    根の `/home` がディレクトリ以外なら、マウントせずにコンソールに書いて続ける）
  * 4. init を pid 1 で作る（親なし、argv は `[INIT_PATH]`、環境変数なし、cwd `/`、標準入出力はコンソール）。
  *    init の読み込み（コンパイル）の終わりは、スレッドを持たずに待つ（#358。終わったら起動用のスレッドで続ける）
  *
@@ -55,6 +57,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
                 return
             }
             machine.mountTmp()?.let { errno -> machine.writeConsoleLine("kibi: /tmp not mounted (${errno.name})") }
+            if (volume.readOnly) mountHome(diskId)
             machine.writeConsoleLine("kibi: booting from disk $diskId")
             machine.scheduler.hooks.beforeInitExec?.invoke(machine)
             startInit()
@@ -87,6 +90,27 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             machine.endBoot(BootFailure.NO_INIT, "${BootConfig.INIT_PATH} のあるディスクがない（開けたディスク $opened 個）")
         }
         return null
+    }
+
+    /** 根が読み取り専用のとき、[BootConfig.homeDisk] を `/home` にマウントする。できなければコンソールに書いて続ける */
+    private fun mountHome(rootDiskId: String) {
+        val homeDisk = config.homeDisk ?: return
+        if (homeDisk == rootDiskId) return
+        if (machine.isBootCancelled) throw BootCancelledException()
+        val volume = try {
+            opener.open(homeDisk)
+        } catch (e: Exception) {
+            null
+        }
+        val reason = when {
+            volume == null -> "cannot open"
+            volume.readOnly -> {
+                volume.fs.retire()
+                "read-only"
+            }
+            else -> machine.mountHome(homeDisk, volume)?.name ?: return
+        }
+        machine.writeConsoleLine("kibi: /home not mounted ($reason)")
     }
 
     /** まだマウントしていないファイルシステムを、ほかのスレッドと分け合わずに見る */

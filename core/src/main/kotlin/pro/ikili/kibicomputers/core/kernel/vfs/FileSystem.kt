@@ -137,10 +137,21 @@ internal interface FileSystem {
     val tracksOpenFiles: Boolean get() = false
 
     /**
-     * 普通のファイル [node] を開いた（[Vfs.open]。[writable] は書くために開いたか）。ホストのファイルを開いたままにするもの（#52）は、
-     * ここで開く。数の上限を超えたら `MFILE`（マシン）・`NFILE`（サーバー全体）。[tracksOpenFiles] のときだけ呼ばれる
+     * 開いたままにする枠を、ファイルを作る前に1つ取る（[Vfs.open] の `O_CREAT`。#434）。数の上限を超えたら `MFILE`・`NFILE`
+     * （何も作らずに open を失敗させるため）。取った枠は、続く `retain(node, writable, reserved = true)` に渡すか、
+     * 作るのに失敗したら [cancelOpen] で返す。[tracksOpenFiles] のときだけ呼ばれる（既定は何もしない）
      */
-    fun retain(node: Long, writable: Boolean) {}
+    fun reserveOpen() {}
+
+    /** [reserveOpen] で取った枠を、使わずに返す（既定は何もしない） */
+    fun cancelOpen() {}
+
+    /**
+     * 普通のファイル [node] を開いた（[Vfs.open]。[writable] は書くために開いたか）。ホストのファイルを開いたままにするもの（#52）は、
+     * ここで開く。数の上限を超えたら `MFILE`（マシン）・`NFILE`（サーバー全体）。[tracksOpenFiles] のときだけ呼ばれる。
+     * [reserved] なら [reserveOpen] で取った枠を使う（成功しても失敗しても、その枠はこの呼び出しが引き受ける。要らなければ返す）
+     */
+    fun retain(node: Long, writable: Boolean, reserved: Boolean = false) {}
 
     /** [retain] した [node] を閉じた（最後の参照が外れた）。カーネルロックの外で呼ばれる（I/O をしてよい） */
     fun release(node: Long) {}

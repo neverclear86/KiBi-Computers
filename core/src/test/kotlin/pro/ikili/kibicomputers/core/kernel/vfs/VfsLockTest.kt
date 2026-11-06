@@ -114,7 +114,7 @@ class VfsLockTest {
             override val tracksOpenFiles: Boolean get() = true
             val opened = HashMap<Long, Int>()
 
-            override fun retain(node: Long, writable: Boolean) {
+            override fun retain(node: Long, writable: Boolean, reserved: Boolean) {
                 opened.merge(node, 1, Int::plus)
             }
 
