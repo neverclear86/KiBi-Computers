@@ -21,6 +21,7 @@
 | `os/lib/kibi/` | 共通ライブラリ（`kibi.zig` が根） | 各プログラムに `--dep kibi -Mkibi=...` で渡す |
 | `os/bin/<名前>.zig` | コマンド | イメージの `/bin/<名前>` |
 | `os/sbin/<名前>.zig` | 管理用のコマンド・init（#100） | イメージの `/sbin/<名前>` |
+| `os/etc/` | 設定ファイル（`inittab` など。#100） | イメージの `/etc/` にそのまま |
 | `os/test/<名前>.zig` | ライブラリを確かめるプログラム | core のテストのリソース `/kibicomputers/wasm/os-<名前>.wasm` |
 
 今入れたコマンドは、パイプラインを確かめるための `echo`・`true`・`false` だけ。ほかの基本コマンドは #103。
