@@ -1,12 +1,7 @@
 // #32 の追加調査: shell_blit の、バイトを1つずつ見るループを、標準ライブラリの道具にしたもの。
 // 改行は ArrayView::search で探し、空白で区切るのはビュー（`buf[from:to]`）の for-in で回す。
 //
-// #32 の追加調査: shell と同じ振る舞いを、標準ライブラリの普通の書き方で確保と写しを減らしたもの。
-//
-// - 語の範囲はタプルの Array ではなく、開始・終わりの FixedArray[Int] に入れる（語ごとの確保をなくす）
-// - 1行はタプルの Option で返さず、LineReader のフィールドに置く
-// - バイトの写し（行の詰め直し・語の写し）は FixedArray::blit_to にする
-// - 添字は普通の `buf[i]`（範囲検査あり）のまま
+// 写しは FixedArray::blit_to、語の範囲は FixedArray[Int]（shell_blit と同じ）
 
 ///|
 struct LineReader {

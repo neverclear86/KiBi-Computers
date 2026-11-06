@@ -190,7 +190,7 @@ internal object Profiler {
     private fun pct(n: Long, of: Long): String = if (of == 0L) "-" else "%.1f%%".format(n * 100.0 / of)
 
     /** 関数ごとの表（上位 [top] 個） */
-    fun table(p: Profile, top: Int = 15): String = buildString {
+    fun table(p: Profile, top: Int = 25): String = buildString {
         appendLine("### ${p.label}（燃料 ${fmt(p.fuel)}。うち start 関数 ${fmt(p.startFuel)}）")
         appendLine()
         appendLine("| 関数 | 自分 | 割合 | 呼んだ先を含む | 呼ばれた回数 | 1 回あたり |")
