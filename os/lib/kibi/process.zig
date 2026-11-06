@@ -7,8 +7,8 @@ const io = @import("io.zig");
 
 pub const Error = errno.Error;
 
-/// 引数と環境変数を読み込む領域の大きさ（バイト）。入りきらなければ `TOOBIG`
-pub const ARGS_BUF_SIZE = 16 * 1024;
+/// 引数と環境変数を読み込む領域の大きさ（バイト。カーネルの上限 64 KiB に合わせる。ADR 0045）。入りきらなければ `TOOBIG`
+pub const ARGS_BUF_SIZE = 64 * 1024;
 /// 引数と環境変数の数の上限
 pub const MAX_ARGS = 256;
 
@@ -173,7 +173,7 @@ pub const MAX_SPAWN_FDS = 32;
 const ROOT_FD: u32 = 3;
 
 /// 引数を [String] に写す領域の大きさ
-pub const MAX_SPAWN_ARGS = 64;
+pub const MAX_SPAWN_ARGS = 256;
 
 /// 子のプロセス（ハンドルはカーネルの fd 番号）
 pub const Child = struct {

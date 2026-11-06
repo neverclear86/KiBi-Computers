@@ -28,7 +28,7 @@ shell PATH [ARGS...]  コンソールのシェル（1 つだけ）。前景で�
 - 分からない種類・形の違う `env`・2 つ目の `shell`・上限超えは、`init: /etc/inittab:<行>: <理由>` を書いて、その行だけ飛ばす
 - inittab がなければ（`NOENT`）`shell /bin/sh` だけの既定で動く。読めない・大きすぎる（8 KiB 超）ときは `init: /etc/inittab: <errno>; using the default` を書いて既定で動く（直すためのシェルが起こせるように）
 - inittab があって `shell` の行がなければ、シェルは起こさない（後ろの常駐プログラムだけのマシン）
-- 上限（仮の値）: 項目 32、全部の語 512、環境変数 32、1 項目の引数 64（`process.MAX_SPAWN_ARGS`）
+- 上限（仮の値）: 項目 32、全部の語 512、環境変数 32、1 項目の引数 256（`process.MAX_SPAWN_ARGS`。#101 で 64 から上げた）
 
 ## 子の起こし方
 
@@ -52,7 +52,7 @@ shell PATH [ARGS...]  コンソールのシェル（1 つだけ）。前景で�
 
 ## 今の制限
 
-- `/bin/sh` はまだない（#101）。今の同梱イメージ `os` で起動すると、`init: cannot start /bin/sh: NOENT` → `init: nothing left to run` で止まる
+- `/bin/sh` は #101 で入った（ADR 0101）
 - 停止・再起動のコマンド（#306）、ランレベル・サービスの依存順・ログのファイルは置かない（必要になったら足す）
 - 環境変数 `TERM` は既定で渡さない（端末の名前は docs/terminal.md。使うプログラムができたら inittab の既定に足す）
 

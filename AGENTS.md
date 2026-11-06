@@ -20,7 +20,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `core/` | Minecraft 非依存のコア（WASMランタイム、カーネル、VFS、状態保存など）。Java 17 ターゲット |
 | `platform-neoforge-1.21.1/` | 1.21.1 / NeoForge の接続層（ブロック、GUI、ネットワークなど）。Java 21 |
 | `platform-forge-1.20.1/` | 1.20.1 / Forge の接続層。Java 17。ModDevGradle の Legacy Forge プラグイン、KFF 4.x |
-| `os/` | 標準 OS のソース（Zig。#98、ADR 0098）。`lib/kibi/` が共通ライブラリ、`bin/`・`sbin/` の `.zig` が1つずつコマンドになる。`core` のビルドが同梱イメージ `os.zip`（`image:os`）にまとめる |
+| `os/` | 標準 OS のソース（Zig。#98、ADR 0098）。`lib/kibi/` が共通ライブラリ、`bin/`・`sbin/` の `.zig` が1つずつコマンドになる（大きなものは同じ名前のディレクトリにソースを分ける。例: `bin/sh/`）。`core` のビルドが同梱イメージ `os.zip`（`image:os`）にまとめる |
 | `dev-driver/` | 開発クライアントを外から操作する HTTP の口（MC 非依存の部分）。各接続層の `src/dev/` が MC 側の操作を実装する。開発環境でだけ読み込み、jar には入れない |
 | `build-logic/` | ビルド用の Gradle プラグイン（included build）。`kibicomputers.wasm` は C を `zig cc` で WASM にビルドし、ソースセットのリソースに入れる |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
