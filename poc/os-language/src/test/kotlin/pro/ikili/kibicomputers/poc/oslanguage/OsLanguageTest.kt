@@ -86,6 +86,21 @@ class OsLanguageTest {
     }
 
     @Test
+    fun `関数ごとの内訳の合計は、計測コードで測った燃料と同じ`() {
+        val runtime = EndiveRuntime()
+        // shell は MoonBit だと命令が多く遅いので、ほかのシナリオで確かめる
+        for (s in Bench.scenarios.filter { it.program != "shell" }) {
+            for (l in languages()) {
+                val bytes = wasm(s.program, l)!!
+                val metered = MiniWasi(s.args, s.stdin, s.files).run(MiniWasi.load(runtime, bytes))
+                val profiled = Profiler.profile(l.label, bytes, s)
+                assertEquals(metered.fuel, profiled.fuel, "${l.label} ${s.label}")
+                assertEquals(String(metered.stdout), String(profiled.stdout), "${l.label} ${s.label}")
+            }
+        }
+    }
+
+    @Test
     fun `測定の表を出す`() {
         assumeTrue(availableLanguages().isNotEmpty())
         println(Bench.run(rounds = 3, languages = languages()))

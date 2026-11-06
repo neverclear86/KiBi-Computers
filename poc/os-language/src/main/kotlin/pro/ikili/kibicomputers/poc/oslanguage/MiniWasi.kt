@@ -31,7 +31,7 @@ internal class MiniWasi(
     /** モジュールの import のうち、このホストが出していないもの（呼ばれると失敗する） */
     val missingImports = mutableListOf<String>()
 
-    private class Exit(val code: Int) : RuntimeException(null, null, false, false)
+    internal class Exit(val code: Int) : RuntimeException(null, null, false, false)
 
     private sealed interface Fd
     private class FileFd(val data: ByteArray, var pos: Int = 0) : Fd
@@ -81,7 +81,7 @@ internal class MiniWasi(
 
     private fun err(errno: Int): LongArray = longArrayOf(errno.toLong())
 
-    private fun function(module: String, name: String): WasmHostFunction? = when ("$module.$name") {
+    internal fun function(module: String, name: String): WasmHostFunction? = when ("$module.$name") {
         "wasi_snapshot_preview1.fd_write" -> WasmHostFunction { inst, a ->
             val m = mem(inst)
             val out = when (a[0].toInt()) {
