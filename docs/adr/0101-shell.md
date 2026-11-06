@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #101（task）。前提: ADR 0098（標準 OS のビルドと `kibi` ライブラリ）、0100（`/sbin/init`）、0074（`kibi:process`）、0075（パイプ・dup）、0427（`kibi:io/tty`）
-- 後続: #102（行編集・補完・履歴）、#103（基本コマンド）
+- 後続: #102（行編集・補完・履歴。ADR 0102）、#103（基本コマンド）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -68,7 +68,7 @@ sh [-eufxvC] [-s] [-i] [引数...]       # 標準入力から読む
 ## 組み込み
 
 特別な組み込み（代入が残り、関数より先）: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local`。
-ほか: `true` `false` `echo`（`-n`）`printf`（`%s %b %c %d %i %u %o %x %X %%`、フラグ・幅・精度、書式の繰り返し）`cd`（`-`・`HOME`・`PWD`・`OLDPWD`）`pwd` `read`（`-r`）`test`/`[` `wait` `command`（`-v`・`-V`）`type` `source`。
+ほか: `history`（#102。ADR 0102） `true` `false` `echo`（`-n`）`printf`（`%s %b %c %d %i %u %o %x %X %%`、フラグ・幅・精度、書式の繰り返し）`cd`（`-`・`HOME`・`PWD`・`OLDPWD`）`pwd` `read`（`-r`）`test`/`[` `wait` `command`（`-v`・`-V`）`type` `source`。
 
 - `exec cmd` は置き換えられないので、動かしてその終了コードで終わる。`exec` だけならリダイレクトをシェルに残す
 - `test -r/-w/-x` は、持ち主・権限がまだない（#110）ので、あれば真

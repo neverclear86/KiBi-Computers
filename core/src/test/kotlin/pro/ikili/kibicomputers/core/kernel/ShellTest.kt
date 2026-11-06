@@ -399,8 +399,8 @@ class ShellTest {
     fun `TTYからは会話的に読み、プロンプトを出す`() {
         val r = run(emptyList(), input = listOf("echo hi", "if true", "then echo multi", "fi", "exit 7"))
         assertEquals(7, r.exitCode)
-        // 入力のエコーとプロンプト（$ と >）、出力
-        val text = r.console
+        // 入力のエコーとプロンプト（$ と >）、出力。行の編集（#102）がプロンプトの前に書く空白と制御は除いて見る
+        val text = r.console.replace(Regex(" *\r\u001b\\[K\r\u001b\\[J"), "")
         assertTrue(text.contains("$ echo hi\nhi\n"), text)
         assertTrue(text.contains("> then echo multi\n> fi\nmulti\n"), text)
     }

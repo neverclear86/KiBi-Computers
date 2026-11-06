@@ -12,6 +12,7 @@ const expand = @import("expand.zig");
 const vars = @import("vars.zig");
 const state = @import("state.zig");
 const builtins = @import("builtins.zig");
+const edit = @import("edit.zig");
 
 const io = kibi.io;
 const fs = kibi.fs;
@@ -1403,6 +1404,8 @@ pub const Reader = struct {
     len: usize = 0,
     eof: bool = false,
     prompt: bool,
+    /// 行の編集（#102）で読む（会話的で、標準入力と標準エラー出力が TTY）
+    edit: bool = false,
     name: []const u8,
     line: usize = 1,
 
@@ -1416,6 +1419,7 @@ pub const Reader = struct {
             self.len = rest;
         }
         if (self.len == self.buf.len) return false;
+        if (self.edit) return self.editLine();
         if (self.prompt) showPrompt(self.len > 0);
         const n = io.read(self.fd, self.buf[self.len..]) catch |e| {
             if (e == error.INTR or e == error.AGAIN) return true;
@@ -1425,6 +1429,26 @@ pub const Reader = struct {
         if (n == 0) self.eof = true;
         if (n > 0 and state.verbose) io.err(self.buf[self.len..][0..n]);
         self.len += n;
+        return true;
+    }
+
+    /// 行の編集で 1 行読む。Ctrl+C なら、読みかけのコマンドを捨てて `$?` を 130 にする
+    fn editLine(self: *Reader) Error!bool {
+        if (self.buf.len - self.len < 2) return false;
+        const m = mem.mark();
+        defer mem.release(m);
+        const p = promptText(self.len > 0);
+        switch (edit.readLine(p, self.buf[self.len..])) {
+            .line => |n| {
+                if (state.verbose) io.err(self.buf[self.len..][0..n]);
+                self.len += n;
+            },
+            .eof => self.eof = true,
+            .interrupt => {
+                self.len = self.start;
+                state.status = 130;
+            },
+        }
         return true;
     }
 
@@ -1505,7 +1529,11 @@ pub fn handleTopError(e: Error) void {
 fn showPrompt(continued: bool) void {
     const m = mem.mark();
     defer mem.release(m);
+    io.err(promptText(continued));
+}
+
+/// `PS1`・`PS2` を展開したもの（展開の領域に置く）
+fn promptText(continued: bool) []const u8 {
     const raw = if (continued) (vars.get("PS2") orelse "> ") else (vars.get("PS1") orelse "$ ");
-    const p = expand.string(raw) catch raw;
-    io.err(p);
+    return expand.string(raw) catch raw;
 }
