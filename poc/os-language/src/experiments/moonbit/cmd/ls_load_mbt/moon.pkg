@@ -1,0 +1,15 @@
+import {
+  "kibi/oslang/sys",
+}
+
+pkgtype(kind: "executable")
+
+// #32 の追加調査: ls_load と同じプログラムを、MoonBit で書いた TLSF のアロケーター（moonc link-core の -allocator tlsf-mbt）でリンクする
+options(
+  link: {
+    "wasm": {
+      "export-memory-name": "memory",
+      "flags": ["-allocator", "tlsf-mbt"],
+    },
+  },
+)

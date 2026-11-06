@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import run.endive.runtime.HostFunction
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
@@ -251,8 +252,11 @@ internal object Profiler {
         appendLine()
         File("build/bench/profile").mkdirs()
         val details = StringBuilder()
-        appendLine("| シナリオ | 版 | 燃料 | Zig 比 | うち start 関数 | 出力が Zig と同じ |")
-        appendLine("| --- | --- | ---: | ---: | ---: | --- |")
+        val runtime = EndiveRuntime()
+        appendLine("実行: 燃料の計測コードを入れて、ランタイムコンパイラ（SIMD の関数はインタプリタ）で動かした `_start` の時間（5 回の中央値。目安）")
+        appendLine()
+        appendLine("| シナリオ | 版 | 燃料 | Zig 比 | うち start 関数 | 出力が Zig と同じ | 実行 |")
+        appendLine("| --- | --- | ---: | ---: | ---: | --- | ---: |")
         for (program in targets) {
             for (scenario in Bench.scenarios.filter { it.program == program }) {
                 details.appendLine("## ${scenario.label}").appendLine()
@@ -261,13 +265,16 @@ internal object Profiler {
                     val p = try {
                         profile(label, bytes, scenario)
                     } catch (e: Exception) {
-                        appendLine("| ${scenario.label} | $label | 失敗: ${e.message?.take(80)} | | | |")
+                        appendLine("| ${scenario.label} | $label | 失敗: ${e.message?.take(80)} | | | | |")
                         continue
                     }
                     if (label == "Zig") zig = p
                     val ratio = zig?.let { "%.2f".format(p.fuel.toDouble() / it.fuel) } ?: "-"
                     val same = zig?.let { if (it.stdout.contentEquals(p.stdout)) "同じ" else "**違う**" } ?: "-"
-                    appendLine("| ${scenario.label} | $label | ${fmt(p.fuel)} | $ratio | ${fmt(p.startFuel)} | $same |")
+                    val module = MiniWasi.load(runtime, bytes)
+                    val times = (0..5).map { MiniWasi(scenario.args, scenario.stdin, scenario.files).run(module).runNanos }.drop(1).sorted()
+                    val ms = "%.2f ms".format(times[times.size / 2] / 1e6)
+                    appendLine("| ${scenario.label} | $label | ${fmt(p.fuel)} | $ratio | ${fmt(p.startFuel)} | $same | $ms |")
                     details.append(table(p))
                     if (listings) {
                         val file = "build/bench/profile/${scenario.label.substringBefore('（')}-${scenario.args.size}-${label.replace('+', '_')}.txt"
