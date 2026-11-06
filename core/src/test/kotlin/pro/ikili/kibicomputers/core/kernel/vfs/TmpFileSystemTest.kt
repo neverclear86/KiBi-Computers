@@ -214,4 +214,54 @@ class TmpFileSystemTest {
         assertEquals(1, fs.nodeCount)
         assertErrno(Errno.IO) { vfs.read(f, ByteArray(4), 0, 4) }
     }
+
+    @Test
+    fun `外した後の作成・書き込みはIOで、RAMを確保しない`() {
+        val (fs, account) = tmp()
+        val node = fs.file("/a", "data")
+        fs.createDirectory(p("/d"))
+        // 外す前に場所を見つけたスレッドが、外した後に届く（#432）
+        fs.onUnmounted()
+        assertEquals(0L, account.usedBytes)
+        assertErrno(Errno.IO) { fs.createFile(p("/b")) }
+        assertErrno(Errno.IO) { fs.createDirectory(p("/e")) }
+        assertErrno(Errno.IO) { fs.write(node, 0, ByteArray(10), 0, 10) }
+        assertErrno(Errno.IO) { fs.append(node, ByteArray(10), 0, 10) }
+        assertErrno(Errno.IO) { fs.setSize(node, 100_000) }
+        assertErrno(Errno.IO) { fs.rename(p("/a"), p("/c")) }
+        assertErrno(Errno.IO) { fs.stat(VfsPath.ROOT) }
+        assertErrno(Errno.IO) { fs.readDirectory(TmpFileSystem.ROOT_NODE) }
+        assertEquals(0L, fs.sizeHint(node))
+        assertEquals(0L, account.usedBytes, "外した後に RAM を確保していない")
+        assertEquals(0L, fs.usedBytes)
+    }
+
+    @Test
+    fun `外すのと作成が同時でも、RAMの勘定が残らない`() {
+        repeat(50) {
+            val (fs, account) = tmp(pages = 64)
+            val vfs = Vfs()
+            val mount = vfs.mount(p("/tmp"), fs, readOnly = false, source = "tmp")
+            val start = java.util.concurrent.CountDownLatch(1)
+            val writer = Thread {
+                start.await()
+                for (i in 0 until 200) {
+                    try {
+                        val f = vfs.open(p("/tmp/f$i"), OpenOptions(read = true, write = true, create = true))
+                        vfs.pwrite(f, 0, ByteArray(100), 0, 100)
+                        vfs.createDirectory(p("/tmp/d$i"))
+                    } catch (e: FsException) {
+                        // 外した後は IO（マウントがなければ ROFS・NOENT）
+                    }
+                }
+            }
+            writer.start()
+            start.countDown()
+            Thread.yield()
+            vfs.unmount(mount.id)
+            writer.join(10_000)
+            assertFalse(writer.isAlive)
+            assertEquals(0L, account.usedBytes, "外した後に確保した RAM が残っている")
+        }
+    }
 }

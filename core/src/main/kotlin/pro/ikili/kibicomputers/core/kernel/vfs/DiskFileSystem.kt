@@ -252,17 +252,36 @@ internal class DiskFileSystem private constructor(
 
     // ---- 開いたファイル ----
 
-    override fun retain(node: Long, writable: Boolean): Unit = io {
+    override fun reserveOpen() {
+        budget.acquire()
+    }
+
+    override fun cancelOpen() {
+        budget.release()
+    }
+
+    override fun retain(node: Long, writable: Boolean, reserved: Boolean) {
+        // 予約した枠で、まだ使っていないもの（最後に残っていれば返す）
+        var spare = reserved
+        try {
+            io { retainLocked(node, writable) { if (spare) spare = false else budget.acquire() } }
+        } finally {
+            if (spare) budget.release()
+        }
+    }
+
+    // [acquire] は、新しくホストのファイルを開くときに枠を1つ取る（予約した枠を使うか、新しく取る）
+    private inline fun retainLocked(node: Long, writable: Boolean, acquire: () -> Unit) {
         val info = info(node)
-        if (info.type != FileType.REGULAR_FILE) return@io
+        if (info.type != FileType.REGULAR_FILE) return
         val want = writable && !readOnly
         val h = handles[node]
         if (h != null && (h.writable || !want)) {
             refresh(node, info, h)
             h.refs++
-            return@io
+            return
         }
-        if (h == null) budget.acquire()
+        if (h == null) acquire()
         val (ch, identity) = try {
             openChannel(node, info, want)
         } catch (e: Throwable) {

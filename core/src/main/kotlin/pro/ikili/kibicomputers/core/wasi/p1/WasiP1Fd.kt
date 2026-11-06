@@ -136,15 +136,18 @@ internal class WasiP1Fd(private val ctx: ProcessContext, private val wait: P1Wai
         }
         val f = unlocked(fd) { _, obj -> file(obj) }
         if (f.isDirectory) return Errno.ISDIR.code
-        // 終わりの位置は、ロックの外で大きさを読む。位置を変えるのはロックの中
-        val end = if (w == Whence.END) ctx.vfs.size(f) else 0L
-        val pos = ctx.withKernelLock {
-            val base = when (w) {
-                Whence.SET -> 0L
-                Whence.CUR -> f.position
-                Whence.END -> end
+        // 終わりの位置は、ロックの外で大きさを読む。位置を変えるのはロックの中。
+        // 同じ開いたファイルの読み書き（FdIo）と重ならないように、その間は withPositionLock の中で行う（#431）
+        val pos = f.withPositionLock {
+            val end = if (w == Whence.END) ctx.vfs.size(f) else 0L
+            ctx.withKernelLock {
+                val base = when (w) {
+                    Whence.SET -> 0L
+                    Whence.CUR -> f.position
+                    Whence.END -> end
+                }
+                Vfs.seekTarget(base, offset).also { f.position = it }
             }
-            Vfs.seekTarget(base, offset).also { f.position = it }
         }
         memory.writeI64(newOffsetPtr, pos)
         return 0

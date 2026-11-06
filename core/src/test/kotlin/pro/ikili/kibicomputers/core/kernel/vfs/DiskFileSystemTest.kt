@@ -290,6 +290,38 @@ class DiskFileSystemTest {
     }
 
     @Test
+    fun `開いたファイルの上限でopenが失敗したら、作成も切り詰めもしない`() {
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = AtomicInteger())
+        val fs = disk(budget = budget)
+        fs.writeAll("/keep", "hello")
+        fs.writeAll("/held", "x")
+        val vfs = Vfs()
+        vfs.mount(VfsPath.ROOT, fs, readOnly = false, source = "disk")
+        val held = vfs.open(p("/held"), OpenOptions(read = true))
+        assertEquals(1, budget.inUse)
+        // 作る open（#434）: 枠がなければ、ファイルを作らない
+        errno(Errno.MFILE) { vfs.open(p("/new"), OpenOptions(read = true, write = true, create = true)) }
+        assertFalse(Files.exists(dir.resolve("disk").resolve("new")), "上限で失敗した open がファイルを作った")
+        // 切り詰める open: 枠がなければ、中身を変えない
+        errno(Errno.MFILE) { vfs.open(p("/keep"), OpenOptions(write = true, truncate = true)) }
+        assertEquals("hello", Files.readString(dir.resolve("disk").resolve("keep")))
+        assertEquals(1, budget.inUse, "失敗した open が枠を残した")
+        // 同じ node を分け合うなら、枠は要らない（予約した枠は返す）
+        val again = vfs.open(p("/held"), OpenOptions(read = true, write = true, truncate = true))
+        assertEquals(1, budget.inUse)
+        assertEquals(0, vfs.size(again))
+        vfs.close(again)
+        vfs.close(held)
+        assertEquals(0, budget.inUse)
+        // 枠が空けば作れる。O_EXCL で EXIST になっても枠は残さない
+        val created = vfs.open(p("/new"), OpenOptions(read = true, write = true, create = true))
+        assertEquals(1, budget.inUse)
+        vfs.close(created)
+        errno(Errno.EXIST) { vfs.open(p("/new"), OpenOptions(write = true, create = true, exclusive = true)) }
+        assertEquals(0, budget.inUse)
+    }
+
+    @Test
     fun `割り込まれたスレッドの操作はIOになり、ほかのスレッドは同じファイルを使い続けられる`() {
         val fs = disk()
         val node = fs.writeAll("/f", "hello")
