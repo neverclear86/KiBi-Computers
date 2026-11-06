@@ -239,6 +239,16 @@ class BasicCommandsTest {
               0   2  10 /tmp/s
              15  32 121 total
             3
+            head: /tmp/none: No such file or directory
+            ==> /tmp/u <==
+            u
+            ==> /tmp/u <==
+            u
+            tail: /tmp/none: No such file or directory
+
+            ==> /tmp/t <==
+            line 15
+            1
             """,
             """
             head -n 2 /tmp/t
@@ -252,8 +262,10 @@ class BasicCommandsTest {
             wc -l </tmp/t
             wc /tmp/t /tmp/s | tail -n 2
             cat /tmp/t | head -n 3 | wc -l
+            head -n 1 /tmp/none /tmp/u 2>&1
+            tail -n 1 /tmp/u /tmp/none /tmp/t 2>&1; echo ${'$'}?
             """,
-            mapOf("/tmp/t" to text, "/tmp/s" to "no newline"),
+            mapOf("/tmp/t" to text, "/tmp/s" to "no newline", "/tmp/u" to "u\n"),
         )
     }
 
@@ -334,6 +346,9 @@ class BasicCommandsTest {
             kill: 99999: No such process
             1
             kill: X: invalid signal
+            2
+            kill: bogus: invalid signal
+            2
             """,
             """
             kill -l
@@ -341,7 +356,8 @@ class BasicCommandsTest {
             sh -c 'while true; do :; done' & kill -9 ${'$'}!; wait ${'$'}!; echo ${'$'}?
             sh -c 'while true; do :; done' & kill -s sigint ${'$'}!; wait ${'$'}!; echo ${'$'}?
             kill 99999 2>&1; echo ${'$'}?
-            kill -X 1 2>&1
+            kill -X 1 2>&1; echo ${'$'}?
+            kill -s bogus 1 2>&1; echo ${'$'}?
             """,
         )
     }

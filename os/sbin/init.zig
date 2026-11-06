@@ -16,6 +16,7 @@
 //! shell /bin/sh arg...      # コンソールのシェル（1 つだけ）。終わったら起こし直す
 //! ```
 //!
+//! `env` はファイル全体を読んでから子を起こすので、書いた位置に関わらず全部の子に効く（同じ名前は後の行が勝つ）。
 //! inittab がない・読めないときは `shell /bin/sh` だけの既定で動く。inittab があって `shell` がなければ、シェルを起こさない。
 //! 動かす子も起こし直す予定もなくなったら、init は終わる（マシンが止まる）。
 const kibi = @import("kibi");
@@ -126,18 +127,39 @@ fn parse(text: []const u8) void {
         var it = Words{ .s = line };
         const first = it.next() orelse continue;
         if (first[0] == '#') continue;
+        // 項目の種類を、語を集める前に決める（知らない項目は語を数えない）。null は env の行
+        const kind: ?Kind = if (eql(first, "env"))
+            null
+        else if (eql(first, "run"))
+            .run
+        else if (eql(first, "daemon"))
+            .daemon
+        else if (eql(first, "respawn"))
+            .respawn
+        else if (eql(first, "shell"))
+            .shell
+        else {
+            warn(line_no, "unknown entry");
+            continue;
+        };
+        var overflow = false;
         while (it.next()) |w| {
             if (words_len == MAX_WORDS) {
-                warn(line_no, "too many words");
-                words_len = start_words;
+                overflow = true;
                 break;
             }
             words[words_len] = w;
             words_len += 1;
         }
+        if (overflow) {
+            // その行は捨てる（警告は 1 つだけ）
+            words_len = start_words;
+            warn(line_no, "too many words");
+            continue;
+        }
         const args = words[start_words..words_len];
 
-        if (eql(first, "env")) {
+        const entry_kind = kind orelse {
             words_len = start_words;
             if (args.len != 1) {
                 warn(line_no, "env takes one NAME=VALUE");
@@ -153,19 +175,6 @@ fn parse(text: []const u8) void {
             }
             if (!setEnv(args[0][0..eq], args[0][eq + 1 ..])) warn(line_no, "too many env entries");
             continue;
-        }
-        const kind: Kind = if (eql(first, "run"))
-            .run
-        else if (eql(first, "daemon"))
-            .daemon
-        else if (eql(first, "respawn"))
-            .respawn
-        else if (eql(first, "shell"))
-            .shell
-        else {
-            words_len = start_words;
-            warn(line_no, "unknown entry");
-            continue;
         };
         if (args.len == 0) {
             warn(line_no, "missing program");
@@ -176,7 +185,7 @@ fn parse(text: []const u8) void {
             warn(line_no, "too many arguments");
             continue;
         }
-        if (kind == .shell) {
+        if (entry_kind == .shell) {
             if (have_shell) {
                 words_len = start_words;
                 warn(line_no, "only one shell is allowed");
@@ -189,7 +198,7 @@ fn parse(text: []const u8) void {
             warn(line_no, "too many entries");
             continue;
         }
-        addEntry(kind, args);
+        addEntry(entry_kind, args);
     }
 }
 

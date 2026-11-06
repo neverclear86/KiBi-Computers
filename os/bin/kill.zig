@@ -79,7 +79,8 @@ fn eqlUpper(s: []const u8, upper: []const u8) bool {
     return true;
 }
 
+/// 知らないシグナルは使い方の誤り（ADR 0103 の終了コード 2）
 fn badSignal(s: []const u8) u8 {
     cli.warn(s, "invalid signal");
-    return 1;
+    return cli.USAGE;
 }

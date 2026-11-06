@@ -291,4 +291,47 @@ class ShellLineEditTest {
         assertTrue(t.contains("\nalpha.txt  alpine/    beta       my file\n"), t)
         assertTrue(s.text.contains("$ cat ../my\\ file \n"), t)
     }
+
+    @Test
+    fun `代入を含む語は等号の後ろを補い、代入の後はコマンドの位置になる`() {
+        val s = session(
+            listOf(
+                "FOO=/tmp/bet\t\r",
+                "echo \$FOO\r",
+                "echo if=/tmp/bet\t\r",
+                "FOO=bar ech\tdone\r",
+                "exit\r",
+            ),
+            files = mapOf("/tmp/beta" to "", "/tmp/alpha" to ""),
+        )
+        val t = s.text
+        for (line in listOf("/tmp/beta", "if=/tmp/beta", "done")) {
+            assertTrue(t.contains("\n$line\n"), "「$line」がない: $t")
+        }
+        assertTrue(t.contains("$ FOO=bar echo done\n"), t)
+    }
+
+    @Test
+    fun `候補の一覧では制御文字をキャレットで見せる`() {
+        val s = session(
+            listOf("echo /tmp/c\t\t\u0015exit\r"),
+            files = mapOf("/tmp/c\u001bx" to "", "/tmp/cy" to ""),
+        )
+        assertTrue(s.text.contains("\nc^[x  cy\n"), s.text)
+        assertTrue(!s.text.contains("c\u001bx"), s.text)
+    }
+
+    @Test
+    fun `プロンプトのOSCは幅に数えない`() {
+        val s = session(
+            listOf("echo abc$left${left}X"),
+            env = mapOf("PS1" to "\u001b]0;title\u0007$ "),
+            exit = false,
+            settled = { h -> h.rows().any { it == "$ echo aXbc" } },
+        )
+        val rows = s.host.rows()
+        val y = rows.indexOf("$ echo aXbc")
+        assertTrue(y >= 0, rows.joinToString("\n"))
+        assertEquals(9 to y, s.host.cursor(), rows.joinToString("\n"))
+    }
 }

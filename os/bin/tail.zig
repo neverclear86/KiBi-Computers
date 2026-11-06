@@ -45,14 +45,23 @@ pub fn main() u8 {
     const files = opts.rest();
     const names: []const []const u8 = if (files.len == 0) &.{"-"} else files;
     var status: u8 = 0;
-    for (names, 0..) |f, i| {
+    var shown: usize = 0;
+    for (names) |f| {
+        // 開いてから見出しを書く（開けなければ見出しなしでエラーだけ）
+        const fd = cli.openInput(f) catch |e| {
+            cli.warnErr(f, e);
+            status = 1;
+            continue;
+        };
+        defer cli.closeInput(fd);
         if (names.len > 1) {
-            if (i > 0) io.out("\n");
+            if (shown > 0) io.out("\n");
             io.out("==> ");
             io.out(if (cli.eql(f, "-")) "standard input" else f);
             io.out(" <==\n");
         }
-        tail(f, mode) catch |e| {
+        shown += 1;
+        tail(fd, mode) catch |e| {
             cli.warnErr(f, e);
             status = 1;
         };
@@ -66,9 +75,7 @@ fn parseCount(v: []const u8) ?Mode {
     return .{ .last = io.parseUnsigned(v) orelse return null };
 }
 
-fn tail(path: []const u8, mode: Mode) kibi.Error!void {
-    const fd = try cli.openInput(path);
-    defer cli.closeInput(fd);
+fn tail(fd: io.Fd, mode: Mode) kibi.Error!void {
     switch (mode) {
         .from => |n| try fromLine(fd, n),
         .last => |n| {
