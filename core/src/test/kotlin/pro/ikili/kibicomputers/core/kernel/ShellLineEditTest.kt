@@ -334,4 +334,31 @@ class ShellLineEditTest {
         assertTrue(y >= 0, rows.joinToString("\n"))
         assertEquals(9 to y, s.host.cursor(), rows.joinToString("\n"))
     }
+
+    @Test
+    fun `プロンプトのSTで終わるOSCとDCSなどの文字列と中間のある列は幅に数えない`() {
+        val esc = "\u001b"
+        val st = "$esc\\"
+        // ST で終わる OSC、DCS・SOS・PM・APC、ESC ( B
+        val ps1 = "$esc]0;title$st${esc}P1;2q$st${esc}Xsos$st$esc^pm$st${esc}_apc$st$esc(B$ "
+        val s = session(
+            listOf("echo abc$left${left}X"),
+            env = mapOf("PS1" to ps1),
+            exit = false,
+            settled = { h -> h.rows().any { it.endsWith("echo aXbc") } },
+        )
+        val rows = s.host.rows()
+        val y = rows.indexOfFirst { it.endsWith("echo aXbc") }
+        assertTrue(y >= 0, rows.joinToString("\n"))
+        // 描き直した後のカーソルは、見える幅（"$ echo aX" の 9）の位置
+        assertEquals(9 to y, s.host.cursor(), rows.joinToString("\n"))
+    }
+
+    @Test
+    fun `代入の値の変数を補う`() {
+        val s = session(listOf("FOO=\$HO\t\r", "echo \$FOO\r", "exit\r"))
+        val t = s.text
+        assertTrue(t.contains("$ FOO=\$HOME"), t)
+        assertTrue(t.contains("\n/home\n"), t)
+    }
 }

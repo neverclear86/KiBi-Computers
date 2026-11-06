@@ -60,13 +60,21 @@ class ShellTest {
     private fun root(m: Machine, files: Map<String, String>) {
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         for (d in listOf("/bin", "/tmp", "/home", "/home/sub")) m.vfs.createDirectory(VfsPath.parse(d))
-        for (name in listOf("sh", "echo", "true", "false")) m.put("/bin/$name", imageFile("/bin/$name"))
+        for (name in listOf("sh", "echo", "true", "false", "kill")) m.put("/bin/$name", imageFile("/bin/$name"))
         for (name in listOf("cat", "args", "envget", "exitwith", "errout", "hang")) m.put("/bin/$name", probe)
         for ((path, text) in files) m.put(path, text.toByteArray())
     }
 
-    /** `/bin/sh` を [args] で動かして終わるまで待つ。[input] はコンソールに打つ行（プロンプトが出るたびに 1 行） */
-    private fun run(args: List<String>, files: Map<String, String> = emptyMap(), input: List<String> = emptyList()): Result = timeout(limit) {
+    /**
+     * `/bin/sh` を [args] で動かして終わるまで待つ。[input] はコンソールに打つ行（プロンプトが出るたびに 1 行）。
+     * [after] は、シェルが終わった後に、同じマシンで確かめること
+     */
+    private fun run(
+        args: List<String>,
+        files: Map<String, String> = emptyMap(),
+        input: List<String> = emptyList(),
+        after: (Harness, Machine) -> Unit = { _, _ -> },
+    ): Result = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
@@ -88,6 +96,7 @@ class ShellTest {
             val exitCode = m.lock.withLockValue { m.kernel.processes[pid]!!.exitCode }
             assertEquals(ProcessState.EXITED, m.stateOf(pid), host.text())
             repeat(5) { h.scheduler.tick() }
+            after(h, m)
             Result(host.text(), exitCode)
         }
     }
@@ -446,6 +455,72 @@ class ShellTest {
     }
 
     @Test
+    fun `ドットで読むファイルが残る領域に入らなければ、知らせて1を返し、シェルは続く`() {
+        // 残る領域（512 KiB）に 128 KiB の変数を 3 つ置くと、上限（256 KiB）より小さい 200 KiB のファイルも入らない
+        val files = mapOf("/home/big" to "#".repeat(200 * 1024) + "\n")
+        assertOutput(
+            """
+            sh: .: /home/big: not enough memory to read the file
+            dot 1
+            again 0
+            """,
+            """
+            x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do x=${'$'}x${'$'}x; done
+            y=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do y=${'$'}y${'$'}y; done
+            z=${'$'}x
+            . /home/big; echo dot ${'$'}?
+            unset x y z; . /home/big; echo again ${'$'}?
+            """,
+            files,
+        )
+    }
+
+    @Test
+    fun `パイプラインの途中の組み込みは、大きい出力も切らずに渡す`() {
+        // 128 KiB の変数を、途中の段の echo・printf で流す（全部ためると、変数と合わせて残る領域に入らない）
+        assertOutput(
+            """
+            131073
+            131072
+            2
+            """,
+            """
+            x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do x=${'$'}x${'$'}x; done
+            echo "${'$'}x" | cat | cat >/tmp/o
+            printf %s "${'$'}x" | cat >/tmp/p
+            unset x
+            y=${'$'}(cat /tmp/o); echo ${'$'}((${'$'}{#y} + 1))
+            y=${'$'}(cat /tmp/p); echo ${'$'}{#y}
+            unset y; x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do x=${'$'}x${'$'}x; done
+            echo "${'$'}x" | exitwith 2; echo ${'$'}?
+            """,
+        )
+    }
+
+    @Test
+    fun `ヒアドキュメント付きの後ろのジョブも、killで本来のコマンドが止まる`() {
+        // パイプ（4 KiB）に入りきるものと、入りきらないもの。書くだけの子のシェルは % や \ を解かずに渡す
+        val big = (1..100).joinToString("\n") { i -> "line $i % \\ ".padEnd(99, 'x') }
+        val script = "hang <<EOF &\nsmall\nEOF\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo small ${'$'}?\n" +
+            "hang <<EOF &\n$big\nEOF\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo big ${'$'}?\n" +
+            "cat <<'EOF' >/tmp/q &\n$big\nEOF\n" +
+            "wait; a=${'$'}(cat /tmp/q); b=${'$'}(cat <<'EOF'\n$big\nEOF\n); [ \"${'$'}a\" = \"${'$'}b\" ] && echo same\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script)) { h, m ->
+            // 止めた hang も、書くだけの子のシェルも残らない
+            fun live() = m.lock.withLockValue { m.kernel.processes.all().filter { !it.state.isTerminal }.map { it.pid } }
+            eventuallyDescribe(30_000, { "残っている: ${live()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                live().isEmpty()
+            }
+        }
+        assertEquals("small 143\nbig 143\nsame\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `会話的なシェルでは、シェルの中で動かす段があってもCtrl+Cが届く`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
@@ -458,6 +533,9 @@ class ShellTest {
                 // echo の出力はパイプより大きく、hang は読まない
                 "echo \"${'$'}x\" | hang" to true,
                 "echo after ${'$'}?" to false,
+                // ためる上限（64 KiB）より大きく、空きを待つ間に Ctrl+C を受ける
+                "y=${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x; echo \"${'$'}y\" | hang" to true,
+                "echo big ${'$'}?" to false,
                 // 最後の段がシェルの中で動く
                 "hang | echo last" to true,
                 "echo second ${'$'}?" to false,
@@ -489,6 +567,7 @@ class ShellTest {
             }
             val text = host.text()
             assertTrue(text.contains("after 130\n"), text)
+            assertTrue(text.contains("big 130\n"), text)
             assertTrue(text.contains("last\n"), text)
             assertTrue(text.contains("second 0\n"), text)
         }
