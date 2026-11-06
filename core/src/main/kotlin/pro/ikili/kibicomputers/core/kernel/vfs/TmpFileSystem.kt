@@ -13,7 +13,9 @@ import java.util.TreeMap
  * - node は 1（根）から順に割り当て、使い回さない。名前を変えても変わらない
  * - 消したファイルは、すぐに中身を返す。開いたままでも、その後の操作は `STALE`
  *   （FS には開く・閉じるが伝わらないので、最後に閉じる時を待てない。ADR 0051）
- * - 外したら（[onUnmounted]）中身をすべて捨て、RAM を返す
+ * - 外したら（[onUnmounted]）中身をすべて捨て、RAM を返す。その後の操作はすべて `IO`（[revoked]。#432）
+ *   VFS をカーネルロックの外で使うので、外す前にマウントを見つけたスレッドが、外した後に作る・書くことがある。
+ *   そのときに RAM を確保すると、返す時がないので、断る
  * - 時刻は [clock]（エポックからのナノ秒）。読んだ時刻（atime）は、作った時と [setTimes] だけで変える（読むたびには変えない）
  * - 保存（#82）までは実行時だけ
  *
@@ -48,6 +50,9 @@ internal class TmpFileSystem(
     private var nextNode = ROOT_NODE
     private val nodes = HashMap<Long, Node>()
     private val root = Node(nextNode++, FileType.DIRECTORY, clock()).also { nodes[it.id] = it }
+
+    /** 外した（[onUnmounted]）。この後の操作は `IO`（[sizeHint] は 0） */
+    private var revoked = false
 
     /** このファイルシステムが RAM から確保しているバイト数 */
     @Volatile
@@ -187,7 +192,7 @@ internal class TmpFileSystem(
     }
 
     @Synchronized
-    override fun sizeHint(node: Long): Long = nodes[node]?.takeIf { it.type == FileType.REGULAR_FILE }?.size ?: 0
+    override fun sizeHint(node: Long): Long = if (revoked) 0 else nodes[node]?.takeIf { it.type == FileType.REGULAR_FILE }?.size ?: 0
 
     @Synchronized
     override fun setSize(node: Long, size: Long) {
@@ -222,9 +227,10 @@ internal class TmpFileSystem(
         n.changedNanos = clock()
     }
 
-    /** 中身をすべて捨て、RAM を返す（根だけの空のファイルシステムに戻る。node は使い回さない） */
+    /** 中身をすべて捨て、RAM を返す。この後の操作は `IO`（外す前に場所を見つけたスレッドが、RAM を確保したまま残さないように。#432） */
     @Synchronized
     override fun onUnmounted() {
+        revoked = true
         nodes.clear()
         root.children!!.clear()
         nodes[root.id] = root
@@ -233,7 +239,15 @@ internal class TmpFileSystem(
 
     // ---- 中身 ----
 
-    private fun node(id: Long): Node = nodes[id] ?: fsError(Errno.STALE)
+    private fun node(id: Long): Node {
+        live()
+        return nodes[id] ?: fsError(Errno.STALE)
+    }
+
+    /** 外した後なら `IO` */
+    private fun live() {
+        if (revoked) fsError(Errno.IO, "/tmp はもう外した")
+    }
 
     private fun file(id: Long): Node {
         val n = node(id)
@@ -242,6 +256,7 @@ internal class TmpFileSystem(
     }
 
     private fun find(path: VfsPath): Node {
+        live()
         var cur = root
         for (name in path.segments) {
             val children = cur.children ?: fsError(Errno.NOTDIR)

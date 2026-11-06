@@ -57,28 +57,30 @@ internal sealed interface FdReadiness {
 internal object FdIo {
     /**
      * 待たずに読む（カーネルロックは自分で取る）。ファイル（[OpenFile]）は、ロックの中で位置を読み、ロックの外で読んで、
-     * ロックの中で位置を進める（ファイルシステムの I/O をロックの外で行うため。#52。ADR 0052）
+     * ロックの中で位置を進める（ファイルシステムの I/O をロックの外で行うため。#52。ADR 0052）。
+     * その間は [OpenFile.withPositionLock] の中で行い、同じ開いたファイルへのほかの読み書きと重ならないようにする（#431）
      */
     fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
         var file: OpenFile? = null
-        var position = 0L
         val r = ctx.withKernelLock {
             val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.READ)
             if (f == null) return@withKernelLock readLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, dst, off, len)
             file = f
-            position = f.position
             null
         }
         if (r != null) return r
         val f = file!!
-        val n = try {
-            ctx.vfs.pread(f, position, dst, off, len)
-        } catch (e: FsException) {
-            return IoResult.Error(e.errno)
+        return f.withPositionLock {
+            val position = ctx.withKernelLock { f.position }
+            val n = try {
+                ctx.vfs.pread(f, position, dst, off, len)
+            } catch (e: FsException) {
+                return@withPositionLock IoResult.Error(e.errno)
+            }
+            ctx.withKernelLock { f.position = position + n }
+            if (n == 0 && len > 0) IoResult.Eof else IoResult.Bytes(n)
         }
-        ctx.withKernelLock { f.position = position + n }
-        return if (n == 0 && len > 0) IoResult.Eof else IoResult.Bytes(n)
     }
 
     /** [fd] が読み・書きの権利 [right] を持つファイル（[OpenFile]）を指していれば、それ（カーネルロックの中）。ほかは `null` */
@@ -89,19 +91,23 @@ internal object FdIo {
         return kernel.objects[entry.objectId] as? OpenFile
     }
 
-    // ファイルへの書き込み（カーネルロックの外。位置はロックの中で読み書きする）
-    private fun writeFile(ctx: ProcessContext, file: OpenFile, position: Long, src: ByteArray, off: Int, len: Int): IoResult = try {
-        if (file.append) {
-            val w = ctx.vfs.append(file, src, off, len)
-            ctx.withKernelLock { file.position = w.position + w.count }
-            IoResult.Bytes(w.count)
-        } else {
-            val n = ctx.vfs.pwrite(file, position, src, off, len)
-            ctx.withKernelLock { file.position = position + n }
-            IoResult.Bytes(n)
+    // ファイルへの書き込み（カーネルロックの外。位置はロックの中で読み書きする）。[OpenFile.withPositionLock] で、同じ開いたファイルへの
+    // ほかの読み書きと重ならないようにする（位置を読んでから進めるまでに割り込まれると、互いのバイトを上書きする。#431）
+    private fun writeFile(ctx: ProcessContext, file: OpenFile, src: ByteArray, off: Int, len: Int): IoResult = file.withPositionLock {
+        try {
+            if (file.append) {
+                val w = ctx.vfs.append(file, src, off, len)
+                ctx.withKernelLock { file.position = w.position + w.count }
+                IoResult.Bytes(w.count)
+            } else {
+                val position = ctx.withKernelLock { file.position }
+                val n = ctx.vfs.pwrite(file, position, src, off, len)
+                ctx.withKernelLock { file.position = position + n }
+                IoResult.Bytes(n)
+            }
+        } catch (e: FsException) {
+            IoResult.Error(e.errno)
         }
-    } catch (e: FsException) {
-        IoResult.Error(e.errno)
     }
 
     /**
@@ -113,12 +119,10 @@ internal object FdIo {
         if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         var flush = false
         var file: OpenFile? = null
-        var position = 0L
         val r = ctx.withKernelLock {
             val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.WRITE)
             if (f != null) {
                 file = f
-                position = f.position
                 return@withKernelLock null
             }
             val console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
@@ -129,7 +133,7 @@ internal object FdIo {
             }
             written
         }
-        if (r == null) return writeFile(ctx, file!!, position, src, off, len)
+        if (r == null) return writeFile(ctx, file!!, src, off, len)
         if (flush) ctx.flushConsole()
         return r
     }

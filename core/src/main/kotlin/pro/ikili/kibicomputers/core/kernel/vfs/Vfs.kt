@@ -130,7 +130,10 @@ internal class Vfs(
      * [trailingSlash] は、パスが `/` で終わっていたか（終わっていればディレクトリでなければならない）。
      *
      * 確かめてから変えるまでの間に、同じマシンのほかのスレッドが変えることがある。`O_CREAT`（`O_EXCL` なし）で作ろうとして
-     * `EXIST` になったとき（ほかのスレッドが先に作った）と、`O_TRUNC` で `STALE` になったとき（間に置き換えられた）は、引き直す
+     * `EXIST` になったとき（ほかのスレッドが先に作った）と、開く・`O_TRUNC` で `STALE` になったとき（間に置き換えられた）は、引き直す。
+     *
+     * 開いたファイルの数の上限（`MFILE`・`NFILE`。[FileSystem.retain]）で失敗するときは、ファイルを作らず、切り詰めもしない（#434）。
+     * 作る前に枠を取り（[FileSystem.reserveOpen]）、あるファイルは開いたことを知らせてから切り詰める
      */
     fun open(path: VfsPath, options: OpenOptions, trailingSlash: Boolean = false): OpenFile {
         if (options.create && options.directory) fsError(Errno.INVAL, "O_CREAT と O_DIRECTORY は一緒に使えない")
@@ -152,15 +155,23 @@ internal class Vfs(
             if (options.directory || trailingSlash) fsError(Errno.NOTDIR, "$path はディレクトリではない")
             val loc = locate(path) ?: fsError(Errno.IO, "$path のマウントがない")
             if (options.write && loc.readOnly) fsError(Errno.ROFS)
+            // 先に開いたことを知らせ（上限なら、切り詰める前に失敗する。#434）、それから切り詰める
+            val file = try {
+                opened(loc, existing.node, existing.type, path, options, reserved = false)
+            } catch (e: FsException) {
+                if (e.errno != Errno.STALE || lastTry) throw e
+                return null
+            }
             if (options.truncate) {
                 try {
                     loc.fs.setSize(existing.node, 0)
                 } catch (e: FsException) {
+                    close(file)
                     if (e.errno != Errno.STALE || lastTry) throw e
                     return null
                 }
             }
-            return opened(loc, existing.node, existing.type, path, options)
+            return file
         }
         if (!options.create) fsError(Errno.NOENT, "$path はない")
         if (trailingSlash) fsError(Errno.ISDIR, "/ で終わるパスに普通のファイルは作れない")
@@ -169,21 +180,34 @@ internal class Vfs(
         val loc = locate(path)
         if (loc == null || parent.device == 0L) fsError(Errno.ROFS, "マウントの祖先のディレクトリには作れない")
         if (loc.readOnly) fsError(Errno.ROFS)
+        // 開いたままにする枠を、作る前に取る（上限なら、何も作らずに失敗する。#434）
+        val reserved = loc.fs.tracksOpenFiles
+        if (reserved) loc.fs.reserveOpen()
         val node = try {
             loc.fs.createFile(loc.relative)
         } catch (e: FsException) {
+            if (reserved) loc.fs.cancelOpen()
             // ほかのスレッドが先に作った。O_EXCL でなければ、あるものを開き直す
             if (e.errno != Errno.EXIST || options.exclusive || lastTry) throw e
             return null
+        } catch (e: Throwable) {
+            if (reserved) loc.fs.cancelOpen()
+            throw e
         }
-        return opened(loc, node, FileType.REGULAR_FILE, path, options)
+        return opened(loc, node, FileType.REGULAR_FILE, path, options, reserved)
     }
 
-    private fun opened(loc: Location, node: Long, type: FileType, path: VfsPath, options: OpenOptions): OpenFile {
+    /**
+     * 開いたファイルを作り、ファイルシステムに開いたことを知らせる（[FileSystem.retain]）。
+     * [reserved] なら [FileSystem.reserveOpen] で取った枠を使う（成功しても失敗しても、その枠は retain が引き受ける）
+     */
+    private fun opened(loc: Location, node: Long, type: FileType, path: VfsPath, options: OpenOptions, reserved: Boolean): OpenFile {
         val file = OpenFile(loc.mount.id, node, type, path, options.read, options.write, options.append)
         if (loc.fs.tracksOpenFiles && type == FileType.REGULAR_FILE) {
-            loc.fs.retain(node, options.write)
+            loc.fs.retain(node, options.write, reserved)
             file.retained = true
+        } else if (reserved) {
+            loc.fs.cancelOpen()
         }
         return file
     }
