@@ -152,6 +152,12 @@ kibiWasm {
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:io/tty（#427）の p1 の import を確かめる CLI
+    module("kibi-tty-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_tty.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

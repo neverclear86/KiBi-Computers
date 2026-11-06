@@ -149,6 +149,33 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_io_ttyは型が一致するときだけ通り、版違い・表にない関数は断る`() {
+        val isTty = Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32) to listOf(I32))
+        val getMode = Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32, I32) to emptyList<Int>())
+        val setMode = Triple(WasiP1Kibi.IO_TTY, "set-mode", listOf(I32, I32, I32) to emptyList<Int>())
+        val getSize = Triple(WasiP1Kibi.IO_TTY, "get-size", listOf(I32, I32) to emptyList<Int>())
+        val getFg = Triple(WasiP1Kibi.IO_TTY, "get-foreground", listOf(I32, I32) to emptyList<Int>())
+        val setFg = Triple(WasiP1Kibi.IO_TTY, "set-foreground", listOf(I32, I32, I32) to emptyList<Int>())
+        val all = listOf(isTty, getMode, setMode, getSize, getFg, setFg)
+        // cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(*all.toTypedArray()))) }
+        for (fn in all) assertEquals(false, WasiP1Kibi.needsRealloc(fn.first, fn.second), fn.second)
+        // 型が違う
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "set-mode", listOf(I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-size", listOf(I32, I32, I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "get-foreground", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "set-foreground", listOf(I32, I32) to emptyList()))), "型が違う")
+        // 版が違う
+        assertNoexec(load(command(Triple("kibi:io/tty@0.2.0", "is-tty", listOf(I32) to listOf(I32)))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:io/tty", "is-tty", listOf(I32) to listOf(I32)))), "版が違う")
+        // 表にない関数
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple(WasiP1Kibi.IO_TTY, "isatty", listOf(I32) to listOf(I32)))), "許可していない")
+    }
+
+    @Test
     fun `kibi_kernel_timersとkibi_computer_clockは型が一致するときだけ通り、版違い・表にない関数・p2とp3のinterfaceは断る`() {
         val I64 = 0x7e
         val create = Triple(WasiP1Kibi.TIMERS, "[static]timer.create", listOf(I32, I32, I64, I32) to emptyList<Int>())

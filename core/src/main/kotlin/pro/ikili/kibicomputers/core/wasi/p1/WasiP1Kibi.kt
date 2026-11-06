@@ -19,9 +19,10 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiIo
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTimers
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
 
 /**
- * 独自拡張（`kibi:*` の WIT。`core/src/main/wit/`）を p1 のプロセスに import として出す層（#408・#73・#75・#426。ADR 0073・0075・0426）。
+ * 独自拡張（`kibi:*` の WIT。`core/src/main/wit/`）を p1 のプロセスに import として出す層（#408・#73・#75・#426・#427。ADR 0073・0075・0426・0427）。
  *
  * import は WIT から Canonical ABI の core の形そのままに導く（Q2-B）: モジュール名は `<ns>:<pkg>/<interface>@<版>`、
  * 関数名は wit-bindgen と同じ（`[static]`・`[method]`・`[resource-drop]`）。可変長の結果はゲストの `cabi_realloc` で場所を取る。
@@ -45,9 +46,16 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTimers
  * | [IO_FD] | `dup` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_FD] | `dup-to` | `(fd, to, ret_ptr: i32) -> ()` |
  * | [IO_PIPE] | `create` | `(ret_ptr: i32) -> ()` |
+ * | [IO_TTY] | `is-tty` | `(fd: i32) -> i32` |
+ * | [IO_TTY] | `get-mode` | `(fd, ret_ptr: i32) -> ()` |
+ * | [IO_TTY] | `set-mode` | `(fd, mode, ret_ptr: i32) -> ()` |
+ * | [IO_TTY] | `get-size` | `(fd, ret_ptr: i32) -> ()` |
+ * | [IO_TTY] | `get-foreground` | `(fd, ret_ptr: i32) -> ()` |
+ * | [IO_TTY] | `set-foreground` | `(fd, pid, ret_ptr: i32) -> ()` |
  *
  * p2・p3 だけの interface（`kibi:io` の `pipe-streams`・`pipe-async`、`kibi:kernel` の `timers-poll`・`events-poll`・
  * `timers-async`・`events-async`）は出さない（表にないので、import すると `NOEXEC`）。
+ * `kibi:io/tty` の `mode`（`flags`）は下位 5 ビットだけを読む（上のビットは捨てる。Canonical ABI の lift と同じ）。
  * `u64` の時間の引数（`set-after`・`set-at`）は、2^63 以上を `Long.MAX_VALUE` に頭打ちにしてカーネルへ渡す（ADR 0426）。
  *
  * どれも待たないので、待機点への変換で止まりうる関数（[WasiP1.WAIT_IMPORTS]）には入れない。
@@ -71,6 +79,12 @@ internal object WasiP1Kibi {
 
     /** `kibi:io/pipe` のモジュール名 */
     const val IO_PIPE: String = "kibi:io/pipe@0.1.0"
+
+    /** `kibi:io/tty` のモジュール名 */
+    const val IO_TTY: String = "kibi:io/tty@0.1.0"
+
+    /** `kibi:io/tty` の `flags mode` のフラグの数 */
+    private const val TTY_MODE_FLAGS = 5
 
     /** 独自拡張のモジュール名の始まり（これで始まるモジュールは [typeOf] の表で確かめる） */
     const val PREFIX: String = "kibi:"
@@ -234,6 +248,64 @@ internal object WasiP1Kibi {
                 return@Fn NONE
             }
             P1Canonical.lowerPipeResult(memory, a[0].i(), ends, 0)
+            NONE
+        },
+        Fn(IO_TTY, "is-tty", WasmFunctionType.of(listOf(I32), listOf(I32)), false) { ctx, _, a ->
+            longArrayOf(if (KibiTty.isTty(ctx, a[0].u32())) 1L else 0L)
+        },
+        Fn(IO_TTY, "get-mode", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val bits = try {
+                KibiTty.mode(ctx, a[0].u32())
+            } catch (e: FsException) {
+                P1Canonical.lowerU8Result(memory, a[1].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerU8Result(memory, a[1].i(), bits, 0)
+            NONE
+        },
+        Fn(IO_TTY, "set-mode", WasmFunctionType.of(listOf(I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                KibiTty.setMode(ctx, a[0].u32(), P1Canonical.liftFlags(a[1].i(), TTY_MODE_FLAGS))
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[2].i(), error)
+            NONE
+        },
+        Fn(IO_TTY, "get-size", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val info = try {
+                KibiTty.size(ctx, a[0].u32())
+            } catch (e: FsException) {
+                P1Canonical.lowerTtySizeResult(memory, a[1].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerTtySizeResult(memory, a[1].i(), info, 0)
+            NONE
+        },
+        Fn(IO_TTY, "get-foreground", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val pid = try {
+                KibiTty.foreground(ctx, a[0].u32())
+            } catch (e: FsException) {
+                P1Canonical.lowerHandleResult(memory, a[1].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerHandleResult(memory, a[1].i(), pid, 0)
+            NONE
+        },
+        Fn(IO_TTY, "set-foreground", WasmFunctionType.of(listOf(I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                KibiTty.setForeground(ctx, a[0].u32(), a[1].u32())
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[2].i(), error)
             NONE
         },
     )

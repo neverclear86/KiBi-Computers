@@ -113,6 +113,7 @@ footprint = EVENT_OVERHEAD_BYTES(96)                 KernelEvent 自体、値の
 - `lua.wasm` を reactor にするか（ADR 0030 の推奨）: #73 で export の形と合わせて決める。Lua の `event` ライブラリ: #94・#95。コマンド型の p1 の待たせ方: #316
 - 追記（#73）: イベントの WIT（`kibi:kernel/events`）、p1 の import、値の写し方、上限超えのエラーは ADR 0073 で決めた。reactor の入口は定義せず、`lua.wasm` はコマンド形式のまま
 - イベントの種類の名前と中身（タイマー、デバイス、ネットワーク、入力、画面の大きさ）: #64・#65・#67・#143・#164・ADR 0060
+  - 追記（#427）: 画面の大きさは `tty-resize`（出したもの `console`、値は列・行・世代の s64。ADR 0427）
 - 保存のバイト形式: #81・#82
 - 他 MOD 向けの公開 API: #65
 - 燃料の費用: #47・#251

@@ -29,7 +29,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:process` | — | プロセスの生成・待機・強制終了、cwd を変える import（ADR 0332） | #74 |
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
-| `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス） | #427 |
+| `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
 | `kibi:device` | — | デバイスの列挙と操作 | #77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
@@ -165,6 +165,7 @@ interface events {
 - タイマー・sleep・uptime・ゲーム内時間の関数の形と、`timer` のイベントの値の写し方: #426（この ADR の規則で WIT から導く）
   - 追記（#426）: ADR 0426 で決めた。`events` の p2・p3 での待ち方（`events-poll`・`events-async`。仮置き）も ADR 0426
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
+  - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
 - p2・p3 の層（`pollable`・async、Canonical ABI の一般の実装）: #264・#266
 - 生成した束縛（wit-bindgen）: SDK #116

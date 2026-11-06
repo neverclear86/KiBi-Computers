@@ -1,0 +1,48 @@
+package kibi:io@0.1.0;
+
+/// TTY の操作（#60・#427。ADR 0060・0427）。p1・p2・p3 で共通（p2/p3 は仮置き。ADR 0427）。
+/// fd はそのプロセスのカーネルの fd 番号（p1 の fd と同じ。p2/p3 では spawn で受け取った 0/1/2）。
+/// fd が開いていなければ bad-descriptor、TTY でなければ no-tty。fd の権利（読み・書き）は問わない（termios と同じ）。
+/// 画面の大きさが変わると、kibi:kernel/events のキューに種類 "tty-resize" のイベントが届く（ADR 0427）。
+interface tty {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// モード（ビットは個別に効く）。全部オンが既定（cooked）、全部オフが raw（cfmakeraw 相当）
+    flags mode {
+        /// ICANON: 行単位の入力と行編集
+        canonical,
+        /// ECHO: 入力をエコーする
+        echo,
+        /// ISIG: Ctrl+C・Ctrl+\ をシグナルにする
+        signals,
+        /// ICRNL: 入力の CR を LF にする
+        cr-to-nl,
+        /// OPOST|ONLCR: 出力の LF を CR LF にする
+        nl-to-crnl,
+    }
+
+    /// 画面の大きさ（文字セル。どちらも 1 以上）と世代（大きさが変わった回数）
+    record size {
+        columns: u32,
+        rows: u32,
+        generation: u64,
+    }
+
+    /// fd が TTY を指すか（開いていなければ false。isatty と同じ）
+    is-tty: func(fd: u32) -> bool;
+
+    /// モード
+    get-mode: func(fd: u32) -> result<mode, error-code>;
+
+    /// モードを変える。canonical から外すと、編集中の行はそのまま読める入力になる（ADR 0060）
+    set-mode: func(fd: u32, mode: mode) -> result<_, error-code>;
+
+    /// 大きさと世代（同じ瞬間の組）
+    get-size: func(fd: u32) -> result<size, error-code>;
+
+    /// Ctrl+C・Ctrl+\ を送る相手の pid（0 = なし）
+    get-foreground: func(fd: u32) -> result<u32, error-code>;
+
+    /// Ctrl+C・Ctrl+\ を送る相手を pid にする（0 = なし）。pid が 2^31 以上なら invalid。生きているかは確かめない（ADR 0060・0046）
+    set-foreground: func(fd: u32, pid: u32) -> result<_, error-code>;
+}

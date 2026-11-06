@@ -10,7 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.fsError
  * fd を通した TTY の操作（ABI 層が使う。#60、ADR 0060）。カーネルロックは自分で取る。
  *
  * fd が開いていなければ `BADF`、TTY でなければ `NOTTY`。fd の権利（読み・書き）は問わない（termios と同じ）。
- * WASM にどう見せるか（`kibi:*` の WIT と p1 向け import）は #73。
+ * WASM への見せ方（`kibi:io/tty` の WIT と p1 向け import）は #427（ADR 0427）。
  */
 internal object TtyControl {
     /** fd [fd] が TTY を指すか（開いていなければ `false`） */
@@ -37,6 +37,10 @@ internal object TtyControl {
     /** 画面の大きさが変わった回数（前に覚えた値と比べて、変わったことを知る） */
     @Throws(FsException::class)
     fun sizeGeneration(ctx: ProcessContext, fd: Int): Long = withTty(ctx, fd) { it.sizeGeneration }
+
+    /** 画面の大きさと世代を、1回のロックで読む（#427） */
+    @Throws(FsException::class)
+    fun sizeInfo(ctx: ProcessContext, fd: Int): TtySizeInfo = withTty(ctx, fd) { TtySizeInfo(it.size, it.sizeGeneration) }
 
     /** Ctrl+C を送る相手を [pid] にする（0 = なし。負は `INVAL`） */
     @Throws(FsException::class)
