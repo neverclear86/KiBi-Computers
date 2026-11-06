@@ -6,6 +6,7 @@
 //! - `envget 名前...`: 環境変数を `名前=値`（なければ `名前 unset`）で書く
 //! - `exitwith n`: 終了コード n で終わる
 //! - `errout 文字列`: 標準エラー出力に書く
+//! - `hang`: 標準入力を読まずに、止められるまで待つ
 const kibi = @import("kibi");
 const io = kibi.io;
 const process = kibi.process;
@@ -48,6 +49,9 @@ pub fn main() u8 {
         }
         io.err("\n");
         return 0;
+    }
+    if (eql(name, "hang")) {
+        while (true) kibi.time.sleep(60 * 1_000_000_000) catch return 103;
     }
     return 102;
 }

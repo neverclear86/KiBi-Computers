@@ -1571,6 +1571,33 @@ public class Machine private constructor(
     }
 
     /**
+     * [volume]（ディスク [diskId]）を [MachineLimits.HOME_PATH] に書き込める形でマウントする（起動用のスレッドから、`/tmp` のマウントの後。#461）。
+     * 根の `/home` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）。マウントしなかったら [volume] を閉じる。
+     * 起動が取り消されていれば [BootCancelledException]
+     */
+    internal fun mountHome(diskId: String, volume: BootVolume): Errno? {
+        try {
+            vfs.checkMountPoint(MachineLimits.HOME_PATH)
+            val mounted = lock.withLockValue {
+                if (bootCancelled) return@withLockValue false
+                vfs.mountLocked(MachineLimits.HOME_PATH, volume.fs, readOnly = false, source = "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
+                true
+            }
+            if (!mounted) {
+                volume.fs.retire()
+                throw BootCancelledException()
+            }
+            return null
+        } catch (e: FsException) {
+            volume.fs.retire()
+            return e.errno
+        } catch (t: Throwable) {
+            if (t !is BootCancelledException) volume.fs.retire()
+            throw t
+        }
+    }
+
+    /**
      * 起動の手順を、init を作らずに終える（起動用のスレッドから）。マウントを外す。
      * [failure] が `null`（取り消し）か、取り消されていれば何も知らせない。そうでなければコンソールに書いて [MachineHost.onBootFailed] で知らせる
      *
@@ -2067,6 +2094,9 @@ internal object MachineLimits {
 
     /** `/tmp` をマウントする場所 */
     internal val TMP_PATH: VfsPath = VfsPath.parse("/tmp")
+
+    /** 根が読み取り専用のときに [BootConfig.homeDisk] をマウントする場所（#461） */
+    internal val HOME_PATH: VfsPath = VfsPath.parse("/home")
 
     /** ホストのディレクトリのディスク（#52）1つの容量（バイト。仮の値。ディスクの種類ごとの値は #124、確定は #251） */
     internal const val DISK_CAPACITY_BYTES: Long = 2L * 1024 * 1024

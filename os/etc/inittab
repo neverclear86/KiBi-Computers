@@ -14,6 +14,6 @@
 # With this file but no "shell" line, no shell is started.
 
 env PATH=/bin:/sbin
-env HOME=/
+env HOME=/home
 
 shell /bin/sh

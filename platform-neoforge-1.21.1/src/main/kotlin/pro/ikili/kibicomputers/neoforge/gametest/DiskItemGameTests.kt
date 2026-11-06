@@ -140,10 +140,9 @@ object DiskItemGameTests {
         val id = DiskItem.diskIdOf(diskSlot(case))
         helper.assertTrue(id != null && DiskStore.isValidId(id), "the disk should get a valid ID but had $id")
         helper.assertTrue(case.computer.bootDiskIds == setOf(id), "the case should remember the boot disk but had ${case.computer.bootDiskIds}")
-        helper.assertTrue(
-            case.computer.machine!!.lastBootConfig!!.bootDisks == listOf(id, TestComputerWiring.TEST_BOOT_DISK),
-            "boot candidates should be the disk then testboot",
-        )
+        val boot = case.computer.machine!!.lastBootConfig!!
+        helper.assertTrue(boot.bootDisks == listOf(id, TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the disk then the OS image")
+        helper.assertTrue(boot.homeDisk == id, "the first disk should be the home disk but was ${boot.homeDisk}")
         case.pressPowerButton()
         helper.assertTrue(case.computer.bootDiskIds.isEmpty(), "turning off should forget the disks")
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run again")
@@ -192,17 +191,17 @@ object DiskItemGameTests {
         }
     }
 
-    /** init のないディスクでは、候補の順のとおり同梱イメージ testboot から起動する。 */
+    /** init のないディスクでは、候補の順のとおり標準 OS の同梱イメージから起動し、シェルのプロンプトが出る（#461）。 */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
-    fun emptyDiskFallsBackToTestboot(helper: GameTestHelper) {
+    fun emptyDiskFallsBackToStandardOs(helper: GameTestHelper) {
         val (case, screen) = build(helper, disk(), withScreen = true)
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
         val machine = case.computer.machine!!
         helper.succeedWhen {
             val text = lines(screen!!.text)
-            helper.assertTrue(text.any { it == "kibi: booting from disk ${TestComputerWiring.TEST_BOOT_DISK}" }, "should fall back to testboot: $text")
-            helper.assertTrue(text.any { it == ">" }, "the Lua REPL prompt should be shown: $text")
+            helper.assertTrue(text.any { it == "kibi: booting from disk ${TestComputerWiring.OS_BOOT_DISK}" }, "should fall back to the OS image: $text")
+            helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
             helper.assertTrue(machine.state == MachineState.RUNNING, "machine should be running")
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
@@ -220,10 +219,9 @@ object DiskItemGameTests {
         helper.assertTrue(diskSlot(case).get(KiBiDataComponents.DISK_ID.get()) == "../evil", "an invalid ID should not be overwritten")
         helper.assertTrue(DiskItem.diskIdOf(diskSlot(case)) == null, "an invalid ID should not be used")
         helper.assertTrue(case.computer.bootDiskIds.isEmpty(), "an invalid ID should not be a boot disk")
-        helper.assertTrue(
-            case.computer.machine!!.lastBootConfig!!.bootDisks == listOf(TestComputerWiring.TEST_BOOT_DISK),
-            "boot candidates should be testboot only",
-        )
+        val boot = case.computer.machine!!.lastBootConfig!!
+        helper.assertTrue(boot.bootDisks == listOf(TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the OS image only")
+        helper.assertTrue(boot.homeDisk == null, "an invalid ID should not be the home disk")
         case.pressPowerButton()
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()

@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -56,6 +57,8 @@ object TestComputerGameTests {
         )
         helper.setBlock(KEYBOARD, KiBiBlocks.KEYBOARD.get())
         val case = helper.getBlockEntity<CaseBlockEntity>(CASE)
+        // Lua の REPL で確かめる（ゲームの既定は標準 OS。#461）
+        case.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
         // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる
         for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
             case.parts.setStackInSlot(case.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
@@ -217,6 +220,7 @@ object TestComputerGameTests {
             KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
         )
         val second = helper.getBlockEntity<CaseBlockEntity>(secondPos)
+        second.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
         for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
             second.parts.setStackInSlot(second.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
         }

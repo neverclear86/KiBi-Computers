@@ -119,7 +119,7 @@ pub fn release(m: Mark) void {
 
 // ---- 残るもの ----
 
-const HEAP_SIZE = 512 * 1024;
+pub const HEAP_SIZE = 512 * 1024;
 var heap_buf: [HEAP_SIZE]u8 align(8) = undefined;
 /// 使った（区画を切り出した）ところの終わり
 var heap_end: usize = 0;
