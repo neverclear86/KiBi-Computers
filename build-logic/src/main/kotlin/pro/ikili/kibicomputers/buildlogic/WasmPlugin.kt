@@ -113,7 +113,7 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
      * その出力を [sourceSet] のリソースに加える（#32）。出力するパッケージは [MoonBuildWasm.packages] で指定する。
      *
      * MoonBit の版とハッシュはルートの `gradle/moonbit.properties` で固定し、取得したものは `<Gradle ホーム>/kibicomputers/moonbit/` に置く。
-     * MoonBit は、Gradle のプロパティ `kibi.moonbit` が `true` のとき、または環境変数 `CI` が `true` のときだけビルドする
+     * MoonBit は、Gradle のプロパティ `kibi.moonbit` が `true` のときだけビルドする（#32 で標準 OS は Zig に決めたので、CI ではビルドしない）
      * （#32 のオーナーの回答。手元の作業環境では MoonBit のツールチェーンを動かさない）。ビルドしないときはタスクを飛ばし、
      * リソースに MoonBit の `.wasm` は入らない。
      */
@@ -128,7 +128,7 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
             toolchainsDir.set(gradleHome)
             outputDir.convention(project.layout.buildDirectory.dir("generated/moonbit/$name"))
             wasmOptSuffix.convention("-opt")
-            onlyIf("kibi.moonbit か CI のときだけ MoonBit をビルドする") { enabled }
+            onlyIf("kibi.moonbit のときだけ MoonBit をビルドする") { enabled }
             action.execute(this)
         }
         project.extensions.getByType(SourceSetContainer::class.java).named(sourceSet) {
@@ -137,10 +137,9 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
         return task
     }
 
-    /** MoonBit をビルドするか（[moonbit] を見る） */
+    /** MoonBit をビルドするか（[moonbit] を見る）。#32 で標準 OS は Zig に決めたので、`kibi.moonbit=true` のときだけ */
     val moonbitEnabled: Boolean
-        get() = project.providers.gradleProperty("kibi.moonbit").orNull?.toBoolean()
-            ?: (project.providers.environmentVariable("CI").orNull?.toBoolean() ?: false)
+        get() = project.providers.gradleProperty("kibi.moonbit").orNull?.toBoolean() ?: false
 
     private val moonbitDist: MoonBitDistribution by lazy {
         MoonBitDistribution.load(project.rootDir.resolve("gradle/moonbit.properties"))

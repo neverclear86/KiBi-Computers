@@ -7,7 +7,7 @@ import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 // 大きさ・インスタンス生成・燃料・速度、カーネル（待機点への変換、書き換えた RAM）の上での振る舞いを比べる。
 // `./gradlew :poc:os-language:run` で測定結果を表で出す（`build/bench/results.md` にも書く）。テストも同じ表を標準出力に出す。
 //
-// MoonBit は、Gradle のプロパティ `kibi.moonbit=true` か CI のときだけビルドする（kibiWasm.moonbit。#32 のオーナーの回答）。
+// MoonBit は、Gradle のプロパティ `kibi.moonbit=true` のときだけビルドする（kibiWasm.moonbit）。#32 で標準 OS は Zig に決めたので、CI ではビルドしない。
 // ビルドしないときは Zig だけを測る。
 plugins {
     application
@@ -54,7 +54,7 @@ kibiWasm {
     }
 }
 
-// #32 の追加調査（燃料の内訳と原因）: MoonBit の書き方・最適化の比較。CI でだけ動かし、失敗してもビルドは止めない。
+// #32 の追加調査（燃料の内訳と原因）: MoonBit の書き方・最適化の比較。kibi.moonbit のときだけ動かし、失敗してもビルドは止めない。
 //
 // - 名前つき（`moon build --release --no-strip`）の元のプログラムと、`src/experiments/moonbit/cmd/<名前>` の書き換え版を、
 //   1つずつ元のモジュールに足してビルドする（書き換え版がコンパイルできなくても、ほかには響かない）
@@ -65,7 +65,7 @@ val moonbitExperiments = tasks.register("moonbitExperiments") {
     group = "verification"
     description = "Builds MoonBit variants for the fuel investigation of #32 (CI only; never fails the build)."
     val enabled = kibiWasm.moonbitEnabled
-    onlyIf("kibi.moonbit か CI のときだけ") { enabled }
+    onlyIf("kibi.moonbit のときだけ") { enabled }
     dependsOn("compileOsLanguageMoonBit")
     val toolchains = gradle.gradleUserHomeDir.resolve("kibicomputers/moonbit")
     val moduleDir = layout.projectDirectory.dir("src/main/moonbit").asFile
@@ -174,7 +174,7 @@ tasks.test {
     testLogging {
         showStandardStreams = true
     }
-    // MoonBit をビルドした（kibi.moonbit か CI）なら、MoonBit のプログラムがないことを失敗にする
+    // MoonBit をビルドした（kibi.moonbit）なら、MoonBit のプログラムがないことを失敗にする
     systemProperty("kibi.moonbit.required", kibiWasm.moonbitEnabled.toString())
 }
 
