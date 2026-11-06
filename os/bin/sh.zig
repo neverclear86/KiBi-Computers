@@ -8,7 +8,7 @@
 //!
 //! 構文・展開・実行の決めごとは docs/adr/0101-shell.md。ソースは `os/bin/sh/` に分けている:
 //! `parse.zig`（字句・構文）、`expand.zig`（展開）、`exec.zig`（実行）、`builtins.zig`（組み込み）、
-//! `vars.zig`（変数・関数）、`mem.zig`（領域）。行編集・補完・履歴は #102。
+//! `vars.zig`（変数・関数）、`mem.zig`（領域）、`edit.zig`・`complete.zig`・`history.zig`（行の編集・補完・履歴。#102）。
 const kibi = @import("kibi");
 const util = @import("sh/util.zig");
 const mem = @import("sh/mem.zig");
@@ -16,6 +16,7 @@ const vars = @import("sh/vars.zig");
 const state = @import("sh/state.zig");
 const exec = @import("sh/exec.zig");
 const builtins = @import("sh/builtins.zig");
+const history = @import("sh/history.zig");
 
 const io = kibi.io;
 const fs = kibi.fs;
@@ -115,7 +116,10 @@ pub fn main() u8 {
         const fg = kibi.tty.getForeground(io.STDIN) catch 0;
         if (fg == 0) kibi.tty.setForeground(io.STDIN, process.selfPid()) catch {};
     }
-    var r = exec.Reader{ .fd = io.STDIN, .buf = &input_buf, .prompt = state.interactive, .name = "" };
+    // 行の編集・補完・履歴（#102）は、標準入力と標準エラー出力が TTY のときだけ
+    const edit = state.interactive and kibi.tty.isTty(io.STDIN) and kibi.tty.isTty(io.STDERR);
+    if (edit) history.load();
+    var r = exec.Reader{ .fd = io.STDIN, .buf = &input_buf, .prompt = state.interactive, .edit = edit, .name = "" };
     r.runAll() catch |e| exec.handleTopError(e);
     if (state.interactive) io.err("\n");
     return state.status;

@@ -6,6 +6,7 @@ const expand = @import("expand.zig");
 const vars = @import("vars.zig");
 const state = @import("state.zig");
 const exec = @import("exec.zig");
+const history = @import("history.zig");
 
 const io = kibi.io;
 const fs = kibi.fs;
@@ -17,9 +18,12 @@ pub const Kind = enum { none, special, regular };
 
 /// POSIX の特別な組み込み（代入が残る。関数より先に見る）
 const specials = [_][]const u8{ ":", ".", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift", "unset", "break", "continue", "local" };
-const regulars = [_][]const u8{ "true", "false", "echo", "printf", "cd", "pwd", "read", "test", "[", "wait", "command", "type", "source" };
+const regulars = [_][]const u8{ "true", "false", "echo", "printf", "cd", "pwd", "read", "test", "[", "wait", "command", "type", "source", "history" };
+/// 組み込みの名前すべて（補完に使う）
+pub const all_names = specials ++ regulars;
 /// 標準入力を読まず、シェルの状態を変えないもの（パイプラインの段・コマンド置換をシェルの中で動かせる）
-const pures = [_][]const u8{ ":", "true", "false", "echo", "printf", "pwd", "test", "[" };
+/// `history` は会話的なシェルの履歴を読むので、子のシェルでは動かさない（`history -c` だけは状態を変える）
+const pures = [_][]const u8{ ":", "true", "false", "echo", "printf", "pwd", "test", "[", "history" };
 
 pub fn kindOf(name: []const u8) Kind {
     for (specials) |s| if (eql(s, name)) return .special;
@@ -59,6 +63,7 @@ pub fn run(argv: []const []const u8) Error!u8 {
     if (eql(name, "local")) return local(args);
     if (eql(name, "command")) return commandV(args);
     if (eql(name, "type")) return typeBuiltin(args);
+    if (eql(name, "history")) return historyBuiltin(args);
     return 127;
 }
 
@@ -650,6 +655,28 @@ fn describe(name: []const u8, verbose: bool) Error!bool {
     }
     if (verbose) util.complain(&.{ name, ": not found" });
     return false;
+}
+
+// ---- history（#102） ----
+
+fn historyBuiltin(args: []const []const u8) Error!u8 {
+    if (args.len > 0) {
+        if (eql(args[0], "-c") and args.len == 1) {
+            history.clear();
+            return 0;
+        }
+        util.complain(&.{ "history: ", args[0], ": unknown option (usage: history [-c])" });
+        return 2;
+    }
+    var i: usize = 0;
+    while (i < history.len()) : (i += 1) {
+        var nb: [24]u8 = undefined;
+        const num = io.formatUnsigned(&nb, history.number(i));
+        var spaces: [5]u8 = @splat(' ');
+        const p = if (num.len < spaces.len) spaces[0 .. spaces.len - num.len] else spaces[0..0];
+        if (!(try say(&.{ p, num, "  ", history.get(i), "\n" }))) return 1;
+    }
+    return 0;
 }
 
 // ---- read ----
