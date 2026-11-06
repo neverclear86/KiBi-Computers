@@ -67,6 +67,8 @@ pub const Event = extern struct {
 pub const EVENTTYPE_CLOCK: u8 = 0;
 pub const EVENTTYPE_FD_READ: u8 = 1;
 pub const EVENTTYPE_FD_WRITE: u8 = 2;
+/// eventrwflags_t: 相手側が閉じた（パイプ）
+pub const EVENT_FD_READWRITE_HANGUP: u16 = 1;
 /// subclockflags_t: timeout が絶対時刻
 pub const SUBSCRIPTION_CLOCK_ABSTIME: u16 = 1;
 
