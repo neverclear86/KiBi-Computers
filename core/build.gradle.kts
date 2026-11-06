@@ -259,6 +259,7 @@ sourceSets.main {
 // 標準 OS（#98。言語は Zig。ADR 0032）。ソースはリポジトリの `os/`:
 // - `os/lib/kibi/`: 共通ライブラリ（システムコールの包み）。プログラムは `@import("kibi")` で使う
 // - `os/bin/<名前>.zig` → イメージの `/bin/<名前>`、`os/sbin/<名前>.zig` → `/sbin/<名前>`（ファイルを置けば足される）
+// - `os/etc/` → イメージの `/etc/`（設定ファイル。そのまま入れる）
 // - `os/test/<名前>.zig`: 共通ライブラリを確かめるプログラム。テストのリソース `/kibicomputers/wasm/os-<名前>.wasm` にする
 // 全部を同梱イメージ os（core のリソース `/kibicomputers/images/os.zip`。起動ディスクの識別子は `image:os`）にまとめる。
 // OS 入りのフロッピー（#97）はこのイメージを中身にする。ビルド時 AOT（#36）は、このイメージのプログラムを変換の対象に足す
@@ -298,6 +299,8 @@ val zipOsImage = tasks.register<Zip>("zipOsImage") {
             }
         }
     }
+    // 設定ファイル（`os/etc/` → イメージの `/etc/`。#100 の `/etc/inittab` など）
+    from(osDir.dir("etc")) { into("etc") }
     archiveFileName = "os.zip"
     destinationDirectory = layout.buildDirectory.dir("generated/images/os/kibicomputers/images")
     isPreserveFileTimestamps = false

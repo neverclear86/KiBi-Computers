@@ -1,0 +1,19 @@
+# /etc/inittab: what /sbin/init starts at boot.
+#
+# One entry per line. Words are separated by spaces or tabs (no quoting).
+# Lines starting with '#' and empty lines are ignored.
+#
+#   env NAME=VALUE        add or replace an environment variable for the programs below
+#   run PATH [ARGS...]    run at boot, one by one, waiting for each to finish
+#   daemon PATH [ARGS...] start in the background once (no standard input)
+#   respawn PATH [ARGS...] start in the background and restart it when it ends
+#   shell PATH [ARGS...]  the console shell, started without login (only one).
+#                         It is restarted when it ends.
+#
+# Without this file, init starts "shell /bin/sh" only.
+# With this file but no "shell" line, no shell is started.
+
+env PATH=/bin:/sbin
+env HOME=/
+
+shell /bin/sh
