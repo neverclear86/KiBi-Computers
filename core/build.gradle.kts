@@ -276,6 +276,10 @@ fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir
         name to kibiWasm.zigModule("os-$dir-$name", sourceSet = sourceSet, resourceDir = resourceDir) {
             root = file
             sources.from(osLibrarySources)
+            // 大きなプログラムは `os/<dir>/<名前>/` に分けて置ける（`@import("<名前>/x.zig")`）
+            sources.from(fileTree(file.resolveSibling(name)) { include("**/*.zig") })
+            // シェルは構文の入れ子・関数の呼び出しで深く再帰するので、スタックを大きくする（触るまで RAM に数えない）
+            if (dir == "bin" && name == "sh") stackSize = 256 * 1024
             modules.put("kibi", osLibrary.file("kibi.zig").asFile)
             outputPath = "$name.wasm"
         }
