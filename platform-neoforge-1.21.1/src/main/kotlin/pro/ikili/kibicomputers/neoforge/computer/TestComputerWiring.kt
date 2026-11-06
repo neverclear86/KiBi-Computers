@@ -24,8 +24,9 @@ import java.util.UUID
  * テスト用コンピューターの仮の結線（#307）。ケース1つにつき1つ持ち、サーバーでだけ使う。
  *
  * - 起動部品は挿さっているとみなす（[withBootPart]）。置き換え先: 起動部品のアイテム #125、ファームウェア #99
- * - 起動ディスクの候補は、ディスクのスロットの順のディスク（#124）、最後に同梱イメージ（[TEST_BOOT_DISK]）（[bootConfig]）。
- *   置き換え先: 標準OS #98、起動部品の設定 #99
+ * - 起動ディスクの候補は、ディスクのスロットの順のディスク（#124）、最後に標準 OS の同梱イメージ（[OS_BOOT_DISK]。#461）
+ *   （[bootConfig]）。同梱イメージから起動したら、最初のディスクを `/home` にマウントする（[BootConfig.homeDisk]）。
+ *   置き換え先: OS 入りのフロッピーから HDD へのインストール #107・#145、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
  *   表示デバイス（[DisplayDevice]）を作って画面に映させ、コンソールの出力を表示デバイスに、キーボードの入力をコンソールに流す
  *   （[MachineConsole]。プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
@@ -117,17 +118,26 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     companion object {
         /**
-         * テスト用コンピューターの起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は Lua の REPL（#315）。
-         * 標準OS（#98）と起動部品（#99）ができたら置き換える
+         * 仮の起動経路の最後の起動ディスク（標準 OS の同梱イメージ `os`。#461）。
+         * 正式な入手方法（OS 入りのフロッピーから HDD へのインストール。#107・#145）がそろったら置き換える
+         */
+        const val OS_BOOT_DISK: String = BootConfig.IMAGE_DISK_PREFIX + "os"
+
+        /**
+         * GameTest 用の起動ディスク（同梱イメージ `testboot`）。`/sbin/init` は Lua の REPL（#315）。
+         * ゲームでは使わない（[CaseBlockEntity.fallbackBootDisk] で差し替えて使う）
          */
         const val TEST_BOOT_DISK: String = BootConfig.IMAGE_DISK_PREFIX + "testboot"
 
-        /** 仮の起動の設定: 起動部品あり、起動ディスクは同梱イメージ testboot */
+        /** 仮の起動の設定: 起動部品あり、起動ディスクは同梱イメージ os */
         val BOOT_CONFIG: BootConfig = bootConfig(emptyList())
 
-        /** 仮の起動の設定: 起動部品あり、起動ディスクの候補は [disks]（ディスクのスロットの順）、最後に同梱イメージ testboot */
-        fun bootConfig(disks: List<String>): BootConfig =
-            BootConfig.builder().firmwarePresent(true).bootDisks(disks + TEST_BOOT_DISK).build()
+        /**
+         * 仮の起動の設定: 起動部品あり、起動ディスクの候補は [disks]（ディスクのスロットの順）、最後に [fallback]。
+         * [fallback]（読み取り専用の同梱イメージ）から起動したときは、[disks] の最初のディスクを `/home` にマウントする（#461）
+         */
+        fun bootConfig(disks: List<String>, fallback: String = OS_BOOT_DISK): BootConfig =
+            BootConfig.builder().firmwarePresent(true).bootDisks(disks + fallback).homeDisk(disks.firstOrNull()).build()
 
         /** 起動部品（#125）のスロットは、挿さっているとみなす。ディスクの識別子は [parts] のまま */
         fun withBootPart(tier: CaseTier, parts: InstalledParts): InstalledParts = object : InstalledParts {

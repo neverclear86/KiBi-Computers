@@ -84,9 +84,12 @@ class BootTest {
     private class Disks : BootVolumeOpener {
         val map = HashMap<String, TestMemoryFileSystem>()
 
+        /** 読み取り専用で開くディスク（同梱イメージの代わり） */
+        val readOnly = HashSet<String>()
+
         override fun open(diskId: String): BootVolume? {
             if (diskId == "throws") throw IllegalStateException("開けない")
-            return map[diskId]?.let { BootVolume(it, readOnly = false) }
+            return map[diskId]?.let { BootVolume(it, readOnly = diskId in readOnly) }
         }
 
         fun empty(id: String): TestMemoryFileSystem = TestMemoryFileSystem().also { map[id] = it }
@@ -127,6 +130,8 @@ class BootTest {
         fun mounts(): List<Pair<String, String>> = m.lock.withLockValue { m.kernel.mounts.entries.map { it.point.toString() to it.source } }
 
         fun bootDisks(vararg ids: String): BootConfig = BootConfig.builder().bootDisks(ids.toList()).build()
+
+        fun withHome(home: String?, vararg ids: String): BootConfig = BootConfig.builder().bootDisks(ids.toList()).homeDisk(home).build()
     }
 
     private fun env(block: Env.() -> Unit) = timeout(limit) {
@@ -470,6 +475,71 @@ class BootTest {
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
         assertEquals(listOf("/" to "disk:d"), mounts())
         assertEquals("kibi: /tmp not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
+    }
+
+    @Test
+    fun `根が読み取り専用ならhomeDiskを書き込める形でhomeにマウントし、再起動の後も中身が残る`() = env {
+        val home = disks.empty("hdd")
+        disks.withInit("img", exe(foreverInit()))
+        disks.readOnly += "img"
+        assertTrue(m.boot(withHome("hdd", "hdd", "img")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/home" to "disk:hdd"), mounts())
+        assertEquals("kibi: booting from disk img\n", host.console.toString())
+        run {
+            val f = m.vfs.open(VfsPath.parse("/home/a"), OpenOptions(read = true, write = true, create = true))
+            assertEquals(2, m.vfs.write(f, "hi".toByteArray(), 0, 2))
+            m.vfs.close(f)
+        }
+        assertEquals(FileType.REGULAR_FILE, home.stat(VfsPath.parse("/a")).type, "ディスクに書かれる")
+
+        assertTrue(m.reboot())
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/home" to "disk:hdd"), mounts())
+        assertEquals(FileType.REGULAR_FILE, m.vfs.stat(VfsPath.parse("/home/a")).type, "再起動の後も残る")
+    }
+
+    @Test
+    fun `根が書き込めるディスクならhomeDiskをマウントしない`() = env {
+        disks.empty("hdd")
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(withHome("hdd", "d")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp"), mounts())
+    }
+
+    @Test
+    fun `homeDiskが根と同じなら二重にマウントしない`() = env {
+        disks.withInit("img", exe(foreverInit()))
+        disks.readOnly += "img"
+        assertTrue(m.boot(withHome("img", "img")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts())
+    }
+
+    @Test
+    fun `homeDiskを開けない・読み取り専用・homeがファイルならマウントせずに起動を続ける`() = env {
+        val img = disks.withInit("img", exe(foreverInit()))
+        disks.readOnly += "img"
+        disks.empty("ro")
+        disks.readOnly += "ro"
+        disks.empty("hdd")
+        for ((home, reason) in listOf("missing" to "cannot open", "throws" to "cannot open", "ro" to "read-only")) {
+            host.console.setLength(0)
+            assertTrue(m.boot(withHome(home, "img")))
+            tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+            assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts(), home)
+            assertEquals("kibi: /home not mounted ($reason)\nkibi: booting from disk img\n", host.console.toString())
+            m.stop()
+            tickUntil { m.state == MachineState.STOPPED && !m.isBooting }
+            tickFor(20)
+        }
+        img.createFile(VfsPath.parse("/home"))
+        host.console.setLength(0)
+        assertTrue(m.boot(withHome("hdd", "img")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts())
+        assertEquals("kibi: /home not mounted (NOTDIR)\nkibi: booting from disk img\n", host.console.toString())
     }
 
     @Test
