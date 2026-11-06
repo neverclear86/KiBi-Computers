@@ -9,6 +9,7 @@ import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -171,6 +172,8 @@ internal object FdIo {
      *   向きの違うパイプの端は `BADF`
      * - コンソール（[Tty]）: 読みは今読めるバイト、書きは出力の空き
      * - ファイル・ディレクトリ（[OpenFile]）: 常にそろう（POSIX の `poll` と同じ）。ファイルの読みは残りのバイトの目安（I/O をしない [Vfs.sizeHintLocked]）、ほかは 0
+     * - 子のハンドル（[ProcessObject]。#74、ADR 0074）: 読みは、子が終われば `nbytes` 0 でそろう。まだなら `(objectId, EXITED)` の key
+     *   （`ProcessLifecycle.onFinishedLocked` が起こす key と同じ）。書きは待てない（`INVAL`。権利が `READ` だけなので、ふつうはその前に `BADF`）
      * - そのほかの待てる種類（イベントキュー、タイマー）: [pro.ikili.kibicomputers.core.kernel.obj.KernelObject.isReady] で、`nbytes` は 1
      * - その条件を待てない種類: `INVAL`
      */
@@ -199,6 +202,11 @@ internal object FdIo {
                 is OpenFile -> when {
                     obj.isDirectory || !reading -> FdReadiness.Ready(0)
                     else -> FdReadiness.Ready(maxOf(0L, vfs.sizeHintLocked(obj) - obj.position))
+                }
+                is ProcessObject -> when {
+                    !reading -> FdReadiness.Error(Errno.INVAL)
+                    obj.status != null -> FdReadiness.Ready(0)
+                    else -> FdReadiness.Pending(WaitKey(obj.id, WaitCondition.EXITED))
                 }
                 else -> when {
                     !obj.canWait(condition) -> FdReadiness.Error(Errno.INVAL)

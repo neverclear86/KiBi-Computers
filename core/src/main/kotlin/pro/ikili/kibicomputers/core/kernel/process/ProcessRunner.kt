@@ -705,6 +705,38 @@ internal class ProcessRunner(private val machine: Machine) {
             return machine.finishExec(wait.pending)
         }
 
+        override fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): ProcessHandle {
+            checkMayBlock("exec")
+            return machine.execWithHandle(path, drivers, options, rt.pid) { future -> awaitHost(future) }
+        }
+
+        override fun finishExecWithHandle(wait: ExecWait): ProcessHandle {
+            checkThread()
+            lock.withLockValue { takeLocked(wait.wait) }
+            return machine.finishExecWithHandle(wait.pending)
+        }
+
+        override fun checkHandleRoom() = machine.checkHandleRoom(rt.pid)
+
+        override fun processHandleStatus(fd: Int): ExitStatus? =
+            lock.withLockValue { machine.lifecycle.processHandleStatusLocked(rt.process, processObjectLocked(fd)) }
+
+        override fun killProcessHandle(fd: Int, signal: KillSignal): KillResult {
+            val (target, result) = lock.withLockValue {
+                val obj = processObjectLocked(fd)
+                obj.pid to machine.lifecycle.killProcessHandleLocked(obj, signal)
+            }
+            if (target == rt.pid && result == KillResult.DELIVERED) throw ProcessKilledException()
+            return result
+        }
+
+        override fun processHandlePid(fd: Int): Int = lock.withLockValue { processObjectLocked(fd).pid }
+
+        /** 自分の fd [fd] が指す子のハンドル（カーネルロックの中）。開いていない・子のハンドルでなければ `BADF` */
+        private fun processObjectLocked(fd: Int): ProcessObject =
+            FdTable(rt.process, machine.kernel.objects, machine.wakeSink).objectOf(fd) as? ProcessObject
+                ?: fsError(Errno.BADF, "fd $fd は子のハンドルではない")
+
         override fun children(): List<Int> = machine.children(rt.pid)
 
         override fun tryReap(selector: ChildSelector): ReapResult = lock.withLockValue { machine.lifecycle.tryReapLocked(rt.pid, selector) }

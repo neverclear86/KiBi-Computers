@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.wasi.p1
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
+import pro.ikili.kibicomputers.core.kernel.process.ExitStatus
+import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
 import pro.ikili.kibicomputers.core.kernel.tty.TtySizeInfo
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -10,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
@@ -30,6 +33,11 @@ import java.nio.charset.CodingErrorAction
  * - `result<event-batch, error-code>`: `{ tag: u8 @0, ok: { events.ptr @8, events.len @12, dropped: u64 @16 } | err: u8 @8 }`（24 / 8）
  * - `event`: `{ kind @0, source @8, values @16 }`（24 / 4）
  * - `event-value`: `{ tag: u8 @0, payload @8 }`（s64・f64 は 8 バイト、bool は u8、text・bytes は (ptr, len)。16 / 8）
+ * - `tuple<string, string>`（`kibi:process` の env の要素）: `{ name.ptr @0, name.len @4, value.ptr @8, value.len @12 }`（16 / 4。#74）
+ * - `fd-assign`: `{ fd: u32 @0, source.tag: u8 @4, source.parent: u32 @8 }`（12 / 4。#74）
+ * - `result<option<exit-status>, error-code>`: `{ tag @0, ok: { opt_tag @4, status_tag @8, exited: u32 @12 | killed: { sig_is_some @12, sig @13 } }
+ *   | err: u8 @4 }`（16 / 4。#74）
+ * - `string` の結果（`get-cwd`）: `{ ptr @0, len @4 }`（8 / 4。`cabi_realloc` で場所を取る。#74）
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
@@ -76,6 +84,20 @@ internal object P1Canonical {
     const val VALUE_SIZE: Int = 16
     const val VALUE_ALIGN: Int = 8
 
+    /** `result<option<exit-status>, error-code>`（`kibi:process` の `status`）の大きさ・align */
+    const val STATUS_RESULT_SIZE: Int = 16
+    const val STATUS_RESULT_ALIGN: Int = 4
+
+    /** `string` の結果（`get-cwd`）の大きさ・align */
+    const val STRING_RESULT_SIZE: Int = 8
+    const val STRING_RESULT_ALIGN: Int = 4
+
+    /** `tuple<string, string>`（env の要素）の大きさ */
+    const val ENV_ENTRY_SIZE: Int = 16
+
+    /** `fd-assign` の大きさ */
+    const val FD_ASSIGN_SIZE: Int = 12
+
     /** `event-value` の判別子 */
     const val VALUE_S64: Int = 0
     const val VALUE_F64: Int = 1
@@ -102,6 +124,96 @@ internal object P1Canonical {
             if (sl < maxBytes.first || sl > maxBytes.last) fsError(Errno.INVAL, "文字列は ${maxBytes.first}..${maxBytes.last} バイト（$sl）")
             if (!P1.inBounds(memory, sp, sl)) fsError(Errno.FAULT, "文字列の範囲が線形メモリの外")
             out += decodeUtf8(memory.read(sp, sl.toInt()))
+        }
+        return out
+    }
+
+    /**
+     * `string`（引数の (ptr, len)）を読む。バイト数が [maxBytes] を超えたら中身を読まずに [tooLong]、範囲外なら `FAULT`、
+     * 正しい UTF-8 でなければ `INVAL`
+     */
+    @Throws(FsException::class)
+    fun liftString(memory: WasmMemory, ptr: Int, len: Int, maxBytes: Int, tooLong: Errno): String {
+        val n = u32(len)
+        if (n > maxBytes) fsError(tooLong, "文字列は $maxBytes バイトまで（$n）")
+        if (!P1.inBounds(memory, ptr, n)) fsError(Errno.FAULT, "文字列の範囲が線形メモリの外")
+        return decodeUtf8(memory.read(ptr, n.toInt()))
+    }
+
+    /**
+     * 引数と環境変数の合計の大きさの残り（[ProcessArgs.MAX_BYTES] から。数え方も [ProcessArgs.check] と同じ: 文字列のバイト数と終わりの NUL、
+     * 環境変数は `名前=値`）。中身を読む前に [take] で引き、足りなければ `TOOBIG`
+     */
+    class ArgBudget(var remaining: Long = ProcessArgs.MAX_BYTES.toLong()) {
+        @Throws(FsException::class)
+        fun take(bytes: Long) {
+            if (bytes > remaining) fsError(Errno.TOOBIG, "引数と環境変数が大きすぎる（上限 ${ProcessArgs.MAX_BYTES} バイト）")
+            remaining -= bytes
+        }
+    }
+
+    /**
+     * `kibi:process` の `args`（`list<string>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、配列・要素が範囲外なら `FAULT`、
+     * 要素の中身を読む前に [budget] から引き（足りなければ `TOOBIG`）、正しい UTF-8 でなければ `INVAL`
+     */
+    @Throws(FsException::class)
+    fun liftArgList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, budget: ArgBudget): List<String> {
+        val count = u32(len)
+        if (count > maxCount) fsError(Errno.TOOBIG, "引数は $maxCount 個まで（$count）")
+        if (!P1.inBounds(memory, ptr, count * 8)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
+        val out = ArrayList<String>(count.toInt())
+        for (i in 0 until count.toInt()) {
+            val base = ptr + i * 8
+            val sp = memory.readI32(base)
+            val sl = u32(memory.readI32(base + 4))
+            budget.take(sl + 1)
+            if (!P1.inBounds(memory, sp, sl)) fsError(Errno.FAULT, "文字列の範囲が線形メモリの外")
+            out += decodeUtf8(memory.read(sp, sl.toInt()))
+        }
+        return out
+    }
+
+    /**
+     * `kibi:process` の `env`（`list<tuple<string, string>>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、
+     * 配列・要素が範囲外なら `FAULT`、組の中身を読む前に [budget] から引き（足りなければ `TOOBIG`）、正しい UTF-8 でなければ `INVAL`
+     */
+    @Throws(FsException::class)
+    fun liftEnvList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, budget: ArgBudget): List<Pair<String, String>> {
+        val count = u32(len)
+        if (count > maxCount) fsError(Errno.TOOBIG, "環境変数は $maxCount 組まで（$count）")
+        if (!P1.inBounds(memory, ptr, count * ENV_ENTRY_SIZE)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
+        val out = ArrayList<Pair<String, String>>(count.toInt())
+        for (i in 0 until count.toInt()) {
+            val base = ptr + i * ENV_ENTRY_SIZE
+            val np = memory.readI32(base)
+            val nl = u32(memory.readI32(base + 4))
+            val vp = memory.readI32(base + 8)
+            val vl = u32(memory.readI32(base + 12))
+            budget.take(nl + 1 + vl + 1)
+            if (!P1.inBounds(memory, np, nl) || !P1.inBounds(memory, vp, vl)) fsError(Errno.FAULT, "文字列の範囲が線形メモリの外")
+            out += decodeUtf8(memory.read(np, nl.toInt())) to decodeUtf8(memory.read(vp, vl.toInt()))
+        }
+        return out
+    }
+
+    /**
+     * `kibi:process` の `fds`（`list<fd-assign>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `INVAL`、配列が範囲外なら `FAULT`、
+     * `fd-source` の判別子が 0（`parent`）・1（`closed`）でなければ `INVAL`。値は符号なしで広げる
+     */
+    @Throws(FsException::class)
+    fun liftFdAssigns(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int): List<KibiProcess.FdAssign> {
+        val count = u32(len)
+        if (count > maxCount) fsError(Errno.INVAL, "fds は $maxCount 個まで（$count）")
+        if (!P1.inBounds(memory, ptr, count * FD_ASSIGN_SIZE)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
+        val out = ArrayList<KibiProcess.FdAssign>(count.toInt())
+        for (i in 0 until count.toInt()) {
+            val base = ptr + i * FD_ASSIGN_SIZE
+            val fd = u32(memory.readI32(base))
+            out += when (val tag = memory.readU8(base + 4)) {
+                0 -> KibiProcess.FdAssign(fd, u32(memory.readI32(base + 8)))
+                1 -> KibiProcess.FdAssign(fd, null)
+                else -> fsError(Errno.INVAL, "fd-source の判別子が不正（$tag）")
+            }
         }
         return out
     }
@@ -179,6 +291,39 @@ internal object P1Canonical {
             memory.writeU8(retPtr, 1)
             memory.writeU8(retPtr + 4, error)
         }
+    }
+
+    /**
+     * `result<option<exit-status>, error-code>` を [retPtr] に書く。[error] が `null` でなければ err（判別子）、そうでなければ ok で、
+     * [status] が `null` なら none。使わない所は 0 にする
+     */
+    fun lowerStatusResult(memory: WasmMemory, retPtr: Int, status: ExitStatus?, error: Int?) {
+        checkStore(memory, retPtr, STATUS_RESULT_SIZE, STATUS_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(STATUS_RESULT_SIZE))
+        if (error != null) {
+            memory.writeU8(retPtr, 1)
+            memory.writeU8(retPtr + 4, error)
+            return
+        }
+        if (status == null) return
+        memory.writeU8(retPtr + 4, 1)
+        val tag = KibiProcess.statusTag(status)
+        memory.writeU8(retPtr + 8, tag)
+        when (tag) {
+            0 -> memory.writeI32(retPtr + 12, status.code)
+            1 -> status.signal?.let {
+                memory.writeU8(retPtr + 12, 1)
+                memory.writeU8(retPtr + 13, KibiProcess.SIGNALS.indexOf(it))
+            }
+        }
+    }
+
+    /** `string` の結果を [retPtr] に書く（中身の場所は [realloc] で取る。大きさ 0 でも呼ぶ） */
+    fun lowerStringResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, value: String) {
+        checkStore(memory, retPtr, STRING_RESULT_SIZE, STRING_RESULT_ALIGN)
+        val (p, l) = lowerBytes(memory, realloc, utf8(value))
+        memory.writeI32(retPtr, p)
+        memory.writeI32(retPtr + 4, l)
     }
 
     /** `result<_, error-code>` を [retPtr] に書く。[error] が `null` なら ok（err の場所は 0 にする）、そうでなければ err（判別子） */

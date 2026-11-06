@@ -38,6 +38,13 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
     /** 巻き戻すときに記録した、待つ key（`_start` から戻るまでの間だけ。実行時だけ） */
     private var pendingKeys: List<WaitKey>? = null
 
+    /**
+     * 今の呼び出しが、巻き直して着いたものか（[enter] で入れる。実行時だけ）。`kibi:process` の `spawn` が、巻き戻す前に持った
+     * 実行時だけの状態（読み込みの `ExecWait`）を引き継ぐかを決めるのに使う（#74）
+     */
+    var rewound: Boolean = false
+        private set
+
     /** 巻き直して着いた呼び出しなら、前に巻き戻したときの [AsyncWait]（[enter] で入れ、呼んだ側が読む） */
     var resumed: AsyncWait? = null
         private set
@@ -46,6 +53,7 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
     fun enter(instance: WasmInstance) {
         caller = instance
         resumed = null
+        rewound = false
         if (!instance.module.isAsyncified) return
         if (instance.asyncState != WasmAsyncState.REWINDING) return
         val process = ctx.withKernelLock { process() }
@@ -53,6 +61,7 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
         // 止まった呼び出しに着いたのに退避した値が残っている: 巻き直しが食い違った（このプロセスだけを CRASHED にする）
         check(left == 0) { "巻き直しの終わりに退避した値が $left 個残っている" }
         instance.asyncState = WasmAsyncState.NORMAL
+        rewound = true
         resumed = ctx.withKernelLock {
             val w = process.asyncWait
             process.asyncWait = null

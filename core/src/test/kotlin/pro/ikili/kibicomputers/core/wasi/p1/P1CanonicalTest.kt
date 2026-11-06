@@ -9,6 +9,11 @@ import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
+import pro.ikili.kibicomputers.core.kernel.process.ExitReason
+import pro.ikili.kibicomputers.core.kernel.process.ExitStatus
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.tty.TtySizeInfo
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -375,5 +380,116 @@ class P1CanonicalTest {
         assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, kind { P1Canonical.lowerTtySizeResult(m, -8, null, 7) })
         assertEquals(WasmTrapKind.OTHER, kind { P1Canonical.lowerTtySizeResult(m, 0x104, info, 0) })
         assertArrayEquals(ByteArray(24), m.read(0x104, 24))
+    }
+
+    // ---- kibi:process（#74） ----
+
+    @Test
+    fun `stringは上限を超えたら読まずに指定のerrno、範囲外はfault、UTF-8でなければinvalid`() {
+        val m = CountingMemory()
+        m.write(0x100, "/bin".toByteArray())
+        assertEquals("/bin", P1Canonical.liftString(m, 0x100, 4, 16, Errno.NAMETOOLONG))
+        assertEquals("", P1Canonical.liftString(m, 0, 0, 16, Errno.NAMETOOLONG))
+        m.bytesRead = 0
+        assertErrno(Errno.NAMETOOLONG) { P1Canonical.liftString(m, 0x100, 17, 16, Errno.NAMETOOLONG) }
+        assertErrno(Errno.NAMETOOLONG) { P1Canonical.liftString(m, 0x100, -1, 16, Errno.NAMETOOLONG) }
+        assertEquals(0L, m.bytesRead)
+        assertErrno(Errno.FAULT) { P1Canonical.liftString(m, WasmMemory.PAGE_SIZE - 2, 4, 16, Errno.NAMETOOLONG) }
+        m.write(0x200, byteArrayOf(0xff.toByte()))
+        assertErrno(Errno.INVAL) { P1Canonical.liftString(m, 0x200, 1, 16, Errno.NAMETOOLONG) }
+    }
+
+    @Test
+    fun `argsは数が多すぎれば要素を読まずにtoo-big、合計が予算を超えれば中身を読まずにtoo-big`() {
+        val m = CountingMemory()
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftArgList(m, 0x200, 5, 4, P1Canonical.ArgBudget()) }
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftArgList(m, 0x200, -1, 4, P1Canonical.ArgBudget()) }
+        assertEquals(0L, m.bytesRead)
+        m.write(0x100, "abc".toByteArray())
+        m.putString(0x200, 0, 0x100, 3)
+        m.putString(0x200, 1, 0x100, 3)
+        // "abc " が2つで 8 バイト
+        assertEquals(listOf("abc", "abc"), P1Canonical.liftArgList(m, 0x200, 2, 4, P1Canonical.ArgBudget(8)))
+        m.bytesRead = 0
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftArgList(m, 0x200, 2, 4, P1Canonical.ArgBudget(7)) }
+        // 2つ目の中身は読まない（要素の (ptr, len) 2つと、1つ目の中身だけ）
+        assertEquals(16L + 3L, m.bytesRead)
+        // 巨大な長さは、範囲を確かめる前に予算で断る
+        m.putString(0x300, 0, 0x100, 0x7fff_ffff)
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftArgList(m, 0x300, 1, 4, P1Canonical.ArgBudget()) }
+        assertErrno(Errno.FAULT) { P1Canonical.liftArgList(m, WasmMemory.PAGE_SIZE - 4, 1, 4, P1Canonical.ArgBudget()) }
+        assertEquals(ProcessArgs.MAX_BYTES.toLong(), P1Canonical.ArgBudget().remaining)
+    }
+
+    @Test
+    fun `envは16バイトの組で、名前=値のNULまでを予算から引く`() {
+        val m = CountingMemory()
+        m.write(0x100, "HOME".toByteArray())
+        m.write(0x110, "/home".toByteArray())
+        m.writeI32(0x200, 0x100)
+        m.writeI32(0x204, 4)
+        m.writeI32(0x208, 0x110)
+        m.writeI32(0x20c, 5)
+        val budget = P1Canonical.ArgBudget(100)
+        assertEquals(listOf("HOME" to "/home"), P1Canonical.liftEnvList(m, 0x200, 1, 4, budget))
+        assertEquals(100L - (4 + 1 + 5 + 1), budget.remaining)
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftEnvList(m, 0x200, 1, 4, P1Canonical.ArgBudget(10)) }
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftEnvList(m, 0x200, 5, 4, P1Canonical.ArgBudget()) }
+        assertErrno(Errno.FAULT) { P1Canonical.liftEnvList(m, WasmMemory.PAGE_SIZE - 8, 1, 4, P1Canonical.ArgBudget()) }
+    }
+
+    @Test
+    fun `fd-assignは12バイトで、判別子0はparent、1はclosed、ほかはinvalid`() {
+        val m = CountingMemory()
+        m.writeI32(0x200, 1)
+        m.writeU8(0x204, 0)
+        m.writeI32(0x208, -1)
+        m.writeI32(0x20c, 5)
+        m.writeU8(0x210, 1)
+        m.writeI32(0x214, 99)
+        assertEquals(
+            listOf(KibiProcess.FdAssign(1, 0xffff_ffffL), KibiProcess.FdAssign(5, null)),
+            P1Canonical.liftFdAssigns(m, 0x200, 2, 4),
+        )
+        m.writeU8(0x210, 2)
+        assertErrno(Errno.INVAL) { P1Canonical.liftFdAssigns(m, 0x200, 2, 4) }
+        m.bytesRead = 0
+        assertErrno(Errno.INVAL) { P1Canonical.liftFdAssigns(m, 0x200, 5, 4) }
+        assertEquals(0L, m.bytesRead)
+        assertErrno(Errno.FAULT) { P1Canonical.liftFdAssigns(m, WasmMemory.PAGE_SIZE - 12, 2, 4) }
+    }
+
+    @Test
+    fun `result_option_exit-statusの配置`() {
+        val m = FakeMemory(1)
+        fun at(status: ExitStatus?, error: Int?): ByteArray {
+            m.write(0x100, ByteArray(16) { 0x55 })
+            P1Canonical.lowerStatusResult(m, 0x100, status, error)
+            return m.read(0x100, 16)
+        }
+        fun bytes(vararg pairs: Pair<Int, Int>) = ByteArray(16).also { b -> for ((i, v) in pairs) b[i] = v.toByte() }
+        assertArrayEquals(bytes(), at(null, null))
+        assertArrayEquals(bytes(0 to 1, 4 to 7), at(null, 7))
+        assertArrayEquals(
+            bytes(4 to 1, 8 to 0, 12 to 0x00, 13 to 0x28, 14 to 0x6b, 15 to 0xee),
+            at(ExitStatus(2, ExitReason.EXITED, 4_000_000_000L.toInt(), null), null),
+        )
+        assertArrayEquals(bytes(4 to 1, 8 to 1, 12 to 1, 13 to 3), at(ExitStatus(2, ExitReason.KILLED, 0, KillSignal.KILL), null))
+        assertArrayEquals(bytes(4 to 1, 8 to 1), at(ExitStatus(2, ExitReason.KILLED, 0, null), null))
+        assertArrayEquals(bytes(4 to 1, 8 to 2), at(ExitStatus(2, ExitReason.CRASHED, 0, null), null))
+        assertThrows<WasmTrapException> { P1Canonical.lowerStatusResult(m, 0x102, null, null) }
+        assertThrows<WasmTrapException> { P1Canonical.lowerStatusResult(m, WasmMemory.PAGE_SIZE - 8, null, null) }
+    }
+
+    @Test
+    fun `stringの結果はcabi_reallocで場所を取り、ptrを0に、lenを4に書く`() {
+        val m = FakeMemory(1)
+        val r = BumpRealloc()
+        P1Canonical.lowerStringResult(m, r, 0x100, "/home")
+        val p = m.readI32(0x100)
+        assertEquals(5, m.readI32(0x104))
+        assertEquals("/home", String(m.read(p, 5)))
+        assertEquals(1, r.calls.size)
+        assertThrows<WasmTrapException> { P1Canonical.lowerStringResult(m, BumpRealloc(), 0x102, "/") }
     }
 }

@@ -27,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessLifecycle
+import pro.ikili.kibicomputers.core.kernel.process.ProcessHandle
 import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRunner
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
@@ -247,6 +248,8 @@ public class Machine private constructor(
         override fun timerClosed(objectId: Int) = timers.cancel(objectId)
 
         override fun fileClosed(file: OpenFile) = vfs.releaseLater(file)
+
+        override fun processHandleClosed(holder: Process, obj: ProcessObject) = lifecycle.onProcessHandleClosedLocked(holder, obj)
     }
 
     /** [vfs] の後で行う知らせ（閉じたファイル、外したファイルシステム）を、起動用のスレッドでロックの外で行う（カーネルロックの中から呼んでよい） */
@@ -542,7 +545,28 @@ public class Machine private constructor(
         options: SpawnOptions = SpawnOptions(),
         parentPid: Int = 0,
         asInit: Boolean = false,
-    ): Int {
+    ): Int = spawnInternal(program, driver, options, parentPid, asInit, withHandle = false).pid
+
+    /**
+     * [spawn] と同じだが、子の `ProcessObject` を指す fd（読む権利だけ）を親 [parentPid] の fd 表に入れ、子の pid と一緒に返す
+     * （`kibi:process` の `[static]process.spawn`。#74、ADR 0074）。fd は子を表に足すのと同じカーネルロックの中で入れるので、
+     * 子は fd が入る前に動き出さない。親の fd 表が満杯なら、子を作らずに `MFILE`。[parentPid] は 0 にできない
+     */
+    @Throws(FsException::class)
+    internal fun spawnWithHandle(program: Program, driver: ProcessDriver, options: SpawnOptions, parentPid: Int): ProcessHandle {
+        require(parentPid != 0) { "親のないプロセスにはハンドルを返せない" }
+        return spawnInternal(program, driver, options, parentPid, asInit = false, withHandle = true)
+    }
+
+    @Throws(FsException::class)
+    private fun spawnInternal(
+        program: Program,
+        driver: ProcessDriver,
+        options: SpawnOptions,
+        parentPid: Int,
+        asInit: Boolean,
+        withHandle: Boolean,
+    ): ProcessHandle {
         val paths = resolveSpawnPaths(options, parentPid)
         lock.lock()
         try {
@@ -560,6 +584,8 @@ public class Machine private constructor(
             if (paths != null && (parent?.cwd ?: VfsPath.ROOT) != paths.base) fsError(Errno.AGAIN, "親の作業ディレクトリが変わった")
             val cwd = paths?.cwd ?: (parent?.cwd ?: VfsPath.ROOT)
             val fdEntries = resolveFdsLocked(options, parent, paths)
+            // 親に返すハンドルの空きは、表を変える前に確かめる（子を作ってから MFILE で断らない）
+            if (withHandle && checkNotNull(parent).handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${parent.handles.limit}）")
             val kind = driver.kind
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
@@ -574,6 +600,13 @@ public class Machine private constructor(
                 bootingValue = false
             }
             installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
+            // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
+            val handleFd = if (withHandle) {
+                kernel.objects.retain(process.objectId)
+                FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(process.objectId, HandleRights.READ)
+            } else {
+                -1
+            }
             val rt = ProcessRuntime(this, process, program, driver)
             runner.initRuntime(rt)
             runtimes[pid] = rt
@@ -586,7 +619,7 @@ public class Machine private constructor(
             } else {
                 cpu.enqueueThreadless(rt)
             }
-            return pid
+            return ProcessHandle(pid, handleFd)
         } finally {
             lock.unlock()
         }
@@ -630,22 +663,51 @@ public class Machine private constructor(
         await: ((CompletableFuture<Program>) -> Program)? = null,
     ): Int {
         val pending = beginExec(path, drivers, options, parentPid)
-        val future = pending.future
-        if (!future.isDone) {
-            try {
-                when {
-                    await != null -> await(future)
-                    // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
-                    else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
-                }
-            } catch (e: Throwable) {
-                // 待つのをやめた（止められた・起動の取り消し）。ほかに待つ側がなく、まだ始まっていなければ読み込まない（#363）
-                future.cancel(false)
-                // 読み込みの失敗そのものなら、下の finishExec で errno にする
-                if (loadFailureOf(future) !== e) throw e
-            }
-        }
+        awaitExecLoad(pending, asInit, await)
         return finishExec(pending, asInit)
+    }
+
+    /**
+     * [exec] と同じだが、子のハンドルを親 [parentPid] の fd 表に入れて返す（[spawnWithHandle]。#74）。
+     * 親の fd 表が満杯なら、読み込みの前に `MFILE`（子を作ってから断らない）
+     */
+    @Throws(FsException::class)
+    internal fun execWithHandle(
+        path: String,
+        drivers: ProcessDriverFactory,
+        options: SpawnOptions,
+        parentPid: Int,
+        await: ((CompletableFuture<Program>) -> Program)? = null,
+    ): ProcessHandle {
+        checkHandleRoom(parentPid)
+        val pending = beginExec(path, drivers, options, parentPid)
+        awaitExecLoad(pending, asInit = false, await)
+        return finishExecWithHandle(pending)
+    }
+
+    /** 親 [parentPid] の fd 表に、子のハンドルを入れる空きがあるか確かめる（なければ `MFILE`）。カーネルロックを自分で取る */
+    @Throws(FsException::class)
+    internal fun checkHandleRoom(parentPid: Int): Unit = lock.withLockValue {
+        val parent = requireNotNull(parentLocked(parentPid)) { "親のないプロセスにはハンドルを返せない" }
+        if (parent.handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${parent.handles.limit}）")
+    }
+
+    /** [exec] の読み込みの終わりを待つ（[await] がなければこのスレッドで）。待つのをやめたら、始まっていない読み込みは取り消す */
+    private fun awaitExecLoad(pending: PendingExec, asInit: Boolean, await: ((CompletableFuture<Program>) -> Program)?) {
+        val future = pending.future
+        if (future.isDone) return
+        try {
+            when {
+                await != null -> await(future)
+                // 起動の init は、起動の取り消し（stop()・reboot()・スケジューラの停止）で待つのをやめる
+                else -> awaitProgram(future, if (asInit) bootCancelSignal else null)
+            }
+        } catch (e: Throwable) {
+            // 待つのをやめた（止められた・起動の取り消し）。ほかに待つ側がなく、まだ始まっていなければ読み込まない（#363）
+            future.cancel(false)
+            // 読み込みの失敗そのものなら、後の finishExec で errno にする
+            if (loadFailureOf(future) !== e) throw e
+        }
     }
 
     /**
@@ -677,9 +739,25 @@ public class Machine private constructor(
      */
     @Throws(FsException::class)
     internal fun finishExec(pending: PendingExec, asInit: Boolean = false): Int {
+        val program = loadedProgram(pending)
+        val driver = pending.drivers.create(program)
+        return spawn(program, driver, pending.options.copy(args = pending.args), pending.parentPid, asInit)
+    }
+
+    /** [finishExec] と同じだが、子のハンドルを親の fd 表に入れて返す（[spawnWithHandle]。#74） */
+    @Throws(FsException::class)
+    internal fun finishExecWithHandle(pending: PendingExec): ProcessHandle {
+        val program = loadedProgram(pending)
+        val driver = pending.drivers.create(program)
+        return spawnWithHandle(program, driver, pending.options.copy(args = pending.args), pending.parentPid)
+    }
+
+    /** 終わった読み込み [pending] の [Program]。失敗は errno にして投げる。終わっていなければ [IllegalStateException] */
+    @Throws(FsException::class)
+    private fun loadedProgram(pending: PendingExec): Program {
         val future = pending.future
         check(future.isDone) { "読み込みが終わっていない" }
-        val program = try {
+        return try {
             awaitProgram(future, null)
         } catch (e: WasmLoadException) {
             Program.unsuspendableReason(e)?.let { fsError(Errno.NOEXEC, "${pending.path} は待機点に変換できない作りなので動かせない: $it") }
@@ -687,8 +765,6 @@ public class Machine private constructor(
         } catch (e: ProgramLoadBusyException) {
             fsError(Errno.AGAIN, "${pending.path} を読み込めない: ${e.message}")
         }
-        val driver = pending.drivers.create(program)
-        return spawn(program, driver, pending.options.copy(args = pending.args), pending.parentPid, asInit)
     }
 
     /**
