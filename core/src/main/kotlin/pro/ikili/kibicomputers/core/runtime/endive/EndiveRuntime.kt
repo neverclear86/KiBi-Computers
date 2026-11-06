@@ -44,6 +44,8 @@ import run.endive.wasm.WasmEngineException
 import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
+import run.endive.wasm.types.GlobalImport
+import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.Table
 import run.endive.wasm.types.TableLimits
@@ -57,6 +59,8 @@ import run.endive.wasm.WasmModule as EndiveModule
  *
  * [load] でパース・検証の後に、ランタイムコンパイラで JVM のバイトコードにコンパイルする（#29 の決定 B、#37）。
  * JVM のメソッドの上限を超える関数だけは、Endive がその関数をインタプリタで動かす（[InterpreterFallback.WARN]。ログに出る）。
+ * Endive のコンパイラは SIMD（v128）に対応していないので、SIMD を使う関数（[simdFunctions]）もその関数だけインタプリタで動かし、
+ * ほかの関数はコンパイルする（#424）。
  * コンパイルの後は、関数の本体を除いたモジュール（[CompiledModule.wasmModule]）だけを持ち、パースした命令の列は捨てる
  * （挿入後の lua.wasm で、ヒープが約 18 MB → 約 0.08 MB）。同じ WASM の読み込みの共有は、呼び出し側（カーネルの `ProgramCache`）が受け持つ。
  *
@@ -106,9 +110,13 @@ public class EndiveRuntime internal constructor(
         if (!compile) return interpreted
         // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
         val compiled = compileOrNull(module) ?: return interpreted
-        // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュールとコンパイル結果だけ
-        return EndiveWasmModule(compiled.wasmModule(), compiled)
+        // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
+        // コンパイル結果だけ
+        return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
     }
+
+    /** コンパイルの結果。[interpreted] は、インタプリタで動かす関数の番号（import を含めた番号） */
+    private class Compilation(val module: CompiledModule, val interpreted: Set<Int>)
 
     /**
      * [module] をコンパイルする。できなければ `null`（ログに出す）。
@@ -116,15 +124,27 @@ public class EndiveRuntime internal constructor(
      * Endive のコンパイラは、JVM のメソッドの上限を超える関数をインタプリタに回す（[InterpreterFallback.WARN]）が、
      * 上限の近くで ASM が上限超えを見分けられずに別の例外で落ちることがある（待機点への変換の後に燃料の計測コードを
      * 挿入した lua.wasm の `luaV_execute`。#37 で見つけた。`exec` は逆の順にして上限に収めている。#341）。そのときは、命令の数が多い関数から順にインタプリタに回して
-     * [MAX_COMPILE_RETRIES] 回までやり直す。それでもだめ（SIMD の局所変数など、コンパイラが対応しない作り）なら `null`。
+     * [MAX_COMPILE_RETRIES] 回までやり直す。それでもだめ（コンパイラが対応しない作り）なら `null`。
+     *
+     * SIMD を使う関数は、初めからインタプリタに回す（[simdFunctions]。#424）。関数の型（引数・戻り値）に v128 があると、
+     * 関数の呼び出しの橋渡しをコンパイルできないので、モジュール全体をインタプリタで動かす。
      *
      * ただし、例外処理（タグ）を使うモジュールでは、関数ごとにインタプリタとコンパイルしたコードを混ぜない
      * （混ぜると、Lua のコルーチンの戻り値が欠けるなど、結果が変わった。#341）。1つでもコンパイルできない関数があれば、
-     * モジュール全体をインタプリタで動かす。
+     * モジュール全体をインタプリタで動かす。SIMD を使う関数があるときも同じ。
      */
-    private fun compileOrNull(module: EndiveModule): CompiledModule? {
+    private fun compileOrNull(module: EndiveModule): Compilation? {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
-        val interpreted = LinkedHashSet<Int>()
+        val simd = simdFunctions(module)
+        if (simd == null) {
+            LOG.log(System.Logger.Level.WARNING, "WASM の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす")
+            return null
+        }
+        if (simd.isNotEmpty() && !mixable) {
+            LOG.log(System.Logger.Level.WARNING, "例外処理を使う WASM の関数 $simd が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす")
+            return null
+        }
+        val interpreted = LinkedHashSet(simd)
         var candidates: List<Int>? = null
         var attempt = 0
         while (true) {
@@ -136,9 +156,9 @@ public class EndiveRuntime internal constructor(
                     // 決めた関数をインタプリタに回すときは、ほかの関数の自動の切り替えは使えない（Endive の制約）
                     else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
                 }
-                return builder.compileModule().also {
-                    if (interpreted.isNotEmpty()) LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない）")
-                }
+                val compiled = builder.compileModule()
+                if (interpreted.isNotEmpty()) LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない）")
+                return Compilation(compiled, interpreted.toSet())
             } catch (e: RuntimeException) {
                 e
             } catch (e: StackOverflowError) {
@@ -167,6 +187,48 @@ public class EndiveRuntime internal constructor(
 
         /** やり直しでインタプリタに回す候補にする、関数の命令の数の下限（これより小さい関数は JVM のメソッドの上限に届かない） */
         private const val LARGE_FUNCTION_INSTRUCTIONS: Int = 4096
+
+        /**
+         * SIMD（v128）を使う関数の番号（import を含めた番号）。関数の型（引数・戻り値）に v128 があるなら `null`（#424）。
+         *
+         * SIMD の命令（`0xFD` の接頭辞）、v128 の局所変数、v128 のグローバルの読み書きのどれかを含む関数を選ぶ。
+         * v128 の値は、これらと、型に v128 がある関数の呼び出し・ブロックからしか生まれないので、残りの関数は v128 を扱わない。
+         */
+        internal fun simdFunctions(module: EndiveModule): Set<Int>? {
+            if (module.typeSection().types().any { t -> t.params().any(::isV128) || t.returns().any(::isV128) }) return null
+            val imports = module.importSection()
+            val v128Globals = HashSet<Int>()
+            var globalIndex = 0
+            for (i in 0 until imports.importCount()) {
+                val imp = imports.getImport(i)
+                if (imp is GlobalImport) {
+                    if (isV128(imp.type())) v128Globals += globalIndex
+                    globalIndex++
+                }
+            }
+            for (global in module.globalSection().globals()) {
+                if (isV128(global.valueType())) v128Globals += globalIndex
+                globalIndex++
+            }
+            val imported = imports.count(ExternalType.FUNCTION)
+            val bodies = module.codeSection().functionBodies()
+            val result = LinkedHashSet<Int>()
+            for (i in bodies.indices) {
+                val body = bodies[i]
+                val usesSimd = body.localTypes().any(::isV128) || body.instructions().any { ins ->
+                    val op = ins.opcode()
+                    op.opcode() ushr 8 == SIMD_PREFIX ||
+                        ((op == OpCode.GLOBAL_GET || op == OpCode.GLOBAL_SET) && ins.operand(0).toInt() in v128Globals)
+                }
+                if (usesSimd) result += i + imported
+            }
+            return result
+        }
+
+        private fun isV128(type: ValType): Boolean = type == ValType.V128
+
+        /** SIMD の命令の接頭辞 */
+        private const val SIMD_PREFIX: Int = 0xFD
 
         /** 命令の数が [LARGE_FUNCTION_INSTRUCTIONS] 以上の関数の番号（import を含めた番号）。大きい順 */
         private fun largeFunctions(module: EndiveModule): List<Int> {
@@ -377,6 +439,9 @@ internal fun romChunks(memory: WasmMemory): Int =
 /** [module] をコンパイルしたコードで動かすなら `true`（#37。テスト用） */
 internal fun isCompiled(module: WasmModule): Boolean = (module as? EndiveWasmModule)?.isCompiled ?: false
 
+/** コンパイルした [module] のうち、インタプリタで動かす関数の番号（import を含めた番号。#424。テスト用） */
+internal fun interpretedFunctions(module: WasmModule): Set<Int> = (module as? EndiveWasmModule)?.interpretedFunctions ?: emptySet()
+
 /** 戻り値のないホストの関数の戻り値 */
 private val NO_VALUES = LongArray(0)
 
@@ -476,7 +541,12 @@ internal fun trapKind(message: String): WasmTrapKind {
  * Endive のモジュール。[compiled] があればコンパイルしたコードで、なければインタプリタで動かす。
  * [module] は、コンパイルしたなら関数の本体を除いたもの（[CompiledModule.wasmModule]）。
  */
-private class EndiveWasmModule(val module: EndiveModule, private val compiled: CompiledModule?) : WasmModule {
+private class EndiveWasmModule(
+    val module: EndiveModule,
+    private val compiled: CompiledModule?,
+    /** コンパイルしたとき、インタプリタで動かす関数の番号（import を含めた番号。テスト用） */
+    val interpretedFunctions: Set<Int> = emptySet(),
+) : WasmModule {
     /** コンパイルしたコードで動かすなら `true`（テスト用） */
     val isCompiled: Boolean get() = compiled != null
 

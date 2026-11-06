@@ -82,6 +82,23 @@ kibiWasm {
             "-Wl,--export=is_even",
         )
     }
+    // SIMD（v128）を含むモジュール（#424）。SIMD を使う関数だけをインタプリタで動かし、ほかはコンパイルする
+    module("simd", sourceSet = "test") {
+        sources.from("src/test/wasm/simd.c")
+        target = "wasm32-freestanding"
+        compilerArgs.addAll(
+            "-O2",
+            "-s",
+            "-nostdlib",
+            "-msimd128",
+            "-Wl,--no-entry",
+            "-Wl,--export=run",
+            "-Wl,--export=sum",
+            "-Wl,--export=fill_seq",
+            "-Wl,--export=dot4",
+            "-Wl,--export=fib",
+        )
+    }
     // wasi-libc をリンクする WASI p1 のプログラム（lua.wasm などと同じビルドの形）
     module("hello-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/hello_wasi.c")
