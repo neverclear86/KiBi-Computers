@@ -105,10 +105,7 @@ val moonbitExperiments = tasks.register("moonbitExperiments") {
         val opts = linkedMapOf(
             "-O2" to listOf("-all", "-O2", "-g"),
             "-O3" to listOf("-all", "-O3", "-g"),
-            "-inline" to listOf(
-                "-all", "-O3", "-g", "--always-inline-max-function-size=12", "--flexible-inline-max-function-size=80",
-                "--inline-functions-with-loops", "--partial-inlining-ifs=4",
-            ),
+            "-O4" to listOf("-all", "-O4", "-g"),
             // 参考: トラップが起きないと仮定させる（範囲検査の unreachable を消せる。安全性は変わる）
             "-tnh" to listOf("-all", "-O3", "-g", "-tnh"),
         )
@@ -119,10 +116,15 @@ val moonbitExperiments = tasks.register("moonbitExperiments") {
                 moduleDir.copyRecursively(w, overwrite = true)
                 if (variant.isNotEmpty()) experimentsDir.resolve(variant).copyRecursively(w.resolve("cmd/$variant"), overwrite = true)
                 val target = work.resolve("${variant.ifEmpty { "base" }}-target")
-                var code = exec(w, bin.resolve("moon").absolutePath, "build", "--target", "wasm", "--release", "--no-strip", "--target-dir", target.absolutePath)
-                if (code != 0) code = exec(w, bin.resolve("moon").absolutePath, "build", "--target", "wasm", "--release", "--target-dir", target.absolutePath)
-                if (code != 0) continue
+                if (exec(w, bin.resolve("moon").absolutePath, "build", "--target", "wasm", "--release", "--no-strip", "--target-dir", target.absolutePath) != 0) continue
                 val built = target.walkTopDown().filter { it.isFile && it.extension == "wasm" }.toList()
+                // 名前を落とした普通のリリースのビルド（--no-strip は名前のほかにコードも少し変わるので、燃料はこちらでも測る）
+                val stripTarget = work.resolve("${variant.ifEmpty { "base" }}-strip-target")
+                val stripped = if (exec(w, bin.resolve("moon").absolutePath, "build", "--target", "wasm", "--release", "--target-dir", stripTarget.absolutePath) == 0) {
+                    stripTarget.walkTopDown().filter { it.isFile && it.extension == "wasm" }.toList()
+                } else {
+                    emptyList()
+                }
                 for (p in if (variant.isEmpty()) baseline else listOf(variant)) {
                     val wasm = built.firstOrNull { it.invariantSeparatorsPath.endsWith("/cmd/$p/$p.wasm") && "/release/" in it.invariantSeparatorsPath }
                         ?: built.firstOrNull { it.invariantSeparatorsPath.endsWith("/cmd/$p/$p.wasm") }
@@ -131,6 +133,11 @@ val moonbitExperiments = tasks.register("moonbitExperiments") {
                         continue
                     }
                     wasm.copyTo(out.resolve("$p.wasm"), overwrite = true)
+                    stripped.firstOrNull { it.invariantSeparatorsPath.endsWith("/cmd/$p/$p.wasm") }?.let { s ->
+                        s.copyTo(out.resolve("$p-strip.wasm"), overwrite = true)
+                        val dst = out.resolve("$p-strip-O3.wasm")
+                        if (exec(w, bin.resolve("moon-wasm-opt").absolutePath, s.absolutePath, "-all", "-O3", "-o", dst.absolutePath) != 0) dst.delete()
+                    }
                     for ((suffix, args) in opts) {
                         val dst = out.resolve("$p$suffix.wasm")
                         if (exec(w, bin.resolve("moon-wasm-opt").absolutePath, wasm.absolutePath, *args.toTypedArray(), "-o", dst.absolutePath) != 0) dst.delete()
