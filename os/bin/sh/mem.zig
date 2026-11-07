@@ -56,12 +56,18 @@ pub const Arena = struct {
     }
 };
 
-/// 末尾に足していく列。足す前に、ほかのものが後ろに置かれていたら、末尾へ写し直す
+/// 末尾に足していく列。
+///
+/// 写し直すときは容量を倍々に取る（#502）。語ごとにほかのものと交互に積まれる列（argv など）でも、
+/// 写し直しは要素の数の対数回で済み、使う量は最後の大きさのおよそ 2 倍に収まる（以前は 2 乗で増えた）。
+/// 容量の残りはこの列のものなので、値として写した列に、両方から足してはいけない。
 pub fn List(comptime T: type) type {
     return struct {
         const Self = @This();
         arena: *Arena,
         items: []T = &[_]T{},
+        /// 取ってある要素の数（`items.len` 以上）
+        cap: usize = 0,
 
         pub fn init(arena: *Arena) Self {
             return .{ .arena = arena };
@@ -73,21 +79,33 @@ pub fn List(comptime T: type) type {
 
         pub fn appendSlice(self: *Self, vs: []const T) Error!void {
             if (vs.len == 0) return;
+            const old = self.items.len;
+            const need = old + vs.len;
+            if (need > self.cap) try self.grow(need);
+            const p: [*]T = @ptrCast(self.items.ptr);
+            self.items = p[0..need];
+            @memcpy(self.items[old..], vs);
+        }
+
+        /// 少なくとも [need] 個入るようにする
+        fn grow(self: *Self, need: usize) Error!void {
             const a = self.arena;
             const base = @intFromPtr(a.buf.ptr);
-            const end = @intFromPtr(self.items.ptr) + self.items.len * @sizeOf(T);
-            if (self.items.len > 0 and end == base + a.top) {
-                // 末尾にいるので、そのまま伸ばす
-                if (a.top + vs.len * @sizeOf(T) > a.buf.len) return error.OutOfMemory;
-                a.top += vs.len * @sizeOf(T);
-                const p: [*]T = @ptrCast(self.items.ptr);
-                self.items = p[0 .. self.items.len + vs.len];
-            } else {
-                const n = try a.slice(T, self.items.len + vs.len);
-                @memcpy(n[0..self.items.len], self.items);
-                self.items = n;
+            const end = @intFromPtr(self.items.ptr) + self.cap * @sizeOf(T);
+            if (self.cap > 0 and end == base + a.top) {
+                // 末尾にいるので、写さずに伸ばす（要るだけ）
+                const more = (need - self.cap) * @sizeOf(T);
+                if (a.top + more > a.buf.len) return error.OutOfMemory;
+                a.top += more;
+                self.cap = need;
+                return;
             }
-            @memcpy(self.items[self.items.len - vs.len ..], vs);
+            // 倍々に取る（初めは要るだけ。1 つしか入らない列が多いので）。取れなければ要るだけ
+            const want = if (self.cap == 0) need else @max(need, self.cap * 2);
+            const n = a.slice(T, want) catch try a.slice(T, need);
+            @memcpy(n[0..self.items.len], self.items);
+            self.items = n[0..self.items.len];
+            self.cap = n.len;
         }
     };
 }
