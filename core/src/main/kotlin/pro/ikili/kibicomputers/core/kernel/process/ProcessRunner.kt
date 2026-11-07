@@ -59,7 +59,7 @@ internal class ProcessRunner(private val machine: Machine) {
     /** 作ったばかりの [ProcessRuntime] に、燃料切れの処理と [ProcessContext] を付ける */
     fun initRuntime(rt: ProcessRuntime) {
         rt.fuelHandler = object : WasmFuelHandler {
-            override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = onFuelExhausted(rt, instance, remaining)
+            override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = onFuelExhaustedPlain(rt, instance, remaining)
 
             override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long =
                 onFuelExhaustedUnwindable(rt, instance, remaining)
@@ -422,6 +422,7 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /** CPU を返す口（block・awaitHost・Wait・Exit）: 今の holder のグローバルを読んで 0 にし、遅延補充してから書き戻す */
     private fun releaseFuelLocked(rt: ProcessRuntime) {
+        rt.fuelOverdraft = false
         if (!rt.process.unmetered) {
             val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
             val r = holder.fuel
@@ -441,6 +442,34 @@ internal class ProcessRunner(private val machine: Machine) {
         if (rt.process.unmetered) return
         val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
         holder.fuel = grant
+    }
+
+    /**
+     * 止まりうる関数でない関数の中の燃料切れ（`kibi.fuel`）。
+     *
+     * 燃料切れも待ち点にしたモジュール（[Program.fuelYield]）の待機点型のプロセスなら、すぐにはスレッドを持って待たず、
+     * 残りを負のまま返して先へ進める（前借り。#477）。残りが負の間は、次に燃料を確かめるところ（関数の入口・loop の先頭）でまた呼ばれるので、
+     * 止まりうる関数の中で確かめたところ（`kibi.async_fuel`。[onFuelExhaustedUnwindable]）で巻き戻し、スレッドを持たずに燃料を待つ。
+     * 前借りが [FUEL_OVERDRAFT_LIMIT] に届いたら（止まりうる関数に戻らずに計算し続けている）、前と同じくスレッドを持ったまま待つ。
+     * 前借りした分は残り（負）として書き戻すので、マシンの燃料の借りになり、後の補充で返す
+     */
+    private fun onFuelExhaustedPlain(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
+        if (remaining > -FUEL_OVERDRAFT_LIMIT && rt.program.fuelYield) {
+            val overdraft = lock.withLockValue {
+                verifyInstanceLocked(rt, instance)
+                if (rt.killed) throw ProcessKilledException()
+                rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
+            }
+            if (overdraft) {
+                if (!rt.fuelOverdraft) {
+                    rt.fuelOverdraft = true
+                    scheduler.fuelOverdrafts.incrementAndGet()
+                }
+                return remaining
+            }
+        }
+        rt.fuelOverdraft = false
+        return onFuelExhausted(rt, instance, remaining)
     }
 
     /** 燃料切れの処理。グローバルを読まない・書かない（残りは引数、新しい手持ちは戻り値） */
@@ -483,6 +512,7 @@ internal class ProcessRunner(private val machine: Machine) {
             return lock.withLockValue { instance.fuel }
         }
         check(instance.asyncState == WasmAsyncState.NORMAL) { "巻き戻しの途中で燃料切れの呼び出しが走った" }
+        rt.fuelOverdraft = false
         rt.fuelUnwound = true
         rt.fuelUnwindRemaining = remaining
         instance.asyncState = WasmAsyncState.UNWINDING
@@ -1211,3 +1241,9 @@ private val TIMER_EVENT_PROBE = KernelEvent(TimerLimits.EVENT_TYPE)
  * 64 MiB（#370 の PoC と同じ）。マシンの RAM がこれより大きければ、RAM の大きさまで広げる
  */
 internal const val ADDRESS_SPACE_PAGES: Int = 1024
+
+/**
+ * 止まりうる関数でない関数の中で燃料が切れたとき、止まりうる関数に戻って巻き戻すまでに前借りしてよい燃料の上限（#477）。
+ * 届いたら、スレッドを持ったまま燃料を待つ。前借りの間は燃料を確かめるたびにホスト関数を呼ぶので、大きくしすぎない
+ */
+internal const val FUEL_OVERDRAFT_LIMIT: Long = 50_000

@@ -125,6 +125,9 @@ public class MachineScheduler private constructor(
     /** 燃料切れで、スレッドを持ったまま燃料を待った回数（数え口。#339） */
     internal val fuelBlockingWaits = AtomicLong()
 
+    /** 止まりうる関数でない関数の中の燃料切れで、前借りして先へ進めた回数（数え口。#477） */
+    internal val fuelOverdrafts = AtomicLong()
+
     init {
         dispatcher.start()
     }

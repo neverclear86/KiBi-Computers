@@ -34,6 +34,9 @@ internal class ProcessRuntime(
     /** 止めたシグナル（`stop()` で止めたなら `null`。最初のものを残す。カーネルロックの中で書く。#46） */
     var killSignal: KillSignal? = null
 
+    /** 止まりうる関数でない関数の中で燃料が切れ、前借りして巻き戻せるところを探している（プロセスのスレッドだけが読み書きする。#477） */
+    var fuelOverdraft: Boolean = false
+
     /** マシンの CPU を持っている（プロセスのスレッドだけが読み書きする） */
     var holdsCpu: Boolean = false
 
