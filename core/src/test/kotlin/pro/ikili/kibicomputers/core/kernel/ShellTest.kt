@@ -22,7 +22,6 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`・`hang`・`nap`）を使う
  */
 class ShellTest {
-
     private val limit = Duration.ofSeconds(180)
 
     private class ConsoleHost : MachineHost {
@@ -753,6 +752,51 @@ class ShellTest {
         val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
         assertEquals("+ cat\n+ cat\n+ set +x\n+ x=$value args q\n<q>\n+ x=short args r\n<r>\n", r.console)
         assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `関数の再帰は上限の100段まで動き、上限で知らせて止まる`() {
+        // #514: 上限に届く前に、スタックが尽きてシェルが落ちていた
+        val d = '$'
+        val r = sh("f() { echo -n .; f; }; f; echo after")
+        assertEquals(".".repeat(100) + "sh: f: too deeply nested function calls\n", r.console)
+        assertEquals(1, r.exitCode)
+        assertOutput("deep", "f() { case ${d}1 in 100) echo deep;; *) f ${d}((${d}1+1));; esac; }; f 1")
+        // 関数の中に複合コマンドの入れ子があっても、100段まで届く
+        val nested = sh("f() { if true; then while true; do { for i in 1; do case x in x) echo -n .; f;; esac; done; }; done; fi; }; f")
+        assertEquals(".".repeat(100) + "sh: f: too deeply nested function calls\n", nested.console)
+        assertEquals(1, nested.exitCode)
+    }
+
+    @Test
+    fun `関数の深さの誤りでも、set -xの跡は代入を展開して出す`() {
+        // #513・#514: 呼べない101段目も、呼ぶときと同じ `+ x=1 f` の跡を出してから知らせる
+        val r = sh("f() { x=1 f; }\nset -x\nf")
+        assertEquals("+ f\n" + "+ x=1 f\n".repeat(100) + "sh: f: too deeply nested function calls\n", r.console)
+        assertEquals(1, r.exitCode)
+    }
+
+    @Test
+    fun `スタックが尽きる前に、深い入れ子を誤りにして止まる`() {
+        // #514: 段の数の上限に届かなくても、eval・構文・算術式の入れ子でスタックが尽きる前に止まる（シェルは落ちない。
+        // [run] がプロセスの EXITED を確かめる）。eval の中の構文の誤りは、ほかと同じく eval が 2 で終わるだけ
+        val d = '$'
+        for (
+            script in listOf(
+                "f() { eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval eval f; }; f; echo after ${d}?",
+                "f() { eval 'if true; then { { { { { { { { { { { { { { { { { { { { f; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; }; fi'; }; f; echo after ${d}?",
+            )
+        ) {
+            val r = sh(script)
+            assertTrue(r.console.endsWith("too deeply nested\nafter 2\n"), r.console.takeLast(300))
+            assertEquals(0, r.exitCode)
+        }
+        for (script in listOf("(".repeat(5000) + "1" + ")".repeat(5000), "!".repeat(5000) + "1")) {
+            val r = sh("echo ${d}(( $script )); echo after")
+            assertTrue(r.console.contains("too deeply nested"), r.console.takeLast(300))
+            assertFalse(r.console.contains("after"), r.console.takeLast(300))
+            assertTrue(r.exitCode != 0, "exit ${r.exitCode}")
+        }
     }
 
     @Test

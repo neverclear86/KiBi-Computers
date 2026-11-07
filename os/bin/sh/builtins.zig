@@ -39,6 +39,14 @@ pub fn isPure(name: []const u8) bool {
 pub fn run(argv: []const []const u8) Error!u8 {
     const name = argv[0];
     const args = argv[1..];
+    // 中でコマンドを動かす（入れ子を深くする）のは eval と `.` だけ。ほかの組み込みのバッファ（パスなど）が、
+    // この2つの再帰の1段ごとのスタックに乗らないように、ほかは別の関数で動かす（#514）
+    if (eql(name, "eval")) return eval(args);
+    if (eql(name, ".") or eql(name, "source")) return dot(args);
+    return @call(.never_inline, runOther, .{ name, args });
+}
+
+fn runOther(name: []const u8, args: []const []const u8) Error!u8 {
     if (eql(name, ":") or eql(name, "true")) return 0;
     if (eql(name, "false")) return 1;
     if (eql(name, "echo")) return echo(args);
@@ -54,8 +62,6 @@ pub fn run(argv: []const []const u8) Error!u8 {
     if (eql(name, "return")) return returnBuiltin(args);
     if (eql(name, "break")) return loopControl(args, .break_);
     if (eql(name, "continue")) return loopControl(args, .continue_);
-    if (eql(name, "eval")) return eval(args);
-    if (eql(name, ".") or eql(name, "source")) return dot(args);
     if (eql(name, "read")) return read(args);
     if (eql(name, "test")) return testBuiltin(args, false);
     if (eql(name, "[")) return testBuiltin(args, true);
@@ -563,17 +569,23 @@ fn eval(args: []const []const u8) Error!u8 {
 /// `.` で読めるファイルの大きさの上限（残る領域の半分）
 const MAX_DOT_SIZE = mem.HEAP_SIZE / 2;
 
+/// `.` のファイルを `PATH` から探して開く（開けなければ知らせて null）。
+/// パスのバッファを、読んだ中身を動かす間（[dot] の再帰）のスタックに残さないように、別の関数にする（#514）
+noinline fn openDotFile(name: []const u8) ?io.Fd {
+    var buf: [fs.MAX_PATH]u8 = undefined;
+    const path = exec.findProgram(name, &buf) orelse name;
+    return fs.open(path, .{}) catch |e| {
+        util.complain(&.{ ".: ", name, ": ", kibi.errno.describe(e) });
+        return null;
+    };
+}
+
 fn dot(args: []const []const u8) Error!u8 {
     if (args.len == 0) {
         util.complain(&.{".: filename argument required"});
         return 2;
     }
-    var buf: [fs.MAX_PATH]u8 = undefined;
-    const path = exec.findProgram(args[0], &buf) orelse args[0];
-    const fd = fs.open(path, .{}) catch |e| {
-        util.complain(&.{ ".: ", args[0], ": ", kibi.errno.describe(e) });
-        return 1;
-    };
+    const fd = openDotFile(args[0]) orelse return 1;
     const st = fs.fstat(fd) catch |e| {
         io.close(fd) catch {};
         util.complain(&.{ ".: ", args[0], ": ", kibi.errno.describe(e) });

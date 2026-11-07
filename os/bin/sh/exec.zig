@@ -106,6 +106,11 @@ fn checkErrexit() void {
 // ---- 入り口 ----
 
 pub fn run(node: *Node) Error!void {
+    // 入れ子（複合コマンド・eval・`.`）を深くしすぎてスタックが尽きる前に、今のコマンドをやめる（#514）
+    if (util.stackLow()) {
+        util.complain(&.{"too deeply nested"});
+        return error.Abort;
+    }
     switch (node.kind) {
         .simple => {
             try runSimple(node);
@@ -117,10 +122,7 @@ pub fn run(node: *Node) Error!void {
                 defer state.in_condition -= 1;
                 try run(p.first);
                 state.status = @intFromBool(state.status == 0);
-            } else {
-                try runPipeline(p.first, p.count);
-                if (p.bang) state.status = @intFromBool(state.status == 0) else checkErrexit();
-            }
+            } else try runPipelineNode(p.first, p.count, p.bang);
         },
         .and_or => |a| {
             {
@@ -142,32 +144,44 @@ pub fn run(node: *Node) Error!void {
                 if (state.flow != .none) return;
             }
         },
-        .func => |f| {
-            const m = mem.mark();
-            defer mem.release(m);
-            const text = try parse.nodeText(f.body, &mem.ast);
-            try vars.defineFunc(f.name, text);
-            state.status = 0;
-        },
-        .subshell => {
-            const m = mem.mark();
-            defer mem.release(m);
-            const pm = pendingMark();
-            const child = (try startNode(node, .{})) orelse {
-                // 起こせなかった（コマンドがない・リダイレクトの誤り・括弧の中の展開の誤り）ときも、括弧が失敗したものとして `set -e` を見る
-                finishPending(pm);
-                checkErrexit();
-                return;
-            };
-            var list = [_]?process.Child{child};
-            state.status = waitChildren(&list, pm);
-            checkErrexit();
-        },
-        else => try runCompound(node),
+        .func => |f| try defineFunction(f.name, f.body),
+        .subshell => try runSubshell(node),
+        else => if (node.redirs != null) try runRedirected(node) else try runCompound(node),
     }
 }
 
-fn runCompound(node: *Node) Error!void {
+// 入れ子を深くしない処理は、[run] に溶け込んで再帰の1段ごとのスタックを大きくしないように、別の関数のままにする（#514）
+
+noinline fn runPipelineNode(first: *Node, count: usize, bang: bool) Error!void {
+    try runPipeline(first, count);
+    if (bang) state.status = @intFromBool(state.status == 0) else checkErrexit();
+}
+
+noinline fn defineFunction(name: []const u8, body: *Node) Error!void {
+    const m = mem.mark();
+    defer mem.release(m);
+    const text = try parse.nodeText(body, &mem.ast);
+    try vars.defineFunc(name, text);
+    state.status = 0;
+}
+
+noinline fn runSubshell(node: *Node) Error!void {
+    const m = mem.mark();
+    defer mem.release(m);
+    const pm = pendingMark();
+    const child = (try startNode(node, .{})) orelse {
+        // 起こせなかった（コマンドがない・リダイレクトの誤り・括弧の中の展開の誤り）ときも、括弧が失敗したものとして `set -e` を見る
+        finishPending(pm);
+        checkErrexit();
+        return;
+    };
+    var list = [_]?process.Child{child};
+    state.status = waitChildren(&list, pm);
+    checkErrexit();
+}
+
+/// リダイレクトの付いた複合コマンド。戻す fd の表（[Saves]）は、リダイレクトのあるときだけスタックに置く（#514）
+noinline fn runRedirected(node: *Node) Error!void {
     var saves = Saves{};
     if (!(try applyRedirs(node.redirs, &saves, true))) {
         restoreRedirs(&saves);
@@ -175,6 +189,10 @@ fn runCompound(node: *Node) Error!void {
         return;
     }
     defer restoreRedirs(&saves);
+    try runCompound(node);
+}
+
+fn runCompound(node: *Node) Error!void {
     switch (node.kind) {
         .group => |body| try run(body),
         .if_ => |i| {
@@ -337,7 +355,12 @@ fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_func
         if (eql(name, "command")) return commandBuiltin(node, argv, assigns, tr);
         return runInProcess(node, argv, assigns, tr);
     }
-    // 外のプログラム。代入はリダイレクトの前に展開する（跡をリダイレクトの誤りより先に出すため）
+    return runExternal(node, argv, assigns, tr);
+}
+
+/// 外のプログラムを起こして待つ。代入はリダイレクトの前に展開する（跡をリダイレクトの誤りより先に出すため）。
+/// 関数の呼び出しの道（[runArgv]）に [FdMap] を置かないように、別の関数にする（#514）
+noinline fn runExternal(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     var traced = Traced.init(tr);
     const env = try tempEnv(assigns, &traced);
     traced.write(io.STDERR);
@@ -404,7 +427,8 @@ fn tempAssign(assigns: ?*parse.Word, frame: usize, tr: ?[]const []const u8) Erro
 pub var local_frame: usize = 0;
 
 fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
-    if (state.func_depth >= MAX_FUNC_DEPTH) {
+    // 段の数が上限に届く前でも、スタックが尽きかけていれば止まる（#514。関数の中の入れ子が深いとき）
+    if (state.func_depth >= MAX_FUNC_DEPTH or util.stackLow()) {
         // 呼べなくても、跡は呼ぶときと同じく代入を展開して出してから知らせる（#513）
         try expandAssignsOnly(assigns, tr);
         util.complain(&.{ argv[0], ": too deeply nested function calls" });
@@ -415,6 +439,12 @@ fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?
     const frame = vars.savedMark();
     defer vars.restoreLocals(frame);
     try tempAssign(assigns, frame, tr);
+    if (node.redirs != null) return callRedirected(node, f, argv);
+    try callBody(f, argv);
+}
+
+/// リダイレクトの付いた関数の呼び出し（[Saves] は、このときだけスタックに置く。#514）
+noinline fn callRedirected(node: *Node, f: *vars.Func, argv: []const []const u8) Error!void {
     var saves = Saves{};
     if (!(try applyRedirs(node.redirs, &saves, true))) {
         restoreRedirs(&saves);
@@ -422,7 +452,11 @@ fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?
         return;
     }
     defer restoreRedirs(&saves);
+    try callBody(f, argv);
+}
 
+/// 関数の本体を、[argv] を位置引数にして動かす
+fn callBody(f: *vars.Func, argv: []const []const u8) Error!void {
     const old_params = vars.params;
     try vars.setParams(argv[1..]);
     defer {

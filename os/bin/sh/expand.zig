@@ -717,6 +717,8 @@ const Arith = struct {
     }
 
     fn unary(self: *Arith) Error!i64 {
+        // 括弧・単項演算子の入れ子は式の中で再帰するので、スタックが尽きる前に誤りにする（#514）
+        if (util.stackLow()) return self.fail("too deeply nested");
         if (self.eat("!")) return @intFromBool((try self.unary()) == 0);
         if (self.eat("~")) return ~(try self.unary());
         if (self.eat("-")) return -%(try self.unary());

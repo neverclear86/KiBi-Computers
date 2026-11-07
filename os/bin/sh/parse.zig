@@ -363,7 +363,7 @@ pub const Parser = struct {
 
     /// `$(` の次から `)` の次まで。中をコマンドとして読んで終わりを見つける（`case` の `)` を数え違えないため）
     fn skipCommandSub(self: *Parser, from: usize) Error!usize {
-        if (self.depth >= MAX_DEPTH) {
+        if (self.depth >= MAX_DEPTH or util.stackLow()) {
             self.syntax(from, "too deeply nested");
             return error.Syntax;
         }
@@ -612,7 +612,7 @@ pub const Parser = struct {
 
     fn command(self: *Parser) Error!*Node {
         const t = try self.peek();
-        if (self.depth >= MAX_DEPTH) {
+        if (self.depth >= MAX_DEPTH or util.stackLow()) {
             self.syntax(t.start, "too deeply nested");
             return error.Syntax;
         }

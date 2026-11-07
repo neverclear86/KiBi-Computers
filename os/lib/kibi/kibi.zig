@@ -17,5 +17,6 @@ pub const memory = @import("memory.zig");
 pub const time = @import("time.zig");
 pub const cli = @import("cli.zig");
 pub const tree = @import("tree.zig");
+pub const stack = @import("stack.zig");
 
 pub const Error = errno.Error;
