@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -67,6 +68,7 @@ class BasicCommandsTest {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home", "/mnt")) m.vfs.createDirectory(VfsPath.parse(d))
             m.vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
+            m.vfs.mount(VfsPath.parse("/dev"), DevFileSystem(), readOnly = false, source = "dev")
             for (name in listOf("sh", "echo", "true", "false") + commands) m.put("/bin/$name", imageFile("/bin/$name"))
             for ((path, text) in files) m.put(path, text.toByteArray())
             val env = mapOf("PATH" to "/bin", "HOME" to "/home")
@@ -729,6 +731,37 @@ class BasicCommandsTest {
             which ls sh
             which nothing; echo ${'$'}?
             which /bin/ls; echo ${'$'}?
+            """,
+        )
+    }
+
+
+    @Test
+    fun `devのnull・zero・tty`() {
+        assertOutput(
+            """
+            null
+            tty
+            zero
+            0
+            0
+            4
+            8
+            hi
+            ok
+            12
+            /dev/null
+            """,
+            """
+            ls /dev | cat
+            echo x >/dev/null; echo ${'$'}?
+            cat /dev/null | wc -c
+            head -c 4 /dev/zero | wc -c
+            head -c 8 /dev/zero | cat >/dev/null; head -c 8 /dev/zero | wc -c
+            echo hi >/dev/tty
+            ls /nothing 2>/dev/null || echo ok
+            head -c 12 /dev/zero >/tmp/z; wc -c </tmp/z
+            ls /dev/null
             """,
         )
     }

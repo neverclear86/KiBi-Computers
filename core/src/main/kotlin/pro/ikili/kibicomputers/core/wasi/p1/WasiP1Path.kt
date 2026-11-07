@@ -145,7 +145,8 @@ internal class WasiP1Path(private val ctx: ProcessContext) {
         // 開くのはロックの外（#52）。fd の表を変えるのはこのプロセスのスレッドだけなので、間に満杯になることはない
         val file = ctx.vfs.open(target.path, options, target.trailingSlash)
         val newFd = try {
-            ctx.withKernelLock { table().open(file, rights, flags) }
+            // /dev/tty なら、fd は制御端末（コンソールの TTY。マシンに1つ）を指す（#485）
+            ctx.withKernelLock { table().openFile(file, ctx.vfs, ctx.kernel.consoleTtyId, rights, flags) }
         } catch (e: Throwable) {
             ctx.vfs.close(file)
             throw e
