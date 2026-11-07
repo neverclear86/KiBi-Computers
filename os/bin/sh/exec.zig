@@ -125,13 +125,24 @@ pub fn run(node: *Node) Error!void {
             } else try runPipelineNode(p.first, p.count, p.bang);
         },
         .and_or => |a| {
+            // 左から順に動かす（`a && b || c` は `(a && b) || c`）。最後のもの以外は条件として動かす（`set -e` を見ない）
             {
                 state.in_condition += 1;
                 defer state.in_condition -= 1;
-                try run(a.left);
+                try run(a.first);
             }
-            if (state.flow != .none) return;
-            if ((state.status == 0) == a.is_and) try run(a.right);
+            var it: ?*parse.AndOrItem = a.rest;
+            while (it) |item| : (it = item.next) {
+                if (state.flow != .none) return;
+                if ((state.status == 0) != item.is_and) continue;
+                if (item.next == null) {
+                    try run(item.node);
+                } else {
+                    state.in_condition += 1;
+                    defer state.in_condition -= 1;
+                    try run(item.node);
+                }
+            }
         },
         .list => |l| {
             var it = l.first;
@@ -195,18 +206,28 @@ noinline fn runRedirected(node: *Node) Error!void {
 fn runCompound(node: *Node) Error!void {
     switch (node.kind) {
         .group => |body| try run(body),
-        .if_ => |i| {
-            {
-                state.in_condition += 1;
-                defer state.in_condition -= 1;
-                try run(i.cond);
+        .if_ => |first| {
+            // `elif` は入れ子の if なので、長い連鎖でも再帰しないよう、ここで順にたどる（#517）
+            var i = first;
+            while (true) {
+                {
+                    state.in_condition += 1;
+                    defer state.in_condition -= 1;
+                    try run(i.cond);
+                }
+                if (state.flow != .none) return;
+                if (state.status == 0) return run(i.then);
+                const e = i.else_ orelse {
+                    state.status = 0;
+                    return;
+                };
+                // elif の if にはリダイレクトが付かない
+                if (e.kind == .if_ and e.redirs == null) {
+                    i = e.kind.if_;
+                    continue;
+                }
+                return run(e);
             }
-            if (state.flow != .none) return;
-            if (state.status == 0) {
-                try run(i.then);
-            } else if (i.else_) |e| {
-                try run(e);
-            } else state.status = 0;
         },
         .loop => |l| {
             state.loop_depth += 1;
@@ -1818,7 +1839,10 @@ pub fn capture(cmd: []const u8) Error![]u8 {
     var count: usize = 0;
     while (true) {
         const n = (p.top() catch {
-            util.complain(&.{ "syntax error in command substitution: ", cmd });
+            // 入れ子のコマンド置換を中で動かす間にスタックが尽きかけたときは、構文の誤りではなく深さの誤りとして知らせる（#517）
+            if (util.stackLow()) {
+                util.complain(&.{"too deeply nested"});
+            } else util.complain(&.{ "syntax error in command substitution: ", cmd });
             state.status = 2;
             subst_status = 2;
             return &[_]u8{};

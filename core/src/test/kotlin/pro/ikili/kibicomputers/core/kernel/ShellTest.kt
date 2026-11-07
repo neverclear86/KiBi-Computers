@@ -1090,4 +1090,72 @@ class ShellTest {
         assertEquals("$line\n1000 w1000\n", r.console)
         assertEquals(0, r.exitCode)
     }
+
+    /** [script] をファイルに置いて動かす（引数の大きさの上限を超える長いスクリプト用） */
+    private fun shFile(script: String, files: Map<String, String> = emptyMap()): Result = run(listOf("/tmp/t.sh"), files + ("/tmp/t.sh" to script))
+
+    @Test
+    fun `ふつうに書きうる長さの連鎖と入れ子は、誤りにならずに動く`() {
+        // #517: 入力の大きさに比例して再帰していた道（&&・||・elif の連鎖）は再帰しない。入れ子は 100 段まで動く
+        val d = '$'
+        val cases = linkedMapOf(
+            "&& 1000" to List(1000) { "true" }.joinToString(" && ") + " && echo ok",
+            "|| 1000" to "false" + " || false".repeat(999) + " || echo ok",
+            "&&と|| 1000" to List(500) { "true && false" }.joinToString(" || ") + " || echo ok",
+            "; 1000" to "n=0; " + "n=${d}((n+1)); ".repeat(1000) + "[ ${d}n = 1000 ] && echo ok",
+            "elif 1000" to "x=999; if [ ${d}x = 0 ]; then echo no; " + (1..999).joinToString("\n") { "elif [ ${d}x = $it ]; then echo ok;" } + " else echo no; fi",
+            "case 1000" to "case w999 in\n" + (0..999).joinToString("\n") { "w$it) echo ok ;;" } + "\nesac",
+            "{ } 100" to "{ ".repeat(100) + "echo ok; " + "}; ".repeat(100),
+            "if 100" to "if true; then ".repeat(100) + "echo ok; " + "fi; ".repeat(100),
+            "関数の中の { } 100" to "f() { " + "{ ".repeat(100) + "echo ok; " + "}; ".repeat(100) + "}; f",
+            "while 100" to "while true; do ".repeat(100) + "echo ok; break 100; " + "done; ".repeat(100),
+            "$( ) 100" to "echo " + "${d}(echo ".repeat(100) + "ok" + ")".repeat(100),
+            "\${ } 100" to "echo " + "${d}{u:-\"".repeat(100) + "ok" + "\"}".repeat(100),
+            "算術の括弧 100" to "[ ${d}(( " + "(".repeat(100) + "1" + ")".repeat(100) + " )) = 1 ] && echo ok",
+            "算術の代入 100" to "[ ${d}(( " + "x=".repeat(100) + "1 )) = 1 ] && [ ${d}x = 1 ] && echo ok",
+            "算術の+= 100" to "x=0; : ${d}(( " + "x+=".repeat(100) + "1 )) && echo ok",
+            "算術の?: 100" to "[ ${d}(( " + "1?".repeat(100) + "1" + ":0".repeat(100) + " )) = 1 ] && echo ok",
+            "算術の項 10000" to "[ ${d}(( " + List(10000) { "1" }.joinToString("+") + " )) = 10000 ] && echo ok",
+            "test の ! 1000" to "[ " + "! ".repeat(1000) + "x ] && echo ok",
+            "* の多いパターン" to "s=" + "ab".repeat(500) + "; case ${d}s in " + "*a".repeat(200) + "*c) echo no ;; " + "*a*b".repeat(200) + ") echo ok ;; esac",
+        )
+        for ((name, script) in cases) {
+            val r = shFile(script)
+            assertEquals("ok\n", r.console, name)
+            assertEquals(0, r.exitCode, name)
+        }
+    }
+
+    @Test
+    fun `長いスクリプトとヒアドキュメントも動く`() {
+        val d = '$'
+        val lines = (1..2000).joinToString("\n") { "line $it ${d}x" }
+        val expected = (1..2000).joinToString("\n") { "line $it v" }
+        val script = "x=v; n=0\n" + "n=${d}((n+1))\n".repeat(2000) + "cat <<EOF\n$lines\nEOF\necho ${d}n"
+        val r = shFile(script)
+        assertEquals("$expected\n2000\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `極端に深い入れ子と連鎖は、誤りにしてシェルが動き続ける`() {
+        // #517: 数千段〜数万段の入れ子は、スタックが尽きる前に誤りにする（子のシェルが落ちずに誤りで終わり、親が続ける）
+        val d = '$'
+        val cases = linkedMapOf(
+            "算術の代入" to "echo ${d}(( " + "x=".repeat(20000) + "1 ))",
+            "算術の+=" to "echo ${d}(( " + "x+=".repeat(20000) + "1 ))",
+            "算術の?:" to "echo ${d}(( " + "1?".repeat(5000) + "1" + ":0".repeat(5000) + " ))",
+            "{ }" to "{ ".repeat(20000) + "echo ok; " + "}; ".repeat(20000),
+            "if" to "if true; then ".repeat(20000) + "echo ok; " + "fi; ".repeat(20000),
+            "$( )" to "echo " + "${d}(echo ".repeat(5000) + "ok" + ")".repeat(5000),
+            "\${ }" to "echo " + "${d}{u:-".repeat(20000) + "ok" + "}".repeat(20000),
+            "\"\${ }\"" to "echo " + "${d}{u:-\"".repeat(5000) + "ok" + "\"}".repeat(5000),
+        )
+        for ((name, script) in cases) {
+            val r = shFile("sh /tmp/deep.sh; echo after ${d}?", mapOf("/tmp/deep.sh" to script))
+            assertTrue(r.console.contains("too deeply nested"), "$name: ${r.console.takeLast(300)}")
+            assertTrue(Regex("after [12]\n$").containsMatchIn(r.console), "$name: ${r.console.takeLast(300)}")
+            assertFalse(r.console.contains("ok\n"), name)
+        }
+    }
 }

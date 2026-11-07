@@ -44,6 +44,13 @@ pub const Item = struct {
     next: ?*Item = null,
 };
 
+/// `&&`・`||` の連鎖の2つ目から先（[is_and] はその前の演算子が `&&`）
+pub const AndOrItem = struct {
+    node: *Node,
+    is_and: bool,
+    next: ?*AndOrItem = null,
+};
+
 pub const CaseItem = struct {
     patterns: *Word,
     body: ?*Node,
@@ -54,7 +61,8 @@ pub const Kind = union(enum) {
     simple: struct { assigns: ?*Word, words: ?*Word },
     /// パイプライン（`first` から `next` でつなぐ）
     pipeline: struct { first: *Node, count: usize, bang: bool },
-    and_or: struct { left: *Node, right: *Node, is_and: bool },
+    /// `&&`・`||` の連鎖（左から順に動かす。長い連鎖でも再帰しないよう、木ではなく並びで持つ。#517）
+    and_or: struct { first: *Node, rest: *AndOrItem },
     list: struct { first: ?*Item },
     subshell: *Node,
     group: *Node,
@@ -103,8 +111,8 @@ pub const Tok = enum {
 
 pub const Token = struct { kind: Tok, text: []const u8, start: usize, end: usize };
 
-/// 入れ子の深さの上限（スタックを使い切らないため）
-const MAX_DEPTH = 100;
+/// 入れ子の深さの上限。実際の限りはスタックの残り（[util.stackLow]）で決まり、これは念のための上限（#517）
+const MAX_DEPTH = 1000;
 
 pub const Parser = struct {
     src: []const u8,
@@ -127,6 +135,8 @@ pub const Parser = struct {
     line_base: usize = 1,
     /// 誤りを知らせない（`$(` の終わりを探す入れ子の読み）
     quiet: bool = false,
+    /// 入れ子が深すぎて止めた（`$(` の中の読みで止めたとき、外で深さの誤りとして知らせるため。#517）
+    too_deep: bool = false,
 
     pub fn init(src: []const u8, at_eof: bool) Parser {
         return .{ .src = src, .at_eof = at_eof };
@@ -292,6 +302,8 @@ pub const Parser = struct {
 
     /// `$` の位置から、その展開の終わりまで（`$` だけ・`$name` も）
     pub fn skipDollar(self: *Parser, at: usize) Error!usize {
+        // `${a:-${b:-...}}`・`"$(("...`の入れ子は、ここを通って再帰する。スタックが尽きる前に誤りにする（#517）
+        if (util.stackLow()) return self.tooDeep(at);
         const s = self.src;
         var i = at + 1;
         if (i == s.len) {
@@ -363,14 +375,12 @@ pub const Parser = struct {
 
     /// `$(` の次から `)` の次まで。中をコマンドとして読んで終わりを見つける（`case` の `)` を数え違えないため）
     fn skipCommandSub(self: *Parser, from: usize) Error!usize {
-        if (self.depth >= MAX_DEPTH or util.stackLow()) {
-            self.syntax(from, "too deeply nested");
-            return error.Syntax;
-        }
+        if (self.depth >= MAX_DEPTH or util.stackLow()) return self.tooDeep(from);
         const m = mem.mark();
         defer mem.release(m);
         var sub = Parser{ .src = self.src, .pos = from, .at_eof = self.at_eof, .depth = self.depth + 1, .quiet = true, .name = self.name, .line_base = self.line_base };
         _ = sub.compoundList() catch |e| {
+            if (e == error.Syntax and sub.too_deep) return self.tooDeep(sub.pos);
             if (e == error.Syntax and !self.quiet) self.syntax(sub.pos, "bad command substitution");
             return e;
         };
@@ -421,6 +431,12 @@ pub const Parser = struct {
             if (c == '\n') n += 1;
         }
         return n;
+    }
+
+    fn tooDeep(self: *Parser, pos: usize) Error {
+        self.too_deep = true;
+        self.syntax(pos, "too deeply nested");
+        return error.Syntax;
     }
 
     fn syntax(self: *Parser, pos: usize, what: []const u8) void {
@@ -573,16 +589,21 @@ pub const Parser = struct {
         const t0 = try self.peek();
         const start = t0.start;
         const hd_start = self.hd_total;
-        var left = try self.pipeline();
+        const first = try self.pipeline();
+        var rest: ?*AndOrItem = null;
+        var last: ?*AndOrItem = null;
         while (true) {
             const t = try self.peek();
             if (t.kind != .and_and and t.kind != .or_or) break;
             _ = try self.take();
             try self.skipNewlines();
-            const right = try self.pipeline();
-            left = try self.newNode(.{ .and_or = .{ .left = left, .right = right, .is_and = t.kind == .and_and } }, start, hd_start);
+            const item = try mem.ast.create(AndOrItem);
+            item.* = .{ .node = try self.pipeline(), .is_and = t.kind == .and_and };
+            if (last) |l| l.next = item else rest = item;
+            last = item;
         }
-        return left;
+        const r = rest orelse return first;
+        return try self.newNode(.{ .and_or = .{ .first = first, .rest = r } }, start, hd_start);
     }
 
     fn pipeline(self: *Parser) Error!*Node {
@@ -612,10 +633,7 @@ pub const Parser = struct {
 
     fn command(self: *Parser) Error!*Node {
         const t = try self.peek();
-        if (self.depth >= MAX_DEPTH or util.stackLow()) {
-            self.syntax(t.start, "too deeply nested");
-            return error.Syntax;
-        }
+        if (self.depth >= MAX_DEPTH or util.stackLow()) return self.tooDeep(t.start);
         self.depth += 1;
         defer self.depth -= 1;
         switch (t.kind) {
@@ -673,30 +691,50 @@ pub const Parser = struct {
         return n;
     }
 
-    /// `if` から `fi` まで（`elif` は入れ子の if にする）
-    fn ifRest(self: *Parser) Error!Kind {
-        _ = try self.take(); // if・elif
+    /// `if` から `fi` まで（`elif` は入れ子の if にする）。
+    /// 長い `elif` の連鎖でも再帰しないよう、`elif` の if を並べながら読み、`fi` の後で元の文字列の範囲を入れる（#517）
+    noinline fn ifRest(self: *Parser) Error!Kind {
+        _ = try self.take(); // if
         const cond = try self.compoundList();
         try self.expectWord("then");
         const then = try self.compoundList();
-        const t = try self.peek();
-        var else_: ?*Node = null;
-        if (isWord(t, "elif")) {
-            const start = t.start;
+        var result: Kind = .{ .if_ = .{ .cond = cond, .then = then, .else_ = null } };
+        var slot: *?*Node = &result.if_.else_;
+        // 最初の elif の if。読む間は、それぞれの src に頭の位置（長さ 0）、hd_count に頭のヒアドキュメントの数を置く
+        var first_elif: ?*Node = null;
+        while (true) {
+            const t = try self.peek();
+            if (!isWord(t, "elif")) break;
             const hd_start = self.hd_total;
-            const k = try self.ifRest();
-            else_ = try self.newNode(k, start, hd_start);
-            return .{ .if_ = .{ .cond = cond, .then = then, .else_ = else_ } };
-        }
-        if (isWord(t, "else")) {
             _ = try self.take();
-            else_ = try self.compoundList();
+            const c = try self.compoundList();
+            try self.expectWord("then");
+            const b = try self.compoundList();
+            const n = try mem.ast.create(Node);
+            n.* = .{ .kind = .{ .if_ = .{ .cond = c, .then = b, .else_ = null } }, .src = self.src[t.start..t.start], .hd_count = hd_start };
+            if (first_elif == null) first_elif = n;
+            slot.* = n;
+            slot = &n.kind.if_.else_;
+        }
+        if (isWord(try self.peek(), "else")) {
+            _ = try self.take();
+            slot.* = try self.compoundList();
         }
         try self.expectWord("fi");
-        return .{ .if_ = .{ .cond = cond, .then = then, .else_ = else_ } };
+        // elif の if の元の文字列は、`elif` から `fi` まで
+        var e = first_elif;
+        while (e) |n| {
+            const start = @intFromPtr(n.src.ptr) - @intFromPtr(self.src.ptr);
+            const filled = try self.newNode(n.kind, start, n.hd_count);
+            n.* = filled.*;
+            const next = n.kind.if_.else_ orelse break;
+            if (next.kind != .if_ or next.src.len != 0) break;
+            e = next;
+        }
+        return result;
     }
 
-    fn forRest(self: *Parser) Error!Kind {
+    noinline fn forRest(self: *Parser) Error!Kind {
         _ = try self.take(); // for
         const nt = try self.take();
         if (nt.kind != .word or !util.isName(nt.text)) {
@@ -736,7 +774,7 @@ pub const Parser = struct {
         return .{ .for_ = .{ .name = nt.text, .words = words, .has_in = has_in, .body = body } };
     }
 
-    fn caseRest(self: *Parser) Error!Kind {
+    noinline fn caseRest(self: *Parser) Error!Kind {
         _ = try self.take(); // case
         const wt = try self.take();
         if (wt.kind != .word) {
@@ -804,7 +842,7 @@ pub const Parser = struct {
         };
     }
 
-    fn redirects(self: *Parser) Error!?*Redir {
+    noinline fn redirects(self: *Parser) Error!?*Redir {
         var first: ?*Redir = null;
         var last: ?*Redir = null;
         while (true) {
@@ -860,7 +898,7 @@ pub const Parser = struct {
     }
 
     /// 単純なコマンド（関数の定義もここで見分ける）
-    fn simple(self: *Parser) Error!*Node {
+    noinline fn simple(self: *Parser) Error!*Node {
         const t0 = try self.peek();
         const start = t0.start;
         const hd_start = self.hd_total;

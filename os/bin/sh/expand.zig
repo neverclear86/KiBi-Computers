@@ -176,6 +176,12 @@ fn subParser(text: []const u8) parse.Parser {
 
 /// [text] を展開して [b] に足す。[in_dq] は `"` の中。[heredoc_mode] はヒアドキュメントの中身
 fn expandText(b: *Builder, text: []const u8, in_dq: bool, heredoc_mode: bool) Error!void {
+    // `${a:-${b:-...}}`・`"..."` の入れ子、中で動かすコマンド置換（`$(echo $(echo ...))`）は、ここを通って再帰する。
+    // スタックが尽きる前に、今のコマンドをやめる（#517）
+    if (util.stackLow()) {
+        util.complain(&.{"too deeply nested"});
+        return error.Abort;
+    }
     var p = subParser(text);
     var i: usize = 0;
     while (i < text.len) {
@@ -209,19 +215,19 @@ fn expandText(b: *Builder, text: []const u8, in_dq: bool, heredoc_mode: bool) Er
                     i += 1;
                     continue;
                 }
-                const end = p.skipSingle(i + 1) catch return badSubst(text);
+                const end = p.skipSingle(i + 1) catch return scanFailed(&p, text);
                 try b.quoted(text[i + 1 .. end - 1]);
                 i = end;
             },
             '"' => {
                 if (in_dq) {
                     // 入れ子の `${x:-"..."}` の中の引用
-                    const end = p.skipDouble(i + 1) catch return badSubst(text);
+                    const end = p.skipDouble(i + 1) catch return scanFailed(&p, text);
                     try expandText(b, text[i + 1 .. end - 1], true, false);
                     i = end;
                     continue;
                 }
-                const end = p.skipDouble(i + 1) catch return badSubst(text);
+                const end = p.skipDouble(i + 1) catch return scanFailed(&p, text);
                 const before = b.appended;
                 b.empty_at = false;
                 try expandText(b, text[i + 1 .. end - 1], true, false);
@@ -274,6 +280,15 @@ fn expandText(b: *Builder, text: []const u8, in_dq: bool, heredoc_mode: bool) Er
     }
 }
 
+/// 展開の終わりを探す読みが失敗した。入れ子が深すぎて止めたなら、そう知らせる（#517）
+fn scanFailed(p: *const parse.Parser, text: []const u8) Error {
+    if (p.too_deep) {
+        util.complain(&.{"too deeply nested"});
+        return error.Abort;
+    }
+    return badSubst(text);
+}
+
 fn badSubst(text: []const u8) Error {
     util.complain(&.{ text, ": bad substitution" });
     return error.Abort;
@@ -287,7 +302,7 @@ fn dollar(b: *Builder, p: *parse.Parser, text: []const u8, at: usize, in_dq: boo
     }
     const n = text[at + 1];
     if (n == '(') {
-        const end = p.skipDollar(at) catch return badSubst(text);
+        const end = p.skipDollar(at) catch return scanFailed(p, text);
         if (at + 2 < text.len and text[at + 2] == '(') {
             const v = try arith(text[at + 3 .. end - 2]);
             var buf: [24]u8 = undefined;
@@ -298,7 +313,7 @@ fn dollar(b: *Builder, p: *parse.Parser, text: []const u8, at: usize, in_dq: boo
         return end;
     }
     if (n == '{') {
-        const end = p.skipDollar(at) catch return badSubst(text);
+        const end = p.skipDollar(at) catch return scanFailed(p, text);
         try braceParam(b, text[at + 2 .. end - 1], in_dq);
         return end;
     }
@@ -549,7 +564,7 @@ fn commandSub(b: *Builder, cmd: []const u8, in_dq: bool) Error!void {
 
 /// `` `...` `` の位置 [at] から。中の `\$`・`` \` ``・`\\` を戻してからコマンド置換にする
 fn backtick(b: *Builder, p: *parse.Parser, text: []const u8, at: usize, in_dq: bool) Error!usize {
-    const end = p.skipBacktick(at + 1) catch return badSubst(text);
+    const end = p.skipBacktick(at + 1) catch return scanFailed(p, text);
     const inner = text[at + 1 .. end - 1];
     var cmd = mem.List(u8).init(&mem.ast);
     var i: usize = 0;
@@ -606,6 +621,8 @@ const Arith = struct {
     }
 
     fn assign(self: *Arith) Error!i64 {
+        // 代入（`x=x=...`・`x+=x+=...`）と `?:` の連鎖は、単項を通らずにここで再帰する（#517）
+        if (util.stackLow()) return self.fail("too deeply nested");
         self.ws();
         const save = self.i;
         if (self.i < self.s.len and util.isAlpha(self.s[self.i])) {
@@ -937,22 +954,34 @@ fn glob(pat: []const u8, out: *mem.List([]const u8)) Error!void {
     sort(out.items[start..]);
 }
 
-fn globRest(prefix: []const u8, rest: []const u8, out: *mem.List([]const u8)) Error!void {
-    if (rest.len == 0) {
-        try out.append(prefix);
-        return;
+/// [prefix]（展開したパス）の後ろの [rest]（印つきのパターン）に合うパスを [out] に足す。
+/// パターンのない部分はループで進め、再帰はパターンのある部分（実際にある、合ったディレクトリ）ごとに1段だけにする（#517）
+fn globRest(prefix0: []const u8, rest0: []const u8, out: *mem.List([]const u8)) Error!void {
+    if (util.stackLow()) {
+        util.complain(&.{"too deeply nested"});
+        return error.Abort;
     }
-    // 次の `/` までが 1 つの部分
-    var j: usize = 0;
-    while (j < rest.len and rest[j] != '/') : (j += 1) {
-        if (rest[j] == ESC) j += 1;
-    }
-    const part = rest[0..@min(j, rest.len)];
-    var next = rest[@min(j, rest.len)..];
-    const slash = next.len > 0;
-    while (next.len > 0 and next[0] == '/') next = next[1..];
+    var prefix = prefix0;
+    var rest = rest0;
+    var part: []const u8 = undefined;
+    var next: []const u8 = undefined;
+    var slash = false;
+    while (true) {
+        if (rest.len == 0) {
+            try out.append(prefix);
+            return;
+        }
+        // 次の `/` までが 1 つの部分
+        var j: usize = 0;
+        while (j < rest.len and rest[j] != '/') : (j += 1) {
+            if (rest[j] == ESC) j += 1;
+        }
+        part = rest[0..@min(j, rest.len)];
+        next = rest[@min(j, rest.len)..];
+        slash = next.len > 0;
+        while (next.len > 0 and next[0] == '/') next = next[1..];
+        if (hasGlob(part)) break;
 
-    if (!hasGlob(part)) {
         const lit = try unescape(part);
         var p = mem.List(u8).init(&mem.str);
         try p.appendSlice(prefix);
@@ -965,7 +994,8 @@ fn globRest(prefix: []const u8, rest: []const u8, out: *mem.List([]const u8)) Er
             try out.append(whole);
             return;
         }
-        return globRest(p.items, next, out);
+        prefix = p.items;
+        rest = next;
     }
 
     const dir = if (prefix.len == 0) "." else prefix;

@@ -854,6 +854,14 @@ const Test = struct {
     }
 
     fn notExpr(self: *Test) bool {
+        // `!`・`(` の入れ子はここを通って再帰する。スタックが尽きる前に、式の誤りにする（#517）
+        if (util.stackLow()) {
+            // 残りの引数は読まない（外へ戻る間に、もう一度ここで知らせない）
+            if (self.i < self.args.len) util.complain(&.{"test: too deeply nested"});
+            self.err = true;
+            self.i = self.args.len;
+            return false;
+        }
         if (self.peek()) |a| {
             // `! x`（ただし `! = x` のような 2 項の左は除く）
             if (eql(a, "!") and !(self.i + 1 < self.args.len and isBinary(self.args[self.i + 1]) and self.i + 2 < self.args.len)) {
