@@ -893,4 +893,14 @@ class ShellTest {
         assertTrue(text.contains("$ echo hi\nhi\n"), text)
         assertTrue(text.contains("> then echo multi\n> fi\nmulti\n"), text)
     }
+
+    @Test
+    fun `1000語ほどのコマンド行でも、echoとforが動く`() {
+        // #502: 語ごとにほかのものと交互に積まれる列（argv・for の値）が、語の数の 2 乗で領域を使っていた
+        val words = (1..1000).map { "w$it" }
+        val line = words.joinToString(" ")
+        val r = sh("echo $line; n=0; for i in $line; do n=${'$'}((n+1)); done; echo ${'$'}n ${'$'}i")
+        assertEquals("$line\n1000 w1000\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
 }
