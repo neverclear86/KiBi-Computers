@@ -742,16 +742,28 @@ class ShellTest {
 
     @Test
     fun `括弧を外して起こすコマンドのset -xの跡は、括弧でfd2を閉じたときと途中の括弧が失敗したときは書かない`() {
-        // #495 の設計メモのとおり。閉じた fd 2 には書かず、途中の括弧のリダイレクトが失敗したらコマンドまで進まない
+        // #495 の設計メモのとおり。閉じた fd 2 には書かず、途中の括弧のリダイレクトが失敗したらコマンドまで進まない。
+        // 途中の括弧が失敗した括弧自身の終了コードは 1（#499。`set +x` の前に取っておく）
         val d = '$'
         val script = "set -x\n" +
             "( args a ) 2>&-\n" +
-            "( ( args b ) </nonexistent ) 2>/tmp/e\n" +
+            "( ( args b ) </nonexistent ) 2>/tmp/e || echo status ${d}?\n" +
             "set +x\n" +
+            "cat /tmp/e\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals("<a>\n+ echo status 1\nstatus 1\n+ set +x\nsh: /nonexistent: No such file or directory\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧の中のコマンド自身のリダイレクトの誤りは、括弧のリダイレクトの先に出る`() {
+        // #498 から、POSIX のサブシェルと同じく、括弧の 2> の先に出る（シェルの stderr には出ない）
+        val d = '$'
+        val script = "( cat </nonexistent ) 2>/tmp/e\n" +
             "echo status ${d}?\n" +
             "cat /tmp/e\n"
         val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
-        assertEquals("<a>\n+ set +x\nstatus 0\nsh: /nonexistent: No such file or directory\n", r.console)
+        assertEquals("status 1\nsh: /nonexistent: No such file or directory\n", r.console)
         assertEquals(0, r.exitCode)
     }
 
