@@ -333,11 +333,12 @@ fn runSimple(node: *Node) Error!void {
         var a = s.assigns;
         while (a) |w| : (a = w.next) {
             const eq = util.indexOf(w.text, '=').?;
-            const value = try expand.assignValue(w.text[eq + 1 ..]);
+            // 値にパターンに効く文字がないと分かっていれば、変数に覚えさせる（展開で調べ直さない。#520）
+            const value = try expand.assignValueKnown(w.text[eq + 1 ..]);
             // 跡は bash・dash と同じく `+ name=value` の1語にする（#504）。値をつながずに続けて書く
             // （つなぐ領域が足りなくて代入が失敗しないように。#510）
-            if (state.xtrace) traceAssign(w.text[0 .. eq + 1], value);
-            try vars.set(w.text[0..eq], value);
+            if (state.xtrace) traceAssign(w.text[0 .. eq + 1], value.text);
+            try vars.setKnown(w.text[0..eq], value.text, value.plain);
         }
         var saves = Saves{};
         const ok = try applyRedirs(node.redirs, &saves, true);
@@ -361,9 +362,9 @@ fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_func
         var a = assigns;
         while (a) |w| : (a = w.next) {
             const eq = util.indexOf(w.text, '=').?;
-            const value = try expand.assignValue(w.text[eq + 1 ..]);
-            try traced.add(w.text[0 .. eq + 1], value);
-            try vars.set(w.text[0..eq], value);
+            const value = try expand.assignValueKnown(w.text[eq + 1 ..]);
+            try traced.add(w.text[0 .. eq + 1], value.text);
+            try vars.setKnown(w.text[0..eq], value.text, value.plain);
         }
         traced.write(io.STDERR);
         if (eql(name, "exec")) return execBuiltin(node, argv);

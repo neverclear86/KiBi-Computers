@@ -17,8 +17,16 @@ const eql = util.eql;
 pub const ESC: u8 = 0x01;
 
 fn isPatternChar(c: u8) bool {
-    return c == '*' or c == '?' or c == '[' or c == ']' or c == '\\' or c == ESC;
+    return pattern_chars[c];
 }
+
+/// 引用されたときに印を付ける文字の表（1 文字ずつ比べるより速い。#520）
+const pattern_chars = blk: {
+    var t: [256]bool = @splat(false);
+    for ("*?[]\\") |c| t[c] = true;
+    t[ESC] = true;
+    break :blk t;
+};
 
 const Builder = struct {
     /// できたフィールド（null ならフィールドを 1 つにまとめる）
@@ -36,6 +44,10 @@ const Builder = struct {
     empty_at: bool = false,
     /// チルダを展開する
     tilde: bool = true,
+    /// 印を置いた（置いていなければ、印を外す読み直しが要らない。#520）
+    esc: bool = false,
+    /// 印を外した結果に、パターンに効く文字があるかもしれない（偽なら、ないと分かっている。#520）
+    pat: bool = false,
 
     fn init(out: ?*mem.List([]const u8), split: bool) Builder {
         return .{ .out = out, .cur = mem.List(u8).init(&mem.str), .split = split };
@@ -51,10 +63,17 @@ const Builder = struct {
 
     /// 引用された文字
     fn quoted(self: *Builder, s: []const u8) Error!void {
-        for (s) |c| {
-            if (isPatternChar(c)) try self.cur.append(ESC);
-            try self.cur.append(c);
+        // 印の要らない文字の続きは、まとめて足す（1 文字ずつ足すと、長い値の展開が重い。#520）
+        var start: usize = 0;
+        for (s, 0..) |c, i| {
+            if (!isPatternChar(c)) continue;
+            try self.cur.appendSlice(s[start..i]);
+            try self.cur.append(ESC);
+            self.esc = true;
+            self.pat = true;
+            start = i;
         }
+        try self.cur.appendSlice(s[start..]);
         self.has = true;
         self.ws_finished = false;
         self.appended += 1;
@@ -62,10 +81,17 @@ const Builder = struct {
 
     /// 引用されていない文字（パターンとして効く）
     fn literal(self: *Builder, s: []const u8) Error!void {
-        for (s) |c| {
-            if (c == ESC) try self.cur.append(ESC);
-            try self.cur.append(c);
+        var start: usize = 0;
+        for (s, 0..) |c, i| {
+            if (!isPatternChar(c)) continue;
+            self.pat = true;
+            if (c != ESC) continue;
+            try self.cur.appendSlice(s[start..i]);
+            try self.cur.append(ESC);
+            self.esc = true;
+            start = i;
         }
+        try self.cur.appendSlice(s[start..]);
         self.has = true;
         self.ws_finished = false;
         self.appended += 1;
@@ -80,7 +106,26 @@ const Builder = struct {
         }
         const ifs = vars.get("IFS") orelse " \t\n";
         self.appended += 1;
-        for (s) |c| {
+        // フィールドに分けるときは結果を 1 つの文字列にしないので、調べない
+        self.pat = true;
+        // IFS の文字と印の表（値の文字ごとに IFS を探すと、長い値の展開が重い。#520）
+        var stop: [256]bool = @splat(false);
+        for (ifs) |c| stop[c] = true;
+        stop[ESC] = true;
+        var i: usize = 0;
+        while (i < s.len) {
+            // 区切りでも印でもない文字の続きは、まとめて足す
+            var j = i;
+            while (j < s.len and !stop[s[j]]) j += 1;
+            if (j > i) {
+                try self.cur.appendSlice(s[i..j]);
+                self.has = true;
+                self.ws_finished = false;
+                i = j;
+                continue;
+            }
+            const c = s[i];
+            i += 1;
             if (util.indexOf(ifs, c) != null) {
                 const white = c == ' ' or c == '\t' or c == '\n';
                 if (white) {
@@ -99,13 +144,42 @@ const Builder = struct {
                 }
                 continue;
             }
-            if (c == ESC) try self.cur.append(ESC);
+            if (c == ESC) {
+                try self.cur.append(ESC);
+                self.esc = true;
+            }
             try self.cur.append(c);
             self.has = true;
             self.ws_finished = false;
         }
     }
+
+    /// パターンに効く文字がないと分かっている展開の結果（変数の値。[vars.Var.plain]）。
+    /// 引用の中か分割しないなら、文字ごとに調べずにまとめて写す（#520）
+    fn plainExpansion(self: *Builder, s: []const u8, in_dq: bool) Error!void {
+        if (!in_dq and self.split and self.out != null) return self.expansion(s, false);
+        if (!in_dq and s.len == 0) return;
+        try self.cur.appendSlice(s);
+        self.has = true;
+        self.ws_finished = false;
+        self.appended += 1;
+    }
 };
+
+/// 変数の値に、パターンに効く文字がない（[vars.Var.plain] が分からなければ調べて覚える）
+fn varPlain(v: *vars.Var) bool {
+    if (v.plain) |p| return p;
+    const value = v.value orelse return true;
+    var p = true;
+    for (value) |c| {
+        if (isPatternChar(c)) {
+            p = false;
+            break;
+        }
+    }
+    v.plain = p;
+    return p;
+}
 
 // ---- 入り口 ----
 
@@ -131,7 +205,11 @@ pub fn fields(words: ?*parse.Word, out: *mem.List([]const u8)) Error!void {
 
 /// 1 つの文字列にする（分割・パス名の展開をしない）。代入の値・リダイレクトの先・case の語
 pub fn string(text: []const u8) Error![]const u8 {
-    return unescape(try pattern(text));
+    var b = Builder.init(null, false);
+    try expandText(&b, text, false, false);
+    // 印がなければ、外すために読み直さない（長い値の代入を軽くする。#520）
+    if (!b.esc) return b.cur.items;
+    return unescape(b.cur.items);
 }
 
 /// パターンとして展開する（引用された文字に印を残す）
@@ -144,6 +222,17 @@ pub fn pattern(text: []const u8) Error![]const u8 {
 /// 代入の値（`=` の後と `:` の後のチルダも展開する）
 pub fn assignValue(text: []const u8) Error![]const u8 {
     return string(text);
+}
+
+/// 展開した代入の値と、その値にパターンに効く文字がないと分かっているか（[vars.setKnown] に渡す）
+pub const Value = struct { text: []const u8, plain: bool };
+
+/// [assignValue] と同じに展開し、パターンに効く文字がないと分かっているかも返す（#520）
+pub fn assignValueKnown(text: []const u8) Error!Value {
+    var b = Builder.init(null, false);
+    try expandText(&b, text, false, false);
+    const v = if (b.esc) try unescape(b.cur.items) else b.cur.items;
+    return .{ .text = v, .plain = !b.pat };
 }
 
 /// ヒアドキュメントの中身（`$`・`` ` ``・`\` だけが効く）
@@ -338,6 +427,15 @@ fn isSpecial(c: u8) bool {
 /// `$name`・`$1`・`$@` など
 fn simpleParam(b: *Builder, name: []const u8, in_dq: bool) Error!void {
     if (eql(name, "@") or eql(name, "*")) return allParams(b, eql(name, "*"), in_dq);
+    if (util.isAlpha(name[0])) {
+        // 名前の変数は、値にパターンに効く文字がないと分かっていれば、まとめて写す（#520）
+        if (vars.find(name)) |x| {
+            if (x.value) |val| {
+                if (varPlain(x)) return b.plainExpansion(val, in_dq);
+                return b.expansion(val, in_dq);
+            }
+        }
+    }
     const v = try lookup(name);
     if (v == null) {
         if (state.nounset and !eql(name, "@") and !eql(name, "*")) {

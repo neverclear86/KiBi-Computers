@@ -104,6 +104,38 @@ class ShellTest {
         }
     }
 
+    /**
+     * [script] を `sh -c` で動かし、終わるまでに使った燃料を、1 tick [perTick] の何 tick 分かで返す。
+     * 燃料を待って止まったときだけ tick を進めるので、遅い環境でも数は揺れない（1 tick 分の誤差まで）
+     */
+    private fun fuelTicks(script: String, perTick: Long = 1_000_000): Int = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = perTick, host = host, memoryBytes = 16L * 1024 * 1024)
+            root(m, emptyMap())
+            val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh", "-c", script), env = mapOf("PATH" to "/bin"), cwd = "/", fds = SpawnOptions.ROOT_PREOPEN))
+            var ticks = 0
+            while (!m.stateOf(pid).isTerminal) {
+                h.scheduler.tick()
+                ticks++
+                eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
+                    when (m.stateOf(pid)) {
+                        // この tick の燃料を受け取ってから（補充した tick が今）、また燃料を待っている
+                        ProcessState.WAITING_FUEL -> m.lock.withLockValue { m.fuelAccount.lastRefillTick == h.scheduler.now }
+                        ProcessState.RUNNABLE -> m.lock.withLockValue {
+                            val rt = m.rt(pid)
+                            m.fuelAccount.lastRefillTick == h.scheduler.now &&
+                                rt.thread == null && rt.waitSet == null && rt.process.asyncStack?.isEmpty == false
+                        }
+                        else -> m.stateOf(pid).isTerminal
+                    }
+                }
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), host.text())
+            ticks
+        }
+    }
+
     private fun sh(script: String, files: Map<String, String> = emptyMap()): Result = run(listOf("-c", script.trimIndent()), files)
 
     private fun assertOutput(expected: String, script: String, files: Map<String, String> = emptyMap()) {
@@ -1248,5 +1280,57 @@ class ShellTest {
             assertTrue(Regex("after [12]\n$").containsMatchIn(r.console), "$name: ${r.console.takeLast(300)}")
             assertFalse(r.console.contains("ok\n") || r.console.contains("st\n"), name)
         }
+    }
+
+    @Test
+    fun `変数に文字列を足していくループは、ループだけの燃料の数倍に収まる`() {
+        // #520: 以前は足す値を 1 文字ずつ写していたので、長さの 2 乗で燃料を使った（3,000 回で 20 倍ほど）
+        val d = '$'
+        val n = 3000
+        val loop = fuelTicks("i=0; while [ ${d}i -lt $n ]; do i=${d}((i+1)); done")
+        val append = fuelTicks("s=; i=0; while [ ${d}i -lt $n ]; do s=\"${d}s x=\"; i=${d}((i+1)); done; [ ${d}{#s} -eq ${n * 3} ]")
+        assertTrue(append <= loop * 2, "ループだけ $loop tick、足すループ $append tick")
+    }
+
+    @Test
+    fun `長い値を何度も積み上げても、シェルの残る領域は尽きない`() {
+        // #520: 古い値を返した空きが断片にならず、使い回される（足した量の合計は残る領域の 512 KiB を大きく超える）
+        assertOutput(
+            """
+            3300 3000 ok
+            """,
+            """
+            r=0
+            while [ ${'$'}r -lt 40 ]; do
+                s=; t=; i=0
+                while [ ${'$'}i -lt 300 ]; do s="${'$'}s abcdefghij"; t="${'$'}t a*b?[c]\d"; i=${'$'}((i+1)); done
+                r=${'$'}((r+1))
+            done
+            echo ${'$'}{#s} ${'$'}{#t} ok
+            """,
+        )
+    }
+
+    @Test
+    fun `パターンに効く文字のある値とない値は、展開で引用のとおりに扱う`() {
+        // #520: 値にパターンに効く文字がないと覚えた変数は、まとめて写す。ある値は今までどおり印を付ける
+        assertOutput(
+            """
+            x* x*
+            glob
+            lit
+            plain
+            [x] y
+            nolit
+            """,
+            """
+            s=x; s="${'$'}s*"; t=${'$'}s; echo "${'$'}s" "${'$'}t"
+            case xyz in ${'$'}t) echo glob;; esac
+            case 'x*' in "${'$'}t") echo lit;; esac
+            p=abc; q="${'$'}p"; case abc in ${'$'}q) echo plain;; esac
+            u='[x]'; v="${'$'}u"; w=y; echo "${'$'}v" ${'$'}w
+            case x in "${'$'}u") echo lit;; *) echo nolit;; esac
+            """,
+        )
     }
 }
