@@ -196,6 +196,22 @@ class ShellLineEditTest {
     }
 
     @Test
+    fun `ちょうど画面の幅で終わる行を確定しても、空行は入らない`() {
+        val s = session(listOf("echo 0123456789abc\r", "echo 0123456789abcdefghijklmnopqrstuvw\r", "exit\r"), columns = 20, rows = 12)
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789abc")
+        assertTrue(i >= 0, shown)
+        assertEquals("0123456789abc", rows[i + 1], shown)
+        // 2 行分ちょうど
+        assertEquals("$ echo 0123456789abc", rows[i + 2], shown)
+        assertEquals("defghijklmnopqrstuvw", rows[i + 3], shown)
+        assertEquals("0123456789abcdefghij", rows[i + 4], shown)
+        assertEquals("klmnopqrstuvw", rows[i + 5], shown)
+        assertTrue(rows[i + 6].startsWith("$"), shown)
+    }
+
+    @Test
     fun `前の出力が改行で終わっていなくても、プロンプトは次の行に出る`() {
         val s = session(listOf("printf abc\r", "exit\r"))
         assertTrue(s.host.rows().contains("abc"), s.host.rows().joinToString("\n"))

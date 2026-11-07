@@ -1435,7 +1435,20 @@ fn closeDeferred(fds: []?io.Fd) void {
 
 // ---- 後ろで動かす ----
 
-pub const Job = struct { child: process.Child, pid: u32, status: ?u8 = null };
+pub const Job = struct {
+    child: process.Child,
+    pid: u32,
+    status: ?u8 = null,
+    /// `jobs` に見せるコマンド（長ければ切る）
+    cmd_buf: [JOB_CMD_MAX]u8 = undefined,
+    cmd_len: u8 = 0,
+
+    pub fn command(self: *const Job) []const u8 {
+        return self.cmd_buf[0..self.cmd_len];
+    }
+};
+/// `jobs` に見せるコマンドの長さの上限（バイト）。超えたら切って `...` を付ける
+pub const JOB_CMD_MAX = 80;
 pub const MAX_JOBS = 32;
 pub var jobs: [MAX_JOBS]?Job = @splat(null);
 /// 後ろのジョブのハンドルを置く fd（ユーザーのリダイレクトとぶつからないよう、高い番号に移す）
@@ -1481,6 +1494,7 @@ fn runBackground(node: *Node) Error!void {
     } else |_| {}
     const pid = c.pid();
     jobs[k] = .{ .child = c, .pid = pid };
+    setJobCommand(&jobs[k].?, node.src);
     state.last_bg = pid;
     state.status = 0;
     if (state.interactive) {
@@ -1492,6 +1506,69 @@ fn runBackground(node: *Node) Error!void {
         io.err(io.formatUnsigned(&b2, pid));
         io.err("\n");
     }
+}
+
+/// [src] の前後の空白を除き、改行・タブを空白にして、ジョブのコマンドにする（長ければ切って `...` を付ける）
+fn setJobCommand(j: *Job, src: []const u8) void {
+    var a: usize = 0;
+    var b = src.len;
+    while (a < b and isBlank(src[a])) a += 1;
+    while (b > a and isBlank(src[b - 1])) b -= 1;
+    var text = src[a..b];
+    var cut = false;
+    if (text.len > JOB_CMD_MAX) {
+        // UTF-8 の文字の途中で切らない
+        var n: usize = JOB_CMD_MAX - 3;
+        while (n > 0 and text[n] & 0xc0 == 0x80) n -= 1;
+        text = text[0..n];
+        cut = true;
+    }
+    for (text, 0..) |c, i| j.cmd_buf[i] = if (c == '\n' or c == '\t' or c == '\r') ' ' else c;
+    var n = text.len;
+    if (cut) {
+        @memcpy(j.cmd_buf[n..][0..3], "...");
+        n += 3;
+    }
+    j.cmd_len = @intCast(n);
+}
+
+fn isBlank(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// `jobs [-l] [-p]`（#486）: 後ろのジョブの番号・状態・コマンドを書く（`-l` は pid も、`-p` は pid だけ）。
+/// 会話的なシェルでは、終わったと書いたものを片付ける（終わったと知らせた後と同じ）
+pub fn listJobs(with_pid: bool, pid_only: bool) Error!u8 {
+    reapJobs(false);
+    for (&jobs, 0..) |*slot, k| {
+        const j = if (slot.*) |*x| x else continue;
+        var b1: [12]u8 = undefined;
+        var b2: [12]u8 = undefined;
+        var b3: [12]u8 = undefined;
+        const pid = io.formatUnsigned(&b2, j.pid);
+        if (pid_only) {
+            if (!(try out(pid)) or !(try out("\n"))) return 1;
+        } else {
+            const failed = j.status != null and j.status.? != 0;
+            const st: []const u8 = if (j.status == null) "Running" else if (failed) "Exit" else "Done";
+            const parts = [_][]const u8{
+                "[",
+                io.formatUnsigned(&b1, k + 1),
+                "] ",
+                if (with_pid) pid else "",
+                if (with_pid) " " else "",
+                st,
+                if (failed) " " else "",
+                if (failed) io.formatUnsigned(&b3, j.status.?) else "",
+                "  ",
+                j.command(),
+                if (j.status == null) " &\n" else "\n",
+            };
+            for (parts) |p| if (!(try out(p))) return 1;
+        }
+        if (j.status != null and state.interactive) slot.* = null;
+    }
+    return 0;
 }
 
 /// 後ろで動かすものに [from] から後に積んだもの（ヒアドキュメント）を、待たずに渡す。
@@ -1529,7 +1606,7 @@ fn spawnWriter(fd: io.Fd, data: []const u8) bool {
 /// 終わった後ろのジョブの終了コードを受け取る（[report] なら終わったことを書く）
 pub fn reapJobs(report: bool) void {
     for (&jobs, 0..) |*slot, k| {
-        const j = &(slot.* orelse continue);
+        const j = if (slot.*) |*x| x else continue;
         if (j.status != null) continue;
         const st = (j.child.status() catch continue) orelse continue;
         j.status = statusOf(st);

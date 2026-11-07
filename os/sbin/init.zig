@@ -3,7 +3,8 @@
 //! 1. `/etc/inittab` を読む（なければ既定。書式は下と docs/adr/0100-sbin-init.md）
 //! 2. `run` の行を書いた順に、1つずつ終わるまで待って動かす（起動時の準備）
 //! 3. `daemon`・`respawn` の行を後ろで起こす（標準入力は渡さない。出力はコンソール）
-//! 4. コンソールの TTY を初期化して（cooked に戻す）、`shell` の行のシェルをログインなしで前景に起こす
+//! 4. コンソールの TTY を初期化して（cooked に戻す）、`shell` の行のシェルをログインなしで前景に起こす。
+//!    シェルの cwd は `HOME`（ディレクトリでなければ `/`）。ほかの子の cwd は `/`
 //! 5. 子の終わりを待ち続ける。`shell`・`respawn` は終わったら起こし直す（1 秒未満で終わったら 1 秒おく）
 //!
 //! inittab の書式（1 行 1 項目。`#` で始まる行と空行は飛ばす。語は空白・タブで区切り、引用符は使えない）:
@@ -221,6 +222,22 @@ fn setEnv(name: []const u8, value: []const u8) bool {
     return true;
 }
 
+fn getEnv(name: []const u8) ?[]const u8 {
+    for (env[0..env_len]) |e| {
+        if (eql(e.name.ptr[0..e.name.len], name)) return e.value.ptr[0..e.value.len];
+    }
+    return null;
+}
+
+/// シェルを始めるディレクトリ。`HOME` が絶対パスのディレクトリならそこ、そうでなければ `/`
+/// （起こすたびに見る。HDD を外して `/home` がなくなっても、シェルは起きる）
+fn homeDir() []const u8 {
+    const home = getEnv("HOME") orelse return "/";
+    if (home.len == 0 or home[0] != '/') return "/";
+    const st = fs.stat(home) catch return "/";
+    return if (st.kind == .directory) home else "/";
+}
+
 fn str(s: []const u8) process.String {
     return .{ .ptr = s.ptr, .len = @intCast(s.len) };
 }
@@ -249,7 +266,7 @@ fn spawn(e: *Entry, background: bool) ?process.Child {
     const fds: []const process.FdAssign = if (background) &closed_stdin else &.{};
     const child = process.spawn(e.argv[0], e.argv, .{
         .env = env[0..env_len],
-        .cwd = "/",
+        .cwd = if (e.kind == .shell) homeDir() else "/",
         .fds = fds,
     }) catch |err| {
         say3("init: cannot start ", e.argv[0], ": ");

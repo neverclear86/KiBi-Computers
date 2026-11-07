@@ -804,6 +804,14 @@ fn finishLine(suffix: []const u8) void {
         pos = len;
         refresh();
     }
+    // ちょうど右端で終わった行は、refresh がもう次の行の頭に出ている（そこでさらに改行すると空行が入る）
+    var p: Pos = .{};
+    measurePrompt(&p, prompt);
+    measureLine(line[0..len], &p);
+    if (suffix.len == 0 and p.pending) {
+        flush();
+        return;
+    }
     put(suffix);
     put("\n");
     flush();

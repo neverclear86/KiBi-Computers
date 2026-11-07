@@ -70,7 +70,7 @@ sh [-eufxvC] [-s] [-i] [引数...]       # 標準入力から読む
 ## 組み込み
 
 特別な組み込み（代入が残り、関数より先）: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local`。
-ほか: `history`（#102。ADR 0102） `true` `false` `echo`（`-n`）`printf`（`%s %b %c %d %i %u %o %x %X %%`、フラグ・幅・精度、書式の繰り返し）`cd`（`-`・`HOME`・`PWD`・`OLDPWD`）`pwd` `read`（`-r`）`test`/`[` `wait` `command`（`-v`・`-V`）`type` `source`。
+ほか: `history`（#102。ADR 0102） `true` `false` `echo`（`-n`）`printf`（`%s %b %c %d %i %u %o %x %X %%`、フラグ・幅・精度、書式の繰り返し）`cd`（`-`・`HOME`・`PWD`・`OLDPWD`）`pwd` `read`（`-r`）`test`/`[` `wait` `jobs`（`-l`・`-p`。#486）`command`（`-v`・`-V`）`type` `source`。
 
 - `exec cmd` は置き換えられないので、動かしてその終了コードで終わる。`exec` だけならリダイレクトをシェルに残す
 - `test -r/-w/-x` は、持ち主・権限がまだない（#110）ので、あれば真
@@ -87,7 +87,7 @@ Zig の標準ライブラリのアロケーターは使わない（ADR 0098）�
 
 ## 今の制限（必要になったら足す）
 
-- `trap`・`alias`・`getopts`・`umask`・`jobs`/`fg`/`bg`（ジョブ制御）はない
+- `trap`・`alias`・`getopts`・`umask`・`fg`/`bg`・`%n`（ジョブ制御）はない。`jobs` は番号・状態（`Running`・`Done`・`Exit n`）・コマンドを書くだけで、パイプラインの段などの子のシェルでは空になる。会話的なシェルでは、終わったと書いたジョブを片付ける
 - 標準入力がファイル・パイプのとき、まとめて読むので、後に動かすコマンドが同じ標準入力の続きを読めないことがある
 - `$(...)` の中のヒアドキュメント、`${x:=w}` などの副作用がサブシェルの側で起きるときの細部は POSIX と違うことがある
 
