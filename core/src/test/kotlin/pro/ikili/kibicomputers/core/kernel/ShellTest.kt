@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
@@ -561,6 +562,27 @@ class ShellTest {
                 "sh: x@@: bad substitution\nbad 1\nsh: x: unset\nend\nafter\n",
             r.console,
         )
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧のコマンドを起こせなかったときも、set -eでスクリプトが止まる`() {
+        // 括弧を外して親から起こしても、起こせなかった括弧は失敗したコマンド（#471）
+        val d = '$'
+        val cases = listOf(
+            "( nosuchcmd )" to 127,
+            "( cat </nonexistent )" to 1,
+            "( args ${d}{x?u} )" to 1,
+            "( : ) </nonexistent" to 1,
+        )
+        for ((cmd, code) in cases) {
+            val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "set -e\n$cmd\necho after\n"))
+            assertFalse(r.console.contains("after"), "$cmd: ${r.console}")
+            assertEquals(code, r.exitCode, cmd)
+        }
+        // 条件の中では止まらない
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "set -e\n( nosuchcmd ) || echo or\necho after\n"))
+        assertTrue(r.console.endsWith("or\nafter\n"), r.console)
         assertEquals(0, r.exitCode)
     }
 

@@ -154,7 +154,9 @@ pub fn run(node: *Node) Error!void {
             defer mem.release(m);
             const pm = pendingMark();
             const child = (try startNode(node, .{})) orelse {
+                // 起こせなかった（コマンドがない・リダイレクトの誤り・括弧の中の展開の誤り）ときも、括弧が失敗したものとして `set -e` を見る
                 finishPending(pm);
+                checkErrexit();
                 return;
             };
             var list = [_]?process.Child{child};
