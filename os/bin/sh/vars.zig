@@ -12,6 +12,9 @@ pub const Var = struct {
     value: ?[]const u8,
     exported: bool = false,
     readonly: bool = false,
+    /// 値にパターンに効く文字（`*?[]\` と展開の印）がないか。null はまだ調べていない（展開が初めて使うときに調べて覚える）。
+    /// ないと分かっていれば、展開で文字ごとに調べずにまとめて写せる（#520）
+    plain: ?bool = null,
 };
 
 /// 変数の数の上限
@@ -56,11 +59,17 @@ fn ensure(name: []const u8) Error!*Var {
 
 /// 値を入れる。読み取り専用なら `Abort`
 pub fn set(name: []const u8, value: []const u8) Error!void {
+    return setKnown(name, value, null);
+}
+
+/// 値を入れる。[plain] は、値にパターンに効く文字がないと分かっているか（[Var.plain]。分からなければ null）
+pub fn setKnown(name: []const u8, value: []const u8, plain: ?bool) Error!void {
     const v = try ensure(name);
     if (v.readonly) return readonlyError(name);
     const nv = try mem.heapDupe(value);
     if (v.value) |old| mem.heapFree(old);
     v.value = nv;
+    v.plain = plain;
 }
 
 pub fn setExported(name: []const u8, on: bool) Error!void {
@@ -150,6 +159,7 @@ pub fn restoreLocals(frame: usize) void {
             if (v) |x| {
                 if (x.value) |old| mem.heapFree(old);
                 x.value = s.value;
+                x.plain = null;
                 x.exported = s.exported;
             } else if (s.value) |val| mem.heapFree(val);
         } else {
