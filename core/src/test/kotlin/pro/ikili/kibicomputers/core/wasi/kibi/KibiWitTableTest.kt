@@ -338,11 +338,16 @@ class KibiWitTableTest {
         /**
          * WIT のキーワード（wit-parser の字句解析 `crates/wit-parser/src/ast/lex.rs` の `keyword`）。
          * 識別子に使うときは `%` を付ける（例: `events.wit` の `%s64`）
+         *
+         * `KibiWitParseTest` が使う wasm-tools 1.256.0（Endive 1.2.0 の `run.endive:wasm-tools` が同梱する版）の
+         * lex.rs と突き合わせた。Endive を上げて同梱の wasm-tools が変わったら、その版の lex.rs と見比べて直す。
+         * `float32`・`float64` は今の lexer にはない（古い WIT のキーワード）が、識別子に使うと古いツールで
+         * 読めなくなるので残している
          */
         val WIT_KEYWORDS: Set<String> = setOf(
             "use", "type", "func", "from", "as", "with", "include", "static", "constructor", "async",
             "interface", "world", "package", "import", "export", "resource", "record", "variant", "enum", "flags",
-            "own", "borrow", "list", "option", "result", "tuple", "future", "stream", "error-context",
+            "own", "borrow", "list", "map", "option", "result", "tuple", "future", "stream", "error-context",
             "string", "char", "bool", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f32", "f64", "float32", "float64", "_",
         )
     }
