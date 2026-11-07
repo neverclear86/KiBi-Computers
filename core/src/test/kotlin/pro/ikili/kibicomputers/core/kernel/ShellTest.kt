@@ -566,6 +566,44 @@ class ShellTest {
     }
 
     @Test
+    fun `途中の括弧のリダイレクトに親の状態を変えうる展開があれば、サブシェルで起こす`() {
+        // 一番内側のコマンドだけでなく、途中の段のリダイレクト・引用なしのヒアドキュメントも見る（#471）
+        val d = '$'
+        val script = "( ( args a ) >/tmp/${d}{x:=f} ) & wait; echo \"x=${d}x\"\n" +
+            "( ( cat ) <<EOF\n${d}{y:=h}\nEOF\n) | cat; echo \"y=${d}y\"\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        // サブシェルに渡したヒアドキュメントの前に空行が入ることがある（main にもある別の不具合）ので、空行は見ない
+        assertEquals(listOf("x=", "h", "y="), r.console.lines().filter { it.isNotEmpty() })
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `一番外の括弧のリダイレクトの展開の誤りは、括弧の中身によらず同じに扱う`() {
+        // 一番外のリダイレクトは括弧を外す前も親で展開していた。中身がコマンド1つでも複合コマンドでも同じ（#471）
+        val d = '$'
+        // 中の展開も誤るときも、一番外のリダイレクトが先
+        val pairs = listOf(
+            "( args a ) >${d}{x?u}" to "( args a; args b ) >${d}{x?u}",
+            "( args ${d}{y?v} ) >${d}{x?u}" to "( args ${d}{y?v}; : ) >${d}{x?u}",
+        )
+        for ((single, compound) in pairs) {
+            val results = listOf(single, compound).map { cmd ->
+                val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "$cmd\necho after ${d}?\n"))
+                r.console to r.exitCode
+            }
+            assertEquals(results[1], results[0], single)
+            assertFalse(results[0].first.contains("after"), results[0].first)
+        }
+        // 途中の括弧のリダイレクトなら、その括弧だけを終える
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "( ( args a ) >${d}{x?u} ); echo after ${d}?\n"))
+        assertEquals("sh: x: u\nafter 1\n", r.console)
+        assertEquals(0, r.exitCode)
+        // 括弧の中の展開の誤りの知らせは、一番外のリダイレクトに従う
+        val quiet = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "( args ${d}{x?u} ) 2>/tmp/e; echo after ${d}?; cat /tmp/e\n"))
+        assertEquals("after 1\nsh: x: u\n", quiet.console)
+    }
+
+    @Test
     fun `括弧のコマンドを起こせなかったときも、set -eでスクリプトが止まる`() {
         // 括弧を外して親から起こしても、起こせなかった括弧は失敗したコマンド（#471）
         val d = '$'

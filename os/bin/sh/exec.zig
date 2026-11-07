@@ -750,32 +750,26 @@ const Base = struct {
 fn startNode(node: *Node, base: Base) Error!?process.Child {
     const m = mem.mark();
     defer mem.release(m);
-    var inner = node;
-    while (innerOf(inner)) |x| inner = x;
-    // 括弧の中の語は親で展開するので、親の状態を変えうる展開（`${x:=w}`・`$((x=1))`・`$(...)`）があればサブシェルで
-    if (inner.kind == .simple and (inner == node or !mayChangeParent(inner))) {
-        const started = startProgram(node, inner, base) catch |e| {
-            // 括弧の中の展開の誤り（`${x?msg}`・`set -u`・bad substitution）は、括弧を外す前と同じく、その括弧だけを終える
-            // （親のシェルは続ける）。括弧がなければ今までどおり上へ渡す
-            if (e != error.Abort or inner == node) return e;
-            if (state.status == 0) state.status = 1;
-            return null;
-        };
-        switch (started) {
-            .not_program => {},
-            .done => |child| return child,
-        }
-    }
     var map = FdMap{ .src = baseSrc(base) };
     defer map.cleanup();
     var target = node;
     if (node.kind == .subshell) {
-        // `( ... )` は中身を子に渡し、リダイレクトはここで行う（括弧ごと渡すと、子がまたサブシェルを起こす）
+        // `( ... )` は中身を子に渡し、リダイレクトはここで行う（括弧ごと渡すと、子がまたサブシェルを起こす）。
+        // 括弧を外して起こすときも、一番外のリダイレクトは先にここで1度だけ行う（その誤りは今までどおり上へ渡す）
         if (!(try map.addRedirs(node.redirs))) {
             state.status = 1;
             return null;
         }
         target = node.kind.subshell;
+    }
+    var inner = node;
+    while (innerOf(inner)) |x| inner = x;
+    // 括弧の中の語は親で展開するので、親の状態を変えうる展開（`${x:=w}`・`$((x=1))`・`$(...)`）があればサブシェルで
+    if (inner.kind == .simple and (inner == node or !mayChangeParent(node, inner))) {
+        switch (try startProgram(node, inner, &map)) {
+            .not_program => {},
+            .done => |child| return child,
+        }
     }
     const text = try parse.nodeText(target, &mem.ast);
     const child = startSubshell(text, &map);
@@ -784,40 +778,56 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
 }
 
 const Started = union(enum) {
-    /// 外のプログラムではない（サブシェルで起こす）
+    /// 外のプログラムではない（サブシェルで起こす。[map] にはまだ何も足していない）
     not_program,
     /// 起こした子（起こせなければ null。`state.status` を入れてある）
     done: ?process.Child,
 };
 
 /// [inner]（単純なコマンド）が外のプログラムなら、そのまま子として起こす。
-/// [outer] から [inner] までの括弧のリダイレクトを、外から順に重ねる
-fn startProgram(outer: *Node, inner: *Node, base: Base) Error!Started {
+/// [outer] が括弧なら、そのリダイレクトは [map] に入れてあるので、その内側から [inner] までの括弧のリダイレクトを外から順に重ねる
+fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
     const s = inner.kind.simple;
     // 語がない・組み込み・関数はサブシェルで（語の展開は子でもう一度行う）
     const first = s.words orelse return .not_program;
     if (!isPlainWord(first.text)) return .not_program;
     const name = first.text;
     if (builtins.kindOf(name) != .none or vars.findFunc(name) != null) return .not_program;
+    // ここから先の誤りは、括弧の中のもの（括弧がなければ今までどおり上へ渡す）
+    const nested = outer != inner;
     var argv = mem.List([]const u8).init(&mem.ast);
-    try expand.fields(s.words, &argv);
+    {
+        // 括弧の中の展開の誤りの知らせは、一番外のリダイレクトを効かせた標準エラー出力へ（サブシェルで展開していたときと同じ）
+        const saved_err = util.err_fd;
+        if (nested) util.err_fd = map.parentFd(2);
+        defer util.err_fd = saved_err;
+        expand.fields(s.words, &argv) catch |e| return failedInside(e, nested);
+    }
     if (argv.items.len == 0) return .not_program;
     if (state.xtrace) trace(argv.items);
-    var map = FdMap{ .src = baseSrc(base) };
-    defer map.cleanup();
-    var n = outer;
+    var n = if (nested) innerOf(outer).? else inner;
     while (true) {
-        if (!(try map.addRedirs(n.redirs))) {
+        const ok = map.addRedirs(n.redirs) catch |e| return failedInside(e, nested);
+        if (!ok) {
             state.status = 1;
             return .{ .done = null };
         }
         if (n == inner) break;
         n = innerOf(n).?;
     }
-    const env = try tempEnv(s.assigns);
-    const child = spawnProgram(argv.items, env, &map);
+    const env = tempEnv(s.assigns) catch |e| return failedInside(e, nested);
+    const child = spawnProgram(argv.items, env, map);
     map.afterSpawn(child != null);
     return .{ .done = child };
+}
+
+/// 括弧を外して起こすときに、括弧の中で起きた誤り [e] を扱う。
+/// 展開の誤り（`${x?msg}`・`set -u`・bad substitution）は、括弧を外す前と同じく、その括弧だけを終える（親のシェルは続ける）。
+/// 括弧の中でなければ（[inside] が偽なら）今までどおり上へ渡す
+fn failedInside(e: Error, inside: bool) Error!Started {
+    if (e != error.Abort or !inside) return e;
+    if (state.status == 0) state.status = 1;
+    return .{ .done = null };
 }
 
 /// 括弧 [node] の中身がコマンド1つなら、そのコマンド（`( ( cmd ) )` は1段ずつ外す）。ほかは null
@@ -831,12 +841,22 @@ fn innerOf(node: *Node) ?*Node {
     return item.node;
 }
 
-/// 単純なコマンド [node] の展開が、親のシェルの状態を変えうるか
-/// （`${x:=w}`・算術の代入・コマンド置換。迷うものは変えうるとみなす）
-fn mayChangeParent(node: *Node) bool {
-    const s = node.kind.simple;
+/// 括弧 [outer] の中の単純なコマンド [inner] を親で起こすと、親のシェルの状態を変えうるか
+/// （`${x:=w}`・算術の代入・コマンド置換。迷うものは変えうるとみなす）。
+/// [inner] の語と、[outer] の中から [inner] までの各段のリダイレクトを見る（一番外のリダイレクトは、括弧を外す前も親で展開していた）
+fn mayChangeParent(outer: *Node, inner: *Node) bool {
+    const s = inner.kind.simple;
     if (wordsMayChange(s.assigns) or wordsMayChange(s.words)) return true;
-    var r = node.redirs;
+    var n = outer;
+    while (n != inner) {
+        n = innerOf(n).?;
+        if (redirsMayChange(n.redirs)) return true;
+    }
+    return false;
+}
+
+fn redirsMayChange(first: ?*parse.Redir) bool {
+    var r = first;
     while (r) |x| : (r = x.next) {
         switch (x.op) {
             .heredoc, .heredoc_strip => if (!x.quoted and textMayChange(x.body)) return true,
