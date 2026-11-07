@@ -295,8 +295,9 @@ fn runSimple(node: *Node) Error!void {
         while (a) |w| : (a = w.next) {
             const eq = util.indexOf(w.text, '=').?;
             const value = try expand.assignValue(w.text[eq + 1 ..]);
-            // 跡は bash・dash と同じく `+ name=value` の1語にする（#504）
-            if (state.xtrace) trace(&.{try mem.ast.concat(w.text[0 .. eq + 1], value)});
+            // 跡は bash・dash と同じく `+ name=value` の1語にする（#504）。値をつながずに続けて書く
+            // （つなぐ領域が足りなくて代入が失敗しないように。#510）
+            if (state.xtrace) traceAssign(w.text[0 .. eq + 1], value);
             try vars.set(w.text[0..eq], value);
         }
         var saves = Saves{};
@@ -458,6 +459,14 @@ fn commandBuiltin(node: *Node, argv: []const []const u8, assigns: ?*parse.Word) 
 
 fn trace(parts: []const []const u8) void {
     traceTo(io.STDERR, parts);
+}
+
+/// 代入の `set -x` の跡（`+ name=value`）を標準エラー出力に書く。[name_eq] は `name=` まで
+fn traceAssign(name_eq: []const u8, value: []const u8) void {
+    io.writeAll(io.STDERR, "+ ") catch {};
+    io.writeAll(io.STDERR, name_eq) catch {};
+    io.writeAll(io.STDERR, value) catch {};
+    io.writeAll(io.STDERR, "\n") catch {};
 }
 
 /// [parts] の `set -x` の跡の長さ（`+`、各語の前の空白、改行）

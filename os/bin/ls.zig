@@ -6,7 +6,8 @@
 //! - `-F`: ディレクトリの名前の後ろに `/`
 //!
 //! 標準出力が TTY なら、画面の幅に合わせて段に並べる（上から下、左から右）。
-//! 1 つのディレクトリの項目は [MAX_ENTRIES] 個・名前の合計 [NAMES_SIZE] バイトまで（超えたらそこまでを書いて知らせる）
+//! 1 つのディレクトリの項目と、パスに並べたファイルは、それぞれ [MAX_ENTRIES] 個・名前の合計 [NAMES_SIZE] バイトまで
+//! （超えたらそこまでを書いて知らせ、終了コードを 1 にする）
 const kibi = @import("kibi");
 const cli = kibi.cli;
 const fs = kibi.fs;
@@ -53,6 +54,7 @@ pub fn main() u8 {
 
     // ファイルを先にまとめて書き、ディレクトリを後に 1 つずつ
     var dirs: usize = 0;
+    var full = false;
     resetItems();
     for (paths) |p| {
         const st = fs.stat(p) catch |e| {
@@ -64,10 +66,18 @@ pub fn main() u8 {
             dirs += 1;
             continue;
         }
-        addItem(p, st.kind) catch {};
+        // 入りきらなくなったら後ろは書かずに、書いた後で知らせる（ディレクトリはこの後に書く。#510）
+        if (full) continue;
+        addItem(p, st.kind) catch {
+            full = true;
+        };
     }
     const files = items_len;
     if (files > 0) printItems(null);
+    if (full) {
+        cli.warn(null, "too many files (listing the first ones)");
+        status = 1;
+    }
     var printed = files > 0;
     for (paths) |p| {
         const st = fs.stat(p) catch continue;

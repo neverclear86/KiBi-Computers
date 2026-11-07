@@ -684,6 +684,34 @@ class ShellTest {
     }
 
     @Test
+    fun `set -xの代入の跡を書くために、代入が領域不足で失敗しない`() {
+        // #510: 跡のために名前と値を構文木などの領域（`mem.ast`、512 KiB）でつないでいたので、
+        // 括弧の中の構文木で領域が埋まっていると、大きな値の代入が跡のせいで失敗した。
+        // 跡は名前・`=`・値を続けて書くので、つなぐ領域は要らない。
+        // 構文木は、動かさない `if false; then : a a ...; fi` の語（3 万語）で埋める
+        val d = '$'
+        val half = "v".repeat(100 * 1024)
+        val filler = List(30000) { "a" }.joinToString(" ")
+        val script = "y=${d}(cat /home/big)\n" +
+            "set -x\n" +
+            "{ x=${d}y${d}y; if false; then : $filler; fi; } 2>/tmp/t\n" +
+            "set +x\n" +
+            "echo len ${d}{#x}\n"
+        var traced = -1L
+        val r = run(
+            listOf("/home/t.sh"),
+            mapOf("/home/t.sh" to script, "/home/big" to half),
+            after = { _, m -> traced = m.vfs.stat(VfsPath.parse("/tmp/t")).size },
+        )
+        // 跡は `+ x=<値>`・`+ false` の 2 行
+        val len = half.length * 2
+        val trace = "+ x=\n".length + len + "+ false\n".length
+        assertEquals("+ set +x\nlen $len\n", r.console)
+        assertEquals(trace.toLong(), traced)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `括弧を外して起こすコマンドのset -xの跡は、括弧のリダイレクトに従う`() {
         // サブシェルで起こしていたときと同じ出先（#478）。コマンド自身のリダイレクトは効かない
         val script = "set -x\n" +
