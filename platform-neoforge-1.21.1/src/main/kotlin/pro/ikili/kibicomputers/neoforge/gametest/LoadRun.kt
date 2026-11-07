@@ -132,10 +132,11 @@ internal data class PhaseResult(
     /** 測っている間の、カーネルのスレッドの最大（10 tick ごとに数えた中で） */
     val peakKernelThreads: Int,
     /**
-     * 測っている間の、カーネルのスレッドのうちプールで次の仕事を待っているワーカーを除いた数の最大（10 tick ごとに数えた中で）。
-     * 前の試験で増えて、まだ消えていないワーカーを数えない（#476: CI で OS ごとに続けて動かすため）
+     * 測っている間の、カーネルのスレッドのうち、段階に入る前からあってプールで次の仕事を待っているワーカーを除いた数の最大
+     * （10 tick ごとに数えた中で）。前の試験で増えて、まだ消えていないワーカーを数えない（#476: CI で OS ごとに続けて動かすため）。
+     * この段階で作られたスレッドは、待っているワーカーでも数える（#483: 台ごとにワーカーを作り、数える前に待ちに入る退行を見落とさない）
      */
-    val peakBusyKernelThreads: Int,
+    val peakPhaseKernelThreads: Int,
     /** 段階の終わりの、JVM のスレッドの数 */
     val jvmThreads: Int,
     /** 測っている間の、JVM のスレッドの最大 */
@@ -244,7 +245,10 @@ internal class LoadRun(
     private var samples = LongArray(1024)
     private var sampleCount = 0
     private var peakKernelThreads = 0
-    private var peakBusyKernelThreads = 0
+    private var peakPhaseKernelThreads = 0
+
+    /** 段階に入ったときにあったカーネルのスレッドの ID。これらのうち、プールで待っているワーカーは [peakPhaseKernelThreads] に数えない */
+    private var baselineKernelThreads: Set<Long> = emptySet()
     private var sentBytes = 0L
     private var countSent = false
 
@@ -352,7 +356,7 @@ internal class LoadRun(
             countSent = true
             threads.resetPeakThreadCount()
             peakKernelThreads = 0
-            peakBusyKernelThreads = 0
+            peakPhaseKernelThreads = 0
         }
         if (recording && phaseTick % 10 == 0) sampleKernelThreads()
         if (t == settings.warmupTicks + settings.measureTicks) next(p)
@@ -443,15 +447,16 @@ internal class LoadRun(
         sampleCount = 0
         sentBytes = 0
         peakKernelThreads = 0
-        peakBusyKernelThreads = 0
+        peakPhaseKernelThreads = 0
         threads.resetPeakThreadCount()
+        baselineKernelThreads = kernelThreadInfos().mapTo(HashSet()) { it.threadId }
     }
 
     private fun finish() {
         val p = phase ?: return
         val wall = (System.nanoTime() - phaseStartNanos) / 1e9
         val stats = TickStats.of(samples.copyOf(sampleCount))
-        val infos = threads.dumpAllThreads(false, false, STACK_DEPTH).filter { it.threadName.startsWith("KiBi-") }
+        val infos = kernelThreadInfos()
         val names = infos.groupingBy { it.threadName.replace(DIGITS, "#") }.eachCount().toSortedMap()
         val kernel = infos.size
         val idleWorkers = infos.count(::isIdleWorker)
@@ -462,7 +467,7 @@ internal class LoadRun(
             kernelThreads = kernel,
             idleWorkerThreads = idleWorkers,
             peakKernelThreads = maxOf(peakKernelThreads, kernel),
-            peakBusyKernelThreads = maxOf(peakBusyKernelThreads, kernel - idleWorkers),
+            peakPhaseKernelThreads = maxOf(peakPhaseKernelThreads, infos.count(::countsInPhase)),
             jvmThreads = threads.threadCount,
             peakJvmThreads = threads.peakThreadCount,
             heapUsedBytes = heapAfterGc(),
@@ -540,10 +545,16 @@ internal class LoadRun(
     }
 
     private fun sampleKernelThreads() {
-        val infos = threads.dumpAllThreads(false, false, STACK_DEPTH).filter { it.threadName.startsWith("KiBi-") }
+        val infos = kernelThreadInfos()
         peakKernelThreads = maxOf(peakKernelThreads, infos.size)
-        peakBusyKernelThreads = maxOf(peakBusyKernelThreads, infos.count { !isIdleWorker(it) })
+        peakPhaseKernelThreads = maxOf(peakPhaseKernelThreads, infos.count(::countsInPhase))
     }
+
+    private fun kernelThreadInfos(): List<ThreadInfo> =
+        threads.dumpAllThreads(false, false, STACK_DEPTH).filter { it.threadName.startsWith("KiBi-") }
+
+    /** [peakPhaseKernelThreads] に数えるか: この段階で作られたスレッドか、仕事をしている（プールで待っていない）スレッド */
+    private fun countsInPhase(info: ThreadInfo): Boolean = info.threadId !in baselineKernelThreads || !isIdleWorker(info)
 
     /** プールで次の仕事を待っているワーカー（しばらくすると終わる） */
     private fun isIdleWorker(info: ThreadInfo): Boolean =
