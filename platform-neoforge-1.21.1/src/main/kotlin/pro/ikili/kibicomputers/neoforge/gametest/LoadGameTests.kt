@@ -26,8 +26,9 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  * ゲームの中での多数台の負荷試験（#345）。手順と結果は `docs/load-test.md`。
  *
  * - CI 用（[CI_COUNT] 台）: `runGameTestServer` で毎回動く。全台が起動し、待っている間と一部が計算・出力している間（見ていても、見ていなくても）に
- *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる
+ *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる。Lua の REPL と標準 OS のシェルの両方で1回ずつ動かす（#476）
  * - 測定用: `runLoadTestServer -PloadTestCounts=100,500,1000` で動く。台数ごとに MSPT・スレッド数・ヒープ使用量をログに書く。
+ *   OS は `-PloadTestOs=lua|standard`（[LoadOs]。既定は Lua の REPL）。
  *   テンプレートを名前空間 [MEASURE_NAMESPACE] のもの（`src/dev/resources`。jar には入らない）にして、
  *   測定用の起動（その名前空間だけを有効にする）でほかの GameTest が混ざらないようにする
  */
@@ -62,8 +63,10 @@ object LoadGameTests {
     private const val CI_MAX_IDLE_KERNEL_THREADS = 8
 
     /**
-     * CI で、起動の間のカーネルのスレッドの最大の上限（#350）。台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
-     * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分
+     * CI で、起動の間のカーネルのスレッド（プールで次の仕事を待っているワーカーを除く）の最大の上限（#350）。
+     * 台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
+     * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分。
+     * 待っているワーカーを除くのは、先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）
      */
     private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
@@ -79,15 +82,23 @@ object LoadGameTests {
     fun loadTests(): Collection<TestFunction> {
         val tests = ArrayList<TestFunction>()
         // 別のバッチにして、ほかのテストと同時に動かない（並べる範囲がテンプレートの外にはみ出すため）
-        tests += TestFunction(
-            "kibicomputers_load_ci", "loadgametests.ci", "${KiBiComputers.MOD_ID}:${SmokeGameTests.EMPTY}",
-            CI_TIMEOUT_TICKS, 0, true,
-        ) { ci(it) }
-        for (count in measureCounts()) {
+        // OS ごとにも別のバッチにする（同じ範囲に並べるため）
+        for (os in LoadOs.entries) {
+            val suffix = if (os == LoadOs.LUA) "" else "_${os.id}"
             tests += TestFunction(
-                "kibicomputers_load_$count", "loadgametests.measure_$count", "$MEASURE_NAMESPACE:${SmokeGameTests.EMPTY}",
-                MEASURE_TIMEOUT_TICKS, 0, true,
-            ) { measure(it, count) }
+                "kibicomputers_load_ci$suffix", "loadgametests.ci$suffix", "${KiBiComputers.MOD_ID}:${SmokeGameTests.EMPTY}",
+                CI_TIMEOUT_TICKS, 0, true,
+            ) { ci(it, os) }
+        }
+        val counts = measureCounts()
+        if (counts.isNotEmpty()) {
+            val os = LoadOs.fromProperty()
+            for (count in counts) {
+                tests += TestFunction(
+                    "kibicomputers_load_$count", "loadgametests.measure_$count", "$MEASURE_NAMESPACE:${SmokeGameTests.EMPTY}",
+                    MEASURE_TIMEOUT_TICKS, 0, true,
+                ) { measure(it, os, count) }
+            }
         }
         return tests
     }
@@ -95,10 +106,10 @@ object LoadGameTests {
     private fun measureCounts(): List<Int> =
         System.getProperty(COUNTS_PROPERTY).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
 
-    private fun ci(helper: GameTestHelper) {
-        val settings = LoadSettings(count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100)
+    private fun ci(helper: GameTestHelper, os: LoadOs) {
+        val settings = LoadSettings(os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100)
         LoadRun(helper, settings) { report ->
-            LOGGER.info("Load test (CI)\n{}", report.toMarkdown())
+            LOGGER.info("Load test (CI, {})\n{}", os.id, report.toMarkdown())
             val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
             val compute = report.phase(LoadPhase.COMPUTE)
@@ -127,8 +138,8 @@ object LoadGameTests {
                     "for $CI_COUNT machines (${idle.kernelThreadNames})",
             )
             helper.assertTrue(
-                boot.peakKernelThreads <= ciMaxBootKernelThreads(),
-                "booting $CI_COUNT machines at once should not create a thread per machine: ${boot.peakKernelThreads} kernel threads " +
+                boot.peakBusyKernelThreads <= ciMaxBootKernelThreads(),
+                "booting $CI_COUNT machines at once should not create a thread per machine: ${boot.peakBusyKernelThreads} busy kernel threads " +
                     "(limit ${ciMaxBootKernelThreads()})",
             )
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
@@ -142,9 +153,9 @@ object LoadGameTests {
         }.start()
     }
 
-    private fun measure(helper: GameTestHelper, count: Int) {
-        val settings = LoadSettings(count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600)
-        LoadRun(helper, settings) { report -> LOGGER.info("Load test ({} computers)\n{}", count, report.toMarkdown()) }.start()
+    private fun measure(helper: GameTestHelper, os: LoadOs, count: Int) {
+        val settings = LoadSettings(os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600)
+        LoadRun(helper, settings) { report -> LOGGER.info("Load test ({} computers, {})\n{}", count, os.id, report.toMarkdown()) }.start()
     }
 
     /** 1台分のブロックの置き方: ケースの上に画面、ケースの南にキーボード。 */
@@ -158,7 +169,7 @@ object LoadGameTests {
         /** [index] 番目のケースの、テンプレートからの相対位置 */
         fun casePos(index: Int, columns: Int): BlockPos = BlockPos((index % columns) * STEP_X, 1, (index / columns) * STEP_Z)
 
-        fun placeComputer(helper: GameTestHelper, case: BlockPos) {
+        fun placeComputer(helper: GameTestHelper, case: BlockPos, os: LoadOs) {
             helper.setBlock(case, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
             helper.setBlock(
                 case.above(),
@@ -166,8 +177,8 @@ object LoadGameTests {
             )
             helper.setBlock(case.south(), KiBiBlocks.KEYBOARD.get())
             val be = helper.getBlockEntity<CaseBlockEntity>(case)
-            // 負荷は Lua の REPL で測る（docs/load-test.md。ゲームの既定は標準 OS。#461）
-            be.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
+            // Lua の REPL で測るときは、テスト用の起動ディスクから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
+            if (os == LoadOs.LUA) be.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
             // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる（TestComputerGameTests と同じ）
             for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
                 be.parts.setStackInSlot(be.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
