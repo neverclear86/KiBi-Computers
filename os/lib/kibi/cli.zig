@@ -405,8 +405,11 @@ pub fn spawnFailureCode(err: Error) u8 {
     return if (err == error.NOENT) 127 else 126;
 }
 
-/// 引数の数の上限（[run]）
+/// 引数の数の上限（[run]。スクリプトとして動かすとき `sh` を前に足すので、[process.MAX_SPAWN_ARGS] より 1 つ少ない）
 pub const MAX_RUN_ARGS = process.MAX_SPAWN_ARGS - 1;
+
+/// [run] がスクリプトを `/bin/sh` に渡す引数の並び（スタックに置くと 32 KiB になるので静的に置く）
+var run_list: [process.MAX_SPAWN_ARGS][]const u8 = undefined;
 
 /// [path]（絶対パス）を引数 [argv] で動かし、終わるまで待つ。WASM でないファイル（`NOEXEC`）は `/bin/sh` のスクリプトとして動かす。
 /// 自分が TTY の前景なら、待つ間は子を前景にする（Ctrl+C が子に届く）。終わったら自分に戻す。
@@ -417,7 +420,7 @@ pub fn run(path: []const u8, argv: []const []const u8, options: process.SpawnOpt
     const child = process.spawn(path, argv, options) catch |e| blk: {
         if (e != error.NOEXEC) return e;
         if (argv.len > MAX_RUN_ARGS) return error.TOOBIG;
-        var list: [process.MAX_SPAWN_ARGS][]const u8 = undefined;
+        const list = &run_list;
         list[0] = "sh";
         list[1] = path;
         for (argv[@min(1, argv.len)..], 0..) |a, i| list[2 + i] = a;

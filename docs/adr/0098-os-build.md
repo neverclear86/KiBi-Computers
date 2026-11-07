@@ -60,7 +60,7 @@ import は自分で宣言し、構造体の配置は `comptime` で確かめる�
 - パスはすべて根の preopen（fd 3）からの相対にして渡す。相対パスは cwd（起動時は `PWD`。ADR 0332）につなぐ。`fs.chdir` はカーネルの cwd（`set-cwd`）とライブラリの cwd を両方変える
 - `process.spawn` は、根の preopen（fd 3）を既定で子に渡す（`inherit_root`）。標準 OS のプログラムはパスを fd 3 から開くため。カーネルの規則（fd 3 以降は書いたものだけ。ADR 0045）は変えない
 - `Child.wait` は `poll_oneoff` の FD_READ で待ってから `status` で受け取る（ADR 0074 の Q1-A）。待つ間は待機点になる
-- 引数・環境変数は 64 KiB（カーネルの上限と同じ。#101 で 16 KiB から上げた）・256 個まで（足りなければ `TOOBIG`）。`spawn` に渡す引数も 256 個まで。パスは 4,096 バイトまで（`NAMETOOLONG`）
+- 引数・環境変数は 64 KiB（カーネルの上限と同じ。#101 で 16 KiB から上げた）・4,096 個まで（足りなければ `TOOBIG`）。`spawn` に渡す引数も 4,096 個まで（`argv[0]` を含む。どちらもカーネルの上限に合わせた。#101 で 64 → 256、#501 で 256 → 4,096）。数に比例する表と `spawn` の写しは静的に置く（スタックに置くと 64 KiB のスタックをはみ出すため）。パスは 4,096 バイトまで（`NAMETOOLONG`）
 - まだ出していないもの: `kibi:kernel/events`・`kibi:kernel/timers`・`kibi:computer/clock`・`get-cwd`（`cabi_realloc` の export が要る）。使うプログラムができたときに足す
 
 ABI（import の名前と形）は既存の ADR 0070〜0075・0408・0427 のまま。新しいシステムコールは足していない。

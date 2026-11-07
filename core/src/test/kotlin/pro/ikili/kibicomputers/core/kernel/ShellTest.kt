@@ -706,9 +706,11 @@ class ShellTest {
     @Test
     fun `括弧を外して起こすコマンドが起こせなくても、長いset -xの跡はパイプに丸ごと入る`() {
         // #500 で見つけた形: 引数が多すぎて起こせない（`ls -d /bin/*` を何度も並べたとき）。
-        // 跡（4096 を超える）と起こせなかった知らせが、どちらも括弧の 2>&1 の先に出る
+        // 跡（4096 を超える）と起こせなかった知らせが、どちらも括弧の 2>&1 の先に出る。
+        // 起こせないのは、引数の数（argv[0] を足して 4,201）が `process.MAX_SPAWN_ARGS`（4,096。#501）を超えるため。
+        // 上限を変えたら、この数もそれを超えるように直す
         val d = '$'
-        val words = (1000 until 1300).map { "word-number-$it" }
+        val words = (10000 until 14200).map { "w$it" }
         val script = "x='${words.joinToString(" ")}'\n" +
             "set -x\n" +
             "( args ${d}x ) 2>&1 | cat >/tmp/p\n" +
@@ -718,6 +720,30 @@ class ShellTest {
         val trace = "+ args " + words.joinToString(" ") + "\n"
         assertTrue(trace.length > 4096)
         assertEquals("+ cat\n+ set +x\n${trace}sh: args: Argument list too long\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `引数が300個あっても、シェルが起こして子が受け取れる`() {
+        // #501: 標準 OS のライブラリの上限が 256 だった（`process.MAX_SPAWN_ARGS`・`process.MAX_ARGS`）。
+        // 起こす側（sh の spawn）と受け取る側（shprobe の `args` の `process.args()`）の両方を通す
+        val names = (100 until 400).map { "/home/sub/f$it" }
+        val r = run(listOf("-c", "args /home/sub/*; echo status $?"), names.associateWith { "" })
+        assertEquals(names.joinToString(" ") { "<$it>" } + "\nstatus 0\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `引数はカーネルの上限の4096個（argv0を含む）まで渡せて、それを超えると起こせない`() {
+        // #501: 上限は `process.MAX_SPAWN_ARGS`・`process.MAX_ARGS`（カーネルの `KibiProcess.MAX_ARGS` と同じ 4,096）
+        val d = '$'
+        val words = (10000 until 14095).map { "w$it" }
+        val script = "x='${words.joinToString(" ")}'\n" +
+            "args ${d}x; echo status ${d}?\n" +
+            "args ${d}x extra; echo status ${d}?\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        val out = words.joinToString(" ") { "<$it>" } + "\n"
+        assertEquals("${out}status 0\nsh: args: Argument list too long\nstatus 126\n", r.console)
         assertEquals(0, r.exitCode)
     }
 

@@ -9,8 +9,9 @@ pub const Error = errno.Error;
 
 /// 引数と環境変数を読み込む領域の大きさ（バイト。カーネルの上限 64 KiB に合わせる。ADR 0045）。入りきらなければ `TOOBIG`
 pub const ARGS_BUF_SIZE = 64 * 1024;
-/// 引数と環境変数の数の上限
-pub const MAX_ARGS = 256;
+/// 引数と環境変数の数の上限（カーネルの `KibiProcess.MAX_ARGS`・`MAX_ENV` に合わせる。#501）。
+/// 数に比例する表（下の `*_ptrs`・`*_slices`）は静的に置くので、使った分しか RAM に数えない
+pub const MAX_ARGS = 4096;
 
 var args_buf: [ARGS_BUF_SIZE]u8 = undefined;
 var args_ptrs: [MAX_ARGS][*:0]u8 = undefined;
@@ -172,8 +173,11 @@ pub const MAX_SPAWN_FDS = 32;
 /// 根の preopen の fd（`fs.ROOT` と同じ）
 const ROOT_FD: u32 = 3;
 
-/// 引数を [String] に写す領域の大きさ
-pub const MAX_SPAWN_ARGS = 256;
+/// [spawn] で渡せる引数の数の上限（`argv[0]` を含む。カーネルの `KibiProcess.MAX_ARGS` に合わせる。#501）
+pub const MAX_SPAWN_ARGS = MAX_ARGS;
+
+/// 引数を [String] に写す領域（スタックに置くと 32 KiB になるので静的に置く。使った分しか RAM に数えない）
+var spawn_strs: [MAX_SPAWN_ARGS]String = undefined;
 
 /// 子のプロセス（ハンドルはカーネルの fd 番号）
 pub const Child = struct {
@@ -224,7 +228,7 @@ pub const Child = struct {
 /// [path] の実行ファイルを、引数 [argv]（`argv[0]` を含む）で子として起こす。読み込みが終わるまで待つ
 pub fn spawn(path: []const u8, argv: []const []const u8, options: SpawnOptions) Error!Child {
     if (argv.len > MAX_SPAWN_ARGS) return error.TOOBIG;
-    var strs: [MAX_SPAWN_ARGS]String = undefined;
+    const strs = spawn_strs[0..argv.len];
     for (argv, 0..) |a, i| strs[i] = .{ .ptr = a.ptr, .len = @intCast(a.len) };
     if (options.fds.len + 1 > MAX_SPAWN_FDS) return error.TOOBIG;
     var fds: [MAX_SPAWN_FDS]FdAssign = undefined;
@@ -244,7 +248,7 @@ pub fn spawn(path: []const u8, argv: []const []const u8, options: SpawnOptions) 
     raw.@"[static]process.spawn"(
         path.ptr,
         @intCast(path.len),
-        &strs,
+        strs.ptr,
         @intCast(argv.len),
         @intFromBool(options.env != null),
         env.ptr,
