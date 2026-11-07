@@ -801,6 +801,23 @@ class ShellTest {
     }
 
     @Test
+    fun `100段の括弧の入れ子は、段ごとに子を起こさずに動く`() {
+        // #518: 中身が組み込みのとき、段ごとに子のシェルを起こし、段の数だけ同時に生きて NFILE で止まっていた
+        val d = '$'
+        fun nest(n: Int, body: String) = "( ".repeat(n) + body + " )".repeat(n)
+        assertOutput("ok\n", nest(100, "echo ok"))
+        // 中身が複数のコマンド・終わりの状態・親の変数を変えないこと
+        assertOutput("a\nb\n3\nx=1\n", "x=1; " + nest(100, "echo a; echo b; x=2; exit 3") + "; echo ${d}?; echo x=${d}x")
+        // 途中の段のリダイレクトは効く（その段からは子がまとめる）
+        assertOutput(
+            "in\nout\n",
+            nest(50, "( " + nest(50, "echo in; echo out >&2") + " ) 2>&1") + " | cat",
+        )
+        // ヒアドキュメントも一番内側に届く
+        assertOutput("doc\n", nest(100, "cat <<E") + "\ndoc\nE")
+    }
+
+    @Test
     fun `関数の深さの誤りでも、set -xの跡は代入を展開して出す`() {
         // #513・#514: 呼べない101段目も、呼ぶときと同じ `+ x=1 f` の跡を出してから知らせる
         val r = sh("f() { x=1 f; }\nset -x\nf")

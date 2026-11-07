@@ -890,7 +890,15 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
             state.status = 1;
             return null;
         }
-        target = node.kind.subshell;
+        // 中身が括弧1つだけの `( ( ... ) )` は1段にまとめて、子に一番内側の中身を渡す（段ごとに子を起こすと、
+        // 子が段の数だけ同時に生きて fd の表が尽きる。#518）。外の括弧の子は内の括弧の子を待つほかに何もしないので、
+        // まとめても変わらない。リダイレクトの付いた段はそこで止め、その段からは子が同じように扱う
+        var n = node;
+        while (innerOf(n)) |x| {
+            if (x.kind != .subshell or x.redirs != null) break;
+            n = x;
+        }
+        target = n.kind.subshell;
     }
     var inner = node;
     while (innerOf(inner)) |x| inner = x;
