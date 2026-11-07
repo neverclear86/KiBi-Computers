@@ -521,6 +521,31 @@ class ShellTest {
     }
 
     @Test
+    fun `括弧に包んだ外のコマンド1つの後ろのジョブも、killで本来のコマンドが止まる`() {
+        // `( cmd ) &` はサブシェルを挟まずに起こすので、`$!` は cmd を指す（#471）。括弧のリダイレクトは外から順に重ねる
+        val script = "( hang ) &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo paren ${'$'}?\n" +
+            "( ( hang ) ) >/tmp/o 2>&1 &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo nested ${'$'}?\n" +
+            "( hang <<EOF\nsmall\nEOF\n) &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo heredoc ${'$'}?\n" +
+            "echo in >/tmp/i; ( cat >/tmp/c ) </tmp/i & wait ${'$'}!; cat /tmp/c\n" +
+            "( exitwith 3 ) & wait ${'$'}!; echo exit ${'$'}?\n" +
+            // 親の状態を変えうる展開があれば、今までどおりサブシェルで（親の x は変わらない）
+            "( args ${'$'}{x:=set} ) & wait; echo \"x=${'$'}x\"\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script)) { h, m ->
+            fun live() = m.lock.withLockValue { m.kernel.processes.all().filter { !it.state.isTerminal }.map { it.pid } }
+            eventuallyDescribe(30_000, { "残っている: ${live()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                live().isEmpty()
+            }
+        }
+        assertEquals("paren 143\nnested 143\nheredoc 143\nin\nexit 3\n<set>\nx=\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `会話的なシェルでは、シェルの中で動かす段があってもCtrl+Cが届く`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()

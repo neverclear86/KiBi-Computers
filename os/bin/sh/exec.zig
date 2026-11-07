@@ -743,33 +743,18 @@ const Base = struct {
     stdout: Src = .inherit,
 };
 
-/// [node] を子として起こす。単純なコマンドで外のプログラムならそのまま、ほかはサブシェルで
+/// [node] を子として起こす。単純なコマンドで外のプログラムならそのまま、ほかはサブシェルで。
+/// `( 外のプログラム1つ )` も括弧を外して直に起こす（`$!`・`kill` が本来のコマンドを指すように。#471）
 fn startNode(node: *Node, base: Base) Error!?process.Child {
     const m = mem.mark();
     defer mem.release(m);
-    if (node.kind == .simple) {
-        const s = node.kind.simple;
-        var argv = mem.List([]const u8).init(&mem.ast);
-        // 語がない・組み込み・関数はサブシェルで（語の展開は子でもう一度行う）
-        const first = s.words;
-        if (first != null and isPlainWord(first.?.text)) {
-            const name = first.?.text;
-            if (builtins.kindOf(name) == .none and vars.findFunc(name) == null) {
-                try expand.fields(s.words, &argv);
-                if (argv.items.len > 0) {
-                    if (state.xtrace) trace(argv.items);
-                    var map = FdMap{ .src = baseSrc(base) };
-                    defer map.cleanup();
-                    if (!(try map.addRedirs(node.redirs))) {
-                        state.status = 1;
-                        return null;
-                    }
-                    const env = try tempEnv(s.assigns);
-                    const child = spawnProgram(argv.items, env, &map);
-                    map.afterSpawn(child != null);
-                    return child;
-                }
-            }
+    var inner = node;
+    while (innerOf(inner)) |x| inner = x;
+    // 括弧の中の語は親で展開するので、親の状態を変えうる展開（`${x:=w}`・`$((x=1))`・`$(...)`）があればサブシェルで
+    if (inner.kind == .simple and (inner == node or !mayChangeParent(inner))) {
+        switch (try startProgram(node, inner, base)) {
+            .not_program => {},
+            .done => |child| return child,
         }
     }
     var map = FdMap{ .src = baseSrc(base) };
@@ -787,6 +772,90 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
     const child = startSubshell(text, &map);
     map.afterSpawn(child != null);
     return child;
+}
+
+const Started = union(enum) {
+    /// 外のプログラムではない（サブシェルで起こす）
+    not_program,
+    /// 起こした子（起こせなければ null。`state.status` を入れてある）
+    done: ?process.Child,
+};
+
+/// [inner]（単純なコマンド）が外のプログラムなら、そのまま子として起こす。
+/// [outer] から [inner] までの括弧のリダイレクトを、外から順に重ねる
+fn startProgram(outer: *Node, inner: *Node, base: Base) Error!Started {
+    const s = inner.kind.simple;
+    // 語がない・組み込み・関数はサブシェルで（語の展開は子でもう一度行う）
+    const first = s.words orelse return .not_program;
+    if (!isPlainWord(first.text)) return .not_program;
+    const name = first.text;
+    if (builtins.kindOf(name) != .none or vars.findFunc(name) != null) return .not_program;
+    var argv = mem.List([]const u8).init(&mem.ast);
+    try expand.fields(s.words, &argv);
+    if (argv.items.len == 0) return .not_program;
+    if (state.xtrace) trace(argv.items);
+    var map = FdMap{ .src = baseSrc(base) };
+    defer map.cleanup();
+    var n = outer;
+    while (true) {
+        if (!(try map.addRedirs(n.redirs))) {
+            state.status = 1;
+            return .{ .done = null };
+        }
+        if (n == inner) break;
+        n = innerOf(n).?;
+    }
+    const env = try tempEnv(s.assigns);
+    const child = spawnProgram(argv.items, env, &map);
+    map.afterSpawn(child != null);
+    return .{ .done = child };
+}
+
+/// 括弧 [node] の中身がコマンド1つなら、そのコマンド（`( ( cmd ) )` は1段ずつ外す）。ほかは null
+fn innerOf(node: *Node) ?*Node {
+    if (node.kind != .subshell) return null;
+    const body = node.kind.subshell;
+    if (body.kind != .list) return body;
+    const item = body.kind.list.first orelse return null;
+    if (item.next != null or item.background) return null;
+    // 並びにはリダイレクトが付かないので、そのまま中のコマンドへ
+    return item.node;
+}
+
+/// 単純なコマンド [node] の展開が、親のシェルの状態を変えうるか
+/// （`${x:=w}`・算術の代入・コマンド置換。迷うものは変えうるとみなす）
+fn mayChangeParent(node: *Node) bool {
+    const s = node.kind.simple;
+    if (wordsMayChange(s.assigns) or wordsMayChange(s.words)) return true;
+    var r = node.redirs;
+    while (r) |x| : (r = x.next) {
+        switch (x.op) {
+            .heredoc, .heredoc_strip => if (!x.quoted and textMayChange(x.body)) return true,
+            else => if (textMayChange(x.target)) return true,
+        }
+    }
+    return false;
+}
+
+fn wordsMayChange(first: ?*parse.Word) bool {
+    var w = first;
+    while (w) |x| : (w = x.next) {
+        if (textMayChange(x.text)) return true;
+    }
+    return false;
+}
+
+fn textMayChange(t: []const u8) bool {
+    var brace = false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] == '`') return true;
+        if (t[i] == '$' and i + 1 < t.len) {
+            if (t[i + 1] == '(') return true;
+            if (t[i + 1] == '{') brace = true;
+        }
+    }
+    return brace and util.indexOf(t, '=') != null;
 }
 
 fn baseSrc(base: Base) [10]Src {
