@@ -1333,4 +1333,96 @@ class ShellTest {
             """,
         )
     }
+
+    @Test
+    fun `誤りの知らせに入れる式やコマンドは、最初の改行の手前で切り詰める`() {
+        // #524: 複数行の式やコマンドは、先頭の空白と改行を飛ばし、最初の行だけに `...` を付ける
+        val d = '$'
+        val cases = linkedMapOf(
+            "echo `echo hi\n)`" to "sh: syntax error in command substitution: echo hi...\n\nafter 0\n",
+            "echo `\n  echo hi\n)`" to "sh: syntax error in command substitution: echo hi...\n\nafter 0\n",
+            "echo ${d}(( 1 +\n 2 2 ))" to "sh: arithmetic: syntax error: 1 +...\nafter 1\n",
+            "echo ${d}(( 1 +\r\n 2 2 ))" to "sh: arithmetic: syntax error: 1 +...\nafter 1\n",
+            // 後ろに空白と改行しか残らなければ、切ったとはしない
+            "echo ${d}((\n 1 +\n ))" to "sh: arithmetic: expected an operand: 1 +\nafter 1\n",
+        )
+        for ((script, expected) in cases) {
+            val r = shFile("sh /tmp/t2.sh; echo after ${d}?", mapOf("/tmp/t2.sh" to script))
+            assertEquals(expected, r.console, script.take(60))
+        }
+    }
+
+    @Test
+    fun `誤りの知らせを切り詰めるとき、UTF-8の字の途中では切らない`() {
+        // #521・#524: 40 バイト目をまたぐ多バイトの字は、字ごと落とす。40 バイト目で終わる字は残す
+        val d = '$'
+        val cases = linkedMapOf(
+            // 2 バイトの字が 40・41 バイト目
+            "a".repeat(39) + "é" + "a".repeat(10) to "a".repeat(39),
+            // 3 バイトの字が 39〜41 バイト目
+            "a".repeat(38) + "あ" + "a".repeat(10) to "a".repeat(38),
+            // 4 バイトの字が 38〜41 バイト目
+            "a".repeat(37) + "😀" + "a".repeat(10) to "a".repeat(37),
+            // 2 バイトの字が 39・40 バイト目（ちょうど 40 バイトで終わる）
+            "a".repeat(38) + "é" + "a".repeat(10) to "a".repeat(38) + "é",
+            // 多バイトの字だけ
+            "あ".repeat(20) to "あ".repeat(13),
+        )
+        for ((inner, shown) in cases) {
+            val r = shFile("sh /tmp/t2.sh; echo after ${d}?", mapOf("/tmp/t2.sh" to "echo ${d}{$inner!}"))
+            assertEquals("sh: $shown...: bad substitution\nafter 1\n", r.console, inner)
+        }
+    }
+
+    @Test
+    fun `IFSを変えたときのフィールド分割はPOSIXの決まりに従う`() {
+        // #524: 空白でない IFS は続けば間に空のフィールドを作り、末尾の 1 つは空のフィールドを作らない。
+        // IFS の空白は前後で無視し、空白でない区切りの隣の空白は区切りの一部になる。`IFS=` では分けない
+        val d = '$'
+        assertOutput(
+            """
+            <a> <> <b>
+            <> <a>
+            < a >
+            <a> <b> <c> <> <d>
+            <a> <b>
+            <a b:c>
+            <x y> <z>
+            <x yz>
+            <x y:z>
+            <x y> <z>
+            <x y> <z>
+            <1> <2> <3> <x1> <2> <3y>
+            <a:b> <a> <b>
+            <p> <q> <x y z>
+            <a> <b> <c>
+            <a> <b>
+            <x y z>
+            """,
+            """
+            IFS=:
+            v='a::b:'; args ${d}v
+            v=':a'; args ${d}v
+            v=' a '; args ${d}v
+            IFS=' :'
+            v=' a : b  c :: d '; args ${d}v
+            v='a :'; args ${d}v b
+            IFS=
+            v='a b:c'; args ${d}v
+            set -- 'x y' z; args ${d}*
+            args "${d}*"
+            IFS=':,'
+            args "${d}*"
+            args ${d}*
+            args "${d}@"
+            v='1,2:3'; args ${d}v x${d}{v}y
+            v='a:b'; args "${d}v" ${d}v
+            unset IFS
+            v='  p   q  '; args ${d}v "${d}*"
+            IFS=:; set -- 'a:b' c; args ${d}*
+            args ${d}(echo 'a:b')
+            IFS=' :'; set -- x y z; args "${d}*"
+            """,
+        )
+    }
 }

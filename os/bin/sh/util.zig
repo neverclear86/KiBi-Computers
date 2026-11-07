@@ -94,18 +94,35 @@ pub fn isBlank(c: u8) bool {
 /// 知らせに入れる、入力から取った部分（式・コマンドなど）の長さの上限（バイト。#521）
 pub const CLIP_LEN = 40;
 
-/// 知らせに入れる [s] の頭。[CLIP_LEN] より長ければ切り詰める（UTF-8 の字の途中では切らない）。
-/// 切ったかは [clipMark] で知らせる
+/// 知らせに入れる [s] の頭。先頭の空白と改行を飛ばし、最初の改行か [CLIP_LEN] バイトの手前までにする
+/// （UTF-8 の字の途中では切らない。#521・#524）。切ったかは [clipMark] で知らせる
 pub fn clip(s: []const u8) []const u8 {
-    if (s.len <= CLIP_LEN) return s;
-    var n: usize = CLIP_LEN;
-    while (n > 0 and (s[n] & 0xc0) == 0x80) n -= 1;
-    return s[0..n];
+    const r = clipRange(s);
+    return s[r.start..r.end];
 }
 
-/// [clip] で [s] を切り詰めたなら `...`、そうでなければ空
+/// [clip] で [s] の後ろを切ったなら `...`、そうでなければ空（後ろに空白と改行しか残らないときは切ったとみなさない）
 pub fn clipMark(s: []const u8) []const u8 {
-    return if (s.len > CLIP_LEN) "..." else "";
+    const r = clipRange(s);
+    for (s[r.end..]) |c| if (!isBlank(c)) return "...";
+    return "";
+}
+
+const ClipRange = struct { start: usize, end: usize };
+
+fn clipRange(s: []const u8) ClipRange {
+    var a: usize = 0;
+    while (a < s.len and isBlank(s[a])) a += 1;
+    var b = a;
+    while (b < s.len and b - a < CLIP_LEN and s[b] != '\n') b += 1;
+    if (b < s.len and s[b] == '\n') {
+        // 改行の前の空白（`\r` など）は出さない
+        while (b > a and isBlank(s[b - 1])) b -= 1;
+    } else {
+        // 字の途中で止めたなら、その字の頭まで戻る
+        while (b < s.len and b > a and (s[b] & 0xc0) == 0x80) b -= 1;
+    }
+    return .{ .start = a, .end = b };
 }
 
 /// 知らせを書く fd（外のコマンドを起こすときは、そのコマンドの `2>` の先。null なら書かない）
