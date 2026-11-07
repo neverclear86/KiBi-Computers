@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
@@ -517,6 +518,109 @@ class ShellTest {
             }
         }
         assertEquals("small 143\nbig 143\nsame\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧に包んだ外のコマンド1つの後ろのジョブも、killで本来のコマンドが止まる`() {
+        // `( cmd ) &` はサブシェルを挟まずに起こすので、`$!` は cmd を指す（#471）。括弧のリダイレクトは外から順に重ねる
+        val script = "( hang ) &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo paren ${'$'}?\n" +
+            "( ( hang ) ) >/tmp/o 2>&1 &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo nested ${'$'}?\n" +
+            "( hang <<EOF\nsmall\nEOF\n) &\n" +
+            "kill ${'$'}!; wait ${'$'}!; echo heredoc ${'$'}?\n" +
+            "echo in >/tmp/i; ( cat >/tmp/c ) </tmp/i & wait ${'$'}!; cat /tmp/c\n" +
+            "( exitwith 3 ) & wait ${'$'}!; echo exit ${'$'}?\n" +
+            // 親の状態を変えうる展開があれば、今までどおりサブシェルで（親の x は変わらない）
+            "( args ${'$'}{x:=set} ) & wait; echo \"x=${'$'}x\"\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script)) { h, m ->
+            fun live() = m.lock.withLockValue { m.kernel.processes.all().filter { !it.state.isTerminal }.map { it.pid } }
+            eventuallyDescribe(30_000, { "残っている: ${live()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                live().isEmpty()
+            }
+        }
+        assertEquals("paren 143\nnested 143\nheredoc 143\nin\nexit 3\n<set>\nx=\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧の中の展開の誤りは、括弧だけを終えて親のスクリプトは続く`() {
+        // 括弧を外して起こしても、`${x?msg}`・`set -u`・bad substitution は括弧の中のエラー（POSIX）。親は止まらない
+        val d = '$'
+        val script = "( args ${d}{x?unset} ) & wait; echo bg\n" +
+            "( args ${d}{x?unset} ); echo fg ${d}?\n" +
+            "set -u; ( args ${d}undef ); echo nounset ${d}?\n" +
+            "( args ${d}{x@@} ); echo bad ${d}?\n" +
+            "echo ${d}( ( args ${d}{x?unset} ) ) end\n" +
+            "echo after\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals(
+            "sh: x: unset\nbg\nsh: x: unset\nfg 1\nsh: undef: parameter not set\nnounset 1\n" +
+                "sh: x@@: bad substitution\nbad 1\nsh: x: unset\nend\nafter\n",
+            r.console,
+        )
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `途中の括弧のリダイレクトに親の状態を変えうる展開があれば、サブシェルで起こす`() {
+        // 一番内側のコマンドだけでなく、途中の段のリダイレクト・引用なしのヒアドキュメントも見る（#471）
+        val d = '$'
+        val script = "( ( args a ) >/tmp/${d}{x:=f} ) & wait; echo \"x=${d}x\"\n" +
+            "( ( cat ) <<EOF\n${d}{y:=h}\nEOF\n) | cat; echo \"y=${d}y\"\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        // サブシェルに渡したヒアドキュメントの前に空行が入ることがある（main にもある別の不具合）ので、空行は見ない
+        assertEquals(listOf("x=", "h", "y="), r.console.lines().filter { it.isNotEmpty() })
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `一番外の括弧のリダイレクトの展開の誤りは、括弧の中身によらず同じに扱う`() {
+        // 一番外のリダイレクトは括弧を外す前も親で展開していた。中身がコマンド1つでも複合コマンドでも同じ（#471）
+        val d = '$'
+        // 中の展開も誤るときも、一番外のリダイレクトが先
+        val pairs = listOf(
+            "( args a ) >${d}{x?u}" to "( args a; args b ) >${d}{x?u}",
+            "( args ${d}{y?v} ) >${d}{x?u}" to "( args ${d}{y?v}; : ) >${d}{x?u}",
+        )
+        for ((single, compound) in pairs) {
+            val results = listOf(single, compound).map { cmd ->
+                val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "$cmd\necho after ${d}?\n"))
+                r.console to r.exitCode
+            }
+            assertEquals(results[1], results[0], single)
+            assertFalse(results[0].first.contains("after"), results[0].first)
+        }
+        // 途中の括弧のリダイレクトなら、その括弧だけを終える
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "( ( args a ) >${d}{x?u} ); echo after ${d}?\n"))
+        assertEquals("sh: x: u\nafter 1\n", r.console)
+        assertEquals(0, r.exitCode)
+        // 括弧の中の展開の誤りの知らせは、一番外のリダイレクトに従う
+        val quiet = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "( args ${d}{x?u} ) 2>/tmp/e; echo after ${d}?; cat /tmp/e\n"))
+        assertEquals("after 1\nsh: x: u\n", quiet.console)
+    }
+
+    @Test
+    fun `括弧のコマンドを起こせなかったときも、set -eでスクリプトが止まる`() {
+        // 括弧を外して親から起こしても、起こせなかった括弧は失敗したコマンド（#471）
+        val d = '$'
+        val cases = listOf(
+            "( nosuchcmd )" to 127,
+            "( cat </nonexistent )" to 1,
+            "( args ${d}{x?u} )" to 1,
+            "( : ) </nonexistent" to 1,
+        )
+        for ((cmd, code) in cases) {
+            val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "set -e\n$cmd\necho after\n"))
+            assertFalse(r.console.contains("after"), "$cmd: ${r.console}")
+            assertEquals(code, r.exitCode, cmd)
+        }
+        // 条件の中では止まらない
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to "set -e\n( nosuchcmd ) || echo or\necho after\n"))
+        assertTrue(r.console.endsWith("or\nafter\n"), r.console)
         assertEquals(0, r.exitCode)
     }
 
