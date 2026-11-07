@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.fd
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Test
@@ -15,6 +16,8 @@ import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -25,7 +28,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 
-/** fd 表の操作（#58）: いちばん小さい番号、dup・dup2・renumber・close と参照カウント、上限、読み書きの振り分け */
+/** fd 表の操作（#58）: いちばん小さい番号、dup・dup2・renumber・close と参照カウント、上限、読み書きの振り分け、`/dev/tty`（#485） */
 class FdTableTest {
     private class Obj : KernelObject() {
         var closed = 0
@@ -195,5 +198,69 @@ class FdTableTest {
         // 普通の KernelObject は読み書きできない
         val o = fds.open(Obj())
         assertEquals(IoResult.Error(Errno.INVAL), FdIo.readLocked(kernel, vfs, sink, 1, o, buf, 0, 1))
+    }
+    private fun devVfs(): Vfs = Vfs(kernel.mounts).also {
+        it.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "tmp")
+        it.mount(VfsPath.parse("/dev"), DevFileSystem(), readOnly = false, source = "dev")
+    }
+
+    private fun openTty(vfs: Vfs) = vfs.open(VfsPath.parse("/dev/tty"), OpenOptions(read = true, write = true))
+
+    /** コンソールの Tty を作る（参照1つはマシンが持つ分） */
+    private fun consoleTty(): Int = kernel.objects.add(Tty(64, 64))
+
+    @Test
+    fun `openFileは制御端末がないとNXIOで、表は変わらない`() {
+        val vfs = devVfs()
+        assertEquals(Errno.NXIO, errno { fds.openFile(openTty(vfs), vfs, 0, HandleRights.ALL) })
+        val notTty = kernel.objects.add(Obj())
+        assertEquals(Errno.NXIO, errno { fds.openFile(openTty(vfs), vfs, notTty, HandleRights.ALL) })
+        assertEquals(0, fds.size)
+        assertEquals(1, kernel.objects.refCount(notTty))
+    }
+
+    @Test
+    fun `openFileは満杯ならMFILEで、Ttyの参照は増えない`() {
+        val vfs = devVfs()
+        val tty = consoleTty()
+        repeat(DEFAULT_HANDLE_LIMIT) { fds.open(Obj()) }
+        assertEquals(Errno.MFILE, errno { fds.openFile(openTty(vfs), vfs, tty, HandleRights.ALL) })
+        assertEquals(1, kernel.objects.refCount(tty))
+        // 普通のファイルも満杯なら MFILE
+        val f = vfs.open(VfsPath.parse("/f"), OpenOptions(read = true, write = true, create = true))
+        val before = kernel.objects.size
+        assertEquals(Errno.MFILE, errno { fds.openFile(f, vfs, tty, HandleRights.ALL) })
+        assertEquals(before, kernel.objects.size)
+    }
+
+    @Test
+    fun `openFileのdev_ttyはコンソールのTtyを指し、閉じてもdupしても参照数が合ってTtyは消えない`() {
+        val vfs = devVfs()
+        val tty = consoleTty()
+        val obj = kernel.objects[tty]
+        val a = fds.openFile(openTty(vfs), vfs, tty, HandleRights.READ, flags = 3)
+        assertEquals(HandleEntry(tty, 3, HandleRights.READ), fds.entry(a), "端末を指し、権利とフラグは渡したもの")
+        assertSame(obj, fds.objectOf(a))
+        assertEquals(2, kernel.objects.refCount(tty))
+        val b = fds.dup(a)
+        assertEquals(3, kernel.objects.refCount(tty))
+        val c = fds.dup2(a, 10)
+        assertEquals(4, kernel.objects.refCount(tty))
+        fds.close(a)
+        fds.close(b)
+        assertEquals(2, kernel.objects.refCount(tty))
+        // もう一度開いても同じ Tty
+        val d = fds.openFile(openTty(vfs), vfs, tty, HandleRights.ALL)
+        assertSame(obj, fds.objectOf(d))
+        assertEquals(3, kernel.objects.refCount(tty))
+        fds.close(c)
+        fds.closeAll()
+        assertEquals(1, kernel.objects.refCount(tty), "マシンが持つ分だけ残る")
+        assertSame(obj, kernel.objects[tty])
+        assertEquals(emptyList<Int>(), sink.objects, "最後の参照は閉じていない")
+        // 普通のファイルは端末に差し替えない
+        val f = fds.openFile(vfs.open(VfsPath.parse("/f"), OpenOptions(read = true, write = true, create = true)), vfs, tty, HandleRights.ALL)
+        assertNotEquals(tty, fds.entry(f).objectId)
+        assertEquals(1, kernel.objects.refCount(tty))
     }
 }
