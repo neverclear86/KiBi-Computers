@@ -2,7 +2,9 @@
 //
 // fuel-spin <mode> <rounds> <inner>
 //   mode = main: main の中のループで計算する（main は printf → fd_write を呼ぶので止まりうる関数。燃料切れを巻き戻せる）
-//   mode = leaf: 止まりうる関数を呼ばない関数（葉）の中のループで計算する（燃料切れはスレッドを持ったまま待つ）
+//   mode = leaf: 止まりうる関数を呼ばない関数（葉）の中のループで計算する（燃料切れは前借りして先へ進め、
+//                葉から戻った main（止まりうる関数）で巻き戻す。前借りが FUEL_OVERDRAFT_LIMIT に届いたときだけ
+//                スレッドを持ったまま待つ。#477）
 // 1 ラウンドごとに、ラウンドの番号と計算の結果を出す。
 #include <stdint.h>
 #include <stdio.h>
