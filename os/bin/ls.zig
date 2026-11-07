@@ -196,28 +196,16 @@ fn printLong(dir: ?[]const u8, it: Item) void {
 
 /// 1970 年からのナノ秒を `YYYY-MM-DD HH:MM`（UTC）で書く
 fn writeTime(ns: u64) void {
-    const secs = ns / 1_000_000_000;
-    const days = secs / 86400;
-    const rem = secs % 86400;
-    // 日数から年月日（Howard Hinnant の civil_from_days）
-    const z: i64 = @as(i64, @intCast(days)) + 719468;
-    const era = @divFloor(z, 146097);
-    const doe: i64 = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
-    const m = if (mp < 10) mp + 3 else mp - 9;
-    const y = yoe + era * 400 + @intFromBool(m <= 2);
-    two(@intCast(y), 4);
+    const t = kibi.time.civil(ns / 1_000_000_000);
+    two(t.year, 4);
     cli.stdout.byte('-');
-    two(@intCast(m), 2);
+    two(t.month, 2);
     cli.stdout.byte('-');
-    two(@intCast(d), 2);
+    two(t.day, 2);
     cli.stdout.byte(' ');
-    two(rem / 3600, 2);
+    two(t.hour, 2);
     cli.stdout.byte(':');
-    two(rem % 3600 / 60, 2);
+    two(t.minute, 2);
 }
 
 /// [v] を [width] 桁（左を 0 で埋める）で書く

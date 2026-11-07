@@ -1,10 +1,12 @@
-//! コマンドを書くための小物（#103）: 文字列・知らせ・まとめて書く出力・オプションの読み方・行の読み方・パスの組み立て。
+//! コマンドを書くための小物（#103・#475）: 文字列・知らせ・まとめて書く出力・オプションの読み方・行の読み方・パスの組み立て・
+//! ほかのプログラムを動かすこと（`env`・`xargs`）。
 //!
 //! 知らせは `プログラムの名前: 対象: 説明` の形で標準エラー出力に書く。名前は [setName] で決める（既定は `argv[0]` の最後の部分）。
 const io = @import("io.zig");
 const errno = @import("errno.zig");
 const process = @import("process.zig");
 const fs = @import("fs.zig");
+const tty = @import("tty.zig");
 
 pub const Error = errno.Error;
 
@@ -66,6 +68,16 @@ pub fn basename(path: []const u8) []const u8 {
     while (start > 0 and path[start - 1] != '/') start -= 1;
     if (start == end) return if (path.len > 0 and path[0] == '/') "/" else path;
     return path[start..end];
+}
+
+/// パスの親の部分（`dirname`。末尾の `/` は除く。`/` を含まなければ `.`、根の直下なら `/`）
+pub fn dirname(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    while (end > 0 and path[end - 1] != '/') end -= 1;
+    if (end == 0) return ".";
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    return path[0..end];
 }
 
 /// [dir] と [name] を `/` でつないで [buf] に書く
@@ -343,4 +355,75 @@ pub fn openInput(path: []const u8) Error!io.Fd {
 /// [openInput] で開いた fd を閉じる（標準入力は閉じない）
 pub fn closeInput(fd: io.Fd) void {
     if (fd != io.STDIN) io.close(fd) catch {};
+}
+
+// ---- ほかのプログラムを動かす ----
+
+/// 既定の `PATH`（環境変数がないとき。シェルと同じ）
+pub const DEFAULT_PATH = "/bin:/sbin";
+
+/// [name] のプログラムを探して、絶対パスを [buf] に書く。`/` を含めばそのまま（cwd につなぐ）、
+/// 含まなければ [search]（`:` で区切ったディレクトリ。空の要素は `.`）から普通のファイルを探す。見つからなければ null
+pub fn findProgram(buf: []u8, name: []const u8, search: []const u8) ?[]const u8 {
+    for (name) |c| {
+        if (c == '/') return fs.absolute(buf, name) catch null;
+    }
+    if (name.len == 0) return null;
+    var rest = search;
+    while (true) {
+        var end: usize = 0;
+        while (end < rest.len and rest[end] != ':') end += 1;
+        const dir = if (end == 0) "." else rest[0..end];
+        var tmp: [fs.MAX_PATH]u8 = undefined;
+        if (join(&tmp, dir, name)) |joined| {
+            if (fs.stat(joined)) |st| {
+                if (st.kind == .file) return fs.absolute(buf, joined) catch null;
+            } else |_| {}
+        } else |_| {}
+        if (end == rest.len) break;
+        rest = rest[end + 1 ..];
+    }
+    return null;
+}
+
+/// 子の終わり方を終了コードにする（シェルの `$?` と同じ。シグナルは 128 + 番号、クラッシュは 139）
+pub fn exitCode(s: process.ExitStatus) u8 {
+    return switch (s) {
+        .exited => |c| @truncate(c),
+        .killed => |sig| if (sig) |x| switch (x) {
+            .interrupt => 130,
+            .quit => 131,
+            .terminate => 143,
+            .kill => 137,
+        } else 137,
+        .crashed => 139,
+    };
+}
+
+/// 子を起こせなかったときの終了コード（見つからない 127、ほか 126。シェルと同じ）
+pub fn spawnFailureCode(err: Error) u8 {
+    return if (err == error.NOENT) 127 else 126;
+}
+
+/// 引数の数の上限（[run]）
+pub const MAX_RUN_ARGS = process.MAX_SPAWN_ARGS - 1;
+
+/// [path]（絶対パス）を引数 [argv] で動かし、終わるまで待つ。WASM でないファイル（`NOEXEC`）は `/bin/sh` のスクリプトとして動かす。
+/// 自分が TTY の前景なら、待つ間は子を前景にする（Ctrl+C が子に届く）。終わったら自分に戻す
+pub fn run(path: []const u8, argv: []const []const u8, options: process.SpawnOptions) Error!process.ExitStatus {
+    const child = process.spawn(path, argv, options) catch |e| blk: {
+        if (e != error.NOEXEC) return e;
+        if (argv.len > MAX_RUN_ARGS) return error.TOOBIG;
+        var list: [process.MAX_SPAWN_ARGS][]const u8 = undefined;
+        list[0] = "sh";
+        list[1] = path;
+        for (argv[@min(1, argv.len)..], 0..) |a, i| list[2 + i] = a;
+        break :blk try process.spawn("/bin/sh", list[0 .. 1 + @max(argv.len, 1)], options);
+    };
+    defer child.release();
+    const me = process.selfPid();
+    const fg = (tty.getForeground(io.STDIN) catch 0) == me;
+    if (fg) tty.setForeground(io.STDIN, child.pid()) catch {};
+    defer if (fg) tty.setForeground(io.STDIN, me) catch {};
+    return child.wait();
 }
