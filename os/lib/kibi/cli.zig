@@ -409,7 +409,10 @@ pub fn spawnFailureCode(err: Error) u8 {
 pub const MAX_RUN_ARGS = process.MAX_SPAWN_ARGS - 1;
 
 /// [path]（絶対パス）を引数 [argv] で動かし、終わるまで待つ。WASM でないファイル（`NOEXEC`）は `/bin/sh` のスクリプトとして動かす。
-/// 自分が TTY の前景なら、待つ間は子を前景にする（Ctrl+C が子に届く）。終わったら自分に戻す
+/// 自分が TTY の前景なら、待つ間は子を前景にする（Ctrl+C が子に届く）。終わったら自分に戻す。
+/// TTY は標準入力・標準エラー・標準出力の順に、最初に TTY だったものを見る（`seq 3 | xargs sleep 9` のように
+/// 標準入力がパイプでも、シェルが前景にした自分の子に Ctrl+C を届けるため。#482）。
+/// 前景にした子が Ctrl+C・Ctrl+\ で止まったときは、自分も同じシグナルで止まる
 pub fn run(path: []const u8, argv: []const []const u8, options: process.SpawnOptions) Error!process.ExitStatus {
     const child = process.spawn(path, argv, options) catch |e| blk: {
         if (e != error.NOEXEC) return e;
@@ -422,8 +425,28 @@ pub fn run(path: []const u8, argv: []const []const u8, options: process.SpawnOpt
     };
     defer child.release();
     const me = process.selfPid();
-    const fg = (tty.getForeground(io.STDIN) catch 0) == me;
-    if (fg) tty.setForeground(io.STDIN, child.pid()) catch {};
-    defer if (fg) tty.setForeground(io.STDIN, me) catch {};
-    return child.wait();
+    const term = ttyFd();
+    const fg = if (term) |fd| (tty.getForeground(fd) catch 0) == me else false;
+    if (!fg) return child.wait();
+    tty.setForeground(term.?, child.pid()) catch {};
+    const s = child.wait() catch |e| {
+        tty.setForeground(term.?, me) catch {};
+        return e;
+    };
+    tty.setForeground(term.?, me) catch {};
+    // 前景の子が Ctrl+C・Ctrl+\ で止まったら、自分も同じシグナルで止まる（Unix で同じプロセスグループにいるのと同じ。
+    // シェルはこれを見て、パイプラインの残りも止める）。無視しているなら戻る
+    switch (s) {
+        .killed => |sig| if (sig) |x| if (x == .interrupt or x == .quit) process.killPid(me, x) catch {},
+        else => {},
+    }
+    return s;
+}
+
+/// 標準入力・標準エラー・標準出力のうち、最初に TTY だったもの（なければ null）
+fn ttyFd() ?io.Fd {
+    for ([_]io.Fd{ io.STDIN, io.STDERR, io.STDOUT }) |fd| {
+        if (tty.isTty(fd)) return fd;
+    }
+    return null;
 }

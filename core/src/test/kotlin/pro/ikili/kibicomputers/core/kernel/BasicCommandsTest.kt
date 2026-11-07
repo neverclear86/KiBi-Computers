@@ -693,6 +693,49 @@ class BasicCommandsTest {
     }
 
     @Test
+    fun `xargsが読むのがパイプでも、Ctrl+Cで動いている子が止まる`() = timeout(limit) {
+        // #482: xargs の標準入力はパイプなので、前景を渡すかを標準エラー（TTY）で決める。渡さないと sleep が孤児として残る
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            for (d in listOf("/bin", "/tmp", "/home")) m.vfs.createDirectory(VfsPath.parse(d))
+            for (name in listOf("sh", "echo", "true", "false") + commands) m.put("/bin/$name", imageFile("/bin/$name"))
+            val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh"), env = mapOf("PATH" to "/bin"), fds = SpawnOptions.ROOT_PREOPEN))
+
+            fun live() = m.lock.withLockValue { m.kernel.processes.all().filter { !it.state.isTerminal }.map { it.pid to it.args } }
+            fun step(describe: () -> String, millis: Long = 150_000, done: () -> Boolean) = eventuallyDescribe(millis, describe) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                done()
+            }
+
+            step({ "プロンプトが出ない: ${host.text()}" }) { host.text().endsWith("$ ") }
+            var seen = host.text().length
+            m.offerConsoleInput("seq 3 | xargs sleep 100\n".toByteArray())
+            step({ "sleep が動かない: ${live()}" }) { live().any { it.second.firstOrNull() == "sleep" } }
+            var lastSent = 0L
+            step({ "プロンプトに戻らない: ${host.text()}" }) {
+                val text = host.text()
+                val now = System.nanoTime()
+                if (now - lastSent > 200_000_000) {
+                    m.offerConsoleInput(byteArrayOf(3))
+                    lastSent = now
+                }
+                text.length > seen && text.endsWith("$ ")
+            }
+            // xargs だけでなく、走っていた sleep も止まる
+            step({ "残っている: ${live()}" }, 20_000) { live().map { it.first } == listOf(pid) }
+            seen = host.text().length
+            m.offerConsoleInput("echo status ${'$'}?\n".toByteArray())
+            step({ "終わらない: ${host.text()}" }) { host.text().length > seen && host.text().endsWith("$ ") }
+            m.offerConsoleInput("exit\n".toByteArray())
+            step({ "終わらない: ${host.text()}" }) { m.stateOf(pid).isTerminal }
+            assertTrue(host.text().contains("status 130\n"), host.text())
+        }
+    }
+
+    @Test
     fun `basenameとdirnameとwhich`() {
         assertOutput(
             """
