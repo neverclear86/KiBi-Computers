@@ -678,8 +678,39 @@ class ShellTest {
             "set +x\n" +
             "echo ${d}s ${d}t ${d}u ${d}x.\n"
         val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
-        // コマンドの前の代入（`x=1 cmd`）は、今は跡に出さない（bash・dash は `+ x=1 args c`。#508）
-        assertEquals("+ s=1\n+ t=1\n+ u=v1w\n+ e=\n+ args c\n<c>\n+ set +x\n1 1 v1w .\n", r.console)
+        // コマンドの前の代入（`x=1 cmd`）も、bash・dash と同じく `+ x=1 args c` と跡に出す（#508）
+        assertEquals("+ s=1\n+ t=1\n+ u=v1w\n+ e=\n+ x=1 args c\n<c>\n+ set +x\n1 1 v1w .\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `set -xのコマンドの前の代入は、展開を1回だけして跡に値を出す`() {
+        // #508: 跡のためにもう一度展開しない。コマンド置換は動くたびに /tmp/n に1バイト足す
+        // （置換の中の跡は /tmp/j へ）。外のプログラム・組み込み・特別な組み込み・関数・command・パイプの段・括弧
+        val d = '$'
+        val sub = "${d}({ set +x; echo >>/tmp/n; echo v; } 2>/tmp/j)"
+        val script = "f() { :; }\n" +
+            "set -x\n" +
+            "x=$sub args c\n" +
+            "x=$sub y=${d}((1+1)) echo e\n" +
+            "x=$sub :\n" +
+            "x=$sub f a\n" +
+            "x=$sub command args d\n" +
+            "x=$sub args p | cat\n" +
+            "( x=$sub args q )\n" +
+            "set +x\n"
+        var count = -1L
+        val r = run(
+            listOf("/home/t.sh"),
+            mapOf("/home/t.sh" to script),
+            after = { _, m -> count = m.vfs.stat(VfsPath.parse("/tmp/n")).size },
+        )
+        assertEquals(
+            "+ x=v args c\n<c>\n+ x=v y=2 echo e\ne\n+ x=v :\n+ x=v f a\n+ :\n" +
+                "+ x=v command args d\n<d>\n+ x=v args p\n+ cat\n<p>\n+ x=v args q\n<q>\n+ set +x\n",
+            r.console,
+        )
+        assertEquals(7L, count)
         assertEquals(0, r.exitCode)
     }
 
