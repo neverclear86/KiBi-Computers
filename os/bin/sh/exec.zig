@@ -456,12 +456,17 @@ fn commandBuiltin(node: *Node, argv: []const []const u8, assigns: ?*parse.Word) 
 }
 
 fn trace(parts: []const []const u8) void {
-    io.err("+");
+    traceTo(io.STDERR, parts);
+}
+
+/// `set -x` の跡を [fd] に書く
+fn traceTo(fd: io.Fd, parts: []const []const u8) void {
+    io.writeAll(fd, "+") catch {};
     for (parts) |p| {
-        io.err(" ");
-        io.err(p);
+        io.writeAll(fd, " ") catch {};
+        io.writeAll(fd, p) catch {};
     }
-    io.err("\n");
+    io.writeAll(fd, "\n") catch {};
 }
 
 // ---- コマンドを探す ----
@@ -804,9 +809,15 @@ fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
         expand.fields(s.words, &argv) catch |e| return failedInside(e, nested);
     }
     if (argv.items.len == 0) return .not_program;
-    if (state.xtrace) trace(argv.items);
     var n = if (nested) innerOf(outer).? else inner;
     while (true) {
+        if (n == inner and state.xtrace) {
+            // `set -x` の跡は、括弧のリダイレクトを効かせた標準エラー出力へ（サブシェルで起こしていたときと同じ。#478）。
+            // コマンド自身のリダイレクトは効かせない（括弧のない `cmd 2>f` と同じ）
+            if (nested) {
+                if (map.parentFd(2)) |fd| traceTo(fd, argv.items);
+            } else trace(argv.items);
+        }
         const ok = map.addRedirs(n.redirs) catch |e| return failedInside(e, nested);
         if (!ok) {
             state.status = 1;

@@ -619,8 +619,43 @@ class ShellTest {
         val script = "( ( args a ) >/tmp/${d}{x:=f} ) & wait; echo \"x=${d}x\"\n" +
             "( ( cat ) <<EOF\n${d}{y:=h}\nEOF\n) | cat; echo \"y=${d}y\"\n"
         val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
-        // サブシェルに渡したヒアドキュメントの前に空行が入ることがある（main にもある別の不具合）ので、空行は見ない
-        assertEquals(listOf("x=", "h", "y="), r.console.lines().filter { it.isNotEmpty() })
+        assertEquals("x=\nh\ny=\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `ヒアドキュメントを渡したサブシェルの出力の前に空行が入らない`() {
+        // #478。括弧を外して起こすもの・サブシェルで起こすもの・パイプの段・後ろのジョブ
+        val d = '$'
+        val script = "( cat <<EOF\na\nEOF\n) & wait\n" +
+            "( ( cat ) <<EOF\nb\nEOF\n) | cat\n" +
+            "( cat <<EOF; echo c2\nc\nEOF\n) & wait\n" +
+            "( ( cat ) <<EOF\n${d}{y:=d}\nEOF\n) | cat\n" +
+            "( cat <<EOF\ne\nEOF\n)\n" +
+            "( : ${d}{z:=1}; cat <<EOF\nf\nEOF\n) & wait\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals("a\nb\nc\nc2\nd\ne\nf\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧を外して起こすコマンドのset -xの跡は、括弧のリダイレクトに従う`() {
+        // サブシェルで起こしていたときと同じ出先（#478）。コマンド自身のリダイレクトは効かない
+        val script = "set -x\n" +
+            "( args a ) 2>/tmp/e\n" +
+            "( ( args b ) 2>/tmp/f )\n" +
+            "( args c 2>/tmp/g )\n" +
+            "( args d ) >/tmp/o 2>/tmp/h & wait\n" +
+            "( args e ) 2>&1 | cat >/tmp/p\n" +
+            "( args f; : ) 2>/tmp/i\n" +
+            "set +x\n" +
+            "cat /tmp/e /tmp/f /tmp/g /tmp/h /tmp/p /tmp/i\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals(
+            "<a>\n<b>\n+ args c\n<c>\n+ wait\n+ cat\n<f>\n+ set +x\n" +
+                "+ args a\n+ args b\n+ args d\n+ args e\n<e>\n+ args f\n+ :\n",
+            r.console,
+        )
         assertEquals(0, r.exitCode)
     }
 

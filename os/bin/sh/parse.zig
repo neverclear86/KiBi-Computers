@@ -959,7 +959,9 @@ pub fn nodeText(node: *const Node, arena: *mem.Arena) Error![]const u8 {
     try out.appendSlice(node.src);
     var r = node.hd_first;
     var k: usize = 0;
-    var newline_done = false;
+    // 中身は `<<EOF` の行の次の行から読まれるので、[node] の文字列が改行で終わっていれば、そのまま後ろに足す
+    // （もう1つ改行を足すと、中身の頭に空行が入る。#478）
+    var newline_done = node.src.len > 0 and node.src[node.src.len - 1] == '\n';
     const lo = @intFromPtr(node.src.ptr);
     const hi = lo + node.src.len;
     while (k < node.hd_count) : (k += 1) {
