@@ -52,7 +52,7 @@ internal data class DirEntry(val name: String, val type: FileType, val node: Lon
  * - 呼ばれるのは、マシンのカーネルロックの**外**（#52。ADR 0051・0052）。同じマシンのいくつものスレッド（プロセスのスレッド、
  *   起動用のスレッド）から同時に呼ばれるので、ファイルシステムが自分で排他する。自分の I/O と自分の排他のほかに待たない
  *   （ほかのマシン・メインスレッド・カーネルロックを待たない）
- * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted] だけ。この3つは I/O をせず、すぐ返す
+ * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted]・[isTerminal] だけ。この4つは I/O をせず、すぐ返す
  */
 internal interface FileSystem {
     /** 書けないファイルシステムか（書く操作の前に VFS が `ROFS` にする） */
@@ -116,6 +116,12 @@ internal interface FileSystem {
     fun setTimes(node: Long, accessedNanos: Long?, modifiedNanos: Long?) {
         fsError(Errno.NOTSUP, "時刻を変えられないファイルシステム")
     }
+
+    /**
+     * [node] が制御端末（`/dev/tty`。#485）か。そうなら、開いた fd はこのファイルではなく、プロセスの端末（`Tty`）を指す
+     * （`FdTable.openFile`）。カーネルロックの中から呼ばれるので、I/O をしない。既定は `false`
+     */
+    fun isTerminal(node: Long): Boolean = false
 
     /** [node] の中身を記憶装置へ書き出す（既定は何もしない） */
     fun sync(node: Long) {}

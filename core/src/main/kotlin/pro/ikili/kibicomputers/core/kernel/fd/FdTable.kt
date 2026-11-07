@@ -7,7 +7,10 @@ import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 
@@ -70,6 +73,20 @@ internal class FdTable(
         if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
         val id = objects.add(obj)
         return install(id, rights, flags)
+    }
+
+    /**
+     * [Vfs.open] で開いた [file] を、いちばん小さい空き番号に入れて返す（パスを開く ABI 層の `path_open` などが使う）。
+     * 制御端末（`/dev/tty`。[Vfs.isTerminalLocked]。#485）なら、[file] は入れずに、端末 [terminalId]（`Tty`）を [rights] で指す
+     * （参照を1つ増やす。`/dev` はファイルシステムに開いたことを知らせないので、[file] は捨ててよい）。端末がなければ（[terminalId] が 0）`NXIO`。
+     * 満杯なら `MFILE`（[file] は表に足さない。閉じるのは呼び出し側）
+     */
+    fun openFile(file: OpenFile, vfs: Vfs, terminalId: Int, rights: Int, flags: Long = 0): Int {
+        if (!vfs.isTerminalLocked(file)) return open(file, rights, flags)
+        if (terminalId == 0 || objects[terminalId] !is Tty) fsError(Errno.NXIO, "制御端末がない")
+        if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
+        objects.retain(terminalId)
+        return handles.insert(HandleEntry(terminalId, flags, rights))
     }
 
     /**

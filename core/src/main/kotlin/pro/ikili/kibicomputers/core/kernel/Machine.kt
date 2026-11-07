@@ -50,6 +50,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtyLimits
 import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
@@ -1571,6 +1572,19 @@ public class Machine private constructor(
     }
 
     /**
+     * デバイスファイル（[DevFileSystem]。`null`・`zero`・`tty`。#485）を [MachineLimits.DEV_PATH] にマウントする（起動用のスレッドから、`/tmp` のマウントの後）。
+     * 根のディスクの `/dev` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）。
+     * 中身は状態を持たず RAM も使わないので、ディスクと同じく、外すのは次の起動の始め（か起動の取り消し）
+     */
+    internal fun mountDev(): Errno? = try {
+        vfs.checkMountPoint(MachineLimits.DEV_PATH)
+        lock.withLockValue { vfs.mountLocked(MachineLimits.DEV_PATH, DevFileSystem(), readOnly = false, source = MachineLimits.DEV_SOURCE) }
+        null
+    } catch (e: FsException) {
+        e.errno
+    }
+
+    /**
      * [volume]（ディスク [diskId]）を [MachineLimits.HOME_PATH] に書き込める形でマウントする（起動用のスレッドから、`/tmp` のマウントの後。#461）。
      * 根の `/home` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）。マウントしなかったら [volume] を閉じる。
      * 起動が取り消されていれば [BootCancelledException]
@@ -2091,6 +2105,12 @@ internal object MachineLimits {
 
     /** `/tmp`（メモリ上のファイルシステム。#53）のマウントの `source` */
     internal const val TMP_SOURCE: String = "tmp"
+
+    /** `/dev`（デバイスファイル。#485）のマウントの `source` */
+    internal const val DEV_SOURCE: String = "dev"
+
+    /** `/dev` をマウントする場所 */
+    internal val DEV_PATH: VfsPath = VfsPath.parse("/dev")
 
     /** `/tmp` をマウントする場所 */
     internal val TMP_PATH: VfsPath = VfsPath.parse("/tmp")
