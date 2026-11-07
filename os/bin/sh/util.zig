@@ -9,6 +9,15 @@ const io = kibi.io;
 /// - `Abort`: 今のコマンドをやめる（展開の誤りなど。知らせは書いた）
 pub const Error = error{ OutOfMemory, Syntax, Incomplete, Abort };
 
+/// 入れ子（関数の呼び出し・複合コマンド・構文の読み）を1段深くするときに、残っていてほしいスタック（バイト。#514）。
+/// 入れ子を深くしない処理（組み込み・外のプログラムを起こす・子を待つ・誤りを知らせる）が、この中に収まる大きさにする
+pub const STACK_RESERVE = 32 * 1024;
+
+/// スタックの残りが [STACK_RESERVE] より少ない（これ以上入れ子を深くすると、シェルが範囲外の読み書きで落ちうる）
+pub fn stackLow() bool {
+    return kibi.stack.remaining() < STACK_RESERVE;
+}
+
 pub fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;

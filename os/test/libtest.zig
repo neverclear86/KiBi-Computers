@@ -43,6 +43,19 @@ fn expect(what: []const u8, ok: bool) void {
     if (!ok) fail(what, null);
 }
 
+/// [n] 段再帰して、どの段でもスタックの残りが [above] より少ないか
+noinline fn deeper(n: u32, above: usize) bool {
+    // volatile で書いて、配列をスタックに置かせる（レジスターに溶かさせない）
+    var pad: [256]u8 = undefined;
+    const vp: *volatile [256]u8 = &pad;
+    vp[0] = @truncate(n);
+    vp[255] = @truncate(n);
+    const here = kibi.stack.remaining();
+    if (here == 0 or here >= above) return false;
+    if (n == 0) return vp[0] == 0;
+    return deeper(n - 1, here) and vp[255] == @as(u8, @truncate(n));
+}
+
 pub fn main() u8 {
     const argv = process.args() catch |e| {
         fail("args", e);
@@ -105,6 +118,12 @@ pub fn main() u8 {
         expect("commit", kibi.memory.commit(&scratch, 0));
         expect("remaining after commit", kibi.memory.remaining() <= before);
         line("memory ok");
+    } else if (eql(case, "stack")) {
+        // 再帰するほど残りが減り、0 にはならない（#514）
+        const top = kibi.stack.remaining();
+        expect("remaining > 0", top > 0);
+        expect("deeper has less", deeper(8, top));
+        line("stack ok");
     } else if (eql(case, "block")) {
         // 標準入力が閉じるまで読み続ける（kill の場面で、先に終わらない子にする）
         var b: [64]u8 = undefined;

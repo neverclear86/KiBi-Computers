@@ -177,6 +177,7 @@ class StandardOsTest {
         assertTrue(tty.endsWith("tty ok\n"), tty)
         assertTrue(Regex("size \\d+x\\d+").containsMatchIn(tty), tty)
         assertEquals("memory ok\n", lib("memory").assertOk().console)
+        assertEquals("stack ok\n", lib("stack").assertOk().console)
         assertEquals("time ok\n", lib("time").assertOk().console)
     }
 }
