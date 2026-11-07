@@ -667,6 +667,23 @@ class ShellTest {
     }
 
     @Test
+    fun `set -xの代入の跡は、名前と=と値を1語にして出す`() {
+        // #504: bash・dash と同じく `+ s=1`（`+ s = 1` ではない）。値は展開したもの
+        val d = '$'
+        val script = "set -x\n" +
+            "s=1\n" +
+            "t=${d}s u=v${d}{s}w\n" +
+            "e=\n" +
+            "x=1 args c\n" +
+            "set +x\n" +
+            "echo ${d}s ${d}t ${d}u ${d}x.\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        // コマンドの前の代入（`x=1 cmd`）は、今は跡に出さない（bash・dash は `+ x=1 args c`。#508）
+        assertEquals("+ s=1\n+ t=1\n+ u=v1w\n+ e=\n+ args c\n<c>\n+ set +x\n1 1 v1w .\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `括弧を外して起こすコマンドのset -xの跡は、括弧のリダイレクトに従う`() {
         // サブシェルで起こしていたときと同じ出先（#478）。コマンド自身のリダイレクトは効かない
         val script = "set -x\n" +
