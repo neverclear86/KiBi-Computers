@@ -295,7 +295,8 @@ fn runSimple(node: *Node) Error!void {
         while (a) |w| : (a = w.next) {
             const eq = util.indexOf(w.text, '=').?;
             const value = try expand.assignValue(w.text[eq + 1 ..]);
-            if (state.xtrace) trace(&.{ w.text[0..eq], "=", value });
+            // 跡は bash・dash と同じく `+ name=value` の1語にする（#504）
+            if (state.xtrace) trace(&.{try mem.ast.concat(w.text[0 .. eq + 1], value)});
             try vars.set(w.text[0..eq], value);
         }
         var saves = Saves{};
