@@ -91,6 +91,23 @@ pub fn isBlank(c: u8) bool {
 
 // ---- 知らせ（標準エラー出力） ----
 
+/// 知らせに入れる、入力から取った部分（式・コマンドなど）の長さの上限（バイト。#521）
+pub const CLIP_LEN = 40;
+
+/// 知らせに入れる [s] の頭。[CLIP_LEN] より長ければ切り詰める（UTF-8 の字の途中では切らない）。
+/// 切ったかは [clipMark] で知らせる
+pub fn clip(s: []const u8) []const u8 {
+    if (s.len <= CLIP_LEN) return s;
+    var n: usize = CLIP_LEN;
+    while (n > 0 and (s[n] & 0xc0) == 0x80) n -= 1;
+    return s[0..n];
+}
+
+/// [clip] で [s] を切り詰めたなら `...`、そうでなければ空
+pub fn clipMark(s: []const u8) []const u8 {
+    return if (s.len > CLIP_LEN) "..." else "";
+}
+
 /// 知らせを書く fd（外のコマンドを起こすときは、そのコマンドの `2>` の先。null なら書かない）
 pub var err_fd: ?io.Fd = io.STDERR;
 

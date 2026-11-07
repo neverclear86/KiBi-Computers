@@ -1838,13 +1838,17 @@ pub fn capture(cmd: []const u8) Error![]u8 {
     var only: ?*Node = null;
     var count: usize = 0;
     while (true) {
-        const n = (p.top() catch {
-            // 入れ子のコマンド置換を中で動かす間にスタックが尽きかけたときは、構文の誤りではなく深さの誤りとして知らせる（#517）
-            if (util.stackLow()) {
-                util.complain(&.{"too deeply nested"});
-            } else util.complain(&.{ "syntax error in command substitution: ", cmd });
+        const n = (p.top() catch |e| {
             state.status = 2;
             subst_status = 2;
+            // 入れ子が深すぎて読みを止めたときは、構文の誤りではなく深さの誤りとして知らせ、今のコマンドをやめる
+            // （[parse.Parser.too_deep] で判断する。`$(` の終わりを探す読み・展開の [expand] と同じ。#517・#521）
+            if (p.too_deep) {
+                util.complain(&.{"too deeply nested"});
+                return error.Abort;
+            }
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            util.complain(&.{ "syntax error in command substitution: ", util.clip(cmd), util.clipMark(cmd) });
             return &[_]u8{};
         }) orelse break;
         if (n.kind == .list) {
