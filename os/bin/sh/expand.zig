@@ -290,7 +290,7 @@ fn scanFailed(p: *const parse.Parser, text: []const u8) Error {
 }
 
 fn badSubst(text: []const u8) Error {
-    util.complain(&.{ text, ": bad substitution" });
+    util.complain(&.{ util.clip(text), util.clipMark(text), ": bad substitution" });
     return error.Abort;
 }
 
@@ -820,7 +820,8 @@ pub fn arith(text: []const u8) Error!i64 {
     a.ws();
     if (a.failed == null and a.i < s.len) a.failed = "syntax error";
     if (a.failed) |why| {
-        util.complain(&.{ "arithmetic: ", why, ": ", s });
+        const shown = util.trim(s);
+        util.complain(&.{ "arithmetic: ", why, ": ", util.clip(shown), util.clipMark(shown) });
         return error.Abort;
     }
     return v;

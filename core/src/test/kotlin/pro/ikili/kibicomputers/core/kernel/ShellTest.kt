@@ -1158,4 +1158,95 @@ class ShellTest {
             assertFalse(r.console.contains("ok\n"), name)
         }
     }
+
+    @Test
+    fun `コマンド置換を動かす中で読みが深さで止まれば、深さの誤りにして今のコマンドをやめる`() {
+        // #521: 外の読みは通るが、入れ子の `$( )` を動かす間にスタックが減って中の読みが止まる深さがある。
+        // そこでは構文の誤り（コマンド全体を出す）ではなく深さの誤りにし、空の結果で外のコマンドを続けない
+        val d = '$'
+        var stoppedInside = false
+        for (n in 140..260 step 5) {
+            val script = "echo " + "${d}(echo ".repeat(n) + "ok" + ")".repeat(n)
+            val r = shFile("sh /tmp/deep.sh; echo after ${d}?", mapOf("/tmp/deep.sh" to script))
+            assertFalse(r.console.contains("syntax error in command substitution"), "$n: ${r.console.takeLast(300)}")
+            if (r.console == "sh: too deeply nested\nafter 2\n") {
+                stoppedInside = true
+            } else if (r.console != "ok\nafter 0\n") {
+                assertTrue(r.console.endsWith("syntax error: too deeply nested\nafter 2\n"), "$n: ${r.console.takeLast(300)}")
+            }
+        }
+        assertTrue(stoppedInside, "中の読みで止まる深さがなかった")
+    }
+
+    @Test
+    fun `誤りの知らせに入れる式やコマンドは、長ければ頭だけにして切り詰める`() {
+        // #521: 深すぎる式などをそのまま出すと画面が埋まるので、頭の 40 バイトに `...` を付ける
+        val d = '$'
+        val arithSyntax = "1 + " + "2 ".repeat(100)
+        val subst = "echo " + "x ".repeat(100) + ")"
+        val cases = linkedMapOf(
+            "echo ${d}(( " + "x=".repeat(5000) + "1 ))" to "sh: arithmetic: too deeply nested: " + "x=".repeat(20) + "...\nafter 1\n",
+            "echo ${d}(( $arithSyntax ))" to "sh: arithmetic: syntax error: " + arithSyntax.take(40) + "...\nafter 1\n",
+            "echo `$subst`" to "sh: syntax error in command substitution: " + subst.take(40) + "...\n\nafter 0\n",
+            "echo ${d}{" + "a".repeat(100) + "!}" to "sh: " + "a".repeat(40) + "...: bad substitution\nafter 1\n",
+            // 短いものは切り詰めない
+            "echo ${d}(( 1 + ))" to "sh: arithmetic: expected an operand: 1 +\nafter 1\n",
+        )
+        for ((script, expected) in cases) {
+            val r = shFile("sh /tmp/t2.sh; echo after ${d}?", mapOf("/tmp/t2.sh" to script))
+            assertEquals(expected, r.console, script.take(60))
+        }
+    }
+
+    @Test
+    fun `入れ子のバッククォートと、*の多いパターンのglobが動く`() {
+        // #517・#521: バッククォートの入れ子は `\` を重ねて書く。`*` の多いパターン・深いパスの glob は、合っても合わなくても終わる
+        val d = '$'
+        fun nested(k: Int): String = if (k == 0) "echo ok" else "echo `" + nested(k - 1).replace("\\", "\\\\").replace("`", "\\`") + "`"
+        val long = "a".repeat(100)
+        val files = mapOf("/home/sub/$long" to "")
+        val cases = linkedMapOf(
+            nested(3) to "ok\nafter 0\n",
+            nested(12) to "ok\nafter 0\n",
+            // `\` が倍々に増えて入力に入りきらない深さは、誤りにして続く
+            nested(16) to "sh: command too long\nafter 2\n",
+            "echo /home/sub/" + "*a".repeat(50) + "*" to "/home/sub/$long\nafter 0\n",
+            "echo /home/sub/" + "*a".repeat(50) + "*b" to "/home/sub/" + "*a".repeat(50) + "*b\nafter 0\n",
+            "echo /home/sub/" + "*a".repeat(3000) + "* | args" to null,
+            "echo /home/" + "*/".repeat(3000) + "x | args" to null,
+            "echo /" + "*/".repeat(20000) + "x | args" to null,
+        )
+        for ((script, expected) in cases) {
+            val r = shFile("sh /tmp/t2.sh; echo after ${d}?", files + ("/tmp/t2.sh" to script))
+            if (expected != null) {
+                assertEquals(expected, r.console, script.take(60))
+            } else {
+                // 合わないパターンはそのまま 1 語で渡る
+                assertTrue(r.console.endsWith("after 0\n"), "${script.take(60)}: ${r.console.takeLast(300)}")
+                assertFalse(r.console.contains("sh: "), "${script.take(60)}: ${r.console.takeLast(300)}")
+            }
+        }
+    }
+
+    @Test
+    fun `数万のtestの!や括弧、&&・||・elifの連鎖は、誤りにしてシェルが動き続ける`() {
+        // #517・#521: 再帰しない道（連鎖）も、極端な大きさでは領域が足りずに誤りになる。シェルは落ちずに親が続ける
+        val d = '$'
+        val cases = linkedMapOf(
+            "test の ! 15000" to "[ " + "! ".repeat(15000) + "x ]; echo st",
+            "test の ! 25000（展開）" to "s='" + "! ".repeat(25000) + "'; [ ${d}s x ]; echo st",
+            "test の ( 15000（展開）" to "s='" + "( ".repeat(15000) + "x" + " )".repeat(15000) + "'; [ ${d}s ]; echo st",
+            "test の ( 12000" to "[ " + "\\( ".repeat(12000) + "x" + " \\)".repeat(12000) + " ]; echo st",
+            "&& 15000" to "true" + "&&true".repeat(15000) + "&&echo ok",
+            "|| 15000" to "false" + "||false".repeat(15000) + "||echo ok",
+            "elif 15000" to "if false; then :; " + "elif false; then :; ".repeat(15000) + "else echo ok; fi",
+            "elif 30000" to "if false; then :; " + (1..30000).joinToString("\n") { "elif false; then :;" } + " else echo ok; fi",
+        )
+        for ((name, script) in cases) {
+            val r = shFile("sh /tmp/big.sh; echo after ${d}?", mapOf("/tmp/big.sh" to script))
+            assertTrue(Regex("sh: (out of memory|command too long|test: too deeply nested)\n").containsMatchIn(r.console), "$name: ${r.console.takeLast(300)}")
+            assertTrue(Regex("after [12]\n$").containsMatchIn(r.console), "$name: ${r.console.takeLast(300)}")
+            assertFalse(r.console.contains("ok\n") || r.console.contains("st\n"), name)
+        }
+    }
 }
