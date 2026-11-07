@@ -15,6 +15,8 @@ var entries: [MAX_ENV][]const u8 = undefined;
 var entries_len: usize = 0;
 var pairs: [MAX_ENV]process.EnvEntry = undefined;
 var path_buf: [kibi.fs.MAX_PATH]u8 = undefined;
+/// `-u` で除く名前（スタックに置くと 32 KiB になるので静的に置く）
+var unset: [process.MAX_ARGS][]const u8 = undefined;
 
 pub fn main() u8 {
     const argv = process.args() catch |e| {
@@ -23,7 +25,6 @@ pub fn main() u8 {
     };
     var opts = cli.Args.init(argv);
     var clear = false;
-    var unset: [process.MAX_ARGS][]const u8 = undefined;
     var unset_len: usize = 0;
     while (opts.next()) |c| switch (c) {
         'i' => clear = true,
