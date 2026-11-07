@@ -39,6 +39,8 @@ class BasicCommandsTest {
 
     private val commands = listOf(
         "cat", "clear", "cp", "du", "grep", "head", "kill", "ls", "mkdir", "mv", "pwd", "rm", "rmdir", "tail", "touch", "wc",
+        // #475
+        "sleep", "env", "printenv", "date", "seq", "yes", "sort", "uniq", "tee", "xargs", "basename", "dirname", "which",
     )
 
     private fun imageFile(path: String): ByteArray {
@@ -54,10 +56,14 @@ class BasicCommandsTest {
     }
 
     /** `/bin/sh -c [script]` を動かし、終わるまで待ってコンソールの出力を返す */
-    private fun sh(script: String, files: Map<String, String> = emptyMap()): String = timeout(limit) {
+    private fun sh(
+        script: String,
+        files: Map<String, String> = emptyMap(),
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+    ): String = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
-            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024)
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024, environment = environment)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home", "/mnt")) m.vfs.createDirectory(VfsPath.parse(d))
             m.vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
@@ -358,6 +364,371 @@ class BasicCommandsTest {
             kill 99999 2>&1; echo ${'$'}?
             kill -X 1 2>&1; echo ${'$'}?
             kill -s bogus 1 2>&1; echo ${'$'}?
+            """,
+        )
+    }
+
+    // ---- #475 ----
+
+    @Test
+    fun `sleep`() {
+        val start = System.nanoTime()
+        assertOutput(
+            """
+            0
+            0
+            sleep: missing operand
+            usage: sleep seconds[s|m|h|d]...
+            2
+            sleep: x: invalid time interval
+            2
+            sleep: 1.2.3: invalid time interval
+            2
+            sleep: unknown option -1
+            usage: sleep seconds[s|m|h|d]...
+            2
+            """,
+            """
+            sleep 0.5; echo ${'$'}?
+            sleep 0 .1s 0.0m; echo ${'$'}?
+            sleep 2>&1; echo ${'$'}?
+            sleep x 2>&1; echo ${'$'}?
+            sleep 1.2.3 2>&1; echo ${'$'}?
+            sleep -1 2>&1; echo ${'$'}?
+            """,
+        )
+        val elapsedMs = (System.nanoTime() - start) / 1_000_000
+        assertTrue(elapsedMs >= 600, "sleep が待っていない: ${elapsedMs}ms")
+    }
+
+    @Test
+    fun `envとprintenv`() {
+        assertOutput(
+            """
+            A=1
+            B=2
+            A=3
+            1
+            1
+            /bin
+            /home
+            5
+            /bin x
+            PWD=/
+            0
+            env: nothing: No such file or directory
+            127
+            /home
+            1
+            2
+            env: unknown option -z
+            usage: env [-i] [-u name]... [name=value]... [command [arg...]]
+            2
+            """,
+            """
+            env -i A=1 B=2
+            env - A=1 A=3
+            env -i A=1 /bin/printenv A
+            env -u HOME printenv HOME; echo ${'$'}?
+            printenv PATH HOME
+            env X=5 printenv X
+            env -i PATH=/bin sh -c 'echo ${'$'}PATH x'
+            env -i printenv; echo ${'$'}?
+            env nothing 2>&1; echo ${'$'}?
+            printenv NOPE HOME; echo ${'$'}?
+            env sh -c 'exit 2'; echo ${'$'}?
+            env -z 2>&1; echo ${'$'}?
+            """,
+        )
+    }
+
+    private fun dateAt(iso: String, script: String): String {
+        val instant = java.time.Instant.parse(iso)
+        val clock = object : MachineClock {
+            override fun realtimeNanos(): Long = instant.epochSecond * 1_000_000_000L + instant.nano
+
+            override fun monotonicNanos(): Long = System.nanoTime()
+
+            override fun worldTicks(): Long = 0
+        }
+        return sh(script, environment = MachineEnvironment.builder().clock(clock).build())
+    }
+
+    @Test
+    fun `date`() {
+        val iso = "2024-02-29T13:05:09.123456789Z"
+        val epoch = java.time.Instant.parse(iso).epochSecond
+        assertEquals(
+            """
+            Thu Feb 29 13:05:09 UTC 2024
+            2024-02-29 13:05:09 060 Thu Thursday Feb February 29 24 20 01 PM 4 4 UTC +0000 123456789 02/29/24 13:05 %|%Q
+            $epoch
+            date: 0101: setting the date is not supported
+            1
+            date: unknown option -x
+            usage: date [-u] [+format]
+            2
+            """.trimIndent() + "\n",
+            dateAt(
+                iso,
+                """
+                date
+                date -u '+%F %T %j %a %A %b %B %e %y %C %I %p %u %w %Z %z %N %D %R %%|%Q'
+                date +%s
+                date 0101 2>&1; echo ${'$'}?
+                date -x 2>&1; echo ${'$'}?
+                """,
+            ),
+        )
+        assertEquals("1970-01-01 00:00:00 001 Thu 12 AM| 1\n", dateAt("1970-01-01T00:00:00Z", "date '+%F %T %j %a %I %p|%e'"))
+        assertEquals("2000-12-31 23:59:59 366 Sun 7 Dec 31\n", dateAt("2000-12-31T23:59:59Z", "date '+%F %T %j %a %u %b %e'"))
+    }
+
+    @Test
+    fun `seqとyes`() {
+        assertOutput(
+            """
+            1
+            2
+            3
+            -1 0 1
+            0.0,0.5,1.0,1.5,2.0
+            08
+            09
+            10
+            5
+            3
+            1
+            1.5
+            -5
+            -2
+            01
+            done
+            y
+            y
+            a b
+            a b
+            seq: 0: invalid zero increment
+            2
+            seq: x: invalid number
+            2
+            seq: missing operand
+            usage: seq [-w] [-s separator] [first [increment]] last
+            2
+            """,
+            """
+            seq 3
+            seq -s ' ' -1 1
+            seq -s, 0 0.5 2
+            seq -w 8 10
+            seq 5 -2 1
+            seq 1.5 1.7
+            seq -w -5 3 1
+            seq 2 1; echo done
+            yes | head -n 2
+            yes a b | head -n 2
+            seq 1 0 2 2>&1; echo ${'$'}?
+            seq x 2>&1; echo ${'$'}?
+            seq 2>&1; echo ${'$'}?
+            """,
+        )
+    }
+
+    @Test
+    fun `sortとuniq`() {
+        val words = "pear\nApple\nbanana\napple\npear\n10 x\n9 y\n-3 z\n"
+        assertOutput(
+            """
+            -3 z
+            10 x
+            9 y
+            Apple
+            apple
+            banana
+            pear
+            pear
+            --
+            pear
+            pear
+            banana
+            apple
+            Apple
+            9 y
+            10 x
+            -3 z
+            --
+            -3 z
+            Apple
+            apple
+            banana
+            pear
+            9 y
+            10 x
+            --
+            Apple
+            banana
+            pear
+            --
+            b:1
+            c:2
+            a:3
+            --
+            3 a
+            1 b
+            2 c
+            --
+            2.5
+            10
+            --
+                  1 Apple
+                  1 apple
+                  1 banana
+                  2 pear
+            --
+            pear
+            --
+            Apple
+            banana
+            --
+                  2 Apple
+            --
+            no newline
+            z
+            --
+            a
+            b
+            c
+            """,
+            """
+            sort /tmp/w
+            echo --
+            sort -r /tmp/w
+            echo --
+            sort -n /tmp/w | uniq
+            echo --
+            grep -v ' ' /tmp/w | sort -u -f
+            echo --
+            sort -t: -k2 -n /tmp/k
+            echo --
+            sort -k2 /tmp/f
+            echo --
+            printf '10\n2.5\n' | sort -n
+            echo --
+            grep -v ' ' /tmp/w | sort | uniq -c
+            echo --
+            grep -v ' ' /tmp/w | sort | uniq -d
+            echo --
+            grep -v ' ' /tmp/w | sort | uniq -u | grep -v apple
+            echo --
+            grep -v ' ' /tmp/w | sort -f | grep -i apple | uniq -c -i
+            echo --
+            printf 'z\nno newline' | sort
+            echo --
+            printf 'c\nb\na\n' >/tmp/s; sort -o /tmp/s /tmp/s; cat /tmp/s
+            """,
+            mapOf("/tmp/w" to words, "/tmp/k" to "a:3\nc:2\nb:1\n", "/tmp/f" to "2 c\n3 a\n1 b\n"),
+        )
+    }
+
+    @Test
+    fun `sortで多くの行を並べる`() {
+        assertOutput(
+            """
+            1
+            2
+            9999
+            20000
+            """,
+            """
+            seq 20000 -1 1 | sort -n | head -n 2
+            seq 20000 | sort | tail -n 1
+            seq 20000 | sort -r -n | head -n 1
+            """,
+        )
+    }
+
+    @Test
+    fun `teeとxargs`() {
+        assertOutput(
+            """
+            hi
+            hi
+            hi
+            again
+            a b c d
+            a b
+            c d
+            x-1-x
+            x-2 3-x
+            echo p q
+            p q
+            a b
+            c
+            1
+            2
+            123
+            0
+            xargs: nothing: No such file or directory
+            127
+            xargs: unmatched quote
+            1
+            nul ok
+            """,
+            """
+            echo hi | tee /tmp/a /tmp/b
+            cat /tmp/a /tmp/b
+            echo again | tee -a /tmp/a >/tmp/null; tail -n 1 /tmp/a
+            printf 'a b\nc\n  d\n' | xargs
+            printf 'a b c d' | xargs -n 2
+            printf '1\n  2 3\n' | xargs -I {} echo x-{}-x
+            echo p q | xargs -t echo 2>&1
+            printf '"a b" c\n' | xargs -n 1 echo
+            printf '1\n2\n' | xargs -n 1 sh -c 'echo ${'$'}0; exit 1'; echo ${'$'}?
+            printf '' | xargs -r false; echo ${'$'}?
+            echo a | xargs nothing 2>&1; echo ${'$'}?
+            echo "'a" | xargs 2>&1; echo ${'$'}?
+            printf 'nul\0ok\0' | xargs -0 echo
+            """,
+        )
+    }
+
+    @Test
+    fun `basenameとdirnameとwhich`() {
+        assertOutput(
+            """
+            c
+            c
+            /
+            c
+            a.tar
+            file.txt
+            a
+            b
+            a/b
+            a
+            .
+            /
+            /
+            /bin/ls
+            /bin/sh
+            1
+            /bin/ls
+            0
+            """,
+            """
+            basename /a/b/c
+            basename /a/b/c/
+            basename /
+            basename c.txt .txt
+            basename a.tar.gz .gz
+            basename file.txt file.txt
+            basename -a -s .c a.c b
+            dirname a/b/c a/b/
+            dirname c
+            dirname /a //a
+            which ls sh
+            which nothing; echo ${'$'}?
+            which /bin/ls; echo ${'$'}?
             """,
         )
     }
