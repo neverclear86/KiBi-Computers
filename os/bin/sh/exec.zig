@@ -306,39 +306,47 @@ fn runSimple(node: *Node) Error!void {
         state.status = if (!ok) 1 else subst_status orelse 0;
         return;
     }
-    if (state.xtrace) trace(argv.items);
-    try runArgv(node, argv.items, s.assigns, false);
+    // 跡は代入を展開した後に、代入の値と語を1行にして出す（`+ x=1 cmd`。#508）。
+    // 代入の値は、代入する所（[runArgv] の先）で1回だけ展開する
+    try runArgv(node, argv.items, s.assigns, false, if (state.xtrace) argv.items else null);
 }
 
-/// 展開した [argv] を動かす（[node] のリダイレクトと [assigns] の代入を使う）
-fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_functions: bool) Error!void {
+/// 展開した [argv] を動かす（[node] のリダイレクトと [assigns] の代入を使う）。
+/// [tr] が null でなければ、代入を展開した後に `set -x` の跡（代入と [tr] の語）を出す
+fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_functions: bool, tr: ?[]const []const u8) Error!void {
     const name = argv[0];
     const kind = builtins.kindOf(name);
     if (kind == .special) {
         // 特別な組み込みの代入は残る
+        var traced = Traced.init(tr);
         var a = assigns;
         while (a) |w| : (a = w.next) {
             const eq = util.indexOf(w.text, '=').?;
-            try vars.set(w.text[0..eq], try expand.assignValue(w.text[eq + 1 ..]));
+            const value = try expand.assignValue(w.text[eq + 1 ..]);
+            try traced.add(w.text[0 .. eq + 1], value);
+            try vars.set(w.text[0..eq], value);
         }
+        traced.write(io.STDERR);
         if (eql(name, "exec")) return execBuiltin(node, argv);
-        return runInProcess(node, argv, null);
+        return runInProcess(node, argv, null, null);
     }
     if (!no_functions) {
-        if (vars.findFunc(name)) |f| return callFunction(node, f, argv, assigns);
+        if (vars.findFunc(name)) |f| return callFunction(node, f, argv, assigns, tr);
     }
     if (kind == .regular) {
-        if (eql(name, "command")) return commandBuiltin(node, argv, assigns);
-        return runInProcess(node, argv, assigns);
+        if (eql(name, "command")) return commandBuiltin(node, argv, assigns, tr);
+        return runInProcess(node, argv, assigns, tr);
     }
-    // 外のプログラム
+    // 外のプログラム。代入はリダイレクトの前に展開する（跡をリダイレクトの誤りより先に出すため）
+    var traced = Traced.init(tr);
+    const env = try tempEnv(assigns, &traced);
+    traced.write(io.STDERR);
     var map = FdMap{};
     defer map.cleanup();
     if (!(try map.addRedirs(node.redirs))) {
         state.status = 1;
         return;
     }
-    const env = try tempEnv(assigns);
     const pm = pendingMark();
     var list = [_]?process.Child{spawnProgram(argv, env, &map)};
     map.afterSpawn(list[0] != null);
@@ -347,24 +355,25 @@ fn runArgv(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, no_func
     state.status = waitChildren(&list, pm);
 }
 
-/// `NAME=v cmd` の代入を、子の環境変数にする
-fn tempEnv(assigns: ?*parse.Word) Error![]process.EnvEntry {
+/// `NAME=v cmd` の代入を、子の環境変数にする（展開した値は [traced] にも覚える）
+fn tempEnv(assigns: ?*parse.Word, traced: *Traced) Error![]process.EnvEntry {
     var extra = mem.List(process.EnvEntry).init(&mem.ast);
     var a = assigns;
     while (a) |w| : (a = w.next) {
         const eq = util.indexOf(w.text, '=').?;
         const value = try expand.assignValue(w.text[eq + 1 ..]);
+        try traced.add(w.text[0 .. eq + 1], value);
         try extra.append(.{ .name = vars.str(w.text[0..eq]), .value = vars.str(value) });
     }
     return vars.environ(&mem.ast, extra.items);
 }
 
 /// 組み込みをシェルの中で動かす（[assigns] は終わるまでの一時の代入）
-fn runInProcess(node: *Node, argv: []const []const u8, assigns: ?*parse.Word) Error!void {
+fn runInProcess(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     const frame = vars.savedMark();
     // 一時の代入だけを戻す（`local` が覚えたものは、関数が終わるまで残す）
     defer if (assigns != null) vars.restoreLocals(frame);
-    try tempAssign(assigns, frame);
+    try tempAssign(assigns, frame, tr);
     var saves = Saves{};
     if (!(try applyRedirs(node.redirs, &saves, true))) {
         restoreRedirs(&saves);
@@ -375,22 +384,26 @@ fn runInProcess(node: *Node, argv: []const []const u8, assigns: ?*parse.Word) Er
     state.status = try builtins.run(argv);
 }
 
-fn tempAssign(assigns: ?*parse.Word, frame: usize) Error!void {
+/// 一時の代入をする。[tr] が null でなければ、代入を終えてから `set -x` の跡を出す
+fn tempAssign(assigns: ?*parse.Word, frame: usize, tr: ?[]const []const u8) Error!void {
+    var traced = Traced.init(tr);
     var a = assigns;
     while (a) |w| : (a = w.next) {
         const eq = util.indexOf(w.text, '=').?;
         const name = w.text[0..eq];
         const value = try expand.assignValue(w.text[eq + 1 ..]);
+        try traced.add(w.text[0 .. eq + 1], value);
         try vars.makeLocal(name, frame);
         try vars.set(name, value);
         try vars.setExported(name, true);
     }
+    traced.write(io.STDERR);
 }
 
 /// 関数の中で `local` が覚える位置
 pub var local_frame: usize = 0;
 
-fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?*parse.Word) Error!void {
+fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     if (state.func_depth >= MAX_FUNC_DEPTH) {
         util.complain(&.{ argv[0], ": too deeply nested function calls" });
         return error.Abort;
@@ -399,7 +412,7 @@ fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?
     defer vars.releaseFunc(f);
     const frame = vars.savedMark();
     defer vars.restoreLocals(frame);
-    try tempAssign(assigns, frame);
+    try tempAssign(assigns, frame, tr);
     var saves = Saves{};
     if (!(try applyRedirs(node.redirs, &saves, true))) {
         restoreRedirs(&saves);
@@ -441,24 +454,28 @@ fn execBuiltin(node: *Node, argv: []const []const u8) Error!void {
         return;
     }
     // 置き換えられないので、動かしてその終了コードで終わる
-    try runArgv(node, argv[1..], null, true);
+    try runArgv(node, argv[1..], null, true, null);
     process.exit(state.status);
 }
 
 /// `command [-v|-V] name args...`
-fn commandBuiltin(node: *Node, argv: []const []const u8, assigns: ?*parse.Word) Error!void {
+fn commandBuiltin(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     if (argv.len >= 2 and (eql(argv[1], "-v") or eql(argv[1], "-V"))) {
-        return runInProcess(node, argv, assigns);
+        return runInProcess(node, argv, assigns, tr);
     }
     if (argv.len == 1) {
+        // 動かすものはないが、代入は展開して跡に出す（`x=1 command` は `+ x=1 command`）
+        var traced = Traced.init(tr);
+        var a = assigns;
+        while (a) |w| : (a = w.next) {
+            const eq = util.indexOf(w.text, '=').?;
+            try traced.add(w.text[0 .. eq + 1], try expand.assignValue(w.text[eq + 1 ..]));
+        }
+        traced.write(io.STDERR);
         state.status = 0;
         return;
     }
-    return runArgv(node, argv[1..], assigns, true);
-}
-
-fn trace(parts: []const []const u8) void {
-    traceTo(io.STDERR, parts);
+    return runArgv(node, argv[1..], assigns, true, tr);
 }
 
 /// 代入の `set -x` の跡（`+ name=value`）を標準エラー出力に書く。[name_eq] は `name=` まで
@@ -469,22 +486,49 @@ fn traceAssign(name_eq: []const u8, value: []const u8) void {
     io.writeAll(io.STDERR, "\n") catch {};
 }
 
-/// [parts] の `set -x` の跡の長さ（`+`、各語の前の空白、改行）
-fn traceLen(parts: []const []const u8) usize {
-    var n: usize = 2;
-    for (parts) |p| n += 1 + p.len;
-    return n;
-}
+/// 展開したコマンドの前の代入の1つ（`name=` と値）
+const Assigned = struct { name_eq: []const u8, value: []const u8 };
 
-/// `set -x` の跡を [fd] に書く
-fn traceTo(fd: io.Fd, parts: []const []const u8) void {
-    io.writeAll(fd, "+") catch {};
-    for (parts) |p| {
-        io.writeAll(fd, " ") catch {};
-        io.writeAll(fd, p) catch {};
+/// コマンドの前の代入を展開しながら覚えて、語と1行にして `set -x` の跡を出す（`+ x=1 cmd`。#508）。
+/// [words] が null なら（跡を出さないなら）何も覚えない。
+/// 名前と値はつながずに続けて書く（つなぐ領域が足りなくて代入が失敗しないように。#510）
+const Traced = struct {
+    words: ?[]const []const u8,
+    assigns: mem.List(Assigned),
+
+    fn init(words: ?[]const []const u8) Traced {
+        return .{ .words = words, .assigns = mem.List(Assigned).init(&mem.ast) };
     }
-    io.writeAll(fd, "\n") catch {};
-}
+
+    fn add(self: *Traced, name_eq: []const u8, value: []const u8) Error!void {
+        if (self.words == null) return;
+        try self.assigns.append(.{ .name_eq = name_eq, .value = value });
+    }
+
+    /// 跡の長さ（`+`、各語の前の空白、改行）
+    fn len(self: *const Traced) usize {
+        var n: usize = 2;
+        for (self.assigns.items) |a| n += 1 + a.name_eq.len + a.value.len;
+        for (self.words orelse &.{}) |p| n += 1 + p.len;
+        return n;
+    }
+
+    /// 跡を [fd] に書く（跡を出さないなら何もしない）
+    fn write(self: *const Traced, fd: io.Fd) void {
+        const words = self.words orelse return;
+        io.writeAll(fd, "+") catch {};
+        for (self.assigns.items) |a| {
+            io.writeAll(fd, " ") catch {};
+            io.writeAll(fd, a.name_eq) catch {};
+            io.writeAll(fd, a.value) catch {};
+        }
+        for (words) |p| {
+            io.writeAll(fd, " ") catch {};
+            io.writeAll(fd, p) catch {};
+        }
+        io.writeAll(fd, "\n") catch {};
+    }
+};
 
 // ---- コマンドを探す ----
 
@@ -826,18 +870,27 @@ fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
         expand.fields(s.words, &argv) catch |e| return failedInside(e, nested);
     }
     if (argv.items.len == 0) return .not_program;
+    // コマンドの前の代入は、跡に出すためにリダイレクトの前に1回だけ展開する（#508）。
+    // 括弧の中なら親の状態を変えうる展開はない（[mayChangeParent]）ので、下でサブシェルに回しても子でもう一度展開してよい
+    var traced = Traced.init(if (state.xtrace) argv.items else null);
+    const env = blk: {
+        const saved_err = util.err_fd;
+        if (nested) util.err_fd = map.parentFd(2);
+        defer util.err_fd = saved_err;
+        break :blk tempEnv(s.assigns, &traced) catch |e| return failedInside(e, nested);
+    };
     // 括弧の中の跡は親が出先に同期で書く。出先は読む側をまだ起こしていないパイプの段の書く端のこともある
     // （`( cmd ) 2>&1 | cat`。段は前から順に起こす）。作ったばかりの空のパイプなので容量までは止まらずに書けるが、
     // それを超える跡はサブシェルで起こして子に書かせる（親は止まらずに読む側を起こせる。#497）
-    if (nested and state.xtrace and traceLen(argv.items) > PIPE_CAPACITY) return .not_program;
+    if (nested and state.xtrace and traced.len() > PIPE_CAPACITY) return .not_program;
     var n = if (nested) innerOf(outer).? else inner;
     while (true) {
         if (n == inner and state.xtrace) {
             // `set -x` の跡は、括弧のリダイレクトを効かせた標準エラー出力へ（サブシェルで起こしていたときと同じ。#478）。
             // コマンド自身のリダイレクトは効かせない（括弧のない `cmd 2>f` と同じ）
             if (nested) {
-                if (map.parentFd(2)) |fd| traceTo(fd, argv.items);
-            } else trace(argv.items);
+                if (map.parentFd(2)) |fd| traced.write(fd);
+            } else traced.write(io.STDERR);
         }
         // 途中の括弧のリダイレクトの誤りの知らせは、その外までのリダイレクトを効かせた標準エラー出力へ
         // （サブシェルで起こしていたときと同じ。コマンド自身のリダイレクトの誤りも、括弧のリダイレクトまでを効かせた出先へ）
@@ -854,7 +907,6 @@ fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
         if (n == inner) break;
         n = innerOf(n).?;
     }
-    const env = tempEnv(s.assigns) catch |e| return failedInside(e, nested);
     const child = spawnProgram(argv.items, env, map);
     map.afterSpawn(child != null);
     return .{ .done = child };
