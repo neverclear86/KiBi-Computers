@@ -68,12 +68,14 @@ class ShellTest {
 
     /**
      * `/bin/sh` を [args] で動かして終わるまで待つ。[input] はコンソールに打つ行（プロンプトが出るたびに 1 行）。
-     * [after] は、シェルが終わった後に、同じマシンで確かめること
+     * [after] は、シェルが終わった後に、同じマシンで確かめること。
+     * [ready] は、[input] の i 行目を打ってよいか（偽の間は、プロンプトが出ていても待つ）
      */
     private fun run(
         args: List<String>,
         files: Map<String, String> = emptyMap(),
         input: List<String> = emptyList(),
+        ready: (Int, Machine) -> Boolean = { _, _ -> true },
         after: (Harness, Machine) -> Unit = { _, _ -> },
     ): Result = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -87,7 +89,7 @@ class ShellTest {
             eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
                 h.scheduler.tick()
                 val text = host.text()
-                if (next < input.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> "))) {
+                if (next < input.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> ")) && ready(next, m)) {
                     seen = text.length
                     m.offerConsoleInput((input[next++] + "\n").toByteArray())
                 }
@@ -427,8 +429,14 @@ class ShellTest {
 
     @Test
     fun `会話的なシェルは、終わったジョブをコマンド付きでプロンプトの前に知らせる`() {
-        // #492: 知らせも jobs と同じ形にする
-        val r = run(emptyList(), input = listOf("exitwith 3 &", "nap", "echo end", "exit"))
+        // #492: 知らせも jobs と同じ形にする。
+        // #497: ジョブが終わったのをカーネルで確かめてから次の行を打つ（時間に頼らない）
+        val exited = { i: Int, m: Machine ->
+            i != 1 || m.lock.withLockValue {
+                m.kernel.processes.all().none { it.args.firstOrNull() == "exitwith" && !it.state.isTerminal }
+            }
+        }
+        val r = run(emptyList(), input = listOf("exitwith 3 &", "echo end", "exit"), ready = exited)
         val text = r.console.replace(Regex(" *\r\u001b\\[K\r\u001b\\[J"), "")
         assertTrue(text.contains("[1] Exit 3  exitwith 3\n"), text)
     }
@@ -676,6 +684,40 @@ class ShellTest {
                 "+ args a\n+ args b\n+ args d\n+ args e\n<e>\n+ args f\n+ :\n",
             r.console,
         )
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧を外して起こすコマンドのset -xの跡がパイプに入りきらなくても、シェルは止まらない`() {
+        // #497: 跡の出先が、読む側をまだ起こしていないパイプの段の書く端（`( cmd ) 2>&1 | cat`）。
+        // 跡がパイプの容量（4096）を超えても、親が書き込みで止まらず、跡も欠けない
+        val d = '$'
+        val word = "a".repeat(16 * 512)
+        val script = "v=aaaaaaaaaaaaaaaa\n" +
+            "for i in 1 2 3 4 5 6 7 8 9; do v=${d}v${d}v; done\n" +
+            "set -x\n" +
+            "( args ${d}v ) 2>&1 | cat >/tmp/p\n" +
+            "( ( args ${d}v ) 2>&1 ) | cat >/tmp/q\n" +
+            "set +x\n" +
+            "cat /tmp/p /tmp/q\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        val pair = "+ args $word\n<$word>\n"
+        assertEquals("+ cat\n+ cat\n+ set +x\n$pair$pair", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧を外して起こすコマンドのset -xの跡は、括弧でfd2を閉じたときと途中の括弧が失敗したときは書かない`() {
+        // #495 の設計メモのとおり。閉じた fd 2 には書かず、途中の括弧のリダイレクトが失敗したらコマンドまで進まない
+        val d = '$'
+        val script = "set -x\n" +
+            "( args a ) 2>&-\n" +
+            "( ( args b ) </nonexistent ) 2>/tmp/e\n" +
+            "set +x\n" +
+            "echo status ${d}?\n" +
+            "cat /tmp/e\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals("<a>\n+ set +x\nstatus 0\nsh: /nonexistent: No such file or directory\n", r.console)
         assertEquals(0, r.exitCode)
     }
 

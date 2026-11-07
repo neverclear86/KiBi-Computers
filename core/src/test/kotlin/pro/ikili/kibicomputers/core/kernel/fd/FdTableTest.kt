@@ -199,6 +199,7 @@ class FdTableTest {
         val o = fds.open(Obj())
         assertEquals(IoResult.Error(Errno.INVAL), FdIo.readLocked(kernel, vfs, sink, 1, o, buf, 0, 1))
     }
+
     private fun devVfs(): Vfs = Vfs(kernel.mounts).also {
         it.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "tmp")
         it.mount(VfsPath.parse("/dev"), DevFileSystem(), readOnly = false, source = "dev")
