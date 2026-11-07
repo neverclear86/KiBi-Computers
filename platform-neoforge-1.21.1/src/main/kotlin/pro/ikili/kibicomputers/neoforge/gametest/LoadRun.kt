@@ -17,15 +17,46 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import java.lang.management.ManagementFactory
+import java.lang.management.ThreadInfo
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.locks.LockSupport
 
-/** 負荷試験の段階。 */
 /** 負荷試験で打つ人（偽物） */
 private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
 
+/**
+ * 負荷試験で動かす OS と、そこで打ち込むもの（#476）。
+ *
+ * @property id `-PloadTestOs` に渡す名前
+ * @property label 結果に書く名前
+ * @property prompt プロンプトの文字。画面に、この文字だけの行が出たら入力待ち
+ * @property computeCommand 計算し続けるコマンド（画面に何も出さない無限ループ）
+ * @property outputCommand 画面に数字を1行ずつ出し続けるコマンド
+ */
+internal enum class LoadOs(val id: String, val label: String, val prompt: Char, val computeCommand: String, val outputCommand: String) {
+    /** テスト用の起動ディスク（#307）の Lua の REPL */
+    LUA("lua", "Lua の REPL", '>', "while true do end", "local i = 0 while true do i = i + 1 print(i) end"),
+
+    /** 標準 OS（#98。ゲームの既定。#461）のシェル */
+    STANDARD("standard", "標準 OS のシェル", '$', "while :; do :; done", "i=0; while :; do i=$((i+1)); echo \$i; done"),
+    ;
+
+    companion object {
+        /** 測定用の OS を渡すシステムプロパティ（`-PloadTestOs`） */
+        const val PROPERTY: String = "kibicomputers.loadTest.os"
+
+        /** [PROPERTY] の OS。なければ [LUA]。知らない名前なら失敗にする */
+        fun fromProperty(): LoadOs {
+            val id = System.getProperty(PROPERTY)?.trim().orEmpty().ifEmpty { return LUA }
+            return entries.firstOrNull { it.id == id }
+                ?: throw IllegalArgumentException("unknown $PROPERTY: $id (expected ${entries.joinToString { it.id }})")
+        }
+    }
+}
+
+/** 負荷試験の段階。 */
 internal enum class LoadPhase(val label: String) {
     /** 何も置いていない（並べる範囲のチャンクは読み込んである）。比べる基準 */
     EMPTY("何もない"),
@@ -33,7 +64,7 @@ internal enum class LoadPhase(val label: String) {
     /** 並べたが、電源は入れていない */
     PLACED("並べただけ（電源なし）"),
 
-    /** 全台が起動して、Lua のプロンプトを出すまで（初回のコンパイルを含む） */
+    /** 全台が起動して、プロンプトを出すまで（初回のコンパイルを含む） */
     BOOT("起動"),
 
     /** 全台が入力を待っている */
@@ -52,6 +83,7 @@ internal enum class LoadPhase(val label: String) {
 /**
  * 負荷試験の設定。
  *
+ * @property os 動かす OS
  * @property count 並べる台数
  * @property busy 計算・出力させる台数（それぞれ）
  * @property paced 実際のサーバーと同じく 1 tick を 50 ms にそろえるか。GameTest のサーバーは待たずに tick を進めるので、
@@ -62,6 +94,7 @@ internal enum class LoadPhase(val label: String) {
  * @property outputTimeoutTicks [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまで待つ上限。出なければ失敗
  */
 internal data class LoadSettings(
+    val os: LoadOs,
     val count: Int,
     val busy: Int,
     val paced: Boolean,
@@ -98,6 +131,11 @@ internal data class PhaseResult(
     val idleWorkerThreads: Int,
     /** 測っている間の、カーネルのスレッドの最大（10 tick ごとに数えた中で） */
     val peakKernelThreads: Int,
+    /**
+     * 測っている間の、カーネルのスレッドのうちプールで次の仕事を待っているワーカーを除いた数の最大（10 tick ごとに数えた中で）。
+     * 前の試験で増えて、まだ消えていないワーカーを数えない（#476: CI で OS ごとに続けて動かすため）
+     */
+    val peakBusyKernelThreads: Int,
     /** 段階の終わりの、JVM のスレッドの数 */
     val jvmThreads: Int,
     /** 測っている間の、JVM のスレッドの最大 */
@@ -138,6 +176,7 @@ internal class LoadReport(
         val idle = phases.firstOrNull { it.phase == LoadPhase.IDLE }?.heapUsedBytes ?: placed
         fun perMachine(from: Long, to: Long) = (to - from).toDouble() / s.count / mib
         val sb = StringBuilder()
+        sb.append("- OS: ").append(s.os.label).append('\n')
         sb.append(String.format(Locale.ROOT, "- 台数: %d（計算・出力はそれぞれ %d 台）、tick を 50 ms にそろえる: %s\n", s.count, s.busy, s.paced))
         sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台の電源を切る: %.1f ms（それぞれ 1 tick の中）\n", placeMillis, powerOnMillis, powerOffMillis))
         sb.append(String.format(Locale.ROOT, "- 出力させる台が全部、画面に出すまで: %d tick（ここから「一部が出力し続ける」を測る）\n", outputWaitTicks))
@@ -205,6 +244,7 @@ internal class LoadRun(
     private var samples = LongArray(1024)
     private var sampleCount = 0
     private var peakKernelThreads = 0
+    private var peakBusyKernelThreads = 0
     private var sentBytes = 0L
     private var countSent = false
 
@@ -290,10 +330,10 @@ internal class LoadRun(
 
     private fun boot() {
         if (phaseTick % 10 != 0) return
-        peakKernelThreads = maxOf(peakKernelThreads, kernelThreads())
+        sampleKernelThreads()
         var waiting = 0
         for (c in computers) {
-            if (!c.ready) c.ready = hasPrompt(c.screen.text)
+            if (!c.ready) c.ready = hasPrompt(c.screen.text, settings.os.prompt)
             if (!c.ready) waiting++
         }
         if (waiting == 0) {
@@ -312,8 +352,9 @@ internal class LoadRun(
             countSent = true
             threads.resetPeakThreadCount()
             peakKernelThreads = 0
+            peakBusyKernelThreads = 0
         }
-        if (recording && phaseTick % 10 == 0) peakKernelThreads = maxOf(peakKernelThreads, kernelThreads())
+        if (recording && phaseTick % 10 == 0) sampleKernelThreads()
         if (t == settings.warmupTicks + settings.measureTicks) next(p)
     }
 
@@ -341,7 +382,7 @@ internal class LoadRun(
             LoadPhase.EMPTY, LoadPhase.IDLE -> Unit
             LoadPhase.PLACED -> {
                 val t0 = System.nanoTime()
-                for (i in 0 until settings.count) LoadGameTests.Layout.placeComputer(helper, LoadGameTests.Layout.casePos(i, columns))
+                for (i in 0 until settings.count) LoadGameTests.Layout.placeComputer(helper, LoadGameTests.Layout.casePos(i, columns), settings.os)
                 placeMillis = (System.nanoTime() - t0) / 1e6
             }
             LoadPhase.BOOT -> {
@@ -361,12 +402,12 @@ internal class LoadRun(
                 // 起動は、電源を入れた次の tick から終わるまでを全部測る
                 recording = true
             }
-            LoadPhase.COMPUTE -> for (c in computeSet) type(c, "while true do end")
+            LoadPhase.COMPUTE -> for (c in computeSet) type(c, settings.os.computeCommand)
             LoadPhase.OUTPUT -> {
                 val t0 = System.nanoTime()
                 for (c in computeSet) c.case.pressPowerButton()
                 powerOffMillis = (System.nanoTime() - t0) / 1e6
-                for (c in outputSet) type(c, "local i = 0 while true do i = i + 1 print(i) end")
+                for (c in outputSet) type(c, settings.os.outputCommand)
             }
             LoadPhase.WATCHED -> watch(outputSet)
         }
@@ -383,7 +424,7 @@ internal class LoadRun(
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a computing machine stopped: ${lines(c.screen.text)}")
                 val text = lines(c.screen.text)
                 // 計算している間はプロンプトに戻らない
-                if (text.lastOrNull { it.isNotEmpty() } != "> while true do end") fail("the loop should keep running: $text")
+                if (text.lastOrNull { it.isNotEmpty() } != "${settings.os.prompt} ${settings.os.computeCommand}") fail("the loop should keep running: $text")
             }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
@@ -402,6 +443,7 @@ internal class LoadRun(
         sampleCount = 0
         sentBytes = 0
         peakKernelThreads = 0
+        peakBusyKernelThreads = 0
         threads.resetPeakThreadCount()
     }
 
@@ -412,7 +454,7 @@ internal class LoadRun(
         val infos = threads.dumpAllThreads(false, false, STACK_DEPTH).filter { it.threadName.startsWith("KiBi-") }
         val names = infos.groupingBy { it.threadName.replace(DIGITS, "#") }.eachCount().toSortedMap()
         val kernel = infos.size
-        val idleWorkers = infos.count { info -> info.stackTrace.any { it.className == ThreadPoolExecutor::class.java.name && it.methodName == "getTask" } }
+        val idleWorkers = infos.count(::isIdleWorker)
         val result = PhaseResult(
             phase = p,
             running = computers.count { it.case.computer.machine?.state == MachineState.RUNNING },
@@ -420,6 +462,7 @@ internal class LoadRun(
             kernelThreads = kernel,
             idleWorkerThreads = idleWorkers,
             peakKernelThreads = maxOf(peakKernelThreads, kernel),
+            peakBusyKernelThreads = maxOf(peakBusyKernelThreads, kernel - idleWorkers),
             jvmThreads = threads.threadCount,
             peakJvmThreads = threads.peakThreadCount,
             heapUsedBytes = heapAfterGc(),
@@ -496,7 +539,15 @@ internal class LoadRun(
         forced.clear()
     }
 
-    private fun kernelThreads(): Int = threads.dumpAllThreads(false, false, 0).count { it.threadName.startsWith("KiBi-") }
+    private fun sampleKernelThreads() {
+        val infos = threads.dumpAllThreads(false, false, STACK_DEPTH).filter { it.threadName.startsWith("KiBi-") }
+        peakKernelThreads = maxOf(peakKernelThreads, infos.size)
+        peakBusyKernelThreads = maxOf(peakBusyKernelThreads, infos.count { !isIdleWorker(it) })
+    }
+
+    /** プールで次の仕事を待っているワーカー（しばらくすると終わる） */
+    private fun isIdleWorker(info: ThreadInfo): Boolean =
+        info.stackTrace.any { it.className == ThreadPoolExecutor::class.java.name && it.methodName == "getTask" }
 
     private fun heapAfterGc(): Long {
         System.gc()
@@ -513,10 +564,10 @@ internal class LoadRun(
 
         private const val TARGET_NANOS = (LoadGameTests.TARGET_TICK_MILLIS * 1_000_000).toLong()
 
-        /** 画面に Lua のプロンプト（`>` だけの行）がある */
-        fun hasPrompt(text: TextBuffer): Boolean {
+        /** 画面にプロンプト（[prompt] の文字だけの行）がある */
+        fun hasPrompt(text: TextBuffer, prompt: Char): Boolean {
             for (y in 0 until text.height) {
-                if (text.getCodePoint(0, y) != '>'.code) continue
+                if (text.getCodePoint(0, y) != prompt.code) continue
                 var blank = true
                 for (x in 1 until text.width) {
                     if (text.getCodePoint(x, y) != ' '.code) {
