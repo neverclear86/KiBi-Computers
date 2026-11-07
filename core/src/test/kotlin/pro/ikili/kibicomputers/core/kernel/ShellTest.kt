@@ -688,6 +688,40 @@ class ShellTest {
     }
 
     @Test
+    fun `括弧を外して起こすコマンドの長いset -xの跡は、語が多くてもパイプに丸ごと入る`() {
+        // #500: パイプの容量（4096）を超える跡を、パターンの展開で出た多くの語で作る（#497 のテストは長い語1つ）
+        val names = (100 until 300).map { "/home/sub/file-with-a-long-name-$it" }
+        val script = "set -x\n" +
+            "( args /home/sub/* ) 2>&1 | cat >/tmp/p\n" +
+            "set +x\n" +
+            "cat /tmp/p\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script) + names.associateWith { "" })
+        val trace = "+ args " + names.joinToString(" ") + "\n"
+        assertTrue(trace.length > 4096)
+        val out = names.joinToString(" ") { "<$it>" } + "\n"
+        assertEquals("+ cat\n+ set +x\n$trace$out", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧を外して起こすコマンドが起こせなくても、長いset -xの跡はパイプに丸ごと入る`() {
+        // #500 で見つけた形: 引数が多すぎて起こせない（`ls -d /bin/*` を何度も並べたとき）。
+        // 跡（4096 を超える）と起こせなかった知らせが、どちらも括弧の 2>&1 の先に出る
+        val d = '$'
+        val words = (1000 until 1300).map { "word-number-$it" }
+        val script = "x='${words.joinToString(" ")}'\n" +
+            "set -x\n" +
+            "( args ${d}x ) 2>&1 | cat >/tmp/p\n" +
+            "set +x\n" +
+            "cat /tmp/p\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        val trace = "+ args " + words.joinToString(" ") + "\n"
+        assertTrue(trace.length > 4096)
+        assertEquals("+ cat\n+ set +x\n${trace}sh: args: Argument list too long\n", r.console)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `括弧を外して起こすコマンドのset -xの跡がパイプに入りきらなくても、シェルは止まらない`() {
         // #497: 跡の出先が、読む側をまだ起こしていないパイプの段の書く端（`( cmd ) 2>&1 | cat`）。
         // 跡がパイプの容量（4096）を超えても、親が書き込みで止まらず、跡も欠けない
