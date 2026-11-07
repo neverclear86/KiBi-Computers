@@ -22,6 +22,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`・`hang`・`nap`）を使う
  */
 class ShellTest {
+
     private val limit = Duration.ofSeconds(180)
 
     private class ConsoleHost : MachineHost {
@@ -711,6 +712,46 @@ class ShellTest {
             r.console,
         )
         assertEquals(7L, count)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `動かすもののないcommandの前の代入は、set -xがなくても1回だけ展開し、跡に出す`() {
+        // #513: `x=... command` は何も起こさないが、代入の値は展開する（コマンド置換・`${d}{y:=w}` が動く。bash・dash と同じ）
+        val d = '$'
+        val sub = "${d}({ set +x; echo >>/tmp/n; echo v; } 2>/tmp/j)"
+        val script = "x=$sub command\n" +
+            "x=${d}{y:=w} command\n" +
+            "echo y=${d}y x=${d}x\n" +
+            "set -x\n" +
+            "x=$sub z=${d}{z:=u} command\n" +
+            "set +x\n" +
+            "echo z=${d}z x=${d}x\n"
+        var count = -1L
+        val r = run(
+            listOf("/home/t.sh"),
+            mapOf("/home/t.sh" to script),
+            after = { _, m -> count = m.vfs.stat(VfsPath.parse("/tmp/n")).size },
+        )
+        assertEquals("y=w x=\n+ x=v z=u command\n+ set +x\nz=u x=\n", r.console)
+        assertEquals(2L, count)
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
+    fun `括弧を外して起こすコマンドの長い代入は跡の長さに入り、パイプの容量を超えても跡は1回だけ丸ごと出る`() {
+        // #513: 語だけでは容量（4096）に入るが、代入を足すと超える跡。サブシェルに回して子に書かせる
+        val d = '$'
+        val value = "a".repeat(16 * 512)
+        val script = "v=aaaaaaaaaaaaaaaa\n" +
+            "for i in 1 2 3 4 5 6 7 8 9; do v=${d}v${d}v; done\n" +
+            "set -x\n" +
+            "( x=${d}v args q ) 2>&1 | cat >/tmp/p\n" +
+            "( x=short args r ) 2>&1 | cat >/tmp/q\n" +
+            "set +x\n" +
+            "cat /tmp/p /tmp/q\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals("+ cat\n+ cat\n+ set +x\n+ x=$value args q\n<q>\n+ x=short args r\n<r>\n", r.console)
         assertEquals(0, r.exitCode)
     }
 

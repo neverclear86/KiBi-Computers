@@ -405,6 +405,8 @@ pub var local_frame: usize = 0;
 
 fn callFunction(node: *Node, f: *vars.Func, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     if (state.func_depth >= MAX_FUNC_DEPTH) {
+        // 呼べなくても、跡は呼ぶときと同じく代入を展開して出してから知らせる（#513）
+        try expandAssignsOnly(assigns, tr);
         util.complain(&.{ argv[0], ": too deeply nested function calls" });
         return error.Abort;
     }
@@ -458,20 +460,26 @@ fn execBuiltin(node: *Node, argv: []const []const u8) Error!void {
     process.exit(state.status);
 }
 
+/// [assigns] を展開するだけで代入はせず、[tr] が null でなければ `set -x` の跡（代入と [tr] の語）を出す
+fn expandAssignsOnly(assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
+    var traced = Traced.init(tr);
+    var a = assigns;
+    while (a) |w| : (a = w.next) {
+        const eq = util.indexOf(w.text, '=').?;
+        try traced.add(w.text[0 .. eq + 1], try expand.assignValue(w.text[eq + 1 ..]));
+    }
+    traced.write(io.STDERR);
+}
+
 /// `command [-v|-V] name args...`
 fn commandBuiltin(node: *Node, argv: []const []const u8, assigns: ?*parse.Word, tr: ?[]const []const u8) Error!void {
     if (argv.len >= 2 and (eql(argv[1], "-v") or eql(argv[1], "-V"))) {
         return runInProcess(node, argv, assigns, tr);
     }
     if (argv.len == 1) {
-        // 動かすものはないが、代入は展開して跡に出す（`x=1 command` は `+ x=1 command`）
-        var traced = Traced.init(tr);
-        var a = assigns;
-        while (a) |w| : (a = w.next) {
-            const eq = util.indexOf(w.text, '=').?;
-            try traced.add(w.text[0 .. eq + 1], try expand.assignValue(w.text[eq + 1 ..]));
-        }
-        traced.write(io.STDERR);
+        // 動かすものはないが、代入は展開して跡に出す（`x=1 command` は `+ x=1 command`）。
+        // `set -x` がなくても展開はする（コマンド置換や `${x:=w}` は動く。bash・dash と同じ）
+        try expandAssignsOnly(assigns, tr);
         state.status = 0;
         return;
     }

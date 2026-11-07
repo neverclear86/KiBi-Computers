@@ -1,6 +1,7 @@
-//! `ls [-1alF] [パス...]`: ディレクトリの中身を名前の順に書く（パスがなければ `.`）。
+//! `ls [-1adlF] [パス...]`: ディレクトリの中身を名前の順に書く（パスがなければ `.`）。
 //!
 //! - `-a`: `.` で始まる名前も（`.`・`..` を含む）
+//! - `-d`: ディレクトリの中ではなく、ディレクトリ自体を（ファイルと同じに）書く
 //! - `-l`: 1 行に 1 つ、`種類 大きさ 変更時刻（UTC） 名前`。種類は `-` ファイル・`d` ディレクトリ・`l` リンク・`c` デバイス・`?` ほか
 //! - `-1`: 1 行に 1 つ（標準出力が TTY でなければ、もとからそう）
 //! - `-F`: ディレクトリの名前の後ろに `/`
@@ -13,7 +14,7 @@ const cli = kibi.cli;
 const fs = kibi.fs;
 const io = kibi.io;
 
-const SYNOPSIS = "ls [-1alF] [file...]";
+const SYNOPSIS = "ls [-1adlF] [file...]";
 
 const MAX_ENTRIES = 2048;
 const NAMES_SIZE = 64 * 1024;
@@ -27,6 +28,7 @@ var items: [MAX_ENTRIES]Item = undefined;
 var items_len: usize = 0;
 
 var all = false;
+var dir_self = false;
 var long = false;
 var one = false;
 var classify = false;
@@ -40,6 +42,7 @@ pub fn main() u8 {
     var opts = cli.Args.init(argv);
     while (opts.next()) |c| switch (c) {
         'a' => all = true,
+        'd' => dir_self = true,
         'l' => long = true,
         '1' => one = true,
         'F' => classify = true,
@@ -52,7 +55,7 @@ pub fn main() u8 {
     const paths: []const []const u8 = if (operands.len == 0) &.{"."} else operands;
     var status: u8 = 0;
 
-    // ファイルを先にまとめて書き、ディレクトリを後に 1 つずつ
+    // ファイルを先にまとめて書き、ディレクトリを後に 1 つずつ（`-d` ならディレクトリもファイルと同じに）
     var dirs: usize = 0;
     var full = false;
     resetItems();
@@ -62,7 +65,7 @@ pub fn main() u8 {
             status = 1;
             continue;
         };
-        if (st.kind == .directory) {
+        if (st.kind == .directory and !dir_self) {
             dirs += 1;
             continue;
         }
@@ -80,6 +83,7 @@ pub fn main() u8 {
     }
     var printed = files > 0;
     for (paths) |p| {
+        if (dir_self) break;
         const st = fs.stat(p) catch continue;
         if (st.kind != .directory) continue;
         if (printed) cli.stdout.byte('\n');

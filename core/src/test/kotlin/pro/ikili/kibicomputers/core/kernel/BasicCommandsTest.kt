@@ -220,6 +220,29 @@ class BasicCommandsTest {
     }
 
     @Test
+    fun `ls -dはディレクトリの中ではなく、ディレクトリ自体を書く`() {
+        // #513: `-d` がなかった（`ls: unknown option -d`）
+        val out = sh(
+            """
+            cd /tmp
+            mkdir dir
+            touch dir/f a
+            ls -d dir a | cat
+            echo --
+            ls -dF dir /tmp/dir a | cat
+            echo --
+            ls -d | cat
+            ls -dl dir
+            ls -z 2>&1; echo ${'$'}?
+            """,
+        )
+        val lines = out.lines()
+        assertEquals(listOf("a", "dir", "--", "/tmp/dir/", "a", "dir/", "--", "."), lines.take(8), out)
+        assertTrue(Regex("^d +\\d+ \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} dir$").matches(lines[8]), out)
+        assertEquals(listOf("ls: unknown option -z", "usage: ls [-1adlF] [file...]", "2"), lines.subList(9, 12), out)
+    }
+
+    @Test
     fun `lsはパスに並べたファイルが多すぎると、書ける分を書いてから知らせ、1で終わる`() {
         // #510: `ls` の項目の上限（`MAX_ENTRIES`、2,048）を超えた分を、黙って落として 0 で終わっていた
         assertOutput(
