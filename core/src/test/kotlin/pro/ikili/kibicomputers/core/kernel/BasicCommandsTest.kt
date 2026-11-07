@@ -743,17 +743,13 @@ class BasicCommandsTest {
             step({ "プロンプトが出ない: ${host.text()}" }) { host.text().endsWith("$ ") }
             var seen = host.text().length
             m.offerConsoleInput("seq 3 | xargs sleep 100\n".toByteArray())
-            step({ "sleep が動かない: ${live()}" }) { live().any { it.second.firstOrNull() == "sleep" } }
-            var lastSent = 0L
-            step({ "プロンプトに戻らない: ${host.text()}" }) {
-                val text = host.text()
-                val now = System.nanoTime()
-                if (now - lastSent > 200_000_000) {
-                    m.offerConsoleInput(byteArrayOf(3))
-                    lastSent = now
-                }
-                text.length > seen && text.endsWith("$ ")
-            }
+            // #492: Ctrl+C は sleep が前景になってから1回だけ送る。プロンプトでの Ctrl+C も $? を 130 にするので、
+            // 余分に送ると status 130 の検査が退行を捕まえられない
+            fun foreground() = m.lock.withLockValue { m.consoleTtyLocked().foregroundPid }
+            fun sleepPid() = live().firstOrNull { it.second.firstOrNull() == "sleep" }?.first
+            step({ "sleep が前景にならない: ${live()} / ${foreground()}" }) { sleepPid().let { it != null && it == foreground() } }
+            m.offerConsoleInput(byteArrayOf(3))
+            step({ "プロンプトに戻らない: ${host.text()}" }) { host.text().let { it.length > seen && it.endsWith("$ ") } }
             // xargs だけでなく、走っていた sleep も止まる
             step({ "残っている: ${live()}" }, 20_000) { live().map { it.first } == listOf(pid) }
             seen = host.text().length

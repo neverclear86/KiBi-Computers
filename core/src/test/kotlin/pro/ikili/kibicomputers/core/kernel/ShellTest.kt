@@ -382,6 +382,9 @@ class ShellTest {
             long ok
             sh: jobs: %1: job specs are not supported
             2
+            dashdash 0
+            sh: jobs: -l: job specs are not supported
+            2
             """,
             """
             exitwith 3 &
@@ -400,6 +403,8 @@ class ShellTest {
             jobs -p >/tmp/p; { read a; read b; read c; } </tmp/p; [ ${d}c = ${d}h ] && echo pids ok
             jobs -l >/tmp/l; while read l; do case ${d}l in "[3] ${d}h Running  hang &") echo long ok;; esac; done </tmp/l
             jobs %1; echo ${d}?
+            jobs -- >/tmp/j; echo dashdash ${d}?
+            jobs -- -l; echo ${d}?
             kill ${d}h; wait ${d}h
             """,
         )
@@ -407,10 +412,25 @@ class ShellTest {
 
     @Test
     fun `会話的なシェルのjobsは、終わったと書いたジョブを片付ける`() {
-        val r = run(emptyList(), input = listOf("hang &", "jobs", "kill ${'$'}!; wait", "jobs; echo end", "exit"))
+        // #492: 同じ行の中で終わったジョブを使う（wait で表を空にしない。プロンプトでの知らせも挟まらない）。
+        // Done と書くまで jobs を回し、書いた後の jobs が何も書かないことを確かめる
+        val d = "${'$'}"
+        val line = "true & while :; do jobs >/tmp/j; read l </tmp/j; case ${d}l in *Done*) break;; esac; done; " +
+            "cat /tmp/j; jobs; jobs; echo end"
+        val r = run(emptyList(), input = listOf("hang &", "jobs", "kill ${d}!; wait", line, "exit"))
         val text = r.console.replace(Regex(" *\r\u001b\\[K\r\u001b\\[J"), "")
         assertTrue(text.contains("[1] Running  hang &\n"), text)
-        assertTrue(text.contains("jobs; echo end\nend\n"), text)
+        assertTrue(text.contains("\n[1] Done  true\nend\n$ exit"), text)
+        // 片付けたものは、プロンプトの前にもう一度知らせない
+        assertEquals(1, Regex("Done  true").findAll(text).count(), text)
+    }
+
+    @Test
+    fun `会話的なシェルは、終わったジョブをコマンド付きでプロンプトの前に知らせる`() {
+        // #492: 知らせも jobs と同じ形にする
+        val r = run(emptyList(), input = listOf("exitwith 3 &", "nap", "echo end", "exit"))
+        val text = r.console.replace(Regex(" *\r\u001b\\[K\r\u001b\\[J"), "")
+        assertTrue(text.contains("[1] Exit 3  exitwith 3\n"), text)
     }
 
     @Test
