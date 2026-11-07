@@ -63,10 +63,11 @@ object LoadGameTests {
     private const val CI_MAX_IDLE_KERNEL_THREADS = 8
 
     /**
-     * CI で、起動の間のカーネルのスレッド（プールで次の仕事を待っているワーカーを除く）の最大の上限（#350）。
+     * CI で、起動の間のカーネルのスレッドの最大の上限（#350）。
      * 台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
      * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分。
-     * 待っているワーカーを除くのは、先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）
+     * 起動の前からあってプールで待っているワーカーは数えない。先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）。
+     * 起動の間に作られたスレッドは、待っているワーカーでも数える（#483）
      */
     private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
@@ -138,8 +139,9 @@ object LoadGameTests {
                     "for $CI_COUNT machines (${idle.kernelThreadNames})",
             )
             helper.assertTrue(
-                boot.peakBusyKernelThreads <= ciMaxBootKernelThreads(),
-                "booting $CI_COUNT machines at once should not create a thread per machine: ${boot.peakBusyKernelThreads} busy kernel threads " +
+                boot.peakPhaseKernelThreads <= ciMaxBootKernelThreads(),
+                "booting $CI_COUNT machines at once should not create a thread per machine: ${boot.peakPhaseKernelThreads} kernel threads " +
+                    "created or working during the boot " +
                     "(limit ${ciMaxBootKernelThreads()})",
             )
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
