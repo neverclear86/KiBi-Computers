@@ -991,12 +991,10 @@ fn pumpWrite(p: *Pending, ev: wasi.Event) void {
 const Stream = struct {
     buf: *Buffer,
     fd: io.Fd,
-    /// パイプラインの子（空きを待つ間、最後のものを前景にして Ctrl+C を届ける）
-    children: []const ?process.Child,
-    /// 読む側が閉じた・書けない（それより後の出力は捨てる）
+    /// パイプラインの子の終わり（空きを待つ間も見て、Ctrl+C で止まった子があれば残りを止める）
+    watch: Watch,
+    /// 読む側が閉じた・書けない・子が Ctrl+C で止まった（それより後の出力は捨てる）
     broken: bool = false,
-    /// 空きを待つために、子を前景にした（段を動かし終えたら、シェルに戻す）
-    fg_given: bool = false,
 };
 
 /// 今動かしている途中の段（なければ null）
@@ -1022,17 +1020,23 @@ fn streamOut(st: *Stream, s: []const u8) bool {
     return pumpOut(st, s);
 }
 
-/// [data] を全部書くまで、空きを待って書く。待つ間も、積んであるヒアドキュメントなどを書く（子と待ち合わないよう）。
-/// 読む側が閉じた・書けなければ false
+/// [data] を全部書くまで、空きを待って書く。待つ間も、積んであるヒアドキュメントなどを書き（子と待ち合わないよう）、
+/// 子の終わりを見る。読む側が閉じた・書けない・子が Ctrl+C で止まった（残りの子も止める）なら false
 fn pumpOut(st: *Stream, data: []const u8) bool {
     // 読む子が止まっていても Ctrl+C で抜けられるよう、子を前景にする
-    if (!st.fg_given) st.fg_given = giveForeground(st.children);
-    var subs: [MAX_PENDING + 1]wasi.Subscription = undefined;
-    var events: [MAX_PENDING + 1]wasi.Event = undefined;
+    if (!st.watch.fg_given) st.watch.giveForeground();
+    var subs: [MAX_SUBS]wasi.Subscription = undefined;
+    var events: [MAX_SUBS]wasi.Event = undefined;
     var off: usize = 0;
     while (off < data.len) {
         subs[0] = .{ .userdata = STREAM_TAG, .tag = wasi.EVENTTYPE_FD_WRITE, .u = .{ .fd = .{ .fd = st.fd } } };
         var n: usize = 1;
+        // 読まない子が途中にいると、最後の子が Ctrl+C で止まっても空きができない。止まったら残りも止めて抜ける
+        n += st.watch.check(subs[n..]);
+        if (st.watch.interrupted) {
+            st.broken = true;
+            return false;
+        }
         for (pending[0..npending], 0..) |p, k| {
             if (!p.open) continue;
             subs[n] = .{ .userdata = PENDING_TAG + k, .tag = wasi.EVENTTYPE_FD_WRITE, .u = .{ .fd = .{ .fd = p.fd } } };
@@ -1059,27 +1063,91 @@ fn pumpOut(st: *Stream, data: []const u8) bool {
             } else if (ev.userdata >= PENDING_TAG) {
                 pumpWrite(&pending[@intCast(ev.userdata - PENDING_TAG)], ev);
             }
+            // 子の終わりは、次の check で見る
         }
     }
     return true;
 }
 
-/// 子のうち最後のものを TTY の前景にする（標準入力が TTY で、このシェルが前景のとき）。渡したら true
-fn giveForeground(children: []const ?process.Child) bool {
-    var fg_child: ?process.Child = null;
-    for (children) |maybe| {
-        if (maybe) |c| fg_child = c;
+/// パイプラインなどの子の終わりを見る（子を待つ間と、途中の段の出力の空きを待つ間）
+const Watch = struct {
+    /// 子（段の位置ごと。シェルの中で動かす段は null）
+    children: []const ?process.Child,
+    done: [MAX_STAGES]bool = @splat(false),
+    /// どれかが Ctrl+C・Ctrl+\ で止まった
+    interrupted: bool = false,
+    /// 最後の段の終了コード（最後の段が子で、終わったとき）
+    last_status: ?u8 = null,
+    /// TTY の前景を子に渡した（終わったら、シェルに戻す）
+    fg_given: bool = false,
+    /// 前景にした子の位置
+    fg_idx: usize = 0,
+
+    /// まだ動いている子のうち最後のもの
+    fn lastRunning(self: *const Watch) ?usize {
+        var k = self.children.len;
+        while (k > 0) {
+            k -= 1;
+            if (self.children[k] != null and !self.done[k]) return k;
+        }
+        return null;
     }
-    const c = fg_child orelse return false;
-    if (!tty.isTty(io.STDIN)) return false;
-    const fg = tty.getForeground(io.STDIN) catch 0;
-    // 会話的なシェルは、前景がなければ自分のものとして渡す
-    if (fg == process.selfPid() or (state.interactive and fg == 0)) {
-        tty.setForeground(io.STDIN, c.pid()) catch {};
-        return true;
+
+    /// 動いている子のうち最後のものを TTY の前景にする（標準入力が TTY で、このシェルが前景のとき）
+    fn giveForeground(self: *Watch) void {
+        const k = self.lastRunning() orelse return;
+        if (!tty.isTty(io.STDIN)) return;
+        const fg = tty.getForeground(io.STDIN) catch 0;
+        // 会話的なシェルは、前景がなければ自分のものとして渡す
+        if (fg == process.selfPid() or (state.interactive and fg == 0)) {
+            tty.setForeground(io.STDIN, self.children[k].?.pid()) catch {};
+            self.fg_given = true;
+            self.fg_idx = k;
+        }
     }
-    return false;
-}
+
+    /// 終わった子を印し、動いている子を [subs] に（userdata は段の位置で FD_READ）足して、足した数を返す。
+    /// Ctrl+C・Ctrl+\ で止まった子があれば、残りの子も止める。前景の子が終わったら、動いている最後の子に前景を移す
+    /// （終わった子が前景のままだと、Ctrl+C がどこにも届かない）
+    fn check(self: *Watch, subs: []wasi.Subscription) usize {
+        const last_idx = self.children.len - 1;
+        for (self.children, 0..) |maybe, i| {
+            const c = maybe orelse continue;
+            if (self.done[i]) continue;
+            const st = c.status() catch {
+                self.done[i] = true;
+                continue;
+            };
+            const s = st orelse continue;
+            self.done[i] = true;
+            if (i == last_idx) self.last_status = statusOf(s);
+            if (s == .killed) {
+                if (s.killed) |sig| {
+                    if (sig == .interrupt or sig == .quit) self.interrupted = true;
+                }
+            }
+        }
+        if (self.interrupted) {
+            for (self.children, 0..) |maybe, i| {
+                if (!self.done[i]) if (maybe) |c| c.kill(.interrupt) catch {};
+            }
+        }
+        if (self.fg_given and self.done[self.fg_idx]) {
+            if (self.lastRunning()) |k| {
+                tty.setForeground(io.STDIN, self.children[k].?.pid()) catch {};
+                self.fg_idx = k;
+            }
+        }
+        var n: usize = 0;
+        for (self.children, 0..) |maybe, i| {
+            const c = maybe orelse continue;
+            if (self.done[i]) continue;
+            subs[n] = .{ .userdata = i, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = c.handle } } };
+            n += 1;
+        }
+        return n;
+    }
+};
 
 /// 子を待つ間に読む、コマンド置換の出力
 const Sink = struct { fd: io.Fd, buf: *Buffer, done: bool = false };
@@ -1090,46 +1158,23 @@ const MAX_SUBS = MAX_STAGES + MAX_PENDING + 1;
 
 /// 子がすべて終わるまで待ち、最後の子の終了コードを返す（ハンドルを閉じる）。
 /// 待つ間に、積んであるヒアドキュメントなどを少しずつ書き、[from] から後に積んだものは最後に片付ける。
-/// 標準入力が TTY で、このシェルが前景なら、子として起こした最後の段を前景にする。どれかが Ctrl+C で止まったら残りも止める
+/// 標準入力が TTY で、このシェルが前景なら、子として起こした段のうち動いている最後のものを前景にする。
+/// どれかが Ctrl+C で止まったら残りも止める
 pub fn waitChildren(children: []?process.Child, from: usize) u8 {
     return waitIo(children, from, null) catch 2;
 }
 
 /// [waitChildren] に加えて、[sink] を書く側が閉じるまで読む。読んだものを置けなければ、子を止めて `OutOfMemory`
 fn waitIo(children: []?process.Child, from: usize, sink: ?*Sink) Error!u8 {
-    var last_status: u8 = state.status;
-    const last_idx = children.len - 1;
+    var w = Watch{ .children = children };
     // 最後の段がシェルの中で動いたときも、Ctrl+C が届くよう、子のうち最後のものを前景にする
-    const fg_given = giveForeground(children);
-    var interrupted = false;
+    w.giveForeground();
     var failure: ?Error = null;
-    var done: [MAX_STAGES]bool = @splat(false);
     var subs: [MAX_SUBS]wasi.Subscription = undefined;
     var events: [MAX_SUBS]wasi.Event = undefined;
     var chunk: [1024]u8 = undefined;
     while (failure == null) {
-        var n: usize = 0;
-        for (children, 0..) |maybe, i| {
-            const c = maybe orelse continue;
-            if (done[i]) continue;
-            const st = c.status() catch {
-                done[i] = true;
-                continue;
-            };
-            if (st) |s| {
-                done[i] = true;
-                const code = statusOf(s);
-                if (i == last_idx) last_status = code;
-                if (s == .killed) {
-                    if (s.killed) |sig| {
-                        if (sig == .interrupt or sig == .quit) interrupted = true;
-                    }
-                }
-                continue;
-            }
-            subs[n] = .{ .userdata = i, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = c.handle } } };
-            n += 1;
-        }
+        var n = w.check(&subs);
         if (sink) |s| {
             if (!s.done) {
                 subs[n] = .{ .userdata = SINK_TAG, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = s.fd } } };
@@ -1138,11 +1183,6 @@ fn waitIo(children: []?process.Child, from: usize, sink: ?*Sink) Error!u8 {
         }
         // 書くものだけが残ったら終わる（読む側は子なので、子が終われば書けない）
         if (n == 0) break;
-        if (interrupted) {
-            for (children, 0..) |maybe, i| {
-                if (!done[i]) if (maybe) |c| c.kill(.interrupt) catch {};
-            }
-        }
         for (pending[0..npending], 0..) |p, k| {
             if (!p.open) continue;
             subs[n] = .{ .userdata = PENDING_TAG + k, .tag = wasi.EVENTTYPE_FD_WRITE, .u = .{ .fd = .{ .fd = p.fd } } };
@@ -1166,18 +1206,18 @@ fn waitIo(children: []?process.Child, from: usize, sink: ?*Sink) Error!u8 {
     }
     if (failure != null) {
         for (children, 0..) |maybe, i| {
-            if (!done[i]) if (maybe) |c| c.kill(.terminate) catch {};
+            if (!w.done[i]) if (maybe) |c| c.kill(.terminate) catch {};
         }
     }
     for (children) |maybe| if (maybe) |c| c.release();
     finishPending(from);
-    if (fg_given) tty.setForeground(io.STDIN, process.selfPid()) catch {};
+    if (w.fg_given) tty.setForeground(io.STDIN, process.selfPid()) catch {};
     if (failure) |e| return e;
-    if (interrupted and fg_given and !state.interactive) {
+    if (w.interrupted and w.fg_given and !state.interactive) {
         // Ctrl+C はシェルのスクリプトごと止める
         process.killPid(process.selfPid(), .interrupt) catch {};
     }
-    return last_status;
+    return w.last_status orelse state.status;
 }
 
 // ---- パイプライン ----
@@ -1252,7 +1292,7 @@ fn runPipeline(first: *Node, count: usize) Error!void {
             // 大きい出力は、ためすぎないよう、空きを待って書く
             deferred_out[k] = null;
             var buf = Buffer{};
-            var st = Stream{ .buf = &buf, .fd = t, .children = children[0..i] };
+            var st = Stream{ .buf = &buf, .fd = t, .watch = .{ .children = children[0..i] } };
             const prev = capture_buf;
             const prev_stream = stream;
             capture_buf = &buf;
@@ -1260,7 +1300,7 @@ fn runPipeline(first: *Node, count: usize) Error!void {
             runStage(dn);
             capture_buf = prev;
             stream = prev_stream;
-            fg_given = fg_given or st.fg_given;
+            fg_given = fg_given or st.watch.fg_given;
             if (st.broken) buf.len = 0;
             queueOwned(t, buf.take());
         } else {

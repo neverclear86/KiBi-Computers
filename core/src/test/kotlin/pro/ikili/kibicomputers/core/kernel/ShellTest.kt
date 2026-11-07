@@ -536,6 +536,14 @@ class ShellTest {
                 // ためる上限（64 KiB）より大きく、空きを待つ間に Ctrl+C を受ける
                 "y=${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x; echo \"${'$'}y\" | hang" to true,
                 "echo big ${'$'}?" to false,
+                // 3 段: 前景の cat が Ctrl+C で止まったら、読まない途中の hang も止めて、空きを待つのをやめる
+                "echo \"${'$'}y\" | hang | cat" to true,
+                "echo three ${'$'}?" to false,
+                // 前景にした最後の段が先に終わったら、動いている段に前景を移す（空きを待つ間と、子を待つ間）
+                "echo \"${'$'}y\" | hang | true" to true,
+                "echo moved ${'$'}?" to false,
+                "hang | true" to true,
+                "echo waited ${'$'}?" to false,
                 // 最後の段がシェルの中で動く
                 "hang | echo last" to true,
                 "echo second ${'$'}?" to false,
@@ -568,6 +576,9 @@ class ShellTest {
             val text = host.text()
             assertTrue(text.contains("after 130\n"), text)
             assertTrue(text.contains("big 130\n"), text)
+            assertTrue(text.contains("three 130\n"), text)
+            assertTrue(text.contains("moved 0\n"), text)
+            assertTrue(text.contains("waited 0\n"), text)
             assertTrue(text.contains("last\n"), text)
             assertTrue(text.contains("second 0\n"), text)
         }
