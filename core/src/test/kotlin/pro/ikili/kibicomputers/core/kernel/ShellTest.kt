@@ -546,6 +546,25 @@ class ShellTest {
     }
 
     @Test
+    fun `括弧の中の展開の誤りは、括弧だけを終えて親のスクリプトは続く`() {
+        // 括弧を外して起こしても、`${x?msg}`・`set -u`・bad substitution は括弧の中のエラー（POSIX）。親は止まらない
+        val d = '$'
+        val script = "( args ${d}{x?unset} ) & wait; echo bg\n" +
+            "( args ${d}{x?unset} ); echo fg ${d}?\n" +
+            "set -u; ( args ${d}undef ); echo nounset ${d}?\n" +
+            "( args ${d}{x@@} ); echo bad ${d}?\n" +
+            "echo ${d}( ( args ${d}{x?unset} ) ) end\n" +
+            "echo after\n"
+        val r = run(listOf("/home/t.sh"), mapOf("/home/t.sh" to script))
+        assertEquals(
+            "sh: x: unset\nbg\nsh: x: unset\nfg 1\nsh: undef: parameter not set\nnounset 1\n" +
+                "sh: x@@: bad substitution\nbad 1\nsh: x: unset\nend\nafter\n",
+            r.console,
+        )
+        assertEquals(0, r.exitCode)
+    }
+
+    @Test
     fun `会話的なシェルでは、シェルの中で動かす段があってもCtrl+Cが届く`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()

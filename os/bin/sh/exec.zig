@@ -752,7 +752,14 @@ fn startNode(node: *Node, base: Base) Error!?process.Child {
     while (innerOf(inner)) |x| inner = x;
     // 括弧の中の語は親で展開するので、親の状態を変えうる展開（`${x:=w}`・`$((x=1))`・`$(...)`）があればサブシェルで
     if (inner.kind == .simple and (inner == node or !mayChangeParent(inner))) {
-        switch (try startProgram(node, inner, base)) {
+        const started = startProgram(node, inner, base) catch |e| {
+            // 括弧の中の展開の誤り（`${x?msg}`・`set -u`・bad substitution）は、括弧を外す前と同じく、その括弧だけを終える
+            // （親のシェルは続ける）。括弧がなければ今までどおり上へ渡す
+            if (e != error.Abort or inner == node) return e;
+            if (state.status == 0) state.status = 1;
+            return null;
+        };
+        switch (started) {
             .not_program => {},
             .done => |child| return child,
         }
