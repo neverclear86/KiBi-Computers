@@ -18,7 +18,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * 標準 OS のシェル `/bin/sh`（#101）を、カーネルの上で動かして確かめる。
- * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`・`hang`）を使う
+ * 外のコマンドには、イメージの `echo`・`true`・`false` と、`os/test/shprobe.zig`（`cat`・`args`・`envget`・`exitwith`・`errout`・`hang`・`nap`）を使う
  */
 class ShellTest {
     private val limit = Duration.ofSeconds(180)
@@ -61,7 +61,7 @@ class ShellTest {
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         for (d in listOf("/bin", "/tmp", "/home", "/home/sub")) m.vfs.createDirectory(VfsPath.parse(d))
         for (name in listOf("sh", "echo", "true", "false", "kill")) m.put("/bin/$name", imageFile("/bin/$name"))
-        for (name in listOf("cat", "args", "envget", "exitwith", "errout", "hang")) m.put("/bin/$name", probe)
+        for (name in listOf("cat", "args", "envget", "exitwith", "errout", "hang", "nap")) m.put("/bin/$name", probe)
         for ((path, text) in files) m.put(path, text.toByteArray())
     }
 
@@ -536,6 +536,15 @@ class ShellTest {
                 // ためる上限（64 KiB）より大きく、空きを待つ間に Ctrl+C を受ける
                 "y=${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x; echo \"${'$'}y\" | hang" to true,
                 "echo big ${'$'}?" to false,
+                // 3 段: 前景の cat が Ctrl+C で止まったら、読まない途中の hang も止めて、空きを待つのをやめる
+                "echo \"${'$'}y\" | hang | cat" to true,
+                "echo three ${'$'}?" to false,
+                // 前景にした最後の段（外のコマンド nap）が先に自分で終わったら、動いている hang に前景を移す。
+                // 移っていれば nap の出力の後の Ctrl+C が hang に届き、移っていなければ届かず終わらない（空きを待つ間と、子を待つ間）
+                "echo \"${'$'}y\" | hang | nap" to true,
+                "echo moved ${'$'}?" to false,
+                "hang | nap" to true,
+                "echo waited ${'$'}?" to false,
                 // 最後の段がシェルの中で動く
                 "hang | echo last" to true,
                 "echo second ${'$'}?" to false,
@@ -543,6 +552,9 @@ class ShellTest {
             )
             var next = 0
             var interrupting = false
+            // nap の出力が出てから Ctrl+C を送る（nap が自分で終わって、前景が移った後に送るため）
+            var awaited: String? = null
+            var lineStart = 0
             var seen = 0
             var lastSent = 0L
             eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
@@ -555,10 +567,12 @@ class ShellTest {
                     atPrompt && next < steps.size -> {
                         seen = text.length
                         val (line, ctrlC) = steps[next++]
+                        awaited = if (line.endsWith("nap")) "napped" else null
+                        lineStart = text.length
                         m.offerConsoleInput((line + "\n").toByteArray())
                         interrupting = ctrlC
                     }
-                    interrupting && !atPrompt && now - lastSent > 200_000_000 -> {
+                    interrupting && !atPrompt && (awaited == null || text.substring(lineStart).contains(awaited!!)) && now - lastSent > 200_000_000 -> {
                         m.offerConsoleInput(byteArrayOf(3))
                         lastSent = now
                     }
@@ -568,6 +582,9 @@ class ShellTest {
             val text = host.text()
             assertTrue(text.contains("after 130\n"), text)
             assertTrue(text.contains("big 130\n"), text)
+            assertTrue(text.contains("three 130\n"), text)
+            assertTrue(text.contains("moved 0\n"), text)
+            assertTrue(text.contains("waited 0\n"), text)
             assertTrue(text.contains("last\n"), text)
             assertTrue(text.contains("second 0\n"), text)
         }

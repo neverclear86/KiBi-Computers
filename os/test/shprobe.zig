@@ -7,6 +7,7 @@
 //! - `exitwith n`: 終了コード n で終わる
 //! - `errout 文字列`: 標準エラー出力に書く
 //! - `hang`: 標準入力を読まずに、止められるまで待つ
+//! - `nap`: 標準入力を読まずに少し待ち、`napped` と書いて終わる（前景の子が自分で終わるのを確かめる）
 const kibi = @import("kibi");
 const io = kibi.io;
 const process = kibi.process;
@@ -52,6 +53,11 @@ pub fn main() u8 {
     }
     if (eql(name, "hang")) {
         while (true) kibi.time.sleep(60 * 1_000_000_000) catch return 103;
+    }
+    if (eql(name, "nap")) {
+        kibi.time.sleep(100 * 1_000_000) catch return 103;
+        io.out("napped\n");
+        return 0;
     }
     return 102;
 }
