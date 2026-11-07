@@ -278,6 +278,34 @@ class BasicCommandsTest {
     }
 
     @Test
+    fun `head -c`() {
+        val text = (1..3).joinToString("") { "line $it\n" }
+        assertOutput(
+            """
+            line 1
+            l
+            lin
+            line 1
+            0
+            ==> /tmp/t <==
+            li
+            ==> /tmp/s <==
+            no
+            no newline
+            """,
+            """
+            head -c 8 /tmp/t; echo
+            head -n 1 -c 3 /tmp/t; echo
+            head -c 3 -n 1 /tmp/t
+            head -c 0 /tmp/t | wc -c
+            head -c 2 /tmp/t /tmp/s; echo
+            head -c 100 /tmp/s; echo
+            """,
+            mapOf("/tmp/t" to text, "/tmp/s" to "no newline"),
+        )
+    }
+
+    @Test
     fun `grep`() {
         assertOutput(
             """
@@ -777,7 +805,6 @@ class BasicCommandsTest {
             """,
         )
     }
-
 
     @Test
     fun `devのnull・zero・tty`() {
