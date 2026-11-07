@@ -459,6 +459,13 @@ fn trace(parts: []const []const u8) void {
     traceTo(io.STDERR, parts);
 }
 
+/// [parts] の `set -x` の跡の長さ（`+`、各語の前の空白、改行）
+fn traceLen(parts: []const []const u8) usize {
+    var n: usize = 2;
+    for (parts) |p| n += 1 + p.len;
+    return n;
+}
+
 /// `set -x` の跡を [fd] に書く
 fn traceTo(fd: io.Fd, parts: []const []const u8) void {
     io.writeAll(fd, "+") catch {};
@@ -809,6 +816,10 @@ fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
         expand.fields(s.words, &argv) catch |e| return failedInside(e, nested);
     }
     if (argv.items.len == 0) return .not_program;
+    // 括弧の中の跡は親が出先に同期で書く。出先は読む側をまだ起こしていないパイプの段の書く端のこともある
+    // （`( cmd ) 2>&1 | cat`。段は前から順に起こす）。作ったばかりの空のパイプなので容量までは止まらずに書けるが、
+    // それを超える跡はサブシェルで起こして子に書かせる（親は止まらずに読む側を起こせる。#497）
+    if (nested and state.xtrace and traceLen(argv.items) > PIPE_CAPACITY) return .not_program;
     var n = if (nested) innerOf(outer).? else inner;
     while (true) {
         if (n == inner and state.xtrace) {
@@ -818,7 +829,14 @@ fn startProgram(outer: *Node, inner: *Node, map: *FdMap) Error!Started {
                 if (map.parentFd(2)) |fd| traceTo(fd, argv.items);
             } else trace(argv.items);
         }
-        const ok = map.addRedirs(n.redirs) catch |e| return failedInside(e, nested);
+        // 途中の括弧のリダイレクトの誤りの知らせは、その外までのリダイレクトを効かせた標準エラー出力へ
+        // （サブシェルで起こしていたときと同じ。コマンド自身のリダイレクトの誤りも、括弧のリダイレクトまでを効かせた出先へ）
+        const ok = blk: {
+            const saved_err = util.err_fd;
+            if (nested) util.err_fd = map.parentFd(2);
+            defer util.err_fd = saved_err;
+            break :blk map.addRedirs(n.redirs) catch |e| return failedInside(e, nested);
+        };
         if (!ok) {
             state.status = 1;
             return .{ .done = null };
