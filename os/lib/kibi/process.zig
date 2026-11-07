@@ -9,19 +9,20 @@ pub const Error = errno.Error;
 
 /// 引数と環境変数を読み込む領域の大きさ（バイト。カーネルの上限 64 KiB に合わせる。ADR 0045）。入りきらなければ `TOOBIG`
 pub const ARGS_BUF_SIZE = 64 * 1024;
-/// 引数と環境変数の数の上限（カーネルの `KibiProcess.MAX_ARGS`・`MAX_ENV` に合わせる。#501）。
-/// 数に比例する表（下の `*_ptrs`・`*_slices`）は静的に置くので、使った分しか RAM に数えない
+/// 引数と環境変数の数の上限（カーネルの `KibiProcess.MAX_ARGS`・`MAX_ENV` に合わせる。#501）
 pub const MAX_ARGS = 4096;
 
-var args_buf: [ARGS_BUF_SIZE]u8 = undefined;
-var args_ptrs: [MAX_ARGS][*:0]u8 = undefined;
-var args_slices: [MAX_ARGS][]const u8 = undefined;
-var args_len: ?usize = null;
+/// 引数（または環境変数）を読み込む領域の大きさ。表（切り口とポインター）と文字列を 1 つの領域に詰めて置く
+const AREA_SIZE = MAX_ARGS * (@sizeOf([]const u8) + @sizeOf([*:0]u8)) + ARGS_BUF_SIZE;
 
-var env_buf: [ARGS_BUF_SIZE]u8 = undefined;
-var env_ptrs: [MAX_ARGS][*:0]u8 = undefined;
-var env_slices: [MAX_ARGS][]const u8 = undefined;
-var env_len: ?usize = null;
+/// 引数を読み込む領域。先頭から、切り口の表・ポインターの表・文字列を、使う数の分だけ続けて置く。
+/// 静的な領域は触るまで RAM に数えないので、数の上限ごとに別の表を置くより、触る区画（4 KiB）が少ない（#510）
+var args_area: [AREA_SIZE]u8 align(@alignOf([]const u8)) = undefined;
+var args_list: ?[]const []const u8 = null;
+
+/// 環境変数を読み込む領域（[args_area] と同じ並び）
+var env_area: [AREA_SIZE]u8 align(@alignOf([]const u8)) = undefined;
+var env_list: ?[]const []const u8 = null;
 
 fn span(s: [*:0]const u8) []const u8 {
     var n: usize = 0;
@@ -29,30 +30,38 @@ fn span(s: [*:0]const u8) []const u8 {
     return s[0..n];
 }
 
+/// [count] 個・合計 [size] バイトの並びを、[get] で [area] に読み込む
+fn readList(area: *align(@alignOf([]const u8)) [AREA_SIZE]u8, count: usize, size: usize, comptime get: anytype) Error![]const []const u8 {
+    if (count > MAX_ARGS or size > ARGS_BUF_SIZE) return error.TOOBIG;
+    const slices: [*][]const u8 = @ptrCast(area);
+    const ptrs_at = count * @sizeOf([]const u8);
+    const ptrs: [*][*:0]u8 = @ptrCast(@alignCast(&area[ptrs_at]));
+    const buf: [*]u8 = area[ptrs_at + count * @sizeOf([*:0]u8) ..].ptr;
+    try errno.check(get(ptrs, buf));
+    for (0..count) |i| slices[i] = span(ptrs[i]);
+    return slices[0..count];
+}
+
 /// 引数（argv。`args()[0]` はプログラムの名前）
 pub fn args() Error![]const []const u8 {
-    if (args_len) |n| return args_slices[0..n];
+    if (args_list) |l| return l;
     var argc: wasi.Size = 0;
     var size: wasi.Size = 0;
     try errno.check(wasi.args_sizes_get(&argc, &size));
-    if (argc > MAX_ARGS or size > ARGS_BUF_SIZE) return error.TOOBIG;
-    try errno.check(wasi.args_get(&args_ptrs, &args_buf));
-    for (0..argc) |i| args_slices[i] = span(args_ptrs[i]);
-    args_len = argc;
-    return args_slices[0..argc];
+    const l = try readList(&args_area, argc, size, wasi.args_get);
+    args_list = l;
+    return l;
 }
 
 /// 環境変数（`名前=値` の並び）
 pub fn environ() Error![]const []const u8 {
-    if (env_len) |n| return env_slices[0..n];
+    if (env_list) |l| return l;
     var count: wasi.Size = 0;
     var size: wasi.Size = 0;
     try errno.check(wasi.environ_sizes_get(&count, &size));
-    if (count > MAX_ARGS or size > ARGS_BUF_SIZE) return error.TOOBIG;
-    try errno.check(wasi.environ_get(&env_ptrs, &env_buf));
-    for (0..count) |i| env_slices[i] = span(env_ptrs[i]);
-    env_len = count;
-    return env_slices[0..count];
+    const l = try readList(&env_area, count, size, wasi.environ_get);
+    env_list = l;
+    return l;
 }
 
 /// 環境変数 [name] の値。なければ（読めなければ）null
@@ -176,8 +185,10 @@ const ROOT_FD: u32 = 3;
 /// [spawn] で渡せる引数の数の上限（`argv[0]` を含む。カーネルの `KibiProcess.MAX_ARGS` に合わせる。#501）
 pub const MAX_SPAWN_ARGS = MAX_ARGS;
 
-/// 引数を [String] に写す領域（スタックに置くと 32 KiB になるので静的に置く。使った分しか RAM に数えない）
+/// 引数を [String] に写す領域（スタックに置くと 32 KiB になるので静的に置く。使った分しか RAM に数えない）。
+/// 引数が [SPAWN_STACK_ARGS] 個までなら、スタックに写す（いつも触っているスタックで済み、この領域を触らない。#510）
 var spawn_strs: [MAX_SPAWN_ARGS]String = undefined;
+const SPAWN_STACK_ARGS = 32;
 
 /// 子のプロセス（ハンドルはカーネルの fd 番号）
 pub const Child = struct {
@@ -228,7 +239,8 @@ pub const Child = struct {
 /// [path] の実行ファイルを、引数 [argv]（`argv[0]` を含む）で子として起こす。読み込みが終わるまで待つ
 pub fn spawn(path: []const u8, argv: []const []const u8, options: SpawnOptions) Error!Child {
     if (argv.len > MAX_SPAWN_ARGS) return error.TOOBIG;
-    const strs = spawn_strs[0..argv.len];
+    var small: [SPAWN_STACK_ARGS]String = undefined;
+    const strs = if (argv.len <= small.len) small[0..argv.len] else spawn_strs[0..argv.len];
     for (argv, 0..) |a, i| strs[i] = .{ .ptr = a.ptr, .len = @intCast(a.len) };
     if (options.fds.len + 1 > MAX_SPAWN_FDS) return error.TOOBIG;
     var fds: [MAX_SPAWN_FDS]FdAssign = undefined;

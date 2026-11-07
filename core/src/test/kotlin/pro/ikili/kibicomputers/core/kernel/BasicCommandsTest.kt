@@ -220,6 +220,25 @@ class BasicCommandsTest {
     }
 
     @Test
+    fun `lsはパスに並べたファイルが多すぎると、書ける分を書いてから知らせ、1で終わる`() {
+        // #510: `ls` の項目の上限（`MAX_ENTRIES`、2,048）を超えた分を、黙って落として 0 で終わっていた
+        assertOutput(
+            """
+            ls: too many files (listing the first ones)
+            status 1
+            2048
+            /tmp/s/10000
+            /tmp/s/12047
+            """,
+            """
+            mkdir /tmp/s; cd /tmp/s; touch ${'$'}(seq 10000 12099)
+            ls /tmp/s/* >/tmp/o; echo status ${'$'}?
+            wc -l </tmp/o; head -n 1 /tmp/o; tail -n 1 /tmp/o
+            """,
+        )
+    }
+
+    @Test
     fun `headとtailとwc`() {
         val text = (1..15).joinToString("") { "line $it\n" }
         assertOutput(
