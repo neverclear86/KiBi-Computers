@@ -201,7 +201,7 @@ class BootTest {
             assertEquals(1, m.kernel.objects.refCount(root.id))
         }
         assertEquals(setOf(0, 1, 2, 3), init.handles.entries().keys)
-        assertEquals(listOf("/" to "disk:b", "/tmp" to "tmp"), mounts())
+        assertEquals(listOf("/" to "disk:b", "/tmp" to "tmp", "/dev" to "dev"), mounts())
         assertEquals("kibi: booting from disk b\n", host.console.toString())
         assertFalse(m.boot(bootDisks("b")), "動いている間は起動しない")
 
@@ -327,7 +327,7 @@ class BootTest {
         m.lock.withLockValue {
             for (id in oldObjects) assertNull(m.kernel.objects[id], "前の起動のゾンビの ProcessObject は残らない（#46）")
         }
-        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp"), mounts(), "前の起動のマウントは残らない")
+        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp", "/dev" to "dev"), mounts(), "前の起動のマウントは残らない")
         assertFalse(host.console.contains("init exited"), host.console.toString())
         assertEquals(2, Regex("booting from disk d").findAll(host.console).count())
     }
@@ -473,8 +473,28 @@ class BootTest {
         disk.createFile(VfsPath.parse("/tmp"))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:d"), mounts())
+        assertEquals(listOf("/" to "disk:d", "/dev" to "dev"), mounts())
         assertEquals("kibi: /tmp not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
+    }
+
+    @Test
+    fun `根のdevがファイルならマウントせずに起動を続ける`() = env {
+        val disk = disks.withInit("d", exe(foreverInit()))
+        disk.createFile(VfsPath.parse("/dev"))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp"), mounts())
+        assertEquals("kibi: /dev not mounted (NOTDIR)\nkibi: booting from disk d\n", host.console.toString())
+    }
+
+    @Test
+    fun `devにnull・zero・ttyが見える`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        for (name in listOf("null", "zero", "tty")) {
+            assertEquals(FileType.CHARACTER_DEVICE, m.vfs.stat(VfsPath.parse("/dev/$name")).type, name)
+        }
     }
 
     @Test
@@ -484,7 +504,7 @@ class BootTest {
         disks.readOnly += "img"
         assertTrue(m.boot(withHome("hdd", "hdd", "img")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/home" to "disk:hdd"), mounts())
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/dev" to "dev", "/home" to "disk:hdd"), mounts())
         assertEquals("kibi: booting from disk img\n", host.console.toString())
         run {
             val f = m.vfs.open(VfsPath.parse("/home/a"), OpenOptions(read = true, write = true, create = true))
@@ -495,7 +515,7 @@ class BootTest {
 
         assertTrue(m.reboot())
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
-        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/home" to "disk:hdd"), mounts())
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/dev" to "dev", "/home" to "disk:hdd"), mounts())
         assertEquals(FileType.REGULAR_FILE, m.vfs.stat(VfsPath.parse("/home/a")).type, "再起動の後も残る")
     }
 
@@ -505,7 +525,7 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(withHome("hdd", "d")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp"), mounts())
+        assertEquals(listOf("/" to "disk:d", "/tmp" to "tmp", "/dev" to "dev"), mounts())
     }
 
     @Test
@@ -514,7 +534,7 @@ class BootTest {
         disks.readOnly += "img"
         assertTrue(m.boot(withHome("img", "img")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts())
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/dev" to "dev"), mounts())
     }
 
     @Test
@@ -528,7 +548,7 @@ class BootTest {
             host.console.setLength(0)
             assertTrue(m.boot(withHome(home, "img")))
             tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-            assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts(), home)
+            assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/dev" to "dev"), mounts(), home)
             assertEquals("kibi: /home not mounted ($reason)\nkibi: booting from disk img\n", host.console.toString())
             m.stop()
             tickUntil { m.state == MachineState.STOPPED && !m.isBooting }
@@ -538,7 +558,7 @@ class BootTest {
         host.console.setLength(0)
         assertTrue(m.boot(withHome("hdd", "img")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp"), mounts())
+        assertEquals(listOf("/" to "disk:img", "/tmp" to "tmp", "/dev" to "dev"), mounts())
         assertEquals("kibi: /home not mounted (NOTDIR)\nkibi: booting from disk img\n", host.console.toString())
     }
 
@@ -551,7 +571,7 @@ class BootTest {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener.forDisks({ id -> dir.resolve(id).takeIf { id == "d1" || id == "empty" }?.let { ResolvedDisk(it, 1L shl 20, 1024) } }, m.hostFiles)
         assertTrue(m.boot(bootDisks("missing", "empty", "d1")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertEquals(listOf("/" to "disk:d1", "/tmp" to "tmp"), mounts())
+        assertEquals(listOf("/" to "disk:d1", "/tmp" to "tmp", "/dev" to "dev"), mounts())
         assertEquals(leases + 1, HostDiskLeases.size, "選ばなかった候補（empty）のリースは返す")
         // テストのスレッド（カーネルロックの外）から読み書きすると、すぐホストに見える
         val f = m.vfs.open(VfsPath.parse("/hello.txt"), OpenOptions(read = true, write = true, create = true))
