@@ -1,7 +1,7 @@
 //! `/sbin/init`（#100）を確かめるための子（core のテスト `InitTest` が `/etc/inittab` に書いて動かす）。
 //!
 //! `initprobe <名前> [終了コード] [raw] [forever]`: 自分の様子を 1 行で標準出力に書く（引数がなければ名前は argv[0] の最後の部分）。
-//! `<名前> fg=<self|other> stdin=<tty|none> mode=<cooked|other> FOO=<値> HOME=<値> args=<引数の数>`
+//! `<名前> fg=<self|other> stdin=<tty|none> mode=<cooked|other> FOO=<値> HOME=<値> args=<引数の数> cwd=<cwd>`
 //! - `raw`: 終わる前にコンソールを raw にする（init が次の子の前に cooked に戻すかを見る）
 //! - `forever`: 書いた後、終わらずに眠り続ける
 const kibi = @import("kibi");
@@ -51,6 +51,8 @@ pub fn main() u8 {
     var b: [20]u8 = undefined;
     io.out(" args=");
     io.out(io.formatUnsigned(&b, argv.len));
+    io.out(" cwd=");
+    io.out(kibi.fs.cwd());
     io.out("\n");
 
     if (raw) tty.setMode(io.STDOUT, tty.Mode.raw) catch {};

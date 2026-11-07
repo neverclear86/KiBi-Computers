@@ -129,16 +129,34 @@ class InitTest {
         val lines = boot(mapOf("/bin/sh" to probe)) { l -> l.count { it.startsWith("sh ") } >= 2 }
         val shells = lines.filter { it.startsWith("sh ") }
         // 前景とモードと既定の環境変数。sh はすぐ終わるので、1 秒おいて起こし直される
-        assertEquals("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1", shells[0], lines.toString())
+        assertEquals("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1 cwd=/", shells[0], lines.toString())
         assertEquals(shells[0], shells[1])
         assertEquals("kibi: booting from disk d", lines.first())
     }
 
     @Test
     fun `イメージのinittabで、bin_shを起こす`() {
-        val lines = boot(mapOf("/bin/sh" to probe, "/etc/inittab" to imageFile("/etc/inittab"))) { l -> l.any { it.startsWith("sh ") } }
-        // HOME は HDD をマウントする /home（#461）
-        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/home args=1" in lines, lines.toString())
+        val lines = boot(mapOf("/bin/sh" to probe, "/etc/inittab" to imageFile("/etc/inittab")), dirs = listOf("/home")) { l ->
+            l.any { it.startsWith("sh ") }
+        }
+        // HOME は HDD をマウントする /home（#461）。シェルはそこで始まる（#486）
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/home args=1 cwd=/home" in lines, lines.toString())
+    }
+
+    @Test
+    fun `シェルはHOMEのディレクトリで始まり、HOMEがディレクトリでなければルートで始まる。ほかの子はルートで始まる`() {
+        val home = boot(
+            mapOf("/bin/initprobe" to probe, inittab("env HOME=/home/me\nrun /bin/initprobe setup\nshell /bin/initprobe shell")),
+            dirs = listOf("/home", "/home/me"),
+        ) { l -> l.any { it.startsWith("shell ") } }
+        assertTrue("setup fg=self stdin=tty mode=cooked FOO=(none) HOME=/home/me args=2 cwd=/" in home, home.toString())
+        assertTrue("shell fg=self stdin=tty mode=cooked FOO=(none) HOME=/home/me args=2 cwd=/home/me" in home, home.toString())
+        for (h in listOf("/missing", "/etc/inittab", "relative")) {
+            val lines = boot(mapOf("/bin/initprobe" to probe, inittab("env HOME=$h\nshell /bin/initprobe shell"))) { l ->
+                l.any { it.startsWith("shell ") }
+            }
+            assertTrue("shell fg=self stdin=tty mode=cooked FOO=(none) HOME=$h args=2 cwd=/" in lines, lines.toString())
+        }
     }
 
     @Test
@@ -168,19 +186,19 @@ class InitTest {
         assertTrue("init: /etc/inittab:8: env takes one NAME=VALUE" in lines, text)
         assertTrue("init: /etc/inittab:12: only one shell is allowed" in lines, text)
         // run は書いた順に、前景で、終わるまで待つ
-        val setup = lines.indexOf("setup fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=2")
-        val fail = lines.indexOf("setupfail fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=3")
+        val setup = lines.indexOf("setup fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=2 cwd=/")
+        val fail = lines.indexOf("setupfail fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=3 cwd=/")
         val failExit = lines.indexOf("init: /bin/initprobe exited with code 3")
         val missing = lines.indexOf("init: cannot start /bin/missing: NOENT")
         assertTrue(setup in 0 until fail && fail < failExit && failExit < missing, text)
         // 後ろの子は run が全部終わってから。標準入力を持たず、前景でない
-        val daemon = lines.indexOfFirst { it.startsWith("daemon fg=other stdin=none ") && it.endsWith(" FOO=bar HOME=/ args=3") }
+        val daemon = lines.indexOfFirst { it.startsWith("daemon fg=other stdin=none ") && it.endsWith(" FOO=bar HOME=/ args=3 cwd=/") }
         assertTrue(daemon > missing, text)
         assertTrue(lines.filter { it.startsWith("again ") }.all { it.startsWith("again fg=other stdin=none ") }, text)
         assertEquals(1, lines.count { it.startsWith("daemon ") }, "daemon は起こし直さない: $text")
         // shell は前景。1 回目が raw にして終わっても、2 回目は cooked で始まる
         val shells = lines.filter { it.startsWith("shell ") }
-        assertTrue(shells.all { it == "shell fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=3" }, text)
+        assertTrue(shells.all { it == "shell fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=3 cwd=/" }, text)
         assertTrue(lines.none { it.startsWith("second ") }, text)
     }
 
@@ -192,7 +210,7 @@ class InitTest {
         assertEquals(
             listOf(
                 "kibi: booting from disk d",
-                "only fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=2",
+                "only fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=2 cwd=/",
                 "init: nothing left to run",
                 "kibi: init exited with code 0",
             ),
@@ -221,7 +239,7 @@ class InitTest {
             l.any { it.startsWith("sh ") }
         }
         assertTrue("init: /etc/inittab: FBIG; using the default" in lines, lines.toString())
-        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1" in lines, lines.toString())
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1 cwd=/" in lines, lines.toString())
         assertTrue(lines.none { it.startsWith("big ") }, lines.toString())
     }
 
@@ -231,7 +249,7 @@ class InitTest {
         val lines = boot(mapOf("/bin/sh" to probe), dirs = listOf("/etc/inittab")) { l -> l.any { it.startsWith("sh ") } }
         val warning = lines.single { it.startsWith("init: /etc/inittab: ") }
         assertTrue(warning.endsWith("; using the default") && "NOENT" !in warning, lines.toString())
-        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1" in lines, lines.toString())
+        assertTrue("sh fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=1 cwd=/" in lines, lines.toString())
     }
 
     @Test
@@ -269,7 +287,7 @@ class InitTest {
             warnings,
             lines.toString(),
         )
-        assertTrue("ok fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=2" in lines, lines.toString())
+        assertTrue("ok fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=2 cwd=/" in lines, lines.toString())
     }
 
     @Test

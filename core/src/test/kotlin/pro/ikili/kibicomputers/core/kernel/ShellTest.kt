@@ -366,6 +366,53 @@ class ShellTest {
     }
 
     @Test
+    fun `jobsは後ろのジョブの番号・状態・コマンドを書く`() {
+        val d = "${'$'}"
+        val long = "echo " + "x".repeat(100)
+        assertOutput(
+            """
+            [1] Exit 3  exitwith 3
+            [2] Done  true
+            [3] Running  hang &
+            [4] Done  ${"echo " + "x".repeat(72)}...
+            again
+            [1] Exit 3  exitwith 3
+            pids ok
+            long ok
+            sh: jobs: %1: job specs are not supported
+            2
+            """,
+            """
+            exitwith 3 &
+            true &
+            hang & h=$d!
+            $long >/tmp/out &
+            while :; do
+                jobs >/tmp/j; n=0
+                while read l; do case ${d}l in *Running*) n=${d}((n+1));; esac; done </tmp/j
+                [ ${d}n = 1 ] && break
+            done
+            cat /tmp/j
+            echo again
+            jobs >/tmp/j
+            read first </tmp/j; echo "${d}first"
+            jobs -p >/tmp/p; { read a; read b; read c; } </tmp/p; [ ${d}c = ${d}h ] && echo pids ok
+            jobs -l >/tmp/l; while read l; do case ${d}l in "[3] ${d}h Running  hang &") echo long ok;; esac; done </tmp/l
+            jobs %1; echo ${d}?
+            kill ${d}h; wait ${d}h
+            """,
+        )
+    }
+
+    @Test
+    fun `会話的なシェルのjobsは、終わったと書いたジョブを片付ける`() {
+        val r = run(emptyList(), input = listOf("hang &", "jobs", "kill ${'$'}!; wait", "jobs; echo end", "exit"))
+        val text = r.console.replace(Regex(" *\r\u001b\\[K\r\u001b\\[J"), "")
+        assertTrue(text.contains("[1] Running  hang &\n"), text)
+        assertTrue(text.contains("jobs; echo end\nend\n"), text)
+    }
+
+    @Test
     fun `会話的なシェルでは、Ctrl+Cは前景の子だけを止める`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()

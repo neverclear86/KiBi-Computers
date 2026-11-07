@@ -18,7 +18,7 @@ pub const Kind = enum { none, special, regular };
 
 /// POSIX の特別な組み込み（代入が残る。関数より先に見る）
 const specials = [_][]const u8{ ":", ".", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift", "unset", "break", "continue", "local" };
-const regulars = [_][]const u8{ "true", "false", "echo", "printf", "cd", "pwd", "read", "test", "[", "wait", "command", "type", "source", "history" };
+const regulars = [_][]const u8{ "true", "false", "echo", "printf", "cd", "pwd", "read", "test", "[", "wait", "jobs", "command", "type", "source", "history" };
 /// 組み込みの名前すべて（補完に使う）
 pub const all_names = specials ++ regulars;
 /// 標準入力を読まず、シェルの状態を変えないもの（パイプラインの段・コマンド置換をシェルの中で動かせる）
@@ -60,6 +60,7 @@ pub fn run(argv: []const []const u8) Error!u8 {
     if (eql(name, "test")) return testBuiltin(args, false);
     if (eql(name, "[")) return testBuiltin(args, true);
     if (eql(name, "wait")) return wait(args);
+    if (eql(name, "jobs")) return jobsBuiltin(args);
     if (eql(name, "local")) return local(args);
     if (eql(name, "command")) return commandV(args);
     if (eql(name, "type")) return typeBuiltin(args);
@@ -623,6 +624,27 @@ fn wait(args: []const []const u8) Error!u8 {
         try pids.append(@intCast(v & 0xffff_ffff));
     }
     return exec.waitJobs(pids.items);
+}
+
+/// `jobs [-l] [-p]`（#486）。`-l` は pid も、`-p` は pid だけ書く。ジョブ制御（`fg`・`bg`・`%n`）はない
+fn jobsBuiltin(args: []const []const u8) Error!u8 {
+    var with_pid = false;
+    var pid_only = false;
+    for (args) |a| {
+        if (a.len < 2 or a[0] != '-') {
+            util.complain(&.{ "jobs: ", a, ": job specs are not supported" });
+            return 2;
+        }
+        for (a[1..]) |c| switch (c) {
+            'l' => with_pid = true,
+            'p' => pid_only = true,
+            else => {
+                util.complain(&.{ "jobs: ", a, ": unknown option" });
+                return 2;
+            },
+        };
+    }
+    return exec.listJobs(with_pid, pid_only);
 }
 
 fn commandV(args: []const []const u8) Error!u8 {
