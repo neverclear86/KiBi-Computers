@@ -12,12 +12,14 @@ import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.FuelYieldRejectionLog
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -142,7 +144,62 @@ class AsyncFuelTest {
     }
 
     @Test
-    fun `葉の関数の中の燃料切れは、今と同じくスレッドを持ったまま待つ`() = timeout(limit) {
+    fun `葉の関数の中の燃料切れは前借りで先へ進み、止まりうる関数に戻ったところで巻き戻す`() = timeout(limit) {
+        // 葉の1回の呼び出しは前借りの上限より小さい（500 回 × 十数命令）
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 7_000)
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val overdrafts0 = h.scheduler.fuelOverdrafts.get()
+            val s = Spin(h, m, listOf("leaf", "300", "500"))
+            assertEquals(expected(300, 500), s.finish())
+            val overdrafts = h.scheduler.fuelOverdrafts.get() - overdrafts0
+            assertTrue(overdrafts > 0, "前借りしていない")
+            assertTrue(h.scheduler.fuelUnwinds.get() - unwinds0 >= overdrafts, "前借りの後に巻き戻していない")
+            assertEquals(blocking0, h.scheduler.fuelBlockingWaits.get(), "スレッドを持ったまま燃料を待った")
+            // 前借りした分は借りになり、後の補充で返す（使った燃料が配った燃料を大きく超えない）
+            m.lock.withLockValue { assertTrue(m.kernel.fuel > -FUEL_OVERDRAFT_LIMIT * 2, "借りが大きすぎる: ${m.kernel.fuel}") }
+        }
+    }
+
+    @Test
+    fun `標準OSのシェルの計算と出力の燃料切れは、スレッドを持たずに待つ`() = timeout(limit) {
+        val image = requireNotNull(ImageFileSystem.bundled("os")) { "os.zip がリソースにない" }
+        val stat = image.stat(VfsPath.parse("/bin/sh"))
+        val sh = ByteArray(stat.size.toInt()).also { image.read(stat.node, 0, it, 0, it.size) }
+        val scripts = listOf(
+            "i=0; while [ \$i -lt 2000 ]; do :; i=\$((i+1)); done",
+            "i=0; while [ \$i -lt 200 ]; do i=\$((i+1)); echo \$i; done",
+        )
+        for (script in scripts) {
+            Harness(execRuntime = EndiveRuntime()).use { h ->
+                val m = h.machine(fuelPerTick = 50_000, memoryBytes = 16L * 1024 * 1024)
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                m.vfs.createDirectory(VfsPath.parse("/bin"))
+                val f = m.vfs.open(VfsPath.parse("/bin/sh"), OpenOptions(read = true, write = true, create = true, truncate = true))
+                m.vfs.write(f, sh, 0, sh.size)
+                val output = m.lock.withLockValue { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
+                val stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+                val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh", "-c", script), stdio = stdio))
+                assertTrue(m.rt(pid).program.fuelYield, "${m.rt(pid).program.fuelYieldRejection}")
+                val unwinds0 = h.scheduler.fuelUnwinds.get()
+                val blocking0 = h.scheduler.fuelBlockingWaits.get()
+                eventually(60_000, "終わらない: $script") {
+                    h.scheduler.tick()
+                    m.stateOf(pid).isTerminal
+                }
+                assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+                val unwinds = h.scheduler.fuelUnwinds.get() - unwinds0
+                val blocking = h.scheduler.fuelBlockingWaits.get() - blocking0
+                println("シェルの燃料切れ（$script）: 巻き戻し $unwinds 回、スレッドを持って待った $blocking 回")
+                assertTrue(unwinds > 0, script)
+                assertEquals(0, blocking, script)
+            }
+        }
+    }
+
+    @Test
+    fun `葉の関数の中で前借りの上限を超えて計算し続けたら、スレッドを持ったまま待つ`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 20_000)
             val before = h.scheduler.fuelBlockingWaits.get()
