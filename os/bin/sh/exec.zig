@@ -1553,33 +1553,42 @@ pub fn listJobs(with_pid: bool, pid_only: bool) Error!u8 {
     reapJobs(false);
     for (&jobs, 0..) |*slot, k| {
         const j = if (slot.*) |*x| x else continue;
-        var b1: [12]u8 = undefined;
-        var b2: [12]u8 = undefined;
-        var b3: [12]u8 = undefined;
-        const pid = io.formatUnsigned(&b2, j.pid);
         if (pid_only) {
-            if (!(try out(pid)) or !(try out("\n"))) return 1;
-        } else {
-            const failed = j.status != null and j.status.? != 0;
-            const st: []const u8 = if (j.status == null) "Running" else if (failed) "Exit" else "Done";
-            const parts = [_][]const u8{
-                "[",
-                io.formatUnsigned(&b1, k + 1),
-                "] ",
-                if (with_pid) pid else "",
-                if (with_pid) " " else "",
-                st,
-                if (failed) " " else "",
-                if (failed) io.formatUnsigned(&b3, j.status.?) else "",
-                "  ",
-                j.command(),
-                if (j.status == null) " &\n" else "\n",
-            };
-            for (parts) |p| if (!(try out(p))) return 1;
-        }
+            var b: [12]u8 = undefined;
+            if (!(try out(io.formatUnsigned(&b, j.pid))) or !(try out("\n"))) return 1;
+        } else if (!(try writeJob(k, j, with_pid, false))) return 1;
         if (j.status != null and state.interactive) slot.* = null;
     }
     return 0;
+}
+
+/// ジョブの1行（`[n] Done  cmd`・`[n] Exit 3  cmd`・`[n] Running  cmd &`）を書く。
+/// [to_err] なら標準エラーに（終わったことの知らせ。#492）、でなければ標準出力に（`jobs`）。書けなければ false
+fn writeJob(k: usize, j: *const Job, with_pid: bool, comptime to_err: bool) Error!bool {
+    var b1: [12]u8 = undefined;
+    var b2: [12]u8 = undefined;
+    var b3: [12]u8 = undefined;
+    const failed = j.status != null and j.status.? != 0;
+    const st: []const u8 = if (j.status == null) "Running" else if (failed) "Exit" else "Done";
+    const parts = [_][]const u8{
+        "[",
+        io.formatUnsigned(&b1, k + 1),
+        "] ",
+        if (with_pid) io.formatUnsigned(&b2, j.pid) else "",
+        if (with_pid) " " else "",
+        st,
+        if (failed) " " else "",
+        if (failed) io.formatUnsigned(&b3, j.status.?) else "",
+        "  ",
+        j.command(),
+        if (j.status == null) " &\n" else "\n",
+    };
+    for (parts) |p| {
+        if (to_err) {
+            io.err(p);
+        } else if (!(try out(p))) return false;
+    }
+    return true;
 }
 
 /// 後ろで動かすものに [from] から後に積んだもの（ヒアドキュメント）を、待たずに渡す。
@@ -1623,10 +1632,8 @@ pub fn reapJobs(report: bool) void {
         j.status = statusOf(st);
         j.child.release();
         if (report) {
-            var b: [12]u8 = undefined;
-            io.err("[");
-            io.err(io.formatUnsigned(&b, k + 1));
-            io.err("] Done\n");
+            // `jobs` と同じ形で、コマンドも書く（#492）
+            _ = writeJob(k, j, false, true) catch {};
             // 知らせたものは片付ける（wait は終了コードを受け取れない。会話的なシェルだけ）
             slot.* = null;
         }

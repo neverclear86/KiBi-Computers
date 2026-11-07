@@ -630,8 +630,14 @@ fn wait(args: []const []const u8) Error!u8 {
 fn jobsBuiltin(args: []const []const u8) Error!u8 {
     var with_pid = false;
     var pid_only = false;
+    var rest_are_specs = false;
     for (args) |a| {
-        if (a.len < 2 or a[0] != '-') {
+        // `--` はオプションの終わり（#492）。後ろはジョブの指定として扱う
+        if (!rest_are_specs and eql(a, "--")) {
+            rest_are_specs = true;
+            continue;
+        }
+        if (rest_are_specs or a.len < 2 or a[0] != '-') {
             util.complain(&.{ "jobs: ", a, ": job specs are not supported" });
             return 2;
         }
