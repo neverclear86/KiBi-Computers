@@ -38,7 +38,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - 電源ボタン（[pressPowerButton]）で、サーバーのマシン管理（[ServerMachines]）にマシンを作る・止める
  * - 動いている間に起動に要る部品・電源を入れたときにあったディスクを抜くと止まる（判断は `core` の [ComputerCase]）
  * - 電源を入れるとき、識別子のないディスクに識別子を付け（#124）、挿さっているディスクの写しをマシンの環境に渡す
- * - チャンクのアンロード・ブロックの破壊でマシンを外す
+ * - チャンクのアンロード・チャンクが FULL でなくなったとき（[chunkDemoted]。#545）・ブロックの破壊でマシンを外す
  * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 標準 OS の同梱イメージの順に起動する
  *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
  *   動いている間に画面を置き直したら、次の tick につなぎ直す（[neighborChanged]。#531・#535）
@@ -265,6 +265,16 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         super.onChunkUnloaded()
         leaveIndex()
         ServerMachines.untrack(this)
+        computer.chunkUnloaded()
+        wiring.disconnect()
+    }
+
+    /**
+     * チャンクが FULL でなくなった（ティックしなくなったが、メモリには残る。#545）。[ServerMachines] が取り出して書いた後に呼ぶ。
+     * マシンを外して電源を切る（アンロードと同じ）。ブロックエンティティは残るので、ID の索引と、読み込まれたケースの一覧には残す。
+     * チャンクが FULL に戻ったら、アンロードの後に読み込み直したのと同じく、電源が切れたまま
+     */
+    internal fun chunkDemoted() {
         computer.chunkUnloaded()
         wiring.disconnect()
     }

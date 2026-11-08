@@ -6,6 +6,8 @@ import net.minecraft.gametest.framework.GameTestServer
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.Tag
 import net.minecraft.resources.ResourceKey
+import net.minecraft.server.level.ChunkHolder
+import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.entity.BlockEntityType
@@ -13,6 +15,7 @@ import net.minecraft.world.level.chunk.LevelChunk
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.level.ChunkDataEvent
 import net.neoforged.neoforge.event.level.ChunkEvent
+import net.neoforged.neoforge.event.level.ChunkTicketLevelUpdatedEvent
 import net.neoforged.neoforge.event.server.ServerAboutToStartEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.server.ServerStoppingEvent
@@ -52,6 +55,11 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  * - 毎 tick の始め（[ServerTickEvent.Pre]）に [MachineManager.tick] を呼び、自動保存（[AutosaveRotation]）を1 tick 分すすめる
  * - チャンクのアンロード（[ChunkEvent.Unload]）: そのチャンクのケースを止め、待ち（tick ごとの予算）、取り出して書き、
  *   チャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が新しい世代を NBT に書く）
+ * - チャンクが FULL でなくなった（[ChunkTicketLevelUpdatedEvent] でチケットの段階が 33 を超えた。#545）: アンロードと同じく
+ *   止め、待ち、取り出して書き、`setUnsaved(true)` を付けてから、マシンを外す（[CaseBlockEntity.chunkDemoted]）。
+ *   スポーンのチャンク・強制読み込み・チャンクローダーのまわりのチャンクは、FULL でなくなってもアンロードされずメモリに残るため。
+ *   イベントの中では印を付けるだけで、tick の終わり（[ServerTickEvent.Post]）に、tick の時間が残っている間だけ流す（1 tick に最低1チャンク）。
+ *   流す前に FULL に戻ったチャンクは何もしない。FULL に戻ったチャンクのケースは、アンロードの後に読み込み直したのと同じく電源が切れている
  * - チャンクの保存（[ChunkDataEvent.Save]）: NBT に入ったケースの世代を、持ち主の位置のタグだけで `markChunkGeneration` に渡す
  * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き、`setChanged` を付ける。
  *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま。そのあと、チャンクのアンロードの列を流しきる（[ChunkUnloadDrain]。#540）
@@ -99,6 +107,9 @@ object ServerMachines {
 
     private var rotation = AutosaveRotation<CaseBlockEntity>(saveConfig)
 
+    /** FULL でなくなって、まだ流していないチャンク（積んだ順）。メインスレッドだけで使う（#545） */
+    private val demoted = LinkedHashMap<ChunkHolder, ServerLevel>()
+
     /** 自動保存の周期を数える tick */
     private var autosaveTicks = 0L
 
@@ -110,7 +121,13 @@ object ServerMachines {
         /** 受けた [ChunkEvent.Unload] のうち、ケースのあったもの */
         var unloadEventsWithCases: Long = 0
 
-        /** アンロードで取り出して書いた台の数 */
+        /** FULL でなくなったチャンク（[ChunkTicketLevelUpdatedEvent]）のうち、動いているケースのあったもの（#545） */
+        var demotedChunksWithCases: Long = 0
+
+        /** FULL でなくなったチャンクで外したマシンの数（#545。取り出して書いた数は [unloadCaptures] に入る） */
+        var demotedMachines: Long = 0
+
+        /** アンロード・FULL でなくなったチャンクで取り出して書いた台の数 */
         var unloadCaptures: Long = 0
 
         /** アンロードで行った書き込み（fsync）の回数 */
@@ -137,6 +154,8 @@ object ServerMachines {
 
         fun reset() {
             unloadEventsWithCases = 0
+            demotedChunksWithCases = 0
+            demotedMachines = 0
             unloadCaptures = 0
             unloadWrites = 0
             autosaveMaxTickWrites = 0
@@ -152,7 +171,9 @@ object ServerMachines {
     fun register() {
         NeoForge.EVENT_BUS.addListener(::onServerAboutToStart)
         NeoForge.EVENT_BUS.addListener(::onServerTick)
+        NeoForge.EVENT_BUS.addListener(::onServerTickPost)
         NeoForge.EVENT_BUS.addListener(::onChunkUnload)
+        NeoForge.EVENT_BUS.addListener(::onChunkTicketLevelUpdated)
         NeoForge.EVENT_BUS.addListener(::onChunkDataSave)
         NeoForge.EVENT_BUS.addListener(::onServerStopping)
         NeoForge.EVENT_BUS.addListener(::onServerStopped)
@@ -164,6 +185,7 @@ object ServerMachines {
         tracked.clear()
         changedLater.clear()
         rotation.clear()
+        demoted.clear()
         autosaveTicks = 0
         // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
         autosaveEnabled = event.server !is GameTestServer
@@ -309,6 +331,53 @@ object ServerMachines {
         }
     }
 
+    // ---- FULL でなくなったチャンク（#545） ----
+
+    /**
+     * チケットの段階が変わった。FULL（33 以下）から FULL でない段階に下がったチャンクを、[demoted] に積む。
+     * チケットの更新の途中で呼ばれる（`ChunkMap.updateChunkScheduling`。チャンクの状態はまだ下がっていない）ので、ここでは何もしない。
+     * 多くのチャンクで頻繁に来るので、段階をまたいだかだけを先に見る
+     */
+    private fun onChunkTicketLevelUpdated(event: ChunkTicketLevelUpdatedEvent) {
+        if (event.oldTicketLevel > FULL_LEVEL || event.newTicketLevel <= FULL_LEVEL) return
+        val holder = event.chunkHolder ?: return
+        if (manager == null) return
+        demoted[holder] = event.level
+    }
+
+    private fun onServerTickPost(event: ServerTickEvent.Post) {
+        if (demoted.isEmpty() || manager == null) return
+        // 1 tick に最低1チャンク。そのあとは tick の時間が残っている間だけ（バニラのアンロードの列と同じ）
+        var first = true
+        while (demoted.isNotEmpty() && (first || event.hasTime())) {
+            val it = demoted.entries.iterator()
+            val entry = it.next()
+            it.remove()
+            if (saveForDemotion(entry.key)) first = false
+        }
+    }
+
+    /**
+     * FULL でなくなった [holder] のチャンクのケースを、アンロードと同じ手順（[saveForUnload]）で取り出して書き、マシンを外す。
+     * FULL に戻っていた・チャンクがもうない・動いているケースがなければ何もしない
+     *
+     * @return 取り出す手順を回した（動いているケースがあった）
+     */
+    private fun saveForDemotion(holder: ChunkHolder): Boolean {
+        if (holder.fullStatus.isOrAfter(FullChunkStatus.FULL)) return false
+        val chunk = holder.latestChunk as? LevelChunk ?: return false
+        val cases = chunk.blockEntities.values.filterIsInstance<CaseBlockEntity>()
+            .filter { !it.isRemoved && it.computer.machine != null }
+        if (cases.isEmpty()) return false
+        Stats.demotedChunksWithCases++
+        saveForUnload(chunk, cases)
+        for (be in cases) {
+            be.chunkDemoted()
+            Stats.demotedMachines++
+        }
+        return true
+    }
+
     // ---- チャンクの保存（NBT が指す世代の印） ----
 
     private fun onChunkDataSave(event: ChunkDataEvent.Save) {
@@ -398,6 +467,7 @@ object ServerMachines {
         tracked.clear()
         changedLater.clear()
         rotation.clear()
+        demoted.clear()
         stop(m)
     }
 
@@ -414,6 +484,9 @@ object ServerMachines {
         }
         LOGGER.info("Stopped {} computers", count)
     }
+
+    /** FULL のチャンクのチケットの段階の上限（`ChunkLevel.byStatus(FullChunkStatus.FULL)`） */
+    private const val FULL_LEVEL = 33
 
     /** 待機点を待つ間の1回の待ち */
     private val WAIT_STEP_NANOS = TimeUnit.MICROSECONDS.toNanos(200)
