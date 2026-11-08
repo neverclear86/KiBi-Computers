@@ -34,7 +34,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - チャンクのアンロード・ブロックの破壊でマシンを外す
  * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 標準 OS の同梱イメージの順に起動する
  *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
- *   動いている間に画面を置き直したら、つなぎ直す（[neighborChanged]。#531）
+ *   動いている間に画面を置き直したら、次の tick につなぎ直す（[neighborChanged]。#531・#535）
  *
  * セーブデータには部品だけを書く（`Parts`）。電源の状態は書かず、読み込んだら電源が切れている（マシンの状態の保存は #81）。
  */
@@ -127,10 +127,19 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         return PreparedDisks(store.snapshot(disks), disks.keys.toList())
     }
 
-    /** 隣のブロックが変わった。動いていて画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531。仮の結線） */
+    /**
+     * 隣のブロックが変わった。動いていて画面をつないでいなければ、次の tick に [reconnectScreen] を回す（#531。仮の結線）。
+     * 置いたブロックのデータ（アイテムやコマンドの NBT の address）は `setBlock` の後で読み込むので、ここではまだつながない（#535）
+     */
     internal fun neighborChanged() {
         val level = level as? ServerLevel ?: return
-        wiring.reconnectScreen(level, blockPos)
+        if (wiring.canReconnectScreen(computer.machine)) level.scheduleTick(blockPos, blockState.block, 1)
+    }
+
+    /** [neighborChanged] で回した次の tick。動いていて画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531・#535） */
+    internal fun reconnectScreen() {
+        val level = level as? ServerLevel ?: return
+        wiring.reconnectScreen(level, blockPos, computer.machine)
     }
 
     private fun onPartsChanged() {

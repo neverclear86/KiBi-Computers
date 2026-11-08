@@ -143,7 +143,7 @@ object TestComputerGameTests {
 
     /**
      * 動いているマシンの画面を壊しても、ケースのスピーカーはつないだままで、ビープが届く。
-     * 画面を置き直すと、画面とキーボードをつなぎ直し、打った式の結果が新しい画面に出る（#531）
+     * 画面を置き直すと、次の tick に画面とキーボードをつなぎ直し、打った式の結果が新しい画面に出る（#531・#535）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -153,6 +153,7 @@ object TestComputerGameTests {
         val machine = case.computer.machine!!
         var broken = false
         var replaced: ScreenBlockEntity? = null
+        var typed = false
         helper.succeedWhen {
             if (!broken) {
                 helper.assertTrue(lines(screen.text).any { it == ">" }, "prompt should be shown")
@@ -169,8 +170,12 @@ object TestComputerGameTests {
                     SCREEN,
                     KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
                 )
-                val placed = helper.getBlockEntity<ScreenBlockEntity>(SCREEN)
-                replaced = placed
+                replaced = helper.getBlockEntity<ScreenBlockEntity>(SCREEN)
+                // 置いたブロックのデータを読み込んだ後につなぐので、置いた tick にはまだつながない（#535）
+                helper.assertTrue(case.wiring.connectedScreen == null, "the placed screen should be reconnected on the next tick")
+            }
+            if (!typed) {
+                val placed = replaced!!
                 helper.assertTrue(case.wiring.connectedScreen === placed, "the placed screen should be reconnected")
                 helper.assertTrue(case.wiring.connectedKeyboard === keyboard, "the keyboard should be reconnected")
                 helper.assertTrue(machine.devices.primaryScreen === case.wiring.connectedScreenDevice, "the screen device should be the console again")
@@ -181,6 +186,7 @@ object TestComputerGameTests {
                 )
                 helper.assertTrue(machine.devices.list() == expected, "devices should be attached again: ${machine.devices.list()}")
                 typeLine(helper, keyboard, "print(20+22)")
+                typed = true
             }
             val text = locked(replaced!!) { lines(replaced!!.text) }
             helper.assertTrue(text.any { it == "42" }, "the result should be shown on the placed screen: $text")
@@ -328,6 +334,83 @@ object TestComputerGameTests {
             helper.assertTrue(case.wiring.beeps.get() == 1L, "the beep should be delivered")
             case.pressPowerButton()
             helper.assertTrue(machine.devices.list().isEmpty(), "turning off should detach the devices: ${machine.devices.list()}")
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * データ付きで置いた画面（クリエイティブのピックブロック・NBT 付きの `/setblock`）は、置いた後に読み込んだ、保存されていた address で
+     * つなぎ直す。壊したら、その address で外れる（#535）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun screenPlacedWithDataIsReconnectedWithSavedAddress(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        val registries = helper.level.registryAccess()
+        // address は最初に使うときに作るので、作ってから保存する
+        val savedAddress = screen.deviceAddress
+        val savedTag = screen.saveWithoutMetadata(registries)
+        helper.setBlock(SCREEN, Blocks.AIR)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        // アイテムの置き方と同じく、setBlock（隣のケースに知らせる）の後でブロックエンティティのデータを読み込む
+        helper.setBlock(
+            SCREEN,
+            KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+        )
+        val placed = helper.getBlockEntity<ScreenBlockEntity>(SCREEN)
+        placed.loadWithComponents(savedTag, registries)
+        helper.assertTrue(placed.deviceAddress == savedAddress, "the placed screen should have the saved address")
+        var broken = false
+        helper.succeedWhen {
+            if (!broken) {
+                helper.assertTrue(case.wiring.connectedScreen === placed, "the placed screen should be reconnected")
+                val expected = listOf(
+                    DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER),
+                    DeviceInfo(savedAddress, DeviceKind.SCREEN),
+                    DeviceInfo(keyboard.deviceAddress, DeviceKind.KEYBOARD),
+                )
+                helper.assertTrue(machine.devices.list() == expected, "the screen should be attached with the saved address: ${machine.devices.list()}")
+                helper.setBlock(SCREEN, Blocks.AIR)
+                broken = true
+                val listed = machine.devices.list()
+                helper.assertTrue(listed == listOf(DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER)), "breaking should detach the screen: $listed")
+                helper.assertTrue(machine.devices.primaryScreen == null, "no screen should stay on the bus")
+            }
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * マシンが自分で止まった（ゲストが止めた）後に画面を置き直しても、止まったマシンにはつながず、キーボードも取らない（#535）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun replacingScreenDoesNotReconnectStoppedMachine(helper: GameTestHelper) {
+        val (case, _, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        helper.setBlock(SCREEN, Blocks.AIR)
+        helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
+        // ゲストが止めたのと同じく、電源を入れたまま、マシンだけが止まる
+        machine.stop()
+        var placedTicks = -1
+        helper.succeedWhen {
+            if (placedTicks < 0) {
+                helper.assertTrue(machine.state == MachineState.STOPPED, "machine should stop: ${machine.state}")
+                helper.assertTrue(case.computer.machine === machine, "the case should still hold the stopped machine")
+                helper.setBlock(
+                    SCREEN,
+                    KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+                )
+                placedTicks = 0
+            }
+            helper.assertTrue(case.wiring.connectedScreen == null, "the stopped machine should not take the screen")
+            helper.assertTrue(keyboard.owner == null, "the stopped machine should not take the keyboard")
+            helper.assertTrue(machine.devices.list() == listOf(DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER)), "no device should be attached")
+            helper.assertTrue(++placedTicks > 3, "watch for a few ticks after placing")
+            case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
