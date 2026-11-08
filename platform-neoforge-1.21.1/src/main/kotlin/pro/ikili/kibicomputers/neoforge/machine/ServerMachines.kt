@@ -54,7 +54,7 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *   チャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が新しい世代を NBT に書く）
  * - チャンクの保存（[ChunkDataEvent.Save]）: NBT に入ったケースの世代を、持ち主の位置のタグだけで `markChunkGeneration` に渡す
  * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き、`setChanged` を付ける。
- *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま
+ *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま。そのあと、チャンクのアンロードの列を流しきる（[ChunkUnloadDrain]。#540）
  * - サーバーが止まった後（[ServerStoppedEvent]）に全マシンを止め、スレッドが終わるのを待つ（上限 [SHUTDOWN_TIMEOUT_MILLIS]）
  *
  * #81 では書き込みはメインスレッドで同期して行う（#84 で書き込みのスレッドに移す）。
@@ -356,8 +356,9 @@ object ServerMachines {
     // ---- サーバーの停止 ----
 
     private fun onServerStopping(event: ServerStoppingEvent) {
-        if (manager == null) return
-        saveForStop(tracked.toList(), keepQuiesced = true)
+        if (manager != null) saveForStop(tracked.toList(), keepQuiesced = true)
+        // 取り出した後に流す（流した分のアンロードは、取り出し済みの台の印を見るだけ）。止める手順が回り続けないように（#540）
+        ChunkUnloadDrain.drainAll(event.server)
     }
 
     /**

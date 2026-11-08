@@ -14,6 +14,10 @@ WASMで動く、部品を組み立てて作るコンピューターMOD。
 Assemble computers and robots from parts, and program them in Lua, Rust, Zig, C and more via WebAssembly.
 '''
 
+# チャンクのアンロードの列を、サーバーの停止の前に流しきるため（#540）
+[[accessTransformers]]
+file = "META-INF/accesstransformer.cfg"
+
 [[dependencies.${mod_id}]]
 modId = "neoforge"
 type = "required"

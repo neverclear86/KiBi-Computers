@@ -27,7 +27,8 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  * ゲームの中での多数台の負荷試験（#345）。手順と結果は `docs/load-test.md`。
  *
  * - CI 用（[CI_COUNT] 台）: `runGameTestServer` で毎回動く。全台が起動し、待っている間と一部が計算・出力している間（見ていても、見ていなくても）に
- *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる。Lua の REPL と標準 OS のシェルの両方で1回ずつ動かす（#476）
+ *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる。Lua の REPL と標準 OS のシェルの両方で1回ずつ動かす（#476）。
+ *   標準 OS の試験では最後にまとめてアンロードし、ケースのあるチャンクが全部アンロードされることも確かめる（#540）
  * - 測定用: `runLoadTestServer -PloadTestCounts=100,500,1000` で動く。台数ごとに MSPT・スレッド数・ヒープ使用量をログに書く。
  *   OS は `-PloadTestOs=lua|standard`（[LoadOs]。既定は Lua の REPL）。
  *   テンプレートを名前空間 [MEASURE_NAMESPACE] のもの（`src/dev/resources`。jar には入らない）にして、
@@ -121,9 +122,18 @@ object LoadGameTests {
         System.getProperty(COUNTS_PROPERTY).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
 
     private fun ci(helper: GameTestHelper, os: LoadOs) {
-        val settings = LoadSettings(os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100)
+        // まとめてアンロードは標準 OS の試験でだけ動かす（アンロードの書き込みは台数 × fsync を 1 tick でするので、1回にとどめる）
+        val massUnload = os == LoadOs.STANDARD
+        val settings = LoadSettings(
+            os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100, massUnload = massUnload,
+        )
         LoadRun(helper, settings) { report ->
             LOGGER.info("Load test (CI, {})\n{}", os.id, report.toMarkdown())
+            if (massUnload) {
+                // 強制読み込みを外したら、ケースのあるチャンクが全部アンロードされる（#540）
+                val unload = report.unload!!
+                helper.assertTrue(unload.stillLoaded == 0, "all chunks with cases should unload after the force loading is removed: $unload")
+            }
             val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
             val compute = report.phase(LoadPhase.COMPUTE)

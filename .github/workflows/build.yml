@@ -40,11 +40,14 @@ jobs:
       - name: Build and test
         run: ./gradlew build --console=plain
 
-      # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）
+      # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）。
+      # サーバーの停止が終わらないとき（#540）に、ジョブの上限（6 時間）まで待たないよう、段ごとに上限を付ける
       - name: GameTest (NeoForge 1.21.1)
+        timeout-minutes: 30
         run: ./gradlew :platform-neoforge-1.21.1:runGameTestServer --console=plain
 
       - name: GameTest (Forge 1.20.1)
+        timeout-minutes: 30
         run: ./gradlew :platform-forge-1.20.1:runGameTestServer --console=plain
 
       - uses: actions/upload-artifact@v7
