@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.computer
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.DiskResolver
 import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
+import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import java.nio.file.Path
 import java.util.UUID
 
@@ -50,10 +51,8 @@ public class DiskStore(public val root: Path) {
     }
 
     public companion object {
-        private val ID_PATTERN = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-
         /** [id] がディスクの識別子の形か（UUID の正規の小文字の形だけ。`..`・区切り文字・大文字・空は `false`） */
         @JvmStatic
-        public fun isValidId(id: String): Boolean = ID_PATTERN.matches(id)
+        public fun isValidId(id: String): Boolean = CanonicalUuid.isValid(id)
     }
 }

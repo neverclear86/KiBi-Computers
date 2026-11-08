@@ -16,6 +16,9 @@ internal class ProcessLifecycle(private val machine: Machine) {
     private fun objectOf(process: Process): ProcessObject? =
         if (process.objectId == 0) null else kernel.objects[process.objectId] as? ProcessObject
 
+    /** 終わりの記録・刈り取りの後片付け（カーネルの状態の側。保存の写しと同じ手順。#81） */
+    private val bookkeeping by lazy { ExitBookkeeping(kernel, machine.wakeSink) { machine.reapLocked(it) } }
+
     /**
      * [rt] が終わった（`ProcessRunner.finishLocked` から。状態・終了コードは入れてある）。
      * 終わりを記録して待ち手を起こし、親へ知らせ、子を付け替える（刈り取られていない子のゾンビは刈り取る）
@@ -23,36 +26,11 @@ internal class ProcessLifecycle(private val machine: Machine) {
     fun onFinishedLocked(rt: ProcessRuntime) {
         val process = rt.process
         process.termSignal = if (process.state == ProcessState.KILLED) rt.killSignal else null
-        val status = statusOf(process)
-        objectOf(process)?.let { obj ->
-            obj.status = status
-            machine.wakeSink.wake(WaitKey(obj.id, WaitCondition.EXITED))
-        }
-        // 親へ知らせる（親がいない・もう終わっているなら、親のないゾンビにする）
-        val parent = if (process.parentPid == 0) null else kernel.processes[process.parentPid]?.takeIf { !it.state.isTerminal }
-        if (parent == null) {
-            process.parentPid = 0
-            kernel.processes.addOrphanZombie(process.pid)
-        } else {
-            objectOf(parent)?.let { obj ->
-                obj.pendingChildExits++
-                machine.wakeSink.wake(WaitKey(obj.id, WaitCondition.CHILD_EXITED))
-            }
-        }
-        // 子: 終わっていなければ親なしに付け替える（止めない）。ゾンビは待つ相手がいないので刈り取る
-        for (childPid in kernel.processes.childrenOf(process.pid)) {
-            val child = kernel.processes[childPid] ?: continue
-            if (child.state.isTerminal) machine.reapLocked(childPid) else child.parentPid = 0
-        }
+        bookkeeping.recordExit(process)
     }
 
     /** 刈り取りの後片付けのうち、カーネルの状態の側（親の数え、`ProcessObject` の参照）。[Machine.reapLocked] から呼ぶ */
-    fun onReapedLocked(process: Process) {
-        if (process.parentPid != 0) {
-            kernel.processes[process.parentPid]?.let { parent -> objectOf(parent)?.let { it.pendingChildExits = (it.pendingChildExits - 1).coerceAtLeast(0) } }
-        }
-        if (process.objectId != 0 && kernel.objects[process.objectId] != null) kernel.objects.release(process.objectId, machine.wakeSink)
-    }
+    fun onReapedLocked(process: Process) = bookkeeping.onReaped(process)
 
     /** [parentPid] の子のうち [selector] に当たるものを1つ刈り取る（待たない） */
     fun tryReapLocked(parentPid: Int, selector: ChildSelector): ReapResult {
@@ -74,15 +52,7 @@ internal class ProcessLifecycle(private val machine: Machine) {
         return ReapResult.Reaped(status)
     }
 
-    /** 終わった [process] の記録（`ProcessObject` がない、テストで直接作ったものにも使う） */
-    private fun statusOf(process: Process): ExitStatus {
-        val reason = when (process.state) {
-            ProcessState.EXITED -> ExitReason.EXITED
-            ProcessState.KILLED -> ExitReason.KILLED
-            else -> ExitReason.CRASHED
-        }
-        return ExitStatus(process.pid, reason, if (reason == ExitReason.EXITED) process.exitCode ?: 0 else 0, process.termSignal)
-    }
+    private fun statusOf(process: Process): ExitStatus = bookkeeping.statusOf(process)
 
     /** [parentPid] が [selector] の子の終わりを待つための key。待つ子がいなければ空 */
     fun childExitKeysLocked(parentPid: Int, selector: ChildSelector): List<WaitKey> = when (selector) {

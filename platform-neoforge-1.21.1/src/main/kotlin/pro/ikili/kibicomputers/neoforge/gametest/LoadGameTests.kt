@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 
 /**
@@ -114,6 +115,15 @@ object LoadGameTests {
             val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
             val compute = report.phase(LoadPhase.COMPUTE)
+            val autosave = report.phase(LoadPhase.AUTOSAVE)
+            val cycle = report.autosave!!
+            // 自動保存（#81、ADR 0081）: 一巡しても TPS を落とさず、1 tick の書き込みは予算 + 1 以下
+            helper.assertTrue(
+                autosave.tick.avg < CI_MAX_AVG_TICK_MILLIS,
+                "ticks during an autosave cycle should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${autosave.tick}",
+            )
+            val budget = ServerMachines.saveConfig.autosaveWritesPerTick
+            helper.assertTrue(cycle.maxTickWrites <= budget + 1, "an autosave tick should write at most ${budget + 1} times: $cycle")
             val unwatched = report.phase(LoadPhase.OUTPUT)
             val output = report.phase(LoadPhase.WATCHED)
             helper.assertTrue(
@@ -156,7 +166,7 @@ object LoadGameTests {
     }
 
     private fun measure(helper: GameTestHelper, os: LoadOs, count: Int) {
-        val settings = LoadSettings(os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600)
+        val settings = LoadSettings(os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true)
         LoadRun(helper, settings) { report -> LOGGER.info("Load test ({} computers, {})\n{}", count, os.id, report.toMarkdown()) }.start()
     }
 

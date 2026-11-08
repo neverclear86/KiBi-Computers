@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
+import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
@@ -33,6 +34,7 @@ object KiBiComputersNeoForge {
         KeyboardInput.register(MOD_BUS)
         ServerMachines.register()
         WorldDisks.register()
+        WorldMachineSaves.register()
         // クライアントのクラスは、クライアントでだけ読み込む
         if (FMLEnvironment.dist.isClient) KiBiClient.register(MOD_BUS)
         startDevDriver()

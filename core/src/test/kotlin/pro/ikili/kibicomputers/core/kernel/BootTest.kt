@@ -639,6 +639,49 @@ class BootTest {
     }
 
     @Test
+    fun `起動の途中の写しは、KILL_TRANSIENTならBOOTINGの理由でプロセスなし、SKIP_IF_TRANSIENTなら写さない`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            reached.countDown()
+            release.await()
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        assertEquals(pro.ikili.kibicomputers.core.persist.SaveReadiness.TRANSIENT, m.saveReadiness())
+        assertNull(m.captureSnapshot(pro.ikili.kibicomputers.core.persist.CapturePolicy.SKIP_IF_TRANSIENT))
+        val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+        assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.BOOTING, copy.coldBootReason)
+        assertEquals(0, copy.processes.size)
+        assertEquals(emptyList<Int>(), copy.killedPids)
+        release.countDown()
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting }
+        // 計算し続ける init は待機点に来ないので、写しの中で殺し、理由は INIT_KILLED
+        val running = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+        assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.INIT_KILLED, running.coldBootReason)
+        assertEquals(listOf(1), running.killedPids)
+        assertEquals(1, initPid(), "元の init は動いたまま")
+        m.stop()
+        tickUntil { m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `再起動の求めを配る前の写しは、REBOOT_PENDINGの理由`() = env {
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(m.reboot())
+        val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+        assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.REBOOT_PENDING, copy.coldBootReason)
+        assertEquals(emptyList<Int>(), copy.killedPids)
+        tickUntil { host.reboots.get() == 1 && Regex("init exited").findAll(host.console).count() == 2 && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
     fun `initが終わるとinitPidを0に戻し、止まったマシンは待機点`() = env {
         disks.withInit("d", exe(exitingInit(0)))
         assertTrue(m.boot(bootDisks("d")))

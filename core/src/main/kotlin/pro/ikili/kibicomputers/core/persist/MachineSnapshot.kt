@@ -1,0 +1,196 @@
+package pro.ikili.kibicomputers.core.persist
+
+import org.jetbrains.annotations.ApiStatus
+import java.io.ByteArrayOutputStream
+import java.io.DataInput
+import java.io.DataInputStream
+import java.io.DataOutput
+import java.io.DataOutputStream
+import java.io.EOFException
+import java.io.IOException
+import java.util.UUID
+
+/**
+ * 保存データの節（#81、ADR 0081）。「種類（u16）・節の版（u16）・長さ（u32）・中身」。
+ *
+ * 中身の形は種類ごとに決める（`KERNEL`・`PROCESS_ABI` の中身は #82）。
+ */
+@ApiStatus.Internal
+public class SnapshotSection(
+    /** 種類（[KERNEL] など。0〜65535） */
+    public val kind: Int,
+    /** 節の版（0〜65535） */
+    public val version: Int,
+    payload: ByteArray,
+) {
+    private val bytes = payload.copyOf()
+
+    init {
+        require(kind in 0..0xFFFF) { "節の種類は u16（$kind）" }
+        require(version in 0..0xFFFF) { "節の版は u16（$version）" }
+    }
+
+    /** 中身（写し） */
+    public val payload: ByteArray get() = bytes.copyOf()
+
+    /** 中身の長さ */
+    public val size: Int get() = bytes.size
+
+    internal fun writeTo(out: DataOutput) {
+        out.writeShort(kind)
+        out.writeShort(version)
+        out.writeInt(bytes.size)
+        out.write(bytes)
+    }
+
+    override fun toString(): String = "SnapshotSection(kind=$kind, version=$version, ${bytes.size} bytes)"
+
+    public companion object {
+        /** カーネルの状態（pid・親子・状態・待ち・fd 表・オブジェクト表・時計。中身は #82） */
+        public const val KERNEL: Int = 1
+
+        /** プロセスごとの ABI 層の状態（先頭に pid（i32）・ABI 層の ID（u16）・層の版（u16）。中身は #82） */
+        public const val PROCESS_ABI: Int = 2
+
+        /** 写しの中で殺した pid の一覧（u32 の個数 + i32 の並び）と、冷えた起動が要る理由（u8） */
+        public const val KILLED: Int = 3
+
+        /** [KILLED] 節の版 */
+        public const val KILLED_VERSION: Int = 1
+    }
+}
+
+/**
+ * マシン1台の保存データの外枠（#81、ADR 0081）。世代ファイル `<世代>.bin` の中身。
+ *
+ * 形: magic `KIBS`、形式の版（u16 = [FORMAT_VERSION]）、MOD のバージョン（`writeUTF`）、UUID（2つの i64）、世代（i64）、
+ * 続いてファイルの終わりまで節（[SnapshotSection]）を並べる。数値はビッグエンディアン。可変長の整数は使わない。
+ *
+ * 読むとき、知らない節と、長さの合わない既知の節は読み飛ばす（[sections] には残る）。`KILLED` 節がない・読めないときは、
+ * 冷えた起動が要るとして扱う（状態を蘇らせない側に倒す）。
+ *
+ * @property machineId マシンの ID
+ * @property generation 世代
+ * @property modVersion 書いた MOD のバージョン
+ * @property sections `KILLED` 以外の節（書く順）
+ * @property killedPids 写しの中で殺した pid（#86 が使う）
+ * @property coldBootCode 冷えた起動が要る理由の値（[ColdBootReason.code]。知らない値もそのまま持つ）
+ */
+@ApiStatus.Internal
+public class MachineSnapshot @JvmOverloads constructor(
+    public val machineId: UUID,
+    public val generation: Long,
+    public val modVersion: String,
+    sections: List<SnapshotSection> = emptyList(),
+    killedPids: List<Int> = emptyList(),
+    public val coldBootCode: Int = ColdBootReason.NONE.code,
+) {
+    init {
+        require(coldBootCode in 0..0xFF) { "冷えた起動の理由は u8（$coldBootCode）" }
+        require(sections.none { it.kind == SnapshotSection.KILLED }) { "KILLED 節は killedPids・coldBootCode で渡す" }
+    }
+
+    public val sections: List<SnapshotSection> = sections.toList()
+
+    public val killedPids: List<Int> = killedPids.toList()
+
+    /** 冷えた起動が要る理由。知らない値なら `null`（[requiresColdBoot] は真） */
+    public val coldBootReason: ColdBootReason? get() = ColdBootReason.fromCode(coldBootCode)
+
+    /** 状態を復元せず、冷えた起動にする */
+    public val requiresColdBoot: Boolean get() = ColdBootReason.requiresColdBoot(coldBootCode)
+
+    /** 書き出す */
+    @Throws(IOException::class)
+    public fun writeTo(out: DataOutput) {
+        out.write(MAGIC)
+        out.writeShort(FORMAT_VERSION)
+        out.writeUTF(modVersion)
+        out.writeLong(machineId.mostSignificantBits)
+        out.writeLong(machineId.leastSignificantBits)
+        out.writeLong(generation)
+        for (section in sections) section.writeTo(out)
+        killedSection().writeTo(out)
+    }
+
+    private fun killedSection(): SnapshotSection {
+        val bytes = ByteArrayOutputStream(4 + killedPids.size * 4 + 1)
+        DataOutputStream(bytes).use { out ->
+            out.writeInt(killedPids.size)
+            for (pid in killedPids) out.writeInt(pid)
+            out.writeByte(coldBootCode)
+        }
+        return SnapshotSection(SnapshotSection.KILLED, SnapshotSection.KILLED_VERSION, bytes.toByteArray())
+    }
+
+    override fun toString(): String =
+        "MachineSnapshot($machineId, generation=$generation, $modVersion, ${sections.size} sections, killed=$killedPids, coldBoot=$coldBootCode)"
+
+    public companion object {
+        /** 形式の版 */
+        public const val FORMAT_VERSION: Int = 1
+
+        /** 節1つの中身の長さの上限（読むとき。壊れたファイルで大きな配列を確保しない） */
+        public const val MAX_SECTION_BYTES: Int = 1 shl 30
+
+        private val MAGIC = byteArrayOf('K'.code.toByte(), 'I'.code.toByte(), 'B'.code.toByte(), 'S'.code.toByte())
+
+        /**
+         * 読む。magic・形式の版が違う・途中で切れている・節の長さが上限を超えるなら [IOException]。
+         * [input] の終わりまで節を読む（節の始まりでちょうど終わっていれば、そこまで）
+         */
+        @JvmStatic
+        @Throws(IOException::class)
+        public fun readFrom(input: DataInput): MachineSnapshot {
+            val magic = ByteArray(4)
+            input.readFully(magic)
+            if (!magic.contentEquals(MAGIC)) throw IOException("保存データの magic が違う")
+            val version = input.readUnsignedShort()
+            if (version != FORMAT_VERSION) throw IOException("保存データの形式の版 $version は読めない")
+            val modVersion = input.readUTF()
+            val id = UUID(input.readLong(), input.readLong())
+            val generation = input.readLong()
+            val sections = ArrayList<SnapshotSection>()
+            var killed: List<Int>? = null
+            var coldBoot = -1
+            while (true) {
+                val high = try {
+                    input.readUnsignedByte()
+                } catch (_: EOFException) {
+                    break
+                }
+                val kind = (high shl 8) or input.readUnsignedByte()
+                val sectionVersion = input.readUnsignedShort()
+                val length = input.readInt().toLong() and 0xFFFF_FFFFL
+                if (length > MAX_SECTION_BYTES) throw IOException("節 $kind の長さ $length が上限を超える")
+                val payload = ByteArray(length.toInt())
+                input.readFully(payload)
+                if (kind == SnapshotSection.KILLED && sectionVersion == SnapshotSection.KILLED_VERSION) {
+                    parseKilled(payload)?.let { (pids, code) ->
+                        killed = pids
+                        coldBoot = code
+                    }
+                    continue
+                }
+                // 知らない節・版の違う KILLED 節は、中身をそのまま持つ（読み飛ばす）
+                if (kind != SnapshotSection.KILLED) sections += SnapshotSection(kind, sectionVersion, payload)
+            }
+            // KILLED 節がない・読めないなら、冷えた起動が要る側に倒す
+            val code = if (coldBoot < 0) UNREADABLE_KILLED_CODE else coldBoot
+            return MachineSnapshot(id, generation, modVersion, sections, killed.orEmpty(), code)
+        }
+
+        /** KILLED 節が読めなかったときの理由（どの理由でもない値。冷えた起動が要る） */
+        private const val UNREADABLE_KILLED_CODE = 0xFF
+
+        /** 長さが合わなければ `null`（読み飛ばす） */
+        private fun parseKilled(payload: ByteArray): Pair<List<Int>, Int>? {
+            if (payload.size < 5) return null
+            val input = DataInputStream(payload.inputStream())
+            val count = input.readInt().toLong() and 0xFFFF_FFFFL
+            if (payload.size.toLong() != 4 + count * 4 + 1) return null
+            val pids = List(count.toInt()) { input.readInt() }
+            return pids to input.readUnsignedByte()
+        }
+    }
+}

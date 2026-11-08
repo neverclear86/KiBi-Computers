@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -70,6 +71,9 @@ internal enum class LoadPhase(val label: String) {
     /** 全台が入力を待っている */
     IDLE("全台が入力待ち"),
 
+    /** 全台が入力を待っている間に、自動保存を1周期回す（#81）。一巡したら終わる */
+    AUTOSAVE("自動保存の一巡（全台が入力待ち）"),
+
     /** 一部の台が無限ループで計算し続ける（残りは入力待ち） */
     COMPUTE("一部が計算し続ける"),
 
@@ -78,6 +82,12 @@ internal enum class LoadPhase(val label: String) {
 
     /** [OUTPUT] の画面を、1人が全部見ている（画面の同期が送られる） */
     WATCHED("一部が出力し続け、1人が見る"),
+
+    /**
+     * 並べた範囲のチャンクの強制読み込みを外し、一斉にアンロードさせる（#81）。アンロードで全台を取り出して書く（延ばせない書き込みの最悪値）。
+     * 測るだけで、目標値では落とさない（#84 の基準にする）
+     */
+    UNLOAD("まとめてアンロード"),
 }
 
 /**
@@ -92,6 +102,7 @@ internal enum class LoadPhase(val label: String) {
  * @property measureTicks 測る tick 数
  * @property bootTimeoutTicks 全台がプロンプトを出すまで待つ上限
  * @property outputTimeoutTicks [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまで待つ上限。出なければ失敗
+ * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
  */
 internal data class LoadSettings(
     val os: LoadOs,
@@ -102,6 +113,7 @@ internal data class LoadSettings(
     val measureTicks: Int,
     val bootTimeoutTicks: Int = if (paced) 150_000 else 15_000,
     val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
+    val massUnload: Boolean = false,
 )
 
 /** tick の時間の統計（ミリ秒）。 */
@@ -153,6 +165,19 @@ internal data class PhaseResult(
     val kernelThreadNames: Map<String, Int>,
 )
 
+/** [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書いた台・飛ばした台の数、1 tick の書き込み（fsync）の最大 */
+internal data class AutosaveResult(val cycleTicks: Int, val written: Long, val skipped: Long, val maxTickWrites: Int)
+
+/** [LoadPhase.UNLOAD] の結果: 取り出して書いた台と書き込みの回数（合計と 1 tick の最大）、終わりに読み込まれたままのチャンク */
+internal data class UnloadResult(
+    val captures: Long,
+    val writes: Long,
+    val maxTickCaptures: Long,
+    val maxTickWrites: Long,
+    val stillLoaded: Int,
+    val ticks: Int,
+)
+
 /** 負荷試験の結果。 */
 internal class LoadReport(
     val settings: LoadSettings,
@@ -167,6 +192,10 @@ internal class LoadReport(
     /** 並べる前に GC したあとのヒープ使用量 */
     val baselineHeapBytes: Long,
     val phases: List<PhaseResult>,
+    /** [LoadPhase.AUTOSAVE] の結果 */
+    val autosave: AutosaveResult?,
+    /** [LoadPhase.UNLOAD] の結果（測らなければ `null`） */
+    val unload: UnloadResult? = null,
 ) {
     fun phase(phase: LoadPhase): PhaseResult = phases.first { it.phase == phase }
 
@@ -189,6 +218,23 @@ internal class LoadReport(
                 Runtime.getRuntime().maxMemory() / mib,
             ),
         )
+        autosave?.let {
+            sb.append(
+                String.format(
+                    Locale.ROOT, "- 自動保存の一巡: %d tick、書いた台 %d、飛ばした台 %d、1 tick の書き込み（fsync）の最大 %d 回\n",
+                    it.cycleTicks, it.written, it.skipped, it.maxTickWrites,
+                ),
+            )
+        }
+        unload?.let {
+            sb.append(
+                String.format(
+                    Locale.ROOT,
+                    "- まとめてアンロード: %d tick、取り出して書いた台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、読み込まれたまま %d チャンク\n",
+                    it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded,
+                ),
+            )
+        }
         sb.append("\n| 段階 | 動いている台 | 長さ | MSPT 平均 | p50 | p95 | 最大 | KiBi スレッド（終わり / うち待機中のワーカー / 最大） | JVM スレッド（終わり / 最大） | ヒープ（GC 後） | 画面の同期 |\n")
         sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |\n")
         for (p in phases) {
@@ -258,6 +304,13 @@ internal class LoadRun(
     private var baselineHeap = 0L
     private var watcher: ServerPlayer? = null
     private var finished = false
+    private var autosaveResult: AutosaveResult? = null
+    private var unloadResult: UnloadResult? = null
+    private var unloading: List<ChunkPos> = emptyList()
+    private var unloadPrevCaptures = 0L
+    private var unloadPrevWrites = 0L
+    private var unloadMaxTickCaptures = 0L
+    private var unloadMaxTickWrites = 0L
 
     private var prevCallback = 0L
     private var prevHarness = 0L
@@ -307,7 +360,12 @@ internal class LoadRun(
             enter(sequence.first())
         } else {
             if (phaseTick == 0) setUp(p)
-            if (p == LoadPhase.BOOT) boot() else steady(p)
+            when (p) {
+                LoadPhase.BOOT -> boot()
+                LoadPhase.AUTOSAVE -> autosave()
+                LoadPhase.UNLOAD -> unload()
+                else -> steady(p)
+            }
         }
         phaseTick++
     }
@@ -318,11 +376,13 @@ internal class LoadRun(
         add(LoadPhase.PLACED)
         add(LoadPhase.BOOT)
         add(LoadPhase.IDLE)
+        add(LoadPhase.AUTOSAVE)
         if (settings.busy > 0) add(LoadPhase.COMPUTE)
         if (settings.busy > 0 && settings.count > settings.busy) {
             add(LoadPhase.OUTPUT)
             add(LoadPhase.WATCHED)
         }
+        if (settings.massUnload) add(LoadPhase.UNLOAD)
     }
 
     private fun next(p: LoadPhase) {
@@ -345,6 +405,31 @@ internal class LoadRun(
         } else if (phaseTick >= settings.bootTimeoutTicks) {
             val c = computers.first { !it.ready }
             fail("$waiting of ${settings.count} computers did not show the prompt within ${settings.bootTimeoutTicks} ticks: ${lines(c.screen.text)}")
+        }
+    }
+
+    private fun autosave() {
+        if (phaseTick == 0) return
+        if (ServerMachines.isAutosaveCycleDone) {
+            val s = ServerMachines.Stats
+            autosaveResult = AutosaveResult(s.autosaveCycleTicks.lastOrNull() ?: phaseTick, s.autosaveWritten, s.autosaveSkipped, s.autosaveMaxTickWrites)
+            next(LoadPhase.AUTOSAVE)
+        } else if (phaseTick >= AUTOSAVE_TIMEOUT_TICKS) {
+            fail("the autosave cycle did not finish within $AUTOSAVE_TIMEOUT_TICKS ticks")
+        }
+    }
+
+    private fun unload() {
+        val s = ServerMachines.Stats
+        unloadMaxTickCaptures = maxOf(unloadMaxTickCaptures, s.unloadCaptures - unloadPrevCaptures)
+        unloadMaxTickWrites = maxOf(unloadMaxTickWrites, s.unloadWrites - unloadPrevWrites)
+        unloadPrevCaptures = s.unloadCaptures
+        unloadPrevWrites = s.unloadWrites
+        if (phaseTick % 10 != 0) return
+        val loaded = unloading.count { level.chunkSource.hasChunk(it.x, it.z) }
+        if (loaded == 0 || phaseTick >= UNLOAD_TIMEOUT_TICKS) {
+            unloadResult = UnloadResult(s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, loaded, phaseTick)
+            next(LoadPhase.UNLOAD)
         }
     }
 
@@ -406,6 +491,11 @@ internal class LoadRun(
                 // 起動は、電源を入れた次の tick から終わるまでを全部測る
                 recording = true
             }
+            LoadPhase.AUTOSAVE -> {
+                ServerMachines.Stats.reset()
+                ServerMachines.startAutosaveCycle()
+                recording = true
+            }
             LoadPhase.COMPUTE -> for (c in computeSet) type(c, settings.os.computeCommand)
             LoadPhase.OUTPUT -> {
                 val t0 = System.nanoTime()
@@ -414,12 +504,28 @@ internal class LoadRun(
                 for (c in outputSet) type(c, settings.os.outputCommand)
             }
             LoadPhase.WATCHED -> watch(outputSet)
+            LoadPhase.UNLOAD -> {
+                // 見ている人は外す（プレイヤーの近くのチャンクは読み込まれたまま）
+                watcher?.let { level.server.playerList.remove(it) }
+                watcher = null
+                ServerMachines.Stats.reset()
+                unloading = forced.toList()
+                for (chunk in forced) level.setChunkForced(chunk.x, chunk.z, false)
+                forced.clear()
+                recording = true
+            }
         }
     }
 
     private fun verify(p: LoadPhase) {
         when (p) {
             LoadPhase.EMPTY, LoadPhase.PLACED, LoadPhase.BOOT -> Unit
+            LoadPhase.AUTOSAVE -> {
+                val r = autosaveResult!!
+                if (r.written + r.skipped != settings.count.toLong()) fail("the autosave should visit all ${settings.count} machines: $r")
+                val notRunning = computers.count { it.case.computer.machine?.state != MachineState.RUNNING }
+                if (notRunning > 0) fail("$notRunning computers stopped during the autosave")
+            }
             LoadPhase.IDLE -> {
                 val notRunning = computers.count { it.case.computer.machine?.state != MachineState.RUNNING }
                 if (notRunning > 0) fail("$notRunning computers stopped while waiting for input")
@@ -430,6 +536,7 @@ internal class LoadRun(
                 // 計算している間はプロンプトに戻らない
                 if (text.lastOrNull { it.isNotEmpty() } != "${settings.os.prompt} ${settings.os.computeCommand}") fail("the loop should keep running: $text")
             }
+            LoadPhase.UNLOAD -> Unit
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
                 if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
@@ -480,7 +587,7 @@ internal class LoadRun(
     }
 
     private fun done() {
-        val report = LoadReport(settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList())
+        val report = LoadReport(settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList(), autosaveResult, unloadResult)
         cleanUp()
         onDone(report)
         helper.succeed()
@@ -568,6 +675,12 @@ internal class LoadRun(
     private fun fail(message: String): Nothing = throw GameTestAssertException(message)
 
     companion object {
+        /** 自動保存の一巡を待つ上限 */
+        private const val AUTOSAVE_TIMEOUT_TICKS = 2_000
+
+        /** まとめてアンロードを待つ上限（過ぎたら、そこまでの結果を書く） */
+        private const val UNLOAD_TIMEOUT_TICKS = 2_000
+
         private val DIGITS = Regex("[0-9]+")
 
         /** プールで仕事を待っているワーカーを見分けるのに読むスタックの深さ */

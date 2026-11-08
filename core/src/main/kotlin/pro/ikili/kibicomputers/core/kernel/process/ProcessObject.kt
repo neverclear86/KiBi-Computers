@@ -40,6 +40,11 @@ internal class ProcessObject(val pid: Int) : KernelObject() {
     /** 刈り取られていない、終わった子の数（表から作り直せる） */
     var pendingChildExits: Int = 0
 
+    override fun copyForSnapshot(): KernelObject = ProcessObject(pid).also {
+        it.status = status
+        it.pendingChildExits = pendingChildExits
+    }
+
     override fun canWait(condition: WaitCondition): Boolean =
         condition == WaitCondition.EXITED || condition == WaitCondition.CHILD_EXITED
 

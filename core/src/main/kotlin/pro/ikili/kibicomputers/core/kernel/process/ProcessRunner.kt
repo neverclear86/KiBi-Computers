@@ -290,7 +290,7 @@ internal class ProcessRunner(private val machine: Machine) {
             scheduler.deactivate(rt)
         }
         enqueueFuelWaitLocked(rt, threadless)
-        if (now != observedTick || (paused && !scheduler.isPaused)) scheduler.dispatcher.signal()
+        if (now != observedTick || (paused && !scheduler.isPausedFor(machine))) scheduler.dispatcher.signal()
         return null
     }
 

@@ -69,6 +69,12 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.machine.isFatal
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.ColdBootReason
+import pro.ikili.kibicomputers.core.persist.KernelStateCopy
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.QuiesceHandle
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -80,6 +86,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
@@ -418,6 +425,98 @@ public class Machine private constructor(
 
     /** 起動の手順が動いている（[boot] を受け付けてから、init を作るか、失敗・取り消しで終わるまで） */
     public val isBooting: Boolean get() = bootingValue
+
+    // ---- 待機点保存（#81、ADR 0081） ----
+
+    /** [quiesce] の数（0 より大きい間は、スケジューラがこのマシンに新しい step を割り当てない） */
+    private val quiesceCount = AtomicInteger()
+
+    /** [quiesce] で止められている */
+    public val isQuiesced: Boolean get() = quiesceCount.get() > 0
+
+    /**
+     * このマシンだけを止める（#81）。スケジューラの `tryActivate` が、このマシンのプロセスに新しい step（と燃料）を割り当てなくなる。
+     * 走っている step は待機点（または燃料切れ）まで走る。返した [QuiesceHandle] の `close()` で続ける。重ねて呼んでもよい
+     * （すべて `close()` するまで止まる）。全体の一時停止（[MachineScheduler.pauseAll]）とは別に働く。どのスレッドから呼んでもよい。待たない
+     */
+    public fun quiesce(): QuiesceHandle {
+        quiesceCount.incrementAndGet()
+        return object : QuiesceHandle {
+            private val done = AtomicBoolean(false)
+
+            override val readiness: SaveReadiness get() = saveReadiness()
+
+            override fun close() {
+                if (done.compareAndSet(false, true)) endQuiesce()
+            }
+        }
+    }
+
+    private fun endQuiesce() {
+        if (quiesceCount.decrementAndGet() > 0) return
+        // 止めている間に燃料待ちに入ったものを起こす（ディスパッチャーも見直す）
+        lock.withLockValue { wakeFuelWaitersLocked() }
+        scheduler.dispatcher.signal()
+    }
+
+    /**
+     * 今保存できるか（#81）。起動中・再起動の待ちなら [SaveReadiness.TRANSIENT]。そうでなければ、プロセスの判定のうち
+     * TRANSIENT があれば TRANSIENT、UNSAVEABLE があれば UNSAVEABLE、どちらもなければ READY（プロセスがなくても READY）
+     */
+    public fun saveReadiness(): SaveReadiness = lock.withLockValue { saveReadinessLocked() }
+
+    private fun saveReadinessLocked(): SaveReadiness {
+        if (bootingValue || rebootRequested || rebootNotified) return SaveReadiness.TRANSIENT
+        var result = SaveReadiness.READY
+        for (process in kernel.processes.all()) {
+            when (processReadinessLocked(process)) {
+                SaveReadiness.TRANSIENT -> return SaveReadiness.TRANSIENT
+                SaveReadiness.UNSAVEABLE -> result = SaveReadiness.UNSAVEABLE
+                SaveReadiness.READY -> {}
+            }
+        }
+        return result
+    }
+
+    /** プロセス1つの判定（[isAtWaitPointLocked] が真なら READY。待機点型は TRANSIENT、ブロッキング型は UNSAVEABLE） */
+    private fun processReadinessLocked(process: Process): SaveReadiness = when {
+        isAtWaitPointLocked(process) -> SaveReadiness.READY
+        process.kind == ProcessKind.WAIT_POINT -> SaveReadiness.TRANSIENT
+        else -> SaveReadiness.UNSAVEABLE
+    }
+
+    /**
+     * カーネルの状態の写しを取る（#81）。カーネルロックの中で写し（[pro.ikili.kibicomputers.core.persist.KernelStateCopy]）を作り、
+     * 元のマシンは止めない・変えない。
+     *
+     * - [CapturePolicy.SKIP_IF_TRANSIENT] で [SaveReadiness.TRANSIENT] なら `null`（自動保存は前の世代を残す）
+     * - そうでなければ必ず写しを返す。`UNSAVEABLE` のプロセス（[CapturePolicy.KILL_TRANSIENT] なら `TRANSIENT` のものも）は、
+     *   写しの中でだけ `SIGKILL` で殺し、殺した pid を記録する
+     * - マシン全体が TRANSIENT（起動中・再起動の待ち）で [CapturePolicy.KILL_TRANSIENT] なら、殺さずにそのまま写し、
+     *   冷えた起動の理由（[ColdBootReason.REBOOT_PENDING]、なければ [ColdBootReason.BOOTING]）を立てる
+     */
+    public fun captureSnapshot(policy: CapturePolicy): MachineSnapshotSource? = captureCopy(policy)?.toSource()
+
+    /** [captureSnapshot] の写しそのもの（テストと #82 用） */
+    internal fun captureCopy(policy: CapturePolicy): KernelStateCopy? = lock.withLockValue {
+        val wholeTransient = bootingValue || rebootRequested || rebootNotified
+        if (policy == CapturePolicy.SKIP_IF_TRANSIENT && saveReadinessLocked() == SaveReadiness.TRANSIENT) return@withLockValue null
+        val hostWaits = HashMap<Int, IntArray>()
+        for ((pid, rt) in runtimes) if (rt.hostWaits.isNotEmpty()) hostWaits[pid] = rt.hostWaits.keys.toIntArray()
+        val copy = KernelStateCopy.of(kernel, kernel.clocks.snapshot(environment.clock, scheduler.now), hostWaits)
+        if (wholeTransient) {
+            copy.markColdBoot(if (rebootRequested || rebootNotified) ColdBootReason.REBOOT_PENDING else ColdBootReason.BOOTING)
+        } else {
+            for (process in kernel.processes.all()) {
+                when (processReadinessLocked(process)) {
+                    SaveReadiness.UNSAVEABLE -> copy.killInCopy(process.pid)
+                    SaveReadiness.TRANSIENT -> if (policy == CapturePolicy.KILL_TRANSIENT) copy.killInCopy(process.pid)
+                    SaveReadiness.READY -> {}
+                }
+            }
+        }
+        copy
+    }
 
     /** 最後に受け付けた [boot] の設定（[reboot] と、[MachineHost.onRebootRequested] の既定の実装が使う）。まだなければ `null` */
     public val lastBootConfig: BootConfig? get() = lastBootConfigValue
@@ -1440,7 +1539,7 @@ public class Machine private constructor(
      * 起こすだけで燃料は渡さない（渡すのは、起こされたプロセスが CPU を取るとき）。起こした数を返す。
      */
     internal fun wakeFuelWaitersLocked(): Int {
-        if (fuelWaiters.isEmpty() || scheduler.isPaused) return 0
+        if (fuelWaiters.isEmpty() || scheduler.isPausedFor(this)) return 0
         val hasFuel = fuelAccount.estimate(scheduler.now) > 0
         val n = fuelWaiters.size
         val start = Math.floorMod(fuelRotation++, n)

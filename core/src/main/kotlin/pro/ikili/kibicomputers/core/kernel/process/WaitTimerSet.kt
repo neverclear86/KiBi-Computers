@@ -51,6 +51,12 @@ internal class WaitTimerSet {
     /** 入っている ID の写し */
     fun toIntArray(): IntArray = ids?.copyOf(size) ?: IntArray(0)
 
+    /** 同じ ID を入れた別のインスタンス（保存の写し。#81） */
+    fun copyForSnapshot(): WaitTimerSet = WaitTimerSet().also { copy ->
+        copy.ids = ids?.copyOf()
+        copy.size = size
+    }
+
     /** 空にする */
     fun clear() {
         size = 0
