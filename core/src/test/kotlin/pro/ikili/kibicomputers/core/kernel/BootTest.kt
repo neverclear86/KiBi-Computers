@@ -656,7 +656,9 @@ class BootTest {
         assertEquals(0, copy.processes.size)
         assertEquals(emptyList<Int>(), copy.killedPids)
         release.countDown()
-        tickUntil { m.state == MachineState.RUNNING && !m.isBooting }
+        // 起動が終わった直後の init は、まだ CPU を取っていない（CREATED）ことがある。CREATED は待機点（_start からやり直せる）なので
+        // 写しの中で殺さない。CPU を取って動き出す（CREATED でなくなる）まで待つ（#542）
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && process(1)?.state.let { it != null && it != ProcessState.CREATED } }
         // 計算し続ける init は待機点に来ないので、写しの中で殺し、理由は INIT_KILLED
         val running = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
         assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.INIT_KILLED, running.coldBootReason)
