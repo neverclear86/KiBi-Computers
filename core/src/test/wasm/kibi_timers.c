@@ -171,8 +171,8 @@ static int run_queue(void) {
         printf("event %.*s [%.*s]", (int)e->kind.len, (const char *)e->kind.ptr, (int)e->source.len, (const char *)e->source.ptr);
         for (uint32_t j = 0; j < e->values.len; j++) {
             const kibi_event_value_t *v = &e->values.ptr[j];
-            if (v->tag == KIBI_EVENT_VALUE_S64) {
-                printf(" s64:%lld", (long long)v->val.s64);
+            if (v->tag == KIBI_EVENT_VALUE_INTEGER) {
+                printf(" integer:%lld", (long long)v->val.integer);
             } else {
                 printf(" ?%u", v->tag);
             }

@@ -58,6 +58,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     internal var fallbackBootDisk: String = TestComputerWiring.OS_BOOT_DISK
 
+    /** ケースに入っているスピーカー（`kibicomputers:speaker`）のデバイスの address（#65）。最初に使うときに作り、セーブデータの [SPEAKER_ADDRESS_TAG] に書く */
+    val speakerAddress: String get() = speakerSlot.get()
+
+    private val speakerSlot = DeviceAddressSlot(SPEAKER_ADDRESS_TAG) { setChanged() }
+
     // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
     private val installedForBoot = TestComputerWiring.withBootPart(tier, parts.installed)
 
@@ -90,7 +95,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (machine == null) {
             wiring.disconnect()
         } else if (machine !== before) {
-            wiring.connect(level, blockPos, machine, boot)
+            wiring.connect(level, blockPos, machine, speakerAddress, boot)
         }
         return status
     }
@@ -142,11 +147,13 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     override fun saveAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
         super.saveAdditional(tag, registries)
         tag.put(PARTS_TAG, parts.serializeNBT(registries))
+        speakerSlot.save(tag)
     }
 
     override fun loadAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
         super.loadAdditional(tag, registries)
         if (tag.contains(PARTS_TAG, Tag.TAG_COMPOUND.toInt())) parts.deserializeNBT(registries, tag.getCompound(PARTS_TAG))
+        speakerSlot.load(tag)
     }
 
     override fun getDisplayName(): Component = blockState.block.name
@@ -157,5 +164,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     companion object {
         /** セーブデータの部品のキー */
         const val PARTS_TAG: String = "Parts"
+
+        /** セーブデータの、スピーカーのデバイスの address のキー（#65） */
+        const val SPEAKER_ADDRESS_TAG: String = "SpeakerAddress"
     }
 }

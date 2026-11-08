@@ -1,0 +1,29 @@
+package kibi:device@0.1.0;
+
+/// つないでいるデバイスの一覧と呼び出し（#65。ADR 0065）。
+interface bus {
+    use types.{value, device-info, method-info, call-error};
+
+    /// つないでいるデバイスの一覧（待たない。接続を変えたときだけ作り直す一覧を読む）
+    list-devices: func() -> list<device-info>;
+
+    /// 開いたデバイス（`/dev/device/<address>` を開いたのと同じ。#54）
+    resource device {
+        /// address のデバイスを開く
+        open: static func(address: string) -> result<device, call-error>;
+        /// address と種類
+        info: func() -> device-info;
+        /// メソッドの一覧
+        methods: func() -> list<method-info>;
+        /// 呼んで、結果まで待つ
+        invoke: func(method: string, args: list<value>) -> result<list<value>, call-error>;
+        /// 待たずに積む（1プロセス 16 個まで。超えたら kernel(again)）
+        start: func(method: string, args: list<value>) -> result<pending-call, call-error>;
+    }
+
+    /// 待たずに積んだ呼び出し（p1 では fd。終わると読める）
+    resource pending-call {
+        /// 結果を受け取る。終わっていなければ none（待たない）
+        take: func() -> option<result<list<value>, call-error>>;
+    }
+}

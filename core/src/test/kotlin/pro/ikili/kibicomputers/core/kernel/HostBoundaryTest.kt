@@ -14,7 +14,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** カーネルと接続層の境界（#44）: 環境、通知（状態・コンソール・ビープ）、メインスレッドでのホスト呼び出し */
+/** カーネルと接続層の境界（#44）: 環境、通知（状態・コンソール・接続層への処理）、メインスレッドでのホスト呼び出し */
 class HostBoundaryTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -33,11 +33,6 @@ class HostBoundaryTest {
             threads += Thread.currentThread()
             log += "console:${String(bytes)}"
             synchronized(console) { console.write(bytes, 0, bytes.size) }
-        }
-
-        override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
-            threads += Thread.currentThread()
-            log += "beep:$frequencyHz/$durationMillis"
         }
     }
 
@@ -95,7 +90,7 @@ class HostBoundaryTest {
     }
 
     @Test
-    fun `コンソールとビープはtickの中でメインスレッドから、起きた順に配られ、続いたコンソールはまとまる`() = timeout(limit) {
+    fun `コンソールと積んだ処理はtickの中でメインスレッドから、起きた順に配られ、続いたコンソールはまとまる`() = timeout(limit) {
         Harness().use { h ->
             val host = RecordingHost()
             val m = h.machine(host = host)
@@ -106,9 +101,9 @@ class HostBoundaryTest {
                     b.host(ctx) { c, _, _ ->
                         c.writeConsole("he".toByteArray())
                         c.writeConsole("xllox".toByteArray(), 1, 3)
-                        c.beep(440, 100)
+                        m.postHostCallback { host.threads += Thread.currentThread(); host.log += "callback:1" }
                         c.writeConsole("!".toByteArray())
-                        c.beep(1, 1_000_000)
+                        m.postHostCallback { host.threads += Thread.currentThread(); host.log += "callback:2" }
                         LongArray(0)
                     }
                 }),
@@ -121,9 +116,9 @@ class HostBoundaryTest {
                 listOf(
                     "state:RUNNING",
                     "console:hello",
-                    "beep:440/100",
+                    "callback:1",
                     "console:!",
-                    "beep:${Machine.MIN_BEEP_FREQUENCY_HZ}/${Machine.MAX_BEEP_DURATION_MILLIS}",
+                    "callback:2",
                     "state:STOPPED",
                 ),
                 host.log.toList(),
@@ -175,15 +170,10 @@ class HostBoundaryTest {
             assertFalse(m.writeConsole(ByteArray(30) { 'b'.code.toByte() }))
             assertEquals(20, m.droppedConsoleBytes.get())
             assertFalse(m.writeConsole(byteArrayOf(1)))
-            repeat(MachineLimits.MAX_PENDING_BEEPS) { assertTrue(m.beep(440, 10)) }
-            assertFalse(m.beep(440, 10))
-            assertEquals(1, m.droppedBeeps.get())
             h.scheduler.tick()
             assertEquals(max, synchronized(host.console) { host.console.size() })
-            assertEquals(MachineLimits.MAX_PENDING_BEEPS, host.log.count { it.startsWith("beep:") })
             // 配った後はまた積める
             assertTrue(m.writeConsole(ByteArray(max)))
-            assertTrue(m.beep(440, 10))
         }
     }
 
@@ -197,10 +187,6 @@ class HostBoundaryTest {
                 }
 
                 override fun onConsoleOutput(machine: Machine, bytes: ByteArray): Unit = throw IllegalStateException("接続層のバグ")
-
-                override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
-                    log += "bad-beep"
-                }
             })
             val good = h.machine(host = object : MachineHost {
                 override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
@@ -210,11 +196,11 @@ class HostBoundaryTest {
                 }
             })
             bad.writeConsole("x".toByteArray())
-            bad.beep(440, 1)
+            bad.postHostCallback { throw IllegalStateException("接続層のバグ") }
+            bad.postHostCallback { log += "bad-callback" }
             good.writeConsole("y".toByteArray())
-            good.beep(440, 1) // 既定の実装は何もしない
             h.scheduler.tick()
-            assertEquals(listOf("bad-beep", "good-console"), log.toList())
+            assertEquals(listOf("bad-callback", "good-console"), log.toList())
         }
     }
 
@@ -307,18 +293,6 @@ class HostBoundaryTest {
             assertEquals(ProcessState.KILLED, m.stateOf(pid))
             assertEquals(0, m.pendingHostCalls)
             assertEquals(h.scheduler.config.maxConcurrentMachines, h.scheduler.permits.availablePermits())
-        }
-    }
-
-    @Test
-    fun `デバイスが変わったことはどのスレッドからでも知らせられる`() = timeout(limit) {
-        Harness().use { h ->
-            val m = h.machine()
-            assertEquals(0, m.devicesGeneration)
-            val threads = List(4) { Thread { repeat(100) { m.notifyDevicesChanged() } } }
-            threads.forEach { it.start() }
-            threads.forEach { it.join() }
-            assertEquals(400, m.devicesGeneration)
         }
     }
 }

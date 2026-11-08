@@ -334,10 +334,60 @@ class KibiWitTableTest {
         return out
     }
 
+    @Test
+    fun `src_main_witのWITはどれもpackage行を持ち、置き場とパッケージ名が合い、パッケージごとにworld importsがある`() {
+        val pkgRe = Regex("""(?m)^\s*package\s+kibi:([a-z0-9-]+)@0\.1\.0\s*;""")
+        for (f in witFiles()) {
+            val m = pkgRe.find(f.readText())
+            assertTrue(m != null, "${f.path} に package kibi:<pkg>@0.1.0; の行がない（KibiWitTableTest の derived・unresolvedUses の前提）")
+            assertEquals("kibi-${m!!.groupValues[1]}", f.parentFile.name, "${f.path}: 置き場 kibi-<pkg>/ とパッケージ名が合わない")
+        }
+        val dirs = File("src/main/wit").listFiles { d -> d.isDirectory }.orEmpty()
+        assertTrue(dirs.isNotEmpty())
+        for (d in dirs) {
+            val text = d.listFiles { f -> f.extension == "wit" }.orEmpty().joinToString("\n") { it.readText() }
+            assertTrue(Regex("""(?m)^\s*world\s+imports\s*\{""").containsMatchIn(text), "${d.name} に world imports がない（ADR 0073）")
+        }
+    }
+
+    @Test
+    fun `src_main_witには%で逃がした識別子がない`() {
+        val escaped = Regex("""%([a-z][a-z0-9-]*)""")
+        val found = witFiles().flatMap { f ->
+            f.readLines().map { it.substringBefore("//") }.flatMap { line -> escaped.findAll(line).map { f.name to it.groupValues[1] }.toList() }
+        }.toSet()
+        assertEquals(ESCAPED_ALLOWED, found, "WIT のキーワードに当たらない名前を選ぶ（ADR 0073）。逃がすときは ADR に理由を書いて ESCAPED_ALLOWED に足す")
+    }
+
+    /** [text] の中の variant [name] の case 名（並び順） */
+    private fun variantCases(text: String, name: String): List<String> {
+        val body = Regex("""variant\s+$name\s*\{([^}]*)}""").find(text.lines().joinToString("\n") { it.substringBefore("//") })
+        checkNotNull(body) { "variant $name がない" }
+        return body.groupValues[1].split(",").map { it.trim().substringBefore("(").trim() }.filter { it.isNotEmpty() }
+    }
+
+    @Test
+    fun `kibi_deviceのvalueとkibi_kernelのevent-valueはnoneを除いて同じcase名の並び`() {
+        val value = variantCases(witText("kibi-device/types.wit"), "value")
+        val event = variantCases(witText("kibi-kernel/events.wit"), "event-value")
+        assertEquals(listOf("integer", "float", "boolean", "text", "bytes"), event)
+        assertEquals(listOf("none") + event, value)
+    }
+
+    @Test
+    fun `kibi_deviceはWITを置くだけで、p1にはまだ出さない`() {
+        val device = derived().filter { it.first.startsWith("kibi:device/") }.toSet()
+        assertTrue(("kibi:device/bus@0.1.0" to "list-devices") in device, device.toString())
+        assertTrue(("kibi:device/bus@0.1.0" to "[method]pending-call.take") in device, device.toString())
+        // WASM に出すのは #77。それまでは p1 の表に入れない（入れたら、上の p1 の検査が対象にする）
+        assertFalse(WasiP1Kibi.modules.any { it.startsWith("kibi:device/") })
+    }
+
     private companion object {
         /**
          * WIT のキーワード（wit-parser の字句解析 `crates/wit-parser/src/ast/lex.rs` の `keyword`）。
-         * 識別子に使うときは `%` を付ける（例: `events.wit` の `%s64`）
+         * `kibi:*` では、識別子にキーワードを使わない名前を選ぶ（ADR 0073）。どうしても使うときだけ `%` を付け（例: 引数名の `%from`）、
+         * 理由を ADR に書いて [ESCAPED_ALLOWED] に足す
          *
          * `KibiWitParseTest` が使う wasm-tools 1.256.0（Endive 1.2.0 の `run.endive:wasm-tools` が同梱する版）の
          * lex.rs と突き合わせた。Endive を上げて同梱の wasm-tools が変わったら、その版の lex.rs と見比べて直す。
@@ -350,5 +400,11 @@ class KibiWitTableTest {
             "own", "borrow", "list", "map", "option", "result", "tuple", "future", "stream", "error-context",
             "string", "char", "bool", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f32", "f64", "float32", "float64", "_",
         )
+
+        /**
+         * `src/main/wit/` で `%` で逃がしてよい識別子（ファイル名 → 識別子）。今はない（ADR 0073。#65 で `event-value` の
+         * case 名を、逃がさずに済む名前に改名した）。足すときは、改名すると意味が変わる・WASI の同じ概念と名前が食い違う理由を ADR に書く
+         */
+        val ESCAPED_ALLOWED: Set<Pair<String, String>> = emptySet()
     }
 }

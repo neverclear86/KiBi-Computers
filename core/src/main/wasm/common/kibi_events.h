@@ -28,18 +28,18 @@ typedef struct {
     uint32_t len;
 } kibi_list_u8_t;
 
-#define KIBI_EVENT_VALUE_S64 0
-#define KIBI_EVENT_VALUE_F64 1
-#define KIBI_EVENT_VALUE_BOOL 2
+#define KIBI_EVENT_VALUE_INTEGER 0
+#define KIBI_EVENT_VALUE_FLOAT 1
+#define KIBI_EVENT_VALUE_BOOLEAN 2
 #define KIBI_EVENT_VALUE_TEXT 3
 #define KIBI_EVENT_VALUE_BYTES 4
 
-// variant event-value（16 バイト、align 8）
+// variant event-value（16 バイト、align 8）。case の名前は WIT と同じ（#65 で s64・f64・bool から改名した）
 typedef struct {
     uint8_t tag;
     union {
-        int64_t s64;
-        double f64;
+        int64_t integer;
+        double floating; // float は C のキーワードなので floating（WIT の case は float）
         uint8_t boolean;
         kibi_string_t text;
         kibi_list_u8_t bytes;

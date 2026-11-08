@@ -31,7 +31,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
-| `kibi:device` | — | デバイスの列挙と操作 | #77 |
+| `kibi:device` | `types`・`bus` | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。WASM に出すのは #77） | #65・#77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | — | 電源（停止・再起動） | #306 |
@@ -41,7 +41,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 
 ### WIT の書き方（#75 で追記）
 
-- 識別子（interface・関数・型の名前、引数名、フィールド名、case 名）が WIT のキーワード（`from`・`use`・`type`・`stream`・`s64` など。wit-parser の字句解析のもの）に当たるなら、`%` で逃がす（`events.wit` の `%s64`）か改名する。名前は p1 の import の関数名・モジュール名に出ることがあるので、改名で済むなら改名を選ぶ（引数名は出ない）
+- 識別子（interface・関数・型の名前、引数名、フィールド名、case 名）が WIT のキーワード（`from`・`use`・`type`・`stream`・`s64` など。wit-parser の字句解析のもの）に当たらない名前を選ぶ（`kibi:*` の識別子すべて）。`%` で逃がすのは、改名すると意味が変わる・WASI の同じ概念と名前が食い違うときだけで、その理由を ADR に書く。variant の case 名は payload の型名ではなく「値の種類」の言葉（`integer`・`text` など）にする（#65 で強めた。`KibiWitTableTest` が `%` の識別子を落とす。許す一覧は空）
 - 新しい WIT は `KibiWitParseTest` が wasm-tools（`wasm-tools component wit`。Endive の `run.endive:wasm-tools`。テストだけの依存）で解析・解決する。`src/main/wit/` のパッケージのディレクトリをすべて対象にするので、パッケージを足せば自動で対象になる。ほかの `kibi:*` のパッケージと、テストのリソースの `wit-stubs/`（`wasi:*` の最小のスタブ）を `deps/` に置いて解決する
 - パッケージをまたぐ `use`（例: `kibi:process` から `kibi:kernel/types`）のために、`src/main/wit/` に `deps/` も symlink も置かない。参照先は `KibiWitTableTest` がテキストで確かめる（#74 で追記。ADR 0074）
 - `KibiWitTableTest` は、予約語の識別子をテキストで拾う検査（速く分かりやすく失敗させるための補助）も持つ
@@ -80,7 +80,7 @@ WASIX の名前と形には揃えない（WASI p1・p2・p3 と `kibi:*` の WIT
 ```wit
 interface events {
     use types.{error-code};
-    variant event-value { %s64(s64), %f64(f64), %bool(bool), text(string), bytes(list<u8>) }
+    variant event-value { integer(s64), float(f64), boolean(bool), text(string), bytes(list<u8>) }
     record event { kind: string, source: string, values: list<event-value> }
     record event-batch { events: list<event>, dropped: u64 }
     resource event-queue {
@@ -90,6 +90,7 @@ interface events {
 }
 ```
 
+- #65 で `event-value` の case 名を `%s64`・`%f64`・`%bool` から `integer`・`float`・`boolean` に改名した（case 名は Canonical ABI に出ないので、ABI・保存形式は変わらない）
 - `kind` は `KernelEvent.type`、`source` はなければ ""、`dropped` は前回の取り出しからあふれて捨てた数（ADR 0063）
 - `open`: `kinds` が空ならすべての種類。`capacity` を省くと既定（仮の値 64。確定は #251）
 - `take`: 待たずに最大 `max` 個。`max` は符号なしで読み、0 だけが `invalid`。`Int.MAX_VALUE` で頭打ち（2^31 以上は「全部」）

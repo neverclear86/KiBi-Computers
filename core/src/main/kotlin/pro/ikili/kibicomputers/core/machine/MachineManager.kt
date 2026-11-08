@@ -237,11 +237,6 @@ internal class ManagedHost<K : Any>(
         guarded("onConsoleOutput") { delegate.onConsoleOutput(machine, bytes) }
     }
 
-    override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
-        if (released) return
-        guarded("onBeep") { delegate.onBeep(machine, frequencyHz, durationMillis) }
-    }
-
     override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
         if (released) return
         guarded("onBootFailed") { delegate.onBootFailed(machine, failure, detail) }

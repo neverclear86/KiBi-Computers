@@ -1,5 +1,14 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.CallError
+import pro.ikili.kibicomputers.core.device.CallResult
+import pro.ikili.kibicomputers.core.device.DeviceCallException
+import pro.ikili.kibicomputers.core.device.DeviceDispatcher
+import pro.ikili.kibicomputers.core.device.DeviceHandle
+import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.device.DeviceLimits
+import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
@@ -1171,7 +1180,68 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun writeConsole(bytes: ByteArray, offset: Int, length: Int): Boolean = machine.writeConsole(bytes, offset, length)
 
-        override fun beep(frequencyHz: Int, durationMillis: Int): Boolean = machine.beep(frequencyHz, durationMillis)
+        override fun listDevices(): List<DeviceInfo> = machine.devices.list()
+
+        override fun openDevice(address: String): Int {
+            checkThread()
+            val attached = machine.devices.find(address) ?: throw DeviceCallException(CallError.Detached)
+            return lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                FdTable(rt.process, machine.kernel.objects, machine.wakeSink).open(DeviceHandle(attached.address, attached.kind), HandleRights.READ)
+            }
+        }
+
+        override fun invokeDevice(address: String, method: String, args: List<DeviceValue>): List<DeviceValue> {
+            checkThread()
+            // メインスレッドのメソッドを待てるのはブロッキング型だけ（積む前に確かめる）
+            if (machine.devices.find(address)?.methods?.find(method)?.mainThread == true) checkMayBlock("invokeDevice")
+            val started = machine.devices.dispatcher.start(rt.pid, address, method, args)
+            payDeviceFuel(started.fuel)
+            val future = started.future
+            if (!future.isDone) {
+                try {
+                    awaitHost(future)
+                } catch (e: ProcessKilledException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 結果は下で future から読む
+                }
+            }
+            return when (val result = DeviceDispatcher.resultOf(future)) {
+                is CallResult.Values -> {
+                    payDeviceFuel(DeviceLimits.payloadBytes(result.values) * DeviceLimits.FUEL_PER_BYTE)
+                    result.values
+                }
+                is CallResult.Error -> throw DeviceCallException(result.error)
+            }
+        }
+
+        override fun startDeviceCall(address: String, method: String, args: List<DeviceValue>): Int {
+            checkThread()
+            val (fd, obj) = lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                machine.openPendingDeviceCallLocked(rt.pid, PendingDeviceCall.State.Queued(address, method, args.toList()))
+            }
+            payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj))
+            return fd
+        }
+
+        override fun takeDeviceCall(fd: Int): CallResult? {
+            checkThread()
+            val result = lock.withLockValue {
+                val obj = FdTable(rt.process, machine.kernel.objects, machine.wakeSink).objectOf(fd) as? PendingDeviceCall
+                    ?: fsError(Errno.BADF, "fd $fd は pending-call でない")
+                obj.result
+            }
+            if (result is CallResult.Values) payDeviceFuel(DeviceLimits.payloadBytes(result.values) * DeviceLimits.FUEL_PER_BYTE)
+            return result
+        }
+
+        /** デバイスの呼び出しの燃料を、手持ちがあれば払う（手持ちがない呼び出し元では払わない。flushConsole と同じ） */
+        private fun payDeviceFuel(amount: Long) {
+            if (amount <= 0 || rt.process.unmetered) return
+            lock.withLockValue { rt.currentHolder?.let { it.fuel -= amount } }
+        }
 
         override fun requestShutdown() = machine.stop()
 

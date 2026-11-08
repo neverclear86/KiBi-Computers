@@ -1,0 +1,8 @@
+package kibi:device@0.1.0;
+
+/// p1 のゲスト向け（wasi:* を参照しない）。`kibi:device` の interface をまとめて import する
+/// （ゲストがコンポーネントにするとき・`component embed` に使う）。p2・p3 向けは #77 で置く
+world imports {
+    import types;
+    import bus;
+}

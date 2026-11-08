@@ -140,7 +140,7 @@ class WasiP1TimersTest {
     @Test
     fun `キューを渡して作ったタイマーはtagと回数のtimerイベントを届ける`() = both("queue") {
         val out = exited()
-        assertTrue("event timer [] s64:-42 s64:1\n" in out, out)
+        assertTrue("event timer [] integer:-42 integer:1\n" in out, out)
         assertTrue("timer read 0\n" in out, out)
     }
 

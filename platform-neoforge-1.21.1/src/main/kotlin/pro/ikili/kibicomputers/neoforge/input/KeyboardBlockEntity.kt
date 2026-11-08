@@ -1,11 +1,14 @@
 package pro.ikili.kibicomputers.neoforge.input
 
 import net.minecraft.core.BlockPos
+import net.minecraft.core.HolderLookup
+import net.minecraft.nbt.CompoundTag
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.input.KeyboardListener
+import pro.ikili.kibicomputers.neoforge.computer.DeviceAddressSlot
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.UUID
 
@@ -16,10 +19,15 @@ import java.util.UUID
  * つながる相手は1つだけ（#360）。先に [claim] した相手が、[release] するまで持つ。2つ目からは断る
  * （他人のキーボードの隣に置いたケースに、打ったものが漏れないように）。
  *
- * 状態は持たないので、セーブデータには何も書かない。
+ * セーブデータに書くのは、キーボードのデバイスの address（[deviceAddress]。#65）だけ。
  */
 class KeyboardBlockEntity(pos: BlockPos, state: BlockState) :
     BlockEntity(KiBiBlocks.KEYBOARD_BLOCK_ENTITY.get(), pos, state) {
+
+    /** キーボードのデバイス（`kibicomputers:keyboard`）の address（#65）。最初に使うときに作り、セーブデータの [DEVICE_ADDRESS_TAG] に書く */
+    val deviceAddress: String get() = addressSlot.get()
+
+    private val addressSlot = DeviceAddressSlot(DEVICE_ADDRESS_TAG) { setChanged() }
 
     /** つながった相手。いなければ null */
     var owner: KeyboardListener? = null
@@ -67,5 +75,20 @@ class KeyboardBlockEntity(pos: BlockPos, state: BlockState) :
     override fun setRemoved() {
         super.setRemoved()
         owner = null
+    }
+
+    override fun saveAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
+        super.saveAdditional(tag, registries)
+        addressSlot.save(tag)
+    }
+
+    override fun loadAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
+        super.loadAdditional(tag, registries)
+        addressSlot.load(tag)
+    }
+
+    companion object {
+        /** セーブデータの、キーボードのデバイスの address のキー（#65） */
+        const val DEVICE_ADDRESS_TAG: String = "DeviceAddress"
     }
 }

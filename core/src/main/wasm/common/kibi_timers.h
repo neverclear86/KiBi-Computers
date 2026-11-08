@@ -48,7 +48,7 @@ _Static_assert(sizeof(kibi_result_u64_t) == 16 && _Alignof(kibi_result_u64_t) ==
 _Static_assert(offsetof(kibi_result_u64_t, val) == 8, "result<u64> payload");
 
 // [static]timer.create(events: option<tuple<borrow<event-queue>, s64>>) -> result<timer, error-code>
-// events_is_some が 0 なら queue・tag は読まれない。1 なら鳴るたびに queue へ "timer" のイベント（値は s64(tag)・s64(回数)）を入れる
+// events_is_some が 0 なら queue・tag は読まれない。1 なら鳴るたびに queue へ "timer" のイベント（値は integer(tag)・integer(回数)）を入れる
 __attribute__((import_module("kibi:kernel/timers@0.1.0"), import_name("[static]timer.create")))
 void kibi_timer_create_raw(int32_t events_is_some, int32_t queue, int64_t tag, kibi_result_timer_t *ret);
 

@@ -54,9 +54,9 @@ class KibiEventsTest {
     fun `開いて取り出すと、受け取る種類だけが届き、あふれた数をdroppedで知らせる`() = inProcess { ctx, m ->
         val q = KibiEvents.open(ctx, listOf("a", "c"), 2)
         val values = listOf(
-            EventValue.I64(-1),
-            EventValue.F64(2.5),
-            EventValue.Bool(true),
+            EventValue.Integer(-1),
+            EventValue.Float(2.5),
+            EventValue.Boolean(true),
             EventValue.Text(""),
             EventValue.Text("\uD800x"),
             EventValue.Bytes(ByteArray(0)),

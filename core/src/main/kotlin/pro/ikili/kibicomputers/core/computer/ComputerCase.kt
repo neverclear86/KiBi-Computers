@@ -57,7 +57,7 @@ public enum class ComputerError {
  *
  * @param K マシンのキー（[MachineManager] と同じ）
  * @property tier ケースのティア
- * @param events マシンからの通知（状態、コンソールの出力、ビープ、起動の失敗、再起動）をそのまま受け取る相手。
+ * @param events マシンからの通知（状態、コンソールの出力、起動の失敗、再起動）をそのまま受け取る相手。
  *   ケース自身の処理（CRASHED でエラーにする）の後に呼ぶ。`null` なら渡さない（再起動の求めは、既定どおり前回の設定で起動し直す）
  */
 @ApiStatus.Internal
@@ -97,10 +97,6 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
         override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
             events?.onConsoleOutput(machine, bytes)
-        }
-
-        override fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {
-            events?.onBeep(machine, frequencyHz, durationMillis)
         }
 
         override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {

@@ -359,5 +359,5 @@ main a5356f9 で、標準 OS のマシン 1 台あたりのヒープが 0.135 Mi
 
 CI のランナーと同じ2コアで試すときは `./gradlew :platform-neoforge-1.21.1:runGameTestServer -PgameTestProcessors=2`（JVM に見せるコア数を絞る。CPU の枠は既定でコア数の半分なので、1つになる）。
 
-出力の処理がメインスレッドのロックの待ちにならないこと（#351）は、core の単体テスト（`MachineConsoleBudgetTest`: 書き手が表示デバイスの
+出力の処理がメインスレッドのロックの待ちにならないこと（#351）は、core の単体テスト（`ScreenDeviceBudgetTest`。#65 で `MachineConsoleBudgetTest` から改名した: 書き手が表示デバイスの
 ロックを持ったままでも、tick がそのロックを待たない）で確かめる。CI の機械の速さに左右される MSPT の差では確かめない。

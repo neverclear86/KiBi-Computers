@@ -53,5 +53,5 @@
 
 - `MachineHost.onConsoleOutput` のバイト列を、画面ごとの `AnsiTerminal.write` に渡す。接続層から使うには `public` にするか、`core` の側で画面とコンソールをつなぐ
 - 応答（DSR・DA）は `TerminalListener.reply` で返すので、`Machine.offerConsoleInput` に渡す
-- BEL は `TerminalListener.bell`。`MachineHost.onBeep` とつなぐかは接続のタスクで決める
+- BEL は `TerminalListener.bell`。#65 で `MachineHost.onBeep` を外し、ビープはスピーカーのデバイス（`SpeakerDevice`。ADR 0065）に移した。`SpeakerDevice` とつなぐかは接続のタスクで決める
 - カーソルの位置と表示は `cursorX`・`cursorY`・`cursorVisible`。描画（#139）と同期で使う

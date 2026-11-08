@@ -40,15 +40,15 @@ class EventQueueTest {
     fun `FIFOで取り出せ、maxで一部だけ取れる`() {
         val q = EventQueue(EventFilter.ALL).also { objects.add(it) }
         assertFalse(q.isReady(WaitCondition.READABLE))
-        for (i in 1..3) q.offer(ev("t", EventValue.I64(i.toLong())), sink)
+        for (i in 1..3) q.offer(ev("t", EventValue.Integer(i.toLong())), sink)
         assertTrue(q.isReady(WaitCondition.READABLE))
         assertFalse(q.isReady(WaitCondition.WRITABLE))
         assertTrue(q.canWait(WaitCondition.READABLE))
         assertFalse(q.canWait(WaitCondition.WRITABLE))
         val first = q.take(2)
-        assertEquals(listOf(1L, 2L), first.events.map { (it.values[0] as EventValue.I64).value })
+        assertEquals(listOf(1L, 2L), first.events.map { (it.values[0] as EventValue.Integer).value })
         assertEquals(1, q.size)
-        assertEquals(listOf(3L), q.take(10).events.map { (it.values[0] as EventValue.I64).value })
+        assertEquals(listOf(3L), q.take(10).events.map { (it.values[0] as EventValue.Integer).value })
         assertEquals(0, q.pendingBytes)
         assertTrue(q.take(1).isEmpty)
         assertThrows<IllegalArgumentException> { q.take(0) }
@@ -215,8 +215,8 @@ class EventQueueTest {
         assertThrows<IllegalArgumentException> { KernelEvent("あ".repeat(22)) }
         assertThrows<IllegalArgumentException> { KernelEvent("t", "s".repeat(EventLimits.MAX_SOURCE_BYTES + 1)) }
         KernelEvent("t", "s".repeat(EventLimits.MAX_SOURCE_BYTES))
-        assertThrows<IllegalArgumentException> { KernelEvent("t", "", List(EventLimits.MAX_VALUES + 1) { EventValue.Bool(true) }) }
-        KernelEvent("t", "", List(EventLimits.MAX_VALUES) { EventValue.Bool(true) })
+        assertThrows<IllegalArgumentException> { KernelEvent("t", "", List(EventLimits.MAX_VALUES + 1) { EventValue.Boolean(true) }) }
+        KernelEvent("t", "", List(EventLimits.MAX_VALUES) { EventValue.Boolean(true) })
         val half = EventLimits.MAX_PAYLOAD_BYTES / 2
         KernelEvent("t", "", listOf(EventValue.Text("a".repeat(half)), EventValue.Bytes(ByteArray(half))))
         assertThrows<IllegalArgumentException> {
@@ -232,7 +232,7 @@ class EventQueueTest {
         assertEquals(base, KernelEvent("t").footprint)
         assertEquals(base + EventLimits.OBJECT_OVERHEAD_BYTES + 3, KernelEvent("t", "src").footprint)
         for (n in listOf(1, 2, EventLimits.MAX_VALUES)) {
-            val e = KernelEvent("t", "", List(n) { EventValue.I64(it.toLong()) })
+            val e = KernelEvent("t", "", List(n) { EventValue.Integer(it.toLong()) })
             assertEquals(base + n * EventLimits.EVENT_VALUE_OVERHEAD_BYTES, e.footprint)
         }
         val text = KernelEvent("t", "", listOf(EventValue.Text("日本")))
@@ -240,7 +240,7 @@ class EventQueueTest {
         val bytes = KernelEvent("t", "", listOf(EventValue.Bytes(ByteArray(10))))
         assertEquals(base + EventLimits.EVENT_VALUE_OVERHEAD_BYTES + EventLimits.OBJECT_OVERHEAD_BYTES + 10, bytes.footprint)
         // MAX_VALUES 個の数値を持つイベントは、空のイベントより値の数 × 固定のコストだけ大きい
-        val numbers = KernelEvent("t", "", List(EventLimits.MAX_VALUES) { EventValue.F64(it.toDouble()) })
+        val numbers = KernelEvent("t", "", List(EventLimits.MAX_VALUES) { EventValue.Float(it.toDouble()) })
         assertTrue(numbers.footprint >= EventLimits.MAX_VALUES * EventLimits.EVENT_VALUE_OVERHEAD_BYTES)
     }
 
@@ -254,11 +254,11 @@ class EventQueueTest {
         assertEquals(2, b.toByteArray()[1])
         assertEquals(EventValue.Bytes(byteArrayOf(1, 2, 3)), b)
         assertNotEquals(EventValue.Bytes(byteArrayOf(1, 2)), b)
-        val values = arrayListOf<EventValue>(EventValue.I64(1))
+        val values = arrayListOf<EventValue>(EventValue.Integer(1))
         val e = KernelEvent("t", "", values)
-        values += EventValue.I64(2)
+        values += EventValue.Integer(2)
         assertEquals(1, e.values.size)
-        assertEquals(KernelEvent("t", "", listOf(EventValue.I64(1))), e)
+        assertEquals(KernelEvent("t", "", listOf(EventValue.Integer(1))), e)
     }
 
     @Test

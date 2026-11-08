@@ -157,8 +157,8 @@ static int run_resize(void) {
         printf("event %.*s [%.*s]", (int)e->kind.len, (const char *)e->kind.ptr, (int)e->source.len, (const char *)e->source.ptr);
         for (uint32_t j = 0; j < e->values.len; j++) {
             const kibi_event_value_t *v = &e->values.ptr[j];
-            if (v->tag == KIBI_EVENT_VALUE_S64) {
-                printf(" %lld", (long long)v->val.s64);
+            if (v->tag == KIBI_EVENT_VALUE_INTEGER) {
+                printf(" %lld", (long long)v->val.integer);
             } else {
                 printf(" ?%u", v->tag);
             }

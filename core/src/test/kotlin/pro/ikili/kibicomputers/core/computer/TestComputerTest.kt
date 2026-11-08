@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.computer
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.device.KeyboardDevice
+import pro.ikili.kibicomputers.core.device.ScreenDevice
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
@@ -18,9 +20,12 @@ import java.time.Duration
 import java.util.Collections
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** テスト用コンピューターの仮の結線（#307）: 同梱イメージ testboot（init は Lua の REPL。#315）からの起動と、[MachineConsole] */
+/** テスト用コンピューターの仮の結線（#307）: 同梱イメージ testboot（init は Lua の REPL。#315）からの起動と、画面・キーボードのデバイス（[ScreenDevice]・[KeyboardDevice]。#65） */
 class TestComputerTest {
     private val limit = Duration.ofSeconds(60)
+
+    private val screenAddress = "00000000-0000-4000-8000-0000000000a1"
+    private val keyboardAddress = "00000000-0000-4000-8000-0000000000a2"
 
     /** 同梱イメージ testboot の起動ディスク */
     private val testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot"
@@ -31,16 +36,14 @@ class TestComputerTest {
         sb.toString().trimEnd()
     }
 
-    /** ケースから、コンソールの出力を画面へ流す相手 */
-    private class ToScreen(val console: MachineConsole) : MachineHost {
+    /** ケースからの通知を記録する相手（コンソールの出力は、つないだ画面のデバイスに行く） */
+    private class Recorder : MachineHost {
         val states: MutableList<MachineState> = Collections.synchronizedList(ArrayList())
         val failures: MutableList<BootFailure> = Collections.synchronizedList(ArrayList())
 
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
             states += state
         }
-
-        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) = console.write(bytes)
 
         override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
             failures += failure
@@ -58,12 +61,14 @@ class TestComputerTest {
         val manager = MachineManager<String>()
         try {
             val screen = TextBuffer(60, 12)
-            val console = MachineConsole(screen, 2)
-            val host = ToScreen(console)
+            val console = ScreenDevice(screen, 2)
+            val keyboard = KeyboardDevice()
+            val host = Recorder()
             val case = ComputerCase<String>(CaseTier.BASIC, host)
             assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "pc", { true }, true, MachineConfig.DEFAULT))
             val machine = case.machine!!
-            console.machine = machine
+            machine.devices.attach(screenAddress, console)
+            machine.devices.attach(keyboardAddress, keyboard)
             assertTrue(machine.boot(BootConfig.builder().addBootDisk("missing").addBootDisk(testBootDisk).build()))
 
             manager.tickUntil({ "プロンプトが出ない: ${lines(screen)} ${host.failures}" }) { lines(screen).contains(">") }
@@ -72,28 +77,30 @@ class TestComputerTest {
             assertTrue(lines(screen).contains("KiBi test init: Lua REPL"), "${lines(screen)}")
 
             // キーボードの入力: 文字と Enter。KeyUp は何も送らない
-            assertEquals(10, console.keyboardInput(KeyboardEvent.Text("print(1+1)")))
-            assertEquals(0, console.keyboardInput(KeyboardEvent.KeyUp(Key.ENTER, 0)))
-            assertEquals(1, console.keyboardInput(KeyboardEvent.KeyDown(Key.ENTER, 0, false)))
+            assertEquals(10, keyboard.input(KeyboardEvent.Text("print(1+1)")))
+            assertEquals(0, keyboard.input(KeyboardEvent.KeyUp(Key.ENTER, 0)))
+            assertEquals(1, keyboard.input(KeyboardEvent.KeyDown(Key.ENTER, 0, false)))
             manager.tickUntil({ "結果が出ない: ${lines(screen)}" }) { lines(screen).contains("2") }
             assertTrue(lines(screen).contains("> print(1+1)"), "TTY のエコー: ${lines(screen)}")
 
             // 式はそのまま値が出る。次のプロンプトが出てから打つ（先に打つと、エコーがプロンプトより前に出て、行の並びが変わる）
             manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).last { it.isNotEmpty() } == ">" }
-            console.keyboardInput(KeyboardEvent.Paste("6*7\n"))
+            keyboard.input(KeyboardEvent.Paste("6*7\n"))
             manager.tickUntil({ "式の値が出ない: ${lines(screen)}" }) { lines(screen).contains("42") }
 
             // os.exit() で REPL（init）が終わり、マシンが止まる
             manager.tickUntil({ "次のプロンプトが出ない: ${lines(screen)}" }) { lines(screen).last { it.isNotEmpty() } == ">" }
-            console.keyboardInput(KeyboardEvent.Paste("os.exit()\n"))
+            keyboard.input(KeyboardEvent.Paste("os.exit()\n"))
             manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) { machine.state == MachineState.STOPPED }
             assertTrue(host.failures.isEmpty(), "${host.failures}")
 
             // 画面を消して、つなぎを外す
             console.reset()
             assertTrue(lines(screen).all { it.isEmpty() })
-            console.machine = null
-            assertEquals(0, console.keyboardInput(KeyboardEvent.Text("x")))
+            machine.devices.detach(screenAddress)
+            machine.devices.detach(keyboardAddress)
+            assertEquals(null, console.machine)
+            assertEquals(0, keyboard.input(KeyboardEvent.Text("x")))
             case.turnOff()
         } finally {
             assertTrue(manager.shutdown(10_000))

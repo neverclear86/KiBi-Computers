@@ -99,9 +99,9 @@ internal object P1Canonical {
     const val FD_ASSIGN_SIZE: Int = 12
 
     /** `event-value` の判別子 */
-    const val VALUE_S64: Int = 0
-    const val VALUE_F64: Int = 1
-    const val VALUE_BOOL: Int = 2
+    const val VALUE_INTEGER: Int = 0
+    const val VALUE_FLOAT: Int = 1
+    const val VALUE_BOOLEAN: Int = 2
     const val VALUE_TEXT: Int = 3
     const val VALUE_BYTES: Int = 4
 
@@ -382,16 +382,16 @@ internal object P1Canonical {
         // 判別子の後ろの詰め物も 0 にする（ゲストが読まない所でも、前の中身を残さない）
         memory.write(at, ByteArray(VALUE_SIZE))
         when (v) {
-            is EventValue.I64 -> {
-                memory.writeU8(at, VALUE_S64)
+            is EventValue.Integer -> {
+                memory.writeU8(at, VALUE_INTEGER)
                 memory.writeI64(at + 8, v.value)
             }
-            is EventValue.F64 -> {
-                memory.writeU8(at, VALUE_F64)
+            is EventValue.Float -> {
+                memory.writeU8(at, VALUE_FLOAT)
                 memory.writeI64(at + 8, java.lang.Double.doubleToRawLongBits(v.value))
             }
-            is EventValue.Bool -> {
-                memory.writeU8(at, VALUE_BOOL)
+            is EventValue.Boolean -> {
+                memory.writeU8(at, VALUE_BOOLEAN)
                 memory.writeU8(at + 8, if (v.value) 1 else 0)
             }
             is EventValue.Text -> {
