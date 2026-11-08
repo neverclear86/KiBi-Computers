@@ -10,13 +10,14 @@ export const meta = {
     { title: 'Review', detail: '正しさ・ルール違反のレビュー、公開 API の Java 相互運用レビュー、指摘の検証' },
     { title: 'Fix', detail: '確かな指摘を直して CI を待ち直す' },
     { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする（merge: false なら飛ばす）' },
-    { title: 'Report', detail: 'PR に結果をまとめ、人の確認が要れば質問して needs-human を付ける。worktree を片付ける' },
+    { title: 'Report', detail: 'PR に結果をまとめる。人の確認が要るものは Fable が前提と推奨を確かめてから質問して needs-human を付ける。worktree を片付ける' },
   ],
 }
 
 // 開発フロー（#242）。
 // 選択 → (プラン) → 実装ループ → CI → レビュー → 修正 → マージ → 報告。最終確認の段階は置かない。
-// 人の確認が要るものは Issue / PR にコメントで質問して needs-human ラベルを付け、返り値の questions にも入れる
+// 人の確認が要るものは、まず別のモデル（Fable）が前提と推奨を確かめ（escalate）、エージェントで直せるなら直して進む。
+// それでも人の判断が要るものは Issue / PR にコメントで質問して needs-human ラベルを付け、返り値の questions にも入れる
 // （起動したセッションがチャットでユーザーに聞く）。
 // モデル: 判断の重い段階は Opus、定型の段階は Sonnet / Haiku。
 const REPO = 'neverclear86/KiBi-Computers'
@@ -42,6 +43,7 @@ const M = {
   verify: { model: 'opus', effort: 'medium' },
   merge: { model: 'sonnet', effort: 'medium' },
   report: { model: 'haiku', effort: 'low' },
+  crossCheck: { model: 'fable', effort: 'high' },
 }
 
 // ---- 並行制御 ----
@@ -191,6 +193,18 @@ const MERGE_SCHEMA = {
   required: ['status', 'reason'],
 }
 
+const CROSS_CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    needsHuman: { type: 'boolean', description: '本当に人の判断が要るか（AGENTS.md で人が決める4つ、未決の decision、エージェントには直せない問題）' },
+    premiseSound: { type: 'boolean', description: '論点の前提（何が問題か、なぜ止まったか）が正しいか' },
+    findings: { type: 'string', description: '確かめた結果。前提の誤り、推奨の妥当性、見落とした選択肢を、根拠（ファイル・行、仕様の URL）付きで書く' },
+    question: { type: ['string', 'null'], description: 'needsHuman のとき、人に出す論点・選択肢・推奨（確かめた結果で直したもの）。それ以外は null' },
+    guidance: { type: ['string', 'null'], description: 'needsHuman でないとき、エージェントが人を待たずに進めるための具体的な直し方。それ以外は null' },
+  },
+  required: ['needsHuman', 'premiseSound', 'findings', 'question', 'guidance'],
+}
+
 // ---- 各段階 ----
 
 async function select() {
@@ -211,14 +225,28 @@ async function select() {
 
 async function plan(info) {
   let prev = null
-  for (let round = 1; round <= 2; round++) {
+  // 人に聞く前の確かめ（crossCheck）が「エージェントで直せる」と返したときの直し方。1回だけ使う
+  let guidance = null
+  let guided = false
+  const MAX_PLAN_ROUNDS = 2
+  for (let round = 1; round <= MAX_PLAN_ROUNDS + (guided ? 1 : 0); round++) {
+    const fixes = [
+      ...(prev ? [`前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}`] : []),
+      ...(guidance ? [`人に聞く前の確かめで示された直し方（これに従う）:\n${guidance}`] : []),
+    ]
+    guidance = null
     const p = await agent(
       `${REPO} の Issue #${info.number}「${info.title}」の実装プランを書き、Issue にコメントとして投稿する。コードは変更しない。
 プランには、変更するファイル、公開する型とシグネチャ（Java から見た形を含む）、データ形式、テスト方針、そして「このプランで決めること」を明記する。
-ABI・保存形式・公開 API について、\`decision\` Issue で決まっていない選択が必要なら、勝手に決めずに status=blocked とし、論点と選択肢を Issue にコメントする。それ以外の細かい設計はプランの中で決めてよい。${prev ? `\n前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}` : ''}`,
+ABI・保存形式・公開 API について、\`decision\` Issue で決まっていない選択が必要なら、勝手に決めずに status=blocked とし、reason に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。それ以外の細かい設計はプランの中で決めてよい。${fixes.length ? `\n${fixes.join('\n')}` : ''}`,
       { label: `plan:#${info.number}#${round}`, phase: 'Plan', schema: PLAN_SCHEMA, ...M.plan },
     )
-    if (!p || p.status !== 'planned') return { ok: false, reason: p?.reason ?? 'プランを作れなかった' }
+    if (!p) return { ok: false, reason: 'プランを作れなかった' }
+    if (p.status !== 'planned') {
+      const e = await escalate('issue', info.number, p.reason ?? 'プランを作れなかった', 'プランを書く段階で、決まっていない選択に当たって止まった', !guided)
+      if (e.guidance) { guidance = e.guidance; guided = true; continue }
+      return { ok: false, reason: e.question }
+    }
     const r = await agent(
       `${REPO} の Issue #${info.number} のプランをレビューする。AGENTS.md のルール、関連する \`decision\` Issue の結論、既存のコードと突き合わせる。コードは変更しない。
 - must: このままでは実装してはいけない問題
@@ -232,37 +260,72 @@ ${p.plan}`,
     if (r.verdict === 'approve') return { ok: true, plan: p.plan }
     if (r.verdict === 'needs_human') {
       const question = `次の設計の選択は decision で決まっていないため、判断してほしい:\n${r.undecided.map(u => `- ${u}`).join('\n')}`
-      await askHuman('issue', info.number, question)
-      return { ok: false, reason: question }
+      const e = await escalate('issue', info.number, question, `プランのレビューが、決まっていない選択を見つけた。プラン:\n${p.plan}`, !guided)
+      if (e.guidance) { guidance = e.guidance; guided = true; prev = null; continue }
+      return { ok: false, reason: e.question }
     }
     prev = r
+    if (round >= MAX_PLAN_ROUNDS + (guided ? 1 : 0)) {
+      const question = `プランが${round}ラウンドで承認されなかった。残った問題:\n${r.must.map(m => `- ${m}`).join('\n')}`
+      const e = await escalate('issue', info.number, question, `プランのレビューの must が直らなかった。最後のプラン:\n${p.plan}`, !guided)
+      if (e.guidance) { guidance = e.guidance; guided = true; continue }
+      return { ok: false, reason: e.question }
+    }
   }
-  const question = `プランが2ラウンドで承認されなかった。残った問題:\n${prev.must.map(m => `- ${m}`).join('\n')}`
-  await askHuman('issue', info.number, question)
-  return { ok: false, reason: question }
+  return { ok: false, reason: 'プランが承認されなかった' }
 }
 
-// 人の確認が要るとき、Issue か PR にコメントで質問し、needs-human ラベルを付ける
+// 人に聞く前に、別のモデル（Fable）が論点を確かめる。前提が間違っていないか、推奨が妥当か、
+// そもそも人の判断が要るものか。エージェントで直せるなら直し方（guidance）を返し、人には聞かない。
+// 人に聞くときは、確かめた結果で直した論点を投稿する
+async function escalate(kind, number, question, context, canResolve) {
+  const label = `${kind === 'pr' ? 'PR' : 'Issue'} #${number}`
+  const c = await agent(
+    `${REPO} の ${label} で、自動の開発フローが人に質問して止まろうとしている。質問を出す前に、別の目で確かめる。コードとリポジトリは変更せず、Issue・PR にも書き込まない。
+${label} の本文と、オーナー・共同作業者のコメント（\`authorAssociation\` が OWNER / MEMBER / COLLABORATOR）、関連する ADR（\`docs/adr/\`）・\`decision\` Issue・コードを実際に読んで、次を確かめる:
+1. 前提: 「何が問題で、なぜ止まったか」は事実として正しいか。指摘が既存のコードや仕様の読み違い、命題の立て方そのものの誤り（問題の切り分けが違う、別の名前・別の設計なら論点が消える、など）になっていないか。
+2. 推奨: 示された選択肢と推奨は妥当か。見落とした選択肢はないか。外部の仕様（WASI・Component Model など）や、リポジトリの既存の決まり（ADR）と食い違っていないか。
+3. 人の判断が要るか: AGENTS.md で人が決めるもの（システムコールの ABI、保存形式、公開 API、ゲームバランスの最終値）や未決の \`decision\` に当たるか。オーナーがすでに回答している内容で決まらないか。プランや実装の書き漏れ・作業の誤りのように、エージェントが直せるものではないか。
+needsHuman=false なら guidance に、エージェントが人を待たずに進めるための具体的な直し方を書く。needsHuman=true なら question に、確かめた結果で直した論点・選択肢・推奨を書く（前提に誤りがあれば、その旨と正しい前提も書く）。すべて日本語で書く。
+
+止まった段階: ${context}
+
+出そうとしている質問:
+${question}`,
+    { label: `cross-check:${kind}#${number}`, phase: 'Report', schema: CROSS_CHECK_SCHEMA, ...M.crossCheck },
+  )
+  if (c && !c.needsHuman && c.guidance && canResolve) {
+    log(`${label}: 人に聞く前の確かめで、エージェントが直せると判断した（${c.premiseSound ? '前提は正しい' : '前提に誤りあり'}）`)
+    return { guidance: c.guidance }
+  }
+  const checked = c
+    ? `${c.question ?? question}\n\n### 別のモデル（Fable）による確かめ\n- 前提: ${c.premiseSound ? '正しい' : '誤りあり'}\n- 人の判断が要るか: ${c.needsHuman ? '要る' : '要らないと判断したが、もう直す機会がないため聞く'}\n\n${c.findings}${!c.needsHuman && c.guidance ? `\n\n直し方の案:\n${c.guidance}` : ''}`
+    : `${question}\n\n（人に聞く前の確かめに失敗した）`
+  await askHuman(kind, number, checked)
+  return { question: checked }
+}
+
+// 人の確認が要るとき、Issue か PR にコメントで質問し、needs-human ラベルを付ける。直接は呼ばず、escalate を通す
 function askHuman(kind, number, question) {
   const cmd = kind === 'pr' ? 'pr' : 'issue'
   return agent(
-    `${REPO} の ${kind === 'pr' ? 'PR' : 'Issue'} #${number} に、次の内容を日本語のコメントで投稿する（\`gh ${cmd} comment ${number} --body-file <ファイル>\`）。見出しは「## 確認してほしいこと」。論点ごとに選択肢と推奨を短く添える。投稿したら \`gh ${cmd} edit ${number} --add-label needs-human\` を実行する。\n\n${question}`,
+    `${REPO} の ${kind === 'pr' ? 'PR' : 'Issue'} #${number} に、次の内容を日本語のコメントで投稿する（\`gh ${cmd} comment ${number} --body-file <ファイル>\`）。見出しは「## 確認してほしいこと」。内容は書き換えずにそのまま載せる（論点・選択肢・推奨と、別のモデルによる確かめの結果を含む）。投稿したら \`gh ${cmd} edit ${number} --add-label needs-human\` を実行する。\n\n${question}`,
     { label: `ask:${cmd}#${number}`, phase: 'Report', ...M.report },
   )
 }
 
-function implement(info, approvedPlan) {
+function implement(info, approvedPlan, guidance) {
   return agent(
     `${REPO} の Issue #${info.number}「${info.title}」を実装して PR を作る。手順は \`.claude/skills/work-issue/SKILL.md\` の 1〜4 に従う。ただし作業場所は、ユーザーのチェックアウトとは別の worktree にする:
 
-1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する。
+1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する（\`.worktrees/issue-${info.number}\` がもうあれば、それを続けて使う）。
 2. 以降の編集・ビルド・テスト・コミット・push はすべてその worktree の中で行う（絶対パスで操作する）。\`git stash\` は使わない。
 3. 実装ループ: 実装 → \`./gradlew build\` → \`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer\` を、すべて通るまで繰り返す。
 4. PR を \`gh pr create\` で作る（1つの Issue を複数の PR に分けるときは、AGENTS.md の手順で Stacked PRs にする）。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
-未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて Issue に質問をコメントし（見出し「## 確認してほしいこと」、論点・選択肢・推奨）、\`gh issue edit ${info.number} --add-label needs-human\` を付けて status=blocked で終える。summary には質問の要点を書く。
-publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}`,
+未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて status=blocked で終える。summary に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。
+publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}`,
     { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
 }
@@ -367,8 +430,9 @@ async function report(info, r) {
   }
   if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
   const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
-  await askHuman('pr', r.impl.pr, question)
-  return question
+  // この段階ではもう直す機会がないので、確かめた結果を添えて聞く
+  const e = await escalate('pr', r.impl.pr, question, `PR の CI・レビュー・マージの段階（ブランチ ${r.impl.branch}）`, false)
+  return e.question
 }
 
 // ---- 1 Issue の流れ ----
@@ -395,10 +459,18 @@ async function runIssue(info) {
       approvedPlan = p.plan
     }
 
-    const impl = await implement(info, approvedPlan)
+    let impl = await implement(info, approvedPlan)
+    if (impl && impl.status === 'blocked') {
+      const e = await escalate('issue', info.number, impl.summary, '実装の段階で、人が決めることか未決の decision に当たって止まった', true)
+      if (!e.guidance) return { issue: info.number, status: 'needs_human', reason: e.question, question: e.question }
+      impl = await implement(info, approvedPlan, e.guidance)
+      if (impl && impl.status === 'blocked') {
+        const again = await escalate('issue', info.number, impl.summary, '実装の段階で、確かめの進め方に従ってもまた止まった', false)
+        return { issue: info.number, status: 'needs_human', reason: again.question, question: again.question }
+      }
+    }
     if (!impl || impl.status !== 'pr_opened' || !impl.pr) {
-      const reason = impl?.summary ?? '実装の段階が失敗した'
-      return { issue: info.number, status: impl ? 'needs_human' : 'failed', reason, question: impl ? reason : null }
+      return { issue: info.number, status: 'failed', reason: impl?.summary ?? '実装の段階が失敗した', question: null }
     }
 
     const tag = `#${info.number}`
