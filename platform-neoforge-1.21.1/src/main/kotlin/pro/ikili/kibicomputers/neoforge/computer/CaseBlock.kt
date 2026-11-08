@@ -5,7 +5,9 @@ import com.mojang.serialization.MapCodec
 import com.mojang.serialization.codecs.RecordCodecBuilder
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
+import net.minecraft.util.RandomSource
 import net.minecraft.world.Containers
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.entity.player.Player
@@ -77,6 +79,11 @@ class CaseBlock(val tier: CaseTier, properties: BlockBehaviour.Properties) : Blo
     ) {
         super.neighborChanged(state, level, pos, neighborBlock, neighborPos, movedByPiston)
         (level.getBlockEntity(pos) as? CaseBlockEntity)?.neighborChanged()
+    }
+
+    // neighborChanged で回した、画面のつなぎ直し（置いたブロックのデータを読み込んだ後に行う。#535）
+    override fun tick(state: BlockState, level: ServerLevel, pos: BlockPos, random: RandomSource) {
+        (level.getBlockEntity(pos) as? CaseBlockEntity)?.reconnectScreen()
     }
 
     @Deprecated("Deprecated in Java")

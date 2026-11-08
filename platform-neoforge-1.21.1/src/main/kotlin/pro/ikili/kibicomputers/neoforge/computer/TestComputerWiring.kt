@@ -38,7 +38,9 @@ import java.util.concurrent.atomic.AtomicLong
  *   （音はまだ鳴らさず数えるだけ。[beeps]）。
  * - つないだ画面が外れたら、画面とキーボードだけを外す（#397）。マシンとスピーカーはつないだまま（#531）
  * - 画面をつないでいない間に、ケースの隣のブロックが変わったら（[CaseBlockEntity.neighborChanged]）、隣の画面と
- *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。隣のブロックの更新で気付くので、画面の置いてある
+ *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
+ *   次の tick に回す。マシンが自分で止まっていれば（CRASHED、ゲストが止めた）つながない（#535）。
+ *   つないだときの address を覚えておき、外すときはそれで外す。隣のブロックの更新で気付くので、画面の置いてある
  *   チャンクが読み込み直されたときなど、ケースの隣のブロックの更新が起きないときはつなぎ直さない。
  *   画面をつないでいる間に置いたキーボードも見ない
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
@@ -52,6 +54,10 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     private var keyboardDevice: KeyboardDevice? = null
     private var screen: ScreenBlockEntity? = null
     private var keyboard: KeyboardBlockEntity? = null
+
+    // つないだときの画面・キーボードの address。外すときはこれで外す（つないだ後にブロックの address が変わっても外せるように。#535）
+    private var screenAddress: String? = null
+    private var keyboardAddress: String? = null
     private var machine: Machine? = null
     private var speakerAddress: String? = null
 
@@ -89,13 +95,23 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     /**
-     * 動いているマシンに画面をつないでいなければ、隣の画面とキーボードを探してつなぐ（#531）。
-     * 電源が切れている、またはもう画面をつないでいるときは何もしない（ケースの隣のブロックが変わるたびに呼ぶので、軽く済ませる）
+     * [current]（ケースの今のマシン）がこの結線のマシンで、止まっておらず（[MachineState.RUNNING] か、起動の途中（[Machine.isBooting]））、
+     * 画面をつないでいないなら `true`。
+     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535）。軽いので、ケースの隣のブロックが変わるたびに呼んでよい
      */
-    fun reconnectScreen(level: Level, casePos: BlockPos) {
-        val m = machine ?: return
-        if (screen != null) return
-        attachScreen(level, casePos, m)
+    fun canReconnectScreen(current: Machine?): Boolean {
+        val m = machine ?: return false
+        return current === m && (m.state == MachineState.RUNNING || m.isBooting) && screen == null
+    }
+
+    /**
+     * 動いているマシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
+     * そうでなければ何もしない。マシンが自分で止まった（CRASHED、ゲストが止めた）ときは、電源が入ったままでもつながない（#535）。
+     * 置いたブロックのデータ（address など）を読み込んだ後に呼ぶ（[CaseBlockEntity.neighborChanged] は次の tick に回す）
+     */
+    fun reconnectScreen(level: Level, casePos: BlockPos, current: Machine?) {
+        if (!canReconnectScreen(current)) return
+        attachScreen(level, casePos, machine ?: return)
     }
 
     private fun attachScreen(level: Level, casePos: BlockPos, machine: Machine) {
@@ -105,12 +121,16 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。つなぐたびに新しく作る
         val display = DisplayDevice.forTier(screen.tier)
         screen.mirror(display)
-        screenDevice = ScreenDevice(display).also { machine.devices.attach(screen.deviceAddress, it) }
+        val address = screen.deviceAddress
+        screenAddress = address
+        screenDevice = ScreenDevice(display).also { machine.devices.attach(address, it) }
         // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
         val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
         if (keyboard != null) {
             this.keyboard = keyboard
-            keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyboard.deviceAddress, it) }
+            val keyAddress = keyboard.deviceAddress
+            keyboardAddress = keyAddress
+            keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyAddress, it) }
         }
     }
 
@@ -133,13 +153,15 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     private fun detachScreen() {
         val m = machine
         keyboard?.release(this)
-        if (keyboardDevice != null) keyboard?.let { m?.devices?.detach(it.deviceAddress) }
+        keyboardAddress?.let { m?.devices?.detach(it) }
+        keyboardAddress = null
         keyboard = null
         keyboardDevice = null
         val s = screen
         if (s?.isRemoved == true) screenDevice?.discardOutput()
         s?.removeRemovalListener(onScreenRemoved)
-        if (screenDevice != null) s?.let { m?.devices?.detach(it.deviceAddress) }
+        screenAddress?.let { m?.devices?.detach(it) }
+        screenAddress = null
         screen = null
         screenDevice = null
     }
