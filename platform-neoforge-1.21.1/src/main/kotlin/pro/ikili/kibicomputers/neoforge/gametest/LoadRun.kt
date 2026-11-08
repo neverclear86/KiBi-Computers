@@ -167,8 +167,19 @@ internal data class PhaseResult(
     val kernelThreadNames: Map<String, Int>,
 )
 
-/** [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書いた台・飛ばした台の数、1 tick の書き込み（fsync）の最大 */
-internal data class AutosaveResult(val cycleTicks: Int, val written: Long, val skipped: Long, val maxTickWrites: Int)
+/**
+ * [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書いた台・飛ばした台の数、1 tick の書き込み（fsync）の最大、
+ * 書き込みにかかった時間の合計（ミリ秒）と、tick の時間から書き込みの時間を引いたもの（[tickExcludingWrites]）。
+ * 書き込みはメインスレッドで同期して fsync する（#84 まで）ので、壁時計の MSPT はディスクの速さに左右される
+ */
+internal data class AutosaveResult(
+    val cycleTicks: Int,
+    val written: Long,
+    val skipped: Long,
+    val maxTickWrites: Int,
+    val writeMillis: Double,
+    val tickExcludingWrites: TickStats,
+)
 
 /** [LoadPhase.UNLOAD] の結果: 取り出して書いた台と書き込みの回数（合計と 1 tick の最大）、ケースのあるチャンクのうちアンロードされなかった数とその全体 */
 internal data class UnloadResult(
@@ -224,8 +235,11 @@ internal class LoadReport(
         autosave?.let {
             sb.append(
                 String.format(
-                    Locale.ROOT, "- 自動保存の一巡: %d tick、書いた台 %d、飛ばした台 %d、1 tick の書き込み（fsync）の最大 %d 回\n",
-                    it.cycleTicks, it.written, it.skipped, it.maxTickWrites,
+                    Locale.ROOT,
+                    "- 自動保存の一巡: %d tick、書いた台 %d、飛ばした台 %d、1 tick の書き込み（fsync）の最大 %d 回、書き込みの時間の合計 %.0f ms、" +
+                        "書き込みを除く MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    it.cycleTicks, it.written, it.skipped, it.maxTickWrites, it.writeMillis,
+                    it.tickExcludingWrites.avg, it.tickExcludingWrites.p50, it.tickExcludingWrites.p95, it.tickExcludingWrites.max,
                 ),
             )
         }
@@ -292,6 +306,9 @@ internal class LoadRun(
     private var phaseStartNanos = 0L
     private var recording = false
     private var samples = LongArray(1024)
+
+    /** [samples] と同じ tick の、自動保存の書き込みにかかった時間（[ServerMachines.Stats.autosaveTickWriteNanos]） */
+    private var writeSamples = LongArray(1024)
     private var sampleCount = 0
     private var peakKernelThreads = 0
     private var peakPhaseKernelThreads = 0
@@ -314,6 +331,7 @@ internal class LoadRun(
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
     private var savedSaveConfig: MachineSaveConfig? = null
+    private var savedAutosaveEnabled: Boolean? = null
     private var unloadPrevWrites = 0L
     private var unloadMaxTickCaptures = 0L
     private var unloadMaxTickWrites = 0L
@@ -326,6 +344,9 @@ internal class LoadRun(
         // MOD の自動保存の周期は止める（ほかの段階に混ざらないように）。自動保存の段階は周期を待たずに始める
         savedSaveConfig = ServerMachines.saveConfig
         ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
+        // GameTest のサーバーでは自動保存が切られているので、試験の間だけ有効にする
+        savedAutosaveEnabled = ServerMachines.autosaveEnabled
+        ServerMachines.autosaveEnabled = true
         helper.onEachTick(::onTick)
     }
 
@@ -335,7 +356,8 @@ internal class LoadRun(
         var work = 0L
         if (prevCallback != 0L) {
             work = (now - prevCallback - prevHarness - prevSleep).coerceAtLeast(0)
-            if (recording) record(work)
+            // この tick の始め（ServerTickEvent.Pre）の自動保存の書き込みは、前の呼び出しからの間に入っている
+            if (recording) record(work, ServerMachines.Stats.autosaveTickWriteNanos)
         }
         prevCallback = now
         try {
@@ -356,9 +378,14 @@ internal class LoadRun(
         }
     }
 
-    private fun record(nanos: Long) {
-        if (sampleCount == samples.size) samples = samples.copyOf(samples.size * 2)
-        samples[sampleCount++] = nanos
+    private fun record(nanos: Long, writeNanos: Long) {
+        if (sampleCount == samples.size) {
+            samples = samples.copyOf(samples.size * 2)
+            writeSamples = writeSamples.copyOf(samples.size)
+        }
+        samples[sampleCount] = nanos
+        writeSamples[sampleCount] = writeNanos
+        sampleCount++
     }
 
     private fun step() {
@@ -421,7 +448,15 @@ internal class LoadRun(
         if (phaseTick == 0) return
         if (ServerMachines.isAutosaveCycleDone) {
             val s = ServerMachines.Stats
-            autosaveResult = AutosaveResult(s.autosaveCycleTicks.lastOrNull() ?: phaseTick, s.autosaveWritten, s.autosaveSkipped, s.autosaveMaxTickWrites)
+            val excluding = LongArray(sampleCount) { (samples[it] - writeSamples[it]).coerceAtLeast(0) }
+            autosaveResult = AutosaveResult(
+                cycleTicks = s.autosaveCycleTicks.lastOrNull() ?: phaseTick,
+                written = s.autosaveWritten,
+                skipped = s.autosaveSkipped,
+                maxTickWrites = s.autosaveMaxTickWrites,
+                writeMillis = s.autosaveWriteNanos / 1e6,
+                tickExcludingWrites = TickStats.of(excluding),
+            )
             next(LoadPhase.AUTOSAVE)
         } else if (phaseTick >= AUTOSAVE_TIMEOUT_TICKS) {
             fail("the autosave cycle did not finish within $AUTOSAVE_TIMEOUT_TICKS ticks")
@@ -678,6 +713,8 @@ internal class LoadRun(
         savedSpawnChunkRadius = null
         savedSaveConfig?.let { ServerMachines.saveConfig = it }
         savedSaveConfig = null
+        savedAutosaveEnabled?.let { ServerMachines.autosaveEnabled = it }
+        savedAutosaveEnabled = null
     }
 
     private fun sampleKernelThreads() {

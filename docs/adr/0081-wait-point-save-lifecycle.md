@@ -41,7 +41,7 @@
 | --- | --- |
 | アンロード | `ChunkEvent.Unload`（`LevelChunk`・`ServerLevel`）で、そのチャンクの全ケースを止める → 待つ（tick ごとの予算 `unloadWaitBudgetMillis` 仮 50 ms）→ `KILL_TRANSIENT` で取り出す → 書く → `chunk.setUnsaved(true)` → 続く `ChunkMap.save` が新しい世代を NBT に書く → `onChunkUnloaded` で捨てる |
 | 停止 | `ServerStoppingEvent`（`saveAllChunks` の前）で全台を止める → まとめて最大 `stopQuiesceMillis`（仮 500 ms）待つ → 全台を `KILL_TRANSIENT` で取り出して書く → `setChanged`。止めた台は `ServerStoppedEvent` まで止めたまま。後で来る `ChunkEvent.Unload` は「取り出し済み」として、NBT が古い世代を指すときだけ `setUnsaved(true)` を付ける |
-| 自動保存 | 周期（仮 6000 tick）ごとに、電源の入っている台の列を作り、tick ごとの予算で回して書く（下） |
+| 自動保存 | 周期（仮 6000 tick）ごとに、電源の入っている台の列を作り、tick ごとの予算で回して書く（下）。GameTest のサーバーでは切る（ほかのテストのケースを止めないように。負荷試験は試験の間だけ有効にする） |
 | プレイヤーの破壊・爆発 | `CaseBlock.playerWillDestroy`・`onBlockExploded` で `<uuid>/` を消す |
 | そのほかの `setRemoved` | 取り出さずに捨てる。ディレクトリは消さない |
 
@@ -60,6 +60,7 @@ fsync は中身の大きさによらず時間がかかる（開発機の D: ド�
 - 予算を超えた分（回数 2 の台で残りが 1 のとき、書く前の確かめで振り直したとき）は次の tick の予算から引く。1 tick の書き込みは最大で予算 + 1
 - 台数で数えない理由: ID を振る初回に予算待ちが `autosaveQuiesceTicks` を超え、飛ばすか止める時間が延びるかのどちらかになるため
 - **仮の値は 1 回**（プランの仮 16 から下げた）。開発機で測ると、予算 16 では 100 台の一巡の間の tick が平均 375 ms、2 回では 1,000 台の一巡の間の平均が 55 ms になった（fsync 約 19 ms × 回数）。1 回で平均約 34 ms（`docs/load-test.md` の「#81 の後の結果」）。1,000 台の一巡は、ID を振る初回で約 2,000 tick、2回目から約 1,000 tick で、周期 6000 tick より短い。確定は #251、書き込みのスレッド（#84）ができたら上げられる
+- **CI の検査は書き込みを除いた MSPT で見る**: 書き込みは #84 までメインスレッドで同期して fsync するので、一巡の間の壁時計の MSPT は、ほぼディスクの fsync の時間になる（開発機で fsync が詰まり、100 台の一巡の平均が 78.91 ms・p50 1.76 ms・最大 664 ms になったことがある）。CI の負荷試験は、書き込みの時間を除いた tick の平均（50 ms 未満）、1 tick の書き込みの回数（予算 + 1 以下）、一巡の tick 数（`2 × 台数 ÷ 予算 + autosaveQuiesceTicks + 2` 以下）を確かめ、壁時計の値は表に出すだけにする
 - **アンロードは延ばせない**: 1 tick の書き込みは「その tick にアンロードされるチャンクの台数 ×（1 か 2）」。`ChunkMap.processUnloads` は 1 tick に最低 200 チャンクを処理するので、最悪は 1 tick に全台。#81 ではこれを受け入れて負荷試験で測り（`docs/load-test.md` の「#81 の後の結果」。1 tick に 48 台で 1.1 秒、90 台で 2.4 秒）、#84 で解く（メインスレッドは写しを作るだけにする）
 
 ## マシンの ID と持ち主（epoch 方式）

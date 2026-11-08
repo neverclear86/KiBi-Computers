@@ -70,6 +70,18 @@ object LoadGameTests {
      * 起動の前からあってプールで待っているワーカーは数えない。先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）。
      * 起動の間に作られたスレッドは、待っているワーカーでも数える（#483）
      */
+    /**
+     * CI の自動保存の一巡の tick 数の上限。台ごとの書き込みは最大 2 回（ID を振る初回は `owner.bin` の分も書く）なので、
+     * 書き込みは合わせて `2 × CI_COUNT` 回で、tick ごとの予算 [budget] で割った tick 数かかる（READY にならずに飛ばす台も、
+     * 止める上限の回数を同じだけ使う）。それに、最初の台を止めてから READY を待つ分（[quiesceTicks]）と、
+     * 周期の始めと終わりの [CI_AUTOSAVE_CYCLE_SLACK_TICKS] を足す
+     */
+    private fun ciMaxAutosaveCycleTicks(budget: Int, quiesceTicks: Int): Int =
+        (2 * CI_COUNT + budget - 1) / budget + quiesceTicks + CI_AUTOSAVE_CYCLE_SLACK_TICKS
+
+    /** [ciMaxAutosaveCycleTicks] の余裕 */
+    private const val CI_AUTOSAVE_CYCLE_SLACK_TICKS = 2
+
     private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
     /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
@@ -117,13 +129,19 @@ object LoadGameTests {
             val compute = report.phase(LoadPhase.COMPUTE)
             val autosave = report.phase(LoadPhase.AUTOSAVE)
             val cycle = report.autosave!!
-            // 自動保存（#81、ADR 0081）: 一巡しても TPS を落とさず、1 tick の書き込みは予算 + 1 以下
+            // 自動保存（#81、ADR 0081）: 書き込み（fsync）を除く tick が TPS を落とさず、1 tick の書き込みは予算 + 1 以下で、
+            // 一巡が回数の予算どおりの tick に収まる。書き込みはメインスレッドで同期して fsync する（#84 まで）ので、
+            // 壁時計の平均（autosave.tick）はディスクに左右される（fsync が詰まると 50 ms を超えうる）。表に出すだけで検査しない
             helper.assertTrue(
-                autosave.tick.avg < CI_MAX_AVG_TICK_MILLIS,
-                "ticks during an autosave cycle should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${autosave.tick}",
+                cycle.tickExcludingWrites.avg < CI_MAX_AVG_TICK_MILLIS,
+                "ticks during an autosave cycle, excluding the writes, should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: " +
+                    "${cycle.tickExcludingWrites} (wall clock: ${autosave.tick})",
             )
-            val budget = ServerMachines.saveConfig.autosaveWritesPerTick
+            val saveConfig = ServerMachines.saveConfig
+            val budget = saveConfig.autosaveWritesPerTick
             helper.assertTrue(cycle.maxTickWrites <= budget + 1, "an autosave tick should write at most ${budget + 1} times: $cycle")
+            val maxCycleTicks = ciMaxAutosaveCycleTicks(budget, saveConfig.autosaveQuiesceTicks)
+            helper.assertTrue(cycle.cycleTicks <= maxCycleTicks, "an autosave cycle should take at most $maxCycleTicks ticks: $cycle")
             val unwatched = report.phase(LoadPhase.OUTPUT)
             val output = report.phase(LoadPhase.WATCHED)
             helper.assertTrue(

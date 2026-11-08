@@ -10,6 +10,7 @@ import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.GameType
+import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -180,6 +181,39 @@ object MachineSaveGameTests {
             helper.assertTrue(store.latestGeneration(id).asLong == generation, "the chunk should point at the latest generation")
             helper.assertTrue(Files.isRegularFile(store.generationFile(id, generation)), "the generation file should exist")
             helper.assertTrue(store.chunkGeneration(id).asLong == generation, "the mark should follow the chunk save")
+        }
+    }
+
+    /**
+     * 爆発（`onBlockExploded`）で壊れたケースは、保存データのディレクトリを消す。ほかのテストのブロックを壊さないよう、
+     * 離れたチャンクで爆発させる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
+    fun explosionDeletesTheSaves(helper: GameTestHelper) {
+        val store = store(helper)
+        val level = helper.level
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 400, helper.absolutePos(CASE).z / 16 - 400)
+        val pos = BlockPos(chunk.minBlockX + 8, 200, chunk.minBlockZ + 8)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        // onLoad（索引に入る）を待ってから取り出して書く
+        helper.runAfterDelay(1) {
+            be.computer.prepareUnload()
+            helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+            be.computer.endQuiesce()
+            val id = be.identity!!.id
+            helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "the save directory should exist")
+            // 中心のブロックは必ず壊れる強さ（ケースの爆発耐性 6）
+            level.explode(null, pos.x + 0.5, pos.y + 0.5, pos.z + 0.5, 4.0f, Level.ExplosionInteraction.BLOCK)
+            level.setChunkForced(chunk.x, chunk.z, false)
+            helper.assertTrue(level.getBlockEntity(pos) !is CaseBlockEntity, "the explosion should destroy the case")
+            helper.assertTrue(!Files.exists(store.directoryOf(id)), "an exploded case should delete its directory")
+            helper.succeed()
         }
     }
 }

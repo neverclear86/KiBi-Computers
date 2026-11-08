@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.neoforge.machine
 
 import com.mojang.logging.LogUtils
 import net.minecraft.core.BlockPos
+import net.minecraft.gametest.framework.GameTestServer
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.Tag
 import net.minecraft.resources.ResourceKey
@@ -83,7 +84,10 @@ object ServerMachines {
             rotation = AutosaveRotation(value)
         }
 
-    /** 自動保存を止める（GameTest がほかのテストのケースを止めないように。負荷試験の自動保存の段階では有効にする） */
+    /**
+     * MOD の自動保存を回すか。GameTest のサーバー（`runGameTestServer`・`runLoadTestServer`）では、起動のときに切る
+     * （ほかのテストのケースを止めて、結果を揺らさないように）。負荷試験（`LoadRun`）は試験の間だけ有効にし、終わったら戻す
+     */
     @Volatile
     internal var autosaveEnabled: Boolean = true
 
@@ -122,6 +126,15 @@ object ServerMachines {
         /** 終わった自動保存の周期の、一巡にかかった tick 数（古い順） */
         val autosaveCycleTicks: MutableList<Int> = ArrayList()
 
+        /**
+         * この tick の自動保存の書き込み（取り出して書く。fsync を含む）にかかった時間（ナノ秒）。tick の始めに 0 にする。
+         * 負荷試験は、tick の時間からこれを引いて「書き込みを除く MSPT」を出す（fsync の時間はディスクに左右されるため）
+         */
+        var autosaveTickWriteNanos: Long = 0
+
+        /** 自動保存の書き込みにかかった時間の合計（ナノ秒） */
+        var autosaveWriteNanos: Long = 0
+
         fun reset() {
             unloadEventsWithCases = 0
             unloadCaptures = 0
@@ -130,6 +143,8 @@ object ServerMachines {
             autosaveWritten = 0
             autosaveSkipped = 0
             autosaveCycleTicks.clear()
+            autosaveTickWriteNanos = 0
+            autosaveWriteNanos = 0
         }
     }
 
@@ -150,6 +165,8 @@ object ServerMachines {
         changedLater.clear()
         rotation.clear()
         autosaveTicks = 0
+        // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
+        autosaveEnabled = event.server !is GameTestServer
         // 設定はまだ仮の値（コンフィグにするのは #251）
         manager = MachineManager(SchedulerConfig.DEFAULT, ERRORS)
     }
@@ -190,6 +207,7 @@ object ServerMachines {
     private fun onServerTick(event: ServerTickEvent.Pre) {
         manager?.tick()
         unloadWaitedNanos = 0
+        Stats.autosaveTickWriteNanos = 0
         if (changedLater.isNotEmpty()) {
             val list = changedLater.toList()
             changedLater.clear()
@@ -222,6 +240,7 @@ object ServerMachines {
         override fun writeIfReady(machine: CaseBlockEntity, handle: QuiesceHandle): Int {
             if (handle.readiness != SaveReadiness.READY) return AutosaveTarget.NOT_READY
             val planned = machine.plannedWrites
+            val start = System.nanoTime()
             return try {
                 val writes = machine.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT)
                 // 読み込み中のチャンクなので setChanged が効き、チャンクの保存が後で NBT を書く
@@ -230,6 +249,10 @@ object ServerMachines {
             } catch (e: IOException) {
                 LOGGER.warn("Failed to save the computer at {} (keeping the previous generation)", machine.blockPos, e)
                 planned
+            } finally {
+                val spent = System.nanoTime() - start
+                Stats.autosaveTickWriteNanos += spent
+                Stats.autosaveWriteNanos += spent
             }
         }
     }

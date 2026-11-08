@@ -250,13 +250,16 @@ public class MachineManager<K : Any> internal constructor(
 
     private fun stopEntry(entry: Entry<K>) {
         entry.host.released = true
-        entry.quiesce?.close()
-        entry.quiesce = null
+        // 先にマシンを閉じてから止める印を返す。印を先に返すと、止めている間に起こされたプロセスが、
+        // 写した後・閉じる前に step を動かしうる（写した後は外すまで止めたままにする。ADR 0081）
         try {
             entry.machine.close()
         } catch (t: Throwable) {
             if (isFatal(t)) throw t
             report(errors, "マシン ${entry.host.key} を止められなかった", t)
+        } finally {
+            entry.quiesce?.close()
+            entry.quiesce = null
         }
     }
 
