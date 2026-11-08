@@ -33,9 +33,14 @@ import java.util.concurrent.atomic.AtomicLong
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
  *   表示デバイス（[DisplayDevice]）を作って画面に映させ、画面とキーボードのデバイス（[ScreenDevice]・[KeyboardDevice]。#65）を
  *   それぞれのブロックの address でマシンにつなぐ（コンソールの出力は表示デバイスに、キーボードの入力はコンソールに流れる。
- *   プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
- *   ケースに入っているスピーカー（[SpeakerDevice]）は、ケースの address で常につなぐ（音はまだ鳴らさず数えるだけ。[beeps]）。
- *   つないだ画面が外れたら、画面とキーボードから外す（#397）。
+ *   プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。
+ *   ケースに入っているスピーカー（[SpeakerDevice]）は、ケースの address で電源が入っている間ずっとつなぐ
+ *   （音はまだ鳴らさず数えるだけ。[beeps]）。
+ * - つないだ画面が外れたら、画面とキーボードだけを外す（#397）。マシンとスピーカーはつないだまま（#531）
+ * - 画面をつないでいない間に、ケースの隣のブロックが変わったら（[CaseBlockEntity.neighborChanged]）、隣の画面と
+ *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。隣のブロックの更新で気付くので、画面の置いてある
+ *   チャンクが読み込み直されたときなど、ケースの隣のブロックの更新が起きないときはつなぎ直さない。
+ *   画面をつないでいる間に置いたキーボードも見ない
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
  *
@@ -67,7 +72,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         private set
 
     // 画面が外れたら、出力を止めている最中でも、すぐに外して取っておいた出力を捨てる（#397）
-    private val onScreenRemoved = Runnable { disconnect() }
+    private val onScreenRemoved = Runnable { detachScreen() }
 
     /**
      * 電源が入った（[machine] を作った）。ケースのスピーカーを [speakerAddress] で、隣の画面とキーボードをそれぞれの address でつなぎ、
@@ -79,32 +84,53 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         bootFailure = null
         this.speakerAddress = speakerAddress
         machine.devices.attach(speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() })
-        val screen = findScreen(level, casePos)
-        if (screen != null) {
-            this.screen = screen
-            screen.addRemovalListener(onScreenRemoved)
-            // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。電源を入れるたびに新しく作る
-            val display = DisplayDevice.forTier(screen.tier)
-            screen.mirror(display)
-            screenDevice = ScreenDevice(display).also { machine.devices.attach(screen.deviceAddress, it) }
-            // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
-            val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
-            if (keyboard != null) {
-                this.keyboard = keyboard
-                keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyboard.deviceAddress, it) }
-            }
-        }
+        attachScreen(level, casePos, machine)
         machine.boot(boot)
     }
 
     /**
-     * 電源が切れた・ケースが消える・画面が外れた。マシンからデバイスを外し、画面とキーボードから外す
-     * （画面は最後の表示デバイスを映したままにし、中身を残す）。
+     * 動いているマシンに画面をつないでいなければ、隣の画面とキーボードを探してつなぐ（#531）。
+     * 電源が切れている、またはもう画面をつないでいるときは何もしない（ケースの隣のブロックが変わるたびに呼ぶので、軽く済ませる）
+     */
+    fun reconnectScreen(level: Level, casePos: BlockPos) {
+        val m = machine ?: return
+        if (screen != null) return
+        attachScreen(level, casePos, m)
+    }
+
+    private fun attachScreen(level: Level, casePos: BlockPos, machine: Machine) {
+        val screen = findScreen(level, casePos) ?: return
+        this.screen = screen
+        screen.addRemovalListener(onScreenRemoved)
+        // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。つなぐたびに新しく作る
+        val display = DisplayDevice.forTier(screen.tier)
+        screen.mirror(display)
+        screenDevice = ScreenDevice(display).also { machine.devices.attach(screen.deviceAddress, it) }
+        // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
+        val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
+        if (keyboard != null) {
+            this.keyboard = keyboard
+            keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyboard.deviceAddress, it) }
+        }
+    }
+
+    /** 電源が切れた・ケースが消える。マシンからすべてのデバイス（画面・キーボード・スピーカー）を外す（[detachScreen]） */
+    fun disconnect() {
+        val m = machine
+        detachScreen()
+        speakerAddress?.let { m?.devices?.detach(it) }
+        speakerAddress = null
+        machine = null
+    }
+
+    /**
+     * マシンから画面とキーボードのデバイスを外し、画面とキーボードから外す（画面は最後の表示デバイスを映したままにし、中身を残す）。
+     * マシンとスピーカーはそのまま（#531）。
      * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）。
      * 画面が外れたときは、画面からの知らせ（[ScreenBlockEntity.addRemovalListener]）で呼ぶ。出力を止めている間は
      * マシンからの通知がないので、それがないと気付けない（#397）
      */
-    fun disconnect() {
+    private fun detachScreen() {
         val m = machine
         keyboard?.release(this)
         if (keyboardDevice != null) keyboard?.let { m?.devices?.detach(it.deviceAddress) }
@@ -116,9 +142,6 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         if (screenDevice != null) s?.let { m?.devices?.detach(it.deviceAddress) }
         screen = null
         screenDevice = null
-        speakerAddress?.let { m?.devices?.detach(it) }
-        speakerAddress = null
-        machine = null
     }
 
     override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit

@@ -33,7 +33,8 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - 電源を入れるとき、識別子のないディスクに識別子を付け（#124）、挿さっているディスクの写しをマシンの環境に渡す
  * - チャンクのアンロード・ブロックの破壊でマシンを外す
  * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 標準 OS の同梱イメージの順に起動する
- *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる
+ *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
+ *   動いている間に画面を置き直したら、つなぎ直す（[neighborChanged]。#531）
  *
  * セーブデータには部品だけを書く（`Parts`）。電源の状態は書かず、読み込んだら電源が切れている（マシンの状態の保存は #81）。
  */
@@ -124,6 +125,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         }
         if (assigned) setChanged()
         return PreparedDisks(store.snapshot(disks), disks.keys.toList())
+    }
+
+    /** 隣のブロックが変わった。動いていて画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531。仮の結線） */
+    internal fun neighborChanged() {
+        val level = level as? ServerLevel ?: return
+        wiring.reconnectScreen(level, blockPos)
     }
 
     private fun onPartsChanged() {
