@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.machine.isFatal
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.ConcurrentHashMap
@@ -19,7 +20,13 @@ import java.util.concurrent.ConcurrentHashMap
  * - メインスレッド（`mainThread`）: `Machine.submitHostCall`（#358）で列に積み、`tick()` の中で実行する
  *   （1 tick に `maxHostCallsPerTick` まで）
  * - 後で返す（[DeviceCallContext.defer]）: メインスレッドで受け取った [DeviceCompletion] を後の tick で終える。
- *   終わるまでは「実行中」で、ホスト呼び出しの件数は使わない。マシンを止めたら [cancelAllLocked] で取り消す
+ *   終わるまでは「実行中」で、ホスト呼び出しの件数は使わない。結果が要らなくなったら取り消す（[DeviceCompletion.isCancelled] が立ち、
+ *   `failed("interrupted")` で終える）: マシンを止めた（[cancelAllLocked]）、待っていたプロセスが止められた・pending-call の fd を
+ *   閉じた（[Started.cancelLocked]。#532）
+ *
+ * ハンドラーが投げたものは、JVM が続けられないエラー（`StackOverflowError` 以外の `VirtualMachineError`。`isFatal`）を除き、
+ * `Error` も含めて `failed("internal error")` にし、ログに出す（#532）。JVM が続けられないエラーは捕まえずにそのまま投げる
+ * （直接のメソッドは呼んだプロセスへ。メインスレッドのメソッドは、呼び出しを失敗で終えてから `tick()` へ。`PendingHostCall` と同じ）。
  *
  * 結果は future で返す。失敗は [DeviceCallException]（[CallError]）で終える。上限は [DeviceLimits]。
  */
@@ -28,7 +35,20 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
     private val running: MutableSet<Deferred> = ConcurrentHashMap.newKeySet()
 
     /** 始めた呼び出し。[fuel] は呼んだプロセスが払う燃料（基本の費用 + 引数のバイト数 + 直接のメソッドが使った分。結果の分は別） */
-    class Started(val future: CompletableFuture<List<DeviceValue>>, val fuel: Long)
+    class Started(
+        val future: CompletableFuture<List<DeviceValue>>,
+        val fuel: Long,
+        private val cancel: (() -> Unit)? = null,
+    ) {
+        /**
+         * 結果がもう要らない（待っていたプロセスが止められた・pending-call の fd を閉じた。#532）。カーネルロックの中で呼ぶ。
+         * まだ実行していないメインスレッドの呼び出しは列から外し（`ProcessKilledException` で終える）、後で返す呼び出しは
+         * [DeviceCompletion.isCancelled] を立てて `failed("interrupted")` で終える。終わった呼び出し・直接の呼び出しでは何もしない
+         */
+        fun cancelLocked() {
+            if (!future.isDone) cancel?.invoke()
+        }
+    }
 
     /** 実行中の後で返す呼び出しの数（テスト用） */
     val runningCount: Int get() = running.size
@@ -37,7 +57,7 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
      * [address] のデバイスのメソッド [method] を引数 [args] で呼び始める。直接のメソッドは、返る前に終わっている。
      * [pid] は出したプロセス（0 = プロセスでない）。[onRun] は、実行し始める直前に（実行するスレッドで）呼ぶ。
      * 待たない。投げない（失敗は future の [DeviceCallException]。メインスレッドの呼び出しを止めて取り消したときは
-     * `ProcessKilledException`）
+     * `ProcessKilledException`）。ただし直接のメソッドが JVM の続けられないエラーを投げたら、そのまま伝える
      */
     fun start(pid: Int, address: String, method: String, args: List<DeviceValue>, onRun: (() -> Unit)? = null): Started {
         val argBytes = DeviceLimits.payloadBytes(args)
@@ -57,23 +77,29 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
             val future = invokeHandler(entry, context, arguments)
             return Started(future, saturatingAdd(fuel, context.consumed))
         }
-        val outer = bus.machine.submitHostCall(
+        val ticket = Ticket()
+        val machine = bus.machine
+        val outer = machine.submitHostCall(
             pid,
             HostCall {
                 onRun?.invoke()
-                if (!device.attached) failed(CallError.Detached) else invokeHandler(entry, CallContext(device, method, mainThread = true), arguments)
+                if (!device.attached) {
+                    failed(CallError.Detached)
+                } else {
+                    invokeHandler(entry, CallContext(device, method, mainThread = true, ticket), arguments)
+                }
             },
         )
-        return Started(outer.thenCompose { it }, fuel)
+        return Started(outer.thenCompose { it }, fuel) {
+            machine.cancelHostCallLocked(outer)
+            ticket.cancel()
+        }
     }
 
     /** 実行中の後で返す呼び出しを、すべて `failed("interrupted")` で終え、[DeviceCompletion.isCancelled] を立てる（マシンを止めた） */
     fun cancelAllLocked() {
         if (running.isEmpty()) return
-        for (d in running.toList()) {
-            d.cancelled = true
-            d.finish(CallError.INTERRUPTED)
-        }
+        for (d in running.toList()) d.cancel()
     }
 
     private fun invokeHandler(entry: DeviceMethods.Entry, context: CallContext, args: DeviceArguments): CompletableFuture<List<DeviceValue>> {
@@ -87,8 +113,13 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
             error = CallError.BadArguments(e.message ?: "")
         } catch (e: DeviceException) {
             error = CallError.Failed(e.message ?: "")
-        } catch (e: Exception) {
-            LOG.log(System.Logger.Level.WARNING, "デバイス ${context.address} のメソッド ${context.method} が例外を投げた", e)
+        } catch (t: Throwable) {
+            if (isFatal(t)) {
+                // JVM が続けられない。後で返すと決めていたら、実行中のまま残さずに終えてから投げる
+                context.deferred?.finish(CallError.INTERNAL_ERROR)
+                throw t
+            }
+            LOG.log(System.Logger.Level.WARNING, "デバイス ${context.address} のメソッド ${context.method} が例外を投げた", t)
             error = CallError.INTERNAL_ERROR
         }
         // 後で返すと決めてから投げたら、その呼び出しを失敗で終える
@@ -115,6 +146,8 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
         private val device: AttachedDevice,
         override val method: String,
         mainThread: Boolean,
+        /** 取り消しの印（メインスレッドの呼び出しだけ） */
+        private val ticket: Ticket? = null,
     ) : DeviceCallContext {
         override val address: String get() = device.address
 
@@ -137,9 +170,35 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
             check(isMainThread) { "direct のメソッドは defer() できない（メインスレッドのメソッドだけ）" }
             check(deferred == null) { "defer() は1回の呼び出しで1回だけ" }
             val d = Deferred()
-            running += d
             deferred = d
+            // 先に実行中に足す（取り消しと入れ違っても、取り消しが外す）
+            running += d
+            if (ticket?.attach(d) == false) d.cancel()
             return d
+        }
+    }
+
+    /**
+     * メインスレッドの呼び出し1回の取り消しの印（#532）。[Started.cancelLocked]（カーネルロックの中）と、メインスレッドの
+     * [CallContext.defer]（ロックの外）の入れ違いを、このオブジェクトのモニターで守る。[Deferred.cancel] はモニターの外で呼ぶ
+     */
+    private class Ticket {
+        private var cancelled = false
+        private var deferred: Deferred? = null
+
+        /** [d] を取り消しの対象にする。もう取り消していたら `false`（呼んだ側が [d] を取り消す） */
+        fun attach(d: Deferred): Boolean = synchronized(this) {
+            if (!cancelled) deferred = d
+            !cancelled
+        }
+
+        /** 取り消す。後で返すと決めていれば、その呼び出しを取り消す */
+        fun cancel() {
+            val d = synchronized(this) {
+                cancelled = true
+                deferred
+            }
+            d?.cancel()
         }
     }
 
@@ -148,7 +207,7 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
         val future = CompletableFuture<List<DeviceValue>>()
 
         @Volatile
-        var cancelled: Boolean = false
+        private var cancelled: Boolean = false
 
         override fun complete(vararg values: DeviceValue) {
             val list = values.toList()
@@ -163,6 +222,13 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
 
         fun finish(error: CallError) {
             if (future.completeExceptionally(DeviceCallException(error))) running.remove(this)
+        }
+
+        /** 結果がもう要らない。[isCancelled] を立て、まだ終わっていなければ `failed("interrupted")` で終える */
+        fun cancel() {
+            if (future.isDone) return
+            cancelled = true
+            finish(CallError.INTERRUPTED)
         }
 
         override val isCancelled: Boolean get() = cancelled

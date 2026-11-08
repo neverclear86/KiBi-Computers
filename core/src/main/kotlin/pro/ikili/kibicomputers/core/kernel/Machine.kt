@@ -68,6 +68,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import pro.ikili.kibicomputers.core.machine.isFatal
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -252,6 +253,10 @@ public class Machine private constructor(
 
         override fun timerClosed(objectId: Int) = timers.cancel(objectId)
 
+        override fun deviceCallClosed(objectId: Int) {
+            pendingDeviceCalls.remove(objectId)?.cancelLocked()
+        }
+
         override fun fileClosed(file: OpenFile) = vfs.releaseLater(file)
 
         override fun processHandleClosed(holder: Process, obj: ProcessObject) = lifecycle.onProcessHandleClosedLocked(holder, obj)
@@ -345,6 +350,12 @@ public class Machine private constructor(
     /** メインスレッドで実行するのを待つホスト呼び出し（カーネルロック） */
     private val hostCalls = ArrayDeque<PendingHostCall<*>>()
     private val queuedForHostCalls = AtomicBoolean(false)
+
+    /**
+     * 実行に回して、まだ終わっていない待たずに積んだデバイスの呼び出し（`PendingDeviceCall` のオブジェクトID → 始めた呼び出し。#532）。
+     * 最後の fd を閉じたら取り消す（[WakeSink.deviceCallClosed]）。終わったら外す。カーネルロック
+     */
+    private val pendingDeviceCalls = HashMap<Int, DeviceDispatcher.Started>()
 
     /**
      * つないでいるデバイスの表（#65、ADR 0065）。接続層が `attach`・`detach` でデバイスをつなぐ（どのスレッドからも呼べる。待たない）。
@@ -1154,9 +1165,15 @@ public class Machine private constructor(
         val started = devices.dispatcher.start(pid, queued.address, queued.method, queued.args) {
             lock.withLockValue { obj.markRunning() }
         }
+        lock.withLockValue {
+            // 終わるまでに最後の fd を閉じたら取り消す（閉じた後なら、その場で取り消す。#532）
+            if (started.future.isDone) return@withLockValue
+            if (obj.id != 0 && kernel.objects[obj.id] === obj) pendingDeviceCalls[obj.id] = started else started.cancelLocked()
+        }
         started.future.whenComplete { _, _ ->
             val result = DeviceDispatcher.resultOf(started.future)
             lock.withLockValue {
+                if (pendingDeviceCalls[obj.id] === started) pendingDeviceCalls.remove(obj.id)
                 if (obj.id != 0 && kernel.objects[obj.id] === obj && obj.finish(result)) {
                     wakeSink.wake(WaitKey(obj.id, WaitCondition.READABLE))
                 }
@@ -2167,6 +2184,8 @@ private class PendingHostCall<T>(
             future.complete(call.run())
         } catch (t: Throwable) {
             future.completeExceptionally(t)
+            // JVM が続けられないエラーは、待ち手を終えてからそのまま投げる（`tick()` へ。デバイスの直接のメソッドと同じ。#532）
+            if (isFatal(t)) throw t
         }
     }
 }
