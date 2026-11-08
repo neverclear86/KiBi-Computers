@@ -206,18 +206,21 @@ object MachineSaveGameTests {
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-        val unloadsBefore = ServerMachines.Stats.unloadEventsWithCases
-        val demotedBefore = ServerMachines.Stats.demotedMachines
+        // 共有のカウンター（ServerMachines.Stats）は、同じバッチで並んで動くほかのテストのチャンクでも動くので見ない（#548）。
+        // このテストのブロックエンティティだけを見る
         // onLoad（追跡と索引）を待ってから外す
         helper.runAfterDelay(1) {
+            helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
             level.setChunkForced(chunk.x, chunk.z, false)
             var id: UUID? = null
             helper.startSequence().thenWaitUntil {
-                helper.assertTrue(ServerMachines.Stats.demotedMachines > demotedBefore, "the demotion should take the machine out")
+                // アンロードされていない: アンロードなら setRemoved され、追跡からも外れる。FULL でなくなっただけなら両方そのまま
+                helper.assertTrue(!be.isRemoved, "the chunk should stay in memory (the block entity was removed)")
+                helper.assertTrue(be in ServerMachines.trackedCases(), "the demoted case should stay tracked")
+                // 外された: マシンがなく、電源が切れている（取り出して書いた世代は下で確かめる）
                 helper.assertTrue(be.computer.machine == null, "the machine should be stopped but was ${be.computer}")
                 helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should be off but was ${be.computer}")
                 helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
-                helper.assertTrue(ServerMachines.Stats.unloadEventsWithCases == unloadsBefore, "the chunk should stay in memory (no unload)")
                 val identity = be.identity
                 helper.assertTrue(identity != null, "the demotion should assign an id")
                 helper.assertTrue(Files.isRegularFile(store.generationFile(identity!!.id, identity.generation)), "the generation file should exist")
