@@ -66,6 +66,19 @@ class CaseBlock(val tier: CaseTier, properties: BlockBehaviour.Properties) : Blo
         return InteractionResult.sidedSuccess(level.isClientSide)
     }
 
+    // 隣のブロックが変わったら、動いているマシンに画面をつなぎ直す（#531）
+    override fun neighborChanged(
+        state: BlockState,
+        level: Level,
+        pos: BlockPos,
+        neighborBlock: Block,
+        neighborPos: BlockPos,
+        movedByPiston: Boolean,
+    ) {
+        super.neighborChanged(state, level, pos, neighborBlock, neighborPos, movedByPiston)
+        (level.getBlockEntity(pos) as? CaseBlockEntity)?.neighborChanged()
+    }
+
     @Deprecated("Deprecated in Java")
     override fun onRemove(state: BlockState, level: Level, pos: BlockPos, newState: BlockState, movedByPiston: Boolean) {
         if (!state.`is`(newState.block)) {
