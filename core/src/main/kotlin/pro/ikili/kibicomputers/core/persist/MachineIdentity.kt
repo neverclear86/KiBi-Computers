@@ -134,8 +134,8 @@ public fun interface MachineSnapshotSource {
  * @property autosaveQuiesceTicks 自動保存で、止めてから [SaveReadiness.READY] になるまで待つ上限（tick）
  * @property autosaveWritesPerTick 自動保存の tick ごとの書き込み（fsync）の回数の予算。`owner.bin` を書く台は 2 と数える。
  *   書き込みはメインスレッドで同期して行う（#84 で別スレッドに移す）ので、fsync 1 回の時間 × 予算が tick に足される。
- *   仮の値 2 は、fsync が約 19 ms かかるディスク（開発機で測った値。ADR 0081）でも 1 tick に約 40 ms で収まるように選んだ。
- *   1,000 台の一巡は、ID を振る初回で約 1,000 tick、2回目から約 500 tick（周期 6000 tick より短い）
+ *   仮の値 1 は、fsync が約 20 ms かかるディスク（開発機で測った値。ADR 0081）でも 20 TPS を保てるように選んだ。
+ *   1,000 台の一巡は、ID を振る初回で約 2,000 tick、2回目から約 1,000 tick（周期 6000 tick より短い）
  * @property unloadWaitBudgetMillis チャンクのアンロードで、tick ごとに待機点を待つ時間の合計の上限
  * @property stopQuiesceMillis サーバーの停止で、全台が待機点に来るのを待つ上限
  */
@@ -143,7 +143,7 @@ public fun interface MachineSnapshotSource {
 public data class MachineSaveConfig @JvmOverloads constructor(
     public val autosavePeriodTicks: Long = 6000,
     public val autosaveQuiesceTicks: Int = 4,
-    public val autosaveWritesPerTick: Int = 2,
+    public val autosaveWritesPerTick: Int = 1,
     public val unloadWaitBudgetMillis: Long = 50,
     public val stopQuiesceMillis: Long = 500,
 ) {

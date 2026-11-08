@@ -78,6 +78,8 @@ object ServerMachines {
     internal var saveConfig: MachineSaveConfig = MachineSaveConfig.DEFAULT
         set(value) {
             field = value
+            // 止めていた台は続けてから、新しい予算の列にする
+            rotation.clear()
             rotation = AutosaveRotation(value)
         }
 

@@ -5,6 +5,7 @@ import net.minecraft.gametest.framework.GameTestAssertException
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.GameRules
 import net.minecraft.world.level.block.Blocks
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.display.TextBuffer
@@ -12,11 +13,12 @@ import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
-import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import java.lang.management.ManagementFactory
 import java.lang.management.ThreadInfo
 import java.util.Locale
@@ -168,13 +170,14 @@ internal data class PhaseResult(
 /** [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書いた台・飛ばした台の数、1 tick の書き込み（fsync）の最大 */
 internal data class AutosaveResult(val cycleTicks: Int, val written: Long, val skipped: Long, val maxTickWrites: Int)
 
-/** [LoadPhase.UNLOAD] の結果: 取り出して書いた台と書き込みの回数（合計と 1 tick の最大）、終わりに読み込まれたままのチャンク */
+/** [LoadPhase.UNLOAD] の結果: 取り出して書いた台と書き込みの回数（合計と 1 tick の最大）、ケースのあるチャンクのうちアンロードされなかった数とその全体 */
 internal data class UnloadResult(
     val captures: Long,
     val writes: Long,
     val maxTickCaptures: Long,
     val maxTickWrites: Long,
     val stillLoaded: Int,
+    val chunks: Int,
     val ticks: Int,
 )
 
@@ -230,8 +233,8 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- まとめてアンロード: %d tick、取り出して書いた台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、読み込まれたまま %d チャンク\n",
-                    it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded,
+                    "- まとめてアンロード: %d tick、取り出して書いた台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、アンロードされなかった %d / %d チャンク（ケースのあるもの）\n",
+                    it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
                 ),
             )
         }
@@ -306,8 +309,11 @@ internal class LoadRun(
     private var finished = false
     private var autosaveResult: AutosaveResult? = null
     private var unloadResult: UnloadResult? = null
-    private var unloading: List<ChunkPos> = emptyList()
+    private var unloadCaseChunks = 0
+    private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
+    private var savedSpawnChunkRadius: Int? = null
+    private var savedSaveConfig: MachineSaveConfig? = null
     private var unloadPrevWrites = 0L
     private var unloadMaxTickCaptures = 0L
     private var unloadMaxTickWrites = 0L
@@ -317,6 +323,9 @@ internal class LoadRun(
     private var prevSleep = 0L
 
     fun start() {
+        // MOD の自動保存の周期は止める（ほかの段階に混ざらないように）。自動保存の段階は周期を待たずに始める
+        savedSaveConfig = ServerMachines.saveConfig
+        ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
         helper.onEachTick(::onTick)
     }
 
@@ -426,9 +435,10 @@ internal class LoadRun(
         unloadPrevCaptures = s.unloadCaptures
         unloadPrevWrites = s.unloadWrites
         if (phaseTick % 10 != 0) return
-        val loaded = unloading.count { level.chunkSource.hasChunk(it.x, it.z) }
-        if (loaded == 0 || phaseTick >= UNLOAD_TIMEOUT_TICKS) {
-            unloadResult = UnloadResult(s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, loaded, phaseTick)
+        // ケースのあるチャンクが全部アンロードされたら終わり（hasChunk は FULL でなくなっただけでも偽になるので、Unload を数える）
+        val remaining = unloadCaseChunks - s.unloadEventsWithCases.toInt()
+        if (remaining <= 0 || phaseTick >= UNLOAD_TIMEOUT_TICKS) {
+            unloadResult = UnloadResult(s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, remaining.coerceAtLeast(0), unloadCaseChunks, phaseTick)
             next(LoadPhase.UNLOAD)
         }
     }
@@ -505,13 +515,26 @@ internal class LoadRun(
             }
             LoadPhase.WATCHED -> watch(outputSet)
             LoadPhase.UNLOAD -> {
-                // 見ている人は外す（プレイヤーの近くのチャンクは読み込まれたまま）
-                watcher?.let { level.server.playerList.remove(it) }
-                watcher = null
+                // 見ている人は遠くへ動かす（プレイヤーの近くのチャンクは読み込まれたまま。外すのは cleanUp）
+                watcher?.let {
+                    it.teleportTo(it.x + 1_000_000, it.y, it.z)
+                    level.chunkSource.move(it)
+                }
                 ServerMachines.Stats.reset()
-                unloading = forced.toList()
+                // スポーンチャンクに重なると読み込まれたままになるので、この段階だけスポーンチャンクをなくす
+                val rule = level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS)
+                savedSpawnChunkRadius = rule.get()
+                rule.set(0, level.server)
+                unloadCaseChunks = computers.mapTo(HashSet()) { ChunkPos(it.case.blockPos) }.size
                 for (chunk in forced) level.setChunkForced(chunk.x, chunk.z, false)
                 forced.clear()
+                // テストの構造物のチャンク（GameTest が強制読み込みする）も外す。強制読み込みのチャンクは、まわり 13 チャンクを
+                // アンロードさせない（チケットの段階 31 が 44 まで広がる）ので、並べた範囲が全部残ってしまう。終わったら戻す
+                for (packed in level.forcedChunks.toLongArray()) {
+                    val chunk = ChunkPos(packed)
+                    level.setChunkForced(chunk.x, chunk.z, false)
+                    unforcedOthers += chunk
+                }
                 recording = true
             }
         }
@@ -649,6 +672,12 @@ internal class LoadRun(
         ScreenSync.transport = ScreenSync.NETWORK
         for (chunk in forced) level.setChunkForced(chunk.x, chunk.z, false)
         forced.clear()
+        for (chunk in unforcedOthers) level.setChunkForced(chunk.x, chunk.z, true)
+        unforcedOthers.clear()
+        savedSpawnChunkRadius?.let { level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS).set(it, level.server) }
+        savedSpawnChunkRadius = null
+        savedSaveConfig?.let { ServerMachines.saveConfig = it }
+        savedSaveConfig = null
     }
 
     private fun sampleKernelThreads() {
