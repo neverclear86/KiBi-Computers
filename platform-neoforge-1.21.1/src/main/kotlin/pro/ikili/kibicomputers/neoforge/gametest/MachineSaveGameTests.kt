@@ -185,6 +185,64 @@ object MachineSaveGameTests {
     }
 
     /**
+     * FULL でなくなったがメモリに残るチャンク（#545）: 5 チャンク離れたチャンクを強制読み込みにしたまま（ケースのチャンクの
+     * チケットの段階は 36。FULL でなく、アンロードもされない）、ケースのチャンクの強制読み込みを外すと、マシンが取り出されて書かれ、
+     * 外される。チャンクはアンロードされず、ブロックエンティティは残る。FULL に戻すと、同じブロックエンティティが ID を保ったまま、
+     * 電源が切れている（アンロードの後に読み込み直したのと同じ）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun demotedChunkSavesAndStopsTheMachine(helper: GameTestHelper) {
+        val store = store(helper)
+        val level = helper.level
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 400, helper.absolutePos(CASE).z / 16 + 400)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        val unloadsBefore = ServerMachines.Stats.unloadEventsWithCases
+        val demotedBefore = ServerMachines.Stats.demotedMachines
+        // onLoad（追跡と索引）を待ってから外す
+        helper.runAfterDelay(1) {
+            level.setChunkForced(chunk.x, chunk.z, false)
+            var id: UUID? = null
+            helper.startSequence().thenWaitUntil {
+                helper.assertTrue(ServerMachines.Stats.demotedMachines > demotedBefore, "the demotion should take the machine out")
+                helper.assertTrue(be.computer.machine == null, "the machine should be stopped but was ${be.computer}")
+                helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should be off but was ${be.computer}")
+                helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
+                helper.assertTrue(ServerMachines.Stats.unloadEventsWithCases == unloadsBefore, "the chunk should stay in memory (no unload)")
+                val identity = be.identity
+                helper.assertTrue(identity != null, "the demotion should assign an id")
+                helper.assertTrue(Files.isRegularFile(store.generationFile(identity!!.id, identity.generation)), "the generation file should exist")
+                helper.assertTrue(store.latestGeneration(identity.id).asLong == identity.generation, "the case should point at the latest generation")
+                id = identity.id
+            }.thenExecute { afterDemotion(helper, chunk, keeper, pos, be, id!!) }.thenSucceed()
+        }
+    }
+
+    private fun afterDemotion(helper: GameTestHelper, chunk: ChunkPos, keeper: ChunkPos, pos: BlockPos, be: CaseBlockEntity, id: UUID) {
+        val level = helper.level
+        // FULL に戻す: 同じブロックエンティティが ID を保ち、電源は切れている。電源はまた入る
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        helper.assertTrue(level.getBlockEntity(pos) === be, "the block entity should stay in memory")
+        helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should stay off after the chunk is FULL again")
+        helper.assertTrue(be.identity?.id == id, "the case should keep its id but was ${be.identity}")
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "the case should run again but was ${be.computer}")
+        be.pressPowerButton()
+        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+        level.setChunkForced(chunk.x, chunk.z, false)
+        level.setChunkForced(keeper.x, keeper.z, false)
+    }
+
+    /**
      * 爆発（`onBlockExploded`）で壊れたケースは、保存データのディレクトリを消す。ほかのテストのブロックを壊さないよう、
      * 離れたチャンクで爆発させる
      */
