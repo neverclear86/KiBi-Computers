@@ -9,6 +9,9 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
 /** コンピューター（ケース）の状態。GUI の状態表示に出す（#121）。 */
 @ApiStatus.Internal
@@ -208,6 +211,21 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         set(ComputerStatus.NO_POWER)
         return true
     }
+
+    /** チャンクのアンロードの前に、マシンを止める（[MachineSlot.prepareUnload]。#81）。マシンがあれば `true` */
+    public fun prepareUnload(): Boolean = slot.prepareUnload()
+
+    /** [prepareUnload] で止めたのをやめて続ける（[MachineSlot.endQuiesce]） */
+    public fun endQuiesce(): Unit = slot.endQuiesce()
+
+    /** マシンの今の判定。マシンがなければ `null` */
+    public fun saveReadiness(): SaveReadiness? = slot.readiness()
+
+    /** 止めている間に、もう取り出した（[MachineSlot.isCaptured]） */
+    public val isCaptured: Boolean get() = slot.isCaptured
+
+    /** マシンの写しを取る（[MachineSlot.capture]）。マシンがなければ `null` */
+    public fun capture(policy: CapturePolicy): MachineSnapshotSource? = slot.capture(policy)
 
     /** チャンクがアンロードされる。マシンを外して [ComputerStatus.OFF] にする（休止は #132）。 */
     public fun chunkUnloaded() {

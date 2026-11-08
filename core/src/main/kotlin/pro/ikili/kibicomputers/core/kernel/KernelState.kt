@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import pro.ikili.kibicomputers.core.kernel.event.EventHub
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
+import pro.ikili.kibicomputers.core.kernel.process.KernelStateView
 import pro.ikili.kibicomputers.core.kernel.process.ProcessTable
 import pro.ikili.kibicomputers.core.kernel.time.KernelClocks
 import pro.ikili.kibicomputers.core.kernel.vfs.MountTable
@@ -13,12 +14,12 @@ import pro.ikili.kibicomputers.core.kernel.vfs.MountTable
  * オブジェクト同士・プロセスとオブジェクトの間は、番号（pid、オブジェクトID、ハンドル番号）で指す。
  * マシンのカーネルロックの中でだけ読み書きする。
  */
-internal class KernelState(maxProcesses: Int) {
+internal class KernelState(maxProcesses: Int) : KernelStateView {
     /** pid → プロセス（と次に割り当てる pid） */
-    val processes: ProcessTable = ProcessTable(maxProcesses)
+    override val processes: ProcessTable = ProcessTable(maxProcesses)
 
     /** オブジェクトID → カーネルオブジェクト（と次に割り当てる ID） */
-    val objects: ObjectTable = ObjectTable()
+    override val objects: ObjectTable = ObjectTable()
 
     /** イベントの種類 → イベントキューのオブジェクトID の索引（#63、ADR 0063） */
     val events: EventHub = EventHub()

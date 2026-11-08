@@ -140,6 +140,9 @@ public class MachineScheduler private constructor(
     /** 一時停止の印（カーネルロックの中から読む） */
     internal val isPaused: Boolean get() = pauseLock.withLockValue { paused }
 
+    /** 全体の一時停止か、[machine] が止められている（`Machine.quiesce`。#81） */
+    internal fun isPausedFor(machine: Machine): Boolean = machine.isQuiesced || isPaused
+
     /** 一時停止の数えに入っているプロセスの数（テスト用） */
     internal val activeProcesses: Int get() = pauseLock.withLockValue { activeCount }
 
@@ -308,7 +311,8 @@ public class MachineScheduler private constructor(
 
     /** 一時停止でなければ、[rt] を実行中に数えて `true`。カーネルロックの中から呼ぶ（このロックは末端） */
     internal fun tryActivate(rt: ProcessRuntime): Boolean = pauseLock.withLockValue {
-        if (paused) return@withLockValue false
+        // 全体の一時停止と、マシン1台だけを止める印（Machine.quiesce。#81）
+        if (paused || rt.machine.isQuiesced) return@withLockValue false
         if (!rt.active) {
             rt.active = true
             activeCount++

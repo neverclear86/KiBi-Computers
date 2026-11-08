@@ -9,6 +9,10 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.QuiesceHandle
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -171,6 +175,51 @@ public class MachineManager<K : Any> internal constructor(
         }
     }
 
+    // ---- 待機点保存（#81、ADR 0081） ----
+
+    /**
+     * [key] のマシンだけを止める（[Machine.quiesce]。もう止めていれば何もしない）。止めたのは [release]・[endQuiesce] で続ける・捨てるまで。
+     *
+     * @return [key] にマシンがあれば `true`
+     */
+    public fun beginQuiesce(key: K): Boolean {
+        val entry = entries[key] ?: return false
+        if (entry.quiesce == null) entry.quiesce = entry.machine.quiesce()
+        return true
+    }
+
+    /** 一覧にある全マシンを止める（サーバーの停止。[shutdown] まで止めたまま） */
+    public fun quiesceAll() {
+        for (key in ArrayList(entries.keys)) beginQuiesce(key)
+    }
+
+    /** [key] のマシンを止めるのをやめて続ける（取り出し済みの印も消す） */
+    public fun endQuiesce(key: K) {
+        val entry = entries[key] ?: return
+        entry.quiesce?.close()
+        entry.quiesce = null
+        entry.captured = false
+    }
+
+    /** [key] のマシンの今の判定（[Machine.saveReadiness]）。なければ `null` */
+    public fun readiness(key: K): SaveReadiness? = entries[key]?.machine?.saveReadiness()
+
+    /** [key] のマシンを、止めている間にもう取り出した（停止の手順で取り出し、アンロードで取り出し直さないため） */
+    public fun isCaptured(key: K): Boolean = entries[key]?.captured == true
+
+    /**
+     * [key] のマシンの写しを取る（[Machine.captureSnapshot]）。マシンがない・止めている間にもう取り出した・
+     * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。止めている間に取り出したら、取り出し済みの印を付ける
+     * （[endQuiesce] で消える。マシンは [release] まで捨てない）
+     */
+    public fun capture(key: K, policy: CapturePolicy): MachineSnapshotSource? {
+        val entry = entries[key] ?: return null
+        if (entry.captured) return null
+        val source = entry.machine.captureSnapshot(policy) ?: return null
+        if (entry.quiesce != null) entry.captured = true
+        return source
+    }
+
     /** 全マシンを止め、一覧を空にし、スケジューラを閉じる。待たずに返す。2回呼んでもよい */
     override fun close() {
         if (closed) return
@@ -201,17 +250,28 @@ public class MachineManager<K : Any> internal constructor(
 
     private fun stopEntry(entry: Entry<K>) {
         entry.host.released = true
+        // 先にマシンを閉じてから止める印を返す。印を先に返すと、止めている間に起こされたプロセスが、
+        // 写した後・閉じる前に step を動かしうる（写した後は外すまで止めたままにする。ADR 0081）
         try {
             entry.machine.close()
         } catch (t: Throwable) {
             if (isFatal(t)) throw t
             report(errors, "マシン ${entry.host.key} を止められなかった", t)
+        } finally {
+            entry.quiesce?.close()
+            entry.quiesce = null
         }
     }
 
     override fun toString(): String = "MachineManager(${entries.size} machines${if (closed) ", closed" else ""})"
 
-    private class Entry<K : Any>(val machine: Machine, val host: ManagedHost<K>)
+    private class Entry<K : Any>(val machine: Machine, val host: ManagedHost<K>) {
+        /** [beginQuiesce] の印（メインスレッドだけで読み書きする） */
+        var quiesce: QuiesceHandle? = null
+
+        /** 止めている間に取り出した */
+        var captured: Boolean = false
+    }
 }
 
 /** [MachineManager] が [MachineScheduler] に渡す [MachineHost]。接続層の例外を知らせ、外した後の通知を捨てる */

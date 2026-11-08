@@ -40,6 +40,13 @@ internal class AsyncStack {
     /** 積んでいる値の写し（下から順。テストと保存用） */
     fun toLongArray(): LongArray = values.copyOf(size)
 
+    /** 同じ値を積んだ別のインスタンス（保存の写し。#81） */
+    fun copyForSnapshot(): AsyncStack = AsyncStack().also { copy ->
+        if (size > copy.values.size) copy.values = LongArray(size)
+        values.copyInto(copy.values, 0, 0, size)
+        copy.size = size
+    }
+
     /** 空にする（プロセスが終わったとき） */
     fun clear() {
         size = 0

@@ -63,6 +63,12 @@ internal class HandleTable<E : Any>(val limit: Int) {
         return result
     }
 
+    /** 同じ番号に同じエントリを入れた別の表（保存の写し。エントリは不変なので共有する。#81） */
+    fun copyForSnapshot(): HandleTable<E> = HandleTable<E>(limit).also { copy ->
+        copy.slots = slots.copyOf()
+        copy.size = size
+    }
+
     private fun grow(minIndex: Int) {
         var n = slots.size.coerceAtLeast(1)
         while (n <= minIndex) n *= 2

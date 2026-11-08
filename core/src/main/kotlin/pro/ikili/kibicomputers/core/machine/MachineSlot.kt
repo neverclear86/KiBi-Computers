@@ -5,6 +5,9 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
 /**
  * ブロックエンティティ1つが持つ、マシンの席（#120）。ブロックエンティティの出来事を [MachineManager] の操作に変える。
@@ -57,6 +60,38 @@ public class MachineSlot<K : Any> {
         this.key = key
         current = machine
         return machine
+    }
+
+    /**
+     * チャンクのアンロードの前の取り出しの用意: マシンを止める（[MachineManager.beginQuiesce]）。
+     * 続けて [readiness] で待ち、[capture] で取り出し、[chunkUnloaded] で外す（#81）
+     *
+     * @return マシンがあれば `true`
+     */
+    public fun prepareUnload(): Boolean {
+        val manager = manager ?: return false
+        val key = key ?: return false
+        return manager.beginQuiesce(key)
+    }
+
+    /** [prepareUnload] で止めたのをやめて続ける（取り出し済みの印も消す） */
+    public fun endQuiesce() {
+        val manager = manager ?: return
+        val key = key ?: return
+        manager.endQuiesce(key)
+    }
+
+    /** 今の判定。マシンがなければ `null` */
+    public fun readiness(): SaveReadiness? = current?.saveReadiness()
+
+    /** 止めている間に、もう取り出した */
+    public val isCaptured: Boolean get() = key?.let { manager?.isCaptured(it) } == true
+
+    /** マシンの写しを取る（[MachineManager.capture]）。マシンがなければ `null` */
+    public fun capture(policy: CapturePolicy): MachineSnapshotSource? {
+        val manager = manager ?: return null
+        val key = key ?: return null
+        return manager.capture(key, policy)
     }
 
     /**

@@ -73,6 +73,13 @@ internal class ProcessTable(val limit: Int) {
         return table.remove(pid)
     }
 
+    /** プロセスごとに写した別の表（保存の写し。`nextPid`・親のないゾンビの並びも写す。#81） */
+    fun copyForSnapshot(): ProcessTable = ProcessTable(limit).also { copy ->
+        for (process in table.values) copy.table[process.pid] = process.copyForSnapshot()
+        copy.orphans.addAll(orphans)
+        copy.nextPid = nextPid
+    }
+
     /** 終わったプロセス（ゾンビ）をすべて外し、pid を 1 から振り直す（起動のとき。#49）。終わっていないプロセスがあれば [IllegalStateException] */
     fun reset() {
         check(liveCount() == 0) { "終わっていないプロセスがある" }

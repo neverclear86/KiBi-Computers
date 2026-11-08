@@ -12,6 +12,7 @@ import net.minecraft.world.Containers
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.context.BlockPlaceContext
+import net.minecraft.world.level.Explosion
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.EntityBlock
@@ -84,6 +85,17 @@ class CaseBlock(val tier: CaseTier, properties: BlockBehaviour.Properties) : Blo
     // neighborChanged で回した、画面のつなぎ直し（置いたブロックのデータを読み込んだ後に行う。#535）
     override fun tick(state: BlockState, level: ServerLevel, pos: BlockPos, random: RandomSource) {
         (level.getBlockEntity(pos) as? CaseBlockEntity)?.reconnectScreen()
+    }
+
+    // プレイヤーの破壊と爆発のときだけ、マシンの保存データのディレクトリを消す（#81。ブロックを運ぶ MOD の setRemoved では消さない）
+    override fun playerWillDestroy(level: Level, pos: BlockPos, state: BlockState, player: Player): BlockState {
+        if (!level.isClientSide) (level.getBlockEntity(pos) as? CaseBlockEntity)?.deleteSaves()
+        return super.playerWillDestroy(level, pos, state, player)
+    }
+
+    override fun onBlockExploded(state: BlockState, level: Level, pos: BlockPos, explosion: Explosion) {
+        if (!level.isClientSide) (level.getBlockEntity(pos) as? CaseBlockEntity)?.deleteSaves()
+        super.onBlockExploded(state, level, pos, explosion)
     }
 
     @Deprecated("Deprecated in Java")

@@ -123,5 +123,25 @@ internal class Process(
     val waitTimers: WaitTimerSet = WaitTimerSet()
 
     /** ハンドル表（fd 表。0/1/2 は標準入出力。操作は `FdTable` を通す。Component Model の resource の表は #265） */
-    val handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
+    var handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
+        private set
+
+    /**
+     * 全欄を写した別のインスタンス（保存の写し。#81、ADR 0081）。fd 表・一時的なタイマー・無視するシグナル・退避した値は作り直し、
+     * 不変のもの（`wait` のリスト、`asyncWait`、引数・環境変数）は共有する。元を変えても写しは変わらない
+     */
+    fun copyForSnapshot(): Process {
+        val copy = Process(pid, parentPid, kind, moduleHash, unmetered, args, env, cwd)
+        copy.objectId = objectId
+        copy.state = state
+        copy.exitCode = exitCode
+        copy.termSignal = termSignal
+        copy.ignoredSignals.addAll(ignoredSignals)
+        copy.wait = wait
+        copy.asyncStack = asyncStack?.copyForSnapshot()
+        copy.asyncWait = asyncWait
+        waitTimers.forEach(copy.waitTimers::add)
+        copy.handles = handles.copyForSnapshot()
+        return copy
+    }
 }

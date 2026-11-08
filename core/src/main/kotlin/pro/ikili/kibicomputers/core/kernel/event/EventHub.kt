@@ -109,6 +109,13 @@ internal class EventHub(
         return queue.offer(event, sink)
     }
 
+    /** 同じ索引を持つ別のインスタンス（保存の写し。#81） */
+    fun copyForSnapshot(): EventHub = EventHub(maxQueues, maxPendingBytes).also { copy ->
+        copy.queues = queues?.let(::LinkedHashSet)
+        copy.all = all?.let(::LinkedHashSet)
+        copy.byType = byType?.let { map -> HashMap(map.mapValues { LinkedHashSet(it.value) }) }
+    }
+
     /** 索引の場所に合う `EventQueue` でない ID を外す（件数は索引の ID の数に比例する） */
     fun sweep(objects: ObjectTable) {
         val ids = queues ?: return
