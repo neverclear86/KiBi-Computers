@@ -99,7 +99,7 @@ internal enum class LoadPhase(val label: String) {
  * @property count 並べる台数
  * @property busy 計算・出力させる台数（それぞれ）
  * @property paced 実際のサーバーと同じく 1 tick を 50 ms にそろえるか。GameTest のサーバーは待たずに tick を進めるので、
- *   そろえないと計算している台に配る燃料（tick ごと）が実際より多くなる
+ *   そろえないと計算している台に配る燃料（tick ごと）が実際より多くなる。重い tick で遅れたら、実際のサーバーと同じく待たずに追いつく（#540）
  * @property warmupTicks 段階が変わってから（[LoadPhase.OUTPUT] では、出力が出てから）、測りはじめるまでの tick 数
  * @property measureTicks 測る tick 数
  * @property bootTimeoutTicks 全台がプロンプトを出すまで待つ上限
@@ -370,7 +370,10 @@ internal class LoadRun(
         prevHarness = end - now
         prevSleep = 0
         if (settings.paced && !finished) {
-            val wait = TARGET_NANOS - work - prevHarness
+            // 実際のサーバーと同じく、サーバーの次の tick の予定（getNextTickTime）までしか待たない。遅れていれば待たずに追いつく。
+            // 1 tick の長さだけで待つと、重い tick（アンロードの書き込みなど）で遅れた分が戻らず、tick の残り時間（haveTime）が
+            // ずっとなくなる。するとチャンクのアンロードの列が 2,000 件を超えるまで流れず、アンロードが進まない（#540）
+            val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
             if (wait > 0) {
                 LockSupport.parkNanos(wait)
                 prevSleep = System.nanoTime() - end
