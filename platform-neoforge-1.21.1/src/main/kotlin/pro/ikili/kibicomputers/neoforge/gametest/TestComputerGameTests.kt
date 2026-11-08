@@ -142,6 +142,55 @@ object TestComputerGameTests {
     }
 
     /**
+     * 動いているマシンの画面を壊しても、ケースのスピーカーはつないだままで、ビープが届く。
+     * 画面を置き直すと、画面とキーボードをつなぎ直し、打った式の結果が新しい画面に出る（#531）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun breakingScreenKeepsSpeakerAndReplacingReconnects(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        var broken = false
+        var replaced: ScreenBlockEntity? = null
+        helper.succeedWhen {
+            if (!broken) {
+                helper.assertTrue(lines(screen.text).any { it == ">" }, "prompt should be shown")
+                helper.setBlock(SCREEN, Blocks.AIR)
+                broken = true
+                val listed = machine.devices.list()
+                helper.assertTrue(listed == listOf(DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER)), "only the speaker should stay: $listed")
+                val speaker = machine.devices.deviceAt(case.speakerAddress) as? SpeakerDevice
+                helper.assertTrue(speaker?.beep(440, 100) == true, "the speaker should still accept a beep")
+            }
+            if (replaced == null) {
+                helper.assertTrue(case.wiring.beeps.get() == 1L, "the beep should be delivered after the screen is gone")
+                helper.setBlock(
+                    SCREEN,
+                    KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+                )
+                val placed = helper.getBlockEntity<ScreenBlockEntity>(SCREEN)
+                replaced = placed
+                helper.assertTrue(case.wiring.connectedScreen === placed, "the placed screen should be reconnected")
+                helper.assertTrue(case.wiring.connectedKeyboard === keyboard, "the keyboard should be reconnected")
+                helper.assertTrue(machine.devices.primaryScreen === case.wiring.connectedScreenDevice, "the screen device should be the console again")
+                val expected = listOf(
+                    DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER),
+                    DeviceInfo(placed.deviceAddress, DeviceKind.SCREEN),
+                    DeviceInfo(keyboard.deviceAddress, DeviceKind.KEYBOARD),
+                )
+                helper.assertTrue(machine.devices.list() == expected, "devices should be attached again: ${machine.devices.list()}")
+                typeLine(helper, keyboard, "print(20+22)")
+            }
+            val text = locked(replaced!!) { lines(replaced!!.text) }
+            helper.assertTrue(text.any { it == "42" }, "the result should be shown on the placed screen: $text")
+            helper.assertTrue(machine.state == MachineState.RUNNING, "machine should keep running")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
      * プログラムが出力し続けている最中（プロセスのスレッドが表示デバイスに書いている間。#355）に画面を壊すと、すぐに外し、
      * 外れた画面（が映していた表示デバイス）にはもう書かない（#397）。
      */
