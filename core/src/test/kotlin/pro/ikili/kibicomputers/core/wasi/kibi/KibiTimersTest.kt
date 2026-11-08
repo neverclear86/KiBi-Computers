@@ -135,7 +135,7 @@ class KibiTimersTest {
         val e = batch.events[0]
         assertEquals("timer", e.type)
         assertEquals("", e.source)
-        assertEquals(listOf(EventValue.I64(-7), EventValue.I64(1)), e.values)
+        assertEquals(listOf(EventValue.Integer(-7), EventValue.Integer(1)), e.values)
         assertEquals(0L, KibiTimers.read(ctx, t))
     }
 

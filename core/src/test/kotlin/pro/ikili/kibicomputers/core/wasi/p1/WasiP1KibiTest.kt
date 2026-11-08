@@ -109,7 +109,7 @@ class WasiP1KibiTest {
     private val event = KernelEvent(
         "test",
         "dev",
-        listOf(EventValue.I64(-5), EventValue.F64(1.5), EventValue.Bool(true), EventValue.Text("hé"), EventValue.Bytes(byteArrayOf(1, 2))),
+        listOf(EventValue.Integer(-5), EventValue.Float(1.5), EventValue.Boolean(true), EventValue.Text("hé"), EventValue.Bytes(byteArrayOf(1, 2))),
     )
 
     private fun Run.waitAndPost() {
@@ -121,7 +121,7 @@ class WasiP1KibiTest {
     }
 
     private fun assertWaitOutput(out: String) {
-        assertTrue("batch 1 dropped 0\nevent test [dev] s64:-5 f64:1.5 bool:1 text:68c3a9 bytes:0102\n" in out, out)
+        assertTrue("batch 1 dropped 0\nevent test [dev] integer:-5 float:1.5 boolean:1 text:68c3a9 bytes:0102\n" in out, out)
         // 配列・kind・source・値の配列・text・bytes
         assertTrue("realloc calls 6\n" in out, out)
         assertTrue("after close 1 7\n" in out, out)

@@ -12,7 +12,7 @@ interface timers {
     /// タイマー。作ると止まった状態で、`set-after`・`set-at` で動かす。
     resource timer {
         /// 止まった状態のタイマーを作る。
-        /// events を渡すと、鳴るたびにそのキューへ種類 "timer"・出したもの ""・値 [s64(tag), s64(回数)] のイベントを入れる
+        /// events を渡すと、鳴るたびにそのキューへ種類 "timer"・出したもの ""・値 [integer(tag), integer(回数)] のイベントを入れる
         /// （そのときは read は 0 を返し、FD_READ にもならない）。省くとイベントは出さない。
         /// キューでなければ bad-descriptor、キューが "timer" を受け取らなければ invalid、ハンドル表が満杯なら mfile。
         create: static func(events: option<tuple<borrow<event-queue>, s64>>) -> result<timer, error-code>;

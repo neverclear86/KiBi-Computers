@@ -66,8 +66,6 @@ class HostBoundaryJavaTest {
 
         MachineConfig config = MachineConfig.builder().maxHostCallsPerTick(8).build();
         assertEquals(8, config.getMaxHostCallsPerTick());
-        assertTrue(Machine.MIN_BEEP_FREQUENCY_HZ < Machine.MAX_BEEP_FREQUENCY_HZ);
-        assertTrue(Machine.MAX_BEEP_DURATION_MILLIS > 0);
 
         MachineScheduler scheduler = new MachineScheduler();
         try {
@@ -79,8 +77,6 @@ class HostBoundaryJavaTest {
 
             // 既定の実装は何もしない（呼べる）
             host.onConsoleOutput(machine, new byte[] {1});
-            host.onBeep(machine, 440, 100);
-            machine.notifyDevicesChanged();
             scheduler.tick();
         } finally {
             scheduler.close();

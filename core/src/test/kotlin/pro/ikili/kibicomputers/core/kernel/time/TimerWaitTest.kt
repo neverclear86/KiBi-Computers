@@ -142,7 +142,7 @@ class TimerWaitTest {
                     val batch = ctx.takeEvents(queue.get())
                     val e = batch.events.single()
                     assertEquals(TimerLimits.EVENT_TYPE, e.type)
-                    got.set(e.values.map { (it as EventValue.I64).value })
+                    got.set(e.values.map { (it as EventValue.Integer).value })
                     assertEquals(0, ctx.takeEvents(other.get()).events.size, "ほかのキューには入れない")
                     StepResult.Exit(0)
                 },

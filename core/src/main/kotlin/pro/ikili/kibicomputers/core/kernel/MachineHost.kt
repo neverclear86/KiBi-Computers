@@ -21,20 +21,13 @@ public fun interface MachineHost {
     public fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?)
 
     /**
-     * 画面への出力（カーネルのコンソール。起動のログ、カーネルのメッセージ、画面のデバイスがないときの標準出力の行き先）。
+     * 画面のデバイスがないときのコンソールの出力（起動のログ、カーネルのメッセージ、標準出力など）。
+     * 画面のデバイス（`Machine.devices` の `primaryScreen`。#65）をつないでいる間は、そこへ書き、ここには渡さない。
      * 中身はコンソールの TTY を通ったバイト列（#60）。改行はいつも CR LF になっている（TTY の出力も、カーネルのメッセージも）。
      * エスケープシーケンスなど、端末としての解釈は受け取る側が行う（#61）。続けて積まれた出力は、1回にまとめて渡す。
      * 渡した配列はカーネルがもう使わないので、持っていてよい
      */
     public fun onConsoleOutput(machine: Machine, bytes: ByteArray) {}
-
-    /**
-     * ビープを鳴らす。
-     *
-     * @param frequencyHz 周波数（[Machine.MIN_BEEP_FREQUENCY_HZ]〜[Machine.MAX_BEEP_FREQUENCY_HZ] に丸めてある）
-     * @param durationMillis 長さ（1〜[Machine.MAX_BEEP_DURATION_MILLIS] に丸めてある）
-     */
-    public fun onBeep(machine: Machine, frequencyHz: Int, durationMillis: Int) {}
 
     /**
      * 起動（[Machine.boot]）に失敗した（#49）。マシンは [MachineState.STOPPED] のまま。

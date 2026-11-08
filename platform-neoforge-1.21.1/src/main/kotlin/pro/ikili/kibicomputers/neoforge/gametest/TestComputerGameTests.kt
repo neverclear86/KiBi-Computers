@@ -13,6 +13,9 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.device.DeviceKind
+import pro.ikili.kibicomputers.core.device.SpeakerDevice
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.input.Key
@@ -74,7 +77,7 @@ object TestComputerGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         helper.assertTrue(case.wiring.connectedScreen === screen, "the adjacent screen should be connected")
         helper.assertTrue(case.wiring.connectedKeyboard === keyboard, "the adjacent keyboard should be connected")
-        helper.assertTrue(screen.display === case.wiring.connectedConsole?.display, "the screen should mirror the machine's display device")
+        helper.assertTrue(screen.display === case.wiring.connectedScreenDevice?.display, "the screen should mirror the machine's display device")
         val machine = case.computer.machine!!
         var typed = false
         helper.succeedWhen {
@@ -112,7 +115,7 @@ object TestComputerGameTests {
         val (case, screen, keyboard) = build(helper)
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         val machine = case.computer.machine!!
-        val console = case.wiring.connectedConsole!!
+        val console = case.wiring.connectedScreenDevice!!
         // 壊した直後に確かめたこと（succeedWhen は失敗すると次の tick にやり直すので、結果を取っておく）
         var problem: String? = null
         var broken = false
@@ -125,7 +128,7 @@ object TestComputerGameTests {
                 problem = when {
                     !screen.isRemoved -> "the screen block entity should be removed"
                     case.wiring.connectedScreen != null -> "breaking the screen should disconnect it at once"
-                    case.wiring.connectedConsole != null -> "breaking the screen should drop the console"
+                    case.wiring.connectedScreenDevice != null || machine.devices.primaryScreen != null -> "breaking the screen should detach the screen device"
                     case.wiring.connectedKeyboard != null || keyboard.owner != null -> "breaking the screen should free the keyboard"
                     console.backlogBytes != 0 -> "nothing should be kept for the removed screen: ${console.backlogBytes}"
                     else -> null
@@ -148,7 +151,7 @@ object TestComputerGameTests {
         val (case, screen, keyboard) = build(helper)
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         val machine = case.computer.machine!!
-        val console = case.wiring.connectedConsole!!
+        val console = case.wiring.connectedScreenDevice!!
         helper.assertTrue(screen.display === console.display, "the screen should mirror the machine's display device")
         var typed = false
         var broken = false
@@ -239,5 +242,44 @@ object TestComputerGameTests {
         helper.setBlock(CASE, Blocks.AIR)
         helper.setBlock(secondPos, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 電源を入れると、ケースのスピーカーと隣の画面・キーボードのデバイスを、それぞれのブロックの address でつなぐ（#65）。
+     * address はセーブデータに書き、読み直しても変わらない。電源を切ると外す
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun devicesAreAttachedWithSavedAddresses(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        val expected = listOf(
+            DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER),
+            DeviceInfo(screen.deviceAddress, DeviceKind.SCREEN),
+            DeviceInfo(keyboard.deviceAddress, DeviceKind.KEYBOARD),
+        )
+        helper.assertTrue(machine.devices.list() == expected, "devices should be attached: ${machine.devices.list()}")
+        helper.assertTrue(machine.devices.primaryScreen === case.wiring.connectedScreenDevice, "the screen device should be the console")
+        helper.assertTrue(expected.map { it.address }.toSet().size == 3, "addresses should differ: $expected")
+        // セーブデータに書いた address は、読み直しても同じ
+        val registries = helper.level.registryAccess()
+        val caseTag = case.saveWithoutMetadata(registries)
+        helper.assertTrue(caseTag.getString(CaseBlockEntity.SPEAKER_ADDRESS_TAG) == case.speakerAddress, "speaker address should be saved: $caseTag")
+        val reloadedScreen = ScreenBlockEntity(screen.blockPos, screen.blockState)
+        reloadedScreen.loadWithComponents(screen.saveWithoutMetadata(registries), registries)
+        helper.assertTrue(reloadedScreen.deviceAddress == screen.deviceAddress, "screen address should survive a reload")
+        val reloadedKeyboard = KeyboardBlockEntity(keyboard.blockPos, keyboard.blockState)
+        reloadedKeyboard.loadWithComponents(keyboard.saveWithoutMetadata(registries), registries)
+        helper.assertTrue(reloadedKeyboard.deviceAddress == keyboard.deviceAddress, "keyboard address should survive a reload")
+        // スピーカーのビープは、次の tick からメインスレッドで受け手に届く
+        val speaker = machine.devices.deviceAt(case.speakerAddress) as SpeakerDevice
+        helper.assertTrue(speaker.beep(440, 100), "the speaker should accept a beep")
+        helper.succeedWhen {
+            helper.assertTrue(case.wiring.beeps.get() == 1L, "the beep should be delivered")
+            case.pressPowerButton()
+            helper.assertTrue(machine.devices.list().isEmpty(), "turning off should detach the devices: ${machine.devices.list()}")
+            helper.setBlock(CASE, Blocks.AIR)
+        }
     }
 }

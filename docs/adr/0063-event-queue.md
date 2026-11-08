@@ -60,7 +60,7 @@ override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
 
 ### イベントの中身
 
-`KernelEvent(type, source, values)`。`type` は種類（名前は出す側の Issue が決める）、`source` は出したもの（デバイスの識別子など。なければ ""）。値は `EventValue` の `I64`・`F64`・`Bool`・`Text`・`Bytes`（保存できる値だけ。`Bytes` は作るとき・外へ渡すときに写す）。WASM・WIT への写し方は #73。
+`KernelEvent(type, source, values)`。`type` は種類（名前は出す側の Issue が決める）、`source` は出したもの（デバイスの識別子など。なければ ""）。値は `EventValue` の `Integer`・`Float`・`Boolean`・`Text`・`Bytes`（#65 で `I64`・`F64`・`Bool` から改名した。保存できる値だけ。`Bytes` は作るとき・外へ渡すときに写す）。WASM・WIT への写し方は #73。
 
 ### 索引の掃除
 

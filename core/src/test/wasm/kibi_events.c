@@ -76,9 +76,9 @@ static void print_batch(const kibi_event_batch_t *b) {
         for (uint32_t j = 0; j < e->values.len; j++) {
             const kibi_event_value_t *v = &e->values.ptr[j];
             switch (v->tag) {
-            case KIBI_EVENT_VALUE_S64: printf(" s64:%lld", (long long)v->val.s64); break;
-            case KIBI_EVENT_VALUE_F64: printf(" f64:%g", v->val.f64); break;
-            case KIBI_EVENT_VALUE_BOOL: printf(" bool:%u", v->val.boolean); break;
+            case KIBI_EVENT_VALUE_INTEGER: printf(" integer:%lld", (long long)v->val.integer); break;
+            case KIBI_EVENT_VALUE_FLOAT: printf(" float:%g", v->val.floating); break;
+            case KIBI_EVENT_VALUE_BOOLEAN: printf(" boolean:%u", v->val.boolean); break;
             case KIBI_EVENT_VALUE_TEXT:
                 printf(" text:");
                 print_bytes(v->val.text.ptr, v->val.text.len);

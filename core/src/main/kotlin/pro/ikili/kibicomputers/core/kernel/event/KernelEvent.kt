@@ -2,16 +2,18 @@ package pro.ikili.kibicomputers.core.kernel.event
 
 /**
  * イベントの値。保存できる値（数値・真偽・文字列・バイト列）だけ。WASM・WIT への写し方は #73。
+ * case の名前は WIT の `event-value`（`integer`・`float`・`boolean`・`text`・`bytes`）と同じ（#65 で改名した。ADR 0073）。
+ * Kotlin の型と紛れるので、使う側は `EventValue.Integer(...)` のように必ず修飾して書く。
  */
 internal sealed interface EventValue {
-    /** 64 ビット整数 */
-    data class I64(val value: Long) : EventValue
+    /** 64 ビット整数（WIT の `integer`） */
+    data class Integer(val value: kotlin.Long) : EventValue
 
-    /** 64 ビット浮動小数 */
-    data class F64(val value: Double) : EventValue
+    /** 64 ビット浮動小数（WIT の `float`） */
+    data class Float(val value: kotlin.Double) : EventValue
 
-    /** 真偽 */
-    data class Bool(val value: Boolean) : EventValue
+    /** 真偽（WIT の `boolean`） */
+    data class Boolean(val value: kotlin.Boolean) : EventValue
 
     /** 文字列 */
     data class Text(val value: String) : EventValue
@@ -26,7 +28,7 @@ internal sealed interface EventValue {
         /** 中身の写し */
         fun toByteArray(): ByteArray = data.copyOf()
 
-        override fun equals(other: Any?): Boolean = other is Bytes && data.contentEquals(other.data)
+        override fun equals(other: Any?): kotlin.Boolean = other is Bytes && data.contentEquals(other.data)
 
         override fun hashCode(): Int = data.contentHashCode()
 

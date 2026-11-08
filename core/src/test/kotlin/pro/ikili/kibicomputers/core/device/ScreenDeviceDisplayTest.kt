@@ -1,7 +1,9 @@
-package pro.ikili.kibicomputers.core.computer
+package pro.ikili.kibicomputers.core.device
 
+import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerCase
+import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -24,7 +26,7 @@ import java.util.concurrent.locks.ReentrantLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 表示デバイス（#355）: プロセスの出力は、プロセスのスレッドで表示デバイスに書く */
-class DisplayDeviceConsoleTest {
+class ScreenDeviceDisplayTest {
     private val limit = Duration.ofSeconds(90)
     private val testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot"
 
@@ -42,28 +44,27 @@ class DisplayDeviceConsoleTest {
         }
     }
 
-    /** メインスレッドに届いたコンソールの出力を記録して、[console] に流す */
+    /** 接続層に届いたコンソールの出力（画面のデバイスがないときの行き先）を記録する */
     private class Recorder : MachineHost {
-        var console: MachineConsole? = null
         val delivered = ByteArrayOutputStream()
 
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
 
         override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
             delivered.write(bytes)
-            console?.write(bytes)
         }
     }
 
-    private fun boot(console: MachineConsole, block: (MachineManager<String>, Machine, Recorder) -> Unit) {
+    private val keyboard = KeyboardDevice()
+
+    private fun boot(console: ScreenDevice, block: (MachineManager<String>, Machine, Recorder) -> Unit) {
         val manager = MachineManager<String>()
         try {
             val host = Recorder()
-            host.console = console
             val case = ComputerCase<String>(CaseTier.BASIC, host)
             assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "pc", { true }, true, MachineConfig.DEFAULT))
             val machine = case.machine!!
-            console.machine = machine
+            machine.attachConsole(console, keyboard)
             assertTrue(machine.boot(BootConfig.builder().addBootDisk(testBootDisk).build()))
             block(manager, machine, host)
             case.turnOff()
@@ -81,21 +82,21 @@ class DisplayDeviceConsoleTest {
     @Test
     fun `プロセスの出力は、メインスレッドを通らずに表示デバイスに書かれる`() = timeout(limit) {
         val display = DisplayDevice.forTier(ScreenTier.COLOR)
-        val console = MachineConsole(display)
+        val console = ScreenDevice(display)
         boot(console) { manager, machine, host ->
             assertSame(display.consoleSink, machine.consoleSink, "つなぐと書く先になる")
             manager.tickUntil({ "プロンプトが出ない: ${lines(display)}" }) { lines(display).lastOrNull { it.isNotEmpty() } == ">" }
             host.delivered.reset()
-            console.keyboardInput(KeyboardEvent.Paste("for i=1,300 do print('n'..i) end\n"))
+            keyboard.input(KeyboardEvent.Paste("for i=1,300 do print('n'..i) end\n"))
             manager.tickUntil({ "最後まで出ない: ${lines(display)}" }) {
                 val shown = lines(display).filter { it.isNotEmpty() }
                 shown.lastOrNull() == ">" && shown.contains("n300")
             }
             val shown = lines(display).filter { it.isNotEmpty() }
             assertEquals((290..300).map { "n$it" } + ">", shown.takeLast(12), "$shown")
-            // プログラムの出力は、メインスレッドの通知（onConsoleOutput）には来ない（エコーなどだけ）
+            // 画面のデバイスをつないでいる間は、接続層（onConsoleOutput）には何も来ない（#65。メインスレッドの分も画面のデバイスに書く）
             val delivered = host.delivered.toString(Charsets.UTF_8)
-            assertFalse(delivered.contains("n150"), "メインスレッドに届いた出力: $delivered")
+            assertEquals("", delivered, "接続層に届いた出力")
         }
     }
 
@@ -114,12 +115,12 @@ class DisplayDeviceConsoleTest {
                 return bytes.size.toLong()
             }
         }
-        val console = MachineConsole(TextBuffer(80, 25), 2)
+        val console = ScreenDevice(TextBuffer(80, 25), 2)
         boot(console) { manager, machine, _ ->
             manager.tickUntil({ "プロンプトが出ない" }) { lines(console.display).lastOrNull { it.isNotEmpty() } == ">" }
-            // マシンの書く先を、記録するものに替える（キー入力は MachineConsole から入れる）
+            // マシンの書く先を、記録するものに替える（キー入力は KeyboardDevice から入れる）
             machine.consoleSink = sink
-            console.keyboardInput(KeyboardEvent.Paste("for i=1,100 do print('m'..i) end\n"))
+            keyboard.input(KeyboardEvent.Paste("for i=1,100 do print('m'..i) end\n"))
             manager.tickUntil({ "出力が出ない: ${synchronized(written) { written.toString(Charsets.UTF_8) }}" }) {
                 synchronized(written) { written.toString(Charsets.UTF_8).contains("m100") }
             }

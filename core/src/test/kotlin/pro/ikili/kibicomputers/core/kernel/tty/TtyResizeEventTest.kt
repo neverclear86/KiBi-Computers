@@ -40,7 +40,7 @@ class TtyResizeEventTest {
         }
     }
 
-    private fun values(vararg v: Long): List<EventValue> = v.map { EventValue.I64(it) }
+    private fun values(vararg v: Long): List<EventValue> = v.map { EventValue.Integer(it) }
 
     @Test
     fun `resizeConsoleで、tty-resizeのキューにconsoleから列・行・世代が入る`() = inProcess { ctx, m ->

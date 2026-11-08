@@ -1,5 +1,9 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.CallResult
+import pro.ikili.kibicomputers.core.device.DeviceCallException
+import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -198,7 +202,7 @@ internal interface ProcessContext {
 
     /**
      * タイマーを作って自分のハンドル表に入れ、ハンドル番号を返す（読む権利だけ。止まった状態で作る）。
-     * [eventQueue] がイベントキューのハンドルなら、鳴るたびにそのキューへ `timer` のイベント（値は `I64(tag)`・`I64(回数)`）を入れる
+     * [eventQueue] がイベントキューのハンドルなら、鳴るたびにそのキューへ `timer` のイベント（値は `Integer(tag)`・`Integer(回数)`）を入れる
      * （そのときは [readTimer] は 0 を返し、`READABLE` にもならない）。
      * [eventQueue] がイベントキューでない・読めないなら `FsException(BADF)`、キューが `timer` を受け取らないなら `FsException(INVAL)`、
      * ハンドル表が満杯なら `FsException(MFILE)`
@@ -404,11 +408,43 @@ internal interface ProcessContext {
     @Throws(ProcessKilledException::class)
     fun <T> submitHostCall(call: HostCall<T>): HostWait<T>
 
-    /** コンソール（画面）へ出力する（[MachineHost.onConsoleOutput]）。上限を超えて捨てた分があれば `false` */
+    /** コンソール（画面）へ出力する（画面のデバイスがあればそこへ、なければ [MachineHost.onConsoleOutput]）。上限を超えて捨てた分があれば `false` */
     fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean
 
-    /** ビープを鳴らす（[MachineHost.onBeep]）。捨てたら `false` */
-    fun beep(frequencyHz: Int, durationMillis: Int): Boolean
+    // ---- デバイス（#65、ADR 0065。WASM に見せる形は #77） ----
+
+    /** つないでいるデバイスの一覧（WIT の `list-devices`）。待たない。どのスレッドから呼んでもよい */
+    fun listDevices(): List<DeviceInfo>
+
+    /**
+     * デバイス [address] を開き、`device` resource の fd を返す（読む権利だけ。WIT の `[static]device.open`、`/dev/device/<address>` #54）。
+     * つないでいなければ [DeviceCallException]（`detached`）、ハンドル表が満杯なら `FsException(MFILE)`
+     */
+    @Throws(DeviceCallException::class, FsException::class)
+    fun openDevice(address: String): Int
+
+    /**
+     * デバイス [address] のメソッド [method] を [args] で呼び、結果まで待つ（WIT の `invoke`）。燃料を払う（ADR 0065）。
+     * 直接のメソッドはこのスレッドで実行する。メインスレッドのメソッドを待てるのは、ブロッキング型（と作っている途中）だけ
+     * （待機点型は [startDeviceCall] で積んで、fd を待つ）。失敗は [DeviceCallException]。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(DeviceCallException::class, ProcessKilledException::class)
+    fun invokeDevice(address: String, method: String, args: List<DeviceValue>): List<DeviceValue>
+
+    /**
+     * [invokeDevice] と同じ呼び出しを待たずに積み、`pending-call` の fd（読む権利だけ。終わると `READABLE`）を返す（WIT の `start`）。
+     * 出した順に実行する。燃料を払う。1プロセス [pro.ikili.kibicomputers.core.device.DeviceLimits.MAX_PENDING_CALLS] 個までで、
+     * 超えたら `FsException(AGAIN)`。ハンドル表が満杯なら `FsException(MFILE)`。カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class)
+    fun startDeviceCall(address: String, method: String, args: List<DeviceValue>): Int
+
+    /**
+     * `pending-call` の fd [fd] の結果（WIT の `take`）。終わっていなければ `null`（待たない）。結果の分の燃料を払う。fd は閉じない。
+     * `pending-call` でなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class)
+    fun takeDeviceCall(fd: Int): CallResult?
 
     /**
      * マシンを止める（`Machine.stop`。#49）。このプロセスも止められるので、この後のホスト関数・待ちは [ProcessKilledException] になる。

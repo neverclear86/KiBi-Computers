@@ -1,6 +1,10 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.device.DeviceBus
+import pro.ikili.kibicomputers.core.device.DeviceDispatcher
+import pro.ikili.kibicomputers.core.device.DeviceLimits
+import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
 import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
@@ -60,6 +64,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -74,7 +79,6 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
@@ -319,7 +323,7 @@ public class Machine private constructor(
      * コンソールの出力を書く先（表示デバイス。#355）。あれば、コンソールの TTY に書いたプロセスが、自分のスレッドで
      * [pumpConsole] から書く（端末の処理の重さは、そのプロセスの燃料で払う）。カーネルのメッセージと、プロセス以外が TTY に
      * 積んだ出力（キー入力のエコーなど）は、これまでどおり [MachineHost.onConsoleOutput] でメインスレッドに配る。
-     * メインスレッドから入れ替える（`MachineConsole.machine`）
+     * メインスレッドから入れ替える（`ScreenDevice.machine`）
      */
     @Volatile
     internal var consoleSink: ConsoleSink? = null
@@ -332,20 +336,21 @@ public class Machine private constructor(
      */
     private var deferredConsole: ArrayList<HostNotification>? = null
 
-    /** 配っていないコンソール出力のバイト数と、ビープの数（上限を超えた分は捨てる） */
+    /** 配っていないコンソール出力のバイト数（上限を超えた分は捨てる） */
     private val pendingConsoleBytes = AtomicLong()
-    private val pendingBeeps = AtomicInteger()
 
-    /** 捨てたコンソール出力のバイト数・ビープの数（数え口） */
+    /** 捨てたコンソール出力のバイト数（数え口） */
     internal val droppedConsoleBytes = AtomicLong()
-    internal val droppedBeeps = AtomicLong()
 
     /** メインスレッドで実行するのを待つホスト呼び出し（カーネルロック） */
     private val hostCalls = ArrayDeque<PendingHostCall<*>>()
     private val queuedForHostCalls = AtomicBoolean(false)
 
-    /** つながっているデバイスが変わった回数（実行時だけ。#63・#65 がイベントにする） */
-    private val devicesGenerationCounter = AtomicLong()
+    /**
+     * つないでいるデバイスの表（#65、ADR 0065）。接続層が `attach`・`detach` でデバイスをつなぐ（どのスレッドからも呼べる。待たない）。
+     * 表を変えるたびに世代（`DeviceBus.generation`）が上がる（ADR 0044 の変更の知らせを置き換えた。ADR 0065）
+     */
+    public val devices: DeviceBus = DeviceBus(this)
 
     // ---- 起動（#49）。どれも実行時だけで、保存しない（カーネルロック）。init の pid は [KernelState.initPid]（保存の対象。#365） ----
 
@@ -495,15 +500,6 @@ public class Machine private constructor(
             if (t.isAlive) return false
         }
         return true
-    }
-
-    /**
-     * つながっているデバイスが変わった（つながった・外れた）ことを知らせる（接続層 → カーネル）。
-     * どのスレッドから呼んでもよい。待たずに返す。何が変わったかは、カーネルがホスト呼び出しで接続層に尋ねる
-     * （デバイスの識別子と呼び出し方は #65。イベントとしてプロセスに届けるのは #63）
-     */
-    public fun notifyDevicesChanged() {
-        devicesGenerationCounter.incrementAndGet()
     }
 
     /** `stop()` してスケジューラから外す。待たずに返す */
@@ -1044,7 +1040,7 @@ public class Machine private constructor(
         lock.withLockValue {
             val tty = consoleTtyLocked()
             if (tty.resize(size)) {
-                val values = listOf(EventValue.I64(columns.toLong()), EventValue.I64(rows.toLong()), EventValue.I64(tty.sizeGeneration))
+                val values = listOf(EventValue.Integer(columns.toLong()), EventValue.Integer(rows.toLong()), EventValue.Integer(tty.sizeGeneration))
                 kernel.events.post(KernelEvent(TtyLimits.RESIZE_EVENT_TYPE, TtyLimits.CONSOLE_SOURCE, values), kernel.objects, wakeSink)
             }
         }
@@ -1127,6 +1123,47 @@ public class Machine private constructor(
      * 配ったキューの数を返す（あふれて捨てた分は数えない）
      */
     internal fun postEvent(event: KernelEvent): Int = lock.withLockValue { kernel.events.post(event, kernel.objects, wakeSink) }
+
+    // ---- デバイスの呼び出し（#65、ADR 0065） ----
+
+    /**
+     * プロセス [pid] に、待たずに積むデバイスの呼び出し（[PendingDeviceCall]、[state]）を作って fd 表に入れ、fd とオブジェクトを返す
+     * （読む権利だけ）。カーネルロックの中で呼ぶ。実行に回すのは、ロックを放してから [dispatchPendingDeviceCall] で行う。
+     * そのプロセスの `pending-call` が [DeviceLimits.MAX_PENDING_CALLS] 個あるなら `AGAIN`、fd 表が満杯なら `MFILE`
+     */
+    @Throws(FsException::class)
+    internal fun openPendingDeviceCallLocked(pid: Int, state: PendingDeviceCall.State): Pair<Int, PendingDeviceCall> {
+        val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
+        val fds = FdTable(process, kernel.objects, wakeSink)
+        val open = fds.entries().values.count { kernel.objects[it.objectId] is PendingDeviceCall }
+        if (open >= DeviceLimits.MAX_PENDING_CALLS) {
+            fsError(Errno.AGAIN, "待たずに積んだデバイスの呼び出しは ${DeviceLimits.MAX_PENDING_CALLS} 個まで")
+        }
+        val obj = PendingDeviceCall(state)
+        return fds.open(obj, HandleRights.READ) to obj
+    }
+
+    /**
+     * まだ実行していない [obj]（表に入っていること）を、デバイスの呼び出しとして実行に回す（保存から戻したものの積み直しにも使う）。
+     * 直接のメソッドは、このスレッドで実行してから返る。終わったら [obj] を終わりにして待ち手を起こす（閉じた後なら何もしない）。
+     * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）
+     */
+    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall): Long {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ってデバイスを呼ばない" }
+        val queued = lock.withLockValue { obj.state as? PendingDeviceCall.State.Queued } ?: return 0
+        val started = devices.dispatcher.start(pid, queued.address, queued.method, queued.args) {
+            lock.withLockValue { obj.markRunning() }
+        }
+        started.future.whenComplete { _, _ ->
+            val result = DeviceDispatcher.resultOf(started.future)
+            lock.withLockValue {
+                if (obj.id != 0 && kernel.objects[obj.id] === obj && obj.finish(result)) {
+                    wakeSink.wake(WaitKey(obj.id, WaitCondition.READABLE))
+                }
+            }
+        }
+        return started.fuel
+    }
 
     /**
      * プロセス [pid] にイベントキューを作ってハンドル表に入れ、ハンドル番号を返す（読む権利だけ）。カーネルロックの中で呼ぶ。
@@ -1224,7 +1261,7 @@ public class Machine private constructor(
         val queue = kernel.objects[timer.eventQueueId] as? EventQueue ?: return
         // イベントで知らせた回数は読んだことにする（数えた回数は READABLE のためだけに残さない）
         timer.read()
-        val event = KernelEvent(TimerLimits.EVENT_TYPE, "", listOf(EventValue.I64(timer.eventTag), EventValue.I64(count)))
+        val event = KernelEvent(TimerLimits.EVENT_TYPE, "", listOf(EventValue.Integer(timer.eventTag), EventValue.Integer(count)))
         kernel.events.deliverTo(queue, event, kernel.objects, wakeSink)
     }
 
@@ -1280,6 +1317,8 @@ public class Machine private constructor(
         }
         // 取りこぼし（すでに終わったプロセスが残した分など）を防ぐため、残りもすべて取り消す
         cancelHostCallsLocked()
+        // 後で返すデバイスの呼び出し（#65）は、実行中のまま残さず取り消す（isCancelled が立つ）
+        devices.dispatcher.cancelAllLocked()
         // ホストのディスク（#52）は、この後の操作を断る（止まり切っていない古いスレッドが触らないように）。閉じるのはロックの外
         vfs.revokeAll()
         checkAllDoneLocked()
@@ -1660,9 +1699,6 @@ public class Machine private constructor(
 
     // ---- カーネル → 接続層（#44） ----
 
-    /** つながっているデバイスが変わった回数 */
-    internal val devicesGeneration: Long get() = devicesGenerationCounter.get()
-
     /**
      * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
@@ -1711,25 +1747,11 @@ public class Machine private constructor(
     }
 
     /**
-     * ビープを鳴らす（次の `tick()` で [MachineHost.onBeep] に渡す）。値は範囲に丸める。どのスレッドから呼んでもよい。
-     * 配っていないビープが [MachineLimits.MAX_PENDING_BEEPS] あるなら捨てて `false`
+     * [callback] を次の `tick()` の中で、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
+     * どのスレッドから呼んでもよい。待たない。中で投げた例外は捨てる
      */
-    internal fun beep(frequencyHz: Int, durationMillis: Int): Boolean {
-        while (true) {
-            val n = pendingBeeps.get()
-            if (n >= MachineLimits.MAX_PENDING_BEEPS) {
-                droppedBeeps.incrementAndGet()
-                return false
-            }
-            if (pendingBeeps.compareAndSet(n, n + 1)) break
-        }
-        postNotification(
-            HostNotification.Beep(
-                frequencyHz.coerceIn(MIN_BEEP_FREQUENCY_HZ, MAX_BEEP_FREQUENCY_HZ),
-                durationMillis.coerceIn(1, MAX_BEEP_DURATION_MILLIS),
-            ),
-        )
-        return true
+    internal fun postHostCallback(callback: Runnable) {
+        postNotification(HostNotification.Callback(callback))
     }
 
     /**
@@ -1755,10 +1777,7 @@ public class Machine private constructor(
             out.flush()
             when (n) {
                 is HostNotification.StateChanged -> safely { host.onStateChanged(this, n.state, n.cause) }
-                is HostNotification.Beep -> {
-                    pendingBeeps.decrementAndGet()
-                    safely { host.onBeep(this, n.frequencyHz, n.durationMillis) }
-                }
+                is HostNotification.Callback -> safely { n.callback.run() }
                 is HostNotification.BootFailed -> safely { host.onBootFailed(this, n.failure, n.detail) }
                 HostNotification.RebootRequested -> {
                     // 積んだ後に stop() されたら、再起動しない
@@ -1855,7 +1874,10 @@ public class Machine private constructor(
                 }
                 val b = bytes ?: return
                 bytes = null
-                safely { host.onConsoleOutput(this@Machine, b.toByteArray()) }
+                val bytes = b.toByteArray()
+                // 画面のデバイスをつないでいればそこへ（#65、ADR 0065）、なければ接続層へ
+                val screen = devices.primaryScreen
+                if (screen != null && screen.machine === this@Machine) safely { screen.write(bytes) } else safely { host.onConsoleOutput(this@Machine, bytes) }
             } finally {
                 unlockSink()
             }
@@ -2036,15 +2058,6 @@ public class Machine private constructor(
     }
 
     public companion object {
-        /** ビープの周波数の下限（Hz） */
-        public const val MIN_BEEP_FREQUENCY_HZ: Int = 20
-
-        /** ビープの周波数の上限（Hz） */
-        public const val MAX_BEEP_FREQUENCY_HZ: Int = 20_000
-
-        /** ビープの長さの上限（ミリ秒。仮の値） */
-        public const val MAX_BEEP_DURATION_MILLIS: Int = 5_000
-
         /** マシンを作る（[MachineScheduler.createMachine] から呼ぶ）。 */
         @JvmSynthetic
         internal fun create(
@@ -2084,9 +2097,6 @@ public class Machine private constructor(
 internal object MachineLimits {
     /** 配っていないコンソール出力の上限（バイト。仮の値） */
     internal const val MAX_PENDING_CONSOLE_BYTES: Long = 64L * 1024
-
-    /** 配っていないビープの上限（仮の値） */
-    internal const val MAX_PENDING_BEEPS: Int = 8
 
     /** 実行ファイルの大きさの上限（バイト。仮の値。確定は #251） */
     internal const val MAX_EXECUTABLE_BYTES: Int = ModuleLimits.DEFAULT_MAX_BYTES
@@ -2192,7 +2202,8 @@ private sealed class HostNotification {
     /** コンソールの TTY に出力がたまった印（取り出すのは配るとき。列の中の位置が、書いた順の目印になる） */
     data object TtyOutput : HostNotification()
 
-    class Beep(val frequencyHz: Int, val durationMillis: Int) : HostNotification()
+    /** [Machine.postHostCallback] で積んだ処理 */
+    class Callback(val callback: Runnable) : HostNotification()
 
     class BootFailed(val failure: BootFailure, val detail: String) : HostNotification()
 

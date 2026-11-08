@@ -1,6 +1,8 @@
 package pro.ikili.kibicomputers.neoforge.display
 
 import net.minecraft.core.BlockPos
+import net.minecraft.core.HolderLookup
+import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.block.entity.BlockEntity
@@ -13,6 +15,7 @@ import pro.ikili.kibicomputers.core.display.ScreenSyncTarget
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
 import pro.ikili.kibicomputers.core.display.TextBuffer
+import pro.ikili.kibicomputers.neoforge.computer.DeviceAddressSlot
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 
 /**
@@ -24,6 +27,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  * - クライアント: 同期で受け取った内容を、自分の表示デバイスに再生して描く
  *
  * 画面の中身はコンピューターが描き直すものとして、今はセーブデータに書かない（保存は表示デバイスの側で #81 が扱う）。
+ * セーブデータに書くのは、画面のデバイスの address（[deviceAddress]。#65）だけ。
  */
 class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     BlockEntity(KiBiBlocks.SCREEN_BLOCK_ENTITY.get(), pos, state) {
@@ -55,6 +59,11 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
      * ブロックエンティティが消えるときに閉じる。
      */
     var renderCache: AutoCloseable? = null
+
+    /** 画面のデバイス（`kibicomputers:screen`）の address（#65）。最初に使うときに作り、セーブデータの [DEVICE_ADDRESS_TAG] に書く */
+    val deviceAddress: String get() = addressSlot.get()
+
+    private val addressSlot = DeviceAddressSlot(DEVICE_ADDRESS_TAG) { setChanged() }
 
     // サーバー: 同期の送り手（映す表示デバイスごとに作り直す）と、見ているプレイヤー（誰が見ているかは距離からサーバーが決める。#359）
     private var sender = ScreenSyncSender(display.text)
@@ -119,6 +128,16 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
 
     /** サーバーで、[player] への同期が送信量の予算で止められていて、画面全体を送れるのを待っているか（#352）。 */
     fun isThrottled(player: ServerPlayer): Boolean = watchers.isThrottled(player)
+
+    override fun saveAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
+        super.saveAdditional(tag, registries)
+        addressSlot.save(tag)
+    }
+
+    override fun loadAdditional(tag: CompoundTag, registries: HolderLookup.Provider) {
+        super.loadAdditional(tag, registries)
+        addressSlot.load(tag)
+    }
 
     override fun onLoad() {
         super.onLoad()
@@ -189,8 +208,11 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         false
     }
 
-    private companion object {
+    companion object {
+        /** セーブデータの、画面のデバイスの address のキー（#65） */
+        const val DEVICE_ADDRESS_TAG: String = "DeviceAddress"
+
         /** 表示デバイスのロックが取れないときに、同期を飛ばしてよい tick の数（これを超えたら待って取る） */
-        const val MAX_BUSY_TICKS = 4
+        private const val MAX_BUSY_TICKS = 4
     }
 }

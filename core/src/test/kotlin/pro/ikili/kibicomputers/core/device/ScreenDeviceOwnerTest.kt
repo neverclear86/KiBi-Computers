@@ -1,14 +1,15 @@
-package pro.ikili.kibicomputers.core.computer
+package pro.ikili.kibicomputers.core.device
 
+import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerCase
+import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.display.TextBuffer
-import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
-import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
@@ -18,7 +19,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 出力を止めている間に、コンソールの持ち主（マシン）が替わるときと、止めている間の順序（#381）。
  * マシンは起動しない（コンソールの出力は、テストから直接書くか、カーネルのメッセージと TTY のエコーで出す）
  */
-class MachineConsoleOwnerTest {
+class ScreenDeviceOwnerTest {
     private val limit = Duration.ofSeconds(60)
 
     private fun lines(text: TextBuffer): List<String> = (0 until text.height).map { y ->
@@ -29,18 +30,9 @@ class MachineConsoleOwnerTest {
 
     private fun count(text: TextBuffer, ch: Char): Int = lines(text).sumOf { line -> line.count { it == ch } }
 
-    /** コンソールの出力を [console] に流す相手。[console] は後から入れる */
-    private class ToConsole : MachineHost {
-        var console: MachineConsole? = null
+    private class Env(val manager: MachineManager<String>) {
+        val host: MachineHost = MachineHost { _, _, _ -> }
 
-        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
-
-        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
-            if (console?.machine === machine) console?.write(bytes)
-        }
-    }
-
-    private class Env(val manager: MachineManager<String>, val host: ToConsole) {
         fun turnOn(id: String): ComputerCase<String> {
             val case = ComputerCase<String>(CaseTier.BASIC, host)
             assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, id, { true }, true, MachineConfig.DEFAULT))
@@ -51,7 +43,7 @@ class MachineConsoleOwnerTest {
     private fun env(block: (Env) -> Unit) {
         val manager = MachineManager<String>()
         try {
-            block(Env(manager, ToConsole()))
+            block(Env(manager))
         } finally {
             assertTrue(manager.shutdown(10_000))
         }
@@ -64,7 +56,7 @@ class MachineConsoleOwnerTest {
         }
 
     // 上限を超える量を直接書いて、取っておく分を作る（1文字 = 1セル）
-    private fun fill(console: MachineConsole, n: Int) {
+    private fun fill(console: ScreenDevice, n: Int) {
         console.write(ByteArray(n) { 'x'.code.toByte() })
         assertTrue(console.backlogBytes > 0, "取っておく分がある")
     }
@@ -75,9 +67,9 @@ class MachineConsoleOwnerTest {
             val case = e.turnOn("pc")
             val machine = case.machine!!
             val screen = TextBuffer(80, 25)
-            val console = MachineConsole(screen, 2)
+            val console = ScreenDevice(screen, 2)
             console.cellsPerTick = 100
-            console.machine = machine
+            machine.devices.attach(SCREEN_ADDRESS, console)
             fill(console, 1500)
             assertTrue(machine.consoleOutputHeld)
             val shown = count(screen, 'x')
@@ -87,7 +79,7 @@ class MachineConsoleOwnerTest {
             e.manager.tick()
             val afterTick = count(screen, 'x')
             assertTrue(afterTick in shown + 1..shown + 100, "次の tick も上限まで: $afterTick")
-            console.machine = null
+            machine.devices.detach(SCREEN_ADDRESS)
             assertEquals(0, console.backlogBytes)
             assertFalse(machine.consoleOutputHeld, "止めるのをやめる")
             assertEquals(afterTick, count(screen, 'x'), "使いきった tick には、もう書かない")
@@ -102,9 +94,9 @@ class MachineConsoleOwnerTest {
             val case = e.turnOn("pc")
             val machine = case.machine!!
             val screen = TextBuffer(80, 25)
-            val console = MachineConsole(screen, 2)
+            val console = ScreenDevice(screen, 2)
             console.cellsPerTick = 100
-            console.machine = machine
+            machine.devices.attach(SCREEN_ADDRESS, console)
             fill(console, 1500)
             val shown = count(screen, 'x')
             console.discardOutput()
@@ -112,7 +104,7 @@ class MachineConsoleOwnerTest {
             assertFalse(machine.consoleOutputHeld)
             assertEquals(1500L - shown, console.droppedBytes)
             e.manager.tick()
-            console.machine = null
+            machine.devices.detach(SCREEN_ADDRESS)
             assertEquals(shown, count(screen, 'x'), "捨てた分は書かない")
             case.turnOff()
         }
@@ -126,14 +118,14 @@ class MachineConsoleOwnerTest {
             val a = caseA.machine!!
             val b = caseB.machine!!
             val screen = TextBuffer(20, 5)
-            val console = MachineConsole(screen, 2)
+            val console = ScreenDevice(screen, 2)
             // 1行送りは画面全体（100 セル）を写すので、1 tick に数行しか進まない
             console.cellsPerTick = 300
-            console.machine = a
+            a.devices.attach(SCREEN_ADDRESS, console)
             console.write((1..60).joinToString("") { "$it\r\n" }.toByteArray())
             assertTrue(a.consoleOutputHeld)
 
-            console.machine = b
+            b.devices.attach(SCREEN_ADDRESS, console)
             assertFalse(a.consoleOutputHeld, "前のマシンは止めない")
             assertTrue(b.consoleOutputHeld, "替えた先のマシンを止める")
             assertTrue(console.backlogBytes > 0, "取っておいた分は捨てない")
@@ -151,9 +143,9 @@ class MachineConsoleOwnerTest {
             val case = e.turnOn("pc")
             val machine = case.machine!!
             val screen = TextBuffer(80, 25)
-            val console = MachineConsole(screen, 2)
+            val console = ScreenDevice(screen, 2)
             console.cellsPerTick = 100
-            console.machine = machine
+            machine.devices.attach(SCREEN_ADDRESS, console)
             fill(console, 1500)
             console.reset()
             assertEquals(0, console.backlogBytes)
@@ -172,19 +164,18 @@ class MachineConsoleOwnerTest {
             val case = e.turnOn("pc")
             val old = case.machine!!
             val screen = TextBuffer(80, 25)
-            val console = MachineConsole(screen, 2)
-            e.host.console = console
+            val console = ScreenDevice(screen, 2)
             console.cellsPerTick = 100
-            console.machine = old
+            old.devices.attach(SCREEN_ADDRESS, console)
             fill(console, 1500)
 
             // 結線と同じ順: 外す → 電源を切る → 入れる → 画面を消してつなぐ
-            console.machine = null
+            old.devices.detach(SCREEN_ADDRESS)
             case.turnOff()
             assertEquals(ComputerStatus.RUNNING, case.turnOn(e.manager, "pc", { true }, true, MachineConfig.DEFAULT))
             val fresh = case.machine!!
             console.reset()
-            console.machine = fresh
+            fresh.devices.attach(SCREEN_ADDRESS, console)
             assertFalse(old.consoleOutputHeld)
             assertFalse(fresh.consoleOutputHeld)
             assertEquals(0, console.backlogBytes)
@@ -202,10 +193,9 @@ class MachineConsoleOwnerTest {
             val case = e.turnOn("pc")
             val machine = case.machine!!
             val screen = TextBuffer(40, 10)
-            val console = MachineConsole(screen, 2)
-            e.host.console = console
+            val console = ScreenDevice(screen, 2)
             console.cellsPerTick = 40
-            console.machine = machine
+            machine.devices.attach(SCREEN_ADDRESS, console)
             fill(console, 600)
             assertTrue(machine.consoleOutputHeld)
 

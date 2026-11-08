@@ -5,8 +5,10 @@ import net.minecraft.core.Direction
 import net.minecraft.world.level.Level
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.InstalledParts
-import pro.ikili.kibicomputers.core.computer.MachineConsole
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.device.KeyboardDevice
+import pro.ikili.kibicomputers.core.device.ScreenDevice
+import pro.ikili.kibicomputers.core.device.SpeakerDevice
 import pro.ikili.kibicomputers.core.display.DisplayDevice
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardListener
@@ -19,6 +21,7 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * テスト用コンピューターの仮の結線（#307）。ケース1つにつき1つ持ち、サーバーでだけ使う。
@@ -28,8 +31,10 @@ import java.util.UUID
  *   （[bootConfig]）。同梱イメージから起動したら、最初のディスクを `/home` にマウントする（[BootConfig.homeDisk]）。
  *   置き換え先: OS 入りのフロッピーから HDD へのインストール #107・#145、起動部品の設定 #99
  * - 電源を入れたときに、隣の画面とキーボードを決め打ちで探し（[findScreen]・[findKeyboard]）、
- *   表示デバイス（[DisplayDevice]）を作って画面に映させ、コンソールの出力を表示デバイスに、キーボードの入力をコンソールに流す
- *   （[MachineConsole]。プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
+ *   表示デバイス（[DisplayDevice]）を作って画面に映させ、画面とキーボードのデバイス（[ScreenDevice]・[KeyboardDevice]。#65）を
+ *   それぞれのブロックの address でマシンにつなぐ（コンソールの出力は表示デバイスに、キーボードの入力はコンソールに流れる。
+ *   プロセスの出力は、プロセスのスレッドが表示デバイスに書く。#355）。動いている間に置いたものは見ない。
+ *   ケースに入っているスピーカー（[SpeakerDevice]）は、ケースの address で常につなぐ（音はまだ鳴らさず数えるだけ。[beeps]）。
  *   つないだ画面が外れたら、画面とキーボードから外す（#397）。
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
  *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
@@ -38,10 +43,12 @@ import java.util.UUID
  * 表示デバイスの中身は、プロセスのスレッドも書くので、読むときはそのロックを持つ。
  */
 internal class TestComputerWiring : MachineHost, KeyboardListener {
-    private var console: MachineConsole? = null
+    private var screenDevice: ScreenDevice? = null
+    private var keyboardDevice: KeyboardDevice? = null
     private var screen: ScreenBlockEntity? = null
     private var keyboard: KeyboardBlockEntity? = null
     private var machine: Machine? = null
+    private var speakerAddress: String? = null
 
     /** つないだ画面。つないでいなければ null */
     val connectedScreen: ScreenBlockEntity? get() = screen
@@ -49,8 +56,11 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     /** つないだキーボード。つないでいなければ null */
     val connectedKeyboard: KeyboardBlockEntity? get() = keyboard
 
-    /** 画面につないだコンソール。つないでいなければ null（テスト用） */
-    val connectedConsole: MachineConsole? get() = console
+    /** 画面のブロックのためにマシンにつないだ画面のデバイス。つないでいなければ null（テスト用） */
+    val connectedScreenDevice: ScreenDevice? get() = screenDevice
+
+    /** スピーカーに届いたビープの数（音はまだ鳴らさない。テスト用） */
+    val beeps: AtomicLong = AtomicLong()
 
     /** 今つないでいるマシンの起動の失敗（[onBootFailed]）。失敗していなければ null（テスト用） */
     var bootFailure: BootFailure? = null
@@ -59,11 +69,16 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     // 画面が外れたら、出力を止めている最中でも、すぐに外して取っておいた出力を捨てる（#397）
     private val onScreenRemoved = Runnable { disconnect() }
 
-    /** 電源が入った（[machine] を作った）。隣の画面とキーボードにつなぎ、[boot] の候補から起動する。 */
-    fun connect(level: Level, casePos: BlockPos, machine: Machine, boot: BootConfig = BOOT_CONFIG) {
+    /**
+     * 電源が入った（[machine] を作った）。ケースのスピーカーを [speakerAddress] で、隣の画面とキーボードをそれぞれの address でつなぎ、
+     * [boot] の候補から起動する。
+     */
+    fun connect(level: Level, casePos: BlockPos, machine: Machine, speakerAddress: String, boot: BootConfig = BOOT_CONFIG) {
         disconnect()
         this.machine = machine
         bootFailure = null
+        this.speakerAddress = speakerAddress
+        machine.devices.attach(speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() })
         val screen = findScreen(level, casePos)
         if (screen != null) {
             this.screen = screen
@@ -71,28 +86,38 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
             // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。電源を入れるたびに新しく作る
             val display = DisplayDevice.forTier(screen.tier)
             screen.mirror(display)
-            console = MachineConsole(display).also { it.machine = machine }
+            screenDevice = ScreenDevice(display).also { machine.devices.attach(screen.deviceAddress, it) }
             // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
-            keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
+            val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
+            if (keyboard != null) {
+                this.keyboard = keyboard
+                keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyboard.deviceAddress, it) }
+            }
         }
         machine.boot(boot)
     }
 
     /**
-     * 電源が切れた・ケースが消える・画面が外れた。画面とキーボードから外す（画面は最後の表示デバイスを映したままにし、中身を残す）。
+     * 電源が切れた・ケースが消える・画面が外れた。マシンからデバイスを外し、画面とキーボードから外す
+     * （画面は最後の表示デバイスを映したままにし、中身を残す）。
      * 書ききれずに取っておいた出力は、1 tick の上限まで書いて残りを捨てる。画面が外れていれば書かずに捨てる（#381）。
-     * 画面が外れたときは、画面からの知らせ（[ScreenBlockEntity.addRemovalListener]）でも呼ぶ。出力を止めている間は
-     * [onConsoleOutput] が呼ばれないので、それだけでは気付けない（#397）
+     * 画面が外れたときは、画面からの知らせ（[ScreenBlockEntity.addRemovalListener]）で呼ぶ。出力を止めている間は
+     * マシンからの通知がないので、それがないと気付けない（#397）
      */
     fun disconnect() {
+        val m = machine
         keyboard?.release(this)
+        if (keyboardDevice != null) keyboard?.let { m?.devices?.detach(it.deviceAddress) }
         keyboard = null
+        keyboardDevice = null
         val s = screen
-        if (s?.isRemoved == true) console?.discardOutput()
+        if (s?.isRemoved == true) screenDevice?.discardOutput()
         s?.removeRemovalListener(onScreenRemoved)
+        if (screenDevice != null) s?.let { m?.devices?.detach(it.deviceAddress) }
         screen = null
-        console?.machine = null
-        console = null
+        screenDevice = null
+        speakerAddress?.let { m?.devices?.detach(it) }
+        speakerAddress = null
         machine = null
     }
 
@@ -102,18 +127,11 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         if (machine === this.machine) bootFailure = failure
     }
 
-    override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
-        if (machine !== this.machine) return
-        val s = screen ?: return
-        if (s.isRemoved) {
-            disconnect()
-            return
-        }
-        console?.write(bytes)
-    }
+    // 画面のデバイスをつないでいないときのコンソールの出力。映す画面がないので捨てる
+    override fun onConsoleOutput(machine: Machine, bytes: ByteArray) = Unit
 
     override fun onKeyboardEvent(typist: UUID, event: KeyboardEvent) {
-        console?.keyboardInput(event)
+        keyboardDevice?.input(event)
     }
 
     companion object {

@@ -88,12 +88,12 @@ interface clock {
 
 - `u64` の引数（`duration`・`instant`・`interval`）は、2^63 以上（core の i64 で負）を `Long.MAX_VALUE` に頭打ちにする（論点5-A）。カーネルは期限を `saturatingAdd` で出すので溢れず、ゲストの入力で `IllegalArgumentException` は出ない。`Long.MAX_VALUE` の期限・間隔は、実際には鳴らない
 - 結果の `u64`（`read`・`uptime-ticks`・`world-ticks`）は、カーネルの `Long`（どれも 0 以上）をそのまま書く。`world-ticks` は環境の `MachineClock.worldTicks()` が負なら 0 にする
-- `tag` は `s64` のままカーネルの `Long` へ（イベントの値 `%s64(tag)` で同じ値が戻る）
+- `tag` は `s64` のままカーネルの `Long` へ（イベントの値 `integer(tag)` で同じ値が戻る。#65 で `%s64` から改名した）
 - 上限は `nfile`、ハンドル表は `mfile`、`self` の誤りは `bad-descriptor`、不正な drop はトラップ、という分け方は ADR 0073 の `events` にそろえた
 
 ## timer のイベントの値
 
-`event { kind: "timer", source: "", values: [ %s64(tag), %s64(回数) ] }`（ADR 0073 の `event-value` のまま。新しい型は足さない）。
+`event { kind: "timer", source: "", values: [ integer(tag), integer(回数) ] }`（ADR 0073 の `event-value` のまま。新しい型は足さない。#65 で `%s64` から改名した）。
 
 - 回数は 1 以上で、遅れて鳴った繰り返しのタイマーは、過ぎた回をまとめた数（ADR 0064）
 - キューが満杯なら捨てて `dropped` に数え、キューが閉じていれば捨てる
@@ -169,7 +169,7 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 
 ## テスト
 
-- `KibiTimersTest`（手で進める時計とタイマー）: キューなし・ありの作成、`set-after`・`set-at`（0・過去を含む）、繰り返しと `cancel`、`interval` の境界、頭打ちの最大値で溢れない、上限で `nfile`、キューへのイベントの値（`I64(tag)`・`I64(回数)`）、キューでない fd・`timer` を受け取らないキュー、タイマーでないハンドル、`drop` で予定も消える
+- `KibiTimersTest`（手で進める時計とタイマー）: キューなし・ありの作成、`set-after`・`set-at`（0・過去を含む）、繰り返しと `cancel`、`interval` の境界、頭打ちの最大値で溢れない、上限で `nfile`、キューへのイベントの値（`Integer(tag)`・`Integer(回数)`。#65 で `I64` から改名した）、キューでない fd・`timer` を受け取らないキュー、タイマーでないハンドル、`drop` で予定も消える
 - `KibiClockTest`: `uptime-ticks` が tick とともに進む、`world-ticks` が環境の `worldTicks` を返す（負は 0、ワールドがなければ 0）
 - `P1CanonicalTest`: `lowerU64Result` の配置と詰め物、範囲外・align 違いのトラップ、`liftOptionDisc`、`u64Arg` の頭打ち
 - `WasiP1ImportCheckTest`: 8 関数の型が合えば `cabi_realloc` なしで通り、型違い・版違い・表にない名前・p2/p3 の interface は `NOEXEC`

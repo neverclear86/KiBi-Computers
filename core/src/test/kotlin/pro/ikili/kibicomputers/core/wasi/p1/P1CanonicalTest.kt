@@ -218,9 +218,9 @@ class P1CanonicalTest {
         val m = FakeMemory(1)
         val r = BumpRealloc()
         val values = listOf(
-            EventValue.I64(-2),
-            EventValue.F64(1.5),
-            EventValue.Bool(true),
+            EventValue.Integer(-2),
+            EventValue.Float(1.5),
+            EventValue.Boolean(true),
             EventValue.Text("h\uD800"),
             EventValue.Bytes(byteArrayOf(1, 2, 3)),
         )
@@ -244,11 +244,11 @@ class P1CanonicalTest {
         val vals = m.readI32(list + 16)
         assertEquals(5, m.readI32(list + 20))
         assertEquals(0, vals % 8)
-        assertEquals(P1Canonical.VALUE_S64, m.readU8(vals))
+        assertEquals(P1Canonical.VALUE_INTEGER, m.readU8(vals))
         assertEquals(-2L, m.readI64(vals + 8))
-        assertEquals(P1Canonical.VALUE_F64, m.readU8(vals + 16))
+        assertEquals(P1Canonical.VALUE_FLOAT, m.readU8(vals + 16))
         assertEquals(1.5, java.lang.Double.longBitsToDouble(m.readI64(vals + 24)))
-        assertEquals(P1Canonical.VALUE_BOOL, m.readU8(vals + 32))
+        assertEquals(P1Canonical.VALUE_BOOLEAN, m.readU8(vals + 32))
         assertEquals(1, m.readU8(vals + 40))
         assertEquals(P1Canonical.VALUE_TEXT, m.readU8(vals + 48))
         // 対になっていないサロゲートは U+FFFD
@@ -273,7 +273,7 @@ class P1CanonicalTest {
 
     @Test
     fun `cabi_reallocが範囲の外やalignの違う場所を返したらトラップ`() {
-        val batch = EventBatch(listOf(KernelEvent("a", "", listOf(EventValue.I64(1)))), 0)
+        val batch = EventBatch(listOf(KernelEvent("a", "", listOf(EventValue.Integer(1)))), 0)
         assertEquals(
             WasmTrapKind.MEMORY_OUT_OF_BOUNDS,
             assertThrows<WasmTrapException> { P1Canonical.lowerBatchResult(FakeMemory(1), BumpRealloc(outside = true), 0x100, batch, 0) }.kind,

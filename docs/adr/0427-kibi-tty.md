@@ -84,8 +84,10 @@ interface tty {
 `Machine.resizeConsole` で `Tty.resize` が true（大きさが実際に変わった）のときだけ、同じロックの中で次を入れる:
 
 ```
-event { kind: "tty-resize", source: "console", values: [ s64(columns), s64(rows), s64(generation) ] }
+event { kind: "tty-resize", source: "console", values: [ integer(columns), integer(rows), integer(generation) ] }
 ```
+
+（値の case は #65 で `s64` から改名した `integer`）
 
 - 受け取るには `event-queue.open(["tty-resize"], …)` で開き、p1 では `poll_oneoff` の `FD_READ` で待つ。`dropped` があれば `get-size` で読み直す（世代で取りこぼしがわかる）
 - `source` は TTY の名前（fd 番号は子で変わるので使わない）。名前は `TtyLimits.RESIZE_EVENT_TYPE`・`TtyLimits.CONSOLE_SOURCE`

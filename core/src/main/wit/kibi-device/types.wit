@@ -1,0 +1,47 @@
+package kibi:device@0.1.0;
+
+/// デバイス（#65。ADR 0065）の呼び出しで使う型。
+/// WASM に出すのは #77（この Issue では WIT を置くだけ）。
+interface types {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// 呼び出しの引数・結果の値（入れ子なし。Java の `DeviceValue`）。
+    /// case の名前は `kibi:kernel/events` の `event-value` と同じ（判別子の番号は違う。ADR 0065）
+    variant value {
+        none,
+        integer(s64),
+        float(f64),
+        boolean(bool),
+        text(string),
+        bytes(list<u8>),
+    }
+
+    /// つないでいるデバイス1つ
+    record device-info {
+        /// 小文字の UUID（36 文字）
+        address: string,
+        /// `<名前空間>:<名前>`（例: `kibicomputers:screen`）
+        kind: string,
+    }
+
+    /// メソッド1つ
+    record method-info {
+        name: string,
+        /// メインスレッドで実行する（次の tick の中で実行するので、結果まで時間がかかる）
+        main-thread: bool,
+    }
+
+    /// 呼び出しの失敗
+    variant call-error {
+        /// カーネルの失敗（上限など）
+        kernel(error-code),
+        /// デバイスが外れた（ハンドルは残る）
+        detached,
+        /// そのメソッドがない
+        no-such-method,
+        /// 引数の形が違う
+        bad-arguments(string),
+        /// デバイスが返した失敗
+        failed(string),
+    }
+}

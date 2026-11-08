@@ -10,9 +10,9 @@ interface events {
 
     /// イベントの値（カーネルの `EventValue`）
     variant event-value {
-        %s64(s64),
-        %f64(f64),
-        %bool(bool),
+        integer(s64),
+        float(f64),
+        boolean(bool),
         text(string),
         bytes(list<u8>),
     }

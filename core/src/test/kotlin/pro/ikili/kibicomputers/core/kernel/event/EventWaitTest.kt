@@ -40,9 +40,9 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class EventWaitTest {
     private val limit = Duration.ofSeconds(30)
 
-    private fun code(e: KernelEvent): Int = (e.values[0] as EventValue.I64).value.toInt()
+    private fun code(e: KernelEvent): Int = (e.values[0] as EventValue.Integer).value.toInt()
 
-    private fun ev(type: String = "test", value: Long = 0) = KernelEvent(type, "", listOf(EventValue.I64(value)))
+    private fun ev(type: String = "test", value: Long = 0) = KernelEvent(type, "", listOf(EventValue.Integer(value)))
 
     /** 待機点型: "test" のキューを開いて待ち、届いたイベントの値で終わる。[handle] にハンドル番号を入れる */
     private fun waitPointDriver(handle: AtomicInteger, resumes: AtomicInteger = AtomicInteger(), extra: (ProcessContext) -> List<WaitKey> = { emptyList() }) =
