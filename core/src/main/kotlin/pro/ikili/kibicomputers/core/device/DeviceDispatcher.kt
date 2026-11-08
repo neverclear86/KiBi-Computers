@@ -26,7 +26,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * ハンドラーが投げたものは、JVM が続けられないエラー（`StackOverflowError` 以外の `VirtualMachineError`。`isFatal`）を除き、
  * `Error` も含めて `failed("internal error")` にし、ログに出す（#532）。JVM が続けられないエラーは捕まえずにそのまま投げる
- * （直接のメソッドは呼んだプロセスへ。メインスレッドのメソッドは、呼び出しを失敗で終えてから `tick()` へ。`PendingHostCall` と同じ）。
+ * （直接のメソッドは呼んだプロセスへ。メインスレッドのメソッドは、呼び出しを `failed("internal error")` で終えてから `tick()` へ。`PendingHostCall` と同じ）。
  *
  * 結果は future で返す。失敗は [DeviceCallException]（[CallError]）で終える。上限は [DeviceLimits]。
  */
@@ -90,7 +90,16 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
                 }
             },
         )
-        return Started(outer.thenCompose { it }, fuel) {
+        // JVM が続けられないエラーで host call が終わったら（`PendingHostCall` が `tick()` へ投げ直す）、待ち手には
+        // 「止めて取り消した」（interrupted）ではなく internal error を返す（後で返すと決めていた場合と同じ。#536）
+        val result = outer.handle { inner, t ->
+            when {
+                t == null -> inner
+                isFatal(t) -> failed(CallError.INTERNAL_ERROR)
+                else -> CompletableFuture.failedFuture(t)
+            }
+        }.thenCompose { it }
+        return Started(result, fuel) {
             machine.cancelHostCallLocked(outer)
             ticket.cancel()
         }
