@@ -538,6 +538,49 @@ class DeviceDispatcherTest {
     }
 
     @Test
+    fun `メインスレッドのメソッドが投げたJVMが続けられないエラーは、呼び出しをinternal errorで終えてからtickへ伝わる`() = timeout(limit) {
+        // 投げた後の tick の続きは保証しない（JVM が続けられない）ので、1つずつ別のマシンで確かめる
+        for (deferFirst in listOf(false, true)) {
+            Harness().use { h ->
+                val m = h.machine()
+                val methods = DeviceMethods.builder()
+                    .mainThread("oom") { ctx, _ ->
+                        if (deferFirst) ctx.defer()
+                        throw OutOfMemoryError("test")
+                    }
+                    .build()
+                m.devices.attach(address, TestDevice(methods))
+                val oom = m.start("oom")
+                assertThrows<OutOfMemoryError> { h.scheduler.tick() }
+                assertEquals(error(CallError.INTERNAL_ERROR), oom.result(), "defer=$deferFirst")
+                assertEquals(0, m.devices.dispatcher.runningCount, "後で返すと決めた呼び出しを実行中に残さない")
+            }
+        }
+    }
+
+    @Test
+    fun `メインスレッドのメソッドが投げたStackOverflowErrorは伝わらず、internal errorで終わる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val methods = DeviceMethods.builder()
+                .mainThread("so") { _, _ -> throw StackOverflowError() }
+                .mainThread("deferred-so") { ctx, _ ->
+                    ctx.defer()
+                    throw StackOverflowError()
+                }
+                .build()
+            m.devices.attach(address, TestDevice(methods))
+            val so = m.start("so")
+            val deferred = m.start("deferred-so")
+            h.scheduler.tick()
+            assertEquals(error(CallError.INTERNAL_ERROR), so.result())
+            assertEquals(error(CallError.INTERNAL_ERROR), deferred.result())
+            assertEquals(0, m.devices.dispatcher.runningCount)
+            assertEquals(MachineState.STOPPED, m.state, "StackOverflowError でマシンを止めない")
+        }
+    }
+
+    @Test
     fun `ブロッキング型のプロセスには、直接のメソッドが投げたErrorがinternal errorとして届く`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000).also { it.fillFuel() }
