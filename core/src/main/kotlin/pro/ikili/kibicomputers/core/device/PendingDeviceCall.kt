@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.device
 import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 
 /**
  * 待たずに積んだデバイスの呼び出し（#65。WIT の `pending-call`）。カーネルオブジェクトで、fd としてプロセスのハンドル表に入る。
@@ -46,6 +47,11 @@ internal class PendingDeviceCall(state: State) : KernelObject() {
 
     override fun isReady(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE && state is State.Done
 
+    /** 最後の fd を閉じた。まだ終わっていなければ、実行時の側が呼び出しを取り消す（#532） */
+    override fun onLastClose(sink: WakeSink) {
+        if (state !is State.Done) sink.deviceCallClosed(id)
+    }
+
     /** 保存の写し（中身の形だけ。バイトの形は #81・#82） */
     sealed class Snapshot {
         /** まだ実行していない呼び出し（戻すと積み直す） */
@@ -65,7 +71,7 @@ internal class PendingDeviceCall(state: State) : KernelObject() {
     override fun toString(): String = "PendingDeviceCall($id, $state)"
 
     companion object {
-        /** 写し [snapshot] から戻す。[Snapshot.Queued] は、表に入れた後に `DeviceDispatcher` で積み直す（`Machine.resumePendingDeviceCall`） */
+        /** 写し [snapshot] から戻す。[Snapshot.Queued] は、表に入れた後に `DeviceDispatcher` で積み直す（`Machine.dispatchPendingDeviceCall`） */
         fun restore(snapshot: Snapshot): PendingDeviceCall = when (snapshot) {
             is Snapshot.Queued -> PendingDeviceCall(State.Queued(snapshot.address, snapshot.method, snapshot.args))
             is Snapshot.Done -> PendingDeviceCall(State.Done(snapshot.result))

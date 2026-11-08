@@ -51,6 +51,12 @@ internal interface WakeSink {
     fun timerClosed(objectId: Int) {}
 
     /**
+     * 待たずに積んだデバイスの呼び出し（`PendingDeviceCall`）[objectId] が閉じられた（参照カウント 0。#532）。
+     * 実行時の側が、まだ終わっていない呼び出しを取り消す（`DeviceDispatcher.Started.cancelLocked`）。既定は何もしない
+     */
+    fun deviceCallClosed(objectId: Int) {}
+
+    /**
      * ファイルシステムに開いたことを知らせた（[OpenFile.retained]）開いたファイル [file] が閉じられた（参照カウント 0。#52）。
      * 実行時の側が、カーネルロックの外でファイルシステムに知らせる（[pro.ikili.kibicomputers.core.kernel.vfs.Vfs.releaseLater]）。
      * 既定は何もしない

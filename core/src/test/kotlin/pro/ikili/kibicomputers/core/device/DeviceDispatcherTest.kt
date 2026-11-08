@@ -20,6 +20,8 @@ import pro.ikili.kibicomputers.core.kernel.eventually
 import pro.ikili.kibicomputers.core.kernel.fillFuel
 import pro.ikili.kibicomputers.core.kernel.hostCallModule
 import pro.ikili.kibicomputers.core.kernel.host
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -33,6 +35,8 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.withLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -346,6 +350,210 @@ class DeviceDispatcherTest {
             h.tickUntil { m.stateOf(pid) == ProcessState.EXITED }
             assertEquals(DeviceHandle.Snapshot(address, "test:device"), handle.get().snapshot())
             assertEquals(CallError.Detached, missing.get())
+        }
+    }
+
+    // ---- 取り消し（#532） ----
+
+    /** 後で返すメソッド `slow` と、すぐ返すメインスレッドのメソッド `fast` を持つデバイスをつなぎ、受け取った [DeviceCompletion] の入れ物を返す。[calls] は呼ばれた回数 */
+    private fun Machine.attachSlow(calls: AtomicInteger = AtomicInteger()): AtomicReference<DeviceCompletion> {
+        val completion = AtomicReference<DeviceCompletion>()
+        val methods = DeviceMethods.builder()
+            .mainThread("slow") { ctx, _ ->
+                calls.incrementAndGet()
+                completion.set(ctx.defer())
+                emptyArray()
+            }
+            .mainThread("fast") { _, _ -> emptyArray() }
+            .build()
+        devices.attach(address, TestDevice(methods))
+        return completion
+    }
+
+    /** プロセス [pid] の fd [fd] を閉じる（カーネルロックの中で） */
+    private fun ProcessContext.closeFd(machine: Machine, fd: Int) = withKernelLock {
+        FdTable(kernel.processes[pid]!!, kernel.objects, machine.wakeSink).close(fd)
+    }
+
+    @Test
+    fun `invokeDeviceで待っていたプロセスを止めると、後で返す呼び出しはisCancelledが立ち実行中から外れる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000).also { it.fillFuel() }
+            val completion = m.attachSlow()
+            val pid = m.spawnTest(
+                h.program(hostCallModule()),
+                runDriver(configure = { ctx, b ->
+                    b.host(ctx) { c, _, _ ->
+                        c.invokeDevice(address, "slow", emptyList())
+                        LongArray(0)
+                    }
+                }),
+            )
+            h.tickUntil { completion.get() != null }
+            assertFalse(completion.get().isCancelled)
+            assertEquals(1, m.devices.dispatcher.runningCount)
+            m.lock.withLock { m.killLocked(pid, KillSignal.TERMINATE) }
+            h.tickUntil { m.stateOf(pid) == ProcessState.KILLED }
+            assertTrue(completion.get().isCancelled)
+            assertEquals(0, m.devices.dispatcher.runningCount)
+            completion.get().complete(DeviceValue.of(1L)) // 後から終えても何もしない
+        }
+    }
+
+    @Test
+    fun `pending-callのfdを閉じると、後で返す呼び出しはisCancelledが立ち実行中から外れる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine().also { it.fillFuel() }
+            val completion = m.attachSlow()
+            val closed = AtomicBoolean()
+            val cancelledBeforeClose = AtomicReference<Boolean>()
+            val slowFd = AtomicReference<Int>()
+            m.spawnTest(
+                h.program(emptyModule()),
+                TestDriver(
+                    ProcessKind.WAIT_POINT,
+                    onResume = { ctx, _ ->
+                        // slow が後で返すと決めた後に fast が終わって起きる
+                        cancelledBeforeClose.set(completion.get().isCancelled)
+                        ctx.closeFd(m, slowFd.get())
+                        closed.set(true)
+                        StepResult.Exit(0)
+                    },
+                ) { ctx ->
+                    slowFd.set(ctx.startDeviceCall(address, "slow", emptyList()))
+                    val fast = ctx.startDeviceCall(address, "fast", emptyList())
+                    StepResult.Wait(listOf(WaitKey(ctx.objectOf(fast), WaitCondition.READABLE)))
+                },
+            )
+            h.tickUntil { closed.get() }
+            assertEquals(false, cancelledBeforeClose.get())
+            assertTrue(completion.get().isCancelled)
+            assertEquals(0, m.devices.dispatcher.runningCount)
+        }
+    }
+
+    @Test
+    fun `pending-callを閉じずにプロセスが終わると、後で返す呼び出しはisCancelledが立ち実行中から外れる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine().also { it.fillFuel() }
+            val completion = m.attachSlow()
+            val cancelledAtExit = AtomicReference<Boolean>()
+            val pid = m.spawnTest(
+                h.program(emptyModule()),
+                TestDriver(
+                    ProcessKind.WAIT_POINT,
+                    onResume = { _, _ ->
+                        cancelledAtExit.set(completion.get().isCancelled)
+                        StepResult.Exit(0)
+                    },
+                ) { ctx ->
+                    ctx.startDeviceCall(address, "slow", emptyList())
+                    val fast = ctx.startDeviceCall(address, "fast", emptyList())
+                    StepResult.Wait(listOf(WaitKey(ctx.objectOf(fast), WaitCondition.READABLE)))
+                },
+            )
+            h.tickUntil { m.stateOf(pid) == ProcessState.EXITED }
+            assertEquals(false, cancelledAtExit.get())
+            assertTrue(completion.get().isCancelled)
+            assertEquals(0, m.devices.dispatcher.runningCount)
+        }
+    }
+
+    @Test
+    fun `まだ実行していないpending-callのfdを閉じると、列から外してメソッドを呼ばない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine().also { it.fillFuel() }
+            val calls = AtomicInteger()
+            m.attachSlow(calls)
+            val pid = m.spawnTest(
+                h.program(emptyModule()),
+                TestDriver(ProcessKind.WAIT_POINT) { ctx ->
+                    val fd = ctx.startDeviceCall(address, "slow", emptyList())
+                    assertEquals(1, m.pendingHostCalls)
+                    ctx.closeFd(m, fd)
+                    assertEquals(0, m.pendingHostCalls, "列から外した")
+                    StepResult.Exit(0)
+                },
+            )
+            eventually { m.stateOf(pid) == ProcessState.EXITED }
+            repeat(3) { h.scheduler.tick() }
+            assertEquals(0, calls.get())
+            assertEquals(0, m.devices.dispatcher.runningCount)
+        }
+    }
+
+    @Test
+    fun `取り消しがdeferより先に来ても、isCancelledが立ちinterruptedで終わる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val completion = AtomicReference<DeviceCompletion>()
+            val started = AtomicReference<DeviceDispatcher.Started>()
+            m.devices.attach(
+                address,
+                TestDevice(
+                    DeviceMethods.builder().mainThread("slow") { ctx, _ ->
+                        // 実行し始めてから defer するまでの間に取り消された
+                        m.lock.withLock { started.get().cancelLocked() }
+                        completion.set(ctx.defer())
+                        emptyArray()
+                    }.build(),
+                ),
+            )
+            started.set(m.start("slow"))
+            h.scheduler.tick()
+            assertTrue(completion.get().isCancelled)
+            assertEquals(error(CallError.INTERRUPTED), started.get().result())
+            assertEquals(0, m.devices.dispatcher.runningCount)
+        }
+    }
+
+    @Test
+    fun `ハンドラーが投げたErrorはinternal errorになり、JVMが続けられないエラーだけそのまま伝わる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val methods = DeviceMethods.builder()
+                .direct("so") { _, _ -> throw StackOverflowError() }
+                .direct("link") { _, _ -> throw NoClassDefFoundError("missing/Class") }
+                .direct("assert") { _, _ -> throw AssertionError("x") }
+                .direct("oom") { _, _ -> throw OutOfMemoryError("test") }
+                .mainThread("main-link") { _, _ -> throw LinkageError("x") }
+                .mainThread("deferred-error") { ctx, _ ->
+                    ctx.defer()
+                    throw ExceptionInInitializerError("x")
+                }
+                .build()
+            m.devices.attach(address, TestDevice(methods))
+            assertEquals(error(CallError.INTERNAL_ERROR), m.start("so").result())
+            assertEquals(error(CallError.INTERNAL_ERROR), m.start("link").result())
+            assertEquals(error(CallError.INTERNAL_ERROR), m.start("assert").result())
+            assertThrows<OutOfMemoryError> { m.start("oom") }
+            val mainLink = m.start("main-link")
+            val deferred = m.start("deferred-error")
+            h.scheduler.tick()
+            assertEquals(error(CallError.INTERNAL_ERROR), mainLink.result())
+            assertEquals(error(CallError.INTERNAL_ERROR), deferred.result())
+            assertEquals(0, m.devices.dispatcher.runningCount)
+            assertEquals(MachineState.STOPPED, m.state, "Error でマシンを止めない")
+        }
+    }
+
+    @Test
+    fun `ブロッキング型のプロセスには、直接のメソッドが投げたErrorがinternal errorとして届く`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000).also { it.fillFuel() }
+            m.devices.attach(address, TestDevice(DeviceMethods.builder().direct("link") { _, _ -> throw LinkageError("x") }.build()))
+            val got = AtomicReference<CallError>()
+            val pid = m.spawnTest(
+                h.program(hostCallModule()),
+                runDriver(configure = { ctx, b ->
+                    b.host(ctx) { c, _, _ ->
+                        got.set(assertThrows<DeviceCallException> { c.invokeDevice(address, "link", emptyList()) }.error)
+                        LongArray(0)
+                    }
+                }),
+            )
+            h.tickUntil { m.stateOf(pid) == ProcessState.EXITED }
+            assertEquals(CallError.INTERNAL_ERROR, got.get())
         }
     }
 }

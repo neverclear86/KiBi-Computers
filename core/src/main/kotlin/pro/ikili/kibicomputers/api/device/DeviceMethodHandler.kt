@@ -8,7 +8,9 @@ package pro.ikili.kibicomputers.api.device
  *
  * 引数の形が違うときは、[DeviceArguments] の取り出しが投げる [DeviceException] をそのまま投げてよい（プロセスには
  * `bad-arguments` として届く）。作者が投げた [DeviceException] はプロセスに `failed(message)` として届く。
- * それ以外の例外は `failed("internal error")` になり、ログに出る（コンピューターは止めない）。
+ * それ以外の例外は、`Error`（`StackOverflowError`・`LinkageError` など）も含めて `failed("internal error")` になり、
+ * ログに出る（コンピューターは止めない）。ただし JVM が続けられないエラー（`OutOfMemoryError` など、`StackOverflowError` 以外の
+ * `VirtualMachineError`）は捕まえずに、そのまま伝える。
  */
 public fun interface DeviceMethodHandler {
     /**

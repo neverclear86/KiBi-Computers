@@ -1202,6 +1202,8 @@ internal class ProcessRunner(private val machine: Machine) {
                 try {
                     awaitHost(future)
                 } catch (e: ProcessKilledException) {
+                    // 待っていたプロセスが止められた。結果はもう要らない（後で返す呼び出しは isCancelled が立つ。#532）
+                    lock.withLockValue { started.cancelLocked() }
                     throw e
                 } catch (e: Exception) {
                     // 結果は下で future から読む
