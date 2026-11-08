@@ -64,13 +64,6 @@ object LoadGameTests {
     private const val CI_MAX_IDLE_KERNEL_THREADS = 8
 
     /**
-     * CI で、起動の間のカーネルのスレッドの最大の上限（#350）。
-     * 台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
-     * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分。
-     * 起動の前からあってプールで待っているワーカーは数えない。先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）。
-     * 起動の間に作られたスレッドは、待っているワーカーでも数える（#483）
-     */
-    /**
      * CI の自動保存の一巡の tick 数の上限。台ごとの書き込みは最大 2 回（ID を振る初回は `owner.bin` の分も書く）なので、
      * 書き込みは合わせて `2 × CI_COUNT` 回で、tick ごとの予算 [budget] で割った tick 数かかる（READY にならずに飛ばす台も、
      * 止める上限の回数を同じだけ使う）。それに、最初の台を止めてから READY を待つ分（[quiesceTicks]）と、
@@ -82,6 +75,13 @@ object LoadGameTests {
     /** [ciMaxAutosaveCycleTicks] の余裕 */
     private const val CI_AUTOSAVE_CYCLE_SLACK_TICKS = 2
 
+    /**
+     * CI で、起動の間のカーネルのスレッドの最大の上限（#350）。
+     * 台数によらず、許可の数（同時に WASM を実行する台数）に比例する:
+     * 許可を持つワーカーと起動用のスレッド（どちらも許可の数まで）、それに [CI_MAX_IDLE_KERNEL_THREADS] の分。
+     * 起動の前からあってプールで待っているワーカーは数えない。先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）。
+     * 起動の間に作られたスレッドは、待っているワーカーでも数える（#483）
+     */
     private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
     /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
