@@ -251,6 +251,68 @@ class MachineSaveStoreAsyncTest {
         assertFalse(s.isUnusable(id), "最後の仕事が終われば印を外す")
     }
 
+    @Test
+    fun `owner_binの失敗を受け取る前に、deleteの後のclaimが同じIDのowner_binを同期で書けば、印が外れて後続は書ける`() {
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val first = s.submit(null, p, src(), null)
+        val id = first.identity.id
+        manual.runAll()
+        assertTrue(s.isUnusable(id), "失敗をまだ受け取っていないので印が残る")
+        Files.delete(root)
+        Files.createDirectories(root)
+        // 受け取る前に壊して消し、コピーした NBT を置き直す（owner.bin がないので KEPT で同じ ID。owner.bin は claim が同期で書く）
+        s.delete(id)
+        index.removeIfOwner(id, p)
+        manual.runAll()
+        val claim = s.claim(id.toString(), 1, 0, q)
+        assertEquals(ClaimResult.KEPT, claim.result)
+        assertEquals(id, claim.identity!!.id)
+        assertEquals(OwnerRecord(0, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        assertFalse(s.isUnusable(id), "owner.bin が同期で書けたので印を外す")
+        // 1つ目の失敗を受け取る前に、次を書かせる（受け取ると、仕事がなければそこでも印が外れるため）
+        val second = s.submit(claim.identity!!, q, src(), null)
+        assertEquals(id, second.identity.id)
+        manual.runAll()
+        assertTrue(exists(second, s), "印が外れたので世代のファイルを書く")
+        val completions = s.pollCompleted()
+        assertEquals(listOf(first, second), completions.map { it.pending })
+        assertFalse(completions[0].succeeded)
+        assertTrue(completions[1].succeeded, "後続は成功で返る")
+        assertEquals(OptionalLong.of(second.identity.generation), s.latestGeneration(id))
+        assertEquals(q, index.ownerOf(id), "古い失敗を受け取っても、claim し直した登録は外さない")
+    }
+
+    @Test
+    fun `owner_binの失敗を受け取る前に、引き取りのclaimが同じIDのowner_binを同期で書けば、印が外れて後続は書ける`() {
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val first = s.submit(null, p, src(), null)
+        val id = first.identity.id
+        manual.runAll()
+        assertTrue(s.isUnusable(id))
+        Files.delete(root)
+        Files.createDirectories(root)
+        // 受け取る前にアンロードされ、NBT が別の場所に置かれる（覚えている owner.bin の epoch 以上なので引き取り、epoch 1 を同期で書く）
+        index.removeIfOwner(id, p)
+        val claim = s.claim(id.toString(), 1, 0, q)
+        assertEquals(ClaimResult.TAKEN_OVER, claim.result)
+        assertEquals(id, claim.identity!!.id)
+        assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        assertFalse(s.isUnusable(id), "owner.bin が同期で書けたので印を外す")
+        val second = s.submit(claim.identity!!, q, src(), null)
+        assertEquals(id, second.identity.id)
+        assertFalse(second.reassigned)
+        manual.runAll()
+        assertTrue(exists(second, s), "印が外れたので世代のファイルを書く")
+        val completions = s.pollCompleted()
+        assertEquals(listOf(first, second), completions.map { it.pending })
+        assertFalse(completions[0].succeeded)
+        assertTrue(completions[1].succeeded, "後続は成功で返る")
+    }
+
     private fun exists(pending: PendingSave, s: MachineSaveStore) =
         Files.exists(s.generationFile(pending.identity.id, pending.identity.generation))
 
