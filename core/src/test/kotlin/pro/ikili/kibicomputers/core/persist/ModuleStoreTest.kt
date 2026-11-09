@@ -61,8 +61,10 @@ class ModuleStoreTest {
         val store = FileModuleStore(dir.resolve("none"))
         assertFalse(store.contains(hash))
         val same = FileModuleStore(dir)
-        assertTrue(same.put(hash, bytes))
+        assertTrue(same.contains(hash), "壊れたファイルの名前も種になる")
+        assertTrue(same.put(hash, bytes), "種だけのハッシュは put で中身を確かめる")
         assertArrayEquals(bytes, Files.readAllBytes(dir.resolve(ModuleStore.hex(hash) + ".wasm")))
+        assertArrayEquals(bytes, same.get(hash))
     }
 
     @Test
