@@ -122,6 +122,7 @@ internal enum class LoadPhase(val label: String) {
  * @property measureTicks 測る tick 数
  * @property bootTimeoutTicks 全台がプロンプトを出すまで待つ上限
  * @property outputTimeoutTicks [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまで待つ上限。出なければ失敗。
+ *   [LoadPhase.COMPUTE] で、計算させる台が全部、打ち込んだ命令を画面に出すまで待つ上限にも使う
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
  */
@@ -671,7 +672,11 @@ internal class LoadRun(
     }
 
     private fun steady(p: LoadPhase) {
-        val from = measureFrom ?: return if (p == LoadPhase.IDLE) awaitTmp() else awaitOutput()
+        val from = measureFrom ?: return when (p) {
+            LoadPhase.IDLE -> awaitTmp()
+            LoadPhase.COMPUTE -> awaitCompute()
+            else -> awaitOutput()
+        }
         val t = phaseTick - from
         if (t == settings.warmupTicks) {
             recording = true
@@ -700,6 +705,25 @@ internal class LoadRun(
             fail("$waiting of ${outputSet.size} output machines showed nothing within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
         }
     }
+
+    /**
+     * [LoadPhase.COMPUTE] のはじめ: 計算させる台が全部、打ち込んだ命令を画面に出す（シェルが読んだ）まで待ってから測りはじめる。
+     * GameTest のサーバーは tick の間で待たないので、CPU の枠が少ない環境（CI のランナーは2コア）では、
+     * 測る tick 数が終わっても、シェルが入力を読んでいないことがある
+     */
+    private fun awaitCompute() {
+        if (phaseTick % 10 != 0) return
+        val waiting = computeSet.count { !runsLoop(it) }
+        if (waiting == 0) {
+            measureFrom = phaseTick
+        } else if (phaseTick >= settings.outputTimeoutTicks) {
+            val c = computeSet.first { !runsLoop(it) }
+            fail("$waiting of ${computeSet.size} computing machines did not show the command within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
+        }
+    }
+
+    private fun runsLoop(c: Computer): Boolean =
+        lines(c.screen.text).lastOrNull { it.isNotEmpty() } == "${settings.os.prompt} ${settings.os.computeCommand}"
 
     /**
      * [LoadPhase.IDLE] のはじめ: `/tmp` に書かせる台（[tmpSet]）が全部、書き終えてプロンプトに戻るまで待ってから測りはじめる（#553）。
@@ -806,7 +830,7 @@ internal class LoadRun(
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a computing machine stopped: ${lines(c.screen.text)}")
                 val text = lines(c.screen.text)
                 // 計算している間はプロンプトに戻らない
-                if (text.lastOrNull { it.isNotEmpty() } != "${settings.os.prompt} ${settings.os.computeCommand}") fail("the loop should keep running: $text")
+                if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
             LoadPhase.UNLOAD -> Unit
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
@@ -819,7 +843,7 @@ internal class LoadRun(
     private fun enter(p: LoadPhase) {
         phase = p
         phaseTick = -1 // step() が 0 にする
-        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE) null else 0
+        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE) null else 0
         phaseStartNanos = System.nanoTime()
         recording = false
         countSent = false
