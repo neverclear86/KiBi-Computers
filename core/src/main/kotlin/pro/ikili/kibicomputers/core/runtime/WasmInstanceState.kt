@@ -12,9 +12,11 @@ import org.jetbrains.annotations.ApiStatus
  * - drop 済みのパッシブなデータ・要素のセグメント（ADR 0030 の結論 2）
  *
  * @property memoryPages 線形メモリのページ数。メモリがなければ -1
+ * @property changedOnly 区画は基準（最後の全体保存）から変わったものだけ（#83。[StateCaptureMode.CHANGED]）。
+ *   このままでは戻せず、基準と合成する（`InstanceStateMerge`）
  */
 @ApiStatus.Internal
-public class WasmInstanceState(
+public class WasmInstanceState @JvmOverloads constructor(
     public val memoryPages: Int,
     writtenChunkIndices: IntArray,
     chunks: List<ByteArray>,
@@ -22,6 +24,7 @@ public class WasmInstanceState(
     tables: List<TableState>,
     droppedDataSegments: IntArray,
     droppedElementSegments: IntArray,
+    public val changedOnly: Boolean = false,
 ) {
     private val chunkIndices = writtenChunkIndices.copyOf()
     private val chunkData: List<ByteArray> = chunks.map { it.copyOf() }
@@ -58,6 +61,9 @@ public class WasmInstanceState(
 
     /** drop 済みの要素セグメントの番号（写し） */
     public val droppedElementSegments: IntArray get() = droppedElements.copyOf()
+
+    /** [i] 番目の区画の中身を写さずに渡す（合成用。#83） */
+    internal fun chunkUnsafe(i: Int): ByteArray = chunkData[i]
 
     /** 区画の中身を写さずに渡す（符号化用） */
     internal fun forEachChunk(action: (index: Int, data: ByteArray) -> Unit) {
@@ -117,3 +123,29 @@ public class WasmInstanceState(
  */
 @ApiStatus.Internal
 public class WasmStateException @JvmOverloads constructor(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * インスタンスの状態の取り出し方（#83、ADR 0083）
+ */
+@ApiStatus.Internal
+public enum class StateCaptureMode {
+    /** 書き換えた区画すべて。変わった区画の追跡は変えない */
+    FULL,
+
+    /** 書き換えた区画すべてを取り、それを基準にして、ここから変わった区画を追い始める（全体保存） */
+    FULL_AND_TRACK,
+
+    /** 最後の [FULL_AND_TRACK] から変わった区画だけ（[WasmInstanceState.changedOnly]）。追跡は変えない */
+    CHANGED,
+}
+
+/**
+ * 線形メモリの区画の数（#83。全体保存に切り替えるかを決めるのに使う）
+ *
+ * @property written 書き換えた区画（数えた区画）の数
+ * @property changed そのうち、最後の [StateCaptureMode.FULL_AND_TRACK] から変わった区画の数
+ */
+@ApiStatus.Internal
+public class MemoryChunkCounts(public val written: Int, public val changed: Int) {
+    override fun toString(): String = "MemoryChunkCounts(written=$written, changed=$changed)"
+}

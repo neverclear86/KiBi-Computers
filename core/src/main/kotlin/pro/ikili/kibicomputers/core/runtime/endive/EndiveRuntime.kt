@@ -1,6 +1,8 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.runtime.MemoryChunkCounts
+import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmException
@@ -831,22 +833,40 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
     }
 
     @Throws(WasmStateException::class)
-    override fun captureState(): WasmInstanceState {
+    override fun captureState(): WasmInstanceState = captureState(StateCaptureMode.FULL)
+
+    /** 区画で数えるメモリ（[WrittenPagesMemory]）か、メモリがなければ追える（#83） */
+    override val tracksChanges: Boolean
+        get() = memoryWrapper.let { it == null || (it as EndiveWasmMemory).raw is WrittenPagesMemory }
+
+    override fun memoryChunkCounts(): MemoryChunkCounts? {
+        val mem = memoryWrapper ?: return MemoryChunkCounts(0, 0)
+        val raw = (mem as EndiveWasmMemory).raw as? WrittenPagesMemory ?: return null
+        val (written, changed) = raw.chunkCounts()
+        return MemoryChunkCounts(written, changed)
+    }
+
+    @Throws(WasmStateException::class)
+    override fun captureState(mode: StateCaptureMode): WasmInstanceState {
         val inst = instance()
         val mod = module.module
         if (mod.startSection().isPresent) throw WasmStateException("start 関数を持つモジュールは、状態から作り直せない")
-        // 線形メモリ（0 番）: 書き換えた区画だけ
+        if (mode != StateCaptureMode.FULL && !tracksChanges) throw WasmStateException("このメモリは変わった区画を追えない（$mode）")
+        // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1
         var indices = IntArray(0)
         var data: List<ByteArray> = emptyList()
         val mem = memoryWrapper
+        // FULL_AND_TRACK は、ほかの部分を取り出せた後に区画を読み取り専用に戻す（取り出せない作りなら追跡を変えない）
+        var parkAfter: WrittenPagesMemory? = null
         if (mem != null) {
             val raw = (mem as EndiveWasmMemory).raw
             pages = raw.pages()
             if (raw is WrittenPagesMemory) {
-                val (i, d) = raw.writtenChunkSnapshot()
+                val (i, d) = raw.writtenChunkSnapshot(changedOnly = mode == StateCaptureMode.CHANGED)
                 indices = i
                 data = d
+                if (mode == StateCaptureMode.FULL_AND_TRACK) parkAfter = raw
             } else {
                 // 区画で数えないメモリ（テストの設定）: 0 でない区画をすべて書き換えた区画として扱う
                 val list = ArrayList<Int>()
@@ -890,13 +910,15 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         val segments = mod.dataSection().dataSegments()
         val droppedData = segments.indices.filter { i -> segments[i].bytes().isNotEmpty() && inst.dataSegmentData(i).isEmpty() }.toIntArray()
         val droppedElements = (0 until inst.elementCount()).filter { inst.element(it) == null }.toIntArray()
-        return WasmInstanceState(pages, indices, data, globals, tables, droppedData, droppedElements)
+        parkAfter?.parkWritten()
+        return WasmInstanceState(pages, indices, data, globals, tables, droppedData, droppedElements, mode == StateCaptureMode.CHANGED)
     }
 
     /** 作ったばかりのインスタンスに、保存した状態 [state] を上書きする（#82）。合わなければ [WasmLinkException] */
     fun restoreState(state: WasmInstanceState) {
         val inst = instance()
         val mod = module.module
+        if (state.changedOnly) throw WasmLinkException("差分の状態は基準と合成してから戻す")
         // メモリ
         val mem = memoryWrapper
         if ((mem == null) != (state.memoryPages < 0)) throw WasmLinkException("保存した状態とメモリの有無が合わない")

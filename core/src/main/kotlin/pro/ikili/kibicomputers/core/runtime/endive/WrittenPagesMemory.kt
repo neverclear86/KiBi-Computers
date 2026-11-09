@@ -35,6 +35,10 @@ import run.endive.runtime.Memory as EndiveMemory
  * 数えられなければ grow を -1 にして [onGrowRefused] を呼ぶ（アロケーターは NULL を返して優しく失敗できる）。
  *
  * 区画の表は `pages()` に合わせて伸ばす（上限の分を先に作らない）。共有メモリ（threads）には使わない。
+ *
+ * 変わった区画の追跡（#83、ADR 0083）: [parkWritten] は、書き換えた区画を同じ配列を指す読み取り専用の見え方に差し替え、
+ * 元の書ける区画を [parked] に置く。次に書いたときの例外で [parked] から戻す（数え直さない・写さない）。なので
+ * 「書ける区画 = 最後の [parkWritten] から変わった区画」「[parked] にある区画 = その時と同じ区画」になる。
  */
 internal class WrittenPagesMemory(
     private val limits: MemoryLimits,
@@ -76,6 +80,12 @@ internal class WrittenPagesMemory(
 
     private var dataSegments: Array<DataSegment>? = null
 
+    /**
+     * [parkWritten] で読み取り専用の見え方に差し替えた、書き換えた区画の元のバッファ（区画の表と同じ長さ。初めて [parkWritten] したときに作る）。
+     * ここにある区画は数えたまま（[writtenChunks] に入っている）
+     */
+    private var parked: Array<ByteBuffer?>? = null
+
     override fun pages(): Int = nPages
 
     @Synchronized
@@ -100,6 +110,7 @@ internal class WrittenPagesMemory(
         fresh[headChunk] = newChunk()
         fresh[tailChunk] = newChunk()
         if (!released) writtenChunks += edges
+        growParked(fresh.size)
         chunks = fresh
         nPages = next
         return prev
@@ -177,6 +188,8 @@ internal class WrittenPagesMemory(
         val table = chunks
         val chunk = table.getOrNull(index) ?: throw outOfBounds(index shl CHUNK_SHIFT, 1)
         if (!chunk.isReadOnly) return chunk
+        // 全体保存の後に初めて書く区画: 数えずに元のバッファへ戻す（中身は同じ配列）
+        unpark(index)?.let { return it }
         val rom = romWriting
         if (rom != null) {
             // インスタンスを作っている途中（データセグメント）: 数えない ROM の区画に書く
@@ -215,14 +228,16 @@ internal class WrittenPagesMemory(
         val first = (start ushr CHUNK_SHIFT).toInt()
         val last = ((start + len - 1) ushr CHUNK_SHIFT).toInt()
         val table = chunks
+        val park = parked
         var fresh = 0
-        for (i in first..last) if (table[i]!!.isReadOnly) fresh++
-        if (fresh == 0) return true
+        for (i in first..last) if (table[i]!!.isReadOnly && park?.get(i) == null) fresh++
         val counted = !released
-        if (counted && budget != null && !budget.tryReserveBytes(fresh.toLong() * CHUNK_SIZE, keepBytes)) return false
+        if (fresh > 0 && counted && budget != null && !budget.tryReserveBytes(fresh.toLong() * CHUNK_SIZE, keepBytes)) return false
         for (i in first..last) {
             val chunk = table[i]!!
             if (!chunk.isReadOnly) continue
+            // もう数えた区画（parkWritten したもの）は、数えずに戻すだけ
+            if (unpark(i) != null) continue
             val copy = newChunk()
             if (chunk !== ZERO_CHUNK) chunk.get(0, copy.array(), 0, CHUNK_SIZE)
             table[i] = copy
@@ -232,21 +247,77 @@ internal class WrittenPagesMemory(
     }
 
     /**
-     * 書き換えた区画（読み取り専用でない区画。数えた区画と同じ）の番号（昇順）と中身の写し（#82）。
-     * 待機点（WASM が動いていないとき）で呼ぶ
+     * 書き換えた区画（数えた区画と同じ）の番号（昇順）と中身の写し（#82）。[changedOnly] なら、最後の [parkWritten] から
+     * 変わった区画（書ける区画）だけ（#83）。待機点（WASM が動いていないとき）で呼ぶ。
+     * [parked] の区画は、読み取り専用の見え方の `array()` が使えないので、元のバッファから写す
      */
     @Synchronized
-    fun writtenChunkSnapshot(): Pair<IntArray, List<ByteArray>> {
+    fun writtenChunkSnapshot(changedOnly: Boolean = false): Pair<IntArray, List<ByteArray>> {
         val table = chunks
+        val park = parked
         val indices = ArrayList<Int>()
         val data = ArrayList<ByteArray>()
         for (i in table.indices) {
             val chunk = table[i] ?: continue
-            if (chunk.isReadOnly) continue
+            val source = when {
+                !chunk.isReadOnly -> chunk
+                changedOnly -> null
+                else -> park?.get(i)
+            } ?: continue
             indices += i
-            data += chunk.array().copyOf()
+            data += source.array().copyOf()
         }
         return indices.toIntArray() to data
+    }
+
+    /**
+     * 今の書き換えた区画を基準にして、ここから変わった区画を追い始める（#83。全体保存の取り出しのとき）。
+     * 書ける区画を、同じ配列を指す読み取り専用の見え方に差し替え、元のバッファを [parked] に置く。数は変えない。
+     * 待機点（WASM が動いていないとき）で呼ぶ
+     */
+    @Synchronized
+    fun parkWritten() {
+        val table = chunks
+        val park = parked ?: arrayOfNulls<ByteBuffer>(table.size).also { parked = it }
+        for (i in table.indices) {
+            val chunk = table[i] ?: continue
+            if (chunk.isReadOnly) continue
+            park[i] = chunk
+            table[i] = readOnlyView(chunk)
+        }
+    }
+
+    /** 書き換えた区画の数と、最後の [parkWritten] から変わった区画の数（#83） */
+    @Synchronized
+    fun chunkCounts(): Pair<Int, Int> {
+        val table = chunks
+        val park = parked
+        var written = 0
+        var changed = 0
+        for (i in table.indices) {
+            val chunk = table[i] ?: continue
+            if (!chunk.isReadOnly) {
+                written++
+                changed++
+            } else if (park?.get(i) != null) {
+                written++
+            }
+        }
+        return written to changed
+    }
+
+    /** [parked] の [index] を区画の表に戻して返す。なければ `null`。ロックの中で呼ぶ */
+    private fun unpark(index: Int): ByteBuffer? {
+        val park = parked ?: return null
+        val buf = park[index] ?: return null
+        park[index] = null
+        chunks[index] = buf
+        return buf
+    }
+
+    private fun growParked(size: Int) {
+        val park = parked ?: return
+        if (park.size < size) parked = park.copyOf(size)
     }
 
     /**
@@ -261,6 +332,7 @@ internal class WrittenPagesMemory(
         val fresh = arrayOfNulls<ByteBuffer>(pages * CHUNKS_PER_PAGE)
         System.arraycopy(old, 0, fresh, 0, old.size)
         java.util.Arrays.fill(fresh, old.size, fresh.size, ZERO_CHUNK)
+        growParked(fresh.size)
         chunks = fresh
         nPages = pages
         return true
@@ -276,11 +348,13 @@ internal class WrittenPagesMemory(
         val table = chunks
         require(index in table.indices) { "区画 $index はメモリの外" }
         val current = table[index]!!
-        if (current.isReadOnly) {
+        val wasParked = parked?.get(index) != null
+        if (current.isReadOnly && !wasParked) {
             val counted = !released
             if (counted && budget != null && !budget.tryReserveBytes(CHUNK_SIZE.toLong())) return false
             if (counted) writtenChunks++
         }
+        if (wasParked) parked!![index] = null
         val fresh = newChunk()
         System.arraycopy(data, 0, fresh.array(), 0, CHUNK_SIZE)
         table[index] = fresh
@@ -564,6 +638,12 @@ internal class WrittenPagesMemory(
         private val ZERO_CHUNK: ByteBuffer = ByteBuffer.allocate(CHUNK_SIZE).asReadOnlyBuffer()
 
         private fun newChunk(): ByteBuffer = ByteBuffer.allocate(CHUNK_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+
+        /**
+         * [buf] と同じ配列を指す読み取り専用の見え方。`asReadOnlyBuffer()` はバイト順を引き継がず BIG_ENDIAN に戻るので付け直す
+         * （付け直さないと `getInt` などがバイトの入れ替わった値を返す）
+         */
+        private fun readOnlyView(buf: ByteBuffer): ByteBuffer = buf.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
 
         private fun isZero(data: ByteArray, from: Int, length: Int): Boolean {
             for (i in from until from + length) if (data[i] != 0.toByte()) return false

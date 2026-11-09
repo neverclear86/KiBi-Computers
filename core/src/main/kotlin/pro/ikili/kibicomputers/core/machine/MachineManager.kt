@@ -10,6 +10,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
@@ -212,9 +214,26 @@ public class MachineManager<K : Any> internal constructor(
      * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。止めている間に取り出したら、取り出し済みの印を付ける
      * （[endQuiesce] で消える。マシンは [release] まで捨てない）
      */
-    public fun capture(key: K, policy: CapturePolicy): MachineSnapshotSource? {
+    @JvmOverloads
+    public fun capture(
+        key: K,
+        policy: CapturePolicy,
+        deltaBase: DeltaBase? = null,
+        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    ): MachineSnapshotSource? {
         val entry = entries[key] ?: return null
         if (entry.captured) return null
+        val source = entry.machine.captureSnapshot(policy, deltaBase, fullSaveChangedRatio) ?: return null
+        if (entry.quiesce != null) entry.captured = true
+        return source
+    }
+
+    /**
+     * [key] のマシンの全体の写しを取り直す（#83。差分の基準が使えず、置き場が書かなかったとき）。取り出し済みの印は見ない（立てたまま）。
+     * マシンがない・[CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`
+     */
+    public fun recapture(key: K, policy: CapturePolicy): MachineSnapshotSource? {
+        val entry = entries[key] ?: return null
         val source = entry.machine.captureSnapshot(policy) ?: return null
         if (entry.quiesce != null) entry.captured = true
         return source

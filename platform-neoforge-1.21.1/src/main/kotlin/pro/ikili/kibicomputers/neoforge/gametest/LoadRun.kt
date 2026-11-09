@@ -122,6 +122,7 @@ internal enum class LoadPhase(val label: String) {
  * @property measureTicks 測る tick 数
  * @property bootTimeoutTicks 全台がプロンプトを出すまで待つ上限
  * @property outputTimeoutTicks [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまで待つ上限。出なければ失敗。
+ *   [LoadPhase.COMPUTE] で、計算させる台が全部、打ち込んだ命令を画面に出すまで待つ上限にも使う
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
  */
@@ -218,6 +219,10 @@ internal data class AvgMax(val avg: Double, val max: Double) {
  * @property tmpWriterTmpfsMax 同じく最大
  * @property otherTmpfsAvg ほかの台（`/tmp` が空）の `TMPFS` 節の中身の大きさの平均
  * @property otherTmpfsMax 同じく最大
+ * @property fullSaves 全体の世代を書いた回数（#83）
+ * @property fullBytesTotal 全体の世代のファイルの大きさの合計
+ * @property deltaSaves 差分の世代を書いた回数（#83）
+ * @property deltaBytesTotal 差分の世代のファイルの大きさの合計
  */
 internal data class SaveCost(
     val saves: Int,
@@ -237,6 +242,10 @@ internal data class SaveCost(
     val tmpWriterTmpfsMax: Int,
     val otherTmpfsAvg: Double,
     val otherTmpfsMax: Int,
+    val fullSaves: Int = 0,
+    val fullBytesTotal: Long = 0,
+    val deltaSaves: Int = 0,
+    val deltaBytesTotal: Long = 0,
 )
 
 /**
@@ -354,6 +363,16 @@ internal class LoadReport(
                         Locale.ROOT, "| %s | %.0f / %d / %d B | %.1f MiB | %d 台・%d / %.0f / %d B | %.0f / %d B |\n",
                         p.label, c.fileBytesAvg, c.fileBytesP50, c.fileBytesMax, c.fileBytesTotal / mib,
                         c.tmpWriters, c.tmpWriterTmpfsMin, c.tmpWriterTmpfsAvg, c.tmpWriterTmpfsMax, c.otherTmpfsAvg, c.otherTmpfsMax,
+                    ),
+                )
+            }
+            sb.append("\n| 段階 | 全体の世代（数・合計） | 差分の世代（数・合計） |\n")
+            sb.append("| --- | --: | --: |\n")
+            for ((p, c) in costs) {
+                sb.append(
+                    String.format(
+                        Locale.ROOT, "| %s | %d・%.1f MiB | %d・%.1f MiB |\n",
+                        p.label, c.fullSaves, c.fullBytesTotal / mib, c.deltaSaves, c.deltaBytesTotal / mib,
                     ),
                 )
             }
@@ -552,6 +571,10 @@ internal class LoadRun(
             tmpWriterTmpfsMax = writers.maxOfOrNull { it.tmpfsBytes } ?: 0,
             otherTmpfsAvg = if (others.isEmpty()) 0.0 else others.map { it.tmpfsBytes }.average(),
             otherTmpfsMax = others.maxOfOrNull { it.tmpfsBytes } ?: 0,
+            fullSaves = saves.count { !it.delta },
+            fullBytesTotal = saves.filter { !it.delta }.sumOf { it.fileBytes.toLong() },
+            deltaSaves = saves.count { it.delta },
+            deltaBytesTotal = saves.filter { it.delta }.sumOf { it.fileBytes.toLong() },
         )
     }
 
@@ -649,7 +672,11 @@ internal class LoadRun(
     }
 
     private fun steady(p: LoadPhase) {
-        val from = measureFrom ?: return if (p == LoadPhase.IDLE) awaitTmp() else awaitOutput()
+        val from = measureFrom ?: return when (p) {
+            LoadPhase.IDLE -> awaitTmp()
+            LoadPhase.COMPUTE -> awaitCompute()
+            else -> awaitOutput()
+        }
         val t = phaseTick - from
         if (t == settings.warmupTicks) {
             recording = true
@@ -678,6 +705,25 @@ internal class LoadRun(
             fail("$waiting of ${outputSet.size} output machines showed nothing within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
         }
     }
+
+    /**
+     * [LoadPhase.COMPUTE] のはじめ: 計算させる台が全部、打ち込んだ命令を画面に出す（シェルが読んだ）まで待ってから測りはじめる。
+     * GameTest のサーバーは tick の間で待たないので、CPU の枠が少ない環境（CI のランナーは2コア）では、
+     * 測る tick 数が終わっても、シェルが入力を読んでいないことがある
+     */
+    private fun awaitCompute() {
+        if (phaseTick % 10 != 0) return
+        val waiting = computeSet.count { !runsLoop(it) }
+        if (waiting == 0) {
+            measureFrom = phaseTick
+        } else if (phaseTick >= settings.outputTimeoutTicks) {
+            val c = computeSet.first { !runsLoop(it) }
+            fail("$waiting of ${computeSet.size} computing machines did not show the command within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
+        }
+    }
+
+    private fun runsLoop(c: Computer): Boolean =
+        lines(c.screen.text).lastOrNull { it.isNotEmpty() } == "${settings.os.prompt} ${settings.os.computeCommand}"
 
     /**
      * [LoadPhase.IDLE] のはじめ: `/tmp` に書かせる台（[tmpSet]）が全部、書き終えてプロンプトに戻るまで待ってから測りはじめる（#553）。
@@ -784,7 +830,7 @@ internal class LoadRun(
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a computing machine stopped: ${lines(c.screen.text)}")
                 val text = lines(c.screen.text)
                 // 計算している間はプロンプトに戻らない
-                if (text.lastOrNull { it.isNotEmpty() } != "${settings.os.prompt} ${settings.os.computeCommand}") fail("the loop should keep running: $text")
+                if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
             LoadPhase.UNLOAD -> Unit
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
@@ -797,7 +843,7 @@ internal class LoadRun(
     private fun enter(p: LoadPhase) {
         phase = p
         phaseTick = -1 // step() が 0 にする
-        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE) null else 0
+        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE) null else 0
         phaseStartNanos = System.nanoTime()
         recording = false
         countSent = false

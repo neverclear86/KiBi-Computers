@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.ModuleSource
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
 
 /** 読んだ p1 の層の中身（#82。#85 がプロセスに戻す） */
@@ -19,7 +20,7 @@ internal class DecodedP1Process(
 )
 
 /**
- * `PROCESS_ABI` 節の p1 の層（層 1、版 1。#82、ADR 0082 の 5.）の中身。
+ * `PROCESS_ABI` 節の p1 の層（層 1。#82、ADR 0082 の 5.。版 2 は #83、ADR 0083 でインスタンスの状態の線形メモリの形を変えた）の中身。
  *
  * モジュールの参照（元のハッシュ 32 バイト・後のハッシュ 32 バイト・計測したか・止まりうる import の集合・変換器の版・段1で変換できたか）、
  * 入口（u8。[ENTRY_NO_INSTANCE]・[ENTRY_START]・[ENTRY_REWIND]）、インスタンスの状態（入口が 0 でないとき。[InstanceStateCodec]）、
@@ -45,7 +46,8 @@ internal object P1SectionCodec {
         asyncStack: LongArray,
         asyncWait: AsyncWait?,
     ): ByteArray {
-        val out = SnapshotWriter(256 + (instance?.writtenChunkCount ?: 0) * (4 + WasmInstanceState.CHUNK_BYTES))
+        // 区画の中身は圧縮するので、番号の分だけ見込む（足りなければ伸びる）
+        val out = SnapshotWriter(256 + (instance?.writtenChunkCount ?: 0) * 8)
         out.raw(source.originalHash)
         out.raw(loadedHash.bytes())
         out.bool(source.metered)
@@ -78,8 +80,19 @@ internal object P1SectionCodec {
         return out.toByteArray()
     }
 
+    /**
+     * 層の版 [layerVersion]（1 か 2。書くのは [SnapshotSection.P1_LAYER_VERSION] だけ）で読む。
+     * インスタンスの状態の区画の数は [budget] で数える（#83）
+     */
     @Throws(SnapshotFormatException::class)
-    fun read(payload: ByteArray): DecodedP1Process {
+    fun read(
+        payload: ByteArray,
+        layerVersion: Int = SnapshotSection.P1_LAYER_VERSION,
+        budget: ChunkReadBudget = ChunkReadBudget.unlimited(),
+    ): DecodedP1Process {
+        if (layerVersion != InstanceStateCodec.VERSION_1 && layerVersion != InstanceStateCodec.VERSION_2) {
+            throw SnapshotFormatException("p1 の層の版 $layerVersion を知らない")
+        }
         val input = SnapshotReader(payload)
         val original = input.raw(ModuleHash.SIZE)
         val loaded = ModuleHash.fromBytes(input.raw(ModuleHash.SIZE))
@@ -95,7 +108,7 @@ internal object P1SectionCodec {
         val source = ModuleSource(original, metered, imports, version, fuelYield)
         val entry = input.u8()
         if (entry > ENTRY_REWIND) throw SnapshotFormatException("入口 $entry が不正")
-        val instance = if (entry == ENTRY_NO_INSTANCE) null else InstanceStateCodec.read(input)
+        val instance = if (entry == ENTRY_NO_INSTANCE) null else InstanceStateCodec.read(input, layerVersion, budget)
         val stackSize = input.count(AsyncStack.MAX_VALUES, 8)
         val stack = LongArray(stackSize) { input.i64() }
         if ((entry == ENTRY_REWIND) != stack.isNotEmpty()) {

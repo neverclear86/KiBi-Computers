@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 
 /** ホスト import を登録する口。`ctx.instantiate` に渡す（最初のインスタンスは [ProcessDriver.configure]）。 */
@@ -51,6 +52,12 @@ internal interface SnapshotCapableDriver : ProcessDriver {
      * 保存できなければ `null`（写しの中で殺す）
      */
     fun captureAbi(rt: ProcessRuntime): ByteArray?
+
+    /**
+     * [mode] でインスタンスの状態を取って、層の中身を返す（#83）。[StateCaptureMode.FULL] 以外は、インスタンスが
+     * [pro.ikili.kibicomputers.core.runtime.WasmInstance.tracksChanges] のときだけ呼ばれる。既定は FULL だけ受け付ける
+     */
+    fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? = if (mode == StateCaptureMode.FULL) captureAbi(rt) else null
 }
 
 /** step の結果 */

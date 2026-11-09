@@ -152,6 +152,14 @@ internal class SnapshotReader(private val buf: ByteArray, private var pos: Int =
         }
     }
 
+    /** [n] バイトの範囲を写さずに [block] に渡し（配列と始まりの位置）、その分を読み進める（#83。伸ばすときに使う） */
+    fun <T> region(n: Int, block: (bytes: ByteArray, offset: Int) -> T): T {
+        need(n)
+        val result = block(buf, pos)
+        pos += n
+        return result
+    }
+
     /** [n] バイトの範囲だけを読む読み手を作り、その分を読み進める */
     fun sub(n: Int): SnapshotReader {
         need(n)

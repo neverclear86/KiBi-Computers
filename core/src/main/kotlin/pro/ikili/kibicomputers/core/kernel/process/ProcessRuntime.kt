@@ -52,6 +52,12 @@ internal class ProcessRuntime(
     /** 線形メモリの使用量（#39。すべてのインスタンスの合計。インスタンスを閉じると減る） */
     val memory: ProcessMemory = machine.memoryAccount.process(machine.config.maxProcessMemoryPages)
 
+    /**
+     * 線形メモリの基準（#83。差分の世代で、変わった区画だけを書けるか）。カーネルロックの中で読み書きする。
+     * インスタンスと組で持つので、インスタンスを作り直したら（exec・戻し）基準はないものとして扱われる
+     */
+    var memoryBase: MemoryBase = MemoryBase.None
+
     /** 作ったインスタンス（作った順） */
     val instances: MutableList<WasmInstance> = ArrayList(1)
 

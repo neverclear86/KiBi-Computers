@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.persist.snapshot.KernelSectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotWriter
 import pro.ikili.kibicomputers.core.persist.snapshot.TmpfsSectionCodec
 import java.util.TreeMap
+import java.util.UUID
 
 /**
  * 保存のためのカーネルの状態の写し（#81・#82、ADR 0081・0082）。カーネルロックの中で [of] で作り、元と次を共有しない:
@@ -69,8 +70,26 @@ internal class KernelStateCopy private constructor(
     /** 開いたファイルのオブジェクトID → FS の中の今のパス（#82。`Vfs.pathHintLocked` で引いたもの） */
     private val paths = HashMap<Int, VfsPath>()
 
-    /** ABI 層の写し1つ */
-    class AbiCapture(val layer: Int, val layerVersion: Int, val payload: ByteArray)
+    /**
+     * ABI 層の写し1つ。[trackedFull] は、インスタンスの状態を全体の形で取り、そこから変わった区画を追い始めた
+     * （`StateCaptureMode.FULL_AND_TRACK`。#83）
+     */
+    class AbiCapture(val layer: Int, val layerVersion: Int, val payload: ByteArray, val trackedFull: Boolean = false)
+
+    /** 取り出しの番号（#83。`Machine` ごとに増える） */
+    var token: Long = 0
+
+    /** 全体保存の取り出し（#83）。差分の取り出しなら `false` */
+    var fullSave: Boolean = true
+
+    /** 差分の取り出しの基準（#83。全体保存なら `null`） */
+    var deltaBase: DeltaBase? = null
+
+    /** 置き場が書けた後に、プロセスの基準を進めてよい（#83。冷えた起動の写しなら `false`） */
+    var commitable: Boolean = true
+
+    /** 置き場が世代のファイルを書けた後に呼ぶ（#83。`Machine` が入れる） */
+    var onCommitted: ((KernelStateCopy, UUID, Long) -> Unit)? = null
 
     /** [pid] が `wakeOnRestore` か */
     fun wakeOnRestore(pid: Int): Boolean = pid in wakeOnRestorePids
@@ -151,9 +170,9 @@ internal class KernelStateCopy private constructor(
     }
 
     /** [pid] の ABI 層の写しを足す（`Machine.captureCopy` の②） */
-    fun putAbi(pid: Int, layer: Int, layerVersion: Int, payload: ByteArray) {
+    fun putAbi(pid: Int, layer: Int, layerVersion: Int, payload: ByteArray, trackedFull: Boolean = false) {
         require(layer in 0..0xFFFF && layerVersion in 0..0xFFFF) { "層の ID と版は u16" }
-        abi[pid] = AbiCapture(layer, layerVersion, payload)
+        abi[pid] = AbiCapture(layer, layerVersion, payload, trackedFull)
     }
 
     /** マウント [mountId] の `/tmp` の写しを足す */
@@ -175,9 +194,27 @@ internal class KernelStateCopy private constructor(
 
     /**
      * 写しを保存データにする。冷えた起動の理由が `NONE` なら `KERNEL`・ABI 層ごとの `PROCESS_ABI`・`TMPFS` を書く。
-     * `NONE` でなければ `KILLED` 節だけ（#82 の 12.）。バイト列にするのは返したものの `build` の中（ロックの外）
+     * `NONE` でなければ `KILLED` 節だけ（#82 の 12.）。バイト列にするのは返したものの `build` の中（ロックの外）。
+     * 差分の取り出しで冷えた起動でなければ、外枠の直後に `DELTA_BASE` 節を書く（#83）
      */
-    fun toSource(): MachineSnapshotSource = MachineSnapshotSource { id, generation, modVersion ->
+    fun toSource(): MachineSnapshotSource {
+        val base = if (coldBootReason == ColdBootReason.NONE && !fullSave) deltaBase else null
+        return object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = base
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot {
+                // 振り直した後（UUID が違う）の差分は書けない（置き場が DeltaBaseUnavailableException で止める）
+                check(base == null || base.id == id) { "差分の基準の UUID ${base?.id} に $id で書こうとした" }
+                return buildSnapshot(id, generation, modVersion, base)
+            }
+
+            override fun committed(id: UUID, generation: Long) {
+                onCommitted?.invoke(this@KernelStateCopy, id, generation)
+            }
+        }
+    }
+
+    private fun buildSnapshot(id: UUID, generation: Long, modVersion: String, base: DeltaBase?): MachineSnapshot {
         val sections = ArrayList<SnapshotSection>()
         if (coldBootReason == ColdBootReason.NONE) {
             sections += SnapshotSection.wrap(SnapshotSection.KERNEL, SnapshotSection.KERNEL_VERSION, KernelSectionCodec.write(this))
@@ -193,7 +230,7 @@ internal class KernelStateCopy private constructor(
                 sections += SnapshotSection.wrap(SnapshotSection.TMPFS, SnapshotSection.TMPFS_VERSION, TmpfsSectionCodec.write(mountId, snapshot))
             }
         }
-        MachineSnapshot(id, generation, modVersion, sections, killed.toList(), coldBootReason.code)
+        return MachineSnapshot(id, generation, modVersion, sections, killed.toList(), coldBootReason.code, base)
     }
 
     companion object {
