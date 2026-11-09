@@ -103,8 +103,17 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** このサーバーで書いたディレクトリ（初めて書く前に、残った `*.tmp` を片付ける。#84 の規則 8） */
     private val initialized: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
-    /** 新しく振った `owner.bin` が書けなかった UUID（後続の仕事は書かずに失敗で返す。仕事がなくなったら外す。#84 の規則 7b） */
+    /**
+     * 新しく振った `owner.bin` が書けなかった UUID（後続の仕事は書かずに失敗で返す。#84 の規則 7b）。外すのは、メインスレッドが失敗を
+     * 受け取り（[dropped]）、かつその UUID の仕事が残っていないとき（#566。仕事が尽きた時点で外すと、受け取る前に入れた後続が書かれる）
+     */
     private val unusable: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * [unusable] のうち、メインスレッドが失敗の完了を受け取ったもの（#566）。[accept] は「ここに入れる → 仕事が残っているか見る」、
+     * [finishTask] は「仕事の数を減らす → ここにあるか見る」の順なので、どちらかが必ず最後の仕事の後に [unusable] から外す
+     */
+    private val dropped: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
     // ---- 両方が触る ----
 
@@ -286,6 +295,8 @@ public class MachineSaveStore @JvmOverloads constructor(
     private fun writeOwner(id: UUID, record: OwnerRecord): Boolean = try {
         OwnerRecord.write(directoryOf(id).resolve(OwnerRecord.FILE_NAME), record)
         owners[id] = record
+        // owner.bin が書けたので、使えない印が残っていても（削除の後に claim し直したときなど）外す
+        forgetUnusable(id)
         true
     } catch (e: IOException) {
         LOG.log(System.Logger.Level.WARNING, "Failed to write owner.bin of $id", e)
@@ -497,9 +508,18 @@ public class MachineSaveStore @JvmOverloads constructor(
         pendingBytesCounter.addAndGet(-bytes)
         pendingTasks.decrementAndGet()
         val left = outstanding.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
-        if (left == null) unusable.remove(id)
+        if (left == null && id in dropped) forgetUnusable(id)
         waitLock.withLock { progress.signalAll() }
     }
+
+    /** [id] の「使えない」の印を外す（#566） */
+    private fun forgetUnusable(id: UUID) {
+        unusable.remove(id)
+        dropped.remove(id)
+    }
+
+    /** [id] が「使えない」の印を持つか（テスト用） */
+    internal fun isUnusable(id: UUID): Boolean = id in unusable
 
     private fun nextGeneration(identity: MachineIdentity): Long =
         maxOf(identity.generation, reserved[identity.id] ?: -1L, latest[identity.id] ?: -1L) + 1
@@ -552,6 +572,11 @@ public class MachineSaveStore @JvmOverloads constructor(
         inFlight[id]?.let {
             it.remove(generation)
             if (it.isEmpty()) inFlight.remove(id)
+        }
+        if (done.unusable) {
+            // 印を外すのは、受け取った後に、その UUID の仕事が残っていないときだけ（受け取る前に入れた後続も書かずに失敗で返す。#566）
+            dropped += id
+            if (!outstanding.containsKey(id)) forgetUnusable(id)
         }
         if (done.registration != null && registrations[id] === done.registration) {
             val result = done.result
