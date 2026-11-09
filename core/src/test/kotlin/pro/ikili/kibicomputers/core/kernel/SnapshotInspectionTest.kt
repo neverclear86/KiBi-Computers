@@ -47,6 +47,13 @@ class SnapshotInspectionTest {
                 ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
             }
             val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+            // 標準入力が閉じていてすぐ終わるプロセス（親のないゾンビとして表に残る。PROCESS_ABI 節を持たない）
+            val closed = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)
+            val zombie = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = closed))
+            eventually(60_000, "標準入力が閉じたプロセスが終わらない") {
+                h.scheduler.tick()
+                m.stateOf(zombie).isTerminal
+            }
             val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt", "x"), stdio = stdio))
             eventually(60_000, "入力を待たない") {
                 h.scheduler.tick()
@@ -63,6 +70,11 @@ class SnapshotInspectionTest {
             assertArrayEquals(ModuleStore.sha256(bytes), p.originalHash)
             assertArrayEquals(m.rt(pid).program.hash.bytes(), p.loadedHash)
             assertArrayEquals(p.loadedHash, p.abiLoadedHash)
+            // ゾンビには節がなくてよい
+            val z = contents.processes.single { it.pid == zombie }
+            assertEquals(null, z.abiLayer)
+            assertEquals(null, z.originalHash)
+            assertEquals(null, z.abiLoadedHash)
 
             // 冷えた起動の写しは読まない
             val cold = MachineSnapshot(snapshot.machineId, 2, "test", emptyList(), listOf(pid), ColdBootReason.INIT_KILLED.code)
@@ -72,6 +84,11 @@ class SnapshotInspectionTest {
                 snapshot.machineId, 3, "test", snapshot.sections.filter { it.kind != SnapshotSection.KERNEL },
             )
             assertThrows<SnapshotFormatException> { SnapshotInspection.inspect(noKernel, m.config.maxProcesses) }
+            // 終わっていないプロセスに PROCESS_ABI 節がない
+            val noAbi = MachineSnapshot(
+                snapshot.machineId, 5, "test", snapshot.sections.filter { it.kind != SnapshotSection.PROCESS_ABI },
+            )
+            assertThrows<SnapshotFormatException> { SnapshotInspection.inspect(noAbi, m.config.maxProcesses) }
             // PROCESS_ABI 節が KERNEL 節にない pid を指す
             val abi = snapshot.sections.single { it.kind == SnapshotSection.PROCESS_ABI }.payload
             val missing = pid + 1000

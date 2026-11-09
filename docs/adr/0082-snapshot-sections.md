@@ -67,4 +67,5 @@ mountId・`nextNode`・node の並び（id・種類・大きさ・3つの時刻�
 - 置き場の `get` が `null`（種だけで中身が壊れていた）なら冷えた起動
 - `wakeOnRestore` のプロセスは戻したら起こす
 - ABI 層 0（テスト用）の節は拒む
+- 終わっていないプロセスに `PROCESS_ABI` 節がなければ、壊れた保存データとして拒む（`SnapshotFormatException`。書く側は終わっていないプロセスすべてに節を書くか、写しの中で殺す）。終わったプロセス（ゾンビ）には節がなくてよい（`SnapshotInspection.inspect` と同じ規則。#559）
 - 読んだ `KERNEL` 節は参照（ハンドル・`wait`・`waitTimers`・`PipeEnd.streamId`・`consoleTtyId`）がすべて表にあることを確かめてある。タイマーの `eventQueueId` は確かめない（上のとおり）
