@@ -200,6 +200,61 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
+    fun `owner_binの失敗を受け取る前に入れた同じIDの後続は、書かずに失敗で返る`() {
+        // 根をファイルにして、1つ目の owner.bin を書けなくする
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val first = s.submit(null, p, src(), null)
+        val id = first.identity.id
+        manual.runAll()
+        assertEquals(0, s.pendingCount, "1つ目は走り終わっている")
+        assertTrue(s.isUnusable(id), "受け取る前は、仕事が尽きても使えない印を残す")
+        // 根を書けるようにしてから、受け取る前に同じ ID の次を入れる（自動保存の後、同じ tick のアンロードなど）
+        Files.delete(root)
+        Files.createDirectories(root)
+        val second = s.submit(first.identity, p, src(), null)
+        assertEquals(id, second.identity.id, "受け取る前は同じ ID の次の世代を予約する")
+        manual.runAll()
+        assertFalse(exists(second, s), "owner.bin のないディレクトリに世代のファイルを書かない")
+        assertFalse(Files.exists(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        val completions = s.pollCompleted()
+        assertEquals(listOf(first, second), completions.map { it.pending })
+        assertTrue(completions.none { it.succeeded }, "どちらも失敗で返る")
+        assertNull(index.ownerOf(id))
+        assertNull(s.ownerOf(id))
+        assertFalse(s.isUnusable(id), "受け取って仕事がなければ印を外す")
+        val third = s.submit(first.identity, p, src(), null)
+        assertNotEquals(id, third.identity.id, "次は振り直す")
+        manual.runAll()
+        assertTrue(s.pollCompleted().single().succeeded)
+        assertTrue(exists(third, s))
+    }
+
+    @Test
+    fun `owner_binの失敗を受け取った時点で後続が残っていれば、印はその後続が終わるまで残す`() {
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val first = s.submit(null, p, src(), null)
+        val id = first.identity.id
+        val second = s.submit(first.identity, p, src(), null)
+        manual.runNext()
+        Files.delete(root)
+        Files.createDirectories(root)
+        // 1つ目の失敗を受け取る。2つ目はまだ列にある
+        assertEquals(listOf(first), s.pollCompleted().map { it.pending })
+        assertTrue(s.isUnusable(id), "後続が残っているうちは印を外さない")
+        manual.runAll()
+        assertFalse(exists(second, s), "受け取った後に走る後続も書かない")
+        assertFalse(s.pollCompleted().single().succeeded)
+        assertFalse(s.isUnusable(id), "最後の仕事が終われば印を外す")
+    }
+
+    private fun exists(pending: PendingSave, s: MachineSaveStore) =
+        Files.exists(s.generationFile(pending.identity.id, pending.identity.generation))
+
+    @Test
     fun `同期のwriteはowner_binの失敗をIOExceptionで返す`() {
         val root = dir.resolve("root")
         Files.write(root, byteArrayOf(1))
