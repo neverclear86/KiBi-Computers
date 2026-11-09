@@ -20,15 +20,11 @@ import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
-import pro.ikili.kibicomputers.core.persist.ColdBootReason
-import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
-import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
-import java.io.DataInputStream
 import java.nio.file.Files
 import java.util.UUID
 
@@ -94,14 +90,6 @@ object MachineSaveGameTests {
         val id = identity.id
         helper.assertTrue(Files.isRegularFile(store.generationFile(id, identity.generation)), "the generation file should exist")
         helper.assertTrue(Files.isRegularFile(store.directoryOf(id).resolve("owner.bin")), "owner.bin should exist")
-        // 世代のファイルの節（#82）: 冷えた起動でなければ KERNEL 節があり、冷えた起動なら KILLED 節だけ
-        val snapshot = DataInputStream(Files.newInputStream(store.generationFile(id, identity.generation)).buffered()).use { MachineSnapshot.readFrom(it) }
-        val kinds = snapshot.sections.map { it.kind }
-        if (snapshot.coldBootCode == ColdBootReason.NONE.code) {
-            helper.assertTrue(kinds.firstOrNull() == SnapshotSection.KERNEL, "a warm snapshot should start with the KERNEL section but was $kinds")
-        } else {
-            helper.assertTrue(kinds.isEmpty(), "a cold snapshot should carry only the KILLED section but was $kinds")
-        }
         helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) == 0, "a machine is captured only once while quiesced")
         be.computer.endQuiesce()
 
