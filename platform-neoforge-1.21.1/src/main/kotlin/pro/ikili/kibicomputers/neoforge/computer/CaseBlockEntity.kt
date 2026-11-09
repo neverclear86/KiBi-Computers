@@ -144,7 +144,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      * 動いているマシンの写しを取り、世代のファイルを書く（#81）。マシンがない・取り出し済み・[policy] が
      * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら何もせず 0。ID がなければここで振る（`owner.bin` が書けなければ 0）。
      * 書けたら [identity] が新しい世代を覚える（`setChanged`・`setUnsaved` は呼び出し側）。
-     * 取り出し・符号化・書き込みの時間と世代のファイルの大きさは [ServerMachines.Stats] に数える（負荷試験用。#553）
+     * 取り出し・符号化・書き込みの時間と世代のファイルの大きさは [ServerMachines.Stats] に数える（負荷試験用。#553）。
+     * ID があれば、置き場の今の基準からの差分の世代を書く（#83。`MachineSaveStore.captureAndWrite`。基準が使えなければ全体を取り直す）
      *
      * @return 行った書き込み（fsync）の回数
      * @throws IOException 世代のファイルが書けなかった
@@ -153,6 +154,18 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal fun captureAndWrite(policy: CapturePolicy): Int {
         val store = WorldMachineSaves.current ?: return 0
         val self = owner ?: return 0
+        val known = identity
+        if (known != null) {
+            val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveChangedRatio)
+            val written = store.captureAndWrite(known, self, capturer)
+            // 取り出さなかった（取り出し済み・TRANSIENT で飛ばした）
+            if (written == null) return 0
+            ServerMachines.Stats.captureNanos += written.captureNanos
+            identity = written.write.identity
+            ServerMachines.Stats.recordSave(blockPos, written.captureNanos, written.write, 0, written.retried)
+            return written.write.writes
+        }
+        // ID がなければ、全体で取ってから振る（置き場は基準を知らない）
         val captureStart = System.nanoTime()
         val captured = computer.capture(policy)
         val captureNanos = System.nanoTime() - captureStart

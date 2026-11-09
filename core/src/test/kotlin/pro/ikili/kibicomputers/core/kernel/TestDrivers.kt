@@ -22,6 +22,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.ConcurrentHashMap
@@ -49,6 +50,14 @@ internal class TestDriver(
     override val abiLayerVersion: Int get() = 1
 
     override fun captureAbi(rt: ProcessRuntime): ByteArray? = abiPayload
+
+    /** [captureAbi] に来たインスタンスの状態の取り方（#83） */
+    val modes: MutableList<StateCaptureMode> = java.util.concurrent.CopyOnWriteArrayList()
+
+    override fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? {
+        modes += mode
+        return abiPayload
+    }
 
     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
         configureCalls.incrementAndGet()

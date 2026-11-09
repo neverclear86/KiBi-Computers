@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
@@ -295,9 +296,11 @@ internal class WasiP1Driver(private val module: WasmModule) : SnapshotCapableDri
      * p1 の層の中身（#82、ADR 0082 の 5.。[P1SectionCodec]）。インスタンスが2つ以上あれば `null`（保存できない）。
      * インスタンスの状態を取り出せない作り（[pro.ikili.kibicomputers.core.runtime.WasmStateException]）は、そのまま投げる
      */
-    override fun captureAbi(rt: ProcessRuntime): ByteArray? {
+    override fun captureAbi(rt: ProcessRuntime): ByteArray? = captureAbi(rt, StateCaptureMode.FULL)
+
+    override fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? {
         if (rt.instances.size > 1) return null
-        val instance = rt.instances.firstOrNull()?.captureState()
+        val instance = rt.instances.firstOrNull()?.captureState(mode)
         val process = rt.process
         val stack = process.asyncStack?.toLongArray() ?: LongArray(0)
         if (instance == null && stack.isNotEmpty()) return null

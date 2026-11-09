@@ -10,7 +10,10 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.SnapshotCapturer
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
 /** コンピューター（ケース）の状態。GUI の状態表示に出す（#121）。 */
@@ -225,7 +228,23 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public val isCaptured: Boolean get() = slot.isCaptured
 
     /** マシンの写しを取る（[MachineSlot.capture]）。マシンがなければ `null` */
-    public fun capture(policy: CapturePolicy): MachineSnapshotSource? = slot.capture(policy)
+    @JvmOverloads
+    public fun capture(
+        policy: CapturePolicy,
+        deltaBase: DeltaBase? = null,
+        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    ): MachineSnapshotSource? = slot.capture(policy, deltaBase, fullSaveChangedRatio)
+
+    /** 全体の写しを取り直す（[MachineSlot.recapture]。#83）。マシンがなければ `null` */
+    public fun recapture(policy: CapturePolicy): MachineSnapshotSource? = slot.recapture(policy)
+
+    /**
+     * 置き場への書き込みの取り出し口（#83。[pro.ikili.kibicomputers.core.persist.MachineSaveStore.captureAndWrite] に渡す）。
+     * 最初は [policy] と基準で取り、取り直しは [recapture]
+     */
+    public fun capturer(policy: CapturePolicy, fullSaveChangedRatio: Double): SnapshotCapturer = SnapshotCapturer { deltaBase, retry ->
+        if (retry) recapture(policy) else capture(policy, deltaBase, fullSaveChangedRatio)
+    }
 
     /** チャンクがアンロードされる。マシンを外して [ComputerStatus.OFF] にする（休止は #132）。 */
     public fun chunkUnloaded() {

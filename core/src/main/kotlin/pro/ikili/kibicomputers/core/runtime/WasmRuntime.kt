@@ -123,6 +123,22 @@ public interface WasmInstance : AutoCloseable {
     @Throws(WasmStateException::class)
     public fun captureState(): WasmInstanceState = throw WasmStateException("このランタイムは状態を取り出せない")
 
+    /**
+     * [mode] で実行の状態を取り出す（#83、ADR 0083）。[StateCaptureMode.FULL] は [captureState] と同じ。
+     * ほかの形は [tracksChanges] が真のランタイムだけが受け付ける（既定は [WasmStateException]）
+     */
+    @Throws(WasmStateException::class)
+    public fun captureState(mode: StateCaptureMode): WasmInstanceState =
+        if (mode == StateCaptureMode.FULL) captureState() else throw WasmStateException("このランタイムは変わった区画を追えない（$mode）")
+
+    /**
+     * 「基準から変わった区画」を追える（#83）。真なら [StateCaptureMode.FULL_AND_TRACK]・[StateCaptureMode.CHANGED] を受け付ける
+     */
+    public val tracksChanges: Boolean get() = false
+
+    /** 線形メモリの区画の数（書き換えた区画と、そのうち基準から変わった区画）。追えないなら `null`（#83） */
+    public fun memoryChunkCounts(): MemoryChunkCounts? = null
+
     /** インスタンスを捨てる。以後 [call] は [IllegalStateException] になる。2回呼んでもよい。 */
     override fun close()
 }

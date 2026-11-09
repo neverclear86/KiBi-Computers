@@ -69,7 +69,12 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitRegistry
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 import pro.ikili.kibicomputers.core.machine.isFatal
+import pro.ikili.kibicomputers.core.kernel.process.BaseRef
+import pro.ikili.kibicomputers.core.kernel.process.MemoryBase
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.KernelStateCopy
 import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
@@ -515,11 +520,28 @@ public class Machine private constructor(
      *   写しの中でだけ `SIGKILL` で殺し、殺した pid を記録する
      * - マシン全体が TRANSIENT（起動中・再起動の待ち）で [CapturePolicy.KILL_TRANSIENT] なら、殺さずにそのまま写し、
      *   冷えた起動の理由（[ColdBootReason.REBOOT_PENDING]、なければ [ColdBootReason.BOOTING]）を立てる
+     *
+     * [deltaBase] があれば差分の写しにする（#83、ADR 0083）: その基準に全体の形で入っているプロセスは、そこから変わった区画だけを取る。
+     * ただし「基準から変わった区画の数 ÷ 書き換えた区画の数」が [fullSaveChangedRatio] を超えたら全体の写しにする。
+     * 全体の写しでは、変わった区画を追えるプロセスの区画を読み取り専用に戻し、置き場が書けたら（[MachineSnapshotSource.committed]）
+     * その世代を基準にする
      */
-    public fun captureSnapshot(policy: CapturePolicy): MachineSnapshotSource? = captureCopy(policy)?.toSource()
+    @JvmOverloads
+    public fun captureSnapshot(
+        policy: CapturePolicy,
+        deltaBase: DeltaBase? = null,
+        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    ): MachineSnapshotSource? = captureCopy(policy, deltaBase, fullSaveChangedRatio)?.toSource()
+
+    /** 取り出しの番号（#83。カーネルロックの中で増やす） */
+    private var captureToken = 0L
 
     /** [captureSnapshot] の写しそのもの（テストと #82 用） */
-    internal fun captureCopy(policy: CapturePolicy): KernelStateCopy? = lock.withLockValue {
+    internal fun captureCopy(
+        policy: CapturePolicy,
+        deltaBase: DeltaBase? = null,
+        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    ): KernelStateCopy? = lock.withLockValue {
         val wholeTransient = bootingValue || rebootRequested || rebootNotified
         if (policy == CapturePolicy.SKIP_IF_TRANSIENT && saveReadinessLocked() == SaveReadiness.TRANSIENT) return@withLockValue null
         val hostWaits = HashMap<Int, IntArray>()
@@ -537,11 +559,64 @@ public class Machine private constructor(
                 }
             }
         }
+        // 全体か差分かを決める（#83）
+        val token = ++captureToken
+        val full = deltaBase == null || changedRatioLocked(BaseRef(deltaBase.id, deltaBase.generation)) > fullSaveChangedRatio
+        copy.token = token
+        copy.fullSave = full
+        copy.deltaBase = if (full) null else deltaBase
+        copy.onCommitted = { c, id, generation -> commitCapture(c, id, generation) }
         // ② 理由が NONE のときだけ中身を取る（NONE でなければ、待機点にいないプロセスのインスタンスを読まない。#82 の 12.）
         if (copy.coldBootReason == ColdBootReason.NONE) captureContentLocked(copy)
-        // ③ ②で init を殺して冷えた起動になったら、取った中身を捨てる
-        if (copy.coldBootReason != ColdBootReason.NONE) copy.discardContent()
+        // 写しの中で殺したプロセスは基準なし（古い基準を残さない。#83）
+        for (pid in copy.killedPids) runtimes[pid]?.memoryBase = MemoryBase.None
+        // ③ ②で init を殺して冷えた起動になったら、取った中身を捨てる。この写しで読み取り専用に戻したプロセスは基準なしに戻す
+        if (copy.coldBootReason != ColdBootReason.NONE) {
+            copy.discardContent()
+            copy.commitable = false
+            for (rt in runtimes.values) {
+                val base = rt.memoryBase
+                if (base is MemoryBase.Pending && base.token == token) rt.memoryBase = MemoryBase.None
+            }
+        }
         copy
+    }
+
+    /**
+     * 差分の写しで書く量の比（#83）: 生きているプロセスのうち、[ref] を基準にしているものは変わった区画、ほかは書き換えた区画すべてを
+     * 「変わった量」、全プロセスの書き換えた区画を「全体の量」とする。区画を数えられないプロセスは毎回全体の形なので数えない
+     */
+    private fun changedRatioLocked(ref: BaseRef): Double {
+        var changed = 0L
+        var total = 0L
+        for (rt in runtimes.values) {
+            if (rt.process.state.isTerminal) continue
+            val instance = rt.instances.firstOrNull() ?: continue
+            val counts = instance.memoryChunkCounts() ?: continue
+            changed += if (MemoryBase.matches(rt.memoryBase, ref, instance)) counts.changed else counts.written
+            total += counts.written
+        }
+        return if (total == 0L) 0.0 else changed.toDouble() / total
+    }
+
+    /**
+     * 置き場が [copy] の写しを [id] の世代 [generation] として書けた（#83）。全体の写しで冷えた起動でなければ、その写しで
+     * 全体の形（`FULL_AND_TRACK`）で取ったプロセスのうち、今も同じインスタンスのものの基準をこの世代にする。
+     * この写しで読み取り専用に戻したほかのプロセスは基準なしにする
+     */
+    private fun commitCapture(copy: KernelStateCopy, id: java.util.UUID, generation: Long) = lock.withLockValue {
+        if (!copy.fullSave || !copy.commitable) return@withLockValue
+        val ref = BaseRef(id, generation)
+        for ((pid, rt) in runtimes) {
+            val base = rt.memoryBase as? MemoryBase.Pending ?: continue
+            if (base.token != copy.token) continue
+            val tracked = copy.abiCaptures[pid]?.trackedFull == true
+            rt.memoryBase = if (tracked && rt.instances.firstOrNull() === base.instance) {
+                MemoryBase.Committed(ref, base.instance)
+            } else {
+                MemoryBase.None
+            }
+        }
     }
 
     /**
@@ -555,11 +630,24 @@ public class Machine private constructor(
             if (copy.processes[pid]?.state?.isTerminal != false) continue
             val rt = runtimes[pid]
             val driver = rt?.driver as? SnapshotCapableDriver
+            // インスタンスの状態の取り方（#83）: 差分なら基準に入っているものだけ変わった区画、全体なら追えるものは追い始める
+            val instance = rt?.instances?.firstOrNull()
+            val delta = copy.deltaBase
+            val mode = when {
+                rt == null || instance == null -> StateCaptureMode.FULL
+                delta != null -> if (MemoryBase.matches(rt.memoryBase, BaseRef(delta.id, delta.generation), instance)) {
+                    StateCaptureMode.CHANGED
+                } else {
+                    StateCaptureMode.FULL
+                }
+                instance.tracksChanges -> StateCaptureMode.FULL_AND_TRACK
+                else -> StateCaptureMode.FULL
+            }
             val payload = if (rt == null || driver == null) {
                 null
             } else {
                 try {
-                    driver.captureAbi(rt)
+                    driver.captureAbi(rt, mode)
                 } catch (e: Exception) {
                     LOG.log(System.Logger.Level.WARNING, "マシン $id の pid $pid の状態を取り出せない: $e")
                     null
@@ -570,7 +658,15 @@ public class Machine private constructor(
                 copy.killInCopy(pid)
                 if (copy.coldBootReason != ColdBootReason.NONE) return
             } else {
-                copy.putAbi(pid, driver.abiLayer, driver.abiLayerVersion, payload)
+                copy.putAbi(pid, driver.abiLayer, driver.abiLayerVersion, payload, mode == StateCaptureMode.FULL_AND_TRACK)
+                // 全体の写しでは、追い始めたものは置き場が書けるのを待つ。ほかは基準なし（差分の写しでは変えない）
+                if (copy.fullSave) {
+                    rt!!.memoryBase = if (mode == StateCaptureMode.FULL_AND_TRACK && instance != null) {
+                        MemoryBase.Pending(copy.token, instance)
+                    } else {
+                        MemoryBase.None
+                    }
+                }
             }
         }
         for (entry in kernel.mounts.entries) {

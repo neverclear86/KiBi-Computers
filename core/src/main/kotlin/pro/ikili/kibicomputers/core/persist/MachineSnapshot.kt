@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.persist
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.persist.snapshot.DeltaBaseCodec
 import java.io.ByteArrayOutputStream
 import java.io.DataInput
 import java.io.DataInputStream
@@ -63,6 +64,18 @@ public class SnapshotSection private constructor(
         /** `/tmp` のマウントごとの中身（#82、ADR 0082。先頭にマウントの ID（i32）） */
         public const val TMPFS: Int = 4
 
+        /**
+         * 差分の世代が指す基準（#83、ADR 0083。基準の世代 i64・基準のファイルの長さ i64・CRC32C（i32））。
+         * 差分の世代にだけ、外枠の直後（節の並びの先頭）に1つ書く。[MachineSnapshot.deltaBase] で渡し、[MachineSnapshot.sections] には入れない
+         */
+        public const val DELTA_BASE: Int = 5
+
+        /** [DELTA_BASE] 節の版 */
+        public const val DELTA_BASE_VERSION: Int = 1
+
+        /** [DELTA_BASE] 節の中身の長さ */
+        public const val DELTA_BASE_LENGTH: Int = 20
+
         /** [KILLED] 節の版 */
         public const val KILLED_VERSION: Int = 1
 
@@ -81,8 +94,8 @@ public class SnapshotSection private constructor(
         /** ABI 層の ID: WASI p1 */
         public const val ABI_LAYER_P1: Int = 1
 
-        /** p1 の層の中身の版 */
-        public const val P1_LAYER_VERSION: Int = 1
+        /** p1 の層の中身の版（2 は #83。インスタンスの状態の線形メモリに形と圧縮を足した。読むときは 1 も読む） */
+        public const val P1_LAYER_VERSION: Int = 2
 
         /** 渡した配列をそのまま持つ節を作る（呼び出し側はその後で配列を変えない） */
         @JvmSynthetic
@@ -99,12 +112,16 @@ public class SnapshotSection private constructor(
  * 読むとき、知らない節と、長さの合わない既知の節は読み飛ばす（[sections] には残る）。`KILLED` 節がない・読めないときは、
  * 冷えた起動が要るとして扱う（状態を蘇らせない側に倒す）。
  *
+ * 差分の世代（#83、ADR 0083）は、外枠の直後に `DELTA_BASE` 節を1つ持つ（[deltaBase]）。先頭以外にある・2つ以上ある・
+ * 版か長さが違う `DELTA_BASE` 節は壊れた保存データ（[SnapshotFormatException]）。
+ *
  * @property machineId マシンの ID
  * @property generation 世代
  * @property modVersion 書いた MOD のバージョン
  * @property sections `KILLED` 以外の節（書く順）
  * @property killedPids 写しの中で殺した pid（#86 が使う）
  * @property coldBootCode 冷えた起動が要る理由の値（[ColdBootReason.code]。知らない値もそのまま持つ）
+ * @property deltaBase 差分の世代なら、指す基準（UUID は [machineId] と同じ）。全体の世代なら `null`
  */
 @ApiStatus.Internal
 public class MachineSnapshot @JvmOverloads constructor(
@@ -114,10 +131,13 @@ public class MachineSnapshot @JvmOverloads constructor(
     sections: List<SnapshotSection> = emptyList(),
     killedPids: List<Int> = emptyList(),
     public val coldBootCode: Int = ColdBootReason.NONE.code,
+    public val deltaBase: DeltaBase? = null,
 ) {
     init {
         require(coldBootCode in 0..0xFF) { "冷えた起動の理由は u8（$coldBootCode）" }
         require(sections.none { it.kind == SnapshotSection.KILLED }) { "KILLED 節は killedPids・coldBootCode で渡す" }
+        require(sections.none { it.kind == SnapshotSection.DELTA_BASE }) { "DELTA_BASE 節は deltaBase で渡す" }
+        require(deltaBase == null || deltaBase.id == machineId) { "差分の基準の UUID は外枠の UUID と同じ" }
     }
 
     public val sections: List<SnapshotSection> = sections.toList()
@@ -139,6 +159,7 @@ public class MachineSnapshot @JvmOverloads constructor(
         out.writeLong(machineId.mostSignificantBits)
         out.writeLong(machineId.leastSignificantBits)
         out.writeLong(generation)
+        deltaBase?.let { DeltaBaseCodec.section(it).writeTo(out) }
         for (section in sections) section.writeTo(out)
         killedSection().writeTo(out)
     }
@@ -154,7 +175,8 @@ public class MachineSnapshot @JvmOverloads constructor(
     }
 
     override fun toString(): String =
-        "MachineSnapshot($machineId, generation=$generation, $modVersion, ${sections.size} sections, killed=$killedPids, coldBoot=$coldBootCode)"
+        "MachineSnapshot($machineId, generation=$generation, $modVersion, ${sections.size} sections, killed=$killedPids, coldBoot=$coldBootCode" +
+            (deltaBase?.let { ", deltaBase=${it.generation}" } ?: "") + ")"
 
     public companion object {
         /** 形式の版 */
@@ -167,34 +189,35 @@ public class MachineSnapshot @JvmOverloads constructor(
 
         /**
          * 読む。magic・形式の版が違う・途中で切れている・節の長さが上限を超えるなら [IOException]。
-         * [input] の終わりまで節を読む（節の始まりでちょうど終わっていれば、そこまで）
+         * [input] の終わりまで節を読む（節の始まりでちょうど終わっていれば、そこまで）。
+         * 節の頭・中身が途中で切れている、`DELTA_BASE` 節が先頭以外にある・2つある・版か長さが違うなら [SnapshotFormatException]（#83）
          */
         @JvmStatic
         @Throws(IOException::class)
         public fun readFrom(input: DataInput): MachineSnapshot {
-            val magic = ByteArray(4)
-            input.readFully(magic)
-            if (!magic.contentEquals(MAGIC)) throw IOException("保存データの magic が違う")
-            val version = input.readUnsignedShort()
-            if (version != FORMAT_VERSION) throw IOException("保存データの形式の版 $version は読めない")
-            val modVersion = input.readUTF()
-            val id = UUID(input.readLong(), input.readLong())
-            val generation = input.readLong()
+            val header = readHeader(input)
             val sections = ArrayList<SnapshotSection>()
             var killed: List<Int>? = null
             var coldBoot = -1
+            var deltaBase: DeltaBase? = null
+            var first = true
             while (true) {
                 val high = try {
                     input.readUnsignedByte()
                 } catch (_: EOFException) {
                     break
                 }
-                val kind = (high shl 8) or input.readUnsignedByte()
-                val sectionVersion = input.readUnsignedShort()
-                val length = input.readInt().toLong() and 0xFFFF_FFFFL
+                val (kind, sectionVersion, length) = truncatedAsFormat { readSectionHead(high, input) }
                 if (length > MAX_SECTION_BYTES) throw IOException("節 $kind の長さ $length が上限を超える")
+                val isFirst = first
+                first = false
+                if (kind == SnapshotSection.DELTA_BASE) {
+                    if (!isFirst) throw SnapshotFormatException("DELTA_BASE 節が先頭にない")
+                    deltaBase = readDeltaBasePayload(header.id, sectionVersion, length, input)
+                    continue
+                }
                 val payload = ByteArray(length.toInt())
-                input.readFully(payload)
+                truncatedAsFormat { input.readFully(payload) }
                 if (kind == SnapshotSection.KILLED && sectionVersion == SnapshotSection.KILLED_VERSION) {
                     parseKilled(payload)?.let { (pids, code) ->
                         killed = pids
@@ -207,7 +230,66 @@ public class MachineSnapshot @JvmOverloads constructor(
             }
             // KILLED 節がない・読めないなら、冷えた起動が要る側に倒す
             val code = if (coldBoot < 0) UNREADABLE_KILLED_CODE else coldBoot
-            return MachineSnapshot(id, generation, modVersion, sections, killed.orEmpty(), code)
+            return MachineSnapshot(header.id, header.generation, header.modVersion, sections, killed.orEmpty(), code, deltaBase)
+        }
+
+        /**
+         * 差分の世代の基準だけを読む（#83。残す世代を決めるときに、ファイル全体を読まずに基準を引く）。
+         * 外枠と、最初の節の頭（種類・版・長さ）と、`DELTA_BASE` 節ならその中身 20 バイトだけを読む。
+         * 最初の節が `DELTA_BASE` 節（版 1・長さ 20）ならその中身（UUID は外枠のもの）、ほかの節か節なしで終わっていれば `null`。
+         * 途中で切れている・`DELTA_BASE` 節の版か長さが違うなら [SnapshotFormatException]、magic・形式の版が違うなら [IOException]。
+         * 2つ目以降の節は見ない（2つ目以降に `DELTA_BASE` 節があるファイルは [readFrom] が拒むので、読める保存データにならない）
+         */
+        @JvmStatic
+        @Throws(IOException::class)
+        public fun readDeltaBase(input: DataInput): DeltaBase? {
+            val header = readHeader(input)
+            val high = try {
+                input.readUnsignedByte()
+            } catch (_: EOFException) {
+                return null
+            }
+            val (kind, sectionVersion, length) = truncatedAsFormat { readSectionHead(high, input) }
+            if (kind != SnapshotSection.DELTA_BASE) return null
+            return readDeltaBasePayload(header.id, sectionVersion, length, input)
+        }
+
+        private class Header(val modVersion: String, val id: UUID, val generation: Long)
+
+        private fun readHeader(input: DataInput): Header = truncatedAsFormat {
+            val magic = ByteArray(4)
+            input.readFully(magic)
+            if (!magic.contentEquals(MAGIC)) throw IOException("保存データの magic が違う")
+            val version = input.readUnsignedShort()
+            if (version != FORMAT_VERSION) throw IOException("保存データの形式の版 $version は読めない")
+            val modVersion = input.readUTF()
+            val id = UUID(input.readLong(), input.readLong())
+            val generation = input.readLong()
+            Header(modVersion, id, generation)
+        }
+
+        /** 種類の上位バイト [high] を読んだ後の、節の頭の残り（種類・版・長さ） */
+        private fun readSectionHead(high: Int, input: DataInput): Triple<Int, Int, Long> {
+            val kind = (high shl 8) or input.readUnsignedByte()
+            val sectionVersion = input.readUnsignedShort()
+            val length = input.readInt().toLong() and 0xFFFF_FFFFL
+            return Triple(kind, sectionVersion, length)
+        }
+
+        private fun readDeltaBasePayload(id: UUID, version: Int, length: Long, input: DataInput): DeltaBase {
+            if (version != SnapshotSection.DELTA_BASE_VERSION || length != SnapshotSection.DELTA_BASE_LENGTH.toLong()) {
+                throw SnapshotFormatException("DELTA_BASE 節の版 $version・長さ $length が違う")
+            }
+            val payload = ByteArray(SnapshotSection.DELTA_BASE_LENGTH)
+            truncatedAsFormat { input.readFully(payload) }
+            return DeltaBaseCodec.read(id, payload)
+        }
+
+        /** 途中で切れていたら（[EOFException]）、壊れた保存データにする */
+        private inline fun <T> truncatedAsFormat(block: () -> T): T = try {
+            block()
+        } catch (e: EOFException) {
+            throw SnapshotFormatException("保存データが途中で切れている", e)
         }
 
         /** KILLED 節が読めなかったときの理由（どの理由でもない値。冷えた起動が要る） */

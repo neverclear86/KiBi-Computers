@@ -42,6 +42,11 @@ class MachineManagerSaveTest {
             assertNotNull(manager.capture("a", CapturePolicy.KILL_TRANSIENT))
             assertTrue(manager.isCaptured("a"))
             assertNull(manager.capture("a", CapturePolicy.KILL_TRANSIENT), "取り出し済みは取り出し直さない")
+            // 差分の基準が使えなかったときの取り直し（#83）は、取り出し済みの印を見ずに全体を取る
+            val again = manager.recapture("a", CapturePolicy.KILL_TRANSIENT)
+            assertNotNull(again)
+            assertNull(again!!.deltaBase)
+            assertTrue(manager.isCaptured("a"), "印は立てたまま")
             assertSame(m, manager["a"], "取り出しただけでは捨てない")
             assertTrue(manager.release("a", MachineReleaseReason.UNLOADED))
             assertFalse(m.isQuiesced, "外すと止める印も返す")

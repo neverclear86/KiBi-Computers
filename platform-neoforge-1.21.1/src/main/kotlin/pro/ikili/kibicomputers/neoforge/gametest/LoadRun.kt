@@ -218,6 +218,10 @@ internal data class AvgMax(val avg: Double, val max: Double) {
  * @property tmpWriterTmpfsMax 同じく最大
  * @property otherTmpfsAvg ほかの台（`/tmp` が空）の `TMPFS` 節の中身の大きさの平均
  * @property otherTmpfsMax 同じく最大
+ * @property fullSaves 全体の世代を書いた回数（#83）
+ * @property fullBytesTotal 全体の世代のファイルの大きさの合計
+ * @property deltaSaves 差分の世代を書いた回数（#83）
+ * @property deltaBytesTotal 差分の世代のファイルの大きさの合計
  */
 internal data class SaveCost(
     val saves: Int,
@@ -237,6 +241,10 @@ internal data class SaveCost(
     val tmpWriterTmpfsMax: Int,
     val otherTmpfsAvg: Double,
     val otherTmpfsMax: Int,
+    val fullSaves: Int = 0,
+    val fullBytesTotal: Long = 0,
+    val deltaSaves: Int = 0,
+    val deltaBytesTotal: Long = 0,
 )
 
 /**
@@ -354,6 +362,16 @@ internal class LoadReport(
                         Locale.ROOT, "| %s | %.0f / %d / %d B | %.1f MiB | %d 台・%d / %.0f / %d B | %.0f / %d B |\n",
                         p.label, c.fileBytesAvg, c.fileBytesP50, c.fileBytesMax, c.fileBytesTotal / mib,
                         c.tmpWriters, c.tmpWriterTmpfsMin, c.tmpWriterTmpfsAvg, c.tmpWriterTmpfsMax, c.otherTmpfsAvg, c.otherTmpfsMax,
+                    ),
+                )
+            }
+            sb.append("\n| 段階 | 全体の世代（数・合計） | 差分の世代（数・合計） |\n")
+            sb.append("| --- | --: | --: |\n")
+            for ((p, c) in costs) {
+                sb.append(
+                    String.format(
+                        Locale.ROOT, "| %s | %d・%.1f MiB | %d・%.1f MiB |\n",
+                        p.label, c.fullSaves, c.fullBytesTotal / mib, c.deltaSaves, c.deltaBytesTotal / mib,
                     ),
                 )
             }
@@ -552,6 +570,10 @@ internal class LoadRun(
             tmpWriterTmpfsMax = writers.maxOfOrNull { it.tmpfsBytes } ?: 0,
             otherTmpfsAvg = if (others.isEmpty()) 0.0 else others.map { it.tmpfsBytes }.average(),
             otherTmpfsMax = others.maxOfOrNull { it.tmpfsBytes } ?: 0,
+            fullSaves = saves.count { !it.delta },
+            fullBytesTotal = saves.filter { !it.delta }.sumOf { it.fileBytes.toLong() },
+            deltaSaves = saves.count { it.delta },
+            deltaBytesTotal = saves.filter { it.delta }.sumOf { it.fileBytes.toLong() },
         )
     }
 

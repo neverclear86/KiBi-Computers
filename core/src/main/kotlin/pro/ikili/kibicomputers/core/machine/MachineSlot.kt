@@ -6,6 +6,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
@@ -88,10 +90,22 @@ public class MachineSlot<K : Any> {
     public val isCaptured: Boolean get() = key?.let { manager?.isCaptured(it) } == true
 
     /** マシンの写しを取る（[MachineManager.capture]）。マシンがなければ `null` */
-    public fun capture(policy: CapturePolicy): MachineSnapshotSource? {
+    @JvmOverloads
+    public fun capture(
+        policy: CapturePolicy,
+        deltaBase: DeltaBase? = null,
+        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    ): MachineSnapshotSource? {
         val manager = manager ?: return null
         val key = key ?: return null
-        return manager.capture(key, policy)
+        return manager.capture(key, policy, deltaBase, fullSaveChangedRatio)
+    }
+
+    /** 全体の写しを取り直す（[MachineManager.recapture]。#83）。マシンがなければ `null` */
+    public fun recapture(policy: CapturePolicy): MachineSnapshotSource? {
+        val manager = manager ?: return null
+        val key = key ?: return null
+        return manager.recapture(key, policy)
     }
 
     /**

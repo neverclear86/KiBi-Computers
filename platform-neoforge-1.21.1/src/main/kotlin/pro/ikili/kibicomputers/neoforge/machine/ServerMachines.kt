@@ -173,13 +173,25 @@ object ServerMachines {
         val saves: MutableList<SaveSample> = ArrayList()
 
         /** 世代のファイルを1つ書いた（`CaseBlockEntity.captureAndWrite` から） */
-        fun recordSave(pos: BlockPos, captureNanos: Long, result: WriteResult, ownerWriteNanos: Long) {
+        fun recordSave(pos: BlockPos, captureNanos: Long, result: WriteResult, ownerWriteNanos: Long, retried: Boolean = false) {
             encodeNanos += result.encodeNanos
             fileWriteNanos += result.fileWriteNanos
+            if (result.delta) deltaSaves++ else fullSaves++
+            if (retried) deltaRetries++
             if (recordSaves) {
-                saves += SaveSample(pos, captureNanos, result.encodeNanos, result.fileWriteNanos + ownerWriteNanos, result.fileBytes, result.tmpfsBytes)
+                saves += SaveSample(
+                    pos, captureNanos, result.encodeNanos, result.fileWriteNanos + ownerWriteNanos, result.fileBytes, result.tmpfsBytes,
+                    result.delta,
+                )
             }
         }
+
+        /** 書いた全体の世代・差分の世代の数（#83） */
+        var fullSaves: Long = 0
+        var deltaSaves: Long = 0
+
+        /** 差分の基準が使えず、全体を取り直して書いた回数（#83） */
+        var deltaRetries: Long = 0
 
         fun reset() {
             unloadEventsWithCases = 0
@@ -195,6 +207,9 @@ object ServerMachines {
             captureNanos = 0
             encodeNanos = 0
             fileWriteNanos = 0
+            fullSaves = 0
+            deltaSaves = 0
+            deltaRetries = 0
             saves.clear()
         }
     }
@@ -216,6 +231,8 @@ object ServerMachines {
         val fileWriteNanos: Long,
         val fileBytes: Int,
         val tmpfsBytes: Int,
+        /** 差分の世代（#83） */
+        val delta: Boolean = false,
     )
 
     /** NeoForge のイベントバスに登録する。MOD の初期化で1回だけ呼ぶ。 */

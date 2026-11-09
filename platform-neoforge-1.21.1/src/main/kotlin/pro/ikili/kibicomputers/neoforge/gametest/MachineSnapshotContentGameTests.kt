@@ -23,8 +23,14 @@ import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
 import pro.ikili.kibicomputers.core.persist.SnapshotInspection
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
+import pro.ikili.kibicomputers.core.input.Key
+import pro.ikili.kibicomputers.core.input.KeyboardEvent
+import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
+import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
+import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
+import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.io.DataInputStream
@@ -46,6 +52,15 @@ object MachineSnapshotContentGameTests {
 
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)
+    private val KEYBOARD = BlockPos(1, 1, 2)
+
+    /** キーボードで1行打つ（Enter まで） */
+    private fun typeLine(helper: GameTestHelper, keyboard: KeyboardBlockEntity, line: String) {
+        val events = listOf(KeyboardEvent.Text(line), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+        for (packet in KeyboardEventCodec.encode(events)) {
+            helper.assertTrue(keyboard.receive(UUID(0, 1), packet) == 2, "keyboard should accept the input")
+        }
+    }
 
     private fun installRequired(be: CaseBlockEntity) {
         for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
@@ -185,5 +200,91 @@ object MachineSnapshotContentGameTests {
         be.pressPowerButton()
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 差分の世代（#83）: 標準 OS で動く台を2回保存すると、1回目は全体、2回目は `DELTA_BASE` 付きの差分で1回目より小さい。
+     * 置き場から読んだ基準を渡した `inspect` が通る。印を進めても基準のファイルが残る。
+     * 全体保存（区画を読み取り専用に戻す）の後もシェルが動き続ける
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun secondSaveIsDeltaAgainstFirst(helper: GameTestHelper) {
+        val store = WorldMachineSaves.current
+        helper.assertTrue(store != null, "the server should have a machine save store")
+        helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
+        helper.setBlock(
+            SCREEN,
+            KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+        )
+        helper.setBlock(KEYBOARD, KiBiBlocks.KEYBOARD.get())
+        val be = helper.getBlockEntity<CaseBlockEntity>(CASE)
+        val keyboard = helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD)
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        fun read(identity: MachineIdentity): MachineSnapshot =
+            DataInputStream(Files.newInputStream(store!!.generationFile(identity.id, identity.generation)).buffered()).use { MachineSnapshot.readFrom(it) }
+        fun size(identity: MachineIdentity): Long = Files.size(store!!.generationFile(identity.id, identity.generation))
+
+        var step = 0
+        var first: MachineIdentity? = null
+        helper.succeedWhen {
+            val text = lines(be.wiring.connectedScreen!!.text)
+            helper.assertTrue(be.wiring.bootFailure == null, "boot should not fail but was ${be.wiring.bootFailure}: $text")
+            when (step) {
+                0 -> {
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                    // 1 回目: 全体（待機点にいない tick なら次の tick に）
+                    helper.assertTrue(be.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the first save should be written")
+                    first = be.identity!!
+                    val snapshot = read(first!!)
+                    helper.assertTrue(snapshot.deltaBase == null, "the first save should be full but was ${snapshot.deltaBase}")
+                    typeLine(helper, keyboard, "echo delta-one")
+                    step = 1
+                    helper.fail("saved the full generation")
+                }
+                1 -> {
+                    helper.assertTrue(text.any { it == "delta-one" }, "the shell should keep running after the full save: $text")
+                    helper.assertTrue(text.last { it.isNotEmpty() } == "$", "the shell should wait for input: $text")
+                    helper.assertTrue(be.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the second save should be written")
+                    val second = be.identity!!
+                    val base = first!!
+                    helper.assertTrue(second.id == base.id && second.generation == base.generation + 1, "same id, next generation: $base → $second")
+                    val snapshot = read(second)
+                    val pointer = snapshot.deltaBase
+                    helper.assertTrue(
+                        pointer != null && pointer.generation == base.generation && pointer.id == base.id,
+                        "the second save should be a delta against the first but was $pointer",
+                    )
+                    helper.assertTrue(size(second) < size(base), "the delta ${size(second)} should be smaller than the full ${size(base)}")
+                    val machine = be.computer.machine!!
+                    try {
+                        SnapshotInspection.inspect(snapshot, machine.config.maxProcesses, ((machine.config.memoryBytes + 65535) / 65536).toInt(), store!!.readGeneration(base.id, base.generation))
+                    } catch (e: SnapshotFormatException) {
+                        throw IllegalStateException("the delta should be readable with its base", e)
+                    }
+                    // 印を進めても基準のファイルが残る
+                    val owner = store!!.ownerOf(base.id)!!
+                    helper.assertTrue(store.markChunkGeneration(base.id, second.generation, owner) == ChunkMarkResult.ADVANCED, "the mark should advance")
+                    var latest = second
+                    repeat(3) {
+                        helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0, "later saves should be written")
+                        latest = be.identity!!
+                        store.markChunkGeneration(latest.id, latest.generation, owner)
+                    }
+                    helper.assertTrue(read(latest).deltaBase?.generation == base.generation, "later saves should stay deltas against the first")
+                    helper.assertTrue(Files.exists(store.generationFile(base.id, base.generation)), "the base should be kept")
+                    helper.assertTrue(!Files.exists(store.generationFile(base.id, second.generation)), "an old delta should be pruned")
+                    typeLine(helper, keyboard, "echo delta-two")
+                    step = 2
+                    helper.fail("saved the delta generation")
+                }
+                else -> {
+                    helper.assertTrue(text.any { it == "delta-two" }, "the shell should keep running after the delta saves: $text")
+                    be.pressPowerButton()
+                    helper.setBlock(CASE, Blocks.AIR)
+                }
+            }
+        }
     }
 }

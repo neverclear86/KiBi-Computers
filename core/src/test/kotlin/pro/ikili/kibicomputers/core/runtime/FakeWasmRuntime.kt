@@ -129,6 +129,18 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     @Volatile
     private var fuelValue: Long = 0
 
+    /** 変わった区画を追えるものとして振る舞う（#83。カーネルの基準の判定のテスト用） */
+    @Volatile
+    var tracks: Boolean = false
+
+    /** [memoryChunkCounts] が返す値（#83） */
+    @Volatile
+    var chunkCounts: MemoryChunkCounts? = null
+
+    override val tracksChanges: Boolean get() = tracks
+
+    override fun memoryChunkCounts(): MemoryChunkCounts? = chunkCounts
+
     private val fakeMemory: FakeMemory? = module.memoryPages?.let { pages ->
         val max = minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages)
         if (config.writtenMemory) {
