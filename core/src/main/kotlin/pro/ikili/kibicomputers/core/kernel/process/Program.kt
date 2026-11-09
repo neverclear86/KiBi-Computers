@@ -29,7 +29,58 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
     override fun toString(): String = digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     companion object {
+        /** ハッシュのバイト数 */
+        const val SIZE: Int = 32
+
         fun of(loadedBytes: ByteArray): ModuleHash = ModuleHash(MessageDigest.getInstance("SHA-256").digest(loadedBytes))
+
+        /** 保存したハッシュ（[SIZE] バイト）から作る（#82） */
+        fun fromBytes(digest: ByteArray): ModuleHash {
+            require(digest.size == SIZE) { "ハッシュは $SIZE バイト" }
+            return ModuleHash(digest.copyOf())
+        }
+    }
+}
+
+/**
+ * モジュールの出どころ（#82、ADR 0082）。保存データはこれでモジュールを指し、戻すとき（#85）にストア（`ModuleStore`）の元のバイト列から
+ * 同じ読み込み方でやり直す（後のハッシュは [Program.hash] と照合する）。
+ *
+ * @property originalHash 元のバイト列（挿入・変換の前）の SHA-256（32 バイト。ストアのキー）
+ * @property metered 燃料の計測コードを挿入したか
+ * @property waitImports 止まりうる import（名前の順）
+ * @property instrumentationVersion 挿入・変換の版（[Instrumentation.VERSION]。計測しないなら 0）
+ * @property fuelYield 段1で変換できたか（[Program.fuelYield]）
+ */
+internal class ModuleSource(
+    originalHash: ByteArray,
+    val metered: Boolean,
+    waitImports: Collection<String>,
+    val instrumentationVersion: Int,
+    val fuelYield: Boolean,
+) {
+    private val hash = originalHash.copyOf()
+
+    init {
+        require(hash.size == ModuleHash.SIZE) { "ハッシュは ${ModuleHash.SIZE} バイト" }
+    }
+
+    /** 止まりうる import（名前の順） */
+    val waitImports: List<String> = waitImports.sorted()
+
+    /** 元のバイト列の SHA-256（写し） */
+    val originalHash: ByteArray get() = hash.copyOf()
+
+    /** 元のバイト列の SHA-256 の16進小文字 */
+    val originalHex: String get() = hash.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    override fun equals(other: Any?): Boolean = other is ModuleSource && hash.contentEquals(other.hash) && metered == other.metered &&
+        waitImports == other.waitImports && instrumentationVersion == other.instrumentationVersion && fuelYield == other.fuelYield
+
+    override fun hashCode(): Int = hash.contentHashCode()
+
+    companion object {
+        fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
     }
 }
 
@@ -43,6 +94,8 @@ internal class ModuleHash private constructor(private val digest: ByteArray) {
 internal class Program private constructor(
     val hash: ModuleHash,
     val module: WasmModule,
+    /** モジュールの出どころ（#82。保存データがモジュールを指すのに使う） */
+    val moduleSource: ModuleSource,
     val fuelYield: Boolean = false,
     val fuelYieldRejection: String? = null,
 ) {
@@ -59,7 +112,8 @@ internal class Program private constructor(
             if (limits != null) ModulePrescan.check(copy, limits, deadline)
             val module = runtime.load(copy)
             deadline?.check("パース・検証・コンパイル")
-            return Program(ModuleHash.of(copy), module)
+            val hash = ModuleHash.of(copy)
+            return Program(hash, module, ModuleSource(hash.bytes(), false, emptyList(), 0, false))
         }
 
         /**
@@ -92,7 +146,8 @@ internal class Program private constructor(
             deadline?.check("パース・検証・コンパイル")
             val hash = ModuleHash.of(injected)
             applied.fuelYieldRejection?.let { FuelYieldRejectionLog.report(hash, it) }
-            return Program(hash, module, applied.fuelYield, applied.fuelYieldRejection)
+            val source = ModuleSource(ModuleSource.sha256(bytes), true, waitImports, Instrumentation.VERSION, applied.fuelYield)
+            return Program(hash, module, source, applied.fuelYield, applied.fuelYieldRejection)
         }
 
         /** [e] が、待機点に変換できない作りのために [loadMetered] が断ったものなら、その理由（どの命令・どの機能か）。違えば `null` */

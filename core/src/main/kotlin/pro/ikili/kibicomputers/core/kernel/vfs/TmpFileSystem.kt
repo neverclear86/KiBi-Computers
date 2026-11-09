@@ -17,7 +17,7 @@ import java.util.TreeMap
  *   VFS をカーネルロックの外で使うので、外す前にマウントを見つけたスレッドが、外した後に作る・書くことがある。
  *   そのときに RAM を確保すると、返す時がないので、断る
  * - 時刻は [clock]（エポックからのナノ秒）。読んだ時刻（atime）は、作った時と [setTimes] だけで変える（読むたびには変えない）
- * - 保存（#82）までは実行時だけ
+ * - 動いている間の中身は、待機点保存と一緒に `TMPFS` 節に保存する（#82、ADR 0082。[snapshot]・[restore]）
  *
  * カーネルロックの外で、同じマシンのいくつものスレッドから同時に使う。中身は自分のモニター（`@Synchronized`）で守る（中は I/O のないメモリの操作だけ）。
  */
@@ -237,6 +237,40 @@ internal class TmpFileSystem(
         releaseRam(usedBytes)
     }
 
+    // ---- 保存（#82） ----
+
+    /**
+     * 中身の写しを取る（#82、ADR 0082）。自分のモニターの中で取る（止めたマシンなのでプロセスは書いていない）。
+     * 外した後なら `null`。[TmpSnapshot.nodes] は node の番号の順
+     */
+    @Synchronized
+    fun snapshot(): TmpSnapshot? {
+        if (revoked) return null
+        val list = nodes.values.sortedBy { it.id }.map { n ->
+            TmpNode(
+                n.id,
+                n.type,
+                n.size,
+                n.accessedNanos,
+                n.modifiedNanos,
+                n.changedNanos,
+                n.children?.map { (name, child) -> name to child.id },
+                n.chunks?.map { (index, chunk) -> index to chunk.copyOf() },
+            )
+        }
+        return TmpSnapshot(nextNode, list)
+    }
+
+    /** RAM に数えるバイト数（[usedBytes] と同じ数え方。#82 の数え直し） */
+    private fun countedBytes(snapshot: TmpSnapshot): Long {
+        var total = 0L
+        for (n in snapshot.nodes) {
+            n.children?.forEach { (name, _) -> total += NODE_COST + nameCost(name) }
+            n.chunks?.let { total += it.size.toLong() * CHUNK_BYTES }
+        }
+        return total
+    }
+
     // ---- 中身 ----
 
     private fun node(id: Long): Node {
@@ -319,9 +353,55 @@ internal class TmpFileSystem(
 
     private fun nameCost(name: String): Long = name.toByteArray(Charsets.UTF_8).size.toLong()
 
+    /**
+     * `/tmp` の中身の写し（#82）。[nodes] は根を含むすべての node（番号の順）。木の形（根から1回ずつ指される）は読む側が確かめる
+     */
+    class TmpSnapshot(val nextNode: Long, val nodes: List<TmpNode>)
+
+    /** node 1つ。ディレクトリは [children]（名前 → 子の node）、普通のファイルは [chunks]（塊の番号 → [CHUNK_BYTES] バイト） */
+    class TmpNode(
+        val id: Long,
+        val type: FileType,
+        val size: Long,
+        val accessedNanos: Long,
+        val modifiedNanos: Long,
+        val changedNanos: Long,
+        val children: List<Pair<String, Long>>?,
+        val chunks: List<Pair<Long, ByteArray>>?,
+    )
+
     companion object {
         /** 根の node */
         const val ROOT_NODE: Long = 1
+
+        /**
+         * 写し [snapshot] から作り直す（#82。戻すのは #85）。RAM は中身から数え直して [memory] から確保し、足りなければ `null`
+         * （冷えた起動にする）。木の形は読む側（`TmpfsSectionCodec`）が確かめたものを渡す
+         */
+        fun restore(memory: MemoryAccount, clock: () -> Long, snapshot: TmpSnapshot): TmpFileSystem? {
+            val fs = TmpFileSystem(memory, clock)
+            val bytes = fs.countedBytes(snapshot)
+            if (bytes > 0 && !memory.tryReserveBytes(bytes)) return null
+            synchronized(fs) {
+                fs.usedBytes = bytes
+                fs.nodes.clear()
+                val built = HashMap<Long, Node>()
+                for (t in snapshot.nodes) {
+                    val n = if (t.id == ROOT_NODE) fs.root else Node(t.id, t.type, 0)
+                    n.size = t.size
+                    n.accessedNanos = t.accessedNanos
+                    n.modifiedNanos = t.modifiedNanos
+                    n.changedNanos = t.changedNanos
+                    t.chunks?.forEach { (index, data) -> n.chunks!![index] = data.copyOf() }
+                    built[t.id] = n
+                }
+                fs.root.children!!.clear()
+                for (t in snapshot.nodes) t.children?.forEach { (name, child) -> built.getValue(t.id).children!![name] = built.getValue(child) }
+                fs.nodes.putAll(built)
+                fs.nextNode = snapshot.nextNode
+            }
+            return fs
+        }
 
         /** 中身を確保する塊の大きさ（バイト） */
         const val CHUNK_BYTES: Int = 4096

@@ -24,6 +24,7 @@
 - **写しは、殺す手順が書き換えるものを元と共有しない**: プロセス表・`Process`（fd 表・待ちのタイマー・Asyncify のスタック）・`ProcessObject`・オブジェクト表（参照の数）を作り直す。オブジェクトの実体は `KernelObject.copyForSnapshot()` が返せば写したもの、返さなければ元の実体を指すだけ（#81 で写せるのは `ProcessObject` だけ）
 - **写しの中の後始末の規則**: `WakeSink` は何もしない `NoopWakeSink`。写していない実体の参照が 0 になっても `onLastClose`・`releaseReferences` を呼ばず、ID を `closedInCopy` に記録するだけ（ファイルのチャネル・パイプ・タイマー・デバイスの呼び出しなど、ホストの資源を閉じない）
   - **#82 への申し送り**: 種類ごとに `copyForSnapshot` を足し、`closedInCopy` を「写した実体の側で閉じた後の状態」に置き換える。すべての種類を写せるまで、`KERNEL` 節の中身は書かない
+  - 済み（#82）: すべての種類に `copyForSnapshot` を足し、写しはすべてのオブジェクトを写す（`closedInCopy` はなくした）。写しの中で殺す手順は写した実体の側で後始末まで走る。節の中身は ADR 0082
 - 殺す手順の帳簿（終了状態・`pendingChildExits`・親なしのゾンビ・刈り取り）は `ExitBookkeeping` に分け、実行時の経路（`ProcessLifecycle`）と写しの経路（`killInCopy`）が同じものを通る
 - init を写しの中で殺したら理由は `INIT_KILLED`
 

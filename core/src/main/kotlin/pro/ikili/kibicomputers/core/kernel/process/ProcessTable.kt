@@ -80,6 +80,18 @@ internal class ProcessTable(val limit: Int) {
         copy.nextPid = nextPid
     }
 
+    /** 保存データから読んだ値を入れる（#82。空の表に。戻すのは #85） */
+    fun restore(processes: Collection<Process>, orphans: Collection<Int>, nextPid: Int) {
+        check(table.isEmpty()) { "空の表にだけ戻す" }
+        for (p in processes) add(p)
+        for (pid in orphans) {
+            require(table[pid]?.state?.isTerminal == true && table.getValue(pid).parentPid == 0) { "親のないゾンビでない pid $pid" }
+            this.orphans.add(pid)
+        }
+        require(nextPid >= 1) { "次の pid は 1 以上" }
+        this.nextPid = nextPid
+    }
+
     /** 終わったプロセス（ゾンビ）をすべて外し、pid を 1 から振り直す（起動のとき。#49）。終わっていないプロセスがあれば [IllegalStateException] */
     fun reset() {
         check(liveCount() == 0) { "終わっていないプロセスがある" }

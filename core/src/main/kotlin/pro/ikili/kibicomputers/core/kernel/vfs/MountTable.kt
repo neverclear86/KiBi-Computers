@@ -58,6 +58,13 @@ internal class MountTable {
         it.nextMountId = nextMountId
     }
 
+    /** 保存データから読んだ値を入れる（#82。空の表に） */
+    fun restore(entries: List<MountEntry>, nextMountId: Int) {
+        check(list.isEmpty()) { "空の表にだけ戻す" }
+        list.addAll(entries)
+        this.nextMountId = nextMountId
+    }
+
     operator fun get(id: Int): MountEntry? = list.firstOrNull { it.id == id }
 
     /** [point] にちょうどあるマウント */

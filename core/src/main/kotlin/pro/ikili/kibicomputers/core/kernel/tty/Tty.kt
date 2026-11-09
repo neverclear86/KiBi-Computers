@@ -4,6 +4,9 @@ import pro.ikili.kibicomputers.core.display.CharWidth
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
+import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
+import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotWriter
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -257,6 +260,48 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         rows = size.rows
         sizeGeneration++
         return true
+    }
+
+    /** 写し（#82）。[outputWritten] は実行時だけなので写さない（写しでは 0） */
+    override fun copyForSnapshot(): KernelObject {
+        val out = SnapshotWriter(64 + input.length + line.length + output.length + history.totalBytes)
+        writeSnapshot(out)
+        return readSnapshot(SnapshotReader(out.toByteArray()))
+    }
+
+    /**
+     * 保存する値をすべて書く（#82、ADR 0082。`KERNEL` 節の `Tty`）。private の欄はここと [readSnapshot] でだけ触る。
+     * [outputWritten] は実行時だけなので書かない
+     */
+    fun writeSnapshot(out: SnapshotWriter) {
+        out.i32(inputCapacity)
+        out.i32(outputCapacity)
+        out.i32(mode.bits)
+        out.i32(columns)
+        out.i32(rows)
+        out.i64(sizeGeneration)
+        out.i32(foregroundPid)
+        out.blob(input.toByteArray())
+        val lineLengths = lines.toIntArray()
+        out.count(lineLengths.size)
+        for (n in lineLengths) out.i32(n)
+        out.blob(line.toByteArray())
+        out.blob(output.toByteArray())
+        out.i32(lineStartColumn)
+        out.i32(column)
+        val historyLines = history.toList()
+        out.count(historyLines.size)
+        for (h in historyLines) out.blob(h)
+        out.i32(historyCursor)
+        val draft = historyDraft
+        out.bool(draft != null)
+        if (draft != null) out.blob(draft)
+        out.u8(escState)
+        out.i32(escLength)
+        out.i32(outCodePoint)
+        out.i32(outRemaining)
+        out.i64(droppedInputBytes)
+        out.i64(droppedEchoBytes)
     }
 
     override fun onLastClose(sink: WakeSink) {
@@ -602,6 +647,66 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
         /** CSI のパラメーターの長さの上限（超えたらシーケンスをやめる） */
         private const val MAX_CSI_PARAM_BYTES = 16
+
+        /** 保存データから読む [Tty] の、入力・出力の上限の上限（壊れたデータで大きな配列を確保しない） */
+        const val MAX_SNAPSHOT_CAPACITY: Int = 1 shl 20
+
+        /** [writeSnapshot] で書いたものを読む（#82）。値が合わなければ [SnapshotFormatException] */
+        @Throws(SnapshotFormatException::class)
+        fun readSnapshot(input: SnapshotReader): Tty {
+            val inCap = input.i32()
+            val outCap = input.i32()
+            if (inCap !in 2..MAX_SNAPSHOT_CAPACITY || outCap !in 2..MAX_SNAPSHOT_CAPACITY) throw SnapshotFormatException("TTY の上限が不正（$inCap, $outCap）")
+            val tty = Tty(inCap, outCap)
+            val modeBits = input.i32()
+            if (modeBits and TtyMode.ALL.inv() != 0) throw SnapshotFormatException("TTY のモードが不正（$modeBits）")
+            tty.mode = TtyMode(modeBits)
+            val cols = input.i32()
+            val rows = input.i32()
+            if (cols < 1 || rows < 1) throw SnapshotFormatException("TTY の大きさが不正（$cols x $rows）")
+            tty.columns = cols
+            tty.rows = rows
+            tty.sizeGeneration = input.i64()
+            val fg = input.i32()
+            if (fg < 0) throw SnapshotFormatException("TTY の前面の pid が負")
+            tty.foregroundPid = fg
+            val inBytes = input.blob(inCap)
+            val lineCount = input.count(inCap + 1, 4)
+            val lineLengths = IntArray(lineCount) { input.i32() }
+            val editing = input.blob(inCap)
+            if (inBytes.size + editing.size > inCap) throw SnapshotFormatException("TTY の入力が上限を超える")
+            if (lineLengths.any { it < 0 } || (lineCount > 0 && lineLengths.sumOf { it.toLong() } != inBytes.size.toLong())) {
+                throw SnapshotFormatException("TTY の行の区切りが入力と合わない")
+            }
+            val outBytes = input.blob(outCap + ECHO_SLACK_BYTES)
+            tty.input.replaceWith(inBytes)
+            tty.lines.replaceWith(lineLengths)
+            tty.line.replaceWith(editing)
+            tty.output.replaceWith(outBytes)
+            tty.lineStartColumn = input.i32()
+            tty.column = input.i32()
+            val historyCount = input.count(HISTORY_MAX_ENTRIES, 4)
+            val historyLines = List(historyCount) { input.blob(HISTORY_MAX_BYTES) }
+            try {
+                tty.history.replaceWith(historyLines)
+            } catch (e: IllegalArgumentException) {
+                throw SnapshotFormatException("TTY の履歴が不正", e)
+            }
+            val cursor = input.i32()
+            if (cursor < -1 || cursor >= historyCount) throw SnapshotFormatException("TTY の履歴の位置が不正（$cursor）")
+            tty.historyCursor = cursor
+            tty.historyDraft = if (input.bool()) input.blob(inCap) else null
+            val esc = input.u8()
+            if (esc !in ESC_NONE..ESC_SS3) throw SnapshotFormatException("TTY のエスケープの状態が不正（$esc）")
+            tty.escState = esc
+            tty.escLength = input.i32()
+            tty.outCodePoint = input.i32()
+            tty.outRemaining = input.i32()
+            if (tty.escLength < 0 || tty.outRemaining !in 0..3) throw SnapshotFormatException("TTY の途中の状態が不正")
+            tty.droppedInputBytes = input.i64()
+            tty.droppedEchoBytes = input.i64()
+            return tty
+        }
 
         private const val ESC_NONE = 0
         private const val ESC_START = 1

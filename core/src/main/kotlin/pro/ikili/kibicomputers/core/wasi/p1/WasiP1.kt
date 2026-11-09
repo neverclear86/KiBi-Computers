@@ -1,5 +1,9 @@
 package pro.ikili.kibicomputers.core.wasi.p1
 
+import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
+import pro.ikili.kibicomputers.core.persist.SnapshotSection
+import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -280,8 +284,25 @@ internal class WasiP1Registration(val suspend: WasiP1Suspend, val kibiProcess: W
  * （wasi-libc は `main` が 0 以外を返したときと `exit()` で呼ぶ）。
  * `proc_exit` を `_start` の外（モジュールの start 関数の中）で呼ぶと、例外で抜けたものとして `CRASHED` になる。
  */
-internal class WasiP1Driver(private val module: WasmModule) : ProcessDriver {
+internal class WasiP1Driver(private val module: WasmModule) : SnapshotCapableDriver {
     override val kind: ProcessKind = if (module.isAsyncified) ProcessKind.WAIT_POINT else ProcessKind.BLOCKING
+
+    override val abiLayer: Int get() = SnapshotSection.ABI_LAYER_P1
+
+    override val abiLayerVersion: Int get() = SnapshotSection.P1_LAYER_VERSION
+
+    /**
+     * p1 の層の中身（#82、ADR 0082 の 5.。[P1SectionCodec]）。インスタンスが2つ以上あれば `null`（保存できない）。
+     * インスタンスの状態を取り出せない作り（[pro.ikili.kibicomputers.core.runtime.WasmStateException]）は、そのまま投げる
+     */
+    override fun captureAbi(rt: ProcessRuntime): ByteArray? {
+        if (rt.instances.size > 1) return null
+        val instance = rt.instances.firstOrNull()?.captureState()
+        val process = rt.process
+        val stack = process.asyncStack?.toLongArray() ?: LongArray(0)
+        if (instance == null && stack.isNotEmpty()) return null
+        return P1SectionCodec.write(rt.program.moduleSource, rt.program.hash, instance, stack, process.asyncWait)
+    }
 
     /** 止まりうる import の入口と出口の処理（[configure] で作る） */
     private var suspend: WasiP1Suspend? = null

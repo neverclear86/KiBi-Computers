@@ -89,6 +89,11 @@ internal class OpenFile(
     /** ディレクトリか */
     val isDirectory: Boolean get() = type == FileType.DIRECTORY
 
+    /** 写し（#82）。[retained] は実行時だけなので写さない（写しでは `false`。写しの中で閉じても知らせない） */
+    override fun copyForSnapshot(): KernelObject = OpenFile(mountId, node, type, path, readable, writable, append).also {
+        it.position = position
+    }
+
     // 普通のファイルは、いつでも読める・書ける（POSIX の poll と同じ）。デバイスファイルは #54 で別の型にする
     override fun canWait(condition: WaitCondition): Boolean = !isDirectory
 

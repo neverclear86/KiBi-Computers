@@ -116,6 +116,24 @@ internal class EventHub(
         copy.byType = byType?.let { map -> HashMap(map.mapValues { LinkedHashSet(it.value) }) }
     }
 
+    /** 索引（保存用。#82）: 全体の ID、すべてを受け取る ID、種類 → ID（どれも足した順。種類は名前の順） */
+    class Index(val queues: List<Int>, val all: List<Int>, val byType: List<Pair<String, List<Int>>>)
+
+    /** 今の索引（[sweep] してから呼ぶ） */
+    fun index(): Index = Index(
+        queues?.toList() ?: emptyList(),
+        all?.toList() ?: emptyList(),
+        byType?.entries?.sortedBy { it.key }?.map { it.key to it.value.toList() } ?: emptyList(),
+    )
+
+    /** 保存した索引を入れる（#82。空の索引に） */
+    fun restoreIndex(index: Index) {
+        check(queues.isNullOrEmpty()) { "空の索引にだけ戻す" }
+        queues = if (index.queues.isEmpty()) null else LinkedHashSet(index.queues)
+        all = if (index.all.isEmpty()) null else LinkedHashSet(index.all)
+        byType = if (index.byType.isEmpty()) null else HashMap(index.byType.associate { (t, ids) -> t to LinkedHashSet(ids) })
+    }
+
     /** 索引の場所に合う `EventQueue` でない ID を外す（件数は索引の ID の数に比例する） */
     fun sweep(objects: ObjectTable) {
         val ids = queues ?: return

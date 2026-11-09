@@ -12,6 +12,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.level.ChunkDataEvent
 import net.neoforged.neoforge.event.level.ChunkEvent
@@ -20,6 +21,7 @@ import net.neoforged.neoforge.event.server.ServerAboutToStartEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
+import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
@@ -27,6 +29,7 @@ import pro.ikili.kibicomputers.core.persist.AutosaveRotation
 import pro.ikili.kibicomputers.core.persist.AutosaveTarget
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
+import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -189,8 +192,11 @@ object ServerMachines {
         autosaveTicks = 0
         // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
         autosaveEnabled = event.server !is GameTestServer
+        // 待機点保存が指すモジュールの置き場（#82）: <world>/kibicomputers/modules
+        val world = event.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
+        val modules = FileModuleStore(world.resolve(KiBiComputers.MOD_ID).resolve("modules"))
         // 設定はまだ仮の値（コンフィグにするのは #251）
-        manager = MachineManager(SchedulerConfig.DEFAULT, ERRORS)
+        manager = MachineManager(SchedulerConfig.builder().moduleStore(modules).build(), ERRORS)
     }
 
     // ---- ケースの出入り ----

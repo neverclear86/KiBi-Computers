@@ -33,6 +33,8 @@ class FdTableTest {
     private class Obj : KernelObject() {
         var closed = 0
 
+        override fun copyForSnapshot(): KernelObject = Obj()
+
         override fun onLastClose(sink: WakeSink) {
             closed++
         }

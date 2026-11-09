@@ -20,6 +20,8 @@ internal class HostCompletion : KernelObject() {
     override fun canWait(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE
 
     override fun isReady(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE && done
+
+    override fun copyForSnapshot(): KernelObject = HostCompletion().also { it.done = done }
 }
 
 /**
@@ -65,4 +67,6 @@ internal class PendingExec internal constructor(
     val parentPid: Int,
     /** 読み込みの結果（呼び出しごとに別のもの。待つのをやめたら `cancel(false)`） */
     val future: CompletableFuture<Program>,
+    /** 実行ファイルの元のバイト列（モジュールの置き場に書く。#82） */
+    val originalBytes: ByteArray? = null,
 )

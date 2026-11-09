@@ -35,6 +35,24 @@ internal interface ProcessDriver {
     fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult
 }
 
+/**
+ * 待機点保存に対応した ABI 層のドライバー（#82、ADR 0082）。対応していないドライバーのプロセスは保存できない（写しの中で殺す）。
+ * 層の ID は `SnapshotSection.ABI_LAYER_*`（0 はテスト用に予約）
+ */
+internal interface SnapshotCapableDriver : ProcessDriver {
+    /** 層の ID（u16） */
+    val abiLayer: Int
+
+    /** 層の中身の版（u16） */
+    val abiLayerVersion: Int
+
+    /**
+     * カーネルロックの中、待機点で呼ばれる。`PROCESS_ABI` 節の層の中身（pid・層の ID・版の後ろ）を返す。
+     * 保存できなければ `null`（写しの中で殺す）
+     */
+    fun captureAbi(rt: ProcessRuntime): ByteArray?
+}
+
 /** step の結果 */
 internal sealed interface StepResult {
     /** [keys] のどれかがそろうまで待つ（`WAIT_POINT` だけ）。[keys] は空でない */

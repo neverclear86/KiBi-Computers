@@ -348,4 +348,17 @@ class DiskFileSystemTest {
         assertEquals(st.modifiedNanos, st.changedNanos)
         assertNull(fs.pathOf(12345))
     }
+
+    @Test
+    fun `pathHintはロックを取らずにFSの中のパスを返し、名前を変えると追う`() {
+        val fs = disk()
+        fs.createDirectory(p("/a"))
+        val node = fs.writeAll("/a/f.txt", "hello")
+        assertEquals(p("/a/f.txt"), fs.pathHint(node))
+        assertEquals(VfsPath.ROOT, fs.pathHint(fs.stat(VfsPath.ROOT).node))
+        fs.rename(p("/a"), p("/b"), false)
+        assertEquals(p("/b/f.txt"), fs.pathHint(fs.stat(p("/b/f.txt")).node))
+        fs.removeFile(p("/b/f.txt"))
+        assertNull(fs.pathHint(12345))
+    }
 }

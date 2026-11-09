@@ -58,6 +58,20 @@ internal class Timer(
     /** イベントを出すタイマーか */
     val sendsEvents: Boolean get() = eventQueueId != 0
 
+    override fun copyForSnapshot(): KernelObject = Timer(eventQueueId, eventTag).also {
+        it.restoreState(armed, deadlineNanos, intervalNanos, expirations, generation)
+    }
+
+    /** 保存した値を入れる（#82。作ったばかりのタイマーに） */
+    fun restoreState(armed: Boolean, deadlineNanos: Long, intervalNanos: Long, expirations: Long, generation: Long) {
+        require(intervalNanos >= 0 && expirations >= 0) { "間隔と回数は 0 以上" }
+        this.armed = armed
+        this.deadlineNanos = deadlineNanos
+        this.intervalNanos = intervalNanos
+        this.expirations = expirations
+        this.generation = generation
+    }
+
     override fun canWait(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE
 
     override fun isReady(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE && expirations > 0

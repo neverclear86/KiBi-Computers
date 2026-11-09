@@ -138,9 +138,9 @@ class KernelStateCopyTest {
         assertNull(copy.objects[f.pipeRead.get()])
         assertNull(copy.objects[f.pipeWrite.get()])
         assertNull(copy.objects[f.timer.get()])
-        assertTrue(copy.closedInCopy.toSet().containsAll(setOf(f.pipeRead.get(), f.pipeWrite.get(), f.timer.get())))
-        // 写していない中身のストリームは、写しの中でも後始末を呼ばないので、参照の数は変わらない
-        assertEquals(2, copy.objects.refCount(streamId))
+        // 写しはすべてのオブジェクトを写すので（#82）、両端を閉じたパイプの中身のストリームは写しの中で閉じる
+        assertEquals(0, copy.objects.refCount(streamId))
+        assertNull(copy.objects[streamId])
         assertEquals(ColdBootReason.NONE, copy.coldBootReason)
     }
 

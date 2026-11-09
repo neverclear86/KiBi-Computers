@@ -24,6 +24,13 @@ import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
  */
 internal object Instrumentation {
     /**
+     * 挿入・変換の出力の版（#82、ADR 0082）。保存データはモジュールを元のバイト列で持ち、戻すときに挿入・変換をやり直して
+     * 後のハッシュを照合する。そのため挿入・変換は決定的であること（同じ入力から同じバイト列。`InstrumentationDeterminismTest`）。
+     * 出力を変える変更（燃料のセグメントの切り方、変換の形など）をしたら、この版を上げる
+     */
+    const val VERSION: Int = 1
+
+    /**
      * [applyDetailed] の結果。
      *
      * @property bytes 書き換えた後の WASM

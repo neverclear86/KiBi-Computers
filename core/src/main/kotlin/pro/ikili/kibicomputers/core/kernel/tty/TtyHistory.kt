@@ -30,6 +30,19 @@ internal class TtyHistory(private val maxEntries: Int, private val maxBytes: Int
         while (entries.size > maxEntries || totalBytes > maxBytes) totalBytes -= entries.removeAt(0).size
     }
 
+    /** 行の写し（古い順。保存用。#82） */
+    fun toList(): List<ByteArray> = entries.map { it.copyOf() }
+
+    /** 行を [lines] に置き換える（保存から戻す。#82）。上限を超える・空の行があれば [IllegalArgumentException] */
+    fun replaceWith(lines: List<ByteArray>) {
+        require(lines.size <= maxEntries) { "履歴の行が多すぎる" }
+        val total = lines.sumOf { it.size }
+        require(total <= maxBytes && lines.all { it.isNotEmpty() }) { "履歴の大きさが不正" }
+        entries.clear()
+        lines.mapTo(entries) { it.copyOf() }
+        totalBytes = total
+    }
+
     fun clear() {
         entries.clear()
         entries.trimToSize()
