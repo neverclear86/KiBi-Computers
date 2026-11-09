@@ -13,7 +13,7 @@ import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
  * @property pid pid
  * @property args 引数（argv。最初の要素はプログラムの名前）
  * @property loadedHash `KERNEL` 節のプロセスのモジュールの識別子（読み込み方を当てた後のバイト列の SHA-256）
- * @property abiLayer `PROCESS_ABI` 節の層の ID（節がなければ `null`）
+ * @property abiLayer `PROCESS_ABI` 節の層の ID。終わったプロセス（ゾンビ）で節がなければ `null`（終わっていないプロセスは必ず節を持つ）
  * @property originalHash p1 の層のモジュール参照の、元のバイト列の SHA-256（モジュールの置き場のファイル名）。p1 の層でなければ `null`
  * @property abiLoadedHash p1 の層のモジュール参照の、後のハッシュ。p1 の層でなければ `null`
  */
@@ -58,7 +58,9 @@ public class SnapshotContents internal constructor(
 public object SnapshotInspection {
     /**
      * [snapshot] の節を読む。`KERNEL` 節がちょうど1つあり `KernelSectionCodec.read` に通ること、`PROCESS_ABI` 節が
-     * `KERNEL` 節にあるプロセスを1回ずつ指すこと、p1 の層が `P1SectionCodec.read` に通り後のハッシュが `KERNEL` 節と合うことを確かめる。
+     * `KERNEL` 節にあるプロセスだけを指し、同じ pid を2回指さないこと、終わっていないプロセス（インスタンスを持つはずのもの）が
+     * どれも `PROCESS_ABI` 節を持つこと、p1 の層が `P1SectionCodec.read` に通り後のハッシュが `KERNEL` 節と合うことを確かめる。
+     * 終わったプロセス（ゾンビ）は ABI 層の写しを取らない（ADR 0082）ので、節がなくてよい。
      * 冷えた起動の写しや、確かめられないものは [SnapshotFormatException]。[maxProcesses] はマシンのプロセスの数の上限
      */
     @JvmStatic
@@ -100,6 +102,9 @@ public object SnapshotInspection {
 
         val processes = kernel.processes.all().sortedBy { it.pid }.map { p ->
             val layer = abi[p.pid]
+            if (layer == null && !p.state.isTerminal) {
+                throw SnapshotFormatException("終わっていない pid ${p.pid} に PROCESS_ABI 節がない")
+            }
             InspectedProcess(p.pid, p.args, p.moduleHash.bytes(), layer?.first, layer?.second, layer?.third?.bytes())
         }
         return SnapshotContents(kernel.initPid, processes)
