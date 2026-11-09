@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.persist.AbiPayload
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 
@@ -58,6 +59,12 @@ internal interface SnapshotCapableDriver : ProcessDriver {
      * [pro.ikili.kibicomputers.core.runtime.WasmInstance.tracksChanges] のときだけ呼ばれる。既定は FULL だけ受け付ける
      */
     fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? = if (mode == StateCaptureMode.FULL) captureAbi(rt) else null
+
+    /**
+     * カーネルロックの中、待機点で呼ばれる（#84）。[mode] でインスタンスの状態の写しを取り、バイト列にするのは後（書き込みのスレッド）に回す。
+     * 写しは元と何も共有しない。既定は [captureAbi] の結果をそのまま包む（その場で符号化する）
+     */
+    fun capturePayload(rt: ProcessRuntime, mode: StateCaptureMode): AbiPayload? = captureAbi(rt, mode)?.let(AbiPayload::encoded)
 }
 
 /** step の結果 */

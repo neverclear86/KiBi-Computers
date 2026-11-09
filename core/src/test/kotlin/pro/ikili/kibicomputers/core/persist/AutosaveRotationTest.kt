@@ -168,4 +168,48 @@ class AutosaveRotationTest {
         assertEquals(1, failing.writeCalls, "失敗の回数を返した台は、その周期では書き直さない")
         assertFalse(rotation.quiescedCount > 0)
     }
+
+    @Test
+    fun `書き込み待ちの上限（NO_CAPACITY）の台で抜け、その台と後ろは止めたまま次のtickに書く`() {
+        val rotation = AutosaveRotation<FakeMachine>(MachineSaveConfig(autosaveWritesPerTick = 4, autosaveQuiesceTicks = 4))
+        val target = Target()
+        val machines = List(3) { FakeMachine(it) }
+        var capacity = 1
+        val calls = ArrayList<FakeMachine>()
+        val limited = object : AutosaveTarget<FakeMachine> by target {
+            override fun writeIfReady(machine: FakeMachine, handle: QuiesceHandle): Int {
+                calls += machine
+                if (handle.readiness != SaveReadiness.READY) return AutosaveTarget.NOT_READY
+                if (capacity <= 0) return AutosaveTarget.NO_CAPACITY
+                capacity--
+                return target.writeIfReady(machine, handle)
+            }
+        }
+        rotation.startCycle(machines)
+        target.now++
+        rotation.tick(limited) // 止めるだけ
+        assertEquals(3, rotation.quiescedCount)
+        target.now++
+        rotation.tick(limited)
+        assertEquals(listOf(machines[0], machines[1]), calls, "2 台目で抜け、3 台目は呼ばない")
+        assertEquals(1, rotation.lastTickWrites, "予算は 1 台目の分だけ使う")
+        assertEquals(1, rotation.writtenInCycle)
+        assertEquals(2, rotation.quiescedCount, "2 台目・3 台目は止めたまま")
+        assertTrue(machines[1] in target.open && machines[2] in target.open, "close しない")
+        // 上限で待っている READY の台は、autosaveQuiesceTicks を過ぎても飛ばさない
+        repeat(6) {
+            target.now++
+            rotation.tick(limited)
+        }
+        assertEquals(0, rotation.skippedInCycle)
+        assertEquals(2, rotation.quiescedCount, "待っている間に止める台は増えない")
+        // 余地ができたら 2 台目から書く
+        calls.clear()
+        capacity = 10
+        target.now++
+        rotation.tick(limited)
+        assertEquals(listOf(machines[1], machines[2]), calls)
+        assertTrue(rotation.isCycleDone)
+        assertEquals(3, rotation.writtenInCycle)
+    }
 }

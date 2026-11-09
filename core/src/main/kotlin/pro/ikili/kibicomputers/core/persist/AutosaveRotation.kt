@@ -16,24 +16,32 @@ public interface AutosaveTarget<T> {
     public fun plannedWrites(machine: T): Int
 
     /**
-     * [handle] が [SaveReadiness.READY] なら取り出して書き、実際の書き込みの回数（失敗したときは試した回数）を返す。
-     * [SaveReadiness.READY] でなければ [NOT_READY]。書いた・失敗した台は、この後 [AutosaveRotation] が `close` する
+     * [handle] が [SaveReadiness.READY] なら取り出して書き込みに回し、書き込みの回数の見積もり（取り出さなかったら 0）を返す。
+     * [SaveReadiness.READY] でなければ [NOT_READY]。書いた・失敗した台は、この後 [AutosaveRotation] が `close` する。
+     *
+     * 取り出しの直前に、書き込み待ちのメモリの上限を見る（#84。台ごと）。余地がなければ取り出さずに [NO_CAPACITY] を返す
+     * （[AutosaveRotation] はその台と後ろの台を止めたまま次の tick に回す）
      */
     public fun writeIfReady(machine: T, handle: QuiesceHandle): Int
 
     public companion object {
         /** [writeIfReady] の「READY でない」 */
         public const val NOT_READY: Int = -1
+
+        /** [writeIfReady] の「書き込み待ちのメモリの上限で、今は回せない」（#84） */
+        public const val NO_CAPACITY: Int = -2
     }
 }
 
 /**
  * 自動保存を回して書く列（#81、ADR 0081）。MC 非依存。メインスレッドだけで使う。
  *
- * 全台を一度に止めず、tick ごとの書き込み（fsync）の回数の予算 [MachineSaveConfig.autosaveWritesPerTick] で回す。毎 [tick]:
+ * 全台を一度に止めず、tick ごとに書き込みに回す回数の予算 [MachineSaveConfig.autosaveWritesPerTick] で回す
+ * （#84 から、書き込み（fsync）は書き込みのスレッドで行い、メインスレッドは取り出して回すだけ。ADR 0084）。毎 [tick]:
  *
- * 1. **書く**: 止めている台を止めた順に見て、[SaveReadiness.READY] のものを予算が尽きるまで書く。予算の足りない READY の台は
- *    止めたまま次の tick に回す（飛ばさない）。後ろの台が先に書けるよう追い越すのは、前の台が READY でないときだけ
+ * 1. **書く**: 止めている台を止めた順に見て、[SaveReadiness.READY] のものを予算が尽きるまで書き込みに回す。予算の足りない READY の台は
+ *    止めたまま次の tick に回す（飛ばさない）。後ろの台が先に書けるよう追い越すのは、前の台が READY でないときだけ。
+ *    書き込み待ちのメモリの上限で回せない台（[AutosaveTarget.NO_CAPACITY]）があれば、その台と後ろの台は予算を使わずに次の tick に回す
  * 2. **飛ばす**: 止めてから [MachineSaveConfig.autosaveQuiesceTicks] tick 経っても READY にならない台は `close` して飛ばし、
  *    次の周期の先頭に回す
  * 3. **止める**: 止めている台の書き込みの回数の合計が「予算 × autosaveQuiesceTicks」を超えないように、列から次の台を止める
@@ -123,6 +131,8 @@ public class AutosaveRotation<T : Any>(private val config: MachineSaveConfig) {
             if (budget <= 0) break
             val writes = target.writeIfReady(machine, q.handle)
             if (writes == AutosaveTarget.NOT_READY) continue
+            // 書き込み待ちのメモリの上限（#84）: この台と後ろの台は止めたまま次の tick（予算は使わない）
+            if (writes == AutosaveTarget.NO_CAPACITY) break
             budget -= writes
             lastTickWrites += writes
             writtenInCycle++

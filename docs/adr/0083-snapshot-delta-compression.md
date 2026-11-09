@@ -116,6 +116,7 @@
 ## 申し送り
 
 - #84: 差分は基準が書けた（fsync した）後に書き、書く待ちの差分が指す基準は消さない。`committed` は書けた後に呼ぶ。圧縮を書き込みのスレッドに移す
+  → #84 で済んだ（ADR 0084 の規則 11・12。圧縮と ABI 層の符号化は `AbiPayload.encode` で書き込みのスレッドに移した。方式・レベルは変えていない）
 - #85: 差分の世代を戻すときは `MachineSaveStore.readGeneration` で基準を読み、確かめて合成する（上限は `MemoryAccount.limitPages`）。
   戻した後のプロセスの基準は `None` でよい。引き継ぐなら、基準の区画を `parkWritten` し差分の区画を書ける区画にして `Committed` にする
 - #251: `fullSaveChangedRatio`（仮 0.5）

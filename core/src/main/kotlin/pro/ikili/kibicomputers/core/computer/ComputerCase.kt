@@ -239,7 +239,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public fun recapture(policy: CapturePolicy): MachineSnapshotSource? = slot.recapture(policy)
 
     /**
-     * 置き場への書き込みの取り出し口（#83。[pro.ikili.kibicomputers.core.persist.MachineSaveStore.captureAndWrite] に渡す）。
+     * 置き場への書き込みの取り出し口（#83。[pro.ikili.kibicomputers.core.persist.MachineSaveStore.captureAndSubmit] に渡す）。
      * 最初は [policy] と基準で取り、取り直しは [recapture]
      */
     public fun capturer(policy: CapturePolicy, fullSaveChangedRatio: Double): SnapshotCapturer = SnapshotCapturer { deltaBase, retry ->

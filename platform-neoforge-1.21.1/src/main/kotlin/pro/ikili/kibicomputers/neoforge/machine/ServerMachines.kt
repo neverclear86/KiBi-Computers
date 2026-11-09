@@ -28,18 +28,21 @@ import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.persist.AutosaveRotation
 import pro.ikili.kibicomputers.core.persist.AutosaveTarget
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.CaptureSubmitResult
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.persist.WriteResult
 import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
-import java.io.IOException
+import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
@@ -57,19 +60,24 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *
  * - サーバーの起動（[ServerAboutToStartEvent]。ワールドとチャンクを読み込む前）に [MachineManager] を作る
  * - 毎 tick の始め（[ServerTickEvent.Pre]）に [MachineManager.tick] を呼び、自動保存（[AutosaveRotation]）を1 tick 分すすめる
- * - チャンクのアンロード（[ChunkEvent.Unload]）: そのチャンクのケースを止め、待ち（tick ごとの予算）、取り出して書き、
- *   チャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が新しい世代を NBT に書く）
+ * - 毎 tick の始めに、書き込みのスレッドで終わった書き込みを受け取り（[processCompletions]）、ケースの NBT の世代を進める（#84）
+ * - チャンクのアンロード（[ChunkEvent.Unload]）: そのチャンクのケースを止め、待ち（tick ごとの予算）、取り出して書き込みに回し、
+ *   予約した世代を NBT に載せてチャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が書く。書き終わりは待たない。#84 の規則 4）
  * - チャンクが FULL でなくなった（[ChunkTicketLevelUpdatedEvent] でチケットの段階が 33 を超えた。#545）: アンロードと同じく
- *   止め、待ち、取り出して書き、`setUnsaved(true)` を付けてから、マシンを外す（[CaseBlockEntity.chunkDemoted]）。
+ *   止め、待ち、取り出して書き込みに回してから、マシンを外す（[CaseBlockEntity.chunkDemoted]）。書き終わったら、そのチャンクに
+ *   `setUnsaved(true)` を付ける（#84 の規則 5）。
  *   スポーンのチャンク・強制読み込み・チャンクローダーのまわりのチャンクは、FULL でなくなってもアンロードされずメモリに残るため。
  *   イベントの中では印を付けるだけで、tick の終わり（[ServerTickEvent.Post]）に、tick の時間が残っている間だけ流す（1 tick に最低1チャンク）。
  *   流す前に FULL に戻ったチャンクは何もしない。FULL に戻ったチャンクのケースは、アンロードの後に読み込み直したのと同じく電源が切れている
  * - チャンクの保存（[ChunkDataEvent.Save]）: NBT に入ったケースの世代を、持ち主の位置のタグだけで `markChunkGeneration` に渡す
- * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き、`setChanged` を付ける。
+ * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き込みに回し、書き込みのスレッドが
+ *   空になるのを待って（[drainSaves]）、書けた台に `setChanged` を付ける（#84 の規則 3）。
  *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま。そのあと、チャンクのアンロードの列を流しきる（[ChunkUnloadDrain]。#540）
  * - サーバーが止まった後（[ServerStoppedEvent]）に全マシンを止め、スレッドが終わるのを待つ（上限 [SHUTDOWN_TIMEOUT_MILLIS]）
  *
- * #81 では書き込みはメインスレッドで同期して行う（#84 で書き込みのスレッドに移す）。
+ * 世代のファイルの符号化と書き込みは、書き込みのスレッドで行う（#84、ADR 0084）。メインスレッドは取り出しと予約だけをする。
+ * 書き込み待ちの写しの合計が上限（[MachineSaveConfig.writerMaxPendingBytes]）以上なら、自動保存は次の tick に回し、
+ * アンロード・停止は台ごとに待つ（期限はチャンク・停止全体で共有）。
  * マシンの中や接続層の通知で起きた例外は、サーバーを落とさずログに書く。
  */
 object ServerMachines {
@@ -94,6 +102,10 @@ object ServerMachines {
             // 止めていた台は続けてから、新しい予算の列にする
             rotation.clear()
             rotation = AutosaveRotation(value)
+            WorldMachineSaves.current?.let {
+                it.maxPendingBytes = value.writerMaxPendingBytes
+                it.claimWaitMillis = value.writerFlushMillis
+            }
         }
 
     /**
@@ -137,7 +149,7 @@ object ServerMachines {
         /** アンロードで行った書き込み（fsync）の回数 */
         var unloadWrites: Long = 0
 
-        /** 自動保存の書き込みの回数（tick ごとの最大） */
+        /** 自動保存で書き込みに回した回数（tick ごとの最大） */
         var autosaveMaxTickWrites: Int = 0
 
         /** 自動保存で書いた台・飛ばした台の数（周期をまたいだ合計） */
@@ -147,24 +159,47 @@ object ServerMachines {
         /** 終わった自動保存の周期の、一巡にかかった tick 数（古い順） */
         val autosaveCycleTicks: MutableList<Int> = ArrayList()
 
-        /** 自動保存の書き込み（取り出して書く。fsync を含む）にかかった時間の合計（ナノ秒） */
+        /** 自動保存で、取り出して書き込みに回すのにかかった時間の合計（ナノ秒。メインスレッド。#84 から書き込みは含まない） */
         var autosaveWriteNanos: Long = 0
 
         /**
-         * 保存（自動保存・アンロード・停止。`CaseBlockEntity.captureAndWrite`）で、取り出し（`captureCopy`。カーネルロックの中）に
-         * かかった時間の合計（ナノ秒。#553）。取り出さずに終わった（TRANSIENT で飛ばした）分も入る
+         * 保存（自動保存・アンロード・停止。`CaseBlockEntity.captureAndSubmit`）で、取り出し（`captureCopy`。カーネルロックの中。
+         * メインスレッド）にかかった時間の合計（ナノ秒。#553）
          */
         var captureNanos: Long = 0
 
-        /** 保存で、符号化（写しを保存データのバイト列にする）にかかった時間の合計（ナノ秒。#553） */
+        /**
+         * 保存で、符号化（写しを保存データのバイト列にする。区画の圧縮を含む）にかかった時間の合計（ナノ秒。#553）。
+         * 書き込みのスレッドで測り、完了を受け取ったときに足す（#84）
+         */
         var encodeNanos: Long = 0
 
         /**
-         * 保存で、ファイルの書き込み（tmp → fsync → rename。世代ファイルと `owner.bin`）にかかった時間の合計（ナノ秒。#553）。
-         * 負荷試験は、tick ごとの増分を tick の時間から引いて「書き込みを除く MSPT」（取り出し・符号化は含む）を出す
-         * （fsync の時間はディスクに左右されるため）
+         * 保存で、ファイルの書き込み（tmp → fsync → rename。世代ファイルと、振った `owner.bin`）にかかった時間の合計（ナノ秒。#553）。
+         * 書き込みのスレッドで測り、完了を受け取ったときに足す（#84）
          */
         var fileWriteNanos: Long = 0
+
+        /** 書けなかった書き込みの数（#84） */
+        var saveFailures: Long = 0
+
+        /** 書き込み待ちの仕事の数・写しの見積もりの合計の最大（予約の直後に見る。#84） */
+        var maxPendingCount: Int = 0
+        var maxPendingBytes: Long = 0
+
+        /** アンロード・停止で、取り出しの前に書き込み待ちの上限を確かめた台の数（#84） */
+        var capacityChecks: Long = 0
+
+        /** そのうち、上限で待った台の数と、待った時間の合計（ナノ秒）、期限を過ぎた回数（#84） */
+        var capacityWaits: Long = 0
+        var capacityWaitNanos: Long = 0
+        var capacityTimeouts: Long = 0
+
+        /** 自動保存で、書き込み待ちの上限のために次の tick に回した回数（#84） */
+        var autosaveNoCapacity: Long = 0
+
+        /** 消えたケース（アンロード済み・壊した）への完了の数（#84。数えるだけ） */
+        var completionsForGone: Long = 0
 
         /** 世代のファイルを書くたびに [saves] に1件残すか（負荷試験が有効にする。ふだんは残さない） */
         var recordSaves: Boolean = false
@@ -172,16 +207,14 @@ object ServerMachines {
         /** 世代のファイルを書いた1回ごとの記録（[recordSaves] のときだけ。古い順） */
         val saves: MutableList<SaveSample> = ArrayList()
 
-        /** 世代のファイルを1つ書いた（`CaseBlockEntity.captureAndWrite` から） */
-        fun recordSave(pos: BlockPos, captureNanos: Long, result: WriteResult, ownerWriteNanos: Long, retried: Boolean = false) {
+        /** 世代のファイルを1つ書けた（完了を受け取ったとき。[captureNanos] は予約の前の取り出しの時間） */
+        fun recordSave(pos: BlockPos, captureNanos: Long, result: WriteResult) {
             encodeNanos += result.encodeNanos
             fileWriteNanos += result.fileWriteNanos
             if (result.delta) deltaSaves++ else fullSaves++
-            if (retried) deltaRetries++
             if (recordSaves) {
                 saves += SaveSample(
-                    pos, captureNanos, result.encodeNanos, result.fileWriteNanos + ownerWriteNanos, result.fileBytes, result.tmpfsBytes,
-                    result.delta,
+                    pos, captureNanos, result.encodeNanos, result.fileWriteNanos, result.fileBytes, result.tmpfsBytes, result.delta,
                 )
             }
         }
@@ -210,6 +243,15 @@ object ServerMachines {
             fullSaves = 0
             deltaSaves = 0
             deltaRetries = 0
+            saveFailures = 0
+            maxPendingCount = 0
+            maxPendingBytes = 0
+            capacityChecks = 0
+            capacityWaits = 0
+            capacityWaitNanos = 0
+            capacityTimeouts = 0
+            autosaveNoCapacity = 0
+            completionsForGone = 0
             saves.clear()
         }
     }
@@ -298,6 +340,7 @@ object ServerMachines {
         get() = rotation.isCycleDone
 
     private fun onServerTick(event: ServerTickEvent.Pre) {
+        processCompletions()
         manager?.tick()
         unloadWaitedNanos = 0
         if (changedLater.isNotEmpty()) {
@@ -331,20 +374,105 @@ object ServerMachines {
 
         override fun writeIfReady(machine: CaseBlockEntity, handle: QuiesceHandle): Int {
             if (handle.readiness != SaveReadiness.READY) return AutosaveTarget.NOT_READY
-            val planned = machine.plannedWrites
+            // 書き込み待ちの上限（#84）: 台ごとに、取り出しの直前に見る。余地がなければ、この台と後ろの台は次の tick
+            val store = WorldMachineSaves.current
+            if (store != null && !store.hasCapacity) {
+                Stats.autosaveNoCapacity++
+                return AutosaveTarget.NO_CAPACITY
+            }
             val start = System.nanoTime()
             return try {
-                val writes = machine.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT)
-                // 読み込み中のチャンクなので setChanged が効き、チャンクの保存が後で NBT を書く
-                if (writes > 0) machine.setChanged()
-                writes
-            } catch (e: IOException) {
-                LOGGER.warn("Failed to save the computer at {} (keeping the previous generation)", machine.blockPos, e)
-                planned
+                // NBT の世代は、書き終わった完了を受け取ったときに進めて setChanged する（規則 2）
+                machine.captureAndSubmit(CapturePolicy.SKIP_IF_TRANSIENT)?.writes ?: 0
             } finally {
                 Stats.autosaveWriteNanos += System.nanoTime() - start
             }
         }
+    }
+
+    // ---- 書き込みの完了（#84） ----
+
+    /** 予約ごとの取り出しの時間（[Stats.recordSaves] のときだけ。完了で [Stats.saves] に入れる） */
+    private val captureNanosOf = IdentityHashMap<PendingSave, Long>()
+
+    /** ケースが書き込みを予約した（[CaseBlockEntity.captureAndSubmit] から）。数え口に入れる */
+    internal fun recordSubmit(submitted: CaptureSubmitResult) {
+        Stats.captureNanos += submitted.captureNanos
+        if (submitted.retried) Stats.deltaRetries++
+        if (Stats.recordSaves) captureNanosOf[submitted.pending] = submitted.captureNanos
+        val store = WorldMachineSaves.current ?: return
+        Stats.maxPendingCount = maxOf(Stats.maxPendingCount, store.pendingCount)
+        Stats.maxPendingBytes = maxOf(Stats.maxPendingBytes, store.pendingBytes)
+    }
+
+    /**
+     * 書き込みのスレッドで終わった書き込みを受け取り、ケースに返す（メインスレッド。毎 tick の始めと [drainSaves]）。
+     * ケースが世代を採ったら（[CaseBlockEntity.onSaveCompleted]）`setChanged` し、FULL でなくなったチャンクなら `setUnsaved(true)` を付ける。
+     * 消えたケースへの完了は数えるだけ
+     */
+    internal fun processCompletions() {
+        val store = WorldMachineSaves.current ?: return
+        for (completion in store.pollCompleted()) {
+            val be = completion.pending.tag as? CaseBlockEntity
+            val captureNanos = captureNanosOf.remove(completion.pending) ?: 0L
+            val result = completion.result
+            if (result != null) Stats.recordSave(be?.blockPos ?: BlockPos.ZERO, captureNanos, result) else Stats.saveFailures++
+            if (be == null) continue
+            val adopted = be.onSaveCompleted(completion)
+            if (be.isRemoved) {
+                Stats.completionsForGone++
+                continue
+            }
+            if (adopted) {
+                be.setChanged()
+                // FULL でないチャンクでは setChanged が届かない（規則 5）
+                be.demotedChunk?.isUnsaved = true
+            }
+        }
+    }
+
+    /**
+     * 書き込みのスレッドが空になるまで待ち（上限 [MachineSaveConfig.writerFlushMillis]）、終わった書き込みを受け取る（停止の手順と GameTest）
+     *
+     * @return 上限までに空になった
+     */
+    internal fun drainSaves(): Boolean {
+        val store = WorldMachineSaves.current ?: return true
+        val flushed = try {
+            store.flush(saveConfig.writerFlushMillis)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!flushed) LOGGER.warn("Computer saves did not finish within {} ms", saveConfig.writerFlushMillis)
+        processCompletions()
+        return flushed
+    }
+
+    /**
+     * アンロード・停止で、取り出しの前に書き込み待ちの上限を確かめ、余地がなければ [deadline]（`System.nanoTime` の値。チャンク・停止全体で共有）
+     * まで待つ（#84）。期限を過ぎたら warn して `false`（呼び出し側は残りの台を待たずに回す）
+     */
+    private fun awaitCapacity(store: MachineSaveStore, deadline: Long): Boolean {
+        Stats.capacityChecks++
+        if (store.hasCapacity) return true
+        Stats.capacityWaits++
+        val start = System.nanoTime()
+        val ok = try {
+            store.awaitCapacity(TimeUnit.NANOSECONDS.toMillis((deadline - start).coerceAtLeast(0)))
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        Stats.capacityWaitNanos += System.nanoTime() - start
+        if (!ok) {
+            Stats.capacityTimeouts++
+            LOGGER.warn(
+                "Pending computer saves stayed over {} bytes for {} ms; queueing the rest without waiting",
+                store.maxPendingBytes, saveConfig.writerFlushMillis,
+            )
+        }
+        return ok
     }
 
     // ---- チャンクのアンロード ----
@@ -355,14 +483,16 @@ object ServerMachines {
         val cases = chunk.blockEntities.values.filterIsInstance<CaseBlockEntity>()
         if (cases.isEmpty()) return
         Stats.unloadEventsWithCases++
-        saveForUnload(chunk, cases)
+        saveForUnload(chunk, cases, adopt = true)
     }
 
     /**
-     * アンロードされる [chunk] の [cases] を取り出して書く。止める → 待つ（tick ごとの予算 [MachineSaveConfig.unloadWaitBudgetMillis]）→
-     * 取り出す（`KILL_TRANSIENT`）→ 書く → チャンクに `setUnsaved(true)`（アンロードでは `setChanged` が効かないため）
+     * アンロードされる [chunk] の [cases] を取り出して書き込みに回す。止める → 待つ（tick ごとの予算 [MachineSaveConfig.unloadWaitBudgetMillis]）→
+     * 台ごとに書き込み待ちの上限を確かめる（期限はチャンクで共有）→ 取り出す（`KILL_TRANSIENT`）→ 書き込みに回す。
+     * [adopt]（アンロード）なら、書き込み中の予約の世代を NBT に載せ、チャンクに `setUnsaved(true)` を付ける（アンロードでは `setChanged` が
+     * 効かないため。#84 の規則 4）。FULL でなくなっただけなら（[adopt] が偽）、書き終わってから進める（規則 5）
      */
-    private fun saveForUnload(chunk: LevelChunk, cases: List<CaseBlockEntity>) {
+    internal fun saveForUnload(chunk: LevelChunk, cases: List<CaseBlockEntity>, adopt: Boolean) {
         val store = WorldMachineSaves.current ?: return
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
@@ -378,25 +508,24 @@ object ServerMachines {
             rotation.remove(be)?.close()
             targets += be
         }
-        if (targets.isEmpty()) return
-        val budget = TimeUnit.MILLISECONDS.toNanos(saveConfig.unloadWaitBudgetMillis)
-        val start = System.nanoTime()
-        while (unloadWaitedNanos + (System.nanoTime() - start) < budget && targets.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
-            LockSupport.parkNanos(WAIT_STEP_NANOS)
-        }
-        unloadWaitedNanos += System.nanoTime() - start
-        for (be in targets) {
-            try {
-                val writes = be.captureAndWrite(CapturePolicy.KILL_TRANSIENT)
-                if (writes > 0) {
-                    Stats.unloadCaptures++
-                    Stats.unloadWrites += writes
-                    chunk.isUnsaved = true
-                }
-            } catch (e: IOException) {
-                LOGGER.warn("Failed to save the computer at {} on chunk unload (keeping the previous generation)", be.blockPos, e)
+        if (targets.isNotEmpty()) {
+            val budget = TimeUnit.MILLISECONDS.toNanos(saveConfig.unloadWaitBudgetMillis)
+            val start = System.nanoTime()
+            while (unloadWaitedNanos + (System.nanoTime() - start) < budget && targets.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
+                LockSupport.parkNanos(WAIT_STEP_NANOS)
+            }
+            unloadWaitedNanos += System.nanoTime() - start
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(saveConfig.writerFlushMillis)
+            var waiting = true
+            for (be in targets) {
+                if (waiting) waiting = awaitCapacity(store, deadline) else Stats.capacityChecks++
+                val pending = be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) ?: continue
+                Stats.unloadCaptures++
+                Stats.unloadWrites += pending.writes
             }
         }
+        // 書き終わりは待たずに、予約した世代を NBT に載せる（書き込み中だった自動保存の予約も同じ。規則 4）
+        if (adopt) for (be in cases) if (be.adoptPendingSave()) chunk.isUnsaved = true
     }
 
     // ---- FULL でなくなったチャンク（#545） ----
@@ -438,9 +567,9 @@ object ServerMachines {
             .filter { !it.isRemoved && it.computer.machine != null }
         if (cases.isEmpty()) return false
         Stats.demotedChunksWithCases++
-        saveForUnload(chunk, cases)
+        saveForUnload(chunk, cases, adopt = false)
         for (be in cases) {
-            be.chunkDemoted()
+            be.chunkDemoted(chunk)
             Stats.demotedMachines++
         }
         return true
@@ -499,11 +628,12 @@ object ServerMachines {
     }
 
     /**
-     * [targets] を止め、まとめて待ち（上限 [MachineSaveConfig.stopQuiesceMillis]）、全台を `KILL_TRANSIENT` で取り出して書き、
-     * `setChanged` を付ける（続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く）。
+     * [targets] を止め、まとめて待ち（上限 [MachineSaveConfig.stopQuiesceMillis]）、全台を `KILL_TRANSIENT` で取り出して書き込みに回し
+     * （台ごとに書き込み待ちの上限を確かめる。期限は全体で共有）、書き込みのスレッドが空になるのを待って（[drainSaves]）、
+     * 書けた台に `setChanged` を付ける（続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く。#84 の規則 3）。
      * [keepQuiesced] なら止めたままにする（サーバーの停止。取り出した後に状態が進まないように）。GameTest は `false` で続ける
      *
-     * @return 書いた台の数
+     * @return 書き込みに回した台の数
      */
     internal fun saveForStop(targets: List<CaseBlockEntity>, keepQuiesced: Boolean): Int {
         rotation.clear()
@@ -514,16 +644,17 @@ object ServerMachines {
             LockSupport.parkNanos(WAIT_STEP_NANOS)
         }
         var saved = 0
+        val store = WorldMachineSaves.current
+        val capacityDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(saveConfig.writerFlushMillis)
+        var waiting = true
         for (be in running) {
-            try {
-                if (be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0) {
-                    be.setChanged()
-                    saved++
-                }
-            } catch (e: IOException) {
-                LOGGER.warn("Failed to save the computer at {} on server stop (keeping the previous generation)", be.blockPos, e)
+            if (store != null) {
+                if (waiting) waiting = awaitCapacity(store, capacityDeadline) else Stats.capacityChecks++
             }
+            if (be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null) saved++
         }
+        // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
+        drainSaves()
         if (!keepQuiesced) for (be in running) be.computer.endQuiesce()
         if (keepQuiesced && running.isNotEmpty()) LOGGER.info("Saved {} of {} running computers", saved, running.size)
         return saved

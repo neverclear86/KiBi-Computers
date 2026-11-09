@@ -204,11 +204,10 @@ internal data class AvgMax(val avg: Double, val max: Double) {
  *
  * @property saves 世代のファイルを書いた回数
  * @property capture 1台あたりの取り出し（`captureCopy`。カーネルロックの中。メインスレッドで呼ぶ）の時間
- * @property encode 1台あたりの符号化（保存データのバイト列にする）の時間
- * @property tickCapture 1 tick の取り出しの時間の合計（保存した tick の平均と、最大）
- * @property tickEncode 1 tick の符号化の時間の合計（同じ）
- * @property tickCaptureEncode 1 tick の取り出しと符号化の時間の合計（同じ）
- * @property fileWriteMillis ファイルの書き込み（fsync を含む）の時間の合計
+ * @property encode 1台あたりの符号化（保存データのバイト列にする）の時間（書き込みのスレッド。#84）
+ * @property tickCapture 1 tick の取り出しの時間の合計（取り出した tick の平均と、最大。メインスレッド）
+ * @property fileWriteMillis ファイルの書き込み（fsync を含む）の時間の合計（書き込みのスレッド。#84）
+ * @property writer 段階の間の書き込みのスレッドの数え口（#84）
  * @property fileBytesAvg 世代のファイルの大きさの平均
  * @property fileBytesP50 世代のファイルの大きさの中央値
  * @property fileBytesMax 世代のファイルの大きさの最大
@@ -229,8 +228,6 @@ internal data class SaveCost(
     val capture: AvgMax,
     val encode: AvgMax,
     val tickCapture: AvgMax,
-    val tickEncode: AvgMax,
-    val tickCaptureEncode: AvgMax,
     val fileWriteMillis: Double,
     val fileBytesAvg: Double,
     val fileBytesP50: Int,
@@ -246,13 +243,41 @@ internal data class SaveCost(
     val fullBytesTotal: Long = 0,
     val deltaSaves: Int = 0,
     val deltaBytesTotal: Long = 0,
+    val writer: WriterStats = WriterStats(),
 )
 
 /**
- * [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書いた台・飛ばした台の数、1 tick の書き込み（fsync）の最大、
- * 書き込みにかかった時間の合計（ミリ秒。取り出し・符号化を含む）と、tick の時間からファイルの書き込みの時間を引いたもの
- * （[tickExcludingWrites]。取り出し・符号化は含む。#553）、保存の手間と大きさ（[cost]）。
- * 書き込みはメインスレッドで同期して fsync する（#84 まで）ので、壁時計の MSPT はディスクの速さに左右される
+ * 書き込みのスレッド（#84）の数え口: 書き込み待ちの仕事の数・写しの見積もりの最大、アンロード・停止で上限を待った台の数・時間・期限切れ、
+ * 自動保存が上限で次の tick に回した回数、書けなかった書き込みの数
+ */
+internal data class WriterStats(
+    val maxPendingCount: Int = 0,
+    val maxPendingBytes: Long = 0,
+    val capacityWaits: Long = 0,
+    val capacityWaitMillis: Double = 0.0,
+    val capacityTimeouts: Long = 0,
+    val autosaveNoCapacity: Long = 0,
+    val failures: Long = 0,
+) {
+    override fun toString(): String = String.format(
+        Locale.ROOT, "待ちの最大 %d 件・%.1f MiB、上限で待った台 %d（%.0f ms、期限切れ %d）、自動保存で次の tick に回した %d、書けなかった %d",
+        maxPendingCount, maxPendingBytes / (1024.0 * 1024.0), capacityWaits, capacityWaitMillis, capacityTimeouts, autosaveNoCapacity, failures,
+    )
+
+    companion object {
+        fun current(): WriterStats = ServerMachines.Stats.let {
+            WriterStats(
+                it.maxPendingCount, it.maxPendingBytes, it.capacityWaits, it.capacityWaitNanos / 1e6, it.capacityTimeouts, it.autosaveNoCapacity,
+                it.saveFailures,
+            )
+        }
+    }
+}
+
+/**
+ * [LoadPhase.AUTOSAVE] の結果: 一巡の tick 数、書き込みに回した台・飛ばした台の数、1 tick で書き込みに回した回数の最大、
+ * 書き込みに回すのにかかった時間の合計（ミリ秒。取り出しと予約。メインスレッド）と、tick の時間（[tick]。壁時計）、保存の手間と大きさ（[cost]）。
+ * 符号化と書き込み（fsync）は書き込みのスレッドで行う（#84）ので、tick の時間には入らない
  */
 internal data class AutosaveResult(
     val cycleTicks: Int,
@@ -260,13 +285,13 @@ internal data class AutosaveResult(
     val skipped: Long,
     val maxTickWrites: Int,
     val writeMillis: Double,
-    val tickExcludingWrites: TickStats,
+    val tick: TickStats,
     val cost: SaveCost,
 )
 
 /**
- * [LoadPhase.UNLOAD] の結果: 取り出して書いた台と書き込みの回数（合計と 1 tick の最大）、ケースのあるチャンクのうちアンロードされなかった数とその全体、
- * tick の時間からファイルの書き込みの時間を引いたもの（[tickExcludingWrites]。#553）、保存の手間と大きさ（[cost]）
+ * [LoadPhase.UNLOAD] の結果: 取り出して書き込みに回した台と書き込みの回数（合計と 1 tick の最大）、ケースのあるチャンクのうちアンロードされなかった数とその全体、
+ * tick の時間（[tick]。壁時計。書き込みは書き込みのスレッドで行う。#84）、保存の手間と大きさ（[cost]）
  */
 internal data class UnloadResult(
     val captures: Long,
@@ -276,7 +301,7 @@ internal data class UnloadResult(
     val stillLoaded: Int,
     val chunks: Int,
     val ticks: Int,
-    val tickExcludingWrites: TickStats,
+    val tick: TickStats,
     val cost: SaveCost,
 )
 
@@ -324,10 +349,10 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- 自動保存の一巡: %d tick、書いた台 %d、飛ばした台 %d、1 tick の書き込み（fsync）の最大 %d 回、書き込みの時間の合計 %.0f ms（取り出し・符号化を含む）、" +
-                        "書き込みを除く MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    "- 自動保存の一巡: %d tick、書き込みに回した台 %d、飛ばした台 %d、1 tick で回した最大 %d 回、回すのにかかった時間の合計 %.0f ms（取り出しと予約）、" +
+                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
                     it.cycleTicks, it.written, it.skipped, it.maxTickWrites, it.writeMillis,
-                    it.tickExcludingWrites.avg, it.tickExcludingWrites.p50, it.tickExcludingWrites.p95, it.tickExcludingWrites.max,
+                    it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
         }
@@ -335,26 +360,28 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- まとめてアンロード: %d tick、取り出して書いた台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、アンロードされなかった %d / %d チャンク（ケースのあるもの）、" +
-                        "書き込みを除く MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    "- まとめてアンロード: %d tick、取り出して書き込みに回した台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、アンロードされなかった %d / %d チャンク（ケースのあるもの）、" +
+                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
                     it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
-                    it.tickExcludingWrites.avg, it.tickExcludingWrites.p50, it.tickExcludingWrites.p95, it.tickExcludingWrites.max,
+                    it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
         }
         val costs = listOfNotNull(autosave?.let { LoadPhase.AUTOSAVE to it.cost }, unload?.let { LoadPhase.UNLOAD to it.cost })
         if (costs.isNotEmpty()) {
             sb.append("\n保存の手間と大きさ（#553。時間はミリ秒の 平均 / 最大。1 tick の合計は、保存した tick の 平均 / 最大）:\n\n")
-            sb.append("| 段階 | 書いた台 | 取り出し（1台） | 符号化（1台） | 取り出し（1 tick） | 符号化（1 tick） | 取り出し + 符号化（1 tick） | ファイルの書き込みの合計 |\n")
-            sb.append("| --- | --: | --: | --: | --: | --: | --: | --: |\n")
+            sb.append("| 段階 | 書いた台 | 取り出し（1台） | 取り出し（1 tick） | 符号化（1台。書き込みのスレッド） | ファイルの書き込みの合計（書き込みのスレッド） |\n")
+            sb.append("| --- | --: | --: | --: | --: | --: |\n")
             for ((p, c) in costs) {
                 sb.append(
                     String.format(
-                        Locale.ROOT, "| %s | %d | %s | %s | %s | %s | %s | %.0f ms |\n",
-                        p.label, c.saves, c.capture, c.encode, c.tickCapture, c.tickEncode, c.tickCaptureEncode, c.fileWriteMillis,
+                        Locale.ROOT, "| %s | %d | %s | %s | %s | %.0f ms |\n",
+                        p.label, c.saves, c.capture, c.tickCapture, c.encode, c.fileWriteMillis,
                     ),
                 )
             }
+            sb.append("\n書き込みのスレッド（#84）:\n\n")
+            for ((p, c) in costs) sb.append("- ").append(p.label).append(": ").append(c.writer).append('\n')
             sb.append("\n| 段階 | 世代のファイル（平均 / p50 / 最大） | 合計 | TMPFS 節: /tmp に書いた台（台数・最小 / 平均 / 最大） | TMPFS 節: ほかの台（平均 / 最大） |\n")
             sb.append("| --- | --: | --: | --: | --: |\n")
             for ((p, c) in costs) {
@@ -435,18 +462,12 @@ internal class LoadRun(
     private var recording = false
     private var samples = LongArray(1024)
 
-    /** [samples] と同じ tick の、保存のファイルの書き込み（fsync を含む）にかかった時間（[ServerMachines.Stats.fileWriteNanos] の増分） */
-    private var writeSamples = LongArray(1024)
-
-    /** [samples] と同じ tick の、取り出し・符号化にかかった時間（[ServerMachines.Stats.captureNanos]・`encodeNanos` の増分） */
+    /** [samples] と同じ tick の、取り出しにかかった時間（[ServerMachines.Stats.captureNanos] の増分） */
     private var captureSamples = LongArray(1024)
-    private var encodeSamples = LongArray(1024)
     private var sampleCount = 0
 
     /** 前の呼び出しの終わりの [ServerMachines.Stats] の累計（tick ごとの増分を出すため） */
-    private var prevFileWrite = 0L
     private var prevCapture = 0L
-    private var prevEncode = 0L
     private var peakKernelThreads = 0
     private var peakPhaseKernelThreads = 0
 
@@ -497,7 +518,7 @@ internal class LoadRun(
             work = (now - prevCallback - prevHarness - prevSleep).coerceAtLeast(0)
             // 自動保存（ServerTickEvent.Pre）・アンロード（チャンクのアンロード、ServerTickEvent.Post）の保存は、前の呼び出しからの間に入っている
             val s = ServerMachines.Stats
-            if (recording) record(work, s.fileWriteNanos - prevFileWrite, s.captureNanos - prevCapture, s.encodeNanos - prevEncode)
+            if (recording) record(work, s.captureNanos - prevCapture)
         }
         prevCallback = now
         try {
@@ -507,11 +528,7 @@ internal class LoadRun(
             throw t
         }
         // step() が Stats.reset() したときも、次の増分がこの時点からになるように、step() の後で覚える
-        ServerMachines.Stats.let {
-            prevFileWrite = it.fileWriteNanos
-            prevCapture = it.captureNanos
-            prevEncode = it.encodeNanos
-        }
+        prevCapture = ServerMachines.Stats.captureNanos
         val end = System.nanoTime()
         prevHarness = end - now
         prevSleep = 0
@@ -527,28 +544,27 @@ internal class LoadRun(
         }
     }
 
-    private fun record(nanos: Long, writeNanos: Long, captureNanos: Long, encodeNanos: Long) {
+    private fun record(nanos: Long, captureNanos: Long) {
         if (sampleCount == samples.size) {
             samples = samples.copyOf(samples.size * 2)
-            writeSamples = writeSamples.copyOf(samples.size)
             captureSamples = captureSamples.copyOf(samples.size)
-            encodeSamples = encodeSamples.copyOf(samples.size)
         }
         samples[sampleCount] = nanos
-        writeSamples[sampleCount] = writeNanos
         captureSamples[sampleCount] = captureNanos
-        encodeSamples[sampleCount] = encodeNanos
         sampleCount++
     }
 
-    /** 測った tick の時間から、ファイルの書き込みの時間を引いたもの（取り出し・符号化は含む） */
-    private fun tickExcludingWrites(): TickStats =
-        TickStats.of(LongArray(sampleCount) { (samples[it] - writeSamples[it]).coerceAtLeast(0) })
+    /** 測った tick の時間（壁時計。#84 から書き込みはメインスレッドの外） */
+    private fun tickStats(): TickStats = TickStats.of(samples.copyOf(sampleCount))
 
-    /** 段階の間の保存の手間と大きさ（[ServerMachines.Stats.saves] と、tick ごとの増分から） */
+    /**
+     * 段階の間の保存の手間と大きさ（[ServerMachines.Stats.saves] と、tick ごとの増分から）。書き込みのスレッドが空になるのを待ち、
+     * 終わった書き込みを受け取ってから数える（[ServerMachines.drainSaves]。この tick の測る時間には入らない）
+     */
     private fun saveCost(): SaveCost {
+        ServerMachines.drainSaves()
         val saves = ServerMachines.Stats.saves.toList()
-        val savedTicks = (0 until sampleCount).filter { captureSamples[it] > 0 || encodeSamples[it] > 0 }
+        val savedTicks = (0 until sampleCount).filter { captureSamples[it] > 0 }
         fun perTick(f: (Int) -> Long) = AvgMax.ofNanos(LongArray(savedTicks.size) { f(savedTicks[it]) })
         val sizes = saves.map { it.fileBytes }.sorted()
         val tmpPositions = tmpSet.mapTo(HashSet()) { it.case.blockPos }
@@ -558,8 +574,6 @@ internal class LoadRun(
             capture = AvgMax.ofNanos(saves.map { it.captureNanos }.toLongArray()),
             encode = AvgMax.ofNanos(saves.map { it.encodeNanos }.toLongArray()),
             tickCapture = perTick { captureSamples[it] },
-            tickEncode = perTick { encodeSamples[it] },
-            tickCaptureEncode = perTick { captureSamples[it] + encodeSamples[it] },
             fileWriteMillis = saves.sumOf { it.fileWriteNanos } / 1e6,
             fileBytesAvg = if (sizes.isEmpty()) 0.0 else sizes.average(),
             fileBytesP50 = if (sizes.isEmpty()) 0 else sizes[(sizes.size - 1) / 2],
@@ -575,6 +589,7 @@ internal class LoadRun(
             fullBytesTotal = saves.filter { !it.delta }.sumOf { it.fileBytes.toLong() },
             deltaSaves = saves.count { it.delta },
             deltaBytesTotal = saves.filter { it.delta }.sumOf { it.fileBytes.toLong() },
+            writer = WriterStats.current(),
         )
     }
 
@@ -644,7 +659,7 @@ internal class LoadRun(
                 skipped = s.autosaveSkipped,
                 maxTickWrites = s.autosaveMaxTickWrites,
                 writeMillis = s.autosaveWriteNanos / 1e6,
-                tickExcludingWrites = tickExcludingWrites(),
+                tick = tickStats(),
                 cost = saveCost(),
             )
             next(LoadPhase.AUTOSAVE)
@@ -665,7 +680,7 @@ internal class LoadRun(
         if (remaining <= 0 || phaseTick >= UNLOAD_TIMEOUT_TICKS) {
             unloadResult = UnloadResult(
                 s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, remaining.coerceAtLeast(0), unloadCaseChunks, phaseTick,
-                tickExcludingWrites(), saveCost(),
+                tickStats(), saveCost(),
             )
             next(LoadPhase.UNLOAD)
         }

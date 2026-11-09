@@ -109,19 +109,21 @@ class DeltaSaveStoreTest {
             }
             src(base)
         }
-        val result = store.captureAndWrite(g1, p, capturer)!!
+        val result = store.captureAndSubmit(g1, p, capturer, null)!!
+        val written = store.pollCompleted().single { it.pending === result.pending }.result!!
         assertTrue(result.retried)
-        assertFalse(result.delta)
-        assertEquals(3, result.write.identity.generation)
+        assertFalse(written.delta)
+        assertEquals(3, written.identity.generation)
         assertEquals(2, calls.size)
         assertNotNull(calls[0].first)
         assertEquals(null to true, calls[1])
         // ふだんは取り直さずに差分
-        val again = store.captureAndWrite(result.write.identity, p) { base, _ -> src(base) }!!
+        val again = store.captureAndSubmit(written.identity, p, { base, _ -> src(base) }, null)!!
+        val againWritten = store.pollCompleted().single().result!!
         assertFalse(again.retried)
-        assertTrue(again.delta)
+        assertTrue(againWritten.delta)
         // 取り出せなければ null
-        assertNull(store.captureAndWrite(again.write.identity, p) { _, _ -> null })
+        assertNull(store.captureAndSubmit(againWritten.identity, p, { _, _ -> null }, null))
     }
 
     @Test

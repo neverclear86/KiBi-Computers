@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
+import java.util.OptionalLong
 import java.util.UUID
 
 /** 待機点保存（#81、ADR 0081）の GameTest: マシンの ID、世代のファイル、チャンクの印、アンロードと停止の手順 */
@@ -84,13 +85,13 @@ object MachineSaveGameTests {
 
         // アンロードの手順と同じく止めてから取り出す（止めている間は1回だけ）
         be.computer.prepareUnload()
-        val writes = be.captureAndWrite(CapturePolicy.KILL_TRANSIENT)
+        val writes = saveNow(be, CapturePolicy.KILL_TRANSIENT)
         helper.assertTrue(writes == 2, "the first save writes owner.bin and a generation but wrote $writes")
         val identity = be.identity!!
         val id = identity.id
         helper.assertTrue(Files.isRegularFile(store.generationFile(id, identity.generation)), "the generation file should exist")
         helper.assertTrue(Files.isRegularFile(store.directoryOf(id).resolve("owner.bin")), "owner.bin should exist")
-        helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) == 0, "a machine is captured only once while quiesced")
+        helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) == 0, "a machine is captured only once while quiesced")
         be.computer.endQuiesce()
 
         // /data get block・/clone・ピックブロックと同じ保存は印を動かさない
@@ -143,6 +144,8 @@ object MachineSaveGameTests {
         val abs = helper.absolutePos(CASE)
         val state = helper.level.getBlockState(abs)
         state.block.playerWillDestroy(helper.level, abs, state, player)
+        // 消すのは書き込みのスレッド（#84）
+        ServerMachines.drainSaves()
         helper.assertTrue(!Files.exists(store.directoryOf(id)), "a player breaking the case should delete its directory")
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
@@ -178,9 +181,10 @@ object MachineSaveGameTests {
             helper.assertTrue(tag != null && tag.contains(CaseBlockEntity.MACHINE_ID_TAG), "the saved chunk should have the case with an id: $tag")
             val id = UUID.fromString(tag!!.getString(CaseBlockEntity.MACHINE_ID_TAG))
             val generation = tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG)
-            helper.assertTrue(store.latestGeneration(id).asLong == generation, "the chunk should point at the latest generation")
+            // NBT は書き終わりを待たずに予約の世代を指す（#84 の規則 4）。書き終わった完了を受け取るまで待つ
+            helper.assertTrue(store.latestGeneration(id) == OptionalLong.of(generation), "the chunk should point at the latest generation")
             helper.assertTrue(Files.isRegularFile(store.generationFile(id, generation)), "the generation file should exist")
-            helper.assertTrue(store.chunkGeneration(id).asLong == generation, "the mark should follow the chunk save")
+            helper.assertTrue(store.chunkGeneration(id) == OptionalLong.of(generation), "the mark should follow the chunk save")
         }
     }
 
@@ -265,7 +269,7 @@ object MachineSaveGameTests {
         // onLoad（索引に入る）を待ってから取り出して書く
         helper.runAfterDelay(1) {
             be.computer.prepareUnload()
-            helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
             be.computer.endQuiesce()
             val id = be.identity!!.id
             helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "the save directory should exist")
@@ -273,6 +277,7 @@ object MachineSaveGameTests {
             level.explode(null, pos.x + 0.5, pos.y + 0.5, pos.z + 0.5, 4.0f, Level.ExplosionInteraction.BLOCK)
             level.setChunkForced(chunk.x, chunk.z, false)
             helper.assertTrue(level.getBlockEntity(pos) !is CaseBlockEntity, "the explosion should destroy the case")
+            ServerMachines.drainSaves()
             helper.assertTrue(!Files.exists(store.directoryOf(id)), "an exploded case should delete its directory")
             helper.succeed()
         }
