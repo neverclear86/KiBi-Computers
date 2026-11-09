@@ -150,6 +150,12 @@ public fun interface MachineSnapshotSource {
      * [id] は書いたファイルの UUID（振り直した後なら新しい UUID）
      */
     public fun committed(id: UUID, generation: Long) {}
+
+    /**
+     * 書き込み待ちの間に持つ写しの大きさの見積もり（バイト。#84。書き込み待ちのメモリの上限に使う）。
+     * [build] は書き込みのスレッドで呼ばれ、[committed] はメインスレッド（[MachineSaveStore.pollCompleted] の中）で呼ばれる
+     */
+    public val estimatedBytes: Long get() = 0
 }
 
 /**
@@ -169,14 +175,14 @@ public data class DeltaBase(
 )
 
 /**
- * 差分の写しの基準が、置き場の覚えている基準と合わない（#83。[MachineSaveStore.write] が何も書かずに投げる）。
- * [MachineSaveStore.captureAndWrite] は、全体の写しを取り直して書く
+ * 差分の写しの基準が、置き場の覚えている基準と合わない（#83。[MachineSaveStore.submit] が何も入れずに投げる）。
+ * [MachineSaveStore.captureAndSubmit] は、全体の写しを取り直して入れる
  */
 @ApiStatus.Internal
 public class DeltaBaseUnavailableException(message: String) : IOException(message)
 
 /**
- * 写しを取る（#83。[MachineSaveStore.captureAndWrite] が呼ぶ）
+ * 写しを取る（#83。[MachineSaveStore.captureAndSubmit] が呼ぶ）
  */
 @ApiStatus.Internal
 public fun interface SnapshotCapturer {
@@ -205,21 +211,84 @@ public class StoredSnapshot(
 }
 
 /**
- * [MachineSaveStore.captureAndWrite] の結果（#83）
+ * [MachineSaveStore.submit] で予約した書き込み（#84、ADR 0084）。
  *
- * @property write 書いた結果
- * @property captureNanos 取り出しにかかった時間（取り直したら、その分も足す）
- * @property retried 基準が使えず、全体を取り直して書いた
- * @property delta 差分の世代を書いた
+ * @property identity 書き込みが終われば NBT に書く値（世代は予約したもの。振り直したなら新しい UUID）
+ * @property reassigned 予約の時点の確かめで、新しい UUID に振り直した（`current` があって、持ち主が合わなかった）
+ * @property writes 書き込み（fsync）の回数の見積もり（新しい UUID の `owner.bin` を書くなら 2）
+ * @property estimatedBytes 書き込み待ちの写しの大きさの見積もり（バイト。[MachineSnapshotSource.estimatedBytes]）
+ * @property deltaBase 差分の世代なら指す基準
+ * @property tag 完了で返す呼び出し側の印（ケースなど）
  */
 @ApiStatus.Internal
-public class CaptureWriteResult(
-    public val write: WriteResult,
+public class PendingSave(
+    public val identity: MachineIdentity,
+    public val reassigned: Boolean,
+    public val writes: Int,
+    public val estimatedBytes: Long,
+    public val deltaBase: DeltaBase?,
+    public val tag: Any?,
+) {
+    override fun toString(): String = "PendingSave($identity, reassigned=$reassigned, writes=$writes, $estimatedBytes bytes, base=${deltaBase?.generation})"
+}
+
+/**
+ * 終わった書き込み（#84。[MachineSaveStore.pollCompleted] が返す）。[result] か [error] のどちらか。
+ * 走らせなかった仕事（閉じた後に入れた・使えない ID の後続）も [error] で返る。予約1つにつき、完了は必ず1つ返る
+ *
+ * @property pending 予約
+ * @property result 書けたときの結果
+ * @property error 書けなかったときの理由
+ */
+@ApiStatus.Internal
+public class SaveCompletion(
+    public val pending: PendingSave,
+    public val result: WriteResult?,
+    public val error: IOException?,
+) {
+    init {
+        require((result == null) != (error == null)) { "結果か理由のどちらか一方" }
+    }
+
+    /** 書けた */
+    public val succeeded: Boolean get() = result != null
+
+    override fun toString(): String = if (result != null) "SaveCompletion($result)" else "SaveCompletion(${pending.identity} failed: $error)"
+}
+
+/**
+ * [MachineSaveStore.captureAndSubmit] の結果（#84）
+ *
+ * @property pending 予約した書き込み
+ * @property captureNanos 取り出しにかかった時間（取り直したら、その分も足す）
+ * @property retried 基準が使えず、全体を取り直した
+ */
+@ApiStatus.Internal
+public class CaptureSubmitResult(
+    public val pending: PendingSave,
     public val captureNanos: Long,
     public val retried: Boolean,
-    public val delta: Boolean,
 ) {
-    override fun toString(): String = "CaptureWriteResult($write, capture=${captureNanos}ns, retried=$retried, delta=$delta)"
+    override fun toString(): String = "CaptureSubmitResult($pending, capture=${captureNanos}ns, retried=$retried)"
+}
+
+/**
+ * 書き込みの完了を、ケースの NBT に書く ID（[identity]）に採るか（#84、ADR 0084 の「完了の扱い」）。
+ *
+ * 1. [completed] の UUID が今の ID（[current]。書き込み中ならその予約の ID）と違えば採らない（壊した・登録し直した後の遅れた完了など）
+ * 2. そうでなく、[identity] が `null` か UUID が違えば（新しい台・振り直しの完了）、世代を比べずに採る
+ *    （振り直した UUID は世代 0 から始まるので、元の UUID の世代とは比べない）
+ * 3. そうでなく（同じ UUID）、世代が [identity] より大きいときだけ採る
+ *
+ * @param identity ケースが今 NBT に書く ID
+ * @param current ケースの今の ID（`予約中の ID ?: identity`）
+ * @param completed 書けた世代の ID
+ */
+@ApiStatus.Internal
+public fun adoptsCompletion(identity: MachineIdentity?, current: MachineIdentity?, completed: MachineIdentity): Boolean {
+    if (current == null || completed.id != current.id) return false
+    if (identity == null || identity.id != completed.id) return true
+    return completed.generation > identity.generation
 }
 
 /**
@@ -227,23 +296,28 @@ public class CaptureWriteResult(
  *
  * @property autosavePeriodTicks 自動保存の周期（tick）
  * @property autosaveQuiesceTicks 自動保存で、止めてから [SaveReadiness.READY] になるまで待つ上限（tick）
- * @property autosaveWritesPerTick 自動保存の tick ごとの書き込み（fsync）の回数の予算。`owner.bin` を書く台は 2 と数える。
- *   書き込みはメインスレッドで同期して行う（#84 で別スレッドに移す）ので、fsync 1 回の時間 × 予算が tick に足される。
- *   仮の値 1 は、fsync が約 20 ms かかるディスク（開発機で測った値。ADR 0081）でも 20 TPS を保てるように選んだ。
- *   1,000 台の一巡は、ID を振る初回で約 2,000 tick、2回目から約 1,000 tick（周期 6000 tick より短い）
+ * @property autosaveWritesPerTick 自動保存で tick ごとに書き込みに回す回数の予算。`owner.bin` を書く台は 2 と数える。
+ *   書き込み（符号化・圧縮・fsync）は書き込みのスレッドで行う（#84）ので、メインスレッドのコストは取り出しだけ。
+ *   仮の値 4（#84。確定は #251）。1,000 台の一巡は、ID を振る初回で約 500 tick、2回目から約 250 tick（周期 6000 tick より短い）
  * @property unloadWaitBudgetMillis チャンクのアンロードで、tick ごとに待機点を待つ時間の合計の上限
  * @property stopQuiesceMillis サーバーの停止で、全台が待機点に来るのを待つ上限
  * @property fullSaveChangedRatio 差分の世代を書く代わりに全体保存にする、「基準から変わった区画の数 ÷ 書き換えた区画の数」の境目（#83）。
  *   これを超えたら全体保存。仮の値 0.5（確定は #251）
+ * @property writerMaxPendingBytes 書き込み待ちの写しの見積もりの合計の上限（バイト。#84）。これ以上なら、自動保存は次の tick に回し、
+ *   アンロード・停止は書き込みのスレッドが進むのを待つ。仮の値 256 MiB（確定は #251）
+ * @property writerFlushMillis 書き込みのスレッドを待つ上限（ミリ秒。#84）: 停止の `flush`・スレッドの join、アンロード・停止の
+ *   メモリの上限の待ち（チャンク・停止全体で共有）、claim がその ID の仕事を待つ上限。仮の値 30 秒
  */
 @ApiStatus.Internal
 public data class MachineSaveConfig @JvmOverloads constructor(
     public val autosavePeriodTicks: Long = 6000,
     public val autosaveQuiesceTicks: Int = 4,
-    public val autosaveWritesPerTick: Int = 1,
+    public val autosaveWritesPerTick: Int = 4,
     public val unloadWaitBudgetMillis: Long = 50,
     public val stopQuiesceMillis: Long = 500,
     public val fullSaveChangedRatio: Double = DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    public val writerMaxPendingBytes: Long = DEFAULT_WRITER_MAX_PENDING_BYTES,
+    public val writerFlushMillis: Long = DEFAULT_WRITER_FLUSH_MILLIS,
 ) {
     init {
         require(autosavePeriodTicks > 0) { "自動保存の周期は 1 以上" }
@@ -252,11 +326,19 @@ public data class MachineSaveConfig @JvmOverloads constructor(
         require(unloadWaitBudgetMillis >= 0) { "アンロードの待ちの予算は 0 以上" }
         require(stopQuiesceMillis >= 0) { "停止の待ちは 0 以上" }
         require(fullSaveChangedRatio in 0.0..1.0) { "全体保存に切り替える比は 0 以上 1 以下" }
+        require(writerMaxPendingBytes > 0) { "書き込み待ちの上限は 1 以上" }
+        require(writerFlushMillis >= 0) { "書き込みのスレッドを待つ上限は 0 以上" }
     }
 
     public companion object {
         /** [fullSaveChangedRatio] の仮の既定値（#83。確定は #251） */
         public const val DEFAULT_FULL_SAVE_CHANGED_RATIO: Double = 0.5
+
+        /** [writerMaxPendingBytes] の仮の既定値（256 MiB。#84） */
+        public const val DEFAULT_WRITER_MAX_PENDING_BYTES: Long = 256L * 1024 * 1024
+
+        /** [writerFlushMillis] の仮の既定値（30 秒。#84） */
+        public const val DEFAULT_WRITER_FLUSH_MILLIS: Long = 30_000
 
         /** 仮の既定値 */
         @JvmField

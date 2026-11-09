@@ -31,6 +31,7 @@ import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.io.DataInputStream
@@ -124,7 +125,7 @@ object MachineSnapshotContentGameTests {
             // アンロードの手順と同じく止めてから取り出す
             be.computer.prepareUnload()
             try {
-                helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+                helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
                 val identity = be.identity!!
                 val snapshot = DataInputStream(Files.newInputStream(store!!.generationFile(identity.id, identity.generation)).buffered())
                     .use { MachineSnapshot.readFrom(it) }
@@ -235,7 +236,7 @@ object MachineSnapshotContentGameTests {
                 0 -> {
                     helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
                     // 1 回目: 全体（待機点にいない tick なら次の tick に）
-                    helper.assertTrue(be.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the first save should be written")
+                    helper.assertTrue(saveNow(be, CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the first save should be written")
                     first = be.identity!!
                     val snapshot = read(first!!)
                     helper.assertTrue(snapshot.deltaBase == null, "the first save should be full but was ${snapshot.deltaBase}")
@@ -246,7 +247,7 @@ object MachineSnapshotContentGameTests {
                 1 -> {
                     helper.assertTrue(text.any { it == "delta-one" }, "the shell should keep running after the full save: $text")
                     helper.assertTrue(text.last { it.isNotEmpty() } == "$", "the shell should wait for input: $text")
-                    helper.assertTrue(be.captureAndWrite(CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the second save should be written")
+                    helper.assertTrue(saveNow(be, CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the second save should be written")
                     val second = be.identity!!
                     val base = first!!
                     helper.assertTrue(second.id == base.id && second.generation == base.generation + 1, "same id, next generation: $base → $second")
@@ -268,10 +269,12 @@ object MachineSnapshotContentGameTests {
                     helper.assertTrue(store.markChunkGeneration(base.id, second.generation, owner) == ChunkMarkResult.ADVANCED, "the mark should advance")
                     var latest = second
                     repeat(3) {
-                        helper.assertTrue(be.captureAndWrite(CapturePolicy.KILL_TRANSIENT) > 0, "later saves should be written")
+                        helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "later saves should be written")
                         latest = be.identity!!
                         store.markChunkGeneration(latest.id, latest.generation, owner)
                     }
+                    // 刈り込みは書き込みのスレッドで走る（#84）
+                    ServerMachines.drainSaves()
                     helper.assertTrue(read(latest).deltaBase?.generation == base.generation, "later saves should stay deltas against the first")
                     helper.assertTrue(Files.exists(store.generationFile(base.id, base.generation)), "the base should be kept")
                     helper.assertTrue(!Files.exists(store.generationFile(base.id, second.generation)), "an old delta should be pruned")

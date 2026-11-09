@@ -13,6 +13,7 @@ import net.minecraft.world.entity.player.Player
 import net.minecraft.world.inventory.AbstractContainerMenu
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.chunk.LevelChunk
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -25,9 +26,11 @@ import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.PendingSave
+import pro.ikili.kibicomputers.core.persist.SaveCompletion
+import pro.ikili.kibicomputers.core.persist.adoptsCompletion
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
-import java.io.IOException
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
@@ -53,6 +56,10 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  *   アンロード・`setRemoved` で索引から外す
  * - 確定した ID があるときの [loadAdditional]（`/data merge` など）は、ID を変えない。読み込み済みで ID がまだなければ、その場で確かめる
  * - ID はマシンを初めて取り出すときに振る（電源を入れていないケースには振らない）
+ *
+ * 書き込みのスレッド（#84、ADR 0084）: 取り出した写しは書き込みに回し（[captureAndSubmit]。予約は [pendingSave]）、NBT に書く [identity] は、
+ * 書き込みの完了（[onSaveCompleted]）か、アンロードで予約の世代を採るとき（[adoptPendingSave]）にだけ進める。
+ * 書き込み中の「今の ID」は [currentIdentity]（予約の ID。なければ [identity]）で、次の予約・削除・索引の外しはこれを使う
  */
 class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     BlockEntity(KiBiBlocks.CASE_BLOCK_ENTITY.get(), pos, state), MenuProvider {
@@ -98,6 +105,20 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     var identity: MachineIdentity? = null
         private set
 
+    /**
+     * 書き込み中の最後の予約（#84）。完了を受け取って、それが最後の予約なら外す。書き込み中に次の予約をしたら置き換える
+     */
+    var pendingSave: PendingSave? = null
+        private set
+
+    /** 今の ID（書き込み中なら最後の予約の ID、なければ [identity]。#84 の規則 7c） */
+    val currentIdentity: MachineIdentity?
+        get() = pendingSave?.identity ?: identity
+
+    /** FULL でなくなったときのチャンク（#545・#84。書き込みの完了で `setUnsaved(true)` を付ける。FULL に戻っても同じもの） */
+    internal var demotedChunk: LevelChunk? = null
+        private set
+
     /** 最後の `claim` の判定（テスト・#85 用。まだなら `null`） */
     var lastClaim: ClaimResult? = null
         private set
@@ -119,8 +140,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick に `setChanged` する */
     private fun claimIdentity() {
-        // 先に取り出して ID が決まっていれば、それを使う（置いた直後の tick に取り出したときなど）
-        if (identity != null) return
+        // 先に取り出して ID が決まっていれば（書き込み中を含む）、それを使う（置いた直後の tick に取り出したときなど）
+        if (currentIdentity != null) return
         val store = WorldMachineSaves.current ?: return
         val self = owner ?: return
         val raw = rawId ?: return
@@ -131,77 +152,79 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (id == null || id.id.toString() != raw || id.generation != rawGeneration || id.epoch != rawEpoch) ServerMachines.markChangedLater(this)
     }
 
-    /** 索引から外す（自分を指しているときだけ） */
+    /** 索引から外す（自分を指しているときだけ。書き込み中なら予約の ID） */
     private fun leaveIndex() {
         if (!loadedOnServer) return
         loadedOnServer = false
-        val id = identity ?: return
+        val id = currentIdentity ?: return
         val self = owner ?: return
         WorldMachineSaves.current?.index?.removeIfOwner(id.id, self)
     }
 
     /**
-     * 動いているマシンの写しを取り、世代のファイルを書く（#81）。マシンがない・取り出し済み・[policy] が
-     * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら何もせず 0。ID がなければここで振る（`owner.bin` が書けなければ 0）。
-     * 書けたら [identity] が新しい世代を覚える（`setChanged`・`setUnsaved` は呼び出し側）。
-     * 取り出し・符号化・書き込みの時間と世代のファイルの大きさは [ServerMachines.Stats] に数える（負荷試験用。#553）。
-     * ID があれば、置き場の今の基準からの差分の世代を書く（#83。`MachineSaveStore.captureAndWrite`。基準が使えなければ全体を取り直す）
+     * 動いているマシンの写しを取り、世代のファイルの書き込みを予約して書き込みのスレッドに回す（#81・#84）。マシンがない・取り出し済み・
+     * [policy] が [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら何もせず `null`。ID がなければ置き場が振る（`owner.bin` も書き込みのスレッドで書く）。
+     * 今の ID（[currentIdentity]）があれば、置き場の今の基準からの差分の世代にする（#83。基準が使えなければ全体を取り直す）。
+     * [identity] は変えない（完了か [adoptPendingSave] で進む）。取り出しの時間は [ServerMachines.Stats] に数える（負荷試験用。#553）
      *
-     * @return 行った書き込み（fsync）の回数
-     * @throws IOException 世代のファイルが書けなかった
+     * @return 予約した書き込み（[PendingSave.writes] が書き込みの回数の見積もり）
      */
-    @Throws(IOException::class)
-    internal fun captureAndWrite(policy: CapturePolicy): Int {
-        val store = WorldMachineSaves.current ?: return 0
-        val self = owner ?: return 0
-        val known = identity
-        if (known != null) {
-            val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveChangedRatio)
-            val written = store.captureAndWrite(known, self, capturer)
-            // 取り出さなかった（取り出し済み・TRANSIENT で飛ばした）
-            if (written == null) return 0
-            ServerMachines.Stats.captureNanos += written.captureNanos
-            identity = written.write.identity
-            ServerMachines.Stats.recordSave(blockPos, written.captureNanos, written.write, 0, written.retried)
-            return written.write.writes
-        }
-        // ID がなければ、全体で取ってから振る（置き場は基準を知らない）
-        val captureStart = System.nanoTime()
-        val captured = computer.capture(policy)
-        val captureNanos = System.nanoTime() - captureStart
-        ServerMachines.Stats.captureNanos += captureNanos
-        val source = captured ?: return 0
-        var writes = 0
-        var ownerWriteNanos = 0L
-        val current = identity ?: run {
-            val start = System.nanoTime()
-            store.assignNewId(self).also { ownerWriteNanos = System.nanoTime() - start }
-        }?.also {
-            writes++
-            identity = it
-        }
-        ServerMachines.Stats.fileWriteNanos += ownerWriteNanos
-        if (current == null) {
-            LOGGER.warn("Could not assign an id to the machine at {}; skipping this save", self)
-            return 0
-        }
-        val result = store.write(current, self, source)
-        identity = result.identity
-        ServerMachines.Stats.recordSave(blockPos, captureNanos, result, ownerWriteNanos)
-        return writes + result.writes
+    internal fun captureAndSubmit(policy: CapturePolicy): PendingSave? {
+        val store = WorldMachineSaves.current ?: return null
+        val self = owner ?: return null
+        val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveChangedRatio)
+        val submitted = store.captureAndSubmit(currentIdentity, self, capturer, this) ?: return null
+        pendingSave = submitted.pending
+        ServerMachines.recordSubmit(submitted)
+        return submitted.pending
     }
 
-    /** 自動保存の書き込みの回数の見積もり（ID があれば 1、ID を振る台は 2） */
-    internal val plannedWrites: Int get() = if (identity == null) 2 else 1
-
-    /** プレイヤーの破壊・爆発: このマシンの保存データのディレクトリを消す（ほかの経路で消えたブロックのディレクトリは残る） */
-    internal fun deleteSaves() {
-        val id = identity ?: return
-        try {
-            WorldMachineSaves.current?.delete(id.id)
-        } catch (e: IOException) {
-            LOGGER.warn("Failed to delete the saves of machine {}", id.id, e)
+    /**
+     * 書き込みの完了を受け取る（#84。[ServerMachines] がメインスレッドで呼ぶ）。書けた世代を採るかは [adoptsCompletion] で決める。
+     * 書けなければ NBT は変えない（前の世代のまま）。最後の予約の完了なら [pendingSave] を外す
+     *
+     * @return [identity] を進めた（呼び出し側が `setChanged` する）
+     */
+    internal fun onSaveCompleted(completion: SaveCompletion): Boolean {
+        var adopted = false
+        val result = completion.result
+        if (result != null) {
+            if (adoptsCompletion(identity, currentIdentity, result.identity)) {
+                identity = result.identity
+                adopted = true
+            }
+        } else {
+            LOGGER.warn(
+                "Failed to save the computer at {} as {} (keeping the previous generation)", blockPos, completion.pending.identity, completion.error,
+            )
         }
+        if (pendingSave === completion.pending) pendingSave = null
+        return adopted
+    }
+
+    /**
+     * アンロード（#84 の規則 4）: 書き込み中の予約の世代を、終わる前に NBT に載せる（続く `ChunkMap.save` が書く）。
+     * 予約がなければ何もしない
+     *
+     * @return 採った
+     */
+    internal fun adoptPendingSave(): Boolean {
+        val pending = pendingSave ?: return false
+        if (identity == pending.identity) return false
+        identity = pending.identity
+        return true
+    }
+
+    /** 自動保存の書き込みの回数の見積もり（今の ID があれば 1、ID を振る台は 2） */
+    internal val plannedWrites: Int get() = if (currentIdentity == null) 2 else 1
+
+    /**
+     * プレイヤーの破壊・爆発: このマシンの保存データのディレクトリを消す（ほかの経路で消えたブロックのディレクトリは残る）。
+     * 書き込み中なら予約の ID を消す（消すのは書き込みの列の仕事で、書き込みの後に走る。#84 の規則 7）
+     */
+    internal fun deleteSaves() {
+        val id = currentIdentity ?: return
+        WorldMachineSaves.current?.delete(id.id)
     }
 
     /**
@@ -298,7 +321,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      * マシンを外して電源を切る（アンロードと同じ）。ブロックエンティティは残るので、ID の索引と、読み込まれたケースの一覧には残す。
      * チャンクが FULL に戻ったら、アンロードの後に読み込み直したのと同じく、電源が切れたまま
      */
-    internal fun chunkDemoted() {
+    internal fun chunkDemoted(chunk: LevelChunk) {
+        demotedChunk = chunk
         computer.chunkUnloaded()
         wiring.disconnect()
     }

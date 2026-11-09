@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
+import pro.ikili.kibicomputers.core.persist.AbiPayload
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
@@ -298,13 +299,29 @@ internal class WasiP1Driver(private val module: WasmModule) : SnapshotCapableDri
      */
     override fun captureAbi(rt: ProcessRuntime): ByteArray? = captureAbi(rt, StateCaptureMode.FULL)
 
-    override fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? {
+    override fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? = capturePayload(rt, mode)?.encode()
+
+    /**
+     * 写しだけを取り、符号化（区画の圧縮を含む）は [AbiPayload.encode]（書き込みのスレッド）に回す（#84）。
+     * インスタンスの状態（[pro.ikili.kibicomputers.core.runtime.WasmInstanceState]）は区画・グローバル・テーブルの写しを持ち、
+     * 非同期スタックは配列の写し、待ち（`AsyncWait`）は変わらない値なので、元のマシンが進んでも中身は変わらない
+     */
+    override fun capturePayload(rt: ProcessRuntime, mode: StateCaptureMode): AbiPayload? {
         if (rt.instances.size > 1) return null
         val instance = rt.instances.firstOrNull()?.captureState(mode)
         val process = rt.process
         val stack = process.asyncStack?.toLongArray() ?: LongArray(0)
         if (instance == null && stack.isNotEmpty()) return null
-        return P1SectionCodec.write(rt.program.moduleSource, rt.program.hash, instance, stack, process.asyncWait)
+        val source = rt.program.moduleSource
+        val hash = rt.program.hash
+        val wait = process.asyncWait
+        val chunkBytes = (instance?.writtenChunkCount ?: 0).toLong() * CHUNK_ESTIMATE
+        return P1Payload(chunkBytes + stack.size * 8L + OTHER_ESTIMATE) { P1SectionCodec.write(source, hash, instance, stack, wait) }
+    }
+
+    /** p1 の層の、符号化を後でする写し（#84） */
+    private class P1Payload(override val estimatedBytes: Long, private val write: () -> ByteArray) : AbiPayload {
+        override fun encode(): ByteArray = write()
     }
 
     /** 止まりうる import の入口と出口の処理（[configure] で作る） */
@@ -357,5 +374,11 @@ internal class WasiP1Driver(private val module: WasmModule) : SnapshotCapableDri
     companion object {
         /** コマンドの入口 */
         const val START: String = "_start"
+
+        /** 書き込み待ちの見積もり: 区画1つ（中身と番号） */
+        private const val CHUNK_ESTIMATE: Long = 4096L + 4
+
+        /** 書き込み待ちの見積もり: 区画のほか（モジュールの参照・グローバル・テーブルなど） */
+        private const val OTHER_ESTIMATE: Long = 1024
     }
 }

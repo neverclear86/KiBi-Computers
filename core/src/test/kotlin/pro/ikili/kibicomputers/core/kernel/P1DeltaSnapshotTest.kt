@@ -158,4 +158,65 @@ class P1DeltaSnapshotTest {
             m.stop()
         }
     }
+
+    /**
+     * 符号化（区画の圧縮）はロックの外（#84）: 取り出した写しを、元のマシンを進めた後で別のスレッドで符号化しても、
+     * 中身は取り出した時点のもの（取り出した直後に符号化したものと同じ）。写しの見積もりは区画の分を含む
+     */
+    @Test
+    fun `取り出した写しは元を進めた後に別のスレッドで符号化しても取り出した時点の中身`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val bytes = resource("prompt-wasi.wasm")
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/bin"))
+            val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
+            m.vfs.write(f, bytes, 0, bytes.size)
+            val (input, output) = m.lock.withLockValue {
+                ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
+            }
+            val out = StringBuilder()
+            fun drain(): String = m.lock.withLockValue {
+                val st = m.kernel.objects[output] as ByteStream
+                val buf = ByteArray(st.available)
+                st.read(buf, 0, buf.size, m.wakeSink)
+                out.append(String(buf, Charsets.UTF_8))
+                out.toString()
+            }
+            val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+            val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio))
+            var prompts = 0
+            fun awaitPrompt() {
+                prompts++
+                eventually(60_000, "プロンプトで待たない: ${drain()}") {
+                    h.scheduler.tick()
+                    drain().split("> ").size - 1 >= prompts && m.stateOf(pid) == ProcessState.WAITING_EVENT
+                }
+            }
+            awaitPrompt()
+            val id = UUID.randomUUID()
+            val later = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!
+            assertTrue(later.estimatedBytes >= 4096, "区画の分を見積もる: ${later.estimatedBytes}")
+            val now = bytesOf(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!.build(id, 1, "test"))
+
+            // 元のマシンを進める（行を読んでメモリを書き換え、また待つ）
+            m.lock.withLockValue {
+                val b = "hello snapshot\n".toByteArray()
+                (m.kernel.objects[input] as ByteStream).write(b, 0, b.size, m.wakeSink)
+            }
+            awaitPrompt()
+            val after = bytesOf(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!.build(id, 1, "test"))
+
+            var built: ByteArray? = null
+            val thread = Thread { built = bytesOf(later.build(id, 1, "test")) }
+            thread.start()
+            thread.join()
+            fun abiOf(data: ByteArray) = stored(data).snapshot.sections.single { it.kind == SnapshotSection.PROCESS_ABI }.payload
+            assertTrue(abiOf(now).contentEquals(abiOf(built!!)), "取り出した時点の中身")
+            assertFalse(abiOf(after).contentEquals(abiOf(now)), "元のマシンは進んでいる")
+
+            m.lock.withLockValue { (m.kernel.objects[input] as ByteStream).closeWrite(m.wakeSink) }
+            m.stop()
+        }
+    }
 }

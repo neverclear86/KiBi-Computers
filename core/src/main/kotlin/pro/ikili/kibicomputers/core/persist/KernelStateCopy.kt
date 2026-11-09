@@ -74,7 +74,7 @@ internal class KernelStateCopy private constructor(
      * ABI 層の写し1つ。[trackedFull] は、インスタンスの状態を全体の形で取り、そこから変わった区画を追い始めた
      * （`StateCaptureMode.FULL_AND_TRACK`。#83）
      */
-    class AbiCapture(val layer: Int, val layerVersion: Int, val payload: ByteArray, val trackedFull: Boolean = false)
+    class AbiCapture(val layer: Int, val layerVersion: Int, val payload: AbiPayload, val trackedFull: Boolean = false)
 
     /** 取り出しの番号（#83。`Machine` ごとに増える） */
     var token: Long = 0
@@ -170,7 +170,7 @@ internal class KernelStateCopy private constructor(
     }
 
     /** [pid] の ABI 層の写しを足す（`Machine.captureCopy` の②） */
-    fun putAbi(pid: Int, layer: Int, layerVersion: Int, payload: ByteArray, trackedFull: Boolean = false) {
+    fun putAbi(pid: Int, layer: Int, layerVersion: Int, payload: AbiPayload, trackedFull: Boolean = false) {
         require(layer in 0..0xFFFF && layerVersion in 0..0xFFFF) { "層の ID と版は u16" }
         abi[pid] = AbiCapture(layer, layerVersion, payload, trackedFull)
     }
@@ -185,6 +185,19 @@ internal class KernelStateCopy private constructor(
         paths[objectId] = path
     }
 
+    /**
+     * 書き込み待ちの間に持つ大きさの見積もり（バイト。#84）: ABI 層の写し（区画の数 × 4,096 + そのほか）と、`/tmp` の中身の塊の合計
+     */
+    val estimatedBytes: Long
+        get() {
+            var total = 0L
+            for (capture in abi.values) total += capture.payload.estimatedBytes
+            for (snapshot in tmpfs.values) {
+                for (node in snapshot.nodes) total += node.chunks?.sumOf { it.second.size.toLong() } ?: 0L
+            }
+            return total
+        }
+
     /** 中身（ABI 層・`/tmp`・パス）を捨てる（②で init を殺して冷えた起動になったとき。#82 の 12.） */
     fun discardContent() {
         abi.clear()
@@ -194,13 +207,17 @@ internal class KernelStateCopy private constructor(
 
     /**
      * 写しを保存データにする。冷えた起動の理由が `NONE` なら `KERNEL`・ABI 層ごとの `PROCESS_ABI`・`TMPFS` を書く。
-     * `NONE` でなければ `KILLED` 節だけ（#82 の 12.）。バイト列にするのは返したものの `build` の中（ロックの外）。
+     * `NONE` でなければ `KILLED` 節だけ（#82 の 12.）。バイト列にする（ABI 層の区画の圧縮を含む。#84）のは、
+     * 返したものの `build` の中（ロックの外。書き込みのスレッド）。
      * 差分の取り出しで冷えた起動でなければ、外枠の直後に `DELTA_BASE` 節を書く（#83）
      */
     fun toSource(): MachineSnapshotSource {
         val base = if (coldBootReason == ColdBootReason.NONE && !fullSave) deltaBase else null
+        val estimated = estimatedBytes
         return object : MachineSnapshotSource {
             override val deltaBase: DeltaBase? get() = base
+
+            override val estimatedBytes: Long get() = estimated
 
             override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot {
                 // 振り直した後（UUID が違う）の差分は書けない（置き場が DeltaBaseUnavailableException で止める）
@@ -219,11 +236,13 @@ internal class KernelStateCopy private constructor(
         if (coldBootReason == ColdBootReason.NONE) {
             sections += SnapshotSection.wrap(SnapshotSection.KERNEL, SnapshotSection.KERNEL_VERSION, KernelSectionCodec.write(this))
             for ((pid, capture) in abi) {
-                val out = SnapshotWriter(8 + capture.payload.size)
+                // 区画の圧縮は、ここ（書き込みのスレッド）で行う（#84）
+                val payload = capture.payload.encode()
+                val out = SnapshotWriter(8 + payload.size)
                 out.i32(pid)
                 out.u16(capture.layer)
                 out.u16(capture.layerVersion)
-                out.raw(capture.payload)
+                out.raw(payload)
                 sections += SnapshotSection.wrap(SnapshotSection.PROCESS_ABI, SnapshotSection.PROCESS_ABI_VERSION, out.toByteArray())
             }
             for ((mountId, snapshot) in tmpfs) {

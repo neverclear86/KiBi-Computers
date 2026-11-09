@@ -647,7 +647,7 @@ public class Machine private constructor(
                 null
             } else {
                 try {
-                    driver.captureAbi(rt, mode)
+                    driver.capturePayload(rt, mode)
                 } catch (e: Exception) {
                     LOG.log(System.Logger.Level.WARNING, "マシン $id の pid $pid の状態を取り出せない: $e")
                     null

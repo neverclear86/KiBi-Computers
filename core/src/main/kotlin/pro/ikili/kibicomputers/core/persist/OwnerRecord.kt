@@ -93,6 +93,20 @@ public data class OwnerRecord(
 }
 
 /**
+ * [dir] の中の `*.tmp`（書き込みの途中で落ちて残った一時ファイル）を消す（#84 の規則 8）。ディレクトリがなければ何もしない。
+ * 世代のファイル・`owner.bin` は消さない
+ */
+@Throws(IOException::class)
+internal fun deleteStaleTemps(dir: Path) {
+    if (!Files.isDirectory(dir)) return
+    Files.newDirectoryStream(dir, "*.tmp").use { stream ->
+        for (path in stream) {
+            if (Files.isRegularFile(path)) Files.deleteIfExists(path)
+        }
+    }
+}
+
+/**
  * [bytes] を `<file>.tmp` に書いて fsync し、`ATOMIC_MOVE` で [file] に置き換える（#81）。
  * 親のディレクトリがなければ作る。失敗したら tmp を消して [IOException]
  */
