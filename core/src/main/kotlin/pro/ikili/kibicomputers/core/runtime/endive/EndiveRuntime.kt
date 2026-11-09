@@ -911,7 +911,9 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         val droppedData = segments.indices.filter { i -> segments[i].bytes().isNotEmpty() && inst.dataSegmentData(i).isEmpty() }.toIntArray()
         val droppedElements = (0 until inst.elementCount()).filter { inst.element(it) == null }.toIntArray()
         parkAfter?.parkWritten()
-        return WasmInstanceState(pages, indices, data, globals, tables, droppedData, droppedElements, mode == StateCaptureMode.CHANGED)
+        // メモリがなければ、差分で取っても全体と同じ（区画がない）。全体の形で返す（#562。差分の形はメモリのある状態だけ）
+        val changedOnly = mode == StateCaptureMode.CHANGED && mem != null
+        return WasmInstanceState(pages, indices, data, globals, tables, droppedData, droppedElements, changedOnly)
     }
 
     /** 作ったばかりのインスタンスに、保存した状態 [state] を上書きする（#82）。合わなければ [WasmLinkException] */

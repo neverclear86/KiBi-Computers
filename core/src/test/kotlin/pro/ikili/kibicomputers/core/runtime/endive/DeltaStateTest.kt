@@ -251,6 +251,32 @@ class DeltaStateTest {
     }
 
     @Test
+    fun `メモリのないインスタンスは、全体の後にCHANGEDで取っても全体の形で、書いて読み直せる（#562）`() {
+        val b = WasmBinary()
+        val g = b.mutableI64Global(0)
+        b.exportFunc("inc", b.func(emptyList(), emptyList(), code(0x23, g, 0x42, 1, 0x7c, 0x24, g)))
+        EndiveRuntime().load(b.build()).instantiate(WasmInstanceConfig.builder().writtenMemoryLimit(64, Budget()).build()).use { inst ->
+            assertTrue(inst.tracksChanges)
+            val full = inst.captureState(StateCaptureMode.FULL_AND_TRACK)
+            assertEquals(-1, full.memoryPages)
+            assertFalse(full.changedOnly)
+            inst.call("inc")
+            val changed = inst.captureState(StateCaptureMode.CHANGED)
+            assertEquals(-1, changed.memoryPages)
+            assertFalse(changed.changedOnly, "メモリがなければ差分の形にしない")
+            assertEquals(listOf(WasmInstanceState.GlobalValue(0, WasmValueType.I64, 1)), changed.globals)
+            assertSameState(changed, roundTrip(changed))
+        }
+        // メモリのない差分の形は作れず、メモリのない基準とは合成しない
+        assertThrows<IllegalArgumentException> {
+            WasmInstanceState(-1, IntArray(0), emptyList(), emptyList(), emptyList(), IntArray(0), IntArray(0), true)
+        }
+        val noMemory = WasmInstanceState(-1, IntArray(0), emptyList(), emptyList(), emptyList(), IntArray(0), IntArray(0))
+        val delta = WasmInstanceState(1, IntArray(0), emptyList(), emptyList(), emptyList(), IntArray(0), IntArray(0), true)
+        assertThrows<SnapshotFormatException> { InstanceStateMerge.merge(noMemory, delta, 100) }
+    }
+
+    @Test
     fun `性質、乱数で書きながら全体→差分→…と取り出すと、基準と差分の合成が同じ時点の全体と一致する`() {
         val random = Random(83)
         instance(pages = 4).use { inst ->

@@ -5,6 +5,12 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
+import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.process.BaseRef
 import pro.ikili.kibicomputers.core.kernel.process.MemoryBase
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -12,11 +18,23 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.MachineSnapshot
+import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.core.persist.SnapshotInspection
+import pro.ikili.kibicomputers.core.persist.StoredSnapshot
 import pro.ikili.kibicomputers.core.runtime.FakeInstance
 import pro.ikili.kibicomputers.core.runtime.MemoryChunkCounts
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.time.Duration
 import java.util.UUID
+import java.util.zip.CRC32C
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -206,6 +224,75 @@ class MachineDeltaCaptureTest {
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             m.lock.withLockValue { m.rt(a.pid).instances.set(0, original) }
             replacement.close()
+            gate.open()
+            m.stop()
+        }
+    }
+
+    /** 待ちは [inner] に任せ、層の中身は本物の p1 の層（[WasiP1Driver]）で取る */
+    private class P1LayerDriver(private val inner: TestDriver, private val p1: WasiP1Driver) : SnapshotCapableDriver {
+        val modes: MutableList<StateCaptureMode> = java.util.concurrent.CopyOnWriteArrayList()
+
+        override val kind: ProcessKind get() = inner.kind
+
+        override val abiLayer: Int get() = p1.abiLayer
+
+        override val abiLayerVersion: Int get() = p1.abiLayerVersion
+
+        override fun captureAbi(rt: ProcessRuntime): ByteArray? = captureAbi(rt, StateCaptureMode.FULL)
+
+        override fun captureAbi(rt: ProcessRuntime, mode: StateCaptureMode): ByteArray? {
+            modes += mode
+            return p1.captureAbi(rt, mode)
+        }
+
+        override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) = inner.configure(ctx, builder)
+
+        override fun start(ctx: ProcessContext): StepResult = inner.start(ctx)
+
+        override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult = inner.resume(ctx, ready)
+    }
+
+    private fun bytesOf(snapshot: MachineSnapshot): ByteArray =
+        ByteArrayOutputStream().also { out -> DataOutputStream(out).use { snapshot.writeTo(it) } }.toByteArray()
+
+    private fun stored(bytes: ByteArray): StoredSnapshot = StoredSnapshot(
+        MachineSnapshot.readFrom(DataInputStream(bytes.inputStream())),
+        bytes.size.toLong(),
+        CRC32C().also { it.update(bytes) }.value.toInt(),
+    )
+
+    @Test
+    fun `線形メモリのないp1のプロセスは、全体の後の差分の写しでも殺されず、基準と合わせて読み直せる（#562）`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            // 線形メモリのない、本物のランタイムのモジュール（可変のグローバルだけ）
+            val bytes = WasmBinary().apply { mutableI64Global(7) }.build()
+            val program = Program.load(EndiveRuntime(), bytes)
+            h.moduleStore.put(ModuleStore.sha256(bytes), bytes)
+            val driver = P1LayerDriver(gated(gate, kind = ProcessKind.WAIT_POINT), WasiP1Driver(program.module))
+            val pid = m.spawnTest(program, driver, unmetered = true)
+            h.tickUntilTrue { m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            assertTrue(m.rt(pid).instances.first().tracksChanges)
+
+            val id = UUID.randomUUID()
+            val full = m.captureCopy(policy)!!
+            assertEquals(emptyList<Int>(), full.killedPids)
+            assertEquals(StateCaptureMode.FULL_AND_TRACK, driver.modes.last())
+            val baseBytes = bytesOf(full.toSource().build(id, 1, "test"))
+            full.toSource().committed(id, 1)
+            assertTrue(m.isCommitted(pid, id, 1))
+            val base = stored(baseBytes)
+
+            val delta = m.captureCopy(policy, base.asDeltaBase(), 1.0)!!
+            assertEquals(StateCaptureMode.CHANGED, driver.modes.last())
+            assertEquals(emptyList<Int>(), delta.killedPids, "差分の写しの中で殺さない")
+            val snapshot = delta.toSource().build(id, 2, "test")
+            assertEquals(base.asDeltaBase(), snapshot.deltaBase)
+            val read = MachineSnapshot.readFrom(DataInputStream(bytesOf(snapshot).inputStream()))
+            val contents = SnapshotInspection.inspect(read, 64, m.config.memoryPages, base)
+            assertEquals(listOf(pid), contents.processes.map { it.pid })
             gate.open()
             m.stop()
         }

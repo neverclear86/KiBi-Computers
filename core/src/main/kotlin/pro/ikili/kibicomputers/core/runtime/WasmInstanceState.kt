@@ -13,7 +13,8 @@ import org.jetbrains.annotations.ApiStatus
  *
  * @property memoryPages 線形メモリのページ数。メモリがなければ -1
  * @property changedOnly 区画は基準（最後の全体保存）から変わったものだけ（#83。[StateCaptureMode.CHANGED]）。
- *   このままでは戻せず、基準と合成する（`InstanceStateMerge`）
+ *   このままでは戻せず、基準と合成する（`InstanceStateMerge`）。メモリのない状態（[memoryPages] が -1）は差分にならない
+ *   （区画がないので、差分で取っても全体と同じ。#562）
  */
 @ApiStatus.Internal
 public class WasmInstanceState @JvmOverloads constructor(
@@ -39,6 +40,7 @@ public class WasmInstanceState @JvmOverloads constructor(
 
     init {
         require(memoryPages >= -1) { "ページ数は -1 以上（$memoryPages）" }
+        require(!changedOnly || memoryPages >= 0) { "メモリのない状態に差分の形はない" }
         require(chunkIndices.size == chunkData.size) { "区画の番号と中身の数が合わない" }
         for (i in chunkIndices.indices) {
             require(chunkData[i].size == CHUNK_BYTES) { "区画は $CHUNK_BYTES バイト" }
@@ -135,7 +137,10 @@ public enum class StateCaptureMode {
     /** 書き換えた区画すべてを取り、それを基準にして、ここから変わった区画を追い始める（全体保存） */
     FULL_AND_TRACK,
 
-    /** 最後の [FULL_AND_TRACK] から変わった区画だけ（[WasmInstanceState.changedOnly]）。追跡は変えない */
+    /**
+     * 最後の [FULL_AND_TRACK] から変わった区画だけ（[WasmInstanceState.changedOnly]）。追跡は変えない。
+     * メモリがなければ全体の形（`changedOnly` が偽）で返る（#562）
+     */
     CHANGED,
 }
 
