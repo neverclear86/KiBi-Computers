@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
@@ -247,6 +248,86 @@ object MachineSaveGameTests {
         level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
         level.setChunkForced(chunk.x, chunk.z, false)
         level.setChunkForced(keeper.x, keeper.z, false)
+    }
+
+    /**
+     * ADR 0084 の規則 5（#567）: FULL でなくなったチャンクには `setChanged` が届かないので、書き終わった完了を受け取ったときに
+     * そのチャンクへ unsaved を付ける。前の世代をディスクのチャンクに置いてから、書き込みのスレッドを止めたまま FULL でなくし、
+     * 完了を受け取る前は付かず（世代も進まない）、受け取った後に付くことを確かめる。そのままアンロードすると、
+     * ディスクのチャンクの NBT と印が新しい世代を指す（付け忘れると前の世代のまま）。
+     * 書き込みのスレッドを tick をまたいで止めるので、ほかのテストと同じバッチにしない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "demoted_chunk_unsaved")
+    fun demotedChunkIsMarkedUnsavedOnCompletion(helper: GameTestHelper) {
+        val store = store(helper)
+        val level = helper.level
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 800, helper.absolutePos(CASE).z / 16)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 4, 200, chunk.minBlockZ + 11)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        // onLoad（追跡と索引）を待ってから、前の世代を書いてディスクのチャンクに載せる
+        helper.runAfterDelay(1) {
+            be.computer.prepareUnload()
+            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+            be.computer.endQuiesce()
+            val first = be.identity!!
+            level.chunkSource.save(true)
+            helper.assertTrue(diskGeneration(helper, chunk, pos) == first.generation, "the chunk on disk should point at ${first.generation}")
+
+            // FULL でなくすと、取り出した書き込みが書き込みのスレッドで止まる（受け取るまで tick をまたぐ）
+            val gate = WriterGate()
+            level.setChunkForced(chunk.x, chunk.z, false)
+            var pending: PendingSave? = null
+            helper.startSequence().thenWaitUntil {
+                helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
+                helper.assertTrue(be.computer.machine == null, "the machine should be stopped but was ${be.computer}")
+            }.thenExecute {
+                val demoted = be.demotedChunk!!
+                try {
+                    helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
+                    helper.assertTrue(!be.isRemoved, "the chunk should stay in memory")
+                    pending = be.pendingSave
+                    helper.assertTrue(pending != null, "the demotion should leave a pending save")
+                    helper.assertTrue(be.identity == first, "the identity should not advance before the write but was ${be.identity}")
+                    // 取り出す前に付いた印（setBlock など）を外し、完了を受け取る前は付かないことを見る
+                    demoted.isUnsaved = false
+                    ServerMachines.processCompletions()
+                    helper.assertTrue(!demoted.isUnsaved, "the chunk should not be unsaved before the completion")
+                    helper.assertTrue(be.identity == first, "nothing should complete while the writer is held")
+                } finally {
+                    gate.close()
+                }
+                ServerMachines.drainSaves()
+                helper.assertTrue(be.identity == pending!!.identity, "the completion should advance to ${pending!!.identity} but was ${be.identity}")
+                helper.assertTrue(demoted.isUnsaved, "the completion should mark the demoted chunk unsaved")
+                // そのままアンロードする（ケースはマシンを持たないので、アンロードの手順は何もしない）
+                level.setChunkForced(keeper.x, keeper.z, false)
+            }.thenWaitUntil {
+                helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
+                val identity = pending!!.identity
+                val generation = diskGeneration(helper, chunk, pos)
+                helper.assertTrue(generation == identity.generation, "the chunk on disk should point at ${identity.generation} but was $generation")
+                helper.assertTrue(store.chunkGeneration(identity.id) == OptionalLong.of(identity.generation), "the mark should follow the chunk save")
+            }.thenSucceed()
+        }
+    }
+
+    /** ディスク（書き込み待ちを含む）のチャンク [chunk] の NBT で、[pos] のケースのタグが指す世代 */
+    private fun diskGeneration(helper: GameTestHelper, chunk: ChunkPos, pos: BlockPos): Long {
+        val data = helper.level.chunkSource.chunkMap.read(chunk).join().orElse(null)
+        helper.assertTrue(data != null, "the chunk should be on disk")
+        val tag = data!!.getList("block_entities", Tag.TAG_COMPOUND.toInt()).map { it as CompoundTag }
+            .firstOrNull { it.getInt("x") == pos.x && it.getInt("y") == pos.y && it.getInt("z") == pos.z }
+        helper.assertTrue(tag != null && tag.contains(CaseBlockEntity.SAVE_GENERATION_TAG), "the saved chunk should have the case with a generation: $tag")
+        return tag!!.getLong(CaseBlockEntity.SAVE_GENERATION_TAG)
     }
 
     /**
