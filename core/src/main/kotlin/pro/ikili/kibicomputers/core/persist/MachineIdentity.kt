@@ -89,14 +89,24 @@ public class Claim(
  * @property identity 書いた後の ID（世代は書いた世代）
  * @property reassigned 書く前の確かめで、新しい UUID に振り直した
  * @property writes 実際に行った書き込み（fsync）の回数（世代ファイル 1 回 + 振り直した `owner.bin` の回数）
+ * @property encodeNanos 符号化（[MachineSnapshotSource.build] と、バイト列にするところ）にかかった時間（ナノ秒。負荷試験用。#553）
+ * @property fileWriteNanos ファイルの書き込み（世代ファイルと、振り直した `owner.bin` の tmp → fsync → rename）にかかった時間（ナノ秒。#553）
+ * @property fileBytes 書いた世代のファイルの大きさ（バイト）
+ * @property tmpfsBytes 世代のファイルの `TMPFS` 節の中身の大きさの合計（バイト。節の見出しは数えない）
  */
 @ApiStatus.Internal
 public class WriteResult(
     public val identity: MachineIdentity,
     public val reassigned: Boolean,
     public val writes: Int,
+    public val encodeNanos: Long = 0,
+    public val fileWriteNanos: Long = 0,
+    public val fileBytes: Int = 0,
+    public val tmpfsBytes: Int = 0,
 ) {
-    override fun toString(): String = "WriteResult($identity, reassigned=$reassigned, writes=$writes)"
+    override fun toString(): String =
+        "WriteResult($identity, reassigned=$reassigned, writes=$writes, encode=${encodeNanos}ns, fileWrite=${fileWriteNanos}ns, " +
+            "$fileBytes bytes, tmpfs $tmpfsBytes bytes)"
 }
 
 /** [MachineSaveStore.markChunkGeneration] の結果（#81） */

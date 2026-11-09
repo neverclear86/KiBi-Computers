@@ -164,10 +164,13 @@ public class MachineSaveStore @JvmOverloads constructor(
         var identity = current
         var writes = 0
         var reassigned = false
+        var fileWriteNanos = 0L
         val record = owners[current.id]
         val mismatch = record == null || record.owner != self || record.epoch != current.epoch
         if (mismatch || nextGeneration(current) > MachineIdentityLimits.MAX_COUNTER) {
+            val ownerStart = System.nanoTime()
             val fresh = assignNewId(self) ?: throw IOException("owner.bin for a new id at $self cannot be written")
+            fileWriteNanos += System.nanoTime() - ownerStart
             LOG.log(
                 System.Logger.Level.WARNING,
                 "Machine ${current.id} at $self does not match its owner.bin (${record?.owner}, epoch ${record?.epoch} vs ${current.epoch}) " +
@@ -179,12 +182,19 @@ public class MachineSaveStore @JvmOverloads constructor(
             reassigned = true
         }
         val generation = nextGeneration(identity)
+        val encodeStart = System.nanoTime()
+        val built = snapshot.build(identity.id, generation, modVersion)
         val bytes = ByteArrayOutputStream(256)
-        DataOutputStream(bytes).use { out -> snapshot.build(identity.id, generation, modVersion).writeTo(out) }
-        writeAtomically(generationFile(identity.id, generation), bytes.toByteArray())
+        DataOutputStream(bytes).use { out -> built.writeTo(out) }
+        val data = bytes.toByteArray()
+        val encodeNanos = System.nanoTime() - encodeStart
+        val tmpfsBytes = built.sections.sumOf { if (it.kind == SnapshotSection.TMPFS) it.size else 0 }
+        val writeStart = System.nanoTime()
+        writeAtomically(generationFile(identity.id, generation), data)
+        fileWriteNanos += System.nanoTime() - writeStart
         latest[identity.id] = generation
         writes++
-        return WriteResult(identity.copy(generation = generation), reassigned, writes)
+        return WriteResult(identity.copy(generation = generation), reassigned, writes, encodeNanos, fileWriteNanos, data.size, tmpfsBytes)
     }
 
     private fun nextGeneration(identity: MachineIdentity): Long = maxOf(identity.generation, latest[identity.id] ?: -1L) + 1

@@ -133,6 +133,9 @@ object LoadGameTests {
                 // 強制読み込みを外したら、ケースのあるチャンクが全部アンロードされる（#540）
                 val unload = report.unload!!
                 helper.assertTrue(unload.stillLoaded == 0, "all chunks with cases should unload after the force loading is removed: $unload")
+                // アンロードの tick は、書き込みを除いても、チャンクのアンロードそのものと待機点を待つ時間（unloadWaitBudgetMillis）を含み、
+                // CI の 100 台は 1 tick に全部が来る（#84 の基準）。取り出し・符号化の時間（unload.cost）は表に出すだけで検査しない（#553）
+                helper.assertTrue(unload.cost.saves.toLong() == unload.captures, "every unload capture should be recorded: $unload")
             }
             val boot = report.phase(LoadPhase.BOOT)
             val idle = report.phase(LoadPhase.IDLE)
@@ -142,11 +145,20 @@ object LoadGameTests {
             // 自動保存（#81、ADR 0081）: 書き込み（fsync）を除く tick が TPS を落とさず、1 tick の書き込みは予算 + 1 以下で、
             // 一巡が回数の予算どおりの tick に収まる。書き込みはメインスレッドで同期して fsync する（#84 まで）ので、
             // 壁時計の平均（autosave.tick）はディスクに左右される（fsync が詰まると 50 ms を超えうる）。表に出すだけで検査しない
+            // 書き込みを除く tick は、取り出し（captureCopy）と符号化を含む（#553）
             helper.assertTrue(
                 cycle.tickExcludingWrites.avg < CI_MAX_AVG_TICK_MILLIS,
-                "ticks during an autosave cycle, excluding the writes, should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: " +
-                    "${cycle.tickExcludingWrites} (wall clock: ${autosave.tick})",
+                "ticks during an autosave cycle, excluding the file writes, should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: " +
+                    "${cycle.tickExcludingWrites} (wall clock: ${autosave.tick}, ${cycle.cost})",
             )
+            // /tmp に書かせた台は、書いた中身を TMPFS 節に持つ。ほかの台の TMPFS 節は空の /tmp の分だけ（#553）
+            val cost = cycle.cost
+            helper.assertTrue(cost.saves > 0 && cost.fileBytesP50 > 0, "the autosave should write generation files: $cost")
+            helper.assertTrue(
+                cost.tmpWriters == CI_BUSY && cost.tmpWriterTmpfsMin >= os.tmpBytes,
+                "the $CI_BUSY machines that wrote ${os.tmpBytes} bytes to /tmp should save them in the TMPFS section: $cost",
+            )
+            helper.assertTrue(cost.otherTmpfsMax < os.tmpBytes, "machines with an empty /tmp should have a small TMPFS section: $cost")
             val saveConfig = ServerMachines.saveConfig
             val budget = saveConfig.autosaveWritesPerTick
             helper.assertTrue(cycle.maxTickWrites <= budget + 1, "an autosave tick should write at most ${budget + 1} times: $cycle")

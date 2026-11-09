@@ -35,6 +35,7 @@ import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
+import pro.ikili.kibicomputers.core.persist.WriteResult
 import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -146,14 +147,39 @@ object ServerMachines {
         /** 終わった自動保存の周期の、一巡にかかった tick 数（古い順） */
         val autosaveCycleTicks: MutableList<Int> = ArrayList()
 
-        /**
-         * この tick の自動保存の書き込み（取り出して書く。fsync を含む）にかかった時間（ナノ秒）。tick の始めに 0 にする。
-         * 負荷試験は、tick の時間からこれを引いて「書き込みを除く MSPT」を出す（fsync の時間はディスクに左右されるため）
-         */
-        var autosaveTickWriteNanos: Long = 0
-
-        /** 自動保存の書き込みにかかった時間の合計（ナノ秒） */
+        /** 自動保存の書き込み（取り出して書く。fsync を含む）にかかった時間の合計（ナノ秒） */
         var autosaveWriteNanos: Long = 0
+
+        /**
+         * 保存（自動保存・アンロード・停止。`CaseBlockEntity.captureAndWrite`）で、取り出し（`captureCopy`。カーネルロックの中）に
+         * かかった時間の合計（ナノ秒。#553）。取り出さずに終わった（TRANSIENT で飛ばした）分も入る
+         */
+        var captureNanos: Long = 0
+
+        /** 保存で、符号化（写しを保存データのバイト列にする）にかかった時間の合計（ナノ秒。#553） */
+        var encodeNanos: Long = 0
+
+        /**
+         * 保存で、ファイルの書き込み（tmp → fsync → rename。世代ファイルと `owner.bin`）にかかった時間の合計（ナノ秒。#553）。
+         * 負荷試験は、tick ごとの増分を tick の時間から引いて「書き込みを除く MSPT」（取り出し・符号化は含む）を出す
+         * （fsync の時間はディスクに左右されるため）
+         */
+        var fileWriteNanos: Long = 0
+
+        /** 世代のファイルを書くたびに [saves] に1件残すか（負荷試験が有効にする。ふだんは残さない） */
+        var recordSaves: Boolean = false
+
+        /** 世代のファイルを書いた1回ごとの記録（[recordSaves] のときだけ。古い順） */
+        val saves: MutableList<SaveSample> = ArrayList()
+
+        /** 世代のファイルを1つ書いた（`CaseBlockEntity.captureAndWrite` から） */
+        fun recordSave(pos: BlockPos, captureNanos: Long, result: WriteResult, ownerWriteNanos: Long) {
+            encodeNanos += result.encodeNanos
+            fileWriteNanos += result.fileWriteNanos
+            if (recordSaves) {
+                saves += SaveSample(pos, captureNanos, result.encodeNanos, result.fileWriteNanos + ownerWriteNanos, result.fileBytes, result.tmpfsBytes)
+            }
+        }
 
         fun reset() {
             unloadEventsWithCases = 0
@@ -165,10 +191,32 @@ object ServerMachines {
             autosaveWritten = 0
             autosaveSkipped = 0
             autosaveCycleTicks.clear()
-            autosaveTickWriteNanos = 0
             autosaveWriteNanos = 0
+            captureNanos = 0
+            encodeNanos = 0
+            fileWriteNanos = 0
+            saves.clear()
         }
     }
+
+    /**
+     * 世代のファイルを1つ書いた記録（負荷試験用。#553）。
+     *
+     * @property pos ケースの位置
+     * @property captureNanos 取り出し（`captureCopy`）の時間
+     * @property encodeNanos 符号化の時間
+     * @property fileWriteNanos ファイルの書き込み（fsync を含む。ID を振った `owner.bin` も）の時間
+     * @property fileBytes 世代のファイルの大きさ
+     * @property tmpfsBytes `TMPFS` 節の中身の大きさ
+     */
+    internal data class SaveSample(
+        val pos: BlockPos,
+        val captureNanos: Long,
+        val encodeNanos: Long,
+        val fileWriteNanos: Long,
+        val fileBytes: Int,
+        val tmpfsBytes: Int,
+    )
 
     /** NeoForge のイベントバスに登録する。MOD の初期化で1回だけ呼ぶ。 */
     fun register() {
@@ -235,7 +283,6 @@ object ServerMachines {
     private fun onServerTick(event: ServerTickEvent.Pre) {
         manager?.tick()
         unloadWaitedNanos = 0
-        Stats.autosaveTickWriteNanos = 0
         if (changedLater.isNotEmpty()) {
             val list = changedLater.toList()
             changedLater.clear()
@@ -278,9 +325,7 @@ object ServerMachines {
                 LOGGER.warn("Failed to save the computer at {} (keeping the previous generation)", machine.blockPos, e)
                 planned
             } finally {
-                val spent = System.nanoTime() - start
-                Stats.autosaveTickWriteNanos += spent
-                Stats.autosaveWriteNanos += spent
+                Stats.autosaveWriteNanos += System.nanoTime() - start
             }
         }
     }
