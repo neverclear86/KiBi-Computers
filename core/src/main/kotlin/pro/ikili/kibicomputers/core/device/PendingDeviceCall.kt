@@ -68,6 +68,9 @@ internal class PendingDeviceCall(state: State) : KernelObject() {
         is State.Done -> Snapshot.Done(s.result)
     }
 
+    /** 写し（#82）。実行中のものは [snapshot] と同じく `failed("interrupted")` にする */
+    override fun copyForSnapshot(): KernelObject = restore(snapshot())
+
     override fun toString(): String = "PendingDeviceCall($id, $state)"
 
     companion object {

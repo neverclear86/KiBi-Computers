@@ -32,10 +32,14 @@ class FdPollTest {
     private val limit = Duration.ofSeconds(30)
 
     /** 待てない種類 */
-    private class Opaque : KernelObject()
+    private class Opaque : KernelObject() {
+        override fun copyForSnapshot(): KernelObject = Opaque()
+    }
 
     /** READABLE だけ待てて、[ready] のときにそろう種類 */
     private class Flag(var ready: Boolean) : KernelObject() {
+        override fun copyForSnapshot(): KernelObject = Flag(ready)
+
         override fun canWait(condition: WaitCondition): Boolean = condition == READABLE
 
         override fun isReady(condition: WaitCondition): Boolean = condition == READABLE && ready

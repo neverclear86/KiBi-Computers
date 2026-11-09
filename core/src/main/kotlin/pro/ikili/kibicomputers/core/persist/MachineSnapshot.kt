@@ -13,17 +13,19 @@ import java.util.UUID
 /**
  * 保存データの節（#81、ADR 0081）。「種類（u16）・節の版（u16）・長さ（u32）・中身」。
  *
- * 中身の形は種類ごとに決める（`KERNEL`・`PROCESS_ABI` の中身は #82）。
+ * 中身の形は種類ごとに決める（`KERNEL`・`PROCESS_ABI`・`TMPFS` の中身は #82、ADR 0082）。
  */
 @ApiStatus.Internal
-public class SnapshotSection(
+public class SnapshotSection private constructor(
     /** 種類（[KERNEL] など。0〜65535） */
     public val kind: Int,
     /** 節の版（0〜65535） */
     public val version: Int,
-    payload: ByteArray,
+    private val bytes: ByteArray,
+    @Suppress("UNUSED_PARAMETER") owned: Boolean,
 ) {
-    private val bytes = payload.copyOf()
+    /** 中身 [payload] を写して持つ節を作る */
+    public constructor(kind: Int, version: Int, payload: ByteArray) : this(kind, version, payload.copyOf(), true)
 
     init {
         require(kind in 0..0xFFFF) { "節の種類は u16（$kind）" }
@@ -35,6 +37,9 @@ public class SnapshotSection(
 
     /** 中身の長さ */
     public val size: Int get() = bytes.size
+
+    /** 中身を写さずに渡す（読む側が変えないこと。#82 の符号化・復号で配列を何度も写さないため） */
+    internal fun payloadUnsafe(): ByteArray = bytes
 
     internal fun writeTo(out: DataOutput) {
         out.writeShort(kind)
@@ -55,8 +60,33 @@ public class SnapshotSection(
         /** 写しの中で殺した pid の一覧（u32 の個数 + i32 の並び）と、冷えた起動が要る理由（u8） */
         public const val KILLED: Int = 3
 
+        /** `/tmp` のマウントごとの中身（#82、ADR 0082。先頭にマウントの ID（i32）） */
+        public const val TMPFS: Int = 4
+
         /** [KILLED] 節の版 */
         public const val KILLED_VERSION: Int = 1
+
+        /** [KERNEL] 節の版 */
+        public const val KERNEL_VERSION: Int = 1
+
+        /** [PROCESS_ABI] 節の版（外側の形。層の中身の版は層ごと） */
+        public const val PROCESS_ABI_VERSION: Int = 1
+
+        /** [TMPFS] 節の版 */
+        public const val TMPFS_VERSION: Int = 1
+
+        /** ABI 層の ID: テスト用（予約。本物の層には使わない。読む側は知らない層として拒む） */
+        public const val ABI_LAYER_TEST: Int = 0
+
+        /** ABI 層の ID: WASI p1 */
+        public const val ABI_LAYER_P1: Int = 1
+
+        /** p1 の層の中身の版 */
+        public const val P1_LAYER_VERSION: Int = 1
+
+        /** 渡した配列をそのまま持つ節を作る（呼び出し側はその後で配列を変えない） */
+        @JvmSynthetic
+        internal fun wrap(kind: Int, version: Int, payload: ByteArray): SnapshotSection = SnapshotSection(kind, version, payload, true)
     }
 }
 
@@ -173,7 +203,7 @@ public class MachineSnapshot @JvmOverloads constructor(
                     continue
                 }
                 // 知らない節・版の違う KILLED 節は、中身をそのまま持つ（読み飛ばす）
-                if (kind != SnapshotSection.KILLED) sections += SnapshotSection(kind, sectionVersion, payload)
+                if (kind != SnapshotSection.KILLED) sections += SnapshotSection.wrap(kind, sectionVersion, payload)
             }
             // KILLED 節がない・読めないなら、冷えた起動が要る側に倒す
             val code = if (coldBoot < 0) UNREADABLE_KILLED_CODE else coldBoot

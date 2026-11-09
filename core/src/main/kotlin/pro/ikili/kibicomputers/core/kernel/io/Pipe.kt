@@ -24,6 +24,8 @@ internal class PipeEnd(
     /** 待ちは中身の ID で受ける（この端の ID では待たない） */
     override fun canWait(condition: WaitCondition): Boolean = false
 
+    override fun copyForSnapshot(): KernelObject = PipeEnd(streamId, reading)
+
     override fun releaseReferences(objects: ObjectTable, sink: WakeSink) {
         val stream = objects[streamId] as? ByteStream ?: return
         if (reading) stream.closeRead(sink) else stream.closeWrite(sink)

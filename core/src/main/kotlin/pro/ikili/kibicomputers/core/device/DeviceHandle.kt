@@ -13,6 +13,8 @@ internal class DeviceHandle(val address: String, val kind: String) : KernelObjec
     /** 保存の写しを取る */
     fun snapshot(): Snapshot = Snapshot(address, kind)
 
+    override fun copyForSnapshot(): KernelObject = DeviceHandle(address, kind)
+
     override fun toString(): String = "DeviceHandle($id, $address, $kind)"
 
     companion object {

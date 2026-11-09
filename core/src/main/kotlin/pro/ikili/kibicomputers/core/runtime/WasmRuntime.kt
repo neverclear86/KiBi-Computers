@@ -61,6 +61,18 @@ public interface WasmModule {
      */
     @Throws(WasmLinkException::class, WasmLoadException::class, WasmTrapException::class)
     public fun instantiate(config: WasmInstanceConfig): WasmInstance
+
+    /**
+     * 保存した状態 [state] からインスタンスを作り直す（#82、ADR 0082。戻すのは #85）。能動データセグメント（ROM の区画）と
+     * 要素セグメントの初期化はするが、start 関数は動かさない。その後でメモリの大きさ・書き換えた区画・可変のグローバル・テーブル・
+     * drop 済みのセグメントを上書きする。書き換えた区画はメモリの数える相手で1つずつ数え直し、断られたら [WasmLinkException]。
+     * 既定は対応していない（[WasmLinkException]）
+     *
+     * @throws WasmLinkException import が足りない、状態がモジュールに合わない、RAM が足りない、start 関数を飛ばせない
+     */
+    @Throws(WasmLinkException::class, WasmLoadException::class)
+    public fun instantiateForRestore(config: WasmInstanceConfig, state: WasmInstanceState): WasmInstance =
+        throw WasmLinkException("このランタイムは状態からインスタンスを作れない")
 }
 
 /** モジュールのインスタンス。線形メモリ・グローバル・テーブルなど、実行の状態を持つ。 */
@@ -103,6 +115,13 @@ public interface WasmInstance : AutoCloseable {
      */
     @Throws(WasmTrapException::class)
     public fun call(name: String, vararg args: Long): LongArray
+
+    /**
+     * 実行の状態を取り出す（#82、ADR 0082）。呼び出しの中でないとき（待機点）だけ呼ぶ。区画の中身は写す。
+     * 取り出せない作り（v128 のグローバルなど）なら [WasmStateException]。既定は対応していない（[WasmStateException]）
+     */
+    @Throws(WasmStateException::class)
+    public fun captureState(): WasmInstanceState = throw WasmStateException("このランタイムは状態を取り出せない")
 
     /** インスタンスを捨てる。以後 [call] は [IllegalStateException] になる。2回呼んでもよい。 */
     override fun close()

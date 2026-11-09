@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmImportDescriptor
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
@@ -18,6 +19,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmStateException
 import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
@@ -47,6 +49,7 @@ import run.endive.wasm.types.FunctionType
 import run.endive.wasm.types.GlobalImport
 import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.MemoryLimits
+import run.endive.wasm.types.MutabilityType
 import run.endive.wasm.types.Table
 import run.endive.wasm.types.TableLimits
 import run.endive.wasm.types.ValType
@@ -442,6 +445,9 @@ internal fun isCompiled(module: WasmModule): Boolean = (module as? EndiveWasmMod
 /** コンパイルした [module] のうち、インタプリタで動かす関数の番号（import を含めた番号。#424。テスト用） */
 internal fun interpretedFunctions(module: WasmModule): Set<Int> = (module as? EndiveWasmModule)?.interpretedFunctions ?: emptySet()
 
+/** テーブルの空の要素（Endive の `Value.REF_NULL_VALUE`） */
+private const val REF_NULL: Int = -1
+
 /** 戻り値のないホストの関数の戻り値 */
 private val NO_VALUES = LongArray(0)
 
@@ -697,6 +703,29 @@ private class EndiveWasmModule(
         return wrapper
     }
 
+    /**
+     * 保存した状態からインスタンスを作り直す（#82、ADR 0082）。start セクションを持つモジュールは、start 関数を飛ばして作れない
+     * （Endive は初期化の中で必ず動かす）ので [WasmLinkException]（取り出す側の [EndiveWasmInstance.captureState] も断る）。
+     * ほかは普通に作り（能動データセグメント・要素セグメントの初期化）、その後で状態を上書きする
+     */
+    @Throws(WasmLinkException::class, WasmLoadException::class)
+    override fun instantiateForRestore(config: WasmInstanceConfig, state: WasmInstanceState): WasmInstance {
+        if (module.startSection().isPresent) throw WasmLinkException("start 関数を持つモジュールは、状態から作り直せない")
+        val instance = try {
+            instantiate(config) as EndiveWasmInstance
+        } catch (e: WasmTrapException) {
+            throw WasmLinkException("インスタンスを作れない: ${e.message}", e)
+        }
+        try {
+            instance.restoreState(state)
+        } catch (t: Throwable) {
+            instance.close()
+            if (t is WasmLinkException) throw t
+            throw WasmLinkException("保存した状態を戻せない: ${t.message ?: t}", t)
+        }
+        return instance
+    }
+
     /** インスタンスを作るときの例外を、この抽象の例外にして投げる。 */
     private fun translateInstantiateFailure(e: Throwable): Nothing {
         hostThrowable(e)?.let { throw it }
@@ -799,6 +828,120 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
             rethrow(e)
         }
         return result ?: LongArray(0)
+    }
+
+    @Throws(WasmStateException::class)
+    override fun captureState(): WasmInstanceState {
+        val inst = instance()
+        val mod = module.module
+        if (mod.startSection().isPresent) throw WasmStateException("start 関数を持つモジュールは、状態から作り直せない")
+        // 線形メモリ（0 番）: 書き換えた区画だけ
+        var pages = -1
+        var indices = IntArray(0)
+        var data: List<ByteArray> = emptyList()
+        val mem = memoryWrapper
+        if (mem != null) {
+            val raw = (mem as EndiveWasmMemory).raw
+            pages = raw.pages()
+            if (raw is WrittenPagesMemory) {
+                val (i, d) = raw.writtenChunkSnapshot()
+                indices = i
+                data = d
+            } else {
+                // 区画で数えないメモリ（テストの設定）: 0 でない区画をすべて書き換えた区画として扱う
+                val list = ArrayList<Int>()
+                val bytes = ArrayList<ByteArray>()
+                val count = pages * WasmInstanceState.CHUNKS_PER_PAGE
+                for (c in 0 until count) {
+                    val chunk = raw.readBytes(c * WasmInstanceState.CHUNK_BYTES, WasmInstanceState.CHUNK_BYTES)
+                    if (chunk.any { it != 0.toByte() }) {
+                        list += c
+                        bytes += chunk
+                    }
+                }
+                indices = list.toIntArray()
+                data = bytes
+            }
+        }
+        // 可変のグローバル（モジュールが定義したもの。グローバルの import はランタイムが断る）
+        if (mod.importSection().count(ExternalType.GLOBAL) > 0) throw WasmStateException("グローバルの import を持つモジュール")
+        val globals = ArrayList<WasmInstanceState.GlobalValue>()
+        mod.globalSection().globals().forEachIndexed { i, g ->
+            if (g.mutabilityType() != MutabilityType.Var) return@forEachIndexed
+            val type = valueType(g.valueType())
+            if (type == WasmValueType.UNSUPPORTED) throw WasmStateException("取り出せない型の可変のグローバル $i（${g.valueType()}）")
+            globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
+        }
+        // テーブル（funcref だけ。ほかのインスタンスの関数は指せない）
+        if (mod.importSection().count(ExternalType.TABLE) > 0) throw WasmStateException("テーブルの import を持つモジュール")
+        val tables = ArrayList<WasmInstanceState.TableState>()
+        for (t in 0 until mod.tableSection().tableCount()) {
+            val table = inst.table(t)
+            if (table.elementType().isObjectRef()) throw WasmStateException("取り出せない型のテーブル $t（${table.elementType()}）")
+            val refs = IntArray(table.size()) { j ->
+                val ref = table.ref(j)
+                val owner = table.instance(j)
+                if (ref != REF_NULL && owner != null && owner !== inst) throw WasmStateException("テーブル $t の要素 $j がほかのインスタンスの関数を指す")
+                ref
+            }
+            tables += WasmInstanceState.TableState(t, refs)
+        }
+        // drop 済みのセグメント（Endive は drop したデータを空の並びに、要素を null にする）
+        val segments = mod.dataSection().dataSegments()
+        val droppedData = segments.indices.filter { i -> segments[i].bytes().isNotEmpty() && inst.dataSegmentData(i).isEmpty() }.toIntArray()
+        val droppedElements = (0 until inst.elementCount()).filter { inst.element(it) == null }.toIntArray()
+        return WasmInstanceState(pages, indices, data, globals, tables, droppedData, droppedElements)
+    }
+
+    /** 作ったばかりのインスタンスに、保存した状態 [state] を上書きする（#82）。合わなければ [WasmLinkException] */
+    fun restoreState(state: WasmInstanceState) {
+        val inst = instance()
+        val mod = module.module
+        // メモリ
+        val mem = memoryWrapper
+        if ((mem == null) != (state.memoryPages < 0)) throw WasmLinkException("保存した状態とメモリの有無が合わない")
+        if (mem != null) {
+            val raw = (mem as EndiveWasmMemory).raw
+            if (raw is WrittenPagesMemory) {
+                if (!raw.restorePages(state.memoryPages)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（今 ${raw.pages()}）")
+                state.forEachChunk { index, bytes ->
+                    if (!raw.restoreChunk(index, bytes)) throw WasmLinkException("メモリの区画 $index を戻せない（RAM が足りない）")
+                }
+            } else {
+                val delta = state.memoryPages - raw.pages()
+                if (delta < 0 || (delta > 0 && mem.grow(delta) < 0)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない")
+                state.forEachChunk { index, bytes -> raw.write(index * WasmInstanceState.CHUNK_BYTES, bytes, 0, bytes.size) }
+            }
+        }
+        // グローバル
+        val defined = mod.globalSection().globals()
+        for (g in state.globals) {
+            val decl = defined.getOrNull(g.index) ?: throw WasmLinkException("グローバル ${g.index} がない")
+            if (decl.mutabilityType() != MutabilityType.Var || valueType(decl.valueType()) != g.type) throw WasmLinkException("グローバル ${g.index} の型が合わない")
+            inst.global(g.index).setValue(g.bits)
+        }
+        // テーブル
+        val functions = inst.functionCount()
+        for (t in state.tables) {
+            if (t.index >= mod.tableSection().tableCount()) throw WasmLinkException("テーブル ${t.index} がない")
+            val table = inst.table(t.index)
+            val delta = t.size - table.size()
+            if (delta < 0 || (delta > 0 && table.grow(delta, REF_NULL, inst) < 0)) throw WasmLinkException("テーブル ${t.index} を ${t.size} 要素に戻せない")
+            for (j in 0 until t.size) {
+                val ref = t.element(j)
+                if (ref != REF_NULL && (ref < 0 || ref >= functions)) throw WasmLinkException("テーブル ${t.index} の要素 $j の関数 $ref がない")
+                table.setRef(j, ref, if (ref == REF_NULL) null else inst)
+            }
+        }
+        val dataCount = mod.dataSection().dataSegments().size
+        for (i in state.droppedDataSegments) {
+            if (i < 0 || i >= dataCount) throw WasmLinkException("データセグメント $i がない")
+            inst.dropDataSegment(i)
+        }
+        for (i in state.droppedElementSegments) {
+            if (i < 0 || i >= inst.elementCount()) throw WasmLinkException("要素セグメント $i がない")
+            inst.setElement(i, null)
+        }
     }
 
     override fun close() {

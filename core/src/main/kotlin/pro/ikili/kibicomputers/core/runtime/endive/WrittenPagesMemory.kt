@@ -231,6 +231,62 @@ internal class WrittenPagesMemory(
         return true
     }
 
+    /**
+     * 書き換えた区画（読み取り専用でない区画。数えた区画と同じ）の番号（昇順）と中身の写し（#82）。
+     * 待機点（WASM が動いていないとき）で呼ぶ
+     */
+    @Synchronized
+    fun writtenChunkSnapshot(): Pair<IntArray, List<ByteArray>> {
+        val table = chunks
+        val indices = ArrayList<Int>()
+        val data = ArrayList<ByteArray>()
+        for (i in table.indices) {
+            val chunk = table[i] ?: continue
+            if (chunk.isReadOnly) continue
+            indices += i
+            data += chunk.array().copyOf()
+        }
+        return indices.toIntArray() to data
+    }
+
+    /**
+     * 大きさを [pages] に戻す（#82。保存した状態からインスタンスを作り直すとき）。`memory.grow` と違い、端の区画を数えない
+     * （区画は [restoreChunk] で1つずつ数える）。縮められない・上限を超えるなら `false`
+     */
+    @Synchronized
+    fun restorePages(pages: Int): Boolean {
+        if (pages < nPages || pages > maximumPages()) return false
+        if (pages == nPages) return true
+        val old = chunks
+        val fresh = arrayOfNulls<ByteBuffer>(pages * CHUNKS_PER_PAGE)
+        System.arraycopy(old, 0, fresh, 0, old.size)
+        java.util.Arrays.fill(fresh, old.size, fresh.size, ZERO_CHUNK)
+        chunks = fresh
+        nPages = pages
+        return true
+    }
+
+    /**
+     * 区画 [index] を、中身 [data]（[CHUNK_SIZE] バイト）の書き換えた区画として戻す（#82）。RAM に 4 KiB を数え、
+     * 断られたら何もせずに `false`。範囲外なら [IllegalArgumentException]
+     */
+    @Synchronized
+    fun restoreChunk(index: Int, data: ByteArray): Boolean {
+        require(data.size == CHUNK_SIZE) { "区画は $CHUNK_SIZE バイト" }
+        val table = chunks
+        require(index in table.indices) { "区画 $index はメモリの外" }
+        val current = table[index]!!
+        if (current.isReadOnly) {
+            val counted = !released
+            if (counted && budget != null && !budget.tryReserveBytes(CHUNK_SIZE.toLong())) return false
+            if (counted) writtenChunks++
+        }
+        val fresh = newChunk()
+        System.arraycopy(data, 0, fresh.array(), 0, CHUNK_SIZE)
+        table[index] = fresh
+        return true
+    }
+
     /** 数えた分をすべて返す。以後は数えない（閉じたインスタンスのメモリ）。2回呼んでもよい */
     @Synchronized
     fun releaseAll() {

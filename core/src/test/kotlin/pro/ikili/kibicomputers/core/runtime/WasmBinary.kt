@@ -16,7 +16,9 @@ class WasmBinary {
     private val functionLocals = mutableListOf<List<Int>>()
     private val exports = mutableListOf<Triple<String, Int, Int>>()
     private val globals = mutableListOf<ByteArray>()
-    private val data = mutableListOf<Pair<Int, ByteArray>>()
+    private val data = mutableListOf<ByteArray>()
+    private var passiveData = false
+    private val elements = mutableListOf<ByteArray>()
     private var memoryPages: Int? = null
     private var tableSize: Int? = null
     private var start: Int? = null
@@ -76,7 +78,22 @@ class WasmBinary {
         return index
     }
 
-    fun data(offset: Int, bytes: ByteArray) = apply { data += offset to bytes }
+    fun data(offset: Int, bytes: ByteArray) = apply {
+        data += byteArrayOf(0x00, 0x41) + sleb(offset.toLong()) + byteArrayOf(0x0b) + uleb(bytes.size.toLong()) + bytes
+    }
+
+    /** パッシブなデータセグメントを足して、データセグメントの番号を返す（データの数のセクションも出す） */
+    fun passiveData(bytes: ByteArray): Int {
+        data += byteArrayOf(0x01) + uleb(bytes.size.toLong()) + bytes
+        passiveData = true
+        return data.size - 1
+    }
+
+    /** テーブル 0 の [offset] からの能動な要素セグメントを足して、要素セグメントの番号を返す */
+    fun elem(offset: Int, funcs: List<Int>): Int {
+        elements += byteArrayOf(0x00, 0x41) + sleb(offset.toLong()) + byteArrayOf(0x0b) + vec(funcs.map { uleb(it.toLong()) })
+        return elements.size - 1
+    }
 
     fun start(index: Int) = apply { start = index }
 
@@ -93,6 +110,8 @@ class WasmBinary {
         if (globals.isNotEmpty()) section(out, 6, vec(globals))
         if (exports.isNotEmpty()) section(out, 7, vec(exports.map { (n, k, i) -> name(n) + byteArrayOf(k.toByte()) + uleb(i.toLong()) }))
         start?.let { section(out, 8, uleb(it.toLong())) }
+        if (elements.isNotEmpty()) section(out, 9, vec(elements))
+        if (passiveData) section(out, 12, uleb(data.size.toLong()))
         if (functions.isNotEmpty()) {
             section(
                 out,
@@ -107,7 +126,7 @@ class WasmBinary {
             )
         }
         if (data.isNotEmpty()) {
-            section(out, 11, vec(data.map { (offset, bytes) -> byteArrayOf(0x00, 0x41) + sleb(offset.toLong()) + byteArrayOf(0x0b) + uleb(bytes.size.toLong()) + bytes }))
+            section(out, 11, vec(data))
         }
         return out.toByteArray()
     }

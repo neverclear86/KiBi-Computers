@@ -126,6 +126,11 @@ internal class Process(
     var handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
         private set
 
+    /** 保存データから読んだハンドル表を入れる（#82） */
+    fun restoreHandles(table: HandleTable<HandleEntry>) {
+        handles = table
+    }
+
     /**
      * 全欄を写した別のインスタンス（保存の写し。#81、ADR 0081）。fd 表・一時的なタイマー・無視するシグナル・退避した値は作り直し、
      * 不変のもの（`wait` のリスト、`asyncWait`、引数・環境変数）は共有する。元を変えても写しは変わらない

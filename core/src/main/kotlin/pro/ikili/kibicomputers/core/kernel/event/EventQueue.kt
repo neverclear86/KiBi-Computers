@@ -77,6 +77,19 @@ internal class EventQueue(
 
     override fun isReady(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE && (size > 0 || dropped > 0)
 
+    /** 溜めているイベント（古い順の写し。保存用。#82） */
+    fun pendingEvents(): List<KernelEvent> = events?.toList() ?: emptyList()
+
+    override fun copyForSnapshot(): KernelObject = EventQueue(filter, capacity).also { it.restoreState(pendingEvents(), dropped) }
+
+    /** 保存した値を入れる（#82。作ったばかりのキューに）。[pendingBytes] は中身から求め直す（ADR 0063） */
+    fun restoreState(events: List<KernelEvent>, dropped: Long) {
+        require(events.size <= capacity && dropped >= 0) { "イベントの数か捨てた数が不正" }
+        this.events = if (events.isEmpty()) null else ArrayDeque(events)
+        pendingBytes = events.sumOf { it.footprint }
+        this.dropped = dropped
+    }
+
     /** [event] を入れる。満杯なら捨てて [dropped] を数え、`false`。どちらでも `(id, READABLE)` を知らせる */
     fun offer(event: KernelEvent, sink: WakeSink): Boolean {
         val ok = size < capacity

@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
@@ -101,6 +102,9 @@ public class MachineScheduler private constructor(
 
     /** タイマーの期限を待つ口（#64、ADR 0064。既定はスレッド `KiBi-timer` 1本） */
     internal val timerService: TimerService = options.timers ?: ExecutorTimerService(TIMER_STACK_BYTES)
+
+    /** 待機点保存が指すモジュールの置き場（#82） */
+    internal val moduleStore: ModuleStore = options.moduleStore ?: config.moduleStore
 
     private val pauseLock = ReentrantLock()
     private val pauseCondition = pauseLock.newCondition()
@@ -348,6 +352,8 @@ internal class SchedulerInternals(
     val moduleLimits: ModuleLimits? = ModuleLimits.DEFAULT,
     /** タイマーの期限を待つ口（テストでは時計を手で進めるもの）。`null` なら [ExecutorTimerService] */
     val timers: TimerService? = null,
+    /** モジュールの置き場（#82。テストのメモリ上のもの）。`null` なら [SchedulerConfig.moduleStore] */
+    val moduleStore: ModuleStore? = null,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */
@@ -397,6 +403,12 @@ public class SchedulerConfig private constructor(builder: Builder) {
      */
     public val totalMemoryBytes: Long = builder.totalMemoryBytes ?: defaultTotalMemoryBytes()
 
+    /**
+     * 待機点保存が指すモジュールの置き場（#82。ワールドごと。接続層が `FileModuleStore` を渡す）。
+     * 既定は [ModuleStore.NONE]（置き場なし。プロセスは保存できない）
+     */
+    public val moduleStore: ModuleStore = builder.moduleStore
+
     /** [SchedulerConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
@@ -406,6 +418,7 @@ public class SchedulerConfig private constructor(builder: Builder) {
         internal var programCacheEntries: Int = 32
         internal var programCacheBytes: Long = 32L * 1024 * 1024
         internal var totalMemoryBytes: Long? = null
+        internal var moduleStore: ModuleStore = ModuleStore.NONE
 
         /** 同時に WASM を実行するマシンの数の上限（1 以上） */
         public fun maxConcurrentMachines(value: Int): Builder = apply {
@@ -448,6 +461,9 @@ public class SchedulerConfig private constructor(builder: Builder) {
             require(value >= 0) { "totalMemoryBytes は 0 以上" }
             totalMemoryBytes = value
         }
+
+        /** 待機点保存が指すモジュールの置き場（#82） */
+        public fun moduleStore(value: ModuleStore): Builder = apply { moduleStore = value }
 
         /** 設定を作る。 */
         public fun build(): SchedulerConfig = SchedulerConfig(this)

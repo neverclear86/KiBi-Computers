@@ -59,6 +59,11 @@ internal class ByteStream(val capacity: Int) : KernelObject() {
     /** 確保しているバッファの大きさ（テスト用） */
     internal val allocatedBytes: Int get() = buffer?.size ?: 0
 
+    /** 読めるバイトの写し（先頭に詰める。保存用。#82） */
+    fun availableBytes(): ByteArray = buffer?.copyOfRange(head, head + available) ?: ByteArray(0)
+
+    override fun copyForSnapshot(): KernelObject = restore(capacity, readClosed, writeClosed, availableBytes())
+
     override fun canWait(condition: WaitCondition): Boolean = condition == WaitCondition.READABLE || condition == WaitCondition.WRITABLE
 
     override fun isReady(condition: WaitCondition): Boolean = when (condition) {
@@ -142,8 +147,21 @@ internal class ByteStream(val capacity: Int) : KernelObject() {
         head = 0
     }
 
-    private companion object {
+    companion object {
         /** 最初に確保する大きさ（仮の値） */
-        const val INITIAL_BUFFER = 256
+        private const val INITIAL_BUFFER = 256
+
+        /** 保存した値から作る（#82）。[bytes] は読めるバイト（[capacity] 以下） */
+        fun restore(capacity: Int, readClosed: Boolean, writeClosed: Boolean, bytes: ByteArray): ByteStream {
+            require(bytes.size <= capacity) { "読めるバイトが容量を超える" }
+            return ByteStream(capacity).also {
+                if (bytes.isNotEmpty()) {
+                    it.buffer = bytes.copyOf()
+                    it.available = bytes.size
+                }
+                it.readClosed = readClosed
+                it.writeClosed = writeClosed
+            }
+        }
     }
 }

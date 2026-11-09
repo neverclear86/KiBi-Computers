@@ -52,7 +52,8 @@ internal data class DirEntry(val name: String, val type: FileType, val node: Lon
  * - 呼ばれるのは、マシンのカーネルロックの**外**（#52。ADR 0051・0052）。同じマシンのいくつものスレッド（プロセスのスレッド、
  *   起動用のスレッド）から同時に呼ばれるので、ファイルシステムが自分で排他する。自分の I/O と自分の排他のほかに待たない
  *   （ほかのマシン・メインスレッド・カーネルロックを待たない）
- * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted]・[isTerminal] だけ。この4つは I/O をせず、すぐ返す
+ * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted]・[isTerminal]・[pathHint] だけ。この5つは I/O をせず、
+ *   自分のロックも長く待たずに、すぐ返す
  */
 internal interface FileSystem {
     /** 書けないファイルシステムか（書く操作の前に VFS が `ROFS` にする） */
@@ -122,6 +123,13 @@ internal interface FileSystem {
      * （`FdTable.openFile`）。カーネルロックの中から呼ばれるので、I/O をしない。既定は `false`
      */
     fun isTerminal(node: Long): Boolean = false
+
+    /**
+     * [node] の今のパスの目安（このファイルシステムの根から）。保存の写しで、開いたファイルをパスで引き直せるように控える（#82。ADR 0082）。
+     * カーネルロックの中から呼ばれるので、I/O をせず、ホストの I/O の間持たれるロックを取らない。分からなければ `null`（既定）。
+     * 古いパスを返すことがある（戻すときに見つからなければ、その fd は `STALE`）
+     */
+    fun pathHint(node: Long): VfsPath? = null
 
     /** [node] の中身を記憶装置へ書き出す（既定は何もしない） */
     fun sync(node: Long) {}

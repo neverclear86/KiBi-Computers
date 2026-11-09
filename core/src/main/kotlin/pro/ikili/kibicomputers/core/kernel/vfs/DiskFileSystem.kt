@@ -69,6 +69,12 @@ internal class DiskFileSystem private constructor(
     /** `poll` の目安（[sizeHint]。ロックなしで読む） */
     private val sizes = ConcurrentHashMap<Long, Long>()
 
+    /**
+     * node → ディスクの根からの名前の並び（[pathHint]。ロックなしで読む。#82）。[nodes] を変える所で一緒に変える。
+     * 並びは変えない `List` を入れ替える（読む側が途中の並びを見ない）
+     */
+    private val paths = ConcurrentHashMap<Long, List<String>>()
+
     @Volatile
     private var revoked = false
 
@@ -88,6 +94,7 @@ internal class DiskFileSystem private constructor(
     init {
         byKey[""] = ROOT_NODE
         nodes[ROOT_NODE] = NodeInfo(FileType.DIRECTORY, emptyList())
+        paths[ROOT_NODE] = emptyList()
     }
 
     override val tracksOpenFiles: Boolean get() = true
@@ -95,8 +102,15 @@ internal class DiskFileSystem private constructor(
     /** 開いたままのホストのファイルの数（テスト用） */
     val openHandles: Int get() = lease.lock.withLock { handles.size }
 
-    /** node の今のパス（ディスクの根から。#82 で、開いたファイルの node → パスを保存するときに使う）。知らない node は `null` */
-    fun pathOf(node: Long): VfsPath? = lease.lock.withLock { nodes[node]?.let { info -> info.segments.fold(VfsPath.ROOT) { p, n -> p.child(n) } } }
+    /** node の今のパス（ディスクの根から。テスト用。保存は [pathHint] を使う）。知らない node は `null` */
+    fun pathOf(node: Long): VfsPath? = lease.lock.withLock { pathHint(node) }
+
+    /**
+     * node の今のパスの目安（ディスクの根から。#82 で、開いたファイルの node → パスを保存するときに使う）。知らない node は `null`。
+     * カーネルロックの中から呼ばれるので、[lease] のロックを取らない（ホストの I/O の間ずっと持たれるため。ADR 0082）。
+     * 名前の変更と同時に読むと、古いパスのことがある
+     */
+    override fun pathHint(node: Long): VfsPath? = paths[node]?.fold(VfsPath.ROOT) { p, n -> p.child(n) }
 
     // ---- パスの操作 ----
 
@@ -394,6 +408,7 @@ internal class DiskFileSystem private constructor(
             val info = nodes[existing]!!
             if (info.type == type) {
                 info.segments = segments
+                paths[existing] = segments
                 return existing
             }
             // 外で別の種類に置き換えられた
@@ -403,12 +418,14 @@ internal class DiskFileSystem private constructor(
         val node = nextNode++
         byKey[k] = node
         nodes[node] = NodeInfo(type, segments)
+        paths[node] = segments
         return node
     }
 
     /** node を表から外す（ディレクトリなら、その下も） */
     private fun forget(node: Long) {
         val info = nodes.remove(node) ?: return
+        paths.remove(node)
         val k = key(info.segments)
         byKey.remove(k)
         sizes.remove(node)
@@ -418,6 +435,7 @@ internal class DiskFileSystem private constructor(
             for (e in below) {
                 byKey.remove(e.key)
                 nodes.remove(e.value)
+                paths.remove(e.value)
                 sizes.remove(e.value)
                 closeHandle(e.value)
             }
@@ -433,6 +451,7 @@ internal class DiskFileSystem private constructor(
         for ((_, node) in moved) {
             val info = nodes[node] ?: continue
             info.segments = to + info.segments.drop(from.size)
+            paths[node] = info.segments
             byKey[key(info.segments)] = node
         }
     }

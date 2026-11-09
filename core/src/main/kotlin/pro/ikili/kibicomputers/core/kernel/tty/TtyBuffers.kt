@@ -73,6 +73,15 @@ internal class TtyBytes(private val limit: Int) {
         length = 0
     }
 
+    /** 中身を [bytes] に置き換える（保存から戻す。#82）。[limit] を超えるなら [IllegalArgumentException] */
+    fun replaceWith(bytes: ByteArray) {
+        require(bytes.size <= limit) { "上限 $limit を超える" }
+        clear()
+        if (bytes.isEmpty()) return
+        buffer = bytes.copyOf()
+        length = bytes.size
+    }
+
     private fun ensureRoom(n: Int) {
         val needed = length + n
         check(needed <= limit) { "上限 $limit を超える" }
@@ -149,6 +158,15 @@ internal class TtyLines {
         lengths = null
         head = 0
         count = 0
+    }
+
+    /** 区切りの写し（先頭から。保存用。#82） */
+    fun toIntArray(): IntArray = lengths?.copyOfRange(head, head + count) ?: IntArray(0)
+
+    /** 区切りを [values] に置き換える（保存から戻す。#82） */
+    fun replaceWith(values: IntArray) {
+        clear()
+        for (v in values) add(v)
     }
 
     private companion object {

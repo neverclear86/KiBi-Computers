@@ -72,6 +72,7 @@ import pro.ikili.kibicomputers.core.machine.isFatal
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.KernelStateCopy
+import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
@@ -478,12 +479,32 @@ public class Machine private constructor(
         return result
     }
 
-    /** プロセス1つの判定（[isAtWaitPointLocked] が真なら READY。待機点型は TRANSIENT、ブロッキング型は UNSAVEABLE） */
-    private fun processReadinessLocked(process: Process): SaveReadiness = when {
-        isAtWaitPointLocked(process) -> SaveReadiness.READY
-        process.kind == ProcessKind.WAIT_POINT -> SaveReadiness.TRANSIENT
-        else -> SaveReadiness.UNSAVEABLE
+    /**
+     * プロセス1つの判定。終わったプロセス（ゾンビ）は READY（ドライバー・ストアは見ない。#82）。終わっていないプロセスは、
+     * 静的に保存できないもの（[isStaticallySaveableLocked]）なら UNSAVEABLE、[isAtWaitPointLocked] が真なら READY、
+     * 待機点型は TRANSIENT、ブロッキング型は UNSAVEABLE
+     */
+    private fun processReadinessLocked(process: Process): SaveReadiness {
+        if (process.state.isTerminal) return SaveReadiness.READY
+        // 終わっていないのに実行時の部分がない（今は起きない。守りだけ）
+        val rt = runtimes[process.pid] ?: return SaveReadiness.UNSAVEABLE
+        if (!isStaticallySaveableLocked(rt)) return SaveReadiness.UNSAVEABLE
+        return when {
+            isAtWaitPointLocked(process) -> SaveReadiness.READY
+            process.kind == ProcessKind.WAIT_POINT -> SaveReadiness.TRANSIENT
+            else -> SaveReadiness.UNSAVEABLE
+        }
     }
+
+    /**
+     * 待っても直らない「保存できないもの」でないか（#82）: ドライバーが保存に対応している（[SnapshotCapableDriver]）、
+     * モジュールがストアにある（[pro.ikili.kibicomputers.core.persist.ModuleStore.contains]。メモリの集合を引くだけ）、
+     * インスタンスが1つ以下（`CREATED` は 0）。型の判定と集合の引きだけなので軽い
+     */
+    private fun isStaticallySaveableLocked(rt: ProcessRuntime): Boolean =
+        rt.driver is SnapshotCapableDriver &&
+            rt.instances.size <= 1 &&
+            scheduler.moduleStore.contains(rt.program.moduleSource.originalHash)
 
     /**
      * カーネルの状態の写しを取る（#81）。カーネルロックの中で写し（[pro.ikili.kibicomputers.core.persist.KernelStateCopy]）を作り、
@@ -507,6 +528,7 @@ public class Machine private constructor(
         if (wholeTransient) {
             copy.markColdBoot(if (rebootRequested || rebootNotified) ColdBootReason.REBOOT_PENDING else ColdBootReason.BOOTING)
         } else {
+            // ① #81 の判定（静的に保存できないものを含む）で殺す
             for (process in kernel.processes.all()) {
                 when (processReadinessLocked(process)) {
                     SaveReadiness.UNSAVEABLE -> copy.killInCopy(process.pid)
@@ -515,8 +537,52 @@ public class Machine private constructor(
                 }
             }
         }
+        // ② 理由が NONE のときだけ中身を取る（NONE でなければ、待機点にいないプロセスのインスタンスを読まない。#82 の 12.）
+        if (copy.coldBootReason == ColdBootReason.NONE) captureContentLocked(copy)
+        // ③ ②で init を殺して冷えた起動になったら、取った中身を捨てる
+        if (copy.coldBootReason != ColdBootReason.NONE) copy.discardContent()
         copy
     }
+
+    /**
+     * 写しの中身を取る（#82 の 11. ②。カーネルロックの中）: 生きているプロセスのホスト側の処理の待ちを外し、ABI 層の写しを取り
+     * （取れなければ写しの中で殺す）、`/tmp` の写しと、開いたファイルの FS の中のパスを取る
+     */
+    private fun captureContentLocked(copy: KernelStateCopy) {
+        val live = kernel.processes.all().filter { copy.processes[it.pid]?.state?.isTerminal == false }.map { it.pid }
+        for (pid in live) copy.dropHostWaitsInCopy(pid)
+        for (pid in live) {
+            if (copy.processes[pid]?.state?.isTerminal != false) continue
+            val rt = runtimes[pid]
+            val driver = rt?.driver as? SnapshotCapableDriver
+            val payload = if (rt == null || driver == null) {
+                null
+            } else {
+                try {
+                    driver.captureAbi(rt)
+                } catch (e: Exception) {
+                    LOG.log(System.Logger.Level.WARNING, "マシン $id の pid $pid の状態を取り出せない: $e")
+                    null
+                }
+            }
+            if (payload == null || driver == null) {
+                LOG.log(System.Logger.Level.WARNING, "マシン $id の pid $pid は保存できないので、保存データの中では止める")
+                copy.killInCopy(pid)
+                if (copy.coldBootReason != ColdBootReason.NONE) return
+            } else {
+                copy.putAbi(pid, driver.abiLayer, driver.abiLayerVersion, payload)
+            }
+        }
+        for (entry in kernel.mounts.entries) {
+            if (entry.source != MachineLimits.TMP_SOURCE) continue
+            val fs = vfs.fileSystemLocked(entry.id) as? TmpFileSystem ?: continue
+            fs.snapshot()?.let { copy.putTmpfs(entry.id, it) }
+        }
+        copy.objects.forEachObject { obj ->
+            if (obj is OpenFile && obj.mountId != 0) vfs.pathHintLocked(obj)?.let { copy.putFilePath(obj.id, it) }
+        }
+    }
+
 
     /** 最後に受け付けた [boot] の設定（[reboot] と、[MachineHost.onRebootRequested] の既定の実装が使う）。まだなければ `null` */
     public val lastBootConfig: BootConfig? get() = lastBootConfigValue
@@ -836,7 +902,26 @@ public class Machine private constructor(
         val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
             if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
         }
-        return PendingExec(executable.path.toString(), executable.args, drivers, options, parentPid, future)
+        // 読み込みが終わったら、元のバイト列をモジュールの置き場に書く（#82。読み込みのスレッドで。メインスレッドでは書かない）
+        val original = executable.bytes
+        future.whenComplete { program, _ -> if (program != null) storeModule(program, original) }
+        return PendingExec(executable.path.toString(), executable.args, drivers, options, parentPid, future, original)
+    }
+
+    /**
+     * [program] の元のバイト列 [original] をモジュールの置き場に書く（#82。もうあれば集合を引くだけ）。カーネルロックの外で呼ぶ。
+     * 書けなくても続ける（そのプロセスは保存できない）
+     */
+    private fun storeModule(program: Program, original: ByteArray?) {
+        if (original == null) return
+        val store = scheduler.moduleStore
+        val hash = program.moduleSource.originalHash
+        if (store.contains(hash)) return
+        try {
+            store.put(hash, original)
+        } catch (e: RuntimeException) {
+            LOG.log(System.Logger.Level.WARNING, "モジュールを置き場に書けない: $e")
+        }
     }
 
     /**
@@ -847,6 +932,7 @@ public class Machine private constructor(
     @Throws(FsException::class)
     internal fun finishExec(pending: PendingExec, asInit: Boolean = false): Int {
         val program = loadedProgram(pending)
+        storeModule(program, pending.originalBytes)
         val driver = pending.drivers.create(program)
         return spawn(program, driver, pending.options.copy(args = pending.args), pending.parentPid, asInit)
     }
@@ -855,6 +941,7 @@ public class Machine private constructor(
     @Throws(FsException::class)
     internal fun finishExecWithHandle(pending: PendingExec): ProcessHandle {
         val program = loadedProgram(pending)
+        storeModule(program, pending.originalBytes)
         val driver = pending.drivers.create(program)
         return spawnWithHandle(program, driver, pending.options.copy(args = pending.args), pending.parentPid)
     }
@@ -2183,6 +2270,9 @@ public class Machine private constructor(
             config: MachineConfig,
             environment: MachineEnvironment,
         ): Machine = Machine(scheduler, id, host, config, environment)
+
+        /** 保存まわりの警告を出す口（#82） */
+        private val LOG: System.Logger = System.getLogger("kibicomputers.machine")
 
         /** 親のないゾンビを刈り取り始める、表の大きさの `maxProcesses` に対する倍率（仮の値。確定は #251） */
         private const val ORPHAN_ZOMBIE_TABLE_FACTOR: Int = 2

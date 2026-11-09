@@ -10,7 +10,10 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
@@ -21,17 +24,31 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
 
-/** テスト用の [ProcessDriver]。振る舞いを関数で渡す。 */
+/**
+ * テスト用の [ProcessDriver]。振る舞いを関数で渡す。保存に対応した（[SnapshotCapableDriver]）ものとして扱い、層の中身は
+ * [abiPayload]（層は [SnapshotSection.ABI_LAYER_TEST]。読む側は拒む）
+ */
 internal class TestDriver(
     override val kind: ProcessKind,
     private val onConfigure: (ProcessContext, WasmInstanceConfig.Builder) -> Unit = { _, _ -> },
     private val onResume: (ProcessContext, List<WaitKey>) -> StepResult = { _, _ -> fail("resume は呼ばれないはず") },
     private val onStart: (ProcessContext) -> StepResult,
-) : ProcessDriver {
+) : SnapshotCapableDriver {
     val configureCalls = AtomicInteger()
+
+    /** 層の中身（`null` なら保存できないものとして写しの中で殺される） */
+    @Volatile
+    var abiPayload: ByteArray? = ByteArray(0)
+
+    override val abiLayer: Int get() = SnapshotSection.ABI_LAYER_TEST
+
+    override val abiLayerVersion: Int get() = 1
+
+    override fun captureAbi(rt: ProcessRuntime): ByteArray? = abiPayload
 
     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
         configureCalls.incrementAndGet()
@@ -43,6 +60,41 @@ internal class TestDriver(
     override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
         assertTrue(ready.isNotEmpty(), "resume に空の並びが来た")
         return onResume(ctx, ready)
+    }
+}
+
+/** 保存に対応していないドライバー（#82。静的な判定で UNSAVEABLE になる）。振る舞いは [inner] に任せる */
+internal class UnsaveableTestDriver(private val inner: TestDriver) : ProcessDriver {
+    override val kind: ProcessKind get() = inner.kind
+
+    override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) = inner.configure(ctx, builder)
+
+    override fun start(ctx: ProcessContext): StepResult = inner.start(ctx)
+
+    override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult = inner.resume(ctx, ready)
+}
+
+/** メモリ上のモジュールの置き場（#82。テスト用） */
+internal class MemoryModuleStore : ModuleStore {
+    private val modules = ConcurrentHashMap<String, ByteArray>()
+
+    /** [put] が呼ばれた数 */
+    val puts = AtomicInteger()
+
+    override fun put(sha256: ByteArray, bytes: ByteArray): Boolean {
+        puts.incrementAndGet()
+        require(ModuleStore.sha256(bytes).contentEquals(sha256)) { "ハッシュが合わない" }
+        modules[ModuleStore.hex(sha256)] = bytes.copyOf()
+        return true
+    }
+
+    override fun contains(sha256: ByteArray): Boolean = sha256.size == 32 && modules.containsKey(ModuleStore.hex(sha256))
+
+    override fun get(sha256: ByteArray): ByteArray? = modules[ModuleStore.hex(sha256)]?.copyOf()
+
+    /** [sha256] のモジュールを消す（「ストアにない」を作る） */
+    fun remove(sha256: ByteArray) {
+        modules.remove(ModuleStore.hex(sha256))
     }
 }
 
@@ -62,11 +114,13 @@ internal class Harness(
     asyncify: Boolean = true,
     /** スケジューラの読み込みの上限（#40）。`null` ならカーネルは [ModuleLimits.DEFAULT] の値で上限をかける */
     moduleLimits: ModuleLimits? = if (execRuntime != null) ModuleLimits.DEFAULT else null,
+    /** モジュールの置き場（#82）。既定はメモリ上のもの。[program] で作ったモジュールはここに置く */
+    val moduleStore: ModuleStore = MemoryModuleStore(),
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore),
     )
     private var counter = 0
 
@@ -95,7 +149,9 @@ internal class Harness(
     fun program(module: FakeModule): Program {
         val bytes = "fake-module-${counter++}".toByteArray()
         runtime.define(bytes, module)
-        return Program.load(runtime, bytes)
+        val program = Program.load(runtime, bytes)
+        moduleStore.put(ModuleStore.sha256(bytes), bytes)
+        return program
     }
 
     fun module(program: Program): WasmModule = program.module
