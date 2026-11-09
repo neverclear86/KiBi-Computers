@@ -225,11 +225,13 @@ async function select() {
 
 async function plan(info) {
   let prev = null
-  // 人に聞く前の確かめ（crossCheck）が「エージェントで直せる」と返したときの直し方。1回だけ使う
+  // 人に聞く前の確かめ（crossCheck）が「エージェントで直せる」と返したときの直し方。
+  // 使うたびにプランのラウンドを1つ足す。MAX_GUIDED 回まで
   let guidance = null
-  let guided = false
+  let guidedCount = 0
   const MAX_PLAN_ROUNDS = 2
-  for (let round = 1; round <= MAX_PLAN_ROUNDS + (guided ? 1 : 0); round++) {
+  const MAX_GUIDED = 2
+  for (let round = 1; round <= MAX_PLAN_ROUNDS + guidedCount; round++) {
     const fixes = [
       ...(prev ? [`前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}`] : []),
       ...(guidance ? [`人に聞く前の確かめで示された直し方（これに従う）:\n${guidance}`] : []),
@@ -243,8 +245,8 @@ ABI・保存形式・公開 API について、\`decision\` Issue で決まっ�
     )
     if (!p) return { ok: false, reason: 'プランを作れなかった' }
     if (p.status !== 'planned') {
-      const e = await escalate('issue', info.number, p.reason ?? 'プランを作れなかった', 'プランを書く段階で、決まっていない選択に当たって止まった', !guided)
-      if (e.guidance) { guidance = e.guidance; guided = true; continue }
+      const e = await escalate('issue', info.number, p.reason ?? 'プランを作れなかった', 'プランを書く段階で、決まっていない選択に当たって止まった', guidedCount < MAX_GUIDED)
+      if (e.guidance) { guidance = e.guidance; guidedCount++; continue }
       return { ok: false, reason: e.question }
     }
     const r = await agent(
@@ -260,15 +262,22 @@ ${p.plan}`,
     if (r.verdict === 'approve') return { ok: true, plan: p.plan }
     if (r.verdict === 'needs_human') {
       const question = `次の設計の選択は decision で決まっていないため、判断してほしい:\n${r.undecided.map(u => `- ${u}`).join('\n')}`
-      const e = await escalate('issue', info.number, question, `プランのレビューが、決まっていない選択を見つけた。プラン:\n${p.plan}`, !guided)
-      if (e.guidance) { guidance = e.guidance; guided = true; prev = null; continue }
+      const e = await escalate('issue', info.number, question, `プランのレビューが、決まっていない選択を見つけた。プラン:\n${p.plan}`, guidedCount < MAX_GUIDED)
+      if (e.guidance) { guidance = e.guidance; guidedCount++; prev = r.must.length ? r : null; continue }
       return { ok: false, reason: e.question }
     }
     prev = r
-    if (round >= MAX_PLAN_ROUNDS + (guided ? 1 : 0)) {
+    if (round >= MAX_PLAN_ROUNDS + guidedCount) {
       const question = `プランが${round}ラウンドで承認されなかった。残った問題:\n${r.must.map(m => `- ${m}`).join('\n')}`
-      const e = await escalate('issue', info.number, question, `プランのレビューの must が直らなかった。最後のプラン:\n${p.plan}`, !guided)
-      if (e.guidance) { guidance = e.guidance; guided = true; continue }
+      const e = await escalate('issue', info.number, question, `プランのレビューの must が直らなかった。最後のプラン:\n${p.plan}`, true)
+      if (e.guidance && guidedCount < MAX_GUIDED) { guidance = e.guidance; guidedCount++; continue }
+      // 直す回数を使い切っても、人の判断が要らない must なら、実装で直すこととしてプランに付けて進む
+      if (e.guidance) {
+        return {
+          ok: true,
+          plan: `${p.plan}\n\n## プランのレビューで残った点（実装で直す）\n${r.must.map(m => `- ${m}`).join('\n')}\n\n直し方:\n${e.guidance}`,
+        }
+      }
       return { ok: false, reason: e.question }
     }
   }
