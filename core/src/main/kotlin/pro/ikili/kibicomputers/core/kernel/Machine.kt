@@ -909,14 +909,15 @@ public class Machine private constructor(
     }
 
     /**
-     * [program] の元のバイト列 [original] をモジュールの置き場に書く（#82。もうあれば集合を引くだけ）。カーネルロックの外で呼ぶ。
+     * [program] の元のバイト列 [original] をモジュールの置き場に書く（#82）。カーネルロックの外で呼ぶ。
+     * [ModuleStore.contains] で飛ばさず、いつも [ModuleStore.put] を呼ぶ（#551）。`contains` は作るときの種（ファイル名だけ）でも
+     * 真になるので、飛ばすと壊れた種のファイルを確かめる機会がなくなる。`put` は中身を確かめたものなら I/O をせずに戻る。
      * 書けなくても続ける（そのプロセスは保存できない）
      */
     private fun storeModule(program: Program, original: ByteArray?) {
         if (original == null) return
         val store = scheduler.moduleStore
         val hash = program.moduleSource.originalHash
-        if (store.contains(hash)) return
         try {
             store.put(hash, original)
         } catch (e: RuntimeException) {
