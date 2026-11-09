@@ -16,7 +16,8 @@ internal object InstanceStateMerge {
     fun merge(base: WasmInstanceState, delta: WasmInstanceState, maxChunks: Long): WasmInstanceState {
         if (base.changedOnly) throw SnapshotFormatException("基準が差分の形")
         if (!delta.changedOnly) throw SnapshotFormatException("差分が全体の形")
-        if ((base.memoryPages < 0) != (delta.memoryPages < 0)) throw SnapshotFormatException("基準と差分でメモリの有無が違う")
+        // 差分の形はメモリのある状態だけ（#562。WasmInstanceState が保つ）。基準にもメモリが要る
+        if (base.memoryPages < 0) throw SnapshotFormatException("基準と差分でメモリの有無が違う")
         if (delta.memoryPages < base.memoryPages) {
             throw SnapshotFormatException("差分のページ数 ${delta.memoryPages} が基準 ${base.memoryPages} より少ない")
         }
