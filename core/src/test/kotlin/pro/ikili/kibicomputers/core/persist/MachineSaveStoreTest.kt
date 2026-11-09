@@ -63,6 +63,26 @@ class MachineSaveStoreTest {
     }
 
     @Test
+    fun `書いた結果に世代のファイルの大きさとTMPFS節の大きさが入る`() {
+        val withTmpfs = MachineSnapshotSource { id, generation, version ->
+            MachineSnapshot(
+                id, generation, version,
+                listOf(
+                    SnapshotSection(SnapshotSection.KERNEL, SnapshotSection.KERNEL_VERSION, ByteArray(100)),
+                    SnapshotSection(SnapshotSection.TMPFS, SnapshotSection.TMPFS_VERSION, ByteArray(30)),
+                    SnapshotSection(SnapshotSection.TMPFS, SnapshotSection.TMPFS_VERSION, ByteArray(12)),
+                ),
+            )
+        }
+        val identity = store.assignNewId(p)!!
+        val result = store.write(identity, p, withTmpfs)
+        assertEquals(Files.size(store.generationFile(identity.id, 1)), result.fileBytes.toLong())
+        assertEquals(42, result.tmpfsBytes)
+        assertTrue(result.encodeNanos >= 0, "符号化の時間を測る: $result")
+        assertTrue(result.fileWriteNanos > 0, "書き込みの時間を測る: $result")
+    }
+
+    @Test
     fun `tmpが残っても世代として読まない`() {
         val identity = writeTimes(store.assignNewId(p)!!, 1)
         Files.write(store.directoryOf(identity.id).resolve("5.bin.tmp"), byteArrayOf(1))
