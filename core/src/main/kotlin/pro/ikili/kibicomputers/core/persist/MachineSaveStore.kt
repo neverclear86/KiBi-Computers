@@ -148,7 +148,8 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /**
      * [root] の名前を一度だけ読み、[knownDirectories] に入れる（#579。サーバーの起動時）。名前だけを見て、エントリごとに stat しない
-     * （ファイルでも、今までの `Files.exists` と同じく避ける）。根がない・読めないときは warn して、読めた分だけで始める
+     * （ファイルでも、今までの `Files.exists` と同じく避ける）。根がない・根がファイル（ディレクトリでない）ときは、warn を出さずに
+     * 空の集合で始める（新しいワールドではふつう）。列挙に失敗したときは warn して、読めた分だけで始める
      */
     private fun scanDirectories() {
         directoryScans++

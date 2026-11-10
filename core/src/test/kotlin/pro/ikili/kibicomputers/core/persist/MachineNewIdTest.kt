@@ -78,14 +78,29 @@ class MachineNewIdTest {
     }
 
     @Test
-    fun `開いた後に振ったUUIDは、ディレクトリができる前でも振らない`() {
+    fun `動いている間に外から置かれたディレクトリは見ず、submitでもassignNewIdでもそのUUIDを振る`() {
+        val store = MachineSaveStore(dir, index, "test", manual)
+        // 開いた後に、サーバーの外からディレクトリを置く（ADR 0084「動いている間に外から置かれたディレクトリは見ない」）。
+        // submit が振った ID は索引・owners・集合に入るので、submit と assignNewId で別の UUID を使う
+        Files.createDirectories(dir.resolve(x.toString()))
+        Files.createDirectories(dir.resolve(y.toString()))
+        store.useIds(x)
+        // ディスクを見ていれば、x を避けて乱数を振るはず
+        assertEquals(x, store.submit(null, p, src(), null).identity.id)
+        store.useIds(y)
+        assertEquals(y, store.assignNewId(p)?.id)
+        assertEquals(1, store.directoryScans, "振るときに読み直さない")
+    }
+
+    @Test
+    fun `開いた後に振ったUUIDは、書き終わって索引から外れても振らない`() {
         val store = MachineSaveStore(dir, index, "test", manual)
         store.useIds(x)
         val first = store.submit(null, p, src(), null)
         assertEquals(x, first.identity.id)
         manual.runAll()
         store.pollCompleted()
-        // 索引から外れても（アンロードの後など）、ディレクトリがあるので振らない
+        // 索引から外れても（アンロードの後など）、覚えている owner.bin（と集合）があるので振らない
         index.removeIfOwner(x, p)
         store.useIds(x, z)
         assertEquals(z, store.assignNewId(p)?.id)
