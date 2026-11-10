@@ -145,9 +145,15 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (computer.beginRestore()) ServerMachines.offerRestore(this)
     }
 
+    /** 最後に [startRestore] で決めた戻す世代（テスト・#575 用。冷えた起動なら `null`。まだなら `null`） */
+    internal var lastRestoreSource: RestoreSource? = null
+        private set
+
     /**
-     * 復元の順番が来た（#85。[ServerMachines] の tick から）。順番待ちでなければ何もしない。今の ID が `claim` に通っていれば、
-     * NBT が指す世代から戻す。ID がない・新しい ID を振った・書き込みが期限までに終わらない（[writesTimedOut]）なら冷えた起動にする
+     * 復元の順番が来た（#85。[ServerMachines] の tick から）。順番待ちでなければ何もしない。今の ID（[currentIdentity]。
+     * 書き込み中なら予約の世代。#575）が `claim` に通っていれば、その世代から戻す（書けなかった世代なら、置き場が直下の世代に落とす。
+     * ADR 0084 の規則 9）。ID がない・新しい ID を振ってからまだ1つも書いていない・書き込みが期限までに終わらない（[writesTimedOut]）なら
+     * 冷えた起動にする
      */
     internal fun startRestore(writesTimedOut: Boolean) {
         val level = level as? ServerLevel ?: return
@@ -157,13 +163,16 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val environment = MachineEnvironment.builder().disks(disks.resolver).build()
         val boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
         val store = WorldMachineSaves.current
-        val id = identity
+        // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
+        val id = currentIdentity
         val source = when {
             store == null || id == null -> null
             writesTimedOut -> null
-            lastClaim?.isNewId == true -> null
+            // 新しい ID は振った直後（世代 0）だけ冷えた起動にする。その後に書いた世代があれば戻す（FULL に戻ったときなど。#575）
+            lastClaim?.isNewId == true && id.generation == 0L -> null
             else -> RestoreSource(store, id.id, id.generation)
         }
+        lastRestoreSource = source
         if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
         ServerMachines.recordRestoreStart(source != null, writesTimedOut)
         computer.startRestore(
