@@ -185,7 +185,7 @@ class CompileWaitTest {
         val a = m.spawnTest(h.program(emptyModule()), execer("/bin/a", outA))
         val b = m.spawnTest(h.program(emptyModule()), execer("/bin/b", outB, ProcessKind.WAIT_POINT))
         tickUntil("読み込みを待たない") {
-            h.scheduler.programs.loadingCount == 5 && m.awaitingLoad(a) && m.awaitingLoad(b)
+            h.scheduler.programs.loadingCount == 5 && loading.isNotEmpty() && m.awaitingLoad(a) && m.awaitingLoad(b)
         }
         assertEquals(1, loading.size, "読み込むスレッドは 1 本")
         assertTrue(booting.all { it.isBooting })
@@ -199,6 +199,7 @@ class CompileWaitTest {
         // 止めた起動は失敗を知らせない。プロセスは止められて終わる
         assertTrue(failures.isEmpty(), failures.toString())
         assertTrue(booting.all { it.state == MachineState.STOPPED })
+        assertTrue(booting.all { it.bootCancelSignal.numberOfDependents == 0 }, "取り消しの登録が残っている")
         assertEquals(ProcessState.KILLED, m.stateOf(a))
         assertEquals(ProcessState.KILLED, m.stateOf(b))
         assertEquals(1, loading.size, "待ち行列の読み込みは始めない")
@@ -211,53 +212,16 @@ class CompileWaitTest {
         val m = h.machine()
         assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
         eventually { loading.isNotEmpty() }
+        eventually { m.bootCancelSignal.numberOfDependents == 1 }
         m.stop()
         eventually { !m.isBooting }
         assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(0, m.bootCancelSignal.numberOfDependents, "取り消しの登録が残っている")
         // 読み込みは続き、終われば共有される
         assertEquals(1, h.scheduler.programs.loadingCount)
         gate.countDown()
         eventually { h.scheduler.programs.loadingCount == 0 }
         assertEquals(1L, h.scheduler.programs.loads.get())
-    }
-
-    @Test
-    fun `起動が終わったら、起動の取り消しの登録を残さない`() = env {
-        val host = FailureHost()
-        val disk = initDisk(exe(exitingInit()))
-        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
-        val m = h.machine(host = host)
-        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
-        eventually { loading.isNotEmpty() }
-        // 読み込みを待つ間は、取り消しの登録がある（stop() で起動をやめられる）
-        eventually { m.bootCancelRegistrations >= 1 }
-        gate.countDown()
-        tickUntil("起動が終わらない") { !m.isBooting }
-        // 起動の後は、init の読み込み（実行ファイルのバイト列）を捕まえた登録が残らない（#598）
-        assertEquals(0, m.bootCancelRegistrations, "起動の取り消しの登録が残っている")
-        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
-        m.stop()
-        assertTrue(m.awaitTermination(5_000))
-    }
-
-    @Test
-    fun `起動の途中のstopの後も、起動の取り消しの登録を残さず、また起動できる`() = env {
-        val disk = initDisk(exe(exitingInit()))
-        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
-        val m = h.machine()
-        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
-        eventually { loading.isNotEmpty() }
-        m.stop()
-        eventually { !m.isBooting }
-        assertEquals(0, m.bootCancelRegistrations, "起動の取り消しの登録が残っている")
-        gate.countDown()
-        eventually { h.scheduler.programs.loadingCount == 0 }
-        // 新しい起動は、新しい信号で取り消せる（終わった値を引き継がない）
-        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
-        tickUntil("起動が終わらない") { !m.isBooting }
-        assertEquals(0, m.bootCancelRegistrations)
-        m.stop()
-        assertTrue(m.awaitTermination(5_000))
     }
 
     @Test
@@ -460,6 +424,7 @@ class CompileWaitTest {
         assertEquals(BootFailure.INIT_START_FAILED, host.failures[0].first)
         assertTrue(host.failures[0].second.contains("多すぎる"), host.failures.toString())
         assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(0, m.bootCancelSignal.numberOfDependents, "取り消しの登録が残っている")
         // 読み込みが終われば数が空き、また起動できる
         gate.countDown()
         held.forEach { f -> runCatching { f.get() } }
@@ -471,5 +436,53 @@ class CompileWaitTest {
         assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
         m.stop()
         assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `起動に成功したら、initの読み込みの取り消しの登録は外れる`() = env {
+        val host = FailureHost()
+        // 終わらない init（動いている間も登録が残らないことを見る）
+        val running = FakeModule.builder().fuelMetered().export("_start", VOID) { ctx, _ ->
+            while (true) {
+                ctx.step(1)
+                Thread.sleep(1)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            LongArray(0)
+        }.build()
+        val disk = initDisk(exe(running))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 1_000_000, host = host)
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        // 読み込みを待つ間は、取り消しの登録が付いている
+        eventually { loading.isNotEmpty() && m.bootCancelSignal.numberOfDependents == 1 }
+        gate.countDown()
+        tickUntil("起動しない") { !m.isBooting && m.state == MachineState.RUNNING }
+        assertEquals(0, m.bootCancelSignal.numberOfDependents, "取り消しの登録が残っている")
+        assertTrue(m.bootCancelSignal.isDone)
+        // 登録は何もしない（起動を終え直さない・失敗を知らせない）
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(MachineState.RUNNING, m.state)
+        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `読み込みの後にinitを作れず起動に失敗したら、取り消しの登録は外れ、失敗は1回だけ知らせる`() = env {
+        val host = FailureHost()
+        val disk = initDisk(exe(register = false))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine(host = host)
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        eventually { loading.isNotEmpty() && m.bootCancelSignal.numberOfDependents == 1 }
+        gate.countDown()
+        tickUntil("起動が失敗しない") { host.failures.isNotEmpty() }
+        assertFalse(m.isBooting)
+        assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(0, m.bootCancelSignal.numberOfDependents, "取り消しの登録が残っている")
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(1, host.failures.size, host.failures.toString())
+        assertEquals(BootFailure.INIT_NOT_EXECUTABLE, host.failures[0].first)
     }
 }
