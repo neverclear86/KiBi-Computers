@@ -718,9 +718,17 @@ class MachineRestoreBranchesTest {
             assertEquals(ProcessState.KILLED, m.lock.withLockValue { rt.process.state })
             assertTrue(m.lock.withLockValue { rt.instances.isEmpty() }, "stopLocked がインスタンスを閉じていない")
             assertTrue(during >= 10_000, "戻す途中で RAM を数えていない（$during）")
-            // インスタンス・/tmp の RAM は 1 回だけ返る（二重に返すと負になるが、discard が例外を捨てるので値で見る）
+            // インスタンスの RAM は 1 回だけ返る。インスタンスはプロセスの勘定（rt.memory）を通して返すので、二重に返すとプロセスの勘定が
+            // 負になった時点で check が投げ、マシンとサーバー全体の勘定には届かない（例外は closeQuietly が捨てる）。そのためプロセスの勘定で見る。
+            // ProcessMemory は数を引いてから check するので、二重に返した分は値に負として残る
+            val processBytes = m.lock.withLockValue { rt.memory.usedBytes }
+            val processPages = m.lock.withLockValue { rt.memory.usedPages }
+            assertEquals(0L, processBytes, "プロセスの RAM の勘定が 0 にならない（負なら WasmInstance.close が二重に返した）")
+            assertEquals(0, processPages, "プロセスの線形メモリのページ数が 0 にならない（負なら WasmInstance.close が二重に返した）")
+            // /tmp の RAM はマシンの勘定から直に返すので、二重に返すとマシンの勘定が負になる（ここで見える）。
+            // サーバー全体の勘定は「返していない」だけを見る（二重に返すと、親に届く前にマシンの勘定の check が投げる）
+            assertEquals(0L, m.memoryAccount.usedBytes, "マシンの RAM の勘定が 0 にならない（負なら /tmp を二重に返した）")
             assertEquals(base, h.scheduler.memoryAccount.usedBytes, "サーバー全体の RAM の勘定が元に戻らない")
-            assertEquals(0L, m.memoryAccount.usedBytes, "マシンの RAM の勘定が 0 にならない")
             // ディスクのリースも 1 回だけ返る（テストの holder の分だけが残る）
             assertEquals(1, HostDiskLeases.usersOf(real), "ディスクのリースを二重に返した、または返していない")
             holder.retire()
