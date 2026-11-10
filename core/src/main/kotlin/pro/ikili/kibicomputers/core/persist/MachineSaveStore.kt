@@ -31,6 +31,7 @@ import kotlin.concurrent.withLock
  *   書き込み待ちの世代とその基準。それ以外は印が進んだときに消す
  *
  * `owner.bin` の中身・印・書いた最新の世代はメモリに覚え（このサーバーが書いた・読んだもの）、毎回ディスクは読まない。
+ * 新しい ID の重なりは、開いたときに根の名前を 1 回読んだ集合で確かめ、振るときにディスクは見ない（#579）。
  * 印はメモリの上だけに持ち、保存しない（再起動の後は [claim] で読んだ世代から始まる）。
  *
  * 差分の世代（#83、ADR 0083）: 全体の世代を書けたら（完了を受け取ったら）、それを今の基準として覚える（メモリだけ。再起動の後の最初の保存は全体）。
@@ -92,6 +93,15 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 受け取ったが、まだ [pollCompleted] で返していない完了（[write] が自分の分だけ抜く） */
     private val ready = ArrayList<SaveCompletion>()
 
+    /**
+     * ディレクトリがあるかもしれない UUID（#579。新しい ID の重なりの確かめに使い、ディスクは見ない。ADR 0084 の規則 2）。
+     *
+     * 不変条件: 開いたときに [root] にあった名前（UUID として読めるもの。大文字も）∪ このストアがディレクトリを作りうる ID
+     * （[newUuid] が返したもの・`owner.bin` を書こうとしたもの）を含む。サーバーが動いている間は外さない（`delete` や、
+     * 新しく振った `owner.bin` が書けなかったときに消えても、多めに持つ側に倒す）。動いている間に外から置かれたディレクトリは見ない
+     */
+    private val knownDirectories = HashSet<UUID>()
+
     // ---- 書き込みのスレッドの持ち物 ----
 
     /**
@@ -124,6 +134,48 @@ public class MachineSaveStore @JvmOverloads constructor(
     private val completed = ConcurrentLinkedQueue<Done>()
     private val waitLock = ReentrantLock()
     private val progress = waitLock.newCondition()
+
+    /** 開いたときに [root] の名前を読んだ回数（数え口。テストが「振るときにディスクを見ない」を確かめる。#579） */
+    internal var directoryScans: Int = 0
+        private set
+
+    /** 新しい ID の候補を作る口（テストが差し替える。既定は [UUID.randomUUID]。#579） */
+    internal var uuidSource: () -> UUID = UUID::randomUUID
+
+    init {
+        scanDirectories()
+    }
+
+    /**
+     * [root] の名前を一度だけ読み、[knownDirectories] に入れる（#579。サーバーの起動時）。名前だけを見て、エントリごとに stat しない
+     * （ファイルでも、今までの `Files.exists` と同じく避ける）。根がない・読めないときは warn して、読めた分だけで始める
+     */
+    private fun scanDirectories() {
+        directoryScans++
+        val start = System.nanoTime()
+        try {
+            if (Files.isDirectory(root)) {
+                Files.newDirectoryStream(root).use { entries ->
+                    for (entry in entries) {
+                        val name = entry.fileName?.toString() ?: continue
+                        if (name.length != UUID_NAME_LENGTH) continue
+                        try {
+                            knownDirectories += UUID.fromString(name)
+                        } catch (_: IllegalArgumentException) {
+                            // UUID の名前でないものは読み飛ばす
+                        }
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            LOG.log(System.Logger.Level.WARNING, "Failed to list machine directories in $root; continuing with ${knownDirectories.size} entries", e)
+        } catch (e: RuntimeException) {
+            // DirectoryIteratorException（反復中の IOException）・SecurityException など
+            LOG.log(System.Logger.Level.WARNING, "Failed to list machine directories in $root; continuing with ${knownDirectories.size} entries", e)
+        }
+        val millis = (System.nanoTime() - start) / 1_000_000.0
+        LOG.log(System.Logger.Level.INFO, "Found ${knownDirectories.size} machine directories in $root (${"%.1f".format(millis)} ms)")
+    }
 
     /** 世代のファイルの頭から基準を読む（#83。テストが差し替える。既定は [MachineSnapshot.readDeltaBase]） */
     internal var deltaBaseReader: (Path) -> DeltaBase? = { path ->
@@ -272,12 +324,16 @@ public class MachineSaveStore @JvmOverloads constructor(
         return MachineIdentity(id, 0, 0)
     }
 
-    /** 索引・覚えている `owner.bin`・列のどれにも、ディスクにもない UUID */
+    /**
+     * 索引・覚えている `owner.bin`・列・ディレクトリがあるかもしれない UUID（[knownDirectories]）のどれにもない UUID。
+     * メモリだけで確かめ、ディスクは見ない（#579、ADR 0084 の規則 2）。返す ID は [knownDirectories] に足す
+     */
     private fun newUuid(): UUID {
         var id: UUID
         do {
-            id = UUID.randomUUID()
-        } while (index.ownerOf(id) != null || owners.containsKey(id) || outstanding.containsKey(id) || Files.exists(directoryOf(id)))
+            id = uuidSource()
+        } while (index.ownerOf(id) != null || owners.containsKey(id) || outstanding.containsKey(id) || id in knownDirectories)
+        knownDirectories += id
         return id
     }
 
@@ -293,6 +349,8 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     private fun writeOwner(id: UUID, record: OwnerRecord): Boolean = try {
+        // 書けなくてもディレクトリは残りうるので、書く前に足す（#579）
+        knownDirectories += id
         OwnerRecord.write(directoryOf(id).resolve(OwnerRecord.FILE_NAME), record)
         owners[id] = record
         // owner.bin が書けたので、使えない印が残っていても（削除の後に claim し直したときなど）外す
@@ -852,6 +910,9 @@ public class MachineSaveStore @JvmOverloads constructor(
         val LOG: System.Logger = System.getLogger("kibicomputers.persist")
 
         const val GENERATION_SUFFIX = ".bin"
+
+        /** UUID の名前（`8-4-4-4-12`）の長さ */
+        const val UUID_NAME_LENGTH = 36
 
         /** [write] が書き込みを待つ上限（実際には待ちきる） */
         const val WRITE_WAIT_MILLIS = 24L * 60 * 60 * 1000
