@@ -73,8 +73,9 @@ public class MachineScheduler private constructor(
     internal val permits = PermitPool(config.maxConcurrentMachines, workers)
 
     /**
-     * 起動の手順（`BootSequence`）を動かすスレッド `KiBi-boot-*`（#350。[SchedulerConfig.maxConcurrentMachines] 本まで、残りは待ち行列）。
-     * 起動の手順はコンパイルや前の起動のスレッドを待って止まるので、ワーカーとは分ける。
+     * 起動の手順（`BootSequence`）と復元の前段（`MachineRestore`）を動かすスレッド `KiBi-boot-*`（#350。[SchedulerConfig.maxConcurrentMachines] 本まで、
+     * 残りは待ち行列）。ホストの I/O・前の起動のスレッドを待って止まるので、ワーカーとは分ける。
+     * モジュールのコンパイルは、スレッドを持たずに待ち、終わったら続きをここに積み直す（init は #358、復元は #577）。
      * 1,000 台を一度に起動しても、スレッドは台数分できない（メインスレッドが作るのも、この本数まで）
      */
     internal val bootExecutor: ThreadPoolExecutor = run {
