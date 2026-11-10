@@ -101,6 +101,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
 /** マシンの状態 */
@@ -397,11 +398,14 @@ public class Machine private constructor(
     private var bootCancelled = false
 
     /**
-     * 起動の取り消しを、init の読み込み（コンパイル）を待つ起動の手順に伝える（#344）。[boot] で作り直し、[stopLocked] で終える。
-     * カーネルロックの中で書く
+     * 起動の手順が終わった（init を作った・init を作らずに終えた）か、取り消されたことを、init の読み込み（コンパイル）を待つ
+     * 起動の手順の取り消しの登録（[whenInitLoaded]）に伝える（#344）。[boot]・[coldBootAfterRestore] で作り直し、
+     * init を作ったとき（[spawnInternal]）・[endBoot]・取り消し（[stopLocked]）で終える。終えると登録が外れる（#592）。
+     * 取り消されたかは [bootCancelled] で見る（これでは見分けない）。カーネルロックの中で書く
      */
     @Volatile
-    private var bootCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+    internal var bootCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+        private set
 
     /** 最後に受け付けた [boot] の設定。実行時だけの値（戻したマシンでは、接続層が渡し直す。ADR 0049・#81） */
     @Volatile
@@ -1177,6 +1181,8 @@ public class Machine private constructor(
             if (asInit) {
                 kernel.initPid = pid
                 bootingValue = false
+                // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
+                bootCancelSignal.complete(Unit)
             }
             installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
             // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
@@ -1376,11 +1382,20 @@ public class Machine private constructor(
     internal fun whenInitLoaded(pending: PendingExec, onLoaded: () -> Unit) {
         val cancel = lock.withLockValue { bootCancelSignal }
         val fired = AtomicBoolean()
-        pending.future.whenComplete { _, _ -> if (fired.compareAndSet(false, true)) runBootStep(onLoaded) }
-        cancel.whenComplete { _, _ ->
-            // stopLocked の中（カーネルロックの中）から呼ばれる。取り消しは読み込みの側のロックだけを取るので、ここで行ってよい
+        // 取り消しの登録は、待っている読み込みの入れ物と fired だけを持つ（pending・onLoaded を捕まえない。#592）。
+        // 信号は起動の終わり（spawnInternal の init・endBoot）でも終えるので、登録はそこで外れる
+        val waiting = AtomicReference<CompletableFuture<Program>?>(pending.future)
+        pending.future.whenComplete { _, _ ->
             if (fired.compareAndSet(false, true)) {
-                pending.future.cancel(false)
+                waiting.set(null)
+                runBootStep(onLoaded)
+            }
+        }
+        cancel.whenComplete { _, _ ->
+            // stopLocked・spawnInternal・endBoot の中（カーネルロックの中）から呼ばれる。取り消しは読み込みの側のロックだけを取るので、
+            // ここで行ってよい。読み込みが先に終わっていれば（起動の終わりで信号を終えたとき）何もしない
+            if (fired.compareAndSet(false, true)) {
+                waiting.getAndSet(null)?.cancel(false)
                 runBootStep { endBoot(null, "") }
             }
         }
@@ -2291,6 +2306,8 @@ public class Machine private constructor(
     internal fun endBoot(failure: BootFailure?, reason: String, detail: String? = null): Unit = lock.withLockValue {
         if (!bootingValue) return@withLockValue
         bootingValue = false
+        // 取り消しの登録（whenInitLoaded）を外す。読み込みの後の失敗なら登録は何もしない。取り消しなら信号はもう終わっている（#592）
+        bootCancelSignal.complete(Unit)
         if (kernel.processes.liveCount() == 0) unmountAllLocked()
         if (failure != null && !bootCancelled) {
             writeConsoleLine(BootSequence.consoleMessage(failure, reason))
