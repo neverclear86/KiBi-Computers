@@ -1,0 +1,680 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.fail
+import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
+import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.ColdBootReason
+import pro.ikili.kibicomputers.core.persist.MachineIdIndex
+import pro.ikili.kibicomputers.core.persist.MachineIdentity
+import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.MachineSnapshot
+import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.QuiesceHandle
+import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreRequest
+import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.persist.SnapshotSection
+import pro.ikili.kibicomputers.core.persist.snapshot.DecodedKernelState
+import pro.ikili.kibicomputers.core.persist.snapshot.DecodedP1Process
+import pro.ikili.kibicomputers.core.persist.snapshot.KernelLimits
+import pro.ikili.kibicomputers.core.persist.snapshot.KernelSectionCodec
+import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
+import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import java.nio.file.Files
+import java.nio.file.Path
+import java.time.Duration
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
+import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+
+/**
+ * 復元（#85、ADR 0085）の主な分岐（#578）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・
+ * 戻した直後の起こし）、`/tmp` と開いたファイル（消えていたら STALE）、冷えた起動の理由ごとの1つずつ、起こしを使う前の保存の `wakeOnRestore`。
+ *
+ * どのテストも、戻す前に書いた世代そのもの（状態・差分か）を確かめてから戻す（「戻って動いた」だけでは、思った形で保存していなくても通るため）
+ */
+class MachineRestoreBranchesTest {
+    @TempDir
+    lateinit var dir: Path
+
+    private val limit = Duration.ofSeconds(120)
+    private val owner = MachineOwner("minecraft:overworld", 0, 64, 0)
+
+    /** 置き場の根（ディスクのディレクトリとは分ける。置き場の根に UUID でないディレクトリを置かない） */
+    private fun newStore(): MachineSaveStore = MachineSaveStore(Files.createDirectories(dir.resolve("saves")), MachineIdIndex(), "test")
+
+    private fun resource(name: String): ByteArray =
+        requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
+
+    private fun bootConfig(): BootConfig = BootConfig.builder().addBootDisk("none").build()
+
+    /** 終わりの知らせの記録（受け手の中の確かめは [errors] に取る。受け手の例外はマシンが捨てる） */
+    private class Finished {
+        val outcomes: MutableList<Pair<RestoreOutcome, ColdBootCause?>> = Collections.synchronizedList(ArrayList())
+
+        @Volatile
+        var onFinished: ((Machine, RestoreOutcome) -> Unit)? = null
+
+        val errors: MutableList<Throwable> = Collections.synchronizedList(ArrayList())
+
+        val listener = RestoreListener { m, outcome, cause ->
+            try {
+                onFinished?.invoke(m, outcome)
+            } catch (t: Throwable) {
+                errors += t
+            }
+            outcomes += outcome to cause
+        }
+
+        fun assertNoErrors() {
+            errors.firstOrNull()?.let { throw AssertionError("受け手の中の確かめが落ちた", it) }
+        }
+    }
+
+    /** 動かしたプロセスと、標準入出力のオブジェクトの ID（[output] は ByteStream のときだけ。0 ならない） */
+    private class Started(val m: Machine, val pid: Int, val input: Int, val output: Int)
+
+    /**
+     * [m] の根に [root] を `disk:root` でマウントし、[name] のモジュールを [path] に置いて、init として動かす。[stdout] を渡せばそれを
+     * 標準出力にする（渡さなければ新しい ByteStream）。標準入力は新しい ByteStream（[withInput] が偽なら閉じる）
+     */
+    private fun start(
+        m: Machine,
+        root: FileSystem,
+        name: String,
+        path: String,
+        args: List<String>,
+        stdout: ((Machine) -> Int)? = null,
+        withInput: Boolean = true,
+        beforeExec: (Machine) -> Unit = {},
+    ): Started {
+        m.vfs.mount(VfsPath.ROOT, root, readOnly = false, source = "disk:root")
+        m.vfs.createDirectory(VfsPath.parse("/bin"))
+        val bytes = resource(name)
+        val f = m.vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
+        m.vfs.write(f, bytes, 0, bytes.size)
+        beforeExec(m)
+        val stdoutId = stdout?.invoke(m)
+        val (input, output) = m.lock.withLockValue {
+            val i = if (withInput) ByteStream(4096).also { m.kernel.objects.add(it) }.id else 0
+            val o = if (stdoutId == null) ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id else 0
+            i to o
+        }
+        val stdio = StdioSpec(
+            if (input != 0) StdioSource.Object(input, HandleRights.READ) else StdioSource.Closed,
+            StdioSource.Object(stdoutId ?: output, HandleRights.WRITE),
+            StdioSource.Closed,
+        )
+        val pid = m.exec(path, KernelDrivers.DEFAULT, SpawnOptions(args = args, stdio = stdio))
+        // exec だけでは init にならない（initPid が 0 だと、戻すときに NO_LIVE_INIT になる）
+        m.lock.withLockValue { m.kernel.initPid = pid }
+        return Started(m, pid, input, output)
+    }
+
+    /** `prompt` を init として動かし、最初の入力を待つところまで進める */
+    private fun startPrompt(h: Harness, m: Machine, root: FileSystem, stdout: ((Machine) -> Int)? = null, beforeExec: (Machine) -> Unit = {}): Started {
+        val s = start(m, root, "prompt-wasi.wasm", "/bin/prompt", listOf("prompt"), stdout, beforeExec = beforeExec)
+        awaitWaiting(h, s, "入力を待たない")
+        return s
+    }
+
+    private fun awaitWaiting(h: Harness, s: Started, message: String) = eventually(60_000, message) {
+        h.scheduler.tick()
+        s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT && s.m.isAtWaitPoint
+    }
+
+    private fun output(m: Machine, id: Int): String = m.lock.withLockValue {
+        (m.kernel.objects[id] as ByteStream).availableBytes().toString(Charsets.UTF_8)
+    }
+
+    private fun send(m: Machine, id: Int, text: String) = m.lock.withLockValue {
+        val b = text.toByteArray()
+        (m.kernel.objects[id] as ByteStream).write(b, 0, b.size, m.wakeSink)
+        Unit
+    }
+
+    /** 待機点の写しを取る（step の途中の一瞬は `null` を返しうるので、取れるまで繰り返す） */
+    private fun capture(m: Machine, deltaBase: pro.ikili.kibicomputers.core.persist.DeltaBase? = null): MachineSnapshotSource {
+        var source: MachineSnapshotSource? = null
+        eventually(10_000, "写しが取れない") {
+            source = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, 1.0)
+            source != null
+        }
+        return source!!
+    }
+
+    /** [captureCopy][Machine.captureCopy] の写し（取れるまで繰り返す） */
+    private fun captureCopy(m: Machine) = run {
+        var copy: pro.ikili.kibicomputers.core.persist.KernelStateCopy? = null
+        eventually(10_000, "写しが取れない") {
+            copy = m.captureCopy(CapturePolicy.SKIP_IF_TRANSIENT)
+            copy != null
+        }
+        copy!!
+    }
+
+    private fun stored(store: MachineSaveStore, identity: MachineIdentity): MachineSnapshot =
+        store.readGeneration(identity.id, identity.generation).snapshot
+
+    /** 書いた世代の `KERNEL` 節 */
+    private fun kernelOf(snapshot: MachineSnapshot): DecodedKernelState =
+        KernelSectionCodec.read(snapshot.sections.single { it.kind == SnapshotSection.KERNEL }.payload, KernelLimits(64))
+
+    /** 書いた世代の [pid] の p1 の層 */
+    private fun p1Of(snapshot: MachineSnapshot, pid: Int): DecodedP1Process {
+        for (section in snapshot.sections) {
+            if (section.kind != SnapshotSection.PROCESS_ABI) continue
+            val r = SnapshotReader(section.payload)
+            if (r.i32() != pid) continue
+            assertEquals(SnapshotSection.ABI_LAYER_P1, r.u16())
+            r.u16()
+            return P1SectionCodec.read(r.raw(r.remaining))
+        }
+        fail("pid $pid の PROCESS_ABI 節がない")
+    }
+
+    /** [identity] の世代から新しいマシンに戻し、知らせが来るまで tick を回す */
+    private fun restore(h: Harness, store: MachineSaveStore, identity: MachineIdentity, finished: Finished = Finished(), fuelPerTick: Long = 10_000_000): Machine {
+        val m = h.machine(fuelPerTick = fuelPerTick)
+        assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+        eventually(60_000, "知らせが来ない") {
+            h.scheduler.tick()
+            finished.outcomes.isNotEmpty()
+        }
+        finished.assertNoErrors()
+        return m
+    }
+
+    /** 冷えた起動になり、表が空のまま */
+    private fun assertColdBoot(m: Machine, finished: Finished, cause: ColdBootCause) {
+        assertEquals(listOf(RestoreOutcome.COLD_BOOT to cause), finished.outcomes.toList())
+        assertEquals(0, m.lock.withLockValue { m.kernel.processes.size }, "表は空のまま")
+        assertTrue(m.lock.withLockValue { m.kernel.mounts.entries.isEmpty() }, "マウントは空のまま")
+    }
+
+    /** 戻すマシンが開く根のディスクを、新しい空のメモリのファイルシステムにする */
+    private fun openFreshRoot(h: Harness) {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+    }
+
+    private fun expectedSpin(rounds: Int, inner: Long): String {
+        var x = 1L
+        val sb = StringBuilder()
+        repeat(rounds) { r ->
+            repeat(inner.toInt()) { x = (x * 1103515245L + 12345L + (x ushr 7)) and 0xFFFF_FFFFL }
+            sb.append("$r $x\n")
+        }
+        return sb.toString()
+    }
+
+    // ---- 差分の世代 ----
+
+    @Test
+    fun `差分の世代から戻すと、基準と合わせた差分の時点から続き、基準が消えていればUNREADABLE`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = startPrompt(h, m, TestMemoryFileSystem())
+            // 世代 1: 全体（置き場が完了を受け取ったときに、次の差分の基準になる）
+            val full = store.write(store.assignNewId(owner)!!, owner, capture(m))
+            assertFalse(full.delta)
+            // 1 行進めて、次のプロンプトで待つ
+            send(m, s.input, "hello\n")
+            eventually(60_000, "次のプロンプトで待たない") {
+                h.scheduler.tick()
+                output(m, s.output).split("> ").size - 1 >= 2 && m.stateOf(s.pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
+            }
+            assertTrue(output(m, s.output).contains("1 hello "))
+            // 世代 2: 差分（比を 1.0 にして、全体に化けないようにする）
+            val base = store.deltaBaseFor(full.identity, owner)
+            assertNotNull(base, "全体を書いた後なのに基準がない")
+
+            assertEquals(full.identity.generation, base!!.generation)
+            val source = capture(m, base)
+            assertEquals(base, source.deltaBase)
+            val delta = store.write(full.identity, owner, source)
+            assertTrue(delta.delta, "差分を書いていない: $delta")
+            val written = stored(store, delta.identity)
+            assertEquals(base, written.deltaBase)
+            assertTrue(p1Of(written, s.pid).instance!!.changedOnly, "p1 の層が変わった区画だけになっていない")
+            m.close()
+
+            // 差分の世代から戻す: 行番号が 2 から続く（差分の時点の状態）
+            val finished2 = Finished()
+            val m2 = restore(h, store, delta.identity, finished2)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished2.outcomes.toList())
+            assertEquals(MachineState.RUNNING, m2.state)
+            assertEquals(ProcessState.WAITING_EVENT, m2.stateOf(s.pid))
+            send(m2, s.input, "world\n")
+            eventually(60_000, "戻したプロセスが答えない: ${output(m2, s.output)}") {
+                h.scheduler.tick()
+                output(m2, s.output).contains("2 world ")
+            }
+            m2.close()
+
+            // 基準の世代のファイルが消えていたら、差分の世代は読めない（ADR 0084 の規則 9）
+            Files.delete(store.generationFile(full.identity.id, full.identity.generation))
+            val finished = Finished()
+            val m3 = restore(h, store, delta.identity, finished)
+            assertColdBoot(m3, finished, ColdBootCause.UNREADABLE)
+            m3.close()
+        }
+    }
+
+    // ---- RUNNABLE のプロセス ----
+
+    @Test
+    fun `燃料待ちのRUNNABLEのプロセスを戻すと、退避した値から続けて最後まで動く`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 20_000)
+            val s = start(m, TestMemoryFileSystem(), "fuel-spin-wasi.wasm", "/bin/spin", listOf("spin", "main", "3", "100000"), withInput = false)
+            h.scheduler.tick()
+            // 燃料切れで巻き戻し、スレッドを持たずに燃料を待つ（tick は回さない: 回すと続きを動かしてしまう）
+            eventually(30_000, "燃料切れで巻き戻さない") {
+                m.lock.withLockValue {
+                    val p = m.kernel.processes[s.pid]!!
+                    val rt = m.rt(s.pid)
+                    p.state == ProcessState.RUNNABLE && rt.thread == null && !rt.stackActive && rt.waitSet == null && p.wait == null &&
+                        p.asyncStack?.isEmpty == false
+                }
+            }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val written = stored(store, identity)
+            val process = kernelOf(written).processes[s.pid]!!
+            assertEquals(ProcessState.RUNNABLE, process.state)
+            assertNull(process.wait, "燃料待ちは待ちがない")
+            assertFalse(s.pid in kernelOf(written).wakeOnRestore)
+            assertTrue(p1Of(written, s.pid).asyncStack.isNotEmpty(), "退避した値がない")
+            m.close()
+
+            val finished = Finished()
+            finished.onFinished = { machine, _ ->
+                machine.lock.withLockValue {
+                    assertEquals(ProcessState.RUNNABLE, machine.kernel.processes[s.pid]!!.state)
+                    assertFalse(machine.runtime(s.pid)!!.restoreWake, "燃料待ちは起こしを立てない")
+                }
+            }
+            val m2 = restore(h, store, identity, finished, fuelPerTick = 20_000)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 燃料は借りのことがあるので、tick を回し続ける
+            eventually(60_000, "最後まで動かない") {
+                h.scheduler.tick()
+                m2.stateOf(s.pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m2.stateOf(s.pid), "${m2.rt(s.pid).lastError}")
+            // 出力のストリームも写しに入っているので、保存の前の分と合わせて全文になる
+            assertEquals(expectedSpin(3, 100_000), output(m2, s.output))
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `イベントで起きたが燃料がないRUNNABLEは、起こしを立てずに待ちを登録し直し、そろった入力で続く`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = startPrompt(h, m, TestMemoryFileSystem())
+            // 止めてから入力を入れる: 起こされても燃料（step）をもらえず、RUNNABLE のまま待機点にいる
+            val hold = m.quiesce()
+            send(m, s.input, "hello\n")
+            eventually(10_000, "RUNNABLE にならない") {
+                h.scheduler.tick()
+                m.stateOf(s.pid) == ProcessState.RUNNABLE && m.isAtWaitPoint
+            }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val kernel = kernelOf(stored(store, identity))
+            val process = kernel.processes[s.pid]!!
+            assertEquals(ProcessState.RUNNABLE, process.state)
+            assertTrue(process.wait?.isNotEmpty() == true, "待ちが残っていない: ${process.wait}")
+            assertFalse(s.pid in kernel.wakeOnRestore, "起こしを使っていない印は立たない")
+            hold.close()
+            m.close()
+
+            val finished = Finished()
+            finished.onFinished = { machine, _ ->
+                machine.lock.withLockValue {
+                    val rt = machine.runtime(s.pid)!!
+                    assertEquals(ProcessState.RUNNABLE, rt.process.state)
+                    assertFalse(rt.restoreWake, "空でない待ちで wakeOnRestore がなければ起こしを立てない")
+                    assertNotNull(rt.waitSet, "待ちを登録し直していない")
+                }
+            }
+            val m2 = restore(h, store, identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 追加の入力なしで、保存の前に入れた行に答える
+            eventually(60_000, "戻したプロセスが答えない: ${output(m2, s.output)}") {
+                h.scheduler.tick()
+                output(m2, s.output).contains("1 hello ")
+            }
+            awaitWaiting(h, Started(m2, s.pid, s.input, s.output), "次の入力を待たない")
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `起こしを使う前に保存し直すとwakeOnRestoreが立ち、戻したRUNNABLEも起こしてから入力を待ち直す`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = startPrompt(h, m, TestMemoryFileSystem())
+            // 世代 1: WAITING_EVENT に wakeOnRestore を立てて書く（本物の取り出しと同じ markWakeOnRestore を使う）
+            val copy = captureCopy(m)
+            copy.markWakeOnRestore(s.pid)
+            val first = store.write(store.assignNewId(owner)!!, owner, copy.toSource()).identity
+            val k1 = kernelOf(stored(store, first))
+            assertEquals(ProcessState.WAITING_EVENT, k1.processes[s.pid]!!.state)
+            assertTrue(s.pid in k1.wakeOnRestore)
+            m.close()
+
+            // 2 台目: 戻した直後に自分でも止め、起こしを使わせないまま保存し直す
+            var hold: QuiesceHandle? = null
+            val finished2 = Finished()
+            finished2.onFinished = { machine, _ ->
+                hold = machine.quiesce()
+                machine.lock.withLockValue { assertTrue(machine.runtime(s.pid)!!.restoreWake, "wakeOnRestore で起こしを立てていない") }
+            }
+            val m2 = restore(h, store, first, finished2)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished2.outcomes.toList())
+            assertTrue(m2.isQuiesced, "自分の quiesce で止まったまま")
+            val copy2 = captureCopy(m2)
+            assertTrue(copy2.wakeOnRestore(s.pid), "起こしを使う前の写しに wakeOnRestore が立たない")
+            m2.lock.withLockValue { assertTrue(m2.runtime(s.pid)!!.restoreWake) }
+            val second = store.write(first, owner, copy2.toSource()).identity
+            val k2 = kernelOf(stored(store, second))
+            // 起こしの予定で RUNNABLE にした（scheduleThreadlessLocked）が、燃料をもらえずに止まっている
+            assertEquals(ProcessState.RUNNABLE, k2.processes[s.pid]!!.state)
+            assertTrue(k2.processes[s.pid]!!.wait?.isNotEmpty() == true)
+            assertTrue(s.pid in k2.wakeOnRestore, "KERNEL 節を往復しても wakeOnRestore が残る")
+
+            // 3 台目: RUNNABLE + wakeOnRestore から戻す
+            val finished3 = Finished()
+            finished3.onFinished = { machine, _ ->
+                machine.lock.withLockValue {
+                    val rt = machine.runtime(s.pid)!!
+                    assertEquals(ProcessState.RUNNABLE, rt.process.state)
+                    assertTrue(rt.restoreWake, "RUNNABLE の wakeOnRestore で起こしを立てていない")
+                }
+            }
+            val m3 = restore(h, store, second, finished3)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished3.outcomes.toList())
+
+            // 2 台目: 止めるのをやめると、起こしを使ってそろいを見ずに続け、入力がないので待ち直す
+            hold!!.close()
+            for ((machine, line) in listOf(m2 to "x", m3 to "y")) {
+                eventually(60_000, "起こしを使って待ち直さない") {
+                    h.scheduler.tick()
+                    machine.lock.withLockValue { !machine.runtime(s.pid)!!.restoreWake } &&
+                        machine.stateOf(s.pid) == ProcessState.WAITING_EVENT && machine.isAtWaitPoint
+                }
+                assertFalse(captureCopy(machine).wakeOnRestore(s.pid), "起こしを使った後の写しに wakeOnRestore が残る")
+                assertFalse(output(machine, s.output).contains("1 "), "入力なしで答えた")
+                send(machine, s.input, "$line\n")
+                eventually(60_000, "起こしの後の入力に答えない: ${output(machine, s.output)}") {
+                    h.scheduler.tick()
+                    output(machine, s.output).contains("1 $line ")
+                }
+            }
+            m2.close()
+            m3.close()
+        }
+    }
+
+    // ---- /tmp と開いたファイル ----
+
+
+    /** `/tmp/x` に書いた模様と、標準出力にしたディスクのファイル `/out.txt` のオブジェクト */
+    private class SavedFiles(val identity: MachineIdentity, val started: Started, val outId: Int, val pattern: ByteArray, val usedBytes: Long)
+
+    /**
+     * 根を本物の [DiskFileSystem]（[disk]）にし、`/tmp` に模様を書き、標準出力をディスクのファイル `/out.txt` にして `prompt` を動かし、
+     * 入力を待ったところで書いて閉じる。戻すマシンは、同じディレクトリを新しく開く（リースは開くだけで移る）
+     */
+    private fun saveWithFiles(h: Harness, store: MachineSaveStore, disk: Path): SavedFiles {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(DiskFileSystem.open(disk), readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 10_000_000)
+        val pattern = ByteArray(10_000) { (it % 251 + 1).toByte() }
+        var outId = 0
+        val s = startPrompt(
+            h,
+            m,
+            DiskFileSystem.open(disk),
+            stdout = { machine ->
+                val out = machine.vfs.open(VfsPath.parse("/out.txt"), OpenOptions(read = false, write = true, create = true, truncate = true))
+                machine.lock.withLockValue { machine.kernel.objects.add(out) }.also { outId = it }
+            },
+        ) { machine ->
+            machine.vfs.createDirectory(VfsPath.parse("/tmp"))
+            assertNull(machine.mountTmp())
+            val t = machine.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = false, write = true, create = true))
+            assertEquals(pattern.size, machine.vfs.write(t, pattern, 0, pattern.size))
+        }
+        // 開いたファイルは、プロセスの標準出力から届く形だけで持つ（テストが足した参照は返す）
+        m.lock.withLockValue { m.kernel.objects.release(outId, m.wakeSink) }
+        assertTrue(m.lock.withLockValue { m.kernel.objects[outId] is OpenFile }, "標準出力の開いたファイルが表にない")
+        eventually(10_000, "プロンプトをファイルに書かない") { String(Files.readAllBytes(disk.resolve("out.txt"))) == "> " }
+        val used = m.memoryAccount.usedBytes
+        val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+        val written = stored(store, identity)
+        assertEquals(1, written.sections.count { it.kind == SnapshotSection.TMPFS }, "TMPFS 節がない")
+        assertEquals(VfsPath.parse("/out.txt"), kernelOf(written).filePaths[outId], "開いたファイルのパスを書いていない")
+        m.close()
+        return SavedFiles(identity, s, outId, pattern, used)
+    }
+
+    @Test
+    fun `tmpと開いたファイルを持つ状態を戻すと、tmpの中身とRAMの勘定が戻り、ファイルの続きに書く`() = timeout(limit) {
+        val store = newStore()
+        val disk = dir.resolve("disk")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWithFiles(h, store, disk)
+            val finished = Finished()
+            val m = restore(h, store, saved.identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // /tmp の中身と、その RAM の勘定（インスタンスの分と合わせて、保存した時と同じ）
+            val t = m.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = true))
+            val buf = ByteArray(saved.pattern.size + 1)
+            assertEquals(saved.pattern.size, m.vfs.read(t, buf, 0, buf.size))
+            assertArrayEquals(saved.pattern, buf.copyOf(saved.pattern.size))
+            assertEquals(saved.usedBytes, m.memoryAccount.usedBytes, "RAM の勘定が保存した時と違う")
+            // 開いたファイル（adoptNode で登録した node）の、保存した位置の続きに答えを書く
+            send(m, saved.started.input, "hello\n")
+            val file = disk.resolve("out.txt")
+            eventually(60_000, "ファイルに答えを書かない") {
+                h.scheduler.tick()
+                String(Files.readAllBytes(file)).split("> ").size - 1 >= 2
+            }
+            val text = String(Files.readAllBytes(file))
+            assertTrue(text.startsWith("> 1 hello "), "保存した位置から続けていない: $text")
+            assertEquals(MachineState.RUNNING, m.state)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `開いたファイルのパスが消えていても戻せ、その操作はSTALEになる`() = timeout(limit) {
+        val store = newStore()
+        val disk = dir.resolve("disk")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWithFiles(h, store, disk)
+            // 保存したマシンを閉じた後に消す（Windows では、開いている間は消せない）
+            Files.delete(disk.resolve("out.txt"))
+            val finished = Finished()
+            val m = restore(h, store, saved.identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList(), "パスが消えていても冷えた起動にしない")
+            val file = m.lock.withLockValue { m.kernel.objects[saved.outId] as OpenFile }
+            val e = assertThrows<FsException> { m.vfs.write(file, "x".toByteArray(), 0, 1) }
+            assertEquals(Errno.STALE, e.errno)
+            assertFalse(Files.exists(disk.resolve("out.txt")), "消えたファイルを作り直した")
+            assertEquals(MachineState.RUNNING, m.state)
+            m.close()
+        }
+    }
+
+    // ---- 冷えた起動の理由 ----
+
+    @Test
+    fun `initを写しの中で殺した世代はKILLED_SECTIONで冷えた起動`() = timeout(limit) {
+        val store = newStore()
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val driver = gated(gate, kind = ProcessKind.WAIT_POINT)
+            driver.abiPayload = null
+            val init = m.spawnTest(h.program(emptyModule()), driver)
+            h.tickUntilTrue { m.stateOf(init) == ProcessState.WAITING_EVENT }
+            m.lock.withLockValue { m.kernel.initPid = init }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val written = stored(store, identity)
+            assertTrue(written.requiresColdBoot)
+            assertEquals(ColdBootReason.INIT_KILLED.code, written.coldBootCode)
+            gate.open()
+            m.close()
+
+            val finished = Finished()
+            val m2 = restore(h, store, identity, finished)
+            assertColdBoot(m2, finished, ColdBootCause.KILLED_SECTION)
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `p1でないABI層のプロセスはUNSUPPORTED_PROCESSで冷えた起動`() = timeout(limit) {
+        val store = newStore()
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val init = m.spawnTest(h.program(emptyModule()), gated(gate, kind = ProcessKind.WAIT_POINT))
+            h.tickUntilTrue { m.stateOf(init) == ProcessState.WAITING_EVENT }
+            m.lock.withLockValue { m.kernel.initPid = init }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val written = stored(store, identity)
+            assertFalse(written.requiresColdBoot)
+            val abi = SnapshotReader(written.sections.single { it.kind == SnapshotSection.PROCESS_ABI }.payload)
+            assertEquals(init, abi.i32())
+            assertEquals(SnapshotSection.ABI_LAYER_TEST, abi.u16())
+            gate.open()
+            m.close()
+
+            val finished = Finished()
+            val m2 = restore(h, store, identity, finished)
+            assertColdBoot(m2, finished, ColdBootCause.UNSUPPORTED_PROCESS)
+            m2.close()
+        }
+    }
+
+    /** [swap] の元のハッシュに、別のバイト列を返す置き場（ハッシュの合わないモジュールを作る） */
+    private class SwappingModuleStore(private val inner: MemoryModuleStore = MemoryModuleStore()) : ModuleStore by inner {
+        @Volatile
+        var swap: Pair<String, ByteArray>? = null
+
+        override fun get(sha256: ByteArray): ByteArray? {
+            val s = swap
+            return if (s != null && ModuleStore.hex(sha256) == s.first) s.second.copyOf() else inner.get(sha256)
+        }
+    }
+
+    /** `prompt` が入力を待ったところを書いて閉じる（根は `disk:root`。[extra] で根の後にマウントを足せる） */
+    private fun savePrompt(h: Harness, store: MachineSaveStore, extra: (Machine) -> Unit = {}): MachineIdentity {
+        val m = h.machine(fuelPerTick = 10_000_000)
+        startPrompt(h, m, TestMemoryFileSystem(), beforeExec = extra)
+        val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+        m.close()
+        return identity
+    }
+
+    @Test
+    fun `読み込み直したモジュールのハッシュが合わなければMODULE_MISMATCH`() = timeout(limit) {
+        val store = newStore()
+        val modules = SwappingModuleStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h ->
+            openFreshRoot(h)
+            val identity = savePrompt(h, store)
+            modules.swap = ModuleStore.hex(ModuleStore.sha256(resource("prompt-wasi.wasm"))) to resource("fuel-spin-wasi.wasm")
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MODULE_MISMATCH)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `置き場のモジュールを読み込めなければMODULE_MISMATCH`() = timeout(limit) {
+        val store = newStore()
+        val modules = MemoryModuleStore()
+        val identity = Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h -> savePrompt(h, store) }
+        // 戻す側のサーバーは、読み込みの上限が厳しい（置き場のバイト列は同じ）
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules, moduleLimits = ModuleLimits(maxBytes = 1)).use { h ->
+            openFreshRoot(h)
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MODULE_MISMATCH)
+            m.close()
+        }
+    }
+
+    /** 閉じた（[FileSystem.retire]）回数を数えるディスク */
+    private class CountingDisk(private val inner: TestMemoryFileSystem = TestMemoryFileSystem()) : FileSystem by inner {
+        val retired = AtomicInteger()
+
+        override fun retire() {
+            retired.incrementAndGet()
+            inner.retire()
+        }
+    }
+
+    @Test
+    fun `ディスクを開けなければMOUNTで冷えた起動にし、先に開いた根は閉じる`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store) { m ->
+                m.vfs.createDirectory(VfsPath.parse("/data"))
+                m.vfs.mount(VfsPath.parse("/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
+            }
+            // 根は開けるが、2つ目のディスク data は開けない
+            val root = CountingDisk()
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(root, readOnly = false) else null }
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MOUNT)
+            eventually(10_000, "先に開いた根を閉じない") { root.retired.get() >= 1 }
+            m.close()
+        }
+    }
+}
