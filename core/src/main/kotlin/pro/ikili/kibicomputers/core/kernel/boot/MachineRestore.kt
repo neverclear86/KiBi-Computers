@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel.boot
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ModuleSource
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -28,8 +29,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.io.IOException
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
 /** 復元を冷えた起動に切り替える（前段の失敗。カーネルの表は空のまま） */
@@ -80,23 +83,71 @@ internal class PreparedRestore(
 }
 
 /**
- * 復元の手順（#85、ADR 0085）。[Machine.restore] が受け付けた後、起動用のスレッド（[BootSequence] と同じ `bootExecutor`）で1回だけ動く。
+ * 復元の手順（#85、ADR 0085）。[Machine.restore] が受け付けた後、起動用のスレッド（[BootSequence] と同じ `bootExecutor`）で段ごとに動く。
+ * モジュールの読み込みを待つ間は、起動用のスレッドを持たない（#577）。読み込みが終わったら、続きを起動用のスレッドに積み直す。
  *
- * 前段（カーネルを変えない）: 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、読み
- * （差分なら基準も）、[SnapshotDecoder] で復号・検査し（`SnapshotInspection` と同じ読み手）、プロセスごとに入口と状態の組み合わせを確かめ、
- * モジュールを置き場の元のバイト列から同じ読み込み方で読み込み直してハッシュを照らし、マウントを開き直し（`/tmp` は `TMPFS` 節から）、
- * 開いたファイルの node をディスクに登録し（I/O なし）、インスタンスを作り直す。どこかで失敗したら、作ったものをすべて返して
- * 冷えた起動（`Machine.restoreFellBack`）にする。
+ * 前段（カーネルを変えない）:
+ * 1. 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、読み（差分なら基準も）、
+ *    [SnapshotDecoder.moduleSources] で p1 の層が参照するモジュールだけを読む（区画は展開しない）。
+ * 2. 別々のモジュールを順に1つずつ、置き場の元のバイト列から同じ読み込み方で読み込む（ProgramCache でサーバー全体と共有）。
+ *    読み込みが終わっていなければ、終わったときに続きを積み直して、スレッドを返す。混んでいたら（[ProgramLoadBusyException]）、
+ *    少し後にタイマーで積み直す。待つ間に持つのは、読んだままの（圧縮のままの）写しと、読み込んだ [Program] だけ。
+ * 3. [SnapshotDecoder] で復号・検査し（`SnapshotInspection` と同じ読み手）、プロセスごとに入口と状態の組み合わせを確かめ、
+ *    ハッシュを照らし、マウントを開き直し（`/tmp` は `TMPFS` 節から）、開いたファイルの node をディスクに登録し（I/O なし）、
+ *    インスタンスを作り直す。
+ *
+ * どこかで失敗したら、作ったものをすべて返して冷えた起動（`Machine.restoreFellBack`）にする。モジュールを読み込めなかったこと
+ * （置き場にない・読み込めない）は、3. でそのモジュールを使う終わっていないプロセスに当たったときに理由にする（読み込みを
+ * 復号より先にしても、冷えた起動の理由の優先は変えない）。
  *
  * 後段（`Machine.completeRestore`。カーネルロックの中）: 表に入れて、実行時の部分（待ちの登録・燃料待ち・CPU の待ち行列）を作る。
+ *
+ * 取り消し（`stop()`・スケジューラの停止）は、待っている読み込みを取り消し（始まっていなければ読み込まない。#363）、
+ * 積み直した続きの頭で黙って抜ける。段から段へは、起動用のスレッドへの積み直しか読み込みの完了で渡すので、欄は一度に1つのスレッドだけが触る
  */
 internal class MachineRestore(private val machine: Machine, private val request: RestoreRequest) {
     private val opener: BootVolumeOpener
         get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
 
+    /** 読んだ写し（1. で読み、3. で復号する） */
+    private var stored: StoredSnapshot? = null
+
+    /** 差分の基準 */
+    private var base: StoredSnapshot? = null
+
+    /** 読み込む別々のモジュール（参照の順） */
+    private var sources: List<ModuleSource> = emptyList()
+
+    /** [sources] のうち、次に読み込むもの */
+    private var next = 0
+
+    /** 読み込んだモジュール（[moduleKey] → [Program]。キャッシュから外れても消えないように強く持つ） */
+    private val programs = HashMap<String, Program>()
+
+    /** 読み込めなかったモジュール（[moduleKey] → 冷えた起動の理由）。使うプロセスがあれば 3. で冷えた起動にする */
+    private val failures = HashMap<String, RestoreFallbackException>()
+
+    /** 今のモジュールが最初に混んでいた時刻（[System.nanoTime]）。混んでいなければ `null` */
+    private var busySince: Long? = null
+
+    /** 終わるのを待っている読み込み（取り消しの登録が見る） */
+    @Volatile
+    private var waiting: CompletableFuture<Program>? = null
+
+    /** 最初の段（起動用のスレッドで1回呼ぶ） */
     fun run() {
+        // 取り消しの登録は復元1回につき1つ（stopLocked の中、カーネルロックの中から呼ばれる。読み込みを取り消すだけ）
+        machine.restoreCancelSignal.whenComplete { _, _ -> waiting?.cancel(false) }
+        step { begin() }
+    }
+
+    /**
+     * 段 [body] を動かす（起動用のスレッドで）。取り消しなら黙って抜け、前段の失敗なら冷えた起動にする。
+     * [body] が前段を終えたら（[PreparedRestore] を返したら）、後段に入る。`null` なら続きは積み直してある
+     */
+    private fun step(body: () -> PreparedRestore?) {
         val prepared = try {
-            prepare()
+            body() ?: return
         } catch (e: RestoreCancelledException) {
             return
         } catch (e: RestoreFallbackException) {
@@ -121,14 +172,27 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
     }
 
+    /**
+     * 続きの段 [body] を起動用のスレッドに積む。読み込み用・タイマーのスレッドから呼ぶので、積む以外のことはしない（#577）。
+     * 受け付けられなければ（スケジューラが閉じた後。閉じるときは先に全台を止めるので、この復元は取り消し済み）何もしない
+     */
+    private fun resume(body: () -> PreparedRestore?) {
+        try {
+            machine.scheduler.bootExecutor.execute { step(body) }
+        } catch (e: RejectedExecutionException) {
+            // 取り消しと同じ（知らせは stopLocked が積んだ）
+        }
+    }
+
     private fun checkCancelled() {
         if (machine.isRestoreCancelled) throw RestoreCancelledException()
     }
 
     private fun fallback(cause: ColdBootCause, message: String, t: Throwable? = null): Nothing = throw RestoreFallbackException(cause, message, t)
 
-    /** 前段。失敗したら作ったものを返してから投げる */
-    private fun prepare(): PreparedRestore {
+    /** 1.: 世代を決めて読み、読み込むモジュールを知る */
+    private fun begin(): PreparedRestore? {
+        checkCancelled()
         val source = request.source
         val store = source.store
         val id = source.id
@@ -145,31 +209,129 @@ internal class MachineRestore(private val machine: Machine, private val request:
             val cause = if (snapshot.coldBootReason == null) ColdBootCause.UNREADABLE else ColdBootCause.KILLED_SECTION
             fallback(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
         }
-        val base = snapshot.deltaBase?.let { read(it.id, it.generation) }
-        checkCancelled()
-        val config = machine.config
-        val decoded = try {
-            SnapshotDecoder.decode(snapshot, config.maxProcesses, config.memoryPages, base)
+        base = snapshot.deltaBase?.let { read(it.id, it.generation) }
+        this.stored = stored
+        val referenced = try {
+            SnapshotDecoder.moduleSources(snapshot, machine.config.maxProcesses)
         } catch (e: SnapshotFormatException) {
             fallback(ColdBootCause.UNREADABLE, "世代 $gen を読めない: ${e.message}", e)
         }
+        val seen = HashSet<String>()
+        sources = referenced.filter { seen.add(moduleKey(it)) }
+        return loadModules()
+    }
+
+    /**
+     * 2.: 残りのモジュールを順に1つずつ読み込む（並べて頼むと、自分の読み込みで待ち行列の上限に当たる。#363）。
+     * 読み込みを待つ・混んでいてやり直すなら、続きを積む手配をして `null` を返す（スレッドを返す）。全部終えたら 3. に進む
+     */
+    private fun loadModules(): PreparedRestore? {
+        while (next < sources.size) {
+            checkCancelled()
+            val source = sources[next]
+            val future = startLoad(source) ?: continue
+            if (!future.isDone) {
+                waiting = future
+                // 登録より先に取り消されていたら、登録の側は waiting を見ていない: ここで取り消す（stopLocked は印を立ててから知らせる）
+                if (machine.isRestoreCancelled) future.cancel(false)
+                future.whenComplete { _, _ -> resume { if (loaded(source, future)) loadModules() else null } }
+                return null
+            }
+            if (!loaded(source, future)) return null
+        }
+        return prepare()
+    }
+
+    /** [source] の読み込みを頼む。置き場になければ失敗を覚えて次に進み、`null` */
+    private fun startLoad(source: ModuleSource): CompletableFuture<Program>? {
+        val bytes = machine.scheduler.moduleStore.get(source.originalHash)
+        if (bytes == null) {
+            failures[moduleKey(source)] = RestoreFallbackException(ColdBootCause.MODULE_MISSING, "モジュール ${source.originalHex} が置き場にない")
+            next++
+            busySince = null
+            return null
+        }
+        val runtime = machine.scheduler.options.runtime
+        val limits = machine.scheduler.options.moduleLimits
+        val waitImports = source.waitImports.toSet()
+        return machine.scheduler.programs.load(machine.id, bytes, source.metered, waitImports) { b ->
+            if (source.metered) Program.loadMetered(runtime, b, limits, waitImports) else Program.load(runtime, b, limits)
+        }
+    }
+
+    /**
+     * 終わった読み込み [future]（[source] のもの）を受け取る（起動用のスレッドで）。次に進めるなら `true`。
+     * 混んでいたら、上限の内ならタイマーでやり直しを積んで `false`、上限を過ぎたら冷えた起動
+     */
+    private fun loaded(source: ModuleSource, future: CompletableFuture<Program>): Boolean {
+        waiting = null
+        checkCancelled()
+        val key = moduleKey(source)
+        val program = try {
+            future.get()
+        } catch (e: CancellationException) {
+            // 読み込みを取り消すのは、復元の取り消しの登録（run）だけ（スケジューラの停止は失敗で終わらせるが、上の checkCancelled で抜ける）
+            throw RestoreCancelledException()
+        } catch (e: ExecutionException) {
+            when (val cause = e.cause ?: e) {
+                is ProgramLoadBusyException -> {
+                    // 読み込みの待ち行列が上限（#363）: 少し後にやり直す（冷えた起動には落とさない）。タイマーのスレッドでは積むだけ
+                    val now = System.nanoTime()
+                    val since = busySince ?: now.also { busySince = it }
+                    if (now - since > TimeUnit.MILLISECONDS.toNanos(BUSY_RETRY_MILLIS)) {
+                        fallback(ColdBootCause.RESTORE_FAILED, "モジュールの読み込みが混んでいる: ${cause.message}", cause)
+                    }
+                    machine.scheduler.timerService.schedule(TimeUnit.MILLISECONDS.toNanos(BUSY_SLEEP_MILLIS)) { resume { loadModules() } }
+                    return false
+                }
+                is WasmLoadException -> {
+                    failures[key] = RestoreFallbackException(
+                        ColdBootCause.MODULE_MISMATCH,
+                        "モジュール ${source.originalHex} を読み込めない: ${cause.message}",
+                        cause,
+                    )
+                    null
+                }
+                else -> throw cause
+            }
+        }
+        if (program != null) programs[key] = program
+        next++
+        busySince = null
+        return true
+    }
+
+    /** 3.: 復号して確かめ、マウントとインスタンスを作り直す。失敗したら作ったものを返してから投げる */
+    private fun prepare(): PreparedRestore {
+        checkCancelled()
+        val stored = checkNotNull(stored)
+        val gen = stored.snapshot.generation
+        val config = machine.config
+        val decoded = try {
+            SnapshotDecoder.decode(stored.snapshot, config.maxProcesses, config.memoryPages, base)
+        } catch (e: SnapshotFormatException) {
+            fallback(ColdBootCause.UNREADABLE, "世代 $gen を読めない: ${e.message}", e)
+        }
+        // 復号した後は、読んだ写しを持たない
+        this.stored = null
+        base = null
         validate(decoded)
         checkCancelled()
 
-        // プログラムを読み込み直す（同じモジュールは1回。ProgramCache でサーバー全体と共有）
-        val programs = HashMap<Int, Program>()
-        val byKey = HashMap<String, Program>()
+        val byPid = HashMap<Int, Program>()
         for (p in decoded.kernel.processes.all()) {
             if (p.state.isTerminal) continue
             val layer = decoded.p1.getValue(p.pid)
-            val key = layer.moduleSource.originalHex + "/" + layer.moduleSource.metered + "/" + layer.moduleSource.waitImports
-            val program = byKey[key] ?: loadProgram(layer.moduleSource).also { byKey[key] = it }
+            val key = moduleKey(layer.moduleSource)
+            failures[key]?.let { throw it }
+            // 先読みは同じ節から読んだので、ないのは写しが不正なときだけ
+            val program = programs[key] ?: fallback(ColdBootCause.UNREADABLE, "pid ${p.pid} のモジュールの参照が先読みと合わない")
             if (program.hash != layer.loadedHash || program.hash != p.moduleHash) {
                 fallback(ColdBootCause.MODULE_MISMATCH, "pid ${p.pid} のモジュールを読み込み直したハッシュが合わない")
             }
-            programs[p.pid] = program
-            checkCancelled()
+            byPid[p.pid] = program
         }
+        checkCancelled()
 
         val fileSystems = LinkedHashMap<Int, FileSystem>()
         val runtimes = ArrayList<Pair<ProcessRuntime, WasmInstance?>>()
@@ -179,7 +341,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
             checkCancelled()
             for (p in decoded.kernel.processes.all().sortedBy { it.pid }) {
                 if (p.state.isTerminal) continue
-                val program = programs.getValue(p.pid)
+                val program = byPid.getValue(p.pid)
                 val driver = try {
                     KernelDrivers.DEFAULT.create(program)
                 } catch (e: FsException) {
@@ -253,50 +415,6 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
     }
 
-    /** [source] のモジュールを置き場の元のバイト列から、保存したときと同じ読み込み方で読み込む（ProgramCache で共有） */
-    private fun loadProgram(source: pro.ikili.kibicomputers.core.kernel.process.ModuleSource): Program {
-        val bytes = machine.scheduler.moduleStore.get(source.originalHash)
-            ?: fallback(ColdBootCause.MODULE_MISSING, "モジュール ${source.originalHex} が置き場にない")
-        val runtime = machine.scheduler.options.runtime
-        val limits = machine.scheduler.options.moduleLimits
-        val waitImports = source.waitImports.toSet()
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(BUSY_RETRY_MILLIS)
-        while (true) {
-            checkCancelled()
-            val future = machine.scheduler.programs.load(machine.id, bytes, source.metered, waitImports) { b ->
-                if (source.metered) Program.loadMetered(runtime, b, limits, waitImports) else Program.load(runtime, b, limits)
-            }
-            try {
-                return await(future)
-            } catch (e: ProgramLoadBusyException) {
-                // 読み込みの待ち行列が上限（#363）: 少し待ってやり直す（冷えた起動には落とさない）
-                if (System.nanoTime() > deadline) fallback(ColdBootCause.RESTORE_FAILED, "モジュールの読み込みが混んでいる: ${e.message}", e)
-                Thread.sleep(BUSY_SLEEP_MILLIS)
-            } catch (e: WasmLoadException) {
-                fallback(ColdBootCause.MODULE_MISMATCH, "モジュール ${source.originalHex} を読み込めない: ${e.message}", e)
-            }
-        }
-    }
-
-    /** 読み込みの終わりを待つ。取り消されたら待つのをやめる（始まっていない読み込みは取り消す） */
-    private fun await(future: CompletableFuture<Program>): Program {
-        val cancel = machine.restoreCancelSignal
-        try {
-            CompletableFuture.anyOf(future, cancel).get()
-        } catch (e: ExecutionException) {
-            // 下の future.get() で投げ直す
-        }
-        if (!future.isDone) {
-            future.cancel(false)
-            throw RestoreCancelledException()
-        }
-        return try {
-            future.get()
-        } catch (e: ExecutionException) {
-            throw e.cause ?: e
-        }
-    }
-
     /** マウントの表のファイルシステムを開き直す（1つでも開けなければ冷えた起動） */
     private fun openMounts(decoded: DecodedSnapshot, out: MutableMap<Int, FileSystem>) {
         for (entry in decoded.kernel.mounts.entries) {
@@ -345,7 +463,10 @@ internal class MachineRestore(private val machine: Machine, private val request:
         /** 読み込みの待ち行列が混んでいるときに、やり直し続ける上限（仮の値） */
         private const val BUSY_RETRY_MILLIS: Long = 60_000
 
-        /** 読み込みのやり直しの間隔 */
+        /** 読み込みのやり直しの間隔（タイマーで積み直す。#577） */
         private const val BUSY_SLEEP_MILLIS: Long = 20
+
+        /** 同じ読み込み方のモジュールを1つにまとめるキー（元のハッシュ・計測・止まりうる import） */
+        private fun moduleKey(source: ModuleSource): String = source.originalHex + "/" + source.metered + "/" + source.waitImports
     }
 }

@@ -94,18 +94,7 @@ internal object P1SectionCodec {
             throw SnapshotFormatException("p1 の層の版 $layerVersion を知らない")
         }
         val input = SnapshotReader(payload)
-        val original = input.raw(ModuleHash.SIZE)
-        val loaded = ModuleHash.fromBytes(input.raw(ModuleHash.SIZE))
-        val metered = input.bool()
-        val importCount = input.count(Int.MAX_VALUE, 4)
-        val imports = List(importCount) { input.string(MAX_IMPORT_NAME) }
-        if (imports.toSet().size != imports.size || imports != imports.sorted()) {
-            throw SnapshotFormatException("止まりうる import の並びが不正")
-        }
-        val version = input.i32()
-        if (version < 0) throw SnapshotFormatException("変換器の版 $version が不正")
-        val fuelYield = input.bool()
-        val source = ModuleSource(original, metered, imports, version, fuelYield)
+        val (source, loaded) = readModuleReference(input)
         val entry = input.u8()
         if (entry > ENTRY_REWIND) throw SnapshotFormatException("入口 $entry が不正")
         val instance = if (entry == ENTRY_NO_INSTANCE) null else InstanceStateCodec.read(input, layerVersion, budget)
@@ -124,5 +113,33 @@ internal object P1SectionCodec {
         }
         input.expectEnd()
         return DecodedP1Process(source, loaded, entry, instance, stack, wait)
+    }
+
+    /**
+     * 層の中身の先頭のモジュールの参照だけを読む（#577。復元の前段が、復号する前に読み込むモジュールを知るため）。
+     * 後ろ（インスタンスの状態など）は読まないので、区画は展開しない。参照の形は層の版 1・2 で同じ
+     */
+    @Throws(SnapshotFormatException::class)
+    fun readModuleSource(payload: ByteArray, layerVersion: Int): ModuleSource {
+        if (layerVersion != InstanceStateCodec.VERSION_1 && layerVersion != InstanceStateCodec.VERSION_2) {
+            throw SnapshotFormatException("p1 の層の版 $layerVersion を知らない")
+        }
+        return readModuleReference(SnapshotReader(payload)).first
+    }
+
+    /** 先頭のモジュールの参照（元のハッシュ・計測・止まりうる import・変換器の版・段1）と後のハッシュ */
+    private fun readModuleReference(input: SnapshotReader): Pair<ModuleSource, ModuleHash> {
+        val original = input.raw(ModuleHash.SIZE)
+        val loaded = ModuleHash.fromBytes(input.raw(ModuleHash.SIZE))
+        val metered = input.bool()
+        val importCount = input.count(Int.MAX_VALUE, 4)
+        val imports = List(importCount) { input.string(MAX_IMPORT_NAME) }
+        if (imports.toSet().size != imports.size || imports != imports.sorted()) {
+            throw SnapshotFormatException("止まりうる import の並びが不正")
+        }
+        val version = input.i32()
+        if (version < 0) throw SnapshotFormatException("変換器の版 $version が不正")
+        val fuelYield = input.bool()
+        return ModuleSource(original, metered, imports, version, fuelYield) to loaded
     }
 }

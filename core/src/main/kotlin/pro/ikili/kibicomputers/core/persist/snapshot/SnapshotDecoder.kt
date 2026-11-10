@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.persist.snapshot
 
+import pro.ikili.kibicomputers.core.kernel.process.ModuleSource
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
@@ -102,6 +103,32 @@ internal object SnapshotDecoder {
             if (tmpfs.put(decoded.mountId, decoded) != null) throw SnapshotFormatException("マウント ${decoded.mountId} の TMPFS 節が重なる")
         }
         return DecodedSnapshot(kernel, p1, layers, tmpfs)
+    }
+
+    /**
+     * 復号する前に、`PROCESS_ABI` 節の p1 の層が参照するモジュールを、節の順に読む（#577。重複は除かない）。
+     * 各節の先頭（pid・層・モジュールの参照）だけを読み、インスタンスの状態は読まない（区画を展開しない）。
+     * 節の数が [maxProcesses] を超えるものは [SnapshotFormatException]（[decode] も必ず断る形）。
+     * ここで断れるものは [decode] も断るので、先に呼んでも冷えた起動の理由は変わらない
+     */
+    @Throws(SnapshotFormatException::class)
+    fun moduleSources(snapshot: MachineSnapshot, maxProcesses: Int): List<ModuleSource> {
+        if (snapshot.requiresColdBoot) throw SnapshotFormatException("冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
+        val result = ArrayList<ModuleSource>()
+        var count = 0
+        for (section in snapshot.sections) {
+            if (section.kind != SnapshotSection.PROCESS_ABI) continue
+            if (++count > maxProcesses) throw SnapshotFormatException("PROCESS_ABI 節が $maxProcesses 個より多い")
+            if (section.version != SnapshotSection.PROCESS_ABI_VERSION) {
+                throw SnapshotFormatException("PROCESS_ABI 節の版 ${section.version}")
+            }
+            val input = SnapshotReader(section.payloadUnsafe())
+            input.i32()
+            val layer = input.u16()
+            val layerVersion = input.u16()
+            if (layer == SnapshotSection.ABI_LAYER_P1) result += P1SectionCodec.readModuleSource(input.raw(input.remaining), layerVersion)
+        }
+        return result
     }
 
     /** `PROCESS_ABI` 節を読む（pid・層・p1 の層なら中身） */
