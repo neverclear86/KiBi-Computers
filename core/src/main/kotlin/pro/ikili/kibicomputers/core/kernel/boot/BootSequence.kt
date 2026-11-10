@@ -84,11 +84,9 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             } catch (e: Exception) {
                 null
             }
-            if (volume == null) {
-                // 取り消されて開かなかったのなら、開けなかった候補として数えずに抜ける（#588）
-                if (machine.isBootCancelled) throw BootCancelledException()
-                continue
-            }
+            // 取り消されて開かなかったときも、ここは `continue` でよい: 次の周の頭で取り消しを見て抜ける。最後の候補でも、
+            // `endBoot` は取り消されていれば失敗を知らせない（#588）
+            ?: continue
             opened++
             if (hasInit(volume)) return diskId to volume
             // 選ばなかった候補は閉じる（ホストのディスクのリースを返す）

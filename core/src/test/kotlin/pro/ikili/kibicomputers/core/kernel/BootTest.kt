@@ -621,7 +621,7 @@ class BootTest {
             assertTrue(m.awaitTermination(5_000))
             assertEquals(MachineState.STOPPED, m.state)
             assertTrue(host.failures.isEmpty(), "取り消された起動は失敗を知らせない: ${host.failures}")
-            assertEquals(leases + 1, HostDiskLeases.size, "A が断った分のリースは返す")
+            assertEquals(1, HostDiskLeases.usersOf(diskDir.toRealPath()), "A が断った分のリースは返す（持つのは B だけ）")
             // B のディスクは今も使える（直す前は、A が世代を進めて IO になった）
             assertEquals(FileType.REGULAR_FILE, b.vfs.stat(VfsPath.parse("/sbin/init")).type)
             val f = b.vfs.open(VfsPath.parse("/hello.txt"), OpenOptions(read = true, write = true, create = true))
@@ -671,7 +671,7 @@ class BootTest {
             tickUntil("A の起動の手順が終わらない") { !m.isBooting }
             assertTrue(m.awaitTermination(5_000))
             assertFalse(host.console.contains("/home not mounted"), "取り消された起動は home の失敗を書かない")
-            assertEquals(leases + 1, HostDiskLeases.size, "A が断った分のリースは返す")
+            assertEquals(1, HostDiskLeases.usersOf(homeDir.toRealPath()), "A が断った分のリースは返す（持つのは B だけ）")
             val f = b.vfs.open(VfsPath.parse("/home/hello.txt"), OpenOptions(read = true, write = true, create = true))
             b.vfs.write(f, "hi".toByteArray(), 0, 2)
             b.vfs.close(f)

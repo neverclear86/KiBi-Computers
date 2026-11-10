@@ -110,4 +110,7 @@ internal object HostDiskLeases {
 
     /** 表にあるリースの数（テスト用） */
     val size: Int get() = leases.size
+
+    /** [root]（`toRealPath` したもの）のリースを持っている者の数。表になければ 0（テスト用） */
+    fun usersOf(root: Path): Int = leases[root]?.users ?: 0
 }

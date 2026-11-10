@@ -556,59 +556,79 @@ class MachineRestoreBranchesTest {
         // #588: A の前段は openMounts で取り消しを確かめた直後（開く前）に止まる。その間に A を閉じ、B が同じ世代を戻してから A を放す
         val store = newStore()
         val disk = dir.resolve("disk")
-        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
-            val saved = saveWithFiles(h, store, disk)
-            val real = BootVolumeOpener.forDisks({ id -> if (id == "root") ResolvedDisk(disk, 1L shl 30, 4096) else null }, HostFileBudget())
-            val aEntered = CountDownLatch(1)
-            val aRelease = CountDownLatch(1)
-            val aDone = CountDownLatch(1)
-            val aOpened = AtomicReference<BootVolume?>()
-            val calls = AtomicInteger()
-            h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
-                override fun open(diskId: String): BootVolume? = open(diskId) { false }
+        // 取り消された前段を冷えた起動に流すと、復元の WARNING（「戻せないので冷えた起動にする」）が残る。restoreFellBack は取り消しなら何もしないので、これだけが差になる
+        val warnings = Collections.synchronizedList(ArrayList<String>())
+        val restoreLog = java.util.logging.Logger.getLogger("kibicomputers.restore")
+        val logHandler = object : java.util.logging.Handler() {
+            override fun publish(record: java.util.logging.LogRecord) {
+                if (record.level == java.util.logging.Level.WARNING) warnings.add(record.message)
+            }
 
-                override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
-                    if (calls.getAndIncrement() != 0) return real.open(diskId, cancelled)
-                    aEntered.countDown()
-                    aRelease.await()
-                    try {
-                        return real.open(diskId, cancelled).also { aOpened.set(it) }
-                    } finally {
-                        aDone.countDown()
+            override fun flush() = Unit
+
+            override fun close() = Unit
+        }
+        restoreLog.addHandler(logHandler)
+        try {
+            Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+                val saved = saveWithFiles(h, store, disk)
+                val real = BootVolumeOpener.forDisks({ id -> if (id == "root") ResolvedDisk(disk, 1L shl 30, 4096) else null }, HostFileBudget())
+                val aEntered = CountDownLatch(1)
+                val aRelease = CountDownLatch(1)
+                val aDone = CountDownLatch(1)
+                val aOpened = AtomicReference<BootVolume?>()
+                val calls = AtomicInteger()
+                h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
+                    override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+                    override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+                        if (calls.getAndIncrement() != 0) return real.open(diskId, cancelled)
+                        aEntered.countDown()
+                        aRelease.await()
+                        try {
+                            return real.open(diskId, cancelled).also { aOpened.set(it) }
+                        } finally {
+                            aDone.countDown()
+                        }
                     }
                 }
-            }
-            val aFinished = Finished()
-            val a = h.machine(fuelPerTick = 10_000_000)
-            assertTrue(a.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), aFinished.listener)))
-            eventually(60_000, "A の前段がディスクを開きに来ない") {
-                h.scheduler.tick()
-                aEntered.count == 0L
-            }
-            a.close()
-            assertTrue(a.isRestoreCancelled)
-            val finished = Finished()
-            val b = restore(h, store, saved.identity, finished)
-            try {
-                assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
-                aRelease.countDown()
-                assertTrue(aDone.await(10, TimeUnit.SECONDS))
-                assertNull(aOpened.get(), "取り消された前段はディスクを開かない")
-                h.scheduler.tick()
-                assertTrue(aFinished.outcomes.none { it.first == RestoreOutcome.COLD_BOOT }, "取り消された前段を冷えた起動に流した: ${aFinished.outcomes}")
-                // B の開いたファイル（ディスクの /out.txt）に、今も書ける（直す前は、A が世代を進めて IO になった）
-                send(b, saved.started.input, "hello\n")
-                val file = disk.resolve("out.txt")
-                eventually(60_000, "ファイルに答えを書かない") {
+                val aFinished = Finished()
+                val a = h.machine(fuelPerTick = 10_000_000)
+                assertTrue(a.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), aFinished.listener)))
+                eventually(60_000, "A の前段がディスクを開きに来ない") {
                     h.scheduler.tick()
-                    String(Files.readAllBytes(file)).split("> ").size - 1 >= 2
+                    aEntered.count == 0L
                 }
-                assertTrue(String(Files.readAllBytes(file)).startsWith("> 1 hello "))
-                assertEquals(MachineState.RUNNING, b.state)
-            } finally {
-                aRelease.countDown()
-                b.close()
+                a.close()
+                assertTrue(a.isRestoreCancelled)
+                val finished = Finished()
+                val b = restore(h, store, saved.identity, finished)
+                try {
+                    assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+                    aRelease.countDown()
+                    assertTrue(aDone.await(10, TimeUnit.SECONDS))
+                    assertNull(aOpened.get(), "取り消された前段はディスクを開かない")
+                    // aDone は opener の中で下りるので、A の前段の段が終わる（起動用のスレッドが空く）まで待ってから見る
+                    eventually(10_000, "A の前段の段が終わらない") { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+                    h.scheduler.tick()
+                    assertTrue(aFinished.outcomes.none { it.first == RestoreOutcome.COLD_BOOT }, "取り消された前段を冷えた起動に流した: ${aFinished.outcomes}")
+                    assertTrue(warnings.none { it.contains("冷えた起動にする") }, "取り消された前段を冷えた起動の経路に流した: $warnings")
+                    // B の開いたファイル（ディスクの /out.txt）に、今も書ける（直す前は、A が世代を進めて IO になった）
+                    send(b, saved.started.input, "hello\n")
+                    val file = disk.resolve("out.txt")
+                    eventually(60_000, "ファイルに答えを書かない") {
+                        h.scheduler.tick()
+                        String(Files.readAllBytes(file)).split("> ").size - 1 >= 2
+                    }
+                    assertTrue(String(Files.readAllBytes(file)).startsWith("> 1 hello "))
+                    assertEquals(MachineState.RUNNING, b.state)
+                } finally {
+                    aRelease.countDown()
+                    b.close()
+                }
             }
+        } finally {
+            restoreLog.removeHandler(logHandler)
         }
     }
 
