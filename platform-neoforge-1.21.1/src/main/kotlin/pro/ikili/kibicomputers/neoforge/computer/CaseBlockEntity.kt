@@ -215,7 +215,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     /**
      * 動いているマシンの写しを取り、世代のファイルの書き込みを予約して書き込みのスレッドに回す（#81・#84）。マシンがない・取り出し済み・
-     * [policy] が [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら何もせず `null`。ID がなければ置き場が振る（`owner.bin` も書き込みのスレッドで書く）。
+     * [policy] が [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT・復元の途中（終わりの知らせが返るまで）・冷えた起動待ちなら何もせず `null`（#589）。ID がなければ置き場が振る（`owner.bin` も書き込みのスレッドで書く）。
      * 今の ID（[currentIdentity]）があれば、置き場の今の基準からの差分の世代にする（#83。基準が使えなければ全体を取り直す）。
      * [identity] は変えない（完了か [adoptPendingSave] で進む）。取り出しの時間は [ServerMachines.Stats] に数える（負荷試験用。#553）
      *
