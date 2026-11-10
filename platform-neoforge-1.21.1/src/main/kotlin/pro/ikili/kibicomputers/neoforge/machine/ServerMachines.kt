@@ -641,8 +641,11 @@ object ServerMachines {
     private fun saveForDemotion(holder: ChunkHolder): Boolean {
         if (holder.fullStatus.isOrAfter(FullChunkStatus.FULL)) return false
         val chunk = holder.latestChunk as? LevelChunk ?: return false
-        val cases = chunk.blockEntities.values.filterIsInstance<CaseBlockEntity>()
-            .filter { !it.isRemoved && it.computer.machine != null }
+        val live = chunk.blockEntities.values.filterIsInstance<CaseBlockEntity>().filter { !it.isRemoved }
+        // 復元の順番待ちの台（マシンがまだない）は、取り出すものがないので、順番待ちから外して電源を切った見た目に戻すだけ（#545）。
+        // 外さないと順番が来たときに、FULL でないチャンクにマシンを作ってしまう
+        for (be in live) if (be.computer.machine == null && be.computer.isRestorePending) be.chunkDemoted(chunk)
+        val cases = live.filter { it.computer.machine != null }
         if (cases.isEmpty()) return false
         Stats.demotedChunksWithCases++
         saveForUnload(chunk, cases, adopt = false)

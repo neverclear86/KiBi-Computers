@@ -5,6 +5,7 @@ import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.nbt.CompoundTag
+import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.block.Blocks
@@ -191,5 +192,65 @@ object MachineRestoreGameTests {
             helper.assertTrue(be.computer.machine == null, "no machine should be created")
             helper.setBlock(CASE, Blocks.AIR)
         }.thenSucceed()
+    }
+
+    /**
+     * 復元の順番待ちの間にチャンクが FULL でなくなると（#545）、順番待ちから外れ、電源が切れた見た目に戻る。
+     * 外れていないと、順番が来たときに FULL でないチャンクにマシンを作ってしまう。電源の状態は残るので、FULL に戻れば復元の順番待ちに入る。
+     * 順番待ちが書き込みの終わりを待つように、書き込みのスレッドを止めたまま書き込みを1つ積んでおく
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400, batch = "demoted_pending_restore")
+    fun demotedChunkDropsAPendingRestore(helper: GameTestHelper) {
+        val level = helper.level
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 420, helper.absolutePos(CASE).z / 16 + 420)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        val config = ServerMachines.saveConfig
+        // 順番待ちが、書き込みの終わりを十分待つようにする（テストの間だけ）
+        ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 60_000)
+        var starts = 0L
+        var gate: WriterGate? = null
+        // onLoad（追跡と索引）を待ってから、書き込みを積む
+        helper.runAfterDelay(1) {
+            be.computer.prepareUnload()
+            gate = WriterGate()
+            helper.assertTrue(be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null, "the case should submit a write")
+            // マシンだけを外し（電源の状態は残る）、書き込みの終わりを待つ復元の順番待ちに入れてから、FULL でなくす
+            be.computer.chunkUnloaded()
+            starts = ServerMachines.Stats.restoresFromSave + ServerMachines.Stats.restoresColdStart
+            helper.assertTrue(be.computer.beginRestore(), "the powered-on case should wait for a restore")
+            ServerMachines.offerRestore(be)
+            level.setChunkForced(chunk.x, chunk.z, false)
+            helper.startSequence().thenWaitUntil {
+                helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
+                helper.assertTrue(!be.computer.isRestorePending, "the pending restore should be dropped: ${be.computer}")
+            }.thenExecute {
+                // 書き込みを終わらせても、順番待ちから外れているので始まらない
+                gate!!.close()
+                ServerMachines.drainSaves()
+            }.thenIdle(20).thenExecute {
+                helper.assertTrue(
+                    ServerMachines.Stats.restoresFromSave + ServerMachines.Stats.restoresColdStart == starts,
+                    "no restore should start in a non-FULL chunk",
+                )
+                helper.assertTrue(be.computer.machine == null, "no machine should be created in a non-FULL chunk: ${be.computer}")
+                helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should look off: ${be.computer}")
+                helper.assertTrue(be.computer.poweredOn, "the power state should be kept for the next load")
+                ServerMachines.saveConfig = config
+                level.setChunkForced(chunk.x, chunk.z, true)
+                level.getChunk(chunk.x, chunk.z)
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+                level.setChunkForced(chunk.x, chunk.z, false)
+                level.setChunkForced(keeper.x, keeper.z, false)
+            }.thenSucceed()
+        }
     }
 }
