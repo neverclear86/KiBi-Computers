@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
+import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -30,12 +31,19 @@ import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.runtime.WasmInstance
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
+import pro.ikili.kibicomputers.core.runtime.WasmLinkException
+import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -83,7 +91,7 @@ class MachineRestoreTest {
     /**
      * `prompt` を init として動かし、入力を待ったところで置き場に書き、マシンを閉じる。根は `disk:root`（[root] を開く口を [h] に入れる）
      */
-    private fun saveWaitingPrompt(h: Harness, store: MachineSaveStore, root: TestMemoryFileSystem): Saved {
+    private fun saveWaitingPrompt(h: Harness, store: MachineSaveStore, root: TestMemoryFileSystem, tmpBytes: Int = 0): Saved {
         // 戻すマシンには、新しい空のファイルシステムを渡す（閉じたマシンの根は使わない）
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
         val m = h.machine(fuelPerTick = 10_000_000)
@@ -92,6 +100,13 @@ class MachineRestoreTest {
         m.vfs.createDirectory(VfsPath.parse("/bin"))
         val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
         m.vfs.write(f, bytes, 0, bytes.size)
+        if (tmpBytes > 0) {
+            // /tmp の中身も写す（戻すときに RAM の勘定に数え直す）
+            m.vfs.createDirectory(VfsPath.parse("/tmp"))
+            assertNull(m.mountTmp())
+            val t = m.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = false, write = true, create = true))
+            assertEquals(tmpBytes, m.vfs.write(t, ByteArray(tmpBytes), 0, tmpBytes))
+        }
         val (input, output) = m.lock.withLockValue {
             ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
         }
@@ -113,6 +128,35 @@ class MachineRestoreTest {
     }
 
     private fun bootConfig(): BootConfig = BootConfig.builder().addBootDisk("none").build()
+
+    /** 閉じた（[FileSystem.retire]）回数を数えるディスク（復元で開き直すディスクの後始末を確かめる） */
+    private class CountingDisk(private val inner: TestMemoryFileSystem = TestMemoryFileSystem()) : FileSystem by inner {
+        val retired = AtomicInteger()
+
+        override fun retire() {
+            retired.incrementAndGet()
+            inner.retire()
+        }
+    }
+
+    /** 戻すマシンが開く根のディスクを [disk] にする */
+    private fun openRootAs(h: Harness, disk: FileSystem) {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(disk, readOnly = false) else null }
+    }
+
+    /** 作り直し（instantiateForRestore）だけ [WasmLinkException] で断るランタイム（RAM の不足でない失敗） */
+    private class LinkFailingRestoreRuntime(private val inner: WasmRuntime) : WasmRuntime by inner {
+        override fun load(bytes: ByteArray): WasmModule {
+            val module = inner.load(bytes)
+            return object : WasmModule by module {
+                override fun instantiateForRestore(config: WasmInstanceConfig, state: WasmInstanceState): WasmInstance =
+                    throw WasmLinkException("テスト: 状態が合わない")
+            }
+        }
+    }
+
+    private fun request(saved: Saved, store: MachineSaveStore, finished: Finished): RestoreRequest =
+        RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), finished.listener)
 
     @Test
     fun `入力を待っていたp1のプロセスを戻し、続きの入力に答える`() = timeout(limit) {
@@ -251,14 +295,22 @@ class MachineRestoreTest {
     }
 
     @Test
-    fun `表に入れる途中で失敗したらCRASHEDにし、知らせは送らない`() = timeout(limit) {
+    fun `表に入れる途中で失敗したらCRASHEDにし、知らせは送らず、作ったものを返す`() = timeout(limit) {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
-            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
-            h.scheduler.hooks.duringRestoreInstall = { throw IllegalStateException("テストの失敗") }
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem(), tmpBytes = 10_000)
+            val disk = CountingDisk()
+            openRootAs(h, disk)
+            val base = h.scheduler.memoryAccount.usedBytes
+            var duringInstall = -1L
+            // つないだ後（マウント・/tmp を表に入れ、プロセスはまだ runtimes に入れていない）で落とす
+            h.scheduler.hooks.duringRestoreInstall = { m ->
+                duringInstall = m.memoryAccount.usedBytes
+                throw IllegalStateException("テストの失敗")
+            }
             val m = h.machine(fuelPerTick = 10_000_000)
             val finished = Finished()
-            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), finished.listener)))
+            assertTrue(m.restore(request(saved, store, finished)))
             eventually(60_000, "CRASHED にならない") {
                 h.scheduler.tick()
                 m.state == MachineState.CRASHED
@@ -268,6 +320,149 @@ class MachineRestoreTest {
             assertFalse(m.isRestoring)
             assertFalse(m.isQuiesced)
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
+            // インスタンス・/tmp の RAM はサーバー全体の勘定にも返り、ディスクは閉じる（#576。起動用スレッドで返す）
+            assertTrue(duringInstall >= 10_000, "戻す途中で RAM を数えていない（$duringInstall）")
+            eventually(10_000, "RAM が返らない") { h.scheduler.memoryAccount.usedBytes == base }
+            assertEquals(0L, m.memoryAccount.usedBytes)
+            eventually(10_000, "ディスクを閉じない") { disk.retired.get() >= 1 }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `表に何も入れる前に後段が失敗しても、作ったものを返す`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem(), tmpBytes = 10_000)
+            val disk = CountingDisk()
+            openRootAs(h, disk)
+            val base = h.scheduler.memoryAccount.usedBytes
+            var beforeInstall = -1L
+            // 表を空でなくして、後段の最初の確かめで落とす
+            h.scheduler.hooks.beforeRestoreInstall = { m ->
+                beforeInstall = m.memoryAccount.usedBytes
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:dummy")
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "CRASHED にならない") {
+                h.scheduler.tick()
+                m.state == MachineState.CRASHED
+            }
+            repeat(3) { h.scheduler.tick() }
+            assertTrue(finished.outcomes.isEmpty())
+            assertFalse(m.isColdBootPending, "後段の失敗は冷えた起動にしない")
+            assertTrue(beforeInstall >= 10_000, "戻す途中で RAM を数えていない（$beforeInstall）")
+            eventually(10_000, "RAM が返らない") { h.scheduler.memoryAccount.usedBytes == base }
+            eventually(10_000, "ディスクを閉じない") { disk.retired.get() >= 1 }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `冷えた起動待ちで知らせを配る前にstopすると、CANCELLEDが1回だけ届く`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness().use { h ->
+            val identity = store.assignNewId(owner)!!
+            val m = h.machine()
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, 5), bootConfig(), finished.listener)))
+            // tick を回さない（知らせを配らない）まま、前段が冷えた起動待ちに切り替えるのを待つ
+            eventually(10_000, "冷えた起動待ちにならない") { m.isColdBootPending }
+            m.stop()
+            repeat(5) { h.scheduler.tick() }
+            finished.assertNoErrors()
+            val (machine, outcome, cause) = finished.outcomes.single()
+            assertTrue(machine === m)
+            assertEquals(RestoreOutcome.CANCELLED, outcome)
+            assertNull(cause)
+            assertFalse(m.isBooting, "冷えた起動を始めない")
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced)
+            assertFalse(m.isColdBootPending)
+            assertEquals(MachineState.STOPPED, m.state)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `取り消した後のrestoreは断り、古い前段のものは返す`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem(), tmpBytes = 10_000)
+            val base = h.scheduler.memoryAccount.usedBytes
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            var beforeInstall = -1L
+            h.scheduler.hooks.beforeRestoreInstall = { m ->
+                beforeInstall = m.memoryAccount.usedBytes
+                entered.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            assertTrue(entered.await(60, TimeUnit.SECONDS))
+            m.stop()
+            // 古い前段はまだ後段の手前で止まっている: 受け付け直すと、古い prepared を表に入れてしまう
+            assertFalse(m.restore(request(saved, store, finished)), "取り消したマシンの restore は断る")
+            release.countDown()
+            eventually(10_000, "RAM が返らない") {
+                h.scheduler.tick()
+                h.scheduler.memoryAccount.usedBytes == base
+            }
+            repeat(3) { h.scheduler.tick() }
+            finished.assertNoErrors()
+            assertTrue(beforeInstall >= 10_000, "戻す途中で RAM を数えていない（$beforeInstall）")
+            assertEquals(listOf(RestoreOutcome.CANCELLED), finished.outcomes.map { it.second })
+            assertEquals(MachineState.STOPPED, m.state)
+            assertEquals(0, m.lock.withLockValue { m.kernel.processes.size })
+            assertTrue(m.lock.withLockValue { m.kernel.mounts.entries.isEmpty() })
+            assertFalse(m.isQuiesced)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `サーバー全体のRAMが足りずにインスタンスを作り直せなければNO_MEMORY`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val config = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).totalMemoryBytes(256L * 1024 * 1024).build()
+        Harness(config, execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val total = h.scheduler.memoryAccount
+            val filler = total.limitBytes - total.usedBytes
+            assertTrue(total.tryReserveBytes(filler), "サーバー全体の RAM を埋める")
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(RestoreOutcome.COLD_BOOT, finished.outcomes.single().second)
+            assertEquals(ColdBootCause.NO_MEMORY, finished.outcomes.single().third)
+            m.close()
+            total.releaseBytes(filler)
+        }
+    }
+
+    @Test
+    fun `RAMの不足でなくインスタンスを作り直せなければRESTORE_FAILED`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = LinkFailingRestoreRuntime(EndiveRuntime()), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(RestoreOutcome.COLD_BOOT, finished.outcomes.single().second)
+            assertEquals(ColdBootCause.RESTORE_FAILED, finished.outcomes.single().third)
             m.close()
         }
     }

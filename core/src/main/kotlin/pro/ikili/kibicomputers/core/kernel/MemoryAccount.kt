@@ -103,13 +103,21 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     /** 今使っているバイト数（線形メモリとテーブルの合計） */
     val usedBytes: Long get() = usedBytesCounter.get()
 
+    /**
+     * 確保を一度でも断ったか（プロセスの上限・マシンの RAM・サーバー全体のどれか）。インスタンスを作り直せなかった理由が
+     * RAM の不足か（`ColdBootCause.NO_MEMORY`）、それ以外か（`RESTORE_FAILED`）を分けるのに使う（#576）
+     */
+    @Volatile
+    var refusedReservation: Boolean = false
+        private set
+
     override fun tryReserve(pages: Int): Boolean {
         require(pages > 0) { "ページ数は正: $pages" }
         val bytes = pages.toLong() * WasmMemory.PAGE_SIZE
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return false
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return refused()
         if (!machine.tryReserve(pages)) {
             usedBytesCounter.addAndGet(-bytes)
-            return false
+            return refused()
         }
         used.addAndGet(pages)
         return true
@@ -128,12 +136,17 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     /** プロセスとマシンのそれぞれで、数えた後の残りが [keepBytes] 以上になるときだけ数える（#408。サーバー全体には [keepBytes] をかけない） */
     override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes > 0) { "バイト数は正: $bytes" }
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return false
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return refused()
         if (!machine.tryReserveBytes(bytes, keepBytes)) {
             usedBytesCounter.addAndGet(-bytes)
-            return false
+            return refused()
         }
         return true
+    }
+
+    private fun refused(): Boolean {
+        refusedReservation = true
+        return false
     }
 
     override fun releaseBytes(bytes: Long) {

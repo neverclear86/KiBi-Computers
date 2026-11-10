@@ -436,7 +436,10 @@ public class Machine private constructor(
     @Volatile
     private var coldBootPending = false
 
-    /** 復元が `stop()`・`close()` で取り消された（前段が見る） */
+    /**
+     * 復元が `stop()`・`close()` で取り消された（前段が見る）。一度立ったら下ろさない（その Machine の [restore] は断る。#576）。
+     * 取り消された古い前段がまだ起動用スレッドで走っていても、この印で止まる
+     */
     @Volatile
     private var restoreCancelled = false
 
@@ -451,6 +454,9 @@ public class Machine private constructor(
 
     /** 前段から: 取り消されたか */
     internal val isRestoreCancelled: Boolean get() = restoreCancelled || scheduler.isClosed
+
+    /** テスト用: 前段が戻せずに冷えた起動待ちになり、[coldBootAfterRestore] を待っているか（知らせを配る前も真） */
+    internal val isColdBootPending: Boolean get() = coldBootPending
 
     /** 復元か、その後の冷えた起動待ちの間（保存しない・待機点にしない） */
     private val restoreTransient: Boolean get() = restoringValue || coldBootPending
@@ -778,20 +784,23 @@ public class Machine private constructor(
      * - 戻せたら [MachineState.RUNNING] にして [RestoreOutcome.RESTORED]（`StateChanged` は知らせの前に届く）
      * - 戻せなかったら（カーネルの表は空のまま）[RestoreOutcome.COLD_BOOT]。受け手は [coldBootAfterRestore] で冷えた起動を始める
      *   （受け手がなければマシンが自分で始める）。その間 [boot] は断る
-     * - `stop()`・`close()` で取り消したら [RestoreOutcome.CANCELLED]（マシンは STOPPED のまま）
+     * - `stop()`・`close()` で取り消したら [RestoreOutcome.CANCELLED]（マシンは STOPPED のまま）。冷えた起動待ちになった後、
+     *   知らせを配る前に取り消したときも CANCELLED（知らせは復元1回につき1回。#576）
      * - 表に入れる途中で失敗したら、カーネルの不整合として [MachineState.CRASHED] にし、知らせは送らない
+     *   （前段で作ったものは起動用スレッドで返す）
      *
      * @return 受け付けたら `true`。[MachineState.STOPPED] でない、起動・復元の途中、一度でも動いた（表が空でない）、
-     *   スケジューラが閉じているなら `false`
+     *   このマシンで復元を一度取り消した（#576）、スケジューラが閉じているなら `false`
      */
     public fun restore(request: RestoreRequest): Boolean {
         lock.lock()
         try {
             if (scheduler.isClosed || closedValue || stateValue != MachineState.STOPPED || bootingValue) return false
             if (restoreHandle != null || coldBootPending || rebootRequested || rebootNotified) return false
+            // 取り消した後は受け付けない（取り消された古い前段が、まだ起動用スレッドで走っているかもしれない。#576）
+            if (restoreCancelled) return false
             if (kernel.processes.size != 0 || kernel.mounts.entries.isNotEmpty() || kernel.consoleTtyId != 0 || runtimes.isNotEmpty()) return false
             restoringValue = true
-            restoreCancelled = false
             restoreCancelSignal = CompletableFuture()
             restoreRequest = request
             restoreHandle = quiesce()
@@ -840,19 +849,25 @@ public class Machine private constructor(
     }
 
     /**
-     * 後段（#85）: 前段の [prepared] を表に入れる（起動用のスレッドから）。取り消されていたら何もせず `false`（呼び手が [prepared] を返す）。
-     * 入れる途中で失敗したら、カーネルの不整合として CRASHED にする（`true` を返す。作ったものは表とともに止まる）
+     * 後段（#85）: 前段の [prepared] を表に入れる（起動用のスレッドから）。
+     *
+     * @return [prepared] の持ち主がカーネルに移ったら `true`。取り消されていた・入れる途中で失敗したら `false` で、
+     *   呼び手がロックの外で [PreparedRestore.discard] する（#576）。途中で失敗したときは、カーネルの不整合として CRASHED にする。
+     *   表に入れ終えたもの（インスタンス・つないだファイルシステム）は [stopLocked] が先に閉じるが、discard で重ねて閉じても何も起きない
+     *   （どの位置で失敗しても、`runtimes` に入らなかったインスタンス・表のプロセスが持ったままの `/tmp` の RAM・ディスクのリースが返る）
      */
     internal fun completeRestore(prepared: PreparedRestore): Boolean = lock.withLockValue {
         if (!restoringValue || restoreCancelled || scheduler.isClosed) return@withLockValue false
         try {
             installRestoredLocked(prepared)
         } catch (t: Throwable) {
-            if (t is VirtualMachineError && t !is StackOverflowError) throw t
-            LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
+            // 後段に入った後の失敗は、前段の失敗（restoreFellBack。表が空のはず）に流さない: 先に印を下ろす
             restoringValue = false
+            val fatal = t is VirtualMachineError && t !is StackOverflowError
+            if (!fatal) LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
             inconsistencyLocked("保存データを表に戻せない: $t")
-            return@withLockValue true
+            if (fatal) throw t
+            return@withLockValue false
         }
         restoringValue = false
         setStateLocked(MachineState.RUNNING, null)
@@ -877,15 +892,20 @@ public class Machine private constructor(
         val handle = restoreHandle
         postNotification(
             HostNotification.Callback {
+                // 冷えた起動待ちのまま、配る前に取り消された（stopLocked は CANCELLED を積まない）: 取り消しとして配る（#576。1回だけ届く）。
+                // 戻した後に止めた RESTORED は替えない（戻したことに変わりない）
+                val cancelled = outcome == RestoreOutcome.COLD_BOOT && restoreCancelled
+                val delivered = if (cancelled) RestoreOutcome.CANCELLED else outcome
+                val deliveredCause = if (cancelled) null else cause
                 try {
                     val listener = request.listener
                     if (listener != null) {
-                        safely { listener.onRestoreFinished(this, outcome, cause) }
-                    } else if (outcome == RestoreOutcome.COLD_BOOT) {
+                        safely { listener.onRestoreFinished(this, delivered, deliveredCause) }
+                    } else if (delivered == RestoreOutcome.COLD_BOOT) {
                         coldBootAfterRestore()
                     }
                 } finally {
-                    if (outcome != RestoreOutcome.CANCELLED && handle != null) {
+                    if (delivered != RestoreOutcome.CANCELLED && handle != null) {
                         val close = lock.withLockValue {
                             if (restoreHandle === handle) {
                                 restoreHandle = null
@@ -1876,7 +1896,8 @@ public class Machine private constructor(
     internal fun stopLocked(crash: Throwable?) {
         // 復元の途中・冷えた起動待ちなら取り消す（#85）。止めるのをやめるのは、プロセスを止めた後
         val restoreHandleToClose = restoreHandle
-        val wasRestoring = restoreHandleToClose != null && (restoringValue || coldBootPending)
+        // 知らせを積むのは前段の途中だけ。冷えた起動待ち（COLD_BOOT を積んだ後）は、配るときに CANCELLED に替える（#576）
+        val wasRestoring = restoreHandleToClose != null && restoringValue
         if (restoreHandleToClose != null || coldBootPending) {
             restoreCancelled = true
             restoringValue = false

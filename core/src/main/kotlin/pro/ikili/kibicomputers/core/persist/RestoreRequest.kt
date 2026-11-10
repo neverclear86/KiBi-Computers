@@ -58,7 +58,10 @@ public enum class RestoreOutcome {
      */
     COLD_BOOT,
 
-    /** 取り消した（`stop()`・`close()`）。マシンは STOPPED のまま（`StateChanged` は出さない） */
+    /**
+     * 取り消した（`stop()`・`close()`）。マシンは STOPPED のまま（`StateChanged` は出さない）。
+     * 冷えた起動待ちになった後、知らせを配る前に取り消したときもこれ（[COLD_BOOT] は届かない。#576）
+     */
     CANCELLED,
 }
 
@@ -98,9 +101,9 @@ public enum class ColdBootCause {
     /** ディスク・イメージが開けない、`/tmp` の中身がない、知らないマウント */
     MOUNT,
 
-    /** RAM が足りない（区画・`/tmp`） */
+    /** RAM が足りない（区画・テーブル・`/tmp`。プロセス・マシン・サーバー全体の RAM の勘定が確保を断った） */
     NO_MEMORY,
 
-    /** そのほかの失敗（インスタンスを作り直せない、内部の例外） */
+    /** そのほかの失敗（インスタンスを作り直せない（状態が合わない・start 関数を持つ・リンクできない）、内部の例外） */
     RESTORE_FAILED,
 }

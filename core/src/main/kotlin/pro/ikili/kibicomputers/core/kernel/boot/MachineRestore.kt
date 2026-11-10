@@ -51,7 +51,11 @@ internal class PreparedRestore(
     val runtimes: List<Pair<ProcessRuntime, WasmInstance?>>,
     val fileSystems: Map<Int, FileSystem>,
 ) {
-    /** 作ったものを返す（インスタンスを閉じ、ファイルシステムを閉じ、`/tmp` の RAM を返す） */
+    /**
+     * 作ったものを返す（インスタンスを閉じ、ファイルシステムを閉じ、`/tmp` の RAM を返す）。カーネルロックの外で呼ぶ。
+     * 後段の途中で失敗したときは、表に入れ終えて [Machine.stopLocked] が閉じたものにも重ねて呼ぶ（インスタンスの `close`・
+     * [FileSystem.retire]・[TmpFileSystem.onUnmounted] は2回目に何もしない。#576）
+     */
     fun discard() {
         for ((_, instance) in runtimes) closeQuietly(instance)
         for (fs in fileSystems.values) retireQuietly(fs)
@@ -107,8 +111,10 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
         try {
             machine.scheduler.hooks.beforeRestoreInstall?.invoke(machine)
+            // 取り消し・後段の途中の失敗（CRASHED）では、持ち主がカーネルに移らないので、ロックの外で返す（#576）
             if (!machine.completeRestore(prepared)) prepared.discard()
         } catch (t: Throwable) {
+            // 後段に入る前の失敗（後段の中の失敗は completeRestore が CRASHED にして印を下ろすので、restoreFellBack は何もしない）
             prepared.discard()
             machine.restoreFellBack(ColdBootCause.RESTORE_FAILED)
             if (t is VirtualMachineError && t !is StackOverflowError) throw t
@@ -193,7 +199,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
                     try {
                         machine.runner.instantiateForRestore(rt, state, layer.asyncStack)
                     } catch (e: WasmLinkException) {
-                        fallback(ColdBootCause.NO_MEMORY, "pid ${p.pid} のインスタンスを作り直せない: ${e.message}", e)
+                        // RAM の不足（区画・テーブル）は、プロセスの勘定が確保を断ったかで見分ける（#576）。作り直す間は WASM のコードが
+                        // 動かないので、断られたら必ず失敗し、断られずに失敗したら RAM 以外（状態が合わない・start 関数・リンクできない）
+                        fallback(restoreInstanceFailureCause(rt), "pid ${p.pid} のインスタンスを作り直せない: ${e.message}", e)
                     } catch (e: WasmLoadException) {
                         fallback(ColdBootCause.RESTORE_FAILED, "pid ${p.pid} のインスタンスを作り直せない: ${e.message}", e)
                     }
@@ -329,6 +337,10 @@ internal class MachineRestore(private val machine: Machine, private val request:
 
     companion object {
         private val LOG: System.Logger = System.getLogger("kibicomputers.restore")
+
+        /** インスタンスを作り直せなかった理由（#576）: [rt] の RAM の勘定が確保を断っていたら NO_MEMORY、ほかは RESTORE_FAILED */
+        internal fun restoreInstanceFailureCause(rt: ProcessRuntime): ColdBootCause =
+            if (rt.memory.refusedReservation) ColdBootCause.NO_MEMORY else ColdBootCause.RESTORE_FAILED
 
         /** 読み込みの待ち行列が混んでいるときに、やり直し続ける上限（仮の値） */
         private const val BUSY_RETRY_MILLIS: Long = 60_000

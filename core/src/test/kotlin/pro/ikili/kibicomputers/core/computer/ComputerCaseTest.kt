@@ -438,6 +438,8 @@ class ComputerCaseTest {
         case.turnOff()
         tickUntil("知らせが来ない") { finished.isNotEmpty() }
         repeat(3) { manager.tick() }
+        // 前段が先に終わっても（冷えた起動待ち）、取り消しが先でも、届くのは取り消しの1回だけ（#576）
+        assertEquals(listOf(RestoreOutcome.CANCELLED), finished)
         assertTrue(ready.isEmpty(), "今のマシンでないのでつながない")
         assertFalse(machine.isBooting, "冷えた起動を始めない")
         assertFalse(machine.isRestoring)
