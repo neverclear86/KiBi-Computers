@@ -90,6 +90,9 @@ internal class MemoryModuleStore : ModuleStore {
     /** [put] が呼ばれた数 */
     val puts = AtomicInteger()
 
+    /** [get] が呼ばれた数 */
+    val gets = AtomicInteger()
+
     override fun put(sha256: ByteArray, bytes: ByteArray): Boolean {
         puts.incrementAndGet()
         require(ModuleStore.sha256(bytes).contentEquals(sha256)) { "ハッシュが合わない" }
@@ -99,7 +102,10 @@ internal class MemoryModuleStore : ModuleStore {
 
     override fun contains(sha256: ByteArray): Boolean = sha256.size == 32 && modules.containsKey(ModuleStore.hex(sha256))
 
-    override fun get(sha256: ByteArray): ByteArray? = modules[ModuleStore.hex(sha256)]?.copyOf()
+    override fun get(sha256: ByteArray): ByteArray? {
+        gets.incrementAndGet()
+        return modules[ModuleStore.hex(sha256)]?.copyOf()
+    }
 
     /** [sha256] のモジュールを消す（「ストアにない」を作る） */
     fun remove(sha256: ByteArray) {

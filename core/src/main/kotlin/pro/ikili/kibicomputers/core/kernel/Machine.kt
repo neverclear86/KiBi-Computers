@@ -443,7 +443,11 @@ public class Machine private constructor(
     @Volatile
     private var restoreCancelled = false
 
-    /** 復元の取り消しを、モジュールの読み込みを待つ前段に伝える。[restore] で作り直し、[stopLocked] で終える */
+    /**
+     * 前段が終わった、または取り消されたことを、モジュールの読み込みを待つ前段の取り消しの登録に伝える。[restore] で作り直し、
+     * 前段の終わり（[completeRestore]・[restoreFellBack]）か取り消し（[stopLocked]）で終える。終えると登録が外れ、前段が持っていた
+     * もの（読み込んだ `Program`・読んだ写し）が回収される（#587）。取り消されたかは [isRestoreCancelled] で見る（これでは見分けない）
+     */
     @Volatile
     internal var restoreCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
         private set
@@ -866,10 +870,14 @@ public class Machine private constructor(
             val fatal = t is VirtualMachineError && t !is StackOverflowError
             if (!fatal) LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
             inconsistencyLocked("保存データを表に戻せない: $t")
+            // stopLocked が終えているはずだが、どの経路でも登録が残らないように重ねて終える（#587）
+            restoreCancelSignal.complete(Unit)
             if (fatal) throw t
             return@withLockValue false
         }
         restoringValue = false
+        // 前段が終わった: 取り消しの登録を外す（待っている読み込みはないので、登録は何もしない。#587）
+        restoreCancelSignal.complete(Unit)
         setStateLocked(MachineState.RUNNING, null)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
         true
@@ -880,6 +888,8 @@ public class Machine private constructor(
         if (!restoringValue || restoreCancelled) return@withLockValue
         restoringValue = false
         coldBootPending = true
+        // 前段が終わった: 取り消しの登録を外す（#587）
+        restoreCancelSignal.complete(Unit)
         postRestoreFinishedLocked(RestoreOutcome.COLD_BOOT, cause)
     }
 

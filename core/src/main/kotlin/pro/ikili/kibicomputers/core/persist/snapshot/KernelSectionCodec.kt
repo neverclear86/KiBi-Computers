@@ -34,7 +34,18 @@ internal class KernelLimits(
     val maxProcesses: Int,
     /** ハンドル表の上限の上限 */
     val maxHandles: Int = DEFAULT_HANDLE_LIMIT,
-)
+) {
+    /**
+     * 表に入るプロセス（終わったもの・親のないゾンビを含む）の数の上限。`KERNEL` 節の表と孤児の列はこれを超えると断る。
+     * 先読み（[SnapshotDecoder.moduleSources]）の節の数の上限も、これにそろえる（#587）
+     */
+    val maxTableProcesses: Int get() = tableProcessLimit(maxProcesses)
+
+    companion object {
+        /** [maxTableProcesses] の式（[maxProcesses] から） */
+        fun tableProcessLimit(maxProcesses: Int): Int = maxProcesses * 2 + 64
+    }
+}
 
 /**
  * 読んだ `KERNEL` 節（#82）。#85 がマシンに戻す。参照（ハンドル・`wait`・`waitTimers`・`PipeEnd.streamId`・`objectId`・
@@ -189,7 +200,7 @@ internal object KernelSectionCodec {
             throw SnapshotFormatException("時計の値が不正", e)
         }
         // プロセス表
-        val maxProcesses = limits.maxProcesses * 2 + 64
+        val maxProcesses = limits.maxTableProcesses
         val nextPid = input.i32()
         if (nextPid < 1) throw SnapshotFormatException("次の pid が不正（$nextPid）")
         val orphanCount = input.count(maxProcesses, 4)

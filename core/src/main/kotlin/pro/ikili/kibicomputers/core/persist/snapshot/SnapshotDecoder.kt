@@ -108,17 +108,19 @@ internal object SnapshotDecoder {
     /**
      * 復号する前に、`PROCESS_ABI` 節の p1 の層が参照するモジュールを、節の順に読む（#577。重複は除かない）。
      * 各節の先頭（pid・層・モジュールの参照）だけを読み、インスタンスの状態は読まない（区画を展開しない）。
-     * 節の数が [maxProcesses] を超えるものは [SnapshotFormatException]（[decode] も必ず断る形）。
-     * ここで断れるものは [decode] も断るので、先に呼んでも冷えた起動の理由は変わらない
+     * 節の数が `KERNEL` 節の表のプロセスの数の上限（[KernelLimits.maxTableProcesses]）を超えるものは [SnapshotFormatException]。
+     * [decode] は表をその上限で読み、`PROCESS_ABI` 節ごとに「pid が表にある・重ならない」を確かめるので、それより多い節は必ず断る（#587）。
+     * 節の版・p1 の層の版も [decode] と同じ検査で、ここで断れるものは [decode] も断るので、先に呼んでも冷えた起動の理由は変わらない
      */
     @Throws(SnapshotFormatException::class)
     fun moduleSources(snapshot: MachineSnapshot, maxProcesses: Int): List<ModuleSource> {
         if (snapshot.requiresColdBoot) throw SnapshotFormatException("冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
+        val limit = KernelLimits.tableProcessLimit(maxProcesses)
         val result = ArrayList<ModuleSource>()
         var count = 0
         for (section in snapshot.sections) {
             if (section.kind != SnapshotSection.PROCESS_ABI) continue
-            if (++count > maxProcesses) throw SnapshotFormatException("PROCESS_ABI 節が $maxProcesses 個より多い")
+            if (++count > limit) throw SnapshotFormatException("PROCESS_ABI 節が $limit 個より多い")
             if (section.version != SnapshotSection.PROCESS_ABI_VERSION) {
                 throw SnapshotFormatException("PROCESS_ABI 節の版 ${section.version}")
             }
