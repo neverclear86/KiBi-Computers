@@ -185,7 +185,7 @@ class CompileWaitTest {
         val a = m.spawnTest(h.program(emptyModule()), execer("/bin/a", outA))
         val b = m.spawnTest(h.program(emptyModule()), execer("/bin/b", outB, ProcessKind.WAIT_POINT))
         tickUntil("読み込みを待たない") {
-            h.scheduler.programs.loadingCount == 5 && m.awaitingLoad(a) && m.awaitingLoad(b)
+            h.scheduler.programs.loadingCount == 5 && loading.isNotEmpty() && m.awaitingLoad(a) && m.awaitingLoad(b)
         }
         assertEquals(1, loading.size, "読み込むスレッドは 1 本")
         assertTrue(booting.all { it.isBooting })
