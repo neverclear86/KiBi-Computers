@@ -29,6 +29,13 @@ const OPTS = Array.isArray(args) || typeof args === 'number' || args == null
   : args
 const WINDOW = OPTS.window ?? 3
 const MERGE = OPTS.merge !== false
+// 既定では、着手前の助言は Opus、コードのレビューは1本（壊れると重い PR は Fable、それ以外は Opus）、指摘の検証は Opus 1本。
+// 壊れると重い PR = area が HEAVY_AREAS に入る Issue か、実装がスレッド・並行処理に触れたと答えた PR。
+// （#576〜#579 での比較の結論。2本立ての費用の大半は Fable 側で、検証は Sonnet だと範囲外として外す指摘が多かった）
+// fable: true は比較用。助言・プランのレビュー・コードのレビュー・指摘の検証を Opus と Fable の両方で行い（指摘は両方の和を使う）、
+// 人に聞く前の確かめには Opus を影として並べる。両者の判断は結果の comparison に残す
+const FABLE = OPTS.fable === true
+const HEAVY_AREAS = ['kernel', 'persistence', 'runtime', 'storage']
 
 const M = {
   select: { model: 'sonnet', effort: 'medium' },
@@ -44,6 +51,27 @@ const M = {
   merge: { model: 'sonnet', effort: 'medium' },
   report: { model: 'haiku', effort: 'low' },
   crossCheck: { model: 'fable', effort: 'high' },
+  advise: { model: 'opus', effort: 'high' },
+  // 壊れると重い PR のレビューと、fable: true のときに並べるもの
+  fable: { model: 'fable', effort: 'high' },
+  crossCheckShadow: { model: 'opus', effort: 'high' },
+}
+
+// Opus と Fable の判断の記録（target は「Issue #n」「PR #n」）
+const comparisons = []
+function record(target, entry) {
+  if (FABLE) comparisons.push({ target, ...entry })
+}
+
+const VERDICT_RANK = { approve: 0, revise: 1, needs_human: 2 }
+// 2つのプランのレビューを合わせる（重い方の判定、指摘は和）
+function combinePlanReviews(opus, fable) {
+  if (!opus || !fable) return opus ?? fable
+  return {
+    verdict: VERDICT_RANK[fable.verdict] > VERDICT_RANK[opus.verdict] ? fable.verdict : opus.verdict,
+    must: [...opus.must, ...fable.must.map(m => `（Fable）${m}`)],
+    undecided: [...opus.undecided, ...fable.undecided.map(u => `（Fable）${u}`)],
+  }
 }
 
 // ---- 並行制御 ----
@@ -130,9 +158,10 @@ const IMPLEMENT_SCHEMA = {
     branch: { type: ['string', 'null'] },
     worktree: { type: ['string', 'null'], description: 'worktree の絶対パス' },
     publicApiChanged: { type: 'boolean' },
+    touchesConcurrency: { type: 'boolean' },
     summary: { type: 'string' },
   },
-  required: ['status', 'pr', 'branch', 'worktree', 'publicApiChanged', 'summary'],
+  required: ['status', 'pr', 'branch', 'worktree', 'publicApiChanged', 'touchesConcurrency', 'summary'],
 }
 
 const CI_SCHEMA = {
@@ -223,7 +252,25 @@ async function select() {
   )
 }
 
-async function plan(info) {
+// 着手の前に設計の助言を書かせる。既定は Opus だけ。fable: true なら Fable の助言を使い、比べるために Opus にも同じことをさせる
+async function advise(info) {
+  const prompt = `${REPO} の Issue #${info.number}「${info.title}」に着手する前に、設計の助言を書く。コードとリポジトリは変更せず、Issue・PR にも書き込まない。
+Issue の本文、オーナー・共同作業者のコメント（\`authorAssociation\` が OWNER / MEMBER / COLLABORATOR）、依存先の Issue・PR、関連する ADR（\`docs/adr/\`）・\`decision\` Issue・既存のコードを実際に読んで、次を箇条書きで書く（根拠のファイル・行や Issue 番号を付ける）:
+1. 守らなければならない前提（オーナーの回答、ADR の規則、既存の不変条件）
+2. 間違えやすい点・壊しやすいところ（スレッド、境界条件、保存形式の互換、1000 台規模の負荷など）
+3. 勧める進め方と、避けるべき進め方
+4. 人の判断が要りそうな論点（AGENTS.md の4つ・未決の decision）。なければ「なし」
+すべて日本語で、実装者がそのまま使える具体さで書く。`
+  if (!FABLE) return (await agent(prompt, { label: `advise:#${info.number}`, phase: 'Plan', ...M.advise })) || null
+  const [fable, opus] = await parallel([
+    () => agent(prompt, { label: `advise-fable:#${info.number}`, phase: 'Plan', ...M.fable }),
+    () => agent(prompt, { label: `advise-opus:#${info.number}`, phase: 'Plan', ...M.crossCheckShadow }),
+  ])
+  record(`Issue #${info.number}`, { stage: 'advice', opus: opus ?? null, fable: fable ?? null })
+  return fable || null
+}
+
+async function plan(info, advice) {
   let prev = null
   // 人に聞く前の確かめ（crossCheck）が「エージェントで直せる」と返したときの直し方。
   // 使うたびにプランのラウンドを1つ足す。MAX_GUIDED 回まで
@@ -233,6 +280,7 @@ async function plan(info) {
   const MAX_GUIDED = 2
   for (let round = 1; round <= MAX_PLAN_ROUNDS + guidedCount; round++) {
     const fixes = [
+      ...(advice && round === 1 ? [`着手前の設計の助言（別のモデル。鵜呑みにせず、コードと突き合わせて使う）:\n${advice}`] : []),
       ...(prev ? [`前回のレビューで直すよう求められた点:\n${prev.must.map(m => `- ${m}`).join('\n')}`] : []),
       ...(guidance ? [`人に聞く前の確かめで示された直し方（これに従う）:\n${guidance}`] : []),
     ]
@@ -249,15 +297,18 @@ ABI・保存形式・公開 API について、\`decision\` Issue で決まっ�
       if (e.guidance) { guidance = e.guidance; guidedCount++; continue }
       return { ok: false, reason: e.question }
     }
-    const r = await agent(
-      `${REPO} の Issue #${info.number} のプランをレビューする。AGENTS.md のルール、関連する \`decision\` Issue の結論、既存のコードと突き合わせる。コードは変更しない。
+    const reviewPrompt = `${REPO} の Issue #${info.number} のプランをレビューする。AGENTS.md のルール、関連する \`decision\` Issue の結論、既存のコードと突き合わせる。コードは変更しない。
 - must: このままでは実装してはいけない問題
 - undecided: システムコールの ABI・保存形式・公開 API について、\`decision\` Issue で決まっていない選択をプランが決めているもの（それ以外の細かい設計の選択は含めない）
 undecided があれば verdict=needs_human。must だけなら revise。どちらもなければ approve。
 プラン:
-${p.plan}`,
-      { label: `plan-review:#${info.number}#${round}`, phase: 'Plan', schema: PLAN_REVIEW_SCHEMA, ...M.planReview },
-    )
+${p.plan}`
+    const [ro, rf] = await parallel([
+      () => agent(reviewPrompt, { label: `plan-review:#${info.number}#${round}`, phase: 'Plan', schema: PLAN_REVIEW_SCHEMA, ...M.planReview }),
+      ...(FABLE ? [() => agent(reviewPrompt, { label: `plan-review-fable:#${info.number}#${round}`, phase: 'Plan', schema: PLAN_REVIEW_SCHEMA, ...M.fable })] : []),
+    ])
+    record(`Issue #${info.number}`, { stage: 'plan-review', round, opus: ro, fable: rf ?? null })
+    const r = combinePlanReviews(ro, FABLE ? rf : null)
     if (!r) return { ok: false, reason: 'プランのレビューに失敗した' }
     if (r.verdict === 'approve') return { ok: true, plan: p.plan }
     if (r.verdict === 'needs_human') {
@@ -289,8 +340,7 @@ ${p.plan}`,
 // 人に聞くときは、確かめた結果で直した論点を投稿する
 async function escalate(kind, number, question, context, canResolve) {
   const label = `${kind === 'pr' ? 'PR' : 'Issue'} #${number}`
-  const c = await agent(
-    `${REPO} の ${label} で、自動の開発フローが人に質問して止まろうとしている。質問を出す前に、別の目で確かめる。コードとリポジトリは変更せず、Issue・PR にも書き込まない。
+  const checkPrompt = `${REPO} の ${label} で、自動の開発フローが人に質問して止まろうとしている。質問を出す前に、別の目で確かめる。コードとリポジトリは変更せず、Issue・PR にも書き込まない。
 ${label} の本文と、オーナー・共同作業者のコメント（\`authorAssociation\` が OWNER / MEMBER / COLLABORATOR）、関連する ADR（\`docs/adr/\`）・\`decision\` Issue・コードを実際に読んで、次を確かめる:
 1. 前提: 「何が問題で、なぜ止まったか」は事実として正しいか。指摘が既存のコードや仕様の読み違い、命題の立て方そのものの誤り（問題の切り分けが違う、別の名前・別の設計なら論点が消える、など）になっていないか。
 2. 推奨: 示された選択肢と推奨は妥当か。見落とした選択肢はないか。外部の仕様（WASI・Component Model など）や、リポジトリの既存の決まり（ADR）と食い違っていないか。
@@ -300,10 +350,14 @@ needsHuman=false なら guidance に、エージェントが人を待たずに�
 止まった段階: ${context}
 
 出そうとしている質問:
-${question}`,
-    { label: `cross-check:${kind}#${number}`, phase: 'Report', schema: CROSS_CHECK_SCHEMA, ...M.crossCheck },
-  )
-  if (c && !c.needsHuman && c.guidance && canResolve) {
+${question}`
+  // 使うのは Fable の結論。fable: true なら、比べるために Opus にも同じことをさせる（結論は使わない）
+  const [c, shadow] = await parallel([
+    () => agent(checkPrompt, { label: `cross-check:${kind}#${number}`, phase: 'Report', schema: CROSS_CHECK_SCHEMA, ...M.crossCheck }),
+    ...(FABLE ? [() => agent(checkPrompt, { label: `cross-check-opus:${kind}#${number}`, phase: 'Report', schema: CROSS_CHECK_SCHEMA, ...M.crossCheckShadow })] : []),
+  ])
+  record(label, { stage: 'cross-check', context, question, opus: shadow ?? null, fable: c })
+  if (c &&!c.needsHuman && c.guidance && canResolve) {
     log(`${label}: 人に聞く前の確かめで、エージェントが直せると判断した（${c.premiseSound ? '前提は正しい' : '前提に誤りあり'}）`)
     return { guidance: c.guidance }
   }
@@ -323,7 +377,7 @@ function askHuman(kind, number, question) {
   )
 }
 
-function implement(info, approvedPlan, guidance) {
+function implement(info, approvedPlan, guidance, advice) {
   return agent(
     `${REPO} の Issue #${info.number}「${info.title}」を実装して PR を作る。手順は \`.claude/skills/work-issue/SKILL.md\` の 1〜4 に従う。ただし作業場所は、ユーザーのチェックアウトとは別の worktree にする:
 
@@ -334,7 +388,7 @@ function implement(info, approvedPlan, guidance) {
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
 未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて status=blocked で終える。summary に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。
-publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}`,
+publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。touchesConcurrency には、スレッド・ロック・非同期の完了待ちなど、並行して動く処理の振る舞いを変えたかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}${advice ? `\n\n着手前の設計の助言（別のモデル。鵜呑みにせず、コードと突き合わせて使う）:\n${advice}` : ''}`,
     { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
 }
@@ -367,32 +421,50 @@ ${ci.failureLog}`,
 async function review(info, impl, round) {
   const base = `${REPO} の PR #${impl.pr}（Issue #${info.number}）をレビューする。差分は \`gh pr diff ${impl.pr}\`、コードは worktree ${impl.worktree} で読める。コードは変更しない。CI（build と両バージョンの GameTest）は通っているので、その再現はしない。
 must は「このままマージすると壊れる・ルールに反する」と確信できるものだけ。推測や好みは should にする。直し方は書かない。`
-  const reviewers = [
-    () => agent(
-      `${base}
-観点: 正しさ（バグ、境界条件、スレッド安全性、エラー処理）、AGENTS.md のルール違反（core に Minecraft を持ち込む、Kotlin 2.2 より新しい API、片方のバージョンだけ壊れる変更）、Issue の要件の取りこぼし、足りないテスト。`,
-      { label: `review:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...M.review },
-    ),
-  ]
+  const correctness = `${base}
+観点: 正しさ（バグ、境界条件、スレッド安全性、エラー処理）、AGENTS.md のルール違反（core に Minecraft を持ち込む、Kotlin 2.2 より新しい API、片方のバージョンだけ壊れる変更）、Issue の要件の取りこぼし、足りないテスト。`
+  // 既定ではレビューは1本。壊れると重い PR は Fable、それ以外は Opus。fable: true なら両方
+  const heavy = info.areas.some(a => HEAVY_AREAS.includes(a)) || impl.touchesConcurrency === true
+  const reviewers = FABLE || !heavy
+    ? [() => agent(correctness, { label: `review:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...M.review })
+      .then(r => r && { by: 'opus', findings: r.findings })]
+    : []
+  if (FABLE || heavy) {
+    reviewers.push(() => agent(correctness, { label: `review-fable:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...M.fable })
+      .then(r => r && { by: 'fable', findings: r.findings }))
+  }
   if (impl.publicApiChanged) {
     reviewers.push(() => agent(
       `${base}
 公開 API（public 宣言、特に pro.ikili.kibicomputers.api 以下）が Java から自然に使えるかを確認する。`,
       { label: `java-api:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, agentType: 'java-api-reviewer', ...M.javaApi },
-    ))
+    ).then(r => r && { by: 'java-api', findings: r.findings }))
   }
-  const findings = (await parallel(reviewers)).filter(Boolean).flatMap(r => r.findings)
-  if (!findings.length) return []
+  const findings = (await parallel(reviewers)).filter(Boolean).flatMap(r => r.findings.map(f => ({ ...f, by: r.by })))
+  if (!findings.length) {
+    record(`PR #${impl.pr}`, { stage: 'review', round, findings: [] })
+    return []
+  }
 
-  // 指摘は別のエージェントが懐疑的に検証し、本当に直すべきものだけ残す
+  // 指摘は別のエージェントが懐疑的に検証し、本当に直すべきものだけ残す（fable: true なら Opus と Fable の両方で検証し、和を残す）。
+  // 残ったものは must・should を問わず直す
   const listed = findings.map((f, i) => `${i}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')
-  const verdict = await agent(
-    `${REPO} の PR #${impl.pr} へのレビュー指摘を検証する。コード（worktree ${impl.worktree}）を実際に読み、各指摘が本当に問題か確かめる。疑わしいもの、好みの問題、PR の範囲外のものは外す。直すべきものの番号だけを返す。コードは変更しない。
-${listed}`,
-    { label: `verify:${impl.pr}#${round}`, phase: 'Review', schema: VERDICT_SCHEMA, ...M.verify },
-  )
-  if (!verdict) return findings.filter(f => f.severity === 'must')
-  return verdict.confirmed.filter(i => findings[i]).map(i => findings[i])
+  const verifyPrompt = `${REPO} の PR #${impl.pr} へのレビュー指摘を検証する。コード（worktree ${impl.worktree}）を実際に読み、各指摘が本当に問題か確かめる。疑わしいもの、好みの問題、PR の範囲外のものは外す。ただし、この PR の作業で見つけた別の問題を Issue にし忘れたこと、ADR・KDoc・PR 本文と実装のずれ、Issue の要件に対するテストの穴は、範囲内として扱う。直すべきものの番号だけを返す（must・should を問わず、残したものはこの PR で直す）。コードは変更しない。
+${listed}`
+  const [vo, vf] = await parallel([
+    () => agent(verifyPrompt, { label: `verify:${impl.pr}#${round}`, phase: 'Review', schema: VERDICT_SCHEMA, ...M.verify }),
+    ...(FABLE ? [() => agent(verifyPrompt, { label: `verify-fable:${impl.pr}#${round}`, phase: 'Review', schema: VERDICT_SCHEMA, ...M.fable })] : []),
+  ])
+  const byOpus = new Set(vo?.confirmed ?? [])
+  const byFable = new Set(vf?.confirmed ?? [])
+  record(`PR #${impl.pr}`, {
+    stage: 'review',
+    round,
+    findings: findings.map((f, i) => ({ ...f, confirmedByOpus: vo ? byOpus.has(i) : null, confirmedByFable: vf ? byFable.has(i) : null })),
+    verifyNotes: { opus: vo?.notes ?? null, fable: vf?.notes ?? null },
+  })
+  if (!vo && !vf) return findings.filter(f => f.severity === 'must')
+  return findings.filter((f, i) => byOpus.has(i) || byFable.has(i))
 }
 
 async function mergePr(info, impl) {
@@ -461,18 +533,19 @@ async function runIssue(info) {
   await slots.acquire()
   for (const a of areas) await areaLock(a).acquire()
   try {
+    const advice = await advise(info)
     let approvedPlan = null
     if (info.needsPlan) {
-      const p = await plan(info)
+      const p = await plan(info, advice)
       if (!p.ok) return { issue: info.number, status: 'needs_human', reason: p.reason, question: p.reason }
       approvedPlan = p.plan
     }
 
-    let impl = await implement(info, approvedPlan)
+    let impl = await implement(info, approvedPlan, null, advice)
     if (impl && impl.status === 'blocked') {
       const e = await escalate('issue', info.number, impl.summary, '実装の段階で、人が決めることか未決の decision に当たって止まった', true)
       if (!e.guidance) return { issue: info.number, status: 'needs_human', reason: e.question, question: e.question }
-      impl = await implement(info, approvedPlan, e.guidance)
+      impl = await implement(info, approvedPlan, e.guidance, advice)
       if (impl && impl.status === 'blocked') {
         const again = await escalate('issue', info.number, impl.summary, '実装の段階で、確かめの進め方に従ってもまた止まった', false)
         return { issue: info.number, status: 'needs_human', reason: again.question, question: again.question }
@@ -487,13 +560,15 @@ async function runIssue(info) {
     const rounds = []
     for (let round = 1; ci && ci.passed && round <= MAX_REVIEW_ROUNDS; round++) {
       const confirmed = await review(info, impl, round)
-      const toFix = confirmed.filter(f => f.severity === 'must')
+      // 検証で残った指摘は must・should を問わず直す（should をマージ前に止めるため）
+      const toFix = confirmed
       rounds.push({ round, confirmed })
       if (!toFix.length) break
-      log(`PR #${impl.pr}: must ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
+      log(`PR #${impl.pr}: 指摘 ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
       const fixed = await agent(
         `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）へのレビュー指摘を直す。worktree の中で修正し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
-${toFix.map((f, i) => `${i + 1}. ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')}`,
+Issue にし忘れた別の問題は、コードを直す代わりに新しい Issue にして適切な Epic のサブ Issue にし（AGENTS.md の手順）、PR 本文に番号を書く。
+${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')}`,
         { label: `fix:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
       )
       if (!fixed || !fixed.pushed) break
@@ -554,4 +629,5 @@ return {
   // 起動したセッションは、これをチャットでユーザーに聞く
   questions: finished.filter(r => r.question).map(r => ({ issue: r.issue, pr: r.pr ?? null, question: r.question })),
   skipped: (selected?.issues ?? []).filter(i => i.blockedReason),
+  ...(FABLE ? { comparison: comparisons } : {}),
 }
