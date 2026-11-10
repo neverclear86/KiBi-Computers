@@ -97,6 +97,19 @@
 冷えた起動待ち（`coldBootPending`）の間も保存せず `boot` を断り、`coldBootAfterRestore` が印を下ろして起動を始める（同じロックの中で `bootingValue` を立てる）。
 画面のデバイスは知らせの中でつなぐので、そのときにはもう `restoringValue` が下りていて、画面の大きさがコンソールに入る（冷えた起動でも残る）。
 
+**知らせが返るまで保存しない**（#589）: 後段が `restoringValue` を下ろしてから、知らせ（`RESTORED`）が返って `restoreHandle` を閉じるまでの間も、
+保存しない（`saveReadiness` は `TRANSIENT`、`isAtWaitPoint` は偽、`captureSnapshot` はどちらの方針でも `null`）。`Machine` の
+`restoreTransient` は `restoringValue || restoreHandle != null || coldBootPending` で、「`isRestoring` の間は保存しない」が core の中で1つの印で成り立つ。
+
+- 実装を ADR に合わせた（ADR を「知らせの中では保存できる」に書き直さなかった）理由: 知らせの中で保存できると困る経路は、今のコードには見つからなかった
+  （写しにデバイスは入らず、回し直す前の呼び出しは `Queued` のまま写り、`quiesce` で止まっているので写すのは戻したのと同じ状態）。
+  それでも、呼び手が `isRestoring` の1つの印に頼れるほうが、`MachineManager.capture` の呼び手や 1.20.1 への移植（#224）がフィルタを忘れても安全で、
+  受け手（`redispatchRestoredDeviceCalls` など）が知らせの中で状態を動かし始めても、その途中を写さない。保存しなくても失うものはない
+  （NBT は戻したばかりの世代を指していて、止めている間は状態が進まない。アンロードの扱いと同じ）。保存形式は変わらない
+- 知らせはメインスレッドで配る（通知の列）。メインスレッドで READY を待つ呼び手（停止・アンロードの待ち、自動保存）は、`isRestoring` の台を先に外す
+  （外さないと、知らせが配られないまま期限いっぱい待つ）。接続層は今もそうしている
+- `restoringValue` を下ろす時点は、知らせの後に遅らせない（上のとおり、知らせの中で画面の大きさをコンソールに入れるため）
+
 **止めている間のプロセス**: 起こされたプロセスはワーカーで step に入るが、`tryGrantLocked` が燃料を渡さない（`quiesce` の間は `tryActivate` が偽）ので、
 `NO_FUEL` で燃料待ちの列に入る。`driver.start`・`resume` は呼ばれず、`CREATED` は `CREATED` のまま、`restoreWake` は残る。`quiesce` を閉じると燃料待ちを起こす。
 
