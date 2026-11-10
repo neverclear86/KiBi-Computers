@@ -91,6 +91,12 @@ internal class KernelStateCopy private constructor(
     /** 置き場が世代のファイルを書けた後に呼ぶ（#83。`Machine` が入れる） */
     var onCommitted: ((KernelStateCopy, UUID, Long) -> Unit)? = null
 
+    /** 戻した直後の起こし（`ProcessRuntime.restoreWake`）をまだ使っていない [pid] の `wakeOnRestore` を立てる（#85） */
+    fun markWakeOnRestore(pid: Int) {
+        val process = processes[pid] ?: return
+        if (!process.state.isTerminal) wakeOnRestorePids += pid
+    }
+
     /** [pid] が `wakeOnRestore` か */
     fun wakeOnRestore(pid: Int): Boolean = pid in wakeOnRestorePids
 

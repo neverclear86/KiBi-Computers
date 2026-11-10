@@ -82,6 +82,13 @@ internal class ProcessRuntime(
     /** step の途中に起こされた（スレッドが外れたら CPU の待ち行列に入れる） */
     var pendingSchedule: Boolean = false
 
+    /**
+     * 保存から戻した直後の起こし（#85、ADR 0085。保存データの `wakeOnRestore`）。立っている間の最初の step は、[waitSet] があれば
+     * そろった key（空でもよい）で、なければ空の並びで `resume` する（揃っていなくても待ち直さない・燃料切れの巻き直しにしない）。
+     * 燃料がなく step に入れなければ立てたまま残す。カーネルロックの中で読み書きする。実行時だけ（保存は `wakeOnRestore` に写す）
+     */
+    var restoreWake: Boolean = false
+
     /** 燃料待ち（・一時停止の解除待ち）から起こされた */
     var fuelReady: Boolean = false
 

@@ -307,6 +307,10 @@ public fun adoptsCompletion(identity: MachineIdentity?, current: MachineIdentity
  *   アンロード・停止は書き込みのスレッドが進むのを待つ。仮の値 256 MiB（確定は #251）
  * @property writerFlushMillis 書き込みのスレッドを待つ上限（ミリ秒。#84）: 停止の `flush`・スレッドの join、アンロード・停止の
  *   メモリの上限の待ち（チャンク・停止全体で共有）、claim がその ID の仕事を待つ上限。仮の値 30 秒
+ * @property restoresPerTick チャンクの読み込みで、tick ごとに復元（#85）を始める台数の上限。読み・復号・インスタンスの作り直しは
+ *   起動用のスレッドなので、メインスレッドのコストは始める手間だけ。仮の値 16（確定は #251）
+ * @property restoreWriteWaitMillis 復元を始める前に、その ID の書き込みの終わりを待つ上限（ミリ秒。#85、ADR 0084 の規則 9）。
+ *   超えたら冷えた起動にする。待つ間は tick ごとに見直すだけで、メインスレッドを止めない。仮の値 2 秒
  */
 @ApiStatus.Internal
 public data class MachineSaveConfig @JvmOverloads constructor(
@@ -318,6 +322,8 @@ public data class MachineSaveConfig @JvmOverloads constructor(
     public val fullSaveChangedRatio: Double = DEFAULT_FULL_SAVE_CHANGED_RATIO,
     public val writerMaxPendingBytes: Long = DEFAULT_WRITER_MAX_PENDING_BYTES,
     public val writerFlushMillis: Long = DEFAULT_WRITER_FLUSH_MILLIS,
+    public val restoresPerTick: Int = 16,
+    public val restoreWriteWaitMillis: Long = 2000,
 ) {
     init {
         require(autosavePeriodTicks > 0) { "自動保存の周期は 1 以上" }
@@ -328,6 +334,8 @@ public data class MachineSaveConfig @JvmOverloads constructor(
         require(fullSaveChangedRatio in 0.0..1.0) { "全体保存に切り替える比は 0 以上 1 以下" }
         require(writerMaxPendingBytes > 0) { "書き込み待ちの上限は 1 以上" }
         require(writerFlushMillis >= 0) { "書き込みのスレッドを待つ上限は 0 以上" }
+        require(restoresPerTick > 0) { "復元を始める台数は 1 以上" }
+        require(restoreWriteWaitMillis >= 0) { "書き込みの終わりを待つ上限は 0 以上" }
     }
 
     public companion object {

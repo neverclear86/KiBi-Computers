@@ -85,14 +85,25 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
      * [boot] の候補から起動する。
      */
     fun connect(level: Level, casePos: BlockPos, machine: Machine, speakerAddress: String, boot: BootConfig = BOOT_CONFIG) {
+        attach(level, casePos, machine, speakerAddress)
+        machine.boot(boot)
+    }
+
+    /**
+     * [machine] にケースのスピーカーと、隣の画面とキーボードをつなぐ（起動はしない）。保存から戻したマシン（#85）は、戻し終えてから
+     * これでつなぐ（画面の大きさは、そこでコンソールに渡る）。前につないでいたものは外す
+     */
+    fun attach(level: Level, casePos: BlockPos, machine: Machine, speakerAddress: String) {
         disconnect()
         this.machine = machine
         bootFailure = null
         this.speakerAddress = speakerAddress
         machine.devices.attach(speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() })
         attachScreen(level, casePos, machine)
-        machine.boot(boot)
     }
+
+    /** 今つないでいるマシン（テスト用） */
+    val connectedMachine: Machine? get() = machine
 
     /**
      * [current]（ケースの今のマシン）がこの結線のマシンで、止まっておらず（[MachineState.RUNNING] か、起動の途中（[Machine.isBooting]））、

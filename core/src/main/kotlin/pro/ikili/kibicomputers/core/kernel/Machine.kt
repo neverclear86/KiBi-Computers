@@ -8,6 +8,13 @@ import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
 import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.MachineRestore
+import pro.ikili.kibicomputers.core.kernel.boot.PreparedRestore
+import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
+import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
+import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
@@ -409,6 +416,45 @@ public class Machine private constructor(
      */
     private var rebootNotified = false
 
+    // ---- 復元（#85、ADR 0085）。どれも実行時だけで、保存しない ----
+
+    /**
+     * 復元を受け付けてから、表に入れ終える（後段）か、冷えた起動待ちに切り替える（前段の失敗）か、取り消すまで立つ。
+     * 立っている間は、コンソールの入力・大きさの変更を受け付けず、コンソールの TTY を作らない（表を空のまま保つ）
+     */
+    @Volatile
+    private var restoringValue = false
+
+    /**
+     * 復元の間このマシンを止める [quiesce]。受け付けたときに取り、終わりの知らせ（[RestoreRequest.listener]）が返った後か、
+     * [stopLocked] で閉じる。`null` でない間は [isRestoring]
+     */
+    @Volatile
+    private var restoreHandle: QuiesceHandle? = null
+
+    /** 前段で戻せなかったので、[coldBootAfterRestore] を待っている */
+    @Volatile
+    private var coldBootPending = false
+
+    /** 復元が `stop()`・`close()` で取り消された（前段が見る） */
+    @Volatile
+    private var restoreCancelled = false
+
+    /** 復元の取り消しを、モジュールの読み込みを待つ前段に伝える。[restore] で作り直し、[stopLocked] で終える */
+    @Volatile
+    internal var restoreCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+        private set
+
+    /** 受け付けた復元（終わりの知らせの宛先） */
+    @Volatile
+    private var restoreRequest: RestoreRequest? = null
+
+    /** 前段から: 取り消されたか */
+    internal val isRestoreCancelled: Boolean get() = restoreCancelled || scheduler.isClosed
+
+    /** 復元か、その後の冷えた起動待ちの間（保存しない・待機点にしない） */
+    private val restoreTransient: Boolean get() = restoringValue || coldBootPending
+
     /** 刈り取ったプロセス・前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
     private val retiredThreads = ArrayList<Thread>()
 
@@ -426,11 +472,20 @@ public class Machine private constructor(
      */
     public val isAtWaitPoint: Boolean
         get() = lock.withLockValue {
-            !bootingValue && !rebootRequested && !rebootNotified && kernel.processes.all().all { isAtWaitPointLocked(it) }
+            !bootingValue && !rebootRequested && !rebootNotified && !restoreTransient && kernel.processes.all().all { isAtWaitPointLocked(it) }
         }
 
     /** 起動の手順が動いている（[boot] を受け付けてから、init を作るか、失敗・取り消しで終わるまで） */
     public val isBooting: Boolean get() = bootingValue
+
+    /**
+     * 復元の途中（#85、ADR 0085）: [restore] を受け付けてから、終わりの知らせ（[RestoreRequest.listener]）が返るか、取り消されるまで。
+     * この間はマシンが [quiesce] で止まっている（プロセスに step を割り当てない）
+     */
+    public val isRestoring: Boolean get() = restoreHandle != null
+
+    /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
+    public val isRebootPending: Boolean get() = lock.withLockValue { rebootRequested || rebootNotified }
 
     // ---- 待機点保存（#81、ADR 0081） ----
 
@@ -472,7 +527,7 @@ public class Machine private constructor(
     public fun saveReadiness(): SaveReadiness = lock.withLockValue { saveReadinessLocked() }
 
     private fun saveReadinessLocked(): SaveReadiness {
-        if (bootingValue || rebootRequested || rebootNotified) return SaveReadiness.TRANSIENT
+        if (bootingValue || rebootRequested || rebootNotified || restoreTransient) return SaveReadiness.TRANSIENT
         var result = SaveReadiness.READY
         for (process in kernel.processes.all()) {
             when (processReadinessLocked(process)) {
@@ -542,11 +597,15 @@ public class Machine private constructor(
         deltaBase: DeltaBase? = null,
         fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
     ): KernelStateCopy? = lock.withLockValue {
+        // 復元の途中・冷えた起動待ちは写さない（表が空か、入れたばかりで、前の世代を残す。#85）
+        if (restoreTransient) return@withLockValue null
         val wholeTransient = bootingValue || rebootRequested || rebootNotified
         if (policy == CapturePolicy.SKIP_IF_TRANSIENT && saveReadinessLocked() == SaveReadiness.TRANSIENT) return@withLockValue null
         val hostWaits = HashMap<Int, IntArray>()
         for ((pid, rt) in runtimes) if (rt.hostWaits.isNotEmpty()) hostWaits[pid] = rt.hostWaits.keys.toIntArray()
         val copy = KernelStateCopy.of(kernel, kernel.clocks.snapshot(environment.clock, scheduler.now), hostWaits)
+        // 戻した直後の起こしをまだ使っていないプロセスは、次の保存でも起こす（#85）
+        for ((pid, rt) in runtimes) if (rt.restoreWake) copy.markWakeOnRestore(pid)
         if (wholeTransient) {
             copy.markColdBoot(if (rebootRequested || rebootNotified) ColdBootReason.REBOOT_PENDING else ColdBootReason.BOOTING)
         } else {
@@ -696,6 +755,8 @@ public class Machine private constructor(
         lock.lock()
         try {
             if (scheduler.isClosed || stateValue != MachineState.STOPPED || bootingValue) return false
+            // 復元の途中・冷えた起動待ちは断る（冷えた起動は coldBootAfterRestore。#85）
+            if (restoreHandle != null || coldBootPending) return false
             bootingValue = true
             bootCancelled = false
             bootCancelSignal = CompletableFuture()
@@ -707,6 +768,217 @@ public class Machine private constructor(
         }
         scheduler.bootExecutor.execute { BootSequence(this, config).run() }
         return true
+    }
+
+    /**
+     * 保存データから戻す（#85、ADR 0085）。どのスレッドから呼んでもよい。待たずに返す（読み・復号・モジュールの読み込み・
+     * インスタンスの作り直しは起動用のスレッド）。受け付けたらマシンを [quiesce] で止め（[isRestoring]）、終わったら
+     * [RestoreRequest.listener] に結果を知らせる（メインスレッドで、通知の列から）。知らせが返った後に止めるのをやめる。
+     *
+     * - 戻せたら [MachineState.RUNNING] にして [RestoreOutcome.RESTORED]（`StateChanged` は知らせの前に届く）
+     * - 戻せなかったら（カーネルの表は空のまま）[RestoreOutcome.COLD_BOOT]。受け手は [coldBootAfterRestore] で冷えた起動を始める
+     *   （受け手がなければマシンが自分で始める）。その間 [boot] は断る
+     * - `stop()`・`close()` で取り消したら [RestoreOutcome.CANCELLED]（マシンは STOPPED のまま）
+     * - 表に入れる途中で失敗したら、カーネルの不整合として [MachineState.CRASHED] にし、知らせは送らない
+     *
+     * @return 受け付けたら `true`。[MachineState.STOPPED] でない、起動・復元の途中、一度でも動いた（表が空でない）、
+     *   スケジューラが閉じているなら `false`
+     */
+    public fun restore(request: RestoreRequest): Boolean {
+        lock.lock()
+        try {
+            if (scheduler.isClosed || closedValue || stateValue != MachineState.STOPPED || bootingValue) return false
+            if (restoreHandle != null || coldBootPending || rebootRequested || rebootNotified) return false
+            if (kernel.processes.size != 0 || kernel.mounts.entries.isNotEmpty() || kernel.consoleTtyId != 0 || runtimes.isNotEmpty()) return false
+            restoringValue = true
+            restoreCancelled = false
+            restoreCancelSignal = CompletableFuture()
+            restoreRequest = request
+            restoreHandle = quiesce()
+            lastBootConfigValue = request.bootConfig
+        } finally {
+            lock.unlock()
+        }
+        try {
+            scheduler.bootExecutor.execute { MachineRestore(this, request).run() }
+        } catch (e: RejectedExecutionException) {
+            // スケジューラが閉じた: 取り消しと同じにする
+            stop()
+        }
+        return true
+    }
+
+    /**
+     * 復元が [RestoreOutcome.COLD_BOOT] で終わったマシンの、冷えた起動を始める（#85）。[RestoreRequest.bootConfig] で [boot] と同じことをする。
+     * 冷えた起動待ちでない・取り消された・スケジューラが閉じているなら何もせず `false`。どのスレッドから呼んでもよい
+     */
+    public fun coldBootAfterRestore(): Boolean {
+        val config: BootConfig
+        lock.lock()
+        try {
+            if (!coldBootPending) return false
+            coldBootPending = false
+            config = lastBootConfigValue ?: return false
+            if (scheduler.isClosed || closedValue || stateValue != MachineState.STOPPED || bootingValue) return false
+            bootingValue = true
+            bootCancelled = false
+            bootCancelSignal = CompletableFuture()
+            rebootRequested = false
+            rebootNotified = false
+        } finally {
+            lock.unlock()
+        }
+        closeRestoreHandle()
+        scheduler.bootExecutor.execute { BootSequence(this, config).run() }
+        return true
+    }
+
+    /** 復元の [quiesce] を閉じる（まだ閉じていなければ）。どのスレッドから呼んでもよい */
+    private fun closeRestoreHandle() {
+        val handle = lock.withLockValue { restoreHandle.also { restoreHandle = null } }
+        handle?.close()
+    }
+
+    /**
+     * 後段（#85）: 前段の [prepared] を表に入れる（起動用のスレッドから）。取り消されていたら何もせず `false`（呼び手が [prepared] を返す）。
+     * 入れる途中で失敗したら、カーネルの不整合として CRASHED にする（`true` を返す。作ったものは表とともに止まる）
+     */
+    internal fun completeRestore(prepared: PreparedRestore): Boolean = lock.withLockValue {
+        if (!restoringValue || restoreCancelled || scheduler.isClosed) return@withLockValue false
+        try {
+            installRestoredLocked(prepared)
+        } catch (t: Throwable) {
+            if (t is VirtualMachineError && t !is StackOverflowError) throw t
+            LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
+            restoringValue = false
+            inconsistencyLocked("保存データを表に戻せない: $t")
+            return@withLockValue true
+        }
+        restoringValue = false
+        setStateLocked(MachineState.RUNNING, null)
+        postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
+        true
+    }
+
+    /** 前段から（#85）: 戻せなかったので冷えた起動待ちにして知らせる（取り消されていたら何もしない） */
+    internal fun restoreFellBack(cause: ColdBootCause): Unit = lock.withLockValue {
+        if (!restoringValue || restoreCancelled) return@withLockValue
+        restoringValue = false
+        coldBootPending = true
+        postRestoreFinishedLocked(RestoreOutcome.COLD_BOOT, cause)
+    }
+
+    /**
+     * 復元の終わりを、通知の列に積む（カーネルロックの中）。配るときに受け手を呼び（受け手がなく COLD_BOOT なら冷えた起動を始め）、
+     * その後で、この復元の [quiesce] がまだ同じなら閉じる（取り消しでは、閉じるのは [stopLocked]）
+     */
+    private fun postRestoreFinishedLocked(outcome: RestoreOutcome, cause: ColdBootCause?) {
+        val request = restoreRequest ?: return
+        val handle = restoreHandle
+        postNotification(
+            HostNotification.Callback {
+                try {
+                    val listener = request.listener
+                    if (listener != null) {
+                        safely { listener.onRestoreFinished(this, outcome, cause) }
+                    } else if (outcome == RestoreOutcome.COLD_BOOT) {
+                        coldBootAfterRestore()
+                    }
+                } finally {
+                    if (outcome != RestoreOutcome.CANCELLED && handle != null) {
+                        val close = lock.withLockValue {
+                            if (restoreHandle === handle) {
+                                restoreHandle = null
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        if (close) handle.close()
+                    }
+                }
+            },
+        )
+    }
+
+    /**
+     * 前段で作ったものを表に入れ、実行時の部分を作る（#85、ADR 0085。カーネルロックの中）。表は空のはず。
+     * プロセスの割り当ては、復元の [quiesce] を閉じるまで止まっている
+     */
+    private fun installRestoredLocked(prepared: PreparedRestore) {
+        val d = prepared.decoded.kernel
+        check(kernel.processes.size == 0 && kernel.mounts.entries.isEmpty() && kernel.consoleTtyId == 0 && runtimes.isEmpty()) {
+            "空でない表には戻さない"
+        }
+        kernel.processes.restore(d.processes.all().toList(), d.processes.orphanZombies.toList(), d.processes.nextPid)
+        kernel.objects.restoreFrom(d.objects)
+        kernel.events.restoreIndex(d.events.index())
+        kernel.mounts.restore(d.mounts.entries.toList(), d.mounts.nextMountId)
+        for ((mountId, fs) in prepared.fileSystems) vfs.attach(mountId, fs)
+        kernel.fuel = minOf(d.fuel, config.fuelPerTick)
+        kernel.consoleTtyId = d.consoleTtyId
+        kernel.initPid = d.initPid
+        restoreClocks(d.clocks)
+        scheduler.hooks.duringRestoreInstall?.invoke(this)
+        for ((rt, instance) in prepared.runtimes) {
+            val process = kernel.processes[rt.pid]
+            check(process != null && process === rt.process) { "pid ${rt.pid} のプロセスが表と違う" }
+            runtimes[rt.pid] = rt
+            if (instance != null) runner.adoptRestoredInstanceLocked(rt, instance)
+        }
+        for ((rt, _) in prepared.runtimes) {
+            val process = rt.process
+            val wake = process.pid in d.wakeOnRestore
+            when (process.state) {
+                ProcessState.CREATED -> cpu.enqueueThreadless(rt)
+                ProcessState.WAITING_EVENT -> {
+                    val keys = process.wait.orEmpty()
+                    if (keys.isNotEmpty()) registerRestoredWaitLocked(rt, keys)
+                    if (wake || keys.isEmpty()) rt.restoreWake = true
+                    val ready = rt.waitSet?.readyKeys(kernel.objects).orEmpty()
+                    if (rt.restoreWake || ready.isNotEmpty()) scheduleThreadlessLocked(rt)
+                }
+                ProcessState.RUNNABLE -> {
+                    val keys = process.wait
+                    if (!keys.isNullOrEmpty()) registerRestoredWaitLocked(rt, keys)
+                    if (wake || (keys != null && keys.isEmpty())) rt.restoreWake = true
+                    // 燃料をもらってから続ける（燃料待ちの列から。quiesce を閉じるまでは割り当てない）
+                    rt.fuelWaitThreadless = true
+                    rt.fuelReady = false
+                    addFuelWaiterLocked(rt)
+                }
+                else -> throw IllegalStateException("pid ${process.pid} の状態 ${process.state} は戻せない")
+            }
+        }
+    }
+
+    private fun registerRestoredWaitLocked(rt: ProcessRuntime, keys: List<WaitKey>) {
+        val waiter = ProcessWaiter { scheduleThreadlessLocked(rt) }
+        rt.waitSet = WaitSet.register(registry, kernel.objects, keys, waiter)
+    }
+
+    /**
+     * 戻したマシンの、まだ実行していないデバイスの呼び出し（[PendingDeviceCall.State.Queued]）を実行に回し直す（#85。メインスレッドから、
+     * デバイスをつないだ後）。カーネルロックを持たずに呼ぶ。回した数を返す
+     */
+    internal fun redispatchRestoredDeviceCalls(): Int {
+        val queued = lock.withLockValue {
+            val owners = HashMap<Int, Int>()
+            for (process in kernel.processes.all().sortedBy { it.pid }) {
+                if (process.state.isTerminal) continue
+                for (entry in process.handles.entries().values) owners.putIfAbsent(entry.objectId, process.pid)
+            }
+            val list = ArrayList<Pair<Int, PendingDeviceCall>>()
+            kernel.objects.forEachObject { obj ->
+                if (obj is PendingDeviceCall && obj.state is PendingDeviceCall.State.Queued && obj.id !in pendingDeviceCalls) {
+                    val pid = owners[obj.id] ?: return@forEachObject
+                    list += pid to obj
+                }
+            }
+            list
+        }
+        for ((pid, obj) in queued) dispatchPendingDeviceCall(pid, obj)
+        return queued.size
     }
 
     /**
@@ -1316,6 +1588,8 @@ public class Machine private constructor(
      */
     internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Int = lock.withLockValue {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
+        // 復元の途中は受け付けない（表を空のまま保つ。#85）
+        if (restoringValue) return@withLockValue 0
         val tty = consoleTtyLocked()
         val r = tty.input(bytes, offset, length, wakeSink)
         if (r.signals.isNotEmpty()) {
@@ -1332,6 +1606,8 @@ public class Machine private constructor(
     internal fun resizeConsole(columns: Int, rows: Int) {
         val size = TtySize(columns, rows)
         lock.withLockValue {
+            // 復元の途中は受け付けない（戻した後に画面のデバイスが渡し直す。#85）
+            if (restoringValue) return@withLockValue
             val tty = consoleTtyLocked()
             if (tty.resize(size)) {
                 val values = listOf(EventValue.Integer(columns.toLong()), EventValue.Integer(rows.toLong()), EventValue.Integer(tty.sizeGeneration))
@@ -1341,10 +1617,10 @@ public class Machine private constructor(
     }
 
     /** コンソールの画面の大きさ */
-    internal val consoleSize: TtySize get() = lock.withLockValue { consoleTtyLocked().size }
+    internal val consoleSize: TtySize get() = lock.withLockValue { if (restoringValue && kernel.consoleTtyId == 0) TtySize(Tty.DEFAULT_COLUMNS, Tty.DEFAULT_ROWS) else consoleTtyLocked().size }
 
     /** コンソールの画面の大きさが変わった回数 */
-    internal val consoleSizeGeneration: Long get() = lock.withLockValue { consoleTtyLocked().sizeGeneration }
+    internal val consoleSizeGeneration: Long get() = lock.withLockValue { if (restoringValue && kernel.consoleTtyId == 0) 0L else consoleTtyLocked().sizeGeneration }
 
     private fun markConsoleDirty() {
         // 通知の列に印を積んで、TTY の出力の順番を、ほかの通知（カーネルのメッセージなど）との前後で決める
@@ -1598,6 +1874,16 @@ public class Machine private constructor(
 
     /** 停止（[crash] があればマシンの不整合）。カーネルロックの中で呼ぶ */
     internal fun stopLocked(crash: Throwable?) {
+        // 復元の途中・冷えた起動待ちなら取り消す（#85）。止めるのをやめるのは、プロセスを止めた後
+        val restoreHandleToClose = restoreHandle
+        val wasRestoring = restoreHandleToClose != null && (restoringValue || coldBootPending)
+        if (restoreHandleToClose != null || coldBootPending) {
+            restoreCancelled = true
+            restoringValue = false
+            coldBootPending = false
+            restoreHandle = null
+            restoreCancelSignal.complete(Unit)
+        }
         if (bootingValue) {
             bootCancelled = true
             // 後続（init の読み込みの待ち。whenInitLoaded）は、読み込みを取り消して起動用のスレッドに続きを積むだけなので、ロックの中で終えてよい
@@ -1622,6 +1908,12 @@ public class Machine private constructor(
         // ホストのディスク（#52）は、この後の操作を断る（止まり切っていない古いスレッドが触らないように）。閉じるのはロックの外
         vfs.revokeAll()
         checkAllDoneLocked()
+        if (restoreHandleToClose != null) {
+            // 止めるのをやめても、プロセスはすべて止めた後なので動かない
+            restoreHandleToClose.close()
+            if (wasRestoring && crash == null) postRestoreFinishedLocked(RestoreOutcome.CANCELLED, null)
+            restoreRequest = null
+        }
     }
 
     /**

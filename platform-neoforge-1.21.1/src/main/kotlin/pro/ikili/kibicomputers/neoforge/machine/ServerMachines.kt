@@ -29,6 +29,7 @@ import pro.ikili.kibicomputers.core.persist.AutosaveRotation
 import pro.ikili.kibicomputers.core.persist.AutosaveTarget
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.CaptureSubmitResult
+import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
@@ -37,6 +38,8 @@ import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreQueue
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.persist.WriteResult
 import pro.ikili.kibicomputers.core.util.CanonicalUuid
@@ -126,6 +129,12 @@ object ServerMachines {
     /** FULL でなくなって、まだ流していないチャンク（積んだ順）。メインスレッドだけで使う（#545） */
     private val demoted = LinkedHashMap<ChunkHolder, ServerLevel>()
 
+    /** FULL に戻ったチャンク（#85。次の tick の終わりに、電源が入っていたケースを復元の順番待ちに入れる）。メインスレッドだけで使う */
+    private val promoted = LinkedHashMap<ChunkHolder, ServerLevel>()
+
+    /** 復元の順番待ち（#85）。メインスレッドだけで使う */
+    private val restoreQueue = RestoreQueue<CaseBlockEntity>()
+
     /** 自動保存の周期を数える tick */
     private var autosaveTicks = 0L
 
@@ -136,6 +145,21 @@ object ServerMachines {
     internal object Stats {
         /** 受けた [ChunkEvent.Unload] のうち、ケースのあったもの */
         var unloadEventsWithCases: Long = 0
+
+        /** 復元（#85）を始めた台のうち、保存した世代から戻そうとした数 */
+        var restoresFromSave: Long = 0
+
+        /** 復元を始めた台のうち、最初から冷えた起動にした数（ID がない・新しい ID・書き込みが終わらない） */
+        var restoresColdStart: Long = 0
+
+        /** 書き込みが期限までに終わらず、冷えた起動にした数 */
+        var restoreWriteTimeouts: Long = 0
+
+        /** 保存した世代から戻せた数 */
+        var restored: Long = 0
+
+        /** 戻せずに冷えた起動にした数 */
+        var restoreFallbacks: Long = 0
 
         /** FULL でなくなったチャンク（[ChunkTicketLevelUpdatedEvent]）のうち、動いているケースのあったもの（#545） */
         var demotedChunksWithCases: Long = 0
@@ -227,6 +251,11 @@ object ServerMachines {
         var deltaRetries: Long = 0
 
         fun reset() {
+            restoresFromSave = 0
+            restoresColdStart = 0
+            restoreWriteTimeouts = 0
+            restored = 0
+            restoreFallbacks = 0
             unloadEventsWithCases = 0
             demotedChunksWithCases = 0
             demotedMachines = 0
@@ -296,6 +325,8 @@ object ServerMachines {
         changedLater.clear()
         rotation.clear()
         demoted.clear()
+        promoted.clear()
+        restoreQueue.clear()
         autosaveTicks = 0
         // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
         autosaveEnabled = event.server !is GameTestServer
@@ -311,6 +342,37 @@ object ServerMachines {
     /** サーバーで読み込まれたケース（`onLoad`） */
     internal fun track(be: CaseBlockEntity) {
         tracked += be
+    }
+
+    /** 電源が入っていたケースを、復元の順番待ちに入れる（#85。[CaseBlockEntity.onLoad] から） */
+    internal fun offerRestore(be: CaseBlockEntity) {
+        restoreQueue.offer(be, be.currentIdentity?.id, System.nanoTime())
+    }
+
+    /** 復元の順番待ちから外す（アンロード・`setRemoved`・FULL でなくなった） */
+    internal fun cancelRestore(be: CaseBlockEntity) {
+        restoreQueue.remove(be)
+    }
+
+    /** 復元の順番待ちの台数（テスト用） */
+    internal val pendingRestores: Int get() = restoreQueue.size
+
+    /** 復元を始めた（[CaseBlockEntity.startRestore]）。数え口に入れる */
+    internal fun recordRestoreStart(fromSave: Boolean, writesTimedOut: Boolean) {
+        if (fromSave) Stats.restoresFromSave++ else Stats.restoresColdStart++
+        if (writesTimedOut) Stats.restoreWriteTimeouts++
+    }
+
+    /** 復元が終わった（メインスレッド）。数え口に入れ、冷えた起動にしたら理由をログに残す */
+    internal fun recordRestoreFinished(pos: BlockPos, outcome: RestoreOutcome, cause: ColdBootCause?) {
+        when (outcome) {
+            RestoreOutcome.RESTORED -> Stats.restored++
+            RestoreOutcome.COLD_BOOT -> {
+                Stats.restoreFallbacks++
+                LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
+            }
+            RestoreOutcome.CANCELLED -> {}
+        }
     }
 
     /** アンロード・`setRemoved` されたケース。自動保存の列からも外す（止めていれば、ここで続ける） */
@@ -332,7 +394,7 @@ object ServerMachines {
 
     /** 自動保存の周期を、今すぐ1つ始める（負荷試験用。周期の数え方は変えない） */
     internal fun startAutosaveCycle() {
-        rotation.startCycle(tracked.filter { it.computer.machine != null })
+        rotation.startCycle(tracked.filter { it.computer.machine != null && !it.computer.isRestoring })
     }
 
     /** 自動保存の周期が終わっている（負荷試験用） */
@@ -342,6 +404,12 @@ object ServerMachines {
     private fun onServerTick(event: ServerTickEvent.Pre) {
         processCompletions()
         manager?.tick()
+        // 復元を始める（#85。tick ごとの台数の上限つき。書き込みの終わっていない台は後回し）
+        if (manager != null) {
+            restoreQueue.tick(System.nanoTime(), WorldMachineSaves.current, saveConfig) { be, timedOut ->
+                if (!be.isRemoved) be.startRestore(timedOut)
+            }
+        }
         unloadWaitedNanos = 0
         if (changedLater.isNotEmpty()) {
             val list = changedLater.toList()
@@ -355,7 +423,7 @@ object ServerMachines {
         autosaveTicks++
         if (autosaveTicks % saveConfig.autosavePeriodTicks == 0L) {
             if (!rotation.isCycleDone) LOGGER.warn("Autosave of computers did not finish within {} ticks", saveConfig.autosavePeriodTicks)
-            rotation.startCycle(tracked.filter { it.computer.machine != null })
+            rotation.startCycle(tracked.filter { it.computer.machine != null && !it.computer.isRestoring })
         }
         if (rotation.isCycleDone) return
         rotation.tick(AUTOSAVE_TARGET)
@@ -497,6 +565,8 @@ object ServerMachines {
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
+            // 復元の途中の台は取り出さない（NBT は前の世代と電源の状態を指したまま。外すと復元を取り消す。#85）
+            if (be.computer.isRestoring) continue
             if (be.computer.isCaptured) {
                 // 停止の手順で取り出し済み: チャンクの NBT がまだ古い世代を指していれば、保存させる
                 val id = be.identity
@@ -536,13 +606,21 @@ object ServerMachines {
      * 多くのチャンクで頻繁に来るので、段階をまたいだかだけを先に見る
      */
     private fun onChunkTicketLevelUpdated(event: ChunkTicketLevelUpdatedEvent) {
-        if (event.oldTicketLevel > FULL_LEVEL || event.newTicketLevel <= FULL_LEVEL) return
+        val down = event.oldTicketLevel <= FULL_LEVEL && event.newTicketLevel > FULL_LEVEL
+        val up = event.oldTicketLevel > FULL_LEVEL && event.newTicketLevel <= FULL_LEVEL
+        if (!down && !up) return
         val holder = event.chunkHolder ?: return
         if (manager == null) return
-        demoted[holder] = event.level
+        if (down) {
+            promoted.remove(holder)
+            demoted[holder] = event.level
+        } else {
+            promoted[holder] = event.level
+        }
     }
 
     private fun onServerTickPost(event: ServerTickEvent.Post) {
+        if (promoted.isNotEmpty() && manager != null) restorePromoted()
         if (demoted.isEmpty() || manager == null) return
         // 1 tick に最低1チャンク。そのあとは tick の時間が残っている間だけ（バニラのアンロードの列と同じ）
         var first = true
@@ -573,6 +651,23 @@ object ServerMachines {
             Stats.demotedMachines++
         }
         return true
+    }
+
+    /**
+     * FULL に戻ったチャンク（#85）の、電源が入っていてマシンのないケースを、復元の順番待ちに入れる（読み込み直したのと同じ）。
+     * まだ FULL でない・チャンクがもうないものは何もしない
+     */
+    private fun restorePromoted() {
+        val list = promoted.keys.toList()
+        promoted.clear()
+        for (holder in list) {
+            if (!holder.fullStatus.isOrAfter(FullChunkStatus.FULL)) continue
+            val chunk = holder.latestChunk as? LevelChunk ?: continue
+            for (be in chunk.blockEntities.values) {
+                if (be !is CaseBlockEntity || be.isRemoved) continue
+                if (be.computer.beginRestore()) offerRestore(be)
+            }
+        }
     }
 
     // ---- チャンクの保存（NBT が指す世代の印） ----
@@ -637,7 +732,8 @@ object ServerMachines {
      */
     internal fun saveForStop(targets: List<CaseBlockEntity>, keepQuiesced: Boolean): Int {
         rotation.clear()
-        val running = targets.filter { !it.isRemoved && it.computer.machine != null }
+        // 復元の途中の台は取り出さない（NBT は前の世代を指したまま。次に読み込んだときに戻し直す。#85）
+        val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(saveConfig.stopQuiesceMillis)
         while (System.nanoTime() < deadline && running.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
@@ -667,6 +763,8 @@ object ServerMachines {
         changedLater.clear()
         rotation.clear()
         demoted.clear()
+        promoted.clear()
+        restoreQueue.clear()
         stop(m)
     }
 

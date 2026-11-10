@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.MachineSpecs
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.computer.RestoreReady
 import pro.ikili.kibicomputers.core.kernel.DiskResolver
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
@@ -27,6 +28,8 @@ import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.PendingSave
+import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.persist.SaveCompletion
 import pro.ikili.kibicomputers.core.persist.adoptsCompletion
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
@@ -46,8 +49,10 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
  *   動いている間に画面を置き直したら、次の tick につなぎ直す（[neighborChanged]。#531・#535）
  *
- * セーブデータには部品（`Parts`）と、マシンの ID の参照（`MachineId`・`SaveGeneration`・`OwnerEpoch`。#81、ADR 0081）を書く。
- * 電源の状態は書かず、読み込んだら電源が切れている（状態の復元は #85）。
+ * セーブデータには部品（`Parts`）と、マシンの ID の参照（`MachineId`・`SaveGeneration`・`OwnerEpoch`。#81、ADR 0081）と、
+ * 電源の状態（`PoweredOn`。#85、ADR 0085）を書く。電源が入っていたら、サーバーで読み込まれたとき（[onLoad]）・チャンクが FULL に
+ * 戻ったときに復元の順番待ち（[ServerMachines.offerRestore]）に入り、順番が来たら（[startRestore]）保存した世代から戻す
+ * （戻せなければ冷えた起動）。`PoweredOn` のない古いセーブデータは、電源が切れているとして読む。
  *
  * マシンの ID（#81）:
  * - NBT から読んだ生の値（[rawId] など）と、確定した ID（[identity]）を分けて持つ。[saveAdditional] は確定した ID があればそれを、
@@ -74,7 +79,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal val wiring: TestComputerWiring = TestComputerWiring()
 
     /** 電源と状態。サーバーでだけ動く（クライアントでは常に [ComputerStatus.OFF]） */
-    val computer: ComputerCase<MachineKey> = ComputerCase(tier, wiring)
+    val computer: ComputerCase<MachineKey> = ComputerCase(tier, wiring) { setChanged() }
 
     /**
      * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[TestComputerWiring.OS_BOOT_DISK]）。
@@ -136,6 +141,44 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         loadedOnServer = true
         ServerMachines.track(this)
         claimIdentity()
+        // 電源が入っていたら、復元の順番待ちに入る（#85。始めるのは ServerMachines の tick）
+        if (computer.beginRestore()) ServerMachines.offerRestore(this)
+    }
+
+    /**
+     * 復元の順番が来た（#85。[ServerMachines] の tick から）。順番待ちでなければ何もしない。今の ID が `claim` に通っていれば、
+     * NBT が指す世代から戻す。ID がない・新しい ID を振った・書き込みが期限までに終わらない（[writesTimedOut]）なら冷えた起動にする
+     */
+    internal fun startRestore(writesTimedOut: Boolean) {
+        val level = level as? ServerLevel ?: return
+        if (!computer.isRestorePending || isRemoved) return
+        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val disks = prepareDisks()
+        val environment = MachineEnvironment.builder().disks(disks.resolver).build()
+        val boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
+        val store = WorldMachineSaves.current
+        val id = identity
+        val source = when {
+            store == null || id == null -> null
+            writesTimedOut -> null
+            lastClaim?.isNewId == true -> null
+            else -> RestoreSource(store, id.id, id.generation)
+        }
+        if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
+        ServerMachines.recordRestoreStart(source != null, writesTimedOut)
+        computer.startRestore(
+            ServerMachines.current,
+            MachineKey.of(level, blockPos),
+            installedForBoot,
+            true,
+            config,
+            environment,
+            boot,
+            source,
+            RestoreReady { machine -> wiring.attach(level, blockPos, machine, speakerAddress) },
+            RestoreListener { _, outcome, cause -> ServerMachines.recordRestoreFinished(blockPos, outcome, cause) },
+        )
+        if (computer.machine == null) wiring.disconnect()
     }
 
     /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick に `setChanged` する */
@@ -312,6 +355,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         super.onChunkUnloaded()
         leaveIndex()
         ServerMachines.untrack(this)
+        ServerMachines.cancelRestore(this)
         computer.chunkUnloaded()
         wiring.disconnect()
     }
@@ -319,10 +363,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /**
      * チャンクが FULL でなくなった（ティックしなくなったが、メモリには残る。#545）。[ServerMachines] が取り出して書いた後に呼ぶ。
      * マシンを外して電源を切る（アンロードと同じ）。ブロックエンティティは残るので、ID の索引と、読み込まれたケースの一覧には残す。
-     * チャンクが FULL に戻ったら、アンロードの後に読み込み直したのと同じく、電源が切れたまま
+     * 電源の状態（[ComputerCase.poweredOn]）は変えないので、チャンクが FULL に戻ったら、読み込み直したのと同じく復元する（#85）
      */
     internal fun chunkDemoted(chunk: LevelChunk) {
         demotedChunk = chunk
+        ServerMachines.cancelRestore(this)
         computer.chunkUnloaded()
         wiring.disconnect()
     }
@@ -331,6 +376,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         super.setRemoved()
         leaveIndex()
         ServerMachines.untrack(this)
+        ServerMachines.cancelRestore(this)
         computer.removed()
         wiring.disconnect()
     }
@@ -339,6 +385,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         super.saveAdditional(tag, registries)
         tag.put(PARTS_TAG, parts.serializeNBT(registries))
         speakerSlot.save(tag)
+        tag.putBoolean(POWERED_ON_TAG, computer.poweredOn)
         // 参照を書くだけ（チャンクの保存のほかに /data get block・/clone・ピックブロックからも呼ばれる。印は ChunkDataEvent.Save で付ける）
         val id = identity
         if (id != null) {
@@ -356,6 +403,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         super.loadAdditional(tag, registries)
         if (tag.contains(PARTS_TAG, Tag.TAG_COMPOUND.toInt())) parts.deserializeNBT(registries, tag.getCompound(PARTS_TAG))
         speakerSlot.load(tag)
+        // 古いセーブデータ（タグがない）は電源が切れている（#85）
+        computer.loadPoweredOn(tag.getBoolean(POWERED_ON_TAG))
         val id = if (tag.contains(MACHINE_ID_TAG, Tag.TAG_STRING.toInt())) tag.getString(MACHINE_ID_TAG) else null
         val generation = if (tag.contains(SAVE_GENERATION_TAG, Tag.TAG_LONG.toInt())) tag.getLong(SAVE_GENERATION_TAG) else null
         val epoch = if (tag.contains(OWNER_EPOCH_TAG, Tag.TAG_LONG.toInt())) tag.getLong(OWNER_EPOCH_TAG) else null
@@ -394,6 +443,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
         /** セーブデータの、持ち主の epoch のキー（#81） */
         const val OWNER_EPOCH_TAG: String = "OwnerEpoch"
+
+        /** セーブデータの、電源が入っているかのキー（#85、ADR 0085） */
+        const val POWERED_ON_TAG: String = "PoweredOn"
 
         private val LOGGER = LogUtils.getLogger()
     }
