@@ -145,7 +145,26 @@ class SnapshotDecoderModuleSourcesTest {
         assertEquals(max, SnapshotDecoder.moduleSources(atLimit, 1).size)
         val over = c.snapshot.withSections(others + List(max + 1) { one })
         assertThrows<SnapshotFormatException> { SnapshotDecoder.moduleSources(over, 1) }
-        assertThrows<SnapshotFormatException> { SnapshotDecoder.decode(over, 1, c.memoryPages, null) }
+        // decode 側: PROCESS_ABI 節は pid が KERNEL 節の表にあり重ならないものしか受けないので、節の数は表のプロセスの数で縛られる。
+        // その表の数を、同じ上限で断ることを確かめる（先読みと decode の上限がずれたら落ちる）
+        assertEquals("数 ${max + 1} が上限 $max を超える", decodeWithTableCount(c, max + 1).message)
+        // ちょうど上限なら数の上限では断らない（中身が足りないので、別の理由で断る）
+        assertNotEquals("数 $max が上限 $max を超える", decodeWithTableCount(c, max).message)
+    }
+
+    /** KERNEL 節のプロセス表の数だけを [count] に書き換えて、maxProcesses = 1 で復号したときの例外 */
+    private fun decodeWithTableCount(c: Captured, count: Int): SnapshotFormatException {
+        val kernel = c.snapshot.sections.single { it.kind == SnapshotSection.KERNEL }
+        val p = kernel.payload
+        // fuel i64・コンソール i32・init i32・時計 i64 x4・次の pid i32 の後に、孤児の数 i32 と孤児の pid i32 の列、表の数 i32
+        val orphanAt = 8 + 4 + 4 + 32 + 4
+        val orphans = SnapshotReader(p.copyOfRange(orphanAt, orphanAt + 4)).i32()
+        val countAt = orphanAt + 4 + orphans * 4
+        java.nio.ByteBuffer.wrap(p).putInt(countAt, count)
+        val patched = c.snapshot.withSections(
+            c.snapshot.sections.map { if (it.kind == SnapshotSection.KERNEL) SnapshotSection(it.kind, it.version, p) else it },
+        )
+        return assertThrows<SnapshotFormatException> { SnapshotDecoder.decode(patched, 1, c.memoryPages, null) }
     }
 
     @Test

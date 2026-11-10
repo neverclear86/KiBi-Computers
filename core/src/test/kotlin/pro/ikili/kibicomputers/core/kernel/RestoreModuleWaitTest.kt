@@ -334,6 +334,8 @@ class RestoreModuleWaitTest {
                 assertTrue(Duration.ofNanos(System.nanoTime() - started) < Duration.ofSeconds(5))
                 assertTrue(restoring.none { it.isRestoring })
                 assertTrue(restoring.all { it.lock.withLockValue { it.kernel.processes.size } == 0 })
+                // 前段は completeRestore・restoreFellBack を通らずに抜けるので、登録を外すのは close() が呼ぶ stop() だけ
+                restoring.forEach { assertNoCancelRegistration(it) }
             } finally {
                 gate.countDown()
             }

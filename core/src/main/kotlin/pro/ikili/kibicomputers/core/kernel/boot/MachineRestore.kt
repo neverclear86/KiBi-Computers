@@ -133,7 +133,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
 
     /**
      * 終わるのを待っている読み込み（取り消しの登録が見る）。登録はこの入れ物だけを持ち、[MachineRestore] を捕まえない（#587）:
-     * 信号を終え損ねても、残るのは空の入れ物だけで、[programs]・[stored]・[base] は回収される
+     * 信号を終え損ねても、[programs]・[stored]・[base] は回収される。入れ物は読み込みの完了（`loaded`）で空にするが、
+     * 完了の後の積み直しが断られたとき（スケジューラが閉じた後）は、終わった読み込み（その [Program]）を持ったまま残る。
+     * そのときは `close()` が呼ぶ `stop()`（`stopLocked`）が信号を終えるので、登録ごと外れる
      */
     private val waiting = AtomicReference<CompletableFuture<Program>?>()
 
