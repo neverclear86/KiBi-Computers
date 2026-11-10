@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -56,7 +57,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -544,6 +548,67 @@ class MachineRestoreBranchesTest {
             assertFalse(Files.exists(disk.resolve("out.txt")), "消えたファイルを作り直した")
             assertEquals(MachineState.RUNNING, m.state)
             m.close()
+        }
+    }
+
+    @Test
+    fun `取り消された古い前段が確かめた後にディスクを開いても、新しく戻したマシンのディスクを締め出さない`() = timeout(limit) {
+        // #588: A の前段は openMounts で取り消しを確かめた直後（開く前）に止まる。その間に A を閉じ、B が同じ世代を戻してから A を放す
+        val store = newStore()
+        val disk = dir.resolve("disk")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWithFiles(h, store, disk)
+            val real = BootVolumeOpener.forDisks({ id -> if (id == "root") ResolvedDisk(disk, 1L shl 30, 4096) else null }, HostFileBudget())
+            val aEntered = CountDownLatch(1)
+            val aRelease = CountDownLatch(1)
+            val aDone = CountDownLatch(1)
+            val aOpened = AtomicReference<BootVolume?>()
+            val calls = AtomicInteger()
+            h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
+                override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+                override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+                    if (calls.getAndIncrement() != 0) return real.open(diskId, cancelled)
+                    aEntered.countDown()
+                    aRelease.await()
+                    try {
+                        return real.open(diskId, cancelled).also { aOpened.set(it) }
+                    } finally {
+                        aDone.countDown()
+                    }
+                }
+            }
+            val aFinished = Finished()
+            val a = h.machine(fuelPerTick = 10_000_000)
+            assertTrue(a.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), aFinished.listener)))
+            eventually(60_000, "A の前段がディスクを開きに来ない") {
+                h.scheduler.tick()
+                aEntered.count == 0L
+            }
+            a.close()
+            assertTrue(a.isRestoreCancelled)
+            val finished = Finished()
+            val b = restore(h, store, saved.identity, finished)
+            try {
+                assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+                aRelease.countDown()
+                assertTrue(aDone.await(10, TimeUnit.SECONDS))
+                assertNull(aOpened.get(), "取り消された前段はディスクを開かない")
+                h.scheduler.tick()
+                assertTrue(aFinished.outcomes.none { it.first == RestoreOutcome.COLD_BOOT }, "取り消された前段を冷えた起動に流した: ${aFinished.outcomes}")
+                // B の開いたファイル（ディスクの /out.txt）に、今も書ける（直す前は、A が世代を進めて IO になった）
+                send(b, saved.started.input, "hello\n")
+                val file = disk.resolve("out.txt")
+                eventually(60_000, "ファイルに答えを書かない") {
+                    h.scheduler.tick()
+                    String(Files.readAllBytes(file)).split("> ").size - 1 >= 2
+                }
+                assertTrue(String(Files.readAllBytes(file)).startsWith("> 1 hello "))
+                assertEquals(MachineState.RUNNING, b.state)
+            } finally {
+                aRelease.countDown()
+                b.close()
+            }
         }
     }
 

@@ -90,6 +90,12 @@
 - 電源を切ってすぐ入れたとき・別の台へ挿し替えたときに、止まり切っていない古いカーネルの I/O は、新しい世代の最初の操作より先に終わる（同じロックで直列）
 - 1つのディスクの I/O はこのロックで1本ずつ行う。待つのは同じディスクを使うスレッドどうしだけ。複合操作（作成の「名前があるか → 作る」、追記、`allocate`、`rename(requireDirectory)`）は、このロックの中で不可分になる
 - 停止（`Machine.stopLocked` → `Vfs.revokeAll`）と外す（`onUnmounted`）は、印を付けるだけで I/O をしない。開いたままのファイルは `retire` が、ロックの外で閉じる。起動で選ばなかった候補のディスクも閉じる
+- **取り消された開き手は世代を進めない（#588）**: 起動の手順（`BootSequence.findBootVolume`・`mountHome`）と復元の前段（`MachineRestore.openMounts`）は「取り消しを確かめる → ロックなしで開く」の形で、確かめた後・開く前に止まった古い手順が、後から新しいマシンの世代を追い越して締め出すことがありえた（世代は戻らないので、新しいマシンのディスクが以後ずっと `IO`）。そこで、開き手は自分の取り消しの確かめを `BootVolumeOpener.open(diskId, cancelled)` → `DiskFileSystem.open(..., cancelled)` → `HostDiskLeases.acquire(root, cancelled)` に渡し、`acquire` は **このロックの中で、世代を進める直前に** それを見る。真なら世代を進めず、取った分（`users`）を返して `DiskOpenCancelledException` を投げる。呼び手は開けなかったとき、まず自分の取り消しを確かめ、取り消されていれば失敗（`NO_BOOT_DISK`・冷えた起動の `MOUNT`）に流さずに黙って抜ける
+  - 確かめは volatile を読むだけ（起動は `Machine.isBootCancelled`、復元は `Machine.isRestoreCancelled`）。カーネルロックを取らない（このロックの中でカーネルロックを取らない規則のまま）。足す負荷は、開くときに volatile を1回読むことだけ
+  - 正しさは次の順序に乗る: 電源の入れ直し・アンロード・撤去では、メインスレッドで古い台を止めて（`stopLocked` が取り消しの印を立てる）から、新しい台を作る。新しい台が世代を進めるのはこのロックの中なので、古い台がその後でこのロックを取れば、必ず取り消しが見える（印 → 新しい台の作成 → 新しい台の unlock → 古い台の lock の happens-before）。古い台が取り消しより前に開いたなら、それは新しい台より前なので、新しい台が勝つ。新しい台に一瞬も `IO` は見えない
+  - 「開いた後に取り消しを見て、世代を戻す」形は採らない。戻すまでの間、新しい台の操作（起動の `init` の確かめを含む）が `IO` になり、戻してよい相手（3つ目の開き手がいないか）も見分けられないため。古い手順が終わるのを新しい台の起動用のスレッドで待つ形も採らない（起動用のスレッドは `maxConcurrentMachines` 本しかない）
+  - 同じディスクの複製を2台で同時に使っているとき（どちらも取り消されていない）は、今までどおり後から開いた側が勝つ
+  - 将来の注意: アンロードの間の休止（#132）で古い台を止めずに残す形になると、上の順序が崩れる。抜き差し・ランタイムのマウント（#56）で別の口からディスクを開くときも、同じ取り消しの確かめを `cancelled` で渡す
 
 ### 割り込み
 
@@ -102,7 +108,7 @@
 
 ## 起動ディスクとしての接続
 
-- `BootVolumeOpener.forDisks(disks, budget)`: `image:` の識別子は同梱イメージ、ほかは `MachineEnvironment.disks`（`DiskResolver`）が返すディレクトリを `DiskFileSystem` として開く（なければ作る）。起動の手順の既定はこれ
+- `BootVolumeOpener.forDisks(disks, budget)`: `image:` の識別子は同梱イメージ、ほかは `MachineEnvironment.disks`（`DiskResolver`）が返すディレクトリを `DiskFileSystem` として開く（なければ作る）。起動の手順の既定はこれ。取り消しを見る形 `open(diskId, cancelled)` で呼ぶと、取り消された開き手は世代を進めずに `null` を返す（上の「排他とリース」。#588）。差し替えの口（テスト）は `open(diskId)` だけを実装すればよい（既定の `open(diskId, cancelled)` は取り消しを見ずに `open(diskId)` を呼ぶ）
 - 接続層（`platform-*`）は変えない。ディスクの識別子とワールドフォルダの中の置き場所は #124、抜き差しは #56
 
 ## 採らなかったもの

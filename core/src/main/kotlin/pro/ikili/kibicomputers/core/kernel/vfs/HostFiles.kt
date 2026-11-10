@@ -53,10 +53,14 @@ internal class HostFileBudget(
     }
 }
 
+/** 開き手（起動・復元の手順）が取り消されていたので、ディスクを開かなかった（世代は進めていない。#588） */
+internal class DiskOpenCancelledException : java.io.IOException("取り消されたので、ディスクを開かなかった")
+
 /**
  * ホストのディレクトリごとの持ち主の世代（リース。#52）。同じディレクトリを新しく開いた [DiskFileSystem] が世代を進め、
  * 古い世代のものの操作は `IO` で断る（電源を切ってすぐ入れたとき、ディスクを別の台へ挿し替えたときに、
  * 止まり切っていない古いカーネルと新しいカーネルが同じディスクを触らないように）。
+ * ただし、もう取り消された開き手は世代を進めない（[acquire]。#588）。
  *
  * 1つのディスクの I/O は [Lease.lock] で1本ずつ行う（待つのは、同じディスクを使うスレッドどうしだけ）。
  */
@@ -74,16 +78,29 @@ internal object HostDiskLeases {
 
     private val leases = ConcurrentHashMap<Path, Lease>()
 
-    /** [root]（`toRealPath` したもの）のリースを取り、新しい世代を返す */
-    fun acquire(root: Path): Pair<Lease, Long> {
+    /**
+     * [root]（`toRealPath` したもの）のリースを取り、新しい世代を返す。
+     *
+     * 世代を進めるのは、[Lease.lock] の中で [cancelled] が偽のときだけ（#588）。真なら世代を進めず、取った分を返して
+     * [DiskOpenCancelledException] を投げる。取り消された古いカーネルが、確かめた後・開く前に止まっている間に、
+     * 新しいカーネルが同じディスクを開いたとき、古い側が後から世代を進めて新しい側を締め出さないようにするため（ADR 0052）。
+     * [cancelled] はロックの中で呼ぶので、volatile を読むだけにし、カーネルロックを取らない
+     */
+    @Throws(DiskOpenCancelledException::class)
+    fun acquire(root: Path, cancelled: () -> Boolean = { false }): Pair<Lease, Long> {
         val lease = leases.compute(root) { _, existing -> (existing ?: Lease(root)).also { it.users++ } }!!
+        val generation: Long
         lease.lock.lock()
         try {
-            lease.generation++
-            return lease to lease.generation
+            generation = if (cancelled()) 0L else ++lease.generation
         } finally {
             lease.lock.unlock()
         }
+        if (generation == 0L) {
+            release(lease)
+            throw DiskOpenCancelledException()
+        }
+        return lease to generation
     }
 
     /** [acquire] の分を返す。使う者がいなくなったら表から外す */

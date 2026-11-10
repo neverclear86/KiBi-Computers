@@ -588,6 +588,103 @@ class BootTest {
     }
 
     @Test
+    fun `取り消された古い起動が確かめた後にディスクを開いても、新しいマシンのディスクを締め出さない`(@TempDir dir: Path) = env {
+        // #588: A は取り消しを確かめた直後（開く前）で止まり、その間に A を止めて B が同じディスクで起動する。後から A が開いても、B の世代は進めない
+        val diskDir = Files.createDirectories(dir.resolve("d1/sbin")).parent
+        Files.write(diskDir.resolve("sbin/init"), exe(foreverInit()))
+        val leases = HostDiskLeases.size
+        val real = BootVolumeOpener.forDisks({ id -> if (id == "d1") ResolvedDisk(diskDir, 1L shl 20, 1024) else null }, m.hostFiles)
+        val aEntered = CountDownLatch(1)
+        val aRelease = CountDownLatch(1)
+        val calls = AtomicInteger()
+        h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
+            override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+            override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+                if (calls.getAndIncrement() == 0) {
+                    aEntered.countDown()
+                    aRelease.await()
+                }
+                return real.open(diskId, cancelled)
+            }
+        }
+        assertTrue(m.boot(bootDisks("d1")))
+        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        m.stop()
+        val bHost = Recorder()
+        val b = h.machine(host = bHost)
+        try {
+            assertTrue(b.boot(bootDisks("d1")))
+            tickUntil { b.state == MachineState.RUNNING && bHost.console.contains("booting") }
+            aRelease.countDown()
+            tickUntil("A の起動の手順が終わらない") { !m.isBooting }
+            assertTrue(m.awaitTermination(5_000))
+            assertEquals(MachineState.STOPPED, m.state)
+            assertTrue(host.failures.isEmpty(), "取り消された起動は失敗を知らせない: ${host.failures}")
+            assertEquals(leases + 1, HostDiskLeases.size, "A が断った分のリースは返す")
+            // B のディスクは今も使える（直す前は、A が世代を進めて IO になった）
+            assertEquals(FileType.REGULAR_FILE, b.vfs.stat(VfsPath.parse("/sbin/init")).type)
+            val f = b.vfs.open(VfsPath.parse("/hello.txt"), OpenOptions(read = true, write = true, create = true))
+            b.vfs.write(f, "hi".toByteArray(), 0, 2)
+            b.vfs.close(f)
+            assertEquals("hi", Files.readString(diskDir.resolve("hello.txt")))
+        } finally {
+            aRelease.countDown()
+            b.stop()
+            assertTrue(b.awaitTermination(5_000))
+        }
+        tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
+    }
+
+    @Test
+    fun `取り消された古い起動の、home を開く前の窓でも新しいマシンのディスクを締め出さない`(@TempDir dir: Path) = env {
+        // #588: mountHome も「確かめる → 開く」の形。読み取り専用の根（メモリ上）から起動し、A は home を開く直前で止まる
+        disks.withInit("ro", exe(foreverInit()))
+        disks.readOnly += "ro"
+        val homeDir = Files.createDirectories(dir.resolve("home"))
+        val leases = HostDiskLeases.size
+        val real = BootVolumeOpener.forDisks({ id -> if (id == "h") ResolvedDisk(homeDir, 1L shl 20, 1024) else null }, m.hostFiles)
+        val aEntered = CountDownLatch(1)
+        val aRelease = CountDownLatch(1)
+        val homeCalls = AtomicInteger()
+        h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
+            override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+            override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+                if (diskId != "h") return disks.open(diskId)
+                if (homeCalls.getAndIncrement() == 0) {
+                    aEntered.countDown()
+                    aRelease.await()
+                }
+                return real.open(diskId, cancelled)
+            }
+        }
+        assertTrue(m.boot(withHome("h", "ro")))
+        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        m.stop()
+        val bHost = Recorder()
+        val b = h.machine(host = bHost)
+        try {
+            assertTrue(b.boot(withHome("h", "ro")))
+            tickUntil { b.state == MachineState.RUNNING && bHost.console.contains("booting") }
+            aRelease.countDown()
+            tickUntil("A の起動の手順が終わらない") { !m.isBooting }
+            assertTrue(m.awaitTermination(5_000))
+            assertFalse(host.console.contains("/home not mounted"), "取り消された起動は home の失敗を書かない")
+            assertEquals(leases + 1, HostDiskLeases.size, "A が断った分のリースは返す")
+            val f = b.vfs.open(VfsPath.parse("/home/hello.txt"), OpenOptions(read = true, write = true, create = true))
+            b.vfs.write(f, "hi".toByteArray(), 0, 2)
+            b.vfs.close(f)
+            assertEquals("hi", Files.readString(homeDir.resolve("hello.txt")))
+        } finally {
+            aRelease.countDown()
+            b.stop()
+            assertTrue(b.awaitTermination(5_000))
+        }
+        tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
+    }
+
+    @Test
     fun `ResolvedDiskの容量がディスクのFSの割り当てに効き、超える書き込みはNOSPC`(@TempDir dir: Path) = env {
         val diskDir = Files.createDirectories(dir.resolve("d1/sbin")).parent
         val init = exe(foreverInit())
