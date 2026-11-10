@@ -399,10 +399,14 @@ public class Machine private constructor(
 
     /**
      * 起動の取り消しを、init の読み込み（コンパイル）を待つ起動の手順に伝える（#344）。[boot] で作り直し、[stopLocked] で終える。
-     * カーネルロックの中で書く
+     * 起動が終わったら（成功でも失敗でも）、終わった値に替えて、起動中の登録ごと手放す（#598。登録が init の読み込みを捕まえたまま残らない）。
+     * 起動の途中でだけ読む。カーネルロックの中で書く
      */
     @Volatile
     private var bootCancelSignal: CompletableFuture<Unit> = CompletableFuture.completedFuture(Unit)
+
+    /** 今の [bootCancelSignal] に付いている登録の数（テスト用。起動の後は 0。#598） */
+    internal val bootCancelRegistrations: Int get() = bootCancelSignal.numberOfDependents
 
     /** 最後に受け付けた [boot] の設定。実行時だけの値（戻したマシンでは、接続層が渡し直す。ADR 0049・#81） */
     @Volatile
@@ -1178,6 +1182,7 @@ public class Machine private constructor(
             if (asInit) {
                 kernel.initPid = pid
                 bootingValue = false
+                releaseBootCancelSignalLocked()
             }
             installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
             // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
@@ -1377,14 +1382,30 @@ public class Machine private constructor(
     internal fun whenInitLoaded(pending: PendingExec, onLoaded: () -> Unit) {
         val cancel = lock.withLockValue { bootCancelSignal }
         val fired = AtomicBoolean()
-        pending.future.whenComplete { _, _ -> if (fired.compareAndSet(false, true)) runBootStep(onLoaded) }
+        // 取り消しの登録には、読み込みの ticket を入れる小さな入れ物だけを持たせる（#598。pending ごと捕まえると、
+        // 起動が終わっても init の実行ファイルのバイト列が残る）。どちらかが勝ったら空にする
+        val load = AtomicReference<CompletableFuture<Program>?>(pending.future)
+        pending.future.whenComplete { _, _ ->
+            if (fired.compareAndSet(false, true)) {
+                load.set(null)
+                runBootStep(onLoaded)
+            }
+        }
         cancel.whenComplete { _, _ ->
             // stopLocked の中（カーネルロックの中）から呼ばれる。取り消しは読み込みの側のロックだけを取るので、ここで行ってよい
             if (fired.compareAndSet(false, true)) {
-                pending.future.cancel(false)
+                load.getAndSet(null)?.cancel(false)
                 runBootStep { endBoot(null, "") }
             }
         }
+    }
+
+    /**
+     * 起動が終わった: [bootCancelSignal] を終わった値に替え、起動中の登録（[whenInitLoaded]・[awaitProgram]）ごと手放す（#598）。
+     * 古い信号は終えない（待つ側に取り消しと伝えない）。起動の途中でしか読まないので、終わった値でよい。カーネルロックの中で呼ぶ
+     */
+    private fun releaseBootCancelSignalLocked() {
+        bootCancelSignal = CompletableFuture.completedFuture(Unit)
     }
 
     /** 起動の手順の続きを、起動用のスレッドで動かす（スケジューラが閉じて受け付けなければ、このスレッドで） */
@@ -2292,6 +2313,7 @@ public class Machine private constructor(
     internal fun endBoot(failure: BootFailure?, reason: String, detail: String? = null): Unit = lock.withLockValue {
         if (!bootingValue) return@withLockValue
         bootingValue = false
+        releaseBootCancelSignalLocked()
         if (kernel.processes.liveCount() == 0) unmountAllLocked()
         if (failure != null && !bootCancelled) {
             writeConsoleLine(BootSequence.consoleMessage(failure, reason))

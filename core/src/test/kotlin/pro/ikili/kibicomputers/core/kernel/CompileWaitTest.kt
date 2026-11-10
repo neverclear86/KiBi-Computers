@@ -222,6 +222,45 @@ class CompileWaitTest {
     }
 
     @Test
+    fun `起動が終わったら、起動の取り消しの登録を残さない`() = env {
+        val host = FailureHost()
+        val disk = initDisk(exe(exitingInit()))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine(host = host)
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        eventually { loading.isNotEmpty() }
+        // 読み込みを待つ間は、取り消しの登録がある（stop() で起動をやめられる）
+        eventually { m.bootCancelRegistrations >= 1 }
+        gate.countDown()
+        tickUntil("起動が終わらない") { !m.isBooting }
+        // 起動の後は、init の読み込み（実行ファイルのバイト列）を捕まえた登録が残らない（#598）
+        assertEquals(0, m.bootCancelRegistrations, "起動の取り消しの登録が残っている")
+        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList())
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `起動の途中のstopの後も、起動の取り消しの登録を残さず、また起動できる`() = env {
+        val disk = initDisk(exe(exitingInit()))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine()
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        eventually { loading.isNotEmpty() }
+        m.stop()
+        eventually { !m.isBooting }
+        assertEquals(0, m.bootCancelRegistrations, "起動の取り消しの登録が残っている")
+        gate.countDown()
+        eventually { h.scheduler.programs.loadingCount == 0 }
+        // 新しい起動は、新しい信号で取り消せる（終わった値を引き継がない）
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        tickUntil("起動が終わらない") { !m.isBooting }
+        assertEquals(0, m.bootCancelRegistrations)
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
     fun `プロセスはexecの読み込みを待つ間CPUと許可を返し、ほかのプロセスが動く`() = env(maxConcurrentMachines = 1) {
         val m = h.machine(fuelPerTick = 1_000_000)
         m.mountRoot("/bin/x" to exe())
