@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.HostDiskLeases
 import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -64,10 +65,13 @@ import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
- * 復元（#85、ADR 0085）の主な分岐（#578）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・
- * 戻した直後の起こし）、`/tmp` と開いたファイル（消えていたら STALE）、冷えた起動の理由ごとの1つずつ、起こしを使う前の保存の `wakeOnRestore`。
+ * 復元（#85、ADR 0085）の主な分岐（#578、#590）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・
+ * 戻した直後の起こし）、待ちが空で `wakeOnRestore` が立つ形、`/tmp` と開いたファイル（消えていたら STALE）、表に入れた後の後段の失敗、
+ * 冷えた起動の理由ごとの1つずつ、起こしを使う前の保存の `wakeOnRestore`。
  *
- * どのテストも、戻す前に書いた世代そのもの（状態・差分か）を確かめてから戻す（「戻って動いた」だけでは、思った形で保存していなくても通るため）
+ * 保存した状態の形に頼るテスト（差分・RUNNABLE・起こし・空の待ち・`/tmp` と開いたファイル・KILLED_SECTION・UNSUPPORTED_PROCESS）は、
+ * 戻す前に書いた世代そのもの（状態・待ち・差分か）を確かめてから戻す（「戻って動いた」だけでは、思った形で保存していなくても通るため）。
+ * [savePrompt] を使うもの（MODULE_MISMATCH の 2 件・MOUNT）は、落ちる原因がモジュール・ディスクの側にあるので、世代の中身は確かめない
  */
 class MachineRestoreBranchesTest {
     @TempDir
@@ -307,7 +311,11 @@ class MachineRestoreBranchesTest {
             openFreshRoot(h)
             val m = h.machine(fuelPerTick = 20_000)
             val s = start(m, TestMemoryFileSystem(), "fuel-spin-wasi.wasm", "/bin/spin", listOf("spin", "main", "3", "100000"), withInput = false)
-            h.scheduler.tick()
+            // 1 ラウンド目の出力が出るまで回す（何も出さないうちに保存すると、頭から動かし直しても通ってしまう。#590）
+            eventually(60_000, "1 ラウンド目を出さない") {
+                h.scheduler.tick()
+                output(m, s.output).isNotEmpty()
+            }
             // 燃料切れで巻き戻し、スレッドを持たずに燃料を待つ（tick は回さない: 回すと続きを動かしてしまう）
             eventually(30_000, "燃料切れで巻き戻さない") {
                 m.lock.withLockValue {
@@ -324,6 +332,12 @@ class MachineRestoreBranchesTest {
             assertNull(process.wait, "燃料待ちは待ちがない")
             assertFalse(s.pid in kernelOf(written).wakeOnRestore)
             assertTrue(p1Of(written, s.pid).asyncStack.isNotEmpty(), "退避した値がない")
+            // 書いた世代の出力は、途中までの分（空でなく、全文の真の先頭部分）。wasi-libc の stdout は tty でなければ 2 行目からためることが
+            // あるので、何行出たかは決め打ちしない
+            val all = expectedSpin(3, 100_000)
+            val savedOutput = (kernelOf(written).objects[s.output] as ByteStream).availableBytes().toString(Charsets.UTF_8)
+            assertTrue(savedOutput.isNotEmpty(), "書いた世代の出力が空")
+            assertTrue(savedOutput.length < all.length && all.startsWith(savedOutput), "書いた世代の出力が途中までの分でない: $savedOutput")
             m.close()
 
             val finished = Finished()
@@ -341,8 +355,8 @@ class MachineRestoreBranchesTest {
                 m2.stateOf(s.pid).isTerminal
             }
             assertEquals(ProcessState.EXITED, m2.stateOf(s.pid), "${m2.rt(s.pid).lastError}")
-            // 出力のストリームも写しに入っているので、保存の前の分と合わせて全文になる
-            assertEquals(expectedSpin(3, 100_000), output(m2, s.output))
+            // 出力のストリームも写しに入っているので、保存の前の分と合わせて全文になる（頭から動かし直すと、1 行目が 2 回出る）
+            assertEquals(all, output(m2, s.output))
             m2.close()
         }
     }
@@ -460,11 +474,112 @@ class MachineRestoreBranchesTest {
         }
     }
 
+    /**
+     * 写しの [pid] の待ちを空の並びにし、`wakeOnRestore` を立てて書く（#590）。ホスト側の処理の待ちだけを待っていたプロセスで、
+     * `dropHostWaitsInCopy` が key を外した結果と同じ形を手で作る（状態は変えない。`null` ではなく空の並び）。
+     * 書いた世代が思った形（[state]・空の待ち・`wakeOnRestore`）かを確かめてから返す
+     */
+    private fun writeEmptyWait(store: MachineSaveStore, m: Machine, pid: Int, state: ProcessState): MachineIdentity {
+        val copy = captureCopy(m)
+        assertEquals(state, copy.processes[pid]!!.state)
+        copy.processes[pid]!!.wait = emptyList()
+        copy.markWakeOnRestore(pid)
+        val identity = store.write(store.assignNewId(owner)!!, owner, copy.toSource()).identity
+        val kernel = kernelOf(stored(store, identity))
+        val process = kernel.processes[pid]!!
+        assertEquals(state, process.state)
+        assertNotNull(process.wait, "空の待ちが NO_WAIT（null）になった")
+        assertTrue(process.wait!!.isEmpty(), "待ちが空でない: ${process.wait}")
+        assertTrue(pid in kernel.wakeOnRestore)
+        return identity
+    }
+
+    /** 戻した直後（知らせの中）: 空の待ちは登録せず（waitSet がない）、起こしを立てて RUNNABLE にしている */
+    private fun assertEmptyWaitRestored(machine: Machine, pid: Int) = machine.lock.withLockValue {
+        val rt = machine.runtime(pid)!!
+        // WAITING_EVENT でも、起こしの予定（scheduleThreadlessLocked）で RUNNABLE になっている
+        assertEquals(ProcessState.RUNNABLE, rt.process.state)
+        assertTrue(rt.restoreWake, "空の待ちで起こしを立てていない")
+        assertNull(rt.waitSet, "空の待ちを登録した")
+        assertTrue(rt.process.wait?.isEmpty() == true, "待ちが空の並びでない: ${rt.process.wait}")
+    }
+
+    @Test
+    fun `待ちが空でwakeOnRestoreが立ったWAITING_EVENTを戻すと、登録せずに起こし、入力がないので待ち直す`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = startPrompt(h, m, TestMemoryFileSystem())
+            val identity = writeEmptyWait(store, m, s.pid, ProcessState.WAITING_EVENT)
+            m.close()
+
+            val finished = Finished()
+            finished.onFinished = { machine, _ -> assertEmptyWaitRestored(machine, s.pid) }
+            val m2 = restore(h, store, identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 起こし（waitSet のないまま resume）を使い、入力がないので空でない待ちで待ち直す
+            eventually(60_000, "起こしを使って待ち直さない") {
+                h.scheduler.tick()
+                m2.lock.withLockValue { !m2.runtime(s.pid)!!.restoreWake } && m2.stateOf(s.pid) == ProcessState.WAITING_EVENT && m2.isAtWaitPoint
+            }
+            assertFalse(output(m2, s.output).contains("1 "), "入力なしで答えた")
+            val copy = captureCopy(m2)
+            assertFalse(copy.wakeOnRestore(s.pid), "起こしを使った後の写しに wakeOnRestore が残る")
+            assertTrue(copy.processes[s.pid]!!.wait?.isNotEmpty() == true, "待ち直した後の待ちが空")
+            send(m2, s.input, "x\n")
+            eventually(60_000, "起こしの後の入力に答えない: ${output(m2, s.output)}") {
+                h.scheduler.tick()
+                output(m2, s.output).contains("1 x ")
+            }
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `待ちが空でwakeOnRestoreが立ったRUNNABLEを戻すと、登録せずに燃料をもらってから起こし、入っていた入力に答える`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = startPrompt(h, m, TestMemoryFileSystem())
+            // (b1) と同じく、止めてから入力を入れて RUNNABLE（待機点）にする
+            val hold = m.quiesce()
+            send(m, s.input, "hello\n")
+            eventually(10_000, "RUNNABLE にならない") {
+                h.scheduler.tick()
+                m.stateOf(s.pid) == ProcessState.RUNNABLE && m.isAtWaitPoint
+            }
+            val identity = writeEmptyWait(store, m, s.pid, ProcessState.RUNNABLE)
+            hold.close()
+            m.close()
+
+            val finished = Finished()
+            finished.onFinished = { machine, _ -> assertEmptyWaitRestored(machine, s.pid) }
+            val m2 = restore(h, store, identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 追加の入力なしで、保存の前に入れた行に答える（起こしで、そろいを見ずに resume する）
+            eventually(60_000, "戻したプロセスが答えない: ${output(m2, s.output)}") {
+                h.scheduler.tick()
+                output(m2, s.output).contains("1 hello ")
+            }
+            awaitWaiting(h, Started(m2, s.pid, s.input, s.output), "次の入力を待たない")
+            assertFalse(m2.lock.withLockValue { m2.runtime(s.pid)!!.restoreWake })
+            m2.close()
+        }
+    }
+
     // ---- /tmp と開いたファイル ----
 
-
-    /** `/tmp/x` に書いた模様と、標準出力にしたディスクのファイル `/out.txt` のオブジェクト */
-    private class SavedFiles(val identity: MachineIdentity, val started: Started, val outId: Int, val pattern: ByteArray, val usedBytes: Long)
+    /** `/tmp/x` に書いた模様と、標準出力にしたディスクのファイル `/out.txt` のオブジェクト（[root] は保存したマシンの根のディスク） */
+    private class SavedFiles(
+        val identity: MachineIdentity,
+        val started: Started,
+        val outId: Int,
+        val pattern: ByteArray,
+        val usedBytes: Long,
+        val root: DiskFileSystem,
+    )
 
     /**
      * 根を本物の [DiskFileSystem]（[disk]）にし、`/tmp` に模様を書き、標準出力をディスクのファイル `/out.txt` にして `prompt` を動かし、
@@ -475,10 +590,11 @@ class MachineRestoreBranchesTest {
         val m = h.machine(fuelPerTick = 10_000_000)
         val pattern = ByteArray(10_000) { (it % 251 + 1).toByte() }
         var outId = 0
+        val root = DiskFileSystem.open(disk)
         val s = startPrompt(
             h,
             m,
-            DiskFileSystem.open(disk),
+            root,
             stdout = { machine ->
                 val out = machine.vfs.open(VfsPath.parse("/out.txt"), OpenOptions(read = false, write = true, create = true, truncate = true))
                 machine.lock.withLockValue { machine.kernel.objects.add(out) }.also { outId = it }
@@ -489,7 +605,7 @@ class MachineRestoreBranchesTest {
             val t = machine.vfs.open(VfsPath.parse("/tmp/x"), OpenOptions(read = false, write = true, create = true))
             assertEquals(pattern.size, machine.vfs.write(t, pattern, 0, pattern.size))
         }
-        // 開いたファイルは、プロセスの標準出力から届く形だけで持つ（テストが足した参照は返す）
+        // 本番と同じく、開いたファイルにはプロセスの標準出力からだけ届く形にする（テストが足した参照は返す）
         m.lock.withLockValue { m.kernel.objects.release(outId, m.wakeSink) }
         assertTrue(m.lock.withLockValue { m.kernel.objects[outId] is OpenFile }, "標準出力の開いたファイルが表にない")
         eventually(10_000, "プロンプトをファイルに書かない") { String(Files.readAllBytes(disk.resolve("out.txt"))) == "> " }
@@ -499,7 +615,7 @@ class MachineRestoreBranchesTest {
         assertEquals(1, written.sections.count { it.kind == SnapshotSection.TMPFS }, "TMPFS 節がない")
         assertEquals(VfsPath.parse("/out.txt"), kernelOf(written).filePaths[outId], "開いたファイルのパスを書いていない")
         m.close()
-        return SavedFiles(identity, s, outId, pattern, used)
+        return SavedFiles(identity, s, outId, pattern, used, root)
     }
 
     @Test
@@ -537,7 +653,8 @@ class MachineRestoreBranchesTest {
         val disk = dir.resolve("disk")
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val saved = saveWithFiles(h, store, disk)
-            // 保存したマシンを閉じた後に消す（Windows では、開いている間は消せない）
+            // ホストのファイルを閉じるのは起動用スレッドの後始末（非同期）なので、閉じ終わるのを待ってから消す
+            eventually(10_000, "保存したマシンのディスクがファイルを閉じない") { saved.root.openHandles == 0 }
             Files.delete(disk.resolve("out.txt"))
             val finished = Finished()
             val m = restore(h, store, saved.identity, finished)
@@ -547,6 +664,75 @@ class MachineRestoreBranchesTest {
             assertEquals(Errno.STALE, e.errno)
             assertFalse(Files.exists(disk.resolve("out.txt")), "消えたファイルを作り直した")
             assertEquals(MachineState.RUNNING, m.state)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `表に入れた後に後段が失敗しても、閉じたものに重ねて閉じるだけで、RAMとディスクのリースは1回だけ返る`() = timeout(limit) {
+        // #590: 1 つ目のループ（runtimes に入れてインスタンスを渡す）を通った後で落とす。stopLocked が閉じた後に discard が重ねて閉じる
+        val store = newStore()
+        val disk = dir.resolve("disk")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            // 戻すマシンの根も、本物の DiskFileSystem（saveWithFiles が bootVolumes を差し替える。包むと adoptNode が効かない）
+            val saved = saveWithFiles(h, store, disk)
+            val pid = saved.started.pid
+            val real = disk.toRealPath()
+            // 保存したマシンの後始末（起動用スレッドでリースを返す）を待つ
+            eventually(10_000, "保存したマシンのリースが返らない") {
+                h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() && HostDiskLeases.usersOf(real) == 0
+            }
+            // テストが別に 1 人分持つ（持ち主が 1 人だけだと、二重に返しても computeIfPresent が何もしないので usersOf に出ない）
+            val holder = DiskFileSystem.open(disk)
+            assertEquals(1, HostDiskLeases.usersOf(real))
+            val base = h.scheduler.memoryAccount.usedBytes
+            var during = -1L
+            // 終わっていない状態のうち、後段が戻せないもの（WAITING_HOST）に書き換える。終わった状態にすると stopLocked が飛ばし、
+            // 閉じたものに重ねる経路を通らない。表の数は state から数えるので、書き換えても表は壊れない
+            h.scheduler.hooks.duringRestoreInstall = { m ->
+                during = m.memoryAccount.usedBytes
+                m.kernel.processes[pid]!!.state = ProcessState.WAITING_HOST
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), finished.listener)))
+            eventually(60_000, "CRASHED にならない") {
+                h.scheduler.tick()
+                m.state == MachineState.CRASHED
+            }
+            h.scheduler.hooks.duringRestoreInstall = null
+            // state は stopLocked の途中（setStateLocked(CRASHED) の直後）で見えるので、ここで見ると復元の quiesce を閉じる前かもしれない。
+            // stopLocked・discard・vfs の後始末はどれも起動用スレッドで走るので、そこが空になるのを待ってから見る
+            val drained = { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+            eventually(10_000, "起動用スレッドの後始末が終わらない") { drained() }
+            // 後始末が全部終わった後に tick して、知らせが積まれていないことを見る（積む退行があっても、先の tick に間に合わないと見えないため）
+            repeat(3) { h.scheduler.tick() }
+            eventually(10_000, "tick の後で起動用スレッドが空にならない") { drained() }
+            repeat(3) { h.scheduler.tick() }
+            assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
+            assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced)
+            // 1 つ目のループで runtimes に入れてインスタンスを渡し、stopLocked が止めて閉じた
+            val rt = m.runtime(pid) ?: fail("1 つ目のループで runtimes に入れていない")
+            assertEquals(ProcessState.KILLED, m.lock.withLockValue { rt.process.state })
+            assertTrue(m.lock.withLockValue { rt.instances.isEmpty() }, "stopLocked がインスタンスを閉じていない")
+            assertTrue(during >= 10_000, "戻す途中で RAM を数えていない（$during）")
+            // インスタンスの RAM は 1 回だけ返る。インスタンスはプロセスの勘定（rt.memory）を通して返すので、二重に返すとプロセスの勘定が
+            // 負になった時点で check が投げ、マシンとサーバー全体の勘定には届かない（例外は closeQuietly が捨てる）。そのためプロセスの勘定で見る。
+            // ProcessMemory は数を引いてから check するので、二重に返した分は値に負として残る
+            val processBytes = m.lock.withLockValue { rt.memory.usedBytes }
+            val processPages = m.lock.withLockValue { rt.memory.usedPages }
+            assertEquals(0L, processBytes, "プロセスの RAM の勘定が 0 にならない（負なら WasmInstance.close が二重に返した）")
+            assertEquals(0, processPages, "プロセスの線形メモリのページ数が 0 にならない（負なら WasmInstance.close が二重に返した）")
+            // /tmp の RAM はマシンの勘定から直に返すので、二重に返すとマシンの勘定が負になる（ここで見える）。
+            // サーバー全体の勘定は「返していない」だけを見る（二重に返すと、親に届く前にマシンの勘定の check が投げる）
+            assertEquals(0L, m.memoryAccount.usedBytes, "マシンの RAM の勘定が 0 にならない（負なら /tmp を二重に返した）")
+            assertEquals(base, h.scheduler.memoryAccount.usedBytes, "サーバー全体の RAM の勘定が元に戻らない")
+            // ディスクのリースも 1 回だけ返る（テストの holder の分だけが残る）
+            assertEquals(1, HostDiskLeases.usersOf(real), "ディスクのリースを二重に返した、または返していない")
+            holder.retire()
+            assertEquals(0, HostDiskLeases.usersOf(real))
             m.close()
         }
     }
