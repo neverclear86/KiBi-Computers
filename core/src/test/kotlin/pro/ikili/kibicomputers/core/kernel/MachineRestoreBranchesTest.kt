@@ -701,6 +701,13 @@ class MachineRestoreBranchesTest {
                 m.state == MachineState.CRASHED
             }
             h.scheduler.hooks.duringRestoreInstall = null
+            // state は stopLocked の途中（setStateLocked(CRASHED) の直後）で見えるので、ここで見ると復元の quiesce を閉じる前かもしれない。
+            // stopLocked・discard・vfs の後始末はどれも起動用スレッドで走るので、そこが空になるのを待ってから見る
+            val drained = { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+            eventually(10_000, "起動用スレッドの後始末が終わらない") { drained() }
+            // 後始末が全部終わった後に tick して、知らせが積まれていないことを見る（積む退行があっても、先の tick に間に合わないと見えないため）
+            repeat(3) { h.scheduler.tick() }
+            eventually(10_000, "tick の後で起動用スレッドが空にならない") { drained() }
             repeat(3) { h.scheduler.tick() }
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
@@ -710,10 +717,6 @@ class MachineRestoreBranchesTest {
             val rt = m.runtime(pid) ?: fail("1 つ目のループで runtimes に入れていない")
             assertEquals(ProcessState.KILLED, m.lock.withLockValue { rt.process.state })
             assertTrue(m.lock.withLockValue { rt.instances.isEmpty() }, "stopLocked がインスタンスを閉じていない")
-            // discard と vfs の後始末（どちらも起動用スレッド）が走り終わるのを待ってから見る（途中の一瞬に等しくなるだけで通らないように）
-            eventually(10_000, "起動用スレッドの後始末が終わらない") {
-                h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty()
-            }
             assertTrue(during >= 10_000, "戻す途中で RAM を数えていない（$during）")
             // インスタンス・/tmp の RAM は 1 回だけ返る（二重に返すと負になるが、discard が例外を捨てるので値で見る）
             assertEquals(base, h.scheduler.memoryAccount.usedBytes, "サーバー全体の RAM の勘定が元に戻らない")
