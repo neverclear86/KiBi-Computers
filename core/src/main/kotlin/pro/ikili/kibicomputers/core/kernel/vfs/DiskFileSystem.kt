@@ -112,6 +112,28 @@ internal class DiskFileSystem private constructor(
      */
     override fun pathHint(node: Long): VfsPath? = paths[node]?.fold(VfsPath.ROOT) { p, n -> p.child(n) }
 
+    /**
+     * 保存から戻した開いたファイルの [node]（前のカーネルの番号）を、ディスクの根からのパス [path]・種類 [type] として表に入れる（#85、ADR 0085）。
+     * まだマウントしていない（ほかのスレッドと分け合わない）ファイルシステムに、起動用のスレッドから呼ぶ。ホストの I/O はしない
+     * （パスが消えていれば、その node の操作は今の規則どおり `STALE`。ADR 0052）。[nextNode] はそれより大きくする。
+     * 同じ node・同じパスがもう入っていれば何もしない。違う node が同じパスを持っていれば、後のものは入れない（その操作は `STALE`）
+     *
+     * @return 入れた（か、同じものが入っていた）
+     */
+    fun adoptNode(node: Long, path: VfsPath, type: FileType): Boolean = lease.lock.withLock {
+        if (node <= ROOT_NODE) return@withLock node == ROOT_NODE && path.isRoot
+        val segments = path.segments
+        val k = key(segments)
+        val existing = nodes[node]
+        if (existing != null) return@withLock key(existing.segments) == k && existing.type == type
+        if (byKey.containsKey(k)) return@withLock false
+        byKey[k] = node
+        nodes[node] = NodeInfo(type, segments)
+        paths[node] = segments
+        if (nextNode <= node) nextNode = node + 1
+        true
+    }
+
     // ---- パスの操作 ----
 
     override fun stat(path: VfsPath): FileStat = io {

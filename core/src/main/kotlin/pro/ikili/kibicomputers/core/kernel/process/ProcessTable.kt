@@ -80,16 +80,29 @@ internal class ProcessTable(val limit: Int) {
         copy.nextPid = nextPid
     }
 
-    /** 保存データから読んだ値を入れる（#82。空の表に。戻すのは #85） */
+    /** 保存データから読んだ値を入れる（#82・#85。空の表に）。入れる前にすべて確かめ（[validateRestore]）、確かめに落ちたら表を変えない */
     fun restore(processes: Collection<Process>, orphans: Collection<Int>, nextPid: Int) {
         check(table.isEmpty()) { "空の表にだけ戻す" }
-        for (p in processes) add(p)
-        for (pid in orphans) {
-            require(table[pid]?.state?.isTerminal == true && table.getValue(pid).parentPid == 0) { "親のないゾンビでない pid $pid" }
-            this.orphans.add(pid)
-        }
-        require(nextPid >= 1) { "次の pid は 1 以上" }
+        validateRestore(processes, orphans, nextPid)
+        for (p in processes) table[p.pid] = p
+        this.orphans.addAll(orphans)
         this.nextPid = nextPid
+    }
+
+    companion object {
+        /**
+         * [restore] に渡せるか確かめる（#85。表は変えない）: pid が重ならない、親のないゾンビが表にあって終わっていて親が 0、次の pid が 1 以上。
+         * 合わなければ [IllegalArgumentException]
+         */
+        fun validateRestore(processes: Collection<Process>, orphans: Collection<Int>, nextPid: Int) {
+            val byPid = HashMap<Int, Process>()
+            for (p in processes) require(byPid.put(p.pid, p) == null) { "pid ${p.pid} は使われている" }
+            for (pid in orphans) {
+                val p = byPid[pid]
+                require(p != null && p.state.isTerminal && p.parentPid == 0) { "親のないゾンビでない pid $pid" }
+            }
+            require(nextPid >= 1) { "次の pid は 1 以上" }
+        }
     }
 
     /** 終わったプロセス（ゾンビ）をすべて外し、pid を 1 から振り直す（起動のとき。#49）。終わっていないプロセスがあれば [IllegalStateException] */

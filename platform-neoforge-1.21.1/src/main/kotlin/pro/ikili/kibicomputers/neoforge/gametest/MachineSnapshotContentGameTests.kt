@@ -51,6 +51,9 @@ object MachineSnapshotContentGameTests {
     /** 起動を待つ tick 数の上限（[StandardOsGameTests] と同じ理由で長くとる） */
     private const val BOOT_TIMEOUT_TICKS = 12_000
 
+    /** [bootingSnapshotIsCold] で、起動中に取り出せるまでやり直す回数の上限 */
+    private const val BOOTING_ATTEMPTS = 20
+
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)
     private val KEYBOARD = BlockPos(1, 1, 2)
@@ -184,15 +187,31 @@ object MachineSnapshotContentGameTests {
         helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
         val be = helper.getBlockEntity<CaseBlockEntity>(CASE)
         installRequired(be)
-        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-        // 同じ tick なので、ケースの onLoad（持ち主と ID）はまだない。写しは直接作る
-        be.computer.prepareUnload()
-        val snapshot = try {
-            be.computer.capture(CapturePolicy.KILL_TRANSIENT)?.build(UUID.randomUUID(), 1, "test")
-        } finally {
-            be.computer.endQuiesce()
+        // 起動は別のスレッドで進むので、電源を入れてから取り出すまでの間に（CI の負荷で tick が遅れると）終わってしまうことがある。
+        // 取り出した後もまだ起動中なら、取り出したときも起動中だった（起動中は一度終わると戻らない）ので、その写しだけを確かめ、
+        // 終わっていたら電源を入れ直してやり直す
+        var snapshot: MachineSnapshot? = null
+        var attempts = 0
+        while (snapshot == null && attempts < BOOTING_ATTEMPTS) {
+            attempts++
+            helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null, "the case should have a machine")
+            // 同じ tick なので、ケースの onLoad（持ち主と ID）はまだない。写しは直接作る
+            be.computer.prepareUnload()
+            val taken = try {
+                be.computer.capture(CapturePolicy.KILL_TRANSIENT)?.build(UUID.randomUUID(), 1, "test")
+            } finally {
+                be.computer.endQuiesce()
+            }
+            helper.assertTrue(taken != null, "the booting machine should be captured")
+            if (machine!!.isBooting) {
+                snapshot = taken
+            } else {
+                be.pressPowerButton()
+            }
         }
-        helper.assertTrue(snapshot != null, "the booting machine should be captured")
+        helper.assertTrue(snapshot != null, "the machine finished booting before it could be captured in all $BOOTING_ATTEMPTS attempts")
         helper.assertTrue(
             snapshot!!.coldBootReason == ColdBootReason.BOOTING,
             "a booting machine should need a cold boot (BOOTING) but was ${snapshot.coldBootReason}",

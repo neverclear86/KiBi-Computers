@@ -361,4 +361,24 @@ class DiskFileSystemTest {
         fs.removeFile(p("/b/f.txt"))
         assertNull(fs.pathHint(12345))
     }
+    @Test
+    fun `保存した開いたファイルのnodeを登録すると読め、外で消すとSTALE（#85）`() {
+        Files.createDirectories(dir.resolve("disk/a"))
+        Files.writeString(dir.resolve("disk/a/f.txt"), "saved")
+        val fs = disk()
+        // I/O をしない登録。番号は保存したもの
+        assertTrue(fs.adoptNode(42, p("/a/f.txt"), FileType.REGULAR_FILE))
+        assertTrue(fs.adoptNode(42, p("/a/f.txt"), FileType.REGULAR_FILE), "同じものは何度でも")
+        assertFalse(fs.adoptNode(42, p("/a/g.txt"), FileType.REGULAR_FILE), "同じ番号の別のパスは断る")
+        assertFalse(fs.adoptNode(43, p("/a/f.txt"), FileType.REGULAR_FILE), "同じパスの別の番号は断る")
+        assertTrue(fs.adoptNode(1, VfsPath.ROOT, FileType.DIRECTORY))
+        assertEquals("saved", fs.readAll(42))
+        assertEquals(p("/a/f.txt"), fs.pathHint(42))
+        // 後で作るファイルは、登録した番号と重ならない
+        val created = fs.writeAll("/a/new.txt", "x")
+        assertTrue(created > 42)
+        // 外で消したら STALE
+        assertTrue(fs.adoptNode(50, p("/a/gone.txt"), FileType.REGULAR_FILE))
+        errno(Errno.STALE) { fs.read(50, 0, ByteArray(1), 0, 1) }
+    }
 }

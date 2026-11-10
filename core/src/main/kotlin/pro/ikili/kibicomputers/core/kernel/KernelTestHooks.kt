@@ -43,4 +43,12 @@ internal class KernelTestHooks {
     /** 起動の手順で、ディスクを探し終えて init を作る前（ロックの外。ワーカーのスレッド） */
     @Volatile
     var beforeInitExec: ((Machine) -> Unit)? = null
+
+    /** 復元（#85）の前段を終えて、後段（カーネルロックの中）に入る前（ロックの外。起動用のスレッド） */
+    @Volatile
+    var beforeRestoreInstall: ((Machine) -> Unit)? = null
+
+    /** 復元の後段の途中（カーネルロックの中。表を入れた後、実行時の部分を作る前）。例外を投げると後段の失敗になる */
+    @Volatile
+    var duringRestoreInstall: ((Machine) -> Unit)? = null
 }

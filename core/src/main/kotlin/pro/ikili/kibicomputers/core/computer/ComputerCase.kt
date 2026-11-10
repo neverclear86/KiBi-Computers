@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.computer
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
@@ -13,6 +14,10 @@ import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
+import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreRequest
+import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.persist.SnapshotCapturer
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
@@ -57,7 +62,17 @@ public enum class ComputerError {
  * - ブロックエンティティの `onChunkUnloaded`・`setRemoved` で [chunkUnloaded]・[removed] を呼ぶ（[MachineSlot] と同じ）。
  *   どちらも状態を [ComputerStatus.OFF] にする
  *
- * 電源の状態はセーブデータに書かない（読み込んだら [ComputerStatus.OFF]。マシンの状態の保存は #81）。
+ * 電源の状態（[poweredOn]）は、接続層がセーブデータ（`PoweredOn`）に書き、読み込んだら [loadPoweredOn] で戻す（#85、ADR 0085）。
+ * 入っていたら、チャンクの読み込みで [beginRestore] → [startRestore] で保存した状態に戻す（戻せなければ冷えた起動）。
+ * [poweredOn] が変わる出来事（ADR 0085 の表）:
+ *
+ * | 出来事 | [poweredOn] |
+ * | --- | --- |
+ * | [turnOn] でマシンを作った・[startRestore] でマシンを作った | `true` |
+ * | [turnOff]・[partsChanged] で止めた・[powerLost] で止めた | `false` |
+ * | マシンが CRASHED になった・ゲストが止めた（再起動の途中でない STOPPED）・起動に失敗した | `false` |
+ * | 部品が足りない・電力がないので [turnOn]・[startRestore] で作れなかった | `false` |
+ * | [chunkUnloaded]・[removed]・マシンを作れなかった（サーバーの停止の途中など） | 変えない |
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知もメインスレッドで届く）。
  *
@@ -70,8 +85,23 @@ public enum class ComputerError {
 public class ComputerCase<K : Any> @JvmOverloads constructor(
     public val tier: CaseTier,
     private val events: MachineHost? = null,
+    private val poweredOnChanged: Runnable? = null,
 ) {
     private val slot = MachineSlot<K>()
+
+    /**
+     * 電源が入っている（#85。接続層がセーブデータに書く）。マシンがなくても（チャンクのアンロードの後・復元の順番待ち）`true` のことがある。
+     * 変わったら、コンストラクターの `poweredOnChanged` を呼ぶ（[loadPoweredOn] では呼ばない）
+     */
+    public var poweredOn: Boolean = false
+        private set
+
+    /** チャンクの読み込みで復元を待っている（[beginRestore] から [startRestore] まで） */
+    public var isRestorePending: Boolean = false
+        private set
+
+    /** 今のマシンが復元の途中（[Machine.isRestoring]） */
+    public val isRestoring: Boolean get() = slot.machine?.isRestoring == true
 
     /** 今の状態 */
     public var status: ComputerStatus = ComputerStatus.OFF
@@ -106,6 +136,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         }
 
         override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            if (machine === slot.machine) setPoweredOn(false)
             events?.onBootFailed(machine, failure, detail)
         }
 
@@ -157,24 +188,121 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
     ): ComputerStatus {
         if (status == ComputerStatus.RUNNING) return status
+        isRestorePending = false
+        if (load(manager, key, parts, hasPower, config, environment) != null) setPoweredOn(true)
+        return status
+    }
+
+    /** [turnOn]・[startRestore] の共通: 部品・電力・マシンを確かめてマシンを作る。作れなければ状態をエラーなどにして `null` */
+    private fun load(
+        manager: MachineManager<K>?,
+        key: K,
+        parts: InstalledParts,
+        hasPower: Boolean,
+        config: MachineConfig,
+        environment: MachineEnvironment,
+    ): Machine? {
         val missing = tier.missingRequired(parts)
         when {
-            missing.isNotEmpty() -> fail(ComputerError.MISSING_PARTS, missing)
-            !hasPower -> set(ComputerStatus.NO_POWER)
-            manager == null -> fail(ComputerError.UNAVAILABLE)
-            slot.load(manager, key, host, config, environment) == null -> fail(ComputerError.UNAVAILABLE)
-            else -> {
-                set(ComputerStatus.RUNNING)
-                bootDiskIds = diskIds(parts)
+            missing.isNotEmpty() -> {
+                fail(ComputerError.MISSING_PARTS, missing)
+                setPoweredOn(false)
             }
+            !hasPower -> {
+                set(ComputerStatus.NO_POWER)
+                setPoweredOn(false)
+            }
+            manager == null -> fail(ComputerError.UNAVAILABLE)
+            else -> {
+                val machine = slot.load(manager, key, host, config, environment)
+                if (machine == null) {
+                    fail(ComputerError.UNAVAILABLE)
+                } else {
+                    set(ComputerStatus.RUNNING)
+                    bootDiskIds = diskIds(parts)
+                    return machine
+                }
+            }
+        }
+        return null
+    }
+
+    /** セーブデータから読んだ電源の状態を入れる（#85。マシンがないときだけ。`poweredOnChanged` は呼ばない） */
+    public fun loadPoweredOn(value: Boolean) {
+        if (slot.machine != null || isRestorePending) return
+        poweredOn = value
+    }
+
+    /**
+     * チャンクの読み込み（#85）: 電源が入っていてマシンがなければ、復元の順番待ちにして [ComputerStatus.RUNNING] を見せる
+     * （順番が来たら [startRestore]）。2回呼んでもよい。
+     *
+     * @return 順番待ちにした（もう順番待ちなら `true`）
+     */
+    public fun beginRestore(): Boolean {
+        if (isRestorePending) return true
+        if (!poweredOn || slot.machine != null) return false
+        isRestorePending = true
+        set(ComputerStatus.RUNNING)
+        return true
+    }
+
+    /**
+     * 復元を始める（#85、ADR 0085）。[beginRestore] で順番待ちでなければ何もしない。部品・電力・マシンを [turnOn] と同じに確かめて
+     * マシンを作り、[source] があれば [Machine.restore] で戻す。終わったら（戻せた・冷えた起動にする）メインスレッドで、まだこのケースの
+     * 今のマシンなら [onReady] を呼び（デバイスをつなぐ）、戻せたらまだ実行していないデバイスの呼び出しを回し直し、冷えた起動なら
+     * [Machine.coldBootAfterRestore] を呼ぶ。[source] がない（ID がない・新しい ID・書き込みが終わらない）か、受け付けられなければ、
+     * [onReady] の後に [bootConfig] で起動する。
+     *
+     * @return 始めた後の状態
+     */
+    @JvmOverloads
+    public fun startRestore(
+        manager: MachineManager<K>?,
+        key: K,
+        parts: InstalledParts,
+        hasPower: Boolean,
+        config: MachineConfig,
+        environment: MachineEnvironment,
+        bootConfig: BootConfig,
+        source: RestoreSource?,
+        onReady: RestoreReady,
+        finished: RestoreListener? = null,
+    ): ComputerStatus {
+        if (!isRestorePending) return status
+        isRestorePending = false
+        val machine = load(manager, key, parts, hasPower, config, environment) ?: return status
+        setPoweredOn(true)
+        val listener = RestoreListener { m, outcome, cause ->
+            // 知らせは close の後も届く: 今のマシンでなければ（電源を切った・アンロードした）何もしない（ADR 0085）
+            if (m === slot.machine) {
+                when (outcome) {
+                    RestoreOutcome.RESTORED -> {
+                        onReady.onReady(m)
+                        m.redispatchRestoredDeviceCalls()
+                    }
+                    RestoreOutcome.COLD_BOOT -> {
+                        onReady.onReady(m)
+                        m.coldBootAfterRestore()
+                    }
+                    RestoreOutcome.CANCELLED -> {}
+                }
+            }
+            finished?.onRestoreFinished(m, outcome, cause)
+        }
+        if (source == null || !machine.restore(RestoreRequest(source, bootConfig, listener))) {
+            onReady.onReady(machine)
+            machine.boot(bootConfig)
         }
         return status
     }
 
     /** 電源を切る。マシンを止めて [ComputerStatus.OFF] にする（エラーの表示も消す）。 */
     public fun turnOff() {
+        isRestorePending = false
         slot.removed()
         set(ComputerStatus.OFF)
+        setPoweredOn(false)
     }
 
     /**
@@ -191,9 +319,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         val missing = tier.missingRequired(parts)
         val diskGone = bootDiskIds.isNotEmpty() && !diskIds(parts).containsAll(bootDiskIds)
         if (missing.isEmpty() && !diskGone) return false
+        isRestorePending = false
         slot.removed()
         val kinds = if (diskGone) PartKind.entries.filter { it in missing || it == PartKind.STORAGE } else missing
         fail(ComputerError.MISSING_PARTS, kinds)
+        setPoweredOn(false)
         return true
     }
 
@@ -210,8 +340,10 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      */
     public fun powerLost(): Boolean {
         if (status != ComputerStatus.RUNNING) return false
+        isRestorePending = false
         slot.removed()
         set(ComputerStatus.NO_POWER)
+        setPoweredOn(false)
         return true
     }
 
@@ -248,21 +380,39 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /** チャンクがアンロードされる。マシンを外して [ComputerStatus.OFF] にする（休止は #132）。 */
     public fun chunkUnloaded() {
+        isRestorePending = false
         slot.chunkUnloaded()
         set(ComputerStatus.OFF)
     }
 
     /** ブロックエンティティが消える。マシンを外して [ComputerStatus.OFF] にする。 */
     public fun removed() {
+        isRestorePending = false
         slot.removed()
         set(ComputerStatus.OFF)
     }
 
-    /** マシンの状態が変わった（[MachineHost.onStateChanged]）。今のマシンが CRASHED になったらエラーにする */
+    /**
+     * マシンの状態が変わった（[MachineHost.onStateChanged]）。今のマシンが CRASHED になったらエラーにして電源を切り、
+     * ゲストが止めた（再起動の途中でない STOPPED）なら電源を切る（#85。状態の表示は変えない）
+     */
     internal fun onMachineStateChanged(machine: Machine, state: MachineState) {
-        if (state != MachineState.CRASHED || machine !== slot.machine) return
-        slot.removed()
-        fail(ComputerError.CRASHED)
+        if (machine !== slot.machine) return
+        when (state) {
+            MachineState.CRASHED -> {
+                slot.removed()
+                fail(ComputerError.CRASHED)
+                setPoweredOn(false)
+            }
+            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) setPoweredOn(false)
+            else -> {}
+        }
+    }
+
+    private fun setPoweredOn(value: Boolean) {
+        if (poweredOn == value) return
+        poweredOn = value
+        poweredOnChanged?.run()
     }
 
     private fun set(newStatus: ComputerStatus) {
@@ -280,4 +430,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     }
 
     override fun toString(): String = "ComputerCase($tier, $status${error?.let { ", $it" } ?: ""})"
+}
+
+/** [ComputerCase.startRestore] の、マシンの用意ができた知らせ（デバイスをつなぐ。#85） */
+@ApiStatus.Internal
+public fun interface RestoreReady {
+    /** [machine] にデバイスをつなぐ（メインスレッドで。この後に、戻したマシンが続くか、冷えた起動を始める） */
+    public fun onReady(machine: Machine)
 }

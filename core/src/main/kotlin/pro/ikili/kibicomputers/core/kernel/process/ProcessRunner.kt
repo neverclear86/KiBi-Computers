@@ -127,12 +127,18 @@ internal class ProcessRunner(private val machine: Machine) {
         val resumed = lock.withLockValue { rt.process.state != ProcessState.CREATED }
         // 燃料切れで巻き戻して燃料を待っていた（#339）: 待つ key はなく、退避した値から巻き直す
         var fuelResume = false
+        // 保存から戻した直後の起こし（#85。ProcessRuntime.restoreWake）: 揃いを見ずに resume する
+        var restoreWake = false
         if (resumed) {
             // 起こされたのに空なら、許可も燃料も使わずに待ち直す
             val empty = lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
                 val ws = rt.waitSet
-                if (ws == null) {
+                if (rt.restoreWake) {
+                    check(ws != null || rt.process.asyncStack?.isEmpty == false) { "退避した値のない復元の起こし" }
+                    restoreWake = true
+                    false
+                } else if (ws == null) {
                     check(rt.process.asyncStack?.isEmpty == false) { "待ちのない step" }
                     fuelResume = true
                     false
@@ -158,9 +164,9 @@ internal class ProcessRunner(private val machine: Machine) {
             val observed = now
             machine.fuelAccount.refill(observed)
             val ws = rt.waitSet
-            if (resumed && !fuelResume) ready = ws!!.readyKeys(machine.kernel.objects)
+            if (resumed && !fuelResume) ready = ws?.readyKeys(machine.kernel.objects).orEmpty()
             when {
-                resumed && !fuelResume && ready.isEmpty() -> {
+                resumed && !fuelResume && !restoreWake && ready.isEmpty() -> {
                     ws!!.rearm()
                     rt.process.state = ProcessState.WAITING_EVENT
                     Outcome.REARM
@@ -173,10 +179,12 @@ internal class ProcessRunner(private val machine: Machine) {
                 }
                 else -> {
                     if (resumed && !fuelResume) {
-                        ws!!.unregister(machine.registry)
+                        // 復元の起こしでは waitSet がないことがある（空の wait）。wait はいつも下ろす（#85）
+                        ws?.unregister(machine.registry)
                         rt.waitSet = null
                         rt.process.wait = null
                     }
+                    rt.restoreWake = false
                     rt.process.state = ProcessState.RUNNING
                     rt.stackActive = true
                     Outcome.GO
@@ -597,6 +605,44 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.loading = null
             rt.process.state = ProcessState.RUNNING
         }
+    }
+
+    /**
+     * 保存から戻すプロセスのインスタンスを作る（#85、ADR 0085）。[load] と同じ設定（`configure` → カーネルの上限 → 燃料 0 → 退避先の結び付け）で
+     * [state] から作り直す（start 関数は動かさない）。退避した値 [asyncStack] を [Process.asyncStack] に入れる。
+     * 起動用のスレッドで、カーネルロックを持たずに呼ぶ。[rt] はまだマシンの表に入れていない（前段。カーネルを変えない）。
+     * 作ったインスタンスは返すだけで、[ProcessRuntime] にはつながない（後段の [adoptRestoredInstanceLocked]）
+     *
+     * @throws pro.ikili.kibicomputers.core.runtime.WasmLinkException 状態がモジュールに合わない・RAM が足りない
+     */
+    fun instantiateForRestore(rt: ProcessRuntime, state: pro.ikili.kibicomputers.core.runtime.WasmInstanceState, asyncStack: LongArray): WasmInstance {
+        val builder = WasmInstanceConfig.builder()
+        rt.driver.configure(rt.context, builder)
+        applyKernelLimits(rt, builder)
+        if (!rt.process.unmetered) builder.fuel(0, rt.fuelHandler)
+        if (rt.program.module.isAsyncified) {
+            val stack = AsyncStack()
+            for (v in asyncStack) stack.push(v)
+            rt.process.asyncStack = stack
+            builder.asyncStack(
+                object : WasmAsyncStack {
+                    override fun push(value: Long) = stack.push(value)
+
+                    override fun pop(): Long = stack.pop()
+                },
+            )
+        } else {
+            require(asyncStack.isEmpty()) { "待機点に変換していないモジュールに退避した値がある" }
+        }
+        return rt.program.module.instantiateForRestore(builder.build(), state)
+    }
+
+    /** [instantiateForRestore] で作った [instance] を [rt] につなぐ（後段。カーネルロックの中）。燃料のグローバルは 0 にする（ADR 0082） */
+    fun adoptRestoredInstanceLocked(rt: ProcessRuntime, instance: WasmInstance) {
+        rt.instances += instance
+        rt.firstInstance = instance
+        rt.fuelHolder = instance
+        if (!rt.process.unmetered) instance.fuel = 0
     }
 
     // ---- 終わり方 ----

@@ -35,6 +35,7 @@
 読むとき、知らない理由の値は「冷えた起動が要る」として扱う（`MachineSnapshot.requiresColdBoot`）。`KILLED` 節がない・読めないときも同じ。
 
 **#85 への申し送り**: 理由が 0 以外なら状態を復元せず、電源は入っているものとして冷えた起動にする（起動の設定は接続層が渡し直す。ADR 0049）。
+済み（#85）: ADR 0085。電源の状態はケースの NBT（`PoweredOn`）に書き、ID はあるが戻せる世代がないときも冷えた起動にする（ADR 0084 の規則 9・10）
 
 ## ライフサイクル
 
@@ -74,7 +75,7 @@ fsync は中身の大きさによらず時間がかかる（開発機の D: ド�
 - BE の NBT に `MachineId`（UUID の正規の小文字。`CanonicalUuid` で検査）・`SaveGeneration`・`OwnerEpoch`（0 以上 2^62 以下）。外れた値は「ID なし」
 - BE は「NBT から読んだ生の値」と「確定した ID」（`identity`）を分けて持ち、`saveAdditional` は確定した ID があればそれを、なければ生の値を書き戻す
 - `owner.bin`: magic `KIBO`、版 u16 = 1、epoch（i64）、持ち主のディメンション（`writeUTF`）と座標（3×i32）
-- **索引**（`MachineIdIndex`。UUID → 持ち主）: `claim` に通った・ID を振った、**読み込み済みの BE** を入れ、`onChunkUnloaded`・`setRemoved` で外す。マシンが動いているかは問わない（#81 では復元しないので、`onLoad` の時点で動いているマシンはほぼない。複製の検出に要るのは「同じ UUID の BE が2つ読み込まれていること」）
+- **索引**（`MachineIdIndex`。UUID → 持ち主）: `claim` に通った・ID を振った、**読み込み済みの BE** を入れ、`onChunkUnloaded`・`setRemoved` で外す。マシンが動いているかは問わない（`onLoad` の時点ではまだ復元を始めていない。復元は順番待ちから次の tick 以降に始める。ADR 0085。複製の検出に要るのは「同じ UUID の BE が2つ読み込まれていること」）
 - `claim`（サーバーの `onLoad`、まだ ID のない読み込み済みの BE の `loadAdditional`）の判定順:
   1. 値の検査に通らない → 新しい UUID（`NEW_ID_INVALID`）
   2. 索引に同じ UUID の別の持ち主 → 新しい UUID（`NEW_ID_DUPLICATE_LOADED`）

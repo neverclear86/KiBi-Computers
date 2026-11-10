@@ -130,6 +130,16 @@ internal class ObjectTable {
         this.nextObjectId = nextObjectId
     }
 
+    /**
+     * 読んだ保存データの表 [other]（`KernelSectionCodec.read` が組み立てたもの）の中身を、空のこの表に移す（#85。[other] は空になる）
+     */
+    fun restoreFrom(other: ObjectTable) {
+        check(entries.isNullOrEmpty()) { "空の表にだけ戻す" }
+        entries = other.entries
+        nextObjectId = other.nextObjectId
+        other.entries = null
+    }
+
     /** ID → 参照の数を ID の順に渡す（保存の書き出し用） */
     fun forEachEntrySorted(action: (id: Int, obj: KernelObject, refCount: Int) -> Unit) {
         val map = entries ?: return

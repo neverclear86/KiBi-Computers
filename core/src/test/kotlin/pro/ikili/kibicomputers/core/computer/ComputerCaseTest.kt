@@ -9,10 +9,22 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.machine.MachineManager
+import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.MachineIdIndex
+import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreSource
+import java.nio.file.Path
 
 /** ケースのティアと電源・状態（#121） */
 class ComputerCaseTest {
@@ -288,5 +300,159 @@ class ComputerCaseTest {
         parts.installed.add(case.tier.firstSlot(PartKind.STORAGE) + 1)
         assertFalse(case.partsChanged(parts))
         assertEquals(ComputerStatus.RUNNING, case.status)
+    }
+    // ---- 電源の状態と復元（#85） ----
+
+    @TempDir
+    lateinit var dir: Path
+
+    private val boot = BootConfig.builder().addBootDisk("none").build()
+
+    /** [condition] がそろうまで manager を tick する */
+    private fun tickUntil(message: String, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (!condition()) {
+            if (System.currentTimeMillis() > deadline) throw AssertionError(message)
+            manager.tick()
+            Thread.sleep(1)
+        }
+    }
+
+    @Test
+    fun `電源の状態は表のとおりに変わり、変わったら知らせる`() {
+        var changes = 0
+        val case = ComputerCase<String>(CaseTier.BASIC, null) { changes++ }
+        val parts = required(case.tier)
+        case.turnOn(manager, "a", parts, true, config)
+        assertTrue(case.poweredOn)
+        assertEquals(1, changes)
+        // アンロードでは変えない
+        case.chunkUnloaded()
+        assertTrue(case.poweredOn)
+        assertEquals(1, changes)
+        case.turnOn(manager, "a", parts, true, config)
+        case.turnOff()
+        assertFalse(case.poweredOn)
+        assertEquals(2, changes)
+        // 部品を抜いた・電力が尽きた・CRASHED・ゲストが止めた
+        case.turnOn(manager, "a", parts, true, config)
+        parts.installed.remove(case.tier.firstSlot(PartKind.CPU))
+        assertTrue(case.partsChanged(parts))
+        assertFalse(case.poweredOn)
+        parts.installed.add(case.tier.firstSlot(PartKind.CPU))
+        case.turnOn(manager, "a", parts, true, config)
+        assertTrue(case.powerLost())
+        assertFalse(case.poweredOn)
+        case.turnOn(manager, "a", parts, true, config)
+        case.onMachineStateChanged(case.machine!!, MachineState.CRASHED)
+        assertFalse(case.poweredOn)
+        case.turnOn(manager, "a", parts, true, config)
+        case.onMachineStateChanged(case.machine!!, MachineState.STOPPED)
+        assertFalse(case.poweredOn)
+        assertEquals(ComputerStatus.RUNNING, case.status, "ゲストが止めても表示は変えない")
+        // 部品が足りなければ入らない。セーブデータから読むときは知らせない
+        case.turnOff()
+        val before = changes
+        val other = ComputerCase<String>(CaseTier.BASIC, null) { changes++ }
+        other.loadPoweredOn(true)
+        assertTrue(other.poweredOn)
+        assertEquals(before, changes)
+        other.turnOn(manager, "b", Parts(), true, config)
+        assertFalse(other.poweredOn)
+        assertEquals(before + 1, changes)
+    }
+
+    @Test
+    fun `電源が入っていたら復元の順番待ちになり、IDがなければつないでから冷えた起動する`() {
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        assertFalse(case.beginRestore(), "電源が切れていれば待たない")
+        case.loadPoweredOn(true)
+        assertTrue(case.beginRestore())
+        assertTrue(case.isRestorePending)
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertNull(case.machine)
+        val ready = ArrayList<Machine>()
+        case.startRestore(manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot, null, RestoreReady { ready += it })
+        assertFalse(case.isRestorePending)
+        val machine = case.machine!!
+        assertEquals(listOf(machine), ready)
+        assertTrue(machine.lastBootConfig === boot, "起動を受け付けた")
+        // 2回目は何もしない
+        case.startRestore(manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot, null, RestoreReady { ready += it })
+        assertEquals(1, ready.size)
+    }
+
+    @Test
+    fun `復元で部品が足りなければエラーにして電源を切る`() {
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        case.loadPoweredOn(true)
+        case.beginRestore()
+        case.startRestore(manager, "a", Parts(), true, config, MachineEnvironment.DEFAULT, boot, null, RestoreReady { error("呼ばない") })
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertFalse(case.poweredOn)
+        assertNull(case.machine)
+    }
+
+    @Test
+    fun `戻せなければ知らせの後につないで冷えた起動する`() {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val identity = store.assignNewId(MachineOwner("o", 0, 0, 0))!!
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        case.loadPoweredOn(true)
+        case.beginRestore()
+        val ready = ArrayList<Machine>()
+        val finished = ArrayList<Pair<RestoreOutcome, ColdBootCause?>>()
+        case.startRestore(
+            manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot,
+            RestoreSource(store, identity.id, 3), RestoreReady { m -> ready += m },
+            RestoreListener { _, outcome, cause -> finished += outcome to cause },
+        )
+        val machine = case.machine!!
+        assertTrue(case.isRestoring)
+        assertFalse(machine.boot(boot), "復元の途中は起動しない")
+        tickUntil("知らせが来ない") { finished.isNotEmpty() }
+        assertEquals(listOf(RestoreOutcome.COLD_BOOT to ColdBootCause.NO_GENERATION), finished)
+        assertEquals(listOf(machine), ready)
+        assertFalse(case.isRestoring)
+        assertTrue(case.poweredOn)
+        assertFalse(machine.coldBootAfterRestore(), "ケースがもう始めた")
+    }
+
+    @Test
+    fun `知らせが届く前に電源を切ったら、古いマシンにはつながない`() {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val identity = store.assignNewId(MachineOwner("o", 0, 0, 0))!!
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        case.loadPoweredOn(true)
+        case.beginRestore()
+        val ready = ArrayList<Machine>()
+        val finished = ArrayList<RestoreOutcome>()
+        case.startRestore(
+            manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot,
+            RestoreSource(store, identity.id, 3), RestoreReady { ready += it },
+            RestoreListener { _, outcome, _ -> finished += outcome },
+        )
+        val machine = case.machine!!
+        // 前段が終わって知らせを積んだ後でも、取り消しでも、配る前に切ったマシンにはつながない
+        Thread.sleep(50)
+        case.turnOff()
+        tickUntil("知らせが来ない") { finished.isNotEmpty() }
+        repeat(3) { manager.tick() }
+        assertTrue(ready.isEmpty(), "今のマシンでないのでつながない")
+        assertFalse(machine.isBooting, "冷えた起動を始めない")
+        assertFalse(machine.isRestoring)
+        assertFalse(case.poweredOn)
+    }
+
+    @Test
+    fun `復元の順番待ちの間に電源を切ると、始めない`() {
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        case.loadPoweredOn(true)
+        case.beginRestore()
+        case.turnOff()
+        assertFalse(case.isRestorePending)
+        case.startRestore(manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot, null, RestoreReady { error("呼ばない") })
+        assertNull(case.machine)
+        assertEquals(ComputerStatus.OFF, case.status)
     }
 }

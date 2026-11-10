@@ -1,14 +1,7 @@
 package pro.ikili.kibicomputers.core.persist
 
 import org.jetbrains.annotations.ApiStatus
-import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
-import pro.ikili.kibicomputers.core.persist.snapshot.ChunkReadBudget
-import pro.ikili.kibicomputers.core.persist.snapshot.DecodedP1Process
-import pro.ikili.kibicomputers.core.persist.snapshot.InstanceStateMerge
-import pro.ikili.kibicomputers.core.persist.snapshot.KernelLimits
-import pro.ikili.kibicomputers.core.persist.snapshot.KernelSectionCodec
-import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
-import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
+import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotDecoder
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 
 /**
@@ -84,101 +77,13 @@ public object SnapshotInspection {
     @JvmStatic
     @Throws(SnapshotFormatException::class)
     public fun inspect(snapshot: MachineSnapshot, maxProcesses: Int, maxMemoryPages: Int, base: StoredSnapshot?): SnapshotContents {
-        if (snapshot.requiresColdBoot) throw SnapshotFormatException("冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
-        val deltaBase = snapshot.deltaBase
-        // 差分なら、基準の p1 の層（pid → 中身）
-        val baseLayers: Map<Int, DecodedP1Process>? = if (deltaBase != null) {
-            if (base == null) throw SnapshotFormatException("差分の世代に基準が渡されていない")
-            val stored = base.snapshot
-            if (stored.machineId != snapshot.machineId || stored.machineId != deltaBase.id || stored.generation != deltaBase.generation ||
-                base.fileLength != deltaBase.fileLength || base.crc32c != deltaBase.crc32c
-            ) {
-                throw SnapshotFormatException("基準 ${stored.machineId}/${stored.generation} が DELTA_BASE 節 $deltaBase と合わない")
-            }
-            if (stored.deltaBase != null) throw SnapshotFormatException("基準が差分の世代")
-            if (stored.requiresColdBoot) throw SnapshotFormatException("基準が冷えた起動の写し")
-            p1Layers(stored, ChunkReadBudget.forPages(maxMemoryPages))
-        } else {
-            null
+        // 戻すとき（#85。MachineRestore）と同じ読み手
+        val decoded = SnapshotDecoder.decode(snapshot, maxProcesses, maxMemoryPages, base)
+        val processes = decoded.kernel.processes.all().sortedBy { it.pid }.map { p ->
+            val layer = decoded.layers[p.pid]
+            val p1 = decoded.p1[p.pid]
+            InspectedProcess(p.pid, p.args, p.moduleHash.bytes(), layer, p1?.moduleSource?.originalHash, p1?.loadedHash?.bytes())
         }
-        val kernelSections = snapshot.sections.filter { it.kind == SnapshotSection.KERNEL }
-        if (kernelSections.size != 1) throw SnapshotFormatException("KERNEL 節が ${kernelSections.size} 個")
-        val kernelSection = kernelSections.single()
-        if (kernelSection.version != SnapshotSection.KERNEL_VERSION) {
-            throw SnapshotFormatException("KERNEL 節の版 ${kernelSection.version}")
-        }
-        val kernel = KernelSectionCodec.read(kernelSection.payloadUnsafe(), KernelLimits(maxProcesses))
-
-        val budget = ChunkReadBudget.forPages(maxMemoryPages)
-        val mergedBudget = ChunkReadBudget.forPages(maxMemoryPages)
-        // pid → (層, 元のハッシュ, 後のハッシュ)
-        val abi = HashMap<Int, Triple<Int, ByteArray?, ModuleHash?>>()
-        for (section in snapshot.sections) {
-            if (section.kind != SnapshotSection.PROCESS_ABI) continue
-            val (pid, layer, decoded) = readAbiSection(section, budget)
-            val process = kernel.processes[pid] ?: throw SnapshotFormatException("PROCESS_ABI 節の pid $pid が KERNEL 節にない")
-            val entry = if (decoded != null) {
-                if (decoded.loadedHash != process.moduleHash) {
-                    throw SnapshotFormatException("pid $pid の後のハッシュが KERNEL 節と合わない")
-                }
-                val instance = decoded.instance
-                if (instance != null && instance.changedOnly) {
-                    val layers = baseLayers ?: throw SnapshotFormatException("pid $pid が差分の形なのに DELTA_BASE 節がない")
-                    val baseProcess = layers[pid] ?: throw SnapshotFormatException("pid $pid が基準にない")
-                    val baseInstance = baseProcess.instance ?: throw SnapshotFormatException("pid $pid の基準にインスタンスがない")
-                    if (baseInstance.changedOnly) throw SnapshotFormatException("pid $pid の基準が差分の形")
-                    if (!baseProcess.moduleSource.originalHash.contentEquals(decoded.moduleSource.originalHash) ||
-                        baseProcess.loadedHash != decoded.loadedHash
-                    ) {
-                        throw SnapshotFormatException("pid $pid のモジュールが基準と違う")
-                    }
-                    val merged = InstanceStateMerge.merge(baseInstance, instance, budget.limitChunks)
-                    mergedBudget.take(merged.writtenChunkCount, merged.memoryPages)
-                } else if (instance != null) {
-                    mergedBudget.take(instance.writtenChunkCount, maxOf(instance.memoryPages, 0))
-                }
-                Triple(layer, decoded.moduleSource.originalHash, decoded.loadedHash)
-            } else {
-                Triple(layer, null, null)
-            }
-            if (abi.put(pid, entry) != null) throw SnapshotFormatException("pid $pid の PROCESS_ABI 節が重なる")
-        }
-
-        val processes = kernel.processes.all().sortedBy { it.pid }.map { p ->
-            val layer = abi[p.pid]
-            if (layer == null && !p.state.isTerminal) {
-                throw SnapshotFormatException("終わっていない pid ${p.pid} に PROCESS_ABI 節がない")
-            }
-            InspectedProcess(p.pid, p.args, p.moduleHash.bytes(), layer?.first, layer?.second, layer?.third?.bytes())
-        }
-        return SnapshotContents(kernel.initPid, processes)
-    }
-
-    /** `PROCESS_ABI` 節を読む（pid・層・p1 の層なら中身） */
-    private fun readAbiSection(section: SnapshotSection, budget: ChunkReadBudget): Triple<Int, Int, DecodedP1Process?> {
-        if (section.version != SnapshotSection.PROCESS_ABI_VERSION) {
-            throw SnapshotFormatException("PROCESS_ABI 節の版 ${section.version}")
-        }
-        val input = SnapshotReader(section.payloadUnsafe())
-        val pid = input.i32()
-        val layer = input.u16()
-        val layerVersion = input.u16()
-        val decoded = if (layer == SnapshotSection.ABI_LAYER_P1) {
-            P1SectionCodec.read(input.raw(input.remaining), layerVersion, budget)
-        } else {
-            null
-        }
-        return Triple(pid, layer, decoded)
-    }
-
-    /** 基準の p1 の層（pid → 中身） */
-    private fun p1Layers(snapshot: MachineSnapshot, budget: ChunkReadBudget): Map<Int, DecodedP1Process> {
-        val result = HashMap<Int, DecodedP1Process>()
-        for (section in snapshot.sections) {
-            if (section.kind != SnapshotSection.PROCESS_ABI) continue
-            val (pid, _, decoded) = readAbiSection(section, budget)
-            if (decoded != null && result.put(pid, decoded) != null) throw SnapshotFormatException("基準の pid $pid の PROCESS_ABI 節が重なる")
-        }
-        return result
+        return SnapshotContents(decoded.kernel.initPid, processes)
     }
 }
