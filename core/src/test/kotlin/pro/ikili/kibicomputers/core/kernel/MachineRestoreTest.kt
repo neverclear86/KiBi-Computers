@@ -31,6 +31,7 @@ import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
@@ -201,6 +202,104 @@ class MachineRestoreTest {
             eventually(60_000, "終わらない") {
                 h.scheduler.tick()
                 m.state == MachineState.STOPPED
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `後段の後も、知らせ（RESTORED）が返るまでは保存しない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            // 受け手は tick のスレッドで動く: 待たずに1回だけ確かめる（#589。restoringValue は下りていて、restoreHandle はまだ開いている）
+            finished.onFinished = { machine, outcome ->
+                assertEquals(RestoreOutcome.RESTORED, outcome)
+                assertTrue(machine.isRestoring)
+                assertEquals(SaveReadiness.TRANSIENT, machine.saveReadiness(), "知らせの中は TRANSIENT")
+                assertFalse(machine.isAtWaitPoint, "知らせの中は待機点にしない")
+                assertNull(machine.captureCopy(CapturePolicy.SKIP_IF_TRANSIENT), "知らせの中は写さない（SKIP_IF_TRANSIENT）")
+                assertNull(machine.captureCopy(CapturePolicy.KILL_TRANSIENT), "知らせの中は写さない（KILL_TRANSIENT）")
+                assertNull(machine.captureSnapshot(CapturePolicy.KILL_TRANSIENT), "知らせの中は取り出さない")
+                val q = machine.quiesce()
+                try {
+                    assertEquals(SaveReadiness.TRANSIENT, q.readiness, "知らせの中で取った quiesce も TRANSIENT")
+                } finally {
+                    q.close()
+                }
+            }
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "復元が終わらない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
+            assertFalse(m.isRestoring)
+            // 知らせが返った後は、待機点に戻れば写せる
+            eventually(60_000, "知らせの後も写せない") {
+                h.scheduler.tick()
+                m.saveReadiness() == SaveReadiness.READY && m.captureCopy(CapturePolicy.SKIP_IF_TRANSIENT) != null
+            }
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(saved.pid))
+            m.close()
+        }
+    }
+
+    @Test
+    fun `後段の後、知らせを配る前にstopしても、TRANSIENTのまま残らない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            // 配るときには stopLocked が restoreHandle を下ろし終えている（#589。知らせは別の handle を閉じない）
+            finished.onFinished = { machine, outcome ->
+                assertEquals(RestoreOutcome.RESTORED, outcome, "戻した後に止めた RESTORED は替えない")
+                assertFalse(machine.isRestoring, "知らせの中でも、止めた後は復元の途中でない")
+            }
+            assertTrue(m.restore(request(saved, store, finished)))
+            // tick を回さない（知らせを配らない）まま、後段が RESTORED を積むのを待つ
+            eventually(60_000, "後段が終わらない") { m.state == MachineState.RUNNING }
+            assertTrue(m.isRestoring, "知らせを配る前は restoreHandle が開いている")
+            assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+            m.stop()
+            assertFalse(m.isRestoring, "stop が restoreHandle を下ろす")
+            eventually(10_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            repeat(3) { h.scheduler.tick() }
+            finished.assertNoErrors()
+            assertEquals(listOf(RestoreOutcome.RESTORED), finished.outcomes.map { it.second })
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced)
+            eventually(10_000, "止めた後も TRANSIENT のまま") {
+                h.scheduler.tick()
+                m.saveReadiness() != SaveReadiness.TRANSIENT
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `受け手がない復元も、知らせの後は写せる`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val m = h.machine(fuelPerTick = 10_000_000)
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), null)))
+            assertNull(m.captureCopy(CapturePolicy.KILL_TRANSIENT), "復元の途中は写さない")
+            eventually(60_000, "復元が終わらない") {
+                h.scheduler.tick()
+                !m.isRestoring
+            }
+            assertEquals(MachineState.RUNNING, m.state)
+            eventually(60_000, "知らせの後も写せない") {
+                h.scheduler.tick()
+                m.saveReadiness() == SaveReadiness.READY && m.captureCopy(CapturePolicy.SKIP_IF_TRANSIENT) != null
             }
             m.close()
         }

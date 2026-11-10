@@ -462,8 +462,12 @@ public class Machine private constructor(
     /** テスト用: 前段が戻せずに冷えた起動待ちになり、[coldBootAfterRestore] を待っているか（知らせを配る前も真） */
     internal val isColdBootPending: Boolean get() = coldBootPending
 
-    /** 復元か、その後の冷えた起動待ちの間（保存しない・待機点にしない） */
-    private val restoreTransient: Boolean get() = restoringValue || coldBootPending
+    /**
+     * 復元を受け付けてから終わりの知らせが返るまで（[isRestoring]）と、冷えた起動待ちの間（保存しない・待機点にしない。#589、ADR 0085）。
+     * 後段が [restoringValue] を下ろした後も、知らせ（RESTORED）が返るまでは [restoreHandle] が開いているので写さない。
+     * [restoringValue] は [restoreHandle] より先に立たず後に下りないが、印がずれても安全側に倒すため両方を見る
+     */
+    private val restoreTransient: Boolean get() = restoringValue || restoreHandle != null || coldBootPending
 
     /** 刈り取ったプロセス・前の起動のプロセスの専用スレッドで、まだ終わっていないかもしれないもの（[awaitTermination] で待つ） */
     private val retiredThreads = ArrayList<Thread>()
@@ -477,6 +481,7 @@ public class Machine private constructor(
      * - 起動の手順が動いていない（[isBooting] でない）
      * - 再起動を求められて待っていない（[reboot] を受け付けてから、[MachineHost.onRebootRequested] を呼ぶまで）
      * - 全プロセスが待機点にいる（または1つもない）
+     * - 復元の途中（[isRestoring]。終わりの知らせが返るまで）でも、冷えた起動待ちでもない（#589）
      *
      * 起動中・再起動の待ちの印は実行時だけの値で保存しないので、その間は待機点にしない（#365）。
      */
@@ -490,7 +495,9 @@ public class Machine private constructor(
 
     /**
      * 復元の途中（#85、ADR 0085）: [restore] を受け付けてから、終わりの知らせ（[RestoreRequest.listener]）が返るか、取り消されるまで。
-     * この間はマシンが [quiesce] で止まっている（プロセスに step を割り当てない）
+     * この間はマシンが [quiesce] で止まっていて（プロセスに step を割り当てない）、保存しない（[saveReadiness] が
+     * [SaveReadiness.TRANSIENT]、[captureSnapshot] が `null`。#589）。知らせはメインスレッドで配るので、メインスレッドで READY を
+     * 待つ呼び手は、この台を先に外す
      */
     public val isRestoring: Boolean get() = restoreHandle != null
 
@@ -531,7 +538,7 @@ public class Machine private constructor(
     }
 
     /**
-     * 今保存できるか（#81）。起動中・再起動の待ちなら [SaveReadiness.TRANSIENT]。そうでなければ、プロセスの判定のうち
+     * 今保存できるか（#81）。起動中・再起動の待ち・復元の途中（[isRestoring]）・冷えた起動待ちなら [SaveReadiness.TRANSIENT]。そうでなければ、プロセスの判定のうち
      * TRANSIENT があれば TRANSIENT、UNSAVEABLE があれば UNSAVEABLE、どちらもなければ READY（プロセスがなくても READY）
      */
     public fun saveReadiness(): SaveReadiness = lock.withLockValue { saveReadinessLocked() }
@@ -580,6 +587,7 @@ public class Machine private constructor(
      * カーネルの状態の写しを取る（#81）。カーネルロックの中で写し（[pro.ikili.kibicomputers.core.persist.KernelStateCopy]）を作り、
      * 元のマシンは止めない・変えない。
      *
+     * - 復元の途中（[isRestoring]。終わりの知らせが返るまで）か冷えた起動待ちなら、どちらの方針でも `null`（#85、#589）
      * - [CapturePolicy.SKIP_IF_TRANSIENT] で [SaveReadiness.TRANSIENT] なら `null`（自動保存は前の世代を残す）
      * - そうでなければ必ず写しを返す。`UNSAVEABLE` のプロセス（[CapturePolicy.KILL_TRANSIENT] なら `TRANSIENT` のものも）は、
      *   写しの中でだけ `SIGKILL` で殺し、殺した pid を記録する
@@ -607,7 +615,7 @@ public class Machine private constructor(
         deltaBase: DeltaBase? = null,
         fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
     ): KernelStateCopy? = lock.withLockValue {
-        // 復元の途中・冷えた起動待ちは写さない（表が空か、入れたばかりで、前の世代を残す。#85）
+        // 復元の途中（知らせが返るまで）・冷えた起動待ちは写さない（表が空か、入れたばかりで、前の世代を残す。#85、#589）
         if (restoreTransient) return@withLockValue null
         val wholeTransient = bootingValue || rebootRequested || rebootNotified
         if (policy == CapturePolicy.SKIP_IF_TRANSIENT && saveReadinessLocked() == SaveReadiness.TRANSIENT) return@withLockValue null
