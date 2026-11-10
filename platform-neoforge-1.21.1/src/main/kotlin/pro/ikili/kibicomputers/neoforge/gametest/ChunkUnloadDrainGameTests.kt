@@ -20,6 +20,10 @@ object ChunkUnloadDrainGameTests {
     /** テストの場所から離れた（読み込まれていない）チャンクまでの距離 */
     private const val FAR_CHUNKS = 400
 
+    /** 読み込まれていないチャンクを探すときの、候補の数と、候補ごとに遠ざける距離（チャンク） */
+    private const val FAR_CANDIDATES = 16
+    private const val FAR_STEP = 37
+
     /** 離れたチャンクを読み込ませるチケット（チャンクを FULL にする段階） */
     private val TICKET: TicketType<ChunkPos> = TicketType.create("kibicomputers_drain_test", Comparator.comparingLong(ChunkPos::toLong))
 
@@ -57,9 +61,17 @@ object ChunkUnloadDrainGameTests {
         helper.succeed()
     }
 
+    /**
+     * テストの場所から離れた、読み込まれていないチャンク。ほかのテストが読み込んだ（まだアンロードされていない）チャンクと
+     * 重なることがあるので、読み込まれていないものが見つかるまで、遠ざけながら探す
+     */
     private fun farChunk(helper: GameTestHelper): ChunkPos {
         val origin = ChunkPos(helper.absolutePos(BlockPos.ZERO))
-        val far = ChunkPos(origin.x + FAR_CHUNKS, origin.z + FAR_CHUNKS)
+        var far = ChunkPos(origin.x + FAR_CHUNKS, origin.z + FAR_CHUNKS)
+        for (attempt in 1 until FAR_CANDIDATES) {
+            if (!helper.level.hasChunk(far.x, far.z)) return far
+            far = ChunkPos(far.x + FAR_STEP, far.z + FAR_STEP)
+        }
         helper.assertFalse(helper.level.hasChunk(far.x, far.z), "the far chunk $far should not be loaded yet")
         return far
     }
