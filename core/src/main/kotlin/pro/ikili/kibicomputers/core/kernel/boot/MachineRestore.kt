@@ -34,6 +34,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /** 復元を冷えた起動に切り替える（前段の失敗。カーネルの表は空のまま） */
 internal class RestoreFallbackException(val cause0: ColdBootCause, message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -130,14 +131,18 @@ internal class MachineRestore(private val machine: Machine, private val request:
     /** 今のモジュールが最初に混んでいた時刻（[System.nanoTime]）。混んでいなければ `null` */
     private var busySince: Long? = null
 
-    /** 終わるのを待っている読み込み（取り消しの登録が見る） */
-    @Volatile
-    private var waiting: CompletableFuture<Program>? = null
+    /**
+     * 終わるのを待っている読み込み（取り消しの登録が見る）。登録はこの入れ物だけを持ち、[MachineRestore] を捕まえない（#587）:
+     * 信号を終え損ねても、残るのは空の入れ物だけで、[programs]・[stored]・[base] は回収される
+     */
+    private val waiting = AtomicReference<CompletableFuture<Program>?>()
 
     /** 最初の段（起動用のスレッドで1回呼ぶ） */
     fun run() {
-        // 取り消しの登録は復元1回につき1つ（stopLocked の中、カーネルロックの中から呼ばれる。読み込みを取り消すだけ）
-        machine.restoreCancelSignal.whenComplete { _, _ -> waiting?.cancel(false) }
+        // 取り消しの登録は復元1回につき1つ（stopLocked の中、カーネルロックの中から呼ばれる。読み込みを取り消すだけ）。
+        // 信号は前段の終わり（completeRestore・restoreFellBack）でも終えるので、登録はそこで外れる（#587）
+        val holder = waiting
+        machine.restoreCancelSignal.whenComplete { _, _ -> holder.get()?.cancel(false) }
         step { begin() }
     }
 
@@ -231,7 +236,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
             val source = sources[next]
             val future = startLoad(source) ?: continue
             if (!future.isDone) {
-                waiting = future
+                waiting.set(future)
                 // 登録より先に取り消されていたら、登録の側は waiting を見ていない: ここで取り消す（stopLocked は印を立ててから知らせる）
                 if (machine.isRestoreCancelled) future.cancel(false)
                 future.whenComplete { _, _ -> resume { if (loaded(source, future)) loadModules() else null } }
@@ -264,7 +269,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
      * 混んでいたら、上限の内ならタイマーでやり直しを積んで `false`、上限を過ぎたら冷えた起動
      */
     private fun loaded(source: ModuleSource, future: CompletableFuture<Program>): Boolean {
-        waiting = null
+        waiting.set(null)
         checkCancelled()
         val key = moduleKey(source)
         val program = try {
