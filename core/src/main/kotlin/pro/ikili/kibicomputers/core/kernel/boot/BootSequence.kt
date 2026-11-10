@@ -35,6 +35,9 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
     private val opener: BootVolumeOpener
         get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
 
+    /** ディスクを開くときに渡す取り消しの確かめ（リースのロックの中で呼ばれる。volatile を読むだけ。#588） */
+    private val isCancelled: () -> Boolean = { machine.isBootCancelled }
+
     fun run() {
         try {
             if (!machine.beginBoot()) {
@@ -77,10 +80,13 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         for (diskId in config.bootDisks) {
             if (machine.isBootCancelled) throw BootCancelledException()
             val volume = try {
-                opener.open(diskId)
+                opener.open(diskId, isCancelled)
             } catch (e: Exception) {
                 null
-            } ?: continue
+            }
+            // 取り消されて開かなかったときも、ここは `continue` でよい: 次の周の頭で取り消しを見て抜ける。最後の候補でも、
+            // `endBoot` は取り消されていれば失敗を知らせない（#588）
+            ?: continue
             opened++
             if (hasInit(volume)) return diskId to volume
             // 選ばなかった候補は閉じる（ホストのディスクのリースを返す）
@@ -100,10 +106,11 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         if (homeDisk == rootDiskId) return
         if (machine.isBootCancelled) throw BootCancelledException()
         val volume = try {
-            opener.open(homeDisk)
+            opener.open(homeDisk, isCancelled)
         } catch (e: Exception) {
             null
         }
+        if (volume == null && machine.isBootCancelled) throw BootCancelledException()
         val reason = when {
             volume == null -> "cannot open"
             volume.readOnly -> {

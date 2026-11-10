@@ -266,6 +266,20 @@ class DiskFileSystemTest {
     }
 
     @Test
+    fun `取り消された開き手は世代を進めず、今の持ち主を締め出さず、取った分を返す`() {
+        // #588: 取り消しはリースのロックの中で見る
+        val leases = HostDiskLeases.size
+        val owner = disk()
+        owner.writeAll("/f", "x")
+        val budget = HostFileBudget(8, 16, AtomicInteger())
+        assertThrows<DiskOpenCancelledException> { DiskFileSystem.open(dir.resolve("disk"), budget = budget, cancelled = { true }) }
+        assertEquals(1, owner.stat(p("/f")).size, "今の持ち主は使えるまま")
+        assertEquals(leases + 1, HostDiskLeases.size)
+        owner.retire()
+        assertEquals(leases, HostDiskLeases.size, "断った分の users を戻していない")
+    }
+
+    @Test
     fun `開いたままのファイルの数はマシンとサーバー全体の枠で数える`() {
         val total = AtomicInteger()
         val a = disk("a", budget = HostFileBudget(perMachine = 2, totalLimit = 3, total = total))

@@ -713,14 +713,23 @@ internal class DiskFileSystem private constructor(
 
         /**
          * [root] をディスクとして開く（なければ作る）。木をたどって使用量を数えるので、カーネルロックの外・起動用のスレッドから呼ぶ。
-         * 同じディレクトリの前の持ち主（ほかの [DiskFileSystem]）は、この時点で古い世代になり、その後の操作は `IO`
+         * 同じディレクトリの前の持ち主（ほかの [DiskFileSystem]）は、この時点で古い世代になり、その後の操作は `IO`。
+         *
+         * [cancelled] は開き手（起動・復元の手順）が取り消されたかを返す。世代を進める直前にリースのロックの中で見て、真なら
+         * 世代を進めずに [DiskOpenCancelledException] を投げる（[HostDiskLeases.acquire]。#588）。volatile を読むだけにする
          */
         @Throws(IOException::class)
-        fun open(root: Path, quota: DiskQuota = DiskQuota(), readOnly: Boolean = false, budget: HostFileBudget = HostFileBudget()): DiskFileSystem {
+        fun open(
+            root: Path,
+            quota: DiskQuota = DiskQuota(),
+            readOnly: Boolean = false,
+            budget: HostFileBudget = HostFileBudget(),
+            cancelled: () -> Boolean = { false },
+        ): DiskFileSystem {
             if (!readOnly) Files.createDirectories(root)
             val real = root.toRealPath()
             if (!Files.isDirectory(real, LinkOption.NOFOLLOW_LINKS)) throw NotDirectoryException(real.toString())
-            val (lease, generation) = HostDiskLeases.acquire(real)
+            val (lease, generation) = HostDiskLeases.acquire(real, cancelled)
             val fs = DiskFileSystem(real, quota, readOnly, budget, lease, generation)
             try {
                 fs.recount()

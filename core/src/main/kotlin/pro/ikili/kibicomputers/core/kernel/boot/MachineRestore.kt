@@ -110,6 +110,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
     private val opener: BootVolumeOpener
         get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
 
+    /** ディスクを開くときに渡す取り消しの確かめ（リースのロックの中で呼ばれる。volatile を読むだけ。#588） */
+    private val isCancelled: () -> Boolean = { machine.isRestoreCancelled }
+
     /** 読んだ写し（1. で読み、3. で復号する） */
     private var stored: StoredSnapshot? = null
 
@@ -431,10 +434,14 @@ internal class MachineRestore(private val machine: Machine, private val request:
                 source.startsWith(MachineLimits.DISK_SOURCE_PREFIX) -> {
                     val diskId = source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
                     val volume = try {
-                        opener.open(diskId)
+                        opener.open(diskId, isCancelled)
                     } catch (e: Exception) {
                         null
-                    } ?: fallback(ColdBootCause.MOUNT, "ディスク $diskId（${entry.point}）を開けない")
+                    } ?: run {
+                        // 取り消されて開かなかったのなら、冷えた起動に流さずに黙って抜ける（#588）
+                        checkCancelled()
+                        fallback(ColdBootCause.MOUNT, "ディスク $diskId（${entry.point}）を開けない")
+                    }
                     volume.fs
                 }
                 source == MachineLimits.TMP_SOURCE -> {
