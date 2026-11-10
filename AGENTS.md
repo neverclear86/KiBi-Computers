@@ -133,9 +133,9 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 1. 選択: 「依存: #n」が閉じていて、未決の `decision` に左右されず、`needs-human` と `human-task` が付いていない Issue を選ぶ。同時に最大3件（`window`）、同じ area は同時に1件まで。
 2. プラン（システムコールの ABI、保存形式、公開 API に関わる Issue だけ）: プランを Issue に投稿し、レビューを受ける。プランがこの3つについて、決まっていない選択を含むなら、人の判断を求めて止まる。
-3. 実装ループ: `.worktrees/issue-<番号>` の worktree で、`build` と両バージョンの GameTest が通るまで直し、PR を作る。
+3. 実装ループ: 着手前に設計の助言（Opus）を書かせてから、`.worktrees/issue-<番号>` の worktree で、`build` と両バージョンの GameTest が通るまで直し、PR を作る。
 4. CI: 落ちたら最大2回直す。
-5. レビュー: 正しさ・ルール違反のレビュー（公開 API の変更があれば Java 相互運用のレビューも）→ 別のエージェントが指摘を検証 → must を直す。最大2ラウンド。
+5. レビュー: 正しさ・ルール違反のレビューを1本（area が kernel・persistence・runtime・storage の Issue と、スレッド・並行処理に触れた PR は Fable、それ以外は Opus。公開 API の変更があれば Java 相互運用のレビューも）→ 別のエージェント（Opus）が指摘を検証 → 残った指摘を must・should を問わず直す。最大2ラウンド。
 6. マージ: 1件ずつ直列に、main を取り込んだ結果で `build` と GameTest を通してから squash マージする（`merge: false` で飛ばせる）。
 7. 報告: PR に結果をコメントし、worktree を片付ける。
 
@@ -145,10 +145,10 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 | 段階 | モデル |
 | --- | --- |
-| プラン、実装、レビュー、指摘の検証、2回目の修正 | Opus（medium。プランのレビューは high） |
+| 着手前の助言、プラン、実装、レビュー（重い PR 以外）、指摘の検証、2回目の修正 | Opus（medium。助言とプランのレビューは high） |
 | 選択、1回目の修正、Java 相互運用レビュー、マージ | Sonnet |
 | CI 待ち、報告 | Haiku |
-| 人に聞く前の確かめ | Fable（high） |
+| 人に聞く前の確かめ、重い PR のレビュー | Fable（high） |
 
 - `main` はブランチ保護されている（PR 必須、CI の `build` が通らないとマージできない、force push 禁止。管理者も対象）。
 - 基本は自動マージ（#242）。CI が通らない、レビューの must が直らない、マージで判断が要る、未決の論点がある、のどれかなら、Fable の確かめを通してから `needs-human` を付けて質問し、マージしない。
