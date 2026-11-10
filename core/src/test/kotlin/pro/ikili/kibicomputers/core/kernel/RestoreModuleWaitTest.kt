@@ -456,13 +456,35 @@ class RestoreModuleWaitTest {
                 Thread.sleep(100)
                 assertTrue(m.isRestoring)
 
-                m.stop()
+                // 起動用のスレッド（1本）を塞いで、やり直しのタイマーが積む続きを待ち行列に溜めてから取り消す。
+                // 続きが取り消しの後に動く順を作る（ゲートが閉じている間は上限で断られて数が変わらないので、
+                // 数ではなく、置き場を読んだ回数で「読み込みを頼まない」を確かめる）
+                val blockerStarted = CountDownLatch(1)
+                val blocker = CountDownLatch(1)
+                h.scheduler.bootExecutor.execute {
+                    blockerStarted.countDown()
+                    blocker.await()
+                }
+                try {
+                    assertTrue(blockerStarted.await(10, TimeUnit.SECONDS))
+                    eventually(10_000, "やり直しの続きが待ち行列に溜まらない") { h.scheduler.bootExecutor.queue.isNotEmpty() }
+                    m.stop()
+                    val getsAfterCancel = modules.gets.get()
+                    // 溜まった続きを動かす（取り消し済みなので、読み込みを頼まない）
+                    blocker.countDown()
+                    eventually(10_000, "溜まった続きが動かない") {
+                        h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty()
+                    }
+                    // タイマーが残っていても、頼まず、積まない
+                    Thread.sleep(200)
+                    assertEquals(getsAfterCancel, modules.gets.get(), "取り消した後に読み込みを頼んだ")
+                } finally {
+                    blocker.countDown()
+                }
                 eventually(10_000, "知らせが来ない") {
                     h.scheduler.tick()
                     finished.outcomes.isNotEmpty()
                 }
-                // やり直しのタイマーが残っていても、積まず、知らせも増えない
-                Thread.sleep(200)
                 assertEquals(max, programs.pendingOf(m.id), "取り消した後に読み込みを積んだ")
                 gate.countDown()
                 eventually(10_000) { programs.loadingCount == 0 && h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
