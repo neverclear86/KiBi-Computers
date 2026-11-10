@@ -94,7 +94,11 @@
 ## 接続層（1.21.1 NeoForge）
 
 - `CaseBlockEntity`: `PoweredOn` を読み書きし、`onLoad` で順番待ちに入る。順番が来たら（`startRestore`）ID・`claim` の判定・書き込みの期限から
-  `RestoreSource` を決めて `ComputerCase.startRestore` に渡す。デバイスは知らせの中で `TestComputerWiring.attach`（起動しない）でつなぐ
+  `RestoreSource` を決めて `ComputerCase.startRestore` に渡す。ID は今の ID（`currentIdentity`。書き込み中なら予約の世代）を使う（#575）。
+  FULL でなくなったときの取り出しは完了を受け取るまで `identity` を進めないので、`identity` を使うと、書き込みが `processCompletions` の後に
+  終わったときに1つ前の世代から戻ってしまう。予約の世代が書けていなければ、規則 9 で直下の世代に落ちる。
+  `claim` が `NEW_ID_*` の台を冷えた起動にするのは、振った直後（世代 0）だけ。その後に書いた世代があれば（FULL に戻ったときなど）戻す。
+  デバイスは知らせの中で `TestComputerWiring.attach`（起動しない）でつなぐ
 - `ServerMachines`: 順番待ちを tick の始めに回す。チャンクが FULL に戻ったら（チケットの段階が 33 以下に上がった。`fullStatus` はチケットの段階から
   その場で決まる）、次の tick の終わりに順番待ちに入れる。アンロード・FULL でなくなった・停止の取り出しは、復元の途中の台を飛ばす（NBT は前の世代と電源の状態を
   指したまま。外すと復元を取り消し、次に読み込んだときに戻し直す）。数え口（`Stats`）に戻した数・冷えた起動の数を足す
