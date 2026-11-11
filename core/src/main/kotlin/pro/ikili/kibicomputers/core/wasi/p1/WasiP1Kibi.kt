@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiIo
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTimers
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
 
@@ -60,7 +61,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * `u64` の時間の引数（`set-after`・`set-at`）は、2^63 以上を `Long.MAX_VALUE` に頭打ちにしてカーネルへ渡す（ADR 0426）。
  *
  * `kibi:process` の `[static]process.spawn` だけが待つ（[WasiP1.WAIT_IMPORTS]。[WasiP1KibiProcess]）。ほかは待たない。
- * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数。
+ * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数、
+ * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）。
  */
 internal object WasiP1Kibi {
     /** `kibi:kernel/events` のモジュール名 */

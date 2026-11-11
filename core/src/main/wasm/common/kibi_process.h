@@ -1,8 +1,8 @@
 // 独自拡張 kibi:process/process（#74。WIT は core/src/main/wit/kibi-process/、ABI は docs/adr/0074-kibi-process.md）を、
 // WASI p1 のプログラムから呼ぶための手書きの宣言（wit-bindgen で作る束縛と、posix_spawn・waitpid・kill 風の関数は SDK #116）。
 //
-// 構造体の配置は Canonical ABI と同じ。get-cwd の結果（文字列）は、プログラムが export する cabi_realloc で場所を取るので、
-// get-cwd を import するプログラムは cabi_realloc を export しなければならない（なければ読み込みで NOEXEC）。
+// 構造体の配置は Canonical ABI と同じ。get-cwd・list-processes の結果は、プログラムが export する cabi_realloc で場所を取るので、
+// これらを import するプログラムは cabi_realloc を export しなければならない（なければ読み込みで NOEXEC）。
 // spawn は読み込み（コンパイル）が終わるまで待つ（止まりうる import。待機点への変換の対象）。
 // process のハンドルはカーネルの fd 番号で、poll_oneoff の FD_READ（poll の POLLIN）で子の終わりを待てる。
 #ifndef KIBI_PROCESS_H
@@ -96,6 +96,41 @@ typedef struct {
     } val;
 } kibi_result_option_exit_status_t;
 
+// list<string>（8 バイト、align 4）。process-info の args
+typedef struct {
+    kibi_process_string_t *ptr;
+    size_t len;
+} kibi_process_list_string_t;
+
+// variant process-state（判別子。#452）
+#define KIBI_PROCESS_STATE_STARTING 0 // 読み込みの途中
+#define KIBI_PROCESS_STATE_RUNNING 1  // 動ける・動いている
+#define KIBI_PROCESS_STATE_WAITING 2  // イベントや接続層の処理を待っている
+#define KIBI_PROCESS_STATE_FINISHED 3 // 終わって刈り取られていない。val.finished が終わり方
+
+// variant process-state（12 バイト、align 4）
+typedef struct {
+    uint8_t tag;
+    union {
+        kibi_process_exit_status_t finished;
+    } val;
+} kibi_process_state_t;
+
+// record process-info（28 バイト、align 4）
+typedef struct {
+    uint32_t pid;
+    uint32_t parent_pid; // 親がなければ 0
+    kibi_process_state_t state;
+    // argv の先頭から最大 16 個・合計 255 バイト（UTF-8）まで。最後の1つは文字の境目で切ってあることがある
+    kibi_process_list_string_t args;
+} kibi_process_info_t;
+
+// list<process-info>（8 バイト、align 4）。list-processes の結果
+typedef struct {
+    kibi_process_info_t *ptr;
+    size_t len;
+} kibi_process_list_process_info_t;
+
 _Static_assert(sizeof(kibi_process_string_t) == 8 && _Alignof(kibi_process_string_t) == 4, "string");
 _Static_assert(sizeof(kibi_process_env_t) == 16 && offsetof(kibi_process_env_t, value) == 8, "tuple<string, string>");
 _Static_assert(sizeof(kibi_process_fd_assign_t) == 12 && _Alignof(kibi_process_fd_assign_t) == 4, "fd-assign");
@@ -110,6 +145,15 @@ _Static_assert(offsetof(kibi_result_option_exit_status_t, val.ok.val.val.exited)
 _Static_assert(offsetof(kibi_result_option_exit_status_t, val.ok.val.val.killed.is_some) == 12, "killed.is_some");
 _Static_assert(offsetof(kibi_result_option_exit_status_t, val.ok.val.val.killed.sig) == 13, "killed.sig");
 _Static_assert(offsetof(kibi_result_option_exit_status_t, val.err) == 4, "result err");
+_Static_assert(sizeof(kibi_process_list_string_t) == 8 && _Alignof(kibi_process_list_string_t) == 4, "list<string>");
+_Static_assert(sizeof(kibi_process_state_t) == 12 && offsetof(kibi_process_state_t, val.finished) == 4, "process-state");
+_Static_assert(sizeof(kibi_process_info_t) == 28 && _Alignof(kibi_process_info_t) == 4, "process-info");
+_Static_assert(offsetof(kibi_process_info_t, parent_pid) == 4, "process-info.parent-pid");
+_Static_assert(offsetof(kibi_process_info_t, state) == 8, "process-info.state");
+_Static_assert(offsetof(kibi_process_info_t, state.val.finished) == 12, "process-info.state.finished");
+_Static_assert(offsetof(kibi_process_info_t, state.val.finished.val.exited) == 16, "process-info.state.finished.exited");
+_Static_assert(offsetof(kibi_process_info_t, args) == 20, "process-info.args");
+_Static_assert(sizeof(kibi_process_list_process_info_t) == 8 && _Alignof(kibi_process_list_process_info_t) == 4, "list<process-info>");
 
 #define KIBI_PROCESS_MODULE "kibi:process/process@0.1.0"
 
@@ -142,6 +186,11 @@ void kibi_process_drop(uint32_t self);
 // kill-pid(pid: u32, sig: signal) -> result<_, error-code>
 __attribute__((import_module(KIBI_PROCESS_MODULE), import_name("kill-pid")))
 void kibi_process_kill_pid(uint32_t pid, int32_t sig, kibi_result_unit_t *ret);
+
+// list-processes() -> list<process-info>（マシンの全プロセスを pid の昇順。ゾンビも含む。待たない。#452）。
+// 配列・args の配列・各文字列の場所は cabi_realloc で取る（文字列に NUL は付かない）
+__attribute__((import_module(KIBI_PROCESS_MODULE), import_name("list-processes")))
+void kibi_process_list_processes(kibi_process_list_process_info_t *ret);
 
 // self-pid() -> u32
 __attribute__((import_module(KIBI_PROCESS_MODULE), import_name("self-pid")))

@@ -15,6 +15,8 @@
 //   kp misaligned-order     揃っていない list より先に読む引数（path・args・env・cwd）の誤りが、トラップより先に返る（#430。ADR 0074）
 //   kp nowait-misaligned    待たない設定で、揃っていない args の ptr で spawn（引数を読む前に again になるはず）
 //   kp self                 self-pid・parent-pid
+//   kp ps                   眠る子・終わった子（ゾンビ）・親なしのゾンビ・シバンの子を作ってから list-processes を表示する（#452）
+//   kp ps-realloc           list-processes の cabi_realloc の中で、もう一度 list-processes を呼ぶ（トラップしないはず）
 // 子:
 //   kp exit <n>             proc_exit(n)（32 ビットそのまま）
 //   kp trap                 トラップする
@@ -22,6 +24,7 @@
 //   kp ignore-child         Ctrl+C を無視してから fd 1 に "r" を書き、眠り続ける
 //   kp orphan               親なし（parent-pid が 0）になったら fd 1 に "orphaned" を書いて終わる
 //   kp cwd-child            get-cwd を表示する
+//   kp hang                 止められるまで眠る（シバン #!/bin/kp hang のスクリプトから）
 #include <errno.h>
 #include <poll.h>
 #include <stdint.h>
@@ -38,6 +41,8 @@
 #define SELF "/bin/kp"
 
 static int realloc_spawn = 0;
+static int realloc_list = 0;
+static long inner_list_len = -1;
 
 __attribute__((export_name("cabi_realloc")))
 void *cabi_realloc(void *ptr, size_t old_size, size_t align, size_t new_size) {
@@ -46,6 +51,14 @@ void *cabi_realloc(void *ptr, size_t old_size, size_t align, size_t new_size) {
     if (realloc_spawn) {
         kibi_result_process_t res;
         kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
+    }
+    if (realloc_list) {
+        // 入れ子は1段だけ
+        realloc_list = 0;
+        kibi_process_list_process_info_t inner;
+        kibi_process_list_processes(&inner);
+        // 書き出し（fd_write）は止まりうる import なので、cabi_realloc の中では呼ばない
+        inner_list_len = (long)inner.len;
     }
     return aligned_alloc(align < sizeof(void *) ? sizeof(void *) : align, new_size == 0 ? 1 : new_size);
 }
@@ -367,6 +380,86 @@ static int run_cwd(void) {
     return 0;
 }
 
+static const char *state_name(uint8_t tag) {
+    switch (tag) {
+    case KIBI_PROCESS_STATE_STARTING: return "starting";
+    case KIBI_PROCESS_STATE_RUNNING: return "running";
+    case KIBI_PROCESS_STATE_WAITING: return "waiting";
+    case KIBI_PROCESS_STATE_FINISHED: return "finished";
+    default: return "bad";
+    }
+}
+
+// 1行に1つ: p <pid> <parent-pid> <状態> <終わり方> <args の数> <args を | でつないだもの>
+static void print_processes(const kibi_process_list_process_info_t *list) {
+    for (size_t i = 0; i < list->len; i++) {
+        const kibi_process_info_t *p = &list->ptr[i];
+        char exit[32] = "-";
+        if (p->state.tag == KIBI_PROCESS_STATE_FINISHED) {
+            kibi_process_exit_status_t s = p->state.val.finished;
+            if (s.tag == KIBI_PROCESS_EXITED) snprintf(exit, sizeof exit, "exited:%u", s.val.exited);
+            else if (s.tag == KIBI_PROCESS_KILLED && s.val.killed.is_some) snprintf(exit, sizeof exit, "killed:%u", s.val.killed.sig);
+            else if (s.tag == KIBI_PROCESS_KILLED) snprintf(exit, sizeof exit, "killed:none");
+            else if (s.tag == KIBI_PROCESS_CRASHED) snprintf(exit, sizeof exit, "crashed");
+            else snprintf(exit, sizeof exit, "bad:%u", s.tag);
+        }
+        printf("p %u %u %s %s %zu ", p->pid, p->parent_pid, state_name(p->state.tag), exit, p->args.len);
+        for (size_t j = 0; j < p->args.len; j++) printf("%s%.*s", j ? "|" : "", (int)p->args.ptr[j].len, p->args.ptr[j].ptr);
+        printf("\n");
+    }
+}
+
+// list の中の pid の要素（なければ NULL）
+static const kibi_process_info_t *find_process(const kibi_process_list_process_info_t *list, uint32_t pid) {
+    for (size_t i = 0; i < list->len; i++) {
+        if (list->ptr[i].pid == pid) return &list->ptr[i];
+    }
+    return NULL;
+}
+
+static int run_ps(void) {
+    // 眠り続ける子
+    const char *sleeper[] = {"kp", "sleep", "60000"};
+    int64_t a = spawn_self(3, sleeper, NULL, 0);
+    // 終わった子（status を読まないのでゾンビのまま）
+    const char *exiter[] = {"kp", "exit", "3"};
+    int64_t b = spawn_self(3, exiter, NULL, 0);
+    // 親なしで終わる子（ハンドルを閉じる）
+    const char *orphan[] = {"kp", "sleep", "20"};
+    int64_t c = spawn_self(3, orphan, NULL, 0);
+    // シバンのスクリプト（argv はインタプリタ・シバンの引数・スクリプトのパス・元の argv[1..]）
+    const char *script[] = {"hang.sh", "x"};
+    int64_t d = spawn_full("/bin/hang.sh", 2, script, NULL, 0, NULL);
+    if (a < 0 || b < 0 || c < 0 || d < 0) {
+        printf("spawn %lld %lld %lld %lld\n", (long long)a, (long long)b, (long long)c, (long long)d);
+        return 1;
+    }
+    uint32_t pa = kibi_process_pid((uint32_t)a), pb = kibi_process_pid((uint32_t)b);
+    uint32_t pc = kibi_process_pid((uint32_t)c), pd = kibi_process_pid((uint32_t)d);
+    printf("children %u %u %u %u\n", pa, pb, pc, pd);
+    kibi_process_drop((uint32_t)c);
+    if (wait_exit((uint32_t)b) != 0) return 1;
+    kibi_process_list_process_info_t list;
+    for (int i = 0;; i++) {
+        kibi_process_list_processes(&list);
+        const kibi_process_info_t *o = find_process(&list, pc);
+        if (o != NULL && o->state.tag == KIBI_PROCESS_STATE_FINISHED && o->parent_pid == 0) break;
+        if (i > 4000) {
+            printf("orphan not finished\n");
+            return 1;
+        }
+        sleep_ms(5);
+    }
+    print_processes(&list);
+    printf("kill %lld %lld\n", (long long)handle_kill((uint32_t)a, KIBI_PROCESS_SIGNAL_KILL),
+           (long long)handle_kill((uint32_t)d, KIBI_PROCESS_SIGNAL_KILL));
+    if (wait_exit((uint32_t)a) != 0 || wait_exit((uint32_t)d) != 0) return 1;
+    // 止めた子は killed:3 と出る（まだ刈り取っていない）
+    kibi_process_list_processes(&list);
+    print_processes(&list);
+    return 0;
+}
+
 static int child_ignore(void) {
     kibi_result_unit_t u;
     kibi_process_set_signal_ignored(KIBI_PROCESS_SIGNAL_INTERRUPT, 1, &u);
@@ -400,6 +493,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(mode, "ignore-child") == 0) return child_ignore();
     if (strcmp(mode, "orphan") == 0) return child_orphan();
+    if (strcmp(mode, "hang") == 0) {
+        for (;;) sleep_ms(1000);
+    }
     if (strcmp(mode, "cwd-child") == 0) {
         print_cwd("child cwd");
         return 0;
@@ -428,6 +524,16 @@ int main(int argc, char **argv) {
         kibi_result_process_t res;
         kibi_process_spawn(SELF, strlen(SELF), MISALIGNED, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
         printf("nowait %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+        return 0;
+    }
+    if (strcmp(mode, "ps") == 0) return run_ps();
+    if (strcmp(mode, "ps-realloc") == 0) {
+        realloc_list = 1;
+        kibi_process_list_process_info_t list;
+        kibi_process_list_processes(&list);
+        printf("inner %ld\n", inner_list_len);
+        printf("outer %zu\n", list.len);
+        print_processes(&list);
         return 0;
     }
     if (strcmp(mode, "self") == 0) {

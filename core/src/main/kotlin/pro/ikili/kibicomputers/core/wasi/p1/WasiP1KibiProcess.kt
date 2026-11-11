@@ -33,6 +33,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
  * | `[method]process.kill` | `(self, sig, ret_ptr: i32) -> ()` |
  * | `[resource-drop]process` | `(self: i32) -> ()` |
  * | `kill-pid` | `(pid, sig, ret_ptr: i32) -> ()` |
+ * | `list-processes` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#452） |
  * | `self-pid`・`parent-pid` | `() -> i32` |
  * | `set-signal-ignored` | `(sig, ignored, ret_ptr: i32) -> ()` |
  * | `get-cwd` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る） |
@@ -50,6 +51,9 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
  * 取り消す）に任せる。`finishExecWithHandle` を呼ばないので子は作られない。
  * 不正なハンドル（`pid`・`[resource-drop]`）はトラップ（結果に error-code がない。Component Model と同じ）。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]（巻き直して着いた `spawn` も1回と数える）。
+ * `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]。
+ * `list-processes` は待たず、`cabi_realloc` の中からも呼べる。一覧はカーネルロックの中で写し、ロックを放してから `cabi_realloc` を呼ぶ
+ * （`cabi_realloc` の中でほかのプロセスが変わっても、返すのは呼んだ時点の写し）。
  */
 internal class WasiP1KibiProcess(
     private val ctx: ProcessContext,
@@ -242,6 +246,12 @@ internal class WasiP1KibiProcess(
             },
             Fn("kill-pid", type(3), needsRealloc = false, mayWait = false) { caller, a ->
                 unit(caller, a[2].i()) { KibiProcess.killPid(ctx, a[0].u32(), KibiProcess.signalOf(a[1].i())) }
+            },
+            Fn("list-processes", type(1), needsRealloc = true, mayWait = false) { caller, a ->
+                val memory = WasiP1Kibi.memoryOf(caller)
+                val entries = KibiProcess.list(ctx)
+                P1Canonical.lowerProcessListResult(memory, WasiP1Kibi.realloc(ctx, caller), a[0].i(), entries)
+                NONE
             },
             Fn("self-pid", type(0, result = true), needsRealloc = false, mayWait = false) { _, _ -> longArrayOf(ctx.pid.toLong()) },
             Fn("parent-pid", type(0, result = true), needsRealloc = false, mayWait = false) { _, _ -> longArrayOf(ctx.parentPid.toLong()) },

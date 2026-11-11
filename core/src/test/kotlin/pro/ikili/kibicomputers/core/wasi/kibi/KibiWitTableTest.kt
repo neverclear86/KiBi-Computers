@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.File
 
@@ -166,11 +167,13 @@ class KibiWitTableTest {
         val wit = derived()
         val expected = setOf(
             "[static]process.spawn", "[method]process.pid", "[method]process.status", "[method]process.kill", "[resource-drop]process",
-            "kill-pid", "self-pid", "parent-pid", "set-signal-ignored", "get-cwd", "set-cwd",
+            "kill-pid", "list-processes", "self-pid", "parent-pid", "set-signal-ignored", "get-cwd", "set-cwd",
         ).map { WasiP1Kibi.PROCESS to it }.toSet()
         assertEquals(expected, wit.filter { it.first == WasiP1Kibi.PROCESS }.toSet())
         for (fn in expected) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
         assertTrue(WasiP1Kibi.needsRealloc(WasiP1Kibi.PROCESS, "get-cwd"))
+        assertTrue(WasiP1Kibi.needsRealloc(WasiP1Kibi.PROCESS, "list-processes"))
+        assertFalse("${WasiP1Kibi.PROCESS}.list-processes" in WasiP1.WAIT_IMPORTS)
         assertFalse(WasiP1Kibi.needsRealloc(WasiP1Kibi.PROCESS, "[static]process.spawn"))
         for ((m, f) in listOf("kibi:process/process-poll@0.1.0" to "subscribe", "kibi:process/process-async@0.1.0" to "wait")) {
             assertTrue((m to f) in wit, "$m.$f が WIT にない")

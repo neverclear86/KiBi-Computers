@@ -1237,6 +1237,8 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun writeConsole(bytes: ByteArray, offset: Int, length: Int): Boolean = machine.writeConsole(bytes, offset, length)
 
+        override fun listProcesses(): List<ProcessListing> = lock.withLockValue { machine.lifecycle.listProcessesLocked() }
+
         override fun listDevices(): List<DeviceInfo> = machine.devices.list()
 
         override fun openDevice(address: String): Int {

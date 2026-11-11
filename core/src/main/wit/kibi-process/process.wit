@@ -27,6 +27,29 @@ interface process {
         crashed,
     }
 
+    /// 一覧に出すプロセスの状態（カーネルの状態を粗くまとめたもの。#452、ADR 0452）
+    variant process-state {
+        /// 作られて、読み込み（インスタンス化）の途中
+        starting,
+        /// 動ける・動いている（CPU や燃料を待っている間も含む）
+        running,
+        /// イベントや接続層の処理を待っている
+        waiting,
+        /// 終わったが、まだ刈り取られていない（ゾンビ）。終わり方を持つ
+        finished(exit-status),
+    }
+
+    /// 一覧に出すプロセス1つの情報（#452、ADR 0452）
+    record process-info {
+        pid: u32,
+        /// 親の pid（親がなければ 0。親なしのゾンビは finished で 0）
+        parent-pid: u32,
+        state: process-state,
+        /// argv の先頭から。個数は 16 まで、UTF-8 のバイト数の合計は 255 まで（仮の値。確定は #251）。
+        /// 収まらない要素は UTF-8 の文字の境目で切って入れ、そこで止める（切って空になるなら入れない）。切ったことの印はない
+        args: list<string>,
+    }
+
     /// 子の fd に何を割り当てるか
     variant fd-source {
         /// 親の fd n（パイプの端、preopen のディレクトリなど）。p2/p3 では 0/1/2 だけ（ほかは bad-descriptor）
@@ -67,6 +90,8 @@ interface process {
 
     /// pid を指定してシグナルを送る（kill コマンド用。ハンドルを持たない相手にも送れる）
     kill-pid: func(pid: u32, sig: signal) -> result<_, error-code>;
+    /// マシンの全プロセス（自分、終わって刈り取られていないもの・親なしのゾンビも含む）を pid の昇順で返す（ps 用。#452）。待たない
+    list-processes: func() -> list<process-info>;
     /// 自分の pid
     self-pid: func() -> u32;
     /// 親の pid（親がなければ 0）

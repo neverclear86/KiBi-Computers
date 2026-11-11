@@ -149,7 +149,7 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
-    fun `kibi_processは型が一致するときだけ通り、get-cwdはcabi_reallocが要り、版違い・p2とp3のinterfaceは断る`() {
+    fun `kibi_processは型が一致するときだけ通り、get-cwdとlist-processesはcabi_reallocが要り、版違い・p2とp3のinterfaceは断る`() {
         val p = WasiP1Kibi.PROCESS
         val spawn = Triple(p, "[static]process.spawn", List(13) { I32 } to emptyList<Int>())
         val pid = Triple(p, "[method]process.pid", listOf(I32) to listOf(I32))
@@ -162,10 +162,16 @@ class WasiP1ImportCheckTest {
         val ignored = Triple(p, "set-signal-ignored", listOf(I32, I32, I32) to emptyList<Int>())
         val getCwd = Triple(p, "get-cwd", listOf(I32) to emptyList<Int>())
         val setCwd = Triple(p, "set-cwd", listOf(I32, I32, I32) to emptyList<Int>())
-        // get-cwd 以外は cabi_realloc が要らない
+        val listProcesses = Triple(p, "list-processes", listOf(I32) to emptyList<Int>())
+        // get-cwd・list-processes 以外は cabi_realloc が要らない
         assertDoesNotThrow { WasiP1.checkImports(load(command(spawn, pid, status, kill, drop, killPid, selfPid, parentPid, ignored, setCwd))) }
         assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), getCwd))) }
         assertNoexec(load(command(getCwd)), WasiP1Kibi.REALLOC)
+        // list-processes も cabi_realloc が要る（#452）。型の違う cabi_realloc・import も断る
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), getCwd, listProcesses))) }
+        assertNoexec(load(command(listProcesses)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(commandWithRealloc(listOf(I32, I32, I32), listOf(I32), listProcesses)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(Triple(p, "list-processes", emptyList<Int>() to listOf(I32)))), "型が違う")
         assertNoexec(load(command(Triple(p, "[static]process.spawn", List(12) { I32 } to emptyList()))), "型が違う")
         assertNoexec(load(command(Triple(p, "[method]process.status", listOf(I32) to listOf(I32)))), "型が違う")
         assertNoexec(load(command(Triple("kibi:process/process@0.2.0", "self-pid", emptyList<Int>() to listOf(I32)))), "版が違う")

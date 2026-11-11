@@ -38,6 +38,8 @@ import java.nio.charset.CodingErrorAction
  * - `result<option<exit-status>, error-code>`: `{ tag @0, ok: { opt_tag @4, status_tag @8, exited: u32 @12 | killed: { sig_is_some @12, sig @13 } }
  *   | err: u8 @4 }`（16 / 4。#74）
  * - `string` の結果（`get-cwd`）: `{ ptr @0, len @4 }`（8 / 4。`cabi_realloc` で場所を取る。#74）
+ * - `list<process-info>` の結果（`list-processes`）: `{ ptr @0, len @4 }`（8 / 4）。`process-info` は
+ *   `{ pid @0, parent-pid @4, state.tag: u8 @8, state.finished: exit-status @12, args.ptr @20, args.len @24 }`（28 / 4。#452）
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
@@ -93,6 +95,17 @@ internal object P1Canonical {
     /** `string` の結果（`get-cwd`）の大きさ・align */
     const val STRING_RESULT_SIZE: Int = 8
     const val STRING_RESULT_ALIGN: Int = 4
+
+    /** `list<T>` の結果（`list-processes`）の大きさ・align */
+    const val LIST_RESULT_SIZE: Int = 8
+    const val LIST_RESULT_ALIGN: Int = 4
+
+    /** `process-info`（`kibi:process` の `list-processes` の要素。#452）の大きさ・align */
+    const val PROCESS_INFO_SIZE: Int = 28
+    const val PROCESS_INFO_ALIGN: Int = 4
+
+    /** `string`（`list<string>` の要素）の大きさ */
+    private const val STRING_SIZE: Int = 8
 
     /** 引数の `list` の要素（`string`・`tuple<string, string>`・`fd-assign`）の align。どれも 4 */
     private const val LIST_ELEMENT_ALIGN: Int = 4
@@ -316,15 +329,60 @@ internal object P1Canonical {
         }
         if (status == null) return
         memory.writeU8(retPtr + 4, 1)
+        writeExitStatus(memory, retPtr + 8, status)
+    }
+
+    /**
+     * `exit-status`（8 / 4）を [at] に書く: 判別子 u8 @0、`exited` は u32 @4、`killed` は `is_some` @4・`sig` @5。
+     * 詰め物と使わない payload は書かないので、呼ぶ側が先に 0 で埋めておく
+     */
+    private fun writeExitStatus(memory: WasmMemory, at: Int, status: ExitStatus) {
         val tag = KibiProcess.statusTag(status)
-        memory.writeU8(retPtr + 8, tag)
+        memory.writeU8(at, tag)
         when (tag) {
-            0 -> memory.writeI32(retPtr + 12, status.code)
+            0 -> memory.writeI32(at + 4, status.code)
             1 -> status.signal?.let {
-                memory.writeU8(retPtr + 12, 1)
-                memory.writeU8(retPtr + 13, KibiProcess.SIGNALS.indexOf(it))
+                memory.writeU8(at + 4, 1)
+                memory.writeU8(at + 5, KibiProcess.SIGNALS.indexOf(it))
             }
         }
+    }
+
+    /**
+     * `list<process-info>` の結果（`list-processes`。#452、ADR 0452）を [retPtr] に書く。retptr の範囲と align を先に確かめ、
+     * 場所は Canonical ABI の lower の順に [realloc] で取る: 外側の配列（align 4、28 × 件数）→ 要素ごとに `args` の配列
+     * （align 4、8 × 個数）→ その各文字列（align 1）。0 件・0 バイトでも呼ぶ。
+     * `process-info` の配置: `pid` @0、`parent-pid` @4、`state` の判別子 u8 @8、`finished` の `exit-status` @12（8 バイト）、
+     * `args.ptr` @20、`args.len` @24。詰め物と使わない payload は 0
+     */
+    fun lowerProcessListResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, entries: List<KibiProcess.Entry>) {
+        checkStore(memory, retPtr, LIST_RESULT_SIZE, LIST_RESULT_ALIGN)
+        val listPtr = alloc(memory, realloc, PROCESS_INFO_ALIGN, allocSize(entries.size, PROCESS_INFO_SIZE))
+        for ((i, e) in entries.withIndex()) {
+            val at = listPtr + i * PROCESS_INFO_SIZE
+            memory.write(at, ByteArray(PROCESS_INFO_SIZE))
+            memory.writeI32(at, e.pid)
+            memory.writeI32(at + 4, e.parentPid)
+            memory.writeU8(at + 8, e.state.ordinal)
+            e.exit?.let { writeExitStatus(memory, at + 12, it) }
+            val argsPtr = alloc(memory, realloc, LIST_ELEMENT_ALIGN, allocSize(e.args.size, STRING_SIZE))
+            for ((j, arg) in e.args.withIndex()) {
+                val (p, l) = lowerBytes(memory, realloc, utf8(arg))
+                memory.writeI32(argsPtr + j * STRING_SIZE, p)
+                memory.writeI32(argsPtr + j * STRING_SIZE + 4, l)
+            }
+            memory.writeI32(at + 20, argsPtr)
+            memory.writeI32(at + 24, e.args.size)
+        }
+        memory.writeI32(retPtr, listPtr)
+        memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    /** 配列の大きさ（[count] × [elementSize]）。`Long` で計算し、`Int` を超えるならトラップ（黙って小さく取らない） */
+    private fun allocSize(count: Int, elementSize: Int): Int {
+        val size = count.toLong() * elementSize
+        if (size > Int.MAX_VALUE) throw WasmTrapException(WasmTrapKind.OTHER, "結果の配列が大きすぎる（$size バイト）")
+        return size.toInt()
     }
 
     /** `string` の結果を [retPtr] に書く（中身の場所は [realloc] で取る。大きさ 0 でも呼ぶ） */
