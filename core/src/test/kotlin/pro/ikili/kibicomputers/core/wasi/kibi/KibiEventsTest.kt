@@ -10,6 +10,8 @@ import pro.ikili.kibicomputers.core.kernel.emptyModule
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -115,6 +117,36 @@ class KibiEventsTest {
     @Test
     fun `マシンのキューの数の上限はnfile`() = inProcess { ctx, _ ->
         repeat(EventLimits.MAX_QUEUES) { KibiEvents.open(ctx, emptyList(), 1) }
+        assertErrno(Errno.NFILE) { KibiEvents.open(ctx, emptyList(), 1) }
+    }
+
+    @Test
+    fun `プロセスのハンドル表が満杯ならmfileで、オブジェクト表にも索引にも残らず、1つ閉じれば開ける`() = inProcess { ctx, _ ->
+        // キューだけで埋めると MAX_QUEUES で nfile が先に出るので、キューでない fd を dup して埋める
+        val spare = ctx.withKernelLock {
+            val table = FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink)
+            val fd = table.open(ByteStream(1))
+            var last = fd
+            while (!table.isFull) last = table.dup(fd)
+            last
+        }
+        val before = ctx.withKernelLock { ctx.kernel.objects.size to ctx.kernel.events.indexedCount }
+        assertErrno(Errno.MFILE) { KibiEvents.open(ctx, emptyList(), null) }
+        assertErrno(Errno.MFILE) { KibiEvents.open(ctx, listOf("a", "b"), 8) }
+        assertEquals(before, ctx.withKernelLock { ctx.kernel.objects.size to ctx.kernel.events.indexedCount })
+        ctx.withKernelLock { FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink).close(spare) }
+        val q = KibiEvents.open(ctx, listOf("a"), null)
+        KibiEvents.drop(ctx, q)
+    }
+
+    @Test
+    fun `キューの数とハンドル表の両方が上限なら、nfileが先`() = inProcess { ctx, _ ->
+        repeat(EventLimits.MAX_QUEUES) { KibiEvents.open(ctx, emptyList(), 1) }
+        ctx.withKernelLock {
+            val table = FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink)
+            val fd = table.open(ByteStream(1))
+            while (!table.isFull) table.dup(fd)
+        }
         assertErrno(Errno.NFILE) { KibiEvents.open(ctx, emptyList(), 1) }
     }
 

@@ -1047,6 +1047,7 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun block(keys: List<WaitKey>): List<WaitKey> {
             checkThread()
+            checkNotInGuestCall("block")
             require(keys.isNotEmpty()) { "待つ条件がない" }
             val waiter = ThreadWaiter(lock.newCondition())
             var previous = ProcessState.RUNNING
@@ -1209,9 +1210,19 @@ internal class ProcessRunner(private val machine: Machine) {
             if (!wait.future.isDone) pending.abandon?.invoke()
         }
 
+        /**
+         * ホスト関数の中から呼んだゲスト（[callGuest]。`cabi_realloc`）の中では、止まって待つ口を使えない（トラップ。ADR 0073。#430）。
+         * ホスト関数の途中は巻き戻せず、ブロッキング型でも呼び出し元のホスト関数の途中で止まることになるため。
+         * ABI の層が入口で弾き忘れた import も、IllegalStateException ではなくトラップで終わる。プロセスのスレッドだけが読み書きするのでロックは要らない
+         */
+        private fun checkNotInGuestCall(name: String) {
+            if (rt.guestCallDepth > 0) throw WasmTrapException(WasmTrapKind.OTHER, "止まりうるホストの処理 $name を cabi_realloc の中で呼んだ")
+        }
+
         /** 止まって待つ口（block を除く）は、ブロッキング型か、作っている途中だけ（待機点型が step の途中でスレッドを持ったまま止まらない。#358） */
         private fun checkMayBlock(name: String) {
             checkThread()
+            checkNotInGuestCall(name)
             lock.withLockValue {
                 check(rt.process.kind == ProcessKind.BLOCKING || rt.loading != null) { "待機点型は $name で止まらず、StepResult.Wait で待つ" }
             }

@@ -1057,54 +1057,57 @@ class ShellTest {
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
             root(m, emptyMap())
             val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh"), env = mapOf("PATH" to "/bin"), fds = SpawnOptions.ROOT_PREOPEN))
-            // (打つ行, プロンプトに戻るまで Ctrl+C を送るか)
-            val steps = listOf(
-                "x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do x=${'$'}x${'$'}x; done" to false,
+            // (打つ行, Ctrl+C を送る相手の名前)。#473: Ctrl+C は、その名前の生きているプロセスが前景になったのを
+            // カーネルで確かめてから1回だけ送る。出力や時間で待つと、遅いときに前景が移る前の子（nap）へ届いてしまう。
+            // 余分に送ると、行の編集中に入って $? を 130 にし、検査が偽の成功にも偽の失敗にもなりうる
+            val steps = listOf<Pair<String, String?>>(
+                "x=a; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do x=${'$'}x${'$'}x; done" to null,
                 // echo の出力はパイプより大きく、hang は読まない
-                "echo \"${'$'}x\" | hang" to true,
-                "echo after ${'$'}?" to false,
+                "echo \"${'$'}x\" | hang" to "hang",
+                "echo after ${'$'}?" to null,
                 // ためる上限（64 KiB）より大きく、空きを待つ間に Ctrl+C を受ける
-                "y=${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x; echo \"${'$'}y\" | hang" to true,
-                "echo big ${'$'}?" to false,
+                "y=${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x${'$'}x; echo \"${'$'}y\" | hang" to "hang",
+                "echo big ${'$'}?" to null,
                 // 3 段: 前景の cat が Ctrl+C で止まったら、読まない途中の hang も止めて、空きを待つのをやめる
-                "echo \"${'$'}y\" | hang | cat" to true,
-                "echo three ${'$'}?" to false,
+                "echo \"${'$'}y\" | hang | cat" to "cat",
+                "echo three ${'$'}?" to null,
                 // 前景にした最後の段（外のコマンド nap）が先に自分で終わったら、動いている hang に前景を移す。
-                // 移っていれば nap の出力の後の Ctrl+C が hang に届き、移っていなければ届かず終わらない（空きを待つ間と、子を待つ間）
-                "echo \"${'$'}y\" | hang | nap" to true,
-                "echo moved ${'$'}?" to false,
-                "hang | nap" to true,
-                "echo waited ${'$'}?" to false,
+                // 前景が hang に移ったのを確かめてから Ctrl+C を送るので、移らなければ終わらない（空きを待つ間と、子を待つ間）
+                "echo \"${'$'}y\" | hang | nap" to "hang",
+                "echo moved ${'$'}?" to null,
+                "hang | nap" to "hang",
+                "echo waited ${'$'}?" to null,
                 // 最後の段がシェルの中で動く
-                "hang | echo last" to true,
-                "echo second ${'$'}?" to false,
-                "exit" to false,
+                "hang | echo last" to "hang",
+                "echo second ${'$'}?" to null,
+                "exit" to null,
             )
+            fun live() = m.lock.withLockValue { m.kernel.processes.all().filter { !it.state.isTerminal }.map { it.pid to it.args } }
+            fun foreground() = m.lock.withLockValue { m.consoleTtyLocked().foregroundPid }
             var next = 0
-            var interrupting = false
-            // nap の出力が出てから Ctrl+C を送る（nap が自分で終わって、前景が移った後に送るため）
-            var awaited: String? = null
-            var lineStart = 0
+            var target: String? = null
+            var sent = false
             var seen = 0
-            var lastSent = 0L
-            eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
+            eventuallyDescribe(150_000, { "終わらない（前景が移らない？）: ${steps.getOrNull(next - 1)?.first} / ${live()} / ${foreground()}\n${host.text()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
                 val text = host.text()
-                val now = System.nanoTime()
                 val atPrompt = text.length > seen && text.endsWith("$ ")
                 when {
                     atPrompt && next < steps.size -> {
                         seen = text.length
-                        val (line, ctrlC) = steps[next++]
-                        awaited = if (line.endsWith("nap")) "napped" else null
-                        lineStart = text.length
+                        val (line, name) = steps[next++]
+                        target = name
+                        sent = false
                         m.offerConsoleInput((line + "\n").toByteArray())
-                        interrupting = ctrlC
                     }
-                    interrupting && !atPrompt && (awaited == null || text.substring(lineStart).contains(awaited!!)) && now - lastSent > 200_000_000 -> {
-                        m.offerConsoleInput(byteArrayOf(3))
-                        lastSent = now
+                    target != null && !sent -> m.lock.withLockValue {
+                        // 確かめてから送るまでを同じロックの中で行う（hang と cat は自分では終わらないので、前景は変わらない）
+                        val fg = m.consoleTtyLocked().foregroundPid
+                        if (m.kernel.processes.all().any { !it.state.isTerminal && it.pid == fg && it.args.firstOrNull() == target }) {
+                            m.offerConsoleInput(byteArrayOf(3))
+                            sent = true
+                        }
                     }
                 }
                 m.stateOf(pid).isTerminal
@@ -1115,6 +1118,8 @@ class ShellTest {
             assertTrue(text.contains("three 130\n"), text)
             assertTrue(text.contains("moved 0\n"), text)
             assertTrue(text.contains("waited 0\n"), text)
+            // nap は2回とも自分で終わっている（前景を移す経路を通った）
+            assertEquals(2, Regex("napped\n").findAll(text).count(), text)
             assertTrue(text.contains("last\n"), text)
             assertTrue(text.contains("second 0\n"), text)
         }
