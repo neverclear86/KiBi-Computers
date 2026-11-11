@@ -1,7 +1,7 @@
 export const meta = {
   name: 'issue-to-pr',
   description: 'Issue を worktree で実装して PR を作り、CI とレビューエージェントで確認・修正してマージする。人の確認が要るものは質問して止まる',
-  whenToUse: 'KiBi Computers の Issue を自動で進めたいとき。args は Issue 番号・番号の配列・{ issues, window, merge }。省略するとエージェントが選ぶ。merge: false でマージしない。',
+  whenToUse: 'KiBi Computers の Issue を自動で進めたいとき。args は Issue 番号・番号の配列・{ issues, window, merge }。省略するとエージェントが選ぶ。merge: false でマージしない。resume: [{ issue, pr }] で止まった PR を CI から続ける。',
   phases: [
     { title: 'Select', detail: '対象の Issue と依存・area・プランの要否を調べる' },
     { title: 'Plan', detail: 'ABI・保存形式・公開 API に関わる Issue だけ、プランを書いてレビューする' },
@@ -29,6 +29,8 @@ const OPTS = Array.isArray(args) || typeof args === 'number' || args == null
   : args
 const WINDOW = OPTS.window ?? 3
 const MERGE = OPTS.merge !== false
+// resume: [{ issue, pr }] で、途中で止まった PR を CI → レビュー → マージの続きから進める（選択・助言・実装は飛ばす）
+const RESUME = Array.isArray(OPTS.resume) ? OPTS.resume : []
 // 既定では、着手前の助言は Opus、コードのレビューは1本（壊れると重い PR は Fable、それ以外は Opus）、指摘の検証は Opus 1本。
 // 壊れると重い PR = area が HEAVY_AREAS に入る Issue か、実装がスレッド・並行処理に触れたと答えた PR。
 // （#576〜#579 での比較の結論。2本立ての費用の大半は Fable 側で、検証は Sonnet だと範囲外として外す指摘が多かった）
@@ -393,11 +395,18 @@ publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputer
   )
 }
 
-function waitCi(pr, label) {
-  return agent(
-    `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。\`gh pr checks ${pr} --watch --interval 30\` を使う（10分を超えそうならもう一度実行する）。失敗したら \`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。コードは変更しない。`,
-    { label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
-  )
+// CI の結果を待つ。passed が偽なのに落ちたチェックの名前がない結果は、まだ走っている間に返したものとみなして待ち直す
+async function waitCi(pr, label) {
+  let ci = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    ci = await agent(
+      `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。\`gh pr checks ${pr} --watch --interval 30\` を使う（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。コードは変更しない。`,
+      { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
+    )
+    if (!ci || ci.passed || ci.failingChecks.length) return ci
+    log(`PR #${pr}: CI の結果に落ちたチェックの名前がない。待ち直す（${attempt + 1}/3）`)
+  }
+  return ci
 }
 
 // CI が通るまで待つ。落ちたら最大 MAX_CI_FIXES 回直す（1回目は Sonnet、2回目は Opus）。
@@ -474,8 +483,8 @@ async function mergePr(info, impl) {
       `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、マージせず status=needs_human で理由を返す。
 2. 取り込んだ結果で \`./gradlew build\` と両バージョンの \`runGameTestServer\` を通す。通らなければ status=needs_human。
-3. 取り込みでコミットが増えたら push し、\`gh pr checks ${impl.pr} --watch --interval 30\` で CI が通るのを待つ。
-4. \`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。`,
+3. 取り込みでコミットが増えたら push する。push したかどうかによらず、\`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。
+4. \`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human で理由を返す。`,
       { label: `merge:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge },
     )
     return m ?? { status: 'needs_human', reason: 'マージの段階が失敗した' }
@@ -533,15 +542,17 @@ async function runIssue(info) {
   await slots.acquire()
   for (const a of areas) await areaLock(a).acquire()
   try {
-    const advice = await advise(info)
+    // 止まった PR の続き（resume）は、助言・プラン・実装を飛ばして CI から進める
+    let impl = info.resumeImpl ?? null
+    const advice = impl ? null : await advise(info)
     let approvedPlan = null
-    if (info.needsPlan) {
+    if (!impl && info.needsPlan) {
       const p = await plan(info, advice)
       if (!p.ok) return { issue: info.number, status: 'needs_human', reason: p.reason, question: p.reason }
       approvedPlan = p.plan
     }
 
-    let impl = await implement(info, approvedPlan, null, advice)
+    if (!impl) impl = await implement(info, approvedPlan, null, advice)
     if (impl && impl.status === 'blocked') {
       const e = await escalate('issue', info.number, impl.summary, '実装の段階で、人が決めることか未決の decision に当たって止まった', true)
       if (!e.guidance) return { issue: info.number, status: 'needs_human', reason: e.question, question: e.question }
@@ -600,8 +611,54 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
 
 // ---- 実行 ----
 
+const RESUME_SCHEMA = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean', description: 'PR が開いていて、worktree を用意できたら true' },
+    title: { type: 'string', description: 'Issue のタイトル' },
+    areas: { type: 'array', items: { type: 'string' }, description: '`area: ` を除いた名前' },
+    branch: { type: ['string', 'null'] },
+    worktree: { type: ['string', 'null'], description: 'worktree の絶対パス' },
+    publicApiChanged: { type: 'boolean' },
+    touchesConcurrency: { type: 'boolean' },
+    summary: { type: 'string' },
+  },
+  required: ['ok', 'title', 'areas', 'branch', 'worktree', 'publicApiChanged', 'touchesConcurrency', 'summary'],
+}
+
+// 止まった PR の続きのために、worktree を用意して実装の結果と同じ形にする。
+// needs-human のラベルは触らない（外すのは人の指示を受けた起動側）
+async function prepareResume({ issue, pr }) {
+  const r = await agent(
+    `${REPO} の PR #${pr}（Issue #${issue}）を、途中で止まったところから自動の流れで続けるために用意する。
+1. \`gh pr view ${pr} --json state,headRefName,body,labels\` と \`gh issue view ${issue} --json title,labels\` を読む。PR が OPEN でないか、PR か Issue に \`needs-human\` ラベルが付いていれば ok=false にして、理由を summary に書く。
+2. リポジトリのルートで \`git fetch origin\` し、\`.worktrees/issue-${issue}\` がなければ \`git worktree add .worktrees/issue-${issue} <headRefName>\`（ローカルのブランチがなければ \`origin/<headRefName>\` から作る）。あれば \`git -C .worktrees/issue-${issue} pull --ff-only\` で先頭に合わせる。
+3. 差分（\`gh pr diff ${pr}\`）から、publicApiChanged（\`public\` な宣言、特に \`pro.ikili.kibicomputers.api\` 以下を足した・変えた）と touchesConcurrency（スレッド・ロック・非同期の完了待ちの振る舞いを変えた）を判断する。summary には PR 本文の要約を書く。
+コードは変更しない。`,
+    { label: `resume:#${issue}`, phase: 'Select', schema: RESUME_SCHEMA, ...M.select },
+  )
+  if (!r || !r.ok) {
+    log(`PR #${pr}（#${issue}）は続けられない: ${r?.summary ?? '用意に失敗した'}`)
+    return null
+  }
+  return {
+    number: issue,
+    title: r.title,
+    areas: r.areas,
+    openDeps: [],
+    blockedReason: null,
+    needsPlan: false,
+    resumeImpl: {
+      status: 'pr_opened', pr, branch: r.branch, worktree: r.worktree,
+      publicApiChanged: r.publicApiChanged, touchesConcurrency: r.touchesConcurrency, summary: r.summary,
+    },
+  }
+}
+
 phase('Select')
-const selected = await select()
+const selected = RESUME.length
+  ? { issues: (await parallel(RESUME.map(x => () => prepareResume(x)))).filter(Boolean) }
+  : await select()
 const infos = (selected?.issues ?? []).filter(i => {
   if (i.blockedReason) log(`#${i.number} は着手しない: ${i.blockedReason}`)
   return !i.blockedReason
