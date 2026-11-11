@@ -206,4 +206,75 @@ class WasiP1KibiTest {
 
     @Test
     fun `cabi_reallocの中でfd_writeを呼ぶと、待たない設定でもトラップ`() = assertTrapsInRealloc(Mode.NONE, "realloc-write", "fd_write")
+
+    /** 不正なハンドルの `[resource-drop]` はトラップで、プロセスは CRASHED（#430） */
+    private fun assertTrapsOnDrop(mode: Mode, case: String, handle: Int) = run(mode, "drop", case) {
+        val out = finish()
+        assertEquals(ProcessState.CRASHED, m.stateOf(pid), out)
+        assertTrue("dropping\n" in out, out)
+        assertFalse("returned" in out, out)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && "[resource-drop]event-queue: 不正なハンドル $handle（BADF）" in e.message!!, "$e")
+    }
+
+    @Test
+    fun `開いていないfdのresource-dropは、待機点型ではトラップ`() = assertTrapsOnDrop(Mode.UNWIND, "unopened", 999)
+
+    @Test
+    fun `開いていないfdのresource-dropは、ブロッキング型でもトラップ`() = assertTrapsOnDrop(Mode.BLOCK, "unopened", 999)
+
+    @Test
+    fun `キューでないfdのresource-dropは、待機点型ではトラップ`() = assertTrapsOnDrop(Mode.UNWIND, "nonqueue", 1)
+
+    @Test
+    fun `キューでないfdのresource-dropは、ブロッキング型でもトラップ`() = assertTrapsOnDrop(Mode.BLOCK, "nonqueue", 1)
+
+    @Test
+    fun `閉じたキューをもう一度resource-dropすると、待機点型ではトラップ`() = run(Mode.UNWIND, "drop", "twice") {
+        val out = finish()
+        assertTrue("dropped once\n" in out, out)
+        assertEquals(ProcessState.CRASHED, m.stateOf(pid), out)
+        assertFalse("returned" in out, out)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && "[resource-drop]event-queue: 不正なハンドル" in e.message!!, "$e")
+    }
+
+    @Test
+    fun `閉じたキューをもう一度resource-dropすると、ブロッキング型でもトラップ`() = run(Mode.BLOCK, "drop", "twice") {
+        val out = finish()
+        assertTrue("dropped once\n" in out, out)
+        assertEquals(ProcessState.CRASHED, m.stateOf(pid), out)
+        assertFalse("returned" in out, out)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && "[resource-drop]event-queue: 不正なハンドル" in e.message!!, "$e")
+    }
+
+    @Test
+    fun `0xffffffffのresource-dropは、待機点型ではトラップ`() = assertTrapsOnDrop(Mode.UNWIND, "max", -1)
+
+    @Test
+    fun `0xffffffffのresource-dropは、ブロッキング型でもトラップ`() = assertTrapsOnDrop(Mode.BLOCK, "max", -1)
+
+    /** align 4 に揃っていない `kinds` の ptr はトラップ（error-code ではない。#430） */
+    private fun assertTrapsOnMisaligned(mode: Mode, len: String) = run(mode, "misaligned", len) {
+        val out = finish()
+        assertEquals(ProcessState.CRASHED, m.stateOf(pid), out)
+        assertTrue("opening\n" in out, out)
+        assertFalse("returned" in out, out)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && "list の場所が align 4 に揃っていない" in e.message!!, "$e")
+        assertEquals(0, m.lock.withLockValue { m.kernel.events.indexedCount }, "キューは開かない")
+    }
+
+    @Test
+    fun `揃っていないkindsでopenすると、待機点型ではトラップ`() = assertTrapsOnMisaligned(Mode.UNWIND, "1")
+
+    @Test
+    fun `揃っていないkindsでopenすると、ブロッキング型でもトラップ`() = assertTrapsOnMisaligned(Mode.BLOCK, "1")
+
+    @Test
+    fun `長さ0でもkindsが揃っていなければトラップ`() = assertTrapsOnMisaligned(Mode.UNWIND, "0")
+
+    @Test
+    fun `要素の数が上限を超えていても、揃っていなければinvalidより先にトラップ`() = assertTrapsOnMisaligned(Mode.UNWIND, "17")
 }

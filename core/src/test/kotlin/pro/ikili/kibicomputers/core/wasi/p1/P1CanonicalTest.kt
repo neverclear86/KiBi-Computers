@@ -138,6 +138,37 @@ class P1CanonicalTest {
         assertErrno(Errno.FAULT) { P1Canonical.liftStringList(m, 0x200, 1, 16, 1..64) }
     }
 
+    /** 揃っていない list の ptr は、メモリを読まずにトラップ（error-code ではない。#430） */
+    private fun assertMisalignedTrap(block: (WasmMemory) -> Unit) {
+        val m = CountingMemory()
+        val e = assertThrows<WasmTrapException> { block(m) }
+        assertEquals(WasmTrapKind.OTHER, e.kind)
+        assertEquals(0L, m.bytesRead)
+    }
+
+    @Test
+    fun `list_stringのptrがalign4に揃っていなければ、長さ0や上限超えでもトラップ`() {
+        for (ptr in listOf(0x201, 0x202, 0x203, -1, 0xffff_fff9.toInt())) {
+            for (len in listOf(0, 1, 17, -1)) assertMisalignedTrap { P1Canonical.liftStringList(it, ptr, len, 16, 1..64) }
+        }
+        // 文字列の中身は align 1 なので、要素の ptr は揃っていなくてよい
+        val m = CountingMemory()
+        m.write(0x101, "ab".toByteArray())
+        m.putString(0x200, 0, 0x101, 2)
+        assertEquals(listOf("ab"), P1Canonical.liftStringList(m, 0x200, 1, 16, 1..64))
+    }
+
+    @Test
+    fun `kibi_processのlistのptrもalign4に揃っていなければトラップ`() {
+        for (ptr in listOf(0x201, 0x202, -1)) {
+            for (len in listOf(0, 1, 5)) {
+                assertMisalignedTrap { P1Canonical.liftArgList(it, ptr, len, 4, P1Canonical.ArgBudget()) }
+                assertMisalignedTrap { P1Canonical.liftEnvList(it, ptr, len, 4, P1Canonical.ArgBudget()) }
+                assertMisalignedTrap { P1Canonical.liftFdAssigns(it, ptr, len, 4) }
+            }
+        }
+    }
+
     @Test
     fun `option_u32は判別子で読み、値は符号なし`() {
         assertNull(P1Canonical.liftOptionU32(0, 123))

@@ -335,6 +335,119 @@ class DiskFileSystemTest {
         assertEquals(0, budget.inUse)
     }
 
+    // 作る open で createFile が失敗したとき、予約した枠を返す経路（Vfs.openOnce の catch 2つ。#469）
+
+    /** [inner] の createFile を [create] で差し替えた包み。ほかは [inner]（本物の枠の数え方）に委ねる */
+    private fun failingCreate(inner: DiskFileSystem, create: (VfsPath) -> Long): FileSystem = object : FileSystem by inner {
+        override fun createFile(path: VfsPath): Long = create(path)
+    }
+
+    private fun mounted(fs: FileSystem): Vfs = Vfs().also { it.mount(VfsPath.ROOT, fs, readOnly = false, source = "disk") }
+
+    private val create = OpenOptions(read = true, write = true, create = true)
+
+    @Test
+    fun `ほかのスレッドが先に作ってEXISTになったら、枠を返して開き直す`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(budget = budget)
+        // 1回目の作成を「ほかのスレッド」が先に済ませたことにする（2回目が EXIST）
+        val vfs = mounted(failingCreate(inner) { path -> inner.createFile(path); inner.createFile(path) })
+        // マシンの枠は1つ。予約を返し忘れると、開き直す retain が MFILE になる
+        val file = vfs.open(p("/new"), create)
+        assertEquals(1, budget.inUse, "予約した枠が残った")
+        assertEquals(1, total.get())
+        vfs.close(file)
+        assertEquals(0, budget.inUse)
+        assertEquals(0, total.get())
+    }
+
+    @Test
+    fun `O_EXCLでほかのスレッドが先に作ってEXISTになったら、枠を返して失敗する`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(budget = budget)
+        val vfs = mounted(failingCreate(inner) { path -> inner.createFile(path); inner.createFile(path) })
+        errno(Errno.EXIST) { vfs.open(p("/new"), OpenOptions(read = true, write = true, create = true, exclusive = true)) }
+        assertEquals(0, budget.inUse, "失敗した open が枠を残した")
+        assertEquals(0, total.get())
+        // 枠が残っていないので、次の open は開ける
+        val file = vfs.open(p("/new"), OpenOptions(read = true))
+        assertEquals(1, budget.inUse)
+        vfs.close(file)
+        assertEquals(0, budget.inUse)
+    }
+
+    @Test
+    fun `作るときにNOSPCになったら、枠を返してファイルを作らない`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(quota = DiskQuota(maxEntries = 1), budget = budget)
+        inner.writeAll("/full", "x")
+        val vfs = mounted(inner)
+        errno(Errno.NOSPC) { vfs.open(p("/new"), create) }
+        assertFalse(Files.exists(dir.resolve("disk").resolve("new")))
+        assertEquals(0, budget.inUse, "失敗した open が枠を残した")
+        assertEquals(0, total.get())
+        // 枠が残っていないので、あるファイルは開ける
+        val file = vfs.open(p("/full"), OpenOptions(read = true))
+        assertEquals(1, budget.inUse)
+        vfs.close(file)
+        assertEquals(0, budget.inUse)
+    }
+
+    @Test
+    fun `作るときにIOになったら、枠を返して失敗する`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(budget = budget)
+        val vfs = mounted(failingCreate(inner) { fsError(Errno.IO, "壊れた") })
+        errno(Errno.IO) { vfs.open(p("/new"), create) }
+        assertEquals(0, budget.inUse, "失敗した open が枠を残した")
+        assertEquals(0, total.get())
+    }
+
+    @Test
+    fun `作るときにFsException以外の例外が出ても、枠を返して投げ直す`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(budget = budget)
+        val vfs = mounted(failingCreate(inner) { error("想定外") })
+        val e = assertThrows<IllegalStateException> { vfs.open(p("/new"), create) }
+        assertEquals("想定外", e.message)
+        assertEquals(0, budget.inUse, "失敗した open が枠を残した")
+        assertEquals(0, total.get())
+    }
+
+    @Test
+    fun `最後の試行までEXISTが続いたら、どの試行の枠も返してEXISTで失敗する`() {
+        val total = AtomicInteger()
+        val budget = HostFileBudget(perMachine = 1, totalLimit = 16, total = total)
+        val inner = disk(budget = budget)
+        val target = p("/new")
+        var reserves = 0
+        var cancels = 0
+        // 見るときはいつもなく、作るときはいつもある（ほかのスレッドが作っては消し続ける）
+        val fs = object : FileSystem by inner {
+            override fun stat(path: VfsPath): FileStat = if (path == target) fsError(Errno.NOENT) else inner.stat(path)
+            override fun createFile(path: VfsPath): Long = fsError(Errno.EXIST)
+            override fun reserveOpen() {
+                reserves++
+                inner.reserveOpen()
+            }
+            override fun cancelOpen() {
+                cancels++
+                inner.cancelOpen()
+            }
+        }
+        val vfs = mounted(fs)
+        errno(Errno.EXIST) { vfs.open(target, create) }
+        assertEquals(Vfs.MAX_RETRIES, reserves)
+        assertEquals(Vfs.MAX_RETRIES, cancels)
+        assertEquals(0, budget.inUse, "失敗した open が枠を残した")
+        assertEquals(0, total.get())
+    }
+
     @Test
     fun `割り込まれたスレッドの操作はIOになり、ほかのスレッドは同じファイルを使い続けられる`() {
         val fs = disk()

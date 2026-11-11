@@ -1,6 +1,6 @@
 package kibi:computer@0.1.0;
 
-/// 残りの RAM を扱う（#408。#370 で決定。#73 で `kibi:computer/memory` から `kibi:computer` に移した）。
+/// 残りの RAM を扱う（#408。#370 で決定。#73 で #408 の `kibi:memory` から `kibi:computer/memory` に移した）。
 /// RAM は、初めて書き込んだ 4 KiB の区画の数で数える（#407）。
 ///
 /// p1 向けには、ADR 0073 の規則でモジュール `kibi:computer/memory@0.1.0` の import（`remaining`・`commit`）として出している。

@@ -2407,7 +2407,7 @@ public class Machine private constructor(
      *
      * TTY の出力は、たまった最初のときに通知の列へ印（[HostNotification.TtyOutput]）を積む。印より後は、TTY から取り出して、
      * 前後の通知と書いた順に並べる（起動のログ → init の出力 → init の終了のメッセージ → RUNNING など）。カーネルのメッセージの前では、
-     * そのメッセージを書いた時点までに TTY に書いた分だけを取り出す（[HostNotification.Console.ttyMark]。#381）
+     * 印を見たかによらず、そのメッセージを書いた時点までに TTY に書いた分を取り出す（[HostNotification.Console.ttyMark]。#381、#435）
      */
     internal fun deliverNotifications() {
         queuedForNotify.set(false)
@@ -2417,6 +2417,8 @@ public class Machine private constructor(
         if (consoleHold == null) resumeDeferredConsole(out)
         while (true) {
             val n = notifications.poll() ?: break
+            // 前の通知の中で止めるのをやめたなら、取っておいた分を、後ろの通知より先に配る（書いた順。#435）
+            if (consoleHold == null) resumeDeferredConsole(out)
             if (n is HostNotification.Console || n === HostNotification.TtyOutput) {
                 // 止めている間は、書いた順に取っておく（配っていないバイト数は、配るまで減らさない。TTY の印は下ろさない）
                 if (consoleHold != null) deferConsole(n) else out.add(n)
@@ -2449,7 +2451,10 @@ public class Machine private constructor(
 
     /**
      * 1回の通知で配るコンソール出力を、書いた順にまとめる（メインスレッドだけで使う）。
-     * TTY の印を見たら、TTY から取り出すのを、次のカーネルのメッセージの前（その目印まで）か、ほかの通知の前・終わり（全部）まで遅らせる
+     * TTY の印を見たら、TTY から取り出すのを、ほかの通知の前・終わり（全部）まで遅らせる。
+     * カーネルのメッセージの前では、印を見たか・飛ばしたか、間にほかの通知が挟まったかによらず、書く先のロックを持ってから、
+     * そのメッセージの目印までを取り出す（#435。配っていないカーネルのメッセージがある間は、プロセスのスレッドは TTY から取り出さない
+     * ので、ここで取り出さないと、メッセージより前に書いた分がメッセージの後に出る）
      */
     private inner class ConsoleCollector {
         private var bytes: ByteArrayOutputStream? = null
@@ -2459,9 +2464,6 @@ public class Machine private constructor(
 
         // TTY から取り出してから、配り終えるまで持つ、書く先のロック（#355。その間にプロセスのスレッドが後の出力を先に書かないように）
         private var locked: ConsoleSink? = null
-
-        // TTY の印を見たが、書く先をプロセスのスレッドが書いている最中だったので、取り出すのを次の tick に回した（#351）
-        private var ttySkipped = false
 
         private fun lockSink() {
             if (locked != null) return
@@ -2492,21 +2494,18 @@ public class Machine private constructor(
                 if (!tryLockSink()) {
                     // プロセスのスレッドが書く先に書いている最中なら、TTY の出力はそのスレッドが書く（#355）。
                     // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick に見直す（#351。待つと、出力し続ける台の数に比例して
-                    // メインスレッドが止まる）。この tick にカーネルのメッセージが来たら、そのときにロックを待って取り出す
-                    ttySkipped = true
+                    // メインスレッドが止まる）。この tick にカーネルのメッセージが来たら、そのときにロックを待って、その目印までを取り出す
                     recheckTtyOutput = true
                     return
                 }
                 ttyPending = true
                 return
             }
+            // カーネルのメッセージはまれなので、書く先のロックを待ってよい。ロックを持ってから取り出す（プロセスのスレッドと二重に書かない）
             lockSink()
-            if (ttySkipped) {
-                ttySkipped = false
-                ttyPending = true
-            }
             n as HostNotification.Console
-            if (ttyPending) drainTtyBefore(n)?.let(::append)
+            // メッセージより前に TTY に書いた分は、印を見ていなくても（飛ばした、ほかの通知の前の flush で見送ったなど）先に出す（#435）
+            drainTtyBefore(n)?.let(::append)
             pendingConsoleBytes.addAndGet(-n.bytes.size.toLong())
             append(n.bytes)
         }
@@ -2514,7 +2513,6 @@ public class Machine private constructor(
         /** たまった分を [host] に渡す（TTY の残りも取り出す） */
         fun flush() {
             try {
-                ttySkipped = false
                 if (ttyPending) {
                     ttyPending = false
                     // 書く先があれば、TTY の出力は書いたプロセスが自分のスレッドで書く。残ったままのものだけ取り出す（#355）
