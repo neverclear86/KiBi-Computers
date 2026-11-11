@@ -266,11 +266,11 @@ class WasiP1KibiProcessTest {
 
     /** align 4 に揃っていない list の ptr は、長さ 0 でもトラップ（error-code ではない）で、子を作らない（#430。ADR 0074） */
     @ParameterizedTest
-    @ValueSource(strings = ["args", "env", "fds"])
+    @ValueSource(strings = ["args", "env", "env-cwd", "fds"])
     fun `揃っていないlistのptrでspawnすると、待機点型ではトラップ`(list: String) = assertTrapsOnMisaligned(Mode.UNWIND, list)
 
     @ParameterizedTest
-    @ValueSource(strings = ["args", "env", "fds"])
+    @ValueSource(strings = ["args", "env", "env-cwd", "fds"])
     fun `揃っていないlistのptrでspawnすると、ブロッキング型でもトラップ`(list: String) = assertTrapsOnMisaligned(Mode.BLOCK, list)
 
     private fun assertTrapsOnMisaligned(mode: Mode, list: String) = run(mode, "misaligned", list) {
@@ -291,6 +291,8 @@ class WasiP1KibiProcessTest {
             assertLine("args-first ${err(Errno.TOOBIG)}", out)
             assertLine("disc-first ${err(Errno.INVAL)}", out)
             assertLine("env-none ${err(Errno.NOENT)}", out)
+            assertLine("cwd-first ${err(Errno.NAMETOOLONG)}", out)
+            assertLine("cwd-disc-first ${err(Errno.INVAL)}", out)
             waitNoChildren()
         }
 

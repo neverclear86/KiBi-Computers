@@ -11,8 +11,8 @@
 //   kp cwd                  set-cwd・get-cwd と、子の cwd（none なら新しい cwd、some ならそれ）。相対パスの spawn
 //   kp realloc-spawn        get-cwd の cabi_realloc の中で spawn を呼ぶ（トラップになるはず）
 //   kp nowait               待たない設定で spawn（again になるはず）
-//   kp misaligned <list>    align 4 に揃っていない list の ptr（長さ 0）で spawn する（トラップになるはず。#430）。list は args・env・fds
-//   kp misaligned-order     揃っていない list より先に読む引数の誤りが、トラップより先に返る（#430。ADR 0074）
+//   kp misaligned <list>    align 4 に揃っていない list の ptr（長さ 0）で spawn する（トラップになるはず。#430）。list は args・env・fds。env-cwd は揃っていない env と不正な cwd の判別子（env のトラップが先）
+//   kp misaligned-order     揃っていない list より先に読む引数（path・args・env・cwd）の誤りが、トラップより先に返る（#430。ADR 0074）
 //   kp nowait-misaligned    待たない設定で、揃っていない args の ptr で spawn（引数を読む前に again になるはず）
 //   kp self                 self-pid・parent-pid
 // 子:
@@ -275,6 +275,9 @@ static int run_misaligned(const char *which) {
         kibi_process_spawn(SELF, strlen(SELF), MISALIGNED, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
     } else if (strcmp(which, "env") == 0) {
         kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 1, MISALIGNED, 0, 0, NULL, 0, NULL, 0, &res);
+    } else if (strcmp(which, "env-cwd") == 0) {
+        // 揃っていない env の list のトラップが、後の cwd の判別子の誤り（invalid）より先
+        kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 1, MISALIGNED, 0, 2, NULL, 0, NULL, 0, &res);
     } else if (strcmp(which, "fds") == 0) {
         kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 0, NULL, 0, 0, NULL, 0, MISALIGNED, 0, &res);
     } else {
@@ -302,6 +305,12 @@ static int run_misaligned_order(void) {
     // env が none なら env_ptr は揃っていなくても確かめない（標準 OS の process.zig は none でも ptr を渡す）。ない path で no-entry
     kibi_process_spawn("/nope", 5, NULL, 0, 0, MISALIGNED, 3, 0, NULL, 0, NULL, 0, &res);
     printf("env-none %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    // cwd が長すぎる（name-too-long）のが、揃っていない fds より先
+    kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 0, NULL, 0, 1, long_path, sizeof long_path, MISALIGNED, 0, &res);
+    printf("cwd-first %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    // cwd の option の判別子が不正（invalid）なのが、揃っていない fds より先
+    kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 0, NULL, 0, 2, NULL, 0, MISALIGNED, 0, &res);
+    printf("cwd-disc-first %d\n", res.is_err ? -1 - (int)res.val.err : 0);
     return 0;
 }
 
