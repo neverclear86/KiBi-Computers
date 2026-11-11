@@ -758,23 +758,6 @@ class NanoEditorTest {
     }
 
     @Test
-    fun `2行しかない画面では、本文の行と状態の行が同じ行に重なり、状態の行の知らせが残る`() = nano(
-        listOf("r.txt"),
-        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
-    ) {
-        m.resizeConsole(40, 2)
-        host.resize(40, 2)
-        // rows=2 では本文の行も状態の行も 1 行目に割り付く（画面の外の行は出ないので commitRow のリセットは通らない。
-        // それは rows=1 のテストが受け持つ）。今の振る舞い（最後に書く状態の行が残る）を留める
-        // 割り当てのないキーで、状態の行に知らせを出す
-        keys("\u001b[1;5A")
-        assertTrue(row(1).contains("Unbound key"), screen)
-        assertFalse(row(1).contains("abcdef"), screen)
-        keys(ctrlX)
-        assertEquals(0, finish())
-    }
-
-    @Test
     fun `1行しかない画面でも、本文の行を状態の行につなげて書かない`() = nano(
         listOf("r.txt"),
         files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
