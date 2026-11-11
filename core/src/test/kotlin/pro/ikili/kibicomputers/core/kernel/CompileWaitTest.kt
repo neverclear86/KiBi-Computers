@@ -457,7 +457,8 @@ class CompileWaitTest {
         // 読み込みを待つ間は、取り消しの登録が付いている
         eventually { loading.isNotEmpty() && m.bootCancelSignal.numberOfDependents == 1 }
         gate.countDown()
-        tickUntil("起動しない") { !m.isBooting && m.state == MachineState.RUNNING }
+        // RUNNING → 印を下ろす → 取り消しの登録を外す、の順なので、ロックなしで読むときは、その順に読んで全部そろうまで待つ（#625）
+        tickUntil("起動しない") { m.state == MachineState.RUNNING && !m.isBooting && m.bootCancelSignal.isDone }
         assertEquals(0, m.bootCancelSignal.numberOfDependents, "取り消しの登録が残っている")
         assertTrue(m.bootCancelSignal.isDone)
         // 登録は何もしない（起動を終え直さない・失敗を知らせない）
