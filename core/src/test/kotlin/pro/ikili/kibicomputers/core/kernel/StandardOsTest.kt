@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.display.CharWidth
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -179,5 +180,40 @@ class StandardOsTest {
         assertEquals("memory ok\n", lib("memory").assertOk().console)
         assertEquals("stack ok\n", lib("stack").assertOk().console)
         assertEquals("time ok\n", lib("time").assertOk().console)
+    }
+
+    @Test
+    fun `ライブラリの全角の範囲はCharWidthと同じで、幅のない範囲は端末も幅0と見る文字だけを含む`() = timeout(limit) {
+        val out = lib("widths").assertOk().console.lines().filter { it.isNotEmpty() }
+        val wide = out.filter { it.startsWith("wide ") }.map { it.split(" ").let { p -> p[1].toInt()..p[2].toInt() } }
+        val zeroTypes = setOf(Character.NON_SPACING_MARK, Character.ENCLOSING_MARK, Character.FORMAT).map { it.toInt() }
+        // CharWidth の全角を、続いた範囲にまとめる（端末が幅 0 にする文字（濁点の結合文字 U+3099 など）は除く）
+        val expected = mutableListOf<IntRange>()
+        var start = -1
+        for (cp in 0..0x110000) {
+            val w = cp < 0x110000 && CharWidth.isWide(cp) && Character.getType(cp) !in zeroTypes
+            if (w && start < 0) start = cp
+            if (!w && start >= 0) {
+                expected += start..(cp - 1)
+                start = -1
+            }
+        }
+        assertEquals(expected, wide)
+        val zero = out.filter { it.startsWith("zero ") }.map { it.split(" ").let { p -> p[1].toInt()..p[2].toInt() } }
+        assertTrue(zero.isNotEmpty(), out.joinToString("\n"))
+        for (r in zero) {
+            for (cp in r) {
+                // 割り当てのない番号は、端末（Character.getType）でも幅 0 にはならないが、文字として出てこない
+                val type = Character.getType(cp)
+                if (type == Character.UNASSIGNED.toInt()) continue
+                assertTrue(type in zeroTypes, "U+${cp.toString(16)} は幅 0 でない（種類 $type）")
+            }
+        }
+    }
+
+    @Test
+    fun `UTF-8の読み方はoverlong・サロゲート・範囲外・途中で切れたものを断る`() = timeout(limit) {
+        val out = lib("utf8", "41", "c3a9", "e38182", "f09f9880", "c09b", "e08080", "eda080", "f4908080", "e381", "80", "ff").assertOk().console
+        assertEquals("65 233 12354 128512 - - - - - - - \n", out)
     }
 }
