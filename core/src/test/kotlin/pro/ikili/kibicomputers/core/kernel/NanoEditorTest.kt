@@ -181,6 +181,8 @@ class NanoEditorTest {
     private val ctrlX = "\u0018"
     private val ctrlS = "\u0013"
     private val ctrlO = "\u000f"
+    private val ctrlK = "\u000b"
+    private val ctrlU = "\u0015"
 
     @Test
     fun `開いたファイルを描き、下にキーの案内を出す。書いて保存して終わると、元の画面とモードに戻る`() = nano(
@@ -709,6 +711,64 @@ class NanoEditorTest {
         assertEquals("line 20", row(2))
         assertEquals(0 to 1, host.cursor())
         keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `同じかたまりで画面の上の行より前に文字を足してから戻っても、上の行の位置がずれない`() = nano(
+        listOf("t.txt"),
+        files = mapOf("/home/t.txt" to (1..100).joinToString("") { "line $it\n" }.toByteArray()),
+    ) {
+        keys("\u001b[6~" + right.repeat(2))
+        assertEquals("line 20", row(1))
+        // ↑ で line 19 へ出て、改行のない文字を足し、同じかたまりの ↓ で画面の中へ戻る
+        // （insert は上の行をカーソルの行 line 19 に求め直す。↓ の後もカーソルの行は画面の中なので、上の行はそのまま。
+        // insert で直していないと、上の行の番号は line 20 のまま位置だけが 1 バイト前（line 19 の改行）を指し、空の行が描かれる）
+        keys(up + "X" + down)
+        assertEquals("liXne 19", row(1))
+        assertEquals("line 20", row(2))
+        assertEquals("line 21", row(3))
+        assertEquals(2, host.cursor().second)
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `同じかたまりで画面の上の行より前に出てから貼り付けても、上の行の位置がずれない`() = nano(
+        listOf("t.txt"),
+        files = mapOf("/home/t.txt" to (1..100).joinToString("") { "line $it\n" }.toByteArray()),
+    ) {
+        // line 1 を切り取っておく
+        keys(ctrlK)
+        assertEquals("line 2", row(1))
+        keys("\u001b[6~" + right.repeat(2))
+        val top = row(1)
+        val above = "line " + (top.removePrefix("line ").toInt() - 1)
+        assertEquals(2 to 1, host.cursor())
+        // ↑ で上の行の 1 つ前の行の 2 桁目へ出て、同じかたまりで ^U（改行を含む「line 1」の行を、行の途中に貼る）
+        keys(up + ctrlU)
+        assertEquals(above.substring(2), row(1))
+        assertEquals(top, row(2))
+        assertEquals(0 to 1, host.cursor())
+        keys(up)
+        assertEquals("liline 1", row(1))
+        assertEquals(above.substring(2), row(2))
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `2行しかない画面でも、状態の行に本文をつなげて書かない`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
+    ) {
+        m.resizeConsole(40, 2)
+        host.resize(40, 2)
+        // 割り当てのないキーで、状態の行に知らせを出す
+        keys("\u001b[1;5A")
+        assertTrue(row(1).contains("Unbound key"), screen)
+        assertFalse(row(1).contains("abcdef"), screen)
+        keys(ctrlX)
         assertEquals(0, finish())
     }
 
