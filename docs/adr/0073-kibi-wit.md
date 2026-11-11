@@ -66,7 +66,7 @@ WIT の関数を、Component Model の Canonical ABI で平らにした core の
 - p1 の errno = 判別子 + 1。カーネルの `Errno` がそのまま写り、C では errno に直しやすい（`KibiErrors`）
 - マシン全体の上限（`ResourceLimitException`）は `nfile`、プロセスのハンドル表が満杯なら `mfile`
 - ゲストの引数の誤り（上限・UTF-8）は `invalid`、範囲外のポインタは `fault` で返す（`result` を返す関数ではトラップにしない。ゲストが自分の誤りを受け取って続けられるように）。書き先（retptr）と `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ
-- 引数の `list` の ptr が要素の align に揃っていないときもトラップ（#430）。Component Model の lift（`load_list_from_range`）でもトラップになるので、Component Model の層（#264）に替えたときに振る舞いを変えないため。長さ 0 でも、ほかの検査より先に確かめる。範囲外のほうは上のとおり `fault` のまま（Component Model ではトラップだが、Q4 で `fault` と決めた）。`string` の中身は align 1 なので確かめない
+- 引数の `list` の ptr が要素の align に揃っていないときもトラップ（#430）。Component Model の lift（`load_list_from_range`）でもトラップになるので、Component Model の層（#264）に替えたときに振る舞いを変えないため。長さ 0 でも、その list の長さ・範囲・中身の検査より先に確かめる。list を複数取る関数（`spawn`）は、引数の順（`path` → `args` → `env` → `cwd` → `fds`）に読むので、先に読む引数の error-code（`name-too-long`・`too-big`・`invalid`）は、あとの list の align のトラップより先に返る。待たない設定（`P1Wait.NONE`）の `again` は、引数を読む前に返る。Component Model の層は全引数を lift してからホストの検査に入るので、これらの組み合わせはトラップになる（今の p1 との既知の差。#264 で Component Model の順に揃える）。範囲外のほうは上のとおり `fault` のまま（Component Model ではトラップだが、Q4 で `fault` と決めた）。`string` の中身は align 1 なので確かめない
 
 ## 版（Q5-A）
 
