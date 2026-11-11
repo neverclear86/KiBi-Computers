@@ -165,7 +165,7 @@ interface events {
 - `KibiEventsTest`: 開く・取り出す・`dropped`・フィルター、`max`・`capacity`・`kinds` の境界、`nfile`・`bad-descriptor`
 - `P1CanonicalTest`: 配置、`cabi_realloc` の呼び出しの順と align・size、上限を超えたときに中身を読まないこと、UTF-8・範囲外、書き先と `cabi_realloc` の誤りのトラップ
 - `WasiP1KibiTest`（`kibi_events.c` を Endive とカーネルで）: `poll_oneoff` で待って取り出す（待機点型・ブロッキング型、`[resource-drop]` と `fd_close`）、不正な入力、`max` の境界、`cabi_realloc` の中の燃料切れ、`cabi_realloc` の中の止まりうる import が3つの待ち方のどれでもトラップ
-- `GuestCallGuardTest`（#430・#617）: `callGuest` の中で止まって待つ口（`block`・`callOnMainThread`・`exec`・`execWithHandle`・`awaitHost`、メインスレッドのメソッドの `invokeDevice`、まだ待つ必要のある `waitChild`・`awaitEvents`・`sleep`）がトラップで CRASHED になる（ブロッキング型で確かめる。待機点型で確かめるのは `block`・`callOnMainThread`・メインスレッドのメソッドの `invokeDevice` の3つだけで、待機点型でも IllegalStateException にならない）。直接のメソッドの `invokeDevice`、0 以下の `sleep`、子のない `waitChild`、届いたイベントのある `awaitEvents` は、待たずに返る
+- `GuestCallGuardTest`（#430・#617）: `callGuest` の中で止まって待つ口（`block`・`callOnMainThread`・`exec`・`execWithHandle`・`awaitHost`、メインスレッドのメソッドの `invokeDevice`、まだ待つ必要のある `waitChild`・`awaitEvents`・`sleep`）がトラップで CRASHED になる（ブロッキング型で確かめる。待機点型で確かめるのは `block`・`callOnMainThread`・メインスレッドのメソッドの `invokeDevice` の3つだけで、待機点型でも IllegalStateException にならない）。直接のメソッドの `invokeDevice`、0 以下の `sleep`、子のない `waitChild`（`NoChild`）、もう終わった子の `waitChild`（`callGuest` の外で `childExitKeys` を `block` で待ってから。刈り取って `Reaped`）、届いたイベントのある `awaitEvents` は、待たずに返る
 - `WasiP1ImportCheckTest`: 型違い・表にない関数・版違い・`cabi_realloc` なし・旧名が `NOEXEC`
 
 ## 決めないこと
