@@ -131,6 +131,15 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 - p3 の `input(stream<u8>)`・`capture` は、カーネルのパイプ（ADR 0059）を1本作り、p3 の層がつなぐ（#266）
 - `wasi:*` の版（p2 は `@0.2.3`、p3 は `wasi:filesystem@0.3.0`）は仮（Q9-A）
 
+## テスト
+
+- `WasiP1KibiProcessTest`（`kibi_process.c` を Endive とカーネルで）: p1 の層を通した spawn の振る舞い。この節の検査順の根拠になるもの（#617）
+  - `misaligned`: args・env・fds の list の ptr が align に揃っていなければ、長さ 0 でもトラップ（`UNWIND`・`BLOCK`）
+  - `misaligned-order`: 先の引数の誤り（`path` の `name-too-long`、`args` の個数の `too-big`、`fds` の判別子の `invalid`）は、後の list の align のトラップより先に error-code で返る。`env` が none なら、揃っていない `env_ptr` でも確かめない
+  - `nowait`・`nowait-misaligned`: `P1Wait.NONE` の `again` は、引数を読む前に返る
+  - 検査順を Component Model に揃えるとき（#616）は、`misaligned-order`・`nowait-misaligned` の期待値も合わせて直す
+- `GuestCallGuardTest`: `callGuest` の中の `exec`・`execWithHandle` がトラップになる（ADR 0073）
+
 ## 保存
 
 - 新しい保存の形はない。fd 表の項目（`HandleEntry(objectId = ProcessObject の id, rights = READ)`）と、既存の `ProcessObject`・`Process.parentPid` だけ

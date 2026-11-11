@@ -8,12 +8,14 @@ import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ChildSelector
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.ReapResult
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
@@ -188,5 +190,54 @@ class GuestCallGuardTest {
             assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
             assertEquals(listOf(DeviceValue.of(42L)), got.get())
         }
+    }
+
+    /**
+     * `callGuest` の中から [body] を呼び、待たずに返って EXITED になることを確かめる。[prepare] は `callGuest` の外で呼ぶ。
+     * [body] が返した値を返す
+     */
+    private fun <P, T> assertReturns(
+        prepare: (Machine, ProcessContext) -> P,
+        body: (ProcessContext, P) -> T,
+    ): T? = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val got = AtomicReference<T>()
+            val pid = m.spawnTest(
+                h.program(emptyModule()),
+                TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    val prepared = prepare(m, ctx)
+                    got.set(ctx.callGuest { body(ctx, prepared) })
+                    StepResult.Exit(0)
+                },
+            )
+            h.tickUntilTrue { m.stateOf(pid).isTerminal }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+            got.get()
+        }
+    }
+
+    @Test
+    fun `callGuestの中でも、0以下のsleepは待たずに返る`() {
+        assertReturns({ _, _ -> }) { ctx, _ ->
+            ctx.sleep(0)
+            ctx.sleep(-1)
+        }
+    }
+
+    @Test
+    fun `callGuestの中でも、子がいなければwaitChildは待たずにNoChildを返す`() =
+        assertEquals(ReapResult.NoChild, assertReturns({ _, _ -> }) { ctx, _ -> ctx.waitChild(ChildSelector.Any) })
+
+    @Test
+    fun `callGuestの中でも、イベントが届いていればawaitEventsは待たずに返す`() {
+        val batch = assertReturns(
+            prepare = { m, ctx ->
+                val q = ctx.openEventQueue(EventFilter(setOf("test")))
+                assertEquals(1, m.postEvent(KernelEvent("test")))
+                q
+            },
+        ) { ctx, q -> ctx.awaitEvents(q) }
+        assertEquals(listOf("test"), batch!!.events.map { it.type })
     }
 }
