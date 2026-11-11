@@ -133,9 +133,9 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 
 ## テスト
 
-- `WasiP1KibiProcessTest`（`kibi_process.c` を Endive とカーネルで）: p1 の層を通した spawn の振る舞い。この節の検査順の根拠になるもの（#617）
+- `WasiP1KibiProcessTest`（`kibi_process.c` を Endive とカーネルで）: p1 の層を通した spawn の振る舞い。「振る舞い（p1）」の「spawn」の検査順（`path` → `args` → `env` → `cwd` → `fds`）の根拠になるもの（#617）
   - `misaligned`: args・env・fds の list の ptr が align に揃っていなければ、長さ 0 でもトラップ（`UNWIND`・`BLOCK`）
-  - `misaligned-order`: 先の引数の誤り（`path` の `name-too-long`、`args` の個数の `too-big`、`fds` の判別子の `invalid`）は、後の list の align のトラップより先に error-code で返る。`env` が none なら、揃っていない `env_ptr` でも確かめない
+  - `misaligned-order`: 先の引数の誤り（`path` の `name-too-long`、`args` の個数の `too-big`、`env` の `option` の判別子の `invalid`）は、後の list（`args`・`env`・`fds`）の ptr が揃っていないトラップより先に error-code で返る。`fds` の `fd-source` の判別子の誤りは、このテストでは確かめない。`env` が none なら、揃っていない `env_ptr` でも確かめない
   - `nowait`・`nowait-misaligned`: `P1Wait.NONE` の `again` は、引数を読む前に返る
   - 検査順を Component Model に揃えるとき（#616）は、`misaligned-order`・`nowait-misaligned` の期待値も合わせて直す
 - `GuestCallGuardTest`: `callGuest` の中の `exec`・`execWithHandle` がトラップになる（ADR 0073）
