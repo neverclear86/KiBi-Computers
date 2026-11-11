@@ -508,4 +508,312 @@ class DiskFileSystemTest {
         assertTrue(fs.adoptNode(50, p("/a/gone.txt"), FileType.REGULAR_FILE))
         errno(Errno.STALE) { fs.read(50, 0, ByteArray(1), 0, 1) }
     }
+
+    // ---- #433: 名前の引き方と、大文字小文字の端のケース ----
+
+    private fun hostNames(sub: String = ""): List<String> =
+        Files.list(dir.resolve("disk").resolve(sub)).use { s -> s.map { it.fileName.toString() }.sorted().toList() }
+
+    @Test
+    fun `Windowsの特殊な名前と8点3形式の短い名前の形は、どのOSでも使えない`() {
+        for (name in listOf("CONIN$", "conout$", "Clock$.txt", "conin$ .log", "ABCDEF~1", "ab12~1.txt", "~1", "A~12.TXT", "abcdef~9.c")) {
+            assertFalse(DiskNames.isValid(name), name)
+        }
+        for (name in listOf("conin", "CONIN$$", "foo~bar", "abcdefghi~1", "a~1.html", "a~1.b.c", "a~", "~", "a~x1", ".kibi-rename-1", "x~1y")) {
+            assertTrue(DiskNames.isValid(name), name)
+        }
+        val fs = disk()
+        for (name in listOf("CONIN$", "CLOCK$.txt", "PROGRA~1", "abcdef~1.txt")) {
+            errno(Errno.INVAL) { fs.createFile(p("/").child(name)) }
+            errno(Errno.NOENT) { fs.stat(p("/").child(name)) }
+        }
+        fs.writeAll("/ok", "1")
+        errno(Errno.INVAL) { fs.rename(p("/ok"), p("/ok~1")) }
+        assertEquals(listOf("ok"), hostNames())
+    }
+
+    @Test
+    fun `大文字小文字をそろえる比べ方はfoldと同じ`() {
+        for ((a, b) in listOf("abc" to "ABC", "Straße" to "STRAßE", "ǆ" to "Ǆ", "a" to "b", "ab" to "abc", "ﬀ" to "FF")) {
+            assertEquals(DiskNames.fold(a) == DiskNames.fold(b), DiskNames.sameName(a, b), "$a / $b")
+        }
+    }
+
+    @Test
+    fun `Windowsの8点3形式の別名では引けず、作れない`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("abcdefghij.txt"), "long")
+        assumeTrue(Files.exists(d.resolve("ABCDEF~1.TXT")), "8.3 形式の短い名前があるホストだけ")
+        val fs = disk()
+        errno(Errno.NOENT) { fs.stat(p("/ABCDEF~1.TXT")) }
+        errno(Errno.INVAL) { fs.createFile(p("/ABCDEF~1.TXT")) }
+        fs.writeAll("/x", "x")
+        errno(Errno.INVAL) { fs.rename(p("/x"), p("/abcdef~1.txt")) }
+        assertEquals("long", Files.readString(d.resolve("abcdefghij.txt")))
+    }
+
+    @Test
+    fun `大文字小文字だけ違う名前が2つあれば、引くときも一覧と同じ項目を選ぶ`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.createDirectory(d.resolve("a"))
+        val upper = d.resolve("A")
+        assumeTrue(runCatching { Files.writeString(upper, "upper") }.isSuccess && Files.list(d).use { it.count() } == 2L, "大文字小文字を区別するホストだけ")
+        val fs = disk()
+        val listed = fs.readDirectory(DiskFileSystem.ROOT_NODE).single()
+        assertEquals("A", listed.name)
+        assertEquals(FileType.REGULAR_FILE, listed.type)
+        val st = fs.stat(p("/a"))
+        assertEquals(FileType.REGULAR_FILE, st.type)
+        assertEquals(listed.node, st.node)
+        assertEquals(FileType.REGULAR_FILE, fs.statNode(st.node).type, "STALE にならない")
+        errno(Errno.NOTDIR) { fs.stat(p("/a/x")) }
+        assertEquals("upper", fs.readAll(st.node))
+        assertEquals(p("/A"), fs.pathOf(st.node))
+    }
+
+    @Test
+    fun `大文字小文字だけ違う名前の先がシンボリックリンクなら、見せるほうを選ぶ`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("a"), "lower")
+        assumeTrue(
+            runCatching { Files.createSymbolicLink(d.resolve("A"), d.resolve("a")) }.isSuccess && Files.list(d).use { it.count() } == 2L,
+            "大文字小文字を区別し、リンクを作れるホストだけ",
+        )
+        val fs = disk()
+        assertEquals(listOf("a"), fs.readDirectory(DiskFileSystem.ROOT_NODE).map { it.name })
+        assertEquals("lower", fs.readAll(fs.stat(p("/A")).node))
+    }
+
+    @Test
+    fun `大文字小文字だけ違う自分の下への名前の変更はINVALで、ホストに触らない`() {
+        val fs = disk()
+        fs.createDirectory(p("/d"))
+        fs.createDirectory(p("/d/e"))
+        errno(Errno.INVAL) { fs.rename(p("/d"), p("/D/x")) }
+        errno(Errno.INVAL) { fs.rename(p("/d"), p("/D/E/x")) }
+        errno(Errno.INVAL) { fs.rename(p("/d"), p("/D/E")) }
+        assertEquals(listOf("d"), hostNames())
+        assertEquals(listOf("e"), hostNames("d"))
+        // 名前の頭だけが同じものは、下ではない
+        fs.createDirectory(p("/dd"))
+        fs.rename(p("/d"), p("/DD/x"))
+        assertEquals(listOf("x"), hostNames("dd"))
+    }
+
+    @Test
+    fun `大文字小文字だけ違う項目を置き換える名前の変更`() {
+        val fs = disk()
+        val old = fs.writeAll("/Foo", "old")
+        val src = fs.writeAll("/bar", "new!")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        fs.rename(p("/bar"), p("/foo"))
+        assertEquals(listOf("foo"), hostNames())
+        assertEquals("new!", Files.readString(dir.resolve("disk/foo")))
+        assertEquals(src, fs.stat(p("/FOO")).node)
+        assertEquals(p("/foo"), fs.pathOf(src))
+        errno(Errno.STALE) { fs.statNode(old) }
+        assertEquals(entries - 1, fs.usedEntries)
+        assertEquals(bytes - 3 - DiskFileSystem.ENTRY_COST, fs.usedBytes)
+        // ディレクトリ: 空のディレクトリを置き換える
+        fs.createDirectory(p("/Dst"))
+        fs.createDirectory(p("/src"))
+        val inner = fs.writeAll("/src/f", "f")
+        fs.rename(p("/src"), p("/dst"))
+        assertEquals(listOf("dst", "foo"), hostNames())
+        assertEquals(listOf("f"), hostNames("dst"))
+        assertEquals(p("/dst/f"), fs.pathOf(inner))
+        assertEquals("f", fs.readAll(fs.stat(p("/DST/F")).node))
+    }
+
+    @Test
+    fun `置き換えるホストのmoveが失敗したら、何も変わらない`() {
+        val fs = disk()
+        val old = fs.writeAll("/Foo", "old")
+        val src = fs.writeAll("/bar", "new!")
+        fs.createDirectory(p("/Dst"))
+        fs.createDirectory(p("/src"))
+        fs.writeAll("/src/f", "f")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        val before = hostNames()
+        // 置き換えの move（ファイル: 1手目。ディレクトリ: src を移す2手目）を失敗させる
+        fs.beforeHostMove = { from, _ -> if (from.fileName.toString() in setOf("bar", "src")) throw java.io.IOException("boom") }
+        errno(Errno.IO) { fs.rename(p("/bar"), p("/foo")) }
+        errno(Errno.IO) { fs.rename(p("/src"), p("/dst")) }
+        fs.beforeHostMove = null
+        assertEquals(before, hostNames())
+        assertEquals("old", Files.readString(dir.resolve("disk/Foo")))
+        assertEquals(old, fs.stat(p("/foo")).node)
+        assertEquals(src, fs.stat(p("/bar")).node)
+        assertEquals(listOf("f"), hostNames("src"))
+        assertTrue(hostNames("Dst").isEmpty())
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+    }
+
+    @Test
+    fun `置き換えた後に名前をそろえられなければ、古い大文字小文字のまま成功する`() {
+        val fs = disk()
+        fs.writeAll("/Foo", "old")
+        val src = fs.writeAll("/bar", "new!")
+        // 一時的な名前から新しい名前（foo）への move を失敗させる
+        fs.beforeHostMove = { _, to -> if (to.fileName.toString() == "foo") throw java.io.IOException("boom") }
+        fs.rename(p("/bar"), p("/foo"))
+        fs.beforeHostMove = null
+        assertEquals(listOf("Foo"), hostNames(), "一時的な名前は残らない")
+        assertEquals("new!", Files.readString(dir.resolve("disk/Foo")))
+        assertEquals(src, fs.stat(p("/foo")).node)
+        assertEquals(p("/Foo"), fs.pathOf(src))
+    }
+
+    @Test
+    fun `置き換えた後に名前をそろえられず、戻せもしなければ、一時的な名前に残して失敗にする`() {
+        val fs = disk()
+        val old = fs.writeAll("/Foo", "old")
+        val src = fs.writeAll("/bar", "new!")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // 置き換えの後の、一時的な名前からの move（新しい名前への2手目と、元の名前へ戻す手）を失敗させる
+        fs.beforeHostMove = { from, _ -> if (from.fileName.toString().startsWith(".kibi-rename-")) throw java.io.IOException("boom") }
+        errno(Errno.IO) { fs.rename(p("/bar"), p("/foo")) }
+        fs.beforeHostMove = null
+        val temp = hostNames().single()
+        assertTrue(temp.startsWith(".kibi-rename-"), temp)
+        assertEquals("new!", Files.readString(dir.resolve("disk/$temp")))
+        // 表はホストに合わせる（置き換えは済んでいる）
+        errno(Errno.NOENT) { fs.stat(p("/foo")) }
+        assertEquals(src, fs.stat(p("/$temp")).node)
+        assertEquals(p("/$temp"), fs.pathOf(src))
+        errno(Errno.STALE) { fs.statNode(old) }
+        assertEquals(entries - 1, fs.usedEntries)
+        assertEquals(bytes - 3 - DiskFileSystem.ENTRY_COST, fs.usedBytes)
+    }
+
+    @Test
+    fun `空のディレクトリの置き換えで、退かしたものを戻せなければ、表をその一時的な名前に合わせて失敗にする`() {
+        val fs = disk()
+        fs.createDirectory(p("/Dst"))
+        val old = fs.stat(p("/Dst")).node
+        fs.createDirectory(p("/src"))
+        val src = fs.stat(p("/src")).node
+        val inner = fs.writeAll("/src/f", "f")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // src を移す手と、退かしたものを戻す手を失敗させる
+        fs.beforeHostMove = { from, _ ->
+            if (from.fileName.toString() == "src" || from.fileName.toString().startsWith(".kibi-rename-")) throw java.io.IOException("boom")
+        }
+        errno(Errno.IO) { fs.rename(p("/src"), p("/dst")) }
+        fs.beforeHostMove = null
+        val temp = hostNames().single { it.startsWith(".kibi-rename-") }
+        assertEquals(listOf(temp, "src"), hostNames())
+        assertEquals(old, fs.stat(p("/$temp")).node)
+        assertEquals(p("/$temp"), fs.pathOf(old))
+        assertEquals(src, fs.stat(p("/src")).node)
+        assertEquals(p("/src/f"), fs.pathOf(inner))
+        errno(Errno.NOENT) { fs.stat(p("/dst")) }
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+    }
+
+    @Test
+    fun `空のディレクトリの置き換えで、退かしたものを消せなければ、その項目を数えたままにする`() {
+        val fs = disk()
+        fs.createDirectory(p("/Dst"))
+        fs.createDirectory(p("/src"))
+        val inner = fs.writeAll("/src/f", "f")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // src を移す手の前に、退かしたものへ外からファイルを置く（消そうとすると DirectoryNotEmpty）
+        fs.beforeHostMove = { from, _ ->
+            if (from.fileName.toString() == "src") {
+                val aside = hostNames().single { it.startsWith(".kibi-rename-") }
+                Files.writeString(dir.resolve("disk/$aside/outside"), "x")
+            }
+        }
+        fs.rename(p("/src"), p("/dst"))
+        fs.beforeHostMove = null
+        val temp = hostNames().single { it.startsWith(".kibi-rename-") }
+        assertEquals(p("/dst/f"), fs.pathOf(inner))
+        // 残った項目は見える名前で、数えたまま（置き換えで項目は増えも減りもしない）
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+        // 外のファイルがなくなれば、ゲームの中から消せる。消せば1項目ぶん減るだけで、負にならない
+        Files.delete(dir.resolve("disk/$temp/outside"))
+        fs.removeDirectory(p("/$temp"))
+        assertEquals(entries - 1, fs.usedEntries)
+        assertEquals(bytes - DiskFileSystem.ENTRY_COST, fs.usedBytes)
+        assertEquals(listOf("dst"), hostNames())
+    }
+
+    @Test
+    fun `大文字小文字だけの名前の変更が失敗したら、元の名前に戻す`() {
+        val fs = disk()
+        val node = fs.writeAll("/foo", "x")
+        fs.beforeHostMove = { _, to -> if (to.fileName.toString() == "Foo") throw java.io.IOException("boom") }
+        errno(Errno.IO) { fs.rename(p("/foo"), p("/Foo")) }
+        fs.beforeHostMove = null
+        assertEquals(listOf("foo"), hostNames())
+        assertEquals(node, fs.stat(p("/FOO")).node)
+        assertEquals(p("/foo"), fs.pathOf(node))
+    }
+
+    @Test
+    fun `大文字小文字だけの名前の変更で、見せていない大文字小文字違いがホストにあれば、それを消さずにEXIST`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("a"), "lower")
+        assumeTrue(
+            runCatching { Files.writeString(d.resolve("A"), "upper") }.isSuccess && Files.list(d).use { it.count() } == 2L,
+            "大文字小文字を区別するホストだけ",
+        )
+        val fs = disk()
+        // 見せるのは名前の順で先の A。a は外から置いた、見せていないもの
+        val node = fs.stat(p("/A")).node
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        errno(Errno.EXIST) { fs.rename(p("/A"), p("/a")) }
+        assertEquals(listOf("A", "a"), hostNames(), "一時的な名前は残らない")
+        assertEquals("upper", Files.readString(d.resolve("A")))
+        assertEquals("lower", Files.readString(d.resolve("a")))
+        assertEquals(node, fs.stat(p("/a")).node)
+        assertEquals(p("/A"), fs.pathOf(node))
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+    }
+
+    @Test
+    fun `大文字小文字違いを置き換える名前の変更で、見せていない新しい大文字小文字がホストにあれば、それを消さずに古い大文字小文字で成功する`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("foo"), "outside")
+        assumeTrue(
+            runCatching { Files.writeString(d.resolve("Foo"), "old") }.isSuccess && Files.list(d).use { it.count() } == 2L,
+            "大文字小文字を区別するホストだけ",
+        )
+        val fs = disk()
+        // 見せるのは名前の順で先の Foo
+        val old = fs.stat(p("/foo")).node
+        assertEquals(p("/Foo"), fs.pathOf(old))
+        val src = fs.writeAll("/bar", "new!")
+        fs.rename(p("/bar"), p("/foo"))
+        assertEquals(listOf("Foo", "foo"), hostNames(), "一時的な名前は残らない")
+        assertEquals("new!", Files.readString(d.resolve("Foo")))
+        assertEquals("outside", Files.readString(d.resolve("foo")), "外のものは消さない")
+        assertEquals(src, fs.stat(p("/foo")).node)
+        assertEquals(p("/Foo"), fs.pathOf(src))
+        errno(Errno.STALE) { fs.statNode(old) }
+        errno(Errno.NOENT) { fs.stat(p("/bar")) }
+    }
+
+    @Test
+    fun `見せていないホストの項目への名前の変更は、それを消さずにEXIST`() {
+        val outside = Files.createDirectories(dir.resolve("outside"))
+        val d = Files.createDirectories(dir.resolve("disk"))
+        assumeTrue(runCatching { Files.createSymbolicLink(d.resolve("link"), outside) }.isSuccess, "シンボリックリンクを作れるホストだけ")
+        val fs = disk()
+        val node = fs.writeAll("/f", "x")
+        errno(Errno.EXIST) { fs.rename(p("/f"), p("/link")) }
+        assertTrue(Files.isSymbolicLink(d.resolve("link")))
+        assertEquals(node, fs.stat(p("/f")).node)
+    }
 }
