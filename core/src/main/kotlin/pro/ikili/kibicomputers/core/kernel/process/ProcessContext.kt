@@ -70,9 +70,10 @@ internal interface ProcessContext {
     /**
      * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: このプロセスを親にして、VFS の実行ファイル [path]
      * （相対パスは作業ディレクトリから）からプロセスを作る（`Machine.exec`）。WASM の読み込み（コンパイル）を待つ間は、CPU と許可を返して止まる。
-     * 待機点型は [beginExec]・[finishExec] で、スレッドを持たずに待つ（#358）。カーネルロックを持たずに呼ぶ。戻り値は子の pid
+     * 待機点型は [beginExec]・[finishExec] で、スレッドを持たずに待つ（#358）。カーネルロックを持たずに呼ぶ。戻り値は子の pid。
+     * [callGuest] の中では [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(FsException::class, ProcessKilledException::class)
+    @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
     fun exec(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): Int
 
     /**
@@ -95,9 +96,10 @@ internal interface ProcessContext {
      * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [exec] と同じだが、子の `ProcessObject` を指す fd（読む権利だけ）を
      * 自分の fd 表に入れ、子の pid と一緒に返す（`kibi:process` の `[static]process.spawn`。#74、ADR 0074）。
      * fd は子を表に足すのと同じカーネルロックの中で入れるので、子は fd が入る前に動き出さない。
-     * fd 表が満杯なら、読み込みの前と子を作る前に確かめて `MFILE`（子を作ってから断らない）。カーネルロックを持たずに呼ぶ
+     * fd 表が満杯なら、読み込みの前と子を作る前に確かめて `MFILE`（子を作ってから断らない）。カーネルロックを持たずに呼ぶ。
+     * [callGuest] の中では [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(FsException::class, ProcessKilledException::class)
+    @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
     fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions = SpawnOptions()): ProcessHandle
 
     /**
@@ -149,9 +151,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: 終わった子を刈り取るまで待つ（[tryReap] が `Running` なら [block] で待ち直す）。
-     * [ReapResult.Running] は返さない
+     * [ReapResult.Running] は返さない。[callGuest] の中で待つ（まだ走っている子を待つ）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class)
+    @Throws(ProcessKilledException::class, WasmTrapException::class)
     fun waitChild(selector: ChildSelector): ReapResult
 
     /**
@@ -187,9 +189,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: イベントキュー [handle] にイベントが1つ以上あるか、あふれて捨てた分があるまで [block] で待ってから取り出す。
-     * 返す結果は空でない
+     * 返す結果は空でない。[callGuest] の中で待つ（キューが空）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(FsException::class, ProcessKilledException::class)
+    @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
     fun awaitEvents(handle: Int, max: Int = Int.MAX_VALUE): EventBatch
 
     // ---- 時計・タイマー（#64、ADR 0064。WASM に見せる形は #72・#73・#264・#266） ----
@@ -252,9 +254,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: [nanos] の間、[block] で止まる（0 以下ならすぐ返る）。ハンドル表を使わない一時的なタイマー（[openWaitTimer]）で待つ。
-     * マシンの動いているタイマーが上限なら [ResourceLimitException]
+     * マシンの動いているタイマーが上限なら [ResourceLimitException]。[callGuest] の中で待つ（[nanos] が正）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class, ResourceLimitException::class)
+    @Throws(ProcessKilledException::class, ResourceLimitException::class, WasmTrapException::class)
     fun sleep(nanos: Long)
 
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
@@ -302,16 +304,18 @@ internal interface ProcessContext {
     /**
      * `BLOCKING` のとき（と、どちらの型でも作っている途中のとき）、[keys] のどれかがそろうまで止まる
      * （CPU と許可を返し、今の holder の手持ちを書き戻す）。最初からそろっていれば、CPU を持ったまますぐ返る。
-     * 起こされても、そろった key が空なら待ち直す。戻り値は空でない
+     * 起こされても、そろった key が空なら待ち直す。戻り値は空でない。
+     * [callGuest] の中（[inGuestCall]）では止まれないので、[WasmTrapException] を投げる（ホスト関数の途中は巻き戻せない。ADR 0073。#430）
      */
-    @Throws(ProcessKilledException::class)
+    @Throws(ProcessKilledException::class, WasmTrapException::class)
     fun block(keys: List<WaitKey>): List<WaitKey>
 
     /**
      * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: 接続層での処理の結果を待つ（CPU と許可を返し、手持ちの燃料を書き戻す）。
-     * future の例外は CPU を取り直してから投げる。待機点型は [watchHost] で、スレッドを持たずに待つ（#358）
+     * future の例外は CPU を取り直してから投げる。待機点型は [watchHost] で、スレッドを持たずに待つ（#358）。
+     * [callGuest] の中では [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class)
+    @Throws(ProcessKilledException::class, WasmTrapException::class)
     fun <T> awaitHost(future: CompletableFuture<T>): T
 
     /**
@@ -355,7 +359,10 @@ internal interface ProcessContext {
 
     /**
      * ホスト関数の中からゲストの export（`cabi_realloc` など。#73）を呼ぶときに、[block] を包む。包んでいる間は [inGuestCall] が立ち、
-     * 燃料が切れても巻き戻さず（待機点型でも）、スレッドを持ったまま燃料を待つ。入れ子にしてよい。プロセスのスレッドから呼ぶ
+     * 燃料が切れても巻き戻さず（待機点型でも）、スレッドを持ったまま燃料を待つ。入れ子にしてよい。プロセスのスレッドから呼ぶ。
+     * 包んでいる間は、止まって待つ口が [WasmTrapException] を投げる: [block]・[exec]・[execWithHandle]・[awaitHost]・[callOnMainThread]、
+     * メインスレッドのメソッドを待つ [invokeDevice]、[block] を通って待つ [waitChild]・[awaitEvents]・[sleep]（この3つは待たずに返せるときは返す）。止まれないのは、ホスト関数の途中は巻き戻せず、ブロッキング型でも呼び出し元の途中で止まることになるため（ADR 0073。#430）。
+     * ABI の層は、止まりうる import をこれらに届く前に入口で弾く（それでも届いた分の守り）。待たない口（[submitHostCall]・[watchHost] など）は呼んでよい
      */
     fun <T> callGuest(block: () -> T): T
 
@@ -393,9 +400,10 @@ internal interface ProcessContext {
      * ワールド・デバイスに触る処理はこれで行う。[call] の例外は、CPU を取り直してから投げる。
      * マシンを止めたとき・このプロセスを止めたとき（[kill]、Ctrl+C）は [ProcessKilledException]（実行していない呼び出しは実行しない）。
      * 取り消すのはまだ列にあるものだけで、メインスレッドがもう実行し始めた呼び出しは最後まで実行する
-     * （途中で止めるとワールドが半端な状態になるため。結果は捨てる）
+     * （途中で止めるとワールドが半端な状態になるため。結果は捨てる）。
+     * [callGuest] の中では [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class)
+    @Throws(ProcessKilledException::class, WasmTrapException::class)
     fun <T> callOnMainThread(call: HostCall<T>): T
 
     /**
@@ -426,9 +434,10 @@ internal interface ProcessContext {
     /**
      * デバイス [address] のメソッド [method] を [args] で呼び、結果まで待つ（WIT の `invoke`）。燃料を払う（ADR 0065）。
      * 直接のメソッドはこのスレッドで実行する。メインスレッドのメソッドを待てるのは、ブロッキング型（と作っている途中）だけ
-     * （待機点型は [startDeviceCall] で積んで、fd を待つ）。失敗は [DeviceCallException]。カーネルロックを持たずに呼ぶ
+     * （待機点型は [startDeviceCall] で積んで、fd を待つ）。失敗は [DeviceCallException]。カーネルロックを持たずに呼ぶ。
+     * メインスレッドのメソッドを待つ呼び出しは、[callGuest] の中では [WasmTrapException]（[block] と同じ。#430。直接のメソッドは待たないので呼べる）
      */
-    @Throws(DeviceCallException::class, ProcessKilledException::class)
+    @Throws(DeviceCallException::class, ProcessKilledException::class, WasmTrapException::class)
     fun invokeDevice(address: String, method: String, args: List<DeviceValue>): List<DeviceValue>
 
     /**

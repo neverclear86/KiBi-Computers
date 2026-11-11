@@ -6,6 +6,9 @@
 //   kibi-events spin           wait と同じだが、取り出すときの cabi_realloc の中で重い計算をする
 //   kibi-events realloc-poll   取り出すときの cabi_realloc の中で poll_oneoff を呼ぶ（トラップになるはず）
 //   kibi-events realloc-write  取り出すときの cabi_realloc の中で fd_write を呼ぶ（トラップになるはず）
+//   kibi-events drop <場合>    不正なハンドルを [resource-drop] に渡す（トラップになるはず。#430）。場合は
+//                              unopened（開いていない fd 999）・nonqueue（キューでない fd 1）・twice（一度閉じたキュー）・max（0xffffffff）
+//   kibi-events misaligned [len]  align 4 に揃っていない kinds の ptr で open する（長さ既定 1。トラップになるはず。#430）
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -198,6 +201,38 @@ static int run_in_realloc(int mode) {
     return 0;
 }
 
+static int run_drop(const char *which) {
+    int32_t fd;
+    if (strcmp(which, "unopened") == 0) {
+        fd = 999;
+    } else if (strcmp(which, "nonqueue") == 0) {
+        fd = 1;
+    } else if (strcmp(which, "twice") == 0) {
+        fd = open_queue(NULL, 0, 0, 0);
+        if (fd < 0) return 1;
+        kibi_event_queue_drop(fd);
+        printf("dropped once\n");
+    } else if (strcmp(which, "max") == 0) {
+        fd = (int32_t)0xffffffffu;
+    } else {
+        return 2;
+    }
+    printf("dropping\n");
+    kibi_event_queue_drop(fd);
+    printf("returned\n");
+    return 0;
+}
+
+static int run_misaligned(uint32_t len) {
+    static kibi_string_t kinds[2];
+    kinds[0] = str("test");
+    kinds[1] = str("test");
+    printf("opening\n");
+    int32_t q = open_queue((const kibi_string_t *)((uintptr_t)kinds + 2), len, 0, 0);
+    printf("returned %d\n", q);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) return 2;
@@ -211,5 +246,7 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "max") == 0) return run_max();
     if (strcmp(mode, "realloc-poll") == 0) return run_in_realloc(MODE_POLL);
     if (strcmp(mode, "realloc-write") == 0) return run_in_realloc(MODE_WRITE);
+    if (strcmp(mode, "drop") == 0 && argc > 2) return run_drop(argv[2]);
+    if (strcmp(mode, "misaligned") == 0) return run_misaligned(argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 10) : 1);
     return 2;
 }
