@@ -668,6 +668,86 @@ class DiskFileSystemTest {
     }
 
     @Test
+    fun `置き換えた後に名前をそろえられず、戻せもしなければ、一時的な名前に残して失敗にする`() {
+        val fs = disk()
+        val old = fs.writeAll("/Foo", "old")
+        val src = fs.writeAll("/bar", "new!")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // 置き換えの後の、一時的な名前からの move（新しい名前への2手目と、元の名前へ戻す手）を失敗させる
+        fs.beforeHostMove = { from, _ -> if (from.fileName.toString().startsWith(".kibi-rename-")) throw java.io.IOException("boom") }
+        errno(Errno.IO) { fs.rename(p("/bar"), p("/foo")) }
+        fs.beforeHostMove = null
+        val temp = hostNames().single()
+        assertTrue(temp.startsWith(".kibi-rename-"), temp)
+        assertEquals("new!", Files.readString(dir.resolve("disk/$temp")))
+        // 表はホストに合わせる（置き換えは済んでいる）
+        errno(Errno.NOENT) { fs.stat(p("/foo")) }
+        assertEquals(src, fs.stat(p("/$temp")).node)
+        assertEquals(p("/$temp"), fs.pathOf(src))
+        errno(Errno.STALE) { fs.statNode(old) }
+        assertEquals(entries - 1, fs.usedEntries)
+        assertEquals(bytes - 3 - DiskFileSystem.ENTRY_COST, fs.usedBytes)
+    }
+
+    @Test
+    fun `空のディレクトリの置き換えで、退かしたものを戻せなければ、表をその一時的な名前に合わせて失敗にする`() {
+        val fs = disk()
+        fs.createDirectory(p("/Dst"))
+        val old = fs.stat(p("/Dst")).node
+        fs.createDirectory(p("/src"))
+        val src = fs.stat(p("/src")).node
+        val inner = fs.writeAll("/src/f", "f")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // src を移す手と、退かしたものを戻す手を失敗させる
+        fs.beforeHostMove = { from, _ ->
+            if (from.fileName.toString() == "src" || from.fileName.toString().startsWith(".kibi-rename-")) throw java.io.IOException("boom")
+        }
+        errno(Errno.IO) { fs.rename(p("/src"), p("/dst")) }
+        fs.beforeHostMove = null
+        val temp = hostNames().single { it.startsWith(".kibi-rename-") }
+        assertEquals(listOf(temp, "src"), hostNames())
+        assertEquals(old, fs.stat(p("/$temp")).node)
+        assertEquals(p("/$temp"), fs.pathOf(old))
+        assertEquals(src, fs.stat(p("/src")).node)
+        assertEquals(p("/src/f"), fs.pathOf(inner))
+        errno(Errno.NOENT) { fs.stat(p("/dst")) }
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+    }
+
+    @Test
+    fun `空のディレクトリの置き換えで、退かしたものを消せなければ、その項目を数えたままにする`() {
+        val fs = disk()
+        fs.createDirectory(p("/Dst"))
+        fs.createDirectory(p("/src"))
+        val inner = fs.writeAll("/src/f", "f")
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        // src を移す手の前に、退かしたものへ外からファイルを置く（消そうとすると DirectoryNotEmpty）
+        fs.beforeHostMove = { from, _ ->
+            if (from.fileName.toString() == "src") {
+                val aside = hostNames().single { it.startsWith(".kibi-rename-") }
+                Files.writeString(dir.resolve("disk/$aside/outside"), "x")
+            }
+        }
+        fs.rename(p("/src"), p("/dst"))
+        fs.beforeHostMove = null
+        val temp = hostNames().single { it.startsWith(".kibi-rename-") }
+        assertEquals(p("/dst/f"), fs.pathOf(inner))
+        // 残った項目は見える名前で、数えたまま（置き換えで項目は増えも減りもしない）
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+        // 外のファイルがなくなれば、ゲームの中から消せる。消せば1項目ぶん減るだけで、負にならない
+        Files.delete(dir.resolve("disk/$temp/outside"))
+        fs.removeDirectory(p("/$temp"))
+        assertEquals(entries - 1, fs.usedEntries)
+        assertEquals(bytes - DiskFileSystem.ENTRY_COST, fs.usedBytes)
+        assertEquals(listOf("dst"), hostNames())
+    }
+
+    @Test
     fun `大文字小文字だけの名前の変更が失敗したら、元の名前に戻す`() {
         val fs = disk()
         val node = fs.writeAll("/foo", "x")

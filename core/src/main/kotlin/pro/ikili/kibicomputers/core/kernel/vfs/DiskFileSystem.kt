@@ -186,7 +186,8 @@ internal class DiskFileSystem private constructor(
     /**
      * 名前の変更。ホストの操作を先に済ませ、node の表と使用量は最後に直す（途中で失敗しても、表と使用量がホストと食い違わない。#433）。
      * 置き換えは [replaceHost]、大文字小文字だけの変更は [renameCase]。置き換え先の大文字小文字が違えば、置き換えてから名前をそろえる
-     * （そろえるのに失敗しても、古い大文字小文字のまま成功にする。そろえれば同じ名前なので）
+     * （そろえるのに失敗しても、元の大文字小文字へ戻せていれば、古い大文字小文字のまま成功にする。そろえれば同じ名前なので。
+     * 戻せずに一時的な名前に残ったときは、表をその名前に合わせて失敗にする）
      */
     override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean): Unit = io {
         writable()
@@ -220,16 +221,21 @@ internal class DiskFileSystem private constructor(
         if (old.type == FileType.DIRECTORY && hasVisibleChildren(old.segments)) fsError(Errno.NOTEMPTY)
         // 置き換えられる側の開いたままのファイルは閉じる（閉じても、次の操作がその場で開き直すだけ）
         closeHandle(old.node)
-        replaceHost(hostPath(src.segments), old.segments, old.type == FileType.DIRECTORY)
+        val leftover = replaceHost(hostPath(src.segments), old.segments, old.type == FileType.DIRECTORY)
         // ここから先は、ホストでは置き換えが済んでいる。forget は relocate より先（鍵が同じなので、後だと移したものを消す）
         forget(old.node)
-        usedBytes -= (if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST
-        usedEntries--
+        if (!leftover) {
+            // 退かしたものが残ったときは、その空のディレクトリが見える項目として残るので、古い項目の分は数えたままにする
+            usedBytes -= (if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST
+            usedEntries--
+        }
         relocate(src.segments, old.segments)
         if (old.segments.last() != to.name) {
-            // 名前を新しい大文字小文字にそろえる。失敗しても置き換えは済んでいるので、古い大文字小文字のまま成功にする
-            val (moved, _) = renameCase(old.segments, target)
+            // 名前を新しい大文字小文字にそろえる。置き換えは済んでいるので、元の大文字小文字へ戻せたなら（moved == old.segments）、
+            // 古い大文字小文字のまま成功にする。一時的な名前に残ったときは、表をそこへ付け替えて失敗にする（成功と言わない）
+            val (moved, error) = renameCase(old.segments, target)
             relocate(old.segments, moved)
+            if (error != null && moved != old.segments) throw error
         }
     }
 
@@ -595,15 +601,19 @@ internal class DiskFileSystem private constructor(
      *   `REPLACE_EXISTING` だけの move は、先に置き換え先を消してから移すので、移すのに失敗すると置き換え先が消える
      * - ディレクトリ（空なのは確かめ済み）: Windows は既存のディレクトリを `MoveFileEx` で置き換えられないので、どの OS でも同じ手順にする。
      *   古いものを一時的な名前へ退かし、[src] を移し、成功したら退かしたものを消す。移すのに失敗したら、退かしたものを戻す。
-     *   退かしたものを消せなかったときは、空のディレクトリのまま残す（置き換えは成功）
+     *   退かしたものを消せなかったときは、空のディレクトリのまま残す（置き換えは成功）。戻せなかったときは、退かしたものの表を
+     *   一時的な名前へ付け替えて失敗にする
+     *
+     * @return 退かしたものが空のディレクトリとして残ったか（残れば、使用量にその1項目を数えたままにする）
      */
-    private fun replaceHost(src: Path, oldSegments: List<String>, directory: Boolean) {
+    private fun replaceHost(src: Path, oldSegments: List<String>, directory: Boolean): Boolean {
         val dst = hostPath(oldSegments)
         if (!directory) {
             host { moveHost(src, dst, StandardCopyOption.ATOMIC_MOVE) }
-            return
+            return false
         }
-        val aside = hostPath(oldSegments.dropLast(1) + tempName())
+        val asideSegments = oldSegments.dropLast(1) + tempName()
+        val aside = hostPath(asideSegments)
         host { moveHost(dst, aside) }
         try {
             host { moveHost(src, dst) }
@@ -611,14 +621,17 @@ internal class DiskFileSystem private constructor(
             try {
                 host { moveHost(aside, dst) }
             } catch (ignored: FsException) {
-                // 戻せなければ、退かした空のディレクトリが一時的な名前のまま残る
+                // 戻せなければ、退かした空のディレクトリが一時的な名前のまま残る。表もそこへ合わせる
+                relocate(oldSegments, asideSegments)
             }
             throw e
         }
-        try {
+        return try {
             host { Files.delete(aside) }
+            false
         } catch (ignored: FsException) {
             // 空のディレクトリが残るだけ
+            true
         }
     }
 
