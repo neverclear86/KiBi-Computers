@@ -2417,6 +2417,8 @@ public class Machine private constructor(
         if (consoleHold == null) resumeDeferredConsole(out)
         while (true) {
             val n = notifications.poll() ?: break
+            // 前の通知の中で止めるのをやめたなら、取っておいた分を、後ろの通知より先に配る（書いた順。#435）
+            if (consoleHold == null) resumeDeferredConsole(out)
             if (n is HostNotification.Console || n === HostNotification.TtyOutput) {
                 // 止めている間は、書いた順に取っておく（配っていないバイト数は、配るまで減らさない。TTY の印は下ろさない）
                 if (consoleHold != null) deferConsole(n) else out.add(n)

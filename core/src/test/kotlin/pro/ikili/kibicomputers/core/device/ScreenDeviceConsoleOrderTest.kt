@@ -150,4 +150,25 @@ class ScreenDeviceConsoleOrderTest {
             assertEquals(listOf("E1", "K1", "E2"), rest, "${lines(e.screen)}")
         }
     }
+
+    @Test
+    fun `通知の中で止めるのをやめても、取っておいた分は後のカーネルのメッセージより先に出る`() = timeout(limit) {
+        env { e ->
+            e.console.cellsPerTick = 40
+            e.console.write(ByteArray(600) { 'x'.code.toByte() })
+            assertTrue(e.machine.consoleOutputHeld)
+            e.machine.offerConsoleInput("E1\n".toByteArray())
+            e.machine.writeConsoleLine("K1")
+            // 止めている間に取っておいた分（E1、K1）が残ったまま、通知の中で止めるのをやめる
+            e.machine.postHostCallback { e.machine.releaseConsoleOutput() }
+            e.machine.writeConsoleLine("K2")
+            eventuallyDescribe(30_000, { "書ききらない: ${lines(e.screen)}" }) {
+                e.manager.tick()
+                e.console.backlogBytes == 0 && lines(e.screen).any { it == "K2" }
+            }
+            e.settle()
+            val rest = shown(e.screen).filter { !it.all { c -> c == 'x' } }
+            assertEquals(listOf("E1", "K1", "K2"), rest, "${lines(e.screen)}")
+        }
+    }
 }
