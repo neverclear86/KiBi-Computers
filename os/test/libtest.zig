@@ -118,6 +118,41 @@ pub fn main() u8 {
         expect("commit", kibi.memory.commit(&scratch, 0));
         expect("remaining after commit", kibi.memory.remaining() <= before);
         line("memory ok");
+    } else if (eql(case, "widths")) {
+        // 幅が 2・0 の範囲を書く（core の `CharWidth` と比べる。#105）
+        var cp: u32 = 0;
+        var run_start: u32 = 0;
+        var run_width: u2 = 1;
+        while (cp <= 0x110000) : (cp += 1) {
+            const w: u2 = if (cp < 0x110000) kibi.text.width(@intCast(cp)) else 1;
+            if (w != run_width) {
+                if (run_width != 1) {
+                    say(if (run_width == 2) "wide " else "zero ");
+                    num(run_start);
+                    say(" ");
+                    num(cp - 1);
+                    say("\n");
+                }
+                run_start = cp;
+                run_width = w;
+            }
+        }
+    } else if (eql(case, "utf8")) {
+        // 厳しい読み方: 引数の 16 進のバイト列ごとに、読めた文字（なければ -）
+        for (rest) |hex| {
+            var b: [8]u8 = undefined;
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i + 1 < hex.len and n < b.len) : (i += 2) {
+                const hi = hexDigit(hex[i]);
+                const lo = hexDigit(hex[i + 1]);
+                b[n] = @intCast(hi * 16 + lo);
+                n += 1;
+            }
+            if (kibi.text.decode(b[0..n])) |c| num(c) else say("-");
+            say(" ");
+        }
+        say("\n");
     } else if (eql(case, "stack")) {
         // 再帰するほど残りが減り、0 にはならない（#514）
         const top = kibi.stack.remaining();
@@ -353,4 +388,13 @@ fn caseSpawn() void {
 
 fn str(s: []const u8) process.String {
     return .{ .ptr = s.ptr, .len = @intCast(s.len) };
+}
+
+fn hexDigit(c: u8) u64 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 0,
+    };
 }
