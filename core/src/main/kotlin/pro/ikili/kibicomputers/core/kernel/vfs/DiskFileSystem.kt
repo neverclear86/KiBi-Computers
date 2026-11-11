@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit
  * - ディスクのディレクトリには、普通のファイルとディレクトリだけを置く。名前はゲームの中の名前のまま（ハッシュにしない）。
  *   管理用のファイルはない。外で直接編集したものは、すぐに見える
  * - 名前の規則は [DiskNames]（Windows で使えない名前は、どの OS でも `INVAL`。大文字小文字だけ違う名前は同じ名前）
+ *   名前を引くときと一覧は同じ規則で選ぶ（大文字小文字だけ違う名前がホストに2つあれば、名前の順で先の見せるもの。[findChild]）
  * - シンボリックリンク・ジャンクションなど、普通のファイル・ディレクトリ以外のホストのものは、無いものとして扱う（一覧に出さない）。
  *   パスは根から1段ずつ確かめるので、途中にリンクを置かれてもディスクの外へは出ない
  * - node は、マウントのたびに 1（根）から、初めて見たときに割り当てる（使い回さない）。名前を変えても変わらない。
@@ -98,6 +99,12 @@ internal class DiskFileSystem private constructor(
     }
 
     override val tracksOpenFiles: Boolean get() = true
+
+    /**
+     * ホストの名前の変更（`Files.move`）の直前に呼ぶ口（テスト専用。例外を投げさせて、失敗の道を試す）。リースのロックの中で呼ばれる
+     */
+    @Volatile
+    var beforeHostMove: ((from: Path, to: Path) -> Unit)? = null
 
     /** 開いたままのホストのファイルの数（テスト用） */
     val openHandles: Int get() = lease.lock.withLock { handles.size }
@@ -176,6 +183,11 @@ internal class DiskFileSystem private constructor(
         usedEntries--
     }
 
+    /**
+     * 名前の変更。ホストの操作を先に済ませ、node の表と使用量は最後に直す（途中で失敗しても、表と使用量がホストと食い違わない。#433）。
+     * 置き換えは [replaceHost]、大文字小文字だけの変更は [renameCase]。置き換え先の大文字小文字が違えば、置き換えてから名前をそろえる
+     * （そろえるのに失敗しても、古い大文字小文字のまま成功にする。そろえれば同じ名前なので）
+     */
     override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean): Unit = io {
         writable()
         if (from.isRoot || to.isRoot) fsError(Errno.BUSY)
@@ -183,37 +195,42 @@ internal class DiskFileSystem private constructor(
         if (requireDirectory && src.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         DiskNames.check(to.name)
         val dstParent = resolveDirectory(to.parent!!)
+        // 自分の下へ移すかは、解決した結果を大文字小文字をそろえた鍵で比べる（`/d` → `/D/x` も。ホストには触らない）
+        val srcKey = key(src.segments)
+        val dstParentKey = key(dstParent.segments)
+        if (dstParentKey == srcKey || dstParentKey.startsWith("$srcKey/")) fsError(Errno.INVAL, "ディレクトリを自分の下へは移せない")
         val old = findChild(dstParent, to.name)
-        if (old != null && old.node == src.node) {
+        val target = dstParent.segments + to.name
+        if (old == null) {
+            // 置き換えない（こちらの規則では無くても、ホストに見せていないものがあれば EXIST。外のものを消さない）
+            host { moveHost(hostPath(src.segments), hostPath(target)) }
+            relocate(src.segments, target)
+            return@io
+        }
+        if (old.node == src.node) {
             // 大文字小文字だけの名前の変更（同じものを指す）。名前が同じなら何もしない
             if (old.segments.last() == to.name) return@io
-        } else {
-            if (to.startsWith(from)) fsError(Errno.INVAL, "ディレクトリを自分の下へは移せない")
-            if (old != null) {
-                if (src.type == FileType.DIRECTORY && old.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
-                if (src.type != FileType.DIRECTORY && old.type == FileType.DIRECTORY) fsError(Errno.ISDIR)
-                if (old.type == FileType.DIRECTORY && hasVisibleChildren(old.segments)) fsError(Errno.NOTEMPTY)
-            }
+            val (moved, error) = renameCase(src.segments, target)
+            relocate(src.segments, moved)
+            if (error != null) throw error
+            return@io
         }
-        val target = dstParent.segments + to.name
-        val srcHost = hostPath(src.segments)
-        if (old != null && old.node != src.node) {
-            closeHandle(old.node)
-            // 置き換えられる側は消える（ホストの move が置き換える。大文字小文字の違う名前で置いていても、名前は新しいほうにそろえる）
-            if (old.segments.last() != to.name) host { Files.delete(hostPath(old.segments)) }
-            forget(old.node)
-            usedBytes -= (if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST
-            usedEntries--
+        if (src.type == FileType.DIRECTORY && old.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
+        if (src.type != FileType.DIRECTORY && old.type == FileType.DIRECTORY) fsError(Errno.ISDIR)
+        if (old.type == FileType.DIRECTORY && hasVisibleChildren(old.segments)) fsError(Errno.NOTEMPTY)
+        // 置き換えられる側の開いたままのファイルは閉じる（閉じても、次の操作がその場で開き直すだけ）
+        closeHandle(old.node)
+        replaceHost(hostPath(src.segments), old.segments, old.type == FileType.DIRECTORY)
+        // ここから先は、ホストでは置き換えが済んでいる。forget は relocate より先（鍵が同じなので、後だと移したものを消す）
+        forget(old.node)
+        usedBytes -= (if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST
+        usedEntries--
+        relocate(src.segments, old.segments)
+        if (old.segments.last() != to.name) {
+            // 名前を新しい大文字小文字にそろえる。失敗しても置き換えは済んでいるので、古い大文字小文字のまま成功にする
+            val (moved, _) = renameCase(old.segments, target)
+            relocate(old.segments, moved)
         }
-        if (old != null && old.node == src.node) {
-            // 大文字小文字だけの変更は、ホストによっては同じものとして何もしないので、一度別の名前を通す
-            val temp = hostPath(dstParent.segments + ".kibi-rename-${System.nanoTime()}")
-            host { Files.move(srcHost, temp) }
-            host { Files.move(temp, hostPath(target)) }
-        } else {
-            host { Files.move(srcHost, hostPath(target), StandardCopyOption.REPLACE_EXISTING) }
-        }
-        relocate(src.segments, target)
     }
 
     // ---- node の操作 ----
@@ -478,23 +495,46 @@ internal class DiskFileSystem private constructor(
         }
     }
 
-    /** [parent] の下の [name]（大文字小文字をそろえて探す）。なければ `null` */
+    /**
+     * [parent] の下の [name]（大文字小文字をそろえて探す）。なければ `null`。
+     *
+     * 一覧（[listVisible]）と同じ規則で選ぶ（#433）: ホストの名前の一覧から、そろえると [name] と同じものを候補にし、名前の順で
+     * 最初の「見せるもの」（[visibleAttrs]）を返す。返す名前と属性は同じ項目のもの。属性を読むのは候補だけ（ふつうは1つ）なので、
+     * 1段あたりのホストの I/O は「名前の一覧1回＋属性1回」（項目ごとの属性は読まない）。
+     *
+     * 完全に同じ名前の項目があっても一覧は省けない。Linux では大文字小文字違い（`a` と `A`）が並ぶことがあり、名前の順で先のものを
+     * 選ぶには一覧が要る。Windows・macOS では完全一致の属性の読み取りが違う大文字小文字や 8.3 の別名にも当たるので、実際の名前は
+     * 一覧でしか分からない（一覧は長い名前しか返さないので、8.3 の別名は候補に出ない）
+     */
     private fun findChild(parent: Resolved, name: String): Resolved? {
         if (!DiskNames.isValid(name)) return null
-        val exact = parent.segments + name
-        val attrs = attrsOf(hostPath(exact))
-        if (attrs != null) {
-            // 大文字小文字を区別しないホスト（Windows・macOS）では、違う大文字小文字でも見つかる。実際の名前を一覧から引く
-            val actual = listVisible(parent.segments).firstOrNull { DiskNames.fold(it.first) == DiskNames.fold(name) }?.first ?: name
-            val segs = parent.segments + actual
+        val dir = hostPath(parent.segments)
+        // 候補（ふつうは0〜1個。2個目からだけリストを作る）
+        var first: String? = null
+        var more: ArrayList<String>? = null
+        host {
+            Files.newDirectoryStream(dir).use { stream ->
+                for (p in stream) {
+                    val n = p.fileName.toString()
+                    if (!DiskNames.sameName(n, name)) continue
+                    val f = first
+                    if (f == null) {
+                        first = n
+                    } else {
+                        val list = more ?: arrayListOf(f).also { more = it }
+                        list += n
+                    }
+                }
+            }
+        }
+        val candidates: List<String> = more?.apply { sort() } ?: listOfNotNull(first)
+        for (n in candidates) {
+            val attrs = visibleAttrs(dir, n) ?: continue
+            val segs = parent.segments + n
             val type = typeOf(attrs)
             return Resolved(nodeFor(segs, type), type, segs, attrs)
         }
-        val folded = DiskNames.fold(name)
-        val match = listVisible(parent.segments).firstOrNull { DiskNames.fold(it.first) == folded } ?: return null
-        val segs = parent.segments + match.first
-        val type = typeOf(match.second)
-        return Resolved(nodeFor(segs, type), type, segs, match.second)
+        return null
     }
 
     /** [path] を根から1段ずつ辿る。なければ `null`、途中がディレクトリでなければ `NOTDIR` */
@@ -528,13 +568,88 @@ internal class DiskFileSystem private constructor(
         val seen = HashSet<String>()
         val out = ArrayList<Pair<String, BasicFileAttributes>>()
         for (name in names) {
-            if (!DiskNames.isValid(name)) continue
-            val attrs = attrsOf(dir.resolve(name)) ?: continue
+            // 見せるものかを確かめてから重複を見る（[findChild] と同じ「名前の順で最初の見せるもの」）
+            val attrs = visibleAttrs(dir, name) ?: continue
             if (!seen.add(DiskNames.fold(name))) continue
             out += name to attrs
         }
         return out
     }
+
+    /** ディレクトリ [dir] の項目 [name] を見せるなら、その属性（使える名前の、普通のファイルかディレクトリ）。見せないなら `null` */
+    private fun visibleAttrs(dir: Path, name: String): BasicFileAttributes? {
+        if (!DiskNames.isValid(name)) return null
+        return attrsOf(dir.resolve(name))
+    }
+
+    /** ホストの名前の変更（[options] がなければ置き換えない。あれば `EXIST`）。先にテスト用の [beforeHostMove] を呼ぶ */
+    private fun moveHost(from: Path, to: Path, vararg options: StandardCopyOption) {
+        beforeHostMove?.invoke(from, to)
+        Files.move(from, to, *options)
+    }
+
+    /**
+     * [src] で、置き換え先の実際の名前 [oldSegments] の項目を置き換える。失敗したら、ホストは変わらない（#433）。
+     *
+     * - ファイル: `ATOMIC_MOVE` の1手（POSIX は `rename(2)`、Windows は `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`）。
+     *   `REPLACE_EXISTING` だけの move は、先に置き換え先を消してから移すので、移すのに失敗すると置き換え先が消える
+     * - ディレクトリ（空なのは確かめ済み）: Windows は既存のディレクトリを `MoveFileEx` で置き換えられないので、どの OS でも同じ手順にする。
+     *   古いものを一時的な名前へ退かし、[src] を移し、成功したら退かしたものを消す。移すのに失敗したら、退かしたものを戻す。
+     *   退かしたものを消せなかったときは、空のディレクトリのまま残す（置き換えは成功）
+     */
+    private fun replaceHost(src: Path, oldSegments: List<String>, directory: Boolean) {
+        val dst = hostPath(oldSegments)
+        if (!directory) {
+            host { moveHost(src, dst, StandardCopyOption.ATOMIC_MOVE) }
+            return
+        }
+        val aside = hostPath(oldSegments.dropLast(1) + tempName())
+        host { moveHost(dst, aside) }
+        try {
+            host { moveHost(src, dst) }
+        } catch (e: FsException) {
+            try {
+                host { moveHost(aside, dst) }
+            } catch (ignored: FsException) {
+                // 戻せなければ、退かした空のディレクトリが一時的な名前のまま残る
+            }
+            throw e
+        }
+        try {
+            host { Files.delete(aside) }
+        } catch (ignored: FsException) {
+            // 空のディレクトリが残るだけ
+        }
+    }
+
+    /**
+     * 大文字小文字だけの名前の変更（[from] → [to]。最後の名前だけが違う）。ホストによっては同じものとして何もしないので、
+     * 一度一時的な名前を通す。2手目は置き換えない（Linux で、見せていない大文字小文字違いが外から置かれていれば `EXIST`。外のものを消さない）。
+     * 2手目が失敗したら元の名前へ戻す。
+     *
+     * @return ホストでの今の名前の並びと、失敗したときの例外。成功なら [to] と `null`、戻せたら [from]、戻せなければ一時的な名前
+     */
+    private fun renameCase(from: List<String>, to: List<String>): Pair<List<String>, FsException?> {
+        val temp = from.dropLast(1) + tempName()
+        try {
+            host { moveHost(hostPath(from), hostPath(temp)) }
+        } catch (e: FsException) {
+            return from to e
+        }
+        try {
+            host { moveHost(hostPath(temp), hostPath(to)) }
+            return to to null
+        } catch (e: FsException) {
+            return try {
+                host { moveHost(hostPath(temp), hostPath(from)) }
+                from to e
+            } catch (ignored: FsException) {
+                temp to e
+            }
+        }
+    }
+
+    private fun tempName(): String = ".kibi-rename-${System.nanoTime()}"
 
     private fun hasVisibleChildren(segments: List<String>): Boolean = host {
         Files.newDirectoryStream(hostPath(segments)).use { it.iterator().hasNext() }
