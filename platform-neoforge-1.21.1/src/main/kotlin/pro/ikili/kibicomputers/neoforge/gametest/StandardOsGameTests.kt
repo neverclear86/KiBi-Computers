@@ -29,6 +29,7 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
+import java.nio.file.Path
 import java.util.UUID
 
 /** ゲームの中で標準 OS を起動する仮の起動経路（#461）の GameTest。 */
@@ -57,15 +58,10 @@ object StandardOsGameTests {
         }
     }
 
-    /**
-     * ケースと HDD・画面・キーボードで電源を入れると、標準 OS のシェルのプロンプトが出る。`~`（`/home`）は HDD で、
-     * `echo hi > ~/a; cat ~/a` が動き、電源を入れ直した後も `~/a` が残る。
-     */
-    @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
-    fun shellWritesHomeOnDiskAndKeepsItAcrossPowerCycles(helper: GameTestHelper) {
-        val store = WorldDisks.current
-        helper.assertTrue(store != null, "the server should have a disk store")
+    private data class Rig(val case: CaseBlockEntity, val screen: ScreenBlockEntity, val keyboard: KeyboardBlockEntity)
+
+    /** ケース（HDD Tier 1 入り）・画面・キーボードを置き、電源を入れる */
+    private fun placeComputer(helper: GameTestHelper): Rig {
         helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
         helper.setBlock(
             SCREEN,
@@ -79,11 +75,28 @@ object StandardOsGameTests {
             case.parts.setStackInSlot(case.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
         }
         case.parts.setStackInSlot(case.tier.firstSlot(PartKind.STORAGE), ItemStack(KiBiBlocks.part(PartTier.TIER_1, PartKind.STORAGE)))
-
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
+        return Rig(case, screen, keyboard)
+    }
+
+    /** ケースの HDD（`~`）の、ワールドの中のディレクトリ */
+    private fun homeDirectory(helper: GameTestHelper, case: CaseBlockEntity): Path {
+        val store = WorldDisks.current
+        helper.assertTrue(store != null, "the server should have a disk store")
         val id = DiskItem.diskIdOf(case.parts.getStackInSlot(case.tier.firstSlot(PartKind.STORAGE)))
         helper.assertTrue(id != null, "the disk should get an ID")
-        val file = store!!.directoryOf(id!!)!!.resolve("a")
+        return store!!.directoryOf(id!!)!!
+    }
+
+    /**
+     * ケースと HDD・画面・キーボードで電源を入れると、標準 OS のシェルのプロンプトが出る。`~`（`/home`）は HDD で、
+     * `echo hi > ~/a; cat ~/a` が動き、電源を入れ直した後も `~/a` が残る。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun shellWritesHomeOnDiskAndKeepsItAcrossPowerCycles(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val file = homeDirectory(helper, case).resolve("a")
         var step = 0
         helper.succeedWhen {
             val text = lines(screen.text)
@@ -125,6 +138,39 @@ object StandardOsGameTests {
                     helper.setBlock(CASE, Blocks.AIR)
                 }
             }
+        }
+    }
+
+    /**
+     * 標準 OS のイメージの `/bin/lua`（#603）: シェルの `printf` で `~/s.lua`（`#!/bin/lua` のスクリプト）を HDD に書き、
+     * `lua ~/s.lua` と、シバンで `~/s.lua` を直接動かせる。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun shellRunsLuaScriptWrittenToHome(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val file = homeDirectory(helper, case).resolve("s.lua")
+        // シェルの組み込みの printf が `\n` を改行にする（`\\n` は Kotlin の文字列の中の `\n` そのもの）
+        val line = "printf '#!/bin/lua\\nprint(\"lua\"..6*7)\\n' > ~/s.lua; lua ~/s.lua; ~/s.lua"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, line)
+                typed = true
+                helper.fail("typed the line")
+            }
+            // 打った行には `lua42` が含まれないので、出力の行だけが数に入る（`lua ~/s.lua` とシバンで2回）
+            helper.assertTrue(text.count { it == "lua42" } == 2, "lua should run the script twice: $text")
+            helper.assertTrue(text.last { it.isNotEmpty() } == "$", "the shell should be back at the prompt: $text")
+            helper.assertTrue(
+                Files.isRegularFile(file) && Files.readString(file) == "#!/bin/lua\nprint(\"lua\"..6*7)\n",
+                "~/s.lua should be on the disk: $text",
+            )
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
         }
     }
 }

@@ -240,13 +240,18 @@ sourceSets.test {
 // テスト用コンピューターの同梱イメージ testboot（#307 の仮の結線。標準OS #98 ができたら置き換える）。
 // src/main/images/testboot/（`/sbin/init` は Lua のスクリプト）に、lua.wasm を `/bin/lua` として足して zip にし、
 // core のリソース `/kibicomputers/images/testboot.zip` にする（#315）
-val zipTestbootImage = tasks.register<Zip>("zipTestbootImage") {
-    from("src/main/images/testboot")
+// lua.wasm（#91 の compileLua の出力）をイメージの `/bin/lua` にする。testboot と標準 OS（#603）で同じものを使い、
+// 中身を同じにして ProgramCache のコンパイルを1回に共有する（#37）
+val luaBinary = copySpec {
     from(compileLua.flatMap { it.outputDir }) {
         include("kibicomputers/wasm/lua.wasm")
         eachFile { path = "bin/lua" }
         includeEmptyDirs = false
     }
+}
+val zipTestbootImage = tasks.register<Zip>("zipTestbootImage") {
+    from("src/main/images/testboot")
+    with(luaBinary)
     archiveFileName = "testboot.zip"
     destinationDirectory = layout.buildDirectory.dir("generated/images/main/kibicomputers/images")
     isPreserveFileTimestamps = false
@@ -315,6 +320,8 @@ val zipOsImage = tasks.register<Zip>("zipOsImage") {
             }
         }
     }
+    // `/bin/lua` は C の Lua（compileLua。#91）の出力。Zig のプログラムではないので明示的に足す（#603。ADR 0098）
+    with(luaBinary)
     // 設定ファイル（`os/etc/` → イメージの `/etc/`。#100 の `/etc/inittab` など）
     from(osDir.dir("etc")) { into("etc") }
     from(osImageSkeleton)
