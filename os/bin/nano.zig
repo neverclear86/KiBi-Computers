@@ -278,10 +278,17 @@ fn reportFull(e: buffer.Error) void {
 
 fn insert(bytes: []const u8) void {
     buffer.insert(st.cur, bytes) catch |e| return reportFull(e);
+    // 画面の上の行より前に足したときは、上の行の位置がずれるので、カーソルの行から求め直す
+    // （同じかたまりの中で上へ出てから入力したとき。[removeRange] と同じ扱い）
+    const before_top = st.cur < st.top;
     st.cur += bytes.len;
     for (bytes) |c| st.cur_line += @intFromBool(c == '\n');
     st.modified = true;
     st.want_dirty = true;
+    if (before_top) {
+        st.top = buffer.lineStart(st.cur);
+        st.top_line = st.cur_line;
+    }
 }
 
 /// [a, b) を消す（カーソルは [a] へ）

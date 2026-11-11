@@ -634,4 +634,94 @@ class NanoEditorTest {
             assertEquals(lua, file("/home/p.lua")!!.decodeToString())
         }
     }
+
+    @Test
+    fun `かたまりの最後の素のESCはEscと見て、次に読んだキーとつながない`() = nano(
+        listOf("e.txt"),
+        files = mapOf("/home/e.txt" to "abc\n".toByteArray()),
+    ) {
+        // ESC だけを 1 回の入力として送る（素の Esc。編集では何もしない）
+        keys("\u001b")
+        // 次の入力の x は M-X にならず、文字として入る
+        keys("x")
+        assertEquals("xabc", row(1))
+        assertFalse(row(22).contains("Unbound key"), screen)
+        // 同じかたまりの中の ESC の後の文字は Alt+文字（M-X は割り当てがない）
+        keys("\u001bx")
+        assertEquals("xabc", row(1))
+        assertTrue(row(22).contains("Unbound key"), screen)
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `修飾キーのついたCSIを読み分ける。Ctrl+Homeはテキストの頭へ、Ctrl+Upは割り当てがない`() = nano(
+        listOf("c.txt"),
+        files = mapOf("/home/c.txt" to (1..5).joinToString("") { "line $it\n" }.toByteArray()),
+    ) {
+        keys(down.repeat(3) + right.repeat(2))
+        assertEquals(2 to 4, host.cursor())
+        keys("\u001b[1;5H")
+        assertEquals(0 to 1, host.cursor())
+        assertFalse(row(22).contains("Unbound key"), screen)
+        // Ctrl+End はテキストの終わり（最後の LF の後の空の行）
+        keys("\u001b[1;5F")
+        assertEquals(0 to 6, host.cursor())
+        keys("\u001b[1;5A")
+        assertTrue(row(22).contains("Unbound key"), screen)
+        // カーソルは動かない
+        assertEquals(0 to 6, host.cursor())
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `F1（ESC O P）でヘルプを開き、^Xで編集に戻る`() = nano(
+        listOf("h.txt"),
+        files = mapOf("/home/h.txt" to "abc\n".toByteArray()),
+    ) {
+        keys("\u001bOP")
+        assertEquals("KiBi nano help", row(1))
+        assertFalse(rows.contains("abc"), screen)
+        keys(ctrlX)
+        assertEquals("abc", row(1))
+        assertEquals(0 to 1, host.cursor())
+        // CSI の形の F1（ESC [ P）でも開く
+        keys("\u001b[P")
+        assertEquals("KiBi nano help", row(1))
+        keys(ctrlX)
+        assertEquals("abc", row(1))
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `同じかたまりで画面の上の行より前に出てから改行しても、上の行の位置がずれない`() = nano(
+        listOf("t.txt"),
+        files = mapOf("/home/t.txt" to (1..100).joinToString("") { "line $it\n" }.toByteArray()),
+    ) {
+        keys("\u001b[6~" + right.repeat(2))
+        assertEquals("line 20", row(1))
+        assertEquals(2 to 1, host.cursor())
+        // ↑ で画面の上の行（line 20）より前の line 19 の 2 桁目へ出て、同じかたまりで改行する
+        keys(up + "\r")
+        assertEquals("ne 19", row(1))
+        assertEquals("line 20", row(2))
+        assertEquals(0 to 1, host.cursor())
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `1行しかない画面でも、本文の行を状態の行につなげて書かない`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
+    ) {
+        m.resizeConsole(40, 1)
+        host.resize(40, 1)
+        keys(right)
+        assertFalse(row(0).startsWith("abcdef"), screen)
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
 }

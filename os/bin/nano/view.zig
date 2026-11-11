@@ -97,7 +97,12 @@ fn hash(s: []const u8) u64 {
 
 /// [y] 行目を、作った中身にする（前と同じなら書かない）
 fn commitRow(y: usize) void {
-    if (y >= rows) return;
+    if (y >= rows) {
+        // 画面の外の行は捨てる（作りかけの中身を次の行へ持ち越さない）
+        rlen = 0;
+        used = 0;
+        return;
+    }
     const h = hash(row[0..rlen]) ^ @as(u64, used);
     if (shown[y] != h) {
         moveTo(y, 0);
