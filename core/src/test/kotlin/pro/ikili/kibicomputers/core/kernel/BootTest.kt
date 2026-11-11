@@ -376,21 +376,33 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val seen = ArrayList<Boolean>()
         val stuck = AtomicBoolean()
+        val hookDone = CountDownLatch(1)
         h.scheduler.hooks.duringInitSpawn = { machine ->
             h.scheduler.hooks.duringInitSpawn = null
-            // カーネルロックを持たない別のスレッド（メインスレッドの代わり）に読ませる
-            val value = AtomicReference<Boolean?>()
-            val reader = Thread { value.set(machine.isRunningOrBooting) }.apply { isDaemon = true }
-            reader.start()
-            // ロックを取らない読み方なら、すぐ終わる。ロックを取る読み方に変わるとここでは終わらないので、デッドロックしないよう
-            // 待つ時間に上限を付ける。上限は、CI が混んでいてもスレッドが動き出せるだけ長く取る（短いと、競合と関係なく落ちる）
-            reader.join(READER_WAIT_MILLIS)
-            if (reader.isAlive) stuck.set(true) else value.get()?.let { synchronized(seen) { seen += it } }
+            try {
+                // カーネルロックを持たない別のスレッド（メインスレッドの代わり）に読ませる
+                val value = AtomicReference<Boolean?>()
+                val reader = Thread { value.set(machine.isRunningOrBooting) }.apply { isDaemon = true }
+                reader.start()
+                // ロックを取らない読み方なら、すぐ終わる。ロックを取る読み方に変わるとここでは終わらないので、デッドロックしないよう
+                // 待つ時間に上限を付ける。上限は、CI が混んでいてもスレッドが動き出せるだけ長く取る（短いと、競合と関係なく落ちる）
+                reader.join(READER_WAIT_MILLIS)
+                if (reader.isAlive) stuck.set(true) else value.get()?.let { synchronized(seen) { seen += it } }
+            } finally {
+                hookDone.countDown()
+            }
         }
         assertTrue(m.boot(bootDisks("d")))
+        // フックが終わるまで、読み手を待つ上限より長く待つ。RUNNING を待つ締め切り（tickUntil）はフックより先に数え始めるので、
+        // 先にこちらを待たないと、読み手が終わらないときに汎用の失敗で落ち、原因が分からない
+        eventually(READER_WAIT_MILLIS + 10_000, "initを作る区間のフックまで進まない") {
+            h.scheduler.tick()
+            Thread.sleep(1)
+            hookDone.count == 0L
+        }
+        assertFalse(stuck.get(), "読み手が終わらない（ロックを取る読み方になっていないか）")
         tickUntil { m.state == MachineState.RUNNING }
         assertTrue(m.isRunningOrBooting)
-        assertFalse(stuck.get(), "読み手が終わらない（ロックを取る読み方になっていないか）")
         assertEquals(listOf(true), synchronized(seen) { seen.toList() }, "区間の途中で、止まっていて起動中でもないように見えた")
     }
 
