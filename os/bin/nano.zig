@@ -593,7 +593,8 @@ fn exitEditor() void {
     }
 }
 
-/// 入力が終わったとき、保存していない編集を `<名前>.save` に残す
+/// 入力が終わったとき、保存していない編集を `<名前>.save` に残す。
+/// 同じ名前のファイルがあれば上書きせず、`<名前>.save.1`、`.save.2` … と番号を付けて避ける
 fn emergencySave() void {
     if (!st.modified) return;
     var buf: [fs.MAX_PATH]u8 = undefined;
@@ -602,7 +603,32 @@ fn emergencySave() void {
     if (base.len + suffix.len > buf.len) return;
     @memcpy(buf[0..base.len], base);
     @memcpy(buf[base.len..][0..suffix.len], suffix);
-    writeDirect(buf[0 .. base.len + suffix.len]) catch {};
+    const stem = base.len + suffix.len;
+    var n: u32 = 0;
+    while (n <= 999) : (n += 1) {
+        var len = stem;
+        if (n > 0) {
+            var digits: [4]u8 = undefined;
+            var d: usize = digits.len;
+            var v = n;
+            while (v > 0) : (v /= 10) {
+                d -= 1;
+                digits[d] = '0' + @as(u8, @intCast(v % 10));
+            }
+            const dl = digits.len - d;
+            if (stem + 1 + dl > buf.len) return;
+            buf[stem] = '.';
+            @memcpy(buf[stem + 1 ..][0..dl], digits[d..]);
+            len = stem + 1 + dl;
+        }
+        const fd = fs.open(buf[0..len], .{ .read = false, .write = true, .create = true, .exclusive = true }) catch |e| {
+            if (e == error.EXIST) continue;
+            return;
+        };
+        defer io.close(fd) catch {};
+        buffer.writeTo(fd) catch {};
+        return;
+    }
 }
 
 // ---- キー ----

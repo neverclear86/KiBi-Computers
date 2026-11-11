@@ -70,6 +70,8 @@ var row: [MAX_COLS * 8 + 64]u8 = undefined;
 var rlen: usize = 0;
 /// この行で使ったセルの数
 var used: usize = 0;
+/// 入力欄の入力の後ろの桁（[drawStatus] が行を埋める前に控える）
+var prompt_end: usize = 0;
 
 fn put(s: []const u8) void {
     const n = @min(s.len, row.len - rlen);
@@ -427,6 +429,7 @@ fn drawStatus() void {
                 s = s[k..];
             }
             _ = putSafe(s, room);
+            prompt_end = used;
             spaces(cols -| used);
             put("\x1b[0m");
         },
@@ -580,7 +583,7 @@ pub fn render() void {
     drawStatus();
     if (st.mode == .prompt) {
         cy = statusRow();
-        cx = @min(used, cols -| 1);
+        cx = @min(prompt_end, cols -| 1);
     }
     commitRow(statusRow());
     if (helpRows() > 0) {

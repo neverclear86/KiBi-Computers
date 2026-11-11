@@ -74,9 +74,12 @@ pub const Reader = struct {
         return .{ .fd = fd };
     }
 
-    /// 読んだまま、まだキーにしていないバイトがあるか（なければ次の [next] は読むのを待つ）
+    /// 読んだまま、まだキーにできるバイトがあるか（なければ次の [next] は読むのを待つ）。
+    /// 領域が埋まって、後ろが UTF-8 やエスケープシーケンスの途中で切れているだけなら、キーにできるバイトはないと見る
+    /// （続きが来るまで待つので、待つ前に今ある分を描けるようにする）
     pub fn pending(self: *const Reader) bool {
-        return self.start < self.end;
+        if (self.start >= self.end) return false;
+        return parse(self.buf[self.start..self.end], !self.filled).used > 0;
     }
 
     /// 次のキー。入力の終わり・読めないときは null

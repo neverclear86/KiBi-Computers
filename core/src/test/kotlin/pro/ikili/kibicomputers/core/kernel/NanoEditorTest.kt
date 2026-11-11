@@ -442,6 +442,22 @@ class NanoEditorTest {
             assertEquals(0, finish())
             assertEquals("x\n", file("/home/nano.save")!!.decodeToString())
         }
+        // 同じ名前のファイルがあれば上書きせず、番号を付けて避ける
+        nano(
+            listOf("o.txt"),
+            files = mapOf(
+                "/home/o.txt" to "old\n".toByteArray(),
+                "/home/o.txt.save" to "mine\n".toByteArray(),
+                "/home/o.txt.save.1" to "mine1\n".toByteArray(),
+            ),
+        ) {
+            keys("new ")
+            endInput()
+            assertEquals(0, finish())
+            assertEquals("mine\n", file("/home/o.txt.save")!!.decodeToString())
+            assertEquals("mine1\n", file("/home/o.txt.save.1")!!.decodeToString())
+            assertEquals("new old\n", file("/home/o.txt.save.2")!!.decodeToString())
+        }
         // 変更がなければ何も書かない
         nano(listOf("n.txt"), files = mapOf("/home/n.txt" to "same\n".toByteArray())) {
             endInput()
@@ -571,6 +587,38 @@ class NanoEditorTest {
         assertTrue(m.stateOf(pid) == ProcessState.WAITING_EVENT, screen)
         keys(ctrlX + "n")
         assertEquals(0, finish())
+    }
+
+    @Test
+    fun `入力欄のカーソルは入力の後ろに出る`() = nano(listOf("q.txt")) {
+        keys(ctrlO)
+        // 初めから入っている名前（q.txt）の後ろ
+        val label = "File Name to Write: "
+        assertTrue(row(22).startsWith(label + "q.txt"), screen)
+        assertEquals(label.length + 5 to 22, host.cursor())
+        keys("abc")
+        assertEquals(label.length + 8 to 22, host.cursor())
+        keys("あ")
+        assertEquals(label.length + 10 to 22, host.cursor())
+        keys("")
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `4KiBの領域がUTF8の途中で埋まっても、読めた分はすぐ描き、続きでつなぐ`() = nano(listOf("big.txt")) {
+        val head = "a".repeat(4094).toByteArray()
+        val bytes = "あ".toByteArray()
+        assertEquals(3, bytes.size)
+        // 4096 バイト目が「あ」の 2 バイト目で終わる
+        m.offerConsoleInput(head + bytes.copyOfRange(0, 2))
+        settle()
+        assertTrue(row(1).contains("aaaa"), row(1))
+        m.offerConsoleInput(bytes.copyOfRange(2, 3))
+        settle()
+        keys(ctrlS + ctrlX)
+        assertEquals(0, finish())
+        assertEquals("a".repeat(4094) + "あ", file("/home/big.txt")!!.decodeToString())
     }
 
     @Test
