@@ -760,6 +760,52 @@ class DiskFileSystemTest {
     }
 
     @Test
+    fun `大文字小文字だけの名前の変更で、見せていない大文字小文字違いがホストにあれば、それを消さずにEXIST`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("a"), "lower")
+        assumeTrue(
+            runCatching { Files.writeString(d.resolve("A"), "upper") }.isSuccess && Files.list(d).use { it.count() } == 2L,
+            "大文字小文字を区別するホストだけ",
+        )
+        val fs = disk()
+        // 見せるのは名前の順で先の A。a は外から置いた、見せていないもの
+        val node = fs.stat(p("/A")).node
+        val entries = fs.usedEntries
+        val bytes = fs.usedBytes
+        errno(Errno.EXIST) { fs.rename(p("/A"), p("/a")) }
+        assertEquals(listOf("A", "a"), hostNames(), "一時的な名前は残らない")
+        assertEquals("upper", Files.readString(d.resolve("A")))
+        assertEquals("lower", Files.readString(d.resolve("a")))
+        assertEquals(node, fs.stat(p("/a")).node)
+        assertEquals(p("/A"), fs.pathOf(node))
+        assertEquals(entries, fs.usedEntries)
+        assertEquals(bytes, fs.usedBytes)
+    }
+
+    @Test
+    fun `大文字小文字違いを置き換える名前の変更で、見せていない新しい大文字小文字がホストにあれば、それを消さずに古い大文字小文字で成功する`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.writeString(d.resolve("foo"), "outside")
+        assumeTrue(
+            runCatching { Files.writeString(d.resolve("Foo"), "old") }.isSuccess && Files.list(d).use { it.count() } == 2L,
+            "大文字小文字を区別するホストだけ",
+        )
+        val fs = disk()
+        // 見せるのは名前の順で先の Foo
+        val old = fs.stat(p("/foo")).node
+        assertEquals(p("/Foo"), fs.pathOf(old))
+        val src = fs.writeAll("/bar", "new!")
+        fs.rename(p("/bar"), p("/foo"))
+        assertEquals(listOf("Foo", "foo"), hostNames(), "一時的な名前は残らない")
+        assertEquals("new!", Files.readString(d.resolve("Foo")))
+        assertEquals("outside", Files.readString(d.resolve("foo")), "外のものは消さない")
+        assertEquals(src, fs.stat(p("/foo")).node)
+        assertEquals(p("/Foo"), fs.pathOf(src))
+        errno(Errno.STALE) { fs.statNode(old) }
+        errno(Errno.NOENT) { fs.stat(p("/bar")) }
+    }
+
+    @Test
     fun `見せていないホストの項目への名前の変更は、それを消さずにEXIST`() {
         val outside = Files.createDirectories(dir.resolve("outside"))
         val d = Files.createDirectories(dir.resolve("disk"))
