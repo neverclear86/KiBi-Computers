@@ -42,12 +42,19 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 起動シーケンス（/sbin/init）と停止・再起動（#49） */
 class BootTest {
     private val limit = Duration.ofSeconds(30)
+
+    private companion object {
+        /** ロックなしの読み手が終わるのを待つ上限。普通はすぐ終わるので、混んだ CI でも足りる長さにする */
+        const val READER_WAIT_MILLIS = 10_000L
+    }
 
     /** 通知を起きた順に記録する接続層 */
     private class Recorder : MachineHost {
@@ -194,8 +201,8 @@ class BootTest {
         disks.withInit("b", exe(foreverInit()))
         disks.withInit("c", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("throws", "missing", "a", "b", "c")))
-        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        assertFalse(m.isBooting)
+        // 状態の後に印が下りるので、ロックなしで読むときは両方がそろうまで待つ（#625）
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && host.console.contains("booting") }
         val init = process(1)!!
         assertEquals(0, init.parentPid)
         assertEquals(listOf("/sbin/init"), init.args)
@@ -372,6 +379,66 @@ class BootTest {
         tickFor(100)
         assertEquals(0, host.reboots.get())
         assertEquals(MachineState.STOPPED, m.state)
+    }
+
+    @Test
+    fun `initを作る区間の途中でも、ロックなしの読み手には止まって見えない`() = env {
+        // #625: 起動中の印を下ろしてから RUNNING にするまでの間に、ロックを取らずに読むと「STOPPED で起動中でもない」に見えた
+        disks.withInit("d", exe(foreverInit()))
+        val seen = ArrayList<Boolean>()
+        val stuck = AtomicBoolean()
+        val hookDone = CountDownLatch(1)
+        h.scheduler.hooks.duringInitSpawn = { machine ->
+            h.scheduler.hooks.duringInitSpawn = null
+            try {
+                // カーネルロックを持たない別のスレッド（メインスレッドの代わり）に読ませる
+                val value = AtomicReference<Boolean?>()
+                val reader = Thread { value.set(machine.isRunningOrBooting) }.apply { isDaemon = true }
+                reader.start()
+                // ロックを取らない読み方なら、すぐ終わる。ロックを取る読み方に変わるとここでは終わらないので、デッドロックしないよう
+                // 待つ時間に上限を付ける。上限は、CI が混んでいてもスレッドが動き出せるだけ長く取る（短いと、競合と関係なく落ちる）
+                reader.join(READER_WAIT_MILLIS)
+                if (reader.isAlive) stuck.set(true) else value.get()?.let { synchronized(seen) { seen += it } }
+            } finally {
+                hookDone.countDown()
+            }
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        // フックが終わるまで、読み手を待つ上限より長く待つ。RUNNING を待つ締め切り（tickUntil）はフックより先に数え始めるので、
+        // 先にこちらを待たないと、読み手が終わらないときに汎用の失敗で落ち、原因が分からない
+        eventually(READER_WAIT_MILLIS + 10_000, "initを作る区間のフックまで進まない") {
+            h.scheduler.tick()
+            Thread.sleep(1)
+            hookDone.count == 0L
+        }
+        assertFalse(stuck.get(), "読み手が終わらない（ロックを取る読み方になっていないか）")
+        tickUntil { m.state == MachineState.RUNNING }
+        assertTrue(m.isRunningOrBooting)
+        assertEquals(listOf(true), synchronized(seen) { seen.toList() }, "区間の途中で、止まっていて起動中でもないように見えた")
+    }
+
+    @Test
+    fun `initを表に足した後で例外が出ると、起動中の印を立てたままINIT_START_FAILEDで知らせる`() = env {
+        // #625: 印は RUNNING にした後に下ろすので、その前の失敗では印が立っている。endBoot が印を下ろし、コンソールとホストに知らせる
+        disks.withInit("d", exe(foreverInit()))
+        val booting = AtomicReference<Boolean?>()
+        h.scheduler.hooks.duringInitSpawn = { machine ->
+            h.scheduler.hooks.duringInitSpawn = null
+            booting.set(machine.isBooting)
+            throw IllegalStateException("テストの失敗")
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil("失敗が届かない") { host.log.any { it.startsWith("bootFailed:") } }
+        assertEquals(true, booting.get(), "例外の時点では、起動中の印が立っている")
+        assertFalse(m.isBooting)
+        assertFalse(m.isRunningOrBooting)
+        assertEquals(MachineState.STOPPED, m.state)
+        assertTrue(host.log.contains("bootFailed:${BootFailure.INIT_START_FAILED}"), "${host.log}")
+        assertTrue(host.console.contains("kibi: cannot start /sbin/init: machine not ready\n"), "${host.console}")
+        assertEquals(emptyList<String>(), host.states(), "RUNNING にならない")
+        // 表に足した後の失敗では、足した pid 1 が巻き戻されずに残る（別の Issue で扱う）。残ったままだと env の終わりの
+        // awaitTermination が終わらないので、このテストでは表から外す
+        m.lock.withLockValue { m.kernel.processes.remove(1) }
     }
 
     @Test

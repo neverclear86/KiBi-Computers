@@ -5,7 +5,8 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 /**
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
- * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt] はカーネルロックの中、ほかはロックの外で呼ぶ。
+ * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt] と [duringInitSpawn] はカーネルロックの中、ほかはロックの外で呼ぶ
+ * （それぞれの KDoc を見る）。
  */
 internal class KernelTestHooks {
     /** step（専用スレッド）の終わりの、登録を外す前（WASM は終わっている） */
@@ -51,4 +52,11 @@ internal class KernelTestHooks {
     /** 復元の後段の途中（カーネルロックの中。表を入れた後、実行時の部分を作る前）。例外を投げると後段の失敗になる */
     @Volatile
     var duringRestoreInstall: ((Machine) -> Unit)? = null
+
+    /**
+     * 起動の init を作る区間の途中（カーネルロックの中。表に足して実行時の部分を作った後、`RUNNING` にする前。#625）。
+     * ロックを取らずに読む口（[Machine.isRunningOrBooting]）が、この間も正しく見えるかを確かめるのに使う
+     */
+    @Volatile
+    var duringInitSpawn: ((Machine) -> Unit)? = null
 }

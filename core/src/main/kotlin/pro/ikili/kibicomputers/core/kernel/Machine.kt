@@ -498,6 +498,21 @@ public class Machine private constructor(
     public val isBooting: Boolean get() = bootingValue
 
     /**
+     * 止まっていない（[MachineState.RUNNING] か、起動の手順の途中（[isBooting]））なら `true`。ロックを取らずに読むので、
+     * メインスレッドから何度呼んでもよい（#625）。
+     *
+     * 起動中の印を先に、状態を後に読む。init を作るときは、同じカーネルロックの区間で `RUNNING` にしてから印を下ろすので
+     * （[spawnInternal]）、印が下りて見えたなら `RUNNING` も見える（どちらも `@Volatile`）。この2つの順番を入れ替えると、
+     * 区間の途中で「止まっていて起動中でもない」に見えることがある。
+     * 再起動の途中（[reboot] を受け付けてから、起動し直すまで）は含まない
+     */
+    public val isRunningOrBooting: Boolean
+        get() {
+            val booting = bootingValue
+            return booting || stateValue == MachineState.RUNNING
+        }
+
+    /**
      * 復元の途中（#85、ADR 0085）: [restore] を受け付けてから、終わりの知らせ（[RestoreRequest.listener]）が返るか、取り消されるまで。
      * この間はマシンが [quiesce] で止まっていて（プロセスに step を割り当てない）、保存しない（[saveReadiness] が
      * [SaveReadiness.TRANSIENT]、[captureSnapshot] が `null`。#589）。知らせはメインスレッドで配るので、メインスレッドで READY を
@@ -1178,12 +1193,7 @@ public class Machine private constructor(
             val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
             kernel.processes.add(process)
             process.objectId = kernel.objects.add(ProcessObject(pid))
-            if (asInit) {
-                kernel.initPid = pid
-                bootingValue = false
-                // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
-                bootCancelSignal.complete(Unit)
-            }
+            if (asInit) kernel.initPid = pid
             installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
             // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
             val handleFd = if (withHandle) {
@@ -1195,7 +1205,16 @@ public class Machine private constructor(
             val rt = ProcessRuntime(this, process, program, driver)
             runner.initRuntime(rt)
             runtimes[pid] = rt
+            if (asInit) scheduler.hooks.duringInitSpawn?.invoke(this)
             if (stateValue == MachineState.STOPPED) setStateLocked(MachineState.RUNNING, null)
+            if (asInit) {
+                // 起動中の印は、RUNNING にした後に下ろす（この順番は不変条件。ロックを取らずに読む [isRunningOrBooting] が、
+                // 区間の途中で「止まっていて起動中でもない」に見えないように。#625、ADR 0049）。
+                // ここより前で例外が出たら、印が立ったまま起動の手順に返り、endBoot が INIT_START_FAILED として知らせる
+                bootingValue = false
+                // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
+                bootCancelSignal.complete(Unit)
+            }
             if (kind == ProcessKind.BLOCKING) {
                 val thread = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(rt) }
                 rt.dedicatedThread = thread
