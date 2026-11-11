@@ -41,6 +41,7 @@ import java.nio.charset.CodingErrorAction
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
+ * 引数の `list` の ptr が要素の align に揃っていないときもトラップ（Canonical ABI の lift と同じ。長さ 0 でも、ほかの検査より先に確かめる。#430）。
  */
 internal object P1Canonical {
     /** ゲストの `cabi_realloc(0, 0, align, size)`。p1 の層が `ctx.callGuest { }` の中で呼ぶ */
@@ -92,6 +93,9 @@ internal object P1Canonical {
     const val STRING_RESULT_SIZE: Int = 8
     const val STRING_RESULT_ALIGN: Int = 4
 
+    /** 引数の `list` の要素（`string`・`tuple<string, string>`・`fd-assign`）の align。どれも 4 */
+    private const val LIST_ELEMENT_ALIGN: Int = 4
+
     /** `tuple<string, string>`（env の要素）の大きさ */
     const val ENV_ENTRY_SIZE: Int = 16
 
@@ -106,12 +110,13 @@ internal object P1Canonical {
     const val VALUE_BYTES: Int = 4
 
     /**
-     * `list<string>` を読む。[len] が [maxCount] を超えたら要素を読まずに `INVAL`、要素のバイト数が [maxBytes] の外なら中身を読まずに `INVAL`、
+     * `list<string>` を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `INVAL`、要素のバイト数が [maxBytes] の外なら中身を読まずに `INVAL`、
      * 中身が正しい UTF-8 でなければ `INVAL`、配列・要素が線形メモリの外なら `FAULT`。
-     * 確かめる順は len → 配列の範囲 → 各要素について（バイト数 → 範囲 → UTF-8）。ホストが読むのは最大で maxCount × (8 + maxBytes.last) バイト
+     * 確かめる順は ptr の align → len → 配列の範囲 → 各要素について（バイト数 → 範囲 → UTF-8）。ホストが読むのは最大で maxCount × (8 + maxBytes.last) バイト
      */
     @Throws(FsException::class)
     fun liftStringList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, maxBytes: IntRange): List<String> {
+        checkListAlign(ptr, LIST_ELEMENT_ALIGN)
         val count = u32(len)
         if (count > maxCount) fsError(Errno.INVAL, "要素は $maxCount 個まで（$count）")
         if (!P1.inBounds(memory, ptr, count * 8)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
@@ -153,11 +158,12 @@ internal object P1Canonical {
     }
 
     /**
-     * `kibi:process` の `args`（`list<string>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、配列・要素が範囲外なら `FAULT`、
+     * `kibi:process` の `args`（`list<string>`）を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、配列・要素が範囲外なら `FAULT`、
      * 要素の中身を読む前に [budget] から引き（足りなければ `TOOBIG`）、正しい UTF-8 でなければ `INVAL`
      */
     @Throws(FsException::class)
     fun liftArgList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, budget: ArgBudget): List<String> {
+        checkListAlign(ptr, LIST_ELEMENT_ALIGN)
         val count = u32(len)
         if (count > maxCount) fsError(Errno.TOOBIG, "引数は $maxCount 個まで（$count）")
         if (!P1.inBounds(memory, ptr, count * 8)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
@@ -174,11 +180,12 @@ internal object P1Canonical {
     }
 
     /**
-     * `kibi:process` の `env`（`list<tuple<string, string>>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、
+     * `kibi:process` の `env`（`list<tuple<string, string>>`）を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `TOOBIG`、
      * 配列・要素が範囲外なら `FAULT`、組の中身を読む前に [budget] から引き（足りなければ `TOOBIG`）、正しい UTF-8 でなければ `INVAL`
      */
     @Throws(FsException::class)
     fun liftEnvList(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int, budget: ArgBudget): List<Pair<String, String>> {
+        checkListAlign(ptr, LIST_ELEMENT_ALIGN)
         val count = u32(len)
         if (count > maxCount) fsError(Errno.TOOBIG, "環境変数は $maxCount 組まで（$count）")
         if (!P1.inBounds(memory, ptr, count * ENV_ENTRY_SIZE)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
@@ -197,11 +204,12 @@ internal object P1Canonical {
     }
 
     /**
-     * `kibi:process` の `fds`（`list<fd-assign>`）を読む。[len] が [maxCount] を超えたら要素を読まずに `INVAL`、配列が範囲外なら `FAULT`、
+     * `kibi:process` の `fds`（`list<fd-assign>`）を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `INVAL`、配列が範囲外なら `FAULT`、
      * `fd-source` の判別子が 0（`parent`）・1（`closed`）でなければ `INVAL`。値は符号なしで広げる
      */
     @Throws(FsException::class)
     fun liftFdAssigns(memory: WasmMemory, ptr: Int, len: Int, maxCount: Int): List<KibiProcess.FdAssign> {
+        checkListAlign(ptr, LIST_ELEMENT_ALIGN)
         val count = u32(len)
         if (count > maxCount) fsError(Errno.INVAL, "fds は $maxCount 個まで（$count）")
         if (!P1.inBounds(memory, ptr, count * FD_ASSIGN_SIZE)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
@@ -422,6 +430,14 @@ internal object P1Canonical {
         if (u32(p) % align != 0L) throw WasmTrapException(WasmTrapKind.OTHER, "cabi_realloc が align $align に揃っていない場所を返した（$p）")
         if (!P1.inBounds(memory, p, size.toLong())) throw WasmTrapException(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, "cabi_realloc が線形メモリの外を返した（$p）")
         return p
+    }
+
+    /**
+     * 引数の `list` の [ptr] が要素の [align] に揃っているか確かめる（違えばトラップ。Canonical ABI の lift と同じ）。
+     * 長さ 0 でも確かめる。メモリは読まない
+     */
+    private fun checkListAlign(ptr: Int, align: Int) {
+        if (u32(ptr) % align != 0L) throw WasmTrapException(WasmTrapKind.OTHER, "list の場所が align $align に揃っていない（$ptr）")
     }
 
     /** 書き先 [ptr] が範囲の中で align に揃っているか確かめる（違えばトラップ） */
