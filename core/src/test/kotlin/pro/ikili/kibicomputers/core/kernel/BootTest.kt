@@ -121,6 +121,17 @@ class BootTest {
             condition()
         }
 
+        /**
+         * init が CPU を取って動き出す（pid 1 が CREATED を抜ける）まで tick を回す。
+         * RUNNING が見えても、init の専用スレッドはまだ `register()` の前のことがある。その間に reboot や写しの kill が入ると、
+         * register が KILLED にして unregister（beforeUnregister のフック）を通らないので、場面を作れない（#542、#624）。
+         * CREATED を抜けていれば、register を通って runBlocking の try/finally の中にいる（tick で燃料を配らないと抜けない）
+         */
+        fun tickUntilInitStarted() = tickUntil("init が CPU を取らない") {
+            m.state == MachineState.RUNNING && !m.isBooting &&
+                process(1)?.state.let { it != null && it != ProcessState.CREATED && !it.isTerminal }
+        }
+
         /** しばらく tick を回す */
         fun tickFor(millis: Long) {
             val end = System.currentTimeMillis() + millis
@@ -822,7 +833,7 @@ class BootTest {
         release.countDown()
         // 起動が終わった直後の init は、まだ CPU を取っていない（CREATED）ことがある。CREATED は待機点（_start からやり直せる）なので
         // 写しの中で殺さない。CPU を取って動き出す（CREATED でなくなる）まで待つ（#542）
-        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && process(1)?.state.let { it != null && it != ProcessState.CREATED } }
+        tickUntilInitStarted()
         // 計算し続ける init は待機点に来ないので、写しの中で殺し、理由は INIT_KILLED
         val running = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
         assertEquals(pro.ikili.kibicomputers.core.persist.ColdBootReason.INIT_KILLED, running.coldBootReason)
@@ -878,7 +889,8 @@ class BootTest {
     fun `動いているinitの再起動を待つ間は待機点にせず、次の起動のinitのpidを置く`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))
-        tickUntil { m.state == MachineState.RUNNING }
+        // 「動いている init」を再起動するので、init が CREATED を抜けるまで待つ（#624）
+        tickUntilInitStarted()
         val firstInit = process(1)!!
         assertEquals(1, initPid())
         assertTrue(m.reboot())
@@ -892,7 +904,9 @@ class BootTest {
     fun `再起動を待つ間はプロセスがすべて終わってもスレッドの登録が残るうちは待機点にしない`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))
-        tickUntil { m.state == MachineState.RUNNING }
+        // reboot が init の register() より先だと、register が KILLED にして unregister を通らず、フックが来ない。
+        // init が CREATED を抜ける（register を通った）まで待つ（#624）
+        tickUntilInitStarted()
         val firstInit = process(1)!!
         // init の専用スレッドを、プロセスが終わった後・登録を外す前で止める（通知を積む前の場面を作る）
         val atGate = CountDownLatch(1)
