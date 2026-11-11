@@ -66,6 +66,7 @@ WIT の関数を、Component Model の Canonical ABI で平らにした core の
 - p1 の errno = 判別子 + 1。カーネルの `Errno` がそのまま写り、C では errno に直しやすい（`KibiErrors`）
 - マシン全体の上限（`ResourceLimitException`）は `nfile`、プロセスのハンドル表が満杯なら `mfile`
 - ゲストの引数の誤り（上限・UTF-8）は `invalid`、範囲外のポインタは `fault` で返す（`result` を返す関数ではトラップにしない。ゲストが自分の誤りを受け取って続けられるように）。書き先（retptr）と `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ
+- 引数の `list` の ptr が要素の align に揃っていないときもトラップ（#430）。Component Model の lift（`load_list_from_range`）でもトラップになるので、Component Model の層（#264）に替えたときに振る舞いを変えないため。長さ 0 でも、その list の長さ・範囲・中身の検査より先に確かめる。list を複数取る関数（`spawn`）は、引数の順（`path` → `args` → `env` → `cwd` → `fds`）に読むので、先に読む引数の error-code（`name-too-long`・`too-big`・`invalid`）は、あとの list の align のトラップより先に返る。待たない設定（`P1Wait.NONE`）の `again` は、引数を読む前に返る。Component Model の層は全引数を lift してからホストの検査に入るので、これらの組み合わせはトラップになる（今の p1 との既知の差。Component Model の層（#264）で、#616 で Component Model の順に揃える）。範囲外のほうは上のとおり `fault` のまま（Component Model ではトラップだが、Q4 で `fault` と決めた）。`string` の中身は align 1 なので確かめない
 
 ## 版（Q5-A）
 
@@ -123,6 +124,7 @@ interface events {
 
 | 条件 | 返すもの |
 | --- | --- |
+| `kinds_ptr` が align 4 に揃っていない（長さ 0 でも。メモリは読まない。#430） | トラップ |
 | `kinds_len > 16`（要素は読まない） | `invalid` |
 | 要素の `len` が `1..64` の外（中身は読まない） | `invalid` |
 | 要素の中身が正しい UTF-8 でない | `invalid` |
@@ -134,7 +136,7 @@ interface events {
 | プロセスのハンドル表が満杯 | `mfile` |
 | `take` の `self` がキューでない fd | `bad-descriptor` |
 
-- 確かめる順: `kinds_len` → 配列の範囲 → 各要素（`len` → 範囲 → UTF-8）→ `capacity`。最初に当たったものを返す
+- 確かめる順: `kinds_ptr` の align → `kinds_len` → 配列の範囲 → 各要素（`len` → 範囲 → UTF-8）→ `capacity`。最初に当たったものを返す
 - 上限（16・64・256）は `EventLimits` の定数をそのまま使い、カーネルの `require` と同じ値を見る。ゲストの入力で `IllegalArgumentException` は出ない
 - ホストが読むのは最大で 16 × 8 バイト（配列）+ 16 × 64 バイト（中身）。`kinds_len` を大きくして同じ領域を指させても、上限で先に止まる
 - 返す文字列は UTF-8。`Text` の対になっていないサロゲートは U+FFFD にする
@@ -143,7 +145,9 @@ interface events {
 
 - ホスト関数の中から `ctx.callGuest { instance.call("cabi_realloc", 0, 0, align, size) }` で呼ぶ。Canonical ABI どおり、大きさ 0 のリストでも呼ぶ。返したポインタが線形メモリの外、または align に揃っていなければトラップ
 - 燃料はゲストの分として数える。`callGuest` の中（`ProcessRuntime.guestCallDepth > 0`。実行時だけの状態で保存しない）で燃料が切れたら、`WAIT_POINT` のプロセスでも巻き戻さず、スレッドを持ったまま燃料を待つ（ホスト関数の途中は巻き戻せないため）。普通の燃料切れでトラップにはしない
-- `callGuest` の中で止まりうる p1 の import（`fd_read`・`fd_write`・`poll_oneoff`）を呼んだら、待ち方（`BLOCK`・`UNWIND`・`NONE`）に依らずトラップにする。検査は `WasiP1` のホスト関数の入口（巻き直しの処理と燃料より前）に置く。ほかの import（`clock_time_get` など）は呼んでよい
+- `callGuest` の中で止まりうる p1 の import（`fd_read`・`fd_write`・`poll_oneoff`、`kibi:process` の `spawn`（ADR 0074））を呼んだら、待ち方（`BLOCK`・`UNWIND`・`NONE`）に依らずトラップにする。検査は `WasiP1` のホスト関数の入口（巻き直しの処理と燃料より前）に置く。ほかの import（`clock_time_get` など）は呼んでよい
+- 止まりうるかの調べ（#430）: カーネルで止まって待つ口は `ProcessContext.block` と、`checkMayBlock` を通るもの（`exec`・`execWithHandle`・`awaitHost`・`callOnMainThread`、メインスレッドのメソッドの `invokeDevice`）、`block` を通って待つもの（`waitChild`・`awaitEvents`・`sleep`。待たずに返せるときは `block` に入らない）。今の p1 の関数でこれらに届くのは、上の4つ（`fd_read`・`fd_write` → `FdIo` → `block`、`poll_oneoff` → `block`、`spawn` → `execWithHandle`）だけで、どれも入口でトラップにしている。`fd_pread`・`fd_pwrite` は VFS を直接呼び、`sched_yield` はすぐに返り、ディスクの I/O はリースのロックの中で同期に行うので、届かない。`kibi:*` のほかの関数（events・timers・clock・memory・io・tty、`spawn` 以外の process）は待たない。燃料切れの待ちは `onFuelExhausted` を通り、これらの口を通らない
+- 守り: `block` と `checkMayBlock` は、`callGuest` の中（`guestCallDepth > 0`）ならロックを取る前にトラップにする（`止まりうるホストの処理 … を cabi_realloc の中で呼んだ`）。ABI の層が入口で弾き忘れた import（#77 の `kibi:device` など）も、IllegalStateException（異常終了の理由が `internal error`）ではなくトラップで終わる。止まりうる import を足すときは、これまでどおり `WasiP1.WAIT_IMPORTS` と入口の検査にも入れる（巻き直しの処理と燃料より前に、待ち方に依らず弾くため）
 
 ## 実装
 

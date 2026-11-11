@@ -10,6 +10,7 @@ import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.eventually
+import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -33,6 +34,7 @@ import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -258,6 +260,42 @@ class WasiP1KibiProcessTest {
 
     @Test
     fun `待たない設定ではspawnはagain`() = run(Mode.NONE, "nowait") {
+        assertLine("nowait ${err(Errno.AGAIN)}", finish())
+        waitNoChildren()
+    }
+
+    /** align 4 に揃っていない list の ptr は、長さ 0 でもトラップ（error-code ではない）で、子を作らない（#430。ADR 0074） */
+    @ParameterizedTest
+    @ValueSource(strings = ["args", "env", "fds"])
+    fun `揃っていないlistのptrでspawnすると、待機点型ではトラップ`(list: String) = assertTrapsOnMisaligned(Mode.UNWIND, list)
+
+    @ParameterizedTest
+    @ValueSource(strings = ["args", "env", "fds"])
+    fun `揃っていないlistのptrでspawnすると、ブロッキング型でもトラップ`(list: String) = assertTrapsOnMisaligned(Mode.BLOCK, list)
+
+    private fun assertTrapsOnMisaligned(mode: Mode, list: String) = run(mode, "misaligned", list) {
+        val out = finish(ProcessState.CRASHED)
+        assertLine("spawning $list", out)
+        assertFalse("returned" in out, out)
+        val e = m.rt(pid).lastError
+        assertTrue(e is WasmTrapException && "list の場所が align 4 に揃っていない" in e.message!!, "$e")
+        waitNoChildren()
+    }
+
+    @ParameterizedTest
+    @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
+    fun `spawnは引数の順に読むので、先の引数のerror-codeが揃っていないlistのトラップより先に返り、noneのenvのptrは確かめない`(mode: Mode) =
+        run(mode, "misaligned-order") {
+            val out = finish()
+            assertLine("path-first ${err(Errno.NAMETOOLONG)}", out)
+            assertLine("args-first ${err(Errno.TOOBIG)}", out)
+            assertLine("disc-first ${err(Errno.INVAL)}", out)
+            assertLine("env-none ${err(Errno.NOENT)}", out)
+            waitNoChildren()
+        }
+
+    @Test
+    fun `待たない設定では、揃っていないlistのptrでもspawnは引数を読む前にagain`() = run(Mode.NONE, "nowait-misaligned") {
         assertLine("nowait ${err(Errno.AGAIN)}", finish())
         waitNoChildren()
     }
