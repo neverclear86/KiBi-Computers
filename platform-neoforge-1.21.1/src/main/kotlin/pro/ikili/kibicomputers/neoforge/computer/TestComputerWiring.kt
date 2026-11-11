@@ -106,13 +106,14 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     val connectedMachine: Machine? get() = machine
 
     /**
-     * [current]（ケースの今のマシン）がこの結線のマシンで、止まっておらず（[MachineState.RUNNING] か、起動の途中（[Machine.isBooting]））、
-     * 画面をつないでいないなら `true`。
-     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535）。軽いので、ケースの隣のブロックが変わるたびに呼んでよい
+     * [current]（ケースの今のマシン）がこの結線のマシンで、画面をつないでおらず、止まっていない
+     * （[MachineState.RUNNING] か、起動の途中。[Machine.isRunningOrBooting]）なら `true`。
+     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535）。ロックを取らず軽いので、ケースの隣のブロックが変わるたびに呼んでよい。
+     * 状態と起動中の印は、別々に読まず [Machine.isRunningOrBooting] で読む（読む順番に意味がある。#625）
      */
     fun canReconnectScreen(current: Machine?): Boolean {
         val m = machine ?: return false
-        return current === m && (m.state == MachineState.RUNNING || m.isBooting) && screen == null
+        return current === m && screen == null && m.isRunningOrBooting
     }
 
     /**

@@ -364,6 +364,27 @@ class BootTest {
     }
 
     @Test
+    fun `initを作る区間の途中でも、ロックなしの読み手には止まって見えない`() = env {
+        // #625: 起動中の印を下ろしてから RUNNING にするまでの間に、ロックを取らずに読むと「STOPPED で起動中でもない」に見えた
+        disks.withInit("d", exe(foreverInit()))
+        val seen = ArrayList<Boolean>()
+        h.scheduler.hooks.duringInitSpawn = { machine ->
+            h.scheduler.hooks.duringInitSpawn = null
+            // カーネルロックを持たない別のスレッド（メインスレッドの代わり）に読ませる
+            var value: Boolean? = null
+            val reader = Thread { value = machine.isRunningOrBooting }
+            reader.start()
+            // ロックを取る読み方なら、ここでは読み終わらない。待つ時間に上限を付けて、デッドロックしない
+            reader.join(200)
+            synchronized(seen) { value?.let { seen += it } }
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        assertTrue(m.isRunningOrBooting)
+        assertEquals(listOf(true), synchronized(seen) { seen.toList() }, "区間の途中で、止まっていて起動中でもないように見えた")
+    }
+
+    @Test
     fun `起動の途中のstopではinitを作らず、何も知らせない`() = env {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
