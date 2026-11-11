@@ -160,9 +160,11 @@ fn lower(c: u8) u8 {
 pub fn find(needle: []const u8, from: usize) ?usize {
     if (needle.len == 0 or needle.len > len) return null;
     const last = len - needle.len;
+    // 始める位置が最後の候補より後ろなら、頭から探す（剰余だと途中から始まって、頭に近い一致を飛ばす）
+    const start = if (from > last) 0 else from;
     var k: usize = 0;
     while (k <= last) : (k += 1) {
-        const i = (from + k) % (last + 1);
+        const i = (start + k) % (last + 1);
         var j: usize = 0;
         while (j < needle.len and lower(at(i + j)) == lower(needle[j])) j += 1;
         if (j == needle.len) return i;

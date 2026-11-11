@@ -137,6 +137,12 @@ class NanoEditorTest {
         }
 
         val ttyMode: TtyMode get() = m.lock.withLockValue { m.consoleTtyLocked().mode }
+
+        /** 入力を終わらせる（TTY を行編集のモードにして、行頭の ^D を送る。読む側には EOF になる） */
+        fun endInput() {
+            m.lock.withLockValue { m.consoleTtyLocked().setMode(TtyMode.COOKED, m.wakeSink) }
+            m.offerConsoleInput(byteArrayOf(4))
+        }
     }
 
     private fun nano(
@@ -342,6 +348,128 @@ class NanoEditorTest {
         assertEquals(0 to 1, host.cursor())
         assertEquals("line 1", row(1))
         keys("\u001bw")
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `検索は後ろへ探し、終わりまでなければ頭に戻る。カーソルが最後の候補より後ろでも、頭の一致から探す`() = nano(
+        listOf("s.txt"),
+        files = mapOf("/home/s.txt" to "foo foo xyz".toByteArray()),
+    ) {
+        // 前に進む（折り返さない）
+        keys("\u0017foo\r")
+        assertEquals(4 to 1, host.cursor())
+        assertFalse(row(22).contains("Wrapped"), screen)
+        // 空の入力は前の語。後ろに一致がないので、頭に戻る
+        keys("\u0017\r")
+        assertEquals(0 to 1, host.cursor())
+        assertTrue(row(22).contains("Search Wrapped"), screen)
+        // 一致が 1 つだけなら、そう知らせる
+        keys("\u0017xyz\r")
+        assertEquals(8 to 1, host.cursor())
+        keys("\u0017\r")
+        assertEquals(8 to 1, host.cursor())
+        assertTrue(row(22).contains("This is the only occurrence"), screen)
+        // 末尾に近い位置（11 は最後の候補 8 より後ろ）から探しても、3 番目ではなく頭の一致に行く
+        keys("\u001b/")
+        assertEquals(11 to 1, host.cursor())
+        keys(left + "\u0017foo\r")
+        assertEquals(0 to 1, host.cursor())
+        assertTrue(row(22).contains("Search Wrapped"), screen)
+        // 見つからなければ動かない
+        keys("\u0017nope\r")
+        assertEquals(0 to 1, host.cursor())
+        assertTrue(row(22).contains("\"nope\" not found"), screen)
+        // M-W は前の語（nope）でもう一度探す
+        keys("\u0017foo\r")
+        assertEquals(4 to 1, host.cursor())
+        keys("\u001bw")
+        assertEquals(0 to 1, host.cursor())
+        keys(ctrlX + "n")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `ページ送りは本文の行数より2行少なく動く。PgDn・PgUp・^Yで行き来する`() = nano(
+        listOf("pg.txt"),
+        files = mapOf("/home/pg.txt" to (1..100).joinToString("") { "line $it\n" }.toByteArray()),
+    ) {
+        // 本文は画面の 1〜21 行目（25 行 - タイトル - 状態 - 案内 2 行）。1 ページは 19 行
+        assertEquals("line 1", row(1))
+        keys("\u001b[6~")
+        assertEquals("line 20", row(1))
+        assertEquals(0 to 1, host.cursor())
+        keys("\u001b[6~")
+        assertEquals("line 39", row(1))
+        keys("\u0019")
+        assertEquals("line 20", row(1))
+        assertEquals(0 to 1, host.cursor())
+        keys("\u001b[5~")
+        assertEquals("line 1", row(1))
+        assertEquals(0 to 1, host.cursor())
+        // 先頭では動かない
+        keys("\u001b[5~")
+        assertEquals("line 1", row(1))
+        assertEquals(0 to 1, host.cursor())
+        // 画面の途中にカーソルがあっても、カーソルと画面が同じだけ動く
+        keys(down.repeat(5) + "\u001b[6~")
+        assertEquals("line 20", row(1))
+        assertEquals(0 to 6, host.cursor())
+        assertEquals("line 25", row(6))
+        // 終わりでは行き過ぎない
+        keys("\u001b[6~".repeat(10))
+        // （最後の LF の後の空の行にカーソルがある）
+        assertTrue(rows.contains("line 100"), screen)
+        assertEquals("", host.rows()[host.cursor().second])
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `入力が終わったら、保存していない編集を名前の後ろに save を付けて残す`() {
+        nano(listOf("e.txt"), files = mapOf("/home/e.txt" to "old\n".toByteArray())) {
+            keys("new ")
+            endInput()
+            assertEquals(0, finish())
+            assertEquals("new old\n", file("/home/e.txt.save")!!.decodeToString())
+            assertEquals("old\n", file("/home/e.txt")!!.decodeToString())
+        }
+        // 名前がなければ nano.save
+        nano(emptyList()) {
+            keys("x\r")
+            endInput()
+            assertEquals(0, finish())
+            assertEquals("x\n", file("/home/nano.save")!!.decodeToString())
+        }
+        // 変更がなければ何も書かない
+        nano(listOf("n.txt"), files = mapOf("/home/n.txt" to "same\n".toByteArray())) {
+            endInput()
+            assertEquals(0, finish())
+            assertEquals(null, file("/home/n.txt.save"))
+            assertEquals("same\n", file("/home/n.txt")!!.decodeToString())
+        }
+    }
+
+    @Test
+    fun `^Kを続けて押すと切り取りに足し、間に別のキーを挟むと切り直す`() = nano(
+        listOf("c.txt"),
+        files = mapOf("/home/c.txt" to "a\nb\nc\nd\n".toByteArray()),
+    ) {
+        keys("\u000b\u000b")
+        assertEquals("c", row(1))
+        assertEquals("d", row(2))
+        keys("\u0015")
+        assertEquals(listOf("a", "b", "c", "d"), rows.subList(1, 5))
+        // 貼り付けの後の ^K は、前の切り取りに足さず切り直す
+        keys("\u000b")
+        assertEquals(listOf("a", "b", "d"), rows.subList(1, 4))
+        // 間にカーソルの移動を挟んでも切り直す（足すなら "c" が残る）
+        keys(up + "\u000b")
+        assertEquals(listOf("a", "d"), rows.subList(1, 3))
+        keys("\u0015")
+        assertEquals(listOf("a", "b", "d"), rows.subList(1, 4))
+        assertEquals("", row(4))
         keys(ctrlX + "n")
         assertEquals(0, finish())
     }
