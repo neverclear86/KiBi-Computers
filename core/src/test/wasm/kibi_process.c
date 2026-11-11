@@ -11,6 +11,9 @@
 //   kp cwd                  set-cwd・get-cwd と、子の cwd（none なら新しい cwd、some ならそれ）。相対パスの spawn
 //   kp realloc-spawn        get-cwd の cabi_realloc の中で spawn を呼ぶ（トラップになるはず）
 //   kp nowait               待たない設定で spawn（again になるはず）
+//   kp misaligned <list>    align 4 に揃っていない list の ptr（長さ 0）で spawn する（トラップになるはず。#430）。list は args・env・fds
+//   kp misaligned-order     揃っていない list より先に読む引数の誤りが、トラップより先に返る（#430。ADR 0074）
+//   kp nowait-misaligned    待たない設定で、揃っていない args の ptr で spawn（引数を読む前に again になるはず）
 //   kp self                 self-pid・parent-pid
 // 子:
 //   kp exit <n>             proc_exit(n)（32 ビットそのまま）
@@ -260,6 +263,48 @@ static int run_errors(void) {
     return 0;
 }
 
+// 4 に揃った場所から 2 ずらした ptr（中身は読まれないはず）
+static _Alignas(8) char misaligned_area[64];
+#define MISALIGNED ((const void *)(misaligned_area + 2))
+
+static int run_misaligned(const char *which) {
+    kibi_result_process_t res;
+    memset(&res, 0xAA, sizeof res);
+    printf("spawning %s\n", which);
+    if (strcmp(which, "args") == 0) {
+        kibi_process_spawn(SELF, strlen(SELF), MISALIGNED, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
+    } else if (strcmp(which, "env") == 0) {
+        kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 1, MISALIGNED, 0, 0, NULL, 0, NULL, 0, &res);
+    } else if (strcmp(which, "fds") == 0) {
+        kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 0, NULL, 0, 0, NULL, 0, MISALIGNED, 0, &res);
+    } else {
+        return 2;
+    }
+    printf("returned %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    return 0;
+}
+
+static char long_path[5000];
+
+static int run_misaligned_order(void) {
+    kibi_result_process_t res;
+    // path が長すぎる（name-too-long）のが、揃っていない args より先
+    memset(long_path, 'a', sizeof long_path);
+    long_path[0] = '/';
+    kibi_process_spawn(long_path, sizeof long_path, MISALIGNED, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
+    printf("path-first %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    // args が多すぎる（too-big。要素は読まない）のが、揃っていない env より先
+    kibi_process_spawn(SELF, strlen(SELF), (const kibi_process_string_t *)0x10, 5000, 1, MISALIGNED, 0, 0, NULL, 0, NULL, 0, &res);
+    printf("args-first %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    // env の option の判別子が不正（invalid）なのが、揃っていない fds より先
+    kibi_process_spawn(SELF, strlen(SELF), NULL, 0, 2, NULL, 0, 0, NULL, 0, MISALIGNED, 0, &res);
+    printf("disc-first %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    // env が none なら env_ptr は揃っていなくても確かめない（標準 OS の process.zig は none でも ptr を渡す）。ない path で no-entry
+    kibi_process_spawn("/nope", 5, NULL, 0, 0, MISALIGNED, 3, 0, NULL, 0, NULL, 0, &res);
+    printf("env-none %d\n", res.is_err ? -1 - (int)res.val.err : 0);
+    return 0;
+}
+
 static int run_mfile(void) {
     int n = 0;
     for (;;) {
@@ -366,6 +411,14 @@ int main(int argc, char **argv) {
     if (strcmp(mode, "nowait") == 0) {
         const char *child[] = {"kp", "exit", "0"};
         printf("nowait %lld\n", (long long)spawn_self(3, child, NULL, 0));
+        return 0;
+    }
+    if (strcmp(mode, "misaligned") == 0 && argc > 2) return run_misaligned(argv[2]);
+    if (strcmp(mode, "misaligned-order") == 0) return run_misaligned_order();
+    if (strcmp(mode, "nowait-misaligned") == 0) {
+        kibi_result_process_t res;
+        kibi_process_spawn(SELF, strlen(SELF), MISALIGNED, 0, 0, NULL, 0, 0, NULL, 0, NULL, 0, &res);
+        printf("nowait %d\n", res.is_err ? -1 - (int)res.val.err : 0);
         return 0;
     }
     if (strcmp(mode, "self") == 0) {

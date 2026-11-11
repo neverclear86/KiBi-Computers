@@ -151,9 +151,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: 終わった子を刈り取るまで待つ（[tryReap] が `Running` なら [block] で待ち直す）。
-     * [ReapResult.Running] は返さない
+     * [ReapResult.Running] は返さない。[callGuest] の中で待つ（まだ走っている子を待つ）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class)
+    @Throws(ProcessKilledException::class, WasmTrapException::class)
     fun waitChild(selector: ChildSelector): ReapResult
 
     /**
@@ -189,9 +189,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: イベントキュー [handle] にイベントが1つ以上あるか、あふれて捨てた分があるまで [block] で待ってから取り出す。
-     * 返す結果は空でない
+     * 返す結果は空でない。[callGuest] の中で待つ（キューが空）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(FsException::class, ProcessKilledException::class)
+    @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
     fun awaitEvents(handle: Int, max: Int = Int.MAX_VALUE): EventBatch
 
     // ---- 時計・タイマー（#64、ADR 0064。WASM に見せる形は #72・#73・#264・#266） ----
@@ -254,9 +254,9 @@ internal interface ProcessContext {
 
     /**
      * ブロッキング型だけ: [nanos] の間、[block] で止まる（0 以下ならすぐ返る）。ハンドル表を使わない一時的なタイマー（[openWaitTimer]）で待つ。
-     * マシンの動いているタイマーが上限なら [ResourceLimitException]
+     * マシンの動いているタイマーが上限なら [ResourceLimitException]。[callGuest] の中で待つ（[nanos] が正）と [WasmTrapException]（[block] と同じ。#430）
      */
-    @Throws(ProcessKilledException::class, ResourceLimitException::class)
+    @Throws(ProcessKilledException::class, ResourceLimitException::class, WasmTrapException::class)
     fun sleep(nanos: Long)
 
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
@@ -361,7 +361,7 @@ internal interface ProcessContext {
      * ホスト関数の中からゲストの export（`cabi_realloc` など。#73）を呼ぶときに、[block] を包む。包んでいる間は [inGuestCall] が立ち、
      * 燃料が切れても巻き戻さず（待機点型でも）、スレッドを持ったまま燃料を待つ。入れ子にしてよい。プロセスのスレッドから呼ぶ。
      * 包んでいる間は、止まって待つ口が [WasmTrapException] を投げる: [block]・[exec]・[execWithHandle]・[awaitHost]・[callOnMainThread]、
-     * メインスレッドのメソッドを待つ [invokeDevice]（ホスト関数の途中は巻き戻せず、ブロッキング型でも呼び出し元の途中で止まることになるため。ADR 0073。#430）。
+     * メインスレッドのメソッドを待つ [invokeDevice]、[block] を通って待つ [waitChild]・[awaitEvents]・[sleep]（この3つは待たずに返せるときは返す）。止まれないのは、ホスト関数の途中は巻き戻せず、ブロッキング型でも呼び出し元の途中で止まることになるため（ADR 0073。#430）。
      * ABI の層は、止まりうる import をこれらに届く前に入口で弾く（それでも届いた分の守り）。待たない口（[submitHostCall]・[watchHost] など）は呼んでよい
      */
     fun <T> callGuest(block: () -> T): T
