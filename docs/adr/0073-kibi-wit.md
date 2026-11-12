@@ -26,7 +26,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:kernel` | `events` | イベントキュー（resource `event-queue`） | #73 |
 | `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部。ADR 0426） | #426 |
 | `kibi:kernel` | `timers-poll`・`events-poll`・`timers-async`・`events-async` | p2・p3 でタイマー・イベントキューを待つ（仮置き。ADR 0426） | #426 |
-| `kibi:process` | `process` | プロセスの生成・待機・強制終了、カーネルの cwd（p1・p2・p3 で共通。ADR 0074・0332） | #74 |
+| `kibi:process` | `process` | プロセスの生成・待機・強制終了、カーネルの cwd、プロセスの一覧（p1・p2・p3 で共通。ADR 0074・0332・0452） | #74・#452 |
 | `kibi:process` | `process-poll`・`process-async` | p2・p3 で子を待つ・ハンドルを渡して子を作る（仮置き。ADR 0074） | #74 |
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |

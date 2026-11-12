@@ -523,4 +523,89 @@ class P1CanonicalTest {
         assertEquals(1, r.calls.size)
         assertThrows<WasmTrapException> { P1Canonical.lowerStringResult(m, BumpRealloc(), 0x102, "/") }
     }
+
+    // ---- list<process-info>（#452、ADR 0452） ----
+
+    private fun entry(pid: Int, parent: Int, state: KibiProcess.ListState, exit: ExitStatus?, vararg args: String) =
+        KibiProcess.Entry(pid, parent, state, exit, args.map { it.toByteArray(Charsets.UTF_8) })
+
+    @Test
+    fun `list_process-infoは28バイトの要素を配置どおりに書き、詰め物を0にする`() {
+        val m = FakeMemory(1)
+        // 前の中身を残さないことを確かめるため、場所を取る範囲を 0x55 で埋めておく
+        m.write(0x8000, ByteArray(0x200) { 0x55 })
+        val r = BumpRealloc()
+        val entries = listOf(
+            entry(1, 0, KibiProcess.ListState.RUNNING, null, "kp", "ps"),
+            entry(2, 1, KibiProcess.ListState.FINISHED, ExitStatus(2, ExitReason.EXITED, 4_000_000_000L.toInt(), null)),
+            entry(3, 0, KibiProcess.ListState.FINISHED, ExitStatus(3, ExitReason.KILLED, 0, KillSignal.TERMINATE), ""),
+            entry(4, 1, KibiProcess.ListState.FINISHED, ExitStatus(4, ExitReason.KILLED, 0, null)),
+            entry(5, 1, KibiProcess.ListState.FINISHED, ExitStatus(5, ExitReason.CRASHED, 0, null)),
+            entry(6, 1, KibiProcess.ListState.STARTING, null),
+            entry(7, 1, KibiProcess.ListState.WAITING, null),
+        )
+        P1Canonical.lowerProcessListResult(m, r, 0x100, entries)
+        val listPtr = m.readI32(0x100)
+        assertEquals(entries.size, m.readI32(0x104))
+        assertEquals(0, listPtr % 4)
+        fun element(i: Int) = m.read(listPtr + i * P1Canonical.PROCESS_INFO_SIZE, P1Canonical.PROCESS_INFO_SIZE)
+        fun bytes(vararg pairs: Pair<Int, Int>) = ByteArray(20).also { b -> for ((i, v) in pairs) b[i] = v.toByte() }
+        // 先頭 20 バイト（pid・parent-pid・state）
+        assertArrayEquals(bytes(0 to 1, 8 to 1), element(0).copyOf(20))
+        assertArrayEquals(bytes(0 to 2, 4 to 1, 8 to 3, 12 to 0, 16 to 0x00, 17 to 0x28, 18 to 0x6b, 19 to 0xee), element(1).copyOf(20))
+        assertArrayEquals(bytes(0 to 3, 8 to 3, 12 to 1, 16 to 1, 17 to 2), element(2).copyOf(20))
+        assertArrayEquals(bytes(0 to 4, 4 to 1, 8 to 3, 12 to 1), element(3).copyOf(20))
+        assertArrayEquals(bytes(0 to 5, 4 to 1, 8 to 3, 12 to 2), element(4).copyOf(20))
+        assertArrayEquals(bytes(0 to 6, 4 to 1, 8 to 0), element(5).copyOf(20))
+        assertArrayEquals(bytes(0 to 7, 4 to 1, 8 to 2), element(6).copyOf(20))
+        // args
+        fun args(i: Int): List<String> {
+            val at = listPtr + i * P1Canonical.PROCESS_INFO_SIZE
+            val p = m.readI32(at + 20)
+            return (0 until m.readI32(at + 24)).map { j -> String(m.read(m.readI32(p + j * 8), m.readI32(p + j * 8 + 4)), Charsets.UTF_8) }
+        }
+        assertEquals(listOf("kp", "ps"), args(0))
+        assertEquals(emptyList<String>(), args(1))
+        assertEquals(listOf(""), args(2))
+        // cabi_realloc の順: 外側の配列 → 要素ごとに args の配列 → 各文字列（0 件・0 バイトでも呼ぶ）
+        assertEquals(
+            listOf(
+                4 to 28 * 7,
+                4 to 16, 1 to 2, 1 to 2,
+                4 to 0,
+                4 to 8, 1 to 0,
+                4 to 0, 4 to 0, 4 to 0, 4 to 0,
+            ),
+            r.calls,
+        )
+    }
+
+    @Test
+    fun `空のlist_process-infoも配列の場所を取る`() {
+        val m = FakeMemory(1)
+        val r = BumpRealloc()
+        P1Canonical.lowerProcessListResult(m, r, 0x100, emptyList())
+        assertEquals(listOf(4 to 0), r.calls)
+        assertEquals(0, m.readI32(0x104))
+    }
+
+    @Test
+    fun `list_process-infoは書き先の誤りをcabi_reallocより先にトラップし、cabi_reallocの返した場所の誤りもトラップ`() {
+        val m = FakeMemory(1)
+        val entries = listOf(entry(1, 0, KibiProcess.ListState.RUNNING, null, "kp"))
+        for (retPtr in listOf(0x102, WasmMemory.PAGE_SIZE - 4)) {
+            val r = BumpRealloc()
+            assertThrows<WasmTrapException> { P1Canonical.lowerProcessListResult(m, r, retPtr, entries) }
+            assertEquals(emptyList<Pair<Int, Int>>(), r.calls)
+        }
+        assertEquals(
+            WasmTrapKind.MEMORY_OUT_OF_BOUNDS,
+            assertThrows<WasmTrapException> { P1Canonical.lowerProcessListResult(m, BumpRealloc(outside = true), 0x100, entries) }.kind,
+        )
+        assertThrows<WasmTrapException> { P1Canonical.lowerProcessListResult(m, BumpRealloc(misalign = true), 0x100, entries) }
+        // args の配列の場所だけが揃っていない
+        var n = 0
+        val second = P1Canonical.Realloc { _, _ -> if (n++ == 1) 0x2002 else 0x1000 }
+        assertThrows<WasmTrapException> { P1Canonical.lowerProcessListResult(m, second, 0x100, entries) }
+    }
 }

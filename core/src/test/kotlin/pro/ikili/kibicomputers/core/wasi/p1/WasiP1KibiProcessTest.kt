@@ -98,7 +98,13 @@ class WasiP1KibiProcessTest {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
             m.vfs.createDirectory(VfsPath.parse("/home"))
-            for ((path, b) in listOf("/bin/kp" to bytes, "/bin/text" to "not wasm".toByteArray())) {
+            val files = listOf(
+                "/bin/kp" to bytes,
+                "/bin/text" to "not wasm".toByteArray(),
+                // シバンのスクリプト（#452 の list-processes の argv）
+                "/bin/hang.sh" to "#!/bin/kp hang\n".toByteArray(),
+            )
+            for ((path, b) in files) {
                 val f = m.vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true))
                 m.vfs.write(f, b, 0, b.size)
             }
@@ -300,6 +306,52 @@ class WasiP1KibiProcessTest {
     fun `待たない設定では、揃っていないlistのptrでもspawnは引数を読む前にagain`() = run(Mode.NONE, "nowait-misaligned") {
         assertLine("nowait ${err(Errno.AGAIN)}", finish())
         waitNoChildren()
+    }
+
+    /** `kp ps` の `p ...` の行 */
+    private fun processLines(out: String): List<String> = out.lines().filter { it.startsWith("p ") }
+
+    @ParameterizedTest
+    @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
+    fun `list-processesは自分・子・ゾンビ・親なしのゾンビ・シバンの子をpidの昇順に返す`(mode: Mode) = run(mode, "ps") {
+        val out = finish()
+        val (pa, pb, pc, pd) = Regex("children (\\d+) (\\d+) (\\d+) (\\d+)\n").find(out)!!.groupValues.drop(1).map { it.toInt() }
+        val lines = processLines(out)
+        // 1回目（子を止める前）と2回目（止めた後）。どちらも表の全部（ほかにプロセスはない）
+        assertEquals(10, lines.size, out)
+        val first = lines.take(5)
+        val second = lines.drop(5)
+        for (part in listOf(first, second)) {
+            assertEquals(listOf(pid, pa, pb, pc, pd).sorted(), part.map { it.split(' ')[1].toInt() }, out)
+        }
+        val live = "(starting|running|waiting)"
+        assertTrue("p $pid 0 running - 2 kp|ps" in first, out)
+        assertTrue(first.any { Regex("p $pa $pid $live - 3 kp\\|sleep\\|60000").matches(it) }, out)
+        assertTrue("p $pb $pid finished exited:3 3 kp|exit|3" in first, out)
+        // 親なしのゾンビ（親の pid は 0）
+        assertTrue("p $pc 0 finished exited:0 2 kp|orphan-quiet" in first, out)
+        // シバンの子の argv は [インタプリタ, シバンの引数, スクリプトのパス, 元の argv[1..]]
+        assertTrue(first.any { Regex("p $pd $pid $live - 4 /bin/kp\\|hang\\|/bin/hang\\.sh\\|x").matches(it) }, out)
+        assertLine("kill 0 0", out)
+        assertTrue("p $pa $pid finished killed:3 3 kp|sleep|60000" in second, out)
+        assertTrue("p $pd $pid finished killed:3 4 /bin/kp|hang|/bin/hang.sh|x" in second, out)
+    }
+
+    @Test
+    fun `list-processesは待たない設定でも使える`() = run(Mode.NONE, "ps-realloc") {
+        val out = finish()
+        assertLine("outer 1", out)
+        assertLine("p $pid 0 running - 2 kp|ps-realloc", out)
+    }
+
+    @ParameterizedTest
+    @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
+    fun `list-processesはcabi_reallocの中からも呼べる`(mode: Mode) = run(mode, "ps-realloc") {
+        val out = finish()
+        assertLine("inner 1", out)
+        assertLine("outer 1", out)
+        assertTrue(out.indexOf("inner 1") < out.indexOf("outer 1"), out)
+        assertLine("p $pid 0 running - 2 kp|ps-realloc", out)
     }
 
     @Test

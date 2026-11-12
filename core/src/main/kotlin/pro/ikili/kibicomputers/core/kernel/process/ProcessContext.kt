@@ -419,6 +419,14 @@ internal interface ProcessContext {
     /** コンソール（画面）へ出力する（画面のデバイスがあればそこへ、なければ [MachineHost.onConsoleOutput]）。上限を超えて捨てた分があれば `false` */
     fun writeConsole(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Boolean
 
+    // ---- プロセスの一覧（#452、ADR 0452） ----
+
+    /**
+     * マシンの全プロセス（自分・ゾンビ・親なしのゾンビを含む）の写し（WIT の `list-processes`）。並びは表の順（pid の昇順とは限らない）。
+     * 待たない。どのスレッドから呼んでもよい（`cabi_realloc` の中からも）。カーネルロックを短く取り、写してから放す
+     */
+    fun listProcesses(): List<ProcessListing>
+
     // ---- デバイス（#65、ADR 0065。WASM に見せる形は #77） ----
 
     /** つないでいるデバイスの一覧（WIT の `list-devices`）。待たない。どのスレッドから呼んでもよい */

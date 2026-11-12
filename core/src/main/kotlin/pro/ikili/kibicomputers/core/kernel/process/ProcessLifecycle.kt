@@ -5,6 +5,20 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 
 /**
+ * プロセス1つの写し（`ProcessContext.listProcesses`。#452、ADR 0452）。カーネルロックの中で作り、外では変わらない。
+ *
+ * @property exit 終わり方（終わっていれば。[state] が終わりの状態のときだけ `null` でない）
+ * @property args argv（[Process.args] と同じ不変のリスト。切り詰めは ABI に依らない層 `KibiProcess.list` が行う）
+ */
+internal data class ProcessListing(
+    val pid: Int,
+    val parentPid: Int,
+    val state: ProcessState,
+    val exit: ExitStatus?,
+    val args: List<String>,
+)
+
+/**
  * プロセスの終わりの記録・刈り取り・親が終わったときの子の扱い・シグナルの判定（#46、ADR 0046）。マシンに1つ。
  *
  * どれもカーネルロックの中で呼ぶ。表から外す・スレッドを止めるといった、マシンの実行時の部分に触る操作は
@@ -53,6 +67,21 @@ internal class ProcessLifecycle(private val machine: Machine) {
     }
 
     private fun statusOf(process: Process): ExitStatus = bookkeeping.statusOf(process)
+
+    /**
+     * マシンの全プロセスの写し（`kibi:process` の `list-processes`。#452、ADR 0452）。表の今の並び（割り当ての順）のまま返す。
+     * 終わったもの（ゾンビ・親なしのゾンビ）も入れ、終わり方は [tryReapLocked] と同じ作り方で付ける。
+     * 写すのは数値と不変の参照（`args`）だけで、[Process] 自体は外へ出さない
+     */
+    fun listProcessesLocked(): List<ProcessListing> = kernel.processes.all().map { p ->
+        ProcessListing(
+            pid = p.pid,
+            parentPid = p.parentPid,
+            state = p.state,
+            exit = if (p.state.isTerminal) objectOf(p)?.status ?: statusOf(p) else null,
+            args = p.args,
+        )
+    }
 
     /** [parentPid] が [selector] の子の終わりを待つための key。待つ子がいなければ空 */
     fun childExitKeysLocked(parentPid: Int, selector: ChildSelector): List<WaitKey> = when (selector) {

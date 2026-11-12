@@ -12,7 +12,7 @@
 - `spawn` は読み込み（コンパイル）が終わるまで待つ（止まりうる import。Q2-A）。読み込みの失敗は `spawn` の `no-exec`
 - 終わり方は `variant exit-status { exited(u32), killed(option<signal>), crashed }`（カーネルの `ExitStatus` のまま。Q3-A）
 - 子への fd は `fds: list<fd-assign>`。fd 0/1/2 は書かなければ引き継ぎ、fd 3 以降（preopen を含む）は書いたものだけ（Q4-A。ADR 0045）
-- interface は1つ（生成・待機・シグナル・pid・cwd。Q5-A）。pid で操作するのは `kill-pid`・`self-pid`・`parent-pid`・`set-signal-ignored` だけで、プロセスの一覧は出さない（Q6-A）
+- interface は1つ（生成・待機・シグナル・pid・cwd。Q5-A）。pid で操作するのは `kill-pid`・`self-pid`・`parent-pid`・`set-signal-ignored` だけで、プロセスの一覧は出さない（Q6-A）。一覧は後に #452（ADR 0452）で `list-processes` として同じ interface に足した
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。新しく持つ状態は、親の fd 表の項目が既存の `ProcessObject`（ADR 0046）を指すことだけ
 - **p2/p3 は WIT とこの ADR だけで、実装しない。仮置き**: p2/p3 での形（interface・関数・型・依存する `wasi:*` の版）は、p2/p3 の層（#262〜#268）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。p1 の ABI は対象外
 
@@ -48,6 +48,7 @@
 | `set-signal-ignored` | `(sig, ignored, ret_ptr: i32) -> ()` | |
 | `get-cwd` | `(ret_ptr: i32) -> ()` | `cabi_realloc` が要る（なければ読み込みで `NOEXEC`） |
 | `set-cwd` | `(path_ptr, path_len, ret_ptr: i32) -> ()` | |
+| `list-processes` | `(ret_ptr: i32) -> ()` | `cabi_realloc` が要る。待たない（#452。ADR 0452） |
 
 `kibi:process/process-poll@0.1.0`・`kibi:process/process-async@0.1.0` を p1 で import すると `NOEXEC`。
 
@@ -126,6 +127,7 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 | ハンドルを閉じる | fd を閉じる経路で付け替え | resource の drop も同じ付け替え | 同じ |
 | `exit-status` | `proc_exit(u32)` → `exited(n)` | `wasi:cli/exit.exit(ok/err)` → `exited(0/1)`、`exit-with-code(n)` → `exited(n)` | 同じ |
 | `get-cwd`・`set-cwd` | カーネルの cwd | 同じ。子の `initial-cwd` は作られたときのカーネルの cwd | 同じ |
+| `list-processes`（#452。ADR 0452） | `cabi_realloc` で場所を取る | 同じ関数（Component Model の lower） | 同じ |
 
 - `handle-source` の stream は、その stream の下のカーネルの fd を子の fd に複製する。カーネルの fd を下に持たない stream は `not-supported`
 - p3 の `input(stream<u8>)`・`capture` は、カーネルのパイプ（ADR 0059）を1本作り、p3 の層がつなぐ（#266）
