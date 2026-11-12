@@ -2618,6 +2618,9 @@ public class Machine private constructor(
         val diskId = source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
         if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX)) fsError(Errno.NOENT, "$source は挿さっていない")
         val claim = lock.withLockValue {
+            // 入口の確かめ（rt.killed）の後に止まったマシンでは予約を取らない。止まった後の予約は新しい世代を持つので取り消されず、
+            // 開くとリースの世代を進めて、同じディスクを開いた次の台を IO にしてしまう（ADR 0052、不変条件 (d)）
+            if (!runningSteadyLocked()) fsError(Errno.IO, "マシンが止まった")
             val insertion = inserted[diskId] ?: fsError(Errno.NOENT, "$source は挿さっていない")
             if (diskClaims.containsKey(diskId) || kernel.mounts.bySource(source) != null) fsError(Errno.BUSY, "$source は使用中")
             claimLocked(diskId, insertion, phase = false) ?: fsError(Errno.NOENT, "$source は挿さっていない")

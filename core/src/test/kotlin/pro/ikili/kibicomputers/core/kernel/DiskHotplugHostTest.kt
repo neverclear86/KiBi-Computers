@@ -7,12 +7,15 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.HostDiskLeases
+import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -20,6 +23,10 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -200,6 +207,119 @@ class DiskHotplugHostTest {
             assertEquals(1, m.mountDisk("disk:d1", VfsPath.parse("/y"), readOnly = true))
             assertEquals(Errno.ROFS, errnoOf { writeText(m, "/y/b", "no") })
             assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    /**
+     * 本番の開き手（`BootVolumeOpener.forDisks` と本物の `DiskFileSystem`）を包み、[gated] を立てた後の最初の `d1` の開きだけを、
+     * 門が開くまで本物を呼ぶ前で止める口。取り消しの確かめ（`cancelled`）は、そのまま本物に渡す
+     */
+    private inner class GatedRealOpener : BootVolumeOpener {
+        val real = BootVolumeOpener.forDisks({ id -> ResolvedDisk(diskDir(id), 1L shl 20, 64) }, HostFileBudget())
+        val gated = AtomicBoolean()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+        override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+            if (diskId == "d1" && gated.compareAndSet(true, false)) {
+                entered.countDown()
+                check(release.await(15, TimeUnit.SECONDS)) { "門が開かない" }
+            }
+            return real.open(diskId, cancelled)
+        }
+    }
+
+    /** 本番の開き手を [GatedRealOpener] で包んで、根 `root` から起動する（`d1` のディレクトリも作る） */
+    private fun bootGated(h: Harness, opener: GatedRealOpener, vararg ids: String): Machine {
+        Files.createDirectories(diskDir("d1"))
+        h.scheduler.hooks.bootVolumes = opener
+        return boot(h, *ids)
+    }
+
+    /** 別の台が開いたディスク [volume] に書けること（世代を追い越されていれば IO になる） */
+    private fun assertStillWritable(volume: BootVolume, name: String) {
+        val node = volume.fs.createFile(VfsPath.parse("/$name"))
+        val bytes = "ok".toByteArray()
+        assertEquals(2, volume.fs.write(node, 0, bytes, 0, bytes.size))
+    }
+
+    /** [m] で `mount disk:d1 /x` を別のスレッドで呼ぶ。結果は失敗の [Errno]（成功なら `null`） */
+    private fun mountInBackground(m: Machine): CompletableFuture<Errno?> {
+        val result = CompletableFuture<Errno?>()
+        Thread {
+            result.complete(
+                try {
+                    m.mountDisk("disk:d1", VfsPath.parse("/x"), false)
+                    null
+                } catch (e: FsException) {
+                    e.errno
+                },
+            )
+        }.start()
+        return result
+    }
+
+    @Test
+    fun `mountが本物のディスクを開いている途中に抜いて別の台が開いても、古い台は世代を進めず、新しい台のディスクはIOにならない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val opener = GatedRealOpener()
+            val m = bootGated(h, opener, "root", "d1")
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            opener.gated.set(true)
+            val result = mountInBackground(m)
+            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            // 抜いて、別の台（ここでは本番の開き手を直に）が同じディスクを開く
+            assertFalse(m.disksChanged(snapshot("root")))
+            val newer = checkNotNull(opener.real.open("d1"))
+            opener.release.countDown()
+            assertEquals(Errno.IO, result.get(10, TimeUnit.SECONDS))
+            assertNull(m.mountAt("/x"))
+            assertStillWritable(newer, "after-mount")
+            assertEquals(0, m.diskClaimCount)
+            newer.fs.retire()
+            m.close()
+        }
+    }
+
+    @Test
+    fun `mountが本物のディスクを開いている途中にマシンが止まって別の台が開いても、新しい台のディスクはIOにならない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val opener = GatedRealOpener()
+            val m = bootGated(h, opener, "root", "d1")
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            opener.gated.set(true)
+            val result = mountInBackground(m)
+            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            m.stop()
+            val newer = checkNotNull(opener.real.open("d1"))
+            opener.release.countDown()
+            assertEquals(Errno.IO, result.get(10, TimeUnit.SECONDS))
+            assertStillWritable(newer, "after-stop")
+            assertEquals(0, m.diskClaimCount)
+            newer.fs.retire()
+            m.close()
+        }
+    }
+
+    @Test
+    fun `自動マウントが本物のディスクを開いている途中に抜いて別の台が開いても、新しい台のディスクはIOにならない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val opener = GatedRealOpener()
+            val m = bootGated(h, opener, "root")
+            opener.gated.set(true)
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            assertFalse(m.disksChanged(snapshot("root")))
+            val newer = checkNotNull(opener.real.open("d1"))
+            opener.release.countDown()
+            eventually(10_000, "予約が残る") { m.diskClaimCount == 0 }
+            eventually(10_000, "起動用のスレッドが空にならない") { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+            assertNull(m.mountAt("/mnt/d1"))
+            assertStillWritable(newer, "after-auto")
+            newer.fs.retire()
             m.close()
         }
     }

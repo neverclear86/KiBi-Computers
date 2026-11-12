@@ -886,8 +886,13 @@ class MachineRestoreBranchesTest {
     }
 
     /** `prompt` が入力を待ったところを書いて閉じる（根は `disk:root`。[extra] で根の後にマウントを足せる） */
-    private fun savePrompt(h: Harness, store: MachineSaveStore, extra: (Machine) -> Unit = {}): MachineIdentity {
-        val m = h.machine(fuelPerTick = 10_000_000)
+    private fun savePrompt(
+        h: Harness,
+        store: MachineSaveStore,
+        environment: MachineEnvironment? = null,
+        extra: (Machine) -> Unit = {},
+    ): MachineIdentity {
+        val m = if (environment == null) h.machine(fuelPerTick = 10_000_000) else h.machine(fuelPerTick = 10_000_000, environment = environment)
         startPrompt(h, m, TestMemoryFileSystem(), beforeExec = extra)
         val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
         m.close()
@@ -940,6 +945,23 @@ class MachineRestoreBranchesTest {
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val identity = savePrompt(h, store)
             h.scheduler.hooks.bootVolumes = BootVolumeOpener { _ -> null }
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MOUNT)
+            assertEquals(0, m.diskClaimCount, "予約は残らない")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `homeのディスクを開けなければMOUNTで冷えた起動にし、予約を残さない`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store) { m ->
+                m.vfs.mount(MachineLimits.HOME_PATH, TestMemoryFileSystem(), readOnly = false, source = "disk:home")
+            }
+            // 根は開けるが、/home のディスクは開けない（抜かれた）
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
             val finished = Finished()
             val m = restore(h, store, identity, finished)
             assertColdBoot(m, finished, ColdBootCause.MOUNT)
@@ -1038,6 +1060,37 @@ class MachineRestoreBranchesTest {
             assertEquals("disk:root", mountSource(m, "/"))
             assertNull(mountSource(m, "/mnt/root"), "戻した根を /mnt に重ねてマウントしない")
             assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `unmountしたまま保存したディスクは、復元の後にまたmntにマウントしてdisk-insertedを出す（handledは保存しない）`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            // 保存する台: data を挿してマウントし、ゲストが unmount したまま保存する
+            val identity = savePrompt(h, store, insertedDisks("root", "data")) { m ->
+                m.vfs.mount(VfsPath.parse("/mnt/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
+                m.unmountAt(VfsPath.parse("/mnt/data"))
+            }
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root" || id == "data") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+            val probe = QueueProbe().also { it.install(h) }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "data"))
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            h.scheduler.hooks.duringRestoreInstall = null
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 保存した表には data のマウントがない。挿し込みの「扱った」印は保存しないので、戻した後は新しい挿し込みとして自動マウントする
+            eventually(10_000, "data をマウントし直さない") {
+                h.scheduler.tick()
+                mountSource(m, "/mnt/data") == "disk:data"
+            }
+            eventually(10_000, "disk-inserted が来ない") { probe.diskEvents(m).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", "data", "/mnt/data")), probe.diskEvents(m))
             m.close()
         }
     }

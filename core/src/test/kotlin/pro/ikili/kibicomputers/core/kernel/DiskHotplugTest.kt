@@ -74,7 +74,7 @@ class DiskHotplugTest {
     }
 
     /** ディスクの識別子 → 中身。開くたびに同じ中身を返す。[gates] の識別子は、開く前に門が開くまで待つ（取り消しは見ない） */
-    private class Disks(val root: FileSystem) : BootVolumeOpener {
+    private class Disks(val root: FileSystem, val rootReadOnly: Boolean = false) : BootVolumeOpener {
         val fs = ConcurrentHashMap<String, CountingDisk>()
         val opens = ConcurrentHashMap<String, AtomicInteger>()
         val gates = ConcurrentHashMap<String, Gate>()
@@ -94,7 +94,7 @@ class DiskHotplugTest {
                 g.entered.countDown()
                 check(g.release.await(15, TimeUnit.SECONDS)) { "門が開かない" }
             }
-            if (diskId == "root") return BootVolume(root, readOnly = false)
+            if (diskId == "root") return BootVolume(root, readOnly = rootReadOnly)
             if (diskId.startsWith("bad")) return null
             return BootVolume(disk(diskId), readOnly = false)
         }
@@ -105,10 +105,17 @@ class DiskHotplugTest {
     private class Booted(val h: Harness, val m: Machine, val disks: Disks)
 
     /** [ids] を挿したマシンを root から起動して、動くまで待つ */
-    private fun boot(h: Harness, vararg ids: String, disks: Disks = Disks(rootFs()), wait: Boolean = true, fuel: Long = 10_000_000): Booted {
+    private fun boot(
+        h: Harness,
+        vararg ids: String,
+        disks: Disks = Disks(rootFs()),
+        wait: Boolean = true,
+        fuel: Long = 10_000_000,
+        config: BootConfig = BootConfig.builder().addBootDisk("root").build(),
+    ): Booted {
         h.scheduler.hooks.bootVolumes = disks
         val m = h.machine(fuelPerTick = fuel, environment = MachineEnvironment.builder().disks(snapshot(*ids)).build())
-        assertTrue(m.boot(BootConfig.builder().addBootDisk("root").build()))
+        assertTrue(m.boot(config))
         if (wait) awaitRunning(h, m)
         return Booted(h, m, disks)
     }
@@ -717,6 +724,75 @@ class DiskHotplugTest {
             // 20 回の mount は 1,000,000 以上の燃料 = 100,000 ずつの tick で 9 回以上は待つ
             assertTrue(mountTicks >= 10, "mount の燃料が払われていない: $mountTicks tick（unmount だけは $cheapTicks tick）")
             assertTrue(mountTicks > cheapTicks + 5, "mount: $mountTicks tick、unmount だけ: $cheapTicks tick")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `読み取り専用の根では、homeのディスクをhomeにだけマウントしてmntに重ねず、抜くと止めるべきと答える`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val config = BootConfig.builder().addBootDisk("root").homeDisk("h1").build()
+            val b = boot(h, "root", "h1", "d1", disks = Disks(rootFs(), rootReadOnly = true), config = config)
+            val m = b.m
+            assertEquals("disk:h1", m.mountAt("/home"))
+            assertEquals(
+                mapOf("/mnt/d1" to "disk:d1"),
+                m.mountPoints().filterKeys { it.startsWith("/mnt") },
+                "/home にしたディスクを /mnt にも重ねてマウントしない",
+            )
+            assertEquals(1, b.disks.opened("h1"), "/home のディスクは1回だけ開く")
+            // 別のディスクを挿して自動マウントの仕事が動いても、/home のディスクは handled なので /mnt に足さない
+            assertFalse(m.disksChanged(snapshot("root", "h1", "d1", "d2")))
+            eventually(10_000, "マウントしない") { m.mountAt("/mnt/d2") == "disk:d2" }
+            awaitBootThreadsIdle(h)
+            assertNull(m.mountAt("/mnt/h1"))
+            assertEquals(1, b.disks.opened("h1"))
+            // /home 以外を抜いても止めない。/home を抜くと止めるべき
+            assertFalse(m.disksChanged(snapshot("root", "h1", "d1")))
+            assertTrue(m.disksChanged(snapshot("root", "d1")), "/home のディスクが抜けたら止める")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `止まったマシンでmountを呼ぶと、予約を取らずディスクを開かずにIO`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1")
+            val m = b.m
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            val before = b.disks.opened("d1")
+            m.stop()
+            eventually(10_000, "止まらない") {
+                h.scheduler.tick()
+                m.state == MachineState.STOPPED
+            }
+            assertEquals(Errno.IO, assertThrows<FsException> { m.mountDisk("disk:d1", VfsPath.parse("/x"), false) }.errno)
+            // 止まった後の予約は新しい世代を持ち取り消されないので、開くと次の台のリースの世代を進めてしまう
+            assertEquals(before, b.disks.opened("d1"), "止まったマシンはディスクを開かない")
+            assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `起動の途中でmntのマウントより後に挿したディスクは、起動の後にmntにマウントしてdisk-insertedを出す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            var queue: EventQueue? = null
+            val changed = java.util.concurrent.CompletableFuture<Boolean>()
+            // mountOtherDisks の後、init を作る前に d1 を挿す（起動の途中なので、disksChanged は仕事を積まない）
+            h.scheduler.hooks.beforeInitExec = { m ->
+                queue = m.subscribeAll()
+                changed.complete(m.disksChanged(snapshot("root", "d1")))
+            }
+            val b = boot(h, "root", wait = false)
+            val m = b.m
+            awaitRunning(h, m)
+            assertEquals(false, changed.get(10, TimeUnit.SECONDS))
+            eventually(10_000, "起動の後にマウントしない") { m.mountAt("/mnt/d1") == "disk:d1" }
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(queue!!).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", "d1", "/mnt/d1")), m.diskEvents(queue!!))
+            assertEquals(1, b.disks.opened("d1"))
+            assertEquals(0, m.diskClaimCount)
             m.close()
         }
     }

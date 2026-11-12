@@ -30,7 +30,8 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 | `source` が `disk:<id>` でない・`disk:image:*`（同梱イメージ）・今挿さっていない | `no-entry` |
 | そのディスクがもうマウントされている・ほかの持ち主が開いている途中（予約がある） | `busy` |
 | `point` にもうマウントがある | `busy` |
-| `point` がない・ディレクトリでない | VFS の検査（`checkMountPoint`）のとおり（`no-entry`・`not-directory`） |
+| `point` がディレクトリ以外のもの・途中がディレクトリでない | `not-directory`（VFS の検査 `checkMountPoint` のとおり） |
+| 呼んだときにマシンが `RUNNING` でない（止まっている途中・止まった） | `io`（予約を取らず、ディスクを開かない） |
 | 開けない・開いている間にマシンが止まった・ディスクが抜けた | `io` |
 | `unmount` の `point` が `/`・`/tmp`・`/dev` | `busy` |
 | `unmount` の `point` の下にほかのマウントがある | `busy` |
@@ -40,6 +41,7 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 | `point` が `VfsPath.MAX_PATH_BYTES` を超える | `name-too-long` |
 
 - `point` の相対パスは、呼んだプロセスのカーネルの作業ディレクトリから解決する
+- `point` がなくてもエラーにしない。マウントは成功し、その位置と祖先は（根のディスクに作らずに）合成のディレクトリとして見える
 - `read-only` が偽でも、ディスクが読み取り専用ならそのまま読み取り専用でマウントする
 - 開いたファイルがあっても `unmount` できる（そのファイルの操作は以後 `IO`）
 
@@ -87,6 +89,9 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 - `RUNNING` の1つの挿し込みにつき、`disk-inserted` は1回まで（`Insertion.handled`。根・`/home`・起動のときにマウントしたものは出さない）
 - `mount` のシステムコールは挿し込みを `handled` にしない。自動マウントの仕事が予約に阻まれて飛ばした挿し込みを `mount` が成功させたときは、`mount` の後始末が自動マウントの仕事を積み直し、
   仕事はマウント済みを見つけて（マウントの位置で）`disk-inserted` を出し、`handled` にする。このため、その後にゲストが `unmount` しても、同じ挿し込みは自動でマウントし直されない
+  （同じ実行の中だけ。`handled` は保存しないので、保存・アンロードをまたぐと変わる。「知っている穴」を見る）
+- システムコールの `mount` は、予約を取る区間で「`RUNNING` で起動・復元の途中でない」（`runningSteadyLocked`）を確かめる。ホスト関数の入口の確かめの後に止まったマシンが、
+  新しい世代の（取り消されない）予約を取って開き、リースの世代を進めないため（(d)。段の予約は `bootCancelled`・`isRestoreCancelled` を足して同じことを防ぐ）
 
 挿し込みのない予約（`insertion == null`）は、同梱イメージ（`image:*`）と、テストのフック（`KernelTestHooks.bootVolumes`）を差したときだけ許す。
 
@@ -112,6 +117,8 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 ## 知っている穴
 
 - 開いているファイルは保存・復元する（#82）が、抜いたディスクを指すものは `IO` になるだけで、ゲストに知らせるのは `disk-removed` だけ
+- `unmount` したまま保存・アンロードしたディスクは、復元の後にまた `/mnt/<名前>` にマウントされ、`disk-inserted` が出る。`Insertion.handled` は保存しない
+  （表は実行時だけ。保存形式を変えないため）ので、戻した後は、挿さっているがマウントしていない新しい挿し込みとして扱う。ゲストは `disk-inserted` を見て外し直せる
 - 標準 OS の `mount`・`umount` コマンドはまだない（#454 で足す）
 - p2・p3 の world は仮置き（ほかの `kibi:*` と同じく、Component Model のホストの実装は #259 の配下）
 - 同じ識別子のディスクを2台に挿したときは、ADR 0052 のリースのとおり後から開いた方が勝つ（#606 の場合も同じ）
