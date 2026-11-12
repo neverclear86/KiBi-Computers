@@ -143,7 +143,8 @@ fn humanSize(buf: []u8, bytes: u64) []const u8 {
     if (bytes < 1024) return kibi.io.formatUnsigned(buf, bytes);
     var unit: usize = 0;
     var div: u128 = 1024;
-    while (unit + 1 < units.len and @as(u128, bytes) >= div * 1024) {
+    // 切り上げた数が 1024 になるなら次の単位にする（1048575 バイトは `1024K` ではなく `1.0M`）
+    while (unit + 1 < units.len and @as(u128, bytes) > div * 1023) {
         div *= 1024;
         unit += 1;
     }

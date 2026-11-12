@@ -78,10 +78,12 @@ class BasicCommandsTest {
         script: String,
         files: Map<String, String> = emptyMap(),
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+        maxProcesses: Int = 64,
+        memoryBytes: Long = 32L * 1024 * 1024,
     ): Run = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
-            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024, environment = environment)
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, maxProcesses = maxProcesses, memoryBytes = memoryBytes, environment = environment)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home", "/mnt")) m.vfs.createDirectory(VfsPath.parse(d))
             m.vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
@@ -917,6 +919,45 @@ class BasicCommandsTest {
         )
     }
 
+    /**
+     * 親なしのゾンビを [count] 個作るスクリプト（`sh -c 'true &'` の子は親が先に終わるのでゾンビで残る）。
+     * ゾンビの CMD は `sh -c <スクリプト>` で、スクリプトに 255 バイトを超える注釈を付けてあるので、1 行が約 335 バイトになる。
+     * [wait] なら、`ps` で数えて [count] 個できるまで待つ（`ps` が動けない RAM の上限では使えない）
+     */
+    private fun zombieScript(count: Int, wait: Boolean = true): String =
+        "for i in \$(seq $count); do sh -c 'true & # ${"x".repeat(300)}'; done\n" +
+            if (wait) {
+                "for i in \$(seq 400); do [ \$(ps -e | grep -c '<defunct>\$') -ge $count ] && break; sleep 0.05; done\n"
+            } else {
+                "sleep 1\n"
+            }
+
+    @Test
+    fun `psの結果が静的な領域を溢れても、ページの残りを使って全部書く`() {
+        // 600 件で約 200 KiB（静的な 64 KiB の外に約 140 KiB）。割り当ては 1 件に 3 回あり、割り当てのたびにページを増やすと
+        // 数百ページの RAM が要るので、RAM の上限 512 KiB で見分けられる
+        val r = run(
+            zombieScript(600) + "ps -e | grep -c '<defunct>\$'\n",
+            maxProcesses = 2000,
+            memoryBytes = 512L * 1024,
+        )
+        assertEquals(ProcessState.EXITED, r.shell, r.text)
+        assertTrue((r.text.lines().lastOrNull { it.isNotEmpty() }?.toIntOrNull() ?: 0) >= 600, r.text)
+    }
+
+    @Test
+    fun `psは増やせないとき、cabi_reallocが線形メモリの外を返してトラップし、シェルは動き続ける`() {
+        // RAM の上限 192 KiB。1,200 件は約 400 KiB で、静的な 64 KiB の領域とページを増やしても足りない。ps は OOM で落ち、シェルは次へ進む
+        val r = run(
+            zombieScript(1200, wait = false) + "ps -e >/dev/null; echo status \$?\necho end\n",
+            maxProcesses = 2000,
+            memoryBytes = 250_000L,
+        )
+        assertEquals(ProcessState.EXITED, r.shell, r.text)
+        assertTrue(Regex("""kibi: ps \(pid \d+\) crashed: out of memory""").containsMatchIn(r.text), r.text)
+        assertEquals(listOf("status 139", "end"), r.text.lines().filter { it.startsWith("status") || it == "end" }, r.text)
+    }
+
     @Test
     fun `psは親なしのゾンビを既定で隠し、-eと-Aで出す`() {
         val out = sh(
@@ -966,6 +1007,22 @@ class BasicCommandsTest {
 
     private fun diskEnvironment(dir: Path, vararg ids: String): MachineEnvironment =
         MachineEnvironment.builder().disks(DiskSnapshot.of(ids.associateWith { ResolvedDisk(dir.resolve(it), 1L shl 20, 64) })).build()
+
+    @Test
+    fun `df -hは切り上げて次の単位に届く値を次の単位で書く`(@TempDir dir: Path) {
+        // 容量 1048575 バイト（1 MiB の 1 バイト下）は、1024K ではなく 1.0M になる
+        val env = MachineEnvironment.builder().disks(DiskSnapshot.of(mapOf("d1" to ResolvedDisk(dir.resolve("d1"), 1048575L, 64)))).build()
+        val out = sh(
+            """
+            mount d1 /a
+            for i in ${'$'}(seq 400); do [ ${'$'}(mount -l | grep -c ' /a') = 1 ] && break; sleep 0.05; done
+            df -h /a | tail -n 1
+            """,
+            environment = env,
+        )
+        val cols = out.lines().first { it.isNotEmpty() }.trim().split(Regex(" +"))
+        assertEquals("1.0M", cols[1], out)
+    }
 
     @Test
     fun `mountでディスクをマウントし、dfとumountで扱う`(@TempDir dir: Path) {
