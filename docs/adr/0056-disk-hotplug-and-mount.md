@@ -43,6 +43,24 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 - `read-only` が偽でも、ディスクが読み取り専用ならそのまま読み取り専用でマウントする
 - 開いたファイルがあっても `unmount` できる（そのファイルの操作は以後 `IO`）
 
+## 燃料（重い呼び出し）
+
+`mount` はホスト側で毎回ディスクを開く（`DiskFileSystem.open` → 木をたどって使用量を数える `recount`、リースの取得）。この仕事は CPU の許可を持ったまま同期に行うので、
+ふつうの呼び出し（`WasiP1Fd.CALL_FUEL` = 100）と同じ燃料では、`unmount` → `mount` を繰り返すゲストが、少ない燃料でワーカーとホストの I/O を使い続けられる（多数台で TPS を落とさない、という規模の目標に反する）。
+そこで `mount` は、呼び出しごとの燃料に加えて次を払う（`ProcessRunner.Context.mount`。計測しないプロセスは払わない）。
+
+- 固定分 `MachineLimits.MOUNT_FUEL` = 50,000（先に払う。失敗しても払う）
+- 開いたディスクの項目（ファイル・ディレクトリ）1つあたり `MOUNT_FUEL_PER_ENTRY` = 100（開いた後に払う。木をたどった量に比例させる。`Machine.mountDisk` が項目の数を返す）
+
+払うのは手持ちの燃料から引く借り（燃料が負になり、次の補充で返す）なので、ゲストは払い終えるまで進めない。仮の値で、確定は #251。
+自動マウント（起動用のスレッド）にはこの燃料は掛けない。挿す・抜くはプレイヤーの操作で回数が限られ、ゲストが繰り返せないため。
+
+## `/tmp` の下へのマウント
+
+`mount` は位置を選ばないので、ゲストは `/tmp` の下（例: `/tmp/x`）にもマウントできる。止まるとき（`checkAllDoneLocked` → `unmountTmpLocked`）は `/tmp` を外して RAM を返すが、
+強制でない `MountTable.remove` は「下にマウントがある」で `BUSY` を投げ、`stop()`・`close()`・`reboot()` の呼び手に例外が漏れて、状態が `STOPPING` のまま残る。
+そのため `unmountTmpLocked` は、`/tmp` の下のマウントを深いほうから強制的に外してから `/tmp` を外す（`unmountForcedLocked`。ファイルシステムには `onUnmounted` で知らせるだけで、I/O はしない）。
+
 ## 自動マウントの名前とイベント
 
 - 名前は識別子の先頭8文字の小文字（`/mnt/abcdef12`）。位置が埋まっていれば、10 文字・11 文字…と延ばす（`-` で終わる長さは飛ばす）。試すのは最大 32 回（`Machine.autoMountPoints`）
@@ -67,6 +85,8 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 - (d) 予約は、マウントした・やめたどちらでも同じ区間か `finally` で外す。段の予約は段の終わりに外す
 - (e) 抜いたディスクのマウントは、抜いた区間（`disksChangedLocked`）で外す。止まったマシン（`RUNNING` でない）では外さず、次の起動が古いマウントを外す
 - `RUNNING` の1つの挿し込みにつき、`disk-inserted` は1回まで（`Insertion.handled`。根・`/home`・起動のときにマウントしたものは出さない）
+- `mount` のシステムコールは挿し込みを `handled` にしない。自動マウントの仕事が予約に阻まれて飛ばした挿し込みを `mount` が成功させたときは、`mount` の後始末が自動マウントの仕事を積み直し、
+  仕事はマウント済みを見つけて（マウントの位置で）`disk-inserted` を出し、`handled` にする。このため、その後にゲストが `unmount` しても、同じ挿し込みは自動でマウントし直されない
 
 挿し込みのない予約（`insertion == null`）は、同梱イメージ（`image:*`）と、テストのフック（`KernelTestHooks.bootVolumes`）を差したときだけ許す。
 

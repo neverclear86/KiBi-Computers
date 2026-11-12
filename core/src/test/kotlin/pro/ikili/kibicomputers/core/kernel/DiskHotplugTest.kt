@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
@@ -104,9 +105,9 @@ class DiskHotplugTest {
     private class Booted(val h: Harness, val m: Machine, val disks: Disks)
 
     /** [ids] を挿したマシンを root から起動して、動くまで待つ */
-    private fun boot(h: Harness, vararg ids: String, disks: Disks = Disks(rootFs()), wait: Boolean = true): Booted {
+    private fun boot(h: Harness, vararg ids: String, disks: Disks = Disks(rootFs()), wait: Boolean = true, fuel: Long = 10_000_000): Booted {
         h.scheduler.hooks.bootVolumes = disks
-        val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().disks(snapshot(*ids)).build())
+        val m = h.machine(fuelPerTick = fuel, environment = MachineEnvironment.builder().disks(snapshot(*ids)).build())
         assertTrue(m.boot(BootConfig.builder().addBootDisk("root").build()))
         if (wait) awaitRunning(h, m)
         return Booted(h, m, disks)
@@ -462,26 +463,37 @@ class DiskHotplugTest {
     }
 
     /** kibi-fs-wasi（p1 の `kibi:fs/mounts`）を [args] で動かし、出力を返す */
-    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String {
-        val program = Program.load(EndiveRuntime(), resource("kibi-fs-wasi.wasm"))
+    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String = runKibiFsCounting(h, m, *args).first
+
+    /** [runKibiFs] と、終わるまでに回した tick の数 */
+    private fun runKibiFsCounting(h: Harness, m: Machine, vararg args: String, metered: Boolean = false): Pair<String, Int> {
         val output = m.lock.withLockValue { m.kernel.objects.add(ByteStream(64 * 1024)) }
         val options = SpawnOptions(
-            allowUnmetered = true,
+            allowUnmetered = !metered,
             fds = SpawnOptions.ROOT_PREOPEN,
             args = listOf("kibi-fs") + args,
             stdio = StdioSpec(StdioSource.Console, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Console),
         )
-        val pid = m.spawn(program, WasiP1Driver(program.module), options)
+        val pid = if (metered) {
+            // 燃料を計測するモジュールとして、ディスクの /bin/kibi-fs を exec する
+            m.exec("/bin/kibi-fs", KernelDrivers.DEFAULT, options)
+        } else {
+            val program = Program.load(EndiveRuntime(), resource("kibi-fs-wasi.wasm"))
+            m.spawn(program, WasiP1Driver(program.module), options)
+        }
+        var ticks = 0
         eventually(60_000, "終わらない") {
             h.scheduler.tick()
+            ticks++
             m.stateOf(pid).isTerminal
         }
-        return m.lock.withLockValue {
+        val text = m.lock.withLockValue {
             val s = m.kernel.objects[output] as ByteStream
             val buf = ByteArray(s.available)
             if (buf.isNotEmpty()) s.read(buf, 0, buf.size, m.wakeSink)
             String(buf, Charsets.UTF_8)
         }
+        return text to ticks
     }
 
     @Test
@@ -521,6 +533,190 @@ class DiskHotplugTest {
             )
             assertEquals(expected, out.lines().filter { it.isNotEmpty() })
             assertEquals("hi", String(b.disks.disk("d1").let { fs -> val n = fs.stat(VfsPath.parse("/a")).node; val buf = ByteArray(2); fs.read(n, 0, buf, 0, 2); buf }))
+            m.close()
+        }
+    }
+
+    /** 起動用のスレッドをすべて塞ぐ（[release] を数えると解ける）。自動マウントの仕事を、積んだままにしておくため */
+    private fun blockBootThreads(h: Harness, release: CountDownLatch) {
+        val executor = h.scheduler.bootExecutor
+        val started = CountDownLatch(executor.maximumPoolSize)
+        repeat(executor.maximumPoolSize) {
+            executor.execute {
+                started.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+        }
+        assertTrue(started.await(10, TimeUnit.SECONDS), "起動用のスレッドを塞げない")
+    }
+
+    private fun awaitBootThreadsIdle(h: Harness) =
+        eventually(10_000, "起動用のスレッドが空にならない") { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+
+    @Test
+    fun `ゲストがtmpの下にマウントしたまま止めても例外が漏れず、STOPPEDになってtmpもマウントも外れる`() = timeout(limit) {
+        for (viaKill in listOf(false, true)) {
+            Harness(execRuntime = EndiveRuntime()).use { h ->
+                val b = boot(h, "root", "d1")
+                val m = b.m
+                m.unmountAt(VfsPath.parse("/mnt/d1"))
+                // /tmp に書いてから、その下にディスクをマウントする
+                val f = m.vfs.open(VfsPath.parse("/tmp/f"), OpenOptions(read = true, write = true, create = true))
+                m.vfs.write(f, ByteArray(4096), 0, 4096)
+                assertTrue(m.memoryAccount.usedBytes > 0)
+                m.mountDisk("disk:d1", VfsPath.parse("/tmp/x"), readOnly = false)
+                assertEquals("disk:d1", m.mountAt("/tmp/x"))
+                if (viaKill) {
+                    // init が自分で終わる（checkAllDoneLocked が STOPPED にする）
+                    m.lock.withLockValue { m.killRuntimeLocked(m.runtimes.getValue(m.kernel.initPid), KillSignal.KILL) }
+                } else {
+                    m.stop()
+                }
+                eventually(10_000, "止まらない") {
+                    h.scheduler.tick()
+                    m.state == MachineState.STOPPED
+                }
+                assertNull(m.mountAt("/tmp"), "viaKill=$viaKill")
+                assertNull(m.mountAt("/tmp/x"), "viaKill=$viaKill")
+                assertEquals(0L, m.memoryAccount.usedBytes, "/tmp の RAM を返す viaKill=$viaKill")
+                assertEquals(0, m.diskClaimCount)
+                // もう一度止めても例外を出さず、起動し直せる
+                m.stop()
+                eventually(10_000, "起動できない") { m.boot(BootConfig.builder().addBootDisk("root").build()) }
+                awaitRunning(h, m)
+                assertEquals("disk:d1", m.mountAt("/mnt/d1"))
+                m.close()
+            }
+        }
+    }
+
+    @Test
+    fun `自動マウントの仕事が飛ばした挿し込みをmountが成功させても、disk-insertedを1回出し、外しても自動で付け直さない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root")
+            val m = b.m
+            val q = m.subscribeAll()
+            val hold = CountDownLatch(1)
+            blockBootThreads(h, hold)
+            val gate = Disks.Gate()
+            b.disks.gates["d1"] = gate
+            // 自動マウントの仕事は積まれたまま動けない。その間にプロセスが先に予約を取る
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            val error = java.util.concurrent.CompletableFuture<Errno?>()
+            val t = Thread {
+                error.complete(
+                    try {
+                        m.mountDisk("disk:d1", VfsPath.parse("/x"), false)
+                        null
+                    } catch (e: FsException) {
+                        e.errno
+                    },
+                )
+            }
+            t.start()
+            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            // 仕事が動く: 予約があるので d1 を飛ばして終わる
+            val runs = m.autoMountRuns.get()
+            hold.countDown()
+            eventually(10_000, "仕事が動かない") { m.autoMountRuns.get() > runs }
+            awaitBootThreadsIdle(h)
+            assertEquals(emptyList<Triple<String, String, String>>(), m.diskEvents(q), "マウントが終わるまで出さない")
+            gate.release.countDown()
+            assertEquals(null, error.get(10, TimeUnit.SECONDS))
+            t.join()
+            assertEquals("disk:d1", m.mountAt("/x"))
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", "d1", "/x")), m.diskEvents(q))
+            assertEquals(1, b.disks.opened("d1"), "同じディスクを2回開かない")
+            // 外しても、同じ挿し込みは自動マウントし直さない（別のディスクを挿して仕事が動いても）
+            m.unmountAt(VfsPath.parse("/x"))
+            assertFalse(m.disksChanged(snapshot("root", "d1", "d2")))
+            eventually(10_000, "マウントしない") { m.mountAt("/mnt/d2") == "disk:d2" }
+            awaitBootThreadsIdle(h)
+            assertNull(m.mountAt("/mnt/d1"))
+            assertEquals(1, b.disks.opened("d1"))
+            assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `予約の持ち主が入れ替わっても、古い持ち主は新しい予約を消さずに開いたものを閉じ、新しい持ち主だけがマウントする`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root")
+            val m = b.m
+            val q = m.subscribeAll()
+            val gateA = Disks.Gate()
+            b.disks.gates["d1"] = gateA
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            assertTrue(gateA.entered.await(10, TimeUnit.SECONDS))
+            // A が開いている途中に抜き、挿し直す（B）
+            assertFalse(m.disksChanged(snapshot("root")))
+            val gateB = Disks.Gate()
+            b.disks.gates["d1"] = gateB
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            assertTrue(gateB.entered.await(10, TimeUnit.SECONDS))
+            assertEquals(1, m.diskClaimCount, "B の予約だけが残る")
+            // A を進める: マウントせず、開いたものを閉じる。B の予約は残る
+            gateA.release.countDown()
+            eventually(10_000, "A の開いたものを閉じない") { b.disks.disk("d1").retired.get() == 1 }
+            assertNull(m.mountAt("/mnt/d1"))
+            assertEquals(1, m.diskClaimCount, "A の後始末が B の予約を消さない")
+            // B を進める
+            gateB.release.countDown()
+            eventually(10_000, "B がマウントしない") { m.mountAt("/mnt/d1") == "disk:d1" }
+            assertEquals(1, b.disks.disk("d1").retired.get(), "B の開いたものは閉じない")
+            assertEquals(0, m.diskClaimCount)
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).any { it.first == "disk-inserted" } }
+            assertEquals(listOf("disk-removed", "disk-inserted"), m.diskEvents(q).map { it.first })
+            m.close()
+        }
+    }
+
+    @Test
+    fun `先頭8文字が同じ2枚のディスクは、名前を延ばして別々の位置にマウントする`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val a = "abcdef12-0000-0000-0000-000000000001"
+            val c = "abcdef12-0000-0000-0000-000000000002"
+            val d = "abcdef12-0000-0000-0000-000000000003"
+            // 起動のときに挿さっている2枚
+            val b = boot(h, "root", a, c)
+            val m = b.m
+            assertEquals(
+                mapOf("/mnt/abcdef12" to "disk:$a", "/mnt/abcdef12-0" to "disk:$c"),
+                m.mountPoints().filterKeys { it.startsWith("/mnt/") },
+            )
+            // 動いている間に挿した3枚目
+            val q = m.subscribeAll()
+            assertFalse(m.disksChanged(snapshot("root", a, c, d)))
+            eventually(10_000, "マウントしない") { m.mountAt("/mnt/abcdef12-00") == "disk:$d" }
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", d, "/mnt/abcdef12-00")), m.diskEvents(q))
+            m.close()
+        }
+    }
+
+    @Test
+    fun `mountは固定の燃料を払うので、mountとunmountを繰り返すゲストは少ない燃料では進めない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // 1 tick の燃料を、mount 1回の固定分（MOUNT_FUEL = 50,000）の 2 倍にする
+            val root = rootFs()
+            root.createDirectory(VfsPath.parse("/bin"))
+            val bytes = resource("kibi-fs-wasi.wasm")
+            root.write(root.createFile(VfsPath.parse("/bin/kibi-fs")), 0, bytes, 0, bytes.size)
+            val b = boot(h, "root", "d1", disks = Disks(root), fuel = 100_000)
+            val m = b.m
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            val cycles = 20
+            val mountArgs = (1..cycles).flatMap { listOf("mount", "disk:d1", "/x", "0", "unmount", "/x") }.toTypedArray()
+            val (out, mountTicks) = runKibiFsCounting(h, m, *mountArgs, metered = true)
+            assertEquals(cycles * 2, out.lines().count { it == "mount 0" || it == "unmount 0" })
+            // 同じ数の呼び出しでも、mount でない unmount（失敗）なら燃料は 100 ずつ
+            val cheapArgs = (1..cycles).flatMap { listOf("unmount", "/nowhere", "unmount", "/nowhere") }.toTypedArray()
+            val (_, cheapTicks) = runKibiFsCounting(h, m, *cheapArgs, metered = true)
+            // 20 回の mount は 1,000,000 以上の燃料 = 100,000 ずつの tick で 9 回以上は待つ
+            assertTrue(mountTicks >= 10, "mount の燃料が払われていない: $mountTicks tick（unmount だけは $cheapTicks tick）")
+            assertTrue(mountTicks > cheapTicks + 5, "mount: $mountTicks tick、unmount だけ: $cheapTicks tick")
             m.close()
         }
     }

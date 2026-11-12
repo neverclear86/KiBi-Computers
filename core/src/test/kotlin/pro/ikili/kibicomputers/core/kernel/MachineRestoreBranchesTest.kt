@@ -61,6 +61,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -977,6 +978,229 @@ class MachineRestoreBranchesTest {
             assertEquals("disk:root", m.lock.withLockValue { m.kernel.mounts.at(VfsPath.ROOT)?.source })
             assertEquals(0, m.diskClaimCount, "予約は残らない")
             assertEquals(0, root.retired.get(), "戻した根は閉じない")
+            m.close()
+        }
+    }
+
+    // ---- ディスクの挿し抜きと復元（#56、ADR 0056） ----
+
+    /** 挿さっているディスクの表（ホストのパスは使わない。開き方はテストのフック） */
+    private fun insertedDisks(vararg ids: String): MachineEnvironment =
+        MachineEnvironment.builder().disks(DiskSnapshot.of(ids.associateWith { ResolvedDisk(Path.of("unused", it), 1L shl 20, 64) })).build()
+
+    /** 戻す途中（表に入れる区間）に、全部を受けるキューを足す。戻したマシンの [queue] に溜まる */
+    private class QueueProbe {
+        @Volatile
+        var queue: EventQueue? = null
+
+        fun install(h: Harness) {
+            h.scheduler.hooks.duringRestoreInstall = { m ->
+                m.kernel.events.ensureCapacity(m.kernel.objects)
+                val q = EventQueue(EventFilter.ALL, 32)
+                m.kernel.objects.add(q)
+                m.kernel.events.subscribe(q, m.kernel.objects)
+                queue = q
+            }
+        }
+
+        fun diskEvents(m: Machine): List<Triple<String, String, String>> = m.lock.withLockValue {
+            queue!!.pendingEvents().filter { it.type.startsWith("disk-") }.map {
+                Triple(it.type, (it.values[0] as EventValue.Text).value, (it.values[1] as EventValue.Text).value)
+            }
+        }
+    }
+
+    private fun mountSource(m: Machine, point: String): String? = m.lock.withLockValue { m.kernel.mounts.at(VfsPath.parse(point))?.source }
+
+    @Test
+    fun `復元の後に、保存した表にない挿さっているディスクを自動でマウントしてdisk-insertedを出す`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store)
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root" || id == "extra") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+            val probe = QueueProbe().also { it.install(h) }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "extra"))
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            h.scheduler.hooks.duringRestoreInstall = null
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 戻した根は予約の持ち主がカーネルに移ったので、自動マウントの対象外。表にない extra だけがマウントされる
+            eventually(10_000, "extra をマウントしない") {
+                h.scheduler.tick()
+                mountSource(m, "/mnt/extra") == "disk:extra"
+            }
+            eventually(10_000, "disk-inserted が来ない") { probe.diskEvents(m).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", "extra", "/mnt/extra")), probe.diskEvents(m))
+            assertEquals("disk:root", mountSource(m, "/"))
+            assertNull(mountSource(m, "/mnt/root"), "戻した根を /mnt に重ねてマウントしない")
+            assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `前段がopenMountsの後に失敗して冷えた起動になったときは、落としたマウントのdisk-removedを出さない`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store) { m ->
+                m.vfs.createDirectory(VfsPath.parse("/data"))
+                m.vfs.mount(VfsPath.parse("/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
+                // 知らないマウントは、data の後（表の順）で冷えた起動（MOUNT）にする
+                m.vfs.createDirectory(VfsPath.parse("/weird"))
+                m.vfs.mount(VfsPath.parse("/weird"), TestMemoryFileSystem(), readOnly = false, source = "weird")
+            }
+            // data は開けない（落とす）。その後の weird で前段が失敗する
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+            val probe = QueueProbe().also { it.install(h) }
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            h.scheduler.hooks.duringRestoreInstall = null
+            assertColdBoot(m, finished, ColdBootCause.MOUNT)
+            assertNull(probe.queue, "後段に入っていないので、戻したキューはない（落としたマウントのイベントはどこにも届かない）")
+            assertEquals(0, m.diskClaimCount, "予約は残らない")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `RESTOREDを配る受け手の中でrebootしても、戻す前のdisk-removedは次のinitへ漏れず、起動し直せる`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store) { m ->
+                m.vfs.createDirectory(VfsPath.parse("/data"))
+                m.vfs.mount(VfsPath.parse("/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
+            }
+            // 起動ディスク none は prompt を init に持つ。data は開けない（落として disk-removed を出す）
+            val bootDisk = TestMemoryFileSystem().also { fs ->
+                fs.createDirectory(VfsPath.parse("/sbin"))
+                val bytes = resource("prompt-wasi.wasm")
+                fs.write(fs.createFile(VfsPath.parse(BootConfig.INIT_PATH)), 0, bytes, 0, bytes.size)
+            }
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id ->
+                when (id) {
+                    "root" -> BootVolume(TestMemoryFileSystem(), readOnly = false)
+                    "none" -> BootVolume(bootDisk, readOnly = true)
+                    else -> null
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "none"))
+            val finished = Finished()
+            // 受け手の中で再起動を求める（RESTORED の配達の途中。戻した表は再起動が片付ける）
+            finished.onFinished = { machine, outcome -> if (outcome == RestoreOutcome.RESTORED) assertTrue(machine.reboot()) }
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            // 起動し直した init が入力を待つ
+            eventually(60_000, "起動し直さない") {
+                h.scheduler.tick()
+                m.state == MachineState.RUNNING && !m.isBooting && !m.isRebootPending &&
+                    m.lock.withLockValue { m.kernel.processes[m.kernel.initPid]?.state == ProcessState.WAITING_EVENT }
+            }
+            // 起動し直した後に作ったキューには、戻す前のディスクのイベントは届かない
+            val q = m.lock.withLockValue {
+                m.kernel.events.ensureCapacity(m.kernel.objects)
+                EventQueue(EventFilter.ALL, 32).also {
+                    m.kernel.objects.add(it)
+                    m.kernel.events.subscribe(it, m.kernel.objects)
+                }
+            }
+            repeat(10) {
+                h.scheduler.tick()
+                Thread.sleep(5)
+            }
+            assertEquals(emptyList<String>(), m.lock.withLockValue { q.pendingEvents().filter { it.type.startsWith("disk-") }.map { it.type } })
+            assertEquals(null, mountSource(m, "/data"), "戻す前のマウントは残らない")
+            assertEquals(0, m.diskClaimCount)
+            m.close()
+        }
+    }
+
+    /** 開くのを [gated] の識別子ごとに止められる開き手（根は常に開ける）。[entered] は止まったときに数える */
+    private class GatedOpener(private val gated: Set<String>) : BootVolumeOpener {
+        val entered = ConcurrentHashMap<String, CountDownLatch>().also { map -> gated.forEach { map[it] = CountDownLatch(1) } }
+        val release = CountDownLatch(1)
+        val opens = ConcurrentHashMap<String, AtomicInteger>()
+
+        override fun open(diskId: String): BootVolume? = open(diskId) { false }
+
+        override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
+            opens.computeIfAbsent(diskId) { AtomicInteger() }.incrementAndGet()
+            if (diskId in gated) {
+                entered.getValue(diskId).countDown()
+                release.await(15, TimeUnit.SECONDS)
+            }
+            return BootVolume(TestMemoryFileSystem(), readOnly = false)
+        }
+    }
+
+    private fun saveWithData(h: Harness, store: MachineSaveStore): MachineIdentity = savePrompt(h, store) { m ->
+        m.vfs.createDirectory(VfsPath.parse("/data"))
+        m.vfs.mount(VfsPath.parse("/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
+    }
+
+    @Test
+    fun `復元の途中で予約の後に頼るディスクを抜くと止めるべきと答え、止めると取り消しになって予約が残らない`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = saveWithData(h, store)
+            val opener = GatedOpener(setOf("data"))
+            h.scheduler.hooks.bootVolumes = opener
+            val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "data"))
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            // data の予約を取って開いている途中
+            assertTrue(opener.entered.getValue("data").await(60, TimeUnit.SECONDS))
+            assertTrue(m.diskClaimCount >= 1, "data の予約を取っている")
+            assertTrue(m.isRestoring)
+            assertTrue(m.disksChanged(DiskSnapshot.of(mapOf("root" to ResolvedDisk(Path.of("unused", "root"), 1L shl 20, 64)))), "復元が頼るディスクが抜けたら止める")
+            m.stop()
+            assertFalse(m.isRestoring, "stop で復元の quiesce を閉じる")
+            opener.release.countDown()
+            eventually(10_000, "取り消しの知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(listOf(RestoreOutcome.CANCELLED), finished.outcomes.map { it.first })
+            eventually(10_000, "予約が残る") { m.diskClaimCount == 0 }
+            assertEquals(MachineState.STOPPED, m.state)
+            assertEquals(0, m.lock.withLockValue { m.kernel.processes.size })
+            m.close()
+        }
+    }
+
+    @Test
+    fun `復元の途中で予約の前に頼るディスクを抜いても止めるべきと答え、そのディスクは開かない`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = saveWithData(h, store)
+            // 根を開いている途中（data はまだ予約していない）で data を抜く
+            val opener = GatedOpener(setOf("root"))
+            h.scheduler.hooks.bootVolumes = opener
+            val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "data"))
+            val finished = Finished()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            assertTrue(opener.entered.getValue("root").await(60, TimeUnit.SECONDS))
+            assertTrue(m.disksChanged(DiskSnapshot.of(mapOf("root" to ResolvedDisk(Path.of("unused", "root"), 1L shl 20, 64)))), "復元が頼るディスクが抜けたら止める")
+            m.stop()
+            opener.release.countDown()
+            eventually(10_000, "取り消しの知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(listOf(RestoreOutcome.CANCELLED), finished.outcomes.map { it.first })
+            assertEquals(0, opener.opens["data"]?.get() ?: 0, "抜けたディスクは開かない")
+            eventually(10_000, "予約が残る") { m.diskClaimCount == 0 }
+            assertEquals(MachineState.STOPPED, m.state)
             m.close()
         }
     }

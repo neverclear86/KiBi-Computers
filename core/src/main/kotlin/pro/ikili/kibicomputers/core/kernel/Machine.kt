@@ -64,6 +64,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
@@ -2203,6 +2204,9 @@ public class Machine private constructor(
     /** 今挿さっているディスクの識別子（GameTest・GUI 用。ロックを取らずに読む写し） */
     public val insertedDiskIds: Set<String> get() = inserted.keys
 
+    /** ディスク [diskId] のマウントの位置（GameTest 用）。マウントしていなければ `null`。カーネルロックを取って読む */
+    public fun mountPointOfDisk(diskId: String): String? = lock.withLockValue { kernel.mounts.bySource(diskSource(diskId))?.point?.toString() }
+
     /**
      * 実行の世代（#56）。実行の終わりと段の始め（[endRunLocked]）で進める。予約（[DiskClaim]）を作ったときの世代と違えば、
      * その予約の開き手は取り消された。ロックを取らずに読む（開き手の取り消しの確かめ）
@@ -2602,11 +2606,13 @@ public class Machine private constructor(
      * ディスクはこのスレッドで同期に開く（`path_open` と同じ）。[readOnly] が偽でも、開いたものが読み取り専用ならそのままマウントする。
      * カーネルロックを持たずに呼ぶ
      *
+     * @return マウントしたディスクの項目（ファイル・ディレクトリ）の数。開いたときに木をたどった量で、呼び手が燃料を払う目安にする
+     *   （ホストのディスクでないものは 0）
      * @throws FsException 挿さっていない・`disk:` でない・同梱イメージ（`NOENT`）、もうマウント中・ほかの持ち主が開いている途中・
      *   位置にもうマウントがある（`BUSY`）、位置がディレクトリでない（`NOTDIR`）、開けない・途中で抜かれた・マシンが止まった（`IO`）
      */
     @Throws(FsException::class)
-    internal fun mountDisk(source: String, point: VfsPath, readOnly: Boolean) {
+    internal fun mountDisk(source: String, point: VfsPath, readOnly: Boolean): Int {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま mount を呼ばない" }
         if (!source.startsWith(MachineLimits.DISK_SOURCE_PREFIX)) fsError(Errno.NOENT, "$source はディスクではない")
         val diskId = source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
@@ -2633,11 +2639,14 @@ public class Machine private constructor(
                 mounted = true
                 releaseLocked(claim)
             }
+            return (v.fs as? DiskFileSystem)?.usedEntries ?: 0
         } finally {
             if (!mounted) volume?.fs?.retire()
             lock.withLockValue {
                 releaseLocked(claim)
-                if (!mounted) rescheduleAutoMountLocked()
+                // マウントできなかったときも、できたときも積み直す: 自動マウントの仕事がこの予約に阻まれて飛ばした挿し込みが残っていれば、
+                // 仕事はマウント済みを見つけて disk-inserted を出し、扱った印を付ける（できたときに積まないと、次の挿し込みまで届かない）
+                rescheduleAutoMountLocked()
             }
         }
     }
@@ -2850,9 +2859,19 @@ public class Machine private constructor(
         maybePostRebootLocked()
     }
 
-    /** `/tmp`（[MachineLimits.TMP_SOURCE]）のマウントを外し、中身が持つ RAM を返す（カーネルロックの中） */
+    /**
+     * `/tmp`（[MachineLimits.TMP_SOURCE]）のマウントを外し、中身が持つ RAM を返す（カーネルロックの中）。
+     * ゲストが `/tmp` の下にマウントしたもの（`mount` は位置を選ばない。#56）も一緒に、深いほうから外す
+     * （下にマウントがあると、強制でない外し方は `BUSY` を投げ、止めるべき道筋から例外が漏れる）
+     */
     private fun unmountTmpLocked() {
-        for (entry in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) vfs.unmount(entry.id)
+        for (tmp in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) {
+            val doomed = kernel.mounts.entries.filter { it.point.startsWith(tmp.point) }.sortedByDescending { it.point.depth }
+            for (entry in doomed) {
+                // 入れ子の /tmp が先に外れていることがある
+                if (kernel.mounts[entry.id] != null) vfs.unmountForcedLocked(entry.id)
+            }
+        }
     }
 
     /** マウントを深いほうからすべて外す（カーネルロックの中） */
@@ -3333,6 +3352,15 @@ internal object MachineLimits {
 
     /** 表示デバイスに書くときに、触ったセル1つあたりにプロセスが払う燃料（#355。仮の値。確定は #251） */
     internal const val CONSOLE_FUEL_PER_CELL: Long = 1
+
+    /**
+     * システムコールの `mount` が払う燃料の固定分（#56。仮の値。確定は #251）。ホスト側で毎回ディスクを開き、木をたどり、リースを取るので、
+     * ふつうの呼び出し（[pro.ikili.kibicomputers.core.wasi.p1.WasiP1Fd.CALL_FUEL] = 100）の 500 倍にする
+     */
+    internal const val MOUNT_FUEL: Long = 50_000
+
+    /** `mount` が開いたディスクの項目1つ（ファイル・ディレクトリ）あたりに払う燃料（木をたどった量に比例する。仮の値。確定は #251） */
+    internal const val MOUNT_FUEL_PER_ENTRY: Long = 100
 
     /** 起動ディスクのマウントの `source`（`disk:<識別子>`） */
     internal const val DISK_SOURCE_PREFIX: String = "disk:"

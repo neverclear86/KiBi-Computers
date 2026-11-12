@@ -227,8 +227,9 @@ object DiskItemGameTests {
     }
 
     /**
-     * 動いている間に根でないディスクを挿しても抜いても止めず（#56）、マシンの今挿さっているディスクの表が変わる。
-     * マウント・イベントの中身は core の DiskHotplugTest が確かめる
+     * 動いている間に、識別子のないディスクを根でないスロットに挿すと、接続層が識別子を付け（`onPartsChanged` → `prepareDisks`）、
+     * マシンの今挿さっているディスクの表に入り、`/mnt/<名前>` にマウントされる（#56）。止まらず、抜くとマウントが外れて表からも消える。
+     * 書き込みがホストのファイルに出ること・イベントの中身は core の DiskHotplugHostTest が確かめる
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -237,23 +238,35 @@ object DiskItemGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
         val machine = case.computer.machine!!
         val first = DiskItem.diskIdOf(diskSlot(case))!!
-        val second = store(helper).newId()
         val secondSlot = (0 until case.tier.slotCount).filter { case.tier.kindOf(it) == PartKind.STORAGE }[1]
-        var step = 0
+        var second: String? = null
+        var pulled = false
         helper.succeedWhen {
-            if (step == 0) {
+            if (second == null) {
                 helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting but was ${machine.state}")
+                // 識別子を付けずに挿す: 動いている間に接続層が付ける
                 val stack = disk()
-                stack.set(KiBiDataComponents.DISK_ID.get(), second)
+                helper.assertTrue(DiskItem.diskIdOf(stack) == null, "the new disk should have no ID")
                 case.parts.setStackInSlot(secondSlot, stack)
+                val id = DiskItem.diskIdOf(case.parts.getStackInSlot(secondSlot))
+                helper.assertTrue(id != null && DiskStore.isValidId(id), "an ID should be assigned while running but was $id")
+                second = id
                 helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "inserting a disk should not stop the case: ${case.computer}")
-                helper.assertTrue(machine.insertedDiskIds == setOf(first, second), "both disks should be inserted but had ${machine.insertedDiskIds}")
+                helper.assertTrue(machine.insertedDiskIds == setOf(first, id!!), "both disks should be inserted but had ${machine.insertedDiskIds}")
+            }
+            val id = second!!
+            if (!pulled) {
+                val point = machine.mountPointOfDisk(id)
+                helper.assertTrue(point != null && point.startsWith("/mnt/"), "the disk should be mounted under /mnt but was $point")
+                helper.assertTrue(store(helper).directoryOf(id) != null && Files.isDirectory(store(helper).directoryOf(id)!!), "the disk should have a host directory")
+                helper.assertTrue(machine.mountPointOfDisk(first) == "/home", "the first disk should stay mounted as /home but was ${machine.mountPointOfDisk(first)}")
                 case.parts.setStackInSlot(secondSlot, ItemStack.EMPTY)
-                step = 1
+                pulled = true
             }
             helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "pulling a non-root disk should not stop the case: ${case.computer}")
             helper.assertTrue(case.computer.machine === machine, "the machine should be kept")
             helper.assertTrue(machine.insertedDiskIds == setOf(first), "only the first disk should be inserted but had ${machine.insertedDiskIds}")
+            helper.assertTrue(machine.mountPointOfDisk(id) == null, "the pulled disk should be unmounted but was ${machine.mountPointOfDisk(id)}")
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
