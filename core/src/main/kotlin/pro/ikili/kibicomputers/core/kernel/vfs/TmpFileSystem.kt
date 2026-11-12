@@ -62,6 +62,18 @@ internal class TmpFileSystem(
     /** ファイルとディレクトリの数（根を含む） */
     val nodeCount: Int @Synchronized get() = nodes.size
 
+    /**
+     * 容量はマシンの RAM 全体、空きはその残り（プロセスの線形メモリなどとも分け合う。#453、ADR 0453）。空きは目安で、
+     * サーバー全体の勘定で断られることがあるので、書けることは保証しない。項目の数の上限はない（`null`）。根は数えない
+     */
+    override fun usage(): FsUsage = FsUsage(
+        totalBytes = memory.limitBytes,
+        usedBytes = usedBytes,
+        availableBytes = maxOf(0L, memory.limitBytes - memory.usedBytes),
+        totalEntries = null,
+        usedEntries = maxOf(0, nodeCount - 1).toLong(),
+    )
+
     // ---- パスの操作 ----
 
     @Synchronized

@@ -101,6 +101,22 @@ internal class DiskFileSystem private constructor(
     override val tracksOpenFiles: Boolean get() = true
 
     /**
+     * 容量（[DiskQuota]）と、メモリ上の使用量（#453、ADR 0453）。開かない・数え直さない（リースに触らない）。
+     * [usedBytes] と [usedEntries] は別々に読むので、書いている途中なら一瞬ずれることがある。
+     * 外で書き足されて使用量が容量を超えても、空きは 0 で止める
+     */
+    override fun usage(): FsUsage {
+        val used = usedBytes
+        return FsUsage(
+            totalBytes = quota.maxBytes,
+            usedBytes = used,
+            availableBytes = maxOf(0L, quota.maxBytes - used),
+            totalEntries = quota.maxEntries.toLong(),
+            usedEntries = usedEntries.toLong(),
+        )
+    }
+
+    /**
      * ホストの名前の変更（`Files.move`）の直前に呼ぶ口（テスト専用。例外を投げさせて、失敗の道を試す）。リースのロックの中で呼ばれる
      */
     @Volatile

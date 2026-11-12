@@ -31,8 +31,14 @@ internal class ImageFileSystem private constructor(
     /** ファイルとディレクトリの数（根を含む） */
     val entryCount: Int get() = byPath.size
 
-    /** 普通のファイルの中身の合計（バイト） */
-    val totalBytes: Long get() = byNode.values.sumOf { it.data?.size?.toLong() ?: 0 }
+    /** 普通のファイルの中身の合計（バイト。作るときに1回だけ数える。同梱イメージは全台で共有するので、呼ぶたびに数えない） */
+    val totalBytes: Long = byNode.values.sumOf { it.data?.size?.toLong() ?: 0 }
+
+    /** 中身の合計が全体で、使用も同じ、空きは 0（読み取り専用。#453、ADR 0453）。項目の数は根を除く */
+    override fun usage(): FsUsage {
+        val entries = (entryCount - 1).toLong()
+        return FsUsage(totalBytes = totalBytes, usedBytes = totalBytes, availableBytes = 0, totalEntries = entries, usedEntries = entries)
+    }
 
     override fun stat(path: VfsPath): FileStat = find(path).stat
 

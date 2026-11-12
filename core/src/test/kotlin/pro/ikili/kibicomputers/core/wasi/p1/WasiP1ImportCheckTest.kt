@@ -182,6 +182,20 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_fs_mountsのlist-mountsとlist-disksはcabi_reallocが要り、mountとunmountだけなら要らない`() {
+        val f = WasiP1Kibi.FS_MOUNTS
+        val mount = Triple(f, "mount", List(6) { I32 } to emptyList<Int>())
+        val unmount = Triple(f, "unmount", List(3) { I32 } to emptyList<Int>())
+        val listMounts = Triple(f, "list-mounts", listOf(I32) to emptyList<Int>())
+        val listDisks = Triple(f, "list-disks", listOf(I32) to emptyList<Int>())
+        assertDoesNotThrow { WasiP1.checkImports(load(command(mount, unmount))) }
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), mount, listMounts, listDisks))) }
+        assertNoexec(load(command(listMounts)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(listDisks)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(Triple(f, "list-mounts", emptyList<Int>() to listOf(I32)))), "型が違う")
+    }
+
+    @Test
     fun `kibi_io_ttyは型が一致するときだけ通り、版違い・表にない関数は断る`() {
         val isTty = Triple(WasiP1Kibi.IO_TTY, "is-tty", listOf(I32) to listOf(I32))
         val getMode = Triple(WasiP1Kibi.IO_TTY, "get-mode", listOf(I32, I32) to emptyList<Int>())

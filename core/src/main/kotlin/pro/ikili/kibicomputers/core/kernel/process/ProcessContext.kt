@@ -4,10 +4,12 @@ import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.device.CallResult
 import pro.ikili.kibicomputers.core.device.DeviceCallException
 import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.kernel.DiskListing
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.kernel.MountListing
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
@@ -71,6 +73,15 @@ internal interface ProcessContext {
     /** [point]（相対パスは作業ディレクトリから）のマウントを外す（`unmount`。#56）。失敗は `Machine.unmountAt` と同じ */
     @Throws(FsException::class)
     fun unmount(point: String)
+
+    /**
+     * マウントの一覧（`list-mounts`。足した順。#453、ADR 0453）。待たない。どのスレッドから呼んでもよい（`cabi_realloc` の中からも）。
+     * カーネルロックの中で表を写し、ロックの外で容量を読む（`Machine.listMounts`）
+     */
+    fun listMounts(): List<MountListing>
+
+    /** 挿さっているディスクの一覧（`list-disks`。スロットの順。#453）。待たない。どのスレッドから呼んでもよい。ディスクは開かない */
+    fun listDisks(): List<DiskListing>
 
     /**
      * このプロセスを親にして、読み込み済みの [program] からプロセスを作る（`Machine.spawn`。[SpawnOptions] の既定は親から引き継ぐ）。

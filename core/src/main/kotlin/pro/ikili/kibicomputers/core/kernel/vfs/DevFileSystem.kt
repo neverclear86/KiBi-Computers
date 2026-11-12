@@ -14,6 +14,9 @@ package pro.ikili.kibicomputers.core.kernel.vfs
  * どの操作も I/O をしないので、どのスレッドから同時に呼んでもよく、排他も要らない。
  */
 internal class DevFileSystem : FileSystem {
+    /** 容量も使用量もすべて 0（中身は RAM にもディスクにも置かない。#453、ADR 0453）。項目の数の上限も 0（`none` は上限なしの意味なので使わない） */
+    override fun usage(): FsUsage = USAGE
+
     override fun stat(path: VfsPath): FileStat {
         if (path.isRoot) return ROOT_STAT
         if (path.depth != 1) {
@@ -107,6 +110,9 @@ internal class DevFileSystem : FileSystem {
     private fun deviceStat(node: Long): FileStat = FileStat(node, FileType.CHARACTER_DEVICE)
 
     companion object {
+        /** [usage] の値（すべて 0） */
+        private val USAGE = FsUsage(totalBytes = 0, usedBytes = 0, availableBytes = 0, totalEntries = 0, usedEntries = 0)
+
         /** 根の node */
         const val ROOT_NODE: Long = 1
 

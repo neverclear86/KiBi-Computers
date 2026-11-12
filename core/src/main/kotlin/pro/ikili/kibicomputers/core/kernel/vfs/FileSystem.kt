@@ -131,6 +131,13 @@ internal interface FileSystem {
      */
     fun pathHint(node: Long): VfsPath? = null
 
+    /**
+     * 容量と使用量（`kibi:fs/mounts` の `list-mounts`。#453、ADR 0453）。分からなければ `null`（既定）。
+     * カーネルロックの**外**で呼ばれる（ロックの中から呼んでよい5つには入らない）。I/O をせず、自分のロックも長く待たずに、すぐ返す
+     * （ディスクを開いたり数え直したりしない。今持っている数を読むだけ）
+     */
+    fun usage(): FsUsage? = null
+
     /** [node] の中身を記憶装置へ書き出す（既定は何もしない） */
     fun sync(node: Long) {}
 

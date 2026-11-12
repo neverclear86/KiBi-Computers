@@ -66,4 +66,9 @@ class DevFileSystemTest {
         // touch /dev/null は通る
         v.setTimes(p("/dev/null"), 1, 2)
     }
+
+    @Test
+    fun `usageはすべて0で、項目の上限もsome(0)`() {
+        assertEquals(FsUsage(0, 0, 0, 0, 0), DevFileSystem().usage())
+    }
 }

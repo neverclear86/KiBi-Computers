@@ -60,6 +60,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [IO_TTY] | `set-foreground` | `(fd, pid, ret_ptr: i32) -> ()` |
  * | [FS_MOUNTS] | `mount` | `(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr: i32) -> ()`（#56） |
  * | [FS_MOUNTS] | `unmount` | `(pt_ptr, pt_len, ret_ptr: i32) -> ()` |
+ * | [FS_MOUNTS] | `list-mounts` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#453） |
+ * | [FS_MOUNTS] | `list-disks` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#453） |
  * | [PROCESS] | （[WasiP1KibiProcess] の表。#74） | |
  *
  * p2・p3 だけの interface（`kibi:io` の `pipe-streams`・`pipe-async`、`kibi:kernel` の `timers-poll`・`events-poll`・
@@ -70,7 +72,9 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * `kibi:computer/power` の `shutdown`・`reboot` は、受け付けたら呼んだプロセスも止まるので戻らない（ADR 0306）。
  * `kibi:process` の `[static]process.spawn` だけが待つ（[WasiP1.WAIT_IMPORTS]。[WasiP1KibiProcess]）。ほかは待たない。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数、
- * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）。
+ * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）、
+ * `kibi:fs/mounts` の `list-mounts`・`list-disks` は加えて件数 × [KibiFs.MOUNT_LIST_FUEL_PER_ENTRY]（#453）。
+ * `list-mounts`・`list-disks` は待たず、`cabi_realloc` の中からも呼べる（一覧はカーネルロックの中で写し、ロックを放してから `cabi_realloc` を呼ぶ）。
  */
 internal object WasiP1Kibi {
     /** `kibi:kernel/events` のモジュール名 */
@@ -360,6 +364,18 @@ internal object WasiP1Kibi {
                 KibiErrors.code(e)
             }
             P1Canonical.lowerUnitResult(memory, a[2].i(), error)
+            NONE
+        },
+        Fn(FS_MOUNTS, "list-mounts", WasmFunctionType.of(listOf(I32), emptyList()), true) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val entries = KibiFs.listMounts(ctx)
+            P1Canonical.lowerMountListResult(memory, realloc(ctx, caller), a[0].i(), entries)
+            NONE
+        },
+        Fn(FS_MOUNTS, "list-disks", WasmFunctionType.of(listOf(I32), emptyList()), true) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val entries = KibiFs.listDisks(ctx)
+            P1Canonical.lowerDiskListResult(memory, realloc(ctx, caller), a[0].i(), entries)
             NONE
         },
     )

@@ -796,4 +796,92 @@ class DiskHotplugTest {
             m.close()
         }
     }
+
+    // ---- マウントとディスクの一覧（#453、ADR 0453） ----
+
+    @Test
+    fun `listMountsはマウントを足した順に、FSの容量を付けて返す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1", "d2")
+            val m = b.m
+            val mounts = m.listMounts()
+            val expected = m.lock.withLockValue { m.kernel.mounts.entries.map { Triple(it.id, it.point.toString(), it.source) } }
+            assertEquals(expected, mounts.map { Triple(it.id, it.point, it.source) })
+            assertTrue(mounts.map { it.source }.containsAll(listOf("disk:root", "tmp", "dev", "disk:d1", "disk:d2")), mounts.toString())
+            // テストのディスク（TestMemoryFileSystem）は容量を知らないので none、/tmp と /dev は some
+            assertNull(mounts.first { it.source == "disk:d1" }.usage)
+            assertNotNull(mounts.first { it.source == "tmp" }.usage)
+            assertEquals(pro.ikili.kibicomputers.core.kernel.vfs.FsUsage(0, 0, 0, 0, 0), mounts.first { it.source == "dev" }.usage)
+            assertFalse(mounts.first { it.source == "disk:d1" }.readOnly)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `listDisksはスロットの順で、マウントしていないディスクも位置なしで出し、その sourceでmountでき、抜くと消え、ディスクを開かない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1", "d2")
+            val m = b.m
+            val cap = 1L shl 20
+            assertEquals(
+                listOf(DiskListing("root", cap, 64, "/"), DiskListing("d1", cap, 64, "/mnt/d1"), DiskListing("d2", cap, 64, "/mnt/d2")),
+                m.listDisks(),
+            )
+            val opens = b.disks.opened("d1")
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            val d1 = m.listDisks().first { it.diskId == "d1" }
+            assertNull(d1.mountPoint)
+            assertEquals(opens, b.disks.opened("d1"), "一覧はディスクを開かない")
+            m.mountDisk(MachineLimits.DISK_SOURCE_PREFIX + d1.diskId, VfsPath.parse("/x"), false)
+            assertEquals("/x", m.listDisks().first { it.diskId == "d1" }.mountPoint)
+            // スロットを入れ替えただけなら、並びだけが変わり、外さない・イベントも出さない
+            val q = m.subscribeAll()
+            assertFalse(m.disksChanged(snapshot("root", "d2", "d1")))
+            assertEquals(listOf("root", "d2", "d1"), m.listDisks().map { it.diskId })
+            assertEquals(emptyList<Triple<String, String, String>>(), m.diskEvents(q))
+            assertEquals("disk:d1", m.mountAt("/x"))
+            // 抜くと消える
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            assertEquals(listOf("root", "d1"), m.listDisks().map { it.diskId })
+            assertTrue(m.listMounts().none { it.source == "disk:d2" })
+            m.close()
+        }
+    }
+
+    @Test
+    fun `p1のlist-mountsとlist-disksは一覧を書き、cabi_reallocの中から呼んでもトラップしない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1", "d2")
+            val m = b.m
+            m.unmountAt(VfsPath.parse("/mnt/d2"))
+            val mounts = m.listMounts()
+            val out = runKibiFs(h, m, "mounts", "disks", "mounts-realloc").lines().filter { it.isNotEmpty() }
+            val expectedMounts = mounts.map { e ->
+                val kind = pro.ikili.kibicomputers.core.wasi.kibi.KibiFs.kindOf(e.source).ordinal
+                val u = e.usage
+                val usage = if (e.source == "tmp") null else if (u == null) "none" else "${u.totalBytes} ${u.usedBytes} ${u.availableBytes} ${u.totalEntries ?: "-"} ${u.usedEntries}"
+                "m ${e.point} ${e.source} $kind ${if (e.readOnly) 1 else 0} ${e.id}" + (usage?.let { " $it" } ?: "")
+            }
+            val mountLines = out.filter { it.startsWith("m ") }
+            assertEquals(expectedMounts.size, mountLines.size, out.toString())
+            for ((line, exp) in mountLines.zip(expectedMounts)) {
+                // /tmp は使用量がプロセスのメモリで動くので、数の前までを比べる
+                if (exp.contains(" tmp ")) {
+                    assertTrue(line.startsWith(exp + " "), "$line / $exp")
+                    assertEquals(11, line.split(" ").size, line)
+                    assertEquals("-", line.split(" ")[9], line)
+                } else {
+                    assertEquals(exp, line)
+                }
+            }
+            assertTrue("mounts ${mounts.size}" in out)
+            val cap = 1L shl 20
+            assertEquals(
+                listOf("d disk:root $cap 64 /", "d disk:d1 $cap 64 /mnt/d1", "d disk:d2 $cap 64 -", "disks 3"),
+                out.filter { it.startsWith("d") },
+            )
+            assertEquals("mounts-realloc ${mounts.size} ${mounts.size}", out.last())
+            m.close()
+        }
+    }
 }

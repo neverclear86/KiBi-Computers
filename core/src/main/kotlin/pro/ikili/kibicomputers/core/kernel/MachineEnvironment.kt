@@ -111,13 +111,13 @@ public fun interface DiskResolver {
 }
 
 /**
- * 挿さっているディスクの、変わらない表（識別子 → 実体。挿した順。#56）。[DiskResolver] として引ける。
+ * 挿さっているディスクの、変わらない表（識別子 → 実体。接続層が渡す順＝スロットの順。#56。`list-disks` もこの順。#453）。[DiskResolver] として引ける。
  * 電源を入れたときは [MachineEnvironment.disks] で、動いている間の挿し抜きは `ComputerCase.partsChanged` でマシンに渡す。
  * 作った後に元の表を変えても、中身は変わらない（プロセスのスレッドからも読むため）
  */
 @ApiStatus.Internal
 public class DiskSnapshot private constructor(
-    /** 識別子 → 実体（変わらない写し。挿した順） */
+    /** 識別子 → 実体（変わらない写し。接続層が渡す順） */
     public val disks: Map<String, ResolvedDisk>,
 ) : DiskResolver {
     override fun resolve(diskId: String): ResolvedDisk? = disks[diskId]
