@@ -1,17 +1,16 @@
-//! 独自拡張 `kibi:kernel/events`（#73。ABI は docs/adr/0073-kibi-wit.md）の包みと、標準 OS の `cabi_realloc`（#87）。
+//! 独自拡張 `kibi:kernel/events`（#73。ABI は docs/adr/0073-kibi-wit.md）の包み（#87）。
 //!
-//! `take` の可変長の結果（イベントの並び・文字列・値）は、ホストがゲストの `cabi_realloc` で場所を取って書く。
-//! 標準 OS は標準のアロケーターを使わないので、`cabi_realloc` は静的な領域（.bss。触るまで RAM に数えない）から切り出すだけにする:
-//! - `take` を呼ぶ直前に先頭へ戻す。取り出したイベントは、次の `take` までしか読めない。
+//! `take` の可変長の結果（イベントの並び・文字列・値）は、ホストがゲストの `cabi_realloc`（`canon.zig`）で場所を取って書く:
+//! - `take` を呼ぶ直前に領域を先頭へ戻す（`canon.reset`）。取り出したイベントは、次の `take` までしか読めない。
 //! - 1 回に 1 件だけ取り出す（[Queue.takeOne]）。1 件の最悪（デバイスが出す大きなイベント）でも約 5 KiB で、領域に収まる。
-//! - 足りなければ線形メモリの外を返す（ホストがトラップする）。0 を返すと、アドレス 0 から上書きしてメモリを壊すため。
-//! - 止まりうる import（`fd_write` など）は呼ばない（`cabi_realloc` の中で呼ぶとトラップ。ADR 0073）。
+//!   毎回先頭へ戻すので、常駐する sh・nano が触る区画は増えない。
 //!
-//! `cabi_realloc` は、`kibi.events` を使うプログラムだけが export する（`core/build.gradle.kts` の `osEventsPrograms` に足し、`--export=cabi_realloc` でビルドする）。
+//! `kibi.events` を使うプログラムは `cabi_realloc` を export する（`core/build.gradle.kts` の `osReallocPrograms` に足す）。
 //! `take` を import するのに `cabi_realloc` がなければ、読み込みで NOEXEC になる。
 const wasi = @import("wasi.zig");
 const io = @import("io.zig");
 const errno = @import("errno.zig");
+const canon = @import("canon.zig");
 
 pub const Error = errno.Error;
 
@@ -99,32 +98,6 @@ const raw = struct {
     extern "kibi:kernel/events@0.1.0" fn @"[resource-drop]event-queue"(self: u32) void;
 };
 
-// ---- cabi_realloc ----
-
-/// `take` の結果を置く領域。1 件の最悪は event 24 + 種類 64 + source 128 + 値 32×16 + 文字列・バイト列の中身 4096 に、
-/// 割り当てごとの詰め物を足して約 5 KiB
-const ARENA_SIZE = 8 * 1024;
-var arena: [ARENA_SIZE]u8 align(16) = undefined;
-var arena_used: usize = 0;
-
-/// 足りないときに返す場所（線形メモリの外。align 8 に揃えてあるので、ホストは範囲外としてトラップする）
-const OUT_OF_ARENA: u32 = 0xFFFF_FFF8;
-
-/// ホストが `take` の結果の場所を取る（Canonical ABI の `cabi_realloc`）。新しく取るだけで、[old] は使わない
-/// （ホストは `cabi_realloc(0, 0, align, size)` で呼ぶ）
-export fn cabi_realloc(old: u32, old_len: u32, alignment: u32, new_len: u32) u32 {
-    _ = old;
-    _ = old_len;
-    const a: usize = if (alignment == 0) 1 else alignment;
-    if (a & (a - 1) != 0) return OUT_OF_ARENA;
-    const base = @intFromPtr(&arena);
-    const start = (base + arena_used + a - 1) & ~(a - 1);
-    const offset = start - base;
-    if (offset > ARENA_SIZE or new_len > ARENA_SIZE - offset) return OUT_OF_ARENA;
-    arena_used = offset + new_len;
-    return @intCast(start);
-}
-
 // ---- キュー ----
 
 /// 1 回の取り出しの結果。[event] は次の `take` まで読める
@@ -151,7 +124,7 @@ pub const Queue = struct {
 
     /// 待たずに 1 件取り出す
     pub fn takeOne(self: Queue) Error!Taken {
-        arena_used = 0;
+        canon.reset();
         var r: ResultBatch = undefined;
         raw.@"[method]event-queue.take"(self.handle, 1, &r);
         if (r.is_err != 0) return io.kibiError(r.val.err);
