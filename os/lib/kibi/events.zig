@@ -189,7 +189,7 @@ pub const Ready = struct {
 };
 
 /// [fd] の入力か [q] のイベントを待つ（`poll_oneoff` の FD_READ を 2 つ。時計では起きない）。
-/// キューの側がエラーで起きたら `IO`（呼び手はキューを閉じて、入力だけを待つ）
+/// キューの側がエラーで起きたら `IO`（ハンドルが不正なとき。呼び手はキューを閉じずに手放して、入力だけを待つ。不正なハンドルの drop はトラップする）
 pub fn waitInputOrQueue(fd: io.Fd, q: Queue) Error!Ready {
     const subs = [_]wasi.Subscription{
         .{ .userdata = 0, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = fd } } },

@@ -69,18 +69,24 @@ fn closeRestored() void {
     restored = null;
 }
 
+/// 待ち・取り出しに失敗したキューを、閉じずに手放す（#87、ADR 0087）。失敗するのはハンドルが不正なとき（取り出しの BADF・
+/// poll のキュー側のエラー）だけで、不正なハンドルを drop するとトラップするので閉じない
+fn abandonRestored() void {
+    restored = null;
+}
+
 /// 読んだバイトが残っていなければ、入力か「保存から戻った」を待つ（#87、ADR 0087）。戻ったら、端末の設定（代替画面・折り返しなし）
 /// から出し直して全体を描き直し、また待つ（戻した直後の表示のデバイスは初期の状態のことが多い。#630）
 fn awaitInput() void {
     while (restored) |q| {
         if (!reader.idle()) return;
         const ready = kibi.events.waitInputOrQueue(io.STDIN, q) catch {
-            closeRestored();
+            abandonRestored();
             return;
         };
         if (ready.queue) {
             const redraw = q.drainRestored() catch {
-                closeRestored();
+                abandonRestored();
                 return;
             };
             if (redraw) {

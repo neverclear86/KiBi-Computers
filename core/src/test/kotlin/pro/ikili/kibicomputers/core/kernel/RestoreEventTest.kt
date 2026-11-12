@@ -36,11 +36,13 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * 復元のイベント `restored`（#87、ADR 0087）: 成功した復元で、戻したキューに1件ずつ届き、値は実時間・ゲーム内時間の飛び。
- * 戻せなかったとき（後段の失敗）には出さない。受け手が返るまでプロセスは動かない
+ * 戻せなかったとき（後段の失敗・冷えた起動・取り消し）には出さない。受け手が返るまでプロセスは動かない
  */
 class RestoreEventTest {
     @TempDir
@@ -234,6 +236,86 @@ class RestoreEventTest {
             assertEquals(RestoreOutcome.CANCELLED, r.outcome, "知らせは来ない")
             assertTrue(seen!!.isNotEmpty(), "キューを表に入れる前に落ちた")
             assertTrue(seen!!.values.all { it.isEmpty() }, "時計を戻した時点で出していた")
+        }
+    }
+
+    @Test
+    fun `冷えた起動になったときは出さず、起動したinitが開いたキューにも入らない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val modules = MemoryModuleStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h ->
+            val saved = save(h, store, ManualClock(realtime = 1_000L, world = 10))
+            // モジュールを置き場から消して、前段で戻せなくする（MODULE_MISSING で冷えた起動待ち）
+            modules.remove(pro.ikili.kibicomputers.core.persist.ModuleStore.sha256(resource("prompt-wasi.wasm")))
+            // 冷えた起動の init は、restored だけを受けるキューを開いて待つ（kibi-events を /sbin/init として起動）
+            val init = TestMemoryFileSystem().also { fs ->
+                val bytes = resource("kibi-events-wasi.wasm")
+                fs.createDirectory(VfsPath.parse("/sbin"))
+                val node = fs.createFile(VfsPath.parse(BootConfig.INIT_PATH))
+                fs.write(node, 0, bytes, 0, bytes.size)
+            }
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id ->
+                when (id) {
+                    "root" -> BootVolume(TestMemoryFileSystem(), readOnly = false)
+                    "d" -> BootVolume(init, readOnly = false)
+                    else -> null
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = env(ManualClock(realtime = 9_000_000_000L, world = 500)))
+            val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
+            val listener = RestoreListener { machine, outcome, _ ->
+                outcomes += outcome
+                if (outcome == RestoreOutcome.COLD_BOOT) machine.coldBootAfterRestore()
+            }
+            val config = BootConfig.builder().addBootDisk("d").build()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.id, saved.generation), config, listener)))
+            // init がキューを開いて待つまで回す
+            eventually(60_000, "init がキューを開いて待たない") {
+                h.scheduler.tick()
+                val pid = m.lock.withLockValue { m.kernel.initPid }
+                pid != 0 && m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint && queues(m).containsKey(RestoreEvents.TYPE)
+            }
+            assertEquals(listOf(RestoreOutcome.COLD_BOOT), outcomes.toList())
+            // 少し回しても、restored は届かない（init は起きず、キューは空のまま）
+            repeat(20) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+            }
+            val pid = m.lock.withLockValue { m.kernel.initPid }
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid), "init が起きた")
+            assertEquals(emptyList<KernelEvent>(), queues(m)[RestoreEvents.TYPE], "冷えた起動で restored を出した")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `取り消したときは出さない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(h, store, ManualClock(realtime = 1_000L, world = 10))
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            h.scheduler.hooks.beforeRestoreInstall = {
+                entered.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = env(ManualClock(realtime = 9_000_000_000L, world = 500)))
+            val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
+            val listener = RestoreListener { _, outcome, _ -> outcomes += outcome }
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.id, saved.generation), bootConfig(), listener)))
+            assertTrue(entered.await(60, TimeUnit.SECONDS), "後段の手前まで来ない")
+            m.stop()
+            release.countDown()
+            eventually(60_000, "取り消しの知らせが来ない") {
+                h.scheduler.tick()
+                outcomes.isNotEmpty()
+            }
+            repeat(5) { h.scheduler.tick() }
+            assertEquals(listOf(RestoreOutcome.CANCELLED), outcomes.toList())
+            assertEquals(MachineState.STOPPED, m.state)
+            assertTrue(queues(m).values.all { q -> q.none { it.type == RestoreEvents.TYPE } }, "取り消したのに restored を出した")
+            h.scheduler.hooks.beforeRestoreInstall = null
+            m.close()
         }
     }
 

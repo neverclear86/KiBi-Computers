@@ -11,9 +11,12 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -140,14 +143,15 @@ class StandardOsRestoreTest {
 
     /**
      * 新しい表示のマシンに戻し、受け手が返るまで回す。[probe] は受け手の中（復元の quiesce が閉じる前）で、プロセス [pid] の
-     * 状態を見る（少し待ってから。受け手の中でプロセスが動くなら、その間に書いて待ちに戻る）
+     * 状態と、それまでに表示に届いた出力・コンソールの TTY にたまった出力のバイト数を見る（少し待ってから。受け手の中でプロセスが
+     * 動くなら、その間に書いて待ちに戻る）
      */
     private fun restore(
         h: Harness,
         store: MachineSaveStore,
         identity: MachineIdentity,
         pid: Int? = null,
-        probe: ((ProcessState) -> Unit)? = null,
+        probe: ((ProcessState, String, Int) -> Unit)? = null,
     ): Pair<Machine, ScreenHost> {
         val host = ScreenHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
@@ -155,7 +159,10 @@ class StandardOsRestoreTest {
         val listener = RestoreListener { machine, outcome, _ ->
             if (pid != null && probe != null) {
                 Thread.sleep(300)
-                probe(machine.stateOf(pid))
+                val pendingTty = machine.lock.withLockValue {
+                    (machine.kernel.objects[machine.kernel.consoleTtyId] as? Tty)?.outputAvailable ?: -1
+                }
+                probe(machine.stateOf(pid), host.text(), pendingTty)
             }
             outcomes += outcome
         }
@@ -177,10 +184,17 @@ class StandardOsRestoreTest {
                 m.offerConsoleInput("echo hi".toByteArray())
             }
             var inListener: ProcessState? = null
-            val (m, host) = restore(h, store, saved, pid) { inListener = it }
+            var drawnInListener: String? = null
+            var pendingInListener: Int? = null
+            val (m, host) = restore(h, store, saved, pid) { state, text, pending ->
+                inListener = state
+                drawnInListener = text
+                pendingInListener = pending
+            }
             // 受け手の中では、sh は起こされている（restored が入った）が、まだ1歩も進んでいない（進めば描いて待ちに戻る）
             assertEquals(ProcessState.RUNNABLE, inListener, "受け手の中の sh の状態")
-            assertEquals("", host.text(), "受け手の中では、まだ何も描いていない")
+            assertEquals("", drawnInListener, "受け手の中では、まだ何も描いていない")
+            assertEquals(0, pendingInListener, "受け手の中では、コンソールの TTY にも書いていない")
             eventuallyDescribe(60_000, { "描き直さない: ${host.text()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
@@ -264,6 +278,54 @@ class StandardOsRestoreTest {
             }
             m.close()
         }
+    }
+
+    /** プロセス [pid] が開いているイベントキューの fd を、カーネルの側から閉じる（ハンドルを不正にする）。閉じた数を返す */
+    private fun closeQueuesFromKernel(m: Machine, pid: Int): Int = m.lock.withLockValue {
+        val table = FdTable(checkNotNull(m.kernel.processes[pid]), m.kernel.objects, m.wakeSink)
+        val fds = table.entries().keys.filter { table.objectOf(it) is EventQueue }
+        fds.forEach { table.close(it) }
+        fds.size
+    }
+
+    /**
+     * キューのハンドルを不正にしてから入力を送る。待ち（poll のキュー側のエラー）か取り出し（BADF）が失敗するが、
+     * 不正なハンドルを drop せず（drop はトラップ）に手放し、入力だけを待って続ける（#87、ADR 0087）
+     */
+    private fun survivesBrokenQueue(program: String, args: List<String>, typed: String, expect: (ScreenHost) -> Boolean) = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ScreenHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            for (d in listOf("/bin", "/home")) m.vfs.createDirectory(VfsPath.parse(d))
+            for (name in listOf(program, "echo")) m.put("/bin/$name", imageFile("/bin/$name"))
+            val pid = m.exec(
+                "/bin/$program",
+                KernelDrivers.DEFAULT,
+                SpawnOptions(args = listOf(program) + args, env = mapOf("PATH" to "/bin", "HOME" to "/home", "PWD" to "/home"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN),
+            )
+            settle(h, m, host, pid)
+            assertEquals(1, closeQueuesFromKernel(m, pid), "$program がキューを開いて待っていない")
+            m.offerConsoleInput(typed.toByteArray())
+            eventuallyDescribe(60_000, { "続かない: ${m.stateOf(pid)}\n${host.screen()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                expect(host)
+            }
+            settle(h, m, host, pid)
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid), "$program が終わった")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `キューのハンドルが不正になってもshは落ちずに入力だけを待つ`() = survivesBrokenQueue("sh", emptyList(), "echo ok\n") { host ->
+        host.row(1) == "ok" && host.row(2) == "$"
+    }
+
+    @Test
+    fun `キューのハンドルが不正になってもnanoは落ちずに入力だけを待つ`() = survivesBrokenQueue("nano", listOf("note.txt"), "hello") { host ->
+        host.row(1) == "hello"
     }
 
     @Test

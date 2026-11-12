@@ -2,8 +2,8 @@
 //
 //   kibi-events wait [close]   開く → poll で待つ → 取り出して標準出力に出す → [resource-drop]（close なら fd_close）で閉じる
 //   kibi-events restored       "restored" だけを受けるキューを開き、poll で待つ。起きたら「woke」を出してから取り出して出す（#87。復元で起きる確認）。
-//                              最後に標準入力を待って生きたままにする
-//   kibi-events invalid      不正な入力ごとの error-code を出す（"inval ..." の行）
+//                              最後に標準入力を待って生きたままにする。引数なしで /sbin/init として起動したときも同じ
+//   kibi-events invalid        不正な入力ごとの error-code を出す（"inval ..." の行）
 //   kibi-events max            max に 0・1・2^31・2^32-1 を渡したときの結果を出す（"max ..." の行）
 //   kibi-events spin           wait と同じだが、取り出すときの cabi_realloc の中で重い計算をする
 //   kibi-events realloc-poll   取り出すときの cabi_realloc の中で poll_oneoff を呼ぶ（トラップになるはず）
@@ -264,6 +264,8 @@ static int run_misaligned(uint32_t len) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    // init（argv は ["/sbin/init"] だけ）として起動したら restored と同じ（#87。冷えた起動の後に開いたキューを確かめる）
+    if (argc == 1 && strcmp(argv[0], "/sbin/init") == 0) return run_restored();
     if (argc < 2) return 2;
     const char *mode = argv[1];
     if (strcmp(mode, "wait") == 0) return run_wait(argc > 2 && strcmp(argv[2], "close") == 0);

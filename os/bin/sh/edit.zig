@@ -684,18 +684,24 @@ fn closeRestored() void {
     restored = null;
 }
 
+/// 待ち・取り出しに失敗したキューを、閉じずに手放す（#87、ADR 0087）。失敗するのはハンドルが不正なとき（取り出しの BADF・
+/// poll のキュー側のエラー）だけで、不正なハンドルを drop するとトラップするので閉じない
+fn abandonRestored() void {
+    restored = null;
+}
+
 /// キーの境目で 1 バイト読む。読む前に、入力か「保存から戻った」を待ち、戻ったら行を描き直してまた待つ（#87、ADR 0087）。
 /// 戻した直後の画面は空のことが多い（表示のデバイスは保存しない。#630）ので、プロンプトと入力中の行を出し直す。
 /// 描き直しは [refresh] だけで行う（画面が残っていても、相対の描き直しなら崩れない）
 fn readKeyByte() ?u8 {
     while (restored) |q| {
         const ready = kibi.events.waitInputOrQueue(IN, q) catch {
-            closeRestored();
+            abandonRestored();
             break;
         };
         if (ready.queue) {
             const redraw = q.drainRestored() catch {
-                closeRestored();
+                abandonRestored();
                 break;
             };
             if (redraw) refresh();
