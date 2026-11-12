@@ -49,6 +49,9 @@ public enum class ComputerError {
 
     /** マシンを作れなかった（サーバーの停止の途中など） */
     UNAVAILABLE,
+
+    /** 起動に失敗した（起動できるディスクがない・init を実行できないなど。理由の詳細は画面のコンソールに出る。#641） */
+    BOOT_FAILED,
 }
 
 /**
@@ -62,6 +65,8 @@ public enum class ComputerError {
  * - マシンが [MachineState.CRASHED] になったら [ComputerStatus.ERROR]（[ComputerError.CRASHED]）
  * - ゲストが止めた（再起動の途中でない [MachineState.STOPPED]。`poweroff`・init の終了）ら、[turnOff] と同じく
  *   マシンを外して [ComputerStatus.OFF] にする（#640）
+ * - 起動に失敗した（[MachineHost.onBootFailed]。再起動・復元の後の起動を含む）ら、マシンを外して [ComputerStatus.ERROR]
+ *   （[ComputerError.BOOT_FAILED]）にする（#641）
  * - ブロックエンティティの `onChunkUnloaded`・`setRemoved` で [chunkUnloaded]・[removed] を呼ぶ（[MachineSlot] と同じ）。
  *   どちらも状態を [ComputerStatus.OFF] にする
  *
@@ -82,7 +87,7 @@ public enum class ComputerError {
  * @param K マシンのキー（[MachineManager] と同じ）
  * @property tier ケースのティア
  * @param events マシンからの通知（状態、コンソールの出力、起動の失敗、再起動）をそのまま受け取る相手。
- *   ケース自身の処理（CRASHED でエラーにする）の後に呼ぶ。`null` なら渡さない（再起動の求めは、既定どおり前回の設定で起動し直す）
+ *   ケース自身の処理（CRASHED・起動の失敗でエラーにする、ゲストが止めたら外す）の後に呼ぶ。`null` なら渡さない（再起動の求めは、既定どおり前回の設定で起動し直す）
  */
 @ApiStatus.Internal
 public class ComputerCase<K : Any> @JvmOverloads constructor(
@@ -122,7 +127,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public val machine: Machine? get() = slot.machine
 
     /**
-     * このケースがマシンに渡す [MachineHost]。ケース自身の処理（CRASHED でエラーにする・ゲストが止めたら外す）をしてから、
+     * このケースがマシンに渡す [MachineHost]。ケース自身の処理（CRASHED・起動の失敗でエラーにする・ゲストが止めたら外す）をしてから、
      * 渡された `events` に中継する。接続層のテストが、マシンを実際に壊さずに通知の経路を確かめるために公開している（#640）
      */
     public val host: MachineHost = object : MachineHost {
@@ -136,7 +141,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         }
 
         override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
-            if (machine === slot.machine) setPoweredOn(false)
+            onMachineBootFailed(machine)
             events?.onBootFailed(machine, failure, detail)
         }
 
@@ -402,6 +407,19 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
             MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) turnOff()
             else -> {}
         }
+    }
+
+    /**
+     * 起動に失敗した（[MachineHost.onBootFailed]。#641）。今のマシンなら、CRASHED と同じくマシンを外して
+     * [ComputerError.BOOT_FAILED] にし、電源を切る。起動の失敗では状態の通知が出ない（ADR 0049）ので、ここで拾う。
+     * 知らせが届くまでに同じマシンがもう起動し直していたら（動いている・起動の途中）、その起動を巻き込まない
+     */
+    internal fun onMachineBootFailed(machine: Machine) {
+        if (machine !== slot.machine || machine.isRunningOrBooting) return
+        isRestorePending = false
+        slot.removed()
+        fail(ComputerError.BOOT_FAILED)
+        setPoweredOn(false)
     }
 
     private fun setPoweredOn(value: Boolean) {

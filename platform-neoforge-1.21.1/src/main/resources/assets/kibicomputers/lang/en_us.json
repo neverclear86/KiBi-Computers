@@ -14,6 +14,7 @@
   "gui.kibicomputers.case.error.missing_parts": "Error: missing %s",
   "gui.kibicomputers.case.error.crashed": "Error: the computer crashed",
   "gui.kibicomputers.case.error.unavailable": "Error: could not start",
+  "gui.kibicomputers.case.error.boot_failed": "Error: failed to boot",
   "gui.kibicomputers.part.cpu": "CPU",
   "gui.kibicomputers.part.memory": "Memory",
   "gui.kibicomputers.part.storage": "Disk",

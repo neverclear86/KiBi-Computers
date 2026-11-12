@@ -14,6 +14,7 @@
   "gui.kibicomputers.case.error.missing_parts": "エラー: %s がない",
   "gui.kibicomputers.case.error.crashed": "エラー: 異常停止した",
   "gui.kibicomputers.case.error.unavailable": "エラー: 起動できない",
+  "gui.kibicomputers.case.error.boot_failed": "エラー: 起動に失敗した",
   "gui.kibicomputers.part.cpu": "CPU",
   "gui.kibicomputers.part.memory": "メモリ",
   "gui.kibicomputers.part.storage": "ディスク",

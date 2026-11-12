@@ -6,6 +6,7 @@ import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -22,12 +23,17 @@ import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
+import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.MachineKey
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.UUID
 
@@ -407,6 +413,50 @@ object TestComputerGameTests {
         helper.assertTrue(keyboard.owner == null, "the keyboard should be freed")
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 起動に失敗したら、ケースの GUI（[CaseMenu.status]）はエラー（[ComputerError.BOOT_FAILED]）になり、ケースはマシンを外して
+     * 結線も外す（#641）。失敗の1行は画面に残り、失敗の理由（[TestComputerWiring.bootFailure]）も外した後に残る。
+     * 電源ボタンを1回押せば、新しいマシンでまた起動を試みる（ここでもまた失敗する）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun bootFailureShowsErrorAndDisconnectsWiring(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        case.fallbackBootDisk = BootConfig.IMAGE_DISK_PREFIX + "no-such-image"
+        val player = helper.makeMockPlayer(GameType.SURVIVAL)
+        val menu = CaseMenu.server(0, player.inventory, case)
+        val key = MachineKey.of(helper.level, helper.absolutePos(CASE))
+        helper.assertTrue(menu.clickMenuButton(player, CaseMenu.POWER_BUTTON), "power button should be handled")
+        helper.assertTrue(menu.status == ComputerStatus.RUNNING, "case should be running but was ${menu.status}")
+        val first = case.computer.machine!!
+        helper.assertTrue(case.wiring.connectedMachine === first, "the machine should be connected")
+        var pressedAgain = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(menu.status == ComputerStatus.ERROR, "the boot failure should show an error but was ${menu.status}: $text")
+            helper.assertTrue(menu.error == ComputerError.BOOT_FAILED, "the error should be BOOT_FAILED but was ${menu.error}")
+            helper.assertTrue(case.computer.machine == null, "the case should release the machine")
+            helper.assertTrue(ServerMachines.current!![key] == null, "the manager should drop the machine")
+            helper.assertTrue(!case.computer.poweredOn, "the power should be off")
+            helper.assertTrue(keyboard.owner == null, "the keyboard should be released")
+            helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+            helper.assertTrue(case.wiring.bootFailure == BootFailure.NO_BOOT_DISK, "the failure should stay: ${case.wiring.bootFailure}")
+            helper.assertTrue(text.any { it == "kibi: no bootable disk" }, "the failure line should stay on the screen: $text")
+            if (!pressedAgain) {
+                // 1回押せば、新しいマシンで起動し直す（空振りしない）
+                helper.assertTrue(menu.clickMenuButton(player, CaseMenu.POWER_BUTTON), "power button should be handled")
+                helper.assertTrue(menu.status == ComputerStatus.RUNNING, "one press should boot again but was ${menu.status}")
+                val next = case.computer.machine
+                helper.assertTrue(next != null && next !== first, "a new machine should be created")
+                helper.assertTrue(ServerMachines.current!![key] === next, "the manager should hold the new machine")
+                helper.assertTrue(case.wiring.bootFailure == null, "connecting a new machine should clear the failure")
+                pressedAgain = true
+                helper.fail("pressed the power button again")
+            }
+            helper.setBlock(CASE, Blocks.AIR)
+        }
     }
 
     /**
