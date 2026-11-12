@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskQuota
@@ -78,7 +79,12 @@ class DiskHotplugTest {
     }
 
     /** ディスクの識別子 → 中身。開くたびに同じ中身を返す。[gates] の識別子は、開く前に門が開くまで待つ（取り消しは見ない） */
-    private class Disks(val root: FileSystem, val rootReadOnly: Boolean = false) : BootVolumeOpener {
+    private class Disks(
+        val root: FileSystem,
+        val rootReadOnly: Boolean = false,
+        /** [root] を返す識別子（同梱イメージの識別子 `image:<名前>` から起動する経路を試すときに足す） */
+        val rootIds: Set<String> = setOf("root"),
+    ) : BootVolumeOpener {
         val fs = ConcurrentHashMap<String, CountingDisk>()
         val opens = ConcurrentHashMap<String, AtomicInteger>()
         val gates = ConcurrentHashMap<String, Gate>()
@@ -101,7 +107,7 @@ class DiskHotplugTest {
                 g.entered.countDown()
                 check(g.release.await(15, TimeUnit.SECONDS)) { "門が開かない" }
             }
-            if (diskId == "root") return BootVolume(root, readOnly = rootReadOnly)
+            if (diskId in rootIds) return BootVolume(root, readOnly = rootReadOnly)
             if (diskId.startsWith("bad")) return null
             overrides[diskId]?.let { return BootVolume(it, readOnly = false) }
             return BootVolume(disk(diskId), readOnly = false)
@@ -991,6 +997,79 @@ class DiskHotplugTest {
     }
 
     @Test
+    fun `Machineが起動で作るsourceは4種だけで、種類はimage・tmp・dev・diskになる`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // 同梱イメージ（image:<名前>）から起動する経路。開き方だけをフックで差し替え、source は Machine が識別子から作る
+            val imageId = BootConfig.IMAGE_DISK_PREFIX + "test"
+            val config = BootConfig.builder().addBootDisk(imageId).homeDisk("h1").build()
+            val disks = Disks(rootFs(), rootReadOnly = true, rootIds = setOf(imageId))
+            val b = boot(h, "h1", "d1", disks = disks, config = config)
+            val m = b.m
+            // 期待値は KibiFs.kindOf からは作らず、文字列と種類を書き下す（ADR 0453 の「Machine が作る source はこの4種だけ」）
+            val expected = mapOf(
+                "/" to ("disk:image:test" to KibiFs.Kind.IMAGE),
+                "/tmp" to ("tmp" to KibiFs.Kind.TMP),
+                "/dev" to ("dev" to KibiFs.Kind.DEV),
+                "/home" to ("disk:h1" to KibiFs.Kind.DISK),
+                "/mnt/d1" to ("disk:d1" to KibiFs.Kind.DISK),
+            )
+            val infos = m.listMounts().map(KibiFs::mountInfoOf)
+            assertEquals(expected, infos.associate { it.point to (it.source to it.kind) })
+            m.close()
+        }
+    }
+
+    @Test
+    fun `Machineが根のディスクから起動したときの根の種類はdisk`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = boot(h, "root").m
+            val root = m.listMounts().map(KibiFs::mountInfoOf).single { it.point == "/" }
+            assertEquals("disk:root" to KibiFs.Kind.DISK, root.source to root.kind)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `list-disksは自動マウントを飛ばしたディスクを位置なしで出し、そのsourceでmountできる`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val root = rootFs()
+            root.createFile(VfsPath.parse("/mnt"))
+            val b = boot(h, "root", disks = Disks(root))
+            val m = b.m
+            val q = m.subscribeAll()
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).isNotEmpty() }
+            val cap = 1L shl 20
+            assertEquals(listOf(DiskListing("root", cap, 64, "/"), DiskListing("d1", cap, 64, null)), m.listDisks())
+            assertEquals(KibiFs.DiskInfo("disk:d1", cap, 64, null), KibiFs.diskInfoOf(m.listDisks()[1]))
+            m.mountDisk("disk:d1", VfsPath.parse("/x"), false)
+            assertEquals("/x", m.listDisks().first { it.diskId == "d1" }.mountPoint)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `list-disksは自動マウントで開いている途中のディスクを位置なしで出し、そのときのmountはbusy`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root")
+            val m = b.m
+            val gate = Disks.Gate()
+            b.disks.gates["d1"] = gate
+            assertFalse(m.disksChanged(snapshot("root", "d1")))
+            assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
+            try {
+                // 予約（DiskClaim）の間は、まだマウントの表にないので位置なし
+                assertNull(m.listDisks().single { it.diskId == "d1" }.mountPoint)
+                assertEquals(Errno.BUSY, assertThrows<FsException> { m.mountDisk("disk:d1", VfsPath.parse("/x"), false) }.errno)
+            } finally {
+                gate.release.countDown()
+            }
+            eventually(10_000, "マウントしない") { m.listDisks().single { it.diskId == "d1" }.mountPoint == "/mnt/d1" }
+            m.close()
+        }
+    }
+
+    @Test
     fun `p1のlist-mountsとlist-disksは一覧を書き、cabi_reallocの中から呼んでもトラップしない`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val b = boot(h, "root", "d1", "d2")
@@ -999,7 +1078,7 @@ class DiskHotplugTest {
             val mounts = m.listMounts()
             val out = runKibiFs(h, m, "mounts", "disks", "mounts-realloc").lines().filter { it.isNotEmpty() }
             val expectedMounts = mounts.map { e ->
-                val kind = pro.ikili.kibicomputers.core.wasi.kibi.KibiFs.kindOf(e.source).ordinal
+                val kind = KibiFs.kindOf(e.source).ordinal
                 val u = e.usage
                 val usage = if (e.source == "tmp") null else if (u == null) "none" else "${u.totalBytes} ${u.usedBytes} ${u.availableBytes} ${u.totalEntries ?: "-"} ${u.usedEntries}"
                 "m ${e.point} ${e.source} $kind ${if (e.readOnly) 1 else 0} ${e.id}" + (usage?.let { " $it" } ?: "")
