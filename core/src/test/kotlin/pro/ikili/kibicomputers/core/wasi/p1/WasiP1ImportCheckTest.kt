@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.wasi.p1
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
@@ -238,6 +239,28 @@ class WasiP1ImportCheckTest {
         assertNoexec(load(command(Triple("kibi:kernel/events-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
         assertNoexec(load(command(Triple("kibi:kernel/timers-async@0.1.0", "[async-lower]wait", listOf(I32, I32) to listOf(I32)))), "許可していない")
         assertNoexec(load(command(Triple("kibi:kernel/events-async@0.1.0", "take", listOf(I32, I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
+    fun `kibi_computer_powerは型が一致するときだけ通り、版違い・版なし・表にない関数は断る`() {
+        val shutdown = Triple(WasiP1Kibi.POWER, "shutdown", emptyList<Int>() to emptyList<Int>())
+        val reboot = Triple(WasiP1Kibi.POWER, "reboot", listOf(I32) to emptyList<Int>())
+        // cabi_realloc は要らない。待たない（待機点への変換の対象でない）
+        assertDoesNotThrow { WasiP1.checkImports(load(command(shutdown, reboot))) }
+        for (fn in listOf(shutdown, reboot)) {
+            assertEquals(false, WasiP1Kibi.needsRealloc(fn.first, fn.second), fn.second)
+            assertFalse("${fn.first}.${fn.second}" in WasiP1.WAIT_IMPORTS, fn.second)
+        }
+        // 型が違う
+        assertNoexec(load(command(Triple(WasiP1Kibi.POWER, "shutdown", listOf(I32) to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.POWER, "reboot", emptyList<Int>() to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(WasiP1Kibi.POWER, "reboot", emptyList<Int>() to listOf(I32)))), "型が違う")
+        // 版が違う・版がない
+        assertNoexec(load(command(Triple("kibi:computer/power@0.2.0", "shutdown", emptyList<Int>() to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple("kibi:computer/power", "shutdown", emptyList<Int>() to emptyList()))), "版が違う")
+        // 表にない関数
+        assertNoexec(load(command(Triple(WasiP1Kibi.POWER, "halt", emptyList<Int>() to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple(WasiP1Kibi.POWER, "reboot-poll", listOf(I32) to emptyList()))), "許可していない")
     }
 
     @Test

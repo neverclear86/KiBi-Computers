@@ -34,7 +34,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:device` | `types`・`bus` | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。WASM に出すのは #77） | #65・#77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
-| `kibi:computer` | — | 電源（停止・再起動） | #306 |
+| `kibi:computer` | `power` | 電源（停止・再起動。ADR 0306） | #306 |
 | `kibi:network` | — | ソケット（`wasi:sockets` で足りなければ） | #76 |
 
 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）を使い、`kibi:*` には入れない。
@@ -175,6 +175,7 @@ interface events {
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
   - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
+  - 追記（#306）: 電源は ADR 0306 で決めた（`kibi:computer/power`）
 - p2・p3 の層（`pollable`・async、Canonical ABI の一般の実装）: #264・#266
 - 生成した束縛（wit-bindgen）: SDK #116
 - 燃料とキューの既定の容量の確定: #251
