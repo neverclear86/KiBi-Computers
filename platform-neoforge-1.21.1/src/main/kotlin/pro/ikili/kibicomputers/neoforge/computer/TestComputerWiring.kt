@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicLong
  * - つないだ画面が外れたら、画面とキーボードだけを外す（#397）。マシンとスピーカーはつないだまま（#531）
  * - 画面をつないでいない間に、ケースの隣のブロックが変わったら（[CaseBlockEntity.neighborChanged]）、隣の画面と
  *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
- *   次の tick に回す。マシンが自分で止まっていれば（CRASHED、ゲストが止めた）つながない（#535）。
+ *   次の tick に回す。マシンが自分で止まったら（CRASHED、ゲストが止めた）、ケースがマシンを外し、結線も外れる
+ *   （[CaseBlockEntity] が [disconnect] を呼ぶ。#640）ので、つながない（#535）。
  *   つないだときの address を覚えておき、外すときはそれで外す。隣のブロックの更新で気付くので、画面の置いてある
  *   チャンクが読み込み直されたときなど、ケースの隣のブロックの更新が起きないときはつなぎ直さない。
  *   画面をつないでいる間に置いたキーボードも見ない
@@ -118,7 +119,8 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     /**
      * 動いているマシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
-     * そうでなければ何もしない。マシンが自分で止まった（CRASHED、ゲストが止めた）ときは、電源が入ったままでもつながない（#535）。
+     * そうでなければ何もしない。マシンが自分で止まった（CRASHED、ゲストが止めた）ときは、ケースがマシンを外して結線も外れるので、
+     * つながない（#535・#640）。
      * 置いたブロックのデータ（address など）を読み込んだ後に呼ぶ（[CaseBlockEntity.neighborChanged] は次の tick に回す）
      */
     fun reconnectScreen(level: Level, casePos: BlockPos, current: Machine?) {

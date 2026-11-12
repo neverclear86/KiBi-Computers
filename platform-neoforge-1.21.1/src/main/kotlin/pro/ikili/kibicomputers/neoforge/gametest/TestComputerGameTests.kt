@@ -11,6 +11,7 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerError
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.device.DeviceInfo
@@ -383,7 +384,34 @@ object TestComputerGameTests {
     }
 
     /**
-     * マシンが自分で止まった（ゲストが止めた）後に画面を置き直しても、止まったマシンにはつながず、キーボードも取らない（#535）
+     * マシンが CRASHED になったら、ケースはエラーにしてマシンを外し、結線も外れる（#640）。閉じたマシンをつないだまま残さず、
+     * キーボードの持ち主も画面の listener も残さない。マシンを実際に壊す手段が接続層にないので、ケースがマシンに渡す通知
+     * （[pro.ikili.kibicomputers.core.computer.ComputerCase.host]）に CRASHED を流して、通知の経路を確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun crashedMachineDisconnectsWiring(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        helper.assertTrue(case.wiring.connectedMachine === machine, "the machine should be connected")
+        helper.assertTrue(case.wiring.connectedScreen === screen, "the screen should be connected")
+        helper.assertTrue(keyboard.owner != null, "the keyboard should be owned by the machine")
+        case.computer.host.onStateChanged(machine, MachineState.CRASHED, null)
+        helper.assertTrue(case.computer.status == ComputerStatus.ERROR, "the case should show the error: ${case.computer}")
+        helper.assertTrue(case.computer.error == ComputerError.CRASHED, "the error should be CRASHED: ${case.computer.error}")
+        helper.assertTrue(case.computer.machine == null, "the case should release the crashed machine")
+        helper.assertTrue(!case.computer.poweredOn, "the case should not stay powered on")
+        helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+        helper.assertTrue(case.wiring.connectedScreen == null, "the screen should be detached")
+        helper.assertTrue(keyboard.owner == null, "the keyboard should be freed")
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
+    }
+
+    /**
+     * マシンが自分で止まった（ゲストが止めた）ら、ケースはマシンを外して OFF にし、結線も外れる（#640）。その後に画面を置き直しても、
+     * 止まったマシンにはつながず、キーボードも取らない（#535）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -393,13 +421,22 @@ object TestComputerGameTests {
         val machine = case.computer.machine!!
         helper.setBlock(SCREEN, Blocks.AIR)
         helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
-        // ゲストが止めたのと同じく、電源を入れたまま、マシンだけが止まる
-        machine.stop()
+        var stopped = false
         var placedTicks = -1
         helper.succeedWhen {
+            if (!stopped) {
+                // 起動の途中で止めると起動の取り消しになる（ゲストの停止ではない。#641 の範囲）ので、起動し終えてから止める
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting")
+                // ゲストが止めたのと同じく、電源を入れたまま、マシンだけが止まる
+                machine.stop()
+                stopped = true
+            }
             if (placedTicks < 0) {
                 helper.assertTrue(machine.state == MachineState.STOPPED, "machine should stop: ${machine.state}")
-                helper.assertTrue(case.computer.machine === machine, "the case should still hold the stopped machine")
+                helper.assertTrue(case.computer.status == ComputerStatus.OFF, "the case should turn off: ${case.computer}")
+                helper.assertTrue(case.computer.machine == null, "the case should release the stopped machine")
+                helper.assertTrue(!case.computer.poweredOn, "the case should not stay powered on")
+                helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
                 helper.setBlock(
                     SCREEN,
                     KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
@@ -408,9 +445,8 @@ object TestComputerGameTests {
             }
             helper.assertTrue(case.wiring.connectedScreen == null, "the stopped machine should not take the screen")
             helper.assertTrue(keyboard.owner == null, "the stopped machine should not take the keyboard")
-            helper.assertTrue(machine.devices.list() == listOf(DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER)), "no device should be attached")
+            helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should stay disconnected")
             helper.assertTrue(++placedTicks > 3, "watch for a few ticks after placing")
-            case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
     }

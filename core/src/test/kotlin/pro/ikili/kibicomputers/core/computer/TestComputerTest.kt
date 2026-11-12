@@ -93,6 +93,9 @@ class TestComputerTest {
             keyboard.input(KeyboardEvent.Paste("os.exit()\n"))
             manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) { machine.state == MachineState.STOPPED }
             assertTrue(host.failures.isEmpty(), "${host.failures}")
+            // init が終わったので、ケースは電源を切ってマシンを外す（#640）
+            assertEquals(ComputerStatus.OFF, case.status)
+            assertEquals(null, case.machine)
 
             // 画面を消して、つなぎを外す
             console.reset()

@@ -185,7 +185,7 @@ class ComputerCaseTest {
         case.turnOn(manager, "a", required(case.tier), true, config)
         val machine = case.machine!!
         // CRASHED でない通知は無視する
-        case.onMachineStateChanged(machine, MachineState.STOPPED)
+        case.onMachineStateChanged(machine, MachineState.STOPPING)
         assertEquals(ComputerStatus.RUNNING, case.status)
         case.onMachineStateChanged(machine, MachineState.CRASHED)
         assertEquals(ComputerStatus.ERROR, case.status)
@@ -270,14 +270,15 @@ class ComputerCaseTest {
     }
 
     @Test
-    fun `ゲストが止めた後も、根のディスクを抜くと止まる`() {
+    fun `ゲストが止めた後は電源が切れていて、根のディスクを抜いても何も起きない`() {
         val case = ComputerCase<String>(CaseTier.BASIC)
         val parts = withDisk(case.tier)
-        val machine = bootedCase(case, parts, "disk-a", mode = "shutdown")
-        tickUntil("止まらない") { machine.state == MachineState.STOPPED && !machine.isBooting }
-        assertEquals(ComputerStatus.RUNNING, case.status)
-        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
-        assertEquals(listOf(PartKind.STORAGE), case.missingParts)
+        bootedCase(case, parts, "disk-a", mode = "shutdown")
+        tickUntil("止まらない") { case.status == ComputerStatus.OFF }
+        assertNull(case.machine)
+        assertFalse(case.partsChanged(parts, DiskSnapshot.EMPTY))
+        assertEquals(ComputerStatus.OFF, case.status)
+        assertEquals(emptyList<PartKind>(), case.missingParts)
     }
 
     @Test
@@ -353,7 +354,10 @@ class ComputerCaseTest {
         case.turnOn(manager, "a", parts, true, config)
         case.onMachineStateChanged(case.machine!!, MachineState.STOPPED)
         assertFalse(case.poweredOn)
-        assertEquals(ComputerStatus.RUNNING, case.status, "ゲストが止めても表示は変えない")
+        // #640: ゲストが止めたら、電源ボタンで切ったときと同じく OFF にしてマシンを外す
+        assertEquals(ComputerStatus.OFF, case.status)
+        assertNull(case.machine)
+        assertNull(manager["a"])
         // 部品が足りなければ入らない。セーブデータから読むときは知らせない
         case.turnOff()
         val before = changes
@@ -509,6 +513,32 @@ class ComputerCaseTest {
         tickUntil("止まらない: ${events.states}") { machine.state == MachineState.STOPPED && !case.poweredOn }
         assertEquals(0, events.reboots.get())
         assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED), events.states.toList())
+        // #640: 状態の表示も OFF になり、マシンは外れる
+        assertEquals(ComputerStatus.OFF, case.status)
+        assertNull(case.machine)
+        assertNull(manager["a"])
+        // 電源ボタンを1回押せば、また起動できる
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", withDisk(case.tier), true, config))
+        assertTrue(case.poweredOn)
+        val next = case.machine!!
+        assertTrue(next !== machine)
+        assertSame(next, manager["a"])
+    }
+
+    @Test
+    fun `initが自分で終わったら電源が切れて表示もOFFになる`() {
+        // 知らないモードでは init が 2 で終わる
+        powerInitDisk("disk-a", "exit")
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", withDisk(case.tier), true, config))
+        val machine = case.machine!!
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("止まらない: ${events.states}") { case.status == ComputerStatus.OFF }
+        assertFalse(case.poweredOn)
+        assertNull(case.machine)
+        assertNull(manager["a"])
+        assertEquals(0, events.reboots.get())
     }
 
     @Test
@@ -523,6 +553,7 @@ class ComputerCaseTest {
             events.reboots.get() == 1 && events.states.size >= 4 && !machine.isBooting && !machine.isRebootPending
         }
         assertTrue(case.poweredOn, "再起動の途中の STOPPED では電源を切らない")
+        assertEquals(ComputerStatus.RUNNING, case.status, "再起動では表示も変えない")
         assertSame(machine, case.machine)
         assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED, MachineState.RUNNING), events.states.toList())
         // 2回目の起動の init は hold で眠り続ける

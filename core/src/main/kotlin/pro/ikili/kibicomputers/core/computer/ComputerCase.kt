@@ -60,6 +60,8 @@ public enum class ComputerError {
  * - 動いている間に起動に要る部品が抜けた・電源を入れたときにあったディスクが抜けた（[partsChanged]）・
  *   電力が尽きた（[powerLost]）ら、マシンを止める
  * - マシンが [MachineState.CRASHED] になったら [ComputerStatus.ERROR]（[ComputerError.CRASHED]）
+ * - ゲストが止めた（再起動の途中でない [MachineState.STOPPED]。`poweroff`・init の終了）ら、[turnOff] と同じく
+ *   マシンを外して [ComputerStatus.OFF] にする（#640）
  * - ブロックエンティティの `onChunkUnloaded`・`setRemoved` で [chunkUnloaded]・[removed] を呼ぶ（[MachineSlot] と同じ）。
  *   どちらも状態を [ComputerStatus.OFF] にする
  *
@@ -119,7 +121,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     /** 動いているマシン。動いていなければ `null` */
     public val machine: Machine? get() = slot.machine
 
-    private val host = object : MachineHost {
+    /**
+     * このケースがマシンに渡す [MachineHost]。ケース自身の処理（CRASHED でエラーにする・ゲストが止めたら外す）をしてから、
+     * 渡された `events` に中継する。接続層のテストが、マシンを実際に壊さずに通知の経路を確かめるために公開している（#640）
+     */
+    public val host: MachineHost = object : MachineHost {
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
             onMachineStateChanged(machine, state)
             events?.onStateChanged(machine, state, cause)
@@ -382,7 +388,8 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * マシンの状態が変わった（[MachineHost.onStateChanged]）。今のマシンが CRASHED になったらエラーにして電源を切り、
-     * ゲストが止めた（再起動の途中でない STOPPED）なら電源を切る（#85。状態の表示は変えない）
+     * ゲストが止めた（再起動の途中でも起動の途中でもない STOPPED）なら、[turnOff] と同じくマシンを外して
+     * [ComputerStatus.OFF] にする（#85・#640）。外したマシンは閉じる（[MachineSlot.removed]）
      */
     internal fun onMachineStateChanged(machine: Machine, state: MachineState) {
         if (machine !== slot.machine) return
@@ -392,7 +399,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
                 fail(ComputerError.CRASHED)
                 setPoweredOn(false)
             }
-            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) setPoweredOn(false)
+            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) turnOff()
             else -> {}
         }
     }
