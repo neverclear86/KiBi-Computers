@@ -512,12 +512,13 @@ class BootTest {
                 StepResult.Exit(0)
             }
         }
-        // init が止まると子は表から消えるので、終わった状態は実行時の部分の Process から見る
-        val first = m.rt(m.spawn(h.program(emptyModule()), asker(true), SpawnOptions(), parentPid = 1))
+        // init が止まると子は表から消えるので、終わった状態は実行時の部分の Process から見る。
+        // 子が spawn から戻る前に終わって刈り取られうるので、実行時の部分は spawn と同じロックの中で取る（spawnRt）
+        val first = m.spawnRt(h.program(emptyModule()), asker(true), SpawnOptions(), parentPid = 1)
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
         assertEquals(ProcessState.KILLED, first.process.state)
 
-        val second = m.rt(m.spawn(h.program(emptyModule()), asker(false), SpawnOptions(), parentPid = 1))
+        val second = m.spawnRt(h.program(emptyModule()), asker(false), SpawnOptions(), parentPid = 1)
         tickUntil { m.state == MachineState.STOPPED }
         assertTrue(m.awaitTermination(5_000))
         tickFor(50)
@@ -562,7 +563,7 @@ class BootTest {
             h.scheduler.hooks.beforePowerRequest = null
             machine.stop()
         }
-        val rt = m.rt(m.spawn(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1))
+        val rt = m.spawnRt(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1)
         tickUntil { m.state == MachineState.STOPPED }
         assertTrue(m.awaitTermination(5_000))
         tickFor(100)

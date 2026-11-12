@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.rt
+import pro.ikili.kibicomputers.core.kernel.spawnRt
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -122,7 +123,7 @@ class WasiP1PowerTest {
                 args = listOf("kpw", arg),
                 stdio = StdioSpec(StdioSource.Closed, StdioSource.Console, StdioSource.Console),
             )
-            return m.rt(m.spawn(p, WasiP1Driver(p.module), options, parentPid = 1))
+            return m.spawnRt(p, WasiP1Driver(p.module), options, parentPid = 1)
         }
     }
 

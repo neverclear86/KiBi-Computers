@@ -14,8 +14,10 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -620,6 +622,116 @@ class MachineRestoreTest {
                 h.scheduler.tick()
                 output(m, saved.output).length > atFinish
             }
+            m.close()
+        }
+    }
+
+    /** 戻したマシンで電源の求めを確かめる接続層（#306）。再起動の求めでは、既定の実装（`boot(lastBootConfig)`）に任せる */
+    private class PowerHost : MachineHost {
+        val reboots = AtomicInteger()
+        val failures: MutableList<BootFailure> = Collections.synchronizedList(ArrayList())
+
+        /** 再起動の求めを受けたときの [Machine.lastBootConfig] */
+        @Volatile
+        var configAtReboot: BootConfig? = null
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            failures += failure
+        }
+
+        override fun onRebootRequested(machine: Machine) {
+            configAtReboot = machine.lastBootConfig
+            reboots.incrementAndGet()
+            super.onRebootRequested(machine)
+        }
+    }
+
+    /**
+     * `prompt` を init として書いた世代を、起動ディスク `boot`（`/sbin/init` に `prompt`）を指す [BootConfig] で戻し、RESTORED まで進める。
+     * 戻した init の子として、電源を求める [driver] を動かす
+     */
+    private fun restoreThenAsk(h: Harness, store: MachineSaveStore, host: PowerHost, driver: TestDriver): Triple<Machine, Saved, BootConfig> {
+        val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+        val bootDisk = TestMemoryFileSystem().also { fs ->
+            fs.createDirectory(VfsPath.parse("/sbin"))
+            val bytes = resource("prompt-wasi.wasm")
+            fs.write(fs.createFile(VfsPath.parse(BootConfig.INIT_PATH)), 0, bytes, 0, bytes.size)
+        }
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id ->
+            when (id) {
+                "root" -> BootVolume(TestMemoryFileSystem(), readOnly = false)
+                "boot" -> BootVolume(bootDisk, readOnly = true)
+                else -> null
+            }
+        }
+        val config = BootConfig.builder().addBootDisk("boot").build()
+        val m = h.machine(fuelPerTick = 10_000_000, host = host)
+        val finished = Finished()
+        assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), config, finished.listener)))
+        eventually(60_000, "復元が終わらない") {
+            h.scheduler.tick()
+            finished.outcomes.isNotEmpty()
+        }
+        assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
+        assertEquals(MachineState.RUNNING, m.state)
+        assertTrue(m.lastBootConfig === config, "復元の求めの BootConfig が最後の BootConfig になる")
+        // 戻した init（saved.pid）の子にする。子がすぐ終わって刈り取られても取り逃さないよう、spawnRt で取る
+        m.spawnRt(h.program(emptyModule()), driver, SpawnOptions(), parentPid = saved.pid)
+        return Triple(m, saved, config)
+    }
+
+    @Test
+    fun `戻したマシンでもプロセスの再起動の求めを受け付け、戻した表を片付けて最後のBootConfigで起動し直す`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val host = PowerHost()
+            val returned = AtomicInteger()
+            val asker = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                ctx.requestReboot()
+                returned.incrementAndGet()
+                StepResult.Exit(0)
+            }
+            val (m, _, config) = restoreThenAsk(h, store, host, asker)
+            eventually(60_000, "再起動して init が入力を待たない") {
+                h.scheduler.tick()
+                host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting && !m.isRebootPending &&
+                    m.lock.withLockValue {
+                        val init = m.kernel.processes[m.kernel.initPid]
+                        init != null && init.state == ProcessState.WAITING_EVENT
+                    }
+            }
+            assertEquals(0, returned.get(), "受け付けたら戻らない")
+            assertTrue(host.configAtReboot === config)
+            assertEquals(emptyList<BootFailure>(), host.failures.toList())
+            m.lock.withLockValue {
+                // 戻した表（prompt と電源を求めた子）は片付き、起動し直した init だけが残る（オブジェクトの ID は使い回されうるので見ない）
+                assertEquals(listOf(m.kernel.initPid), m.kernel.processes.all().map { it.pid })
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `戻したマシンでプロセスが停止を求めると、再起動せずに止まる`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val host = PowerHost()
+            val asker = TestDriver(ProcessKind.BLOCKING) { ctx -> ctx.requestShutdown() }
+            val (m, saved, _) = restoreThenAsk(h, store, host, asker)
+            eventually(60_000, "止まらない") {
+                h.scheduler.tick()
+                m.state == MachineState.STOPPED
+            }
+            assertTrue(m.awaitTermination(5_000))
+            repeat(20) {
+                h.scheduler.tick()
+                Thread.sleep(5)
+            }
+            assertEquals(0, host.reboots.get())
+            assertEquals(MachineState.STOPPED, m.state)
+            assertEquals(ProcessState.KILLED, m.stateOf(saved.pid))
             m.close()
         }
     }
