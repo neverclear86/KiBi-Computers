@@ -438,6 +438,36 @@ class ComputerCaseTest {
     }
 
     @Test
+    fun `戻せずに冷えた起動をして失敗したらエラーにして外す`() {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val identity = store.assignNewId(MachineOwner("o", 0, 0, 0))!!
+        lateinit var case: ComputerCase<String>
+        val events = BootFailures { case }
+        case = ComputerCase(CaseTier.BASIC, events)
+        case.loadPoweredOn(true)
+        case.beginRestore()
+        val finished = ArrayList<Pair<RestoreOutcome, ColdBootCause?>>()
+        // 起動部品のない boot なので、復元に失敗した後の冷えた起動も失敗する
+        case.startRestore(
+            manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot,
+            RestoreSource(store, identity.id, 3), RestoreReady { },
+            RestoreListener { _, outcome, cause -> finished += outcome to cause },
+        )
+        tickUntil("起動の失敗が届かない: ${case.status}") { events.failures.isNotEmpty() }
+        assertEquals(listOf(RestoreOutcome.COLD_BOOT to ColdBootCause.NO_GENERATION), finished)
+        assertEquals(listOf(BootFailure.NO_BOOT_DISK), events.failures.toList())
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertEquals(ComputerError.BOOT_FAILED, case.error)
+        assertFalse(case.poweredOn)
+        assertFalse(case.isRestorePending)
+        assertFalse(case.isRestoring)
+        assertNull(case.machine)
+        assertNull(manager["a"])
+        // ケースの処理の後に中継する
+        assertEquals(listOf<Machine?>(null), events.machineAtFailure.toList())
+    }
+
+    @Test
     fun `知らせが届く前に電源を切ったら、古いマシンにはつながない`() {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         val identity = store.assignNewId(MachineOwner("o", 0, 0, 0))!!
