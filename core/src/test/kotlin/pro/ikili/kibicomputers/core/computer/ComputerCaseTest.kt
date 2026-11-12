@@ -411,6 +411,9 @@ class ComputerCaseTest {
 
     @Test
     fun `戻せなければ知らせの後につないで冷えた起動する`() {
+        // 冷えた起動が成功するよう、起動できるディスクを使う（起動に失敗するとケースはエラーで電源を切る。#641）
+        powerInitDisk("disk-a", "hold")
+        val bootable = BootConfig.builder().addBootDisk("disk-a").build()
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         val identity = store.assignNewId(MachineOwner("o", 0, 0, 0))!!
         val case = ComputerCase<String>(CaseTier.BASIC)
@@ -419,7 +422,7 @@ class ComputerCaseTest {
         val ready = ArrayList<Machine>()
         val finished = ArrayList<Pair<RestoreOutcome, ColdBootCause?>>()
         case.startRestore(
-            manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot,
+            manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, bootable,
             RestoreSource(store, identity.id, 3), RestoreReady { m -> ready += m },
             RestoreListener { _, outcome, cause -> finished += outcome to cause },
         )
