@@ -32,11 +32,9 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 途中で取り消されたら、マウントを外して何も知らせずに終える。
  */
 internal class BootSequence(private val machine: Machine, private val config: BootConfig) {
+    /** 今挿さっているディスクを開く口（開くたびに今の表を引く。#56） */
     private val opener: BootVolumeOpener
-        get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
-
-    /** ディスクを開くときに渡す取り消しの確かめ（リースのロックの中で呼ばれる。volatile を読むだけ。#588） */
-    private val isCancelled: () -> Boolean = { machine.isBootCancelled }
+        get() = machine.openerForCurrentDisks()
 
     fun run() {
         try {
@@ -48,14 +46,17 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
                 machine.endBoot(BootFailure.NO_FIRMWARE, "起動部品がない")
                 return
             }
-            val (diskId, volume) = findBootVolume() ?: return
+            val (diskId, volume, claim) = findBootVolume() ?: return
             val mounted = try {
-                machine.mountBootRoot(diskId, volume)
+                machine.mountBootRoot(diskId, volume, claim)
             } catch (t: Throwable) {
                 volume.fs.retire()
                 throw t
+            } finally {
+                machine.releaseDiskClaim(claim)
             }
             if (!mounted) {
+                // 取り消された・途中で抜かれた（抜かれたときは disksChanged が止めるので、ここでは知らせない。#56）
                 volume.fs.retire()
                 machine.endBoot(null, "")
                 return
@@ -63,6 +64,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             machine.mountTmp()?.let { errno -> machine.writeConsoleLine("kibi: /tmp not mounted (${errno.name})") }
             machine.mountDev()?.let { errno -> machine.writeConsoleLine("kibi: /dev not mounted (${errno.name})") }
             if (volume.readOnly) mountHome(diskId)
+            mountOtherDisks()
             machine.writeConsoleLine("kibi: booting from disk $diskId")
             machine.scheduler.hooks.beforeInitExec?.invoke(machine)
             startInit()
@@ -74,23 +76,38 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         }
     }
 
-    /** init のあるディスクを探す。見つからなければ失敗を知らせて `null` */
-    private fun findBootVolume(): Pair<String, BootVolume>? {
+    /** 選んだ根（識別子、開いたもの、段の予約） */
+    private data class Root(val diskId: String, val volume: BootVolume, val claim: Machine.DiskClaim)
+
+    /**
+     * init のあるディスクを探す。見つからなければ失敗を知らせて `null`。候補は段の予約をしてから開く（#56。予約できない・今の表にない
+     * 候補は開けないとして飛ばす）。選んだ候補の予約は持ったまま返す
+     */
+    private fun findBootVolume(): Root? {
         var opened = 0
         for (diskId in config.bootDisks) {
             if (machine.isBootCancelled) throw BootCancelledException()
-            val volume = try {
-                opener.open(diskId, isCancelled)
-            } catch (e: Exception) {
-                null
+            val claim = machine.claimPhaseDisk(diskId) ?: continue
+            var keep = false
+            try {
+                val volume = try {
+                    opener.open(diskId, machine.bootClaimCancelled(claim))
+                } catch (e: Exception) {
+                    null
+                }
+                // 取り消されて開かなかったときも、ここは `continue` でよい: 次の周の頭で取り消しを見て抜ける。最後の候補でも、
+                // `endBoot` は取り消されていれば失敗を知らせない（#588）
+                ?: continue
+                opened++
+                if (hasInit(volume)) {
+                    keep = true
+                    return Root(diskId, volume, claim)
+                }
+                // 選ばなかった候補は閉じる（ホストのディスクのリースを返す）
+                volume.fs.retire()
+            } finally {
+                if (!keep) machine.releaseDiskClaim(claim)
             }
-            // 取り消されて開かなかったときも、ここは `continue` でよい: 次の周の頭で取り消しを見て抜ける。最後の候補でも、
-            // `endBoot` は取り消されていれば失敗を知らせない（#588）
-            ?: continue
-            opened++
-            if (hasInit(volume)) return diskId to volume
-            // 選ばなかった候補は閉じる（ホストのディスクのリースを返す）
-            volume.fs.retire()
         }
         if (opened == 0) {
             machine.endBoot(BootFailure.NO_BOOT_DISK, if (config.bootDisks.isEmpty()) "起動ディスクの候補がない" else "どの候補も開けない: ${config.bootDisks}")
@@ -105,21 +122,43 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         val homeDisk = config.homeDisk ?: return
         if (homeDisk == rootDiskId) return
         if (machine.isBootCancelled) throw BootCancelledException()
-        val volume = try {
-            opener.open(homeDisk, isCancelled)
-        } catch (e: Exception) {
-            null
-        }
-        if (volume == null && machine.isBootCancelled) throw BootCancelledException()
-        val reason = when {
-            volume == null -> "cannot open"
-            volume.readOnly -> {
-                volume.fs.retire()
-                "read-only"
+        // 段の予約をしてから開く（予約できない・今の表にないなら開けない。#56）
+        val claim = machine.claimPhaseDisk(homeDisk)
+        val reason = try {
+            val volume = if (claim == null) {
+                null
+            } else {
+                try {
+                    opener.open(homeDisk, machine.bootClaimCancelled(claim))
+                } catch (e: Exception) {
+                    null
+                }
             }
-            else -> machine.mountHome(homeDisk, volume)?.name ?: return
+            if (volume == null && machine.isBootCancelled) throw BootCancelledException()
+            when {
+                volume == null -> "cannot open"
+                volume.readOnly -> {
+                    volume.fs.retire()
+                    "read-only"
+                }
+                else -> machine.mountHome(homeDisk, volume, checkNotNull(claim))?.name ?: return
+            }
+        } finally {
+            if (claim != null) machine.releaseDiskClaim(claim)
         }
         machine.writeConsoleLine("kibi: /home not mounted ($reason)")
+    }
+
+    /**
+     * 根と `/home` のほかに挿さっているディスクを、`/mnt/<識別子の先頭8文字>` にマウントする（#56、ADR 0056）。段の予約をしてから開く。
+     * 開けない・位置が使えないものは飛ばす（コンソールにもイベントにも出さない）。取り消されたら [BootCancelledException]
+     */
+    private fun mountOtherDisks() {
+        for (diskId in machine.bootMountCandidates()) {
+            if (machine.isBootCancelled) throw BootCancelledException()
+            val claim = machine.claimPhaseDisk(diskId) ?: continue
+            machine.mountBootDisk(claim)
+        }
     }
 
     /** まだマウントしていないファイルシステムを、ほかのスレッドと分け合わずに見る */

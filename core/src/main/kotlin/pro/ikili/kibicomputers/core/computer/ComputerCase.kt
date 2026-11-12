@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.computer
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.BootFailure
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -115,13 +116,6 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public var missingParts: List<PartKind> = emptyList()
         private set
 
-    /**
-     * 電源を入れたときにディスクのスロットにあったディスクの識別子（[InstalledParts.diskIdAt]。#124）。
-     * [ComputerStatus.RUNNING] でなければ空。どれかが抜けたら [partsChanged] で止める
-     */
-    public var bootDiskIds: Set<String> = emptySet()
-        private set
-
     /** 動いているマシン。動いていなければ `null` */
     public val machine: Machine? get() = slot.machine
 
@@ -219,7 +213,6 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
                     fail(ComputerError.UNAVAILABLE)
                 } else {
                     set(ComputerStatus.RUNNING)
-                    bootDiskIds = diskIds(parts)
                     return machine
                 }
             }
@@ -306,18 +299,19 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     }
 
     /**
-     * 部品が挿された・抜かれた。動いている間に、起動に要る部品がなくなった、または電源を入れたときにあったディスク
-     * （[bootDiskIds]）のどれかがディスクのスロットからなくなったら、マシンを止めて [ComputerError.MISSING_PARTS] にする。
-     * ディスクが抜けたときは、ほかのディスクが残っていても [missingParts] に [PartKind.STORAGE] を入れる。
-     * 同じディスクを別のディスクのスロットに挿し直したとき（識別子が残る）は止めない。
-     * 動いていなければ何もしない（足りない部品の表示も変えない）。
+     * 部品が挿された・抜かれた（#56）。[disks] は今挿さっているディスク（[DiskStore.snapshot]）。動いている間なら、マシンに今の表を渡す
+     * （[Machine.disksChanged]。挿したディスクは `/mnt` に自動でマウントし、抜いたディスクは外す）。
+     * 起動に要る部品がなくなった、またはマシンが止めるべきと答えた（`/`・`/home` のディスク、起動・復元の途中ならそれが頼るディスクが抜けた）
+     * なら、マシンを止めて [ComputerError.MISSING_PARTS] にする。ディスクで止めたときは、ほかのディスクが残っていても [missingParts] に
+     * [PartKind.STORAGE] を入れる。同じディスクを別のディスクのスロットに挿し直したとき（識別子が残る）は止めない。
+     * マシンがない（復元の順番待ち）ときは部品だけを見る。動いていなければ何もしない（足りない部品の表示も変えない）。
      *
      * @return マシンを止めたら `true`
      */
-    public fun partsChanged(parts: InstalledParts): Boolean {
+    public fun partsChanged(parts: InstalledParts, disks: DiskSnapshot): Boolean {
         if (status != ComputerStatus.RUNNING) return false
         val missing = tier.missingRequired(parts)
-        val diskGone = bootDiskIds.isNotEmpty() && !diskIds(parts).containsAll(bootDiskIds)
+        val diskGone = slot.machine?.disksChanged(disks) == true
         if (missing.isEmpty() && !diskGone) return false
         isRestorePending = false
         slot.removed()
@@ -326,12 +320,6 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         setPoweredOn(false)
         return true
     }
-
-    /** ディスクのスロットに挿さっているディスクの識別子 */
-    private fun diskIds(parts: InstalledParts): Set<String> =
-        tier.slots.indices
-            .filter { tier.slots[it] == PartKind.STORAGE }
-            .mapNotNullTo(LinkedHashSet()) { parts.diskIdAt(it) }
 
     /**
      * 電力が尽きた（#128）。動いていればマシンを止めて [ComputerStatus.NO_POWER] にする（実行中の処理は失われる）。
@@ -419,11 +407,9 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         status = newStatus
         error = null
         missingParts = emptyList()
-        bootDiskIds = emptySet()
     }
 
     private fun fail(reason: ComputerError, missing: List<PartKind> = emptyList()) {
-        bootDiskIds = emptySet()
         status = ComputerStatus.ERROR
         error = reason
         missingParts = missing

@@ -762,6 +762,19 @@ internal class ProcessRunner(private val machine: Machine) {
             lock.withLockValue { rt.process.cwd = target }
         }
 
+        override fun mount(source: String, point: String, readOnly: Boolean) {
+            // ホスト側の仕事（ディスクを開いて木をたどる・リースを取る）は、ふつうの呼び出しより桁違いに重い。固定分を先に、
+            // 木の大きさに比例する分を開いた後に払う（unmount → mount を繰り返してワーカーとホストの I/O を使い続けられない。#56、ADR 0056）
+            chargeFuel(MachineLimits.MOUNT_FUEL)
+            val target = VfsPath.resolve(lock.withLockValue { rt.process.cwd }, point)
+            val entries = machine.mountDisk(source, target, readOnly)
+            chargeFuel(entries * MachineLimits.MOUNT_FUEL_PER_ENTRY)
+        }
+
+        override fun unmount(point: String) {
+            machine.unmountAt(VfsPath.resolve(lock.withLockValue { rt.process.cwd }, point))
+        }
+
         override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =
             machine.spawn(program, driver, options, rt.pid)
 

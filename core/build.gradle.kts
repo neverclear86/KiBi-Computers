@@ -187,6 +187,12 @@ kibiWasm {
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:fs/mounts（#56）の p1 の import を確かめる CLI
+    module("kibi-fs-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_fs.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
 }
 
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる

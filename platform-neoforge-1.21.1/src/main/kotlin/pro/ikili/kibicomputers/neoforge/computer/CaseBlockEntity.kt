@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.computer.MachineSpecs
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.computer.RestoreReady
-import pro.ikili.kibicomputers.core.kernel.DiskResolver
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
@@ -160,7 +160,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (!computer.isRestorePending || isRemoved) return
         val config = MachineSpecs.configOf(tier, parts.tiers)
         val disks = prepareDisks()
-        val environment = MachineEnvironment.builder().disks(disks.resolver).build()
+        val environment = MachineEnvironment.builder().disks(disks.snapshot).build()
         val boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
         val store = WorldMachineSaves.current
         // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
@@ -293,7 +293,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         var boot = TestComputerWiring.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             val disks = prepareDisks()
-            environment = MachineEnvironment.builder().disks(disks.resolver).build()
+            environment = MachineEnvironment.builder().disks(disks.snapshot).build()
             boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
         }
         val status = computer.pressPowerButton(
@@ -314,7 +314,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /** 電源を入れる前のディスクの用意: 挿さっているディスクの写しと、起動の候補（ディスクのスロットの順） */
-    private class PreparedDisks(val resolver: DiskResolver, val bootOrder: List<String>)
+    private class PreparedDisks(val snapshot: DiskSnapshot, val bootOrder: List<String>)
 
     /**
      * ディスクのスロットの、識別子のないディスクに識別子を付け（形の正しくない値は上書きしない）、
@@ -322,7 +322,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      * サーバーのディスクの置き場（[WorldDisks]）がなければ、ディスクなし
      */
     private fun prepareDisks(): PreparedDisks {
-        val store = WorldDisks.current ?: return PreparedDisks(DiskResolver.NONE, emptyList())
+        val store = WorldDisks.current ?: return PreparedDisks(DiskSnapshot.EMPTY, emptyList())
         val disks = LinkedHashMap<String, PartTier>()
         var assigned = false
         for (slot in 0 until tier.slotCount) {
@@ -357,7 +357,10 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     private fun onPartsChanged() {
         setChanged()
         val level = level ?: return
-        if (!level.isClientSide && computer.partsChanged(installedForBoot)) wiring.disconnect()
+        if (level.isClientSide) return
+        // 動いている間だけ、今挿さっているディスクの表を作り直してマシンに渡す（#56。挿したディスクに識別子も付ける）
+        val disks = if (computer.status == ComputerStatus.RUNNING) prepareDisks().snapshot else DiskSnapshot.EMPTY
+        if (computer.partsChanged(installedForBoot, disks)) wiring.disconnect()
     }
 
     override fun onChunkUnloaded() {

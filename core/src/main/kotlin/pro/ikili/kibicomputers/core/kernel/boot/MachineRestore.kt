@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
@@ -49,11 +50,17 @@ internal class RestoreCancelledException : RuntimeException("復元を取り消�
  * @property decoded 復号した保存データ
  * @property runtimes 終わっていないプロセスの実行時の部分と、作り直したインスタンス（`CREATED` は `null`）
  * @property fileSystems マウントの ID → 開き直したファイルシステム
+ * @property droppedDisks 前段で開けずに表から落としたマウントの [識別子, 保存したときの位置]（#56。戻せたら `disk-removed` で知らせる）
+ * @property droppedMountIds 表から落としたマウントの ID（後段が表に入れない）
+ * @property claims 開き直したディスクの段の予約（#56）。後段が戻せたら `completeRestore` が外し、戻さなかったら呼び手が外す
  */
 internal class PreparedRestore(
     val decoded: DecodedSnapshot,
     val runtimes: List<Pair<ProcessRuntime, WasmInstance?>>,
     val fileSystems: Map<Int, FileSystem>,
+    val droppedDisks: List<Pair<String, String>> = emptyList(),
+    val droppedMountIds: Set<Int> = emptySet(),
+    val claims: List<Machine.DiskClaim> = emptyList(),
 ) {
     /**
      * 作ったものを返す（インスタンスを閉じ、ファイルシステムを閉じ、`/tmp` の RAM を返す）。カーネルロックの外で呼ぶ。
@@ -107,11 +114,9 @@ internal class PreparedRestore(
  * 積み直した続きの頭で黙って抜ける。段から段へは、起動用のスレッドへの積み直しか読み込みの完了で渡すので、欄は一度に1つのスレッドだけが触る
  */
 internal class MachineRestore(private val machine: Machine, private val request: RestoreRequest) {
+    /** 今挿さっているディスクを開く口（開くたびに今の表を引く。#56） */
     private val opener: BootVolumeOpener
-        get() = machine.scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(machine.environment.disks, machine.hostFiles)
-
-    /** ディスクを開くときに渡す取り消しの確かめ（リースのロックの中で呼ばれる。volatile を読むだけ。#588） */
-    private val isCancelled: () -> Boolean = { machine.isRestoreCancelled }
+        get() = machine.openerForCurrentDisks()
 
     /** 読んだ写し（1. で読み、3. で復号する） */
     private var stored: StoredSnapshot? = null
@@ -172,11 +177,15 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
         try {
             machine.scheduler.hooks.beforeRestoreInstall?.invoke(machine)
-            // 取り消し・後段の途中の失敗（CRASHED）では、持ち主がカーネルに移らないので、ロックの外で返す（#576）
-            if (!machine.completeRestore(prepared)) prepared.discard()
+            // 取り消し・後段の途中の失敗（CRASHED）では、持ち主がカーネルに移らないので、ロックの外で返す（#576）。段の予約も外す（#56）
+            if (!machine.completeRestore(prepared)) {
+                prepared.discard()
+                machine.releaseDiskClaims(prepared.claims)
+            }
         } catch (t: Throwable) {
             // 後段に入る前の失敗（後段の中の失敗は completeRestore が CRASHED にして印を下ろすので、restoreFellBack は何もしない）
             prepared.discard()
+            machine.releaseDiskClaims(prepared.claims)
             machine.restoreFellBack(ColdBootCause.RESTORE_FAILED)
             if (t is VirtualMachineError && t !is StackOverflowError) throw t
         }
@@ -345,8 +354,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
 
         val fileSystems = LinkedHashMap<Int, FileSystem>()
         val runtimes = ArrayList<Pair<ProcessRuntime, WasmInstance?>>()
+        val mounts = OpenedMounts()
         try {
-            openMounts(decoded, fileSystems)
+            openMounts(decoded, fileSystems, mounts)
             adoptOpenFiles(decoded, fileSystems)
             checkCancelled()
             for (p in decoded.kernel.processes.all().sortedBy { it.pid }) {
@@ -383,9 +393,17 @@ internal class MachineRestore(private val machine: Machine, private val request:
             }
         } catch (t: Throwable) {
             PreparedRestore(decoded, runtimes, fileSystems).discard()
+            machine.releaseDiskClaims(mounts.claims)
             throw t
         }
-        return PreparedRestore(decoded, runtimes, fileSystems)
+        return PreparedRestore(decoded, runtimes, fileSystems, mounts.dropped, mounts.droppedIds, mounts.claims)
+    }
+
+    /** [openMounts] が集めるもの（#56） */
+    private class OpenedMounts {
+        val claims = ArrayList<Machine.DiskClaim>()
+        val dropped = ArrayList<Pair<String, String>>()
+        val droppedIds = HashSet<Int>()
     }
 
     private fun read(id: java.util.UUID, generation: Long): StoredSnapshot = try {
@@ -425,23 +443,42 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
     }
 
-    /** マウントの表のファイルシステムを開き直す（1つでも開けなければ冷えた起動） */
-    private fun openMounts(decoded: DecodedSnapshot, out: MutableMap<Int, FileSystem>) {
+    /**
+     * マウントの表のファイルシステムを開き直す。ディスクは段の予約をしてから開く（#56）。根・`/home` のディスクが開けなければ冷えた起動、
+     * それ以外のディスクが開けなければ（今の表にない・開けない）表から落として続ける（[OpenedMounts.dropped]）。ほかが開けなければ冷えた起動
+     */
+    private fun openMounts(decoded: DecodedSnapshot, out: MutableMap<Int, FileSystem>, mounts: OpenedMounts) {
         for (entry in decoded.kernel.mounts.entries) {
             checkCancelled()
             val source = entry.source
             val fs: FileSystem = when {
                 source.startsWith(MachineLimits.DISK_SOURCE_PREFIX) -> {
                     val diskId = source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
-                    val volume = try {
-                        opener.open(diskId, isCancelled)
-                    } catch (e: Exception) {
+                    val claim = machine.claimPhaseDisk(diskId)
+                    val volume = if (claim == null) {
                         null
-                    } ?: run {
+                    } else {
+                        try {
+                            opener.open(diskId, machine.restoreClaimCancelled(claim))
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                    if (volume == null) {
+                        if (claim != null) machine.releaseDiskClaim(claim)
                         // 取り消されて開かなかったのなら、冷えた起動に流さずに黙って抜ける（#588）
                         checkCancelled()
-                        fallback(ColdBootCause.MOUNT, "ディスク $diskId（${entry.point}）を開けない")
+                        // 予約の後に抜かれた: disksChanged が止めるので、取り消しと同じに黙って抜ける（#56）
+                        if (claim != null && machine.isClaimCancelled(claim)) throw RestoreCancelledException()
+                        if (entry.point == VfsPath.ROOT || entry.point == MachineLimits.HOME_PATH) {
+                            fallback(ColdBootCause.MOUNT, "ディスク $diskId（${entry.point}）を開けない")
+                        }
+                        LOG.log(System.Logger.Level.WARNING, "マシン ${request.source.id} のディスク $diskId（${entry.point}）を開けないので、マウントを落とす")
+                        mounts.dropped += diskId to entry.point.toString()
+                        mounts.droppedIds += entry.id
+                        continue
                     }
+                    mounts.claims += checkNotNull(claim)
                     volume.fs
                 }
                 source == MachineLimits.TMP_SOURCE -> {

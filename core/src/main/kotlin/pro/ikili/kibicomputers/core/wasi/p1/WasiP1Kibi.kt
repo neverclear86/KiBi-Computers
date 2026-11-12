@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -16,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiClock
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiIo
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiPower
@@ -56,6 +58,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [IO_TTY] | `get-size` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_TTY] | `get-foreground` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_TTY] | `set-foreground` | `(fd, pid, ret_ptr: i32) -> ()` |
+ * | [FS_MOUNTS] | `mount` | `(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr: i32) -> ()`（#56） |
+ * | [FS_MOUNTS] | `unmount` | `(pt_ptr, pt_len, ret_ptr: i32) -> ()` |
  * | [PROCESS] | （[WasiP1KibiProcess] の表。#74） | |
  *
  * p2・p3 だけの interface（`kibi:io` の `pipe-streams`・`pipe-async`、`kibi:kernel` の `timers-poll`・`events-poll`・
@@ -92,6 +96,9 @@ internal object WasiP1Kibi {
 
     /** `kibi:io/tty` のモジュール名 */
     const val IO_TTY: String = "kibi:io/tty@0.1.0"
+
+    /** `kibi:fs/mounts` のモジュール名（#56） */
+    const val FS_MOUNTS: String = "kibi:fs/mounts@0.1.0"
 
     /** `kibi:process/process` のモジュール名（[WasiP1KibiProcess]） */
     const val PROCESS: String = WasiP1KibiProcess.MODULE
@@ -323,6 +330,31 @@ internal object WasiP1Kibi {
             val memory = memoryOf(caller)
             val error = try {
                 KibiTty.setForeground(ctx, a[0].u32(), a[1].u32())
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[2].i(), error)
+            NONE
+        },
+        Fn(FS_MOUNTS, "mount", WasmFunctionType.of(listOf(I32, I32, I32, I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                val source = P1Canonical.liftString(memory, a[0].i(), a[1].i(), KibiFs.MAX_SOURCE_BYTES, Errno.INVAL)
+                val point = P1Canonical.liftString(memory, a[2].i(), a[3].i(), VfsPath.MAX_PATH_BYTES, Errno.NAMETOOLONG)
+                // bool の lift: 0 以外は true（Canonical ABI）
+                KibiFs.mount(ctx, source, point, a[4].i() != 0)
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[5].i(), error)
+            NONE
+        },
+        Fn(FS_MOUNTS, "unmount", WasmFunctionType.of(listOf(I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                KibiFs.unmount(ctx, P1Canonical.liftString(memory, a[0].i(), a[1].i(), VfsPath.MAX_PATH_BYTES, Errno.NAMETOOLONG))
                 null
             } catch (e: FsException) {
                 KibiErrors.code(e)

@@ -37,7 +37,7 @@ class ComputerCaseJavaTest {
         assertEquals(ComputerError.MISSING_PARTS, computer.getError());
         assertEquals(ComputerStatus.RUNNING, computer.pressPowerButton(manager, "key", all, true, MachineConfig.DEFAULT));
         assertNotNull(computer.getMachine());
-        computer.partsChanged(all);
+        computer.partsChanged(all, pro.ikili.kibicomputers.core.kernel.DiskSnapshot.EMPTY);
         computer.powerLost();
         assertEquals(ComputerStatus.NO_POWER, computer.getStatus());
         computer.turnOff();

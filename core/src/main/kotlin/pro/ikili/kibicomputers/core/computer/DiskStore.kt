@@ -1,7 +1,7 @@
 package pro.ikili.kibicomputers.core.computer
 
 import org.jetbrains.annotations.ApiStatus
-import pro.ikili.kibicomputers.core.kernel.DiskResolver
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import java.nio.file.Path
@@ -28,27 +28,21 @@ public class DiskStore(public val root: Path) {
     public fun directoryOf(id: String): Path? = if (isValidId(id)) root.resolve(id) else null
 
     /**
-     * 挿さっているディスク（識別子 → ティア）から、変わらない [DiskResolver] を作る（電源を入れたときにメインスレッドで呼ぶ）。
+     * 挿さっているディスク（識別子 → ティア）から、変わらない [DiskSnapshot] を作る（電源を入れたとき・動いている間に挿し抜きしたときに、
+     * メインスレッドで呼ぶ。#56）。挿した順を保つ。
      * 形の正しくない識別子は入れない。容量は [PartTier.diskBytes]・[PartTier.diskEntries]。
      * 作った後に [disks] を変えても、結果は変わらない（プロセスのスレッドから呼ばれるため、ワールドにもアイテムにも触らない）
      */
-    public fun snapshot(disks: Map<String, PartTier>): DiskResolver {
-        val resolved = HashMap<String, ResolvedDisk>()
+    public fun snapshot(disks: Map<String, PartTier>): DiskSnapshot {
+        val resolved = LinkedHashMap<String, ResolvedDisk>()
         for ((id, tier) in disks) {
             val dir = directoryOf(id) ?: continue
             resolved[id] = ResolvedDisk(dir, tier.diskBytes, tier.diskEntries)
         }
-        if (resolved.isEmpty()) return DiskResolver.NONE
-        return SnapshotResolver(resolved)
+        return DiskSnapshot.of(resolved)
     }
 
     override fun toString(): String = "DiskStore($root)"
-
-    private class SnapshotResolver(private val disks: Map<String, ResolvedDisk>) : DiskResolver {
-        override fun resolve(diskId: String): ResolvedDisk? = disks[diskId]
-
-        override fun toString(): String = "DiskStore.snapshot(${disks.keys})"
-    }
 
     public companion object {
         /** [id] がディスクの識別子の形か（UUID の正規の小文字の形だけ。`..`・区切り文字・大文字・空は `false`） */
