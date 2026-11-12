@@ -4,4 +4,5 @@ package kibi:computer@0.1.0;
 world imports {
     import memory;
     import clock;
+    import power;
 }

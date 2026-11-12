@@ -28,6 +28,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.withLock
 
 /**
  * テスト用の [ProcessDriver]。振る舞いを関数で渡す。保存に対応した（[SnapshotCapableDriver]）ものとして扱い、層の中身は
@@ -182,6 +183,14 @@ internal fun Machine.spawnTest(program: Program, driver: ProcessDriver, unmetere
     spawn(program, driver, SpawnOptions(allowUnmetered = unmetered), parentPid)
 
 internal fun Machine.rt(pid: Int): ProcessRuntime = runtime(pid)!!
+
+/**
+ * [Machine.spawn] して、作ったプロセスの実行時の部分を返す。spawn と取り出しを1つのカーネルロックの区間にするので、
+ * 子がすぐ終わって刈り取られ（`runtimes` から外れ）ても、取り逃さない（spawn の後に [rt] で取ると競合する）。
+ * 作業ディレクトリ・preopen を指定する [options] には使えない（spawn がロックを持たずに呼ぶことを求めるため）
+ */
+internal fun Machine.spawnRt(program: Program, driver: ProcessDriver, options: SpawnOptions = SpawnOptions(), parentPid: Int = 0): ProcessRuntime =
+    lock.withLock { runtime(spawn(program, driver, options, parentPid))!! }
 
 internal fun Machine.stateOf(pid: Int): ProcessState = processState(pid)!!
 
