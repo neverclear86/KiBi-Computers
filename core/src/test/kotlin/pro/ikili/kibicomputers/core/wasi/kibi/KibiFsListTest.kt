@@ -3,8 +3,11 @@ package pro.ikili.kibicomputers.core.wasi.kibi
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.DiskListing
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.Harness
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MountListing
+import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import pro.ikili.kibicomputers.core.kernel.TestDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -15,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.FsUsage
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.FakeModule
+import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -48,7 +52,9 @@ class KibiFsListTest {
     fun `list-mountsとlist-disksは1件につきMOUNT_LIST_FUEL_PER_ENTRYの燃料を引く`() = timeout(Duration.ofSeconds(30)) {
         val module = FakeModule.builder().fuelMetered().memory(1).build()
         Harness().use { h ->
-            val m = h.machine(fuelPerTick = 1_000_000)
+            // list-disks が0件だと件数 × 係数も 0 になり、引き忘れや係数の誤りを検出できないので、ディスクを3枚挿しておく
+            val disks = DiskSnapshot.of(listOf("a", "b", "c").associateWith { ResolvedDisk(Path.of("unused-$it"), 1L shl 20, 64) })
+            val m = h.machine(fuelPerTick = 1_000_000, environment = MachineEnvironment.builder().disks(disks).build())
             val root = TestMemoryFileSystem().also { it.createDirectory(VfsPath.parse("/a")) }
             m.vfs.mount(VfsPath.ROOT, root, readOnly = false, source = "test:root")
             m.vfs.mount(VfsPath.parse("/a"), TestMemoryFileSystem(), readOnly = true, source = "test:a")
@@ -61,7 +67,8 @@ class KibiFsListTest {
                     assertEquals(2, n)
                     val before2 = ctx.fuelHolder.fuel
                     val d = KibiFs.listDisks(ctx).size
-                    assertEquals(d * KibiFs.MOUNT_LIST_FUEL_PER_ENTRY, before2 - ctx.fuelHolder.fuel)
+                    assertEquals(3, d)
+                    assertEquals(3 * KibiFs.MOUNT_LIST_FUEL_PER_ENTRY, before2 - ctx.fuelHolder.fuel, "ディスク $d 枚に比例して引く")
                 } catch (t: Throwable) {
                     error.set(t)
                 }

@@ -22,9 +22,13 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskQuota
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.FsUsage
+import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -79,6 +83,9 @@ class DiskHotplugTest {
         val opens = ConcurrentHashMap<String, AtomicInteger>()
         val gates = ConcurrentHashMap<String, Gate>()
 
+        /** 識別子 → 開くときに返すファイルシステム（本物の `DiskFileSystem` などに差し替える。#453） */
+        val overrides = ConcurrentHashMap<String, FileSystem>()
+
         class Gate {
             val entered = CountDownLatch(1)
             val release = CountDownLatch(1)
@@ -96,6 +103,7 @@ class DiskHotplugTest {
             }
             if (diskId == "root") return BootVolume(root, readOnly = rootReadOnly)
             if (diskId.startsWith("bad")) return null
+            overrides[diskId]?.let { return BootVolume(it, readOnly = false) }
             return BootVolume(disk(diskId), readOnly = false)
         }
 
@@ -805,14 +813,148 @@ class DiskHotplugTest {
             val b = boot(h, "root", "d1", "d2")
             val m = b.m
             val mounts = m.listMounts()
-            val expected = m.lock.withLockValue { m.kernel.mounts.entries.map { Triple(it.id, it.point.toString(), it.source) } }
-            assertEquals(expected, mounts.map { Triple(it.id, it.point, it.source) })
             assertTrue(mounts.map { it.source }.containsAll(listOf("disk:root", "tmp", "dev", "disk:d1", "disk:d2")), mounts.toString())
             // テストのディスク（TestMemoryFileSystem）は容量を知らないので none、/tmp と /dev は some
             assertNull(mounts.first { it.source == "disk:d1" }.usage)
             assertNotNull(mounts.first { it.source == "tmp" }.usage)
-            assertEquals(pro.ikili.kibicomputers.core.kernel.vfs.FsUsage(0, 0, 0, 0, 0), mounts.first { it.source == "dev" }.usage)
+            assertEquals(FsUsage(0, 0, 0, 0, 0), mounts.first { it.source == "dev" }.usage)
             assertFalse(mounts.first { it.source == "disk:d1" }.readOnly)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `listMountsの並びはunmountしてmountし直すと後ろへ回る`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1", "d2")
+            val m = b.m
+            // 期待値はカーネルの表（m.kernel.mounts）からは作らず、一覧どうしの前後で比べる
+            val before = m.listMounts().map { it.source }
+            assertTrue(before.indexOf("disk:d1") in 0 until before.indexOf("disk:d2"), before.toString())
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            assertEquals(before.filter { it != "disk:d1" }, m.listMounts().map { it.source })
+            m.mountDisk("disk:d1", VfsPath.parse("/x"), false)
+            val after = m.listMounts()
+            assertEquals(before.filter { it != "disk:d1" } + "disk:d1", after.map { it.source })
+            assertEquals("/x", after.last().point)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `listMountsのreadOnlyはマウントの指定とFS自体の読み取り専用のどちらでもtrueで、idはfilestatのdevと同じ`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // root は読み取り専用でマウントする（マウントの指定の側）
+            val b = boot(h, "root", "d1", "d2", disks = Disks(rootFs(), rootReadOnly = true))
+            val m = b.m
+            m.unmountAt(VfsPath.parse("/mnt/d2"))
+            m.mountDisk("disk:d2", VfsPath.parse("/ro"), true)
+            // FS 自体が読み取り専用（マウントの指定は読み書き）
+            m.vfs.mount(VfsPath.parse("/rofs"), TestMemoryFileSystem(readOnly = true), readOnly = false, source = "test:rofs")
+            m.vfs.mount(VfsPath.parse("/rwfs"), TestMemoryFileSystem(), readOnly = false, source = "test:rwfs")
+            val mounts = m.listMounts()
+            val readOnlyBySource = mounts.associate { it.source to it.readOnly }
+            assertEquals(true, readOnlyBySource["disk:root"], "読み取り専用でマウントした root")
+            assertEquals(true, readOnlyBySource["disk:d2"], "読み取り専用でマウントしたディスク")
+            assertEquals(true, readOnlyBySource["test:rofs"], "FS 自体が読み取り専用")
+            assertEquals(false, readOnlyBySource["disk:d1"])
+            assertEquals(false, readOnlyBySource["test:rwfs"])
+            // id は stat().device（p1 の filestat.dev）と同じ値
+            for (e in mounts) {
+                assertEquals(e.id.toLong(), m.vfs.stat(VfsPath.parse(e.point)).device, "${e.point} (${e.source})")
+            }
+            assertEquals(mounts.size, mounts.map { it.id }.toSet().size, "id は重ならない")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `listMountsはFSがつながっていない項目で落ちず、usageはnoneでreadOnlyはマウントの指定のまま`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1")
+            val m = b.m
+            // 復元のとき、Vfs.attach の前の表（マウントの項目だけでファイルシステムがない）を作る
+            val (ro, rw) = m.lock.withLockValue {
+                m.kernel.mounts.add(VfsPath.parse("/ghost-ro"), true, "disk:ghost-ro") to
+                    m.kernel.mounts.add(VfsPath.parse("/ghost-rw"), false, "disk:ghost-rw")
+            }
+            val mounts = m.listMounts().associateBy { it.id }
+            assertNull(mounts.getValue(ro.id).usage)
+            assertEquals(true, mounts.getValue(ro.id).readOnly)
+            assertNull(mounts.getValue(rw.id).usage)
+            assertEquals(false, mounts.getValue(rw.id).readOnly)
+            assertEquals("disk:ghost-ro", mounts.getValue(ro.id).source)
+            m.lock.withLockValue {
+                m.kernel.mounts.remove(ro.id)
+                m.kernel.mounts.remove(rw.id)
+            }
+            m.close()
+        }
+    }
+
+    /** 容量を読むとき（[FileSystem.usage]）に [onUsage] を呼ぶファイルシステム */
+    private class HookedUsage(private val inner: TestMemoryFileSystem = TestMemoryFileSystem(), val onUsage: () -> Unit) : FileSystem by inner {
+        override fun usage(): FsUsage {
+            onUsage()
+            return FsUsage(10, 4, 6, 8, 2)
+        }
+    }
+
+    @Test
+    fun `listMountsは容量を読んでいる間に外れたマウントの項目を残し、usageだけnoneにする`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1")
+            val m = b.m
+            var unmountDuringUsage = false
+            val fs = HookedUsage {
+                // listMounts はカーネルロックを持たずに容量を読むので、ここで外せる
+                if (unmountDuringUsage) m.unmountAt(VfsPath.parse("/hooked"))
+            }
+            m.vfs.mount(VfsPath.parse("/hooked"), fs, readOnly = false, source = "test:hooked")
+            // 外れなければ容量が出る
+            assertEquals(FsUsage(10, 4, 6, 8, 2), m.listMounts().first { it.source == "test:hooked" }.usage)
+            unmountDuringUsage = true
+            val mounts = m.listMounts()
+            val hooked = mounts.firstOrNull { it.source == "test:hooked" }
+            assertNotNull(hooked, "写した項目は残る: $mounts")
+            assertNull(hooked!!.usage, "読んだ後に外れたマウントの容量は見せない")
+            assertEquals("/hooked", hooked.point)
+            // 外れた後の一覧には出ない
+            assertTrue(m.listMounts().none { it.source == "test:hooked" })
+            // ほかの項目の容量は影響を受けない
+            assertNotNull(mounts.first { it.source == "tmp" }.usage)
+            m.close()
+        }
+    }
+
+    /** 同梱でない、小さなイメージ（`d/a.txt` に 5 バイト。項目は `/d` と `/d/a.txt` の2つ） */
+    private fun tinyImage(): ImageFileSystem {
+        val out = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(out).use { z ->
+            z.putNextEntry(java.util.zip.ZipEntry("d/a.txt"))
+            z.write("hello".toByteArray())
+            z.closeEntry()
+        }
+        return ImageFileSystem.fromZip(java.io.ByteArrayInputStream(out.toByteArray()))
+    }
+
+    @Test
+    fun `listMountsは本物のDiskFileSystemとイメージの容量をそのまま返す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val real = DiskFileSystem.open(dir.resolve("real"), DiskQuota(maxBytes = 1L shl 20, maxEntries = 64))
+            val disks = Disks(rootFs())
+            disks.overrides["d1"] = real
+            val b = boot(h, "root", "d1", disks = disks)
+            val m = b.m
+            m.vfs.mount(VfsPath.parse("/img"), tinyImage(), readOnly = true, source = "disk:image:tiny")
+            val mounts = m.listMounts()
+            val d1 = mounts.first { it.source == "disk:d1" }
+            assertEquals(real.usage(), d1.usage)
+            assertEquals(1L shl 20, d1.usage!!.totalBytes)
+            assertEquals(64L, d1.usage!!.totalEntries)
+            val img = mounts.first { it.source == "disk:image:tiny" }
+            assertEquals(FsUsage(totalBytes = 5, usedBytes = 5, availableBytes = 0, totalEntries = 2, usedEntries = 2), img.usage)
+            assertTrue(img.readOnly)
             m.close()
         }
     }
@@ -881,6 +1023,29 @@ class DiskHotplugTest {
                 out.filter { it.startsWith("d") },
             )
             assertEquals("mounts-realloc ${mounts.size} ${mounts.size}", out.last())
+            m.close()
+        }
+    }
+
+    @Test
+    fun `p1のlist-mountsは本物のDiskFileSystemのsome(usage)とイメージの項目をkibi_fsの経路で書く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val real = DiskFileSystem.open(dir.resolve("real"), DiskQuota(maxBytes = 1L shl 20, maxEntries = 64))
+            val disks = Disks(rootFs())
+            disks.overrides["d1"] = real
+            val b = boot(h, "root", "d1", disks = disks)
+            val m = b.m
+            val img = m.vfs.mount(VfsPath.parse("/img"), tinyImage(), readOnly = true, source = "disk:image:tiny")
+            val d1Id = m.listMounts().first { it.source == "disk:d1" }.id
+            val lines = runKibiFs(h, m, "mounts").lines().filter { it.startsWith("m ") }
+            // 期待値は実装の一覧からではなく、ファイルシステム自身の値と、イメージに入れたものの数から作る。種類は disk = 0、image = 1
+            val u = real.usage()
+            assertEquals(1L shl 20, u.totalBytes)
+            assertEquals(
+                "m /mnt/d1 disk:d1 0 0 $d1Id ${u.totalBytes} ${u.usedBytes} ${u.availableBytes} 64 ${u.usedEntries}",
+                lines.first { it.startsWith("m /mnt/d1 ") },
+            )
+            assertEquals("m /img disk:image:tiny 1 1 ${img.id} 5 5 0 2 2", lines.first { it.startsWith("m /img ") })
             m.close()
         }
     }
