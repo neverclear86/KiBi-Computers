@@ -23,6 +23,7 @@
 //   kp sleep <ms>           眠って 0 で終わる
 //   kp ignore-child         Ctrl+C を無視してから fd 1 に "r" を書き、眠り続ける
 //   kp orphan               親なし（parent-pid が 0）になったら fd 1 に "orphaned" を書いて終わる
+//   kp orphan-quiet         親なし（parent-pid が 0）になったら何も書かずに 0 で終わる（親が閉じるまで終わらないので、順序が時間に依らない）
 //   kp cwd-child            get-cwd を表示する
 //   kp hang                 止められるまで眠る（シバン #!/bin/kp hang のスクリプトから）
 #include <errno.h>
@@ -424,9 +425,9 @@ static int run_ps(void) {
     // 終わった子（status を読まないのでゾンビのまま）
     const char *exiter[] = {"kp", "exit", "3"};
     int64_t b = spawn_self(3, exiter, NULL, 0);
-    // 親なしで終わる子（ハンドルを閉じる）
-    const char *orphan[] = {"kp", "sleep", "20"};
-    int64_t c = spawn_self(3, orphan, NULL, 0);
+    // 親なしで終わる子（ハンドルを閉じる）。親なしになるまで終わらないので、閉じる前に終わって刈り取られることはない
+    const char *orphan[] = {"kp", "orphan-quiet"};
+    int64_t c = spawn_self(2, orphan, NULL, 0);
     // シバンのスクリプト（argv はインタプリタ・シバンの引数・スクリプトのパス・元の argv[1..]）
     const char *script[] = {"hang.sh", "x"};
     int64_t d = spawn_full("/bin/hang.sh", 2, script, NULL, 0, NULL);
@@ -468,6 +469,14 @@ static int child_ignore(void) {
     for (;;) sleep_ms(1000);
 }
 
+static int child_orphan_quiet(void) {
+    for (int i = 0; i < 4000; i++) {
+        if (kibi_process_parent_pid() == 0) return 0;
+        sleep_ms(5);
+    }
+    return 1;
+}
+
 static int child_orphan(void) {
     for (int i = 0; i < 4000; i++) {
         if (kibi_process_parent_pid() == 0) {
@@ -493,6 +502,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(mode, "ignore-child") == 0) return child_ignore();
     if (strcmp(mode, "orphan") == 0) return child_orphan();
+    if (strcmp(mode, "orphan-quiet") == 0) return child_orphan_quiet();
     if (strcmp(mode, "hang") == 0) {
         for (;;) sleep_ms(1000);
     }

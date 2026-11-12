@@ -329,7 +329,7 @@ class WasiP1KibiProcessTest {
         assertTrue(first.any { Regex("p $pa $pid $live - 3 kp\\|sleep\\|60000").matches(it) }, out)
         assertTrue("p $pb $pid finished exited:3 3 kp|exit|3" in first, out)
         // 親なしのゾンビ（親の pid は 0）
-        assertTrue("p $pc 0 finished exited:0 3 kp|sleep|20" in first, out)
+        assertTrue("p $pc 0 finished exited:0 2 kp|orphan-quiet" in first, out)
         // シバンの子の argv は [インタプリタ, シバンの引数, スクリプトのパス, 元の argv[1..]]
         assertTrue(first.any { Regex("p $pd $pid $live - 4 /bin/kp\\|hang\\|/bin/hang\\.sh\\|x").matches(it) }, out)
         assertLine("kill 0 0", out)
