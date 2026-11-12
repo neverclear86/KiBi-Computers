@@ -138,12 +138,27 @@ class StandardOsRestoreTest {
         return written to pid
     }
 
-    /** 新しい表示のマシンに戻し、受け手が返るまで回す */
-    private fun restore(h: Harness, store: MachineSaveStore, identity: MachineIdentity): Pair<Machine, ScreenHost> {
+    /**
+     * 新しい表示のマシンに戻し、受け手が返るまで回す。[probe] は受け手の中（復元の quiesce が閉じる前）で、プロセス [pid] の
+     * 状態を見る（少し待ってから。受け手の中でプロセスが動くなら、その間に書いて待ちに戻る）
+     */
+    private fun restore(
+        h: Harness,
+        store: MachineSaveStore,
+        identity: MachineIdentity,
+        pid: Int? = null,
+        probe: ((ProcessState) -> Unit)? = null,
+    ): Pair<Machine, ScreenHost> {
         val host = ScreenHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
         val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
-        val listener = RestoreListener { _, outcome, _ -> outcomes += outcome }
+        val listener = RestoreListener { machine, outcome, _ ->
+            if (pid != null && probe != null) {
+                Thread.sleep(300)
+                probe(machine.stateOf(pid))
+            }
+            outcomes += outcome
+        }
         assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), listener)))
         eventually(60_000, "復元が終わらない") {
             h.scheduler.tick()
@@ -161,7 +176,10 @@ class StandardOsRestoreTest {
                 assertTrue(host.text().endsWith("$ "), host.text())
                 m.offerConsoleInput("echo hi".toByteArray())
             }
-            val (m, host) = restore(h, store, saved)
+            var inListener: ProcessState? = null
+            val (m, host) = restore(h, store, saved, pid) { inListener = it }
+            // 受け手の中では、sh は起こされている（restored が入った）が、まだ1歩も進んでいない（進めば描いて待ちに戻る）
+            assertEquals(ProcessState.RUNNABLE, inListener, "受け手の中の sh の状態")
             assertEquals("", host.text(), "受け手の中では、まだ何も描いていない")
             eventuallyDescribe(60_000, { "描き直さない: ${host.text()}" }) {
                 h.scheduler.tick()
@@ -249,16 +267,31 @@ class StandardOsRestoreTest {
     }
 
     @Test
-    fun `shとnanoはcabi_reallocをexportしてkibi_kernel_eventsをimportする`() {
+    fun `eventsを使うプログラムだけがcabi_reallocをexportし、ほかの export は増えない`() {
         val runtime = EndiveRuntime()
-        for (name in listOf("sh", "nano")) {
-            val module = runtime.load(imageFile("/bin/$name"))
-            assertTrue(module.exports.any { it.name == "cabi_realloc" }, "$name が cabi_realloc を出していない")
-            val events = module.imports.filter { it.module == "kibi:kernel/events@0.1.0" }.map { it.name }.toSet()
-            assertEquals(setOf("[static]event-queue.open", "[method]event-queue.take", "[resource-drop]event-queue"), events, name)
+        val eventsProgram = setOf("sh", "nano")
+        var checked = 0
+        for (dir in listOf("/bin", "/sbin")) {
+            val entries = image.readDirectory(image.stat(VfsPath.parse(dir)).node)
+            for (entry in entries) {
+                val module = runtime.load(imageFile("$dir/${entry.name}"))
+                val exports = module.exports.map { it.name }.toSet()
+                val events = module.imports.filter { it.module == "kibi:kernel/events@0.1.0" }.map { it.name }.toSet()
+                if (entry.name in eventsProgram && dir == "/bin") {
+                    assertEquals(
+                        setOf("[static]event-queue.open", "[method]event-queue.take", "[resource-drop]event-queue"),
+                        events,
+                        entry.name,
+                    )
+                    assertEquals(setOf("memory", "_start", "cabi_realloc"), exports, "${entry.name} の export")
+                } else {
+                    // events を使わないプログラムには何も足さない（`-rdynamic` は `__stack_pointer` まで足してしまう）
+                    assertEquals(emptySet<String>(), events, "${entry.name} が events を import している")
+                    assertEquals(setOf("memory", "_start"), exports, "$dir/${entry.name} の export")
+                }
+                checked++
+            }
         }
-        // events を使わないプログラムには出さない
-        val echo = runtime.load(imageFile("/bin/echo"))
-        assertTrue(echo.exports.none { it.name == "cabi_realloc" }, "echo が cabi_realloc を出している")
+        assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }

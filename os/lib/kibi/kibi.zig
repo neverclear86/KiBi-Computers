@@ -5,7 +5,7 @@
 //! バッファは静的に置く（.bss はゼロなので、触るまで RAM に数えない。#407）。
 //!
 //! `kibi:kernel/events`（`events`。#87）を使うプログラムは、`cabi_realloc` も export する（静的な領域から切り出すだけ。
-//! `events.zig` を参照したプログラムだけに出る）。
+//! `core/build.gradle.kts` の `osEventsPrograms` に足したプログラムだけに出る）。
 //!
 //! 出していないもの（使うプログラムができたときに足す）: `kibi:kernel/timers`・
 //! `kibi:computer/clock`・`get-cwd`（cwd は `fs.cwd()` が `PWD` から持つ）。

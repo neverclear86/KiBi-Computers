@@ -41,7 +41,7 @@ event { kind: "restored", source: "", values: [integer(実時間の飛び ns), i
 - 共通ライブラリに `kibi.events`（`os/lib/kibi/events.zig`）を置く。`open`・`take`・`[resource-drop]` の包みと、`cabi_realloc` の export
   - `cabi_realloc` は 8 KiB の静的な領域（.bss）から切り出すだけ。`take` の直前に先頭へ戻し、1回に1件だけ取り出す（1件の最悪は約 5 KiB）。足りなければ線形メモリの外（`0xFFFFFFF8`）を返してトラップさせる（0 を返すとアドレス 0 から上書きする）。止まりうる import は呼ばない
   - 配置（Canonical ABI）は `kibi_events.h` の `_Static_assert` と同じ値を `comptime` で確かめる
-  - Zig は WASM の実行ファイルで `_start` のほかを export しないので、標準 OS のプログラムを `-rdynamic` でビルドする。出るのは解析された `export fn` だけで、`kibi.events` を使わないプログラムには何も足されない
+  - Zig は WASM の実行ファイルで `_start` のほかを export しないので、`kibi.events` を使うプログラム（`sh`・`nano`）だけを `--export=cabi_realloc` でビルドする（`core/build.gradle.kts` の `osEventsPrograms`）。`-rdynamic` は使わない。可変グローバル `__stack_pointer` まで全プログラムに足してしまい、events を使わないプログラムの export とバイナリが変わるため。events を使うプログラムを足したら、`osEventsPrograms` にも足す（足し忘れると読み込みで NOEXEC になる）
 - 待ち方: `waitInputOrQueue` で、標準入力とキューを `poll_oneoff` の FD_READ 2つで待つ。時計の購読は付けない（待っているだけの台を定期的に起こさない）。キューの側が起きたら `take` で空にし（`dropped` も消費する）、空回りしない
 - 描き直す条件: `kind == "restored"` かつ `source == ""`、または `dropped > 0`
 - キューを開けない（マシンのキューが上限の `NFILE`、ハンドル表が満杯の `MFILE`）・待ち・取り出しに失敗したら、キューを閉じて、標準入力だけを待つ従来の動きに戻す
@@ -63,6 +63,6 @@ event { kind: "restored", source: "", values: [integer(実時間の飛び ns), i
 
 ## 確かめ方
 
-- `core` の `RestoreEventTest`: 全部を受けるキューと `restored` だけを受けるキューに1件ずつ届き、ほかの種類のキューには届かない。値（正・0・負・飽和）。受け手の中は止めたまま。取り出さずに保存・復元すると2件。表に入れる途中の失敗では出さない
-- `core` の `StandardOsRestoreTest`（待機点型に変換した標準 OS）: `sh` が入力中の行のまま戻ると、キーを打たずにプロンプトと行を描き直し、続きの入力が効き、待っている間に出力しない。`nano` が `?1049h`・`?7l` から全体を描き直す。キューを開けなくても `sh` は動く。`sh`・`nano` が `cabi_realloc` を出し、`echo` は出さない
+- `core` の `RestoreEventTest`: 全部を受けるキューと `restored` だけを受けるキューに1件ずつ届き、ほかの種類のキューには届かない。値（正・0・負・飽和）。受け手の中は止めたまま（`restored` を `poll` で待っていたプロセスは、受け手の中では起きている=RUNNABLE が1歩も進まず、受け手が返ってから取り出す）。取り出さずに保存・復元すると2件。表に入れる途中の失敗では出さない
+- `core` の `StandardOsRestoreTest`（待機点型に変換した標準 OS）: `sh` が入力中の行のまま戻ると、キーを打たずにプロンプトと行を描き直し、続きの入力が効き、待っている間に出力しない。`nano` が `?1049h`・`?7l` から全体を描き直す。キューを開けなくても `sh` は動く。イメージの全プログラムの export を調べ、`sh`・`nano` だけが `cabi_realloc` を足し（`memory`・`_start`・`cabi_realloc`）、ほかは `memory`・`_start` のままであることを確かめる
 - 1.21.1 の GameTest `MachineRestoreGameTests.restoredShellRedrawsThePrompt`: 画面も置き直して戻すと、キーを打つ前に `$ echo pending` が出て、Enter で動く

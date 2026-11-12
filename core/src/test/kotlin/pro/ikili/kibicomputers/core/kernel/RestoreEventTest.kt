@@ -72,10 +72,18 @@ class RestoreEventTest {
      * `prompt` を動かし、全部を受けるキューと `restored` だけを受けるキュー（と、[extra] の種類だけを受けるキュー）を持たせて、
      * 入力を待ったところで書く
      */
-    private fun save(h: Harness, store: MachineSaveStore, clock: ManualClock, extra: String = "timer"): MachineIdentity {
+    private fun save(
+        h: Harness,
+        store: MachineSaveStore,
+        clock: ManualClock,
+        extra: String = "timer",
+        program: String = "prompt-wasi.wasm",
+        args: List<String> = emptyList(),
+        harnessQueues: Boolean = true,
+    ): MachineIdentity {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
         val m = h.machine(fuelPerTick = 10_000_000, environment = env(clock))
-        val bytes = resource("prompt-wasi.wasm")
+        val bytes = resource(program)
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
         m.vfs.createDirectory(VfsPath.parse("/bin"))
         val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
@@ -84,12 +92,14 @@ class RestoreEventTest {
             ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
         }
         val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
-        val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio))
+        val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt") + args, stdio = stdio))
         m.lock.withLockValue {
             m.kernel.initPid = pid
-            m.openEventQueueLocked(pid, EventFilter.ALL, 64)
-            m.openEventQueueLocked(pid, EventFilter(setOf(RestoreEvents.TYPE)), 64)
-            m.openEventQueueLocked(pid, EventFilter(setOf(extra)), 64)
+            if (harnessQueues) {
+                m.openEventQueueLocked(pid, EventFilter.ALL, 64)
+                m.openEventQueueLocked(pid, EventFilter(setOf(RestoreEvents.TYPE)), 64)
+                m.openEventQueueLocked(pid, EventFilter(setOf(extra)), 64)
+            }
         }
         eventually(60_000, "入力を待たない") {
             h.scheduler.tick()
@@ -101,16 +111,28 @@ class RestoreEventTest {
         return written
     }
 
-    private class Result(val outcome: RestoreOutcome, val inListener: Map<String, List<KernelEvent>>, val quiesced: Boolean)
+    private class Result(
+        val outcome: RestoreOutcome,
+        val inListener: Map<String, List<KernelEvent>>,
+        val quiesced: Boolean,
+        val probe: Any? = null,
+    )
 
     /** [identity] を時計 [clock] のマシンに戻し、受け手の中で見たキューの中身を返す。戻したマシンは [keep] に渡す */
-    private fun restore(h: Harness, store: MachineSaveStore, identity: MachineIdentity, clock: ManualClock, keep: (Machine) -> Unit = { it.close() }): Result {
+    private fun restore(
+        h: Harness,
+        store: MachineSaveStore,
+        identity: MachineIdentity,
+        clock: ManualClock,
+        probe: ((Machine) -> Any?)? = null,
+        keep: (Machine) -> Unit = { it.close() },
+    ): Result {
         val m = h.machine(fuelPerTick = 10_000_000, environment = env(clock))
         val results = Collections.synchronizedList(ArrayList<Result>())
         val errors = Collections.synchronizedList(ArrayList<Throwable>())
         val listener = RestoreListener { machine, outcome, _ ->
             try {
-                results += Result(outcome, queues(machine), machine.isQuiesced)
+                results += Result(outcome, queues(machine), machine.isQuiesced, probe?.invoke(machine))
             } catch (t: Throwable) {
                 errors += t
             }
@@ -177,7 +199,7 @@ class RestoreEventTest {
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val saved = save(h, store, ManualClock(realtime = 100L, world = 1))
             var second: MachineIdentity? = null
-            restore(h, store, saved, ManualClock(realtime = 300L, world = 4)) { m ->
+            restore(h, store, saved, ManualClock(realtime = 300L, world = 4), keep = { m ->
                 eventually(60_000, "知らせの後も写せない") {
                     h.scheduler.tick()
                     m.saveReadiness() == SaveReadiness.READY && m.isAtWaitPoint
@@ -185,7 +207,7 @@ class RestoreEventTest {
                 // 写しを取る時点の時計（実時間 300、ゲーム内 4）が、次の復元の起点になる
                 second = store.write(store.assignNewId(owner)!!, owner, m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
                 m.close()
-            }
+            })
             val r = restore(h, store, second!!, ManualClock(realtime = 1_000L, world = 10))
             assertEquals(RestoreOutcome.RESTORED, r.outcome)
             assertEquals(listOf(restored(200, 3), restored(700, 6)), r.inListener[RestoreEvents.TYPE])
@@ -203,15 +225,60 @@ class RestoreEventTest {
                 seen = queues(m)
                 throw IllegalStateException("テストの失敗")
             }
-            val r = restore(h, store, saved, ManualClock(realtime = 9_999_999_999L)) { m ->
+            val r = restore(h, store, saved, ManualClock(realtime = 9_999_999_999L), keep = { m ->
                 assertEquals(MachineState.CRASHED, m.state)
                 repeat(3) { h.scheduler.tick() }
                 assertTrue(queues(m).values.all { q -> q.none { it.type == RestoreEvents.TYPE } }, "CRASHED のマシンに restored が入った")
                 m.close()
-            }
+            })
             assertEquals(RestoreOutcome.CANCELLED, r.outcome, "知らせは来ない")
             assertTrue(seen!!.isNotEmpty(), "キューを表に入れる前に落ちた")
             assertTrue(seen!!.values.all { it.isEmpty() }, "時計を戻した時点で出していた")
+        }
+    }
+
+    /** 受け手の中で見たプロセスの様子（状態と、ストリームに書かれた中身） */
+    private class Observed(val state: ProcessState, val output: String)
+
+    private fun Machine.streamText(): String = lock.withLockValue {
+        val sb = StringBuilder()
+        kernel.objects.forEachObject { obj -> if (obj is ByteStream) sb.append(String(obj.availableBytes(), Charsets.UTF_8)) }
+        sb.toString()
+    }
+
+    @Test
+    fun `restoredを待っていたプロセスは起き、受け手が返るまで動かない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(
+                h, store, ManualClock(realtime = 1_000L, world = 10),
+                program = "kibi-events-wasi.wasm", args = listOf("restored"), harnessQueues = false,
+            )
+            val r = restore(
+                h, store, saved, ManualClock(realtime = 1_000_501_000L, world = 110),
+                probe = { m ->
+                    val pid = m.lock.withLockValue { m.kernel.initPid }
+                    // 動けるなら、この間に起きて書いて待ちに戻るはずの時間を空ける。受け手の中なので、プロセスは割り当てられない
+                    Thread.sleep(300)
+                    Observed(m.stateOf(pid), m.streamText())
+                },
+                keep = { m ->
+                    // 受け手が返った後は動く: 取り出して出力する
+                    eventually(60_000, "起きて取り出さない: ${m.streamText()}") {
+                        h.scheduler.tick()
+                        "done\n" in m.streamText()
+                    }
+                    val text = m.streamText()
+                    assertTrue(text.startsWith("opened\nwoke\n"), text)
+                    assertTrue("event restored [] integer:1000500000 integer:100\n" in text, text)
+                    m.close()
+                },
+            )
+            assertEquals(RestoreOutcome.RESTORED, r.outcome)
+            val seen = r.probe as Observed
+            // 起こされている（RESTORED の受け手より前にイベントが入った）が、まだ1歩も進んでいない
+            assertEquals(ProcessState.RUNNABLE, seen.state, "受け手の中: 起きてはいるが割り当てられていない")
+            assertEquals("opened\n", seen.output, "受け手の中で書いた")
         }
     }
 }

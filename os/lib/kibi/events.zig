@@ -7,7 +7,7 @@
 //! - 足りなければ線形メモリの外を返す（ホストがトラップする）。0 を返すと、アドレス 0 から上書きしてメモリを壊すため。
 //! - 止まりうる import（`fd_write` など）は呼ばない（`cabi_realloc` の中で呼ぶとトラップ。ADR 0073）。
 //!
-//! `cabi_realloc` は、このファイルを読み込んだ（`kibi.events` を参照した）プログラムだけが export する。
+//! `cabi_realloc` は、`kibi.events` を使うプログラムだけが export する（`core/build.gradle.kts` の `osEventsPrograms` に足し、`--export=cabi_realloc` でビルドする）。
 //! `take` を import するのに `cabi_realloc` がなければ、読み込みで NOEXEC になる。
 const wasi = @import("wasi.zig");
 const io = @import("io.zig");
