@@ -1304,9 +1304,35 @@ internal class ProcessRunner(private val machine: Machine) {
             lock.withLockValue { rt.currentHolder?.let { it.fuel -= amount } }
         }
 
-        override fun requestShutdown() = machine.stop()
+        override fun requestShutdown(): Nothing {
+            powerRequest { machine.stop() }
+            // stop() は呼んだこのプロセスも止める（killed を立てる）
+            throw ProcessKilledException()
+        }
 
-        override fun requestReboot(): Boolean = machine.reboot()
+        override fun requestReboot(): Boolean {
+            val accepted = powerRequest { machine.reboot() }
+            // 受け付けたら、このプロセスも止まっている。断っても、CRASHED などで止められていれば戻らない
+            if (accepted || lock.withLockValue { rt.killed }) throw ProcessKilledException()
+            return false
+        }
+
+        /**
+         * 電源の求め（#306）。止められていないことを確かめてから [request] を呼ぶまでを、1つのカーネルロックの区間にする。
+         * [hostFunction] の包みの確認と本体の間に、ほかのスレッドの `Machine.stop()` が入ると、その後の `reboot()` が
+         * 止めたはずのマシンをまた再起動させてしまうため。ロックは再入できる（`machine.lock` と同じもの）。
+         * `Machine.stop()`・`reboot()` は、ロックの外で後処理をしないことを前提にしている（入れ子にしても意味が変わらない）。
+         * 受け付けた後は、割り込みで止まる処理（待ち・`flushConsole` など）を挟まずにすぐ投げる
+         * （`killRuntimeLocked` が自分のスレッドにも割り込みをかけるため）
+         */
+        private inline fun <T> powerRequest(request: () -> T): T {
+            checkThread()
+            hooks.beforePowerRequest?.invoke(machine, rt.pid)
+            return lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                request()
+            }
+        }
 
         override fun takeFuelUnwind(): Boolean {
             val unwound = rt.fuelUnwound

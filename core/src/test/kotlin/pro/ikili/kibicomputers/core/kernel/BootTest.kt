@@ -36,6 +36,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.wasi.p1.P1
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -499,26 +500,103 @@ class BootTest {
     }
 
     @Test
-    fun `プロセスから停止と再起動を求められる`() = env {
+    fun `プロセスから停止と再起動を求められ、受け付けると呼んだプロセスはKILLEDで戻らない`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { m.state == MachineState.RUNNING }
-        val never = m.lock.withLockValue { m.kernel.objects.add(ByteStream(1)) }
+        val returned = AtomicBoolean()
         val asker = { reboot: Boolean ->
             TestDriver(ProcessKind.BLOCKING) { ctx ->
-                if (reboot) assertTrue(ctx.requestReboot()) else ctx.requestShutdown()
-                ctx.block(listOf(WaitKey(never, WaitCondition.READABLE)))
+                if (reboot) ctx.requestReboot() else ctx.requestShutdown()
+                returned.set(true)
                 StepResult.Exit(0)
             }
         }
-        m.spawn(h.program(emptyModule()), asker(true), SpawnOptions(), parentPid = 1)
+        // init が止まると子は表から消えるので、終わった状態は実行時の部分の Process から見る
+        val first = m.rt(m.spawn(h.program(emptyModule()), asker(true), SpawnOptions(), parentPid = 1))
         tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING }
+        assertEquals(ProcessState.KILLED, first.process.state)
 
-        m.spawn(h.program(emptyModule()), asker(false), SpawnOptions(), parentPid = 1)
+        val second = m.rt(m.spawn(h.program(emptyModule()), asker(false), SpawnOptions(), parentPid = 1))
         tickUntil { m.state == MachineState.STOPPED }
         assertTrue(m.awaitTermination(5_000))
         tickFor(50)
+        assertFalse(returned.get(), "受け付けたら戻らない")
         assertEquals(1, host.reboots.get())
+        assertFalse(host.console.contains("init exited"), host.console.toString())
+        assertEquals(ProcessState.KILLED, m.stateOf(1))
+        assertEquals(ProcessState.KILLED, second.process.state)
+    }
+
+    @Test
+    fun `起動を通らずに作ったマシンではプロセスの再起動の求めを断り、プロセスは続く`() = env {
+        val result = AtomicReference<Boolean?>()
+        val pid = m.spawn(
+            h.program(emptyModule()),
+            TestDriver(ProcessKind.BLOCKING) { ctx ->
+                result.set(ctx.requestReboot())
+                StepResult.Exit(7)
+            },
+            SpawnOptions(),
+        )
+        tickUntil { m.stateOf(pid).isTerminal }
+        assertEquals(false, result.get())
+        assertEquals(ProcessState.EXITED, m.stateOf(pid))
+        assertEquals(0, host.reboots.get())
+    }
+
+    @Test
+    fun `確かめてから再起動を求めるまでの間にstopが入ると、再起動しない`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING }
+        val returned = AtomicBoolean()
+        val asker = TestDriver(ProcessKind.BLOCKING) { ctx ->
+            ctx.requestReboot()
+            returned.set(true)
+            StepResult.Exit(0)
+        }
+        val rt = m.rt(m.spawn(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1))
+        val pid = rt.pid
+        // ホスト関数の包みの確認を過ぎた後、電源の求めの前に、プレイヤーが止める
+        h.scheduler.hooks.beforePowerRequest = { machine, p ->
+            if (p == pid) {
+                h.scheduler.hooks.beforePowerRequest = null
+                machine.stop()
+            }
+        }
+        tickUntil { m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        tickFor(100)
+        assertEquals(0, host.reboots.get(), "止めたマシンは再起動しない: ${host.log}")
+        assertEquals(MachineState.STOPPED, m.state)
+        assertFalse(m.isRebootPending)
+        assertFalse(returned.get(), "止められたプロセスには戻らない")
+        assertEquals(ProcessState.KILLED, rt.process.state)
+    }
+
+    @Test
+    fun `initが自分で停止・再起動を求めてもinit exitedは出ない`() = env {
+        val asks = AtomicInteger()
+        // p1 の import（kibi:computer/power）から求める。再起動は受け付ければ書き先に書かないので、0 を渡す
+        val selfPowerInit = FakeModule.builder()
+            .fuelMetered()
+            .import(WasiP1Kibi.POWER, "shutdown", VOID)
+            .import(WasiP1Kibi.POWER, "reboot", WasmFunctionType.of(listOf(WasmValueType.I32), emptyList()))
+            .export("_start", VOID) { ctx, _ ->
+                ctx.step(1)
+                // 1回目の起動では再起動、2回目では停止
+                if (asks.getAndIncrement() == 0) ctx.callImport(WasiP1Kibi.POWER, "reboot", 0L) else ctx.callImport(WasiP1Kibi.POWER, "shutdown")
+                LongArray(0)
+            }
+            .build()
+        disks.withInit("d", exe(selfPowerInit))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.reboots.get() == 1 && asks.get() == 2 && m.state == MachineState.STOPPED && !m.isRebootPending && !m.isBooting }
+        assertTrue(m.awaitTermination(5_000))
+        tickFor(50)
+        assertEquals(1, host.reboots.get())
+        assertEquals(listOf("state:RUNNING", "state:STOPPING", "state:STOPPED", "state:RUNNING", "state:STOPPING", "state:STOPPED"), host.states())
         assertFalse(host.console.contains("init exited"), host.console.toString())
         assertEquals(ProcessState.KILLED, m.stateOf(1))
     }

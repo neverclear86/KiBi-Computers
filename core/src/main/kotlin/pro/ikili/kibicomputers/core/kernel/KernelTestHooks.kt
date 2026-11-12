@@ -33,6 +33,13 @@ internal class KernelTestHooks {
     @Volatile
     var beforeConsoleFlush: ((Machine, Int) -> Unit)? = null
 
+    /**
+     * プロセスが電源の求め（`requestShutdown`・`requestReboot`。#306）を出す前（カーネルロックの外。プロセスのスレッド）。
+     * ホスト関数の包みが止められていないことを確かめた後なので、ここで `stop()` を挟むと、確かめてから求めるまでの競合を作れる
+     */
+    @Volatile
+    var beforePowerRequest: ((Machine, Int) -> Unit)? = null
+
     /** `stop()` で、登録を確かめた後・割り込みを送る前（カーネルロックの中） */
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null

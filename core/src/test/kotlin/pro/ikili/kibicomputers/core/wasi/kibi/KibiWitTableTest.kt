@@ -128,6 +128,17 @@ class KibiWitTableTest {
     }
 
     @Test
+    fun `kibi_computer_powerの関数はすべてp1に出していて、worldがpowerをimportし、wasiを参照しない`() {
+        val wit = derived()
+        val power = setOf("shutdown", "reboot").map { WasiP1Kibi.POWER to it }.toSet()
+        assertEquals(power, wit.filter { it.first == WasiP1Kibi.POWER }.toSet())
+        for (fn in power) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
+        val world = witText("kibi-computer/world.wit")
+        assertTrue(Regex("""import\s+power\s*;""").containsMatchIn(world), world)
+        assertFalse(useLines(witText("kibi-computer/power.wit")).any { "wasi:" in it })
+    }
+
+    @Test
     fun `kibi_kernelのp2とp3のinterfaceはWITにあり、p1には出さない`() {
         val wit = derived()
         val expected = mapOf(

@@ -24,7 +24,14 @@ import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.nio.file.Path
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 /** ケースのティアと電源・状態（#121） */
 class ComputerCaseTest {
@@ -456,5 +463,72 @@ class ComputerCaseTest {
         case.startRestore(manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, boot, null, RestoreReady { error("呼ばない") })
         assertNull(case.machine)
         assertEquals(ComputerStatus.OFF, case.status)
+    }
+
+    /**
+     * /sbin/init を kibi-power-wasi（#306）にし、/kpw-mode に [mode] を置いたディスク [id] を起動に使わせる。
+     * 戻り値は、/kpw-mode の今の中身を読む関数
+     */
+    private fun powerInitDisk(id: String, mode: String): () -> String {
+        val wasm = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/kibi-power-wasi.wasm")) { "kibi-power-wasi.wasm がない" }
+            .use { it.readBytes() }
+        val fs = TestMemoryFileSystem()
+        fs.createDirectory(VfsPath.parse("/sbin"))
+        val nodes = listOf(BootConfig.INIT_PATH to wasm, "/kpw-mode" to mode.toByteArray()).map { (path, bytes) ->
+            fs.createFile(VfsPath.parse(path)).also { fs.write(it, 0, bytes, 0, bytes.size) }
+        }
+        manager.scheduler.hooks.bootVolumes = BootVolumeOpener { disk -> if (disk == id) BootVolume(fs, readOnly = false) else null }
+        return {
+            val buf = ByteArray(32)
+            String(buf, 0, fs.read(nodes[1], 0, buf, 0, buf.size).coerceAtLeast(0))
+        }
+    }
+
+    /** 状態の変化を記録する（ケースの events） */
+    private class States : MachineHost {
+        val states: MutableList<MachineState> = Collections.synchronizedList(ArrayList())
+        val reboots = AtomicInteger()
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
+            states += state
+        }
+
+        override fun onRebootRequested(machine: Machine) {
+            reboots.incrementAndGet()
+            super.onRebootRequested(machine)
+        }
+    }
+
+    @Test
+    fun `ゲストがkibi_computer_powerで止めたら電源が切れる`() {
+        powerInitDisk("disk-a", "shutdown")
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", withDisk(case.tier), true, config))
+        assertTrue(case.poweredOn)
+        val machine = case.machine!!
+        // 接続層と同じく、電源を入れた後に起動する
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("止まらない: ${events.states}") { machine.state == MachineState.STOPPED && !case.poweredOn }
+        assertEquals(0, events.reboots.get())
+        assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED), events.states.toList())
+    }
+
+    @Test
+    fun `ゲストがkibi_computer_powerで再起動しても電源は切れない`() {
+        val modeFile = powerInitDisk("disk-a", "reboot-once")
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", withDisk(case.tier), true, config))
+        val machine = case.machine!!
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("再起動しない: ${events.states}") {
+            events.reboots.get() == 1 && events.states.size >= 4 && !machine.isBooting && !machine.isRebootPending
+        }
+        assertTrue(case.poweredOn, "再起動の途中の STOPPED では電源を切らない")
+        assertSame(machine, case.machine)
+        assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED, MachineState.RUNNING), events.states.toList())
+        // 2回目の起動の init は hold で眠り続ける
+        assertEquals("hold", modeFile())
     }
 }

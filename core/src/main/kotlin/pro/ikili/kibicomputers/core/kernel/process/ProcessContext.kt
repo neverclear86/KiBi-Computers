@@ -464,12 +464,21 @@ internal interface ProcessContext {
     fun takeDeviceCall(fd: Int): CallResult?
 
     /**
-     * マシンを止める（`Machine.stop`。#49）。このプロセスも止められるので、この後のホスト関数・待ちは [ProcessKilledException] になる。
-     * WASM から呼ぶシステムコールの形は #306
+     * マシンを止める（`Machine.stop`。#49・#306。ADR 0306）。必ず受け付け、このプロセスも止まるので戻らない
+     * （[ProcessKilledException] を投げる）。このプロセスが既に止められていても同じ例外を投げる（そのときは `stop` を呼ばない）。
+     * どのプロセスからでも呼べる（ADR 0046。マシンの中では権限を分けない）。カーネルロックを持たずに呼ぶ。
+     * `kibi:computer/power` の `shutdown`（[pro.ikili.kibicomputers.core.wasi.kibi.KibiPower]）
      */
-    fun requestShutdown()
+    @Throws(ProcessKilledException::class)
+    fun requestShutdown(): Nothing
 
-    /** マシンを再起動する（`Machine.reboot`。#49）。受け付けたら `true`（一度も起動していなければ `false`）。システムコールの形は #306 */
+    /**
+     * マシンを再起動する（`Machine.reboot`。#49・#306。ADR 0306）。受け付けたら、このプロセスも止まるので戻らない
+     * （[ProcessKilledException] を投げる）。断ったら `false`（起動も復元も通らずに作ったマシン、スケジューラを閉じる途中）。
+     * このプロセスが既に止められている（呼ぶ前、または断った時点で）なら、`false` を返さずに例外を投げる。
+     * どのプロセスからでも呼べる。カーネルロックを持たずに呼ぶ。`kibi:computer/power` の `reboot`
+     */
+    @Throws(ProcessKilledException::class)
     fun requestReboot(): Boolean
 }
 

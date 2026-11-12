@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiIo
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiPower
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTimers
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
@@ -44,6 +45,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [MEMORY] | `commit` | `(ptr, len: i32, keep: i64) -> i32` |
  * | [CLOCK] | `uptime-ticks` | `() -> i64` |
  * | [CLOCK] | `world-ticks` | `() -> i64` |
+ * | [POWER] | `shutdown` | `() -> ()`（戻らない） |
+ * | [POWER] | `reboot` | `(ret_ptr: i32) -> ()`（受け付けたら戻らない。断ったときだけ書く） |
  * | [IO_FD] | `dup` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_FD] | `dup-to` | `(fd, to, ret_ptr: i32) -> ()` |
  * | [IO_PIPE] | `create` | `(ret_ptr: i32) -> ()` |
@@ -60,6 +63,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * `kibi:io/tty` の `mode`（`flags`）は下位 5 ビットだけを読む（上のビットは捨てる。Canonical ABI の lift と同じ）。
  * `u64` の時間の引数（`set-after`・`set-at`）は、2^63 以上を `Long.MAX_VALUE` に頭打ちにしてカーネルへ渡す（ADR 0426）。
  *
+ * `kibi:computer/power` の `shutdown`・`reboot` は、受け付けたら呼んだプロセスも止まるので戻らない（ADR 0306）。
  * `kibi:process` の `[static]process.spawn` だけが待つ（[WasiP1.WAIT_IMPORTS]。[WasiP1KibiProcess]）。ほかは待たない。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数、
  * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）。
@@ -76,6 +80,9 @@ internal object WasiP1Kibi {
 
     /** `kibi:computer/memory` のモジュール名 */
     const val MEMORY: String = "kibi:computer/memory@0.1.0"
+
+    /** `kibi:computer/power` のモジュール名（#306） */
+    const val POWER: String = "kibi:computer/power@0.1.0"
 
     /** `kibi:io/fd` のモジュール名 */
     const val IO_FD: String = "kibi:io/fd@0.1.0"
@@ -222,6 +229,15 @@ internal object WasiP1Kibi {
             val memory = caller.memory
             val ok = memory != null && KibiMemory.commit(ctx, memory, a[0].toInt(), a[1].toInt(), a[2])
             longArrayOf(if (ok) 1L else 0L)
+        },
+        Fn(POWER, "shutdown", WasmFunctionType.of(emptyList(), emptyList()), false) { ctx, _, _ ->
+            KibiPower.shutdown(ctx)
+        },
+        Fn(POWER, "reboot", WasmFunctionType.of(listOf(I32), emptyList()), false) { ctx, caller, a ->
+            // 受け付けたら戻らない（書き先は確かめない）。断ったときだけ書く（範囲外ならトラップ。ADR 0306）
+            val error = KibiPower.reboot(ctx)
+            P1Canonical.lowerUnitResult(memoryOf(caller), a[0].i(), error)
+            NONE
         },
         Fn(IO_FD, "dup", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
             val memory = memoryOf(caller)

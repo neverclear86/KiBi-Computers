@@ -65,6 +65,8 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 
 内部の `ProcessContext.requestShutdown()`（= `Machine.stop`）・`requestReboot()`（= `Machine.reboot`）。WASM から呼ぶシステムコールの形は ABI に当たるので、#306（ABI は #73）で決める。
 
+- 追記（#306）: ADR 0306 で決めた（`kibi:computer/power`）。受け付けたら呼んだプロセスも止まり、戻らない（`requestShutdown(): Nothing`、`requestReboot()` は受け付けたら `ProcessKilledException`）。止められていないことを確かめてから `stop()`・`reboot()` を呼ぶまでを1つのカーネルロックの区間にした
+
 ## コンソールのメッセージ
 
 カーネルが固定の英語の1行を書く（改行は LF。コンソールへの書き出しで CR LF になる）。翻訳した表示が要るときは、接続層が `onBootFailed` を受けて自分で出す。
@@ -86,6 +88,7 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
   - init の pid は `KernelState.initPid` に保存する（戻したマシンでも、init が終わったら止める・init にシグナルを送れない、が続く）
   - 起動の途中・再起動の途中（`reboot()` を受け付けてから `onRebootRequested` を呼ぶまで）は保存しない。この間は `isAtWaitPoint` が `false`
   - 戻したマシンでは、接続層が `BootConfig` を渡し直す（`lastBootConfig` を決め直す）。渡し直すまでは `reboot()` が `false` を返す。渡し直す口の形は #81 で決める。`BootConfig` は保存しない（その時点のワールドで作り直すほうが正しい）
+    - 訂正（#306）: 今のコードでは、復元（`Machine.restore`）が復元の求めの `bootConfig` を `lastBootConfig` に入れるので、戻したマシンでも `reboot()` を受け付ける。`false` になるのは、起動も復元も通らずに作ったマシン・スケジューラが閉じている・`CRASHED` のとき（ADR 0306）
 
 ## 今の制限
 
