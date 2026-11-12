@@ -41,7 +41,8 @@ event { kind: "restored", source: "", values: [integer(実時間の飛び ns), i
 - 共通ライブラリに `kibi.events`（`os/lib/kibi/events.zig`）を置く。`open`・`take`・`[resource-drop]` の包みと、`cabi_realloc` の export
   - `cabi_realloc` は 8 KiB の静的な領域（.bss）から切り出すだけ。`take` の直前に先頭へ戻し、1回に1件だけ取り出す（1件の最悪は約 5 KiB）。足りなければ線形メモリの外（`0xFFFFFFF8`）を返してトラップさせる（0 を返すとアドレス 0 から上書きする）。止まりうる import は呼ばない
   - 配置（Canonical ABI）は `kibi_events.h` の `_Static_assert` と同じ値を `comptime` で確かめる
-  - Zig は WASM の実行ファイルで `_start` のほかを export しないので、`kibi.events` を使うプログラム（`sh`・`nano`）だけを `--export=cabi_realloc` でビルドする（`core/build.gradle.kts` の `osEventsPrograms`）。`-rdynamic` は使わない。可変グローバル `__stack_pointer` まで全プログラムに足してしまい、events を使わないプログラムの export とバイナリが変わるため。events を使うプログラムを足したら、`osEventsPrograms` にも足す（足し忘れると読み込みで NOEXEC になる）
+  - 追記（#454）: `cabi_realloc` は `os/lib/kibi/canon.zig` に移し、`ps`・`df`・`mount` と共有した。領域は 64 KiB にし、足りなければ `memory.grow` で増やした先を返す（増やせなければ線形メモリの外）。先頭へ戻すのは `canon.reset` だけで、`take` の包みは今までどおり毎回その直前に戻す（sh・nano が触る区画は 1 件分のまま増えない）。一覧の包み（`list-processes`・`list-mounts`・`list-disks`）は戻さないので、続けて呼んだ結果を同時に読める
+  - Zig は WASM の実行ファイルで `_start` のほかを export しないので、`kibi.events` を使うプログラム（`sh`・`nano`）だけを `--export=cabi_realloc` でビルドする（`core/build.gradle.kts` の `osEventsPrograms`。#454 で `osReallocPrograms` に改名し、`ps`・`df`・`mount` を足した）。`-rdynamic` は使わない。可変グローバル `__stack_pointer` まで全プログラムに足してしまい、events を使わないプログラムの export とバイナリが変わるため。events を使うプログラムを足したら、`osEventsPrograms` にも足す（足し忘れると読み込みで NOEXEC になる）
 - 待ち方: `waitInputOrQueue` で、標準入力とキューを `poll_oneoff` の FD_READ 2つで待つ。時計の購読は付けない（待っているだけの台を定期的に起こさない）。キューの側が起きたら `take` で空にし（`dropped` も消費する）、空回りしない
 - 描き直す条件: `kind == "restored"` かつ `source == ""`、または `dropped > 0`
 - キューを開けない（マシンのキューが上限の `NFILE`、ハンドル表が満杯の `MFILE`）ときは、標準入力だけを待つ従来の動きに戻す

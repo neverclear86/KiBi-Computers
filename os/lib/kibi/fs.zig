@@ -97,6 +97,8 @@ pub const Stat = struct {
     /// 変更時刻（ナノ秒）
     mtime: u64,
     ino: u64,
+    /// ファイルシステムの番号（`mounts.Mount.id` と同じ値。マウントの祖先の合成のディレクトリは 0）
+    dev: u64 = 0,
 };
 
 fn toStat(s: wasi.Filestat) Stat {
@@ -107,7 +109,7 @@ fn toStat(s: wasi.Filestat) Stat {
         .CHARACTER_DEVICE, .BLOCK_DEVICE => .device,
         else => .other,
     };
-    return .{ .kind = kind, .size = s.size, .mtime = s.mtim, .ino = s.ino };
+    return .{ .kind = kind, .size = s.size, .mtime = s.mtim, .ino = s.ino, .dev = s.dev };
 }
 
 /// [path] の情報（シンボリックリンクはたどる）

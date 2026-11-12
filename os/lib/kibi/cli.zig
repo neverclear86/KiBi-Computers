@@ -192,6 +192,20 @@ pub const Writer = struct {
         self.len += bytes.len;
     }
 
+    /// ほかのプログラムやカーネルが決めた文字列（argv・マウントの位置など）を書く。制御文字（0x00〜0x1F・0x7F）は `?` にする
+    /// （端末に ESC や改行をそのまま送らない）
+    pub fn printable(self: *Writer, bytes: []const u8) void {
+        var start: usize = 0;
+        for (bytes, 0..) |c, i| {
+            if (c < 0x20 or c == 0x7f) {
+                self.write(bytes[start..i]);
+                self.byte('?');
+                start = i + 1;
+            }
+        }
+        self.write(bytes[start..]);
+    }
+
     pub fn byte(self: *Writer, c: u8) void {
         self.write(&[_]u8{c});
     }

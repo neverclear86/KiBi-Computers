@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
@@ -14,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
+import java.nio.file.Path
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -42,6 +44,8 @@ class BasicCommandsTest {
         "cat", "clear", "cp", "du", "grep", "head", "kill", "ls", "mkdir", "mv", "pwd", "rm", "rmdir", "tail", "touch", "wc",
         // #475
         "sleep", "env", "printenv", "date", "seq", "yes", "sort", "uniq", "tee", "xargs", "basename", "dirname", "which",
+        // #454
+        "ps", "df", "mount", "umount", "reboot", "shutdown",
     )
 
     private fun imageFile(path: String): ByteArray {
@@ -61,7 +65,20 @@ class BasicCommandsTest {
         script: String,
         files: Map<String, String> = emptyMap(),
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
-    ): String = timeout(limit) {
+    ): String = run(script, files, environment).let { r ->
+        assertEquals(ProcessState.EXITED, r.shell, r.text)
+        r.text
+    }
+
+    /** [run] の結果: コンソールの出力、シェルの終わり方、終わった後のマシンの状態 */
+    private class Run(val text: String, val shell: ProcessState?, val machine: MachineState)
+
+    /** `/bin/sh -c [script]` を動かし、シェルが終わる（かマシンが止まる）まで待つ */
+    private fun run(
+        script: String,
+        files: Map<String, String> = emptyMap(),
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+    ): Run = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024, environment = environment)
@@ -77,14 +94,14 @@ class BasicCommandsTest {
                 KernelDrivers.DEFAULT,
                 SpawnOptions(args = listOf("sh", "-c", script.trimIndent()), env = env, cwd = "/", fds = SpawnOptions.ROOT_PREOPEN),
             )
+            val shell = m.runtime(pid)
             eventuallyDescribe(200_000, { "終わらない: ${host.text()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
-                m.stateOf(pid).isTerminal
+                m.state == MachineState.STOPPED || m.stateOf(pid).isTerminal
             }
-            assertEquals(ProcessState.EXITED, m.stateOf(pid), host.text())
             repeat(5) { h.scheduler.tick() }
-            host.text()
+            Run(host.text(), shell?.process?.state, m.state)
         }
     }
 
@@ -872,5 +889,202 @@ class BasicCommandsTest {
             ls /dev/null
             """,
         )
+    }
+
+    // ---- #454: ps・df・mount・umount・reboot・shutdown ----
+
+    @Test
+    fun `psはpidの昇順にPID・PPID・STAT・CMDを書き、知らないオプションは2`() {
+        val out = sh(
+            """
+            ps
+            echo ${'$'}?
+            ps -x 2>&1; echo ${'$'}?
+            ps a 2>&1; echo ${'$'}?
+            """,
+        )
+        val lines = out.lines()
+        assertEquals("PID PPID STAT CMD", lines[0].trim().replace(Regex(" +"), " "), out)
+        val rows = lines.drop(1).takeWhile { Regex("""^ *\d+ """).containsMatchIn(it) }
+        val pids = rows.map { it.trim().split(Regex(" +"))[0].toInt() }
+        assertEquals(pids.sorted(), pids, "pid の昇順: $out")
+        assertTrue(rows.any { Regex("""^ *\d+ +0 S +sh -c """).containsMatchIn(it) }, "sh が待っている: $out")
+        assertTrue(rows.any { Regex("""^ *\d+ +\d+ R +ps$""").matches(it) }, "ps 自身が動いている: $out")
+        assertEquals(
+            listOf("0", "ps: unknown option -x", "usage: ps [-e|-A]", "2", "ps: extra operand", "usage: ps [-e|-A]", "2"),
+            lines.drop(1 + rows.size).filter { it.isNotEmpty() },
+            out,
+        )
+    }
+
+    @Test
+    fun `psは親なしのゾンビを既定で隠し、-eと-Aで出す`() {
+        val out = sh(
+            """
+            sh -c 'true &'
+            for i in ${'$'}(seq 400); do ps -e | grep -q 'Z    .*<defunct>${'$'}' && break; sleep 0.05; done
+            ps | grep -c '<defunct>${'$'}'
+            ps -e | grep -c 'Z    .*<defunct>${'$'}'
+            ps -A | grep -c 'Z    .*<defunct>${'$'}'
+            ps -e | grep -c ' 0 Z    .*<defunct>${'$'}'
+            """,
+        )
+        // `&` の子（サブシェル）は、親の sh -c が先に終わるので親なしのゾンビになる。grep は sh の引数（スクリプト）に合わないよう行末で合わせる
+        assertEquals(listOf("0", "1", "1", "1", ""), out.lines(), out)
+    }
+
+    @Test
+    fun `dfは容量のないマウントを-にし、devは0で使用率は-`() {
+        val out = sh(
+            """
+            df
+            df -i /dev
+            df -h /mnt/nothing 2>&1; echo ${'$'}?
+            df -h /dev / | tail -n 2
+            df -x 2>&1; echo ${'$'}?
+            """,
+        )
+        assertEquals(
+            """
+            Filesystem 1K-blocks Used Available Use% Mounted on
+            test:root          -    -         -    - /
+            test:mnt           -    -         -    - /mnt
+            dev                0    0         0    - /dev
+            Filesystem Inodes IUsed IFree IUse% Mounted on
+            dev             0     0     0     - /dev
+            df: /mnt/nothing: No such file or directory
+            1
+            dev           0    0     0    - /dev
+            test:root     -    -     -    - /
+            df: unknown option -x
+            usage: df [-h|-k] [-i] [file...]
+            2
+            """.trimIndent().lines() + "",
+            out.lines(),
+        )
+    }
+
+    private fun diskEnvironment(dir: Path, vararg ids: String): MachineEnvironment =
+        MachineEnvironment.builder().disks(DiskSnapshot.of(ids.associateWith { ResolvedDisk(dir.resolve(it), 1L shl 20, 64) })).build()
+
+    @Test
+    fun `mountでディスクをマウントし、dfとumountで扱う`(@TempDir dir: Path) {
+        val out = sh(
+            """
+            mount -l
+            mount d1 /a/b
+            for i in ${'$'}(seq 400); do [ ${'$'}(mount -l | grep -c ' /mnt/d') = 2 ] && break; sleep 0.05; done
+            mount -l
+            umount /mnt/d2 /mnt/d3
+            mount -r disk:d2 /mnt/two
+            mount
+            mount -l
+            echo hi >/a/b/f; cat /a/b/f
+            touch /mnt/two/f 2>/dev/null || echo ro
+            df /a/b/f | tail -n 1
+            df -i /a/b | tail -n 1
+            cd /a/b; df . | tail -n 1; cd /
+            df /a | tail -n 1
+            mount disk:d1 /c 2>&1; echo ${'$'}?
+            mount disk:d3 /a/b 2>&1; echo ${'$'}?
+            mount disk:nope /y 2>&1; echo ${'$'}?
+            mount disk:image:os /y 2>&1; echo ${'$'}?
+            umount /a/b/ /mnt/two; echo ${'$'}?
+            mount -l | tail -n 3
+            umount /a/b 2>&1; echo ${'$'}?
+            umount / /dev 2>&1; echo ${'$'}?
+            mount disk:d1 2>&1; echo ${'$'}?
+            umount 2>&1; echo ${'$'}?
+            """,
+            environment = diskEnvironment(dir, "d1", "d2", "d3"),
+        )
+        val lines = out.lines()
+        assertEquals(
+            listOf(
+                "Disk    1K-blocks Entries Mounted on",
+                "disk:d1      1024      64 -",
+                "disk:d2      1024      64 -",
+                "disk:d3      1024      64 -",
+                // mount の後始末が自動マウントの仕事を積み直し、まだ扱っていない挿し込みを /mnt/<名前> にマウントする（ADR 0056）
+                "Disk    1K-blocks Entries Mounted on",
+                "disk:d1      1024      64 /a/b",
+                "disk:d2      1024      64 /mnt/d2",
+                "disk:d3      1024      64 /mnt/d3",
+                "test:root on / type disk (rw)",
+                "test:mnt on /mnt type disk (rw)",
+                "dev on /dev type dev (rw)",
+                "disk:d1 on /a/b type disk (rw)",
+                "disk:d2 on /mnt/two type disk (ro)",
+                "Disk    1K-blocks Entries Mounted on",
+                "disk:d1      1024      64 /a/b",
+                "disk:d2      1024      64 /mnt/two",
+                "disk:d3      1024      64 -",
+                "hi",
+                "ro",
+            ),
+            lines.take(19),
+            out,
+        )
+        assertTrue(Regex("""^disk:d1 +1024 +\d+ +\d+ +\d+% /a/b$""").matches(lines[19]), out)
+        assertTrue(Regex("""^disk:d1 +64 +1 +63 +2% /a/b$""").matches(lines[20]), out)
+        assertEquals(lines[19], lines[21], "cwd の . も同じマウント: $out")
+        assertTrue(Regex("^test:root +- +- +- +- /$").matches(lines[22]), "合成のディレクトリは位置の最も長い一致: $out")
+        assertEquals(
+            listOf(
+                "mount: /c: Device or resource busy", "1",
+                "mount: /a/b: Device or resource busy", "1",
+                "mount: disk:nope: No such file or directory", "1",
+                "mount: disk:image:os: No such file or directory", "1",
+                "0",
+                "disk:d1      1024      64 -",
+                "disk:d2      1024      64 -",
+                "disk:d3      1024      64 -",
+                "umount: /a/b: Invalid argument", "1",
+                "umount: /: Device or resource busy",
+                "umount: /dev: Device or resource busy", "1",
+                "mount: missing operand", "usage: mount [-l] | mount [-r|-w] disk dir", "2",
+                "umount: missing operand", "usage: umount dir...", "2",
+            ),
+            lines.drop(23).filter { it.isNotEmpty() },
+            out,
+        )
+    }
+
+    @Test
+    fun `起動を通らないマシンではrebootとshutdown -rはNot supportedで1`() {
+        assertOutput(
+            """
+            reboot: Not supported
+            1
+            shutdown: Not supported
+            1
+            shutdown: only 'now' is supported
+            usage: shutdown [-h|-r] [now]
+            2
+            reboot: extra operand
+            usage: reboot
+            2
+            """,
+            """
+            reboot 2>&1; echo ${'$'}?
+            shutdown -r now 2>&1; echo ${'$'}?
+            shutdown +5 2>&1; echo ${'$'}?
+            reboot now 2>&1; echo ${'$'}?
+            """,
+        )
+    }
+
+    @Test
+    fun `shutdownはマシンを止め、後ろのコマンドは動かない`() {
+        val r = run(
+            """
+            echo before
+            shutdown -h now
+            echo after
+            """,
+        )
+        assertEquals(listOf("before", ""), r.text.lines())
+        assertEquals(MachineState.STOPPED, r.machine)
+        assertEquals(ProcessState.KILLED, r.shell)
     }
 }

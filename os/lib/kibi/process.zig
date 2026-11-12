@@ -4,6 +4,7 @@
 const wasi = @import("wasi.zig");
 const errno = @import("errno.zig");
 const io = @import("io.zig");
+const canon = @import("canon.zig");
 
 pub const Error = errno.Error;
 
@@ -162,6 +163,7 @@ const raw = struct {
     extern "kibi:process/process@0.1.0" fn @"parent-pid"() u32;
     extern "kibi:process/process@0.1.0" fn @"set-signal-ignored"(sig: i32, ignored: i32, ret: *io.ResultUnit) void;
     extern "kibi:process/process@0.1.0" fn @"set-cwd"(path_ptr: [*]const u8, path_len: u32, ret: *io.ResultUnit) void;
+    extern "kibi:process/process@0.1.0" fn @"list-processes"(ret: *List) void;
 };
 
 /// 子を作るときの指定
@@ -305,6 +307,71 @@ pub fn setCwdRaw(path: []const u8) Error!void {
     var r: io.ResultUnit = undefined;
     raw.@"set-cwd"(path.ptr, @intCast(path.len), &r);
     try io.checkUnit(r);
+}
+
+// ---- プロセスの一覧（list-processes。#452、ADR 0452）----
+
+/// variant exit-status（8 バイト、align 4）
+pub const RawExitStatus = extern struct {
+    tag: u8,
+    val: extern union {
+        exited: u32,
+        killed: extern struct { is_some: u8, sig: u8 },
+    },
+
+    pub fn decode(self: RawExitStatus) ExitStatus {
+        return switch (self.tag) {
+            0 => .{ .exited = self.val.exited },
+            1 => .{ .killed = if (self.val.killed.is_some == 0) null else @as(Signal, @enumFromInt(self.val.killed.sig)) },
+            else => .crashed,
+        };
+    }
+};
+
+/// enum の判別子（variant process-state）
+pub const ProcessStateTag = enum(u8) { starting = 0, running = 1, waiting = 2, finished = 3, _ };
+
+/// record process-info（28 バイト、align 4。core/src/main/wasm/common/kibi_process.h と同じ）
+pub const ProcessInfo = extern struct {
+    pid: u32,
+    parent_pid: u32,
+    state: extern struct {
+        tag: ProcessStateTag,
+        /// `finished` のときだけ意味がある
+        finished: RawExitStatus,
+    },
+    args_ptr: [*]const String,
+    args_len: u32,
+
+    /// argv の先頭から、個数 16・UTF-8 の合計 255 バイトまで（切ったことは分からない）
+    pub fn args(self: *const ProcessInfo) []const String {
+        return self.args_ptr[0..self.args_len];
+    }
+
+    /// 親なしのゾンビ（終わっていて、親がいない）
+    pub fn isOrphanZombie(self: *const ProcessInfo) bool {
+        return self.state.tag == .finished and self.parent_pid == 0;
+    }
+};
+
+const List = extern struct { ptr: [*]const ProcessInfo, len: u32 };
+
+/// マシンの全プロセス（自分・ゾンビ・親なしのゾンビを含む）を pid の昇順で返す。待たない。
+/// 結果は `cabi_realloc` の領域（`canon.zig`）に置かれ、`canon.reset` を呼ぶまで読める（この関数は領域を戻さない）。
+/// 使うプログラムは `cabi_realloc` を export する（`core/build.gradle.kts` の `osReallocPrograms`）
+pub fn listProcesses() []const ProcessInfo {
+    // 使うプログラムにだけ `cabi_realloc` を入れる（関数が参照されたときだけ canon.zig が解析される）
+    _ = canon.ARENA_SIZE;
+    var r: List = undefined;
+    raw.@"list-processes"(&r);
+    return r.ptr[0..r.len];
+}
+
+comptime {
+    if (@sizeOf(RawExitStatus) != 8 or @alignOf(RawExitStatus) != 4 or @offsetOf(RawExitStatus, "val") != 4) @compileError("exit-status");
+    if (@sizeOf(ProcessInfo) != 28 or @alignOf(ProcessInfo) != 4) @compileError("process-info");
+    if (@offsetOf(ProcessInfo, "state") != 8 or @offsetOf(ProcessInfo, "args_ptr") != 20 or @offsetOf(ProcessInfo, "args_len") != 24) @compileError("process-info fields");
+    if (@sizeOf(List) != 8) @compileError("list<process-info>");
 }
 
 comptime {

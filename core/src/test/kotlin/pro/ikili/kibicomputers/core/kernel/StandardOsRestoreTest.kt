@@ -31,6 +31,7 @@ import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.ByteArrayOutputStream
 import java.nio.file.Path
 import java.time.Duration
@@ -329,31 +330,28 @@ class StandardOsRestoreTest {
     }
 
     @Test
-    fun `eventsを使うプログラムだけがcabi_reallocをexportし、ほかの export は増えない`() {
+    fun `cabi_reallocの要るimportを持つプログラムだけがcabi_reallocをexportし、ほかの export は増えない`() {
         val runtime = EndiveRuntime()
-        val eventsProgram = setOf("sh", "nano")
+        val realloc = mutableSetOf<String>()
         var checked = 0
         for (dir in listOf("/bin", "/sbin")) {
             val entries = image.readDirectory(image.stat(VfsPath.parse(dir)).node)
             for (entry in entries) {
                 val module = runtime.load(imageFile("$dir/${entry.name}"))
                 val exports = module.exports.map { it.name }.toSet()
-                val events = module.imports.filter { it.module == "kibi:kernel/events@0.1.0" }.map { it.name }.toSet()
-                if (entry.name in eventsProgram && dir == "/bin") {
-                    assertEquals(
-                        setOf("[static]event-queue.open", "[method]event-queue.take", "[resource-drop]event-queue"),
-                        events,
-                        entry.name,
-                    )
-                    assertEquals(setOf("memory", "_start", "cabi_realloc"), exports, "${entry.name} の export")
+                val needs = module.imports.filter { WasiP1Kibi.needsRealloc(it.module, it.name) }.map { "${it.module}#${it.name}" }
+                if (needs.isNotEmpty()) {
+                    assertEquals(setOf("memory", "_start", "cabi_realloc"), exports, "$dir/${entry.name} の export（$needs を import する）")
+                    realloc += "$dir/${entry.name}"
                 } else {
-                    // events を使わないプログラムには何も足さない（`-rdynamic` は `__stack_pointer` まで足してしまう）
-                    assertEquals(emptySet<String>(), events, "${entry.name} が events を import している")
+                    // 要らないプログラムには何も足さない（`-rdynamic` は `__stack_pointer` まで足してしまう）
                     assertEquals(setOf("memory", "_start"), exports, "$dir/${entry.name} の export")
                 }
                 checked++
             }
         }
+        // 名前を並べた検査ではないが、取り違え（import がなくなった・増えた）に気づけるよう、今の集合も確かめる
+        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount"), realloc)
         assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }

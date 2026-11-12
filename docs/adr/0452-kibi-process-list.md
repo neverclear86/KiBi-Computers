@@ -83,10 +83,10 @@ C の宣言は `kibi_process.h` の `kibi_process_info_t`・`kibi_process_list_p
 
 同じ `interface process` の関数として、Component Model の lower で返す（ADR 0074 の「p2/p3 への写し方」）。切り詰め・並び・状態の写し方は ABI に依らない層（`KibiProcess.list`）が受け持つので、p2/p3 の層も同じものを使う。
 
-## 後続（#454 への申し送り。#454 の Issue にもコメントで書いた）
+## 後続（#454 への申し送り。#454 で済んだ）
 
-- 標準 OS（Zig）は今 `cabi_realloc` を export していない（`os/lib/kibi/kibi.zig`）。`ps` を作るときに Zig のライブラリへ `cabi_realloc` の export を足す
-- `ps` の既定の表示では親なしのゾンビ（`finished` かつ `parent-pid == 0`）を隠す
+- 標準 OS（Zig）の `cabi_realloc` は `os/lib/kibi/canon.zig` にまとめ、`ps` も export する（ADR 0098・0103）
+- `ps` の既定の表示では親なしのゾンビ（`finished` かつ `parent-pid == 0`）を隠し、`-e`（`-A`）で出す（ADR 0103）
 
 ## 確かめ方
 
