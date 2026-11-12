@@ -91,6 +91,7 @@ class CaseScreen(menu: CaseMenu, playerInventory: Inventory, title: Component) :
                 Component.translatable("$PREFIX.error.missing_parts", joined)
             }
             ComputerError.CRASHED -> Component.translatable("$PREFIX.error.crashed")
+            ComputerError.BOOT_FAILED -> Component.translatable("$PREFIX.error.boot_failed")
             ComputerError.UNAVAILABLE, null -> Component.translatable("$PREFIX.error.unavailable")
         }
         else -> Component.translatable(statusKey(menu.status))

@@ -32,7 +32,7 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 3. 起動部品がなければ `NO_FIRMWARE`
 4. 候補を前から順に `BootVolumeOpener` で開く。開けない（`null`・例外）ものは飛ばす。`/sbin/init` が**普通のファイル**としてある最初のディスクを `/` にマウントする（`source` は `disk:<識別子>`）。1つも開けなければ `NO_BOOT_DISK`、開けたが init がなければ `NO_INIT`（ディレクトリの `/sbin/init` も「ない」扱い）
 5. `Machine.exec("/sbin/init", KernelDrivers.DEFAULT, …, asInit = true)`。`ACCES`・`FBIG`・`NOEXEC` は `INIT_NOT_EXECUTABLE`、上限・燃料を計測しないモジュールなどは `INIT_START_FAILED`
-6. 失敗したら、マウントを外して知らせる。マシンは `STOPPED` のまま（状態の通知は出ない）
+6. 失敗したら、マウントを外して知らせる。マシンは `STOPPED` のまま（状態の通知は出ない）。ケース（`ComputerCase`）はこの知らせでマシンを外し、GUI をエラー（`BOOT_FAILED`）にする（#641、ADR 0085 の追記）
 
 `KernelDrivers.DEFAULT` は、`_start` を export するモジュールを `WasiP1Driver` で動かし、それ以外は `NOEXEC`。Component Model は #259 の層が足す。
 

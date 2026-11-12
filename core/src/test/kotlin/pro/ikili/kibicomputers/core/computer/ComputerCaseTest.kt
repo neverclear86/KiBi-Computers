@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import pro.ikili.kibicomputers.core.kernel.Machine
@@ -358,6 +359,13 @@ class ComputerCaseTest {
         assertEquals(ComputerStatus.OFF, case.status)
         assertNull(case.machine)
         assertNull(manager["a"])
+        // #641: 起動に失敗した
+        case.turnOn(manager, "a", parts, true, config)
+        assertTrue(case.poweredOn)
+        case.host.onBootFailed(case.machine!!, BootFailure.NO_BOOT_DISK, "")
+        assertFalse(case.poweredOn)
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertEquals(ComputerError.BOOT_FAILED, case.error)
         // 部品が足りなければ入らない。セーブデータから読むときは知らせない
         case.turnOff()
         val before = changes
@@ -498,6 +506,92 @@ class ComputerCaseTest {
             reboots.incrementAndGet()
             super.onRebootRequested(machine)
         }
+    }
+
+    /** 起動の失敗の中継を記録する（ケースの events）。届いたときのケースのマシンも覚える */
+    private class BootFailures(private val case: () -> ComputerCase<String>) : MachineHost {
+        val failures: MutableList<BootFailure> = Collections.synchronizedList(ArrayList())
+        val machineAtFailure: MutableList<Machine?> = Collections.synchronizedList(ArrayList())
+        val statusAtFailure: MutableList<ComputerStatus> = Collections.synchronizedList(ArrayList())
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
+
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            machineAtFailure += case().machine
+            statusAtFailure += case().status
+            failures += failure
+        }
+    }
+
+    @Test
+    fun `起動に失敗したらエラーにしてマシンを外し、電源ボタン1回でまた起動する`() {
+        lateinit var case: ComputerCase<String>
+        val events = BootFailures { case }
+        case = ComputerCase(CaseTier.BASIC, events)
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", required(case.tier), true, config))
+        val machine = case.machine!!
+        // 接続層と同じく、電源を入れた後に起動する（起動部品がないので失敗する）
+        assertTrue(machine.boot(boot))
+        tickUntil("起動の失敗が届かない: ${case.status}") { events.failures.isNotEmpty() }
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertEquals(ComputerError.BOOT_FAILED, case.error)
+        assertTrue(case.missingParts.isEmpty())
+        assertFalse(case.poweredOn)
+        assertNull(case.machine)
+        assertNull(manager["a"])
+        // ケースの処理の後に中継する（接続層は「マシンが外れた」を見て結線を外す）
+        assertEquals(listOf<Machine?>(null), events.machineAtFailure.toList())
+        assertEquals(listOf(ComputerStatus.ERROR), events.statusAtFailure.toList())
+        // 電源ボタンの1回目で入る（空振りしない）
+        assertEquals(ComputerStatus.RUNNING, case.pressPowerButton(manager, "a", required(case.tier), true, config))
+        assertTrue(case.poweredOn)
+        assertNull(case.error)
+        val next = case.machine!!
+        assertTrue(next !== machine)
+        assertSame(next, manager["a"])
+    }
+
+    @Test
+    fun `古いマシンや動いているマシンの起動の失敗は無視する`() {
+        powerInitDisk("disk-a", "hold")
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        case.turnOn(manager, "a", withDisk(case.tier), true, config)
+        val old = case.machine!!
+        case.turnOff()
+        case.turnOn(manager, "a", withDisk(case.tier), true, config)
+        case.host.onBootFailed(old, BootFailure.NO_BOOT_DISK, "")
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertTrue(case.poweredOn)
+        // 知らせが届くまでに起動し直して動いていたら、その起動を巻き込まない
+        val machine = case.machine!!
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("動かない: ${machine.state}") { machine.state == MachineState.RUNNING && !machine.isBooting }
+        case.host.onBootFailed(machine, BootFailure.NO_BOOT_DISK, "")
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertSame(machine, case.machine)
+        assertTrue(case.poweredOn)
+    }
+
+    @Test
+    fun `再起動の後に起動に失敗してもエラーにして外す`() {
+        powerInitDisk("disk-a", "reboot-once")
+        // 1回目の起動の後はディスクを開けなくする（再起動の起動は NO_BOOT_DISK で失敗する）
+        val opener = manager.scheduler.hooks.bootVolumes!!
+        val opened = AtomicInteger()
+        manager.scheduler.hooks.bootVolumes = BootVolumeOpener { disk -> if (opened.getAndIncrement() == 0) opener.open(disk) else null }
+        lateinit var case: ComputerCase<String>
+        val events = BootFailures { case }
+        case = ComputerCase(CaseTier.BASIC, events)
+        case.turnOn(manager, "a", withDisk(case.tier), true, config)
+        val machine = case.machine!!
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("起動の失敗が届かない: ${case.status}") { events.failures.isNotEmpty() }
+        assertEquals(listOf(BootFailure.NO_BOOT_DISK), events.failures.toList())
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertEquals(ComputerError.BOOT_FAILED, case.error)
+        assertFalse(case.poweredOn)
+        assertNull(case.machine)
+        assertNull(manager["a"])
     }
 
     @Test

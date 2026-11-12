@@ -83,9 +83,10 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal val wiring: TestComputerWiring = TestComputerWiring()
 
     /**
-     * マシンからの通知を [wiring] に中継する。ケース（[computer]）が自分の判断でマシンを外した（CRASHED・ゲストが止めた。#640）
-     * ときは、結線も外す（キーボードの持ち主・画面の listener を残さない）。外すかどうかは [ComputerCase] が決め、ここでは結果
-     * （[ComputerCase.machine] が `null`）だけを見る。[ComputerCase] は自分の処理の後に呼ぶので、このときにはもう外れている
+     * マシンからの通知を [wiring] に中継する。ケース（[computer]）が自分の判断でマシンを外した（CRASHED・ゲストが止めた。#640、
+     * 起動に失敗した。#641）ときは、結線も外す（キーボードの持ち主・画面の listener を残さない）。外すかどうかは [ComputerCase] が決め、ここでは結果
+     * （[ComputerCase.machine] が `null`）だけを見る。[ComputerCase] は自分の処理の後に呼ぶので、このときにはもう外れている。
+     * 結線に先に渡してから外す（起動の失敗の理由 [TestComputerWiring.bootFailure] は、つないでいるマシンのものだけを覚え、外しても残る）
      */
     private val machineEvents = object : MachineHost {
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
@@ -95,7 +96,10 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
         override fun onConsoleOutput(machine: Machine, bytes: ByteArray) = wiring.onConsoleOutput(machine, bytes)
 
-        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) = wiring.onBootFailed(machine, failure, detail)
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
+            wiring.onBootFailed(machine, failure, detail)
+            if (computer.machine == null && wiring.connectedMachine === machine) wiring.disconnect()
+        }
 
         override fun onRebootRequested(machine: Machine) = wiring.onRebootRequested(machine)
     }
