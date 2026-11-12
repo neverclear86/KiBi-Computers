@@ -493,9 +493,19 @@ async function mergePr(info, impl) {
   }
 }
 
+// 最後のラウンドの指摘を、直せなかったもの（remaining）と、直して push したがレビューし直していないもの（fixedUnreviewed）に分ける。
+// 最後のラウンドの後にはレビューを回さないので、直したかどうかは修正のエージェントの申告（pushed）で分ける
+function lastFindings(rounds) {
+  const last = rounds.length ? rounds[rounds.length - 1] : null
+  if (!last) return { all: [], remaining: [], fixedUnreviewed: [] }
+  return last.fixed
+    ? { all: last.confirmed, remaining: [], fixedUnreviewed: last.confirmed }
+    : { all: last.confirmed, remaining: last.confirmed, fixedUnreviewed: [] }
+}
+
 // PR に結果をまとめる。自動でマージできなかったときは質問を返す
 async function report(info, r) {
-  const remaining = r.rounds.length ? r.rounds[r.rounds.length - 1].confirmed : []
+  const { remaining, fixedUnreviewed } = lastFindings(r.rounds)
   const ciState = !r.ci ? 'CI の確認に失敗' : r.ci.passed ? 'CI 通過' : `CI 失敗（${r.ci.failingChecks.join(', ')}）`
   const ready = r.ready
   const mergeState = r.merge
@@ -505,7 +515,8 @@ async function report(info, r) {
     `${REPO} の PR #${r.impl.pr} に、自動レビューの結果を日本語のコメントで投稿する（\`gh pr comment ${r.impl.pr} --body-file <ファイル>\`）。内容:
 - CI: ${ciState}
 - レビューの回数: ${r.rounds.length}
-- 最後のレビューで残った指摘: ${remaining.length ? remaining.map(f => `[${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join(' / ') : 'なし'}
+- 最後のレビューで残った指摘（直せなかったもの）: ${remaining.length ? remaining.map(f => `[${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join(' / ') : 'なし'}
+- 最後のレビューの指摘で、直して push したがレビューし直していないもの: ${fixedUnreviewed.length ? fixedUnreviewed.map(f => `[${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join(' / ') : 'なし'}
 - 結論: ${ready ? 'マージ可能' : '人の確認が必要'}
 - マージ: ${mergeState}
 投稿したら、リポジトリのルートで \`git worktree remove --force ${r.impl.worktree}\` を実行して worktree を片付ける。`,
@@ -517,6 +528,9 @@ async function report(info, r) {
   if (!r.ci || !r.ci.passed) reasons.push(`CI が通らない: ${ciState}`)
   for (const f of remaining.filter(f => f.severity === 'must')) {
     reasons.push(`レビューの指摘が直らなかった: ${f.file}:${f.line ?? '-'} ${f.problem}`)
+  }
+  for (const f of fixedUnreviewed.filter(f => f.severity === 'must')) {
+    reasons.push(`最後のラウンドで直して push したが、レビューし直していない must の指摘: ${f.file}:${f.line ?? '-'} ${f.problem}`)
   }
   if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
   const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
@@ -573,7 +587,8 @@ async function runIssue(info) {
       const confirmed = await review(info, impl, round)
       // 検証で残った指摘は must・should を問わず直す（should をマージ前に止めるため）
       const toFix = confirmed
-      rounds.push({ round, confirmed })
+      const entry = { round, confirmed, fixed: false }
+      rounds.push(entry)
       if (!toFix.length) break
       log(`PR #${impl.pr}: 指摘 ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
       const fixed = await agent(
@@ -583,11 +598,13 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
         { label: `fix:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
       )
       if (!fixed || !fixed.pushed) break
+      entry.fixed = true
       ci = await untilGreen(impl, `${tag}-r${round}`)
     }
 
-    const remaining = rounds.length ? rounds[rounds.length - 1].confirmed : []
-    const ready = ci && ci.passed && !remaining.some(f => f.severity === 'must')
+    // マージの条件は変えない: 最後のラウンドの must は、直して push していてもレビューし直していないので止める
+    const { all: lastConfirmed, remaining, fixedUnreviewed } = lastFindings(rounds)
+    const ready = ci && ci.passed && !lastConfirmed.some(f => f.severity === 'must')
     const merge = MERGE && ready ? await mergePr(info, impl) : null
 
     const result = { impl, ci, rounds, merge }
@@ -600,6 +617,7 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
       ciPassed: ci?.passed ?? null,
       reviewRounds: rounds.length,
       remainingFindings: remaining,
+      fixedUnreviewedFindings: fixedUnreviewed,
       mergeReason: merge?.reason ?? null,
       question,
     }
