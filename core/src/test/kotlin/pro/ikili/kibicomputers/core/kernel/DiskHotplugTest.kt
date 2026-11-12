@@ -20,7 +20,6 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.Program
-import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
@@ -504,34 +503,10 @@ class DiskHotplugTest {
             m.spawn(program, WasiP1Driver(program.module), options)
         }
         var ticks = 0
-        if (metered) {
-            // 燃料を待っているとき（CPU を持たず、マシンの燃料が尽きている）にだけ tick を進めて数える。
-            // 時計で回すと、読み込み（コンパイル）が遅い環境ほど tick が増え、燃料の差が数に出なくなる。
-            // 燃料の補充は 1 tick で最大 fuelPerTick なので、払った燃料の分だけは必ず tick を数える。
-            // 燃料以外で止まって進まないとき（CPU 待ちが長いなど）に備えて、1 秒動かなければ tick を進める
-            var lastTick = System.nanoTime()
-            eventually(60_000, "終わらない") {
-                val (state, starved) = m.lock.withLockValue {
-                    val state = m.stateOf(pid)
-                    val holdsCpu = state == ProcessState.RUNNING || state == ProcessState.LOADING
-                    state to (!holdsCpu && m.fuelAccount.estimate(h.scheduler.now) <= 0)
-                }
-                if (state.isTerminal) return@eventually true
-                val stalled = state != ProcessState.RUNNING && state != ProcessState.LOADING &&
-                    System.nanoTime() - lastTick > 1_000_000_000L
-                if (starved || stalled) {
-                    h.scheduler.tick()
-                    ticks++
-                    lastTick = System.nanoTime()
-                }
-                false
-            }
-        } else {
-            eventually(60_000, "終わらない") {
-                h.scheduler.tick()
-                ticks++
-                m.stateOf(pid).isTerminal
-            }
+        eventually(60_000, "終わらない") {
+            h.scheduler.tick()
+            ticks++
+            m.stateOf(pid).isTerminal
         }
         val text = m.lock.withLockValue {
             val s = m.kernel.objects[output] as ByteStream
