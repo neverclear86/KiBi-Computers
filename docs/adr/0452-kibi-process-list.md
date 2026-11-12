@@ -35,6 +35,7 @@
 - 残りの予算に収まる要素は丸ごと入れる。空文字列は残りが 0 でも入る
 - 収まらない要素は、残りの予算以下に UTF-8 の文字の境目で切って入れ、そこで止める（末尾から継続バイト `10xxxxxx` を戻って、文字の先頭バイトの手前で切る）。切って空になる（残りが 0、または最初の文字が入らない）なら入れずに止める（実在しない空の引数に見えるのを避ける）
 - 切ったことはゲストには分からない（印の欄を足すのは ABI の変更になるので足さない）
+- 実装: UTF-8 化は `WasiUtf8.encode` の1つだけ。意味の層（`KibiProcess.truncateArgs`）が切った結果を UTF-8 の `ByteArray` で持ち、p1 の層はそれをそのまま書く（変換を2回しない。数えたバイト列と書くバイト列が同じものなので、合計 255 バイトの上限と文字の境目がずれない）
 - シバンで起動したものの argv は `[インタプリタ, (シバンの引数), スクリプトの絶対パス, 元の argv[1..]]`（`Machine.loadExecutable`）。Lua のスクリプトでも、3 番目の要素でスクリプトを見分けられる
 
 ## p1 の import
@@ -82,7 +83,7 @@ C の宣言は `kibi_process.h` の `kibi_process_info_t`・`kibi_process_list_p
 
 同じ `interface process` の関数として、Component Model の lower で返す（ADR 0074 の「p2/p3 への写し方」）。切り詰め・並び・状態の写し方は ABI に依らない層（`KibiProcess.list`）が受け持つので、p2/p3 の層も同じものを使う。
 
-## 後続（#454 への申し送り）
+## 後続（#454 への申し送り。#454 の Issue にもコメントで書いた）
 
 - 標準 OS（Zig）は今 `cabi_realloc` を export していない（`os/lib/kibi/kibi.zig`）。`ps` を作るときに Zig のライブラリへ `cabi_realloc` の export を足す
 - `ps` の既定の表示では親なしのゾンビ（`finished` かつ `parent-pid == 0`）を隠す

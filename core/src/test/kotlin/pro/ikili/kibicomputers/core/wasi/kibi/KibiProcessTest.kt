@@ -126,19 +126,24 @@ class KibiProcessTest {
         )
         assertEquals(
             listOf(
-                KibiProcess.Entry(1, 0, ListState.RUNNING, null, listOf("init")),
-                KibiProcess.Entry(3, 1, ListState.WAITING, null, listOf("sh", "-c")),
-                KibiProcess.Entry(7, 1, ListState.FINISHED, killedNone, emptyList()),
-                KibiProcess.Entry(Int.MAX_VALUE, 0, ListState.FINISHED, exited, listOf("a")),
+                KibiProcess.Entry(1, 0, ListState.RUNNING, null, utf8s("init")),
+                KibiProcess.Entry(3, 1, ListState.WAITING, null, utf8s("sh", "-c")),
+                KibiProcess.Entry(7, 1, ListState.FINISHED, killedNone, utf8s()),
+                KibiProcess.Entry(Int.MAX_VALUE, 0, ListState.FINISHED, exited, utf8s("a")),
             ),
             KibiProcess.entries(listed),
         )
         assertEquals(emptyList<KibiProcess.Entry>(), KibiProcess.entries(emptyList()))
     }
 
-    private fun truncate(vararg args: String) = KibiProcess.truncateArgs(args.toList())
+    private fun utf8s(vararg args: String) = args.map { it.toByteArray(Charsets.UTF_8) }
 
-    private fun bytesOf(args: List<String>) = args.sumOf { P1Canonical.utf8(it).size }
+    /** 切った結果を文字列にして返す（比べやすくするため） */
+    private fun truncateToStrings(args: List<String>) = KibiProcess.truncateArgs(args).map { String(it, Charsets.UTF_8) }
+
+    private fun truncate(vararg args: String) = truncateToStrings(args.toList())
+
+    private fun bytesOf(args: List<ByteArray>) = args.sumOf { it.size }
 
     private val emoji = String(Character.toChars(0x1F600))
 
@@ -146,8 +151,8 @@ class KibiProcessTest {
     fun `argsは16個まで`() {
         assertEquals(emptyList<String>(), truncate())
         val many = (0 until 20).map { "$it" }
-        assertEquals(many.take(16), KibiProcess.truncateArgs(many))
-        assertEquals(List(16) { "" }, KibiProcess.truncateArgs(List(20) { "" }))
+        assertEquals(many.take(16), truncateToStrings(many))
+        assertEquals(List(16) { "" }, truncateToStrings(List(20) { "" }))
     }
 
     @Test
@@ -187,7 +192,7 @@ class KibiProcessTest {
     }
 
     @Test
-    fun `切った結果は上限に収まり、p1のUTF-8にすると元の先頭と同じバイト列`() {
+    fun `切った結果は上限に収まり、元のUTF-8の先頭と同じ正しいバイト列`() {
         val high = 0xD800.toChar().toString()
         val inputs = listOf(
             listOf("x".repeat(100), "あ".repeat(100), emoji.repeat(100)),
@@ -200,13 +205,21 @@ class KibiProcessTest {
             assertTrue(out.size <= KibiProcess.MAX_LIST_ARGS)
             assertTrue(bytesOf(out) <= KibiProcess.MAX_LIST_ARG_BYTES, "${bytesOf(out)}")
             // 最後の要素以外は元のまま（UTF-8 にした値として）
-            for ((i, s) in out.dropLast(1).withIndex()) assertArrayEquals(P1Canonical.utf8(args[i]), P1Canonical.utf8(s))
-            // 最後の要素は元の UTF-8 の先頭
+            for ((i, b) in out.dropLast(1).withIndex()) assertArrayEquals(P1Canonical.utf8(args[i]), b)
+            // 最後の要素は元の UTF-8 の先頭で、文字の途中で切れていない（正しい UTF-8）
             if (out.isNotEmpty()) {
                 val orig = P1Canonical.utf8(args[out.lastIndex])
-                val cut = P1Canonical.utf8(out.last())
+                val cut = out.last()
                 assertArrayEquals(orig.copyOf(cut.size), cut)
+                assertTrue(cut.isEmpty() || isValidUtf8(cut), "文字の途中で切れている")
             }
         }
+    }
+
+    private fun isValidUtf8(bytes: ByteArray): Boolean = try {
+        Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(bytes))
+        true
+    } catch (e: java.nio.charset.CharacterCodingException) {
+        false
     }
 }

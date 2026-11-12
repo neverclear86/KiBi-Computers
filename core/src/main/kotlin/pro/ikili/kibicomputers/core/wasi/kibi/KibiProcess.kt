@@ -19,8 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
-import java.nio.CharBuffer
-import java.nio.charset.CodingErrorAction
+import pro.ikili.kibicomputers.core.wasi.WasiUtf8
 
 /**
  * 独自拡張 `kibi:process/process`（#74。ADR 0074）の意味。ABI の層（p1 の import、後の Component Model）に依らない部分。
@@ -64,9 +63,27 @@ internal object KibiProcess {
 
     /**
      * `process-info` 1つ（ABI に依らない形）。[exit] は [state] が [ListState.FINISHED] のときだけ `null` でない。
-     * [args] は上限で切った後のもの（[truncateArgs]。どれも正しい UTF-8 にできる文字列で、対になっていないサロゲートは U+FFFD にしてある）
+     * [args] は上限で切った後の UTF-8 のバイト列（[truncateArgs]。対になっていないサロゲートは U+FFFD にしてある）。
+     * ABI の層はこれをそのまま書く（UTF-8 化をもう一度しない。数えたバイト数と書くバイト列を同じものにするため）。
+     * `ByteArray` を持つので、[equals]・[hashCode] は中身で比べる
      */
-    data class Entry(val pid: Int, val parentPid: Int, val state: ListState, val exit: ExitStatus?, val args: List<String>)
+    class Entry(val pid: Int, val parentPid: Int, val state: ListState, val exit: ExitStatus?, val args: List<ByteArray>) {
+        override fun equals(other: Any?): Boolean = this === other ||
+            other is Entry && pid == other.pid && parentPid == other.parentPid && state == other.state && exit == other.exit &&
+            args.size == other.args.size && args.indices.all { args[it].contentEquals(other.args[it]) }
+
+        override fun hashCode(): Int {
+            var h = pid
+            h = 31 * h + parentPid
+            h = 31 * h + state.hashCode()
+            h = 31 * h + (exit?.hashCode() ?: 0)
+            for (a in args) h = 31 * h + a.contentHashCode()
+            return h
+        }
+
+        override fun toString(): String =
+            "Entry(pid=$pid, parentPid=$parentPid, state=$state, exit=$exit, args=${args.map { String(it, Charsets.UTF_8) }})"
+    }
 
     /** `spawn` の引数（ABI の層が読んだもの）。[env]・[cwd] の `null` は none */
     data class Request(
@@ -184,43 +201,31 @@ internal object KibiProcess {
     /**
      * `args` を上限で切る（ADR 0452）。数え方は UTF-8 のバイト数の和（NUL・区切りは数えない。対になっていないサロゲートは U+FFFD の 3 バイト）。
      * 先頭から順に、[MAX_LIST_ARGS] 個入れたら止める。残りの予算に収まる要素は丸ごと入れる（空文字列は残りが 0 でも入る）。
-     * 収まらない要素は、残りの予算以下に UTF-8 の文字の境目で切って入れ、そこで止める（切って空になるなら入れずに止める）
+     * 収まらない要素は、残りの予算以下に UTF-8 の文字の境目で切って入れ、そこで止める（切って空になるなら入れずに止める）。
+     * 結果は UTF-8 のバイト列（[WasiUtf8.encode]）で、ABI の層はそのまま書く
      */
-    fun truncateArgs(args: List<String>): List<String> {
-        val out = ArrayList<String>(minOf(args.size, MAX_LIST_ARGS))
+    fun truncateArgs(args: List<String>): List<ByteArray> {
+        val out = ArrayList<ByteArray>(minOf(args.size, MAX_LIST_ARGS))
         var remaining = MAX_LIST_ARG_BYTES
         for (arg in args) {
             if (out.size == MAX_LIST_ARGS) break
             // 長い要素は先頭の remaining + 1 文字だけを UTF-8 にする（どの文字も 1 バイト以上なので、それで予算を超えると分かる。
             // 途中で割ったサロゲートは最後の文字なので、そのバイトは remaining 以降に来て、切る位置より前に影響しない）
             val head = if (arg.length > remaining + 1) arg.substring(0, remaining + 1) else arg
-            val bytes = utf8(head)
+            val bytes = WasiUtf8.encode(head)
             if (bytes.size <= remaining) {
-                out += String(bytes, Charsets.UTF_8)
+                out += bytes
                 remaining -= bytes.size
                 continue
             }
             // 継続バイト（10xxxxxx）を戻って、文字の先頭バイトの手前で切る
             var end = remaining
             while (end > 0 && (bytes[end].toInt() and 0xC0) == 0x80) end--
-            if (end > 0) out += String(bytes, 0, end, Charsets.UTF_8)
+            if (end > 0) out += bytes.copyOf(end)
             break
         }
         return out
     }
-
-    /** UTF-8 にする。対になっていないサロゲートは U+FFFD にする（p1 の `P1Canonical.utf8` と同じ） */
-    private fun utf8(s: String): ByteArray {
-        val encoder = Charsets.UTF_8.newEncoder()
-            .onMalformedInput(CodingErrorAction.REPLACE)
-            .onUnmappableCharacter(CodingErrorAction.REPLACE)
-            .replaceWith(REPLACEMENT)
-        val buf = encoder.encode(CharBuffer.wrap(s))
-        return ByteArray(buf.remaining()).also { buf.get(it) }
-    }
-
-    /** U+FFFD の UTF-8 */
-    private val REPLACEMENT = byteArrayOf(0xEF.toByte(), 0xBF.toByte(), 0xBD.toByte())
 
     /** WIT の `exit-status` の判別子（`exited` 0・`killed` 1・`crashed` 2） */
     fun statusTag(status: ExitStatus): Int = when (status.reason) {

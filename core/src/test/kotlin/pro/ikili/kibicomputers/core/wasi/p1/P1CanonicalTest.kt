@@ -527,7 +527,7 @@ class P1CanonicalTest {
     // ---- list<process-info>（#452、ADR 0452） ----
 
     private fun entry(pid: Int, parent: Int, state: KibiProcess.ListState, exit: ExitStatus?, vararg args: String) =
-        KibiProcess.Entry(pid, parent, state, exit, args.toList())
+        KibiProcess.Entry(pid, parent, state, exit, args.map { it.toByteArray(Charsets.UTF_8) })
 
     @Test
     fun `list_process-infoは28バイトの要素を配置どおりに書き、詰め物を0にする`() {

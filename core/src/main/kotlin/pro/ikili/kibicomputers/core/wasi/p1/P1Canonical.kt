@@ -12,9 +12,9 @@ import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.wasi.WasiUtf8
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import java.nio.ByteBuffer
-import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
@@ -367,7 +367,7 @@ internal object P1Canonical {
             e.exit?.let { writeExitStatus(memory, at + 12, it) }
             val argsPtr = alloc(memory, realloc, LIST_ELEMENT_ALIGN, allocSize(e.args.size, STRING_SIZE))
             for ((j, arg) in e.args.withIndex()) {
-                val (p, l) = lowerBytes(memory, realloc, utf8(arg))
+                val (p, l) = lowerBytes(memory, realloc, arg)
                 memory.writeI32(argsPtr + j * STRING_SIZE, p)
                 memory.writeI32(argsPtr + j * STRING_SIZE + 4, l)
             }
@@ -517,18 +517,8 @@ internal object P1Canonical {
         fsError(Errno.INVAL, "文字列が正しい UTF-8 でない")
     }
 
-    /** UTF-8 にする。対になっていないサロゲートは U+FFFD にする */
-    fun utf8(s: String): ByteArray {
-        val encoder = Charsets.UTF_8.newEncoder()
-            .onMalformedInput(CodingErrorAction.REPLACE)
-            .onUnmappableCharacter(CodingErrorAction.REPLACE)
-            .replaceWith(REPLACEMENT)
-        val buf = encoder.encode(CharBuffer.wrap(s))
-        return ByteArray(buf.remaining()).also { buf.get(it) }
-    }
-
-    /** U+FFFD の UTF-8 */
-    private val REPLACEMENT = byteArrayOf(0xEF.toByte(), 0xBF.toByte(), 0xBD.toByte())
+    /** UTF-8 にする。対になっていないサロゲートは U+FFFD にする（[WasiUtf8.encode]） */
+    fun utf8(s: String): ByteArray = WasiUtf8.encode(s)
 
     private fun u32(v: Int): Long = v.toLong() and 0xffff_ffffL
 }
