@@ -762,6 +762,15 @@ internal class ProcessRunner(private val machine: Machine) {
             lock.withLockValue { rt.process.cwd = target }
         }
 
+        override fun mount(source: String, point: String, readOnly: Boolean) {
+            val target = VfsPath.resolve(lock.withLockValue { rt.process.cwd }, point)
+            machine.mountDisk(source, target, readOnly)
+        }
+
+        override fun unmount(point: String) {
+            machine.unmountAt(VfsPath.resolve(lock.withLockValue { rt.process.cwd }, point))
+        }
+
         override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =
             machine.spawn(program, driver, options, rt.pid)
 

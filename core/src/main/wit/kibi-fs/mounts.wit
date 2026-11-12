@@ -1,0 +1,17 @@
+package kibi:fs@0.1.0;
+
+/// マウントの操作（#56。ADR 0056）。p1・p2・p3 で共通（待たない関数なので -poll・-async の版は置かない）。
+/// 挿したディスクは、カーネルが /mnt/<識別子の先頭8文字> に自動でマウントし、kibi:kernel/events のキューに
+/// 種類 "disk-inserted"・"disk-removed"（source ""、values は [識別子, マウントの位置]。マウントしていなければ位置は ""）が届く。
+interface mounts {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// その台に今挿さっているディスク source（"disk:<識別子>"）を point にマウントする。point の相対パスはカーネルの cwd から。
+    /// 挿さっていない・disk: でない・同梱イメージなら no-entry。もうマウントしている・開いている途中・point にもうマウントがあるなら busy。
+    /// read-only が false でも、読み取り専用のディスクは読み取り専用でマウントする。開けない・途中で抜かれたら io
+    mount: func(source: string, point: string, read-only: bool) -> result<_, error-code>;
+
+    /// point のマウントを外す（開いたファイルがあっても外す。その後の操作は io）。マウントの位置でなければ invalid、
+    /// 下にマウントがある・/ か /tmp・/dev のマウントなら busy
+    unmount: func(point: string) -> result<_, error-code>;
+}

@@ -11,6 +11,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
+import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -141,16 +143,16 @@ class ComputerCaseTest {
         parts.installed.add(case.tier.firstSlot(PartKind.EXPANSION))
         case.turnOn(manager, "a", parts, true, config)
         parts.installed.remove(case.tier.firstSlot(PartKind.EXPANSION))
-        assertFalse(case.partsChanged(parts))
+        assertFalse(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertEquals(ComputerStatus.RUNNING, case.status)
 
         parts.installed.remove(case.tier.firstSlot(PartKind.MEMORY))
-        assertTrue(case.partsChanged(parts))
+        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertEquals(ComputerStatus.ERROR, case.status)
         assertEquals(listOf(PartKind.MEMORY), case.missingParts)
         assertNull(manager["a"])
         // 止まっている間は何もしない
-        assertFalse(case.partsChanged(Parts()))
+        assertFalse(case.partsChanged(Parts(), DiskSnapshot.EMPTY))
         assertEquals(listOf(PartKind.MEMORY), case.missingParts)
     }
 
@@ -209,105 +211,100 @@ class ComputerCaseTest {
         assertNull(manager["a"])
     }
 
-    @Test
-    fun `電源を入れるとディスクの識別子を覚え、切ると空になる`() {
-        val case = ComputerCase<String>(CaseTier.ADVANCED)
-        val parts = withDisk(case.tier)
-        val second = case.tier.firstSlot(PartKind.STORAGE) + 1
-        parts.installed.add(second)
-        parts.ids[second] = "disk-b"
-        assertEquals(emptySet<String>(), case.bootDiskIds)
-        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", parts, true, config))
-        assertEquals(setOf("disk-a", "disk-b"), case.bootDiskIds)
-        case.turnOff()
-        assertEquals(emptySet<String>(), case.bootDiskIds)
-        // 起動できなかったときも空
-        parts.installed.remove(0)
-        assertEquals(ComputerStatus.ERROR, case.turnOn(manager, "a", parts, true, config))
-        assertEquals(emptySet<String>(), case.bootDiskIds)
+    /** 識別子 [ids] のディスクの表（中身は [dir] の下） */
+    private fun snapshotOf(vararg ids: String): DiskSnapshot =
+        DiskSnapshot.of(ids.associateWith { ResolvedDisk(dir.resolve(it), 1L shl 20, 64) })
+
+    /** ディスク [ids] を挿して電源を入れ、init（kibi-power-wasi の hold）を disk-a から起動して動くまで待つ */
+    private fun bootedCase(case: ComputerCase<String>, parts: InstalledParts, vararg ids: String, mode: String = "hold"): Machine {
+        powerInitDisk("disk-a", mode)
+        val env = MachineEnvironment.builder().disks(snapshotOf(*ids)).build()
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", parts, true, config, env))
+        val machine = case.machine!!
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        if (mode == "hold") tickUntil("起動しない") { machine.state == MachineState.RUNNING && !machine.isBooting }
+        return machine
     }
 
     @Test
-    fun `動いている間に起動時のディスクを抜くと止まり、足りない部品はSTORAGE`() {
+    fun `電源を入れたときのディスクの表がマシンに入り、挿し抜きで変わる`() {
+        val case = ComputerCase<String>(CaseTier.ADVANCED)
+        val parts = withDisk(case.tier)
+        val env = MachineEnvironment.builder().disks(snapshotOf("disk-a", "disk-b")).build()
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", parts, true, config, env))
+        val machine = case.machine!!
+        assertEquals(setOf("disk-a", "disk-b"), machine.insertedDiskIds)
+        // 起動していない（何もマウントしていない）マシンでは、どれを抜いても止めない
+        assertFalse(case.partsChanged(parts, snapshotOf("disk-a")))
+        assertEquals(setOf("disk-a"), machine.insertedDiskIds)
+        assertFalse(case.partsChanged(parts, snapshotOf("disk-a", "disk-new")))
+        assertEquals(setOf("disk-a", "disk-new"), machine.insertedDiskIds)
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertSame(machine, case.machine)
+    }
+
+    @Test
+    fun `動いている間に根のディスクを抜くと止まり、足りない部品はSTORAGE`() {
         val case = ComputerCase<String>(CaseTier.BASIC)
         val parts = withDisk(case.tier)
-        case.turnOn(manager, "a", parts, true, config)
+        bootedCase(case, parts, "disk-a")
         parts.installed.remove(case.tier.firstSlot(PartKind.STORAGE))
-        assertTrue(case.partsChanged(parts))
+        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertEquals(ComputerStatus.ERROR, case.status)
         assertEquals(ComputerError.MISSING_PARTS, case.error)
         assertEquals(listOf(PartKind.STORAGE), case.missingParts)
-        assertEquals(emptySet<String>(), case.bootDiskIds)
         assertNull(case.machine)
         assertNull(manager["a"])
     }
 
     @Test
-    fun `ほかのディスクが残っていても、起動時のディスクが抜けたら止まる`() {
+    fun `根でないディスクを抜いても、ディスクを足しても止めない`() {
         val case = ComputerCase<String>(CaseTier.ADVANCED)
         val parts = withDisk(case.tier)
-        val first = case.tier.firstSlot(PartKind.STORAGE)
-        case.turnOn(manager, "a", parts, true, config)
-        // 識別子のない部品に差し替える（必須の部品はそろっている）
-        parts.ids.remove(first)
-        assertTrue(case.partsChanged(parts))
-        assertEquals(listOf(PartKind.STORAGE), case.missingParts)
-
-        // 別のディスクに差し替える
-        parts.ids[first] = "disk-a"
-        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", parts, true, config))
-        parts.ids[first] = "disk-b"
-        assertTrue(case.partsChanged(parts))
-        assertEquals(ComputerError.MISSING_PARTS, case.error)
-        assertEquals(listOf(PartKind.STORAGE), case.missingParts)
-    }
-
-    @Test
-    fun `同じディスクを別のスロットに挿し直す・ディスクを足すのは止めない`() {
-        val case = ComputerCase<String>(CaseTier.ADVANCED)
-        val parts = withDisk(case.tier)
-        val first = case.tier.firstSlot(PartKind.STORAGE)
-        case.turnOn(manager, "a", parts, true, config)
-        val machine = case.machine
-        parts.installed.remove(first)
-        parts.ids.remove(first)
-        parts.installed.add(first + 1)
-        parts.ids[first + 1] = "disk-a"
-        assertFalse(case.partsChanged(parts))
-        // 起動時になかったディスクを足す
-        parts.installed.add(first)
-        parts.ids[first] = "disk-new"
-        assertFalse(case.partsChanged(parts))
+        val machine = bootedCase(case, parts, "disk-a", "disk-b")
+        assertFalse(case.partsChanged(parts, snapshotOf("disk-a")))
+        assertFalse(case.partsChanged(parts, snapshotOf("disk-a", "disk-new")))
         assertEquals(ComputerStatus.RUNNING, case.status)
         assertSame(machine, case.machine)
-        assertEquals(setOf("disk-a"), case.bootDiskIds)
+        assertEquals(MachineState.RUNNING, machine.state)
     }
 
     @Test
-    fun `CPUとディスクが同時に抜けると種類の順に並ぶ`() {
+    fun `ゲストが止めた後も、根のディスクを抜くと止まる`() {
+        val case = ComputerCase<String>(CaseTier.BASIC)
+        val parts = withDisk(case.tier)
+        val machine = bootedCase(case, parts, "disk-a", mode = "shutdown")
+        tickUntil("止まらない") { machine.state == MachineState.STOPPED && !machine.isBooting }
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
+        assertEquals(listOf(PartKind.STORAGE), case.missingParts)
+    }
+
+    @Test
+    fun `CPUと根のディスクが同時に抜けると種類の順に並ぶ`() {
         val case = ComputerCase<String>(CaseTier.ADVANCED)
         val parts = withDisk(case.tier)
         val first = case.tier.firstSlot(PartKind.STORAGE)
         // 2つ目のディスクのスロットにも部品があり、STORAGE 自体は足りている
         parts.installed.add(first + 1)
-        case.turnOn(manager, "a", parts, true, config)
+        bootedCase(case, parts, "disk-a")
         parts.installed.remove(first)
         parts.installed.remove(case.tier.firstSlot(PartKind.CPU))
-        assertTrue(case.partsChanged(parts))
+        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertEquals(listOf(PartKind.CPU, PartKind.STORAGE), case.missingParts)
     }
 
     @Test
-    fun `ディスクの識別子を答えない部品の集まりでは、今までどおり`() {
+    fun `ディスクの表が変わらなければ、部品だけを見る`() {
         val case = ComputerCase<String>(CaseTier.ADVANCED)
         val parts = required(case.tier)
         case.turnOn(manager, "a", parts, true, config)
-        assertEquals(emptySet<String>(), case.bootDiskIds)
         parts.installed.remove(case.tier.firstSlot(PartKind.STORAGE))
         parts.installed.add(case.tier.firstSlot(PartKind.STORAGE) + 1)
-        assertFalse(case.partsChanged(parts))
+        assertFalse(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertEquals(ComputerStatus.RUNNING, case.status)
     }
+
     // ---- 電源の状態と復元（#85） ----
 
     @TempDir
@@ -344,7 +341,7 @@ class ComputerCaseTest {
         // 部品を抜いた・電力が尽きた・CRASHED・ゲストが止めた
         case.turnOn(manager, "a", parts, true, config)
         parts.installed.remove(case.tier.firstSlot(PartKind.CPU))
-        assertTrue(case.partsChanged(parts))
+        assertTrue(case.partsChanged(parts, DiskSnapshot.EMPTY))
         assertFalse(case.poweredOn)
         parts.installed.add(case.tier.firstSlot(PartKind.CPU))
         case.turnOn(manager, "a", parts, true, config)

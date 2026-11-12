@@ -111,6 +111,32 @@ public fun interface DiskResolver {
 }
 
 /**
+ * 挿さっているディスクの、変わらない表（識別子 → 実体。挿した順。#56）。[DiskResolver] として引ける。
+ * 電源を入れたときは [MachineEnvironment.disks] で、動いている間の挿し抜きは `ComputerCase.partsChanged` でマシンに渡す。
+ * 作った後に元の表を変えても、中身は変わらない（プロセスのスレッドからも読むため）
+ */
+@ApiStatus.Internal
+public class DiskSnapshot private constructor(
+    /** 識別子 → 実体（変わらない写し。挿した順） */
+    public val disks: Map<String, ResolvedDisk>,
+) : DiskResolver {
+    override fun resolve(diskId: String): ResolvedDisk? = disks[diskId]
+
+    override fun toString(): String = "DiskSnapshot(${disks.keys})"
+
+    public companion object {
+        /** ディスクが1つもない */
+        @JvmField
+        public val EMPTY: DiskSnapshot = DiskSnapshot(emptyMap())
+
+        /** [disks] の写しを取る（空なら [EMPTY]） */
+        @JvmStatic
+        public fun of(disks: Map<String, ResolvedDisk>): DiskSnapshot =
+            if (disks.isEmpty()) EMPTY else DiskSnapshot(java.util.Collections.unmodifiableMap(LinkedHashMap(disks)))
+    }
+}
+
+/**
  * マシンが動く環境（接続層 → カーネル。#44）。[MachineScheduler.createMachine] に渡す。[builder] で作る。
  *
  * ここにあるものは、どれもプロセスのスレッドからも使われる。接続層の実装は、ワールドに直接触らない（スレッドが違うため）。
@@ -132,8 +158,8 @@ public class MachineEnvironment private constructor(builder: Builder) {
     /** 乱数の元 */
     public val entropy: EntropySource = builder.entropy
 
-    /** ディスクの実体 */
-    public val disks: DiskResolver = builder.disks
+    /** 電源を入れたときに挿さっていたディスク（その後の挿し抜きはマシンが受け取る。#56） */
+    public val disks: DiskSnapshot = builder.disks
 
     /**
      * マシンの実行状態の保存先のディレクトリ（#81・#82・#84 が使う。中に置くファイルの形はそちらで決める）。
@@ -145,7 +171,7 @@ public class MachineEnvironment private constructor(builder: Builder) {
     public class Builder internal constructor() {
         internal var clock: MachineClock = MachineClock.SYSTEM
         internal var entropy: EntropySource = EntropySource.SECURE
-        internal var disks: DiskResolver = DiskResolver.NONE
+        internal var disks: DiskSnapshot = DiskSnapshot.EMPTY
         internal var storageDirectory: Path? = null
 
         /** 時計（既定は [MachineClock.SYSTEM]） */
@@ -154,8 +180,8 @@ public class MachineEnvironment private constructor(builder: Builder) {
         /** 乱数の元（既定は [EntropySource.SECURE]） */
         public fun entropy(value: EntropySource): Builder = apply { entropy = value }
 
-        /** ディスクの実体（既定は [DiskResolver.NONE]） */
-        public fun disks(value: DiskResolver): Builder = apply { disks = value }
+        /** 挿さっているディスク（既定は [DiskSnapshot.EMPTY]） */
+        public fun disks(value: DiskSnapshot): Builder = apply { disks = value }
 
         /** 保存先のディレクトリ（既定は `null` = 保存しない） */
         public fun storageDirectory(value: Path?): Builder = apply { storageDirectory = value }

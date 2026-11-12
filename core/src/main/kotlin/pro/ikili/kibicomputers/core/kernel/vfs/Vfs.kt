@@ -91,8 +91,16 @@ internal class Vfs(
      * マウント [id] を外す（カーネルロックの中）。開いているファイルは、この後の操作が `IO` になる。ファイルシステムには
      * [FileSystem.onUnmounted] で知らせ、ロックの外で [FileSystem.retire] を呼ぶ
      */
-    fun unmount(id: Int): MountEntry = synchronized(this) {
-        val entry = mounts.remove(id)
+    fun unmount(id: Int): MountEntry = unmountLocked(id, forced = false)
+
+    /**
+     * マウント [id] を、下のマウントを見ずに外す（ディスクを抜いたとき。カーネルロックの中。#56）。ほかは [unmount] と同じ
+     * （ファイルシステムには [FileSystem.onUnmounted] で知らせるだけで、I/O はしない）
+     */
+    fun unmountForcedLocked(id: Int): MountEntry = unmountLocked(id, forced = true)
+
+    private fun unmountLocked(id: Int, forced: Boolean): MountEntry = synchronized(this) {
+        val entry = if (forced) mounts.removeForced(id) else mounts.remove(id)
         val fs = fileSystems.remove(id)
         publish()
         if (fs != null) {

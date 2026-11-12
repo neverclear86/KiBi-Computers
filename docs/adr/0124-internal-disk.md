@@ -50,13 +50,11 @@
 ## 動いている間にディスクを抜いたとき
 
 - 判断は `core` の `ComputerCase`。接続層は、挿さっているディスクの識別子を `InstalledParts.diskIdAt` で答えるだけ
-- `ComputerCase` は、電源を入れたときにディスクのスロットにあった識別子を `bootDiskIds` に覚える（`RUNNING` でなくなったら空。保存しない）
-- `partsChanged` は、起動に要る部品の不足に加えて、`bootDiskIds` のどれかがディスクのスロットからなくなったときも止め、
-  `ComputerError.MISSING_PARTS` にする。`missingParts` は不足の種類に `STORAGE` を足して `PartKind` の順に並べる
+- #56 で変えた（ADR 0056）: `bootDiskIds` は消し、接続層は部品が変わるたびに（動いている間だけ）今のディスクの写しを作り直して
+  `partsChanged(parts, disks)` に渡す。マシン（`Machine.disksChanged`）は、`/`・`/home` のディスク（と起動・復元の途中で頼るディスク）が抜けたときだけ
+  「止めるべき」と答え、`partsChanged` が `ComputerError.MISSING_PARTS` にする。`missingParts` は不足の種類に `STORAGE` を足して `PartKind` の順に並べる
   （ほかのディスクが残っていても `[STORAGE]`）
-- 同じディスクを別のディスクのスロットに挿し直したとき（識別子が残る）・起動時になかったディスクを足したときは止めない
-- 起動ディスク以外のディスク（init のないもの）も、今は抜けたら止める（どれが起動ディスクになったかは起動のワーカーが決めるため）。
-  起動ディスク以外のマウントと抜き差しの正式な扱いは #56
+- それ以外のディスクは、抜いても止めない（マウントを外して `disk-removed`）。足したディスクは `/mnt` に自動でマウントする（`disk-inserted`）
 - `InstalledParts.diskIdAt` は既定の実装（`null`）を持つので、`fun interface` のままで、ディスクを答えない実装は今までどおり動く
 
 ## 同じ識別子のアイテムが2つあるとき
@@ -66,7 +64,6 @@
 
 ## 決めないこと
 
-- 起動ディスク以外のディスクのマウント・抜き差しの通知（#56）
 - 開いたファイルの保存と復元（#82）
 - 1.20.1 への移植（#224）
 - 容量の確定値（#251）

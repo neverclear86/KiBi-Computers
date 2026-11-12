@@ -1,5 +1,8 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -931,20 +934,49 @@ class MachineRestoreBranchesTest {
     }
 
     @Test
-    fun `ディスクを開けなければMOUNTで冷えた起動にし、先に開いた根は閉じる`() = timeout(limit) {
+    fun `根のディスクを開けなければMOUNTで冷えた起動にし、予約を残さない`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val identity = savePrompt(h, store)
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { _ -> null }
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MOUNT)
+            assertEquals(0, m.diskClaimCount, "予約は残らない")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根でないディスクを開けなければ、そのマウントだけ落として戻し、disk-removedを出す`() = timeout(limit) {
         val store = newStore()
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val identity = savePrompt(h, store) { m ->
                 m.vfs.createDirectory(VfsPath.parse("/data"))
                 m.vfs.mount(VfsPath.parse("/data"), TestMemoryFileSystem(), readOnly = false, source = "disk:data")
             }
-            // 根は開けるが、2つ目のディスク data は開けない
+            // 根は開けるが、2つ目のディスク data は開けない（抜かれた）
             val root = CountingDisk()
             h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(root, readOnly = false) else null }
+            val events = Collections.synchronizedList(ArrayList<Pair<String, List<EventValue>>>())
+            var queue: EventQueue? = null
+            h.scheduler.hooks.duringRestoreInstall = { m ->
+                m.kernel.events.ensureCapacity(m.kernel.objects)
+                val q = EventQueue(EventFilter.ALL, 16)
+                m.kernel.objects.add(q)
+                m.kernel.events.subscribe(q, m.kernel.objects)
+                queue = q
+            }
             val finished = Finished()
             val m = restore(h, store, identity, finished)
-            assertColdBoot(m, finished, ColdBootCause.MOUNT)
-            eventually(10_000, "先に開いた根を閉じない") { root.retired.get() >= 1 }
+            h.scheduler.hooks.duringRestoreInstall = null
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            m.lock.withLockValue { queue!!.pendingEvents().filter { it.type.startsWith("disk-") }.forEach { events += it.type to it.values } }
+            assertEquals(listOf("disk-removed" to listOf<EventValue>(EventValue.Text("data"), EventValue.Text("/data"))), events.toList())
+            assertEquals(null, m.lock.withLockValue { m.kernel.mounts.at(VfsPath.parse("/data")) })
+            assertEquals("disk:root", m.lock.withLockValue { m.kernel.mounts.at(VfsPath.ROOT)?.source })
+            assertEquals(0, m.diskClaimCount, "予約は残らない")
+            assertEquals(0, root.retired.get(), "戻した根は閉じない")
             m.close()
         }
     }

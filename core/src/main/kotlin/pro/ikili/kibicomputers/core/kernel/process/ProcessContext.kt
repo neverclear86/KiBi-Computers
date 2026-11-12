@@ -61,6 +61,18 @@ internal interface ProcessContext {
     fun changeDirectory(path: String)
 
     /**
+     * その台に今挿さっているディスク [source]（`disk:<識別子>`）を [point] にマウントする（`kibi:fs/mounts` の `mount`。#56、ADR 0056）。
+     * [point] の相対パスは作業ディレクトリから辿る。ディスクはこのスレッドで同期に開く。カーネルロックを持たずに呼ぶ。
+     * 失敗は `Machine.mountDisk` と同じ
+     */
+    @Throws(FsException::class)
+    fun mount(source: String, point: String, readOnly: Boolean)
+
+    /** [point]（相対パスは作業ディレクトリから）のマウントを外す（`unmount`。#56）。失敗は `Machine.unmountAt` と同じ */
+    @Throws(FsException::class)
+    fun unmount(point: String)
+
+    /**
      * このプロセスを親にして、読み込み済みの [program] からプロセスを作る（`Machine.spawn`。[SpawnOptions] の既定は親から引き継ぐ）。
      * カーネルロックを持たずに呼ぶ。戻り値は子の pid
      */

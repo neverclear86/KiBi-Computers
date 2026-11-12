@@ -57,7 +57,7 @@ class HostBoundaryTest {
             val env = MachineEnvironment.builder()
                 .clock(clock)
                 .entropy { it.fill(7) }
-                .disks { id -> if (id == "a") ResolvedDisk(Paths.get("disk-a"), 1024, 16) else null }
+                .disks(DiskSnapshot.of(mapOf("a" to ResolvedDisk(Paths.get("disk-a"), 1024, 16))))
                 .storageDirectory(Paths.get("save"))
                 .build()
             val m = h.machine(environment = env)

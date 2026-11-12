@@ -58,8 +58,8 @@ object DiskItemGameTests {
     /**
      * ケース（ディスクのスロットに [disk]、ほかの必須の部品は種類を確かめずに鉄インゴット）と、[withScreen] なら上に画面を置く。
      */
-    private fun build(helper: GameTestHelper, disk: ItemStack, withScreen: Boolean): Pair<CaseBlockEntity, ScreenBlockEntity?> {
-        helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
+    private fun build(helper: GameTestHelper, disk: ItemStack, withScreen: Boolean, caseTier: CaseTier = CaseTier.BASIC): Pair<CaseBlockEntity, ScreenBlockEntity?> {
+        helper.setBlock(CASE, KiBiBlocks.CASES.getValue(caseTier).get())
         val screen = if (withScreen) {
             helper.setBlock(
                 SCREEN,
@@ -139,12 +139,11 @@ object DiskItemGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
         val id = DiskItem.diskIdOf(diskSlot(case))
         helper.assertTrue(id != null && DiskStore.isValidId(id), "the disk should get a valid ID but had $id")
-        helper.assertTrue(case.computer.bootDiskIds == setOf(id), "the case should remember the boot disk but had ${case.computer.bootDiskIds}")
+        helper.assertTrue(case.computer.machine!!.insertedDiskIds == setOf(id), "the machine should know the inserted disk but had ${case.computer.machine!!.insertedDiskIds}")
         val boot = case.computer.machine!!.lastBootConfig!!
         helper.assertTrue(boot.bootDisks == listOf(id, TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the disk then the OS image")
         helper.assertTrue(boot.homeDisk == id, "the first disk should be the home disk but was ${boot.homeDisk}")
         case.pressPowerButton()
-        helper.assertTrue(case.computer.bootDiskIds.isEmpty(), "turning off should forget the disks")
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run again")
         helper.assertTrue(DiskItem.diskIdOf(diskSlot(case)) == id, "the ID should not change across power cycles")
         case.pressPowerButton()
@@ -218,12 +217,45 @@ object DiskItemGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
         helper.assertTrue(diskSlot(case).get(KiBiDataComponents.DISK_ID.get()) == "../evil", "an invalid ID should not be overwritten")
         helper.assertTrue(DiskItem.diskIdOf(diskSlot(case)) == null, "an invalid ID should not be used")
-        helper.assertTrue(case.computer.bootDiskIds.isEmpty(), "an invalid ID should not be a boot disk")
+        helper.assertTrue(case.computer.machine!!.insertedDiskIds.isEmpty(), "an invalid ID should not be an inserted disk")
         val boot = case.computer.machine!!.lastBootConfig!!
         helper.assertTrue(boot.bootDisks == listOf(TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the OS image only")
         helper.assertTrue(boot.homeDisk == null, "an invalid ID should not be the home disk")
         case.pressPowerButton()
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 動いている間に根でないディスクを挿しても抜いても止めず（#56）、マシンの今挿さっているディスクの表が変わる。
+     * マウント・イベントの中身は core の DiskHotplugTest が確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun hotplugSecondDiskKeepsRunning(helper: GameTestHelper) {
+        val (case, _) = build(helper, disk(), withScreen = false, caseTier = CaseTier.ADVANCED)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
+        val machine = case.computer.machine!!
+        val first = DiskItem.diskIdOf(diskSlot(case))!!
+        val second = store(helper).newId()
+        val secondSlot = (0 until case.tier.slotCount).filter { case.tier.kindOf(it) == PartKind.STORAGE }[1]
+        var step = 0
+        helper.succeedWhen {
+            if (step == 0) {
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting but was ${machine.state}")
+                val stack = disk()
+                stack.set(KiBiDataComponents.DISK_ID.get(), second)
+                case.parts.setStackInSlot(secondSlot, stack)
+                helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "inserting a disk should not stop the case: ${case.computer}")
+                helper.assertTrue(machine.insertedDiskIds == setOf(first, second), "both disks should be inserted but had ${machine.insertedDiskIds}")
+                case.parts.setStackInSlot(secondSlot, ItemStack.EMPTY)
+                step = 1
+            }
+            helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "pulling a non-root disk should not stop the case: ${case.computer}")
+            helper.assertTrue(case.computer.machine === machine, "the machine should be kept")
+            helper.assertTrue(machine.insertedDiskIds == setOf(first), "only the first disk should be inserted but had ${machine.insertedDiskIds}")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
     }
 }

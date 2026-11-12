@@ -1,0 +1,16 @@
+package kibi:fs@0.1.0;
+
+/// p1 のゲスト向け（wasi:* を参照しない）。kibi:fs の interface を import する
+world imports {
+    import mounts;
+}
+
+/// p2 のゲスト向け（仮置き。ADR 0056）
+world imports-p2 {
+    import mounts;
+}
+
+/// p3 のゲスト向け（仮置き。ADR 0056）
+world imports-p3 {
+    import mounts;
+}

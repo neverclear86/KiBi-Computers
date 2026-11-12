@@ -52,6 +52,19 @@ internal class MountTable {
         return entry
     }
 
+    /**
+     * [id] のマウントを、下のマウントを見ずに外す（ディスクを抜いたとき。#56）。なければ `INVAL`。
+     * 下のマウントは残る（祖先は合成のディレクトリとして見える。ADR 0051）
+     */
+    fun removeForced(id: Int): MountEntry {
+        val entry = get(id) ?: fsError(Errno.INVAL, "マウント $id はない")
+        list.remove(entry)
+        return entry
+    }
+
+    /** [source] をマウントしたもの（足した順で最初のもの）。なければ `null`（#56） */
+    fun bySource(source: String): MountEntry? = list.firstOrNull { it.source == source }
+
     /** 今の中身の写し（[Vfs] が、カーネルロックの外から読むために公開する。写しは変えない） */
     fun snapshot(): MountTable = MountTable().also {
         it.list.addAll(list)

@@ -52,7 +52,7 @@ class HostBoundaryJavaTest {
         MachineEnvironment env = MachineEnvironment.builder()
                 .clock(clock)
                 .entropy(bytes -> java.util.Arrays.fill(bytes, (byte) 1))
-                .disks(id -> new ResolvedDisk(disks.resolve(id), 1024, 16))
+                .disks(DiskSnapshot.of(java.util.Map.of("abc", new ResolvedDisk(disks.resolve("abc"), 1024, 16))))
                 .storageDirectory(Paths.get("save", "m1"))
                 .build();
         assertEquals(1234, env.getClock().worldTicks());

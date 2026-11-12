@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.boot.BootCancelledException
 import pro.ikili.kibicomputers.core.kernel.boot.BootSequence
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.boot.MachineRestore
 import pro.ikili.kibicomputers.core.kernel.boot.PreparedRestore
 import pro.ikili.kibicomputers.core.kernel.wait.ProcessWaiter
@@ -801,6 +802,8 @@ public class Machine private constructor(
             rebootRequested = false
             rebootNotified = false
             lastBootConfigValue = config
+            // 段の印と同じ区間で、この起動が頼るディスクを今の表にする（#56）
+            beginPhaseDisksLocked()
         } finally {
             lock.unlock()
         }
@@ -834,6 +837,7 @@ public class Machine private constructor(
             if (kernel.processes.size != 0 || kernel.mounts.entries.isNotEmpty() || kernel.consoleTtyId != 0 || runtimes.isNotEmpty()) return false
             restoringValue = true
             restoreCancelSignal = CompletableFuture()
+            beginPhaseDisksLocked()
             restoreRequest = request
             restoreHandle = quiesce()
             lastBootConfigValue = request.bootConfig
@@ -866,6 +870,7 @@ public class Machine private constructor(
             bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
+            beginPhaseDisksLocked()
         } finally {
             lock.unlock()
         }
@@ -906,12 +911,20 @@ public class Machine private constructor(
         restoringValue = false
         // 前段が終わった: 取り消しの登録を外す（待っている読み込みはないので、登録は何もしない。#587）
         restoreCancelSignal.complete(Unit)
+        // 段の予約を外す（戻したマウントの持ち主はカーネルに移った）。戻した表にある挿し込みは自動マウントしない（#56）。
+        // 途中で抜かれて予約が外れていれば何もしない（そのとき disksChanged はもう true を返している）
+        for (claim in prepared.claims) {
+            if (claim.generation == runGeneration) markHandledLocked(claim)
+            releaseLocked(claim)
+        }
         setStateLocked(MachineState.RUNNING, null)
         // 「保存から戻った」を知らせる（#87、ADR 0087）。索引と待ちを戻した後なので、戻したキューに届き、待っているプロセスが起きる。
         // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
         // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
         val values = listOf(EventValue.Integer(jump.realtimeNanos), EventValue.Integer(jump.worldTicks))
         kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
+        // 前段で開けずに表から落としたマウントを知らせる（#56。保存したときの位置で1回だけ。失敗・取り消し・冷えた起動では出さない）
+        for ((diskId, point) in prepared.droppedDisks) postDiskEventLocked(DiskEvents.REMOVED, diskId, point)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
         true
     }
@@ -957,7 +970,11 @@ public class Machine private constructor(
                                 false
                             }
                         }
-                        if (close) handle.close()
+                        if (close) {
+                            handle.close()
+                            // 保存した表にない挿さっているディスクを、戻した後にマウントする（#56）
+                            if (delivered == RestoreOutcome.RESTORED) lock.withLockValue { scheduleAutoMount() }
+                        }
                     }
                 }
             },
@@ -976,7 +993,8 @@ public class Machine private constructor(
         kernel.processes.restore(d.processes.all().toList(), d.processes.orphanZombies.toList(), d.processes.nextPid)
         kernel.objects.restoreFrom(d.objects)
         kernel.events.restoreIndex(d.events.index())
-        kernel.mounts.restore(d.mounts.entries.toList(), d.mounts.nextMountId)
+        // 前段で開けなかったマウント（#56）は表に入れない（指す開いたファイルは IO になる。ADR 0051）
+        kernel.mounts.restore(d.mounts.entries.filter { it.id !in prepared.droppedMountIds }, d.mounts.nextMountId)
         for ((mountId, fs) in prepared.fileSystems) vfs.attach(mountId, fs)
         kernel.fuel = minOf(d.fuel, config.fuelPerTick)
         kernel.consoleTtyId = d.consoleTtyId
@@ -1221,6 +1239,8 @@ public class Machine private constructor(
                 bootingValue = false
                 // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
                 bootCancelSignal.complete(Unit)
+                // 起動の途中に挿して、起動の手順が扱わなかったディスクをマウントする（#56）
+                scheduleAutoMount()
             }
             if (kind == ProcessKind.BLOCKING) {
                 val thread = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(rt) }
@@ -1988,6 +2008,8 @@ public class Machine private constructor(
         devices.dispatcher.cancelAllLocked()
         // ホストのディスク（#52）は、この後の操作を断る（止まり切っていない古いスレッドが触らないように）。閉じるのはロックの外
         vfs.revokeAll()
+        // 実行の終わり: 開いている途中の予約を取り消す（#56）
+        endRunLocked()
         checkAllDoneLocked()
         if (restoreHandleToClose != null) {
             // 止めるのをやめても、プロセスはすべて止めた後なので動かない
@@ -2155,12 +2177,486 @@ public class Machine private constructor(
     internal fun checkAllDoneLocked() {
         if (kernel.processes.liveCount() > 0) return
         if (!bootingValue) unmountTmpLocked()
-        if (stateValue == MachineState.RUNNING || stateValue == MachineState.STOPPING) setStateLocked(MachineState.STOPPED, null)
+        if (stateValue == MachineState.RUNNING || stateValue == MachineState.STOPPING) {
+            // 実行の終わり（init が最後に自分で終わったときは stopLocked を通らない。#56）
+            endRunLocked()
+            setStateLocked(MachineState.STOPPED, null)
+        }
         if (registeredThreads == 0) {
             terminated.signalAll()
             maybePostRebootLocked()
         }
     }
+
+    // ---- ディスクの挿し抜きとマウント（#56、ADR 0056）。どれも実行時だけで、保存しない ----
+
+    /**
+     * 今挿さっているディスクの表（識別子 → 挿し込み。挿した順）。変わらない表を差し替えるだけで、差し替えはカーネルロックの中
+     * （[disksChanged]）。ロックを取らずに読むのは、開き手（[openerForCurrentDisks]）・取り消しの確かめ・[insertedDiskIds] だけ。
+     * 最初の値は [MachineEnvironment.disks]
+     */
+    @Volatile
+    private var inserted: Map<String, Insertion> = LinkedHashMap<String, Insertion>().also { map ->
+        for ((diskId, disk) in environment.disks.disks) map[diskId] = Insertion(diskId, disk)
+    }
+
+    /** 今挿さっているディスクの識別子（GameTest・GUI 用。ロックを取らずに読む写し） */
+    public val insertedDiskIds: Set<String> get() = inserted.keys
+
+    /**
+     * 実行の世代（#56）。実行の終わりと段の始め（[endRunLocked]）で進める。予約（[DiskClaim]）を作ったときの世代と違えば、
+     * その予約の開き手は取り消された。ロックを取らずに読む（開き手の取り消しの確かめ）
+     */
+    @Volatile
+    private var runGeneration = 0L
+
+    /** ディスクの識別子 → 開いている途中の持ち主（カーネルロックの中だけ）。同じディスクを2つの持ち主が同時に開かない（ADR 0052 のリース） */
+    private val diskClaims = HashMap<String, DiskClaim>()
+
+    /**
+     * この起動・復元が頼るディスク（カーネルロックの中だけ）。段の印（[bootingValue]・[restoringValue]）を立てるのと同じ区間で今の表の
+     * 識別子に入れ直し、段の予約（[claimPhaseDisk]）のたびに足す。起動・復元の途中にここにある識別子が抜けたら止める（[disksChanged]）
+     */
+    private var phaseDisks: MutableSet<String> = HashSet()
+
+    /** 自動マウントの仕事（[reconcileMounts]）を、起動用のスレッドに積んだか（積むのは1台に1つ） */
+    private val autoMountScheduled = AtomicBoolean()
+
+    /** 自動マウントの仕事を走らせた回数（テスト用） */
+    internal val autoMountRuns = AtomicInteger()
+
+    /** 開いている途中の予約の数（テスト用） */
+    internal val diskClaimCount: Int get() = lock.withLockValue { diskClaims.size }
+
+    /** 挿し込み1回（識別子と実体）。抜いたら [cancelled] が立つ。同じ識別子を挿し直したら別の挿し込み */
+    internal class Insertion(val diskId: String, val disk: ResolvedDisk) {
+        /** 抜かれた（ロックを取らずに読む） */
+        @Volatile
+        var cancelled = false
+
+        /** この実行で、自動マウント・起動のマウントを済ませた（試した）。カーネルロックの中だけ */
+        var handled = false
+    }
+
+    /** 開く処理1回ごとの予約（持ち主の印）。[insertion] は挿し込みのないもの（同梱イメージ・テストのフック）なら `null` */
+    internal class DiskClaim(val diskId: String, val insertion: Insertion?, val generation: Long)
+
+    /** 実行の終わり・段の始め（カーネルロックの中）: 世代を進め、予約を空にする（#56） */
+    private fun endRunLocked() {
+        runGeneration++
+        diskClaims.clear()
+    }
+
+    /** 段の始め（[boot]・[coldBootAfterRestore]・[restore] の、段の印を立てる区間。カーネルロックの中） */
+    private fun beginPhaseDisksLocked() {
+        endRunLocked()
+        phaseDisks = HashSet(inserted.keys)
+        for (insertion in inserted.values) insertion.handled = false
+    }
+
+    /**
+     * 今の表からディスクを開く口。テストのフック（[KernelTestHooks.bootVolumes]）があればそれ、なければ今の表（[inserted]）を引く
+     * [BootVolumeOpener.forDisks]（開くたびに今の表を読む）
+     */
+    internal fun openerForCurrentDisks(): BootVolumeOpener =
+        scheduler.hooks.bootVolumes ?: BootVolumeOpener.forDisks(DiskResolver { inserted[it]?.disk }, hostFiles)
+
+    /**
+     * [diskId] を予約する（カーネルロックの中）。[insertion] があれば、それがまだ今の表にあって抜かれていないことを確かめる。
+     * もうマウントしている・ほかの持ち主が予約しているなら `null`。[phase] なら同じ区間で [phaseDisks] に足す（段の予約）
+     */
+    private fun claimLocked(diskId: String, insertion: Insertion?, phase: Boolean): DiskClaim? {
+        if (insertion != null && (inserted[diskId] !== insertion || insertion.cancelled)) return null
+        if (diskClaims.containsKey(diskId)) return null
+        if (kernel.mounts.bySource(diskSource(diskId)) != null) return null
+        val claim = DiskClaim(diskId, insertion, runGeneration)
+        diskClaims[diskId] = claim
+        if (phase) phaseDisks.add(diskId)
+        return claim
+    }
+
+    /** [claim] を外す（カーネルロックの中）。もう外れていた・ほかの持ち主のものなら何もしない */
+    private fun releaseLocked(claim: DiskClaim) {
+        diskClaims.remove(claim.diskId, claim)
+    }
+
+    /** [claim] がまだ生きているか（世代が同じ・挿し込みが抜かれていない・予約が残っている。カーネルロックの中） */
+    private fun claimAliveLocked(claim: DiskClaim): Boolean =
+        claim.generation == runGeneration && insertionAliveLocked(claim) && diskClaims[claim.diskId] === claim
+
+    private fun insertionAliveLocked(claim: DiskClaim): Boolean {
+        val insertion = claim.insertion ?: return true
+        return inserted[claim.diskId] === insertion && !insertion.cancelled
+    }
+
+    /**
+     * 開き終えた [claim] を、自動マウント・システムコールでマウントしてよいか（カーネルロックの中）。RUNNING で起動・復元の途中でなく、
+     * 予約が生きている。マウントの位置が空いているかは、呼び手が別に確かめる（#56）
+     */
+    private fun canMountClaimLocked(claim: DiskClaim): Boolean = runningSteadyLocked() && claimAliveLocked(claim)
+
+    /** RUNNING で起動・復元の途中でない（自動マウント・システムコールのマウントとディスクのイベントを出してよい）。カーネルロックの中 */
+    private fun runningSteadyLocked(): Boolean = stateValue == MachineState.RUNNING && !bootingValue && !restoreTransient
+
+    /** [claim] の開き手の取り消しの確かめ（リースのロックの中で呼ばれる。volatile を読むだけ。ADR 0052） */
+    private fun claimCancelled(claim: DiskClaim): Boolean =
+        claim.generation != runGeneration || claim.insertion?.cancelled == true
+
+    /**
+     * 段の予約（起動の根の候補・`/home`・`/mnt`、復元の保存した表の `disk:`）。どのスレッドから呼んでもよい（ロックを自分で取る）。
+     * 今の表にない識別子は、同梱イメージ（`image:`）かテストのフックがあるときだけ予約する。予約できなければ `null`（開けないとして扱う）
+     */
+    internal fun claimPhaseDisk(diskId: String): DiskClaim? = lock.withLockValue {
+        val insertion = inserted[diskId]
+        if (insertion == null && !diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX) && scheduler.hooks.bootVolumes == null) {
+            return@withLockValue null
+        }
+        claimLocked(diskId, insertion, phase = true)
+    }
+
+    /** 予約を外す（ロックを自分で取る） */
+    internal fun releaseDiskClaim(claim: DiskClaim): Unit = lock.withLockValue { releaseLocked(claim) }
+
+    /** 予約をまとめて外す（ロックを自分で取る。復元の失敗・取り消し） */
+    internal fun releaseDiskClaims(claims: List<DiskClaim>) {
+        if (claims.isEmpty()) return
+        lock.withLockValue { for (claim in claims) releaseLocked(claim) }
+    }
+
+    /** 起動の段の予約 [claim] の取り消しの確かめ（起動の取り消しか、予約の取り消し） */
+    internal fun bootClaimCancelled(claim: DiskClaim): () -> Boolean = { bootCancelled || claimCancelled(claim) }
+
+    /** 復元の段の予約 [claim] の取り消しの確かめ */
+    internal fun restoreClaimCancelled(claim: DiskClaim): () -> Boolean = { isRestoreCancelled || claimCancelled(claim) }
+
+    /** 段の予約 [claim] が取り消された（開いた後の確かめ。ロックを取らずに読む） */
+    internal fun isClaimCancelled(claim: DiskClaim): Boolean = claimCancelled(claim)
+
+    /** 起動の段の予約 [claim] がまだ生きているか（ロックを自分で取る） */
+    internal fun isPhaseClaimAlive(claim: DiskClaim): Boolean = lock.withLockValue { claimAliveLocked(claim) }
+
+    /** 起動の途中に `/mnt` へマウントする候補（今の表のうち、まだ扱っておらず、マウントも予約もしていないもの。挿した順） */
+    internal fun bootMountCandidates(): List<String> = lock.withLockValue {
+        inserted.values.filter {
+            !it.handled && kernel.mounts.bySource(diskSource(it.diskId)) == null && !diskClaims.containsKey(it.diskId)
+        }.map { it.diskId }
+    }
+
+    /** [claim] の挿し込みを、この実行で扱った（自動マウントしない）印にする（カーネルロックの中） */
+    private fun markHandledLocked(claim: DiskClaim) {
+        val insertion = claim.insertion ?: return
+        if (inserted[claim.diskId] === insertion) insertion.handled = true
+    }
+
+    /**
+     * 起動の途中に、[claim]（段の予約）のディスクを `/mnt/<名前>` にマウントする（起動用のスレッドから。#56）。イベントは出さない
+     * （ゲストがまだいない）。開けない・位置が使えないときは、マウントせずに続ける。起動が取り消されたら [BootCancelledException]
+     */
+    internal fun mountBootDisk(claim: DiskClaim) {
+        val result = try {
+            mountUnderMnt(claim, bootClaimCancelled(claim)) { !bootCancelled && claimAliveLocked(claim) }
+        } finally {
+            lock.withLockValue {
+                markHandledLocked(claim)
+                releaseLocked(claim)
+            }
+        }
+        if (result == MntResult.SILENT && bootCancelled) throw BootCancelledException()
+    }
+
+    /** [mountUnderMnt] の結果 */
+    private enum class MntResult {
+        /** マウントした（予約は外した） */
+        MOUNTED,
+
+        /** 開けない・位置が使えない（開いたものは閉じた） */
+        FAILED,
+
+        /** 取り消された・マウントしてよい状態でなくなった（開いたものは閉じた） */
+        SILENT,
+    }
+
+    /**
+     * [claim] のディスクを開いて `/mnt/<識別子の先頭8文字>` にマウントする（ロックの外から。#56、ADR 0056）。名前を決め、ロックの外で
+     * 位置を確かめて開き、ロックの中で [canMountLocked] と位置が空いていることを確かめてマウントする（同じ区間で予約を外し、
+     * [onMountedLocked] を呼ぶ）。位置が埋まっていたら、開いたものを持ったまま名前を延ばしてやり直す（上限つき）。
+     * マウントしなかったら、開いたものをロックの外で閉じる。マウントしなかったときの予約は外さない（呼び手が外す）
+     */
+    private fun mountUnderMnt(
+        claim: DiskClaim,
+        cancelled: () -> Boolean,
+        onMountedLocked: (VfsPath) -> Unit = {},
+        canMountLocked: () -> Boolean,
+    ): MntResult {
+        val names = autoMountPoints(claim.diskId)
+        var volume: BootVolume? = null
+        var result = MntResult.FAILED
+        try {
+            var index = 0
+            var tries = 0
+            while (true) {
+                // 名前を決める（ロックの中で、表のすべての位置と比べる）
+                val next = lock.withLockValue {
+                    if (!canMountLocked()) return@withLockValue -1
+                    var i = index
+                    while (i < names.size && kernel.mounts.at(names[i]) != null) i++
+                    i
+                }
+                if (next < 0) {
+                    result = MntResult.SILENT
+                    return result
+                }
+                if (next >= names.size || ++tries > MAX_AUTO_MOUNT_TRIES) return result
+                index = next
+                val point = names[index]
+                try {
+                    vfs.checkMountPoint(point)
+                } catch (e: FsException) {
+                    return result
+                }
+                val opened = volume ?: run {
+                    val v = try {
+                        openerForCurrentDisks().open(claim.diskId, cancelled)
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (v == null) {
+                        if (cancelled()) result = MntResult.SILENT
+                        return result
+                    }
+                    volume = v
+                    v
+                }
+                val mounted: Boolean? = lock.withLockValue {
+                    if (!canMountLocked()) return@withLockValue null
+                    if (kernel.mounts.at(point) != null) return@withLockValue false
+                    vfs.mountLocked(point, opened.fs, opened.readOnly, diskSource(claim.diskId))
+                    releaseLocked(claim)
+                    onMountedLocked(point)
+                    true
+                }
+                when (mounted) {
+                    null -> {
+                        result = MntResult.SILENT
+                        return result
+                    }
+                    true -> {
+                        result = MntResult.MOUNTED
+                        return result
+                    }
+                    false -> index++
+                }
+            }
+        } finally {
+            if (result != MntResult.MOUNTED) volume?.fs?.retire()
+        }
+    }
+
+    /**
+     * ディスクの挿し抜き（メインスレッドから。`ComputerCase.partsChanged`。#56）。今挿さっているディスクの表を [disks] に差し替える。
+     * 止めるべきなら `true`（抜けたディスクが `/`・`/home` にマウントしてある、または起動・復元の途中でそれが頼るディスク）。
+     * 止めないときは、RUNNING で起動・復元の途中でなければ、抜けたディスクを外して `disk-removed` を出し、増えたら自動マウントの仕事を積む。
+     * それ以外の状態では、表の差し替え・取り消しの印・予約の解除だけをする。これらは1つのカーネルロックの区間で行う
+     * （µs。例外はメインスレッドに漏らさない）
+     */
+    internal fun disksChanged(disks: DiskSnapshot): Boolean = try {
+        lock.withLockValue { disksChangedLocked(disks) }
+    } catch (e: RuntimeException) {
+        LOG.log(System.Logger.Level.ERROR, "マシン $id のディスクの挿し抜きを扱えない: $e")
+        false
+    }
+
+    private fun disksChangedLocked(disks: DiskSnapshot): Boolean {
+        val old = inserted
+        if (old.keys == disks.disks.keys) return false
+        val next = LinkedHashMap<String, Insertion>()
+        for ((diskId, disk) in disks.disks) next[diskId] = old[diskId] ?: Insertion(diskId, disk)
+        val removed = old.values.filter { next[it.diskId] !== it }
+        val added = next.values.any { old[it.diskId] !== it }
+        inserted = next
+        for (insertion in removed) {
+            insertion.cancelled = true
+            // どの持ち主の予約でも外す（持ち主は後で remove(id, claim) で外すので、新しい持ち主のものを消さない）
+            diskClaims.remove(insertion.diskId)
+        }
+        val phase = bootingValue || restoreTransient
+        for (insertion in removed) {
+            val source = diskSource(insertion.diskId)
+            val essential = kernel.mounts.entries.any { it.source == source && (it.point == VfsPath.ROOT || it.point == MachineLimits.HOME_PATH) }
+            if (essential || (phase && insertion.diskId in phaseDisks)) return true
+        }
+        if (!runningSteadyLocked()) return false
+        for (insertion in removed) {
+            val entry = kernel.mounts.bySource(diskSource(insertion.diskId))
+            val point = if (entry != null) {
+                vfs.unmountForcedLocked(entry.id)
+                entry.point.toString()
+            } else {
+                ""
+            }
+            postDiskEventLocked(DiskEvents.REMOVED, insertion.diskId, point)
+        }
+        if (added) scheduleAutoMount()
+        return false
+    }
+
+    /** ディスクのイベント（[DiskEvents]）を出す（カーネルロックの中） */
+    private fun postDiskEventLocked(kind: String, diskId: String, point: String) {
+        val values = listOf(EventValue.Text(diskId), EventValue.Text(point))
+        kernel.events.post(KernelEvent(kind, DiskEvents.SOURCE, values), kernel.objects, wakeSink)
+    }
+
+    /** 自動マウントの仕事を積む（カーネルロックの中から呼んでよい。積むだけで待たない。積むのは1台に1つ） */
+    private fun scheduleAutoMount() {
+        if (!autoMountScheduled.compareAndSet(false, true)) return
+        val job = Runnable {
+            // 印を下ろしてから状態を読む（下ろした後の挿し込みは、もう1回積まれる）
+            autoMountScheduled.set(false)
+            autoMountRuns.incrementAndGet()
+            reconcileMounts()
+        }
+        try {
+            scheduler.bootExecutor.execute(job)
+        } catch (e: RejectedExecutionException) {
+            // スケジューラが閉じた: 何も開いていないので印を戻すだけ
+            autoMountScheduled.set(false)
+        }
+    }
+
+    /** 予約をマウントせずに外したとき（カーネルロックの中）: 飛ばされた挿し込みが残っていれば、自動マウントの仕事を積み直す */
+    private fun rescheduleAutoMountLocked() {
+        if (!runningSteadyLocked()) return
+        if (inserted.values.any { !it.handled && !diskClaims.containsKey(it.diskId) }) scheduleAutoMount()
+    }
+
+    /**
+     * 自動マウントの仕事（起動用のスレッドで。#56）。今の表のうち、この実行でまだ扱っていない挿し込みを1つずつ `/mnt/<名前>` にマウントし、
+     * `disk-inserted` を出す。RUNNING で起動・復元の途中でなければ何もしない
+     */
+    private fun reconcileMounts() {
+        // フックで開くテストは、表にないディスクも開いてマウントするので、表にないマウントを外さない
+        val cleanup = scheduler.hooks.bootVolumes == null
+        while (true) {
+            val claim = lock.withLockValue {
+                if (!runningSteadyLocked()) return
+                if (cleanup) unmountStaleDisksLocked()
+                for (insertion in inserted.values) {
+                    if (insertion.handled) continue
+                    val existing = kernel.mounts.bySource(diskSource(insertion.diskId))
+                    if (existing != null) {
+                        // システムコールでマウントしたものなど
+                        insertion.handled = true
+                        postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, existing.point.toString())
+                        continue
+                    }
+                    // ほかの持ち主が開いている途中なら飛ばす（その持ち主がマウントせずに外したら積み直される）
+                    val c = claimLocked(insertion.diskId, insertion, phase = false) ?: continue
+                    insertion.handled = true
+                    return@withLockValue c
+                }
+                null
+            } ?: return
+            autoMount(claim)
+        }
+    }
+
+    /** 今の表にない `disk:` のマウント（`/`・`/home`・同梱イメージ以外）を外して `disk-removed` を出す（カーネルロックの中） */
+    private fun unmountStaleDisksLocked() {
+        for (entry in kernel.mounts.entries.toList()) {
+            if (!entry.source.startsWith(MachineLimits.DISK_SOURCE_PREFIX)) continue
+            if (entry.point == VfsPath.ROOT || entry.point == MachineLimits.HOME_PATH) continue
+            val diskId = entry.source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
+            if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX) || inserted.containsKey(diskId)) continue
+            vfs.unmountForcedLocked(entry.id)
+            postDiskEventLocked(DiskEvents.REMOVED, diskId, entry.point.toString())
+        }
+    }
+
+    /** 予約 [claim] のディスクを自動マウントする（起動用のスレッドで、ロックの外から） */
+    private fun autoMount(claim: DiskClaim) {
+        var result = MntResult.SILENT
+        try {
+            result = mountUnderMnt(
+                claim,
+                cancelled = { claimCancelled(claim) },
+                onMountedLocked = { point -> postDiskEventLocked(DiskEvents.INSERTED, claim.diskId, point.toString()) },
+                canMountLocked = { canMountClaimLocked(claim) },
+            )
+        } catch (e: RuntimeException) {
+            LOG.log(System.Logger.Level.WARNING, "マシン $id のディスク ${claim.diskId} を自動マウントできない: $e")
+            result = MntResult.FAILED
+        } finally {
+            lock.withLockValue {
+                // 位置が使えない・開けない: マウントせずに知らせる（RUNNING の挿し込み1つにつき disk-inserted は1回）
+                val report = result == MntResult.FAILED && runningSteadyLocked() &&
+                    claim.generation == runGeneration && insertionAliveLocked(claim)
+                releaseLocked(claim)
+                if (report) postDiskEventLocked(DiskEvents.INSERTED, claim.diskId, "")
+                if (result != MntResult.MOUNTED) rescheduleAutoMountLocked()
+            }
+        }
+    }
+
+    /**
+     * システムコールの `mount`（プロセスのスレッドから。#56、ADR 0056）。[source] はその台に今挿さっている `disk:<識別子>` だけ。
+     * ディスクはこのスレッドで同期に開く（`path_open` と同じ）。[readOnly] が偽でも、開いたものが読み取り専用ならそのままマウントする。
+     * カーネルロックを持たずに呼ぶ
+     *
+     * @throws FsException 挿さっていない・`disk:` でない・同梱イメージ（`NOENT`）、もうマウント中・ほかの持ち主が開いている途中・
+     *   位置にもうマウントがある（`BUSY`）、位置がディレクトリでない（`NOTDIR`）、開けない・途中で抜かれた・マシンが止まった（`IO`）
+     */
+    @Throws(FsException::class)
+    internal fun mountDisk(source: String, point: VfsPath, readOnly: Boolean) {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま mount を呼ばない" }
+        if (!source.startsWith(MachineLimits.DISK_SOURCE_PREFIX)) fsError(Errno.NOENT, "$source はディスクではない")
+        val diskId = source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
+        if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX)) fsError(Errno.NOENT, "$source は挿さっていない")
+        val claim = lock.withLockValue {
+            val insertion = inserted[diskId] ?: fsError(Errno.NOENT, "$source は挿さっていない")
+            if (diskClaims.containsKey(diskId) || kernel.mounts.bySource(source) != null) fsError(Errno.BUSY, "$source は使用中")
+            claimLocked(diskId, insertion, phase = false) ?: fsError(Errno.NOENT, "$source は挿さっていない")
+        }
+        var volume: BootVolume? = null
+        var mounted = false
+        try {
+            vfs.checkMountPoint(point)
+            val v = try {
+                openerForCurrentDisks().open(diskId) { claimCancelled(claim) }
+            } catch (e: Exception) {
+                null
+            } ?: fsError(Errno.IO, "$source を開けない")
+            volume = v
+            lock.withLockValue {
+                if (!canMountClaimLocked(claim)) fsError(Errno.IO, "$source は抜かれた・マシンが止まった")
+                if (kernel.mounts.at(point) != null) fsError(Errno.BUSY, "$point にはもうマウントがある")
+                vfs.mountLocked(point, v.fs, readOnly || v.readOnly, source)
+                mounted = true
+                releaseLocked(claim)
+            }
+        } finally {
+            if (!mounted) volume?.fs?.retire()
+            lock.withLockValue {
+                releaseLocked(claim)
+                if (!mounted) rescheduleAutoMountLocked()
+            }
+        }
+    }
+
+    /**
+     * システムコールの `unmount`（プロセスのスレッドから。#56）。開いたファイルがあっても外す（その後の操作は `IO`。ADR 0051）
+     *
+     * @throws FsException マウントの位置でない（`INVAL`）、下にマウントがある・`/` か `tmp`・`dev` のマウント（`BUSY`）
+     */
+    @Throws(FsException::class)
+    internal fun unmountAt(point: VfsPath): Unit = lock.withLockValue {
+        val entry = kernel.mounts.at(point) ?: fsError(Errno.INVAL, "$point はマウントの位置ではない")
+        if (entry.point == VfsPath.ROOT || entry.source == MachineLimits.TMP_SOURCE || entry.source == MachineLimits.DEV_SOURCE) {
+            fsError(Errno.BUSY, "$point は外せない")
+        }
+        vfs.unmount(entry.id)
+    }
+
+    private fun diskSource(diskId: String): String = MachineLimits.DISK_SOURCE_PREFIX + diskId
 
     // ---- 起動・init の終わり・再起動（#49） ----
 
@@ -2256,13 +2752,18 @@ public class Machine private constructor(
         true
     }
 
-    /** 起動ディスク [diskId] の [volume] を `/` にマウントする（起動用のスレッドから）。取り消されていれば何もせず `false` */
-    internal fun mountBootRoot(diskId: String, volume: BootVolume): Boolean {
+    /**
+     * 起動ディスク [diskId] の [volume] を `/` にマウントする（起動用のスレッドから）。[claim] はその段の予約で、同じ区間で外す（#56）。
+     * 取り消されていた・予約が外れていた（途中で抜かれた）なら何もせず `false`
+     */
+    internal fun mountBootRoot(diskId: String, volume: BootVolume, claim: DiskClaim): Boolean {
         // 位置の確かめ（ファイルシステムを呼ぶことがある）はロックの外、表を変えるのはロックの中（#52）
         vfs.checkMountPoint(VfsPath.ROOT)
         return lock.withLockValue {
-            if (bootCancelled) return@withLockValue false
+            if (bootCancelled || !claimAliveLocked(claim)) return@withLockValue false
             vfs.mountLocked(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
+            markHandledLocked(claim)
+            releaseLocked(claim)
             true
         }
     }
@@ -2299,14 +2800,17 @@ public class Machine private constructor(
     /**
      * [volume]（ディスク [diskId]）を [MachineLimits.HOME_PATH] に書き込める形でマウントする（起動用のスレッドから、`/tmp` のマウントの後。#461）。
      * 根の `/home` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）。マウントしなかったら [volume] を閉じる。
-     * 起動が取り消されていれば [BootCancelledException]
+     * 起動が取り消されていた・予約 [claim] が外れていた（途中で抜かれた）なら [BootCancelledException]。予約はマウントと同じ区間で外す
+     * （マウントしなかったときは呼び手が外す。#56）
      */
-    internal fun mountHome(diskId: String, volume: BootVolume): Errno? {
+    internal fun mountHome(diskId: String, volume: BootVolume, claim: DiskClaim): Errno? {
         try {
             vfs.checkMountPoint(MachineLimits.HOME_PATH)
             val mounted = lock.withLockValue {
-                if (bootCancelled) return@withLockValue false
+                if (bootCancelled || !claimAliveLocked(claim)) return@withLockValue false
                 vfs.mountLocked(MachineLimits.HOME_PATH, volume.fs, readOnly = false, source = "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
+                markHandledLocked(claim)
+                releaseLocked(claim)
                 true
             }
             if (!mounted) {
@@ -2761,12 +3265,56 @@ public class Machine private constructor(
         /** 起動の始めに、前のスレッドを待つときの見直しの間隔 */
         private const val BOOT_WAIT_NANOS: Long = 10_000_000
 
+        /** 自動マウントで、位置が埋まっていたときに名前を延ばしてやり直す回数の上限（#56） */
+        private const val MAX_AUTO_MOUNT_TRIES: Int = 32
+
+        /**
+         * ディスク [diskId] を自動マウントする位置の候補（#56、ADR 0056）: `/mnt/<識別子の先頭8文字>`（小文字）。重なったら1文字ずつ延ばし、
+         * `-` で終わる長さは飛ばす（UUID なら 8 → 10 → 11 …）。1つのパスの部分にできない文字（`/` など）を含む長さは使わない
+         */
+        internal fun autoMountPoints(diskId: String): List<VfsPath> {
+            val name = diskId.lowercase()
+            val out = ArrayList<VfsPath>()
+            for (len in minOf(AUTO_MOUNT_NAME_CHARS, name.length)..name.length) {
+                if (len == 0) continue
+                val part = name.substring(0, len)
+                if (part.endsWith("-")) continue
+                if (part == "." || part == ".." || part.any { it == '/' || it == '\\' || it.code < 0x20 }) continue
+                val point = try {
+                    VfsPath.parse("/mnt/$part")
+                } catch (e: RuntimeException) {
+                    continue
+                }
+                if (point.depth == 2) out += point
+            }
+            return out
+        }
+
+        /** 自動マウントの名前の長さ（識別子の先頭の文字数） */
+        private const val AUTO_MOUNT_NAME_CHARS: Int = 8
+
         /** コンソールのメッセージに出すプロセスの名前の最大の文字数 */
         private const val MAX_LABEL_CHARS: Int = 64
 
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D
     }
+}
+
+/**
+ * ディスクの挿し抜きのイベント（#56、ADR 0056）。RUNNING のマシンにカーネルが出す（同報）。
+ * 形は `event { kind: "disk-inserted" | "disk-removed", source: "", values: [text(識別子), text(マウントの位置)] }`。
+ * マウントしていなければ位置は `""`
+ */
+internal object DiskEvents {
+    /** 挿した（自動マウントを試した後に1回） */
+    const val INSERTED: String = "disk-inserted"
+
+    /** 抜いた */
+    const val REMOVED: String = "disk-removed"
+
+    /** 出したもの（カーネル） */
+    const val SOURCE: String = ""
 }
 
 /** マシンの内部の上限など（公開 API の外） */

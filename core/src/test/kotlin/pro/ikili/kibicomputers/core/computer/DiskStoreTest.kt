@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
-import pro.ikili.kibicomputers.core.kernel.DiskResolver
+import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.ResolvedDisk
 import java.nio.file.Files
 import java.nio.file.Path
@@ -88,7 +88,7 @@ class DiskStoreTest {
 
     @Test
     fun `ディスクがなければNONE`() {
-        assertSame(DiskResolver.NONE, store.snapshot(emptyMap()))
-        assertSame(DiskResolver.NONE, store.snapshot(mapOf("x" to PartTier.TIER_1)))
+        assertSame(DiskSnapshot.EMPTY, store.snapshot(emptyMap()))
+        assertSame(DiskSnapshot.EMPTY, store.snapshot(mapOf("x" to PartTier.TIER_1)))
     }
 }
