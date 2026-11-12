@@ -556,15 +556,13 @@ class BootTest {
             returned.set(true)
             StepResult.Exit(0)
         }
-        val rt = m.rt(m.spawn(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1))
-        val pid = rt.pid
-        // ホスト関数の包みの確認を過ぎた後、電源の求めの前に、プレイヤーが止める
-        h.scheduler.hooks.beforePowerRequest = { machine, p ->
-            if (p == pid) {
-                h.scheduler.hooks.beforePowerRequest = null
-                machine.stop()
-            }
+        // ホスト関数の包みの確認を過ぎた後、電源の求めの前に、プレイヤーが止める。
+        // BLOCKING は spawn の中で専用スレッドが始まるので、フックは spawn の前に入れる（init は電源を求めないので pid で絞らない）
+        h.scheduler.hooks.beforePowerRequest = { machine, _ ->
+            h.scheduler.hooks.beforePowerRequest = null
+            machine.stop()
         }
+        val rt = m.rt(m.spawn(h.program(emptyModule()), asker, SpawnOptions(), parentPid = 1))
         tickUntil { m.state == MachineState.STOPPED }
         assertTrue(m.awaitTermination(5_000))
         tickFor(100)
