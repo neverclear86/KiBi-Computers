@@ -82,6 +82,11 @@ pub const Reader = struct {
         return parse(self.buf[self.start..self.end], !self.filled).used > 0;
     }
 
+    /// 読んだまま残っているバイトが 1 つもないか（途中で切れたシーケンスも含めて）。真なら、次の [next] は読み込みから始まる
+    pub fn idle(self: *const Reader) bool {
+        return self.start >= self.end;
+    }
+
     /// 次のキー。入力の終わり・読めないときは null
     pub fn next(self: *Reader) ?Key {
         while (true) {

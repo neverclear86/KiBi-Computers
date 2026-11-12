@@ -56,7 +56,7 @@ internal class KernelClocks {
 
     /**
      * [snapshot] の時点から単調時計と経過時間が続くように、ずれを決め直す（復元。#81）。
-     * 実時間とゲーム内時間がどれだけ飛んだかを返す（「時間が飛んだ」イベントは #87）
+     * 実時間とゲーム内時間がどれだけ飛んだかを返す（成功した復元で `restored` イベントの値になる。#87、ADR 0087）
      */
     fun restore(snapshot: ClockSnapshot, clock: MachineClock, nowTick: Long): TimeJump {
         monotonicOffsetNanos = saturatingSub(snapshot.monotonicNanos, clock.monotonicNanos())
@@ -85,7 +85,10 @@ internal data class ClockSnapshot(
     }
 }
 
-/** 復元で飛んだ時間（[KernelClocks.restore] の結果）。負のこともある（ホストの時計を戻した、別のワールドに移した） */
+/**
+ * 復元で飛んだ時間（[KernelClocks.restore] の結果）。負のこともある（ホストの時計を戻した、別のワールドに移した）。
+ * あふれたときは [saturatingSub] で `Long.MIN_VALUE`・`Long.MAX_VALUE` に留まる。成功した復元で、そのまま `restored` イベントの値になる（#87、ADR 0087）
+ */
 internal data class TimeJump(
     /** 実時間の飛び（ナノ秒） */
     val realtimeNanos: Long,

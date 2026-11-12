@@ -285,6 +285,9 @@ fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir
             sources.from(fileTree(file.resolveSibling(name)) { include("**/*.zig") })
             // シェルは構文の入れ子・関数の呼び出しで深く再帰するので、スタックを大きくする（触るまで RAM に数えない）
             if (dir == "bin" && name == "sh") stackSize = 256 * 1024
+            // `export fn`（`kibi.events` の `cabi_realloc`。#87）を出す。Zig は WASM の実行ファイルで `_start` のほかを export しないため。
+            // 出るのは、プログラムが参照して解析された `export fn` だけ（events を使わないプログラムには何も足されない）
+            compilerArgs.add("-rdynamic")
             modules.put("kibi", osLibrary.file("kibi.zig").asFile)
             outputPath = "$name.wasm"
         }

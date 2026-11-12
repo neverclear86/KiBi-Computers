@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
 import pro.ikili.kibicomputers.core.kernel.fd.STDIN
@@ -889,7 +890,7 @@ public class Machine private constructor(
      */
     internal fun completeRestore(prepared: PreparedRestore): Boolean = lock.withLockValue {
         if (!restoringValue || restoreCancelled || scheduler.isClosed) return@withLockValue false
-        try {
+        val jump = try {
             installRestoredLocked(prepared)
         } catch (t: Throwable) {
             // 後段に入った後の失敗は、前段の失敗（restoreFellBack。表が空のはず）に流さない: 先に印を下ろす
@@ -906,6 +907,11 @@ public class Machine private constructor(
         // 前段が終わった: 取り消しの登録を外す（待っている読み込みはないので、登録は何もしない。#587）
         restoreCancelSignal.complete(Unit)
         setStateLocked(MachineState.RUNNING, null)
+        // 「保存から戻った」を知らせる（#87、ADR 0087）。索引と待ちを戻した後なので、戻したキューに届き、待っているプロセスが起きる。
+        // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
+        // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
+        val values = listOf(EventValue.Integer(jump.realtimeNanos), EventValue.Integer(jump.worldTicks))
+        kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
         true
     }
@@ -960,9 +966,9 @@ public class Machine private constructor(
 
     /**
      * 前段で作ったものを表に入れ、実行時の部分を作る（#85、ADR 0085。カーネルロックの中）。表は空のはず。
-     * プロセスの割り当ては、復元の [quiesce] を閉じるまで止まっている
+     * プロセスの割り当ては、復元の [quiesce] を閉じるまで止まっている。時計の飛び（[restoreClocks] の結果）を返す（`restored` イベントの値。#87）
      */
-    private fun installRestoredLocked(prepared: PreparedRestore) {
+    private fun installRestoredLocked(prepared: PreparedRestore): TimeJump {
         val d = prepared.decoded.kernel
         check(kernel.processes.size == 0 && kernel.mounts.entries.isEmpty() && kernel.consoleTtyId == 0 && runtimes.isEmpty()) {
             "空でない表には戻さない"
@@ -975,7 +981,7 @@ public class Machine private constructor(
         kernel.fuel = minOf(d.fuel, config.fuelPerTick)
         kernel.consoleTtyId = d.consoleTtyId
         kernel.initPid = d.initPid
-        restoreClocks(d.clocks)
+        val jump = restoreClocks(d.clocks)
         scheduler.hooks.duringRestoreInstall?.invoke(this)
         for ((rt, instance) in prepared.runtimes) {
             val process = kernel.processes[rt.pid]
@@ -1007,6 +1013,7 @@ public class Machine private constructor(
                 else -> throw IllegalStateException("pid ${process.pid} の状態 ${process.state} は戻せない")
             }
         }
+        return jump
     }
 
     private fun registerRestoredWaitLocked(rt: ProcessRuntime, keys: List<WaitKey>) {
@@ -1919,7 +1926,8 @@ public class Machine private constructor(
     /**
      * [snapshot] の時点から単調時計と経過時間が続くように決め直し、動いているタイマーの予定を入れ直す（復元。#81）。
      * タイマーの期限は単調時計で持つので、止まっていた間の分は進まない（残りの時間から続く）。
-     * 実時間とゲーム内時間がどれだけ飛んだかを返す（イベントにするのは #87）。どのスレッドから呼んでもよい
+     * 実時間とゲーム内時間がどれだけ飛んだかを返す。イベント（`restored`。#87、ADR 0087）にするのは呼び手の [completeRestore] で、
+     * ここでは出さない。どのスレッドから呼んでもよい
      */
     internal fun restoreClocks(snapshot: ClockSnapshot): TimeJump = lock.withLockValue {
         val jump = kernel.clocks.restore(snapshot, environment.clock, scheduler.now)

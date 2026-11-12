@@ -676,6 +676,35 @@ fn readByte() ?u8 {
     }
 }
 
+/// 「保存から戻った」を受け取るキュー（#87。[readLine] の間だけ開く。開けなければ null で、入力だけを待つ）
+var restored: ?kibi.events.Queue = null;
+
+fn closeRestored() void {
+    if (restored) |q| q.close();
+    restored = null;
+}
+
+/// キーの境目で 1 バイト読む。読む前に、入力か「保存から戻った」を待ち、戻ったら行を描き直してまた待つ（#87、ADR 0087）。
+/// 戻した直後の画面は空のことが多い（表示のデバイスは保存しない。#630）ので、プロンプトと入力中の行を出し直す。
+/// 描き直しは [refresh] だけで行う（画面が残っていても、相対の描き直しなら崩れない）
+fn readKeyByte() ?u8 {
+    while (restored) |q| {
+        const ready = kibi.events.waitInputOrQueue(IN, q) catch {
+            closeRestored();
+            break;
+        };
+        if (ready.queue) {
+            const redraw = q.drainRestored() catch {
+                closeRestored();
+                break;
+            };
+            if (redraw) refresh();
+        }
+        if (ready.input) break;
+    }
+    return readByte();
+}
+
 const Key = enum { none, up, down, left, right, home, end, delete, word_left, word_right };
 
 /// `ESC [` の後を読んで、キーにする
@@ -824,6 +853,8 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     const restore = if (saved.canonical) saved else tty.Mode.cooked;
     tty.setMode(IN, .{ .nl_to_crnl = true }) catch {};
     defer tty.setMode(IN, restore) catch {};
+    restored = kibi.events.openRestored();
+    defer closeRestored();
 
     prompt = p;
     len = 0;
@@ -839,7 +870,8 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     var utf8_rest: usize = 0;
     var utf8_start: usize = 0;
     while (true) {
-        const c = readByte() orelse {
+        // UTF-8 の続き・エスケープシーケンスの途中（readEscape・readCsi）は、従来どおり入力だけを読む
+        const c = (if (utf8_rest > 0) readByte() else readKeyByte()) orelse {
             finishLine("");
             return .eof;
         };
