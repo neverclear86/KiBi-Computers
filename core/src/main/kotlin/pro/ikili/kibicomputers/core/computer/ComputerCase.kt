@@ -60,6 +60,8 @@ public enum class ComputerError {
  * - 動いている間に起動に要る部品が抜けた・電源を入れたときにあったディスクが抜けた（[partsChanged]）・
  *   電力が尽きた（[powerLost]）ら、マシンを止める
  * - マシンが [MachineState.CRASHED] になったら [ComputerStatus.ERROR]（[ComputerError.CRASHED]）
+ * - ゲストが止めた（再起動の途中でない [MachineState.STOPPED]。`poweroff`・init の終了）ら、[turnOff] と同じく
+ *   マシンを外して [ComputerStatus.OFF] にする（#640）
  * - ブロックエンティティの `onChunkUnloaded`・`setRemoved` で [chunkUnloaded]・[removed] を呼ぶ（[MachineSlot] と同じ）。
  *   どちらも状態を [ComputerStatus.OFF] にする
  *
@@ -382,7 +384,8 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * マシンの状態が変わった（[MachineHost.onStateChanged]）。今のマシンが CRASHED になったらエラーにして電源を切り、
-     * ゲストが止めた（再起動の途中でない STOPPED）なら電源を切る（#85。状態の表示は変えない）
+     * ゲストが止めた（再起動の途中でも起動の途中でもない STOPPED）なら、[turnOff] と同じくマシンを外して
+     * [ComputerStatus.OFF] にする（#85・#640）。外したマシンは閉じる（[MachineSlot.removed]）
      */
     internal fun onMachineStateChanged(machine: Machine, state: MachineState) {
         if (machine !== slot.machine) return
@@ -392,7 +395,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
                 fail(ComputerError.CRASHED)
                 setPoweredOn(false)
             }
-            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) setPoweredOn(false)
+            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) turnOff()
             else -> {}
         }
     }

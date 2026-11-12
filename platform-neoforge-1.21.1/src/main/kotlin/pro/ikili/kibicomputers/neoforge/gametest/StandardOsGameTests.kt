@@ -6,6 +6,7 @@ import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -21,12 +22,15 @@ import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.DiskItem
 import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.MachineKey
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
 import java.nio.file.Path
@@ -86,6 +90,67 @@ object StandardOsGameTests {
         val id = DiskItem.diskIdOf(case.parts.getStackInSlot(case.tier.firstSlot(PartKind.STORAGE)))
         helper.assertTrue(id != null, "the disk should get an ID")
         return store!!.directoryOf(id!!)!!
+    }
+
+    /**
+     * 標準 OS の `reboot` では、ケースの GUI（[CaseMenu.status]）は RUNNING のままで、同じマシンが起動し直す。
+     * `shutdown now` では、GUI が OFF になり、ケースはマシンを外し、キーボードも放す。電源ボタンを1回押せば、また起動する（#640）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun guestShutdownTurnsCaseOffButRebootKeepsRunning(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val player = helper.makeMockPlayer(GameType.SURVIVAL)
+        val menu = CaseMenu.server(0, player.inventory, case)
+        val key = MachineKey.of(helper.level, helper.absolutePos(CASE))
+        val machine = case.computer.machine!!
+        val booting = "kibi: booting from disk ${TestComputerWiring.OS_BOOT_DISK}"
+        var step = 0
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            when (step) {
+                0 -> {
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                    typeLine(helper, keyboard, "clear")
+                    step = 1
+                    helper.fail("typed clear")
+                }
+                1 -> {
+                    // 画面を消してから再起動し、起動の行がまた出るのを待つ
+                    helper.assertTrue(text.none { it == booting } && text.any { it == "$" }, "the screen should be cleared: $text")
+                    typeLine(helper, keyboard, "reboot")
+                    step = 2
+                    helper.fail("typed reboot")
+                }
+                2 -> {
+                    helper.assertTrue(menu.status == ComputerStatus.RUNNING, "reboot should keep the case running but was ${menu.status}")
+                    helper.assertTrue(case.computer.machine === machine, "reboot should keep the same machine")
+                    helper.assertTrue(text.any { it == booting }, "the machine should boot again: $text")
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown again: $text")
+                    helper.assertTrue(case.computer.poweredOn, "reboot should keep the power on")
+                    typeLine(helper, keyboard, "shutdown now")
+                    step = 3
+                    helper.fail("typed shutdown now")
+                }
+                3 -> {
+                    helper.assertTrue(menu.status == ComputerStatus.OFF, "shutdown should turn the case off but was ${menu.status}")
+                    helper.assertTrue(case.computer.machine == null, "the case should release the machine")
+                    helper.assertTrue(ServerMachines.current!![key] == null, "the manager should drop the machine")
+                    helper.assertTrue(!case.computer.poweredOn, "the power should be off")
+                    helper.assertTrue(keyboard.owner == null, "the keyboard should be released")
+                    helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+                    // 1回押せば起動する
+                    helper.assertTrue(menu.clickMenuButton(player, CaseMenu.POWER_BUTTON), "power button should be handled")
+                    helper.assertTrue(menu.status == ComputerStatus.RUNNING, "one press should boot again but was ${menu.status}")
+                    val next = case.computer.machine
+                    helper.assertTrue(next != null && next !== machine, "a new machine should be created")
+                    helper.assertTrue(ServerMachines.current!![key] === next, "the manager should hold the new machine")
+                    case.pressPowerButton()
+                    helper.setBlock(CASE, Blocks.AIR)
+                }
+            }
+        }
     }
 
     /**

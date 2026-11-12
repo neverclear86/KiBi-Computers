@@ -21,7 +21,11 @@ import pro.ikili.kibicomputers.core.computer.MachineSpecs
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.computer.RestoreReady
+import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
+import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
@@ -78,8 +82,26 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** テスト用コンピューターの仮の結線（#307）。#129・#99 ができたら置き換える */
     internal val wiring: TestComputerWiring = TestComputerWiring()
 
+    /**
+     * マシンからの通知を [wiring] に中継する。ケース（[computer]）が自分の判断でマシンを外した（CRASHED・ゲストが止めた。#640）
+     * ときは、結線も外す（キーボードの持ち主・画面の listener を残さない）。外すかどうかは [ComputerCase] が決め、ここでは結果
+     * （[ComputerCase.machine] が `null`）だけを見る。[ComputerCase] は自分の処理の後に呼ぶので、このときにはもう外れている
+     */
+    private val machineEvents = object : MachineHost {
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
+            wiring.onStateChanged(machine, state, cause)
+            if (computer.machine == null && wiring.connectedMachine === machine) wiring.disconnect()
+        }
+
+        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) = wiring.onConsoleOutput(machine, bytes)
+
+        override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) = wiring.onBootFailed(machine, failure, detail)
+
+        override fun onRebootRequested(machine: Machine) = wiring.onRebootRequested(machine)
+    }
+
     /** 電源と状態。サーバーでだけ動く（クライアントでは常に [ComputerStatus.OFF]） */
-    val computer: ComputerCase<MachineKey> = ComputerCase(tier, wiring) { setChanged() }
+    val computer: ComputerCase<MachineKey> = ComputerCase(tier, machineEvents) { setChanged() }
 
     /**
      * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[TestComputerWiring.OS_BOOT_DISK]）。
