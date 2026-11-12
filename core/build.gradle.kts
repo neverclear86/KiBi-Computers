@@ -278,6 +278,10 @@ val osDir = rootProject.layout.projectDirectory.dir("os")
 val osLibrary = osDir.dir("lib/kibi")
 val osLibrarySources = fileTree(osLibrary) { include("**/*.zig") }
 
+// `kibi.events`（`cabi_realloc` を export する必要がある）を使うプログラム。使うものを足したら、ここにも足す
+// （足し忘れると、読み込みで NOEXEC になる。`StandardOsRestoreTest` が検出する）
+val osEventsPrograms = mapOf("bin" to setOf("sh", "nano"))
+
 // `os/<dir>/` の `.zig` を1つずつ WASM にする（sourceSet が null ならリソースに入れない）
 fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir(dir).asFile
     .listFiles { f -> f.isFile && f.name.endsWith(".zig") }.orEmpty()
@@ -291,6 +295,9 @@ fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir
             sources.from(fileTree(file.resolveSibling(name)) { include("**/*.zig") })
             // シェルは構文の入れ子・関数の呼び出しで深く再帰するので、スタックを大きくする（触るまで RAM に数えない）
             if (dir == "bin" && name == "sh") stackSize = 256 * 1024
+            // `kibi.events` を使うプログラムだけ、`cabi_realloc`（#87）を export する。Zig は WASM の実行ファイルで `_start` のほかを
+            // export しないため。`-rdynamic` は可変グローバル `__stack_pointer` まで全プログラムに足すので使わない
+            if (dir in osEventsPrograms.keys && name in osEventsPrograms.getValue(dir)) compilerArgs.add("--export=cabi_realloc")
             modules.put("kibi", osLibrary.file("kibi.zig").asFile)
             outputPath = "$name.wasm"
         }

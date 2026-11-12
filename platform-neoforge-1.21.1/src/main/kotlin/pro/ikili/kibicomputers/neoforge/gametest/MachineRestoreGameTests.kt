@@ -151,6 +151,53 @@ object MachineRestoreGameTests {
         }.thenSucceed()
     }
 
+    /**
+     * 戻すと、キーを打つ前にシェルがプロンプトと入力中の行を描き直す（`restored` イベント。#87、ADR 0087）。画面も置き直して
+     * （ワールドを読み込み直したときと同じく、表示は空から始まる）、描き直しが前の画面の残りでないことを確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoredShellRedrawsThePrompt(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            // 確定しない入力（Enter を押さない）
+            for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.Text("echo pending")))) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
+            }
+        }.thenWaitUntil {
+            val text = lines(first.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the typed text should be shown: $text")
+        }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            helper.setBlock(SCREEN, Blocks.AIR)
+            helper.setBlock(
+                SCREEN,
+                KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+            )
+            copy = reload(helper, tag)
+        }.thenWaitUntil {
+            val be = copy!!
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
+            val screen = be.wiring.connectedScreen
+            helper.assertTrue(screen != null, "the screen should be connected after restoring")
+            val text = lines(screen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line without a key: $text")
+        }.thenExecute {
+            val events = listOf(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+            for (packet in KeyboardEventCodec.encode(events)) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
+            }
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "pending" }, "the restored shell should run the redrawn line: $text")
+        }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
     /** 電源を切った台の NBT は PoweredOn が偽で、置き直しても戻さない。タグのない古いセーブデータも電源が切れている */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)

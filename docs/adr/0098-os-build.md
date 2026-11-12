@@ -69,6 +69,7 @@ import は自分で宣言し、構造体の配置は `comptime` で確かめる�
 - `Child.wait` は `poll_oneoff` の FD_READ で待ってから `status` で受け取る（ADR 0074 の Q1-A）。待つ間は待機点になる
 - 引数・環境変数は 64 KiB（カーネルの上限と同じ。#101 で 16 KiB から上げた）・4,096 個まで（足りなければ `TOOBIG`）。`spawn` に渡す引数も 4,096 個まで（`argv[0]` を含む。どちらもカーネルの上限に合わせた。#101 で 64 → 256、#501 で 256 → 4,096）。数に比例する表と `spawn` の写しは静的に置く（スタックに置くと 64 KiB のスタックをはみ出すため）。パスは 4,096 バイトまで（`NAMETOOLONG`）
 - まだ出していないもの: `kibi:kernel/events`・`kibi:kernel/timers`・`kibi:computer/clock`・`get-cwd`（`cabi_realloc` の export が要る）。使うプログラムができたときに足す
+  - 追記（#87）: `kibi:kernel/events` を `events.zig`（`kibi.events`）で出した。`cabi_realloc` は 8 KiB の静的な領域から切り出すだけのもので、`take` は1回に1件だけ取り出す。`kibi.events` を使うプログラム（`sh`・`nano`）だけを `--export=cabi_realloc` でビルドして `cabi_realloc` を export する（`core/build.gradle.kts` の `osEventsPrograms`。ほかのプログラムの export は `memory`・`_start` のまま。`-rdynamic` は `__stack_pointer` まで全プログラムに足すので使わない）。`keys.Reader.idle()` も足した（ADR 0087）
 
 ABI（import の名前と形）は既存の ADR 0070〜0075・0408・0427 のまま。新しいシステムコールは足していない。
 

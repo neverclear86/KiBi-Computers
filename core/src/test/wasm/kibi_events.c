@@ -1,6 +1,8 @@
 // 独自拡張 kibi:kernel/events（#73）の p1 の import を確かめる CLI。WasiP1KibiTest が動かす。
 //
 //   kibi-events wait [close]   開く → poll で待つ → 取り出して標準出力に出す → [resource-drop]（close なら fd_close）で閉じる
+//   kibi-events restored       "restored" だけを受けるキューを開き、poll で待つ。起きたら「woke」を出してから取り出して出す（#87。復元で起きる確認）。
+//                              最後に標準入力を待って生きたままにする。引数なしで /sbin/init として起動したときも同じ
 //   kibi-events invalid        不正な入力ごとの error-code を出す（"inval ..." の行）
 //   kibi-events max            max に 0・1・2^31・2^32-1 を渡したときの結果を出す（"max ..." の行）
 //   kibi-events spin           wait と同じだが、取り出すときの cabi_realloc の中で重い計算をする
@@ -129,6 +131,33 @@ static int run_wait(int close_with_fd_close) {
     return 0;
 }
 
+static int run_restored(void) {
+    kibi_string_t kinds[1] = {str("restored")};
+    int32_t q = open_queue(kinds, 1, 1, 8);
+    if (q < 0) {
+        printf("open failed %d\n", -1 - q);
+        return 1;
+    }
+    printf("opened\n");
+    struct pollfd pfd = {.fd = q, .events = POLLIN};
+    if (poll(&pfd, 1, -1) != 1 || !(pfd.revents & POLLIN)) {
+        printf("poll failed\n");
+        return 1;
+    }
+    printf("woke\n");
+    kibi_result_event_batch_t r;
+    kibi_event_queue_take_raw(q, 16, &r);
+    if (r.is_err) {
+        printf("take failed %u\n", r.val.err);
+        return 1;
+    }
+    print_batch(&r.val.ok);
+    printf("done\n");
+    char c;
+    (void)read(0, &c, 1);
+    return 0;
+}
+
 static int run_invalid(void) {
     static kibi_string_t many[17];
     for (int i = 0; i < 17; i++) many[i] = str("k");
@@ -235,6 +264,8 @@ static int run_misaligned(uint32_t len) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    // init（argv は ["/sbin/init"] だけ）として起動したら restored と同じ（#87。冷えた起動の後に開いたキューを確かめる）
+    if (argc == 1 && strcmp(argv[0], "/sbin/init") == 0) return run_restored();
     if (argc < 2) return 2;
     const char *mode = argv[1];
     if (strcmp(mode, "wait") == 0) return run_wait(argc > 2 && strcmp(argv[2], "close") == 0);
@@ -242,6 +273,7 @@ int main(int argc, char **argv) {
         realloc_mode = MODE_SPIN;
         return run_wait(0);
     }
+    if (strcmp(mode, "restored") == 0) return run_restored();
     if (strcmp(mode, "invalid") == 0) return run_invalid();
     if (strcmp(mode, "max") == 0) return run_max();
     if (strcmp(mode, "realloc-poll") == 0) return run_in_realloc(MODE_POLL);

@@ -1,0 +1,366 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
+import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.event.EventFilter
+import pro.ikili.kibicomputers.core.kernel.event.EventQueue
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
+import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.time.ManualClock
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineIdIndex
+import pro.ikili.kibicomputers.core.persist.MachineIdentity
+import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.RestoreRequest
+import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import java.nio.file.Path
+import java.time.Duration
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+
+/**
+ * 復元のイベント `restored`（#87、ADR 0087）: 成功した復元で、戻したキューに1件ずつ届き、値は実時間・ゲーム内時間の飛び。
+ * 戻せなかったとき（後段の失敗・冷えた起動・取り消し）には出さない。受け手が返るまでプロセスは動かない
+ */
+class RestoreEventTest {
+    @TempDir
+    lateinit var dir: Path
+
+    private val limit = Duration.ofSeconds(120)
+    private val owner = MachineOwner("minecraft:overworld", 0, 64, 0)
+
+    private fun resource(name: String): ByteArray =
+        requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
+
+    private fun bootConfig(): BootConfig = BootConfig.builder().addBootDisk("none").build()
+
+    private fun env(clock: ManualClock): MachineEnvironment = MachineEnvironment.builder().clock(clock).build()
+
+    /** 戻したマシンのキューの中身（フィルターが全部なら "all"、そうでなければ種類の並び） */
+    private fun queues(m: Machine): Map<String, List<KernelEvent>> = m.lock.withLockValue {
+        val out = LinkedHashMap<String, List<KernelEvent>>()
+        m.kernel.objects.forEachObject { obj ->
+            if (obj is EventQueue) out[if (obj.filter.acceptsAll) "all" else obj.filter.types.joinToString(",")] = obj.pendingEvents()
+        }
+        out
+    }
+
+    private fun restored(realtime: Long, world: Long): KernelEvent =
+        KernelEvent(RestoreEvents.TYPE, "", listOf(EventValue.Integer(realtime), EventValue.Integer(world)))
+
+    /**
+     * `prompt` を動かし、全部を受けるキューと `restored` だけを受けるキュー（と、[extra] の種類だけを受けるキュー）を持たせて、
+     * 入力を待ったところで書く
+     */
+    private fun save(
+        h: Harness,
+        store: MachineSaveStore,
+        clock: ManualClock,
+        extra: String = "timer",
+        program: String = "prompt-wasi.wasm",
+        args: List<String> = emptyList(),
+        harnessQueues: Boolean = true,
+    ): MachineIdentity {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 10_000_000, environment = env(clock))
+        val bytes = resource(program)
+        m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
+        m.vfs.createDirectory(VfsPath.parse("/bin"))
+        val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
+        m.vfs.write(f, bytes, 0, bytes.size)
+        val (input, output) = m.lock.withLockValue {
+            ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
+        }
+        val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+        val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt") + args, stdio = stdio))
+        m.lock.withLockValue {
+            m.kernel.initPid = pid
+            if (harnessQueues) {
+                m.openEventQueueLocked(pid, EventFilter.ALL, 64)
+                m.openEventQueueLocked(pid, EventFilter(setOf(RestoreEvents.TYPE)), 64)
+                m.openEventQueueLocked(pid, EventFilter(setOf(extra)), 64)
+            }
+        }
+        eventually(60_000, "入力を待たない") {
+            h.scheduler.tick()
+            m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
+        }
+        val identity = store.assignNewId(owner)!!
+        val written = store.write(identity, owner, m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
+        m.close()
+        return written
+    }
+
+    private class Result(
+        val outcome: RestoreOutcome,
+        val inListener: Map<String, List<KernelEvent>>,
+        val quiesced: Boolean,
+        val probe: Any? = null,
+    )
+
+    /** [identity] を時計 [clock] のマシンに戻し、受け手の中で見たキューの中身を返す。戻したマシンは [keep] に渡す */
+    private fun restore(
+        h: Harness,
+        store: MachineSaveStore,
+        identity: MachineIdentity,
+        clock: ManualClock,
+        probe: ((Machine) -> Any?)? = null,
+        keep: (Machine) -> Unit = { it.close() },
+    ): Result {
+        val m = h.machine(fuelPerTick = 10_000_000, environment = env(clock))
+        val results = Collections.synchronizedList(ArrayList<Result>())
+        val errors = Collections.synchronizedList(ArrayList<Throwable>())
+        val listener = RestoreListener { machine, outcome, _ ->
+            try {
+                results += Result(outcome, queues(machine), machine.isQuiesced, probe?.invoke(machine))
+            } catch (t: Throwable) {
+                errors += t
+            }
+        }
+        assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), listener)))
+        eventually(60_000, "復元が終わらない") {
+            h.scheduler.tick()
+            results.isNotEmpty() || m.state == MachineState.CRASHED
+        }
+        errors.firstOrNull()?.let { throw AssertionError("受け手の中で落ちた", it) }
+        keep(m)
+        return results.singleOrNull() ?: Result(RestoreOutcome.CANCELLED, emptyMap(), false)
+    }
+
+    private fun jumpCase(before: ManualClock, after: ManualClock, realtime: Long, world: Long) = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(h, store, before)
+            val r = restore(h, store, saved, after)
+            assertEquals(RestoreOutcome.RESTORED, r.outcome)
+            assertTrue(r.quiesced, "受け手の中は止めたまま")
+            val expected = listOf(restored(realtime, world))
+            assertEquals(expected, r.inListener["all"], "全部を受けるキュー")
+            assertEquals(expected, r.inListener[RestoreEvents.TYPE], "restored だけを受けるキュー")
+            assertEquals(emptyList<KernelEvent>(), r.inListener["timer"], "ほかの種類だけを受けるキューには届かない")
+        }
+    }
+
+    @Test
+    fun `成功した復元で、実時間とゲーム内時間の飛びを1件ずつ届ける`() = jumpCase(
+        ManualClock(realtime = 1_000_000_000L, world = 100),
+        ManualClock(monotonic = 5L, realtime = 6_000_000_000L, world = 1_300),
+        realtime = 5_000_000_000L,
+        world = 1_200,
+    )
+
+    @Test
+    fun `飛びが0でも届ける`() = jumpCase(
+        ManualClock(realtime = 42L, world = 7),
+        ManualClock(realtime = 42L, world = 7),
+        realtime = 0,
+        world = 0,
+    )
+
+    @Test
+    fun `時計が戻ったときは負の値をそのまま届ける`() = jumpCase(
+        ManualClock(realtime = 9_000L, world = 500),
+        ManualClock(realtime = 1_000L, world = 20),
+        realtime = -8_000,
+        world = -480,
+    )
+
+    @Test
+    fun `あふれる飛びは飽和した値で届ける`() = jumpCase(
+        ManualClock(realtime = Long.MAX_VALUE, world = Long.MIN_VALUE),
+        ManualClock(realtime = Long.MIN_VALUE, world = Long.MAX_VALUE),
+        realtime = Long.MIN_VALUE,
+        world = Long.MAX_VALUE,
+    )
+
+    @Test
+    fun `取り出さずにもう一度保存して戻すと2件になる`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(h, store, ManualClock(realtime = 100L, world = 1))
+            var second: MachineIdentity? = null
+            restore(h, store, saved, ManualClock(realtime = 300L, world = 4), keep = { m ->
+                eventually(60_000, "知らせの後も写せない") {
+                    h.scheduler.tick()
+                    m.saveReadiness() == SaveReadiness.READY && m.isAtWaitPoint
+                }
+                // 写しを取る時点の時計（実時間 300、ゲーム内 4）が、次の復元の起点になる
+                second = store.write(store.assignNewId(owner)!!, owner, m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
+                m.close()
+            })
+            val r = restore(h, store, second!!, ManualClock(realtime = 1_000L, world = 10))
+            assertEquals(RestoreOutcome.RESTORED, r.outcome)
+            assertEquals(listOf(restored(200, 3), restored(700, 6)), r.inListener[RestoreEvents.TYPE])
+        }
+    }
+
+    @Test
+    fun `表に入れる途中で失敗したときは出さない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(h, store, ManualClock())
+            var seen: Map<String, List<KernelEvent>>? = null
+            // 時計を戻した後（キューは表に入っている）で落とす
+            h.scheduler.hooks.duringRestoreInstall = { m ->
+                seen = queues(m)
+                throw IllegalStateException("テストの失敗")
+            }
+            val r = restore(h, store, saved, ManualClock(realtime = 9_999_999_999L), keep = { m ->
+                assertEquals(MachineState.CRASHED, m.state)
+                repeat(3) { h.scheduler.tick() }
+                assertTrue(queues(m).values.all { q -> q.none { it.type == RestoreEvents.TYPE } }, "CRASHED のマシンに restored が入った")
+                m.close()
+            })
+            assertEquals(RestoreOutcome.CANCELLED, r.outcome, "知らせは来ない")
+            assertTrue(seen!!.isNotEmpty(), "キューを表に入れる前に落ちた")
+            assertTrue(seen!!.values.all { it.isEmpty() }, "時計を戻した時点で出していた")
+        }
+    }
+
+    @Test
+    fun `冷えた起動になったときは出さず、起動したinitが開いたキューにも入らない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val modules = MemoryModuleStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h ->
+            val saved = save(h, store, ManualClock(realtime = 1_000L, world = 10))
+            // モジュールを置き場から消して、前段で戻せなくする（MODULE_MISSING で冷えた起動待ち）
+            modules.remove(pro.ikili.kibicomputers.core.persist.ModuleStore.sha256(resource("prompt-wasi.wasm")))
+            // 冷えた起動の init は、restored だけを受けるキューを開いて待つ（kibi-events を /sbin/init として起動）
+            val init = TestMemoryFileSystem().also { fs ->
+                val bytes = resource("kibi-events-wasi.wasm")
+                fs.createDirectory(VfsPath.parse("/sbin"))
+                val node = fs.createFile(VfsPath.parse(BootConfig.INIT_PATH))
+                fs.write(node, 0, bytes, 0, bytes.size)
+            }
+            h.scheduler.hooks.bootVolumes = BootVolumeOpener { id ->
+                when (id) {
+                    "root" -> BootVolume(TestMemoryFileSystem(), readOnly = false)
+                    "d" -> BootVolume(init, readOnly = false)
+                    else -> null
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = env(ManualClock(realtime = 9_000_000_000L, world = 500)))
+            val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
+            val listener = RestoreListener { machine, outcome, _ ->
+                outcomes += outcome
+                if (outcome == RestoreOutcome.COLD_BOOT) machine.coldBootAfterRestore()
+            }
+            val config = BootConfig.builder().addBootDisk("d").build()
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.id, saved.generation), config, listener)))
+            // init がキューを開いて待つまで回す
+            eventually(60_000, "init がキューを開いて待たない") {
+                h.scheduler.tick()
+                val pid = m.lock.withLockValue { m.kernel.initPid }
+                pid != 0 && m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint && queues(m).containsKey(RestoreEvents.TYPE)
+            }
+            assertEquals(listOf(RestoreOutcome.COLD_BOOT), outcomes.toList())
+            // 少し回しても、restored は届かない（init は起きず、キューは空のまま）
+            repeat(20) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+            }
+            val pid = m.lock.withLockValue { m.kernel.initPid }
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid), "init が起きた")
+            assertEquals(emptyList<KernelEvent>(), queues(m)[RestoreEvents.TYPE], "冷えた起動で restored を出した")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `取り消したときは出さない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(h, store, ManualClock(realtime = 1_000L, world = 10))
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            h.scheduler.hooks.beforeRestoreInstall = {
+                entered.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = env(ManualClock(realtime = 9_000_000_000L, world = 500)))
+            val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
+            val listener = RestoreListener { _, outcome, _ -> outcomes += outcome }
+            assertTrue(m.restore(RestoreRequest(RestoreSource(store, saved.id, saved.generation), bootConfig(), listener)))
+            assertTrue(entered.await(60, TimeUnit.SECONDS), "後段の手前まで来ない")
+            m.stop()
+            release.countDown()
+            eventually(60_000, "取り消しの知らせが来ない") {
+                h.scheduler.tick()
+                outcomes.isNotEmpty()
+            }
+            repeat(5) { h.scheduler.tick() }
+            assertEquals(listOf(RestoreOutcome.CANCELLED), outcomes.toList())
+            assertEquals(MachineState.STOPPED, m.state)
+            assertTrue(queues(m).values.all { q -> q.none { it.type == RestoreEvents.TYPE } }, "取り消したのに restored を出した")
+            h.scheduler.hooks.beforeRestoreInstall = null
+            m.close()
+        }
+    }
+
+    /** 受け手の中で見たプロセスの様子（状態と、ストリームに書かれた中身） */
+    private class Observed(val state: ProcessState, val output: String)
+
+    private fun Machine.streamText(): String = lock.withLockValue {
+        val sb = StringBuilder()
+        kernel.objects.forEachObject { obj -> if (obj is ByteStream) sb.append(String(obj.availableBytes(), Charsets.UTF_8)) }
+        sb.toString()
+    }
+
+    @Test
+    fun `restoredを待っていたプロセスは起き、受け手が返るまで動かない`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = save(
+                h, store, ManualClock(realtime = 1_000L, world = 10),
+                program = "kibi-events-wasi.wasm", args = listOf("restored"), harnessQueues = false,
+            )
+            val r = restore(
+                h, store, saved, ManualClock(realtime = 1_000_501_000L, world = 110),
+                probe = { m ->
+                    val pid = m.lock.withLockValue { m.kernel.initPid }
+                    // 動けるなら、この間に起きて書いて待ちに戻るはずの時間を空ける。受け手の中なので、プロセスは割り当てられない
+                    Thread.sleep(300)
+                    Observed(m.stateOf(pid), m.streamText())
+                },
+                keep = { m ->
+                    // 受け手が返った後は動く: 取り出して出力する
+                    eventually(60_000, "起きて取り出さない: ${m.streamText()}") {
+                        h.scheduler.tick()
+                        "done\n" in m.streamText()
+                    }
+                    val text = m.streamText()
+                    assertTrue(text.startsWith("opened\nwoke\n"), text)
+                    assertTrue("event restored [] integer:1000500000 integer:100\n" in text, text)
+                    m.close()
+                },
+            )
+            assertEquals(RestoreOutcome.RESTORED, r.outcome)
+            val seen = r.probe as Observed
+            // 起こされている（RESTORED の受け手より前にイベントが入った）が、まだ1歩も進んでいない
+            assertEquals(ProcessState.RUNNABLE, seen.state, "受け手の中: 起きてはいるが割り当てられていない")
+            assertEquals("opened\n", seen.output, "受け手の中で書いた")
+        }
+    }
+}

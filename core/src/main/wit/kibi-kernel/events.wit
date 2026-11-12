@@ -5,6 +5,9 @@ package kibi:kernel@0.1.0;
 /// p1 では、`event-queue` のハンドルはカーネルの fd 番号。`poll_oneoff` の `FD_READ` で、イベントが届く（か、あふれて捨てた分がある）まで待てる。
 /// p2 の `pollable`・p3 の async での待ち方は、`wasi:io` に依存しないよう別の interface（`events-poll`・`events-async`。仮置き。ADR 0426）に置く。
 /// タイマー（`timers`）を作るときにキューを渡すと、鳴るたびに種類 "timer" のイベントが届く（ADR 0426）。
+/// 保存から戻るたびに、カーネルが種類 "restored"・source ""・値 [integer(実時間の飛び ns), integer(ゲーム内時間の飛び tick)]
+/// のイベントを1件出す（成功した復元だけ。飛びが 0・負でも出す。#87、ADR 0087）。意味は「保存から戻った」だけで、画面が空とは約束しない。
+/// デバイスも同じ種類名を出せるので、カーネルのものは source "" で見分ける。
 interface events {
     use types.{error-code};
 

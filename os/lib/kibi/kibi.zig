@@ -4,8 +4,11 @@
 //! Zig の標準ライブラリの高い層（`std.Io`・アロケーター）は版ごとに形が変わり、大きさも増えるので使わない。
 //! バッファは静的に置く（.bss はゼロなので、触るまで RAM に数えない。#407）。
 //!
-//! 出していないもの（使うプログラムができたときに足す）: `kibi:kernel/events`・`kibi:kernel/timers`・
-//! `kibi:computer/clock`・`get-cwd`（cabi_realloc の export が要る。cwd は `fs.cwd()` が `PWD` から持つ）。
+//! `kibi:kernel/events`（`events`。#87）を使うプログラムは、`cabi_realloc` も export する（静的な領域から切り出すだけ。
+//! `core/build.gradle.kts` の `osEventsPrograms` に足したプログラムだけに出る）。
+//!
+//! 出していないもの（使うプログラムができたときに足す）: `kibi:kernel/timers`・
+//! `kibi:computer/clock`・`get-cwd`（cwd は `fs.cwd()` が `PWD` から持つ）。
 
 pub const wasi = @import("wasi.zig");
 pub const errno = @import("errno.zig");
@@ -20,5 +23,6 @@ pub const tree = @import("tree.zig");
 pub const stack = @import("stack.zig");
 pub const text = @import("text.zig");
 pub const keys = @import("keys.zig");
+pub const events = @import("events.zig");
 
 pub const Error = errno.Error;

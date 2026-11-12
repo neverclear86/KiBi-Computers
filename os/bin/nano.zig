@@ -7,7 +7,7 @@
 //! 決めごと（キーの表・画面・上限・保存の手順・今の制限）は docs/adr/0105-nano.md。ソースは `os/bin/nano/` に分けている:
 //! `buffer.zig`（テキスト）、`view.zig`（表示）、`state.zig`（状態）。
 //!
-//! 待っている間は標準入力の読み込み（待機点）で止まるだけにする（時計で起きない）。
+//! 待っている間は標準入力の読み込み（待機点）か、標準入力と「保存から戻った」のキューの `poll_oneoff`（#87）で止まるだけにする（時計で起きない）。
 //! キーは読んだ分を全部処理してから、まとめて 1 回描く（貼り付けで 1 文字ごとに描かない）。
 const kibi = @import("kibi");
 const buffer = @import("nano/buffer.zig");
@@ -61,10 +61,50 @@ const help_shortcuts = [_]st.Shortcut{
     .{ .key = "PgDn", .label = "Next Page" },
 };
 
+/// 「保存から戻った」を受け取るキュー（#87。起動中ずっと開く。開けなければ null で、入力だけを待つ）
+var restored: ?kibi.events.Queue = null;
+
+fn closeRestored() void {
+    if (restored) |q| q.close();
+    restored = null;
+}
+
+/// 待ち・取り出しに失敗したキューを、閉じずに手放す（#87、ADR 0087）。失敗するのはハンドルが不正なとき（取り出しの BADF・
+/// poll のキュー側のエラー）だけで、不正なハンドルを drop するとトラップするので閉じない
+fn abandonRestored() void {
+    restored = null;
+}
+
+/// 読んだバイトが残っていなければ、入力か「保存から戻った」を待つ（#87、ADR 0087）。戻ったら、端末の設定（代替画面・折り返しなし）
+/// から出し直して全体を描き直し、また待つ（戻した直後の表示のデバイスは初期の状態のことが多い。#630）
+fn awaitInput() void {
+    while (restored) |q| {
+        if (!reader.idle()) return;
+        const ready = kibi.events.waitInputOrQueue(io.STDIN, q) catch {
+            abandonRestored();
+            return;
+        };
+        if (ready.queue) {
+            const redraw = q.drainRestored() catch {
+                abandonRestored();
+                return;
+            };
+            if (redraw) {
+                view.enter();
+                view.render();
+            }
+        }
+        if (ready.input) return;
+    }
+}
+
 /// 次のキー。読んだ分を処理し終えていたら、描いてから待つ
 fn nextKey() ?Key {
     if (eof) return null;
-    if (!reader.pending()) view.render();
+    if (!reader.pending()) {
+        view.render();
+        awaitInput();
+    }
     const k = reader.next();
     if (k == null) eof = true;
     return k;
@@ -800,6 +840,8 @@ pub fn main() u8 {
     defer tty.setMode(io.STDIN, saved) catch {};
     view.enter();
     defer view.leave();
+    restored = kibi.events.openRestored();
+    defer closeRestored();
 
     while (!quit) {
         const k = nextKey() orelse break;
