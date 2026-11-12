@@ -11,6 +11,7 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerError
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.device.DeviceInfo
@@ -380,6 +381,32 @@ object TestComputerGameTests {
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
+    }
+
+    /**
+     * マシンが CRASHED になったら、ケースはエラーにしてマシンを外し、結線も外れる（#640）。閉じたマシンをつないだまま残さず、
+     * キーボードの持ち主も画面の listener も残さない。マシンを実際に壊す手段が接続層にないので、ケースがマシンに渡す通知
+     * （[pro.ikili.kibicomputers.core.computer.ComputerCase.host]）に CRASHED を流して、通知の経路を確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun crashedMachineDisconnectsWiring(helper: GameTestHelper) {
+        val (case, screen, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        helper.assertTrue(case.wiring.connectedMachine === machine, "the machine should be connected")
+        helper.assertTrue(case.wiring.connectedScreen === screen, "the screen should be connected")
+        helper.assertTrue(keyboard.owner != null, "the keyboard should be owned by the machine")
+        case.computer.host.onStateChanged(machine, MachineState.CRASHED, null)
+        helper.assertTrue(case.computer.status == ComputerStatus.ERROR, "the case should show the error: ${case.computer}")
+        helper.assertTrue(case.computer.error == ComputerError.CRASHED, "the error should be CRASHED: ${case.computer.error}")
+        helper.assertTrue(case.computer.machine == null, "the case should release the crashed machine")
+        helper.assertTrue(!case.computer.poweredOn, "the case should not stay powered on")
+        helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+        helper.assertTrue(case.wiring.connectedScreen == null, "the screen should be detached")
+        helper.assertTrue(keyboard.owner == null, "the keyboard should be freed")
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
     }
 
     /**

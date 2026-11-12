@@ -121,7 +121,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     /** 動いているマシン。動いていなければ `null` */
     public val machine: Machine? get() = slot.machine
 
-    private val host = object : MachineHost {
+    /**
+     * このケースがマシンに渡す [MachineHost]。ケース自身の処理（CRASHED でエラーにする・ゲストが止めたら外す）をしてから、
+     * 渡された `events` に中継する。接続層のテストが、マシンを実際に壊さずに通知の経路を確かめるために公開している（#640）
+     */
+    public val host: MachineHost = object : MachineHost {
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
             onMachineStateChanged(machine, state)
             events?.onStateChanged(machine, state, cause)
