@@ -35,7 +35,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | `power` | 電源（停止・再起動。ADR 0306） | #306 |
-| `kibi:fs` | `mounts` | ディスクのマウント・アンマウント（p1・p2・p3 で共通。ADR 0056） | #56 |
+| `kibi:fs` | `mounts` | ディスクのマウント・アンマウント（p1・p2・p3 で共通。ADR 0056）、マウントとディスクの一覧 `list-mounts`・`list-disks`（`cabi_realloc` が要る。ADR 0453） | #56・#453 |
 | `kibi:network` | — | ソケット（`wasi:sockets` で足りなければ） | #76 |
 
 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）を使い、`kibi:*` には入れない。

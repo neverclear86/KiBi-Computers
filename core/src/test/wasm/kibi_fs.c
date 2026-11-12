@@ -7,6 +7,10 @@
 //   oob                 範囲外の文字列で mount（fault の判別子 + 1 が出る）
 //   long                4,097 バイトの point で mount（name-too-long）、4,097 バイトの source で mount（invalid）
 //   badutf8             UTF-8 でない source で mount（invalid）
+//   mounts              list-mounts を "m <point> <source> <kind> <ro> <id> <total> <used> <avail> <total-entries|-> <used-entries>" で出す
+//                       （usage が none なら数の代わりに "none"）。最後に "mounts <件数>"
+//   disks               list-disks を "d <source> <capacity> <max-entries> <mount-point|->" で出す。最後に "disks <件数>"
+//   mounts-realloc      list-mounts の cabi_realloc の中で、もう一度 list-mounts を呼ぶ（トラップしないはず。"mounts-realloc <外> <内>"）
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -15,6 +19,23 @@
 #include <unistd.h>
 
 #include "kibi_fs.h"
+
+static int realloc_list = 0;
+static long inner_list_len = -1;
+
+__attribute__((export_name("cabi_realloc")))
+void *cabi_realloc(void *ptr, size_t old_size, size_t align, size_t new_size) {
+    (void)ptr;
+    (void)old_size;
+    if (realloc_list) {
+        // 入れ子は1段だけ。書き出し（fd_write）は cabi_realloc の中では呼ばない
+        realloc_list = 0;
+        kibi_fs_list_mount_info_t inner;
+        kibi_fs_list_mounts(&inner);
+        inner_list_len = (long)inner.len;
+    }
+    return aligned_alloc(align < sizeof(void *) ? sizeof(void *) : align, new_size == 0 ? 1 : new_size);
+}
 
 static int result_of(const kibi_result_unit_t *r) {
     return r->is_err ? (int)r->err + 1 : 0;
@@ -63,6 +84,47 @@ int main(int argc, char **argv) {
         } else if (strcmp(op, "badutf8") == 0) {
             static const char bad[] = {'d', 'i', 's', 'k', ':', (char)0xff};
             printf("badutf8 %d\n", do_mount(bad, sizeof bad, "/mnt/x", 6, 0));
+        } else if (strcmp(op, "mounts") == 0) {
+            kibi_fs_list_mount_info_t list;
+            memset(&list, 0xAA, sizeof list);
+            kibi_fs_list_mounts(&list);
+            for (size_t j = 0; j < list.len; j++) {
+                const kibi_fs_mount_info_t *e = &list.ptr[j];
+                printf("m %.*s %.*s %u %u %u", (int)e->point.len, e->point.ptr, (int)e->source.len, e->source.ptr,
+                       (unsigned)e->kind, (unsigned)e->read_only, (unsigned)e->id);
+                if (e->usage_is_some) {
+                    printf(" %llu %llu %llu", (unsigned long long)e->usage.total_bytes, (unsigned long long)e->usage.used_bytes,
+                           (unsigned long long)e->usage.available_bytes);
+                    if (e->usage.total_entries_is_some) {
+                        printf(" %u", (unsigned)e->usage.total_entries);
+                    } else {
+                        printf(" -");
+                    }
+                    printf(" %u\n", (unsigned)e->usage.used_entries);
+                } else {
+                    printf(" none\n");
+                }
+            }
+            printf("mounts %zu\n", list.len);
+        } else if (strcmp(op, "disks") == 0) {
+            kibi_fs_list_disk_info_t list;
+            memset(&list, 0xAA, sizeof list);
+            kibi_fs_list_disks(&list);
+            for (size_t j = 0; j < list.len; j++) {
+                const kibi_fs_disk_info_t *e = &list.ptr[j];
+                printf("d %.*s %llu %u ", (int)e->source.len, e->source.ptr, (unsigned long long)e->capacity_bytes, (unsigned)e->max_entries);
+                if (e->mount_point_is_some) {
+                    printf("%.*s\n", (int)e->mount_point.len, e->mount_point.ptr);
+                } else {
+                    printf("-\n");
+                }
+            }
+            printf("disks %zu\n", list.len);
+        } else if (strcmp(op, "mounts-realloc") == 0) {
+            realloc_list = 1;
+            kibi_fs_list_mount_info_t outer;
+            kibi_fs_list_mounts(&outer);
+            printf("mounts-realloc %zu %ld\n", outer.len, inner_list_len);
         } else {
             printf("unknown %s\n", op);
             return 2;

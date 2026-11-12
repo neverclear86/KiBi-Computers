@@ -65,9 +65,11 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.HostFileBudget
+import pro.ikili.kibicomputers.core.kernel.vfs.MountEntry
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
@@ -2192,7 +2194,7 @@ public class Machine private constructor(
     // ---- ディスクの挿し抜きとマウント（#56、ADR 0056）。どれも実行時だけで、保存しない ----
 
     /**
-     * 今挿さっているディスクの表（識別子 → 挿し込み。挿した順）。変わらない表を差し替えるだけで、差し替えはカーネルロックの中
+     * 今挿さっているディスクの表（識別子 → 挿し込み。接続層が渡す順＝スロットの順）。変わらない表を差し替えるだけで、差し替えはカーネルロックの中
      * （[disksChanged]）。ロックを取らずに読むのは、開き手（[openerForCurrentDisks]）・取り消しの確かめ・[insertedDiskIds] だけ。
      * 最初の値は [MachineEnvironment.disks]
      */
@@ -2339,7 +2341,7 @@ public class Machine private constructor(
     /** 起動の段の予約 [claim] がまだ生きているか（ロックを自分で取る） */
     internal fun isPhaseClaimAlive(claim: DiskClaim): Boolean = lock.withLockValue { claimAliveLocked(claim) }
 
-    /** 起動の途中に `/mnt` へマウントする候補（今の表のうち、まだ扱っておらず、マウントも予約もしていないもの。挿した順） */
+    /** 起動の途中に `/mnt` へマウントする候補（今の表のうち、まだ扱っておらず、マウントも予約もしていないもの。表の順＝スロットの順） */
     internal fun bootMountCandidates(): List<String> = lock.withLockValue {
         inserted.values.filter {
             !it.handled && kernel.mounts.bySource(diskSource(it.diskId)) == null && !diskClaims.containsKey(it.diskId)
@@ -2472,7 +2474,13 @@ public class Machine private constructor(
 
     private fun disksChangedLocked(disks: DiskSnapshot): Boolean {
         val old = inserted
-        if (old.keys == disks.disks.keys) return false
+        if (old.keys == disks.disks.keys) {
+            // 同じ組み合わせのまま並び（スロット）だけ変わったら、挿し込みはそのままに並びだけ直す（list-disks の順。#453）
+            if (old.keys.toList() != disks.disks.keys.toList()) {
+                inserted = LinkedHashMap<String, Insertion>().also { map -> for (diskId in disks.disks.keys) map[diskId] = old.getValue(diskId) }
+            }
+            return false
+        }
         val next = LinkedHashMap<String, Insertion>()
         for ((diskId, disk) in disks.disks) next[diskId] = old[diskId] ?: Insertion(diskId, disk)
         val removed = old.values.filter { next[it.diskId] !== it }
@@ -2669,6 +2677,43 @@ public class Machine private constructor(
     }
 
     private fun diskSource(diskId: String): String = MachineLimits.DISK_SOURCE_PREFIX + diskId
+
+    // ---- マウントとディスクの一覧（#453、ADR 0453） ----
+
+    /** ロックの中で写したマウント1つと、そのファイルシステム（つながっていなければ `null`）。容量はロックの外で読む */
+    internal class MountRef(val entry: MountEntry, val fs: FileSystem?)
+
+    /** マウントの表の写し（足した順。カーネルロックの中）。表の実体は外へ出さない */
+    internal fun listMountsLocked(): List<MountRef> = kernel.mounts.entries.map { MountRef(it, vfs.fileSystemLocked(it.id)) }
+
+    /** 挿さっているディスクの写し（スロットの順。カーネルロックの中）。ディスクは開かない */
+    internal fun listDisksLocked(): List<DiskListing> = inserted.values.map {
+        DiskListing(it.diskId, it.disk.capacityBytes, it.disk.maxEntries, kernel.mounts.bySource(diskSource(it.diskId))?.point?.toString())
+    }
+
+    /**
+     * マウントの一覧（`list-mounts`。足した順）。待たない。カーネルロックを持たずに呼ぶ（`cabi_realloc` の中からも呼べる）。
+     * ロックの中で表を写し、ロックを放してから各ファイルシステムの容量（[FileSystem.usage]。I/O なし）を読む。
+     * 読んだ後に、もう一度短くロックを取り、その間に外れたマウントの容量を `null` にする（外したファイルシステムの数を見せない）
+     */
+    internal fun listMounts(): List<MountListing> {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ったまま list-mounts を呼ばない" }
+        val refs = lock.withLockValue { listMountsLocked() }
+        val usages = refs.map { it.fs?.usage() }
+        val alive = lock.withLockValue { refs.map { kernel.mounts[it.entry.id] === it.entry && vfs.fileSystemLocked(it.entry.id) === it.fs } }
+        return refs.mapIndexed { i, r ->
+            MountListing(
+                id = r.entry.id,
+                point = r.entry.point.toString(),
+                source = r.entry.source,
+                readOnly = r.entry.readOnly || r.fs?.readOnly == true,
+                usage = if (alive[i]) usages[i] else null,
+            )
+        }
+    }
+
+    /** 挿さっているディスクの一覧（`list-disks`。スロットの順）。待たない。カーネルロックを短く取り、写してから放す */
+    internal fun listDisks(): List<DiskListing> = lock.withLockValue { listDisksLocked() }
 
     // ---- 起動・init の終わり・再起動（#49） ----
 

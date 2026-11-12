@@ -9,11 +9,13 @@ import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.device.DeviceLimits
 import pro.ikili.kibicomputers.core.device.PendingDeviceCall
+import pro.ikili.kibicomputers.core.kernel.DiskListing
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
+import pro.ikili.kibicomputers.core.kernel.MountListing
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
@@ -774,6 +776,10 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun unmount(point: String) {
             machine.unmountAt(VfsPath.resolve(lock.withLockValue { rt.process.cwd }, point))
         }
+
+        override fun listMounts(): List<MountListing> = machine.listMounts()
+
+        override fun listDisks(): List<DiskListing> = machine.listDisks()
 
         override fun spawn(program: Program, driver: ProcessDriver, options: SpawnOptions): Int =
             machine.spawn(program, driver, options, rt.pid)

@@ -13,7 +13,9 @@ import pro.ikili.kibicomputers.core.kernel.process.ExitReason
 import pro.ikili.kibicomputers.core.kernel.process.ExitStatus
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
+import pro.ikili.kibicomputers.core.kernel.vfs.FsUsage
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.tty.TtySizeInfo
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -607,5 +609,95 @@ class P1CanonicalTest {
         var n = 0
         val second = P1Canonical.Realloc { _, _ -> if (n++ == 1) 0x2002 else 0x1000 }
         assertThrows<WasmTrapException> { P1Canonical.lowerProcessListResult(m, second, 0x100, entries) }
+    }
+
+    @Test
+    fun `list_mount-infoはalign8の配列に72バイトずつ書き、usageのnoneと上限なしも書ける`() {
+        val m = FakeMemory(1)
+        val r = BumpRealloc()
+        val entries = listOf(
+            KibiFs.MountInfo("/", "disk:r", KibiFs.Kind.DISK, false, 1, FsUsage(0x1_0000_0002L, 3, 4, 5, 6)),
+            KibiFs.MountInfo("/tmp", "tmp", KibiFs.Kind.TMP, true, 2, FsUsage(10, 20, 30, null, 7)),
+            KibiFs.MountInfo("/x", "", KibiFs.Kind.DEV, false, 9, null),
+        )
+        P1Canonical.lowerMountListResult(m, r, 0x100, entries)
+        val listPtr = m.readI32(0x100)
+        assertEquals(3, m.readI32(0x104))
+        assertEquals(0, listPtr % 8)
+        fun at(i: Int) = listPtr + i * P1Canonical.MOUNT_INFO_SIZE
+        fun str(p: Int) = String(m.read(m.readI32(p), m.readI32(p + 4)), Charsets.UTF_8)
+        assertEquals("/", str(at(0)))
+        assertEquals("disk:r", str(at(0) + 8))
+        assertEquals(0, m.readU8(at(0) + 16))
+        assertEquals(0, m.readU8(at(0) + 17))
+        assertEquals(1, m.readI32(at(0) + 20))
+        assertEquals(1, m.readU8(at(0) + 24))
+        assertEquals(0x1_0000_0002L, m.readI64(at(0) + 32))
+        assertEquals(3L, m.readI64(at(0) + 40))
+        assertEquals(4L, m.readI64(at(0) + 48))
+        assertEquals(1, m.readU8(at(0) + 56))
+        assertEquals(5, m.readI32(at(0) + 60))
+        assertEquals(6, m.readI32(at(0) + 64))
+        // tmp: read-only・上限なし
+        assertEquals(2, m.readU8(at(1) + 16))
+        assertEquals(1, m.readU8(at(1) + 17))
+        assertEquals(0, m.readU8(at(1) + 56))
+        assertEquals(0, m.readI32(at(1) + 60))
+        assertEquals(7, m.readI32(at(1) + 64))
+        // usage が none なら、判別子より後ろは 0
+        assertEquals(3, m.readU8(at(2) + 16))
+        assertEquals(9, m.readI32(at(2) + 20))
+        assertArrayEquals(ByteArray(48), m.read(at(2) + 24, 48))
+        // 詰め物は 0
+        assertArrayEquals(ByteArray(2), m.read(at(0) + 18, 2))
+        assertArrayEquals(ByteArray(7), m.read(at(0) + 25, 7))
+        assertArrayEquals(ByteArray(3), m.read(at(0) + 57, 3))
+        assertArrayEquals(ByteArray(4), m.read(at(0) + 68, 4))
+        // cabi_realloc の順: 外側の配列 → 要素ごとに point → source（0 バイトでも呼ぶ）
+        assertEquals(listOf(8 to 72 * 3, 1 to 1, 1 to 6, 1 to 4, 1 to 3, 1 to 2, 1 to 0), r.calls)
+    }
+
+    @Test
+    fun `list_disk-infoはalign8の配列に32バイトずつ書き、mount-pointはsomeのときだけ場所を取る`() {
+        val m = FakeMemory(1)
+        val r = BumpRealloc()
+        val entries = listOf(
+            KibiFs.DiskInfo("disk:a", 0x1_0000_0000L, 64, "/mnt/a"),
+            KibiFs.DiskInfo("disk:b", 1024, 8, null),
+        )
+        P1Canonical.lowerDiskListResult(m, r, 0x100, entries)
+        val listPtr = m.readI32(0x100)
+        assertEquals(2, m.readI32(0x104))
+        assertEquals(0, listPtr % 8)
+        fun at(i: Int) = listPtr + i * P1Canonical.DISK_INFO_SIZE
+        fun str(p: Int) = String(m.read(m.readI32(p), m.readI32(p + 4)), Charsets.UTF_8)
+        assertEquals("disk:a", str(at(0)))
+        assertEquals(0x1_0000_0000L, m.readI64(at(0) + 8))
+        assertEquals(64, m.readI32(at(0) + 16))
+        assertEquals(1, m.readU8(at(0) + 20))
+        assertEquals("/mnt/a", str(at(0) + 24))
+        assertEquals("disk:b", str(at(1)))
+        assertEquals(8, m.readI32(at(1) + 16))
+        assertArrayEquals(ByteArray(12), m.read(at(1) + 20, 12))
+        assertEquals(listOf(8 to 64, 1 to 6, 1 to 6, 1 to 6), r.calls)
+    }
+
+    @Test
+    fun `空のlist_mount-infoとlist_disk-infoも配列の場所を取り、書き先の誤りはcabi_reallocより先にトラップ`() {
+        val m = FakeMemory(1)
+        val r = BumpRealloc()
+        P1Canonical.lowerMountListResult(m, r, 0x100, emptyList())
+        P1Canonical.lowerDiskListResult(m, r, 0x108, emptyList())
+        assertEquals(listOf(8 to 0, 8 to 0), r.calls)
+        val one = listOf(KibiFs.DiskInfo("disk:a", 1, 1, null))
+        for (retPtr in listOf(0x102, WasmMemory.PAGE_SIZE - 4)) {
+            val r2 = BumpRealloc()
+            assertThrows<WasmTrapException> { P1Canonical.lowerDiskListResult(m, r2, retPtr, one) }
+            assertThrows<WasmTrapException> { P1Canonical.lowerMountListResult(m, r2, retPtr, emptyList()) }
+            assertEquals(emptyList<Pair<Int, Int>>(), r2.calls)
+        }
+        // align 8 に揃っていない配列の場所はトラップ
+        val four = P1Canonical.Realloc { _, _ -> 0x1004 }
+        assertThrows<WasmTrapException> { P1Canonical.lowerDiskListResult(m, four, 0x100, one) }
     }
 }

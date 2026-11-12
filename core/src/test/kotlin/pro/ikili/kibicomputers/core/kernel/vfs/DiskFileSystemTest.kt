@@ -816,4 +816,27 @@ class DiskFileSystemTest {
         assertTrue(Files.isSymbolicLink(d.resolve("link")))
         assertEquals(node, fs.stat(p("/f")).node)
     }
+
+    @Test
+    fun `usageは容量と、項目ごとの管理の分を含む使用量を、開き直さずに返す`() {
+        val quota = DiskQuota(maxBytes = 10_000, maxEntries = 8)
+        val fs = disk(quota = quota)
+        assertEquals(FsUsage(10_000, 0, 10_000, 8, 0), fs.usage())
+        fs.createDirectory(p("/d"))
+        val node = fs.createFile(p("/d/a"))
+        fs.write(node, 0, ByteArray(100), 0, 100)
+        val used = 100 + 2 * DiskFileSystem.ENTRY_COST
+        assertEquals(FsUsage(10_000, used, 10_000 - used, 8, 2), fs.usage())
+    }
+
+    @Test
+    fun `外で書き足して使用量が容量を超えても、usageの空きは0で止まる`() {
+        Files.createDirectories(dir.resolve("full"))
+        Files.write(dir.resolve("full/big"), ByteArray(2_000))
+        val fs = disk("full", quota = DiskQuota(maxBytes = 1_000, maxEntries = 8))
+        val u = fs.usage()
+        assertEquals(2_000 + DiskFileSystem.ENTRY_COST, u.usedBytes)
+        assertEquals(0, u.availableBytes)
+        assertEquals(1, u.usedEntries)
+    }
 }

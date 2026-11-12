@@ -14,4 +14,67 @@ interface mounts {
     /// point のマウントを外す（開いたファイルがあっても外す。その後の操作は io）。マウントの位置でなければ invalid、
     /// 下にマウントがある・/ か /tmp・/dev のマウントなら busy
     unmount: func(point: string) -> result<_, error-code>;
+
+    /// マウントの種類（source から決まる。#453、ADR 0453）
+    enum fs-kind {
+        /// ホストのディスク（source "disk:<識別子>"）
+        disk,
+        /// 同梱の読み取り専用イメージ（source "disk:image:<名前>"。mount の source には使えない）
+        image,
+        /// メモリ上の /tmp（source "tmp"）
+        tmp,
+        /// デバイスファイルの /dev（source "dev"）
+        dev,
+    }
+
+    /// 容量と使用量（#453、ADR 0453）。使用量は管理の分（ディスクは項目ごとの 256 バイト、tmpfs は項目ごとの分と 4 KiB 単位の塊）を含むので、
+    /// du の合計とは合わない。used-bytes と used-entries は別々に読むので、書いている途中なら一瞬ずれることがある。
+    /// image は全体 = 使用 = 中身の合計で空きは 0。dev はすべて 0（total-entries は some(0)）
+    record fs-usage {
+        /// 全体（バイト）。tmp はマシンの RAM 全体
+        total-bytes: u64,
+        /// 使っている量（バイト）
+        used-bytes: u64,
+        /// 空き（バイト）。tmp は RAM の残り（プロセスのメモリとも分け合う）で目安。書けることは保証しない
+        available-bytes: u64,
+        /// ファイル・ディレクトリの数の上限（根を除く）。none は上限なし（tmp）
+        total-entries: option<u32>,
+        /// ファイル・ディレクトリの数（根を除く）
+        used-entries: u32,
+    }
+
+    /// マウント1つ（#453）
+    record mount-info {
+        /// マウントの位置（絶対パス）
+        point: string,
+        /// 何をマウントしたか（"disk:<識別子>"・"disk:image:<名前>"・"tmp"・"dev"）
+        source: string,
+        kind: fs-kind,
+        /// 読み取り専用でマウントしたか、ファイルシステムが読み取り専用か
+        read-only: bool,
+        /// マウントの ID（filestat の dev と同じ値。df <パス> は stat の dev がこれと等しいものを引く）。
+        /// マウントの祖先の、どの FS にもないディレクトリの dev は 0 で、どの id にも当たらない
+        id: u32,
+        /// 容量と使用量。FS がまだつながっていない（起動・復元の途中）・分からない・一覧を作る間に外れたなら none
+        usage: option<fs-usage>,
+    }
+
+    /// 挿さっているディスク1枚（#453）。ディスクを開かずに分かることだけを返す（マウントしていないディスクの使用量は出さない）
+    record disk-info {
+        /// "disk:<識別子>"（mount の source にそのまま渡せる）
+        source: string,
+        /// 使える量（バイト。中身＋項目ごとの 256 バイト）
+        capacity-bytes: u64,
+        /// ファイル・ディレクトリの数の上限（根を除く）
+        max-entries: u32,
+        /// マウントの位置。マウントしていない・開いている途中なら none（開いている途中に mount すると busy）
+        mount-point: option<string>,
+    }
+
+    /// その台のマウントを、マウントを足した順に返す（df・mount 用。#453）。待たない。
+    /// list-disks とは別の呼び出しなので、間にディスクの抜き差しがあると、2つの結果が食い違うことがある
+    list-mounts: func() -> list<mount-info>;
+
+    /// その台に今挿さっているディスクを、スロットの順に返す（#453）。同梱イメージは入らない。待たない
+    list-disks: func() -> list<disk-info>;
 }

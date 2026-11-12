@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.wasi.WasiUtf8
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -40,6 +41,11 @@ import java.nio.charset.CodingErrorAction
  * - `string` の結果（`get-cwd`）: `{ ptr @0, len @4 }`（8 / 4。`cabi_realloc` で場所を取る。#74）
  * - `list<process-info>` の結果（`list-processes`）: `{ ptr @0, len @4 }`（8 / 4）。`process-info` は
  *   `{ pid @0, parent-pid @4, state.tag: u8 @8, state.finished: exit-status @12, args.ptr @20, args.len @24 }`（28 / 4。#452）
+ * - `list<mount-info>` の結果（`list-mounts`）: `{ ptr @0, len @4 }`（8 / 4）。`mount-info` は（72 / 8。#453）
+ *   `{ point @0/@4, source @8/@12, kind: u8 @16, read-only @17, id @20, usage.tag @24, usage.some: fs-usage @32 }`、
+ *   `fs-usage` は `{ total @0, used @8, available @16, total-entries.tag @24, total-entries.some @28, used-entries @32 }`（40 / 8）
+ * - `list<disk-info>` の結果（`list-disks`）: `{ ptr @0, len @4 }`（8 / 4）。`disk-info` は
+ *   `{ source @0/@4, capacity-bytes @8, max-entries @16, mount-point.tag @20, mount-point.ptr @24, mount-point.len @28 }`（32 / 8。#453）
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
@@ -103,6 +109,14 @@ internal object P1Canonical {
     /** `process-info`（`kibi:process` の `list-processes` の要素。#452）の大きさ・align */
     const val PROCESS_INFO_SIZE: Int = 28
     const val PROCESS_INFO_ALIGN: Int = 4
+
+    /** `mount-info`（`kibi:fs/mounts` の `list-mounts` の要素。#453）の大きさ・align（u64 を含むので 8） */
+    const val MOUNT_INFO_SIZE: Int = 72
+    const val MOUNT_INFO_ALIGN: Int = 8
+
+    /** `disk-info`（`kibi:fs/mounts` の `list-disks` の要素。#453）の大きさ・align */
+    const val DISK_INFO_SIZE: Int = 32
+    const val DISK_INFO_ALIGN: Int = 8
 
     /** `string`（`list<string>` の要素）の大きさ */
     private const val STRING_SIZE: Int = 8
@@ -377,6 +391,70 @@ internal object P1Canonical {
         memory.writeI32(retPtr, listPtr)
         memory.writeI32(retPtr + 4, entries.size)
     }
+
+    /**
+     * `list<mount-info>` の結果（`list-mounts`。#453、ADR 0453）を [retPtr] に書く。retptr の範囲と align を先に確かめ、
+     * 場所は Canonical ABI の lower の順に [realloc] で取る: 外側の配列（align 8、72 × 件数）→ 要素ごとに `point` → `source`
+     * （どちらも align 1）。0 件・0 バイトでも呼ぶ。詰め物と使わない payload は 0。u32 を超える項目の数は u32 の最大で止める
+     */
+    fun lowerMountListResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, entries: List<KibiFs.MountInfo>) {
+        checkStore(memory, retPtr, LIST_RESULT_SIZE, LIST_RESULT_ALIGN)
+        val listPtr = alloc(memory, realloc, MOUNT_INFO_ALIGN, allocSize(entries.size, MOUNT_INFO_SIZE))
+        for ((i, e) in entries.withIndex()) {
+            val at = listPtr + i * MOUNT_INFO_SIZE
+            memory.write(at, ByteArray(MOUNT_INFO_SIZE))
+            val (pp, pl) = lowerBytes(memory, realloc, utf8(e.point))
+            memory.writeI32(at, pp)
+            memory.writeI32(at + 4, pl)
+            val (sp, sl) = lowerBytes(memory, realloc, utf8(e.source))
+            memory.writeI32(at + 8, sp)
+            memory.writeI32(at + 12, sl)
+            memory.writeU8(at + 16, e.kind.ordinal)
+            memory.writeU8(at + 17, if (e.readOnly) 1 else 0)
+            memory.writeI32(at + 20, e.id)
+            val u = e.usage ?: continue
+            memory.writeU8(at + 24, 1)
+            val ua = at + 32
+            memory.writeI64(ua, u.totalBytes)
+            memory.writeI64(ua + 8, u.usedBytes)
+            memory.writeI64(ua + 16, u.availableBytes)
+            u.totalEntries?.let {
+                memory.writeU8(ua + 24, 1)
+                memory.writeI32(ua + 28, u32Clamp(it))
+            }
+            memory.writeI32(ua + 32, u32Clamp(u.usedEntries))
+        }
+        memory.writeI32(retPtr, listPtr)
+        memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    /**
+     * `list<disk-info>` の結果（`list-disks`。#453、ADR 0453）を [retPtr] に書く。場所は外側の配列（align 8、32 × 件数）→
+     * 要素ごとに `source` → `mount-point`（some のときだけ。align 1）の順に [realloc] で取る。詰め物と使わない payload は 0
+     */
+    fun lowerDiskListResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, entries: List<KibiFs.DiskInfo>) {
+        checkStore(memory, retPtr, LIST_RESULT_SIZE, LIST_RESULT_ALIGN)
+        val listPtr = alloc(memory, realloc, DISK_INFO_ALIGN, allocSize(entries.size, DISK_INFO_SIZE))
+        for ((i, e) in entries.withIndex()) {
+            val at = listPtr + i * DISK_INFO_SIZE
+            memory.write(at, ByteArray(DISK_INFO_SIZE))
+            val (sp, sl) = lowerBytes(memory, realloc, utf8(e.source))
+            memory.writeI32(at, sp)
+            memory.writeI32(at + 4, sl)
+            memory.writeI64(at + 8, e.capacityBytes)
+            memory.writeI32(at + 16, e.maxEntries)
+            val point = e.mountPoint ?: continue
+            memory.writeU8(at + 20, 1)
+            val (mp, ml) = lowerBytes(memory, realloc, utf8(point))
+            memory.writeI32(at + 24, mp)
+            memory.writeI32(at + 28, ml)
+        }
+        memory.writeI32(retPtr, listPtr)
+        memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    /** 0 以上の [v] を u32 の範囲で止めて、`Int` のビット列にする */
+    private fun u32Clamp(v: Long): Int = v.coerceIn(0L, 0xffff_ffffL).toInt()
 
     /** 配列の大きさ（[count] × [elementSize]）。`Long` で計算し、`Int` を超えるならトラップ（黙って小さく取らない） */
     private fun allocSize(count: Int, elementSize: Int): Int {

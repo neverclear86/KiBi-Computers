@@ -264,4 +264,24 @@ class TmpFileSystemTest {
             assertEquals(0L, account.usedBytes, "外した後に確保した RAM が残っている")
         }
     }
+
+    @Test
+    fun `usageは全体がマシンのRAMで、空きはRAMの残り、項目は根を除き上限なし`() {
+        val (fs, account) = tmp(pages = 4)
+        val total = 4L * WasmMemory.PAGE_SIZE
+        assertEquals(FsUsage(total, 0, total, null, 0), fs.usage())
+        fs.createDirectory(p("/d"))
+        fs.file("/d/a", "hi")
+        val u = fs.usage()
+        assertEquals(fs.usedBytes, u.usedBytes)
+        assertEquals(2, u.usedEntries)
+        assertEquals(total - account.usedBytes, u.availableBytes)
+        // プロセスのメモリも同じ RAM から取るので、空きが減る
+        assertTrue(account.tryReserve(1))
+        assertEquals(total - account.usedBytes, fs.usage().availableBytes)
+        assertEquals(u.usedBytes, fs.usage().usedBytes)
+        // 外した後も負にならない
+        fs.onUnmounted()
+        assertTrue(fs.usage().usedEntries >= 0)
+    }
 }

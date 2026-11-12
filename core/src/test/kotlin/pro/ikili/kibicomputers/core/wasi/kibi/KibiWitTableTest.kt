@@ -174,6 +174,20 @@ class KibiWitTableTest {
     }
 
     @Test
+    fun `kibi_fsのmountsの関数はすべてp1に出し、一覧の2つだけがcabi_reallocを要り、待たない`() {
+        val wit = derived()
+        val expected = setOf("mount", "unmount", "list-mounts", "list-disks").map { WasiP1Kibi.FS_MOUNTS to it }.toSet()
+        assertEquals(expected, wit.filter { it.first == WasiP1Kibi.FS_MOUNTS }.toSet())
+        for (fn in expected) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
+        for (name in listOf("list-mounts", "list-disks")) {
+            assertTrue(WasiP1Kibi.needsRealloc(WasiP1Kibi.FS_MOUNTS, name))
+            assertFalse("${WasiP1Kibi.FS_MOUNTS}.$name" in WasiP1.WAIT_IMPORTS)
+        }
+        assertFalse(WasiP1Kibi.needsRealloc(WasiP1Kibi.FS_MOUNTS, "mount"))
+        assertFalse(WasiP1Kibi.needsRealloc(WasiP1Kibi.FS_MOUNTS, "unmount"))
+    }
+
+    @Test
     fun `kibi_processのprocessの関数はすべてp1に出し、process-pollとprocess-asyncは出さない`() {
         val wit = derived()
         val expected = setOf(

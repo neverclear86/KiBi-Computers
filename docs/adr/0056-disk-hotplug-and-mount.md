@@ -120,5 +120,8 @@ p1: `mount(src_ptr, src_len, pt_ptr, pt_len, ro, ret_ptr) -> ()`、`unmount(pt_p
 - `unmount` したまま保存・アンロードしたディスクは、復元の後にまた `/mnt/<名前>` にマウントされ、`disk-inserted` が出る。`Insertion.handled` は保存しない
   （表は実行時だけ。保存形式を変えないため）ので、戻した後は、挿さっているがマウントしていない新しい挿し込みとして扱う。ゲストは `disk-inserted` を見て外し直せる
 - 標準 OS の `mount`・`umount` コマンドはまだない（#454 で足す）
+- （#453 で解けた）以前は、挿さっているがマウントしていないディスク（`unmount` した後・自動マウントの位置が使えなかったもの）を、ゲストが `disk-inserted` を見逃すと知る手段がなかった。今は `list-disks`（ADR 0453）が、位置 `none` で返す。その `source` をそのまま `mount` に渡せる
+- `list-mounts` は同梱イメージの根を `disk:image:<名前>`（種類 `image`）として返すが、その source を `mount` に渡すと `no-entry`（同梱イメージは挿し込みではないので、`list-disks` にも出ない）。一覧と `mount` が受け付ける source は対称でない
+- 開いている途中（予約がある）のディスクは、`list-disks` では位置 `none` に見えるが、そのときに `mount` すると `busy`
 - p2・p3 の world は仮置き（ほかの `kibi:*` と同じく、Component Model のホストの実装は #259 の配下）
 - 同じ識別子のディスクを2台に挿したときは、ADR 0052 のリースのとおり後から開いた方が勝つ（#606 の場合も同じ）

@@ -145,4 +145,10 @@ class ImageFileSystemTest {
         assertThrows<IllegalArgumentException> { ImageFileSystem.bundled("../sample") }
         assertThrows<IllegalArgumentException> { ImageFileSystem.bundled("") }
     }
+
+    @Test
+    fun `usageは中身の合計が全体と使用で、空きは0、項目は根を除く`() {
+        val fs = image("bin/init" to "#!init", "etc/" to null, "readme.txt" to "hi")
+        assertEquals(FsUsage(8, 8, 0, 4, 4), fs.usage())
+    }
 }
