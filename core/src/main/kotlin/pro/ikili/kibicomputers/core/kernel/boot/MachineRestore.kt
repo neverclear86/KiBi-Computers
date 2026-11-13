@@ -225,16 +225,18 @@ internal class MachineRestore(private val machine: Machine, private val request:
             // NBT が欠番（失敗した予約）を指すのは正常（ADR 0084 の規則 9）
             LOG.log(System.Logger.Level.WARNING, "マシン $id は NBT の世代 ${source.generation} がないので、世代 $gen に戻す")
         }
+        // MOD のバージョンは、ファイルを読む前に、外枠の頭だけを読んで比べる（#88、ADR 0088）。
+        // 版の違うファイルは、全体の読み込み・CRC・節の解釈（KILLED 節・基準）をしない
+        checkModVersion(peekModVersion(id, gen), "世代 $gen")
         val stored = read(id, gen)
         val snapshot = stored.snapshot
-        // MOD のバージョンは、中身を解釈する前（KILLED 節・基準・モジュールより先）に比べる（#88、ADR 0088）
-        checkModVersion(snapshot.modVersion, "世代 $gen")
         if (snapshot.requiresColdBoot) {
             val cause = if (snapshot.coldBootReason == null) ColdBootCause.UNREADABLE else ColdBootCause.KILLED_SECTION
             fallback(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
         }
         base = snapshot.deltaBase?.let { ref ->
-            read(ref.id, ref.generation).also { checkModVersion(it.snapshot.modVersion, "差分の基準 ${ref.generation}") }
+            checkModVersion(peekModVersion(ref.id, ref.generation), "差分の基準 ${ref.generation}")
+            read(ref.id, ref.generation)
         }
         this.stored = stored
         val referenced = try {
@@ -432,6 +434,13 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val claims = ArrayList<Machine.DiskClaim>()
         val dropped = ArrayList<Pair<String, String>>()
         val droppedIds = HashSet<Int>()
+    }
+
+    /** 世代のファイルの外枠から MOD のバージョンだけを読む（読めなければ `UNREADABLE`） */
+    private fun peekModVersion(id: java.util.UUID, generation: Long): String = try {
+        request.source.store.readGenerationModVersion(id, generation)
+    } catch (e: IOException) {
+        fallback(ColdBootCause.UNREADABLE, "世代 $id/$generation の外枠を読めない: $e", e)
     }
 
     private fun read(id: java.util.UUID, generation: Long): StoredSnapshot = try {

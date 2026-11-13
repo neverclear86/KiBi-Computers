@@ -729,6 +729,16 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
+     * [id] の世代 [generation] のファイルの外枠から、書いた MOD のバージョンだけを読む（#88）。
+     * ファイル全体の読み込み・CRC・節の解釈をせずに、戻す前に MOD のバージョンを比べるための口
+     *
+     * @throws IOException 読めない・外枠が壊れている・形式の版が違う
+     */
+    @Throws(IOException::class)
+    public fun readGenerationModVersion(id: UUID, generation: Long): String =
+        DataInputStream(BufferedInputStream(Files.newInputStream(generationFile(id, generation)), 256)).use { MachineSnapshot.readModVersion(it) }
+
+    /**
      * [id] のディレクトリを消し、覚えていることも忘れる（プレイヤーの破壊・爆発のときだけ呼ぶ）。消すのは書き込みの列の仕事で、
      * それより前に入れた書き込みの後に走る（#84 の規則 7）。消せなければ warn
      */

@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -39,6 +40,7 @@ import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.Path
@@ -216,6 +218,28 @@ class RestoreVersionTest {
             val finished2 = Finished()
             val m2 = restore(h, store("old"), identity, finished2)
             assertColdBoot(m2, finished2, ColdBootCause.KILLED_SECTION)
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `版の違うファイルは外枠の頭しか読まない（中身が壊れていてもMOD_VERSION、読めない中身はUNREADABLE）`() = timeout(limit) {
+        val old = store("old")
+        val identity = old.write(old.assignNewId(owner)!!, owner, fake()).identity
+        val file = old.generationFile(identity.id, identity.generation)
+        // 節の頭の途中で切れた尾を足す: 全体を読む readGeneration は読めないが、外枠の頭だけなら MOD のバージョンが読める
+        Files.write(file, Files.readAllBytes(file) + byteArrayOf(0x00))
+        assertEquals("old", old.readGenerationModVersion(identity.id, identity.generation))
+        assertThrows(IOException::class.java) { old.readGeneration(identity.id, identity.generation) }
+        Harness().use { h ->
+            val finished = Finished()
+            val m = restore(h, store("new"), identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MOD_VERSION)
+            m.close()
+            // 同じ版なら、中身を読んで UNREADABLE
+            val finished2 = Finished()
+            val m2 = restore(h, store("old"), identity, finished2)
+            assertColdBoot(m2, finished2, ColdBootCause.UNREADABLE)
             m2.close()
         }
     }
