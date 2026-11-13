@@ -1046,7 +1046,7 @@ public class Machine private constructor(
                 try {
                     val listener = request.listener
                     if (listener != null) {
-                        safely { listener.onRestoreFinished(this, delivered, deliveredCause) }
+                        safely(HostFailureKind.RESTORE_LISTENER) { listener.onRestoreFinished(this, delivered, deliveredCause) }
                     } else if (delivered == RestoreOutcome.COLD_BOOT) {
                         coldBootAfterRestore()
                     }
@@ -3238,7 +3238,7 @@ public class Machine private constructor(
 
     /**
      * [callback] を次の `tick()` の中で、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
-     * どのスレッドから呼んでもよい。待たない。中で投げた例外は捨てる
+     * どのスレッドから呼んでもよい。待たない。中で投げた例外はログに出して捨てる（JVM の致命的なエラーは投げる。#674）
      */
     internal fun postHostCallback(callback: Runnable) {
         postNotification(HostNotification.Callback(callback))
@@ -3255,7 +3255,7 @@ public class Machine private constructor(
         queuedForNotify.set(false)
         val out = ConsoleCollector()
         // 止めている相手に、新しい tick になったことを知らせる（続きを処理して、追いつけば止めるのをやめる）
-        consoleHold?.let { safely { it.resume() } }
+        consoleHold?.let { safely(HostFailureKind.CONSOLE_HOLD_RESUME) { it.resume() } }
         if (consoleHold == null) resumeDeferredConsole(out)
         while (true) {
             val n = notifications.poll() ?: break
@@ -3268,14 +3268,14 @@ public class Machine private constructor(
             }
             out.flush()
             when (n) {
-                is HostNotification.StateChanged -> safely { host.onStateChanged(this, n.state, n.cause) }
-                is HostNotification.Callback -> safely { n.callback.run() }
-                is HostNotification.BootFailed -> safely { host.onBootFailed(this, n.failure, n.detail) }
+                is HostNotification.StateChanged -> safely(HostFailureKind.STATE_CHANGED) { host.onStateChanged(this, n.state, n.cause) }
+                is HostNotification.Callback -> safely(HostFailureKind.CALLBACK) { n.callback.run() }
+                is HostNotification.BootFailed -> safely(HostFailureKind.BOOT_FAILED) { host.onBootFailed(this, n.failure, n.detail) }
                 HostNotification.RebootRequested -> {
                     // 積んだ後に stop() されたら、再起動しない
                     // 遅らせている間（期限の前）は配らない（積んだのは期限が来た後だけなので、普通は起きない。#635）
                     val go = lock.withLockValue { (rebootNotified && rebootDueTick == 0L).also { if (it) rebootNotified = false } }
-                    if (go) safely { host.onRebootRequested(this) }
+                    if (go) safely(HostFailureKind.REBOOT_REQUESTED) { host.onRebootRequested(this) }
                 }
                 is HostNotification.Console, HostNotification.TtyOutput -> Unit
             }
@@ -3366,7 +3366,11 @@ public class Machine private constructor(
                 val bytes = b.toByteArray()
                 // 画面のデバイスをつないでいればそこへ（#65、ADR 0065）、なければ接続層へ
                 val screen = devices.primaryScreen
-                if (screen != null && screen.machine === this@Machine) safely { screen.write(bytes) } else safely { host.onConsoleOutput(this@Machine, bytes) }
+                if (screen != null && screen.machine === this@Machine) {
+                    safely(HostFailureKind.SCREEN_WRITE) { screen.write(bytes) }
+                } else {
+                    safely(HostFailureKind.CONSOLE_OUTPUT) { host.onConsoleOutput(this@Machine, bytes) }
+                }
             } finally {
                 unlockSink()
             }
@@ -3467,12 +3471,75 @@ public class Machine private constructor(
         for (n in deferred) out.add(n)
     }
 
-    private inline fun safely(block: () -> Unit) {
+    /**
+     * 接続層に配る通知を呼ぶ。接続層の例外は、ログに出して捨てる（ほかのマシン・後の通知に伝えない。ADR 0044）。
+     * JVM の致命的なエラー（[isFatal]）は、ログに出さずに投げる（#674）。呼ぶのは [deliverNotifications] の中（メインスレッド）だけ
+     */
+    private inline fun safely(kind: HostFailureKind, block: () -> Unit) {
         try {
             block()
         } catch (t: Throwable) {
-            // 接続層の例外はほかのマシン・後の通知に伝えない
+            if (isFatal(t)) throw t
+            reportHostFailure(kind, t)
         }
+    }
+
+    /**
+     * 接続層の例外を、この台で一度ログに出した種類（[HostFailureKind] の ordinal のビット。#674）。
+     * メインスレッド（[deliverNotifications] の中）だけで読み書きする。保存しない（作り直したマシンでは、また最初の1回になる）
+     */
+    private var hostFailuresLogged = 0
+
+    /**
+     * [safely] が捨てる例外をログに出す（#674）。1台・1種類につき最初の1回は WARNING、2回目からは DEBUG（スタックトレースなし）。
+     * WARNING のスタックトレースは、スケジューラ全体で種類ごとに最初の1回だけ付ける（全台の受け手が同じ不具合で投げても、
+     * 1,000 本のスタックトレースでログを埋めない。ADR 0088 の「ログと数え口」と同じ考え方）
+     */
+    private fun reportHostFailure(kind: HostFailureKind, t: Throwable) {
+        try {
+            val bit = 1 shl kind.ordinal
+            if (hostFailuresLogged and bit == 0) {
+                hostFailuresLogged = hostFailuresLogged or bit
+                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。この台・この種類の2回目からは DEBUG）: $t"
+                if (scheduler.claimHostFailureTrace(bit)) {
+                    LOG.log(System.Logger.Level.WARNING, message, t)
+                } else {
+                    LOG.log(System.Logger.Level.WARNING, message)
+                }
+            } else if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
+                LOG.log(System.Logger.Level.DEBUG, "マシン $id の接続層の${kind.label}がまた例外を投げた（捨てて続ける）: $t")
+            }
+        } catch (e: Throwable) {
+            // ログに出せない（例外の toString が投げたなど）: 捨てる。致命的なエラーは投げる
+            if (isFatal(e)) throw e
+        }
+    }
+
+    /** [safely] で呼ぶ接続層の通知の種類（ログの出し分けに使う。#674） */
+    private enum class HostFailureKind(val label: String) {
+        /** [MachineHost.onStateChanged] */
+        STATE_CHANGED("状態の通知"),
+
+        /** [MachineHost.onBootFailed] */
+        BOOT_FAILED("起動の失敗の通知"),
+
+        /** [MachineHost.onRebootRequested] */
+        REBOOT_REQUESTED("再起動の通知"),
+
+        /** [MachineHost.onConsoleOutput] */
+        CONSOLE_OUTPUT("コンソール出力"),
+
+        /** 画面のデバイスへの書き込み */
+        SCREEN_WRITE("画面への書き込み"),
+
+        /** [postHostCallback] の処理 */
+        CALLBACK("処理（postHostCallback）"),
+
+        /** 復元の受け手（[pro.ikili.kibicomputers.core.persist.RestoreListener]） */
+        RESTORE_LISTENER("復元の受け手"),
+
+        /** コンソールの出力を止めている相手の再開（[ConsoleHoldListener.resume]） */
+        CONSOLE_HOLD_RESUME("出力の再開"),
     }
 
     // ---- メインスレッドでのホスト呼び出し（#44） ----

@@ -41,7 +41,7 @@
 - 配っていない分の上限（仮の値）: コンソール 64 KiB、ビープ 8 個。超えた分は捨てる（数え口 `droppedConsoleBytes`・`SpeakerDevice.droppedBeeps`。#65 で `Machine.droppedBeeps` から移した）。書き手を待たせる流量の制御は、ABI 層が `ByteStream` で行う（#58・#60）。この上限は、ABI 層のバグや、通知を配らないまま（`tick()` が呼ばれない間）でもメモリが際限なく増えないためのもの
 - ビープの値は範囲に丸める: 周波数 20〜20,000 Hz、長さ 1〜5,000 ms（長さの上限は仮の値）
 - `MachineHost` は `fun interface` のまま、`onStateChanged` だけを必須にし、`onConsoleOutput` は何もしない既定の実装を持つ（JVM の default メソッド。Java のクラスでも実装を省ける。#65 で `onBeep` を外し、スピーカーのデバイスに移した）
-- 接続層の例外は捨てる。同じマシンの後の通知と、ほかのマシンには伝えない
+- 接続層の例外は捨てる。同じマシンの後の通知と、ほかのマシンには伝えない。捨てる前にログ（`kibicomputers.machine`）に出す: 1台・1種類（状態の通知、コンソール出力、`postHostCallback` の処理、復元の受け手など）につき最初の1回は WARNING、2回目からは DEBUG（スタックトレースなし）。WARNING のスタックトレースは、スケジューラ全体で種類ごとに最初の1回だけ付ける（全台が同じ不具合で投げてもログを埋めない。ADR 0088 の「ログと数え口」と同じ考え方）。JVM の致命的なエラー（`StackOverflowError` 以外の `VirtualMachineError`）は捨てずに投げる（`MachineRestore.step`・`PendingHostCall` と同じ。#674）
 - 停止はこれまでどおり `onStateChanged(STOPPED / CRASHED)` で知らせる
 
 ## ホスト呼び出し（ワールド・デバイスの操作）

@@ -62,6 +62,12 @@ public class MachineScheduler private constructor(
     private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
     private val blockingCount = AtomicInteger()
 
+    /** 接続層の例外のスタックトレースを、もうログに出した種類（`Machine` の通知の種類のビット。#674） */
+    private val hostFailureTraced = AtomicInteger()
+
+    /** 接続層の例外の種類 [bit] で、スタックトレースを出すのがスケジューラ全体で最初なら `true`（以後は `false`。#674） */
+    internal fun claimHostFailureTrace(bit: Int): Boolean = hostFailureTraced.getAndUpdate { it or bit } and bit == 0
+
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
     private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
     private val wakeLock = ReentrantLock()
