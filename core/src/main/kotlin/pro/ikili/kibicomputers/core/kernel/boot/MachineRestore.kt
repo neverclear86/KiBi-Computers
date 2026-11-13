@@ -508,7 +508,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
                         checkCancelled()
                         // 予約の後に抜かれた: disksChanged が止めるので、取り消しと同じに黙って抜ける（#56）
                         if (claim != null && machine.isClaimCancelled(claim)) throw RestoreCancelledException()
-                        if (entry.point == VfsPath.ROOT || entry.point == MachineLimits.HOME_PATH) {
+                        // /home は FS の規則で比べる（根は先に開いて印を付けてあるので、根がディスクなら /HOME も /home。#606）
+                        if (entry.point == VfsPath.ROOT || decoded.kernel.mounts.isAt(entry, MachineLimits.HOME_PATH)) {
                             fallback(ColdBootCause.MOUNT, "ディスク $diskId（${entry.point}）を開けない")
                         }
                         LOG.log(System.Logger.Level.WARNING, "マシン ${request.source.id} のディスク $diskId（${entry.point}）を開けないので、マウントを落とす")
@@ -528,6 +529,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
                 else -> fallback(ColdBootCause.MOUNT, "知らないマウント $source（${entry.point}）")
             }
             out[entry.id] = fs
+            // 後のマウントの /home の見分けに、この FS が大文字小文字を区別するかを先に知らせる（つなぐときにも知らせる。#606）
+            decoded.kernel.mounts.setIgnoresCase(entry.id, fs.ignoresCase)
         }
     }
 

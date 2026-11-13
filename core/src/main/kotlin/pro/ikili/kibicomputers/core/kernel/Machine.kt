@@ -2673,7 +2673,8 @@ public class Machine private constructor(
         val phase = bootingValue || restoreTransient
         for (insertion in removed) {
             val source = diskSource(insertion.diskId)
-            val essential = kernel.mounts.entries.any { it.source == source && (it.point == VfsPath.ROOT || it.point == MachineLimits.HOME_PATH) }
+            // /home は FS の規則で比べる（根がディスクなら /HOME に置いたものも /home のマウント。#606）
+            val essential = kernel.mounts.entries.any { it.source == source && (it.point == VfsPath.ROOT || kernel.mounts.isAt(it, MachineLimits.HOME_PATH)) }
             if (essential || (phase && insertion.diskId in phaseDisks)) return true
         }
         if (!runningSteadyLocked()) return false
@@ -2751,11 +2752,11 @@ public class Machine private constructor(
         }
     }
 
-    /** 今の表にない `disk:` のマウント（`/`・`/home`・同梱イメージ以外）を外して `disk-removed` を出す（カーネルロックの中） */
+    /** 今の表にない `disk:` のマウント（`/`・`/home`（FS の規則で比べる。#606）・同梱イメージ以外）を外して `disk-removed` を出す（カーネルロックの中） */
     private fun unmountStaleDisksLocked() {
         for (entry in kernel.mounts.entries.toList()) {
             if (!entry.source.startsWith(MachineLimits.DISK_SOURCE_PREFIX)) continue
-            if (entry.point == VfsPath.ROOT || entry.point == MachineLimits.HOME_PATH) continue
+            if (entry.point == VfsPath.ROOT || kernel.mounts.isAt(entry, MachineLimits.HOME_PATH)) continue
             val diskId = entry.source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
             if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX) || inserted.containsKey(diskId)) continue
             vfs.unmountForcedLocked(entry.id)
@@ -3140,7 +3141,8 @@ public class Machine private constructor(
      */
     private fun unmountTmpLocked() {
         for (tmp in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) {
-            val doomed = kernel.mounts.entries.filter { it.point.startsWith(tmp.point) }.sortedByDescending { it.point.depth }
+            // 下にあるかは、大文字小文字の規則も含めて比べる（根がディスクなら /TMP/x も /tmp の下。#606）
+            val doomed = kernel.mounts.entries.filter { kernel.mounts.isAtOrBelow(it, tmp) }.sortedByDescending { it.point.depth }
             for (entry in doomed) {
                 // 入れ子の /tmp が先に外れていることがある
                 if (kernel.mounts[entry.id] != null) vfs.unmountForcedLocked(entry.id)

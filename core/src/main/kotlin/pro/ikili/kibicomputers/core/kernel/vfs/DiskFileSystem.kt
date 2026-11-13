@@ -54,6 +54,9 @@ internal class DiskFileSystem private constructor(
     private val lease: HostDiskLeases.Lease,
     private val generation: Long,
 ) : FileSystem {
+    /** 名前は大文字小文字を区別しない（[DiskNames.sameName]。ADR 0052。#606） */
+    override val ignoresCase: Boolean get() = true
+
     /** 開いたままのホストのファイル（[refs] は [retain] の数） */
     private class Handle(var channel: FileChannel, var writable: Boolean, var identity: Any?) {
         var refs = 0
