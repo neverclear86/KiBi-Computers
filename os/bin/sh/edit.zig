@@ -13,6 +13,7 @@ const complete = @import("complete.zig");
 
 const io = kibi.io;
 const tty = kibi.tty;
+const utf8 = kibi.text;
 
 const IN = io.STDIN;
 const OUT = io.STDERR;
@@ -96,51 +97,28 @@ fn bell() void {
 
 // ---- 文字の幅 ----
 
-/// UTF-8 の 1 文字を読む。[n] はバイト数。不正なら U+FFFD で 1 バイト
-fn decode(s: []const u8, n: *usize) u21 {
-    const c = s[0];
-    n.* = 1;
-    if (c < 0x80) return c;
-    const need: usize = if (c & 0xe0 == 0xc0) 2 else if (c & 0xf0 == 0xe0) 3 else if (c & 0xf8 == 0xf0) 4 else return 0xfffd;
-    if (s.len < need) return 0xfffd;
-    var v: u32 = c & (@as(u8, 0x7f) >> @intCast(need));
-    for (s[1..need]) |b| {
-        if (b & 0xc0 != 0x80) return 0xfffd;
-        v = (v << 6) | (b & 0x3f);
-    }
-    if (v > 0x10ffff) return 0xfffd;
-    n.* = need;
-    return @intCast(v);
-}
-
-// `CharWidth`（core）と同じ全角の範囲
-const wide_ranges = [_][2]u21{
-    .{ 0x1100, 0x115F },   .{ 0x231A, 0x231B },   .{ 0x2E80, 0x303E },   .{ 0x3041, 0x33FF },
-    .{ 0x3400, 0x4DBF },   .{ 0x4E00, 0x9FFF },   .{ 0xA000, 0xA4CF },   .{ 0xA960, 0xA97F },
-    .{ 0xAC00, 0xD7A3 },   .{ 0xF900, 0xFAFF },   .{ 0xFE10, 0xFE19 },   .{ 0xFE30, 0xFE6F },
-    .{ 0xFF00, 0xFF60 },   .{ 0xFFE0, 0xFFE6 },   .{ 0x1F300, 0x1F64F }, .{ 0x1F900, 0x1F9FF },
-    .{ 0x20000, 0x2FFFD }, .{ 0x30000, 0x3FFFD },
+/// 行・プロンプトの 1 文字（制御文字の後ろ）
+const Glyph = struct {
+    /// バイト数
+    n: usize,
+    /// 幅
+    w: u2,
+    /// 原文のまま送れる。偽なら U+FFFD（1 セル）で見せる
+    ok: bool,
 };
 
-// 幅のない文字（結合文字・書式の文字）の主な範囲。端末の解釈は Unicode の一般カテゴリ Mn・Me・Cf を幅 0 にする
-const zero_ranges = [_][2]u21{
-    .{ 0x0300, 0x036F }, .{ 0x0483, 0x0489 }, .{ 0x0591, 0x05BD }, .{ 0x0610, 0x061A },
-    .{ 0x064B, 0x065F }, .{ 0x200B, 0x200F }, .{ 0x202A, 0x202E }, .{ 0x2060, 0x2064 },
-    .{ 0x20D0, 0x20FF }, .{ 0x3099, 0x309A }, .{ 0xFE00, 0xFE0F }, .{ 0xFE20, 0xFE2F },
-    .{ 0xFEFF, 0xFEFF },
-};
-
-fn inRanges(cp: u21, ranges: []const [2]u21) bool {
-    for (ranges) |r| {
-        if (cp < r[0]) return false;
-        if (cp <= r[1]) return true;
-    }
-    return false;
+/// [s] の頭の 1 文字。制御文字（0x00〜0x1f・0x7f）は呼ぶ側で扱う。読み方と幅は `kibi.text`（ADR 0105）。
+/// 不正な UTF-8 は 1 バイトごとに、C1 の制御文字（U+0080〜U+009F。端末が読み捨てる）は 1 文字を U+FFFD で見せる
+fn glyph(s: []const u8) Glyph {
+    const cp = utf8.decode(s) orelse return .{ .n = 1, .w = 1, .ok = false };
+    const n = utf8.sequenceLength(s[0]);
+    if (cp >= 0x80 and cp < 0xa0) return .{ .n = n, .w = 1, .ok = false };
+    return .{ .n = n, .w = utf8.width(cp), .ok = true };
 }
 
-fn charWidth(cp: u21) u32 {
-    if (inRanges(cp, &zero_ranges)) return 0;
-    return if (inRanges(cp, &wide_ranges)) 2 else 1;
+/// [g]（[s] の頭）を書く
+fn putGlyph(s: []const u8, g: Glyph) void {
+    if (g.ok) put(s[0..g.n]) else put(utf8.REPLACEMENT);
 }
 
 // ---- 位置を数える ----
@@ -179,42 +157,46 @@ const Pos = struct {
     }
 };
 
-/// プロンプトを書いたときの位置の動き。エスケープシーケンスは幅 0 と見る
-/// （CSI `ESC [ ... 終端`、OSC `ESC ] ... BEL か ST`、DCS などの文字列 `ESC P|X|^|_ ... ST`、ほかの `ESC 中間 終端`）
-fn measurePrompt(p: *Pos, s: []const u8) void {
+/// プロンプト [s] を書いたときの位置の動き。[emit] なら書きもする（数えるだけのときも同じ規則で数える）。
+/// エスケープシーケンスは幅 0 と見て、そのまま送る
+/// （CSI `ESC [ ... 終端`、OSC `ESC ] ... BEL か ST`、DCS などの文字列 `ESC P|X|^|_ ... ST`、ほかの `ESC 中間 終端`）。
+/// 改行・CR・タブとほかの制御文字もそのまま送る。文字は行と同じく [glyph] で読み、不正なバイトは U+FFFD にして送る
+fn walkPrompt(p: *Pos, s: []const u8, emit: bool) void {
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
         if (c == 0x1b) {
-            i = skipEscape(s, i);
-            continue;
-        }
-        if (c == '\n') {
-            p.* = .{ .row = p.row + 1 };
-            i += 1;
-            continue;
-        }
-        if (c == '\r') {
-            p.col = 0;
-            p.pending = false;
-            i += 1;
-            continue;
-        }
-        if (c == '\t') {
-            const next = (p.col / 8 + 1) * 8;
-            if (!p.pending) p.col = @min(next, cols - 1);
-            i += 1;
+            const next = skipEscape(s, i);
+            if (emit) put(s[i..next]);
+            i = next;
             continue;
         }
         if (c < 0x20 or c == 0x7f) {
+            if (emit) putByte(c);
             i += 1;
+            switch (c) {
+                '\n' => p.* = .{ .row = p.row + 1 },
+                '\r' => {
+                    p.col = 0;
+                    p.pending = false;
+                },
+                '\t' => {
+                    const next = (p.col / 8 + 1) * 8;
+                    if (!p.pending) p.col = @min(next, cols - 1);
+                },
+                else => {},
+            }
             continue;
         }
-        var n: usize = 1;
-        const cp = decode(s[i..], &n);
-        p.advance(charWidth(cp));
-        i += n;
+        const g = glyph(s[i..]);
+        if (emit) putGlyph(s[i..], g);
+        p.advance(g.w);
+        i += g.n;
     }
+}
+
+fn measurePrompt(p: *Pos, s: []const u8) void {
+    walkPrompt(p, s, false);
 }
 
 /// [s] の [start] にある ESC から始まるエスケープシーケンスの、次の位置
@@ -261,14 +243,10 @@ fn emitLine(s: []const u8, p: *Pos) void {
             i += 1;
             continue;
         }
-        var n: usize = 1;
-        const cp = decode(s[i..], &n);
-        if (cp == 0xfffd and n == 1 and c >= 0x80) {
-            // 途中で切れた・不正なバイト。端末と同じく U+FFFD に見せる
-            put("\xef\xbf\xbd");
-        } else put(s[i..][0..n]);
-        p.advance(charWidth(cp));
-        i += n;
+        const g = glyph(s[i..]);
+        putGlyph(s[i..], g);
+        p.advance(g.w);
+        i += g.n;
     }
 }
 
@@ -282,10 +260,9 @@ fn measureLine(s: []const u8, p: *Pos) void {
             i += 1;
             continue;
         }
-        var n: usize = 1;
-        const cp = decode(s[i..], &n);
-        p.advance(charWidth(cp));
-        i += n;
+        const g = glyph(s[i..]);
+        p.advance(g.w);
+        i += g.n;
     }
 }
 
@@ -301,8 +278,7 @@ fn refresh() void {
     if (cur_row > 0) csi(cur_row, 'A');
     put("\r\x1b[J");
     var p: Pos = .{};
-    put(prompt);
-    measurePrompt(&p, prompt);
+    walkPrompt(&p, prompt, true);
     emitLine(line[0..pos], &p);
     const target = p.visible();
     emitLine(line[pos..len], &p);
@@ -334,15 +310,11 @@ fn freshLine() void {
 
 // ---- 編集 ----
 
-fn isCont(c: u8) bool {
-    return c & 0xc0 == 0x80;
-}
-
 fn prevChar(from: usize) usize {
     var i = from;
     if (i == 0) return 0;
     i -= 1;
-    while (i > 0 and isCont(line[i])) i -= 1;
+    while (i > 0 and utf8.isContinuation(line[i])) i -= 1;
     return i;
 }
 
@@ -350,7 +322,7 @@ fn nextChar(from: usize) usize {
     var i = from;
     if (i >= len) return len;
     i += 1;
-    while (i < len and isCont(line[i])) i += 1;
+    while (i < len and utf8.isContinuation(line[i])) i += 1;
     return i;
 }
 
@@ -431,10 +403,9 @@ fn typed(s: []const u8) void {
         var p: Pos = .{};
         measurePrompt(&p, prompt);
         measureLine(line[0 .. len - s.len], &p);
-        var n: usize = 1;
-        const cp = decode(s, &n);
-        const w = charWidth(cp);
-        if (!p.pending and n == s.len and s[0] >= 0x20 and p.col + w < cols) {
+        const g = glyph(s);
+        // 原文のまま送れる 1 文字だけ（不正なバイト・C1 は描き直して U+FFFD で見せる）
+        if (!p.pending and g.ok and g.n == s.len and s[0] >= 0x20 and p.col + g.w < cols) {
             put(s);
             flush();
             return;
@@ -884,7 +855,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
         const was_tab = last_tab;
         last_tab = false;
         if (utf8_rest > 0) {
-            if (isCont(c)) {
+            if (utf8.isContinuation(c)) {
                 if (!insert(&[_]u8{c})) {
                     bell();
                     flush();
