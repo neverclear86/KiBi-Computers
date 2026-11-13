@@ -3140,7 +3140,8 @@ public class Machine private constructor(
      */
     private fun unmountTmpLocked() {
         for (tmp in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) {
-            val doomed = kernel.mounts.entries.filter { it.point.startsWith(tmp.point) }.sortedByDescending { it.point.depth }
+            // 下にあるかは、大文字小文字の規則も含めて比べる（根がディスクなら /TMP/x も /tmp の下。#606）
+            val doomed = kernel.mounts.entries.filter { kernel.mounts.isAtOrBelow(it, tmp) }.sortedByDescending { it.point.depth }
             for (entry in doomed) {
                 // 入れ子の /tmp が先に外れていることがある
                 if (kernel.mounts[entry.id] != null) vfs.unmountForcedLocked(entry.id)

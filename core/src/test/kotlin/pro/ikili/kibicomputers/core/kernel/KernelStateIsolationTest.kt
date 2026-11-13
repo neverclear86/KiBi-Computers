@@ -46,7 +46,7 @@ class KernelStateIsolationTest {
         val c = value.javaClass
         when {
             c.isPrimitive || c in allowedLeaf || c.isEnum || (c.superclass?.isEnum == true) -> return
-            value is ByteArray || value is IntArray || value is LongArray -> return
+            value is ByteArray || value is IntArray || value is LongArray || value is BooleanArray -> return
             value is Array<*> -> value.forEachIndexed { i, v -> walk(v, "$path[$i]", seen) }
             value is Map<*, *> -> value.forEach { (k, v) ->
                 walk(k, "$path{key}", seen)
