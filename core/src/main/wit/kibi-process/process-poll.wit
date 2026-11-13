@@ -1,7 +1,7 @@
 package kibi:process@0.1.0;
 
 /// p2 で、プロセスの終わりを待つ・p2 のハンドルを子に渡す（ADR 0074）。p1 では使わない。
-/// 仮置き: interface・関数・型・wasi:* の版は、p2 の層 #264 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+/// 仮置き: interface・関数・型・wasi:* の版は、p2 の層（#685）を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
 interface process-poll {
     use wasi:io/poll@0.2.3.{pollable};
     use wasi:io/streams@0.2.3.{input-stream, output-stream};

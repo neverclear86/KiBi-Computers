@@ -7,7 +7,8 @@ import org.jetbrains.annotations.ApiStatus
  *
  * どの通知も [MachineScheduler.tick] の中で、メインスレッドから、マシンごとに起きた順に呼ばれる。
  * 呼ばれるとき、カーネルはロックも CPU も許可も持っていない。中から `stop()`・`close()`・`createMachine` を呼んでよい。
- * 中で投げた例外は捨てる（ほかのマシンと、同じマシンの後の通知には伝えない）。
+ * 中で投げた例外は、ログに出して捨てる（ほかのマシンと、同じマシンの後の通知には伝えない）。JVM の致命的なエラー
+ * （`StackOverflowError` 以外の `VirtualMachineError`）は捨てずに `tick()` の外へ投げる（#674）。
  *
  * [onStateChanged] だけが必須。ほかは何もしない既定の実装を持つ（Java からはラムダでも、クラスでも実装できる）。
  */

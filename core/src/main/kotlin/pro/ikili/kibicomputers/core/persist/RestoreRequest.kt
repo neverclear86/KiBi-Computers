@@ -38,7 +38,8 @@ public class RestoreRequest @JvmOverloads constructor(
  * 復元の終わりの知らせ（#85）。メインスレッドで、マシンの通知の列から1回だけ届く。
  * 後段の失敗（カーネルの不整合。[pro.ikili.kibicomputers.core.kernel.MachineState.CRASHED]）では呼ばない（ADR 0085）。
  * 知らせは [Machine.close] の後も配られるので、受け手は自分の今のマシンか確かめる（ADR 0085）。
- * これが返った後に、マシンが復元の `quiesce` を閉じる（そこで初めてプロセスに step が割り当てられる）
+ * これが返った後に、マシンが復元の `quiesce` を閉じる（そこで初めてプロセスに step が割り当てられる）。
+ * 投げた例外はログに出して捨てる（`quiesce` は閉じる。JVM の致命的なエラーは投げる。#674）
  */
 @ApiStatus.Internal
 public fun interface RestoreListener {

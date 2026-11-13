@@ -122,11 +122,15 @@ class RebootBackoffMachineTest {
         }
     }
 
+    /** init の `_start` が回った回数。init がスレッドを持って動いているかを見る */
+    private val initLoops = java.util.concurrent.atomic.AtomicInteger()
+
     private fun foreverInit(): FakeModule = FakeModule.builder()
         .fuelMetered()
         .export("_start", VOID) { ctx, _ ->
             while (true) {
                 ctx.step(1)
+                initLoops.incrementAndGet()
                 Thread.sleep(1)
             }
             @Suppress("UNREACHABLE_CODE")
@@ -191,6 +195,11 @@ class RebootBackoffMachineTest {
             release.countDown()
         }
         tickUntilInitStarted()
+        // 燃料は tick でしか届かず、起動した直後の init はスレッドを持たずに燃料待ちのことがある。
+        // 1 tick 進めて、init がスレッドを持って回っているのを確かめてから reboot する（持たない init は止める時に登録を外す所を通らない）
+        val loops = initLoops.get()
+        h.scheduler.tick()
+        eventually(10_000, "init が回らない") { initLoops.get() >= loops + 3 }
 
         // reboot を受け付けて、init のスレッドが止まり切る前（求めの印だけ）: プロセスのスレッドが進めば解ける
         val atGate = CountDownLatch(1)
