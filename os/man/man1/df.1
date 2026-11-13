@@ -1,0 +1,25 @@
+# df(1)
+
+## NAME
+
+df - report file system space usage
+
+## SYNOPSIS
+
+    df [-h|-k] [-i] [file...]
+
+## DESCRIPTION
+
+Prints the size, usage and free space of every mount, with the columns `Filesystem 1K-blocks Used Available Use% Mounted on`. With a file, prints only the mount holding it.
+
+Usage includes file system overhead, so it does not match `du`. The free space of `tmp` is an estimate, as RAM is shared with processes. A mount that cannot report its size shows `-`.
+
+## OPTIONS
+
+- `-h`: sizes in human-readable units (K, M, G)
+- `-k`: sizes in KiB (the default)
+- `-i`: show entry counts (`Inodes IUsed IFree IUse%`) instead of sizes
+
+## SEE ALSO
+
+du(1), mount(1)

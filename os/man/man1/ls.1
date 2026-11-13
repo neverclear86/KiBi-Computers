@@ -1,0 +1,33 @@
+# ls(1)
+
+## NAME
+
+ls - list directory contents
+
+## SYNOPSIS
+
+    ls [-1adlF] [file...]
+
+## DESCRIPTION
+
+Lists the entries of each directory (default `.`) in name order. On a terminal, names are arranged in columns to fit the screen width.
+
+At most 2048 entries and 64 KiB of names are listed per directory.
+
+## OPTIONS
+
+- `-a`: include names starting with `.`
+- `-d`: list directories themselves, not their contents
+- `-l`: long format: type, size, modification time (UTC) and name
+- `-1`: one name per line
+- `-F`: append `/` to directory names
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+du(1), mkdir(1)

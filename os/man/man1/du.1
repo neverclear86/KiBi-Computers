@@ -1,0 +1,24 @@
+# du(1)
+
+## NAME
+
+du - estimate file space usage
+
+## SYNOPSIS
+
+    du [-as] [-b|-k] [file...]
+
+## DESCRIPTION
+
+Writes the total size of the files under each path (default `.`), one line per directory, as `KiB<TAB>path`. Sizes are file sizes rounded up to KiB, not disk blocks. Symbolic links are not followed.
+
+## OPTIONS
+
+- `-a`: also list files
+- `-s`: only the total for each operand
+- `-b`: sizes in bytes
+- `-k`: sizes in KiB (the default)
+
+## SEE ALSO
+
+df(1), ls(1)

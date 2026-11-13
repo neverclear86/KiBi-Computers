@@ -1,0 +1,23 @@
+# init(8)
+
+## NAME
+
+init - the first process
+
+## SYNOPSIS
+
+    /sbin/init
+
+## DESCRIPTION
+
+init is started first when the computer boots (pid 1). It reads `/etc/inittab`, runs the `run` entries one by one, starts the `daemon` and `respawn` entries, and then starts the console shell in the foreground. A shell or `respawn` program that ends is started again.
+
+Without `/etc/inittab`, init starts `/bin/sh` only.
+
+## FILES
+
+- `/etc/inittab`: what to start at boot
+
+## SEE ALSO
+
+inittab(5), sh(1)

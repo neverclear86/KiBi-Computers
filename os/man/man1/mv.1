@@ -1,0 +1,28 @@
+# mv(1)
+
+## NAME
+
+mv - move or rename files
+
+## SYNOPSIS
+
+    mv source dest
+    mv source... directory
+
+## DESCRIPTION
+
+Renames or moves files. If the destination is a directory, each source is moved into it. Moving to another file system copies the data and then removes the source.
+
+## OPTIONS
+
+- `-f`: accepted and ignored
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+cp(1), rm(1)
