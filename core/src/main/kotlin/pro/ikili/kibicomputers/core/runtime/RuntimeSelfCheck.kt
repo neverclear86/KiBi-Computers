@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.runtime.component.ComponentLoader
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
@@ -51,6 +52,20 @@ public object RuntimeSelfCheck {
         val lua = checkNotNull(RuntimeSelfCheck::class.java.getResourceAsStream(LUA_RESOURCE)) { "$LUA_RESOURCE が同梱されていない" }
             .use { it.readBytes() }
         return isCompiled(EndiveRuntime().load(Instrumentation.apply(lua, WasiP1.WAIT_IMPORTS)))
+    }
+
+    /**
+     * コンポーネントの検証器（wasm-tools を WASM にしたもの。#262）を、最小のコンポーネント（ヘッダーだけ）に当てて、
+     * 読み込んで動かせたなら `true`。検証器の jar（`run.endive:wasi`・`wasm-tools`）が実行環境から見えるかを GameTest で確かめるために使う。
+     * 重い（初回は 1 秒ほど）ので、起動時には呼ばない。
+     *
+     * @throws WasmLoadException 検証器を読み込めない、または最小のコンポーネントが通らない
+     */
+    @JvmStatic
+    @Throws(WasmLoadException::class)
+    public fun validatesComponent(): Boolean {
+        val empty = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00)
+        return ComponentLoader.load(empty).root.sections.isEmpty()
     }
 
     private const val LUA_RESOURCE: String = "/kibicomputers/wasm/lua.wasm"
