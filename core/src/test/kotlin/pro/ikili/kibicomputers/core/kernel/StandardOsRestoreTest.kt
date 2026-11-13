@@ -351,7 +351,7 @@ class StandardOsRestoreTest {
             }
         }
         // 名前を並べた検査ではないが、取り違え（import がなくなった・増えた）に気づけるよう、今の集合も確かめる
-        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount"), realloc)
+        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man"), realloc)
         assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }

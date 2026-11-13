@@ -1,0 +1,27 @@
+# date(1)
+
+## NAME
+
+date - print the date and time
+
+## SYNOPSIS
+
+    date [-u] [+format]
+
+## DESCRIPTION
+
+Prints the current date and time. Time is always UTC (there are no time zones yet). The default format is `%a %b %e %H:%M:%S UTC %Y`.
+
+A format starting with `+` uses strftime conversions: `%Y %C %y %m %d %e %H %I %M %S %p %j %a %A %b %h %B %u %w %s %N %F %T %D %R %Z %z %n %t %%`. Setting the clock is not supported.
+
+## OPTIONS
+
+- `-u`: accepted; the time is always UTC
+
+## EXAMPLES
+
+    date +%F
+
+## SEE ALSO
+
+sleep(1)

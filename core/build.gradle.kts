@@ -287,7 +287,7 @@ val osLibrarySources = fileTree(osLibrary) { include("**/*.zig") }
 // 可変長の結果を返す import（`kibi.events` の `take`・`process.listProcesses`・`mounts.listMounts`/`listDisks`）を使い、
 // `cabi_realloc`（`os/lib/kibi/canon.zig`）を export する必要があるプログラム。使うものを足したら、ここにも足す
 // （足し忘れると、読み込みで NOEXEC になる。`StandardOsRestoreTest` が import から検出する）
-val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount"))
+val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount", "man"))
 
 // `os/<dir>/` の `.zig` を1つずつ WASM にする（sourceSet が null ならリソースに入れない）
 fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir(dir).asFile
@@ -344,6 +344,8 @@ val zipOsImage = tasks.register<Zip>("zipOsImage") {
     with(luaBinary)
     // 設定ファイル（`os/etc/` → イメージの `/etc/`。#100 の `/etc/inittab` など）
     from(osDir.dir("etc")) { into("etc") }
+    // man ページ（#106。`os/man/[言語/]man<節>/<名前>.<節>` → `/usr/share/man/...`。書式は docs/adr/0106-man.md）
+    from(osDir.dir("man")) { into("usr/share/man") }
     from(osImageSkeleton)
     archiveFileName = "os.zip"
     destinationDirectory = layout.buildDirectory.dir("generated/images/os/kibicomputers/images")

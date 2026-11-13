@@ -1,0 +1,28 @@
+# lua(1)
+
+## NAME
+
+lua - the Lua interpreter
+
+## SYNOPSIS
+
+    lua [options] [script [args...]]
+
+## DESCRIPTION
+
+Runs Lua programs. Without a script, reads an interactive prompt (REPL) when standard input is a terminal, or runs standard input as a script otherwise.
+
+There is no shell inside Lua: `os.execute`, `io.popen` and `os.tmpname` are not available.
+
+## OPTIONS
+
+- `-e stat`: execute the string
+- `-i`: enter interactive mode after the script
+- `-l name`: require the library
+- `-v`: print version information
+- `-E`: ignore environment variables
+- `-`: run standard input
+
+## SEE ALSO
+
+nano(1), sh(1)

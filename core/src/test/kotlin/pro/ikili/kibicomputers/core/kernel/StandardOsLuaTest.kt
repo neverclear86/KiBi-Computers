@@ -104,9 +104,9 @@ class StandardOsLuaTest {
         val resource = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/lua.wasm")) { "lua.wasm がリソースにない" }
             .use { it.readBytes() }
         assertArrayEquals(resource, bytes)
-        // 根は bin・etc・home・sbin・tmp だけ（lua の元の置き場所 `kibicomputers/` の空のディレクトリが入らない）
+        // 根は bin・etc・home・sbin・tmp・usr（man ページ。#106）だけ（lua の元の置き場所 `kibicomputers/` の空のディレクトリが入らない）
         val root = image.readDirectory(image.stat(VfsPath.ROOT).node).map { it.name }.sorted()
-        assertEquals(listOf("bin", "etc", "home", "sbin", "tmp"), root)
+        assertEquals(listOf("bin", "etc", "home", "sbin", "tmp", "usr"), root)
     }
 
     @Test

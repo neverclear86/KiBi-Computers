@@ -1,0 +1,27 @@
+# tail(1)
+
+## NAME
+
+tail - output the last part of files
+
+## SYNOPSIS
+
+    tail [-n [+]lines] [file...]
+
+## DESCRIPTION
+
+Writes the last 10 lines of each file (or standard input). With `+N`, writes from line N to the end. `-f` is not supported.
+
+## OPTIONS
+
+- `-n lines`: number of lines (also `-lines`)
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+head(1)

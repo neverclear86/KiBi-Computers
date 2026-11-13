@@ -1,0 +1,27 @@
+# basename(1)
+
+## 名前
+
+basename - パスからディレクトリと後ろの部分を除く
+
+## 書式
+
+    basename path [suffix]
+    basename -a [-s suffix] path...
+
+## 説明
+
+パスの最後の部分を、末尾の `/` を除いて書きます。`.txt` のような後ろの部分を書くと、名前がそれで終わっていれば（名前全体と同じでなければ）除きます。
+
+## オプション
+
+- `-a`: パスを複数受け付ける
+- `-s suffix`: この後ろの部分を除く（`-a` も付く）
+
+## 例
+
+    basename /home/note.txt .txt
+
+## 関連項目
+
+dirname(1)

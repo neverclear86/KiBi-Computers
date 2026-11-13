@@ -1,0 +1,26 @@
+# kibi(7)
+
+## 名前
+
+kibi - WASI の対応範囲と kibi の拡張
+
+## 説明
+
+プログラムは WebAssembly の上で、WASI preview 1・preview 2・preview 3 と Component Model で動きます。WASI にない機能は、`kibi:*` という名前の WIT のパッケージで出しています。preview 1 のプログラムには、同じ関数を `kibi:パッケージ/インターフェース@版` という名前の import で出しています。
+
+## パッケージ
+
+- `kibi:kernel`: イベントのキュー（`events`）とタイマー（`timers`）
+- `kibi:process`: プロセスを起こす・待つ・止める、作業ディレクトリ、プロセスの一覧
+- `kibi:io`: ファイル記述子の複製、パイプ、端末（`tty`: raw モード・大きさ・前景）
+- `kibi:fs`: ディスクのマウントと、マウント・ディスクの一覧（`mounts`）
+- `kibi:computer`: 残りのメモリ（`memory`）、起動からの時間とゲーム内の時間（`clock`）、電源（`power`）
+- `kibi:device`: デバイスの一覧と操作（`bus`）
+
+## 注意
+
+詳しい定義は MOD の WIT のファイルと設計の文書にあります。
+
+## 関連項目
+
+intro(7)

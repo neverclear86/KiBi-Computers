@@ -1,0 +1,29 @@
+# intro(7)
+
+## NAME
+
+intro - introduction to the standard OS
+
+## DESCRIPTION
+
+The standard OS of KiBi Computers is a small Unix-like system. Programs are WebAssembly modules; the commands in `/bin` are written in Zig, and `/bin/lua` runs Lua.
+
+Start with `ls /bin` to see the commands, and `man name` to read about one. `man -k word` searches the page summaries.
+
+## FILES
+
+- `/bin`: commands
+- `/sbin`: system programs (init)
+- `/etc`: settings
+- `/home`: your files (on the hard disk)
+- `/tmp`: temporary files in RAM
+- `/dev`: devices
+- `/usr/share/man`: manual pages
+
+## NOTES
+
+Manual pages are small Markdown files under `/usr/share/man/[LANG/]manN/name.N`. A translation is added by creating a language directory such as `/usr/share/man/fr`; pages without a translation fall back to English.
+
+## SEE ALSO
+
+man(1), sh(1), kibi(7)

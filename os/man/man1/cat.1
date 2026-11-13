@@ -1,0 +1,26 @@
+# cat(1)
+
+## NAME
+
+cat - concatenate files to standard output
+
+## SYNOPSIS
+
+    cat [-u] [file...]
+
+## DESCRIPTION
+
+Writes each file in order to standard output. With no file, or when a file is `-`, reads standard input.
+
+## OPTIONS
+
+- `-u`: accepted for compatibility; output is never buffered across files
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+
+## SEE ALSO
+
+head(1), tail(1), tee(1)
