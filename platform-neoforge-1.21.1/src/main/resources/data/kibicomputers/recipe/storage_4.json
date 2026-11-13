@@ -1,5 +1,5 @@
 {
-  "type": "minecraft:crafting_shaped",
+  "type": "kibicomputers:disk_upgrade",
   "category": "misc",
   "pattern": [
     "MRM",
