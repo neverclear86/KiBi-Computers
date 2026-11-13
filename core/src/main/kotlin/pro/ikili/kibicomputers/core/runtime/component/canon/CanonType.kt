@@ -37,6 +37,23 @@ internal sealed class CanonType {
     abstract val flat: List<CoreFlat>?
     abstract val depth: Int
 
+    /** 型の書き方を [out] に足す（[appendTo] から呼ぶ） */
+    protected abstract fun render(out: StringBuilder)
+
+    /**
+     * 型の書き方を [out] に足す。展開した木が大きい型（共有した部分型を重ねたもの）でも指数的な長さにならないよう、
+     * [MAX_RENDER] 文字を超えたら `…` で打ち切る
+     */
+    internal fun appendTo(out: StringBuilder) {
+        if (out.length >= MAX_RENDER) {
+            if (!out.endsWith(ELLIPSIS)) out.append(ELLIPSIS)
+            return
+        }
+        render(out)
+    }
+
+    final override fun toString(): String = StringBuilder().also { appendTo(it) }.toString()
+
     /** 大きさ・align・平らにした形が決まったプリミティブ */
     sealed class Primitive(
         override val size: Int,
@@ -46,7 +63,9 @@ internal sealed class CanonType {
         override val align: Int get() = size
         override val flat: List<CoreFlat> = listOf(flat)
         override val depth: Int get() = 1
-        override fun toString(): String = label
+        override fun render(out: StringBuilder) {
+            out.append(label)
+        }
     }
 
     object Bool : Primitive(1, CoreFlat.I32, "bool")
@@ -68,7 +87,9 @@ internal sealed class CanonType {
         override val align: Int get() = 4
         override val flat: List<CoreFlat> = listOf(CoreFlat.I32, CoreFlat.I32)
         override val depth: Int get() = 1
-        override fun toString(): String = "string"
+        override fun render(out: StringBuilder) {
+            out.append("string")
+        }
     }
 
     /** `list<T>`（長さが決まっていないもの。`{ ptr: u32, len: u32 }`） */
@@ -77,7 +98,11 @@ internal sealed class CanonType {
         override val align: Int get() = 4
         override val flat: List<CoreFlat> get() = Str.flat
         override val depth: Int = element.depth + 1
-        override fun toString(): String = "list<$element>"
+        override fun render(out: StringBuilder) {
+            out.append("list<")
+            element.appendTo(out)
+            out.append('>')
+        }
     }
 
     /** record・tuple（フィールドを順に align に揃えて並べる） */
@@ -113,12 +138,29 @@ internal sealed class CanonType {
             require(names.size == types.size) { "フィールドの名前と型の数が違う" }
         }
 
-        override fun toString(): String = names.indices.joinToString(", ", "record{", "}") { "${names[it]}: ${fieldTypes[it]}" }
+        override fun render(out: StringBuilder) {
+            out.append("record{")
+            for (i in names.indices) {
+                if (i > 0) out.append(", ")
+                if (out.length >= MAX_RENDER) { out.append(ELLIPSIS); break }
+                out.append(names[i]).append(": ")
+                fieldTypes[i].appendTo(out)
+            }
+            out.append('}')
+        }
     }
 
     /** `tuple` */
     class Tuple(types: List<CanonType>) : Fields(types) {
-        override fun toString(): String = fieldTypes.joinToString(", ", "tuple<", ">")
+        override fun render(out: StringBuilder) {
+            out.append("tuple<")
+            for ((i, t) in fieldTypes.withIndex()) {
+                if (i > 0) out.append(", ")
+                if (out.length >= MAX_RENDER) { out.append(ELLIPSIS); break }
+                t.appendTo(out)
+            }
+            out.append('>')
+        }
     }
 
     /**
@@ -175,23 +217,52 @@ internal sealed class CanonType {
             require(names.size == types.size) { "場合の名前と型の数が違う" }
         }
 
-        override fun toString(): String =
-            names.indices.joinToString(", ", "variant{", "}") { i -> caseTypes[i]?.let { "${names[i]}($it)" } ?: names[i] }
+        override fun render(out: StringBuilder) {
+            out.append("variant{")
+            for (i in names.indices) {
+                if (i > 0) out.append(", ")
+                if (out.length >= MAX_RENDER) { out.append(ELLIPSIS); break }
+                out.append(names[i])
+                val t = caseTypes[i] ?: continue
+                out.append('(')
+                t.appendTo(out)
+                out.append(')')
+            }
+            out.append('}')
+        }
     }
 
     /** `enum`（中身のない variant） */
     class Enum(val names: List<String>) : Cases(arrayOfNulls<CanonType>(names.size).asList()) {
-        override fun toString(): String = names.joinToString(", ", "enum{", "}")
+        override fun render(out: StringBuilder) {
+            out.append("enum{")
+            for ((i, n) in names.withIndex()) {
+                if (i > 0) out.append(", ")
+                if (out.length >= MAX_RENDER) { out.append(ELLIPSIS); break }
+                out.append(n)
+            }
+            out.append('}')
+        }
     }
 
     /** `option<T>`（`none` が 0、`some` が 1） */
     class Option(val type: CanonType) : Cases(listOf(null, type)) {
-        override fun toString(): String = "option<$type>"
+        override fun render(out: StringBuilder) {
+            out.append("option<")
+            type.appendTo(out)
+            out.append('>')
+        }
     }
 
     /** `result<T, E>`（`ok` が 0、`error` が 1） */
     class Result(val ok: CanonType?, val err: CanonType?) : Cases(listOf(ok, err)) {
-        override fun toString(): String = "result<${ok ?: "_"}, ${err ?: "_"}>"
+        override fun render(out: StringBuilder) {
+            out.append("result<")
+            if (ok == null) out.append('_') else ok.appendTo(out)
+            out.append(", ")
+            if (err == null) out.append('_') else err.appendTo(out)
+            out.append('>')
+        }
     }
 
     /** `flags`（32 個まで。8 個までは 1 バイト、16 個までは 2 バイト、それより多ければ 4 バイト） */
@@ -211,7 +282,15 @@ internal sealed class CanonType {
             mask = if (n == 32) -1 else (1 shl n) - 1
         }
 
-        override fun toString(): String = names.joinToString(", ", "flags{", "}")
+        override fun render(out: StringBuilder) {
+            out.append("flags{")
+            for ((i, n) in names.withIndex()) {
+                if (i > 0) out.append(", ")
+                if (out.length >= MAX_RENDER) { out.append(ELLIPSIS); break }
+                out.append(n)
+            }
+            out.append('}')
+        }
     }
 
     /**
@@ -226,11 +305,15 @@ internal sealed class CanonType {
     }
 
     class Own(resource: Int) : Handle(resource) {
-        override fun toString(): String = "own<$resource>"
+        override fun render(out: StringBuilder) {
+            out.append("own<").append(resource).append('>')
+        }
     }
 
     class Borrow(resource: Int) : Handle(resource) {
-        override fun toString(): String = "borrow<$resource>"
+        override fun render(out: StringBuilder) {
+            out.append("borrow<").append(resource).append('>')
+        }
     }
 
     companion object {
@@ -239,6 +322,11 @@ internal sealed class CanonType {
 
         /** flags の数の上限 */
         const val MAX_FLAGS: Int = 32
+
+        /** [toString] の長さの目安（超えたら `…` で打ち切る） */
+        private const val MAX_RENDER: Int = 400
+
+        private const val ELLIPSIS: String = "…"
 
         private val I32_FLAT = listOf(CoreFlat.I32)
 
@@ -271,27 +359,37 @@ internal sealed class CanonType {
         /**
          * [a] と [b] が同じ形か（名前・場合・フィールドの並びと型、resource の識別子まで同じ）。
          * ホストが宣言した型と、ゲストの型が合うかを確かめるのに使う（呼ぶのはリンク。#263）。
-         * 同じオブジェクトは中まで見ない（型は共有されるので、たどる手間はほぼ型の定義の数で済む）
+         * 同じオブジェクトは中まで見ない。別々に作った同じ形の型どうしでも、比べた（オブジェクトの）組は
+         * 1回しかたどらないので、手間は木に展開した大きさではなく、2つの型の定義の数の積までで済む
          */
-        fun sameShape(a: CanonType?, b: CanonType?): Boolean {
+        fun sameShape(a: CanonType?, b: CanonType?): Boolean = sameShape(a, b, HashSet())
+
+        /** 参照で比べる組。違いが見つかれば全体が `false` で終わるので、たどり始めた組は「同じ」として扱ってよい */
+        private class Pair(val a: CanonType, val b: CanonType) {
+            override fun equals(other: Any?): Boolean = other is Pair && other.a === a && other.b === b
+            override fun hashCode(): Int = System.identityHashCode(a) * 31 + System.identityHashCode(b)
+        }
+
+        private fun sameShape(a: CanonType?, b: CanonType?, seen: HashSet<Pair>): Boolean {
             if (a === b) return true
             if (a == null || b == null) return false
+            if (!seen.add(Pair(a, b))) return true
             return when (a) {
                 is Primitive, Str -> false // プリミティブはオブジェクトが1つずつなので、参照が違えば違う
-                is ListOf -> b is ListOf && sameShape(a.element, b.element)
-                is Record -> b is Record && a.names == b.names && sameAll(a.fieldTypes, b.fieldTypes)
-                is Tuple -> b is Tuple && sameAll(a.fieldTypes, b.fieldTypes)
-                is Variant -> b is Variant && a.names == b.names && sameAll(a.caseTypes, b.caseTypes)
+                is ListOf -> b is ListOf && sameShape(a.element, b.element, seen)
+                is Record -> b is Record && a.names == b.names && sameAll(a.fieldTypes, b.fieldTypes, seen)
+                is Tuple -> b is Tuple && sameAll(a.fieldTypes, b.fieldTypes, seen)
+                is Variant -> b is Variant && a.names == b.names && sameAll(a.caseTypes, b.caseTypes, seen)
                 is Enum -> b is Enum && a.names == b.names
-                is Option -> b is Option && sameShape(a.type, b.type)
-                is Result -> b is Result && sameShape(a.ok, b.ok) && sameShape(a.err, b.err)
+                is Option -> b is Option && sameShape(a.type, b.type, seen)
+                is Result -> b is Result && sameShape(a.ok, b.ok, seen) && sameShape(a.err, b.err, seen)
                 is Flags -> b is Flags && a.names == b.names
                 is Own -> b is Own && a.resource == b.resource
                 is Borrow -> b is Borrow && a.resource == b.resource
             }
         }
 
-        private fun sameAll(a: List<CanonType?>, b: List<CanonType?>): Boolean =
-            a.size == b.size && a.indices.all { sameShape(a[it], b[it]) }
+        private fun sameAll(a: List<CanonType?>, b: List<CanonType?>, seen: HashSet<Pair>): Boolean =
+            a.size == b.size && a.indices.all { sameShape(a[it], b[it], seen) }
     }
 }

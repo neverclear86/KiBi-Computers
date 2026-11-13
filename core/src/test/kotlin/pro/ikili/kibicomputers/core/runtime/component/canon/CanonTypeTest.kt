@@ -3,9 +3,11 @@ package pro.ikili.kibicomputers.core.runtime.component.canon
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTimeoutPreemptively
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.function.ThrowingSupplier
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType.Bool
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType.Enum
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType.F32
@@ -25,6 +27,7 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType.Variant
 import pro.ikili.kibicomputers.core.runtime.component.canon.CoreFlat.I32
 import pro.ikili.kibicomputers.core.runtime.component.canon.CoreFlat.I64
 import pro.ikili.kibicomputers.core.wasi.p1.P1Canonical
+import java.time.Duration
 
 /** Canonical ABI の型の配置と平らにした形（#264） */
 class CanonTypeTest {
@@ -131,5 +134,50 @@ class CanonTypeTest {
         assertTrue(CanonType.sameShape(Result(null, a), Result(null, b)))
         assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Own(2)))
         assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Borrow(1)))
+    }
+
+    private fun <T> within10s(block: () -> T): T = assertTimeoutPreemptively(Duration.ofSeconds(10), ThrowingSupplier { block() })
+
+    /** 部分型を 2 回ずつ指して重ねた型（大きさはほとんど増えないが、木に展開すると 2^depth の大きさ） */
+    private fun diamond(depth: Int, leaf: CanonType): CanonType {
+        var t = leaf
+        repeat(depth - 1) { t = Result(t, t) }
+        return t
+    }
+
+    @Test
+    fun `別々に作った共有の多い型どうしも、比べる手間は型の定義の数で済む`() {
+        // 深さ 100 まで作れる（CanonTypeSpace も wasmparser も通す）。木に展開すると 2^99 回の比較になる
+        val a = diamond(CanonLimits.MAX_TYPE_DEPTH, U32)
+        val b = diamond(CanonLimits.MAX_TYPE_DEPTH, U32)
+        assertEquals(CanonLimits.MAX_TYPE_DEPTH, a.depth)
+        assertTrue(within10s { CanonType.sameShape(a, b) })
+        // 一番底が違えば、違うと分かる（これも定義の数で済む）
+        val c = diamond(CanonLimits.MAX_TYPE_DEPTH, U64)
+        assertFalse(within10s { CanonType.sameShape(a, c) })
+        // 形が同じで片方の一番底の 1 か所だけが違うものも、違うと分かる
+        var left: CanonType = Result(U32, U32)
+        var right: CanonType = Result(U32, U64)
+        repeat(CanonLimits.MAX_TYPE_DEPTH - 2) {
+            left = Result(left, left)
+            right = Result(right, right)
+        }
+        assertFalse(within10s { CanonType.sameShape(left, right) })
+    }
+
+    @Test
+    fun `型の書き方は、展開すると大きい型でも短く打ち切る`() {
+        assertEquals("record{f0: u32, f1: string}", record(U32, Str).toString())
+        assertEquals("result<_, list<u8>>", Result(null, ListOf(U8)).toString())
+        assertEquals("variant{c0(u8), c1}", variant(U8, null).toString())
+        assertEquals("option<own<3>>", Option(CanonType.Own(3)).toString())
+        val deep = diamond(CanonLimits.MAX_TYPE_DEPTH, U32)
+        val s = within10s { deep.toString() }
+        assertTrue(s.length < 1000) { "${s.length} 文字" }
+        assertTrue(s.contains("…"))
+        // 深さ 10 万の鎖も、再帰を使い果たさずに書ける
+        var t: CanonType = U8
+        repeat(100_000) { t = Option(t) }
+        assertTrue(t.toString().length < 1000)
     }
 }

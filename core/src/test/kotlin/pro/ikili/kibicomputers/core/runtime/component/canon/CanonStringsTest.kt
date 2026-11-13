@@ -126,6 +126,61 @@ class CanonStringsTest {
     }
 
     @Test
+    fun `latin1 で lift したものを UTF-8 へは、最悪の大きさ（単位数の 2 倍）で広げて縮める`() {
+        memory.write(0x100, bytes(0x61, 0xe9))
+        val latin = CanonStrings.load(cx(LATIN1_UTF16), 0x100, 2)
+        realloc.calls.clear()
+        val (b, n) = store(UTF8, latin)
+        assertArrayEquals("aé".toByteArray(), b)
+        assertEquals(3L, n)
+        // 元は 2 単位: 2 で取り、最悪の 4 に広げ、3 に縮める
+        assertEquals(listOf(2, 4, 3), realloc.calls.map { it.newSize })
+        assertEquals(listOf(0, 2, 4), realloc.calls.map { it.oldSize })
+        assertEquals(listOf(1, 1, 1), realloc.calls.map { it.align })
+        // ASCII だけなら、取ったまま（広げも縮めもしない）
+        memory.write(0x200, bytes(0x61, 0x62))
+        val ascii = CanonStrings.load(cx(LATIN1_UTF16), 0x200, 2)
+        realloc.calls.clear()
+        val (b2, n2) = store(UTF8, ascii)
+        assertArrayEquals("ab".toByteArray(), b2)
+        assertEquals(2L, n2)
+        assertEquals(listOf(Call(0, 0, 1, 2)), realloc.calls)
+    }
+
+    @Test
+    fun `UTF-16 で lift したものを UTF-16 へは、元と同じ大きさで 1 回だけ取って写す`() {
+        memory.write(0x100, "a😀é".toByteArray(Charsets.UTF_16LE))
+        val s = CanonStrings.load(cx(UTF16), 0x100, 4)
+        assertEquals("a😀é", s.value)
+        realloc.calls.clear()
+        val (b, n) = store(UTF16, s)
+        assertArrayEquals("a😀é".toByteArray(Charsets.UTF_16LE), b)
+        assertEquals(4L, n)
+        assertEquals(listOf(Call(0, 0, 2, 8)), realloc.calls)
+    }
+
+    @Test
+    fun `UTF-16 で lift したものを latin1+utf16 へは、単位数で取り、縮めない`() {
+        // すべて latin1: 2 単位で取り、そのまま（UTF-8 のバイト数ではなく単位数で数えるので、縮める realloc は起きない）
+        memory.write(0x100, "aé".toByteArray(Charsets.UTF_16LE))
+        val latin = CanonStrings.load(cx(UTF16), 0x100, 2)
+        realloc.calls.clear()
+        val (b, n) = store(LATIN1_UTF16, latin)
+        assertArrayEquals(bytes(0x61, 0xe9), b)
+        assertEquals(2L, n)
+        assertEquals(listOf(Call(0, 0, 2, 2)), realloc.calls)
+        // 2^8 以上の文字がある: 2 で取り、最悪の 4 に広げる。UTF-16 で 4 バイトなので縮めない
+        memory.write(0x200, "éあ".toByteArray(Charsets.UTF_16LE))
+        val wide = CanonStrings.load(cx(UTF16), 0x200, 2)
+        realloc.calls.clear()
+        val (b2, n2) = store(LATIN1_UTF16, wide)
+        assertArrayEquals(bytes(0xe9, 0, 0x42, 0x30), b2)
+        assertEquals(2L or tag, n2)
+        assertEquals(listOf(2, 4), realloc.calls.map { it.newSize })
+        assertEquals(listOf(0, 2), realloc.calls.map { it.oldSize })
+    }
+
+    @Test
     fun `4 バイトの文字とサロゲートの対`() {
         val (b, n) = store(UTF16, CanonValue.str("😀"))
         assertArrayEquals("😀".toByteArray(Charsets.UTF_16LE), b)
