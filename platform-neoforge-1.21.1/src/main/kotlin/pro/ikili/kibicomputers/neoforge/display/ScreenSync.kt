@@ -155,7 +155,8 @@ object ScreenSync {
 
     /**
      * 1つの画面の [ScreenWatchers] に、プレイヤーの位置を教え、フラグメントを送る口。
-     * 画面のチャンクがプレイヤーに届いていない（追跡していない、送る順番を待っている）間は、見られないものとする。
+     * 画面のチャンクがプレイヤーに届いていない（追跡していない、まだ送れる状態になっていない、送る順番を待っている）間は、
+     * 見られないものとする（[isChunkSent]）。
      */
     internal class Host(private val screen: ScreenBlockEntity) : ScreenSyncHost<ServerPlayer> {
         private val center = Vec3.atCenterOf(screen.blockPos)
@@ -168,9 +169,8 @@ object ScreenSync {
             if (player.hasDisconnected() || player.isRemoved || player.level() !== screen.level) {
                 return Double.POSITIVE_INFINITY
             }
-            if (!player.chunkTrackingView.contains(chunk) || player.connection.chunkSender.isPending(chunk.toLong())) {
-                return Double.POSITIVE_INFINITY
-            }
+            val level = screen.level as? ServerLevel ?: return Double.POSITIVE_INFINITY
+            if (!isChunkSent(level, player, chunk)) return Double.POSITIVE_INFINITY
             return center.distanceToSqr(player.eyePosition)
         }
 
@@ -180,11 +180,34 @@ object ScreenSync {
         }
     }
 
+    /**
+     * [chunk] がもう [player] に送られたか（クライアントがチャンクを持っているはずか）。メインスレッドから呼ぶ。
+     *
+     * サーバーはチャンクを、追跡の範囲に入っただけでは送らず、送れる状態（[net.minecraft.server.level.ChunkMap.getChunkToSend]。
+     * ブロックが tick する段まで読み込み終えたもの）になってから送る順番待ちに入れる。画面のブロックエンティティは、その前の段
+     * （FULL）で読み込まれるので、追跡の範囲に入っていて順番待ちでもないのに、まだ送っていないことがある。その間に送った画面の中身は、
+     * クライアントがチャンクを持っていないので捨てられ、サーバーは送れたものとして差分しか送らない（#636。ワールドに入り直した直後、
+     * 画面が空のままになった）。
+     */
+    internal fun isChunkSent(level: ServerLevel, player: ServerPlayer, chunk: ChunkPos): Boolean {
+        if (!player.chunkTrackingView.contains(chunk)) return false
+        val key = chunk.toLong()
+        if (player.connection.chunkSender.isPending(key)) return false
+        return level.chunkSource.chunkMap.getChunkToSend(key) != null
+    }
+
     // クライアント: 画面の中身のフラグメントを受け取った（メインスレッドで呼ばれる）
     private fun onUpdate(payload: ScreenUpdatePayload, context: IPayloadContext) {
         val level = context.player().level()
-        if (!level.isClientSide || level.dimension() != payload.dimension || !level.isLoaded(payload.pos)) return
-        val screen = level.getBlockEntity(payload.pos) as? ScreenBlockEntity ?: return
+        if (!level.isClientSide || level.dimension() != payload.dimension || !level.isLoaded(payload.pos)) {
+            // サーバーは送れたものとして扱うので、ここで捨てると次のキーフレームまで画面が古いままになる（#636）
+            LOGGER.debug("Dropped screen sync data at {}: the chunk is not loaded on the client", payload.pos)
+            return
+        }
+        val screen = level.getBlockEntity(payload.pos) as? ScreenBlockEntity ?: run {
+            LOGGER.debug("Dropped screen sync data at {}: no screen block entity on the client", payload.pos)
+            return
+        }
         if (!screen.receiveSync(payload.data)) {
             LOGGER.debug("Malformed screen sync data at {}; requesting a keyframe", payload.pos)
             context.reply(ScreenResyncPayload(payload.pos))
