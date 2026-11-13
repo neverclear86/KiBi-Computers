@@ -501,10 +501,11 @@ internal class ProcessRunner(private val machine: Machine) {
             giveBackLocked(remaining)
             scheduler.deactivate(rt)
             val prev = rt.process.state
+            // 数えてから状態を変える（ロックを外して数えると、WAITING_FUEL を見た側がまだ数えていない値を読む）
+            scheduler.fuelBlockingWaits.incrementAndGet()
             rt.process.state = ProcessState.WAITING_FUEL
             prev
         }
-        scheduler.fuelBlockingWaits.incrementAndGet()
         releasePermitAndCpu(rt)
         val grant = acquireCpu(rt, null)!!
         lock.withLockValue { rt.process.state = previous }
