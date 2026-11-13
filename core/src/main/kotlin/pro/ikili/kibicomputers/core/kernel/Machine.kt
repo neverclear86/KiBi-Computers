@@ -525,8 +525,10 @@ public class Machine private constructor(
 
     /**
      * 止まっていない（[isRunningOrBooting]）か、再起動の途中（[reboot] を受け付けてから、[MachineHost.onRebootRequested] で
-     * 起動し直すまで）なら `true`。ゲストやカーネルが止めた（[MachineState.CRASHED]）なら、再起動を求められていても `false`（#535）。
-     * [stop] で取り消した再起動は含まない。ロックを取らずに読むので、メインスレッドから何度呼んでもよい（#626）。
+     * 起動し直すまで）なら `true`。カーネルが止めた（[MachineState.CRASHED]）なら、再起動を求められていても `false`（#535）。
+     * [stop] で取り消した再起動は含まない（[stop] は再起動の求めの印を下ろす。ゲストが電源の求めで [stop] を呼んだときも同じ）。
+     * [reboot] の後に init が自分で終わっただけなら、求めの印は残るので `true` のまま再起動が続く（ゲストが止めても `false` とは限らない）。
+     * ロックを取らずに読むので、メインスレッドから何度呼んでもよい（#626）。
      *
      * 印と状態は、受け渡しの古い側を先に読む: 起動中の印 → 状態 → 再起動の求め（[rebootRequested]）→ 積んだ再起動の通知
      * （[rebootNotified]）。書く側はどれも、次の印を立ててから前の印を下ろす（init を作るときは `RUNNING` にしてから起動中の印を
@@ -2811,6 +2813,7 @@ public class Machine private constructor(
         // 通知の印を立ててから求めの印を下ろす（この順番は不変条件。ロックを取らずに読む [isRunningBootingOrRebooting] が、
         // 間で「再起動の途中でない」と見ないため。#626）
         rebootNotified = true
+        scheduler.hooks.duringRebootPost?.invoke(this)
         rebootRequested = false
         postNotification(HostNotification.RebootRequested)
     }

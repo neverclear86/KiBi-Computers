@@ -572,10 +572,12 @@ object TestComputerGameTests {
         helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
         var ticksAfterBreak = 0
         var placedTicks = -1
+        var attachedBefore = 0
         helper.succeedWhen {
             if (placedTicks < 0) {
                 helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting")
                 helper.assertTrue(++ticksAfterBreak > 2, "wait for the reconnect scheduled when the screen was broken")
+                attachedBefore = case.wiring.screenAttachCount
                 helper.assertTrue(machine.reboot(), "reboot should be accepted")
                 machine.stop()
                 helper.setBlock(
@@ -587,6 +589,11 @@ object TestComputerGameTests {
             helper.assertTrue(case.wiring.connectedScreen == null, "the stopped machine should not take the screen")
             helper.assertTrue(keyboard.owner == null, "the stopped machine should not take the keyboard")
             helper.assertTrue(++placedTicks > 3, "watch for a few ticks after placing")
+            // 一時的につないですぐ外れたものは、tick の終わりの状態では見えない（止まった通知でケースが結線を外す）。つないだ回数で確かめる
+            helper.assertTrue(
+                case.wiring.screenAttachCount == attachedBefore,
+                "the screen should never have been attached to the stopped machine (${case.wiring.screenAttachCount - attachedBefore} attach)",
+            )
             helper.assertTrue(case.computer.status == ComputerStatus.OFF, "the case should turn off: ${case.computer}")
             helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
             helper.setBlock(CASE, Blocks.AIR)

@@ -448,6 +448,32 @@ class BootTest {
     }
 
     @Test
+    fun `再起動の通知を積む区間の途中でも、ロックなしの読み手には再起動の途中に見える`() = env {
+        // #626: 通知の印を立ててから求めの印を下ろす（順番を戻すと、間で両方偽に見える窓ができる）。区間の途中で読ませる
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        val seen = ArrayList<Boolean>()
+        val stuck = AtomicBoolean()
+        h.scheduler.hooks.duringRebootPost = { machine ->
+            h.scheduler.hooks.duringRebootPost = null
+            // カーネルロックを持たない別のスレッド（メインスレッドの代わり）に読ませる。上限の付け方は duringInitSpawn のテストと同じ
+            val value = AtomicReference<Boolean?>()
+            val reader = Thread { value.set(machine.isRunningBootingOrRebooting) }.apply { isDaemon = true }
+            reader.start()
+            reader.join(READER_WAIT_MILLIS)
+            if (reader.isAlive) stuck.set(true) else value.get()?.let { synchronized(seen) { seen += it } }
+        }
+        // STOPPED でプロセスもスレッドもないので、reboot の中で通知を積む（フックはそこで呼ばれる）
+        assertTrue(m.reboot())
+        assertFalse(stuck.get(), "読み手が終わらない（ロックを取る読み方になっていないか）")
+        assertEquals(listOf(true), synchronized(seen) { seen.toList() }, "通知を積む区間の途中で、再起動の途中でないように見えた")
+        assertTrue(m.isRebootPending)
+        assertTrue(m.isRunningBootingOrRebooting, "積んだ後")
+    }
+
+    @Test
     fun `再起動の途中でもCRASHEDなら止まった扱い`() = env {
         // #535: reboot の後にマシンの不整合で止まっても、印は下りない（stopLocked は印を触らない）。CRASHED にはつながない
         disks.withInit("d", exe(exitingInit(0)))

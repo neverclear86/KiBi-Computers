@@ -66,4 +66,11 @@ internal class KernelTestHooks {
      */
     @Volatile
     var duringInitSpawn: ((Machine) -> Unit)? = null
+
+    /**
+     * 再起動の求めを通知の列に積む区間の途中（カーネルロックの中。通知の印を立てた後、求めの印を下ろす前。#626）。
+     * ロックを取らずに読む口（[Machine.isRunningBootingOrRebooting]）が、この間も正しく見えるかを確かめるのに使う
+     */
+    @Volatile
+    var duringRebootPost: ((Machine) -> Unit)? = null
 }

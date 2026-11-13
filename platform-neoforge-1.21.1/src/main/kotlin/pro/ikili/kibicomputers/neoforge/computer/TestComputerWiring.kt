@@ -72,6 +72,14 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     /** 画面のブロックのためにマシンにつないだ画面のデバイス。つないでいなければ null（テスト用） */
     val connectedScreenDevice: ScreenDevice? get() = screenDevice
 
+    /**
+     * 画面をマシンにつないだ回数（つなぎ直しも数える。つないですぐ外れても残る。テスト用）。
+     * 「つながなかった」ことは、ある時点で `connectedScreen == null` と読むだけだと、つないですぐ外れたものを見逃すので、これで確かめる
+     */
+    @Volatile
+    var screenAttachCount: Int = 0
+        private set
+
     /** スピーカーに届いたビープの数（音はまだ鳴らさない。テスト用） */
     val beeps: AtomicLong = AtomicLong()
 
@@ -132,6 +140,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     private fun attachScreen(level: Level, casePos: BlockPos, machine: Machine) {
         val screen = findScreen(level, casePos) ?: return
+        screenAttachCount++
         this.screen = screen
         screen.addRemovalListener(onScreenRemoved)
         // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。つなぐたびに新しく作る
