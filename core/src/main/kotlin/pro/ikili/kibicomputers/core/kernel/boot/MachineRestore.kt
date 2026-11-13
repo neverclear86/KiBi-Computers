@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.core.persist.StoredSnapshot
 import pro.ikili.kibicomputers.core.persist.snapshot.DecodedSnapshot
 import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotDecoder
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
@@ -166,7 +167,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
         } catch (e: RestoreCancelledException) {
             return
         } catch (e: RestoreFallbackException) {
-            LOG.log(System.Logger.Level.WARNING, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
+            // MOD のバージョン違いは更新直後に全台が当たるので、1台ごとは DEBUG（要約は接続層が1回出す。ADR 0088）
+            val level = if (e.cause0 == ColdBootCause.MOD_VERSION) System.Logger.Level.DEBUG else System.Logger.Level.WARNING
+            LOG.log(level, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
             machine.restoreFellBack(e.cause0)
             return
         } catch (t: Throwable) {
@@ -224,11 +227,15 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
         val stored = read(id, gen)
         val snapshot = stored.snapshot
+        // MOD のバージョンは、中身を解釈する前（KILLED 節・基準・モジュールより先）に比べる（#88、ADR 0088）
+        checkModVersion(snapshot.modVersion, "世代 $gen")
         if (snapshot.requiresColdBoot) {
             val cause = if (snapshot.coldBootReason == null) ColdBootCause.UNREADABLE else ColdBootCause.KILLED_SECTION
             fallback(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
         }
-        base = snapshot.deltaBase?.let { read(it.id, it.generation) }
+        base = snapshot.deltaBase?.let { ref ->
+            read(ref.id, ref.generation).also { checkModVersion(it.snapshot.modVersion, "差分の基準 ${ref.generation}") }
+        }
         this.stored = stored
         val referenced = try {
             SnapshotDecoder.moduleSources(snapshot, machine.config.maxProcesses)
@@ -261,8 +268,29 @@ internal class MachineRestore(private val machine: Machine, private val request:
         return prepare()
     }
 
-    /** [source] の読み込みを頼む。置き場になければ失敗を覚えて次に進み、`null` */
+    /**
+     * 保存データを書いた MOD のバージョン [saved] が今のもの（置き場の [pro.ikili.kibicomputers.core.persist.MachineSaveStore.modVersion]）
+     * と違えば冷えた起動（#88、ADR 0088）。文字列の完全一致で比べる
+     */
+    private fun checkModVersion(saved: String, what: String) {
+        val current = request.source.store.modVersion
+        if (saved != current) fallback(ColdBootCause.MOD_VERSION, "$what を書いた MOD のバージョン $saved と今の $current が違う")
+    }
+
+    /**
+     * [source] の読み込みを頼む。置き場にない・変換器の版が今のものと違うなら、失敗を覚えて次に進み、`null`
+     * （使う終わっていないプロセスがあるときだけ 3. で理由にする。ADR 0085・0088）
+     */
     private fun startLoad(source: ModuleSource): CompletableFuture<Program>? {
+        if (source.metered && source.instrumentationVersion != Instrumentation.VERSION) {
+            failures[moduleKey(source)] = RestoreFallbackException(
+                ColdBootCause.MODULE_MISMATCH,
+                "モジュール ${source.originalHex} の変換器の版 ${source.instrumentationVersion} と今の ${Instrumentation.VERSION} が違う",
+            )
+            next++
+            busySince = null
+            return null
+        }
         val bytes = machine.scheduler.moduleStore.get(source.originalHash)
         if (bytes == null) {
             failures[moduleKey(source)] = RestoreFallbackException(ColdBootCause.MODULE_MISSING, "モジュール ${source.originalHex} が置き場にない")

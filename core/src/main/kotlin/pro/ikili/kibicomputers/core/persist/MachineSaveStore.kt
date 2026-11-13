@@ -46,7 +46,7 @@ import kotlin.concurrent.withLock
  *
  * @property root 置き場の根
  * @property index サーバーの ID の索引
- * @param modVersion 保存データに書く MOD のバージョン
+ * @property modVersion 保存データに書く MOD のバージョン（戻すときは保存データのものと比べる。#88）
  * @param executor 保存の仕事を走らせる口（既定は呼んだスレッドでその場で走らせる [SaveExecutor.DIRECT]）
  * @param maxPendingBytes 書き込み待ちの写しの見積もりの合計の上限（[hasCapacity]）
  * @param claimWaitMillis [claim] がその UUID の仕事を待つ上限（過ぎたら新しい UUID にする）
@@ -55,7 +55,7 @@ import kotlin.concurrent.withLock
 public class MachineSaveStore @JvmOverloads constructor(
     public val root: Path,
     public val index: MachineIdIndex,
-    private val modVersion: String = "unknown",
+    public val modVersion: String = "unknown",
     private val executor: SaveExecutor = SaveExecutor.DIRECT,
     maxPendingBytes: Long = Long.MAX_VALUE,
     claimWaitMillis: Long = MachineSaveConfig.DEFAULT_WRITER_FLUSH_MILLIS,

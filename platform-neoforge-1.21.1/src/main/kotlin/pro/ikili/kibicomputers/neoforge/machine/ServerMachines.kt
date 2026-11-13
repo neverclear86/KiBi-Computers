@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.persist.AutosaveTarget
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.CaptureSubmitResult
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.ColdBootLog
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
@@ -138,6 +139,9 @@ object ServerMachines {
     /** 自動保存の周期を数える tick */
     private var autosaveTicks = 0L
 
+    /** 冷えた起動のログの出し方（MOD のバージョン違いの要約は、サーバーの起動ごとに1回。#88） */
+    private var coldBootLog = ColdBootLog()
+
     /** この tick のアンロードで待機点を待った時間の合計（ナノ秒） */
     private var unloadWaitedNanos = 0L
 
@@ -160,6 +164,9 @@ object ServerMachines {
 
         /** 戻せずに冷えた起動にした数 */
         var restoreFallbacks: Long = 0
+
+        /** [restoreFallbacks] のうち、保存データを書いた MOD のバージョンが今のものと違ったもの（#88） */
+        var restoreVersionMismatches: Long = 0
 
         /** FULL でなくなったチャンク（[ChunkTicketLevelUpdatedEvent]）のうち、動いているケースのあったもの（#545） */
         var demotedChunksWithCases: Long = 0
@@ -256,6 +263,7 @@ object ServerMachines {
             restoreWriteTimeouts = 0
             restored = 0
             restoreFallbacks = 0
+            restoreVersionMismatches = 0
             unloadEventsWithCases = 0
             demotedChunksWithCases = 0
             demotedMachines = 0
@@ -327,6 +335,7 @@ object ServerMachines {
         demoted.clear()
         promoted.clear()
         restoreQueue.clear()
+        coldBootLog = ColdBootLog()
         autosaveTicks = 0
         // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
         autosaveEnabled = event.server !is GameTestServer
@@ -369,7 +378,18 @@ object ServerMachines {
             RestoreOutcome.RESTORED -> Stats.restored++
             RestoreOutcome.COLD_BOOT -> {
                 Stats.restoreFallbacks++
-                LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
+                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
+                when (coldBootLog.classify(cause)) {
+                    ColdBootLog.Kind.EACH -> LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
+                    ColdBootLog.Kind.SUMMARY -> {
+                        LOGGER.info(
+                            "Computer saves were written by a different version of {}; running computers will cold-boot instead of being restored",
+                            KiBiComputers.MOD_ID,
+                        )
+                        LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
+                    }
+                    ColdBootLog.Kind.QUIET -> LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
+                }
             }
             RestoreOutcome.CANCELLED -> {}
         }

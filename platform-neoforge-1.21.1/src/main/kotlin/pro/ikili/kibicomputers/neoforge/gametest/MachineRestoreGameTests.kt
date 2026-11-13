@@ -9,6 +9,7 @@ import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.block.Blocks
+import net.neoforged.fml.ModList
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -64,6 +65,22 @@ object MachineRestoreGameTests {
         val sb = StringBuilder()
         for (x in 0 until text.width) sb.appendCodePoint(text.getCodePoint(x, y))
         sb.toString().trimEnd()
+    }
+
+    /**
+     * 置き場が保存データに書き、戻すときに比べる MOD のバージョン（#88）が、MOD のコンテナの版と同じで、`"unknown"` でない。
+     * 数え口（[ServerMachines.Stats]）は読みも書きもしない（ログの出し方の判定は core の `ColdBootLogTest` が受け持つ）
+     */
+    @JvmStatic
+    @GameTest(template = "empty")
+    fun saveStoreRecordsTheModVersion(helper: GameTestHelper) {
+        val store = WorldMachineSaves.current
+        helper.assertTrue(store != null, "the save store should exist while the server runs")
+        val expected = ModList.get().getModContainerById(KiBiComputers.MOD_ID).map { it.modInfo.version.toString() }.orElse(null)
+        helper.assertTrue(expected != null, "the mod container should exist")
+        helper.assertTrue(store!!.modVersion != "unknown", "the save store should know the mod version")
+        helper.assertTrue(store.modVersion == expected, "the save store should use the mod container version: ${store.modVersion} != $expected")
+        helper.succeed()
     }
 
     /** ケース・画面・キーボードを置き、電源を入れる */
