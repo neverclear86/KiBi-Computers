@@ -66,6 +66,13 @@ internal class ComponentLimits(
      * 展開した後の宣言の総数の上限にもなる
      */
     val maxExpansionSteps: Int = 1_000_000,
+    /**
+     * wasm-tools の検証の手間の見積もり（[ComponentValidationCost]）の上限。検証は途中で止められないので、
+     * インスタンス化の引数ごとの型の確認が膨らむ形（引数の総数 × 型の重さ）を、検証の前に断る。
+     * 測定では 1 単位あたり 1〜3.5 マイクロ秒（Windows・JDK 25、暖めた後）で、既定の値なら最悪でも数秒に収まる。
+     * 実際のツールチェーンのコンポーネントは、この 100 倍以上の余裕がある見込み
+     */
+    val maxValidationCost: Long = 2_000_000,
 ) {
     init {
         require(maxNestingDepth >= 0) { "maxNestingDepth は 0 以上: $maxNestingDepth" }

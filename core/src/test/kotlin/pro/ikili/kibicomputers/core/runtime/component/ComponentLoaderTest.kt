@@ -461,6 +461,166 @@ class ComponentLoaderTest {
         assertEquals(8, ComponentLoader.load(bytes).expandedCoreInstances)
     }
 
+    /**
+     * export が [n] 個のインスタンス型 2 つ、それを outer alias して import する入れ子のコンポーネント（import [k] 個）、
+     * それを [m] 回インスタンス化するもの。wasm-tools の検証が M × k × N に比例して重くなる形
+     */
+    private fun subtypeComponent(n: Int, k: Int, m: Int): ByteArray {
+        val exports = (0 until n).joinToString(" ") { """(export "f$it" (func))""" }
+        val imports = (0 until k).joinToString(" ") { """(import "i$it" (instance (type ${'$'}tb)))""" }
+        val args = (0 until k).joinToString(" ") { """(with "i$it" (instance ${'$'}a))""" }
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c $args))" }
+        return wat(
+            """
+            (component
+              (type ${'$'}ta (instance $exports))
+              (type ${'$'}tb (instance $exports))
+              (import "wasi:a/b" (instance ${'$'}a (type ${'$'}ta)))
+              (component ${'$'}c
+                (alias outer 1 ${'$'}tb (type ${'$'}tb))
+                $imports
+              )
+              $instances
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `インスタンス化の引数ごとの型の確認が膨らむ形は検証の前に断る`() {
+        // N=2,000・k=100・M=100 は wasm-tools の検証に CPU で 20 秒以上かかる（約 98 KB）。検証に入る前に断る
+        val bomb = subtypeComponent(n = 2000, k = 100, m = 100)
+        assertTrue(bomb.size < 400_000) { "${bomb.size}" }
+        var validated = false
+        val e = assertThrows<WasmLoadException> {
+            ComponentLoader.load(bomb, validate = { validated = true })
+        }
+        assertMessage(e, "検証が重すぎる")
+        assertTrue(!validated)
+        // 断るのは短い時間（パーサーと見積もりだけ）
+        val start = System.nanoTime()
+        rejects(bomb)
+        assertTrue(System.nanoTime() - start < 2_000_000_000L)
+
+        // 見積もりは、引数の総数 × 型の重さ
+        val small = subtypeComponent(n = 10, k = 3, m = 4)
+        val estimate = ComponentValidationCost.estimate(ComponentParser.parse(small, ComponentLimits.DEFAULT, null))
+        assertEquals(12L, estimate.argumentCount)
+        assertTrue(estimate.maxTypeWeight in 10L..30L) { "${estimate.maxTypeWeight}" }
+        // 上限は差し替えられる。同じ形でも小さければ通る
+        assertMessage(rejects(small, ComponentLimits(maxValidationCost = estimate.cost - 1)), "検証が重すぎる")
+        assertEquals(0, ComponentLoader.load(small, ComponentLimits(maxValidationCost = estimate.cost)).expandedCoreInstances)
+    }
+
+    @Test
+    fun `実際に使う形の見積もりは上限に十分収まる`() {
+        // WASI のインターフェースを数十個 import し、1 回インスタンス化するコンポーネントの規模
+        val c = subtypeComponent(n = 200, k = 60, m = 3)
+        val e = ComponentValidationCost.estimate(ComponentParser.parse(c, ComponentLimits.DEFAULT, null))
+        assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
+        assertDoesNotThrow { ComponentLoader.load(c) }
+    }
+
+    @Test
+    fun `instanceのexportに入れたコンポーネントも追って数える`() {
+        val bytes = wat(
+            """
+            (component
+              (component ${'$'}leaf (core module ${'$'}m) (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m)))
+              (instance ${'$'}bag (export "c" (component ${'$'}leaf)))
+              (alias export ${'$'}bag "c" (component ${'$'}c))
+              (instance (instantiate ${'$'}c))
+              (instance (instantiate ${'$'}c))
+              (instance (instantiate ${'$'}c))
+            )
+            """,
+        )
+        val c = ComponentLoader.load(bytes)
+        assertEquals(6, c.expandedCoreInstances)
+        assertEquals(3, c.expandedInstances)
+        // 数えた数が上限に当たる
+        assertMessage(rejects(bytes, ComponentLimits(maxExpandedCoreInstances = 5)), "コアモジュールのインスタンスの数")
+    }
+
+    @Test
+    fun `インスタンスの引数を入れ子のimportで受けて、そのexportのコンポーネントを数える`() {
+        val bytes = wat(
+            """
+            (component
+              (component ${'$'}leaf (core module ${'$'}m) (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m)))
+              (instance ${'$'}bag (export "c" (component ${'$'}leaf)))
+              (component ${'$'}user
+                (import "i" (instance ${'$'}i (export "c" (component))))
+                (alias export ${'$'}i "c" (component ${'$'}c))
+                (instance (instantiate ${'$'}c))
+                (instance (instantiate ${'$'}c))
+                (instance (instantiate ${'$'}c))
+              )
+              (instance (instantiate ${'$'}user (with "i" (instance ${'$'}bag))))
+            )
+            """,
+        )
+        val c = ComponentLoader.load(bytes)
+        // user の中で leaf を 3 回（6 個）。コンポーネントのインスタンスは bag を除いて user の 1 回と leaf の 3 回で 4 個
+        assertEquals(6, c.expandedCoreInstances)
+        assertEquals(4, c.expandedInstances)
+        assertMessage(rejects(bytes, ComponentLimits(maxExpandedInstances = 3)), "コンポーネントのインスタンスの数")
+    }
+
+    @Test
+    fun `exportが足す番号を使ってインスタンス化しても数える`() {
+        // mid の添字空間: component 0 = import の c、1 = export の c2（番号を足す）、2 = 中の big（core のインスタンスが 5 個）。
+        // 番号 1 を数え損なうと、big（5 個）を数えて合計が変わる
+        val bytes = wat(
+            """
+            (component
+              (component ${'$'}leaf (core module ${'$'}m) (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m)))
+              (component ${'$'}mid
+                (import "c" (component ${'$'}c))
+                (export ${'$'}c2 "c2" (component ${'$'}c))
+                (component ${'$'}big
+                  (core module ${'$'}m)
+                  (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m))
+                  (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m))
+                )
+                (instance (instantiate ${'$'}c2))
+              )
+              (instance ${'$'}x (instantiate ${'$'}mid (with "c" (component ${'$'}leaf))))
+              (alias export ${'$'}x "c2" (component ${'$'}again))
+              (instance (instantiate ${'$'}again))
+            )
+            """,
+        )
+        // mid の中で c2 = leaf を 1 回（2 個）、外で export された c2 = leaf を 1 回（2 個）
+        val c = ComponentLoader.load(bytes)
+        assertEquals(4, c.expandedCoreInstances)
+        assertEquals(3, c.expandedInstances)
+    }
+
+    @Test
+    fun `入れ子のimportの後の番号でインスタンス化しても数える`() {
+        // user の添字空間: component 0 = 自分の big（5 個）、1 = import の c。import が番号を足さないと、番号 1 は何も指さない
+        val bytes = wat(
+            """
+            (component
+              (component ${'$'}leaf (core module ${'$'}m) (core instance (instantiate ${'$'}m)))
+              (component ${'$'}user
+                (component ${'$'}big
+                  (core module ${'$'}m)
+                  (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m))
+                  (core instance (instantiate ${'$'}m)) (core instance (instantiate ${'$'}m))
+                )
+                (import "c" (component ${'$'}c))
+                (instance (instantiate ${'$'}c))
+                (instance (instantiate ${'$'}c))
+              )
+              (instance (instantiate ${'$'}user (with "c" (component ${'$'}leaf))))
+            )
+            """,
+        )
+        assertEquals(2, ComponentLoader.load(bytes).expandedCoreInstances)
+    }
+
     @Test
     fun `wasm-toolsの検証で型の誤りを断る`() {
         val bad = wat(
@@ -515,6 +675,69 @@ class ComponentLoaderTest {
         val bytes = wat("""(component (core module (import "kibi" "fuel" (func (param i64)))))""")
         assertMessage(rejects(bytes), "予約したモジュール名 kibi")
         assertDoesNotThrow { ComponentLoader.load(wat("""(component (core module (import "kibix" "fuel" (func (param i64)))))""")) }
+    }
+
+    /** [imports]（core モジュールの import の宣言）の後ろに、[last] を import する core モジュールを持つコンポーネント */
+    private fun importModule(imports: String, last: String = "kibi"): ByteArray =
+        wat("""(component (core module $imports (import "$last" "fuel" (func (param i64)))))""")
+
+    private fun moduleNames(bytes: ByteArray): List<String> {
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        return CoreModuleImports.moduleNames(bytes, root.allCoreModules().single())
+    }
+
+    @Test
+    fun `予約したモジュール名は表やメモリのimportの後ろにあっても見つける`() {
+        // import の記述の読み飛ばし（関数・テーブル・メモリ・グローバル・タグ）が 1 バイトでもずれると、後ろの import を見逃す
+        val before = mapOf(
+            "関数" to """(import "a" "f" (func (param i32)))""",
+            "メモリ" to """(import "a" "m" (memory 1))""",
+            "最大つきのメモリ" to """(import "a" "m2" (memory 300 60000))""",
+            "テーブル" to """(import "a" "t" (table 1 funcref))""",
+            "最大つきのテーブル" to """(import "a" "t2" (table 200 100000 externref))""",
+            "不変のグローバル" to """(import "a" "g" (global i32))""",
+            "可変のグローバル" to """(import "a" "g2" (global (mut f64)))""",
+            "タグ" to """(import "a" "e" (tag (param i32)))""",
+        )
+        for ((label, import) in before) {
+            val bytes = importModule(import)
+            assertEquals(listOf("a", "kibi"), moduleNames(bytes), label)
+            assertMessage(rejects(bytes), "予約したモジュール名 kibi")
+            // 予約していない名前なら通る
+            val ok = importModule(import, last = "kibix")
+            assertEquals(listOf("a", "kibix"), moduleNames(ok), label)
+            assertDoesNotThrow { ComponentLoader.load(ok) }
+        }
+        // すべてを並べた後ろでも見つける
+        // （メモリは 1 つまで）
+        val one = before.filterKeys { it != "最大つきのメモリ" }.values
+        val all = importModule(one.joinToString(" "))
+        assertEquals(List(one.size) { "a" } + "kibi", moduleNames(all))
+        assertMessage(rejects(all), "予約したモジュール名 kibi")
+        // 共有メモリ（スレッドは有効にしていないので検証には通らない）の後ろでも、読み飛ばしは合う
+        assertEquals(listOf("a", "kibi"), moduleNames(importModule("""(import "a" "m" (memory 1 2 shared))""")))
+        // 先頭にあっても、メモリの前にあっても同じ
+        val first = wat("""(component (core module (import "kibi" "x" (memory 1)) (import "b" "t" (table 1 funcref))))""")
+        assertEquals(listOf("kibi", "b"), moduleNames(first))
+        assertMessage(rejects(first), "予約したモジュール名 kibi")
+    }
+
+    @Test
+    fun `参照の型の長い形のimportも読み飛ばす`() {
+        // `(ref null $t)` のテーブルとグローバル（0x63・0x64 の後ろに型の添字が付く）。wasm-tools の検証には通らない
+        // （function-references は有効にしていない）ので、読み飛ばしだけを確かめる
+        val bytes = wat(
+            """
+            (component (core module
+              (type ${'$'}t (func))
+              (import "a" "t" (table 1 (ref null ${'$'}t)))
+              (import "a" "g" (global (ref null ${'$'}t)))
+              (import "a" "h" (global (mut (ref extern))))
+              (import "kibi" "fuel" (func (param i64)))
+            ))
+            """,
+        )
+        assertEquals(listOf("a", "a", "a", "kibi"), moduleNames(bytes))
     }
 
     @Test
