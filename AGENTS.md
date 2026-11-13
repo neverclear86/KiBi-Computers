@@ -160,4 +160,5 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - `platform-*/build.gradle.kts` でサブプロジェクトの `gradle.properties` を読むときは `property(name)` を使う（`providers.gradleProperty` はルートの値しか読まない）。
 - リポジトリはルート `build.gradle.kts` の `subprojects {}` で宣言している（ModDevGradle がプロジェクト側にリポジトリを足すため、settings 側の宣言は無視される）。
 - 1.20.1（Forge）は 1.21.1 と細部が違う: GameTest の構造物は `data/kibicomputers/structures/`（複数形）に置く。データを読ませるには `pack.mcmeta` が必要。`mods.toml` は `META-INF/mods.toml` で、依存の指定は `mandatory = true`。jar は `reobfJar` で SRG 名に変換される。
+- core のログ（`System.getLogger`、名前は `kibicomputers.*`）は、`CoreLogRouting`（JUL の `kibicomputers` ロガーに付けたハンドラー）から接続層の `CoreLogBridge` を通って SLF4J（`latest.log`・`debug.log`）に出る（#673）。`kibicomputers` の JUL ロガーのレベル・ハンドラーをいじらない。GameTest でログを確かめるときは、log4j の root の設定にアペンダーを付けて名前で絞る（`Logger.addAppender` だと、その名前の行がファイルに出なくなる）。
 - GameTest はクラスに `@GameTestHolder(KiBiComputers.MOD_ID)` と `@PrefixGameTestTemplate(false)`、メソッドに `@JvmStatic` と `@GameTest(template = "empty")` を付ける。`empty` は `data/kibicomputers/structure/empty.nbt`（空の 3x3x3）。例: `platform-neoforge-1.21.1/src/main/kotlin/pro/ikili/kibicomputers/neoforge/gametest/SmokeGameTests.kt`。

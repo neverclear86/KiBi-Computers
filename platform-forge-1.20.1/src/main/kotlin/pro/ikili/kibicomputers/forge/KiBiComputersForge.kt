@@ -13,6 +13,8 @@ object KiBiComputersForge {
 
     init {
         LOGGER.info("Loading {}", KiBiComputers.MOD_NAME)
+        // core のログ（EndiveRuntime の WARNING など）を取りこぼさないよう、ほかより先に取り付ける
+        CoreLogBridge.install(LOGGER)
         runCatching { RuntimeSelfCheck.add(1, 2) }
             .onSuccess { LOGGER.info("WASM runtime self-check passed (1 + 2 = {})", it) }
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
