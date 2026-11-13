@@ -735,14 +735,113 @@ class NanoEditorTest {
     }
 
     @Test
-    fun `1行しかない画面でも、本文の行を状態の行につなげて書かない`() = nano(
+    fun `1行の画面では、知らせか入力欄があるときだけ状態の行が本文の行を覆う`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
+        columns = 40,
+        rows = 1,
+    ) {
+        // 起動の知らせが本文を覆う（本文がつながって書かれない）
+        assertTrue(row(0).trim().startsWith("[ Read 1 line"), screen)
+        assertFalse(row(0).contains("abcdef"), screen)
+        // 知らせが消えると、本文が見える。タイトルは出さない
+        keys(right)
+        assertEquals("abcdef", row(0))
+        assertEquals(1 to 0, host.cursor())
+        keys("\u0003")
+        assertTrue(row(0).contains("line 1/2"), screen)
+        assertFalse(row(0).contains("abcdef"), screen)
+        // 次のキーで本文に戻る
+        keys(right)
+        assertEquals("abcdef", row(0))
+        assertEquals(2 to 0, host.cursor())
+        // 入力欄もカーソルも 0 行目に出る
+        keys("\u0017")
+        assertTrue(row(0).startsWith("Search"), screen)
+        assertEquals(0, host.cursor().second)
+        keys("\u0003")
+        assertTrue(row(0).contains("Cancelled"), screen)
+        keys(right)
+        assertEquals("abcdef", row(0))
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `2行の画面では、タイトルを出さずに本文1行と状態の行にする`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\nsecond\nthird\n".toByteArray()),
+        columns = 40,
+        rows = 2,
+    ) {
+        assertEquals("abcdef", row(0))
+        assertTrue(row(1).trim().startsWith("[ Read 3 lines"), screen)
+        assertEquals(0 to 0, host.cursor())
+        keys(right)
+        assertEquals("abcdef", row(0))
+        assertEquals("", row(1))
+        assertEquals(1 to 0, host.cursor())
+        keys("\u0003")
+        assertEquals("abcdef", row(0))
+        assertTrue(row(1).contains("line 1/4"), screen)
+        // 縦に動くと、本文の 1 行が入れ替わる（1 行のスクロール領域は使わない）
+        keys(down)
+        assertEquals("second", row(0))
+        assertEquals(1 to 0, host.cursor())
+        assertFalse(host.text().contains("\u001b[1;1r"), "1 行のスクロール領域を使った")
+        assertFalse(host.text().contains("\u001b[2;2r"), "状態の行をスクロール領域にした")
+        // 入力欄は 1 行目に出て、本文は見えたまま
+        keys("\u0017")
+        assertTrue(row(1).startsWith("Search"), screen)
+        assertEquals("second", row(0))
+        assertEquals(1, host.cursor().second)
+        keys("\u0003")
+        assertTrue(row(1).contains("Cancelled"), screen)
+        assertEquals("second", row(0))
+        // ヘルプも 0 行目から
+        keys("\u0007")
+        assertEquals("KiBi nano help", row(0))
+        keys(ctrlX)
+        assertEquals("second", row(0))
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `3行の画面では、タイトル・本文・状態の行を1行ずつ出す`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
+        columns = 40,
+        rows = 3,
+    ) {
+        assertTrue(row(0).contains("nano") && row(0).contains("r.txt"), screen)
+        assertEquals("abcdef", row(1))
+        assertTrue(row(2).contains("Read 1 line"), screen)
+        assertEquals(0 to 1, host.cursor())
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `25行から2行にしてまた25行に戻すと、タイトルの行が消えてから戻る`() = nano(
         listOf("r.txt"),
         files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
     ) {
-        m.resizeConsole(40, 1)
-        host.resize(40, 1)
+        assertTrue(row(0).contains("r.txt"), screen)
+        assertEquals("abcdef", row(1))
+        m.resizeConsole(80, 2)
+        host.resize(80, 2)
         keys(right)
-        assertFalse(row(0).startsWith("abcdef"), screen)
+        assertEquals("abcdef", row(0))
+        assertEquals("", row(1))
+        assertEquals(1 to 0, host.cursor())
+        m.resizeConsole(80, 25)
+        host.resize(80, 25)
+        keys(right)
+        assertTrue(row(0).contains("r.txt"), screen)
+        assertEquals("abcdef", row(1))
+        assertTrue(row(24).startsWith("^X Exit"), screen)
+        assertEquals(2 to 1, host.cursor())
         keys(ctrlX)
         assertEquals(0, finish())
     }
