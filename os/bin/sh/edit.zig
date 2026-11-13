@@ -49,6 +49,8 @@ var cur_row: usize = 0;
 /// Ctrl+K・Ctrl+U・Ctrl+W などで消した文字（Ctrl+Y で戻す）
 var kill_buf: [MAX_LINE]u8 = undefined;
 var kill_len: usize = 0;
+/// kill_buf が、上限を超えて切れた行を全部消したときの中身（Ctrl+Y で戻すと、切れた行がまた実行できてしまうため、戻したら印を付ける）
+var kill_truncated = false;
 
 /// 呼び戻している履歴の位置（history.len() なら編集中の新しい行）
 var hist_index: usize = 0;
@@ -373,12 +375,18 @@ fn insert(s: []const u8) bool {
     return true;
 }
 
+/// line[a..b] を消すと行が空になる
+fn removesAll(a: usize, b: usize) bool {
+    return a == 0 and b - a == len;
+}
+
 /// line[a..b] を消す。[save] なら Ctrl+Y で戻せるように残す
 fn remove(a: usize, b: usize, save: bool) void {
     if (b <= a) return;
     if (save) {
         @memcpy(kill_buf[0 .. b - a], line[a..b]);
         kill_len = b - a;
+        kill_truncated = truncated and removesAll(a, b);
     }
     const n = b - a;
     var k = a;
@@ -583,7 +591,10 @@ fn completeWord() void {
     var changed = false;
     if (common > w.text.len and util.startsWith(first.text, w.text)) {
         if (!insertQuoted(first.text[w.text.len..common], w.quote)) {
+            // 入らなかった。何も入れていないので、閉じる引用符や空白も足さない
             bell();
+            flush();
+            return;
         }
         changed = true;
     }
@@ -973,7 +984,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
             },
             25 => {
                 // Ctrl+Y
-                if (!insert(kill_buf[0..kill_len])) bell();
+                if (!insert(kill_buf[0..kill_len])) bell() else if (kill_truncated) lost();
                 refresh();
             },
             20 => {

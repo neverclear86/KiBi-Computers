@@ -245,8 +245,10 @@ object MachineSnapshotContentGameTests {
         fun read(identity: MachineIdentity): MachineSnapshot =
             DataInputStream(Files.newInputStream(store!!.generationFile(identity.id, identity.generation)).buffered()).use { MachineSnapshot.readFrom(it) }
         fun size(identity: MachineIdentity): Long = Files.size(store!!.generationFile(identity.id, identity.generation))
-        // 差分の保存。全体に切り替える比の境目（既定 0.5）は外す。シェルが 1 行で書き換える区画の比は、標準 OS の
-        // データの並び（文字列を 1 つ足しただけでも動く）しだいで境目をまたぐため（境目そのものは core の MachineDeltaCaptureTest が確かめる）
+        // 差分の保存。このテストが確かめるのは差分の世代の中身なので、全体に切り替える比の境目（既定 0.5）は外す。
+        // init と sh だけの小さな台では、シェルが 1 行で書き換える区画の比が、元から境目にある（main で 14/28 = 0.50、
+        // 標準 OS の文字列を足した #667 で 16/29 = 0.55）。境目そのものは core の MachineDeltaCaptureTest が確かめ、
+        // 既定値のままで差分になるかどうかは #668 で扱う
         fun saveDelta(policy: CapturePolicy): Int {
             val config = ServerMachines.saveConfig
             return try {

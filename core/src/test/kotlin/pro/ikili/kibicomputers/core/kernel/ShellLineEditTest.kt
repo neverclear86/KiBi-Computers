@@ -549,4 +549,77 @@ class ShellLineEditTest {
         assertTrue(!t.contains("  echo AAAA"), tail)
         assertEquals(0, s.exitCode)
     }
+
+    @Test
+    fun `切れた行は、Ctrl+Uで消してCtrl+Yで戻しても、履歴を行き来しても実行しない`() {
+        val a = "A".repeat(5000)
+        val s = session(
+            listOf(
+                "echo hist\r",
+                // 切れた行を Ctrl+U で消して Ctrl+Y で戻すと、印も戻る
+                "> /home/cy.txt echo $a\u0015\u0019\n",
+                // kill の中身は次の行にも残る。そこで戻しても実行しない
+                "\u0019\n",
+                // 履歴を呼び戻して編集中の行に戻ると、印も戻る
+                "> /home/ud.txt echo $a$up$down\n",
+                "echo \"st=\$?\"\r",
+                // 履歴の項目に置き換えて実行するなら、切れた行ではなくなる
+                "> /home/ud2.txt echo $a$up\r",
+                "history\r",
+                "exit\r",
+            ),
+            read = listOf("/home/cy.txt", "/home/ud.txt", "/home/ud2.txt", "/home/.sh_history"),
+            splittable = true,
+        )
+        val t = s.text
+        val tail = t.takeLast(2000)
+        assertEquals(3, Regex("sh: line too long\n").findAll(t).count(), tail)
+        assertTrue(t.contains("\nst=2\n"), tail)
+        assertEquals("<none>", s.files["/home/cy.txt"])
+        assertEquals("<none>", s.files["/home/ud.txt"])
+        // ud2 は直前の履歴（echo "st=$?"）に置き換わったので、ファイルは作られず、st=0 が出る
+        assertEquals("<none>", s.files["/home/ud2.txt"])
+        assertTrue(t.contains("\nst=0\n"), tail)
+        // 続けて同じ行を実行した分は、履歴に重ねない
+        assertEquals("echo hist\necho \"st=\$?\"\nhistory\nexit\n", s.files["/home/.sh_history"])
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `補完で入れる文字が行に入りきらないときは、何も入れない`() {
+        // ": " + P×4083 + " /tmp/a" で 4092 バイト。残り 4 バイトに、補う 9 バイト（bcdefghij）は入らない
+        val line = ": " + "P".repeat(4083) + " /tmp/a"
+        assertEquals(4092, line.toByteArray().size)
+        val s = session(
+            listOf("$line\t\r", "exit\r"),
+            files = mapOf("/tmp/abcdefghij" to ""),
+            read = listOf("/home/.sh_history"),
+            splittable = true,
+        )
+        // 半端に入れた行（/tmp/abcde など）ではなく、打った行のまま実行する
+        assertEquals("$line\nexit\n", s.files["/home/.sh_history"])
+        assertTrue(s.text.contains("\u0007"), "ベルが鳴らない")
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `続きの行で入力の領域の残りが少ないと、入らない履歴の項目は呼び戻さずベルを鳴らす`() {
+        // 入力の領域は 64 KiB。引用符を開いたままの行を重ねて、残りを 4090 バイトより小さくする
+        val x = "x".repeat(4090)
+        val y = "y".repeat(1500)
+        val steps = buildList {
+            add(": '\r")
+            repeat(15) { add("$x\n") }
+            add("$y\n")
+            // y の項目は入る。x の項目（4090 バイト）は入らず、ベルで行はそのまま
+            add("$up$up\u0015'\r")
+            add("echo \"st=\$?\"\r")
+            add("exit\r")
+        }
+        val s = session(steps, splittable = true)
+        val t = s.text
+        assertEquals(1, t.count { it == '\u0007' }, t.takeLast(500))
+        assertTrue(t.contains("\nst=0\n"), t.takeLast(500))
+        assertEquals(0, s.exitCode)
+    }
 }
