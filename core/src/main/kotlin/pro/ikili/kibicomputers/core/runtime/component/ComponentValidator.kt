@@ -1,11 +1,14 @@
 package pro.ikili.kibicomputers.core.runtime.component
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import run.endive.log.Logger
 import run.endive.log.SystemLogger
 import run.endive.runtime.ByteArrayMemory
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
+import run.endive.runtime.WasmInterruptedException
 import run.endive.tools.wasm.WasmToolsModule
 import run.endive.wasi.WasiExitException
 import run.endive.wasi.WasiOptions
@@ -27,6 +30,10 @@ import java.util.Random
  * - 機能は [FEATURES] で明示する（wasm-tools の既定や `all` にしない）
  * - ゲストの線形メモリに上限（[MAX_MEMORY_PAGES]）を付ける
  * - 失敗は [WasmLoadException] にする。メッセージには標準エラー出力の先頭を入れる
+ * - 検証の時間の上限は持たない（`LoadDeadline` は検証の間は確かめられない。呼ぶ側が見積もりで重いものを断る。
+ *   時間で止める形は #666）。スレッドの割り込み（`Thread.interrupt`。スケジューラの停止が使う）では途中で止まり、
+ *   内容の失敗ではないので [WasmLoadException] ではなく [WasmTrapException]（[WasmTrapKind.INTERRUPTED]）にする
+ *   （割り込みの印は立てたまま返す）
  *
  * 状態を持たないので、どのスレッドから同時に呼んでもよい（呼び出しごとに WASI とインスタンスを作って閉じる）。
  * 重い（2回目以降で数十 ms）ので、コンパイル用のスレッド（#29・#37）から呼ぶ。メインスレッドと tick からは呼ばない。
@@ -96,31 +103,66 @@ internal object ComponentValidator {
     private val EMPTY_COMPONENT = byteArrayOf(0x00, 0x61, 0x73, 0x6d, WasmBinaryHeader.COMPONENT_VERSION.toByte(), 0x00, 0x01, 0x00)
 
     /**
-     * [bytes] を検証する。通らなければ [WasmLoadException]。
-     * [maxMemoryPages] はゲストの線形メモリの上限（テストで小さくする。普段は [MAX_MEMORY_PAGES]）
+     * 検証用の写し [image] を検証する。失敗のメッセージの位置（`at offset 0x..`）は、元のバイト列の中の位置に直す。
+     * 失敗は [validate] と同じ
      */
-    @Throws(WasmLoadException::class)
-    fun validate(bytes: ByteArray, maxMemoryPages: Int = MAX_MEMORY_PAGES) {
+    @Throws(WasmLoadException::class, WasmTrapException::class)
+    fun validate(image: ValidationImage.Image) {
+        validate(image.bytes, MAX_MEMORY_PAGES, image::mapMessage)
+    }
+
+    /**
+     * [bytes] を検証する。通らなければ [WasmLoadException]。スレッドが割り込まれて止まったら [WasmTrapException]
+     * （[WasmTrapKind.INTERRUPTED]。割り込みの印は立てたまま）。
+     * [maxMemoryPages] はゲストの線形メモリの上限（テストで小さくする。普段は [MAX_MEMORY_PAGES]）。
+     * [mapMessage] は、失敗の理由（wasm-tools の標準エラー出力）の書き直し（位置を元のバイト列のものに直す）
+     */
+    @Throws(WasmLoadException::class, WasmTrapException::class)
+    fun validate(bytes: ByteArray, maxMemoryPages: Int = MAX_MEMORY_PAGES, mapMessage: (String) -> String = { it }) {
         val m = guarded("初期化") { module }
         val stderr = BoundedOutput(MAX_OUTPUT_BYTES)
         val exit = try {
             run(m, bytes, stderr, maxMemoryPages)
         } catch (e: WasmLoadException) {
             throw e
+        } catch (e: WasmTrapException) {
+            throw e
         } catch (e: StackOverflowError) {
             throw WasmLoadException("コンポーネントの検証が異常終了した（スタックが足りない）", e)
         } catch (e: LinkageError) {
             throw internalFailure(e)
         } catch (e: RuntimeException) {
+            // 割り込みで止まったものは、内容の失敗ではない（壊れたコンポーネントとして覚えさせない）
+            if (interrupted(e)) throw interruptedFailure(e)
             // ゲストのトラップ（メモリの上限で確保に失敗して abort したときなど）。内容に原因があることが多いので、内容の失敗として扱う
             throw WasmLoadException("コンポーネントの検証が異常終了した（メモリの上限を超えた、など）: $e", e)
         }
         if (exit != 0) {
-            val message = reason(stderr.text()).let {
+            // 割り込まれて WASI の入出力が失敗し、終了コードで終わったときも、内容の失敗にしない
+            if (Thread.currentThread().isInterrupted) throw interruptedFailure(null)
+            val message = mapMessage(reason(stderr.text())).let {
                 if (it.length > MAX_MESSAGE_CHARS) it.take(MAX_MESSAGE_CHARS) + "…" else it
             }
             throw WasmLoadException("コンポーネントの検証に通らない: $message")
         }
+    }
+
+    /** [e]（原因を含む）が割り込みで止まったものか。割り込みの印が立っているときも、割り込みとみなす */
+    private fun interrupted(e: Throwable): Boolean {
+        if (Thread.currentThread().isInterrupted) return true
+        var cur: Throwable? = e
+        var depth = 0
+        while (cur != null && depth++ < 16) {
+            if (cur is WasmInterruptedException || cur is InterruptedException) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun interruptedFailure(cause: Throwable?): WasmTrapException {
+        // Endive が印を下ろしていても、呼ぶ側（コンパイル用のスレッドの停止）が見られるように立て直す
+        Thread.currentThread().interrupt()
+        return WasmTrapException(WasmTrapKind.INTERRUPTED, "コンポーネントの検証中にスレッドが割り込まれた", cause)
     }
 
     /** ログの行（`[2026-11-13T00:36:39Z WARN ] ...`。時刻が入る）。失敗の理由ではない */

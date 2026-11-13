@@ -21,6 +21,11 @@ import java.io.ByteArrayOutputStream
  * core モジュールのカスタム セクションの壊れ（UTF-8 の誤り、途中で終わっている）と、コードセクションの本体の後ろの余り。
  * どれも実行されるバイトではないが、「wasm-tools の検証に通った」と言えるのはコンポーネントの層までで、
  * core モジュールの中身は、元のバイト列を Endive が読んで初めて確かめられる（#263）。
+ *
+ * 写しの中の位置は元と違う（core モジュールの本体とカスタム セクションを落とし、大きさの変わったセクションの長さを
+ * 書き直す）ので、写しのどこが元のどこから来たかを持つ（[Image.originalOffset]）。wasm-tools のメッセージの位置
+ * （`at offset 0x..`）を元のファイルの位置に直すのに使う。そのまま写した部分は元と同じ位置に、書き直した部分
+ * （セクションの id と長さ、`unreachable` の本体）は、元のセクションの先頭に対応させる。
  */
 internal object ValidationImage {
     private const val CORE_SEC_CUSTOM = 0
@@ -29,27 +34,110 @@ internal object ValidationImage {
     /** `unreachable` だけの関数の本体（ローカル変数なし、`unreachable`、`end`）と、その大きさ */
     private val STUB_BODY = byteArrayOf(0x03, 0x00, 0x00, 0x0b)
 
-    /** [root]（[bytes] を読んだもの）の検証用の写し */
-    @Throws(WasmLoadException::class)
-    fun of(bytes: ByteArray, root: ParsedComponent): ByteArray {
-        val out = ByteArrayOutputStream(bytes.size / 4)
-        writeComponent(bytes, root, out)
-        return out.toByteArray()
+    /** 検証用の写し [bytes] と、その中の位置から元の位置への対応 */
+    class Image internal constructor(
+        val bytes: ByteArray,
+        /** 区間ごとの、写しの中の先頭（昇順） */
+        private val imageStarts: IntArray,
+        /** 区間ごとの、対応する元の位置 */
+        private val originStarts: IntArray,
+        /** 区間が元をそのまま写したものか（`false` なら、区間のどこも [originStarts] の位置に対応させる） */
+        private val exact: BooleanArray,
+    ) {
+        /** 写しの中の位置 [imageOffset] に対応する、元のバイト列の中の位置 */
+        fun originalOffset(imageOffset: Long): Long {
+            if (imageStarts.isEmpty() || imageOffset < 0) return imageOffset
+            val key = if (imageOffset > Int.MAX_VALUE) Int.MAX_VALUE else imageOffset.toInt()
+            var i = java.util.Arrays.binarySearch(imageStarts, key)
+            if (i < 0) i = -i - 2
+            if (i < 0) return imageOffset
+            return if (exact[i]) originStarts[i] + (imageOffset - imageStarts[i]) else originStarts[i].toLong()
+        }
+
+        /** wasm-tools のメッセージの中の位置（`offset 0x..`）を、元のバイト列の中の位置に直したもの */
+        fun mapMessage(message: String): String = OFFSET.replace(message) { m ->
+            val v = m.groupValues[1].toLongOrNull(16)
+            if (v == null) m.value else "offset 0x" + originalOffset(v).toString(16)
+        }
+
+        private companion object {
+            val OFFSET = Regex("""offset 0x([0-9a-fA-F]{1,15})""")
+        }
     }
 
-    private fun writeComponent(bytes: ByteArray, c: ParsedComponent, out: ByteArrayOutputStream) {
-        out.write(bytes, c.range.offset, WasmBinaryHeader.SIZE)
+    /** [root]（[bytes] を読んだもの）の検証用の写し */
+    @Throws(WasmLoadException::class)
+    fun of(bytes: ByteArray, root: ParsedComponent): Image = writeComponent(bytes, root).toImage()
+
+    /** 写しを書くもの。書いた区間ごとに、元のどこから来たかを覚える */
+    private class Writer(sizeHint: Int) {
+        val out = ByteArrayOutputStream(sizeHint)
+        private var imageStarts = IntArray(16)
+        private var originStarts = IntArray(16)
+        private var exact = BooleanArray(16)
+        private var n = 0
+
+        val size: Int get() = out.size()
+
+        private fun mark(image: Int, origin: Int, isExact: Boolean) {
+            if (n > 0 && imageStarts[n - 1] == image) n--
+            if (n == imageStarts.size) {
+                imageStarts = imageStarts.copyOf(n * 2)
+                originStarts = originStarts.copyOf(n * 2)
+                exact = exact.copyOf(n * 2)
+            }
+            imageStarts[n] = image
+            originStarts[n] = origin
+            exact[n] = isExact
+            n++
+        }
+
+        /** 元の [offset] から [length] バイトをそのまま写す */
+        fun copy(bytes: ByteArray, offset: Int, length: Int) {
+            if (length <= 0) return
+            mark(size, offset, true)
+            out.write(bytes, offset, length)
+        }
+
+        /** 新しく作ったバイト列を書く。どこも元の [anchor] に対応させる */
+        fun emit(data: ByteArray, anchor: Int) {
+            if (data.isEmpty()) return
+            mark(size, anchor, false)
+            out.write(data)
+        }
+
+        /** 別に書いた [child] を続けて書く（区間も写す） */
+        fun append(child: Writer) {
+            val base = size
+            for (i in 0 until child.n) mark(base + child.imageStarts[i], child.originStarts[i], child.exact[i])
+            child.out.writeTo(out)
+        }
+
+        fun toImage(): Image = Image(out.toByteArray(), imageStarts.copyOf(n), originStarts.copyOf(n), exact.copyOf(n))
+    }
+
+    private fun writeComponent(bytes: ByteArray, c: ParsedComponent): Writer {
+        val w = Writer(c.range.length / 4)
+        w.copy(bytes, c.range.offset, WasmBinaryHeader.SIZE)
+        // セクションは隙間なく並ぶので、前のセクションの終わりが次のセクションの先頭（id と長さ）
+        var begin = c.range.offset + WasmBinaryHeader.SIZE
         for (s in c.sections) {
             when (s) {
-                is ComponentSection.CoreModule -> section(out, 1, stubModule(bytes, s.range))
-                is ComponentSection.Nested -> section(out, 4, ByteArrayOutputStream().also { writeComponent(bytes, s.component, it) }.toByteArray())
+                is ComponentSection.CoreModule -> sectionOf(w, 1, stubModule(bytes, s.range), begin)
+                is ComponentSection.Nested -> sectionOf(w, 4, writeComponent(bytes, s.component), begin)
                 else -> {
-                    out.write(idOf(s))
-                    leb(out, s.range.length.toLong())
-                    out.write(bytes, s.range.offset, s.range.length)
+                    if (begin < s.range.offset && s.range.offset - begin <= 6) {
+                        // id と長さも含めて、元のとおりに写す
+                        w.copy(bytes, begin, s.range.end - begin)
+                    } else {
+                        w.emit(header(idOf(s), s.range.length), begin)
+                        w.copy(bytes, s.range.offset, s.range.length)
+                    }
                 }
             }
+            begin = s.range.end
         }
+        return w
     }
 
     private fun idOf(s: ComponentSection): Int = when (s) {
@@ -67,11 +155,12 @@ internal object ValidationImage {
     }
 
     /** core モジュールの写し（関数の本体を `unreachable` に、カスタム セクションを除く）。`ModulePrescan` を通ったものに使う */
-    private fun stubModule(bytes: ByteArray, range: ByteRange): ByteArray {
-        val out = ByteArrayOutputStream()
-        out.write(bytes, range.offset, WasmBinaryHeader.SIZE)
+    private fun stubModule(bytes: ByteArray, range: ByteRange): Writer {
+        val w = Writer(range.length / 4)
+        w.copy(bytes, range.offset, WasmBinaryHeader.SIZE)
         var pos = range.offset + WasmBinaryHeader.SIZE
         while (pos < range.end) {
+            val begin = pos
             val id = bytes[pos++].toInt() and 0xff
             val (size, after) = readU32(bytes, pos, range.end)
             pos = after
@@ -85,22 +174,28 @@ internal object ValidationImage {
                     val body = ByteArrayOutputStream(5 + count * STUB_BODY.size)
                     leb(body, count.toLong())
                     repeat(count) { body.write(STUB_BODY) }
-                    section(out, id, body.toByteArray())
+                    val content = body.toByteArray()
+                    w.emit(header(id, content.size), begin)
+                    w.emit(content, begin)
                 }
-                else -> {
-                    out.write(id)
-                    leb(out, size.toLong())
-                    out.write(bytes, start, size)
-                }
+                // id と長さも含めて、元のとおりに写す
+                else -> w.copy(bytes, begin, pos - begin)
             }
         }
-        return out.toByteArray()
+        return w
     }
 
-    private fun section(out: ByteArrayOutputStream, id: Int, content: ByteArray) {
+    /** [content] を id [id] のセクションとして書く（id と長さは、元のセクションの先頭 [anchor] に対応させる） */
+    private fun sectionOf(w: Writer, id: Int, content: Writer, anchor: Int) {
+        w.emit(header(id, content.size), anchor)
+        w.append(content)
+    }
+
+    private fun header(id: Int, length: Int): ByteArray {
+        val out = ByteArrayOutputStream(6)
         out.write(id)
-        leb(out, content.size.toLong())
-        out.write(content)
+        leb(out, length.toLong())
+        return out.toByteArray()
     }
 
     private fun readU32(bytes: ByteArray, at: Int, end: Int): Pair<Int, Int> {

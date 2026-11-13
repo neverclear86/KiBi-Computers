@@ -1,6 +1,8 @@
 package pro.ikili.kibicomputers.core.runtime.component
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
 import java.security.MessageDigest
@@ -46,14 +48,16 @@ internal class LoadedComponent(
  * 2. ヘッダー（layer 1・version 0x0d）
  * 3. 自前のパーサーで、構造の上限を確かめながら読む（[ComponentParser]）
  * 4. 中の各 core モジュールに、p1 と同じ構造の確認（`ModulePrescan`）を当てる
- * 5. wasm-tools で検証する（[ComponentValidator]）。検証は途中で止められないので、時間が膨らむ形（インスタンス化の
- *    引数ごとの型の確認。[ComponentValidationCost]）は始める前に断る。core モジュールの関数の本体は除いた写し
- *    （[ValidationImage]）を渡す。本体と、core モジュールのカスタム セクションの壊れなどは、p1 と同じく Endive が読み込むとき（#263）に確かめる
+ * 5. wasm-tools で検証する（[ComponentValidator]）。検証の間は時間の上限を確かめられない（止まるのはスレッドの
+ *    割り込みだけ。時間で止める形は #666）ので、時間が膨らむ形（大きな型の確認を何度もさせる。[ComponentValidationCost]）は
+ *    始める前に断る。core モジュールの関数の本体は除いた写し（[ValidationImage]）を渡す。失敗のメッセージの位置は、
+ *    元のバイト列の位置に直す。本体と、core モジュールのカスタム セクションの壊れなどは、p1 と同じく Endive が読み込むとき（#263）に確かめる
  * 6. import の形（[ComponentImportPolicy]）と、core モジュールが予約したモジュール名を import していないこと
  * 7. 入れ子を展開した後のインスタンスの数（コアモジュールとコンポーネントの両方。[ComponentExpansion]）
  *
  * 検証器（[ComponentValidator]）のクラスが読めないなど、検証器そのものの失敗（[LinkageError]）も、内部の失敗と分かる
- * [WasmLoadException] にする（ログにも出す）。
+ * [WasmLoadException] にする（ログにも出す）。検証の途中でスレッドが割り込まれたら、内容の失敗ではないので
+ * [WasmTrapException]（[WasmTrapKind.INTERRUPTED]）を投げる（`ProgramCache` は [WasmLoadException] だけを失敗として覚える）。
  *
  * 重い（検証に数十 ms、初回は1秒ほど）ので、コンパイル用のスレッドから呼ぶ。状態を持たないので、同時に呼んでよい。
  * 実行（exec）にはまだつないでいない（#263）。
@@ -67,7 +71,7 @@ internal object ComponentLoader {
      * [validate] は wasm-tools の検証の差し替え（テストで、検証をまたいだ時間の上限を確かめるため）。`null` なら
      * [ComponentValidator.validate]
      */
-    @Throws(WasmLoadException::class)
+    @Throws(WasmLoadException::class, WasmTrapException::class)
     fun load(
         bytes: ByteArray,
         limits: ComponentLimits = ComponentLimits.DEFAULT,
@@ -92,11 +96,11 @@ internal object ComponentLoader {
             ModulePrescan.check(range.copyOf(bytes), limits.moduleLimits, deadline)
         }
         deadline.check("core モジュールの構造の確認")
-        // wasm-tools の検証は途中で止められないので、時間が膨らむ形は始める前に断る
+        // wasm-tools の検証の間は時間の上限を確かめられないので、時間が膨らむ形は始める前に断る
         ComponentValidationCost.check(root, limits)
         // 関数の本体は Endive が読み込むときに検証するので、wasm-tools には本体を除いた写しを渡す（ValidationImage）
         val image = ValidationImage.of(bytes, root)
-        if (validate != null) validate(image) else validator { ComponentValidator.validate(image) }
+        if (validate != null) validate(image.bytes) else validator { ComponentValidator.validate(image) }
         deadline.check("コンポーネントの検証")
         for (import in root.imports) {
             policy.reject(import)?.let { throw WasmLoadException("許可しない import ${import.name}: $it") }

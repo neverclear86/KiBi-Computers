@@ -9,6 +9,8 @@ import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
@@ -246,6 +248,9 @@ class ComponentLoaderTest {
         assertMessage(rejects(full, ComponentLimits(maxCanons = 3)), "canonの数")
         assertMessage(rejects(full, ComponentLimits(maxExports = 2)), "exportの数")
         assertMessage(rejects(full, ComponentLimits(maxVectorItems = 1)), "上限 1")
+        assertMessage(rejects(full, ComponentLimits(maxAliases = 0)), "aliasの数")
+        assertMessage(rejects(full, ComponentLimits(maxInstances = 1)), "インスタンスの数")
+        assertMessage(rejects(full, ComponentLimits(maxComponents = 0)), "入れ子のコンポーネントの数")
         // 中の core モジュールには、p1 と同じ構造の上限（ModulePrescan）を当てる
         assertMessage(rejects(full, ComponentLimits(moduleLimits = ModuleLimits(maxFunctions = 0))), "関数の数")
         // 時間の上限
@@ -255,6 +260,70 @@ class ComponentLoaderTest {
         while (deadline.elapsedNanos <= 1) spin++
         val e = assertThrows<WasmLoadException> { ComponentParser.parse(full, ComponentLimits.DEFAULT, deadline) }
         assertMessage(e, "時間の上限")
+    }
+
+    /** 1 回ずつインスタンス化する入れ子を [levels] 段重ねたもの */
+    private fun chain(levels: Int): ByteArray {
+        val sb = StringBuilder("(component \$root\n")
+        sb.append("  (component \$c0 (core module \$m) (core instance (instantiate \$m)))\n")
+        for (i in 1..levels) {
+            sb.append("  (component \$c$i (alias outer \$root \$c${i - 1} (component \$p)) (instance (instantiate \$p)))\n")
+        }
+        sb.append("  (instance (instantiate \$c$levels))\n)")
+        return wat(sb.toString())
+    }
+
+    @Test
+    fun `インスタンス化の入れ子の深さに上限がある`() {
+        assertEquals(61, ComponentLoader.load(chain(60)).expandedInstances)
+        assertMessage(rejects(chain(70)), "インスタンス化の入れ子が深すぎる（上限 64）")
+    }
+
+    @Test
+    fun `展開の確認にも時間の上限がある`() {
+        val root = ComponentParser.parse(doubling(8), ComponentLimits.DEFAULT, null)
+        assertEquals(256, ComponentExpansion.count(root, ComponentLimits.DEFAULT, null).coreInstances)
+        val deadline = LoadDeadline(1)
+        var spin = 0L
+        while (deadline.elapsedNanos <= 1) spin++
+        val e = assertThrows<WasmLoadException> { ComponentExpansion.count(root, ComponentLimits.DEFAULT, deadline) }
+        assertMessage(e, "時間の上限")
+        assertMessage(e, "コンポーネントの展開の確認")
+    }
+
+    /** [bytes] の一番外の core の型のセクションの、最初のモジュール型の宣言 */
+    private fun moduleTypeDecls(bytes: ByteArray): List<CoreModuleDecl> {
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        val types = root.sections.filterIsInstance<ComponentSection.CoreTypes>().single()
+        return (types.items.single() as CoreDefType.Module).decls
+    }
+
+    @Test
+    fun `64ビットの大きさを読む`() {
+        val bytes = wat("""(component (core type (module (import "a" "m" (memory i64 1 0xffffffffffffffff)))))""")
+        val memory = (moduleTypeDecls(bytes).single() as CoreModuleDecl.Import).desc as CoreExternDesc.Memory
+        assertEquals(1L, memory.limits.min)
+        assertEquals(-1L, memory.limits.max)
+        // 10 バイト目に 64 ビットを超える分があるものは断る
+        val max = byteArrayOf(0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0xff.toByte(), 0x01)
+        val at = (0..bytes.size - max.size).single { i -> max.indices.all { bytes[i + it] == max[it] } }
+        val over = bytes.copyOf().also { it[at + 9] = 0x03 }
+        assertMessage(assertThrows<WasmLoadException> { ComponentParser.parse(over, ComponentLimits.DEFAULT, null) }, "64 ビットを超える")
+    }
+
+    @Test
+    fun `coreの参照の型の長い形を読む`() {
+        val bytes = wat(
+            """
+            (component (core type (module
+              (type (func))
+              (import "a" "g" (global (ref null 0)))
+              (import "a" "h" (global (ref 0)))
+            )))
+            """,
+        )
+        val globals = moduleTypeDecls(bytes).filterIsInstance<CoreModuleDecl.Import>().map { (it.desc as CoreExternDesc.Global).type }
+        assertEquals(listOf(CoreValType(0x63, 0), CoreValType(0x64, 0)), globals)
     }
 
     private fun leb(v: Int): ByteArray {
@@ -502,10 +571,10 @@ class ComponentLoaderTest {
         rejects(bomb)
         assertTrue(System.nanoTime() - start < 2_000_000_000L)
 
-        // 見積もりは、引数の総数 × 型の重さ
+        // 見積もりは、型の確認の回数（引数の総数）× 型の大きさ
         val small = subtypeComponent(n = 10, k = 3, m = 4)
         val estimate = ComponentValidationCost.estimate(ComponentParser.parse(small, ComponentLimits.DEFAULT, null))
-        assertEquals(12L, estimate.argumentCount)
+        assertEquals(12L, estimate.checkCount)
         assertTrue(estimate.maxTypeWeight in 10L..30L) { "${estimate.maxTypeWeight}" }
         // 上限は差し替えられる。同じ形でも小さければ通る
         assertMessage(rejects(small, ComponentLimits(maxValidationCost = estimate.cost - 1)), "検証が重すぎる")
@@ -519,6 +588,201 @@ class ComponentLoaderTest {
         val e = ComponentValidationCost.estimate(ComponentParser.parse(c, ComponentLimits.DEFAULT, null))
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(c) }
+    }
+
+    private fun estimateOf(bytes: ByteArray) = ComponentValidationCost.estimate(ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null))
+
+    /** [bytes] は見積もりで断られ、検証まで行かない */
+    private fun rejectedBeforeValidation(bytes: ByteArray) {
+        var validated = false
+        val e = assertThrows<WasmLoadException> { ComponentLoader.load(bytes, validate = { validated = true }) }
+        assertMessage(e, "検証が重すぎる")
+        assertTrue(!validated)
+    }
+
+    /**
+     * [type] の型を 2 つ（`$ta`・`$tb`）定義し、`$tb` を [k] 個受ける入れ子のコンポーネントに、`$ta` 由来のものを渡して [m] 回
+     * インスタンス化するもの。[import] は受ける側の import の記述、[arg] は渡す引数
+     */
+    private fun typedArgComponent(type: String, k: Int, m: Int, prelude: String, import: String, arg: String): ByteArray {
+        val imports = (0 until k).joinToString(" ") { """(import "i$it" $import)""" }
+        val args = (0 until k).joinToString(" ") { """(with "i$it" $arg)""" }
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c $args))" }
+        return wat(
+            """
+            (component
+              (type ${'$'}ta $type)
+              (type ${'$'}tb $type)
+              $prelude
+              (component ${'$'}c
+                (alias outer 1 ${'$'}tb (type ${'$'}tb))
+                $imports
+              )
+              $instances
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `型の引数と関数の引数で大きな型を何度も確かめさせる形も検証の前に断る`() {
+        // フィールド 4,000 個の record を (type (eq ..)) で 100 個 × 100 回受ける（wasm-tools で CPU 約 13 秒）
+        val fields = (0 until 4000).joinToString(" ") { """(field "f$it" u32)""" }
+        val record = typedArgComponent("(record $fields)", k = 100, m = 100, prelude = "", import = "(type (eq ${'$'}tb))", arg = "(type ${'$'}ta)")
+        val r = estimateOf(record)
+        assertEquals(10_000L, r.checkCount)
+        assertTrue(r.maxTypeWeight >= 4000) { "${r.maxTypeWeight}" }
+        rejectedBeforeValidation(record)
+
+        // 引数 1,000 個の関数型を 100 個 × 100 回受ける（約 2 秒）
+        val params = (0 until 1000).joinToString(" ") { """(param "p$it" u32)""" }
+        val func = typedArgComponent(
+            "(func $params)", k = 100, m = 100,
+            prelude = """(import "g" (func ${'$'}g (type ${'$'}ta)))""", import = "(func (type ${'$'}tb))", arg = "(func ${'$'}g)",
+        )
+        val f = estimateOf(func)
+        assertTrue(f.maxTypeWeight >= 1000) { "${f.maxTypeWeight}" }
+        rejectedBeforeValidation(func)
+
+        // 小さな形は通る（見積もりは引数 × 大きさ）
+        val smallFields = (0 until 10).joinToString(" ") { """(field "f$it" u32)""" }
+        val small = typedArgComponent("(record $smallFields)", k = 3, m = 2, prelude = "", import = "(type (eq ${'$'}tb))", arg = "(type ${'$'}ta)")
+        val s = estimateOf(small)
+        assertEquals(6L, s.checkCount)
+        assertEquals(11L, s.maxTypeWeight)
+    }
+
+    @Test
+    fun `型の大きさは参照している型の中まで数える`() {
+        // フィールド 100 個の record を、100 個のフィールドに持つ record（展開すると約 1 万）
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val outer = (0 until 100).joinToString(" ") { """(field "g$it" ${'$'}in)""" }
+        val bytes = wat("""(component (type ${'$'}in (record $inner)) (type (record $outer)))""")
+        assertEquals(1L + 100 * 101, estimateOf(bytes).maxTypeWeight)
+        // インスタンス型の export の型の中まで数え、alias で引いた型も同じ大きさとして使う
+        val aliased = wat(
+            """
+            (component
+              (import "wasi:a/b" (instance ${'$'}i (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr)))))
+              (alias export ${'$'}i "r" (type ${'$'}r))
+              (type (list ${'$'}r))
+            )
+            """,
+        )
+        val w = estimateOf(aliased).maxTypeWeight
+        // record は 101、インスタンス型はその export、list はその上に 1
+        assertTrue(w in 102L..110L) { "$w" }
+        // 型を付けた export も、型の確認として数える
+        val ascribed = wat("""(component (import "f" (func ${'$'}f)) (export "g" (func ${'$'}f) (func)))""")
+        assertEquals(1L, estimateOf(ascribed).checkCount)
+    }
+
+    @Test
+    fun `ツールチェーンが作るコンポーネントの見積もりは上限に十分収まる`() {
+        // WASI の filesystem に近い規模のインターフェース（record・variant・enum・flags・resource と関数 40 個）を
+        // import と export に持つ world を、wasm-tools の component embed --dummy と component new でコンポーネントにする
+        val fields = (0 until 12).joinToString(", ") { "f$it: u64" }
+        val cases = (0 until 37).joinToString(", ") { "e$it" }
+        val funcs = (0 until 40).joinToString("\n") { "    m$it: func(d: borrow<descriptor>, s: stat, o: option<list<stat>>) -> result<tuple<stat, u64>, error-code>;" }
+        val wit = """
+            package test:fs@0.2.0;
+            interface types {
+                record stat { $fields }
+                enum error-code { $cases }
+                flags open-flags { create, directory, exclusive, truncate }
+                variant entry { file(stat), dir(list<stat>), link(string), other }
+                resource descriptor {
+                    open: func(f: open-flags) -> result<descriptor, error-code>;
+                    read-dir: func() -> result<list<entry>, error-code>;
+                }
+            $funcs
+            }
+            world w {
+                import types;
+                export types;
+            }
+        """.trimIndent()
+        val embed = WitTool.run(
+            listOf("component", "embed", "--dummy", "-w", "w", "${WitTool.WORK}/w.wit", "-o", "${WitTool.WORK}/core.wasm"),
+            mapOf("w.wit" to wit.toByteArray()),
+            listOf("core.wasm"),
+        )
+        assertEquals(0, embed.exitCode) { embed.stderr }
+        val made = WitTool.run(
+            listOf("component", "new", "${WitTool.WORK}/core.wasm", "-o", "${WitTool.WORK}/c.wasm"),
+            mapOf("core.wasm" to embed.outputs.getValue("core.wasm")),
+            listOf("c.wasm"),
+        )
+        assertEquals(0, made.exitCode) { made.stderr }
+        val c = made.outputs.getValue("c.wasm")
+        val e = estimateOf(c)
+        assertTrue(e.cost * 10 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
+        val root = ComponentParser.parse(c, ComponentLimits.DEFAULT, null)
+        assertDoesNotThrow { ComponentValidator.validate(ValidationImage.of(c, root)) }
+    }
+
+    @Test
+    fun `検証中にスレッドが割り込まれたらloadは内容の失敗にしない`() {
+        ComponentValidator.warmUp()
+        val bytes = full
+        // 割り込まれていれば WasmTrapException（INTERRUPTED）で返し、印は立てたまま（WasmLoadException ではないので、ProgramCache は覚えない）
+        Thread.currentThread().interrupt()
+        try {
+            val e = assertThrows<WasmTrapException> { ComponentLoader.load(bytes) }
+            assertEquals(WasmTrapKind.INTERRUPTED, e.kind)
+            assertTrue(Thread.currentThread().isInterrupted)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
+    fun `割り込みで止まった検証はWasmTrapExceptionになる`() {
+        ComponentValidator.warmUp()
+        val slow = subtypeComponent(n = 2000, k = 100, m = 100)
+        var failure: Throwable? = null
+        var flag = false
+        val t = Thread {
+            failure = runCatching { ComponentValidator.validate(slow) }.exceptionOrNull()
+            flag = Thread.currentThread().isInterrupted
+        }
+        t.start()
+        Thread.sleep(500)
+        val clock = System.nanoTime()
+        t.interrupt()
+        t.join(10_000)
+        assertTrue(!t.isAlive) { "割り込んでも止まらない" }
+        assertTrue(System.nanoTime() - clock < 5_000_000_000L)
+        val e = failure
+        assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED) { "$e" }
+        assertTrue(flag)
+    }
+
+    @Test
+    fun `検証の失敗の位置は元のバイト列の位置にする`() {
+        // core モジュールの関数の本体とカスタム セクション（写しでは落とす）の後ろに、型の誤り
+        val bad = wat(
+            """
+            (component
+              (core module ${'$'}m
+                (func (export "f") (result i64) (local i32 i32 i32) i64.const 0 i64.const 1 i64.add)
+                (@custom "pad" "0123456789012345678901234567890123456789")
+              )
+              (core instance ${'$'}i (instantiate ${'$'}m))
+              (func (result u32) (canon lift (core func ${'$'}i "f")))
+            )
+            """,
+        )
+        val offset = Regex("""offset 0x([0-9a-f]+)""")
+        fun offsetIn(message: String): Long = offset.find(message)!!.groupValues[1].toLong(16)
+        val direct = assertThrows<WasmLoadException> { ComponentValidator.validate(bad) }.message!!
+        val image = ValidationImage.of(bad, ComponentParser.parse(bad, ComponentLimits.DEFAULT, null))
+        val raw = assertThrows<WasmLoadException> { ComponentValidator.validate(image.bytes) }.message!!
+        // 写しの中の位置は元と違う
+        assertTrue(offsetIn(raw) != offsetIn(direct)) { "$raw / $direct" }
+        val loaded = rejects(bad).message!!
+        assertEquals(offsetIn(direct), offsetIn(loaded)) { "$loaded / $direct" }
+        assertEquals(offsetIn(direct), image.originalOffset(offsetIn(raw)))
     }
 
     @Test
@@ -798,7 +1062,7 @@ class ComponentLoaderTest {
     @Test
     fun `検証用の写しはcoreモジュールの中身を確かめない`() {
         val root = ComponentParser.parse(full, ComponentLimits.DEFAULT, null)
-        val image = ValidationImage.of(full, root)
+        val image = ValidationImage.of(full, root).bytes
         val parsed = ComponentParser.parse(image, ComponentLimits.DEFAULT, null)
         // コンポーネントのセクションは同じ（core モジュールとカスタム セクションの範囲だけが変わる）
         assertEquals(
