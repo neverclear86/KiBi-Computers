@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
+import pro.ikili.kibicomputers.neoforge.registry.KiBiRecipes
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.loading.FMLEnvironment
 import org.slf4j.Logger
@@ -30,6 +31,7 @@ object KiBiComputersNeoForge {
         KiBiDataComponents.register(MOD_BUS)
         KiBiBlocks.register(MOD_BUS)
         KiBiMenus.register(MOD_BUS)
+        KiBiRecipes.register(MOD_BUS)
         ScreenSync.register(MOD_BUS)
         KeyboardInput.register(MOD_BUS)
         ServerMachines.register()

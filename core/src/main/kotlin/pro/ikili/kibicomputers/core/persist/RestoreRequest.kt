@@ -80,6 +80,9 @@ public enum class ColdBootCause {
     /** 戻せる世代がない（`restorableGeneration` が空） */
     NO_GENERATION,
 
+    /** 保存データを書いた MOD のバージョンが今のものと違う（差分の基準のものを含む。#88、ADR 0088） */
+    MOD_VERSION,
+
     /** `KILLED` 節の理由が 0 以外（起動中・再起動の待ち・init を殺した写し） */
     KILLED_SECTION,
 
