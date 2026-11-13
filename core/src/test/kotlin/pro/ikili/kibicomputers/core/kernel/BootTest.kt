@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KillResult
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
@@ -145,6 +146,17 @@ class BootTest {
         fun process(pid: Int): Process? = m.lock.withLockValue { m.kernel.processes[pid] }
 
         fun pids(): List<Int> = m.lock.withLockValue { m.kernel.processes.all().map { it.pid } }
+
+        /** オブジェクト表に残ったプロセスのオブジェクトと開いたファイル（preopen のディレクトリを含む）の数 */
+        fun leftoverObjects(): Pair<Int, Int> = m.lock.withLockValue {
+            var processes = 0
+            var files = 0
+            m.kernel.objects.forEachObject {
+                if (it is ProcessObject) processes++
+                if (it is OpenFile) files++
+            }
+            processes to files
+        }
 
         fun mounts(): List<Pair<String, String>> = m.lock.withLockValue { m.kernel.mounts.entries.map { it.point.toString() to it.source } }
 
@@ -545,9 +557,70 @@ class BootTest {
         assertTrue(host.log.contains("bootFailed:${BootFailure.INIT_START_FAILED}"), "${host.log}")
         assertTrue(host.console.contains("kibi: cannot start /sbin/init: machine not ready\n"), "${host.console}")
         assertEquals(emptyList<String>(), host.states(), "RUNNING にならない")
-        // 表に足した後の失敗では、足した pid 1 が巻き戻されずに残る（別の Issue で扱う）。残ったままだと env の終わりの
-        // awaitTermination が終わらないので、このテストでは表から外す
-        m.lock.withLockValue { m.kernel.processes.remove(1) }
+        // #629: 表に足した分は巻き戻され、マウントも外れ、待つ側も終わる
+        assertEquals(emptyList<Int>(), pids())
+        assertEquals(emptyList<Pair<String, String>>(), mounts())
+        assertEquals(0, m.lock.withLockValue { m.kernel.initPid })
+        assertEquals(0, h.scheduler.blockingProcesses)
+        assertTrue(m.lock.withLockValue { m.runtimes.isEmpty() })
+        // pid 1 の ProcessObject と preopen（ROOT_PREOPEN）の OpenFile も残らない。ディレクトリの OpenFile は
+        // ファイルシステムに開いたことを知らせないので、漏れてもマウントの取り外しでは見つからない
+        assertEquals(0 to 0, leftoverObjects())
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `initの作成が途中の段で失敗しても、プロセスのオブジェクトとpreopenのOpenFileを残さない`() = env {
+        // #629: init の fd は 0〜2（コンソール）と 3（ROOT_PREOPEN。まだ表にない OpenFile）。親がないので HANDLE の段は通らない
+        disks.withInit("d", exe(foreverInit()))
+        val cases = listOf(
+            SpawnStage.TABLE to 1,
+            SpawnStage.OBJECT to 1,
+            SpawnStage.FD to 1,
+            SpawnStage.FD to 4,
+            SpawnStage.RUNTIME_INIT to 1,
+            SpawnStage.RUNTIME to 1,
+        )
+        for ((i, case) in cases.withIndex()) {
+            val (stage, nth) = case
+            var seen = 0
+            h.scheduler.hooks.atSpawnStage = { s ->
+                if (s == stage && ++seen == nth) throw IllegalStateException("テストの失敗 $stage#$nth")
+            }
+            assertTrue(m.boot(bootDisks("d")), "$stage#$nth")
+            tickUntil("$stage#$nth: 失敗が届かない") { synchronized(host.log) { host.log.count { it.startsWith("bootFailed:") } } == i + 1 }
+            h.scheduler.hooks.atSpawnStage = null
+            assertEquals(nth, seen, "$stage#$nth: その段まで進んだ")
+            assertEquals(MachineState.STOPPED, m.state, "$stage#$nth")
+            assertEquals(emptyList<Int>(), pids(), "$stage#$nth")
+            assertEquals(emptyList<Pair<String, String>>(), mounts(), "$stage#$nth")
+            assertEquals(0, m.lock.withLockValue { m.kernel.initPid }, "$stage#$nth")
+            assertTrue(m.lock.withLockValue { m.runtimes.isEmpty() }, "$stage#$nth")
+            assertEquals(0 to 0, leftoverObjects(), "$stage#$nth: オブジェクト表に残る")
+            assertTrue(m.awaitTermination(5_000), "$stage#$nth")
+        }
+        // 巻き戻した後も、起動すると pid 1 の init が動き、ディレクトリが1つ開いている
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntilInitStarted()
+        assertEquals(listOf(1), pids())
+        assertEquals(1 to 1, leftoverObjects())
+    }
+
+    @Test
+    fun `initの作成を巻き戻した後も、もう一度起動するとpid1のinitが動く`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        h.scheduler.hooks.duringInitSpawn = { _ ->
+            h.scheduler.hooks.duringInitSpawn = null
+            throw RuntimeException("テストの失敗")
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil("失敗が届かない") { host.log.any { it.startsWith("bootFailed:") } }
+        assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(emptyList<Int>(), pids())
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntilInitStarted()
+        assertEquals(listOf(1), pids(), "init の pid は次の起動で 1 に戻る")
+        assertEquals(1, m.lock.withLockValue { m.kernel.initPid })
     }
 
     @Test

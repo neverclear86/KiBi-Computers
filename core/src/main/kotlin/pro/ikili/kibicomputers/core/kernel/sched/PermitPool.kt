@@ -58,7 +58,8 @@ internal class PermitPool(permits: Int, private val workers: WorkerPool) {
 
     /**
      * スレッドを持たない仕事 [task] を並べる。許可が空いていれば、すぐワーカーに渡す。
-     * [task] は許可を持って動き、自分で [release] する。[key] は [remove] で外すときの目印
+     * [task] は許可を持って動き、自分で [release] する。[key] は [remove] で外すときの目印。
+     * ワーカーに渡せずに投げたら（スレッドを作れないとき）、取った許可は返してから投げ直す
      */
     fun submit(key: Any, task: Runnable) {
         lock.withLockValue {
@@ -69,7 +70,17 @@ internal class PermitPool(permits: Int, private val workers: WorkerPool) {
                 return
             }
         }
-        workers.execute(task)
+        try {
+            workers.execute(task)
+        } catch (t: Throwable) {
+            // ワーカーのスレッドを作れないときなど。仕事は動かず、取った許可を返す者がいないので、ここで返して投げ直す（#629）
+            try {
+                release()
+            } catch (e: Throwable) {
+                if (e !== t) t.addSuppressed(e)
+            }
+            throw t
+        }
     }
 
     /** まだ許可を受け取っていない、[key] の仕事を外す（止めたとき）。外したら `true` */
