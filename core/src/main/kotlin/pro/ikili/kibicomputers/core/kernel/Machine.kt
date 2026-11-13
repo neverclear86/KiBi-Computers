@@ -1152,7 +1152,9 @@ public class Machine private constructor(
      * カーネルロックを持たずに呼ぶ（持っていれば [IllegalStateException]。#52）。
      *
      * 引数・環境変数・作業ディレクトリ・fd は [options] で決める（[SpawnOptions]）。どれも表を変える前に確かめ、
-     * 失敗したら何も変えない。
+     * 失敗したら何も変えない。表に足した後で失敗したとき（内部エラー。メモリ不足など）も、足した分（表・オブジェクト・fd・
+     * 実行時の部分・ブロッキング型の枠・init の pid）を同じロックの中で巻き戻し、例外をそのまま投げる（#629）。
+     * 割り当てた pid と、ついでに刈り取った親のないゾンビは戻さない。
      *
      * @param parentPid 0 は親なし（init）。0 以外は、表にある、終わっていないプロセスの pid でなければ [IllegalArgumentException]
      * @param asInit 起動の手順（#49）が init を作る。起動が取り消されていれば [BootCancelledException]。作れたら init として覚え、起動の手順を終える
@@ -1216,46 +1218,120 @@ public class Machine private constructor(
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
             }
-            reapOrphanZombiesLocked()
-            val pid = kernel.processes.allocatePid()
-            val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
-            kernel.processes.add(process)
-            process.objectId = kernel.objects.add(ProcessObject(pid))
-            if (asInit) kernel.initPid = pid
-            installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
-            // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
-            val handleFd = if (withHandle) {
-                kernel.objects.retain(process.objectId)
-                FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(process.objectId, HandleRights.READ)
-            } else {
-                -1
+            // ここから引き返せない点（スレッドを動かす・待ち行列に積む）までに例外が出たら、足した分を巻き戻して投げ直す（#629）。
+            // どこまで進んだかを覚えておき、進んだ分だけ戻す（rollbackSpawnLocked）。成功の道筋では何も作らない
+            val reserved = kind == ProcessKind.BLOCKING
+            val prevInitPid = kernel.initPid
+            var process: Process? = null
+            var handleRetained = false
+            var handleFd = -1
+            var rt: ProcessRuntime? = null
+            var thread: KernelThread? = null
+            var enqueued = false
+            try {
+                reapOrphanZombiesLocked()
+                val pid = kernel.processes.allocatePid()
+                val p = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
+                kernel.processes.add(p)
+                process = p
+                p.objectId = kernel.objects.add(ProcessObject(pid))
+                if (asInit) kernel.initPid = pid
+                installFdsLocked(FdTable(p, kernel.objects, wakeSink), fdEntries)
+                // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
+                if (withHandle) {
+                    kernel.objects.retain(p.objectId)
+                    handleRetained = true
+                    handleFd = FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(p.objectId, HandleRights.READ)
+                }
+                val r = ProcessRuntime(this, p, program, driver)
+                runner.initRuntime(r)
+                runtimes[pid] = r
+                rt = r
+                if (kind == ProcessKind.BLOCKING) {
+                    val t = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(r) }
+                    r.dedicatedThread = t
+                    scheduler.dedicatedThreads.add(t)
+                    thread = t
+                }
+                // フックは、すべて確保した後・引き返せない点の前に呼ぶ（投げると、いちばん多く巻き戻す）
+                if (asInit) scheduler.hooks.duringInitSpawn?.invoke(this)
+                scheduler.hooks.duringSpawn?.invoke(this, pid)
+                // 引き返せない点。新しいスレッド・ワーカーは、登録でカーネルロックを取る（ProcessRunner.register）ので、
+                // このロックを返すまで動き出さない。だから、RUNNING にする前に動かしても、子が先に動くことはない
+                if (thread != null) {
+                    thread.start()
+                } else {
+                    enqueued = true
+                    cpu.enqueueThreadless(r)
+                }
+            } catch (t: Throwable) {
+                rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, parent, rt, thread, enqueued)
+                throw t
             }
-            val rt = ProcessRuntime(this, process, program, driver)
-            runner.initRuntime(rt)
-            runtimes[pid] = rt
-            if (asInit) scheduler.hooks.duringInitSpawn?.invoke(this)
+            // ここからは投げない処理だけ（巻き戻せないので）
             if (stateValue == MachineState.STOPPED) setStateLocked(MachineState.RUNNING, null)
             if (asInit) {
                 // 起動中の印は、RUNNING にした後に下ろす（この順番は不変条件。ロックを取らずに読む [isRunningOrBooting] が、
                 // 区間の途中で「止まっていて起動中でもない」に見えないように。#625、ADR 0049）。
-                // ここより前で例外が出たら、印が立ったまま起動の手順に返り、endBoot が INIT_START_FAILED として知らせる
+                // ここより前（引き返せない点の前）で例外が出たら、足した分を巻き戻してから（#629）、印が立ったまま起動の手順に返り、
+                // endBoot が INIT_START_FAILED として知らせる
                 bootingValue = false
                 // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
                 bootCancelSignal.complete(Unit)
                 // 起動の途中に挿して、起動の手順が扱わなかったディスクをマウントする（#56）
                 scheduleAutoMount()
             }
-            if (kind == ProcessKind.BLOCKING) {
-                val thread = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(rt) }
-                rt.dedicatedThread = thread
-                scheduler.dedicatedThreads.add(thread)
-                thread.start()
-            } else {
-                cpu.enqueueThreadless(rt)
-            }
-            return ProcessHandle(pid, handleFd)
+            return ProcessHandle(checkNotNull(process).pid, handleFd)
         } finally {
             lock.unlock()
+        }
+    }
+
+    /**
+     * [spawnInternal] が表に足した後で失敗したときの巻き戻し（#629）。カーネルロックの中で、進んだところまでだけを戻す。
+     *
+     * ふつうの終わり方（`finishLocked`・`reapLocked`）は使わない。親への終わりの知らせ・ゾンビ・コンソールの文が出てしまうため。
+     * 状態（`stateValue`）と起動中の印（`bootingValue`・`bootCancelSignal`）には触らない（起動の init なら、印は endBoot が下ろす）。
+     * pid・オブジェクトの ID は戻さない（すぐには使い回さない）。刈り取った親のないゾンビ・コンソールの Tty も戻さない。
+     * 各段は独立させ、途中の段が投げても残りを続ける。出た例外は [cause] に `addSuppressed` で付ける（[cause] は包まずに投げ直す）
+     */
+    private fun rollbackSpawnLocked(
+        cause: Throwable,
+        reserved: Boolean,
+        prevInitPid: Int,
+        process: Process?,
+        handleRetained: Boolean,
+        handleFd: Int,
+        parent: Process?,
+        rt: ProcessRuntime?,
+        thread: KernelThread?,
+        enqueued: Boolean,
+    ) {
+        if (thread != null) rollbackStep(cause) { scheduler.dedicatedThreads.remove(thread) }
+        if (enqueued && rt != null) rollbackStep(cause) { cpu.removeThreadless(rt) }
+        if (process != null) {
+            val pid = process.pid
+            // 表から先に外す。親のハンドルを閉じても、子の付け替え（onProcessHandleClosedLocked）が起きない
+            rollbackStep(cause) { if (runtimes[pid] === rt) runtimes.remove(pid) }
+            rollbackStep(cause) { if (kernel.processes[pid] === process) kernel.processes.remove(pid) }
+            // 子の fd（installFdsLocked が途中で投げても、入った分はここで拾う）
+            rollbackStep(cause) { FdTable(process, kernel.objects, wakeSink).closeAll() }
+            if (handleFd >= 0) rollbackStep(cause) { checkNotNull(parent).handles.remove(handleFd) }
+            if (handleRetained) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
+            // カーネルが持つ ProcessObject の参照（最後の1つ）
+            if (process.objectId != 0) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
+        }
+        kernel.initPid = prevInitPid
+        if (reserved) scheduler.releaseBlocking()
+        // awaitTermination で待っている側を起こす（状態は変えないので、checkAllDoneLocked は呼ばない）
+        if (kernel.processes.liveCount() == 0 && registeredThreads == 0) terminated.signalAll()
+    }
+
+    private inline fun rollbackStep(cause: Throwable, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Throwable) {
+            if (e !== cause) cause.addSuppressed(e)
         }
     }
 

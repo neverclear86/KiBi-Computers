@@ -5,7 +5,7 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 /**
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
- * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt] と [duringInitSpawn] はカーネルロックの中、ほかはロックの外で呼ぶ
+ * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt]・[duringInitSpawn]・[duringSpawn] はカーネルロックの中、ほかはロックの外で呼ぶ
  * （それぞれの KDoc を見る）。
  */
 internal class KernelTestHooks {
@@ -62,8 +62,16 @@ internal class KernelTestHooks {
 
     /**
      * 起動の init を作る区間の途中（カーネルロックの中。表に足して実行時の部分を作った後、`RUNNING` にする前。#625）。
-     * ロックを取らずに読む口（[Machine.isRunningOrBooting]）が、この間も正しく見えるかを確かめるのに使う
+     * ロックを取らずに読む口（[Machine.isRunningOrBooting]）が、この間も正しく見えるかを確かめるのに使う。
+     * 例外を投げると、足した分が巻き戻される（#629）
      */
     @Volatile
     var duringInitSpawn: ((Machine) -> Unit)? = null
+
+    /**
+     * すべての spawn の途中（カーネルロックの中。表・オブジェクト・fd・実行時の部分・専用スレッドを確保した後、スレッドを動かす・
+     * 待ち行列に積む前。init なら [duringInitSpawn] の後）。例外を投げると、足した分が巻き戻される（#629）
+     */
+    @Volatile
+    var duringSpawn: ((Machine, Int) -> Unit)? = null
 }

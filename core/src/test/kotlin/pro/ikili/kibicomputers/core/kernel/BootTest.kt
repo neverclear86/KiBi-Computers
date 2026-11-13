@@ -437,9 +437,30 @@ class BootTest {
         assertTrue(host.log.contains("bootFailed:${BootFailure.INIT_START_FAILED}"), "${host.log}")
         assertTrue(host.console.contains("kibi: cannot start /sbin/init: machine not ready\n"), "${host.console}")
         assertEquals(emptyList<String>(), host.states(), "RUNNING にならない")
-        // 表に足した後の失敗では、足した pid 1 が巻き戻されずに残る（別の Issue で扱う）。残ったままだと env の終わりの
-        // awaitTermination が終わらないので、このテストでは表から外す
-        m.lock.withLockValue { m.kernel.processes.remove(1) }
+        // #629: 表に足した分は巻き戻され、マウントも外れ、待つ側も終わる
+        assertEquals(emptyList<Int>(), pids())
+        assertEquals(emptyList<Pair<String, String>>(), mounts())
+        assertEquals(0, m.lock.withLockValue { m.kernel.initPid })
+        assertEquals(0, h.scheduler.blockingProcesses)
+        assertTrue(m.lock.withLockValue { m.runtimes.isEmpty() })
+        assertTrue(m.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `initの作成を巻き戻した後も、もう一度起動するとpid1のinitが動く`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        h.scheduler.hooks.duringInitSpawn = { _ ->
+            h.scheduler.hooks.duringInitSpawn = null
+            throw RuntimeException("テストの失敗")
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil("失敗が届かない") { host.log.any { it.startsWith("bootFailed:") } }
+        assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(emptyList<Int>(), pids())
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntilInitStarted()
+        assertEquals(listOf(1), pids(), "init の pid は次の起動で 1 に戻る")
+        assertEquals(1, m.lock.withLockValue { m.kernel.initPid })
     }
 
     @Test
