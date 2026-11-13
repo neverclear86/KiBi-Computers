@@ -2,14 +2,14 @@
 
 - 状態: 採用
 - Issue: #426（task）。前提: ADR 0063（イベントキュー）、0064（タイマーと時計）、0072（p1 の `poll_oneoff`）、0073（`kibi:*` の WIT と p1 の import の導き方）、0075（`kibi:io`。`wasi:io` の版）
-- 後続: #439（接続層からゲーム内時間を渡す）、#264・#266（p2・p3 の層）、#265（Component Model の resource のハンドル）、#267（対象の `wasi:*` の版）、#116（SDK の束縛）、#94・#95（Lua の `os.sleep`・`event`）、#251（仮の値の確定）
+- 後続: #439（接続層からゲーム内時間を渡す）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#265（Component Model の resource のハンドル）、#267（対象の `wasi:*` の版）、#116（SDK の束縛）、#94・#95（Lua の `os.sleep`・`event`）、#251（仮の値の確定）
 - ABI の選択（`set-after`・`set-at` の2関数、ナノ秒の `u64`、`interval = 0` で1回だけ、`create` の引数、2^63 以上の頭打ち、`uptime-ticks`・`world-ticks`、sleep の import を足さない、p2/p3 の待ち方は別 interface、p3 は `async func`）は、#426 のプランへのオーナーの回答（論点1〜7、A・B）で決めた。p2/p3 の WIT は仮置きで、細部はエージェントに任された
 
 ## 決めたこと（要約）
 
 - `kibi:kernel@0.1.0` に `interface timers`（resource `timer`）、`kibi:computer@0.1.0` に `interface clock` を置き、p1 向けの import を ADR 0073 の規則で導いて実装した
 - 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）のままで、`kibi:*` には入れない。sleep の独自の import も足さない
-- p2・p3 の待ち方は、`wasi:io` に依存しないよう別の interface（`timers-poll`・`events-poll`・`timers-async`・`events-async`）に置く。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#264・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。WIT とこの ADR だけで、実装しない
+- p2・p3 の待ち方は、`wasi:io` に依存しないよう別の interface（`timers-poll`・`events-poll`・`timers-async`・`events-async`）に置く。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#685・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。WIT とこの ADR だけで、実装しない
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。足した型（`KibiTimers`・`KibiClock`）はすべて Kotlin の `internal object`。タイマーは既存の `KernelState.objects` の `Timer`、時計は `ClockSnapshot`（ADR 0064）で、新しく持つ状態はない
 
 ## WIT（p1 で実装するもの）
@@ -179,7 +179,7 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 
 ## 決めないこと
 
-- p2/p3 の層の実装（`pollable`・async、resource のハンドル）: #264・#265・#266。上の p2/p3 の WIT は仮置き
+- p2/p3 の層の実装（`pollable`・async、resource のハンドル）: #685（p2）・#265（resource）・#266（p3）。上の p2/p3 の WIT は仮置き
 - 対象の `wasi:*` の版: #267
 - 接続層からゲーム内時間を渡すこと: #439
 - Lua の `os.sleep`・`event` との対応: #94・#95

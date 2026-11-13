@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #264（Epic #259）。前提は ADR 0260（Component Model は `core` に自前で実装）、ADR 0262（コンポーネントの読み込みと検証）、ADR 0073（`kibi:*` の WIT と p1 の import。`cabi_realloc` の呼び方）、ADR 0306（書き先は書くときに確かめる）
-- 後続: #263（リンクと exec）、#265（resource のハンドル表）、#266（非同期・stream・future）、#270（インスタンスをまたぐ燃料）、#616（`spawn` の検査の順）、#251（仮の値の確定）
+- 後続: #263（リンクと exec）、#265（resource のハンドル表）、#266（非同期・stream・future）、#270（インスタンスをまたぐ燃料）、#616（`spawn` の検査の順）、#267（`wasi:io/poll`・`wasi:clocks` などの p2）、#685（`kibi:*` の p2 の interface と仮置きの WIT の確定）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 
 ## 背景
@@ -36,6 +36,12 @@ component-model の `design/mvp/canonical-abi/definitions.py`（main、コミッ
 - `bool` は 0 以外を true、`u8`〜`s16` の平らにした値は上位のビットを捨てる、`char` は 0x110000 以上とサロゲートをトラップ、flags は宣言の外のビットを捨てる、判別子が範囲の外ならトラップ
 - variant の平らにした形は `join`（i32 と f32 は i32、ほかの組み合わせは i64）。値は `long` のビット列で持ち、i32・f32 は上位を 0 にして書き、読む側は下位 32 ビットを取るので、`CoerceValueIter` の読み替えと lower の広げ方は、ビット列のまま置くことで済む。余った場所は 0 で埋め、lift では読み飛ばす
 - 平らにした形の数え上げは 16 個（`MAX_FLAT_PARAMS`）を超えたところで打ち切る（フィールドが 10 万個の record でも、形を全部は作らない）
+
+### ホストの実装からの使い方
+
+ホストの実装（#263 のリンクで `kibi:*`・`wasi:*` の import に当てるもの）は、場合・フィールド・ビットの番号を手で数えずに、型の名前で値を作る・読む。`CanonType.Record` の `value("name" to v, …)`・`field(v, "name")`、`Variant`・`Enum` の `case("name", 中身)`・`caseName(v)`、`Flags` の `value("a", "b")`・`has(v, "a")`・`namesOf(v)`。option・result・文字列は `CanonValue.some`・`ok`・`err`・`str`。名前の表は初めて引いたときに作る（型は多く作るので、作るときには作らない）。名前がない・中身が型に合わないのはホストの誤りなので `IllegalArgumentException`。
+
+値は汎用の `CanonValue` を経由する。型付きの codec（ホストの Kotlin の型へ直接 lift する形）は、使いやすさのためには要らず、負荷が重いと分かったとき（#267 で測る）にだけ足す。
 
 ### 浮動小数点数は決定的なプロファイル
 
@@ -87,11 +93,11 @@ lift・lower は型の深さだけ再帰する。上限は `CanonLimits.MAX_TYPE
 - error-context、長さ固定の list、map、GC の option（今の検証の機能では通らないので、来たら断る）
 - 引けない型（上の範囲の外）と、それを使う型
 
-own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作る（ADR 0260 の「保存できる形」で設計するため、ここでは作らない）。
+own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。識別子はその添字空間の中でだけ意味を持つので、別の空間の型どうし（ゲストの型とホストが宣言した型など）を `CanonType.sameShape` で比べるときは、リンク（#263）が import の解決から作った resource の対応（`CanonResourceMatch`）を渡す。1 つの空間の中だけなら `CanonResourceMatch.SAME_SPACE`（番号が同じなら同じ）で比べる。比べる側に対応を渡させるため、既定の値は置かない。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作る（ADR 0260 の「保存できる形」で設計するため、ここでは作らない）。
 
 ### 失敗の扱い
 
-ゲストの入力の誤りは、どれも `WasmTrapException`（範囲の外は `MEMORY_OUT_OF_BOUNDS`、ほかは `OTHER`）。範囲を確かめた後のメモリの読み書きで `WasmMemoryAccessException` が出たら、トラップにする。ホストの値が型に合わないのはホストの誤りなので `IllegalArgumentException`。読み込み・リンクの時点の誤りは `WasmLoadException`。
+ゲストの入力の誤りは、どれも `WasmTrapException`（範囲の外は `MEMORY_OUT_OF_BOUNDS`、ほかは `OTHER`）。範囲を確かめた後のメモリの読み書きで `WasmMemoryAccessException` が出たら、トラップにする。ホストの値が型に合わないのはホストの誤りなので `IllegalArgumentException`。呼ぶ側（リンカー）が `CanonFunction` に渡す core の引数・結果の数が型と違うのも同じ（`liftParams`・`lowerResult`・`liftResult` が確かめる）。読み込み・リンクの時点の誤りは `WasmLoadException`。
 
 ### p1 の `P1Canonical` は置き換えない
 

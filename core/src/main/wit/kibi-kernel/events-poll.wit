@@ -1,6 +1,6 @@
 package kibi:kernel@0.1.0;
 
-/// p2 でイベントキューを待つ（ADR 0426）。仮置き: interface・関数・型・`wasi:*` の版は、p2 の層 #264 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+/// p2 でイベントキューを待つ（ADR 0426）。仮置き: interface・関数・型・`wasi:*` の版は、p2 の層（#685）を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
 interface events-poll {
     use events.{event-queue};
     use wasi:io/poll@0.2.3.{pollable};

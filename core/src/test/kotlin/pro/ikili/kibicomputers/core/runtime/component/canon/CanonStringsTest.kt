@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.runtime.component.canon
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.FakeMemory
@@ -220,7 +221,37 @@ class CanonStringsTest {
         // 長さの上限は align より先
         val e = assertThrows<WasmTrapException> { CanonStrings.load(cx(UTF16), 1, 1 shl 27) }
         assertEquals(WasmTrapKind.OTHER, e.kind)
+        // 長さの上限も align も OTHER なので、メッセージで見分ける
+        assertTrue(e.message!!.contains("長すぎる")) { e.message }
         val oob = assertThrows<WasmTrapException> { CanonStrings.load(cx(UTF8), 0xfff0, 0x20) }
         assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, oob.kind)
+    }
+
+    @Test
+    fun `lower でも、写すバイト数を realloc の前に予算から引く`() {
+        fun budgeted(e: CanonStringEncoding, maxBytes: Long) =
+            canonContext(memory, e, realloc, budget = CanonBudget(maxBytes = maxBytes))
+        val utf16Lifted = CanonValue.Str("ab", UTF16, 2)
+        val latin1Lifted = CanonValue.Str("ab", LATIN1_UTF16, 2L or tag)
+        // (送り先の符号化, 値, 引く大きさ): 写す（copy）、UTF-8 へ広げる最悪の大きさ（toUtf8）、UTF-16 の最悪の大きさ、
+        // latin1+utf16 の最悪の大きさ、UTF-16 で書いてから詰める大きさ
+        val cases = listOf(
+            Triple(UTF8, CanonValue.str("abcd"), 4L),
+            Triple(UTF8, utf16Lifted, 6L),
+            Triple(UTF16, CanonValue.str("abc"), 6L),
+            Triple(LATIN1_UTF16, CanonValue.str("abc"), 6L),
+            Triple(LATIN1_UTF16, latin1Lifted, 4L),
+        )
+        for ((e, v, need) in cases) {
+            realloc.calls.clear()
+            val ex = assertThrows<WasmTrapException> { CanonStrings.store(budgeted(e, need - 1), v) }
+            assertEquals(WasmTrapKind.OTHER, ex.kind)
+            assertTrue(ex.message!!.contains("バイト数")) { "$e $v: ${ex.message}" }
+            assertTrue(realloc.calls.isEmpty()) { "$e $v" }
+            CanonStrings.store(budgeted(e, need), v)
+        }
+        // 文字列 1 つも値 1 つとして数える
+        val noValues = canonContext(memory, UTF8, realloc, budget = CanonBudget(maxValues = 0))
+        trap { CanonStrings.store(noValues, CanonValue.str("a")) }
     }
 }

@@ -84,6 +84,7 @@ internal class CanonFunction(val params: List<CanonType>, val result: CanonType?
      */
     @Throws(WasmTrapException::class)
     fun lowerResult(cx: CanonContext, value: CanonValue?, args: LongArray): LongArray = guarded {
+        require(args.size == lowerSignature.params.size) { "core の引数の数が違う（${args.size}。$lowerSignature）" }
         if (result == null) {
             require(value == null) { "結果のない関数に値を返した" }
             return@guarded EMPTY

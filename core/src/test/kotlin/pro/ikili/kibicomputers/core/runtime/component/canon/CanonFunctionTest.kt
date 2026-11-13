@@ -82,6 +82,21 @@ class CanonFunctionTest {
     }
 
     @Test
+    fun `core の引数・結果の数が型と違うのはホストの誤り`() {
+        // 結果をポインタで渡す関数の書き先は最後の引数。数が違えば、別の引数を書き先にせず断る
+        val f = CanonFunction(listOf(U32), Str)
+        assertThrows<IllegalArgumentException> { f.lowerResult(cx, CanonValue.str("x"), LongArray(0)) }
+        assertThrows<IllegalArgumentException> { f.lowerResult(cx, CanonValue.str("x"), longArrayOf(0x100)) }
+        assertThrows<IllegalArgumentException> { f.lowerResult(cx, CanonValue.str("x"), longArrayOf(7, 0x100, 0x200)) }
+        // 平らに返す関数でも数を確かめる
+        val g = CanonFunction(emptyList(), U32)
+        assertThrows<IllegalArgumentException> { g.lowerResult(cx, I32(5), longArrayOf(1)) }
+        assertThrows<IllegalArgumentException> { f.liftParams(cx, longArrayOf(7)) }
+        assertThrows<IllegalArgumentException> { f.liftResult(cx, LongArray(0)) }
+        assertTrue(realloc.calls.isEmpty())
+    }
+
+    @Test
     fun `引数の場所の align と範囲を確かめる`() {
         val f = CanonFunction(listOf(U32) + List(16) { U8 }, null)
         trap { f.liftParams(cx, longArrayOf(2)) }

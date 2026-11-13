@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #72（task）。前提: ADR 0043（カーネルの構成）、0063（イベントキュー）、0064（タイマーと時計）、0070（p1 の `fd_*`）、0261（p1 の層を直接実装する）
-- 後続: #73（イベントキューの fd を開く import。ADR 0073）、#426（タイマーの fd。ADR 0426）、#329（`WAIT_POINT` の p1 を `poll_oneoff` で待たせる）、#264・#266（p2・p3 の待ち）、#81・#82（保存）、#251（仮の値の確定）、#332（cwd と `PWD`）
+- 後続: #73（イベントキューの fd を開く import。ADR 0073）、#426（タイマーの fd。ADR 0426）、#329（`WAIT_POINT` の p1 を `poll_oneoff` で待たせる）、#267・#685・#266（p2・p3 の待ち）、#81・#82（保存）、#251（仮の値の確定）、#332（cwd と `PWD`）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -95,6 +95,6 @@ event（32 バイト、align 8）
   - 追記（#73）: イベントキューの fd と取り出し方は ADR 0073（`kibi:kernel/events`）、タイマーの fd は #426
   - 追記（#426）: タイマーの fd は ADR 0426（`kibi:kernel/timers`）。`FD_READ` で待つ所は変えていない（`FdIo.pollLocked` の汎用の分岐）
 - `WAIT_POINT` の p1 を `poll_oneoff` で待たせる形: #329
-- p2 の `wasi:io/poll`・`wasi:clocks`: #264 配下、p3 の waitable-set: #266
+- p2 の `wasi:io/poll`・`wasi:clocks`: #267（`kibi:*` の p2 の待ち方は #685）、p3 の waitable-set: #266
 - 保存のバイト形式: #81・#82。仮の値の確定: #251
 - ADR 0045・0071 が #72 としていた「cwd と wasi-libc の `PWD` の合わせ方」は `poll_oneoff` の範囲の外なので、#332（#68 のサブ Issue）に渡す

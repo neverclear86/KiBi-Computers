@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #73（task）。前提: ADR 0043（カーネルの構成）、0063（イベントキュー）、0072（p1 の `poll_oneoff`）、0261（p1 の層を直接実装する）、0329（p1 の待機点への変換）、#257（WASI の対応範囲と独自拡張の定義方法）
-- 後続: #426（タイマーと時計）、#427（TTY）、#74（プロセス）、#75（パイプと fd の複製）、#76（ソケット）、#77（デバイス）、#306（電源）、#326（キーの押下）、#264・#266（p2・p3 の層）、#116（SDK の束縛）、#251（仮の値の確定）
+- 後続: #426（タイマーと時計）、#427（TTY）、#74（プロセス）、#75（パイプと fd の複製）、#76（ソケット）、#77（デバイス）、#306（電源）、#326（キーの押下）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#116（SDK の束縛）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 - ABI の選択（Q1〜Q6、タイマーと時計の置き場所）は、#73 のプランへのオーナーの回答で決めた（すべて推奨どおり）
 
@@ -96,7 +96,7 @@ interface events {
 - `kind` は `KernelEvent.type`、`source` はなければ ""、`dropped` は前回の取り出しからあふれて捨てた数（ADR 0063）
 - `open`: `kinds` が空ならすべての種類。`capacity` を省くと既定（仮の値 64。確定は #251）
 - `take`: 待たずに最大 `max` 個。`max` は符号なしで読み、0 だけが `invalid`。`Int.MAX_VALUE` で頭打ち（2^31 以上は「全部」）
-- 待ち方: p1 はキューの fd を `poll_oneoff` の `FD_READ` で待つ。p2 の `subscribe() -> pollable`・p3 の async は `wasi:io` に依存するので、#264・#266 で別の interface として足す
+- 待ち方: p1 はキューの fd を `poll_oneoff` の `FD_READ` で待つ。p2 の `subscribe() -> pollable`・p3 の async は `wasi:io` に依存するので、p2 は #685、p3 は #266 で別の interface として足す
 - 燃料: 呼び出しごとに `CALL_FUEL`、`take` は加えて渡したイベントの数
 
 ### p1 向けの import
@@ -154,7 +154,7 @@ interface events {
 
 - WIT: `core/src/main/wit/kibi-kernel/{types,events,world}.wit`、`core/src/main/wit/kibi-computer/{memory,world}.wit`、`core/src/main/wit/kibi-io/`（#75。ADR 0075）、`kibi-kernel/timers*.wit`・`events-poll.wit`・`events-async.wit`・`kibi-computer/clock.wit`（#426。ADR 0426）
 - `core.wasi.kibi.KibiErrors`（`error-code` の写し方）、`KibiEvents`（意味の部分。ABI の層に依らない）
-- `core.wasi.p1.P1Canonical`（p1 に要る Canonical ABI の最小限の lift・lower。#264 ができたら置き換える）、`WasiP1Kibi`（import の表）、`WasiP1.checkImports`（読み込みの検査）
+- `core.wasi.p1.P1Canonical`（p1 に要る Canonical ABI の最小限の lift・lower。Component Model の層（#264）とは意図して違うので置き換えない。ADR 0264）、`WasiP1Kibi`（import の表）、`WasiP1.checkImports`（読み込みの検査）
 - `ProcessContext.callGuest`・`inGuestCall`
 - C: `core/src/main/wasm/common/kibi_memory.h`・`kibi_events.h`（手書き。wit-bindgen で作る束縛は SDK #116）
 
@@ -177,7 +177,7 @@ interface events {
   - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
   - 追記（#306）: 電源は ADR 0306 で決めた（`kibi:computer/power`）
-- p2・p3 の層（`pollable`・async、Canonical ABI の一般の実装）: #264・#266
+- p2・p3 の層: Canonical ABI の一般の実装は #264（ADR 0264）、`kibi:*` の p2 の `pollable` は #685、async は #266
 - 生成した束縛（wit-bindgen）: SDK #116
 - 燃料とキューの既定の容量の確定: #251
 - 異常終了の理由の文（`kibi:memory commit was refused …`）は読む人向けの名前なので、今回は変えない

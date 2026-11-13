@@ -253,6 +253,92 @@ class CanonAbiTest {
     }
 
     @Test
+    fun `判別子が 2 バイト・4 バイトの enum と variant をメモリに書いて読める`() {
+        val e2 = CanonType.Enum((0 until 300).map { "e$it" })
+        assertEquals(2, e2.discSize)
+        memory.writeU8(0x102, 0x55)
+        CanonAbi.store(cx, Case(299, null), e2, 0x100)
+        assertEquals(0x2b, memory.readU8(0x100))
+        assertEquals(0x01, memory.readU8(0x101))
+        assertEquals(0x55, memory.readU8(0x102)) // 判別子の外は書かない
+        assertEquals(Case(299, null), CanonAbi.load(cx, 0x100, e2))
+        memory.writeU8(0x100, 0x2c) // 300
+        trap { CanonAbi.load(cx, 0x100, e2) }
+
+        val n = 0x10001
+        val v4 = variant(*Array<CanonType?>(n) { if (it == n - 1) U64 else null })
+        assertEquals(4, v4.discSize)
+        assertEquals(8, v4.payloadOffset)
+        CanonAbi.store(cx, Case(n - 1, I64(-2)), v4, 0x200)
+        assertEquals(n - 1, memory.readI32(0x200))
+        assertEquals(-2L, memory.readI64(0x208))
+        assertEquals(Case(n - 1, I64(-2)), CanonAbi.load(cx, 0x200, v4))
+        memory.writeI32(0x200, n)
+        trap { CanonAbi.load(cx, 0x200, v4) }
+        // 判別子は u32 として読む（負の数にならない）
+        memory.writeI32(0x200, -1)
+        trap { CanonAbi.load(cx, 0x200, v4) }.also { assertTrue(it.message!!.contains("4294967295")) { it.message } }
+    }
+
+    @Test
+    fun `flags をメモリに書いて読める（2 バイト・4 バイト）`() {
+        val f9 = Flags((0 until 9).map { "b$it" })
+        CanonAbi.store(cx, CanonValue.Flags(0x1ff), f9, 0x100)
+        assertEquals(0xff, memory.readU8(0x100))
+        assertEquals(0x01, memory.readU8(0x101))
+        assertEquals(CanonValue.Flags(0x1ff), CanonAbi.load(cx, 0x100, f9))
+        val f32 = Flags((0 until 32).map { "b$it" })
+        val bits = 0x8000_0001.toInt()
+        CanonAbi.store(cx, CanonValue.Flags(bits), f32, 0x200)
+        assertEquals(bits, memory.readI32(0x200))
+        assertEquals(CanonValue.Flags(bits), CanonAbi.load(cx, 0x200, f32))
+    }
+
+    @Test
+    fun `負の s8・s16 をメモリに書くと、型の幅だけ 2 の補数で書く`() {
+        memory.write(0x100, ByteArray(4) { 0x55 })
+        CanonAbi.store(cx, I32(-1), S8, 0x100)
+        assertEquals(0xff, memory.readU8(0x100))
+        assertEquals(0x55, memory.readU8(0x101))
+        assertEquals(I32(-1), CanonAbi.load(cx, 0x100, S8))
+        CanonAbi.store(cx, I32(-128), S8, 0x100)
+        assertEquals(0x80, memory.readU8(0x100))
+        assertEquals(I32(-128), CanonAbi.load(cx, 0x100, S8))
+        CanonAbi.store(cx, I32(-2), S16, 0x100)
+        assertEquals(0xfe, memory.readU8(0x100))
+        assertEquals(0xff, memory.readU8(0x101))
+        assertEquals(0x55, memory.readU8(0x102))
+        assertEquals(I32(-2), CanonAbi.load(cx, 0x100, S16))
+        CanonAbi.store(cx, I32(-0x8000), S16, 0x100)
+        assertEquals(I32(-0x8000), CanonAbi.load(cx, 0x100, S16))
+        assertThrows<IllegalArgumentException> { CanonAbi.store(cx, I32(-129), S8, 0x100) }
+        assertThrows<IllegalArgumentException> { CanonAbi.store(cx, I32(-0x8001), S16, 0x100) }
+    }
+
+    @Test
+    fun `lower でも予算を超えたら、realloc を呼ぶ前にトラップ`() {
+        fun budgeted(maxBytes: Long = CanonLimits.DEFAULT_MAX_BYTES, maxValues: Long = CanonLimits.DEFAULT_MAX_VALUES) =
+            canonContext(memory, realloc = realloc, budget = CanonBudget(maxBytes, maxValues))
+        // list<u64> の 24 バイト
+        trap { CanonAbi.storeList(budgeted(maxBytes = 23), Items(listOf(I64(1), I64(2), I64(3))), ListOf(U64)) }
+            .also { assertTrue(it.message!!.contains("バイト数")) { it.message } }
+        // list<u8>（ByteArray のまま写す道）
+        trap { CanonAbi.storeList(budgeted(maxBytes = 2), CanonValue.Bytes(byteArrayOf(1, 2, 3)), ListOf(U8)) }
+            .also { assertTrue(it.message!!.contains("バイト数")) { it.message } }
+        assertTrue(realloc.calls.isEmpty())
+        // ちょうどなら書ける
+        CanonAbi.storeList(budgeted(maxBytes = 24), Items(listOf(I64(1), I64(2), I64(3))), ListOf(U64))
+        realloc.calls.clear()
+        // 値の数（record の 3 フィールドと record そのもの）
+        trap { CanonAbi.store(budgeted(maxValues = 3), Fields(listOf(I32(1), I32(2), I32(3))), record(U32, U32, U32), 0x100) }
+            .also { assertTrue(it.message!!.contains("値の数")) { it.message } }
+        CanonAbi.store(budgeted(maxValues = 4), Fields(listOf(I32(1), I32(2), I32(3))), record(U32, U32, U32), 0x100)
+        // 平らにして渡す道も同じ予算で数える
+        trap { lowerFlat(record(U32, U32), Fields(listOf(I32(1), I32(2))), budgeted(maxValues = 2)) }
+        assertTrue(realloc.calls.isEmpty())
+    }
+
+    @Test
     fun `resource は差し込んだ口で lift・lower する`() {
         val res = object : CanonResources {
             override fun liftOwn(type: CanonType.Own, handle: Int): Int = handle * 10 + type.resource

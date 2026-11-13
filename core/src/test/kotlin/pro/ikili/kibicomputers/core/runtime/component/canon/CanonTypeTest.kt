@@ -128,12 +128,70 @@ class CanonTypeTest {
     fun `構造で比べる`() {
         val a = record(U32, Str)
         val b = record(U32, Str)
-        assertTrue(CanonType.sameShape(a, b))
-        assertFalse(CanonType.sameShape(a, Record(listOf("x", "f1"), listOf(U32, Str))))
-        assertFalse(CanonType.sameShape(a, Tuple(listOf(U32, Str))))
-        assertTrue(CanonType.sameShape(Result(null, a), Result(null, b)))
-        assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Own(2)))
-        assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Borrow(1)))
+        assertTrue(CanonType.sameShape(a, b, CanonResourceMatch.SAME_SPACE))
+        assertFalse(CanonType.sameShape(a, Record(listOf("x", "f1"), listOf(U32, Str)), CanonResourceMatch.SAME_SPACE))
+        assertFalse(CanonType.sameShape(a, Tuple(listOf(U32, Str)), CanonResourceMatch.SAME_SPACE))
+        assertTrue(CanonType.sameShape(Result(null, a), Result(null, b), CanonResourceMatch.SAME_SPACE))
+        assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Own(2), CanonResourceMatch.SAME_SPACE))
+        assertFalse(CanonType.sameShape(CanonType.Own(1), CanonType.Borrow(1), CanonResourceMatch.SAME_SPACE))
+    }
+
+    @Test
+    fun `別の添字空間の resource は、渡した対応で比べる`() {
+        // ゲストの空間では 3 番、ホストの空間では 0 番が同じ resource。ゲストの 0 番は別の resource
+        val map = mapOf(3 to 0, 5 to 1)
+        val guestToHost = CanonResourceMatch { g, h -> map[g] == h }
+        val guest = Result(CanonType.Own(3), CanonType.Borrow(5))
+        val host = Result(CanonType.Own(0), CanonType.Borrow(1))
+        assertTrue(CanonType.sameShape(guest, host, guestToHost))
+        // 番号が同じでも、対応がなければ違う
+        assertFalse(CanonType.sameShape(Result(CanonType.Own(0), null), Result(CanonType.Own(0), null), guestToHost))
+        // 番号で比べると取り違える（同じ resource が違うと出て、別の resource が同じと出る）
+        assertFalse(CanonType.sameShape(guest, host, CanonResourceMatch.SAME_SPACE))
+        assertTrue(CanonType.sameShape(CanonType.Own(0), CanonType.Own(0), CanonResourceMatch.SAME_SPACE))
+        // list・record の中でも対応で比べる
+        val g2 = Record(listOf("h"), listOf(ListOf(CanonType.Own(5))))
+        val h2 = Record(listOf("h"), listOf(ListOf(CanonType.Own(1))))
+        assertTrue(CanonType.sameShape(g2, h2, guestToHost))
+        assertFalse(CanonType.sameShape(g2, Record(listOf("h"), listOf(ListOf(CanonType.Own(0)))), guestToHost))
+    }
+
+    @Test
+    fun `ホストは名前で値を作り、読む`() {
+        val kind = Enum(listOf("file", "dir"))
+        val info = Record(listOf("name", "size", "kind"), listOf(Str, U64, kind))
+        val v = info.value("size" to CanonValue.I64(10), "kind" to kind.case("dir"), "name" to CanonValue.str("a"))
+        assertEquals(CanonValue.Fields(listOf(CanonValue.str("a"), CanonValue.I64(10), CanonValue.Case(1, null))), v)
+        assertEquals(CanonValue.I64(10), info.field(v, "size"))
+        assertEquals("dir", kind.caseName(info.field(v, "kind")))
+        assertEquals(2, info.fieldIndex("kind"))
+        assertEquals(0, kind.caseIndex("file"))
+        // 足りない・重なる・ない名前・型に合わない値はホストの誤り
+        assertThrows<IllegalArgumentException> { info.value("name" to CanonValue.str("a"), "size" to CanonValue.I64(1)) }
+        assertThrows<IllegalArgumentException> {
+            info.value("name" to CanonValue.str("a"), "name" to CanonValue.str("b"), "kind" to kind.case("file"))
+        }
+        assertThrows<IllegalArgumentException> { info.field(v, "nope") }
+        assertThrows<IllegalArgumentException> { info.field(CanonValue.I32(0), "size") }
+        assertThrows<IllegalArgumentException> { kind.case("nope") }
+
+        val ready = Variant(listOf("closed", "ready"), listOf(null, U32))
+        assertEquals(CanonValue.Case(1, CanonValue.I32(4)), ready.case("ready", CanonValue.I32(4)))
+        assertEquals(CanonValue.Case(0, null), ready.case("closed"))
+        assertEquals("ready", ready.caseName(CanonValue.Case(1, CanonValue.I32(4))))
+        assertEquals(1, ready.caseIndex("ready"))
+        assertThrows<IllegalArgumentException> { ready.case("ready") }
+        assertThrows<IllegalArgumentException> { ready.case("closed", CanonValue.I32(1)) }
+        assertThrows<IllegalArgumentException> { ready.caseName(CanonValue.Case(2, null)) }
+
+        val perms = Flags(listOf("read", "write", "exec"))
+        val p = perms.value("read", "exec")
+        assertEquals(CanonValue.Flags(0b101), p)
+        assertTrue(perms.has(p, "exec"))
+        assertFalse(perms.has(p, "write"))
+        assertEquals(listOf("read", "exec"), perms.namesOf(p))
+        assertEquals(1 shl 31, Flags((0 until 32).map { "b$it" }).bit("b31"))
+        assertThrows<IllegalArgumentException> { perms.value("nope") }
     }
 
     private fun <T> within10s(block: () -> T): T = assertTimeoutPreemptively(Duration.ofSeconds(10), ThrowingSupplier { block() })
@@ -151,10 +209,10 @@ class CanonTypeTest {
         val a = diamond(CanonLimits.MAX_TYPE_DEPTH, U32)
         val b = diamond(CanonLimits.MAX_TYPE_DEPTH, U32)
         assertEquals(CanonLimits.MAX_TYPE_DEPTH, a.depth)
-        assertTrue(within10s { CanonType.sameShape(a, b) })
+        assertTrue(within10s { CanonType.sameShape(a, b, CanonResourceMatch.SAME_SPACE) })
         // 一番底が違えば、違うと分かる（これも定義の数で済む）
         val c = diamond(CanonLimits.MAX_TYPE_DEPTH, U64)
-        assertFalse(within10s { CanonType.sameShape(a, c) })
+        assertFalse(within10s { CanonType.sameShape(a, c, CanonResourceMatch.SAME_SPACE) })
         // 形が同じで片方の一番底の 1 か所だけが違うものも、違うと分かる
         var left: CanonType = Result(U32, U32)
         var right: CanonType = Result(U32, U64)
@@ -162,7 +220,7 @@ class CanonTypeTest {
             left = Result(left, left)
             right = Result(right, right)
         }
-        assertFalse(within10s { CanonType.sameShape(left, right) })
+        assertFalse(within10s { CanonType.sameShape(left, right, CanonResourceMatch.SAME_SPACE) })
     }
 
     @Test

@@ -121,7 +121,7 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 | `process` の項目 | p1 | p2 | p3 |
 | --- | --- | --- | --- |
 | resource `process` | ハンドル = カーネルの fd 番号 | Component Model の resource（ハンドル表は #265。中身は同じ `ProcessObject`） | 同じ |
-| `spawn` | 止まりうる import | 同期の関数（待ち方は #264 の層の決まりに従う） | 使えるが、`process-async.spawn` を使う |
+| `spawn` | 止まりうる import | 同期の関数（待ち方は p2 の層 #685 の決まりに従う） | 使えるが、`process-async.spawn` を使う |
 | 子の fd | `fds` の `parent(n)` | `fds` は `parent(0/1/2)` と `closed` だけ（Q8-A）。ほかは `spawn-with-handles` | 同じ。ほかは `process-async.spawn` |
 | 待つ | fd を `poll_oneoff` の `FD_READ` | `process-poll.subscribe` の `pollable`（同じ `EXITED` の key。刈り取らない） | `process-async.wait`（Q7-A。複数の子は subtask を waitable-set で） |
 | ハンドルを閉じる | fd を閉じる経路で付け替え | resource の drop も同じ付け替え | 同じ |

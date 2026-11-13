@@ -138,6 +138,25 @@ internal sealed class CanonType {
             require(names.size == types.size) { "フィールドの名前と型の数が違う" }
         }
 
+        private val index = NameIndex(names, "record のフィールド")
+
+        /** [name] のフィールドの番号（[CanonValue.Fields] の位置） */
+        fun fieldIndex(name: String): Int = index[name]
+
+        /** ホストの値を名前で作る。[values] は全フィールドを 1 回ずつ（順は問わない） */
+        fun value(vararg values: kotlin.Pair<String, CanonValue>): CanonValue.Fields {
+            val out = arrayOfNulls<CanonValue>(names.size)
+            for ((n, v) in values) {
+                val i = index[n]
+                require(out[i] == null) { "record のフィールド $n が 2 回ある" }
+                out[i] = v
+            }
+            return CanonValue.Fields(out.mapIndexed { i, v -> requireNotNull(v) { "record のフィールド ${names[i]} がない" } })
+        }
+
+        /** [v]（この型の値）の [name] のフィールド */
+        fun field(v: CanonValue, name: String): CanonValue = fieldsOf(v, this)[index[name]]
+
         override fun render(out: StringBuilder) {
             out.append("record{")
             for (i in names.indices) {
@@ -217,6 +236,21 @@ internal sealed class CanonType {
             require(names.size == types.size) { "場合の名前と型の数が違う" }
         }
 
+        private val index = NameIndex(names, "variant の場合")
+
+        /** [name] の場合の番号（[CanonValue.Case.index]） */
+        fun caseIndex(name: String): Int = index[name]
+
+        /** ホストの値を名前で作る。[payload] は中身のある場合にだけ渡す */
+        fun case(name: String, payload: CanonValue? = null): CanonValue.Case {
+            val i = index[name]
+            require((caseTypes[i] == null) == (payload == null)) { "variant の場合 $name の中身が型に合わない" }
+            return CanonValue.Case(i, payload)
+        }
+
+        /** [v]（この型の値）の場合の名前 */
+        fun caseName(v: CanonValue): String = names[caseIndexOf(v, this)]
+
         override fun render(out: StringBuilder) {
             out.append("variant{")
             for (i in names.indices) {
@@ -234,6 +268,17 @@ internal sealed class CanonType {
 
     /** `enum`（中身のない variant） */
     class Enum(val names: List<String>) : Cases(arrayOfNulls<CanonType>(names.size).asList()) {
+        private val index = NameIndex(names, "enum の場合")
+
+        /** [name] の場合の番号（[CanonValue.Case.index]） */
+        fun caseIndex(name: String): Int = index[name]
+
+        /** ホストの値を名前で作る */
+        fun case(name: String): CanonValue.Case = CanonValue.Case(index[name], null)
+
+        /** [v]（この型の値）の場合の名前 */
+        fun caseName(v: CanonValue): String = names[caseIndexOf(v, this)]
+
         override fun render(out: StringBuilder) {
             out.append("enum{")
             for ((i, n) in names.withIndex()) {
@@ -282,6 +327,23 @@ internal sealed class CanonType {
             mask = if (n == 32) -1 else (1 shl n) - 1
         }
 
+        private val index = NameIndex(names, "flags")
+
+        /** [name] のビット（[CanonValue.Flags.bits] の中の 1 ビット） */
+        fun bit(name: String): Int = 1 shl index[name]
+
+        /** [set] の名前のビットを立てた値 */
+        fun value(vararg set: String): CanonValue.Flags = CanonValue.Flags(set.fold(0) { acc, n -> acc or bit(n) })
+
+        /** [v]（この型の値）で [name] が立っているか */
+        fun has(v: CanonValue, name: String): Boolean = flagBits(v, this) and bit(name) != 0
+
+        /** [v]（この型の値）で立っている名前（宣言の順） */
+        fun namesOf(v: CanonValue): List<String> {
+            val bits = flagBits(v, this)
+            return names.filterIndexed { i, _ -> bits and (1 shl i) != 0 }
+        }
+
         override fun render(out: StringBuilder) {
             out.append("flags{")
             for ((i, n) in names.withIndex()) {
@@ -295,7 +357,8 @@ internal sealed class CanonType {
 
     /**
      * resource のハンドル（`own<R>`・`borrow<R>`）。[resource] は resource の型を指す識別子（型の添字空間で、
-     * その resource を定義・import した番号）。ハンドル表は #265 が持つので、lift・lower は [CanonResources] に任せる
+     * その resource を定義・import した番号）。番号はその添字空間の中でだけ意味を持つ（別の空間の型と比べるときは
+     * [sameShape] に対応を渡す）。ハンドル表は #265 が持つので、lift・lower は [CanonResources] に任せる
      */
     sealed class Handle(val resource: Int) : CanonType() {
         override val size: Int get() = 4
@@ -357,39 +420,86 @@ internal sealed class CanonType {
         }
 
         /**
-         * [a] と [b] が同じ形か（名前・場合・フィールドの並びと型、resource の識別子まで同じ）。
-         * ホストが宣言した型と、ゲストの型が合うかを確かめるのに使う（呼ぶのはリンク。#263）。
-         * 同じオブジェクトは中まで見ない。別々に作った同じ形の型どうしでも、比べた（オブジェクトの）組は
-         * 1回しかたどらないので、手間は木に展開した大きさではなく、2つの型の定義の数の積までで済む
+         * [a] と [b] が同じ形か（名前・場合・フィールドの並びと型まで同じで、own・borrow の resource は [resources] が
+         * 同じとしたもの）。ホストが宣言した型と、ゲストの型が合うかを確かめるのに使う（呼ぶのはリンク。#263）。
+         *
+         * resource の識別子（[Handle.resource]）は型の添字空間ごとの番号なので、数値が同じでも別の空間なら同じ resource
+         * とは限らない。別の空間の型どうし（ゲストの型とホストの型など）を比べるときは、リンクが import の解決から作った
+         * 対応を [resources] に渡す。1 つの空間の中の型どうしだけは [CanonResourceMatch.SAME_SPACE] で比べてよい。
+         *
+         * 同じオブジェクトは同じ型として中まで見ない（[resources] も呼ばない）。別々に作った同じ形の型どうしでも、
+         * 比べた（オブジェクトの）組は 1回しかたどらないので、手間は木に展開した大きさではなく、2つの型の定義の数の積までで済む
          */
-        fun sameShape(a: CanonType?, b: CanonType?): Boolean = sameShape(a, b, HashSet())
+        fun sameShape(a: CanonType?, b: CanonType?, resources: CanonResourceMatch): Boolean =
+            sameShape(a, b, resources, HashSet())
 
         /** 参照で比べる組。違いが見つかれば全体が `false` で終わるので、たどり始めた組は「同じ」として扱ってよい */
-        private class Pair(val a: CanonType, val b: CanonType) {
-            override fun equals(other: Any?): Boolean = other is Pair && other.a === a && other.b === b
+        private class Visited(val a: CanonType, val b: CanonType) {
+            override fun equals(other: Any?): Boolean = other is Visited && other.a === a && other.b === b
             override fun hashCode(): Int = System.identityHashCode(a) * 31 + System.identityHashCode(b)
         }
 
-        private fun sameShape(a: CanonType?, b: CanonType?, seen: HashSet<Pair>): Boolean {
+        private fun sameShape(a: CanonType?, b: CanonType?, r: CanonResourceMatch, seen: HashSet<Visited>): Boolean {
             if (a === b) return true
             if (a == null || b == null) return false
-            if (!seen.add(Pair(a, b))) return true
+            if (!seen.add(Visited(a, b))) return true
             return when (a) {
                 is Primitive, Str -> false // プリミティブはオブジェクトが1つずつなので、参照が違えば違う
-                is ListOf -> b is ListOf && sameShape(a.element, b.element, seen)
-                is Record -> b is Record && a.names == b.names && sameAll(a.fieldTypes, b.fieldTypes, seen)
-                is Tuple -> b is Tuple && sameAll(a.fieldTypes, b.fieldTypes, seen)
-                is Variant -> b is Variant && a.names == b.names && sameAll(a.caseTypes, b.caseTypes, seen)
+                is ListOf -> b is ListOf && sameShape(a.element, b.element, r, seen)
+                is Record -> b is Record && a.names == b.names && sameAll(a.fieldTypes, b.fieldTypes, r, seen)
+                is Tuple -> b is Tuple && sameAll(a.fieldTypes, b.fieldTypes, r, seen)
+                is Variant -> b is Variant && a.names == b.names && sameAll(a.caseTypes, b.caseTypes, r, seen)
                 is Enum -> b is Enum && a.names == b.names
-                is Option -> b is Option && sameShape(a.type, b.type, seen)
-                is Result -> b is Result && sameShape(a.ok, b.ok, seen) && sameShape(a.err, b.err, seen)
+                is Option -> b is Option && sameShape(a.type, b.type, r, seen)
+                is Result -> b is Result && sameShape(a.ok, b.ok, r, seen) && sameShape(a.err, b.err, r, seen)
                 is Flags -> b is Flags && a.names == b.names
-                is Own -> b is Own && a.resource == b.resource
-                is Borrow -> b is Borrow && a.resource == b.resource
+                is Own -> b is Own && r.same(a.resource, b.resource)
+                is Borrow -> b is Borrow && r.same(a.resource, b.resource)
             }
         }
 
-        private fun sameAll(a: List<CanonType?>, b: List<CanonType?>, seen: HashSet<Pair>): Boolean =
-            a.size == b.size && a.indices.all { sameShape(a[it], b[it], seen) }
+        private fun sameAll(a: List<CanonType?>, b: List<CanonType?>, r: CanonResourceMatch, seen: HashSet<Visited>): Boolean =
+            a.size == b.size && a.indices.all { sameShape(a[it], b[it], r, seen) }
     }
+}
+
+/**
+ * 2 つの型の添字空間の resource の識別子（[CanonType.Handle.resource]）が、同じ resource を指すか。
+ * 識別子は空間ごとの番号なので、別の空間の型を [CanonType.sameShape] で比べるときは、リンク（#263）が import の解決から
+ * 作った対応を渡す
+ */
+internal fun interface CanonResourceMatch {
+    fun same(a: Int, b: Int): Boolean
+
+    companion object {
+        /** 1 つの添字空間の中の型どうし（番号が同じなら同じ resource） */
+        val SAME_SPACE: CanonResourceMatch = CanonResourceMatch { a, b -> a == b }
+    }
+}
+
+/**
+ * 名前から番号を引く表（ホストが名前で値を作る・読むための補助）。型は多く作るので、表は初めて引いたときに作る
+ * （`lazy` は既定で同期するので、スレッドをまたいで共有してよい）
+ */
+private class NameIndex(private val names: List<String>, private val what: String) {
+    private val map: Map<String, Int> by lazy {
+        HashMap<String, Int>(names.size * 2).also { m -> names.forEachIndexed { i, n -> m.putIfAbsent(n, i) } }
+    }
+
+    operator fun get(name: String): Int = map[name] ?: throw IllegalArgumentException("$what に $name がない")
+}
+
+private fun fieldsOf(v: CanonValue, t: CanonType.Record): List<CanonValue> {
+    require(v is CanonValue.Fields && v.fields.size == t.fieldTypes.size) { "値が型に合わない（$t）: $v" }
+    return v.fields
+}
+
+private fun caseIndexOf(v: CanonValue, t: CanonType.Cases): Int {
+    require(v is CanonValue.Case && v.index in t.caseTypes.indices) { "値が型に合わない（$t）: $v" }
+    return v.index
+}
+
+private fun flagBits(v: CanonValue, t: CanonType.Flags): Int {
+    require(v is CanonValue.Flags) { "値が型に合わない（$t）: $v" }
+    return v.bits
 }

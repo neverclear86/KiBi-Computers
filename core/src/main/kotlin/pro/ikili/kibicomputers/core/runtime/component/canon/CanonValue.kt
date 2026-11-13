@@ -11,6 +11,10 @@ package pro.ikili.kibicomputers.core.runtime.component.canon
  * - variant・enum・option・result は [Case]（場合の番号と中身。option は none が 0・some が 1、result は ok が 0・error が 1）
  * - flags は [Flags]（宣言の順に下位のビットから）
  * - own・borrow は [Handle]（[CanonResources] が lift・lower で変換した値）
+ *
+ * ホストの実装は、番号を手で数えずに型の名前で作る・読む: record は [CanonType.Record.value]・[CanonType.Record.field]、
+ * variant・enum は `case`・`caseName`、flags は [CanonType.Flags.value]・[CanonType.Flags.has]・[CanonType.Flags.namesOf]。
+ * option・result・文字列は下の [some]・[ok]・[err]・[str]
  */
 internal sealed class CanonValue {
     class Bool(val value: Boolean) : CanonValue() {
