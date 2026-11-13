@@ -653,6 +653,31 @@ class ComponentLoaderTest {
     }
 
     @Test
+    fun `入れ子のコンポーネントの import の型と、引数のないインスタンス化も見積もりに入る`() {
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        // import に大きなインスタンス型を持つコンポーネントを、引数として渡す（import も逆向きに比べる）
+        val asArg = wat(
+            """
+            (component
+              (component ${'$'}x
+                (import "i" (instance (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr))))))
+              (component ${'$'}y (import "c" (component)))
+              (instance (instantiate ${'$'}y (with "c" (component ${'$'}x))))
+            )
+            """,
+        )
+        val a = estimateOf(asArg)
+        assertEquals(1L, a.checkCount)
+        assertTrue(a.cost >= 101) { "${a.cost}" }
+        // 引数のないインスタンス化も、そのたびに export の型を写し直すので数える（型の確認の回数には入れない）
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        val noArgs = wat("""(component (component ${'$'}c (type ${'$'}r (record $inner)) (export "r" (type ${'$'}r))) $instances)""")
+        val n = estimateOf(noArgs)
+        assertEquals(0L, n.checkCount)
+        assertTrue(n.cost >= 10L * 101) { "${n.cost}" }
+    }
+
+    @Test
     fun `型の大きさは参照している型の中まで数える`() {
         // フィールド 100 個の record を、100 個のフィールドに持つ record（展開すると約 1 万）
         val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }

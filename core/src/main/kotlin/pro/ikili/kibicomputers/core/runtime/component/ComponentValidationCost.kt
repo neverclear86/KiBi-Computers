@@ -94,6 +94,11 @@ internal object ComponentValidationCost {
         /** 確かめる型の大きさの合計 */
         var cost = 0L
 
+        /** インスタンス化での export の型の写し直しを数える（型の確認の回数には入れない） */
+        private fun remap(info: Info?) {
+            cost = minOf(cost + sizeOf(info), Long.MAX_VALUE / 2)
+        }
+
         /** 型の確認を 1 回数える。確かめるのは [info] の型（引けなければ、それまでの最大） */
         private fun check(info: Info?) {
             checks++
@@ -124,13 +129,19 @@ internal object ComponentValidationCost {
                     is ComponentSection.Nested -> s.components += component(section.component, s)
                     is ComponentSection.CoreTypes -> for (t in section.items) s.coreTypes += Info(coreType(t))
                     is ComponentSection.Types -> for (t in section.items) s.types += defType(t, s)
-                    is ComponentSection.Imports -> for (item in section.items) extern(s, item.desc)
+                    // import の型も、このコンポーネントの型の大きさに入る（コンポーネントを引数に渡すと、import も逆向きに比べる）
+                    is ComponentSection.Imports -> for (item in section.items) {
+                        size = sum(size, 1 + extern(s, item.desc).size)
+                    }
                     is ComponentSection.Aliases -> for (item in section.items) alias(s, item)
                     is ComponentSection.Instances -> for (item in section.items) {
                         s.instances += when (item) {
                             is InstanceExpr.Instantiate -> {
                                 for ((_, arg) in item.args) check(s.lookup(arg))
-                                s.components.getOrNull(item.component)
+                                val target = s.components.getOrNull(item.component)
+                                // 引数がなくても、インスタンス化のたびに export の型を写し直す（resource の置き換え）
+                                remap(target)
+                                target
                             }
                             is InstanceExpr.FromExports -> fromExports(s, item.exports)
                         }

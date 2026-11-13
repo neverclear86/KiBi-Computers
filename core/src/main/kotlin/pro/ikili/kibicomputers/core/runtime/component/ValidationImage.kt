@@ -54,14 +54,14 @@ internal object ValidationImage {
             return if (exact[i]) originStarts[i] + (imageOffset - imageStarts[i]) else originStarts[i].toLong()
         }
 
-        /** wasm-tools のメッセージの中の位置（`offset 0x..`）を、元のバイト列の中の位置に直したもの */
+        /** wasm-tools のメッセージの中の位置（`at offset 0x..`）を、元のバイト列の中の位置に直したもの */
         fun mapMessage(message: String): String = OFFSET.replace(message) { m ->
             val v = m.groupValues[1].toLongOrNull(16)
-            if (v == null) m.value else "offset 0x" + originalOffset(v).toString(16)
+            if (v == null) m.value else "at offset 0x" + originalOffset(v).toString(16)
         }
 
         private companion object {
-            val OFFSET = Regex("""offset 0x([0-9a-fA-F]{1,15})""")
+            val OFFSET = Regex("""at offset 0x([0-9a-fA-F]{1,15})""")
         }
     }
 
