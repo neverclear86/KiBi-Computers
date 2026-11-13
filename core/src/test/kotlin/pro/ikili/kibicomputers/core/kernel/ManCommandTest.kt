@@ -251,6 +251,60 @@ class ManCommandTest {
     }
 
     @Test
+    fun `空のページ・大きすぎるページ・合計が入りきらないページは、理由を知らせて1で終わる`() {
+        val filler = "word ".repeat(12 * 1024)
+        val big = "# big(1)\n\n## NAME\n\n" + "x ".repeat(33 * 1024)
+        val out = sh(
+            """
+            MANPATH=/home/man man empty; echo "status ${'$'}?"
+            MANPATH=/home/man man big; echo "status ${'$'}?"
+            MANPATH=/home/man man p1 p2 p3 | grep -c .
+            """,
+            files = mapOf(
+                "/home/man/man1/empty.1" to "",
+                "/home/man/man1/big.1" to big,
+                "/home/man/man1/p1.1" to "# p1(1)\n\n$filler\n",
+                "/home/man/man1/p2.1" to "# p2(1)\n\n$filler\n",
+                "/home/man/man1/p3.1" to "# p3(1)\n\n$filler\n",
+            ),
+        )
+        val lines = out.lines()
+        assertEquals("man: empty: manual page is empty", lines[0], out)
+        assertEquals("status 1", lines[1], out)
+        assertEquals("man: big: manual page too large", lines[2], out)
+        assertEquals("status 1", lines[3], out)
+        // 3 つめだけが合計に入らない（1 ページの大きさの超過とは別の知らせ）。入った 2 つは書く
+        assertEquals("man: p3: too many manual pages at once (total size limit)", lines[4], out)
+        assertTrue(lines[5].toInt() > 100, out)
+    }
+
+    @Test
+    fun `16Ki文字を超える段落も、文字を捨てずに続きを書く`() {
+        val words = (1..3500).joinToString(" ") { "w%04d".format(it) }
+        val out = sh(
+            """
+            MANPATH=/home/man man big | cat
+            """,
+            files = mapOf("/home/man/man1/big.1" to "# big(1)\n\n$words\n"),
+        )
+        assertFalse(out.contains("truncated"), out)
+        val found = Regex("w\\d{4}").findAll(out).map { it.value }.toList()
+        assertEquals((1..3500).map { "w%04d".format(it) }, found)
+        for (line in out.lines()) assertTrue(displayWidth(line) <= 80, line)
+    }
+
+    @Test
+    fun `幅を超える見出しは空白の位置で折る`() {
+        val out = sh(
+            """
+            MANWIDTH=20 MANPATH=/home/man man h | cat
+            """,
+            files = mapOf("/home/man/man1/h.1" to "# h(1)\n\n## alpha beta gamma delta epsilon\n\ntext\n"),
+        )
+        assertTrue(out.contains("alpha beta gamma\ndelta epsilon\n"), out)
+    }
+
+    @Test
     fun `どのページも幅50と80で、英語も日本語も行が幅を超えない`() {
         val names = manPages.keys.filter { !it.startsWith("/usr/share/man/ja/") }.map { it.substringAfterLast('/') }
         val script = buildString {

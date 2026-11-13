@@ -12,7 +12,7 @@ const text = kibi.text;
 const OUT_SIZE = 256 * 1024;
 /// 行の数の上限
 const MAX_LINES = 16 * 1024;
-/// 1 つの段落の文字の数の上限（超えた分は、次の段落として続ける）
+/// 1 つの段落の文字の数の上限（超えたら、そこまでを書いて、残りを同じ段落の続きとして続ける。[spill]）
 const MAX_CELLS = 16 * 1024;
 
 var out_buf: [OUT_SIZE]u8 = undefined;
@@ -107,9 +107,28 @@ var code_on = false;
 var pending_join = false;
 
 fn addCell(c: Cell) void {
-    if (ncells >= cells.len) return;
+    if (ncells >= cells.len) spill();
     cells[ncells] = c;
     ncells += 1;
+}
+
+/// 段落の文字が上限に達した。最後の空白までを書き（空白がなければ全部）、残りを同じ段落の続きとして先頭に寄せる
+/// （続きの行は 2 行目以降と同じ字下げで、印は付けない）
+fn spill() void {
+    var s = ncells;
+    while (s > 0 and !cells[s - 1].space) s -= 1;
+    // s は最後の空白の次。空白が先頭にしかなければ（日本語など）、全部を書く
+    var keep = ncells;
+    var tail: usize = 0;
+    if (s > 1) {
+        keep = s - 1;
+        tail = ncells - s;
+    }
+    ncells = keep;
+    flowCells(true);
+    var k: usize = 0;
+    while (k < tail) : (k += 1) cells[k] = cells[s + k];
+    ncells = tail;
 }
 
 fn addSpace() void {
@@ -230,10 +249,27 @@ fn emitCells(from: usize, to: usize) void {
     endLine();
 }
 
-/// 段落を折って書く。1 行目は [first] だけ字下げして [prefix] を書き、2 行目からは [rest] だけ字下げする
-fn flowCells(first: usize, prefix: []const u8, rest: usize) void {
+/// 今まとめている段落の字下げ: 1 行目は [cur_first] だけ字下げして [cur_prefix] を書き、2 行目からは [cur_rest] だけ字下げする
+var cur_first: usize = 0;
+var cur_prefix: []const u8 = "";
+var cur_rest: usize = 0;
+/// 段落の途中までを [spill] で書いた（次に書く行は 2 行目以降と同じ扱い）
+var continued = false;
+
+fn setFlow(first: usize, prefix: []const u8, rest: usize) void {
+    cur_first = first;
+    cur_prefix = prefix;
+    cur_rest = rest;
+    continued = false;
+}
+
+/// たまった文字を [cur_first] などで折って書く。[more] なら段落はまだ続く（次に書く行は 2 行目以降と同じ扱い）
+fn flowCells(more: bool) void {
+    const first = cur_first;
+    const prefix = cur_prefix;
+    const rest = cur_rest;
     var i: usize = 0;
-    var first_line = true;
+    var first_line = !continued;
     while (true) {
         while (i < ncells and cells[i].space) i += 1;
         if (i >= ncells and !first_line) break;
@@ -281,6 +317,7 @@ fn flowCells(first: usize, prefix: []const u8, rest: usize) void {
         i = end;
     }
     ncells = 0;
+    continued = more;
 }
 
 fn text_width(s: []const u8) usize {
@@ -327,29 +364,25 @@ fn startPara(kind: Block) void {
     bold_on = false;
     code_on = false;
     pending_join = false;
+    const b = if (in_section) bodyIndent() else 0;
+    if (kind == .item) setFlow(b, "- ", b + 2) else setFlow(b, "", b);
 }
 
 fn flush() void {
-    switch (open) {
-        .para => flowCells(if (in_section) bodyIndent() else 0, "", if (in_section) bodyIndent() else 0),
-        .item => {
-            const b = if (in_section) bodyIndent() else 0;
-            flowCells(b, "- ", b + 2);
-        },
-        else => {},
-    }
+    if (open == .para or open == .item) flowCells(false);
     open = .nothing;
 }
 
-/// 見出しを書く（太字、折らない。幅を超えた分は文字の境目で次の行へ）
+/// 見出しを書く（太字。幅を超えたら段落と同じ規則で折る）
 fn heading(s: []const u8, indent: usize) void {
     ncells = 0;
     bold_on = true;
     code_on = false;
     pending_join = false;
+    setFlow(indent, "", indent);
     addInline(s);
     for (cells[0..ncells]) |*c| c.bold = true;
-    flowCells(indent, "", indent);
+    flowCells(false);
     bold_on = false;
 }
 

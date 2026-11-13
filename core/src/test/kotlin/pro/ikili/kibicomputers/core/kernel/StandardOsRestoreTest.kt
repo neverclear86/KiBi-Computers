@@ -119,6 +119,7 @@ class StandardOsRestoreTest {
         store: MachineSaveStore,
         program: String,
         args: List<String> = emptyList(),
+        files: Map<String, ByteArray> = emptyMap(),
         setup: (Machine, ScreenHost, Int) -> Unit,
     ): Pair<MachineIdentity, Int> {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
@@ -127,6 +128,14 @@ class StandardOsRestoreTest {
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
         for (d in listOf("/bin", "/tmp", "/home")) m.vfs.createDirectory(VfsPath.parse(d))
         m.put("/bin/$program", imageFile("/bin/$program"))
+        for ((path, bytes) in files) {
+            var dirPath = ""
+            for (part in path.trim('/').split('/').dropLast(1)) {
+                dirPath += "/$part"
+                if (runCatching { m.vfs.stat(VfsPath.parse(dirPath)) }.isFailure) m.vfs.createDirectory(VfsPath.parse(dirPath))
+            }
+            m.put(path, bytes)
+        }
         val pid = m.exec(
             "/bin/$program",
             KernelDrivers.DEFAULT,
@@ -250,6 +259,42 @@ class StandardOsRestoreTest {
                 h.scheduler.tick()
                 Thread.sleep(1)
                 host.row(1) == "hello world"
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `manは戻ると代替画面に入り直し、rawのまま同じページの同じ位置を描き直す`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            var before = ""
+            val (saved, pid) = saveRunning(h, store, "man", listOf("man"), mapOf("/usr/share/man/man1/man.1" to imageFile("/usr/share/man/man1/man.1"))) { m, host, p ->
+                assertTrue(host.terminal.alternateScreen)
+                assertTrue(host.row(24).startsWith("--More--("), host.screen())
+                // 1 画面送って、先頭ではない位置で保存する
+                m.offerConsoleInput(" ".toByteArray())
+                settle(h, m, host, p)
+                assertTrue(host.row(0) != "man(1)", host.screen())
+                before = host.screen()
+            }
+            val (m, host) = restore(h, store, saved)
+            eventuallyDescribe(60_000, { "描き直さない: ${host.screen()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.terminal.alternateScreen && host.screen() == before
+            }
+            settle(h, m, host, pid)
+            assertTrue(host.text().startsWith("\u001b[?1049h\u001b[?7l"), host.text())
+            val mode = m.lock.withLockValue { m.consoleTtyLocked().mode }
+            assertTrue(!mode.canonical && !mode.signals, mode.toString())
+            assertEquals(before, host.screen())
+            // 続きの入力も効く（戻した後も 1 行戻ると、先頭の位置が動く）
+            m.offerConsoleInput("k".toByteArray())
+            eventuallyDescribe(60_000, { "動かない: ${host.screen()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.screen() != before
             }
             m.close()
         }

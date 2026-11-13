@@ -195,24 +195,41 @@ fn pagePath(dir: []const u8, lang: []const u8, sec: []const u8, name: []const u8
     return path_buf[0..n];
 }
 
-/// 普通のファイル [path] を [src_buf] の後ろに読む。なければ null（ほかのエラーも「ない」と同じに扱う）
-fn readPage(path: []const u8, name: []const u8) ?[]const u8 {
-    const fd = fs.open(path, .{}) catch return null;
+/// [readPage] の結果
+const Read = union(enum) {
+    /// 普通のファイルがない（開けない・ほかの種類。次の候補を探す）
+    missing,
+    /// あったが読めなかった（理由は知らせ済み。探すのをやめる）
+    failed,
+    page: []const u8,
+};
+
+/// 普通のファイル [path] を [src_buf] の後ろに読む
+fn readPage(path: []const u8, name: []const u8) Read {
+    const fd = fs.open(path, .{}) catch return .missing;
     defer io.close(fd) catch {};
-    const st = fs.fstat(fd) catch return null;
-    if (st.kind != .file) return null;
-    const limit = @min(MAX_PAGE, src_buf.len - src_len);
-    if (st.size > limit) {
+    const st = fs.fstat(fd) catch return .missing;
+    if (st.kind != .file) return .missing;
+    if (st.size > MAX_PAGE) {
         cli.warn(name, "manual page too large");
-        return "";
+        return .failed;
     }
-    const n = io.readAll(fd, src_buf[src_len..][0..limit]) catch |e| {
+    const room = src_buf.len - src_len;
+    if (st.size > room) {
+        cli.warn(name, "too many manual pages at once (total size limit)");
+        return .failed;
+    }
+    const n = io.readAll(fd, src_buf[src_len..][0..@min(MAX_PAGE, room)]) catch |e| {
         cli.warnErr(path, e);
-        return "";
+        return .failed;
     };
+    if (n == 0) {
+        cli.warn(name, "manual page is empty");
+        return .failed;
+    }
     const page = src_buf[src_len..][0..n];
     src_len += n;
-    return page;
+    return .{ .page = page };
 }
 
 /// MANPATH の各ディレクトリ（`:` 区切り。空の要素は飛ばす）
@@ -243,8 +260,11 @@ fn load(name: []const u8, section: ?[]const u8, langs: *const Langs, manpath: []
                 var it: PathIter = .{ .rest = manpath };
                 while (it.next()) |dir| {
                     const path = pagePath(dir, lang, sec, name) orelse continue;
-                    const page = readPage(path, name) orelse continue;
-                    if (page.len == 0) return false;
+                    const page = switch (readPage(path, name)) {
+                        .missing => continue,
+                        .failed => return false,
+                        .page => |p| p,
+                    };
                     if (npages >= pages.len) {
                         cli.warn(name, "too many pages");
                         return false;
