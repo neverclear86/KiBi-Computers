@@ -117,13 +117,31 @@ dependencies {
     jarJar(libs.endive.compiler) { isTransitive = false }
     implementation(libs.endive.compiler) { exclude(group = "org.ow2.asm") }
     "additionalRuntimeClasspath"(libs.endive.compiler) { isTransitive = false }
-    // コンポーネントの検証（#262）: Endive の WASI p1 と wasm-tools（WASM にしたもの）。仮想 FS の zerofs は使わないので入れない
-    for (lib in listOf(libs.endive.wasi, libs.endive.wasm.tools)) {
+    // コンポーネントの検証（#262）: Endive の WASI p1 と wasm-tools（WASM にしたもの）、その両方が依存するログ（run.endive:log）。
+    // jarJar は推移的な依存を同梱しないので、log も明示する。仮想 FS の zerofs は使わないので入れない
+    for (lib in listOf(libs.endive.wasi, libs.endive.wasm.tools, libs.endive.log)) {
         jarJar(lib) { exclude(group = "io.roastedroot") }
         implementation(lib) { exclude(group = "io.roastedroot") }
         "additionalRuntimeClasspath"(lib) { exclude(group = "io.roastedroot") }
     }
 }
+
+// 同梱漏れの確認（#262）: 実行時に要る Endive のライブラリ（run.endive）が、すべて Jar-in-Jar に入っていること。
+// jarJar は推移的な依存を入れず、開発環境では additionalRuntimeClasspath が推移的に載せるので、漏れても GameTest では気づけない
+val checkBundledLibraries = tasks.register("checkBundledLibraries") {
+    group = "verification"
+    description = "Checks that every run.endive runtime library is bundled with Jar-in-Jar"
+    fun endiveModules(name: String) = configurations.named(name).map { c ->
+        c.incoming.resolutionResult.allComponents.mapNotNull { (it.id as? ModuleComponentIdentifier)?.takeIf { id -> id.group == "run.endive" }?.module }.toSortedSet()
+    }
+    val needed = endiveModules("runtimeClasspath")
+    val bundled = endiveModules("jarJar")
+    doLast {
+        val missing = needed.get() - bundled.get()
+        if (missing.isNotEmpty()) throw GradleException("Jar-in-Jar に入っていない run.endive のライブラリ: $missing")
+    }
+}
+tasks.check { dependsOn(checkBundledLibraries) }
 
 // dev ソースセットも build でコンパイルする（jar には入れない）
 tasks.build {

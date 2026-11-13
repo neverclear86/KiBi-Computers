@@ -25,6 +25,7 @@ endive-wasm = { module = "run.endive:wasm", version.ref = "endive" }
 endive-wasi = { module = "run.endive:wasi", version.ref = "endive" }
 endive-compiler = { module = "run.endive:compiler", version.ref = "endive" }
 endive-wasm-tools = { module = "run.endive:wasm-tools", version.ref = "endive" }
+endive-log = { module = "run.endive:log", version.ref = "endive" }
 zerofs = { module = "io.roastedroot:zerofs", version.ref = "zerofs" }
 endive-build-time-compiler = { module = "run.endive:build-time-compiler", version.ref = "endive" }
 endive-redline-build-time-compiler = { module = "run.endive:redline-build-time-compiler-experimental", version.ref = "endive" }

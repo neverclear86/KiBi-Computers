@@ -63,8 +63,14 @@ internal object ComponentValidator {
 
     private val LOG: System.Logger = System.getLogger("kibicomputers.component")
 
-    private val quiet = object : SystemLogger() {
-        override fun isLoggable(level: Logger.Level): Boolean = false
+    /**
+     * Endive の WASI のログを黙らせるもの。初めて使うときに作る（Endive のクラスが見えないときに、このオブジェクトの
+     * 初期化ではなく、[validate] の中の [LinkageError] として失敗させ、[WasmLoadException] に包むため）
+     */
+    private val quiet: Logger by lazy {
+        object : SystemLogger() {
+            override fun isLoggable(level: Logger.Level): Boolean = false
+        }
     }
 
     /** wasm-tools のモジュール。初めて使うときに読む（1回だけ。スレッドセーフ） */
@@ -89,13 +95,16 @@ internal object ComponentValidator {
     /** 空のコンポーネント（ヘッダーだけ） */
     private val EMPTY_COMPONENT = byteArrayOf(0x00, 0x61, 0x73, 0x6d, WasmBinaryHeader.COMPONENT_VERSION.toByte(), 0x00, 0x01, 0x00)
 
-    /** [bytes] を検証する。通らなければ [WasmLoadException] */
+    /**
+     * [bytes] を検証する。通らなければ [WasmLoadException]。
+     * [maxMemoryPages] はゲストの線形メモリの上限（テストで小さくする。普段は [MAX_MEMORY_PAGES]）
+     */
     @Throws(WasmLoadException::class)
-    fun validate(bytes: ByteArray) {
+    fun validate(bytes: ByteArray, maxMemoryPages: Int = MAX_MEMORY_PAGES) {
         val m = guarded("初期化") { module }
         val stderr = BoundedOutput(MAX_OUTPUT_BYTES)
         val exit = try {
-            run(m, bytes, stderr)
+            run(m, bytes, stderr, maxMemoryPages)
         } catch (e: WasmLoadException) {
             throw e
         } catch (e: StackOverflowError) {
@@ -130,7 +139,7 @@ internal object ComponentValidator {
             .removePrefix("error: ")
 
     /** wasm-tools を動かし、終了コードを返す */
-    private fun run(m: WasmModule, bytes: ByteArray, stderr: OutputStream): Int {
+    private fun run(m: WasmModule, bytes: ByteArray, stderr: OutputStream, maxMemoryPages: Int): Int {
         val options = WasiOptions.builder()
             .withStdin(ByteArrayInputStream(bytes), false)
             .withStdout(BoundedOutput(MAX_OUTPUT_BYTES), false)
@@ -145,7 +154,7 @@ internal object ComponentValidator {
             try {
                 Instance.builder(m)
                     .withMachineFactory(WasmToolsModule::create)
-                    .withMemoryFactory { limits -> ByteArrayMemory(capped(limits)) }
+                    .withMemoryFactory { limits -> ByteArrayMemory(capped(limits, maxMemoryPages)) }
                     .withImportValues(ImportValues.builder().addFunction(*wasi.toHostFunctions()).build())
                     .build()
             } catch (e: WasiExitException) {
@@ -155,11 +164,11 @@ internal object ComponentValidator {
         return 0
     }
 
-    private fun capped(limits: MemoryLimits): MemoryLimits {
-        if (limits.initialPages() > MAX_MEMORY_PAGES) {
-            throw WasmLoadException("検証器のメモリの最初の大きさが上限を超える（内部の失敗）")
+    private fun capped(limits: MemoryLimits, maxPages: Int): MemoryLimits {
+        if (limits.initialPages() > maxPages) {
+            throw WasmLoadException("検証器のメモリの最初の大きさ（${limits.initialPages()} ページ）が上限を超える（内部の失敗）")
         }
-        return MemoryLimits(limits.initialPages(), minOf(limits.maximumPages(), MAX_MEMORY_PAGES))
+        return MemoryLimits(limits.initialPages(), minOf(limits.maximumPages(), maxPages))
     }
 
     /** 検証器そのものの準備（内容ではない失敗は、内部の失敗と分かるメッセージにしてログに出す） */

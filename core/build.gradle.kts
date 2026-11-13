@@ -36,6 +36,8 @@ dependencies {
     // zerofs（仮想 FS）は validate では使わないので外す（テストでは下の testImplementation で足す）
     implementation(libs.endive.wasi)
     implementation(libs.endive.wasm.tools) { exclude(group = "io.roastedroot", module = "zerofs") }
+    // wasi と wasm-tools が依存し、ComponentValidator も直接使う（ログを黙らせる SystemLogger）
+    implementation(libs.endive.log)
     // `pro.ikili.kibicomputers.api` 以外の public には `@ApiStatus.Internal` を付ける（#366）。
     // 注釈は実行時に要らない（Minecraft も同じものを持つ）。使う側の IDE が警告を出せるよう、コンパイル時には見せる
     compileOnlyApi(libs.jetbrains.annotations)

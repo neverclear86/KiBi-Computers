@@ -22,6 +22,11 @@ internal class LoadedComponent(
     val coreModules: List<ByteRange>,
     /** 入れ子を展開した後の、コアモジュールのインスタンスの数（[ComponentExpansion]） */
     val expandedCoreInstances: Int,
+    /**
+     * 入れ子を展開した後の、コンポーネントのインスタンス（`instance (instantiate ...)`）の数（[ComponentExpansion]）。
+     * 一番外のコンポーネントそのものは数えない
+     */
+    val expandedInstances: Int,
 ) {
     /** [range] の core モジュールのバイト列（写したもの） */
     fun coreModuleBytes(range: ByteRange): ByteArray = range.copyOf(bytes)
@@ -44,18 +49,29 @@ internal class LoadedComponent(
  * 5. wasm-tools で検証する（[ComponentValidator]）。core モジュールの関数の本体は除いた写し（[ValidationImage]）を渡す。
  *    本体と、core モジュールのカスタム セクションの壊れなどは、p1 と同じく Endive が読み込むとき（#263）に確かめる
  * 6. import の形（[ComponentImportPolicy]）と、core モジュールが予約したモジュール名を import していないこと
- * 7. 入れ子を展開した後のインスタンスの数（[ComponentExpansion]）
+ * 7. 入れ子を展開した後のインスタンスの数（コアモジュールとコンポーネントの両方。[ComponentExpansion]）
+ *
+ * 検証器（[ComponentValidator]）のクラスが読めないなど、検証器そのものの失敗（[LinkageError]）も、内部の失敗と分かる
+ * [WasmLoadException] にする（ログにも出す）。
  *
  * 重い（検証に数十 ms、初回は1秒ほど）ので、コンパイル用のスレッドから呼ぶ。状態を持たないので、同時に呼んでよい。
  * 実行（exec）にはまだつないでいない（#263）。
  */
 internal object ComponentLoader {
-    /** [bytes] を読み込んで検証する */
+    private val LOG: System.Logger = System.getLogger("kibicomputers.component")
+
+    /**
+     * [bytes] を読み込んで検証する。
+     *
+     * [validate] は wasm-tools の検証の差し替え（テストで、検証をまたいだ時間の上限を確かめるため）。`null` なら
+     * [ComponentValidator.validate]
+     */
     @Throws(WasmLoadException::class)
     fun load(
         bytes: ByteArray,
         limits: ComponentLimits = ComponentLimits.DEFAULT,
         policy: ComponentImportPolicy = ComponentImportPolicy.DEFAULT,
+        validate: ((ByteArray) -> Unit)? = null,
     ): LoadedComponent {
         if (bytes.size > limits.maxBytes) {
             throw WasmLoadException("コンポーネントが大きすぎる（${bytes.size} バイト。上限 ${limits.maxBytes}）")
@@ -66,7 +82,7 @@ internal object ComponentLoader {
             null -> throw WasmLoadException("WASM のコンポーネントのヘッダーがない")
         }
         // 検証器の初回の初期化（1秒ほど）は、内容と関係なく遅いので、時間の上限を測り始める前に済ませる
-        ComponentValidator.warmUp()
+        validator { ComponentValidator.warmUp() }
         val deadline = LoadDeadline(limits.moduleLimits.timeLimitNanos)
         val root = ComponentParser.parse(bytes, limits, deadline)
         val modules = root.allCoreModules()
@@ -76,7 +92,8 @@ internal object ComponentLoader {
         }
         deadline.check("core モジュールの構造の確認")
         // 関数の本体は Endive が読み込むときに検証するので、wasm-tools には本体を除いた写しを渡す（ValidationImage）
-        ComponentValidator.validate(ValidationImage.of(bytes, root))
+        val image = ValidationImage.of(bytes, root)
+        if (validate != null) validate(image) else validator { ComponentValidator.validate(image) }
         deadline.check("コンポーネントの検証")
         for (import in root.imports) {
             policy.reject(import)?.let { throw WasmLoadException("許可しない import ${import.name}: $it") }
@@ -86,9 +103,20 @@ internal object ComponentLoader {
                 throw WasmLoadException("core モジュールが予約したモジュール名 ${CoreModuleImports.RESERVED_MODULE} を import している")
             }
         }
-        val instances = ComponentExpansion.countCoreInstances(root, limits, deadline)
+        val expansion = ComponentExpansion.count(root, limits, deadline)
         deadline.check("コンポーネントの展開の確認")
         val sha256 = MessageDigest.getInstance("SHA-256").digest(bytes)
-        return LoadedComponent(bytes, sha256, root, modules, instances)
+        return LoadedComponent(bytes, sha256, root, modules, expansion.coreInstances, expansion.instances)
+    }
+
+    /**
+     * 検証器を呼ぶ。[ComponentValidator] のクラスの初期化そのもの（Endive のクラスが見えないときなど）で失敗した
+     * [LinkageError] は、[ComponentValidator] の中では包めないので、ここで内部の失敗として包む
+     */
+    private inline fun <T> validator(block: () -> T): T = try {
+        block()
+    } catch (e: LinkageError) {
+        LOG.log(System.Logger.Level.ERROR, "コンポーネントの検証器（wasm-tools）を動かせない（クラスの読み込み）", e)
+        throw WasmLoadException("コンポーネントの検証器を動かせない（内部の失敗。クラスの読み込み）: $e", e)
     }
 }

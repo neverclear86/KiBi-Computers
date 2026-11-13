@@ -34,12 +34,17 @@ internal class ComponentLimits(
     val maxCanons: Int = 100_000,
     /** インスタンスの宣言（コンポーネントとコアの両方）の数 */
     val maxInstances: Int = 10_000,
+    /**
+     * セクションの数（入れ子のコンポーネントも含めたバイナリ全体）。要素が 0 個のセクションは 3 バイトなので、
+     * これがないと 16 MiB に約 559 万個並べられ、木と wasm-tools の検証が大きく重くなる
+     */
+    val maxSections: Int = 100_000,
     /** 1 つのベクター（record のフィールド、引数、canon の option など）の要素の数 */
     val maxVectorItems: Int = 100_000,
     /**
-     * デコードする要素の総数（ベクターの要素の合計。入れ子のコンポーネントも含めたバイナリ全体）。
+     * デコードする要素の総数（ベクターの要素とセクションの合計。入れ子のコンポーネントも含めたバイナリ全体）。
      * 木のメモリは、この数にほぼ比例する（1 要素あたり 20〜100 バイトほど。名前を持つものが重い）ので、
-     * 最悪でも数十 MiB に収まる値にする。ベクターを読む前に、その要素の数を足して確かめる
+     * [maxSections] とあわせて、最悪でも数十 MiB に収まる値にする。ベクターとセクションを読む前に、その数を足して確かめる
      */
     val maxDecodedItems: Int = 500_000,
     /** 名前（import・export・フィールドの名前、カスタム セクションの名前）のバイト数 */
@@ -51,7 +56,15 @@ internal class ComponentLimits(
      * 宣言の数は少ないまま実際のインスタンスが指数的に増えるので、展開した数で数える（[ComponentExpansion]）
      */
     val maxExpandedCoreInstances: Int = 1_000,
-    /** 展開を数えるときに見てよい宣言の数（[ComponentExpansion] の手間の上限） */
+    /**
+     * 入れ子を展開した後の、コンポーネントのインスタンス（`instance (instantiate ...)`）の総数。core のインスタンスを
+     * 持たないコンポーネントを重ねても、インスタンスごとに resource の型などができるので、こちらも数える
+     */
+    val maxExpandedInstances: Int = 1_000,
+    /**
+     * 展開を数えるときに見てよい宣言の数（[ComponentExpansion] の手間の上限）。型・canon も 1 つずつ数えるので、
+     * 展開した後の宣言の総数の上限にもなる
+     */
     val maxExpansionSteps: Int = 1_000_000,
 ) {
     init {

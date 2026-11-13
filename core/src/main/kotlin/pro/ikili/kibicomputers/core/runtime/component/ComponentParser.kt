@@ -70,6 +70,7 @@ internal object ComponentParser {
         var canons = 0
         var instances = 0
         var items = 0
+        var sections = 0
 
         /** デコードしたベクターの要素の合計（木のメモリの目安） */
         var decoded = 0L
@@ -111,6 +112,9 @@ internal object ComponentParser {
             val sections = ArrayList<ComponentSection>()
             val r = Reader(this, start + WasmBinaryHeader.SIZE, end)
             while (r.pos < r.end) {
+                // 空のセクション（3 バイト）を並べて、木と検証を重くさせない。数と、デコードする要素の総数の両方に数える
+                totals.sections = add("セクション", totals.sections, 1, limits.maxSections)
+                reserve(1)
                 val id = r.u8()
                 val size = r.u32()
                 if (size > r.end - r.pos) fail("セクション $id の大きさ $size が残りを超える")

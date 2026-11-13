@@ -20,9 +20,9 @@
 4. 中の各 core モジュールに、p1 と同じ構造の確認（`ModulePrescan`、`ModuleLimits`）を当てる
 5. wasm-tools で検証する（`ComponentValidator`）。core モジュールの関数の本体は除いた写し（`ValidationImage`）を渡す
 6. トップレベルの import の形（`ComponentImportPolicy`）と、core モジュールが予約したモジュール名 `kibi` を import していないこと
-7. 入れ子を展開した後の、core モジュールのインスタンスの数（`ComponentExpansion`）
+7. 入れ子を展開した後の、core モジュールとコンポーネントのインスタンスの数（`ComponentExpansion`）
 
-結果（`LoadedComponent`）は、元のバイト列、その SHA-256、宣言の順の木（`ParsedComponent`）、すべての core モジュールの範囲、展開後のインスタンスの数を持つ。
+結果（`LoadedComponent`）は、元のバイト列、その SHA-256、宣言の順の木（`ParsedComponent`）、すべての core モジュールの範囲、展開後のインスタンスの数（core とコンポーネントの両方）を持つ。
 
 ### パーサー
 
@@ -34,7 +34,7 @@
 
 ### 構造の上限（仮の値。確定は #251）
 
-数はバイナリ全体（入れ子を含む）の合計。どれも「上限以下」と「残りのバイト数以下」を確かめてから確保する。ただし、種類ごとの上限を掛け合わせると、1 バイトの要素ごとにオブジェクトができるので、16 MiB の入力でも木が数百 MiB になる（実測: bool 10 万個の tuple を 160 個並べた 16 MB で約 305 MiB。名前が空の引数 5 万個の関数型を 160 個で約 519 MiB）。そこで、ベクターを読む前に、その要素の数を足して総数の上限（500,000）を確かめる。木のメモリは 1 要素あたり 20〜100 バイトほどなので、最悪でも数十 MiB に収まる。名前は UTF-8 として正しいかも確かめる。
+数はバイナリ全体（入れ子を含む）の合計。どれも「上限以下」と「残りのバイト数以下」を確かめてから確保する。ただし、種類ごとの上限を掛け合わせると、1 バイトの要素ごとにオブジェクトができるので、16 MiB の入力でも木が数百 MiB になる（実測: bool 10 万個の tuple を 160 個並べた 16 MB で約 305 MiB。名前が空の引数 5 万個の関数型を 160 個で約 519 MiB）。そこで、ベクターを読む前に、その要素の数を足して総数の上限（500,000）を確かめる。セクションそのものにも数の上限（100,000）を置き、要素の総数にも数える。要素が 0 個のセクションは 3 バイト（例: `07 01 00`）なので、これがないと 16 MiB に約 559 万個並び、木が約 408 MiB になり、wasm-tools の検証（途中で止められない）に CPU で約 20 秒かかった（レビューでの実測）。木のメモリは 1 要素あたり 20〜100 バイトほどなので、両方の上限で最悪でも数十 MiB に収まる。名前は UTF-8 として正しいかも確かめる。
 
 | 上限 | 値 |
 | --- | --- |
@@ -45,18 +45,20 @@
 | import の数 / export の数 | 10,000 / 10,000 |
 | alias の数 / canon の数 | 100,000 / 100,000 |
 | インスタンス（コンポーネントと core）の宣言の数 | 10,000 |
+| セクションの数（バイナリ全体） | 100,000 |
 | 1 つのベクターの要素の数 | 100,000 |
-| デコードする要素の総数（ベクターの要素の合計。バイナリ全体） | 500,000 |
+| デコードする要素の総数（ベクターの要素とセクションの合計。バイナリ全体） | 500,000 |
 | 名前のバイト数 | 4,096 |
 | 型の入れ子の深さ | 32 |
 | 展開した後の core モジュールのインスタンスの数 | 1,000 |
-| 展開を数える手間（見る宣言の数） | 1,000,000 |
+| 展開した後のコンポーネントのインスタンスの数 | 1,000 |
+| 展開を数える手間（見る宣言の数。型・canon も 1 つずつ） | 1,000,000 |
 
 中の core モジュールには、それぞれ `ModuleLimits`（関数の数、本体の大きさ、ローカル変数など）を当てる。
 
 ### 展開後のインスタンスの数
 
-A が B を2回、B が C を2回…とインスタンス化する作りを重ねると、宣言は少ないまま実際のインスタンスが 2^深さ に増える。`ComponentExpansion` はインスタンス化をなぞり（どのコンポーネント・インスタンスがどこに渡るかだけを追い、関数や値は追わない）、`core instance (instantiate ...)` の数を数える。コンポーネントは、インスタンス化の引数・export・alias（outer を含む）で渡されるので、それも追う。ホストから来るもの（トップレベルの import）は中身のないものとして扱う。検証に通った後で行う（型があるので、自分自身をインスタンス化し続ける作りはない）が、深さ（64）と手間にも上限を置く。
+A が B を2回、B が C を2回…とインスタンス化する作りを重ねると、宣言は少ないまま実際のインスタンスが 2^深さ に増える。`ComponentExpansion` はインスタンス化をなぞり（どのコンポーネント・インスタンスがどこに渡るかだけを追い、関数や値は追わない）、`core instance (instantiate ...)` の数と `instance (instantiate ...)` の数を、それぞれ数える。core のインスタンスを持たないコンポーネント（resource の型を export するだけ、など）でも、インスタンスごとに型ができるので、コンポーネントのインスタンスも数える（数えないと、約 1 KB の入力で十数万個のインスタンスが残った）。なぞる手間は、型・canon も 1 つずつ数えるので、展開した後の宣言の総数の上限にもなる。コンポーネントは、インスタンス化の引数・export・alias（outer を含む）で渡されるので、それも追う。ホストから来るもの（トップレベルの import）は中身のないものとして扱う。検証に通った後で行う（型があるので、自分自身をインスタンス化し続ける作りはない）が、深さ（64）と手間にも上限を置く。
 
 ### 検証（wasm-tools）
 
@@ -65,8 +67,12 @@ A が B を2回、B が C を2回…とインスタンス化する作りを重�
 - 有効にする機能（`ComponentValidator.FEATURES`）: `-all,wasm2,tail-call,exceptions,extended-const,call-indirect-overlong,bulk-memory-opt,component-model,cm-async`。`all` や wasm-tools の既定は使わない（GC・スレッド・memory64 や、値の import・start、Component Model のスレッドまで通ってしまうため）。stackful の非同期（`cm-async-stackful`）は #266 で決めるまで断る。`cm-error-context` も今は入れない
 - ゲストの線形メモリの上限は 2,048 ページ（128 MiB。仮の値）
 - 失敗は `WasmLoadException` にし、メッセージに標準エラー出力の先頭（500 文字まで）を入れる。wasm-tools は検証に失敗すると、DWARF の読み直しに失敗したログ（`[<時刻> WARN ] ...`）を先に出すことがあるので、環境変数 `RUST_LOG=off` でログを止め、念のためログの行（`ComponentValidator.reason`）も除く。時刻が入ると同じバイナリでもメッセージが変わり、先頭の 500 文字をログが使ってしまう
-- **検証器そのものの失敗（`LinkageError`、wasm-tools のモジュールの読み込みの失敗など）も `WasmLoadException` に包むが、メッセージに「内部の失敗」と書き、ログ（ERROR）にも出す。** 包まないと、読み込みの呼び出し元（`Machine.loadedProgram`）が想定していない例外が上がるため。`OutOfMemoryError` などの `VirtualMachineError` は包まない
-- ゲストのトラップ（メモリの上限で確保に失敗して abort したときなど）は、内容の失敗として扱う
+- **検証器そのものの失敗（`LinkageError`、wasm-tools のモジュールの読み込みの失敗など）も `WasmLoadException` に包むが、メッセージに「内部の失敗」と書き、ログ（ERROR）にも出す。** 包まないと、読み込みの呼び出し元（`Machine.loadedProgram`）が想定していない例外が上がるため。`ComponentValidator` 自身のクラスの初期化で失敗したもの（Endive のクラスが見えないとき）は中では包めないので、`ComponentLoader` が検証器を呼ぶところで包む。`ComponentValidator` は初期化で Endive のクラスに触れない（ログを黙らせるものも初めて使うときに作る）。`OutOfMemoryError` などの `VirtualMachineError` は包まない
+- ゲストのトラップ（メモリの上限で確保に失敗して abort したときなど）は、内容の失敗として扱う。入力を読み込みきれないときは、wasm-tools が「out of memory」で終わる（これも内容の失敗）
+
+### 同梱
+
+検証器が使う `wasi`・`wasm-tools` と、その両方が依存する `log`（`run.endive:log`。`wasi` の module-info が `requires run.endive.log`）を、各接続層の Jar-in-Jar に入れる。jarJar は推移的な依存を入れず、開発環境では `additionalRuntimeClasspath` が推移的に載せるので、漏れても GameTest では気づけない。そこで各接続層の `checkBundledLibraries`（`check` に含む）が、実行時のクラスパスにある `run.endive` のライブラリがすべて Jar-in-Jar に入っていることを確かめる。
 
 ### 関数の本体を除いた写しで検証する
 
@@ -101,7 +107,7 @@ jar は約 5.5 MiB 増える（`wasm-tools-1.2.0.jar` 5,635,996 バイト、`was
 
 ### 実行（exec）にはまだつながない
 
-`Machine.beginExec` の読み込み（`Program.load*`・`ProgramCache`）は変えない。コンポーネントを exec したときは、`ModulePrescan` がヘッダーで見分けて、重い検証をせずにすぐ「Component Model のコンポーネントは、まだ実行できない（#263）」で断る（`NOEXEC`）。`ProgramCache`・`Program`・保存データ（`ModuleSource`・スナップショットの節）は、#263・#269 で扱う。
+`Machine.beginExec` の読み込み（`Program.load*`・`ProgramCache`）は変えない。コンポーネントを exec したときは、`ModulePrescan` がヘッダーで見分けて、重い検証をせずにすぐ「Component Model のコンポーネントは、まだ実行できない（#263）」で断る（`NOEXEC`。exec の経路を通すテストは `ComponentExecTest`）。`ProgramCache`・`Program`・保存データ（`ModuleSource`・スナップショットの節）は、#263・#269 で扱う。
 
 ## 測定
 
@@ -121,4 +127,4 @@ Windows・Java 17（Gradle のテスト。温まっていない JVM）。
 
 - 実際のツールチェーンのコンポーネント（Rust の `wasm32-wasip2`・`wasm32-wasip3`）。テストは wasm-tools で WAT から作ったものだけ。ツールチェーンのものは #263 か #267 で用意する
 - Component Model の仕様のテスト（component-model の `test/` の wast）の取り込み（#263 のリンクと合わせて行う）
-- Java 21（NeoForge）での測定と、製品の環境（jarJar で同梱した jar）で検証器のクラスが読めること。MOD の jar に `wasm-tools`・`wasi` が同梱されていることだけ確かめた（開発環境の GameTest は `additionalRuntimeClasspath` から読むので、jarJar の読み込みは確かめられない）。検証器はまだ実行（exec）からは呼ばれない（#263 でつなぐ）。開発環境の実行時クラスパスの配線は、GameTest `componentValidatorWorksOnServer`（両バージョン。`RuntimeSelfCheck.validatesComponent`）で確かめる
+- Java 21（NeoForge）での測定と、製品の環境（jarJar で同梱した jar をモジュールとして読む）で検証器のクラスが読めること（製品のサーバーの起動は試していない）。同梱の漏れは `checkBundledLibraries` で確かめ、クラスが足りないときに `WasmLoadException` になることは単体テスト（`ComponentValidatorLinkageTest`）で確かめた（開発環境の GameTest は `additionalRuntimeClasspath` から読むので、jarJar の読み込みは確かめられない）。検証器はまだ実行（exec）からは呼ばれない（#263 でつなぐ）。開発環境の実行時クラスパスの配線は、GameTest `componentValidatorWorksOnServer`（両バージョン。`RuntimeSelfCheck.validatesComponent`）で確かめる

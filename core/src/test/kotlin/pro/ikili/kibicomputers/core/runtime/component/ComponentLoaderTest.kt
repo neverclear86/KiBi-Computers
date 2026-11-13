@@ -316,8 +316,126 @@ class ComponentLoaderTest {
         // 宣言は 10 段分しかないが、展開すると 1024 個
         val bomb = doubling(10)
         assertTrue(bomb.size < 2000)
-        assertMessage(rejects(bomb), "展開した後のコアモジュールのインスタンスの数")
+        // 既定の上限では、途中の段のコンポーネントのインスタンス（2,047 個）で先に断る
+        assertMessage(rejects(bomb), "展開した後のコンポーネントのインスタンスの数")
+        assertMessage(rejects(bomb, ComponentLimits(maxExpandedInstances = 10_000)), "展開した後のコアモジュールのインスタンスの数")
         assertMessage(rejects(doubling(4), ComponentLimits(maxExpandedCoreInstances = 15)), "上限 15")
+    }
+
+    /** 型のセクションを 1 つ持つコンポーネントを葉にして、2 回ずつインスタンス化する入れ子を [levels] 段重ねたもの（core のインスタンスはない） */
+    private fun resourceDoubling(levels: Int): ByteArray {
+        val sb = StringBuilder("(component \$root\n")
+        sb.append("  (component \$c0 (type \$r (resource (rep i32))) (export \"r\" (type \$r)))\n")
+        for (i in 1..levels) {
+            sb.append("  (component \$c$i (alias outer \$root \$c${i - 1} (component \$p)) (instance (instantiate \$p)) (instance (instantiate \$p)))\n")
+        }
+        sb.append("  (instance (instantiate \$c$levels))\n)")
+        return wat(sb.toString())
+    }
+
+    @Test
+    fun `coreのインスタンスがなくてもコンポーネントのインスタンスが増えるものは断る`() {
+        // 1 + 2 + 4 + 8 = 15 個
+        val small = ComponentLoader.load(resourceDoubling(3))
+        assertEquals(0, small.expandedCoreInstances)
+        assertEquals(15, small.expandedInstances)
+        // 1 KB ほどで、展開すると 2,047 個
+        val bomb = resourceDoubling(10)
+        assertTrue(bomb.size < 1_000)
+        assertMessage(rejects(bomb), "展開した後のコンポーネントのインスタンスの数が上限 1000")
+        assertMessage(rejects(resourceDoubling(3), ComponentLimits(maxExpandedInstances = 14)), "上限 14")
+        // 型も 1 つずつ手間に数える（葉の resource の型 8 個 + ほかの宣言）
+        assertMessage(rejects(resourceDoubling(3), ComponentLimits(maxExpansionSteps = 40)), "なぞる手間")
+    }
+
+    /** 要素が 0 個のセクション（id が [id]、3 バイト）を [n] 個並べたコンポーネント */
+    private fun emptySections(n: Int, id: Int): ByteArray {
+        val out = ByteArray(8 + 3 * n)
+        byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00).copyInto(out)
+        for (i in 0 until n) {
+            out[8 + 3 * i] = id.toByte()
+            out[8 + 3 * i + 1] = 1
+            out[8 + 3 * i + 2] = 0
+        }
+        return out
+    }
+
+    @Test
+    fun `空のセクションを並べたものはセクションの数で断る`() {
+        val max = ComponentLimits.DEFAULT.maxSections
+        // 上限ちょうどは、検証まで含めて時間の上限に収まる
+        val ok = emptySections(max, 7)
+        assertEquals(max, ComponentLoader.load(ok).root.sections.size)
+        // 16 MiB 近くまで並べたもの（約 559 万個）は、パーサーがすぐ断る（検証まで行かない）
+        val count = (ComponentLimits.DEFAULT.maxBytes - 8) / 3
+        for (id in listOf(0, 2, 7)) {
+            val big = emptySections(count, id)
+            val clock = LoadDeadline(Long.MAX_VALUE)
+            assertMessage(rejects(big), "セクションの数が上限 $max")
+            assertTrue(clock.elapsedNanos < 2_000_000_000L) { "断るのに ${clock.elapsedNanos / 1_000_000} ms かかった" }
+        }
+        assertMessage(rejects(emptySections(11, 7), ComponentLimits(maxSections = 10)), "セクションの数が上限 10")
+        // セクションもデコードする要素の総数に数える
+        assertMessage(rejects(emptySections(11, 7), ComponentLimits(maxDecodedItems = 10)), "デコードする要素の総数")
+    }
+
+    /** データのセグメントに [dataBytes] バイトを持つ core モジュールを 1 つだけ持つコンポーネント */
+    private fun bigDataComponent(dataBytes: Int): ByteArray {
+        val module = java.io.ByteArrayOutputStream()
+        module.write(byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00))
+        // メモリ 1 つ（最初 256 ページ = 16 MiB）
+        module.write(byteArrayOf(0x05, 0x04, 0x01, 0x00, 0x80.toByte(), 0x02))
+        val data = java.io.ByteArrayOutputStream()
+        data.write(byteArrayOf(0x01, 0x00, 0x41, 0x00, 0x0b))
+        data.write(leb(dataBytes))
+        data.write(ByteArray(dataBytes) { (it * 31).toByte() })
+        module.write(0x0b)
+        module.write(leb(data.size()))
+        data.writeTo(module)
+        val out = java.io.ByteArrayOutputStream()
+        out.write(byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x01))
+        out.write(leb(module.size()))
+        module.writeTo(out)
+        return out.toByteArray()
+    }
+
+    @Test
+    fun `16MiB近いコンポーネントも時間の上限の中で読める`() {
+        val bytes = bigDataComponent(ComponentLimits.DEFAULT.maxBytes - 64)
+        assertTrue(bytes.size <= ComponentLimits.DEFAULT.maxBytes)
+        // 時間の上限（既定 8 秒）を超えたら load が断るので、通れば収まっている
+        val c = ComponentLoader.load(bytes)
+        assertEquals(1, c.coreModules.size)
+    }
+
+    @Test
+    fun `wasm-toolsの検証をまたいだ時間も上限に数える`() {
+        val limit = 500_000_000L
+        val limits = ComponentLimits(moduleLimits = ModuleLimits(timeLimitNanos = limit))
+        // 検証が終わった後の確認で断る（検証の間は止められないので、終わった後で確かめる）
+        val e = assertThrows<WasmLoadException> {
+            ComponentLoader.load(full, limits) { image ->
+                ComponentValidator.validate(image)
+                val spin = LoadDeadline(Long.MAX_VALUE)
+                var n = 0L
+                while (spin.elapsedNanos <= limit + 100_000_000L) n++
+            }
+        }
+        assertMessage(e, "コンポーネントの検証、")
+        // 差し替えずに同じ上限で読めば通る
+        assertDoesNotThrow { ComponentLoader.load(full, limits) }
+    }
+
+    @Test
+    fun `検証器のメモリの上限を超えたらWasmLoadException`() {
+        // 最初の大きさより小さな上限は、内部の失敗
+        assertMessage(assertThrows<WasmLoadException> { ComponentValidator.validate(full, maxMemoryPages = 1) }, "最初の大きさ")
+        // 入力を読み込みきれない上限では、wasm-tools が確保に失敗して終わる（内容の失敗として、WasmLoadException になる）
+        val big = bigDataComponent(8 * 1024 * 1024)
+        val e = assertThrows<WasmLoadException> { ComponentValidator.validate(big, maxMemoryPages = VALIDATOR_SMALL_PAGES) }
+        assertMessage(e, "out of memory")
+        // 既定の上限なら通る
+        assertDoesNotThrow { ComponentValidator.validate(big) }
     }
 
     @Test
@@ -478,5 +596,10 @@ class ComponentLoaderTest {
         val range = c.coreModules.first()
         assertArrayEquals(full.copyOfRange(range.offset, range.end), c.coreModuleBytes(range))
         assertTrue(c.bytes === full || c.bytes.contentEquals(full))
+    }
+
+    private companion object {
+        /** wasm-tools の最初のメモリ（37 ページ）より大きく、8 MiB の入力は読み込みきれない上限（64 ページ = 4 MiB） */
+        const val VALIDATOR_SMALL_PAGES = 64
     }
 }

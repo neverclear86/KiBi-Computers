@@ -4,32 +4,43 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 
 /**
- * 入れ子を展開した後の、コアモジュールのインスタンスの数を数える（#262）。
+ * 入れ子を展開した後の、コアモジュールとコンポーネントのインスタンスの数を数える（#262）。
  *
  * コンポーネントは、中のコンポーネントを何度でもインスタンス化できる。A が B を2回、B が C を2回…と重ねると、
  * 宣言の数は少ないまま、実際のインスタンスは 2^深さ に増え、#263 のインスタンス化でメモリと時間を使い尽くす。
  * そこで、インスタンス化をなぞって（どのコンポーネントがどのインスタンスになるかだけを追い、関数や値は追わない）、
- * `core instance (instantiate ...)` の数を数え、[ComponentLimits.maxExpandedCoreInstances] を超えたら断る。
+ * `core instance (instantiate ...)` の数と `instance (instantiate ...)` の数を数え、それぞれ
+ * [ComponentLimits.maxExpandedCoreInstances]・[ComponentLimits.maxExpandedInstances] を超えたら断る
+ * （core のインスタンスを持たないコンポーネントでも、インスタンスごとに resource の型などができるので、両方を数える）。
  *
  * コンポーネントとインスタンスは、インスタンス化の引数・export・alias で渡されるので、それも追う。
  * ホストから来るもの（トップレベルの import）は中身を持たないものとして扱う（ホストはコンポーネントを渡さない）。
  * 検証（[ComponentValidator]）に通った後で呼ぶ（型が正しいので、自分自身をインスタンス化し続けるような作りはない）。
- * それでもなぞる手間（[ComponentLimits.maxExpansionSteps]）と深さに上限を置く。
+ * それでもなぞる手間（[ComponentLimits.maxExpansionSteps]）と深さに上限を置く。手間は、なぞった宣言（型・canon も
+ * 1 つずつ）の数で数えるので、展開した後の宣言の総数の上限にもなる。
  */
 internal object ComponentExpansion {
     /** なぞるインスタンス化の入れ子の深さの上限 */
     private const val MAX_DEPTH = 64
 
-    /** [root] をインスタンス化したときの、コアモジュールのインスタンスの数。上限を超えたら [WasmLoadException] */
+    /** 展開した後の数 */
+    class Counts(
+        /** コアモジュールのインスタンスの数 */
+        val coreInstances: Int,
+        /** コンポーネントのインスタンス（`instance (instantiate ...)`）の数。一番外のコンポーネントは数えない */
+        val instances: Int,
+    )
+
+    /** [root] をインスタンス化したときの、インスタンスの数。上限を超えたら [WasmLoadException] */
     @Throws(WasmLoadException::class)
-    fun countCoreInstances(root: ParsedComponent, limits: ComponentLimits, deadline: LoadDeadline?): Int {
+    fun count(root: ParsedComponent, limits: ComponentLimits, deadline: LoadDeadline?): Counts {
         val walker = Walker(limits, deadline)
         try {
             walker.instantiate(root, null, emptyMap(), 0)
         } catch (e: StackOverflowError) {
             ComponentParser.fail("インスタンス化の入れ子が深すぎる")
         }
-        return walker.coreInstances
+        return Counts(walker.coreInstances, walker.instances)
     }
 
     /** 定義されたコンポーネントと、それが定義された場所の環境（外側の alias で使う） */
@@ -67,13 +78,17 @@ internal object ComponentExpansion {
 
     private class Walker(val limits: ComponentLimits, val deadline: LoadDeadline?) {
         var coreInstances = 0
+        var instances = 0
         private var steps = 0L
 
-        private fun step() {
-            if (++steps > limits.maxExpansionSteps) {
+        /** 宣言を [n] 個なぞる */
+        private fun step(n: Int = 1) {
+            val before = steps
+            steps += n
+            if (steps > limits.maxExpansionSteps) {
                 ComponentParser.fail("インスタンス化をなぞる手間が上限 ${limits.maxExpansionSteps} を超える")
             }
-            if (steps and 0xff == 0L) deadline?.check("コンポーネントの展開の確認")
+            if (before ushr 8 != steps ushr 8) deadline?.check("コンポーネントの展開の確認")
         }
 
         fun instantiate(def: ParsedComponent, lexical: Env?, args: Map<String, Any?>, depth: Int): InstanceValue {
@@ -103,6 +118,12 @@ internal object ComponentExpansion {
                         step()
                         env.instances += when (item) {
                             is InstanceExpr.Instantiate -> {
+                                instances++
+                                if (instances > limits.maxExpandedInstances) {
+                                    ComponentParser.fail(
+                                        "展開した後のコンポーネントのインスタンスの数が上限 ${limits.maxExpandedInstances} を超える",
+                                    )
+                                }
                                 val target = env.components.getOrNull(item.component)
                                 if (target == null) {
                                     null
@@ -130,9 +151,11 @@ internal object ComponentExpansion {
                         // export も、その種類の添字空間に新しい番号を足す
                         env.push(item.target.sort, value)
                     }
-                    is ComponentSection.Custom, is ComponentSection.CoreModule, is ComponentSection.CoreTypes,
-                    is ComponentSection.Types, is ComponentSection.Canons,
-                    -> Unit
+                    // 型と canon も、インスタンスごとにできる（resource の型など）ので、1 つずつ手間に数える
+                    is ComponentSection.CoreTypes -> step(section.items.size)
+                    is ComponentSection.Types -> step(section.items.size)
+                    is ComponentSection.Canons -> step(section.items.size)
+                    is ComponentSection.Custom, is ComponentSection.CoreModule -> Unit
                 }
             }
             return InstanceValue(exports)
