@@ -13,15 +13,15 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.process.ModuleHash
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
-import pro.ikili.kibicomputers.core.kernel.vfs.FileType
+import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
-import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
-import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
@@ -29,6 +29,7 @@ import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
@@ -41,9 +42,14 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 同梱イメージ（`image:os`）の中身だけが変わったビルドで、動いている台を戻す場面（#670）。
  *
  * 本物の `/sbin/init` から標準 OS を起動し（根は同梱イメージ、`/home` は書き込めるディスク）、シェルが入力を待っているところで
- * 保存して閉じる。次に「イメージが同じ・`/bin/sh` だけ変えた」×「同じスケジューラ・新しいスケジューラ（JVM の起動し直しのまね。
- * 読み込みのキャッシュが冷えている）」の組み合わせで戻し、描き直し・続きの入力・`reboot` の後の起動を確かめる。
- * 置き場（モジュールのバイト列）と保存先、`/home` の中身は、保存と復元で共有する（ワールドのフォルダーと同じ）
+ * 保存して閉じる。次に「イメージが同じ・`/bin/sh` だけ変えた」×「同じスケジューラ・新しいスケジューラ（JVM の起動し直しのまね）」の
+ * 組み合わせで戻し、描き直し・続きの入力・`reboot` の後の起動を確かめる。
+ *
+ * ワールドのフォルダー（[World]）は本番と同じ作りにする: モジュールの置き場は [FileModuleStore]、保存先は [MachineSaveStore]、
+ * `/home` は [DiskFileSystem]。「新しいスケジューラ」の組では、保存した側のスケジューラとワールドの持ち物をすべて閉じ、
+ * 同じフォルダーを新しく開き直して戻す（スケジューラの読み込みのキャッシュも、保存先・置き場のメモリ上の状態も冷えている）。
+ * 開き直しても、動かない部分が残る: 同梱イメージ（[ImageFileSystem]）は実行中に読み込むリソースで、JVM が同じなので共有する
+ * （`ImageFileSystem.bundled` のキャッシュには触らず、保存側・復元側で同じ [imageA] を渡す）
  */
 class ChangedImageRestoreTest {
     @TempDir
@@ -115,14 +121,29 @@ class ChangedImageRestoreTest {
         return out.toByteArray()
     }
 
-    private fun harness(modules: MemoryModuleStore): Harness = Harness(execRuntime = EndiveRuntime(), moduleStore = modules)
+    /** ワールドのフォルダーを開いたもの（本番と同じ作り。開き直すと、メモリ上の状態は新しくなる） */
+    private inner class World : AutoCloseable {
+        val store = MachineSaveStore(dir.resolve("machines"), MachineIdIndex(), "test")
+        val modules: ModuleStore = FileModuleStore(dir.resolve("modules"))
+        private val opened = Collections.synchronizedList(ArrayList<DiskFileSystem>())
 
-    /** 根を [image]、`/home` を [home] として開く口を [h] に入れる */
-    private fun volumes(h: Harness, image: () -> ImageFileSystem, home: TestMemoryFileSystem) {
+        /** `/home` のディスクを開く（本番と同じに、台を起こすたびに開き直す。前に開いたものは古い世代になる） */
+        fun openHome(): DiskFileSystem = DiskFileSystem.open(dir.resolve("home")).also { opened += it }
+
+        override fun close() = opened.forEach { it.retire() }
+    }
+
+    /** ホスト側から見た `/home/t`（`/home` は [DiskFileSystem] なので、そのフォルダーのファイル） */
+    private fun hostFile(): String? = runCatching { Files.readString(dir.resolve("home").resolve("t")) }.getOrNull()
+
+    private fun harness(modules: ModuleStore): Harness = Harness(execRuntime = EndiveRuntime(), moduleStore = modules)
+
+    /** 根を [image]、`/home` を [home] が開くディスクとして開く口を [h] に入れる */
+    private fun volumes(h: Harness, image: () -> ImageFileSystem, home: () -> DiskFileSystem) {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id ->
             when (id) {
                 OS -> BootVolume(image(), readOnly = true)
-                HOME -> BootVolume(home, readOnly = false)
+                HOME -> BootVolume(home(), readOnly = false)
                 else -> null
             }
         }
@@ -156,21 +177,18 @@ class ChangedImageRestoreTest {
 
     /**
      * 組み合わせ1つ。[changeImage] なら、戻すときの根を `/bin/sh` だけ変えたイメージにする。[freshScheduler] なら、
-     * 保存と復元で別のスケジューラを使う（置き場・保存先・`/home` だけを共有する）
+     * 保存と復元で別のスケジューラ・別の [World]（同じフォルダーを開き直したもの）を使う
      */
     @ParameterizedTest(name = "イメージを変える={0}, 新しいスケジューラ={1}")
     @CsvSource("false,false", "false,true", "true,false", "true,true")
     fun `動いている台を戻すと描き直し、続きの入力とrebootが効く`(changeImage: Boolean, freshScheduler: Boolean) = timeout(limit) {
-        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
-        val modules = MemoryModuleStore()
-        val home = TestMemoryFileSystem()
         val zip = osZip()
         val imageA = ImageFileSystem.fromZip(ByteArrayInputStream(zip))
         val imageB = if (changeImage) ImageFileSystem.fromZip(ByteArrayInputStream(changedZip(zip, setOf("/bin/sh")))) else imageA
         var current = imageA
 
         // 保存する側: 起動してシェルの入力待ちまで進め、確定しない入力を入れてから写す
-        fun save(h: Harness): Triple<MachineIdentity, Int, ModuleHash> {
+        fun save(h: Harness, store: MachineSaveStore): Triple<MachineIdentity, Int, ModuleHash> {
             val host = ScreenHost()
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024)
             assertTrue(m.boot(bootConfig))
@@ -185,7 +203,7 @@ class ChangedImageRestoreTest {
         }
 
         // 戻す側
-        fun restore(h: Harness, identity: MachineIdentity, pid: Int, oldShellHash: ModuleHash) {
+        fun restore(h: Harness, store: MachineSaveStore, identity: MachineIdentity, pid: Int, oldShellHash: ModuleHash) {
             current = imageB
             val host = ScreenHost()
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024)
@@ -204,12 +222,13 @@ class ChangedImageRestoreTest {
                 host.row(0) == "$ echo pending"
             }
             assertEquals(pid, settlePrompt(h, m, host, "描き直しの後"))
-            // 続きの入力が効く（echo はシェルの組み込み。書く先は /home のディスク）
+            // 続きの入力が効く（echo はシェルの組み込み。書く先は /home のディスク）。保存前に打った `echo pending` に続けて ` > /home/t` が
+            // 1 つの行としてつながったなら、中身は pending になる。つながらなければ、空のファイルか、別の行（`> /home/t` だけ）になる
             m.offerConsoleInput(" > /home/t\n".toByteArray())
-            eventuallyDescribe(60_000, { "入力が効かない: ${host.screen()}" }) {
+            eventuallyDescribe(60_000, { "入力が効かない（${hostFile()?.let { "中身 \"$it\"" } ?: "ファイルがない"}）: ${host.screen()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
-                runCatching { home.stat(VfsPath.parse("/t")).type == FileType.REGULAR_FILE }.getOrDefault(false)
+                hostFile() == "pending\n"
             }
             settlePrompt(h, m, host, "書いた後")
             // reboot（今のイメージの /bin/reboot を起こす）で、今のイメージから上がり直す（pid は振り直すので、出力で見る）
@@ -226,20 +245,26 @@ class ChangedImageRestoreTest {
         }
 
         if (freshScheduler) {
-            // 保存したスケジューラを閉じてから、新しいスケジューラで戻す（読み込みのキャッシュが冷えている）
-            val (identity, pid, hash) = harness(modules).use { h ->
-                volumes(h, { current }, home)
-                save(h)
+            // 保存したスケジューラとワールドの持ち物を閉じてから、同じフォルダーを開き直して戻す
+            val (identity, pid, hash) = World().use { w ->
+                harness(w.modules).use { h ->
+                    volumes(h, { current }, w::openHome)
+                    save(h, w.store)
+                }
             }
-            harness(modules).use { h ->
-                volumes(h, { current }, home)
-                restore(h, identity, pid, hash)
+            World().use { w ->
+                harness(w.modules).use { h ->
+                    volumes(h, { current }, w::openHome)
+                    restore(h, w.store, identity, pid, hash)
+                }
             }
         } else {
-            harness(modules).use { h ->
-                volumes(h, { current }, home)
-                val (identity, pid, hash) = save(h)
-                restore(h, identity, pid, hash)
+            World().use { w ->
+                harness(w.modules).use { h ->
+                    volumes(h, { current }, w::openHome)
+                    val (identity, pid, hash) = save(h, w.store)
+                    restore(h, w.store, identity, pid, hash)
+                }
             }
         }
     }
