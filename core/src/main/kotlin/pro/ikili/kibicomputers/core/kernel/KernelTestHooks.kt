@@ -5,8 +5,9 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 /**
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
- * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt]・[duringInitSpawn]・[duringSpawn] はカーネルロックの中、ほかはロックの外で呼ぶ
- * （それぞれの KDoc を見る）。
+ * 多くは `(マシン, pid)` を受け取る（[beforeInitExec] などはマシンだけ、[atSpawnStage] は段（[SpawnStage]）だけ）。
+ * [stopBeforeInterrupt]・[duringRestoreInstall]・[duringInitSpawn]・[duringSpawn]・[atSpawnStage]・[duringRebootPost] は
+ * カーネルロックの中、ほかはロックの外で呼ぶ（それぞれの KDoc を見る）。ロックの中のフックで、カーネルロックを要る別のスレッドを待つとデッドロックする。
  */
 internal class KernelTestHooks {
     /** step（専用スレッド）の終わりの、登録を外す前（WASM は終わっている） */

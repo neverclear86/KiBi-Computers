@@ -14,6 +14,9 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.time.Duration
 import java.util.concurrent.ExecutorService
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -170,6 +173,68 @@ internal class SpawnRollbackTest {
             assertTrue(m.awaitTermination(5_000))
         }
     }
+
+    /** オブジェクト表にある、開いたファイル（ディレクトリを含む）の数 */
+    private fun openFiles(m: Machine): Int = m.lock.withLockValue {
+        var n = 0
+        m.kernel.objects.forEachObject { if (it is OpenFile) n++ }
+        n
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `まだ表にないfd（preopenのディレクトリ）も、FDの段の途中・後の段のどちらで失敗しても表に残らない`(kind: ProcessKind) =
+        timeout(Duration.ofSeconds(60)) {
+            Harness().use { h ->
+                val m = h.machine()
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                val program = h.program(emptyModule())
+                val parentGate = Gate(m)
+                val parent = m.spawnTest(program, gated(parentGate))
+                try {
+                    m.lock.withLockValue { FdTable(m.kernel.processes[parent]!!, m.kernel.objects, m.wakeSink).pipe() }
+                    // 新しく作る OpenFile（PendingFd.NewObject）を、既存のオブジェクトの fd の前後に置く
+                    val options = SpawnOptions(
+                        fds = mapOf(3 to StdioSource.Directory("/"), 4 to StdioSource.Inherit, 5 to StdioSource.Directory("/")),
+                    )
+                    val driver = gated(Gate(m), kind = kind)
+                    val openBefore = openFiles(m)
+                    // fd は 0〜2（コンソール）・3（ディレクトリ）・4（既存）・5（ディレクトリ）の順に入る。
+                    // FD の段は、3・4・5 を入れた直後（4 番目・5 番目・6 番目）で失敗させる。ほかの段は fd をすべて入れた後
+                    val cases = SpawnStage.entries.map { it to 1 } + listOf(SpawnStage.FD to 4, SpawnStage.FD to 5, SpawnStage.FD to 6)
+                    for ((stage, nth) in cases) {
+                        val before = snapshot(m, parent)
+                        val failure = IllegalStateException("テストの失敗 $stage#$nth")
+                        var seen = 0
+                        h.scheduler.hooks.atSpawnStage = { s ->
+                            if (s == stage && ++seen == nth) throw failure
+                        }
+                        val thrown = assertThrows<IllegalStateException>("$stage#$nth") { m.spawnWithHandle(program, driver, options, parent) }
+                        h.scheduler.hooks.atSpawnStage = null
+                        assertSame(failure, thrown, "$stage#$nth: 包まずに投げ直す")
+                        assertEquals(nth, seen, "$stage#$nth: その段まで進んだ")
+                        assertEquals(before, snapshot(m, parent), "$stage#$nth: 元に戻る")
+                        assertEquals(openBefore, openFiles(m), "$stage#$nth: 作った OpenFile が表に残る")
+                    }
+                    // spawn の最後（すべて確保した後）での失敗
+                    val before = snapshot(m, parent)
+                    h.scheduler.hooks.duringSpawn = { _, _ -> throw IllegalStateException("テストの失敗") }
+                    assertThrows<IllegalStateException> { m.spawnWithHandle(program, driver, options, parent) }
+                    h.scheduler.hooks.duringSpawn = null
+                    assertEquals(before, snapshot(m, parent))
+                    assertEquals(openBefore, openFiles(m), "作った OpenFile が表に残る")
+
+                    // 巻き戻した後も、ふつうに作れて、ディレクトリが2つ渡る
+                    val child = m.spawnWithHandle(program, exiting(5, kind), options, parent)
+                    assertEquals(openBefore + 2, openFiles(m))
+                    h.tickUntilTrue("子が終わらない") { m.processState(child.pid)?.isTerminal == true }
+                } finally {
+                    parentGate.open()
+                }
+                h.tickUntilTrue("親が終わらない") { m.processState(parent)?.isTerminal == true }
+                assertTrue(m.awaitTermination(5_000))
+            }
+        }
 
     @Test
     fun `待ち行列に積むときにワーカーを作れず投げても、CPUの待ち行列と許可は元に戻る`() = timeout(Duration.ofSeconds(30)) {
