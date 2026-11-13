@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.core.persist.StoredSnapshot
 import pro.ikili.kibicomputers.core.persist.snapshot.DecodedSnapshot
 import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotDecoder
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
@@ -95,8 +96,9 @@ internal class PreparedRestore(
  * モジュールの読み込みを待つ間は、起動用のスレッドを持たない（#577）。読み込みが終わったら、続きを起動用のスレッドに積み直す。
  *
  * 前段（カーネルを変えない）:
- * 1. 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、読み（差分なら基準も）、
- *    [SnapshotDecoder.moduleSources] で p1 の層が参照するモジュールだけを読む（区画は展開しない）。
+ * 1. 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、外枠の頭だけを読んで
+ *    MOD のバージョンを今のものと比べ（違えば中身を解釈せずに `MOD_VERSION`。#88、ADR 0088）、全体を読み（差分なら基準も、
+ *    同じように版を比べてから）、[SnapshotDecoder.moduleSources] で p1 の層が参照するモジュールだけを読む（区画は展開しない）。
  * 2. 別々のモジュールを順に1つずつ、置き場の元のバイト列から同じ読み込み方で読み込む（ProgramCache でサーバー全体と共有）。
  *    読み込みが終わっていなければ、終わったときに続きを積み直して、スレッドを返す。混んでいたら（[ProgramLoadBusyException]）、
  *    少し後にタイマーで積み直す。待つ間に持つのは、読んだままの（圧縮のままの）写しと、読み込んだ [Program] だけ。
@@ -166,7 +168,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
         } catch (e: RestoreCancelledException) {
             return
         } catch (e: RestoreFallbackException) {
-            LOG.log(System.Logger.Level.WARNING, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
+            // MOD のバージョン違いは更新直後に全台が当たるので、1台ごとは DEBUG（要約は接続層が1回出す。ADR 0088）
+            val level = if (e.cause0 == ColdBootCause.MOD_VERSION) System.Logger.Level.DEBUG else System.Logger.Level.WARNING
+            LOG.log(level, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
             machine.restoreFellBack(e.cause0)
             return
         } catch (t: Throwable) {
@@ -209,7 +213,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
 
     private fun fallback(cause: ColdBootCause, message: String, t: Throwable? = null): Nothing = throw RestoreFallbackException(cause, message, t)
 
-    /** 1.: 世代を決めて読み、読み込むモジュールを知る */
+    /** 1.: 世代を決め、MOD のバージョンを比べてから読み、読み込むモジュールを知る */
     private fun begin(): PreparedRestore? {
         checkCancelled()
         val source = request.source
@@ -222,13 +226,19 @@ internal class MachineRestore(private val machine: Machine, private val request:
             // NBT が欠番（失敗した予約）を指すのは正常（ADR 0084 の規則 9）
             LOG.log(System.Logger.Level.WARNING, "マシン $id は NBT の世代 ${source.generation} がないので、世代 $gen に戻す")
         }
+        // MOD のバージョンは、ファイルを読む前に、外枠の頭だけを読んで比べる（#88、ADR 0088）。
+        // 版の違うファイルは、全体の読み込み・CRC・節の解釈（KILLED 節・基準）をしない
+        checkModVersion(peekModVersion(id, gen), "世代 $gen")
         val stored = read(id, gen)
         val snapshot = stored.snapshot
         if (snapshot.requiresColdBoot) {
             val cause = if (snapshot.coldBootReason == null) ColdBootCause.UNREADABLE else ColdBootCause.KILLED_SECTION
             fallback(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
         }
-        base = snapshot.deltaBase?.let { read(it.id, it.generation) }
+        base = snapshot.deltaBase?.let { ref ->
+            checkModVersion(peekModVersion(ref.id, ref.generation), "差分の基準 ${ref.generation}")
+            read(ref.id, ref.generation)
+        }
         this.stored = stored
         val referenced = try {
             SnapshotDecoder.moduleSources(snapshot, machine.config.maxProcesses)
@@ -261,8 +271,29 @@ internal class MachineRestore(private val machine: Machine, private val request:
         return prepare()
     }
 
-    /** [source] の読み込みを頼む。置き場になければ失敗を覚えて次に進み、`null` */
+    /**
+     * 保存データを書いた MOD のバージョン [saved] が今のもの（置き場の [pro.ikili.kibicomputers.core.persist.MachineSaveStore.modVersion]）
+     * と違えば冷えた起動（#88、ADR 0088）。文字列の完全一致で比べる
+     */
+    private fun checkModVersion(saved: String, what: String) {
+        val current = request.source.store.modVersion
+        if (saved != current) fallback(ColdBootCause.MOD_VERSION, "$what を書いた MOD のバージョン $saved と今の $current が違う")
+    }
+
+    /**
+     * [source] の読み込みを頼む。置き場にない・変換器の版が今のものと違うなら、失敗を覚えて次に進み、`null`
+     * （使う終わっていないプロセスがあるときだけ 3. で理由にする。ADR 0085・0088）
+     */
     private fun startLoad(source: ModuleSource): CompletableFuture<Program>? {
+        if (source.metered && source.instrumentationVersion != Instrumentation.VERSION) {
+            failures[moduleKey(source)] = RestoreFallbackException(
+                ColdBootCause.MODULE_MISMATCH,
+                "モジュール ${source.originalHex} の変換器の版 ${source.instrumentationVersion} と今の ${Instrumentation.VERSION} が違う",
+            )
+            next++
+            busySince = null
+            return null
+        }
         val bytes = machine.scheduler.moduleStore.get(source.originalHash)
         if (bytes == null) {
             failures[moduleKey(source)] = RestoreFallbackException(ColdBootCause.MODULE_MISSING, "モジュール ${source.originalHex} が置き場にない")
@@ -404,6 +435,13 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val claims = ArrayList<Machine.DiskClaim>()
         val dropped = ArrayList<Pair<String, String>>()
         val droppedIds = HashSet<Int>()
+    }
+
+    /** 世代のファイルの外枠から MOD のバージョンだけを読む（読めなければ `UNREADABLE`） */
+    private fun peekModVersion(id: java.util.UUID, generation: Long): String = try {
+        request.source.store.readGenerationModVersion(id, generation)
+    } catch (e: IOException) {
+        fallback(ColdBootCause.UNREADABLE, "世代 $id/$generation の外枠を読めない: $e", e)
     }
 
     private fun read(id: java.util.UUID, generation: Long): StoredSnapshot = try {

@@ -46,7 +46,7 @@ import kotlin.concurrent.withLock
  *
  * @property root 置き場の根
  * @property index サーバーの ID の索引
- * @param modVersion 保存データに書く MOD のバージョン
+ * @property modVersion 保存データに書く MOD のバージョン（戻すときは保存データのものと比べる。#88）
  * @param executor 保存の仕事を走らせる口（既定は呼んだスレッドでその場で走らせる [SaveExecutor.DIRECT]）
  * @param maxPendingBytes 書き込み待ちの写しの見積もりの合計の上限（[hasCapacity]）
  * @param claimWaitMillis [claim] がその UUID の仕事を待つ上限（過ぎたら新しい UUID にする）
@@ -55,7 +55,7 @@ import kotlin.concurrent.withLock
 public class MachineSaveStore @JvmOverloads constructor(
     public val root: Path,
     public val index: MachineIdIndex,
-    private val modVersion: String = "unknown",
+    public val modVersion: String = "unknown",
     private val executor: SaveExecutor = SaveExecutor.DIRECT,
     maxPendingBytes: Long = Long.MAX_VALUE,
     claimWaitMillis: Long = MachineSaveConfig.DEFAULT_WRITER_FLUSH_MILLIS,
@@ -727,6 +727,16 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
         return StoredSnapshot(snapshot, data.size.toLong(), crc32c(data))
     }
+
+    /**
+     * [id] の世代 [generation] のファイルの外枠から、書いた MOD のバージョンだけを読む（#88）。
+     * ファイル全体の読み込み・CRC・節の解釈をせずに、戻す前に MOD のバージョンを比べるための口
+     *
+     * @throws IOException 読めない・外枠が壊れている・形式の版が違う
+     */
+    @Throws(IOException::class)
+    public fun readGenerationModVersion(id: UUID, generation: Long): String =
+        DataInputStream(BufferedInputStream(Files.newInputStream(generationFile(id, generation)), 256)).use { MachineSnapshot.readModVersion(it) }
 
     /**
      * [id] のディレクトリを消し、覚えていることも忘れる（プレイヤーの破壊・爆発のときだけ呼ぶ）。消すのは書き込みの列の仕事で、
