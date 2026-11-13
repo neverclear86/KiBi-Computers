@@ -11,6 +11,8 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -18,7 +20,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class RebootBackoffMachineTest {
     private val limit = Duration.ofSeconds(30)
 
-    /** 1回目は待たず、2回目から 3・6・12 tick。1,000 tick 動くと1段戻る */
+    /** 1回目は待たず、2回目から 3・6・12 tick。1,000 tick 動くと1段戻る（借りの上限は 4,000） */
     private val backoff = RebootBackoff(freeReboots = 1, baseDelayTicks = 3, maxDelayTicks = 1000, decayTicks = 1000, capLevels = 4)
 
     private class Recorder : MachineHost {
@@ -43,19 +45,40 @@ class RebootBackoffMachineTest {
 
         fun tickUntilRunning() = tickUntil("起動し直さない") { m.state == MachineState.RUNNING && !m.isBooting }
 
-        /** [reboot] を求め、止まって待ちに入るまで待つ（tick は進めない）。待ちの期限の tick を返す */
-        fun rebootAndAwaitDeferral(): Long {
+        /** tick を進めずに、init が動いている（起動の途中でない）のを待つ */
+        fun awaitRunning() = eventually(10_000, "起動しない") { m.state == MachineState.RUNNING && !m.isBooting }
+
+        /**
+         * [Machine.reboot] を求め、止まって、再起動の求めを通知に積む（か、待ちに入る）ところまで進める。tick は進めない。
+         * 戻ったときは、借りと期限が決まっている（通知はまだ配っていない）
+         */
+        fun rebootAndAwaitPost() {
+            val posted = CountDownLatch(1)
+            h.scheduler.hooks.duringRebootPost = {
+                h.scheduler.hooks.duringRebootPost = null
+                posted.countDown()
+            }
             assertTrue(m.reboot())
-            eventually(10_000, "待ちに入らない") { m.deferredRebootDueTick != 0L }
-            return m.deferredRebootDueTick
+            assertTrue(posted.await(10, TimeUnit.SECONDS), "再起動の求めを積まない")
         }
 
-        /** 待たずに起動し直す [reboot] */
+        /** [Machine.reboot] を求め、待ちに入るまで進める。待ちの期限の tick を返す */
+        fun rebootAndAwaitDeferral(): Long {
+            rebootAndAwaitPost()
+            val due = m.deferredRebootDueTick
+            assertTrue(due != 0L, "待ちに入らない")
+            return due
+        }
+
+        /**
+         * 待たずに起動し直す [Machine.reboot]。止まって積んだ後、待ちに入らず（tick を進める前に確かめる）、次の tick 1回で起動し直す
+         */
         fun rebootImmediately() {
             val before = host.reboots.get()
-            assertTrue(m.reboot())
-            tickUntil("待たずに起動し直さない") { host.reboots.get() == before + 1 }
-            assertEquals(0L, m.deferredRebootDueTick)
+            rebootAndAwaitPost()
+            assertEquals(0L, m.deferredRebootDueTick, "待たずに起動し直すはずが、待ちに入った")
+            h.scheduler.tick()
+            assertEquals(before + 1, host.reboots.get(), "次の tick で起動し直さない")
             tickUntilRunning()
         }
 
@@ -116,6 +139,8 @@ class RebootBackoffMachineTest {
         assertTrue(m.isRunningBootingOrRebooting)
         assertFalse(m.isAtWaitPoint)
         assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+        // 待ちは tick でしか解けない（メインスレッドで保存を待つ呼び手が、待っても無駄。#635）
+        assertFalse(m.isSettlingForSave)
         assertEquals(1, h.scheduler.pendingTickWakes)
 
         tickUpTo(due, reboots = 1)
@@ -143,6 +168,7 @@ class RebootBackoffMachineTest {
         assertEquals(0L, m.deferredRebootDueTick)
         assertEquals(0L, m.rebootDebt)
         assertEquals(SaveReadiness.READY, m.saveReadiness())
+        assertFalse(m.isSettlingForSave)
         while (now < due + 5) h.scheduler.tick()
         assertEquals(1, host.reboots.get(), "取り消した再起動はしない")
         assertEquals(MachineState.STOPPED, m.state)
@@ -170,15 +196,116 @@ class RebootBackoffMachineTest {
     }
 
     @Test
+    fun `待つ間に重ねてrebootしても、期限も借りも列の項目も起動し直す回数も変わらない`() = env {
+        rebootImmediately()
+        val due = rebootAndAwaitDeferral()
+        val debt = m.rebootDebt
+        assertTrue(m.reboot(), "重ねた求めも受け付ける")
+        assertEquals(due, m.deferredRebootDueTick, "今の期限のまま")
+        assertEquals(debt, m.rebootDebt, "借りを増やさない")
+        assertEquals(1, h.scheduler.pendingTickWakes, "列に足さない")
+        assertTrue(m.isRebootPending)
+        assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+
+        tickUpTo(due, reboots = 1)
+        h.scheduler.tick()
+        assertEquals(2, host.reboots.get(), "期限の tick で1回だけ起動し直す")
+        assertEquals(0, h.scheduler.pendingTickWakes)
+        tickUntilRunning()
+        repeat(20) { h.scheduler.tick() }
+        assertEquals(2, host.reboots.get(), "重ねた分は起動し直さない")
+    }
+
+    @Test
+    fun `通知を積んだ後、配る前に重ねてrebootしても、借りも起動し直す回数も変わらない`() = env {
+        rebootAndAwaitPost()
+        assertEquals(0L, m.deferredRebootDueTick, "1回目は待たない")
+        val debt = m.rebootDebt
+        assertEquals(backoff.decayTicks, debt)
+        assertTrue(m.reboot(), "重ねた求めも受け付ける")
+        assertEquals(debt, m.rebootDebt, "借りを増やさない")
+        assertEquals(0L, m.deferredRebootDueTick, "待ちに入らない")
+        assertTrue(m.isRebootPending)
+
+        h.scheduler.tick()
+        assertEquals(1, host.reboots.get(), "最初の通知で1回だけ起動し直す")
+        tickUntilRunning()
+        repeat(20) { h.scheduler.tick() }
+        assertEquals(1, host.reboots.get(), "重ねた分は起動し直さない")
+        assertEquals(debt, m.rebootDebt)
+    }
+
+    @Test
+    fun `前の起動で積んだ古い通知が残っていても、新しい待ちを飛ばさない`() = env {
+        // 1回目（待たない）の通知を積んだ後、配る前に boot する（積んだ印は boot が下ろす）。tick を進めないので、古い通知は列に残る
+        rebootAndAwaitPost()
+        assertEquals(0L, m.deferredRebootDueTick)
+        assertTrue(m.boot(config), "通知を積んだ後は STOPPED なので boot を受け付ける")
+        awaitRunning()
+        // 2回目は待つ。待ちに入った後で、古い通知を配る tick が来る
+        val due = rebootAndAwaitDeferral()
+        assertTrue(now + 1 < due)
+        h.scheduler.tick()
+        assertEquals(0, host.reboots.get(), "古い通知で、待ちを飛ばして起動し直した")
+        assertTrue(m.isRebootPending)
+        tickUpTo(due, reboots = 0)
+        h.scheduler.tick()
+        assertEquals(1, host.reboots.get(), "期限の tick で起動し直す")
+    }
+
+    @Test
+    fun `動いたtick数だけ借りが減る`() = env {
+        rebootImmediately()
+        assertEquals(backoff.decayTicks, m.rebootDebt)
+        repeat(300) { h.scheduler.tick() }
+        val ran = now - m.initStartedTick
+        assertTrue(ran in 300 until backoff.decayTicks, "init が動いた tick 数: $ran")
+        rebootAndAwaitPost()
+        assertEquals(2 * backoff.decayTicks - ran, m.rebootDebt, "借りは、動いた分だけ減ってから、1回分増える")
+    }
+
+    @Test
     fun `長く動いてから再起動すると、借りが減って待たない`() = env {
         rebootImmediately()
         val due = rebootAndAwaitDeferral()
+        assertTrue(m.rebootDebt > backoff.decayTicks)
         tickUpTo(due, reboots = 1)
         h.scheduler.tick()
         tickUntilRunning()
-        // 2段分（2,000 tick）を超えて動けば、段 1 に戻る（待たない）
+        // 2段分（2,000 tick）を超えて動けば、借りが 1 段分に戻る（待たない。rebootImmediately が待ちに入らないことを確かめる）
         repeat(2_100) { h.scheduler.tick() }
         rebootImmediately()
+        assertEquals(backoff.decayTicks, m.rebootDebt)
+    }
+
+    @Test
+    fun `起動の途中のrebootは動いた時間を0と数える`() = env {
+        rebootImmediately()
+        rebootAndAwaitDeferral()
+        m.rebootDebt = 2 * backoff.decayTicks
+        // 待つ間に boot し、init を作る前で止める。その間に tick が進んでも、init は動いていない
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            h.scheduler.hooks.beforeInitExec = null
+            reached.countDown()
+            release.await(10, TimeUnit.SECONDS)
+        }
+        assertTrue(m.boot(config))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        repeat(500) { h.scheduler.tick() }
+        assertTrue(m.isBooting)
+        assertEquals(-1L, m.initStartedTick)
+        val posted = CountDownLatch(1)
+        h.scheduler.hooks.duringRebootPost = {
+            h.scheduler.hooks.duringRebootPost = null
+            posted.countDown()
+        }
+        assertTrue(m.reboot())
+        release.countDown()
+        assertTrue(posted.await(10, TimeUnit.SECONDS), "再起動の求めを積まない")
+        assertEquals(3 * backoff.decayTicks, m.rebootDebt, "動いた時間は 0: 借りは減らず、1回分増える")
+        assertTrue(m.deferredRebootDueTick != 0L, "3 段目なので待つ")
     }
 
     @Test

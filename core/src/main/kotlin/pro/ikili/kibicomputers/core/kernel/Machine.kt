@@ -618,6 +618,21 @@ public class Machine private constructor(
      */
     public fun saveReadiness(): SaveReadiness = lock.withLockValue { saveReadinessLocked() }
 
+    /**
+     * 保存の判定が [SaveReadiness.TRANSIENT] で、待てば READY に近づくなら `true`（#635）。
+     * 再起動の通知を積んだ後（[MachineHost.onRebootRequested] を呼ぶまで。起動し直すまでの待ちの間を含む）は、
+     * [MachineScheduler.tick]（メインスレッド）が通知を配るか [stop] でしか解けない。メインスレッドで [saveReadiness] の変わるのを待つ呼び手
+     * （チャンクのアンロード、サーバーの停止）は、待っても tick が進まず予算を使い切るだけなので、これが偽の台は待たずに取り出す
+     * （取り出す内容は、待っても変わらない。[ColdBootReason.REBOOT_PENDING] の冷えた起動）
+     */
+    public val isSettlingForSave: Boolean get() = lock.withLockValue { saveReadinessLocked() == SaveReadiness.TRANSIENT && !rebootNotified }
+
+    /**
+     * 再起動の通知を、起動し直すまでの待ち（[RebootBackoff]。#635）で遅らせている間なら `true`。この間は [isRebootPending]・
+     * [saveReadiness] の `TRANSIENT` のままで、[MachineScheduler.tick] が期限に通知を積む（[stop]・[boot] で取り消す）
+     */
+    public val isRebootDeferred: Boolean get() = lock.withLockValue { rebootNotified && rebootDueTick != 0L }
+
     private fun saveReadinessLocked(): SaveReadiness {
         if (bootingValue || rebootRequested || rebootNotified || restoreTransient) return SaveReadiness.TRANSIENT
         var result = SaveReadiness.READY
@@ -2980,8 +2995,13 @@ public class Machine private constructor(
     /** テスト用: 遅らせている再起動の期限の tick（遅らせていなければ `0`） */
     internal val deferredRebootDueTick: Long get() = lock.withLockValue { rebootDueTick }
 
-    /** テスト用: 再起動の借り（tick） */
-    internal val rebootDebt: Long get() = lock.withLockValue { rebootDebtTicks }
+    /** テスト用: 再起動の借り（tick）。借りのあるマシンを、再起動を重ねずに作るために書き換えられる */
+    internal var rebootDebt: Long
+        get() = lock.withLockValue { rebootDebtTicks }
+        set(value) = lock.withLockValue { rebootDebtTicks = value }
+
+    /** テスト用: 今の init が動き始めた tick（動いていなければ `-1`） */
+    internal val initStartedTick: Long get() = lock.withLockValue { initStartTick }
 
     /**
      * 起動の手順の始め（起動用のスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、

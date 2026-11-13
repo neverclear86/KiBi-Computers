@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
@@ -596,6 +597,35 @@ object TestComputerGameTests {
             )
             helper.assertTrue(case.computer.status == ComputerStatus.OFF, "the case should turn off: ${case.computer}")
             helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * 再起動を繰り返して起動し直すまでの待ち（#635）に入った台は、アンロードと停止の待ち（メインスレッドで保存の判定が変わるのを待つ）に
+     * 数えない。待ちの間の保存の判定は `TRANSIENT` のままだが、tick でしか解けないので、待つと予算を使い切るだけになる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun deferredRebootIsNotWaitedForOnSave(helper: GameTestHelper) {
+        val (case, _, _) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        var requested = 0
+        helper.succeedWhen {
+            if (!machine.isRebootDeferred) {
+                // 3 回までは待たずに起動し直す。起動し直したら、また求める
+                if (machine.state == MachineState.RUNNING && !machine.isBooting && !machine.isRebootPending) {
+                    helper.assertTrue(++requested <= 8, "the reboots should be deferred after a few requests")
+                    helper.assertTrue(machine.reboot(), "reboot should be accepted")
+                }
+                helper.assertTrue(false, "wait for the reboot to be deferred ($requested requests)")
+            }
+            helper.assertTrue(machine.isRebootPending, "a deferred reboot is still pending")
+            helper.assertTrue(machine.saveReadiness() == SaveReadiness.TRANSIENT, "the save readiness stays transient")
+            helper.assertTrue(!case.computer.isSettlingForSave, "waiting for a deferred reboot would only burn the wait budget")
+            helper.assertTrue(!ServerMachines.anySettling(listOf(case)), "the unload and stop waits should not wait for it")
+            case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
