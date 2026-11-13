@@ -1685,15 +1685,19 @@ public class Machine private constructor(
 
     /**
      * コンソールの TTY にキー入力 [bytes] を渡す（キーボードから）。どのスレッドから呼んでもよい。
-     * TTY がモードに従って全部処理し（行編集、エコー、Ctrl+C）、受け付けたバイト数（あふれて捨てた分を除く）を返す。
-     * Ctrl+C などのシグナルは、カーネルロックの中で、起きた順に [ttySignalHandler] に渡す
+     * TTY がモードに従って全部処理し（行編集、エコー、Ctrl+C）、受け付けたバイト数（あふれて捨てた分を除く。TTY の待ちの列に
+     * 積んだ分は受け付けたものとして数える。#609）を返す。
+     * Ctrl+C などのシグナルは、カーネルロックの中で、起きた順に [ttySignalHandler] に渡す。
+     *
+     * @param splittable 文字の境目で分けて入れてよい入力（貼り付けと文字の入力）。入りきらない分は TTY の待ちの列に積み、
+     *   プロセスが読んで空いたら続きを入れる（#609）。キーのバイト列（エスケープシーケンス）や画面の応答は `false`（分けない）
      */
-    internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Int = lock.withLockValue {
+    internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset, splittable: Boolean = false): Int = lock.withLockValue {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
         // 復元の途中は受け付けない（表を空のまま保つ。#85）
         if (restoringValue) return@withLockValue 0
         val tty = consoleTtyLocked()
-        val r = tty.input(bytes, offset, length, wakeSink)
+        val r = tty.input(bytes, offset, length, wakeSink, splittable)
         if (r.signals.isNotEmpty()) {
             val handler = ttySignalHandler
             for (s in r.signals) handler.onSignal(this, s, tty.foregroundPid)

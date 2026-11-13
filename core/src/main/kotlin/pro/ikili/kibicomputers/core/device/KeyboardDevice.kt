@@ -44,14 +44,17 @@ public class KeyboardDevice : Device {
      * キーボードの入力 [event] を、マシンのコンソールに流す。キー入力のエコーは、入力の直後にここで画面に書く
      * （書くプロセスがいないので。打った量だけなので軽い。#355）。
      *
-     * @return TTY が受け付けたバイト数。マシンがない・送るものがない入力なら 0
+     * 貼り付けと文字の入力は、文字の境目で分けて入れてよい入力として渡す（TTY に入りきらなければ待たせる。#609）。
+     *
+     * @return TTY が受け付けたバイト数（待ちの列に積んだ分を含む）。マシンがない・送るものがない入力なら 0
      */
     public fun input(event: KeyboardEvent): Int {
         val m = machine ?: return 0
         // #326: キー入力をイベントキューにも届けるときは、ここで context の postEvent に渡す（イベントの名前と値の形は #326 で決める）
         val bytes = TerminalKeyEncoder.encode(event)
         if (bytes.isEmpty()) return 0
-        val accepted = m.offerConsoleInput(bytes)
+        val splittable = event is KeyboardEvent.Paste || event is KeyboardEvent.Text
+        val accepted = m.offerConsoleInput(bytes, splittable = splittable)
         m.pumpConsole()
         return accepted
     }

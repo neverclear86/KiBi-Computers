@@ -23,7 +23,9 @@ import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
  * - canonical では、エコーしているときに確定した行を履歴に残し、上下の矢印（`ESC [ A`・`ESC [ B`）で編集中の行に呼び戻す（#96）。
  *   ほかの `ESC [` と `ESC O` のシーケンスは行に入れずに読み捨てる
  *
- * 状態はどれも番号・真偽・バイト列（保存の対象。書き出す形は #82）。カーネルロックの中で使う。
+ * - 貼り付け（分けてよい入力）が入りきらないときは、残りを実行時だけの待ちの列に積み、プロセスが読んで空いたら続きを入れる（#609）
+ *
+ * 状態はどれも番号・真偽・バイト列（保存の対象。書き出す形は #82。待ちの列だけは保存しない）。カーネルロックの中で使う。
  *
  * @param inputCapacity 入力の上限（読める入力＋編集中の行の合計）
  * @param outputCapacity 配っていない出力の上限（エコーはこれを [ECHO_SLACK_BYTES] まで超えて積める）
@@ -97,6 +99,13 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     private var outCodePoint = 0
     private var outRemaining = 0
 
+    /**
+     * 入りきらなかった入力の待ちの列（#609）。実行時だけの値で、保存しない（[copyForSnapshot]・[writeSnapshot] に入れない）。
+     * [pendingChunks] は入力1回ごとの長さで、正は分けてよい（貼り付け）、負は分けてはいけない（キーのバイト列）
+     */
+    private val pending = TtyBytes(PENDING_INPUT_BYTES)
+    private val pendingChunks = TtyLines()
+
     /** あふれて捨てた入力のバイト数（数え口） */
     var droppedInputBytes: Long = 0
         private set
@@ -111,6 +120,9 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     /** 編集中の行のバイト数 */
     val editingLength: Int get() = line.length
 
+    /** 待ちの列のバイト数（#609。実行時だけ） */
+    val pendingInputBytes: Int get() = pending.length
+
     /** 配っていない出力のバイト数 */
     val outputAvailable: Int get() = output.length
 
@@ -118,7 +130,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     val outputFree: Int get() = outputSpace.coerceAtLeast(0)
 
     /** 確保しているバッファの合計（テスト用） */
-    internal val allocatedBytes: Int get() = input.allocatedBytes + line.allocatedBytes + output.allocatedBytes
+    internal val allocatedBytes: Int get() = input.allocatedBytes + line.allocatedBytes + output.allocatedBytes + pending.allocatedBytes
 
     /** 履歴の行の数（テスト用） */
     internal val historyCount: Int get() = history.count
@@ -140,32 +152,55 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         else -> false
     }
 
-    /** 接続層からのキー入力。モードに従って全部処理する（途中で止めない）。エコーは出力に積む */
-    fun input(src: ByteArray, off: Int, len: Int, sink: WakeSink): TtyInputResult {
+    /**
+     * 接続層からのキー入力。モードに従って全部処理する（途中で止めない）。エコーは出力に積む。
+     *
+     * [splittable] は、UTF-8 の文字の境目で分けて入れてよい入力（貼り付け。#609）。入りきらず、プロセスが読めば空く
+     * （読める入力がある）ときは、入った文字の後ろから残りを待ちの列に積み、[read] で空いたら続きを入れる。
+     * 待ちの列が空でない間は、後から来た入力も順番を保つために列の後ろに積む（シグナルのバイトを含む入力は除く。
+     * シグナルは今の入力と一緒に待ちの列も捨てる）。列にも入らない分は捨てて数える
+     */
+    fun input(src: ByteArray, off: Int, len: Int, sink: WakeSink, splittable: Boolean = false): TtyInputResult {
         require(off >= 0 && len >= 0 && off + len <= src.size) { "src の範囲外" }
         val wasReadable = readable
         var flushed = false
         var signals: MutableList<TtySignal>? = null
         outputAdded = false
         droppedInCall = 0
-        for (i in off until off + len) {
-            var b = src[i].toInt() and 0xFF
-            if (b == CR && mode.crToNl) b = LF
-            if (mode.signals && (b == CTRL_C || b == CTRL_BACKSLASH)) {
-                input.clear()
-                lines.clear()
-                line.clear()
-                resetLineState()
-                flushed = true
-                echoChar(b)
-                echoChar(LF)
-                (signals ?: ArrayList<TtySignal>(1).also { signals = it }) += if (b == CTRL_C) TtySignal.INTERRUPT else TtySignal.QUIT
-                continue
-            }
-            if (mode.canonical) {
-                if (!escapeInput(b)) canonicalInput(b)
-            } else {
-                rawInput(b)
+        val end = off + len
+        val hasSignal = mode.signals && containsSignal(src, off, end)
+        if (hasSignal) clearPending()
+        if (!hasSignal && pendingChunks.count > 0) {
+            enqueue(src, off, end, splittable)
+        } else {
+            var i = off
+            while (i < end) {
+                val raw = src[i].toInt() and 0xFF
+                val b = if (raw == CR && mode.crToNl) LF else raw
+                if (mode.signals && (b == CTRL_C || b == CTRL_BACKSLASH)) {
+                    input.clear()
+                    lines.clear()
+                    line.clear()
+                    resetLineState()
+                    flushed = true
+                    echoChar(b)
+                    echoChar(LF)
+                    (signals ?: ArrayList<TtySignal>(1).also { signals = it }) += if (b == CTRL_C) TtySignal.INTERRUPT else TtySignal.QUIT
+                    i++
+                    continue
+                }
+                if (splittable && !hasSignal) {
+                    val k = charLength(src, i, end)
+                    if (!fitsChar(src, i, k) && readable) {
+                        enqueue(src, i, end, splittable = true)
+                        break
+                    }
+                    for (j in i until i + k) processByte(src[j].toInt() and 0xFF)
+                    i += k
+                    continue
+                }
+                processByte(b)
+                i++
             }
         }
         if (readable && (!wasReadable || flushed)) sink.wake(WaitKey(id, WaitCondition.READABLE))
@@ -176,25 +211,30 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         return TtyInputResult(signals ?: emptyList(), dropped)
     }
 
-    /** プロセスが読む（fd 0）。canonical では1回に1行まで（行の境目を越えない） */
+    /** プロセスが読む（fd 0）。canonical では1回に1行まで（行の境目を越えない）。読んで空いたら待ちの列から続きを入れる（#609） */
     fun read(dst: ByteArray, off: Int, len: Int, sink: WakeSink): ReadResult {
         require(off >= 0 && len >= 0 && off + len <= dst.size) { "dst の範囲外" }
         if (!readable) return ReadResult.WouldBlock
         if (len == 0) return ReadResult.Bytes(0)
+        val result: ReadResult
         if (lines.count > 0) {
             val first = lines.first
             if (first == 0) {
                 lines.removeFirst()
-                return ReadResult.Eof
+                result = ReadResult.Eof
+            } else {
+                val n = minOf(len, first)
+                input.take(dst, off, n)
+                lines.consumeFirst(n)
+                result = ReadResult.Bytes(n)
             }
-            val n = minOf(len, first)
+        } else {
+            val n = minOf(len, input.length)
             input.take(dst, off, n)
-            lines.consumeFirst(n)
-            return ReadResult.Bytes(n)
+            result = ReadResult.Bytes(n)
         }
-        val n = minOf(len, input.length)
-        input.take(dst, off, n)
-        return ReadResult.Bytes(n)
+        refill(sink)
+        return result
     }
 
     /** プロセスが書く（fd 1・2）。空いている分だけ書く（一部だけのことがある）。数は [src] の側のバイト数 */
@@ -251,6 +291,8 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         }
         this.mode = mode
         if (!wasReadable && readable) sink.wake(WaitKey(id, WaitCondition.READABLE))
+        // 入る量はモードで変わる（canonical は確定の LF の1バイトを残す）ので、続きを入れ直す
+        refill(sink)
     }
 
     /** 画面の大きさを変える。変わったら世代を1つ進めて `true`（待ち手は起こさない。待てる形の知らせは `Machine.resizeConsole` が入れる `tty-resize` のイベント。ADR 0427） */
@@ -262,7 +304,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         return true
     }
 
-    /** 写し（#82）。[outputWritten] は実行時だけなので写さない（写しでは 0） */
+    /** 写し（#82）。[outputWritten] と待ちの列（#609）は実行時だけなので写さない（写しでは 0・空） */
     override fun copyForSnapshot(): KernelObject {
         val out = SnapshotWriter(64 + input.length + line.length + output.length + history.totalBytes)
         writeSnapshot(out)
@@ -271,7 +313,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
     /**
      * 保存する値をすべて書く（#82、ADR 0082。`KERNEL` 節の `Tty`）。private の欄はここと [readSnapshot] でだけ触る。
-     * [outputWritten] は実行時だけなので書かない
+     * [outputWritten] と待ちの列（#609）は実行時だけなので書かない
      */
     fun writeSnapshot(out: SnapshotWriter) {
         out.i32(inputCapacity)
@@ -310,10 +352,159 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         line.clear()
         output.clear()
         history.clear()
+        clearPending()
         resetLineState()
     }
 
+    // ---- 待ちの列（#609） ----
+
+    /**
+     * 待ちの列の先頭から、入る間だけ入力に入れる。分けてよいかたまりは文字ずつ、分けてはいけないかたまりは全部入るときだけ入れる。
+     * 入らなくても読める入力がない（待っても空かない）ときは、今までどおり処理して（あふれた分は捨てて）進む。
+     * 列のバイトはシグナルとして扱わない（signals が有効なときはシグナルのバイトを列に積まない。切れていたときに積んだバイトはただのデータ）
+     */
+    private fun refill(sink: WakeSink) {
+        if (pendingChunks.count == 0) return
+        val wasReadable = readable
+        outputAdded = false
+        droppedInCall = 0
+        val buf = ByteArray(MAX_CHAR_BYTES)
+        while (pendingChunks.count > 0) {
+            val v = pendingChunks.first
+            if (v > 0) {
+                val k = pendingCharLength(v)
+                if (!fitsPendingChar(k) && readable) break
+                pending.take(buf, 0, k)
+                pendingChunks.consumeFirst(k)
+                for (j in 0 until k) processByte(buf[j].toInt() and 0xFF)
+            } else {
+                val n = -v
+                if (!fitsWhole(n) && readable) break
+                val bytes = ByteArray(n)
+                pending.take(bytes, 0, n)
+                pendingChunks.removeFirst()
+                for (x in bytes) processByte(x.toInt() and 0xFF)
+            }
+        }
+        if (!wasReadable && readable) sink.wake(WaitKey(id, WaitCondition.READABLE))
+        if (outputAdded) sink.outputPending(id)
+        outputAdded = false
+        droppedInCall = 0
+    }
+
+    /** [src] の [from] から [end] の手前までを待ちの列の後ろに積む。入りきらない分は捨てて数える（分けてよければ文字の境目まで積む） */
+    private fun enqueue(src: ByteArray, from: Int, end: Int, splittable: Boolean) {
+        val n = end - from
+        if (n <= 0) return
+        val room = PENDING_INPUT_BYTES - pending.length
+        val take = when {
+            n <= room -> n
+            !splittable -> 0
+            else -> {
+                var t = 0
+                var i = from
+                while (i < end) {
+                    val k = charLength(src, i, end)
+                    if (t + k > room) break
+                    t += k
+                    i += k
+                }
+                t
+            }
+        }
+        for (j in from until from + take) pending.add(src[j])
+        if (take > 0) pendingChunks.add(if (splittable) take else -take)
+        if (take < n) dropMany(n - take)
+    }
+
+    private fun clearPending() {
+        pending.clear()
+        pendingChunks.clear()
+    }
+
+    /** 待ちの列の先頭の1文字のバイト数（先頭のかたまり [chunk] バイトの中で数える） */
+    private fun pendingCharLength(chunk: Int): Int {
+        val n = utf8Length(pending[0].toInt() and 0xFF)
+        if (n < 2) return 1
+        var k = 1
+        while (k < n && k < chunk && (pending[k].toInt() and 0xC0) == 0x80) k++
+        return k
+    }
+
+    private fun fitsPendingChar(k: Int): Boolean =
+        if (k == 1) fitsByte(pending[0].toInt() and 0xFF) else charRoom() >= k + escSlack()
+
+    /** [src] の [i] から始まる1文字のバイト数（[end] で途切れたら、そこまで。壊れた UTF-8 は1） */
+    private fun charLength(src: ByteArray, i: Int, end: Int): Int {
+        val n = utf8Length(src[i].toInt() and 0xFF)
+        if (n < 2) return 1
+        var k = 1
+        while (k < n && i + k < end && (src[i + k].toInt() and 0xC0) == 0x80) k++
+        return k
+    }
+
+    private fun fitsChar(src: ByteArray, i: Int, k: Int): Boolean =
+        if (k == 1) fitsByte(src[i].toInt() and 0xFF) else charRoom() >= k + escSlack()
+
+    /** [n] バイトのかたまりが、どのバイトも捨てずに入るか（多めに見積もる。1バイトで行と入力は合わせて1バイトまでしか増えない） */
+    private fun fitsWhole(n: Int): Boolean = charRoom() >= n + escSlack()
+
+    /** 文字を入れられる残り（canonical は行に入れる文字の残り、非 canonical は読める入力の残り） */
+    private fun charRoom(): Int =
+        if (!mode.canonical) {
+            inputCapacity - input.length
+        } else {
+            minOf(inputCapacity - 1 - input.length - line.length, MAX_LINE_BYTES - line.length)
+        }
+
+    /** canonical で ESC の次を待っているなら、その ESC が行に入る分の1 */
+    private fun escSlack(): Int = if (mode.canonical && escState == ESC_START) 1 else 0
+
+    /** 1バイト [raw] を今処理して、捨てずに入るか（[processByte] と同じ分かれ方で見る） */
+    private fun fitsByte(raw: Int): Boolean {
+        val b = if (raw == CR && mode.crToNl) LF else raw
+        if (!mode.canonical) return input.length < inputCapacity
+        return when (escState) {
+            ESC_START -> when (b) {
+                LEFT_BRACKET, LETTER_O -> true
+                else -> charRoom() >= 1 + (if (usesRoom(b)) 1 else 0)
+            }
+            ESC_CSI -> if (b in 0x20..0x7E) true else fitsPlain(b)
+            ESC_SS3 -> if (b in 0x40..0x7E) true else fitsPlain(b)
+            else -> fitsPlain(b)
+        }
+    }
+
+    /** エスケープシーケンスの外の1バイトが、canonical で捨てずに入るか */
+    private fun fitsPlain(b: Int): Boolean = when {
+        b == ESC -> true
+        b == LF -> line.length > 0 || input.length < inputCapacity
+        usesRoom(b) -> charRoom() >= 1
+        else -> true
+    }
+
+    /** canonical で、行に入って場所を使うバイトか（LF・消去・Ctrl+D・ESC は使わない） */
+    private fun usesRoom(b: Int): Boolean = b != LF && b != DEL && b != BS && b != CTRL_U && b != CTRL_W && b != CTRL_D && b != ESC
+
+    private fun containsSignal(src: ByteArray, from: Int, end: Int): Boolean {
+        for (i in from until end) {
+            val b = src[i].toInt() and 0xFF
+            if (b == CTRL_C || b == CTRL_BACKSLASH) return true
+        }
+        return false
+    }
+
     // ---- 入力 ----
+
+    /** シグナルを除く1バイトを、モードに従って処理する（入らなければ捨てて数える） */
+    private fun processByte(raw: Int) {
+        val b = if (raw == CR && mode.crToNl) LF else raw
+        if (mode.canonical) {
+            if (!escapeInput(b)) canonicalInput(b)
+        } else {
+            rawInput(b)
+        }
+    }
 
     private fun canonicalInput(b: Int) {
         when (b) {
@@ -498,6 +689,13 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         if (mode.echo) echoBytes(BEL)
     }
 
+    /** あふれた [n] バイトをまとめて捨てる。エコーするなら BEL を1回鳴らす */
+    private fun dropMany(n: Int) {
+        droppedInCall += n
+        droppedInputBytes += n
+        if (mode.echo) echoBytes(BEL)
+    }
+
     /** 編集中の行の、文字の始まりの位置（UTF-8 の1文字ずつ） */
     private fun charStarts(): IntArray {
         val out = IntArray(line.length)
@@ -634,6 +832,12 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
 
         /** エコーが出力の上限を超えて積める量（バイト。仮の値。確定は #251） */
         const val ECHO_SLACK_BYTES: Int = 1024
+
+        /** 入りきらなかった入力の待ちの列の上限（バイト。#609。1回の貼り付けの上限と同じ。仮の値。確定は #251） */
+        const val PENDING_INPUT_BYTES: Int = 8192
+
+        /** UTF-8 の1文字の最大のバイト数 */
+        private const val MAX_CHAR_BYTES = 4
 
         /** 画面の大きさの既定（仮の値。画面のデバイスがつながったら #65・#66 が入れる） */
         const val DEFAULT_COLUMNS: Int = 80

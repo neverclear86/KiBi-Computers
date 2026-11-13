@@ -119,6 +119,12 @@ class NanoEditorTest {
             settle()
         }
 
+        /** [s] を 1 回の貼り付けとして入れる（LF は CR にして、文字の境目で分けてよい入力として渡す。#609） */
+        fun paste(s: String) {
+            m.offerConsoleInput(s.replace('\n', '\r').toByteArray(), splittable = true)
+            settle()
+        }
+
         fun row(y: Int) = host.row(y)
         val screen: String get() = host.screen()
         val rows: List<String> get() = host.rows()
@@ -632,6 +638,22 @@ class NanoEditorTest {
             keys(ctrlS + ctrlX)
             assertEquals(0, finish())
             assertEquals(lua, file("/home/p.lua")!!.decodeToString())
+        }
+    }
+
+    @Test
+    fun `4KiBを超えるLuaを一度に貼り付けても欠けずに入る`() {
+        // 多バイト文字を混ぜて、TTY の入力の上限（4 KiB）の境目が文字の途中に当たりうる長さにする
+        val lua = (1..400).joinToString("") { "  if x == $it then\n    print(\"値$it\")\n  end\n" }
+        val bytes = lua.toByteArray()
+        val end = (6_000 until bytes.size).first { bytes[it] == '\n'.code.toByte() } + 1
+        val text = bytes.copyOf(end).decodeToString()
+        assertTrue(text.toByteArray().size in 6_000..6_100)
+        nano(listOf("big.lua")) {
+            paste(text)
+            keys(ctrlS + ctrlX)
+            assertEquals(0, finish())
+            assertEquals(text, file("/home/big.lua")!!.decodeToString())
         }
     }
 
