@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel.tty
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.input.KeyboardText
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
@@ -347,6 +348,92 @@ class TtyPendingInputTest {
         while (true) got.append(t.readBytes(1)?.decodeToString() ?: break)
         assertEquals("abcdefgh\u0003", got.toString())
         assertEquals(0, t.pendingInputBytes)
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `待ちの列の上限は1回の貼り付けの上限以上で、入力がいっぱいでも上限ちょうどの貼り付けは欠けない`() {
+        assertTrue(Tty.PENDING_INPUT_BYTES >= KeyboardText.MAX_PASTE_BYTES, "2つの上限がずれると貼り付けが黙って欠ける（#609）")
+        // raw: 読める入力がいっぱいの状態で、上限ちょうどを貼る
+        val t = rawTty()
+        assertEquals(0, t.paste(ByteArray(4096) { 'f'.code.toByte() }).dropped)
+        assertEquals(4096, t.inputAvailable)
+        val text = ByteArray(KeyboardText.MAX_PASTE_BYTES) { ('a' + it % 26).code.toByte() }
+        assertEquals(0, t.paste(text).dropped)
+        assertEquals(KeyboardText.MAX_PASTE_BYTES, t.pendingInputBytes)
+        val got = t.readAll()
+        assertEquals(4096 + KeyboardText.MAX_PASTE_BYTES, got.size)
+        assertTrue(got.copyOfRange(4096, got.size).contentEquals(text))
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `canonicalで確定した行がいっぱいのときも、上限ちょうどの複数行の貼り付けは欠けない`() {
+        val t = tty()
+        // 確定した行で入力をいっぱいにする（canonical は確定の 1 バイトを残す）
+        val fill = "w".repeat(4094) + "\r"
+        assertEquals(0, t.paste(fill).dropped)
+        // 多バイト文字を含む行を、上限ちょうどになるまで並べる
+        val line = "あいう" + "x".repeat(54) + "\r" // 64 バイト
+        val text = line.repeat(KeyboardText.MAX_PASTE_BYTES / 64)
+        assertEquals(KeyboardText.MAX_PASTE_BYTES, text.toByteArray().size)
+        assertEquals(0, t.paste(text).dropped)
+        assertEquals("w".repeat(4094) + "\n", t.readBytes()!!.decodeToString())
+        val got = ArrayList<String>()
+        while (true) got += (t.readBytes() ?: break).decodeToString()
+        assertEquals(List(KeyboardText.MAX_PASTE_BYTES / 64) { line.replace('\r', '\n') }, got)
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `Ctrl+Dの印を読むと、読める入力がなくなるので、待っていた続きを入れて入らない分は捨てる`() {
+        val t = tty(input = 8)
+        t.key("\u0004")
+        // 印だけで読める。行に 7 バイト入り、残りは読めば空くかもしれないので待つ
+        t.paste("abcdefghij")
+        assertEquals(3, t.pendingInputBytes)
+        assertEquals(ReadResult.Eof, t.read(ByteArray(16), 0, 16, sink))
+        // 印を読んでも行の場所は空かないが、読める入力がなくなったので、続きを処理して入らない分は捨てる
+        assertEquals(0, t.pendingInputBytes)
+        assertEquals(3, t.droppedInputBytes)
+        t.key("\r")
+        assertEquals("abcdefg\n", t.readBytes()!!.decodeToString())
+    }
+
+    @Test
+    fun `Ctrl+Dの印の後に確定した行があれば、印を読んだ後も続きを待たせる`() {
+        val t = tty(input = 8)
+        t.key("\u0004")
+        t.key("ab\r")
+        t.paste("cdefgh")
+        // 入力 3 + 行 4 + 確定の 1 バイトでいっぱい
+        assertEquals(2, t.pendingInputBytes)
+        assertEquals(ReadResult.Eof, t.read(ByteArray(16), 0, 16, sink))
+        assertEquals(2, t.pendingInputBytes, "まだ読める行があるので待つ")
+        assertEquals("ab\n", t.readBytes()!!.decodeToString())
+        assertEquals(0, t.pendingInputBytes)
+        t.key("\r")
+        assertEquals("cdefgh\n", t.readBytes()!!.decodeToString())
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `rawで列を残したままcanonicalに戻すと、入力がいっぱいの間は待ち、読んだ後に行編集とエコー付きで入る`() {
+        val t = rawTty(input = 8)
+        t.paste("abcdefgh" + "ijk\u007f\r")
+        assertEquals(8, t.inputAvailable)
+        assertEquals(5, t.pendingInputBytes)
+        t.out()
+        t.setMode(TtyMode.COOKED, sink)
+        // 入力がいっぱい（文字の残りは負、LF も入らない）で読める入力があるので、続きは待つ
+        assertEquals(5, t.pendingInputBytes)
+        assertEquals("", t.out())
+        // raw でたまった分は確定した1つの塊として読める
+        assertEquals("abcdefgh", t.readBytes()!!.decodeToString())
+        // 続きは canonical で入る: Backspace が効き、CR は LF になって行を確定する
+        assertEquals(0, t.pendingInputBytes)
+        assertTrue(t.out().startsWith("ijk"), "続きはエコーする")
+        assertEquals("ij\n", t.readBytes()!!.decodeToString())
         assertEquals(0, t.droppedInputBytes)
     }
 

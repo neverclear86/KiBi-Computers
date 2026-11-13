@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.tty
 
 import pro.ikili.kibicomputers.core.display.CharWidth
+import pro.ikili.kibicomputers.core.input.KeyboardText
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
@@ -841,8 +842,11 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         /** エコーが出力の上限を超えて積める量（バイト。仮の値。確定は #251） */
         const val ECHO_SLACK_BYTES: Int = 1024
 
-        /** 入りきらなかった入力の待ちの列の上限（バイト。#609。1回の貼り付けの上限と同じ。仮の値。確定は #251） */
-        const val PENDING_INPUT_BYTES: Int = 8192
+        /**
+         * 入りきらなかった入力の待ちの列の上限（バイト。#609）。入力がいっぱいでも1回の貼り付けを欠けずに受けられるよう、
+         * 貼り付けの上限 [KeyboardText.MAX_PASTE_BYTES] に合わせる（2つがずれると #609 と同じく黙って欠ける。仮の値。確定は #251）
+         */
+        const val PENDING_INPUT_BYTES: Int = KeyboardText.MAX_PASTE_BYTES
 
         /** UTF-8 の1文字の最大のバイト数 */
         private const val MAX_CHAR_BYTES = 4

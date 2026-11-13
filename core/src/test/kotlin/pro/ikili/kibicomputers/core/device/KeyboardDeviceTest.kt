@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
+import pro.ikili.kibicomputers.core.input.KeyboardText
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
 import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
@@ -74,6 +75,24 @@ class KeyboardDeviceTest {
                 val tty = m.consoleTtyLocked()
                 assertEquals(1, tty.pendingInputBytes)
                 assertEquals(dropped, tty.droppedInputBytes)
+            }
+        }
+    }
+
+    @Test
+    fun `入力がいっぱいでも、貼り付けの上限ちょうどの貼り付けは全部受け付けて捨てない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val keyboard = KeyboardDevice()
+            m.devices.attach(KEYBOARD_ADDRESS, keyboard)
+            m.lock.withLock { m.consoleTtyLocked().setMode(TtyMode.RAW, m.wakeSink) }
+            assertEquals(MachineLimits.CONSOLE_INPUT_BYTES, keyboard.input(KeyboardEvent.Paste("f".repeat(MachineLimits.CONSOLE_INPUT_BYTES))))
+            assertEquals(KeyboardText.MAX_PASTE_BYTES, keyboard.input(KeyboardEvent.Paste("p".repeat(KeyboardText.MAX_PASTE_BYTES))))
+            m.lock.withLock {
+                val tty = m.consoleTtyLocked()
+                assertEquals(MachineLimits.CONSOLE_INPUT_BYTES, tty.inputAvailable)
+                assertEquals(KeyboardText.MAX_PASTE_BYTES, tty.pendingInputBytes)
+                assertEquals(0L, tty.droppedInputBytes)
             }
         }
     }
