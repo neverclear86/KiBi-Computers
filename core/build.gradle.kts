@@ -32,14 +32,17 @@ dependencies {
     api(libs.endive.wasm)
     // プレイヤーの WASM はランタイムコンパイラで動かす（#29 の決定、#37）。ASM が要る（MC ではローダーが持つものを使う）
     implementation(libs.endive.compiler)
+    // コンポーネントの検証（#262。ADR 0262）。wasm-tools を WASM にしたものを、Endive の WASI p1 の上で動かす。
+    // zerofs（仮想 FS）は validate では使わないので外す（テストでは下の testImplementation で足す）
+    implementation(libs.endive.wasi)
+    implementation(libs.endive.wasm.tools) { exclude(group = "io.roastedroot", module = "zerofs") }
+    // wasi と wasm-tools が依存し、ComponentValidator も直接使う（ログを黙らせる SystemLogger）
+    implementation(libs.endive.log)
     // `pro.ikili.kibicomputers.api` 以外の public には `@ApiStatus.Internal` を付ける（#366）。
     // 注釈は実行時に要らない（Minecraft も同じものを持つ）。使う側の IDE が警告を出せるよう、コンパイル時には見せる
     compileOnlyApi(libs.jetbrains.annotations)
 
-    // lua.wasm などの WASI p1 のプログラムをテストで動かすため（実行時のカーネルは自前の WASI を使う）
-    testImplementation(libs.endive.wasi)
-    // WIT（src/main/wit）を wasm-tools で解析するテスト（KibiWitParseTest。#75）。テストだけで使い、jarJar には入れない
-    testImplementation(libs.endive.wasm.tools)
+    // WIT（src/main/wit）を wasm-tools で解析するテスト（KibiWitParseTest。#75）の仮想 FS
     testImplementation(libs.zerofs)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)

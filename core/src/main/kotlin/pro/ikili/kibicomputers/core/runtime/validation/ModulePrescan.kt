@@ -1,6 +1,8 @@
 package pro.ikili.kibicomputers.core.runtime.validation
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryHeader
+import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryKind
 
 /**
  * ランタイムに渡す前の、WASM のバイナリの軽い確認（#40）。
@@ -40,6 +42,10 @@ internal object ModulePrescan {
         if (bytes.size > limits.maxBytes) fail("大きすぎる（${bytes.size} バイト。上限 ${limits.maxBytes}）")
         if (bytes.size < HEADER.size) fail("WASM のヘッダーがない")
         for (i in 0 until 4) if (bytes[i] != HEADER[i]) fail("WASM のヘッダーがない")
+        if (WasmBinaryHeader.kindOf(bytes) == WasmBinaryKind.COMPONENT) {
+            // コンポーネント（layer 1）は、重い検証をせずにすぐ断る（実行は #263 でつなぐ）
+            throw WasmLoadException("Component Model のコンポーネントは、まだ実行できない（#263）")
+        }
         for (i in 4 until 8) if (bytes[i] != HEADER[i]) fail("WASM のコアモジュール（version 1）ではない")
         val r = Reader(bytes, HEADER.size, bytes.size)
         while (r.pos < r.end) {

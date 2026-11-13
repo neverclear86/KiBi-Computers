@@ -48,5 +48,16 @@ object SmokeGameTests {
         helper.succeed()
     }
 
+    /**
+     * コンポーネントの検証器（wasm-tools を WASM にしたもの）を、ゲームの実行環境で読み込んで動かせる（#262）。
+     * 検証器の jar（`run.endive:wasi`・`wasm-tools`）の同梱と実行時クラスパスの配線が合っているかを確かめる。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun componentValidatorWorksOnServer(helper: GameTestHelper) {
+        helper.assertTrue(RuntimeSelfCheck.validatesComponent(), "the component validator should load and accept a minimal component")
+        helper.succeed()
+    }
+
     const val EMPTY: String = "empty"
 }
