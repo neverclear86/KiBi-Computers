@@ -1,0 +1,27 @@
+# basename(1)
+
+## NAME
+
+basename - strip directory and suffix from a path
+
+## SYNOPSIS
+
+    basename path [suffix]
+    basename -a [-s suffix] path...
+
+## DESCRIPTION
+
+Writes the last component of each path, without trailing slashes. If a suffix such as `.txt` is given and the name ends with it (and is not equal to it), the suffix is removed.
+
+## OPTIONS
+
+- `-a`: accept several paths
+- `-s suffix`: remove this suffix (implies `-a`)
+
+## EXAMPLES
+
+    basename /home/note.txt .txt
+
+## SEE ALSO
+
+dirname(1)

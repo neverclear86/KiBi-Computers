@@ -1,0 +1,35 @@
+# sh(1)
+
+## NAME
+
+sh - the command shell
+
+## SYNOPSIS
+
+    sh [-eux] [-c command [name [arg...]]]
+    sh [-eux] script [arg...]
+    sh [-eux] [-s] [arg...]
+
+## DESCRIPTION
+
+A POSIX-style shell: pipelines, lists, `if`, `while`, `for`, `case`, functions, redirections, here-documents, `$(...)`, parameter expansion and globbing. On a terminal it reads commands interactively with line editing, completion (Tab) and history (`~/.sh_history`).
+
+Built-in commands: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local` `history` `true` `false` `echo` `printf` `cd` `pwd` `read` `test` `[` `wait` `jobs` `command` `type` `source`.
+
+## OPTIONS
+
+- `-c`: run the command string
+- `-e`: exit when a command fails
+- `-u`: treat unset variables as errors
+- `-x`: print commands before running them
+- `-s`: read commands from standard input
+
+## ENVIRONMENT
+
+- `PATH`: where commands are looked up (default `/bin:/sbin`)
+- `HOME`: the directory for `cd` without an argument
+- `PWD`: the working directory
+
+## SEE ALSO
+
+intro(7), inittab(5)

@@ -1,0 +1,29 @@
+# kill(1)
+
+## NAME
+
+kill - send a signal to a process
+
+## SYNOPSIS
+
+    kill [-s signal | -signal] pid...
+    kill -l
+
+## DESCRIPTION
+
+Sends a signal (default `TERM`) to the processes. The kernel has four signals: `INT` (2), `QUIT` (3), `KILL` (9) and `TERM` (15). Names may be written with or without `SIG`, in any case.
+
+## OPTIONS
+
+- `-s signal`: the signal to send
+- `-l`: list the signal names
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+ps(1)

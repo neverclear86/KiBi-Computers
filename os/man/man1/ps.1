@@ -1,0 +1,21 @@
+# ps(1)
+
+## NAME
+
+ps - list processes
+
+## SYNOPSIS
+
+    ps [-e|-A]
+
+## DESCRIPTION
+
+Lists the processes of this computer with the columns `PID PPID STAT CMD`. STAT is `I` (starting), `R` (running), `S` (waiting) or `Z` (finished, not yet collected).
+
+## OPTIONS
+
+- `-e, -A`: also show finished processes that have no parent
+
+## SEE ALSO
+
+kill(1)

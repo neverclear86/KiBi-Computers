@@ -1,0 +1,29 @@
+# cp(1)
+
+## NAME
+
+cp - copy files and directories
+
+## SYNOPSIS
+
+    cp [-rR] source dest
+    cp [-rR] source... directory
+
+## DESCRIPTION
+
+Copies files. If the destination is a directory, each source is copied into it under the same name. A directory is never copied into itself. Symbolic links inside a copied tree are not copied.
+
+## OPTIONS
+
+- `-r, -R`: copy directories and their contents
+- `-f`: accepted and ignored
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+mv(1), rm(1)

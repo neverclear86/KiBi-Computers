@@ -1,0 +1,28 @@
+# head(1)
+
+## NAME
+
+head - output the first part of files
+
+## SYNOPSIS
+
+    head [-n lines | -c bytes] [file...]
+
+## DESCRIPTION
+
+Writes the first 10 lines of each file (or standard input). With two or more files, each is preceded by `==> name <==`.
+
+## OPTIONS
+
+- `-n lines`: write this many lines (also `-lines`)
+- `-c bytes`: write this many bytes
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+tail(1), cat(1)

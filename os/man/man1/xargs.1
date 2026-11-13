@@ -1,0 +1,34 @@
+# xargs(1)
+
+## NAME
+
+xargs - build and run commands from standard input
+
+## SYNOPSIS
+
+    xargs [-0rt] [-n max-args] [-I replace] [command [arg...]]
+
+## DESCRIPTION
+
+Reads words from standard input and runs the command (default `echo`) with them added as arguments. Words are separated by blanks and newlines; quotes and `\` can be used.
+
+## OPTIONS
+
+- `-0`: words are separated by NUL
+- `-n N`: at most N words per command
+- `-I replace`: run once per line, replacing the string in the arguments
+- `-r`: do not run the command when there are no words
+- `-t`: print each command before running it
+
+## EXIT STATUS
+
+- `0`: success
+- `123`: a command exited with 1 to 125
+- `124`: a command exited with 255
+- `125`: a command was killed by a signal
+- `126`: the command could not be started
+- `127`: the command was not found
+
+## SEE ALSO
+
+sh(1)

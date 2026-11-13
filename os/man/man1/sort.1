@@ -1,0 +1,28 @@
+# sort(1)
+
+## NAME
+
+sort - sort lines of text
+
+## SYNOPSIS
+
+    sort [-bfnru] [-k field[,field]] [-t char] [-o file] [file...]
+
+## DESCRIPTION
+
+Writes the lines of the files (or standard input) in order. The default order is by bytes. Lines with equal keys are ordered by the whole line. The whole input is kept in memory (up to 4 MiB and 262,144 lines).
+
+## OPTIONS
+
+- `-b`: ignore leading blanks in keys
+- `-f`: ignore case
+- `-n`: compare by leading number
+- `-r`: reverse the order
+- `-u`: write only the first of equal lines
+- `-k N[,M]`: use fields N to M as the key
+- `-t char`: field separator (default: blanks)
+- `-o file`: write to this file (may be an input)
+
+## SEE ALSO
+
+uniq(1)

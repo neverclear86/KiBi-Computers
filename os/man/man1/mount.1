@@ -1,0 +1,27 @@
+# mount(1)
+
+## NAME
+
+mount - mount a disk or list mounts
+
+## SYNOPSIS
+
+    mount
+    mount -l
+    mount [-r|-w] disk dir
+
+## DESCRIPTION
+
+Without arguments, lists mounts in the order they were added, as `source on dir type kind (ro|rw)`.
+
+With a disk and a directory, mounts the disk (`disk:ID`; `disk:` is added if missing) on the directory. The directory does not need to exist.
+
+## OPTIONS
+
+- `-l`: list inserted disks with their size, entry count and mount point
+- `-r`: mount read-only
+- `-w`: mount read-write (the default)
+
+## SEE ALSO
+
+umount(1), df(1)
