@@ -431,6 +431,23 @@ public class Machine private constructor(
     @Volatile
     private var rebootNotified = false
 
+    // ---- 起動ループの抑止（#635、ADR 0635）。どれも実行時だけで、保存しない。カーネルロックの中で読み書きする ----
+
+    /** 再起動の借り（[RebootBackoff]）。[stop] でだけ 0 に戻す */
+    private var rebootDebtTicks = 0L
+
+    /** 今の init が動き始めた tick（init を作った・復元で戻した tick）。動いていなければ `-1` */
+    private var initStartTick = -1L
+
+    /** 受け付けた [reboot] の、その起動で init が動いた tick 数。求めがなければ `-1` */
+    private var pendingRebootRanTicks = -1L
+
+    /**
+     * 再起動の通知を、この tick まで遅らせている（[rebootNotified] は立てたまま）。遅らせていなければ `0`。
+     * 期限に [MachineScheduler] が [wakeDeferredReboot] を呼ぶ。[stop]・[boot]・[coldBootAfterRestore] で下ろす
+     */
+    private var rebootDueTick = 0L
+
     // ---- 復元（#85、ADR 0085）。どれも実行時だけで、保存しない ----
 
     /**
@@ -838,6 +855,9 @@ public class Machine private constructor(
             bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            initStartTick = -1L
             lastBootConfigValue = config
             // 段の印と同じ区間で、この起動が頼るディスクを今の表にする（#56）
             beginPhaseDisksLocked()
@@ -907,6 +927,9 @@ public class Machine private constructor(
             bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            initStartTick = -1L
             beginPhaseDisksLocked()
         } finally {
             lock.unlock()
@@ -955,6 +978,8 @@ public class Machine private constructor(
             releaseLocked(claim)
         }
         setStateLocked(MachineState.RUNNING, null)
+        // 戻した init は、ここから動いたと数える（起動ループの抑止。#635）
+        initStartTick = scheduler.now
         // 「保存から戻った」を知らせる（#87、ADR 0087）。索引と待ちを戻した後なので、戻したキューに届き、待っているプロセスが起きる。
         // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
         // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
@@ -1106,12 +1131,20 @@ public class Machine private constructor(
      * 起動の途中なら、それを取り消してから同じようにする。どのスレッドから呼んでもよい。待たずに返す。
      * 求めた後に [stop] すると、再起動を取り消す。
      *
+     * 短い間に繰り返すと、止まった後、[MachineHost.onRebootRequested] を呼ぶまで待つ（起動ループの抑止。#635、ADR 0635。
+     * [RebootBackoff]）。待つ間も再起動の途中（[isRebootPending]）で、受け付けたことは変わらない
+     *
      * @return 受け付けたら `true`。一度も [boot] していない、[MachineState.CRASHED]、スケジューラが閉じているなら `false`
      */
     public fun reboot(): Boolean {
         lock.lock()
         try {
             if (lastBootConfigValue == null || scheduler.isClosed || stateValue == MachineState.CRASHED) return false
+            // この起動で init が動いた時間を、求めを受け付けたときに数える（重ねて呼んだ分は数え直さない。#635）
+            if (!rebootRequested && !rebootNotified) {
+                val start = initStartTick
+                pendingRebootRanTicks = if (start >= 0 && stateValue == MachineState.RUNNING && !bootingValue) scheduler.now - start else 0L
+            }
             rebootRequested = true
             stopLocked(null)
             maybePostRebootLocked()
@@ -1131,6 +1164,10 @@ public class Machine private constructor(
         try {
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            // 止めたら借りを返す（電源を切った・ゲストの shutdown。#635）
+            rebootDebtTicks = 0L
             stopLocked(null)
         } finally {
             lock.unlock()
@@ -1311,6 +1348,7 @@ public class Machine private constructor(
             // ここからは投げない処理だけ（巻き戻せないので）
             if (stateValue == MachineState.STOPPED) setStateLocked(MachineState.RUNNING, null)
             if (asInit) {
+                initStartTick = scheduler.now
                 // 起動中の印は、RUNNING にした後に下ろす（この順番は不変条件。ロックを取らずに読む [isRunningOrBooting] が、
                 // 区間の途中で「止まっていて起動中でもない」に見えないように。#625、ADR 0049）。
                 // ここより前（引き返せない点の前）で例外が出たら、足した分を巻き戻してから（#629）、印が立ったまま起動の手順に返り、
@@ -2894,17 +2932,56 @@ public class Machine private constructor(
         return if (cleaned.length <= MAX_LABEL_CHARS) cleaned else cleaned.take(MAX_LABEL_CHARS) + "..."
     }
 
-    /** 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中） */
+    /**
+     * 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中）。
+     * 短い間に繰り返していれば、積まずに期限の tick まで遅らせる（[RebootBackoff]。#635）。どのスレッドからも呼ばれるので、
+     * ここでは期限を決めるだけで、host は呼ばない
+     */
     private fun maybePostRebootLocked() {
         if (!rebootRequested || bootingValue || stateValue != MachineState.STOPPED) return
         if (kernel.processes.liveCount() > 0 || registeredThreads > 0) return
+        if (rebootNotified) {
+            // もう通知を積んだか、遅らせている（重ねて呼んだ reboot）。今の予定のままにし、借りも増やさない
+            rebootRequested = false
+            return
+        }
+        val step = scheduler.options.rebootBackoff.next(rebootDebtTicks, pendingRebootRanTicks.coerceAtLeast(0))
+        rebootDebtTicks = step.debtTicks
+        pendingRebootRanTicks = -1L
+        initStartTick = -1L
         // 通知の印を立ててから求めの印を下ろす（この順番は不変条件。ロックを取らずに読む [isRunningBootingOrRebooting] が、
         // 間で「再起動の途中でない」と見ないため。#626）
         rebootNotified = true
         scheduler.hooks.duringRebootPost?.invoke(this)
         rebootRequested = false
-        postNotification(HostNotification.RebootRequested)
+        if (step.delayTicks > 0) {
+            // 待つ間も rebootNotified は立てたまま（再起動の途中。保存しない・isRebootPending・stop で取り消す、は今までどおり）
+            val due = scheduler.now + step.delayTicks
+            rebootDueTick = due
+            scheduler.wakeAtTick(this, due)
+        } else {
+            postNotification(HostNotification.RebootRequested)
+        }
     }
+
+    /**
+     * 遅らせた再起動の期限の tick に、[MachineScheduler] がメインスレッドから呼ぶ（#635）。まだ待っていて期限が来ていれば、
+     * 再起動の通知を積む（同じ tick の中で配る）。取り消された・起動し直した・新しい期限に替わったなら何もしない
+     */
+    internal fun wakeDeferredReboot() {
+        lock.withLockValue {
+            val due = rebootDueTick
+            if (!rebootNotified || due == 0L || scheduler.now < due) return@withLockValue
+            rebootDueTick = 0L
+            postNotification(HostNotification.RebootRequested)
+        }
+    }
+
+    /** テスト用: 遅らせている再起動の期限の tick（遅らせていなければ `0`） */
+    internal val deferredRebootDueTick: Long get() = lock.withLockValue { rebootDueTick }
+
+    /** テスト用: 再起動の借り（tick） */
+    internal val rebootDebt: Long get() = lock.withLockValue { rebootDebtTicks }
 
     /**
      * 起動の手順の始め（起動用のスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、
@@ -3158,7 +3235,8 @@ public class Machine private constructor(
                 is HostNotification.BootFailed -> safely { host.onBootFailed(this, n.failure, n.detail) }
                 HostNotification.RebootRequested -> {
                     // 積んだ後に stop() されたら、再起動しない
-                    val go = lock.withLockValue { rebootNotified.also { rebootNotified = false } }
+                    // 遅らせている間（期限の前）は配らない（積んだのは期限が来た後だけなので、普通は起きない。#635）
+                    val go = lock.withLockValue { (rebootNotified && rebootDueTick == 0L).also { if (it) rebootNotified = false } }
                     if (go) safely { host.onRebootRequested(this) }
                 }
                 is HostNotification.Console, HostNotification.TtyOutput -> Unit

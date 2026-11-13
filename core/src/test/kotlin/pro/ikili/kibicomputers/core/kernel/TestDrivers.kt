@@ -132,11 +132,13 @@ internal class Harness(
     moduleLimits: ModuleLimits? = if (execRuntime != null) ModuleLimits.DEFAULT else null,
     /** モジュールの置き場（#82）。既定はメモリ上のもの。[program] で作ったモジュールはここに置く */
     val moduleStore: ModuleStore = MemoryModuleStore(),
+    /** ゲストの再起動で起動し直すまでの待ち（#635） */
+    rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff),
     )
     private var counter = 0
 
