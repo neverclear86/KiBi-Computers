@@ -2,14 +2,14 @@
 
 - 状態: 採用
 - Issue: #75（task）。前提: ADR 0058（fd 表）、0059（パイプ）、0070（p1 の fd_*）、0072（p1 の `poll_oneoff`）、0073（`kibi:*` の WIT と p1 の import の導き方）
-- 後続: #427（`kibi:io/tty`）、#74（`spawn-options.fds` で子に渡す）、#101（シェルの `|`）、#264・#266（p2・p3 の層）、#116（SDK の `dup`・`dup2`・`pipe`）、#251（仮の値の確定）
+- 後続: #427（`kibi:io/tty`）、#74（`spawn-options.fds` で子に渡す）、#101（シェルの `|`）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#116（SDK の `dup`・`dup2`・`pipe`）、#251（仮の値の確定）
 - ABI の選択（p1 だけの `fd`・`pipe`、p2/p3 は仮置き、複製は p1 だけ など）は、#75 のプランへのオーナーの回答（Q1〜Q8）で決めた
 
 ## 決めたこと（要約）
 
 - `kibi:io@0.1.0` に、p1 だけの `fd`（`dup`・`dup-to`）と `pipe`（`create`）、p2 だけの `pipe-streams`、p3 だけの `pipe-async` を置く
 - p1 向けの import は ADR 0073 の規則で WIT から導く。どれも待たず、`cabi_realloc` も要らない
-- p2・p3 の分（`pipe-streams`・`pipe-async`）は WIT とこの ADR だけで、実装しない。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#264・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）
+- p2・p3 の分（`pipe-streams`・`pipe-async`）は WIT とこの ADR だけで、実装しない。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#685・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。足した型はすべて Kotlin の `internal`。新しく持つ状態はない（パイプの端・中身は既に `KernelState` のオブジェクト表にあり、fd 表の項目の形も同じ）
 
 ## WIT
@@ -118,6 +118,6 @@ world imports-p3 { import pipe-async; }
 
 - TTY: #427
 - 子プロセスへの渡し方: #74
-- p2・p3 の層の実装と、仮置きの WIT の確定: #264・#266
+- p2・p3 の層の実装と、仮置きの WIT の確定: p2 は #685、p3 は #266
 - 生成した束縛と libc 風の関数: SDK #116
 - パイプの容量と燃料の確定: #251
