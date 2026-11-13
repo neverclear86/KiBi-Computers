@@ -768,6 +768,31 @@ class NanoEditorTest {
     }
 
     @Test
+    fun `1行の画面でも、ヘルプを0行目に出して、動かして、^Xで本文に戻る`() = nano(
+        listOf("r.txt"),
+        files = mapOf("/home/r.txt" to "abcdef\n".toByteArray()),
+        columns = 40,
+        rows = 1,
+    ) {
+        // 起動の知らせが出ている最初のキーでヘルプを開く（知らせはキーで消え、ヘルプの間は出ない）
+        assertTrue(row(0).trim().startsWith("[ Read 1 line"), screen)
+        keys("\u0007")
+        assertEquals("KiBi nano help", row(0))
+        assertFalse(row(0).contains("Read 1 line"), screen)
+        assertFalse(row(0).contains("abcdef"), screen)
+        // 1 行ずつ動く（本文の行は 1 行だけ）
+        keys(down + down)
+        assertTrue(row(0).startsWith("Type to insert text"), screen)
+        keys(up + up)
+        assertEquals("KiBi nano help", row(0))
+        keys(ctrlX)
+        assertEquals("abcdef", row(0))
+        assertEquals(0 to 0, host.cursor())
+        keys(ctrlX)
+        assertEquals(0, finish())
+    }
+
+    @Test
     fun `2行の画面では、タイトルを出さずに本文1行と状態の行にする`() = nano(
         listOf("r.txt"),
         files = mapOf("/home/r.txt" to "abcdef\nsecond\nthird\n".toByteArray()),
