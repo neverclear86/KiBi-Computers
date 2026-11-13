@@ -96,6 +96,42 @@ class CoreLogRoutingTest {
     }
 
     @Test
+    fun restoresParentHandlersWhenHandlerIsClosedByLogManagerReset() {
+        val toParent = Collections.synchronizedList(ArrayList<String>())
+        val capture = object : Handler() {
+            override fun publish(record: LogRecord) {
+                if (record.loggerName?.startsWith(root) == true) toParent += record.message
+            }
+
+            override fun flush() = Unit
+
+            override fun close() = Unit
+        }
+        val handle = CoreLogRouting.install(sink, root)
+        assertNotNull(handle)
+        val jdkRoot = Logger.getLogger("")
+        try {
+            // LogManager.reset() が、ロガーのハンドラーを外して close() するところまでを再現する
+            val logger = Logger.getLogger(root)
+            for (h in logger.handlers) {
+                logger.removeHandler(h)
+                h.close()
+            }
+            jdkRoot.addHandler(capture)
+            System.getLogger("$root.child").log(System.Logger.Level.WARNING, "reset の後")
+            assertEquals(listOf("reset の後"), toParent.toList())
+            assertEquals(emptyList<String>(), lines.map { it.message })
+            // 取り付けは解けているので、同じ root にまた付けられる
+            val again = CoreLogRouting.install(sink, root)
+            assertNotNull(again)
+            again!!.close()
+        } finally {
+            jdkRoot.removeHandler(capture)
+            handle!!.close()
+        }
+    }
+
+    @Test
     fun secondInstallForSameRootDoesNothing() {
         val first = CoreLogRouting.install(sink, root)
         try {

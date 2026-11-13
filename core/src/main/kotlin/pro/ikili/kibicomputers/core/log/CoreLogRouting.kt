@@ -65,6 +65,8 @@ public fun interface CoreLogSink {
  * 探されず、MOD の jar の中からは効かないので使わない。
  *
  * - 親（root の `ConsoleHandler`）には流さない（同じ行が標準エラーに二重に出ないように）。
+ * - 実行中に JUL が設定し直されて（`LogManager.reset()` / `readConfiguration()`）ハンドラーが外されたら、
+ *   取り付けを解いて親に流す設定を戻す。以後のログは標準エラーなど親の出力先に出る（sink には来ない）。
  * - JUL の `LogManager` が JDK のものでない環境（log4j-jul などに差し替えた環境）では、何もしない。
  * - JUL のロガーは弱い参照でしか持たれないので、取り付けたロガーはここで強く持つ。
  */
@@ -103,7 +105,7 @@ public object CoreLogRouting {
         private val logger: Logger,
         sink: CoreLogSink,
     ) : AutoCloseable {
-        private val handler = SinkHandler(sink)
+        private val handler = SinkHandler(sink) { close() }
         private var previousLevel: Level? = null
         private var previousUseParent: Boolean = true
 
@@ -132,7 +134,7 @@ public object CoreLogRouting {
         }
     }
 
-    private class SinkHandler(private val sink: CoreLogSink) : Handler() {
+    private class SinkHandler(private val sink: CoreLogSink, private val onClose: () -> Unit) : Handler() {
         private val formatter = SimpleFormatter()
 
         init {
@@ -153,6 +155,12 @@ public object CoreLogRouting {
 
         override fun flush(): Unit = Unit
 
-        override fun close(): Unit = Unit
+        /**
+         * `LogManager.reset()` / `readConfiguration()` は、ロガーからハンドラーを外すときに `close()` を呼ぶ。
+         * そのとき `useParentHandlers` は元に戻らない（reset が消すのはハンドラーとレベルだけ）ので、ここで取り付けを
+         * 解いて親に流す設定を戻す。戻さないと、別の MOD やライブラリが実行中に JUL を設定し直したときに、
+         * ログが sink にも親にも流れず、黙って消える。
+         */
+        override fun close(): Unit = onClose()
     }
 }
