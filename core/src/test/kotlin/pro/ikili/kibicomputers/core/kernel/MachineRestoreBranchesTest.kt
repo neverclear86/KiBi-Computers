@@ -705,14 +705,8 @@ class MachineRestoreBranchesTest {
                 m.state == MachineState.CRASHED
             }
             h.scheduler.hooks.duringRestoreInstall = null
-            // state は stopLocked の途中（setStateLocked(CRASHED) の直後）で見えるので、ここで見ると復元の quiesce を閉じる前かもしれない。
-            // stopLocked・discard・vfs の後始末はどれも起動用スレッドで走るので、そこが空になるのを待ってから見る
-            val drained = { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
-            eventually(10_000, "起動用スレッドの後始末が終わらない") { drained() }
-            // 後始末が全部終わった後に tick して、知らせが積まれていないことを見る（積む退行があっても、先の tick に間に合わないと見えないため）
-            repeat(3) { h.scheduler.tick() }
-            eventually(10_000, "tick の後で起動用スレッドが空にならない") { drained() }
-            repeat(3) { h.scheduler.tick() }
+            // state は stopLocked の途中で見えるので、後始末が終わるまで待ってから見る（Harness.awaitRestoreCleanup）
+            h.awaitRestoreCleanup(m)
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             assertFalse(m.isRestoring)

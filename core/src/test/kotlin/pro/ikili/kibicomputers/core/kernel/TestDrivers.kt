@@ -211,6 +211,23 @@ internal fun eventuallyDescribe(timeoutMillis: Long = 5_000, describe: () -> Str
     }
 }
 
+/**
+ * 後段の失敗で CRASHED を見た後、後始末が終わるまで待ってから tick する（#669。MachineRestoreTest と MachineRestoreBranchesTest が使う）。
+ *
+ * state はロックを取らずに読むので、stopLocked の途中（setStateLocked(CRASHED) の直後で、復元の quiesce を閉じる前、
+ * 通知を積む前）で見えることがある。マシンのロックを一度取って completeRestore のロックの区間が終わるのを待ち、
+ * ロックの外の後始末（discard など）を走らせる起動用スレッドが空になるのも待つ。その後に tick して、知らせが積まれて
+ * いないこと（積む退行があっても、先の tick に間に合わないと見えないため）と CRASHED の通知を見る
+ */
+internal fun Harness.awaitRestoreCleanup(m: Machine) {
+    m.lock.withLockValue { }
+    val drained = { scheduler.bootExecutor.activeCount == 0 && scheduler.bootExecutor.queue.isEmpty() }
+    eventually(10_000, "起動用スレッドの後始末が終わらない") { drained() }
+    repeat(3) { scheduler.tick() }
+    eventually(10_000, "tick の後で起動用スレッドが空にならない") { drained() }
+    repeat(3) { scheduler.tick() }
+}
+
 /** 名前が `KiBi-` で始まるスレッドが残っていない */
 internal fun assertNoKernelThreads() {
     eventually(5_000, "カーネルのスレッドが残っている: ${kernelThreadNames()}") { kernelThreadNames().isEmpty() }
