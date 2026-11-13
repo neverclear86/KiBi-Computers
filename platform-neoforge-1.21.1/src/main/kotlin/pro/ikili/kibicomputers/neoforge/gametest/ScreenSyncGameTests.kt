@@ -480,7 +480,7 @@ object ScreenSyncGameTests {
         val level = helper.level
         val here = ChunkPos(helper.absolutePos(POS))
         // 届いたチャンクの画面は、見られる
-        helper.assertTrue(ScreenSync.isChunkSent(level, player, here), "the test chunk should have been sent")
+        helper.assertTrue(ScreenSync.isChunkProbablySent(level, player, here), "the test chunk should have been sent")
         val near = ScreenSync.Host(helper.getBlockEntity<ScreenBlockEntity>(POS)).distanceSquared(player)
         helper.assertTrue(near.isFinite(), "a screen in a sent chunk should be visible but was $near")
         // テストの場所から離れたチャンクを、同期の読み込み（一時的なチケット）で FULL まで読み込む。ブロックが tick する段には
@@ -497,7 +497,7 @@ object ScreenSyncGameTests {
             player.setChunkTrackingView(ChunkTrackingView.of(here, 64))
             helper.assertTrue(player.chunkTrackingView.contains(far), "the far chunk should be in the tracking view")
             helper.assertTrue(!player.connection.chunkSender.isPending(far.toLong()), "the far chunk should not be pending")
-            helper.assertTrue(!ScreenSync.isChunkSent(level, player, far), "the far chunk should not count as sent")
+            helper.assertTrue(!ScreenSync.isChunkProbablySent(level, player, far), "the far chunk should not count as sent")
             val d = ScreenSync.Host(farScreen!!).distanceSquared(player)
             helper.assertTrue(d == Double.POSITIVE_INFINITY, "a screen in a chunk not yet sent should not be visible but was $d")
         } finally {

@@ -156,7 +156,7 @@ object ScreenSync {
     /**
      * 1つの画面の [ScreenWatchers] に、プレイヤーの位置を教え、フラグメントを送る口。
      * 画面のチャンクがプレイヤーに届いていない（追跡していない、まだ送れる状態になっていない、送る順番を待っている）間は、
-     * 見られないものとする（[isChunkSent]）。
+     * 見られないものとする（[isChunkProbablySent]）。
      */
     internal class Host(private val screen: ScreenBlockEntity) : ScreenSyncHost<ServerPlayer> {
         private val center = Vec3.atCenterOf(screen.blockPos)
@@ -170,7 +170,7 @@ object ScreenSync {
                 return Double.POSITIVE_INFINITY
             }
             val level = screen.level as? ServerLevel ?: return Double.POSITIVE_INFINITY
-            if (!isChunkSent(level, player, chunk)) return Double.POSITIVE_INFINITY
+            if (!isChunkProbablySent(level, player, chunk)) return Double.POSITIVE_INFINITY
             return center.distanceToSqr(player.eyePosition)
         }
 
@@ -181,15 +181,28 @@ object ScreenSync {
     }
 
     /**
-     * [chunk] がもう [player] に送られたか（クライアントがチャンクを持っているはずか）。メインスレッドから呼ぶ。
+     * [chunk] がもう [player] に送られたとみなしてよいか。メインスレッドから呼ぶ。
      *
-     * サーバーはチャンクを、追跡の範囲に入っただけでは送らず、送れる状態（[net.minecraft.server.level.ChunkMap.getChunkToSend]。
-     * ブロックが tick する段まで読み込み終えたもの）になってから送る順番待ちに入れる。画面のブロックエンティティは、その前の段
-     * （FULL）で読み込まれるので、追跡の範囲に入っていて順番待ちでもないのに、まだ送っていないことがある。その間に送った画面の中身は、
-     * クライアントがチャンクを持っていないので捨てられ、サーバーは送れたものとして差分しか送らない（#636。ワールドに入り直した直後、
-     * 画面が空のままになった）。
+     * 送った事実を記録しているのではなく、「追跡の範囲に入っている・送る順番待ちでない・いま送れる状態
+     * （[net.minecraft.server.level.ChunkMap.getChunkToSend] が null でない）」から推し量っている。
+     *
+     * サーバーはチャンクを、追跡の範囲に入っただけでは送らず、送れる状態（ブロックが tick する段まで読み込み終え、
+     * `ChunkHolder` の送る前の待ち（`sendSync`）も終わったもの）になってから送る順番待ちに入れる。画面のブロックエンティティは、
+     * その前の段（FULL）で読み込まれるので、追跡の範囲に入っていて順番待ちでもないのに、まだ送っていないことがある。その間に送った
+     * 画面の中身は、クライアントがチャンクを持っていないので捨てられ、サーバーは送れたものとして差分しか送らない（#636。ワールドに
+     * 入り直した直後、画面が空のままになった）。
+     *
+     * ふつうの経路（tick する段になるのと同じ呼び出しの中で順番待ちに入る）では、送れる状態と送ったことは一致する。ずれるのは、
+     * `ChunkMap.waitForLightBeforeSending` で送る前にライトの処理を待たせたチャンク（バニラでは End の出口ポータルの周り。
+     * 他 MOD も呼べる）だけ:
+     * - 既に届いているチャンクでも、ライトの処理が終わるまで偽になる。見ている人から外れ、次に見はじめる（キーフレームを送り直す）
+     *   まで、その画面は更新されない
+     * - 待ちが終わってから順番待ちに入れるタスク（メインスレッドに積まれる）が走るまでの間は、まだ送っていないのに真になる。
+     *   その間にキーフレームを送ると、#636 と同じように捨てられる
+     *
+     * 送った事実をプレイヤーごとに記録すれば、どちらも起きない（#655）。
      */
-    internal fun isChunkSent(level: ServerLevel, player: ServerPlayer, chunk: ChunkPos): Boolean {
+    internal fun isChunkProbablySent(level: ServerLevel, player: ServerPlayer, chunk: ChunkPos): Boolean {
         if (!player.chunkTrackingView.contains(chunk)) return false
         val key = chunk.toLong()
         if (player.connection.chunkSender.isPending(key)) return false
