@@ -257,6 +257,48 @@ class ComponentLoaderTest {
         assertMessage(e, "時間の上限")
     }
 
+    private fun leb(v: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var x = v
+        do {
+            var b = x and 0x7f
+            x = x ushr 7
+            if (x != 0) b = b or 0x80
+            out.write(b)
+        } while (x != 0)
+        return out.toByteArray()
+    }
+
+    /** bool が [elements] 個の tuple を [tuples] 個並べた型のセクションだけのコンポーネント（検証には通らない） */
+    private fun tuples(tuples: Int, elements: Int): ByteArray {
+        val body = java.io.ByteArrayOutputStream()
+        body.write(leb(tuples))
+        repeat(tuples) {
+            body.write(0x6f)
+            body.write(leb(elements))
+            repeat(elements) { body.write(0x7f) }
+        }
+        val section = java.io.ByteArrayOutputStream()
+        section.write(byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x07))
+        section.write(leb(body.size()))
+        section.write(body.toByteArray())
+        return section.toByteArray()
+    }
+
+    @Test
+    fun `デコードする要素の総数に上限がある`() {
+        // 1 つのベクターは上限に収まる小さな tuple でも、並べた合計で断る（掛け合わせた確保を抑える）
+        val limits = ComponentLimits(maxDecodedItems = 2_500)
+        assertDoesNotThrow { ComponentParser.parse(tuples(2, 1_000), limits, null) }
+        val e = assertThrows<WasmLoadException> { ComponentParser.parse(tuples(3, 1_000), limits, null) }
+        assertMessage(e, "デコードする要素の総数が上限 2500")
+        // 既定の上限でも、1 つのベクターが上限に収まる tuple を重ねたものは、検証の前に断る
+        assertMessage(
+            assertThrows<WasmLoadException> { ComponentParser.parse(tuples(10, 99_000), ComponentLimits.DEFAULT, null) },
+            "デコードする要素の総数",
+        )
+    }
+
     /** 2 回ずつインスタンス化する入れ子を [levels] 段重ねたもの（core のインスタンスは 2^levels 個） */
     private fun doubling(levels: Int): ByteArray {
         val sb = StringBuilder("(component \$root\n")
@@ -369,7 +411,6 @@ class ComponentLoaderTest {
 
     @Test
     fun `同時に検証しても結果が変わらない`() {
-        val bad = full.copyOf().also { it[it.size - 1] = 0x7f }
         val pool = Executors.newFixedThreadPool(4)
         try {
             val tasks = (0 until 16).map { i ->
@@ -391,14 +432,30 @@ class ComponentLoaderTest {
         } finally {
             pool.shutdownNow()
         }
-        // 壊れたものは何度でも同じように断る
-        val first = runCatching { ComponentLoader.load(bad) }.exceptionOrNull()?.message
-        val second = runCatching { ComponentLoader.load(bad) }.exceptionOrNull()?.message
-        assertEquals(first, second)
     }
 
     @Test
-    fun `検証用の写しは関数の本体だけを除く`() {
+    fun `壊れたものは何度でも同じメッセージで断る`() {
+        // 71 バイト目を 0 にすると、wasm-tools が検証に失敗する（DWARF の読み直しのログも出る）。load が成功する壊し方だと確かめにならない
+        val bad = full.copyOf().also { it[70] = 0 }
+        val first = rejects(bad).message!!
+        assertMessage(rejects(bad), "検証に通らない")
+        assertEquals(first, rejects(bad).message)
+        // 時刻つきのログの行は、メッセージに入らない（秒をまたいでも変わらない）
+        assertTrue(!first.contains("WARN") && !Regex("""\d{4}-\d{2}-\d{2}T""").containsMatchIn(first)) { first }
+    }
+
+    @Test
+    fun `検証器の標準エラー出力から理由だけを取り出す`() {
+        val log = "[2026-11-13T00:36:39Z WARN ] failed to parse DWARF information: function section is absent (at offset 0x5d)"
+        assertEquals("unknown function 0", ComponentValidator.reason("$log\nerror: unknown function 0\n"))
+        assertEquals("unknown function 0", ComponentValidator.reason("error: unknown function 0\n"))
+        assertEquals("a\nb", ComponentValidator.reason("[2026-11-13T00:36:39Z INFO  ] x\nerror: a\nb"))
+        assertEquals("", ComponentValidator.reason(log))
+    }
+
+    @Test
+    fun `検証用の写しはcoreモジュールの中身を確かめない`() {
         val root = ComponentParser.parse(full, ComponentLimits.DEFAULT, null)
         val image = ValidationImage.of(full, root)
         val parsed = ComponentParser.parse(image, ComponentLimits.DEFAULT, null)
@@ -409,7 +466,7 @@ class ComponentLoaderTest {
         )
         assertEquals(root.allCoreModules().size, parsed.allCoreModules().size)
         assertDoesNotThrow { ComponentValidator.validate(image) }
-        // 関数の本体の誤りは、ここでは見ない（p1 と同じく、Endive が読み込むときに検証する。#263）
+        // core モジュールの中身（関数の本体、カスタム セクションの壊れ）は、ここでは見ない（Endive が読み込むときに確かめる。#263）
         val badBody = wat("(component (core module (func (result i32) i64.const 0)))")
         assertDoesNotThrow { ComponentLoader.load(badBody) }
         assertThrows<WasmLoadException> { ComponentValidator.validate(badBody) }

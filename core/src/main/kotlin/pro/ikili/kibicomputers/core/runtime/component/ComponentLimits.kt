@@ -7,6 +7,8 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
  * 値はどれも仮の値（確定は #251）。
  *
  * 小さなバイト列で大きな確保や長い処理をさせるのを、自前のパーサー（[ComponentParser]）が読むときに断る。
+ * デコードした木のメモリは、種類ごとの数の上限ではなく、デコードする要素の総数（[maxDecodedItems]）で抑える
+ * （1 バイトの要素ごとにオブジェクトができるので、入力のバイト数だけでは抑えられない）。
  * 数はどれも、入れ子のコンポーネントも含めたバイナリ全体の合計で数える。中のコアモジュールには、
  * それぞれ [moduleLimits] を当てる（`ModulePrescan`）。バイト数の上限と時間の上限は [moduleLimits] のものを使う
  * （実行ファイルの大きさの上限と同じ 16 MiB、検証の時間は 8 秒）。
@@ -34,6 +36,12 @@ internal class ComponentLimits(
     val maxInstances: Int = 10_000,
     /** 1 つのベクター（record のフィールド、引数、canon の option など）の要素の数 */
     val maxVectorItems: Int = 100_000,
+    /**
+     * デコードする要素の総数（ベクターの要素の合計。入れ子のコンポーネントも含めたバイナリ全体）。
+     * 木のメモリは、この数にほぼ比例する（1 要素あたり 20〜100 バイトほど。名前を持つものが重い）ので、
+     * 最悪でも数十 MiB に収まる値にする。ベクターを読む前に、その要素の数を足して確かめる
+     */
+    val maxDecodedItems: Int = 500_000,
     /** 名前（import・export・フィールドの名前、カスタム セクションの名前）のバイト数 */
     val maxNameBytes: Int = 4096,
     /** 型の入れ子の深さ（コンポーネント型・インスタンス型・モジュール型の中の宣言の段数） */

@@ -14,4 +14,9 @@ class RuntimeSelfCheckTest {
     fun `セルフチェックが成功する`() {
         assertTrue(RuntimeSelfCheck.isWorking())
     }
+
+    @Test
+    fun `コンポーネントの検証器を動かせる`() {
+        assertTrue(RuntimeSelfCheck.validatesComponent())
+    }
 }

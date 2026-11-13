@@ -107,12 +107,27 @@ internal object ComponentValidator {
             throw WasmLoadException("コンポーネントの検証が異常終了した（メモリの上限を超えた、など）: $e", e)
         }
         if (exit != 0) {
-            val message = stderr.text().trim().removePrefix("error: ").let {
+            val message = reason(stderr.text()).let {
                 if (it.length > MAX_MESSAGE_CHARS) it.take(MAX_MESSAGE_CHARS) + "…" else it
             }
             throw WasmLoadException("コンポーネントの検証に通らない: $message")
         }
     }
+
+    /** ログの行（`[2026-11-13T00:36:39Z WARN ] ...`。時刻が入る）。失敗の理由ではない */
+    private val LOG_LINE = Regex("""^\[\S+\s+(?:ERROR|WARN|INFO|DEBUG|TRACE)\s*].*""")
+
+    /**
+     * 標準エラー出力から、失敗の理由を取り出す。wasm-tools は検証に失敗すると、DWARF の読み直しなどのログ
+     * （時刻つき）を先に出すことがあるので、ログの行は除き、先頭の `error: ` も取る。
+     * 同じバイナリなら呼ぶたびに同じメッセージになるようにするため
+     */
+    internal fun reason(stderr: String): String =
+        stderr.lineSequence()
+            .filterNot { LOG_LINE.matches(it.trim()) }
+            .joinToString("\n")
+            .trim()
+            .removePrefix("error: ")
 
     /** wasm-tools を動かし、終了コードを返す */
     private fun run(m: WasmModule, bytes: ByteArray, stderr: OutputStream): Int {
@@ -122,6 +137,8 @@ internal object ComponentValidator {
             .withStderr(stderr, false)
             // 乱数はハッシュの種などにだけ使われる。結果を決定的にするため固定する
             .withRandom(Random(0x262))
+            // ログ（時刻つき）を出させない。理由の取り出し（[reason]）でも除く
+            .withEnvironment("RUST_LOG", "off")
             .withArguments(listOf("wasm-tools", "validate", "--features=$FEATURES", "-"))
             .build()
         WasiPreview1.builder().withLogger(quiet).withOptions(options).build().use { wasi ->

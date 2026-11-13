@@ -42,7 +42,7 @@ internal class LoadedComponent(
  * 3. 自前のパーサーで、構造の上限を確かめながら読む（[ComponentParser]）
  * 4. 中の各 core モジュールに、p1 と同じ構造の確認（`ModulePrescan`）を当てる
  * 5. wasm-tools で検証する（[ComponentValidator]）。core モジュールの関数の本体は除いた写し（[ValidationImage]）を渡す。
- *    本体は、p1 と同じく Endive が読み込むとき（#263）に検証する
+ *    本体と、core モジュールのカスタム セクションの壊れなどは、p1 と同じく Endive が読み込むとき（#263）に確かめる
  * 6. import の形（[ComponentImportPolicy]）と、core モジュールが予約したモジュール名を import していないこと
  * 7. 入れ子を展開した後のインスタンスの数（[ComponentExpansion]）
  *

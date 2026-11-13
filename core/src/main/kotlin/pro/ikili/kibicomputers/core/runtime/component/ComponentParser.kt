@@ -70,6 +70,9 @@ internal object ComponentParser {
         var canons = 0
         var instances = 0
         var items = 0
+
+        /** デコードしたベクターの要素の合計（木のメモリの目安） */
+        var decoded = 0L
     }
 
     private class State(val bytes: ByteArray, val limits: ComponentLimits, val deadline: LoadDeadline?) {
@@ -78,6 +81,12 @@ internal object ComponentParser {
         /** 要素を1つ読むたびに呼ぶ。一定の間隔で時間の上限を確かめる */
         fun tick() {
             if (++totals.items % DEADLINE_INTERVAL == 0) deadline?.check("コンポーネントの構造の確認")
+        }
+
+        /** [n] 個の要素をデコードする前に、総数の上限を確かめる */
+        fun reserve(n: Int) {
+            totals.decoded += n
+            if (totals.decoded > limits.maxDecodedItems) fail("デコードする要素の総数が上限 ${limits.maxDecodedItems} を超える")
         }
 
         fun add(what: String, current: Int, n: Int, max: Int): Int {
@@ -277,6 +286,7 @@ internal object ComponentParser {
             val n = u32()
             if (n > limits.maxVectorItems) fail("${what}の数 $n が上限 ${limits.maxVectorItems} を超える")
             if (n > end - pos) fail("${what}の数 $n が残りのバイト数に合わない")
+            state.reserve(n.toInt())
             return n.toInt()
         }
 

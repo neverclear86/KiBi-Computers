@@ -16,6 +16,11 @@ import java.io.ByteArrayOutputStream
  *
  * import・export と型が元と同じなので、コンポーネントとしての正しさ（インスタンス化の引数、canon の型、alias など）の
  * 検証の結果は、元のバイナリと変わらない。
+ *
+ * 見逃すのは関数の本体だけではない。写しが落とす・読まない core モジュールの部分の誤りも、wasm-tools には届かない:
+ * core モジュールのカスタム セクションの壊れ（UTF-8 の誤り、途中で終わっている）と、コードセクションの本体の後ろの余り。
+ * どれも実行されるバイトではないが、「wasm-tools の検証に通った」と言えるのはコンポーネントの層までで、
+ * core モジュールの中身は、元のバイト列を Endive が読んで初めて確かめられる（#263）。
  */
 internal object ValidationImage {
     private const val CORE_SEC_CUSTOM = 0
