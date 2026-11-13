@@ -666,7 +666,7 @@ public class Machine private constructor(
      */
     private fun processReadinessLocked(process: Process): SaveReadiness {
         if (process.state.isTerminal) return SaveReadiness.READY
-        // 終わっていないのに実行時の部分がない（今は起きない。守りだけ）
+        // 終わっていないのに実行時の部分がない（今は起きない。後段の失敗で runtimes に入らなかったものも KILLED にする。#671。守りだけ）
         val rt = runtimes[process.pid] ?: return SaveReadiness.UNSAVEABLE
         if (!isStaticallySaveableLocked(rt)) return SaveReadiness.UNSAVEABLE
         return when {
@@ -979,7 +979,9 @@ public class Machine private constructor(
      * @return [prepared] の持ち主がカーネルに移ったら `true`。取り消されていた・入れる途中で失敗したら `false` で、
      *   呼び手がロックの外で [PreparedRestore.discard] する（#576）。途中で失敗したときは、カーネルの不整合として CRASHED にする。
      *   表に入れ終えたもの（インスタンス・つないだファイルシステム）は [stopLocked] が先に閉じるが、discard で重ねて閉じても何も起きない
-     *   （どの位置で失敗しても、`runtimes` に入らなかったインスタンス・表のプロセスが持ったままの `/tmp` の RAM・ディスクのリースが返る）
+     *   （どの位置で失敗しても、`runtimes` に入らなかったインスタンス・表のプロセスが持ったままの `/tmp` の RAM・ディスクのリースが返る）。
+     *   `runtimes` に入れる前の表のプロセスは、CRASHED にする前に KILLED にする（[endUnadoptedRestoredProcessesLocked]。
+     *   [awaitTermination] が返り、`/tmp` も [stopLocked] の中で外れる。#671）
      */
     internal fun completeRestore(prepared: PreparedRestore): Boolean = lock.withLockValue {
         if (!restoringValue || restoreCancelled || scheduler.isClosed) return@withLockValue false
@@ -990,6 +992,8 @@ public class Machine private constructor(
             restoringValue = false
             val fatal = t is VirtualMachineError && t !is StackOverflowError
             if (!fatal) LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
+            // runtimes に入れる前の表のプロセスは stopLocked が止めないので、先に終わった状態にする（#671）
+            endUnadoptedRestoredProcessesLocked()
             inconsistencyLocked("保存データを表に戻せない: $t")
             // stopLocked が終えているはずだが、どの経路でも登録が残らないように重ねて終える（#587）
             restoreCancelSignal.complete(Unit)
@@ -1017,6 +1021,24 @@ public class Machine private constructor(
         for ((diskId, point) in prepared.droppedDisks) postDiskEventLocked(DiskEvents.REMOVED, diskId, point)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
         true
+    }
+
+    /**
+     * 後段の失敗（[completeRestore]）で、表にあるのに `runtimes` に入っていない、終わっていないプロセスを KILLED にする（#671。カーネルロックの中）。
+     * [stopLocked] は `runtimes` のプロセスしか止めないので、これがないと [awaitTermination] が返らず、表と `runtimes` が食い違ったまま残る。
+     *
+     * 半端な表は巻き戻さない（ADR 0085）: 表から外さず、状態と待ちを書き換えるだけ。fd・オブジェクト・待ちの登録には触らない
+     * （オブジェクトの表は途中まで戻っているかもしれず、返すと投げたり [PreparedRestore.discard] と二重に返したりしうる。
+     * 前段で作ったものは discard が、`/tmp` は [stopLocked] の [checkAllDoneLocked] が返す）。投げる操作はしない。
+     * 親への知らせ・コンソールへの書き込みもしない（台は CRASHED になり、ケースが外す）。
+     * 場所を後段の失敗に限るのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
+     */
+    private fun endUnadoptedRestoredProcessesLocked() {
+        for (process in kernel.processes.all()) {
+            if (process.state.isTerminal || runtimes.containsKey(process.pid)) continue
+            process.state = ProcessState.KILLED
+            process.wait = null
+        }
     }
 
     /** 前段から（#85）: 戻せなかったので冷えた起動待ちにして知らせる（取り消されていたら何もしない） */

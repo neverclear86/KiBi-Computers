@@ -715,6 +715,8 @@ class MachineRestoreBranchesTest {
             val rt = m.runtime(pid) ?: fail("1 つ目のループで runtimes に入れていない")
             assertEquals(ProcessState.KILLED, m.lock.withLockValue { rt.process.state })
             assertTrue(m.lock.withLockValue { rt.instances.isEmpty() }, "stopLocked がインスタンスを閉じていない")
+            // 全部 runtimes に入った後の失敗でも、表のプロセスは終わり、awaitTermination が返る（#671）
+            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
             assertTrue(during >= 10_000, "戻す途中で RAM を数えていない（$during）")
             // インスタンスの RAM は 1 回だけ返る。インスタンスはプロセスの勘定（rt.memory）を通して返すので、二重に返すとプロセスの勘定が
             // 負になった時点で check が投げ、マシンとサーバー全体の勘定には届かない（例外は closeQuietly が捨てる）。そのためプロセスの勘定で見る。

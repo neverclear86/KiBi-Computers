@@ -426,6 +426,14 @@ class MachineRestoreTest {
             eventually(10_000, "RAM が返らない") { h.scheduler.memoryAccount.usedBytes == base }
             assertEquals(0L, m.memoryAccount.usedBytes)
             eventually(10_000, "ディスクを閉じない") { disk.retired.get() >= 1 }
+            // runtimes に入れる前の表のプロセスも終わった状態になり、awaitTermination が返る（#671）。表は巻き戻さない
+            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.lock.withLockValue {
+                assertEquals(0, m.kernel.processes.liveCount())
+                assertTrue(m.kernel.processes.size > 0, "表を巻き戻した")
+                assertTrue(m.kernel.processes.all().all { it.state.isTerminal })
+                assertTrue(m.kernel.processes.all().any { it.state == ProcessState.KILLED })
+            }
             m.close()
         }
     }
