@@ -21,7 +21,7 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 
 - `MachineConfig.maxDevices`（Builder は 1 以上）。`MachineSpecs.configOf` が CPU のスロットのうち最大の `PartTier.cpuMaxDevices` を入れる。CPU がなければ既定
 - 数えるのは `DeviceBus` につないだもの全部（ケースのスピーカーも1つ）。種類で重みは付けない（単純で予測しやすい）
-- 仮の値（確定は #122・#251。OpenComputers の CPU の刻みに近づけた）
+- 仮の値（確定は #122・#251 で、どちらにもこの値をコメントで残した。OpenComputers の CPU の刻みに近づけた）
 
   | | 接続数 |
   | --- | --- |
@@ -40,8 +40,9 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 - `DeviceBus.limit`・`size` はロックなしで読める。接続層（#129）はこれを見て、満杯なら重い準備（表示デバイスを作るなど）を省ける
 - 空いても core は自分でつなぎ直さない（tick ごとの巡回を足さない）。つなぎ直すのは接続層（今は `TestComputerWiring.reconnectScreen`、正式には #129）
 - 上限は電源を入れたとき・戻したときに決まる。CPU を抜くとマシンは止まるので、動いている間は変わらない。**保存しない**（`KernelState` に入れない）。
-  戻したときの上限が保存したときより小さいと、つなげなかったデバイスへのハンドル・積んだ呼び出しは `detached` になる（ADR 0065 の決まりどおり）
-- 仮の結線（`TestComputerWiring`）は、`attach` の結果を見てから自分の状態を確定する。断られたキーボードは手放す（ほかのケースが使える）。
+  戻したときの上限が保存したときより小さいと、つなげなかったデバイスへのハンドル・積んだ呼び出しは `detached` になる（ADR 0065 の決まりどおり）。
+  保存 → 上限の小さいマシンへの復元 → `redispatchRestoredDeviceCalls` の経路は `DeviceLimitRestoreTest` で確かめている
+- 仮の結線（`TestComputerWiring`）は、`attach` の結果を見てから自分の状態を確定する。断られたキーボード、`attach` が例外で抜けた（address の重複）キーボードは手放す（ほかのケースが使える）。
   断られたことはログに1回だけ出す。つなぐ順はスピーカー → 画面 → キーボード
 
 ## 開いたデバイスからの呼び出し（`ProcessContext`）

@@ -687,4 +687,71 @@ object TestComputerGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+
+    /**
+     * つなげる数が1のマシンでは、スピーカーで満杯になり、画面は断られる（先読みで表示デバイスを作らずに諦める）。
+     * 断られた画面は何も変えず（つないだ印、つないだ回数、address、画面が映す表示デバイス）、キーボードは取らず、
+     * ログは1回だけ。その後の [TestComputerWiring.reconnectScreen] でも変わらない。マシンは動き続ける
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun deviceLimitRefusesScreenAndKeepsRunning(helper: GameTestHelper) {
+        val (_, screen, keyboard) = build(helper)
+        val manager = ServerMachines.current!!
+        val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
+        val wiring = TestComputerWiring()
+        val machine = manager.attach(key, wiring, MachineConfig.builder().maxDevices(1).build())
+        val speaker = UUID.randomUUID().toString()
+        val displayBefore = screen.display
+        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, TestComputerWiring.bootConfig(emptyList(), TestComputerWiring.TEST_BOOT_DISK))
+        fun assertRefused(stage: String) {
+            helper.assertTrue(wiring.connectedScreen == null, "$stage: the refused screen should not be connected")
+            helper.assertTrue(wiring.connectedScreenDevice == null, "$stage: no screen device should be kept")
+            helper.assertTrue(wiring.screenAttachCount == 0, "$stage: the screen should never have been attached (${wiring.screenAttachCount})")
+            helper.assertTrue(wiring.connectedKeyboard == null, "$stage: the keyboard should not be connected")
+            helper.assertTrue(keyboard.owner == null, "$stage: the keyboard should not be taken")
+            helper.assertTrue(screen.display === displayBefore, "$stage: the screen should keep its own display")
+            helper.assertTrue(machine.devices.list().map { it.address } == listOf(speaker), "$stage: only the speaker: ${machine.devices.list()}")
+            helper.assertTrue(wiring.limitLogCount == 1, "$stage: the refusal should be logged once (${wiring.limitLogCount})")
+        }
+        assertRefused("after connect")
+        // 隣のブロックが変わったときの探し直しでも、状態は変わらず、ログも増えない
+        helper.assertTrue(wiring.canReconnectScreen(machine), "the wiring should try to reconnect the screen")
+        wiring.reconnectScreen(helper.level, helper.absolutePos(CASE), machine)
+        assertRefused("after reconnect")
+        helper.succeedWhen {
+            helper.assertTrue(machine.state == MachineState.RUNNING, "the machine should keep running: ${machine.state}")
+            wiring.disconnect()
+            manager.release(key, machine, MachineReleaseReason.REMOVED)
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * キーボードを取った後に [pro.ikili.kibicomputers.core.device.DeviceBus.attach] が例外で抜けても（address の重複。満杯の `false` とは別）、
+     * キーボードは手放す。ほかのケースが取れなくなるのを防ぐ
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardIsReleasedWhenAttachThrows(helper: GameTestHelper) {
+        val (_, _, keyboard) = build(helper)
+        val manager = ServerMachines.current!!
+        val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
+        val wiring = TestComputerWiring()
+        val machine = manager.attach(key, wiring, MachineConfig.DEFAULT)
+        // スピーカーの address をキーボードと同じにして、キーボードをつなぐときに重複させる
+        val thrown = try {
+            wiring.connect(helper.level, helper.absolutePos(CASE), machine, keyboard.deviceAddress)
+            null
+        } catch (e: IllegalArgumentException) {
+            e
+        }
+        helper.assertTrue(thrown != null, "attaching the keyboard with a duplicate address should throw")
+        helper.assertTrue(keyboard.owner == null, "the keyboard should be released after the failed attach")
+        helper.assertTrue(wiring.connectedKeyboard == null, "the keyboard should not be connected")
+        wiring.disconnect()
+        manager.release(key, machine, MachineReleaseReason.REMOVED)
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
+    }
 }

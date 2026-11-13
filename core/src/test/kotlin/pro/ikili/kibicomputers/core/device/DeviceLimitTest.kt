@@ -333,12 +333,13 @@ class DeviceLimitTest {
         }
     }
 
-    // ---- 戻したときの上限 ----
+    // ---- 戻したハンドル ----
+    // 保存 → 上限の小さいマシンへの復元 → 回し直し、の実際の経路は DeviceLimitRestoreTest。ここは戻したハンドルの口（fd）からの呼び出しを確かめる
 
     @Test
-    fun `戻したときの上限が小さく、つなげなかったデバイスへのハンドルと積んだ呼び出しはdetached`() = timeout(limit) {
+    fun `戻したハンドルと積んだ呼び出しが、つながっていないaddressを指すと、fdからの呼び出しはdetached`() = timeout(limit) {
         Harness().use { h ->
-            // 保存したときは2つつないでいた。戻した先の上限は1で、2つ目（b）は断られる
+            // 上限1で、2つ目（b）は断られる（保存から戻した経路は DeviceLimitRestoreTest）
             val m = h.machine(fuelPerTick = 1_000_000, maxDevices = 1).also { it.fillFuel() }
             val b = address(2)
             assertTrue(m.devices.attach(a, TestDevice(dw)))

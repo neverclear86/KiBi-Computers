@@ -48,10 +48,10 @@ import java.util.concurrent.atomic.AtomicLong
  *   チャンクが読み込み直されたときなど、ケースの隣のブロックの更新が起きないときはつなぎ直さない。
  *   画面をつないでいる間に置いたキーボードも見ない
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
+ *   置き換え先: 隣接デバイスの検出と接続 #129（画面・キーボードのデバイスは #65・#66 で済んだ）
  * - つなげる数は CPU で決まる（`MachineConfig.maxDevices`。#66）。満杯で断られたもの（`DeviceBus.attach` が `false`）は
  *   つながないままにし、自分の状態も変えない（断られたキーボードは手放す）。断られたことはログに1回だけ出す。
  *   つなぐ順はスピーカー → 画面 → キーボード
- *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
  * 表示デバイスの中身は、プロセスのスレッドも書くので、読むときはそのロックを持つ。
@@ -112,7 +112,7 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         disconnect()
         this.machine = machine
         bootFailure = null
-        limitLogged = false
+        limitLogCount = 0
         if (attachDevice(machine, speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() }, "speaker")) {
             this.speakerAddress = speakerAddress
         }
@@ -168,18 +168,22 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) } ?: return
         val keyAddress = keyboard.deviceAddress
         val keyDevice = KeyboardDevice()
-        if (!attachDevice(machine, keyAddress, keyDevice, "keyboard")) {
-            // 断られた。ほかのケースが使えるよう手放す
-            keyboard.release(this)
-            return
+        var attachedKeyboard = false
+        try {
+            attachedKeyboard = attachDevice(machine, keyAddress, keyDevice, "keyboard")
+        } finally {
+            // 断られた・例外で抜けた（address の重複など）ときは、ほかのケースが使えるよう手放す
+            if (!attachedKeyboard) keyboard.release(this)
         }
+        if (!attachedKeyboard) return
         this.keyboard = keyboard
         keyboardAddress = keyAddress
         keyboardDevice = keyDevice
     }
 
-    // 満杯で断られたことをログに出したか（同じ結線で続けて断られても、繰り返し出さない。電源を入れ直すと戻す）
-    private var limitLogged = false
+    /** 満杯で断られたことをログに出した回数。同じ結線で続けて断られても1回だけ出す（電源を入れ直すと戻す。テスト用） */
+    var limitLogCount: Int = 0
+        private set
 
     /** [device] を [address] でつなぐ。満杯で断られたら、ログに出して `false` */
     private fun attachDevice(machine: Machine, address: String, device: Device, name: String): Boolean {
@@ -189,8 +193,8 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     private fun logRefused(machine: Machine, name: String) {
-        if (limitLogged) return
-        limitLogged = true
+        if (limitLogCount > 0) return
+        limitLogCount++
         LOGGER.info("Device limit ({}) reached; not attaching the {}", machine.devices.limit, name)
     }
 
