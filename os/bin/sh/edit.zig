@@ -589,6 +589,8 @@ fn completeWord() void {
     const common = complete.commonPrefix();
     const first = complete.items[0];
     var changed = false;
+    // 補完で入れる文字（名前の続きと、閉じる引用符・空白・`/`）は、全部入るか何も入らないか
+    const start = pos;
     if (common > w.text.len and util.startsWith(first.text, w.text)) {
         if (!insertQuoted(first.text[w.text.len..common], w.quote)) {
             // 入らなかった。何も入れていないので、閉じる引用符や空白も足さない
@@ -599,15 +601,23 @@ fn completeWord() void {
         changed = true;
     }
     if (complete.count == 1) {
+        var ok = true;
         if (first.dir) {
-            if (common == first.text.len and !util.startsWith(line[pos..len], "/")) _ = insert("/");
+            if (common == first.text.len and !util.startsWith(line[pos..len], "/")) ok = insert("/");
         } else {
             switch (w.quote) {
-                .single => _ = insert("'"),
-                .double => _ = insert("\""),
+                .single => ok = insert("'"),
+                .double => ok = insert("\""),
                 .none => {},
             }
-            if (pos == len or line[pos] != ' ') _ = insert(" ");
+            if (ok and (pos == len or line[pos] != ' ')) ok = insert(" ");
+        }
+        if (!ok) {
+            // 後ろに足す文字が入らなかった。入れた名前の続きも戻して、行は元のまま
+            remove(start, pos, false);
+            bell();
+            flush();
+            return;
         }
         changed = true;
     }

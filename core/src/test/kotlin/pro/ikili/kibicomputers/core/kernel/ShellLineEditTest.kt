@@ -603,6 +603,32 @@ class ShellLineEditTest {
     }
 
     @Test
+    fun `補完の後ろに足す引用符・空白・スラッシュが入らないときは、補った名前も入れない`() {
+        // どれも、名前の続きはちょうど入るが、後ろに足す 1 文字が入らない（1 行の上限は 4096 バイト）
+        val space = ": " + "P".repeat(4084) + " /tmp/a" // + bcd で 4096。空白が入らない
+        val quote = ": " + "P".repeat(4083) + " \"/tmp/a" // + bcd で 4096。閉じる " が入らない
+        val dir = ": " + "P".repeat(4084) + " /tmp/dir" // + x で 4096。/ が入らない
+        assertEquals(4093, space.toByteArray().size)
+        assertEquals(4093, quote.toByteArray().size)
+        assertEquals(4095, dir.toByteArray().size)
+        val s = session(
+            listOf(
+                "$space\t\r",
+                // 引用符が開いたままの行にはならない。自分で閉じれば、補う前の行のまま実行する
+                "$quote\t\"\r",
+                "$dir\t\r",
+                "exit\r",
+            ),
+            files = mapOf("/tmp/abcd" to "", "/tmp/dirx/" to ""),
+            read = listOf("/home/.sh_history"),
+            splittable = true,
+        )
+        assertEquals(listOf(space, "$quote\"", dir, "exit").joinToString("\n", postfix = "\n"), s.files["/home/.sh_history"])
+        assertEquals(3, s.text.count { it == '\u0007' }, s.text.takeLast(500))
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
     fun `続きの行で入力の領域の残りが少ないと、入らない履歴の項目は呼び戻さずベルを鳴らす`() {
         // 入力の領域は 64 KiB。引用符を開いたままの行を重ねて、残りを 4090 バイトより小さくする
         val x = "x".repeat(4090)
