@@ -50,6 +50,12 @@ public class MachineScheduler private constructor(
         /** `KiBi-timer` のスタック（タイマーを鳴らすだけなので小さくてよい） */
         private const val TIMER_STACK_BYTES: Long = 1L * 1024 * 1024
 
+        /** 接続層の例外の投げた場所を決めるスタックの段数（標準ライブラリのフレームは数えない。#674） */
+        private const val HOST_FAILURE_FRAMES = 3
+
+        /** スタックトレースを出した、接続層の例外の場所を覚える数の上限（#674。仮の値） */
+        private const val HOST_FAILURE_TRACE_LIMIT = 64
+
         /** 内部の設定（テスト用の差し替え）を付けてスケジューラを作る。 */
         @JvmSynthetic
         internal fun create(config: SchedulerConfig, options: SchedulerInternals): MachineScheduler = MachineScheduler(config, options)
@@ -61,6 +67,53 @@ public class MachineScheduler private constructor(
     private val notifyQueue = ConcurrentLinkedQueue<Machine>()
     private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
     private val blockingCount = AtomicInteger()
+
+    /** 接続層の例外のスタックトレースを、もうログに出した場所（種類・例外のクラス・呼んだ側のスタック。#674） */
+    private val hostFailureTraced: MutableSet<List<Any>> = ConcurrentHashMap.newKeySet()
+
+    /** [claimHostFailureTrace] の結果（#674） */
+    internal enum class HostFailureTrace {
+        /** まだ記録になかった場所。今回スタックトレースを出す */
+        NEW,
+
+        /** 記録済みの場所（スタックトレースはもう出した） */
+        KNOWN,
+
+        /** 記録が [HOST_FAILURE_TRACE_LIMIT] 個に達していて、新しい場所を覚えられない（スタックトレースはどこにも出ていない） */
+        LIMIT_REACHED,
+    }
+
+    /**
+     * 接続層の例外 [t]（種類は `Machine` の `HostFailureKind` の ordinal [kind]）の投げた場所で、スタックトレースを出すのが
+     * スケジューラ全体で最初なら [HostFailureTrace.NEW]（以後は [HostFailureTrace.KNOWN]。#674）。
+     * 場所は、種類・例外のクラス・スタックの上から [HOST_FAILURE_FRAMES] 個で決める。ただし、JDK と Kotlin の標準ライブラリの
+     * フレーム（`ArrayList.get` が `Objects.checkIndex` を通って投げるなど）は数えず、それより下の呼んだ側のフレームを使う
+     * （標準ライブラリの中だけで決めると、別々の呼び出し元からの例外が同じ場所になる）。スタックがすべて標準ライブラリなら、上から使う。
+     * 覚える場所は [HOST_FAILURE_TRACE_LIMIT] 個まで（超えたら、新しい場所は [HostFailureTrace.LIMIT_REACHED]）
+     */
+    internal fun claimHostFailureTrace(kind: Int, t: Throwable): HostFailureTrace {
+        val frames = t.stackTrace
+        val site = ArrayList<Any>(HOST_FAILURE_FRAMES + 2)
+        site += kind
+        site += t.javaClass
+        for (frame in frames) {
+            if (site.size - 2 >= HOST_FAILURE_FRAMES) break
+            if (!isLibraryFrame(frame)) site += frame
+        }
+        if (site.size == 2) {
+            for (i in 0 until minOf(HOST_FAILURE_FRAMES, frames.size)) site += frames[i]
+        }
+        if (site in hostFailureTraced) return HostFailureTrace.KNOWN
+        if (hostFailureTraced.size >= HOST_FAILURE_TRACE_LIMIT) return HostFailureTrace.LIMIT_REACHED
+        return if (hostFailureTraced.add(site)) HostFailureTrace.NEW else HostFailureTrace.KNOWN
+    }
+
+    /** JDK か Kotlin の標準ライブラリのフレーム（[claimHostFailureTrace] の場所に数えない） */
+    private fun isLibraryFrame(frame: StackTraceElement): Boolean {
+        val name = frame.className
+        return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") ||
+            name.startsWith("sun.") || name.startsWith("com.sun.") || name.startsWith("kotlin.")
+    }
 
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
     private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
@@ -211,13 +264,32 @@ public class MachineScheduler private constructor(
         }
         while (true) batch += notifyQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
-        for (machine in batch) machine.deliverNotifications()
+        deliverNotifications(batch)
         batch.clear()
         while (true) batch += hostCallQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
         for (machine in batch) {
             // 残ったマシンは次の tick へ（この tick の中では入れ直さない）
             if (machine.runHostCalls()) hostCallQueue.add(machine)
+        }
+    }
+
+    /**
+     * [batch] のマシンに通知を配る。JVM の致命的なエラー（[Machine] の `safely` が投げ直す）で途中で抜けるときは、
+     * まだ配っていないマシンと、投げたマシンの残りを、次の tick に回してから投げ直す（`queuedForNotify` が立ったまま、
+     * 列にも載っていない状態にしない。#674）
+     */
+    private fun deliverNotifications(batch: List<Machine>) {
+        var i = 0
+        try {
+            while (i < batch.size) {
+                batch[i].deliverNotifications()
+                i++
+            }
+        } catch (t: Throwable) {
+            for (j in i + 1 until batch.size) notifyQueue.add(batch[j])
+            batch[i].requestNotifyAfterAbort()
+            throw t
         }
     }
 

@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicLong
 @ApiStatus.Internal
 public fun interface SpeakerListener {
     /**
-     * ビープを鳴らす。つないだマシンの `tick()` の中で、メインスレッドから呼ばれる。中で投げた例外は捨てる。
+     * ビープを鳴らす。つないだマシンの `tick()` の中で、メインスレッドから呼ばれる。中で投げた例外はログに出して捨てる（JVM の致命的なエラーは投げる。#674）。
      *
      * @param frequencyHz 周波数（[SpeakerDevice.MIN_FREQUENCY_HZ]〜[SpeakerDevice.MAX_FREQUENCY_HZ] に丸めてある）
      * @param durationMillis 長さ（1〜[SpeakerDevice.MAX_DURATION_MILLIS] に丸めてある）
