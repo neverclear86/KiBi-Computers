@@ -260,6 +260,31 @@ class DiskHotplugTest {
     }
 
     @Test
+    fun `根がディスクなら、HOMEに綴りを変えてマウントしたディスクもhomeのマウントで、抜くと止めるべきと答える`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = bootDiskRoot(h).m
+            m.unmountAt(VfsPath.parse("/home"))
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            m.mountDisk("disk:d1", VfsPath.parse("/HOME"), false)
+            assertEquals("disk:d1", m.mountAt("/home"))
+            assertTrue(m.disksChanged(snapshot("root")), "/HOME のディスクが抜けたら止める")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がメモリなら、HOMEにマウントしたディスクはhomeのマウントではなく、抜くと外す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = boot(h, "root", "d1").m
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            m.mountDisk("disk:d1", VfsPath.parse("/HOME"), false)
+            assertFalse(m.disksChanged(snapshot("root")), "/home 以外のディスクは止めずに外す")
+            assertNull(m.mountAt("/HOME"))
+            m.close()
+        }
+    }
+
+    @Test
     fun `根がメモリなら、unmountは大文字小文字の違う位置を別の位置として扱う`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val b = boot(h, "root", "d1")

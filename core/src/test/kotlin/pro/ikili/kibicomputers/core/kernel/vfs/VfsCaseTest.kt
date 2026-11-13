@@ -195,6 +195,9 @@ class VfsCaseTest {
         vfs.attach(root.id, disk())
         assertEquals(lower, vfs.mounts.covering(p("/TMP/x")))
         assertEquals(lower, vfs.mounts.at(p("/Tmp")))
+        // 位置を名指しするときは、綴りがちょうど一致するものを先に選ぶ（後のものもパスから外せる）
+        assertEquals(upper, vfs.mounts.at(p("/TMP")))
+        assertEquals(lower, vfs.mounts.at(p("/tmp")))
         assertEquals(setOf("tmp"), vfs.mounts.childNamesTowardMounts(VfsPath.ROOT))
         vfs.attach(lower.id, tmpfs())
         vfs.attach(upper.id, TestMemoryFileSystem())
@@ -203,5 +206,43 @@ class VfsCaseTest {
         // 先のものを外せば、残ったほうが見える
         vfs.unmount(lower.id)
         assertEquals(upper.id.toLong(), vfs.stat(p("/tmp")).device)
+    }
+
+    @Test
+    fun `今の表でも、区別するFSの中の綴り違いの位置の上にディスクをマウントすると重なり、綴りで名指しして外せる`() {
+        val vfs = Vfs()
+        vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "image")
+        val lower = vfs.mount(p("/mnt/x/a"), TestMemoryFileSystem(), readOnly = false, source = "a")
+        val upper = vfs.mount(p("/mnt/x/A"), TestMemoryFileSystem(), readOnly = false, source = "A")
+        val table = vfs.mounts
+        assertEquals(upper, table.covering(p("/mnt/x/A/f")))
+        // 上にディスクをマウントすると、2つの位置は同じになる（例外にしない）
+        val parent = vfs.mount(p("/mnt/x"), disk(), readOnly = false, source = "disk:x")
+        assertEquals(lower, table.covering(p("/mnt/x/A/f")), "パスは足した順で先のものに属する")
+        assertEquals(upper, table.at(p("/mnt/x/A")))
+        assertEquals(lower, table.at(p("/mnt/x/a")))
+        assertEquals(null, table.at(p("/MNT/x/a")), "根は区別するので /MNT は別の位置")
+        assertTrue(table.isAt(upper, p("/mnt/x/a")))
+        assertTrue(table.isAtOrBelow(upper, lower) && table.isAtOrBelow(lower, upper))
+        // 親は下にマウントがあるので外せない。重なった2つはどちらからでも外せる
+        assertErrno(Errno.BUSY) { vfs.unmount(parent.id) }
+        vfs.unmount(table.at(p("/mnt/x/A"))!!.id)
+        assertEquals(lower, table.at(p("/mnt/x/A")))
+        vfs.unmount(lower.id)
+        vfs.unmount(parent.id)
+    }
+
+    @Test
+    fun `isAtは位置を大文字小文字の規則で比べる`() {
+        val s = setup()
+        val home = s.vfs.mount(p("/HOME"), TestMemoryFileSystem(), readOnly = false, source = "home")
+        assertTrue(s.vfs.mounts.isAt(home, p("/home")))
+        assertFalse(s.vfs.mounts.isAt(home, p("/home/x")))
+        assertFalse(s.vfs.mounts.isAt(s.tmpMount, p("/home")))
+        val sensitive = Vfs()
+        sensitive.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "image")
+        val home2 = sensitive.mount(p("/HOME"), TestMemoryFileSystem(), readOnly = false, source = "home")
+        assertFalse(sensitive.mounts.isAt(home2, p("/home")))
+        assertTrue(sensitive.mounts.isAt(home2, p("/HOME")))
     }
 }

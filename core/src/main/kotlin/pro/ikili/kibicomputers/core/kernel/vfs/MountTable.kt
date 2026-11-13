@@ -34,8 +34,15 @@ internal class MountEntry(
  * （パスの操作のたびには作らない）。FS が区別しないかは実行時だけの値（保存しない）で、[add]・[setIgnoresCase] で知らせる。
  * 知らせのないマウント（復元してまだ FS をつないでいないもの）は、区別するとして扱う。
  *
- * 古い表（#606 より前は区別して比べていた）では、大文字小文字だけ違う位置に重ねてマウントしていることがある。
- * そのときも例外にせず、深いほう、同じ深さなら足した順で先のものを選ぶ。
+ * 大文字小文字だけ違う位置に重なったマウントは、次の2つの道筋でできる。どちらも例外にしない。
+ * - 古い表（#606 より前は区別して比べていた）
+ * - 今の表でも、区別する FS の中の `/mnt/x/a` と `/mnt/x/A` にマウントしてから、その上の `/mnt/x` に区別しない FS
+ *   （ディスク）をマウントしたとき（[add] は [point] そのものしか見ない。比べ方の印を作り直すと、2つの位置が重なる）。
+ *   復元した表に FS をつなぐ順（[setIgnoresCase]）でも同じ
+ *
+ * パスの解決（[covering]）は、深いほう、同じ深さなら足した順で先のものを選ぶ。後のものはパスからは届かない。
+ * 位置を名指しするとき（[at]。`umount` など）は、綴りがちょうど一致するものを先に選ぶので、後のものも綴りを合わせれば外せる。
+ * 重なったものは互いに「下」とみなさないので、[remove] はどちらからでも外せる。
  */
 internal class MountTable {
     private val list = ArrayList<MountEntry>(4)
@@ -74,7 +81,7 @@ internal class MountTable {
 
     /**
      * [id] のマウントを外す。なければ `INVAL`、下（より深いところ）に別のマウントがあれば `BUSY`。
-     * 古い表で同じ位置に重なったマウント（#606）は下とみなさない（どちらからでも外せる）
+     * 大文字小文字だけ違う、同じ位置に重なったマウント（#606）は下とみなさない（どちらからでも外せる）
      */
     fun remove(id: Int): MountEntry {
         val entry = get(id) ?: fsError(Errno.INVAL, "マウント $id はない")
@@ -122,12 +129,24 @@ internal class MountTable {
 
     operator fun get(id: Int): MountEntry? = list.firstOrNull { it.id == id }
 
-    /** [point] にちょうどあるマウント（大文字小文字の規則も含めて同じ位置。重なっていれば足した順で先のもの） */
+    /**
+     * [point] にちょうどあるマウント（大文字小文字の規則も含めて同じ位置）。
+     * 重なっていれば、綴りがちょうど一致するもの、なければ足した順で先のもの（重なったマウントを綴りで名指しして外せるように。#606）
+     */
     fun at(point: VfsPath): MountEntry? {
+        for (e in list) {
+            if (e.point == point) return e
+        }
         for (k in list.indices) {
             if (list[k].point.depth == point.depth && matches(k, point, point.depth)) return list[k]
         }
         return null
+    }
+
+    /** [entry] が [point] にちょうどあるか（大文字小文字の規則も含めて同じ位置。`/home` のマウントかを見分ける。#606） */
+    fun isAt(entry: MountEntry, point: VfsPath): Boolean {
+        val k = list.indexOf(entry)
+        return k >= 0 && entry.point.depth == point.depth && matches(k, point, point.depth)
     }
 
     /** [path] が属するマウント（いちばん長く一致する位置のもの。同じ深さなら足した順で先のもの）。どこにも属さなければ `null` */
@@ -147,7 +166,7 @@ internal class MountTable {
     /** [path] か、その下にマウントがある */
     fun hasMountAtOrBelow(path: VfsPath): Boolean = list.indices.any { k -> list[k].point.depth >= path.depth && matches(k, path, path.depth) }
 
-    /** [entry] が [base] の位置か、その下にあるか（大文字小文字の規則も含めて。[entry] 自身と、古い表で同じ位置に重なったものも真。#606） */
+    /** [entry] が [base] の位置か、その下にあるか（大文字小文字の規則も含めて。[entry] 自身と、同じ位置に重なったものも真。#606） */
     fun isAtOrBelow(entry: MountEntry, base: MountEntry): Boolean {
         val k = list.indexOf(entry)
         if (k < 0 || entry.point.depth < base.point.depth) return false
