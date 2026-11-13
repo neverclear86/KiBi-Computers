@@ -163,6 +163,41 @@ class CoreLogRoutingTest {
     }
 
     @Test
+    fun setLevelsAppliesPerChildLevelsLikeLog4jLoggerConfigs() {
+        val handle = CoreLogRouting.install(sink, root, CoreLogLevel.INFO)!!
+        val only = System.getLogger("$root.only")
+        val onlyDeep = System.getLogger("$root.only.deep")
+        val other = System.getLogger("$root.other")
+        try {
+            // 子1つだけ DEBUG にする（log4j の設定で `kibicomputers.restore` だけ DEBUG にしたとき）
+            handle.setLevels(mapOf(root to CoreLogLevel.INFO, "$root.only" to CoreLogLevel.DEBUG, "outside.x" to CoreLogLevel.TRACE))
+            assertTrue(only.isLoggable(System.Logger.Level.DEBUG))
+            assertTrue(onlyDeep.isLoggable(System.Logger.Level.DEBUG), "孫は、いちばん近い祖先の設定を継ぐ")
+            assertTrue(!only.isLoggable(System.Logger.Level.TRACE))
+            assertTrue(!other.isLoggable(System.Logger.Level.DEBUG), "兄弟は根の設定のまま")
+            assertTrue(!Logger.getLogger("outside.x").isLoggable(Level.FINEST), "木の外は触らない")
+            only.log(System.Logger.Level.DEBUG, "通る")
+            other.log(System.Logger.Level.DEBUG, "落ちる")
+            assertEquals(listOf("通る"), lines.map { it.message })
+
+            // 設定を読み直して、子の設定がなくなった。根だけ WARN になった
+            handle.setLevels(mapOf(root to CoreLogLevel.WARN))
+            assertTrue(!only.isLoggable(System.Logger.Level.DEBUG))
+            assertTrue(!other.isLoggable(System.Logger.Level.INFO))
+            assertNull(Logger.getLogger("$root.only").level, "子のレベルは取り付ける前（なし）に戻る")
+        } finally {
+            handle.setLevels(mapOf("$root.only" to CoreLogLevel.TRACE))
+            handle.close()
+        }
+        // 外したら、子に付けたレベルも元に戻る
+        assertNull(Logger.getLogger("$root.only").level)
+        assertNull(Logger.getLogger(root).level)
+        // 外した後の setLevels は何もしない
+        handle.setLevels(mapOf("$root.only" to CoreLogLevel.TRACE))
+        assertNull(Logger.getLogger("$root.only").level)
+    }
+
+    @Test
     fun sinkFailureDoesNotLeakToCaller() {
         val handle = CoreLogRouting.install({ _, _, _, _ -> throw IllegalStateException("sink broke") }, root)
         try {

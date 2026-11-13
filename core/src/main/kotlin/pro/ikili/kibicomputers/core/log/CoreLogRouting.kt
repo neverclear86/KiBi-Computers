@@ -57,6 +57,25 @@ public fun interface CoreLogSink {
 }
 
 /**
+ * [CoreLogRouting.install] で取り付けた経路（#673）。閉じると取り付けを解き、JUL の設定を元に戻す。
+ */
+@ApiStatus.Internal
+public interface CoreLogRoute : AutoCloseable {
+    /**
+     * ロガー名ごとの、sink に流すレベルを置き換える。JUL のロガーのレベルにそのまま写すので、
+     * 名前の木の継承（いちばん近い祖先の設定が効く）は log4j の `LoggerConfig` と同じになる。
+     *
+     * - 取り付けた根の名前が [levels] になければ、[CoreLogRouting.install] の `minLevel` を使う。
+     * - 根の木の外の名前は無視する。
+     * - 前に渡して今回なくなった子の名前は、取り付ける前のレベルに戻す。
+     * - 取り付けが解けた後に呼んでも、何もしない。
+     */
+    public fun setLevels(levels: Map<String, CoreLogLevel>)
+
+    override fun close()
+}
+
+/**
  * core が `System.getLogger` で出すログを、接続層のロガー（SLF4J / log4j）に流す（#673）。
  *
  * core のロガーは JDK 既定の `System.LoggerFinder`（`java.util.logging`）に流れるので、
@@ -65,6 +84,9 @@ public fun interface CoreLogSink {
  * 探されず、MOD の jar の中からは効かないので使わない。
  *
  * - 親（root の `ConsoleHandler`）には流さない（同じ行が標準エラーに二重に出ないように）。
+ * - レベルは接続層のロガーの設定を写したもの（[CoreLogRoute.setLevels]）で決める。`isLoggable` を必要以上に
+ *   真にしないため。取り付けている間は、`logging.properties` などで JUL の `kibicomputers` の木に付けたレベルより、
+ *   接続層の設定が優先する（出口が接続層のロガーなので、そちらの設定に合わせる）。
  * - 実行中に JUL が設定し直されて（`LogManager.reset()` / `readConfiguration()`）ハンドラーが外されたら、
  *   取り付けを解いて親に流す設定を戻す。以後のログは標準エラーなど親の出力先に出る（sink には来ない）。
  * - JUL の `LogManager` が JDK のものでない環境（log4j-jul などに差し替えた環境）では、何もしない。
@@ -78,19 +100,20 @@ public object CoreLogRouting {
     private val installed = ConcurrentHashMap<String, Installation>()
 
     /**
-     * [root] 以下のロガーの [minLevel] 以上の行を [sink] に流す。
+     * [root] 以下のロガーの行を [sink] に流す。最初は木全体を [minLevel] 以上にし、子ごとのレベルは
+     * 返した経路の [CoreLogRoute.setLevels] で付ける。
      *
-     * @return 取り付けたら、外す口。既に取り付け済み、または JUL が JDK のものでなく取り付けなかったら `null`
+     * @return 取り付けたら、その経路。既に取り付け済み、または JUL が JDK のものでなく取り付けなかったら `null`
      */
     @JvmStatic
     @JvmOverloads
-    public fun install(sink: CoreLogSink, root: String = ROOT, minLevel: CoreLogLevel = CoreLogLevel.TRACE): AutoCloseable? {
+    public fun install(sink: CoreLogSink, root: String = ROOT, minLevel: CoreLogLevel = CoreLogLevel.TRACE): CoreLogRoute? {
         if (LogManager.getLogManager().javaClass != LogManager::class.java) return null
         val logger = Logger.getLogger(root)
-        val installation = Installation(root, logger, sink)
+        val installation = Installation(root, logger, sink, minLevel)
         if (installed.putIfAbsent(root, installation) != null) return null
         return try {
-            installation.attach(CoreLogLevel.julThreshold(minLevel))
+            installation.attach()
             installation
         } catch (e: RuntimeException) {
             // 設定を変えられない環境（SecurityException など）。MOD の読み込みは止めない
@@ -104,21 +127,49 @@ public object CoreLogRouting {
         // 強い参照。手放すと JUL のロガーが回収され、子は黙って root の ConsoleHandler 行きに戻る
         private val logger: Logger,
         sink: CoreLogSink,
-    ) : AutoCloseable {
+        private val defaultLevel: CoreLogLevel,
+    ) : CoreLogRoute {
         private val handler = SinkHandler(sink) { close() }
         private var previousLevel: Level? = null
         private var previousUseParent: Boolean = true
 
-        fun attach(level: Level) {
+        // レベルを付けた子のロガー（強い参照）と、付ける前のレベル
+        private val children = HashMap<String, Pair<Logger, Level?>>()
+        private var closed = false
+
+        @Synchronized
+        fun attach() {
             previousLevel = logger.level
             previousUseParent = logger.useParentHandlers
             logger.addHandler(handler)
             try {
-                logger.level = level
+                logger.level = CoreLogLevel.julThreshold(defaultLevel)
                 logger.useParentHandlers = false
             } catch (e: RuntimeException) {
                 restore()
                 throw e
+            }
+        }
+
+        @Synchronized
+        override fun setLevels(levels: Map<String, CoreLogLevel>) {
+            if (closed) return
+            logger.level = CoreLogLevel.julThreshold(levels[root] ?: defaultLevel)
+            val wanted = levels.filterKeys { it.startsWith("$root.") }
+            val iterator = children.entries.iterator()
+            while (iterator.hasNext()) {
+                val (name, entry) = iterator.next()
+                if (name !in wanted) {
+                    entry.first.level = entry.second
+                    iterator.remove()
+                }
+            }
+            for ((name, level) in wanted) {
+                val entry = children.getOrPut(name) {
+                    val child = Logger.getLogger(name)
+                    child to child.level
+                }
+                entry.first.level = CoreLogLevel.julThreshold(level)
             }
         }
 
@@ -127,10 +178,14 @@ public object CoreLogRouting {
             restore()
         }
 
+        @Synchronized
         private fun restore() {
+            closed = true
             logger.removeHandler(handler)
             logger.level = previousLevel
             logger.useParentHandlers = previousUseParent
+            for ((child, level) in children.values) child.level = level
+            children.clear()
         }
     }
 

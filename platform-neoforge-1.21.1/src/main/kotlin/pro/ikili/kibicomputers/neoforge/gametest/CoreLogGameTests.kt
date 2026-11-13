@@ -8,7 +8,9 @@ import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.LogEvent
 import org.apache.logging.log4j.core.LoggerContext
 import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Configurator
 import pro.ikili.kibicomputers.core.KiBiComputers
+import pro.ikili.kibicomputers.neoforge.CoreLogBridge
 import java.util.Collections
 import java.util.UUID
 import org.apache.logging.log4j.Level as Log4jLevel
@@ -55,6 +57,54 @@ object CoreLogGameTests {
                 "the core DEBUG should reach log4j as DEBUG (debug.log): $events",
             )
         }
+        helper.succeed()
+    }
+
+    /**
+     * log4j の設定で子のロガーだけを DEBUG にしたら、その子の DEBUG だけが JUL を通って届く。
+     * 兄弟のロガーは、log4j の判定と JUL の判定が一致したまま（#681 のレビュー）。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun childOnlyLog4jLevelIsMirroredToCoreLogger(helper: GameTestHelper) {
+        val only = "$NAME.only"
+        val other = "$NAME.other"
+        val context = LoggerContext.getContext(false)
+        helper.assertTrue(context.configuration.loggers[only] == null, "the test logger config should not exist yet")
+        val events = Collections.synchronizedList(ArrayList<Pair<String, Log4jLevel>>())
+        @Suppress("DEPRECATION")
+        val appender = object : AbstractAppender("kibicomputers-logtest-${UUID.randomUUID()}", null, null, true) {
+            override fun append(event: LogEvent) {
+                if (event.loggerName == only || event.loggerName == other) events += event.loggerName to event.level
+            }
+        }
+        appender.start()
+        val rootConfig = context.configuration.rootLogger
+        rootConfig.addAppender(appender, null, null)
+        val mark = UUID.randomUUID().toString()
+        try {
+            Configurator.setLevel(only, Log4jLevel.DEBUG)
+            CoreLogBridge.refresh()
+            val onlyLog = System.getLogger(only)
+            val otherLog = System.getLogger(other)
+            helper.assertTrue(onlyLog.isLoggable(System.Logger.Level.DEBUG), "the child set to DEBUG in log4j should be DEBUG in JUL")
+            helper.assertTrue(
+                otherLog.isLoggable(System.Logger.Level.DEBUG) == LogManager.getLogger(other).isDebugEnabled,
+                "a sibling should follow log4j's level for it",
+            )
+            onlyLog.log(System.Logger.Level.DEBUG, "CoreLogGameTests child debug line $mark")
+            helper.assertTrue(events.contains(only to Log4jLevel.DEBUG), "the child DEBUG should reach log4j: $events")
+        } finally {
+            context.configuration.removeLogger(only)
+            context.updateLoggers()
+            CoreLogBridge.refresh()
+            rootConfig.removeAppender(appender.name)
+            appender.stop()
+        }
+        helper.assertTrue(
+            System.getLogger(only).isLoggable(System.Logger.Level.DEBUG) == LogManager.getLogger(only).isDebugEnabled,
+            "after the config is removed, the child should follow log4j again",
+        )
         helper.succeed()
     }
 }
