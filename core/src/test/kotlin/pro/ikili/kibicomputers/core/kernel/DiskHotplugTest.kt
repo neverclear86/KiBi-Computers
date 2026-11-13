@@ -513,8 +513,11 @@ class DiskHotplugTest {
             b.disks.gates["d2"] = gate
             assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
             assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
-            assertFalse(m.disksChanged(snapshot("root", "d0", "d2", "d1")))
-            assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
+            // 挿してから抜くまでを1つのロックの区間にする（d1 の挿し込みで積まれた自動マウントの仕事が、間に割り込んで d1 を予約しないように）
+            m.lock.withLockValue {
+                assertFalse(m.disksChanged(snapshot("root", "d0", "d2", "d1")))
+                assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
+            }
             gate.release.countDown()
             eventually(10_000, "マウントしない") { m.mountAt("/mnt/d2") == "disk:d2" }
             Thread.sleep(100)
