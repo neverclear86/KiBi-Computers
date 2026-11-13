@@ -21,7 +21,7 @@ import java.nio.charset.CodingErrorAction
 
 /**
  * p1 向けの独自拡張の import（#73。ADR 0073 の Q2-B）に要る、Canonical ABI の最小限の lift・lower（`kibi:io` は #75）。
- * Component Model の層（#264）ができたら置き換える。
+ * Component Model の層（#264。`runtime.component.canon`）とは、範囲外・UTF-8 の誤りを error-code で返す点などが意図して違うので、置き換えていない（ADR 0264）。
  *
  * 配置は Canonical ABI どおり（リトルエンディアン、wasm32）:
  * - `list<T>`・`string`: `{ ptr: i32 @0, len: i32 @4 }`（8 / 4）

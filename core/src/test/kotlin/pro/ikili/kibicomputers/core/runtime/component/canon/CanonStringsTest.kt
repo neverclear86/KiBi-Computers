@@ -1,0 +1,171 @@
+package pro.ikili.kibicomputers.core.runtime.component.canon
+
+import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.runtime.FakeMemory
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonStringEncoding.LATIN1_UTF16
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonStringEncoding.UTF16
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonStringEncoding.UTF8
+import pro.ikili.kibicomputers.core.runtime.component.canon.RecordingRealloc.Call
+
+/** `string` の 3 つの符号化の lift・lower と、realloc の呼び方（#264。仕様の `store_string_into_range`） */
+class CanonStringsTest {
+    private val memory = FakeMemory(1)
+    private val realloc = RecordingRealloc(memory)
+    private val tag = CanonLimits.UTF16_TAG
+
+    private fun cx(e: CanonStringEncoding) = canonContext(memory, e, realloc)
+
+    private fun store(e: CanonStringEncoding, v: CanonValue.Str): Pair<ByteArray, Long> {
+        val r = CanonStrings.store(cx(e), v)
+        val units = r[1]
+        val bytes = when (e) {
+            UTF8 -> units
+            UTF16 -> 2 * units
+            LATIN1_UTF16 -> if (units and tag != 0L) 2 * (units xor tag) else units
+        }
+        return memory.read(r[0].toInt(), bytes.toInt()) to units
+    }
+
+    private fun trap(block: () -> Unit) {
+        val e = assertThrows<WasmTrapException> { block() }
+        assertEquals(WasmTrapKind.OTHER, e.kind) { e.message }
+    }
+
+    private fun bytes(vararg b: Int) = ByteArray(b.size) { b[it].toByte() }
+
+    @Test
+    fun `UTF-8 へは正確な大きさで 1 回だけ取る`() {
+        val (b, n) = store(UTF8, CanonValue.str("aé"))
+        assertArrayEquals("aé".toByteArray(), b)
+        assertEquals(3L, n)
+        assertEquals(listOf(Call(0, 0, 1, 3)), realloc.calls)
+    }
+
+    @Test
+    fun `UTF-8 から UTF-16 へは最悪の大きさで取り、短ければ縮める`() {
+        val (b, n) = store(UTF16, CanonValue.str("aé"))
+        assertArrayEquals(bytes(0x61, 0, 0xe9, 0), b)
+        assertEquals(2L, n)
+        assertEquals(Call(0, 0, 2, 6), realloc.calls[0])
+        assertEquals(Call(realloc.calls[1].old, 6, 2, 4), realloc.calls[1])
+        realloc.calls.clear()
+        store(UTF16, CanonValue.str("ab"))
+        assertEquals(listOf(Call(0, 0, 2, 4)), realloc.calls)
+    }
+
+    @Test
+    fun `UTF-8 から latin1+utf16 へ、すべて latin1 なら縮める`() {
+        val (b, n) = store(LATIN1_UTF16, CanonValue.str("aé"))
+        assertArrayEquals(bytes(0x61, 0xe9), b)
+        assertEquals(2L, n)
+        assertEquals(Call(0, 0, 2, 3), realloc.calls[0])
+        assertEquals(3, realloc.calls[1].oldSize)
+        assertEquals(2, realloc.calls[1].newSize)
+        assertEquals(2, realloc.calls.size)
+    }
+
+    @Test
+    fun `UTF-8 から latin1+utf16 へ、2^8 以上の文字を見たら UTF-16 に広げて縮める`() {
+        val (b, n) = store(LATIN1_UTF16, CanonValue.str("éあ"))
+        assertArrayEquals(bytes(0xe9, 0, 0x42, 0x30), b)
+        assertEquals(2L or tag, n)
+        // UTF-8 で 5 バイト: 5 で取り、10 に広げ、4 に縮める
+        assertEquals(listOf(5, 10, 4), realloc.calls.map { it.newSize })
+        assertEquals(listOf(0, 5, 10), realloc.calls.map { it.oldSize })
+    }
+
+    @Test
+    fun `UTF-16 で lift したものを UTF-8 へは、ASCII でない文字を見たら広げて縮める`() {
+        memory.write(0x100, bytes(0x61, 0, 0xe9, 0))
+        val s = CanonStrings.load(cx(UTF16), 0x100, 2)
+        assertEquals("aé", s.value)
+        realloc.calls.clear()
+        val (b, n) = store(UTF8, s)
+        assertArrayEquals("aé".toByteArray(), b)
+        assertEquals(3L, n)
+        // 元は 2 単位: 2 で取り、最悪の 6 に広げ、3 に縮める
+        assertEquals(listOf(2, 6, 3), realloc.calls.map { it.newSize })
+    }
+
+    @Test
+    fun `latin1+utf16 どうしは、latin1 なら写し、UTF-16 で latin1 だけなら詰めて縮める`() {
+        memory.write(0x100, bytes(0x61, 0xe9))
+        val latin = CanonStrings.load(cx(LATIN1_UTF16), 0x100, 2)
+        assertEquals("aé", latin.value)
+        realloc.calls.clear()
+        val (b1, n1) = store(LATIN1_UTF16, latin)
+        assertArrayEquals(bytes(0x61, 0xe9), b1)
+        assertEquals(2L, n1)
+        assertEquals(listOf(Call(0, 0, 2, 2)), realloc.calls)
+
+        memory.write(0x200, bytes(0x61, 0, 0xe9, 0))
+        val wide = CanonStrings.load(cx(LATIN1_UTF16), 0x200, (2L or tag).toInt())
+        realloc.calls.clear()
+        val (b2, n2) = store(LATIN1_UTF16, wide)
+        assertArrayEquals(bytes(0x61, 0xe9), b2)
+        assertEquals(2L, n2)
+        assertEquals(listOf(4, 2), realloc.calls.map { it.newSize })
+
+        memory.write(0x300, bytes(0x42, 0x30))
+        val kana = CanonStrings.load(cx(LATIN1_UTF16), 0x300, (1L or tag).toInt())
+        realloc.calls.clear()
+        val (_, n3) = store(LATIN1_UTF16, kana)
+        assertEquals(1L or tag, n3)
+        assertEquals(listOf(2), realloc.calls.map { it.newSize })
+        // latin1 の値を UTF-16 へ
+        realloc.calls.clear()
+        val (b4, n4) = store(UTF16, latin)
+        assertArrayEquals(bytes(0x61, 0, 0xe9, 0), b4)
+        assertEquals(2L, n4)
+        assertEquals(listOf(Call(0, 0, 2, 4)), realloc.calls)
+    }
+
+    @Test
+    fun `4 バイトの文字とサロゲートの対`() {
+        val (b, n) = store(UTF16, CanonValue.str("😀"))
+        assertArrayEquals("😀".toByteArray(Charsets.UTF_16LE), b)
+        assertEquals(2L, n)
+        memory.write(0x100, "😀".toByteArray())
+        assertEquals("😀", CanonStrings.load(cx(UTF8), 0x100, 4).value)
+    }
+
+    @Test
+    fun `ホストの文字列の対になっていないサロゲートは U+FFFD にする`() {
+        val s = CanonValue.str("a\uD800b")
+        assertEquals("a�b", s.value)
+        assertEquals(5L, s.taggedCodeUnits)
+        assertEquals("😀", CanonValue.str("😀").value)
+    }
+
+    @Test
+    fun `正しくない符号化はトラップ`() {
+        memory.write(0x100, bytes(0xc3, 0x28))
+        trap { CanonStrings.load(cx(UTF8), 0x100, 2) }
+        // UTF-8 のサロゲート（CESU）
+        memory.write(0x100, bytes(0xed, 0xa0, 0x80))
+        trap { CanonStrings.load(cx(UTF8), 0x100, 3) }
+        // UTF-16 の対になっていないサロゲート
+        memory.write(0x100, bytes(0x00, 0xd8, 0x61, 0x00))
+        trap { CanonStrings.load(cx(UTF16), 0x100, 2) }
+        memory.write(0x100, bytes(0x00, 0xdc))
+        trap { CanonStrings.load(cx(LATIN1_UTF16), 0x100, (1L or tag).toInt()) }
+    }
+
+    @Test
+    fun `長さ・align・範囲の順に確かめる`() {
+        // UTF-16 は align 2（長さ 0 でも）
+        trap { CanonStrings.load(cx(UTF16), 1, 0) }
+        trap { CanonStrings.load(cx(LATIN1_UTF16), 1, 0) }
+        assertEquals("", CanonStrings.load(cx(UTF8), 1, 0).value)
+        // 長さの上限は align より先
+        val e = assertThrows<WasmTrapException> { CanonStrings.load(cx(UTF16), 1, 1 shl 27) }
+        assertEquals(WasmTrapKind.OTHER, e.kind)
+        val oob = assertThrows<WasmTrapException> { CanonStrings.load(cx(UTF8), 0xfff0, 0x20) }
+        assertEquals(WasmTrapKind.MEMORY_OUT_OF_BOUNDS, oob.kind)
+    }
+}
