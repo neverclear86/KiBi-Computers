@@ -594,6 +594,54 @@ class BootTest {
     }
 
     @Test
+    fun `起動の途中のrebootでも、取り消して通知を積み、起動し直すまで止まっていない扱い`() = env {
+        // #626: 起動の途中の reboot は、求めの印が立った後で endBoot が起動中の印を下ろし、maybePostRebootLocked が通知を積む。
+        // その受け渡しの間も、ロックなしの読み手に「止まっていて再起動の途中でもない」に見えない
+        disks.withInit("d", exe(foreverInit()))
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            h.scheduler.hooks.beforeInitExec = null
+            reached.countDown()
+            release.await()
+        }
+        assertTrue(m.boot(bootDisks("d")))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        assertTrue(m.isBooting)
+        assertTrue(m.reboot())
+        assertTrue(m.isBooting, "起動の手順はまだ終わっていない")
+        assertEquals(MachineState.STOPPED, m.state)
+        assertTrue(m.isRunningBootingOrRebooting, "起動の途中で reboot を受け付けた直後")
+        // 起動の手順を進めて取り消させる間、別のスレッド（メインスレッドの代わり）に読み続けさせる。通知は tick で配るので、
+        // 起動中の印が下りて通知を積むまでの間は、tick を回さない（配って起動し直す区間は、この読み手の対象にしない）
+        val seenFalse = AtomicBoolean()
+        val reads = AtomicInteger()
+        val stopReader = AtomicBoolean()
+        val reader = Thread {
+            while (!stopReader.get()) {
+                if (!m.isRunningBootingOrRebooting) seenFalse.set(true)
+                reads.incrementAndGet()
+            }
+        }.apply { isDaemon = true }
+        reader.start()
+        try {
+            eventually { reads.get() > 0 }
+            release.countDown()
+            eventually { !m.isBooting && m.isRebootPending }
+        } finally {
+            stopReader.set(true)
+            reader.join(READER_WAIT_MILLIS)
+        }
+        assertFalse(reader.isAlive, "読み手が終わらない")
+        assertFalse(seenFalse.get(), "起動の取り消しから通知を積むまでの間に、再起動の途中でないように見えた")
+        assertEquals(MachineState.STOPPED, m.state)
+        assertEquals(0, host.reboots.get(), "通知はまだ配っていない")
+        assertTrue(m.isRunningBootingOrRebooting, "取り消して通知を積み、配る前")
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting }
+        assertTrue(m.isRunningBootingOrRebooting, "起動し直した後")
+    }
+
+    @Test
     fun `CRASHEDと閉じたスケジューラでは起動しない`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine()
