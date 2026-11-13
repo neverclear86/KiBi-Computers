@@ -880,7 +880,28 @@ class DiskFileSystemTest {
     }
 
     @Test
-    fun `マウントのときの数え直しは、使えない名前とシンボリックリンクの先を数えない（#607）`() {
+    fun `マウントのときの数え直しは、使えない名前の項目と、その下の木を数えない（#607）`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.write(d.resolve("ok"), ByteArray(10))
+        // 8.3 形式の短い名前の形は、どのホストでも作れ、どのホストでも使えない名前
+        assertFalse(DiskNames.isValid("zz~1"))
+        Files.write(d.resolve("zz~1"), ByteArray(100))
+        val badDir = Files.createDirectories(d.resolve("yy~1"))
+        Files.write(badDir.resolve("inner"), ByteArray(200))
+        Files.createDirectories(badDir.resolve("deep"))
+        // 深いところにも
+        val sub = Files.createDirectories(d.resolve("sub"))
+        Files.write(sub.resolve("ww~2"), ByteArray(300))
+        Files.write(sub.resolve("keep"), ByteArray(7))
+        val fs = disk()
+        assertEquals(listOf("ok", "sub"), fs.readDirectory(DiskFileSystem.ROOT_NODE).map { it.name }.sorted())
+        assertEquals(3, fs.usedEntries)
+        assertEquals(10 + 7 + 3 * DiskFileSystem.ENTRY_COST, fs.usedBytes)
+        assertEquals(visibleUsage(fs), fs.usedEntries to fs.usedBytes)
+    }
+
+    @Test
+    fun `マウントのときの数え直しは、シンボリックリンクの先を数えない（#607）`() {
         val outside = Files.createDirectories(dir.resolve("outside"))
         Files.write(outside.resolve("secret"), ByteArray(500))
         val d = Files.createDirectories(dir.resolve("disk"))
@@ -889,6 +910,83 @@ class DiskFileSystemTest {
         val fs = disk()
         assertEquals(1, fs.usedEntries)
         assertEquals(10 + DiskFileSystem.ENTRY_COST, fs.usedBytes)
+    }
+
+    /**
+     * ディレクトリ [d] の一覧を読めなくして、元に戻す手続きを返す。できないホスト（root で動いているなど）では `null`。
+     * POSIX は権限を外し、Windows は ACL で一覧を拒否する
+     */
+    private fun makeUnlistable(d: Path): (() -> Unit)? {
+        fun listable() = runCatching { Files.newDirectoryStream(d).use { it.iterator().hasNext() } }.isSuccess
+        val posix = Files.getFileAttributeView(d, java.nio.file.attribute.PosixFileAttributeView::class.java)
+        if (posix != null) {
+            val before = posix.readAttributes().permissions()
+            posix.setPermissions(emptySet())
+            val restore = { posix.setPermissions(before) }
+            if (listable()) {
+                restore()
+                return null
+            }
+            return restore
+        }
+        val acl = Files.getFileAttributeView(d, java.nio.file.attribute.AclFileAttributeView::class.java) ?: return null
+        val before = acl.getAcl()
+        val deny = java.nio.file.attribute.AclEntry.newBuilder()
+            .setType(java.nio.file.attribute.AclEntryType.DENY)
+            .setPrincipal(acl.owner)
+            .setPermissions(java.nio.file.attribute.AclEntryPermission.LIST_DIRECTORY)
+            .build()
+        acl.setAcl(listOf(deny) + before)
+        val restore = { acl.setAcl(before) }
+        if (listable()) {
+            restore()
+            return null
+        }
+        return restore
+    }
+
+    @Test
+    fun `マウントのときの数え直しは、読めないディレクトリの下を数えずに続け、マウントを失敗させない（#607）`() {
+        val d = Files.createDirectories(dir.resolve("disk"))
+        Files.write(d.resolve("ok"), ByteArray(10))
+        val locked = Files.createDirectories(d.resolve("locked"))
+        Files.write(locked.resolve("inner"), ByteArray(500))
+        Files.createDirectories(locked.resolve("deeper"))
+        val fine = Files.createDirectories(d.resolve("fine"))
+        Files.write(fine.resolve("f"), ByteArray(7))
+        val restore = makeUnlistable(locked)
+        assumeTrue(restore != null, "ディレクトリの一覧を読めなくできるホストだけ")
+        try {
+            val fs = disk()
+            // 読めないディレクトリ自身は数え、その下は数えない。ほかは続けて数える
+            assertEquals(4, fs.usedEntries)
+            assertEquals(10 + 7 + 4 * DiskFileSystem.ENTRY_COST, fs.usedBytes)
+        } finally {
+            restore?.invoke()
+        }
+    }
+
+    @Test
+    fun `数えていないファイルを縮めても、使用量は0未満にならない（#607）`() {
+        val fs = disk()
+        fs.writeAll("/counted", "0123456789")
+        // マウントの後に外で置いたものは数えていない
+        Files.write(dir.resolve("disk/late"), ByteArray(5000))
+        val late = fs.stat(p("/late")).node
+        fs.setSize(late, 0)
+        assertEquals(0, fs.usedBytes)
+        assertEquals(1, fs.usedEntries)
+    }
+
+    @Test
+    fun `数えていない項目を名前の変更で置き換えても、使用量は0未満にならない（#607）`() {
+        val fs = disk()
+        fs.writeAll("/a", "0123456789")
+        Files.write(dir.resolve("disk/b"), ByteArray(5000))
+        fs.rename(p("/a"), p("/b"), false)
+        assertEquals(0, fs.usedBytes)
+        assertEquals(0, fs.usedEntries)
+        assertEquals(listOf("b"), fs.readDirectory(DiskFileSystem.ROOT_NODE).map { it.name })
     }
 
     @Test
