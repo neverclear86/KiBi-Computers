@@ -25,7 +25,9 @@ import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.BootFailure
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.machine.MachineReleaseReason
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
@@ -650,6 +652,38 @@ object TestComputerGameTests {
                 "wait for the machine to boot again: ${machine.state}",
             )
             case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * つなげる数（`MachineConfig.maxDevices`。#66）が2のマシンでは、スピーカーと画面がつながり、キーボードは断られる。
+     * 断られたキーボードは手放し（ほかのケースが使える）、マシンは動き続ける
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun deviceLimitRefusesKeyboardAndKeepsRunning(helper: GameTestHelper) {
+        val (_, screen, keyboard) = build(helper)
+        val manager = ServerMachines.current!!
+        // ケースのブロックの電源は入れず、上限の小さいマシンを同じ場所の結線でつなぐ
+        val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
+        val wiring = TestComputerWiring()
+        val machine = manager.attach(key, wiring, MachineConfig.builder().maxDevices(2).build())
+        val speaker = UUID.randomUUID().toString()
+        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, TestComputerWiring.bootConfig(emptyList(), TestComputerWiring.TEST_BOOT_DISK))
+        helper.assertTrue(machine.devices.limit == 2, "the limit should come from the config")
+        helper.assertTrue(wiring.connectedScreen === screen, "the screen should be connected")
+        helper.assertTrue(wiring.connectedKeyboard == null, "the keyboard should be refused")
+        helper.assertTrue(keyboard.owner == null, "the refused keyboard should be released")
+        helper.assertTrue(
+            machine.devices.list().map { it.address } == listOf(speaker, screen.deviceAddress),
+            "only the speaker and the screen should be attached: ${machine.devices.list()}",
+        )
+        helper.succeedWhen {
+            helper.assertTrue(machine.state == MachineState.RUNNING, "the machine should keep running: ${machine.state}")
+            helper.assertTrue(wiring.connectedScreenDevice === machine.devices.primaryScreen, "the screen should be the console")
+            wiring.disconnect()
+            manager.release(key, machine, MachineReleaseReason.REMOVED)
             helper.setBlock(CASE, Blocks.AIR)
         }
     }

@@ -851,7 +851,7 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
         /** UTF-8 の1文字の最大のバイト数 */
         private const val MAX_CHAR_BYTES = 4
 
-        /** 画面の大きさの既定（仮の値。画面のデバイスがつながったら #65・#66 が入れる） */
+        /** 画面の大きさの既定（仮の値。画面のデバイスがつながったら `ScreenDevice` が入れる。#65） */
         const val DEFAULT_COLUMNS: Int = 80
         const val DEFAULT_ROWS: Int = 25
 
