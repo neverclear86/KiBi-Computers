@@ -152,6 +152,12 @@ public class MachineConfig private constructor(builder: Builder) {
      */
     public val maxProcessMemoryBytes: Long = builder.maxProcessMemoryBytes ?: builder.memoryBytes
 
+    /**
+     * つなげるデバイスの数の上限（#66、ADR 0066）。`DeviceBus` につないだもの全部を1つずつ数える（ケースのスピーカーも含む）。
+     * 上限に達したら `DeviceBus.attach` は断る（`false`）。保存しない（CPU から毎回決める）。仮: 16（確定は #122・#251）
+     */
+    public val maxDevices: Int = builder.maxDevices
+
     /** RAM のページ数 */
     internal val memoryPages: Int get() = pagesOf(memoryBytes)
 
@@ -165,6 +171,7 @@ public class MachineConfig private constructor(builder: Builder) {
         internal var maxHostCallsPerTick: Int = 64
         internal var memoryBytes: Long = 32L * 1024 * 1024
         internal var maxProcessMemoryBytes: Long? = null
+        internal var maxDevices: Int = 16
 
         /** 1 tick に配る燃料（1 以上） */
         public fun fuelPerTick(value: Long): Builder = apply {
@@ -194,6 +201,12 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun maxProcessMemoryBytes(value: Long): Builder = apply {
             require(value >= WasmMemory.PAGE_SIZE) { "maxProcessMemoryBytes は ${WasmMemory.PAGE_SIZE} 以上" }
             maxProcessMemoryBytes = value
+        }
+
+        /** つなげるデバイスの数の上限（1 以上） */
+        public fun maxDevices(value: Int): Builder = apply {
+            require(value >= 1) { "maxDevices は 1 以上" }
+            maxDevices = value
         }
 
         /** 設定を作る。 */
@@ -1881,7 +1894,7 @@ public class Machine private constructor(
     }
 
     /**
-     * コンソールの画面の大きさを変える（画面のデバイスから。#65・#66）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException]。
+     * コンソールの画面の大きさを変える（画面のデバイス `ScreenDevice` から。#65）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException]。
      * 大きさが実際に変わったときだけ、同じロックの中で `tty-resize` のイベント（値は列・行・世代。ADR 0427）を入れる
      */
     internal fun resizeConsole(columns: Int, rows: Int) {
@@ -1997,12 +2010,15 @@ public class Machine private constructor(
     /**
      * まだ実行していない [obj]（表に入っていること）を、デバイスの呼び出しとして実行に回す（保存から戻したものの積み直しにも使う）。
      * 直接のメソッドは、このスレッドで実行してから返る。終わったら [obj] を終わりにして待ち手を起こす（閉じた後なら何もしない）。
-     * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）
+     * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）。
+     * [expectedKind] を渡したら、その種類のデバイスでなければ `detached`（device の fd からの呼び出し。#66。保存した呼び出しは
+     * address だけを持つので、戻したものは照合しない）
      */
-    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall): Long {
+    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall, expectedKind: String? = null): Long {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ってデバイスを呼ばない" }
         val queued = lock.withLockValue { obj.state as? PendingDeviceCall.State.Queued } ?: return 0
-        val started = devices.dispatcher.start(pid, queued.address, queued.method, queued.args) {
+        val device = devices.dispatcher.resolve(queued.address, expectedKind)
+        val started = devices.dispatcher.start(pid, device, queued.method, queued.args) {
             lock.withLockValue { obj.markRunning() }
         }
         lock.withLockValue {

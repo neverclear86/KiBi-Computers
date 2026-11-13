@@ -4,6 +4,7 @@ import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.device.CallResult
 import pro.ikili.kibicomputers.core.device.DeviceCallException
 import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.device.MethodInfo
 import pro.ikili.kibicomputers.core.kernel.DiskListing
 import pro.ikili.kibicomputers.core.kernel.HostCall
 import pro.ikili.kibicomputers.core.kernel.KernelState
@@ -485,6 +486,38 @@ internal interface ProcessContext {
      */
     @Throws(FsException::class)
     fun takeDeviceCall(fd: Int): CallResult?
+
+    // ---- 開いたデバイス（fd。WIT の `device` resource のメソッド。#66、ADR 0066） ----
+    // ハンドルからデバイスを引くときは、毎回 address で引く（復元したハンドルも、後でつながったデバイスを使える）。
+    // 今その address につながっているデバイスの種類がハンドルの種類と違えば、外れているのと同じに扱う。
+
+    /**
+     * device の fd [fd] の address と種類（WIT の `info`）。外れていても返す。待たない。燃料を取らない。どのスレッドから呼んでもよい。
+     * device でなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class)
+    fun deviceInfo(fd: Int): DeviceInfo
+
+    /**
+     * device の fd [fd] のメソッドの一覧（WIT の `methods`。登録した順）。外れている・種類が違うなら空。
+     * 待たない。燃料を取らない。どのスレッドから呼んでもよい。device でなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class)
+    fun deviceMethods(fd: Int): List<MethodInfo>
+
+    /**
+     * device の fd [fd] で [invokeDevice] と同じ呼び出しをする（WIT の `invoke`）。外れている・種類が違うなら [DeviceCallException]（`detached`）。
+     * device でなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class, DeviceCallException::class, ProcessKilledException::class, WasmTrapException::class)
+    fun invokeDevice(fd: Int, method: String, args: List<DeviceValue>): List<DeviceValue>
+
+    /**
+     * device の fd [fd] で [startDeviceCall] と同じ呼び出しを積む（WIT の `start`）。外れている・種類が違うなら、積んだ呼び出しが
+     * `detached` で終わる。device でなければ `FsException(BADF)`
+     */
+    @Throws(FsException::class)
+    fun startDeviceCall(fd: Int, method: String, args: List<DeviceValue>): Int
 
     /**
      * マシンを止める（`Machine.stop`。#49・#306。ADR 0306）。必ず受け付け、このプロセスも止まるので戻らない

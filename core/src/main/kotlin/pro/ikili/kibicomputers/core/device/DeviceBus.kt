@@ -22,6 +22,8 @@ public data class DeviceInfo(
  * - 表は変えるときだけ作り直す変わらない表（copy-on-write）で、呼び出し（プロセスのスレッド）はロックなしで読む。
  *   デバイスは tick を持たないので、tick ごとのコストは台数とデバイス数に比例しない
  * - 画面（[ScreenDevice]）を最初につないだものが [primaryScreen]。カーネルのコンソールの出力はそこへ行く
+ * - つなげる数は [limit]（`MachineConfig.maxDevices`。CPU で決まる。#66、ADR 0066）まで。満杯なら [attach] は断る（`false`）。
+ *   外して空いても自分ではつなぎ直さない（つなぎ直すのは接続層。#129）
  *
  * 組み込みの [ScreenDevice]・[KeyboardDevice] はマシンのコンソールにつながるので、メインスレッドからつなぐ・外す。
  */
@@ -31,6 +33,10 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
 
     @Volatile
     private var table: Map<String, AttachedDevice> = emptyMap()
+
+    /** [table] の一覧（[list] が返す。表を作り直すときに一緒に作る） */
+    @Volatile
+    private var listing: List<DeviceInfo> = emptyList()
 
     @Volatile
     private var primaryScreenValue: ScreenDevice? = null
@@ -46,22 +52,30 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
     /** 最初につないだ画面。なければ `null`（カーネルのコンソールの出力先。なければ `MachineHost.onConsoleOutput`） */
     public val primaryScreen: ScreenDevice? get() = primaryScreenValue
 
+    /** つなげるデバイスの数の上限（`MachineConfig.maxDevices`。動いている間は変わらない。ロックなしで読める） */
+    public val limit: Int get() = machine.config.maxDevices
+
+    /** 今つないでいるデバイスの数（ロックなしで読める） */
+    public val size: Int get() = table.size
+
     /**
      * [device] を [address] でつなぐ。種類とメソッドの表をここで1回だけ読み、[Device.onAttached] を呼ぶ。
+     * もう [limit] 個つないでいたら、何もせずに `false` を返す（表も [generation] も変えない。#66）。
      *
+     * @return つないだら `true`。上限に達していて断ったら `false`
      * @throws IllegalArgumentException address の形が違う・もうその address でつないでいる・種類の形が違う
      */
-    public fun attach(address: String, device: Device) {
+    public fun attach(address: String, device: Device): Boolean {
         DeviceAddress.parse(address)
         val kind = device.kind
         require(DeviceKind.isValid(kind)) { "デバイスの種類は <名前空間>:<名前>（${DeviceKind.MAX_BYTES} バイトまで）: $kind" }
         val methods = device.methods
         synchronized(writeLock) {
             require(address !in table) { "address $address のデバイスはもうつないである" }
+            // 数えてから入れるまでを同じロックの中で行う（並んだ attach でも上限を越えない）
+            if (table.size >= limit) return false
             val attached = AttachedDevice(this, address, kind, device, methods)
-            table = LinkedHashMap(table).also { it[address] = attached }
-            recomputePrimaryScreen()
-            generationCounter.incrementAndGet()
+            setTableLocked(LinkedHashMap(table).also { it[address] = attached })
             try {
                 device.onAttached(attached)
             } catch (t: Throwable) {
@@ -70,6 +84,7 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
                 throw t
             }
         }
+        return true
     }
 
     /**
@@ -83,8 +98,11 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
         true
     }
 
-    /** つないでいるデバイスの一覧（つないだ順。待たない） */
-    public fun list(): List<DeviceInfo> = table.values.map { DeviceInfo(it.address, it.kind) }
+    /**
+     * つないでいるデバイスの一覧（つないだ順。待たない。割り当てない）。表を変えるまで同じ変わらないリストを返す。
+     * 並びは復元やつなぎ直しで変わりうる（ゲストは並びに頼れない）
+     */
+    public fun list(): List<DeviceInfo> = listing
 
     /** [address] でつないでいるデバイス。なければ `null`（ロックなしで読む） */
     internal fun find(address: String): AttachedDevice? = table[address]
@@ -94,11 +112,17 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
 
     private fun removeLocked(address: String): AttachedDevice? {
         val attached = table[address] ?: return null
-        table = LinkedHashMap(table).also { it.remove(address) }
         attached.attached = false
+        setTableLocked(LinkedHashMap(table).also { it.remove(address) })
+        return attached
+    }
+
+    /** 表を [next] にし、一覧・最初の画面・[generation] を合わせる（[writeLock] の中で呼ぶ） */
+    private fun setTableLocked(next: Map<String, AttachedDevice>) {
+        table = next
+        listing = java.util.Collections.unmodifiableList(next.values.map { it.info })
         recomputePrimaryScreen()
         generationCounter.incrementAndGet()
-        return attached
     }
 
     private fun recomputePrimaryScreen() {

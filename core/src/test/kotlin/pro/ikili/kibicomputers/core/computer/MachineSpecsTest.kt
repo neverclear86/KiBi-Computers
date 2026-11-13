@@ -22,6 +22,26 @@ class MachineSpecsTest {
         val config = MachineSpecs.configOf(CaseTier.SUPERIOR) { null }
         assertEquals(MachineConfig.DEFAULT.fuelPerTick, config.fuelPerTick)
         assertEquals(MachineConfig.DEFAULT.memoryBytes, config.memoryBytes)
+        assertEquals(MachineConfig.DEFAULT.maxDevices, config.maxDevices)
+    }
+
+    @Test
+    fun `CPU のティアで接続数が決まり、仮の値は 8・12・16・32・256`() {
+        val tier = CaseTier.SUPERIOR
+        val cpu = tier.firstSlot(PartKind.CPU)
+        val expected = mapOf(
+            PartTier.TIER_1 to 8,
+            PartTier.TIER_2 to 12,
+            PartTier.TIER_3 to 16,
+            PartTier.TIER_4 to 32,
+            PartTier.CREATIVE to 256,
+        )
+        for ((part, devices) in expected) {
+            assertEquals(devices, part.cpuMaxDevices)
+            assertEquals(devices, MachineSpecs.configOf(tier, parts(part, cpu)).maxDevices, "$part")
+        }
+        // 最低のティアでも、ケースのスピーカー・画面・キーボードの3つは入る
+        assertTrue(PartTier.entries.all { it.cpuMaxDevices >= 3 })
     }
 
     @Test
@@ -41,6 +61,7 @@ class MachineSpecsTest {
         val others = intArrayOf(tier.firstSlot(PartKind.STORAGE), tier.firstSlot(PartKind.BOOT), tier.firstSlot(PartKind.EXPANSION))
         val config = MachineSpecs.configOf(tier, parts(PartTier.CREATIVE, *others))
         assertEquals(MachineConfig.DEFAULT.fuelPerTick, config.fuelPerTick)
+        assertEquals(MachineConfig.DEFAULT.maxDevices, config.maxDevices)
         assertEquals(MachineConfig.DEFAULT.memoryBytes, config.memoryBytes)
     }
 }

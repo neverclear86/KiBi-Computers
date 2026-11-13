@@ -153,12 +153,14 @@ internal class Harness(
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
         memoryBytes: Long? = null,
         maxProcessMemoryBytes: Long? = null,
+        maxDevices: Int? = null,
     ): Machine =
         scheduler.createMachine(
             host ?: MachineHost { m, s, _ -> events += m.id to s },
             MachineConfig.builder().fuelPerTick(fuelPerTick).maxProcesses(maxProcesses).maxHostCallsPerTick(maxHostCallsPerTick).apply {
                 memoryBytes?.let { memoryBytes(it) }
                 maxProcessMemoryBytes?.let { maxProcessMemoryBytes(it) }
+                maxDevices?.let { maxDevices(it) }
             }.build(),
             environment,
         )
