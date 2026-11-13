@@ -600,6 +600,13 @@ object ServerMachines {
         return ok
     }
 
+    /**
+     * [cases] に、待てば保存の判定が READY に近づく台（[pro.ikili.kibicomputers.core.computer.ComputerCase.isSettlingForSave]）があるか。
+     * アンロードと停止の待ちは、メインスレッドで待つので、再起動の通知を積んだ後の台（起動し直すまでの待ちの間を含む。#635）は
+     * 待っても解けない。待たずに取り出す（`REBOOT_PENDING` の冷えた起動になるのは、待っても変わらない）
+     */
+    internal fun anySettling(cases: List<CaseBlockEntity>): Boolean = cases.any { it.computer.isSettlingForSave }
+
     // ---- チャンクのアンロード ----
 
     private fun onChunkUnload(event: ChunkEvent.Unload) {
@@ -638,7 +645,7 @@ object ServerMachines {
         if (targets.isNotEmpty()) {
             val budget = TimeUnit.MILLISECONDS.toNanos(saveConfig.unloadWaitBudgetMillis)
             val start = System.nanoTime()
-            while (unloadWaitedNanos + (System.nanoTime() - start) < budget && targets.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
+            while (unloadWaitedNanos + (System.nanoTime() - start) < budget && anySettling(targets)) {
                 LockSupport.parkNanos(WAIT_STEP_NANOS)
             }
             unloadWaitedNanos += System.nanoTime() - start
@@ -796,7 +803,7 @@ object ServerMachines {
         val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(saveConfig.stopQuiesceMillis)
-        while (System.nanoTime() < deadline && running.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
+        while (System.nanoTime() < deadline && anySettling(running)) {
             LockSupport.parkNanos(WAIT_STEP_NANOS)
         }
         var saved = 0

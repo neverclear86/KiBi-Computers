@@ -355,6 +355,9 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     /** マシンの今の判定。マシンがなければ `null` */
     public fun saveReadiness(): SaveReadiness? = slot.readiness()
 
+    /** マシンの保存の判定が、待てば READY に近づくか（[MachineSlot.isSettlingForSave]）。マシンがなければ `false` */
+    public val isSettlingForSave: Boolean get() = slot.isSettlingForSave
+
     /** 止めている間に、もう取り出した（[MachineSlot.isCaptured]） */
     public val isCaptured: Boolean get() = slot.isCaptured
 

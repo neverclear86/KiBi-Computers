@@ -18,15 +18,19 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.machine.MachineManager
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -34,6 +38,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import java.nio.file.Path
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /** ケースのティアと電源・状態（#121） */
@@ -684,6 +689,56 @@ class ComputerCaseTest {
         assertSame(machine, case.machine)
         assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED, MachineState.RUNNING), events.states.toList())
         // 2回目の起動の init は hold で眠り続ける
+        assertEquals("hold", modeFile())
+    }
+
+    @Test
+    fun `再起動を待つ間はSTOPPEDが先に届いても電源を切らず、期限の後に同じマシンが起動し直す`() {
+        // #635: 待ちがあると STOPPED の通知だけが先に配られ、再起動の通知は期限の tick まで来ない
+        val modeFile = powerInitDisk("disk-a", "reboot-once")
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        assertEquals(ComputerStatus.RUNNING, case.turnOn(manager, "a", withDisk(case.tier), true, config))
+        val machine = case.machine!!
+        // 借りを積んでおき、1回目の再起動から待たせる（借りは boot では戻らない）
+        machine.rebootDebt = 4 * RebootBackoff.DEFAULT.decayTicks
+        assertTrue(machine.boot(BootConfig.builder().addBootDisk("disk-a").build()))
+        tickUntil("待ちに入らない: ${events.states}") { machine.isRebootDeferred }
+        assertTrue(machine.awaitTermination(5_000))
+        // 状態の通知は次の tick で配る。待ち（40 tick）の間に STOPPED まで届く
+        tickUntil("STOPPED が届かない: ${events.states}") { events.states.size >= 3 }
+        assertTrue(machine.isRebootDeferred, "STOPPED が届いた時点でも、まだ待っている")
+        assertEquals(MachineState.STOPPED, machine.state)
+        assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED), events.states.toList())
+        assertEquals(0, events.reboots.get())
+        assertTrue(case.poweredOn, "待つ間に STOPPED を受け取っても電源を切らない")
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertSame(machine, case.machine)
+        assertSame(machine, manager["a"])
+        // 保存: 判定は TRANSIENT のまま（自動保存は前の世代を残す）。tick でしか解けないので、メインスレッドで待つ呼び手は待たない
+        assertEquals(SaveReadiness.TRANSIENT, case.saveReadiness())
+        assertFalse(case.isSettlingForSave)
+        assertNull(case.capture(CapturePolicy.SKIP_IF_TRANSIENT))
+        // 待たずに取り出す（アンロード）と、再起動の途中の冷えた起動として書く
+        assertTrue(case.prepareUnload())
+        val snapshot = case.capture(CapturePolicy.KILL_TRANSIENT)!!.build(UUID.randomUUID(), 1, "test")
+        assertEquals(ColdBootReason.REBOOT_PENDING, snapshot.coldBootReason)
+        assertEquals(emptyList<Int>(), snapshot.killedPids)
+        case.endQuiesce()
+        // 期限の前の tick でも、電源も表示も変わらない
+        repeat(5) {
+            manager.tick()
+            assertTrue(machine.isRebootDeferred)
+            assertTrue(case.poweredOn)
+            assertEquals(ComputerStatus.RUNNING, case.status)
+        }
+        tickUntil("起動し直さない: ${events.states}") {
+            events.reboots.get() == 1 && events.states.size >= 4 && !machine.isBooting && !machine.isRebootPending
+        }
+        assertTrue(case.poweredOn)
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertSame(machine, case.machine)
+        assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED, MachineState.RUNNING), events.states.toList())
         assertEquals("hold", modeFile())
     }
 }

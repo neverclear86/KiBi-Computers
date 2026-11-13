@@ -86,6 +86,9 @@ public class MachineSlot<K : Any> {
     /** 今の判定。マシンがなければ `null` */
     public fun readiness(): SaveReadiness? = current?.saveReadiness()
 
+    /** マシンの保存の判定が、待てば READY に近づくか（[Machine.isSettlingForSave]）。マシンがなければ `false` */
+    public val isSettlingForSave: Boolean get() = current?.isSettlingForSave == true
+
     /** 止めている間に、もう取り出した */
     public val isCaptured: Boolean get() = key?.let { manager?.isCaptured(it) } == true
 

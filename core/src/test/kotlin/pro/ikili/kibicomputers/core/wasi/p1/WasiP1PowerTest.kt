@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.VOID
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -140,8 +141,8 @@ class WasiP1PowerTest {
         }
         .build()
 
-    private fun env(block: Env.() -> Unit) = timeout(limit) {
-        Harness().use { h ->
+    private fun env(rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT, block: Env.() -> Unit) = timeout(limit) {
+        Harness(rebootBackoff = rebootBackoff).use { h ->
             val host = Recorder()
             val m = h.machine(host = host)
             Env(h, m, host).block()
@@ -184,6 +185,25 @@ class WasiP1PowerTest {
         assertTrue("before\n" in host.console, host.console.toString())
         assertFalse("refused" in host.console || "after" in host.console, "戻らない: ${host.console}")
         assertFalse("init exited" in host.console, host.console.toString())
+    }
+
+    @ParameterizedTest
+    @EnumSource(Mode::class)
+    fun `起動し直すまで待つときも、rebootを呼んだプロセスはその場で止まって戻らない`(mode: Mode) = env(
+        // 1回目から 1,000 tick 待つ（#635）
+        RebootBackoff(freeReboots = 0, baseDelayTicks = 1000, maxDelayTicks = 1000, decayTicks = 1000, capLevels = 1),
+    ) {
+        boot()
+        val rt = spawnUnderInit(mode, "reboot")
+        // ホスト関数の中では待たない: 期限よりずっと前に、プロセスは KILLED で終わり、マシンは STOPPED の再起動の途中になる
+        tickUntil("止まらない: ${host.log}") { rt.process.state == ProcessState.KILLED && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(10_000))
+        assertTrue(m.isRebootPending)
+        assertTrue(m.deferredRebootDueTick > h.scheduler.now, "まだ期限の前")
+        assertEquals(0, host.reboots.get())
+        assertFalse(rt.lastError is WasmTrapException, "${rt.lastError}")
+        assertTrue("before\n" in host.console, host.console.toString())
+        assertFalse("refused" in host.console || "after" in host.console, "戻らない: ${host.console}")
     }
 
     @ParameterizedTest
