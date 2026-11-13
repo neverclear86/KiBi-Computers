@@ -161,6 +161,23 @@ class MachineRestoreTest {
     private fun request(saved: Saved, store: MachineSaveStore, finished: Finished): RestoreRequest =
         RestoreRequest(RestoreSource(store, saved.identity.id, saved.identity.generation), bootConfig(), finished.listener)
 
+    /**
+     * 後段の失敗で CRASHED を見た後、後始末が終わるまで待ってから tick する（#669。#596 の MachineRestoreBranchesTest と同じ待ち方）。
+     *
+     * state はロックを取らずに読むので、stopLocked の途中（setStateLocked(CRASHED) の直後で、復元の quiesce を閉じる前、
+     * 通知を積む前）で見えることがある。マシンのロックを一度取って completeRestore のロックの区間が終わるのを待ち、
+     * ロックの外の後始末（discard など）を走らせる起動用スレッドが空になるのも待つ。その後に tick して、知らせが積まれて
+     * いないこと（積む退行があっても、先の tick に間に合わないと見えないため）と CRASHED の通知を見る
+     */
+    private fun awaitRestoreCleanup(h: Harness, m: Machine) {
+        m.lock.withLockValue { }
+        val drained = { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
+        eventually(10_000, "起動用スレッドの後始末が終わらない") { drained() }
+        repeat(3) { h.scheduler.tick() }
+        eventually(10_000, "tick の後で起動用スレッドが空にならない") { drained() }
+        repeat(3) { h.scheduler.tick() }
+    }
+
     @Test
     fun `入力を待っていたp1のプロセスを戻し、続きの入力に答える`() = timeout(limit) {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
@@ -416,8 +433,8 @@ class MachineRestoreTest {
                 h.scheduler.tick()
                 m.state == MachineState.CRASHED
             }
-            repeat(3) { h.scheduler.tick() }
-            assertTrue(finished.outcomes.isEmpty())
+            awaitRestoreCleanup(h, m)
+            assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
             assertFalse(m.isQuiesced)
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
@@ -451,9 +468,12 @@ class MachineRestoreTest {
                 h.scheduler.tick()
                 m.state == MachineState.CRASHED
             }
-            repeat(3) { h.scheduler.tick() }
-            assertTrue(finished.outcomes.isEmpty())
+            awaitRestoreCleanup(h, m)
+            assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isColdBootPending, "後段の失敗は冷えた起動にしない")
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced)
+            assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             assertTrue(beforeInstall >= 10_000, "戻す途中で RAM を数えていない（$beforeInstall）")
             eventually(10_000, "RAM が返らない") { h.scheduler.memoryAccount.usedBytes == base }
             eventually(10_000, "ディスクを閉じない") { disk.retired.get() >= 1 }
