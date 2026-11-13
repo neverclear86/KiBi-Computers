@@ -245,6 +245,31 @@ class RestoreVersionTest {
     }
 
     @Test
+    fun `外枠そのものが読めなければ、版の違う置き場で戻してもMOD_VERSIONでなくUNREADABLE`() = timeout(limit) {
+        val old = store("old")
+        // 外枠の頭: magic（4）、形式の版（u16）、MOD のバージョン（writeUTF）、UUID、世代
+        val corruptions: List<Pair<String, (ByteArray) -> ByteArray>> = listOf(
+            "形式の版が違う" to { b -> b.copyOf().also { ByteBuffer.wrap(it).putShort(4, (MachineSnapshot.FORMAT_VERSION + 1).toShort()) } },
+            "magic が違う" to { b -> b.copyOf().also { it[0] = 'X'.code.toByte() } },
+            // MOD のバージョンの途中（長さの u16 の後の1バイト目）で切る
+            "外枠の途中で切れた" to { b -> b.copyOf(4 + 2 + 2 + 1) },
+        )
+        Harness().use { h ->
+            for ((name, corrupt) in corruptions) {
+                val identity = old.write(old.assignNewId(owner)!!, owner, fake()).identity
+                val file = old.generationFile(identity.id, identity.generation)
+                Files.write(file, corrupt(Files.readAllBytes(file)))
+                assertThrows(IOException::class.java, { old.readGenerationModVersion(identity.id, identity.generation) }, name)
+                val finished = Finished()
+                val m = restore(h, store("new"), identity, finished)
+                assertEquals(listOf(RestoreOutcome.COLD_BOOT to ColdBootCause.UNREADABLE), finished.outcomes.toList(), name)
+                assertColdBoot(m, finished, ColdBootCause.UNREADABLE)
+                m.close()
+            }
+        }
+    }
+
+    @Test
     fun `差分の世代で基準だけMODのバージョンが違えばMOD_VERSION`() = timeout(limit) {
         val s = store("new")
         // 基準（全体）だけ "old" で書き、差分は今の版 "new" で書く

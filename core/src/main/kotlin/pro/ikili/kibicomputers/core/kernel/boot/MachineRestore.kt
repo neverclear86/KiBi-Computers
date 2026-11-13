@@ -96,8 +96,9 @@ internal class PreparedRestore(
  * モジュールの読み込みを待つ間は、起動用のスレッドを持たない（#577）。読み込みが終わったら、続きを起動用のスレッドに積み直す。
  *
  * 前段（カーネルを変えない）:
- * 1. 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、読み（差分なら基準も）、
- *    [SnapshotDecoder.moduleSources] で p1 の層が参照するモジュールだけを読む（区画は展開しない）。
+ * 1. 戻す世代を決め（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.restorableGeneration]）、外枠の頭だけを読んで
+ *    MOD のバージョンを今のものと比べ（違えば中身を解釈せずに `MOD_VERSION`。#88、ADR 0088）、全体を読み（差分なら基準も、
+ *    同じように版を比べてから）、[SnapshotDecoder.moduleSources] で p1 の層が参照するモジュールだけを読む（区画は展開しない）。
  * 2. 別々のモジュールを順に1つずつ、置き場の元のバイト列から同じ読み込み方で読み込む（ProgramCache でサーバー全体と共有）。
  *    読み込みが終わっていなければ、終わったときに続きを積み直して、スレッドを返す。混んでいたら（[ProgramLoadBusyException]）、
  *    少し後にタイマーで積み直す。待つ間に持つのは、読んだままの（圧縮のままの）写しと、読み込んだ [Program] だけ。
@@ -212,7 +213,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
 
     private fun fallback(cause: ColdBootCause, message: String, t: Throwable? = null): Nothing = throw RestoreFallbackException(cause, message, t)
 
-    /** 1.: 世代を決めて読み、読み込むモジュールを知る */
+    /** 1.: 世代を決め、MOD のバージョンを比べてから読み、読み込むモジュールを知る */
     private fun begin(): PreparedRestore? {
         checkCancelled()
         val source = request.source

@@ -7,7 +7,7 @@
 
 - **保存形式は変えない。** MOD のバージョンは外枠に既に書いている（ADR 0081）。変換器の版も `PROCESS_ABI` 節に書いている（ADR 0082）。#88 はそれを戻すときに比べるだけ
 - 戻すときの前段（ADR 0085。起動用のスレッド）で、次を比べる。合わなければ冷えた起動にする
-  1. 外枠の MOD のバージョン（`MachineSnapshot.modVersion`）と今の MOD のバージョン（`MachineSaveStore.modVersion`。接続層が `ModList` から渡す）。合わなければ `ColdBootCause.MOD_VERSION`
+  1. 外枠の MOD のバージョン（`MachineSaveStore.readGenerationModVersion` で外枠の頭だけを読んだ値。`MachineSnapshot.modVersion` と同じもの）と今の MOD のバージョン（`MachineSaveStore.modVersion`。接続層が `ModList` から渡す）。合わなければ `ColdBootCause.MOD_VERSION`
   2. 差分の世代なら、基準の世代の MOD のバージョンも同じように比べる（`MOD_VERSION`）
   3. 計測ありのモジュールの変換器の版（`ModuleSource.instrumentationVersion`）と今の `Instrumentation.VERSION`。合わなければ `MODULE_MISMATCH`
 - 冷えた起動の理由 `MOD_VERSION` は実行時だけの `ColdBootCause` に足した。保存される `ColdBootReason`（`KILLED` 節の u8）には足さない
@@ -15,9 +15,9 @@
 
 ## 比べる順番
 
-1. 世代を決めて（`restorableGeneration`）、読む
-2. **MOD のバージョンを比べる。** ファイルを読む前に、外枠の頭だけを読んで（`MachineSaveStore.readGenerationModVersion`。ファイル全体の読み込み・CRC・節の解釈はしない）比べる。`KILLED` 節・差分の基準・`PROCESS_ABI` 節より先にする。版の違うファイルの中身は一切解釈しない（今の読み手が昔の形を正しく読める保証がないため。中身が今の形と合わなくても、理由は `UNREADABLE` でなく `MOD_VERSION` になる）。モジュールのコンパイルも始めない（MOD を更新した直後は電源の入っていた全台が当たるので、無駄なコンパイルと読み込みを全台分させない）。外枠そのものの形式の版（`FORMAT_VERSION`）が違うときは MOD のバージョンの位置が分からないので `UNREADABLE` のまま（形式の版を上げる変更は MOD の更新と一緒に出るので、そのときの1台ごとのログは許す）
-3. `KILLED` 節の理由（`KILLED_SECTION`）
+1. 世代を決める（`restorableGeneration`）。ファイルはまだ読まない
+2. **MOD のバージョンを比べる。** ファイル全体を読む前に、外枠の頭だけを読んで（`MachineSaveStore.readGenerationModVersion`。ファイル全体の読み込み・CRC・節の解釈はしない）比べる。`KILLED` 節・差分の基準・`PROCESS_ABI` 節より先にする。版の違うファイルの中身は一切解釈しない（今の読み手が昔の形を正しく読める保証がないため。中身が今の形と合わなくても、理由は `UNREADABLE` でなく `MOD_VERSION` になる）。モジュールのコンパイルも始めない（MOD を更新した直後は電源の入っていた全台が当たるので、無駄なコンパイルと読み込みを全台分させない）。外枠そのものの形式の版（`FORMAT_VERSION`）が違うときは MOD のバージョンの位置が分からないので `UNREADABLE` のまま（形式の版を上げる変更は MOD の更新と一緒に出るので、そのときの1台ごとのログは許す）
+3. 版が合えば、ファイル全体を読む（`readGeneration`）。読めなければ `UNREADABLE`。続いて `KILLED` 節の理由（`KILLED_SECTION`）
 4. 差分の基準は、外枠の頭だけを読んでその MOD のバージョンを比べてから、全体を読む。差分と基準は同じサーバーの中で書かれる（置き場は基準をメモリにしか覚えず、再起動の後の最初の保存は全体。ADR 0083）ので本来は一致するが、安く確かめられるので比べる
 5. 読み込むモジュールを知り、1つずつ読み込む。**計測ありのモジュールは、読み込みを頼む前に変換器の版を比べる。** 違えば読み込まずに `MODULE_MISMATCH` として覚え、使う終わっていないプロセスがあるときだけ冷えた起動の理由にする（ADR 0085 の「使わないモジュールで落とさない」）。計測しないモジュールの版は 0 なので比べない。読み込み直した後のハッシュの照合はそのまま残す
 
