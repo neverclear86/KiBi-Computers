@@ -126,6 +126,39 @@ class MachineRestoreTest {
         return Saved(written, input, output, pid)
     }
 
+    /** [saveWaitingPrompt] の `prompt` に、その子の `prompt` を足した2つが、入力を待ったところで保存する。子の pid も返す */
+    private fun saveWaitingPromptWithChild(h: Harness, store: MachineSaveStore): Pair<Saved, Int> {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 10_000_000)
+        val bytes = resource("prompt-wasi.wasm")
+        m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
+        m.vfs.createDirectory(VfsPath.parse("/bin"))
+        val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
+        m.vfs.write(f, bytes, 0, bytes.size)
+        fun spawn(): Triple<Int, Int, Int> {
+            val (input, output) = m.lock.withLockValue {
+                ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id
+            }
+            val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+            return Triple(m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio)), input, output)
+        }
+        val (pid, input, output) = spawn()
+        val (childPid, _, _) = spawn()
+        m.lock.withLockValue {
+            m.kernel.initPid = pid
+            // 2つ目を1つ目の子にする（表の親子の印だけ。子のハンドルは持たせない）
+            m.kernel.processes[childPid]!!.parentPid = pid
+        }
+        eventually(60_000, "入力を待たない") {
+            h.scheduler.tick()
+            m.stateOf(pid) == ProcessState.WAITING_EVENT && m.stateOf(childPid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
+        }
+        val identity = store.assignNewId(owner)!!
+        val written = store.write(identity, owner, m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
+        m.close()
+        return Saved(written, input, output, pid) to childPid
+    }
+
     private fun output(m: Machine, id: Int): String = m.lock.withLockValue {
         (m.kernel.objects[id] as ByteStream).availableBytes().toString(Charsets.UTF_8)
     }
@@ -433,6 +466,55 @@ class MachineRestoreTest {
                 assertTrue(m.kernel.processes.size > 0, "表を巻き戻した")
                 assertTrue(m.kernel.processes.all().all { it.state.isTerminal })
                 assertTrue(m.kernel.processes.all().any { it.state == ProcessState.KILLED })
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `採用済みの親と未採用の子が混ざる位置で後段が失敗しても、未採用の子は表に残ったままKILLEDになり、awaitTerminationが返る`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            // 親（init）と、その子の2つが、入力待ちで保存される
+            val (saved, childPid) = saveWaitingPromptWithChild(h, store)
+            val parentPid = saved.pid
+            val disk = CountingDisk()
+            openRootAs(h, disk)
+            var adopted = -1
+            // 1つ目を runtimes に入れた直後（1つ目のループの途中）で落とす。2つ目は runtimes に入らない
+            h.scheduler.hooks.afterRestoreAdopt = { _, pid ->
+                if (adopted < 0) {
+                    adopted = pid
+                    throw IllegalStateException("テストの失敗")
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "CRASHED にならない") {
+                h.scheduler.tick()
+                m.state == MachineState.CRASHED
+            }
+            h.awaitRestoreCleanup(m)
+            // 先に入れたのは親（pid の小さい方）で、子は runtimes に入っていない
+            assertEquals(parentPid, adopted, "親が先に runtimes に入っていない")
+            assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
+            assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
+            // stopLocked が最後まで進み、表のプロセスがすべて終わっている
+            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.lock.withLockValue {
+                assertNotNull(m.runtimes[parentPid], "親が runtimes にない")
+                assertNull(m.runtimes[childPid], "子が runtimes に入っている")
+                assertEquals(0, m.kernel.processes.liveCount())
+                // 表は巻き戻さない: 採用済みの親の終わりが、未採用の子を刈り取っていない
+                val child = m.kernel.processes[childPid]
+                assertNotNull(child, "未採用の子が表から外れた")
+                assertEquals(ProcessState.KILLED, child!!.state)
+                assertEquals(0, child.parentPid, "親なしに付け替わっていない")
+                assertNotNull(m.kernel.objects[child.objectId], "未採用の子の ProcessObject の参照が返った")
+                assertTrue(m.kernel.processes.all().all { it.state.isTerminal })
             }
             m.close()
         }
