@@ -603,7 +603,8 @@ object TestComputerGameTests {
 
     /**
      * 再起動を繰り返して起動し直すまでの待ち（#635）に入った台は、アンロードと停止の待ち（メインスレッドで保存の判定が変わるのを待つ）に
-     * 数えない。待ちの間の保存の判定は `TRANSIENT` のままだが、tick でしか解けないので、待つと予算を使い切るだけになる
+     * 数えない。待ちの間の保存の判定は `TRANSIENT` のままだが、tick でしか解けないので、待つと予算を使い切るだけになる。
+     * 待ちの間（STOPPED の通知は先に届く）もケースは電源を入れたまま・表示も RUNNING のままで、期限の後に同じマシンが起動し直す
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -612,19 +613,42 @@ object TestComputerGameTests {
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
         val machine = case.computer.machine!!
         var requested = 0
+        var sawDeferral = false
+        var deferredTicks = 0
         helper.succeedWhen {
-            if (!machine.isRebootDeferred) {
-                // 3 回までは待たずに起動し直す。起動し直したら、また求める
-                if (machine.state == MachineState.RUNNING && !machine.isBooting && !machine.isRebootPending) {
-                    helper.assertTrue(++requested <= 8, "the reboots should be deferred after a few requests")
-                    helper.assertTrue(machine.reboot(), "reboot should be accepted")
+            if (!sawDeferral) {
+                if (!machine.isRebootDeferred) {
+                    // 3 回までは待たずに起動し直す。起動し直したら、また求める
+                    if (machine.state == MachineState.RUNNING && !machine.isBooting && !machine.isRebootPending) {
+                        helper.assertTrue(++requested <= 8, "the reboots should be deferred after a few requests")
+                        helper.assertTrue(machine.reboot(), "reboot should be accepted")
+                    }
+                    helper.assertTrue(false, "wait for the reboot to be deferred ($requested requests)")
                 }
-                helper.assertTrue(false, "wait for the reboot to be deferred ($requested requests)")
+                sawDeferral = true
+                helper.assertTrue(machine.isRebootPending, "a deferred reboot is still pending")
+                helper.assertTrue(machine.saveReadiness() == SaveReadiness.TRANSIENT, "the save readiness stays transient")
+                helper.assertTrue(!case.computer.isSettlingForSave, "waiting for a deferred reboot would only burn the wait budget")
+                helper.assertTrue(!ServerMachines.anySettling(listOf(case)), "the unload and stop waits should not wait for it")
             }
-            helper.assertTrue(machine.isRebootPending, "a deferred reboot is still pending")
-            helper.assertTrue(machine.saveReadiness() == SaveReadiness.TRANSIENT, "the save readiness stays transient")
-            helper.assertTrue(!case.computer.isSettlingForSave, "waiting for a deferred reboot would only burn the wait budget")
-            helper.assertTrue(!ServerMachines.anySettling(listOf(case)), "the unload and stop waits should not wait for it")
+            if (machine.isRebootDeferred) {
+                // 待ちの間: マシンは STOPPED だが、ケースは電源を切らず、表示も変えない
+                deferredTicks++
+                helper.assertTrue(machine.state == MachineState.STOPPED, "the deferred machine is stopped: ${machine.state}")
+                helper.assertTrue(case.computer.poweredOn, "the case should stay powered on while the reboot is deferred")
+                helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "the case should show RUNNING: ${case.computer}")
+                helper.assertTrue(case.computer.machine === machine, "the case should keep the machine")
+                helper.assertTrue(false, "wait for the deferred reboot ($deferredTicks ticks)")
+            }
+            // 期限の後: 同じマシンがケース経由で起動し直す
+            helper.assertTrue(deferredTicks > 1, "the reboot should have been deferred for some ticks ($deferredTicks)")
+            helper.assertTrue(case.computer.machine === machine, "the case should keep the machine after the reboot")
+            helper.assertTrue(case.computer.poweredOn, "the case should stay powered on after the reboot")
+            helper.assertTrue(case.computer.status == ComputerStatus.RUNNING, "the case should show RUNNING: ${case.computer}")
+            helper.assertTrue(
+                machine.state == MachineState.RUNNING && !machine.isBooting && !machine.isRebootPending,
+                "wait for the machine to boot again: ${machine.state}",
+            )
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }

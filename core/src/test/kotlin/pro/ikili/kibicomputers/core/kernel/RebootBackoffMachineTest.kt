@@ -159,6 +159,60 @@ class RebootBackoffMachineTest {
     }
 
     @Test
+    fun `起動の途中と、rebootを受け付けて止まり切る前は、保存を待つ価値がある`() = env {
+        // アンロード・停止の待ち（#635）が、tick を進めずに解ける TRANSIENT を待たなくならないことを確かめる
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+        // 起動の途中（init を作る前）: 起動のスレッドが進めば解ける
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            h.scheduler.hooks.beforeInitExec = null
+            reached.countDown()
+            release.await(10, TimeUnit.SECONDS)
+        }
+        assertTrue(m.boot(config))
+        try {
+            assertTrue(reached.await(5, TimeUnit.SECONDS), "起動の途中で止まらない")
+            assertTrue(m.isBooting)
+            assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+            assertTrue(m.isSettlingForSave, "起動の途中は待てば解ける")
+        } finally {
+            release.countDown()
+        }
+        awaitRunning()
+
+        // reboot を受け付けて、init のスレッドが止まり切る前（求めの印だけ）: プロセスのスレッドが進めば解ける
+        val atGate = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        h.scheduler.hooks.beforeUnregister = { machine, pid ->
+            if (machine === m && pid == 1 && atGate.count > 0) {
+                atGate.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+        }
+        try {
+            assertTrue(m.reboot())
+            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            assertTrue(m.isRebootPending)
+            assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+            assertTrue(m.isSettlingForSave, "止まり切る前は待てば解ける")
+        } finally {
+            h.scheduler.hooks.beforeUnregister = null
+            gate.countDown()
+        }
+        // 止まり切って通知を積んだ後（待たない回）は、tick でしか解けない。tick を進めないので通知は配られない
+        eventually(10_000, "通知を積まない") { !m.isSettlingForSave }
+        assertTrue(m.isRebootPending)
+        assertEquals(0L, m.deferredRebootDueTick, "1回目は待たない")
+        assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+        assertEquals(0, host.reboots.get())
+        h.scheduler.tick()
+        assertEquals(1, host.reboots.get())
+        tickUntilRunning()
+    }
+
+    @Test
     fun `待つ間にstopすると再起動せず、借りも返す`() = env {
         rebootImmediately()
         val due = rebootAndAwaitDeferral()

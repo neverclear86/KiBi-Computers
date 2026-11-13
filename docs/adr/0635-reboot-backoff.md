@@ -13,7 +13,8 @@
 - 短い間に再起動を繰り返すマシンだけ、**止まった後、起動し直す（`MachineHost.onRebootRequested` を呼ぶ）までを遅らせる。**
 - 方式は「借り付きの指数の待ち」（`core` の内部の型 `RebootBackoff`）。
 - ゲストへの見せ方は「何も返さず、遅らせる」（下の (a)）。`reboot` の ABI は ADR 0306 のまま（B: 受け付けたら戻らない、D: 断るときは `not-supported` だけ、断る条件は3つのまま）。WIT の型、p1 の import、`KibiPower`、`ProcessRunner` は変えていない。`power.wit` には doc コメントを1行足しただけ。
-- 抑止は `Machine` の中だけで行う。接続層（`platform-*`）・`ComputerCase` は変えていない。
+- 抑止（待つかどうか・待ちの長さ・期限に起動し直すこと）は `Machine` の中だけで行う。接続層（`platform-*`）・`ComputerCase` の電源と状態の扱いは変えていない。
+- 待ちの間の台をメインスレッドの保存の待ちに数えないために、`Machine.isSettlingForSave` と、それを中継する `MachineSlot.isSettlingForSave`・`ComputerCase.isSettlingForSave` を足し、`platform-neoforge-1.21.1` の `ServerMachines.saveForUnload`・`saveForStop` の待ちの条件を `saveReadiness() == TRANSIENT` からこれに替えた（下の「状態保存・ケースとの関係」）。1.20.1 の接続層にはまだ同じ待ちがないので変えていない。
 - 保存形式・公開 API は変えていない。足した状態はどれも実行時だけ。
 
 ## 方式の比較
