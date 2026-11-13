@@ -102,6 +102,12 @@ class BasicCommandsTest {
                 Thread.sleep(1)
                 m.state == MachineState.STOPPED || m.stateOf(pid).isTerminal
             }
+            // シェルが終わった後も、止める処理が残っているプロセス（shutdown 自身など）が片付いてマシンが STOPPED になるまで、少し待つ
+            val settleDeadline = System.currentTimeMillis() + 2_000
+            do {
+                h.scheduler.tick()
+                Thread.sleep(1)
+            } while (m.state != MachineState.STOPPED && System.currentTimeMillis() < settleDeadline)
             repeat(5) { h.scheduler.tick() }
             Run(host.text(), shell?.process?.state, m.state)
         }
