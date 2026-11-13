@@ -416,13 +416,19 @@ public class Machine private constructor(
     @Volatile
     private var lastBootConfigValue: BootConfig? = null
 
-    /** 再起動を求められ、プロセスがすべて止まるのを待っている。実行時だけの値。立っている間は [isAtWaitPoint] が `false`（#365） */
+    /**
+     * 再起動を求められ、プロセスがすべて止まるのを待っている。実行時だけの値。立っている間は [isAtWaitPoint] が `false`（#365）。
+     * カーネルロックの中で書き、[isRunningBootingOrRebooting] がロックなしでも読む（#626）
+     */
+    @Volatile
     private var rebootRequested = false
 
     /**
      * 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す）。実行時だけの値。
-     * この間はプロセスが0個の [MachineState.STOPPED] だが、ここで保存すると再起動が消えるので、[isAtWaitPoint] は `false`（#365）
+     * この間はプロセスが0個の [MachineState.STOPPED] だが、ここで保存すると再起動が消えるので、[isAtWaitPoint] は `false`（#365）。
+     * カーネルロックの中で書き、[isRunningBootingOrRebooting] がロックなしでも読む（#626）
      */
+    @Volatile
     private var rebootNotified = false
 
     // ---- 復元（#85、ADR 0085）。どれも実行時だけで、保存しない ----
@@ -509,12 +515,40 @@ public class Machine private constructor(
      * 起動中の印を先に、状態を後に読む。init を作るときは、同じカーネルロックの区間で `RUNNING` にしてから印を下ろすので
      * （[spawnInternal]）、印が下りて見えたなら `RUNNING` も見える（どちらも `@Volatile`）。この2つの順番を入れ替えると、
      * 区間の途中で「止まっていて起動中でもない」に見えることがある。
-     * 再起動の途中（[reboot] を受け付けてから、起動し直すまで）は含まない
+     * 再起動の途中（[reboot] を受け付けてから、起動し直すまで）は含まない（含めるなら [isRunningBootingOrRebooting]）
      */
     public val isRunningOrBooting: Boolean
         get() {
             val booting = bootingValue
             return booting || stateValue == MachineState.RUNNING
+        }
+
+    /**
+     * 止まっていない（[isRunningOrBooting]）か、再起動の途中（[reboot] を受け付けてから、[MachineHost.onRebootRequested] で
+     * 起動し直すまで）なら `true`。カーネルが止めた（[MachineState.CRASHED]）なら、再起動を求められていても `false`（#535）。
+     * [stop] で取り消した再起動は含まない（[stop] は再起動の求めの印を下ろす。ゲストが電源の求めで [stop] を呼んだときも同じ）。
+     * [reboot] の後に init が自分で終わっただけなら、求めの印は残るので `true` のまま再起動が続く（ゲストが止めても `false` とは限らない）。
+     * ロックを取らずに読むので、メインスレッドから何度呼んでもよい（#626）。
+     *
+     * 印と状態は、受け渡しの古い側を先に読む: 起動中の印 → 状態 → 再起動の求め（[rebootRequested]）→ 積んだ再起動の通知
+     * （[rebootNotified]）。書く側はどれも、次の印を立ててから前の印を下ろす（init を作るときは `RUNNING` にしてから起動中の印を
+     * 下ろす、[reboot] は求めの印を立ててから止める、[maybePostRebootLocked] は通知の印を立ててから求めの印を下ろす、起動の途中の
+     * [reboot] は求めの印が立った後で `endBoot` が起動中の印を下ろす）ので、この順で読めば受け渡しの途中で「止まっていて
+     * 再起動の途中でもない」に見えない。どれも `@Volatile`。
+     *
+     * 通知を配るときだけは、通知の印を下ろしてから [MachineHost.onRebootRequested] の中で [boot] が起動中の印を立てる。
+     * これは通知を配るスレッド（メインスレッド）の中の続きなので、メインスレッドから読むときは見えない。ほかのスレッドから読むときと、
+     * [MachineHost.onRebootRequested] の中で [boot] より前に読むときは `false` になりうる
+     */
+    public val isRunningBootingOrRebooting: Boolean
+        get() {
+            val booting = bootingValue
+            val s = stateValue
+            if (booting || s == MachineState.RUNNING) return true
+            // reboot() の後、止まり切る前にカーネルが止めても、求めの印は下りない（stopLocked は印を触らない）
+            if (s == MachineState.CRASHED) return false
+            val requested = rebootRequested
+            return requested || rebootNotified
         }
 
     /**
@@ -2864,8 +2898,11 @@ public class Machine private constructor(
     private fun maybePostRebootLocked() {
         if (!rebootRequested || bootingValue || stateValue != MachineState.STOPPED) return
         if (kernel.processes.liveCount() > 0 || registeredThreads > 0) return
-        rebootRequested = false
+        // 通知の印を立ててから求めの印を下ろす（この順番は不変条件。ロックを取らずに読む [isRunningBootingOrRebooting] が、
+        // 間で「再起動の途中でない」と見ないため。#626）
         rebootNotified = true
+        scheduler.hooks.duringRebootPost?.invoke(this)
+        rebootRequested = false
         postNotification(HostNotification.RebootRequested)
     }
 
