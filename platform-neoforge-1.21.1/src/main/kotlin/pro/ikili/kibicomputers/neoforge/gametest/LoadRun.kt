@@ -19,11 +19,13 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
+import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import java.lang.management.ManagementFactory
 import java.lang.management.ThreadInfo
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
 
 /** 負荷試験で打つ人（偽物） */
@@ -258,17 +260,21 @@ internal data class WriterStats(
     val capacityTimeouts: Long = 0,
     val autosaveNoCapacity: Long = 0,
     val failures: Long = 0,
+    /** 段階の前に予約して、段階の間に終わった書き込みの数（段階の数には入れない。#614） */
+    val staleCompletions: Long = 0,
 ) {
     override fun toString(): String = String.format(
-        Locale.ROOT, "待ちの最大 %d 件・%.1f MiB、上限で待った台 %d（%.0f ms、期限切れ %d）、自動保存で次の tick に回した %d、書けなかった %d",
+        Locale.ROOT,
+        "待ちの最大 %d 件・%.1f MiB、上限で待った台 %d（%.0f ms、期限切れ %d）、自動保存で次の tick に回した %d、書けなかった %d、前の段階の完了 %d",
         maxPendingCount, maxPendingBytes / (1024.0 * 1024.0), capacityWaits, capacityWaitMillis, capacityTimeouts, autosaveNoCapacity, failures,
+        staleCompletions,
     )
 
     companion object {
         fun current(): WriterStats = ServerMachines.Stats.let {
             WriterStats(
                 it.maxPendingCount, it.maxPendingBytes, it.capacityWaits, it.capacityWaitNanos / 1e6, it.capacityTimeouts, it.autosaveNoCapacity,
-                it.saveFailures,
+                it.saveFailures, it.staleCompletions,
             )
         }
     }
@@ -485,6 +491,16 @@ internal class LoadRun(
     private var autosaveResult: AutosaveResult? = null
     private var unloadResult: UnloadResult? = null
     private var unloadCaseChunks = 0
+    private var unloadRemaining = 0
+
+    /** [LoadPhase.AUTOSAVE]・[LoadPhase.UNLOAD] の測る区間の tick の時間（終えたら。`null` ならまだ測っている。#614） */
+    private var measuredTick: TickStats? = null
+
+    /** 測る区間を終えたときの段階の中の tick（この後は書き込みの終わりを待つ） */
+    private var measuredTicks = 0
+
+    /** 段階に予約した書き込みの終わりを待つ期限（`System.nanoTime` の値。[stopMeasuring] で決める） */
+    private var saveWaitDeadline = 0L
     private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
@@ -558,11 +574,10 @@ internal class LoadRun(
     private fun tickStats(): TickStats = TickStats.of(samples.copyOf(sampleCount))
 
     /**
-     * 段階の間の保存の手間と大きさ（[ServerMachines.Stats.saves] と、tick ごとの増分から）。書き込みのスレッドが空になるのを待ち、
-     * 終わった書き込みを受け取ってから数える（[ServerMachines.drainSaves]。この tick の測る時間には入らない）
+     * 段階の間の保存の手間と大きさ（[ServerMachines.Stats.saves] と、tick ごとの増分から）。段階に予約した書き込みがすべて終わってから
+     * （[awaitPhaseSaves]）呼ぶ。段階の前に予約した書き込みは数えない（#614）
      */
     private fun saveCost(): SaveCost {
-        ServerMachines.drainSaves()
         val saves = ServerMachines.Stats.saves.toList()
         val savedTicks = (0 until sampleCount).filter { captureSamples[it] > 0 }
         fun perTick(f: (Int) -> Long) = AvgMax.ofNanos(LongArray(savedTicks.size) { f(savedTicks[it]) })
@@ -651,21 +666,63 @@ internal class LoadRun(
 
     private fun autosave() {
         if (phaseTick == 0) return
-        if (ServerMachines.isAutosaveCycleDone) {
-            val s = ServerMachines.Stats
-            autosaveResult = AutosaveResult(
-                cycleTicks = s.autosaveCycleTicks.lastOrNull() ?: phaseTick,
-                written = s.autosaveWritten,
-                skipped = s.autosaveSkipped,
-                maxTickWrites = s.autosaveMaxTickWrites,
-                writeMillis = s.autosaveWriteNanos / 1e6,
-                tick = tickStats(),
-                cost = saveCost(),
-            )
-            next(LoadPhase.AUTOSAVE)
-        } else if (phaseTick >= AUTOSAVE_TIMEOUT_TICKS) {
-            fail("the autosave cycle did not finish within $AUTOSAVE_TIMEOUT_TICKS ticks")
+        val tick = measuredTick ?: if (ServerMachines.isAutosaveCycleDone) {
+            stopMeasuring()
+        } else {
+            if (phaseTick >= AUTOSAVE_TIMEOUT_TICKS) fail("the autosave cycle did not finish within $AUTOSAVE_TIMEOUT_TICKS ticks")
+            return
         }
+        if (!awaitPhaseSaves()) return
+        val s = ServerMachines.Stats
+        autosaveResult = AutosaveResult(
+            cycleTicks = s.autosaveCycleTicks.lastOrNull() ?: measuredTicks,
+            written = s.autosaveWritten,
+            skipped = s.autosaveSkipped,
+            maxTickWrites = s.autosaveMaxTickWrites,
+            writeMillis = s.autosaveWriteNanos / 1e6,
+            tick = tick,
+            cost = saveCost(),
+        )
+        next(LoadPhase.AUTOSAVE)
+    }
+
+    /**
+     * 段階の測る区間を終える: ここまでの tick の時間を取り、この後の tick（書き込みの終わりを待つ間）は測らない（#614）
+     */
+    private fun stopMeasuring(): TickStats {
+        val tick = tickStats()
+        measuredTick = tick
+        measuredTicks = phaseTick
+        saveWaitDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SAVE_WAIT_TIMEOUT_MILLIS)
+        recording = false
+        return tick
+    }
+
+    /**
+     * 段階に予約した書き込み（[ServerMachines.Stats.windowOutstanding]）がすべて終わったか（#614）。終わっていなければ、書き込みのスレッドが
+     * 空になるのを 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待って、終わった書き込みを受け取る。tick をまたいで待つので、
+     * 1回でメインスレッドを長く止めず、急いで回す試験（`paced` でない）でも tick の数が増えすぎない。待つ tick は測らない（[stopMeasuring]）。
+     * 壁時計の上限（[SAVE_WAIT_TIMEOUT_MILLIS]）を過ぎたら失敗する
+     */
+    private fun awaitPhaseSaves(): Boolean {
+        val s = ServerMachines.Stats
+        val store = WorldMachineSaves.current
+        if (s.windowOutstanding > 0 && store != null) {
+            try {
+                store.flush(SAVE_WAIT_STEP_MILLIS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        ServerMachines.processCompletions()
+        if (s.windowOutstanding <= 0) return true
+        if (System.nanoTime() - saveWaitDeadline >= 0) {
+            fail(
+                "${s.windowOutstanding} of ${s.windowSubmits} saves queued in the $phase phase did not finish within $SAVE_WAIT_TIMEOUT_MILLIS ms " +
+                    "(pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
+            )
+        }
+        return false
     }
 
     private fun unload() {
@@ -674,16 +731,20 @@ internal class LoadRun(
         unloadMaxTickWrites = maxOf(unloadMaxTickWrites, s.unloadWrites - unloadPrevWrites)
         unloadPrevCaptures = s.unloadCaptures
         unloadPrevWrites = s.unloadWrites
-        if (phaseTick % 10 != 0) return
-        // ケースのあるチャンクが全部アンロードされたら終わり（hasChunk は FULL でなくなっただけでも偽になるので、Unload を数える）
-        val remaining = unloadCaseChunks - s.unloadEventsWithCases.toInt()
-        if (remaining <= 0 || phaseTick >= UNLOAD_TIMEOUT_TICKS) {
-            unloadResult = UnloadResult(
-                s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, remaining.coerceAtLeast(0), unloadCaseChunks, phaseTick,
-                tickStats(), saveCost(),
-            )
-            next(LoadPhase.UNLOAD)
+        if (measuredTick == null) {
+            if (phaseTick % 10 != 0) return
+            // ケースのあるチャンクが全部アンロードされたら終わり（hasChunk は FULL でなくなっただけでも偽になるので、Unload を数える）
+            val remaining = unloadCaseChunks - s.unloadEventsWithCases.toInt()
+            if (remaining > 0 && phaseTick < UNLOAD_TIMEOUT_TICKS) return
+            unloadRemaining = remaining.coerceAtLeast(0)
+            stopMeasuring()
         }
+        if (!awaitPhaseSaves()) return
+        unloadResult = UnloadResult(
+            s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, unloadRemaining, unloadCaseChunks, measuredTicks,
+            measuredTick!!, saveCost(),
+        )
+        next(LoadPhase.UNLOAD)
     }
 
     private fun steady(p: LoadPhase) {
@@ -861,6 +922,8 @@ internal class LoadRun(
         measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE) null else 0
         phaseStartNanos = System.nanoTime()
         recording = false
+        measuredTick = null
+        measuredTicks = 0
         countSent = false
         sampleCount = 0
         sentBytes = 0
@@ -1001,6 +1064,15 @@ internal class LoadRun(
 
         /** まとめてアンロードを待つ上限（過ぎたら、そこまでの結果を書く） */
         private const val UNLOAD_TIMEOUT_TICKS = 2_000
+
+        /**
+         * 段階に予約した書き込みが終わるのを待つ上限（壁時計。#614）。遅いマシン（CI、ほかのビルドと並んだ手元）でも余裕のある長さにする。
+         * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] 待つので、待つ tick は多くて 2,400 で、試験の上限（`CI_TIMEOUT_TICKS`）に収まる
+         */
+        private const val SAVE_WAIT_TIMEOUT_MILLIS = 120_000L
+
+        /** 段階に予約した書き込みの終わりを待つ間、1 tick で書き込みのスレッドを待つ上限 */
+        private const val SAVE_WAIT_STEP_MILLIS = 50L
 
         private val DIGITS = Regex("[0-9]+")
 

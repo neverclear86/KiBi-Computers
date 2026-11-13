@@ -282,4 +282,42 @@ object AsyncSaveGameTests {
             helper.succeed()
         }
     }
+
+    /**
+     * 負荷試験の数え方（#614）: [ServerMachines.Stats.recordSaves] の間、区間（[ServerMachines.Stats.reset]）の前に予約して後で終わった完了は、
+     * 新しい区間の保存に数えない（前の段階の書き込みが、アンロードの段階に混ざって数えられた）。ケースへは区間によらず完了を返す。
+     * [ServerMachines.Stats] を空にするので、ほかのテストと同時に動かないよう別のバッチにする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200, batch = "kibicomputers_save_window")
+    fun completionsQueuedBeforeAResetAreNotCounted(helper: GameTestHelper) {
+        withRunningCase(helper) { be ->
+            val stats = ServerMachines.Stats
+            try {
+                stats.recordSaves = true
+                stats.reset()
+                val (first, second) = WriterGate().use {
+                    val first = submit(helper, be)
+                    helper.assertTrue(stats.windowSubmits == 1L, "the first save should be queued in the first window: ${stats.windowSubmits}")
+                    stats.reset()
+                    helper.assertTrue(stats.windowOutstanding == 0L, "a new window should start empty: ${stats.windowOutstanding}")
+                    val second = submit(helper, be)
+                    ServerMachines.processCompletions()
+                    helper.assertTrue(stats.windowOutstanding == 1L, "the second save should be outstanding: ${stats.windowOutstanding}")
+                    first to second
+                }
+                ServerMachines.drainSaves()
+                helper.assertTrue(stats.staleCompletions == 1L, "the save queued before the reset should be stale: ${stats.staleCompletions}")
+                helper.assertTrue(stats.saves.size == 1, "only the save queued in this window should be recorded: ${stats.saves}")
+                helper.assertTrue(stats.fullSaves + stats.deltaSaves == 1L, "only one generation should be counted: ${stats.fullSaves} + ${stats.deltaSaves}")
+                helper.assertTrue(stats.windowOutstanding == 0L && stats.saveFailures == 0L, "the window should be complete: ${stats.windowOutstanding}")
+                helper.assertTrue(be.identity == second.identity, "the case should adopt both completions and end at ${second.identity}: ${be.identity}")
+                helper.assertTrue(first.identity.generation < second.identity.generation, "the reservations should be in order: $first, $second")
+            } finally {
+                stats.recordSaves = false
+                stats.reset()
+            }
+            finish(helper)
+        }
+    }
 }

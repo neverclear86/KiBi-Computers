@@ -135,6 +135,8 @@ object LoadGameTests {
                 helper.assertTrue(unload.stillLoaded == 0, "all chunks with cases should unload after the force loading is removed: $unload")
                 // アンロードの tick は、書き込みを除いても、チャンクのアンロードそのものと待機点を待つ時間（unloadWaitBudgetMillis）を含み、
                 // CI の 100 台は 1 tick に全部が来る（#84 の基準）。取り出し・符号化の時間（unload.cost）は表に出すだけで検査しない（#553）
+                // 数えるのは、この段階に予約した書き込みだけ（前の段階の書き込みの完了は writer の「前の段階の完了」に出る。#614）
+                helper.assertTrue(unload.cost.writer.failures == 0L, "every unload write should succeed: $unload")
                 helper.assertTrue(unload.cost.saves.toLong() == unload.captures, "every unload capture should be recorded: $unload")
             }
             val boot = report.phase(LoadPhase.BOOT)
