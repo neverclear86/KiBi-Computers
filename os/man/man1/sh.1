@@ -12,7 +12,7 @@ sh - the command shell
 
 ## DESCRIPTION
 
-A POSIX-style shell: pipelines, lists, `if`, `while`, `for`, `case`, functions, redirections, here-documents, `$(...)`, parameter expansion and globbing. On a terminal it reads commands interactively with line editing, completion (Tab) and history (`~/.sh_history`).
+A POSIX-style shell: pipelines, lists, `if`, `while`, `for`, `case`, functions, redirections, here-documents, `$(...)`, parameter expansion and globbing. On a terminal it reads commands interactively with line editing, completion (Tab) and history (`~/.sh_history`). An interactive line holds up to 4096 bytes; a line that overflowed is not run when Enter is pressed (`sh: line too long`).
 
 Built-in commands: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local` `history` `true` `false` `echo` `printf` `cd` `pwd` `read` `test` `[` `wait` `jobs` `command` `type` `source`.
 

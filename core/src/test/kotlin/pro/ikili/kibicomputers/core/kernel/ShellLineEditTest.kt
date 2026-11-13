@@ -99,7 +99,9 @@ class ShellLineEditTest {
     /**
      * 会話的な `sh` を起こし、プロンプト（`$ `・`> `）が出るたびに [steps] を 1 つずつ打つ。
      * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ。
-     * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）
+     * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）。
+     * [splittable] なら貼り付けと同じく分けて入れてよい入力として渡す（raw の TTY の 4 KiB を超える行を打つため。#609）。
+     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる
      */
     private fun session(
         steps: List<String>,
@@ -110,6 +112,7 @@ class ShellLineEditTest {
         exit: Boolean = true,
         read: List<String> = emptyList(),
         charset: Charset = Charsets.UTF_8,
+        splittable: Boolean = false,
         settled: (ScreenHost) -> Boolean = { true },
     ): Session = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -132,7 +135,8 @@ class ShellLineEditTest {
                 val text = host.text()
                 if (next < steps.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> "))) {
                     seen = text.length
-                    m.offerConsoleInput(steps[next++].toByteArray(charset))
+                    val bytes = steps[next++].toByteArray(charset)
+                    assertEquals(bytes.size, m.offerConsoleInput(bytes, splittable = splittable), "TTY が入力を捨てた")
                 }
                 Thread.sleep(1)
                 if (exit) m.stateOf(pid).isTerminal else next == steps.size && settled(host)
@@ -473,5 +477,175 @@ class ShellLineEditTest {
         val t = s.text
         assertTrue(t.contains("$ FOO=\$HOME"), t)
         assertTrue(t.contains("\n/home\n"), t)
+    }
+
+    @Test
+    fun `上限を超えた行は実行せず履歴にも残さない`() {
+        // 1 行の上限は 4096 バイト（ADR 0102）。超えた行は貼り付けで渡す
+        val a = "A".repeat(5000)
+        val ok = "echo " + "O".repeat(4076) + " > /home/ok.txt"
+        val ng = "echo " + "N".repeat(4077) + " > /home/ng.txt"
+        // 全角の 1 文字が境目をまたぐ（4094 バイトの後ろの 3 バイト）。後ろの C は入るが、印は残る
+        val u8Head = "> /home/u8.txt echo " + "B".repeat(4074)
+        val u8 = u8Head + "あC"
+        assertEquals(4096, ok.toByteArray().size)
+        assertEquals(4097, ng.toByteArray().size)
+        assertEquals(4094, u8Head.toByteArray().size)
+        val s = session(
+            listOf(
+                "echo $a > /home/p1.txt\n",
+                "echo \"st=\$?\"\r",
+                "$ok\n",
+                "$ng\n",
+                // 超えた後に Backspace で短くしても、捨てた中身は戻らないので実行しない
+                "echo $a" + "\u007f".repeat(1000) + " > /home/bs.txt\n",
+                // Ctrl+U で全部消して打ち直した行は実行する
+                "echo $a\u0015echo cu > /home/cu.txt\n",
+                // 続きの行で超えたら、読みかけのコマンドごと捨てる
+                "if true; then\r",
+                "echo pre > /home/pre.txt\r",
+                "echo $a\n",
+                "echo \"st2=\$?\"\r",
+                "$u8\n",
+                "history\r",
+                "exit\r",
+            ),
+            read = listOf(
+                "/home/p1.txt",
+                "/home/ok.txt",
+                "/home/ng.txt",
+                "/home/bs.txt",
+                "/home/cu.txt",
+                "/home/pre.txt",
+                "/home/u8.txt",
+                "/home/.sh_history",
+            ),
+            splittable = true,
+        )
+        val t = s.text
+        val tail = t.takeLast(3000)
+        assertEquals(5, Regex("sh: line too long\n").findAll(t).count(), tail)
+        assertTrue(t.contains("\nst=2\n"), tail)
+        assertTrue(t.contains("\nst2=2\n"), tail)
+        assertEquals("<none>", s.files["/home/p1.txt"])
+        assertEquals("O".repeat(4076) + "\n", s.files["/home/ok.txt"])
+        assertEquals("<none>", s.files["/home/ng.txt"])
+        assertEquals("<none>", s.files["/home/bs.txt"])
+        assertEquals("cu\n", s.files["/home/cu.txt"])
+        assertEquals("<none>", s.files["/home/pre.txt"])
+        assertEquals("<none>", s.files["/home/u8.txt"])
+        val expected = listOf(
+            "echo \"st=\$?\"",
+            ok,
+            "echo cu > /home/cu.txt",
+            "if true; then",
+            "echo pre > /home/pre.txt",
+            "echo \"st2=\$?\"",
+            "history",
+            "exit",
+        )
+        assertEquals(expected.joinToString("\n", postfix = "\n"), s.files["/home/.sh_history"])
+        // history の一覧にも、上限を超えた行はない
+        assertTrue(!t.contains("  echo AAAA"), tail)
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `切れた行は、Ctrl+Uで消してCtrl+Yで戻しても、履歴を行き来しても実行しない`() {
+        val a = "A".repeat(5000)
+        val s = session(
+            listOf(
+                "echo hist\r",
+                // 切れた行を Ctrl+U で消して Ctrl+Y で戻すと、印も戻る
+                "> /home/cy.txt echo $a\u0015\u0019\n",
+                // kill の中身は次の行にも残る。そこで戻しても実行しない
+                "\u0019\n",
+                // 履歴を呼び戻して編集中の行に戻ると、印も戻る
+                "> /home/ud.txt echo $a$up$down\n",
+                "echo \"st=\$?\"\r",
+                // 履歴の項目に置き換えて実行するなら、切れた行ではなくなる
+                "> /home/ud2.txt echo $a$up\r",
+                "history\r",
+                "exit\r",
+            ),
+            read = listOf("/home/cy.txt", "/home/ud.txt", "/home/ud2.txt", "/home/.sh_history"),
+            splittable = true,
+        )
+        val t = s.text
+        val tail = t.takeLast(2000)
+        assertEquals(3, Regex("sh: line too long\n").findAll(t).count(), tail)
+        assertTrue(t.contains("\nst=2\n"), tail)
+        assertEquals("<none>", s.files["/home/cy.txt"])
+        assertEquals("<none>", s.files["/home/ud.txt"])
+        // ud2 は直前の履歴（echo "st=$?"）に置き換わったので、ファイルは作られず、st=0 が出る
+        assertEquals("<none>", s.files["/home/ud2.txt"])
+        assertTrue(t.contains("\nst=0\n"), tail)
+        // 続けて同じ行を実行した分は、履歴に重ねない
+        assertEquals("echo hist\necho \"st=\$?\"\nhistory\nexit\n", s.files["/home/.sh_history"])
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `補完で入れる文字が行に入りきらないときは、何も入れない`() {
+        // ": " + P×4083 + " /tmp/a" で 4092 バイト。残り 4 バイトに、補う 9 バイト（bcdefghij）は入らない
+        val line = ": " + "P".repeat(4083) + " /tmp/a"
+        assertEquals(4092, line.toByteArray().size)
+        val s = session(
+            listOf("$line\t\r", "exit\r"),
+            files = mapOf("/tmp/abcdefghij" to ""),
+            read = listOf("/home/.sh_history"),
+            splittable = true,
+        )
+        // 半端に入れた行（/tmp/abcde など）ではなく、打った行のまま実行する
+        assertEquals("$line\nexit\n", s.files["/home/.sh_history"])
+        assertTrue(s.text.contains("\u0007"), "ベルが鳴らない")
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `補完の後ろに足す引用符・空白・スラッシュが入らないときは、補った名前も入れない`() {
+        // どれも、名前の続きはちょうど入るが、後ろに足す 1 文字が入らない（1 行の上限は 4096 バイト）
+        val space = ": " + "P".repeat(4084) + " /tmp/a" // + bcd で 4096。空白が入らない
+        val quote = ": " + "P".repeat(4083) + " \"/tmp/a" // + bcd で 4096。閉じる " が入らない
+        val dir = ": " + "P".repeat(4084) + " /tmp/dir" // + x で 4096。/ が入らない
+        assertEquals(4093, space.toByteArray().size)
+        assertEquals(4093, quote.toByteArray().size)
+        assertEquals(4095, dir.toByteArray().size)
+        val s = session(
+            listOf(
+                "$space\t\r",
+                // 引用符が開いたままの行にはならない。自分で閉じれば、補う前の行のまま実行する
+                "$quote\t\"\r",
+                "$dir\t\r",
+                "exit\r",
+            ),
+            files = mapOf("/tmp/abcd" to "", "/tmp/dirx/" to ""),
+            read = listOf("/home/.sh_history"),
+            splittable = true,
+        )
+        assertEquals(listOf(space, "$quote\"", dir, "exit").joinToString("\n", postfix = "\n"), s.files["/home/.sh_history"])
+        assertEquals(3, s.text.count { it == '\u0007' }, s.text.takeLast(500))
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `続きの行で入力の領域の残りが少ないと、入らない履歴の項目は呼び戻さずベルを鳴らす`() {
+        // 入力の領域は 64 KiB。引用符を開いたままの行を重ねて、残りを 4090 バイトより小さくする
+        val x = "x".repeat(4090)
+        val y = "y".repeat(1500)
+        val steps = buildList {
+            add(": '\r")
+            repeat(15) { add("$x\n") }
+            add("$y\n")
+            // y の項目は入る。x の項目（4090 バイト）は入らず、ベルで行はそのまま
+            add("$up$up\u0015'\r")
+            add("echo \"st=\$?\"\r")
+            add("exit\r")
+        }
+        val s = session(steps, splittable = true)
+        val t = s.text
+        assertEquals(1, t.count { it == '\u0007' }, t.takeLast(500))
+        assertTrue(t.contains("\nst=0\n"), t.takeLast(500))
+        assertEquals(0, s.exitCode)
     }
 }

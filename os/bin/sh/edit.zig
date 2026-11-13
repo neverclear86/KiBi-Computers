@@ -28,6 +28,9 @@ pub const Result = union(enum) {
     eof,
     /// Ctrl+C（行を捨てた）
     interrupt,
+    /// 上限（[MAX_LINE]、または out の残り）を超えて入力の一部を捨てた行で Enter を押した。
+    /// 行は out に書かず、履歴にも残さない（切れた行を実行しないため。#665）
+    too_long,
 };
 
 var line: [MAX_LINE]u8 = undefined;
@@ -35,6 +38,9 @@ var len: usize = 0;
 var pos: usize = 0;
 /// この行に入れられる長さ
 var cap: usize = 0;
+/// 上限を超えて、利用者の入力の一部を捨てた（Enter で実行しない）。
+/// Backspace で短くしても、捨てた中身は戻らないので、長さではなくこの印で見る
+var truncated = false;
 var prompt: []const u8 = "";
 var cols: u32 = 80;
 /// カーソルの行（プロンプトの最初の行から数える）
@@ -43,12 +49,16 @@ var cur_row: usize = 0;
 /// Ctrl+K・Ctrl+U・Ctrl+W などで消した文字（Ctrl+Y で戻す）
 var kill_buf: [MAX_LINE]u8 = undefined;
 var kill_len: usize = 0;
+/// kill_buf が、上限を超えて切れた行を全部消したときの中身（Ctrl+Y で戻すと、切れた行がまた実行できてしまうため、戻したら印を付ける）
+var kill_truncated = false;
 
 /// 呼び戻している履歴の位置（history.len() なら編集中の新しい行）
 var hist_index: usize = 0;
 /// 履歴を呼び戻す前に編集していた行
 var scratch: [MAX_LINE]u8 = undefined;
 var scratch_len: usize = 0;
+/// scratch の行の [truncated]
+var scratch_truncated = false;
 
 /// 直前のキーが Tab だった（2 回目の Tab で候補を並べる）
 var last_tab = false;
@@ -365,25 +375,43 @@ fn insert(s: []const u8) bool {
     return true;
 }
 
+/// line[a..b] を消すと行が空になる
+fn removesAll(a: usize, b: usize) bool {
+    return a == 0 and b - a == len;
+}
+
 /// line[a..b] を消す。[save] なら Ctrl+Y で戻せるように残す
 fn remove(a: usize, b: usize, save: bool) void {
     if (b <= a) return;
     if (save) {
         @memcpy(kill_buf[0 .. b - a], line[a..b]);
         kill_len = b - a;
+        kill_truncated = truncated and removesAll(a, b);
     }
     const n = b - a;
     var k = a;
     while (k + n < len) : (k += 1) line[k] = line[k + n];
     len -= n;
     if (pos >= b) pos -= n else if (pos > a) pos = a;
+    // 全部消したら、もう捨てた入力に頼った行ではない（打ち直せば実行できる）
+    if (len == 0) truncated = false;
 }
 
-fn setLine(s: []const u8) void {
-    const n = @min(s.len, cap);
-    @memcpy(line[0..n], s[0..n]);
-    len = n;
-    pos = n;
+/// 入力が上限を超えて入らなかった。最初の 1 回だけベルを鳴らし、行に印を付ける
+fn lost() void {
+    if (truncated) return;
+    truncated = true;
+    bell();
+    flush();
+}
+
+/// 行を [s] に置き換える。入らなければ（続きの行で残りが少ないとき）false で、行はそのまま
+fn setLine(s: []const u8) bool {
+    if (s.len > cap) return false;
+    @memcpy(line[0..s.len], s);
+    len = s.len;
+    pos = s.len;
+    return true;
 }
 
 /// 履歴を [delta]（-1 で古い方）動かす
@@ -391,18 +419,31 @@ fn historyMove(up: bool) void {
     const total = history.len();
     if (up) {
         if (hist_index == 0) return bell();
-        if (hist_index == total) {
-            @memcpy(scratch[0..len], line[0..len]);
-            scratch_len = len;
-        }
+        if (!setLineFrom(hist_index - 1, total)) return bell();
         hist_index -= 1;
-        setLine(history.get(hist_index));
     } else {
         if (hist_index >= total) return bell();
+        if (!setLineFrom(hist_index + 1, total)) return bell();
         hist_index += 1;
-        if (hist_index == total) setLine(scratch[0..scratch_len]) else setLine(history.get(hist_index));
     }
     refresh();
+}
+
+/// 行を履歴の [index] の項目（[total] なら履歴を呼び戻す前の行）に置き換える。
+/// 入らなければ（ベルは呼ぶ側）false で、行はそのまま
+fn setLineFrom(index: usize, total: usize) bool {
+    const from_scratch = index == total;
+    const s = if (from_scratch) scratch[0..scratch_len] else history.get(index);
+    if (s.len > cap) return false;
+    // 編集中の新しい行を離れるときは、印ごと退避する（↓で戻ったときに印も戻す）
+    if (hist_index == total) {
+        @memcpy(scratch[0..len], line[0..len]);
+        scratch_len = len;
+        scratch_truncated = truncated;
+    }
+    _ = setLine(s);
+    truncated = from_scratch and scratch_truncated;
+    return true;
 }
 
 /// 普通の文字を入れたときの表示。行の末尾に足して折り返さないなら、その文字だけ書く
@@ -521,10 +562,14 @@ fn needsEscape(c: u8, q: Quote) bool {
 }
 
 /// [s] を、開いている引用 [q] の中に合う形で入れる
+/// 全部入るか、何も入らないか（入らなければ行は元のまま）
 fn insertQuoted(s: []const u8, q: Quote) bool {
+    const start = pos;
     for (s) |c| {
-        if (needsEscape(c, q) and !insert("\\")) return false;
-        if (!insert(&[_]u8{c})) return false;
+        if ((needsEscape(c, q) and !insert("\\")) or !insert(&[_]u8{c})) {
+            remove(start, pos, false);
+            return false;
+        }
     }
     return true;
 }
@@ -544,22 +589,35 @@ fn completeWord() void {
     const common = complete.commonPrefix();
     const first = complete.items[0];
     var changed = false;
+    // 補完で入れる文字（名前の続きと、閉じる引用符・空白・`/`）は、全部入るか何も入らないか
+    const start = pos;
     if (common > w.text.len and util.startsWith(first.text, w.text)) {
         if (!insertQuoted(first.text[w.text.len..common], w.quote)) {
+            // 入らなかった。何も入れていないので、閉じる引用符や空白も足さない
             bell();
+            flush();
+            return;
         }
         changed = true;
     }
     if (complete.count == 1) {
+        var ok = true;
         if (first.dir) {
-            if (common == first.text.len and !util.startsWith(line[pos..len], "/")) _ = insert("/");
+            if (common == first.text.len and !util.startsWith(line[pos..len], "/")) ok = insert("/");
         } else {
             switch (w.quote) {
-                .single => _ = insert("'"),
-                .double => _ = insert("\""),
+                .single => ok = insert("'"),
+                .double => ok = insert("\""),
                 .none => {},
             }
-            if (pos == len or line[pos] != ' ') _ = insert(" ");
+            if (ok and (pos == len or line[pos] != ' ')) ok = insert(" ");
+        }
+        if (!ok) {
+            // 後ろに足す文字が入らなかった。入れた名前の続きも戻して、行は元のまま
+            remove(start, pos, false);
+            bell();
+            flush();
+            return;
         }
         changed = true;
     }
@@ -847,6 +905,8 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     cap = @min(MAX_LINE, if (out.len > 0) out.len - 1 else 0);
     hist_index = history.len();
     scratch_len = 0;
+    truncated = false;
+    scratch_truncated = false;
     last_tab = false;
     freshLine();
     refresh();
@@ -864,9 +924,9 @@ pub fn readLine(p: []const u8, out: []u8) Result {
         last_tab = false;
         if (utf8_rest > 0) {
             if (utf8.isContinuation(c)) {
+                // 先頭のバイトで 1 文字が丸ごと入ることを確かめてあるので、普通はここで入る
                 if (!insert(&[_]u8{c})) {
-                    bell();
-                    flush();
+                    lost();
                     utf8_rest = 0;
                     continue;
                 }
@@ -881,6 +941,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
         switch (c) {
             '\r', '\n' => {
                 finishLine("");
+                if (truncated) return .too_long;
                 const n = len;
                 @memcpy(out[0..n], line[0..n]);
                 out[n] = '\n';
@@ -933,7 +994,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
             },
             25 => {
                 // Ctrl+Y
-                if (!insert(kill_buf[0..kill_len])) bell();
+                if (!insert(kill_buf[0..kill_len])) bell() else if (kill_truncated) lost();
                 refresh();
             },
             20 => {
@@ -969,9 +1030,9 @@ pub fn readLine(p: []const u8, out: []u8) Result {
                 if (c < 0x20) continue;
                 if (c >= 0x80) {
                     const need: usize = if (c & 0xe0 == 0xc0) 1 else if (c & 0xf0 == 0xe0) 2 else if (c & 0xf8 == 0xf0) 3 else continue;
-                    if (!insert(&[_]u8{c})) {
-                        bell();
-                        flush();
+                    // 1 文字が丸ごと入らなければ、先頭のバイトも入れない（続きのバイトは下の continue で捨てる）
+                    if (len + 1 + need > cap or !insert(&[_]u8{c})) {
+                        lost();
                         continue;
                     }
                     utf8_start = pos - 1;
@@ -979,8 +1040,7 @@ pub fn readLine(p: []const u8, out: []u8) Result {
                     continue;
                 }
                 if (!insert(&[_]u8{c})) {
-                    bell();
-                    flush();
+                    lost();
                     continue;
                 }
                 typed(line[pos - 1 .. pos]);

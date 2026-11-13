@@ -245,6 +245,19 @@ object MachineSnapshotContentGameTests {
         fun read(identity: MachineIdentity): MachineSnapshot =
             DataInputStream(Files.newInputStream(store!!.generationFile(identity.id, identity.generation)).buffered()).use { MachineSnapshot.readFrom(it) }
         fun size(identity: MachineIdentity): Long = Files.size(store!!.generationFile(identity.id, identity.generation))
+        // 差分の保存。このテストが確かめるのは差分の世代の中身なので、全体に切り替える比の境目（既定 0.5）は外す。
+        // init と sh だけの小さな台では、シェルが 1 行で書き換える区画の比が、元から境目にある（main で 14/28 = 0.50、
+        // 標準 OS の文字列を足した #667 で 16/29 = 0.55）。境目そのものは core の MachineDeltaCaptureTest が確かめ、
+        // 既定値のままで差分になるかどうかは #668 で扱う
+        fun saveDelta(policy: CapturePolicy): Int {
+            val config = ServerMachines.saveConfig
+            return try {
+                ServerMachines.saveConfig = config.copy(fullSaveChangedRatio = 1.0)
+                saveNow(be, policy)
+            } finally {
+                ServerMachines.saveConfig = config
+            }
+        }
 
         var step = 0
         var first: MachineIdentity? = null
@@ -266,7 +279,7 @@ object MachineSnapshotContentGameTests {
                 1 -> {
                     helper.assertTrue(text.any { it == "delta-one" }, "the shell should keep running after the full save: $text")
                     helper.assertTrue(text.last { it.isNotEmpty() } == "$", "the shell should wait for input: $text")
-                    helper.assertTrue(saveNow(be, CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the second save should be written")
+                    helper.assertTrue(saveDelta(CapturePolicy.SKIP_IF_TRANSIENT) > 0, "the second save should be written")
                     val second = be.identity!!
                     val base = first!!
                     helper.assertTrue(second.id == base.id && second.generation == base.generation + 1, "same id, next generation: $base → $second")
@@ -288,7 +301,7 @@ object MachineSnapshotContentGameTests {
                     helper.assertTrue(store.markChunkGeneration(base.id, second.generation, owner) == ChunkMarkResult.ADVANCED, "the mark should advance")
                     var latest = second
                     repeat(3) {
-                        helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "later saves should be written")
+                        helper.assertTrue(saveDelta(CapturePolicy.KILL_TRANSIENT) > 0, "later saves should be written")
                         latest = be.identity!!
                         store.markChunkGeneration(latest.id, latest.generation, owner)
                     }
