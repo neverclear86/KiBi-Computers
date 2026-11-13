@@ -500,4 +500,103 @@ object TestComputerGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+
+    /**
+     * 再起動の途中（[pro.ikili.kibicomputers.core.kernel.Machine.reboot] を受け付けてから、起動し直すまで）に画面を置いても、
+     * 次の tick に画面とキーボードをつなぎ直し、起動し直したマシンに打った式の結果が置いた画面に出る（#626）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun screenPlacedWhileRebootingIsReconnected(helper: GameTestHelper) {
+        val (case, _, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        var broken = false
+        var ticksAfterBreak = 0
+        var placed: ScreenBlockEntity? = null
+        var typed = false
+        helper.succeedWhen {
+            if (!broken) {
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting")
+                helper.setBlock(SCREEN, Blocks.AIR)
+                broken = true
+                helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
+            }
+            if (placed == null) {
+                // 壊した tick に回ったつなぎ直し（RUNNING なので回る）が済んでから置く。同じ tick に置くと、その予約で
+                // 直す前のコードでもつながってしまう（scheduleTick は同じ位置の予約を重ねない）
+                helper.assertTrue(++ticksAfterBreak > 2, "wait for the reconnect scheduled when the screen was broken")
+                helper.assertTrue(machine.reboot(), "reboot should be accepted")
+                helper.assertTrue(!machine.isRunningOrBooting, "the machine should be in the middle of rebooting: ${machine.state}")
+                helper.setBlock(
+                    SCREEN,
+                    KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+                )
+                placed = helper.getBlockEntity<ScreenBlockEntity>(SCREEN)
+                // 置いたブロックのデータを読み込んだ後につなぐので、置いた tick にはまだつながない（#535）
+                helper.assertTrue(case.wiring.connectedScreen == null, "the placed screen should be reconnected on the next tick")
+            }
+            if (!typed) {
+                val screen = placed!!
+                helper.assertTrue(case.wiring.connectedScreen === screen, "the placed screen should be reconnected")
+                helper.assertTrue(case.wiring.connectedKeyboard === keyboard, "the keyboard should be reconnected")
+                // 起動し直すまで待ってから打つ（プロンプトは画面をつなぐ前に出ていることがあるので、プロンプトは待たない）
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish rebooting")
+                helper.assertTrue(case.computer.machine === machine, "the case should keep the rebooted machine")
+                helper.assertTrue(machine.devices.primaryScreen === case.wiring.connectedScreenDevice, "the screen device should be the console")
+                val expected = listOf(
+                    DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER),
+                    DeviceInfo(screen.deviceAddress, DeviceKind.SCREEN),
+                    DeviceInfo(keyboard.deviceAddress, DeviceKind.KEYBOARD),
+                )
+                helper.assertTrue(machine.devices.list() == expected, "devices should be attached again: ${machine.devices.list()}")
+                typeLine(helper, keyboard, "print(20+22)")
+                typed = true
+            }
+            val text = locked(placed!!) { lines(placed!!.text) }
+            // 打った行は REPL が読み始める前にエコーされることがあり、そのときは結果がプロンプトの後に続く（"> 42"）
+            helper.assertTrue(text.any { it == "42" || it == "> 42" }, "the result should be shown on the placed screen: $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /** 再起動を求めた後に止めた（ゲストが止めたのと同じ）マシンには、その間に置いた画面をつながない（#535・#626） */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun screenPlacedAfterCancelledRebootIsNotReconnected(helper: GameTestHelper) {
+        val (case, _, keyboard) = build(helper)
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        helper.setBlock(SCREEN, Blocks.AIR)
+        helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
+        var ticksAfterBreak = 0
+        var placedTicks = -1
+        var attachedBefore = 0
+        helper.succeedWhen {
+            if (placedTicks < 0) {
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting")
+                helper.assertTrue(++ticksAfterBreak > 2, "wait for the reconnect scheduled when the screen was broken")
+                attachedBefore = case.wiring.screenAttachCount
+                helper.assertTrue(machine.reboot(), "reboot should be accepted")
+                machine.stop()
+                helper.setBlock(
+                    SCREEN,
+                    KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+                )
+                placedTicks = 0
+            }
+            helper.assertTrue(case.wiring.connectedScreen == null, "the stopped machine should not take the screen")
+            helper.assertTrue(keyboard.owner == null, "the stopped machine should not take the keyboard")
+            helper.assertTrue(++placedTicks > 3, "watch for a few ticks after placing")
+            // 一時的につないですぐ外れたものは、tick の終わりの状態では見えない（止まった通知でケースが結線を外す）。つないだ回数で確かめる
+            helper.assertTrue(
+                case.wiring.screenAttachCount == attachedBefore,
+                "the screen should never have been attached to the stopped machine (${case.wiring.screenAttachCount - attachedBefore} attach)",
+            )
+            helper.assertTrue(case.computer.status == ComputerStatus.OFF, "the case should turn off: ${case.computer}")
+            helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
 }
