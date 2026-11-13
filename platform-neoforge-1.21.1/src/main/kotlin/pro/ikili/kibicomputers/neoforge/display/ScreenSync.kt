@@ -199,7 +199,18 @@ object ScreenSync {
     // クライアント: 画面の中身のフラグメントを受け取った（メインスレッドで呼ばれる）
     private fun onUpdate(payload: ScreenUpdatePayload, context: IPayloadContext) {
         val level = context.player().level()
-        if (!level.isClientSide || level.dimension() != payload.dimension || !level.isLoaded(payload.pos)) {
+        if (!level.isClientSide) return
+        if (level.dimension() != payload.dimension) {
+            // ディメンションを移った直後に、元のディメンションの画面の分が届くことがある（ふつうに起きる）
+            LOGGER.debug(
+                "Dropped screen sync data at {}: it is for {} but the client is in {}",
+                payload.pos,
+                payload.dimension.location(),
+                level.dimension().location(),
+            )
+            return
+        }
+        if (!level.isLoaded(payload.pos)) {
             // サーバーは送れたものとして扱うので、ここで捨てると次のキーフレームまで画面が古いままになる（#636）
             LOGGER.debug("Dropped screen sync data at {}: the chunk is not loaded on the client", payload.pos)
             return
