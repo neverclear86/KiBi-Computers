@@ -99,7 +99,9 @@ class ShellLineEditTest {
     /**
      * 会話的な `sh` を起こし、プロンプト（`$ `・`> `）が出るたびに [steps] を 1 つずつ打つ。
      * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ。
-     * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）
+     * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）。
+     * [splittable] なら貼り付けと同じく分けて入れてよい入力として渡す（raw の TTY の 4 KiB を超える行を打つため。#609）。
+     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる
      */
     private fun session(
         steps: List<String>,
@@ -110,6 +112,7 @@ class ShellLineEditTest {
         exit: Boolean = true,
         read: List<String> = emptyList(),
         charset: Charset = Charsets.UTF_8,
+        splittable: Boolean = false,
         settled: (ScreenHost) -> Boolean = { true },
     ): Session = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -132,7 +135,8 @@ class ShellLineEditTest {
                 val text = host.text()
                 if (next < steps.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> "))) {
                     seen = text.length
-                    m.offerConsoleInput(steps[next++].toByteArray(charset))
+                    val bytes = steps[next++].toByteArray(charset)
+                    assertEquals(bytes.size, m.offerConsoleInput(bytes, splittable = splittable), "TTY が入力を捨てた")
                 }
                 Thread.sleep(1)
                 if (exit) m.stateOf(pid).isTerminal else next == steps.size && settled(host)
@@ -473,5 +477,76 @@ class ShellLineEditTest {
         val t = s.text
         assertTrue(t.contains("$ FOO=\$HOME"), t)
         assertTrue(t.contains("\n/home\n"), t)
+    }
+
+    @Test
+    fun `上限を超えた行は実行せず履歴にも残さない`() {
+        // 1 行の上限は 4096 バイト（ADR 0102）。超えた行は貼り付けで渡す
+        val a = "A".repeat(5000)
+        val ok = "echo " + "O".repeat(4076) + " > /home/ok.txt"
+        val ng = "echo " + "N".repeat(4077) + " > /home/ng.txt"
+        // 全角の 1 文字が境目をまたぐ（4094 バイトの後ろの 3 バイト）。後ろの C は入るが、印は残る
+        val u8Head = "> /home/u8.txt echo " + "B".repeat(4074)
+        val u8 = u8Head + "あC"
+        assertEquals(4096, ok.toByteArray().size)
+        assertEquals(4097, ng.toByteArray().size)
+        assertEquals(4094, u8Head.toByteArray().size)
+        val s = session(
+            listOf(
+                "echo $a > /home/p1.txt\n",
+                "echo \"st=\$?\"\r",
+                "$ok\n",
+                "$ng\n",
+                // 超えた後に Backspace で短くしても、捨てた中身は戻らないので実行しない
+                "echo $a" + "\u007f".repeat(1000) + " > /home/bs.txt\n",
+                // Ctrl+U で全部消して打ち直した行は実行する
+                "echo $a\u0015echo cu > /home/cu.txt\n",
+                // 続きの行で超えたら、読みかけのコマンドごと捨てる
+                "if true; then\r",
+                "echo pre > /home/pre.txt\r",
+                "echo $a\n",
+                "echo \"st2=\$?\"\r",
+                "$u8\n",
+                "history\r",
+                "exit\r",
+            ),
+            read = listOf(
+                "/home/p1.txt",
+                "/home/ok.txt",
+                "/home/ng.txt",
+                "/home/bs.txt",
+                "/home/cu.txt",
+                "/home/pre.txt",
+                "/home/u8.txt",
+                "/home/.sh_history",
+            ),
+            splittable = true,
+        )
+        val t = s.text
+        val tail = t.takeLast(3000)
+        assertEquals(5, Regex("sh: line too long\n").findAll(t).count(), tail)
+        assertTrue(t.contains("\nst=2\n"), tail)
+        assertTrue(t.contains("\nst2=2\n"), tail)
+        assertEquals("<none>", s.files["/home/p1.txt"])
+        assertEquals("O".repeat(4076) + "\n", s.files["/home/ok.txt"])
+        assertEquals("<none>", s.files["/home/ng.txt"])
+        assertEquals("<none>", s.files["/home/bs.txt"])
+        assertEquals("cu\n", s.files["/home/cu.txt"])
+        assertEquals("<none>", s.files["/home/pre.txt"])
+        assertEquals("<none>", s.files["/home/u8.txt"])
+        val expected = listOf(
+            "echo \"st=\$?\"",
+            ok,
+            "echo cu > /home/cu.txt",
+            "if true; then",
+            "echo pre > /home/pre.txt",
+            "echo \"st2=\$?\"",
+            "history",
+            "exit",
+        )
+        assertEquals(expected.joinToString("\n", postfix = "\n"), s.files["/home/.sh_history"])
+        // history の一覧にも、上限を超えた行はない
+        assertTrue(!t.contains("  echo AAAA"), tail)
+        assertEquals(0, s.exitCode)
     }
 }

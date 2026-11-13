@@ -12,7 +12,7 @@ sh - コマンドのシェル
 
 ## 説明
 
-POSIX 風のシェルです。パイプライン、リスト、`if`・`while`・`for`・`case`、関数、リダイレクト、ヒアドキュメント、`$(...)`、パラメーター展開、ワイルドカードを使えます。端末では、行の編集・補完（Tab）・履歴（`~/.sh_history`）つきで会話的にコマンドを読みます。
+POSIX 風のシェルです。パイプライン、リスト、`if`・`while`・`for`・`case`、関数、リダイレクト、ヒアドキュメント、`$(...)`、パラメーター展開、ワイルドカードを使えます。端末では、行の編集・補完（Tab）・履歴（`~/.sh_history`）つきで会話的にコマンドを読みます。会話的な 1 行は 4096 バイトまでで、超えて欠けた行は Enter を押しても実行しません（`sh: line too long`）。
 
 組み込みのコマンド: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local` `history` `true` `false` `echo` `printf` `cd` `pwd` `read` `test` `[` `wait` `jobs` `command` `type` `source`。
 

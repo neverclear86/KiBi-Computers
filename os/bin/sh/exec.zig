@@ -2090,7 +2090,8 @@ pub const Reader = struct {
         return true;
     }
 
-    /// 行の編集で 1 行読む。Ctrl+C なら、読みかけのコマンドを捨てて `$?` を 130 にする
+    /// 行の編集で 1 行読む。Ctrl+C なら、読みかけのコマンドを捨てて `$?` を 130 にする。
+    /// 上限を超えた行なら、`sh: line too long` を出して読みかけのコマンドを捨て、`$?` を 2 にする
     fn editLine(self: *Reader) Error!bool {
         if (self.buf.len - self.len < 2) return false;
         const m = mem.mark();
@@ -2105,6 +2106,13 @@ pub const Reader = struct {
             .interrupt => {
                 self.len = self.start;
                 state.status = 130;
+            },
+            .too_long => {
+                // 上限を超えて切れた行は実行しない（#665）。続きの行なら、前の行とつながって
+                // 別のコマンドにならないよう、読みかけのコマンドごと捨てる
+                util.complain(&.{"line too long"});
+                self.len = self.start;
+                state.status = 2;
             },
         }
         return true;
