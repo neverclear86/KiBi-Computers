@@ -744,25 +744,33 @@ class NanoEditorTest {
         // 起動の知らせが本文を覆う（本文がつながって書かれない）
         assertTrue(row(0).trim().startsWith("[ Read 1 line"), screen)
         assertFalse(row(0).contains("abcdef"), screen)
+        // 知らせが覆っている間は、カーソルを知らせの文字に重ねず隠す
+        assertFalse(host.terminal.cursorVisible, screen)
         // 知らせが消えると、本文が見える。タイトルは出さない
         keys(right)
         assertEquals("abcdef", row(0))
         assertEquals(1 to 0, host.cursor())
+        assertTrue(host.terminal.cursorVisible)
         keys("\u0003")
         assertTrue(row(0).contains("line 1/2"), screen)
         assertFalse(row(0).contains("abcdef"), screen)
+        assertFalse(host.terminal.cursorVisible, screen)
         // 次のキーで本文に戻る
         keys(right)
         assertEquals("abcdef", row(0))
         assertEquals(2 to 0, host.cursor())
+        assertTrue(host.terminal.cursorVisible)
         // 入力欄もカーソルも 0 行目に出る
         keys("\u0017")
         assertTrue(row(0).startsWith("Search"), screen)
         assertEquals(0, host.cursor().second)
+        assertTrue(host.terminal.cursorVisible)
         keys("\u0003")
         assertTrue(row(0).contains("Cancelled"), screen)
+        assertFalse(host.terminal.cursorVisible, screen)
         keys(right)
         assertEquals("abcdef", row(0))
+        assertTrue(host.terminal.cursorVisible)
         keys(ctrlX)
         assertEquals(0, finish())
     }

@@ -627,7 +627,9 @@ pub fn render() void {
         drawShortcuts(1);
         commitRow(rows - 1);
     }
-    if (st.mode == .help) {
+    // 1 行の画面で知らせが本文を覆っている間は、本文の行を描いていないので、
+    // カーソルを置く場所がない（知らせの文字の上に重ねない）。ヘルプと同じく隠す
+    if (st.mode == .help or (textCovered() and st.mode != .prompt)) {
         out("\x1b[?25l");
     } else {
         moveTo(@min(cy, rows - 1), @min(cx, cols - 1));
