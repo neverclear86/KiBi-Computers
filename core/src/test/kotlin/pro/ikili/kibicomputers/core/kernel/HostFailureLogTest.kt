@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.device.SCREEN_ADDRESS
+import pro.ikili.kibicomputers.core.device.ScreenDevice
+import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
@@ -26,7 +29,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * `Machine.safely` が捨てる接続層の例外をログに出す（#674、ADR 0044）: 1台・1種類で最初の1回は WARNING、2回目からは DEBUG。
- * スタックトレースはスケジューラ全体で種類ごとに最初の1回だけ。JVM の致命的なエラーは捨てずに投げる
+ * スタックトレースはスケジューラ全体で、投げた場所ごとに最初の1回だけ。JVM の致命的なエラーは捨てずに投げる
  */
 class HostFailureLogTest {
     @TempDir
@@ -100,27 +103,68 @@ class HostFailureLogTest {
     }
 
     @Test
-    fun `同じ台・同じ種類の2回目はDEBUG、別の台はまたWARNING`() = timeout(limit) {
+    fun `同じ台の同じ例外の繰り返しはDEBUG、別の台の同じ場所はスタックトレースなしのWARNING`() = timeout(limit) {
         Captured().use { logs ->
             Harness().use { h ->
                 val a = h.machine(host = QuietHost())
                 val b = h.machine(host = QuietHost())
-                a.postHostCallback { throw IllegalStateException("1回目") }
+                val bug = Runnable { throw IllegalStateException("同じバグ") }
+                a.postHostCallback(bug)
                 h.scheduler.tick()
-                a.postHostCallback { throw IllegalStateException("2回目") }
+                a.postHostCallback(bug)
                 h.scheduler.tick()
                 assertEquals(1, logs.of(a, Level.WARNING).size)
+                assertNotNull(logs.of(a, Level.WARNING).single().thrown)
                 val debug = logs.of(a, Level.FINE).single()
-                assertTrue(debug.message.contains("2回目"))
+                assertTrue(debug.message.contains("同じバグ"))
                 assertNull(debug.thrown, "DEBUG にはスタックトレースを付けない")
 
-                // 別の台の同じ種類
-                b.postHostCallback { throw IllegalStateException("別の台") }
+                // 別の台の同じ種類・同じ場所
+                b.postHostCallback(bug)
                 h.scheduler.tick()
                 assertEquals(1, logs.of(a, Level.WARNING).size)
                 val other = logs.of(b, Level.WARNING).single()
-                assertTrue(other.message.contains("別の台"))
-                assertNull(other.thrown, "同じ種類のスタックトレースは、スケジューラ全体で最初の1回だけ")
+                assertTrue(other.message.contains("同じバグ"))
+                assertNull(other.thrown, "同じ場所のスタックトレースは、スケジューラ全体で最初の1回だけ")
+            }
+        }
+    }
+
+    @Test
+    fun `同じ種類でも別の不具合なら、台が同じでも違っても、それぞれスタックトレース付きのWARNINGになる`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                val a = h.machine(host = QuietHost())
+                val b = h.machine(host = QuietHost())
+                a.postHostCallback { throw IllegalStateException("バグA") }
+                h.scheduler.tick()
+                // 同じ台・同じ種類で、別の不具合（例外のクラスが違う）
+                a.postHostCallback { throw IllegalArgumentException("バグB") }
+                h.scheduler.tick()
+                // 別の台で、別の場所から同じクラスの例外
+                b.postHostCallback { throw IllegalStateException("バグC") }
+                h.scheduler.tick()
+                val warnings = logs.of(a, Level.WARNING) + logs.of(b, Level.WARNING)
+                assertEquals(3, warnings.size, warnings.map { it.message }.toString())
+                assertTrue(warnings.all { it.thrown != null }, "投げた場所が違えば、スタックトレースを付ける")
+                assertTrue(logs.of(a, Level.FINE).isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun `同じ台で例外のメッセージだけ変わっても、投げた場所が同じなら2回目はスタックトレースなしのDEBUGになる`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                val a = h.machine(host = QuietHost())
+                var n = 0
+                val bug = Runnable { throw IllegalStateException("回 ${n++}") }
+                a.postHostCallback(bug)
+                h.scheduler.tick()
+                a.postHostCallback(bug)
+                h.scheduler.tick()
+                assertEquals(1, logs.of(a, Level.WARNING).size)
+                assertNull(logs.of(a, Level.FINE).single().thrown)
             }
         }
     }
@@ -196,6 +240,103 @@ class HostFailureLogTest {
                 h.scheduler.tick()
                 assertEquals(listOf("after"), after.toList())
                 assertTrue(logs.of(m, Level.WARNING).single().message.contains("StackOverflowError"))
+            }
+        }
+    }
+
+    @Test
+    fun `致命的なエラーで抜けても、配っていないマシンと残りの通知は次のtickで配られる`() = timeout(limit) {
+        Captured().use { _ ->
+            Harness().use { h ->
+                val log = Collections.synchronizedList(ArrayList<String>())
+                val bad = h.machine(host = QuietHost())
+                val good = h.machine(host = QuietHost())
+                bad.postHostCallback { throw OutOfMemoryError("test") }
+                bad.postHostCallback { log += "bad-after" }
+                good.postHostCallback { log += "good" }
+                assertThrows(OutOfMemoryError::class.java) { h.scheduler.tick() }
+                assertTrue(log.isEmpty())
+                h.scheduler.tick()
+                assertEquals(setOf("bad-after", "good"), log.toSet())
+                assertEquals(2, log.size)
+                // 積み直した後も、通常どおり通知が積める（queuedForNotify が立ったままになっていない）
+                good.postHostCallback { log += "good-again" }
+                h.scheduler.tick()
+                assertEquals(3, log.size)
+            }
+        }
+    }
+
+    @Test
+    fun `復元の受け手が致命的なエラーを投げると、復元の印は閉じ、tickの外へ届き、ログには出ない`() = timeout(limit) {
+        Captured().use { logs ->
+            val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+            Harness().use { h ->
+                val identity = store.assignNewId(MachineOwner("minecraft:overworld", 0, 64, 0))!!
+                val m = h.machine(host = QuietHost())
+                val config = BootConfig.builder().addBootDisk("none").build()
+                val listener = RestoreListener { _, _, _ -> throw OutOfMemoryError("受け手") }
+                assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, 5), config, listener)))
+                var thrown: Throwable? = null
+                eventually(10_000, "致命的なエラーが tick の外へ届かない") {
+                    try {
+                        h.scheduler.tick()
+                    } catch (e: OutOfMemoryError) {
+                        thrown = e
+                    }
+                    thrown != null
+                }
+                assertEquals("受け手", thrown!!.message)
+                assertFalse(m.isRestoring, "受け手が致命的なエラーを投げても復元の印は閉じる")
+                assertTrue(logs.of(m, Level.WARNING).isEmpty(), "致命的なエラーはログに出さない")
+                m.close()
+            }
+        }
+    }
+
+    @Test
+    fun `画面への書き込みが投げると、画面への書き込みの種類でWARNINGが出る`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                val console = Collections.synchronizedList(ArrayList<String>())
+                val m = h.machine(host = QuietHost { console += String(it) })
+                val buffer = TextBuffer(20, 3)
+                val screen = ScreenDevice(buffer, 2)
+                assertTrue(m.devices.attach(SCREEN_ADDRESS, screen))
+                // 画面のバッファを壊して、書き込みが投げるようにする
+                val field = TextBuffer::class.java.getDeclaredField("codePoints")
+                field.isAccessible = true
+                val original = field.get(buffer)
+                field.set(buffer, IntArray(0))
+                try {
+                    m.writeConsole("x".toByteArray())
+                    h.scheduler.tick()
+                } finally {
+                    field.set(buffer, original)
+                }
+                val warning = logs.of(m, Level.WARNING).single()
+                assertTrue(warning.message.contains("画面への書き込み"), warning.message)
+                assertNotNull(warning.thrown)
+                assertTrue(console.isEmpty(), "画面があれば接続層には来ない")
+                m.devices.detach(SCREEN_ADDRESS)
+            }
+        }
+    }
+
+    @Test
+    fun `出力を止めている相手の再開が投げると、出力の再開の種類でWARNINGが出る`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                val m = h.machine(host = QuietHost())
+                m.holdConsoleOutput { throw IllegalStateException("再開のバグ") }
+                h.scheduler.tick()
+                h.scheduler.tick()
+                m.releaseConsoleOutput()
+                val warning = logs.of(m, Level.WARNING).single()
+                assertTrue(warning.message.contains("出力の再開"), warning.message)
+                assertTrue(warning.message.contains("再開のバグ"))
+                assertNotNull(warning.thrown)
+                assertEquals(1, logs.of(m, Level.FINE).size, "止めている間は毎 tick 回るので、2回目からは DEBUG")
             }
         }
     }

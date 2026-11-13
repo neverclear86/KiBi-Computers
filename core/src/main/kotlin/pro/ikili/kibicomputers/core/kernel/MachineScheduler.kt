@@ -50,6 +50,12 @@ public class MachineScheduler private constructor(
         /** `KiBi-timer` のスタック（タイマーを鳴らすだけなので小さくてよい） */
         private const val TIMER_STACK_BYTES: Long = 1L * 1024 * 1024
 
+        /** 接続層の例外の投げた場所を決めるスタックの段数（#674） */
+        private const val HOST_FAILURE_FRAMES = 3
+
+        /** スタックトレースを出した、接続層の例外の場所を覚える数の上限（#674。仮の値） */
+        private const val HOST_FAILURE_TRACE_LIMIT = 64
+
         /** 内部の設定（テスト用の差し替え）を付けてスケジューラを作る。 */
         @JvmSynthetic
         internal fun create(config: SchedulerConfig, options: SchedulerInternals): MachineScheduler = MachineScheduler(config, options)
@@ -62,11 +68,23 @@ public class MachineScheduler private constructor(
     private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
     private val blockingCount = AtomicInteger()
 
-    /** 接続層の例外のスタックトレースを、もうログに出した種類（`Machine` の通知の種類のビット。#674） */
-    private val hostFailureTraced = AtomicInteger()
+    /** 接続層の例外のスタックトレースを、もうログに出した場所（種類・例外のクラス・スタックの上のほう。#674） */
+    private val hostFailureTraced: MutableSet<List<Any>> = ConcurrentHashMap.newKeySet()
 
-    /** 接続層の例外の種類 [bit] で、スタックトレースを出すのがスケジューラ全体で最初なら `true`（以後は `false`。#674） */
-    internal fun claimHostFailureTrace(bit: Int): Boolean = hostFailureTraced.getAndUpdate { it or bit } and bit == 0
+    /**
+     * 接続層の例外 [t]（種類は `Machine` の `HostFailureKind` の ordinal [kind]）の投げた場所で、スタックトレースを出すのが
+     * スケジューラ全体で最初なら `true`（以後は `false`。#674）。場所は、種類・例外のクラス・スタックの上から [HOST_FAILURE_FRAMES] 個で決める。
+     * 覚える場所は [HOST_FAILURE_TRACE_LIMIT] 個まで（超えたら、新しい場所でも `false`）
+     */
+    internal fun claimHostFailureTrace(kind: Int, t: Throwable): Boolean {
+        if (hostFailureTraced.size >= HOST_FAILURE_TRACE_LIMIT) return false
+        val frames = t.stackTrace
+        val site = ArrayList<Any>(HOST_FAILURE_FRAMES + 2)
+        site += kind
+        site += t.javaClass
+        for (i in 0 until minOf(HOST_FAILURE_FRAMES, frames.size)) site += frames[i]
+        return hostFailureTraced.add(site)
+    }
 
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
     private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
@@ -217,13 +235,32 @@ public class MachineScheduler private constructor(
         }
         while (true) batch += notifyQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
-        for (machine in batch) machine.deliverNotifications()
+        deliverNotifications(batch)
         batch.clear()
         while (true) batch += hostCallQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
         for (machine in batch) {
             // 残ったマシンは次の tick へ（この tick の中では入れ直さない）
             if (machine.runHostCalls()) hostCallQueue.add(machine)
+        }
+    }
+
+    /**
+     * [batch] のマシンに通知を配る。JVM の致命的なエラー（[Machine] の `safely` が投げ直す）で途中で抜けるときは、
+     * まだ配っていないマシンと、投げたマシンの残りを、次の tick に回してから投げ直す（`queuedForNotify` が立ったまま、
+     * 列にも載っていない状態にしない。#674）
+     */
+    private fun deliverNotifications(batch: List<Machine>) {
+        var i = 0
+        try {
+            while (i < batch.size) {
+                batch[i].deliverNotifications()
+                i++
+            }
+        } catch (t: Throwable) {
+            for (j in i + 1 until batch.size) notifyQueue.add(batch[j])
+            batch[i].requestNotifyAfterAbort()
+            throw t
         }
     }
 

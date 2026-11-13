@@ -3460,6 +3460,11 @@ public class Machine private constructor(
         if (queuedForNotify.compareAndSet(false, true)) scheduler.enqueueNotify(this)
     }
 
+    /** [deliverNotifications] が致命的なエラーで途中で抜けたので、残りの通知を次の tick に配り直す（#674）。スケジューラの `tick()` から呼ぶ */
+    internal fun requestNotifyAfterAbort() {
+        requestNotify()
+    }
+
     private fun deferConsole(n: HostNotification) {
         (deferredConsole ?: ArrayList<HostNotification>().also { deferredConsole = it }).add(n)
     }
@@ -3491,23 +3496,41 @@ public class Machine private constructor(
     private var hostFailuresLogged = 0
 
     /**
-     * [safely] が捨てる例外をログに出す（#674）。1台・1種類につき最初の1回は WARNING、2回目からは DEBUG（スタックトレースなし）。
-     * WARNING のスタックトレースは、スケジューラ全体で種類ごとに最初の1回だけ付ける（全台の受け手が同じ不具合で投げても、
-     * 1,000 本のスタックトレースでログを埋めない。ADR 0088 の「ログと数え口」と同じ考え方）
+     * 種類ごとに、この台で最後にログに出した例外の目印（クラスとメッセージのハッシュ）。[hostFailuresLogged] が立っている種類だけ意味がある。
+     * 同じ目印の繰り返し（毎 tick 投げるなど）では、スタックトレースを読まずに済ませるために持つ。[hostFailuresLogged] と同じく
+     * メインスレッドだけで読み書きし、保存しない
+     */
+    private var hostFailureSignatures: IntArray? = null
+
+    /**
+     * [safely] が捨てる例外をログに出す（#674）。1台・1種類につき最初の1回は WARNING、同じ例外の繰り返しは DEBUG（スタックトレースなし）。
+     * 例外の中身が変わったとき（クラスかメッセージが違う）は、スケジューラ全体で見て、投げた場所（例外のクラスと
+     * スタックの上のほう）がまだ記録にない場合に限り、WARNING にスタックトレースを付ける（[MachineScheduler.claimHostFailureTrace]）。
+     * 全台が同じ不具合で投げても、1,000 本のスタックトレースでログを埋めない（ADR 0088 の「ログと数え口」と同じ考え方）
      */
     private fun reportHostFailure(kind: HostFailureKind, t: Throwable) {
         try {
             val bit = 1 shl kind.ordinal
-            if (hostFailuresLogged and bit == 0) {
-                hostFailuresLogged = hostFailuresLogged or bit
-                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。この台・この種類の2回目からは DEBUG）: $t"
-                if (scheduler.claimHostFailureTrace(bit)) {
-                    LOG.log(System.Logger.Level.WARNING, message, t)
-                } else {
-                    LOG.log(System.Logger.Level.WARNING, message)
+            val first = hostFailuresLogged and bit == 0
+            val signature = 31 * t.javaClass.hashCode() + (t.message?.hashCode() ?: 0)
+            val signatures = hostFailureSignatures ?: IntArray(HostFailureKind.entries.size).also { hostFailureSignatures = it }
+            if (!first && signatures[kind.ordinal] == signature) {
+                if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
+                    LOG.log(System.Logger.Level.DEBUG, "マシン $id の接続層の${kind.label}がまた例外を投げた（捨てて続ける）: $t")
                 }
+                return
+            }
+            hostFailuresLogged = hostFailuresLogged or bit
+            signatures[kind.ordinal] = signature
+            val newSite = scheduler.claimHostFailureTrace(kind.ordinal, t)
+            if (newSite) {
+                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。同じ例外の繰り返しは DEBUG）: $t"
+                LOG.log(System.Logger.Level.WARNING, message, t)
+            } else if (first) {
+                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。同じ例外の繰り返しは DEBUG。投げた場所は記録済みなので、スタックトレースは省く）: $t"
+                LOG.log(System.Logger.Level.WARNING, message)
             } else if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
-                LOG.log(System.Logger.Level.DEBUG, "マシン $id の接続層の${kind.label}がまた例外を投げた（捨てて続ける）: $t")
+                LOG.log(System.Logger.Level.DEBUG, "マシン $id の接続層の${kind.label}が別の例外を投げた（捨てて続ける）: $t")
             }
         } catch (e: Throwable) {
             // ログに出せない（例外の toString が投げたなど）: 捨てる。致命的なエラーは投げる
