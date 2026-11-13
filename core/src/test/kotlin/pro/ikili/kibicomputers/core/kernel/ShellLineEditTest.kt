@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
+import java.nio.charset.Charset
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -97,7 +98,8 @@ class ShellLineEditTest {
 
     /**
      * 会話的な `sh` を起こし、プロンプト（`$ `・`> `）が出るたびに [steps] を 1 つずつ打つ。
-     * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ
+     * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ。
+     * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）
      */
     private fun session(
         steps: List<String>,
@@ -107,6 +109,7 @@ class ShellLineEditTest {
         rows: Int = 25,
         exit: Boolean = true,
         read: List<String> = emptyList(),
+        charset: Charset = Charsets.UTF_8,
         settled: (ScreenHost) -> Boolean = { true },
     ): Session = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -129,7 +132,7 @@ class ShellLineEditTest {
                 val text = host.text()
                 if (next < steps.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> "))) {
                     seen = text.length
-                    m.offerConsoleInput(steps[next++].toByteArray())
+                    m.offerConsoleInput(steps[next++].toByteArray(charset))
                 }
                 Thread.sleep(1)
                 if (exit) m.stateOf(pid).isTerminal else next == steps.size && settled(host)
@@ -144,6 +147,9 @@ class ShellLineEditTest {
             Session(host, exitCode, read.associateWith { m.readText(it) ?: "<none>" })
         }
     }
+
+    /** バイト [b] をそのまま打つための文字列（ISO-8859-1 で打つ [session] に渡す） */
+    private fun raw(vararg b: Int): String = String(CharArray(b.size) { b[it].toChar() })
 
     private val left = "\u001b[D"
     private val right = "\u001b[C"
@@ -368,6 +374,97 @@ class ShellLineEditTest {
         assertTrue(y >= 0, rows.joinToString("\n"))
         // 描き直した後のカーソルは、見える幅（"$ echo aX" の 9）の位置
         assertEquals(9 to y, s.host.cursor(), rows.joinToString("\n"))
+    }
+
+    @Test
+    fun `幅のない文字は幅に数えない`() {
+        // U+302A（CJK の声調記号。Mn）は端末が読み捨てる。全角に数えるとカーソルが 2 セルずれる
+        val s = session(
+            listOf("echo a\u302Ab${left}X"),
+            exit = false,
+            settled = { h -> h.rows().any { it == "$ echo aXb" } },
+        )
+        val rows = s.host.rows()
+        val y = rows.indexOf("$ echo aXb")
+        assertTrue(y >= 0, rows.joinToString("\n"))
+        assertEquals(9 to y, s.host.cursor(), rows.joinToString("\n"))
+    }
+
+    @Test
+    fun `不正なUTF-8とC1の制御文字はU+FFFDで見せる`() {
+        // overlong（E0 80 80）は 1 バイトごとに、C1（C2 85）は 1 文字を U+FFFD に。ISO-8859-1 でバイトをそのまま打つ
+        val shown = "$ echo \uFFFD\uFFFD\uFFFD\uFFFDYx"
+        val s = session(
+            listOf("echo ${raw(0xE0, 0x80, 0x80, 0xC2, 0x85)}x${left}Y"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == shown } },
+        )
+        val rows = s.host.rows()
+        val y = rows.indexOf(shown)
+        assertTrue(y >= 0, rows.joinToString("\n"))
+        assertEquals(12 to y, s.host.cursor(), rows.joinToString("\n"))
+    }
+
+    @Test
+    fun `不正なUTF-8の上のカーソル移動とBackspaceとDeleteは見えている文字ごとに動く`() {
+        // overlong（E0 80 80）は U+FFFD が 3 つ。左・右は 1 つずつ、Backspace・Delete も 1 つずつ消す
+        val bad = raw(0xE0, 0x80, 0x80)
+        val del = "\u001b[3~"
+        // 左へ 1 つ → X は 2 つめの後ろ
+        val moved = session(
+            listOf("echo $bad${left}X"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��X�" } },
+        )
+        val movedRows = moved.host.rows()
+        val my = movedRows.indexOf("$ echo ��X�")
+        assertTrue(my >= 0, movedRows.joinToString("\n"))
+        assertEquals(10 to my, moved.host.cursor(), movedRows.joinToString("\n"))
+        // 左へ 3 つ・右へ 1 つ → X は 1 つめの後ろ
+        val back = session(
+            listOf("echo $bad$left$left$left${right}X"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo �X��" } },
+        )
+        val backRows = back.host.rows()
+        assertTrue(backRows.contains("$ echo �X��"), backRows.joinToString("\n"))
+        // Backspace は 1 つだけ消す
+        val bs = session(
+            listOf("echo $bad\u007f"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��" } },
+        )
+        val bsRows = bs.host.rows()
+        assertTrue(bsRows.contains("$ echo ��"), bsRows.joinToString("\n"))
+        // Delete も 1 つだけ消す（先頭の 1 つめの前へ戻ってから）
+        val dl = session(
+            listOf("echo $bad$left$left$left$del"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��" } },
+        )
+        val dlRows = dl.host.rows()
+        assertTrue(dlRows.contains("$ echo ��"), dlRows.joinToString("\n"))
+    }
+
+    @Test
+    fun `プロンプトの不正なUTF-8はバイトごとにU+FFFDにして数える`() {
+        // サロゲート（ED A0 80）を端末は 1 つの U+FFFD に読む。sh は 3 つの U+FFFD にして送り、3 セルと数える
+        val s = session(
+            listOf("PS1='${raw(0xED, 0xA0, 0x80)}> '\r", "echo abc$left${left}X"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it.endsWith("> echo aXbc") } },
+        )
+        val rows = s.host.rows()
+        val y = rows.indexOfFirst { it.endsWith("> echo aXbc") }
+        assertTrue(y >= 0, rows.joinToString("\n"))
+        assertEquals("\uFFFD\uFFFD\uFFFD> echo aXbc", rows[y])
+        assertEquals(12 to y, s.host.cursor(), rows.joinToString("\n"))
     }
 
     @Test
