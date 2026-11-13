@@ -352,6 +352,8 @@ class ManCommandTest {
 
         fun bytes(): Int = synchronized(this) { out.size() }
 
+        fun resize(columns: Int, rows: Int) = synchronized(this) { terminal.resize(columns, rows) }
+
         fun row(y: Int): String = synchronized(this) {
             buildString {
                 var x = 0
@@ -388,7 +390,15 @@ class ManCommandTest {
             settle()
         }
 
+        /** 画面とコンソールの TTY の大きさを変える（man は次のキーで読み直す） */
+        fun resize(columns: Int, rows: Int) {
+            m.resizeConsole(columns, rows)
+            host.resize(columns, rows)
+        }
+
         val rows: List<String> get() = host.rows()
+
+        fun screen(): String = rows.joinToString("\n")
         val ttyMode: TtyMode get() = m.lock.withLockValue { m.consoleTtyLocked().mode }
         val finished: Boolean get() = m.stateOf(pid).isTerminal
 
@@ -446,6 +456,52 @@ class ManCommandTest {
         assertTrue(rows.any { it.contains("ディレクトリ") }, rows.joinToString("\n"))
         for (r in rows) assertTrue(displayWidth(r) <= 50, r)
         keys("\u0003")
+        assertTrue(finished)
+        assertEquals(0, exitCode())
+        assertEquals(TtyMode.COOKED, ttyMode)
+    }
+
+    @Test
+    fun `行数だけ変わると送る量が変わり、いちばん上の行はそのまま`() = pager(listOf("man")) {
+        val tall = rows.take(15)
+        resize(50, 10)
+        keys("x") // 何もしないキー。大きさを読み直して描き直す
+        assertEquals(tall.take(9), rows.take(9))
+        assertTrue(rows[9].startsWith("--More--("), screen())
+        keys(" ")
+        // 新しい行数 − 1（9 行）だけ送る
+        assertEquals(tall.drop(9).take(6), rows.take(6))
+        assertTrue(rows[9].startsWith("--More--("), screen())
+        keys("q")
+        assertTrue(finished)
+    }
+
+    @Test
+    fun `幅が変わると組み直し、行は新しい幅に収まり、いちばん上は最後のページを超えない`() = pager(listOf("man")) {
+        keys(" ")
+        val before = rows.take(15)
+        // 狭くする: 新しい幅で折り直し、ページの途中のまま
+        resize(30, 16)
+        keys("x")
+        for (r in rows) assertTrue(displayWidth(r) <= 30, "幅 30 を超える: [$r]")
+        assertTrue(rows[15].startsWith("--More--("), screen())
+        assertTrue(rows.take(15) != before, screen())
+        // いちばん上は割合で移るので、先頭（top = 0）には戻らない
+        assertTrue(rows[0] != "man(1)", screen())
+        // 最後のページで広げる: 行が減っても、いちばん上は新しい最後のページ（G と同じ位置）に収まる
+        keys("G")
+        assertEquals("(END)", rows[15])
+        resize(80, 16)
+        keys("x")
+        for (r in rows) assertTrue(displayWidth(r) <= 80, "幅 80 を超える: [$r]")
+        assertEquals("(END)", rows[15])
+        val afterResize = rows
+        keys("G")
+        assertEquals(afterResize, rows)
+        // 最後のページが画面の途中から始まっていない（1 行戻ると画面が変わる）
+        keys("k")
+        assertTrue(rows != afterResize, screen())
+        keys("q")
         assertTrue(finished)
         assertEquals(0, exitCode())
         assertEquals(TtyMode.COOKED, ttyMode)
