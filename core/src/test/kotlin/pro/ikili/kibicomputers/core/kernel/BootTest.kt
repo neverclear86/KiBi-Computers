@@ -383,6 +383,88 @@ class BootTest {
     }
 
     @Test
+    fun `再起動の途中は止まっていない扱いで、ロックを持たれていても読み手は待たない`() = env {
+        // #626: reboot() を受け付けてから起動し直すまで（STOPPING → STOPPED で求めを待つ → 通知を積む）も、画面をつなぎ直してよい
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntilInitStarted()
+        assertTrue(m.isRunningBootingOrRebooting)
+        // init の専用スレッドを、プロセスが終わった後・登録を外す前で止める（STOPPED で求めの印だけが立った場面を作る）
+        val atGate = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        h.scheduler.hooks.beforeUnregister = { machine, pid ->
+            if (machine === m && pid == 1 && atGate.count > 0) {
+                atGate.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+        }
+        try {
+            assertTrue(m.reboot())
+            assertFalse(m.isRunningOrBooting, "isRunningOrBooting は再起動の途中を含まない")
+            assertTrue(m.isRunningBootingOrRebooting, "reboot を受け付けた直後")
+            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            h.scheduler.hooks.beforeUnregister = null
+            tickFor(50)
+            assertEquals(MachineState.STOPPED, m.state)
+            assertFalse(m.isBooting)
+            assertEquals(0, host.reboots.get())
+            assertTrue(m.isRunningBootingOrRebooting, "止まり切って、求めを積む前")
+            // カーネルロックを持っている間に、別のスレッド（メインスレッドの代わり）に読ませる。ロックを取らないので待たない
+            val value = AtomicReference<Boolean?>()
+            val stuck = AtomicBoolean()
+            m.lock.withLockValue {
+                val reader = Thread { value.set(m.isRunningBootingOrRebooting) }.apply { isDaemon = true }
+                reader.start()
+                reader.join(READER_WAIT_MILLIS)
+                stuck.set(reader.isAlive)
+            }
+            assertFalse(stuck.get(), "読み手が終わらない（ロックを取る読み方になっていないか）")
+            assertEquals(true, value.get())
+        } finally {
+            h.scheduler.hooks.beforeUnregister = null
+            gate.countDown()
+        }
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting }
+        assertTrue(m.isRunningBootingOrRebooting, "起動し直した後")
+    }
+
+    @Test
+    fun `再起動の通知を積んで配る前も止まっていない扱いで、stopで取り消すと止まった扱い`() = env {
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertFalse(m.isRunningBootingOrRebooting, "ゲスト（init）が止めたマシン")
+        // STOPPED でプロセスもスレッドもないので、すぐ通知を積む（配るのは次の tick）
+        assertTrue(m.reboot())
+        assertEquals(MachineState.STOPPED, m.state)
+        assertTrue(m.isRebootPending)
+        assertTrue(m.isRunningBootingOrRebooting, "通知を積んで、配る前")
+        m.stop()
+        assertFalse(m.isRunningBootingOrRebooting, "stop で取り消した再起動は含まない")
+        tickFor(100)
+        assertEquals(0, host.reboots.get())
+        assertFalse(m.isRunningBootingOrRebooting)
+    }
+
+    @Test
+    fun `再起動の途中でもCRASHEDなら止まった扱い`() = env {
+        // #535: reboot の後にマシンの不整合で止まっても、印は下りない（stopLocked は印を触らない）。CRASHED にはつながない
+        disks.withInit("d", exe(exitingInit(0)))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(m.awaitTermination(5_000))
+        assertTrue(m.reboot())
+        m.lock.withLockValue { m.stopLocked(IllegalStateException("テストの不整合")) }
+        assertEquals(MachineState.CRASHED, m.state)
+        assertTrue(m.isRebootPending, "印は残っている")
+        assertFalse(m.isRunningBootingOrRebooting)
+        tickFor(100)
+        assertEquals(MachineState.CRASHED, m.state)
+        assertFalse(m.isRunningBootingOrRebooting)
+    }
+
+    @Test
     fun `initを作る区間の途中でも、ロックなしの読み手には止まって見えない`() = env {
         // #625: 起動中の印を下ろしてから RUNNING にするまでの間に、ロックを取らずに読むと「STOPPED で起動中でもない」に見えた
         disks.withInit("d", exe(foreverInit()))

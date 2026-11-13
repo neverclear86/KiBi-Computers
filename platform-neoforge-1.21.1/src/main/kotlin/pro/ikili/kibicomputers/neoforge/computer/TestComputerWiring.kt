@@ -38,7 +38,8 @@ import java.util.concurrent.atomic.AtomicLong
  *   （音はまだ鳴らさず数えるだけ。[beeps]）。
  * - つないだ画面が外れたら、画面とキーボードだけを外す（#397）。マシンとスピーカーはつないだまま（#531）
  * - 画面をつないでいない間に、ケースの隣のブロックが変わったら（[CaseBlockEntity.neighborChanged]）、隣の画面と
- *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
+ *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。再起動の途中（[Machine.reboot] を受け付けてから
+ *   起動し直すまで）も含む（#626）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
  *   次の tick に回す。マシンが自分で止まったら（CRASHED、ゲストが止めた、起動に失敗した）、ケースがマシンを外し、結線も外れる
  *   （[CaseBlockEntity] が [disconnect] を呼ぶ。#640・#641）ので、つながない（#535）。
  *   つないだときの address を覚えておき、外すときはそれで外す。隣のブロックの更新で気付くので、画面の置いてある
@@ -108,17 +109,18 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     /**
      * [current]（ケースの今のマシン）がこの結線のマシンで、画面をつないでおらず、止まっていない
-     * （[MachineState.RUNNING] か、起動の途中。[Machine.isRunningOrBooting]）なら `true`。
-     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535）。ロックを取らず軽いので、ケースの隣のブロックが変わるたびに呼んでよい。
-     * 状態と起動中の印は、別々に読まず [Machine.isRunningOrBooting] で読む（読む順番に意味がある。#625）
+     * （[MachineState.RUNNING]、起動の途中、再起動の途中。[Machine.isRunningBootingOrRebooting]）なら `true`。
+     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535・#626）。ゲストが止めた・CRASHED なら `false`。
+     * ロックを取らず軽いので、ケースの隣のブロックが変わるたびに呼んでよい。画面をつないでいる台は、マシンの印を読まない。
+     * 状態と印は、別々に読まず [Machine.isRunningBootingOrRebooting] で読む（読む順番に意味がある。#625・#626）
      */
     fun canReconnectScreen(current: Machine?): Boolean {
         val m = machine ?: return false
-        return current === m && screen == null && m.isRunningOrBooting
+        return current === m && screen == null && m.isRunningBootingOrRebooting
     }
 
     /**
-     * 動いているマシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
+     * 止まっていない（再起動の途中も含む）マシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
      * そうでなければ何もしない。マシンが自分で止まった（CRASHED、ゲストが止めた、起動に失敗した）ときは、ケースがマシンを外して
      * 結線も外れるので、つながない（#535・#640・#641）。
      * 置いたブロックのデータ（address など）を読み込んだ後に呼ぶ（[CaseBlockEntity.neighborChanged] は次の tick に回す）

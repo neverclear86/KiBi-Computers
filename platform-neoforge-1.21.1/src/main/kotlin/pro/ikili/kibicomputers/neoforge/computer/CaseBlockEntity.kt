@@ -366,7 +366,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /**
-     * 隣のブロックが変わった。動いていて画面をつないでいなければ、次の tick に [reconnectScreen] を回す（#531。仮の結線）。
+     * 隣のブロックが変わった。止まっていなくて（再起動の途中も含む。#626）画面をつないでいなければ、次の tick に [reconnectScreen] を回す（#531。仮の結線）。
      * 置いたブロックのデータ（アイテムやコマンドの NBT の address）は `setBlock` の後で読み込むので、ここではまだつながない（#535）
      */
     internal fun neighborChanged() {
@@ -374,7 +374,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (wiring.canReconnectScreen(computer.machine)) level.scheduleTick(blockPos, blockState.block, 1)
     }
 
-    /** [neighborChanged] で回した次の tick。動いていて画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531・#535） */
+    /** [neighborChanged] で回した次の tick。止まっていなくて（再起動の途中も含む）画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531・#535） */
     internal fun reconnectScreen() {
         val level = level as? ServerLevel ?: return
         wiring.reconnectScreen(level, blockPos, computer.machine)
