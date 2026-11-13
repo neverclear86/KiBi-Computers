@@ -153,6 +153,76 @@ class HostFailureLogTest {
     }
 
     @Test
+    fun `標準ライブラリの中で投げる例外でも、呼び出し元が違えばそれぞれスタックトレース付きのWARNINGになる`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                val a = h.machine(host = QuietHost())
+                val b = h.machine(host = QuietHost())
+                val c = h.machine(host = QuietHost())
+                val empty = ArrayList<Int>()
+                // どちらも ArrayList.get → Objects.checkIndex の中で投げる（上3段は JDK の中で同じ）
+                a.postHostCallback { empty[0] }
+                h.scheduler.tick()
+                b.postHostCallback { empty[1] }
+                h.scheduler.tick()
+                // String.charAt も Objects.checkIndex を通る（クラスは StringIndexOutOfBoundsException）
+                c.postHostCallback { "".get(0) }
+                h.scheduler.tick()
+                val warnings = listOf(a, b, c).map { logs.of(it, Level.WARNING).single() }
+                assertTrue(warnings.all { it.thrown != null }, "呼び出し元が違えば、スタックトレースを付ける")
+
+                // 同じ呼び出し元からは、別の台でもスタックトレースを省く
+                val bug = Runnable { empty[2] }
+                val d = h.machine(host = QuietHost())
+                val e = h.machine(host = QuietHost())
+                d.postHostCallback(bug)
+                h.scheduler.tick()
+                e.postHostCallback(bug)
+                h.scheduler.tick()
+                assertNotNull(logs.of(d, Level.WARNING).single().thrown)
+                val known = logs.of(e, Level.WARNING).single()
+                assertNull(known.thrown)
+                assertTrue(known.message.contains("記録済み"), known.message)
+            }
+        }
+    }
+
+    @Test
+    fun `場所の記録が上限に達すると、新しい場所はスタックトレースなしで、上限に達したと書いたWARNINGになる`() = timeout(limit) {
+        Captured().use { logs ->
+            Harness().use { h ->
+                // 記録を上限まで埋める（どの通知の種類とも重ならない種類で）
+                var filled = 0
+                while (true) {
+                    val t = IllegalStateException("埋める")
+                    t.stackTrace = arrayOf(StackTraceElement("test.Fill", "site$filled", "Fill.kt", filled))
+                    val trace = h.scheduler.claimHostFailureTrace(1000, t)
+                    if (trace == MachineScheduler.HostFailureTrace.LIMIT_REACHED) break
+                    assertEquals(MachineScheduler.HostFailureTrace.NEW, trace)
+                    filled++
+                    assertTrue(filled <= 1000, "上限がない")
+                }
+                // 記録済みの場所は、上限に達した後も KNOWN
+                val again = IllegalStateException("埋める")
+                again.stackTrace = arrayOf(StackTraceElement("test.Fill", "site0", "Fill.kt", 0))
+                assertEquals(MachineScheduler.HostFailureTrace.KNOWN, h.scheduler.claimHostFailureTrace(1000, again))
+
+                val m = h.machine(host = QuietHost())
+                m.postHostCallback { throw IllegalStateException("上限の後のバグ") }
+                h.scheduler.tick()
+                m.postHostCallback { throw IllegalArgumentException("上限の後の別のバグ") }
+                h.scheduler.tick()
+                val warning = logs.of(m, Level.WARNING).single()
+                assertNull(warning.thrown, "上限に達した後の新しい場所は覚えられないので、スタックトレースを付けない")
+                assertTrue(warning.message.contains("上限に達した"), warning.message)
+                assertFalse(warning.message.contains("記録済み"), warning.message)
+                // 同じ台・同じ種類の2つ目は DEBUG
+                assertTrue(logs.of(m, Level.FINE).single().message.contains("上限の後の別のバグ"))
+            }
+        }
+    }
+
+    @Test
     fun `同じ台で例外のメッセージだけ変わっても、投げた場所が同じなら2回目はスタックトレースなしのDEBUGになる`() = timeout(limit) {
         Captured().use { logs ->
             Harness().use { h ->

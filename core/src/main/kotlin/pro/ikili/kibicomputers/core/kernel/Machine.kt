@@ -3505,7 +3505,8 @@ public class Machine private constructor(
     /**
      * [safely] が捨てる例外をログに出す（#674）。1台・1種類につき最初の1回は WARNING、同じ例外の繰り返しは DEBUG（スタックトレースなし）。
      * 例外の中身が変わったとき（クラスかメッセージが違う）は、スケジューラ全体で見て、投げた場所（例外のクラスと
-     * スタックの上のほう）がまだ記録にない場合に限り、WARNING にスタックトレースを付ける（[MachineScheduler.claimHostFailureTrace]）。
+     * スタックの上のほう。標準ライブラリのフレームは除く）がまだ記録にない場合に限り、WARNING にスタックトレースを付ける（[MachineScheduler.claimHostFailureTrace]）。
+     * 記録が上限に達して新しい場所を覚えられないときは、スタックトレースを付けず、そう書いた WARNING にする。
      * 全台が同じ不具合で投げても、1,000 本のスタックトレースでログを埋めない（ADR 0088 の「ログと数え口」と同じ考え方）
      */
     private fun reportHostFailure(kind: HostFailureKind, t: Throwable) {
@@ -3522,12 +3523,17 @@ public class Machine private constructor(
             }
             hostFailuresLogged = hostFailuresLogged or bit
             signatures[kind.ordinal] = signature
-            val newSite = scheduler.claimHostFailureTrace(kind.ordinal, t)
-            if (newSite) {
+            val trace = scheduler.claimHostFailureTrace(kind.ordinal, t)
+            if (trace == MachineScheduler.HostFailureTrace.NEW) {
                 val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。同じ例外の繰り返しは DEBUG）: $t"
                 LOG.log(System.Logger.Level.WARNING, message, t)
             } else if (first) {
-                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。同じ例外の繰り返しは DEBUG。投げた場所は記録済みなので、スタックトレースは省く）: $t"
+                val omitted = if (trace == MachineScheduler.HostFailureTrace.KNOWN) {
+                    "投げた場所は記録済みなので、スタックトレースは省く"
+                } else {
+                    "スタックトレースを出した場所の数が上限に達したので、スタックトレースは省く"
+                }
+                val message = "マシン $id の接続層の${kind.label}が例外を投げた（捨てて続ける。同じ例外の繰り返しは DEBUG。$omitted）: $t"
                 LOG.log(System.Logger.Level.WARNING, message)
             } else if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
                 LOG.log(System.Logger.Level.DEBUG, "マシン $id の接続層の${kind.label}が別の例外を投げた（捨てて続ける）: $t")
