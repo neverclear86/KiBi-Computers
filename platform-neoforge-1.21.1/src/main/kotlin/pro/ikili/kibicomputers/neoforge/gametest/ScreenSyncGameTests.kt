@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.resources.ResourceKey
+import net.minecraft.server.level.ChunkTrackingView
 import net.minecraft.server.level.ClientInformation
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.entity.Entity
@@ -463,6 +464,46 @@ object ScreenSyncGameTests {
         val above = BlockPos(abs.x, top + 2, abs.z)
         helper.assertTrue(outcome(above) == ScreenSync.ResyncOutcome.NOT_LOADED, "an unloaded position should be dropped")
         cleanUp(helper, player)
+        helper.succeed()
+    }
+
+    /**
+     * 追跡の範囲に入っていて送る順番待ちでもなくても、チャンクがまだ送れる状態（ブロックが tick する段）でなければ、
+     * クライアントはチャンクを持っていないので、見られないものとする（#636）。
+     * そうしないと、その間に送ったキーフレームをクライアントが捨て、サーバーは差分しか送らなくなる。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun screenInChunkNotYetSentIsNotWatched(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get())
+        val (player, _) = watcherAt(helper, ScreenTier.COLOR, 2.0)
+        val level = helper.level
+        val here = ChunkPos(helper.absolutePos(POS))
+        // 届いたチャンクの画面は、見られる
+        helper.assertTrue(ScreenSync.isChunkProbablySent(level, player, here), "the test chunk should have been sent")
+        val near = ScreenSync.Host(helper.getBlockEntity<ScreenBlockEntity>(POS)).distanceSquared(player)
+        helper.assertTrue(near.isFinite(), "a screen in a sent chunk should be visible but was $near")
+        // テストの場所から離れたチャンクを、同期の読み込み（一時的なチケット）で FULL まで読み込む。ブロックが tick する段には
+        // ならないので、まだ送れない（画面のブロックエンティティはこの段で読み込まれる）
+        val far = ChunkPos(here.x + 40, here.z + 40)
+        level.getChunk(far.x, far.z)
+        helper.assertTrue(level.chunkSource.chunkMap.getChunkToSend(far.toLong()) == null, "the far chunk should not be sendable yet")
+        val farPos = far.getMiddleBlockPosition(helper.absolutePos(POS).y)
+        level.setBlock(farPos, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState(), 3)
+        try {
+            val farScreen = level.getBlockEntity(farPos) as? ScreenBlockEntity
+            helper.assertTrue(farScreen != null, "the far screen should have a block entity")
+            // 追跡の範囲に入れる（送る順番待ちには入らない。本物のサーバーでも、送れる状態になるまでは入れない）
+            player.setChunkTrackingView(ChunkTrackingView.of(here, 64))
+            helper.assertTrue(player.chunkTrackingView.contains(far), "the far chunk should be in the tracking view")
+            helper.assertTrue(!player.connection.chunkSender.isPending(far.toLong()), "the far chunk should not be pending")
+            helper.assertTrue(!ScreenSync.isChunkProbablySent(level, player, far), "the far chunk should not count as sent")
+            val d = ScreenSync.Host(farScreen!!).distanceSquared(player)
+            helper.assertTrue(d == Double.POSITIVE_INFINITY, "a screen in a chunk not yet sent should not be visible but was $d")
+        } finally {
+            level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
+            cleanUp(helper, player)
+        }
         helper.succeed()
     }
 
