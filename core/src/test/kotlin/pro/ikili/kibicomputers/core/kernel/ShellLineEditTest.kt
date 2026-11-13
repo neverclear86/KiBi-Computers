@@ -407,6 +407,51 @@ class ShellLineEditTest {
     }
 
     @Test
+    fun `不正なUTF-8の上のカーソル移動とBackspaceとDeleteは見えている文字ごとに動く`() {
+        // overlong（E0 80 80）は U+FFFD が 3 つ。左・右は 1 つずつ、Backspace・Delete も 1 つずつ消す
+        val bad = raw(0xE0, 0x80, 0x80)
+        val del = "\u001b[3~"
+        // 左へ 1 つ → X は 2 つめの後ろ
+        val moved = session(
+            listOf("echo $bad${left}X"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��X�" } },
+        )
+        val movedRows = moved.host.rows()
+        val my = movedRows.indexOf("$ echo ��X�")
+        assertTrue(my >= 0, movedRows.joinToString("\n"))
+        assertEquals(10 to my, moved.host.cursor(), movedRows.joinToString("\n"))
+        // 左へ 3 つ・右へ 1 つ → X は 1 つめの後ろ
+        val back = session(
+            listOf("echo $bad$left$left$left${right}X"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo �X��" } },
+        )
+        val backRows = back.host.rows()
+        assertTrue(backRows.contains("$ echo �X��"), backRows.joinToString("\n"))
+        // Backspace は 1 つだけ消す
+        val bs = session(
+            listOf("echo $bad\u007f"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��" } },
+        )
+        val bsRows = bs.host.rows()
+        assertTrue(bsRows.contains("$ echo ��"), bsRows.joinToString("\n"))
+        // Delete も 1 つだけ消す（先頭の 1 つめの前へ戻ってから）
+        val dl = session(
+            listOf("echo $bad$left$left$left$del"),
+            exit = false,
+            charset = Charsets.ISO_8859_1,
+            settled = { h -> h.rows().any { it == "$ echo ��" } },
+        )
+        val dlRows = dl.host.rows()
+        assertTrue(dlRows.contains("$ echo ��"), dlRows.joinToString("\n"))
+    }
+
+    @Test
     fun `プロンプトの不正なUTF-8はバイトごとにU+FFFDにして数える`() {
         // サロゲート（ED A0 80）を端末は 1 つの U+FFFD に読む。sh は 3 つの U+FFFD にして送り、3 セルと数える
         val s = session(

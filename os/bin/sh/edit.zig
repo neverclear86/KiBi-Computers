@@ -310,20 +310,28 @@ fn freshLine() void {
 
 // ---- 編集 ----
 
-fn prevChar(from: usize) usize {
-    var i = from;
-    if (i == 0) return 0;
-    i -= 1;
-    while (i > 0 and utf8.isContinuation(line[i])) i -= 1;
-    return i;
+/// [s] の頭の 1 文字のバイト数（描画と同じ区切り。制御文字は 1 バイト、不正な UTF-8 は 1 バイトごと）
+fn charLen(s: []const u8) usize {
+    const c = s[0];
+    if (c < 0x20 or c == 0x7f) return 1;
+    return glyph(s).n;
 }
 
+/// [from] の 1 文字前。描画（[emitLine]）が行の頭から [from] までを読むのと同じ区切りで数える
+fn prevChar(from: usize) usize {
+    var i: usize = 0;
+    var last: usize = 0;
+    while (i < from) {
+        last = i;
+        i += charLen(line[i..from]);
+    }
+    return last;
+}
+
+/// [from] の 1 文字後（描画と同じ区切り）
 fn nextChar(from: usize) usize {
-    var i = from;
-    if (i >= len) return len;
-    i += 1;
-    while (i < len and utf8.isContinuation(line[i])) i += 1;
-    return i;
+    if (from >= len) return len;
+    return from + charLen(line[from..len]);
 }
 
 fn isWordChar(c: u8) bool {
