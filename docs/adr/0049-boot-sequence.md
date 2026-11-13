@@ -39,7 +39,7 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 ### 取り消し
 
 - 起動の途中の `stop()`・`reboot()` は、印（`bootCancelled`）を立てるだけ。手順は区切りごとに印を見て、何も知らせずに終える
-- init を作る `spawn` は、表に足すのと同じカーネルロックの中で印を確かめる（`asInit`）。作れたら、その場で init の pid を覚え、起動中の印を下ろす。これで「起動の途中の `stop()` が init を止め損ねる」隙間がない。起動中の印は、同じロックの区間で `RUNNING` にした**後**に下ろす。ロックを取らずに読む側（`Machine.isRunningOrBooting`。印を先に、状態を後に読む）が、区間の途中で「止まっていて起動中でもない」と見ないため（#625）。区間の途中（表に足した後、印を下ろす前）で例外が出たら、印が立ったまま起動の手順に返り、`endBoot` が `INIT_START_FAILED` として知らせる
+- init を作る `spawn` は、表に足すのと同じカーネルロックの中で印を確かめる（`asInit`）。作れたら、その場で init の pid を覚え、起動中の印を下ろす。これで「起動の途中の `stop()` が init を止め損ねる」隙間がない。起動中の印は、同じロックの区間で `RUNNING` にした**後**に下ろす。ロックを取らずに読む側（`Machine.isRunningOrBooting`。印を先に、状態を後に読む）が、区間の途中で「止まっていて起動中でもない」と見ないため（#625）。再起動の途中も含めて読む側（`Machine.isRunningBootingOrRebooting`。画面のつなぎ直しが使う）は、起動中の印 → 状態 → 再起動の求め（`rebootRequested`）→ 積んだ再起動の通知（`rebootNotified`）の順に読む。書く側は次の印を立ててから前の印を下ろす（`reboot()` は求めの印を立ててから止める。求めを通知の列に積むときは、通知の印を立ててから求めの印を下ろす）。CRASHED なら、求めの印が残っていても再起動の途中と見なさない（#535・#626）。区間の途中（表に足した後、印を下ろす前）で例外が出たら、印が立ったまま起動の手順に返り、`endBoot` が `INIT_START_FAILED` として知らせる
 - init の読み込みを待つ間の取り消しは、信号（`bootCancelSignal`。実行時だけの値）で伝える。信号は、起動中の印を下ろすのと同じロックの区間で終える（init を作ったとき・init を作らずに終えたとき）。起動の途中の `stop()` は、印（`bootCancelled`）を立てるのと同じ区間で信号も終える（起動中の印を下ろすのは、後から起動用のスレッドで走る `endBoot`）。終えると取り消しの登録が外れ、起動の手順が持っていたもの（init のバイト列・読み込んだ `Program`）が回収される（#592）
 
 ### ディスクを開く口
@@ -83,7 +83,7 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 ## データ形式
 
 - `KernelState`（保存の対象）に `initPid` を足す（#365。0 = init がいない、それ以外 = init の pid）。バイト形式は #82。マウントの表は今のまま（`source` に `disk:<識別子>`）
-- ほかに足したものはどれも実行時だけ: 最後の `BootConfig`、起動中・取り消し・再起動の求め（`rebootRequested`・`rebootNotified`）の印、前の起動の専用スレッド（`awaitTermination` で待つ）
+- ほかに足したものはどれも実行時だけ: 最後の `BootConfig`、起動中・取り消し・再起動の求め（`rebootRequested`・`rebootNotified`。ロックなしで読むため `@Volatile` にしたが、保存しない。#626）の印、前の起動の専用スレッド（`awaitTermination` で待つ）
 - #81 への申し送り:
   - init の pid は `KernelState.initPid` に保存する（戻したマシンでも、init が終わったら止める・init にシグナルを送れない、が続く）
   - 起動の途中・再起動の途中（`reboot()` を受け付けてから `onRebootRequested` を呼ぶまで）は保存しない。この間は `isAtWaitPoint` が `false`
