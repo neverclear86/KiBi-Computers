@@ -117,6 +117,12 @@ dependencies {
     jarJar(libs.endive.compiler) { isTransitive = false }
     implementation(libs.endive.compiler) { exclude(group = "org.ow2.asm") }
     "additionalRuntimeClasspath"(libs.endive.compiler) { isTransitive = false }
+    // コンポーネントの検証（#262）: Endive の WASI p1 と wasm-tools（WASM にしたもの）。仮想 FS の zerofs は使わないので入れない
+    for (lib in listOf(libs.endive.wasi, libs.endive.wasm.tools)) {
+        jarJar(lib) { exclude(group = "io.roastedroot") }
+        implementation(lib) { exclude(group = "io.roastedroot") }
+        "additionalRuntimeClasspath"(lib) { exclude(group = "io.roastedroot") }
+    }
 }
 
 // dev ソースセットも build でコンパイルする（jar には入れない）
