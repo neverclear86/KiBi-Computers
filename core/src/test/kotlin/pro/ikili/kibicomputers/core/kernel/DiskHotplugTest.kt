@@ -57,8 +57,10 @@ class DiskHotplugTest {
         requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/$name")) { "$name がリソースにない" }.use { it.readBytes() }
 
     /** init（hold）を置いた根 */
-    private fun rootFs(): TestMemoryFileSystem {
-        val fs = TestMemoryFileSystem()
+    private fun rootFs(): TestMemoryFileSystem = populateRoot(TestMemoryFileSystem())
+
+    /** [fs] に init（hold）を置く */
+    private fun <T : FileSystem> populateRoot(fs: T): T {
         fs.createDirectory(VfsPath.parse("/sbin"))
         for ((path, bytes) in listOf(BootConfig.INIT_PATH to resource("kibi-power-wasi.wasm"), "/kpw-mode" to "hold".toByteArray())) {
             val node = fs.createFile(VfsPath.parse(path))
@@ -228,6 +230,108 @@ class DiskHotplugTest {
             assertNull(m.mountAt("/mnt/d1"))
             assertEquals("disk:d2", m.mountAt("/mnt/d1/sub"))
             assertEquals(MachineState.RUNNING, m.state)
+            m.close()
+        }
+    }
+
+    /** 根が本物のディスク（名前の大文字小文字を区別しない）のマシンで、`/mnt` のディスクと `/home` のメモリのマウントを足して起動する */
+    private fun bootDiskRoot(h: Harness): Booted {
+        val root = populateRoot(DiskFileSystem.open(dir.resolve("rootdisk"), DiskQuota(maxBytes = 1L shl 20, maxEntries = 64)))
+        return boot(h, "root", "d1", disks = Disks(root)).also {
+            it.m.vfs.mount(VfsPath.parse("/home"), TestMemoryFileSystem(), readOnly = false, source = "test:home")
+        }
+    }
+
+    @Test
+    fun `根がディスクなら、unmountは大文字小文字の違う位置のマウントを外し、tmpは外せない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = bootDiskRoot(h).m
+            fun errnoOf(block: () -> Unit): Errno = assertThrows<FsException> { block() }.errno
+            assertEquals(Errno.BUSY, errnoOf { m.unmountAt(VfsPath.parse("/TMP")) }, "/TMP は /tmp に解決する")
+            assertEquals("tmp", m.mountAt("/tmp"))
+            assertEquals(Errno.BUSY, errnoOf { m.unmountAt(VfsPath.parse("/DEV")) })
+            m.unmountAt(VfsPath.parse("/HOME"))
+            assertNull(m.mountAt("/home"))
+            m.unmountAt(VfsPath.parse("/MNT/D1"))
+            assertNull(m.mountAt("/mnt/d1"))
+            assertEquals(Errno.INVAL, errnoOf { m.unmountAt(VfsPath.parse("/HOME")) }, "もう外れている")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がディスクなら、HOMEに綴りを変えてマウントしたディスクもhomeのマウントで、抜くと止めるべきと答える`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = bootDiskRoot(h).m
+            m.unmountAt(VfsPath.parse("/home"))
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            m.mountDisk("disk:d1", VfsPath.parse("/HOME"), false)
+            assertEquals("disk:d1", m.mountAt("/home"))
+            assertTrue(m.disksChanged(snapshot("root")), "/HOME のディスクが抜けたら止める")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がメモリなら、HOMEにマウントしたディスクはhomeのマウントではなく、抜くと外す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = boot(h, "root", "d1").m
+            m.unmountAt(VfsPath.parse("/mnt/d1"))
+            m.mountDisk("disk:d1", VfsPath.parse("/HOME"), false)
+            assertFalse(m.disksChanged(snapshot("root")), "/home 以外のディスクは止めずに外す")
+            assertNull(m.mountAt("/HOME"))
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がメモリなら、unmountは大文字小文字の違う位置を別の位置として扱う`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = boot(h, "root", "d1")
+            val m = b.m
+            m.vfs.mount(VfsPath.parse("/home"), TestMemoryFileSystem(), readOnly = false, source = "test:home")
+            assertEquals(Errno.INVAL, assertThrows<FsException> { m.unmountAt(VfsPath.parse("/HOME")) }.errno)
+            assertEquals("test:home", m.mountAt("/home"))
+            assertEquals(Errno.INVAL, assertThrows<FsException> { m.unmountAt(VfsPath.parse("/TMP")) }.errno)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がディスクなら、tmpの下に大文字小文字違いで置いたマウントも、最後のプロセスの終了でtmpと一緒に外れる`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val b = bootDiskRoot(h)
+            val m = b.m
+            m.vfs.mount(VfsPath.parse("/TMP/x"), TestMemoryFileSystem(), readOnly = false, source = "test:under-tmp")
+            m.vfs.mount(VfsPath.parse("/TMP/x/y"), TestMemoryFileSystem(), readOnly = false, source = "test:under-tmp-y")
+            fun sources(): List<String> = m.lock.withLockValue { m.kernel.mounts.entries.map { it.source } }
+            assertTrue("test:under-tmp" in sources() && "test:under-tmp-y" in sources(), sources().toString())
+            m.stop()
+            eventually(60_000, "止まらない") {
+                h.scheduler.tick()
+                m.state == MachineState.STOPPED
+            }
+            val left = sources()
+            assertFalse("tmp" in left, "tmp が残る: $left")
+            assertFalse("test:under-tmp" in left || "test:under-tmp-y" in left, "tmp の下のマウントが残る: $left")
+            assertTrue("test:home" in left && "disk:d1" in left, "tmp の外のマウントは残す: $left")
+            m.close()
+        }
+    }
+
+    @Test
+    fun `根がメモリなら、tmpの下に大文字小文字違いで置いたマウントは、tmpが外れても残る`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = boot(h, "root", "d1").m
+            m.vfs.mount(VfsPath.parse("/TMP/x"), TestMemoryFileSystem(), readOnly = false, source = "test:not-under-tmp")
+            m.stop()
+            eventually(60_000, "止まらない") {
+                h.scheduler.tick()
+                m.state == MachineState.STOPPED
+            }
+            val left = m.lock.withLockValue { m.kernel.mounts.entries.map { it.source } }
+            assertFalse("tmp" in left, "tmp が残る: $left")
+            assertTrue("test:not-under-tmp" in left, "別の位置のマウントは残す: $left")
             m.close()
         }
     }
@@ -409,8 +513,11 @@ class DiskHotplugTest {
             b.disks.gates["d2"] = gate
             assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
             assertTrue(gate.entered.await(10, TimeUnit.SECONDS))
-            assertFalse(m.disksChanged(snapshot("root", "d0", "d2", "d1")))
-            assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
+            // 挿してから抜くまでを1つのロックの区間にする（d1 の挿し込みで積まれた自動マウントの仕事が、間に割り込んで d1 を予約しないように）
+            m.lock.withLockValue {
+                assertFalse(m.disksChanged(snapshot("root", "d0", "d2", "d1")))
+                assertFalse(m.disksChanged(snapshot("root", "d0", "d2")))
+            }
             gate.release.countDown()
             eventually(10_000, "マウントしない") { m.mountAt("/mnt/d2") == "disk:d2" }
             Thread.sleep(100)

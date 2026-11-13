@@ -19,6 +19,14 @@ internal class AttachedDevice(
     val device: Device,
     val methods: DeviceMethods,
 ) : DeviceContext {
+    /** 一覧に載せる情報（[DeviceBus.list]・`info`） */
+    val info: DeviceInfo = DeviceInfo(address, kind)
+
+    /** メソッドの一覧（WIT の `methods`。登録した順）。メソッドの表は変わらないので、つないだときに1回だけ作る（#66） */
+    val methodInfos: List<MethodInfo> = methods.names.map { name ->
+        MethodInfo(name, checkNotNull(methods.find(name)).mainThread)
+    }
+
     /** つないだマシン */
     val machine: Machine get() = bus.machine
 

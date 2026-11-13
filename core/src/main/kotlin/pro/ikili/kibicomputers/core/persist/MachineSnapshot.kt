@@ -254,6 +254,14 @@ public class MachineSnapshot @JvmOverloads constructor(
             return readDeltaBasePayload(header.id, sectionVersion, length, input)
         }
 
+        /**
+         * 外枠の MOD のバージョンだけを読む（#88。戻すときに、版の違うファイルの中身を解釈する前に比べる。ファイル全体を読まない）。
+         * magic・形式の版が違うなら [IOException]、外枠の途中で切れているなら [SnapshotFormatException]
+         */
+        @JvmStatic
+        @Throws(IOException::class)
+        public fun readModVersion(input: DataInput): String = readHeader(input).modVersion
+
         private class Header(val modVersion: String, val id: UUID, val generation: Long)
 
         private fun readHeader(input: DataInput): Header = truncatedAsFormat {

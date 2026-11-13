@@ -152,6 +152,12 @@ public class MachineConfig private constructor(builder: Builder) {
      */
     public val maxProcessMemoryBytes: Long = builder.maxProcessMemoryBytes ?: builder.memoryBytes
 
+    /**
+     * つなげるデバイスの数の上限（#66、ADR 0066）。`DeviceBus` につないだもの全部を1つずつ数える（ケースのスピーカーも含む）。
+     * 上限に達したら `DeviceBus.attach` は断る（`false`）。保存しない（CPU から毎回決める）。仮: 16（確定は #122・#251）
+     */
+    public val maxDevices: Int = builder.maxDevices
+
     /** RAM のページ数 */
     internal val memoryPages: Int get() = pagesOf(memoryBytes)
 
@@ -165,6 +171,7 @@ public class MachineConfig private constructor(builder: Builder) {
         internal var maxHostCallsPerTick: Int = 64
         internal var memoryBytes: Long = 32L * 1024 * 1024
         internal var maxProcessMemoryBytes: Long? = null
+        internal var maxDevices: Int = 16
 
         /** 1 tick に配る燃料（1 以上） */
         public fun fuelPerTick(value: Long): Builder = apply {
@@ -194,6 +201,12 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun maxProcessMemoryBytes(value: Long): Builder = apply {
             require(value >= WasmMemory.PAGE_SIZE) { "maxProcessMemoryBytes は ${WasmMemory.PAGE_SIZE} 以上" }
             maxProcessMemoryBytes = value
+        }
+
+        /** つなげるデバイスの数の上限（1 以上） */
+        public fun maxDevices(value: Int): Builder = apply {
+            require(value >= 1) { "maxDevices は 1 以上" }
+            maxDevices = value
         }
 
         /** 設定を作る。 */
@@ -416,14 +429,37 @@ public class Machine private constructor(
     @Volatile
     private var lastBootConfigValue: BootConfig? = null
 
-    /** 再起動を求められ、プロセスがすべて止まるのを待っている。実行時だけの値。立っている間は [isAtWaitPoint] が `false`（#365） */
+    /**
+     * 再起動を求められ、プロセスがすべて止まるのを待っている。実行時だけの値。立っている間は [isAtWaitPoint] が `false`（#365）。
+     * カーネルロックの中で書き、[isRunningBootingOrRebooting] がロックなしでも読む（#626）
+     */
+    @Volatile
     private var rebootRequested = false
 
     /**
      * 再起動の求めを通知の列に積み、まだ配っていない（`stop()` で取り消す）。実行時だけの値。
-     * この間はプロセスが0個の [MachineState.STOPPED] だが、ここで保存すると再起動が消えるので、[isAtWaitPoint] は `false`（#365）
+     * この間はプロセスが0個の [MachineState.STOPPED] だが、ここで保存すると再起動が消えるので、[isAtWaitPoint] は `false`（#365）。
+     * カーネルロックの中で書き、[isRunningBootingOrRebooting] がロックなしでも読む（#626）
      */
+    @Volatile
     private var rebootNotified = false
+
+    // ---- 起動ループの抑止（#635、ADR 0635）。どれも実行時だけで、保存しない。カーネルロックの中で読み書きする ----
+
+    /** 再起動の借り（[RebootBackoff]）。[stop] でだけ 0 に戻す */
+    private var rebootDebtTicks = 0L
+
+    /** 今の init が動き始めた tick（init を作った・復元で戻した tick）。動いていなければ `-1` */
+    private var initStartTick = -1L
+
+    /** 受け付けた [reboot] の、その起動で init が動いた tick 数。求めがなければ `-1` */
+    private var pendingRebootRanTicks = -1L
+
+    /**
+     * 再起動の通知を、この tick まで遅らせている（[rebootNotified] は立てたまま）。遅らせていなければ `0`。
+     * 期限に [MachineScheduler] が [wakeDeferredReboot] を呼ぶ。[stop]・[boot]・[coldBootAfterRestore] で下ろす
+     */
+    private var rebootDueTick = 0L
 
     // ---- 復元（#85、ADR 0085）。どれも実行時だけで、保存しない ----
 
@@ -509,12 +545,40 @@ public class Machine private constructor(
      * 起動中の印を先に、状態を後に読む。init を作るときは、同じカーネルロックの区間で `RUNNING` にしてから印を下ろすので
      * （[spawnInternal]）、印が下りて見えたなら `RUNNING` も見える（どちらも `@Volatile`）。この2つの順番を入れ替えると、
      * 区間の途中で「止まっていて起動中でもない」に見えることがある。
-     * 再起動の途中（[reboot] を受け付けてから、起動し直すまで）は含まない
+     * 再起動の途中（[reboot] を受け付けてから、起動し直すまで）は含まない（含めるなら [isRunningBootingOrRebooting]）
      */
     public val isRunningOrBooting: Boolean
         get() {
             val booting = bootingValue
             return booting || stateValue == MachineState.RUNNING
+        }
+
+    /**
+     * 止まっていない（[isRunningOrBooting]）か、再起動の途中（[reboot] を受け付けてから、[MachineHost.onRebootRequested] で
+     * 起動し直すまで）なら `true`。カーネルが止めた（[MachineState.CRASHED]）なら、再起動を求められていても `false`（#535）。
+     * [stop] で取り消した再起動は含まない（[stop] は再起動の求めの印を下ろす。ゲストが電源の求めで [stop] を呼んだときも同じ）。
+     * [reboot] の後に init が自分で終わっただけなら、求めの印は残るので `true` のまま再起動が続く（ゲストが止めても `false` とは限らない）。
+     * ロックを取らずに読むので、メインスレッドから何度呼んでもよい（#626）。
+     *
+     * 印と状態は、受け渡しの古い側を先に読む: 起動中の印 → 状態 → 再起動の求め（[rebootRequested]）→ 積んだ再起動の通知
+     * （[rebootNotified]）。書く側はどれも、次の印を立ててから前の印を下ろす（init を作るときは `RUNNING` にしてから起動中の印を
+     * 下ろす、[reboot] は求めの印を立ててから止める、[maybePostRebootLocked] は通知の印を立ててから求めの印を下ろす、起動の途中の
+     * [reboot] は求めの印が立った後で `endBoot` が起動中の印を下ろす）ので、この順で読めば受け渡しの途中で「止まっていて
+     * 再起動の途中でもない」に見えない。どれも `@Volatile`。
+     *
+     * 通知を配るときだけは、通知の印を下ろしてから [MachineHost.onRebootRequested] の中で [boot] が起動中の印を立てる。
+     * これは通知を配るスレッド（メインスレッド）の中の続きなので、メインスレッドから読むときは見えない。ほかのスレッドから読むときと、
+     * [MachineHost.onRebootRequested] の中で [boot] より前に読むときは `false` になりうる
+     */
+    public val isRunningBootingOrRebooting: Boolean
+        get() {
+            val booting = bootingValue
+            val s = stateValue
+            if (booting || s == MachineState.RUNNING) return true
+            // reboot() の後、止まり切る前にカーネルが止めても、求めの印は下りない（stopLocked は印を触らない）
+            if (s == MachineState.CRASHED) return false
+            val requested = rebootRequested
+            return requested || rebootNotified
         }
 
     /**
@@ -566,6 +630,21 @@ public class Machine private constructor(
      * TRANSIENT があれば TRANSIENT、UNSAVEABLE があれば UNSAVEABLE、どちらもなければ READY（プロセスがなくても READY）
      */
     public fun saveReadiness(): SaveReadiness = lock.withLockValue { saveReadinessLocked() }
+
+    /**
+     * 保存の判定が [SaveReadiness.TRANSIENT] で、待てば READY に近づくなら `true`（#635）。
+     * 再起動の通知を積んだ後（[MachineHost.onRebootRequested] を呼ぶまで。起動し直すまでの待ちの間を含む）は、
+     * [MachineScheduler.tick]（メインスレッド）が通知を配るか [stop] でしか解けない。メインスレッドで [saveReadiness] の変わるのを待つ呼び手
+     * （チャンクのアンロード、サーバーの停止）は、待っても tick が進まず予算を使い切るだけなので、これが偽の台は待たずに取り出す
+     * （取り出す内容は、待っても変わらない。[ColdBootReason.REBOOT_PENDING] の冷えた起動）
+     */
+    public val isSettlingForSave: Boolean get() = lock.withLockValue { saveReadinessLocked() == SaveReadiness.TRANSIENT && !rebootNotified }
+
+    /**
+     * 再起動の通知を、起動し直すまでの待ち（[RebootBackoff]。#635）で遅らせている間なら `true`。この間は [isRebootPending]・
+     * [saveReadiness] の `TRANSIENT` のままで、[MachineScheduler.tick] が期限に通知を積む（[stop]・[boot] で取り消す）
+     */
+    public val isRebootDeferred: Boolean get() = lock.withLockValue { rebootNotified && rebootDueTick != 0L }
 
     private fun saveReadinessLocked(): SaveReadiness {
         if (bootingValue || rebootRequested || rebootNotified || restoreTransient) return SaveReadiness.TRANSIENT
@@ -804,6 +883,9 @@ public class Machine private constructor(
             bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            initStartTick = -1L
             lastBootConfigValue = config
             // 段の印と同じ区間で、この起動が頼るディスクを今の表にする（#56）
             beginPhaseDisksLocked()
@@ -873,6 +955,9 @@ public class Machine private constructor(
             bootCancelSignal = CompletableFuture()
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            initStartTick = -1L
             beginPhaseDisksLocked()
         } finally {
             lock.unlock()
@@ -921,6 +1006,8 @@ public class Machine private constructor(
             releaseLocked(claim)
         }
         setStateLocked(MachineState.RUNNING, null)
+        // 戻した init は、ここから動いたと数える（起動ループの抑止。#635）
+        initStartTick = scheduler.now
         // 「保存から戻った」を知らせる（#87、ADR 0087）。索引と待ちを戻した後なので、戻したキューに届き、待っているプロセスが起きる。
         // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
         // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
@@ -1072,12 +1159,20 @@ public class Machine private constructor(
      * 起動の途中なら、それを取り消してから同じようにする。どのスレッドから呼んでもよい。待たずに返す。
      * 求めた後に [stop] すると、再起動を取り消す。
      *
+     * 短い間に繰り返すと、止まった後、[MachineHost.onRebootRequested] を呼ぶまで待つ（起動ループの抑止。#635、ADR 0635。
+     * [RebootBackoff]）。待つ間も再起動の途中（[isRebootPending]）で、受け付けたことは変わらない
+     *
      * @return 受け付けたら `true`。一度も [boot] していない、[MachineState.CRASHED]、スケジューラが閉じているなら `false`
      */
     public fun reboot(): Boolean {
         lock.lock()
         try {
             if (lastBootConfigValue == null || scheduler.isClosed || stateValue == MachineState.CRASHED) return false
+            // この起動で init が動いた時間を、求めを受け付けたときに数える（重ねて呼んだ分は数え直さない。#635）
+            if (!rebootRequested && !rebootNotified) {
+                val start = initStartTick
+                pendingRebootRanTicks = if (start >= 0 && stateValue == MachineState.RUNNING && !bootingValue) scheduler.now - start else 0L
+            }
             rebootRequested = true
             stopLocked(null)
             maybePostRebootLocked()
@@ -1097,6 +1192,10 @@ public class Machine private constructor(
         try {
             rebootRequested = false
             rebootNotified = false
+            rebootDueTick = 0L
+            pendingRebootRanTicks = -1L
+            // 止めたら借りを返す（電源を切った・ゲストの shutdown。#635）
+            rebootDebtTicks = 0L
             stopLocked(null)
         } finally {
             lock.unlock()
@@ -1152,7 +1251,9 @@ public class Machine private constructor(
      * カーネルロックを持たずに呼ぶ（持っていれば [IllegalStateException]。#52）。
      *
      * 引数・環境変数・作業ディレクトリ・fd は [options] で決める（[SpawnOptions]）。どれも表を変える前に確かめ、
-     * 失敗したら何も変えない。
+     * 失敗したら何も変えない。表に足した後で失敗したとき（内部エラー。メモリ不足など）も、足した分（表・オブジェクト・fd・
+     * 実行時の部分・ブロッキング型の枠・init の pid）を同じロックの中で巻き戻し、例外をそのまま投げる（#629）。
+     * 割り当てた pid と、ついでに刈り取った親のないゾンビは戻さない。
      *
      * @param parentPid 0 は親なし（init）。0 以外は、表にある、終わっていないプロセスの pid でなければ [IllegalArgumentException]
      * @param asInit 起動の手順（#49）が init を作る。起動が取り消されていれば [BootCancelledException]。作れたら init として覚え、起動の手順を終える
@@ -1216,46 +1317,132 @@ public class Machine private constructor(
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
             }
-            reapOrphanZombiesLocked()
-            val pid = kernel.processes.allocatePid()
-            val process = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
-            kernel.processes.add(process)
-            process.objectId = kernel.objects.add(ProcessObject(pid))
-            if (asInit) kernel.initPid = pid
-            installFdsLocked(FdTable(process, kernel.objects, wakeSink), fdEntries)
-            // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
-            val handleFd = if (withHandle) {
-                kernel.objects.retain(process.objectId)
-                FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(process.objectId, HandleRights.READ)
-            } else {
-                -1
+            // ここから引き返せない点（スレッドを動かす・待ち行列に積む）までに例外が出たら、足した分を巻き戻して投げ直す（#629）。
+            // どこまで進んだかを覚えておき、進んだ分だけ戻す（rollbackSpawnLocked）。成功の道筋では何も作らない
+            val reserved = kind == ProcessKind.BLOCKING
+            val prevInitPid = kernel.initPid
+            var process: Process? = null
+            var handleRetained = false
+            var handleFd = -1
+            var rt: ProcessRuntime? = null
+            var thread: KernelThread? = null
+            var enqueued = false
+            try {
+                reapOrphanZombiesLocked()
+                val pid = kernel.processes.allocatePid()
+                val p = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
+                kernel.processes.add(p)
+                process = p
+                spawnStage(SpawnStage.TABLE)
+                p.objectId = kernel.objects.add(ProcessObject(pid))
+                if (asInit) kernel.initPid = pid
+                spawnStage(SpawnStage.OBJECT)
+                installFdsLocked(FdTable(p, kernel.objects, wakeSink), fdEntries)
+                // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
+                if (withHandle) {
+                    kernel.objects.retain(p.objectId)
+                    handleRetained = true
+                    spawnStage(SpawnStage.HANDLE_RETAINED)
+                    handleFd = FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(p.objectId, HandleRights.READ)
+                    spawnStage(SpawnStage.HANDLE)
+                }
+                val r = ProcessRuntime(this, p, program, driver)
+                runner.initRuntime(r)
+                spawnStage(SpawnStage.RUNTIME_INIT)
+                runtimes[pid] = r
+                rt = r
+                spawnStage(SpawnStage.RUNTIME)
+                if (kind == ProcessKind.BLOCKING) {
+                    val t = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(r) }
+                    r.dedicatedThread = t
+                    scheduler.dedicatedThreads.add(t)
+                    thread = t
+                }
+                // フックは、すべて確保した後・引き返せない点の前に呼ぶ（投げると、いちばん多く巻き戻す）
+                if (asInit) scheduler.hooks.duringInitSpawn?.invoke(this)
+                scheduler.hooks.duringSpawn?.invoke(this, pid)
+                // 引き返せない点。新しいスレッド・ワーカーは、登録でカーネルロックを取る（ProcessRunner.register）ので、
+                // このロックを返すまで動き出さない。だから、RUNNING にする前に動かしても、子が先に動くことはない
+                if (thread != null) {
+                    thread.start()
+                } else {
+                    enqueued = true
+                    cpu.enqueueThreadless(r)
+                }
+            } catch (t: Throwable) {
+                rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, parent, rt, thread, enqueued)
+                throw t
             }
-            val rt = ProcessRuntime(this, process, program, driver)
-            runner.initRuntime(rt)
-            runtimes[pid] = rt
-            if (asInit) scheduler.hooks.duringInitSpawn?.invoke(this)
+            // ここからは投げない処理だけ（巻き戻せないので）
             if (stateValue == MachineState.STOPPED) setStateLocked(MachineState.RUNNING, null)
             if (asInit) {
+                initStartTick = scheduler.now
                 // 起動中の印は、RUNNING にした後に下ろす（この順番は不変条件。ロックを取らずに読む [isRunningOrBooting] が、
                 // 区間の途中で「止まっていて起動中でもない」に見えないように。#625、ADR 0049）。
-                // ここより前で例外が出たら、印が立ったまま起動の手順に返り、endBoot が INIT_START_FAILED として知らせる
+                // ここより前（引き返せない点の前）で例外が出たら、足した分を巻き戻してから（#629）、印が立ったまま起動の手順に返り、
+                // endBoot が INIT_START_FAILED として知らせる
                 bootingValue = false
                 // 起動の手順が終わった。取り消しの登録（whenInitLoaded）を外す。登録は読み込みが終わった後なので何もしない（#592）
                 bootCancelSignal.complete(Unit)
                 // 起動の途中に挿して、起動の手順が扱わなかったディスクをマウントする（#56）
                 scheduleAutoMount()
             }
-            if (kind == ProcessKind.BLOCKING) {
-                val thread = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(rt) }
-                rt.dedicatedThread = thread
-                scheduler.dedicatedThreads.add(thread)
-                thread.start()
-            } else {
-                cpu.enqueueThreadless(rt)
-            }
-            return ProcessHandle(pid, handleFd)
+            return ProcessHandle(checkNotNull(process).pid, handleFd)
         } finally {
             lock.unlock()
+        }
+    }
+
+    /**
+     * [spawnInternal] が表に足した後で失敗したときの巻き戻し（#629）。カーネルロックの中で、進んだところまでだけを戻す。
+     *
+     * ふつうの終わり方（`finishLocked`・`reapLocked`）は使わない。親への終わりの知らせ・ゾンビ・コンソールの文が出てしまうため。
+     * 状態（`stateValue`）と起動中の印（`bootingValue`・`bootCancelSignal`）には触らない（起動の init なら、印は endBoot が下ろす）。
+     * pid・オブジェクトの ID は戻さない（すぐには使い回さない）。刈り取った親のないゾンビ・コンソールの Tty も戻さない。
+     * 各段は独立させ、途中の段が投げても残りを続ける。出た例外は [cause] に `addSuppressed` で付ける（[cause] は包まずに投げ直す）
+     */
+    private fun rollbackSpawnLocked(
+        cause: Throwable,
+        reserved: Boolean,
+        prevInitPid: Int,
+        process: Process?,
+        handleRetained: Boolean,
+        handleFd: Int,
+        parent: Process?,
+        rt: ProcessRuntime?,
+        thread: KernelThread?,
+        enqueued: Boolean,
+    ) {
+        if (thread != null) rollbackStep(cause) { scheduler.dedicatedThreads.remove(thread) }
+        if (enqueued && rt != null) rollbackStep(cause) { cpu.removeThreadless(rt) }
+        if (process != null) {
+            val pid = process.pid
+            // 表から先に外す。親のハンドルを閉じても、子の付け替え（onProcessHandleClosedLocked）が起きない
+            rollbackStep(cause) { if (runtimes[pid] === rt) runtimes.remove(pid) }
+            rollbackStep(cause) { if (kernel.processes[pid] === process) kernel.processes.remove(pid) }
+            // 子の fd（installFdsLocked が途中で投げても、入った分はここで拾う）
+            rollbackStep(cause) { FdTable(process, kernel.objects, wakeSink).closeAll() }
+            if (handleFd >= 0) rollbackStep(cause) { checkNotNull(parent).handles.remove(handleFd) }
+            if (handleRetained) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
+            // カーネルが持つ ProcessObject の参照（最後の1つ）
+            if (process.objectId != 0) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
+        }
+        kernel.initPid = prevInitPid
+        if (reserved) scheduler.releaseBlocking()
+        // awaitTermination で待っている側を起こす（状態は変えないので、checkAllDoneLocked は呼ばない）
+        if (kernel.processes.liveCount() == 0 && registeredThreads == 0) terminated.signalAll()
+    }
+
+    /** テスト用のフック（[KernelTestHooks.atSpawnStage]）を呼ぶ */
+    private fun spawnStage(stage: SpawnStage) {
+        scheduler.hooks.atSpawnStage?.invoke(stage)
+    }
+
+    private inline fun rollbackStep(cause: Throwable, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Throwable) {
+            if (e !== cause) cause.addSuppressed(e)
         }
     }
 
@@ -1661,6 +1848,7 @@ public class Machine private constructor(
                     is PendingFd.NewObject -> HandleEntry(kernel.objects.add(p.obj).also { created += it }, rights = p.rights)
                 }
                 fds.installAt(fd, entry)
+                spawnStage(SpawnStage.FD)
             }
         } finally {
             for (id in created) kernel.objects.release(id, wakeSink)
@@ -1685,15 +1873,19 @@ public class Machine private constructor(
 
     /**
      * コンソールの TTY にキー入力 [bytes] を渡す（キーボードから）。どのスレッドから呼んでもよい。
-     * TTY がモードに従って全部処理し（行編集、エコー、Ctrl+C）、受け付けたバイト数（あふれて捨てた分を除く）を返す。
-     * Ctrl+C などのシグナルは、カーネルロックの中で、起きた順に [ttySignalHandler] に渡す
+     * TTY がモードに従って全部処理し（行編集、エコー、Ctrl+C）、受け付けたバイト数（あふれて捨てた分を除く。TTY の待ちの列に
+     * 積んだ分は受け付けたものとして数える。#609）を返す。
+     * Ctrl+C などのシグナルは、カーネルロックの中で、起きた順に [ttySignalHandler] に渡す。
+     *
+     * @param splittable 文字の境目で分けて入れてよい入力（貼り付けと文字の入力）。入りきらない分は TTY の待ちの列に積み、
+     *   プロセスが読んで空いたら続きを入れる（#609）。キーのバイト列（エスケープシーケンス）や画面の応答は `false`（分けない）
      */
-    internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset): Int = lock.withLockValue {
+    internal fun offerConsoleInput(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size - offset, splittable: Boolean = false): Int = lock.withLockValue {
         require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "範囲が配列の外" }
         // 復元の途中は受け付けない（表を空のまま保つ。#85）
         if (restoringValue) return@withLockValue 0
         val tty = consoleTtyLocked()
-        val r = tty.input(bytes, offset, length, wakeSink)
+        val r = tty.input(bytes, offset, length, wakeSink, splittable)
         if (r.signals.isNotEmpty()) {
             val handler = ttySignalHandler
             for (s in r.signals) handler.onSignal(this, s, tty.foregroundPid)
@@ -1702,7 +1894,7 @@ public class Machine private constructor(
     }
 
     /**
-     * コンソールの画面の大きさを変える（画面のデバイスから。#65・#66）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException]。
+     * コンソールの画面の大きさを変える（画面のデバイス `ScreenDevice` から。#65）。どのスレッドから呼んでもよい。1 未満は [IllegalArgumentException]。
      * 大きさが実際に変わったときだけ、同じロックの中で `tty-resize` のイベント（値は列・行・世代。ADR 0427）を入れる
      */
     internal fun resizeConsole(columns: Int, rows: Int) {
@@ -1818,12 +2010,15 @@ public class Machine private constructor(
     /**
      * まだ実行していない [obj]（表に入っていること）を、デバイスの呼び出しとして実行に回す（保存から戻したものの積み直しにも使う）。
      * 直接のメソッドは、このスレッドで実行してから返る。終わったら [obj] を終わりにして待ち手を起こす（閉じた後なら何もしない）。
-     * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）
+     * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）。
+     * [expectedKind] を渡したら、その種類のデバイスでなければ `detached`（device の fd からの呼び出し。#66。保存した呼び出しは
+     * address だけを持つので、戻したものは照合しない）
      */
-    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall): Long {
+    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall, expectedKind: String? = null): Long {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ってデバイスを呼ばない" }
         val queued = lock.withLockValue { obj.state as? PendingDeviceCall.State.Queued } ?: return 0
-        val started = devices.dispatcher.start(pid, queued.address, queued.method, queued.args) {
+        val device = devices.dispatcher.resolve(queued.address, expectedKind)
+        val started = devices.dispatcher.start(pid, device, queued.method, queued.args) {
             lock.withLockValue { obj.markRunning() }
         }
         lock.withLockValue {
@@ -2494,7 +2689,8 @@ public class Machine private constructor(
         val phase = bootingValue || restoreTransient
         for (insertion in removed) {
             val source = diskSource(insertion.diskId)
-            val essential = kernel.mounts.entries.any { it.source == source && (it.point == VfsPath.ROOT || it.point == MachineLimits.HOME_PATH) }
+            // /home は FS の規則で比べる（根がディスクなら /HOME に置いたものも /home のマウント。#606）
+            val essential = kernel.mounts.entries.any { it.source == source && (it.point == VfsPath.ROOT || kernel.mounts.isAt(it, MachineLimits.HOME_PATH)) }
             if (essential || (phase && insertion.diskId in phaseDisks)) return true
         }
         if (!runningSteadyLocked()) return false
@@ -2572,11 +2768,11 @@ public class Machine private constructor(
         }
     }
 
-    /** 今の表にない `disk:` のマウント（`/`・`/home`・同梱イメージ以外）を外して `disk-removed` を出す（カーネルロックの中） */
+    /** 今の表にない `disk:` のマウント（`/`・`/home`（FS の規則で比べる。#606）・同梱イメージ以外）を外して `disk-removed` を出す（カーネルロックの中） */
     private fun unmountStaleDisksLocked() {
         for (entry in kernel.mounts.entries.toList()) {
             if (!entry.source.startsWith(MachineLimits.DISK_SOURCE_PREFIX)) continue
-            if (entry.point == VfsPath.ROOT || entry.point == MachineLimits.HOME_PATH) continue
+            if (entry.point == VfsPath.ROOT || kernel.mounts.isAt(entry, MachineLimits.HOME_PATH)) continue
             val diskId = entry.source.substring(MachineLimits.DISK_SOURCE_PREFIX.length)
             if (diskId.startsWith(BootConfig.IMAGE_DISK_PREFIX) || inserted.containsKey(diskId)) continue
             vfs.unmountForcedLocked(entry.id)
@@ -2768,14 +2964,61 @@ public class Machine private constructor(
         return if (cleaned.length <= MAX_LABEL_CHARS) cleaned else cleaned.take(MAX_LABEL_CHARS) + "..."
     }
 
-    /** 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中） */
+    /**
+     * 再起動を求められていて、プロセスもスレッドも残っていなければ、再起動の求めを通知の列に積む（カーネルロックの中）。
+     * 短い間に繰り返していれば、積まずに期限の tick まで遅らせる（[RebootBackoff]。#635）。どのスレッドからも呼ばれるので、
+     * ここでは期限を決めるだけで、host は呼ばない
+     */
     private fun maybePostRebootLocked() {
         if (!rebootRequested || bootingValue || stateValue != MachineState.STOPPED) return
         if (kernel.processes.liveCount() > 0 || registeredThreads > 0) return
-        rebootRequested = false
+        if (rebootNotified) {
+            // もう通知を積んだか、遅らせている（重ねて呼んだ reboot）。今の予定のままにし、借りも増やさない
+            rebootRequested = false
+            return
+        }
+        val step = scheduler.options.rebootBackoff.next(rebootDebtTicks, pendingRebootRanTicks.coerceAtLeast(0))
+        rebootDebtTicks = step.debtTicks
+        pendingRebootRanTicks = -1L
+        initStartTick = -1L
+        // 通知の印を立ててから求めの印を下ろす（この順番は不変条件。ロックを取らずに読む [isRunningBootingOrRebooting] が、
+        // 間で「再起動の途中でない」と見ないため。#626）
         rebootNotified = true
-        postNotification(HostNotification.RebootRequested)
+        scheduler.hooks.duringRebootPost?.invoke(this)
+        rebootRequested = false
+        if (step.delayTicks > 0) {
+            // 待つ間も rebootNotified は立てたまま（再起動の途中。保存しない・isRebootPending・stop で取り消す、は今までどおり）
+            val due = scheduler.now + step.delayTicks
+            rebootDueTick = due
+            scheduler.wakeAtTick(this, due)
+        } else {
+            postNotification(HostNotification.RebootRequested)
+        }
     }
+
+    /**
+     * 遅らせた再起動の期限の tick に、[MachineScheduler] がメインスレッドから呼ぶ（#635）。まだ待っていて期限が来ていれば、
+     * 再起動の通知を積む（同じ tick の中で配る）。取り消された・起動し直した・新しい期限に替わったなら何もしない
+     */
+    internal fun wakeDeferredReboot() {
+        lock.withLockValue {
+            val due = rebootDueTick
+            if (!rebootNotified || due == 0L || scheduler.now < due) return@withLockValue
+            rebootDueTick = 0L
+            postNotification(HostNotification.RebootRequested)
+        }
+    }
+
+    /** テスト用: 遅らせている再起動の期限の tick（遅らせていなければ `0`） */
+    internal val deferredRebootDueTick: Long get() = lock.withLockValue { rebootDueTick }
+
+    /** テスト用: 再起動の借り（tick）。借りのあるマシンを、再起動を重ねずに作るために書き換えられる */
+    internal var rebootDebt: Long
+        get() = lock.withLockValue { rebootDebtTicks }
+        set(value) = lock.withLockValue { rebootDebtTicks = value }
+
+    /** テスト用: 今の init が動き始めた tick（動いていなければ `-1`） */
+    internal val initStartedTick: Long get() = lock.withLockValue { initStartTick }
 
     /**
      * 起動の手順の始め（起動用のスレッドから）。前の起動のスレッドが登録を外すのを待ち、ゾンビを外して pid を 1 に戻し、
@@ -2914,7 +3157,8 @@ public class Machine private constructor(
      */
     private fun unmountTmpLocked() {
         for (tmp in kernel.mounts.entries.filter { it.source == MachineLimits.TMP_SOURCE }) {
-            val doomed = kernel.mounts.entries.filter { it.point.startsWith(tmp.point) }.sortedByDescending { it.point.depth }
+            // 下にあるかは、大文字小文字の規則も含めて比べる（根がディスクなら /TMP/x も /tmp の下。#606）
+            val doomed = kernel.mounts.entries.filter { kernel.mounts.isAtOrBelow(it, tmp) }.sortedByDescending { it.point.depth }
             for (entry in doomed) {
                 // 入れ子の /tmp が先に外れていることがある
                 if (kernel.mounts[entry.id] != null) vfs.unmountForcedLocked(entry.id)
@@ -3029,7 +3273,8 @@ public class Machine private constructor(
                 is HostNotification.BootFailed -> safely { host.onBootFailed(this, n.failure, n.detail) }
                 HostNotification.RebootRequested -> {
                     // 積んだ後に stop() されたら、再起動しない
-                    val go = lock.withLockValue { rebootNotified.also { rebootNotified = false } }
+                    // 遅らせている間（期限の前）は配らない（積んだのは期限が来た後だけなので、普通は起きない。#635）
+                    val go = lock.withLockValue { (rebootNotified && rebootDueTick == 0L).also { if (it) rebootNotified = false } }
                     if (go) safely { host.onRebootRequested(this) }
                 }
                 is HostNotification.Console, HostNotification.TtyOutput -> Unit

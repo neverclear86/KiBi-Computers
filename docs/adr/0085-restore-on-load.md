@@ -37,10 +37,11 @@
 | `claim` が新しい ID を振った（`NEW_ID_*`） | `NEW_ID` |
 | その ID の書き込みが期限までに終わらない | `WRITES_PENDING` |
 | 戻せる世代がない（`restorableGeneration` が空。ADR 0084 の規則 9・10） | `NO_GENERATION` |
+| 保存データを書いた MOD のバージョンが今のものと違う（差分の基準のものを含む。`KILLED` 節より先に比べる。#88、ADR 0088） | `MOD_VERSION` |
 | `KILLED` 節の理由が 0 以外（起動中・再起動の待ち・init を殺した写し） | `KILLED_SECTION` |
 | 読めない・壊れている・`KILLED` 節が読めない（`0xFF`）・差分の基準がない・合わない・pid 表が不正 | `UNREADABLE` |
 | モジュールが置き場にない | `MODULE_MISSING` |
-| 読み込み直したモジュールのハッシュが保存データと合わない・読み込めない | `MODULE_MISMATCH` |
+| 読み込み直したモジュールのハッシュが保存データと合わない・読み込めない・計測ありのモジュールの変換器の版が今のものと違う（読み込まない。ADR 0088） | `MODULE_MISMATCH` |
 | 戻せないプロセス（ABI 層が p1 でない・入口と状態の組み合わせが下の表にない・BLOCKING のドライバー） | `UNSUPPORTED_PROCESS` |
 | init が終わっている・表にない | `NO_LIVE_INIT` |
 | 根・`/home` のディスク・イメージが開けない・`/tmp` の `TMPFS` 節がない・知らないマウント（それ以外のディスクが開けなければ、そのマウントだけ落とす。ADR 0056） | `MOUNT` |

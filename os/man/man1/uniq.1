@@ -1,0 +1,24 @@
+# uniq(1)
+
+## NAME
+
+uniq - report or omit repeated lines
+
+## SYNOPSIS
+
+    uniq [-cdui] [input [output]]
+
+## DESCRIPTION
+
+Writes the input with adjacent equal lines merged into one. Lines that are not adjacent are not merged, so sort first.
+
+## OPTIONS
+
+- `-c`: prefix the number of occurrences
+- `-d`: only repeated lines
+- `-u`: only lines that are not repeated
+- `-i`: ignore case
+
+## SEE ALSO
+
+sort(1)

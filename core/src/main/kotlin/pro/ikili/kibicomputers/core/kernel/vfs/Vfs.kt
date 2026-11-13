@@ -6,7 +6,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * 仮想ファイルシステム（マシンに1つ）。マウントの表（[mounts]。保存の対象）と、マウントの ID → [FileSystem]（実行時だけ）を持つ。
  * 設計は ADR 0051・0052。
  *
- * - パスは、いちばん長く一致するマウントの位置で、どのファイルシステムに属するかを決める
+ * - パスは、いちばん長く一致するマウントの位置で、どのファイルシステムに属するかを決める（名前は、その名前を引くディレクトリの
+ *   ファイルシステムの規則で比べる。ディスクの中では大文字小文字を区別しない。#606。[MountTable]）
  * - マウントの位置の祖先（`/mnt/disk` をマウントしたときの `/mnt`、根に何もマウントしていないときの `/`）は、
  *   下のファイルシステムになくてもディレクトリとして見える（中身はマウントの位置へ向かう名前だけ。書けない）
  * - マウントの位置と、その祖先は、消す・名前を変えることができない（`BUSY`）
@@ -72,7 +73,7 @@ internal class Vfs(
      * マウントすれば、その位置はマウントの根として見えるので壊れない）
      */
     fun mountLocked(point: VfsPath, fs: FileSystem, readOnly: Boolean, source: String): MountEntry = synchronized(this) {
-        val entry = mounts.add(point, readOnly, source)
+        val entry = mounts.add(point, readOnly, source, fs.ignoresCase)
         fileSystems[entry.id] = fs
         publish()
         entry
@@ -114,6 +115,7 @@ internal class Vfs(
     fun attach(id: Int, fs: FileSystem): Unit = synchronized(this) {
         requireNotNull(mounts[id]) { "マウント $id はない" }
         fileSystems[id] = fs
+        mounts.setIgnoresCase(id, fs.ignoresCase)
         publish()
     }
 
@@ -394,7 +396,7 @@ internal class Vfs(
 
     /**
      * ディレクトリの中身を名前の順に返す。ファイルシステムの中身に、マウントの位置へ向かう名前（ディレクトリ）を足す
-     * （同じ名前があればマウントの側を見せる）。`.` と `..` は含めない
+     * （同じ名前があればマウントの側を見せる。大文字小文字を区別しないディレクトリでは、そろえると同じ名前も。#606）。`.` と `..` は含めない
      */
     fun readDirectory(file: OpenFile): List<DirEntry> {
         if (!file.isDirectory) fsError(Errno.NOTDIR)
@@ -403,7 +405,10 @@ internal class Vfs(
         if (file.mountId != 0) {
             for (e in fsOf(file).readDirectory(file.node)) byName[e.name] = e
         }
+        // 大文字小文字を区別しないディレクトリ（ディスク）なら、マウントの位置とそろえると同じ名前は、マウントの側だけを見せる（#606）
+        val fold = v.table.ignoresCaseIn(file.path)
         for (name in v.table.childNamesTowardMounts(file.path)) {
+            if (fold) byName.keys.removeIf { it != name && DiskNames.sameName(it, name) }
             val child = file.path.child(name)
             val node = v.table.at(child)?.let { m ->
                 v.fileSystems[m.id]?.let { fs ->
@@ -511,7 +516,8 @@ internal class Vfs(
         val mount = v.table.covering(path) ?: return null
         val fs = v.fileSystems[mount.id] ?: fsError(Errno.IO, "マウント ${mount.id} のファイルシステムがない")
         checkUnlocked()
-        return Location(mount, fs, path.relativeTo(mount.point))
+        // 先頭の名前を落とす（covering は大文字小文字を区別せずに一致することがあるので、relativeTo では確かめない。#606）
+        return Location(mount, fs, path.dropLeading(mount.point.depth))
     }
 
     /** 書く操作の場所。マウントの祖先のディレクトリ（どの FS にもない）か、読み取り専用なら `ROFS` */

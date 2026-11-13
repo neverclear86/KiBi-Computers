@@ -40,7 +40,8 @@ public fun interface MachineHost {
     /**
      * 再起動（[Machine.reboot]）を求められ、プロセスがすべて止まった（#49）。
      * 既定の実装は、前回の設定（[Machine.lastBootConfig]）でもう一度 [Machine.boot] する。
-     * 上書きすると、その時点のディスクで [BootConfig] を作り直して起動できる（起動しないこともできる）
+     * 上書きすると、その時点のディスクで [BootConfig] を作り直して起動できる（起動しないこともできる）。
+     * 短い間に再起動を繰り返したマシンでは、止まってから少し遅れて呼ぶ（起動ループの抑止。#635、ADR 0635）
      */
     public fun onRebootRequested(machine: Machine) {
         machine.lastBootConfig?.let { machine.boot(it) }

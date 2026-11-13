@@ -5,8 +5,9 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 /**
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
- * どれも `(マシン, pid)` を受け取る。[stopBeforeInterrupt] と [duringInitSpawn] はカーネルロックの中、ほかはロックの外で呼ぶ
- * （それぞれの KDoc を見る）。
+ * 多くは `(マシン, pid)` を受け取る（[beforeInitExec] などはマシンだけ、[atSpawnStage] は段（[SpawnStage]）だけ）。
+ * [stopBeforeInterrupt]・[duringRestoreInstall]・[duringInitSpawn]・[duringSpawn]・[atSpawnStage]・[duringRebootPost] は
+ * カーネルロックの中、ほかはロックの外で呼ぶ（それぞれの KDoc を見る）。ロックの中のフックで、カーネルロックを要る別のスレッドを待つとデッドロックする。
  */
 internal class KernelTestHooks {
     /** step（専用スレッド）の終わりの、登録を外す前（WASM は終わっている） */
@@ -62,8 +63,54 @@ internal class KernelTestHooks {
 
     /**
      * 起動の init を作る区間の途中（カーネルロックの中。表に足して実行時の部分を作った後、`RUNNING` にする前。#625）。
-     * ロックを取らずに読む口（[Machine.isRunningOrBooting]）が、この間も正しく見えるかを確かめるのに使う
+     * ロックを取らずに読む口（[Machine.isRunningOrBooting]）が、この間も正しく見えるかを確かめるのに使う。
+     * 例外を投げると、足した分が巻き戻される（#629）
      */
     @Volatile
     var duringInitSpawn: ((Machine) -> Unit)? = null
+
+    /**
+     * すべての spawn の途中（カーネルロックの中。表・オブジェクト・fd・実行時の部分・専用スレッドを確保した後、スレッドを動かす・
+     * 待ち行列に積む前。init なら [duringInitSpawn] の後）。例外を投げると、足した分が巻き戻される（#629）
+     */
+    @Volatile
+    var duringSpawn: ((Machine, Int) -> Unit)? = null
+
+    /**
+     * spawn が表に足す各段を終えるたびに呼ぶ（カーネルロックの中。段は [SpawnStage]）。例外を投げると、そこまでに足した分が巻き戻される（#629）。
+     * 途中の段（fd が途中まで入った、親のハンドルを保持しただけ、など）での失敗を再現するのに使う
+     */
+    @Volatile
+    var atSpawnStage: ((SpawnStage) -> Unit)? = null
+
+    /**
+     * 再起動の求めを通知の列に積む区間の途中（カーネルロックの中。通知の印を立てた後、求めの印を下ろす前。#626）。
+     * ロックを取らずに読む口（[Machine.isRunningBootingOrRebooting]）が、この間も正しく見えるかを確かめるのに使う
+     */
+    @Volatile
+    var duringRebootPost: ((Machine) -> Unit)? = null
+}
+
+/** spawn が表に足す段（[KernelTestHooks.atSpawnStage]）。段を終えた直後に呼ぶ */
+internal enum class SpawnStage {
+    /** 表（プロセスの表）に足した。オブジェクトはまだない */
+    TABLE,
+
+    /** プロセスのオブジェクトを足した（init なら initPid も） */
+    OBJECT,
+
+    /** 子の fd を1つ割り当てた（割り当てるたびに呼ぶ） */
+    FD,
+
+    /** 親に返すハンドルの参照を足した。fd にはまだ入れていない */
+    HANDLE_RETAINED,
+
+    /** 親に返すハンドルを親の fd 表に入れた */
+    HANDLE,
+
+    /** 実行時の部分を作った。まだ表（runtimes）に足していない */
+    RUNTIME_INIT,
+
+    /** 実行時の部分を表（runtimes）に足した */
+    RUNTIME,
 }

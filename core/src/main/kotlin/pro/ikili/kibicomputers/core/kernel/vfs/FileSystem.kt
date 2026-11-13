@@ -52,12 +52,18 @@ internal data class DirEntry(val name: String, val type: FileType, val node: Lon
  * - 呼ばれるのは、マシンのカーネルロックの**外**（#52。ADR 0051・0052）。同じマシンのいくつものスレッド（プロセスのスレッド、
  *   起動用のスレッド）から同時に呼ばれるので、ファイルシステムが自分で排他する。自分の I/O と自分の排他のほかに待たない
  *   （ほかのマシン・メインスレッド・カーネルロックを待たない）
- * - カーネルロックの中から呼ばれるのは [sizeHint]・[revoke]・[onUnmounted]・[isTerminal]・[pathHint] だけ。この5つは I/O をせず、
+ * - カーネルロックの中から呼ばれるのは [ignoresCase]・[sizeHint]・[revoke]・[onUnmounted]・[isTerminal]・[pathHint] だけ。この6つは I/O をせず、
  *   自分のロックも長く待たずに、すぐ返す
  */
 internal interface FileSystem {
     /** 書けないファイルシステムか（書く操作の前に VFS が `ROFS` にする） */
     val readOnly: Boolean get() = false
+
+    /**
+     * 名前の大文字小文字を区別しないか（ディスク。ADR 0052）。[Vfs] がマウントの位置と名前を比べるのに使う（#606）。
+     * マウントするとき（カーネルロックの中）に読むので、I/O をしない定数にする
+     */
+    val ignoresCase: Boolean get() = false
 
     /** [path] の属性。なければ `NOENT`、途中がディレクトリでなければ `NOTDIR` */
     fun stat(path: VfsPath): FileStat

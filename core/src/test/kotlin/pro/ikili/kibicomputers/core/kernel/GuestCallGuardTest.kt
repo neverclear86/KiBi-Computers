@@ -149,6 +149,28 @@ class GuestCallGuardTest {
         assertTraps(ProcessKind.WAIT_POINT, "invokeDevice") { ctx, _ -> ctx.invokeDevice(address, "w", emptyList()) }
 
     @Test
+    fun `callGuestの中からメインスレッドのメソッドをfdのinvokeDeviceで呼ぶとトラップ`() = assertTraps(
+        ProcessKind.BLOCKING,
+        "invokeDevice",
+        prepare = { ctx, _ -> ctx.openDevice(address) },
+    ) { ctx, fd -> ctx.invokeDevice(fd, "w", emptyList()) }
+
+    @Test
+    fun `callGuestの中でも、fdのinfo・methodsと直接のメソッドのinvokeは呼べる`() {
+        val got = assertReturns({ m, ctx, _ -> m.attachDevice(); ctx.openDevice(address) }) { ctx, fd ->
+            listOf(ctx.deviceInfo(fd), ctx.deviceMethods(fd), ctx.invokeDevice(fd, "d", emptyList()))
+        }
+        assertEquals(
+            listOf(
+                pro.ikili.kibicomputers.core.device.DeviceInfo(address, "test:device"),
+                listOf(pro.ikili.kibicomputers.core.device.MethodInfo("d", false), pro.ikili.kibicomputers.core.device.MethodInfo("w", true)),
+                listOf(DeviceValue.of(42L)),
+            ),
+            got,
+        )
+    }
+
+    @Test
     fun `callGuestの中から、まだ走っている子をwaitChildで待つとトラップ`() = assertTraps(
         ProcessKind.BLOCKING,
         "block",

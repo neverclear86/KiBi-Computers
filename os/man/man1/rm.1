@@ -1,0 +1,28 @@
+# rm(1)
+
+## NAME
+
+rm - remove files or directories
+
+## SYNOPSIS
+
+    rm [-rRf] file...
+
+## DESCRIPTION
+
+Removes files. `.`, `..` and `/` are refused.
+
+## OPTIONS
+
+- `-r, -R`: remove directories and their contents
+- `-f`: ignore files that do not exist
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: an error occurred for some operand
+- `2`: usage error
+
+## SEE ALSO
+
+rmdir(1)

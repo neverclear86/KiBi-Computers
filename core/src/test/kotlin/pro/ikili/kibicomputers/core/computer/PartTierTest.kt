@@ -25,10 +25,19 @@ class PartTierTest {
     }
 
     @Test
-    fun `正式なティアのCPUとRAMは今は既定の値`() {
+    fun `正式なティアのCPUの燃料とRAMの容量は今は既定の値`() {
         for (tier in formal) {
             assertEquals(MachineConfig.DEFAULT.fuelPerTick, tier.cpuFuelPerTick)
             assertEquals(MachineConfig.DEFAULT.memoryBytes, tier.memoryBytes)
         }
+    }
+
+    @Test
+    fun `CPUの接続数はティアの順に増え、3段目が既定の値で、クリエイティブがいちばん多い`() {
+        val counts = formal.map { it.cpuMaxDevices }
+        assertEquals(counts.sorted(), counts)
+        assertEquals(counts.size, counts.toSet().size)
+        assertEquals(MachineConfig.DEFAULT.maxDevices, PartTier.TIER_3.cpuMaxDevices)
+        assertTrue(PartTier.CREATIVE.cpuMaxDevices > counts.max())
     }
 }

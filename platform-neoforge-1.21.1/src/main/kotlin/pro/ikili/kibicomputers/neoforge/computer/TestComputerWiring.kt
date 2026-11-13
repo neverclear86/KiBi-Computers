@@ -1,8 +1,10 @@
 package pro.ikili.kibicomputers.neoforge.computer
 
+import com.mojang.logging.LogUtils
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.world.level.Level
+import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.InstalledParts
 import pro.ikili.kibicomputers.core.computer.PartKind
@@ -38,14 +40,18 @@ import java.util.concurrent.atomic.AtomicLong
  *   （音はまだ鳴らさず数えるだけ。[beeps]）。
  * - つないだ画面が外れたら、画面とキーボードだけを外す（#397）。マシンとスピーカーはつないだまま（#531）
  * - 画面をつないでいない間に、ケースの隣のブロックが変わったら（[CaseBlockEntity.neighborChanged]）、隣の画面と
- *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
+ *   キーボードを探し直してつなぐ（[reconnectScreen]。#531）。再起動の途中（[Machine.reboot] を受け付けてから
+ *   起動し直すまで）も含む（#626）。置いた画面のデータ（address）を読み込んだ後につなぐよう、
  *   次の tick に回す。マシンが自分で止まったら（CRASHED、ゲストが止めた、起動に失敗した）、ケースがマシンを外し、結線も外れる
  *   （[CaseBlockEntity] が [disconnect] を呼ぶ。#640・#641）ので、つながない（#535）。
  *   つないだときの address を覚えておき、外すときはそれで外す。隣のブロックの更新で気付くので、画面の置いてある
  *   チャンクが読み込み直されたときなど、ケースの隣のブロックの更新が起きないときはつなぎ直さない。
  *   画面をつないでいる間に置いたキーボードも見ない
  *   キーボードがすでに別のケースにつながっていれば、つながない（[KeyboardBlockEntity.claim]）
- *   置き換え先: 隣接デバイスの検出と接続 #129、画面・キーボードのデバイス #65・#66
+ *   置き換え先: 隣接デバイスの検出と接続 #129（画面・キーボードのデバイスは #65・#66 で済んだ）
+ * - つなげる数は CPU で決まる（`MachineConfig.maxDevices`。#66）。満杯で断られたもの（`DeviceBus.attach` が `false`）は
+ *   つながないままにし、自分の状態も変えない（断られたキーボードは手放す）。断られたことはログに1回だけ出す。
+ *   つなぐ順はスピーカー → 画面 → キーボード
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
  * 表示デバイスの中身は、プロセスのスレッドも書くので、読むときはそのロックを持つ。
@@ -70,6 +76,14 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     /** 画面のブロックのためにマシンにつないだ画面のデバイス。つないでいなければ null（テスト用） */
     val connectedScreenDevice: ScreenDevice? get() = screenDevice
+
+    /**
+     * 画面をマシンにつないだ回数（つなぎ直しも数える。つないですぐ外れても残る。テスト用）。
+     * 「つながなかった」ことは、ある時点で `connectedScreen == null` と読むだけだと、つないですぐ外れたものを見逃すので、これで確かめる
+     */
+    @Volatile
+    var screenAttachCount: Int = 0
+        private set
 
     /** スピーカーに届いたビープの数（音はまだ鳴らさない。テスト用） */
     val beeps: AtomicLong = AtomicLong()
@@ -98,8 +112,10 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
         disconnect()
         this.machine = machine
         bootFailure = null
-        this.speakerAddress = speakerAddress
-        machine.devices.attach(speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() })
+        limitLogCount = 0
+        if (attachDevice(machine, speakerAddress, SpeakerDevice { _, _ -> beeps.incrementAndGet() }, "speaker")) {
+            this.speakerAddress = speakerAddress
+        }
         attachScreen(level, casePos, machine)
     }
 
@@ -108,17 +124,18 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     /**
      * [current]（ケースの今のマシン）がこの結線のマシンで、画面をつないでおらず、止まっていない
-     * （[MachineState.RUNNING] か、起動の途中。[Machine.isRunningOrBooting]）なら `true`。
-     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535）。ロックを取らず軽いので、ケースの隣のブロックが変わるたびに呼んでよい。
-     * 状態と起動中の印は、別々に読まず [Machine.isRunningOrBooting] で読む（読む順番に意味がある。#625）
+     * （[MachineState.RUNNING]、起動の途中、再起動の途中。[Machine.isRunningBootingOrRebooting]）なら `true`。
+     * そのときだけ画面をつなぎ直す（[reconnectScreen]。#531・#535・#626）。ゲストが止めた・CRASHED なら `false`。
+     * ロックを取らず軽いので、ケースの隣のブロックが変わるたびに呼んでよい。画面をつないでいる台は、マシンの印を読まない。
+     * 状態と印は、別々に読まず [Machine.isRunningBootingOrRebooting] で読む（読む順番に意味がある。#625・#626）
      */
     fun canReconnectScreen(current: Machine?): Boolean {
         val m = machine ?: return false
-        return current === m && screen == null && m.isRunningOrBooting
+        return current === m && screen == null && m.isRunningBootingOrRebooting
     }
 
     /**
-     * 動いているマシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
+     * 止まっていない（再起動の途中も含む）マシンに画面をつないでいなければ（[canReconnectScreen]）、隣の画面とキーボードを探してつなぐ（#531）。
      * そうでなければ何もしない。マシンが自分で止まった（CRASHED、ゲストが止めた、起動に失敗した）ときは、ケースがマシンを外して
      * 結線も外れるので、つながない（#535・#640・#641）。
      * 置いたブロックのデータ（address など）を読み込んだ後に呼ぶ（[CaseBlockEntity.neighborChanged] は次の tick に回す）
@@ -130,22 +147,55 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
 
     private fun attachScreen(level: Level, casePos: BlockPos, machine: Machine) {
         val screen = findScreen(level, casePos) ?: return
-        this.screen = screen
-        screen.addRemovalListener(onScreenRemoved)
+        // 満杯なら、表示デバイスを作らずに諦める（隣のブロックが変わるたびに呼ばれるので、軽く済ませる）
+        if (machine.devices.size >= machine.devices.limit) {
+            logRefused(machine, "screen")
+            return
+        }
         // 表示デバイスはマシンの側（この結線）が持ち、画面はそれを映す（#355）。つなぐたびに新しく作る
         val display = DisplayDevice.forTier(screen.tier)
-        screen.mirror(display)
         val address = screen.deviceAddress
+        val device = ScreenDevice(display)
+        // つなげてから、自分の状態を確定する（断られたら何も残さない。#66）
+        if (!attachDevice(machine, address, device, "screen")) return
+        screenAttachCount++
+        this.screen = screen
+        screen.addRemovalListener(onScreenRemoved)
+        screen.mirror(display)
         screenAddress = address
-        screenDevice = ScreenDevice(display).also { machine.devices.attach(address, it) }
+        screenDevice = device
         // 1つのキーボードは、最初につないだケースだけが持つ（#360。正式な形は #129）
-        val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) }
-        if (keyboard != null) {
-            this.keyboard = keyboard
-            val keyAddress = keyboard.deviceAddress
-            keyboardAddress = keyAddress
-            keyboardDevice = KeyboardDevice().also { machine.devices.attach(keyAddress, it) }
+        val keyboard = findKeyboard(level, casePos, screen.blockPos)?.takeIf { it.claim(this) } ?: return
+        val keyAddress = keyboard.deviceAddress
+        val keyDevice = KeyboardDevice()
+        var attachedKeyboard = false
+        try {
+            attachedKeyboard = attachDevice(machine, keyAddress, keyDevice, "keyboard")
+        } finally {
+            // 断られた・例外で抜けた（address の重複など）ときは、ほかのケースが使えるよう手放す
+            if (!attachedKeyboard) keyboard.release(this)
         }
+        if (!attachedKeyboard) return
+        this.keyboard = keyboard
+        keyboardAddress = keyAddress
+        keyboardDevice = keyDevice
+    }
+
+    /** 満杯で断られたことをログに出した回数。同じ結線で続けて断られても1回だけ出す（電源を入れ直すと戻す。テスト用） */
+    var limitLogCount: Int = 0
+        private set
+
+    /** [device] を [address] でつなぐ。満杯で断られたら、ログに出して `false` */
+    private fun attachDevice(machine: Machine, address: String, device: Device, name: String): Boolean {
+        if (machine.devices.attach(address, device)) return true
+        logRefused(machine, name)
+        return false
+    }
+
+    private fun logRefused(machine: Machine, name: String) {
+        if (limitLogCount > 0) return
+        limitLogCount++
+        LOGGER.info("Device limit ({}) reached; not attaching the {}", machine.devices.limit, name)
     }
 
     /** 電源が切れた・ケースが消える。マシンからすべてのデバイス（画面・キーボード・スピーカー）を外す（[detachScreen]） */
@@ -194,6 +244,8 @@ internal class TestComputerWiring : MachineHost, KeyboardListener {
     }
 
     companion object {
+        private val LOGGER = LogUtils.getLogger()
+
         /**
          * 仮の起動経路の最後の起動ディスク（標準 OS の同梱イメージ `os`。#461）。
          * 正式な入手方法（OS 入りのフロッピーから HDD へのインストール。#107・#145）がそろったら置き換える

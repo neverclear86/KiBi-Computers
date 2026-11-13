@@ -1,0 +1,45 @@
+# grep(1)
+
+## NAME
+
+grep - print lines that match patterns
+
+## SYNOPSIS
+
+    grep [-EFcHhilnqsvx] [-e pattern]... [pattern] [file...]
+
+## DESCRIPTION
+
+Prints the lines of the files (or standard input) that match a pattern. Patterns are basic regular expressions by default. Supported: `.` `[...]` `[:class:]` `*` `^` `$`, and `+ ?` (ERE) or `\+ \?` (BRE). Groups, alternation, intervals and back references are not supported.
+
+A line is at most 64 KiB; longer lines are split.
+
+## OPTIONS
+
+- `-E`: extended regular expressions
+- `-F`: fixed strings
+- `-e pattern`: use this pattern (may be repeated)
+- `-i`: ignore case
+- `-v`: select non-matching lines
+- `-x`: match whole lines only
+- `-c`: print only a count of matching lines
+- `-l`: print only the names of matching files
+- `-q`: print nothing
+- `-n`: prefix line numbers
+- `-H`: prefix file names
+- `-h`: never prefix file names
+- `-s`: do not report unreadable files
+
+## EXIT STATUS
+
+- `0`: a line matched
+- `1`: no line matched
+- `2`: an error occurred
+
+## EXAMPLES
+
+    ls /bin | grep -c .
+
+## SEE ALSO
+
+sort(1), wc(1)

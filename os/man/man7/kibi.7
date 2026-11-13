@@ -1,0 +1,26 @@
+# kibi(7)
+
+## NAME
+
+kibi - WASI support and the kibi extensions
+
+## DESCRIPTION
+
+Programs run on WebAssembly with WASI preview 1, preview 2 and preview 3, and the Component Model. Features that WASI does not have are provided as WIT packages named `kibi:*`. Preview 1 programs get the same functions as imports named `kibi:PACKAGE/INTERFACE@VERSION`.
+
+## PACKAGES
+
+- `kibi:kernel`: event queues (`events`) and timers (`timers`)
+- `kibi:process`: start, wait for and kill processes; the working directory; the process list
+- `kibi:io`: duplicating file descriptors, pipes, and the terminal (`tty`: raw mode, size, foreground)
+- `kibi:fs`: mounting disks and listing mounts and disks (`mounts`)
+- `kibi:computer`: free memory (`memory`), uptime and game time (`clock`), power (`power`)
+- `kibi:device`: listing and using devices (`bus`)
+
+## NOTES
+
+The full definitions are the WIT files of the mod and its design documents.
+
+## SEE ALSO
+
+intro(7)

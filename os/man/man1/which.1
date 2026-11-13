@@ -1,0 +1,26 @@
+# which(1)
+
+## NAME
+
+which - locate a command
+
+## SYNOPSIS
+
+    which [-a] name...
+
+## DESCRIPTION
+
+Writes the path of the program for each name, searching `PATH` (or `/bin:/sbin`). Shell built-ins and functions are not searched; use `command -v` for those.
+
+## OPTIONS
+
+- `-a`: print every match
+
+## EXIT STATUS
+
+- `0`: every name was found
+- `1`: a name was not found
+
+## SEE ALSO
+
+sh(1)

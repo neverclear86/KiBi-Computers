@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.persist.AutosaveTarget
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.CaptureSubmitResult
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.ColdBootLog
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
@@ -138,6 +139,9 @@ object ServerMachines {
     /** 自動保存の周期を数える tick */
     private var autosaveTicks = 0L
 
+    /** 冷えた起動のログの出し方（MOD のバージョン違いの要約は、サーバーの起動ごとに1回。#88） */
+    private var coldBootLog = ColdBootLog()
+
     /** この tick のアンロードで待機点を待った時間の合計（ナノ秒） */
     private var unloadWaitedNanos = 0L
 
@@ -160,6 +164,9 @@ object ServerMachines {
 
         /** 戻せずに冷えた起動にした数 */
         var restoreFallbacks: Long = 0
+
+        /** [restoreFallbacks] のうち、保存データを書いた MOD のバージョンが今のものと違ったもの（#88） */
+        var restoreVersionMismatches: Long = 0
 
         /** FULL でなくなったチャンク（[ChunkTicketLevelUpdatedEvent]）のうち、動いているケースのあったもの（#545） */
         var demotedChunksWithCases: Long = 0
@@ -225,8 +232,28 @@ object ServerMachines {
         /** 消えたケース（アンロード済み・壊した）への完了の数（#84。数えるだけ） */
         var completionsForGone: Long = 0
 
-        /** 世代のファイルを書くたびに [saves] に1件残すか（負荷試験が有効にする。ふだんは残さない） */
+        /**
+         * 世代のファイルを書くたびに [saves] に1件残すか（負荷試験が有効にする。ふだんは残さない）。
+         * 有効な間は、予約を区間（[window]。[reset] で次に進む）ごとに分け、前の区間に予約した完了（と、無効な間に予約した完了）は
+         * [saves] や時間・数の数え口に入れず、[staleCompletions] に数える（#614）
+         */
         var recordSaves: Boolean = false
+
+        /** 今の区間の番号（[reset] のたびに増える。[recordSaves] のときだけ使う。#614） */
+        var window: Long = 0
+            private set
+
+        /** 今の区間に予約した書き込みの数（[recordSaves] のときだけ数える。#614） */
+        var windowSubmits: Long = 0
+
+        /** 今の区間に予約した書き込みのうち、完了（書けた・書けなかった）を受け取った数（[recordSaves] のときだけ数える。#614） */
+        var windowCompletions: Long = 0
+
+        /** 今の区間に予約して、まだ完了を受け取っていない書き込みの数（[recordSaves] のときだけ意味を持つ。#614） */
+        val windowOutstanding: Long get() = windowSubmits - windowCompletions
+
+        /** 今の区間より前に予約した書き込みの完了の数（[recordSaves] のときだけ数える。数え口には入れない。#614） */
+        var staleCompletions: Long = 0
 
         /** 世代のファイルを書いた1回ごとの記録（[recordSaves] のときだけ。古い順） */
         val saves: MutableList<SaveSample> = ArrayList()
@@ -256,6 +283,7 @@ object ServerMachines {
             restoreWriteTimeouts = 0
             restored = 0
             restoreFallbacks = 0
+            restoreVersionMismatches = 0
             unloadEventsWithCases = 0
             demotedChunksWithCases = 0
             demotedMachines = 0
@@ -282,6 +310,10 @@ object ServerMachines {
             autosaveNoCapacity = 0
             completionsForGone = 0
             saves.clear()
+            window++
+            windowSubmits = 0
+            windowCompletions = 0
+            staleCompletions = 0
         }
     }
 
@@ -327,6 +359,8 @@ object ServerMachines {
         demoted.clear()
         promoted.clear()
         restoreQueue.clear()
+        submitOf.clear()
+        coldBootLog = ColdBootLog()
         autosaveTicks = 0
         // GameTest のサーバーでは自動保存を切る（負荷試験は自分で有効にする）
         autosaveEnabled = event.server !is GameTestServer
@@ -369,7 +403,18 @@ object ServerMachines {
             RestoreOutcome.RESTORED -> Stats.restored++
             RestoreOutcome.COLD_BOOT -> {
                 Stats.restoreFallbacks++
-                LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
+                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
+                when (coldBootLog.classify(cause)) {
+                    ColdBootLog.Kind.EACH -> LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
+                    ColdBootLog.Kind.SUMMARY -> {
+                        LOGGER.info(
+                            "Computer saves were written by a different version of {}; running computers will cold-boot instead of being restored",
+                            KiBiComputers.MOD_ID,
+                        )
+                        LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
+                    }
+                    ColdBootLog.Kind.QUIET -> LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
+                }
             }
             RestoreOutcome.CANCELLED -> {}
         }
@@ -460,14 +505,20 @@ object ServerMachines {
 
     // ---- 書き込みの完了（#84） ----
 
-    /** 予約ごとの取り出しの時間（[Stats.recordSaves] のときだけ。完了で [Stats.saves] に入れる） */
-    private val captureNanosOf = IdentityHashMap<PendingSave, Long>()
+    /** 予約ごとの取り出しの時間と区間（[Stats.recordSaves] のときだけ。完了で [Stats.saves] に入れる） */
+    private val submitOf = IdentityHashMap<PendingSave, SubmitInfo>()
+
+    /** 予約の記録（負荷試験用。[captureNanos] は取り出しの時間、[window] は予約した区間の番号。#614） */
+    private class SubmitInfo(val captureNanos: Long, val window: Long)
 
     /** ケースが書き込みを予約した（[CaseBlockEntity.captureAndSubmit] から）。数え口に入れる */
     internal fun recordSubmit(submitted: CaptureSubmitResult) {
         Stats.captureNanos += submitted.captureNanos
         if (submitted.retried) Stats.deltaRetries++
-        if (Stats.recordSaves) captureNanosOf[submitted.pending] = submitted.captureNanos
+        if (Stats.recordSaves) {
+            submitOf[submitted.pending] = SubmitInfo(submitted.captureNanos, Stats.window)
+            Stats.windowSubmits++
+        }
         val store = WorldMachineSaves.current ?: return
         Stats.maxPendingCount = maxOf(Stats.maxPendingCount, store.pendingCount)
         Stats.maxPendingBytes = maxOf(Stats.maxPendingBytes, store.pendingBytes)
@@ -476,15 +527,21 @@ object ServerMachines {
     /**
      * 書き込みのスレッドで終わった書き込みを受け取り、ケースに返す（メインスレッド。毎 tick の始めと [drainSaves]）。
      * ケースが世代を採ったら（[CaseBlockEntity.onSaveCompleted]）`setChanged` し、FULL でなくなったチャンクなら `setUnsaved(true)` を付ける。
-     * 消えたケースへの完了は数えるだけ
+     * 消えたケースへの完了は数えるだけ。[Stats.recordSaves] の間は、今の区間に予約した完了だけを数え口に入れる（#614。
+     * ケースへは、区間によらずすべての完了を返す）
      */
     internal fun processCompletions() {
         val store = WorldMachineSaves.current ?: return
         for (completion in store.pollCompleted()) {
             val be = completion.pending.tag as? CaseBlockEntity
-            val captureNanos = captureNanosOf.remove(completion.pending) ?: 0L
+            val info = submitOf.remove(completion.pending)
             val result = completion.result
-            if (result != null) Stats.recordSave(be?.blockPos ?: BlockPos.ZERO, captureNanos, result) else Stats.saveFailures++
+            if (Stats.recordSaves && (info == null || info.window != Stats.window)) {
+                Stats.staleCompletions++
+            } else {
+                if (Stats.recordSaves) Stats.windowCompletions++
+                if (result != null) Stats.recordSave(be?.blockPos ?: BlockPos.ZERO, info?.captureNanos ?: 0L, result) else Stats.saveFailures++
+            }
             if (be == null) continue
             val adopted = be.onSaveCompleted(completion)
             if (be.isRemoved) {
@@ -543,6 +600,13 @@ object ServerMachines {
         return ok
     }
 
+    /**
+     * [cases] に、待てば保存の判定が READY に近づく台（[pro.ikili.kibicomputers.core.computer.ComputerCase.isSettlingForSave]）があるか。
+     * アンロードと停止の待ちは、メインスレッドで待つので、再起動の通知を積んだ後の台（起動し直すまでの待ちの間を含む。#635）は
+     * 待っても解けない。待たずに取り出す（`REBOOT_PENDING` の冷えた起動になるのは、待っても変わらない）
+     */
+    internal fun anySettling(cases: List<CaseBlockEntity>): Boolean = cases.any { it.computer.isSettlingForSave }
+
     // ---- チャンクのアンロード ----
 
     private fun onChunkUnload(event: ChunkEvent.Unload) {
@@ -581,7 +645,7 @@ object ServerMachines {
         if (targets.isNotEmpty()) {
             val budget = TimeUnit.MILLISECONDS.toNanos(saveConfig.unloadWaitBudgetMillis)
             val start = System.nanoTime()
-            while (unloadWaitedNanos + (System.nanoTime() - start) < budget && targets.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
+            while (unloadWaitedNanos + (System.nanoTime() - start) < budget && anySettling(targets)) {
                 LockSupport.parkNanos(WAIT_STEP_NANOS)
             }
             unloadWaitedNanos += System.nanoTime() - start
@@ -739,7 +803,7 @@ object ServerMachines {
         val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(saveConfig.stopQuiesceMillis)
-        while (System.nanoTime() < deadline && running.any { it.computer.saveReadiness() == SaveReadiness.TRANSIENT }) {
+        while (System.nanoTime() < deadline && anySettling(running)) {
             LockSupport.parkNanos(WAIT_STEP_NANOS)
         }
         var saved = 0

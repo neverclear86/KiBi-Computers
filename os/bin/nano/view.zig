@@ -313,15 +313,35 @@ fn helpRows() usize {
     return if (rows >= 8) 2 else 0;
 }
 
-/// 状態の行
-fn statusRow() usize {
-    return if (rows >= 2) rows - 1 - helpRows() else 0;
+/// タイトルの行の数（3 行より低い画面では出さず、本文に回す。#623）
+fn titleRows() usize {
+    return if (rows >= 3) 1 else 0;
 }
 
-/// 本文の行の数
+/// 本文の最初の行
+fn textTop() usize {
+    return titleRows();
+}
+
+/// 状態の行（1 行の画面では本文と同じ 0 行目）
+fn statusRow() usize {
+    return rows - 1 - helpRows();
+}
+
+/// 本文の行の数（1 行の画面では、状態の行と分け合う 1 行）
 pub fn textRows() usize {
-    const reserved = 2 + helpRows();
+    const reserved = titleRows() + 1 + helpRows();
     return if (rows > reserved) rows - reserved else 1;
+}
+
+/// 状態の行に出すもの（入力欄か知らせ）がある
+fn statusVisible() bool {
+    return st.mode == .prompt or st.msg().len > 0;
+}
+
+/// 本文の行を状態の行が覆う（1 行の画面で、入力欄か知らせがある）
+fn textCovered() bool {
+    return rows == 1 and statusVisible();
 }
 
 /// 大きさを読み直す（変わっていれば全体を描き直す）
@@ -374,7 +394,7 @@ fn adjustTop() void {
 /// 本文を [d] 行（正なら上へ）動かす
 fn scrollText(d: isize) void {
     const tr = textRows();
-    const first: usize = 1;
+    const first = textTop();
     const n: usize = @abs(d);
     out("\x1b[");
     outNum(first + 1);
@@ -545,15 +565,18 @@ pub fn render() void {
     var cy: usize = 0;
     if (st.mode == .help) {
         shown_top = null;
-        drawTitle();
-        commitRow(0);
+        if (titleRows() > 0) {
+            drawTitle();
+            commitRow(0);
+        }
         const max_top = help_lines.len -| tr;
         if (st.help_top > max_top) st.help_top = max_top;
+        // 状態の行が覆うときは、作ってから捨てないよう、作りもしない
         var y: usize = 0;
-        while (y < tr) : (y += 1) {
+        while (y < tr and !textCovered()) : (y += 1) {
             const i = st.help_top + y;
             if (i < help_lines.len) _ = putSafe(help_lines[i], cols);
-            commitRow(1 + y);
+            commitRow(textTop() + y);
         }
     } else {
         adjustTop();
@@ -564,8 +587,10 @@ pub fn render() void {
             }
         }
         shown_top = st.top_line;
-        drawTitle();
-        commitRow(0);
+        if (titleRows() > 0) {
+            drawTitle();
+            commitRow(0);
+        }
         const cs = buffer.lineStart(st.cur);
         const cc = columnOf(cs, st.cur);
         if (st.want_dirty) {
@@ -574,30 +599,37 @@ pub fn render() void {
         }
         const h = hscrollFor(cc);
         var s: ?usize = st.top;
+        // 状態の行が覆うときは、作ってから捨てないよう、作りもしない
         var y: usize = 0;
-        while (y < tr) : (y += 1) {
+        while (y < tr and !textCovered()) : (y += 1) {
             if (s) |start| {
                 drawLine(start, if (start == cs) h else 0);
                 s = buffer.nextLine(start);
             }
-            commitRow(1 + y);
+            commitRow(textTop() + y);
         }
-        cy = 1 + st.cur_line - st.top_line;
+        cy = textTop() + st.cur_line - st.top_line;
         cx = cc - h;
     }
-    drawStatus();
+    // 1 行の画面では、出すものがないときに状態の行を確定しない（本文を空の行で消さない）。
+    // どの行も 1 回の描画で高々 1 回だけ確定する
+    if (rows > 1 or statusVisible()) {
+        drawStatus();
+        commitRow(statusRow());
+    }
     if (st.mode == .prompt) {
         cy = statusRow();
         cx = @min(prompt_end, cols -| 1);
     }
-    commitRow(statusRow());
     if (helpRows() > 0) {
         drawShortcuts(0);
         commitRow(rows - 2);
         drawShortcuts(1);
         commitRow(rows - 1);
     }
-    if (st.mode == .help) {
+    // 1 行の画面で知らせが本文を覆っている間は、本文の行を描いていないので、
+    // カーソルを置く場所がない（知らせの文字の上に重ねない）。ヘルプと同じく隠す
+    if (st.mode == .help or (textCovered() and st.mode != .prompt)) {
         out("\x1b[?25l");
     } else {
         moveTo(@min(cy, rows - 1), @min(cx, cols - 1));

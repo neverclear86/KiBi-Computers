@@ -132,11 +132,13 @@ internal class Harness(
     moduleLimits: ModuleLimits? = if (execRuntime != null) ModuleLimits.DEFAULT else null,
     /** モジュールの置き場（#82）。既定はメモリ上のもの。[program] で作ったモジュールはここに置く */
     val moduleStore: ModuleStore = MemoryModuleStore(),
+    /** ゲストの再起動で起動し直すまでの待ち（#635） */
+    rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff),
     )
     private var counter = 0
 
@@ -151,12 +153,14 @@ internal class Harness(
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
         memoryBytes: Long? = null,
         maxProcessMemoryBytes: Long? = null,
+        maxDevices: Int? = null,
     ): Machine =
         scheduler.createMachine(
             host ?: MachineHost { m, s, _ -> events += m.id to s },
             MachineConfig.builder().fuelPerTick(fuelPerTick).maxProcesses(maxProcesses).maxHostCallsPerTick(maxHostCallsPerTick).apply {
                 memoryBytes?.let { memoryBytes(it) }
                 maxProcessMemoryBytes?.let { maxProcessMemoryBytes(it) }
+                maxDevices?.let { maxDevices(it) }
             }.build(),
             environment,
         )

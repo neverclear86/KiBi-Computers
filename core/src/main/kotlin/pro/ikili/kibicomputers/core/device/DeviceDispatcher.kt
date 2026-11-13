@@ -59,7 +59,23 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
      * 待たない。投げない（失敗は future の [DeviceCallException]。メインスレッドの呼び出しを止めて取り消したときは
      * `ProcessKilledException`）。ただし直接のメソッドが JVM の続けられないエラーを投げたら、そのまま伝える
      */
-    fun start(pid: Int, address: String, method: String, args: List<DeviceValue>, onRun: (() -> Unit)? = null): Started {
+    fun start(pid: Int, address: String, method: String, args: List<DeviceValue>, onRun: (() -> Unit)? = null): Started =
+        start(pid, resolve(address), method, args, onRun)
+
+    /**
+     * 今 [address] につないでいるデバイス。なければ `null`。[expectedKind] を渡したら、種類が違うものも `null`
+     * （開いたハンドルの種類と、後から同じ address でつないだものの種類が違う。#66）。ロックなしで読む
+     */
+    fun resolve(address: String, expectedKind: String? = null): AttachedDevice? {
+        val device = bus.find(address) ?: return null
+        return if (expectedKind != null && device.kind != expectedKind) null else device
+    }
+
+    /**
+     * 引いておいたデバイス [device]（`null` = 外れている）で、[start] と同じ呼び出しを始める。デバイスを1回だけ引き、呼ぶ側の確かめ
+     * （メインスレッドのメソッドか）と実行に同じものを使うため（#66）
+     */
+    fun start(pid: Int, device: AttachedDevice?, method: String, args: List<DeviceValue>, onRun: (() -> Unit)? = null): Started {
         val argBytes = DeviceLimits.payloadBytes(args)
         val fuel = DeviceLimits.CALL_FUEL + argBytes * DeviceLimits.FUEL_PER_BYTE
         if (args.size > DeviceLimits.MAX_VALUES || argBytes > DeviceLimits.MAX_PAYLOAD_BYTES) {
@@ -68,7 +84,7 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
         if (DeviceLimits.utf8Length(method) > DeviceLimits.MAX_METHOD_BYTES) {
             return Started(failed(CallError.Kernel(Errno.NAMETOOLONG)), fuel)
         }
-        val device = bus.find(address) ?: return Started(failed(CallError.Detached), fuel)
+        if (device == null || !device.attached) return Started(failed(CallError.Detached), fuel)
         val entry = device.methods.find(method) ?: return Started(failed(CallError.NoSuchMethod), fuel)
         val arguments = DeviceArguments(args.toList())
         if (!entry.mainThread) {

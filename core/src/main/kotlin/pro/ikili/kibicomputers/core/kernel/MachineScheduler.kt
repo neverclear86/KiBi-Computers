@@ -14,6 +14,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.Collections
+import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
@@ -60,6 +61,11 @@ public class MachineScheduler private constructor(
     private val notifyQueue = ConcurrentLinkedQueue<Machine>()
     private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
     private val blockingCount = AtomicInteger()
+
+    /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
+    private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
+    private val wakeLock = ReentrantLock()
+    private var wakeSeq = 0L
 
     /** ブロッキング型の専用スレッド（終わるのを待つため） */
     internal val dedicatedThreads: MutableSet<Thread> = Collections.newSetFromMap(ConcurrentHashMap())
@@ -182,12 +188,27 @@ public class MachineScheduler private constructor(
      * メインスレッドから毎 tick 呼ぶ。tick の番号を進めてディスパッチャーに知らせ、
      * 通知のあるマシンだけ [MachineHost] に配る。続けて、ホスト呼び出し（ワールド操作など）を待つマシンだけ、
      * その呼び出しをこのスレッドで実行する（1台あたり [MachineConfig.maxHostCallsPerTick] まで。残りは次の tick）。
-     * 台数によらない（通知と呼び出しの数にだけ比例する）。
+     * 台数によらない（通知と呼び出しの数にだけ比例する）。期限の tick に起こすマシン（再起動の待ち。#635）は、
+     * 期限が来たものだけ起こしてから通知を配る（期限が来ていなければ、列の先頭を見るだけ）。
      */
     public fun tick() {
-        tickCounter.incrementAndGet()
+        val now = tickCounter.incrementAndGet()
         dispatcher.signal()
         val batch = ArrayList<Machine>()
+        // マシンのロックの中で列のロックを取る（wakeAtTick）ので、列のロックを放してからマシンを呼ぶ
+        wakeLock.withLockValue {
+            while (true) {
+                val head = wakeQueue.peek() ?: break
+                if (head.tick > now) break
+                wakeQueue.poll()
+                batch += head.machine
+            }
+        }
+        if (batch.isNotEmpty()) {
+            tickVisitedMachines.addAndGet(batch.size.toLong())
+            for (machine in batch) machine.wakeDeferredReboot()
+            batch.clear()
+        }
         while (true) batch += notifyQueue.poll() ?: break
         tickVisitedMachines.addAndGet(batch.size.toLong())
         for (machine in batch) machine.deliverNotifications()
@@ -252,6 +273,7 @@ public class MachineScheduler private constructor(
         if (closed) return
         closed = true
         machines.values.forEach { it.stop() }
+        wakeLock.withLockValue { wakeQueue.clear() }
         dispatcher.close()
         timerService.close()
         workers.shutdown()
@@ -300,6 +322,21 @@ public class MachineScheduler private constructor(
     internal fun enqueueHostCalls(machine: Machine) {
         hostCallQueue.add(machine)
     }
+
+    /**
+     * [machine] を tick [tick] に起こす（`Machine.wakeDeferredReboot` を、その tick の `tick()` の中、通知を配る前に呼ぶ。#635）。
+     * どのスレッドから呼んでもよい（カーネルロックの中からも。この列のロックは末端）。取り消す口はない:
+     * 起こされた側が、まだ待っているかを自分で確かめる
+     */
+    internal fun wakeAtTick(machine: Machine, tick: Long) {
+        if (closed) return
+        wakeLock.withLockValue { wakeQueue.add(TickWake(tick, wakeSeq++, machine)) }
+    }
+
+    /** 期限の tick に起こす列に入れたマシンの数（テスト用） */
+    internal val pendingTickWakes: Int get() = wakeLock.withLockValue { wakeQueue.size }
+
+    private class TickWake(val tick: Long, val seq: Long, val machine: Machine)
 
     /** ブロッキング型のプロセスの枠を1つ取る。上限なら `false` */
     internal fun tryReserveBlocking(): Boolean {
@@ -355,6 +392,8 @@ internal class SchedulerInternals(
     val timers: TimerService? = null,
     /** モジュールの置き場（#82。テストのメモリ上のもの）。`null` なら [SchedulerConfig.moduleStore] */
     val moduleStore: ModuleStore? = null,
+    /** ゲストの再起動で起動し直すまでの待ち（#635。テストで短い値や [RebootBackoff.NONE] にする） */
+    val rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
 )
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */

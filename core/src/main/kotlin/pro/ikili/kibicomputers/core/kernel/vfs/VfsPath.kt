@@ -40,6 +40,12 @@ internal class VfsPath private constructor(
         return if (prefix.isRoot) this else VfsPath(segments.subList(prefix.segments.size, segments.size).toList())
     }
 
+    /** 先頭の名前を [count] 個落としたパス（[count] は深さ以下。名前は比べない。#606） */
+    fun dropLeading(count: Int): VfsPath {
+        require(count in 0..segments.size) { "$this から $count 個は落とせない" }
+        return if (count == 0) this else VfsPath(segments.subList(count, segments.size).toList())
+    }
+
     /** [other] をこのパスの下に付ける */
     fun append(other: VfsPath): VfsPath = if (other.isRoot) this else VfsPath(segments + other.segments).also { it.checkLength() }
 

@@ -1,0 +1,35 @@
+# sh(1)
+
+## 名前
+
+sh - コマンドのシェル
+
+## 書式
+
+    sh [-eux] [-c command [name [arg...]]]
+    sh [-eux] script [arg...]
+    sh [-eux] [-s] [arg...]
+
+## 説明
+
+POSIX 風のシェルです。パイプライン、リスト、`if`・`while`・`for`・`case`、関数、リダイレクト、ヒアドキュメント、`$(...)`、パラメーター展開、ワイルドカードを使えます。端末では、行の編集・補完（Tab）・履歴（`~/.sh_history`）つきで会話的にコマンドを読みます。
+
+組み込みのコマンド: `:` `.` `eval` `exec` `exit` `export` `readonly` `return` `set` `shift` `unset` `break` `continue` `local` `history` `true` `false` `echo` `printf` `cd` `pwd` `read` `test` `[` `wait` `jobs` `command` `type` `source`。
+
+## オプション
+
+- `-c`: コマンドの文字列を動かす
+- `-e`: コマンドが失敗したら終わる
+- `-u`: 設定されていない変数をエラーにする
+- `-x`: 動かす前にコマンドを書く
+- `-s`: 標準入力からコマンドを読む
+
+## 環境変数
+
+- `PATH`: コマンドを探す場所（既定は `/bin:/sbin`）
+- `HOME`: 引数のない `cd` の行き先
+- `PWD`: 作業ディレクトリ
+
+## 関連項目
+
+intro(7), inittab(5)

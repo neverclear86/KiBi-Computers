@@ -8,6 +8,8 @@ import pro.ikili.kibicomputers.core.device.DeviceDispatcher
 import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.device.DeviceLimits
+import pro.ikili.kibicomputers.core.device.AttachedDevice
+import pro.ikili.kibicomputers.core.device.MethodInfo
 import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.DiskListing
 import pro.ikili.kibicomputers.core.kernel.HostCall
@@ -1271,9 +1273,20 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun invokeDevice(address: String, method: String, args: List<DeviceValue>): List<DeviceValue> {
             checkThread()
+            return invokeResolved(machine.devices.dispatcher.resolve(address), method, args)
+        }
+
+        override fun invokeDevice(fd: Int, method: String, args: List<DeviceValue>): List<DeviceValue> {
+            checkThread()
+            val handle = deviceHandleOf(fd)
+            return invokeResolved(machine.devices.dispatcher.resolve(handle.address, handle.kind), method, args)
+        }
+
+        /** 引いたデバイス [device]（`null` = 外れている）のメソッドを呼んで待つ。デバイスは1回だけ引いて、確かめと実行に同じものを使う */
+        private fun invokeResolved(device: AttachedDevice?, method: String, args: List<DeviceValue>): List<DeviceValue> {
             // メインスレッドのメソッドを待てるのはブロッキング型だけ（積む前に確かめる）
-            if (machine.devices.find(address)?.methods?.find(method)?.mainThread == true) checkMayBlock("invokeDevice")
-            val started = machine.devices.dispatcher.start(rt.pid, address, method, args)
+            if (device?.methods?.find(method)?.mainThread == true) checkMayBlock("invokeDevice")
+            val started = machine.devices.dispatcher.start(rt.pid, device, method, args)
             payDeviceFuel(started.fuel)
             val future = started.future
             if (!future.isDone) {
@@ -1305,6 +1318,32 @@ internal class ProcessRunner(private val machine: Machine) {
             payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj))
             return fd
         }
+
+        override fun startDeviceCall(fd: Int, method: String, args: List<DeviceValue>): Int {
+            checkThread()
+            val (callFd, obj, kind) = lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                val handle = deviceHandleOfLocked(fd)
+                val (callFd, obj) = machine.openPendingDeviceCallLocked(rt.pid, PendingDeviceCall.State.Queued(handle.address, method, args.toList()))
+                Triple(callFd, obj, handle.kind)
+            }
+            payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj, kind))
+            return callFd
+        }
+
+        override fun deviceInfo(fd: Int): DeviceInfo = deviceHandleOf(fd).info
+
+        override fun deviceMethods(fd: Int): List<MethodInfo> {
+            val handle = deviceHandleOf(fd)
+            return machine.devices.dispatcher.resolve(handle.address, handle.kind)?.methodInfos ?: emptyList()
+        }
+
+        /** fd [fd] の device のハンドル（中身は変わらないので、ロックを放してから読んでよい）。device でなければ `FsException(BADF)` */
+        private fun deviceHandleOf(fd: Int): DeviceHandle = lock.withLockValue { deviceHandleOfLocked(fd) }
+
+        private fun deviceHandleOfLocked(fd: Int): DeviceHandle =
+            FdTable(rt.process, machine.kernel.objects, machine.wakeSink).objectOf(fd) as? DeviceHandle
+                ?: fsError(Errno.BADF, "fd $fd は device でない")
 
         override fun takeDeviceCall(fd: Int): CallResult? {
             checkThread()

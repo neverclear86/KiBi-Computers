@@ -1,0 +1,68 @@
+# man(1)
+
+## NAME
+
+man - display manual pages
+
+## SYNOPSIS
+
+    man [-L lang] [section] name...
+    man -k keyword...
+
+## DESCRIPTION
+
+Displays the manual page for each name. Without a section, sections 1, 8, 5 and 7 are searched in this order.
+
+When both standard input and standard output are terminals, a long page is shown one screen at a time. Otherwise the whole page is written without attributes, wrapped at 80 columns.
+
+The language is taken from `-L`, or from the first non-empty of `LC_ALL`, `LC_MESSAGES` and `LANG`. For `ja_JP.UTF-8`, man tries `ja_JP.UTF-8`, `ja_JP`, `ja` and then English. `C`, `POSIX` and an unset value mean English. If a page has no translation, the English page is shown.
+
+## OPTIONS
+
+- `-L lang`: use this language
+- `-k`: search the NAME line of every page for the keywords (case-insensitive)
+
+## KEYS
+
+- `space, f`: next screen (quits at the end)
+- `Enter, j, Down`: next line
+- `k, y, Up`: previous line
+- `b`: previous screen
+- `d, u`: half a screen down or up
+- `g, G`: first or last line
+- `q, Ctrl+C`: quit
+
+## ENVIRONMENT
+
+- `LANG, LC_ALL, LC_MESSAGES`: the language of the pages
+- `MANPATH`: directories to search, separated by `:` (default `/usr/share/man`)
+- `MANWIDTH`: the line width (default: the screen width, or 80)
+
+## FILES
+
+- `/usr/share/man/manN/name.N`: English pages
+- `/usr/share/man/LANG/manN/name.N`: translated pages
+
+## EXIT STATUS
+
+- `0`: success
+- `1`: a page was not found, or `-k` found nothing
+- `2`: usage error
+
+## EXAMPLES
+
+Show this page in Japanese:
+
+    man -L ja man
+
+Use Japanese for every page in this shell:
+
+    export LANG=ja_JP.UTF-8
+
+## NOTES
+
+A page is a small Markdown file. Adding a directory such as `/usr/share/man/fr` adds a language. See `intro(7)`.
+
+## SEE ALSO
+
+intro(7), inittab(5)

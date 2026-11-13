@@ -6,6 +6,7 @@ import java.nio.channels.ClosedChannelException
 import java.nio.channels.FileChannel
 import java.nio.channels.NonWritableChannelException
 import java.nio.file.AccessDeniedException
+import java.nio.file.DirectoryIteratorException
 import java.nio.file.DirectoryNotEmptyException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileSystemException
@@ -54,6 +55,9 @@ internal class DiskFileSystem private constructor(
     private val lease: HostDiskLeases.Lease,
     private val generation: Long,
 ) : FileSystem {
+    /** 名前は大文字小文字を区別しない（[DiskNames.sameName]。ADR 0052。#606） */
+    override val ignoresCase: Boolean get() = true
+
     /** 開いたままのホストのファイル（[refs] は [retain] の数） */
     private class Handle(var channel: FileChannel, var writable: Boolean, var identity: Any?) {
         var refs = 0
@@ -184,8 +188,7 @@ internal class DiskFileSystem private constructor(
         closeHandle(r.node)
         host { Files.delete(hostPath(r.segments)) }
         forget(r.node)
-        usedBytes -= r.attrs.size() + ENTRY_COST
-        usedEntries--
+        releaseUsage(r.attrs.size() + ENTRY_COST)
     }
 
     override fun removeDirectory(path: VfsPath): Unit = io {
@@ -195,8 +198,7 @@ internal class DiskFileSystem private constructor(
         if (r.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         host { Files.delete(hostPath(r.segments)) }
         forget(r.node)
-        usedBytes -= ENTRY_COST
-        usedEntries--
+        releaseUsage(ENTRY_COST)
     }
 
     /**
@@ -242,8 +244,7 @@ internal class DiskFileSystem private constructor(
         forget(old.node)
         if (!leftover) {
             // 退かしたものが残ったときは、その空のディレクトリが見える項目として残るので、古い項目の分は数えたままにする
-            usedBytes -= (if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST
-            usedEntries--
+            releaseUsage((if (old.type == FileType.REGULAR_FILE) old.attrs.size() else 0) + ENTRY_COST)
         }
         relocate(src.segments, old.segments)
         if (old.segments.last() != to.name) {
@@ -580,22 +581,42 @@ internal class DiskFileSystem private constructor(
      * ディレクトリの中身のうち、見せるもの（使える名前の、普通のファイルとディレクトリ）を名前の順に。
      * 大文字小文字だけ違う名前が2つあれば（Linux のホストで外から置いたもの）、名前の順で先のものだけ
      */
-    private fun listVisible(segments: List<String>): List<Pair<String, BasicFileAttributes>> {
-        val dir = hostPath(segments)
-        val names = ArrayList<String>()
-        host {
-            Files.newDirectoryStream(dir).use { stream -> for (p in stream) names += p.fileName.toString() }
-        }
+    private fun listVisible(segments: List<String>): List<Pair<String, BasicFileAttributes>> = host {
+        visibleEntries(hostPath(segments))
+    }
+
+    /**
+     * [listVisible] と [recount] が共有する、見せる項目を選ぶ規則（#433、#607）。ホストの名前 [names] を `String` の自然順に並べ、
+     * そろえると同じ名前（[DiskNames.fold]）のうち、最初の見せるもの（[shown] が属性を返すもの）を1つ選ぶ。
+     * もう選んだ鍵と同じ名前は、[shown] を呼ばずに飛ばす（選ぶ結果は「見せるものかを確かめてから重複を見る」のと同じ）。
+     * [names] は並べ替える
+     */
+    private inline fun pickVisible(
+        names: MutableList<String>,
+        shown: (String) -> BasicFileAttributes?,
+    ): List<Pair<String, BasicFileAttributes>> {
         names.sort()
         val seen = HashSet<String>()
         val out = ArrayList<Pair<String, BasicFileAttributes>>()
         for (name in names) {
-            // 見せるものかを確かめてから重複を見る（[findChild] と同じ「名前の順で最初の見せるもの」）
-            val attrs = visibleAttrs(dir, name) ?: continue
-            if (!seen.add(DiskNames.fold(name))) continue
+            val key = DiskNames.fold(name)
+            if (key in seen) continue
+            val attrs = shown(name) ?: continue
+            seen += key
             out += name to attrs
         }
         return out
+    }
+
+    /**
+     * ディレクトリ [dir] の見せる項目（[pickVisible]）。属性は項目ごとに [visibleAttrs] で読む（候補が重複した名前の分は読まない）。
+     * `host {}` を通さないので、一覧の失敗は素の [IOException]（走査中なら [DirectoryIteratorException]）で出る。
+     * 1項目の属性を読めないときは、[attrsOf] がその項目を見せないもの（`null`）にする
+     */
+    private fun visibleEntries(dir: Path): List<Pair<String, BasicFileAttributes>> {
+        val names = ArrayList<String>()
+        Files.newDirectoryStream(dir).use { stream -> for (p in stream) names += p.fileName.toString() }
+        return pickVisible(names) { visibleAttrs(dir, it) }
     }
 
     /** ディレクトリ [dir] の項目 [name] を見せるなら、その属性（使える名前の、普通のファイルかディレクトリ）。見せないなら `null` */
@@ -803,7 +824,7 @@ internal class DiskFileSystem private constructor(
         var pos = position
         while (buf.hasRemaining()) pos += ch.write(buf, pos)
         val after = ch.size()
-        usedBytes += after - before
+        usedBytes = (usedBytes + after - before).coerceAtLeast(0)
         sizes[node] = after
         return count
     }
@@ -817,7 +838,7 @@ internal class DiskFileSystem private constructor(
             ch.truncate(size)
         }
         val after = ch.size()
-        usedBytes += after - before
+        usedBytes = (usedBytes + after - before).coerceAtLeast(0)
         sizes[node] = after
     }
 
@@ -897,34 +918,84 @@ internal class DiskFileSystem private constructor(
         }
     }
 
-    /** 木をたどって使用量を数え直す（見せないものは数えない） */
+    /**
+     * 木をたどって使用量を数え直す（#607）。数えるのは一覧（[listVisible]）と同じ規則（[pickVisible]）で見せる項目だけで、
+     * 見せないもの（使えない名前、普通のファイル・ディレクトリ以外、大文字小文字だけ違う名前で隠れた側）の下はたどらない。
+     *
+     * 1ディレクトリずつ深さ1の [Files.walkFileTree] で名前と属性を集める。Windows のホストでは、ディレクトリの列挙で得た属性を
+     * そのまま使うので、項目ごとに属性を読み直さない（[visibleEntries] の項目ごとの読み取りは、4,096 項目で約 20 倍遅かった）。
+     * 属性はリンクをたどらない（[attrsOf] と同じ）。深い木でもスタックがあふれないよう、明示的なスタックで1ディレクトリずつたどる
+     * （木全体の名前を一度にメモリへ載せない）。
+     *
+     * 読めないディレクトリはその下を数えずに続け、マウントを失敗させない（そのディレクトリ自身は数える。根が読めなければ 0）。
+     * 1項目の属性を読めないときは、その項目を見せないものとして続ける
+     */
     private fun recount() {
         var bytes = 0L
         var entries = 0
-        Files.walkFileTree(
-            root,
-            object : SimpleFileVisitor<Path>() {
-                override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    if (dir == root) return FileVisitResult.CONTINUE
-                    if (!attrs.isDirectory || !DiskNames.isValid(dir.fileName.toString())) return FileVisitResult.SKIP_SUBTREE
-                    entries++
+        val stack = ArrayDeque<Path>()
+        stack.addLast(root)
+        while (stack.isNotEmpty()) {
+            val dir = stack.removeLast()
+            val found = listWithAttrs(dir) ?: continue
+            val children = pickVisible(ArrayList(found.keys)) { name ->
+                val attrs = found[name]
+                if (attrs != null && DiskNames.isValid(name) && (attrs.isRegularFile || attrs.isDirectory)) attrs else null
+            }
+            for ((name, attrs) in children) {
+                entries++
+                if (attrs.isDirectory) {
                     bytes += ENTRY_COST
-                    return FileVisitResult.CONTINUE
+                    stack.addLast(dir.resolve(name))
+                } else {
+                    bytes += attrs.size() + ENTRY_COST
                 }
-
-                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    if (attrs.isRegularFile && DiskNames.isValid(file.fileName.toString())) {
-                        entries++
-                        bytes += attrs.size() + ENTRY_COST
-                    }
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
-            },
-        )
+            }
+        }
         usedBytes = bytes
         usedEntries = entries
+    }
+
+    /**
+     * [dir] の直下の項目の名前と属性（リンクをたどらない）。ディレクトリを読めなければ `null`。属性を読めない項目は入れない。
+     * 深さ1の [Files.walkFileTree] を使うのは、Windows のホストで列挙の属性をそのまま使えるのがこの API だけだから
+     */
+    private fun listWithAttrs(dir: Path): Map<String, BasicFileAttributes>? {
+        val found = HashMap<String, BasicFileAttributes>()
+        var failed = false
+        try {
+            Files.walkFileTree(
+                dir,
+                emptySet(),
+                1,
+                object : SimpleFileVisitor<Path>() {
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        // 深さ1では、子ディレクトリもここに来る。始点（dir）自身が来るのは、dir がディレクトリでないときだけ
+                        if (file != dir) found[file.fileName.toString()] = attrs
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                        if (file == dir) failed = true
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun postVisitDirectory(d: Path, exc: IOException?): FileVisitResult {
+                        if (exc != null) failed = true
+                        return FileVisitResult.CONTINUE
+                    }
+                },
+            )
+        } catch (e: IOException) {
+            return null
+        }
+        return if (failed) null else found
+    }
+
+    /** 消した項目1つ分（[bytes]）を使用量から引く。数え直しで数えていない項目（外で置かれたもの）もあるので、0 で止める */
+    private fun releaseUsage(bytes: Long) {
+        usedBytes = (usedBytes - bytes).coerceAtLeast(0)
+        usedEntries = (usedEntries - 1).coerceAtLeast(0)
     }
 }
 

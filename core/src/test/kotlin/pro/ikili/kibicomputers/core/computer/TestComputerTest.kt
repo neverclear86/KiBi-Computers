@@ -93,8 +93,8 @@ class TestComputerTest {
             keyboard.input(KeyboardEvent.Paste("os.exit()\n"))
             manager.tickUntil({ "止まらない: ${lines(screen)} ${host.states}" }) { machine.state == MachineState.STOPPED }
             assertTrue(host.failures.isEmpty(), "${host.failures}")
-            // init が終わったので、ケースは電源を切ってマシンを外す（#640）
-            assertEquals(ComputerStatus.OFF, case.status)
+            // init が終わったので、ケースは電源を切ってマシンを外す（#640）。STOPPED を見た tick の後で切るので、切れるまで tick する
+            manager.tickUntil({ "ケースの電源が切れない: ${case.status}" }) { case.status == ComputerStatus.OFF }
             assertEquals(null, case.machine)
 
             // 画面を消して、つなぎを外す
