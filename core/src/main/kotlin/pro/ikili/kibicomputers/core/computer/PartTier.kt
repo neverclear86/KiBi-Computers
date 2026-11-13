@@ -8,7 +8,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
  *
  * 正式なティアは [TIER_1]〜[TIER_4]（#122〜#125）。検証用の [CREATIVE] はいつも最後。
  * 今アイテムとして登録しているのは、正式なティアではディスク（#124）だけ。CPU・RAM の正式な値は #122・#123 で決めるので、
- * 正式なティアの CPU・RAM には今は [MachineConfig.DEFAULT] と同じ値を入れている。
+ * 正式なティアの CPU の燃料と RAM の容量には今は [MachineConfig.DEFAULT] と同じ値を入れている（CPU の接続数 [cpuMaxDevices] は
+ * ティアごとに違い、[TIER_3] だけが [MachineConfig.DEFAULT] の `maxDevices` と同じ。#66）。
  * 性能値はどれも仮の値で、正式な値は #20・#251 で確定する。
  *
  * @property level ティアの番号（正式なティアは 1〜4、[CREATIVE] は 0）

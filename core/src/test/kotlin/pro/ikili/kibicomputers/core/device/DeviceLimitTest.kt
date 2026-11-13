@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.device
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -31,6 +32,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -275,6 +277,24 @@ class DeviceLimitTest {
                 ),
                 got.get(),
             )
+        }
+    }
+
+    @Test
+    fun `引いた後に外れたデバイスは、直接のメソッドでもdetachedで、ハンドラーを呼ばない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val called = AtomicInteger()
+            val methods = DeviceMethods.builder().direct("d") { _, _ -> called.incrementAndGet(); arrayOf(DeviceValue.of(1L)) }.build()
+            assertTrue(m.devices.attach(a, TestDevice(methods)))
+            val device = m.devices.dispatcher.resolve(a, "test:device")
+            assertNotNull(device)
+            assertTrue(m.devices.detach(a))
+            // resolve で引いた後に外れた（device != null && !device.attached）
+            val started = m.devices.dispatcher.start(0, device, "d", emptyList())
+            val error = assertThrows<ExecutionException> { started.future.get() }.cause
+            assertEquals(CallError.Detached, (error as DeviceCallException).error)
+            assertEquals(0, called.get(), "外れたデバイスのハンドラーは呼ばない")
         }
     }
 
