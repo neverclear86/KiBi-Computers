@@ -74,4 +74,35 @@ internal class KernelTestHooks {
      */
     @Volatile
     var duringSpawn: ((Machine, Int) -> Unit)? = null
+
+    /**
+     * spawn が表に足す各段を終えるたびに呼ぶ（カーネルロックの中。段は [SpawnStage]）。例外を投げると、そこまでに足した分が巻き戻される（#629）。
+     * 途中の段（fd が途中まで入った、親のハンドルを保持しただけ、など）での失敗を再現するのに使う
+     */
+    @Volatile
+    var atSpawnStage: ((SpawnStage) -> Unit)? = null
+}
+
+/** spawn が表に足す段（[KernelTestHooks.atSpawnStage]）。段を終えた直後に呼ぶ */
+internal enum class SpawnStage {
+    /** 表（プロセスの表）に足した。オブジェクトはまだない */
+    TABLE,
+
+    /** プロセスのオブジェクトを足した（init なら initPid も） */
+    OBJECT,
+
+    /** 子の fd を1つ割り当てた（割り当てるたびに呼ぶ） */
+    FD,
+
+    /** 親に返すハンドルの参照を足した。fd にはまだ入れていない */
+    HANDLE_RETAINED,
+
+    /** 親に返すハンドルを親の fd 表に入れた */
+    HANDLE,
+
+    /** 実行時の部分を作った。まだ表（runtimes）に足していない */
+    RUNTIME_INIT,
+
+    /** 実行時の部分を表（runtimes）に足した */
+    RUNTIME,
 }

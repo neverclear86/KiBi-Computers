@@ -1234,19 +1234,25 @@ public class Machine private constructor(
                 val p = Process(pid, parentPid, kind, program.hash, !metered, ArrayList(options.args), LinkedHashMap(env), cwd)
                 kernel.processes.add(p)
                 process = p
+                spawnStage(SpawnStage.TABLE)
                 p.objectId = kernel.objects.add(ProcessObject(pid))
                 if (asInit) kernel.initPid = pid
+                spawnStage(SpawnStage.OBJECT)
                 installFdsLocked(FdTable(p, kernel.objects, wakeSink), fdEntries)
                 // 親に返すハンドル（空きは上で確かめた。子の fd に親の fd を写した後なので、子には渡らない）
                 if (withHandle) {
                     kernel.objects.retain(p.objectId)
                     handleRetained = true
+                    spawnStage(SpawnStage.HANDLE_RETAINED)
                     handleFd = FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(p.objectId, HandleRights.READ)
+                    spawnStage(SpawnStage.HANDLE)
                 }
                 val r = ProcessRuntime(this, p, program, driver)
                 runner.initRuntime(r)
+                spawnStage(SpawnStage.RUNTIME_INIT)
                 runtimes[pid] = r
                 rt = r
+                spawnStage(SpawnStage.RUNTIME)
                 if (kind == ProcessKind.BLOCKING) {
                     val t = KernelThread("KiBi-m$id-p$pid", scheduler.config.threadStackBytes) { runner.runBlocking(r) }
                     r.dedicatedThread = t
@@ -1325,6 +1331,11 @@ public class Machine private constructor(
         if (reserved) scheduler.releaseBlocking()
         // awaitTermination で待っている側を起こす（状態は変えないので、checkAllDoneLocked は呼ばない）
         if (kernel.processes.liveCount() == 0 && registeredThreads == 0) terminated.signalAll()
+    }
+
+    /** テスト用のフック（[KernelTestHooks.atSpawnStage]）を呼ぶ */
+    private fun spawnStage(stage: SpawnStage) {
+        scheduler.hooks.atSpawnStage?.invoke(stage)
     }
 
     private inline fun rollbackStep(cause: Throwable, block: () -> Unit) {
@@ -1737,6 +1748,7 @@ public class Machine private constructor(
                     is PendingFd.NewObject -> HandleEntry(kernel.objects.add(p.obj).also { created += it }, rights = p.rights)
                 }
                 fds.installAt(fd, entry)
+                spawnStage(SpawnStage.FD)
             }
         } finally {
             for (id in created) kernel.objects.release(id, wakeSink)
