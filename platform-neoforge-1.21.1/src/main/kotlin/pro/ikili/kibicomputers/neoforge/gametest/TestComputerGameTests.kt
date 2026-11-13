@@ -462,7 +462,11 @@ object TestComputerGameTests {
 
     /**
      * マシンが自分で止まった（ゲストが止めた）ら、ケースはマシンを外して OFF にし、結線も外れる（#640）。その後に画面を置き直しても、
-     * 止まったマシンにはつながず、キーボードも取らない（#535）
+     * 止まったマシンにはつながず、キーボードも取らない（#535）。
+     *
+     * 起動し終えてから止める（#633）。起動の途中の [pro.ikili.kibicomputers.core.kernel.Machine.stop] は起動の取り消しになり、
+     * 起動用のスレッドで起動の後始末が走るまで起動中の扱いのまま残る。STOPPED の通知も出ないので、ケースはマシンを持ち続け、
+     * 置いた画面をつなぎうる（本番で外から起動の途中に `stop()` を呼ぶ道はない。ADR 0085）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -474,9 +478,10 @@ object TestComputerGameTests {
         helper.assertTrue(keyboard.owner == null, "breaking the screen should free the keyboard")
         var stopped = false
         var placedTicks = -1
+        var attachedBefore = 0
         helper.succeedWhen {
             if (!stopped) {
-                // 起動の途中で止めると起動の取り消しになる（ゲストの停止ではない。#641 の範囲）ので、起動し終えてから止める
+                // 起動の途中で止めると起動の取り消しになる（ゲストの停止ではない。#641・#633）ので、起動し終えてから止める
                 helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "machine should finish booting")
                 // ゲストが止めたのと同じく、電源を入れたまま、マシンだけが止まる
                 machine.stop()
@@ -488,6 +493,7 @@ object TestComputerGameTests {
                 helper.assertTrue(case.computer.machine == null, "the case should release the stopped machine")
                 helper.assertTrue(!case.computer.poweredOn, "the case should not stay powered on")
                 helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should be disconnected")
+                attachedBefore = case.wiring.screenAttachCount
                 helper.setBlock(
                     SCREEN,
                     KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
@@ -497,6 +503,11 @@ object TestComputerGameTests {
             helper.assertTrue(case.wiring.connectedScreen == null, "the stopped machine should not take the screen")
             helper.assertTrue(keyboard.owner == null, "the stopped machine should not take the keyboard")
             helper.assertTrue(case.wiring.connectedMachine == null, "the wiring should stay disconnected")
+            // tick の終わりの状態だけでは、一時的につないですぐ外れたものが見えない。つないだ回数で確かめる（#633）
+            helper.assertTrue(
+                case.wiring.screenAttachCount == attachedBefore,
+                "the screen should never have been attached to the stopped machine (${case.wiring.screenAttachCount - attachedBefore} attach)",
+            )
             helper.assertTrue(++placedTicks > 3, "watch for a few ticks after placing")
             helper.setBlock(CASE, Blocks.AIR)
         }
