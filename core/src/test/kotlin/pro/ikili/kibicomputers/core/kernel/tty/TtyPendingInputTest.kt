@@ -253,5 +253,102 @@ class TtyPendingInputTest {
         assertEquals(0, t.pendingInputBytes)
     }
 
+    @Test
+    fun `列から入れるときも、次の多バイト文字が空きに入らなければ文字の境目で止まる`() {
+        val t = rawTty(input = 8)
+        t.paste("abcdefg" + "あい")
+        assertEquals(7, t.inputAvailable, "「あ」は空き 1 に入らないので待つ")
+        assertEquals(6, t.pendingInputBytes)
+        // 1バイト読むと空きは 2。まだ「あ」（3バイト）は入らない
+        assertEquals("a", t.readBytes(1)!!.decodeToString())
+        assertEquals(6, t.inputAvailable)
+        assertEquals(6, t.pendingInputBytes, "文字の途中までは入れない")
+        // もう 1バイト読むと空きは 3。「あ」だけが入る
+        assertEquals("b", t.readBytes(1)!!.decodeToString())
+        assertEquals(8, t.inputAvailable)
+        assertEquals(3, t.pendingInputBytes)
+        assertEquals("cdefgあい", t.readAll(1).decodeToString())
+    }
+
+    @Test
+    fun `canonicalでエスケープシーケンスの途中のESCは、行に入る場所が空くまで待ち、捨てずに行に入る`() {
+        for (prefix in listOf("\u001b[", "\u001bO")) {
+            val t = tty(input = 8)
+            t.key("ab\n")
+            t.key("cdef")
+            // 行はいっぱい（入力 3 + 行 4 + 確定の 1 バイト）
+            t.key(prefix)
+            t.paste("\u001b")
+            assertEquals(1, t.pendingInputBytes, "ESC は行に入るので、空きを待つ")
+            assertEquals("ab\n", t.readAll().decodeToString())
+            assertEquals(0, t.pendingInputBytes)
+            t.key("\r")
+            assertEquals("cdef\u001b\n", t.readAll().decodeToString(), "シーケンスをやめた ESC は行に残る")
+            assertEquals(0, t.droppedInputBytes)
+        }
+    }
+
+    @Test
+    fun `canonicalでESCの次を待っているとき、ESCが行に入る分も見て入れるかを決める`() {
+        val t = tty(input = 8)
+        t.key("a\n")
+        t.key("cd")
+        t.key("\u001b")
+        // 行の空きは 3。「あ」（3バイト）だけなら入るが、ESC が行に入る分の 1 が足りない
+        t.paste("あ")
+        assertEquals(3, t.pendingInputBytes)
+        assertEquals("a\n", t.readAll().decodeToString())
+        t.key("\r")
+        assertEquals("cd\u001bあ\n", t.readAll().decodeToString())
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `canonicalでESCの次を待っているとき、ESCがまた来ると場所を使う`() {
+        val t = tty(input = 8)
+        t.key("ab\n")
+        t.key("cdef")
+        t.key("\u001b")
+        t.paste("\u001b")
+        assertEquals(1, t.pendingInputBytes)
+        assertEquals("ab\n", t.readAll().decodeToString())
+        t.key("\r")
+        assertEquals("cdef\u001b\u001b\n", t.readAll().decodeToString())
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `1バイトの消去は場所を使わないので、列の先頭に来たら行がいっぱいでも待たずに効く`() {
+        val t = tty(input = 8)
+        t.key("ab\n")
+        t.key("cdef")
+        // 行がいっぱいで読める入力もあるので、文字は待ち、後の Backspace も打った順に効かせるため列の後ろに積む
+        t.paste("x")
+        t.key("\u007f")
+        assertEquals(2, t.pendingInputBytes)
+        assertEquals("a", t.readBytes(1)!!.decodeToString())
+        // 空き 1 に x が入って行がいっぱいになるが、Backspace は場所を使わないのでそのまま効く
+        assertEquals(0, t.pendingInputBytes)
+        t.key("\r")
+        assertEquals("b\n", t.readBytes()!!.decodeToString())
+        assertEquals("cdef\n", t.readBytes()!!.decodeToString())
+        assertEquals(0, t.droppedInputBytes)
+    }
+
+    @Test
+    fun `rawで列に積んだCtrl+Cは、signalsありのモードに切り替えた後もデータとして入る`() {
+        val t = rawTty(input = 4)
+        t.paste("abcdefgh")
+        val r = t.key("\u0003")
+        assertTrue(r.signals.isEmpty())
+        assertEquals(9, t.pendingInputBytes + t.inputAvailable)
+        t.setMode(cbreak, sink)
+        val got = StringBuilder()
+        while (true) got.append(t.readBytes(1)?.decodeToString() ?: break)
+        assertEquals("abcdefgh\u0003", got.toString())
+        assertEquals(0, t.pendingInputBytes)
+        assertEquals(0, t.droppedInputBytes)
+    }
+
     private fun Tty.out(): String = drainOutput(sink)?.toString(Charsets.UTF_8) ?: ""
 }

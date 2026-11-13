@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.device
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
@@ -46,6 +47,33 @@ class KeyboardDeviceTest {
                 assertEquals(MachineLimits.CONSOLE_INPUT_BYTES, tty.inputAvailable)
                 assertEquals(6000 - MachineLimits.CONSOLE_INPUT_BYTES, tty.pendingInputBytes)
                 assertEquals(0L, tty.droppedInputBytes)
+            }
+        }
+    }
+
+    @Test
+    fun `文字の入力は分けてよい入力として、キーは分けない入力として渡す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val keyboard = KeyboardDevice()
+            m.devices.attach(KEYBOARD_ADDRESS, keyboard)
+            m.lock.withLock { m.consoleTtyLocked().setMode(TtyMode.RAW, m.wakeSink) }
+            // 入力をいっぱいにする
+            assertEquals(MachineLimits.CONSOLE_INPUT_BYTES, keyboard.input(KeyboardEvent.Paste("p".repeat(MachineLimits.CONSOLE_INPUT_BYTES))))
+            // キー（エスケープシーケンス）は分けない入力なので、入らなければ捨てる
+            assertEquals(0, keyboard.input(KeyboardEvent.KeyDown(Key.UP, 0, false)))
+            val dropped = m.lock.withLock {
+                val tty = m.consoleTtyLocked()
+                assertEquals(0, tty.pendingInputBytes)
+                tty.droppedInputBytes
+            }
+            assertTrue(dropped > 0)
+            // 文字の入力は分けてよい入力なので、入らなければ待ちの列に積んで、捨てない
+            assertEquals(1, keyboard.input(KeyboardEvent.Text("x")))
+            m.lock.withLock {
+                val tty = m.consoleTtyLocked()
+                assertEquals(1, tty.pendingInputBytes)
+                assertEquals(dropped, tty.droppedInputBytes)
             }
         }
     }

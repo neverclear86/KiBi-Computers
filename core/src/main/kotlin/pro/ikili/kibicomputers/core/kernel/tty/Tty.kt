@@ -153,12 +153,13 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
     }
 
     /**
-     * 接続層からのキー入力。モードに従って全部処理する（途中で止めない）。エコーは出力に積む。
+     * 接続層からのキー入力。モードに従って処理する。エコーは出力に積む。[splittable] でない入力は全部処理する（途中で止めない）。
      *
      * [splittable] は、UTF-8 の文字の境目で分けて入れてよい入力（貼り付け。#609）。入りきらず、プロセスが読めば空く
      * （読める入力がある）ときは、入った文字の後ろから残りを待ちの列に積み、[read] で空いたら続きを入れる。
      * 待ちの列が空でない間は、後から来た入力も順番を保つために列の後ろに積む（シグナルのバイトを含む入力は除く。
-     * シグナルは今の入力と一緒に待ちの列も捨てる）。列にも入らない分は捨てて数える
+     * シグナルは今の入力と一緒に待ちの列も捨てる）。列にも入らない分は捨てて数える。
+     * 列があるときは消去のキーも列の後ろに積むので、列の先頭が入るまで効かない（打った順に効かせるため）
      */
     fun input(src: ByteArray, off: Int, len: Int, sink: WakeSink, splittable: Boolean = false): TtyInputResult {
         require(off >= 0 && len >= 0 && off + len <= src.size) { "src の範囲外" }
@@ -379,7 +380,9 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                 for (j in 0 until k) processByte(buf[j].toInt() and 0xFF)
             } else {
                 val n = -v
-                if (!fitsWhole(n) && readable) break
+                // 1バイトのキー（消去など）は、場所を使わないものを待たせない。それより長いかたまりは全部入る空きを待つ
+                val fits = if (n == 1) fitsByte(pending[0].toInt() and 0xFF) else fitsWhole(n)
+                if (!fits && readable) break
                 val bytes = ByteArray(n)
                 pending.take(bytes, 0, n)
                 pendingChunks.removeFirst()
@@ -469,11 +472,16 @@ internal class Tty(val inputCapacity: Int, val outputCapacity: Int) : KernelObje
                 LEFT_BRACKET, LETTER_O -> true
                 else -> charRoom() >= 1 + (if (usesRoom(b)) 1 else 0)
             }
-            ESC_CSI -> if (b in 0x20..0x7E) true else fitsPlain(b)
-            ESC_SS3 -> if (b in 0x40..0x7E) true else fitsPlain(b)
+            // シーケンスの途中で終わりのバイトでも続きのバイトでもないものが来ると、シーケンスをやめて [canonicalInput] で扱う。
+            // ESC もそのまま行に入る（新しいシーケンスは始まらない）ので、場所を使う
+            ESC_CSI -> if (b in 0x20..0x7E) true else fitsAfterAbort(b)
+            ESC_SS3 -> if (b in 0x40..0x7E) true else fitsAfterAbort(b)
             else -> fitsPlain(b)
         }
     }
+
+    /** エスケープシーケンスをやめた直後の1バイトが（[canonicalInput] で普通に扱われて）捨てずに入るか。ESC は行に入るので場所を使う */
+    private fun fitsAfterAbort(b: Int): Boolean = if (b == ESC) charRoom() >= 1 else fitsPlain(b)
 
     /** エスケープシーケンスの外の1バイトが、canonical で捨てずに入るか */
     private fun fitsPlain(b: Int): Boolean = when {
