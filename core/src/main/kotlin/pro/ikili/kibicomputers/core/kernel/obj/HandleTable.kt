@@ -1,7 +1,8 @@
 package pro.ikili.kibicomputers.core.kernel.obj
 
 /**
- * ハンドル表（番号 → エントリ）。p1 の fd 表も、Component Model の resource ハンドル表（#265）も、この一種にする。
+ * ハンドル表（番号 → エントリ）。p1 の fd 表に使う。Component Model の resource のハンドル表は、番号の振り方（1 から振り、
+ * 空きは最後に空いたものから使う）がゲストから見える仕様で違うので、別の型（`ResourceTable`。#265・ADR 0265）にした。
  *
  * 新しいハンドルには、いちばん小さい空き番号を使う。表は小さい配列（8）から倍に広げ、[limit] を超えない。
  */

@@ -93,7 +93,7 @@ lift・lower は型の深さだけ再帰する。上限は `CanonLimits.MAX_TYPE
 - error-context、長さ固定の list、map、GC の option（今の検証の機能では通らないので、来たら断る）
 - 引けない型（上の範囲の外）と、それを使う型
 
-own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。識別子はその添字空間の中でだけ意味を持つので、別の空間の型どうし（ゲストの型とホストが宣言した型など）を `CanonType.sameShape` で比べるときは、リンク（#263）が import の解決から作った resource の対応（`CanonResourceMatch`）を渡す。1 つの空間の中だけなら `CanonResourceMatch.SAME_SPACE`（番号が同じなら同じ）で比べる。比べる側に対応を渡させるため、既定の値は置かない。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作る（ADR 0260 の「保存できる形」で設計するため、ここでは作らない）。
+own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。識別子はその添字空間の中でだけ意味を持つので、別の空間の型どうし（ゲストの型とホストが宣言した型など）を `CanonType.sameShape` で比べるときは、リンク（#263）が import の解決から作った resource の対応（`CanonResourceMatch`）を渡す。1 つの空間の中だけなら `CanonResourceMatch.SAME_SPACE`（番号が同じなら同じ）で比べる。比べる側に対応を渡させるため、既定の値は置かない。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作った（ADR 0265。`LinkedComponent` がインスタンスごとに持つ）。
 
 ### 失敗の扱い
 

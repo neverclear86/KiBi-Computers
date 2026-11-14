@@ -341,26 +341,6 @@ class ComponentLinkTest {
     }
 
     @Test
-    fun `resourceのcanonは呼ぶとトラップする`() {
-        val p = load(
-            """
-            (component
-              (type ${'$'}r (resource (rep i32)))
-              (core func ${'$'}new (canon resource.new ${'$'}r))
-              (core module ${'$'}m
-                (import "x" "new" (func ${'$'}n (param i32) (result i32)))
-                (func (export "run") (result i32) (call ${'$'}n (i32.const 1))))
-              (core instance ${'$'}xi (export "new" (func ${'$'}new)))
-              (core instance ${'$'}i (instantiate ${'$'}m (with "x" (instance ${'$'}xi))))
-              (func (export "run") (result u32) (canon lift (core func ${'$'}i "run"))))
-            """,
-        )
-        instantiate(p).use { c ->
-            assertTrue(assertThrows<WasmTrapException> { c.call("run") }.message!!.contains("#265"))
-        }
-    }
-
-    @Test
     fun `coreモジュールの関数の本体はEndiveが検証する`() {
         val bytes = wat("""(component (core module (func (result i32))))""")
         assertNotNull(ComponentLoader.load(bytes, policy = ANY_IMPORT))

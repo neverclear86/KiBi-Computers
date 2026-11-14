@@ -31,7 +31,7 @@ internal object LinkTesting {
 
     fun fn(params: List<CanonType>, result: CanonType?): CanonFunction = CanonFunction(params, result)
 
-    fun host(name: String, vararg functions: Pair<String, HostFunction>, resources: Map<String, Int> = emptyMap()): HostInterface =
+    fun host(name: String, vararg functions: Pair<String, HostFunction>, resources: Map<String, HostResource> = emptyMap()): HostInterface =
         HostInterface(name, functions.toMap(), resources)
 
     fun u32(v: Int): CanonValue = CanonValue.I32(v)
