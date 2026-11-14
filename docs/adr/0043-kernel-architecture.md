@@ -8,7 +8,7 @@
 ## 決めたこと（要約）
 
 - カーネルの単位は「マシン（コンピューター1台）」。マシンは `KernelState`（プロセス表・オブジェクト表・燃料）を1つ持つ。1プロセス = 1 WASM インスタンス（Component Model では、手持ちを持つコアインスタンスは1つ）
-- p1・p2・p3 で共有する土台は `KernelObject`（オブジェクトIDと参照カウント）、`HandleTable`（fd と resource ハンドルの共通の形）、待ち（`WaitKey` / `WaitRegistry` / `WaitSet`）、`ByteStream` の4つ。ABI 層は `ProcessDriver` を実装して、その上に乗る
+- p1・p2・p3 で共有する土台は `KernelObject`（オブジェクトIDと参照カウント）、`HandleTable`（fd の表。Component Model の resource のハンドル表は、番号の振り方が違うので別の型にした。ADR 0265）、待ち（`WaitKey` / `WaitRegistry` / `WaitSet`）、`ByteStream` の4つ。ABI 層は `ProcessDriver` を実装して、その上に乗る
 - プロセスの動き方は `BLOCKING`（ホスト関数の中で止まる）と `WAIT_POINT`（export から戻って待つ）の2種類。保存できるのは `WAIT_POINT` で待っているときだけ
 - スレッドは WASM のスタックがあるあいだだけ持つ。ブロッキング型は専用スレッド（サーバー全体の上限あり）、待機点型は共有のワーカーで step を動かし、待機点と step の境目ではスレッドを持たない
 - 燃料の正はマシンの `KernelState.fuel`。CPU を取るときに遅延補充し（tick ごとに配るのと同じ値の閉じた式）、`tick()` は台数によらない

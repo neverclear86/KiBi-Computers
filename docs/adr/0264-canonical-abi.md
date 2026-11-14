@@ -2,12 +2,12 @@
 
 - 状態: 採用
 - Issue: #264（Epic #259）。前提は ADR 0260（Component Model は `core` に自前で実装）、ADR 0262（コンポーネントの読み込みと検証）、ADR 0073（`kibi:*` の WIT と p1 の import。`cabi_realloc` の呼び方）、ADR 0306（書き先は書くときに確かめる）
-- 後続: #263（リンクと exec）、#265（resource のハンドル表）、#266（非同期・stream・future）、#270（インスタンスをまたぐ燃料）、#616（`spawn` の検査の順）、#267（`wasi:io/poll`・`wasi:clocks` などの p2）、#685（`kibi:*` の p2 の interface と仮置きの WIT の確定）、#251（仮の値の確定）
+- 後続: #263（リンク）、#687（exec）、#265（resource のハンドル表）、#266（非同期・stream・future）、#270（インスタンスをまたぐ燃料）、#616（`spawn` の検査の順）、#267（`wasi:io/poll`・`wasi:clocks` などの p2）、#685（`kibi:*` の p2 の interface と仮置きの WIT の確定）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 
 ## 背景
 
-Component Model の値（数値・char・string・list・record・tuple・variant・enum・option・result・flags・own・borrow）を、core の値と線形メモリの間で受け渡す部品が要る（Canonical ABI の lift と lower）。#262 で読み込みと検証はできたが、exec はリンク（#263）で行うので、#264 ではリンクから呼ぶ部品と、その単体テストまでにする。
+Component Model の値（数値・char・string・list・record・tuple・variant・enum・option・result・flags・own・borrow）を、core の値と線形メモリの間で受け渡す部品が要る（Canonical ABI の lift と lower）。#262 で読み込みと検証はできたが、実行にはリンク（#263）が要る（exec につなぐのは #687）ので、#264 ではリンクから呼ぶ部品と、その単体テストまでにする。
 
 ## 決定
 
@@ -93,7 +93,7 @@ lift・lower は型の深さだけ再帰する。上限は `CanonLimits.MAX_TYPE
 - error-context、長さ固定の list、map、GC の option（今の検証の機能では通らないので、来たら断る）
 - 引けない型（上の範囲の外）と、それを使う型
 
-own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。識別子はその添字空間の中でだけ意味を持つので、別の空間の型どうし（ゲストの型とホストが宣言した型など）を `CanonType.sameShape` で比べるときは、リンク（#263）が import の解決から作った resource の対応（`CanonResourceMatch`）を渡す。1 つの空間の中だけなら `CanonResourceMatch.SAME_SPACE`（番号が同じなら同じ）で比べる。比べる側に対応を渡させるため、既定の値は置かない。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作る（ADR 0260 の「保存できる形」で設計するため、ここでは作らない）。
+own・borrow の resource は、その resource を定義・import した型の添字を識別子にする。識別子はその添字空間の中でだけ意味を持つので、別の空間の型どうし（ゲストの型とホストが宣言した型など）を `CanonType.sameShape` で比べるときは、リンク（#263）が import の解決から作った resource の対応（`CanonResourceMatch`）を渡す。1 つの空間の中だけなら `CanonResourceMatch.SAME_SPACE`（番号が同じなら同じ）で比べる。比べる側に対応を渡させるため、既定の値は置かない。ハンドルの lift・lower は `CanonResources` に任せ、ハンドル表は #265 が作った（ADR 0265。`LinkedComponent` がインスタンスごとに持つ）。
 
 ### 失敗の扱い
 

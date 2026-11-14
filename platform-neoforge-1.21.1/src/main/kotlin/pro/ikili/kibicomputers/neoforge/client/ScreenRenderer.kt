@@ -27,7 +27,7 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 /**
  * 画面ブロックの正面に、画面バッファの中身を描く（#139）。
  *
- * 描く順（奥から）: 画面の地（黒）→ ピクセル画面（3段目で、使われているときだけ）→ 文字の背景 → 文字。
+ * 描く順（奥から）: 画面の地（黒。正面の枠の内側全体を塗り、中身の外の余白にテクスチャが透けないようにする。#714）→ ピクセル画面（3段目で、使われているときだけ）→ 文字の背景 → 文字。
  * 既定の背景色（黒）のセルは地と同じなので描かず、ピクセル画面が透けて見える。
  *
  * 負荷を下げるために、次のことをする。
@@ -60,7 +60,7 @@ class ScreenRenderer(context: BlockEntityRendererProvider.Context) : BlockEntity
         val h = layout.contentHeight.toFloat()
 
         val quads = bufferSource.getBuffer(RenderType.textBackground())
-        quad(quads, pose, 0f, 0f, w, h, Z_BASE, TextBuffer.DEFAULT_BACKGROUND)
+        quad(quads, pose, layout.innerLeft, layout.innerTop, layout.innerRight, layout.innerBottom, Z_BASE, TextBuffer.DEFAULT_BACKGROUND)
         if (be.hasPixels) be.pixels?.let { drawPixels(be, it, pose, bufferSource, w, h) }
         // 別の描画の種類のバッファを取ると前のバッファは使えなくなるので、取り直す
         val backgrounds = bufferSource.getBuffer(RenderType.textBackground())

@@ -22,9 +22,17 @@ import pro.ikili.kibicomputers.core.runtime.component.link.HostFunction
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
 import java.util.concurrent.atomic.AtomicInteger
+import org.junit.jupiter.api.Assertions.assertNull
+import pro.ikili.kibicomputers.core.kernel.process.KillResult
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import java.time.Duration
+import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** コンポーネントのプロセス（#263）: カーネルの中でリンクし、core インスタンスをまたいで動かす */
+/** コンポーネントのプロセス（#263）: カーネルの中でリンクし、core インスタンスをまたいで動かす。読み込みの途中の失敗（#692）も確かめる */
 class ComponentProcessTest {
+    private val limit = Duration.ofSeconds(60)
     private val pids = AtomicInteger(-1)
     private val hostCalls = AtomicInteger()
 
@@ -134,6 +142,112 @@ class ComponentProcessTest {
             assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
             assertEquals(ProcessState.CRASHED, rt.process.state)
             assertTrue(rt.lastError is IllegalStateException, "${rt.lastError}")
+        }
+    }
+
+    /**
+     * 1 つ目の core モジュール: メモリに書き込む（RAM は書き込んだ区画で数える。#407）。[start] は 2 つ目の start 関数の本体
+     * （`$mark` を呼ぶと [marks] が増える。2 つ目のインスタンスを作ったかどうかが分かる）
+     */
+    private fun failingLoad(start: String, firstStart: String = "") = """
+        (component
+          (import "test:host/kernel" (instance ${'$'}h (export "die" (func)) (export "mark" (func))))
+          (alias export ${'$'}h "die" (func ${'$'}die))
+          (alias export ${'$'}h "mark" (func ${'$'}mark))
+          (core func ${'$'}die_lower (canon lower (func ${'$'}die)))
+          (core func ${'$'}mark_lower (canon lower (func ${'$'}mark)))
+          (core module ${'$'}a
+            (import "host" "die" (func ${'$'}die))
+            (memory (export "mem") 1)
+            (data (i32.const 0) "hello")
+            (func ${'$'}s (i32.store (i32.const 8192) (i32.const 1)) $firstStart)
+            (start ${'$'}s))
+          (core instance ${'$'}hi (export "die" (func ${'$'}die_lower)) (export "mark" (func ${'$'}mark_lower)))
+          (core instance ${'$'}ia (instantiate ${'$'}a (with "host" (instance ${'$'}hi))))
+          (core module ${'$'}b
+            (import "host" "mark" (func ${'$'}mark))
+            (func ${'$'}s $start)
+            (start ${'$'}s))
+          (core instance ${'$'}ib (instantiate ${'$'}b (with "host" (instance ${'$'}hi)))))
+    """
+
+    private val dies = AtomicInteger()
+    private val marks = AtomicInteger()
+
+    /** ホストの関数 `test:host/kernel.die`（呼んだプロセスを自分で kill する） */
+    private val dieHost = ComponentHost.of(
+        LinkTesting.host(
+            "test:host/kernel",
+            "die" to HostFunction(LinkTesting.fn(emptyList(), null)) { call, _ ->
+                dies.incrementAndGet()
+                val ctx = (call.env as KernelLinkEnv).ctx
+                assertEquals(KillResult.DELIVERED, ctx.kill(ctx.pid, KillSignal.TERMINATE))
+                null
+            },
+            "mark" to HostFunction(LinkTesting.fn(emptyList(), null)) { _, _ ->
+                marks.incrementAndGet()
+                null
+            },
+        ),
+    )
+
+    private val startTraps by lazy { Program.component(LinkTesting.load(failingLoad("unreachable"), dieHost, metered = true)) }
+    private val startSpins by lazy { Program.component(LinkTesting.load(failingLoad("(loop ${'$'}l (br ${'$'}l))"), dieHost, metered = true)) }
+    private val killsItself by lazy { Program.component(LinkTesting.load(failingLoad("(call ${'$'}mark)", firstStart = "(call ${'$'}die)"), dieHost, metered = true)) }
+
+    /** 読み込みの途中で終わったプロセスが、作ったものをみな返したこと */
+    private fun assertCleanedUp(m: Machine, rt: ProcessRuntime, before: Long) {
+        assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
+        assertEquals(before, m.memoryAccount.usedBytes, "マシンの RAM を返す")
+        assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
+        lockedCheck(m) {
+            assertTrue(rt.instances.isEmpty(), "作った core インスタンスを閉じる")
+            assertNull(rt.component)
+        }
+    }
+
+    private fun lockedCheck(m: Machine, block: () -> Unit) = m.lock.withLockValue { block() }
+
+    @Test
+    fun `2つ目のcoreインスタンスのstart関数がトラップしたら、プロセスだけがCRASHEDになり作ったものを返す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            val before = m.memoryAccount.usedBytes
+            val rt = m.spawnRt(startTraps, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
+            h.tickUntilTrue("終わらない") { rt.process.state.isTerminal || m.state == MachineState.CRASHED }
+            assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
+            assertTrue(rt.lastError is WasmTrapException, "${rt.lastError}")
+            assertCleanedUp(m, rt, before)
+        }
+    }
+
+    @Test
+    fun `作る途中で燃料を待っているところをkillすると、KILLEDになり作ったものを返す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 2_000)
+            val before = m.memoryAccount.usedBytes
+            val rt = m.spawnRt(startSpins, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
+            h.tickUntilTrue("燃料待ちにならない: ${rt.process.state}") { rt.process.state == ProcessState.WAITING_FUEL }
+            assertTrue(m.memoryAccount.usedBytes > before, "1 つ目のインスタンスが書き込んだ分を数えている")
+            assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(rt.process.pid, KillSignal.TERMINATE) })
+            h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
+            assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
+            assertCleanedUp(m, rt, before)
+        }
+    }
+
+    @Test
+    fun `インスタンスを作る間にkillされたら、KILLEDになり作ったものを返す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            val before = m.memoryAccount.usedBytes
+            val rt = m.spawnRt(killsItself, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
+            h.tickUntilTrue("終わらない") { rt.process.state.isTerminal || m.state == MachineState.CRASHED }
+            assertEquals(1, dies.get())
+            assertEquals(0, marks.get(), "kill の印を見て、2 つ目のインスタンスを作らずに止まる")
+            // 1 つ目の start の中で kill した。作り終えた直後に印を見て止める（割り込みでトラップしても CRASHED にはしない）
+            assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
+            assertCleanedUp(m, rt, before)
         }
     }
 }

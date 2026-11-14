@@ -16,6 +16,10 @@ import org.jetbrains.annotations.ApiStatus
  * @property scale フォントの 1 単位が、ブロックの単位でいくつになるか
  * @property offsetX 正面の左端から中身の左端までの長さ（ブロックの単位）
  * @property offsetY 正面の上端から中身の上端までの長さ（ブロックの単位）
+ * @property innerLeft 正面の枠の内側（余白 margin を除いた範囲。中身の外の余白も含む）の左端。フォントの単位で、中身の左上が原点
+ * @property innerTop 正面の枠の内側の上端（フォントの単位。中身の左上が原点で、y は下向き）
+ * @property innerRight 正面の枠の内側の右端（フォントの単位）
+ * @property innerBottom 正面の枠の内側の下端（フォントの単位）
  */
 @ApiStatus.Internal
 public class ScreenLayout private constructor(
@@ -24,6 +28,10 @@ public class ScreenLayout private constructor(
     @JvmField public val scale: Float,
     @JvmField public val offsetX: Float,
     @JvmField public val offsetY: Float,
+    @JvmField public val innerLeft: Float,
+    @JvmField public val innerTop: Float,
+    @JvmField public val innerRight: Float,
+    @JvmField public val innerBottom: Float,
 ) {
     /** 中身の幅（フォントの単位）。 */
     public val contentWidth: Int
@@ -69,7 +77,18 @@ public class ScreenLayout private constructor(
             val scale = minOf(innerWidth / (columns * CELL_WIDTH), innerHeight / (rows * CELL_HEIGHT))
             val offsetX = (faceWidth - columns * CELL_WIDTH * scale) / 2
             val offsetY = (faceHeight - rows * CELL_HEIGHT * scale) / 2
-            return ScreenLayout(columns, rows, scale, offsetX, offsetY)
+            // 枠の内側を、中身の左上を原点とするフォントの単位で表す（中身の外の余白を地の色で塗るため。#714）
+            return ScreenLayout(
+                columns,
+                rows,
+                scale,
+                offsetX,
+                offsetY,
+                innerLeft = (margin - offsetX) / scale,
+                innerTop = (margin - offsetY) / scale,
+                innerRight = (faceWidth - margin - offsetX) / scale,
+                innerBottom = (faceHeight - margin - offsetY) / scale,
+            )
         }
     }
 }

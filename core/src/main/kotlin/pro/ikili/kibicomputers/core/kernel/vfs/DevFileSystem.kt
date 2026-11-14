@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.vfs
 
+import pro.ikili.kibicomputers.core.device.DeviceAddress
 import pro.ikili.kibicomputers.core.device.DeviceBus
 import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.kernel.EntropySource
@@ -45,7 +46,9 @@ internal interface DeviceDirectory {
  * - `zero`: 読むと 0 のバイトで埋まる、書くと全部を捨てる
  *
  * node は固定の番号（保存した開いたファイルが指すので変えない・使い回さない）。デバイスの node は address から決まる値
- * （[deviceNode]。ビット 62 を立てて固定の番号と重ならないようにする。表を持たない）。
+ * （[deviceNode]。ビット 62 を立てて固定の番号と重ならないようにする。表を持たない）。62 ビットのハッシュなので、別の address が
+ * 同じ node になりうる（address は持ち主の NBT にあり、狙って作れる）。そのため node から address は引かず、差し替え（[special]）は
+ * 開いたパスの名前で引く（#693）。一覧と stat では、衝突した2つが同じ node に見える（既知の制約。ADR 0054）。
  *
  * どれも大きさは 0。`O_TRUNC`（[setSize]）・時刻の変更（[setTimes]）は受け付けて何もしない（Linux の `/dev/null` と同じく、
  * `> /dev/null` や `touch /dev/null` が通るように）。ファイルを作る・消す・名前を変えるのは `ACCES`（中身は決まっている）。
@@ -79,7 +82,8 @@ internal class DevFileSystem(
         ROOT_NODE -> ROOT_STAT
         DEVICE_DIR_NODE -> DEVICE_DIR_STAT
         NULL_NODE, ZERO_NODE, TTY_NODE, RANDOM_NODE, URANDOM_NODE -> deviceStat(node)
-        else -> if (isDeviceNode(node) && addressOf(node) != null) deviceStat(node) else fsError(Errno.STALE)
+        // node が同じデバイスが1つでもつながっていれば生きている（衝突していても、片方が残っていれば STALE にしない）
+        else -> if (isDeviceNode(node) && devices.list().any { deviceNode(it.address) == node }) deviceStat(node) else fsError(Errno.STALE)
     }
 
     override fun createFile(path: VfsPath): Long = fsError(Errno.ACCES, "/dev には作れない")
@@ -150,15 +154,17 @@ internal class DevFileSystem(
     }
 
     /**
-     * 開いた fd の差し替え先（[SpecialFile]）。`tty` なら端末、デバイスの node なら今つないでいるデバイス（外れていれば [SpecialFile.Detached]）。
-     * カーネルロックの中から呼ばれる（I/O をしない。デバイスの表はロックなしで読む）
+     * 開いた fd の差し替え先（[SpecialFile]）。`tty` なら端末、デバイスの node なら、開いたパスの名前 [name]（address）で今つないでいる
+     * デバイスを引く（#693。node で引くと、node が同じ別のデバイスが開きうる）。[name] が address の形でない、[node] と合わない、
+     * またはそのデバイスが外れていれば [SpecialFile.Detached]（node が同じ別のデバイスが残っていても、それは開かない）。
+     * カーネルロックの中から呼ばれる（I/O をしない。例外を投げない。デバイスの表はロックなしで読む）
      */
-    override fun special(node: Long): SpecialFile? = when {
+    override fun special(node: Long, name: String): SpecialFile? = when {
         node == TTY_NODE -> SpecialFile.Terminal
         isDeviceNode(node) -> {
-            val address = addressOf(node)
-            val kind = address?.let { devices.kindOf(it) }
-            if (address == null || kind == null) SpecialFile.Detached else SpecialFile.Device(address, kind)
+            // 形を先に確かめる（deviceNode の UUID.fromString は形の違う名前で投げうる）
+            val kind = if (DeviceAddress.isValid(name) && deviceNode(name) == node) devices.kindOf(name) else null
+            if (kind == null) SpecialFile.Detached else SpecialFile.Device(name, kind)
         }
         else -> null
     }
@@ -184,9 +190,6 @@ internal class DevFileSystem(
             done += chunk.size
         }
     }
-
-    /** デバイスの node [node] の address（今つないでいるものから探す。なければ `null`） */
-    private fun addressOf(node: Long): String? = devices.list().firstOrNull { deviceNode(it.address) == node }?.address
 
     private fun byName(name: String): Long? = ENTRIES.firstOrNull { it.name == name }?.node
 

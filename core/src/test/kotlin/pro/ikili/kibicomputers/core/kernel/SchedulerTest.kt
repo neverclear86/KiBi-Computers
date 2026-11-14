@@ -244,10 +244,9 @@ class SchedulerTest {
             assertEquals(MachineState.RUNNING, m.state)
             val child = m.spawnTest(program, waitForever, parentPid = parent)
             assertEquals(parent, m.lock.withLockValue { m.kernel.processes[child]!!.parentPid })
+            // 止めている途中の spawn は `stop中のspawnはIllegalStateException` が確かめる。
+            // ここで状態を見てから spawn すると、その間に停止が終わって通ってしまう（#709）。
             m.stop()
-            if (m.state == MachineState.STOPPING) {
-                assertThrows<IllegalStateException> { m.spawnTest(program, waitForever) }
-            }
             assertTrue(m.awaitTermination(5_000))
             assertEquals(MachineState.STOPPED, m.state)
         }

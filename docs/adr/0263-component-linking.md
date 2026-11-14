@@ -42,7 +42,7 @@
 - realloc と post-return は `may_leave` を下ろして、`LinkEnv.callGuest`（カーネルでは `ProcessContext.callGuest`。中では止まる口を使えない。ADR 0073）の中で呼ぶ。コンポーネントどうしの呼び出し（ゲストからゲスト）は `callGuest` で包まない。
 - 一度トラップしたら、それ以上は呼べない（仕様ではトラップしたストアは使えなくなる。以後の呼び出しはトラップ）。
 - ホストからの `LinkedComponent.call` は入れ子にできない（#691）。ホストの関数の中・インスタンス化の途中（start 関数から呼ばれたホストの関数）から呼ぶと `IllegalStateException`。ホストの関数の中から呼べると、core の関数が `callGuest` で包まれずに動き、止まる口を使えてしまう（ADR 0073）。断るのは呼び出しの前なので、断った呼び出しはコンポーネントを壊さない（例外が外側まで伝われば、外側の呼び出しが壊す）。
-- resource の canon（`resource.new`・`rep`・`drop`）は、呼ぶとトラップする関数としてつなぐ（ハンドル表は #265）。own・borrow の受け渡しも ADR 0264 のままトラップ。
+- resource の canon（`resource.new`・`rep`・`drop`）と own・borrow の受け渡しは、ハンドル表（#265。ADR 0265）でつなぐ。
 - async の canon・組み込み（stream・future など）、map 型などは `WasmLoadException`（#266 ほか）。
 
 ### 燃料: core インスタンスで 1 つのグローバルを共有する
@@ -67,8 +67,9 @@
 
 ## テスト
 
-- `ComponentLinkTest`: ホストの関数、core インスタンスどうしのメモリ・グローバル・テーブル・関数、文字列と realloc・post-return の順、`may_leave`、トラップの後、入れ子のコンポーネント、同じ中身のモジュールのまとめ、燃料の共有、元のバイト列の検証。
-- `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。通らないもの（map、async、複数のメモリ、resource）は理由と一緒に挙げる。
-- `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` から最初のホストの関数まで届くことを確かめる（resource が要るところから先は #265）。
-- `ComponentProcessTest`: カーネルの中で、インスタンスをまたぐ呼び出しと燃料切れでマシンを壊さない。
+- `ComponentLinkTest`: ホストの関数、core インスタンスどうしのメモリ・グローバル・テーブル・関数、文字列と realloc・post-return の順、`may_leave`（realloc の中と post-return の中。post-return から core どうしで直接呼ぶのはトラップしない）、トラップの後、入れ子のコンポーネント、同じ中身のモジュールのまとめ、燃料の共有、元のバイト列の検証。インスタンスの間の受け渡し（メモリ・グローバル・テーブル・関数、文字列、入れ子）は、計測なしとありの両方で回し、計測ありでは燃料が減って、どのインスタンスから読んでも同じことも確かめる（#692）。
+- `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。計測なしとあり（燃料を共有する形）の両方で動かし、計測ありで燃料が切れたトラップは `assert_trap` の成功に数えない（#692。`json-from-wast` はファイルごとに 1 回）。通らないもの（map、async、複数のメモリ）は理由と一緒に挙げる（resource は #265 で通るようにした。`test/resources` の wast も足した）。
+- `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` からホストの関数まで届き、標準入出力の own を受けた先まで進むことを確かめる（#265）。
+- `ComponentProcessTest`: カーネルの中で、インスタンスをまたぐ呼び出しと燃料切れでマシンを壊さない。読み込みの途中の失敗（#692）: 2 つ目の start 関数のトラップ（プロセスだけが `CRASHED`）、作る途中の燃料待ちでの kill と、インスタンスを作る間の kill（`KILLED`）。どれもマシンを壊さず、作った core インスタンスを閉じ、プロセスとマシンの RAM を返す。
+- `FuelInjectorSharedTest`: 燃料を共有する形の挿入（#692）。グローバルの import があるとき・ないときの、関数の本体・export・グローバルの初期値（import を指す形と、前に定義したグローバルを指す extended-const の形）・データと要素のオフセット・要素の式の番号の付け替えを、wasm-tools の検証、Endive の読み込み、実行の結果で確かめる。パッシブの要素の式は、Endive が `table.init` で `global.get` を正しく置かない（#706）ので、wasm-tools で読み戻して確かめる。共有しない形では、今までどおりグローバルの import を断る。
 - GameTest `componentLinksOnServer`（両バージョン）。

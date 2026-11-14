@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
@@ -20,9 +22,19 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.instantia
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.load
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.u32
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.wat
+import java.util.concurrent.atomic.AtomicInteger
 
-/** コンポーネントのインスタンス化とリンク（#263） */
+/** コンポーネントのインスタンス化とリンク（#263）。インスタンスの間の受け渡しは、計測なしとあり（燃料を共有する形）の両方で確かめる（#692） */
 class ComponentLinkTest {
+    /** 計測ありなら、燃料が減っていて、どの core インスタンスから読んでも同じこと（共有の形）を確かめる */
+    private fun assertFuelShared(p: ComponentProgram, c: LinkedComponent) {
+        if (!p.metered) return
+        assertTrue(p.plan.modules.all { it.sharesFuel })
+        val left = c.coreInstances.map(WasmInstance::fuel)
+        assertEquals(1, left.toSet().size, "共有した残りはどのインスタンスから読んでも同じ: $left")
+        assertTrue(left[0] < LinkTesting.DEFAULT_FUEL, "燃料が減っていない: ${left[0]}")
+    }
+
     private val doubleHost = ComponentHost.of(
         host(
             "test:host/math",
@@ -78,8 +90,9 @@ class ComponentLinkTest {
         instantiate(load(callsHost, more)).use { c -> assertEquals(u32(7), c.call("run", args = listOf(u32(3)))) }
     }
 
-    @Test
-    fun `coreインスタンスどうしでメモリ・グローバル・テーブル・関数を渡す`() {
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `coreインスタンスどうしでメモリ・グローバル・テーブル・関数を渡す`(metered: Boolean) {
         val p = load(
             """
             (component
@@ -108,11 +121,13 @@ class ComponentLinkTest {
               (func (export "run") (result u32) (canon lift (core func ${'$'}ib "run")))
               (func (export "peek") (result u32) (canon lift (core func ${'$'}ia "peek"))))
             """,
+            metered = metered,
         )
         instantiate(p).use { c ->
             assertEquals(2, c.coreInstances.size)
             assertEquals(u32(49), c.call("run"))
             assertEquals(u32(102), c.call("peek"))
+            assertFuelShared(p, c)
         }
     }
 
@@ -140,8 +155,9 @@ class ComponentLinkTest {
         ),
     )
 
-    @Test
-    fun `文字列をreallocで渡し、post-returnは結果を写した後に呼ぶ`() {
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `文字列をreallocで渡し、post-returnは結果を写した後に呼ぶ`(metered: Boolean) {
         val p = load(
             """
             (component
@@ -170,10 +186,12 @@ class ComponentLinkTest {
               (func (export "post-count") (result u32) (canon lift (core func ${'$'}mi "post-count"))))
             """,
             greetHost,
+            metered = metered,
         )
         instantiate(p).use { c ->
             assertEquals(CanonValue.Str.of("hello, world"), c.call("run"))
             assertEquals(u32(1), c.call("post-count"))
+            assertFuelShared(p, c)
         }
     }
 
@@ -220,7 +238,71 @@ class ComponentLinkTest {
     }
 
     @Test
-    fun `入れ子のコンポーネントの関数を呼び、post-returnは呼ぶ側が写した後`() {
+    fun `post-returnの中からimportを呼ぶとトラップし、ホストの関数は動かない`() {
+        val pings = AtomicInteger()
+        val ping = ComponentHost.of(
+            host("test:host/ping", "ping" to HostFunction(fn(emptyList(), null)) { _, _ -> pings.incrementAndGet().let { null } }),
+        )
+        val p = load(
+            """
+            (component
+              (import "test:host/ping" (instance ${'$'}ph (export "ping" (func))))
+              (alias export ${'$'}ph "ping" (func ${'$'}ping))
+              (core func ${'$'}ping_lower (canon lower (func ${'$'}ping)))
+              (core module ${'$'}m
+                (import "host" "ping" (func ${'$'}ping))
+                (func (export "run") (result i32) i32.const 42)
+                (func (export "post") (param i32) call ${'$'}ping)
+                (func (export "plain") (result i32) i32.const 1))
+              (core instance ${'$'}hi (export "ping" (func ${'$'}ping_lower)))
+              (core instance ${'$'}i (instantiate ${'$'}m (with "host" (instance ${'$'}hi))))
+              (alias core export ${'$'}i "run" (core func ${'$'}run))
+              (alias core export ${'$'}i "post" (core func ${'$'}post))
+              (func (export "run") (result u32) (canon lift (core func ${'$'}run) (post-return ${'$'}post)))
+              (func (export "plain") (result u32) (canon lift (core func ${'$'}i "plain"))))
+            """,
+            ping,
+        )
+        instantiate(p).use { c ->
+            val e = assertThrows<WasmTrapException> { c.call("run") }
+            assertTrue(e.message!!.contains("may_leave"), e.message)
+            // may_leave は lower の入口（引数の lift の前）で確かめるので、ホストの関数の本体は動かない
+            assertEquals(0, pings.get())
+            val again = assertThrows<WasmTrapException> { c.call("plain") }
+            assertTrue(again.message!!.contains("前にトラップした"), again.message)
+        }
+    }
+
+    @Test
+    fun `post-returnからcoreどうしで直接呼ぶのはトラップしない`() {
+        val p = load(
+            """
+            (component
+              (core module ${'$'}a
+                (global ${'$'}n (mut i32) (i32.const 0))
+                (func (export "bump") (global.set ${'$'}n (i32.add (global.get ${'$'}n) (i32.const 1))))
+                (func (export "count") (result i32) (global.get ${'$'}n)))
+              (core instance ${'$'}ia (instantiate ${'$'}a))
+              (core module ${'$'}b
+                (import "a" "bump" (func ${'$'}bump))
+                (func (export "run") (result i32) i32.const 42)
+                (func (export "post") (param i32) call ${'$'}bump))
+              (core instance ${'$'}ib (instantiate ${'$'}b (with "a" (instance ${'$'}ia))))
+              (alias core export ${'$'}ib "run" (core func ${'$'}run))
+              (alias core export ${'$'}ib "post" (core func ${'$'}post))
+              (func (export "run") (result u32) (canon lift (core func ${'$'}run) (post-return ${'$'}post)))
+              (func (export "count") (result u32) (canon lift (core func ${'$'}ia "count"))))
+            """,
+        )
+        instantiate(p).use { c ->
+            assertEquals(u32(42), c.call("run"))
+            assertEquals(u32(1), c.call("count"))
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `入れ子のコンポーネントの関数を呼び、post-returnは呼ぶ側が写した後`(metered: Boolean) {
         val p = load(
             """
             (component
@@ -258,11 +340,13 @@ class ComponentLinkTest {
               (alias export ${'$'}in "count" (func ${'$'}count))
               (export "count" (func ${'$'}count)))
             """,
+            metered = metered,
         )
         instantiate(p).use { c ->
             assertEquals(3, c.coreInstances.size)
             assertEquals(CanonValue.Str.of("inner!"), c.call("run"))
             assertEquals(u32(1), c.call("count"))
+            assertFuelShared(p, c)
         }
     }
 
@@ -337,26 +421,6 @@ class ComponentLinkTest {
         instantiate(p, fuel = 100).use { c ->
             val e = assertThrows<WasmTrapException> { c.call("run", args = listOf(u32(100_000))) }
             assertEquals(WasmTrapKind.FUEL_EXHAUSTED, e.kind)
-        }
-    }
-
-    @Test
-    fun `resourceのcanonは呼ぶとトラップする`() {
-        val p = load(
-            """
-            (component
-              (type ${'$'}r (resource (rep i32)))
-              (core func ${'$'}new (canon resource.new ${'$'}r))
-              (core module ${'$'}m
-                (import "x" "new" (func ${'$'}n (param i32) (result i32)))
-                (func (export "run") (result i32) (call ${'$'}n (i32.const 1))))
-              (core instance ${'$'}xi (export "new" (func ${'$'}new)))
-              (core instance ${'$'}i (instantiate ${'$'}m (with "x" (instance ${'$'}xi))))
-              (func (export "run") (result u32) (canon lift (core func ${'$'}i "run"))))
-            """,
-        )
-        instantiate(p).use { c ->
-            assertTrue(assertThrows<WasmTrapException> { c.call("run") }.message!!.contains("#265"))
         }
     }
 

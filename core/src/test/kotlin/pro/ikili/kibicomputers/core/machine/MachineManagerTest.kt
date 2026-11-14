@@ -196,11 +196,23 @@ class MachineManagerTest {
             host.onStateChanged(m, MachineState.CRASHED, cause)
             assertSame(cause, errors.errors.single())
             assertEquals(listOf(MachineState.CRASHED), log)
-            // 外した後も CRASHED は知らせる（接続層の受け口には届けない）
+            // 外した後も CRASHED は知らせる（接続層の受け口には届けない）。原因はマシン1台につき1回だけ出す（#698）
             host.released = true
             host.onStateChanged(m, MachineState.CRASHED, null)
+            assertEquals(1, errors.errors.size)
+            assertEquals(listOf(MachineState.CRASHED), log)
+            // 外した後に初めて届いた CRASHED も出す（ケースが CRASHED 以外の理由で外した後に壊れた台）
+            val late = ManagedHost("late", { _, s, _ -> log += s }, errors)
+            late.released = true
+            late.onStateChanged(m, MachineState.CRASHED, cause)
             assertEquals(2, errors.errors.size)
             assertEquals(listOf(MachineState.CRASHED), log)
+            // ケースが先に出した（reportCrash）なら、後の知らせで重ねない
+            val settled = ManagedHost("settled", { _, s, _ -> log += s }, errors)
+            settled.reportCrash(cause)
+            settled.released = true
+            settled.onStateChanged(m, MachineState.CRASHED, cause)
+            assertEquals(3, errors.errors.size)
             val throwing = ManagedHost("k", { _, _, _ -> throw IllegalStateException() }, { _, _ -> throw IllegalStateException() })
             throwing.onStateChanged(m, MachineState.RUNNING, null)
         }

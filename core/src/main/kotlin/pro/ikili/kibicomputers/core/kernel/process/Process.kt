@@ -122,7 +122,7 @@ internal class Process(
      */
     val waitTimers: WaitTimerSet = WaitTimerSet()
 
-    /** ハンドル表（fd 表。0/1/2 は標準入出力。操作は `FdTable` を通す。Component Model の resource の表は #265） */
+    /** ハンドル表（fd 表。0/1/2 は標準入出力。操作は `FdTable` を通す。Component Model の resource の表はここに入れない。コンポーネントのインスタンスごとの `ResourceTable`。ADR 0265） */
     var handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
         private set
 

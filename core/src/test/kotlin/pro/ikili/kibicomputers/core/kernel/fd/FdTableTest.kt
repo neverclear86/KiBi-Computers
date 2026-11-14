@@ -309,6 +309,21 @@ class FdTableTest {
     }
 
     @Test
+    fun `openFileのdev_deviceはnodeが同じ別のデバイスがあっても、開いたパスのデバイスを指す`() {
+        // address と上位・下位の 64 ビットを入れ替えたもの（node が同じ。#693）
+        val other = "a4564266-1417-4000-123e-4567e89b12d3"
+        assertEquals(DevFileSystem.deviceNode(address), DevFileSystem.deviceNode(other))
+        val devices = Devices().also {
+            it.table[address] = "kibi:screen"
+            it.table[other] = "kibi:keyboard"
+        }
+        val vfs = deviceVfs(devices)
+        val file = vfs.open(VfsPath.parse("/dev/device/$other"), OpenOptions(read = true))
+        val fd = fds.openFile(file, vfs, 0, HandleRights.READ)
+        assertEquals(DeviceInfo(other, "kibi:keyboard"), (fds.objectOf(fd) as DeviceHandle).info)
+    }
+
+    @Test
     fun `openFileのdev_deviceは開く途中で外れたらNOENTで、満杯ならMFILE`() {
         val devices = Devices().also { it.table[address] = "kibi:screen" }
         val vfs = deviceVfs(devices)

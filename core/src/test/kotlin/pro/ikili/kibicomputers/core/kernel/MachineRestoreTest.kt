@@ -288,7 +288,8 @@ class MachineRestoreTest {
                     handleId = m.kernel.objects.add(DeviceHandle(address, TestDevice.kind))
                 }
             }
-            val m = h.machine(fuelPerTick = 10_000_000)
+            // 戻すマシンの乱数の元は一定値: 復元で作り直した /dev がこの元を使うかを中身で確かめる（#694）
+            val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().entropy { it.fill(0x5A) }.build())
             val finished = Finished()
             assertTrue(m.restore(request(saved, store, finished)))
             eventually(60_000, "復元が終わらない") {
@@ -299,7 +300,9 @@ class MachineRestoreTest {
             assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
             val (random, handle) = m.lock.withLockValue { m.kernel.objects[randomId] as OpenFile to m.kernel.objects[handleId] as DeviceHandle }
             assertEquals(DevFileSystem.RANDOM_NODE, random.node)
-            assertEquals(16, m.vfs.pread(random, 0, ByteArray(16), 0, 16), "保存した node のまま読める")
+            val bytes = ByteArray(16)
+            assertEquals(16, m.vfs.pread(random, 0, bytes, 0, 16), "保存した node のまま読める")
+            assertTrue(bytes.all { it == 0x5A.toByte() }, "戻した /dev は戻すマシンの乱数の元を使う")
             assertEquals(DeviceInfo(address, TestDevice.kind), handle.info)
             // 戻した /dev も、このマシンのデバイスの表を見る
             assertEquals(Errno.NOENT, assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/dev/device/$address")) }.errno)
@@ -519,6 +522,10 @@ class MachineRestoreTest {
             h.awaitRestoreCleanup(m)
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced)
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             // インスタンス・/tmp の RAM はサーバー全体の勘定にも返り、ディスクは閉じる（#576。起動用スレッドで返す）
@@ -567,6 +574,10 @@ class MachineRestoreTest {
             assertEquals(parentPid, adopted, "親が先に runtimes に入っていない")
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             // stopLocked が最後まで進み、表のプロセスがすべて終わっている
@@ -617,6 +628,10 @@ class MachineRestoreTest {
             assertEquals(childPid, adopted, "子が先に runtimes に入っていない")
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")

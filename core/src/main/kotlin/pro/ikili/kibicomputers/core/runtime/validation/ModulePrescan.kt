@@ -43,8 +43,8 @@ internal object ModulePrescan {
         if (bytes.size < HEADER.size) fail("WASM のヘッダーがない")
         for (i in 0 until 4) if (bytes[i] != HEADER[i]) fail("WASM のヘッダーがない")
         if (WasmBinaryHeader.kindOf(bytes) == WasmBinaryKind.COMPONENT) {
-            // コンポーネント（layer 1）は、重い検証をせずにすぐ断る（実行は #263 でつなぐ）
-            throw WasmLoadException("Component Model のコンポーネントは、まだ実行できない（#263）")
+            // コンポーネント（layer 1）は、重い検証をせずにすぐ断る（exec につなぐのは #687）
+            throw WasmLoadException("Component Model のコンポーネントは、まだ実行できない")
         }
         for (i in 4 until 8) if (bytes[i] != HEADER[i]) fail("WASM のコアモジュール（version 1）ではない")
         val r = Reader(bytes, HEADER.size, bytes.size)

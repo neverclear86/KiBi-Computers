@@ -1,15 +1,14 @@
 package pro.ikili.kibicomputers.core.runtime.component.link
 
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
-import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
-import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.component.Alias
 import pro.ikili.kibicomputers.core.runtime.component.ByteRange
 import pro.ikili.kibicomputers.core.runtime.component.Canon
 import pro.ikili.kibicomputers.core.runtime.component.ComponentSection
 import pro.ikili.kibicomputers.core.runtime.component.ComponentTypeDef
+import pro.ikili.kibicomputers.core.runtime.component.CoreValType
 import pro.ikili.kibicomputers.core.runtime.component.CoreInstanceExpr
 import pro.ikili.kibicomputers.core.runtime.component.DefType
 import pro.ikili.kibicomputers.core.runtime.component.DefValType
@@ -55,11 +54,16 @@ internal class ComponentPlanner private constructor(
     private val lifts = ArrayList<LiftSpec>()
     private val lowers = ArrayList<LowerSpec>()
     private var frames = 0
-    private var nextResource = 1
     private var work = 0L
+
+    /** resource の番号 → 記録（0 番は使わない。#265） */
+    private val resources = arrayListOf<ResourceInfo?>(null)
 
     /** ゲストの resource の識別子 → ホストの resource の識別子（一番外の import から作った対応） */
     private val hostResources = HashMap<Int, Int>()
+
+    /** ホストの resource の識別子 → 最初に結び付いたゲストの resource の番号（正規の番号。#265） */
+    private val hostCanonical = HashMap<Int, Int>()
 
     /** ゲストとホストの型を比べるときの resource の対応 */
     private val hostMatch = CanonResourceMatch { guest, hostId -> hostResources[guest] == hostId }
@@ -80,7 +84,7 @@ internal class ComponentPlanner private constructor(
             val root = p.instantiate(component.root, null, null)
             val exports = LinkedHashMap<String, ExportItem>()
             for ((name, item) in root) exports[name] = p.exportItem(item)
-            return ComponentPlan(modules, p.steps.toList(), p.lifts.toList(), p.lowers.toList(), p.frames, exports)
+            return ComponentPlan(modules, p.steps.toList(), p.lifts.toList(), p.lowers.toList(), p.frames, exports, p.resources.toList())
         }
 
         private fun fail(message: String): Nothing = throw WasmLoadException(message)
@@ -143,7 +147,9 @@ internal class ComponentPlanner private constructor(
         fun define(t: DefType): TypeEntry = when (t) {
             is DefValType -> resolving { TypeEntry.Value(CanonTypeConvert.defValType(t, this)) }
             is FuncType -> resolving { TypeEntry.Func(CanonTypeConvert.funcType(t, this)) }
-            is ResourceType -> TypeEntry.Resource(newResource())
+            // resource の定義はコンポーネントの Types セクションにだけ来る（Frame で記録する。guestResource）。
+            // インスタンス型の中には来ない（検証で通らない）
+            is ResourceType -> TypeEntry.Unresolved("インスタンス型の中の resource の定義")
             is InstanceTypeDef -> TypeEntry.InstanceDecl(t.decls, this)
             is ComponentTypeDef -> TypeEntry.ComponentDecl
         }
@@ -210,7 +216,22 @@ internal class ComponentPlanner private constructor(
         private fun mismatch(sort: Sort, item: Item): Nothing = fail("${sort.label} に種類の違う値（$item）を渡した")
     }
 
-    private fun newResource(): Int = nextResource++
+    private fun newResource(impl: ResourceImpl): Int {
+        val id = resources.size
+        resources += ResourceInfo(id, impl)
+        return id
+    }
+
+    /**
+     * [f] の Types セクションの resource の定義 [t] を記録する。dtor は、定義した時点の [f] の core func の添字空間で引く。
+     * rep は i32 だけ（[CanonType.Handle] は 4 バイト・i32 の固定。memory64 は無効なので、検証を通ったものには来ない）
+     */
+    private fun guestResource(f: Frame, t: ResourceType): TypeEntry {
+        if (t.rep != CoreValType.I32) fail("resource の rep が i32 でない（${t.rep}）")
+        val dtor = t.destructor?.let { f.core(Sort.CORE_FUNC, it) }
+        if (dtor != null && dtor.functionType != I32_TO_NONE) fail("resource の dtor の型が (i32) -> () でない（${dtor.functionType}）")
+        return TypeEntry.Resource(newResource(ResourceImpl.Guest(f.id, dtor)))
+    }
 
     /** なぞった宣言の数を数え、ときどき時間の上限を確かめる */
     private fun step() {
@@ -256,7 +277,7 @@ internal class ComponentPlanner private constructor(
                 }
                 is ComponentSection.Types -> for (t in section.items) {
                     step()
-                    f.scope.types += f.scope.define(t)
+                    f.scope.types += if (t is ResourceType) guestResource(f, t) else f.scope.define(t)
                 }
                 is ComponentSection.Canons -> for (c in section.items) {
                     step()
@@ -358,11 +379,21 @@ internal class ComponentPlanner private constructor(
                 lowers += LowerSpec(callee, callee.function, binding(f, CanonOptions.of(c.options)), f.id)
                 f.coreFuncs += CoreRef.Lowered(id, callee.function.lowerSignature.toWasm())
             }
-            is Canon.ResourceNew -> f.coreFuncs += CoreRef.Trapping(I32_TO_I32, "resource.new はまだ扱えない（#265）")
-            is Canon.ResourceRep -> f.coreFuncs += CoreRef.Trapping(I32_TO_I32, "resource.rep はまだ扱えない（#265）")
-            is Canon.ResourceDrop -> f.coreFuncs += CoreRef.Trapping(I32_TO_NONE, "resource.drop はまだ扱えない（#265）")
+            is Canon.ResourceNew -> f.coreFuncs += resourceOp(f, CoreRef.ResourceOp.Op.NEW, c.typeIndex)
+            is Canon.ResourceRep -> f.coreFuncs += resourceOp(f, CoreRef.ResourceOp.Op.REP, c.typeIndex)
+            is Canon.ResourceDrop -> f.coreFuncs += resourceOp(f, CoreRef.ResourceOp.Op.DROP, c.typeIndex)
             is Canon.Builtin -> fail("canon ${c.op.label} はまだ扱えない（#266）")
         }
+    }
+
+    /** canon `resource.*` の [op]。new・rep は、その resource を定義したインスタンスの中でだけ書ける（検証の規則。守りとして確かめる） */
+    private fun resourceOp(f: Frame, op: CoreRef.ResourceOp.Op, typeIndex: Int): CoreRef.ResourceOp {
+        val e = f.scope.ref(typeIndex) as? TypeEntry.Resource ?: fail("canon ${op.label} の型 $typeIndex が resource でない")
+        if (op != CoreRef.ResourceOp.Op.DROP) {
+            val impl = resources[e.id]?.impl
+            if (impl !is ResourceImpl.Guest || impl.instance != f.id) fail("canon ${op.label} の resource $typeIndex は、このコンポーネントが定義したものでない")
+        }
+        return CoreRef.ResourceOp(op, e.id, f.id)
     }
 
     private fun binding(f: Frame, o: CanonOptions): CanonBinding = CanonBinding(
@@ -398,7 +429,7 @@ internal class ComponentPlanner private constructor(
                 is TypeDecl.Export -> shape[d.name] = when (val desc = d.desc) {
                     is ExternDesc.Func -> Shape.Func(scope.ref(desc.typeIndex))
                     is ExternDesc.Type -> {
-                        val e = desc.eqTypeIndex?.let { scope.ref(it) } ?: TypeEntry.Resource(newResource())
+                        val e = desc.eqTypeIndex?.let { scope.ref(it) } ?: TypeEntry.Resource(newResource(ResourceImpl.Abstract))
                         scope.types += e
                         Shape.Type(e)
                     }
@@ -440,13 +471,22 @@ internal class ComponentPlanner private constructor(
         return Item.Instance(exports)
     }
 
-    private fun bindHostResource(iface: String, member: String, guest: Int, hostId: Int?) {
+    /**
+     * ゲストの resource [guest] を、ホストの resource [host] に結び付ける。同じホストの resource に結び付いたゲストの番号は、
+     * どれも同じ正規の番号（最初に結び付いた番号）にする（#265）
+     */
+    private fun bindHostResource(iface: String, member: String, guest: Int, host: HostResource?) {
+        if (resources[guest]?.impl is ResourceImpl.Guest) fail("ホストのインターフェース $iface の resource $member が、ゲストの定義した resource を指す")
         val bound = hostResources[guest]
         when {
-            hostId == null && bound == null -> fail("ホストのインターフェース $iface に resource $member がない")
-            hostId == null -> Unit
-            bound == null -> hostResources[guest] = hostId
-            bound != hostId -> fail("ホストのインターフェース $iface の resource $member が、ほかのインターフェースの同じ型と違う")
+            host == null && bound == null -> fail("ホストのインターフェース $iface に resource $member がない")
+            host == null -> Unit
+            bound == null -> {
+                hostResources[guest] = host.id
+                val canonical = hostCanonical.getOrPut(host.id) { guest }
+                resources[guest] = ResourceInfo(canonical, ResourceImpl.Host(iface, member, host))
+            }
+            bound != host.id -> fail("ホストのインターフェース $iface の resource $member が、ほかのインターフェースの同じ型と違う")
         }
     }
 
@@ -463,6 +503,3 @@ internal class ComponentPlanner private constructor(
         else -> ExportItem.Other
     }
 }
-
-private val I32_TO_I32 = WasmFunctionType(listOf(WasmValueType.I32), listOf(WasmValueType.I32))
-private val I32_TO_NONE = WasmFunctionType(listOf(WasmValueType.I32), emptyList())

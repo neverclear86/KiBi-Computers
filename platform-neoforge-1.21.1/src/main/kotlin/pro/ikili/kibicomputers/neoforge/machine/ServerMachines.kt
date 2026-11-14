@@ -48,6 +48,7 @@ import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.IdentityHashMap
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
 
@@ -397,13 +398,12 @@ object ServerMachines {
         if (writesTimedOut) Stats.restoreWriteTimeouts++
     }
 
-    /** 復元が終わった（メインスレッド）。数え口に入れ、冷えた起動にしたら理由をログに残す */
+    /** 復元が終わった（メインスレッド）。数え口に入れ（[countRestoreFinished]）、冷えた起動にしたら理由をログに残す */
     internal fun recordRestoreFinished(pos: BlockPos, outcome: RestoreOutcome, cause: ColdBootCause?) {
+        countRestoreFinished(outcome, cause)
         when (outcome) {
-            RestoreOutcome.RESTORED -> Stats.restored++
+            RestoreOutcome.RESTORED -> {}
             RestoreOutcome.COLD_BOOT -> {
-                Stats.restoreFallbacks++
-                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
                 when (coldBootLog.classify(cause)) {
                     ColdBootLog.Kind.EACH -> LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
                     ColdBootLog.Kind.SUMMARY -> {
@@ -415,6 +415,21 @@ object ServerMachines {
                     }
                     ColdBootLog.Kind.QUIET -> LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
                 }
+            }
+            RestoreOutcome.CANCELLED -> {}
+        }
+    }
+
+    /**
+     * 復元の終わりを数え口にだけ入れる（ログは出さず、[coldBootLog] の「起動ごとに1回の要約」も使わない）。
+     * [recordRestoreFinished] から呼ぶほか、GameTest が数え方だけを確かめるのに使う（#708）
+     */
+    internal fun countRestoreFinished(outcome: RestoreOutcome, cause: ColdBootCause?) {
+        when (outcome) {
+            RestoreOutcome.RESTORED -> Stats.restored++
+            RestoreOutcome.COLD_BOOT -> {
+                Stats.restoreFallbacks++
+                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
             }
             RestoreOutcome.CANCELLED -> {}
         }
@@ -607,6 +622,33 @@ object ServerMachines {
      */
     internal fun anySettling(cases: List<CaseBlockEntity>): Boolean = cases.any { it.computer.isSettlingForSave }
 
+    /**
+     * 止まった台（CRASHED・ゲストが止めた）を、知らせを待たずに電源の切れた状態にそろえる（#698。
+     * [pro.ikili.kibicomputers.core.computer.ComputerCase.settleStoppedMachine]）。アンロード・FULL でなくなった・停止の経路で、
+     * 取り出す前と後に呼ぶ（これらの経路では、知らせが届く前に NBT を書き、外した後の知らせは捨てられるため）。
+     * ゲストが止めた直後の STOPPING（プロセスのスレッドが終わり切る前）も、止まったものとしてそろえる。
+     * CRASHED で外した台の原因（カーネルの不整合の例外）は、core がマネージャーのエラーの出し先（[ERRORS]）に1回だけ出す
+     * （tick が回るアンロード・FULL でなくなった経路で後から知らせが届いても重ねず、tick の回らない停止でも残る）。
+     * [quiet]（アンロード・FULL でなくなった経路）なら、電源の状態が変わっても `setChanged` を呼ばない
+     * （隣のブロックの `onNeighborChange` が、アンロード中・FULL でないチャンクを読み直すのを避ける）。呼び手がチャンクに `isUnsaved` を付ける
+     *
+     * @return 電源の状態を変えた
+     */
+    private fun settleStopped(be: CaseBlockEntity, quiet: Boolean): Boolean = be.settleStopped(quiet)
+
+    /**
+     * 取り出した後・写した後のそろえ（[settleStopped]）の前に、取り出した台のうち登録のある台にだけ呼ぶフック（GameTest 用。#698）。
+     * 待ち・取り出しの間に止まる台を作るのに使う。メインスレッドで呼ぶ。本番では空。
+     * ケースごとに登録するので、並行する GameTest が互いのフックを上書きしない（#713）。登録した側が必ず外す
+     */
+    internal val afterCaptureForTest: MutableMap<CaseBlockEntity, (CaseBlockEntity) -> Unit> = ConcurrentHashMap()
+
+    /** [targets] のうち、[afterCaptureForTest] に登録のある台のフックを呼ぶ。本番では空かどうかを1回見るだけ */
+    private fun runAfterCaptureForTest(targets: List<CaseBlockEntity>) {
+        if (afterCaptureForTest.isEmpty()) return
+        for (be in targets) afterCaptureForTest[be]?.invoke(be)
+    }
+
     // ---- チャンクのアンロード ----
 
     private fun onChunkUnload(event: ChunkEvent.Unload) {
@@ -626,6 +668,8 @@ object ServerMachines {
      */
     internal fun saveForUnload(chunk: LevelChunk, cases: List<CaseBlockEntity>, adopt: Boolean) {
         val store = WorldMachineSaves.current ?: return
+        // 止まった台は電源を切ってから書く（アンロードでは setChanged が効かないので、変わったらチャンクに印を付ける。#698）
+        for (be in cases) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -657,6 +701,9 @@ object ServerMachines {
                 Stats.unloadCaptures++
                 Stats.unloadWrites += pending.writes
             }
+            runAfterCaptureForTest(targets)
+            // 待ち・取り出しの間に止まった台（別のスレッドで CRASHED になる・ゲストが止める）も、電源を切った状態で NBT に載せる（#698）
+            for (be in targets) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
         }
         // 書き終わりは待たずに、予約した世代を NBT に載せる（書き込み中だった自動保存の予約も同じ。規則 4）
         if (adopt) for (be in cases) if (be.adoptPendingSave()) chunk.isUnsaved = true
@@ -799,6 +846,8 @@ object ServerMachines {
      */
     internal fun saveForStop(targets: List<CaseBlockEntity>, keepQuiesced: Boolean): Int {
         rotation.clear()
+        // 止まった台（CRASHED・ゲストが止めた）は、知らせがもう届かないので、ここで電源を切る（setChanged で NBT に載る。#698）
+        for (be in targets) if (!be.isRemoved) settleStopped(be, quiet = false)
         // 復元の途中の台は取り出さない（NBT は前の世代を指したまま。次に読み込んだときに戻し直す。#85）
         val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
@@ -816,6 +865,9 @@ object ServerMachines {
             }
             if (be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null) saved++
         }
+        runAfterCaptureForTest(running)
+        // 待ち・取り出しの間に止まった台も、電源を切った状態で NBT に載せる（写しは取らないか、取っても電源が切れているので戻されない。#698）
+        for (be in running) settleStopped(be, quiet = false)
         // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
         drainSaves()
         if (!keepQuiesced) for (be in running) be.computer.endQuiesce()
@@ -832,6 +884,7 @@ object ServerMachines {
         demoted.clear()
         promoted.clear()
         restoreQueue.clear()
+        afterCaptureForTest.clear()
         stop(m)
     }
 

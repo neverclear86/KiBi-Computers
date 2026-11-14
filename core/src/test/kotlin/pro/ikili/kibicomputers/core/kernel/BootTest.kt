@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
@@ -165,12 +167,12 @@ class BootTest {
         fun withHome(home: String?, vararg ids: String): BootConfig = BootConfig.builder().bootDisks(ids.toList()).homeDisk(home).build()
     }
 
-    private fun env(block: Env.() -> Unit) = timeout(limit) {
+    private fun env(environment: MachineEnvironment = MachineEnvironment.DEFAULT, block: Env.() -> Unit) = timeout(limit) {
         Harness().use { h ->
             val host = Recorder()
             val disks = Disks()
             h.scheduler.hooks.bootVolumes = disks
-            val m = h.machine(host = host)
+            val m = h.machine(host = host, environment = environment)
             Env(h, m, host, disks).block()
             m.stop()
             assertTrue(m.awaitTermination(5_000))
@@ -880,6 +882,35 @@ class BootTest {
             assertEquals(FileType.CHARACTER_DEVICE, m.vfs.stat(VfsPath.parse("/dev/$name")).type, name)
         }
         assertEquals(FileType.DIRECTORY, m.vfs.stat(VfsPath.parse("/dev/device")).type)
+    }
+
+    private object TestDevice : Device {
+        override val kind = "test:device"
+        override val methods: DeviceMethods = DeviceMethods.builder().build()
+    }
+
+    /**
+     * 起動の結線（#694）: `mountDev` が環境の乱数の元とこのマシンのデバイスの表を渡していること。
+     * `DevFileSystem` の引数には既定値（`EntropySource.SECURE`・`DeviceDirectory.NONE`）があり、渡し忘れても種類は変わらないので、中身で確かめる
+     */
+    @Test
+    fun `起動したdevは環境の乱数の元とマシンのデバイスの表を使う`() = env(MachineEnvironment.builder().entropy { it.fill(0x5A) }.build()) {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(bootDisks("d")))
+        tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
+        for (name in listOf("random", "urandom")) {
+            val f = m.vfs.open(VfsPath.parse("/dev/$name"), OpenOptions(read = true))
+            val buf = ByteArray(32)
+            assertEquals(buf.size, m.vfs.read(f, buf, 0, buf.size), name)
+            m.vfs.close(f)
+            assertTrue(buf.all { it == 0x5A.toByte() }, "$name は環境の乱数の元から読む")
+        }
+        val address = "00000000-0000-4000-8000-000000000694"
+        val path = VfsPath.parse("/dev/device/$address")
+        assertEquals(Errno.NOENT, assertThrows<FsException> { m.vfs.stat(path) }.errno)
+        // テストのスレッド（カーネルロックの外）から attach する（ADR 0065 のロックの順）
+        assertTrue(m.devices.attach(address, TestDevice))
+        assertEquals(FileType.CHARACTER_DEVICE, m.vfs.stat(path).type, "このマシンの表を、読むたびに見る")
     }
 
     @Test
