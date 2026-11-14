@@ -56,6 +56,8 @@ Other events of the system keep their names. When an event comes from a device, 
 - `os.pullEvent` and `os.pullEventRaw` wait in place and do not yield, even inside a coroutine (this may change with the coroutine scheduler)
 - `os.sleep` does not throw away other events; they wait in the queue
 - `os.time`, `os.clock` and `os.date` are the standard Lua functions
+- `os.day` and `os.epoch` give different numbers. CC: Tweaked counts the in-game day from 1, and shifts the time of day by 6000 ticks (a day starts at 06:00). It uses the time of day of the world, which `/time set` changes. Here `ingame` uses the world tick counter, which only goes forward: `os.day` is the ticks divided by 24000 and starts at 0, and `os.epoch` is the ticks times 3600 (in CC: Tweaked, the same value plus 30000 ticks, which is 108000000 milliseconds). The `utc` and `local` days are counted from 0 (1970-01-01); CC: Tweaked starts at 1. The reason is that the tick counter is not changed by `/time set`, so programs can measure time with it
+- There is no global `sleep`, only `os.sleep` (CC: Tweaked has both). The standard globals are not changed
 - There is no time zone: `local` is UTC
 - `os.queueEvent` does not reach other programs
 - `os.getComputerID`, `os.getComputerLabel`, `os.setComputerLabel`, `os.run` and `os.loadAPI` are not available

@@ -396,4 +396,32 @@ class LuaKibiApiTest {
             assertTrue(first.all { it == "true" || it.endsWith("not enough memory") }, out)
         }
     }
+
+    /** 長い失敗の文と、上限いっぱいの数のメソッドを持つデバイス */
+    private class Wordy : Device {
+        override val kind = "test:wordy"
+        override val methods: DeviceMethods = DeviceMethods.builder().also { b ->
+            b.direct("long-fail") { _, _ -> throw DeviceException("e".repeat(5000)) }
+            b.direct("long-bad") { _, _ -> throw DeviceException("あ".repeat(2000)) }
+            for (i in 0 until 254) b.direct("m$i") { _, _ -> emptyArray() }
+        }.build()
+    }
+
+    @Test
+    fun `長い失敗の文は切り詰められ、メソッドが上限いっぱいでもgetMethodsとwrapが使える`() = timeout(limit) {
+        Run(
+            """
+            local ok, msg = pcall(peripheral.call, "$OTHER", "long-fail")
+            print(ok, #msg, msg == ("e"):rep(#msg))
+            local ok2, msg2 = pcall(peripheral.call, "$OTHER", "long-bad")
+            print(ok2, #msg2 <= 1024, msg2:sub(1, 3))
+            print(#peripheral.getMethods("$OTHER"))
+            local w = peripheral.wrap("$OTHER")
+            print(w.m0 ~= nil, w.m253 ~= nil, peripheral.getType(w))
+            """.trimIndent(),
+        ).use { r ->
+            assertTrue(r.m.devices.attach(OTHER, Wordy()))
+            assertEquals("false\t1024\ttrue\nfalse\ttrue\tあ\n256\ntrue\ttrue\ttest:wordy\n", r.finish())
+        }
+    }
 }

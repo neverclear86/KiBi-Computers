@@ -103,6 +103,23 @@ class DeviceBusTest {
     }
 
     @Test
+    fun `メソッドは256個までで、超えるデバイスはつながない`() = timeout(limit) {
+        Harness().use { h ->
+            val bus = h.machine().devices
+            fun device(count: Int) = object : Device {
+                override val kind = "test:many"
+                override val methods: DeviceMethods = DeviceMethods.builder().also { b ->
+                    for (i in 0 until count) b.direct("m$i") { _, _ -> emptyArray() }
+                }.build()
+            }
+            assertThrows<IllegalArgumentException> { bus.attach(a, device(DeviceLimits.MAX_METHODS + 1)) }
+            assertTrue(bus.list().isEmpty())
+            assertTrue(bus.attach(a, device(DeviceLimits.MAX_METHODS)))
+            assertEquals(DeviceLimits.MAX_METHODS, bus.dispatcher.resolve(a)!!.methodInfos.size)
+        }
+    }
+
+    @Test
     fun `onAttachedが投げたら、つながずに例外を返す`() = timeout(limit) {
         Harness().use { h ->
             val bus = h.machine().devices

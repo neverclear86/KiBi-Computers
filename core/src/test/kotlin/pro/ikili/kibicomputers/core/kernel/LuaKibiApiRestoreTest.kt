@@ -37,6 +37,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 /**
  * Lua 向けの KiBi API（#94。ADR 0094）で待っている間に保存して戻す。
  * `os.pullEvent` で待つ Lua は、戻した後に `restored` のイベントを受け取って続く。
+ * `os.startTimer`・`os.sleep` で待つ Lua は、期限が単調時計の絶対時刻なので、戻した後も同じ期限で続く（タイマーの表と C の静的変数がそろっている）。
  * `peripheral.call` でメインスレッドのメソッドの結果を待つ Lua は、実行中のものが `interrupted` の Lua のエラーになり、メソッドは1回だけ走る
  */
 class LuaKibiApiRestoreTest {
@@ -142,5 +143,44 @@ class LuaKibiApiRestoreTest {
         )
         assertTrue(Regex("calling\nfalse\t[^\n]*interrupted\ndone\n").containsMatchIn(out), out)
         assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun `startTimerで待っている間に保存して戻すと、同じ期限のtimerが鳴り、タイマーの表とFIFOが続く`() = timeout(limit) {
+        val out = saveAndRestore(
+            """
+            local t1 = os.startTimer(2)
+            local t2 = os.startTimer(100000)
+            local t4 = os.startTimer(100000)
+            os.queueEvent('a', 1)
+            print('waiting'); io.stdout:flush()
+            local e, id = os.pullEvent('timer')
+            print(e, id == t1)
+            os.cancelTimer(t2)
+            os.queueEvent('x', 5)
+            print(os.pullEvent('x'))
+            local t3 = os.startTimer(0.1)
+            local e3, id3 = os.pullEvent('timer')
+            print(id3 == t3, t1, t2, t3, t4)
+            os.cancelTimer(t4)
+            local t5 = os.startTimer(0.1)
+            print(select(2, os.pullEvent('timer')) == t5, t5)
+            """.trimIndent() + "\n",
+            "waiting\n",
+            Regex("true\t5\n"),
+            AtomicInteger(),
+        )
+        assertEquals("waiting\ntimer\ttrue\nx\t5\ntrue\t1\t2\t4\t3\ntrue\t5\n", out)
+    }
+
+    @Test
+    fun `sleepで待っている間に保存して戻すと、期限まで待って続ける`() = timeout(limit) {
+        val out = saveAndRestore(
+            "print('waiting'); io.stdout:flush()\nos.sleep(1.5)\nprint('slept')\nprint(peripheral.call('$address', 'echo', 9))\n",
+            "waiting\n",
+            Regex("slept\n9\n"),
+            AtomicInteger(),
+        )
+        assertEquals("waiting\nslept\n9\n", out)
     }
 }

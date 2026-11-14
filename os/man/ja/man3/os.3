@@ -56,6 +56,8 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 - `os.pullEvent`・`os.pullEventRaw` はその場で待ち、コルーチンの中でも yield しない（コルーチンのスケジューラーで変わることがある）
 - `os.sleep` はほかのイベントを捨てない（キューに残る）
 - `os.time`・`os.clock`・`os.date` は標準の Lua のもの
+- `os.day`・`os.epoch` の値が違う。CC: Tweaked はゲーム内の日を 1 から数え、時刻を 6000 tick ずらす（1 日の始まりが 6 時）。また、ワールドの時刻（`/time set` で変わる）を使う。ここの `ingame` はワールドの tick の数え（進む一方）を使い、`os.day` はそれを 24000 で割ったもの（0 から）、`os.epoch` は 3600 倍したもの（CC: Tweaked は同じ値に 30000 tick、つまり 108000000 ミリ秒を足す）。`utc`・`local` の日数も 0（1970-01-01）から数える（CC: Tweaked は 1 から）。理由は、tick の数えは `/time set` で変わらないので、時間を測るのに使えるため
+- グローバルの `sleep` はなく、`os.sleep` だけ（CC: Tweaked は両方ある）。標準のグローバルは変えない
 - タイムゾーンはない。`local` は UTC
 - `os.queueEvent` はほかのプログラムに届かない
 - `os.getComputerID`・`os.getComputerLabel`・`os.setComputerLabel`・`os.run`・`os.loadAPI` はない

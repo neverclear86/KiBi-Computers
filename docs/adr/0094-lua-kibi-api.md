@@ -31,7 +31,8 @@
 - 確保できなければ線形メモリの外（`0xFFFFFFF8`。標準 OS の `canon.zig` と同じ）を返し、ホストにトラップさせる。0 は返さない（アドレス 0 から書かれてメモリを壊す）
 - `cabi_realloc` の中では Lua の API・エラー・止まりうる import を呼ばない
 - import の前に、結果の最大の大きさが入るかを見る（`kibi_lua_reserve`）。RAM の残りが十分ならそのまま進む。少なければ、その大きさの場所を先に取り（解放した穴に入れば新しく数えない）、`cabi_realloc` はそこから切り出す。取れなければ `not enough memory` の Lua のエラーにする（pcall で受けられる。トラップにしない）。RAM は解放しても減らないので、残りだけを見ると、一度上限に達した後は穴があっても断り続けるため
-- 見積もり（仮の値）: `invoke` は値 32 個＋文字列 64 KiB＋1 KiB、`list-devices` は 256 台 × 116 バイト、`methods` は 16 KiB、`open`・`info` は 512 バイト、`take` は 8 件 × 約 4.8 KiB
+- 見積もり（仮の値）: `invoke` は値 32 個＋文字列 64 KiB＋失敗の文 1 KiB＋揃えの余り 1 KiB、`list-devices` は 256 台 × 116 バイト、`methods` は 256 個 × 76 バイト＋余り 1 KiB（`info` と合わせて取る）、`open`・`info` は 512 バイト、`take` は 8 件 × 約 4.8 KiB
+- **見積もりはホスト側の上限が裏付ける**（超えるとトラップになるため）。`call-error` の `bad-arguments`・`failed` の message は、ホストが 1,024 バイト（UTF-8。文字の途中では切らない）に切り詰める（`DeviceLimits.MAX_ERROR_MESSAGE_BYTES`。デバイスの作者が自由に書ける文なので）。1つのデバイスのメソッドは 256 個までで、超えるデバイスは `DeviceBus.attach` が `IllegalArgumentException` で断る（`DeviceLimits.MAX_METHODS`。名前は 64 バイトまでなので 1 個 76 バイトで見積もれる）。どちらも仮の値（確定は #251）
 
 ## peripheral
 
@@ -49,7 +50,7 @@
 | `bytes(s)` | bytes として渡す文字列を包む（KiBi だけ。CC にはない） |
 
 - 名前は address。36 バイトなら大文字を小文字に直してから開く（カーネルは大文字を受けない）
-- **fd を持ち続けない。** `call` も `wrap` の関数も、呼ぶたびに open → invoke → drop する。fd はプロセスあたり 256、デバイスは最大 256 なので、全部の fd を持つと `mfile` に当たる。`__gc` で閉じる形にすると、二重の drop（トラップ）と GC の遅れによる fd の枯渇を気にすることになる
+- **fd を持ち続けない。** `call` も `wrap` の関数も、呼ぶたびに open → invoke → drop する。import の結果（`info`・`methods`・`invoke`）を読んだらすぐ drop してから Lua の値に写す（写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れない。漏れると 256 個で `mfile` になり peripheral 全体が使えなくなる）。fd はプロセスあたり 256、デバイスは最大 256 なので、全部の fd を持つと `mfile` に当たる。`__gc` で閉じる形にすると、二重の drop（トラップ）と GC の遅れによる fd の枯渇を気にすることになる
 - `wrap` は作ったときの kind を覚え、呼ぶたびに `info` で確かめる。違えば（同じ address に別の種類がつながったら）`No such peripheral`（fd を持つ場合に kind が変わると届かないのと同じ振る舞い）
 - `wrap` のテーブルのメタテーブル: `__name = "peripheral"`・`name`・`type`。`getType`・`hasType`・`getMethods`・`getName` は wrap したテーブルも受ける（CC と同じ）
 - メソッドの別名: ケバブケース（`get-size`）は Lua の識別子にならないので、`wrap` のテーブルにキャメルケース（`getSize`）も入れる。「`-`＋英小文字」を大文字にし、`-` の後が英小文字でないもの（`a-1`・`a--b`・末尾の `-`）には付けない。本来の名前は大文字を含まない（`[a-z][a-z0-9_-]*`）ので、ぶつからない。`call` は大文字を「`-`＋小文字」に直してから呼ぶ（両方の形を受ける）
@@ -92,6 +93,7 @@
 - `pullEvent` は `terminate` で `Terminated` のエラー（CC と同じ。今は `terminate` を出すものはない）
 - `queueEvent(name, ...)`: その時点で届いているもの（期限の来たタイマー、開いていればキューのイベント）を先に FIFO に移してから、後ろに積む（CC と同じ順）。値はどの Lua の値でもよい。ほかのプロセスには届かない（ゲストがイベントを出す import はない）
 - `take` の `dropped` は黙って捨てず、`events_dropped`（捨てた数）のイベントにする
+- 取り出したイベントを FIFO に移す途中で Lua の確保がメモリ不足になったら、移せなかった数を C の変数（`events_lost`）に数え、次に確保できたときに `events_dropped` にする（取り出し済みのイベントはカーネルのキューに戻せないので、せめて「失った」と知らせる）。FIFO の末尾は積み終えてから進める（確保に失敗しても穴ができない）。タイマーも、イベントを積んでから表から外す（積む途中で失敗しても次に鳴る）
 
 イベントの名前の写し方:
 
@@ -116,14 +118,20 @@
 
 ### 時刻と電源
 
-- `epoch([kind])`: ミリ秒の整数。`ingame`（既定。CC と同じ）は `world-ticks` × 3600（1 tick = 3.6 秒）、`utc` は `clock_time_get(REALTIME)`、`local` は utc と同じ（タイムゾーンがない）
+- `epoch([kind])`: ミリ秒の整数。`ingame`（既定）は `world-ticks` × 3600（1 tick = 3.6 秒）、`utc` は `clock_time_get(REALTIME)`、`local` は utc と同じ（タイムゾーンがない）
 - `day([kind])`: `ingame` は `world-ticks` ÷ 24000、`utc`・`local` は 1970-01-01 からの日数
+- **CC と値が違う**（man の違いに書いた）: CC の `ingame` は、ワールドの時刻（`Level.getDayTime()`。`/time set` で変わる）に 6000 tick を足して、日を 1 から数える（`os.day` = (dayTime + 6000) ÷ 24000 + 1、`os.epoch` = (dayTime + 30000) × 3600 ms）。CC の `utc` の日数も 1 から（1970-01-01 が 1）。KiBi は `world-ticks`（ゲーム内時間。進む一方）を 0 から数える。時間を測る用途には、`/time set` で飛ばない後者が向くため。CC に値を合わせる上書きは #237 に回す
+- グローバルの `sleep`（CC の bios が定義する）は足さない。標準のグローバルは変えない方針（`os.sleep` はある）。#237 で足す
 - `shutdown()`: `fflush(NULL)` してから `kibi:computer/power.shutdown`（戻らない）
 - `reboot()`: `fflush(NULL)` してから `reboot`。断られたら（`not-supported`）`false, "not-supported"` を返す
 
 ### #95 との境目
 
 `pullEventRaw` は今はその場でカーネルを待ち、コルーチンの中でも yield しない。#95 で、CC と同じく `coroutine.yield` に基づくスケジューラーに置き換える前提（`os.pullEventRaw` を Lua で包み直せば差し替えられる）。コルーチンの中での振る舞いはテストで固めない（`pcall`・コルーチン・`string.gsub` のコールバックの中で待てることだけを確かめる）。
+
+### テストで確かめていないこと
+
+RAM の上限の近くで、import の結果を読んだ後の Lua の確保だけが失敗する経路（fd を閉じること、取り出したイベントを数えること）は、決まった形では再現できず、テストにしていない。残りが 4 KiB 単位で減ることに頼って、埋めながら試す形は、上限の近くの別のトラップ（Issue にした）に当たって安定しなかった。コードの順（fd を先に閉じる、積み終えてから進める）で保っている。
 
 ## 範囲に入れなかったもの
 
@@ -144,7 +152,7 @@
 ## テスト
 
 - `LuaKibiApiTest`（実際の Endive・`lua.wasm`・カーネル）: peripheral の各関数（直接とメインスレッドのメソッド、大文字の address、別名）、`wrap`・`find`・`getName`、wrap の後の kind の付け替え、値の写し方の境界（整数の値の float、-0.0・NaN・inf・2^63、不正な UTF-8、bytes、途中の nil、32/33 個、64 KiB）、エラーの写し方、接続・切断・デバイスのイベント、タイマーと `queueEvent` の順・フィルター・`sleep` がイベントを捨てないこと、`pcall`・コルーチン・`gsub` の中で待つこと、`reboot` の断り、`shutdown`、キューを遅れて開くこと、RAM の上限の近くで `not enough memory` になり CRASHED にならないこと
-- `LuaKibiApiRestoreTest`: `pullEvent` で待つ間に保存して戻すと `restored` を受ける。`peripheral.call` の実行中に保存して戻すと `interrupted` のエラーで、メソッドは1回だけ走る
+- `LuaKibiApiRestoreTest`: `pullEvent` で待つ間に保存して戻すと `restored` を受ける。`startTimer`・`sleep` で待つ間に保存して戻すと、同じ期限で続く（Lua の中のタイマーの表・FIFO と、C の静的変数が戻した後もそろっている）。`peripheral.call` の実行中に保存して戻すと `interrupted` のエラーで、メソッドは1回だけ走る
 - `LuaWasmTest`: 素の Endive で動かすため、足した import のスタブを足した
 - `ManCommandTest`: man3 のページがあること
 - `StandardOsRestoreTest`: `cabi_realloc` を export するプログラムに `/bin/lua` が加わった

@@ -25,11 +25,19 @@
 #define MAX_METHOD_BYTES 64
 #define ADDRESS_BYTES 36
 
-/* 結果の見積もり（kibi_lua_check_memory に渡す）。invoke は値 32 個の並び＋文字列 64 KiB＋エラーの文 */
-#define INVOKE_RESULT_BYTES (MAX_VALUES * 16 + MAX_PAYLOAD_BYTES + 1024)
+/* ホストが切り詰める上限（DeviceLimits）: call-error の message（バイト）、メソッドの数 */
+#define MAX_ERROR_MESSAGE_BYTES 1024
+#define MAX_METHODS 256
+
+/*
+ * 結果の見積もり（kibi_lua_check_memory に渡す）。invoke は値 32 個の並び＋文字列 64 KiB＋確保ごとの揃えの余り（エラーのときは
+ * エラーの文 MAX_ERROR_MESSAGE_BYTES。成功と排他なので余りに含める）
+ */
+#define INVOKE_RESULT_BYTES (MAX_VALUES * 16 + MAX_PAYLOAD_BYTES + MAX_ERROR_MESSAGE_BYTES + 1024)
 /* list-devices（最大 256 台。address 36 バイト＋種類＋並び 16 バイト）・methods・info の見積もり */
 #define LIST_RESULT_BYTES (256 * (16 + ADDRESS_BYTES + 64))
-#define METHODS_RESULT_BYTES (16 * 1024)
+/* methods は 1 件あたり 12 バイト＋名前 64 バイト（最大 MAX_METHODS 件）＋並びの揃え */
+#define METHODS_RESULT_BYTES (MAX_METHODS * (12 + MAX_METHOD_BYTES) + 1024)
 #define INFO_RESULT_BYTES 512
 
 /* ---- 名前（address） ---- */
@@ -139,11 +147,15 @@ static void reserve_or_close(lua_State *L, uint32_t fd, size_t need) {
     }
 }
 
-/* 開いたデバイスの種類を積む */
+/*
+ * 開いたデバイスの種類を積む。fd は閉じる（import の結果を読んだらすぐ閉じてから Lua の値に写す。
+ * 写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れないように）
+ */
 static void push_kind(lua_State *L, uint32_t fd) {
     reserve_or_close(L, fd, INFO_RESULT_BYTES);
     kibi_device_info_t info;
     kibi_device_info(fd, &info);
+    kibi_device_drop(fd);
     lua_pushlstring(L, info.kind.ptr, info.kind.len);
     kibi_lua_arena_reset();
 }
@@ -410,8 +422,7 @@ static int type_of(lua_State *L, int idx) {
     check_address(L, idx, &a);
     int64_t fd = open_device(L, &a);
     if (fd < 0) return 0;
-    push_kind(L, (uint32_t)fd);
-    kibi_device_drop((uint32_t)fd);
+    push_kind(L, (uint32_t)fd); /* fd は閉じる */
     return 1;
 }
 
@@ -444,23 +455,25 @@ static int l_hasType(lua_State *L) {
     return 1;
 }
 
-/* fd のメソッドの名前の並びを積む（呼ぶ前に kibi_lua_reserve を済ませること） */
-static void push_methods(lua_State *L, uint32_t fd) {
+/*
+ * 開いた fd のメソッドの並びと種類を積む（methods, kind の順）。fd は閉じる。
+ * メモリが足りないときも fd を閉じてから Lua のエラーにする。import の結果を読んだらすぐ fd を閉じてから Lua の値に写す
+ * （写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れないように）
+ */
+static void push_methods_and_kind(lua_State *L, uint32_t fd) {
+    reserve_or_close(L, fd, METHODS_RESULT_BYTES + INFO_RESULT_BYTES);
     kibi_device_list_method_info_t l;
     kibi_device_methods(fd, &l);
+    kibi_device_info_t info;
+    kibi_device_info(fd, &info);
+    kibi_device_drop(fd);
     lua_createtable(L, (int)l.len, 0);
     for (size_t i = 0; i < l.len; i++) {
         lua_pushlstring(L, l.ptr[i].name.ptr, l.ptr[i].name.len);
         lua_rawseti(L, -2, (lua_Integer)i + 1);
     }
+    lua_pushlstring(L, info.kind.ptr, info.kind.len);
     kibi_lua_arena_reset();
-}
-
-/* 開いた fd のメソッドの並びと種類を積む。メモリが足りないときは fd を閉じてから Lua のエラーにする */
-static void push_methods_and_kind(lua_State *L, uint32_t fd) {
-    reserve_or_close(L, fd, METHODS_RESULT_BYTES);
-    push_methods(L, fd);
-    push_kind(L, fd);
 }
 
 /* peripheral.getMethods(name) */
@@ -472,8 +485,7 @@ static int l_getMethods(lua_State *L) {
         lua_pushnil(L);
         return 1;
     }
-    push_methods_and_kind(L, (uint32_t)fd);
-    kibi_device_drop((uint32_t)fd);
+    push_methods_and_kind(L, (uint32_t)fd); /* fd は閉じる */
     lua_pop(L, 1);
     return 1;
 }
@@ -488,8 +500,7 @@ static int l_getName(lua_State *L) {
 static int wrap(lua_State *L, const address_t *a) {
     int64_t fd = open_device(L, a);
     if (fd < 0) return 0;
-    push_methods_and_kind(L, (uint32_t)fd); /* methods, kind */
-    kibi_device_drop((uint32_t)fd);
+    push_methods_and_kind(L, (uint32_t)fd); /* methods, kind。fd は閉じる */
     int methods = lua_gettop(L) - 1;
     int kind = lua_gettop(L);
     lua_Integer n = luaL_len(L, methods);

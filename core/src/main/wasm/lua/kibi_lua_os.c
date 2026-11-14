@@ -47,6 +47,13 @@ static lua_Integer next_timer_id = 0;
 static lua_Integer timer_count = 0;
 /* キューの fd（開いていなければ -1） */
 static int32_t queue_fd = -1;
+/*
+ * FIFO に移せなかった（取り出した後に Lua の確保でメモリ不足になった）イベントと、カーネルが捨てたイベントの数。
+ * 次に確保できたとき "events_dropped" のイベントにする（黙って捨てない）
+ */
+static uint64_t events_lost = 0;
+/* convert_batch が FIFO に移し終えたイベントの数 */
+static uint32_t convert_done = 0;
 
 static int64_t monotonic_now(void) {
     __wasi_timestamp_t t = 0;
@@ -83,7 +90,9 @@ static void fifo_push(lua_State *L, int n) {
     lua_setfield(L, -2, "n");
     push_registry(L, &FIFO_KEY);
     lua_insert(L, -2);
-    lua_rawseti(L, -2, fifo_tail++);
+    /* 積み終えてから進める（確保に失敗して longjmp しても、fifo_tail だけ進んで穴ができないように） */
+    lua_rawseti(L, -2, fifo_tail);
+    fifo_tail++;
     lua_settop(L, base - 1);
 }
 
@@ -143,10 +152,11 @@ static void fire_timers(lua_State *L) {
     int64_t deadline;
     lua_Integer id;
     while (earliest_timer(L, &deadline, &id) && deadline <= now) {
-        remove_timer(L, id);
+        /* 先に積む（積む途中でメモリ不足になっても、タイマーは残って次に鳴る） */
         lua_pushliteral(L, "timer");
         lua_pushinteger(L, id);
         fifo_push(L, 2);
+        remove_timer(L, id);
     }
 }
 
@@ -232,10 +242,39 @@ static void push_kernel_event(lua_State *L, const kibi_event_t *e) {
     fifo_push(L, n + (int)nvals);
 }
 
-/* 開いたキューから、待たずに取れるイベントをすべて FIFO に移す。移した数を返す */
+/* lua_pcall で呼ぶ。取り出したイベント（引数 1 の lightuserdata が指す結果）を、FIFO に移し終えたものの次から移す */
+static int convert_batch(lua_State *L) {
+    const kibi_result_event_batch_t *r = (const kibi_result_event_batch_t *)lua_touserdata(L, 1);
+    uint32_t n = r->val.ok.events.len;
+    while (convert_done < n) {
+        push_kernel_event(L, &r->val.ok.events.ptr[convert_done]);
+        convert_done++;
+    }
+    return 0;
+}
+
+static void add_lost(uint64_t n) {
+    events_lost = n > UINT64_MAX - events_lost ? UINT64_MAX : events_lost + n;
+}
+
+/* 数えておいた失ったイベントを "events_dropped" のイベントにする。積めたら 1（積めなければ Lua のエラーで、数は残る） */
+static int flush_lost(lua_State *L) {
+    if (events_lost == 0) return 0;
+    lua_pushliteral(L, "events_dropped");
+    lua_pushinteger(L, events_lost > (uint64_t)INT64_MAX ? INT64_MAX : (lua_Integer)events_lost);
+    fifo_push(L, 2);
+    events_lost = 0;
+    return 1;
+}
+
+/*
+ * 開いたキューから、待たずに取れるイベントをすべて FIFO に移す。移した数を返す。
+ * 取り出した後に Lua の確保でメモリ不足になったら、移せなかった数を events_lost に数えてから、そのエラーを投げる
+ * （取り出し済みのイベントは戻せないので、せめて「失った」と後で知らせる）
+ */
 static int take_kernel_events(lua_State *L) {
     if (queue_fd < 0) return 0;
-    int moved = 0;
+    int moved = flush_lost(L);
     for (;;) {
         kibi_lua_arena_reset();
         kibi_lua_check_memory(L, TAKE_RESULT_BYTES);
@@ -246,16 +285,18 @@ static int take_kernel_events(lua_State *L) {
             return luaL_error(L, "cannot take events: %s", kibi_lua_error_name(r.val.err));
         }
         uint32_t n = r.val.ok.events.len;
-        uint64_t dropped = r.val.ok.dropped;
-        for (uint32_t i = 0; i < n; i++) push_kernel_event(L, &r.val.ok.events.ptr[i]);
-        kibi_lua_arena_reset();
-        if (dropped > 0) {
-            /* あふれて捨てたイベントの数（黙って捨てない） */
-            lua_pushliteral(L, "events_dropped");
-            lua_pushinteger(L, dropped > (uint64_t)INT64_MAX ? INT64_MAX : (lua_Integer)dropped);
-            fifo_push(L, 2);
+        convert_done = 0;
+        lua_pushcfunction(L, convert_batch);
+        lua_pushlightuserdata(L, &r);
+        int status = lua_pcall(L, 1, 0, 0);
+        add_lost(r.val.ok.dropped); /* あふれて捨てたイベントの数 */
+        if (status != LUA_OK) {
+            add_lost(n - convert_done);
+            kibi_lua_arena_reset();
+            return lua_error(L);
         }
-        moved += (int)n + (dropped > 0);
+        kibi_lua_arena_reset();
+        moved += (int)n + flush_lost(L);
         if (n < TAKE_MAX) return moved;
     }
 }
