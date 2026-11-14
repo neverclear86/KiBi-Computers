@@ -164,7 +164,7 @@ class ManCommandTest {
     }
 
     @Test
-    fun `節を書くとその節だけを探し、書かなければ1・8・5・7の順`() {
+    fun `節を書くとその節だけを探し、書かなければ1・8・3・5・7の順`() {
         val out = sh(
             """
             man inittab | head -1
