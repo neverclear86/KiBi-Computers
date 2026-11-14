@@ -21,10 +21,11 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  *   つないだ後で出さなくなったら、次のつなぎ直しで外す
  * - 同じ実体（[DeviceHolder.exclusionKey]）の登録は、どれか1つを通してだけつなぐ（#153、ADR 0153。[DeviceRegistry.isFreeFor]）
  * - 持ち主やデバイス（他 MOD のコード）が投げた例外は受けて、つながずに手放す（[Host.onAttachFailed]・[Host.onDetachFailed]。
- *   JVM が続けられないもの（[rethrowIfFatal]）だけ投げ直す）。**つなぐときに投げた登録は、この結線では同じ登録（世代）の間は
+ *   JVM が続けられないもの（[rethrowIfFatal]）だけ投げ直す）。つないだ後の知らせ（持ち主の onConnected）が投げたときは、
+ *   つないだままにして [Host.onConnectedFailed] で知らせる。**つなぐときに投げた登録は、この結線では同じ登録（世代）の間は
  *   もう試さない**（[failed]）。新しい登録になる・候補から外れる・[disconnect] するまで。(結線, 登録) の組ごとに、投げて失敗するのは
  *   1回までなので、失敗 → 手放し → 知らせ → 再試行が2台の間で回り続けない。満杯で断ったものは覚えない（空いたら見直す。ADR 0066）
- * - catch・finally の中と、[Host] の知らせ（[Host.onRefused]・[Host.onAttachFailed]・[Host.onDetachFailed]）には、他 MOD の
+ * - catch・finally の中と、[Host] の知らせ（[Host.onRefused]・[Host.onAttachFailed]・[Host.onConnectedFailed]・[Host.onDetachFailed]）には、他 MOD の
  *   コードを呼ばずに済む値（登録・読み済みの address・例外）だけを渡す
  *
  * マシンが動いているかは、呼び手が [Machine.isRunningBootingOrRebooting] で1回だけ読んで決める（#625・#626）。
@@ -50,10 +51,17 @@ public class MachineWiring<K : Any>(
         public fun onRefused(machine: Machine, holder: DeviceHolder<K>) {}
 
         /**
-         * [entry] をつなげなかった（address・種類の形の誤り、持ち主やデバイスが投げたなど）。[address] はそれまでに読めた address
-         * （読む前に投げたら `null`）。他 MOD のコード（持ち主の address の読み書きなど）を呼ばない
+         * [entry] をつなげなかった（address・種類の形の誤り、持ち主やデバイスが投げたなど）。つながずに手放し、同じ登録の間はもう試さない。
+         * [address] はそれまでに読めた address（読む前に投げたら `null`）。他 MOD のコード（持ち主の address の読み書きなど）を呼ばない。
+         * つないだ後の知らせが投げたときは、これではなく [onConnectedFailed] を呼ぶ
          */
         public fun onAttachFailed(entry: DeviceRegistry.Entry<K>, address: String?, error: Throwable) {}
+
+        /**
+         * [entry] はつないだが、その後の知らせ（持ち主の [DeviceHolder.onConnected] か [onConnected]）が投げた。つないだままにする
+         * （外すのは、ほかのデバイスと同じく候補から外れたとき）。[address] はつないだ address。他 MOD のコードを呼ばない
+         */
+        public fun onConnectedFailed(entry: DeviceRegistry.Entry<K>, address: String, error: Throwable) {}
 
         /**
          * [entry] を外すときに、持ち主かデバイスが投げた（外すのは済んでいる）。[address] はつないだときの address。
@@ -195,10 +203,14 @@ public class MachineWiring<K : Any>(
             host.onConnected(holder, device)
         } catch (t: Throwable) {
             rethrowIfFatal(t)
-            // つなげなかったら、この登録の間はもう試さない（失敗 → 手放し → 知らせ → 再試行が回り続けないように）。
-            // つないだ後の知らせ（持ち主の onConnected）が投げたときは、つないだままにする
-            if (!attached) failed[entry.key] = entry
-            host.onAttachFailed(entry, address, t)
+            if (attached) {
+                // つないだ後の知らせ（持ち主・接続層の onConnected）が投げた。つないだままにし、つなげなかったとは知らせない
+                host.onConnectedFailed(entry, address!!, t)
+            } else {
+                // つなげなかったら、この登録の間はもう試さない（失敗 → 手放し → 知らせ → 再試行が回り続けないように）
+                failed[entry.key] = entry
+                host.onAttachFailed(entry, address, t)
+            }
         } finally {
             if (!attached) registry.drop(entry, this, notify = true)
         }

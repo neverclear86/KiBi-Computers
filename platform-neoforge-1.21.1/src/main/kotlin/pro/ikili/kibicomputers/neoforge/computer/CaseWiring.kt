@@ -175,6 +175,10 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
         LOGGER.warn("Could not attach the {} ({}); not retrying it until it changes", nameOf(entry.holder), address ?: "no address", error)
     }
 
+    override fun onConnectedFailed(entry: DeviceRegistry.Entry<GlobalPos>, address: String, error: Throwable) {
+        LOGGER.warn("The {} ({}) threw after it was attached; keeping it attached", nameOf(entry.holder), address, error)
+    }
+
     override fun onDetachFailed(entry: DeviceRegistry.Entry<GlobalPos>, address: String, error: Throwable) {
         LOGGER.warn("The {} ({}) threw while detaching", nameOf(entry.holder), address, error)
     }
