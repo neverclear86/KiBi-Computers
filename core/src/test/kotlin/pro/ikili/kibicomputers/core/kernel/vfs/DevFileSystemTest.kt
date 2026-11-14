@@ -166,4 +166,63 @@ class DevFileSystemTest {
         // touch は通る
         v.setTimes(p("/dev/device/$a1"), 1, 2)
     }
+
+    /** [a1] と node が同じになる address（上位と下位の 64 ビットの入れ替え・ビット 62 だけ違うもの。#693） */
+    private val swapped = "a4564266-1417-4000-123e-4567e89b12d3"
+    private val bit62 = "523e4567-e89b-12d3-a456-426614174000"
+
+    @Test
+    fun `nodeが同じになる2つのデバイスは、開いたパスの名前のデバイスに差し替わる`() {
+        for (b in listOf(swapped, bit62)) {
+            assertEquals(DevFileSystem.deviceNode(a1), DevFileSystem.deviceNode(b), "前提: node が衝突する")
+            // 先に a1 を入れる（node で引くと、先に見つかる a1 が開いてしまう）
+            val devices = Devices().also {
+                it.table[a1] = "kibi:screen"
+                it.table[b] = "kibi:keyboard"
+            }
+            val v = vfs(DevFileSystem(devices = devices))
+            val fb = v.open(p("/dev/device/$b"), OpenOptions(read = true, write = true))
+            assertEquals(SpecialFile.Device(b, "kibi:keyboard"), v.specialLocked(fb))
+            val fa = v.open(p("/dev/device/$a1"), OpenOptions(read = true, write = true))
+            assertEquals(SpecialFile.Device(a1, "kibi:screen"), v.specialLocked(fa))
+            // 一覧と stat では同じ node に見える（既知の制約）
+            assertEquals(v.stat(p("/dev/device/$a1")), v.stat(p("/dev/device/$b")))
+            assertEquals(FileType.CHARACTER_DEVICE, v.stat(p("/dev/device/$b")).type)
+        }
+    }
+
+    @Test
+    fun `開いてから差し替えるまでに外れたら、nodeが同じ別のデバイスが残っていてもDetached`() {
+        val devices = Devices().also {
+            it.table[a1] = "kibi:screen"
+            it.table[swapped] = "kibi:keyboard"
+        }
+        val fs = DevFileSystem(devices = devices)
+        val v = vfs(fs)
+        val node = DevFileSystem.deviceNode(swapped)
+        val f = v.open(p("/dev/device/$swapped"), OpenOptions(read = true))
+        devices.table.remove(swapped)
+        assertSame(SpecialFile.Detached, v.specialLocked(f))
+        // 片方が残っていれば node は生きている。両方外れたら STALE
+        assertEquals(node, fs.statNode(node).node)
+        devices.table.remove(a1)
+        assertEquals(Errno.STALE, errno { fs.statNode(node) })
+    }
+
+    @Test
+    fun `specialは名前がaddressの形でないかnodeと合わなければDetachedで、例外を投げない`() {
+        val devices = Devices().also {
+            it.table[a1] = "kibi:screen"
+            it.table["NOT-A-UUID"] = "kibi:screen"
+        }
+        val fs = DevFileSystem(devices = devices)
+        val node = DevFileSystem.deviceNode(a1)
+        assertEquals(SpecialFile.Device(a1, "kibi:screen"), fs.special(node, a1))
+        assertSame(SpecialFile.Detached, fs.special(node, a2), "node と合わない名前")
+        assertSame(SpecialFile.Detached, fs.special(node, a1.uppercase()))
+        assertSame(SpecialFile.Detached, fs.special(node, "NOT-A-UUID"))
+        assertSame(SpecialFile.Detached, fs.special(node, ""))
+        assertSame(SpecialFile.Terminal, fs.special(DevFileSystem.TTY_NODE, "tty"))
+        assertNull(fs.special(DevFileSystem.NULL_NODE, "null"))
+    }
 }

@@ -455,11 +455,12 @@ internal class Vfs(
 
     /**
      * [file] を fd に入れるときの差し替え先（`/dev/tty`・`/dev/device/<address>`。[FileSystem.special]。I/O をしない）。
-     * 普通のファイル・ディレクトリ・外れたマウントは `null`
+     * ファイルシステムには、node と開いたときのパスの最後の名前を渡す（#693。マウントの中の相対パスは作らない。復元した
+     * [OpenFile] のパスはマウントより浅いことがあり、ロックの中で投げうるため）。普通のファイル・ディレクトリ・外れたマウントは `null`
      */
     fun specialLocked(file: OpenFile): SpecialFile? {
         if (file.mountId == 0 || file.isDirectory) return null
-        return view.fileSystems[file.mountId]?.special(file.node)
+        return view.fileSystems[file.mountId]?.special(file.node, file.path.name)
     }
 
     /**
