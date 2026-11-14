@@ -51,6 +51,12 @@ class AsyncFuelTest {
         vfs.write(f, bytes, 0, bytes.size)
     }
 
+    /** [install] 済みのマシンに、実行ファイルを足す */
+    private fun Machine.put(path: String, bytes: ByteArray) {
+        val f = vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
+        vfs.write(f, bytes, 0, bytes.size)
+    }
+
     private inner class Spin(val h: Harness, val m: Machine, args: List<String>, install: Boolean = true) {
         val output: Int = m.lock.withLockValue { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
         val pid: Int
@@ -227,6 +233,50 @@ class AsyncFuelTest {
     }
 
     @Test
+    fun `計算し続ける待機点型2本と、スレッドを持って待つ型1本が混ざると、後者は少ない側に偏るが飢えない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // 1 tick に 4 スライス。燃料待ちの全員を起こすとき、スレッドを持たない側（巻き戻して待つ側）は、カーネルロックの中でその順に
+            // CPU の待ち行列に並ぶが、スレッドを持って待つ側は、起きてロックを取り直してから CPU に着くので、同じ回で起こされた
+            // スレッドを持たない側の後ろになる（ADR 0047）。ずれではなく、決まった向きの偏りで、取り分は少ない側でも毎 tick 1 スライス
+            val slice = 20_000L
+            val m = h.machine(fuelPerTick = slice * 4, fuelSlice = slice)
+            val runs = ConcurrentHashMap<Int, AtomicInteger>()
+            h.scheduler.hooks.beforeFuelUnwound = { _, pid -> runs.computeIfAbsent(pid) { AtomicInteger() }.incrementAndGet() }
+            val w1 = Spin(h, m, listOf("main", "1000000", "100"))
+            val w2 = Spin(h, m, listOf("main", "1000000", "100"), install = false)
+            m.put("/bin/fallback", fallbackModule(100_000_000))
+            val stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)
+            val blocking = m.exec("/bin/fallback", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("fallback"), stdio = stdio))
+            assertFalse(m.rt(blocking).program.fuelYield, "燃料切れを待ち点にできるモジュールになっている")
+            eventually(30_000, "3 本とも燃料待ちにならない") { m.fuelWaiterCount == 3 }
+            val ticks = 12
+            val perTick = ArrayList<Int>()
+            var prevW = 0
+            for (k in 1..ticks) {
+                val woken0 = h.scheduler.dispatcher.woken.get()
+                h.scheduler.tick()
+                eventually(30_000, "tick $k: 燃料を使い切らない") {
+                    h.scheduler.dispatcher.woken.get() - woken0 >= 3 && m.fuelWaiterCount == 3 && m.lock.withLockValue { m.kernel.fuel <= 0 }
+                }
+                val w = listOf(w1.pid, w2.pid).sumOf { runs[it]?.get() ?: 0 }
+                perTick += 4 - (w - prevW)
+                prevW = w
+            }
+            // 巻き戻して待つ側が動いたスライスの数 = 全部のスライス - スレッドを持って待つ側の数（tick ごとのスレッドを持つ側の数）
+            val counts = listOf(w1.pid, w2.pid).map { runs[it]?.get() ?: 0 }
+            val blockingSlices = ticks * 4 - counts.sum()
+            assertEquals(blockingSlices, perTick.sum())
+            // 飢えない: 毎 tick 少なくとも 1 スライスは動く（スレッドを持つ側は燃料待ちから起きるたびに CPU を取り直すので、取り分は tick ごとに 1 以上）
+            assertTrue(perTick.all { it >= 1 }, "スレッドを持って待つ側が動かなかった tick がある: $perTick（巻き戻す側 $counts）")
+            // 巻き戻す側も飢えない
+            assertTrue(counts.all { it >= ticks }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
+            // 偏りの向き: スレッドを持って待つ側は、巻き戻す側のどちらよりも少ない（手で追った結果は 1 : 1.5 : 1.5。実測も毎 tick 1 スライス）
+            assertTrue(blockingSlices <= counts.min(), "偏りの向きが変わった: スレッドを持つ側 $perTick、巻き戻す側 $counts")
+            for (pid in listOf(w1.pid, w2.pid, blocking)) m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
+        }
+    }
+
+    @Test
     fun `前借りを挟んでも、葉の関数で計算し続ける2つのプロセスは同じtickの中で交代して最後まで進む`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             // 葉の関数の中のスライス切れは、待つ者がいれば前借りして先へ進み、止まりうる関数（main）に戻ったところで巻き戻して譲る（#477、#47）
@@ -248,6 +298,53 @@ class AsyncFuelTest {
             assertTrue(h.scheduler.fuelOverdrafts.get() > overdrafts0, "前借りしていない")
             assertTrue(h.scheduler.fuelYields.get() > yields0, "譲っていない")
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+        }
+    }
+
+    @Test
+    fun `計算し続ける待機点型の2本がいても、イベントで起きた待機点型のプロセスは同じtickの中で動く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // 1 tick の燃料は、起こされたプロセスが動くまでに使い切られないほど大きい（tick は最初の 1 回だけ進める）。
+            // 「前借り → 巻き戻して譲る」道を通る葉の関数で計算し続ける 2 本と、標準 OS のシェルと同じ「入力を待つ待機点型」
+            // （スレッドを持たず、イベントで CPU の待ち行列に並ぶ側）を同じ台に置く（#47）
+            val m = h.machine(fuelPerTick = 1_000_000_000, fuelSlice = 40_000)
+            val a = Spin(h, m, listOf("leaf", "1000000", "30000"))
+            val b = Spin(h, m, listOf("leaf", "1000000", "30000"), install = false)
+            m.put("/bin/prompt", resource("prompt-wasi.wasm"))
+            val ids = m.lock.withLockValue {
+                ByteStream(4096).also { m.kernel.objects.add(it) }.id to ByteStream(4096).also { m.kernel.objects.add(it) }.id
+            }
+            val stdio = StdioSpec(StdioSource.Object(ids.first, HandleRights.READ), StdioSource.Object(ids.second, HandleRights.WRITE), StdioSource.Closed)
+            val prompt = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio))
+            val promptOut = StringBuilder()
+            fun promptOutput(): String {
+                m.lock.withLockValue {
+                    val s = m.kernel.objects[ids.second] as ByteStream
+                    val buf = ByteArray(s.available)
+                    s.read(buf, 0, buf.size, m.wakeSink)
+                    promptOut.append(String(buf, Charsets.UTF_8))
+                }
+                return promptOut.toString()
+            }
+            // 3 本とも動き始め、プロンプトが入力を待つところ（イベント待ち）まで進める。この後 tick は進めない
+            h.scheduler.tick()
+            val tick = h.scheduler.now
+            eventually(60_000, "プロンプトで待たない: ${promptOutput()}") {
+                promptOutput().endsWith("> ") && m.stateOf(prompt) == ProcessState.WAITING_EVENT
+            }
+            // 計算し続ける 2 本が、同じ tick の中で、スライスを使い切るたびに巻き戻して譲り合っている
+            val yields0 = h.scheduler.fuelYields.get()
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            eventually(60_000, "計算し続ける 2 本が譲り合わない") { h.scheduler.fuelYields.get() - yields0 >= 4 }
+            assertEquals(unwinds0, h.scheduler.fuelUnwinds.get(), "tick の燃料を使い切った")
+            m.lock.withLockValue { (m.kernel.objects[ids.first] as ByteStream).write("ping\n".toByteArray(), 0, 5, m.wakeSink) }
+            // 入力が着いたら、tick を進めずに（燃料を待たずに）CPU の待ち行列に並んで、1 行を返す
+            eventually(60_000, "同じ tick の中で動かない: ${promptOutput()}") { promptOutput().contains("1 ping ") }
+            assertEquals(tick, h.scheduler.now, "tick が進んだ")
+            assertEquals(unwinds0, h.scheduler.fuelUnwinds.get(), "tick の燃料を使い切ってから動いた")
+            assertTrue(m.lock.withLockValue { m.kernel.fuel } > 0, "1 tick の燃料を使い切った")
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+            for (pid in listOf(a.pid, b.pid, prompt)) m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
         }
     }
 
