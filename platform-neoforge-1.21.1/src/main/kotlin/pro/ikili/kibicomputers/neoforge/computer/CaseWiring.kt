@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
  *
- * @param current ケースの今のマシン（[rewire] で、この結線のマシンかを確かめる）。`null` なら確かめない（テスト用）
+ * @param current ケースの今のマシンを返す関数（[rewire] で、この結線のマシンかを確かめる）。関数自体が `null` なら確かめない（テスト用）。
+ *   関数が `null`（ケースがもうマシンを持っていない）を返したときは、この結線のマシンではないので、つなぎ直さない
  */
 internal class CaseWiring(private val current: (() -> Machine?)? = null) : MachineHost, MachineWiring.Host<GlobalPos> {
     private val core = MachineWiring(DeviceWiring.registry, this)
@@ -116,7 +117,9 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
     /** 隣と中継の候補を引き直してつなぐ（[wantsRewire] のときだけ）。[DeviceWiring] が tick の終わりに呼ぶ */
     fun rewire() {
         val m = core.machine ?: return
-        if (!wantsRewire(current?.invoke() ?: m)) return
+        // current 自体が null なら確かめない（テスト用）。ケースのマシンが null なら、この結線のマシンではない
+        val caseMachine = if (current == null) m else current.invoke()
+        if (!wantsRewire(caseMachine)) return
         core.rewire()
     }
 

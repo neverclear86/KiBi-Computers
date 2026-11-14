@@ -226,6 +226,46 @@ class MachineWiringTest {
     }
 
     @Test
+    fun `同じ位置に新しい持ち主が先に載ったら、古い登録の持ち主を外し、後からの外れは何もせず、新しい世代でつなぎ直す`() = timeout(limit) {
+        Harness().use { h ->
+            val registry = DeviceRegistry<String>()
+            val host = TestHost(listOf("s"))
+            val wiring = MachineWiring(registry, host)
+            val old = Holder("old")
+            val e1 = registry.register("s", old)
+            val m = h.machine()
+            wiring.attach(m)
+            assertEquals(listOf("test:old"), kinds(m))
+            assertSame(wiring, e1.owner)
+            val scheduledBefore = host.scheduled
+            // チャンクの差し替え: 新しい持ち主が先に載り（setLevel）、古い持ち主の外れ（setRemoved）が後に来る
+            val fresh = Holder("fresh")
+            val e2 = registry.register("s", fresh)
+            assertEquals(emptyList<String>(), kinds(m), "古い登録の持ち主の結線は、すぐに外れる")
+            assertEquals(listOf("connected", "removed"), old.log)
+            assertFalse(e1.registered)
+            assertNull(e1.owner)
+            assertTrue(e2.generation > e1.generation)
+            assertTrue(host.scheduled > scheduledBefore, "外れたら見直しを頼む")
+            assertNull(wiring.entryOf(old))
+            // 古い持ち主の後からの外れは、何もしない（新しい登録にも、結線にも響かない）
+            registry.unregister(e1)
+            assertEquals(listOf("connected", "removed"), old.log)
+            assertSame(e2, registry["s"])
+            assertTrue(e2.registered)
+            assertNull(e2.owner)
+            // 新しい世代でつなぎ直す
+            wiring.rewire()
+            assertEquals(listOf("test:fresh"), kinds(m))
+            assertSame(e2, wiring.entryOf(fresh))
+            assertSame(wiring, e2.owner)
+            assertEquals(listOf("connected"), fresh.log)
+            wiring.disconnect()
+            assertEquals(0, registry.watchedKeys)
+        }
+    }
+
+    @Test
     fun `止まったマシンのdisconnectとデバイスのアンロードが重なっても投げない`() = timeout(limit) {
         Harness().use { h ->
             val registry = DeviceRegistry<String>()

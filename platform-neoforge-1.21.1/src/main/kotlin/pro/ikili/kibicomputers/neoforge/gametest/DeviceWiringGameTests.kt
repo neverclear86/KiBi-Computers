@@ -17,15 +17,22 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.device.DeviceKind
 import pro.ikili.kibicomputers.core.display.ScreenTier
+import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.machine.MachineReleaseReason
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.CaseWiring
 import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
+import pro.ikili.kibicomputers.neoforge.machine.MachineKey
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.util.UUID
 
 /**
  * 隣接デバイスの検出と接続（#129、ADR 0129）の GameTest: 登録表から引き直すこと、排他と空いたら次へ、address の振り直し、
@@ -102,6 +109,93 @@ object DeviceWiringGameTests {
             helper.assertTrue(screen.registrationGeneration == after, "the screen should know its registration")
             cleanUp(helper, case)
         }
+    }
+
+    /**
+     * キーボードのチャンクだけがアンロードされたら、マシンは止めずにそのキーボードだけを外す（隣のものも、画面を通した中継のものも）。
+     * 読み込み直すと、新しい世代の登録として tick の終わりにつなぎ直す（#129）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun keyboardChunkReloadReconnects(helper: GameTestHelper) {
+        val case = placeCase(helper, CASE)
+        val screen = placeScreen(helper, SCREEN)
+        // 画面の前（中継）のキーボードと、ケースの隣（南）のキーボード
+        val relayed = placeKeyboard(helper, KEYBOARD)
+        val adjacent = placeKeyboard(helper, CASE.south())
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should be running")
+        val machine = case.computer.machine!!
+        helper.assertTrue(case.wiring.connectedScreen === screen, "the screen should be connected")
+        helper.assertTrue(case.wiring.generationOf(relayed) != null, "the relayed keyboard should be connected")
+        helper.assertTrue(case.wiring.generationOf(adjacent) != null, "the adjacent keyboard should be connected")
+        val keyboards = listOf(relayed, adjacent)
+        val before = keyboards.map { case.wiring.generationOf(it)!! }
+        for (k in keyboards) {
+            // キーボードのチャンクのアンロード（ブロックエンティティはそのまま）
+            k.onChunkUnloaded()
+            helper.assertTrue(case.wiring.generationOf(k) == null, "the unloaded keyboard should be detached")
+            helper.assertTrue(k.owner == null && k.wiredTo == null, "the unloaded keyboard should be freed")
+        }
+        val listed = machine.devices.list()
+        helper.assertTrue(
+            listed == listOf(DeviceInfo(case.speakerAddress, DeviceKind.SPEAKER), DeviceInfo(screen.deviceAddress, DeviceKind.SCREEN)),
+            "only the speaker and the screen should stay: $listed",
+        )
+        helper.assertTrue(machine.state != MachineState.CRASHED && case.computer.machine === machine, "the machine should keep running")
+        helper.assertTrue(case.wiring.connectedScreen === screen, "the screen should stay connected")
+        // 読み込み直す。つなぐのは tick の終わり
+        for (k in keyboards) k.onLoad()
+        helper.assertTrue(case.wiring.connected.none { it is KeyboardBlockEntity }, "the reloaded keyboards should be connected at the end of the tick")
+        helper.succeedWhen {
+            for ((i, k) in keyboards.withIndex()) {
+                val after = case.wiring.generationOf(k)
+                helper.assertTrue(after != null, "the reloaded keyboard $i should be connected again")
+                helper.assertTrue(after!! > before[i], "the reloaded keyboard $i should be a new registration (${before[i]} -> $after)")
+                helper.assertTrue(k.wiredTo === case.wiring && k.owner != null, "the reloaded keyboard $i should be wired to the case")
+            }
+            helper.assertTrue(machine.devices.list().size == 4, "all the devices should be attached: ${machine.devices.list()}")
+            cleanUp(helper, case)
+        }
+    }
+
+    /**
+     * つなぎ直し（[CaseWiring.rewire]）は、ケースの今のマシンがこの結線のマシンのときだけ行う。ケースがもうマシンを持っていない
+     * （今のマシンが `null`）ときは、この結線のマシンを今のマシンとみなさず、つながない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun rewireSkipsWhenCaseHasNoMachine(helper: GameTestHelper) {
+        placeCase(helper, CASE)
+        val screen = placeScreen(helper, SCREEN)
+        val manager = ServerMachines.current!!
+        val key = MachineKey(helper.level.dimension(), helper.absolutePos(CASE.east()))
+        var caseMachine: Machine? = null
+        val wiring = CaseWiring { caseMachine }
+        val machine = manager.attach(key, wiring, MachineConfig.DEFAULT)
+        caseMachine = machine
+        // 起動して（動いている印がないと、つなぎ直さない）つなぐ
+        wiring.connect(
+            helper.level,
+            helper.absolutePos(CASE),
+            machine,
+            UUID.randomUUID().toString(),
+            ProvisionalBoot.bootConfig(emptyList(), ProvisionalBoot.TEST_BOOT_DISK),
+        )
+        helper.assertTrue(wiring.connectedScreen === screen, "the screen should be connected")
+        // 画面を外して、読み込み直す（つなぎ直しを頼まれる）
+        screen.onChunkUnloaded()
+        screen.onLoad()
+        helper.assertTrue(wiring.connectedScreen == null, "the screen should be detached")
+        caseMachine = null
+        wiring.rewire()
+        helper.assertTrue(wiring.connectedScreen == null, "a case without a machine should not reconnect")
+        caseMachine = machine
+        wiring.rewire()
+        helper.assertTrue(wiring.connectedScreen === screen, "the case's machine should reconnect")
+        wiring.disconnect()
+        manager.release(key, machine, MachineReleaseReason.REMOVED)
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
     }
 
     /**
