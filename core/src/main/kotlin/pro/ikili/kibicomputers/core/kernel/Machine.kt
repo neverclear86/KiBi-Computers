@@ -3372,9 +3372,9 @@ public class Machine private constructor(
         // 通知の中で止めるのをやめた（つなぎを外したなど）なら、取っておいた分もここで配る
         if (consoleHold == null) resumeDeferredConsole(out)
         out.flush()
-        // 止めている間は、毎 tick 回ってくる（止めている台だけ。待っている台の負荷は増えない）
+        // 止めている間は、通知を配るたびに積み直す（止めている台だけ。待っている台の負荷は増えない）。予算（#356）で持ち越されない限り毎 tick 回ってくる
         if (consoleHold != null) requestNotify()
-        // TTY に残った出力を、次の tick に見直す（この tick の中では配り直さない）
+        // TTY に残った出力を、次の tick 以降に見直す（この tick の中では配り直さない。混んでいれば予算で後の tick。#356）
         if (recheckTtyOutput) {
             recheckTtyOutput = false
             if (consoleDirty.compareAndSet(false, true)) postNotification(HostNotification.TtyOutput)
@@ -3425,7 +3425,7 @@ public class Machine private constructor(
                 consoleDirty.set(false)
                 if (!tryLockSink()) {
                     // プロセスのスレッドが書く先に書いている最中なら、TTY の出力はそのスレッドが書く（#355）。
-                    // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick に見直す（#351。待つと、出力し続ける台の数に比例して
+                    // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick 以降に見直す（#351。待つと、出力し続ける台の数に比例して
                     // メインスレッドが止まる）。この tick にカーネルのメッセージが来たら、そのときにロックを待って、その目印までを取り出す
                     recheckTtyOutput = true
                     return
@@ -3473,7 +3473,7 @@ public class Machine private constructor(
     // 前の通知で見た、コンソールの TTY の出力の位置（-1 = 見ていない）。メインスレッドだけで使う（#355）
     private var lastSeenTtyWritten = -1L
 
-    // 次の tick の通知で、TTY の出力が残ったままか見直す
+    // 次に通知を配るとき（次の tick 以降）に、TTY の出力が残ったままか見直す
     private var recheckTtyOutput = false
 
     /**
@@ -3481,7 +3481,7 @@ public class Machine private constructor(
      * TTY の出力は、ふつうは書いたプロセスが [pumpConsole] で自分のスレッドで書くので、メインスレッドでは書かない。
      * 前の tick の通知から書き足されずに残っているもの（キー入力のエコー、プロセスが書けなかった分など）だけを取り出す。
      * まだ書き足されているか、TTY に書いたプロセスがまだ書いていない（[consolePumpsReserved]。書き手のスレッドが遅れているだけ。#419）
-     * なら取り出さず、次の tick の通知で見直す
+     * なら取り出さず、次に通知を配るとき（次の tick 以降）に見直す
      */
     private fun drainStaleConsoleOutput(): ByteArray? = lock.withLockValue {
         val id = kernel.consoleTtyId
@@ -3526,8 +3526,9 @@ public class Machine private constructor(
     /**
      * コンソールの出力を配るのを止める（#357）。メインスレッドから呼ぶ。止めている間は、TTY の出力を取り出さないので、
      * TTY がいっぱいになると書き手（プロセス）は待つ。カーネルのメッセージも、書いた順に取っておく。
-     * 止めている間、毎 tick の通知の始めに [listener] の `resume` を呼ぶ。[releaseConsoleOutput] で、取っておいた分を
-     * 次の通知で（`resume` の中で止めるのをやめたなら、その tick のうちに）書いた順に配る。
+     * 止めている間、このマシンに通知を配るたびに、その始めに [listener] の `resume` を呼ぶ（配るたびに積み直すので、ふつうは毎 tick。
+     * メインスレッドの予算（#356）で通知が持ち越された tick には呼ばない）。[releaseConsoleOutput] で、取っておいた分を
+     * 次の通知で（`resume` の中で止めるのをやめたなら、その通知のうちに）書いた順に配る。
      * すでに止めていれば、知らせる先を [listener] に替える
      */
     internal fun holdConsoleOutput(listener: ConsoleHoldListener) {
@@ -3923,7 +3924,10 @@ internal interface ConsoleSink {
 
 /** コンソールの出力を止めている相手（#357。[Machine.holdConsoleOutput]） */
 internal fun interface ConsoleHoldListener {
-    /** 止めている間、毎 tick の通知の始めにメインスレッドから呼ぶ。追いついたら中で [Machine.releaseConsoleOutput] を呼んでよい */
+    /**
+     * 止めている間、マシンに通知を配るたびに、その始めにメインスレッドから呼ぶ（ふつうは毎 tick。予算（#356）で通知が持ち越された tick には呼ばない）。
+     * 追いついたら中で [Machine.releaseConsoleOutput] を呼んでよい
+     */
     fun resume()
 }
 

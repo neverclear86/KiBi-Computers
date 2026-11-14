@@ -1,12 +1,25 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.CallResult
+import pro.ikili.kibicomputers.core.device.PendingDeviceCall
+import pro.ikili.kibicomputers.core.kernel.process.HostWait
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -321,6 +334,130 @@ class MainThreadBudgetTest {
             // 印が立ったままになっていない
             b.call(capped, "capped-again", 1)
             assertEquals(listOf("capped-again"), b.tick())
+        }
+    }
+
+    /** 時計を [cost] 進めて [name] を記録し、9 を返すメインスレッドのメソッド `m` を持つデバイス */
+    private class ClockDevice(private val b: Budgeted, private val name: String, private val cost: Long) : Device {
+        override val kind = "test:budget"
+        override val methods: DeviceMethods = DeviceMethods.builder().mainThread("m") { _, _ ->
+            b.clock.addAndGet(cost)
+            b.log += name
+            arrayOf(DeviceValue.of(9L))
+        }.build()
+    }
+
+    @Test
+    fun `ブロッキング型のcallOnMainThreadは、予算で後のtickに回っても結果まで待つ`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val hog = b.machine()
+            val m = b.machine().also { it.fillFuel() }
+            // 予算を使い切る呼び出しを先に積み、プロセスの呼び出しを後ろに並べる
+            b.call(hog, "hog", 1_000)
+            val got = AtomicReference<String>()
+            val pid = m.spawnTest(b.h.program(emptyModule()), doing { ctx -> got.set(ctx.callOnMainThread { b.log += "p"; "done" }) })
+            eventually { m.pendingHostCalls == 1 }
+            // hog が予算を使い切り、プロセスの呼び出しは手を付けずに持ち越す。プロセスは待ったまま
+            assertEquals(listOf("hog"), b.tick())
+            assertEquals(1, b.h.scheduler.carriedMachines.get())
+            assertEquals(1, m.pendingHostCalls)
+            assertNull(got.get())
+            assertFalse(m.stateOf(pid).isTerminal)
+            // 次の tick の先頭で実行し、プロセスは結果を受け取って終わる
+            assertEquals(listOf("p"), b.tick())
+            eventually { m.stateOf(pid) == ProcessState.EXITED }
+            assertEquals("done", got.get())
+        }
+    }
+
+    @Test
+    fun `待機点型のHostWaitは、予算で後のtickに回ってもスレッドを持たずに待ち、結果を受け取る`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val hog = b.machine()
+            val m = b.machine().also { it.fillFuel() }
+            b.call(hog, "hog", 1_000)
+            val wait = AtomicReference<HostWait<String>>()
+            val got = AtomicReference<String>()
+            val driver = TestDriver(
+                ProcessKind.WAIT_POINT,
+                onResume = { ctx, _ ->
+                    got.set(ctx.takeHostResult(wait.get()))
+                    StepResult.Exit(0)
+                },
+            ) { ctx ->
+                val w = ctx.submitHostCall { b.log += "p"; "done" }
+                wait.set(w)
+                StepResult.Wait(listOf(w.key))
+            }
+            val pid = m.spawnTest(b.h.program(emptyModule()), driver)
+            eventually { m.pendingHostCalls == 1 && m.isAtWaitPoint }
+            assertEquals(listOf("hog"), b.tick())
+            assertEquals(1, b.h.scheduler.carriedMachines.get())
+            // 持ち越しの列にいる間も、待機点で待ったまま（断らず、捨てない）
+            assertEquals(1, m.pendingHostCalls)
+            assertTrue(m.isAtWaitPoint)
+            assertFalse(wait.get().future.isDone)
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid))
+            assertEquals(listOf("p"), b.tick())
+            eventually { m.stateOf(pid) == ProcessState.EXITED }
+            assertEquals("done", got.get())
+        }
+    }
+
+    @Test
+    fun `待たずに積んだデバイスの呼び出しは、持ち越しの列にいる間はQueuedのままで、写しを戻すと積み直して実行する`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val address = "00000000-0000-4000-8000-000000000356"
+            val hog = b.machine()
+            val m = b.machine()
+            assertTrue(m.devices.attach(address, ClockDevice(b, "dev", 1)))
+            b.call(hog, "hog", 1_000)
+            val call = PendingDeviceCall(PendingDeviceCall.State.Queued(address, "m", emptyList()))
+            m.lock.withLockValue { m.kernel.objects.add(call) }
+            assertTrue(m.dispatchPendingDeviceCall(0, call) > 0)
+            assertEquals(listOf("hog"), b.tick())
+            assertEquals(1, b.h.scheduler.carriedMachines.get())
+            // 持ち越しの列にいる間: 実行し始めていないので Queued で写す（Running・interrupted にしない）
+            val snapshot = m.lock.withLockValue { call.snapshot() }
+            assertEquals(PendingDeviceCall.Snapshot.Queued(address, "m", emptyList()), snapshot)
+            assertFalse(m.lock.withLockValue { call.isReady(WaitCondition.READABLE) })
+
+            // 写しを別のマシンに戻すと、積み直して実行する（保存から戻したのと同じ。ADR 0077）
+            val restoredOn = b.machine()
+            assertTrue(restoredOn.devices.attach(address, ClockDevice(b, "restored", 1)))
+            val restored = PendingDeviceCall.restore(snapshot)
+            restoredOn.lock.withLockValue { restoredOn.kernel.objects.add(restored) }
+            assertTrue(restoredOn.dispatchPendingDeviceCall(0, restored) > 0)
+
+            // 元の呼び出しは次の tick の先頭で、戻した呼び出しはその後ろで実行する
+            assertEquals(listOf("dev", "restored"), b.tick())
+            assertEquals(CallResult.Values(listOf(DeviceValue.of(9L))), m.lock.withLockValue { call.result })
+            assertEquals(CallResult.Values(listOf(DeviceValue.of(9L))), restoredOn.lock.withLockValue { restored.result })
+        }
+    }
+
+    @Test
+    fun `重なったtickは持ち越しの列を触らずに返し、残りは後のtickで処理する`() = timeout(limit) {
+        Budgeted(Long.MAX_VALUE).use { b ->
+            val m = b.machine()
+            val other = b.machine()
+            val before = b.h.scheduler.now
+            // 呼び出しの中から（同じスレッドで）と、ほかのスレッドから、tick を重ねて呼ぶ
+            m.submitHostCall(0) {
+                b.h.scheduler.tick()
+                val t = Thread { b.h.scheduler.tick() }
+                t.start()
+                t.join()
+                b.log += "m"
+            }
+            b.call(other, "other", 1)
+            assertEquals(listOf("m", "other"), b.tick())
+            assertEquals(2, b.h.scheduler.overlappedTicks.get())
+            // 重なった tick も番号は進める
+            assertEquals(before + 3, b.h.scheduler.now)
+            // 重なった tick の間に積んだものは、後の tick で処理する
+            b.call(m, "again", 1)
+            assertEquals(listOf("again"), b.tick())
         }
     }
 }

@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.device.PendingDeviceCall
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.kernel.eventually
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
@@ -43,6 +44,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -205,16 +207,23 @@ class WasiP1KibiDeviceTest {
         }
     }
 
-    private fun harness(mode: Mode) = Harness(execRuntime = EndiveRuntime(), asyncify = mode == Mode.UNWIND)
+    private fun harness(mode: Mode, schedulerConfig: SchedulerConfig? = null, nanoTime: (() -> Long)? = null) = Harness(
+        schedulerConfig = schedulerConfig ?: SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).build(),
+        execRuntime = EndiveRuntime(),
+        asyncify = mode == Mode.UNWIND,
+        nanoTime = nanoTime ?: { 0L },
+    )
 
     private fun run(
         mode: Mode,
         vararg args: String,
         beforeSpawn: Run.() -> Unit = {},
         moduleBytes: ByteArray? = null,
+        schedulerConfig: SchedulerConfig? = null,
+        nanoTime: (() -> Long)? = null,
         block: Run.() -> Unit,
     ) = timeout(Duration.ofSeconds(120)) {
-        harness(mode).use { h -> Run(h, h.machine(fuelPerTick = 10_000_000), mode, args.toList(), beforeSpawn, moduleBytes).block() }
+        harness(mode, schedulerConfig, nanoTime).use { h -> Run(h, h.machine(fuelPerTick = 10_000_000), mode, args.toList(), beforeSpawn, moduleBytes).block() }
     }
 
     private fun assertLine(line: String, out: String) = assertTrue("$line\n" in out, out)
@@ -242,6 +251,31 @@ class WasiP1KibiDeviceTest {
         assertTrue(Regex("bad err bad-arguments .+\n").containsMatchIn(out), out)
         assertLine("nsm err no-such-method", out)
         assertLine("dropped", out)
+    }
+
+    /** 予算（#356）を確かめるテストの時計（ほかのマシンのホスト呼び出しの中でだけ進める） */
+    private val budgetClock = AtomicLong(1_000_000)
+
+    @ParameterizedTest
+    @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
+    fun `メインスレッドのメソッドのinvokeは、サーバー全体の予算で後のtickに回っても結果まで待つ`(mode: Mode) = run(
+        mode,
+        "main",
+        ADDRESS,
+        schedulerConfig = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).mainThreadBudgetNanos(100).build(),
+        nanoTime = { budgetClock.get() },
+        beforeSpawn = {
+            // 1件で予算を使い切る呼び出しを出し続ける台。この台が先に並ぶ tick では、invoke の呼び出しは持ち越しになる
+            val hog = h.machine(host = { _, _, _ -> })
+            repeat(10_000) { hog.submitHostCall(0) { budgetClock.addAndGet(1_000) } }
+        },
+    ) {
+        val out = finish()
+        assertLine("main ok 1 i:7", out)
+        assertEquals(1, dev.calls("main-echo"))
+        assertLine("direct ok 1 i:7", out)
+        assertTrue(h.scheduler.carriedMachines.get() > 0, "invoke の呼び出しが持ち越されていない")
+        assertTrue(h.scheduler.budgetCutTicks.get() > 0)
     }
 
     @ParameterizedTest

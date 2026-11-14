@@ -69,10 +69,18 @@ public class MachineScheduler private constructor(
 
     /**
      * 通知・ホスト呼び出しを待つマシンの、持ち越しの列（#356）。[tick] の頭で [notifyQueue]・[hostCallQueue] から移し、前から処理する。
-     * 予算で打ち切ったときの残りが、次の tick に残る。メインスレッド（[tick]）だけが触る。保存はしない（実行時だけのもの）
+     * 予算で打ち切ったときの残りが、次の tick に残る。保存はしない（実行時だけのもの）。
+     * スレッド安全でないので、[carryOwner] を取った [tick] だけが触る（重なった [tick] は触らない）
      */
     private val notifyCarry = ArrayDeque<Machine>()
     private val hostCallCarry = ArrayDeque<Machine>()
+
+    /**
+     * 持ち越しの列を触っている [tick] がある間 `true`。[tick] が重なっても（テストがほかのスレッドから呼ぶ・配る中や呼び出しの中から呼ぶ）、
+     * 列を触るのは1つだけにする。取り合いではなく compare-and-set なので待たない（マシンのロックとの順を気にしなくてよい）。
+     * 取る・放すで、前の [tick] が列に書いたものが次の [tick] から見える
+     */
+    private val carryOwner = AtomicBoolean()
     private val blockingCount = AtomicInteger()
 
     /** 接続層の例外のスタックトレースを、もうログに出した場所（種類・例外のクラス・呼んだ側のスタック。#674） */
@@ -193,6 +201,9 @@ public class MachineScheduler private constructor(
     /** 予算で打ち切ったとき、手を付けずに次の tick へ持ち越したマシンの数の合計（数え口。#356。段ごとに数える） */
     internal val carriedMachines = AtomicLong()
 
+    /** [tick] が、ほかの [tick] と重なったので、通知とホスト呼び出しを処理せずに返した数（数え口。#356） */
+    internal val overlappedTicks = AtomicLong()
+
     /** [tick] で通知を配るのにかかった時間の合計（ナノ秒。数え口。#356） */
     internal val notifyNanos = AtomicLong()
 
@@ -265,7 +276,10 @@ public class MachineScheduler private constructor(
      *
      * 通知とホスト呼び出しには、サーバー全体の tick ごとの時間の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356、ADR 0356）を置く。
      * 通知は予算の半分まで、ホスト呼び出しは tick の頭から予算いっぱいまで。予算が尽きたら、手を付けていないマシンは次の tick の先頭に、
-     * 途中まで処理したマシンは次の tick の後ろに回す（巡回）。どちらの段も、毎 tick 少なくとも1台（ホスト呼び出しは1件）は進める
+     * 途中まで処理したマシンは次の tick の後ろに回す（巡回）。どちらの段も、毎 tick 少なくとも1台（ホスト呼び出しは1件）は進める。
+     *
+     * ほかの [tick] と重なったとき（ほかのスレッドから、または通知・ホスト呼び出しの中から呼んだとき）は、tick の番号を進め、
+     * 期限の来たマシンを起こすところまでして、通知とホスト呼び出しは処理せずに返す（列に残り、後の tick で処理する。[overlappedTicks]）
      */
     public fun tick() {
         val now = tickCounter.incrementAndGet()
@@ -285,15 +299,24 @@ public class MachineScheduler private constructor(
             for (machine in batch) machine.wakeDeferredReboot()
             batch.clear()
         }
-        // 列から取り出すのは tick の頭の1回だけ（配る中で積み直したマシンは、次の tick に回る）
-        while (true) notifyCarry.addLast(notifyQueue.poll() ?: break)
-        val budget = TickBudget(options.nanoTime, config.mainThreadBudgetNanos)
-        var cut = false
-        if (notifyCarry.isNotEmpty()) cut = deliverNotifications(budget)
-        // 通知の中で出したホスト呼び出しも、この tick で実行する（取り出すのはこの1回だけ）
-        while (true) hostCallCarry.addLast(hostCallQueue.poll() ?: break)
-        if (hostCallCarry.isNotEmpty()) cut = runHostCalls(budget) || cut
-        if (cut) budgetCutTicks.incrementAndGet()
+        // 持ち越しの列はスレッド安全でない。重なった tick は触らずに返す
+        if (!carryOwner.compareAndSet(false, true)) {
+            overlappedTicks.incrementAndGet()
+            return
+        }
+        try {
+            // 列から取り出すのは tick の頭の1回だけ（配る中で積み直したマシンは、次の tick に回る）
+            while (true) notifyCarry.addLast(notifyQueue.poll() ?: break)
+            val budget = TickBudget(options.nanoTime, config.mainThreadBudgetNanos)
+            var cut = false
+            if (notifyCarry.isNotEmpty()) cut = deliverNotifications(budget)
+            // 通知の中で出したホスト呼び出しも、この tick で実行する（取り出すのはこの1回だけ）
+            while (true) hostCallCarry.addLast(hostCallQueue.poll() ?: break)
+            if (hostCallCarry.isNotEmpty()) cut = runHostCalls(budget) || cut
+            if (cut) budgetCutTicks.incrementAndGet()
+        } finally {
+            carryOwner.set(false)
+        }
     }
 
     /**
