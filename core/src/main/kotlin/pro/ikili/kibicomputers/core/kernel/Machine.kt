@@ -64,6 +64,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtySignal
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DeviceDirectory
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
@@ -3085,13 +3086,13 @@ public class Machine private constructor(
     }
 
     /**
-     * デバイスファイル（[DevFileSystem]。`null`・`zero`・`tty`。#485）を [MachineLimits.DEV_PATH] にマウントする（起動用のスレッドから、`/tmp` のマウントの後）。
+     * デバイスファイル（[DevFileSystem]。`null`・`zero`・`random`・`tty`・`device/` など。#485・#54）を [MachineLimits.DEV_PATH] にマウントする（起動用のスレッドから、`/tmp` のマウントの後）。
      * 根のディスクの `/dev` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）。
      * 中身は状態を持たず RAM も使わないので、ディスクと同じく、外すのは次の起動の始め（か起動の取り消し）
      */
     internal fun mountDev(): Errno? = try {
         vfs.checkMountPoint(MachineLimits.DEV_PATH)
-        lock.withLockValue { vfs.mountLocked(MachineLimits.DEV_PATH, DevFileSystem(), readOnly = false, source = MachineLimits.DEV_SOURCE) }
+        lock.withLockValue { vfs.mountLocked(MachineLimits.DEV_PATH, DevFileSystem(environment.entropy, DeviceDirectory.of(devices)), readOnly = false, source = MachineLimits.DEV_SOURCE) }
         null
     } catch (e: FsException) {
         e.errno
