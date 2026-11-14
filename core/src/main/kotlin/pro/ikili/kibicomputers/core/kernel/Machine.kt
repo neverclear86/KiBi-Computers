@@ -2833,6 +2833,7 @@ public class Machine private constructor(
             val claim = lock.withLockValue {
                 if (!runningSteadyLocked()) return
                 if (cleanup) unmountStaleDisksLocked()
+                val firmwareRoot = kernel.mounts.at(VfsPath.ROOT)?.source == MachineLimits.FIRMWARE_SOURCE
                 for (insertion in inserted.values) {
                     if (insertion.handled) continue
                     val existing = kernel.mounts.bySource(diskSource(insertion.diskId))
@@ -2840,6 +2841,12 @@ public class Machine private constructor(
                         // システムコールでマウントしたものなど
                         insertion.handled = true
                         postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, existing.point.toString())
+                        continue
+                    }
+                    if (firmwareRoot) {
+                        // プログラムだけの起動（ADR 0099）: ディスクは自動でマウントしない。開かず、位置の空の disk-inserted で知らせるだけ
+                        insertion.handled = true
+                        postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, "")
                         continue
                     }
                     // ほかの持ち主が開いている途中なら飛ばす（その持ち主がマウントせずに外したら積み直される）

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -15,6 +16,8 @@ import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
@@ -85,6 +88,34 @@ class FirmwareRestoreTest {
             val (m, result) = restore(h, saved, store, config, host)
             assertEquals(RestoreOutcome.RESTORED to null, result)
             assertEquals(listOf("/" to "firmware", "/tmp" to "tmp", "/dev" to "dev"), mounts(m))
+            m.offerConsoleInput("hello\n".toByteArray())
+            eventually(60_000, "戻したプロセスが答えない") {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.text.contains("hello")
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `保存したときと違うプログラムで復元すると、根は今のプログラムになり、動いていたプロセスは保存したときのモジュールで続く`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val other = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/hello-wasi.wasm")) { "hello-wasi.wasm がリソースにない" }.use { it.readBytes() }
+        assertTrue(!other.contentEquals(program))
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaiting(h, store, BootConfig.builder().firmwareProgram(program).build())
+            val host = Console()
+            val (m, result) = restore(h, saved, store, BootConfig.builder().firmwareProgram(other).build(), host)
+            assertEquals(RestoreOutcome.RESTORED to null, result)
+            assertEquals(listOf("/" to "firmware", "/tmp" to "tmp", "/dev" to "dev"), mounts(m))
+            // 根の /sbin/init は今の設定のプログラム（書き換え後のもの）
+            val file = m.vfs.open(VfsPath.parse("/sbin/init"), OpenOptions(read = true))
+            val bytes = ByteArray(other.size + 1)
+            val n = m.vfs.read(file, bytes, 0, bytes.size)
+            m.vfs.close(file)
+            assertArrayEquals(other, bytes.copyOf(n))
+            // 動いていたプロセスは、保存したときのモジュール（prompt）がハッシュで戻って、続きの入力に答える
             m.offerConsoleInput("hello\n".toByteArray())
             eventually(60_000, "戻したプロセスが答えない") {
                 h.scheduler.tick()

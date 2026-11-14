@@ -34,6 +34,7 @@
 3. `/tmp`・`/dev` を今のとおりマウントする
 4. `/home` も、ほかのディスク（`/mnt/...`）もマウントしない。`bootDisks` と `homeDisk` は使わない（空でも `NO_BOOT_DISK` にしない）
 5. コンソールに `kibi: booting from firmware` を書き、init を作る
+- **動いている間にディスクを挿したとき**: 自動マウントの仕事（ADR 0056）は、根が `firmware` の台ではマウントしない（`Machine.reconcileMounts` が根の `source` を見る）。読み取り専用の根に `/mnt` がなくても、マウントの位置はなくてよい（`Vfs.mountLocked`）ので、見ないと `/mnt/<名前>` に書き込み可能でマウントされてしまい、「ほかのディスクをマウントしない」に反する。ディスクは開かず、位置が空の `disk-inserted`（識別子、位置 `""`）を1回だけ出す。コンソールには何も書かず、ログも出さない（位置が使えないときと同じ）。プログラムはこのイベントで挿さったことを知れる（`list-disks` にも出る）。抜いたときは、マウントがないので位置が空の `disk-removed` を出す。ゲストが `mount` システムコールで自分でマウントするのは妨げない（その使い方は #184・#235 で決める）。`DiskHotplugTest` が確かめている
 - プログラムが空・WASM でない・`_start` がない → `INIT_NOT_EXECUTABLE`、燃料を計測できない → `INIT_START_FAILED`（新しい `BootFailure` は足さない）
 - プログラムが終わったら、ディスクから起動した init と同じく `STOPPED`（自動では再起動しない。ドローンで繰り返したいなら、プログラムが自分で待つ）
 - 再起動の既定（`MachineHost.onRebootRequested` → `lastBootConfig`）は、前回のプログラムで起動し直す
