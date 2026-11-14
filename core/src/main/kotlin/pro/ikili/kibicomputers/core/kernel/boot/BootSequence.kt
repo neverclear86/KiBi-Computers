@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 
 /** 起動の途中で `stop()`・`reboot()` された（失敗の通知は出さない） */
@@ -20,8 +21,10 @@ internal class BootCancelledException : RuntimeException("起動を取り消し�
  * 起動の手順（#49。ADR 0049）。[Machine.boot] が受け付けた後、起動用のスレッド（`KiBi-boot-*`。#350）で1回だけ動く。
  *
  * 1. 前回の残り（ゾンビ、pid、マウント）を片付ける
- * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]
- * 3. 候補のディスクを順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする。
+ * 2. 起動部品がなければ [BootFailure.NO_FIRMWARE]。起動部品のプログラムだけで起動する（[BootConfig.isProgramOnly]。#99）なら、
+ *    そのプログラムを `/sbin/init` に置いた読み取り専用の FS を `/` にマウントし、`/tmp`・`/dev` をマウントして 4 に進む
+ *    （ディスクは使わない。`/home` も、ほかのディスクもマウントしない）
+ * 3. 候補のディスクを [BootConfig.bootOrder] の順に開き、[BootConfig.INIT_PATH] が普通のファイルとしてある最初のディスクを `/` にマウントする。
  *    続けて空の `/tmp`（メモリ上。#53）をマウントする（根の `/tmp` がディレクトリ以外ならマウントせず、コンソールに書いて続ける）。
  *    続けてデバイスファイルの `/dev`（`null`・`zero`・`tty`。#485）をマウントする（`/tmp` と同じく、できなければコンソールに書いて続ける）。
  *    根が読み取り専用なら、[BootConfig.homeDisk] を書き込める形で `/home` にマウントする（#461。開けない・読み取り専用・
@@ -44,6 +47,10 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
             }
             if (!config.isFirmwarePresent) {
                 machine.endBoot(BootFailure.NO_FIRMWARE, "起動部品がない")
+                return
+            }
+            if (config.isProgramOnly) {
+                bootFromFirmware(checkNotNull(config.programBytes))
                 return
             }
             val (diskId, volume, claim) = findBootVolume() ?: return
@@ -76,6 +83,18 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         }
     }
 
+    /** 起動部品のプログラムだけで起動する（#99、ADR 0099）。取り消されたら [BootCancelledException] */
+    private fun bootFromFirmware(program: ByteArray) {
+        if (machine.isBootCancelled) throw BootCancelledException()
+        if (!machine.mountFirmwareRoot(ImageFileSystem.firmwareRoot(program))) throw BootCancelledException()
+        machine.mountTmp()?.let { errno -> machine.writeConsoleLine("kibi: /tmp not mounted (${errno.name})") }
+        machine.mountDev()?.let { errno -> machine.writeConsoleLine("kibi: /dev not mounted (${errno.name})") }
+        if (machine.isBootCancelled) throw BootCancelledException()
+        machine.writeConsoleLine("kibi: booting from firmware")
+        machine.scheduler.hooks.beforeInitExec?.invoke(machine)
+        startInit()
+    }
+
     /** 選んだ根（識別子、開いたもの、段の予約） */
     private data class Root(val diskId: String, val volume: BootVolume, val claim: Machine.DiskClaim)
 
@@ -85,7 +104,7 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
      */
     private fun findBootVolume(): Root? {
         var opened = 0
-        for (diskId in config.bootDisks) {
+        for (diskId in config.bootOrder) {
             if (machine.isBootCancelled) throw BootCancelledException()
             val claim = machine.claimPhaseDisk(diskId) ?: continue
             var keep = false

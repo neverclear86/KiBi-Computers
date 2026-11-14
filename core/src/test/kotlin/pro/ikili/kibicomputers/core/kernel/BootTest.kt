@@ -292,6 +292,118 @@ class BootTest {
         }
     }
 
+    // ---- 起動部品（#99、ADR 0099） ----
+
+    @Test
+    fun `優先する起動ディスクが候補にあれば先に試し、なければ候補の順のまま`() = env {
+        disks.withInit("a", exe(foreverInit()))
+        disks.withInit("b", exe(foreverInit()))
+        assertEquals(listOf("b", "a", "c"), BootConfig.builder().bootDisks(listOf("a", "b", "c")).preferredBootDisk("b").build().bootOrder)
+        assertEquals(listOf("a", "b"), BootConfig.builder().bootDisks(listOf("a", "b")).preferredBootDisk("zzz").build().bootOrder)
+        assertEquals(listOf("a", "b"), BootConfig.builder().bootDisks(listOf("a", "b")).build().bootOrder)
+
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("a", "b")).preferredBootDisk("b").build()))
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && host.console.contains("booting") }
+        assertEquals("/" to "disk:b", mounts().first())
+        assertEquals("kibi: booting from disk b\n", host.console.toString())
+        m.stop()
+        tickUntil { m.state == MachineState.STOPPED }
+
+        // 優先するディスクに init がなければ、残りの候補を順に試す
+        disks.empty("noinit")
+        host.console.setLength(0)
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("a", "noinit")).preferredBootDisk("noinit").build()))
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && host.console.contains("booting") }
+        assertEquals("/" to "disk:a", mounts().first())
+    }
+
+    @Test
+    fun `プログラムだけの起動は起動部品のプログラムをinitにし、ディスクとhomeを使わない`() = env {
+        disks.withInit("disk", exe(foreverInit()))
+        disks.empty("home")
+        val program = exe(foreverInit())
+        val config = BootConfig.builder().bootDisks(listOf("disk")).homeDisk("home").firmwareProgram(program).build()
+        assertTrue(config.isProgramOnly)
+        assertTrue(m.boot(config))
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && host.console.contains("booting") }
+        val init = process(1)!!
+        assertEquals(listOf("/sbin/init"), init.args)
+        assertEquals("/", init.cwd.toString())
+        assertEquals(listOf("/" to "firmware", "/tmp" to "tmp", "/dev" to "dev"), mounts())
+        assertEquals("kibi: booting from firmware\n", host.console.toString())
+        // 根は読み取り専用
+        val e = assertThrows<FsException> { m.vfs.createDirectory(VfsPath.parse("/x")) }
+        assertEquals(Errno.ROFS, e.errno)
+
+        // 再起動の既定は前回の設定（同じプログラム）でもう一度起動する
+        assertTrue(m.reboot())
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting && process(1) != null }
+        assertEquals(listOf("/" to "firmware", "/tmp" to "tmp", "/dev" to "dev"), mounts())
+    }
+
+    @Test
+    fun `プログラムだけの起動でinitが終わるとSTOPPEDになり、動かせないプログラムは起動の失敗で知らせる`() = env {
+        assertTrue(m.boot(BootConfig.builder().firmwareProgram(exe(exitingInit(2))).build()))
+        tickUntil { host.console.contains("init exited") && m.state == MachineState.STOPPED }
+        assertTrue(host.console.contains("kibi: init exited with code 2"), host.console.toString())
+        assertEquals(0, host.reboots.get(), "自動では再起動しない")
+
+        val cases = listOf(
+            ByteArray(0) to BootFailure.INIT_NOT_EXECUTABLE,
+            "not-a-registered-module".toByteArray() to BootFailure.INIT_NOT_EXECUTABLE,
+            exe(FakeModule.builder().fuelMetered().export("run", VOID) { _, _ -> LongArray(0) }.build()) to BootFailure.INIT_NOT_EXECUTABLE,
+            exe(FakeModule.builder().export("_start", VOID) { _, _ -> LongArray(0) }.build()) to BootFailure.INIT_START_FAILED,
+        )
+        for ((bytes, failure) in cases) {
+            host.failures.clear()
+            assertTrue(m.boot(BootConfig.builder().firmwareProgram(bytes).build()))
+            tickUntil("$failure が届かない") { host.failures.isNotEmpty() && !m.isBooting }
+            assertEquals(listOf(failure), host.failures.toList())
+            assertEquals(MachineState.STOPPED, m.state)
+            assertEquals(emptyList<Pair<String, String>>(), mounts(), "マウントを残さない")
+            assertEquals(emptyList<Int>(), pids())
+        }
+        // 起動部品がなければ、プログラムがあっても NO_FIRMWARE
+        host.failures.clear()
+        assertTrue(m.boot(BootConfig.builder().firmwarePresent(false).firmwareProgram(exe(foreverInit())).build()))
+        tickUntil { host.failures.isNotEmpty() && !m.isBooting }
+        assertEquals(listOf(BootFailure.NO_FIRMWARE), host.failures.toList())
+    }
+
+    @Test
+    fun `プログラムだけの起動の途中のstopではinitを作らず、マウントを残さない`() = env {
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            reached.countDown()
+            release.await()
+        }
+        assertTrue(m.boot(BootConfig.builder().firmwareProgram(exe(foreverInit())).build()))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        m.stop()
+        release.countDown()
+        eventually { !m.isBooting }
+        tickFor(50)
+        assertEquals(emptyList<Int>(), pids())
+        assertEquals(emptyList<Pair<String, String>>(), mounts())
+        assertEquals(emptyList<String>(), host.states())
+        assertTrue(host.failures.isEmpty())
+    }
+
+    @Test
+    fun `起動部品のプログラムは写して持ち、大きすぎるものは断る`() {
+        val bytes = byteArrayOf(1, 2, 3)
+        val config = BootConfig.builder().firmwareProgram(bytes).build()
+        bytes[0] = 9
+        assertEquals(listOf<Byte>(1, 2, 3), config.firmwareProgram()!!.toList())
+        config.firmwareProgram()!![1] = 9
+        assertEquals(listOf<Byte>(1, 2, 3), config.firmwareProgram()!!.toList())
+        assertFalse(BootConfig.builder().build().isProgramOnly)
+        assertNull(BootConfig.builder().build().firmwareProgram())
+        BootConfig.builder().firmwareProgram(ByteArray(BootConfig.MAX_FIRMWARE_PROGRAM_BYTES))
+        assertThrows<IllegalArgumentException> { BootConfig.builder().firmwareProgram(ByteArray(BootConfig.MAX_FIRMWARE_PROGRAM_BYTES + 1)) }
+    }
+
     @Test
     fun `initが終わるとメッセージを出し、ほかのプロセスを止めてSTOPPEDになる`() = env {
         val cases = listOf(

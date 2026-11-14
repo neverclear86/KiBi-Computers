@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
+import com.mojang.logging.LogUtils
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTestAssertException
 import net.minecraft.gametest.framework.GameTestHelper
@@ -13,8 +14,11 @@ import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.config.ConfigSide
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -515,6 +519,15 @@ internal class LoadRun(
     private var prevSleep = 0L
 
     fun start() {
+        // 結果はコンフィグの値に左右される（runClient などと同じ run/config を使う）。既定と違う値があれば、結果と一緒に残す
+        val nonDefault = KiBiConfig.entries(ConfigSide.SERVER).filter { KiBiConfigs.server[it] != it.default }
+        if (nonDefault.isNotEmpty()) {
+            LOGGER.warn(
+                "The load test runs with non-default values in {}: {}",
+                ConfigSide.SERVER.fileName,
+                nonDefault.joinToString { "${it.path}=${KiBiConfigs.server[it]}" },
+            )
+        }
         // MOD の自動保存の周期は止める（ほかの段階に混ざらないように）。自動保存の段階は周期を待たずに始める
         savedSaveConfig = ServerMachines.saveConfig
         ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
@@ -1059,6 +1072,8 @@ internal class LoadRun(
     private fun fail(message: String): Nothing = throw GameTestAssertException(message)
 
     companion object {
+        private val LOGGER = LogUtils.getLogger()
+
         /** 自動保存の一巡を待つ上限 */
         private const val AUTOSAVE_TIMEOUT_TICKS = 2_000
 

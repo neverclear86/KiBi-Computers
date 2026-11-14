@@ -165,6 +165,19 @@ internal class ImageFileSystem private constructor(
             return build(files)
         }
 
+        /**
+         * 起動部品のプログラムだけの起動（#99）で根にする FS を作る。[program] を `/sbin/init` に、空のディレクトリ `/tmp`・`/dev` を置く
+         * （`/tmp`・`/dev` のマウントの位置にする）。[program] は写さずに持つ（変えない配列を渡すこと）
+         */
+        fun firmwareRoot(program: ByteArray): ImageFileSystem {
+            val files = LinkedHashMap<VfsPath, ByteArray?>()
+            files[VfsPath.ROOT] = null
+            files[VfsPath.parse("/tmp")] = null
+            files[VfsPath.parse("/dev")] = null
+            files[VfsPath.parse("/sbin/init")] = program
+            return build(files)
+        }
+
         /** zip の項目の名前をパスにする。`\` は使わない前提（zip の規約どおり `/` 区切り） */
         private fun parseName(name: String): VfsPath {
             require('\\' !in name) { "項目の名前に \\ がある: $name" }
