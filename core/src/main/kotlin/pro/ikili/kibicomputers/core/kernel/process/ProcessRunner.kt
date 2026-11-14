@@ -273,21 +273,33 @@ internal class ProcessRunner(private val machine: Machine) {
             val grantedTick = machine.fuelAccount.lastRefillTick
             rt.process.state = ProcessState.RUNNABLE
             rt.stackActive = false
-            enqueueFuelWaitLocked(rt, threadless = true)
+            // CPU を返す前に並ぶので、CPU の待ち行列にいるプロセス（この後で燃料がないと分かって並ぶ）の後ろに回る（#47）
+            enqueueFuelWaitLocked(rt, threadless = true, behindCpu = true)
             giveBackLocked(rt.fuelUnwindRemaining - stack.size.toLong() * FuelCosts.ASYNC_VALUE)
             rt.fuelUnwindRemaining = 0
             scheduler.deactivate(rt)
-            scheduler.fuelUnwinds.incrementAndGet()
+            // 巻き戻すと決めたときにマシンの燃料が残っていて（譲るための巻き戻し。#47）、巻き戻しの費用を引いた後も正で、一時停止でなければ、
+            // 譲ったものとして数える（自分も燃料待ちから起こされ、CPU の列の後ろに並び直す）。費用を引いて 0 以下になったら、
+            // 次の tick まで燃料を待つので、巻き戻して燃料を待ったものとして数える
+            if (rt.fuelUnwindYield && machine.kernel.fuel > 0 && !scheduler.isPausedFor(machine)) {
+                scheduler.fuelYields.incrementAndGet()
+            } else {
+                scheduler.fuelUnwinds.incrementAndGet()
+            }
+            rt.fuelUnwindYield = false
             if (now != grantedTick) scheduler.dispatcher.signal()
         }
         releasePermitAndCpu(rt, endOfStep = true)
     }
 
-    /** 燃料待ちの列に入れる（[threadless] ならスレッドを持たない待ち手として）。カーネルロックの中で呼ぶ */
-    private fun enqueueFuelWaitLocked(rt: ProcessRuntime, threadless: Boolean) {
+    /**
+     * 燃料待ちの列に入れる（[threadless] ならスレッドを持たない待ち手として。[behindCpu] は [Machine.addFuelWaiterLocked]）。
+     * カーネルロックの中で呼ぶ
+     */
+    private fun enqueueFuelWaitLocked(rt: ProcessRuntime, threadless: Boolean, behindCpu: Boolean = false) {
         rt.fuelReady = false
         rt.fuelWaitThreadless = threadless
-        machine.addFuelWaiterLocked(rt)
+        machine.addFuelWaiterLocked(rt, behindCpu)
     }
 
     /**
@@ -301,7 +313,7 @@ internal class ProcessRunner(private val machine: Machine) {
         val paused = !scheduler.tryActivate(rt)
         if (!paused) {
             if (rt.process.unmetered) return 0L
-            val grant = machine.fuelAccount.take(observedTick)
+            val grant = machine.fuelAccount.take(observedTick, machine.config.fuelSlice)
             if (grant > 0) return grant
             scheduler.deactivate(rt)
         }
@@ -371,8 +383,13 @@ internal class ProcessRunner(private val machine: Machine) {
      * CPU → 許可を取り、カーネルロックの中で遅延補充してから、停止の印・[precheck]・一時停止・燃料を確かめて grant を返す。
      * 一時停止か燃料がなければ、許可と CPU を返して燃料待ちの列で待ち、やり直す。
      * [precheck] が `false` を返したら、許可と CPU を返して `null` を返す（待ち直し）。
+     * [onNoFuelLocked] は、一時停止か燃料がなくて燃料待ちの列に入れたとき、待つ前にカーネルロックの中で呼ぶ（状態と数え口を合わせるのに使う）
      */
-    private fun acquireCpu(rt: ProcessRuntime, precheck: (() -> Boolean)?): Long? {
+    private fun acquireCpu(
+        rt: ProcessRuntime,
+        precheck: (() -> Boolean)?,
+        onNoFuelLocked: (() -> Unit)? = null,
+    ): Long? {
         while (true) {
             if (!rt.holdsCpu) {
                 try {
@@ -390,7 +407,10 @@ internal class ProcessRunner(private val machine: Machine) {
                 machine.fuelAccount.refill(observed)
                 when {
                     precheck != null && !precheck() -> Outcome.REARM
-                    tryGrantLocked(rt, observed, threadless = false)?.also { grant = it } == null -> Outcome.NO_FUEL
+                    tryGrantLocked(rt, observed, threadless = false)?.also { grant = it } == null -> {
+                        onNoFuelLocked?.invoke()
+                        Outcome.NO_FUEL
+                    }
                     else -> Outcome.GO
                 }
             }
@@ -463,6 +483,38 @@ internal class ProcessRunner(private val machine: Machine) {
         if (machine.kernel.fuel > 0) machine.wakeFuelWaitersLocked()
     }
 
+    /**
+     * スライスを使い切ったとき（#47、ADR 0047）: CPU を返さずにその場で次のスライスを足せるなら、マシンの燃料に残り [remaining] を書き戻してから
+     * 次のスライスを取り、新しい手持ちを返す。足せなければ何も書き換えずに `null`。カーネルロックの中で呼ぶ。
+     *
+     * 足すのは、一時停止（マシンだけの quiesce も）でなく、手持ちを渡した tick の中（[FuelAccount.lastRefillTick] が今の tick）で、
+     * 書き戻した後のマシンの燃料が正で、CPU を待つプロセスも燃料待ちもいないときだけ。
+     * 待つ者がいれば譲る（呼んだ側が CPU を返す）。tick が進んでいれば、待つ者がいなくても CPU と許可を返す（呼んだ側が返して取り直す）。
+     * 許可はサーバー全体で数が限られ、公平な順で回るので、tick をまたいで持ち続けると、ほかの台が取れなくなる（ADR 0027。#47 より前は燃料切れのたびに返していた）。
+     * プロセスが1つだけの台は、同じ tick の中なら CPU と許可の出し入れも巻き戻しもせずに、1 tick に `fuelPerTick` まで使える。
+     * 手持ちは呼んだ側（燃料切れの処理の戻り値）が今の holder に入れるので、作っている途中・ホスト関数の中から呼んだゲストの中でもよい
+     */
+    private fun renewSliceLocked(rt: ProcessRuntime, remaining: Long): Long? {
+        if (rt.killed || scheduler.isPausedFor(machine)) return null
+        val observed = now
+        val account = machine.fuelAccount
+        // 手持ちを渡した後に tick が進んでいたら、その場で足さない（許可を回す）
+        if (account.lastRefillTick != observed) return null
+        if (account.afterGiveBack(observed, remaining) <= 0) return null
+        if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked()) return null
+        account.giveBack(observed, remaining)
+        val grant = account.take(observed, machine.config.fuelSlice)
+        check(grant > 0) { "書き戻した後の燃料が正なのに、スライスを渡せない" }
+        // 前借りしていたら、ここで返した（巻き戻せるところを探さなくてよい）
+        rt.fuelOverdraft = false
+        scheduler.fuelSliceRenewals.incrementAndGet()
+        return grant
+    }
+
+    /** その場で足せなかったとき、譲るのか（マシンの燃料が残っていて、一時停止でない）。数え口と状態を分けるのに使う。カーネルロックの中で呼ぶ */
+    private fun yieldingLocked(remaining: Long): Boolean =
+        !scheduler.isPausedFor(machine) && machine.fuelAccount.afterGiveBack(now, remaining) > 0
+
     private fun setHolderFuelLocked(rt: ProcessRuntime, grant: Long) {
         if (rt.process.unmetered) return
         val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
@@ -483,6 +535,8 @@ internal class ProcessRunner(private val machine: Machine) {
             val overdraft = lock.withLockValue {
                 verifyInstanceLocked(rt, instance)
                 if (rt.killed) throw ProcessKilledException()
+                // 譲る相手がいなければ、前借りせずにその場で次のスライスを足す（#47）
+                renewSliceLocked(rt, remaining)?.let { return it }
                 rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
             }
             if (overdraft) {
@@ -497,21 +551,44 @@ internal class ProcessRunner(private val machine: Machine) {
         return onFuelExhausted(rt, instance, remaining)
     }
 
-    /** 燃料切れの処理。グローバルを読まない・書かない（残りは引数、新しい手持ちは戻り値） */
+    /**
+     * 燃料切れの処理（スレッドを持ったまま）。グローバルを読まない・書かない（残りは引数、新しい手持ちは戻り値）。
+     *
+     * 譲る相手がいなければ、その場で次のスライスを足して続ける（[renewSliceLocked]）。
+     * マシンの燃料が残っていれば（スライスを使い切っただけ。#47）、CPU を返して FIFO の後ろに並び直す。状態は変えない（燃料を待つのではない）。
+     * ただし、CPU を取り直したときにその tick の燃料がもう残っていない（か一時停止）なら、そこから先は燃料を待つので、
+     * `WAITING_FUEL` にして `fuelBlockingWaits` に数えてから待つ（譲った回数の `fuelYields` にも数えたまま）。
+     * 残っていない（か一時停止）なら、`WAITING_FUEL` にして次の tick の補充（か再開）を待つ
+     */
     private fun onFuelExhausted(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
+        var waitingFuel = false
         val previous = lock.withLockValue {
             verifyInstanceLocked(rt, instance)
             if (rt.killed) throw ProcessKilledException()
+            renewSliceLocked(rt, remaining)?.let { return it }
+            val yielding = yieldingLocked(remaining)
             giveBackLocked(remaining)
             scheduler.deactivate(rt)
             val prev = rt.process.state
-            // 数えてから状態を変える（ロックを外して数えると、WAITING_FUEL を見た側がまだ数えていない値を読む）
-            scheduler.fuelBlockingWaits.incrementAndGet()
-            rt.process.state = ProcessState.WAITING_FUEL
+            if (yielding) {
+                scheduler.fuelYields.incrementAndGet()
+            } else {
+                // 数えてから状態を変える（ロックを外して数えると、WAITING_FUEL を見た側がまだ数えていない値を読む）
+                scheduler.fuelBlockingWaits.incrementAndGet()
+                rt.process.state = ProcessState.WAITING_FUEL
+                waitingFuel = true
+            }
             prev
         }
         releasePermitAndCpu(rt)
-        val grant = acquireCpu(rt, null)!!
+        val grant = acquireCpu(rt, precheck = null) {
+            // 譲った後、CPU を取り直したら燃料が残っていなかった: ここから次の tick（か再開）を待つ
+            if (!waitingFuel) {
+                waitingFuel = true
+                scheduler.fuelBlockingWaits.incrementAndGet()
+                rt.process.state = ProcessState.WAITING_FUEL
+            }
+        }!!
         lock.withLockValue { rt.process.state = previous }
         return grant
     }
@@ -538,9 +615,15 @@ internal class ProcessRunner(private val machine: Machine) {
             return lock.withLockValue { instance.fuel }
         }
         check(instance.asyncState == WasmAsyncState.NORMAL) { "巻き戻しの途中で燃料切れの呼び出しが走った" }
+        val yielding = lock.withLockValue {
+            if (rt.killed) throw ProcessKilledException()
+            renewSliceLocked(rt, remaining)?.let { return it }
+            yieldingLocked(remaining)
+        }
         rt.fuelOverdraft = false
         rt.fuelUnwound = true
         rt.fuelUnwindRemaining = remaining
+        rt.fuelUnwindYield = yielding
         instance.asyncState = WasmAsyncState.UNWINDING
         return remaining
     }
@@ -1190,7 +1273,7 @@ internal class ProcessRunner(private val machine: Machine) {
                         lock.unlock()
                     }
                     var ready: List<WaitKey> = emptyList()
-                    val grant = acquireCpu(rt) {
+                    val grant = acquireCpu(rt, precheck = {
                         ready = ws.readyKeys(machine.kernel.objects)
                         if (ready.isEmpty()) {
                             ws.rearm()
@@ -1198,7 +1281,7 @@ internal class ProcessRunner(private val machine: Machine) {
                         } else {
                             true
                         }
-                    } ?: continue
+                    }) ?: continue
                     lock.withLockValue {
                         ws.unregister(machine.registry)
                         rt.waitSet = null

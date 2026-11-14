@@ -103,6 +103,12 @@ internal class ProcessRuntime(
     var fuelWaitThreadless: Boolean = false
 
     /**
+     * 燃料待ちの列で、CPU の待ち行列にいたプロセスの後ろに回る（スライスを使い切って巻き戻した待機点型。#47、ADR 0047）。
+     * カーネルロックの中で読み書きする
+     */
+    var fuelWaitBehindCpu: Boolean = false
+
+    /**
      * 燃料切れで巻き戻すよう頼んだ（#339）。step の中でだけ立つ（ドライバーが [ProcessContext.takeFuelUnwind] で消す）。
      * プロセスのスレッドだけが読み書きする
      */
@@ -110,6 +116,12 @@ internal class ProcessRuntime(
 
     /** [fuelUnwound] を立てたときの燃料の残り（負。行き過ぎた分）。マシンの燃料に書き戻す */
     var fuelUnwindRemaining: Long = 0
+
+    /**
+     * [fuelUnwound] を立てたとき、マシンの燃料がまだ残っていた（燃料切れでなく、譲るための巻き戻し）。数え口を分けるだけ（#47）。
+     * 巻き戻しの費用を引いた後に 0 以下になったら、燃料切れとして数える（[fuelUnwound] の後始末のところで決める）
+     */
+    var fuelUnwindYield: Boolean = false
 
     /** 燃料待ちからの巻き直しの途中（#339）。止まった燃料切れの呼び出しに着いたら消す。プロセスのスレッドだけが読み書きする */
     var rewindingForFuel: Boolean = false

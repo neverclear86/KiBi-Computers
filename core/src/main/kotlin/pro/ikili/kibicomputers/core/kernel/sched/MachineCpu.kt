@@ -29,7 +29,7 @@ internal class MachineCpu(
     /** 今の持ち主（テスト用） */
     val currentOwner: ProcessRuntime? get() = lock.withLockValue { owner }
 
-    /** 待っている数（テスト用） */
+    /** 待っている数（スライスを使い切ったときに、譲るかを決めるのに使う。#47） */
     val waiting: Int get() = lock.withLockValue { queue.size }
 
     /** スレッドで CPU を取る。取れるまで止まる。割り込まれたら [InterruptedException] */
