@@ -97,10 +97,15 @@ internal object FuelInjector {
      * [wasm] に計測コードを挿入する。重いので（lua.wasm で数十 ms）、メインスレッドでは呼ばない。
      *
      * [checkpoint] は関数の本体を1つ書き換えるごとに呼ぶ（検証の時間の上限。#40）。投げた [WasmLoadException] はそのまま外に出る
+     *
+     * [sharedGlobal] なら、残りのグローバルを定義せずに [WasmFuel.IMPORT_MODULE].[WasmFuel.IMPORT_GLOBAL]（可変の i64）として
+     * import し、それを [WasmFuel.EXPORT_GLOBAL] として export する（#263。コンポーネントの core インスタンスどうしで残りを共有する）。
+     * import はグローバルの import の最後に足すので、定義済みのグローバルの番号が1つずれる。`global.get`・`global.set`、export、
+     * 定数式（グローバル・要素・データの初期値）の番号を付け替える。このときは、ほかのグローバルの import も断らない
      */
     @Throws(WasmLoadException::class)
-    fun inject(wasm: ByteArray, checkpoint: () -> Unit = {}): Result = try {
-        injectUnchecked(wasm, checkpoint)
+    fun inject(wasm: ByteArray, sharedGlobal: Boolean = false, checkpoint: () -> Unit = {}): Result = try {
+        injectUnchecked(wasm, checkpoint, sharedGlobal)
     } catch (e: WasmLoadException) {
         throw e
     } catch (e: Exception) {
@@ -109,7 +114,7 @@ internal object FuelInjector {
         throw WasmLoadException("燃料の計測コードを挿入できない: 入れ子が深すぎる", e)
     }
 
-    private fun injectUnchecked(wasm: ByteArray, checkpoint: () -> Unit): Result {
+    private fun injectUnchecked(wasm: ByteArray, checkpoint: () -> Unit, shared: Boolean): Result {
         val module = Parser.parse(wasm)
         checkpoint()
         val importSection = module.importSection()
@@ -118,21 +123,26 @@ internal object FuelInjector {
             if (imp is FunctionImport && imp.module() == WasmFuel.IMPORT_MODULE && imp.name() == WasmFuel.IMPORT_NAME) {
                 throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_NAME} は予約された import")
             }
+            if (imp.module() == WasmFuel.IMPORT_MODULE && imp.name() == WasmFuel.IMPORT_GLOBAL) {
+                throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_GLOBAL} は予約された import")
+            }
         }
         val exportSection = module.exportSection()
         for (i in 0 until exportSection.exportCount()) {
             if (exportSection.getExport(i).name() == WasmFuel.EXPORT_GLOBAL) throw WasmLoadException("${WasmFuel.EXPORT_GLOBAL} は予約された export")
         }
         val importedGlobals = importSection.count(ExternalType.GLOBAL)
-        if (importedGlobals > 0) throw WasmLoadException("グローバルの import には対応していない")
+        if (importedGlobals > 0 && !shared) throw WasmLoadException("グローバルの import には対応していない")
 
         val sections = scanSections(wasm)
         val importedFuncs = importSection.count(ExternalType.FUNCTION)
         val definedGlobals = module.globalSection().globalCount()
         val newTypeIdx = module.typeSection().subTypeCount()
         val fuelFunc = importedFuncs
-        val fuelGlobal = importedGlobals + definedGlobals
+        // 共有するなら、グローバルの import の最後に足す（定義済みのグローバルが1つずれる）。しないなら、定義済みの最後に足す
+        val fuelGlobal = if (shared) importedGlobals else importedGlobals + definedGlobals
         val remap = { idx: Long -> if (idx >= fuelFunc) idx + 1 else idx }
+        val globalRemap = if (shared) { idx: Long -> if (idx >= importedGlobals) idx + 1 else idx } else { idx: Long -> idx }
 
         var checks = 0
         var charges = 0
@@ -156,11 +166,16 @@ internal object FuelInjector {
             val pos = if (id == Int.MAX_VALUE) Int.MAX_VALUE else order.indexOf(id)
             for (missing in listOf(SEC_TYPE, SEC_IMPORT, SEC_GLOBAL, SEC_EXPORT)) {
                 if (has(missing) || order.indexOf(missing) >= pos || !created.add(missing)) continue
+                // 共有するなら、残りのグローバルは import するので、グローバルのセクションは作らない
+                if (missing == SEC_GLOBAL && shared) continue
                 val body = Sink()
-                body.leb(1)
+                body.leb(if (missing == SEC_IMPORT && shared) 2 else 1)
                 when (missing) {
                     SEC_TYPE -> body.fuelType()
-                    SEC_IMPORT -> body.fuelImport(newTypeIdx)
+                    SEC_IMPORT -> {
+                        body.fuelImport(newTypeIdx)
+                        if (shared) body.fuelGlobalImport()
+                    }
                     SEC_GLOBAL -> body.fuelGlobal()
                     SEC_EXPORT -> body.fuelExport(fuelGlobal)
                 }
@@ -176,26 +191,36 @@ internal object FuelInjector {
                     // 名前のセクションは関数の番号がずれるので捨てる
                     if (Reader(wasm, s.start, s.end).name() != "name") emit(s.id, Sink().also { it.bytes(wasm, s.start, s.end - s.start) })
                 }
-                SEC_TYPE, SEC_IMPORT -> {
+                SEC_TYPE -> {
                     val n = r.leb()
                     val body = Sink()
                     body.leb(n + 1)
                     body.bytes(wasm, r.pos, s.end - r.pos)
-                    if (s.id == SEC_TYPE) body.fuelType() else body.fuelImport(newTypeIdx)
+                    body.fuelType()
+                    emit(s.id, body)
+                }
+                SEC_IMPORT -> {
+                    val n = r.leb()
+                    val body = Sink()
+                    body.leb(n + if (shared) 2 else 1)
+                    body.bytes(wasm, r.pos, s.end - r.pos)
+                    body.fuelImport(newTypeIdx)
+                    if (shared) body.fuelGlobalImport()
                     emit(s.id, body)
                 }
                 SEC_GLOBAL -> {
                     val n = r.leb()
                     val body = Sink()
-                    body.leb(n + 1)
+                    body.leb(if (shared) n else n + 1)
                     repeat(n.toInt()) {
                         r.copyValType(body)
                         body.u8(r.u8()) // mut
-                        r.copyConstExpr(body, remap)
+                        r.copyConstExpr(body, remap, globalRemap)
                     }
-                    body.fuelGlobal()
+                    if (!shared) body.fuelGlobal()
                     emit(s.id, body)
                 }
+                SEC_DATA -> emit(s.id, if (shared) rewriteData(r, remap, globalRemap) else Sink().also { it.bytes(wasm, s.start, s.end - s.start) })
                 SEC_EXPORT -> {
                     val n = r.leb()
                     val body = Sink()
@@ -207,13 +232,19 @@ internal object FuelInjector {
                         val kind = r.u8()
                         body.u8(kind)
                         val idx = r.leb()
-                        body.leb(if (kind == 0) remap(idx) else idx)
+                        body.leb(
+                            when (kind) {
+                                0 -> remap(idx)
+                                3 -> globalRemap(idx)
+                                else -> idx
+                            },
+                        )
                     }
                     body.fuelExport(fuelGlobal)
                     emit(s.id, body)
                 }
                 SEC_START -> emit(s.id, Sink().also { it.leb(remap(r.leb())) })
-                SEC_ELEMENT -> emit(s.id, rewriteElements(r, remap))
+                SEC_ELEMENT -> emit(s.id, rewriteElements(r, remap, globalRemap))
                 SEC_TABLE -> {
                     val n = r.leb()
                     repeat(n.toInt()) {
@@ -234,7 +265,7 @@ internal object FuelInjector {
                         val bodyEnd = bodyStart + size
                         val fb = module.codeSection().getFunctionBody(i)
                         val params = module.functionSection().getFunctionType(i, module.typeSection()).params().size
-                        val ctx = BodyContext(fuelFunc, fuelGlobal, remap, params + fb.localTypes().size)
+                        val ctx = BodyContext(fuelFunc, fuelGlobal, remap, params + fb.localTypes().size, if (shared) globalRemap else null)
                         val fn = Sink()
                         val stats = rewriteBody(wasm, bodyStart, bodyEnd, fb.instructions(), ctx, fn)
                         checks += stats.checks
@@ -303,6 +334,8 @@ internal object FuelInjector {
         val remap: (Long) -> Long,
         /** 足すローカル変数の最初の番号（引数とローカル変数の後ろ） */
         val firstNewLocal: Int,
+        /** グローバルの番号の付け替え（燃料を共有するとき。#263）。付け替えないなら `null` */
+        val globalRemap: ((Long) -> Long)?,
     ) {
         /** 残りをローカルに写すか（`try_table` を含まない関数） */
         var cached: Boolean = false
@@ -401,6 +434,15 @@ internal object FuelInjector {
                     out.u8(op.opcode())
                     out.leb(ctx.remap(ins.operand(0)))
                 }
+                OpCode.GLOBAL_GET, OpCode.GLOBAL_SET -> {
+                    val g = ctx.globalRemap
+                    if (g == null) {
+                        out.bytes(wasm, start, end - start)
+                    } else {
+                        out.u8(op.opcode())
+                        out.leb(g(ins.operand(0)))
+                    }
+                }
                 else -> out.bytes(wasm, start, end - start)
             }
 
@@ -417,7 +459,33 @@ internal object FuelInjector {
         return BodyStats(checks, charges, maxUnchecked)
     }
 
-    private fun rewriteElements(r: Reader, remap: (Long) -> Long): Sink {
+    /** データセグメントの初期値の式（オフセット）の番号を付け替える（#263。燃料を共有するとき） */
+    private fun rewriteData(r: Reader, remap: (Long) -> Long, globalRemap: (Long) -> Long): Sink {
+        val body = Sink()
+        val n = r.leb()
+        body.leb(n)
+        repeat(n.toInt()) {
+            val flag = r.leb().toInt()
+            body.leb(flag.toLong())
+            when (flag) {
+                0 -> r.copyConstExpr(body, remap, globalRemap)
+                1 -> Unit
+                2 -> {
+                    body.leb(r.leb())
+                    r.copyConstExpr(body, remap, globalRemap)
+                }
+                else -> throw WasmLoadException("データセグメントの形式 $flag には対応していない")
+            }
+            val len = r.leb()
+            body.leb(len)
+            if (len < 0 || r.pos + len > r.end) throw WasmLoadException("データセグメントが範囲を超える")
+            body.bytes(r.buf, r.pos, len.toInt())
+            r.pos += len.toInt()
+        }
+        return body
+    }
+
+    private fun rewriteElements(r: Reader, remap: (Long) -> Long, globalRemap: (Long) -> Long): Sink {
         val body = Sink()
         val n = r.leb()
         body.leb(n)
@@ -432,11 +500,11 @@ internal object FuelInjector {
             fun exprVec() {
                 val m = r.leb()
                 body.leb(m)
-                repeat(m.toInt()) { r.copyConstExpr(body, remap) }
+                repeat(m.toInt()) { r.copyConstExpr(body, remap, globalRemap) }
             }
             when (flag) {
                 0 -> {
-                    r.copyConstExpr(body, remap)
+                    r.copyConstExpr(body, remap, globalRemap)
                     funcIdxVec()
                 }
                 1, 3 -> {
@@ -445,12 +513,12 @@ internal object FuelInjector {
                 }
                 2 -> {
                     body.leb(r.leb())
-                    r.copyConstExpr(body, remap)
+                    r.copyConstExpr(body, remap, globalRemap)
                     body.u8(r.u8())
                     funcIdxVec()
                 }
                 4 -> {
-                    r.copyConstExpr(body, remap)
+                    r.copyConstExpr(body, remap, globalRemap)
                     exprVec()
                 }
                 5, 7 -> {
@@ -459,7 +527,7 @@ internal object FuelInjector {
                 }
                 6 -> {
                     body.leb(r.leb())
-                    r.copyConstExpr(body, remap)
+                    r.copyConstExpr(body, remap, globalRemap)
                     r.copyValType(body)
                     exprVec()
                 }
@@ -478,6 +546,7 @@ internal object FuelInjector {
     private const val SEC_START = 8
     private const val SEC_ELEMENT = 9
     private const val SEC_CODE = 10
+    private const val SEC_DATA = 11
     private const val SEC_TAG = 13
 
     private class Section(val id: Int, val start: Int, val end: Int)
@@ -524,7 +593,17 @@ internal object FuelInjector {
         u8(0x0B)
     }
 
+    /** `(import "kibi" "fuel_global" (global (mut i64)))`（#263。燃料を共有するとき） */
+    private fun Sink.fuelGlobalImport() {
+        name(WasmFuel.IMPORT_MODULE)
+        name(WasmFuel.IMPORT_GLOBAL)
+        u8(0x03)
+        u8(I64)
+        u8(0x01)
+    }
+
     private fun Sink.fuelExport(globalIdx: Int) {
+
         name(WasmFuel.EXPORT_GLOBAL)
         u8(0x03)
         leb(globalIdx.toLong())
@@ -730,8 +809,8 @@ internal object FuelInjector {
             if (flags and 1 != 0) skipLeb()
         }
 
-        /** 定数式を写す。`ref.func` の番号だけ付け替える */
-        fun copyConstExpr(out: Sink, remap: (Long) -> Long) {
+        /** 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える */
+        fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {
                 val start = pos
                 when (val op = u8()) {
@@ -739,9 +818,13 @@ internal object FuelInjector {
                         out.u8(op)
                         return
                     }
-                    0x41, 0x42, 0x23 -> {
+                    0x41, 0x42 -> {
                         skipLeb()
                         out.bytes(buf, start, pos - start)
+                    }
+                    0x23 -> { // global.get
+                        out.u8(op)
+                        out.leb(globalRemap(leb()))
                     }
                     0x43 -> {
                         pos += 4

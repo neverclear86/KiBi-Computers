@@ -23,7 +23,9 @@ internal interface ProcessDriver {
     /**
      * `LOADING` の中、最初のインスタンスを作る前に、プロセスのスレッドで1回だけ呼ばれる（CPU と許可は持っている。カーネルロックは持っていない）。
      * ホスト import を [builder] に登録する。`builder.fuel` は呼ばない（呼ぶと `IllegalStateException` でプロセスが `CRASHED`）。
-     * `ctx.instance` はまだ呼べない。例外は「例外で抜けたとき」の規則で `CRASHED`（停止の印があれば `KILLED`）
+     * `ctx.instance` はまだ呼べない。例外は「例外で抜けたとき」の規則で `CRASHED`（停止の印があれば `KILLED`）。
+     * コンポーネントのプロセス（[Program.component]。#263）では呼ばない（ホストの関数はリンクの計画が持つ。[builder] の代わりに
+     * 中の core インスタンスごとにカーネルが設定する）
      */
     fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder)
 

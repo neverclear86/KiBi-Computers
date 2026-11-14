@@ -7,6 +7,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmException
 import pro.ikili.kibicomputers.core.runtime.WasmExportDescriptor
+import pro.ikili.kibicomputers.core.runtime.WasmExtern
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmFuel
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -21,6 +22,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmStateException
 import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -34,6 +36,11 @@ import run.endive.runtime.ExportFunction
 import run.endive.runtime.GlobalFactory
 import run.endive.runtime.GlobalInstance
 import run.endive.runtime.HostFunction
+import run.endive.runtime.ImportFunction
+import run.endive.runtime.ImportGlobal
+import run.endive.runtime.ImportMemory
+import run.endive.runtime.ImportTable
+import run.endive.runtime.ImportTag
 import run.endive.runtime.ImportValues
 import run.endive.runtime.Instance
 import run.endive.runtime.TableInstance
@@ -566,7 +573,9 @@ private class EndiveWasmModule(
 
     override val isFuelMetered: Boolean
 
-    /** 燃料の残りを入れるグローバルの番号。計測しないなら -1 */
+    override val sharesFuel: Boolean
+
+    /** 燃料の残りを入れる、定義したグローバルの番号（import を含めた番号）。計測しない・共有する（import する）なら -1 */
     private val fuelGlobalIndex: Int
 
     override val isAsyncified: Boolean
@@ -603,10 +612,22 @@ private class EndiveWasmModule(
             throw WasmLoadException("燃料の計測の import・export の型が違う")
         }
         isFuelMetered = fuelImport != null
-        if (fuelExport != null && module.importSection().count(ExternalType.GLOBAL) > 0) {
+        // 共有の燃料（#263）: 残りのグローバルを import する。燃料を計測するモジュールだけが持てる
+        val fuelGlobalImport = rawImports.firstOrNull { it.module == WasmFuel.IMPORT_MODULE && it.name == WasmFuel.IMPORT_GLOBAL }
+        if (fuelGlobalImport != null) {
+            if (!isFuelMetered) throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_GLOBAL} は燃料を計測するモジュールだけが持てる")
+            val global = section.getImport(rawImports.indexOf(fuelGlobalImport)) as? GlobalImport
+            if (global == null || global.type() != ValType.I64 || global.mutabilityType() != MutabilityType.Var) {
+                throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_GLOBAL} の型が違う")
+            }
+        }
+        sharesFuel = fuelGlobalImport != null
+        // 定義した燃料のグローバルは、作るときに番号で見分けて最初の燃料を入れる（GlobalFactory は定義したものだけを数える）ので、
+        // ほかのグローバルの import とは一緒にできない。共有するモジュールは燃料のグローバルを import するので、ほかの import もよい
+        if (fuelExport != null && !sharesFuel && module.importSection().count(ExternalType.GLOBAL) > 0) {
             throw WasmLoadException("グローバルの import には対応していない")
         }
-        fuelGlobalIndex = if (fuelExport != null) exportSection.let { es -> (0 until es.exportCount()).map(es::getExport).first { it.name() == WasmFuel.EXPORT_GLOBAL }.index() } else -1
+        fuelGlobalIndex = if (fuelExport != null && !sharesFuel) exportSection.let { es -> (0 until es.exportCount()).map(es::getExport).first { it.name() == WasmFuel.EXPORT_GLOBAL }.index() } else -1
         // 待機点への変換（#329）: import 2つと状態のグローバルの export は、そろっていて型が合うときだけ
         val pushImport = rawImports.firstOrNull { it.module == WasmAsync.IMPORT_MODULE && it.name == WasmAsync.PUSH }
         val popImport = rawImports.firstOrNull { it.module == WasmAsync.IMPORT_MODULE && it.name == WasmAsync.POP }
@@ -627,7 +648,7 @@ private class EndiveWasmModule(
             if (!isAsyncified || !isFuelMetered) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} は燃料を計測し、待機点に変換したモジュールだけが持てる")
             if (asyncFuelImport.functionType != WasmAsync.FUEL_TYPE) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} の型が違う")
         }
-        val hidden = listOfNotNull(fuelImport, fuelExport, pushImport, popImport, stateExport, asyncFuelImport)
+        val hidden = listOfNotNull(fuelImport, fuelExport, fuelGlobalImport, pushImport, popImport, stateExport, asyncFuelImport)
         imports = rawImports.filter { imp -> hidden.none { it === imp } }
         exports = rawExports.filter { exp -> hidden.none { it === exp } }
     }
@@ -640,13 +661,26 @@ private class EndiveWasmModule(
 
     fun exportedFunctionType(name: String): WasmFunctionType? = exports.firstOrNull { it.name == name && it.kind == WasmExternKind.FUNCTION }?.functionType
 
+    /** export [name] の種類（燃料などランタイムがつなぐものは除く）。なければ `null` */
+    fun exportKind(name: String): WasmExternKind? = exports.firstOrNull { it.name == name }?.kind
+
     @Throws(WasmLinkException::class, WasmLoadException::class, WasmTrapException::class)
     override fun instantiate(config: WasmInstanceConfig): WasmInstance {
         val wrapper = EndiveWasmInstance(this, config)
         val values = ImportValues.builder()
         for (imp in rawImports) {
+            if (sharesFuel && imp.module == WasmFuel.IMPORT_MODULE && imp.name == WasmFuel.IMPORT_GLOBAL) {
+                val shared = config.sharedFuel ?: throw WasmLinkException("燃料を共有するモジュールに sharedFuel がない")
+                values.addGlobal(ImportGlobal(imp.module, imp.name, sharedFuelGlobal(shared)))
+                continue
+            }
+            val extern = config.externImport(imp.module, imp.name)
+            if (extern != null) {
+                addExternImport(values, imp, extern)
+                continue
+            }
             if (imp.kind != WasmExternKind.FUNCTION) {
-                throw WasmLinkException("関数でない import には対応していない: $imp")
+                throw WasmLinkException("import がない: $imp")
             }
             val type = imp.functionType!!
             if (isFuelMetered && imp.module == WasmFuel.IMPORT_MODULE && imp.name == WasmFuel.IMPORT_NAME) {
@@ -703,6 +737,33 @@ private class EndiveWasmModule(
         }
         wrapper.attach(instance)
         return wrapper
+    }
+
+    /**
+     * ほかのインスタンスの export [extern] を、import [imp] として [values] に足す（#263）。種類・関数の型が違えば [WasmLinkException]。
+     * テーブル・メモリ・グローバル・タグの型は、Endive がインスタンスを作るときに確かめる（合わなければ [WasmLinkException]）
+     */
+    private fun addExternImport(values: ImportValues.Builder, imp: WasmImportDescriptor, extern: WasmExtern) {
+        if (extern.kind != imp.kind) throw WasmLinkException("import の種類が違う: $imp に $extern")
+        val owner = extern.instance as? EndiveWasmInstance ?: throw WasmLinkException("ほかのランタイムのインスタンスの export は渡せない: $extern")
+        val raw = owner.rawInstance()
+        val name = extern.exportName
+        when (imp.kind) {
+            WasmExternKind.FUNCTION -> {
+                val actual = owner.module.exportedFunctionType(name) ?: throw WasmLinkException("export がない: $extern")
+                if (actual != imp.functionType) throw WasmLinkException("import の型が違う: $imp に $actual")
+                values.addFunction(ImportFunction.exportAsImport(imp.module, imp.name, raw, name))
+            }
+            WasmExternKind.MEMORY -> values.addMemory(ImportMemory(imp.module, imp.name, raw.exports().memory(name)))
+            WasmExternKind.TABLE -> values.addTable(ImportTable(imp.module, imp.name, raw.exports().table(name)))
+            WasmExternKind.GLOBAL -> values.addGlobal(ImportGlobal(imp.module, imp.name, raw.exports().global(name)))
+            WasmExternKind.TAG -> values.addTag(ImportTag(imp.module, imp.name, raw.exports().tag(name)))
+        }
+    }
+
+    /** [shared] に結び付けた Endive のグローバル（なければ作る） */
+    private fun sharedFuelGlobal(shared: WasmSharedFuel): GlobalInstance = synchronized(shared) {
+        (shared.binding as? GlobalInstance) ?: GlobalInstance(shared.initial, 0L, ValType.I64, MutabilityType.Var).also { shared.binding = it }
     }
 
     /**
@@ -770,6 +831,19 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
 
     /** export の関数（名前ごとに1回だけ引く） */
     private val exportFunctions = HashMap<String, ExportFunction>()
+
+    /** export の線形メモリ（名前ごとに1回だけ包む。#263） */
+    private val exportMemories = HashMap<String, WasmMemory>()
+
+    /** Endive のインスタンス（#263。ほかのインスタンスの import に export を渡すため） */
+    fun rawInstance(): Instance = instance()
+
+    override fun extern(name: String): WasmExtern? = module.exportKind(name)?.let { WasmExtern(it, this, name) }
+
+    override fun exportedMemory(name: String): WasmMemory? {
+        if (module.exportKind(name) != WasmExternKind.MEMORY) return null
+        return exportMemories.getOrPut(name) { EndiveWasmMemory(instance().exports().memory(name)) }
+    }
 
     fun attach(instance: Instance) {
         raw = instance
@@ -972,6 +1046,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         if (closed) return
         closed = true
         exportFunctions.clear()
+        exportMemories.clear()
         try {
             raw?.close()
         } finally {

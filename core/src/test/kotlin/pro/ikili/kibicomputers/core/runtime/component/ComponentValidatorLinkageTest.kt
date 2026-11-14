@@ -28,7 +28,7 @@ class ComponentValidatorLinkageTest {
             // 1 回目はクラスの読み込みの失敗、2 回目以降は初期化に失敗したクラスの再利用。どちらも包む
             repeat(2) {
                 val e = try {
-                    load.invoke(null, instance, empty, null, null, null, 0b1110, null)
+                    load.invoke(null, instance, empty, null, null, null, null, 0b11110, null)
                     null
                 } catch (e: InvocationTargetException) {
                     e.targetException

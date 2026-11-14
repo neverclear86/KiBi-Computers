@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.kernel.ProcessMemory
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import java.util.concurrent.locks.Condition
 
 /**
@@ -69,6 +70,12 @@ internal class ProcessRuntime(
 
     /** 作っている途中の記録 */
     var loading: LoadingFrame? = null
+
+    /**
+     * インスタンス化したコンポーネント（#263。[Program.component] のプロセスだけ。作り終えるまで `null`）。
+     * プロセスのスレッドだけが使う（中の core インスタンスは [instances] にも入れてある）
+     */
+    var component: LinkedComponent? = null
 
     /** 今の待ち */
     var waitSet: WaitSet? = null

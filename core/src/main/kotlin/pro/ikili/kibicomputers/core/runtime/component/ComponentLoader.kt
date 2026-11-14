@@ -60,7 +60,7 @@ internal class LoadedComponent(
  * [WasmTrapException]（[WasmTrapKind.INTERRUPTED]）を投げる（`ProgramCache` は [WasmLoadException] だけを失敗として覚える）。
  *
  * 重い（検証に数十 ms、初回は1秒ほど）ので、コンパイル用のスレッドから呼ぶ。状態を持たないので、同時に呼んでよい。
- * 実行（exec）にはまだつないでいない（#263）。
+ * 中の core モジュールの読み込みとリンクは `ComponentProgram`（#263）。
  */
 internal object ComponentLoader {
     private val LOG: System.Logger = System.getLogger("kibicomputers.component")
@@ -69,13 +69,15 @@ internal object ComponentLoader {
      * [bytes] を読み込んで検証する。
      *
      * [validate] は wasm-tools の検証の差し替え（テストで、検証をまたいだ時間の上限を確かめるため）。`null` なら
-     * [ComponentValidator.validate]
+     * [ComponentValidator.validate]。[deadline] は時間の上限（`null` なら、検証器の初期化の後にここで作る）。読み込みの後の段
+     * （core モジュールの読み込みとリンク。#263）まで同じ上限で測るときに渡す
      */
     @Throws(WasmLoadException::class, WasmTrapException::class)
     fun load(
         bytes: ByteArray,
         limits: ComponentLimits = ComponentLimits.DEFAULT,
         policy: ComponentImportPolicy = ComponentImportPolicy.DEFAULT,
+        deadline: LoadDeadline? = null,
         validate: ((ByteArray) -> Unit)? = null,
     ): LoadedComponent {
         if (bytes.size > limits.maxBytes) {
@@ -87,8 +89,9 @@ internal object ComponentLoader {
             null -> throw WasmLoadException("WASM のコンポーネントのヘッダーがない")
         }
         // 検証器の初回の初期化（1秒ほど）は、内容と関係なく遅いので、時間の上限を測り始める前に済ませる
-        validator { ComponentValidator.warmUp() }
-        val deadline = LoadDeadline(limits.moduleLimits.timeLimitNanos)
+        warmUp()
+        @Suppress("NAME_SHADOWING")
+        val deadline = deadline ?: LoadDeadline(limits.moduleLimits.timeLimitNanos)
         val root = ComponentParser.parse(bytes, limits, deadline)
         val modules = root.allCoreModules()
         for (range in modules) {
@@ -114,6 +117,15 @@ internal object ComponentLoader {
         deadline.check("コンポーネントの展開の確認")
         val sha256 = MessageDigest.getInstance("SHA-256").digest(bytes)
         return LoadedComponent(bytes, sha256, root, modules, expansion.coreInstances, expansion.instances)
+    }
+
+    /**
+     * 検証器の初回の初期化を済ませる（内容と関係なく遅いので、時間の上限を測り始める前に呼ぶ）。
+     * [load] に [LoadDeadline] を渡す側（リンクまで同じ上限で測る。#263）は、上限を作る前にこれを呼ぶ
+     */
+    @Throws(WasmLoadException::class)
+    fun warmUp() {
+        validator { ComponentValidator.warmUp() }
     }
 
     /**

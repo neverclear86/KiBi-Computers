@@ -18,6 +18,7 @@ internal object KernelDrivers {
         override val waitImports: Set<String> get() = WasiP1.WAIT_IMPORTS
 
         override fun create(program: Program): ProcessDriver {
+            if (program.component != null) fsError(Errno.NOEXEC, "コンポーネントを動かす層はまだない（#687）")
             val module = program.module
             val isCommand = module.exports.any { it.name == WasiP1Driver.START && it.kind == WasmExternKind.FUNCTION }
             if (!isCommand) fsError(Errno.NOEXEC, "動かせる形でない（${WasiP1Driver.START} がない）")

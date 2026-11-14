@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.asyncify.AsyncifyUnsupported
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
@@ -93,13 +94,36 @@ internal class ModuleSource(
  */
 internal class Program private constructor(
     val hash: ModuleHash,
-    val module: WasmModule,
+    private val coreModule: WasmModule?,
     /** モジュールの出どころ（#82。保存データがモジュールを指すのに使う） */
     val moduleSource: ModuleSource,
     val fuelYield: Boolean = false,
     val fuelYieldRejection: String? = null,
+    /** コンポーネント（#263）なら、読み込んでリンクの計画まで済ませたもの。core モジュールなら `null` */
+    val component: ComponentProgram? = null,
 ) {
+    /**
+     * core モジュール（p1 のプログラム）。
+     *
+     * @throws IllegalStateException コンポーネントの Program（[component]）
+     */
+    val module: WasmModule
+        get() = coreModule ?: throw IllegalStateException("コンポーネントの Program に core モジュールはない")
+
+    /** 燃料を計測するか（コンポーネントなら、中の core モジュールに計測コードを挿入したか） */
+    val isFuelMetered: Boolean get() = component?.metered ?: module.isFuelMetered
+
     companion object {
+        /**
+         * 読み込んだコンポーネント [component] の Program（#263）。識別子は元のバイト列の SHA-256。
+         * コンポーネントのプロセスは保存できない（`Machine` が保存できないものとして扱う。保存の形は #269）
+         */
+        fun component(component: ComponentProgram): Program {
+            val sha = component.sha256
+            val source = ModuleSource(sha, component.metered, emptyList(), if (component.metered) Instrumentation.VERSION else 0, false)
+            return Program(ModuleHash.fromBytes(sha), null, source, component = component)
+        }
+
         /**
          * [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない）。
          *

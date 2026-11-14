@@ -10,10 +10,8 @@ import pro.ikili.kibicomputers.core.runtime.component.ExternDesc
 import pro.ikili.kibicomputers.core.runtime.component.FuncType
 import pro.ikili.kibicomputers.core.runtime.component.InstanceTypeDef
 import pro.ikili.kibicomputers.core.runtime.component.ParsedComponent
-import pro.ikili.kibicomputers.core.runtime.component.PrimValType
 import pro.ikili.kibicomputers.core.runtime.component.ResourceType
 import pro.ikili.kibicomputers.core.runtime.component.Sort
-import pro.ikili.kibicomputers.core.runtime.component.ValType
 
 /**
  * 1 つのコンポーネントの型の添字空間を、Canonical ABI の型（[CanonType]）に解決したもの（#264。ADR 0264）。
@@ -109,7 +107,7 @@ internal class CanonTypeSpace private constructor(private val entries: Array<Ent
         }
     }
 
-    private class Builder(private val outers: List<CanonTypeSpace>) {
+    private class Builder(private val outers: List<CanonTypeSpace>) : CanonTypeConvert.Refs {
         val entries = ArrayList<Entry>()
         val next: Int get() = entries.size
 
@@ -125,80 +123,29 @@ internal class CanonTypeSpace private constructor(private val entries: Array<Ent
             else -> Entry.Unresolved("外側のコンポーネントの型（リンクで引く。#263）")
         }
 
-        /** 値の型。解決できなければ [Unresolved] の理由を投げる */
-        private fun valType(v: ValType): CanonType = when (v) {
-            is ValType.Primitive -> primitive(v.type)
-            is ValType.Ref -> when (val e = ref(v.typeIndex)) {
-                is Entry.Value -> e.type
-                is Entry.Unresolved -> throw Unresolved(e.reason)
-                else -> throw Unresolved("型 ${v.typeIndex} は値の型ではない")
-            }
+        override fun value(index: Int): CanonType = when (val e = ref(index)) {
+            is Entry.Value -> e.type
+            is Entry.Unresolved -> throw CanonTypeConvert.Unresolved(e.reason)
+            else -> throw CanonTypeConvert.Unresolved("型 $index は値の型ではない")
         }
 
-        private fun primitive(p: PrimValType): CanonType = when (p) {
-            PrimValType.BOOL -> CanonType.Bool
-            PrimValType.S8 -> CanonType.S8
-            PrimValType.U8 -> CanonType.U8
-            PrimValType.S16 -> CanonType.S16
-            PrimValType.U16 -> CanonType.U16
-            PrimValType.S32 -> CanonType.S32
-            PrimValType.U32 -> CanonType.U32
-            PrimValType.S64 -> CanonType.S64
-            PrimValType.U64 -> CanonType.U64
-            PrimValType.F32 -> CanonType.F32
-            PrimValType.F64 -> CanonType.F64
-            PrimValType.CHAR -> CanonType.Char
-            PrimValType.STRING -> CanonType.Str
-            PrimValType.ERROR_CONTEXT -> throw Unresolved("error-context はまだ扱えない")
-        }
-
-        private fun resource(index: Int): Int = when (val e = ref(index)) {
+        override fun resource(index: Int): Int = when (val e = ref(index)) {
             is Entry.Resource -> e.id
-            is Entry.Unresolved -> throw Unresolved(e.reason)
-            else -> throw Unresolved("型 $index は resource ではない")
+            is Entry.Unresolved -> throw CanonTypeConvert.Unresolved(e.reason)
+            else -> throw CanonTypeConvert.Unresolved("型 $index は resource ではない")
         }
 
-        fun defValType(t: DefValType): Entry = resolving {
-            val type = when (t) {
-                is DefValType.Primitive -> primitive(t.type)
-                is DefValType.Record -> CanonType.Record(t.fields.map { it.name }, t.fields.map { valType(it.type) })
-                is DefValType.Variant -> CanonType.Variant(t.cases.map { it.name }, t.cases.map { c -> c.type?.let { valType(it) } })
-                is DefValType.ListOf -> {
-                    if (t.fixedLength != null) throw Unresolved("長さ固定の list はまだ扱えない")
-                    CanonType.ListOf(valType(t.element))
-                }
-                is DefValType.MapOf -> throw Unresolved("map はまだ扱えない")
-                is DefValType.Tuple -> CanonType.Tuple(t.types.map { valType(it) })
-                is DefValType.Flags -> CanonType.Flags(t.names)
-                is DefValType.Enum -> CanonType.Enum(t.names)
-                is DefValType.Option -> CanonType.Option(valType(t.type))
-                is DefValType.Result -> CanonType.Result(t.ok?.let { valType(it) }, t.err?.let { valType(it) })
-                is DefValType.Own -> CanonType.Own(resource(t.typeIndex))
-                is DefValType.Borrow -> CanonType.Borrow(resource(t.typeIndex))
-                is DefValType.Stream -> throw Unresolved("stream はまだ扱えない（#266）")
-                is DefValType.Future -> throw Unresolved("future はまだ扱えない（#266）")
-            }
-            if (type.depth > CanonLimits.MAX_TYPE_DEPTH) throw Unresolved("型が深すぎる（${type.depth}。上限 ${CanonLimits.MAX_TYPE_DEPTH}）")
-            Entry.Value(type)
-        }
+        fun defValType(t: DefValType): Entry = resolving { Entry.Value(CanonTypeConvert.defValType(t, this)) }
 
-        fun funcType(t: FuncType): Entry = resolving {
-            if (t.async) throw Unresolved("async の関数はまだ扱えない（#266）")
-            Entry.Func(CanonFunction(t.params.map { valType(it.type) }, t.result?.let { valType(it) }))
-        }
+        fun funcType(t: FuncType): Entry = resolving { Entry.Func(CanonTypeConvert.funcType(t, this)) }
 
         /** 型を作る。解決できない・大きすぎるものは [Entry.Unresolved] にする */
         private inline fun resolving(block: () -> Entry): Entry = try {
             block()
-        } catch (e: Unresolved) {
+        } catch (e: CanonTypeConvert.Unresolved) {
             Entry.Unresolved(e.message!!)
-        } catch (e: IllegalArgumentException) {
-            // 型の大きさが Int を超える、flags の数が範囲の外など（CanonType の require）
-            Entry.Unresolved(e.message ?: "型を作れない")
         }
     }
-
-    private class Unresolved(reason: String) : Exception(reason, null, false, false)
 }
 
 /**

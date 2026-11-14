@@ -53,6 +53,15 @@ public interface WasmModule {
     public val isAsyncified: Boolean
 
     /**
+     * 燃料の残りを、ほかのインスタンスと共有するグローバルに置くモジュールなら `true`（#263。コンポーネントの core モジュール）。
+     *
+     * 共有するモジュールは、燃料のグローバルを定義せずに [WasmFuel.IMPORT_MODULE].[WasmFuel.IMPORT_GLOBAL]（可変の i64）として
+     * import し、それを [WasmFuel.EXPORT_GLOBAL] として export し直す。この import もランタイムがつなぐ（[imports] には出さない）ので、
+     * インスタンスを作るときは [WasmInstanceConfig.sharedFuel] が要る。[WasmInstanceConfig.initialFuel] は使わない
+     */
+    public val sharesFuel: Boolean get() = false
+
+    /**
      * インスタンスを作る。モジュールに start 関数があれば、燃料を設定した後に実行する。
      *
      * @throws WasmLinkException import が足りない、型が合わない、またはデータ・要素のセグメントが範囲に収まらない
@@ -139,8 +148,48 @@ public interface WasmInstance : AutoCloseable {
     /** 線形メモリの区画の数（書き換えた区画と、そのうち基準から変わった区画）。追えないなら `null`（#83） */
     public fun memoryChunkCounts(): MemoryChunkCounts? = null
 
+    /**
+     * export [name] を、ほかのインスタンスの import に渡せる形で返す（#263。コンポーネントの core インスタンスどうしのリンク）。
+     * その名前の export がなければ `null`。既定は対応していない（`null`）
+     */
+    public fun extern(name: String): WasmExtern? = null
+
+    /** export された線形メモリ [name]（#263。canon の `memory` option）。なければ `null`。既定は対応していない（`null`） */
+    public fun exportedMemory(name: String): WasmMemory? = null
+
     /** インスタンスを捨てる。以後 [call] は [IllegalStateException] になる。2回呼んでもよい。 */
     override fun close()
+}
+
+/**
+ * インスタンスの export 1 つ（#263）。[WasmInstanceConfig.Builder.importExtern] で、ほかのインスタンスの import に渡す。
+ *
+ * 渡したメモリ・テーブルの確保は、作った側のインスタンスの数える相手（[WasmMemoryBudget] など）で数えたままにする
+ * （受けた側では数え直さず、閉じたときにも返さない）。同じランタイムのインスタンスどうしでだけ渡せる
+ */
+@ApiStatus.Internal
+public class WasmExtern internal constructor(
+    /** 種類 */
+    public val kind: WasmExternKind,
+    /** export したインスタンス */
+    internal val instance: WasmInstance,
+    /** export の名前 */
+    internal val exportName: String,
+) {
+    override fun toString(): String = "extern $exportName ($kind)"
+}
+
+/**
+ * インスタンスどうしで共有する燃料の残り（#263。[WasmModule.sharesFuel]）。1 つのプロセスのコンポーネントの core インスタンスは、
+ * みな同じものを import する。値は、共有するどのインスタンスの [WasmInstance.fuel] からも読み書きできる（同じ値）。
+ *
+ * [initial] は最初の値。ランタイムは初めてインスタンスに渡すときに、自分のグローバルを作って [binding] に結び付ける
+ */
+@ApiStatus.Internal
+public class WasmSharedFuel(internal val initial: Long) {
+    /** ランタイムのグローバル（初めてインスタンスに渡すときに作る。同じランタイムでだけ使う） */
+    @Volatile
+    internal var binding: Any? = null
 }
 
 /**
@@ -316,6 +365,12 @@ public object WasmFuel {
 
     /** 燃料切れを知らせる import の名前 */
     public const val IMPORT_NAME: String = "fuel"
+
+    /**
+     * 燃料の残りを共有するモジュール（[WasmModule.sharesFuel]。#263）が、残りのグローバル（可変の i64）を import する名前。
+     * モジュール名は [IMPORT_MODULE]
+     */
+    public const val IMPORT_GLOBAL: String = "fuel_global"
 
     /** 燃料の残りを入れる、可変の i64 のグローバルの export 名 */
     public const val EXPORT_GLOBAL: String = "kibi_fuel"

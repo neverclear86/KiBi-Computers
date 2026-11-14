@@ -75,6 +75,18 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
      */
     public val asyncStack: WasmAsyncStack? = builder.asyncStack
 
+    /**
+     * 燃料の残りを共有するモジュール（[WasmModule.sharesFuel]。#263）に渡す、共有の残り。`null` なら、共有するモジュールのインスタンスは
+     * 作れない（[WasmLinkException]）
+     */
+    internal val sharedFuel: WasmSharedFuel? = builder.sharedFuel
+
+    /** ほかのインスタンスの export を渡す import（#263。モジュール名と名前 → export） */
+    internal val externImports: Map<String, WasmExtern> = HashMap(builder.externImports)
+
+    /** [module].[name] に渡す、ほかのインスタンスの export。なければ `null` */
+    internal fun externImport(module: String, name: String): WasmExtern? = externImports[externKey(module, name)]
+
     /** [module].[name] のホストの関数。なければ `null` */
     public fun hostImport(module: String, name: String): WasmHostImport? = hostImports.firstOrNull { it.module == module && it.name == name }
 
@@ -91,10 +103,13 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         internal var writtenMemory: Boolean = false
         internal var writtenMemoryBudget: WasmTableBudget? = null
         internal var onMemoryGrowRefused: Runnable? = null
+        internal var sharedFuel: WasmSharedFuel? = null
+        internal val externImports = HashMap<String, WasmExtern>()
 
         /** ホストの関数を足す。同じ名前を2回足すと [IllegalArgumentException]。 */
         public fun hostFunction(import: WasmHostImport): Builder = apply {
             require(hostImports.none { it.module == import.module && it.name == import.name }) { "${import.module}.${import.name} が2回登録された" }
+            require(externKey(import.module, import.name) !in externImports) { "${import.module}.${import.name} はほかのインスタンスの export として登録された" }
             hostImports += import
         }
 
@@ -165,6 +180,20 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
             tableBudget = budget
         }
 
+        /**
+         * import [module].[name] に、ほかのインスタンスの export [extern] を渡す（#263）。同じ名前を2回渡す、またはホストの関数と
+         * 重なると [IllegalArgumentException]。種類と型が import の宣言と合わなければ、インスタンスを作るときに [WasmLinkException]
+         */
+        internal fun importExtern(module: String, name: String, extern: WasmExtern): Builder = apply {
+            require(hostImports.none { it.module == module && it.name == name }) { "$module.$name はホストの関数として登録された" }
+            require(externImports.put(externKey(module, name), extern) == null) { "$module.$name が2回登録された" }
+        }
+
+        /** 燃料の残りを共有するモジュールに渡す、共有の残りを決める（#263。[WasmInstanceConfig.sharedFuel]） */
+        internal fun sharedFuel(fuel: WasmSharedFuel?): Builder = apply {
+            sharedFuel = fuel
+        }
+
         /** 待機点への変換をかけたモジュールが退避する値の置き場所を決める（#329。[WasmInstanceConfig.asyncStack]）。 */
         public fun asyncStack(stack: WasmAsyncStack?): Builder = apply {
             asyncStack = stack
@@ -184,3 +213,6 @@ public class WasmInstanceConfig private constructor(builder: Builder) {
         public fun builder(): Builder = Builder()
     }
 }
+
+/** [WasmInstanceConfig.externImports] の鍵（モジュール名と名前を、名前に出ない文字でつなぐ） */
+private fun externKey(module: String, name: String): String = "$module\u0000$name"
