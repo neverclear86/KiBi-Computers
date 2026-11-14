@@ -66,6 +66,35 @@ class ScreenRenderingTest {
     }
 
     @Test
+    fun `枠の内側は中身の外の余白も含み、中身の左上を原点にフォントの単位で表す`() {
+        // 80x25 セル = 320x200 単位。幅で決まり、上下に余白ができる（#714）
+        val wide = ScreenLayout.fit(80, 25)
+        val margin = ScreenLayout.DEFAULT_MARGIN
+        assertEquals(0f, wide.innerLeft, 1e-3f)
+        assertEquals(320f, wide.innerRight, 1e-3f)
+        assertTrue(wide.innerTop < 0f)
+        assertTrue(wide.innerBottom > 200f)
+        assertEquals(margin, wide.innerTop * wide.scale + wide.offsetY, 1e-6f)
+        assertEquals(1f - margin, wide.innerBottom * wide.scale + wide.offsetY, 1e-6f)
+        assertEquals(margin, wide.innerLeft * wide.scale + wide.offsetX, 1e-6f)
+        assertEquals(1f - margin, wide.innerRight * wide.scale + wide.offsetX, 1e-6f)
+        // 縦長の解像度では高さで決まり、左右に余白ができる
+        val tall = ScreenLayout.fit(10, 40)
+        assertEquals(0f, tall.innerTop, 1e-3f)
+        assertEquals(320f, tall.innerBottom, 1e-3f)
+        assertTrue(tall.innerLeft < 0f)
+        assertTrue(tall.innerRight > 40f)
+        assertEquals(margin, tall.innerLeft * tall.scale + tall.offsetX, 1e-6f)
+        assertEquals(1f - margin, tall.innerRight * tall.scale + tall.offsetX, 1e-6f)
+        // 結合した面（#138）でも、渡した面の大きさと余白から求める
+        val big = ScreenLayout.fit(80, 25, 3f, 2f, 0.25f)
+        assertEquals(0.25f, big.innerTop * big.scale + big.offsetY, 1e-5f)
+        assertEquals(2f - 0.25f, big.innerBottom * big.scale + big.offsetY, 1e-5f)
+        assertEquals(0.25f, big.innerLeft * big.scale + big.offsetX, 1e-5f)
+        assertEquals(3f - 0.25f, big.innerRight * big.scale + big.offsetX, 1e-5f)
+    }
+
+    @Test
     fun `遠い画面ほど省いて描き、大きい画面は遠くまで描く`() {
         assertEquals(ScreenDetail.FULL, ScreenDetail.forDistance(0.0))
         assertEquals(ScreenDetail.FULL, ScreenDetail.forDistance(24.0 * 24.0))
