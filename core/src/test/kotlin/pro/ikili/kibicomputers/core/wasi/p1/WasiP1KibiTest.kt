@@ -175,10 +175,20 @@ class WasiP1KibiTest {
     fun `cabi_reallocの中で燃料が切れても、巻き戻さずに燃料を待って続ける`() = run(Mode.UNWIND, "spin", fuelPerTick = 2_000_000, fuelSlice = 2_000_000) {
         waitAndPost()
         val before = h.scheduler.fuelBlockingWaits.get()
+        // tick を進めずに、この tick の燃料を使い切って待つところまで待つ（tick が進むと、その場でスライスを足して待たずに済むことがある）。
+        // 200 ms 待っても来なければ、燃料待ちで止まっているとして、1 回だけ tick を進める
+        var spins = 0
+        eventually(60_000, "cabi_realloc の中で燃料を待たない") {
+            drain()
+            if (h.scheduler.fuelBlockingWaits.get() > before || m.stateOf(pid).isTerminal) return@eventually true
+            if (++spins % 200 == 0) h.scheduler.tick()
+            false
+        }
+        val waited = h.scheduler.fuelBlockingWaits.get() > before
         val out = finish()
         assertEquals(ProcessState.EXITED, m.stateOf(pid), "$out ${rt.lastError}")
         assertWaitOutput(out)
-        assertTrue(h.scheduler.fuelBlockingWaits.get() > before, "cabi_realloc の中で燃料を待っていない")
+        assertTrue(waited, "cabi_realloc の中で燃料を待っていない")
     }
 
     private fun assertTrapsInRealloc(mode: Mode, what: String, name: String) = run(mode, what) {
