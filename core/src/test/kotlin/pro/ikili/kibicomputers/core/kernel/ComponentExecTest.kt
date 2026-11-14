@@ -15,7 +15,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
-/** コンポーネント（layer 1）を exec したときの振る舞い（#262。実行は #263 でつなぐ） */
+/** コンポーネント（layer 1）を exec したときの振る舞い（#262。exec につなぐのは #687） */
 class ComponentExecTest {
     private val limit = Duration.ofSeconds(60)
 

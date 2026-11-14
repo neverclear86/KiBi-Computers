@@ -70,7 +70,7 @@ A が B を2回、B が C を2回…とインスタンス化する作りを重�
 - 失敗は `WasmLoadException` にし、メッセージに標準エラー出力の先頭（500 文字まで）を入れる。wasm-tools は検証に失敗すると、DWARF の読み直しに失敗したログ（`[<時刻> WARN ] ...`）を先に出すことがあるので、環境変数 `RUST_LOG=off` でログを止め、念のためログの行（`ComponentValidator.reason`）も除く。時刻が入ると同じバイナリでもメッセージが変わり、先頭の 500 文字をログが使ってしまう
 - **検証器そのものの失敗（`LinkageError`、wasm-tools のモジュールの読み込みの失敗など）も `WasmLoadException` に包むが、メッセージに「内部の失敗」と書き、ログ（ERROR）にも出す。** 包まないと、読み込みの呼び出し元（`Machine.loadedProgram`）が想定していない例外が上がるため。`ComponentValidator` 自身のクラスの初期化で失敗したもの（Endive のクラスが見えないとき）は中では包めないので、`ComponentLoader` が検証器を呼ぶところで包む。`ComponentValidator` は初期化で Endive のクラスに触れない（ログを黙らせるものも初めて使うときに作る）。`OutOfMemoryError` などの `VirtualMachineError` は包まない
 - ゲストのトラップ（メモリの上限で確保に失敗して abort したときなど）は、内容の失敗として扱う。入力を読み込みきれないときは、wasm-tools が「out of memory」で終わる（これも内容の失敗）
-- **検証中にスレッドが割り込まれたら（`Thread.interrupt`。Endive が `WasmInterruptedException` で止める）、内容の失敗ではないので `WasmTrapException`（`INTERRUPTED`）にし、割り込みの印は立てたままにする。** コンパイル用のスレッドはスケジューラの停止（`compilerExecutor.shutdownNow()`）で割り込まれるので、`WasmLoadException` にすると、止めただけの読み込みが壊れたコンポーネントとして報告され、`ProgramCache` に失敗として覚えられる（`ProgramCache` は `WasmLoadException` だけを覚える。p1 の実行側の `EndiveRuntime` が `INTERRUPTED` を分けるのと同じ）。今の `Machine.loadedProgram` は `WasmLoadException` と `ProgramLoadBusyException` しか受けないので、#263 で `ComponentLoader` を実行につなぐときに、`WasmTrapException`（`INTERRUPTED`）も受ける
+- **検証中にスレッドが割り込まれたら（`Thread.interrupt`。Endive が `WasmInterruptedException` で止める）、内容の失敗ではないので `WasmTrapException`（`INTERRUPTED`）にし、割り込みの印は立てたままにする。** コンパイル用のスレッドはスケジューラの停止（`compilerExecutor.shutdownNow()`）で割り込まれるので、`WasmLoadException` にすると、止めただけの読み込みが壊れたコンポーネントとして報告され、`ProgramCache` に失敗として覚えられる（`ProgramCache` は `WasmLoadException` だけを覚える。p1 の実行側の `EndiveRuntime` が `INTERRUPTED` を分けるのと同じ）。今の `Machine.loadedProgram` は `WasmLoadException` と `ProgramLoadBusyException` しか受けないので、#687 で `ComponentLoader` を exec につなぐときに、`WasmTrapException`（`INTERRUPTED`）も受ける
 - 失敗のメッセージに入る wasm-tools の位置（`at offset 0x..`）は検証用の写しの中の位置なので、元のバイト列の位置に直す（`ValidationImage.Image.originalOffset`）。そのまま写した部分は元と同じ位置に、書き直した部分（セクションの長さ、`unreachable` の本体）は元のセクションの先頭に対応させる
 
 ### 同梱
@@ -103,7 +103,7 @@ wasm-tools の検証は、時間の上限では途中で止まらない（Endive
 
 引けない型を最大とするので、実際より大きい側にずれる。上限は 2,000,000（測定では 1 単位あたり 0.2〜3.5 マイクロ秒なので、最悪でも数秒）。上の N=2,000・k=100・M=100 は約 4,000 万で、N=200 のもの（約 400 万）も、record・関数型のものも上限を超えて断る。
 
-実際のツールチェーンのコンポーネント（関数ごとに引数と export がある形。テストの「ツールチェーンが作る形」）は、見積もりが上限の 10 分の 1 未満に収まる。ただし、参照のたびに型の大きさを足すので、wac で合成した、インスタンスの引数が多いコンポーネントでは、余裕が 10 倍より小さくなりうる（実物は #263 か #267 で用意して確かめる）。**この見積もりは、見つけた形だけを抑える。** wasm-tools の検証に、ほかにも入力の大きさに対して大きく膨らむ形があれば、同じ方法で見積もりに足す。足すまでは、検証の時間の上限は、検証が終わった後の確認でしか効かない。core のインスタンス化の引数（core モジュールの import ごとの確認）は、見積もりに入れていない（#666 で調べる）。
+実際のツールチェーンのコンポーネント（関数ごとに引数と export がある形。テストの「ツールチェーンが作る形」）は、見積もりが上限の 10 分の 1 未満に収まる。ただし、参照のたびに型の大きさを足すので、wac で合成した、インスタンスの引数が多いコンポーネントでは、余裕が 10 倍より小さくなりうる（実物での確認は #666 で行う。#263 ではしていない）。**この見積もりは、見つけた形だけを抑える。** wasm-tools の検証に、ほかにも入力の大きさに対して大きく膨らむ形があれば、同じ方法で見積もりに足す。足すまでは、検証の時間の上限は、検証が終わった後の確認でしか効かない。core のインスタンス化の引数（core モジュールの import ごとの確認）は、見積もりに入れていない（#666 で調べる）。
 
 ### 関数の本体を除いた写しで検証する
 
@@ -138,7 +138,7 @@ jar は約 5.5 MiB 増える（`wasm-tools-1.2.0.jar` 5,635,996 バイト、`was
 
 ### 実行（exec）にはまだつながない
 
-`Machine.beginExec` の読み込み（`Program.load*`・`ProgramCache`）は変えない。コンポーネントを exec したときは、`ModulePrescan` がヘッダーで見分けて、重い検証をせずにすぐ「Component Model のコンポーネントは、まだ実行できない（#263）」で断る（`NOEXEC`。exec の経路を通すテストは `ComponentExecTest`）。`ProgramCache`・`Program`・保存データ（`ModuleSource`・スナップショットの節）は、#263・#269 で扱う。
+`Machine.beginExec` の読み込み（`Program.load*`・`ProgramCache`）は変えない。コンポーネントを exec したときは、`ModulePrescan` がヘッダーで見分けて、重い検証をせずにすぐ「Component Model のコンポーネントは、まだ実行できない」で断る（`NOEXEC`。exec の経路を通すテストは `ComponentExecTest`）。`Program` は #263 で扱った（`Program.component`）。`ProgramCache` は #687、保存データ（`ModuleSource`・スナップショットの節）は #269 で扱う。
 
 ## 測定
 
@@ -156,6 +156,6 @@ Windows・Java 17（Gradle のテスト。温まっていない JVM）。
 
 ## 測っていないこと
 
-- 実際のツールチェーンのコンポーネント（Rust の `wasm32-wasip2`・`wasm32-wasip3`）。テストは wasm-tools で WAT から作ったものだけ。ツールチェーンのものは #263 か #267 で用意する
-- Component Model の仕様のテスト（component-model の `test/` の wast）の取り込み（#263 のリンクと合わせて行う）
-- Java 21（NeoForge）での測定と、製品の環境（jarJar で同梱した jar をモジュールとして読む）で検証器のクラスが読めること（製品のサーバーの起動は試していない）。同梱の漏れは `checkBundledLibraries` で確かめ、クラスが足りないときに `WasmLoadException` になることは単体テスト（`ComponentValidatorLinkageTest`）で確かめた（開発環境の GameTest は `additionalRuntimeClasspath` から読むので、jarJar の読み込みは確かめられない）。検証器はまだ実行（exec）からは呼ばれない（#263 でつなぐ）。開発環境の実行時クラスパスの配線は、GameTest `componentValidatorWorksOnServer`（両バージョン。`RuntimeSelfCheck.validatesComponent`）で確かめる
+- 実際のツールチェーンのコンポーネント（Rust の `wasm32-wasip2`・`wasm32-wasip3`）。ツールチェーンのものは #263 で用意して、読み込みと実行を確かめた（`ToolchainComponentTest`）。検証の時間はそれでは測っていない
+- Component Model の仕様のテスト（component-model の `test/` の wast）の取り込み（#263 で取り込んだ。`ComponentSpecTest`。検証の時間はそれでは測っていない）
+- Java 21（NeoForge）での測定と、製品の環境（jarJar で同梱した jar をモジュールとして読む）で検証器のクラスが読めること（製品のサーバーの起動は試していない）。同梱の漏れは `checkBundledLibraries` で確かめ、クラスが足りないときに `WasmLoadException` になることは単体テスト（`ComponentValidatorLinkageTest`）で確かめた（開発環境の GameTest は `additionalRuntimeClasspath` から読むので、jarJar の読み込みは確かめられない）。検証器はまだ実行（exec）からは呼ばれない（#687 でつなぐ）。開発環境の実行時クラスパスの配線は、GameTest `componentValidatorWorksOnServer`（両バージョン。`RuntimeSelfCheck.validatesComponent`）で確かめる

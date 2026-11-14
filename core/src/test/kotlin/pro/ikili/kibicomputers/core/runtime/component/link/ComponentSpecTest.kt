@@ -4,7 +4,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
@@ -15,6 +17,9 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
  * wast は仕様のリポジトリ（https://github.com/WebAssembly/component-model 、コミット dd1fefc0c618382359feca6f2c758a2b3ef21c36、
  * Apache-2.0 WITH LLVM-exception）から写したもの（`src/test/resources/component-spec/`。`values/post-return.wast` は仕様の
  * `nyi.txt` にあり、同梱の wasm-tools でも読めないので入れていない）。`wasm-tools json-from-wast` で命令の並びとバイナリにして動かす。
+ *
+ * 計測なしと計測あり（燃料を共有する形。#692）の両方で動かす。`json-from-wast` はファイルごとに 1 回だけ走らせ、出力を両方で
+ * 使い回す。計測ありの失敗の鍵には `metered:` を前に付ける。計測ありでは、燃料切れのトラップは `assert_trap` の成功に数えない。
  *
  * トラップのメッセージは比べない（トラップしたことだけを確かめる）。まだ扱えない機能（async #266 など）で
  * 通らないものは [KNOWN] に理由と一緒に挙げる。挙げたものが通るようになったら、[KNOWN] から外す（ずれたら落ちる）
@@ -43,23 +48,42 @@ class ComponentSpecTest {
     @Test
     fun `仕様のwastを動かす`() {
         val failures = LinkedHashMap<String, String>()
-        var passed = 0
+        val passed = IntArray(2)
         for (name in files) {
-            val r = SpecRun(name)
-            r.run()
-            passed += r.passed
-            failures.putAll(r.failures)
+            val outputs = jsonFromWast(name)
+            for ((i, metered) in listOf(false, true).withIndex()) {
+                val r = SpecRun(name, outputs, metered)
+                r.run()
+                passed[i] += r.passed
+                failures.putAll(r.failures)
+            }
         }
-        val unexpected = failures.filterKeys { it !in known }
-        val fixed = known.keys.filter { it !in failures }
+        val expected = known + known.mapKeys { "$METERED${it.key}" }
+        val unexpected = failures.filterKeys { it !in expected }
+        val fixed = expected.keys.filter { it !in failures }
         assertTrue(unexpected.isEmpty() && fixed.isEmpty()) {
             "通らないもの:\n" + unexpected.entries.joinToString("\n") { "  ${it.key}: ${it.value}" } +
                 "\n通るようになったもの（KNOWN から外す）: $fixed"
         }
-        assertTrue(passed >= 250, "通った数が少ない: $passed")
+        assertTrue(passed[0] >= 250, "計測なしで通った数が少ない: ${passed[0]}")
+        assertTrue(passed[1] >= 250, "計測ありで通った数が少ない: ${passed[1]}")
     }
 
-    private class SpecRun(val name: String) {
+    /** [name] の wast を `json-from-wast` にかけた出力（重いので、ファイルごとに 1 回だけ） */
+    private fun jsonFromWast(name: String): Map<String, ByteArray> {
+        val wast = requireNotNull(javaClass.getResourceAsStream("/component-spec/$name.wast")) { "$name.wast がない" }.readBytes()
+        val outputs = listOf("out/t.json") + (0 until 400).map { "out/t.$it.wasm" }
+        val r = WitTool.run(
+            listOf("json-from-wast", "work/t.wast", "-o", "work/out/t.json", "--wasm-dir", "work/out"),
+            mapOf("t.wast" to wast, "out/.keep" to ByteArray(0)),
+            outputs,
+        )
+        assertEquals(0, r.exitCode, "$name: json-from-wast に失敗: ${r.stderr}")
+        return r.outputs
+    }
+
+    /** [metered] なら、core モジュールに燃料の計測を入れ、インスタンスの間で燃料を共有して動かす */
+    private class SpecRun(val name: String, val outputs: Map<String, ByteArray>, val metered: Boolean) {
         val failures = LinkedHashMap<String, String>()
         var passed = 0
         private var current: LinkedComponent? = null
@@ -68,20 +92,13 @@ class ComponentSpecTest {
         private val instances = HashMap<String, Pair<LinkedComponent?, String?>>()
 
         fun run() {
-            val wast = requireNotNull(javaClass.getResourceAsStream("/component-spec/$name.wast")) { "$name.wast がない" }.readBytes()
-            val outputs = listOf("out/t.json") + (0 until 400).map { "out/t.$it.wasm" }
-            val r = WitTool.run(
-                listOf("json-from-wast", "work/t.wast", "-o", "work/out/t.json", "--wasm-dir", "work/out"),
-                mapOf("t.wast" to wast, "out/.keep" to ByteArray(0)),
-                outputs,
-            )
-            assertEquals(0, r.exitCode, "$name: json-from-wast に失敗: ${r.stderr}")
-            val json = Json.parse(String(r.outputs.getValue("out/t.json"), Charsets.UTF_8)) as Map<*, *>
-            fun wasm(file: Any?): ByteArray = r.outputs["out/$file"] ?: error("$name: $file がない")
+            val json = Json.parse(String(outputs.getValue("out/t.json"), Charsets.UTF_8)) as Map<*, *>
+            fun wasm(file: Any?): ByteArray = outputs["out/$file"] ?: error("$name: $file がない")
+            val prefix = if (metered) METERED else ""
             try {
                 for (c in json["commands"] as List<*>) {
                     c as Map<*, *>
-                    val key = "$name:${(c["line"] as Number).toInt()}"
+                    val key = "$prefix$name:${(c["line"] as Number).toInt()}"
                     try {
                         when (c["type"]) {
                             "module" -> instantiate(key, wasm(c["filename"]), c["name"] as String?)
@@ -104,8 +121,8 @@ class ComponentSpecTest {
 
         private fun instantiate(key: String, bytes: ByteArray, name: String?) {
             val result = try {
-                val p = ComponentProgram.load(LinkTesting.runtime, bytes, ComponentHost.NONE, metered = false, policy = LinkTesting.ANY_IMPORT)
-                LinkedComponent.instantiate(p.plan) to null
+                val p = ComponentProgram.load(LinkTesting.runtime, bytes, ComponentHost.NONE, metered, policy = LinkTesting.ANY_IMPORT)
+                LinkedComponent.instantiate(p.plan, LinkEnv.NONE, if (metered) WasmSharedFuel(FUEL) else null) to null
             } catch (e: WasmLoadException) {
                 null to "読み込めない: ${e.message}"
             } catch (e: Exception) {
@@ -153,13 +170,14 @@ class ComponentSpecTest {
                 val r = invoke(key, c, action)
                 failures[key] = "トラップしない（$r。期待: ${cmd["text"]}）"
             } catch (e: WasmTrapException) {
-                passed++
+                // 計測ありで燃料が切れたのは、期待したトラップではない（FUEL は十分に大きいので、切れたら計測の不具合）
+                if (e.kind == WasmTrapKind.FUEL_EXHAUSTED) failures[key] = "燃料が切れた: ${e.message}" else passed++
             }
         }
 
         private fun assertInvalid(key: String, bytes: ByteArray) {
             try {
-                ComponentProgram.load(LinkTesting.runtime, bytes, ComponentHost.NONE, metered = false, policy = LinkTesting.ANY_IMPORT)
+                ComponentProgram.load(LinkTesting.runtime, bytes, ComponentHost.NONE, metered, policy = LinkTesting.ANY_IMPORT)
                 failures[key] = "読み込めてしまう"
             } catch (e: WasmLoadException) {
                 passed++
@@ -306,6 +324,12 @@ class ComponentSpecTest {
     }
 
     private companion object {
+        /** 計測ありの失敗の鍵の前に付けるもの */
+        const val METERED = "metered:"
+
+        /** 計測ありで 1 つのインスタンスに渡す燃料（切れないほど大きく） */
+        const val FUEL = 1L shl 40
+
         const val MAP = "map 型（component-model-map）は検証器で有効にしていない（#264 で扱わないとした型）"
         const val ASYNC = "async（stackful）の機能を使う。#266"
         const val MULTI_MEMORY = "core モジュールのメモリは 1 つまで（p1 と同じ上限。ModuleLimits・検証器の multi-memory）"

@@ -207,7 +207,7 @@ class ComponentLoaderTest {
     @Test
     fun `p1の読み込みはコンポーネントをすぐ断る`() {
         val e = assertThrows<WasmLoadException> { ModulePrescan.check(full, ModuleLimits.DEFAULT, null) }
-        assertMessage(e, "#263")
+        assertMessage(e, "コンポーネント")
     }
 
     @Test
