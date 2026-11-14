@@ -87,8 +87,9 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
             try {
                 device.onAttached(attached)
             } catch (t: Throwable) {
-                // つなげなかったので、表から戻す（接続を知らせていないので、切断も出さない）
-                removeLocked(address)
+                // つなげなかったので、表から戻す（接続を知らせていないので、切断も出さない）。
+                // onAttached の中で自分を外し、同じ address に別のデバイスをつないでいたら、それは外さない（自分のものだけ戻す）
+                if (table[address] === attached) removeLocked(address)
                 throw t
             }
             // onAttached の中で自分を外していなければ知らせる（書き込みのロックは再入できるので、外したなら表にない）

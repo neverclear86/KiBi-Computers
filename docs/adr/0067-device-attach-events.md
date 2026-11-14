@@ -32,6 +32,7 @@ event { kind: "device-detached", source: "", values: [text(address), text(種類
   - `detach` は `announced` が立っているときだけ出す
   - この場合はどちらも出ない（接続を知らせていないものの切断は出さない）
   - `onAttached` の中で別のデバイスをつないだときは、内側の `device-attached` が外側より先に並ぶ（受け入れる）
+  - `onAttached` が投げたときに表から戻すのも、`table[address] === attached` のときだけ。中で自分を外して同じ address に別のデバイスをつないでいたら、そのデバイスは残す（外すと、接続だけ届いて切断が届かない）
 
 ### 順番とロック
 

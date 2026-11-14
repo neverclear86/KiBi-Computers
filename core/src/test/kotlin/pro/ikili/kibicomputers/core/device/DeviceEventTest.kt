@@ -199,6 +199,47 @@ class DeviceEventTest {
     }
 
     @Test
+    fun `onAttachedの中で自分を外して同じaddressにつなぎ直し、その後で投げても、つなぎ直したデバイスは残る`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val q = m.subscribe()
+            val inner = Plain("test:inner")
+            val outer = object : Plain("test:outer") {
+                override fun onAttached(context: DeviceContext) {
+                    assertTrue(m.devices.detach(context.address))
+                    assertTrue(m.devices.attach(context.address, inner))
+                    throw IllegalStateException("つなげない")
+                }
+            }
+            assertThrows<IllegalStateException> { m.devices.attach(a, outer) }
+            // 内側のデバイスは表に残り、接続は届いていて、切断は出ていない
+            assertEquals(listOf(DeviceInfo(a, "test:inner")), m.devices.list())
+            assertTrue(m.devices.deviceAt(a) === inner)
+            assertEquals(listOf(attached(a, "test:inner")), m.pending(q))
+            // 外せば、切断が対になって届く
+            assertTrue(m.devices.detach(a))
+            assertEquals(listOf(attached(a, "test:inner"), detached(a, "test:inner")), m.pending(q))
+        }
+    }
+
+    @Test
+    fun `onAttachedの中で自分を外してから投げても、接続も切断も出ず、表は空のまま`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val q = m.subscribe()
+            val outer = object : Plain("test:outer") {
+                override fun onAttached(context: DeviceContext) {
+                    m.devices.detach(context.address)
+                    throw IllegalStateException("つなげない")
+                }
+            }
+            assertThrows<IllegalStateException> { m.devices.attach(a, outer) }
+            assertTrue(m.devices.list().isEmpty())
+            assertEquals(emptyList<KernelEvent>(), m.pending(q))
+        }
+    }
+
+    @Test
     fun `キューがなくても、閉じたマシンでも、つなぐ・外すは例外にならない`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine()
