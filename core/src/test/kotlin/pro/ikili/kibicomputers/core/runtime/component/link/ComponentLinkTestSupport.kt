@@ -12,6 +12,9 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 /** リンクのテストの道具（#263） */
 internal object LinkTesting {
     /** 名前の形を見ない import の判定（テストの名前空間 `test:*` を通す） */
+    /** [instantiate] が渡す燃料の既定値 */
+    const val DEFAULT_FUEL = 10_000_000L
+
     val ANY_IMPORT: ComponentImportPolicy = ComponentImportPolicy { null }
 
     val runtime: WasmRuntime by lazy { EndiveRuntime() }
@@ -26,7 +29,7 @@ internal object LinkTesting {
         validate: ((ByteArray) -> Unit)? = null,
     ): ComponentProgram = ComponentProgram.load(runtime, wat(text), host, metered, policy = ANY_IMPORT, validate = validate)
 
-    fun instantiate(program: ComponentProgram, env: LinkEnv = LinkEnv.NONE, fuel: Long = 10_000_000): LinkedComponent =
+    fun instantiate(program: ComponentProgram, env: LinkEnv = LinkEnv.NONE, fuel: Long = DEFAULT_FUEL): LinkedComponent =
         LinkedComponent.instantiate(program.plan, env, if (program.metered) WasmSharedFuel(fuel) else null)
 
     fun fn(params: List<CanonType>, result: CanonType?): CanonFunction = CanonFunction(params, result)

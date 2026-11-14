@@ -32,7 +32,7 @@ class ComponentLinkTest {
         assertTrue(p.plan.modules.all { it.sharesFuel })
         val left = c.coreInstances.map(WasmInstance::fuel)
         assertEquals(1, left.toSet().size, "共有した残りはどのインスタンスから読んでも同じ: $left")
-        assertTrue(left[0] < DEFAULT_FUEL, "燃料が減っていない: ${left[0]}")
+        assertTrue(left[0] < LinkTesting.DEFAULT_FUEL, "燃料が減っていない: ${left[0]}")
     }
 
     private val doubleHost = ComponentHost.of(
@@ -485,10 +485,5 @@ class ComponentLinkTest {
         assertThrows<WasmTrapException> { instantiate(p, env) }
         assertEquals(1, created.size)
         assertThrows<IllegalStateException> { created[0].call("f") }
-    }
-
-    private companion object {
-        /** [LinkTesting.instantiate] が渡す燃料 */
-        const val DEFAULT_FUEL = 10_000_000L
     }
 }

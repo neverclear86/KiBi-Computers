@@ -116,25 +116,34 @@ class ComponentProcessTest {
         assertEquals(false, unmetered.isFuelMetered)
     }
 
-    /** 1 つ目の core モジュール: メモリに書き込む（RAM は書き込んだ区画で数える。#407）。[start] は 2 つ目の start 関数の本体 */
+    /**
+     * 1 つ目の core モジュール: メモリに書き込む（RAM は書き込んだ区画で数える。#407）。[start] は 2 つ目の start 関数の本体
+     * （`$mark` を呼ぶと [marks] が増える。2 つ目のインスタンスを作ったかどうかが分かる）
+     */
     private fun failingLoad(start: String, firstStart: String = "") = """
         (component
-          (import "test:host/kernel" (instance ${'$'}h (export "die" (func))))
+          (import "test:host/kernel" (instance ${'$'}h (export "die" (func)) (export "mark" (func))))
           (alias export ${'$'}h "die" (func ${'$'}die))
+          (alias export ${'$'}h "mark" (func ${'$'}mark))
           (core func ${'$'}die_lower (canon lower (func ${'$'}die)))
+          (core func ${'$'}mark_lower (canon lower (func ${'$'}mark)))
           (core module ${'$'}a
             (import "host" "die" (func ${'$'}die))
             (memory (export "mem") 1)
             (data (i32.const 0) "hello")
             (func ${'$'}s (i32.store (i32.const 8192) (i32.const 1)) $firstStart)
             (start ${'$'}s))
-          (core instance ${'$'}hi (export "die" (func ${'$'}die_lower)))
+          (core instance ${'$'}hi (export "die" (func ${'$'}die_lower)) (export "mark" (func ${'$'}mark_lower)))
           (core instance ${'$'}ia (instantiate ${'$'}a (with "host" (instance ${'$'}hi))))
-          (core module ${'$'}b (func ${'$'}s $start) (start ${'$'}s))
-          (core instance ${'$'}ib (instantiate ${'$'}b)))
+          (core module ${'$'}b
+            (import "host" "mark" (func ${'$'}mark))
+            (func ${'$'}s $start)
+            (start ${'$'}s))
+          (core instance ${'$'}ib (instantiate ${'$'}b (with "host" (instance ${'$'}hi)))))
     """
 
     private val dies = AtomicInteger()
+    private val marks = AtomicInteger()
 
     /** ホストの関数 `test:host/kernel.die`（呼んだプロセスを自分で kill する） */
     private val dieHost = ComponentHost.of(
@@ -146,12 +155,16 @@ class ComponentProcessTest {
                 assertEquals(KillResult.DELIVERED, ctx.kill(ctx.pid, KillSignal.TERMINATE))
                 null
             },
+            "mark" to HostFunction(LinkTesting.fn(emptyList(), null)) { _, _ ->
+                marks.incrementAndGet()
+                null
+            },
         ),
     )
 
     private val startTraps by lazy { Program.component(LinkTesting.load(failingLoad("unreachable"), dieHost, metered = true)) }
     private val startSpins by lazy { Program.component(LinkTesting.load(failingLoad("(loop ${'$'}l (br ${'$'}l))"), dieHost, metered = true)) }
-    private val killsItself by lazy { Program.component(LinkTesting.load(failingLoad("nop", firstStart = "(call ${'$'}die)"), dieHost, metered = true)) }
+    private val killsItself by lazy { Program.component(LinkTesting.load(failingLoad("(call ${'$'}mark)", firstStart = "(call ${'$'}die)"), dieHost, metered = true)) }
 
     /** 読み込みの途中で終わったプロセスが、作ったものをみな返したこと */
     private fun assertCleanedUp(m: Machine, rt: ProcessRuntime, before: Long) {
@@ -202,6 +215,7 @@ class ComponentProcessTest {
             val rt = m.spawnRt(killsItself, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
             h.tickUntilTrue("終わらない") { rt.process.state.isTerminal || m.state == MachineState.CRASHED }
             assertEquals(1, dies.get())
+            assertEquals(0, marks.get(), "kill の印を見て、2 つ目のインスタンスを作らずに止まる")
             // 1 つ目の start の中で kill した。作り終えた直後に印を見て止める（割り込みでトラップしても CRASHED にはしない）
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
             assertCleanedUp(m, rt, before)
