@@ -680,10 +680,11 @@ public class Machine private constructor(
     /**
      * 待っても直らない「保存できないもの」でないか（#82）: ドライバーが保存に対応している（[SnapshotCapableDriver]）、
      * モジュールがストアにある（[pro.ikili.kibicomputers.core.persist.ModuleStore.contains]。メモリの集合を引くだけ）、
-     * インスタンスが1つ以下（`CREATED` は 0）。型の判定と集合の引きだけなので軽い
+     * インスタンスが1つ以下（`CREATED` は 0）、コンポーネントでない（#263。保存の形は #269）。型の判定と集合の引きだけなので軽い
      */
     private fun isStaticallySaveableLocked(rt: ProcessRuntime): Boolean =
         rt.driver is SnapshotCapableDriver &&
+            rt.program.component == null &&
             rt.instances.size <= 1 &&
             scheduler.moduleStore.contains(rt.program.moduleSource.originalHash)
 
@@ -1339,7 +1340,7 @@ public class Machine private constructor(
             if (asInit && (!bootingValue || bootCancelled)) throw BootCancelledException()
             check(!scheduler.isClosed) { "スケジューラは閉じている" }
             check(stateValue != MachineState.STOPPING && stateValue != MachineState.CRASHED) { "マシンは $stateValue" }
-            val metered = program.module.isFuelMetered
+            val metered = program.isFuelMetered
             require(metered || options.allowUnmetered) { "燃料を計測しないモジュールはプロセスにできない" }
             val parent = parentLocked(parentPid)
             if (kernel.processes.limitedCount() >= config.maxProcesses) throw ResourceLimitException("プロセスの数が上限（${config.maxProcesses}）")

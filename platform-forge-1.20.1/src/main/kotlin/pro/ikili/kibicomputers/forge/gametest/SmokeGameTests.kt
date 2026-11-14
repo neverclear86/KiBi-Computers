@@ -59,5 +59,16 @@ object SmokeGameTests {
         helper.succeed()
     }
 
+    /**
+     * コンポーネントを読み込み、core インスタンスどうしをつないで（燃料のグローバルを共有して）呼べる（#263）。
+     * 検証器・燃料の計測コードの挿入・ランタイムコンパイラ・リンカーが、ゲームの実行環境で一緒に動くかを確かめる。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun componentLinksOnServer(helper: GameTestHelper) {
+        helper.assertTrue(RuntimeSelfCheck.linksComponent(), "a component with two linked core instances should run")
+        helper.succeed()
+    }
+
     const val EMPTY: String = "empty"
 }

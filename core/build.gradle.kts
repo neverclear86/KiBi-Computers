@@ -198,6 +198,23 @@ kibiWasm {
     }
 }
 
+// WASI p1 のモジュールを p2 のコンポーネントにするアダプター（wasmtime の配布物。#263）。
+// テストで `wasm-tools component new --adapt` に渡し、実際のツールチェーンの形のコンポーネントを作る（MOD には入れない）
+val wasiAdapterProps = Properties().apply {
+    rootProject.file("gradle/wasi-adapter.properties").reader(Charsets.UTF_8).use(::load)
+}
+val wasiAdapter = kibiWasm.sourceArchive("wasi-adapter") {
+    url = "https://github.com/bytecodealliance/wasmtime/releases/download/v${wasiAdapterProps.getProperty("version")}/wasi_snapshot_preview1.command.wasm"
+    sha256 = wasiAdapterProps.getProperty("sha256")
+    outputDir = layout.buildDirectory.dir("generated/wasi-adapter/kibicomputers/wasi-adapter")
+}
+sourceSets.named("test") {
+    resources.srcDir(layout.buildDirectory.dir("generated/wasi-adapter"))
+}
+tasks.named("processTestResources") {
+    dependsOn(wasiAdapter)
+}
+
 // Lua 5.4 を WASI p1 向けにビルドした lua.wasm（#91）。core のリソース `/kibicomputers/wasm/lua.wasm` に入れる
 val luaProps = Properties().apply {
     rootProject.file("gradle/lua.properties").reader(Charsets.UTF_8).use(::load)

@@ -18,7 +18,7 @@ import java.nio.file.StandardOpenOption
  *
  * アーカイブは [downloadsDir]（Gradle ホームの下。手元と CI で共有する）に SHA-256 ごとに置き、
  * 2回目からはダウンロードしない。展開先は [outputDir] で、アーカイブの先頭のディレクトリ
- * （`lua-5.4.9/` など）は取り除く。
+ * （`lua-5.4.9/` など）は取り除く。アーカイブでない `.wasm`（テストで使う WASI のアダプター。#263）は、そのまま [outputDir] に写す。
  */
 abstract class SourceArchive : DefaultTask() {
     /** アーカイブの URL（`.tar.gz`・`.tar.xz`・`.zip`）。 */
@@ -48,6 +48,7 @@ abstract class SourceArchive : DefaultTask() {
             name.endsWith(".tar.gz") || name.endsWith(".tgz") -> Archives.extractTarGz(archive, out)
             name.endsWith(".tar.xz") -> Archives.extractTarXz(archive, out)
             name.endsWith(".zip") -> Archives.extractZip(archive, out)
+            name.endsWith(".wasm") -> Files.copy(archive, out.resolve(name))
             else -> throw GradleException("展開できないアーカイブの形式です: ${url.get()}")
         }
     }

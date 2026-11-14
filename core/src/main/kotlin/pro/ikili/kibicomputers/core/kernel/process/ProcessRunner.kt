@@ -50,6 +50,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.runtime.WasmLinkException
+import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
@@ -541,9 +545,23 @@ internal class ProcessRunner(private val machine: Machine) {
         return remaining
     }
 
-    /** ホスト関数・燃料切れの処理の入口の照合。違えばマシンを CRASHED にして投げる */
+    /**
+     * ホスト関数・燃料切れの処理の入口の照合。違えばマシンを CRASHED にして投げる。
+     *
+     * コンポーネントのプロセス（#263）は、中の core インスタンスがみな燃料のグローバルを共有し、互いに呼び合う（どれからでもホスト関数・
+     * 燃料切れの処理が呼ばれる）ので、このプロセスのインスタンスのどれかであればよい。作っている途中は、作り終えていない core インスタンスの
+     * start 関数からも呼ばれるので照合しない（最初に呼んだものを仮の holder にするだけ。どれも同じ残りを読み書きする）
+     */
     private fun verifyInstanceLocked(rt: ProcessRuntime, instance: WasmInstance) {
         val frame = rt.loading
+        if (rt.program.component != null) {
+            if (frame != null) {
+                if (frame.provisional == null) frame.provisional = instance
+            } else if (rt.instances.none { it === instance }) {
+                throw machine.inconsistencyLocked("このプロセスのインスタンスでないものから呼ばれた（pid ${rt.pid}）")
+            }
+            return
+        }
         if (frame != null) {
             val provisional = frame.provisional
             if (provisional == null) {
@@ -575,6 +593,7 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /** プロセスの始まり: LOADING で configure → 燃料の設定 → instantiate */
     private fun load(rt: ProcessRuntime, grant: Long) {
+        rt.program.component?.let { return loadComponent(rt, it, grant) }
         lock.withLockValue {
             rt.process.state = ProcessState.LOADING
             rt.loading = LoadingFrame(null, null)
@@ -607,6 +626,57 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.instances += instance
             rt.firstInstance = instance
             rt.fuelHolder = instance
+            rt.loading = null
+            rt.process.state = ProcessState.RUNNING
+        }
+    }
+
+    /**
+     * コンポーネントのプロセスの始まり（#263。ADR 0263）: LOADING で、リンクの計画のとおりに core インスタンスを作る。
+     *
+     * 中の core インスタンスは、みな同じ燃料のグローバル（[WasmSharedFuel]。最初の値は配分 [grant]）を共有する。ホストの関数は計画が持つ
+     * もの（`ComponentHost`）を [ProcessContext.hostFunction] で包んで渡し、`ProcessDriver.configure` は呼ばない。作ったインスタンスは
+     * 作るたびに [ProcessRuntime.instances] に入れる（途中で失敗しても、プロセスの終わりで閉じる）。作り終えたら最初のインスタンスを holder にする
+     */
+    private fun loadComponent(rt: ProcessRuntime, program: ComponentProgram, grant: Long) {
+        lock.withLockValue {
+            rt.process.state = ProcessState.LOADING
+            rt.loading = LoadingFrame(null, null)
+            rt.stackActive = true
+        }
+        val metered = !rt.process.unmetered
+        check(metered == program.metered) { "燃料の計測の有無がプロセスと違うコンポーネント" }
+        val ctx = rt.context
+        val env = object : KernelLinkEnv(ctx) {
+            override fun configure(builder: WasmInstanceConfig.Builder) {
+                applyKernelLimits(rt, builder)
+                if (metered) builder.fuel(0, rt.fuelHandler)
+            }
+
+            override fun wrapHost(function: WasmHostFunction): WasmHostFunction =
+                ctx.hostFunction { _, caller, args -> function.call(caller, args) }
+
+            override fun <T> callGuest(block: () -> T): T = ctx.callGuest(block)
+
+            override fun onInstanceCreated(instance: WasmInstance) {
+                lock.withLockValue {
+                    if (rt.killed) throw ProcessKilledException()
+                    rt.instances += instance
+                }
+            }
+
+            override fun chargeFuel(amount: Long) = ctx.chargeFuel(amount)
+        }
+        val linked = LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+        lock.withLockValue {
+            val first = rt.instances.firstOrNull()
+            if (first == null) {
+                linked.close()
+                throw WasmLinkException("core インスタンスのないコンポーネントは動かせない")
+            }
+            rt.component = linked
+            rt.firstInstance = first
+            rt.fuelHolder = first
             rt.loading = null
             rt.process.state = ProcessState.RUNNING
         }
@@ -716,6 +786,7 @@ internal class ProcessRunner(private val machine: Machine) {
             }
         }
         rt.instances.clear()
+        rt.component = null
         rt.fuelHolder = null
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
@@ -983,6 +1054,14 @@ internal class ProcessRunner(private val machine: Machine) {
         override val fuelHolder: WasmInstance
             get() = lock.withLockValue { rt.fuelHolder ?: throw IllegalStateException("インスタンスはまだない（LOADING）") }
 
+        override val component: LinkedComponent
+            get() {
+                checkThread()
+                return rt.component ?: throw IllegalStateException(
+                    if (rt.program.component == null) "コンポーネントのプロセスでない" else "コンポーネントはまだない（LOADING）",
+                )
+            }
+
         override val kernel: KernelState get() = machine.kernel
 
         override val vfs: Vfs get() = machine.vfs
@@ -1022,6 +1101,7 @@ internal class ProcessRunner(private val machine: Machine) {
             checkThread()
             lock.withLockValue {
                 check(rt.loading == null) { "作っている途中は instantiate を入れ子で呼べない" }
+                check(rt.program.component == null) { "コンポーネントのプロセスは instantiate を呼べない（core インスタンスはリンクの計画が作る）" }
                 check(rt.fuelHolder != null) { "最初のインスタンスがまだない" }
             }
             require(module.isFuelMetered == !rt.process.unmetered) { "燃料の計測の有無がプロセスと違うモジュール" }

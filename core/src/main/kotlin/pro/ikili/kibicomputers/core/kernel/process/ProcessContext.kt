@@ -28,6 +28,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkEnv
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import java.util.concurrent.CompletableFuture
 
 /** カーネルの包みを通すホスト関数。[ProcessContext.hostFunction] に渡す。 */
@@ -290,6 +292,14 @@ internal interface ProcessContext {
     val fuelHolder: WasmInstance
 
     /**
+     * インスタンス化したコンポーネント（#263。コンポーネントの Program のプロセスだけ）。core インスタンスはみな燃料のグローバルを
+     * 共有する（[pro.ikili.kibicomputers.core.runtime.WasmModule.sharesFuel]）ので、[fuelHolder] はどれでも同じ残りを指す。
+     * `LOADING` の間・core モジュールのプロセスでは `IllegalStateException`
+     */
+    val component: LinkedComponent
+        get() = throw IllegalStateException("コンポーネントのプロセスでない")
+
+    /**
      * ABI 層のホスト関数を包む。ABI 層はホスト関数をすべてこれで作る。包みは入口で停止の印を確かめ（[ProcessKilledException]）、
      * 渡された instance を照合する（作っている途中なら仮の holder にする／同じか確かめる。そうでなければ [fuelHolder] と同じか確かめる。
      * 違えばマシンを `CRASHED`）。その後 [f] を呼ぶ
@@ -540,6 +550,12 @@ internal interface ProcessContext {
 
 /** 子のハンドル（[ProcessContext.execWithHandle]）: 子の [pid] と、その `ProcessObject` を指す自分の [fd]（#74） */
 internal data class ProcessHandle(val pid: Int, val fd: Int)
+
+/**
+ * カーネルがコンポーネントをインスタンス化するときの [LinkEnv]（#263）。ホストの関数（`HostFunctionBody`）は、
+ * `call.env` をこの型として [ctx] からプロセスの口を使う
+ */
+internal abstract class KernelLinkEnv(val ctx: ProcessContext) : LinkEnv
 
 /** 作っている途中の記録（実行時だけ。[ProcessRuntime.loading]） */
 internal class LoadingFrame(
