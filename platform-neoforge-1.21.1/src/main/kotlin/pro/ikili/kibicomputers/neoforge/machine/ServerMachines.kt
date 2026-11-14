@@ -23,7 +23,9 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.config.ConfigValues
+import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.core.config.OverridableValue
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
@@ -38,6 +40,7 @@ import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
@@ -103,31 +106,44 @@ object ServerMachines {
     val current: MachineManager<MachineKey>?
         get() = manager
 
-    /** コンフィグ（[KiBiConfigs.server]）から作った待機点保存の設定。メインスレッドだけで使う */
-    private var configuredSave: MachineSaveConfig = MachineSaveConfig.DEFAULT
-
-    /** テスト（GameTest・負荷試験）の上書き。コンフィグの値と同じ値に戻したら外す（読み直しを止めないように） */
-    private var saveOverride: MachineSaveConfig? = null
+    /**
+     * 待機点保存の設定の2層（#202）。コンフィグ（[KiBiConfigs.server]）の値の上に、テスト（GameTest・負荷試験）の上書きが載る。
+     * メインスレッドだけで使う
+     */
+    private val save = OverridableValue(MachineSaveConfig.DEFAULT)
 
     /** 最後に当てたコンフィグの写し（参照の違いで、読み直しを見つける） */
     private var appliedConfig: ConfigValues? = null
 
+    /** サーバーのコンフィグを読んだ後で、サーバーを作る前（[onServerAboutToStart]）に、コンフィグが読まれていたか（テスト用） */
+    @Volatile
+    internal var configLoadedAtStart: Boolean = false
+        private set
+
     /**
      * 待機点保存の設定（#202。コンフィグの値。値はまだ仮で、確定は #251）。負荷試験・GameTest が差し替え、終わったら戻す。
-     * 差し替えている間に読み直したコンフィグは、戻したときに効く
+     * 差し替えている間に読み直したコンフィグは、元の値に戻したときに効く（[OverridableValue]）
      */
     internal var saveConfig: MachineSaveConfig
-        get() = saveOverride ?: configuredSave
+        get() = save.value
         set(value) {
-            val previous = saveConfig
-            saveOverride = value.takeIf { it != configuredSave }
+            val previous = save.value
+            save.set(value)
             applySaveConfig(previous)
         }
+
+    /** 自動保存の列を作った設定（テスト用）。いつも [saveConfig] と同じになる */
+    internal var rotationConfig: MachineSaveConfig = save.value
+        private set
 
     /** スケジューラを作った設定（テスト用）。サーバーが動いていなければ `null` */
     @Volatile
     internal var schedulerConfig: SchedulerConfig? = null
         private set
+
+    /** スケジューラの設定を、今のコンフィグ（[KiBiConfigs.server]）から作る。サーバーを開くとき（[onServerAboutToStart]）に使う */
+    internal fun schedulerConfigFromConfig(modules: ModuleStore): SchedulerConfig =
+        KiBiConfig.schedulerConfig(KiBiConfigs.server, modules)
 
     /** [saveConfig] が [previous] から変わったら、自動保存の列と書き込みの上限に当てる */
     private fun applySaveConfig(previous: MachineSaveConfig) {
@@ -136,6 +152,7 @@ object ServerMachines {
         // 止めていた台は続けてから、新しい予算の列にする
         rotation.clear()
         rotation = AutosaveRotation(value)
+        rotationConfig = value
         WorldMachineSaves.current?.let {
             it.maxPendingBytes = value.writerMaxPendingBytes
             it.claimWaitMillis = value.writerFlushMillis
@@ -146,14 +163,27 @@ object ServerMachines {
      * コンフィグの写しが変わっていたら、読み直しで効く値を当てる（#202）。読み直しはファイルを見張るスレッドで写しを
      * 差し替えるだけなので、ここ（メインスレッドの tick の始め）で当てる。変わっていなければ参照を1回比べるだけ
      */
-    private fun applyConfigIfChanged() {
+    internal fun applyConfigIfChanged() {
+        if (KiBiConfigs.server === appliedConfig) return
+        applyConfig(save.value)
+    }
+
+    /** 今のコンフィグの写しを [save] に入れ、[previous] から変わっていれば当てる */
+    private fun applyConfig(previous: MachineSaveConfig) {
         val values = KiBiConfigs.server
-        if (values === appliedConfig) return
         appliedConfig = values
-        val previous = saveConfig
-        configuredSave = KiBiConfig.machineSaveConfig(values)
-        if (saveOverride == configuredSave) saveOverride = null
+        save.configure(KiBiConfig.machineSaveConfig(values))
         applySaveConfig(previous)
+    }
+
+    /**
+     * 新しいサーバーを開くときに、テストの上書きを捨て、今のコンフィグを当て直す。上書きが戻されずに残っていても
+     * （統合サーバーの開き直しなど）、設定と自動保存の列がずれない
+     */
+    internal fun resetConfigForNewServer() {
+        val previous = save.value
+        save.clearOverride()
+        applyConfig(previous)
     }
 
     /**
@@ -413,9 +443,9 @@ object ServerMachines {
         val modules = FileModuleStore(world.resolve(KiBiComputers.MOD_ID).resolve("modules"))
         // コンフィグ（#202）。SERVER のコンフィグは、このイベントの前（ServerLifecycleHooks.handleServerAboutToStart）に読まれる。
         // スレッドの数などは、ここで作るときに決まる（読み直しでは変えない。ADR 0202）
-        saveOverride = null
-        applyConfigIfChanged()
-        val scheduler = KiBiConfig.schedulerConfig(KiBiConfigs.server, modules)
+        configLoadedAtStart = KiBiConfigs.isLoaded(ConfigSide.SERVER)
+        resetConfigForNewServer()
+        val scheduler = schedulerConfigFromConfig(modules)
         schedulerConfig = scheduler
         manager = MachineManager(scheduler, ERRORS)
     }

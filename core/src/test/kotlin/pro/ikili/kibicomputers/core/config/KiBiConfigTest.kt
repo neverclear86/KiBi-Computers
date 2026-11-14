@@ -76,7 +76,47 @@ class KiBiConfigTest {
             KiBiConfig.machineSaveConfig(values)
             KiBiConfig.screenSyncTraffic<Any>(values)
             KiBiConfig.keyboardInputBudget(values)
+            // 自動保存の周期は、止めた台が書かれる前に替わらない長さになる
+            val save = KiBiConfig.machineSaveConfig(values)
+            assertTrue(
+                save.autosavePeriodTicks >= save.autosaveQuiesceTicks + 2,
+                "周期 ${save.autosavePeriodTicks} が待つ ${save.autosaveQuiesceTicks} tick より短い",
+            )
         }
+    }
+
+    @Test
+    fun autosavePeriodIsRaisedAboveTheQuiesceWait() {
+        val short = ConfigValues.resolve(
+            mapSource(KiBiConfig.AUTOSAVE_PERIOD_TICKS to 20, KiBiConfig.AUTOSAVE_QUIESCE_TICKS to 100),
+        )
+        assertEquals(20, short[KiBiConfig.AUTOSAVE_PERIOD_TICKS])
+        assertEquals(102L, KiBiConfig.machineSaveConfig(short).autosavePeriodTicks)
+        // 十分長ければそのまま
+        val long = ConfigValues.resolve(mapSource(KiBiConfig.AUTOSAVE_PERIOD_TICKS to 600))
+        assertEquals(600L, KiBiConfig.machineSaveConfig(long).autosavePeriodTicks)
+        // 周期の下限は 1 秒（1 tick ごとに止めて戻す周期は設定できない）
+        val tooShort = ConfigValues.resolve(mapSource(KiBiConfig.AUTOSAVE_PERIOD_TICKS to 1))
+        assertEquals(KiBiConfig.AUTOSAVE_PERIOD_TICKS.default, tooShort[KiBiConfig.AUTOSAVE_PERIOD_TICKS])
+        assertEquals(listOf<ConfigEntry<*>>(KiBiConfig.AUTOSAVE_PERIOD_TICKS), tooShort.rejected)
+    }
+
+    @Test
+    fun keyboardBudgetIsRebuiltWhenTheConfiguredValuesChange() {
+        val values = ConfigValues.DEFAULTS
+        val used = KiBiConfig.keyboardInputBudget(values)
+        used.tryConsume(10, 0)
+        assertSame(used, KiBiConfig.keyboardInputBudget(values, used), "同じ値なら、使いかけの予算を残す")
+        assertNotSame(used, KiBiConfig.keyboardInputBudget(values, null))
+
+        val changed = ConfigValues.resolve(mapSource(KiBiConfig.KEYBOARD_INPUT_REFILL_PER_TICK to 0))
+        val rebuilt = KiBiConfig.keyboardInputBudget(changed, used)
+        assertNotSame(used, rebuilt)
+        assertEquals(0, rebuilt.refillPerTick)
+        assertEquals(used.capacity, rebuilt.capacity)
+
+        val bigger = ConfigValues.resolve(mapSource(KiBiConfig.KEYBOARD_INPUT_CAPACITY to used.capacity + 1))
+        assertEquals(used.capacity + 1, KiBiConfig.keyboardInputBudget(bigger, used).capacity)
     }
 
     @Test

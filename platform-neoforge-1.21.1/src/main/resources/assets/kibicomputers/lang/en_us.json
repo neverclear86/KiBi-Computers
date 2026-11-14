@@ -70,7 +70,7 @@
   "kibicomputers.configuration.scheduler.totalMemoryMiB": "Total RAM limit (MiB)",
   "kibicomputers.configuration.scheduler.totalMemoryMiB.tooltip": "Total RAM limit for all computers on the server, in MiB. 0 = automatic (half of the maximum JVM heap).",
   "kibicomputers.configuration.save.autosavePeriodTicks": "Autosave interval (ticks)",
-  "kibicomputers.configuration.save.autosavePeriodTicks.tooltip": "Interval between autosaves of running computers, in ticks.",
+  "kibicomputers.configuration.save.autosavePeriodTicks.tooltip": "Interval between autosaves of running computers, in ticks. Raised to at least autosaveQuiesceTicks + 2 (a shorter interval would close computers before they are written).",
   "kibicomputers.configuration.save.autosaveQuiesceTicks": "Autosave wait (ticks)",
   "kibicomputers.configuration.save.autosaveQuiesceTicks.tooltip": "Ticks an autosave waits for a computer to reach a safe point.",
   "kibicomputers.configuration.save.autosaveWritesPerTick": "Autosaves per tick",

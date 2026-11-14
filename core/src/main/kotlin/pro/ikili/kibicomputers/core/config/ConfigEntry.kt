@@ -12,7 +12,10 @@ public enum class ConfigSide(
     /** ファイル名の分類の部分（`kibicomputers-<suffix>.toml`） */
     public val suffix: String,
 ) {
-    /** サーバーの設定。ワールドごとの `serverconfig/` に置かれ、つないだクライアントにも送られる */
+    /**
+     * サーバーの設定。つないだクライアントにも送られる。置き場はローダーに従う: NeoForge 21.1 は `config/`
+     * （ワールドの `serverconfig/` に同じ名前のファイルがあればそちらが優先）、Forge 1.20.1 はワールドの `serverconfig/`
+     */
     SERVER("server"),
 
     /** クライアントだけの設定（見た目など）。`config/` に置かれる */

@@ -27,22 +27,23 @@
 
 ### 値の流れと読み直し
 
-- SERVER のファイルは、ローダーが `ServerLifecycleHooks.handleServerAboutToStart` の中で、`ServerAboutToStartEvent` より前に読む（両バージョンのソースで確かめた。GameTest でも確かめる）。`ModConfigEvent.Loading` で写しを作り、`ConfigState` に入れる。
+- SERVER のファイルは、ローダーが `ServerLifecycleHooks.handleServerAboutToStart` の中で、`ServerAboutToStartEvent` より前に読む（両バージョンのソースで確かめた。1.21.1 の GameTest で、サーバーを開くときにすでに読まれていたことを確かめる。1.20.1 の GameTest は、MOD のバスの購読で `Loading` を受けたことを確かめる）。`ModConfigEvent.Loading` で写しを作り、`ConfigState` に入れる。
 - 1.21.1 の `ServerMachines.onServerAboutToStart` は、その写しから `SchedulerConfig` を作って `MachineManager` を作る。
 - 読み直し（`ModConfigEvent.Reloading`）はファイルを見張るスレッドから来る。そこでは写しを作って参照を差し替えるだけで、マシンの状態に触らない。使う側はメインスレッドの tick の始めに参照を1回比べ、変わっていたときだけ当てる（tick ごとのコストは参照の比較1回。台数によらない）。
   - `save` の値: `ServerMachines` が `MachineSaveConfig` を作り直し、中身が変わったときだけ自動保存の列と書き込みの上限に当てる。
   - `screenSync` の値: 予算が変わったときだけ `ScreenSyncTraffic` を作り直す（プレイヤーごとの勘定は空に戻る）。
-  - `keyboard` の値: 次に作るキーボードの予算から効く（作った予算は変えない）。
+  - `keyboard` の値: 次にキーボードを開くときから効く。使いかけの予算（プレイヤーとキーボードの組ごとに、満タンに戻るまで残る）の値が古ければ、開くときに今の値で作り直す（使った分は戻る）。`inputRefillBytesPerTick` が 0 の予算も、値を直して開き直せば新しい値になる。
 - `scheduler` の値（スレッドの数・スタック・許可の数・キャッシュ・RAM の上限）は、スケジューラを作るときに決まる。spec では `worldRestart()` にし、読み直しでは当てない。読み直しで変わったら「次にサーバー（ワールド）を開いたときに効く」とログに出す。動いている 1,000 台を止めて作り直すのは重く、壊れやすいため。
   - NeoForge の `ConfigValue.get()` は `worldRestart` の項目を読み直しでも変えないので、接続層は `getRaw()` で読み、変化を見つける。
 - 値が範囲の外・型の違いなら（spec が直すので普通は起きない）、その項目は既定にしてログに出す。
-- GameTest・負荷試験が `ServerMachines.saveConfig` を差し替えるときは、コンフィグの値とは別の層（上書き）に入れる。上書きをコンフィグの値と同じ値に戻したら外れ、その後の読み直しが効く。
+- GameTest・負荷試験が `ServerMachines.saveConfig` を差し替えるときは、コンフィグの値とは別の層（上書き。core の `OverridableValue`）に入れる。上書きがあれば上書きが優先される。コンフィグの値と同じ値、または上書きを載せたときのコンフィグの値（テストの定型 `val c = saveConfig; saveConfig = c.copy(..); …; saveConfig = c` の `c`）に戻したら外れ、その後の読み直しが効く。新しいサーバーを開くとき（`onServerAboutToStart`）は、上書きを捨てて今のコンフィグを当て直す（設定と自動保存の列がずれない）。
 
 ### 自動の既定と単位
 
 - 機械によって変わる既定（`maxConcurrentMachines` = CPU のスレッド数の半分、`totalMemoryMiB` = JVM のヒープの最大値の半分）は、数をファイルに書かず、番兵 0 を「自動」とする。解釈は `KiBiConfig.schedulerConfig` で行う（`SchedulerConfig` の既定に任せる）。最初に起動した機械の数がファイルに残り、`defaultconfigs/` で配られるのを防ぐ。
 - バイト数は、書きやすい単位の整数（`...MiB`・`...KiB`。キー名に単位を入れる）で受け、バイトの `Long` に直すのは `KiBiConfig` の組み立てだけにする（2 GiB を超えても桁があふれない）。
 - 範囲は spec と core の `require` の両方にある。全項目の最小と最大で組み立てても例外にならないことを、core の単体テストで確かめる。
+- 範囲の外ではないが、項目の間で意味が合わなくなる組み合わせは、組み立てで直す。自動保存の周期（`autosavePeriodTicks`）は、「待つ tick（`autosaveQuiesceTicks`）+ 2」より短いとき、それに引き上げる（周期が替わるたびに、止めている台は書く前でも戻されるので、短いと1台も書かれずに周期ごとに WARN が出る）。周期の下限は 20 tick（1 秒）。
 
 ### 説明（日英）
 

@@ -61,7 +61,7 @@ object ScreenSync {
     private var trafficConfig: ConfigValues? = null
 
     /** コンフィグの予算が変わっていたら、[traffic] を作り直す。メインスレッドから呼ぶ */
-    private fun applyConfigIfChanged() {
+    internal fun applyConfigIfChanged() {
         val values = KiBiConfigs.server
         if (values === trafficConfig) return
         trafficConfig = values

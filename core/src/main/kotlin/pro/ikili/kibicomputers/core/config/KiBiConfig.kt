@@ -11,8 +11,8 @@ import pro.ikili.kibicomputers.core.persist.ModuleStore
 /**
  * KiBi Computers のコンフィグの項目の一覧と、値から core の設定を組み立てる関数（#202、ADR 0202）。
  *
- * 項目を足すときは、ここに宣言を1つ足し（[ENTRIES] に入れる）、lang（両バージョンの `en_us`・`ja_jp`）に名前と説明を足す。
- * 接続層は [ENTRIES] を走査して spec に写すので、接続層は直さなくてよい。
+ * 項目を足すときは、ここに宣言を1つ足し（[ENTRIES] に入れる）、1.21.1 の lang（`en_us`・`ja_jp`）に名前と説明を足す
+ * （1.20.1 には lang がなく、移植のとき #224 で足す）。接続層は [ENTRIES] を走査して spec に写すので、接続層は直さなくてよい。
  *
  * 既定の値はすべて仮の値（確定は #251）。機械によって変わる既定（コア数・ヒープ）は数を書かず、「自動」の番兵（0）にする。
  * バイト数は MiB・KiB の整数で受け、バイトに直すのはここの組み立てだけにする（桁あふれを1か所で防ぐ）。
@@ -21,6 +21,15 @@ import pro.ikili.kibicomputers.core.persist.ModuleStore
 public object KiBiConfig {
     private const val MIB: Long = 1024L * 1024
     private const val KIB: Long = 1024L
+
+    /** 自動保存の周期の最小（1 秒）。これより短くしても、止めた台が書かれる前に周期が替わりやすいだけ */
+    private const val MIN_AUTOSAVE_PERIOD_TICKS: Int = 20
+
+    /**
+     * 自動保存の周期は「待つ tick + これ」以上にする。周期が替わると、止めている台は書く前でも `close` して列に戻す（AutosaveRotation）。
+     * 止めた tick の次の tick から待つ tick の間に書けるよう、止める tick と書く tick の2つ分を足す
+     */
+    private const val AUTOSAVE_PERIOD_MARGIN_TICKS: Int = 2
 
     private val entries = ArrayList<ConfigEntry<*>>()
 
@@ -103,9 +112,9 @@ public object KiBiConfig {
     /** 自動保存の周期（tick） */
     @JvmField
     public val AUTOSAVE_PERIOD_TICKS: IntEntry = serverInt(
-        "save", "autosavePeriodTicks", 6000, 1, Int.MAX_VALUE, ConfigApply.RELOAD,
-        "Interval between autosaves of running computers, in ticks.",
-        "動いているコンピューターを自動保存する周期（tick）。",
+        "save", "autosavePeriodTicks", 6000, MIN_AUTOSAVE_PERIOD_TICKS, Int.MAX_VALUE, ConfigApply.RELOAD,
+        "Interval between autosaves of running computers, in ticks. Raised to at least autosaveQuiesceTicks + 2 (a shorter interval would close computers before they are written).",
+        "動いているコンピューターを自動保存する周期（tick）。autosaveQuiesceTicks + 2 より短いときは、それに引き上げる（短いと、書く前に止めた台を戻してしまう）。",
     )
 
     /** 自動保存で、待機点に来るのを待つ tick の数 */
@@ -268,7 +277,10 @@ public object KiBiConfig {
     /** [values] から待機点保存の設定を作る */
     @JvmStatic
     public fun machineSaveConfig(values: ConfigValues): MachineSaveConfig = MachineSaveConfig(
-        autosavePeriodTicks = values[AUTOSAVE_PERIOD_TICKS].toLong(),
+        autosavePeriodTicks = maxOf(
+            values[AUTOSAVE_PERIOD_TICKS].toLong(),
+            values[AUTOSAVE_QUIESCE_TICKS].toLong() + AUTOSAVE_PERIOD_MARGIN_TICKS,
+        ),
         autosaveQuiesceTicks = values[AUTOSAVE_QUIESCE_TICKS],
         autosaveWritesPerTick = values[AUTOSAVE_WRITES_PER_TICK],
         unloadWaitBudgetMillis = values[UNLOAD_WAIT_BUDGET_MILLIS].toLong(),
@@ -289,4 +301,20 @@ public object KiBiConfig {
     @JvmStatic
     public fun keyboardInputBudget(values: ConfigValues): KeyboardInputBudget =
         KeyboardInputBudget(values[KEYBOARD_INPUT_CAPACITY], values[KEYBOARD_INPUT_REFILL_PER_TICK])
+
+    /**
+     * [values] に合うキーボードの入力の予算。[existing]（使いかけの予算）が今の値（ためておける量・戻る量）と同じならそれを返し、
+     * 違えば作り直す（使った分は戻る）。使いかけの予算は満タンに戻るまで残るので、値を変えた後に開いたキーボードにも、
+     * 古い値の予算が残らないようにする
+     */
+    @JvmStatic
+    public fun keyboardInputBudget(values: ConfigValues, existing: KeyboardInputBudget?): KeyboardInputBudget {
+        val capacity = values[KEYBOARD_INPUT_CAPACITY]
+        val refill = values[KEYBOARD_INPUT_REFILL_PER_TICK]
+        return if (existing != null && existing.capacity == capacity && existing.refillPerTick == refill) {
+            existing
+        } else {
+            KeyboardInputBudget(capacity, refill)
+        }
+    }
 }

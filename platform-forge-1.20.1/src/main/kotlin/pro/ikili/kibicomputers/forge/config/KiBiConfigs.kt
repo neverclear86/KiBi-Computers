@@ -55,6 +55,23 @@ object KiBiConfigs {
     /** [side] のファイルを読み込んだことがあるか（テスト用） */
     internal fun isLoaded(side: ConfigSide): Boolean = side in loaded
 
+    private val loadedByEvent = java.util.concurrent.ConcurrentHashMap.newKeySet<ConfigSide>()
+    private val reloadedByEvent = java.util.concurrent.ConcurrentHashMap.newKeySet<ConfigSide>()
+
+    /**
+     * [side] の読み込みの `ModConfigEvent.Loading` を、MOD のバスの購読で受けたことがあるか（テスト用）。
+     * [isLoaded] は、`ServerAboutToStartEvent` の予備の購読でも立つので、バスを取れなかったときは区別できない
+     */
+    internal fun isLoadedByEvent(side: ConfigSide): Boolean = side in loadedByEvent
+
+    /** [side] の読み直しの `ModConfigEvent.Reloading` を、MOD のバスの購読で受けたことがあるか（テスト用） */
+    internal fun isReloadedByEvent(side: ConfigSide): Boolean = side in reloadedByEvent
+
+    /** 項目 [entry] の spec の値（テスト用。値を差し替えて、読み直しのイベントを流すのに使う） */
+    @Suppress("UNCHECKED_CAST")
+    internal fun specValue(entry: ConfigEntry<*>): ForgeConfigSpec.ConfigValue<Any>? =
+        registered[entry.side]?.values?.get(entry) as ForgeConfigSpec.ConfigValue<Any>?
+
     /** 項目のある分類の spec を作って登録する。MOD の初期化で1回だけ呼ぶ */
     fun register(context: ModLoadingContext) {
         for (side in ConfigSide.entries) {
@@ -119,6 +136,7 @@ object KiBiConfigs {
 
     private fun refresh(config: ModConfig, reload: Boolean) {
         val (side, reg) = registered.entries.firstOrNull { it.value.spec === config.getSpec() }?.toPair() ?: return
+        (if (reload) reloadedByEvent else loadedByEvent) += side
         refresh(side, reg, reload)
     }
 

@@ -52,6 +52,22 @@ object KiBiConfigs {
     /** [side] のファイルを読み込んだことがあるか（テスト用） */
     internal fun isLoaded(side: ConfigSide): Boolean = side in loaded
 
+    /** 項目 [entry] の spec の値（テスト用。値を差し替えて、読み直しのイベントを流すのに使う） */
+    @Suppress("UNCHECKED_CAST")
+    internal fun specValue(entry: ConfigEntry<*>): ModConfigSpec.ConfigValue<Any>? =
+        registered[entry.side]?.values?.get(entry) as ModConfigSpec.ConfigValue<Any>?
+
+    /** 読み込み・読み直しの結果（テスト用） */
+    class Report(val side: ConfigSide, val reload: Boolean, val changed: List<ConfigEntry<*>>, val rejected: List<ConfigEntry<*>>) {
+        /** 変わった値のうち、次にサーバー（ワールド）を開いたときに効くもの */
+        val needsRestart: List<ConfigEntry<*>> get() = changed.filter { it.apply == ConfigApply.WORLD_RESTART }
+    }
+
+    /** 最後に読み込み・読み直しをした結果（テスト用） */
+    @Volatile
+    internal var lastReport: Report? = null
+        private set
+
     /** 項目のある分類の spec を作って登録する。MOD の初期化で1回だけ呼ぶ */
     fun register(container: ModContainer, modBus: IEventBus) {
         for (side in ConfigSide.entries) {
@@ -105,8 +121,10 @@ object KiBiConfigs {
         for (entry in next.rejected) LOGGER.warn("Ignoring an invalid value of {} in {}; using the default", entry.path, side.fileName)
         val changed = state(side).update(next)
         loaded += side
+        val report = Report(side, reload, changed, next.rejected)
+        lastReport = report
         if (!reload) return
-        changed.filter { it.apply == ConfigApply.WORLD_RESTART }.forEach {
+        report.needsRestart.forEach {
             LOGGER.info("{} in {} changed; it takes effect the next time the server (world) starts", it.path, side.fileName)
         }
         if (changed.isNotEmpty()) LOGGER.info("Reloaded {} ({} values changed)", side.fileName, changed.size)

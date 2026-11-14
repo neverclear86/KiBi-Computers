@@ -70,7 +70,7 @@
   "kibicomputers.configuration.scheduler.totalMemoryMiB": "RAM の合計の上限（MiB）",
   "kibicomputers.configuration.scheduler.totalMemoryMiB.tooltip": "サーバーの全コンピューターの RAM の合計の上限（MiB）。0 は自動（JVM のヒープの最大値の半分）。",
   "kibicomputers.configuration.save.autosavePeriodTicks": "自動保存の周期（tick）",
-  "kibicomputers.configuration.save.autosavePeriodTicks.tooltip": "動いているコンピューターを自動保存する周期（tick）。",
+  "kibicomputers.configuration.save.autosavePeriodTicks.tooltip": "動いているコンピューターを自動保存する周期（tick）。autosaveQuiesceTicks + 2 より短いときは、それに引き上げる（短いと、書く前に止めた台を戻してしまう）。",
   "kibicomputers.configuration.save.autosaveQuiesceTicks": "自動保存の待ち（tick）",
   "kibicomputers.configuration.save.autosaveQuiesceTicks.tooltip": "自動保存で、コンピューターが待機点に来るのを待つ tick の数。",
   "kibicomputers.configuration.save.autosaveWritesPerTick": "1 tick の自動保存の台数",
