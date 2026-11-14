@@ -3154,6 +3154,19 @@ public class Machine private constructor(
     }
 
     /**
+     * 起動部品のプログラムを置いた [fs] を `/` にマウントする（起動用のスレッドから。プログラムだけの起動。#99）。
+     * ディスクではないので予約は要らない。取り消されていたら何もせず `false`
+     */
+    internal fun mountFirmwareRoot(fs: FileSystem): Boolean {
+        vfs.checkMountPoint(VfsPath.ROOT)
+        return lock.withLockValue {
+            if (bootCancelled) return@withLockValue false
+            vfs.mountLocked(VfsPath.ROOT, fs, readOnly = true, source = MachineLimits.FIRMWARE_SOURCE)
+            true
+        }
+    }
+
+    /**
      * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（起動用のスレッドから、根のマウントの後）。
      * 根のディスクの `/tmp` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）
      */
@@ -3844,6 +3857,9 @@ internal object MachineLimits {
 
     /** `/dev`（デバイスファイル。#485）のマウントの `source` */
     internal const val DEV_SOURCE: String = "dev"
+
+    /** プログラムだけで起動したときの根（起動部品のプログラムを置いた読み取り専用の FS。#99、ADR 0099）のマウントの `source` */
+    internal const val FIRMWARE_SOURCE: String = "firmware"
 
     /** `/dev` をマウントする場所 */
     internal val DEV_PATH: VfsPath = VfsPath.parse("/dev")

@@ -16,6 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.DeviceDirectory
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -527,6 +528,13 @@ internal class MachineRestore(private val machine: Machine, private val request:
                         ?: fallback(ColdBootCause.NO_MEMORY, "${entry.point} の中身の RAM が足りない")
                 }
                 source == MachineLimits.DEV_SOURCE -> DevFileSystem(machine.environment.entropy, DeviceDirectory.of(machine.devices))
+                // 起動部品のプログラムの根（#99）: 今の起動部品の中身で作り直す（保存した時点と違ってよい。プロセスのモジュールはハッシュで戻る）。
+                // 今の設定がプログラムだけの起動でなければ（起動部品を抜いた・プログラムを消した）冷えた起動
+                source == MachineLimits.FIRMWARE_SOURCE && entry.point == VfsPath.ROOT -> {
+                    val program = request.bootConfig.programBytes
+                        ?: fallback(ColdBootCause.MOUNT, "起動部品のプログラムがない（${entry.point}）")
+                    ImageFileSystem.firmwareRoot(program)
+                }
                 else -> fallback(ColdBootCause.MOUNT, "知らないマウント $source（${entry.point}）")
             }
             out[entry.id] = fs
