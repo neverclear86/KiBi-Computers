@@ -384,6 +384,8 @@ internal class LinkedComponent private constructor(
             return
         }
         // own なら dtor を呼ぶ（同じインスタンスでも呼ぶ。ゲストからゲストへの呼び出しなので callGuest では包まない）
+        // 仕様の canon_resource_drop は dtor を canon_lower → canon_lift で呼び（実装したインスタンスへの再入を検査）、dtor がなければ
+        // trap_if_on_the_stack する。ここでは写していない（通常の呼び出しにも再入の検査がない。#705。ADR 0265）
         when (val impl = plan.resource(ref.resource).impl) {
             is ResourceImpl.Guest -> impl.dtor?.let { callCore(it, longArrayOf(u32(rep))) }
             is ResourceImpl.Host -> impl.resource.drop?.drop(ComponentCall(this, env, impl.interfaceName, "[resource-drop]${impl.name}"), rep)

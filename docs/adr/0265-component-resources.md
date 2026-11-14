@@ -54,6 +54,12 @@ ADR 0043 は「`HandleTable` は fd と resource ハンドルの共通の形」�
 - `resource.new` と `resource.drop` は `may_leave` が下りていればトラップ（realloc・post-return の中）。`resource.rep` は見ない。
 - `resource.drop` の own は dtor を呼ぶ。ゲストの dtor は、実装したインスタンスの core 関数を直接呼ぶ（同じインスタンスでも呼ぶ。ゲストからゲストへの呼び出しなので `callGuest` で包まない）。ホストの dtor は `HostResourceDrop.drop`。実体なし、または dtor がないなら何もしない。borrow の drop は、範囲の task の数を減らすだけ。
 
+### 仕様のとおりには写していないもの（再入の検査。#705）
+
+仕様の `canon_resource_drop` は、own の dtor を `canon_lower` → `canon_lift` を通して呼ぶ（実装したインスタンスへの再入の検査が入る）。dtor がないときは `task.trap_if_on_the_stack(rt.impl)` でトラップする。ここでは、ゲストの dtor を `callCore` で直接呼び、dtor がなければ何もしない。そのため、たとえば B が A を呼び、その中で A が B の resource の own を drop すると、仕様ではトラップになるが、ここでは B の dtor が再入で走る。
+
+これは resource に限った穴ではない。今の `LinkedComponent` は、通常の import の呼び出し（`callLowered` → `callFunc`）にも `may_enter` の検査を持たない。同じ穴なので、resource の drop だけを塞がず、#705 でまとめて写す（スタックの上にあるインスタンスを積み、`canon_lift` の入口と `resource.drop` の両方で見る）。それまでは、再入がトラップにならず、ゲストの動きが仕様より緩い。ハンドル表の検査・上限・燃料はそのまま効き、呼び出しは同じスレッドの同期なので、ホストや他のプロセスを壊す形にはならない。
+
 ### resource の同一性
 
 resource の型の照合は、plan の `ResourceInfo.canonical`（正規の番号）で比べる。ゲストの型の番号（`CanonType.Handle.resource`）は、インスタンス化・import のたびに新しく振る（生成的）が、別のインターフェースの import が同じホストの resource（`HostResource.id`）に結び付いたら、どれも最初に結び付いた番号を正規の番号にする。ハンドル表には正規の番号を書く。
