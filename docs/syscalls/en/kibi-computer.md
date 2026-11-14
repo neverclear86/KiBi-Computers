@@ -33,6 +33,7 @@ interface clock {
 
 - `uptime-ticks` is the time since boot in ticks (1 tick is meant to be 50 ms). It is 0 at boot, counts only ticks in which the machine ran, and continues across a save and restore
 - `world-ticks` is the in-game time (world ticks). It is 0 if there is no world, and it jumps over the time between a save and a restore
+- **Not implemented yet: in the game it always returns 0**, because the platform layers do not pass the in-game time to the machine yet ([#439](https://github.com/neverclear86/KiBi-Computers/issues/439))
 - For the current time and a monotonic clock in nanoseconds, use WASI `clock_time_get` ([WASI p1](./wasi-p1.md#clocks))
 
 ## power

@@ -130,7 +130,7 @@ Errors versus traps:
 | A location returned by `cabi_realloc` outside the linear memory or not aligned | Trap |
 | `[resource-drop]` of an invalid handle; an invalid handle to a function that returns no `error-code` | Trap |
 
-- If there are several mistakes, the first one found in the checking order is returned. The order is fixed per function and is given in each page's table of checks (or its text). A handle (the leading `self` or `fd`) is not always checked in parameter order: some functions check the other argument values first and the handle after (`max` of `event-queue.take`, `method` and `args` of `device.invoke` and `start`, `pid` of `tty.set-foreground`)
+- If there are several mistakes, the first one found in the checking order is returned. The order is fixed per function and is given in each page's table of checks (or its text). A handle (the leading `self` or `fd`) is not always checked in parameter order: some functions check the other argument values first and the handle after (`max` of `event-queue.take`, `method` and `args` of `device.invoke` and `start`, `pid` of `tty.set-foreground`, `sig` of `process.kill`)
 - **Known difference from the Component Model layer**: the Component Model reads in (lifts) all arguments before the host checks them, so combinations where p1 returns an `error-code` but a later argument has a bad alignment will trap there. Also, out-of-bounds pointers trap in the Component Model. The order will be aligned when the p2 layer is built ([#616](https://github.com/neverclear86/KiBi-Computers/issues/616)), so do not rely on which mistake is reported first
 
 ## cabi_realloc

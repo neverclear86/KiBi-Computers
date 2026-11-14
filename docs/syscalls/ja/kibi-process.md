@@ -123,7 +123,7 @@ interface process {
 | `set-cwd` | `(path_ptr: i32, path_len: i32, ret_ptr: i32) -> ()` | — | — |
 <!-- /check -->
 
-`[method]process.pid` と `[resource-drop]process` に不正なハンドルを渡すとトラップです。`status`・`kill` は `bad-descriptor` を返します。
+`[method]process.pid` と `[resource-drop]process` に不正なハンドルを渡すとトラップです。`status`・`kill` は `bad-descriptor` を返します。`kill` は `sig` を先に確かめるので、`sig` の判別子もハンドルも不正なら `invalid` です。
 
 ## メモリ上の配置
 
@@ -154,9 +154,15 @@ interface process {
 | `fds` が 256 個を超える（仮の値） | `invalid` |
 | 文字列が UTF-8 でない、`option`・`fd-source` の判別子が不正、`fds` の fd が重複 | `invalid` |
 | 引数の場所が線形メモリの外 | `fault` |
-| 実行ファイルがない・普通のファイルでない・動かせない形 | `no-entry`・`access`・`no-exec` など |
-| `fds` の `parent` が開いていない | `bad-descriptor` |
+| `args`・`env` の文字列に NUL がある、`env` の名前が空・`=` を含む | `invalid` |
+| `fds` の `fd`・`parent` の fd が 2^31 以上 | `bad-descriptor` |
+| 実行ファイルがない・普通のファイルでない・動かせない形、シバンを 4 回を超えてたどった | `no-entry`・`access`・`no-exec`・`loop` など |
+| このマシンの読み込み中・待ちの読み込みが上限（仮の値） | `again` |
 | `cwd` がない・ディレクトリでない | `no-entry`・`not-directory` |
+| 実行ファイルを読み込むあいだに、親の作業ディレクトリが変わった（`cwd` か `fds` の preopen を指定したとき） | `again` |
+| `fds` の `fd` が 256 以上（0〜2 と 3〜255 だけ書けます）、`parent` が開いていない | `bad-descriptor` |
+
+`again` は一時的な失敗です。少し待ってから同じ `spawn` をやり直してください。
 
 `signal` の判別子が 0〜3 の外なら `invalid`、`set-signal-ignored` に `kill` を渡すと `invalid` です。`set-cwd` は、ない場所なら `no-entry`、ディレクトリでなければ `not-directory` です。
 

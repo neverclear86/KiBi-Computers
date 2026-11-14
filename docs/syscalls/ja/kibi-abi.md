@@ -130,7 +130,7 @@ WIT の元のファイル（説明のコメントつき）は、リポジトリ�
 | `cabi_realloc` が返した場所が線形メモリの外・align に揃っていない | トラップ |
 | 不正なハンドルの `[resource-drop]`、`error-code` を返さない関数の不正なハンドル | トラップ |
 
-- 複数の誤りがあれば、確かめる順で最初に当たったものを返します。順は関数ごとに決まっていて、各ページの検査の表（または説明）にあります。ハンドル（先頭の `self`・`fd`）は、引数の順に確かめるとは限りません。ほかの引数の値を先に確かめて、ハンドルを後にするものがあります（`event-queue.take` の `max`、`device.invoke`・`start` の `method`・`args`、`tty.set-foreground` の `pid`）
+- 複数の誤りがあれば、確かめる順で最初に当たったものを返します。順は関数ごとに決まっていて、各ページの検査の表（または説明）にあります。ハンドル（先頭の `self`・`fd`）は、引数の順に確かめるとは限りません。ほかの引数の値を先に確かめて、ハンドルを後にするものがあります（`event-queue.take` の `max`、`device.invoke`・`start` の `method`・`args`、`tty.set-foreground` の `pid`、`process.kill` の `sig`）
 - **Component Model の層との既知の差**: Component Model では、ホストが確かめる前に全引数を読み込む（lift する）ので、p1 で `error-code` が返る組み合わせのうち、後ろの引数の align の誤りを含むものはトラップになります。また範囲外のポインタは、Component Model ではトラップです。p2 の層を作るときに順を揃えるので（[#616](https://github.com/neverclear86/KiBi-Computers/issues/616)）、どの誤りが先に出るかに頼らないでください
 
 ## cabi_realloc

@@ -33,6 +33,7 @@ interface clock {
 
 - `uptime-ticks` は起動からの経過（tick。1 tick は 50 ms の想定）です。起動したときが 0 で、マシンが動いていた tick だけを数え、保存・復元をまたいで続きます
 - `world-ticks` はゲーム内時間（ワールドの tick）です。ワールドがなければ 0 で、保存・復元のあいだは飛びます
+- **今は未実装で、ゲームの中では常に 0 を返します。** 接続層がまだゲーム内時間をマシンに渡していないためです（[#439](https://github.com/neverclear86/KiBi-Computers/issues/439)）
 - 現在時刻と単調時計（ナノ秒）は、WASI の `clock_time_get` を使ってください（[WASI p1](./wasi-p1.md#時計)）
 
 ## power

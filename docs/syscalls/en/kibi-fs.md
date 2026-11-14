@@ -61,7 +61,7 @@ interface mounts {
 | `source` is not `disk:<identifier>`, is a bundled image (`disk:image:*`), or is not inserted now | `no-entry` |
 | That disk is already mounted or is being opened | `busy` |
 | `point` already has a mount | `busy` |
-| `point` is not a directory, or a component on the way is not a directory | `not-directory` |
+| `point` is not a directory, or something on the way in the path is not a directory | `not-directory` |
 | The machine is not running, the disk cannot be opened, or it was removed while opening | `io` |
 | `point` of `unmount` is `/`, `/tmp`, or `/dev`, or has other mounts below it | `busy` |
 | `point` of `unmount` is not a mount point | `invalid` |

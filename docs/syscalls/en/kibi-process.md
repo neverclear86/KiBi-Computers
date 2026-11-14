@@ -123,7 +123,7 @@ Module: `kibi:process/process@0.1.0`
 | `set-cwd` | `(path_ptr: i32, path_len: i32, ret_ptr: i32) -> ()` | — | — |
 <!-- /check -->
 
-Passing an invalid handle to `[method]process.pid` or `[resource-drop]process` traps. `status` and `kill` return `bad-descriptor`.
+Passing an invalid handle to `[method]process.pid` or `[resource-drop]process` traps. `status` and `kill` return `bad-descriptor`. `kill` checks `sig` first, so if both the `sig` discriminant and the handle are invalid, it returns `invalid`.
 
 ## Memory layout
 
@@ -154,9 +154,15 @@ Checked in parameter order (`path` → `args` → `env` → `cwd` → `fds`); th
 | Over 256 `fds` (provisional) | `invalid` |
 | A string that is not UTF-8, an invalid `option` or `fd-source` discriminant, a duplicate fd in `fds` | `invalid` |
 | An argument location outside the linear memory | `fault` |
-| The executable is missing, not a regular file, or not in a runnable form | `no-entry`, `access`, `no-exec`, and so on |
-| A `parent` fd in `fds` that is not open | `bad-descriptor` |
+| A NUL in an `args` or `env` string, or an `env` name that is empty or contains `=` | `invalid` |
+| An `fd` or a `parent` fd in `fds` of 2^31 or more | `bad-descriptor` |
+| The executable is missing, not a regular file, or not in a runnable form, or a shebang was followed more than 4 times | `no-entry`, `access`, `no-exec`, `loop`, and so on |
+| This machine's loads in progress and waiting loads are at the limit (provisional) | `again` |
 | `cwd` missing or not a directory | `no-entry`, `not-directory` |
+| The parent's working directory changed while the executable was loading (when `cwd` or a preopen in `fds` is given) | `again` |
+| An `fd` in `fds` of 256 or more (only 0 to 2 and 3 to 255 can be given), or a `parent` fd that is not open | `bad-descriptor` |
+
+`again` is a temporary failure. Wait a little and retry the same `spawn`.
 
 A `signal` discriminant outside 0 to 3 returns `invalid`, and passing `kill` to `set-signal-ignored` returns `invalid`. `set-cwd` returns `no-entry` for a missing path and `not-directory` for something that is not a directory.
 

@@ -46,14 +46,14 @@ KiBi Computers provides WASI p1 (module name `wasi_snapshot_preview1`) with the 
 | `fd_sync` | Yes | Streams return `INVAL` |
 | `fd_tell` | Yes | Streams return `SPIPE` |
 | `fd_write` | Yes | May block. [Reading and writing](#reading-and-writing) |
-| `path_create_directory` | Yes | `EXIST` if the last component is `.` or `..` |
+| `path_create_directory` | Yes | `EXIST` if the last name in the path is `.` or `..` |
 | `path_filestat_get` | Yes | |
 | `path_filestat_set_times` | Yes | Same rules as `fd_filestat_set_times`. Read-only mounts return `ROFS` |
 | `path_link` | Yes | Checks the base fd, then always returns `NOTSUP` (there are no hard links) |
 | `path_open` | Yes | [Paths](#paths) |
 | `path_readlink` | Yes | There are no links: `INVAL` if the path exists, otherwise the lookup error |
-| `path_remove_directory` | Yes | `INVAL` if the last component is `.`, `NOTEMPTY` if it is `..` |
-| `path_rename` | Yes | Crossing a mount returns `XDEV`; a mount point returns `BUSY`. `INVAL` if the last component is `.` or `..` |
+| `path_remove_directory` | Yes | `INVAL` if the last name in the path is `.`, `NOTEMPTY` if it is `..` |
+| `path_rename` | Yes | Crossing a mount returns `XDEV`; a mount point returns `BUSY`. `INVAL` if the last name in the path is `.` or `..` |
 | `path_symlink` | Yes | Checks the base fd, then always returns `NOTSUP` (there are no symbolic links) |
 | `path_unlink_file` | Yes | Directories return `ISDIR` |
 | `poll_oneoff` | Yes | May block. [poll_oneoff](#poll_oneoff) |
