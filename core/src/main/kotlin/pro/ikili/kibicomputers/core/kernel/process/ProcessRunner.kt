@@ -616,7 +616,15 @@ internal class ProcessRunner(private val machine: Machine) {
                 },
             )
         }
-        val instance = rt.program.module.instantiate(builder.build())
+        val refusalsBefore = rt.memory.refusalCount
+        rt.instantiateRefusedMemory = false
+        val instance = try {
+            rt.program.module.instantiate(builder.build())
+        } catch (t: Throwable) {
+            // 作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
+            if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true
+            throw t
+        }
         lock.withLockValue {
             val frame = rt.loading!!
             val provisional = frame.provisional
@@ -648,8 +656,12 @@ internal class ProcessRunner(private val machine: Machine) {
         val metered = !rt.process.unmetered
         check(metered == program.metered) { "燃料の計測の有無がプロセスと違うコンポーネント" }
         val ctx = rt.context
+        // いま作っている core インスタンスより前に断った分は、その失敗の原因にしない（#48）。core インスタンスを作り始めるたびに更新する
+        var refusalsBefore = rt.memory.refusalCount
+        rt.instantiateRefusedMemory = false
         val env = object : KernelLinkEnv(ctx) {
             override fun configure(builder: WasmInstanceConfig.Builder) {
+                refusalsBefore = rt.memory.refusalCount
                 applyKernelLimits(rt, builder)
                 if (metered) builder.fuel(0, rt.fuelHandler)
             }
@@ -668,7 +680,13 @@ internal class ProcessRunner(private val machine: Machine) {
 
             override fun chargeFuel(amount: Long) = ctx.chargeFuel(amount)
         }
-        val linked = LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+        val linked = try {
+            LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+        } catch (t: Throwable) {
+            // 失敗した core インスタンスを作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
+            if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true
+            throw t
+        }
         lock.withLockValue {
             val first = rt.instances.firstOrNull()
             if (first == null) {
@@ -781,12 +799,12 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /**
      * インスタンスを作れなかった（[WasmLinkException]）のが、RAM の上限で確保を断られたせいか（#48）。
-     * 最初のインスタンス（LOADING の間。[load]・[loadComponent]）は、それまでに一度も断っていないので、断った記録があればそのせい。
-     * 実行中に作る2つ目以降（[ProcessContext.instantiate]）は、作る前後で断った回数が増えたか（[ProcessRuntime.instantiateRefusedMemory]）。
+     * どの経路（[load]・[loadComponent]・[ProcessContext.instantiate]）も、失敗した core インスタンスを作る前後で断った回数が
+     * 増えたかで決める（[ProcessRuntime.instantiateRefusedMemory]）。コンポーネントは core インスタンスを順に作り、先に作ったものの
+     * start 関数が断ることがあるので、「それまでに一度でも断ったか」では見ない。
      * RAM と関係のない失敗（import がない、型が違う、start 関数のトラップなど）には付けない
      */
-    private fun instantiateRefusedMemory(rt: ProcessRuntime): Boolean =
-        (rt.process.state == ProcessState.LOADING && rt.memory.refusedReservation) || rt.instantiateRefusedMemory
+    private fun instantiateRefusedMemory(rt: ProcessRuntime): Boolean = rt.instantiateRefusedMemory
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
     fun finishLocked(rt: ProcessRuntime, state: ProcessState, exitCode: Int?) {

@@ -60,8 +60,16 @@ class InitMemoryMessageTest {
      * RAM [ramBytes]・[pages] ページの線形メモリの init を、`_start` の本体 [body] で起動し、マシンが止まるまで待つ。
      * [body] は返した値を結果に積める（grow・commit の戻り値を確かめる）
      */
-    private fun bootInit(ramBytes: Long, pages: Int = 1, tableBytes: Long = 0, body: (FakeContext, MutableList<Long>) -> Unit): Result = timeout(limit) {
-        Harness().use { h ->
+    private fun bootInit(
+        ramBytes: Long,
+        pages: Int = 1,
+        tableBytes: Long = 0,
+        totalBytes: Long? = null,
+        body: (FakeContext, MutableList<Long>) -> Unit,
+    ): Result = timeout(limit) {
+        Harness(
+            SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).apply { totalBytes?.let { totalMemoryBytes(it) } }.build(),
+        ).use { h ->
             val host = ConsoleRecorder()
             val results = Collections.synchronizedList(mutableListOf<Long>())
             val module = FakeModule.builder()
@@ -147,6 +155,23 @@ class InitMemoryMessageTest {
         assertEquals(2, r.exitCode)
         assertTrue(
             r.console.endsWith("kibi: init exited with code 2 (kibi:memory commit was refused: out of memory, RAM limit 64 KiB)\n"),
+            r.console,
+        )
+    }
+
+    @Test
+    fun `initがcommitをサーバー全体の上限で断られた後に0以外で終わると、RAMの上限ではなくサーバー全体の上限と書く`() {
+        // マシンの RAM には余裕があり、サーバー全体（64 KiB = 16 区画）を使い切った後に、もう 1 区画を数えようとする
+        // （commit の keep はサーバー全体にはかけない。ADR 0048）
+        val r = bootInit(16 * page, pages = 2, totalBytes = page) { ctx, results ->
+            ctx.memory.touch(0, 16)
+            results += ctx.callImport(WasiP1Kibi.MEMORY, "commit", 16L * chunk, chunk.toLong(), 0L)[0]
+            ctx.exit(2)
+        }
+        assertEquals(listOf(0L), r.results, "commit は断られる")
+        assertEquals(ProcessState.EXITED, r.state, r.console)
+        assertTrue(
+            r.console.endsWith("kibi: init exited with code 2 (kibi:memory commit was refused: out of memory, server memory limit reached)\n"),
             r.console,
         )
     }

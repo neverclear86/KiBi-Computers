@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.time.Duration
@@ -243,6 +244,122 @@ class SpawnMemoryLimitTest {
             )
             h.awaitCrash(m, host, pid, "kibi: unrelated (pid $pid) crashed: cannot instantiate module")
             assertFalse(host.console.contains("out of memory"), host.console.toString())
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `memory_growをサーバー全体の上限で断られた後に0以外で終わると、サーバー全体の上限と書く`() = timeout(limit) {
+        harness(totalBytes = page).use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = 16 * page)
+            val results = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val pid = m.spawnNamed(
+                h.program(FakeModule.builder().fuelMetered().memory(1).build()),
+                TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    val memory = ctx.instance.memory!!
+                    // サーバー全体の残りは 16 区画。15 区画を書いてから 1 ページ増やすと、端の 2 区画を数えられない
+                    for (i in 0 until 15) memory.writeU8(i * 4096, 1)
+                    results += memory.grow(1)
+                    StepResult.Exit(1)
+                },
+                "g",
+            )
+            h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
+            assertEquals(listOf(-1), results.toList(), "端の区画を数えられないので grow は -1")
+            h.tickUntil("コンソールに出ない: ${host.console}") { host.console.contains("kibi: g (pid $pid) exited") }
+            assertTrue(
+                host.console.contains("kibi: g (pid $pid) exited with code 1 (memory.grow was refused: out of memory, server memory limit reached)\n"),
+                host.console.toString(),
+            )
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    /** 作れない core インスタンス 1 つのコンポーネント: 最初のテーブルが 64 KiB に収まらない（`funcref` の要素は 12 バイト） */
+    private val tooBigComponent = """
+        (component
+          (core module ${'$'}a
+            (table 10000 funcref)
+            (func (export "run")))
+          (core instance ${'$'}ia (instantiate ${'$'}a)))
+    """
+
+    /**
+     * 先に作る core インスタンス a の start 関数が 15 区画を書いて 1 ページ増やし、断られても続ける（`memory.grow` は -1）。
+     * 後に作る b は、線形メモリの外に書く data セグメントを持ち、RAM と関係なく作れない
+     */
+    private val unrelatedLinkFailureComponent = """
+        (component
+          (core module ${'$'}a
+            (memory (export "mem") 1)
+            (func ${'$'}start
+              (local ${'$'}i i32)
+              (loop ${'$'}l
+                (i32.store8 (i32.mul (local.get ${'$'}i) (i32.const 4096)) (i32.const 1))
+                (local.set ${'$'}i (i32.add (local.get ${'$'}i) (i32.const 1)))
+                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const 15))))
+              (drop (memory.grow (i32.const 1))))
+            (start ${'$'}start))
+          (core module ${'$'}b
+            (memory 1)
+            (data (i32.const 65536) "x"))
+          (core instance ${'$'}ia (instantiate ${'$'}a))
+          (core instance ${'$'}ib (instantiate ${'$'}b)))
+    """
+
+    private fun Machine.spawnComponent(text: String, name: String): Int =
+        spawn(
+            Program.component(LinkTesting.load(text, metered = false)),
+            TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) },
+            SpawnOptions(args = listOf(name), allowUnmetered = true),
+        )
+
+    @Test
+    fun `コンポーネントのプロセスがRAMで作れないときは、メモリ不足と出てRAMが戻る`() = timeout(limit) {
+        harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = page)
+            val pid = m.spawnComponent(tooBigComponent, "comp")
+            h.awaitCrash(m, host, pid, "kibi: comp (pid $pid) crashed: cannot instantiate module (out of memory, RAM limit 64 KiB)")
+            assertTrue(m.rt(pid).lastError is WasmLinkException)
+            assertEquals(0L, m.memoryAccount.usedBytes, "作りかけの分も RAM に残らない")
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `コンポーネントのプロセスがサーバー全体の上限で作れないときは、サーバー全体の上限と書く`() = timeout(limit) {
+        harness(totalBytes = page).use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = 16 * page)
+            val pid = m.spawnComponent(tooBigComponent, "comp")
+            h.awaitCrash(m, host, pid, "kibi: comp (pid $pid) crashed: cannot instantiate module (out of memory, server memory limit reached)")
+            assertEquals(0L, m.memoryAccount.usedBytes)
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `コンポーネントの先のcoreインスタンスが確保を断られても、後のインスタンスがRAMと関係なく作れないときはメモリ不足と書かない`() = timeout(limit) {
+        harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = page)
+            val pid = m.spawnComponent(unrelatedLinkFailureComponent, "comp")
+            h.tickUntil("異常終了が出ない: ${host.console}") { host.console.contains("kibi: comp (pid $pid) crashed: ") }
+            assertState(ProcessState.CRASHED, m, pid)
+            assertTrue(m.rt(pid).lastError is WasmLinkException, "${m.rt(pid).lastError}")
+            // a の start 関数が断られたことを確かめる（断っていないと、この試験は何も確かめていない）
+            assertTrue(m.rt(pid).memory.refusedReservation, "先のインスタンスが確保を断られていない")
+            // 先に断った grow の注記は付くが、作れなかった理由をメモリ不足とは書かない
+            assertFalse(host.console.contains("cannot instantiate module (out of memory"), host.console.toString())
+            assertTrue(host.console.contains("cannot instantiate module (memory.grow was refused: out of memory, RAM limit 64 KiB)"), host.console.toString())
             m.stop()
             assertTrue(m.awaitTermination(5_000))
         }

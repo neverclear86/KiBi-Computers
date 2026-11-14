@@ -145,7 +145,7 @@ internal class ProcessRuntime(
     var memoryCommitRefused: Boolean = false
 
     /**
-     * 最後に [ProcessContext.instantiate] で作ろうとしたインスタンスが、RAM の上限で確保を断られて作れなかった（#48）。
+     * 最後に作ろうとした core インスタンス（[ProcessContext.instantiate]、最初のインスタンス、コンポーネントの core インスタンスのそれぞれ）が、RAM の上限で確保を断られて作れなかった（#48）。
      * この後にプロセスが [pro.ikili.kibicomputers.core.runtime.WasmLinkException] で異常終了したら、メモリ不足と表示する。
      * 次に作るときに下ろす。プロセスのスレッドが、ロックを持たずに書く
      */

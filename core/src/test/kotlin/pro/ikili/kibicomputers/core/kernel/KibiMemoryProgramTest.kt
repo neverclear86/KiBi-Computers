@@ -46,7 +46,10 @@ class KibiMemoryProgramTest {
     }
 
     /** `kibi-memory-wasi.wasm` を RAM [ramBytes] のマシンで [args] で動かして、終わるまで待つ */
-    private fun run(vararg args: String, ramBytes: Long = 512 * kib): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
+    private fun run(vararg args: String, ramBytes: Long = 512 * kib, totalBytes: Long? = null): Result = Harness(
+        SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(64).apply { totalBytes?.let { totalMemoryBytes(it) } }.build(),
+        execRuntime = EndiveRuntime(),
+    ).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
         run {
@@ -146,5 +149,16 @@ class KibiMemoryProgramTest {
         assertEquals(ProcessState.EXITED, r.state, r.console)
         assertEquals(3, r.exitCode, r.console)
         assertTrue("kibi: km (pid ${r.pid}) exited with code 3 (memory.grow and kibi:memory commit were refused: out of memory, RAM limit 256 KiB)\n" in r.console, r.console)
+    }
+
+    @Test
+    fun `growとcommitの両方をサーバー全体の上限で断られた後に0以外で終わると、サーバー全体の上限として書く`() = timeout(limit) {
+        val r = run("refuse-grow", "3", ramBytes = 512 * kib, totalBytes = 256 * kib)
+        assertEquals(ProcessState.EXITED, r.state, r.console)
+        assertEquals(3, r.exitCode, r.console)
+        assertTrue(
+            "kibi: km (pid ${r.pid}) exited with code 3 (memory.grow and kibi:memory commit were refused: out of memory, server memory limit reached)\n" in r.console,
+            r.console,
+        )
     }
 }
