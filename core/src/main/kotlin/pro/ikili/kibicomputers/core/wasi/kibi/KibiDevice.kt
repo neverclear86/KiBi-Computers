@@ -1,7 +1,6 @@
 package pro.ikili.kibicomputers.core.wasi.kibi
 
 import pro.ikili.kibicomputers.core.device.CallError
-import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 
 /**
@@ -18,7 +17,4 @@ internal object KibiDevice {
 
     /** カーネルの口が投げた [e] の `call-error`（`kernel(error-code)`） */
     fun kernelError(e: FsException): CallError = CallError.Kernel(e.errno)
-
-    /** [errno] の `kernel(error-code)` */
-    fun kernelError(errno: Errno): CallError = CallError.Kernel(errno)
 }

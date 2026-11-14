@@ -32,15 +32,19 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import java.nio.ByteBuffer
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
@@ -98,7 +102,7 @@ class WasiP1KibiDeviceRestoreTest {
         if (stage != Stage.RUNNING) repeat(BLOCKERS) { m.submitHostCall(0, HostCall { }) }
         val method = if (stage == Stage.RUNNING) "defer" else "main-echo"
         val stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
-        val pid = m.exec("/bin/kd", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("kd", "once", address, method), stdio = stdio))
+        val pid = m.exec("/bin/kd", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("kd", "once-fd", address, method), stdio = stdio))
         m.lock.withLockValue { m.kernel.initPid = pid }
         val want = if (stage == Stage.RUNNING) PendingDeviceCall.State.Running::class else PendingDeviceCall.State.Queued::class
         eventually(60_000, "invoke で待たない") {
@@ -121,10 +125,32 @@ class WasiP1KibiDeviceRestoreTest {
         val identity = store.assignNewId(owner)!!
         val snapshot = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)
         assertNotNull(snapshot, "待っている間は保存できる")
-        val written = store.write(identity, owner, snapshot!!).identity
+        assertSectionLayout(snapshot!!.build(identity.id, identity.generation, "test"))
+        val written = store.write(identity, owner, snapshot).identity
         hold?.close()
         m.close()
         return Saved(written, output, pid, call!!.id)
+    }
+
+    /**
+     * invoke で待つマシンの保存データの節の形と版が、この機能の前と変わらない（#77 は保存形式を変えない。ADR 0077）:
+     * `KERNEL`（版 1）の後に、プロセス1つ分の `PROCESS_ABI`（版 1。pid・p1 の層・層の版 2）だけが並ぶ。
+     * 待っている `pending-call` は、これまでの fd 表とオブジェクト表の形のまま `KERNEL` 節に入る
+     */
+    private fun assertSectionLayout(snapshot: MachineSnapshot) {
+        // 版は保存済みのデータが読めるかどうかの境目なので、定数の名前ではなく数そのものを固定する
+        assertEquals(1, SnapshotSection.KERNEL_VERSION)
+        assertEquals(1, SnapshotSection.PROCESS_ABI_VERSION)
+        assertEquals(2, SnapshotSection.P1_LAYER_VERSION)
+        val sections = snapshot.sections
+        assertEquals(listOf(SnapshotSection.KERNEL, SnapshotSection.PROCESS_ABI), sections.map { it.kind }, sections.toString())
+        assertEquals(listOf(1, 1), sections.map { it.version }, sections.toString())
+        val abi = ByteBuffer.wrap(sections[1].payload)
+        assertEquals(1, abi.getInt(), "pid")
+        assertEquals(SnapshotSection.ABI_LAYER_P1, abi.getShort().toInt() and 0xffff, "ABI 層")
+        assertEquals(SnapshotSection.P1_LAYER_VERSION, abi.getShort().toInt() and 0xffff, "層の版")
+        assertEquals(emptyList<Int>(), snapshot.killedPids)
+        assertEquals(ColdBootReason.NONE.code, snapshot.coldBootCode)
     }
 
     @ParameterizedTest
@@ -159,7 +185,7 @@ class WasiP1KibiDeviceRestoreTest {
             }
             eventually(60_000, "戻したプロセスが結果を書かない") {
                 h.scheduler.tick()
-                outcomes.isNotEmpty() && "once " in output()
+                outcomes.isNotEmpty() && FD_AFTER.containsMatchIn(output())
             }
             errors.firstOrNull()?.let { throw AssertionError("復元の知らせの中で失敗した", it) }
             assertEquals(listOf(RestoreOutcome.RESTORED), outcomes.toList())
@@ -169,6 +195,12 @@ class WasiP1KibiDeviceRestoreTest {
                 else -> "once ok 1 i:11"
             }
             assertTrue("calling\n$expected\n" in out, out)
+            // invoke の前後で、いちばん小さい空き fd が同じ: 待つ間に持った pending-call の fd が、復元の後に fd 表に残らない。
+            // 復元では実行時の欄（pendingInvoke）がないので、起こした key から引いた fd を閉じる道を通る
+            val fdBefore = Regex("fd-before (\\d+)\n").find(out)?.groupValues?.get(1)
+            val fdAfter = FD_AFTER.find(out)?.groupValues?.get(1)
+            assertNotNull(fdBefore, out)
+            assertEquals(fdBefore, fdAfter, out)
             assertEquals(1, calls.get(), "メソッドは保存の前後を通して1回だけ走る")
             m.close()
         }
@@ -177,5 +209,7 @@ class WasiP1KibiDeviceRestoreTest {
     private companion object {
         /** 先に積む空のホストの呼び出しの数 */
         const val BLOCKERS = 200
+
+        val FD_AFTER = Regex("fd-after (\\d+)\n")
     }
 }

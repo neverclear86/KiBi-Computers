@@ -5,6 +5,7 @@
 //   kd basic <a>            open・info・methods と、直接のメソッド echo を全種類の値で invoke
 //   kd main <a>             メインスレッドのメソッド main-echo を invoke（待ち方ごとに結果が変わる）
 //   kd once <a> <method>    <method> を1回 invoke して結果を書く（保存・kill の確かめ）
+//   kd once-fd <a> <method> once と同じで、invoke の前後に「いちばん小さい空き fd」を fd-before・fd-after として書く（待つ間の pending-call が残らないことの確かめ）
 //   kd start <a>            main-echo を start し、終わる前の take（none）→ poll → take を2回 → drop
 //   kd swap <a>             swap（同じ address に別の種類をつなぎ直す）の後の invoke・start・methods・info
 //   kd unplug <a>           unplug（外す）の後の invoke・methods
@@ -15,7 +16,7 @@
 //   kd drop-type <a>        device の fd を [resource-drop]pending-call で閉じる（トラップになるはず）
 //   kd info-bad             不正なハンドルで info（トラップになるはず）
 //   kd limit <a>            start を 16 個積んだまま invoke、17 個目の start は again、invoke の後に fd が残らない
-//   kd mfile <a>            fd 表を満杯にしてから invoke（直接は通り、メインスレッドは mfile）
+//   kd mfile <a>            fd 表を満杯にしてから open・invoke・start（open・start と、メインスレッドの invoke は mfile。直接の invoke は通る）
 //   kd devfs <a>            /dev/device/<a> を path_open で開いた fd で invoke
 #include <errno.h>
 #include <fcntl.h>
@@ -226,6 +227,24 @@ static int run_once(const char *a, const char *m) {
     printf("calling\n");
     fflush(stdout);
     invoke("once", (uint32_t)h, m, NULL, 0);
+    return 0;
+}
+
+// いちばん小さい空き fd の番号（open して、すぐ閉じる）。開けなければ -1
+static int64_t probe_fd(const char *a) {
+    int64_t p = open_dev(a);
+    if (p >= 0) kibi_device_drop((uint32_t)p);
+    return p;
+}
+
+static int run_once_fd(const char *a, const char *m) {
+    int64_t h = open_dev(a);
+    if (h < 0) return 1;
+    printf("fd-before %lld\n", (long long)probe_fd(a));
+    printf("calling\n");
+    fflush(stdout);
+    invoke("once", (uint32_t)h, m, NULL, 0);
+    printf("fd-after %lld\n", (long long)probe_fd(a));
     return 0;
 }
 
@@ -465,6 +484,9 @@ static int run_mfile(const char *a) {
     kibi_device_value_t v = integer(1);
     invoke("direct", (uint32_t)h, "echo", &v, 1);
     invoke("main", (uint32_t)h, "main-echo", &v, 1);
+    // start は pending-call を fd 表に入れるので、直接のメソッドでも満杯なら mfile（open_dev が失敗した行の後に書く）
+    start("start-direct", (uint32_t)h, "echo", &v, 1);
+    start("start-main", (uint32_t)h, "main-echo", &v, 1);
     return 0;
 }
 
@@ -491,6 +513,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "basic")) return run_basic(a);
     if (!strcmp(cmd, "main")) return run_main(a);
     if (!strcmp(cmd, "once") && argc > 3) return run_once(a, argv[3]);
+    if (!strcmp(cmd, "once-fd") && argc > 3) return run_once_fd(a, argv[3]);
     if (!strcmp(cmd, "start")) return run_start(a);
     if (!strcmp(cmd, "swap")) return run_swap(a);
     if (!strcmp(cmd, "unplug")) return run_unplug(a);

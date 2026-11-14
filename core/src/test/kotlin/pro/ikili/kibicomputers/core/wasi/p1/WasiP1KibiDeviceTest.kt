@@ -36,6 +36,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.withLockValue
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
@@ -136,7 +137,14 @@ class WasiP1KibiDeviceTest {
             .build()
     }
 
-    private inner class Run(val h: Harness, val m: Machine, mode: Mode, args: List<String>, beforeSpawn: Run.() -> Unit = {}) {
+    private inner class Run(
+        val h: Harness,
+        val m: Machine,
+        mode: Mode,
+        args: List<String>,
+        beforeSpawn: Run.() -> Unit = {},
+        moduleBytes: ByteArray? = null,
+    ) {
         private val output: Int
         private val text = StringBuilder()
         val dev = TestDev(m)
@@ -149,7 +157,12 @@ class WasiP1KibiDeviceTest {
             assertEquals(null, m.mountDev())
             assertTrue(m.devices.attach(ADDRESS, dev))
             output = m.lock.withLockValue { m.kernel.objects.add(ByteStream(256 * 1024)) }
-            val program = if (mode == Mode.UNWIND) asyncProgram else plainProgram
+            val program = when {
+                moduleBytes != null && mode == Mode.UNWIND -> Program.loadMetered(EndiveRuntime(), moduleBytes, null, WasiP1.WAIT_IMPORTS)
+                moduleBytes != null -> Program.load(EndiveRuntime(), moduleBytes)
+                mode == Mode.UNWIND -> asyncProgram
+                else -> plainProgram
+            }
             val out = StdioSource.Object(output, HandleRights.WRITE)
             val options = SpawnOptions(
                 allowUnmetered = !program.module.isFuelMetered,
@@ -194,8 +207,14 @@ class WasiP1KibiDeviceTest {
 
     private fun harness(mode: Mode) = Harness(execRuntime = EndiveRuntime(), asyncify = mode == Mode.UNWIND)
 
-    private fun run(mode: Mode, vararg args: String, beforeSpawn: Run.() -> Unit = {}, block: Run.() -> Unit) = timeout(Duration.ofSeconds(120)) {
-        harness(mode).use { h -> Run(h, h.machine(fuelPerTick = 10_000_000), mode, args.toList(), beforeSpawn).block() }
+    private fun run(
+        mode: Mode,
+        vararg args: String,
+        beforeSpawn: Run.() -> Unit = {},
+        moduleBytes: ByteArray? = null,
+        block: Run.() -> Unit,
+    ) = timeout(Duration.ofSeconds(120)) {
+        harness(mode).use { h -> Run(h, h.machine(fuelPerTick = 10_000_000), mode, args.toList(), beforeSpawn, moduleBytes).block() }
     }
 
     private fun assertLine(line: String, out: String) = assertTrue("$line\n" in out, out)
@@ -396,12 +415,19 @@ class WasiP1KibiDeviceTest {
 
     @ParameterizedTest
     @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
-    fun `fd表が満杯でも直接のメソッドはinvokeでき、待機点型のメインスレッドのメソッドはmfile`(mode: Mode) = run(mode, "mfile", ADDRESS) {
+    fun `fd表が満杯でも直接のメソッドはinvokeでき、openとstartと待機点型のメインスレッドのメソッドはmfile`(mode: Mode) = run(mode, "mfile", ADDRESS) {
         val out = finish()
         assertLine("filled 1", out)
+        // 満杯になるまで回した open の最後の失敗（open は fd を1つ使う）
+        assertLine("open ${kernel(Errno.MFILE)}", out)
         assertLine("direct ok 1 i:1", out)
         // ブロッキング型は fd を使わずに待つ
         if (mode == Mode.UNWIND) assertLine("main ${kernel(Errno.MFILE)}", out) else assertLine("main ok 1 i:1", out)
+        // start は直接のメソッドでもメインスレッドのメソッドでも pending-call の fd が要る（どの待ち方でも）
+        assertLine("start-direct ${kernel(Errno.MFILE)}", out)
+        assertLine("start-main ${kernel(Errno.MFILE)}", out)
+        // main の invoke（ブロッキング型だけ走る）の1回だけで、満杯で断った start はメソッドを走らせない
+        assertEquals(if (mode == Mode.UNWIND) 0 else 1, dev.calls("main-echo"))
     }
 
     @ParameterizedTest
@@ -433,6 +459,55 @@ class WasiP1KibiDeviceTest {
             assertEquals(0, dev.calls("main-echo"))
             assertEquals(0, replacement.mainEchoCalls.get())
         }
+    }
+
+    /**
+     * モジュールの start 関数（インスタンスを作っている途中。`LOADING`）の中の `invoke` は、巻き戻せない（canUnwind が false）ので、
+     * 待機点型のモジュールでもブロッキングの道（`ctx.invokeDevice`）で結果まで待つ。fd（`pending-call`）も作らない
+     */
+    @Test
+    fun `モジュールのstart関数の中のinvokeは、待機点型でも巻き戻さずにブロッキングで結果まで待つ`() {
+        val module = startFunctionModule()
+        run(Mode.UNWIND, moduleBytes = module) {
+            val out = finish()
+            // _start が invoke の結果の判別子（0 = ok）を終了コードにする。finish は終了コード 0 を確かめている
+            assertEquals(1, dev.calls("main-echo"), "メインスレッドのメソッドが1回走った: $out")
+            assertEquals(0, pendingCalls())
+            assertFalse(driver!!.kibiDevice!!.hasPendingInvokeForTest, "巻き戻していない")
+        }
+    }
+
+    /**
+     * start 関数が `open(ADDRESS)` → `invoke(handle, "main-echo", [])` を呼び、`_start` がその結果の判別子を `proc_exit` の終了コードにするモジュール。
+     * `cabi_realloc` は固定の場所を返す（結果は読まない）
+     */
+    private fun startFunctionModule(): ByteArray {
+        val i32 = WasmBinary.I32
+        fun c(n: Int) = WasmBinary.code(0x41, WasmBinary.sleb(n.toLong()))
+        val bus = WasiP1KibiDevice.MODULE
+        val bin = WasmBinary()
+        val open = bin.importFunc(bus, "[static]device.open", listOf(i32, i32, i32), emptyList())
+        val invoke = bin.importFunc(bus, "[method]device.invoke", List(6) { i32 }, emptyList())
+        val exit = bin.importFunc("wasi_snapshot_preview1", "proc_exit", listOf(i32), emptyList())
+        bin.memory(1)
+        bin.data(0x100, ADDRESS.toByteArray())
+        bin.data(0x140, "main-echo".toByteArray())
+        val realloc = bin.func(List(4) { i32 }, listOf(i32), c(0x1000))
+        val startFn = bin.func(
+            emptyList(),
+            emptyList(),
+            WasmBinary.code(
+                c(0x100), c(36), c(0x200), 0x10, open,
+                // self = open の結果の ok（オフセット 4）
+                c(0x200), 0x28, 0x02, 0x04,
+                c(0x140), c(9), c(0x300), c(0), c(0x400), 0x10, invoke,
+            ),
+        )
+        val entry = bin.func(emptyList(), emptyList(), WasmBinary.code(c(0x400), 0x2d, 0x00, 0x00, 0x10, exit))
+        bin.exportFunc("cabi_realloc", realloc)
+        bin.exportFunc("_start", entry)
+        bin.start(startFn)
+        return bin.build()
     }
 
     private companion object {
