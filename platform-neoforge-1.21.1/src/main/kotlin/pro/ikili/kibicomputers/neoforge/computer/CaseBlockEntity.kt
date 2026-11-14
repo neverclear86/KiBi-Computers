@@ -234,12 +234,19 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             source,
             RestoreReady { machine -> wiring.attach(level, blockPos, machine, speakerAddress) },
             RestoreListener { _, outcome, cause ->
-                // 知らせは close の後も届く: この呼び出しの復元の知らせだけを記録する（#708）
-                if (serial == restoreStarts) lastRestoreOutcome = outcome
+                noteRestoreOutcome(serial, outcome)
                 ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
             },
         )
         if (computer.machine == null) wiring.disconnect()
+    }
+
+    /**
+     * [serial] 番目に始めた復元の知らせを [lastRestoreOutcome] に記録する（#708）。知らせは close の後も届くので、最後に始めた復元
+     * （[restoreStarts]）の知らせだけを記録し、取り消した前の復元の遅れた知らせでは上書きしない。GameTest が直接呼んで確かめる
+     */
+    internal fun noteRestoreOutcome(serial: Int, outcome: RestoreOutcome) {
+        if (serial == restoreStarts) lastRestoreOutcome = outcome
     }
 
     /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick に `setChanged` する */

@@ -156,6 +156,12 @@ object MachineRestoreGameTests {
                 "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
                     "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, ${be.computer}",
             )
+            // 取り消した前の復元の遅れた知らせ（通し番号が古い）は、今の復元の記録を上書きしない（#708）
+            be.noteRestoreOutcome(be.restoreStarts - 1, RestoreOutcome.CANCELLED)
+            helper.assertTrue(
+                be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "a stale notification should not overwrite the outcome: ${be.lastRestoreOutcome}",
+            )
             helper.assertTrue(be.computer.machine!!.state == MachineState.RUNNING, "the restored machine should run")
             typeLine(helper, helper.getBlockEntity(KEYBOARD), "echo restored-ok")
         }.thenWaitUntil {
@@ -574,13 +580,14 @@ object MachineRestoreGameTests {
     }
 
     /**
-     * 復元の数え口（#708）: [ServerMachines.recordRestoreStart]・[ServerMachines.recordRestoreFinished] が、結果ごとに決まった口だけを1つずつ増やす。
-     * 1回の tick の中で前後を比べるので、並行するほかのテストの復元は混ざらない
+     * 復元の数え口（#708）: [ServerMachines.recordRestoreStart]・[ServerMachines.countRestoreFinished] が、結果ごとに決まった口だけを1つずつ増やす。
+     * 1回の tick の中で前後を比べるので、並行するほかのテストの復元は混ざらない。終わりの側は、ログを出す [ServerMachines.recordRestoreFinished]
+     * ではなく数えるだけの口を呼ぶ（作り物の冷えた起動をログに出さず、「起動ごとに1回の要約」（#88）も使い切らない。ログの出し方は core の
+     * `ColdBootLogTest` が受け持つ）
      */
     @JvmStatic
     @GameTest(template = "empty")
     fun restoreStatsCountEachOutcome(helper: GameTestHelper) {
-        val pos = helper.absolutePos(CASE)
         fun expect(label: String, before: RestoreStats, expected: RestoreStats) {
             val after = RestoreStats.now()
             helper.assertTrue(after == expected, "$label: expected $expected but was $after (before $before)")
@@ -599,19 +606,19 @@ object MachineRestoreGameTests {
         expect("write timeout", before, before.copy(coldStarts = before.coldStarts + 1, writeTimeouts = before.writeTimeouts + 1))
 
         before = RestoreStats.now()
-        ServerMachines.recordRestoreFinished(pos, RestoreOutcome.RESTORED, null)
+        ServerMachines.countRestoreFinished(RestoreOutcome.RESTORED, null)
         expect("restored", before, before.copy(restored = before.restored + 1))
 
         before = RestoreStats.now()
-        ServerMachines.recordRestoreFinished(pos, RestoreOutcome.COLD_BOOT, ColdBootCause.RESTORE_FAILED)
+        ServerMachines.countRestoreFinished(RestoreOutcome.COLD_BOOT, ColdBootCause.RESTORE_FAILED)
         expect("fallback", before, before.copy(fallbacks = before.fallbacks + 1))
 
         before = RestoreStats.now()
-        ServerMachines.recordRestoreFinished(pos, RestoreOutcome.COLD_BOOT, ColdBootCause.MOD_VERSION)
+        ServerMachines.countRestoreFinished(RestoreOutcome.COLD_BOOT, ColdBootCause.MOD_VERSION)
         expect("version mismatch", before, before.copy(fallbacks = before.fallbacks + 1, versionMismatches = before.versionMismatches + 1))
 
         before = RestoreStats.now()
-        ServerMachines.recordRestoreFinished(pos, RestoreOutcome.CANCELLED, null)
+        ServerMachines.countRestoreFinished(RestoreOutcome.CANCELLED, null)
         expect("cancelled", before, before)
         helper.succeed()
     }
@@ -632,14 +639,24 @@ object MachineRestoreGameTests {
             before = RestoreStats.now()
             copy = reload(helper, tag)
         }.thenWaitUntil {
+            // 配線まで待つ（知らせは復元の途中が終わる前に配られる）。冷えた起動・受け付けなかったときも配線はされるので、すぐ次で落ちる
             val be = copy!!
-            helper.assertTrue(be.lastRestoreOutcome == RestoreOutcome.RESTORED, "the restore should finish: ${be.computer}")
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine === machine, "the restored machine should be wired")
         }.thenExecute {
+            val be = copy!!
             val after = RestoreStats.now()
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreSource != null && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
+                    "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, before $before, after $after, ${be.computer}",
+            )
             helper.assertTrue(
                 after == before.copy(fromSave = before.fromSave + 1, restored = before.restored + 1),
                 "a restore from the save should be counted once: before $before, after $after",
             )
+            be.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }.thenSucceed()
     }
