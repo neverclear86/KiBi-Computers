@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
@@ -143,8 +144,12 @@ class MachineRestoreTest {
         return Saved(written, input, output, pid)
     }
 
-    /** [saveWaitingPrompt] の `prompt` に、その子の `prompt` を足した2つが、入力を待ったところで保存する。子の pid も返す */
-    private fun saveWaitingPromptWithChild(h: Harness, store: MachineSaveStore): Pair<Saved, Int> {
+    /**
+     * [saveWaitingPrompt] の `prompt` に、その子の `prompt` を足した2つが、入力を待ったところで保存する。子の pid も返す。
+     * [Saved.pid] は親（init）。[childFirst] なら、pid の小さい方（先に作った方）を子にし、大きい方を親（init）にする
+     * （pid が一周して使い回され、子の pid が親より小さくなった状態を、表の親子の印で作る。#696）
+     */
+    private fun saveWaitingPromptWithChild(h: Harness, store: MachineSaveStore, childFirst: Boolean = false): Pair<Saved, Int> {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
         val m = h.machine(fuelPerTick = 10_000_000)
         val bytes = resource("prompt-wasi.wasm")
@@ -159,11 +164,13 @@ class MachineRestoreTest {
             val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
             return Triple(m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio)), input, output)
         }
-        val (pid, input, output) = spawn()
-        val (childPid, _, _) = spawn()
+        val first = spawn()
+        val second = spawn()
+        val (pid, input, output) = if (childFirst) second else first
+        val childPid = if (childFirst) first.first else second.first
         m.lock.withLockValue {
             m.kernel.initPid = pid
-            // 2つ目を1つ目の子にする（表の親子の印だけ。子のハンドルは持たせない）
+            // 子を親の子にする（表の親子の印だけ。子のハンドルは持たせない）
             m.kernel.processes[childPid]!!.parentPid = pid
         }
         eventually(60_000, "入力を待たない") {
@@ -575,6 +582,69 @@ class MachineRestoreTest {
                 assertEquals(0, child.parentPid, "親なしに付け替わっていない")
                 assertNotNull(m.kernel.objects[child.objectId], "未採用の子の ProcessObject の参照が返った")
                 assertTrue(m.kernel.processes.all().all { it.state.isTerminal })
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `採用済みの子と未採用の親が混ざる位置で後段が失敗しても、両方KILLEDになり、awaitTerminationが返る`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            // 子（pid の小さい方）と、その親（init。pid の大きい方）の2つが、入力待ちで保存される。
+            // pid が一周して使い回され、子の pid が親より小さくなった状態を、表の親子の印で作る（#696）
+            val (saved, childPid) = saveWaitingPromptWithChild(h, store, childFirst = true)
+            val parentPid = saved.pid
+            assertTrue(childPid < parentPid)
+            val disk = CountingDisk()
+            openRootAs(h, disk)
+            var adopted = -1
+            // runtimes は pid の昇順で作るので、1つ目（子）を runtimes に入れた直後で落とすと、親は runtimes に入らない
+            h.scheduler.hooks.afterRestoreAdopt = { _, pid ->
+                if (adopted < 0) {
+                    adopted = pid
+                    throw IllegalStateException("テストの失敗")
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "CRASHED にならない") {
+                h.scheduler.tick()
+                m.state == MachineState.CRASHED
+            }
+            h.awaitRestoreCleanup(m)
+            assertEquals(childPid, adopted, "子が先に runtimes に入っていない")
+            assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
+            assertFalse(m.isRestoring)
+            assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
+            assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
+            assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
+            m.lock.withLockValue {
+                assertNotNull(m.runtimes[childPid], "子が runtimes にない")
+                assertNull(m.runtimes[parentPid], "親が runtimes に入っている")
+                assertEquals(0, m.kernel.processes.liveCount())
+                assertEquals(2, m.kernel.processes.size, "表を巻き戻した・刈り取った")
+                // 採用済みの子は stopLocked の finishLocked で終わる。そのとき親はまだ終わっていないので、親付きのゾンビとして残り、親に知らせる
+                val child = m.kernel.processes[childPid]!!
+                assertEquals(ProcessState.KILLED, child.state)
+                assertEquals(parentPid, child.parentPid, "子が親なしに付け替わった")
+                val childObject = m.kernel.objects[child.objectId] as ProcessObject?
+                assertNotNull(childObject, "子の ProcessObject の参照が返った")
+                assertNotNull(childObject!!.status, "子の終わりを記録していない")
+                // 未採用の親は endUnadoptedRestoredProcessesLocked が状態と待ちだけを書き換える（終わりの記録を通らない）。
+                // そのため ProcessObject.status は null のまま、親のないゾンビの並びにも入らず、子のゾンビも刈り取らない。
+                // ADR 0085 の記録（追記 #696）どおり。recordExit を通すように変えたら、ここも変える
+                val parent = m.kernel.processes[parentPid]!!
+                assertEquals(ProcessState.KILLED, parent.state)
+                assertNull(parent.wait)
+                val parentObject = m.kernel.objects[parent.objectId] as ProcessObject?
+                assertNotNull(parentObject, "親の ProcessObject の参照が返った")
+                assertNull(parentObject!!.status, "未採用の親の終わりを記録した（ADR 0085 の記録と違う）")
+                assertEquals(1, parentObject.pendingChildExits, "子の終わりが親に届いていない")
+                assertFalse(parentPid in m.kernel.processes.orphanZombies, "未採用の親を親のないゾンビにした（ADR 0085 の記録と違う）")
+                // init は onProcessFinishedLocked を通らないので、終わった親を指したまま
+                assertEquals(parentPid, m.kernel.initPid)
             }
             m.close()
         }
