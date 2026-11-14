@@ -77,6 +77,8 @@
 
 `DeviceContext.postEvent(kind, values...)` で、マシンのイベントキュー（ADR 0063）に `source` = address のイベントを入れる。値は同じ種類の `EventValue` に写し、`none` は載せない。上限を超えた・外れた後は `false` を返して捨てる。接続・切断のイベントは #67。
 
+- 追記（#67）: 接続・切断のイベント `device-attached`・`device-detached`（source `""`、値は address・種類）は ADR 0067 で決めた。`DeviceBus` の書き込みのロックの中で出すので、つなぐ・外すはカーネルロックを短く取る（カーネルロックを持って呼ばない）
+
 ## WIT（`kibi:device@0.1.0`）
 
 置き場は `core/src/main/wit/kibi-device/`（`types.wit`・`bus.wit`・`world.wit`。`world imports`）。

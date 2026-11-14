@@ -8,6 +8,12 @@ package kibi:kernel@0.1.0;
 /// 保存から戻るたびに、カーネルが種類 "restored"・source ""・値 [integer(実時間の飛び ns), integer(ゲーム内時間の飛び tick)]
 /// のイベントを1件出す（成功した復元だけ。飛びが 0・負でも出す。#87、ADR 0087）。意味は「保存から戻った」だけで、画面が空とは約束しない。
 /// デバイスも同じ種類名を出せるので、カーネルのものは source "" で見分ける。
+/// デバイスをつなぐ・外すたびに、カーネルが種類 "device-attached"・"device-detached"、source ""、値 [text(address), text(種類)]
+/// のイベントを1件出す（成功した接続・切断だけ。#67、ADR 0067）。同じ address の接続と切断は起きた順に並び、届いた時点で
+/// `kibi:device` の一覧は新しい表になっている。起動前・再起動の前の接続は届かない（起動したら一覧を読む）。
+/// 保存から戻ったときは、"restored" の後に、戻した先でつなぎ直した全デバイスの "device-attached" が届く（保存の前に
+/// つないでいた分と重なりうる。消えた分の "device-detached" は出ない）。受け手は "restored" を受けたとき・dropped が 0 でないときに一覧を読み直す。
+/// デバイスも同じ種類名を出せるので、カーネルのものは source "" で見分ける。
 interface events {
     use types.{error-code};
 
