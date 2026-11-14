@@ -165,6 +165,77 @@ class ComponentResourceTest {
         }
     }
 
+    /**
+     * 子のコンポーネント `C` が borrow を受けて string を返し、`D` がそれを canon lower で呼ぶ（呼ぶ側の realloc が動く）。
+     * `D` の realloc は unreachable なので、realloc まで進めばそのトラップになる
+     */
+    private val borrowThenRealloc = """
+        (component
+          (import "test:host/res" (instance ${'$'}h
+            (export "thing" (type ${'$'}t (sub resource)))
+            (export "make" (func (param "n" u32) (result (own ${'$'}t))))))
+          (alias export ${'$'}h "thing" (type ${'$'}thing))
+          (alias export ${'$'}h "make" (func ${'$'}make))
+          (component ${'$'}C
+            (import "thing" (type ${'$'}t (sub resource)))
+            (core func ${'$'}drop (canon resource.drop ${'$'}t))
+            (core module ${'$'}CM
+              (import "" "drop" (func ${'$'}drop (param i32)))
+              (memory (export "mem") 1)
+              (data (i32.const 16) "hi")
+              (func ${'$'}ret (result i32)
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 2))
+                (i32.const 0))
+              (func (export "keep") (param i32) (result i32) (call ${'$'}ret))
+              (func (export "fine") (param ${'$'}b i32) (result i32) (call ${'$'}drop (local.get ${'$'}b)) (call ${'$'}ret)))
+            (core instance ${'$'}ci (instantiate ${'$'}CM (with "" (instance (export "drop" (func ${'$'}drop))))))
+            (func (export "keep") (param "t" (borrow ${'$'}t)) (result string) (canon lift (core func ${'$'}ci "keep") (memory ${'$'}ci "mem")))
+            (func (export "fine") (param "t" (borrow ${'$'}t)) (result string) (canon lift (core func ${'$'}ci "fine") (memory ${'$'}ci "mem"))))
+          (component ${'$'}D
+            (import "thing" (type ${'$'}t (sub resource)))
+            (import "make" (func ${'$'}make (param "n" u32) (result (own ${'$'}t))))
+            (import "keep" (func ${'$'}keep (param "t" (borrow ${'$'}t)) (result string)))
+            (import "fine" (func ${'$'}fine (param "t" (borrow ${'$'}t)) (result string)))
+            (core module ${'$'}Mem
+              (memory (export "mem") 1)
+              (func (export "realloc") (param i32 i32 i32 i32) (result i32) unreachable))
+            (core instance ${'$'}mem (instantiate ${'$'}Mem))
+            (core func ${'$'}make_l (canon lower (func ${'$'}make)))
+            (core func ${'$'}keep_l (canon lower (func ${'$'}keep) (memory ${'$'}mem "mem") (realloc (func ${'$'}mem "realloc"))))
+            (core func ${'$'}fine_l (canon lower (func ${'$'}fine) (memory ${'$'}mem "mem") (realloc (func ${'$'}mem "realloc"))))
+            (core module ${'$'}DM
+              (import "" "make" (func ${'$'}make (param i32) (result i32)))
+              (import "" "keep" (func ${'$'}keep (param i32 i32)))
+              (import "" "fine" (func ${'$'}fine (param i32 i32)))
+              (func (export "run-keep") (result i32) (call ${'$'}keep (call ${'$'}make (i32.const 1)) (i32.const 64)) (i32.const 0))
+              (func (export "run-fine") (result i32) (call ${'$'}fine (call ${'$'}make (i32.const 1)) (i32.const 64)) (i32.const 0)))
+            (core instance ${'$'}dm (instantiate ${'$'}DM (with "" (instance
+              (export "make" (func ${'$'}make_l)) (export "keep" (func ${'$'}keep_l)) (export "fine" (func ${'$'}fine_l))))))
+            (func (export "run-keep") (result u32) (canon lift (core func ${'$'}dm "run-keep")))
+            (func (export "run-fine") (result u32) (canon lift (core func ${'$'}dm "run-fine"))))
+          (instance ${'$'}c (instantiate ${'$'}C (with "thing" (type ${'$'}thing))))
+          (instance ${'$'}d (instantiate ${'$'}D
+            (with "thing" (type ${'$'}thing)) (with "make" (func ${'$'}make))
+            (with "keep" (func ${'$'}c "keep")) (with "fine" (func ${'$'}c "fine"))))
+          (func (export "run-keep") (alias export ${'$'}d "run-keep"))
+          (func (export "run-fine") (alias export ${'$'}d "run-fine")))
+    """
+
+    @Test
+    fun `borrowを残して返ると、呼ぶ側のreallocより前にトラップ`() {
+        val p = load(borrowThenRealloc, thingHost(Log()))
+        instantiate(p).use { c ->
+            val e = assertThrows<WasmTrapException> { c.call("run-keep") }
+            assertTrue(e.message!!.contains("drop せずに返った"), e.message)
+        }
+        // borrow を drop して返れば、呼ぶ側の realloc まで進む（unreachable のトラップになる）
+        instantiate(p).use { c ->
+            val e = assertThrows<WasmTrapException> { c.call("run-fine") }
+            assertTrue(!e.message!!.contains("drop せずに返った"), e.message)
+        }
+    }
+
     // ---- ゲストの resource ----
 
     private val guestResource = """
