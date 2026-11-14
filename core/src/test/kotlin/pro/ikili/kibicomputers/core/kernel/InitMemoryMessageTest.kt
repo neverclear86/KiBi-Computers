@@ -60,13 +60,14 @@ class InitMemoryMessageTest {
      * RAM [ramBytes]・[pages] ページの線形メモリの init を、`_start` の本体 [body] で起動し、マシンが止まるまで待つ。
      * [body] は返した値を結果に積める（grow・commit の戻り値を確かめる）
      */
-    private fun bootInit(ramBytes: Long, pages: Int = 1, body: (FakeContext, MutableList<Long>) -> Unit): Result = timeout(limit) {
+    private fun bootInit(ramBytes: Long, pages: Int = 1, tableBytes: Long = 0, body: (FakeContext, MutableList<Long>) -> Unit): Result = timeout(limit) {
         Harness().use { h ->
             val host = ConsoleRecorder()
             val results = Collections.synchronizedList(mutableListOf<Long>())
             val module = FakeModule.builder()
                 .fuelMetered()
                 .memory(pages)
+                .tableBytes(tableBytes)
                 .import(P1.MODULE, "proc_exit", procExitType)
                 .import(WasiP1Kibi.MEMORY, "commit", WasiP1Kibi.typeOf(WasiP1Kibi.MEMORY, "commit")!!)
                 .export("_start", VOID) { ctx, _ ->
@@ -106,6 +107,14 @@ class InitMemoryMessageTest {
         val r = bootInit(page, pages = 2) { ctx, _ -> ctx.memory.touch(0, 17) }
         assertEquals(ProcessState.CRASHED, r.state, r.console)
         assertEquals("kibi: booting from disk d\nkibi: init crashed: out of memory (RAM limit 64 KiB)\n", r.console)
+    }
+
+    @Test
+    fun `initの最初のテーブルがRAMに収まらず作れないと、メモリ不足と表示する`() {
+        // RAM 64 KiB に、最初のテーブルが 1 バイトはみ出す（#48）
+        val r = bootInit(page, tableBytes = page + 1) { _, _ -> }
+        assertEquals(ProcessState.CRASHED, r.state, r.console)
+        assertEquals("kibi: booting from disk d\nkibi: init crashed: cannot instantiate module (out of memory, RAM limit 64 KiB)\n", r.console)
     }
 
     @Test

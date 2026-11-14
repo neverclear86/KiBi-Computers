@@ -144,6 +144,14 @@ internal class ProcessRuntime(
     @Volatile
     var memoryCommitRefused: Boolean = false
 
+    /**
+     * 最後に [ProcessContext.instantiate] で作ろうとしたインスタンスが、RAM の上限で確保を断られて作れなかった（#48）。
+     * この後にプロセスが [pro.ikili.kibicomputers.core.runtime.WasmLinkException] で異常終了したら、メモリ不足と表示する。
+     * 次に作るときに下ろす。プロセスのスレッドが、ロックを持たずに書く
+     */
+    @Volatile
+    var instantiateRefusedMemory: Boolean = false
+
     /** このプロセスの燃料切れの処理（カーネルが作る） */
     lateinit var fuelHandler: WasmFuelHandler
 

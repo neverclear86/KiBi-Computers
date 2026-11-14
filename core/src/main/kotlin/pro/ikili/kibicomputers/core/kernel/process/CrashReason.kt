@@ -27,26 +27,41 @@ internal fun crashReason(t: Throwable): String = when (t) {
 }
 
 /**
- * RAM の上限を超えた書き込みでトラップしたときの理由（#407）。例: `out of memory (RAM limit 128 KiB)`。
- * [limitBytes] はプロセスが数えられる上限（プロセスの上限とマシンの RAM のうち小さい方）
+ * メモリ不足の文で、どの上限に当たったかを書く部分（#407・#48。ADR 0048）。
+ * サーバー全体の勘定（#362）で断ったときは `server memory limit reached`（マシンの RAM には余裕があるので、RAM の上限を書かない）。
+ * それ以外は `RAM limit 128 KiB` のように、プロセスが数えられる上限 [limitBytes]（プロセスの上限とマシンの RAM のうち小さい方）を書く
  */
-internal fun outOfMemoryReason(limitBytes: Long): String = "out of memory (RAM limit ${formatBytes(limitBytes)})"
+internal fun memoryLimitText(serverRefused: Boolean, limitBytes: Long): String =
+    if (serverRefused) "server memory limit reached" else "RAM limit ${formatBytes(limitBytes)}"
+
+/**
+ * RAM の上限を超えた書き込みでトラップしたときの理由（#407）。例: `out of memory (RAM limit 128 KiB)`。
+ * [limit] は [memoryLimitText] の文
+ */
+internal fun outOfMemoryReason(limit: String): String = "out of memory ($limit)"
+
+/**
+ * インスタンスを作る間に RAM の上限で確保を断られて、プロセスを作れなかったときの理由（#48）。
+ * 例: `cannot instantiate module (out of memory, RAM limit 128 KiB)`。[limit] は [memoryLimitText] の文
+ */
+internal fun instantiateOutOfMemoryReason(limit: String): String = "cannot instantiate module (out of memory, $limit)"
 
 /**
  * `memory.grow`（#407）や `kibi:computer/memory` の `commit`（#408）を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文。
- * どちらも断っていなければ `null`。例:
+ * どちらも断っていなければ `null`。[limit] は [memoryLimitText] の文。例:
  * - grow だけ: `memory.grow was refused: out of memory, RAM limit 128 KiB`
  * - commit だけ: `kibi:memory commit was refused: out of memory, RAM limit 128 KiB`
  * - 両方: `memory.grow and kibi:memory commit were refused: out of memory, RAM limit 128 KiB`
+ * - サーバー全体で断ったとき: `memory.grow was refused: out of memory, server memory limit reached`
  */
-internal fun memoryRefusedNote(growRefused: Boolean, commitRefused: Boolean, limitBytes: Long): String? {
+internal fun memoryRefusedNote(growRefused: Boolean, commitRefused: Boolean, limit: String): String? {
     val what = when {
         growRefused && commitRefused -> "memory.grow and kibi:memory commit were refused"
         growRefused -> "memory.grow was refused"
         commitRefused -> "kibi:memory commit was refused"
         else -> return null
     }
-    return "$what: out of memory, RAM limit ${formatBytes(limitBytes)}"
+    return "$what: out of memory, $limit"
 }
 
 /** バイト数を、1 MiB の倍数なら MiB、1 KiB の倍数なら KiB、そうでなければバイトで書く */

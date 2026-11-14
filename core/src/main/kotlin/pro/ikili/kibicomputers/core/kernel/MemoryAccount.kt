@@ -43,10 +43,13 @@ internal class MemoryAccount(
     val usedPages: Int get() = linearPages.get()
 
     /** 線形メモリを [pages] ページ確保できれば数えて `true` */
-    fun tryReserve(pages: Int): Boolean {
-        if (!tryReserveBytes(pages.toLong() * WasmMemory.PAGE_SIZE)) return false
-        linearPages.addAndGet(pages)
-        return true
+    fun tryReserve(pages: Int): Boolean = reserve(pages) == null
+
+    /** [tryReserve] と同じだが、断った段を返す（数えたら `null`。[reserveBytes]） */
+    fun reserve(pages: Int): MemoryRefusal? {
+        val refusal = reserveBytes(pages.toLong() * WasmMemory.PAGE_SIZE, 0)
+        if (refusal == null) linearPages.addAndGet(pages)
+        return refusal
     }
 
     fun release(pages: Int) {
@@ -62,14 +65,20 @@ internal class MemoryAccount(
      * [tryReserveBytes] と同じだが、自分の勘定では、数えた後の残りが [keepBytes]（符号なし 64 ビット。負の値は 2^63 以上）
      * 以上になるときだけ数える（`kibi:computer/memory` の `commit`。#408）。親（サーバー全体）の勘定には [keepBytes] をかけない
      */
-    fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
+    fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean = reserveBytes(bytes, keepBytes) == null
+
+    /**
+     * [tryReserveBytes] と同じだが、断った段を返す（#48）。数えたら `null`、自分の勘定で断ったら [MemoryRefusal.MACHINE]、
+     * 親（サーバー全体）で断ったら [MemoryRefusal.SERVER]。自分と親のそれぞれを1回の CAS で数え、親で断られたら自分の分を戻す
+     */
+    fun reserveBytes(bytes: Long, keepBytes: Long): MemoryRefusal? {
         require(bytes >= 0) { "バイト数は 0 以上: $bytes" }
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return false
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return MemoryRefusal.MACHINE
         if (parent != null && !parent.tryReserveBytes(bytes)) {
             usedBytesCounter.addAndGet(-bytes)
-            return false
+            return MemoryRefusal.SERVER
         }
-        return true
+        return null
     }
 
     /** [tryReserveBytes] で確保した [bytes] バイトを返す（親からも引く） */
@@ -107,17 +116,31 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
      * 確保を一度でも断ったか（プロセスの上限・マシンの RAM・サーバー全体のどれか）。インスタンスを作り直せなかった理由が
      * RAM の不足か（`ColdBootCause.NO_MEMORY`）、それ以外か（`RESTORE_FAILED`）を分けるのに使う（#576）
      */
+    val refusedReservation: Boolean get() = lastRefusal != null
+
+    /**
+     * 最後に確保を断った段（#48）。一度も断っていなければ `null`。コンソールに出すメモリ不足の理由を、断った段に合わせるのに使う
+     * （サーバー全体で断ったときは、マシンの RAM の上限を書かない）。
+     * 書くのは確保を断ったときだけ（断るたびに上書きする）。プロセスはマシンの勘定を共有するので、マシンの [MemoryAccount] ではなくここに置く
+     */
     @Volatile
-    var refusedReservation: Boolean = false
+    var lastRefusal: MemoryRefusal? = null
         private set
+
+    /** 確保を断った回数（#48）。インスタンスを作る間に断ったかを、前後の値を比べて見分ける。断ったときだけ書く */
+    private val refusals = AtomicInteger()
+
+    /** 確保を断った回数（[refusals]） */
+    val refusalCount: Int get() = refusals.get()
 
     override fun tryReserve(pages: Int): Boolean {
         require(pages > 0) { "ページ数は正: $pages" }
         val bytes = pages.toLong() * WasmMemory.PAGE_SIZE
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return refused()
-        if (!machine.tryReserve(pages)) {
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return refused(MemoryRefusal.PROCESS)
+        val refusal = machine.reserve(pages)
+        if (refusal != null) {
             usedBytesCounter.addAndGet(-bytes)
-            return refused()
+            return refused(refusal)
         }
         used.addAndGet(pages)
         return true
@@ -136,16 +159,18 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     /** プロセスとマシンのそれぞれで、数えた後の残りが [keepBytes] 以上になるときだけ数える（#408。サーバー全体には [keepBytes] をかけない） */
     override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes > 0) { "バイト数は正: $bytes" }
-        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return refused()
-        if (!machine.tryReserveBytes(bytes, keepBytes)) {
+        if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return refused(MemoryRefusal.PROCESS)
+        val refusal = machine.reserveBytes(bytes, keepBytes)
+        if (refusal != null) {
             usedBytesCounter.addAndGet(-bytes)
-            return refused()
+            return refused(refusal)
         }
         return true
     }
 
-    private fun refused(): Boolean {
-        refusedReservation = true
+    private fun refused(refusal: MemoryRefusal): Boolean {
+        lastRefusal = refusal
+        refusals.incrementAndGet()
         return false
     }
 
@@ -168,6 +193,18 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
         val after = usedBytesCounter.addAndGet(-bytes)
         check(after >= 0) { "プロセスのメモリの使用量が負になった: $after バイト" }
     }
+}
+
+/** 確保を断った段（#48。ADR 0048）。プロセス → マシン → サーバー全体の順に数え、最初に収まらなかった段 */
+internal enum class MemoryRefusal {
+    /** プロセスの上限（`maxProcessMemoryBytes`） */
+    PROCESS,
+
+    /** マシンの RAM */
+    MACHINE,
+
+    /** サーバー全体の勘定（`SchedulerConfig.totalMemoryBytes`。#362） */
+    SERVER,
 }
 
 /**

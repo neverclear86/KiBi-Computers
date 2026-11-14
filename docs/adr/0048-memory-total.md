@@ -1,0 +1,64 @@
+# 0048: 全プロセスのメモリ合計の管理
+
+- 状態: 採用
+- Issue: #48（task）。前提: #39（RAM の上限）、#45（プロセスの生成。ADR 0045）、#362（サーバー全体の勘定）、#370・#407（RAM の数え方）、#408（`kibi:memory`）
+- 番号は Issue 番号にそろえている
+
+## 決めたこと（要約）
+
+- RAM の勘定は 3 段（プロセス → マシン → サーバー全体）。どれも実行時だけのもので、保存しない（復元のときは数え直す。ADR 0082・0085）
+- 上限を超えたときの振る舞いは、確保の種類ごとに下の表のとおり。**プロセスの生成が RAM で失敗したときは、子を `CRASHED` にし、コンソールにメモリ不足と出す**（spawn の戻り値は変えない）
+- どの段で断ったかを記録し、サーバー全体で断ったときは、マシンの RAM の上限ではなく `server memory limit reached` と書く
+- ABI（`kibi:memory` の `remaining`・`commit`、spawn の戻り値）、保存形式、公開 API は変えない
+
+## 3 段の勘定
+
+| 段 | 持ち主 | 上限 | 数えるもの |
+| --- | --- | --- | --- |
+| プロセス | `ProcessMemory`（プロセスのすべてのインスタンスで共有） | `MachineConfig.maxProcessMemoryBytes`（既定は RAM と同じ） | 線形メモリ（初めて書き込んだ 4 KiB の区画。#407）、テーブルの要素（#361） |
+| マシン（RAM） | `Machine.memoryAccount`（`MemoryAccount`） | `MachineConfig.memoryBytes`（RAM のパーツの合計。仮の値。#251） | マシンのすべてのプロセスの分と、`/tmp` の中身（ADR 0053） |
+| サーバー全体 | `MachineScheduler.memoryAccount`（`MemoryAccount`） | `SchedulerConfig.totalMemoryBytes`（既定はヒープの最大値の半分。仮。#251） | すべてのマシンの分 |
+
+- 確保は「プロセス → マシン → サーバー」の順に、それぞれ 1 回の CAS で数える。上の段で断られたら、下の段の分を戻す。返すときは全段から引く。カーネルロックは使わない（`memory.grow` と初めての書き込みは、プロセスのスレッドからロックを持たずに来る）
+- 合計はプロセスを走査して求めない（カウンターを持つだけ）。tick ごとの集計もしない。1,000 台規模でも、待っているだけの台には負荷を足さない
+- 解放しても減らさない（最高値）。プロセスが終わったときにまとめて返す（#370）。OS や init も同じ枠で数える
+
+## 上限を超えたとき
+
+| 確保 | 断ったときの振る舞い | コンソール |
+| --- | --- | --- |
+| 線形メモリへの初めての書き込み | トラップ（`OUT_OF_MEMORY`） | `crashed: out of memory (RAM limit 128 KiB)` |
+| `memory.grow` | -1（増やした範囲の端の区画を数えられないとき） | その後に異常終了したら `(memory.grow was refused: out of memory, RAM limit 128 KiB)` を添える |
+| `kibi:memory` の `commit` | false | 同上（`kibi:memory commit was refused`） |
+| `table.grow` | -1 | 添えない（下の「決めないこと」） |
+| `/tmp` への書き込み | `NOSPC`（書けた分があれば短い書き込み） | なし |
+| プロセスの生成（最初のインスタンス。テーブルの最初の要素など） | 子が `CRASHED` | `crashed: cannot instantiate module (out of memory, RAM limit 128 KiB)` |
+| 実行中に作る 2 つ目以降のインスタンス（`ProcessContext.instantiate`） | `WasmLinkException`（ABI 層が扱える） | そのまま異常終了したら、生成と同じ文 |
+
+- `RAM limit` に書くのは、プロセスが数えられる上限（プロセスの上限とマシンの RAM のうち小さい方）
+- **サーバー全体の勘定で断ったとき**は、`RAM limit ...` の代わりに `server memory limit reached` と書く（例: `out of memory (server memory limit reached)`、`cannot instantiate module (out of memory, server memory limit reached)`）。マシンの RAM には余裕があるので、RAM の上限を書くと誤解を招く
+- どの段で断ったかは、`ProcessMemory.lastRefusal`（最後に断った段）に記録する。マシンの勘定はプロセスで共有するので、記録はプロセスの側に置く。断ったときだけ書くので、確保の速い経路には何も足さない
+- `kibi:memory` の `remaining` は、プロセスの上限とマシンの RAM のうち小さい方の残りで、サーバー全体は入れない（#408 のまま）。`commit` の `keep` もサーバー全体にはかけない
+
+## プロセスの生成が RAM で失敗したとき
+
+spawn（`kibi:process spawn`・`Machine.exec`）は、読み込み（コンパイル）が終わるまでしか待たない（ADR 0074）。インスタンスは子のスレッドが作るので、RAM の不足はその後で分かる。
+
+- 子は `CRASHED` で終わり、親は終了待ち（`status`）で `crashed` を見る。spawn の戻り値（ok と pid）は変えない
+- 判定: `WasmLinkException` で終わり、かつ
+  - 最初のインスタンス（`LOADING` の間）なら、プロセスの勘定が一度でも確保を断ったこと（新しいプロセスは、その前に断ることがない）
+  - 2 つ目以降なら、作る前後で断った回数（`ProcessMemory.refusalCount`）が増えたこと
+- RAM と関係のない失敗（import がない、型が違う、start 関数のトラップ）には、メモリ不足と書かない。前に別の確保を断っていても、2 つ目以降の判定は作る前後の回数で見るので混ざらない
+- 作りかけのインスタンスのメモリ・テーブルの分は、全段に返る（ランタイムが失敗のときもまとめて返す。#318）
+- init（pid 1）でも同じ文が `kibi: init crashed: ...` に出る
+
+### 採らなかったもの
+
+- spawn を、子のインスタンスができるまで待たせる / 生成の前に残りを比べて spawn で `no-memory` を返す: ABI（ADR 0074 の spawn の返すエラー）と待機点の保存に関わる。事前の確認は競合で必ずすり抜けるので、子の `CRASHED` の経路は残る
+- 宣言したページ数で事前に予約する: #370 の数え方（書いた区画だけ）に反し、小さい RAM で Lua が起動しなくなる
+
+## 決めないこと
+
+- `table.grow` を断った後の異常終了に、メモリ不足の注記を添えること（今は `memory.grow`・`commit` だけ）
+- RAM・サーバー全体の上限の最終値: #251・#20・#123
+- インスタンスをまたぐ燃料と上限の残り: #270
