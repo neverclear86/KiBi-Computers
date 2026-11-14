@@ -21,6 +21,7 @@
   - `SKIP_IF_TRANSIENT`（自動保存）: `TRANSIENT` があれば `null`（前の世代を残す）。`UNSAVEABLE` は写しの中で殺す
   - `KILL_TRANSIENT`（アンロード・停止）: `TRANSIENT` も写しの中で殺す
   - マシン全体が `TRANSIENT`（起動中・再起動待ち）で `KILL_TRANSIENT` のときは、必ず写しを作り、理由を `REBOOT_PENDING`（優先）か `BOOTING` にする。殺す手順は走らせない
+  - 追記（#698）: 状態が `CRASHED` の台は、どちらの方針でも `null`（写さない）。呼び手が電源を切って書く（ADR 0085 の追記（#698））
 - **写しは、殺す手順が書き換えるものを元と共有しない**: プロセス表・`Process`（fd 表・待ちのタイマー・Asyncify のスタック）・`ProcessObject`・オブジェクト表（参照の数）を作り直す。オブジェクトの実体は `KernelObject.copyForSnapshot()` が返せば写したもの、返さなければ元の実体を指すだけ（#81 で写せるのは `ProcessObject` だけ）
 - **写しの中の後始末の規則**: `WakeSink` は何もしない `NoopWakeSink`。写していない実体の参照が 0 になっても `onLastClose`・`releaseReferences` を呼ばず、ID を `closedInCopy` に記録するだけ（ファイルのチャネル・パイプ・タイマー・デバイスの呼び出しなど、ホストの資源を閉じない）
   - **#82 への申し送り**: 種類ごとに `copyForSnapshot` を足し、`closedInCopy` を「写した実体の側で閉じた後の状態」に置き換える。すべての種類を写せるまで、`KERNEL` 節の中身は書かない

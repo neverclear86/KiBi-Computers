@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
@@ -150,6 +151,37 @@ object MachineSaveGameTests {
         helper.assertTrue(!Files.exists(store.directoryOf(id)), "a player breaking the case should delete its directory")
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 止まった台の知らせが届く前に停止の手順が走っても（#698）、電源を切った状態で NBT に載る。停止の手順では tick が回らず、
+     * 外した後の知らせは捨てられるので、手順の中でケースがそろえる（結線も外す）。CRASHED の窓そのものは core の単体テストで確かめる
+     * （GameTest からは本物のマシンを CRASHED にできない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopSaveSettlesAStoppedMachine(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            machine.stop()
+            helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+            helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+            // 知らせはまだ届いていない（tick が回っていない）
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 0, "a stopped machine should not be captured")
+            helper.assertTrue(!be.computer.poweredOn, "the stop save should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the stop save should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine == null, "the stop save should disconnect the wiring")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
     }
 
     /**

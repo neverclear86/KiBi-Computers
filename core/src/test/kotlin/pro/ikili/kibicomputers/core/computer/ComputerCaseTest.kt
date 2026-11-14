@@ -40,6 +40,7 @@ import java.nio.file.Path
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.withLock
 
 /** ケースのティアと電源・状態（#121） */
 class ComputerCaseTest {
@@ -740,5 +741,93 @@ class ComputerCaseTest {
         assertSame(machine, case.machine)
         assertEquals(listOf(MachineState.RUNNING, MachineState.STOPPING, MachineState.STOPPED, MachineState.RUNNING), events.states.toList())
         assertEquals("hold", modeFile())
+    }
+
+    // ---- 止まったマシンを知らせの前にそろえる（#698） ----
+
+    /** [machine] をカーネルの不整合で CRASHED にする（知らせは次の tick まで配らない） */
+    private fun crash(machine: Machine) {
+        machine.lock.withLock { machine.inconsistencyLocked("テスト") }
+        assertEquals(MachineState.CRASHED, machine.state)
+    }
+
+    @Test
+    fun `CRASHEDの知らせの前にそろえると、エラーにして電源を切り、後の知らせで二重にならない`() {
+        var changes = 0
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events) { changes++ }
+        val machine = bootedCase(case, withDisk(case.tier), "disk-a")
+        assertTrue(case.poweredOn)
+        val before = changes
+        crash(machine)
+        // 知らせの前は、まだ動いている表示のまま。写しは取らない
+        assertEquals(ComputerStatus.RUNNING, case.status)
+        assertNull(case.capture(CapturePolicy.KILL_TRANSIENT))
+        assertNull(case.capture(CapturePolicy.SKIP_IF_TRANSIENT))
+        assertFalse(case.isSettlingForSave)
+        assertTrue(case.settleStoppedMachine())
+        assertEquals(ComputerStatus.ERROR, case.status)
+        assertEquals(ComputerError.CRASHED, case.error)
+        assertFalse(case.poweredOn)
+        assertNull(case.machine)
+        assertNull(manager["a"])
+        assertEquals(before + 1, changes)
+        assertEquals(1, events.states.count { it == MachineState.CRASHED }, "events に中継していない: ${events.states}")
+        // 2回目は何もしない。後で届く知らせも外したマシンのものなので捨てる
+        assertFalse(case.settleStoppedMachine())
+        repeat(5) { manager.tick() }
+        assertEquals(before + 1, changes)
+        assertEquals(1, events.states.count { it == MachineState.CRASHED }, "二重に届いた: ${events.states}")
+        assertEquals(ComputerError.CRASHED, case.error)
+    }
+
+    @Test
+    fun `写した後にCRASHEDになった台も、そろえると電源が切れる`() {
+        val case = ComputerCase<String>(CaseTier.BASIC, States())
+        val machine = bootedCase(case, withDisk(case.tier), "disk-a")
+        assertTrue(case.prepareUnload())
+        assertNotNull(case.capture(CapturePolicy.KILL_TRANSIENT))
+        crash(machine)
+        assertTrue(case.settleStoppedMachine())
+        assertFalse(case.poweredOn)
+        assertEquals(ComputerError.CRASHED, case.error)
+        assertNull(manager["a"])
+    }
+
+    @Test
+    fun `止まったSTOPPEDの台は、知らせの前にそろえるとOFFにして電源を切る`() {
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        val machine = bootedCase(case, withDisk(case.tier), "disk-a")
+        machine.stop()
+        assertTrue(machine.awaitTermination(5_000))
+        assertEquals(MachineState.STOPPED, machine.state)
+        assertTrue(case.poweredOn, "知らせの前")
+        assertTrue(case.settleStoppedMachine())
+        assertEquals(ComputerStatus.OFF, case.status)
+        assertFalse(case.poweredOn)
+        assertNull(manager["a"])
+        assertEquals(MachineState.STOPPED, events.states.last())
+        val delivered = events.states.size
+        repeat(5) { manager.tick() }
+        assertEquals(delivered, events.states.size, "外した後の知らせが届いた: ${events.states}")
+    }
+
+    @Test
+    fun `動いている・再起動の途中・マシンがない台は、そろえても何もしない`() {
+        val case = ComputerCase<String>(CaseTier.BASIC, States())
+        assertFalse(case.settleStoppedMachine(), "マシンがない")
+        val machine = bootedCase(case, withDisk(case.tier), "disk-a")
+        assertFalse(case.settleStoppedMachine(), "動いている")
+        assertSame(machine, case.machine)
+        assertTrue(machine.reboot())
+        assertTrue(machine.awaitTermination(5_000))
+        assertTrue(machine.isRebootPending)
+        assertFalse(case.settleStoppedMachine(), "再起動の途中")
+        assertTrue(case.poweredOn)
+        assertSame(machine, case.machine)
+        tickUntil("起動し直さない") { machine.state == MachineState.RUNNING && !machine.isBooting }
+        assertFalse(case.settleStoppedMachine())
+        assertEquals(ComputerStatus.RUNNING, case.status)
     }
 }

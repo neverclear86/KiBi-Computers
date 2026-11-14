@@ -212,7 +212,7 @@ public class MachineManager<K : Any> internal constructor(
     /**
      * [key] のマシンの写しを取る（[Machine.captureSnapshot]）。マシンがない・止めている間にもう取り出した・
      * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。復元の途中（[Machine.isRestoring]。終わりの知らせが返るまで）と
-     * 冷えた起動待ちは、方針によらず `null`（#589）。止めている間に取り出したら、取り出し済みの印を付ける
+     * 冷えた起動待ちは、方針によらず `null`（#589）。CRASHED の台も、方針によらず `null`（#698）。止めている間に取り出したら、取り出し済みの印を付ける
      * （[endQuiesce] で消える。マシンは [release] まで捨てない）
      */
     @JvmOverloads
@@ -232,7 +232,7 @@ public class MachineManager<K : Any> internal constructor(
     /**
      * [key] のマシンの全体の写しを取り直す（#83。差分の基準が使えず、置き場が書かなかったとき）。取り出し済みの印は見ない（立てたまま）。
      * マシンがない・[CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。復元の途中（[Machine.isRestoring]）と
-     * 冷えた起動待ちは、方針によらず `null`（#589）
+     * 冷えた起動待ちは、方針によらず `null`（#589）。CRASHED の台も `null`（#698）
      */
     public fun recapture(key: K, policy: CapturePolicy): MachineSnapshotSource? {
         val entry = entries[key] ?: return null

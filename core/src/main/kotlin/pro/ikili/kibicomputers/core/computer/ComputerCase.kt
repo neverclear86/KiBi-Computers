@@ -361,7 +361,10 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     /** 止めている間に、もう取り出した（[MachineSlot.isCaptured]） */
     public val isCaptured: Boolean get() = slot.isCaptured
 
-    /** マシンの写しを取る（[MachineSlot.capture]）。マシンがなければ `null` */
+    /**
+     * マシンの写しを取る（[MachineSlot.capture]）。マシンがない・CRASHED の台（#698）なら `null`。
+     * 写す前と後に [settleStoppedMachine] を呼ぶのは呼び手（接続層のアンロード・停止の経路）
+     */
     @JvmOverloads
     public fun capture(
         policy: CapturePolicy,
@@ -378,6 +381,34 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      */
     public fun capturer(policy: CapturePolicy, fullSaveChangedRatio: Double): SnapshotCapturer = SnapshotCapturer { deltaBase, retry ->
         if (retry) recapture(policy) else capture(policy, deltaBase, fullSaveChangedRatio)
+    }
+
+    /**
+     * 止まったマシンを、知らせを待たずに今の状態にそろえる（#698。メインスレッドで、保存の前と後に呼ぶ）。
+     * 今のマシンが CRASHED なら、[MachineHost.onStateChanged] の知らせと同じ後始末をその場でする
+     * （外して [ComputerError.CRASHED] にし、電源を切り、`events` にも CRASHED を中継する）。
+     * ゲストが止めた・起動に失敗した（復元の途中・起動の途中・再起動の途中でない STOPPED）なら、同じく STOPPED を受けた扱いで
+     * [turnOff] と同じにする（起動の失敗も [ComputerStatus.OFF] になる。どちらも電源が切れるので、セーブデータには違いが出ない）。
+     *
+     * CRASHED・STOPPED の知らせは次の [MachineManager.tick] で届くが、チャンクのアンロード・サーバーの停止では届く前に
+     * セーブデータ（`PoweredOn`）を書き、外した後の知らせは捨てられる。そのため、ここで電源を切ってから書く。
+     * 後で届く知らせは、外したマシンのものなので二重にならない（[onMachineStateChanged] と `ManagedHost.released`）。
+     * 状態を読むだけなので軽い（[Machine.state] は volatile。STOPPED のときだけ再起動の待ちをロックで読む）。
+     *
+     * @return マシンを外して電源の状態を変えたら `true`
+     */
+    public fun settleStoppedMachine(): Boolean {
+        val machine = slot.machine ?: return false
+        when (machine.state) {
+            MachineState.CRASHED -> host.onStateChanged(machine, MachineState.CRASHED, machine.crashCauseForHost)
+            MachineState.STOPPED -> {
+                // 復元の途中・冷えた起動待ちも STOPPED で、知らせを出さない。ここで電源を切ると復元を取り消してしまう
+                if (machine.isRestoring || machine.isBooting || machine.isRebootPending) return false
+                host.onStateChanged(machine, MachineState.STOPPED, null)
+            }
+            else -> return false
+        }
+        return slot.machine !== machine
     }
 
     /** チャンクがアンロードされる。マシンを外して [ComputerStatus.OFF] にする（休止は #132）。 */

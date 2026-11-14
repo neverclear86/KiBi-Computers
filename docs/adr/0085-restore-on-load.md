@@ -29,6 +29,13 @@
 
 追記（#641）: 起動に失敗したとき（`onBootFailed`。電源を入れた後・reboot の後・復元できずに冷えた起動にした後のどれも）は、`poweredOn` を偽にするだけでなく、マシンを外して状態の表示をエラー（`ComputerError.BOOT_FAILED`）にする（CRASHED と同じ後始末。接続層は結線も外す）。起動の失敗では状態の通知が出ない（ADR 0049）ので、ケースは `onBootFailed` で拾う。OFF でなくエラーにするのは、ゲストが自分で止めた正常な停止（#640）と区別し、画面をつないでいない台でも GUI で失敗が分かるようにするため。理由の詳細（`BootFailure`）はメニューに同期せず、画面のコンソールの1行に任せる。知らせが届くまでに同じマシンがもう起動し直していたら（`isRunningOrBooting`）外さない。`stop()` で取り消した起動は知らせが出ないので対象外（本番で外から `stop()` を呼ぶ道はない）。`PoweredOn` の意味と NBT は変えない（`ComputerStatus`・`ComputerError` は保存しない）。
 
+追記（#698）: CRASHED の知らせはケースに次の `MachineManager.tick` で届くので、CRASHED になってからケースが外すまでの間に保存の経路が走りうる（自動保存は同じ tick の `tick` の後、アンロード・FULL でなくなった・停止はいつでも。停止では tick が回らないので、最後の tick の後や停止の待ちの間に CRASHED になった台は必ずこの間に入る）。#671 の後段の失敗の台は `restoreHandle` を下ろすので「復元の途中」の除外にもかからない。これまでは CRASHED の台をそのまま写して書いていた（読み込むと `NO_LIVE_INIT` などの冷えた起動になり、壊れた台が電源の入ったまま動き出す）。さらに、アンロード・停止では外した後の知らせが捨てられるので、`PoweredOn` が真のまま残っていた。ゲストが止めた・起動に失敗した STOPPED の台も、電源の状態について同じだった。そこで次のようにした。
+
+- `Machine.captureCopy` は CRASHED の台を、どちらの方針でも断る（`null`。取り出しの番号・差分の基準に触らない）。#696 の「直さずにこの形」（後段の失敗の崩れた表）が置き場に書かれないことは、これで成り立つ。STOPPED は断らない（再起動の途中の `REBOOT_PENDING` の規則を守る）。`Machine.isSettlingForSave` は CRASHED で偽（再起動を求めた後に CRASHED になると `saveReadiness` が `TRANSIENT` のまま残り、解けない待ちで予算を使い切るため。ADR 0635）
+- `ComputerCase.settleStoppedMachine()` は、今のマシンが CRASHED か、ゲストが止めた・起動に失敗した STOPPED（復元の途中・起動の途中・再起動の途中でない）なら、知らせを待たずに同じ後始末をする（外す・表示・`poweredOn` を偽・`events` に中継して結線も外す）。起動に失敗した台は、ここを通ると表示が BOOT_FAILED でなく OFF になる（見分ける印は足さない。この経路の直後に、どちらもマシンを外して表示が OFF になるため）
+- 1.21.1 の `ServerMachines` は、アンロード・FULL でなくなった（`saveForUnload`）と停止（`saveForStop`）で、取り出す台を絞る前と、取り出した後に `settleStoppedMachine` を呼ぶ。アンロード・FULL でなくなったでは、変わったらチャンクに `setUnsaved(true)` を付ける（`setChanged` が効かないため。ADR 0084 の規則 4・5）。停止では `setChanged` → `saveAllChunks` で NBT に載り、CRASHED の台を warn でログに残す（core のクラッシュのログは tick で出るため）。写した後に CRASHED になった台は、写した世代が残るが、電源が切れているので戻されない。自動保存では呼ばない（次の tick で知らせが届き、チャンクは FULL なので `setChanged` が効く）
+- 保存形式（NBT のタグ・世代ファイル・`KernelStateCopy` の符号化）は変えない。変わるのは写すかどうかと、`PoweredOn=false` を書く時点だけ
+
 ## 冷えた起動にする場面（`ColdBootCause`）
 
 | 場面 | 理由 |
