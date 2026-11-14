@@ -19,6 +19,12 @@ internal class DeviceAddressSlot(private val key: String, private val onAssigned
         onAssigned()
     }
 
+    /** 新しい address を振り直す（同じマシンに同じ address がもうつながっていたとき。#129）。セーブデータに書く印を付ける */
+    fun reassign() {
+        value = DeviceAddress.random()
+        onAssigned()
+    }
+
     /** もう作ってあれば [tag] に書く */
     fun save(tag: CompoundTag) {
         value?.let { tag.putString(key, it) }

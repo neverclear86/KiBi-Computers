@@ -43,14 +43,13 @@ import kotlin.math.floor
  * - サーバーが開いたセッション [session] でだけ開く（#360）。閉じたらサーバーに知らせる。サーバーが閉じたら閉じる
  *
  * @param session サーバーが作った入力のセッションの番号
- * @param initialScreenPos 右クリックした画面（キーボードを直接右クリックしたなら null。そのときは [KeyboardInput.findScreen] で探す）
+ * @param initialScreenPos 中身を出す画面。サーバーが決める（キーボードがつながったコンピューターの画面。つながっていなければ右クリックした画面。#129）
  */
 class KeyboardInputScreen(val session: Int, val keyboardPos: BlockPos, initialScreenPos: BlockPos?) :
     Screen(Component.translatable("$PREFIX.title")) {
 
-    /** 中身を描く画面。見つからなければ null。画面が壊れたり置かれたりしたら、tick ごとに探し直す */
-    var screenPos: BlockPos? = initialScreenPos
-        private set
+    /** 中身を描く画面（サーバーが決めた位置）。なければ null。その位置の画面が壊れたら、画面がない旨を出す */
+    val screenPos: BlockPos? = initialScreenPos
 
     private val pending = ArrayList<KeyboardEvent>()
     private val text = StringBuilder()
@@ -63,7 +62,6 @@ class KeyboardInputScreen(val session: Int, val keyboardPos: BlockPos, initialSc
     private val held = LinkedHashMap<Int, Key>()
 
     override fun init() {
-        updateScreenPos()
         addRenderableWidget(
             Button.builder(Component.translatable("$PREFIX.close")) { onClose() }
                 .bounds(width - CLOSE_WIDTH - 4, 2, CLOSE_WIDTH, BAR_HEIGHT - 4)
@@ -174,12 +172,6 @@ class KeyboardInputScreen(val session: Int, val keyboardPos: BlockPos, initialSc
         return (if (pixels >= SNAP_MIN_PIXELS) floor(pixels) else pixels) / windowScale
     }
 
-    private fun updateScreenPos() {
-        val level = minecraft?.level ?: return
-        if (screenPos?.let { level.getBlockEntity(it) is ScreenBlockEntity } == true) return
-        screenPos = KeyboardInput.findScreen(level, keyboardPos)
-    }
-
     override fun keyPressed(keyCode: Int, scanCode: Int, glfwModifiers: Int): Boolean {
         val modifiers = withHeldModifiers(glfwModifiers)
         val shift = modifiers and KeyModifiers.SHIFT != 0
@@ -243,7 +235,6 @@ class KeyboardInputScreen(val session: Int, val keyboardPos: BlockPos, initialSc
             onClose()
             return
         }
-        updateScreenPos()
         flush()
     }
 
