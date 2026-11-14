@@ -90,7 +90,7 @@
   追記（#671）: `stopLocked` が `runtimes` のプロセスを終えた後に、表にあって `runtimes` に入っていない終わっていないプロセスを KILLED にする（状態と待ちを書き換えるだけ。表から外さず、fd・オブジェクトは片付けない）。
   先に KILLED にすると、採用済みの親の終わりが終わった子を刈り取る（表から外し、オブジェクトの参照を返す）ので、後にする。
   `stopLocked` は `runtimes` のプロセスしか止めないので、これがないと `awaitTermination` が返らない。`/tmp` は `stopLocked` の `checkAllDoneLocked` が外す（2回目の `onUnmounted` は何もしないので二重に返らない）。
-  `stopLocked` の一般の掃除にしないのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
+  `stopLocked` の一般の掃除にしないのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため。
   追記（#696）: 上の KILLED は終わりの記録（`ExitBookkeeping.recordExit`）を通さないので、そのプロセスについて表の不変条件が崩れたまま残る。
   `ProcessObject.status` は null のまま（終了コード・`termSignal` も入らない）、親のないものも `orphanZombies` に入らない（古い順の刈り取りにもかからない）、
   親に知らせない（`pendingChildExits`・`CHILD_EXITED`）、子の付け替えも子のゾンビの刈り取りもしない、init でも `kernel.initPid` を下ろさない、
