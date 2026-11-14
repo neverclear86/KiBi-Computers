@@ -449,7 +449,20 @@ must は「このままマージすると壊れる・ルールに反する」と
       { label: `java-api:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, agentType: 'java-api-reviewer', ...M.javaApi },
     ).then(r => r && { by: 'java-api', findings: r.findings }))
   }
-  const findings = (await parallel(reviewers)).filter(Boolean).flatMap(r => r.findings.map(f => ({ ...f, by: r.by })))
+  const results = (await parallel(reviewers)).filter(Boolean)
+  // 正しさのレビューが 1 本も返らなかったら（利用上限などでエージェントが失敗した）、Opus でやり直す。
+  // 返らなかったのを「指摘なし」と同じに扱うと、レビューなしでマージに進んでしまう
+  if (!results.some(r => r.by === 'opus' || r.by === 'fable')) {
+    log(`PR #${impl.pr}: 正しさのレビューが返らなかった。Opus でやり直す（${round}/${MAX_REVIEW_ROUNDS}）`)
+    const retry = await agent(correctness, { label: `review-retry:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...M.review })
+    if (!retry) {
+      log(`PR #${impl.pr}: やり直しのレビューも返らなかった。マージしない`)
+      record(`PR #${impl.pr}`, { stage: 'review', round, reviewFailed: true })
+      return [{ file: '-', line: null, severity: 'must', problem: 'レビューのエージェントが失敗し、この PR をレビューできなかった（やり直しも失敗）', by: 'workflow', reviewFailed: true }]
+    }
+    results.push({ by: 'opus', findings: retry.findings })
+  }
+  const findings = results.flatMap(r => r.findings.map(f => ({ ...f, by: r.by })))
   if (!findings.length) {
     record(`PR #${impl.pr}`, { stage: 'review', round, findings: [] })
     return []
@@ -472,7 +485,11 @@ ${listed}`
     findings: findings.map((f, i) => ({ ...f, confirmedByOpus: vo ? byOpus.has(i) : null, confirmedByFable: vf ? byFable.has(i) : null })),
     verifyNotes: { opus: vo?.notes ?? null, fable: vf?.notes ?? null },
   })
-  if (!vo && !vf) return findings.filter(f => f.severity === 'must')
+  if (!vo && !vf) {
+    // 検証が返らなかった（エージェントの失敗）。黙って捨てずに、指摘をすべて直す側に倒す
+    log(`PR #${impl.pr}: 指摘の検証が返らなかった。指摘 ${findings.length} 件をすべて直す`)
+    return findings
+  }
   return findings.filter((f, i) => byOpus.has(i) || byFable.has(i))
 }
 
@@ -589,6 +606,8 @@ async function runIssue(info) {
       const toFix = confirmed
       const entry = { round, confirmed, fixed: false }
       rounds.push(entry)
+      // レビューできなかったときは、直すものがない。must として残し、マージを止める
+      if (confirmed.some(f => f.reviewFailed)) break
       if (!toFix.length) break
       log(`PR #${impl.pr}: 指摘 ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
       const fixed = await agent(
