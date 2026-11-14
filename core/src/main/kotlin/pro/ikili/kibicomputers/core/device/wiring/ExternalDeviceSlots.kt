@@ -5,7 +5,9 @@ import pro.ikili.kibicomputers.api.device.Device
 
 /**
  * 他 MOD のデバイスのアダプター（[ExternalDeviceHolder]）を、位置ごとに登録表に出し入れする（#153、ADR 0153）。
- * 位置ごとに、そこを見張っている結線（[offer] した者）を数えるだけで、排他は登録表（実体の組）が受け持つ。
+ * 位置ごとに、そこを見張っている結線（[offer] した者）を数える。排他は登録表（実体の組）が受け持つ。
+ * つないでよいのは、その位置を [offer] した結線だけ（[ExternalDeviceHolder.isOfferedTo]。watcher には [MachineWiring.host] を渡す）。
+ * 位置のアダプターは1つなので、面ごとの出し分けは、これで守る
  *
  * - 結線は、隣の位置に能力のデバイスを見つけたら [offer]、なくなったら [release] する（どちらも、結線が前に見たものと
  *   変わったときだけ呼ぶ。同じ実体なら何もしない）
@@ -24,9 +26,20 @@ public class ExternalDeviceSlots<K : Any>(private val registry: DeviceRegistry<K
         public fun create(key: K, device: Device): ExternalDeviceHolder<K>
     }
 
-    private class Slot<K : Any>(var holder: ExternalDeviceHolder<K>) {
+    private class Slot<K : Any>(holder: ExternalDeviceHolder<K>) {
         val watchers = ArrayList<Any>(1)
         var entry: DeviceRegistry.Entry<K>? = null
+
+        // 持ち主を替えるときも、見張りの表を渡し直す（つないでよいのは offer した結線だけ。ExternalDeviceHolder.isOfferedTo）
+        var holder: ExternalDeviceHolder<K> = holder
+            set(value) {
+                field = value
+                value.offeredTo = watchers
+            }
+
+        init {
+            holder.offeredTo = watchers
+        }
     }
 
     private val slots = HashMap<K, Slot<K>>()

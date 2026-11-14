@@ -45,7 +45,10 @@ public class DeviceRegistry<K : Any> {
      * 同じ実体（[DeviceHolder.exclusionKey]）の登録の組（実行時だけ。保存しない）。[ownerEntry] は、組の中で今つないでいる登録
      * （[Entry.owner] と一緒に立てて、一緒に下ろす）
      */
-    internal class Group<K : Any> {
+    internal class Group<K : Any>(
+        /** 組の実体（[DeviceHolder.exclusionKey]）。空になったときに、表から直接外すためのキー */
+        val key: Any,
+    ) {
         val entries = ArrayList<Entry<K>>(1)
         var ownerEntry: Entry<K>? = null
     }
@@ -79,7 +82,7 @@ public class DeviceRegistry<K : Any> {
             if (it.holder === holder) return it
             remove(it)
         }
-        val group = holder.exclusionKey?.let { groups.getOrPut(it) { Group() } }
+        val group = holder.exclusionKey?.let { groups.getOrPut(it) { Group(it) } }
         val entry = Entry(key, holder, ++lastGeneration, group)
         group?.entries?.add(entry)
         entries[key] = entry
@@ -115,7 +118,8 @@ public class DeviceRegistry<K : Any> {
                 // 同じ実体のほかの位置が空いた（見張っている結線に知らせる。持ち主の結線には下の onEntryRemoved が頼む）
                 for (other in group.entries) notifyWatchers(other.key, except = entry.owner)
             }
-            if (group.entries.isEmpty()) groups.values.removeIf { it === group }
+            // 実体のキーで直接外す（表をなめない。一斉アンロードで N 台が外れても、1つずつ O(1)）
+            if (group.entries.isEmpty() && groups[group.key] === group) groups.remove(group.key)
         }
         val owner = entry.owner ?: return
         entry.owner = null

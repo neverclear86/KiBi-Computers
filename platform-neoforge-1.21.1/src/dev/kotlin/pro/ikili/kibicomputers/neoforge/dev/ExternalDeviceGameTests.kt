@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.neoforge.dev
 
 import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
 import net.minecraft.core.GlobalPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
@@ -355,6 +356,59 @@ object ExternalDeviceGameTests {
             helper.assertTrue(reactor.log == listOf("attached", "detached", "attached"), "attach and detach should alternate: ${reactor.log}")
             cleanUp(helper, listOf(a, b), pos)
             helper.succeed()
+        }
+    }
+
+    /**
+     * 面ごとの出し分け: 西の面（ケース a）にだけ出すブロックを、東のケース b はつながない。a の最初のつなぎが失敗して持ち主がいない間も、
+     * 電源を入れ直しても、b は拾わない（位置のアダプターは1つでも、つなげるのは出した面のケースだけ）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun onlyTheOfferingFaceCanConnect(helper: GameTestHelper) {
+        val pos = CENTER
+        helper.setBlock(pos, Blocks.LODESTONE)
+        val abs = helper.absolutePos(pos)
+        val reactor = TestReactor(TestReactor.KIND).apply { attachFailures = 1 }
+        TestDevices.behave(abs) { side -> if (side == Direction.WEST) reactor else null }
+        val a = placeCase(helper, CENTER.west())
+        val b = placeCase(helper, CENTER.east())
+        powerOn(helper, a)
+        helper.assertTrue(foreign(a).isEmpty() && reactor.attachCalls == 1, "a's first attach should fail")
+        powerOn(helper, b)
+        helper.assertTrue(b.wiring.capabilityAt(Direction.WEST) == null, "b's face should not see the device")
+        helper.runAfterDelay(5) {
+            helper.assertTrue(foreign(b).isEmpty(), "b should not take a device it is not offered: ${foreign(b)}")
+            helper.assertTrue(reactor.attachCalls == 1, "nobody should try again: ${reactor.attachCalls}")
+            cleanUp(helper, listOf(a, b), pos)
+            helper.succeed()
+        }
+    }
+
+    /**
+     * 面ごとの出し分けの変更: a がつないだ後で、a の面だけ出すのをやめると a は外れ、出している b がつなぐ
+     * （位置のアダプターは、b が出している間は残る）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun withdrawingOneFaceDetachesThatCaseAndHandsOver(helper: GameTestHelper) {
+        val pos = CENTER
+        helper.setBlock(pos, Blocks.LODESTONE)
+        val abs = helper.absolutePos(pos)
+        val reactor = TestReactor(TestReactor.KIND)
+        TestDevices.behave(abs) { reactor }
+        val a = placeCase(helper, CENTER.west())
+        val b = placeCase(helper, CENTER.east())
+        powerOn(helper, a)
+        powerOn(helper, b)
+        helper.assertTrue(foreign(a) == listOf(reactor) && foreign(b).isEmpty(), "a should own the device")
+        TestDevices.behave(abs) { side -> if (side == Direction.EAST) reactor else null }
+        invalidate(helper, pos)
+        helper.succeedWhen {
+            helper.assertTrue(foreign(a).isEmpty(), "a withdrew its face, so it should detach: ${foreign(a)}")
+            helper.assertTrue(foreign(b) == listOf(reactor), "b, which is offered the device, should take it: ${foreign(b)}")
+            helper.assertTrue(reactor.log == listOf("attached", "detached", "attached"), "attach and detach should alternate: ${reactor.log}")
+            cleanUp(helper, listOf(a, b), pos)
         }
     }
 }

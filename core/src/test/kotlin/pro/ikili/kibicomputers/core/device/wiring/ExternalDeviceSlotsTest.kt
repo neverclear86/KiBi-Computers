@@ -40,7 +40,10 @@ class ExternalDeviceSlotsTest {
 
     private class Host(val neighbors: List<String>) : MachineWiring.Host<String> {
         override fun neighborKeys(): List<String> = neighbors
-        override fun scheduleRewire() {}
+        var rescheduled = 0
+        override fun scheduleRewire() {
+            rescheduled++
+        }
     }
 
     private val factory = ExternalDeviceSlots.Factory<String> { key, device -> ExternalDeviceHolder(key, device, Addresses()) }
@@ -111,10 +114,12 @@ class ExternalDeviceSlotsTest {
             val registry = DeviceRegistry<String>()
             val slots = ExternalDeviceSlots(registry)
             val d = Foreign()
-            val a = MachineWiring(registry, Host(listOf("p1")))
-            val b = MachineWiring(registry, Host(listOf("p2")))
-            slots.offer("p1", a, d, factory)
-            slots.offer("p2", b, d, factory)
+            val ha = Host(listOf("p1"))
+            val hb = Host(listOf("p2"))
+            val a = MachineWiring(registry, ha)
+            val b = MachineWiring(registry, hb)
+            slots.offer("p1", ha, d, factory)
+            slots.offer("p2", hb, d, factory)
             val ma = h.machine()
             val mb = h.machine()
             a.attach(ma)
@@ -123,6 +128,62 @@ class ExternalDeviceSlotsTest {
             assertEquals(1, registry.groupCount)
             // address はつないだ位置のもの
             assertEquals(slots.holderAt("p1")!!.deviceAddress, ma.devices.list().single().address)
+            a.disconnect()
+            b.disconnect()
+        }
+    }
+
+    @Test
+    fun `offerした結線だけがつなぎ、出していない隣のケースはつながない`() = timeout(limit) {
+        Harness().use { h ->
+            val registry = DeviceRegistry<String>()
+            val slots = ExternalDeviceSlots(registry)
+            val d = Foreign()
+            val ha = Host(listOf("p"))
+            val hb = Host(listOf("p"))
+            val a = MachineWiring(registry, ha)
+            val b = MachineWiring(registry, hb)
+            // a だけが p に出している（b の面では出していない）
+            slots.offer("p", ha, d, factory)
+            val ma = h.machine()
+            val mb = h.machine()
+            b.attach(mb)
+            assertEquals(0, mb.devices.size, "出していない結線はつながない（持ち主がいなくても）")
+            a.attach(ma)
+            assertEquals(1, ma.devices.size)
+            // a が手放した後も、b はつながない
+            a.disconnect()
+            b.rewire()
+            assertEquals(0, mb.devices.size)
+            b.disconnect()
+        }
+    }
+
+    @Test
+    fun `出すのをやめた結線は、ほかの結線が出している間も、次のつなぎ直しで外す`() = timeout(limit) {
+        Harness().use { h ->
+            val registry = DeviceRegistry<String>()
+            val slots = ExternalDeviceSlots(registry)
+            val d = Foreign()
+            val ha = Host(listOf("p"))
+            val hb = Host(listOf("p"))
+            val a = MachineWiring(registry, ha)
+            val b = MachineWiring(registry, hb)
+            slots.offer("p", ha, d, factory)
+            slots.offer("p", hb, d, factory)
+            val ma = h.machine()
+            val mb = h.machine()
+            a.attach(ma)
+            b.attach(mb)
+            assertEquals(1, ma.devices.size)
+            assertEquals(0, mb.devices.size, "a が持っている")
+            slots.release("p", ha)
+            assertEquals(1, slots.watcherCount("p"), "b がまだ出している")
+            a.rewire()
+            assertEquals(0, ma.devices.size, "a は出すのをやめたので外れる")
+            assertTrue(hb.rescheduled > 0, "空いたことが b に知らされる")
+            b.rewire()
+            assertEquals(1, mb.devices.size, "出している b がつなぐ")
             a.disconnect()
             b.disconnect()
         }

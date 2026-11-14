@@ -17,6 +17,8 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  *   tick ごとに見回らない
  * - つないだデバイスの持ち主が登録表から外れたら（壊れた・アンロードした）、すぐにマシンから外す（`device-detached` は `DeviceBus` が出す。#67）
  * - 手放すとき（[disconnect]・候補から外れた）は、見張っているほかの結線に知らせる（空いたら次へ）
+ * - 持ち主が結線に出していなければ（[DeviceHolder.isOfferedTo]。他 MOD のデバイスを別の面のケースだけが出している）つながない。
+ *   つないだ後で出さなくなったら、次のつなぎ直しで外す
  * - 同じ実体（[DeviceHolder.exclusionKey]）の登録は、どれか1つを通してだけつなぐ（#153、ADR 0153。[DeviceRegistry.isFreeFor]）
  * - 持ち主やデバイス（他 MOD のコード）が投げた例外は受けて、つながずに手放す（[Host.onAttachFailed]・[Host.onDetachFailed]。
  *   JVM が続けられないもの（[rethrowIfFatal]）だけ投げ直す）。**つなぐときに投げた登録は、この結線では同じ登録（世代）の間は
@@ -135,7 +137,9 @@ public class MachineWiring<K : Any>(
         val reach = HashSet<K>(neighbors)
         for (c in connections) if (c.entry.key in neighbors) reach.addAll(c.entry.holder.relayKeys())
         for (c in connections.toTypedArray()) {
-            if (c.entry.key !in reach || registry[c.entry.key] !== c.entry) disconnectOne(c, removed = false)
+            if (c.entry.key !in reach || registry[c.entry.key] !== c.entry || !c.entry.holder.isOfferedTo(host)) {
+                disconnectOne(c, removed = false)
+            }
         }
     }
 
@@ -155,6 +159,8 @@ public class MachineWiring<K : Any>(
         }
         val holder = entry.holder
         if (relayed && !holder.relayable) return
+        // 持ち主が、この結線には出していない（他 MOD のデバイスを、ほかの面のケースだけが出している）。見張りは続ける
+        if (!holder.isOfferedTo(host)) return
         if (!registry.isFreeFor(entry, this)) return
         tryConnect(m, entry)
     }

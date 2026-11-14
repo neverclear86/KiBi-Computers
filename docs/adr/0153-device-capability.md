@@ -39,6 +39,11 @@
 - 能力で見つけた位置は、どれも位置ごとのアダプター（`ExternalDeviceHolder`。`DeviceHolder` を実装する）として、内蔵と同じ登録表（ADR 0129）に載せる。
   つなぐ規則（候補の順、上限、address の振り直し、外れたらすぐ外す）は内蔵と同じ
 - `ExternalDeviceSlots` は、位置ごとに見張っている結線を数えるだけ。最初の結線が来たら載せ、最後の結線が去ったら外す（外し忘れで登録表が増え続けないように）
+- **つなげるのは、その位置を `offer` した結線だけ**（`DeviceHolder.isOfferedTo`。内蔵は既定で `true`）。アダプターは位置ごとに1つで、
+  どの結線も隣の6位置を候補として引くので、これがないと、面ごとの出し分け（上面にだけ出すなど）が守られない。出していない面の隣のケースが、
+  持ち主が断った・投げた・まだ rewire していない間にアダプターを拾えてしまう。`MachineWiring` は、出していない持ち主を飛ばし（`visit`。見張りは続ける）、
+  つないだ後で出さなくなった（`release` した）持ち主は、次のつなぎ直しで外す（`prune`。手放すので、出している結線に知らせる）。
+  `offer` の watcher には `MachineWiring.host` を渡す（`ExternalDeviceHolder.offeredTo` が見張りの表をそのまま共有する）
 - 内蔵（画面・キーボード）が載っている位置には載せない（内蔵を優先する）。アダプターの後に内蔵が置き換えたら、手放しても内蔵の登録は外さない
 - アダプターは、つなぐたびにデバイスを `GuardedDevice` で包む（`kind`・`methods` を1回だけ読む）。能力が消えた・替わった（`retire`）後、
   マシンから外れるまでの間の呼び出しは `failed("device unavailable")` にする（外すのは tick の終わりなので、その間にメインスレッドの呼び出しが届きうる）
@@ -51,7 +56,7 @@
 - 単位は位置ではなく実体。マルチブロックの各部が同じ実体を返すと、位置ごとの排他では、隣り合う2台のケースが同じ実体を別の位置からつなぎ、
   `onAttached` が2回続けて呼ばれる。`DeviceHolder.exclusionKey`（内部。既定 `null`）に、アダプターは能力が返した生の `Device` を返す
 - `DeviceRegistry` は `IdentityHashMap<実体, Group>` を持つ。`Group` は同じ実体の登録（キー）と、今つないでいる登録 `ownerEntry` を持つ。
-  `register` で `exclusionKey` を1回読んで足し、`remove`・`clear` で抜く（組が空になったら消す）。`Group` は実行時だけで保存しない
+  `register` で `exclusionKey` を1回読んで足し、`remove`・`clear` で抜く（組が空になったら、実体のキーで直接消す。表をなめない。多数台の一斉アンロードで O(N²) にならないように）。`Group` は実行時だけで保存しない
 - `Entry.owner` と `Group.ownerEntry` は一緒に立てて（`claim`）、一緒に下ろす（`drop`）。下ろすのは、つなげなかったとき（`tryConnect` の `finally`）、
   外したとき（`disconnectOne`）、登録が外れたとき（`remove`）。下ろしたら、同じ実体のすべてのキーを見張っている結線に知らせる（下ろした本人を除く）
 - 候補を引くとき、`Group.ownerEntry` がほかの登録なら飛ばす（持ち主が自分でも飛ばす。1台のケースが同じ実体の2つの位置に触れても、1回だけつなぐ）

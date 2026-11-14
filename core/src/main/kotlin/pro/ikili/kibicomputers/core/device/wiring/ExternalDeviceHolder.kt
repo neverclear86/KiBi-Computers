@@ -7,6 +7,8 @@ import pro.ikili.kibicomputers.api.device.Device
  * 他 MOD のブロックが能力で出したデバイス（[device]）を、位置 [key] の持ち主として登録表に載せるアダプター（#153、ADR 0153）。
  * 位置ごとに1つ作る（[ExternalDeviceSlots] が出し入れする）。
  *
+ * - つないでよいのは、その位置を [ExternalDeviceSlots.offer] した結線だけ（[isOfferedTo]）。位置ごとに1つのアダプターを、
+ *   面ごとの出し分けとは関係なく、隣のほかのケースがつなぐのを防ぐ
  * - 排他の単位は実体（[exclusionKey] は [device]）。同じ実体を複数の位置で出しても、つながるマシンは1台だけ
  * - address は [addresses] が持つ（接続層: ブロックエンティティがあればそのデータ添付、なければ座標から決めたもの）。
  *   読み書きは他 MOD のブロックエンティティに触るので、投げうる（[MachineWiring] が受ける）
@@ -39,6 +41,14 @@ public class ExternalDeviceHolder<K : Any>(
         private set
 
     override val exclusionKey: Any get() = device
+
+    /**
+     * この位置を [ExternalDeviceSlots.offer] した結線（[MachineWiring.host]）。[ExternalDeviceSlots] が、位置の見張りの表をそのまま
+     * 渡す（同じ表を共有するので、出し入れが自動で映る）。`null`（スロットを通さずに作った）なら、制限しない
+     */
+    internal var offeredTo: List<Any>? = null
+
+    override fun isOfferedTo(host: MachineWiring.Host<K>): Boolean = offeredTo?.any { it === host } ?: true
 
     override val deviceAddress: String get() = addresses.read()
 

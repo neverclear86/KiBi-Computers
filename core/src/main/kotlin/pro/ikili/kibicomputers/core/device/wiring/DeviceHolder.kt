@@ -49,4 +49,12 @@ public interface DeviceHolder<K : Any> {
      * 登録表に載せるときに1回だけ読み、その登録の間は変えない
      */
     public val exclusionKey: Any? get() = null
+
+    /**
+     * [host] の結線が、この持ち主をつないでよいか（#153、ADR 0153）。既定は `true`（内蔵は、隣に載っていればどの結線もつなぐ）。
+     * 他 MOD のデバイスのアダプターは、その位置を [ExternalDeviceSlots.offer] した結線（能力をその面で出している結線）だけ `true` を返す。
+     * 位置ごとに1つのアダプターを、面ごとの出し分け（上面にだけ出すなど）に関係なく、ほかの面のケースがつなぐのを防ぐ。
+     * 手放された（`false` になった）持ち主は、結線が次のつなぎ直しで外す
+     */
+    public fun isOfferedTo(host: MachineWiring.Host<K>): Boolean = true
 }

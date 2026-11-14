@@ -30,6 +30,7 @@ import java.util.UUID
  *
  * スレッド: サーバーのメインスレッドからだけ使う。
  */
+// watcher は、ケースの結線（MachineWiring.host）。登録表のアダプターは、出した結線だけがつなげる
 internal class CapabilityNeighbors(private val watcher: Any, private val onInvalidated: Runnable) {
     private val caches = arrayOfNulls<BlockCapabilityCache<Device, Direction?>>(FACES.size)
     private val keys = arrayOfNulls<GlobalPos>(FACES.size)
