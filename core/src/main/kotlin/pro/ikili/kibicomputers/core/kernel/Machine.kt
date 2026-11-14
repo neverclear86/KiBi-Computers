@@ -2833,6 +2833,7 @@ public class Machine private constructor(
             val claim = lock.withLockValue {
                 if (!runningSteadyLocked()) return
                 if (cleanup) unmountStaleDisksLocked()
+                val firmwareRoot = kernel.mounts.at(VfsPath.ROOT)?.source == MachineLimits.FIRMWARE_SOURCE
                 for (insertion in inserted.values) {
                     if (insertion.handled) continue
                     val existing = kernel.mounts.bySource(diskSource(insertion.diskId))
@@ -2840,6 +2841,12 @@ public class Machine private constructor(
                         // システムコールでマウントしたものなど
                         insertion.handled = true
                         postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, existing.point.toString())
+                        continue
+                    }
+                    if (firmwareRoot) {
+                        // プログラムだけの起動（ADR 0099）: ディスクは自動でマウントしない。開かず、位置の空の disk-inserted で知らせるだけ
+                        insertion.handled = true
+                        postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, "")
                         continue
                     }
                     // ほかの持ち主が開いている途中なら飛ばす（その持ち主がマウントせずに外したら積み直される）
@@ -3149,6 +3156,19 @@ public class Machine private constructor(
             vfs.mountLocked(VfsPath.ROOT, volume.fs, volume.readOnly, "${MachineLimits.DISK_SOURCE_PREFIX}$diskId")
             markHandledLocked(claim)
             releaseLocked(claim)
+            true
+        }
+    }
+
+    /**
+     * 起動部品のプログラムを置いた [fs] を `/` にマウントする（起動用のスレッドから。プログラムだけの起動。#99）。
+     * ディスクではないので予約は要らない。取り消されていたら何もせず `false`
+     */
+    internal fun mountFirmwareRoot(fs: FileSystem): Boolean {
+        vfs.checkMountPoint(VfsPath.ROOT)
+        return lock.withLockValue {
+            if (bootCancelled) return@withLockValue false
+            vfs.mountLocked(VfsPath.ROOT, fs, readOnly = true, source = MachineLimits.FIRMWARE_SOURCE)
             true
         }
     }
@@ -3844,6 +3864,9 @@ internal object MachineLimits {
 
     /** `/dev`（デバイスファイル。#485）のマウントの `source` */
     internal const val DEV_SOURCE: String = "dev"
+
+    /** プログラムだけで起動したときの根（起動部品のプログラムを置いた読み取り専用の FS。#99、ADR 0099）のマウントの `source` */
+    internal const val FIRMWARE_SOURCE: String = "firmware"
 
     /** `/dev` をマウントする場所 */
     internal val DEV_PATH: VfsPath = VfsPath.parse("/dev")

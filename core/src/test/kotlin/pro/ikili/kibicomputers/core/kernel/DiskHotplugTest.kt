@@ -420,6 +420,34 @@ class DiskHotplugTest {
     }
 
     @Test
+    fun `プログラムだけで起動した台に動いている間にディスクを挿しても、マウントせず開かずに位置の空のdisk-insertedを1回出す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val config = BootConfig.builder().firmwareProgram(resource("prompt-wasi.wasm")).build()
+            val b = boot(h, disks = Disks(rootFs()), config = config)
+            val m = b.m
+            val before = m.mountPoints()
+            assertEquals(mapOf("/" to "firmware", "/tmp" to "tmp", "/dev" to "dev"), before)
+            val q = m.subscribeAll()
+            val runs = m.autoMountRuns.get()
+            assertFalse(m.disksChanged(snapshot("d1")))
+            // 根が firmware の台は自動マウントしない（ADR 0099）: 開かず、位置の空の disk-inserted を1回出す
+            eventually(10_000, "disk-inserted が来ない") { m.diskEvents(q).isNotEmpty() }
+            assertEquals(listOf(Triple("disk-inserted", "d1", "")), m.diskEvents(q))
+            Thread.sleep(200)
+            assertEquals(listOf(Triple("disk-inserted", "d1", "")), m.diskEvents(q), "イベントは1回だけ")
+            assertEquals(before, m.mountPoints(), "マウントを増やさない")
+            assertEquals(0, b.disks.opened("d1"), "位置が使えなければ開かない")
+            assertEquals(0, m.diskClaimCount)
+            assertTrue(m.autoMountRuns.get() - runs <= 2, "回り続ける: ${m.autoMountRuns.get() - runs}")
+            assertEquals(MachineState.RUNNING, m.state)
+            // 抜くと、マウントがないので位置の空の disk-removed
+            assertFalse(m.disksChanged(DiskSnapshot.EMPTY))
+            assertEquals(listOf(Triple("disk-inserted", "d1", ""), Triple("disk-removed", "d1", "")), m.diskEvents(q))
+            m.close()
+        }
+    }
+
+    @Test
     fun `開けないディスクでは、自動マウントの仕事が回り続けない`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val b = boot(h, "root")

@@ -31,6 +31,8 @@ class KibiFsListTest {
         assertEquals(KibiFs.Kind.IMAGE, KibiFs.kindOf("disk:image:os"))
         assertEquals(KibiFs.Kind.TMP, KibiFs.kindOf("tmp"))
         assertEquals(KibiFs.Kind.DEV, KibiFs.kindOf("dev"))
+        // プログラムだけで起動した台の `/`（ADR 0099）は、メモリ上の読み取り専用の FS なので image
+        assertEquals(KibiFs.Kind.IMAGE, KibiFs.kindOf("firmware"))
         assertEquals(KibiFs.Kind.DISK, KibiFs.kindOf("test:root"))
         assertEquals(KibiFs.Kind.DISK, KibiFs.kindOf(""))
         // 判別子は WIT の enum fs-kind の順
