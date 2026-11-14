@@ -6,7 +6,12 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
+import pro.ikili.kibicomputers.core.device.DeviceHandle
+import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
@@ -19,7 +24,12 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.tty.TtySize
+import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.FileType
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -94,7 +104,13 @@ class MachineRestoreTest {
     /**
      * `prompt` を init として動かし、入力を待ったところで置き場に書き、マシンを閉じる。根は `disk:root`（[root] を開く口を [h] に入れる）
      */
-    private fun saveWaitingPrompt(h: Harness, store: MachineSaveStore, root: TestMemoryFileSystem, tmpBytes: Int = 0): Saved {
+    private fun saveWaitingPrompt(
+        h: Harness,
+        store: MachineSaveStore,
+        root: TestMemoryFileSystem,
+        tmpBytes: Int = 0,
+        beforeSave: (Machine) -> Unit = {},
+    ): Saved {
         // 戻すマシンには、新しい空のファイルシステムを渡す（閉じたマシンの根は使わない）
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
         val m = h.machine(fuelPerTick = 10_000_000)
@@ -120,6 +136,7 @@ class MachineRestoreTest {
             h.scheduler.tick()
             m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
         }
+        beforeSave(m)
         val identity = store.assignNewId(owner)!!
         val written = store.write(identity, owner, m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
         m.close()
@@ -238,6 +255,49 @@ class MachineRestoreTest {
                 h.scheduler.tick()
                 m.state == MachineState.STOPPED
             }
+            m.close()
+        }
+    }
+
+    private object TestDevice : Device {
+        override val kind = "test:device"
+        override val methods: DeviceMethods = DeviceMethods.builder().build()
+    }
+
+    @Test
+    fun `devの開いたファイルとデバイスのハンドルは戻り、戻したdevもデバイスの表と乱数の元を使う`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val address = "00000000-0000-4000-8000-000000000054"
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            var randomId = 0
+            var handleId = 0
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem()) { m ->
+                m.vfs.createDirectory(VfsPath.parse("/dev"))
+                assertNull(m.mountDev())
+                assertTrue(m.devices.attach(address, TestDevice))
+                val random = m.vfs.open(VfsPath.parse("/dev/random"), OpenOptions(read = true))
+                m.lock.withLockValue {
+                    randomId = m.kernel.objects.add(random)
+                    handleId = m.kernel.objects.add(DeviceHandle(address, TestDevice.kind))
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "復元が終わらない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
+            val (random, handle) = m.lock.withLockValue { m.kernel.objects[randomId] as OpenFile to m.kernel.objects[handleId] as DeviceHandle }
+            assertEquals(DevFileSystem.RANDOM_NODE, random.node)
+            assertEquals(16, m.vfs.pread(random, 0, ByteArray(16), 0, 16), "保存した node のまま読める")
+            assertEquals(DeviceInfo(address, TestDevice.kind), handle.info)
+            // 戻した /dev も、このマシンのデバイスの表を見る
+            assertEquals(Errno.NOENT, assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/dev/device/$address")) }.errno)
+            assertTrue(m.devices.attach(address, TestDevice))
+            assertEquals(FileType.CHARACTER_DEVICE, m.vfs.stat(VfsPath.parse("/dev/device/$address")).type)
             m.close()
         }
     }

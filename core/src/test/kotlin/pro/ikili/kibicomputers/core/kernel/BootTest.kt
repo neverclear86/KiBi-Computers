@@ -872,13 +872,14 @@ class BootTest {
     }
 
     @Test
-    fun `devにnull・zero・ttyが見える`() = env {
+    fun `devにnull・zero・random・tty・deviceが見える`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))
         tickUntil { m.state == MachineState.RUNNING && host.console.contains("booting") }
-        for (name in listOf("null", "zero", "tty")) {
+        for (name in listOf("null", "zero", "random", "urandom", "tty")) {
             assertEquals(FileType.CHARACTER_DEVICE, m.vfs.stat(VfsPath.parse("/dev/$name")).type, name)
         }
+        assertEquals(FileType.DIRECTORY, m.vfs.stat(VfsPath.parse("/dev/device")).type)
     }
 
     @Test

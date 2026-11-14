@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.device.DeviceHandle
+import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.RecordingSink
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -18,6 +20,7 @@ import pro.ikili.kibicomputers.core.kernel.process.Process
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DeviceDirectory
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -265,5 +268,64 @@ class FdTableTest {
         val f = fds.openFile(vfs.open(VfsPath.parse("/f"), OpenOptions(read = true, write = true, create = true)), vfs, tty, HandleRights.ALL)
         assertNotEquals(tty, fds.entry(f).objectId)
         assertEquals(1, kernel.objects.refCount(tty))
+    }
+
+    // ---- /dev/device/<address>（#54） ----
+
+    private class Devices : DeviceDirectory {
+        val table = LinkedHashMap<String, String>()
+
+        override fun list(): List<DeviceInfo> = table.map { DeviceInfo(it.key, it.value) }
+
+        override fun kindOf(address: String): String? = table[address]
+    }
+
+    private val address = "123e4567-e89b-12d3-a456-426614174000"
+
+    private fun deviceVfs(devices: Devices): Vfs = Vfs(kernel.mounts).also {
+        it.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "tmp")
+        it.mount(VfsPath.parse("/dev"), DevFileSystem(devices = devices), readOnly = false, source = "dev")
+    }
+
+    @Test
+    fun `openFileのdev_deviceはDeviceHandleを指し、読み書きはNOSYS`() {
+        val devices = Devices().also { it.table[address] = "kibi:screen" }
+        val vfs = deviceVfs(devices)
+        val file = vfs.open(VfsPath.parse("/dev/device/$address"), OpenOptions(read = true, write = true, truncate = true))
+        val fd = fds.openFile(file, vfs, 0, HandleRights.READ or HandleRights.WRITE)
+        val handle = fds.objectOf(fd) as DeviceHandle
+        assertEquals(DeviceInfo(address, "kibi:screen"), handle.info)
+        assertEquals(HandleRights.READ or HandleRights.WRITE, fds.entry(fd).rights, "権利は開いたときに求めたもの")
+        val buf = ByteArray(4)
+        assertEquals(IoResult.Error(Errno.NOSYS), FdIo.readLocked(kernel, vfs, sink, 1, fd, buf, 0, 4))
+        assertEquals(IoResult.Error(Errno.NOSYS), FdIo.writeLocked(kernel, vfs, sink, 1, fd, buf, 0, 4))
+        // 複製は同じハンドルを指し、閉じると参照が減る
+        val d = fds.dup(fd)
+        assertSame(handle, fds.objectOf(d))
+        assertEquals(2, kernel.objects.refCount(handle.id))
+        fds.close(fd)
+        fds.close(d)
+        assertNull(kernel.objects[handle.id])
+    }
+
+    @Test
+    fun `openFileのdev_deviceは開く途中で外れたらNOENTで、満杯ならMFILE`() {
+        val devices = Devices().also { it.table[address] = "kibi:screen" }
+        val vfs = deviceVfs(devices)
+        val file = vfs.open(VfsPath.parse("/dev/device/$address"), OpenOptions(read = true))
+        devices.table.clear()
+        val before = kernel.objects.size
+        assertEquals(Errno.NOENT, errno { fds.openFile(file, vfs, 0, HandleRights.READ) })
+        assertEquals(0, fds.size)
+        assertEquals(before, kernel.objects.size)
+        // つなぎ直したら開ける（種類は今つないでいるもの）
+        devices.table[address] = "kibi:keyboard"
+        repeat(DEFAULT_HANDLE_LIMIT) { fds.open(Obj()) }
+        val objects = kernel.objects.size
+        assertEquals(Errno.MFILE, errno { fds.openFile(file, vfs, 0, HandleRights.READ) })
+        assertEquals(objects, kernel.objects.size, "満杯なら表に足さない")
+        fds.close(0)
+        val fd = fds.openFile(file, vfs, 0, HandleRights.READ)
+        assertEquals("kibi:keyboard", (fds.objectOf(fd) as DeviceHandle).kind)
     }
 }

@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProgramLoadBusyException
 import pro.ikili.kibicomputers.core.kernel.process.SnapshotCapableDriver
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DeviceDirectory
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -525,7 +526,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
                     TmpFileSystem.restore(machine.memoryAccount, { machine.environment.clock.realtimeNanos() }, tmp.snapshot)
                         ?: fallback(ColdBootCause.NO_MEMORY, "${entry.point} の中身の RAM が足りない")
                 }
-                source == MachineLimits.DEV_SOURCE -> DevFileSystem()
+                source == MachineLimits.DEV_SOURCE -> DevFileSystem(machine.environment.entropy, DeviceDirectory.of(machine.devices))
                 else -> fallback(ColdBootCause.MOUNT, "知らないマウント $source（${entry.point}）")
             }
             out[entry.id] = fs

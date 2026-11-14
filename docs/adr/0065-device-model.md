@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #65（task）。前提: ADR 0043（カーネル）・0044（カーネルと接続層の境界）・0355（表示デバイス）、#271（呼び方「デバイス」）
-- 後続: #66（開いたデバイスからの呼び出しの口、接続数の上限。ADR 0066 で済んだ）、#67（接続・切断のイベント）、#77（WASM に出す）、#54（`/dev/device`）、
+- 後続: #66（開いたデバイスからの呼び出しの口、接続数の上限。ADR 0066 で済んだ）、#67（接続・切断のイベント）、#77（WASM に出す）、#54（`/dev/device`。ADR 0054 で済んだ）、
   #94（Lua の `device`）、#129（隣接の検出と登録表）、#153（`BlockCapability` と作者向けの説明）、#326（キー入力のイベント）、
   #81・#82（保存のバイトの形）、#356（サーバー全体の予算）、#224（1.20.1 への移植）
 - 番号は Issue 番号にそろえている
@@ -85,7 +85,7 @@
 - `resource device`（`open`・`info`・`methods`・`invoke`・`start`）、`resource pending-call`（`take`）
 - 値の case 名は `kibi:kernel/events` の `event-value` と同じ「値の種類」の言葉にした。`event-value` は #65 で `%s64`・`%f64`・`%bool` から `integer`・`float`・`boolean` に改名した（Kotlin の `EventValue.I64`・`F64`・`Bool` も `Integer`・`Float`・`Boolean` に。ABI・保存形式は変わらない）
 - 判別子の番号は合わない: `value` は none=0・integer=1・float=2・boolean=3・text=4・bytes=5、`event-value` は integer=0・float=1・boolean=2・text=3・bytes=4。カーネルの中では番号でなく種類で写すので困らない
-- `/dev/device/<address>` を開くと `device` resource と同じ fd になる（Q5。実装は #54）。Lua の `device.list()` などは #94
+- `/dev/device/<address>` を開くと `device` resource と同じ fd になる（Q5。#54 で実装した。ADR 0054）。Lua の `device.list()` などは #94
 
 ## 公開 API（Q4、`pro.ikili.kibicomputers.api.device`）
 
