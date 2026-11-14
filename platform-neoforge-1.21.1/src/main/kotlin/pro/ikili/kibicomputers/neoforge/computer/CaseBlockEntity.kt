@@ -27,7 +27,6 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
-import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
@@ -117,20 +116,28 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     private var quietChange = false
 
     /**
-     * 止まった台を知らせの前にそろえる（#698。[ComputerCase.settleStoppedMachine]）。CRASHED の原因は、外すと知らせも tick も届かないので、
-     * ここでログに残す。[quiet] なら、電源の状態が変わっても `setChanged` を呼ばない（アンロード・FULL でなくなったチャンクの経路。
-     * 呼び手がチャンクに `isUnsaved` を付ける）
+     * 止まった台を知らせの前にそろえる（#698。[ComputerCase.settleStoppedMachine]）。CRASHED の原因は、core がマネージャーの
+     * エラーの出し先（[ServerMachines] のログ）に1回だけ出す（後で知らせが届いても重ねない）。[quiet] なら、電源の状態が変わっても
+     * `setChanged` を呼ばない（アンロード・FULL でなくなったチャンクの経路。呼び手がチャンクに `isUnsaved` を付ける）
      *
      * @return 電源の状態を変えた
      */
     internal fun settleStopped(quiet: Boolean): Boolean {
-        val errors = MachineErrorListener { message, error -> LOGGER.error("Computer at {}: {}", blockPos, message, error) }
         quietChange = quiet
         try {
-            return computer.settleStoppedMachine(errors)
+            return computer.settleStoppedMachine()
         } finally {
             quietChange = false
         }
+    }
+
+    /** [setChanged] を呼んだ回数（テスト・#698 用。[settleStopped] の `quiet` を確かめる。メモリにだけ持つ） */
+    internal var setChangedCalls: Int = 0
+        private set
+
+    override fun setChanged() {
+        setChangedCalls++
+        super.setChanged()
     }
 
     /**

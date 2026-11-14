@@ -9,10 +9,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
-import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
-import pro.ikili.kibicomputers.core.machine.report
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -391,35 +389,42 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      * （外して [ComputerError.CRASHED] にし、電源を切り、`events` にも CRASHED を中継する）。
      * ゲストが止めた・起動に失敗した（復元の途中・起動の途中・再起動の途中でない STOPPED）なら、同じく STOPPED を受けた扱いで
      * [turnOff] と同じにする（起動の失敗も [ComputerStatus.OFF] になる。どちらも電源が切れるので、セーブデータには違いが出ない）。
+     * ゲストが止めた直後で、プロセスのスレッドがまだ終わり切っていない STOPPING（`stop()`・init の終わりの後。再起動の途中でない）も、
+     * 待てば必ずゲストが止めた STOPPED になるので、同じく STOPPED を受けた扱いにする（`events` にも STOPPED を中継する）。
+     * ブロッキング型のプロセスが残る台は保存の待ち（[isSettlingForSave]）が待たないので、写す前にこれを通さないと、写しの中で init を
+     * 殺した冷えた起動の世代と電源の入った状態が書かれ、ゲストが電源を切った台が次の読み込みで起動し直す。
+     * STOPPING の台がケースに付いたままなのは、ゲストが止めたときと再起動の途中だけ（ケースが自分で止めるときは先に外す。
+     * スケジューラを閉じるのは、保存の経路が終わった後）。
      *
      * CRASHED・STOPPED の知らせは次の [MachineManager.tick] で届くが、チャンクのアンロード・サーバーの停止では届く前に
      * セーブデータ（`PoweredOn`）を書き、外した後の知らせは捨てられる。そのため、ここで電源を切ってから書く。
      * 後で届く知らせは、外したマシンのものなので二重にならない（[onMachineStateChanged] と `ManagedHost.released`）。
-     * 状態を読むだけなので軽い（[Machine.state] は volatile。STOPPED のときだけ再起動の待ちをロックで読む）。
+     * CRASHED の原因（カーネルの不整合の例外）は、外す前に [MachineManager] の [pro.ikili.kibicomputers.core.machine.MachineErrorListener]
+     * に出す（[MachineSlot.reportCrash]）。後で知らせが届いても（tick が回るアンロード・FULL でなくなった経路）重ねて出さず、
+     * 届かなくても（tick の回らないサーバーの停止）ここで出してあるので残る。
+     * 状態を読むだけなので軽い（[Machine.state] は volatile。STOPPED・STOPPING のときだけ再起動の待ちをロックで読む）。
      * 読む順番は [Machine.isRunningOrBooting] と同じで、起動中の印を先に、状態を後に読む（起動用のスレッドは、init を作るときに
      * `RUNNING` にしてから印を下ろすので、逆に読むと「止まっていて起動中でもない」に見えて、起動し終えたばかりの台の電源を切ってしまう）。
      *
-     * @param errors 外す CRASHED の原因（カーネルの不整合の例外）の出し先。外した後は知らせも tick も届かないので、
-     * 渡さないと原因がどこにも残らない。`null` なら出さない
      * @return マシンを外して電源の状態を変えたら `true`
      */
-    @JvmOverloads
-    public fun settleStoppedMachine(errors: MachineErrorListener? = null): Boolean {
+    public fun settleStoppedMachine(): Boolean {
         val machine = slot.machine ?: return false
         // 起動中の印を、状態より先に読む（この順番を入れ替えない）
         val booting = machine.isBooting
         when (machine.state) {
             MachineState.CRASHED -> {
-                val cause = machine.crashCauseForHost
-                if (errors != null) report(errors, "マシンが止まった（カーネルの不整合）", cause ?: IllegalStateException("原因なし"))
-                host.onStateChanged(machine, MachineState.CRASHED, cause)
+                // 外すと一覧から消えるので、原因は先に出す（1台につき1回）
+                slot.reportCrash()
+                host.onStateChanged(machine, MachineState.CRASHED, machine.crashCauseForHost)
             }
-            MachineState.STOPPED -> {
-                // 復元の途中・冷えた起動待ちも STOPPED で、知らせを出さない。ここで電源を切ると復元を取り消してしまう
+            MachineState.STOPPED, MachineState.STOPPING -> {
+                // 復元の途中・冷えた起動待ちも STOPPED で、知らせを出さない。ここで電源を切ると復元を取り消してしまう。
+                // 再起動の途中は STOPPING・STOPPED を通るが、電源を切らない（#640）
                 if (booting || machine.isRestoring || machine.isRebootPending) return false
                 host.onStateChanged(machine, MachineState.STOPPED, null)
             }
-            else -> return false
+            MachineState.RUNNING -> return false
         }
         return slot.machine !== machine
     }

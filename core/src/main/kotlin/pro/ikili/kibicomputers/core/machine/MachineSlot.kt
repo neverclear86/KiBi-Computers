@@ -118,6 +118,14 @@ public class MachineSlot<K : Any> {
      */
     public fun chunkUnloaded(): Boolean = release(MachineReleaseReason.UNLOADED)
 
+    /** 今のマシンが CRASHED なら、その原因を管理の出し先に今出す（[MachineManager.reportCrash]。外す前に呼ぶ。#698） */
+    internal fun reportCrash() {
+        val manager = manager ?: return
+        val key = key ?: return
+        val machine = current ?: return
+        manager.reportCrash(key, machine)
+    }
+
     /**
      * ブロックエンティティが消える。[chunkUnloaded] の後なら何もしない。そうでなければ壊された・置き換えられたとして
      * [MachineReleaseReason.REMOVED] で外す。

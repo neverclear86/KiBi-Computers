@@ -20,7 +20,9 @@ import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
+import pro.ikili.kibicomputers.core.kernel.awaitKeepingInterrupt
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
@@ -46,7 +48,12 @@ import kotlin.concurrent.withLock
 
 /** ケースのティアと電源・状態（#121） */
 class ComputerCaseTest {
-    private val manager = MachineManager<String>(SchedulerConfig.builder().maxConcurrentMachines(1).build())
+    /** マネージャーのエラーの出し先に出たもの（#698） */
+    private val managerErrors: MutableList<Pair<String, Throwable>> = Collections.synchronizedList(ArrayList())
+    private val manager = MachineManager<String>(
+        SchedulerConfig.builder().maxConcurrentMachines(1).build(),
+        MachineErrorListener { message, error -> managerErrors += message to error },
+    )
     private val config = MachineConfig.DEFAULT
 
     @AfterEach
@@ -914,17 +921,32 @@ class ComputerCaseTest {
     }
 
     @Test
-    fun `CRASHEDでそろえた台の原因は、渡した出し先に残る`() {
+    fun `CRASHEDでそろえた台の原因は、マネージャーの出し先に1回だけ出て、後の知らせで重ならない`() {
         val case = ComputerCase<String>(CaseTier.BASIC, States())
         val machine = bootedCase(case, withDisk(case.tier), "disk-a")
         crash(machine)
-        val reported = ArrayList<Pair<String, Throwable>>()
-        assertTrue(case.settleStoppedMachine { message, error -> reported += message to error })
-        assertEquals(1, reported.size, "原因が出ていない: $reported")
+        assertTrue(case.settleStoppedMachine())
+        assertEquals(1, managerErrors.size, "原因が出ていない: $managerErrors")
+        assertTrue(managerErrors[0].first.contains("カーネルの不整合"), "$managerErrors")
         assertNull(case.machine)
         // 2回目は外した後なので、出さない
-        assertFalse(case.settleStoppedMachine { message, error -> reported += message to error })
-        assertEquals(1, reported.size)
+        assertFalse(case.settleStoppedMachine())
+        // アンロード・FULL でなくなった経路では tick が回り、外した後も CRASHED の知らせが配られる。原因は重ねて出さない
+        repeat(5) { manager.tick() }
+        assertEquals(1, managerErrors.size, "二重に出た: $managerErrors")
+    }
+
+    @Test
+    fun `そろえずにCRASHEDの知らせが届いた台の原因も、マネージャーの出し先に1回だけ出る`() {
+        val case = ComputerCase<String>(CaseTier.BASIC, States())
+        val machine = bootedCase(case, withDisk(case.tier), "disk-a")
+        crash(machine)
+        tickUntil("知らせが届かない") { case.machine == null }
+        assertEquals(ComputerError.CRASHED, case.error)
+        assertEquals(1, managerErrors.size, "$managerErrors")
+        assertFalse(case.settleStoppedMachine())
+        repeat(3) { manager.tick() }
+        assertEquals(1, managerErrors.size, "$managerErrors")
     }
 
     @Test
@@ -933,8 +955,89 @@ class ComputerCaseTest {
         val machine = bootedCase(case, withDisk(case.tier), "disk-a")
         machine.stop()
         assertTrue(machine.awaitTermination(5_000))
-        val reported = ArrayList<Throwable>()
-        assertTrue(case.settleStoppedMachine { _, error -> reported += error })
-        assertTrue(reported.isEmpty(), "$reported")
+        assertTrue(case.settleStoppedMachine())
+        repeat(3) { manager.tick() }
+        assertTrue(managerErrors.isEmpty(), "$managerErrors")
+    }
+
+    /**
+     * init（ブロッキング型）が最初にコンソールへ書いたところで、そのスレッドを止めておいて起動する（カーネルロックの外。
+     * 割り込まれても門が開くまで待つ）。返した `stop` で止めると、スレッドが終わり切らないので STOPPING のまま残る。門を開けると終わる
+     */
+    private inner class HeldInit(case: ComputerCase<String>) {
+        private val atGate = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        val machine: Machine
+
+        init {
+            val first = java.util.concurrent.atomic.AtomicBoolean(true)
+            manager.scheduler.hooks.beforeConsoleFlush = { _, _ ->
+                if (first.compareAndSet(true, false)) {
+                    atGate.countDown()
+                    gate.awaitKeepingInterrupt()
+                }
+            }
+            machine = bootedCase(case, withDisk(case.tier), "disk-a")
+            assertTrue(atGate.await(10, TimeUnit.SECONDS), "init がコンソールに書かない")
+        }
+
+        fun stop(stopper: () -> Unit) {
+            stopper()
+            assertEquals(MachineState.STOPPING, machine.state, "スレッドが終わり切る前")
+        }
+
+        fun release() {
+            manager.scheduler.hooks.beforeConsoleFlush = null
+            gate.countDown()
+        }
+    }
+
+    @Test
+    fun `ゲストが止めた直後のSTOPPINGの台も、そろえると写す前に電源を切る`() {
+        val events = States()
+        val case = ComputerCase<String>(CaseTier.BASIC, events)
+        val held = HeldInit(case)
+        val machine = held.machine
+        try {
+            held.stop { machine.stop() }
+            // ブロッキング型のプロセスが残るので、保存の待ちは待たない（待たずに写すと、init を殺した冷えた起動の世代になる）
+            assertEquals(SaveReadiness.UNSAVEABLE, machine.saveReadiness())
+            assertFalse(case.isSettlingForSave)
+            assertTrue(case.poweredOn, "知らせの前")
+            assertTrue(case.prepareUnload())
+            assertTrue(case.settleStoppedMachine())
+            assertEquals(ComputerStatus.OFF, case.status)
+            assertFalse(case.poweredOn)
+            assertNull(case.machine)
+            assertNull(manager["a"])
+            assertNull(case.capture(CapturePolicy.KILL_TRANSIENT), "外した後は写さない")
+            assertEquals(MachineState.STOPPED, events.states.last())
+        } finally {
+            held.release()
+        }
+        assertTrue(machine.awaitTermination(5_000))
+        val delivered = events.states.size
+        repeat(5) { manager.tick() }
+        assertEquals(delivered, events.states.size, "外した後の知らせが届いた: ${events.states}")
+        assertFalse(case.poweredOn)
+    }
+
+    @Test
+    fun `再起動の途中のSTOPPINGの台は、そろえても何もしない`() {
+        val case = ComputerCase<String>(CaseTier.BASIC, States())
+        val held = HeldInit(case)
+        val machine = held.machine
+        try {
+            held.stop { assertTrue(machine.reboot()) }
+            assertTrue(machine.isRebootPending)
+            assertFalse(case.settleStoppedMachine(), "再起動の途中")
+            assertTrue(case.poweredOn)
+            assertSame(machine, case.machine)
+        } finally {
+            held.release()
+        }
+        tickUntil("起動し直さない") { machine.state == MachineState.RUNNING && !machine.isBooting && !machine.isRebootPending }
+        assertTrue(case.poweredOn)
+        assertEquals(ComputerStatus.RUNNING, case.status)
     }
 }
