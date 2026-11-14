@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * - [mount]（4 引数）は、ロックの外で位置を確かめ（[checkMountPoint]）、続けて表を変える便利な口（マシンを使わないテスト用）
  * - [OpenFile.position] は読まない・変えない（[read]・[write]・[seek] を除く。これらは、ほかのスレッドと分け合わない開いたファイルにだけ使う）。
  *   fd から使う開いたファイルの位置は、呼び出し側がカーネルロックの中で読み書きする
- * - ロックの中で呼んでよいのは、表を変える操作と [sizeHintLocked]・[isTerminalLocked]・[pathHintLocked]・[releaseLater] だけ
+ * - ロックの中で呼んでよいのは、表を変える操作と [sizeHintLocked]・[specialLocked]・[pathHintLocked]・[releaseLater] だけ
  */
 internal class Vfs(
     /** マウントの表（保存の対象。`KernelState.mounts`） */
@@ -453,10 +453,13 @@ internal class Vfs(
         return view.fileSystems[file.mountId]?.pathHint(file.node)
     }
 
-    /** [file] が制御端末（`/dev/tty`。[FileSystem.isTerminal]）か（I/O をしない）。ディレクトリ・外れたマウントは `false` */
-    fun isTerminalLocked(file: OpenFile): Boolean {
-        if (file.mountId == 0 || file.isDirectory) return false
-        return view.fileSystems[file.mountId]?.isTerminal(file.node) ?: false
+    /**
+     * [file] を fd に入れるときの差し替え先（`/dev/tty`・`/dev/device/<address>`。[FileSystem.special]。I/O をしない）。
+     * 普通のファイル・ディレクトリ・外れたマウントは `null`
+     */
+    fun specialLocked(file: OpenFile): SpecialFile? {
+        if (file.mountId == 0 || file.isDirectory) return null
+        return view.fileSystems[file.mountId]?.special(file.node)
     }
 
     /**

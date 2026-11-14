@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.fd
 
+import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -250,6 +251,8 @@ internal object FdIo {
                     val n = vfs.read(obj, dst, off, len)
                     if (n == 0 && len > 0) IoResult.Eof else IoResult.Bytes(n)
                 }
+                // デバイスの fd（`/dev/device/<address>`・`kibi:device`）の読み書きは、まだない（ADR 0054。#65 の Q5）
+                is DeviceHandle -> IoResult.Error(Errno.NOSYS)
                 else -> IoResult.Error(Errno.INVAL)
             }
         } catch (e: FsException) {
@@ -278,6 +281,7 @@ internal object FdIo {
                     WriteResult.Closed -> IoResult.Error(Errno.PIPE)
                 }
                 is OpenFile -> IoResult.Bytes(vfs.write(obj, src, off, len))
+                is DeviceHandle -> IoResult.Error(Errno.NOSYS)
                 else -> IoResult.Error(Errno.INVAL)
             }
         } catch (e: FsException) {

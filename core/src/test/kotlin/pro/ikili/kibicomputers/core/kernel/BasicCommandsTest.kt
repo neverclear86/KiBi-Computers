@@ -4,10 +4,13 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.DevFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.DeviceDirectory
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -65,7 +68,8 @@ class BasicCommandsTest {
         script: String,
         files: Map<String, String> = emptyMap(),
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
-    ): String = run(script, files, environment).let { r ->
+        devices: Map<String, Device> = emptyMap(),
+    ): String = run(script, files, environment, devices = devices).let { r ->
         assertEquals(ProcessState.EXITED, r.shell, r.text)
         r.text
     }
@@ -80,6 +84,7 @@ class BasicCommandsTest {
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
         maxProcesses: Int = 64,
         memoryBytes: Long = 32L * 1024 * 1024,
+        devices: Map<String, Device> = emptyMap(),
     ): Run = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
@@ -87,7 +92,8 @@ class BasicCommandsTest {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home", "/mnt")) m.vfs.createDirectory(VfsPath.parse(d))
             m.vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
-            m.vfs.mount(VfsPath.parse("/dev"), DevFileSystem(), readOnly = false, source = "dev")
+            m.vfs.mount(VfsPath.parse("/dev"), DevFileSystem(m.environment.entropy, DeviceDirectory.of(m.devices)), readOnly = false, source = "dev")
+            for ((address, device) in devices) assertTrue(m.devices.attach(address, device))
             for (name in listOf("sh", "echo", "true", "false") + commands) m.put("/bin/$name", imageFile("/bin/$name"))
             for ((path, text) in files) m.put(path, text.toByteArray())
             val env = mapOf("PATH" to "/bin", "HOME" to "/home")
@@ -113,8 +119,8 @@ class BasicCommandsTest {
         }
     }
 
-    private fun assertOutput(expected: String, script: String, files: Map<String, String> = emptyMap()) {
-        assertEquals(expected.trimIndent() + "\n", sh(script, files), "script:\n${script.trimIndent()}")
+    private fun assertOutput(expected: String, script: String, files: Map<String, String> = emptyMap(), devices: Map<String, Device> = emptyMap()) {
+        assertEquals(expected.trimIndent() + "\n", sh(script, files, devices = devices), "script:\n${script.trimIndent()}")
     }
 
     @Test
@@ -873,8 +879,11 @@ class BasicCommandsTest {
     fun `devのnull・zero・tty`() {
         assertOutput(
             """
+            device
             null
+            random
             tty
+            urandom
             zero
             0
             0
@@ -896,6 +905,36 @@ class BasicCommandsTest {
             head -c 12 /dev/zero >/tmp/z; wc -c </tmp/z
             ls /dev/null
             """,
+        )
+    }
+
+    private object TestDevice : Device {
+        override val kind = "test:device"
+        override val methods: DeviceMethods = DeviceMethods.builder().build()
+    }
+
+    @Test
+    fun `devのrandomとdevice`() {
+        val address = "00000000-0000-4000-8000-000000000054"
+        assertOutput(
+            """
+            16
+            1000
+            $address
+            cat: /dev/device/$address: Function not implemented
+            1
+            1
+            ls: /dev/device/nothing: No such file or directory
+            """,
+            """
+            head -c 16 /dev/random | wc -c
+            head -c 1000 /dev/urandom | wc -c
+            ls /dev/device
+            cat /dev/device/$address 2>&1; echo ${'$'}?
+            echo x >/dev/device/$address; echo ${'$'}?
+            ls /dev/device/nothing 2>&1
+            """,
+            devices = mapOf(address to TestDevice),
         )
     }
 

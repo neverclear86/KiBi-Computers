@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #427（task）。前提: ADR 0060（TTY と `TtyControl`）、0063（イベントキュー）、0073（`kibi:*` の WIT と p1 の import の導き方）、0075（`kibi:io` のパッケージ、`kibi_io.h`）
-- 後続: #54（`/dev/tty`）、#65（接続層から画面の大きさを渡す。`ScreenDevice` で済んだ）、#102（シェルの raw モード）、#116（SDK の `tcgetattr`・`tcsetattr`・`ioctl(TIOCGWINSZ)` 風の束縛）、#262〜#268（p2・p3 の層）、#251（仮の値の確定）
+- 後続: #54（`/dev/tty`。ADR 0054 で済んだ）、#65（接続層から画面の大きさを渡す。`ScreenDevice` で済んだ）、#102（シェルの raw モード）、#116（SDK の `tcgetattr`・`tcsetattr`・`ioctl(TIOCGWINSZ)` 風の束縛）、#262〜#268（p2・p3 の層）、#251（仮の値の確定）
 - ABI の選択（モードの表し方、関数の分け方、大きさと世代の返し方、前のプロセスの表し方と検査、`tty-resize` の形、p2/p3 で同じ interface を使うこと）は、#427 のプランへのオーナーの回答（Q1〜Q6 はすべて A。fd は `u32`。p2/p3 の WIT は仮置き）で決めた
 
 ## 決めたこと（要約）
@@ -123,7 +123,7 @@ event { kind: "tty-resize", source: "console", values: [ integer(columns), integ
 
 ## 決めないこと
 
-- `/dev/tty`: #54
+- `/dev/tty`: #54（ADR 0054）
 - 接続層から画面の大きさを渡す口（`resizeConsole` を呼ぶ側）: #65（`ScreenDevice` がつないだときに呼ぶ。済んだ）
 - シェルでの raw モードの使い方: #102
 - 生成した束縛と termios 風の関数: SDK #116

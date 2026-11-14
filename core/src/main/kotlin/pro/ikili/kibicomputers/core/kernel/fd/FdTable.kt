@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.fd
 
+import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.io.Pipes
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
@@ -10,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.vfs.SpecialFile
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
@@ -77,16 +79,25 @@ internal class FdTable(
 
     /**
      * [Vfs.open] で開いた [file] を、いちばん小さい空き番号に入れて返す（パスを開く ABI 層の `path_open` などが使う）。
-     * 制御端末（`/dev/tty`。[Vfs.isTerminalLocked]。#485）なら、[file] は入れずに、端末 [terminalId]（`Tty`）を [rights] で指す
-     * （参照を1つ増やす。`/dev` はファイルシステムに開いたことを知らせないので、[file] は捨ててよい）。端末がなければ（[terminalId] が 0）`NXIO`。
+     * 差し替え先のあるファイル（[Vfs.specialLocked]。ADR 0054）なら、[file] は入れずに、次のものを [rights] で指す
+     * （`/dev` はファイルシステムに開いたことを知らせないので、[file] は捨ててよい。閉じるのは呼び出し側）。
+     *
+     * - 制御端末（`/dev/tty`。#485）: 端末 [terminalId]（`Tty`）の参照を1つ増やす。端末がなければ（[terminalId] が 0）`NXIO`
+     * - デバイス（`/dev/device/<address>`。#54）: 新しい [DeviceHandle]（`kibi:device` で開いたものと同じ形。種類は今つないでいるもの）。
+     *   開く途中でデバイスが外れていたら `NOENT`
+     *
      * 満杯なら `MFILE`（[file] は表に足さない。閉じるのは呼び出し側）
      */
-    fun openFile(file: OpenFile, vfs: Vfs, terminalId: Int, rights: Int, flags: Long = 0): Int {
-        if (!vfs.isTerminalLocked(file)) return open(file, rights, flags)
-        if (terminalId == 0 || objects[terminalId] !is Tty) fsError(Errno.NXIO, "制御端末がない")
-        if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
-        objects.retain(terminalId)
-        return handles.insert(HandleEntry(terminalId, flags, rights))
+    fun openFile(file: OpenFile, vfs: Vfs, terminalId: Int, rights: Int, flags: Long = 0): Int = when (val special = vfs.specialLocked(file)) {
+        null -> open(file, rights, flags)
+        SpecialFile.Terminal -> {
+            if (terminalId == 0 || objects[terminalId] !is Tty) fsError(Errno.NXIO, "制御端末がない")
+            if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
+            objects.retain(terminalId)
+            handles.insert(HandleEntry(terminalId, flags, rights))
+        }
+        is SpecialFile.Device -> open(DeviceHandle(special.address, special.kind), rights, flags)
+        SpecialFile.Detached -> fsError(Errno.NOENT, "デバイスが外れた")
     }
 
     /**

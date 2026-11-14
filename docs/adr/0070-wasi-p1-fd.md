@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #70（task）。前提: ADR 0051（VFS の中核）、0058（fd 表と標準入出力）、0261（p1 の層を直接実装する）
-- 後続: #69（args・clock・proc_exit など）、#71（`path_*` と preopen の構成）、#72（`poll_oneoff`）、#59（パイプ）、#54（`/dev`）、#79（仕様書）
+- 後続: #69（args・clock・proc_exit など）、#71（`path_*` と preopen の構成）、#72（`poll_oneoff`）、#59（パイプ）、#54（`/dev`。ADR 0054 で済んだ）、#79（仕様書）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -78,4 +78,4 @@
 ## 決めないこと
 
 - `poll_oneoff`: #72。args・clock・`proc_exit`: #69（`path_*`・preopen の構成・`path_open` の `DSYNC` などは #71 で決めた。ADR 0071）
-- デバイスファイル（`/dev/null` など）の種類と読み書き: #54。パイプ: #59
+- デバイスファイル（`/dev/null` など）の種類と読み書き: #54（ADR 0054）。パイプ: #59

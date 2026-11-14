@@ -40,6 +40,21 @@ internal data class FileStat(
 internal data class DirEntry(val name: String, val type: FileType, val node: Long)
 
 /**
+ * 開くと、fd がファイルではなく別のカーネルオブジェクトを指すファイル（[FileSystem.special]。`/dev` の `tty`・`device/<address>`。
+ * #485・#54、ADR 0054）。差し替えは `FdTable.openFile` で行う
+ */
+internal sealed interface SpecialFile {
+    /** 制御端末（`/dev/tty`）。fd はプロセスの端末（`Tty`）を指す */
+    object Terminal : SpecialFile
+
+    /** つないでいるデバイス（`/dev/device/<address>`）。fd はそのデバイスのハンドル（`DeviceHandle(address, kind)`）を指す */
+    data class Device(val address: String, val kind: String) : SpecialFile
+
+    /** デバイスのファイルだが、開く途中でデバイスが外れた（`NOENT`） */
+    object Detached : SpecialFile
+}
+
+/**
  * ファイルシステムの抽象（ディスク #52、`/tmp` #53、`/dev` #54、読み取り専用のイメージ #55）。[Vfs] にマウントして使う。
  *
  * - パスは**このファイルシステムの根からの**正規化したパス（[VfsPath]）。マウントの位置は知らない
@@ -52,7 +67,7 @@ internal data class DirEntry(val name: String, val type: FileType, val node: Lon
  * - 呼ばれるのは、マシンのカーネルロックの**外**（#52。ADR 0051・0052）。同じマシンのいくつものスレッド（プロセスのスレッド、
  *   起動用のスレッド）から同時に呼ばれるので、ファイルシステムが自分で排他する。自分の I/O と自分の排他のほかに待たない
  *   （ほかのマシン・メインスレッド・カーネルロックを待たない）
- * - カーネルロックの中から呼ばれるのは [ignoresCase]・[sizeHint]・[revoke]・[onUnmounted]・[isTerminal]・[pathHint] だけ。この6つは I/O をせず、
+ * - カーネルロックの中から呼ばれるのは [ignoresCase]・[sizeHint]・[revoke]・[onUnmounted]・[special]・[pathHint] だけ。この6つは I/O をせず、
  *   自分のロックも長く待たずに、すぐ返す
  */
 internal interface FileSystem {
@@ -125,10 +140,11 @@ internal interface FileSystem {
     }
 
     /**
-     * [node] が制御端末（`/dev/tty`。#485）か。そうなら、開いた fd はこのファイルではなく、プロセスの端末（`Tty`）を指す
-     * （`FdTable.openFile`）。カーネルロックの中から呼ばれるので、I/O をしない。既定は `false`
+     * [node] を開いたときの差し替え先（[SpecialFile]。`/dev/tty`・`/dev/device/<address>`。#485・#54）。`null` でなければ、開いた fd は
+     * このファイルではなく、差し替え先のオブジェクトを指す（`FdTable.openFile`）。カーネルロックの中から呼ばれるので、I/O をせず、
+     * 長く待たない。既定は `null`（普通のファイル）
      */
-    fun isTerminal(node: Long): Boolean = false
+    fun special(node: Long): SpecialFile? = null
 
     /**
      * [node] の今のパスの目安（このファイルシステムの根から）。保存の写しで、開いたファイルをパスで引き直せるように控える（#82。ADR 0082）。
@@ -139,7 +155,7 @@ internal interface FileSystem {
 
     /**
      * 容量と使用量（`kibi:fs/mounts` の `list-mounts`。#453、ADR 0453）。分からなければ `null`（既定）。
-     * カーネルロックの**外**で呼ばれる（ロックの中から呼んでよい5つには入らない）。I/O をせず、自分のロックも長く待たずに、すぐ返す
+     * カーネルロックの**外**で呼ばれる（ロックの中から呼んでよい6つには入らない）。I/O をせず、自分のロックも長く待たずに、すぐ返す
      * （ディスクを開いたり数え直したりしない。今持っている数を読むだけ）
      */
     fun usage(): FsUsage? = null

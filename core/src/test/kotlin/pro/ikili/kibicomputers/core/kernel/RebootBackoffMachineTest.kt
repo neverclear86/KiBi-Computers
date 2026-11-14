@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
@@ -47,6 +48,15 @@ class RebootBackoffMachineTest {
 
         /** tick を進めずに、init が動いている（起動の途中でない）のを待つ */
         fun awaitRunning() = eventually(10_000, "起動しない") { m.state == MachineState.RUNNING && !m.isBooting }
+
+        /**
+         * init が CPU を取って、専用スレッドの登録を済ませる（CREATED を抜ける）まで tick を進める。
+         * CREATED のまま reboot すると register が KILLED にして unregister（beforeUnregister のフック）を通らず、止める場面を作れない
+         */
+        fun tickUntilInitStarted() = tickUntil("init が CPU を取らない") {
+            m.state == MachineState.RUNNING && !m.isBooting &&
+                m.lock.withLockValue { m.kernel.processes[1] }?.state.let { it != null && it != ProcessState.CREATED && !it.isTerminal }
+        }
 
         /**
          * [Machine.reboot] を求め、止まって、再起動の求めを通知に積む（か、待ちに入る）ところまで進める。tick は進めない。
@@ -184,7 +194,7 @@ class RebootBackoffMachineTest {
         } finally {
             release.countDown()
         }
-        awaitRunning()
+        tickUntilInitStarted()
         // 燃料は tick でしか届かず、起動した直後の init はスレッドを持たずに燃料待ちのことがある。
         // 1 tick 進めて、init がスレッドを持って回っているのを確かめてから reboot する（持たない init は止める時に登録を外す所を通らない）
         val loops = initLoops.get()
