@@ -53,7 +53,11 @@ internal interface LinkEnv {
  * - realloc と post-return は `may_leave` を下ろして呼ぶ。post-return は、結果を呼ぶ側に渡し終えた（lower した・写した）後に呼ぶ
  * - 一度トラップしたら、それ以上は呼べない（以後の呼び出しはトラップ）
  *
- * コンポーネントどうしの呼び出し（lift した関数を lower した import）は、ゲストからゲストへの呼び出しなので [LinkEnv.callGuest] で包まない
+ * コンポーネントどうしの呼び出し（lift した関数を lower した import）は、ゲストからゲストへの呼び出しなので [LinkEnv.callGuest] で包まない。
+ *
+ * ホストからの [call] は入れ子にできない（#691）。ホストの関数（[HostFunctionBody]）は必ず [call] かインスタンス化の下で動くので、
+ * その中から [call] を呼ぶと [IllegalStateException] になる。ホストの関数の中から呼べると、core の関数が [LinkEnv.callGuest] で
+ * 包まれずに動き、ホスト関数の途中で止まる口を使えてしまう（ADR 0073）。仕様の「同じコンポーネントのインスタンスに入れ子で入らない」にも合う
  *
  * resource（#265。ADR 0265）: ハンドル表はコンポーネントのインスタンスごとに 1 つ（[ResourceTable]。使ったインスタンスの分だけ作る）。
  * borrow の範囲は、同期の呼び出しのスタック（仕様の Task の番号と borrow の数、Subtask の lenders）で持ち、引数に borrow を含む
@@ -68,6 +72,9 @@ internal class LinkedComponent private constructor(
     private val memories = HashMap<CoreRef.Export, WasmMemory>()
     private var poisoned: String? = null
     private var closed = false
+
+    /** [call] かインスタンス化の途中（プロセスのスレッドだけが読み書きする。#691） */
+    private var entered = false
 
     // ---- resource（#265） ----
 
@@ -106,11 +113,14 @@ internal class LinkedComponent private constructor(
         @Throws(WasmLinkException::class, WasmTrapException::class)
         fun instantiate(plan: ComponentPlan, env: LinkEnv = LinkEnv.NONE, sharedFuel: WasmSharedFuel? = null): LinkedComponent {
             val c = LinkedComponent(plan, env)
+            c.entered = true
             try {
                 for (step in plan.steps) c.instantiateStep(step, sharedFuel)
             } catch (t: Throwable) {
                 c.close()
                 throw t
+            } finally {
+                c.entered = false
             }
             return c
         }
@@ -160,7 +170,10 @@ internal class LinkedComponent private constructor(
     }
 
     /**
-     * export した関数 [func] を、ホストから呼ぶ（引数は値。結果のない関数は `null`）。ホストの関数の中からは呼ばない。
+     * export した関数 [func] を、ホストから呼ぶ（引数は値。結果のない関数は `null`）。
+     *
+     * ホストの関数の中・インスタンス化の途中（start 関数から呼ばれたホストの関数）からは呼べない（[IllegalStateException]。#691）。
+     * この検査は呼び出しの前に行うので、断った呼び出しはこのコンポーネントを壊さない（例外が外側の呼び出しまで伝われば、外側が壊す）。
      *
      * own・borrow の値は rep（[HostFunctionBody] と同じ）。引数に、ゲストが実装した resource の own・borrow は渡せない
      * （ホストはゲストの dtor を呼べず、rep を偽れるため。[IllegalArgumentException]。コンポーネントは使えなくならない）。
@@ -168,18 +181,26 @@ internal class LinkedComponent private constructor(
      * 捨てても dtor は呼ばれない。仕様の埋め込みと同じ）
      *
      * @throws WasmTrapException ゲストがトラップした（以後、このコンポーネントは呼べない）
+     * @throws IllegalStateException ホストの関数の中から呼んだ、または閉じたコンポーネントを呼んだ
+     * @throws IllegalArgumentException 引数に、ゲストが実装した resource の own・borrow を渡した
      */
     @Throws(WasmTrapException::class)
     fun call(func: FuncRef, args: List<CanonValue>): CanonValue? {
+        check(!entered) { "ホストの関数の中（またはインスタンス化の途中）から LinkedComponent.call を呼んだ" }
         for (r in func.function.paramResources) {
             val info = plan.resource(r)
             require(info.impl !is ResourceImpl.Guest) { "ゲストが実装した resource（${info.canonical}）の own・borrow をホストから渡した" }
         }
-        return guarded {
-            val budget = CanonBudget()
-            val r = callFunc(func, args, budget) { it }
-            env.chargeFuel(cost(budget))
-            r
+        entered = true
+        try {
+            return guarded {
+                val budget = CanonBudget()
+                val r = callFunc(func, args, budget) { it }
+                env.chargeFuel(cost(budget))
+                r
+            }
+        } finally {
+            entered = false
         }
     }
 

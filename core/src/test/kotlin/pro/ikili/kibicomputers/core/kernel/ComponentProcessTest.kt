@@ -116,6 +116,35 @@ class ComponentProcessTest {
         assertEquals(false, unmetered.isFuelMetered)
     }
 
+    @Test
+    fun `ホストの関数の中からプロセスのコンポーネントを呼ぶとプロセスだけが落ちる`() {
+        // ホストの関数が KernelLinkEnv から同じ LinkedComponent を引いて call を呼ぶ（#691）
+        val reentering = ComponentHost.of(
+            LinkTesting.host(
+                "test:host/kernel",
+                "pid" to HostFunction(LinkTesting.fn(emptyList(), CanonType.U32)) { call, _ ->
+                    val c = (call.env as KernelLinkEnv).ctx.component
+                    c.call(c.function("run")!!, listOf(CanonValue.I32(1)))
+                },
+            ),
+        )
+        Harness().use { h ->
+            val m = h.machine()
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                ctx.component.call("run", args = listOf(CanonValue.I32(10)))
+                StepResult.Exit(0)
+            }
+            val rt = m.spawnRt(Program.component(LinkTesting.load(text, reentering, metered = true)), driver)
+            eventually(20_000, "終わらない") {
+                h.scheduler.tick()
+                rt.process.state.isTerminal || m.state == MachineState.CRASHED
+            }
+            assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
+            assertEquals(ProcessState.CRASHED, rt.process.state)
+            assertTrue(rt.lastError is IllegalStateException, "${rt.lastError}")
+        }
+    }
+
     /**
      * 1 つ目の core モジュール: メモリに書き込む（RAM は書き込んだ区画で数える。#407）。[start] は 2 つ目の start 関数の本体
      * （`$mark` を呼ぶと [marks] が増える。2 つ目のインスタンスを作ったかどうかが分かる）
