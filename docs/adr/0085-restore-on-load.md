@@ -91,6 +91,14 @@
   先に KILLED にすると、採用済みの親の終わりが終わった子を刈り取る（表から外し、オブジェクトの参照を返す）ので、後にする。
   `stopLocked` は `runtimes` のプロセスしか止めないので、これがないと `awaitTermination` が返らない。`/tmp` は `stopLocked` の `checkAllDoneLocked` が外す（2回目の `onUnmounted` は何もしないので二重に返らない）。
   `stopLocked` の一般の掃除にしないのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
+  追記（#696）: 上の KILLED は終わりの記録（`ExitBookkeeping.recordExit`）を通さないので、そのプロセスについて表の不変条件が崩れたまま残る。
+  `ProcessObject.status` は null のまま（終了コード・`termSignal` も入らない）、親のないものも `orphanZombies` に入らない（古い順の刈り取りにもかからない）、
+  親に知らせない（`pendingChildExits`・`CHILD_EXITED`）、子の付け替えも子のゾンビの刈り取りもしない、init でも `kernel.initPid` を下ろさない、
+  fd・`waitTimers`・オブジェクトの参照を返さない（前段で作ったものは discard が返す）。
+  `runtimes` は pid の昇順で作るので、混ざる位置は2通りある。採用済みの親と未採用の子なら、子は親の終わりで親なしに付け替えられ、表に残ったまま KILLED になる。
+  採用済みの子と未採用の親（pid の使い回しで、子の pid が親より小さい）なら、子は先に終わって親に知らせ（`pendingChildExits` が増える）、
+  終わった親を指す親付きのゾンビとして残る。親の `status` は null のまま。どちらもテストで固定している（`MachineRestoreTest`）。
+  台は CRASHED のまま使い続けない（`boot`・`reboot` は断り、ケースは CRASHED の知らせでマシンを外して閉じる）ので、直さずにこの形にしておく
 - 取り消し（`stop()`・`close()`）は前段のどこでも効き、作ったものを返す。読み込みを待っている間なら、`restoreCancelSignal` に復元1回につき1つ付けた登録が、待っている読み込みを取り消す（始まっていなければ読み込まない。#363）。登録は待っている読み込みの入れ物だけを持ち、`restoreCancelSignal` は取り消し（`stopLocked`）に加えて前段の終わり（`completeRestore`・`restoreFellBack`）でも終えるので、終わった台に登録は残らない（#587）。後段に入る前に取り消されたら入れない。知らせは `CANCELLED`。
   前段が冷えた起動待ちに切り替えた（`COLD_BOOT` を積んだ）後、配る前に取り消したときも、配るときに `CANCELLED` に替える（`stopLocked` は前段の途中のときだけ `CANCELLED` を積む）。
   知らせは復元1回につき1回で、取り消した台を冷えた起動に数えない（#576）
