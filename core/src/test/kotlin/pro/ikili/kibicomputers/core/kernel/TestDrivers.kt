@@ -134,11 +134,16 @@ internal class Harness(
     val moduleStore: ModuleStore = MemoryModuleStore(),
     /** ゲストの再起動で起動し直すまでの待ち（#635） */
     rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
+    /**
+     * tick ごとの予算（#356）を測る時計。既定は止まった時計で、予算は効かない（初回のログ・クラスの読み込みで、
+     * 実際の時間の予算が効いて通知が次の tick に回り、テストが不安定にならないように）。予算を確かめるテストは手で進める時計を渡す
+     */
+    nanoTime: () -> Long = { 0L },
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff),
+        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff, nanoTime = nanoTime),
     )
     private var counter = 0
 

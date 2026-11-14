@@ -66,6 +66,13 @@ public class MachineScheduler private constructor(
     private val nextMachineId = AtomicLong(1)
     private val notifyQueue = ConcurrentLinkedQueue<Machine>()
     private val hostCallQueue = ConcurrentLinkedQueue<Machine>()
+
+    /**
+     * 通知・ホスト呼び出しを待つマシンの、持ち越しの列（#356）。[tick] の頭で [notifyQueue]・[hostCallQueue] から移し、前から処理する。
+     * 予算で打ち切ったときの残りが、次の tick に残る。メインスレッド（[tick]）だけが触る。保存はしない（実行時だけのもの）
+     */
+    private val notifyCarry = ArrayDeque<Machine>()
+    private val hostCallCarry = ArrayDeque<Machine>()
     private val blockingCount = AtomicInteger()
 
     /** 接続層の例外のスタックトレースを、もうログに出した場所（種類・例外のクラス・呼んだ側のスタック。#674） */
@@ -180,6 +187,18 @@ public class MachineScheduler private constructor(
     /** [tick] が通知を配ったマシンの数の合計（数え口） */
     internal val tickVisitedMachines = AtomicLong()
 
+    /** [tick] で、通知かホスト呼び出しを予算で打ち切った tick の数（数え口。#356） */
+    internal val budgetCutTicks = AtomicLong()
+
+    /** 予算で打ち切ったとき、手を付けずに次の tick へ持ち越したマシンの数の合計（数え口。#356。段ごとに数える） */
+    internal val carriedMachines = AtomicLong()
+
+    /** [tick] で通知を配るのにかかった時間の合計（ナノ秒。数え口。#356） */
+    internal val notifyNanos = AtomicLong()
+
+    /** [tick] でホスト呼び出しを実行するのにかかった時間の合計（ナノ秒。数え口。#356） */
+    internal val hostCallNanos = AtomicLong()
+
     /** `stop()` が送った割り込みの数（数え口） */
     internal val interruptsSent = AtomicLong()
 
@@ -240,9 +259,13 @@ public class MachineScheduler private constructor(
     /**
      * メインスレッドから毎 tick 呼ぶ。tick の番号を進めてディスパッチャーに知らせ、
      * 通知のあるマシンだけ [MachineHost] に配る。続けて、ホスト呼び出し（ワールド操作など）を待つマシンだけ、
-     * その呼び出しをこのスレッドで実行する（1台あたり [MachineConfig.maxHostCallsPerTick] まで。残りは次の tick）。
+     * その呼び出しをこのスレッドで実行する（1台あたり [MachineConfig.maxHostCallsPerTick] まで）。
      * 台数によらない（通知と呼び出しの数にだけ比例する）。期限の tick に起こすマシン（再起動の待ち。#635）は、
-     * 期限が来たものだけ起こしてから通知を配る（期限が来ていなければ、列の先頭を見るだけ）。
+     * 期限が来たものだけ起こしてから通知を配る（期限が来ていなければ、列の先頭を見るだけ。予算の外）。
+     *
+     * 通知とホスト呼び出しには、サーバー全体の tick ごとの時間の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356、ADR 0356）を置く。
+     * 通知は予算の半分まで、ホスト呼び出しは tick の頭から予算いっぱいまで。予算が尽きたら、手を付けていないマシンは次の tick の先頭に、
+     * 途中まで処理したマシンは次の tick の後ろに回す（巡回）。どちらの段も、毎 tick 少なくとも1台（ホスト呼び出しは1件）は進める
      */
     public fun tick() {
         val now = tickCounter.incrementAndGet()
@@ -262,35 +285,77 @@ public class MachineScheduler private constructor(
             for (machine in batch) machine.wakeDeferredReboot()
             batch.clear()
         }
-        while (true) batch += notifyQueue.poll() ?: break
-        tickVisitedMachines.addAndGet(batch.size.toLong())
-        deliverNotifications(batch)
-        batch.clear()
-        while (true) batch += hostCallQueue.poll() ?: break
-        tickVisitedMachines.addAndGet(batch.size.toLong())
-        for (machine in batch) {
-            // 残ったマシンは次の tick へ（この tick の中では入れ直さない）
-            if (machine.runHostCalls()) hostCallQueue.add(machine)
-        }
+        // 列から取り出すのは tick の頭の1回だけ（配る中で積み直したマシンは、次の tick に回る）
+        while (true) notifyCarry.addLast(notifyQueue.poll() ?: break)
+        val budget = TickBudget(options.nanoTime, config.mainThreadBudgetNanos)
+        var cut = false
+        if (notifyCarry.isNotEmpty()) cut = deliverNotifications(budget)
+        // 通知の中で出したホスト呼び出しも、この tick で実行する（取り出すのはこの1回だけ）
+        while (true) hostCallCarry.addLast(hostCallQueue.poll() ?: break)
+        if (hostCallCarry.isNotEmpty()) cut = runHostCalls(budget) || cut
+        if (cut) budgetCutTicks.incrementAndGet()
     }
 
     /**
-     * [batch] のマシンに通知を配る。JVM の致命的なエラー（[Machine] の `safely` が投げ直す）で途中で抜けるときは、
-     * まだ配っていないマシンと、投げたマシンの残りを、次の tick に回してから投げ直す（`queuedForNotify` が立ったまま、
-     * 列にも載っていない状態にしない。#674）
+     * 持ち越しの列の前から、通知を配る（マシンの単位。1台の途中では切らない）。台の間で、tick の頭から予算の半分を過ぎていたら止める
+     * （1台目は必ず配る）。予算で打ち切ったら `true`。配ったマシンは列から外れる（配る中で積み直したら、[notifyQueue] から次の tick へ）。
+     * JVM の致命的なエラー（[Machine] の `safely` が投げ直す）で途中で抜けるときは、投げたマシンの残りを次の tick に回してから投げ直す
+     * （まだ配っていないマシンは持ち越しの列に残る。`queuedForNotify` が立ったまま、列にも載っていない状態にしない。#674）
      */
-    private fun deliverNotifications(batch: List<Machine>) {
-        var i = 0
+    private fun deliverNotifications(budget: TickBudget): Boolean {
+        val limit = budget.limitNanos / 2
+        // 時計を読み始める（tick の頭）
+        val start = budget.elapsed()
+        var visited = 0L
+        var cut = false
         try {
-            while (i < batch.size) {
-                batch[i].deliverNotifications()
-                i++
+            while (true) {
+                if (visited > 0 && budget.elapsed() >= limit) {
+                    cut = true
+                    break
+                }
+                val machine = notifyCarry.removeFirstOrNull() ?: break
+                visited++
+                try {
+                    machine.deliverNotifications()
+                } catch (t: Throwable) {
+                    machine.requestNotifyAfterAbort()
+                    throw t
+                }
             }
-        } catch (t: Throwable) {
-            for (j in i + 1 until batch.size) notifyQueue.add(batch[j])
-            batch[i].requestNotifyAfterAbort()
-            throw t
+        } finally {
+            tickVisitedMachines.addAndGet(visited)
+            notifyNanos.addAndGet(budget.elapsed() - start)
         }
+        if (cut) carriedMachines.addAndGet(notifyCarry.size.toLong())
+        return cut
+    }
+
+    /**
+     * 持ち越しの列の前から、マシンごとにホスト呼び出しを実行する。tick の頭から予算を過ぎたら止める（毎 tick 1件目は必ず実行する）。
+     * 予算で打ち切ったら `true`。手を付けていないマシンは持ち越しの列の前に残り、実行したうえでまだ残っているマシン
+     * （1台の上限か予算に達した）は、この tick の終わりに列の後ろへ回す（この tick の中では2回処理しない）。
+     * JVM の致命的なエラーで抜けるときも、実行していたマシンを列に戻す（`queuedForHostCalls` が立ったまま列にない状態にしない）
+     */
+    private fun runHostCalls(budget: TickBudget): Boolean {
+        val start = budget.elapsed()
+        val again = ArrayList<Machine>()
+        var visited = 0L
+        try {
+            while (!budget.expired) {
+                val machine = hostCallCarry.removeFirstOrNull() ?: break
+                visited++
+                // 投げたときも列に戻す（空なら、次に回ってきたときに印を下ろす）
+                again += machine
+                if (!machine.runHostCalls(budget)) again.removeAt(again.size - 1)
+            }
+        } finally {
+            tickVisitedMachines.addAndGet(visited)
+            hostCallNanos.addAndGet(budget.elapsed() - start)
+            hostCallCarry.addAll(again)
+        }
+        if (budget.expired) carriedMachines.addAndGet((hostCallCarry.size - again.size).toLong())
+        return budget.expired
     }
 
     /**
@@ -466,7 +531,38 @@ internal class SchedulerInternals(
     val moduleStore: ModuleStore? = null,
     /** ゲストの再起動で起動し直すまでの待ち（#635。テストで短い値や [RebootBackoff.NONE] にする） */
     val rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
+    /** tick ごとの予算（#356）を測る時計（ナノ秒。テストで手で進めるものにする） */
+    val nanoTime: () -> Long = System::nanoTime,
 )
+
+/**
+ * 1回の `tick()` の中の、メインスレッドの時間の予算（#356）。[limitNanos] は tick の頭からの上限。
+ * 時計は最初に要るときに読み始める（通知もホスト呼び出しもない tick では読まない）。メインスレッドだけで使う
+ */
+internal class TickBudget(private val clock: () -> Long, val limitNanos: Long) {
+    private var start = 0L
+    private var started = false
+
+    /** 予算を使い切った（[check] が見た）。いったん立ったら下ろさない */
+    var expired: Boolean = false
+        private set
+
+    /** tick の頭（最初に読んだとき）からの経過時間 */
+    fun elapsed(): Long {
+        val t = clock()
+        if (!started) {
+            started = true
+            start = t
+        }
+        return t - start
+    }
+
+    /** 1件を処理した後に呼ぶ。予算を使い切ったら `true`（以後 [expired]） */
+    fun check(): Boolean {
+        if (!expired && elapsed() >= limitNanos) expired = true
+        return expired
+    }
+}
 
 /** 一時停止の解除。`close()` で再開する（2回呼んでもよい）。 */
 @ApiStatus.Internal
@@ -521,6 +617,14 @@ public class SchedulerConfig private constructor(builder: Builder) {
      */
     public val moduleStore: ModuleStore = builder.moduleStore
 
+    /**
+     * メインスレッドで行うカーネルの処理（通知の配布とホスト呼び出し）の、サーバー全体の tick ごとの時間の予算（ナノ秒。#356、ADR 0356）。
+     * 通知は半分まで、ホスト呼び出しは通知の残りを含めて全部まで使う。超えた分は次の tick 以降に持ち越す（捨てない・断らない）。
+     * 1件で超えることはある（呼び出しは途中で止められない）が、毎 tick 少なくとも1件は進める。
+     * 仮: 5 ms（1 tick の 1 割。確定は #251）
+     */
+    public val mainThreadBudgetNanos: Long = builder.mainThreadBudgetNanos
+
     /** [SchedulerConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
@@ -531,6 +635,7 @@ public class SchedulerConfig private constructor(builder: Builder) {
         internal var programCacheBytes: Long = 32L * 1024 * 1024
         internal var totalMemoryBytes: Long? = null
         internal var moduleStore: ModuleStore = ModuleStore.NONE
+        internal var mainThreadBudgetNanos: Long = 5_000_000
 
         /** 同時に WASM を実行するマシンの数の上限（1 以上） */
         public fun maxConcurrentMachines(value: Int): Builder = apply {
@@ -576,6 +681,12 @@ public class SchedulerConfig private constructor(builder: Builder) {
 
         /** 待機点保存が指すモジュールの置き場（#82） */
         public fun moduleStore(value: ModuleStore): Builder = apply { moduleStore = value }
+
+        /** メインスレッドの tick ごとの時間の予算（ナノ秒。1 以上。`Long.MAX_VALUE` で実質なし。#356） */
+        public fun mainThreadBudgetNanos(value: Long): Builder = apply {
+            require(value >= 1) { "mainThreadBudgetNanos は 1 以上" }
+            mainThreadBudgetNanos = value
+        }
 
         /** 設定を作る。 */
         public fun build(): SchedulerConfig = SchedulerConfig(this)

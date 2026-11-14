@@ -138,7 +138,10 @@ public class MachineConfig private constructor(builder: Builder) {
     /** プロセスの数の上限（終わっていないプロセスと、親が刈り取っていないゾンビの合計。仮: 64。#46） */
     public val maxProcesses: Int = builder.maxProcesses
 
-    /** 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ */
+    /**
+     * 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ。
+     * サーバー全体の時間の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）は、これに重ねてかかる
+     */
     public val maxHostCallsPerTick: Int = builder.maxHostCallsPerTick
 
     /**
@@ -3659,8 +3662,9 @@ public class Machine private constructor(
     // ---- メインスレッドでのホスト呼び出し（#44） ----
 
     /**
-     * [call] を次の `tick()` の中でメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
-     * 残りは次の tick へ、出した順に）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
+     * [call] を次の `tick()` 以降にメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
+     * 残りは次の tick へ、出した順に。サーバー全体の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）を使い切った tick では、
+     * 後の tick に回る。断らない）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
      * マシンが止めている途中・止まった（CRASHED）とき、スケジューラが閉じているときは、[ProcessKilledException] で終えた future を返す。
      * 実行する前にマシンを止めたときも、同じ例外で終える（実行しない）。
      *
@@ -3684,13 +3688,18 @@ public class Machine private constructor(
         return future
     }
 
-    /** `tick()` の中で、メインスレッドからホスト呼び出しを実行する（ロックの外）。まだ残っていれば `true` */
-    internal fun runHostCalls(): Boolean {
+    /**
+     * `tick()` の中で、メインスレッドからホスト呼び出しを実行する（ロックの外）。まだ残っていれば `true`。
+     * 1 tick に [MachineConfig.maxHostCallsPerTick] 件まで。1件ごとにサーバー全体の予算（[budget]。#356）を確かめ、
+     * 使い切ったらそこで止める（呼んだ時点で1件は実行する）
+     */
+    internal fun runHostCalls(budget: TickBudget): Boolean {
         var ran = 0
         while (ran < config.maxHostCallsPerTick) {
             val pending = lock.withLockValue { hostCalls.removeFirstOrNull() } ?: break
             ran++
             pending.run()
+            if (budget.check()) break
         }
         return lock.withLockValue {
             val remains = hostCalls.isNotEmpty()

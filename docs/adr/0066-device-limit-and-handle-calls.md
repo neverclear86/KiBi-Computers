@@ -75,5 +75,5 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 
 ## 負荷
 
-tick の処理は増やさない。メインスレッドの呼び出しの件数は `maxHostCallsPerTick` のまま（サーバー全体の予算は #356）。
+tick の処理は増やさない。メインスレッドの呼び出しの件数は `maxHostCallsPerTick` のまま。これに重ねて、サーバー全体の tick ごとの時間の予算がかかる（#356、ADR 0356）。
 上限の判定は、つなぐときの `writeLock` の中で表の大きさを見るだけ。
