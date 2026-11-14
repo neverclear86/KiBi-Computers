@@ -96,7 +96,8 @@
 
 - メソッドの表はつないだときに1回だけ読む（変わらない表）
 - Kotlin の関数型・`suspend`・value class は出さない。Java からの使い方は `DeviceApiJavaTest`
-- MC 依存の部分（NeoForge の `BlockCapability`）は #153
+- MC 依存の部分（NeoForge の `BlockCapability`）は #153 で `pro.ikili.kibicomputers.neoforge.api.KibiCapabilities.DEVICE`（`BlockCapability<Device, @Nullable Direction>`）にした。
+  他 MOD のデバイスも1台のマシンにだけつながる（実体の単位の排他）。address は KiBi が持つ（ブロックエンティティのデータ添付、なければ座標から）。ADR 0153
 
 ## 保存（Q6）
 

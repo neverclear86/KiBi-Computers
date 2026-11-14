@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
@@ -131,6 +132,7 @@ internal enum class LoadPhase(val label: String) {
  *   [LoadPhase.COMPUTE] で、計算させる台が全部、打ち込んだ命令を画面に出すまで待つ上限にも使う
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
+ * @property devicesEvery この台数に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。#153）を置く（`-PloadTestDevices`。0 なら置かない）
  */
 internal data class LoadSettings(
     val os: LoadOs,
@@ -142,7 +144,13 @@ internal data class LoadSettings(
     val bootTimeoutTicks: Int = if (paced) 150_000 else 15_000,
     val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
     val massUnload: Boolean = false,
-)
+    val devicesEvery: Int = System.getProperty(DEVICES_PROPERTY)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+) {
+    companion object {
+        /** 他 MOD 役のデバイスを置く割合を渡すシステムプロパティ（`-PloadTestDevices`） */
+        const val DEVICES_PROPERTY: String = "kibicomputers.loadTest.devices"
+    }
+}
 
 /** tick の時間の統計（ミリ秒）。 */
 internal data class TickStats(val ticks: Int, val avg: Double, val p50: Double, val p95: Double, val max: Double) {
@@ -345,6 +353,9 @@ internal class LoadReport(
         val sb = StringBuilder()
         sb.append("- OS: ").append(s.os.label).append('\n')
         sb.append(String.format(Locale.ROOT, "- 台数: %d（計算・出力はそれぞれ %d 台）、tick を 50 ms にそろえる: %s\n", s.count, s.busy, s.paced))
+        if (s.devicesEvery > 0) {
+            sb.append(String.format(Locale.ROOT, "- 他 MOD 役のデバイス（樽）: %d 台に1台（%d 個）\n", s.devicesEvery, (s.count + s.devicesEvery - 1) / s.devicesEvery))
+        }
         sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台の電源を切る: %.1f ms（それぞれ 1 tick の中）\n", placeMillis, powerOnMillis, powerOffMillis))
         sb.append(String.format(Locale.ROOT, "- 出力させる台が全部、画面に出すまで: %d tick（ここから「一部が出力し続ける」を測る）\n", outputWaitTicks))
         sb.append(
@@ -844,6 +855,12 @@ internal class LoadRun(
             LoadPhase.PLACED -> {
                 val t0 = System.nanoTime()
                 for (i in 0 until settings.count) LoadGameTests.Layout.placeComputer(helper, LoadGameTests.Layout.casePos(i, columns), settings.os)
+                // 他 MOD 役のデバイス（#153）。北隣は前の列のキーボードの南で、ほかのケースには隣り合わない
+                if (settings.devicesEvery > 0) {
+                    for (i in 0 until settings.count step settings.devicesEvery) {
+                        helper.setBlock(LoadGameTests.Layout.casePos(i, columns).north(), Blocks.BARREL)
+                    }
+                }
                 placeMillis = (System.nanoTime() - t0) / 1e6
             }
             LoadPhase.BOOT -> {
@@ -858,6 +875,13 @@ internal class LoadRun(
                 for (c in computers) {
                     if (c.case.wiring.connectedScreen !== c.screen || c.case.wiring.connectedKeyboard !== c.keyboard) {
                         fail("computer at ${c.case.blockPos} is not wired to its own screen and keyboard")
+                    }
+                }
+                if (settings.devicesEvery > 0) {
+                    for (i in computers.indices step settings.devicesEvery) {
+                        if (computers[i].case.wiring.connected.none { it is ExternalDeviceHolder<*> }) {
+                            fail("computer #$i is not wired to the test device next to it (is kibicomputers.dev.testDevices set?)")
+                        }
                     }
                 }
                 // 起動は、電源を入れた次の tick から終わるまでを全部測る
@@ -1030,6 +1054,7 @@ internal class LoadRun(
             helper.setBlock(pos, Blocks.AIR)
             helper.setBlock(pos.above(), Blocks.AIR)
             helper.setBlock(pos.south(), Blocks.AIR)
+            if (settings.devicesEvery > 0) helper.setBlock(pos.north(), Blocks.AIR)
         }
         watcher?.let { level.server.playerList.remove(it) }
         watcher = null

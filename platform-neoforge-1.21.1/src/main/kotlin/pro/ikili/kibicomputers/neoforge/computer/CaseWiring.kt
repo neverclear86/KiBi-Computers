@@ -9,6 +9,7 @@ import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.core.device.ScreenDevice
 import pro.ikili.kibicomputers.core.device.SpeakerDevice
 import pro.ikili.kibicomputers.core.device.wiring.DeviceHolder
+import pro.ikili.kibicomputers.core.device.wiring.DeviceRegistry
 import pro.ikili.kibicomputers.core.device.wiring.MachineWiring
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.BootFailure
@@ -30,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong
  *   （[DeviceWiring.schedule] → [rewire]）。つなぎ直すのは、ケースの今のマシンがこの結線のマシンで、止まっていない
  *   （[Machine.isRunningBootingOrRebooting]。再起動の途中も含む。#626）ときだけ
  * - マシンが自分で止まったら（CRASHED、ゲストが止めた、起動に失敗した）、ケースがマシンを外し、結線も外す（[disconnect]。#640・#641）
+ * - 隣の6面の他 MOD のデバイスの能力（`KibiCapabilities.DEVICE`。#153）は [CapabilityNeighbors] が見張り、つなぎ直しの前に
+ *   問い合わせ直して、変わったものだけ登録表に出し入れする。つなぐ規則は内蔵と同じ
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知も、キーボードの入力もメインスレッドで届く）。
  *
@@ -40,6 +43,22 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
     private val core = MachineWiring(DeviceWiring.registry, this)
 
     private var neighbors: List<GlobalPos> = emptyList()
+
+    // 隣の他 MOD のデバイスの能力（#153）。知らせの中では、つなぎ直しを頼むだけ
+    private val capabilities = CapabilityNeighbors(this) { DeviceWiring.schedule(this) }
+
+    /** このケースでつなぎ直した回数（[wantsRewire] のときだけ数える。テスト用） */
+    var rewires: Int = 0
+        private set
+
+    /** [face] の面で今見ている他 MOD のデバイス（テスト用） */
+    fun capabilityAt(face: Direction): Device? = capabilities.seen(face)
+
+    /** 隣の能力の provider が投げた回数（テスト用） */
+    val capabilityFailures: Int get() = capabilities.failures
+
+    /** つなぐときに投げたので、同じ登録の間は試さない候補の数（テスト用） */
+    val failedCandidates: Int get() = core.failedCount
     private var speakerAddress: String? = null
 
     /** 今つないでいるマシン（テスト用） */
@@ -102,6 +121,8 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
         } else {
             logRefused(machine, "speaker")
         }
+        capabilities.start(level, casePos)
+        capabilities.refresh()
         core.attach(machine)
     }
 
@@ -120,6 +141,8 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
         // current 自体が null なら確かめない（テスト用）。ケースのマシンが null なら、この結線のマシンではない
         val caseMachine = if (current == null) m else current.invoke()
         if (!wantsRewire(caseMachine)) return
+        rewires++
+        capabilities.refresh()
         core.rewire()
     }
 
@@ -127,6 +150,7 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
     fun disconnect() {
         val m = core.machine
         core.disconnect()
+        capabilities.stop()
         speakerAddress?.let { m?.devices?.detach(it) }
         speakerAddress = null
         neighbors = emptyList()
@@ -146,8 +170,17 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
 
     override fun onRefused(machine: Machine, holder: DeviceHolder<GlobalPos>) = logRefused(machine, nameOf(holder))
 
-    override fun onAttachFailed(holder: DeviceHolder<GlobalPos>, error: IllegalArgumentException) {
-        LOGGER.warn("Could not attach the {} ({})", nameOf(holder), holder.deviceAddress, error)
+    // 他 MOD のコード（持ち主の address の読み書きなど）を呼ばない。読み済みの address と登録の位置だけを使う
+    override fun onAttachFailed(entry: DeviceRegistry.Entry<GlobalPos>, address: String?, error: Throwable) {
+        LOGGER.warn("Could not attach the {} ({}); not retrying it until it changes", nameOf(entry.holder), address ?: "no address", error)
+    }
+
+    override fun onConnectedFailed(entry: DeviceRegistry.Entry<GlobalPos>, address: String, error: Throwable) {
+        LOGGER.warn("The {} ({}) threw after it was attached; keeping it attached", nameOf(entry.holder), address, error)
+    }
+
+    override fun onDetachFailed(entry: DeviceRegistry.Entry<GlobalPos>, address: String, error: Throwable) {
+        LOGGER.warn("The {} ({}) threw while detaching", nameOf(entry.holder), address, error)
     }
 
     override fun onConnected(holder: DeviceHolder<GlobalPos>, device: Device) {
@@ -157,6 +190,7 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
     private fun nameOf(holder: DeviceHolder<GlobalPos>): String = when (holder) {
         is ScreenBlockEntity -> "screen"
         is KeyboardBlockEntity -> "keyboard"
+        // 他 MOD のデバイスのアダプター（ExternalDeviceHolder）の toString は、位置とクラス名だけで作る
         else -> holder.toString()
     }
 
