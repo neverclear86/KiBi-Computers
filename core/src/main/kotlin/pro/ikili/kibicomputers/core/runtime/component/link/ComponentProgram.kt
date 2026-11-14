@@ -39,7 +39,7 @@ internal class ComponentProgram private constructor(
          * 元のバイト列を読んで検証する）。wasm-tools の検証は関数の本体を除いた写しにしか当てていない（#262）ので、本体の検証、
          * core モジュールのカスタム セクションの壊れ、コードのセクションの後ろの余りは、ここで Endive が断る。
          *
-         * 重いので、コンパイル用のスレッドから呼ぶ。
+         * 重いので、コンパイル用のスレッドから呼ぶ。[validate] は wasm-tools の検証の差し替え（テスト用。[ComponentLoader.load]）
          *
          * @throws WasmLoadException 読めない・検証に通らない・ホストにない import・まだ扱えない機能・上限を超えた
          * @throws WasmTrapException 検証の途中でスレッドが割り込まれた（[pro.ikili.kibicomputers.core.runtime.WasmTrapKind.INTERRUPTED]。
@@ -53,10 +53,11 @@ internal class ComponentProgram private constructor(
             metered: Boolean = true,
             limits: ComponentLimits = ComponentLimits.DEFAULT,
             policy: ComponentImportPolicy = ComponentImportPolicy.DEFAULT,
+            validate: ((ByteArray) -> Unit)? = null,
         ): ComponentProgram {
             ComponentLoader.warmUp()
             val deadline = LoadDeadline(limits.moduleLimits.timeLimitNanos)
-            val loaded = ComponentLoader.load(bytes, limits, policy, deadline = deadline)
+            val loaded = ComponentLoader.load(bytes, limits, policy, deadline = deadline, validate = validate)
             val modules = ArrayList<WasmModule>()
             val byContent = HashMap<ByteBuffer, Int>()
             val moduleIndex = HashMap<ByteRange, Int>()
