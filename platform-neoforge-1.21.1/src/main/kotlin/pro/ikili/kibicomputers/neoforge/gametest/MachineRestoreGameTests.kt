@@ -25,6 +25,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -134,28 +135,25 @@ object MachineRestoreGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun restoresARunningComputerOnLoad(helper: GameTestHelper) {
         val first = placeComputer(helper)
-        var restored = 0L
-        var coldStarts = 0L
         var copy: CaseBlockEntity? = null
         helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
             val tag = saveAndTag(helper, first)
             helper.assertTrue(tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "a running case should save PoweredOn: $tag")
-            restored = ServerMachines.Stats.restored
-            coldStarts = ServerMachines.Stats.restoresColdStart + ServerMachines.Stats.restoreFallbacks
             copy = reload(helper, tag)
             helper.assertTrue(copy!!.computer.poweredOn, "the reloaded case should be powered on")
         }.thenWaitUntil {
             val be = copy!!
             val machine = be.computer.machine
             helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
-            helper.assertTrue(ServerMachines.Stats.restored > restored, "the machine should be restored from the save")
             helper.assertTrue(be.wiring.connectedMachine === machine, "the restored machine should be wired")
             helper.assertTrue(be.wiring.connectedScreen != null, "the screen should be connected after restoring")
         }.thenExecute {
             val be = copy!!
+            // 共有の ServerMachines.Stats は並行するほかのテストでも動くので見ない（#708）。このケースの記録を見る
             helper.assertTrue(
-                ServerMachines.Stats.restoresColdStart + ServerMachines.Stats.restoreFallbacks == coldStarts,
-                "the restore should not cold-boot",
+                be.restoreStarts == 1 && be.lastRestoreSource != null && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
+                    "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, ${be.computer}",
             )
             helper.assertTrue(be.computer.machine!!.state == MachineState.RUNNING, "the restored machine should run")
             typeLine(helper, helper.getBlockEntity(KEYBOARD), "echo restored-ok")
@@ -283,7 +281,7 @@ object MachineRestoreGameTests {
         val config = ServerMachines.saveConfig
         // 順番待ちが、書き込みの終わりを十分待つようにする（テストの間だけ）
         ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 60_000)
-        var starts = 0L
+        var starts = 0
         var gate: WriterGate? = null
         // onLoad（追跡と索引）を待ってから、書き込みを積む
         helper.runAfterDelay(1) {
@@ -292,7 +290,7 @@ object MachineRestoreGameTests {
             helper.assertTrue(be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null, "the case should submit a write")
             // マシンだけを外し（電源の状態は残る）、書き込みの終わりを待つ復元の順番待ちに入れてから、FULL でなくす
             be.computer.chunkUnloaded()
-            starts = ServerMachines.Stats.restoresFromSave + ServerMachines.Stats.restoresColdStart
+            starts = be.restoreStarts
             helper.assertTrue(be.computer.beginRestore(), "the powered-on case should wait for a restore")
             ServerMachines.offerRestore(be)
             level.setChunkForced(chunk.x, chunk.z, false)
@@ -305,8 +303,8 @@ object MachineRestoreGameTests {
                 ServerMachines.drainSaves()
             }.thenIdle(20).thenExecute {
                 helper.assertTrue(
-                    ServerMachines.Stats.restoresFromSave + ServerMachines.Stats.restoresColdStart == starts,
-                    "no restore should start in a non-FULL chunk",
+                    be.restoreStarts == starts,
+                    "no restore should start in a non-FULL chunk: ${be.restoreStarts - starts} started",
                 )
                 helper.assertTrue(be.computer.machine == null, "no machine should be created in a non-FULL chunk: ${be.computer}")
                 helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should look off: ${be.computer}")
@@ -522,13 +520,11 @@ object MachineRestoreGameTests {
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         val config = ServerMachines.saveConfig
         var gate: WriterGate? = null
-        var timeouts = 0L
-        var coldStarts = 0L
+        var starts = 0
         helper.startSequence().thenWaitUntil { assertPrompt(helper, be) }.thenExecute {
             // 順番が来たら、書き込みを待たずに期限切れにする（テストの間だけ）
             ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 0)
-            timeouts = ServerMachines.Stats.restoreWriteTimeouts
-            coldStarts = ServerMachines.Stats.restoresColdStart
+            starts = be.restoreStarts
             gate = WriterGate()
             far.setFull(false)
         }.thenWaitUntil {
@@ -540,8 +536,9 @@ object MachineRestoreGameTests {
             helper.assertTrue(be.computer.machine != null, "the restore should start: ${be.computer}")
         }.thenExecute {
             helper.assertTrue(be.lastRestoreSource == null, "a timed-out write should cold-boot but was ${be.lastRestoreSource}")
-            helper.assertTrue(ServerMachines.Stats.restoreWriteTimeouts > timeouts, "the write timeout should be counted")
-            helper.assertTrue(ServerMachines.Stats.restoresColdStart > coldStarts, "the cold boot should be counted")
+            // 共有の ServerMachines.Stats は並行するほかのテストでも動くので見ない（#708）。このケースの記録を見る
+            helper.assertTrue(be.restoreStarts > starts, "the restore should start from this case")
+            helper.assertTrue(be.lastRestoreTimedOut, "the restore should see the write timeout")
             val pending = be.pendingSave
             helper.assertTrue(pending != null, "the write should still be pending")
             ServerMachines.saveConfig = config
