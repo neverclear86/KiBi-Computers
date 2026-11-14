@@ -397,13 +397,12 @@ object ServerMachines {
         if (writesTimedOut) Stats.restoreWriteTimeouts++
     }
 
-    /** 復元が終わった（メインスレッド）。数え口に入れ、冷えた起動にしたら理由をログに残す */
+    /** 復元が終わった（メインスレッド）。数え口に入れ（[countRestoreFinished]）、冷えた起動にしたら理由をログに残す */
     internal fun recordRestoreFinished(pos: BlockPos, outcome: RestoreOutcome, cause: ColdBootCause?) {
+        countRestoreFinished(outcome, cause)
         when (outcome) {
-            RestoreOutcome.RESTORED -> Stats.restored++
+            RestoreOutcome.RESTORED -> {}
             RestoreOutcome.COLD_BOOT -> {
-                Stats.restoreFallbacks++
-                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
                 when (coldBootLog.classify(cause)) {
                     ColdBootLog.Kind.EACH -> LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
                     ColdBootLog.Kind.SUMMARY -> {
@@ -415,6 +414,21 @@ object ServerMachines {
                     }
                     ColdBootLog.Kind.QUIET -> LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
                 }
+            }
+            RestoreOutcome.CANCELLED -> {}
+        }
+    }
+
+    /**
+     * 復元の終わりを数え口にだけ入れる（ログは出さず、[coldBootLog] の「起動ごとに1回の要約」も使わない）。
+     * [recordRestoreFinished] から呼ぶほか、GameTest が数え方だけを確かめるのに使う（#708）
+     */
+    internal fun countRestoreFinished(outcome: RestoreOutcome, cause: ColdBootCause?) {
+        when (outcome) {
+            RestoreOutcome.RESTORED -> Stats.restored++
+            RestoreOutcome.COLD_BOOT -> {
+                Stats.restoreFallbacks++
+                if (cause == ColdBootCause.MOD_VERSION) Stats.restoreVersionMismatches++
             }
             RestoreOutcome.CANCELLED -> {}
         }

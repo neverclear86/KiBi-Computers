@@ -170,11 +170,12 @@ object MachineSaveGameTests {
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-        val capturesBefore = ServerMachines.Stats.unloadCaptures
         level.setChunkForced(chunk.x, chunk.z, false)
         helper.succeedWhen {
             helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
-            helper.assertTrue(ServerMachines.Stats.unloadCaptures > capturesBefore, "the unload should capture the machine")
+            // 共有のカウンター（ServerMachines.Stats.unloadCaptures）は並行するほかのテストのチャンクでも動くので見ない（#548・#708）。
+            // 取り出されたことは、このケースの ID がディスク上のチャンクに載り、その世代のファイルと印がそろうことで確かめる
+            // （電源を入れただけでは ID は振られない）
             val data = level.chunkSource.chunkMap.read(chunk).join().orElse(null)
             helper.assertTrue(data != null, "the chunk should be on disk")
             val tag = data!!.getList("block_entities", Tag.TAG_COMPOUND.toInt()).map { it as CompoundTag }

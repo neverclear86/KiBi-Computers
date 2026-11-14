@@ -256,6 +256,8 @@ object AsyncSaveGameTests {
         helper.runAfterDelay(1) {
             val config = ServerMachines.saveConfig
             val maxBytes = store.maxPendingBytes
+            // 共有のカウンターの差を見るが、取り出し（saveForUnload）から drainSaves までは同じ tick のメインスレッドの同期処理の中で
+            // 終わり、その間にほかのテストのコードは走らないので、並行するテストの影響を受けない（#708）
             val stats = ServerMachines.Stats
             val checks = stats.capacityChecks
             val waits = stats.capacityWaits

@@ -33,6 +33,7 @@ import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.RestoreListener
+import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreSource
 import pro.ikili.kibicomputers.core.persist.SaveCompletion
 import pro.ikili.kibicomputers.core.persist.adoptsCompletion
@@ -176,6 +177,24 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         private set
 
     /**
+     * [startRestore] で復元を始めた回数（テスト・#708 用。メモリにだけ持ち、保存しない）。共有の [ServerMachines.Stats] は並行する
+     * ほかのテストのケースでも動くので、テストはこのケースの記録を見る
+     */
+    internal var restoreStarts: Int = 0
+        private set
+
+    /** 最後に [startRestore] へ渡った `writesTimedOut`（テスト・#708 用。まだなら `false`） */
+    internal var lastRestoreTimedOut: Boolean = false
+        private set
+
+    /**
+     * 最後に始めた復元の知らせ（テスト・#708 用）。始めた時点で `null` に戻す。知らせが来ないとき（冷えた起動を直接始めた・
+     * `restore()` が受け付けなかった）も `null` のまま。前の復元の遅れた知らせでは上書きしない
+     */
+    internal var lastRestoreOutcome: RestoreOutcome? = null
+        private set
+
+    /**
      * 復元の順番が来た（#85。[ServerMachines] の tick から）。順番待ちでなければ何もしない。今の ID（[currentIdentity]。
      * 書き込み中なら予約の世代。#575）が `claim` に通っていれば、その世代から戻す（書けなかった世代なら、置き場が直下の世代に落とす。
      * ADR 0084 の規則 9）。ID がない・新しい ID を振ってからまだ1つも書いていない・書き込みが期限までに終わらない（[writesTimedOut]）なら
@@ -199,6 +218,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             else -> RestoreSource(store, id.id, id.generation)
         }
         lastRestoreSource = source
+        lastRestoreTimedOut = writesTimedOut
+        lastRestoreOutcome = null
+        val serial = ++restoreStarts
         if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
         ServerMachines.recordRestoreStart(source != null, writesTimedOut)
         computer.startRestore(
@@ -211,9 +233,20 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             boot,
             source,
             RestoreReady { machine -> wiring.attach(level, blockPos, machine, speakerAddress) },
-            RestoreListener { _, outcome, cause -> ServerMachines.recordRestoreFinished(blockPos, outcome, cause) },
+            RestoreListener { _, outcome, cause ->
+                noteRestoreOutcome(serial, outcome)
+                ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
+            },
         )
         if (computer.machine == null) wiring.disconnect()
+    }
+
+    /**
+     * [serial] 番目に始めた復元の知らせを [lastRestoreOutcome] に記録する（#708）。知らせは close の後も届くので、最後に始めた復元
+     * （[restoreStarts]）の知らせだけを記録し、取り消した前の復元の遅れた知らせでは上書きしない。GameTest が直接呼んで確かめる
+     */
+    internal fun noteRestoreOutcome(serial: Int, outcome: RestoreOutcome) {
+        if (serial == restoreStarts) lastRestoreOutcome = outcome
     }
 
     /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick に `setChanged` する */
