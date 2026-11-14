@@ -1,0 +1,68 @@
+# os(3)
+
+## NAME
+
+os - events, timers, time and power for Lua
+
+## SYNOPSIS
+
+    os.pullEvent([filter])
+    os.pullEventRaw([filter])
+    os.queueEvent(name, ...)
+    os.startTimer(seconds)
+    os.cancelTimer(id)
+    os.sleep(seconds)
+    os.epoch([kind])
+    os.day([kind])
+    os.shutdown()
+    os.reboot()
+
+## DESCRIPTION
+
+lua(1) adds these functions to the standard `os` library. They follow the `os` API of CC: Tweaked. The standard `os.time`, `os.clock`, `os.date` and `os.exit` are not changed.
+
+### Events
+
+An event is a name followed by values. `os.pullEvent` waits for the next event and returns its name and values. With `filter`, events with other names are thrown away. `os.pullEvent` raises the error `Terminated` on a `terminate` event; `os.pullEventRaw` returns it.
+
+The program starts to receive the events of the system when it first calls `os.pullEvent` or `os.pullEventRaw`. Events from before that are not received. Up to 64 events are kept while the program does not read them; after that, new events are thrown away and an `events_dropped` event with the number of lost events is added.
+
+`os.queueEvent` adds an event after the events that have already arrived. It reaches only this program.
+
+- `peripheral` address: a device was connected
+- `peripheral_detach` address: a device was disconnected
+- `term_resize`: the size of the terminal changed
+- `timer` id: a timer of `os.startTimer` went off
+- `restored` ns ticks: the world was loaded; the real time (nanoseconds) and the game time (ticks) that were skipped
+- `events_dropped` count: events were lost
+
+Other events of the system keep their names. When an event comes from a device, its address comes before the values.
+
+### Timers
+
+`os.startTimer` returns an id, and a `timer` event with that id arrives after `seconds`. `os.cancelTimer` stops it. `os.sleep` waits for `seconds`. The shortest time is one game tick (0.05 seconds).
+
+### Time
+
+- `os.epoch([kind])`: milliseconds. `ingame` (the default) is the game time of the world (one tick is 3.6 seconds); `utc` is the real time since 1970; `local` is the same as `utc`
+- `os.day([kind])`: days. `ingame` (the default) is the game time divided by 24000 ticks; `utc` and `local` are the days since 1970
+
+### Power
+
+`os.shutdown()` turns the computer off and `os.reboot()` restarts it. Both write out buffered output first and do not return. If the computer cannot restart, `os.reboot` returns false and the reason.
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- `os.pullEvent` and `os.pullEventRaw` wait in place and do not yield, even inside a coroutine (this may change with the coroutine scheduler)
+- `os.sleep` does not throw away other events; they wait in the queue
+- `os.time`, `os.clock` and `os.date` are the standard Lua functions
+- `os.day` and `os.epoch` give different numbers. CC: Tweaked counts the in-game day from 1, and shifts the time of day by 6000 ticks (a day starts at 06:00). It uses the time of day of the world, which `/time set` changes. Here `ingame` uses the world tick counter, which only goes forward: `os.day` is the ticks divided by 24000 and starts at 0, and `os.epoch` is the ticks times 3600 (in CC: Tweaked, the same value plus 30000 ticks, which is 108000000 milliseconds). The `utc` and `local` days are counted from 0 (1970-01-01); CC: Tweaked starts at 1. The reason is that the tick counter is not changed by `/time set`, so programs can measure time with it
+- There is no global `sleep`, only `os.sleep` (CC: Tweaked has both). The standard globals are not changed
+- There is no time zone: `local` is UTC
+- `os.queueEvent` does not reach other programs
+- `os.getComputerID`, `os.getComputerLabel`, `os.setComputerLabel`, `os.run` and `os.loadAPI` are not available
+- There are no `key` and `char` events yet
+
+## SEE ALSO
+
+peripheral(3), lua(1), kibi(7)

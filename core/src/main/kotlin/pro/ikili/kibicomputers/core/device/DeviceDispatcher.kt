@@ -135,9 +135,9 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
             context.deferred?.let { return it.future }
             return checkResult(values, context)
         } catch (e: BadArgumentsException) {
-            error = CallError.BadArguments(e.message ?: "")
+            error = CallError.BadArguments(DeviceLimits.truncateMessage(e.message ?: ""))
         } catch (e: DeviceException) {
-            error = CallError.Failed(e.message ?: "")
+            error = CallError.Failed(DeviceLimits.truncateMessage(e.message ?: ""))
         } catch (t: Throwable) {
             if (isFatal(t)) {
                 // JVM が続けられない。後で返すと決めていたら、実行中のまま残さずに終えてから投げる
@@ -243,7 +243,7 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
             if (future.complete(list)) running.remove(this)
         }
 
-        override fun fail(message: String) = finish(CallError.Failed(message))
+        override fun fail(message: String) = finish(CallError.Failed(DeviceLimits.truncateMessage(message)))
 
         fun finish(error: CallError) {
             if (future.completeExceptionally(DeviceCallException(error))) running.remove(this)

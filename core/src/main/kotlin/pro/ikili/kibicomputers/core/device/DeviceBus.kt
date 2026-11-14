@@ -71,13 +71,17 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
      * （画面の `tty-resize` など）はその前に並ぶ。[Device.onAttached] の中で自分を外したときは出さない。
      *
      * @return つないだら `true`。上限に達していて断ったら `false`（どちらもイベントは出さない）
-     * @throws IllegalArgumentException address の形が違う・もうその address でつないでいる・種類の形が違う
+     * @throws IllegalArgumentException address の形が違う・もうその address でつないでいる・種類の形が違う・メソッドが
+     *   [DeviceLimits.MAX_METHODS] 個を超える
      */
     public fun attach(address: String, device: Device): Boolean {
         DeviceAddress.parse(address)
         val kind = device.kind
         require(DeviceKind.isValid(kind)) { "デバイスの種類は <名前空間>:<名前>（${DeviceKind.MAX_BYTES} バイトまで）: $kind" }
         val methods = device.methods
+        require(methods.names.size <= DeviceLimits.MAX_METHODS) {
+            "デバイスのメソッドは ${DeviceLimits.MAX_METHODS} 個まで（${methods.names.size}）: $kind"
+        }
         synchronized(writeLock) {
             require(address !in table) { "address $address のデバイスはもうつないである" }
             // 数えてから入れるまでを同じロックの中で行う（並んだ attach でも上限を越えない）

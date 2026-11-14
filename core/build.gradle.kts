@@ -231,9 +231,18 @@ val luaSource = kibiWasm.sourceArchive("lua") {
     sha256 = luaProps.getProperty("sha256")
 }
 val compileLua = kibiWasm.module("lua") {
-    // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない
-    sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c") } })
+    // 標準のインタープリター（lua.c）とライブラリ。luac.c（コンパイラー）は入れない。
+    // linit.c は KiBi の API（#94。ADR 0094）を開く kibi_linit.c に差し替える
+    sources.from(luaSource.map { task -> task.outputDir.dir("src").get().asFileTree.matching { include("*.c"); exclude("luac.c", "linit.c") } })
     sources.from("src/main/wasm/lua/kibi_wasi.c")
+    // Lua 向けの KiBi API（#94）: peripheral・os の拡張と、可変長の結果を受ける cabi_realloc
+    sources.from(
+        "src/main/wasm/lua/kibi_linit.c",
+        "src/main/wasm/lua/kibi_lua_canon.c",
+        "src/main/wasm/lua/kibi_lua_peripheral.c",
+        "src/main/wasm/lua/kibi_lua_os.c",
+    )
+    includeDirs.from(luaSource.map { task -> task.outputDir.dir("src") })
     // 起動時に PWD（カーネルの cwd）へ chdir する（#332）
     sources.from("src/main/wasm/common/kibi_cwd.c")
     includeDirs.from("src/main/wasm/lua")
