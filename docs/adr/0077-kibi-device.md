@@ -55,7 +55,7 @@
 1. 入口で、`cabi_realloc` の中（`inGuestCall`）ならトラップ。巻き直しの処理と燃料より前、メソッドの種類も見ずに弾く（ADR 0073）
 2. `ProcessContext.beginDeviceInvoke` がデバイスを1回だけ引く
    - 直接のメソッド: その場で実行して結果を返す（`pending-call` も fd も作らない。何度も呼ぶ道を軽く保つ）
-   - メインスレッドのメソッド: `P1Wait.NONE` なら積む前に `kernel(again)`。そうでなければ `PendingDeviceCall(Queued)` を呼んだプロセスの fd 表に入れ（読む権利だけ）、ロックを放してから、引いた `AttachedDevice` をそのまま `Machine.dispatchPendingDeviceCall(pid, obj, device)` に渡す（引き直さない）
+   - メインスレッドのメソッド: `callGuest` の中なら、`mayWait` に依らず積む前にトラップ（入口で弾き忘れたときのカーネル側の守り。ADR 0073）。`P1Wait.NONE` なら積む前に `kernel(again)`。そうでなければ `PendingDeviceCall(Queued)` を呼んだプロセスの fd 表に入れ（読む権利だけ）、ロックを放してから、引いた `AttachedDevice` をそのまま `Machine.dispatchPendingDeviceCall(pid, obj, device)` に渡す（引き直さない）
 3. 待機点型（`UNWIND`）は、その fd と key（`READABLE`）を実行時だけの欄に持って巻き戻す。巻き直して着いたら、結果があれば受け取って fd を閉じ、なければ同じ key でもう一度巻き戻す。ブロッキング型（`BLOCK`）は今までの `ProcessContext.invokeDevice` で待つ
 4. 結果は `ctx.callGuest { }` の中で書く
 
@@ -118,3 +118,4 @@
 - `WasiP1KibiDeviceTest`: 直接 / メインスレッド × `UNWIND` / `BLOCK` / `NONE`、`start` → `poll_oneoff` → `take`、列挙と `/dev/device` の fd、外れた後・種類の違うデバイス、境界の値、`cabi_realloc` の中の `invoke` のトラップ、ハンドルの誤り、kill での取り消し、実行時の欄を忘れた巻き直し、デバイスを1回だけ引くこと（テスト用のフック `KernelTestHooks.afterDeviceInvokeResolve` で、引いた後に付け替える）
 - `WasiP1KibiDeviceRestoreTest`: 待つ間に保存して戻す（`Queued`・実行中・`Done`）。メソッドは保存の前後を通して1回だけ走り、実行中のものは `failed("interrupted")`
 - `WasiP1ImportCheckTest`・`KibiWitTableTest`・`KibiWitParseTest`: import の型・`cabi_realloc` の要否・p2・p3 の interface を断ること、WIT との突き合わせ
+- `GuestCallGuardTest`: `callGuest` の中からメインスレッドのメソッドを `beginDeviceInvoke` で呼ぶとトラップ（待機点型・ブロッキング型、`mayWait` が `false` でも）、直接のメソッドは呼べる

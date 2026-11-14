@@ -536,7 +536,8 @@ internal interface ProcessContext {
      *   `pending-call` も fd も作らない
      * - メインスレッドのメソッド: [mayWait] が `false` なら積まずに `Done(kernel(again))`。そうでなければ、呼んだプロセスの fd 表に
      *   `pending-call`（読む権利だけ。`DeviceLimits.MAX_PENDING_CALLS` には数えない）を入れて積み、[DeviceInvokeStart.Waiting]。結果は [takeDeviceCall] で受け取り、呼んだ側が fd を閉じる。
-     *   待つ間の状態はその `pending-call` だけなので、保存できる（#65 の Q6 のとおり、実行中のものは `failed("interrupted")` になる）
+     *   待つ間の状態はその `pending-call` だけなので、保存できる（#65 の Q6 のとおり、実行中のものは `failed("interrupted")` になる）。
+     *   [callGuest] の中では、[mayWait] に依らず積む前にトラップにする（`WasmTrapException`。ホスト関数の途中は巻き戻せないため。ADR 0073）
      *
      * device でなければ `FsException(BADF)`、fd 表が満杯なら `FsException(MFILE)`、止められていれば [ProcessKilledException]
      */

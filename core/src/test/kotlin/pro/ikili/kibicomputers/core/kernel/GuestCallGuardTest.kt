@@ -156,6 +156,35 @@ class GuestCallGuardTest {
     ) { ctx, fd -> ctx.invokeDevice(fd, "w", emptyList()) }
 
     @Test
+    fun `待機点型でcallGuestの中からメインスレッドのメソッドをbeginDeviceInvokeで呼ぶと、積まずにトラップ`() = assertTraps(
+        ProcessKind.WAIT_POINT,
+        "beginDeviceInvoke",
+        prepare = { ctx, _ -> ctx.openDevice(address) },
+    ) { ctx, fd -> ctx.beginDeviceInvoke(fd, "w", emptyList(), mayWait = true) }
+
+    @Test
+    fun `ブロッキング型でcallGuestの中からメインスレッドのメソッドをbeginDeviceInvokeで呼んでもトラップ`() = assertTraps(
+        ProcessKind.BLOCKING,
+        "beginDeviceInvoke",
+        prepare = { ctx, _ -> ctx.openDevice(address) },
+    ) { ctx, fd -> ctx.beginDeviceInvoke(fd, "w", emptyList(), mayWait = true) }
+
+    @Test
+    fun `callGuestの中では、待たない設定でもメインスレッドのメソッドのbeginDeviceInvokeはトラップ`() = assertTraps(
+        ProcessKind.WAIT_POINT,
+        "beginDeviceInvoke",
+        prepare = { ctx, _ -> ctx.openDevice(address) },
+    ) { ctx, fd -> ctx.beginDeviceInvoke(fd, "w", emptyList(), mayWait = false) }
+
+    @Test
+    fun `callGuestの中でも、直接のメソッドはbeginDeviceInvokeで待たずに呼べる`() {
+        val got = assertReturns({ m, ctx, _ -> m.attachDevice(); ctx.openDevice(address) }) { ctx, fd ->
+            (ctx.beginDeviceInvoke(fd, "d", emptyList(), mayWait = true) as pro.ikili.kibicomputers.core.kernel.process.DeviceInvokeStart.Done).result
+        }
+        assertEquals(listOf(DeviceValue.of(42L)), (got as pro.ikili.kibicomputers.core.device.CallResult.Values).values)
+    }
+
+    @Test
     fun `callGuestの中でも、fdのinfo・methodsと直接のメソッドのinvokeは呼べる`() {
         val got = assertReturns({ m, ctx, _ -> m.attachDevice(); ctx.openDevice(address) }) { ctx, fd ->
             listOf(ctx.deviceInfo(fd), ctx.deviceMethods(fd), ctx.invokeDevice(fd, "d", emptyList()))

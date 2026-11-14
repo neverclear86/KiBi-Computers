@@ -1427,6 +1427,9 @@ internal class ProcessRunner(private val machine: Machine) {
                 if (result is CallResult.Values) payDeviceFuel(DeviceLimits.payloadBytes(result.values) * DeviceLimits.FUEL_PER_BYTE)
                 return DeviceInvokeStart.Done(result)
             }
+            // メインスレッドのメソッドは結果を待つ（待機点型は巻き戻し、ブロッキング型は block で待つ）。
+            // callGuest の中ではホスト関数の途中で巻き戻すことになるので、mayWait に依らず pending-call を積む前にトラップにする（ADR 0073）
+            checkNotInGuestCall("beginDeviceInvoke")
             if (!mayWait) return DeviceInvokeStart.Done(CallResult.Error(CallError.Kernel(Errno.AGAIN)))
             val (callFd, obj) = lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
