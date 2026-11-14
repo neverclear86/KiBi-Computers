@@ -1,8 +1,20 @@
 package kibi:device@0.1.0;
 
-/// p1 のゲスト向け（wasi:* を参照しない）。`kibi:device` の interface をまとめて import する
-/// （ゲストがコンポーネントにするとき・`component embed` に使う）。p2・p3 向けは #77 で置く
+/// p1 のゲスト向け（wasi:* を参照しない）。`kibi:device` の p1 の interface をまとめて import する
+/// （ゲストがコンポーネントにするとき・`component embed` に使う）。p1 の import の形は ADR 0077
 world imports {
     import types;
     import bus;
+}
+
+/// p2 のゲスト向け（仮置き。ADR 0077）
+world imports-p2 {
+    include imports;
+    import bus-poll;
+}
+
+/// p3 のゲスト向け（仮置き。ADR 0077）
+world imports-p3 {
+    include imports;
+    import bus-async;
 }

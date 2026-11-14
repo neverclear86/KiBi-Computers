@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #66（task）。前提: ADR 0065（デバイスモデル）、ADR 0073（`cabi_realloc` の中で待たない）
-- 後続: #77（WASM に出す）、#54（`/dev/device`。ADR 0054 で済んだ）、#94（Lua の `device`）、#129（隣接の検出と登録表。空いたときのつなぎ直し）、
+- 後続: #77（WASM に出す。ADR 0077 で済んだ）、#54（`/dev/device`。ADR 0054 で済んだ）、#94（Lua の `device`）、#129（隣接の検出と登録表。空いたときのつなぎ直し）、
   #67（接続・切断のイベント）、#122（CPU の性能）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 
@@ -61,7 +61,7 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 - fd → `DeviceHandle` はカーネルロックの中で引き、ハンドラーはロックの外で呼ぶ（ロックの順はデバイス → カーネルのまま）
 - メソッドの一覧は `MethodInfo(name, mainThread)`（内部の型）。メソッドの表は変わらないので、つないだときに1回だけ作る
 - `listDevices`・`deviceInfo`・`deviceMethods` は待たず、燃料を取らず、どのスレッドからでも呼べる（`cabi_realloc` の中からも）。メインスレッドに回さない。
-  WASM へ写す分の費用は #77 で決める。メインスレッドのメソッドを待つ `invoke` は、今までどおり `callGuest` の中では `WasmTrapException`（#430）
+  WASM へ写す分の費用は #77 で決めた（ADR 0077。仮の値）。メインスレッドのメソッドを待つ `invoke` は、今までどおり `callGuest` の中では `WasmTrapException`（#430）
 - デバイスは1回だけ引き、「メインスレッドのメソッドか」の確かめと実行に同じものを使う（`DeviceDispatcher.resolve` → `start(pid, device, …)`）。
   #65 の `invokeDevice` は2回引いていて、間に付け替えが起きると待機点型のプロセスが `checkMayBlock` で `IllegalStateException` になりえた
 

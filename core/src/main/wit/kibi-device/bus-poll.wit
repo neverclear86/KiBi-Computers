@@ -1,0 +1,11 @@
+package kibi:device@0.1.0;
+
+/// p2 で、待たずに積んだ呼び出しの終わりを待つ（#77。ADR 0077）。p1 では使わない（p1 では pending-call の fd を poll_oneoff で待つ）。
+/// 仮置き: interface・関数・型・wasi:* の版は、p2 の層（#685）を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+interface bus-poll {
+    use wasi:io/poll@0.2.3.{pollable};
+    use bus.{pending-call};
+
+    /// 結果が出ると準備完了になる pollable（p1 の FD_READ と同じ条件）。準備完了になっても受け取らない（受け取りは pending-call.take）
+    subscribe: func(call: borrow<pending-call>) -> pollable;
+}
