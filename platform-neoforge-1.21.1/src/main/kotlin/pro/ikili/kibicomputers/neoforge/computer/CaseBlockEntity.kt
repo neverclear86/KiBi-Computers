@@ -106,7 +106,39 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /** 電源と状態。サーバーでだけ動く（クライアントでは常に [ComputerStatus.OFF]） */
-    val computer: ComputerCase<MachineKey> = ComputerCase(tier, machineEvents) { setChanged() }
+    val computer: ComputerCase<MachineKey> = ComputerCase(tier, machineEvents) { if (!quietChange) setChanged() }
+
+    /**
+     * 電源の状態が変わっても [setChanged] を呼ばない間（[settleStopped] の `quiet`）。アンロード中・FULL でなくなったチャンクの上で
+     * `setChanged` を呼ぶと、隣のブロックの `onNeighborChange`（コンパレーターなど）が、そのチャンクを読み直すことがある。
+     * 呼び手がチャンクに `isUnsaved` を付けて、NBT を書かせる。メインスレッドだけで使う
+     */
+    private var quietChange = false
+
+    /**
+     * 止まった台を知らせの前にそろえる（#698。[ComputerCase.settleStoppedMachine]）。CRASHED の原因は、core がマネージャーの
+     * エラーの出し先（[ServerMachines] のログ）に1回だけ出す（後で知らせが届いても重ねない）。[quiet] なら、電源の状態が変わっても
+     * `setChanged` を呼ばない（アンロード・FULL でなくなったチャンクの経路。呼び手がチャンクに `isUnsaved` を付ける）
+     *
+     * @return 電源の状態を変えた
+     */
+    internal fun settleStopped(quiet: Boolean): Boolean {
+        quietChange = quiet
+        try {
+            return computer.settleStoppedMachine()
+        } finally {
+            quietChange = false
+        }
+    }
+
+    /** [setChanged] を呼んだ回数（テスト・#698 用。[settleStopped] の `quiet` を確かめる。メモリにだけ持つ） */
+    internal var setChangedCalls: Int = 0
+        private set
+
+    override fun setChanged() {
+        setChangedCalls++
+        super.setChanged()
+    }
 
     /**
      * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[TestComputerWiring.OS_BOOT_DISK]）。
@@ -274,7 +306,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     /**
      * 動いているマシンの写しを取り、世代のファイルの書き込みを予約して書き込みのスレッドに回す（#81・#84）。マシンがない・取り出し済み・
-     * [policy] が [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT・復元の途中（終わりの知らせが返るまで）・冷えた起動待ちなら何もせず `null`（#589）。ID がなければ置き場が振る（`owner.bin` も書き込みのスレッドで書く）。
+     * [policy] が [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT・復元の途中（終わりの知らせが返るまで）・冷えた起動待ち・CRASHED の台（#698）なら何もせず `null`（#589）。CRASHED の台の電源を切るのは呼び手（[ServerMachines] のアンロード・停止の経路）。ID がなければ置き場が振る（`owner.bin` も書き込みのスレッドで書く）。
      * 今の ID（[currentIdentity]）があれば、置き場の今の基準からの差分の世代にする（#83。基準が使えなければ全体を取り直す）。
      * [identity] は変えない（完了か [adoptPendingSave] で進む）。取り出しの時間は [ServerMachines.Stats] に数える（負荷試験用。#553）
      *

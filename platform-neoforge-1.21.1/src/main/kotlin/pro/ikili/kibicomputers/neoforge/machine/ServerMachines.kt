@@ -621,6 +621,27 @@ object ServerMachines {
      */
     internal fun anySettling(cases: List<CaseBlockEntity>): Boolean = cases.any { it.computer.isSettlingForSave }
 
+    /**
+     * 止まった台（CRASHED・ゲストが止めた）を、知らせを待たずに電源の切れた状態にそろえる（#698。
+     * [pro.ikili.kibicomputers.core.computer.ComputerCase.settleStoppedMachine]）。アンロード・FULL でなくなった・停止の経路で、
+     * 取り出す前と後に呼ぶ（これらの経路では、知らせが届く前に NBT を書き、外した後の知らせは捨てられるため）。
+     * ゲストが止めた直後の STOPPING（プロセスのスレッドが終わり切る前）も、止まったものとしてそろえる。
+     * CRASHED で外した台の原因（カーネルの不整合の例外）は、core がマネージャーのエラーの出し先（[ERRORS]）に1回だけ出す
+     * （tick が回るアンロード・FULL でなくなった経路で後から知らせが届いても重ねず、tick の回らない停止でも残る）。
+     * [quiet]（アンロード・FULL でなくなった経路）なら、電源の状態が変わっても `setChanged` を呼ばない
+     * （隣のブロックの `onNeighborChange` が、アンロード中・FULL でないチャンクを読み直すのを避ける）。呼び手がチャンクに `isUnsaved` を付ける
+     *
+     * @return 電源の状態を変えた
+     */
+    private fun settleStopped(be: CaseBlockEntity, quiet: Boolean): Boolean = be.settleStopped(quiet)
+
+    /**
+     * 取り出した後・写した後のそろえ（[settleStopped]）の前に、取り出した台ごとに呼ぶ（GameTest 用。#698）。待ち・取り出しの間に止まる台を
+     * 作るのに使う。メインスレッドで呼ぶ。本番では `null`
+     */
+    @Volatile
+    internal var afterCaptureForTest: ((CaseBlockEntity) -> Unit)? = null
+
     // ---- チャンクのアンロード ----
 
     private fun onChunkUnload(event: ChunkEvent.Unload) {
@@ -640,6 +661,8 @@ object ServerMachines {
      */
     internal fun saveForUnload(chunk: LevelChunk, cases: List<CaseBlockEntity>, adopt: Boolean) {
         val store = WorldMachineSaves.current ?: return
+        // 止まった台は電源を切ってから書く（アンロードでは setChanged が効かないので、変わったらチャンクに印を付ける。#698）
+        for (be in cases) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -671,6 +694,9 @@ object ServerMachines {
                 Stats.unloadCaptures++
                 Stats.unloadWrites += pending.writes
             }
+            afterCaptureForTest?.let { hook -> for (be in targets) hook(be) }
+            // 待ち・取り出しの間に止まった台（別のスレッドで CRASHED になる・ゲストが止める）も、電源を切った状態で NBT に載せる（#698）
+            for (be in targets) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
         }
         // 書き終わりは待たずに、予約した世代を NBT に載せる（書き込み中だった自動保存の予約も同じ。規則 4）
         if (adopt) for (be in cases) if (be.adoptPendingSave()) chunk.isUnsaved = true
@@ -813,6 +839,8 @@ object ServerMachines {
      */
     internal fun saveForStop(targets: List<CaseBlockEntity>, keepQuiesced: Boolean): Int {
         rotation.clear()
+        // 止まった台（CRASHED・ゲストが止めた）は、知らせがもう届かないので、ここで電源を切る（setChanged で NBT に載る。#698）
+        for (be in targets) if (!be.isRemoved) settleStopped(be, quiet = false)
         // 復元の途中の台は取り出さない（NBT は前の世代を指したまま。次に読み込んだときに戻し直す。#85）
         val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
@@ -830,6 +858,9 @@ object ServerMachines {
             }
             if (be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null) saved++
         }
+        afterCaptureForTest?.let { hook -> for (be in running) hook(be) }
+        // 待ち・取り出しの間に止まった台も、電源を切った状態で NBT に載せる（写しは取らないか、取っても電源が切れているので戻されない。#698）
+        for (be in running) settleStopped(be, quiet = false)
         // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
         drainSaves()
         if (!keepQuiesced) for (be in running) be.computer.endQuiesce()

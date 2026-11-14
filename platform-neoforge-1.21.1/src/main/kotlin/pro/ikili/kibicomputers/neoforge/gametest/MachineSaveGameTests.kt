@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
@@ -150,6 +151,245 @@ object MachineSaveGameTests {
         helper.assertTrue(!Files.exists(store.directoryOf(id)), "a player breaking the case should delete its directory")
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()
+    }
+
+    /**
+     * 止まった台の知らせが届く前に停止の手順が走っても（#698）、電源を切った状態で NBT に載る。停止の手順では tick が回らず、
+     * 外した後の知らせは捨てられるので、手順の中でケースがそろえる（結線も外す）。CRASHED の窓そのものは core の単体テストで確かめる
+     * （GameTest からは本物のマシンを CRASHED にできない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopSaveSettlesAStoppedMachine(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            machine.stop()
+            helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+            helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+            // 知らせはまだ届いていない（tick が回っていない）
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            val changes = be.setChangedCalls
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 0, "a stopped machine should not be captured")
+            helper.assertTrue(be.setChangedCalls > changes, "the stop save should call setChanged so that saveAllChunks writes the NBT")
+            helper.assertTrue(!be.computer.poweredOn, "the stop save should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the stop save should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine == null, "the stop save should disconnect the wiring")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * 止まった台の知らせが届く前にアンロード・FULL でなくなった経路（[ServerMachines.saveForUnload]）が走っても（#698）、
+     * 電源を切った状態で NBT に載る。アンロード中は `setChanged` を呼べない（隣のブロックがチャンクを読み直しうる）ので、
+     * チャンクに `isUnsaved` を付けて書かせる。この1行が抜けると、`PoweredOn=false` がディスクに行かない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun unloadSaveSettlesAStoppedMachine(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            machine.stop()
+            helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+            helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+            // 知らせはまだ届いていない（tick が回っていない）
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
+            chunk.isUnsaved = false
+            val changes = be.setChangedCalls
+            ServerMachines.saveForUnload(chunk, listOf(be), adopt = true)
+            helper.assertTrue(be.setChangedCalls == changes, "the unload save should not call setChanged (it can reload the chunk through neighbors)")
+            helper.assertTrue(!be.computer.poweredOn, "the unload save should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the unload save should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine == null, "the unload save should disconnect the wiring")
+            helper.assertTrue(chunk.isUnsaved, "the chunk should be marked unsaved so that PoweredOn=false reaches the disk")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * 取り出しの後に [be] のマシンを止める（ゲストが止めたのと同じ `stop()`。STOPPED まで待つ）フックを付けて [body] を回す（#698）。
+     * 取り出す前のそろえでは動いていて、写した後のそろえだけが止まった台を見る
+     */
+    private fun stoppingAfterCapture(helper: GameTestHelper, be: CaseBlockEntity, body: () -> Unit): Boolean {
+        var stopped = false
+        ServerMachines.afterCaptureForTest = { target ->
+            if (target === be && !stopped) {
+                // フックの中では投げない（保存の経路の途中なので）。確かめるのは後
+                val machine = be.computer.machine
+                stopped = machine != null && be.computer.poweredOn
+                machine?.stop()
+                if (machine?.awaitTermination(5_000) != true) stopped = false
+            }
+        }
+        try {
+            body()
+        } finally {
+            ServerMachines.afterCaptureForTest = null
+        }
+        return stopped
+    }
+
+    /**
+     * 停止の手順の、写した後のそろえ（#698）: 取り出した後・知らせの前にゲストが止めた台も、電源を切った状態で NBT に載る
+     * （写した世代は残るが、電源が切れているので戻されない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopSaveSettlesAMachineStoppedAfterCapture(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            var saved = 0
+            val stopped = stoppingAfterCapture(helper, be) { saved = ServerMachines.saveForStop(listOf(be), keepQuiesced = false) }
+            helper.assertTrue(stopped, "the hook should stop a powered machine after the capture")
+            helper.assertTrue(saved == 1, "the running machine should be captured before it stops but saved $saved")
+            helper.assertTrue(!be.computer.poweredOn, "the settle after the capture should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the settle after the capture should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine == null, "the settle after the capture should disconnect the wiring")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * FULL でなくなった経路（`adopt = false`）の、写した後のそろえ（#698）: 取り出した後にゲストが止めた台も電源を切り、
+     * `setChanged` を呼ばずに（[CaseBlockEntity.settleStopped] の `quiet`）チャンクに `isUnsaved` を付ける。
+     * `adopt = false` では予約の世代を NBT に載せない（印を付けない）ので、印はそろえの1行だけが付ける
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun unloadSaveSettlesAMachineStoppedAfterCapture(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
+            chunk.isUnsaved = false
+            var changes = -1
+            val stopped = stoppingAfterCapture(helper, be) {
+                val hook = ServerMachines.afterCaptureForTest!!
+                ServerMachines.afterCaptureForTest = { target ->
+                    hook(target)
+                    // 取り出しの間に付いた印を外し、そろえが付けるかを見る
+                    if (target === be) {
+                        chunk.isUnsaved = false
+                        changes = be.setChangedCalls
+                    }
+                }
+                ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
+            }
+            helper.assertTrue(stopped, "the hook should stop a powered machine after the capture")
+            helper.assertTrue(be.pendingSave != null, "the running machine should be captured before it stops")
+            helper.assertTrue(!be.computer.poweredOn, "the settle after the capture should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the settle after the capture should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.setChangedCalls == changes, "the settle should not call setChanged on the unload path")
+            helper.assertTrue(chunk.isUnsaved, "the settle after the capture should mark the chunk unsaved")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            ServerMachines.drainSaves()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * 本物の FULL でなくなった経路（`saveForDemotion` → `saveForUnload(adopt = false)` → `chunkDemoted`。#545・#698）:
+     * 取り出した後・知らせの前にゲストが止めた台は、外された後も電源が切れている（`chunkDemoted` だけでは電源が入ったまま残り、
+     * FULL に戻ると復元の順番待ちに入る）。FULL に戻しても起動し直さない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun demotedChunkSettlesAMachineStoppedAfterCapture(helper: GameTestHelper) {
+        val level = helper.level
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 400, helper.absolutePos(CASE).z / 16 - 800)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 7, 200, chunk.minBlockZ + 3)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        val machine = be.computer.machine!!
+        var stopped = false
+        fun cleanUp() {
+            if (ServerMachines.afterCaptureForTest != null) ServerMachines.afterCaptureForTest = null
+            level.setChunkForced(chunk.x, chunk.z, false)
+            level.setChunkForced(keeper.x, keeper.z, false)
+        }
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            ServerMachines.afterCaptureForTest = { target ->
+                // フックは tick の終わりの保存の経路の中で呼ばれるので、投げない。確かめるのは後
+                if (target === be && !stopped) {
+                    val powered = be.computer.poweredOn && be.computer.machine === machine
+                    machine.stop()
+                    stopped = machine.awaitTermination(5_000) && powered
+                }
+            }
+            // 置いたときの印を外し、そろえ（FULL でなくなった経路では setChanged が届かない）が付けるかを見る
+            level.getChunk(chunk.x, chunk.z).isUnsaved = false
+            level.setChunkForced(chunk.x, chunk.z, false)
+        }.thenWaitUntil {
+            helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
+            helper.assertTrue(be.computer.machine == null, "the machine should be released but was ${be.computer}")
+        }.thenExecute {
+            ServerMachines.afterCaptureForTest = null
+            try {
+                helper.assertTrue(stopped, "the hook should stop a powered machine after the demotion capture")
+                helper.assertTrue(!be.isRemoved, "the chunk should stay in memory")
+                helper.assertTrue(!be.computer.poweredOn, "the settle after the demotion capture should power the case off")
+                helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+                helper.assertTrue(be.demotedChunk!!.isUnsaved, "the demoted chunk should be marked unsaved")
+                val tag = be.saveWithoutMetadata(level.registryAccess())
+                helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+                // FULL に戻しても、電源が切れているので復元の順番待ちに入らない
+                level.setChunkForced(chunk.x, chunk.z, true)
+                level.getChunk(chunk.x, chunk.z)
+            } catch (t: Throwable) {
+                cleanUp()
+                throw t
+            }
+        }.thenExecuteAfter(5) {
+            try {
+                helper.assertTrue(level.getBlockEntity(pos) === be, "the block entity should stay in memory")
+                helper.assertTrue(!be.computer.isRestorePending && be.computer.machine == null, "the case should not restore but was ${be.computer}")
+                helper.assertTrue(!be.computer.poweredOn && be.computer.status == ComputerStatus.OFF, "the case should stay off but was ${be.computer}")
+                ServerMachines.drainSaves()
+                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+            } finally {
+                cleanUp()
+            }
+        }.thenSucceed()
     }
 
     /**

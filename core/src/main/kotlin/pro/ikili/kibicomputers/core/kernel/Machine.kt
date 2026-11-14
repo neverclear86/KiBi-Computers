@@ -348,6 +348,12 @@ public class Machine private constructor(
 
     private var crashCause: Throwable? = null
 
+    /**
+     * CRASHED にした原因（[MachineHost.onStateChanged] に渡すもの）。ケースが知らせを待たずにマシンを外すとき（[pro.ikili.kibicomputers.core.computer.ComputerCase.settleStoppedMachine]。#698）に使う。
+     * CRASHED になる前は `null`
+     */
+    internal val crashCauseForHost: Throwable? get() = lock.withLockValue { crashCause }
+
     /** 登録されているスレッドの数（カーネルロック） */
     private var registeredThreads = 0
 
@@ -637,9 +643,12 @@ public class Machine private constructor(
      * 再起動の通知を積んだ後（[MachineHost.onRebootRequested] を呼ぶまで。起動し直すまでの待ちの間を含む）は、
      * [MachineScheduler.tick]（メインスレッド）が通知を配るか [stop] でしか解けない。メインスレッドで [saveReadiness] の変わるのを待つ呼び手
      * （チャンクのアンロード、サーバーの停止）は、待っても tick が進まず予算を使い切るだけなので、これが偽の台は待たずに取り出す
-     * （取り出す内容は、待っても変わらない。[ColdBootReason.REBOOT_PENDING] の冷えた起動）
+     * （取り出す内容は、待っても変わらない。[ColdBootReason.REBOOT_PENDING] の冷えた起動）。
+     * CRASHED の台も偽（再起動を求めた後に CRASHED になると [saveReadiness] は TRANSIENT のまま残るが、待っても解けず、写しも取らない。#698）
      */
-    public val isSettlingForSave: Boolean get() = lock.withLockValue { saveReadinessLocked() == SaveReadiness.TRANSIENT && !rebootNotified }
+    public val isSettlingForSave: Boolean get() = lock.withLockValue {
+        stateValue != MachineState.CRASHED && saveReadinessLocked() == SaveReadiness.TRANSIENT && !rebootNotified
+    }
 
     /**
      * 再起動の通知を、起動し直すまでの待ち（[RebootBackoff]。#635）で遅らせている間なら `true`。この間は [isRebootPending]・
@@ -693,6 +702,8 @@ public class Machine private constructor(
      * 元のマシンは止めない・変えない。
      *
      * - 復元の途中（[isRestoring]。終わりの知らせが返るまで）か冷えた起動待ちなら、どちらの方針でも `null`（#85、#589）
+     * - 状態が [MachineState.CRASHED] なら、どちらの方針でも `null`（#698。壊れた台は保存しない。後段の失敗の不変条件の崩れた表
+     *   （[endUnadoptedRestoredProcessesLocked]）も写さない）。断るときは取り出しの番号・差分の基準に触らない
      * - [CapturePolicy.SKIP_IF_TRANSIENT] で [SaveReadiness.TRANSIENT] なら `null`（自動保存は前の世代を残す）
      * - そうでなければ必ず写しを返す。`UNSAVEABLE` のプロセス（[CapturePolicy.KILL_TRANSIENT] なら `TRANSIENT` のものも）は、
      *   写しの中でだけ `SIGKILL` で殺し、殺した pid を記録する
@@ -721,7 +732,8 @@ public class Machine private constructor(
         fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
     ): KernelStateCopy? = lock.withLockValue {
         // 復元の途中（知らせが返るまで）・冷えた起動待ちは写さない（表が空か、入れたばかりで、前の世代を残す。#85、#589）
-        if (restoreTransient) return@withLockValue null
+        // CRASHED の台は写さない（#698）。ケースが知らせを受けて外すまでの間に呼ばれうる。CRASHED は抜けないので、ここで見れば足りる
+        if (restoreTransient || stateValue == MachineState.CRASHED) return@withLockValue null
         val wholeTransient = bootingValue || rebootRequested || rebootNotified
         if (policy == CapturePolicy.SKIP_IF_TRANSIENT && saveReadinessLocked() == SaveReadiness.TRANSIENT) return@withLockValue null
         val hostWaits = HashMap<Int, IntArray>()
@@ -1053,7 +1065,8 @@ public class Machine private constructor(
      * - init でも `kernel.initPid` を下ろさない（[onProcessFinishedLocked] を通らない）
      * - fd・一時的なタイマー（`waitTimers`）・オブジェクトの参照を返さない（わざと。上のとおり）
      *
-     * 台は CRASHED のまま使い続けない: [boot]・[reboot] は断り、ケースは CRASHED の知らせでマシンを外して閉じる
+     * 台は CRASHED のまま使い続けない: [boot]・[reboot] は断り、ケースは CRASHED の知らせでマシンを外して閉じる。
+     * 保存もしない（[captureCopy] は CRASHED の台を断る。#698）ので、崩れた表が置き場に書かれることはない
      */
     private fun endUnadoptedRestoredProcessesLocked() {
         for (process in kernel.processes.all()) {

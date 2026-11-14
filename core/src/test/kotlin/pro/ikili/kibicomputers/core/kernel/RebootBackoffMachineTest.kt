@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
@@ -9,6 +10,7 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.time.Duration
@@ -229,6 +231,43 @@ class RebootBackoffMachineTest {
         h.scheduler.tick()
         assertEquals(1, host.reboots.get())
         tickUntilRunning()
+    }
+
+    @Test
+    fun `rebootを受け付けて止まり切る前にCRASHEDになった台は、保存を待たず、写さない`() = env {
+        // #698: 再起動の求めの印が立ったまま CRASHED になると saveReadiness は TRANSIENT のまま残るが、待っても解けない
+        tickUntilInitStarted()
+        val loops = initLoops.get()
+        h.scheduler.tick()
+        eventually(10_000, "init が回らない") { initLoops.get() >= loops + 3 }
+        val atGate = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        h.scheduler.hooks.beforeUnregister = { machine, pid ->
+            if (machine === m && pid == 1 && atGate.count > 0) {
+                atGate.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+        }
+        try {
+            assertTrue(m.reboot())
+            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            assertTrue(m.isSettlingForSave, "止まり切る前は待てば解ける")
+            m.lock.withLockValue { m.inconsistencyLocked("テスト") }
+            assertEquals(MachineState.CRASHED, m.state)
+            assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
+            assertFalse(m.isSettlingForSave, "CRASHED は待っても解けない")
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+        } finally {
+            h.scheduler.hooks.beforeUnregister = null
+            gate.countDown()
+        }
+        assertTrue(m.awaitTermination(5_000))
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(MachineState.CRASHED, m.state)
+        assertFalse(m.isSettlingForSave)
+        assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+        assertEquals(0, host.reboots.get(), "CRASHED の台は起動し直さない")
     }
 
     @Test

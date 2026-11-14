@@ -16,6 +16,7 @@ import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /** マシンを手放す理由（[MachineManager.release]）。 */
@@ -212,7 +213,7 @@ public class MachineManager<K : Any> internal constructor(
     /**
      * [key] のマシンの写しを取る（[Machine.captureSnapshot]）。マシンがない・止めている間にもう取り出した・
      * [CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。復元の途中（[Machine.isRestoring]。終わりの知らせが返るまで）と
-     * 冷えた起動待ちは、方針によらず `null`（#589）。止めている間に取り出したら、取り出し済みの印を付ける
+     * 冷えた起動待ちは、方針によらず `null`（#589）。CRASHED の台も、方針によらず `null`（#698）。止めている間に取り出したら、取り出し済みの印を付ける
      * （[endQuiesce] で消える。マシンは [release] まで捨てない）
      */
     @JvmOverloads
@@ -232,13 +233,25 @@ public class MachineManager<K : Any> internal constructor(
     /**
      * [key] のマシンの全体の写しを取り直す（#83。差分の基準が使えず、置き場が書かなかったとき）。取り出し済みの印は見ない（立てたまま）。
      * マシンがない・[CapturePolicy.SKIP_IF_TRANSIENT] で TRANSIENT なら `null`。復元の途中（[Machine.isRestoring]）と
-     * 冷えた起動待ちは、方針によらず `null`（#589）
+     * 冷えた起動待ちは、方針によらず `null`（#589）。CRASHED の台も `null`（#698）
      */
     public fun recapture(key: K, policy: CapturePolicy): MachineSnapshotSource? {
         val entry = entries[key] ?: return null
         val source = entry.machine.captureSnapshot(policy) ?: return null
         if (entry.quiesce != null) entry.captured = true
         return source
+    }
+
+    /**
+     * [key] のマシンが [machine] で CRASHED なら、その原因（カーネルの不整合の例外）を [MachineErrorListener] に今出す（#698）。
+     * ケースが CRASHED の知らせを待たずにマシンを外すとき（[pro.ikili.kibicomputers.core.computer.ComputerCase.settleStoppedMachine]）に、
+     * 外す前に呼ぶ。原因はマシン1台につき1回だけ出す: 後で知らせが届いても（tick が回るアンロード・FULL でなくなった経路）重ねて出さず、
+     * 知らせが届かなくても（tick の回らないサーバーの停止）ここで出してあるので残る。メインスレッドで呼ぶ
+     */
+    internal fun reportCrash(key: K, machine: Machine) {
+        val entry = entries[key] ?: return
+        if (entry.machine !== machine || machine.state != MachineState.CRASHED) return
+        entry.host.reportCrash(machine.crashCauseForHost)
     }
 
     /** 全マシンを止め、一覧を空にし、スケジューラを閉じる。待たずに返す。2回呼んでもよい */
@@ -305,10 +318,21 @@ internal class ManagedHost<K : Any>(
     @Volatile
     var released: Boolean = false
 
+    /** CRASHED の原因を出した（[reportCrash]。1台につき1回だけ出す。#698） */
+    private val crashReported = AtomicBoolean(false)
+
+    /**
+     * CRASHED の原因を [errors] に出す。CRASHED の知らせ（外した後も届く）と、知らせを待たずに外すケース（[MachineManager.reportCrash]）の
+     * どちらが先でも、1回だけ出す（#698）
+     */
+    fun reportCrash(cause: Throwable?) {
+        if (!crashReported.compareAndSet(false, true)) return
+        report(errors, "マシン $key が止まった（カーネルの不整合）", cause ?: IllegalStateException("原因なし"))
+    }
+
     override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
-        if (state == MachineState.CRASHED) {
-            report(errors, "マシン $key が止まった（カーネルの不整合）", cause ?: IllegalStateException("原因なし"))
-        }
+        // 外した後も出す（外した理由が CRASHED でなくても、原因はここでしか分からない）。ケースが先に出していれば重ねない
+        if (state == MachineState.CRASHED) reportCrash(cause)
         if (released) return
         guarded("onStateChanged") { delegate.onStateChanged(machine, state, cause) }
     }

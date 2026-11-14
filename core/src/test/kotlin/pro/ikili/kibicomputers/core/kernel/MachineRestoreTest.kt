@@ -522,6 +522,10 @@ class MachineRestoreTest {
             h.awaitRestoreCleanup(m)
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced)
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             // インスタンス・/tmp の RAM はサーバー全体の勘定にも返り、ディスクは閉じる（#576。起動用スレッドで返す）
@@ -570,6 +574,10 @@ class MachineRestoreTest {
             assertEquals(parentPid, adopted, "親が先に runtimes に入っていない")
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             // stopLocked が最後まで進み、表のプロセスがすべて終わっている
@@ -620,6 +628,10 @@ class MachineRestoreTest {
             assertEquals(childPid, adopted, "子が先に runtimes に入っていない")
             assertTrue(finished.outcomes.isEmpty(), "後段の失敗で知らせを送った: ${finished.outcomes}")
             assertFalse(m.isRestoring)
+            // 復元の途中でなくなっても、崩れた表は写さない（#698）
+            assertNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT))
+            assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
+            assertFalse(m.isSettlingForSave)
             assertFalse(m.isQuiesced, "復元の quiesce が閉じていない")
             assertEquals(1, h.events.count { it.first == m.id && it.second == MachineState.CRASHED })
             assertTrue(m.awaitTermination(5_000), "表のプロセスが終わっていない")
