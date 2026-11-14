@@ -51,7 +51,11 @@ public interface AutosaveTarget<T> {
  * @param T 接続層の台の参照。`equals`・`hashCode` で同じ台を見分ける
  */
 @ApiStatus.Internal
-public class AutosaveRotation<T : Any>(private val config: MachineSaveConfig) {
+public class AutosaveRotation<T : Any>(config: MachineSaveConfig) {
+    /** 今の設定（予算と待つ tick）。[reconfigure] で替わる */
+    public var config: MachineSaveConfig = config
+        private set
+
     private class Quiesced(val handle: QuiesceHandle, val planned: Int) {
         var age: Int = 0
     }
@@ -171,6 +175,15 @@ public class AutosaveRotation<T : Any>(private val config: MachineSaveConfig) {
         pending.remove(machine)
         carry.remove(machine)
         return quiesced.remove(machine)?.handle
+    }
+
+    /**
+     * 設定を [next] に替える（コンフィグの読み直し。#202）。周期の途中でも列は捨てない: まだ止めていない台・止めている台・
+     * 次の周期の先頭に回す台と、今の周期の数え口はそのまま残し、次の [tick] から新しい予算と待つ tick で回す。
+     * 止めている台の経った tick は残すので、待つ tick を縮めれば、次の tick で飛ばされることがある
+     */
+    public fun reconfigure(next: MachineSaveConfig) {
+        config = next
     }
 
     /** すべての台を `close` して列を空にする（サーバーの停止） */

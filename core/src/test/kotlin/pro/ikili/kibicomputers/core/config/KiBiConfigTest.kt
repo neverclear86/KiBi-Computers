@@ -141,6 +141,42 @@ class KiBiConfigTest {
     }
 
     @Test
+    fun integerEntriesRejectFractionalNumbers() {
+        val values = ConfigValues.resolve(
+            mapSource(
+                // 切り捨てて 2 にしない
+                KiBiConfig.COMPILER_THREADS to 2.9,
+                // NaN を 0（「自動」の番兵）にしない
+                KiBiConfig.MAX_CONCURRENT_MACHINES to Double.NaN,
+                KiBiConfig.TOTAL_MEMORY_MIB to 1.0f,
+                // 小数の項目は整数の値も受ける
+                KiBiConfig.FULL_SAVE_CHANGED_RATIO to 1,
+                // 整数の型なら Int の項目にも受ける
+                KiBiConfig.RESTORES_PER_TICK to 3.toShort(),
+            ),
+        )
+        assertEquals(KiBiConfig.COMPILER_THREADS.default, values[KiBiConfig.COMPILER_THREADS])
+        assertEquals(KiBiConfig.MAX_CONCURRENT_MACHINES.default, values[KiBiConfig.MAX_CONCURRENT_MACHINES])
+        assertEquals(KiBiConfig.TOTAL_MEMORY_MIB.default, values[KiBiConfig.TOTAL_MEMORY_MIB])
+        assertEquals(1.0, values[KiBiConfig.FULL_SAVE_CHANGED_RATIO])
+        assertEquals(3, values[KiBiConfig.RESTORES_PER_TICK])
+        assertEquals(
+            setOf(KiBiConfig.COMPILER_THREADS, KiBiConfig.MAX_CONCURRENT_MACHINES, KiBiConfig.TOTAL_MEMORY_MIB),
+            values.rejected.toSet(),
+        )
+    }
+
+    @Test
+    fun longEntryAcceptsIntegralTypesOnly() {
+        val entry = LongEntry(ConfigSide.SERVER, "t", "n", 5L, 0L, 10L, ConfigApply.RELOAD, "en", "ja")
+        assertEquals(7L, entry.coerce(7))
+        assertEquals(7L, entry.coerce(7L))
+        assertEquals(null, entry.coerce(7.0))
+        assertEquals(null, entry.coerce(11L))
+        assertEquals(null, entry.coerce("7"))
+    }
+
+    @Test
     fun pathsAreUniqueAndDescriptionsAreFilled() {
         val paths = KiBiConfig.ENTRIES.map { "${it.side}:${it.path}" }
         assertEquals(paths.size, paths.toSet().size, "重なったキー: $paths")

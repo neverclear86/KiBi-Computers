@@ -132,9 +132,8 @@ object ServerMachines {
             applySaveConfig(previous)
         }
 
-    /** 自動保存の列を作った設定（テスト用）。いつも [saveConfig] と同じになる */
-    internal var rotationConfig: MachineSaveConfig = save.value
-        private set
+    /** 自動保存の列が使っている設定（テスト用）。いつも [saveConfig] と同じになる */
+    internal val rotationConfig: MachineSaveConfig get() = rotation.config
 
     /** スケジューラを作った設定（テスト用）。サーバーが動いていなければ `null` */
     @Volatile
@@ -149,10 +148,8 @@ object ServerMachines {
     private fun applySaveConfig(previous: MachineSaveConfig) {
         val value = saveConfig
         if (value == previous) return
-        // 止めていた台は続けてから、新しい予算の列にする
-        rotation.clear()
-        rotation = AutosaveRotation(value)
-        rotationConfig = value
+        // 周期の途中でも列（まだ書いていない台・次の周期の先頭に回す台）と数え口は残し、次の tick から新しい予算で回す
+        rotation.reconfigure(value)
         WorldMachineSaves.current?.let {
             it.maxPendingBytes = value.writerMaxPendingBytes
             it.claimWaitMillis = value.writerFlushMillis

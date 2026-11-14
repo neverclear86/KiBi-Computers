@@ -29,11 +29,12 @@
 
 - SERVER のファイルは、ローダーが `ServerLifecycleHooks.handleServerAboutToStart` の中で、`ServerAboutToStartEvent` より前に読む（両バージョンのソースで確かめた。1.21.1 の GameTest で、サーバーを開くときにすでに読まれていたことを確かめる。1.20.1 の GameTest は、MOD のバスの購読で `Loading` を受けたことを確かめる）。`ModConfigEvent.Loading` で写しを作り、`ConfigState` に入れる。
 - 1.21.1 の `ServerMachines.onServerAboutToStart` は、その写しから `SchedulerConfig` を作って `MachineManager` を作る。
-- 読み直し（`ModConfigEvent.Reloading`）はファイルを見張るスレッドから来る。そこでは写しを作って参照を差し替えるだけで、マシンの状態に触らない。使う側はメインスレッドの tick の始めに参照を1回比べ、変わっていたときだけ当てる（tick ごとのコストは参照の比較1回。台数によらない）。
-  - `save` の値: `ServerMachines` が `MachineSaveConfig` を作り直し、中身が変わったときだけ自動保存の列と書き込みの上限に当てる。
+- 読み直し（`ModConfigEvent.Reloading`）は、ファイルの書き換え（ファイルを見張るスレッド）、1.21.1 の設定画面の保存（クライアントのスレッド）、専用サーバーにつないだクライアントが同期されたサーバーの設定を受け取ったとき（FML の `acceptSyncedConfig`）から来る。どれもメインスレッドとは限らない。そこでは写しを作って参照を差し替えるだけで、マシンの状態に触らない。使う側はメインスレッドの tick の始めに参照を1回比べ、変わっていたときだけ当てる（tick ごとのコストは参照の比較1回。台数によらない）。
+  - `save` の値: `ServerMachines` が `MachineSaveConfig` を作り直し、中身が変わったときだけ自動保存の列と書き込みの上限に当てる。自動保存の列は作り直さず、設定だけを差し替える（`AutosaveRotation.reconfigure`）。周期の途中でも、まだ書いていない台・次の周期の先頭に回す台と周期の数え口は残り、次の tick から新しい予算で回る。
   - `screenSync` の値: 予算が変わったときだけ `ScreenSyncTraffic` を作り直す（プレイヤーごとの勘定は空に戻る）。
   - `keyboard` の値: 次にキーボードを開くときから効く。使いかけの予算（プレイヤーとキーボードの組ごとに、満タンに戻るまで残る）の値が古ければ、開くときに今の値で作り直す（使った分は戻る）。`inputRefillBytesPerTick` が 0 の予算も、値を直して開き直せば新しい値になる。
 - `scheduler` の値（スレッドの数・スタック・許可の数・キャッシュ・RAM の上限）は、スケジューラを作るときに決まる。spec では `worldRestart()` にし、読み直しでは当てない。読み直しで変わったら「次にサーバー（ワールド）を開いたときに効く」とログに出す。動いている 1,000 台を止めて作り直すのは重く、壊れやすいため。
+  - 同期された設定（ファイルを持たない。`getFullPath` が例外になることで見分ける）を受け取ったときは、クライアントの写しを差し替えるだけで、「次の起動で効く」「読み直した」のログは出さない（DEBUG だけ）。クライアントでは何も変えておらず、このクライアントがサーバーを開くときはファイルを読んで `Loading` が来るため。
   - NeoForge の `ConfigValue.get()` は `worldRestart` の項目を読み直しでも変えないので、接続層は `getRaw()` で読み、変化を見つける。
 - 値が範囲の外・型の違いなら（spec が直すので普通は起きない）、その項目は既定にしてログに出す。
 - GameTest・負荷試験が `ServerMachines.saveConfig` を差し替えるときは、コンフィグの値とは別の層（上書き。core の `OverridableValue`）に入れる。上書きがあれば上書きが優先される。コンフィグの値と同じ値、または上書きを載せたときのコンフィグの値（テストの定型 `val c = saveConfig; saveConfig = c.copy(..); …; saveConfig = c` の `c`）に戻したら外れ、その後の読み直しが効く。新しいサーバーを開くとき（`onServerAboutToStart`）は、上書きを捨てて今のコンフィグを当て直す（設定と自動保存の列がずれない）。

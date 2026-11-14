@@ -69,10 +69,12 @@ public sealed class ConfigEntry<T : Any>(
     /** 設定画面の名前の lang のキー。説明は末尾に `.tooltip` を付けたキー */
     public val translationKey: String get() = "$TRANSLATION_PREFIX$section.$name"
 
-    /** [value] がこの項目の値として正しいか（型と範囲） */
-    public abstract fun accepts(value: Any): Boolean
-
-    /** ローダーから受け取った値を、この項目の型に直す。直せないか範囲の外なら null */
+    /**
+     * ローダーから受け取った値を、この項目の型に直す。型が違うか範囲の外なら null（呼ぶ側は既定にして `rejected` に入れる）。
+     *
+     * 整数の項目は整数の型（`Byte`・`Short`・`Int`・`Long`）だけを受ける。小数（`2.9`・`NaN`）は切り捨てずに断る
+     * （`NaN` を 0 にすると「自動」の番兵になってしまう）。小数の項目は数なら何でも受けるが、`NaN` は断る
+     */
     public abstract fun coerce(value: Any): T?
 
     override fun toString(): String = "${side.suffix}:$path"
@@ -106,10 +108,8 @@ public class IntEntry internal constructor(
         require(auto == null || auto in min..max) { "$name: auto out of range" }
     }
 
-    override fun accepts(value: Any): Boolean = value is Int && value in min..max
-
     override fun coerce(value: Any): Int? {
-        val n = (value as? Number)?.toLong() ?: return null
+        val n = integralOrNull(value) ?: return null
         return if (n in min.toLong()..max.toLong()) n.toInt() else null
     }
 }
@@ -132,11 +132,8 @@ public class LongEntry internal constructor(
         require(default in min..max) { "$name: default out of range" }
     }
 
-    override fun accepts(value: Any): Boolean = value is Long && value in min..max
-
     override fun coerce(value: Any): Long? {
-        if (value !is Int && value !is Long) return null
-        val n = (value as Number).toLong()
+        val n = integralOrNull(value) ?: return null
         return if (n in min..max) n else null
     }
 }
@@ -159,8 +156,6 @@ public class DoubleEntry internal constructor(
         require(default in min..max) { "$name: default out of range" }
     }
 
-    override fun accepts(value: Any): Boolean = value is Double && value in min..max
-
     override fun coerce(value: Any): Double? {
         val n = (value as? Number)?.toDouble() ?: return null
         return if (!n.isNaN() && n in min..max) n else null
@@ -178,7 +173,14 @@ public class BooleanEntry internal constructor(
     commentEn: String,
     commentJa: String,
 ) : ConfigEntry<Boolean>(side, section, name, default, apply, commentEn, commentJa) {
-    override fun accepts(value: Any): Boolean = value is Boolean
-
     override fun coerce(value: Any): Boolean? = value as? Boolean
+}
+
+/** 整数の型（`Byte`・`Short`・`Int`・`Long`）なら `Long` に直す。それ以外（小数・文字列など）は null */
+private fun integralOrNull(value: Any): Long? = when (value) {
+    is Int -> value.toLong()
+    is Long -> value
+    is Short -> value.toLong()
+    is Byte -> value.toLong()
+    else -> null
 }

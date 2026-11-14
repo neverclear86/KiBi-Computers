@@ -32,7 +32,11 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  *
  * 読み直しは、spec の値を差し替えてから、FML がファイルの変更で出すのと同じイベント（[ModConfigEvent.Reloading]）を
  * MOD のバスに流して試す（[reload]）。ファイルは書かない（ファイルを見張るスレッドとの競合を避ける）。
- * 値を変えるテストは、ほかのテストと同時に走らないよう、それぞれ別の batch にする
+ * 値を変えるテストは、ほかのテストと同時に走らないよう、それぞれ別の batch にする。
+ *
+ * `runClient`・`runGameTestServer`・`runLoadTestServer` は同じ `run/config/kibicomputers-server.toml` を使うので、
+ * ファイルの値が既定とは限らない（開発クライアントの設定画面で変えた後など）。値を変えるテストは、組み込みの既定ではなく、
+ * 始めたときの値から変え（[otherValues]）、始めたときの値に戻ったことを確かめる
  */
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
@@ -58,13 +62,16 @@ object ConfigGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, batch = "kibicomputers_config_scheduler")
     fun serverConfigValuesReachTheSchedulerConfig(helper: GameTestHelper) {
         val running = ServerMachines.schedulerConfig ?: throw GameTestAssertException("the scheduler config should be recorded")
-        val threads = KiBiConfig.COMPILER_THREADS.default + 1
-        val concurrent = 3
+        val initialThreads = KiBiConfigs.server[KiBiConfig.COMPILER_THREADS]
+        val threads = otherValues(KiBiConfig.COMPILER_THREADS, 1).single()
+        // 0（自動）でない値にする
+        val concurrent = otherValues(KiBiConfig.MAX_CONCURRENT_MACHINES, 2).first { it != KiBiConfig.MAX_CONCURRENT_MACHINES.auto }
         val originals = originalsOf(KiBiConfig.COMPILER_THREADS, KiBiConfig.MAX_CONCURRENT_MACHINES)
         try {
             reload(KiBiConfig.COMPILER_THREADS to threads, KiBiConfig.MAX_CONCURRENT_MACHINES to concurrent)
             val report = KiBiConfigs.lastReport ?: throw GameTestAssertException("a reload should be reported")
             helper.assertTrue(report.reload && report.side == ConfigSide.SERVER, "the report should be of a server reload")
+            helper.assertTrue(!report.synced, "a reload of the file should not be taken as a synced config")
             helper.assertTrue(
                 report.changed.toSet() == setOf(KiBiConfig.MAX_CONCURRENT_MACHINES, KiBiConfig.COMPILER_THREADS),
                 "both values should be reported as changed: ${report.changed}",
@@ -83,7 +90,7 @@ object ConfigGameTests {
             restore(originals)
         }
         helper.assertTrue(
-            ServerMachines.schedulerConfigFromConfig(ModuleStore.NONE).compilerThreads == KiBiConfig.COMPILER_THREADS.default,
+            ServerMachines.schedulerConfigFromConfig(ModuleStore.NONE).compilerThreads == initialThreads,
             "restoring the value should be reflected",
         )
         helper.succeed()
@@ -98,8 +105,9 @@ object ConfigGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, batch = "kibicomputers_config_save", timeoutTicks = 100)
     fun reloadedSaveValuesApply(helper: GameTestHelper) {
         val entry = KiBiConfig.RESTORES_PER_TICK
+        val initial = KiBiConfigs.server[entry]
         val originals = originalsOf(entry)
-        val first = entry.default + 1
+        val (first, second, third) = otherValues(entry, 3)
         reload(entry to first)
         helper.assertTrue(
             KiBiConfigs.lastReport?.changed == listOf<ConfigEntry<*>>(entry),
@@ -114,7 +122,7 @@ object ConfigGameTests {
                     "the reloaded value should apply on the next tick: ${ServerMachines.saveConfig.restoresPerTick}",
                 )
                 helper.assertTrue(ServerMachines.rotationConfig == ServerMachines.saveConfig, "the autosave rotation should follow the config")
-                overrideLayers(helper, entry, first)
+                overrideLayers(helper, entry, second, third)
                 newServerDropsTheOverride(helper)
             } finally {
                 restore(originals)
@@ -122,18 +130,18 @@ object ConfigGameTests {
             }
             helper.assertTrue(
                 ServerMachines.saveConfig == KiBiConfig.machineSaveConfig(KiBiConfigs.server) &&
-                    ServerMachines.saveConfig.restoresPerTick == entry.default,
+                    ServerMachines.saveConfig.restoresPerTick == initial,
                 "restoring the value should be reflected",
             )
             helper.succeed()
         }
     }
 
-    private fun overrideLayers(helper: GameTestHelper, entry: IntEntry, current: Int) {
+    private fun overrideLayers(helper: GameTestHelper, entry: IntEntry, second: Int, third: Int) {
         // テストの定型: 差し替えて、戻す。間にコンフィグが読み直されても、戻したら新しい値が効く
         val before = ServerMachines.saveConfig
         ServerMachines.saveConfig = before.copy(writerFlushMillis = 200)
-        reload(entry to current + 1)
+        reload(entry to second)
         ServerMachines.applyConfigIfChanged()
         helper.assertTrue(
             ServerMachines.saveConfig == before.copy(writerFlushMillis = 200),
@@ -141,17 +149,17 @@ object ConfigGameTests {
         )
         ServerMachines.saveConfig = before
         helper.assertTrue(
-            ServerMachines.saveConfig.restoresPerTick == current + 1,
+            ServerMachines.saveConfig.restoresPerTick == second,
             "after putting the old value back, the reloaded value should apply: ${ServerMachines.saveConfig.restoresPerTick}",
         )
         helper.assertTrue(ServerMachines.rotationConfig == ServerMachines.saveConfig, "the autosave rotation should follow the config")
         // コンフィグと同じ値に戻したら、上書きは外れる（その後の読み直しが効く）
         ServerMachines.saveConfig = ServerMachines.saveConfig.copy(writerFlushMillis = 300)
         ServerMachines.saveConfig = KiBiConfig.machineSaveConfig(KiBiConfigs.server)
-        reload(entry to current + 2)
+        reload(entry to third)
         ServerMachines.applyConfigIfChanged()
         helper.assertTrue(
-            ServerMachines.saveConfig.restoresPerTick == current + 2,
+            ServerMachines.saveConfig.restoresPerTick == third,
             "setting the configured value should drop the override: ${ServerMachines.saveConfig.restoresPerTick}",
         )
     }
@@ -175,7 +183,7 @@ object ConfigGameTests {
         val unrelated = KiBiConfig.RESTORES_PER_TICK
         val originals = originalsOf(player, unrelated)
         val before = ScreenSync.traffic
-        val bumped = before.playerBytesPerSecond + 1000
+        val bumped = otherValues(player, 1).single()
         reload(player to bumped)
         helper.runAfterDelay(2) {
             try {
@@ -183,7 +191,7 @@ object ConfigGameTests {
                 helper.assertTrue(rebuilt !== before, "the traffic should be rebuilt when the budget changes")
                 helper.assertTrue(rebuilt.playerBytesPerSecond == bumped, "the player budget should come from the config: ${rebuilt.playerBytesPerSecond}")
                 // 予算に関係のない値の読み直しでは、作り直さない（プレイヤーごとの勘定を消さない）
-                reload(unrelated to unrelated.default + 1)
+                reload(unrelated to otherValues(unrelated, 1).single())
                 ScreenSync.applyConfigIfChanged()
                 helper.assertTrue(ScreenSync.traffic === rebuilt, "an unrelated reload should keep the traffic")
             } finally {
@@ -210,18 +218,20 @@ object ConfigGameTests {
         val capacity = KiBiConfig.KEYBOARD_INPUT_CAPACITY
         val refill = KiBiConfig.KEYBOARD_INPUT_REFILL_PER_TICK
         val originals = originalsOf(capacity, refill)
+        val initialCapacity = KiBiConfigs.server[capacity]
+        val bigger = otherValues(capacity, 1).single()
         try {
             reload(refill to 0)
             val stuck = KeyboardSessions.open(player, abs, null) ?: throw GameTestAssertException("the keyboard should open")
-            helper.assertTrue(stuck.budget.refillPerTick == 0 && stuck.budget.capacity == capacity.default, "the budget should come from the config")
+            helper.assertTrue(stuck.budget.refillPerTick == 0 && stuck.budget.capacity == initialCapacity, "the budget should come from the config")
             helper.assertTrue(stuck.budget.tryConsume(100, 0), "some of the budget should be usable")
             KeyboardSessions.closeFromClient(player, stuck.id)
 
-            reload(refill to 7, capacity to capacity.default + 1000)
+            reload(refill to 7, capacity to bigger)
             val fixed = KeyboardSessions.open(player, abs, null) ?: throw GameTestAssertException("the keyboard should reopen")
             helper.assertTrue(fixed.budget !== stuck.budget, "a partly used budget with old values should be rebuilt")
             helper.assertTrue(
-                fixed.budget.refillPerTick == 7 && fixed.budget.capacity == capacity.default + 1000,
+                fixed.budget.refillPerTick == 7 && fixed.budget.capacity == bigger,
                 "the rebuilt budget should use the reloaded values: ${fixed.budget.capacity}/${fixed.budget.refillPerTick}",
             )
             helper.assertTrue(fixed.budget.tryConsume(100, 0), "the rebuilt budget should be usable")
@@ -236,6 +246,30 @@ object ConfigGameTests {
         } finally {
             restore(originals)
             KeyboardSessions.loggedOut(player)
+        }
+        helper.succeed()
+    }
+
+    /**
+     * 専用サーバーから同期された設定（ファイルを持たない）を受け取ったクライアントの経路では、写しは差し替えるが、
+     * 「次の起動で効く」とは報告しない（クライアントでは何も変えていない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, batch = "kibicomputers_config_synced")
+    fun syncedServerConfigIsNotReportedAsNeedingARestart(helper: GameTestHelper) {
+        val entry = KiBiConfig.COMPILER_THREADS
+        val originals = originalsOf(entry)
+        val synced = otherValues(entry, 1).single()
+        try {
+            (KiBiConfigs.specValue(entry) ?: error("no spec value for ${entry.path}")).set(synced)
+            KiBiConfigs.refreshForTest(ConfigSide.SERVER, reload = true, synced = true)
+            val report = KiBiConfigs.lastReport ?: throw GameTestAssertException("a reload should be reported")
+            helper.assertTrue(report.synced, "the report should be of a synced config")
+            helper.assertTrue(report.changed == listOf<ConfigEntry<*>>(entry), "the synced value should be taken: ${report.changed}")
+            helper.assertTrue(report.needsRestart.isEmpty(), "a synced config should not be reported as needing a restart: ${report.needsRestart}")
+            helper.assertTrue(KiBiConfigs.server[entry] == synced, "the client copy should hold the synced value")
+        } finally {
+            restore(originals)
         }
         helper.succeed()
     }
@@ -267,6 +301,19 @@ object ConfigGameTests {
 
     private fun serverModConfig(): ModConfig =
         ModConfigs.getModConfigs(KiBiComputers.MOD_ID).first { it.type == ModConfig.Type.SERVER }
+
+    /**
+     * [entry] の今の値（ファイルの値。既定とは限らない）と違う、範囲の中の値を [count] 個（重ならない）。
+     * 今の値より大きい値を先に、足りなければ小さい値を使う
+     */
+    private fun otherValues(entry: IntEntry, count: Int): List<Int> {
+        val current = KiBiConfigs.server[entry].toLong()
+        val above = (current + 1..minOf(entry.max.toLong(), current + count)).map { it.toInt() }
+        val below = (maxOf(entry.min.toLong(), current - count) until current).reversed().map { it.toInt() }
+        val values = (above + below).take(count)
+        check(values.size == count) { "${entry.path} has no $count values other than $current" }
+        return values
+    }
 
     private fun originalsOf(vararg entries: ConfigEntry<*>): List<Pair<ConfigEntry<*>, Any>> =
         entries.map { it to (KiBiConfigs.specValue(it)?.getRaw() ?: error("no spec value for ${it.path}")) }

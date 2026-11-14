@@ -26,7 +26,8 @@ import java.util.IdentityHashMap
  * core のコンフィグの定義（[KiBiConfig.ENTRIES]）を Forge の [ForgeConfigSpec] に写して登録し、読み込み・読み直しのたびに
  * 値の写し（[ConfigValues]）を作って [state] に入れる（#202、ADR 0202）。項目ごとのコードは書かない。
  *
- * 読み直しのイベントはファイルを見張るスレッドから来る。ここでは写しを作って参照を差し替えるだけで、マシンの状態には触らない。
+ * 読み直しのイベントは、ファイルの書き換え（ファイルを見張るスレッド）と、専用サーバーにつないだクライアントが同期された
+ * サーバーの設定を受け取ったとき（ファイルを持たない設定。案内のログは出さない）に来る。どちらもメインスレッドとは限らない。ここでは写しを作って参照を差し替えるだけで、マシンの状態には触らない。
  * 使う側は、メインスレッドの tick で参照の変化を見て当てる（1.20.1 の使う側の移植は #224）。
  * 1.21.1（`platform-neoforge-1.21.1` の同名のクラス）と同じファイル名・同じキーの木にする。
  */
@@ -137,10 +138,16 @@ object KiBiConfigs {
     private fun refresh(config: ModConfig, reload: Boolean) {
         val (side, reg) = registered.entries.firstOrNull { it.value.spec === config.getSpec() }?.toPair() ?: return
         (if (reload) reloadedByEvent else loadedByEvent) += side
-        refresh(side, reg, reload)
+        refresh(side, reg, reload, synced = reload && !isFileBacked(config))
     }
 
-    private fun refresh(side: ConfigSide, reg: Registered, reload: Boolean) {
+    /**
+     * [config] がファイルから読んだものか。専用サーバーから同期された設定は、ファイルを持たない `CommentedConfig` になり、
+     * `getFullPath` が例外になる（Forge 1.20.1 の `ModConfig.acceptSyncedConfig`）
+     */
+    private fun isFileBacked(config: ModConfig): Boolean = runCatching { config.fullPath }.isSuccess
+
+    private fun refresh(side: ConfigSide, reg: Registered, reload: Boolean, synced: Boolean = false) {
         // 1.20.1 の get() は読み直しでキャッシュを捨てる（worldRestart は印だけ）。読み込む前なら既定にする
         val source = ConfigSource { entry -> runCatching { reg.values[entry]?.get() }.getOrNull() }
         val next = ConfigValues.resolve(source, KiBiConfig.entries(side))
@@ -148,6 +155,11 @@ object KiBiConfigs {
         val changed = state(side).update(next)
         loaded += side
         if (!reload) return
+        // 同期された設定を受け取ったクライアントでは何も変えておらず、次の起動で効くものもないので、案内を出さない
+        if (synced) {
+            LOGGER.debug("Received {} from the server ({} values differ from the previous copy)", side.fileName, changed.size)
+            return
+        }
         changed.filter { it.apply == ConfigApply.WORLD_RESTART }.forEach {
             LOGGER.info("{} in {} changed; it takes effect the next time the server (world) starts", it.path, side.fileName)
         }

@@ -23,6 +23,7 @@
 
 - `runLoadTestServer` は GameTest のサーバーで、測定用のテスト（`LoadGameTests` が台数ごとに作る）だけを動かす。
   テンプレートは名前空間 `kibicomputers_load`（`src/dev/resources`。jar には入らない）のもので、その名前空間だけを有効にして、ほかの GameTest を混ぜない
+- 結果はサーバーのコンフィグ（`platform-neoforge-1.21.1/run/config/kibicomputers-server.toml`。#202）の値に左右される。`runClient`・`runGameTestServer` と同じ `run/` を使うので、開発クライアントの設定画面などで変えた値がそのまま効く。既定と違う値があると、試験の始めに `The load test runs with non-default values in ...` が WARN で出る。結果を比べるときは、ファイルを消すか既定に戻してから測る
 - `-PloadTestOs` は `lua`（既定。テスト用の起動ディスクの Lua の REPL）か `standard`（標準 OS のシェル。ゲームの既定。#461）
 - CI の `runGameTestServer` では、100 台の小さな試験（`loadgametests.ci` と `loadgametests.ci_standard`）が毎回動く（下の「CI の試験」）
 

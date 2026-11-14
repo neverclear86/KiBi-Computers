@@ -212,4 +212,52 @@ class AutosaveRotationTest {
         assertTrue(rotation.isCycleDone)
         assertEquals(3, rotation.writtenInCycle)
     }
+
+    @Test
+    fun `周期の途中で設定を替えても、まだ書いていない台と次の周期に回す台を捨てない`() {
+        val rotation = AutosaveRotation<FakeMachine>(MachineSaveConfig(autosaveWritesPerTick = 2, autosaveQuiesceTicks = 2))
+        val target = Target()
+        // M0 は READY にならず飛ばされて、次の周期の先頭に回る
+        val stuck = FakeMachine(0, readyAfter = 1_000)
+        val machines = listOf(stuck) + List(9) { FakeMachine(it + 1) }
+        rotation.startCycle(machines)
+        repeat(3) {
+            target.now++
+            rotation.tick(target)
+        }
+        assertEquals(1, rotation.skippedInCycle)
+        val writtenBefore = rotation.writtenInCycle
+        assertTrue(writtenBefore in 1 until 9, "周期の途中: $writtenBefore")
+        assertFalse(rotation.isCycleDone)
+
+        // 自動保存の列が使わない値だけ・使う値の両方を替える
+        val next = MachineSaveConfig(autosaveWritesPerTick = 4, autosaveQuiesceTicks = 2, restoresPerTick = 3)
+        rotation.reconfigure(next)
+        assertEquals(next, rotation.config)
+        assertEquals(writtenBefore, rotation.writtenInCycle, "数え口は残る")
+
+        var ticks = 0
+        while (!rotation.isCycleDone) {
+            target.now++
+            rotation.tick(target)
+            assertTrue(rotation.lastTickWrites <= 4 + 1)
+            assertTrue(++ticks < 100, "一巡しない")
+        }
+        assertTrue(machines.drop(1).all { it.writeCalls == 1 }, "まだ書いていなかった台も、この周期で書く")
+        assertEquals(9, rotation.writtenInCycle)
+        assertEquals(1, rotation.skippedInCycle)
+
+        // 飛ばした台は次の周期の先頭に回る
+        val order = ArrayList<FakeMachine>()
+        val recording = object : AutosaveTarget<FakeMachine> by target {
+            override fun quiesce(machine: FakeMachine): QuiesceHandle {
+                order += machine
+                return target.quiesce(machine)
+            }
+        }
+        rotation.startCycle(machines.drop(1) + stuck)
+        target.now++
+        rotation.tick(recording)
+        assertEquals(stuck, order.first())
+    }
 }

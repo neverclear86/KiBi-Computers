@@ -15,10 +15,10 @@ import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenSyncSender
-import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
+import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -83,7 +83,8 @@ object LoadGameTests {
      * 起動の前からあってプールで待っているワーカーは数えない。先に動いた OS の試験で増えたワーカーが、まだ消えずに残っているため（#476）。
      * 起動の間に作られたスレッドは、待っているワーカーでも数える（#483）
      */
-    private fun ciMaxBootKernelThreads(): Int = 2 * SchedulerConfig.DEFAULT.maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
+    private fun ciMaxBootKernelThreads(): Int =
+        2 * (ServerMachines.schedulerConfig ?: SchedulerConfig.DEFAULT).maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
     /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
     private const val CI_TIMEOUT_TICKS = 30_000
@@ -197,7 +198,8 @@ object LoadGameTests {
             )
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
             // 1人に送る量は、見ている画面の数によらず、プレイヤーごとの予算に収まる（#352）
-            val perSecond = ScreenSyncTraffic.DEFAULT_PLAYER_BYTES_PER_SECOND.toLong()
+            // 組み込みの既定ではなく、動いているサーバーの予算（コンフィグの値）と比べる
+            val perSecond = ScreenSync.traffic.playerBytesPerSecond.toLong()
             val limit = perSecond * (output.tick.ticks + 2) / ScreenSyncSender.TICKS_PER_SECOND + perSecond
             helper.assertTrue(
                 output.sentBytes <= limit,

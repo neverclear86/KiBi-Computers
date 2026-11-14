@@ -24,7 +24,14 @@ import java.util.IdentityHashMap
  * core のコンフィグの定義（[KiBiConfig.ENTRIES]）を NeoForge の [ModConfigSpec] に写して登録し、読み込み・読み直しのたびに
  * 値の写し（[ConfigValues]）を作って [state] に入れる（#202、ADR 0202）。項目ごとのコードは書かない。
  *
- * 読み直しのイベントはファイルを見張るスレッドから来る。ここでは写しを作って参照を差し替えるだけで、マシンの状態には触らない。
+ * 読み直し（[ModConfigEvent.Reloading]）は3つの経路で来る。どれもメインスレッドとは限らない:
+ * - ファイルの書き換え（ファイルを見張るスレッド）
+ * - 設定画面（NeoForge の `ConfigurationScreen`）の保存（クライアントのスレッド）
+ * - 専用サーバーにつないだクライアントが、同期されたサーバーの設定を受け取ったとき（FML の `ConfigTracker.acceptSyncedConfig`。
+ *   ファイルを持たない設定になる）。このときはクライアントの写しを差し替えるだけで、「次の起動で効く」などの案内は出さない
+ *   （クライアントでは何も変えておらず、このクライアントがサーバーを開くときは、ファイルを読み直して `Loading` が来る）
+ *
+ * ここでは写しを作って参照を差し替えるだけで、マシンの状態には触らない。
  * 使う側（[pro.ikili.kibicomputers.neoforge.machine.ServerMachines] など）は、メインスレッドの tick で参照の変化を見て当てる。
  */
 object KiBiConfigs {
@@ -58,9 +65,23 @@ object KiBiConfigs {
         registered[entry.side]?.values?.get(entry) as ModConfigSpec.ConfigValue<Any>?
 
     /** 読み込み・読み直しの結果（テスト用） */
-    class Report(val side: ConfigSide, val reload: Boolean, val changed: List<ConfigEntry<*>>, val rejected: List<ConfigEntry<*>>) {
-        /** 変わった値のうち、次にサーバー（ワールド）を開いたときに効くもの */
-        val needsRestart: List<ConfigEntry<*>> get() = changed.filter { it.apply == ConfigApply.WORLD_RESTART }
+    class Report(
+        val side: ConfigSide,
+        val reload: Boolean,
+        val changed: List<ConfigEntry<*>>,
+        val rejected: List<ConfigEntry<*>>,
+        /** サーバーから同期された設定（ファイルを持たない）を受け取った */
+        val synced: Boolean = false,
+    ) {
+        /** 変わった値のうち、次にサーバー（ワールド）を開いたときに効くもの。同期された設定では空（このクライアントでは効かない） */
+        val needsRestart: List<ConfigEntry<*>>
+            get() = if (synced) emptyList() else changed.filter { it.apply == ConfigApply.WORLD_RESTART }
+    }
+
+    /** [refresh] を、イベントの代わりに直接呼ぶ（テスト用。[synced] は同期された設定を受け取った経路のつもりにする） */
+    internal fun refreshForTest(side: ConfigSide, reload: Boolean, synced: Boolean) {
+        val reg = registered[side] ?: return
+        refresh(side, reg, reload, synced)
     }
 
     /** 最後に読み込み・読み直しをした結果（テスト用） */
@@ -114,6 +135,16 @@ object KiBiConfigs {
 
     private fun refresh(config: ModConfig, reload: Boolean) {
         val (side, reg) = registered.entries.firstOrNull { it.value.spec === config.spec }?.toPair() ?: return
+        refresh(side, reg, reload, synced = reload && !isFileBacked(config))
+    }
+
+    /**
+     * [config] がファイルから読んだものか。サーバーから同期された設定（と、ファイルのない既定のサーバー設定）は
+     * ファイルを持たず、`getFullPath` が例外になる（FML 4.0 の `ModConfig`）
+     */
+    private fun isFileBacked(config: ModConfig): Boolean = runCatching { config.fullPath }.isSuccess
+
+    private fun refresh(side: ConfigSide, reg: Registered, reload: Boolean, synced: Boolean) {
         // キャッシュしない値を読む（worldRestart の項目は get() だと読み直しで変わらず、「次の起動で効く」を出せない）。
         // 読み込む前（spec がまだ読まれていない）なら既定にする
         val source = ConfigSource { entry -> runCatching { reg.values[entry]?.getRaw() }.getOrNull() }
@@ -121,9 +152,13 @@ object KiBiConfigs {
         for (entry in next.rejected) LOGGER.warn("Ignoring an invalid value of {} in {}; using the default", entry.path, side.fileName)
         val changed = state(side).update(next)
         loaded += side
-        val report = Report(side, reload, changed, next.rejected)
+        val report = Report(side, reload, changed, next.rejected, synced)
         lastReport = report
         if (!reload) return
+        if (synced) {
+            LOGGER.debug("Received {} from the server ({} values differ from the previous copy)", side.fileName, changed.size)
+            return
+        }
         report.needsRestart.forEach {
             LOGGER.info("{} in {} changed; it takes effect the next time the server (world) starts", it.path, side.fileName)
         }
