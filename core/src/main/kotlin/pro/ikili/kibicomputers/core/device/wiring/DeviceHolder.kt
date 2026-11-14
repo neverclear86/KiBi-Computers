@@ -41,4 +41,12 @@ public interface DeviceHolder<K : Any> {
 
     /** 中継（ほかのデバイスの [relayKeys]）で届いたときもつなぐか（キーボードは `true`） */
     public val relayable: Boolean get() = false
+
+    /**
+     * 排他の単位（#153、ADR 0153）。同じもの（`===`）を返す登録どうしは1つのデバイスとみなし、どれか1つの登録を通して
+     * 1台のマシンにだけつなぐ（[DeviceRegistry.Entry.owner] に加えて、同じ実体のほかの位置もふさぐ）。`null` なら位置ごとの排他だけ
+     * （内蔵の画面・キーボード）。他 MOD のデバイスのアダプター（[ExternalDeviceHolder]）は、能力が返した生の `Device` を返す。
+     * 登録表に載せるときに1回だけ読み、その登録の間は変えない
+     */
+    public val exclusionKey: Any? get() = null
 }

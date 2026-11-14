@@ -20,6 +20,28 @@ public class DeviceMethods private constructor(private val entries: Map<String, 
     @JvmSynthetic
     internal fun find(name: String): Entry? = entries[name]
 
+    /**
+     * どのメソッドも、[revoked] が `true` を返す間は [DeviceException]（`failed(message)`）を投げる表（内部用。#153 の
+     * 他 MOD のデバイスの包み）。処理と呼ぶスレッドは変えない
+     */
+    @JvmSynthetic
+    internal fun guarded(message: String, revoked: () -> Boolean): DeviceMethods {
+        if (entries.isEmpty()) return this
+        val next = LinkedHashMap<String, Entry>()
+        for ((name, e) in entries) {
+            val inner = e.handler
+            next[name] = Entry(
+                name,
+                DeviceMethodHandler { context, args ->
+                    if (revoked()) throw DeviceException(message)
+                    inner.call(context, args)
+                },
+                e.mainThread,
+            )
+        }
+        return DeviceMethods(next)
+    }
+
     /** 登録したメソッド1つ（内部用） */
     internal class Entry(val name: String, val handler: DeviceMethodHandler, val mainThread: Boolean)
 
