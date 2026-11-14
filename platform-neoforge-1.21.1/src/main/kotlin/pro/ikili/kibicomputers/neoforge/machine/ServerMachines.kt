@@ -22,6 +22,10 @@ import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import pro.ikili.kibicomputers.core.KiBiComputers
+import pro.ikili.kibicomputers.core.config.ConfigValues
+import pro.ikili.kibicomputers.core.config.ConfigSide
+import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.core.config.OverridableValue
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
@@ -36,6 +40,7 @@ import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
@@ -45,6 +50,7 @@ import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.persist.WriteResult
 import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.IdentityHashMap
 import java.util.UUID
@@ -100,18 +106,82 @@ object ServerMachines {
     val current: MachineManager<MachineKey>?
         get() = manager
 
-    /** 待機点保存の仮の値（確定は #251）。負荷試験・GameTest が差し替え、終わったら戻す */
-    internal var saveConfig: MachineSaveConfig = MachineSaveConfig.DEFAULT
+    /**
+     * 待機点保存の設定の2層（#202）。コンフィグ（[KiBiConfigs.server]）の値の上に、テスト（GameTest・負荷試験）の上書きが載る。
+     * メインスレッドだけで使う
+     */
+    private val save = OverridableValue(MachineSaveConfig.DEFAULT)
+
+    /** 最後に当てたコンフィグの写し（参照の違いで、読み直しを見つける） */
+    private var appliedConfig: ConfigValues? = null
+
+    /** サーバーのコンフィグを読んだ後で、サーバーを作る前（[onServerAboutToStart]）に、コンフィグが読まれていたか（テスト用） */
+    @Volatile
+    internal var configLoadedAtStart: Boolean = false
+        private set
+
+    /**
+     * 待機点保存の設定（#202。コンフィグの値。値はまだ仮で、確定は #251）。負荷試験・GameTest が差し替え、終わったら戻す。
+     * 差し替えている間に読み直したコンフィグは、元の値に戻したときに効く（[OverridableValue]）
+     */
+    internal var saveConfig: MachineSaveConfig
+        get() = save.value
         set(value) {
-            field = value
-            // 止めていた台は続けてから、新しい予算の列にする
-            rotation.clear()
-            rotation = AutosaveRotation(value)
-            WorldMachineSaves.current?.let {
-                it.maxPendingBytes = value.writerMaxPendingBytes
-                it.claimWaitMillis = value.writerFlushMillis
-            }
+            val previous = save.value
+            save.set(value)
+            applySaveConfig(previous)
         }
+
+    /** 自動保存の列が使っている設定（テスト用）。いつも [saveConfig] と同じになる */
+    internal val rotationConfig: MachineSaveConfig get() = rotation.config
+
+    /** スケジューラを作った設定（テスト用）。サーバーが動いていなければ `null` */
+    @Volatile
+    internal var schedulerConfig: SchedulerConfig? = null
+        private set
+
+    /** スケジューラの設定を、今のコンフィグ（[KiBiConfigs.server]）から作る。サーバーを開くとき（[onServerAboutToStart]）に使う */
+    internal fun schedulerConfigFromConfig(modules: ModuleStore): SchedulerConfig =
+        KiBiConfig.schedulerConfig(KiBiConfigs.server, modules)
+
+    /** [saveConfig] が [previous] から変わったら、自動保存の列と書き込みの上限に当てる */
+    private fun applySaveConfig(previous: MachineSaveConfig) {
+        val value = saveConfig
+        if (value == previous) return
+        // 周期の途中でも列（まだ書いていない台・次の周期の先頭に回す台）と数え口は残し、次の tick から新しい予算で回す
+        rotation.reconfigure(value)
+        WorldMachineSaves.current?.let {
+            it.maxPendingBytes = value.writerMaxPendingBytes
+            it.claimWaitMillis = value.writerFlushMillis
+        }
+    }
+
+    /**
+     * コンフィグの写しが変わっていたら、読み直しで効く値を当てる（#202）。読み直しはファイルを見張るスレッドで写しを
+     * 差し替えるだけなので、ここ（メインスレッドの tick の始め）で当てる。変わっていなければ参照を1回比べるだけ
+     */
+    internal fun applyConfigIfChanged() {
+        if (KiBiConfigs.server === appliedConfig) return
+        applyConfig(save.value)
+    }
+
+    /** 今のコンフィグの写しを [save] に入れ、[previous] から変わっていれば当てる */
+    private fun applyConfig(previous: MachineSaveConfig) {
+        val values = KiBiConfigs.server
+        appliedConfig = values
+        save.configure(KiBiConfig.machineSaveConfig(values))
+        applySaveConfig(previous)
+    }
+
+    /**
+     * 新しいサーバーを開くときに、テストの上書きを捨て、今のコンフィグを当て直す。上書きが戻されずに残っていても
+     * （統合サーバーの開き直しなど）、設定と自動保存の列がずれない
+     */
+    internal fun resetConfigForNewServer() {
+        val previous = save.value
+        save.clearOverride()
+        applyConfig(previous)
+    }
 
     /**
      * MOD の自動保存を回すか。GameTest のサーバー（`runGameTestServer`・`runLoadTestServer`）では、起動のときに切る
@@ -368,8 +438,13 @@ object ServerMachines {
         // 待機点保存が指すモジュールの置き場（#82）: <world>/kibicomputers/modules
         val world = event.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
         val modules = FileModuleStore(world.resolve(KiBiComputers.MOD_ID).resolve("modules"))
-        // 設定はまだ仮の値（コンフィグにするのは #251）
-        manager = MachineManager(SchedulerConfig.builder().moduleStore(modules).build(), ERRORS)
+        // コンフィグ（#202）。SERVER のコンフィグは、このイベントの前（ServerLifecycleHooks.handleServerAboutToStart）に読まれる。
+        // スレッドの数などは、ここで作るときに決まる（読み直しでは変えない。ADR 0202）
+        configLoadedAtStart = KiBiConfigs.isLoaded(ConfigSide.SERVER)
+        resetConfigForNewServer()
+        val scheduler = schedulerConfigFromConfig(modules)
+        schedulerConfig = scheduler
+        manager = MachineManager(scheduler, ERRORS)
     }
 
     // ---- ケースの出入り ----
@@ -462,6 +537,7 @@ object ServerMachines {
         get() = rotation.isCycleDone
 
     private fun onServerTick(event: ServerTickEvent.Pre) {
+        applyConfigIfChanged()
         processCompletions()
         manager?.tick()
         // 復元を始める（#85。tick ごとの台数の上限つき。書き込みの終わっていない台は後回し）
@@ -878,6 +954,7 @@ object ServerMachines {
     private fun onServerStopped(event: ServerStoppedEvent) {
         val m = manager ?: return
         manager = null
+        schedulerConfig = null
         tracked.clear()
         changedLater.clear()
         rotation.clear()

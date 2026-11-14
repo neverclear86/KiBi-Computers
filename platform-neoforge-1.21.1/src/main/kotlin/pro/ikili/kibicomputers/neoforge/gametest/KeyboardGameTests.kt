@@ -253,9 +253,11 @@ object KeyboardGameTests {
         val typing = KeyboardSessions.open(typist, abs, null) ?: throw GameTestAssertException("typist should open a session")
         // 同じ tick に送りすぎると、上限を超えた分は捨てる
         val big = packet(KeyboardEvent.Paste("y".repeat(KeyboardEventCodec.MAX_TEXT_BYTES)))
+        // 予算の大きさはコンフィグの値（run/config のファイルで変わる）なので、組み込みの既定ではなく今の予算から数を決める
+        val sent = flood.budget.capacity / big.size + 2
         var accepted = 0
-        repeat(10) { if (KeyboardSessions.receive(flooder, KeyboardInputPayload(flood.id, big)) > 0) accepted++ }
-        helper.assertTrue(accepted in 1..9, "budget should accept some and reject the rest but accepted $accepted")
+        repeat(sent) { if (KeyboardSessions.receive(flooder, KeyboardInputPayload(flood.id, big)) > 0) accepted++ }
+        helper.assertTrue(accepted in 1 until sent, "budget should accept some and reject the rest but accepted $accepted of $sent")
         helper.assertTrue(KeyboardSessions.receive(typist, KeyboardInputPayload(typing.id, big)) > 0, "another player's input should still be accepted")
         // 開き直しても、使い切った分は戻らない
         val reopened = KeyboardSessions.open(flooder, abs, null) ?: throw GameTestAssertException("flooder should reopen")

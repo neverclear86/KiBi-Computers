@@ -22,7 +22,6 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.display.PixelBuffer
 import pro.ikili.kibicomputers.core.display.ScreenSyncReceiver
 import pro.ikili.kibicomputers.core.display.ScreenSyncSender
-import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenSyncTarget
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
@@ -293,7 +292,8 @@ object ScreenSyncGameTests {
             }
             .thenExecute {
                 val sent = traffic.bytesSent(player) - bytesBefore
-                val perSecond = ScreenSyncTraffic.DEFAULT_PLAYER_BYTES_PER_SECOND.toLong()
+                // 組み込みの既定ではなく、動いているサーバーの予算（コンフィグの値）と比べる
+                val perSecond = traffic.playerBytesPerSecond.toLong()
                 // 測った tick 分の予算 + 初めの残り（1秒分）+ 余裕（1 tick のずれ）
                 val limit = perSecond * (ticks + 2) / ScreenSyncSender.TICKS_PER_SECOND + perSecond
                 helper.assertTrue(sent <= limit, "sent $sent bytes in $ticks ticks, over the per-player budget ($limit)")
