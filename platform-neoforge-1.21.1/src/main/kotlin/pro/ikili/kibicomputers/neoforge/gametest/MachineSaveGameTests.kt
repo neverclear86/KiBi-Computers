@@ -360,6 +360,8 @@ object MachineSaveGameTests {
         }.thenWaitUntil {
             helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
             helper.assertTrue(be.computer.machine == null, "the machine should be released but was ${be.computer}")
+            // 書き込みの完了（ここで印が付く）は書き込みのスレッドから後の tick で戻るので、印が付くまで待つ
+            helper.assertTrue(be.demotedChunk!!.isUnsaved, "the demoted chunk should be marked unsaved")
         }.thenExecute {
             ServerMachines.afterCaptureForTest.remove(be)
             try {
