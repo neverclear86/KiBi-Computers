@@ -47,9 +47,10 @@ class CommandLuaWasmTest {
     }
 
     @Test
-    fun `export は _start と memory だけで、途中から入り直す口がない`() {
+    fun `export は _start と memory と cabi_realloc だけで、途中から入り直す口がない`() {
+        // cabi_realloc（#94）は、ホストが可変長の結果の場所を取るための口で、プログラムの途中から入り直す口ではない
         val section = WasmProgram.LUA_COMMAND.module.exportSection()
         val names = (0 until section.exportCount()).map { section.getExport(it).name() }.sorted()
-        assertEquals(listOf("_start", "memory"), names)
+        assertEquals(listOf("_start", "cabi_realloc", "memory"), names)
     }
 }

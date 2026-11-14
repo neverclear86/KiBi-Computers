@@ -134,7 +134,7 @@ class ManCommandTest {
         val en = manPages.keys.filter { !it.startsWith("/usr/share/man/ja/") }.map { it.removePrefix("/usr/share/man/") }.toSet()
         val ja = manPages.keys.filter { it.startsWith("/usr/share/man/ja/") }.map { it.removePrefix("/usr/share/man/ja/") }.toSet()
         assertEquals(en, ja)
-        for (p in listOf("man5/inittab.5", "man7/intro.7", "man7/kibi.7")) assertTrue(p in en, p)
+        for (p in listOf("man3/peripheral.3", "man3/os.3", "man5/inittab.5", "man7/intro.7", "man7/kibi.7")) assertTrue(p in en, p)
     }
 
     @Test

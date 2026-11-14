@@ -1,0 +1,66 @@
+# os(3)
+
+## 名前
+
+os - Lua のイベント・タイマー・時刻・電源
+
+## 書式
+
+    os.pullEvent([filter])
+    os.pullEventRaw([filter])
+    os.queueEvent(name, ...)
+    os.startTimer(seconds)
+    os.cancelTimer(id)
+    os.sleep(seconds)
+    os.epoch([kind])
+    os.day([kind])
+    os.shutdown()
+    os.reboot()
+
+## 説明
+
+lua(1) は、標準の `os` ライブラリにこれらの関数を足します。CC: Tweaked の `os` に合わせています。標準の `os.time`・`os.clock`・`os.date`・`os.exit` は変えていません。
+
+### イベント
+
+イベントは、名前と、それに続く値です。`os.pullEvent` は次のイベントを待ち、名前と値を返します。`filter` があれば、ほかの名前のイベントは捨てます。`os.pullEvent` は `terminate` のイベントで `Terminated` のエラーにします。`os.pullEventRaw` はそれも返します。
+
+システムのイベントは、プログラムが初めて `os.pullEvent` か `os.pullEventRaw` を呼んだときから受け取ります。それより前のイベントは受け取れません。読まない間は 64 件まで溜め、それを超えた新しいイベントは捨てて、捨てた数を持つ `events_dropped` のイベントを足します。
+
+`os.queueEvent` は、もう届いているイベントの後ろにイベントを足します。届くのはこのプログラムだけです。
+
+- `peripheral` address: デバイスがつながった
+- `peripheral_detach` address: デバイスが外れた
+- `term_resize`: 端末の大きさが変わった
+- `timer` id: `os.startTimer` のタイマーが鳴った
+- `restored` ns ticks: ワールドを読み込んだ。飛んだ実時間（ナノ秒）とゲーム内時間（tick）
+- `events_dropped` 数: イベントを捨てた
+
+ほかのシステムのイベントは名前を変えません。デバイスから来たイベントは、値の前にその address が入ります。
+
+### タイマー
+
+`os.startTimer` は id を返し、`seconds` 秒の後にその id の `timer` のイベントが届きます。`os.cancelTimer` で止めます。`os.sleep` は `seconds` 秒待ちます。最短は 1 tick（0.05 秒）です。
+
+### 時刻
+
+- `os.epoch([kind])`: ミリ秒。`ingame`（既定）はワールドのゲーム内時間（1 tick が 3.6 秒）、`utc` は 1970 年からの実時間、`local` は `utc` と同じ
+- `os.day([kind])`: 日数。`ingame`（既定）はゲーム内時間を 24000 tick で割ったもの、`utc`・`local` は 1970 年からの日数
+
+### 電源
+
+`os.shutdown()` はコンピューターを止め、`os.reboot()` は再起動します。どちらも溜めた出力を書き出してから止まり、戻りません。再起動できないときは、`os.reboot` は false と理由を返します。
+
+## CC: Tweaked との違い
+
+- `os.pullEvent`・`os.pullEventRaw` はその場で待ち、コルーチンの中でも yield しない（コルーチンのスケジューラーで変わることがある）
+- `os.sleep` はほかのイベントを捨てない（キューに残る）
+- `os.time`・`os.clock`・`os.date` は標準の Lua のもの
+- タイムゾーンはない。`local` は UTC
+- `os.queueEvent` はほかのプログラムに届かない
+- `os.getComputerID`・`os.getComputerLabel`・`os.setComputerLabel`・`os.run`・`os.loadAPI` はない
+- `key`・`char` のイベントはまだない
+
+## 関連項目
+
+peripheral(3), lua(1), kibi(7)
