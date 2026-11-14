@@ -47,6 +47,10 @@ class LuaKibiApiTest {
         @Volatile
         var context: DeviceContext? = null
 
+        /** テストの側が準備を終えたら `true`（スクリプトが `posted` で待つ） */
+        @Volatile
+        var posted = false
+
         override fun onAttached(context: DeviceContext) {
             this.context = context
         }
@@ -61,6 +65,11 @@ class LuaKibiApiTest {
                 context!!.postEvent("ping", DeviceValue.of(args.getLong(0)))
                 emptyArray()
             }
+            .direct("emit-as") { _, args ->
+                context!!.postEvent(args.getText(0), *Array(args.size() - 1) { args.get(it + 1) })
+                emptyArray()
+            }
+            .direct("posted") { _, _ -> arrayOf(DeviceValue.of(posted)) }
             .mainThread("main-echo") { _, args ->
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
@@ -68,8 +77,13 @@ class LuaKibiApiTest {
             .build()
     }
 
-    private inner class Run(script: String, val h: Harness = Harness(execRuntime = EndiveRuntime()), memoryBytes: Long? = null) : AutoCloseable {
-        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes)
+    private inner class Run(
+        script: String,
+        val h: Harness = Harness(execRuntime = EndiveRuntime()),
+        memoryBytes: Long? = null,
+        environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+    ) : AutoCloseable {
+        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment)
         val dev = TestDev()
         private val output: Int
         private val text = StringBuilder()
@@ -146,7 +160,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "echo,emit,fail,get-size,main-echo,needs-int,types",
+                "echo,emit,emit-as,fail,get-size,main-echo,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -282,6 +296,70 @@ class LuaKibiApiTest {
             val out = r.finish()
             assertEquals("ready\nperipheral\t$OTHER\nperipheral_detach\t$OTHER\nping\t$ADDRESS\t5\n", out)
         }
+    }
+
+    @Test
+    fun `カーネルのイベントの写し方とあふれて捨てた数`() = timeout(limit) {
+        // キュー（64 件）に、コンソールの tty-resize、デバイスが出す同じ名前のイベント、source のあるイベントを入れ、
+        // 残りを ping で埋めてあふれさせる。ping 以外を届いた順に書き、ping は数だけ書く
+        Run(
+            """
+            os.queueEvent("ready")
+            os.pullEvent("ready")
+            print("open")
+            io.stdout:flush()
+            repeat os.sleep(0.05) until peripheral.call("$ADDRESS", "posted")
+            peripheral.call("$ADDRESS", "emit-as", "tty-resize", 1, 2)
+            peripheral.call("$ADDRESS", "emit-as", "device-attached", "x")
+            peripheral.call("$ADDRESS", "emit-as", "multi", 1, "a", true)
+            for i = 1, 70 do peripheral.call("$ADDRESS", "emit", i) end
+            os.queueEvent("end")
+            local pings = 0
+            while true do
+                local ev = table.pack(os.pullEvent())
+                if ev[1] == "end" then break end
+                if ev[1] == "ping" then
+                    pings = pings + 1
+                else
+                    for i = 1, ev.n do ev[i] = tostring(ev[i]) end
+                    print(table.concat(ev, "\t", 1, ev.n))
+                end
+            end
+            print("pings", pings)
+            """.trimIndent(),
+        ).use { r ->
+            r.waitFor("open\n")
+            r.m.resizeConsole(100, 30)
+            r.dev.posted = true
+            val out = r.finish()
+            assertEquals(
+                listOf(
+                    // コンソールの tty-resize は値なしの term_resize
+                    "term_resize",
+                    // デバイスが出した同じ名前のイベントは写さず、source（address）を値の前に入れる
+                    "tty-resize\t$ADDRESS\t1\t2",
+                    "device-attached\t$ADDRESS\tx",
+                    "multi\t$ADDRESS\t1\ta\ttrue",
+                    // 64 件のうち 4 件は上のもの、残り 60 件が ping。あふれた 10 件は events_dropped で知らせる
+                    "events_dropped\t10",
+                    "pings\t60",
+                ).joinToString("\n", postfix = "\n"),
+                out.removePrefix("open\n"),
+            )
+        }
+    }
+
+    @Test
+    fun `os_epochとos_dayの既定のingameはworld-ticksから`() = timeout(limit) {
+        val ticks = 24000L * 3 + 5
+        val clock = object : MachineClock {
+            override fun realtimeNanos(): Long = MachineClock.SYSTEM.realtimeNanos()
+            override fun monotonicNanos(): Long = MachineClock.SYSTEM.monotonicNanos()
+            override fun worldTicks(): Long = ticks
+        }
+        val env = MachineEnvironment.builder().clock(clock).build()
+        val out = Run("print(os.epoch(), os.day(), os.epoch('ingame'), os.day('ingame'))", environment = env).use { it.finish() }
+        assertEquals("${ticks * 3600}\t3\t${ticks * 3600}\t3\n", out)
     }
 
     @Test
