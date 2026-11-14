@@ -2407,7 +2407,6 @@ public class Machine private constructor(
     /** 燃料待ち（・一時停止の解除待ち）のプロセス（カーネルロック） */
     private val fuelWaiters = ArrayList<ProcessRuntime>()
     private var inDispatcher = false
-    private var fuelRotation = 0
 
     /** 燃料待ちの数（テスト用） */
     internal val fuelWaiterCount: Int get() = lock.withLockValue { fuelWaiters.size }
@@ -2427,15 +2426,16 @@ public class Machine private constructor(
     /**
      * 燃料待ちを起こす（燃料があるか、燃料を計測しないプロセスで、一時停止でなければ）。カーネルロックの中で呼ぶ。
      * 起こすだけで燃料は渡さない（渡すのは、起こされたプロセスが CPU を取るとき）。起こした数を返す。
+     *
+     * 起こす順は、燃料待ちの列に入った順（FIFO）。スレッドを持たないプロセスは、その順で CPU の待ち行列に並ぶ。
+     * 順をずらさないのは、ずらすと tick をまたぐ順番が実行の様子（巻き戻して譲るたびに起こす回数）で変わり、プロセスが
+     * 1 tick のスライスの数より多いときに配分が偏るため（#47、ADR 0047）
      */
     internal fun wakeFuelWaitersLocked(): Int {
         if (fuelWaiters.isEmpty() || scheduler.isPausedFor(this)) return 0
         val hasFuel = fuelAccount.estimate(scheduler.now) > 0
-        val n = fuelWaiters.size
-        val start = Math.floorMod(fuelRotation++, n)
-        val order = List(n) { fuelWaiters[(start + it) % n] }
         var woken = 0
-        for (rt in order) {
+        for (rt in fuelWaiters.toList()) {
             if (rt.process.state.isTerminal) {
                 fuelWaiters.remove(rt)
                 continue

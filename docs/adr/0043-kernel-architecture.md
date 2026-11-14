@@ -84,7 +84,7 @@ ADR 0027 は「実行中のコンピューター1台に1スレッド」だった
 
 ## 一時停止と停止
 
-- `pauseAll(timeoutMillis)` は一時停止の印を立て、実行中（燃料を受け取って動いている）のプロセスがなくなるまで待つ。プロセスは CPU を取るところで止まる。止まるまでの上限は手持ち（最大 `fuelPerTick`）を使い切るまで。時間切れなら一時停止を解いてから `TimeoutException`
+- `pauseAll(timeoutMillis)` は一時停止の印を立て、実行中（燃料を受け取って動いている）のプロセスがなくなるまで待つ。プロセスは CPU を取るところで止まる。止まるまでの上限は手持ち（最大でスライス `MachineConfig.fuelSlice`。追記 #47、ADR 0047。#47 より前は `fuelPerTick`）を使い切るまで。時間切れなら一時停止を解いてから `TimeoutException`
 - `Machine.stop()` は待たずに返す（どのスレッドから呼んでもよい）。状態を `STOPPING` にし、各プロセスに停止の印を立てる。スレッドを持たないプロセスはその場で `KILLED` にし、スレッドが登録されているプロセスにだけ `Thread.interrupt()` を送る
 - 計算中の WASM は Endive の中断（`WasmInterruptedException` → `WasmTrapKind.INTERRUPTED`）で止める。カーネルの待ちはすべて割り込みを受けられる形
 - 停止の印があるときの例外は `KILLED`、ないときは `CRASHED`。カーネルの不整合はマシンを `CRASHED` にする

@@ -170,7 +170,7 @@ class WasiP1KibiTest {
         assertTrue("max err:27 ok:0 ok:0 ok:0\n" in out, out)
     }
 
-    // スライスを 1 tick 分にする（#47）。小さいと、tick が進んだ後のスライスの切れ目をその場で足して、燃料を待たずに済むことがある
+    // スライスを 1 tick 分にする（#47）。小さいと、燃料が切れる前にスライスの切れ目が来て、その場で足すか譲るので、燃料を待つ（fuelBlockingWaits）ところまで行かない
     @Test
     fun `cabi_reallocの中で燃料が切れても、巻き戻さずに燃料を待って続ける`() = run(Mode.UNWIND, "spin", fuelPerTick = 2_000_000, fuelSlice = 2_000_000) {
         waitAndPost()
@@ -189,6 +189,19 @@ class WasiP1KibiTest {
         assertEquals(ProcessState.EXITED, m.stateOf(pid), "$out ${rt.lastError}")
         assertWaitOutput(out)
         assertTrue(waited, "cabi_realloc の中で燃料を待っていない")
+    }
+
+    @Test
+    fun `cabi_reallocの中でスライスを使い切っても、巻き戻さずにスレッドを持ったまま足すか譲るかして続ける`() = run(Mode.UNWIND, "spin", fuelPerTick = 2_000_000, fuelSlice = 100_000) {
+        waitAndPost()
+        val renewals0 = h.scheduler.fuelSliceRenewals.get()
+        val yields0 = h.scheduler.fuelYields.get()
+        val out = finish()
+        assertEquals(ProcessState.EXITED, m.stateOf(pid), "$out ${rt.lastError}")
+        assertWaitOutput(out)
+        // ホスト関数の中から呼んだゲスト（cabi_realloc）の中は巻き戻せない。スライスの切れ目で、その場で足すか（同じ tick）、許可を回す（tick が進んだ後）
+        val breaks = h.scheduler.fuelSliceRenewals.get() - renewals0 + h.scheduler.fuelYields.get() - yields0
+        assertTrue(breaks > 0, "cabi_realloc の中でスライスの切れ目がない")
     }
 
     private fun assertTrapsInRealloc(mode: Mode, what: String, name: String) = run(mode, what) {

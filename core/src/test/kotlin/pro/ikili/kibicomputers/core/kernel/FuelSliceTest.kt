@@ -81,18 +81,21 @@ class FuelSliceTest {
             h.scheduler.tick()
             eventually(10_000) { p1.get() + p2.get() >= 999 }
             val yields0 = h.scheduler.fuelYields.get()
-            for (k in 2..4) {
-                val a = p1.get()
-                val b = p2.get()
+            val a0 = p1.get()
+            val b0 = p2.get()
+            for (k in 2..6) {
+                val before = p1.get() + p2.get()
                 h.scheduler.tick()
                 eventually(10_000) { p1.get() + p2.get() >= 1000 * k - 2 }
                 Thread.sleep(20)
-                val da = p1.get() - a
-                val db = p2.get() - b
-                assertTrue(da + db <= 1000 + 2, "tick $k: 1 tick に配る燃料を超えた: $da + $db")
-                // 1 tick を独り占めせず、どちらもスライスの数回分は進む
-                assertTrue(da >= 300 && db >= 300, "tick $k: 偏っている: $da / $db")
+                val used = p1.get() + p2.get() - before
+                assertTrue(used <= 1000 + 2, "tick $k: 1 tick に配る燃料を超えた: $used")
             }
+            // tick ごとの内訳は見ない（ブロッキング型は、起こされたスレッドが CPU の待ち行列に着くまでの間「待つ者」に数えないので、
+            // 起き上がりが遅れた tick は片方に偏りうる）。5 tick の合計で、どちらも独り占めされずに進んだことを見る
+            val da = p1.get() - a0
+            val db = p2.get() - b0
+            assertTrue(da >= 1000 && db >= 1000, "偏っている: $da / $db")
             assertTrue(h.scheduler.fuelYields.get() - yields0 >= 6, "譲った回数: ${h.scheduler.fuelYields.get() - yields0}")
             m.stop()
         }
@@ -101,8 +104,9 @@ class FuelSliceTest {
     @Test
     fun `計算し続けるプロセスがいても、イベントで起きたプロセスは同じtickの中で動く`() = timeout(limit) {
         Harness().use { h ->
-            // 1 tick は 1000 × 50 µs = 50 ms。スライスは 100（5 ms）
-            val m = h.machine(fuelPerTick = 1000, fuelSlice = 100)
+            // 1 tick の燃料は 1,000,000（計算するプロセスの 1 燃料が 50 µs なので、使い切るのに 50 秒かかる）。スライスは 100（5 ms）。
+            // 起こされたプロセスが動くまでに使われる燃料は 1 tick の燃料よりずっと少ないはずで、テストのスレッドが止まっても tick をまたがない
+            val m = h.machine(fuelPerTick = 1_000_000, fuelSlice = 100)
             val s = m.lock.withLockValue { ByteStream(16).also { m.kernel.objects.add(it) } }
             val woke = CountDownLatch(1)
             val waiterReady = CountDownLatch(1)
@@ -121,7 +125,6 @@ class FuelSliceTest {
             assertTrue(waiterReady.await(10, TimeUnit.SECONDS))
             val spins = List(3) { AtomicInteger() }
             spins.forEach { m.spawnTest(h.program(slowSpin(it, micros = 50)), runDriver()) }
-            // 計算するプロセスが動き始めた tick の途中で起こす
             h.scheduler.tick()
             eventually(10_000) { spins.all { it.get() > 0 } }
             val total = spins.sumOf { it.get() }
@@ -129,8 +132,38 @@ class FuelSliceTest {
             // tick を進めずに動く（スライスを使い切るたびに、CPU の待ち行列の後ろへ回る）
             assertTrue(woke.await(10, TimeUnit.SECONDS), "起こされたプロセスが同じ tick の中で動かない")
             val after = spins.sumOf { it.get() }
-            assertTrue(after - total < 1000, "1 tick の燃料を使い切ってから動いた: ${after - total}")
+            assertTrue(after - total < 100_000, "1 tick の燃料のほとんどを使い切ってから動いた: ${after - total}")
             m.stop()
+        }
+    }
+
+    @Test
+    fun `手持ちを渡した後にtickが進んだら、待つ者がいなくても次の切れ目で許可を返して取り直す`() = timeout(limit) {
+        Harness().use { h ->
+            // 1 tick の燃料は大きく、tick の燃料は使い切らない。スライスだけが切れる
+            val m = h.machine(fuelPerTick = 1_000_000, fuelSlice = 100)
+            val permitsBefore = h.scheduler.permits.availablePermits()
+            val progress = AtomicInteger()
+            m.spawnTest(h.program(slowSpin(progress, micros = 20)), runDriver())
+            h.scheduler.tick()
+            eventually { progress.get() > 300 }
+            val permits0 = h.scheduler.permitAcquisitions.get()
+            // 同じ tick の中は、許可を持ったまま足し続ける
+            val start = progress.get()
+            eventually { progress.get() > start + 300 }
+            assertEquals(permits0, h.scheduler.permitAcquisitions.get(), "同じ tick の中で許可を取り直した")
+            assertTrue(h.scheduler.fuelSliceRenewals.get() > 0)
+            // tick が進んだら、次のスライスの切れ目で許可と CPU を返して並び直す（公平な許可の列に戻る）。
+            // 許可を持ち続けると、ほかの台が許可を取れない
+            val yields0 = h.scheduler.fuelYields.get()
+            repeat(3) {
+                val before = h.scheduler.permitAcquisitions.get()
+                h.scheduler.tick()
+                eventually(10_000, "tick が進んでも許可を返さない") { h.scheduler.permitAcquisitions.get() > before }
+            }
+            assertTrue(h.scheduler.fuelYields.get() - yields0 >= 3, "譲った回数: ${h.scheduler.fuelYields.get() - yields0}")
+            m.stop()
+            eventually(10_000) { h.scheduler.permits.availablePermits() == permitsBefore }
         }
     }
 

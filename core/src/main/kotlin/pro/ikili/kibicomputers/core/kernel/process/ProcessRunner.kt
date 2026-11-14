@@ -277,8 +277,14 @@ internal class ProcessRunner(private val machine: Machine) {
             giveBackLocked(rt.fuelUnwindRemaining - stack.size.toLong() * FuelCosts.ASYNC_VALUE)
             rt.fuelUnwindRemaining = 0
             scheduler.deactivate(rt)
-            // マシンの燃料が残っていたら、譲るための巻き戻し（#47）。自分も燃料待ちから起こされ、CPU の列の後ろに並び直す
-            if (rt.fuelUnwindYield) scheduler.fuelYields.incrementAndGet() else scheduler.fuelUnwinds.incrementAndGet()
+            // 巻き戻すと決めたときにマシンの燃料が残っていて（譲るための巻き戻し。#47）、巻き戻しの費用を引いた後も正で、一時停止でなければ、
+            // 譲ったものとして数える（自分も燃料待ちから起こされ、CPU の列の後ろに並び直す）。費用を引いて 0 以下になったら、
+            // 次の tick まで燃料を待つので、巻き戻して燃料を待ったものとして数える
+            if (rt.fuelUnwindYield && machine.kernel.fuel > 0 && !scheduler.isPausedFor(machine)) {
+                scheduler.fuelYields.incrementAndGet()
+            } else {
+                scheduler.fuelUnwinds.incrementAndGet()
+            }
             rt.fuelUnwindYield = false
             if (now != grantedTick) scheduler.dispatcher.signal()
         }
@@ -469,14 +475,19 @@ internal class ProcessRunner(private val machine: Machine) {
      * スライスを使い切ったとき（#47、ADR 0047）: CPU を返さずにその場で次のスライスを足せるなら、マシンの燃料に残り [remaining] を書き戻してから
      * 次のスライスを取り、新しい手持ちを返す。足せなければ何も書き換えずに `null`。カーネルロックの中で呼ぶ。
      *
-     * 足すのは、一時停止（マシンだけの quiesce も）でなく、書き戻した後のマシンの燃料が正で、CPU を待つプロセスも燃料待ちもいないときだけ。
-     * 待つ者がいれば譲る（呼んだ側が CPU を返す）。プロセスが1つだけの台は、CPU と許可の出し入れも巻き戻しもせずに、1 tick に `fuelPerTick` まで使える。
+     * 足すのは、一時停止（マシンだけの quiesce も）でなく、手持ちを渡した tick の中（[FuelAccount.lastRefillTick] が今の tick）で、
+     * 書き戻した後のマシンの燃料が正で、CPU を待つプロセスも燃料待ちもいないときだけ。
+     * 待つ者がいれば譲る（呼んだ側が CPU を返す）。tick が進んでいれば、待つ者がいなくても CPU と許可を返す（呼んだ側が返して取り直す）。
+     * 許可はサーバー全体で数が限られ、公平な順で回るので、tick をまたいで持ち続けると、ほかの台が取れなくなる（ADR 0027。#47 より前は燃料切れのたびに返していた）。
+     * プロセスが1つだけの台は、同じ tick の中なら CPU と許可の出し入れも巻き戻しもせずに、1 tick に `fuelPerTick` まで使える。
      * 手持ちは呼んだ側（燃料切れの処理の戻り値）が今の holder に入れるので、作っている途中・ホスト関数の中から呼んだゲストの中でもよい
      */
     private fun renewSliceLocked(rt: ProcessRuntime, remaining: Long): Long? {
         if (rt.killed || scheduler.isPausedFor(machine)) return null
         val observed = now
         val account = machine.fuelAccount
+        // 手持ちを渡した後に tick が進んでいたら、その場で足さない（許可を回す）
+        if (account.lastRefillTick != observed) return null
         if (account.afterGiveBack(observed, remaining) <= 0) return null
         if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked()) return null
         account.giveBack(observed, remaining)
