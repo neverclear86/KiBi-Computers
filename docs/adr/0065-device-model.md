@@ -22,6 +22,7 @@
 - **address**: 小文字・ハイフンありの UUID（36 文字）。デバイスを作ったときに決め、**持ち主（アイテムのデータ・ブロックエンティティの NBT）が保存する**。大文字は受けない（`DeviceAddress.parse`）
   - 画面・キーボードの BE は文字列タグ `DeviceAddress`、ケースの BE はケースに付いたスピーカーの address を `SpeakerAddress` に持つ。タグがない（古いワールド）・形が違うときは、最初に要ったときに新しく振って保存する
   - 1台のマシンの中で重なれば `DeviceBus.attach` が断る（`IllegalArgumentException`）。ブロックの複製などで重なったときの振り直しは #129
+    - 追記（#129）: 後からつなぐほうの address を振り直してつなぐ（ADR 0129）
 - **kind**: `<名前空間>:<名前>`。文字の規則は Minecraft の ResourceLocation と同じ（名前空間 `[a-z0-9._-]+`、名前 `[a-z0-9/._-]+`、`:` はちょうど1つ）で、合わせて 64 バイトまで。例: `kibicomputers:disk-drive`・`mymod:fusion-reactor/core`
 - **メソッド名**: `[a-z][a-z0-9_-]*`、64 バイトまで
 
@@ -116,6 +117,7 @@
 
 1. この Issue: `TestComputerWiring` が `ScreenDevice`・`KeyboardDevice`・`SpeakerDevice` を `DeviceBus` につなぐ（#65 で `MachineConsole` を `ScreenDevice` に、`MachineConsole.keyboardInput` を `KeyboardDevice` に、`MachineHost.onBeep` を `SpeakerDevice` に、`Machine.notifyDevicesChanged()` を `DeviceBus` に移した）。コンソールの出力先は `DeviceBus.primaryScreen`、画面がなければ `MachineHost.onConsoleOutput`。振る舞いは変えない。NeoForge のスピーカーの受け手は、まだ音を鳴らさない
 2. #129: 隣接の検出と登録表に置き換え、`TestComputerWiring` を消す
+   - 追記（#129）: 済んだ。登録表（`DeviceRegistry`）と結線（`MachineWiring`・接続層の `CaseWiring`）に置き換えた。ADR 0129
 3. #137 以降: カード1枚 = デバイス1つで足す
 
 ## テスト

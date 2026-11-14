@@ -1,12 +1,18 @@
 package pro.ikili.kibicomputers.neoforge.display
 
 import net.minecraft.core.BlockPos
+import net.minecraft.core.GlobalPos
 import net.minecraft.core.HolderLookup
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
+import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.core.device.ScreenDevice
+import pro.ikili.kibicomputers.core.device.wiring.DeviceHolder
+import pro.ikili.kibicomputers.core.device.wiring.DeviceRegistry
 import pro.ikili.kibicomputers.core.display.DisplayDevice
 import pro.ikili.kibicomputers.core.display.PixelBuffer
 import pro.ikili.kibicomputers.core.display.ScreenSyncReceiver
@@ -15,22 +21,29 @@ import pro.ikili.kibicomputers.core.display.ScreenSyncTarget
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
 import pro.ikili.kibicomputers.core.display.TextBuffer
+import pro.ikili.kibicomputers.neoforge.computer.CaseWiring
 import pro.ikili.kibicomputers.neoforge.computer.DeviceAddressSlot
+import pro.ikili.kibicomputers.neoforge.computer.DeviceWiring
+import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 
 /**
  * 画面ブロックのブロックエンティティ。表示デバイス（[DisplayDevice]。`core`）を「映す」（#355）。
  *
- * - サーバー: 映す表示デバイスは、マシンの側（今はテスト用の結線）が持ち、[mirror] で入れる。入れるまでは、ティアの最大の大きさの
+ * - サーバー: 映す表示デバイスは、マシンの側（ケースの結線 [CaseWiring]。#129）が持ち、つないだときに [mirror] で入れる。入れるまでは、ティアの最大の大きさの
  *   空の表示デバイスを映す。中身はプロセスのスレッドが書くので、tick の終わりに表示デバイスのロックを持って、同期の差分を取り出して
  *   見ているクライアントに送る（#140、[ScreenSync]）
  * - クライアント: 同期で受け取った内容を、自分の表示デバイスに再生して描く
  *
  * 画面の中身はコンピューターが描き直すものとして、今はセーブデータに書かない（保存は表示デバイスの側で #81 が扱う）。
  * セーブデータに書くのは、画面のデバイスの address（[deviceAddress]。#65）だけ。
+ *
+ * サーバーで読み込まれたら、デバイスの登録表（[DeviceWiring.registry]。#129）に載り、壊れた・アンロードしたら外れる
+ * （つないでいたマシンからは、すぐに外れる。取っておいた出力は捨てる。#397・#381）。画面の前・下・横・後ろのキーボードは、
+ * この画面をつないだマシンが続けてつなぐ（[relayKeys]）。
  */
 class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
-    BlockEntity(KiBiBlocks.SCREEN_BLOCK_ENTITY.get(), pos, state) {
+    BlockEntity(KiBiBlocks.SCREEN_BLOCK_ENTITY.get(), pos, state), DeviceHolder<GlobalPos> {
 
     /** この画面のティア。ブロックから決まる。 */
     val tier: ScreenTier = (state.block as ScreenBlock).tier
@@ -61,7 +74,7 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     var renderCache: AutoCloseable? = null
 
     /** 画面のデバイス（`kibicomputers:screen`）の address（#65）。最初に使うときに作り、セーブデータの [DEVICE_ADDRESS_TAG] に書く */
-    val deviceAddress: String get() = addressSlot.get()
+    override val deviceAddress: String get() = addressSlot.get()
 
     private val addressSlot = DeviceAddressSlot(DEVICE_ADDRESS_TAG) { setChanged() }
 
@@ -101,22 +114,53 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         sender = ScreenSyncSender(device.text)
     }
 
-    // サーバー: 画面が外れた（ブロックエンティティが消えた）ときに知らせる先（#397）。たいていは0〜1個なので、要るまで作らない
-    private var removalListeners: ArrayList<Runnable>? = null
+    // サーバー: デバイスの登録表の登録（#129）。載っていなければ null
+    private var registration: DeviceRegistry.Entry<GlobalPos>? = null
 
-    /**
-     * サーバー: 画面が外れた（壊された・チャンクが読み込まれなくなったなどで、ブロックエンティティが消えた）ときに [listener] を呼ぶ（#397）。
-     * 呼ぶのは1回だけで、呼んだ後は登録を外す。メインスレッドから使う
-     */
-    internal fun addRemovalListener(listener: Runnable) {
-        (removalListeners ?: ArrayList<Runnable>(1).also { removalListeners = it }).add(listener)
+    /** サーバー: この画面をつないでいるケースの結線。いなければ null */
+    internal val wiredTo: CaseWiring? get() = registration?.owner?.host as? CaseWiring
+
+    /** サーバー: デバイスの登録表に載っているときの世代（テスト用）。載っていなければ null */
+    val registrationGeneration: Long? get() = registration?.generation
+
+    override fun reassignDeviceAddress() = addressSlot.reassign()
+
+    // 表示デバイスはマシンの側が持ち、つなぐたびに新しく作る（#355）
+    override fun createDevice(): Device = ScreenDevice(DisplayDevice.forTier(tier))
+
+    override fun onConnected(device: Device) {
+        mirror((device as ScreenDevice).display)
     }
 
-    /** サーバー: [addRemovalListener] で登録した [listener] を外す。登録していなければ何もしない */
-    internal fun removeRemovalListener(listener: Runnable) {
-        val ls = removalListeners ?: return
-        ls.remove(listener)
-        if (ls.isEmpty()) removalListeners = null
+    // 画面は最後の表示デバイスを映したままにし、中身を残す。外れた（壊れた・アンロードした）なら、書ききれずに取っておいた出力を捨てる（#381・#397）
+    override fun onDisconnected(device: Device, removed: Boolean) {
+        if (removed) (device as ScreenDevice).discardOutput()
+    }
+
+    override fun relayKeys(): List<GlobalPos> {
+        val level = level ?: return emptyList()
+        return KeyboardInput.keyboardSpots(blockPos, blockState.getValue(ScreenBlock.FACING)).map { DeviceWiring.keyOf(level, it) }
+    }
+
+    /**
+     * サーバー: デバイスの登録表に載る（#129）。ブロックを置いたときは `setLevel` の時点（`onLoad` は NeoForge が tick の途中まで遅らせる）、
+     * チャンクを読み込んだときは `onLoad` で載る。もう載っていれば何もしない。つなぐのは tick の終わり（置いたブロックのデータを読み込んだ後。#535）
+     */
+    private fun register() {
+        val level = level as? ServerLevel ?: return
+        if (registration != null || isRemoved) return
+        registration = DeviceWiring.registry.register(DeviceWiring.keyOf(level, blockPos), this)
+    }
+
+    override fun setLevel(level: Level) {
+        super.setLevel(level)
+        register()
+    }
+
+    private fun unregister() {
+        val r = registration ?: return
+        registration = null
+        DeviceWiring.registry.unregister(r)
     }
 
     /** サーバーで、この画面を見ているプレイヤーの数（新しく見に来て、まだ送っていない人も含む）。 */
@@ -142,7 +186,14 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
     override fun onLoad() {
         super.onLoad()
         val level = level ?: return
-        if (!level.isClientSide) ScreenSync.serverScreens.add(this)
+        if (level.isClientSide) return
+        ScreenSync.serverScreens.add(this)
+        register()
+    }
+
+    override fun onChunkUnloaded() {
+        super.onChunkUnloaded()
+        unregister()
     }
 
     override fun setRemoved() {
@@ -151,10 +202,8 @@ class ScreenBlockEntity(pos: BlockPos, state: BlockState) :
         watchers.clear()
         renderCache?.close()
         renderCache = null
-        // isRemoved が真になってから知らせる。知らせた先が登録を外しても困らないように、先に手放す
-        val listeners = removalListeners ?: return
-        removalListeners = null
-        for (l in listeners) l.run()
+        // isRemoved が真になってから外す（つないでいたマシンからすぐに外れる。#397）
+        unregister()
     }
 
     /**

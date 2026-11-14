@@ -31,7 +31,8 @@ import pro.ikili.kibicomputers.core.machine.MachineReleaseReason
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
-import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
+import pro.ikili.kibicomputers.neoforge.computer.CaseWiring
+import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -40,7 +41,10 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.UUID
 
-/** テスト用コンピューターの仮の結線（#307）の GameTest。 */
+/**
+ * ケースと隣の画面・キーボードの結線（#129。もとは仮の結線 #307）の GameTest。キーボードは画面の正面の前に置く
+ * （ケースの隣ではなく、画面を通してつながる。画面が外れたら一緒に外れる）
+ */
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object TestComputerGameTests {
@@ -53,7 +57,7 @@ object TestComputerGameTests {
 
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)
-    private val KEYBOARD = BlockPos(1, 1, 2)
+    private val KEYBOARD = BlockPos(1, 2, 2)
 
     /** 画面の各行の文字列（行末の空白を除く） */
     private fun lines(text: TextBuffer): List<String> = (0 until text.height).map { y ->
@@ -71,7 +75,7 @@ object TestComputerGameTests {
         helper.setBlock(KEYBOARD, KiBiBlocks.KEYBOARD.get())
         val case = helper.getBlockEntity<CaseBlockEntity>(CASE)
         // Lua の REPL で確かめる（ゲームの既定は標準 OS。#461）
-        case.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
+        case.fallbackBootDisk = ProvisionalBoot.TEST_BOOT_DISK
         // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる
         for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
             case.parts.setStackInSlot(case.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
@@ -288,7 +292,7 @@ object TestComputerGameTests {
             KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
         )
         val second = helper.getBlockEntity<CaseBlockEntity>(secondPos)
-        second.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
+        second.fallbackBootDisk = ProvisionalBoot.TEST_BOOT_DISK
         for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
             second.parts.setStackInSlot(second.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
         }
@@ -296,7 +300,7 @@ object TestComputerGameTests {
         helper.assertTrue(second.pressPowerButton() == ComputerStatus.RUNNING, "second case should be running")
         helper.assertTrue(first.wiring.connectedKeyboard === keyboard, "the first case should take the keyboard")
         helper.assertTrue(second.wiring.connectedKeyboard == null, "the second case should not take the keyboard")
-        helper.assertTrue(keyboard.owner === first.wiring, "the keyboard should deliver only to the first case")
+        helper.assertTrue(keyboard.wiredTo === first.wiring, "the keyboard should deliver only to the first case")
         // 1台目を切ると空く。2台目を入れ直すとつながる
         first.pressPowerButton()
         helper.assertTrue(keyboard.owner == null, "turning the first case off should free the keyboard")
@@ -420,7 +424,7 @@ object TestComputerGameTests {
 
     /**
      * 起動に失敗したら、ケースの GUI（[CaseMenu.status]）はエラー（[ComputerError.BOOT_FAILED]）になり、ケースはマシンを外して
-     * 結線も外す（#641）。失敗の1行は画面に残り、失敗の理由（[TestComputerWiring.bootFailure]）も外した後に残る。
+     * 結線も外す（#641）。失敗の1行は画面に残り、失敗の理由（[CaseWiring.bootFailure]）も外した後に残る。
      * 電源ボタンを1回押せば、新しいマシンでまた起動を試みる（ここでもまた失敗する）
      */
     @JvmStatic
@@ -678,10 +682,10 @@ object TestComputerGameTests {
         val manager = ServerMachines.current!!
         // ケースのブロックの電源は入れず、上限の小さいマシンを同じ場所の結線でつなぐ
         val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
-        val wiring = TestComputerWiring()
+        val wiring = CaseWiring()
         val machine = manager.attach(key, wiring, MachineConfig.builder().maxDevices(2).build())
         val speaker = UUID.randomUUID().toString()
-        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, TestComputerWiring.bootConfig(emptyList(), TestComputerWiring.TEST_BOOT_DISK))
+        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, ProvisionalBoot.bootConfig(emptyList(), ProvisionalBoot.TEST_BOOT_DISK))
         helper.assertTrue(machine.devices.limit == 2, "the limit should come from the config")
         helper.assertTrue(wiring.connectedScreen === screen, "the screen should be connected")
         helper.assertTrue(wiring.connectedKeyboard == null, "the keyboard should be refused")
@@ -702,7 +706,7 @@ object TestComputerGameTests {
     /**
      * つなげる数が1のマシンでは、スピーカーで満杯になり、画面は断られる（先読みで表示デバイスを作らずに諦める）。
      * 断られた画面は何も変えず（つないだ印、つないだ回数、address、画面が映す表示デバイス）、キーボードは取らず、
-     * ログは1回だけ。その後の [TestComputerWiring.reconnectScreen] でも変わらない。マシンは動き続ける
+     * ログは1回だけ。その後の [CaseWiring.rewire] でも変わらない。マシンは動き続ける
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -710,11 +714,11 @@ object TestComputerGameTests {
         val (_, screen, keyboard) = build(helper)
         val manager = ServerMachines.current!!
         val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
-        val wiring = TestComputerWiring()
+        val wiring = CaseWiring()
         val machine = manager.attach(key, wiring, MachineConfig.builder().maxDevices(1).build())
         val speaker = UUID.randomUUID().toString()
         val displayBefore = screen.display
-        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, TestComputerWiring.bootConfig(emptyList(), TestComputerWiring.TEST_BOOT_DISK))
+        wiring.connect(helper.level, helper.absolutePos(CASE), machine, speaker, ProvisionalBoot.bootConfig(emptyList(), ProvisionalBoot.TEST_BOOT_DISK))
         fun assertRefused(stage: String) {
             helper.assertTrue(wiring.connectedScreen == null, "$stage: the refused screen should not be connected")
             helper.assertTrue(wiring.connectedScreenDevice == null, "$stage: no screen device should be kept")
@@ -727,8 +731,8 @@ object TestComputerGameTests {
         }
         assertRefused("after connect")
         // 隣のブロックが変わったときの探し直しでも、状態は変わらず、ログも増えない
-        helper.assertTrue(wiring.canReconnectScreen(machine), "the wiring should try to reconnect the screen")
-        wiring.reconnectScreen(helper.level, helper.absolutePos(CASE), machine)
+        helper.assertTrue(wiring.wantsRewire(machine), "the wiring should try to reconnect the screen")
+        wiring.rewire()
         assertRefused("after reconnect")
         helper.succeedWhen {
             helper.assertTrue(machine.state == MachineState.RUNNING, "the machine should keep running: ${machine.state}")
@@ -739,28 +743,29 @@ object TestComputerGameTests {
     }
 
     /**
-     * キーボードを取った後に [pro.ikili.kibicomputers.core.device.DeviceBus.attach] が例外で抜けても（address の重複。満杯の `false` とは別）、
-     * キーボードは手放す。ほかのケースが取れなくなるのを防ぐ
+     * 同じマシンに同じ address のデバイスがもうつながっていたら（ブロックの複製など。ここではスピーカーをキーボードと同じ address にする）、
+     * 後から来たほう（キーボード）の address を振り直してつなぐ（#129。例外で止めない）。振り直した address はセーブデータに書く
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
-    fun keyboardIsReleasedWhenAttachThrows(helper: GameTestHelper) {
-        val (_, _, keyboard) = build(helper)
+    fun duplicateAddressIsReassignedForTheLaterDevice(helper: GameTestHelper) {
+        val (_, screen, keyboard) = build(helper)
         val manager = ServerMachines.current!!
         val key = MachineKey(helper.level.dimension(), helper.absolutePos(KEYBOARD.east()))
-        val wiring = TestComputerWiring()
+        val wiring = CaseWiring()
         val machine = manager.attach(key, wiring, MachineConfig.DEFAULT)
-        // スピーカーの address をキーボードと同じにして、キーボードをつなぐときに重複させる
-        val thrown = try {
-            wiring.connect(helper.level, helper.absolutePos(CASE), machine, keyboard.deviceAddress)
-            null
-        } catch (e: IllegalArgumentException) {
-            e
-        }
-        helper.assertTrue(thrown != null, "attaching the keyboard with a duplicate address should throw")
-        helper.assertTrue(keyboard.owner == null, "the keyboard should be released after the failed attach")
-        helper.assertTrue(wiring.connectedKeyboard == null, "the keyboard should not be connected")
+        val shared = keyboard.deviceAddress
+        wiring.attach(helper.level, helper.absolutePos(CASE), machine, shared)
+        helper.assertTrue(wiring.connectedKeyboard === keyboard, "the keyboard should be connected")
+        helper.assertTrue(keyboard.deviceAddress != shared, "the later keyboard should get a new address")
+        helper.assertTrue(
+            machine.devices.list().map { it.address } == listOf(shared, screen.deviceAddress, keyboard.deviceAddress),
+            "the speaker keeps the address and the keyboard is attached with the new one: ${machine.devices.list()}",
+        )
+        val tag = keyboard.saveWithoutMetadata(helper.level.registryAccess())
+        helper.assertTrue(tag.getString(KeyboardBlockEntity.DEVICE_ADDRESS_TAG) == keyboard.deviceAddress, "the new address should be saved: $tag")
         wiring.disconnect()
+        helper.assertTrue(keyboard.owner == null, "the keyboard should be released")
         manager.release(key, machine, MachineReleaseReason.REMOVED)
         helper.setBlock(CASE, Blocks.AIR)
         helper.succeed()

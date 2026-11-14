@@ -24,7 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.DiskItem
-import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
+import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
@@ -104,7 +104,7 @@ object StandardOsGameTests {
         val menu = CaseMenu.server(0, player.inventory, case)
         val key = MachineKey.of(helper.level, helper.absolutePos(CASE))
         val machine = case.computer.machine!!
-        val booting = "kibi: booting from disk ${TestComputerWiring.OS_BOOT_DISK}"
+        val booting = "kibi: booting from disk ${ProvisionalBoot.OS_BOOT_DISK}"
         var step = 0
         helper.succeedWhen {
             val text = lines(screen.text)
@@ -169,7 +169,7 @@ object StandardOsGameTests {
             when (step) {
                 0 -> {
                     helper.assertTrue(
-                        text.any { it == "kibi: booting from disk ${TestComputerWiring.OS_BOOT_DISK}" },
+                        text.any { it == "kibi: booting from disk ${ProvisionalBoot.OS_BOOT_DISK}" },
                         "should boot the OS image: $text",
                     )
                     helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")

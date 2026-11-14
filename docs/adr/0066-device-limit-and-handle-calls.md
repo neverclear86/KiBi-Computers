@@ -39,11 +39,13 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 - 判定は `writeLock` の中で、数えてから入れるまでを同じロックで行う（並んだ `attach` でも越えない）。`onAttached` が投げたときの戻しで数も戻る
 - `DeviceBus.limit`・`size` はロックなしで読める。接続層（#129）はこれを見て、満杯なら重い準備（表示デバイスを作るなど）を省ける
 - 空いても core は自分でつなぎ直さない（tick ごとの巡回を足さない）。つなぎ直すのは接続層（今は `TestComputerWiring.reconnectScreen`、正式には #129）
+  - 追記（#129）: 接続層の結線（`MachineWiring`）が、自分のデバイスが外れたときに断った候補を見直す（tick の終わりに1回。ADR 0129）
 - 上限は電源を入れたとき・戻したときに決まる。CPU を抜くとマシンは止まるので、動いている間は変わらない。**保存しない**（`KernelState` に入れない）。
   戻したときの上限が保存したときより小さいと、つなげなかったデバイスへのハンドル・積んだ呼び出しは `detached` になる（ADR 0065 の決まりどおり）。
   保存 → 上限の小さいマシンへの復元 → `redispatchRestoredDeviceCalls` の経路は `DeviceLimitRestoreTest` で確かめている
 - 仮の結線（`TestComputerWiring`）は、`attach` の結果を見てから自分の状態を確定する。断られたキーボード、`attach` が例外で抜けた（address の重複）キーボードは手放す（ほかのケースが使える）。
   断られたことはログに1回だけ出す。つなぐ順はスピーカー → 画面 → キーボード
+  - 追記（#129）: 結線は `MachineWiring` になった。断られたもの・例外で抜けたものは手放す（ほかの結線に知らせる）。address の重複は例外にせず、後から来たほうを振り直す。つなぐ順はスピーカー → 隣（下・上・北・南・西・東）→ 画面の中継のキーボード（ADR 0129）
 
 ## 開いたデバイスからの呼び出し（`ProcessContext`）
 

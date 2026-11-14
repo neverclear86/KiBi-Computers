@@ -57,7 +57,8 @@ object KeyboardSessions {
 
     /**
      * [player] に、キーボード [keyboardPos] への入力のセッションを開き、クライアントに入力 GUI を開かせる。
-     * 前のセッションがあれば閉じる。[screenPos] は右クリックした画面（GUI に中身を出すため。なければ null）。
+     * 前のセッションがあれば閉じる。GUI に中身を出す画面は、キーボードがつながったコンピューターの画面（[KeyboardInput.connectedScreen]）、
+     * つながっていなければ [screenPos]（右クリックした画面。なければ null）。
      *
      * @return 開いたセッション。届く距離にない、キーボードがないなら null
      */
@@ -73,8 +74,20 @@ object KeyboardSessions {
         val session = KeyboardSession(nextId++, player.uuid, budget)
         if (nextId <= 0) nextId = 1
         sessions[player.uuid] = Open(player, level, keyboardPos.immutable(), keyboard, session)
-        send(player, KeyboardOpenPayload(session.id, keyboardPos, Optional.ofNullable(screenPos)))
+        // GUI に出す画面は、キーボードがつながったコンピューターのコンソールの画面（#129）。つながっていなければ右クリックした画面
+        val shown = KeyboardInput.connectedScreen(keyboard) ?: screenPos
+        send(player, KeyboardOpenPayload(session.id, keyboardPos, Optional.ofNullable(shown)))
         return session
+    }
+
+    /**
+     * キーボード [keyboard] への、開いているセッションをすべて閉じる（キーボードがマシンから外れたとき。#129）。
+     * 押したままのキーの離しは、外れる前の相手に届ける
+     */
+    internal fun closeFor(keyboard: KeyboardBlockEntity) {
+        if (sessions.isEmpty()) return
+        val ids = sessions.entries.filter { it.value.keyboard === keyboard }.map { it.key }
+        for (id in ids) close(id, notifyClient = true)
     }
 
     /** [player] の開いているセッション。なければ null。 */

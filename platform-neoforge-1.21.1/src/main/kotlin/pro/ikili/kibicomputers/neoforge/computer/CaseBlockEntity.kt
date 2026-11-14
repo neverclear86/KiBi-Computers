@@ -50,9 +50,9 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - 動いている間に起動に要る部品・電源を入れたときにあったディスクを抜くと止まる（判断は `core` の [ComputerCase]）
  * - 電源を入れるとき、識別子のないディスクに識別子を付け（#124）、挿さっているディスクの写しをマシンの環境に渡す
  * - チャンクのアンロード・チャンクが FULL でなくなったとき（[chunkDemoted]。#545）・ブロックの破壊でマシンを外す
- * - 電源を入れると、隣の画面とキーボードにつないで、ディスク → 標準 OS の同梱イメージの順に起動する
- *   （仮の結線。[TestComputerWiring]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
- *   動いている間に画面を置き直したら、次の tick につなぎ直す（[neighborChanged]。#531・#535）
+ * - 電源を入れると、隣の画面とキーボードにつなぎ（[CaseWiring]。#129）、ディスク → 標準 OS の同梱イメージの順に起動する
+ *   （仮の起動。[ProvisionalBoot]、#307・#461）。同梱イメージから起動したら、最初のディスクが `/home` になる。
+ *   動いている間に隣にデバイスを置いた・読み込んだ・ほかのケースが手放したら、tick の終わりにつなぎ直す（[DeviceWiring]）
  *
  * セーブデータには部品（`Parts`）と、マシンの ID の参照（`MachineId`・`SaveGeneration`・`OwnerEpoch`。#81、ADR 0081）と、
  * 電源の状態（`PoweredOn`。#85、ADR 0085）を書く。電源が入っていたら、サーバーで読み込まれたとき（[onLoad]）・チャンクが FULL に
@@ -80,14 +80,14 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** 部品スロット */
     val parts: CaseParts = CaseParts(tier) { onPartsChanged() }
 
-    /** テスト用コンピューターの仮の結線（#307）。#129・#99 ができたら置き換える */
-    internal val wiring: TestComputerWiring = TestComputerWiring()
+    /** 隣のデバイスの結線（#129）。つなぎ直すのは、この結線のマシンがケースの今のマシンのときだけ */
+    internal val wiring: CaseWiring = CaseWiring { computer.machine }
 
     /**
      * マシンからの通知を [wiring] に中継する。ケース（[computer]）が自分の判断でマシンを外した（CRASHED・ゲストが止めた。#640、
      * 起動に失敗した。#641）ときは、結線も外す（キーボードの持ち主・画面の listener を残さない）。外すかどうかは [ComputerCase] が決め、ここでは結果
      * （[ComputerCase.machine] が `null`）だけを見る。[ComputerCase] は自分の処理の後に呼ぶので、このときにはもう外れている。
-     * 結線に先に渡してから外す（起動の失敗の理由 [TestComputerWiring.bootFailure] は、つないでいるマシンのものだけを覚え、外しても残る）
+     * 結線に先に渡してから外す（起動の失敗の理由 [CaseWiring.bootFailure] は、つないでいるマシンのものだけを覚え、外しても残る）
      */
     private val machineEvents = object : MachineHost {
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {
@@ -141,10 +141,10 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /**
-     * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[TestComputerWiring.OS_BOOT_DISK]）。
-     * GameTest が Lua の REPL（[TestComputerWiring.TEST_BOOT_DISK]）で動かすために差し替える。保存しない
+     * 起動ディスクの候補の最後に足す同梱イメージ（既定は標準 OS。[ProvisionalBoot.OS_BOOT_DISK]）。
+     * GameTest と負荷試験が、試験用の起動イメージ（Lua の REPL。[ProvisionalBoot.TEST_BOOT_DISK]）で動かすために差し替える。保存しない
      */
-    internal var fallbackBootDisk: String = TestComputerWiring.OS_BOOT_DISK
+    internal var fallbackBootDisk: String = ProvisionalBoot.OS_BOOT_DISK
 
     /** ケースに入っているスピーカー（`kibicomputers:speaker`）のデバイスの address（#65）。最初に使うときに作り、セーブデータの [SPEAKER_ADDRESS_TAG] に書く */
     val speakerAddress: String get() = speakerSlot.get()
@@ -152,7 +152,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     private val speakerSlot = DeviceAddressSlot(SPEAKER_ADDRESS_TAG) { setChanged() }
 
     // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
-    private val installedForBoot = TestComputerWiring.withBootPart(tier, parts.installed)
+    private val installedForBoot = ProvisionalBoot.withBootPart(tier, parts.installed)
 
     // ---- マシンの ID（#81） ----
 
@@ -238,7 +238,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val config = MachineSpecs.configOf(tier, parts.tiers)
         val disks = prepareDisks()
         val environment = MachineEnvironment.builder().disks(disks.snapshot).build()
-        val boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
+        val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
         val store = WorldMachineSaves.current
         // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
         val id = currentIdentity
@@ -381,11 +381,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = MachineSpecs.configOf(tier, parts.tiers)
         var environment = MachineEnvironment.DEFAULT
-        var boot = TestComputerWiring.bootConfig(emptyList(), fallbackBootDisk)
+        var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             val disks = prepareDisks()
             environment = MachineEnvironment.builder().disks(disks.snapshot).build()
-            boot = TestComputerWiring.bootConfig(disks.bootOrder, fallbackBootDisk)
+            boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
         }
         val status = computer.pressPowerButton(
             ServerMachines.current,
@@ -428,21 +428,6 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         }
         if (assigned) setChanged()
         return PreparedDisks(store.snapshot(disks), disks.keys.toList())
-    }
-
-    /**
-     * 隣のブロックが変わった。止まっていなくて（再起動の途中も含む。#626）画面をつないでいなければ、次の tick に [reconnectScreen] を回す（#531。仮の結線）。
-     * 置いたブロックのデータ（アイテムやコマンドの NBT の address）は `setBlock` の後で読み込むので、ここではまだつながない（#535）
-     */
-    internal fun neighborChanged() {
-        val level = level as? ServerLevel ?: return
-        if (wiring.canReconnectScreen(computer.machine)) level.scheduleTick(blockPos, blockState.block, 1)
-    }
-
-    /** [neighborChanged] で回した次の tick。止まっていなくて（再起動の途中も含む）画面をつないでいなければ、隣の画面とキーボードをつなぎ直す（#531・#535） */
-    internal fun reconnectScreen() {
-        val level = level as? ServerLevel ?: return
-        wiring.reconnectScreen(level, blockPos, computer.machine)
     }
 
     private fun onPartsChanged() {
