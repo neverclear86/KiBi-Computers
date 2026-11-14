@@ -278,6 +278,57 @@ class SpawnMemoryLimitTest {
         }
     }
 
+    /**
+     * grow と commit を違う段で断ったとき（#48）: 注記の上限は、プロセス全体で最後に断った段ではなく、それぞれを断った段で書く。
+     * [growFirst] なら grow（サーバー全体）→ commit（プロセスの上限）、そうでなければ逆の順に断らせる
+     */
+    private fun growAndCommitRefusedAtDifferentStages(growFirst: Boolean) = timeout(limit) {
+        harness(totalBytes = page).use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = 16 * page)
+            val results = java.util.Collections.synchronizedList(mutableListOf<Any>())
+            val pid = m.spawnNamed(
+                h.program(FakeModule.builder().fuelMetered().memory(1).build()),
+                TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    val memory = ctx.instance.memory!!
+                    // サーバー全体の残りは 16 区画。15 区画を書いてから 1 ページ増やすと、端の 2 区画をサーバー全体で数えられない
+                    for (i in 0 until 15) memory.writeU8(i * 4096, 1)
+                    // 残りをプロセスの上限より多く残せと言う commit は、プロセスの上限で断られる（サーバー全体には keepBytes をかけない）
+                    val commit = { ctx.commitMemory(memory, 15 * 4096, 1, 1L shl 40) }
+                    if (growFirst) {
+                        results += memory.grow(1)
+                        results += commit()
+                    } else {
+                        results += commit()
+                        results += memory.grow(1)
+                    }
+                    StepResult.Exit(1)
+                },
+                "gc",
+            )
+            h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
+            assertEquals(if (growFirst) listOf<Any>(-1, false) else listOf<Any>(false, -1), results.toList())
+            h.tickUntil("コンソールに出ない: ${host.console}") { host.console.contains("kibi: gc (pid $pid) exited") }
+            assertTrue(
+                host.console.contains(
+                    "kibi: gc (pid $pid) exited with code 1 (memory.grow was refused: out of memory, server memory limit reached; " +
+                        "kibi:memory commit was refused: out of memory, RAM limit 1 MiB)\n",
+                ),
+                host.console.toString(),
+            )
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `growをサーバー全体で断られた後にcommitをプロセスの上限で断られると、それぞれを断った上限を書く`() =
+        growAndCommitRefusedAtDifferentStages(growFirst = true)
+
+    @Test
+    fun `commitをプロセスの上限で断られた後にgrowをサーバー全体で断られても、それぞれを断った上限を書く`() =
+        growAndCommitRefusedAtDifferentStages(growFirst = false)
+
     /** 作れない core インスタンス 1 つのコンポーネント: 最初のテーブルが 64 KiB に収まらない（`funcref` の要素は 12 バイト） */
     private val tooBigComponent = """
         (component

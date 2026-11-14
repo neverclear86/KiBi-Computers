@@ -48,20 +48,21 @@ internal fun instantiateOutOfMemoryReason(limit: String): String = "cannot insta
 
 /**
  * `memory.grow`（#407）や `kibi:computer/memory` の `commit`（#408）を RAM の上限で断った後に、プロセスが異常終了したときに、理由に添える文。
- * どちらも断っていなければ `null`。[limit] は [memoryLimitText] の文。例:
+ * [growLimit]・[commitLimit] は、それぞれを最後に断った段の [memoryLimitText] の文（断っていなければ `null`。#48）。
+ * どちらも断っていなければ `null`。例:
  * - grow だけ: `memory.grow was refused: out of memory, RAM limit 128 KiB`
  * - commit だけ: `kibi:memory commit was refused: out of memory, RAM limit 128 KiB`
- * - 両方: `memory.grow and kibi:memory commit were refused: out of memory, RAM limit 128 KiB`
+ * - 両方を同じ上限で: `memory.grow and kibi:memory commit were refused: out of memory, RAM limit 128 KiB`
+ * - 両方を違う上限で: `memory.grow was refused: out of memory, server memory limit reached; kibi:memory commit was refused: out of memory, RAM limit 128 KiB`
  * - サーバー全体で断ったとき: `memory.grow was refused: out of memory, server memory limit reached`
  */
-internal fun memoryRefusedNote(growRefused: Boolean, commitRefused: Boolean, limit: String): String? {
-    val what = when {
-        growRefused && commitRefused -> "memory.grow and kibi:memory commit were refused"
-        growRefused -> "memory.grow was refused"
-        commitRefused -> "kibi:memory commit was refused"
-        else -> return null
-    }
-    return "$what: out of memory, $limit"
+internal fun memoryRefusedNote(growLimit: String?, commitLimit: String?): String? = when {
+    growLimit != null && commitLimit != null && growLimit == commitLimit -> "memory.grow and kibi:memory commit were refused: out of memory, $growLimit"
+    growLimit != null && commitLimit != null ->
+        "memory.grow was refused: out of memory, $growLimit; kibi:memory commit was refused: out of memory, $commitLimit"
+    growLimit != null -> "memory.grow was refused: out of memory, $growLimit"
+    commitLimit != null -> "kibi:memory commit was refused: out of memory, $commitLimit"
+    else -> null
 }
 
 /** バイト数を、1 MiB の倍数なら MiB、1 KiB の倍数なら KiB、そうでなければバイトで書く */

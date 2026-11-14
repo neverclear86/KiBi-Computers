@@ -38,6 +38,9 @@
 - `RAM limit` に書くのは、プロセスが数えられる上限（プロセスの上限とマシンの RAM のうち小さい方）
 - **サーバー全体の勘定で断ったとき**は、`RAM limit ...` の代わりに `server memory limit reached` と書く（例: `out of memory (server memory limit reached)`、`cannot instantiate module (out of memory, server memory limit reached)`）。マシンの RAM には余裕があるので、RAM の上限を書くと誤解を招く
 - どの段で断ったかは、`ProcessMemory.lastRefusal`（最後に断った段）に記録する。マシンの勘定はプロセスで共有するので、記録はプロセスの側に置く。断ったときだけ書くので、確保の速い経路には何も足さない
+  - トラップとインスタンスの生成の失敗は、断った直後に同じスレッドで読むので、`lastRefusal` で決める
+  - `memory.grow`・`commit` の注記は、異常終了したときに後から書くので、`lastRefusal` を読むと後の別の確保（注記を付けない `table.grow` など）で上書きされた段になる。そこで、grow・commit を断った直後に、そのときの `lastRefusal` を `ProcessRuntime.memoryGrowRefusal`・`memoryCommitRefusal` に写し、注記はそれぞれの段で書く
+  - grow と commit を違う段で断ったときは、別々に書く（例: `memory.grow was refused: out of memory, server memory limit reached; kibi:memory commit was refused: out of memory, RAM limit 128 KiB`）。同じ段なら、これまでどおり 1 つにまとめる
 - `kibi:memory` の `remaining` は、プロセスの上限とマシンの RAM のうち小さい方の残りで、サーバー全体は入れない（#408 のまま）。`commit` の `keep` もサーバー全体にはかけない
 
 ## プロセスの生成が RAM で失敗したとき

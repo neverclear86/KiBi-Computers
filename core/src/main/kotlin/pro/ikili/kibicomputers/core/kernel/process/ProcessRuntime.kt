@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MemoryRefusal
 import pro.ikili.kibicomputers.core.kernel.ProcessMemory
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
@@ -131,18 +132,19 @@ internal class ProcessRuntime(
     var crashReason: String? = null
 
     /**
-     * `memory.grow` を RAM の上限で断った（#407）。この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。
+     * `memory.grow` を RAM の上限で最後に断った段（#407・#48）。断っていなければ `null`。この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。
+     * 断った直後に [ProcessMemory.lastRefusal] を写す（後の別の確保で上書きされても、grow を断った段を出せるように）。
      * プロセスのスレッドが、ロックを持たずに書く
      */
     @Volatile
-    var memoryGrowRefused: Boolean = false
+    var memoryGrowRefusal: MemoryRefusal? = null
 
     /**
-     * `kibi:computer/memory` の `commit` を RAM の上限で断った（#408。範囲外で断ったときは立てない）。[memoryGrowRefused] と同じく、
+     * `kibi:computer/memory` の `commit` を RAM の上限で最後に断った段（#408・#48。範囲外で断ったときは書かない）。[memoryGrowRefusal] と同じく、
      * この後にプロセスが異常終了したら、メモリ不足が原因だったと表示する。プロセスのスレッドが、ロックを持たずに書く
      */
     @Volatile
-    var memoryCommitRefused: Boolean = false
+    var memoryCommitRefusal: MemoryRefusal? = null
 
     /**
      * 最後に作ろうとした core インスタンス（[ProcessContext.instantiate]、最初のインスタンス、コンポーネントの core インスタンスのそれぞれ）が、RAM の上限で確保を断られて作れなかった（#48）。

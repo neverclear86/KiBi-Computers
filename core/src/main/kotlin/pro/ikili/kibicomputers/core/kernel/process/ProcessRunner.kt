@@ -585,7 +585,7 @@ internal class ProcessRunner(private val machine: Machine) {
         // RAM は初めて書き込んだ 4 KiB の区画で数える（#407）。ページ数はアドレス空間の上限だけを見る。
         // アドレス空間は RAM より大きくてよい（書かない所は数えない）。RAM がそれより大きいマシンでは RAM まで
         val ramPages = minOf(rt.memory.limitPages, machine.memoryAccount.limitPages)
-        builder.writtenMemoryLimit(maxOf(ADDRESS_SPACE_PAGES, ramPages), rt.memory) { rt.memoryGrowRefused = true }
+        builder.writtenMemoryLimit(maxOf(ADDRESS_SPACE_PAGES, ramPages), rt.memory) { rt.memoryGrowRefusal = rt.memory.lastRefusal }
         // テーブル（#361）: 要素数の上限は読み込みの上限と同じ値にし、要素の分はメモリと同じくプロセスと RAM に数える
         check(builder.tableBudget == null && builder.maxTableElements == Int.MAX_VALUE) { "ABI 層は builder.tableLimit を呼ばない（テーブルの上限はカーネルが設定する）" }
         val maxTableElements = (scheduler.options.moduleLimits ?: ModuleLimits.DEFAULT).maxTableElements
@@ -787,14 +787,24 @@ internal class ProcessRunner(private val machine: Machine) {
         return if (note != null) "$reason ($note)" else reason
     }
 
-    /** メモリ不足の文の、当たった上限の部分（[memoryLimitText]。最後に断った段で決める。#48） */
-    private fun memoryLimitText(rt: ProcessRuntime): String =
-        memoryLimitText(rt.memory.lastRefusal == MemoryRefusal.SERVER, rt.memory.effectiveLimitBytes)
+    /**
+     * メモリ不足の文の、当たった上限の部分（[memoryLimitText]。プロセス全体で最後に断った段で決める。#48）。
+     * 断った直後に同じスレッドで読む所（OUT_OF_MEMORY のトラップ、インスタンスを作れなかったとき）だけで使う
+     */
+    private fun memoryLimitText(rt: ProcessRuntime): String = memoryLimitText(rt, rt.memory.lastRefusal)
 
-    /** `memory.grow`・`kibi:computer/memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null` */
+    /** [refusal] の段で断ったときの、メモリ不足の文の当たった上限の部分（[memoryLimitText]。#48） */
+    private fun memoryLimitText(rt: ProcessRuntime, refusal: MemoryRefusal?): String =
+        memoryLimitText(refusal == MemoryRefusal.SERVER, rt.memory.effectiveLimitBytes)
+
+    /**
+     * `memory.grow`・`kibi:computer/memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null`。
+     * 当たった上限は、それぞれを断った段で書く（後の別の確保で `ProcessMemory.lastRefusal` が変わっていても。#48）
+     */
     private fun refusedMemoryNote(rt: ProcessRuntime): String? {
-        if (!rt.memoryGrowRefused && !rt.memoryCommitRefused) return null
-        return memoryRefusedNote(rt.memoryGrowRefused, rt.memoryCommitRefused, memoryLimitText(rt))
+        val grow = rt.memoryGrowRefusal?.let { memoryLimitText(rt, it) }
+        val commit = rt.memoryCommitRefusal?.let { memoryLimitText(rt, it) }
+        return memoryRefusedNote(grow, commit)
     }
 
     /**
@@ -1565,7 +1575,7 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun commitMemory(memory: WasmMemory, address: Int, length: Int, keepBytes: Long): Boolean {
             val committed = memory.commit(address, length, keepBytes)
             // 範囲外は例外で抜けるので、false は RAM が理由で断ったとき
-            if (!committed) rt.memoryCommitRefused = true
+            if (!committed) rt.memoryCommitRefusal = rt.memory.lastRefusal
             return committed
         }
 
