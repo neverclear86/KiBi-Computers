@@ -12,9 +12,12 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent
 import net.neoforged.neoforge.network.PacketDistributor
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent
 import net.neoforged.neoforge.network.handling.IPayloadContext
+import pro.ikili.kibicomputers.core.config.ConfigValues
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.display.ScreenSyncHost
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import java.util.Collections
 import java.util.IdentityHashMap
 
@@ -46,8 +49,29 @@ object ScreenSync {
     /** サーバーで読み込まれている画面。 */
     internal val serverScreens: MutableSet<ScreenBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
 
-    /** 画面の同期の、プレイヤーごとの送信量の勘定と、プレイヤーごと・サーバー全体の予算（#359、#352）。 */
-    val traffic: ScreenSyncTraffic<ServerPlayer> = ScreenSyncTraffic()
+    /**
+     * 画面の同期の、プレイヤーごとの送信量の勘定と、プレイヤーごと・サーバー全体の予算（#359、#352）。
+     * 予算はコンフィグ（#202）の値。読み直して予算が変わったら、tick の始めに作り直す（プレイヤーごとの勘定は空に戻る）
+     */
+    @Volatile
+    var traffic: ScreenSyncTraffic<ServerPlayer> = ScreenSyncTraffic()
+        private set
+
+    /** [traffic] を作ったコンフィグの写し */
+    private var trafficConfig: ConfigValues? = null
+
+    /** コンフィグの予算が変わっていたら、[traffic] を作り直す。メインスレッドから呼ぶ */
+    internal fun applyConfigIfChanged() {
+        val values = KiBiConfigs.server
+        if (values === trafficConfig) return
+        trafficConfig = values
+        val current = traffic
+        if (current.playerBytesPerSecond != values[KiBiConfig.SCREEN_PLAYER_BYTES_PER_SECOND] ||
+            current.serverBytesPerSecond != values[KiBiConfig.SCREEN_SERVER_BYTES_PER_SECOND]
+        ) {
+            traffic = KiBiConfig.screenSyncTraffic(values)
+        }
+    }
 
     /** プレイヤーへの送り方。GameTest では、偽物のプレイヤーに送れないので差し替える。 */
     fun interface Transport {
@@ -78,6 +102,7 @@ object ScreenSync {
     }
 
     private fun onServerTick(event: ServerTickEvent.Post) {
+        applyConfigIfChanged()
         // 送る間に画面が消えることはないが、念のため写してから回す
         if (serverScreens.isNotEmpty()) for (screen in serverScreens.toTypedArray()) screen.syncTick()
         // 積んだ分を予算の中で送り、予算を増やす（画面がなくても予算は戻す）

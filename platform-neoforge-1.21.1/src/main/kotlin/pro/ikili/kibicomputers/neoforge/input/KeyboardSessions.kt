@@ -10,8 +10,10 @@ import net.neoforged.neoforge.event.entity.player.PlayerEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import net.neoforged.neoforge.network.PacketDistributor
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
 import pro.ikili.kibicomputers.core.input.KeyboardSession
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import java.util.Optional
 import java.util.UUID
 
@@ -25,7 +27,8 @@ import java.util.UUID
  *   開いているセッションは GUI を開いている人の数だけなので、待っているだけのコンピューターには負荷がかからない）
  * - 閉じるときに、押したままのキーの離しを合成してキーボードに配る（#326 で使う）
  * - 受け取る量の上限（[KeyboardInputBudget]）は、プレイヤーとキーボードの組ごと。開き直しても戻らないように、
- *   使い切っていない分はログアウトまで覚えておく（満タンに戻ったものは、次に開くときに捨てる）
+ *   使い切っていない分はログアウトまで覚えておく（満タンに戻ったものは、次に開くときに捨てる）。
+ *   値はコンフィグ（#202）から作る。コンフィグを変えた後に開くとき、覚えている予算の値が古ければ作り直す（使った分は戻る）
  */
 object KeyboardSessions {
     private class Open(
@@ -70,7 +73,10 @@ object KeyboardSessions {
         val tick = tickOf(player)
         val mine = budgets.getOrPut(player.uuid) { HashMap() }
         mine.values.removeIf { it.available(tick) >= it.capacity }
-        val budget = mine.getOrPut(GlobalPos.of(level.dimension(), keyboardPos)) { KeyboardInputBudget() }
+        // 使いかけの予算が古い値（コンフィグを変える前のためておける量・戻る量）なら、今の値で作り直す（#202）
+        val budgetKey = GlobalPos.of(level.dimension(), keyboardPos)
+        val budget = KiBiConfig.keyboardInputBudget(KiBiConfigs.server, mine[budgetKey])
+        mine[budgetKey] = budget
         val session = KeyboardSession(nextId++, player.uuid, budget)
         if (nextId <= 0) nextId = 1
         sessions[player.uuid] = Open(player, level, keyboardPos.immutable(), keyboard, session)

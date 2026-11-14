@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.neoforge.client.KiBiClient
 import pro.ikili.kibicomputers.neoforge.computer.DeviceWiring
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
@@ -14,6 +15,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 import pro.ikili.kibicomputers.neoforge.registry.KiBiMenus
 import pro.ikili.kibicomputers.neoforge.registry.KiBiRecipes
+import net.neoforged.fml.ModLoadingContext
 import net.neoforged.fml.common.Mod
 import net.neoforged.fml.loading.FMLEnvironment
 import org.slf4j.Logger
@@ -31,6 +33,9 @@ object KiBiComputersNeoForge {
         runCatching { RuntimeSelfCheck.add(1, 2) }
             .onSuccess { LOGGER.info("WASM runtime self-check passed (1 + 2 = {})", it) }
             .onFailure { LOGGER.error("WASM runtime self-check failed", it) }
+        val container = ModLoadingContext.get().activeContainer
+        // コンフィグ（#202）。SERVER のファイルはワールドを開くときに読まれる
+        KiBiConfigs.register(container, MOD_BUS)
         KiBiDataComponents.register(MOD_BUS)
         KiBiBlocks.register(MOD_BUS)
         KiBiMenus.register(MOD_BUS)
@@ -42,7 +47,7 @@ object KiBiComputersNeoForge {
         WorldDisks.register()
         WorldMachineSaves.register()
         // クライアントのクラスは、クライアントでだけ読み込む
-        if (FMLEnvironment.dist.isClient) KiBiClient.register(MOD_BUS)
+        if (FMLEnvironment.dist.isClient) KiBiClient.register(container, MOD_BUS)
         startDevDriver()
     }
 
