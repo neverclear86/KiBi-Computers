@@ -41,6 +41,7 @@
 - lift した関数を呼んだら: 引数を lower（必要なら realloc）→ core の関数を呼ぶ → 結果を lift → **呼ぶ側に結果を渡し終えてから**（ホストなら値として返す・ゲストどうしなら呼ぶ側のメモリに lower してから）post-return。
 - realloc と post-return は `may_leave` を下ろして、`LinkEnv.callGuest`（カーネルでは `ProcessContext.callGuest`。中では止まる口を使えない。ADR 0073）の中で呼ぶ。コンポーネントどうしの呼び出し（ゲストからゲスト）は `callGuest` で包まない。
 - 一度トラップしたら、それ以上は呼べない（仕様ではトラップしたストアは使えなくなる。以後の呼び出しはトラップ）。
+- ホストからの `LinkedComponent.call` は入れ子にできない（#691）。ホストの関数の中・インスタンス化の途中（start 関数から呼ばれたホストの関数）から呼ぶと `IllegalStateException`。ホストの関数の中から呼べると、core の関数が `callGuest` で包まれずに動き、止まる口を使えてしまう（ADR 0073）。断るのは呼び出しの前なので、断った呼び出しはコンポーネントを壊さない（例外が外側まで伝われば、外側の呼び出しが壊す）。
 - resource の canon（`resource.new`・`rep`・`drop`）は、呼ぶとトラップする関数としてつなぐ（ハンドル表は #265）。own・borrow の受け渡しも ADR 0264 のままトラップ。
 - async の canon・組み込み（stream・future など）、map 型などは `WasmLoadException`（#266 ほか）。
 

@@ -422,4 +422,75 @@ class ComponentLinkTest {
         assertEquals(1, created.size)
         assertThrows<IllegalStateException> { created[0].call("f") }
     }
+
+    /** 呼ばれると、呼んだコンポーネントの "run" を入れ子で呼ぶホスト（#691）。[swallow] なら断られた例外を握りつぶして 0 を返す */
+    private fun reenteringHost(swallow: Boolean, rejected: MutableList<IllegalStateException>) = ComponentHost.of(
+        host(
+            "test:host/math",
+            "double" to HostFunction(fn(listOf(CanonType.U32), CanonType.U32)) { call, _ ->
+                try {
+                    call.component.call(call.component.function("run")!!, listOf(u32(1)))
+                } catch (e: IllegalStateException) {
+                    rejected += e
+                    if (!swallow) throw e
+                    u32(0)
+                }
+            },
+        ),
+    )
+
+    @Test
+    fun `ホストの関数の中からcallを呼ぶと断られ、外の呼び出しも失敗して以後は呼べない`() {
+        val rejected = ArrayList<IllegalStateException>()
+        instantiate(load(callsHost, reenteringHost(swallow = false, rejected))).use { c ->
+            val e = assertThrows<IllegalStateException> { c.call("run", args = listOf(u32(5))) }
+            assertTrue(e.message!!.contains("ホストの関数の中"), e.message)
+            assertEquals(1, rejected.size)
+            val again = assertThrows<WasmTrapException> { c.call("run", args = listOf(u32(5))) }
+            assertTrue(again.message!!.contains("前にトラップした"), again.message)
+        }
+    }
+
+    @Test
+    fun `断られた入れ子のcallはコンポーネントを壊さず、その後の呼び出しは普通に動く`() {
+        val rejected = ArrayList<IllegalStateException>()
+        instantiate(load(callsHost, reenteringHost(swallow = true, rejected))).use { c ->
+            assertEquals(u32(1), c.call("run", args = listOf(u32(5))))
+            assertEquals(u32(1), c.call("run", args = listOf(u32(7))))
+            assertEquals(2, rejected.size)
+        }
+    }
+
+    @Test
+    fun `start関数から呼ばれたホストの関数の中からcallを呼ぶと、インスタンス化が失敗して作ったものを閉じる`() {
+        val p = load(
+            """
+            (component
+              (import "test:host/math" (instance ${'$'}h
+                (export "double" (func (param "x" u32) (result u32)))))
+              (alias export ${'$'}h "double" (func ${'$'}double))
+              (core func ${'$'}double_lower (canon lower (func ${'$'}double)))
+              (core module ${'$'}a (func (export "f") (param i32) (result i32) local.get 0))
+              (core instance ${'$'}ia (instantiate ${'$'}a))
+              (core module ${'$'}m
+                (import "host" "double" (func ${'$'}d (param i32) (result i32)))
+                (func ${'$'}s i32.const 1 call ${'$'}d drop)
+                (start ${'$'}s))
+              (core instance ${'$'}hi (export "double" (func ${'$'}double_lower)))
+              (core instance ${'$'}i (instantiate ${'$'}m (with "host" (instance ${'$'}hi))))
+              (func (export "run") (param "x" u32) (result u32) (canon lift (core func ${'$'}ia "f"))))
+            """,
+            reenteringHost(swallow = false, ArrayList()),
+        )
+        val created = ArrayList<WasmInstance>()
+        val env = object : LinkEnv {
+            override fun onInstanceCreated(instance: WasmInstance) {
+                created += instance
+            }
+        }
+        val e = assertThrows<IllegalStateException> { instantiate(p, env) }
+        assertTrue(e.message!!.contains("インスタンス化の途中"), e.message)
+        assertEquals(1, created.size)
+        assertThrows<IllegalStateException> { created[0].call("f", 1L) }
+    }
 }

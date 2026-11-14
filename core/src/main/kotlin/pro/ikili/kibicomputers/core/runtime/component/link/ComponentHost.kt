@@ -67,7 +67,7 @@ internal fun interface HostFunctionBody {
 
 /** ホストの関数の呼び出し 1 回の文脈 */
 internal class ComponentCall(
-    /** 呼んだコンポーネントのインスタンス（プロセスに 1 つ） */
+    /** 呼んだコンポーネントのインスタンス（プロセスに 1 つ）。この中からその [LinkedComponent.call] は呼べない（[IllegalStateException]。#691） */
     val component: LinkedComponent,
     /** インスタンス化のときに渡した環境（カーネルなら、プロセスの口を持つ） */
     val env: LinkEnv,

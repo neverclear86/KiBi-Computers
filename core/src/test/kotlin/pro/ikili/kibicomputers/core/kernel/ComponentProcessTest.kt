@@ -107,4 +107,33 @@ class ComponentProcessTest {
         val unmetered = Program.component(ComponentProgram.load(LinkTesting.runtime, LinkTesting.wat("(component)"), ComponentHost.NONE, metered = false))
         assertEquals(false, unmetered.isFuelMetered)
     }
+
+    @Test
+    fun `ホストの関数の中からプロセスのコンポーネントを呼ぶとプロセスだけが落ちる`() {
+        // ホストの関数が KernelLinkEnv から同じ LinkedComponent を引いて call を呼ぶ（#691）
+        val reentering = ComponentHost.of(
+            LinkTesting.host(
+                "test:host/kernel",
+                "pid" to HostFunction(LinkTesting.fn(emptyList(), CanonType.U32)) { call, _ ->
+                    val c = (call.env as KernelLinkEnv).ctx.component
+                    c.call(c.function("run")!!, listOf(CanonValue.I32(1)))
+                },
+            ),
+        )
+        Harness().use { h ->
+            val m = h.machine()
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                ctx.component.call("run", args = listOf(CanonValue.I32(10)))
+                StepResult.Exit(0)
+            }
+            val rt = m.spawnRt(Program.component(LinkTesting.load(text, reentering, metered = true)), driver)
+            eventually(20_000, "終わらない") {
+                h.scheduler.tick()
+                rt.process.state.isTerminal || m.state == MachineState.CRASHED
+            }
+            assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
+            assertEquals(ProcessState.CRASHED, rt.process.state)
+            assertTrue(rt.lastError is IllegalStateException, "${rt.lastError}")
+        }
+    }
 }
