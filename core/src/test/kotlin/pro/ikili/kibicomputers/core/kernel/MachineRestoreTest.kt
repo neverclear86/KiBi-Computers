@@ -288,7 +288,8 @@ class MachineRestoreTest {
                     handleId = m.kernel.objects.add(DeviceHandle(address, TestDevice.kind))
                 }
             }
-            val m = h.machine(fuelPerTick = 10_000_000)
+            // 戻すマシンの乱数の元は一定値: 復元で作り直した /dev がこの元を使うかを中身で確かめる（#694）
+            val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().entropy { it.fill(0x5A) }.build())
             val finished = Finished()
             assertTrue(m.restore(request(saved, store, finished)))
             eventually(60_000, "復元が終わらない") {
@@ -299,7 +300,9 @@ class MachineRestoreTest {
             assertEquals(RestoreOutcome.RESTORED, finished.outcomes.single().second)
             val (random, handle) = m.lock.withLockValue { m.kernel.objects[randomId] as OpenFile to m.kernel.objects[handleId] as DeviceHandle }
             assertEquals(DevFileSystem.RANDOM_NODE, random.node)
-            assertEquals(16, m.vfs.pread(random, 0, ByteArray(16), 0, 16), "保存した node のまま読める")
+            val bytes = ByteArray(16)
+            assertEquals(16, m.vfs.pread(random, 0, bytes, 0, 16), "保存した node のまま読める")
+            assertTrue(bytes.all { it == 0x5A.toByte() }, "戻した /dev は戻すマシンの乱数の元を使う")
             assertEquals(DeviceInfo(address, TestDevice.kind), handle.info)
             // 戻した /dev も、このマシンのデバイスの表を見る
             assertEquals(Errno.NOENT, assertThrows<FsException> { m.vfs.stat(VfsPath.parse("/dev/device/$address")) }.errno)

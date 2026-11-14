@@ -2,8 +2,11 @@ package pro.ikili.kibicomputers.core.wasi.p1
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.TestDriver
@@ -41,7 +44,7 @@ class WasiP1PathTest {
     private val allFunctions = arrayOf(
         "path_open", "path_create_directory", "path_remove_directory", "path_unlink_file", "path_rename",
         "path_filestat_get", "path_filestat_set_times", "path_readlink", "path_symlink", "path_link",
-        "fd_read", "fd_write", "fd_close", "fd_fdstat_get", "fd_prestat_get", "fd_prestat_dir_name",
+        "fd_read", "fd_write", "fd_close", "fd_fdstat_get", "fd_filestat_get", "fd_prestat_get", "fd_prestat_dir_name",
     )
 
     private fun forwarding(): FakeModule {
@@ -146,10 +149,11 @@ class WasiP1PathTest {
         lock.withLockValue { kernel.objects.add(f) }
     }
 
-    private fun run(body: (Machine, ProcessContext, P) -> Unit) = timeout(limit) {
+    private fun run(setup: (Machine) -> Unit = {}, body: (Machine, ProcessContext, P) -> Unit) = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1_000_000)
             val fileId = m.setUpFiles()
+            setup(m)
             val module = forwarding()
             val options = SpawnOptions(
                 stdio = StdioSpec.CLOSED,
@@ -193,6 +197,74 @@ class WasiP1PathTest {
         val buf = ByteArray(256)
         val n = vfs.read(f, buf, 0, buf.size)
         String(buf, 0, n, Charsets.UTF_8)
+    }
+
+    private object TestDevice : Device {
+        override val kind = "test:device"
+        override val methods: DeviceMethods = DeviceMethods.builder().build()
+    }
+
+    private val deviceAddress = "00000000-0000-4000-8000-000000000694"
+
+    /** 根に `/dev` を作って本物の結線（`mountDev`）でマウントし、[deviceAddress] のデバイスをつなぐ（spawn の前。テストのスレッドから） */
+    private fun withDevice(m: Machine) {
+        m.vfs.createDirectory(VfsPath.parse("/dev"))
+        assertNull(m.mountDev())
+        assertTrue(m.devices.attach(deviceAddress, TestDevice))
+    }
+
+    /** `fd_fdstat_get` の種類と権利（rights_base） */
+    private fun P.fdstat(fd: Int): Pair<Int, Long> {
+        assertEquals(0, call("fd_fdstat_get", fd.toLong(), P.STAT.toLong()))
+        return mem.readU8(P.STAT) to mem.readI64(P.STAT + 8)
+    }
+
+    /** `fd_filestat_get` の種類 */
+    private fun P.filestatType(fd: Int): Int {
+        assertEquals(0, call("fd_filestat_get", fd.toLong(), P.STAT.toLong()))
+        return mem.readU8(P.STAT + 16)
+    }
+
+    /** 1 バイトの `fd_read`・`fd_write` の errno（長さ 0 だと権利しか確かめないので、1 バイト以上にする） */
+    private fun P.readOne(fd: Int): Int {
+        mem.writeI32(P.IOV, P.BUF)
+        mem.writeI32(P.IOV + 4, 1)
+        return call("fd_read", fd.toLong(), P.IOV.toLong(), 1, P.OUT.toLong())
+    }
+
+    private fun P.writeOne(fd: Int): Int = write(fd, "x")
+
+    @Test
+    fun `パスで開いたdeviceのfdはfdstatとfilestatがUNKNOWNで、読み書きはNOSYS`() = run(setup = ::withDevice) { _, _, p ->
+        // パスの stat は CHARACTER_DEVICE（ls -l 向け。ADR 0054）
+        assertEquals(0, p.stat(3, "dev/device/$deviceAddress"))
+        assertEquals(P1.FILETYPE_CHARACTER_DEVICE, p.statType)
+        val fd = p.open(3, "dev/device/$deviceAddress", rights = P1.RIGHT_FD_READ or P1.RIGHT_FD_WRITE)
+        assertTrue(fd >= 0, "新しい fd: $fd")
+        // fd は UNKNOWN（CHARACTER_DEVICE を返す fd は Tty だけ。isatty を偽にする）
+        val (type, rights) = p.fdstat(fd)
+        assertEquals(P1.FILETYPE_UNKNOWN, type)
+        assertEquals(P1.RIGHT_FD_READ or P1.RIGHT_FD_WRITE, rights and (P1.RIGHT_FD_READ or P1.RIGHT_FD_WRITE), "求めた READ・WRITE をそのまま渡す")
+        assertEquals(0L, rights and (P1.RIGHT_FD_SEEK or P1.RIGHT_FD_TELL), "SEEK・TELL はない")
+        assertEquals(P1.FILETYPE_UNKNOWN, p.filestatType(fd))
+        assertEquals(Errno.NOSYS.code, p.readOne(fd))
+        assertEquals(Errno.NOSYS.code, p.writeOne(fd), "WRITE の権利があるので BADF ではなく NOSYS")
+    }
+
+    /**
+     * `kibi:device` の open で開いた fd（#694）。WASM に出す import は #77 でまだないので、同じ口の [ProcessContext.openDevice] で開く
+     * （プロセスのスレッドから呼ぶ）。#77 で import になっても、この口を通る
+     */
+    @Test
+    fun `kibi_deviceのopenで開いたfdはREADだけで、読むとNOSYS、書くとBADF`() = run(setup = ::withDevice) { _, ctx, p ->
+        val fd = ctx.openDevice(deviceAddress)
+        val (type, rights) = p.fdstat(fd)
+        assertEquals(P1.FILETYPE_UNKNOWN, type)
+        assertEquals(P1.RIGHT_FD_READ, rights and (P1.RIGHT_FD_READ or P1.RIGHT_FD_WRITE), "READ だけ（ADR 0054）")
+        assertEquals(0L, rights and (P1.RIGHT_FD_SEEK or P1.RIGHT_FD_TELL))
+        assertEquals(P1.FILETYPE_UNKNOWN, p.filestatType(fd))
+        assertEquals(Errno.NOSYS.code, p.readOne(fd))
+        assertEquals(Errno.BADF.code, p.writeOne(fd), "WRITE の権利がないので、NOSYS より先に BADF")
     }
 
     @Test
