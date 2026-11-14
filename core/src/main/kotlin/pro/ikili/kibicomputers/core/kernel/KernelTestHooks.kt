@@ -6,7 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
  * テスト用の内部のフック。競合の順番をテストで作るために、決まった場所で止められる。既定は何もしない。
  *
  * 多くは `(マシン, pid)` を受け取る（[beforeInitExec] などはマシンだけ、[atSpawnStage] は段（[SpawnStage]）だけ）。
- * [stopBeforeInterrupt]・[duringRestoreInstall]・[duringInitSpawn]・[duringSpawn]・[atSpawnStage]・[duringRebootPost] は
+ * [stopBeforeInterrupt]・[duringRestoreInstall]・[afterRestoreAdopt]・[duringInitSpawn]・[duringSpawn]・[atSpawnStage]・[duringRebootPost] は
  * カーネルロックの中、ほかはロックの外で呼ぶ（それぞれの KDoc を見る）。ロックの中のフックで、カーネルロックを要る別のスレッドを待つとデッドロックする。
  */
 internal class KernelTestHooks {
@@ -60,6 +60,13 @@ internal class KernelTestHooks {
     /** 復元の後段の途中（カーネルロックの中。表を入れた後、実行時の部分を作る前）。例外を投げると後段の失敗になる */
     @Volatile
     var duringRestoreInstall: ((Machine) -> Unit)? = null
+
+    /**
+     * 復元の後段で、プロセス1つを `runtimes` に入れてインスタンスを渡した直後（カーネルロックの中。引数は pid）。
+     * 例外を投げると、それ以降のプロセスが `runtimes` に入らないまま失敗する（採用済みと未採用が混ざる位置。#671）
+     */
+    @Volatile
+    var afterRestoreAdopt: ((Machine, Int) -> Unit)? = null
 
     /**
      * 起動の init を作る区間の途中（カーネルロックの中。表に足して実行時の部分を作った後、`RUNNING` にする前。#625）。

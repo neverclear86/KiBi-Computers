@@ -86,7 +86,11 @@
 - **後段で失敗したら**（表に入れかけた後）、カーネルの不整合として CRASHED にする（`inconsistencyLocked`）。知らせ（`RestoreListener`）は送らない。ケースは CRASHED の規則（マシンを外して ERROR、電源を切る）で受ける。
   `completeRestore` は `false` を返し、前段で作ったもの（インスタンス・ファイルシステム）は起動用のスレッドが**ロックの外で全部** `discard` する（#576。ロックの中で I/O をしない ADR 0052 の規則）。
   表に入れ終えて `stopLocked` が閉じたものにも重ねて呼ぶが、`WasmInstance.close`・`FileSystem.retire`・`TmpFileSystem.onUnmounted` は2回目に何もしない。
-  失敗の位置によらず、サーバー全体の RAM の勘定（マシンを閉じても戻らない）・表のプロセスが持ったままの `/tmp`・ディスクのリースが返る。半端な表は巻き戻さない
+  失敗の位置によらず、サーバー全体の RAM の勘定（マシンを閉じても戻らない）・表のプロセスが持ったままの `/tmp`・ディスクのリースが返る。半端な表は巻き戻さない。
+  追記（#671）: `stopLocked` が `runtimes` のプロセスを終えた後に、表にあって `runtimes` に入っていない終わっていないプロセスを KILLED にする（状態と待ちを書き換えるだけ。表から外さず、fd・オブジェクトは片付けない）。
+  先に KILLED にすると、採用済みの親の終わりが終わった子を刈り取る（表から外し、オブジェクトの参照を返す）ので、後にする。
+  `stopLocked` は `runtimes` のプロセスしか止めないので、これがないと `awaitTermination` が返らない。`/tmp` は `stopLocked` の `checkAllDoneLocked` が外す（2回目の `onUnmounted` は何もしないので二重に返らない）。
+  `stopLocked` の一般の掃除にしないのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
 - 取り消し（`stop()`・`close()`）は前段のどこでも効き、作ったものを返す。読み込みを待っている間なら、`restoreCancelSignal` に復元1回につき1つ付けた登録が、待っている読み込みを取り消す（始まっていなければ読み込まない。#363）。登録は待っている読み込みの入れ物だけを持ち、`restoreCancelSignal` は取り消し（`stopLocked`）に加えて前段の終わり（`completeRestore`・`restoreFellBack`）でも終えるので、終わった台に登録は残らない（#587）。後段に入る前に取り消されたら入れない。知らせは `CANCELLED`。
   前段が冷えた起動待ちに切り替えた（`COLD_BOOT` を積んだ）後、配る前に取り消したときも、配るときに `CANCELLED` に替える（`stopLocked` は前段の途中のときだけ `CANCELLED` を積む）。
   知らせは復元1回につき1回で、取り消した台を冷えた起動に数えない（#576）

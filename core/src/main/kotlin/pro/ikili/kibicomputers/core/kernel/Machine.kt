@@ -667,7 +667,7 @@ public class Machine private constructor(
      */
     private fun processReadinessLocked(process: Process): SaveReadiness {
         if (process.state.isTerminal) return SaveReadiness.READY
-        // 終わっていないのに実行時の部分がない（今は起きない。守りだけ）
+        // 終わっていないのに実行時の部分がない（今は起きない。後段の失敗で runtimes に入らなかったものも KILLED にする。#671。守りだけ）
         val rt = runtimes[process.pid] ?: return SaveReadiness.UNSAVEABLE
         if (!isStaticallySaveableLocked(rt)) return SaveReadiness.UNSAVEABLE
         return when {
@@ -980,7 +980,9 @@ public class Machine private constructor(
      * @return [prepared] の持ち主がカーネルに移ったら `true`。取り消されていた・入れる途中で失敗したら `false` で、
      *   呼び手がロックの外で [PreparedRestore.discard] する（#576）。途中で失敗したときは、カーネルの不整合として CRASHED にする。
      *   表に入れ終えたもの（インスタンス・つないだファイルシステム）は [stopLocked] が先に閉じるが、discard で重ねて閉じても何も起きない
-     *   （どの位置で失敗しても、`runtimes` に入らなかったインスタンス・表のプロセスが持ったままの `/tmp` の RAM・ディスクのリースが返る）
+     *   （どの位置で失敗しても、`runtimes` に入らなかったインスタンス・表のプロセスが持ったままの `/tmp` の RAM・ディスクのリースが返る）。
+     *   `runtimes` に入れる前の表のプロセスは、[stopLocked] が `runtimes` のプロセスを終えた後に KILLED にする
+     *   （[endUnadoptedRestoredProcessesLocked]。[awaitTermination] が返り、`/tmp` も [stopLocked] の中で外れる。#671）
      */
     internal fun completeRestore(prepared: PreparedRestore): Boolean = lock.withLockValue {
         if (!restoringValue || restoreCancelled || scheduler.isClosed) return@withLockValue false
@@ -991,7 +993,13 @@ public class Machine private constructor(
             restoringValue = false
             val fatal = t is VirtualMachineError && t !is StackOverflowError
             if (!fatal) LOG.log(System.Logger.Level.ERROR, "マシン $id を表に戻す途中で失敗した: $t")
-            inconsistencyLocked("保存データを表に戻せない: $t")
+            // runtimes に入れる前の表のプロセスは stopLocked が止めないので、stopLocked が runtimes のプロセスを終えた後に終わった状態にする（#671）
+            endUnadoptedOnStop = true
+            try {
+                inconsistencyLocked("保存データを表に戻せない: $t")
+            } finally {
+                endUnadoptedOnStop = false
+            }
             // stopLocked が終えているはずだが、どの経路でも登録が残らないように重ねて終える（#587）
             restoreCancelSignal.complete(Unit)
             if (fatal) throw t
@@ -1019,6 +1027,34 @@ public class Machine private constructor(
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
         true
     }
+
+    /**
+     * 後段の失敗（[completeRestore]）で、表にあるのに `runtimes` に入っていない、終わっていないプロセスを KILLED にする（#671。カーネルロックの中）。
+     * [stopLocked] は `runtimes` のプロセスしか止めないので、これがないと [awaitTermination] が返らず、表と `runtimes` が食い違ったまま残る。
+     *
+     * [stopLocked] が `runtimes` のプロセスをすべて終えた**後**に呼ぶ（[endUnadoptedOnStop]）。先に KILLED にすると、採用済みの親の終わり
+     * （[ProcessRunner.finishLocked] の終わりの記録・fd を閉じたときの付け替え）が、終わった未採用の子を `reapLocked` で表から外し、
+     * `ProcessObject` の参照を返してしまうため。後なら、その時点で未採用の子は終わっていないので、親なしに付け替えられるだけで表に残る。
+     *
+     * 半端な表は巻き戻さない（ADR 0085）: 表から外さず、状態と待ちを書き換えるだけ。fd・オブジェクト・待ちの登録には触らない
+     * （オブジェクトの表は途中まで戻っているかもしれず、返すと投げたり [PreparedRestore.discard] と二重に返したりしうる。
+     * 前段で作ったものは discard が、`/tmp` は [stopLocked] の [checkAllDoneLocked] が返す）。投げる操作はしない。
+     * 親への知らせ・コンソールへの書き込みもしない（台は CRASHED になり、ケースが外す）。
+     * 場所を後段の失敗に限るのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
+     */
+    private fun endUnadoptedRestoredProcessesLocked() {
+        for (process in kernel.processes.all()) {
+            if (process.state.isTerminal || runtimes.containsKey(process.pid)) continue
+            process.state = ProcessState.KILLED
+            process.wait = null
+        }
+    }
+
+    /**
+     * 後段の失敗の [stopLocked] の間だけ立てる（[completeRestore]。カーネルロックの中）。立っていれば、[stopLocked] は `runtimes` のプロセスを終えた後に
+     * [endUnadoptedRestoredProcessesLocked] を呼ぶ（#671）
+     */
+    private var endUnadoptedOnStop = false
 
     /** 前段から（#85）: 戻せなかったので冷えた起動待ちにして知らせる（取り消されていたら何もしない） */
     internal fun restoreFellBack(cause: ColdBootCause): Unit = lock.withLockValue {
@@ -1097,6 +1133,7 @@ public class Machine private constructor(
             check(process != null && process === rt.process) { "pid ${rt.pid} のプロセスが表と違う" }
             runtimes[rt.pid] = rt
             if (instance != null) runner.adoptRestoredInstanceLocked(rt, instance)
+            scheduler.hooks.afterRestoreAdopt?.invoke(this, rt.pid)
         }
         for ((rt, _) in prepared.runtimes) {
             val process = rt.process
@@ -2201,6 +2238,8 @@ public class Machine private constructor(
             if (rt.process.state.isTerminal) continue
             killRuntimeLocked(rt, null)
         }
+        // 後段の失敗では、runtimes に入っていない表のプロセスも終える。採用済みの親の終わりが未採用の子を刈り取らないよう、上の後（#671）
+        if (endUnadoptedOnStop) endUnadoptedRestoredProcessesLocked()
         // 取りこぼし（すでに終わったプロセスが残した分など）を防ぐため、残りもすべて取り消す
         cancelHostCallsLocked()
         // 後で返すデバイスの呼び出し（#65）は、実行中のまま残さず取り消す（isCancelled が立つ）
