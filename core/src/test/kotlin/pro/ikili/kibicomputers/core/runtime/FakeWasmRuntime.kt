@@ -76,6 +76,7 @@ class FakeModule private constructor(
     internal val data: List<Pair<Int, ByteArray>>,
     override val isFuelMetered: Boolean,
     internal val start: FakeFunction?,
+    internal val tableBytes: Long,
 ) : WasmModule {
     override val isAsyncified: Boolean get() = false
 
@@ -91,9 +92,18 @@ class FakeModule private constructor(
             if (pages > minOf(FakeMemory.MAX_PAGES, config.maxMemoryPages)) throw WasmLinkException("ダミー: メモリの最初のページ数が上限を超える")
             if (!config.writtenMemory && pages > 0 && config.memoryBudget?.tryReserve(pages) == false) throw WasmLinkException("ダミー: メモリを確保できない")
         }
-        val instance = FakeInstance(this, config)
+        // テーブル（#361）: 最初の要素の分を数える。数えられなければ作れない（Endive と同じく WasmLinkException。#48）
+        val tableBudget = config.tableBudget
+        val reservedTable = if (tableBudget != null && tableBytes > 0) tableBytes else 0L
+        if (reservedTable > 0 && !tableBudget!!.tryReserveBytes(reservedTable)) throw WasmLinkException("ダミー: テーブルを確保できない（RAM が足りない）")
+        val instance = FakeInstance(this, config, reservedTable)
         if (isFuelMetered) instance.fuel = config.initialFuel
-        start?.let { instance.run(it, LongArray(0)) }
+        try {
+            start?.let { instance.run(it, LongArray(0)) }
+        } catch (t: Throwable) {
+            instance.close()
+            throw t
+        }
         return instance
     }
 
@@ -104,6 +114,7 @@ class FakeModule private constructor(
         private val data = mutableListOf<Pair<Int, ByteArray>>()
         private var fuelMetered = false
         private var start: FakeFunction? = null
+        private var tableBytes = 0L
 
         fun import(module: String, name: String, type: WasmFunctionType) = apply { imports += WasmImportDescriptor(module, name, WasmExternKind.FUNCTION, type) }
 
@@ -117,7 +128,10 @@ class FakeModule private constructor(
 
         fun start(function: FakeFunction) = apply { start = function }
 
-        fun build(): FakeModule = FakeModule(imports.toList(), functions.toMap(), memoryPages, data.toList(), fuelMetered, start)
+        /** テーブルの最初の要素が使う [bytes] バイトを、インスタンスを作るときに数える（#361・#48） */
+        fun tableBytes(bytes: Long) = apply { tableBytes = bytes }
+
+        fun build(): FakeModule = FakeModule(imports.toList(), functions.toMap(), memoryPages, data.toList(), fuelMetered, start, tableBytes)
     }
 
     companion object {
@@ -125,7 +139,7 @@ class FakeModule private constructor(
     }
 }
 
-internal class FakeInstance(override val module: FakeModule, private val config: WasmInstanceConfig) : WasmInstance {
+internal class FakeInstance(override val module: FakeModule, private val config: WasmInstanceConfig, private val tableBytes: Long = 0) : WasmInstance {
     @Volatile
     private var fuelValue: Long = 0
 
@@ -222,6 +236,7 @@ internal class FakeInstance(override val module: FakeModule, private val config:
         if (closed) return
         closed = true
         fakeMemory?.releaseAll()
+        if (tableBytes > 0) config.tableBudget?.releaseBytes(tableBytes)
     }
 }
 
