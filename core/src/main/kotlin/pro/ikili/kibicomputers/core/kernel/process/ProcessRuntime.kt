@@ -60,7 +60,7 @@ internal class ProcessRuntime(
     var memoryBase: MemoryBase = MemoryBase.None
 
     /** 作ったインスタンス（作った順） */
-    val instances: MutableList<WasmInstance> = ArrayList(1)
+    val instances: ProcessInstances = ProcessInstances()
 
     /** 最初に作ったインスタンス */
     var firstInstance: WasmInstance? = null

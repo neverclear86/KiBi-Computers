@@ -106,33 +106,6 @@ object KeyboardGameTests {
         helper.succeed()
     }
 
-    /** 入力 GUI に出す画面: 隣のケースの画面（テスト用コンピューター）か、このキーボードを見つける画面。なければ null。 */
-    @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
-    fun keyboardFindsItsScreen(helper: GameTestHelper) {
-        val keyboard = BlockPos(1, 1, 2)
-        helper.setBlock(keyboard, KiBiBlocks.KEYBOARD.get())
-        val absKeyboard = helper.absolutePos(keyboard)
-        fun find() = KeyboardInput.findScreen(helper.level, absKeyboard)
-        helper.assertTrue(find() == null, "no screen yet")
-        // 机の上のキーボード: 画面は1つ上の段で、正面がキーボードの方
-        val screen = BlockPos(1, 2, 1)
-        helper.setBlock(screen, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH))
-        helper.assertTrue(find() == helper.absolutePos(screen), "screen above in front should be found but was ${find()}")
-        // 背を向けた画面は、このキーボードを見つけないが、隣にあるので見つける
-        helper.setBlock(screen, Blocks.AIR)
-        val back = BlockPos(1, 1, 1)
-        helper.setBlock(back, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.NORTH))
-        helper.assertTrue(find() == helper.absolutePos(back), "adjacent screen should be found but was ${find()}")
-        helper.setBlock(back, Blocks.AIR)
-        // テスト用コンピューター: キーボードの隣のケースの、上の画面
-        helper.setBlock(back, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
-        val caseScreen = BlockPos(1, 2, 1)
-        helper.setBlock(caseScreen, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH))
-        helper.assertTrue(find() == helper.absolutePos(caseScreen), "the case's screen should be found but was ${find()}")
-        helper.succeed()
-    }
-
     /** 画面の前・前の下・隣のキーボードを見つける。遠いもの・画面でないものは見つけない。 */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)

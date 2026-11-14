@@ -4,6 +4,7 @@ import com.mojang.logging.LogUtils
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.neoforge.client.KiBiClient
+import pro.ikili.kibicomputers.neoforge.computer.DeviceWiring
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
@@ -37,6 +38,7 @@ object KiBiComputersNeoForge {
         ScreenSync.register(MOD_BUS)
         KeyboardInput.register(MOD_BUS)
         ServerMachines.register()
+        DeviceWiring.register()
         WorldDisks.register()
         WorldMachineSaves.register()
         // クライアントのクラスは、クライアントでだけ読み込む

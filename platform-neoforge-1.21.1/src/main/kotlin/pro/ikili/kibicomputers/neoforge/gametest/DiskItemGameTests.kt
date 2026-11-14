@@ -22,7 +22,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseParts
 import pro.ikili.kibicomputers.neoforge.computer.DiskItem
-import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
+import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
@@ -141,7 +141,7 @@ object DiskItemGameTests {
         helper.assertTrue(id != null && DiskStore.isValidId(id), "the disk should get a valid ID but had $id")
         helper.assertTrue(case.computer.machine!!.insertedDiskIds == setOf(id), "the machine should know the inserted disk but had ${case.computer.machine!!.insertedDiskIds}")
         val boot = case.computer.machine!!.lastBootConfig!!
-        helper.assertTrue(boot.bootDisks == listOf(id, TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the disk then the OS image")
+        helper.assertTrue(boot.bootDisks == listOf(id, ProvisionalBoot.OS_BOOT_DISK), "boot candidates should be the disk then the OS image")
         helper.assertTrue(boot.homeDisk == id, "the first disk should be the home disk but was ${boot.homeDisk}")
         case.pressPowerButton()
         helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run again")
@@ -199,7 +199,7 @@ object DiskItemGameTests {
         val machine = case.computer.machine!!
         helper.succeedWhen {
             val text = lines(screen!!.text)
-            helper.assertTrue(text.any { it == "kibi: booting from disk ${TestComputerWiring.OS_BOOT_DISK}" }, "should fall back to the OS image: $text")
+            helper.assertTrue(text.any { it == "kibi: booting from disk ${ProvisionalBoot.OS_BOOT_DISK}" }, "should fall back to the OS image: $text")
             helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
             helper.assertTrue(machine.state == MachineState.RUNNING, "machine should be running")
             case.pressPowerButton()
@@ -219,7 +219,7 @@ object DiskItemGameTests {
         helper.assertTrue(DiskItem.diskIdOf(diskSlot(case)) == null, "an invalid ID should not be used")
         helper.assertTrue(case.computer.machine!!.insertedDiskIds.isEmpty(), "an invalid ID should not be an inserted disk")
         val boot = case.computer.machine!!.lastBootConfig!!
-        helper.assertTrue(boot.bootDisks == listOf(TestComputerWiring.OS_BOOT_DISK), "boot candidates should be the OS image only")
+        helper.assertTrue(boot.bootDisks == listOf(ProvisionalBoot.OS_BOOT_DISK), "boot candidates should be the OS image only")
         helper.assertTrue(boot.homeDisk == null, "an invalid ID should not be the home disk")
         case.pressPowerButton()
         helper.setBlock(CASE, Blocks.AIR)

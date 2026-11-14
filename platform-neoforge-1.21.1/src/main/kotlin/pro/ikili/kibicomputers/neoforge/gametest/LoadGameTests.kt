@@ -18,7 +18,7 @@ import pro.ikili.kibicomputers.core.display.ScreenSyncSender
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
-import pro.ikili.kibicomputers.neoforge.computer.TestComputerWiring
+import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -231,7 +231,7 @@ object LoadGameTests {
             helper.setBlock(case.south(), KiBiBlocks.KEYBOARD.get())
             val be = helper.getBlockEntity<CaseBlockEntity>(case)
             // Lua の REPL で測るときは、テスト用の起動ディスクから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
-            if (os == LoadOs.LUA) be.fallbackBootDisk = TestComputerWiring.TEST_BOOT_DISK
+            if (os == LoadOs.LUA) be.fallbackBootDisk = ProvisionalBoot.TEST_BOOT_DISK
             // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる（TestComputerGameTests と同じ）
             for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
                 be.parts.setStackInSlot(be.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))

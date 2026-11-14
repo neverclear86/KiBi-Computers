@@ -557,7 +557,7 @@ internal class ProcessRunner(private val machine: Machine) {
         if (rt.program.component != null) {
             if (frame != null) {
                 if (frame.provisional == null) frame.provisional = instance
-            } else if (rt.instances.none { it === instance }) {
+            } else if (!rt.instances.containsSame(instance)) {
                 throw machine.inconsistencyLocked("このプロセスのインスタンスでないものから呼ばれた（pid ${rt.pid}）")
             }
             return
@@ -1086,7 +1086,7 @@ internal class ProcessRunner(private val machine: Machine) {
             checkThread()
             lock.withLockValue {
                 check(rt.loading == null) { "作っている途中は switchFuelHolder を呼べない" }
-                require(rt.instances.any { it === target }) { "このプロセスのインスタンスでない" }
+                require(rt.instances.containsSame(target)) { "このプロセスのインスタンスでない" }
                 val holder = rt.fuelHolder!!
                 if (!rt.process.unmetered && holder !== target) {
                     val r = holder.fuel
