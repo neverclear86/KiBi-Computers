@@ -141,10 +141,11 @@ internal interface FileSystem {
 
     /**
      * [node] を開いたときの差し替え先（[SpecialFile]。`/dev/tty`・`/dev/device/<address>`。#485・#54）。`null` でなければ、開いた fd は
-     * このファイルではなく、差し替え先のオブジェクトを指す（`FdTable.openFile`）。カーネルロックの中から呼ばれるので、I/O をせず、
-     * 長く待たない。既定は `null`（普通のファイル）
+     * このファイルではなく、差し替え先のオブジェクトを指す（`FdTable.openFile`）。[name] は開いたときのパスの最後の名前
+     * （`/dev/device/<address>` の address。node が同じになる別の名前と区別するため。#693）。カーネルロックの中から呼ばれるので、
+     * I/O をせず、長く待たず、例外を投げない。既定は `null`（普通のファイル）
      */
-    fun special(node: Long): SpecialFile? = null
+    fun special(node: Long, name: String): SpecialFile? = null
 
     /**
      * [node] の今のパスの目安（このファイルシステムの根から）。保存の写しで、開いたファイルをパスで引き直せるように控える（#82。ADR 0082）。
