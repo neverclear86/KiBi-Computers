@@ -164,7 +164,11 @@ class DeviceBusTest {
             assertTrue(ctx.postEvent("heat", DeviceValue.of(5L), DeviceValue.none(), DeviceValue.of("hot"), DeviceValue.of(true)))
             val batch = m.lock.withLock { q.take(10) }
             assertEquals(
-                listOf(KernelEvent("heat", a, listOf(EventValue.Integer(5), EventValue.Text("hot"), EventValue.Boolean(true)))),
+                listOf(
+                    // つないだときのカーネルのイベント（#67、ADR 0067）
+                    KernelEvent(DeviceEvents.ATTACHED, "", listOf(EventValue.Text(a), EventValue.Text("test:recording"))),
+                    KernelEvent("heat", a, listOf(EventValue.Integer(5), EventValue.Text("hot"), EventValue.Boolean(true))),
+                ),
                 batch.events,
             )
             // 上限を超えるもの（名前が長い・空、値が多い）は捨てて false

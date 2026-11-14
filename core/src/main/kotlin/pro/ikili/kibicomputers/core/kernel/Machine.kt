@@ -1041,7 +1041,19 @@ public class Machine private constructor(
      * （オブジェクトの表は途中まで戻っているかもしれず、返すと投げたり [PreparedRestore.discard] と二重に返したりしうる。
      * 前段で作ったものは discard が、`/tmp` は [stopLocked] の [checkAllDoneLocked] が返す）。投げる操作はしない。
      * 親への知らせ・コンソールへの書き込みもしない（台は CRASHED になり、ケースが外す）。
-     * 場所を後段の失敗に限るのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため
+     * 場所を後段の失敗に限るのは、spawn の途中（表に足した後、`runtimes` に足す前）のプロセスを巻き込まないため。
+     *
+     * 終わりの記録（`ExitBookkeeping.recordExit`・[ProcessRunner.finishLocked]）を通さないので、ここで KILLED にしたプロセスについては、
+     * 表の次の不変条件が崩れたまま残る（ADR 0085 の追記（#696））:
+     * - `ProcessObject.status` は `null` のまま（`EXITED` の待ちも起こさない）。終了コード・`termSignal` も入れない
+     * - 親がいない・親が終わっているものも、親のないゾンビの並び（`orphanZombies`）に入れない。そのため古い順の刈り取りにもかからない
+     * - 親に知らせない（`pendingChildExits`・`CHILD_EXITED`）。子の付け替えも、子のゾンビの刈り取りもしない。
+     *   採用済みの子と未採用の親が混ざる場合（pid の使い回しで、子の pid が親より小さい）、子は先に終わって親付きのゾンビになり、
+     *   終わった親を指したまま表に残る（上限の数えにも入ったまま）
+     * - init でも `kernel.initPid` を下ろさない（[onProcessFinishedLocked] を通らない）
+     * - fd・一時的なタイマー（`waitTimers`）・オブジェクトの参照を返さない（わざと。上のとおり）
+     *
+     * 台は CRASHED のまま使い続けない: [boot]・[reboot] は断り、ケースは CRASHED の知らせでマシンを外して閉じる
      */
     private fun endUnadoptedRestoredProcessesLocked() {
         for (process in kernel.processes.all()) {

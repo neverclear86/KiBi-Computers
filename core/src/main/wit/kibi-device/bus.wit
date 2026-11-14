@@ -5,6 +5,7 @@ interface bus {
     use types.{value, device-info, method-info, call-error};
 
     /// つないでいるデバイスの一覧（待たない。接続を変えたときだけ作り直す一覧を読む）
+    /// 接続・切断は `kibi:kernel` のイベント "device-attached"・"device-detached"（source ""）で知らせる（#67、ADR 0067）
     list-devices: func() -> list<device-info>;
 
     /// 開いたデバイス（`/dev/device/<address>` を開いたのと同じ。#54）
