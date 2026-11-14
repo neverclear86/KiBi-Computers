@@ -224,23 +224,25 @@ object MachineSaveGameTests {
 
     /**
      * 取り出しの後に [be] のマシンを止める（ゲストが止めたのと同じ `stop()`。STOPPED まで待つ）フックを付けて [body] を回す（#698）。
-     * 取り出す前のそろえでは動いていて、写した後のそろえだけが止まった台を見る
+     * 止めた後に [afterStop] を呼ぶ。取り出す前のそろえでは動いていて、写した後のそろえだけが止まった台を見る。
+     * フックは [be] にだけ付く（[ServerMachines.afterCaptureForTest] はケースごと。#713）ので、既定のバッチでほかのテストと並べてよい
      */
-    private fun stoppingAfterCapture(helper: GameTestHelper, be: CaseBlockEntity, body: () -> Unit): Boolean {
+    private fun stoppingAfterCapture(helper: GameTestHelper, be: CaseBlockEntity, afterStop: () -> Unit = {}, body: () -> Unit): Boolean {
         var stopped = false
-        ServerMachines.afterCaptureForTest = { target ->
-            if (target === be && !stopped) {
+        ServerMachines.afterCaptureForTest[be] = {
+            if (!stopped) {
                 // フックの中では投げない（保存の経路の途中なので）。確かめるのは後
                 val machine = be.computer.machine
                 stopped = machine != null && be.computer.poweredOn
                 machine?.stop()
                 if (machine?.awaitTermination(5_000) != true) stopped = false
+                afterStop()
             }
         }
         try {
             body()
         } finally {
-            ServerMachines.afterCaptureForTest = null
+            ServerMachines.afterCaptureForTest.remove(be)
         }
         return stopped
     }
@@ -289,16 +291,11 @@ object MachineSaveGameTests {
             val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
             chunk.isUnsaved = false
             var changes = -1
-            val stopped = stoppingAfterCapture(helper, be) {
-                val hook = ServerMachines.afterCaptureForTest!!
-                ServerMachines.afterCaptureForTest = { target ->
-                    hook(target)
-                    // 取り出しの間に付いた印を外し、そろえが付けるかを見る
-                    if (target === be) {
-                        chunk.isUnsaved = false
-                        changes = be.setChangedCalls
-                    }
-                }
+            val stopped = stoppingAfterCapture(helper, be, afterStop = {
+                // 取り出しの間に付いた印を外し、そろえが付けるかを見る
+                chunk.isUnsaved = false
+                changes = be.setChangedCalls
+            }) {
                 ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
             }
             helper.assertTrue(stopped, "the hook should stop a powered machine after the capture")
@@ -340,7 +337,7 @@ object MachineSaveGameTests {
         val machine = be.computer.machine!!
         var stopped = false
         fun cleanUp() {
-            if (ServerMachines.afterCaptureForTest != null) ServerMachines.afterCaptureForTest = null
+            ServerMachines.afterCaptureForTest.remove(be)
             level.setChunkForced(chunk.x, chunk.z, false)
             level.setChunkForced(keeper.x, keeper.z, false)
         }
@@ -348,9 +345,10 @@ object MachineSaveGameTests {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
             helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
         }.thenExecute {
-            ServerMachines.afterCaptureForTest = { target ->
+            // フックは be にだけ付く（ケースごと。#713）ので、tick をまたいで付けたままでも、並行するテストの保存では呼ばれず、上書きもされない
+            ServerMachines.afterCaptureForTest[be] = {
                 // フックは tick の終わりの保存の経路の中で呼ばれるので、投げない。確かめるのは後
-                if (target === be && !stopped) {
+                if (!stopped) {
                     val powered = be.computer.poweredOn && be.computer.machine === machine
                     machine.stop()
                     stopped = machine.awaitTermination(5_000) && powered
@@ -363,7 +361,7 @@ object MachineSaveGameTests {
             helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
             helper.assertTrue(be.computer.machine == null, "the machine should be released but was ${be.computer}")
         }.thenExecute {
-            ServerMachines.afterCaptureForTest = null
+            ServerMachines.afterCaptureForTest.remove(be)
             try {
                 helper.assertTrue(stopped, "the hook should stop a powered machine after the demotion capture")
                 helper.assertTrue(!be.isRemoved, "the chunk should stay in memory")
