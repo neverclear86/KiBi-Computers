@@ -358,7 +358,7 @@ internal sealed class CanonType {
     /**
      * resource のハンドル（`own<R>`・`borrow<R>`）。[resource] は resource の型を指す識別子（型の添字空間で、
      * その resource を定義・import した番号）。番号はその添字空間の中でだけ意味を持つ（別の空間の型と比べるときは
-     * [sameShape] に対応を渡す）。ハンドル表は #265 が持つので、lift・lower は [CanonResources] に任せる
+     * [sameShape] に対応を渡す）。ハンドル表はリンカーが持つので（#265）、lift・lower は [CanonResources] に任せる
      */
     sealed class Handle(val resource: Int) : CanonType() {
         override val size: Int get() = 4

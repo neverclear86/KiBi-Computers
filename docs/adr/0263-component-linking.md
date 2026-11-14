@@ -41,7 +41,7 @@
 - lift した関数を呼んだら: 引数を lower（必要なら realloc）→ core の関数を呼ぶ → 結果を lift → **呼ぶ側に結果を渡し終えてから**（ホストなら値として返す・ゲストどうしなら呼ぶ側のメモリに lower してから）post-return。
 - realloc と post-return は `may_leave` を下ろして、`LinkEnv.callGuest`（カーネルでは `ProcessContext.callGuest`。中では止まる口を使えない。ADR 0073）の中で呼ぶ。コンポーネントどうしの呼び出し（ゲストからゲスト）は `callGuest` で包まない。
 - 一度トラップしたら、それ以上は呼べない（仕様ではトラップしたストアは使えなくなる。以後の呼び出しはトラップ）。
-- resource の canon（`resource.new`・`rep`・`drop`）は、呼ぶとトラップする関数としてつなぐ（ハンドル表は #265）。own・borrow の受け渡しも ADR 0264 のままトラップ。
+- resource の canon（`resource.new`・`rep`・`drop`）と own・borrow の受け渡しは、ハンドル表（#265。ADR 0265）でつなぐ。
 - async の canon・組み込み（stream・future など）、map 型などは `WasmLoadException`（#266 ほか）。
 
 ### 燃料: core インスタンスで 1 つのグローバルを共有する
@@ -67,7 +67,7 @@
 ## テスト
 
 - `ComponentLinkTest`: ホストの関数、core インスタンスどうしのメモリ・グローバル・テーブル・関数、文字列と realloc・post-return の順、`may_leave`、トラップの後、入れ子のコンポーネント、同じ中身のモジュールのまとめ、燃料の共有、元のバイト列の検証。
-- `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。通らないもの（map、async、複数のメモリ、resource）は理由と一緒に挙げる。
-- `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` から最初のホストの関数まで届くことを確かめる（resource が要るところから先は #265）。
+- `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。通らないもの（map、async、複数のメモリ）は理由と一緒に挙げる（resource は #265 で通るようにした。`test/resources` の wast も足した）。
+- `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` からホストの関数まで届き、標準入出力の own を受けた先まで進むことを確かめる（#265）。
 - `ComponentProcessTest`: カーネルの中で、インスタンスをまたぐ呼び出しと燃料切れでマシンを壊さない。
 - GameTest `componentLinksOnServer`（両バージョン）。

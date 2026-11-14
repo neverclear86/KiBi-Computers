@@ -37,6 +37,39 @@ internal class CanonFunction(val params: List<CanonType>, val result: CanonType?
         require(depth <= CanonLimits.MAX_TYPE_DEPTH + 1) { "型が深すぎる（$depth）" }
     }
 
+    /** 引数の型に出てくる resource（own・borrow の [CanonType.Handle.resource]。重なりなし。#265） */
+    val paramResources: IntArray
+
+    /**
+     * 引数のどこかに borrow があるか（#265）。ある関数の呼び出しだけ、borrow の範囲（仕様の Task・Subtask）を記録する
+     * （ない関数は、記録のためのものを何も作らない）
+     */
+    val paramsHaveBorrow: Boolean
+
+    init {
+        // 共有した部分型を重ねた型でも指数的にならないよう、見たものは 2 回たどらない
+        val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<CanonType, Boolean>())
+        val found = LinkedHashSet<Int>()
+        var borrow = false
+        val stack = ArrayDeque<CanonType>(params)
+        while (stack.isNotEmpty()) {
+            val t = stack.removeLast()
+            if (!seen.add(t)) continue
+            when (t) {
+                is CanonType.Handle -> {
+                    found += t.resource
+                    if (t is CanonType.Borrow) borrow = true
+                }
+                is CanonType.ListOf -> stack += t.element
+                is CanonType.Fields -> stack += t.fieldTypes
+                is CanonType.Cases -> for (c in t.caseTypes) if (c != null) stack += c
+                else -> Unit
+            }
+        }
+        paramResources = found.toIntArray()
+        paramsHaveBorrow = borrow
+    }
+
     /** core の関数の型（引数と結果の平らにした型） */
     class CoreSignature(val params: List<CoreFlat>, val results: List<CoreFlat>) {
         override fun equals(other: Any?): Boolean = other is CoreSignature && other.params == params && other.results == results

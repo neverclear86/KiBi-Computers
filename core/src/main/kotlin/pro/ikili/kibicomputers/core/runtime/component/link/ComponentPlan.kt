@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CoreFlat
 // リンクの計画（#263。ADR 0263）。コンポーネントをインスタンス化したときに、どの core インスタンスを、どのモジュールから、
 // どの import を渡して作るかと、canon の lift・lower がどの core の関数・メモリを使うかを、読み込みのとき（コンパイル用の
 // スレッド）に 1 回だけ決めたもの。入れ子のコンポーネントのインスタンス化も、ここで平らに展開してある。
-// 不変なので、`ProgramCache` で全マシンが共有してよい。プロセスごとの状態（インスタンス、may_leave）は LinkedComponent が持つ。
+// 不変なので、`ProgramCache` で全マシンが共有してよい。プロセスごとの状態（インスタンス、may_leave、ハンドル表）は LinkedComponent が持つ。
 
 /** core の添字空間の 1 つが指すもの */
 internal sealed interface CoreRef {
@@ -32,11 +32,35 @@ internal sealed interface CoreRef {
         override fun toString(): String = "canon lower $lower"
     }
 
-    /** 呼ばれたらトラップするだけの組み込み（resource の canon。ハンドル表は #265） */
-    class Trapping(override val functionType: WasmFunctionType, val reason: String) : CoreRef {
+    /**
+     * canon の `resource.new`・`resource.rep`・`resource.drop`（#265。ADR 0265）。[resource] は plan の resource の番号
+     * （[ComponentPlan.resources] の添字）、[instance] はその canon を書いたコンポーネントのインスタンス（使うハンドル表の持ち主）
+     */
+    class ResourceOp(val op: Op, val resource: Int, val instance: Int) : CoreRef {
+        enum class Op(val label: String) { NEW("resource.new"), REP("resource.rep"), DROP("resource.drop") }
+
         override val kind: WasmExternKind get() = WasmExternKind.FUNCTION
-        override fun toString(): String = "組み込み（$reason）"
+        override val functionType: WasmFunctionType get() = if (op == Op.DROP) I32_TO_NONE else I32_TO_I32
+        override fun toString(): String = "canon ${op.label}（resource $resource）"
     }
+}
+
+/**
+ * resource の型 1 つの記録（#265。ADR 0265）。[canonical] が同じなら同じ resource の型として照合する
+ * （別のインターフェースの import が同じホストの resource に結び付いたときも、同じ番号になる）
+ */
+internal class ResourceInfo(val canonical: Int, val impl: ResourceImpl)
+
+/** resource を実装したもの */
+internal sealed interface ResourceImpl {
+    /** ゲストが定義した resource。[instance] は実装したコンポーネントのインスタンスの番号、[dtor] は `(i32) -> ()` の core 関数 */
+    class Guest(val instance: Int, val dtor: CoreRef?) : ResourceImpl
+
+    /** ホストの resource（[HostResource.id] で同一性を決める） */
+    class Host(val interfaceName: String, val name: String, val resource: HostResource) : ResourceImpl
+
+    /** 実体のない resource（ホストの [HostInterface.fallback] のインスタンス型にだけある型。drop しても何も呼ばない） */
+    data object Abstract : ResourceImpl
 }
 
 /** コンポーネントの関数 1 つ。[function] は型（lift・lower の計画） */
@@ -82,6 +106,7 @@ internal sealed interface ExportItem {
  * @property modules 読み込んだ core モジュール（同じ中身は 1 つにまとめてある）
  * @property steps 作る core インスタンス（作る順。import は前の段の export だけを指す）
  * @property componentInstances コンポーネントのインスタンスの数（一番外を 0 番として数える）
+ * @property resources resource の番号（[pro.ikili.kibicomputers.core.runtime.component.canon.CanonType.Handle.resource]）→ 記録。0 番は使わない
  */
 internal class ComponentPlan(
     val modules: List<WasmModule>,
@@ -90,7 +115,12 @@ internal class ComponentPlan(
     val lowers: List<LowerSpec>,
     val componentInstances: Int,
     val exports: Map<String, ExportItem>,
-)
+    val resources: List<ResourceInfo?> = emptyList(),
+) {
+    /** resource の番号 [resource] の記録（計画にない番号は内部の誤り） */
+    fun resource(resource: Int): ResourceInfo =
+        resources.getOrNull(resource) ?: throw IllegalStateException("resource $resource は計画にない（内部の誤り）")
+}
 
 /** canon の計画の core の型を、ランタイムの関数の型にする */
 internal fun CanonFunction.CoreSignature.toWasm(): WasmFunctionType =
@@ -102,3 +132,6 @@ private fun wasmValueType(f: CoreFlat): WasmValueType = when (f) {
     CoreFlat.F32 -> WasmValueType.F32
     CoreFlat.F64 -> WasmValueType.F64
 }
+
+internal val I32_TO_I32 = WasmFunctionType(listOf(WasmValueType.I32), listOf(WasmValueType.I32))
+internal val I32_TO_NONE = WasmFunctionType(listOf(WasmValueType.I32), emptyList())

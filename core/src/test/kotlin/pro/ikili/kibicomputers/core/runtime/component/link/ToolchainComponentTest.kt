@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
 /**
@@ -15,8 +16,9 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
  * アダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドのコンポーネントにし（wasi-sdk の wasm32-wasip2 と同じ作り方）、
  * 読み込み・リンク・インスタンス化して `wasi:cli/run` を呼ぶ。
  *
- * resource のハンドル表（#265）がまだないので、標準入出力を取る（own<input-stream> を返す）ところから先へは進めない。
- * ここでは、アダプターの 4 つの core モジュール（メモリ・テーブルを渡し合う）がつながり、最初のホストの関数まで canon lower で届くことを確かめる
+ * 実物のホスト（`wasi:*`。#267）はまだないので、スタブのホストで、アダプターの 4 つの core モジュール（メモリ・テーブルを渡し合う）が
+ * つながり、canon lower でホストの関数に届くことと、resource の own を返す関数（標準入出力を取る `get-stdout` など。#265）の
+ * 先の、次のホストの関数まで進むことを確かめる
  */
 class ToolchainComponentTest {
     private fun resource(path: String): ByteArray = requireNotNull(javaClass.getResourceAsStream(path)) { "$path がない" }.readBytes()
@@ -34,10 +36,14 @@ class ToolchainComponentTest {
         r.outputs.getValue("c.wasm")
     }
 
-    /** ゲストの宣言どおりの関数を出し、呼ばれたら記録してトラップするホスト。`wasi:cli/exit` の `exit` だけは型を書いて出す */
+    /**
+     * ゲストの宣言どおりの関数を出し、呼ばれたら記録するホスト。結果が own の関数は新しい rep を返し、それ以外はトラップする。
+     * `wasi:cli/exit` の `exit` だけは型を書いて出す
+     */
     private class StubHost : ComponentHost {
         val calls = ArrayList<String>()
         val names = ArrayList<String>()
+        private var nextRep = 100
 
         override fun interfaceOf(name: String): HostInterface {
             names += name
@@ -45,12 +51,16 @@ class ToolchainComponentTest {
                 calls += "${call.interfaceName}#${call.functionName}"
                 throw WasmTrapException(WasmTrapKind.OTHER, "テストのホスト: ${call.functionName}")
             }
+            val give = HostFunctionBody { call, _ ->
+                calls += "${call.interfaceName}#${call.functionName}"
+                CanonValue.Handle(nextRep++)
+            }
             val declared = if (name.startsWith("wasi:cli/exit@")) {
                 mapOf("exit" to HostFunction(LinkTesting.fn(listOf(CanonType.Result(null, null)), null), stop))
             } else {
                 emptyMap()
             }
-            return HostInterface(name, declared, fallback = { _, _ -> stop })
+            return HostInterface(name, declared, fallback = { _, type -> if (type.result is CanonType.Own) give else stop })
         }
     }
 
@@ -67,8 +77,9 @@ class ToolchainComponentTest {
             val f = requireNotNull(c.function(run, "run"))
             val e = assertThrows<WasmTrapException> { c.call(f, emptyList()) }
             assertTrue(e.message!!.contains("テストのホスト"), e.message)
-            assertEquals(1, host.calls.size, "${host.calls}")
-            assertTrue(host.calls[0].startsWith("wasi:cli/std"), "${host.calls}")
+            // 標準入出力の own を 3 つ受けて表に足し、その次のホストの関数（own を返さないのでトラップ）まで進む
+            assertTrue(host.calls.size >= 4, "${host.calls}")
+            assertEquals(listOf("get-stdin", "get-stdout", "get-stderr"), host.calls.take(3).map { it.substringAfter('#') }, "${host.calls}")
         }
     }
 

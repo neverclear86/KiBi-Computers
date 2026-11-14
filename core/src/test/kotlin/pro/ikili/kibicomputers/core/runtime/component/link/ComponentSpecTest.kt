@@ -10,13 +10,13 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
 /**
- * Component Model の仕様のテスト（`test/values`・`test/linking` の wast）を、リンカーで動かす（#263）。
+ * Component Model の仕様のテスト（`test/values`・`test/linking`・`test/resources` の wast）を、リンカーで動かす（#263・#265）。
  *
  * wast は仕様のリポジトリ（https://github.com/WebAssembly/component-model 、コミット dd1fefc0c618382359feca6f2c758a2b3ef21c36、
  * Apache-2.0 WITH LLVM-exception）から写したもの（`src/test/resources/component-spec/`。`values/post-return.wast` は仕様の
  * `nyi.txt` にあり、同梱の wasm-tools でも読めないので入れていない）。`wasm-tools json-from-wast` で命令の並びとバイナリにして動かす。
  *
- * トラップのメッセージは比べない（トラップしたことだけを確かめる）。まだ扱えない機能（resource のハンドル表 #265、async #266 など）で
+ * トラップのメッセージは比べない（トラップしたことだけを確かめる）。まだ扱えない機能（async #266 など）で
  * 通らないものは [KNOWN] に理由と一緒に挙げる。挙げたものが通るようになったら、[KNOWN] から外す（ずれたら落ちる）
  */
 class ComponentSpecTest {
@@ -32,6 +32,9 @@ class ComponentSpecTest {
         "linking-shared-everything-dynamic-linking",
         "linking-tags",
         "linking-unit",
+        "resources-borrows",
+        "resources-handle-table",
+        "resources-multiple-resources",
     )
 
     /** 通らないと分かっているもの（`ファイル:行` → 理由） */
@@ -306,17 +309,12 @@ class ComponentSpecTest {
         const val MAP = "map 型（component-model-map）は検証器で有効にしていない（#264 で扱わないとした型）"
         const val ASYNC = "async（stackful）の機能を使う。#266"
         const val MULTI_MEMORY = "core モジュールのメモリは 1 つまで（p1 と同じ上限。ModuleLimits・検証器の multi-memory）"
-        const val RESOURCES = "resource のハンドル表がまだない（resource.new がトラップする。#265）"
 
         val KNOWN: Map<String, String> = buildMap {
             fun add(file: String, reason: String, vararg lines: Int) = lines.forEach { put("$file:$it", reason) }
             add("values-concat", MAP, 463, 723, 729, 732, 741, 748, 755, 762, 770, 788)
             add("values-variants", ASYNC, 83, 183, 184, 185, 186)
             add("linking-unit", MULTI_MEMORY, 261, 295, 296, 297, 298, 299, 300, 301, 302, 308, 344, 345, 346, 347, 348, 349, 350, 351, 355, 374, 375)
-            add(
-                "linking-unit", RESOURCES, 725, 726, 727, 728, 729, 730, 788, 789, 790, 791, 792, 793, 864, 865, 866, 867, 931, 932, 933, 934,
-                995, 996, 997, 998, 1019, 1020, 1021, 1022, 1023, 1094, 1095, 1096, 1097, 1161, 1162, 1163, 1164, 1165, 1166, 1167, 1168,
-            )
         }
     }
 }

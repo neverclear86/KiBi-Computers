@@ -29,8 +29,8 @@ internal fun interface ComponentHost {
 }
 
 /**
- * ホストのインターフェース 1 つ。[functions] は関数の名前 → 関数、[resources] は resource の型の名前 → ホストの resource の識別子
- * （ホストの関数の型の own・borrow が指す番号。ホスト全体で一意にする）。
+ * ホストのインターフェース 1 つ。[functions] は関数の名前 → 関数、[resources] は resource の型の名前 → ホストの resource
+ * （[HostResource.id] は、ホストの関数の型の own・borrow が指す番号。ホスト全体で一意にする）。
  *
  * ゲストの import のインスタンス型は、この部分型でなければならない（ゲストが宣言した関数・resource がすべてあり、関数の型が同じ）。
  * ホストにだけあるものは見ない。
@@ -42,13 +42,35 @@ internal fun interface ComponentHost {
 internal class HostInterface(
     val name: String,
     val functions: Map<String, HostFunction>,
-    val resources: Map<String, Int> = emptyMap(),
+    val resources: Map<String, HostResource> = emptyMap(),
     val fallback: HostFallback? = null,
 )
 
 /** [HostInterface.fallback]。[member] の、ゲストが宣言した型 [type] の関数の処理。出さないなら `null` */
 internal fun interface HostFallback {
     fun function(member: String, type: CanonFunction): HostFunctionBody?
+}
+
+/**
+ * ホストの resource 1 つ（#265。ADR 0265）。[id] はホスト全体で一意にし、ホストの関数の型の own・borrow はこの番号を指す。
+ * [drop] は、ゲストが own を `resource.drop` で捨てたときの処理（`null` なら何もしない）。
+ *
+ * ゲストのハンドル表が持つのは「ハンドルの番号 → rep」の写しだけで、rep が指す実体（fd・カーネルのオブジェクトなど）は
+ * ホスト（カーネル）の側の、プロセスの終わりに必ず閉じるものに持たせる。プロセスが終わる・トラップしたときに、
+ * ゲストの表に残ったハンドルの [drop] は呼ばない
+ */
+internal class HostResource(val id: Int, val drop: HostResourceDrop? = null)
+
+/**
+ * ホストの resource の dtor（#265）。ゲストが own を `resource.drop` したときに、プロセスのスレッドで、ゲストの core が
+ * 呼んだ組み込みの中から呼ばれる（[ComponentCall.functionName] は `[resource-drop]<名前>`）。
+ *
+ * 待たない・すぐ戻る。カーネルロックが要るなら自分で短く取る。状態は持たず、[rep] で引く。
+ * ゲストの入力の誤りは [WasmTrapException]
+ */
+internal fun interface HostResourceDrop {
+    @Throws(WasmTrapException::class)
+    fun drop(call: ComponentCall, rep: Int)
 }
 
 /** ホストの関数 1 つ。[type] はホストの宣言した型（own・borrow はホストの resource の識別子を指す） */
@@ -59,6 +81,11 @@ internal class HostFunction(val type: CanonFunction, val body: HostFunctionBody)
  *
  * プロセスのスレッドで、ゲストの canon lower の呼び出しの中から呼ばれる。ゲストのメモリには触らない（値は写してある）。
  * ゲストの入力の誤りは [WasmTrapException]、ホストの誤り（型に合わない値を返したなど）は [IllegalArgumentException]
+ *
+ * own・borrow の値（[CanonValue.Handle]）は、ハンドルの番号ではなく rep（#265）:
+ * - 引数の own は、ゲストの表から外して受けたもの。所有はホストに移る（閉じる責任もホスト）
+ * - 引数の borrow は、この呼び出しの中でだけ使える（呼び出しの外に持ち出さない）
+ * - 結果の own は、ゲストの表に新しいハンドルとして足す
  */
 internal fun interface HostFunctionBody {
     @Throws(WasmTrapException::class)

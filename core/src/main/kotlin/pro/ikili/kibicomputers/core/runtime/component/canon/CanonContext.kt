@@ -31,9 +31,11 @@ internal fun interface CanonRealloc {
 }
 
 /**
- * resource のハンドルの lift・lower（ハンドル表は #265）。lift はゲストのハンドル（u32 のビット列）を受けて
- * ホストの値を返し、lower はホストの値を受けてゲストのハンドルを返す。誤り（表にない、型が違う）は
- * [WasmTrapException] にする
+ * resource のハンドルの lift・lower。lift はゲストのハンドル（u32 のビット列）を受けて rep を返し、lower は rep を受けて
+ * ゲストのハンドルを返す（borrow を、その resource を実装したインスタンスに渡すときは rep のまま。仕様の `pass_rep_not_handle`）。
+ * 誤り（表にない、型が違う、貸している own を渡した）は [WasmTrapException] にする。
+ *
+ * 実装は、リンカー（`LinkedComponent`）がコンポーネントのインスタンスごとに持つ（ハンドル表と borrow の範囲。#265・ADR 0265）
  */
 internal interface CanonResources {
     @Throws(WasmTrapException::class)
@@ -49,13 +51,13 @@ internal interface CanonResources {
     fun lowerBorrow(type: CanonType.Borrow, value: Int): Int
 
     companion object {
-        /** resource をまだ扱えないもの（どれもトラップ） */
+        /** resource を扱えない文脈（どれもトラップ。単体のテストなど、リンカーを通さないとき） */
         val UNSUPPORTED: CanonResources = object : CanonResources {
             override fun liftOwn(type: CanonType.Own, handle: Int): Int = unsupported()
             override fun liftBorrow(type: CanonType.Borrow, handle: Int): Int = unsupported()
             override fun lowerOwn(type: CanonType.Own, value: Int): Int = unsupported()
             override fun lowerBorrow(type: CanonType.Borrow, value: Int): Int = unsupported()
-            private fun unsupported(): Nothing = CanonTraps.trap("resource のハンドルはまだ扱えない（#265）")
+            private fun unsupported(): Nothing = CanonTraps.trap("この文脈では resource のハンドルを扱えない")
         }
     }
 }
@@ -82,6 +84,15 @@ internal object CanonLimits {
 
     /** 1 回の呼び出しで作る・写す値の数の上限の既定（仮の値） */
     const val DEFAULT_MAX_VALUES: Long = 1_000_000
+
+    /** ハンドル表 1 つの番号の上限（仕様の `Table.MAX_LENGTH`） */
+    const val MAX_TABLE_LENGTH: Int = (1 shl 28) - 1
+
+    /**
+     * 1 つのプロセス（コンポーネントの全インスタンスの合計）で同時に持てるハンドルの数の上限（仮の値。確定は #251）。
+     * 仕様の上限（[MAX_TABLE_LENGTH]）より早くトラップにする（ADR 0265）
+     */
+    const val MAX_HANDLES: Int = 4_096
 }
 
 /**
