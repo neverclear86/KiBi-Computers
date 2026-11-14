@@ -10,8 +10,10 @@ import net.neoforged.neoforge.event.entity.player.PlayerEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import net.neoforged.neoforge.network.PacketDistributor
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
 import pro.ikili.kibicomputers.core.input.KeyboardSession
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import java.util.Optional
 import java.util.UUID
 
@@ -70,7 +72,7 @@ object KeyboardSessions {
         val tick = tickOf(player)
         val mine = budgets.getOrPut(player.uuid) { HashMap() }
         mine.values.removeIf { it.available(tick) >= it.capacity }
-        val budget = mine.getOrPut(GlobalPos.of(level.dimension(), keyboardPos)) { KeyboardInputBudget() }
+        val budget = mine.getOrPut(GlobalPos.of(level.dimension(), keyboardPos)) { KiBiConfig.keyboardInputBudget(KiBiConfigs.server) }
         val session = KeyboardSession(nextId++, player.uuid, budget)
         if (nextId <= 0) nextId = 1
         sessions[player.uuid] = Open(player, level, keyboardPos.immutable(), keyboard, session)
