@@ -182,6 +182,36 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_device_busは型が一致するときだけ通り、drop以外はcabi_reallocが要り、版違い・typesとp2とp3のinterfaceは断る`() {
+        val d = WasiP1Kibi.DEVICE
+        val list = Triple(d, "list-devices", listOf(I32) to emptyList<Int>())
+        val open = Triple(d, "[static]device.open", listOf(I32, I32, I32) to emptyList<Int>())
+        val info = Triple(d, "[method]device.info", listOf(I32, I32) to emptyList<Int>())
+        val methods = Triple(d, "[method]device.methods", listOf(I32, I32) to emptyList<Int>())
+        val invoke = Triple(d, "[method]device.invoke", List(6) { I32 } to emptyList<Int>())
+        val start = Triple(d, "[method]device.start", List(6) { I32 } to emptyList<Int>())
+        val take = Triple(d, "[method]pending-call.take", listOf(I32, I32) to emptyList<Int>())
+        val dropDevice = Triple(d, "[resource-drop]device", listOf(I32) to emptyList<Int>())
+        val dropCall = Triple(d, "[resource-drop]pending-call", listOf(I32) to emptyList<Int>())
+        val realloc = listOf(I32, I32, I32, I32) to listOf(I32)
+        assertDoesNotThrow {
+            WasiP1.checkImports(
+                load(commandWithRealloc(realloc.first, realloc.second, list, open, info, methods, invoke, start, take, dropDevice, dropCall)),
+            )
+        }
+        // drop だけなら cabi_realloc は要らない
+        assertDoesNotThrow { WasiP1.checkImports(load(command(dropDevice, dropCall))) }
+        for (f in listOf(list, open, info, methods, invoke, start, take)) assertNoexec(load(command(f)), WasiP1Kibi.REALLOC)
+        assertNoexec(load(command(Triple(d, "[method]device.invoke", List(5) { I32 } to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple(d, "[method]pending-call.take", listOf(I32) to listOf(I32)))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:device/bus@0.2.0", "[resource-drop]device", listOf(I32) to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple(d, "[method]device.close", listOf(I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:device/types@0.1.0", "value", listOf(I32) to emptyList()))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:device/bus-poll@0.1.0", "subscribe", listOf(I32) to listOf(I32)))), "許可していない")
+        assertNoexec(load(command(Triple("kibi:device/bus-async@0.1.0", "wait", listOf(I32, I32) to emptyList()))), "許可していない")
+    }
+
+    @Test
     fun `kibi_fs_mountsのlist-mountsとlist-disksはcabi_reallocが要り、mountとunmountだけなら要らない`() {
         val f = WasiP1Kibi.FS_MOUNTS
         val mount = Triple(f, "mount", List(6) { I32 } to emptyList<Int>())

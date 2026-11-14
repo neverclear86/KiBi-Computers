@@ -1,0 +1,13 @@
+package kibi:device@0.1.0;
+
+/// p3 で、デバイスの呼び出しの結果を待つ（#77。ADR 0077）。wasi:* を参照しない。
+/// 仮置き: interface・関数・型は、p3 の層 #266 を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+interface bus-async {
+    use types.{value, call-error};
+    use bus.{device, pending-call};
+
+    /// bus.device.invoke と同じ（メインスレッドのメソッドも結果まで待つ）。待つ間、呼んだタスクだけが止まる
+    invoke: async func(d: borrow<device>, method: string, args: list<value>) -> result<list<value>, call-error>;
+    /// start で積んだ呼び出しの結果が出るまで待って受け取る（p3 には pollable がないため。take と同じく閉じない）
+    wait: async func(call: borrow<pending-call>) -> result<list<value>, call-error>;
+}

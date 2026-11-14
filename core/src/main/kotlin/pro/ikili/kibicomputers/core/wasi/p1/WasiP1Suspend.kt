@@ -49,11 +49,30 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
     var resumed: AsyncWait? = null
         private set
 
+    /** ドライバーが再開するときに渡された、そろった key（[onResume] で入れ、次の [enter] が受け取る。実行時だけ） */
+    private var readyOnResume: List<WaitKey> = emptyList()
+
+    /**
+     * 巻き直して着いた呼び出しなら、起こした key（そろった待ちの key。[enter] で入れ、呼んだ側が読む。実行時だけ）。
+     * `kibi:device` の `invoke` が、実行時の状態を失ったとき（保存からの復元）に、待っていた `pending-call` を引くのに使う（#77）。
+     * 空のこともある（保存から戻した直後の起こし。ADR 0085）
+     */
+    var resumedReady: List<WaitKey> = emptyList()
+        private set
+
+    /** ドライバーが巻き直す前に呼ぶ。[ready] は `resume` に渡されたそろった key */
+    fun onResume(ready: List<WaitKey>) {
+        readyOnResume = ready
+    }
+
     /** 止まりうる import の入口。[instance] は呼んだインスタンス */
     fun enter(instance: WasmInstance) {
         caller = instance
         resumed = null
         rewound = false
+        resumedReady = emptyList()
+        val ready = readyOnResume
+        readyOnResume = emptyList()
         if (!instance.module.isAsyncified) return
         if (instance.asyncState != WasmAsyncState.REWINDING) return
         val process = ctx.withKernelLock { process() }
@@ -62,6 +81,7 @@ internal class WasiP1Suspend(private val ctx: ProcessContext) {
         check(left == 0) { "巻き直しの終わりに退避した値が $left 個残っている" }
         instance.asyncState = WasmAsyncState.NORMAL
         rewound = true
+        resumedReady = ready
         resumed = ctx.withKernelLock {
             val w = process.asyncWait
             process.asyncWait = null

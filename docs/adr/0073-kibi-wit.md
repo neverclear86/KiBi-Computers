@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #73（task）。前提: ADR 0043（カーネルの構成）、0063（イベントキュー）、0072（p1 の `poll_oneoff`）、0261（p1 の層を直接実装する）、0329（p1 の待機点への変換）、#257（WASI の対応範囲と独自拡張の定義方法）
-- 後続: #426（タイマーと時計）、#427（TTY）、#74（プロセス）、#75（パイプと fd の複製）、#76（ソケット）、#77（デバイス）、#306（電源）、#326（キーの押下）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#116（SDK の束縛）、#251（仮の値の確定）
+- 後続: #426（タイマーと時計）、#427（TTY）、#74（プロセス）、#75（パイプと fd の複製）、#76（ソケット）、#77（デバイス。ADR 0077）、#306（電源）、#326（キーの押下）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#116（SDK の束縛）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
 - ABI の選択（Q1〜Q6、タイマーと時計の置き場所）は、#73 のプランへのオーナーの回答で決めた（すべて推奨どおり）
 
@@ -31,7 +31,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（仮置き。ADR 0075） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
-| `kibi:device` | `types`・`bus` | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。WASM に出すのは #77） | #65・#77 |
+| `kibi:device` | `types`・`bus`・`bus-poll`（p2）・`bus-async`（p3） | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。p1 に `bus` を出した。ADR 0077。p2・p3 は仮置き） | #65・#77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | `power` | 電源（停止・再起動。ADR 0306） | #306 |
@@ -146,9 +146,9 @@ interface events {
 
 - ホスト関数の中から `ctx.callGuest { instance.call("cabi_realloc", 0, 0, align, size) }` で呼ぶ。Canonical ABI どおり、大きさ 0 のリストでも呼ぶ。返したポインタが線形メモリの外、または align に揃っていなければトラップ
 - 燃料はゲストの分として数える。`callGuest` の中（`ProcessRuntime.guestCallDepth > 0`。実行時だけの状態で保存しない）で燃料が切れたら、`WAIT_POINT` のプロセスでも巻き戻さず、スレッドを持ったまま燃料を待つ（ホスト関数の途中は巻き戻せないため）。普通の燃料切れでトラップにはしない
-- `callGuest` の中で止まりうる p1 の import（`fd_read`・`fd_write`・`poll_oneoff`、`kibi:process` の `spawn`（ADR 0074））を呼んだら、待ち方（`BLOCK`・`UNWIND`・`NONE`）に依らずトラップにする。検査は `WasiP1` のホスト関数の入口（巻き直しの処理と燃料より前）に置く。ほかの import（`clock_time_get` など）は呼んでよい
-- 止まりうるかの調べ（#430）: カーネルで止まって待つ口は `ProcessContext.block` と、`checkMayBlock` を通るもの（`exec`・`execWithHandle`・`awaitHost`・`callOnMainThread`、メインスレッドのメソッドの `invokeDevice`）、`block` を通って待つもの（`waitChild`・`awaitEvents`・`sleep`。待たずに返せるときは `block` に入らない）。今の p1 の関数でこれらに届くのは、上の4つ（`fd_read`・`fd_write` → `FdIo` → `block`、`poll_oneoff` → `block`、`spawn` → `execWithHandle`）だけで、どれも入口でトラップにしている。`fd_pread`・`fd_pwrite` は VFS を直接呼び、`sched_yield` はすぐに返り、ディスクの I/O はリースのロックの中で同期に行うので、届かない。`kibi:*` のほかの関数（events・timers・clock・memory・io・tty、`spawn` 以外の process）は待たない。燃料切れの待ちは `onFuelExhausted` を通り、これらの口を通らない
-- 守り: `block` と `checkMayBlock` は、`callGuest` の中（`guestCallDepth > 0`）ならロックを取る前にトラップにする（`止まりうるホストの処理 … を cabi_realloc の中で呼んだ`）。ABI の層が入口で弾き忘れた import（#77 の `kibi:device` など）も、IllegalStateException（異常終了の理由が `internal error`）ではなくトラップで終わる。止まりうる import を足すときは、これまでどおり `WasiP1.WAIT_IMPORTS` と入口の検査にも入れる（巻き直しの処理と燃料より前に、待ち方に依らず弾くため）
+- `callGuest` の中で止まりうる p1 の import（`fd_read`・`fd_write`・`poll_oneoff`、`kibi:process` の `spawn`（ADR 0074）、`kibi:device` の `[method]device.invoke`（#77。ADR 0077））を呼んだら、待ち方（`BLOCK`・`UNWIND`・`NONE`）に依らずトラップにする。検査は `WasiP1` のホスト関数の入口（巻き直しの処理と燃料より前）に置く。ほかの import（`clock_time_get` など）は呼んでよい
+- 止まりうるかの調べ（#430）: カーネルで止まって待つ口は `ProcessContext.block` と、`checkMayBlock` を通るもの（`exec`・`execWithHandle`・`awaitHost`・`callOnMainThread`、メインスレッドのメソッドの `invokeDevice`）、`block` を通って待つもの（`waitChild`・`awaitEvents`・`sleep`。待たずに返せるときは `block` に入らない）、メインスレッドのメソッドの `pending-call` を積んで待機点で待つ `beginDeviceInvoke`。今の p1 の関数でこれらに届くのは、上の5つ（`fd_read`・`fd_write` → `FdIo` → `block`、`poll_oneoff` → `block`、`spawn` → `execWithHandle`、`invoke` → `invokeDevice`（`BLOCK`）・`beginDeviceInvoke`（`UNWIND`））だけで、どれも入口でトラップにしている。`fd_pread`・`fd_pwrite` は VFS を直接呼び、`sched_yield` はすぐに返り、ディスクの I/O はリースのロックの中で同期に行うので、届かない。`kibi:*` のほかの関数（events・timers・clock・memory・io・tty、`spawn` 以外の process、`invoke` 以外の device。`start` は積むだけで待たない）は待たない。燃料切れの待ちは `onFuelExhausted` を通り、これらの口を通らない
+- 守り: `block` と `checkMayBlock` は、`callGuest` の中（`guestCallDepth > 0`）ならロックを取る前にトラップにする（`止まりうるホストの処理 … を cabi_realloc の中で呼んだ`）。`beginDeviceInvoke` も、メインスレッドのメソッドなら `mayWait` に依らず `pending-call` を積む前に同じトラップにする（直接のメソッドはその場で終わるので呼んでよい）。ABI の層が入口で弾き忘れた import（`kibi:device` の `invoke` は入口で弾く。#77、ADR 0077）も、IllegalStateException（異常終了の理由が `internal error`）ではなくトラップで終わる。止まりうる import を足すときは、これまでどおり `WasiP1.WAIT_IMPORTS` と入口の検査にも入れる（巻き直しの処理と燃料より前に、待ち方に依らず弾くため）
 
 ## 実装
 
@@ -175,7 +175,7 @@ interface events {
   - 追記（#426）: ADR 0426 で決めた。`events` の p2・p3 での待ち方（`events-poll`・`events-async`。仮置き）も ADR 0426
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
   - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
-- プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
+- プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77（ADR 0077）・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
   - 追記（#306）: 電源は ADR 0306 で決めた（`kibi:computer/power`）
 - p2・p3 の層: Canonical ABI の一般の実装は #264（ADR 0264）、`kibi:*` の p2 の `pollable` は #685、async は #266
 - 生成した束縛（wit-bindgen）: SDK #116

@@ -63,14 +63,17 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [FS_MOUNTS] | `list-mounts` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#453） |
  * | [FS_MOUNTS] | `list-disks` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#453） |
  * | [PROCESS] | （[WasiP1KibiProcess] の表。#74） | |
+ * | [DEVICE] | （[WasiP1KibiDevice] の表。#77） | |
  *
  * p2・p3 だけの interface（`kibi:io` の `pipe-streams`・`pipe-async`、`kibi:kernel` の `timers-poll`・`events-poll`・
- * `timers-async`・`events-async`、`kibi:process` の `process-poll`・`process-async`）は出さない（表にないので、import すると `NOEXEC`）。
+ * `timers-async`・`events-async`、`kibi:process` の `process-poll`・`process-async`、`kibi:device` の `bus-poll`・`bus-async`）は出さない
+ * （表にないので、import すると `NOEXEC`）。関数のない `kibi:device/types` も同じ。
  * `kibi:io/tty` の `mode`（`flags`）は下位 5 ビットだけを読む（上のビットは捨てる。Canonical ABI の lift と同じ）。
  * `u64` の時間の引数（`set-after`・`set-at`）は、2^63 以上を `Long.MAX_VALUE` に頭打ちにしてカーネルへ渡す（ADR 0426）。
  *
  * `kibi:computer/power` の `shutdown`・`reboot` は、受け付けたら呼んだプロセスも止まるので戻らない（ADR 0306）。
- * `kibi:process` の `[static]process.spawn` だけが待つ（[WasiP1.WAIT_IMPORTS]。[WasiP1KibiProcess]）。ほかは待たない。
+ * `kibi:process` の `[static]process.spawn` と `kibi:device` の `[method]device.invoke` だけが待つ（[WasiP1.WAIT_IMPORTS]。
+ * [WasiP1KibiProcess]・[WasiP1KibiDevice]）。ほかは待たない。
  * 燃料（仮の値。確定は #251）: 呼び出しごとに [WasiP1Fd.CALL_FUEL]、`take` は加えて渡したイベントの数、
  * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）、
  * `kibi:fs/mounts` の `list-mounts`・`list-disks` は加えて件数 × [KibiFs.MOUNT_LIST_FUEL_PER_ENTRY]（#453）。
@@ -106,6 +109,9 @@ internal object WasiP1Kibi {
 
     /** `kibi:process/process` のモジュール名（[WasiP1KibiProcess]） */
     const val PROCESS: String = WasiP1KibiProcess.MODULE
+
+    /** `kibi:device/bus` のモジュール名（[WasiP1KibiDevice]。#77） */
+    const val DEVICE: String = WasiP1KibiDevice.MODULE
 
     /** `kibi:io/tty` の `flags mode` のフラグの数 */
     private const val TTY_MODE_FLAGS = 5
@@ -399,26 +405,39 @@ internal object WasiP1Kibi {
     }
 
     /** 出しているモジュール名 */
-    val modules: Set<String> = FUNCTIONS.map { it.module }.toSet() + PROCESS
+    val modules: Set<String> = FUNCTIONS.map { it.module }.toSet() + PROCESS + DEVICE
 
     /** 出している関数 [module].[name] の型（なければ `null`） */
-    fun typeOf(module: String, name: String): WasmFunctionType? =
-        if (module == PROCESS) WasiP1KibiProcess.typeOf(name) else find(module, name)?.type
+    fun typeOf(module: String, name: String): WasmFunctionType? = when (module) {
+        PROCESS -> WasiP1KibiProcess.typeOf(name)
+        DEVICE -> WasiP1KibiDevice.typeOf(name)
+        else -> find(module, name)?.type
+    }
 
     /** [module].[name] が `cabi_realloc` を要するか（出していない関数なら `false`） */
-    fun needsRealloc(module: String, name: String): Boolean =
-        if (module == PROCESS) WasiP1KibiProcess.needsRealloc(name) else find(module, name)?.needsRealloc == true
+    fun needsRealloc(module: String, name: String): Boolean = when (module) {
+        PROCESS -> WasiP1KibiProcess.needsRealloc(name)
+        DEVICE -> WasiP1KibiDevice.needsRealloc(name)
+        else -> find(module, name)?.needsRealloc == true
+    }
 
     /** 出している関数の (モジュール名, 名前) の一覧（`KibiWitTableTest` が WIT と突き合わせる） */
-    val functions: List<Pair<String, String>> get() = FUNCTIONS.map { it.module to it.name } + WasiP1KibiProcess.names.map { PROCESS to it }
+    val functions: List<Pair<String, String>>
+        get() = FUNCTIONS.map { it.module to it.name } + WasiP1KibiProcess.names.map { PROCESS to it } + WasiP1KibiDevice.names.map { DEVICE to it }
 
     private fun find(module: String, name: String): Fn? = FUNCTIONS.firstOrNull { it.module == module && it.name == name }
 
     /**
      * 独自拡張の関数を [builder] に登録する（`ProcessDriver.configure` の中から。[WasiP1.register] が呼ぶ）。
-     * [suspend]・[wait] は止まりうる `kibi:process` の `spawn` の待ち方。戻り値はこのプロセスの `kibi:process` の import
+     * [suspend]・[wait] は止まりうる `kibi:process` の `spawn`・`kibi:device` の `invoke` の待ち方。
+     * 戻り値はこのプロセスの `kibi:process`・`kibi:device` の import
      */
-    fun register(ctx: ProcessContext, builder: WasmInstanceConfig.Builder, suspend: WasiP1Suspend, wait: P1Wait): WasiP1KibiProcess {
+    fun register(
+        ctx: ProcessContext,
+        builder: WasmInstanceConfig.Builder,
+        suspend: WasiP1Suspend,
+        wait: P1Wait,
+    ): Pair<WasiP1KibiProcess, WasiP1KibiDevice> {
         for (fn in FUNCTIONS) {
             builder.hostFunction(
                 fn.module,
@@ -435,6 +454,8 @@ internal object WasiP1Kibi {
                 },
             )
         }
-        return WasiP1KibiProcess(ctx, suspend, wait).also { it.register(builder) }
+        val process = WasiP1KibiProcess(ctx, suspend, wait).also { it.register(builder) }
+        val device = WasiP1KibiDevice(ctx, suspend, wait).also { it.register(builder) }
+        return process to device
     }
 }

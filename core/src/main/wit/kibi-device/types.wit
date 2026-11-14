@@ -1,7 +1,7 @@
 package kibi:device@0.1.0;
 
 /// デバイス（#65。ADR 0065）の呼び出しで使う型。
-/// WASM に出すのは #77（この Issue では WIT を置くだけ）。
+/// p1 の import として出す形は #77（ADR 0077）。
 interface types {
     use kibi:kernel/types@0.1.0.{error-code};
 
