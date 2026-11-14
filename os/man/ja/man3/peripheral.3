@@ -1,0 +1,72 @@
+# peripheral(3)
+
+## 名前
+
+peripheral - Lua からデバイスを使う
+
+## 書式
+
+    peripheral.getNames()
+    peripheral.isPresent(name)
+    peripheral.getType(name)
+    peripheral.hasType(name, type)
+    peripheral.getMethods(name)
+    peripheral.call(name, method, ...)
+    peripheral.wrap(name)
+    peripheral.find(type [, filter])
+    peripheral.getName(wrapped)
+    peripheral.bytes(s)
+
+## 説明
+
+lua(1) の `peripheral` ライブラリは、コンピューターにつながったデバイスを列挙して呼び出します。CC: Tweaked の `peripheral` に合わせています。グローバルにあり、`require("peripheral")` でも得られます。
+
+デバイスの名前は address（`0a1b2c3d-...` のような小文字の UUID）です。大文字も受け付け、小文字に直します。デバイスの種類は `kibicomputers:screen` のような kind です。
+
+- `getNames()`: つながっているデバイスの address のテーブル
+- `isPresent(name)`: その address にデバイスがつながっているか
+- `getType(name)`: デバイスの種類。なければ nil
+- `hasType(name, type)`: 種類が `type` か。`type` は種類の全体か、`:` の後ろ（`screen` は `kibicomputers:screen` に合う）と比べる。デバイスがなければ nil
+- `getMethods(name)`: メソッドの名前のテーブル。なければ nil
+- `call(name, method, ...)`: メソッドを引数で呼び、結果を返す
+- `wrap(name)`: メソッドごとの関数を入れたテーブル。なければ nil。`p.getSize()` のようにドットで呼ぶ
+- `find(type [, filter])`: 種類が `type` に合う（`hasType` と同じ）デバイスをすべて wrap し、複数の値で返す。`filter` があれば、`filter(name, wrapped)` が真のものだけ
+- `getName(wrapped)`: wrap したデバイスの address。`getType`・`hasType`・`getMethods` も wrap したデバイスを受ける
+- `bytes(s)`: 文字列 `s` を、text ではなく bytes として渡すように包む
+
+メソッドの名前はケバブケース（`get-size`）です。`wrap` はキャメルケースの別名（`getSize`）も入れ、`call` はどちらの形も受けます。
+
+サーバーのメインスレッドで動くメソッドの呼び出しは、最低 1 tick 待ちます。待つ間はスレッドを使いません。
+
+## 値
+
+- nil: none
+- boolean: boolean
+- 整数: integer
+- 浮動小数: float。整数の値の浮動小数（`10/2`）は integer として送る
+- 文字列: text。正しい UTF-8 でなければならない
+- `peripheral.bytes(s)`: bytes
+
+結果も同じように戻ります。text と bytes はどちらも文字列になります。テーブルと関数は渡せません。1 回の呼び出しの引数は 32 個、文字列は合わせて 64 KiB まで、メソッドの名前は 64 バイトまでです。
+
+## エラー
+
+呼び出しに失敗すると Lua のエラーになります。
+
+- `No such peripheral`: その address にデバイスがない。または wrap の後に、違う種類のデバイスがそこにつながった
+- `No such method 名前`: そのメソッドがない
+- デバイスのメッセージ: 引数が違う、またはメソッドが失敗した
+- `interrupted`: メソッドの実行中にワールドを保存して読み込んだ
+- `not enough memory`: 結果がコンピューターのメモリに入らないかもしれない
+- `device call failed: エラー`: そのほかのシステムのエラー
+
+## CC: Tweaked との違い
+
+- 名前は側面（`left`）やネットワーク名ではなく address
+- デバイスの種類は 1 つ（kind）
+- UTF-8 でない文字列は `peripheral.bytes` で包む
+- テーブルはデバイスに渡せず、返ってもこない
+
+## 関連項目
+
+os(3), lua(1), kibi(7)

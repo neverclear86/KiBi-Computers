@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.kernel.KernelState
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
+import pro.ikili.kibicomputers.core.kernel.MemoryRefusal
 import pro.ikili.kibicomputers.core.kernel.MountListing
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
@@ -667,7 +668,7 @@ internal class ProcessRunner(private val machine: Machine) {
         // RAM は初めて書き込んだ 4 KiB の区画で数える（#407）。ページ数はアドレス空間の上限だけを見る。
         // アドレス空間は RAM より大きくてよい（書かない所は数えない）。RAM がそれより大きいマシンでは RAM まで
         val ramPages = minOf(rt.memory.limitPages, machine.memoryAccount.limitPages)
-        builder.writtenMemoryLimit(maxOf(ADDRESS_SPACE_PAGES, ramPages), rt.memory) { rt.memoryGrowRefused = true }
+        builder.writtenMemoryLimit(maxOf(ADDRESS_SPACE_PAGES, ramPages), rt.memory) { rt.memoryGrowRefusal = rt.memory.lastRefusal }
         // テーブル（#361）: 要素数の上限は読み込みの上限と同じ値にし、要素の分はメモリと同じくプロセスと RAM に数える
         check(builder.tableBudget == null && builder.maxTableElements == Int.MAX_VALUE) { "ABI 層は builder.tableLimit を呼ばない（テーブルの上限はカーネルが設定する）" }
         val maxTableElements = (scheduler.options.moduleLimits ?: ModuleLimits.DEFAULT).maxTableElements
@@ -698,7 +699,15 @@ internal class ProcessRunner(private val machine: Machine) {
                 },
             )
         }
-        val instance = rt.program.module.instantiate(builder.build())
+        val refusalsBefore = rt.memory.refusalCount
+        rt.instantiateRefusedMemory = false
+        val instance = try {
+            rt.program.module.instantiate(builder.build())
+        } catch (t: Throwable) {
+            // 作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
+            if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true
+            throw t
+        }
         lock.withLockValue {
             val frame = rt.loading!!
             val provisional = frame.provisional
@@ -730,8 +739,12 @@ internal class ProcessRunner(private val machine: Machine) {
         val metered = !rt.process.unmetered
         check(metered == program.metered) { "燃料の計測の有無がプロセスと違うコンポーネント" }
         val ctx = rt.context
+        // いま作っている core インスタンスより前に断った分は、その失敗の原因にしない（#48）。core インスタンスを作り始めるたびに更新する
+        var refusalsBefore = rt.memory.refusalCount
+        rt.instantiateRefusedMemory = false
         val env = object : KernelLinkEnv(ctx) {
             override fun configure(builder: WasmInstanceConfig.Builder) {
+                refusalsBefore = rt.memory.refusalCount
                 applyKernelLimits(rt, builder)
                 if (metered) builder.fuel(0, rt.fuelHandler)
             }
@@ -750,7 +763,13 @@ internal class ProcessRunner(private val machine: Machine) {
 
             override fun chargeFuel(amount: Long) = ctx.chargeFuel(amount)
         }
-        val linked = LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+        val linked = try {
+            LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+        } catch (t: Throwable) {
+            // 失敗した core インスタンスを作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
+            if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true
+            throw t
+        }
         lock.withLockValue {
             val first = rt.instances.firstOrNull()
             if (first == null) {
@@ -838,18 +857,47 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /**
      * `CRASHED` の理由（#41）。RAM の上限を超えた書き込みのトラップは上限を添え、`memory.grow` を RAM の上限で断った後の
-     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）。`kibi:computer/memory` の `commit` を断った後も同じ（#408）
+     * ほかのトラップには、メモリ不足が原因かもしれないと添える（#407）。`kibi:computer/memory` の `commit` を断った後も同じ（#408）。
+     * インスタンスを作る間に RAM の上限で確保を断られて作れなかったときも、メモリ不足と書く（#48。ADR 0048）。
+     * サーバー全体の勘定で断ったときは、RAM の上限ではなくサーバー全体の上限に当たったと書く（#48）
      */
     private fun processCrashReason(rt: ProcessRuntime, t: Throwable): String {
-        if (t is WasmTrapException && t.kind == WasmTrapKind.OUT_OF_MEMORY) return outOfMemoryReason(rt.memory.effectiveLimitBytes)
+        val limit = memoryLimitText(rt)
+        if (t is WasmTrapException && t.kind == WasmTrapKind.OUT_OF_MEMORY) return outOfMemoryReason(limit)
+        if (t is WasmLinkException && instantiateRefusedMemory(rt)) return instantiateOutOfMemoryReason(limit)
         val reason = crashReason(t)
         val note = refusedMemoryNote(rt)
         return if (note != null) "$reason ($note)" else reason
     }
 
-    /** `memory.grow`・`kibi:computer/memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null` */
-    private fun refusedMemoryNote(rt: ProcessRuntime): String? =
-        memoryRefusedNote(rt.memoryGrowRefused, rt.memoryCommitRefused, rt.memory.effectiveLimitBytes)
+    /**
+     * メモリ不足の文の、当たった上限の部分（[memoryLimitText]。プロセス全体で最後に断った段で決める。#48）。
+     * 断った直後に同じスレッドで読む所（OUT_OF_MEMORY のトラップ、インスタンスを作れなかったとき）だけで使う
+     */
+    private fun memoryLimitText(rt: ProcessRuntime): String = memoryLimitText(rt, rt.memory.lastRefusal)
+
+    /** [refusal] の段で断ったときの、メモリ不足の文の当たった上限の部分（[memoryLimitText]。#48） */
+    private fun memoryLimitText(rt: ProcessRuntime, refusal: MemoryRefusal?): String =
+        memoryLimitText(refusal == MemoryRefusal.SERVER, rt.memory.effectiveLimitBytes)
+
+    /**
+     * `memory.grow`・`kibi:computer/memory` の `commit` を RAM の上限で断っていたら、そう書いた文（#407・#408）。なければ `null`。
+     * 当たった上限は、それぞれを断った段で書く（後の別の確保で `ProcessMemory.lastRefusal` が変わっていても。#48）
+     */
+    private fun refusedMemoryNote(rt: ProcessRuntime): String? {
+        val grow = rt.memoryGrowRefusal?.let { memoryLimitText(rt, it) }
+        val commit = rt.memoryCommitRefusal?.let { memoryLimitText(rt, it) }
+        return memoryRefusedNote(grow, commit)
+    }
+
+    /**
+     * インスタンスを作れなかった（[WasmLinkException]）のが、RAM の上限で確保を断られたせいか（#48）。
+     * どの経路（[load]・[loadComponent]・[ProcessContext.instantiate]）も、失敗した core インスタンスを作る前後で断った回数が
+     * 増えたかで決める（[ProcessRuntime.instantiateRefusedMemory]）。コンポーネントは core インスタンスを順に作り、先に作ったものの
+     * start 関数が断ることがあるので、「それまでに一度でも断ったか」では見ない。
+     * RAM と関係のない失敗（import がない、型が違う、start 関数のトラップなど）には付けない
+     */
+    private fun instantiateRefusedMemory(rt: ProcessRuntime): Boolean = rt.instantiateRefusedMemory
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
     fun finishLocked(rt: ProcessRuntime, state: ProcessState, exitCode: Int?) {
@@ -1205,11 +1253,15 @@ internal class ProcessRunner(private val machine: Machine) {
                 }
             }
             if (!rt.process.unmetered) builder.fuel(r, rt.fuelHandler)
+            val refusalsBefore = rt.memory.refusalCount
+            rt.instantiateRefusedMemory = false
             val created = try {
                 module.instantiate(builder.build())
             } catch (t: Throwable) {
                 // CPU と許可は返さない。燃料は捨てる（元の holder は 0 のまま）
                 lock.withLockValue { rt.loading = null }
+                // 作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
+                if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true
                 throw t
             }
             lock.withLockValue {
@@ -1606,7 +1658,7 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun commitMemory(memory: WasmMemory, address: Int, length: Int, keepBytes: Long): Boolean {
             val committed = memory.commit(address, length, keepBytes)
             // 範囲外は例外で抜けるので、false は RAM が理由で断ったとき
-            if (!committed) rt.memoryCommitRefused = true
+            if (!committed) rt.memoryCommitRefusal = rt.memory.lastRefusal
             return committed
         }
 

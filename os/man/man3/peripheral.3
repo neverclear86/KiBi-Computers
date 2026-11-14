@@ -1,0 +1,72 @@
+# peripheral(3)
+
+## NAME
+
+peripheral - use devices from Lua
+
+## SYNOPSIS
+
+    peripheral.getNames()
+    peripheral.isPresent(name)
+    peripheral.getType(name)
+    peripheral.hasType(name, type)
+    peripheral.getMethods(name)
+    peripheral.call(name, method, ...)
+    peripheral.wrap(name)
+    peripheral.find(type [, filter])
+    peripheral.getName(wrapped)
+    peripheral.bytes(s)
+
+## DESCRIPTION
+
+The `peripheral` library of lua(1) lists and calls the devices connected to the computer. It follows the `peripheral` API of CC: Tweaked. It is a global and is also returned by `require("peripheral")`.
+
+A device is named by its address, a lower-case UUID such as `0a1b2c3d-...`. Upper-case letters are accepted and turned into lower case. The type of a device is its kind, such as `kibicomputers:screen`.
+
+- `getNames()`: a table of the addresses of the connected devices
+- `isPresent(name)`: whether a device is connected at the address
+- `getType(name)`: the kind of the device, or nil
+- `hasType(name, type)`: whether the kind is `type`. `type` matches the whole kind or the part after `:` (`screen` matches `kibicomputers:screen`). nil if no device is connected
+- `getMethods(name)`: a table of the method names, or nil
+- `call(name, method, ...)`: calls the method with the arguments and returns its results
+- `wrap(name)`: a table with one function per method, or nil. Call them with a dot: `p.getSize()`
+- `find(type [, filter])`: wraps every device whose kind matches `type` (as in `hasType`) and returns them as multiple values. With `filter`, only the devices for which `filter(name, wrapped)` returns true
+- `getName(wrapped)`: the address of a wrapped device. `getType`, `hasType` and `getMethods` also accept a wrapped device
+- `bytes(s)`: wraps the string `s` so that it is passed as bytes instead of text
+
+Method names are in kebab case (`get-size`). `wrap` also adds a camel case alias (`getSize`), and `call` accepts both forms.
+
+A call to a method that runs on the main thread of the server waits at least one game tick. Waiting does not use a thread.
+
+## VALUES
+
+- nil: none
+- boolean: boolean
+- integer: integer
+- float: float. A float with an integer value (`10/2`) is sent as an integer
+- string: text. It must be valid UTF-8
+- `peripheral.bytes(s)`: bytes
+
+Results come back the same way; text and bytes both become strings. Tables and functions cannot be passed. A call takes at most 32 arguments and 64 KiB of strings, and a method name is at most 64 bytes.
+
+## ERRORS
+
+A failed call raises a Lua error:
+
+- `No such peripheral`: no device is connected at the address, or a different kind of device was connected there after `wrap`
+- `No such method NAME`: the device has no such method
+- the message of the device: the arguments were wrong, or the method failed
+- `interrupted`: the world was saved and loaded while the method was running
+- `not enough memory`: the result might not fit in the memory of the computer
+- `device call failed: ERROR`: another error of the system
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- Names are addresses, not sides (`left`) or network names
+- A device has one type, its kind
+- Strings that are not UTF-8 must be wrapped with `peripheral.bytes`
+- Tables cannot be passed to or returned from a device
+
+## SEE ALSO
+
+os(3), lua(1), kibi(7)

@@ -63,7 +63,7 @@ class LuaMemoryLimitTest {
     }
 
     @ParameterizedTest
-    @ValueSource(longs = [128, 512])
+    @ValueSource(longs = [192, 512])
     fun `大きなテーブルを作るとnot enough memoryのエラーになり、pcallで受けられる`(ramKib: Long) = timeout(limit) {
         // エラーを受けた後は、新しい確保をせずに（作ったテーブルを捨てて GC してから）結果を書いて終わる
         val script = """
@@ -81,7 +81,7 @@ class LuaMemoryLimitTest {
     }
 
     @ParameterizedTest
-    @ValueSource(longs = [128, 512])
+    @ValueSource(longs = [192, 512])
     fun `受けなければLuaのエラーで終わり、メモリ不足が原因だったと表示する`(ramKib: Long) = timeout(limit) {
         val r = runLua("local t = {} for i = 1, 1e7 do t[i] = ('x'):rep(64) .. i end", ramKib * kib)
         assertEquals(ProcessState.EXITED, r.state, r.console)

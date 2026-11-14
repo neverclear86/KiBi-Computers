@@ -59,6 +59,8 @@ class MiniWasi(private val kernel: MiniKernel) {
             "commit" -> Body { _, _ -> longArrayOf(1) }
             else -> null
         }
+        // Lua 向けの KiBi API（#94）の import。この PoC では呼ばないので、呼ばれたら落とす
+        in KIBI_LUA_API -> Body { _, _ -> throw UnsupportedOperationException("$module.$name") }
         WASI -> when (name) {
             "fd_write" -> Body { mem, args -> ok(fdWrite(mem, args[0].toInt(), args[1].toInt(), args[2].toInt(), args[3].toInt())) }
             "fd_read" -> Body { mem, args -> ok(fdRead(mem, args[0].toInt(), args[1].toInt(), args[2].toInt(), args[3].toInt())) }
@@ -166,6 +168,7 @@ class MiniWasi(private val kernel: MiniKernel) {
         const val WASI = "wasi_snapshot_preview1"
         const val KIBI_POC = "kibi_poc"
         const val KIBI = "kibi:computer/memory@0.1.0"
+        val KIBI_LUA_API = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0")
         const val SUCCESS = 0
         const val EBADF = 8
         const val ENOSYS = 52

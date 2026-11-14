@@ -4,7 +4,7 @@
 //!   （`man/render.zig`）で、画面の幅に合わせてその場で折る
 //! - 言語は `-L`、なければ `LC_ALL` > `LC_MESSAGES` > `LANG`。`ja_JP.UTF-8` なら `ja_JP.UTF-8` → `ja_JP` → `ja` → 既定（英語）の順に探す。
 //!   `C`・`POSIX`・空・未設定は英語。その言語のページがなければ英語を出す
-//! - 節を書かなければ 1 → 8 → 5 → 7 の順に探す
+//! - 節を書かなければ 1 → 8 → 3 → 5 → 7 の順に探す（3 は Lua の API。#94）
 //! - 標準入力と標準出力がどちらも TTY なら、ページを送りながら見せる（`man/pager.zig`）。ほかは全部を書いて終わる（TTY でなければ
 //!   SGR を書かず、幅は 80）
 //! - 幅は `MANWIDTH`（20〜1024）があればそれ、なければ画面の幅（TTY でなければ 80）
@@ -23,7 +23,7 @@ const SYNOPSIS = "man [-L lang] [section] name... | man -k keyword...";
 
 const DEFAULT_MANPATH = "/usr/share/man";
 /// 節を書かないときに探す順
-const DEFAULT_SECTIONS = [_][]const u8{ "1", "8", "5", "7" };
+const DEFAULT_SECTIONS = [_][]const u8{ "1", "8", "3", "5", "7" };
 /// 1 ページの大きさの上限
 const MAX_PAGE = 64 * 1024;
 /// 続けて見せるページの合計の上限

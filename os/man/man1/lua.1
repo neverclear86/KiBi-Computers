@@ -14,6 +14,8 @@ Runs Lua programs. Without a script, reads an interactive prompt (REPL) when sta
 
 There is no shell inside Lua: `os.execute`, `io.popen` and `os.tmpname` are not available.
 
+The `peripheral` library uses the devices of the computer (peripheral(3)), and the `os` library has events, timers, time and power functions (os(3)). They follow the Lua APIs of CC: Tweaked.
+
 ## OPTIONS
 
 - `-e stat`: execute the string
@@ -25,4 +27,4 @@ There is no shell inside Lua: `os.execute`, `io.popen` and `os.tmpname` are not 
 
 ## SEE ALSO
 
-nano(1), sh(1)
+peripheral(3), os(3), nano(1), sh(1)

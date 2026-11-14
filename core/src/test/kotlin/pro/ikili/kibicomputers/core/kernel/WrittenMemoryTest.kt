@@ -113,8 +113,10 @@ class WrittenMemoryTest {
     }
 
     @Test
-    fun `Luaは128KiBのRAMで動く`() = timeout(limit) {
-        val r = run("lua.wasm", listOf("lua", "-e", "print(1 + 1)"), ramBytes = 128 * kib)
+    fun `Luaは192KiBのRAMで動く`() = timeout(limit) {
+        // 起動時の RAM の目安。#94 で peripheral と os の関数のテーブル（約 1.5 KiB）を足し、128 KiB（WASM の 2 ページ）では
+        // アロケーターが残す分（16 KiB）に届かなくなったので、3 ページ（192 KiB）にした。ゲームの RAM は MiB 単位（PartTier）
+        val r = run("lua.wasm", listOf("lua", "-e", "print(1 + 1)"), ramBytes = 192 * kib)
         assertEquals(ProcessState.EXITED, r.state, r.console)
         assertEquals(0, r.exitCode, r.console)
         assertTrue("2\n" in r.console, r.console)

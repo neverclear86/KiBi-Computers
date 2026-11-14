@@ -599,4 +599,40 @@ class DeviceDispatcherTest {
             assertEquals(CallError.INTERNAL_ERROR, got.get())
         }
     }
+
+    @Test
+    fun `失敗の文は1024バイトで切り詰め、文字の途中では切らない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val methods = DeviceMethods.builder()
+                .direct("author") { _, _ -> throw DeviceException("x".repeat(5000)) }
+                .direct("wide") { _, _ -> throw DeviceException("あ".repeat(2000)) }
+                .direct("short") { _, _ -> throw DeviceException("overheated") }
+                .mainThread("later") { ctx, _ ->
+                    ctx.defer().fail("😀".repeat(1000))
+                    emptyArray()
+                }
+                .build()
+            m.devices.attach(address, TestDevice(methods))
+            assertEquals(error(CallError.Failed("x".repeat(1024))), m.start("author").result())
+            // あ は 3 バイト。1024 バイトに入るのは 341 文字（1023 バイト）
+            assertEquals(error(CallError.Failed("あ".repeat(341))), m.start("wide").result())
+            assertEquals(error(CallError.Failed("overheated")), m.start("short").result())
+            val later = m.start("later")
+            h.scheduler.tick()
+            // 😀 は 4 バイト（サロゲートの対）。256 個で 1024 バイト
+            assertEquals(error(CallError.Failed("😀".repeat(256))), later.result())
+        }
+    }
+
+    @Test
+    fun `truncateMessageは上限に収まるものをそのまま返す`() {
+        assertEquals("", DeviceLimits.truncateMessage(""))
+        val exact = "y".repeat(DeviceLimits.MAX_ERROR_MESSAGE_BYTES)
+        assertEquals(exact, DeviceLimits.truncateMessage(exact))
+        assertEquals(exact, DeviceLimits.truncateMessage(exact + "z"))
+        // 文字の途中（サロゲートの対の間）で切らない
+        val cut = "y".repeat(DeviceLimits.MAX_ERROR_MESSAGE_BYTES - 2) + "😀"
+        assertEquals("y".repeat(DeviceLimits.MAX_ERROR_MESSAGE_BYTES - 2), DeviceLimits.truncateMessage(cut))
+    }
 }

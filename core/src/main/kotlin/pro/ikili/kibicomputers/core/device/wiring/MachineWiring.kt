@@ -17,6 +17,16 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  *   tick ごとに見回らない
  * - つないだデバイスの持ち主が登録表から外れたら（壊れた・アンロードした）、すぐにマシンから外す（`device-detached` は `DeviceBus` が出す。#67）
  * - 手放すとき（[disconnect]・候補から外れた）は、見張っているほかの結線に知らせる（空いたら次へ）
+ * - 持ち主が結線に出していなければ（[DeviceHolder.isOfferedTo]。他 MOD のデバイスを別の面のケースだけが出している）つながない。
+ *   つないだ後で出さなくなったら、次のつなぎ直しで外す
+ * - 同じ実体（[DeviceHolder.exclusionKey]）の登録は、どれか1つを通してだけつなぐ（#153、ADR 0153。[DeviceRegistry.isFreeFor]）
+ * - 持ち主やデバイス（他 MOD のコード）が投げた例外は受けて、つながずに手放す（[Host.onAttachFailed]・[Host.onDetachFailed]。
+ *   JVM が続けられないもの（[rethrowIfFatal]）だけ投げ直す）。つないだ後の知らせ（持ち主の onConnected）が投げたときは、
+ *   つないだままにして [Host.onConnectedFailed] で知らせる。**つなぐときに投げた登録は、この結線では同じ登録（世代）の間は
+ *   もう試さない**（[failed]）。新しい登録になる・候補から外れる・[disconnect] するまで。(結線, 登録) の組ごとに、投げて失敗するのは
+ *   1回までなので、失敗 → 手放し → 知らせ → 再試行が2台の間で回り続けない。満杯で断ったものは覚えない（空いたら見直す。ADR 0066）
+ * - catch・finally の中と、[Host] の知らせ（[Host.onRefused]・[Host.onAttachFailed]・[Host.onConnectedFailed]・[Host.onDetachFailed]）には、他 MOD の
+ *   コードを呼ばずに済む値（登録・読み済みの address・例外）だけを渡す
  *
  * マシンが動いているかは、呼び手が [Machine.isRunningBootingOrRebooting] で1回だけ読んで決める（#625・#626）。
  *
@@ -40,8 +50,24 @@ public class MachineWiring<K : Any>(
         /** [holder] を、[machine] が満杯なので断った */
         public fun onRefused(machine: Machine, holder: DeviceHolder<K>) {}
 
-        /** [holder] をつなげなかった（address・種類の形の誤りなど。プログラムの誤り） */
-        public fun onAttachFailed(holder: DeviceHolder<K>, error: IllegalArgumentException) {}
+        /**
+         * [entry] をつなげなかった（address・種類の形の誤り、持ち主やデバイスが投げたなど）。つながずに手放し、同じ登録の間はもう試さない。
+         * [address] はそれまでに読めた address（読む前に投げたら `null`）。他 MOD のコード（持ち主の address の読み書きなど）を呼ばない。
+         * つないだ後の知らせが投げたときは、これではなく [onConnectedFailed] を呼ぶ
+         */
+        public fun onAttachFailed(entry: DeviceRegistry.Entry<K>, address: String?, error: Throwable) {}
+
+        /**
+         * [entry] はつないだが、その後の知らせ（持ち主の [DeviceHolder.onConnected] か [onConnected]）が投げた。つないだままにする
+         * （外すのは、ほかのデバイスと同じく候補から外れたとき）。[address] はつないだ address。他 MOD のコードを呼ばない
+         */
+        public fun onConnectedFailed(entry: DeviceRegistry.Entry<K>, address: String, error: Throwable) {}
+
+        /**
+         * [entry] を外すときに、持ち主かデバイスが投げた（外すのは済んでいる）。[address] はつないだときの address。
+         * 他 MOD のコードを呼ばない
+         */
+        public fun onDetachFailed(entry: DeviceRegistry.Entry<K>, address: String, error: Throwable) {}
 
         /** [holder] の [device] をつないだ */
         public fun onConnected(holder: DeviceHolder<K>, device: Device) {}
@@ -53,6 +79,12 @@ public class MachineWiring<K : Any>(
 
     // 見張っているキー（候補）
     private var watched: Set<K> = emptySet()
+
+    // キーごとの、つなぐときに投げた登録（同じ登録の間はもう試さない。見張るキーの数まで）
+    private val failed = HashMap<K, DeviceRegistry.Entry<K>>()
+
+    /** つなぐときに投げたので、同じ登録の間はもう試さない登録の数（テスト用） */
+    public val failedCount: Int get() = failed.size
 
     /** つないでいるマシン。なければ `null` */
     public var machine: Machine? = null
@@ -98,7 +130,8 @@ public class MachineWiring<K : Any>(
             if (c.entry.key !in neighbors) continue
             for (key in c.entry.holder.relayKeys()) visit(m, key, relayed = true, seen)
         }
-        // 3. 候補を見張る（変わったところだけ出し入れする）
+        // 3. 候補を見張る（変わったところだけ出し入れする）。候補から外れたキーの失敗は忘れる
+        if (failed.isNotEmpty()) failed.keys.retainAll(seen)
         if (seen != watched) {
             for (k in watched) if (k !in seen) registry.unwatch(k, this)
             for (k in seen) if (k !in watched) registry.watch(k, this)
@@ -112,18 +145,31 @@ public class MachineWiring<K : Any>(
         val reach = HashSet<K>(neighbors)
         for (c in connections) if (c.entry.key in neighbors) reach.addAll(c.entry.holder.relayKeys())
         for (c in connections.toTypedArray()) {
-            if (c.entry.key !in reach || registry[c.entry.key] !== c.entry) disconnectOne(c, removed = false)
+            if (c.entry.key !in reach || registry[c.entry.key] !== c.entry || !c.entry.holder.isOfferedTo(host)) {
+                disconnectOne(c, removed = false)
+            }
         }
     }
 
     private fun visit(m: Machine, key: K, relayed: Boolean, seen: MutableSet<K>) {
         if (!seen.add(key)) return
         if (connections.any { it.entry.key == key }) return
-        val entry = registry[key] ?: return
+        val entry = registry[key]
+        if (entry == null) {
+            failed.remove(key)
+            return
+        }
+        val lastFailed = failed[key]
+        if (lastFailed != null) {
+            // 同じ登録で投げたものは、もう試さない（見張りは続ける）。登録が替わったら忘れて試す
+            if (lastFailed === entry) return
+            failed.remove(key)
+        }
         val holder = entry.holder
         if (relayed && !holder.relayable) return
-        val owner = entry.owner
-        if (owner != null && owner !== this) return
+        // 持ち主が、この結線には出していない（他 MOD のデバイスを、ほかの面のケースだけが出している）。見張りは続ける
+        if (!holder.isOfferedTo(host)) return
+        if (!registry.isFreeFor(entry, this)) return
         tryConnect(m, entry)
     }
 
@@ -135,11 +181,16 @@ public class MachineWiring<K : Any>(
             host.onRefused(m, holder)
             return
         }
-        entry.owner = this
+        registry.claim(entry, this)
         var attached = false
+        // 読めた address（ログに渡す。catch の中で持ち主の address を読み直さない）
+        var address: String? = null
         try {
-            if (bus.deviceAt(holder.deviceAddress) != null) holder.reassignDeviceAddress()
-            val address = holder.deviceAddress
+            address = holder.deviceAddress
+            if (bus.deviceAt(address) != null) {
+                holder.reassignDeviceAddress()
+                address = holder.deviceAddress
+            }
             val device = holder.createDevice()
             attached = bus.attach(address, device)
             if (!attached) {
@@ -150,13 +201,18 @@ public class MachineWiring<K : Any>(
             connections += Connection(entry, address, device)
             holder.onConnected(device)
             host.onConnected(holder, device)
-        } catch (e: IllegalArgumentException) {
-            host.onAttachFailed(holder, e)
-        } finally {
-            if (!attached && entry.owner === this) {
-                entry.owner = null
-                registry.released(entry, this)
+        } catch (t: Throwable) {
+            rethrowIfFatal(t)
+            if (attached) {
+                // つないだ後の知らせ（持ち主・接続層の onConnected）が投げた。つないだままにし、つなげなかったとは知らせない
+                host.onConnectedFailed(entry, address!!, t)
+            } else {
+                // つなげなかったら、この登録の間はもう試さない（失敗 → 手放し → 知らせ → 再試行が回り続けないように）
+                failed[entry.key] = entry
+                host.onAttachFailed(entry, address, t)
             }
+        } finally {
+            if (!attached) registry.drop(entry, this, notify = true)
         }
     }
 
@@ -165,6 +221,7 @@ public class MachineWiring<K : Any>(
         for (c in connections.asReversed().toTypedArray()) disconnectOne(c, removed = false)
         for (k in watched) registry.unwatch(k, this)
         watched = emptySet()
+        failed.clear()
         machine = null
     }
 
@@ -184,15 +241,28 @@ public class MachineWiring<K : Any>(
         host.scheduleRewire()
     }
 
+    /**
+     * [c] を外して手放す。持ち主の [DeviceHolder.onDisconnected] やデバイスの `onDetached`（他 MOD のコード）が投げても、
+     * 外すのと手放すのは済ませ、知らせて続ける（[disconnect] の残りも外し続ける）
+     */
     private fun disconnectOne(c: Connection<K>, removed: Boolean) {
         if (!connections.remove(c)) return
+        var error: Throwable? = null
         try {
             c.entry.holder.onDisconnected(c.device, removed)
-        } finally {
-            machine?.devices?.detach(c.address)
-            if (c.entry.owner === this) c.entry.owner = null
-            if (!removed) registry.released(c.entry, this)
+        } catch (t: Throwable) {
+            rethrowIfFatal(t)
+            error = t
         }
+        try {
+            machine?.devices?.detach(c.address)
+        } catch (t: Throwable) {
+            rethrowIfFatal(t)
+            if (error == null) error = t else error.addSuppressed(t)
+        } finally {
+            registry.drop(c.entry, this, notify = !removed)
+        }
+        if (error != null) host.onDetachFailed(c.entry, c.address, error)
     }
 
     override fun toString(): String = "MachineWiring(${connections.size} devices, $machine)"

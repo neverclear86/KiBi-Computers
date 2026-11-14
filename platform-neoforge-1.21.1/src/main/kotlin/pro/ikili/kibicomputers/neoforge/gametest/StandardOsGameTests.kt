@@ -238,4 +238,32 @@ object StandardOsGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+
+    /**
+     * Lua の peripheral（#94、ADR 0094）: 標準 OS の `/bin/lua` から、ケースのスピーカーと隣の画面・キーボードを列挙し、
+     * 種類で探して、画面の `get-size` をキャメルケースの別名で呼べる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaListsAndCallsAdjacentDevices(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val script = "local s = peripheral.find('screen'); local w, h = s.getSize(); " +
+            "print(table.concat({'pk', #peripheral.getNames(), peripheral.getType(peripheral.getName(peripheral.find('speaker'))), " +
+            "tostring(peripheral.hasType(peripheral.getName(peripheral.find('keyboard')), 'kibicomputers:keyboard')), w .. 'x' .. h}, ','))"
+        val expected = "pk,3,kibicomputers:speaker,true,${screen.text.width}x${screen.text.height}"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, "lua -e \"$script\"")
+                typed = true
+                helper.fail("typed the line")
+            }
+            helper.assertTrue(text.any { it == expected }, "lua should list and call the devices ($expected): $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
 }

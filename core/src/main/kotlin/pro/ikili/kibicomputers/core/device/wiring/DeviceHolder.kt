@@ -41,4 +41,20 @@ public interface DeviceHolder<K : Any> {
 
     /** 中継（ほかのデバイスの [relayKeys]）で届いたときもつなぐか（キーボードは `true`） */
     public val relayable: Boolean get() = false
+
+    /**
+     * 排他の単位（#153、ADR 0153）。同じもの（`===`）を返す登録どうしは1つのデバイスとみなし、どれか1つの登録を通して
+     * 1台のマシンにだけつなぐ（[DeviceRegistry.Entry.owner] に加えて、同じ実体のほかの位置もふさぐ）。`null` なら位置ごとの排他だけ
+     * （内蔵の画面・キーボード）。他 MOD のデバイスのアダプター（[ExternalDeviceHolder]）は、能力が返した生の `Device` を返す。
+     * 登録表に載せるときに1回だけ読み、その登録の間は変えない
+     */
+    public val exclusionKey: Any? get() = null
+
+    /**
+     * [host] の結線が、この持ち主をつないでよいか（#153、ADR 0153）。既定は `true`（内蔵は、隣に載っていればどの結線もつなぐ）。
+     * 他 MOD のデバイスのアダプターは、その位置を [ExternalDeviceSlots.offer] した結線（能力をその面で出している結線）だけ `true` を返す。
+     * 位置ごとに1つのアダプターを、面ごとの出し分け（上面にだけ出すなど）に関係なく、ほかの面のケースがつなぐのを防ぐ。
+     * 手放された（`false` になった）持ち主は、結線が次のつなぎ直しで外す
+     */
+    public fun isOfferedTo(host: MachineWiring.Host<K>): Boolean = true
 }

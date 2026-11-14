@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream
  * zig cc でビルドした実際のプログラムを、ランタイムの抽象を通して動かすために使う。
  * カーネルの WASI（#259）ではない。標準入出力・引数・時計・乱数だけを持ち、ファイルや preopen はない。
  * 知らない関数は `ENOSYS` を返す。`kibi:computer/memory` の import（#408）は、いつも RAM が足りると答える。
+ * Lua 向けの KiBi API（#94）が使う `kibi:*` の import は、呼ばれたら落とす（インスタンスを作るためだけにつなぐ）。
  */
 class TestWasiP1(private val args: List<String>, stdin: String = "") {
     /** `proc_exit` で投げる。 */
@@ -27,6 +28,8 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
             when (imp.module) {
                 MODULE -> builder.hostFunction(MODULE, imp.name, type, function(imp.name, type))
                 KIBI -> kibiFunction(imp.name)?.let { builder.hostFunction(KIBI, imp.name, type, it) }
+                // 同梱の lua.wasm の、Lua 向けの KiBi API（#94）が使う import。ここでは呼ばないので、呼ばれたら落とす
+                in KIBI_LUA_API -> builder.hostFunction(imp.module, imp.name, type, WasmHostFunction { _, _ -> throw UnsupportedOperationException("${imp.module}.${imp.name}") })
             }
         }
         return builder.build()
@@ -142,6 +145,9 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
     companion object {
         const val MODULE = "wasi_snapshot_preview1"
         const val KIBI = "kibi:computer/memory@0.1.0"
+
+        /** Lua 向けの KiBi API（#94）が使う import のモジュール */
+        val KIBI_LUA_API: Set<String> = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0")
         private const val SUCCESS = 0
         private const val EBADF = 8
         private const val ENOSYS = 52

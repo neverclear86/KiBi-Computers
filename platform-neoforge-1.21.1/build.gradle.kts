@@ -29,6 +29,10 @@ val dev: SourceSet = sourceSets.create("dev") {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
 }
+// dev の GameTest（#153 の他 MOD 役のデバイス）から、接続層の internal な型（CaseWiring など）を使う
+kotlin.target.compilations.named("dev") {
+    associateWith(kotlin.target.compilations.getByName("main"))
+}
 
 neoForge {
     version = prop("neoforge_version")
@@ -57,6 +61,8 @@ neoForge {
         }
         register("gameTestServer") {
             type = "gameTestServer"
+            // 他 MOD 役の試験用デバイス（dev ソースセット。#153）を登録する
+            systemProperty("kibicomputers.dev.testDevices", "true")
             // CI のランナー（2コア）と同じ条件で試すときは -PgameTestProcessors=2（JVM に見せるコア数を絞る）
             providers.gradleProperty("gameTestProcessors").orNull?.let { jvmArgument("-XX:ActiveProcessorCount=$it") }
         }
@@ -68,6 +74,9 @@ neoForge {
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
             // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る
             systemProperty("kibicomputers.loadTest.os", providers.gradleProperty("loadTestOs").getOrElse("lua"))
+            // -PloadTestDevices=<n> で、n 台に1台の割合でケースの隣に他 MOD 役のデバイス（#153）を置く（既定は 0 = 置かない）
+            systemProperty("kibicomputers.dev.testDevices", "true")
+            systemProperty("kibicomputers.loadTest.devices", providers.gradleProperty("loadTestDevices").getOrElse("0"))
             // -PloadTestJfr=<ファイル> で、JFR のプロファイルを取る（メインスレッドで重いところを探すとき。#351）
             providers.gradleProperty("loadTestJfr").orNull?.let {
                 jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")

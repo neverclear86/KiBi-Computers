@@ -14,6 +14,8 @@ Lua のプログラムを動かします。スクリプトがなければ、標�
 
 Lua の中からシェルは使えません。`os.execute`・`io.popen`・`os.tmpname` は使えません。
 
+`peripheral` ライブラリでコンピューターのデバイスを使えます（peripheral(3)）。`os` ライブラリにはイベント・タイマー・時刻・電源の関数があります（os(3)）。どちらも CC: Tweaked の Lua の API に合わせています。
+
 ## オプション
 
 - `-e stat`: 文字列を実行する
@@ -25,4 +27,4 @@ Lua の中からシェルは使えません。`os.execute`・`io.popen`・`os.tm
 
 ## 関連項目
 
-nano(1), sh(1)
+peripheral(3), os(3), nano(1), sh(1)

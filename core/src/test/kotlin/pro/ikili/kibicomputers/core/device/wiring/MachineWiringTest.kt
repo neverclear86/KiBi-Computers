@@ -29,6 +29,7 @@ class MachineWiringTest {
         val relays: List<String> = emptyList(),
         override val relayable: Boolean = false,
         var address: String = DeviceAddress.random(),
+        val connectThrows: Boolean = false,
     ) : DeviceHolder<String> {
         val log = ArrayList<String>()
         var created = 0
@@ -47,6 +48,7 @@ class MachineWiringTest {
 
         override fun onConnected(device: Device) {
             log += "connected"
+            if (connectThrows) throw IllegalStateException("connect boom")
         }
 
         override fun onDisconnected(device: Device, removed: Boolean) {
@@ -60,6 +62,8 @@ class MachineWiringTest {
     private class TestHost(val neighbors: List<String>) : MachineWiring.Host<String> {
         var scheduled = 0
         val refused = ArrayList<String>()
+        val attachFailed = ArrayList<String>()
+        val connectedFailed = ArrayList<Pair<String, String>>()
 
         override fun neighborKeys(): List<String> = neighbors
 
@@ -69,6 +73,14 @@ class MachineWiringTest {
 
         override fun onRefused(machine: Machine, holder: DeviceHolder<String>) {
             refused += (holder as Holder).name
+        }
+
+        override fun onAttachFailed(entry: DeviceRegistry.Entry<String>, address: String?, error: Throwable) {
+            attachFailed += entry.key
+        }
+
+        override fun onConnectedFailed(entry: DeviceRegistry.Entry<String>, address: String, error: Throwable) {
+            connectedFailed += entry.key to address
         }
     }
 
@@ -97,6 +109,31 @@ class MachineWiringTest {
             assertEquals(emptyList<String>(), kinds(m))
             assertNull(registry["up"]!!.owner)
             assertEquals(0, registry.watchedKeys, "外したら見張りもやめる")
+        }
+    }
+
+    @Test
+    fun `つないだ後に持ち主のonConnectedが投げたら、つないだままにして、つなげなかったとは知らせない`() = timeout(limit) {
+        Harness().use { h ->
+            val registry = DeviceRegistry<String>()
+            val screen = Holder("screen", connectThrows = true)
+            registry.register("s", screen)
+            val host = TestHost(listOf("s"))
+            val wiring = MachineWiring(registry, host)
+            val m = h.machine()
+            wiring.attach(m)
+            assertEquals(listOf("test:screen"), kinds(m), "つないだまま")
+            assertSame(wiring, registry["s"]!!.owner, "手放さない")
+            assertEquals(listOf(screen), wiring.connected)
+            assertEquals(emptyList<String>(), host.attachFailed, "つなげなかったとは知らせない")
+            assertEquals(listOf("s" to screen.address), host.connectedFailed)
+            assertEquals(0, wiring.failedCount, "もう試さない登録にはしない")
+            wiring.rewire()
+            assertEquals(listOf("test:screen"), kinds(m))
+            assertEquals(1, screen.created, "つないだままなので作り直さない")
+            wiring.disconnect()
+            assertEquals(emptyList<String>(), kinds(m))
+            assertNull(registry["s"]!!.owner)
         }
     }
 

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.neoforge.computer
 
+import com.mojang.logging.LogUtils
 import net.minecraft.core.BlockPos
 import net.minecraft.core.GlobalPos
 import net.minecraft.world.level.Level
@@ -7,6 +8,8 @@ import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import pro.ikili.kibicomputers.core.device.wiring.DeviceRegistry
+import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceSlots
+import pro.ikili.kibicomputers.core.device.wiring.rethrowIfFatal
 import java.util.Collections
 import java.util.IdentityHashMap
 
@@ -19,10 +22,17 @@ import java.util.IdentityHashMap
  *   チャンクの読み込みの途中や `onLoad` の中ではつながない。置いたブロックのデータ（address）は `setBlock` の後で読み込まれるので、
  *   tick の終わりにはそろっている（#535）
  * - 頼まれない台は何もしない（tick ごとの巡回はしない）
+ * - 他 MOD のデバイス（#153）は、ケースが見つけたら [externalSlots] がアダプターを登録表に載せる。つなぎ直しはケースごとに
+ *   受け、投げても残りのケースを続ける（[guardedFailures]）
  */
 internal object DeviceWiring {
     /** 登録表 */
     val registry: DeviceRegistry<GlobalPos> = DeviceRegistry()
+
+    /** 他 MOD のデバイスのアダプターの出し入れ（#153） */
+    val externalSlots: ExternalDeviceSlots<GlobalPos> = ExternalDeviceSlots(registry)
+
+    private val LOGGER = LogUtils.getLogger()
 
     // つなぎ直しを頼まれた結線（同じものは1回にまとめる）
     private val pending: MutableSet<CaseWiring> = Collections.newSetFromMap(IdentityHashMap())
@@ -38,10 +48,15 @@ internal object DeviceWiring {
     var rewireCount: Long = 0
         private set
 
+    /** ケースのつなぎ直しが投げて、ここで受けた回数（ふつうは 0。テスト用） */
+    var guardedFailures: Long = 0
+        private set
+
     fun register() {
         NeoForge.EVENT_BUS.addListener<ServerTickEvent.Post> { flush() }
         NeoForge.EVENT_BUS.addListener<ServerStoppedEvent> {
             pending.clear()
+            externalSlots.clear()
             registry.clear()
         }
     }
@@ -62,7 +77,14 @@ internal object DeviceWiring {
             pending.clear()
             for (w in batch) {
                 rewireCount++
-                w.rewire()
+                try {
+                    w.rewire()
+                } catch (t: Throwable) {
+                    // 1つのケースの誤りで、残りのケースのつなぎ直しとサーバーを止めない
+                    rethrowIfFatal(t)
+                    guardedFailures++
+                    LOGGER.error("Rewiring a computer case failed", t)
+                }
             }
         }
     }
