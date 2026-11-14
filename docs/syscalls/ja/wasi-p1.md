@@ -100,11 +100,12 @@ KiBi Computers は WASI p1（モジュール名 `wasi_snapshot_preview1`）を�
 | --- | --- | --- |
 | 普通のファイル | `REGULAR_FILE` | 位置・同期・属性の操作と、開き方に応じた `FD_READ`・`FD_WRITE` など |
 | ディレクトリ | `DIRECTORY` | `path_*`・`fd_readdir` など。継承する権利はすべて |
+| `/dev/null`・`/dev/zero`・`/dev/random`・`/dev/urandom` を `path_open` で開いたもの | `CHARACTER_DEVICE` | 普通のファイルと同じ（`SEEK`・`TELL` を持ちます） |
 | コンソール | `CHARACTER_DEVICE` | `FD_READ`・`FD_WRITE`（開き方に応じて）、poll、filestat。`SEEK`・`TELL` は持ちません |
 | パイプ、イベントキュー、タイマー、プロセスなどのハンドル | `UNKNOWN` | 同上 |
 
 - 権利は fd の種類と、開いたときの読み書きの別から毎回作ります。実際に守らせるのは読み書きの別だけで、p1 の細かい権利（`fd_fdstat_set_rights`、`path_open` の `rights_inheriting`）では絞れません
-- コンソールだけが `CHARACTER_DEVICE` なので、wasi-libc の `isatty` はコンソールでだけ真になります
+- wasi-libc の `isatty` は、`CHARACTER_DEVICE` で、かつ `SEEK`・`TELL` の権利がない fd でだけ真になります。コンソールがそれにあたります。`/dev` のファイルは `CHARACTER_DEVICE` ですが `SEEK`・`TELL` を持つので、偽です
 
 ### 読み書き
 
@@ -144,7 +145,8 @@ KiBi Computers は WASI p1（モジュール名 `wasi_snapshot_preview1`）を�
 | パイプ | 読めるバイトがあるか、書く側が閉じた。`nbytes` は読めるバイト数 | 空きがあるか、読む側が閉じた。`nbytes` は空き |
 | コンソール | 読める入力がある | 書ける空きがある |
 | ファイル・ディレクトリ | 常にそろう | 常にそろう |
-| イベントキュー、タイマー、子プロセス、デバイスの呼び出し（`kibi:*` のハンドル） | 取り出せるものがある・終わった。`nbytes` は 1 | 書く権利がないので `BADF` |
+| イベントキュー、タイマー、デバイスの呼び出し（`kibi:*` のハンドル） | 取り出せるものがある・終わった。`nbytes` は 1 | 書く権利がないので `BADF` |
+| 子プロセス（`kibi:process` のハンドル） | 終わった。`nbytes` は 0 | 書く権利がないので `BADF` |
 | それ以外で待てない種類 | `INVAL` のイベント | 同左 |
 
 - `HANGUP`（`eventrwflags`）は、パイプの相手側が閉じたときだけ立てます
@@ -178,7 +180,7 @@ p1 には作業ディレクトリ（cwd）を読み書きする関数があり�
 
 ## 待ち方と保存
 
-止まりうる関数は、p1 の `fd_read`・`fd_write`・`poll_oneoff` と、`kibi:process` の `[static]process.spawn`、`kibi:device` の `[method]device.invoke` の5つです。
+止まりうる関数は、[止まりうる import](./kibi-abi.md#止まりうる-import) の表のものです。
 
 - カーネルは読み込みのときに、モジュールを**待機点に変換**します（呼び出しの途中の状態を線形メモリの外へ退避できる形に書き換えます）。変換したプロセスは、止まりうる関数で待つ間、スレッドを持たず、マシンごとワールドに保存して、読み込んだ後にその呼び出しの続きから動けます。燃料が切れたときも、多くの場合は同じように止まります
 - **変換できない作りのモジュールは、読み込みで `NOEXEC` です。** 止まりうる関数を呼びうる関数の中に、SIMD（v128）のローカル変数や命令、型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなどがある場合です。エラーのメッセージに、どの関数のどの機能かが出ます。止まりうる関数を import しないモジュールは、この理由では断りません

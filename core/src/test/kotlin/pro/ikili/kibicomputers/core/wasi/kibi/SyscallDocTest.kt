@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.wasi.p1.P1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.File
@@ -17,6 +18,8 @@ import java.io.File
  * - `check:error-codes`: `error-code` の判別子・名前・p1 の errno が `types.wit` と `Errno` の並びと一致
  * - `check:imports <モジュール>`: `kibi:*` の p1 の import の表（関数名・core の型・`cabi_realloc` が要るか・止まりうるか）が
  *   [WasiP1Kibi] と [WasiP1.WAIT_IMPORTS] と一致し、全体で出している関数をちょうど覆う
+ * - `check:wait-imports`: 「止まりうる import」の表が [WasiP1.WAIT_IMPORTS] とちょうど一致する。p1 の関数の表で「止まりうる」と書いたものも、
+ *   `wasi_snapshot_preview1` の [WasiP1.WAIT_IMPORTS] とちょうど一致する
  * - ```wit のブロック: コメントと空行を除いて、`core/src/main/wit/` の元のファイルと一致し、p1 で使う WIT をすべて載せている
  */
 class SyscallDocTest {
@@ -79,6 +82,22 @@ class SyscallDocTest {
                 val name = code(row[0])
                 assertEquals(name !in WasiP1.implemented, "NOSYS" in row[1], "$lang: $name の対応の欄（${row[1]}）")
             }
+            // 備考の「止まりうる」（en は「May block」）が、止まりうる import の p1 側とちょうど一致する
+            val marked = rows.filter { Regex("止まりうる|May block").containsMatchIn(it[2]) }.map { "${P1.MODULE}.${code(it[0])}" }.toSet()
+            val p1Waits = WasiP1.WAIT_IMPORTS.filter { it.startsWith("${P1.MODULE}.") }.toSet()
+            assertEquals(p1Waits, marked, "$lang: p1 の関数の表の止まりうるもの")
+        }
+    }
+
+    @Test
+    fun `止まりうるimportの表はWAIT_IMPORTSと一致する`() {
+        for (lang in langs) {
+            val tables = checked(lang, "wait-imports")
+            assertEquals(1, tables.size, "$lang: 止まりうる import の表は1つ")
+            val rows = tables.single().second
+            val seen = rows.map { "${code(it[0])}.${code(it[1])}" }
+            assertEquals(seen.size, seen.toSet().size, "$lang: 重複がある")
+            assertEquals(WasiP1.WAIT_IMPORTS, seen.toSet(), "$lang: 止まりうる import")
         }
     }
 

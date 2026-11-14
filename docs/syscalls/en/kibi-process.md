@@ -147,7 +147,6 @@ Checked in parameter order (`path` → `args` → `env` → `cwd` → `fds`); th
 
 | Condition | Result |
 | --- | --- |
-| A process set not to wait (before reading the arguments) | `again` |
 | `path` or `cwd` over 4096 bytes | `name-too-long` |
 | The array ptr of `args`, `env`, or `fds` not aligned to 4 (even with length 0; `env` is not checked when `none`) | Trap |
 | Over 4096 `args` or 4096 `env` pairs (provisional; before reading the elements) | `too-big` |

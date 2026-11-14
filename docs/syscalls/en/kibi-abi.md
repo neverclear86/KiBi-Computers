@@ -130,7 +130,7 @@ Errors versus traps:
 | A location returned by `cabi_realloc` outside the linear memory or not aligned | Trap |
 | `[resource-drop]` of an invalid handle; an invalid handle to a function that returns no `error-code` | Trap |
 
-- Arguments are read and checked in parameter order. If there are several mistakes, the first one found is returned
+- If there are several mistakes, the first one found in the checking order is returned. The order is fixed per function and is given in each page's table of checks (or its text). A handle (the leading `self` or `fd`) is not always checked in parameter order: some functions check the other argument values first and the handle after (`max` of `event-queue.take`, `method` and `args` of `device.invoke` and `start`, `pid` of `tty.set-foreground`)
 - **Known difference from the Component Model layer**: the Component Model reads in (lifts) all arguments before the host checks them, so combinations where p1 returns an `error-code` but a later argument has a bad alignment will trap there. Also, out-of-bounds pointers trap in the Component Model. The order will be aligned when the p2 layer is built ([#616](https://github.com/neverclear86/KiBi-Computers/issues/616)), so do not rely on which mistake is reported first
 
 ## cabi_realloc
@@ -151,8 +151,9 @@ void *cabi_realloc(void *old_ptr, size_t old_size, size_t align, size_t new_size
 
 ## Imports that may block
 
-The following five may make the process wait until the result is ready ([Waiting and saving](./wasi-p1.md#waiting-and-saving)).
+The functions in the following table may make the process wait until the result is ready ([Waiting and saving](./wasi-p1.md#waiting-and-saving)).
 
+<!-- check:wait-imports -->
 | Module | Function | Waits for |
 | --- | --- | --- |
 | `wasi_snapshot_preview1` | `fd_read` | Input to read |
@@ -160,6 +161,7 @@ The following five may make the process wait until the result is ready ([Waiting
 | `wasi_snapshot_preview1` | `poll_oneoff` | Any subscription |
 | `kibi:process/process@0.1.0` | `[static]process.spawn` | Loading (compiling) the executable |
 | `kibi:device/bus@0.1.0` | `[method]device.invoke` | The result of a device method |
+<!-- /check -->
 
 The other `kibi:*` functions do not wait. `shutdown` and `reboot` in `kibi:computer/power` do not return once accepted, because the calling process stops at once too.
 

@@ -100,11 +100,12 @@ An executable that is not a regular file returns `ACCES`; one that is too large 
 | --- | --- | --- |
 | Regular file | `REGULAR_FILE` | Position, sync, and attribute operations, plus `FD_READ` and `FD_WRITE` according to how it was opened |
 | Directory | `DIRECTORY` | `path_*`, `fd_readdir`, and so on. All inheriting rights |
+| `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom` opened with `path_open` | `CHARACTER_DEVICE` | Same as a regular file (has `SEEK` and `TELL`) |
 | Console | `CHARACTER_DEVICE` | `FD_READ` and `FD_WRITE` (according to how it was opened), poll, filestat. No `SEEK` or `TELL` |
 | Pipes and handles such as event queues, timers, and processes | `UNKNOWN` | Same as above |
 
 - Rights are computed each time from the kind of fd and whether it was opened for reading or writing. Only read versus write is actually enforced; the finer p1 rights (`fd_fdstat_set_rights`, `rights_inheriting` of `path_open`) cannot narrow access
-- Only the console is a `CHARACTER_DEVICE`, so wasi-libc's `isatty` is true only for the console
+- wasi-libc's `isatty` is true only for an fd that is a `CHARACTER_DEVICE` and also lacks the `SEEK` and `TELL` rights. The console is such an fd. The `/dev` files are `CHARACTER_DEVICE` but have `SEEK` and `TELL`, so it is false for them
 
 ### Reading and writing
 
@@ -144,7 +145,8 @@ An executable that is not a regular file returns `ACCES`; one that is too large 
 | Pipe | Bytes to read, or the write end was closed. `nbytes` is the bytes available | Free space, or the read end was closed. `nbytes` is the free space |
 | Console | Input to read | Space to write |
 | File or directory | Always ready | Always ready |
-| Event queue, timer, child process, device call (`kibi:*` handles) | Something to take, or finished. `nbytes` is 1 | `BADF` (no write right) |
+| Event queue, timer, device call (`kibi:*` handles) | Something to take, or finished. `nbytes` is 1 | `BADF` (no write right) |
+| Child process (`kibi:process` handle) | Finished. `nbytes` is 0 | `BADF` (no write right) |
 | Any other kind that cannot be waited on | `INVAL` event | Same |
 
 - `HANGUP` (in `eventrwflags`) is set only when the other end of a pipe was closed
@@ -178,7 +180,7 @@ p1 has no function to read or change the working directory (cwd). The kernel kee
 
 ## Waiting and saving
 
-Five functions may block: `fd_read`, `fd_write`, and `poll_oneoff` in p1, `[static]process.spawn` in `kibi:process`, and `[method]device.invoke` in `kibi:device`.
+The functions that may block are the ones in the table of [Imports that may block](./kibi-abi.md#imports-that-may-block).
 
 - At load time, the kernel **converts the module to wait points** (it rewrites the module so that the state in the middle of a call can be moved out of the linear memory). While a converted process waits in a function that may block, it holds no thread; its machine can be saved with the world, and after loading, the call continues where it was. Running out of fuel usually stops the process in the same way
 - **A module whose code cannot be converted fails at load time with `NOEXEC`.** This happens when a function that can reach a blocking call contains SIMD (v128) locals or instructions, typed references (GC, function references), a tail call to a blocking function, and so on. The error message says which function and which feature. A module that imports no function that may block is never rejected for this reason

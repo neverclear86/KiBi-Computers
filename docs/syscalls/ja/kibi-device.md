@@ -124,7 +124,6 @@ interface bus {
 | 引数の場所が線形メモリの外 | `kernel(fault)` |
 | `invoke`・`start`・`take` の不正なハンドル | `kernel(bad-descriptor)` |
 | `info`・`methods`・`[resource-drop]*` の不正なハンドル | トラップ |
-| 待たない設定のプロセスで、メインスレッドのメソッドを `invoke` | `kernel(again)` |
 | fd の表が満杯（`open`・`start`、メインスレッドのメソッドの `invoke`） | `kernel(mfile)` |
 
 `boolean` は 0 でなければ真です。返す文字列は UTF-8 です。上限の数は仮の値です。

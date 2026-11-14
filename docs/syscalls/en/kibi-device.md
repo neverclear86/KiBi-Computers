@@ -124,7 +124,6 @@ The `value` discriminants are `none` = 0, `integer` = 1, `float` = 2, `boolean` 
 | An argument location outside the linear memory | `kernel(fault)` |
 | An invalid handle to `invoke`, `start`, or `take` | `kernel(bad-descriptor)` |
 | An invalid handle to `info`, `methods`, or `[resource-drop]*` | Trap |
-| `invoke` of a main-thread method from a process set not to wait | `kernel(again)` |
 | The fd table full (`open`, `start`, `invoke` of a main-thread method) | `kernel(mfile)` |
 
 A `boolean` is true if nonzero. Returned strings are UTF-8. The limit numbers are provisional.
