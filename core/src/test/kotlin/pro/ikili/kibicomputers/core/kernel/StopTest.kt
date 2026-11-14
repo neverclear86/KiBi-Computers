@@ -163,8 +163,10 @@ class StopTest {
             eventually {
                 h.scheduler.tick()
                 Thread.sleep(2)
-                m.stateOf(blocked) == ProcessState.WAITING_EVENT && m.stateOf(host) == ProcessState.WAITING_HOST && m.stateOf(fuelWait) == ProcessState.WAITING_FUEL
+                m.stateOf(blocked) == ProcessState.WAITING_EVENT && m.stateOf(host) == ProcessState.WAITING_HOST
             }
+            // tick を止めて、燃料を使い切って待つところまで待つ（tick が進むと、待たずに譲って済むので、燃料待ちの状態が見えないことがある）
+            eventually { m.stateOf(fuelWait) == ProcessState.WAITING_FUEL }
             m.stop()
             assertTrue(m.awaitTermination(5_000))
             listOf(fuelWait, blocked, host).forEach { assertState(ProcessState.KILLED, m, it) }

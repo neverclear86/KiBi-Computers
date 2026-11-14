@@ -422,12 +422,23 @@ class AsyncFuelTest {
             assertTrue(reason.contains("SIMD"), reason)
             // 読み込んだときに、理由をもうログに出している（同じモジュールではもう出さない）
             assertFalse(FuelYieldRejectionLog.report(program.hash, reason))
+            // 最初の燃料をこの tick で渡し、使い切って待つところまで tick を進めずに待つ（tick が進むと、待たずに譲って済むことがある）。
+            // 200 ms 待っても来なければ、燃料待ちで止まっているとして、1 回だけ tick を進める
+            h.scheduler.tick()
+            var spins = 0
+            eventually(60_000, "燃料切れでスレッドを持って待たない") {
+                if (h.scheduler.fuelBlockingWaits.get() > blocking0 || m.stateOf(pid).isTerminal) return@eventually true
+                Thread.sleep(1)
+                if (++spins % 200 == 0) h.scheduler.tick()
+                false
+            }
+            val waited = h.scheduler.fuelBlockingWaits.get() > blocking0
             eventually(60_000, "終わらない") {
                 h.scheduler.tick()
                 m.stateOf(pid).isTerminal
             }
             assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
-            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0, "燃料切れでスレッドを持って待っていない")
+            assertTrue(waited, "燃料切れでスレッドを持って待っていない")
             assertEquals(unwinds0, h.scheduler.fuelUnwinds.get(), "段2なのに燃料切れで巻き戻した")
         }
     }
