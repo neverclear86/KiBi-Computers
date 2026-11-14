@@ -222,6 +222,18 @@ public class MachineScheduler private constructor(
     /** 止まりうる関数でない関数の中の燃料切れで、前借りして先へ進めた回数（数え口。#477） */
     internal val fuelOverdrafts = AtomicLong()
 
+    /**
+     * スライスを使い切ったが、CPU を待つプロセスがいないので、CPU を返さずにその場で次のスライスを足した回数（数え口。#47）。
+     * [fuelUnwinds]・[fuelBlockingWaits] には数えない
+     */
+    internal val fuelSliceRenewals = AtomicLong()
+
+    /**
+     * スライスを使い切り、マシンの燃料がまだ残っているのに CPU を返した回数（ほかのプロセスに譲った・一時停止。数え口。#47）。
+     * 巻き戻して譲ったものも、スレッドを持ったまま譲ったものも数える。[fuelUnwinds]・[fuelBlockingWaits] には数えない
+     */
+    internal val fuelYields = AtomicLong()
+
     init {
         dispatcher.start()
     }
@@ -390,7 +402,7 @@ public class MachineScheduler private constructor(
     /**
      * 全マシンを一時停止する。実行中のプロセスがなくなったら返す。返した [PauseHandle] の `close()` で再開する。
      *
-     * 止まるまでの上限は、実行中のプロセスが手持ちの燃料（最大で `fuelPerTick`）を使い切るまで。
+     * 止まるまでの上限は、実行中のプロセスが手持ちの燃料（最大でスライス `MachineConfig.fuelSlice`。#47）を使い切るまで。
      * 時間内に止まらなければ、一時停止を解いてから [TimeoutException] を投げる（燃料を計測しないプロセスが計算中なら必ずこれになる）。
      *
      * @throws IllegalStateException もう一時停止している

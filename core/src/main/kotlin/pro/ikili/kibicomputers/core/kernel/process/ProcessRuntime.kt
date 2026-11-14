@@ -111,6 +111,9 @@ internal class ProcessRuntime(
     /** [fuelUnwound] を立てたときの燃料の残り（負。行き過ぎた分）。マシンの燃料に書き戻す */
     var fuelUnwindRemaining: Long = 0
 
+    /** [fuelUnwound] を立てたとき、マシンの燃料がまだ残っていた（燃料切れでなく、譲るための巻き戻し。数え口を分けるだけ。#47） */
+    var fuelUnwindYield: Boolean = false
+
     /** 燃料待ちからの巻き直しの途中（#339）。止まった燃料切れの呼び出しに着いたら消す。プロセスのスレッドだけが読み書きする */
     var rewindingForFuel: Boolean = false
 

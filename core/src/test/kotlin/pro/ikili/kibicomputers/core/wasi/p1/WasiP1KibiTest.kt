@@ -102,9 +102,10 @@ class WasiP1KibiTest {
         }
     }
 
-    private fun run(mode: Mode, vararg args: String, fuelPerTick: Long = 10_000_000, block: Run.() -> Unit) = timeout(Duration.ofSeconds(90)) {
-        Harness().use { h -> Run(h, h.machine(fuelPerTick = fuelPerTick), mode, args.toList()).block() }
-    }
+    private fun run(mode: Mode, vararg args: String, fuelPerTick: Long = 10_000_000, fuelSlice: Long? = null, block: Run.() -> Unit) =
+        timeout(Duration.ofSeconds(90)) {
+            Harness().use { h -> Run(h, h.machine(fuelPerTick = fuelPerTick, fuelSlice = fuelSlice), mode, args.toList()).block() }
+        }
 
     private val event = KernelEvent(
         "test",
@@ -169,8 +170,9 @@ class WasiP1KibiTest {
         assertTrue("max err:27 ok:0 ok:0 ok:0\n" in out, out)
     }
 
+    // スライスを 1 tick 分にする（#47）。小さいと、tick が進んだ後のスライスの切れ目をその場で足して、燃料を待たずに済むことがある
     @Test
-    fun `cabi_reallocの中で燃料が切れても、巻き戻さずに燃料を待って続ける`() = run(Mode.UNWIND, "spin", fuelPerTick = 2_000_000) {
+    fun `cabi_reallocの中で燃料が切れても、巻き戻さずに燃料を待って続ける`() = run(Mode.UNWIND, "spin", fuelPerTick = 2_000_000, fuelSlice = 2_000_000) {
         waitAndPost()
         val before = h.scheduler.fuelBlockingWaits.get()
         val out = finish()

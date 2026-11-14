@@ -50,13 +50,13 @@ class AsyncFuelTest {
         vfs.write(f, bytes, 0, bytes.size)
     }
 
-    private inner class Spin(val h: Harness, val m: Machine, args: List<String>) {
+    private inner class Spin(val h: Harness, val m: Machine, args: List<String>, install: Boolean = true) {
         val output: Int = m.lock.withLockValue { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
         val pid: Int
         private val out = StringBuilder()
 
         init {
-            m.install()
+            if (install) m.install()
             val stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
             pid = m.exec("/bin/spin", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("spin") + args, stdio = stdio))
         }
@@ -129,6 +129,46 @@ class AsyncFuelTest {
             val out = s.finish()
             assertEquals(expected(3, 100_000), out)
             assertTrue(m.lock.withLockValue { s.process.asyncStack!!.isEmpty })
+        }
+    }
+
+    @Test
+    fun `スライスを使い切ると、計算し続ける2つのプロセスは巻き戻してスレッドを持たずに譲り合う`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            // スライスは 1 tick の 1/10。2つが同じ tick の中で交代する（#47）
+            val m = h.machine(fuelPerTick = 200_000, fuelSlice = 20_000)
+            val yields0 = h.scheduler.fuelYields.get()
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val a = Spin(h, m, listOf("main", "4", "100000"))
+            val b = Spin(h, m, listOf("main", "4", "100000"), install = false)
+            eventually(60_000, "終わらない") {
+                h.scheduler.tick()
+                a.drain()
+                b.drain()
+                m.stateOf(a.pid).isTerminal && m.stateOf(b.pid).isTerminal
+            }
+            assertEquals(expected(4, 100_000), a.drain())
+            assertEquals(expected(4, 100_000), b.drain())
+            assertTrue(h.scheduler.fuelYields.get() - yields0 > 0, "譲っていない")
+            assertEquals(blocking0, h.scheduler.fuelBlockingWaits.get(), "スレッドを持ったまま待った")
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+        }
+    }
+
+    @Test
+    fun `プロセスが1つだけなら、スライスを使い切っても巻き戻さずにその場で足す`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 200_000, fuelSlice = 20_000)
+            val yields0 = h.scheduler.fuelYields.get()
+            val renewals0 = h.scheduler.fuelSliceRenewals.get()
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            val s = Spin(h, m, listOf("main", "3", "100000"))
+            assertEquals(expected(3, 100_000), s.finish())
+            val renewals = h.scheduler.fuelSliceRenewals.get() - renewals0
+            val unwinds = h.scheduler.fuelUnwinds.get() - unwinds0
+            assertEquals(yields0, h.scheduler.fuelYields.get(), "譲る相手がいないのに譲った")
+            // 巻き戻すのは tick の燃料を使い切ったときだけ。スライスの切れ目はその場で足す
+            assertTrue(renewals > unwinds, "その場で足した $renewals 回、巻き戻した $unwinds 回")
         }
     }
 
