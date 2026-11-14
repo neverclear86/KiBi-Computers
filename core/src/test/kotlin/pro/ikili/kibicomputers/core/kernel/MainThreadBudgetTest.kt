@@ -90,6 +90,8 @@ class MainThreadBudgetTest {
             assertEquals(emptyList<String>(), b.tick())
             // 手を付けずに持ち越した台を数える（1〜5 tick 目に2台・2台・2台・2台・1台）
             assertEquals(9, b.h.scheduler.carriedMachines.get())
+            // 打ち切ったのは1〜5 tick 目（6 tick 目は予算を超えたが、残りがないので数えない）
+            assertEquals(5, b.h.scheduler.budgetCutTicks.get())
         }
     }
 
@@ -154,7 +156,32 @@ class MainThreadBudgetTest {
             // 通知: 1台目 60（台の途中では切らない）、2台目 120 で半分（100）を超えたので止める。3台目は持ち越し。
             // ホスト呼び出し: 130・140 で予算の内なので、両方
             assertEquals(listOf("n1a", "n1b", "n2a", "n2b", "c1", "c2"), b.tick())
+            assertEquals(1, b.h.scheduler.budgetCutTicks.get())
+            // 3台目を配り切った tick は、時間が半分を超えても打ち切りに数えない
             assertEquals(listOf("n3a", "n3b"), b.tick())
+            assertEquals(1, b.h.scheduler.budgetCutTicks.get())
+        }
+    }
+
+    @Test
+    fun `配り切った・実行し切ったtickは、予算を超えても打ち切りに数えない`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val m = b.machine()
+            // 通知: 1台だけで、予算の半分を大きく超えるが、残りはない
+            b.notify(m, "n", 500)
+            assertEquals(listOf("n"), b.tick())
+            assertEquals(0, b.h.scheduler.budgetCutTicks.get())
+            // ホスト呼び出し: 最後の1件で予算を超えるが、残りはない
+            b.call(m, "c1", 10)
+            b.call(m, "c2", 500)
+            assertEquals(listOf("c1", "c2"), b.tick())
+            assertEquals(0, b.h.scheduler.budgetCutTicks.get())
+            assertEquals(0, b.h.scheduler.carriedMachines.get())
+            // 残りがあれば数える
+            b.call(m, "c3", 500)
+            b.call(m, "c4", 1)
+            assertEquals(listOf("c3"), b.tick())
+            assertEquals(1, b.h.scheduler.budgetCutTicks.get())
         }
     }
 
@@ -172,6 +199,8 @@ class MainThreadBudgetTest {
             assertEquals(listOf("n2", "c2"), b.tick())
             b.notify(other, "n3", 1_000)
             assertEquals(listOf("n3"), b.tick())
+            // 1 tick 目だけ、c2 が残ったので数える。2・3 tick 目は、予算を使い切っても残りがない
+            assertEquals(1, b.h.scheduler.budgetCutTicks.get())
         }
     }
 
@@ -224,6 +253,74 @@ class MainThreadBudgetTest {
             b.notify(y, "y2", 0)
             assertEquals(listOf("y1", "y2"), b.tick())
             assertEquals(emptyList<String>(), b.tick())
+        }
+    }
+
+    @Test
+    fun `持ち越しの列にいる間に止めた台は、回ってきたときに印が下り、起動し直した後の呼び出しをまた積める`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val x = b.machine()
+            val y = b.machine()
+            b.call(x, "x1", 200)
+            val cancelled = listOf(b.call(y, "y1", 1), b.call(y, "y2", 1))
+            // x が予算を使い切り、y は手を付けずに持ち越しの列に残る
+            assertEquals(listOf("x1"), b.tick())
+            assertEquals(2, y.pendingHostCalls)
+            y.stop()
+            assertTrue(cancelled.all { it.isCompletedExceptionally })
+            assertEquals(0, y.pendingHostCalls)
+            // 回ってきても何も実行せず、印を下ろす
+            assertEquals(emptyList<String>(), b.tick())
+            // 印が下りているので、積み直した呼び出しが列に載り、実行される
+            val again = b.call(y, "y3", 1)
+            assertEquals(listOf("y3"), b.tick())
+            assertEquals("y3", again.get())
+            assertEquals(0, y.pendingHostCalls)
+        }
+    }
+
+    @Test
+    fun `出力を止めている台は、予算で打ち切る tick をまたいでも1 tick に2回配られず、ほかの台を飢えさせない`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val held = b.machine()
+            val p = b.machine()
+            val q = b.machine()
+            // 毎 tick、配るたびに自分を積み直す台（再開で時計を進めて、予算の半分を超える）
+            held.holdConsoleOutput {
+                b.clock.addAndGet(1_000)
+                b.log += "held"
+            }
+            b.notify(p, "p", 1_000)
+            b.notify(q, "q", 1_000)
+            // 1 tick に1台ずつ。held は積み直しで次の tick の後ろに回り、p・q が先に配られる
+            assertEquals(listOf("held"), b.tick())
+            assertEquals(listOf("p"), b.tick())
+            assertEquals(listOf("q"), b.tick())
+            assertEquals(listOf("held"), b.tick())
+            assertEquals(listOf("held"), b.tick())
+            held.releaseConsoleOutput()
+        }
+    }
+
+    @Test
+    fun `致命的なエラーの時点で1台の上限に達していた台も、失われずに後のtickで実行される`() = timeout(limit) {
+        Budgeted(Long.MAX_VALUE).use { b ->
+            val capped = b.machine(maxHostCallsPerTick = 1)
+            val bad = b.machine()
+            val good = b.machine()
+            b.call(capped, "capped-1", 1)
+            b.call(capped, "capped-2", 1)
+            bad.submitHostCall(0) { throw OutOfMemoryError("test") }
+            b.call(bad, "bad-after", 1)
+            b.call(good, "good", 1)
+            // capped は上限に達して again に入った後で、bad が投げる
+            assertThrows(OutOfMemoryError::class.java) { b.h.scheduler.tick() }
+            assertEquals(listOf("capped-1"), b.log.toList())
+            assertEquals(setOf("capped-2", "bad-after", "good"), b.tick().toSet())
+            assertEquals(0, capped.pendingHostCalls)
+            // 印が立ったままになっていない
+            b.call(capped, "capped-again", 1)
+            assertEquals(listOf("capped-again"), b.tick())
         }
     }
 }

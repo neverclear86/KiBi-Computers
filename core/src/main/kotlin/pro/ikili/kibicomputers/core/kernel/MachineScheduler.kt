@@ -187,7 +187,7 @@ public class MachineScheduler private constructor(
     /** [tick] が通知を配ったマシンの数の合計（数え口） */
     internal val tickVisitedMachines = AtomicLong()
 
-    /** [tick] で、通知かホスト呼び出しを予算で打ち切った tick の数（数え口。#356） */
+    /** [tick] で、通知かホスト呼び出しを予算で打ち切った（まだ残りがあるのに止めた）tick の数（数え口。#356。配り切った・実行し切った tick は数えない） */
     internal val budgetCutTicks = AtomicLong()
 
     /** 予算で打ち切ったとき、手を付けずに次の tick へ持ち越したマシンの数の合計（数え口。#356。段ごとに数える） */
@@ -298,7 +298,7 @@ public class MachineScheduler private constructor(
 
     /**
      * 持ち越しの列の前から、通知を配る（マシンの単位。1台の途中では切らない）。台の間で、tick の頭から予算の半分を過ぎていたら止める
-     * （1台目は必ず配る）。予算で打ち切ったら `true`。配ったマシンは列から外れる（配る中で積み直したら、[notifyQueue] から次の tick へ）。
+     * （1台目は必ず配る）。予算のために、配っていない台を残して止めたら `true`（配り切ったなら、時間が半分を超えても `false`）。配ったマシンは列から外れる（配る中で積み直したら、[notifyQueue] から次の tick へ）。
      * JVM の致命的なエラー（[Machine] の `safely` が投げ直す）で途中で抜けるときは、投げたマシンの残りを次の tick に回してから投げ直す
      * （まだ配っていないマシンは持ち越しの列に残る。`queuedForNotify` が立ったまま、列にも載っていない状態にしない。#674）
      */
@@ -310,7 +310,8 @@ public class MachineScheduler private constructor(
         var cut = false
         try {
             while (true) {
-                if (visited > 0 && budget.elapsed() >= limit) {
+                // 残りがあるときだけ「打ち切った」（配り切ったなら、時間が半分を超えていても数えない）
+                if (visited > 0 && notifyCarry.isNotEmpty() && budget.elapsed() >= limit) {
                     cut = true
                     break
                 }
@@ -333,7 +334,8 @@ public class MachineScheduler private constructor(
 
     /**
      * 持ち越しの列の前から、マシンごとにホスト呼び出しを実行する。tick の頭から予算を過ぎたら止める（毎 tick 1件目は必ず実行する）。
-     * 予算で打ち切ったら `true`。手を付けていないマシンは持ち越しの列の前に残り、実行したうえでまだ残っているマシン
+     * 予算のために、実行していない呼び出しを残して止めたら `true`（最後の1件で予算を超えただけで、残りがなければ `false`）。
+     * 手を付けていないマシンは持ち越しの列の前に残り、実行したうえでまだ残っているマシン
      * （1台の上限か予算に達した）は、この tick の終わりに列の後ろへ回す（この tick の中では2回処理しない）。
      * JVM の致命的なエラーで抜けるときも、実行していたマシンを列に戻す（`queuedForHostCalls` が立ったまま列にない状態にしない）
      */
@@ -341,21 +343,25 @@ public class MachineScheduler private constructor(
         val start = budget.elapsed()
         val again = ArrayList<Machine>()
         var visited = 0L
+        // 予算が尽きたとき、止めた台に実行していない呼び出しが残っている
+        var leftover = false
         try {
             while (!budget.expired) {
                 val machine = hostCallCarry.removeFirstOrNull() ?: break
                 visited++
                 // 投げたときも列に戻す（空なら、次に回ってきたときに印を下ろす）
                 again += machine
-                if (!machine.runHostCalls(budget)) again.removeAt(again.size - 1)
+                if (!machine.runHostCalls(budget)) again.removeAt(again.size - 1) else if (budget.expired) leftover = true
             }
         } finally {
             tickVisitedMachines.addAndGet(visited)
             hostCallNanos.addAndGet(budget.elapsed() - start)
             hostCallCarry.addAll(again)
         }
-        if (budget.expired) carriedMachines.addAndGet((hostCallCarry.size - again.size).toLong())
-        return budget.expired
+        if (!budget.expired) return false
+        val untouched = hostCallCarry.size - again.size
+        carriedMachines.addAndGet(untouched.toLong())
+        return untouched > 0 || leftover
     }
 
     /**

@@ -429,7 +429,7 @@ internal interface ProcessContext {
     val environment: MachineEnvironment
 
     /**
-     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [call] を次の `tick()` の中でメインスレッドから実行し、その結果を待つ
+     * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [call] を次の `tick()` 以降にメインスレッドから実行し（混んでいれば後の tick。1台の件数の上限とサーバー全体の予算がある。#356）、その結果を待つ
      * （[awaitHost] と同じく、待つ間は CPU と許可を返す）。待機点型は [submitHostCall] で、スレッドを持たずに待つ（#358）。
      * ワールド・デバイスに触る処理はこれで行う。[call] の例外は、CPU を取り直してから投げる。
      * マシンを止めたとき・このプロセスを止めたとき（[kill]、Ctrl+C）は [ProcessKilledException]（実行していない呼び出しは実行しない）。
@@ -441,7 +441,7 @@ internal interface ProcessContext {
     fun <T> callOnMainThread(call: HostCall<T>): T
 
     /**
-     * [call] を次の `tick()` の中でメインスレッドから実行するよう出し、待たずに返す（#358。[callOnMainThread] のスレッドを持たない形）。
+     * [call] を次の `tick()` 以降にメインスレッドから実行するよう出し（混んでいれば後の tick。#356）、待たずに返す（#358。[callOnMainThread] のスレッドを持たない形）。
      * 待機点型は戻り値の `key` を `StepResult.Wait` に入れて待ち、そろったら [takeHostResult] で結果を受け取る。
      * 取り消しは [callOnMainThread] と同じ（止められたら、まだ列にあるものは実行しない。[closeHostWait] でも取り消す）。
      * 止められていれば [ProcessKilledException]。

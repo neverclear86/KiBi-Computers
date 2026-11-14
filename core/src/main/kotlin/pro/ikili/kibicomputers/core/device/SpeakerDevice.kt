@@ -25,7 +25,7 @@ public fun interface SpeakerListener {
  * スピーカーのデバイス（`kibicomputers:speaker`。#65、ADR 0065）。ケースに付いたビープ（ADR 0044 の接続層へのビープの通知を置き換えた）。
  *
  * メソッド: `beep(frequency: integer, duration-ms: integer) -> boolean`（直接）。値は範囲に丸め、つないだマシンの通知の列に積む
- * だけで待たない。鳴らすのは次の `tick()` の中で、メインスレッドから [listener] を呼ぶ（デバイスは tick を持たない）。
+ * だけで待たない。鳴らすのは次の `tick()` 以降に、メインスレッドから [listener] を呼ぶ（混んでいれば後の tick。#356。デバイスは tick を持たない）。
  * まだ鳴らしていないビープが [MAX_PENDING] 個あるなら捨てて `false`。
  *
  * スレッド: つなぐ・外すのはメインスレッド。`beep` はどのスレッドから呼んでもよい。
@@ -59,7 +59,7 @@ public class SpeakerDevice(private val listener: SpeakerListener) : Device {
     }
 
     /**
-     * ビープを鳴らす（次の `tick()` で [listener] に渡す）。値は範囲に丸める。どのスレッドから呼んでもよい。
+     * ビープを鳴らす（次の `tick()` 以降に [listener] に渡す。混んでいれば後の tick）。値は範囲に丸める。どのスレッドから呼んでもよい。
      * つないでいない・まだ鳴らしていないビープが [MAX_PENDING] 個あるなら捨てて `false`
      */
     public fun beep(frequencyHz: Int, durationMillis: Int): Boolean {

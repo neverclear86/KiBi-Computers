@@ -283,7 +283,7 @@ public class Machine private constructor(
     internal val registry = WaitRegistry()
 
     /**
-     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの TTY に出力がたまったら、次の tick で配るよう印を付ける。
+     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの TTY に出力がたまったら、次の tick 以降に配るよう印を付ける。
      * カーネルの中でオブジェクトの状態を変えるときは、[registry] ではなくこれを使う
      */
     internal val wakeSink: WakeSink = object : WakeSink {
@@ -1223,7 +1223,7 @@ public class Machine private constructor(
 
     /**
      * 再起動する（#49）。動いていれば [stop] と同じく止め、プロセスがすべて終わって [MachineState.STOPPED] になったら、
-     * 次の `tick()` で [MachineHost.onRebootRequested] を呼ぶ（既定の実装は [lastBootConfig] で [boot] する）。
+     * 次の `tick()` 以降に [MachineHost.onRebootRequested] を呼ぶ（通知にもサーバー全体の予算があり、混んでいれば後の tick。既定の実装は [lastBootConfig] で [boot] する）。
      * 起動の途中なら、それを取り消してから同じようにする。どのスレッドから呼んでもよい。待たずに返す。
      * 求めた後に [stop] すると、再起動を取り消す。
      *
@@ -3278,7 +3278,7 @@ public class Machine private constructor(
     // ---- カーネル → 接続層（#44） ----
 
     /**
-     * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
+     * コンソールへ出力する（次の `tick()` 以降に [MachineHost.onConsoleOutput] に渡す。混んでいれば後の tick。#356）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
      * 配っていない分（CR LF にした後のバイト数）が [MachineLimits.MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
      * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）。
@@ -3325,7 +3325,8 @@ public class Machine private constructor(
     }
 
     /**
-     * [callback] を次の `tick()` の中で、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
+     * [callback] を次の `tick()` 以降に、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
+     * 通知にもサーバー全体の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）があり、混んでいれば後の tick に回る（捨てない）。
      * どのスレッドから呼んでもよい。待たない。中で投げた例外はログに出して捨てる（JVM の致命的なエラーは投げる。#674）
      */
     internal fun postHostCallback(callback: Runnable) {
