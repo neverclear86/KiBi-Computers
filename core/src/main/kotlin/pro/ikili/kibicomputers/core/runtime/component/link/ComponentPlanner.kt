@@ -293,6 +293,13 @@ internal class ComponentPlanner private constructor(
                 }
                 imp to ref
             }
+            // コンポーネントの中の core モジュールは、同じ (module, name) の import を2回書けない（Component Model の検証の規則。
+            // wasm-tools も断る）。検証を通ったものには来ないが、来たらインスタンス化の IllegalArgumentException でなく、
+            // 読み込みの失敗にする（#690）
+            val seen = HashSet<Pair<String, String>>()
+            for ((imp, _) in bindings) {
+                if (!seen.add(imp.module to imp.name)) fail("core モジュールが import ${imp.module}.${imp.name} を2回書いている")
+            }
             val step = steps.size
             steps += CoreStep(moduleId, bindings)
             module.exports.associate { it.name to CoreRef.Export(step, it.name, it.kind, it.functionType) }
