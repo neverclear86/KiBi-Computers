@@ -64,7 +64,7 @@ internal class LiftSpec(val core: CoreRef, val function: CanonFunction, val opti
 /** canon lower 1 つ。[callee] を呼ぶ。[instance] はその canon を書いたコンポーネントのインスタンスの番号（呼ぶ側） */
 internal class LowerSpec(val callee: FuncRef, val function: CanonFunction, val options: CanonBinding, val instance: Int)
 
-/** core インスタンス 1 つの作り方。[imports] はモジュールの import（宣言の順）ごとに渡すもの */
+/** core インスタンス 1 つの作り方。[imports] はモジュールの import（宣言の順）ごとに渡すもの。(module, name) は重ならない（#690） */
 internal class CoreStep(val module: Int, val imports: List<Pair<WasmImportDescriptor, CoreRef>>)
 
 /** 一番外のコンポーネントの export */

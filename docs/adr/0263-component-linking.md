@@ -24,6 +24,7 @@
 
 - **core モジュールは、コンポーネントの中の元のバイト列を Endive に渡す。** wasm-tools の検証は関数の本体を除いた写し（ADR 0262 の `ValidationImage`）にしか当てていないので、本体の検証、core モジュールのカスタム セクションの壊れ（名前が UTF-8 でない・長さがあふれる）、コードのセクションの後ろの余り・本体の `end` の後ろの余りは、Endive のパーサーが断る（燃料の計測コードを挿入するときも、挿入の前に元のバイト列を Endive のパーサーで読む）。テスト（`ComponentLinkTest`）で、手で作ったバイト列で確かめた。
 - **同じ中身の core モジュールは 1 つにまとめる**（読み込み・コンパイルは 1 回。インスタンスは別に作る）。
+- **core モジュールの同じ (module, name) の import は断る**（#690）。コンポーネントの中の core モジュールは同じ import を 2 回書けない（Component Model の検証の規則。wasm-tools が `duplicate import name` で断る）。計画でも、種類・型を確かめた後に重なりを確かめて `WasmLoadException` にする（検証を差し替えて通しても、インスタンス化の `IllegalArgumentException` で CRASHED にならないための守り）。インスタンス化の設定（`WasmInstanceConfig`）の、ほかのインスタンスの export の鍵は `(module, name)` の組にする（文字列をつなぐと、U+0000 を含む別々の名前が重なる）。
 - 失敗は `WasmLoadException`（`ProgramCache` が覚えてよい）。検証の途中の割り込みは ADR 0262 のまま `WasmTrapException`（`INTERRUPTED`）で、読み込みの失敗として覚えない。
 
 ### ホスト（`ComponentHost`）

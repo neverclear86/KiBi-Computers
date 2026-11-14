@@ -23,7 +23,8 @@ internal object LinkTesting {
         host: ComponentHost = ComponentHost.NONE,
         metered: Boolean = false,
         runtime: WasmRuntime = this.runtime,
-    ): ComponentProgram = ComponentProgram.load(runtime, wat(text), host, metered, policy = ANY_IMPORT)
+        validate: ((ByteArray) -> Unit)? = null,
+    ): ComponentProgram = ComponentProgram.load(runtime, wat(text), host, metered, policy = ANY_IMPORT, validate = validate)
 
     fun instantiate(program: ComponentProgram, env: LinkEnv = LinkEnv.NONE, fuel: Long = 10_000_000): LinkedComponent =
         LinkedComponent.instantiate(program.plan, env, if (program.metered) WasmSharedFuel(fuel) else null)
