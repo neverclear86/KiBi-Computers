@@ -9,8 +9,10 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.machine.MachineErrorListener
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
+import pro.ikili.kibicomputers.core.machine.report
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -394,16 +396,27 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      * セーブデータ（`PoweredOn`）を書き、外した後の知らせは捨てられる。そのため、ここで電源を切ってから書く。
      * 後で届く知らせは、外したマシンのものなので二重にならない（[onMachineStateChanged] と `ManagedHost.released`）。
      * 状態を読むだけなので軽い（[Machine.state] は volatile。STOPPED のときだけ再起動の待ちをロックで読む）。
+     * 読む順番は [Machine.isRunningOrBooting] と同じで、起動中の印を先に、状態を後に読む（起動用のスレッドは、init を作るときに
+     * `RUNNING` にしてから印を下ろすので、逆に読むと「止まっていて起動中でもない」に見えて、起動し終えたばかりの台の電源を切ってしまう）。
      *
+     * @param errors 外す CRASHED の原因（カーネルの不整合の例外）の出し先。外した後は知らせも tick も届かないので、
+     * 渡さないと原因がどこにも残らない。`null` なら出さない
      * @return マシンを外して電源の状態を変えたら `true`
      */
-    public fun settleStoppedMachine(): Boolean {
+    @JvmOverloads
+    public fun settleStoppedMachine(errors: MachineErrorListener? = null): Boolean {
         val machine = slot.machine ?: return false
+        // 起動中の印を、状態より先に読む（この順番を入れ替えない）
+        val booting = machine.isBooting
         when (machine.state) {
-            MachineState.CRASHED -> host.onStateChanged(machine, MachineState.CRASHED, machine.crashCauseForHost)
+            MachineState.CRASHED -> {
+                val cause = machine.crashCauseForHost
+                if (errors != null) report(errors, "マシンが止まった（カーネルの不整合）", cause ?: IllegalStateException("原因なし"))
+                host.onStateChanged(machine, MachineState.CRASHED, cause)
+            }
             MachineState.STOPPED -> {
                 // 復元の途中・冷えた起動待ちも STOPPED で、知らせを出さない。ここで電源を切ると復元を取り消してしまう
-                if (machine.isRestoring || machine.isBooting || machine.isRebootPending) return false
+                if (booting || machine.isRestoring || machine.isRebootPending) return false
                 host.onStateChanged(machine, MachineState.STOPPED, null)
             }
             else -> return false
@@ -438,7 +451,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
                 fail(ComputerError.CRASHED)
                 setPoweredOn(false)
             }
-            MachineState.STOPPED -> if (!machine.isRebootPending && !machine.isBooting) turnOff()
+            MachineState.STOPPED -> if (!machine.isBooting && !machine.isRebootPending) turnOff()
             else -> {}
         }
     }

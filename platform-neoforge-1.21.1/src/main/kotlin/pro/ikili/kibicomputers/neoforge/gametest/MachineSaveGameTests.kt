@@ -185,6 +185,40 @@ object MachineSaveGameTests {
     }
 
     /**
+     * 止まった台の知らせが届く前にアンロード・FULL でなくなった経路（[ServerMachines.saveForUnload]）が走っても（#698）、
+     * 電源を切った状態で NBT に載る。アンロード中は `setChanged` を呼べない（隣のブロックがチャンクを読み直しうる）ので、
+     * チャンクに `isUnsaved` を付けて書かせる。この1行が抜けると、`PoweredOn=false` がディスクに行かない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun unloadSaveSettlesAStoppedMachine(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            machine.stop()
+            helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+            helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+            // 知らせはまだ届いていない（tick が回っていない）
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
+            chunk.isUnsaved = false
+            ServerMachines.saveForUnload(chunk, listOf(be), adopt = true)
+            helper.assertTrue(!be.computer.poweredOn, "the unload save should power the case off")
+            helper.assertTrue(be.computer.machine == null, "the unload save should release the machine")
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
+            helper.assertTrue(be.wiring.connectedMachine == null, "the unload save should disconnect the wiring")
+            helper.assertTrue(chunk.isUnsaved, "the chunk should be marked unsaved so that PoweredOn=false reaches the disk")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+        }.thenExecuteAfter(3) {
+            helper.assertTrue(be.computer.status == ComputerStatus.OFF && !be.computer.poweredOn, "a late notification should change nothing")
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
      * 本物のアンロードの経路（`ChunkEvent.Unload` → `ChunkMap.save`）: 強制読み込みを外したチャンクのケースは、
      * アンロードで取り出して書かれ、ディスクに行ったチャンクの NBT が書いた世代を指し、印も同じ世代になる
      */
