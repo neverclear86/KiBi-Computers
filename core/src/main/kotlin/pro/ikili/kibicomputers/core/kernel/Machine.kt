@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.device.AttachedDevice
 import pro.ikili.kibicomputers.core.device.DeviceBus
 import pro.ikili.kibicomputers.core.device.DeviceDispatcher
 import pro.ikili.kibicomputers.core.device.DeviceLimits
@@ -2057,15 +2058,23 @@ public class Machine private constructor(
     /**
      * プロセス [pid] に、待たずに積むデバイスの呼び出し（[PendingDeviceCall]、[state]）を作って fd 表に入れ、fd とオブジェクトを返す
      * （読む権利だけ）。カーネルロックの中で呼ぶ。実行に回すのは、ロックを放してから [dispatchPendingDeviceCall] で行う。
-     * そのプロセスの `pending-call` が [DeviceLimits.MAX_PENDING_CALLS] 個あるなら `AGAIN`、fd 表が満杯なら `MFILE`
+     * [countTowardLimit] なら、そのプロセスの `pending-call` が [DeviceLimits.MAX_PENDING_CALLS] 個あるときに `AGAIN`
+     * （`false` は p1 の待機点型の `invoke` が結果を待つ間に持つもの。1プロセスに同時に1つしかないので数えない。#77、ADR 0077）。
+     * fd 表が満杯なら `MFILE`
      */
     @Throws(FsException::class)
-    internal fun openPendingDeviceCallLocked(pid: Int, state: PendingDeviceCall.State): Pair<Int, PendingDeviceCall> {
+    internal fun openPendingDeviceCallLocked(
+        pid: Int,
+        state: PendingDeviceCall.State,
+        countTowardLimit: Boolean = true,
+    ): Pair<Int, PendingDeviceCall> {
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
         val fds = FdTable(process, kernel.objects, wakeSink)
-        val open = fds.entries().values.count { kernel.objects[it.objectId] is PendingDeviceCall }
-        if (open >= DeviceLimits.MAX_PENDING_CALLS) {
-            fsError(Errno.AGAIN, "待たずに積んだデバイスの呼び出しは ${DeviceLimits.MAX_PENDING_CALLS} 個まで")
+        if (countTowardLimit) {
+            val open = fds.entries().values.count { kernel.objects[it.objectId] is PendingDeviceCall }
+            if (open >= DeviceLimits.MAX_PENDING_CALLS) {
+                fsError(Errno.AGAIN, "待たずに積んだデバイスの呼び出しは ${DeviceLimits.MAX_PENDING_CALLS} 個まで")
+            }
         }
         val obj = PendingDeviceCall(state)
         return fds.open(obj, HandleRights.READ) to obj
@@ -2076,12 +2085,22 @@ public class Machine private constructor(
      * 直接のメソッドは、このスレッドで実行してから返る。終わったら [obj] を終わりにして待ち手を起こす（閉じた後なら何もしない）。
      * カーネルロックを持たずに呼ぶ（デバイスのハンドラーを呼ぶため）。払う燃料を返す（まだ実行していないものでなければ 0）。
      * [expectedKind] を渡したら、その種類のデバイスでなければ `detached`（device の fd からの呼び出し。#66。保存した呼び出しは
-     * address だけを持つので、戻したものは照合しない）
+     * address だけを持つので、戻したものは照合しない）。デバイスはここで1回だけ引き、引いたもので [dispatchPendingDeviceCall] に回す
      */
     internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall, expectedKind: String? = null): Long {
         check(!lock.isHeldByCurrentThread) { "カーネルロックを持ってデバイスを呼ばない" }
         val queued = lock.withLockValue { obj.state as? PendingDeviceCall.State.Queued } ?: return 0
-        val device = devices.dispatcher.resolve(queued.address, expectedKind)
+        return dispatchPendingDeviceCall(pid, obj, devices.dispatcher.resolve(queued.address, expectedKind))
+    }
+
+    /**
+     * 呼んだ側が引いたデバイス [device]（`null` = 外れている・種類が違う）で、まだ実行していない [obj] を実行に回す（ほかは上と同じ）。
+     * ここではデバイスを引き直さない: 「メインスレッドのメソッドか」を確かめたデバイスと、実行するデバイスを同じものにするため
+     * （ADR 0066。p1 の待機点型の `invoke` が使う。#77、ADR 0077）
+     */
+    internal fun dispatchPendingDeviceCall(pid: Int, obj: PendingDeviceCall, device: AttachedDevice?): Long {
+        check(!lock.isHeldByCurrentThread) { "カーネルロックを持ってデバイスを呼ばない" }
+        val queued = lock.withLockValue { obj.state as? PendingDeviceCall.State.Queued } ?: return 0
         val started = devices.dispatcher.start(pid, device, queued.method, queued.args) {
             lock.withLockValue { obj.markRunning() }
         }

@@ -178,6 +178,12 @@ kibiWasm {
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:device/bus（#77）の p1 の import を確かめる CLI
+    module("kibi-device-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_device.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // 独自拡張 kibi:computer/power（#306）の p1 の import を確かめる CLI
     module("kibi-power-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_power.c")

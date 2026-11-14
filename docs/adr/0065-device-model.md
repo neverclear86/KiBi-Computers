@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #65（task）。前提: ADR 0043（カーネル）・0044（カーネルと接続層の境界）・0355（表示デバイス）、#271（呼び方「デバイス」）
-- 後続: #66（開いたデバイスからの呼び出しの口、接続数の上限。ADR 0066 で済んだ）、#67（接続・切断のイベント）、#77（WASM に出す）、#54（`/dev/device`。ADR 0054 で済んだ）、
+- 後続: #66（開いたデバイスからの呼び出しの口、接続数の上限。ADR 0066 で済んだ）、#67（接続・切断のイベント）、#77（WASM に出す。ADR 0077 で済んだ）、#54（`/dev/device`。ADR 0054 で済んだ）、
   #94（Lua の `device`）、#129（隣接の検出と登録表）、#153（`BlockCapability` と作者向けの説明）、#326（キー入力のイベント）、
   #81・#82（保存のバイトの形）、#356（サーバー全体の予算）、#224（1.20.1 への移植）
 - 番号は Issue 番号にそろえている
@@ -14,7 +14,7 @@
 - メソッドは **直接（プロセスのスレッド）か、メインスレッド（次の tick の中）** のどちらかで実行する。どちらにするかはデバイスがメソッドごとに選ぶ
 - マシンごとの **`DeviceBus`**（`Machine.devices`）に、接続層がデバイスをつなぐ・外す。一覧は copy-on-write の表で、カーネルロックなしで読む
 - 公開 API は `pro.ikili.kibicomputers.api.device`（`core`。MC 非依存）。他 MOD は `Device` を実装し、メソッドを builder の表で登録する（反射なし）
-- WIT は `kibi:device@0.1.0`（`types`・`bus`）。この Issue では WIT を置くだけで、WASM に出すのは #77
+- WIT は `kibi:device@0.1.0`（`types`・`bus`）。この Issue では WIT を置くだけで、WASM に出すのは #77（ADR 0077。p1 に `bus` を出し、p2・p3 の `bus-poll`・`bus-async` を仮置きした）
 - 画面・キーボード・ケースのビープを、組み込みのデバイス（`kibicomputers:screen`・`kibicomputers:keyboard`・`kibicomputers:speaker`）に移した
 
 ## 識別子と種類（Q1）

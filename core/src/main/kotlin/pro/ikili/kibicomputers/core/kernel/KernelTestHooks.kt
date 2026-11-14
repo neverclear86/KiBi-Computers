@@ -41,6 +41,13 @@ internal class KernelTestHooks {
     @Volatile
     var beforePowerRequest: ((Machine, Int) -> Unit)? = null
 
+    /**
+     * `ProcessContext.beginDeviceInvoke`（#77）で、デバイスを引いた後・実行に回す前（カーネルロックの外。プロセスのスレッド）。
+     * ここでデバイスを付け替えると、引いた後の付け替えを作れる（引き直さないことの確かめ。ADR 0066）
+     */
+    @Volatile
+    var afterDeviceInvokeResolve: ((Machine, Int) -> Unit)? = null
+
     /** `stop()` で、登録を確かめた後・割り込みを送る前（カーネルロックの中） */
     @Volatile
     var stopBeforeInterrupt: ((Machine, Int) -> Unit)? = null

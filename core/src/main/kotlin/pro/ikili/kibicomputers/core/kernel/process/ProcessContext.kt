@@ -461,7 +461,7 @@ internal interface ProcessContext {
      */
     fun listProcesses(): List<ProcessListing>
 
-    // ---- デバイス（#65、ADR 0065。WASM に見せる形は #77） ----
+    // ---- デバイス（#65、ADR 0065。WASM に見せる形は #77、ADR 0077） ----
 
     /** つないでいるデバイスの一覧（WIT の `list-devices`）。待たない。どのスレッドから呼んでもよい */
     fun listDevices(): List<DeviceInfo>
@@ -476,7 +476,7 @@ internal interface ProcessContext {
     /**
      * デバイス [address] のメソッド [method] を [args] で呼び、結果まで待つ（WIT の `invoke`）。燃料を払う（ADR 0065）。
      * 直接のメソッドはこのスレッドで実行する。メインスレッドのメソッドを待てるのは、ブロッキング型（と作っている途中）だけ
-     * （待機点型は [startDeviceCall] で積んで、fd を待つ）。失敗は [DeviceCallException]。カーネルロックを持たずに呼ぶ。
+     * （待機点型は [beginDeviceInvoke] か [startDeviceCall] で積んで、fd を待つ）。失敗は [DeviceCallException]。カーネルロックを持たずに呼ぶ。
      * メインスレッドのメソッドを待つ呼び出しは、[callGuest] の中では [WasmTrapException]（[block] と同じ。#430。直接のメソッドは待たないので呼べる）
      */
     @Throws(DeviceCallException::class, ProcessKilledException::class, WasmTrapException::class)
@@ -528,6 +528,27 @@ internal interface ProcessContext {
      */
     @Throws(FsException::class)
     fun startDeviceCall(fd: Int, method: String, args: List<DeviceValue>): Int
+
+    /**
+     * device の fd [fd] で `invoke` を、止まらずに始める（待機点型の p1 の `invoke`。#77、ADR 0077）。デバイスは1回だけ引き、
+     * 「メインスレッドのメソッドか」の確かめと実行に同じものを使う（ADR 0066）。燃料を払う（[invokeDevice] と同じ）。カーネルロックを持たずに呼ぶ。
+     * - 直接のメソッド（と、外れている・メソッドがない・上限を超えたなど、その場で終わるもの）: その場で実行して [DeviceInvokeStart.Done]。
+     *   `pending-call` も fd も作らない
+     * - メインスレッドのメソッド: [mayWait] が `false` なら積まずに `Done(kernel(again))`。そうでなければ、呼んだプロセスの fd 表に
+     *   `pending-call`（読む権利だけ。`DeviceLimits.MAX_PENDING_CALLS` には数えない）を入れて積み、[DeviceInvokeStart.Waiting]。結果は [takeDeviceCall] で受け取り、呼んだ側が fd を閉じる。
+     *   待つ間の状態はその `pending-call` だけなので、保存できる（#65 の Q6 のとおり、実行中のものは `failed("interrupted")` になる）。
+     *   [callGuest] の中では、[mayWait] に依らず積む前にトラップにする（`WasmTrapException`。ホスト関数の途中は巻き戻せないため。ADR 0073）
+     *
+     * device でなければ `FsException(BADF)`、fd 表が満杯なら `FsException(MFILE)`、止められていれば [ProcessKilledException]
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun beginDeviceInvoke(fd: Int, method: String, args: List<DeviceValue>, mayWait: Boolean): DeviceInvokeStart
+
+    /**
+     * 自分の fd 表で、[key]（`READABLE`）の待ちのオブジェクトを指す `pending-call` の fd（なければ `null`）。
+     * 待機点型の p1 の `invoke` が、巻き直して着いたときに、起こした key から前の呼び出しを引くのに使う（#77）
+     */
+    fun pendingDeviceCallFdOf(key: WaitKey): Int?
 
     /**
      * マシンを止める（`Machine.stop`。#49・#306。ADR 0306）。必ず受け付け、このプロセスも止まるので戻らない

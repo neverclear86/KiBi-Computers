@@ -1,5 +1,11 @@
 package pro.ikili.kibicomputers.core.wasi.p1
 
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.CallError
+import pro.ikili.kibicomputers.core.device.CallResult
+import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.device.DeviceLimits
+import pro.ikili.kibicomputers.core.device.MethodInfo
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.fd.PipeFds
@@ -13,6 +19,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.wasi.WasiUtf8
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import java.nio.ByteBuffer
@@ -46,6 +53,11 @@ import java.nio.charset.CodingErrorAction
  *   `fs-usage` は `{ total @0, used @8, available @16, total-entries.tag @24, total-entries.some @28, used-entries @32 }`（40 / 8）
  * - `list<disk-info>` の結果（`list-disks`）: `{ ptr @0, len @4 }`（8 / 4）。`disk-info` は
  *   `{ source @0/@4, capacity-bytes @8, max-entries @16, mount-point.tag @20, mount-point.ptr @24, mount-point.len @28 }`（32 / 8。#453）
+ * - `kibi:device`（#77、ADR 0077）の `value`: `{ tag: u8 @0, payload @8 }`（16 / 8。判別子は none=0・integer=1・float=2・boolean=3・text=4・bytes=5 で、
+ *   `event-value` とは番号が違う。ADR 0065）。`call-error`: `{ tag: u8 @0, payload @4 }`（12 / 4。`kernel` は error-code の u8、
+ *   `bad-arguments`・`failed` は string）。`result<list<value>, call-error>`・`result<device, call-error>`・`result<pending-call, call-error>`:
+ *   `{ tag @0, payload @4 }`（16 / 4）。`option<result<list<value>, call-error>>`: `{ tag @0, result @4 }`（20 / 4）。
+ *   `device-info`: `{ address @0/@4, kind @8/@12 }`（16 / 4）。`method-info`: `{ name @0/@4, main-thread: u8 @8 }`（12 / 4）
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
@@ -136,6 +148,41 @@ internal object P1Canonical {
     const val VALUE_BOOLEAN: Int = 2
     const val VALUE_TEXT: Int = 3
     const val VALUE_BYTES: Int = 4
+
+    /** `kibi:device/types` の `value` の判別子（`event-value` の [VALUE_INTEGER] などとは番号が違う。ADR 0065） */
+    const val DEVICE_VALUE_NONE: Int = 0
+    const val DEVICE_VALUE_INTEGER: Int = 1
+    const val DEVICE_VALUE_FLOAT: Int = 2
+    const val DEVICE_VALUE_BOOLEAN: Int = 3
+    const val DEVICE_VALUE_TEXT: Int = 4
+    const val DEVICE_VALUE_BYTES: Int = 5
+
+    /** `kibi:device/types` の `value` の大きさ・align */
+    const val DEVICE_VALUE_SIZE: Int = 16
+    const val DEVICE_VALUE_ALIGN: Int = 8
+
+    /** `kibi:device/types` の `call-error` の判別子 */
+    const val CALL_ERROR_KERNEL: Int = 0
+    const val CALL_ERROR_DETACHED: Int = 1
+    const val CALL_ERROR_NO_SUCH_METHOD: Int = 2
+    const val CALL_ERROR_BAD_ARGUMENTS: Int = 3
+    const val CALL_ERROR_FAILED: Int = 4
+
+    /** `result<T, call-error>`（`T` は `list<value>`・`device`・`pending-call`）の大きさ・align */
+    const val CALL_RESULT_SIZE: Int = 16
+    const val CALL_RESULT_ALIGN: Int = 4
+
+    /** `option<result<list<value>, call-error>>`（`take`）の大きさ・align */
+    const val TAKE_RESULT_SIZE: Int = 20
+    const val TAKE_RESULT_ALIGN: Int = 4
+
+    /** `device-info` の大きさ・align */
+    const val DEVICE_INFO_SIZE: Int = 16
+    const val DEVICE_INFO_ALIGN: Int = 4
+
+    /** `method-info` の大きさ・align */
+    const val METHOD_INFO_SIZE: Int = 12
+    const val METHOD_INFO_ALIGN: Int = 4
 
     /**
      * `list<string>` を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `INVAL`、要素のバイト数が [maxBytes] の外なら中身を読まずに `INVAL`、
@@ -448,6 +495,197 @@ internal object P1Canonical {
             val (mp, ml) = lowerBytes(memory, realloc, utf8(point))
             memory.writeI32(at + 24, mp)
             memory.writeI32(at + 28, ml)
+        }
+        memory.writeI32(retPtr, listPtr)
+        memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    // ---- kibi:device（#77、ADR 0077） ----
+
+    /**
+     * `kibi:device` の引数の `list<value>` を読む。確かめる順は: [ptr] の align 8（違えば長さ 0 でもトラップ。#430）→ [len] が
+     * [DeviceLimits.MAX_VALUES] を超えたら要素を読まずに `TOOBIG` → 配列の範囲（外なら `FAULT`）→ 各要素の判別子（0..5 の外なら `INVAL`）と
+     * text・bytes の長さの合計（[DeviceLimits.MAX_PAYLOAD_BYTES] を超えたら中身を読まずに `TOOBIG`）→ 各要素の中身（範囲外なら `FAULT`、
+     * text が正しい UTF-8 でなければ `INVAL`）。`boolean` は 0 でなければ true（Canonical ABI の lift と同じ）。
+     * 上限の値と返すコードは `DeviceDispatcher.start` と同じ。ホストが読むのは最大で 32 × 16 + 64 KiB バイト
+     */
+    @Throws(FsException::class)
+    fun liftDeviceValues(memory: WasmMemory, ptr: Int, len: Int): List<DeviceValue> {
+        checkListAlign(ptr, DEVICE_VALUE_ALIGN)
+        val count = u32(len)
+        if (count > DeviceLimits.MAX_VALUES) fsError(Errno.TOOBIG, "引数は ${DeviceLimits.MAX_VALUES} 個まで（$count）")
+        if (!P1.inBounds(memory, ptr, count * DEVICE_VALUE_SIZE)) fsError(Errno.FAULT, "list の範囲が線形メモリの外")
+        val n = count.toInt()
+        var payload = 0L
+        for (i in 0 until n) {
+            val at = ptr + i * DEVICE_VALUE_SIZE
+            when (val tag = memory.readU8(at)) {
+                DEVICE_VALUE_TEXT, DEVICE_VALUE_BYTES -> payload += u32(memory.readI32(at + 12))
+                DEVICE_VALUE_NONE, DEVICE_VALUE_INTEGER, DEVICE_VALUE_FLOAT, DEVICE_VALUE_BOOLEAN -> {}
+                else -> fsError(Errno.INVAL, "value の判別子が不正（$tag）")
+            }
+        }
+        if (payload > DeviceLimits.MAX_PAYLOAD_BYTES) {
+            fsError(Errno.TOOBIG, "text・bytes の合計は ${DeviceLimits.MAX_PAYLOAD_BYTES} バイトまで（$payload）")
+        }
+        val out = ArrayList<DeviceValue>(n)
+        for (i in 0 until n) {
+            val at = ptr + i * DEVICE_VALUE_SIZE
+            val tag = memory.readU8(at)
+            out += when (tag) {
+                DEVICE_VALUE_NONE -> DeviceValue.none()
+                DEVICE_VALUE_INTEGER -> DeviceValue.of(memory.readI64(at + 8))
+                DEVICE_VALUE_FLOAT -> DeviceValue.of(java.lang.Double.longBitsToDouble(memory.readI64(at + 8)))
+                DEVICE_VALUE_BOOLEAN -> DeviceValue.of(memory.readU8(at + 8) != 0)
+                else -> {
+                    val p = memory.readI32(at + 8)
+                    val l = u32(memory.readI32(at + 12))
+                    if (!P1.inBounds(memory, p, l)) fsError(Errno.FAULT, "value の中身が線形メモリの外")
+                    val bytes = memory.read(p, l.toInt())
+                    if (tag == DEVICE_VALUE_TEXT) DeviceValue.of(decodeUtf8(bytes)) else DeviceValue.of(bytes)
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * `result<list<value>, call-error>`（`invoke`）を [retPtr] に書く。ok なら、場所を Canonical ABI の lower の順に [realloc] で取る:
+     * 外側の配列（align 8、16 × 個数）→ 各要素の text・bytes の中身（align 1）を前から。0 個でも呼ぶ。
+     * err の `bad-arguments`・`failed` は、その文字列の場所を取る。使わない所と詰め物は 0
+     */
+    fun lowerCallResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, result: CallResult) {
+        checkStore(memory, retPtr, CALL_RESULT_SIZE, CALL_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(CALL_RESULT_SIZE))
+        writeCallResult(memory, realloc, retPtr, result)
+    }
+
+    /** `option<result<list<value>, call-error>>`（`take`）を [retPtr] に書く。[result] が `null` なら none（中の書き方は [lowerCallResult]） */
+    fun lowerTakeResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, result: CallResult?) {
+        checkStore(memory, retPtr, TAKE_RESULT_SIZE, TAKE_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(TAKE_RESULT_SIZE))
+        if (result == null) return
+        memory.writeU8(retPtr, 1)
+        writeCallResult(memory, realloc, retPtr + 4, result)
+    }
+
+    /** `result<device, call-error>`・`result<pending-call, call-error>` を [retPtr] に書く。[error] が `null` なら ok で [handle]（fd） */
+    fun lowerCallHandleResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, handle: Int, error: CallError?) {
+        checkStore(memory, retPtr, CALL_RESULT_SIZE, CALL_RESULT_ALIGN)
+        memory.write(retPtr, ByteArray(CALL_RESULT_SIZE))
+        if (error == null) {
+            memory.writeI32(retPtr + 4, handle)
+        } else {
+            memory.writeU8(retPtr, 1)
+            writeCallError(memory, realloc, retPtr + 4, error)
+        }
+    }
+
+    /** `result<list<value>, call-error>` を [at] に書く（0 で埋めてあること） */
+    private fun writeCallResult(memory: WasmMemory, realloc: Realloc, at: Int, result: CallResult) {
+        when (result) {
+            is CallResult.Values -> {
+                val values = result.values
+                val listPtr = alloc(memory, realloc, DEVICE_VALUE_ALIGN, allocSize(values.size, DEVICE_VALUE_SIZE))
+                for ((i, v) in values.withIndex()) writeDeviceValue(memory, realloc, listPtr + i * DEVICE_VALUE_SIZE, v)
+                memory.writeI32(at + 4, listPtr)
+                memory.writeI32(at + 8, values.size)
+            }
+            is CallResult.Error -> {
+                memory.writeU8(at, 1)
+                writeCallError(memory, realloc, at + 4, result.error)
+            }
+        }
+    }
+
+    /** `call-error` を [at] に書く（0 で埋めてあること）。`bad-arguments`・`failed` の文字列の場所は [realloc] で取る */
+    private fun writeCallError(memory: WasmMemory, realloc: Realloc, at: Int, error: CallError) {
+        when (error) {
+            is CallError.Kernel -> {
+                memory.writeU8(at, CALL_ERROR_KERNEL)
+                memory.writeU8(at + 4, KibiErrors.code(error.errno))
+            }
+            CallError.Detached -> memory.writeU8(at, CALL_ERROR_DETACHED)
+            CallError.NoSuchMethod -> memory.writeU8(at, CALL_ERROR_NO_SUCH_METHOD)
+            is CallError.BadArguments -> writeTaggedString(memory, realloc, at, CALL_ERROR_BAD_ARGUMENTS, error.message)
+            is CallError.Failed -> writeTaggedString(memory, realloc, at, CALL_ERROR_FAILED, error.message)
+        }
+    }
+
+    private fun writeTaggedString(memory: WasmMemory, realloc: Realloc, at: Int, tag: Int, value: String) {
+        val (p, l) = lowerBytes(memory, realloc, utf8(value))
+        memory.writeU8(at, tag)
+        memory.writeI32(at + 4, p)
+        memory.writeI32(at + 8, l)
+    }
+
+    /** `value` を [at] に書く（詰め物も 0 にする） */
+    private fun writeDeviceValue(memory: WasmMemory, realloc: Realloc, at: Int, v: DeviceValue) {
+        memory.write(at, ByteArray(DEVICE_VALUE_SIZE))
+        when (v.type) {
+            DeviceValue.Type.NONE -> memory.writeU8(at, DEVICE_VALUE_NONE)
+            DeviceValue.Type.INTEGER -> {
+                memory.writeU8(at, DEVICE_VALUE_INTEGER)
+                memory.writeI64(at + 8, v.asLong())
+            }
+            DeviceValue.Type.FLOAT -> {
+                memory.writeU8(at, DEVICE_VALUE_FLOAT)
+                memory.writeI64(at + 8, java.lang.Double.doubleToRawLongBits(v.asDouble()))
+            }
+            DeviceValue.Type.BOOLEAN -> {
+                memory.writeU8(at, DEVICE_VALUE_BOOLEAN)
+                memory.writeU8(at + 8, if (v.asBoolean()) 1 else 0)
+            }
+            DeviceValue.Type.TEXT -> {
+                val (p, l) = lowerBytes(memory, realloc, utf8(v.asText()))
+                memory.writeU8(at, DEVICE_VALUE_TEXT)
+                memory.writeI32(at + 8, p)
+                memory.writeI32(at + 12, l)
+            }
+            DeviceValue.Type.BYTES -> {
+                val (p, l) = lowerBytes(memory, realloc, v.bytesUnsafe())
+                memory.writeU8(at, DEVICE_VALUE_BYTES)
+                memory.writeI32(at + 8, p)
+                memory.writeI32(at + 12, l)
+            }
+        }
+    }
+
+    /** `device-info`（`info`）を [retPtr] に書く。address → kind の順に [realloc] で場所を取る */
+    fun lowerDeviceInfo(memory: WasmMemory, realloc: Realloc, retPtr: Int, info: DeviceInfo) {
+        checkStore(memory, retPtr, DEVICE_INFO_SIZE, DEVICE_INFO_ALIGN)
+        writeDeviceInfo(memory, realloc, retPtr, info)
+    }
+
+    private fun writeDeviceInfo(memory: WasmMemory, realloc: Realloc, at: Int, info: DeviceInfo) {
+        val (ap, al) = lowerBytes(memory, realloc, utf8(info.address))
+        memory.writeI32(at, ap)
+        memory.writeI32(at + 4, al)
+        val (kp, kl) = lowerBytes(memory, realloc, utf8(info.kind))
+        memory.writeI32(at + 8, kp)
+        memory.writeI32(at + 12, kl)
+    }
+
+    /** `list<device-info>`（`list-devices`）を [retPtr] に書く。外側の配列（align 4、16 × 件数）→ 要素ごとに address → kind の順に場所を取る */
+    fun lowerDeviceInfoList(memory: WasmMemory, realloc: Realloc, retPtr: Int, entries: List<DeviceInfo>) {
+        checkStore(memory, retPtr, LIST_RESULT_SIZE, LIST_RESULT_ALIGN)
+        val listPtr = alloc(memory, realloc, DEVICE_INFO_ALIGN, allocSize(entries.size, DEVICE_INFO_SIZE))
+        for ((i, e) in entries.withIndex()) writeDeviceInfo(memory, realloc, listPtr + i * DEVICE_INFO_SIZE, e)
+        memory.writeI32(retPtr, listPtr)
+        memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    /** `list<method-info>`（`methods`）を [retPtr] に書く。外側の配列（align 4、12 × 件数）→ 要素ごとに name の場所を取る。詰め物は 0 */
+    fun lowerMethodInfoList(memory: WasmMemory, realloc: Realloc, retPtr: Int, entries: List<MethodInfo>) {
+        checkStore(memory, retPtr, LIST_RESULT_SIZE, LIST_RESULT_ALIGN)
+        val listPtr = alloc(memory, realloc, METHOD_INFO_ALIGN, allocSize(entries.size, METHOD_INFO_SIZE))
+        for ((i, e) in entries.withIndex()) {
+            val at = listPtr + i * METHOD_INFO_SIZE
+            memory.write(at, ByteArray(METHOD_INFO_SIZE))
+            val (p, l) = lowerBytes(memory, realloc, utf8(e.name))
+            memory.writeI32(at, p)
+            memory.writeI32(at + 4, l)
+            memory.writeU8(at + 8, if (e.mainThread) 1 else 0)
         }
         memory.writeI32(retPtr, listPtr)
         memory.writeI32(retPtr + 4, entries.size)

@@ -1412,6 +1412,45 @@ internal class ProcessRunner(private val machine: Machine) {
             return callFd
         }
 
+        override fun beginDeviceInvoke(fd: Int, method: String, args: List<DeviceValue>, mayWait: Boolean): DeviceInvokeStart {
+            checkThread()
+            val handle = deviceHandleOf(fd)
+            // デバイスを引くのはここの1回だけ（ADR 0066）。確かめと実行に同じものを使う
+            val device = machine.devices.dispatcher.resolve(handle.address, handle.kind)
+            hooks.afterDeviceInvokeResolve?.invoke(machine, rt.pid)
+            if (device?.methods?.find(method)?.mainThread != true) {
+                // 直接のメソッドと、その場で失敗するもの（外れた・メソッドがない・上限）: pending-call を作らずに返す
+                val started = machine.devices.dispatcher.start(rt.pid, device, method, args)
+                payDeviceFuel(started.fuel)
+                check(started.future.isDone) { "直接の呼び出しが終わらずに返った" }
+                val result = DeviceDispatcher.resultOf(started.future)
+                if (result is CallResult.Values) payDeviceFuel(DeviceLimits.payloadBytes(result.values) * DeviceLimits.FUEL_PER_BYTE)
+                return DeviceInvokeStart.Done(result)
+            }
+            // メインスレッドのメソッドは結果を待つ（待機点型は巻き戻し、ブロッキング型は block で待つ）。
+            // callGuest の中ではホスト関数の途中で巻き戻すことになるので、mayWait に依らず pending-call を積む前にトラップにする（ADR 0073）
+            checkNotInGuestCall("beginDeviceInvoke")
+            if (!mayWait) return DeviceInvokeStart.Done(CallResult.Error(CallError.Kernel(Errno.AGAIN)))
+            val (callFd, obj) = lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                machine.openPendingDeviceCallLocked(
+                    rt.pid,
+                    PendingDeviceCall.State.Queued(handle.address, method, args.toList()),
+                    countTowardLimit = false,
+                )
+            }
+            payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj, device))
+            return DeviceInvokeStart.Waiting(callFd, WaitKey(obj.id, WaitCondition.READABLE))
+        }
+
+        override fun pendingDeviceCallFdOf(key: WaitKey): Int? {
+            if (key.condition != WaitCondition.READABLE) return null
+            return lock.withLockValue {
+                if (machine.kernel.objects[key.objectId] !is PendingDeviceCall) return@withLockValue null
+                rt.process.handles.entries().entries.firstOrNull { it.value.objectId == key.objectId }?.key
+            }
+        }
+
         override fun deviceInfo(fd: Int): DeviceInfo = deviceHandleOf(fd).info
 
         override fun deviceMethods(fd: Int): List<MethodInfo> {

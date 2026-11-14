@@ -403,12 +403,17 @@ class KibiWitTableTest {
     }
 
     @Test
-    fun `kibi_deviceはWITを置くだけで、p1にはまだ出さない`() {
+    fun `kibi_deviceはbusだけをp1に出し、typesとp2・p3のinterfaceは出さない`() {
         val device = derived().filter { it.first.startsWith("kibi:device/") }.toSet()
         assertTrue(("kibi:device/bus@0.1.0" to "list-devices") in device, device.toString())
-        assertTrue(("kibi:device/bus@0.1.0" to "[method]pending-call.take") in device, device.toString())
-        // WASM に出すのは #77。それまでは p1 の表に入れない（入れたら、上の p1 の検査が対象にする）
-        assertFalse(WasiP1Kibi.modules.any { it.startsWith("kibi:device/") })
+        assertTrue(("kibi:device/bus-poll@0.1.0" to "subscribe") in device, device.toString())
+        assertTrue(("kibi:device/bus-async@0.1.0" to "invoke") in device, device.toString())
+        assertEquals(setOf("kibi:device/bus@0.1.0"), WasiP1Kibi.modules.filter { it.startsWith("kibi:device/") }.toSet())
+        // 止まりうるのは invoke だけ（#77。ADR 0077）
+        assertEquals(
+            setOf("kibi:device/bus@0.1.0.[method]device.invoke"),
+            WasiP1.WAIT_IMPORTS.filter { it.startsWith("kibi:device/") }.toSet(),
+        )
     }
 
     private companion object {

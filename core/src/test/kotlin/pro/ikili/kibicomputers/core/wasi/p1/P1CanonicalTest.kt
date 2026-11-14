@@ -5,6 +5,12 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.CallError
+import pro.ikili.kibicomputers.core.device.CallResult
+import pro.ikili.kibicomputers.core.device.DeviceInfo
+import pro.ikili.kibicomputers.core.device.DeviceLimits
+import pro.ikili.kibicomputers.core.device.MethodInfo
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
@@ -13,6 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ExitReason
 import pro.ikili.kibicomputers.core.kernel.process.ExitStatus
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
 import pro.ikili.kibicomputers.core.kernel.vfs.FsUsage
@@ -699,5 +706,359 @@ class P1CanonicalTest {
         // align 8 に揃っていない配列の場所はトラップ
         val four = P1Canonical.Realloc { _, _ -> 0x1004 }
         assertThrows<WasmTrapException> { P1Canonical.lowerDiskListResult(m, four, 0x100, one) }
+    }
+
+    // ---- kibi:device（#77、ADR 0077） ----
+
+    private fun filled(): WasmMemory = FakeMemory(1).also {
+        // 前の中身を残さないことを確かめるため、書き先と場所を取る範囲を 0x55 で埋めておく
+        it.write(0x100, ByteArray(0x100) { 0x55 })
+        it.write(0x8000, ByteArray(0x400) { 0x55 })
+    }
+
+    private fun WasmMemory.zeros(at: Int, len: Int) = assertArrayEquals(ByteArray(len), read(at, len), "$at から $len バイトは 0")
+
+    private fun WasmMemory.string(ptrAt: Int): String = String(read(readI32(ptrAt), readI32(ptrAt + 4)), Charsets.UTF_8)
+
+    @Test
+    fun `invokeのokはalign8の配列に16バイトずつ書き、詰め物と使わない所を0にして、場所を配列から中身の順に取る`() {
+        val m = filled()
+        val r = BumpRealloc()
+        val values = listOf(
+            DeviceValue.none(),
+            DeviceValue.of(-5L),
+            DeviceValue.of(1.5),
+            DeviceValue.of(true),
+            DeviceValue.of("héllo"),
+            DeviceValue.of(byteArrayOf(1, 2, 3)),
+            DeviceValue.of(""),
+        )
+        P1Canonical.lowerCallResult(m, r, 0x100, CallResult.Values(values))
+        assertEquals(0, m.readU8(0x100))
+        m.zeros(0x101, 3)
+        val listPtr = m.readI32(0x104)
+        assertEquals(7, m.readI32(0x108))
+        m.zeros(0x10c, 4)
+        assertEquals(0, listPtr % 8)
+        fun at(i: Int) = listPtr + i * P1Canonical.DEVICE_VALUE_SIZE
+        // none: 全部 0
+        m.zeros(at(0), 16)
+        // integer
+        assertEquals(1, m.readU8(at(1)))
+        m.zeros(at(1) + 1, 7)
+        assertEquals(-5L, m.readI64(at(1) + 8))
+        // float
+        assertEquals(2, m.readU8(at(2)))
+        m.zeros(at(2) + 1, 7)
+        assertEquals(1.5, java.lang.Double.longBitsToDouble(m.readI64(at(2) + 8)))
+        // boolean
+        assertEquals(3, m.readU8(at(3)))
+        m.zeros(at(3) + 1, 7)
+        assertEquals(1, m.readU8(at(3) + 8))
+        m.zeros(at(3) + 9, 7)
+        // text・bytes
+        assertEquals(4, m.readU8(at(4)))
+        m.zeros(at(4) + 1, 7)
+        assertEquals("héllo", m.string(at(4) + 8))
+        assertEquals(5, m.readU8(at(5)))
+        m.zeros(at(5) + 1, 7)
+        assertArrayEquals(byteArrayOf(1, 2, 3), m.read(m.readI32(at(5) + 8), m.readI32(at(5) + 12)))
+        assertEquals(4, m.readU8(at(6)))
+        assertEquals(0, m.readI32(at(6) + 12))
+        // cabi_realloc の順: 外側の配列 → 各要素の text・bytes の中身を前から（0 バイトでも呼ぶ）
+        assertEquals(listOf(8 to 16 * 7, 1 to 6, 1 to 3, 1 to 0), r.calls)
+    }
+
+    @Test
+    fun `invokeの空のokも配列の場所を取る`() {
+        val m = filled()
+        val r = BumpRealloc()
+        P1Canonical.lowerCallResult(m, r, 0x100, CallResult.Values(emptyList()))
+        assertEquals(listOf(8 to 0), r.calls)
+        assertEquals(0, m.readU8(0x100))
+        assertEquals(0, m.readI32(0x108))
+    }
+
+    @Test
+    fun `invokeのerrはcall-errorの判別子をオフセット4に書き、bad-argumentsとfailedだけ文字列の場所を取り、使わない所を0にする`() {
+        fun lower(error: CallError): Pair<WasmMemory, List<Pair<Int, Int>>> {
+            val m = filled()
+            val r = BumpRealloc()
+            P1Canonical.lowerCallResult(m, r, 0x100, CallResult.Error(error))
+            assertEquals(1, m.readU8(0x100), "result の判別子は err")
+            m.zeros(0x101, 3)
+            return m to r.calls
+        }
+        val (kernel, kernelCalls) = lower(CallError.Kernel(Errno.TOOBIG))
+        assertEquals(P1Canonical.CALL_ERROR_KERNEL, kernel.readU8(0x104))
+        kernel.zeros(0x105, 3)
+        assertEquals(KibiErrors.code(Errno.TOOBIG), kernel.readU8(0x108))
+        kernel.zeros(0x109, 7)
+        assertEquals(emptyList<Pair<Int, Int>>(), kernelCalls)
+        for ((error, tag) in listOf(CallError.Detached to P1Canonical.CALL_ERROR_DETACHED, CallError.NoSuchMethod to P1Canonical.CALL_ERROR_NO_SUCH_METHOD)) {
+            val (m, calls) = lower(error)
+            assertEquals(tag, m.readU8(0x104))
+            m.zeros(0x105, 11)
+            assertEquals(emptyList<Pair<Int, Int>>(), calls)
+        }
+        for ((message, error, tag) in listOf(
+            Triple("bad あ", CallError.BadArguments("bad あ"), P1Canonical.CALL_ERROR_BAD_ARGUMENTS),
+            Triple("", CallError.Failed(""), P1Canonical.CALL_ERROR_FAILED),
+        )) {
+            val (m, calls) = lower(error)
+            assertEquals(tag, m.readU8(0x104))
+            m.zeros(0x105, 3)
+            assertEquals(message, m.string(0x108))
+            assertEquals(listOf(1 to message.toByteArray(Charsets.UTF_8).size), calls)
+        }
+    }
+
+    @Test
+    fun `takeのnoneは20バイトを全部0にしてcabi_reallocを呼ばず、someは判別子1の後ろにresultを書く`() {
+        val none = filled()
+        val noneRealloc = BumpRealloc()
+        P1Canonical.lowerTakeResult(none, noneRealloc, 0x100, null)
+        none.zeros(0x100, P1Canonical.TAKE_RESULT_SIZE)
+        assertEquals(emptyList<Pair<Int, Int>>(), noneRealloc.calls)
+        // 書き先の外側は触らない
+        assertEquals(0x55, none.readU8(0x100 + P1Canonical.TAKE_RESULT_SIZE))
+
+        val ok = filled()
+        val okRealloc = BumpRealloc()
+        P1Canonical.lowerTakeResult(ok, okRealloc, 0x100, CallResult.Values(listOf(DeviceValue.of("ab"), DeviceValue.of(7L))))
+        assertEquals(1, ok.readU8(0x100))
+        ok.zeros(0x101, 3)
+        assertEquals(0, ok.readU8(0x104), "中の result は ok")
+        ok.zeros(0x105, 3)
+        val listPtr = ok.readI32(0x108)
+        assertEquals(2, ok.readI32(0x10c))
+        ok.zeros(0x110, 4)
+        assertEquals("ab", ok.string(listPtr + 8))
+        assertEquals(7L, ok.readI64(listPtr + 16 + 8))
+        assertEquals(listOf(8 to 32, 1 to 2), okRealloc.calls)
+
+        val err = filled()
+        val errRealloc = BumpRealloc()
+        P1Canonical.lowerTakeResult(err, errRealloc, 0x100, CallResult.Error(CallError.Failed("no")))
+        assertEquals(1, err.readU8(0x100))
+        err.zeros(0x101, 3)
+        assertEquals(1, err.readU8(0x104), "中の result は err")
+        err.zeros(0x105, 3)
+        assertEquals(P1Canonical.CALL_ERROR_FAILED, err.readU8(0x108))
+        err.zeros(0x109, 3)
+        assertEquals("no", err.string(0x10c))
+        assertEquals(listOf(1 to 2), errRealloc.calls)
+    }
+
+    @Test
+    fun `open_startの結果はokならfdをオフセット4に書き、errならcall-errorをオフセット4に書いて、cabi_reallocを呼ぶのは文字列のときだけ`() {
+        val ok = filled()
+        val okRealloc = BumpRealloc()
+        P1Canonical.lowerCallHandleResult(ok, okRealloc, 0x100, 0x1234, null)
+        assertEquals(0, ok.readU8(0x100))
+        ok.zeros(0x101, 3)
+        assertEquals(0x1234, ok.readI32(0x104))
+        ok.zeros(0x108, 8)
+        assertEquals(emptyList<Pair<Int, Int>>(), okRealloc.calls)
+
+        val detached = filled()
+        P1Canonical.lowerCallHandleResult(detached, BumpRealloc(), 0x100, 99, CallError.Detached)
+        assertEquals(1, detached.readU8(0x100))
+        detached.zeros(0x101, 3)
+        assertEquals(P1Canonical.CALL_ERROR_DETACHED, detached.readU8(0x104))
+        detached.zeros(0x105, 11)
+
+        val failed = filled()
+        val failedRealloc = BumpRealloc()
+        P1Canonical.lowerCallHandleResult(failed, failedRealloc, 0x100, 0, CallError.BadArguments("x"))
+        assertEquals(1, failed.readU8(0x100))
+        assertEquals(P1Canonical.CALL_ERROR_BAD_ARGUMENTS, failed.readU8(0x104))
+        failed.zeros(0x105, 3)
+        assertEquals("x", failed.string(0x108))
+        assertEquals(listOf(1 to 1), failedRealloc.calls)
+
+        val kernel = filled()
+        P1Canonical.lowerCallHandleResult(kernel, BumpRealloc(), 0x100, 0, CallError.Kernel(Errno.MFILE))
+        assertEquals(P1Canonical.CALL_ERROR_KERNEL, kernel.readU8(0x104))
+        assertEquals(KibiErrors.code(Errno.MFILE), kernel.readU8(0x108))
+        kernel.zeros(0x109, 7)
+    }
+
+    @Test
+    fun `device-infoはaddress、kindの順に場所を取り、リストは外側の配列から要素ごとに取る`() {
+        val address = "00000000-0000-4000-8000-0000000000b7"
+        val single = filled()
+        val singleRealloc = BumpRealloc()
+        P1Canonical.lowerDeviceInfo(single, singleRealloc, 0x100, DeviceInfo(address, "test:dev"))
+        assertEquals(address, single.string(0x100))
+        assertEquals("test:dev", single.string(0x108))
+        assertEquals(listOf(1 to 36, 1 to 8), singleRealloc.calls)
+
+        val m = filled()
+        val r = BumpRealloc()
+        val second = address.replace('b', 'c')
+        P1Canonical.lowerDeviceInfoList(m, r, 0x100, listOf(DeviceInfo(address, "a:b"), DeviceInfo(second, "")))
+        val listPtr = m.readI32(0x100)
+        assertEquals(2, m.readI32(0x104))
+        assertEquals(0, listPtr % 4)
+        assertEquals(address, m.string(listPtr))
+        assertEquals("a:b", m.string(listPtr + 8))
+        assertEquals(second, m.string(listPtr + 16))
+        assertEquals("", m.string(listPtr + 24))
+        assertEquals(listOf(4 to 32, 1 to 36, 1 to 3, 1 to 36, 1 to 0), r.calls)
+
+        val empty = BumpRealloc()
+        P1Canonical.lowerDeviceInfoList(filled(), empty, 0x100, emptyList())
+        assertEquals(listOf(4 to 0), empty.calls)
+    }
+
+    @Test
+    fun `method-infoは12バイトの要素にnameとmain-threadを書き、詰め物を0にして、要素ごとにnameの場所を取る`() {
+        val m = filled()
+        val r = BumpRealloc()
+        P1Canonical.lowerMethodInfoList(m, r, 0x100, listOf(MethodInfo("echo", false), MethodInfo("", true), MethodInfo("tick", true)))
+        val listPtr = m.readI32(0x100)
+        assertEquals(3, m.readI32(0x104))
+        assertEquals(0, listPtr % 4)
+        fun at(i: Int) = listPtr + i * P1Canonical.METHOD_INFO_SIZE
+        assertEquals("echo", m.string(at(0)))
+        assertEquals(0, m.readU8(at(0) + 8))
+        assertEquals("", m.string(at(1)))
+        assertEquals(1, m.readU8(at(1) + 8))
+        assertEquals("tick", m.string(at(2)))
+        assertEquals(1, m.readU8(at(2) + 8))
+        for (i in 0 until 3) m.zeros(at(i) + 9, 3)
+        assertEquals(listOf(4 to 36, 1 to 4, 1 to 0, 1 to 4), r.calls)
+
+        val empty = BumpRealloc()
+        P1Canonical.lowerMethodInfoList(filled(), empty, 0x100, emptyList())
+        assertEquals(listOf(4 to 0), empty.calls)
+    }
+
+    @Test
+    fun `kibi_deviceのlowerは書き先の誤りをcabi_reallocより先にトラップし、cabi_reallocの返した場所の誤りもトラップ`() {
+        val values = CallResult.Values(listOf(DeviceValue.of("a"), DeviceValue.of("b")))
+        class Case(val name: String, val firstAlloc8or4: Boolean, val lower: (WasmMemory, P1Canonical.Realloc, Int) -> Unit)
+        val cases = listOf(
+            Case("invoke", true) { m, r, p -> P1Canonical.lowerCallResult(m, r, p, values) },
+            Case("take", true) { m, r, p -> P1Canonical.lowerTakeResult(m, r, p, values) },
+            // 最初の場所が align 1 の文字列なので、揃っていない場所は返せない
+            Case("open", false) { m, r, p -> P1Canonical.lowerCallHandleResult(m, r, p, 3, CallError.Failed("x")) },
+            Case("info", false) { m, r, p -> P1Canonical.lowerDeviceInfo(m, r, p, DeviceInfo("a", "b")) },
+            Case("list-devices", true) { m, r, p -> P1Canonical.lowerDeviceInfoList(m, r, p, listOf(DeviceInfo("a", "b"))) },
+            Case("methods", true) { m, r, p -> P1Canonical.lowerMethodInfoList(m, r, p, listOf(MethodInfo("a", false))) },
+        )
+        for (c in cases) {
+            val m = FakeMemory(1)
+            // align 4 に揃っていない書き先と、範囲の外にはみ出す書き先
+            for (retPtr in listOf(0x102, WasmMemory.PAGE_SIZE - 4)) {
+                val r = BumpRealloc()
+                assertThrows<WasmTrapException>(c.name) { c.lower(m, r, retPtr) }
+                assertEquals(emptyList<Pair<Int, Int>>(), r.calls, "${c.name}: 書き先の誤りは cabi_realloc より先")
+            }
+            assertEquals(
+                WasmTrapKind.MEMORY_OUT_OF_BOUNDS,
+                assertThrows<WasmTrapException>(c.name) { c.lower(m, BumpRealloc(outside = true), 0x100) }.kind,
+            )
+            if (c.firstAlloc8or4) assertThrows<WasmTrapException>(c.name) { c.lower(m, BumpRealloc(misalign = true), 0x100) }
+        }
+        // 外側の配列は揃っていて、中身の場所だけが範囲の外
+        var n = 0
+        val second = P1Canonical.Realloc { _, _ -> if (n++ == 1) 0xffff_fff0.toInt() else 0x1000 }
+        assertThrows<WasmTrapException> { P1Canonical.lowerCallResult(FakeMemory(1), second, 0x100, values) }
+    }
+
+    @Test
+    fun `liftDeviceValuesは16バイトの要素を判別子で読み、booleanは0でなければtrue、詰め物は見ない`() {
+        val m = FakeMemory(1)
+        val at = 0x200
+        // 詰め物（判別子の後ろの 7 バイトなど）に 0 以外を入れても読み取りに影響しない
+        m.write(at, ByteArray(16 * 6) { 0x7f })
+        fun put(i: Int, tag: Int) = m.writeU8(at + i * 16, tag)
+        put(0, 0)
+        put(1, 1)
+        m.writeI64(at + 16 + 8, -9L)
+        put(2, 2)
+        m.writeI64(at + 32 + 8, java.lang.Double.doubleToRawLongBits(2.5))
+        put(3, 3)
+        m.writeU8(at + 48 + 8, 2)
+        put(4, 4)
+        m.write(0x400, "hé".toByteArray())
+        m.writeI32(at + 64 + 8, 0x400)
+        m.writeI32(at + 64 + 12, 3)
+        put(5, 5)
+        m.write(0x410, byteArrayOf(9, 8))
+        m.writeI32(at + 80 + 8, 0x410)
+        m.writeI32(at + 80 + 12, 2)
+        val values = P1Canonical.liftDeviceValues(m, at, 6)
+        assertEquals(DeviceValue.Type.NONE, values[0].type)
+        assertEquals(-9L, values[1].asLong())
+        assertEquals(2.5, values[2].asDouble())
+        assertEquals(true, values[3].asBoolean())
+        assertEquals("hé", values[4].asText())
+        assertArrayEquals(byteArrayOf(9, 8), values[5].bytesUnsafe())
+        assertEquals(emptyList<DeviceValue>(), P1Canonical.liftDeviceValues(m, at, 0))
+    }
+
+    @Test
+    fun `liftDeviceValuesの個数が上限を超えたら何も読まずにtoo-big、align8に揃っていなければ長さ0でもトラップ`() {
+        val m = CountingMemory()
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftDeviceValues(m, 0x200, DeviceLimits.MAX_VALUES + 1) }
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftDeviceValues(m, 0x200, -1) }
+        assertEquals(0L, m.bytesRead)
+        // 上限ちょうどは通る（全部 none）
+        assertEquals(DeviceLimits.MAX_VALUES, P1Canonical.liftDeviceValues(m, 0x200, DeviceLimits.MAX_VALUES).size)
+        for (ptr in listOf(0x204, 0x201)) {
+            assertThrows<WasmTrapException> { P1Canonical.liftDeviceValues(m, ptr, 0) }
+            assertThrows<WasmTrapException> { P1Canonical.liftDeviceValues(m, ptr, 1) }
+            assertThrows<WasmTrapException> { P1Canonical.liftDeviceValues(m, ptr, 100) }
+        }
+    }
+
+    @Test
+    fun `liftDeviceValuesは配列の外はfault、判別子が不正ならinvalid、中身の長さの合計が上限を超えたら中身を読まずにtoo-big`() {
+        val m = CountingMemory()
+        // 配列が線形メモリの外
+        assertErrno(Errno.FAULT) { P1Canonical.liftDeviceValues(m, WasmMemory.PAGE_SIZE - 16, 2) }
+        // 判別子が 0..5 の外
+        m.writeU8(0x200, 6)
+        assertErrno(Errno.INVAL) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        m.writeU8(0x200, 0xff)
+        assertErrno(Errno.INVAL) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        // text・bytes の長さの合計が上限を超える（中身は読まない）
+        m.writeU8(0x200, 5)
+        m.writeI32(0x200 + 8, 0)
+        m.writeI32(0x200 + 12, DeviceLimits.MAX_PAYLOAD_BYTES / 2)
+        m.writeU8(0x210, 4)
+        m.writeI32(0x210 + 8, 0)
+        m.writeI32(0x210 + 12, DeviceLimits.MAX_PAYLOAD_BYTES / 2 + 1)
+        val before = m.bytesRead
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftDeviceValues(m, 0x200, 2) }
+        // 読んだのは判別子と長さだけ（要素 2 つで 1 + 4 バイトずつ）
+        assertEquals(10L, m.bytesRead - before)
+        // 長さが u32 で 2^31 以上でも、符号付きにならずに TOOBIG
+        m.writeI32(0x200 + 12, -1)
+        assertErrno(Errno.TOOBIG) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        // 上限ちょうどは通る
+        m.writeI32(0x200 + 12, DeviceLimits.MAX_PAYLOAD_BYTES)
+        assertEquals(DeviceLimits.MAX_PAYLOAD_BYTES, P1Canonical.liftDeviceValues(m, 0x200, 1)[0].bytesUnsafe().size)
+    }
+
+    @Test
+    fun `liftDeviceValuesはtext・bytesの中身が線形メモリの外ならfault、textがUTF-8でなければinvalid`() {
+        val m = FakeMemory(1)
+        m.writeU8(0x200, 5)
+        m.writeI32(0x208, WasmMemory.PAGE_SIZE - 2)
+        m.writeI32(0x20c, 4)
+        assertErrno(Errno.FAULT) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        m.writeU8(0x200, 4)
+        assertErrno(Errno.FAULT) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        // 正しくない UTF-8 は text だけ INVAL。bytes はそのまま読める
+        m.write(0x400, byteArrayOf(0xc3.toByte(), 0x28))
+        m.writeI32(0x208, 0x400)
+        m.writeI32(0x20c, 2)
+        assertErrno(Errno.INVAL) { P1Canonical.liftDeviceValues(m, 0x200, 1) }
+        m.writeU8(0x200, 5)
+        assertArrayEquals(byteArrayOf(0xc3.toByte(), 0x28), P1Canonical.liftDeviceValues(m, 0x200, 1)[0].bytesUnsafe())
     }
 }
