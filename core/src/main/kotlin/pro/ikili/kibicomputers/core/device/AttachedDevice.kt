@@ -34,6 +34,12 @@ internal class AttachedDevice(
     @Volatile
     var attached: Boolean = true
 
+    /**
+     * 接続のイベント `device-attached` を出した（#67、ADR 0067）。立っているものだけ、外したときに `device-detached` を出す。
+     * [DeviceBus] の書き込みのロックの中だけで読み書きする
+     */
+    var announced: Boolean = false
+
     override fun postEvent(kind: String, vararg values: DeviceValue): Boolean {
         if (!attached) return false
         if (DeviceLimits.utf8Length(kind) > DeviceLimits.MAX_EVENT_BYTES) return false

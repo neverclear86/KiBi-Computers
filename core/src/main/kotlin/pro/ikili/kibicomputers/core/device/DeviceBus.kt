@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.device
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import java.util.concurrent.atomic.AtomicLong
 
 /** つないでいるデバイス1つの情報（WIT の `device-info`）。 */
@@ -17,8 +19,11 @@ public data class DeviceInfo(
 /**
  * マシン1台につないでいるデバイスの表（#65、ADR 0065）。`Machine.devices` で使う。address → つないだデバイス。
  *
- * - [attach]・[detach] で表を変える（どのスレッドからも呼べる。待たない）。変えるたびに [generation] が上がる
- *   （ADR 0044 の変更の知らせを置き換えた。ADR 0065）
+ * - [attach]・[detach] で表を変える（どのスレッドからも呼べる。イベントを出すためにカーネルロックを短く取るので、
+ *   カーネルロックを持って呼ばない）。変えるたびに [generation] が上がる（ADR 0044 の変更の知らせを置き換えた。ADR 0065）
+ * - 成功した接続・切断ごとに、カーネルのイベント `device-attached`・`device-detached`（[DeviceEvents]）を1件出す（#67、ADR 0067）。
+ *   表を入れ替えた後、書き込みのロックの中で出すので、同じ address の接続と切断は起きた順に並び、受け手が [list] を読むと新しい表が見える。
+ *   ロックの順は「書き込みのロック → (デバイスのロック) → カーネルロック」
  * - 表は変えるときだけ作り直す変わらない表（copy-on-write）で、呼び出し（プロセスのスレッド）はロックなしで読む。
  *   デバイスは tick を持たないので、tick ごとのコストは台数とデバイス数に比例しない
  * - 画面（[ScreenDevice]）を最初につないだものが [primaryScreen]。カーネルのコンソールの出力はそこへ行く
@@ -46,7 +51,7 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
     /** 呼び出しの振り分け */
     internal val dispatcher: DeviceDispatcher = DeviceDispatcher(this)
 
-    /** 表を変えた回数（実行時だけ。#67 が接続・切断のイベントにする） */
+    /** 表を変えた回数（実行時だけ。イベントには載せない。ADR 0067） */
     public val generation: Long get() = generationCounter.get()
 
     /** 最初につないだ画面。なければ `null`（カーネルのコンソールの出力先。なければ `MachineHost.onConsoleOutput`） */
@@ -62,7 +67,10 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
      * [device] を [address] でつなぐ。種類とメソッドの表をここで1回だけ読み、[Device.onAttached] を呼ぶ。
      * もう [limit] 個つないでいたら、何もせずに `false` を返す（表も [generation] も変えない。#66）。
      *
-     * @return つないだら `true`。上限に達していて断ったら `false`
+     * [Device.onAttached] が返った後、まだつないでいれば `device-attached` を1件出す（#67）。[Device.onAttached] の中で出たイベント
+     * （画面の `tty-resize` など）はその前に並ぶ。[Device.onAttached] の中で自分を外したときは出さない。
+     *
+     * @return つないだら `true`。上限に達していて断ったら `false`（どちらもイベントは出さない）
      * @throws IllegalArgumentException address の形が違う・もうその address でつないでいる・種類の形が違う
      */
     public fun attach(address: String, device: Device): Boolean {
@@ -79,9 +87,14 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
             try {
                 device.onAttached(attached)
             } catch (t: Throwable) {
-                // つなげなかったので、表から戻す
+                // つなげなかったので、表から戻す（接続を知らせていないので、切断も出さない）
                 removeLocked(address)
                 throw t
+            }
+            // onAttached の中で自分を外していなければ知らせる（書き込みのロックは再入できるので、外したなら表にない）
+            if (table[address] === attached) {
+                attached.announced = true
+                postLocked(DeviceEvents.ATTACHED, attached)
             }
         }
         return true
@@ -89,13 +102,27 @@ public class DeviceBus internal constructor(internal val machine: Machine) {
 
     /**
      * [address] のデバイスを外し、[Device.onDetached] を呼ぶ。この後、そのデバイスへの呼び出しは `detached` になる。
+     * 接続を知らせたデバイスなら、`device-detached` を1件出す（#67。[Device.onDetached] が例外を投げても出し、例外はそのまま投げる）。
      *
-     * @return 外したら `true`。つないでいなければ `false`
+     * @return 外したら `true`。つないでいなければ `false`（イベントは出さない）
      */
     public fun detach(address: String): Boolean = synchronized(writeLock) {
         val attached = removeLocked(address) ?: return false
-        attached.device.onDetached(attached)
+        try {
+            attached.device.onDetached(attached)
+        } finally {
+            // 外れたのは事実なので、onDetached が投げても出す（ここには post 以外を置かない。元の例外を隠さない）
+            if (attached.announced) postLocked(DeviceEvents.DETACHED, attached)
+        }
         true
+    }
+
+    /**
+     * 接続・切断のイベント [type] を、[attached] の address とつないだときの種類で出す（[writeLock] の中で呼ぶ。ADR 0067）。
+     * キューがない・止まった・閉じたマシンでは、[Machine.postEvent] が捨てるだけ
+     */
+    private fun postLocked(type: String, attached: AttachedDevice) {
+        machine.postEvent(KernelEvent(type, DeviceEvents.SOURCE, listOf(EventValue.Text(attached.address), EventValue.Text(attached.kind))))
     }
 
     /**
