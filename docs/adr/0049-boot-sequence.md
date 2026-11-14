@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #49（task）。前提: ADR 0043（カーネル全体）、0044（MC 層との境界）、0045（プロセスの生成）、0051（VFS）
-- 後続: #99（起動部品の中身と探す順）、#52・#55（起動ディスクのファイルシステム）、#306（停止・再起動のシステムコール。ABI は #73）、#81（戻したマシンの init）、#121（電源ボタン）
+- 後続: #99（起動部品の中身と探す順。ADR 0099 で決めた: 優先する起動ディスクを先に試す `BootConfig.preferredBootDisk`、ドローンなど向けのプログラムだけの起動 `BootConfig.firmwareProgram`）、#52・#55（起動ディスクのファイルシステム）、#306（停止・再起動のシステムコール。ABI は #73）、#81（戻したマシンの init）、#121（電源ボタン）
 - 番号は Issue 番号にそろえている
 
 ## 決めたこと（要約）
@@ -74,7 +74,7 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
 
 | 場面 | メッセージ |
 | --- | --- |
-| 起動を始めた | `kibi: booting from disk <識別子>` |
+| 起動を始めた | `kibi: booting from disk <識別子>`（起動部品のプログラムだけの起動は `kibi: booting from firmware`。#99、ADR 0099） |
 | `NO_FIRMWARE` | `kibi: no boot firmware` |
 | `NO_BOOT_DISK` | `kibi: no bootable disk` |
 | `NO_INIT` | `kibi: /sbin/init not found` |

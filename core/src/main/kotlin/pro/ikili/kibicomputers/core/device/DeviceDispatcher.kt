@@ -18,7 +18,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * - 直接（`direct`）: 呼んだスレッドでその場で実行する。カーネルロックを持たずに呼ぶ（デバイスは自分のロックで守る）
  * - メインスレッド（`mainThread`）: `Machine.submitHostCall`（#358）で列に積み、`tick()` の中で実行する
- *   （1 tick に `maxHostCallsPerTick` まで）
+ *   （1 tick に `maxHostCallsPerTick` まで。サーバー全体の時間の予算を使い切った tick では、後の tick に回る。#356）
  * - 後で返す（[DeviceCallContext.defer]）: メインスレッドで受け取った [DeviceCompletion] を後の tick で終える。
  *   終わるまでは「実行中」で、ホスト呼び出しの件数は使わない。結果が要らなくなったら取り消す（[DeviceCompletion.isCancelled] が立ち、
  *   `failed("interrupted")` で終える）: マシンを止めた（[cancelAllLocked]）、待っていたプロセスが止められた・pending-call の fd を

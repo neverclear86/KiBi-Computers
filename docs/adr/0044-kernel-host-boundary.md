@@ -42,12 +42,14 @@
 - ビープの値は範囲に丸める: 周波数 20〜20,000 Hz、長さ 1〜5,000 ms（長さの上限は仮の値）
 - `MachineHost` は `fun interface` のまま、`onStateChanged` だけを必須にし、`onConsoleOutput` は何もしない既定の実装を持つ（JVM の default メソッド。Java のクラスでも実装を省ける。#65 で `onBeep` を外し、スピーカーのデバイスに移した）
 - 接続層の例外は捨てる。同じマシンの後の通知と、ほかのマシンには伝えない。捨てる前にログ（`kibicomputers.machine`）に出す: 1台・1種類（状態の通知、コンソール出力、`postHostCallback` の処理、復元の受け手など）につき最初の1回は WARNING、2回目からは DEBUG（スタックトレースなし）。同じ台・同じ種類でも、例外のクラスかメッセージが前と違えば、また WARNING か DEBUG で知らせる。WARNING のスタックトレースは、スケジューラ全体で、投げた場所（種類・例外のクラス・スタックの上3段。JDK と Kotlin の標準ライブラリのフレームは数えず、呼んだ側のフレームを使う）ごとに最初の1回だけ付ける（全台が同じ不具合で投げてもログを埋めない。覚える場所は64個まで。上限に達した後の新しい場所は、スタックトレースを付けず、上限に達したことを書いた WARNING にする。ADR 0088 の「ログと数え口」と同じ考え方）。JVM の致命的なエラー（`StackOverflowError` 以外の `VirtualMachineError`）は捨てずに `tick()` の外へ投げる（`MachineRestore.step`・`PendingHostCall` と同じ。#674）。その tick でまだ配っていないマシンと、投げたマシンの残りの通知は、次の tick に回す（通知の列に積み直す。`tick()` の呼び手が続けても、通知が止まったままにならない）
+- 通知の配布にも、サーバー全体の tick ごとの時間の予算がかかる（予算の半分まで。マシンの単位で、1台の通知の途中では切らない。#356、ADR 0356）
 - 停止はこれまでどおり `onStateChanged(STOPPED / CRASHED)` で知らせる
 
 ## ホスト呼び出し（ワールド・デバイスの操作）
 
 - プロセスのスレッドはワールドに触れない。触る処理は `HostCall` にして `Machine.submitHostCall` で列に積み、`tick()` の中でメインスレッドが実行する。プロセスは `ProcessContext.callOnMainThread(call)` で、CPU と許可を返して結果を待つ（`awaitHost` の上に作る。ADR 0043）
 - 1 tick に1台が実行するのは `MachineConfig.maxHostCallsPerTick`（仮に 64）まで。残りは出した順に次の tick へ。`tick()` は呼び出しを待つマシンだけを見る（通知と同じ形。台数によらない）
+- これに重ねて、サーバー全体の tick ごとの時間の予算（`SchedulerConfig.mainThreadBudgetNanos`。仮に 5 ms）がかかる。予算を使い切った tick では、残りのマシンを次の tick に持ち越し、マシンの間は巡回して配る。呼んだ側は今と同じ形で待つ（断らない・捨てない）。JVM の致命的なエラーで `tick()` の外へ抜けても、実行していたマシンは持ち越しの列に戻す（#356、ADR 0356）
 - 呼び出しの例外は、CPU を取り直してからプロセスに投げる
 - マシンを止める（`stop()`・不整合で `CRASHED`）と、まだ実行していない呼び出しは実行せずに `ProcessKilledException` で終える。止めている途中・`CRASHED`・スケジューラを閉じた後に出された呼び出しも同じ。止められたプロセス（停止の印が立っている）は、マシンが `STOPPED` に戻った後でも呼び出しを出さない
 - `HostCall` と `callOnMainThread` は `internal`。接続層が使うのは、ABI 層が中で呼ぶ接続層の実装（デバイスの操作など。#65・#77）で、接続層が `HostCall` を直接作ることはない

@@ -138,7 +138,10 @@ public class MachineConfig private constructor(builder: Builder) {
     /** プロセスの数の上限（終わっていないプロセスと、親が刈り取っていないゾンビの合計。仮: 64。#46） */
     public val maxProcesses: Int = builder.maxProcesses
 
-    /** 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ */
+    /**
+     * 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ。
+     * サーバー全体の時間の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）は、これに重ねてかかる
+     */
     public val maxHostCallsPerTick: Int = builder.maxHostCallsPerTick
 
     /**
@@ -280,7 +283,7 @@ public class Machine private constructor(
     internal val registry = WaitRegistry()
 
     /**
-     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの TTY に出力がたまったら、次の tick で配るよう印を付ける。
+     * オブジェクトの操作に渡す知らせ口。[registry] に渡し、コンソールの TTY に出力がたまったら、次の tick 以降に配るよう印を付ける。
      * カーネルの中でオブジェクトの状態を変えるときは、[registry] ではなくこれを使う
      */
     internal val wakeSink: WakeSink = object : WakeSink {
@@ -1220,7 +1223,7 @@ public class Machine private constructor(
 
     /**
      * 再起動する（#49）。動いていれば [stop] と同じく止め、プロセスがすべて終わって [MachineState.STOPPED] になったら、
-     * 次の `tick()` で [MachineHost.onRebootRequested] を呼ぶ（既定の実装は [lastBootConfig] で [boot] する）。
+     * 次の `tick()` 以降に [MachineHost.onRebootRequested] を呼ぶ（通知にもサーバー全体の予算があり、混んでいれば後の tick。既定の実装は [lastBootConfig] で [boot] する）。
      * 起動の途中なら、それを取り消してから同じようにする。どのスレッドから呼んでもよい。待たずに返す。
      * 求めた後に [stop] すると、再起動を取り消す。
      *
@@ -2833,6 +2836,7 @@ public class Machine private constructor(
             val claim = lock.withLockValue {
                 if (!runningSteadyLocked()) return
                 if (cleanup) unmountStaleDisksLocked()
+                val firmwareRoot = kernel.mounts.at(VfsPath.ROOT)?.source == MachineLimits.FIRMWARE_SOURCE
                 for (insertion in inserted.values) {
                     if (insertion.handled) continue
                     val existing = kernel.mounts.bySource(diskSource(insertion.diskId))
@@ -2840,6 +2844,12 @@ public class Machine private constructor(
                         // システムコールでマウントしたものなど
                         insertion.handled = true
                         postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, existing.point.toString())
+                        continue
+                    }
+                    if (firmwareRoot) {
+                        // プログラムだけの起動（ADR 0099）: ディスクは自動でマウントしない。開かず、位置の空の disk-inserted で知らせるだけ
+                        insertion.handled = true
+                        postDiskEventLocked(DiskEvents.INSERTED, insertion.diskId, "")
                         continue
                     }
                     // ほかの持ち主が開いている途中なら飛ばす（その持ち主がマウントせずに外したら積み直される）
@@ -3154,6 +3164,19 @@ public class Machine private constructor(
     }
 
     /**
+     * 起動部品のプログラムを置いた [fs] を `/` にマウントする（起動用のスレッドから。プログラムだけの起動。#99）。
+     * ディスクではないので予約は要らない。取り消されていたら何もせず `false`
+     */
+    internal fun mountFirmwareRoot(fs: FileSystem): Boolean {
+        vfs.checkMountPoint(VfsPath.ROOT)
+        return lock.withLockValue {
+            if (bootCancelled) return@withLockValue false
+            vfs.mountLocked(VfsPath.ROOT, fs, readOnly = true, source = MachineLimits.FIRMWARE_SOURCE)
+            true
+        }
+    }
+
+    /**
      * 空の `/tmp`（[TmpFileSystem]。中身は RAM に数える。#53）を [MachineLimits.TMP_PATH] にマウントする（起動用のスレッドから、根のマウントの後）。
      * 根のディスクの `/tmp` がディレクトリ以外のものなら、マウントせずにその [Errno] を返す（起動は続ける）
      */
@@ -3275,7 +3298,7 @@ public class Machine private constructor(
     // ---- カーネル → 接続層（#44） ----
 
     /**
-     * コンソールへ出力する（次の `tick()` で [MachineHost.onConsoleOutput] に渡す）。どのスレッドから呼んでもよい。
+     * コンソールへ出力する（次の `tick()` 以降に [MachineHost.onConsoleOutput] に渡す。混んでいれば後の tick。#356）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
      * 配っていない分（CR LF にした後のバイト数）が [MachineLimits.MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
      * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）。
@@ -3322,7 +3345,8 @@ public class Machine private constructor(
     }
 
     /**
-     * [callback] を次の `tick()` の中で、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
+     * [callback] を次の `tick()` 以降に、メインスレッドから、ほかの通知と起きた順に呼ぶ（スピーカーのデバイスの音など。#65）。
+     * 通知にもサーバー全体の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）があり、混んでいれば後の tick に回る（捨てない）。
      * どのスレッドから呼んでもよい。待たない。中で投げた例外はログに出して捨てる（JVM の致命的なエラーは投げる。#674）
      */
     internal fun postHostCallback(callback: Runnable) {
@@ -3368,9 +3392,9 @@ public class Machine private constructor(
         // 通知の中で止めるのをやめた（つなぎを外したなど）なら、取っておいた分もここで配る
         if (consoleHold == null) resumeDeferredConsole(out)
         out.flush()
-        // 止めている間は、毎 tick 回ってくる（止めている台だけ。待っている台の負荷は増えない）
+        // 止めている間は、通知を配るたびに積み直す（止めている台だけ。待っている台の負荷は増えない）。予算（#356）で持ち越されない限り毎 tick 回ってくる
         if (consoleHold != null) requestNotify()
-        // TTY に残った出力を、次の tick に見直す（この tick の中では配り直さない）
+        // TTY に残った出力を、次の tick 以降に見直す（この tick の中では配り直さない。混んでいれば予算で後の tick。#356）
         if (recheckTtyOutput) {
             recheckTtyOutput = false
             if (consoleDirty.compareAndSet(false, true)) postNotification(HostNotification.TtyOutput)
@@ -3421,7 +3445,7 @@ public class Machine private constructor(
                 consoleDirty.set(false)
                 if (!tryLockSink()) {
                     // プロセスのスレッドが書く先に書いている最中なら、TTY の出力はそのスレッドが書く（#355）。
-                    // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick に見直す（#351。待つと、出力し続ける台の数に比例して
+                    // メインスレッドはロックを待たず、残ったままの出力がないかを次の tick 以降に見直す（#351。待つと、出力し続ける台の数に比例して
                     // メインスレッドが止まる）。この tick にカーネルのメッセージが来たら、そのときにロックを待って、その目印までを取り出す
                     recheckTtyOutput = true
                     return
@@ -3469,7 +3493,7 @@ public class Machine private constructor(
     // 前の通知で見た、コンソールの TTY の出力の位置（-1 = 見ていない）。メインスレッドだけで使う（#355）
     private var lastSeenTtyWritten = -1L
 
-    // 次の tick の通知で、TTY の出力が残ったままか見直す
+    // 次に通知を配るとき（次の tick 以降）に、TTY の出力が残ったままか見直す
     private var recheckTtyOutput = false
 
     /**
@@ -3477,7 +3501,7 @@ public class Machine private constructor(
      * TTY の出力は、ふつうは書いたプロセスが [pumpConsole] で自分のスレッドで書くので、メインスレッドでは書かない。
      * 前の tick の通知から書き足されずに残っているもの（キー入力のエコー、プロセスが書けなかった分など）だけを取り出す。
      * まだ書き足されているか、TTY に書いたプロセスがまだ書いていない（[consolePumpsReserved]。書き手のスレッドが遅れているだけ。#419）
-     * なら取り出さず、次の tick の通知で見直す
+     * なら取り出さず、次に通知を配るとき（次の tick 以降）に見直す
      */
     private fun drainStaleConsoleOutput(): ByteArray? = lock.withLockValue {
         val id = kernel.consoleTtyId
@@ -3522,8 +3546,9 @@ public class Machine private constructor(
     /**
      * コンソールの出力を配るのを止める（#357）。メインスレッドから呼ぶ。止めている間は、TTY の出力を取り出さないので、
      * TTY がいっぱいになると書き手（プロセス）は待つ。カーネルのメッセージも、書いた順に取っておく。
-     * 止めている間、毎 tick の通知の始めに [listener] の `resume` を呼ぶ。[releaseConsoleOutput] で、取っておいた分を
-     * 次の通知で（`resume` の中で止めるのをやめたなら、その tick のうちに）書いた順に配る。
+     * 止めている間、このマシンに通知を配るたびに、その始めに [listener] の `resume` を呼ぶ（配るたびに積み直すので、ふつうは毎 tick。
+     * メインスレッドの予算（#356）で通知が持ち越された tick には呼ばない）。[releaseConsoleOutput] で、取っておいた分を
+     * 次の通知で（`resume` の中で止めるのをやめたなら、その通知のうちに）書いた順に配る。
      * すでに止めていれば、知らせる先を [listener] に替える
      */
     internal fun holdConsoleOutput(listener: ConsoleHoldListener) {
@@ -3659,8 +3684,9 @@ public class Machine private constructor(
     // ---- メインスレッドでのホスト呼び出し（#44） ----
 
     /**
-     * [call] を次の `tick()` の中でメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
-     * 残りは次の tick へ、出した順に）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
+     * [call] を次の `tick()` 以降にメインスレッドから実行する（1 tick に [MachineConfig.maxHostCallsPerTick] まで。
+     * 残りは次の tick へ、出した順に。サーバー全体の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）を使い切った tick では、
+     * 後の tick に回る。断らない）。プロセスのスレッドからは `ProcessContext.callOnMainThread` で使う。
      * マシンが止めている途中・止まった（CRASHED）とき、スケジューラが閉じているときは、[ProcessKilledException] で終えた future を返す。
      * 実行する前にマシンを止めたときも、同じ例外で終える（実行しない）。
      *
@@ -3684,13 +3710,18 @@ public class Machine private constructor(
         return future
     }
 
-    /** `tick()` の中で、メインスレッドからホスト呼び出しを実行する（ロックの外）。まだ残っていれば `true` */
-    internal fun runHostCalls(): Boolean {
+    /**
+     * `tick()` の中で、メインスレッドからホスト呼び出しを実行する（ロックの外）。まだ残っていれば `true`。
+     * 1 tick に [MachineConfig.maxHostCallsPerTick] 件まで。1件ごとにサーバー全体の予算（[budget]。#356）を確かめ、
+     * 使い切ったらそこで止める（呼んだ時点で1件は実行する）
+     */
+    internal fun runHostCalls(budget: TickBudget): Boolean {
         var ran = 0
         while (ran < config.maxHostCallsPerTick) {
             val pending = lock.withLockValue { hostCalls.removeFirstOrNull() } ?: break
             ran++
             pending.run()
+            if (budget.check()) break
         }
         return lock.withLockValue {
             val remains = hostCalls.isNotEmpty()
@@ -3845,6 +3876,9 @@ internal object MachineLimits {
     /** `/dev`（デバイスファイル。#485）のマウントの `source` */
     internal const val DEV_SOURCE: String = "dev"
 
+    /** プログラムだけで起動したときの根（起動部品のプログラムを置いた読み取り専用の FS。#99、ADR 0099）のマウントの `source` */
+    internal const val FIRMWARE_SOURCE: String = "firmware"
+
     /** `/dev` をマウントする場所 */
     internal val DEV_PATH: VfsPath = VfsPath.parse("/dev")
 
@@ -3913,7 +3947,10 @@ internal interface ConsoleSink {
 
 /** コンソールの出力を止めている相手（#357。[Machine.holdConsoleOutput]） */
 internal fun interface ConsoleHoldListener {
-    /** 止めている間、毎 tick の通知の始めにメインスレッドから呼ぶ。追いついたら中で [Machine.releaseConsoleOutput] を呼んでよい */
+    /**
+     * 止めている間、マシンに通知を配るたびに、その始めにメインスレッドから呼ぶ（ふつうは毎 tick。予算（#356）で通知が持ち越された tick には呼ばない）。
+     * 追いついたら中で [Machine.releaseConsoleOutput] を呼んでよい
+     */
     fun resume()
 }
 

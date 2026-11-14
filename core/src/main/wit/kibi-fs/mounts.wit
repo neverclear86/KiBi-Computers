@@ -19,7 +19,8 @@ interface mounts {
     enum fs-kind {
         /// ホストのディスク（source "disk:<識別子>"）
         disk,
-        /// 同梱の読み取り専用イメージ（source "disk:image:<名前>"。mount の source には使えない）
+        /// 同梱の読み取り専用イメージ（source "disk:image:<名前>"。mount の source には使えない）。
+        /// 起動部品のプログラムだけで起動した台の /（source "firmware"。メモリ上の読み取り専用の FS）もこれ
         image,
         /// メモリ上の /tmp（source "tmp"）
         tmp,

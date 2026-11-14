@@ -36,7 +36,7 @@
 
 ## 各欄の決め方
 
-- `kind` は FS の型からではなく source から決める（`KibiFs.kindOf`）。`disk:image:` → `image`、ほかの `disk:` → `disk`、`tmp` → `tmp`、`dev` → `dev`。知らない source は `disk` に倒す（ホスト関数で例外を投げるとゲストがトラップするため）。Machine が作る source はこの4種だけ
+- `kind` は FS の型からではなく source から決める（`KibiFs.kindOf`）。`disk:image:` → `image`、ほかの `disk:` → `disk`、`tmp` → `tmp`、`dev` → `dev`、`firmware`（ADR 0099。プログラムだけで起動した台の `/`）→ `image`。知らない source は `disk` に倒す（ホスト関数で例外を投げるとゲストがトラップするため）。Machine が作る source はこの5種だけ
 - `read-only` = マウントの `readOnly` ‖ FS の `readOnly`（`Vfs` の `Location.readOnly` と同じ）。FS がつながっていなければマウントの印だけ
 - `id` = `MountEntry.id`（p1 の `filestat.dev` と同じ値）。マウントの祖先の合成ディレクトリは `dev` 0 で、どの `id` にも当たらない
 - `usage` が `none` になるのは、FS がまだつながっていない（起動・復元の途中、`Vfs.attach` の前）、`usage()` が `null`（テスト用の FS など）、一覧を作る間に外れた、のどれか

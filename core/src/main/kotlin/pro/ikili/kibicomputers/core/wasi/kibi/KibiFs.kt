@@ -70,7 +70,8 @@ internal object KibiFs {
 
     /**
      * マウントの source から種類を決める（ADR 0453。ファイルシステムの型からは決めない。つながっていない項目にも同じ規則で決まる）。
-     * `disk:image:` → [Kind.IMAGE]、ほかの `disk:` → [Kind.DISK]、`tmp` → [Kind.TMP]、`dev` → [Kind.DEV]。
+     * `disk:image:` → [Kind.IMAGE]、ほかの `disk:` → [Kind.DISK]、`tmp` → [Kind.TMP]、`dev` → [Kind.DEV]、
+     * `firmware`（起動部品のプログラムだけで起動した台の `/`。メモリ上の読み取り専用の FS。ADR 0099）→ [Kind.IMAGE]。
      * 知らない source は [Kind.DISK] に倒す（例外を投げるとゲストがトラップするため）
      */
     fun kindOf(source: String): Kind = when {
@@ -78,6 +79,7 @@ internal object KibiFs {
         source.startsWith(MachineLimits.DISK_SOURCE_PREFIX) -> Kind.DISK
         source == MachineLimits.TMP_SOURCE -> Kind.TMP
         source == MachineLimits.DEV_SOURCE -> Kind.DEV
+        source == MachineLimits.FIRMWARE_SOURCE -> Kind.IMAGE
         else -> Kind.DISK
     }
 
