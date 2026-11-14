@@ -48,6 +48,7 @@ import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.IdentityHashMap
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
 
@@ -636,11 +637,17 @@ object ServerMachines {
     private fun settleStopped(be: CaseBlockEntity, quiet: Boolean): Boolean = be.settleStopped(quiet)
 
     /**
-     * 取り出した後・写した後のそろえ（[settleStopped]）の前に、取り出した台ごとに呼ぶ（GameTest 用。#698）。待ち・取り出しの間に止まる台を
-     * 作るのに使う。メインスレッドで呼ぶ。本番では `null`
+     * 取り出した後・写した後のそろえ（[settleStopped]）の前に、取り出した台のうち登録のある台にだけ呼ぶフック（GameTest 用。#698）。
+     * 待ち・取り出しの間に止まる台を作るのに使う。メインスレッドで呼ぶ。本番では空。
+     * ケースごとに登録するので、並行する GameTest が互いのフックを上書きしない（#713）。登録した側が必ず外す
      */
-    @Volatile
-    internal var afterCaptureForTest: ((CaseBlockEntity) -> Unit)? = null
+    internal val afterCaptureForTest: MutableMap<CaseBlockEntity, (CaseBlockEntity) -> Unit> = ConcurrentHashMap()
+
+    /** [targets] のうち、[afterCaptureForTest] に登録のある台のフックを呼ぶ。本番では空かどうかを1回見るだけ */
+    private fun runAfterCaptureForTest(targets: List<CaseBlockEntity>) {
+        if (afterCaptureForTest.isEmpty()) return
+        for (be in targets) afterCaptureForTest[be]?.invoke(be)
+    }
 
     // ---- チャンクのアンロード ----
 
@@ -694,7 +701,7 @@ object ServerMachines {
                 Stats.unloadCaptures++
                 Stats.unloadWrites += pending.writes
             }
-            afterCaptureForTest?.let { hook -> for (be in targets) hook(be) }
+            runAfterCaptureForTest(targets)
             // 待ち・取り出しの間に止まった台（別のスレッドで CRASHED になる・ゲストが止める）も、電源を切った状態で NBT に載せる（#698）
             for (be in targets) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
         }
@@ -858,7 +865,7 @@ object ServerMachines {
             }
             if (be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null) saved++
         }
-        afterCaptureForTest?.let { hook -> for (be in running) hook(be) }
+        runAfterCaptureForTest(running)
         // 待ち・取り出しの間に止まった台も、電源を切った状態で NBT に載せる（写しは取らないか、取っても電源が切れているので戻されない。#698）
         for (be in running) settleStopped(be, quiet = false)
         // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
@@ -877,6 +884,7 @@ object ServerMachines {
         demoted.clear()
         promoted.clear()
         restoreQueue.clear()
+        afterCaptureForTest.clear()
         stop(m)
     }
 
