@@ -19,7 +19,7 @@ import pro.ikili.kibicomputers.core.kernel.Machine
  * - それ以外のコンソールの出力（カーネルのメッセージ、キー入力のエコーなど）は、マシンが `tick()` の中で [write] に渡し
  *   （[DeviceBus.primaryScreen] のとき）、メインスレッドで ANSI エスケープシーケンスを解釈して（#61）[display] に書く
  * - 端末からの応答（カーソル位置の問い合わせへの答えなど）は、TTY に流す
- * - [write] で 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick に回し、その間はマシンからの出力を止める
+ * - [write] で 1 tick に処理するセルの数に上限を置く（#357）。超えた分は取っておいて次の tick 以降に回し（マシンへの通知が予算（#356）で持ち越されれば、その分遅れる）、その間はマシンからの出力を止める
  *   （プロセスのスレッドからも書かない。TTY がいっぱいになると、書いたプロセスは空くまで待つ）。マシンをつないでいない間に [write] したものは、
  *   上限なしで全部処理する
  * - 取っておいた分があるときにマシンから外すと（[Device.onDetached]。電源を切ったときなど）、その tick の残りの上限まで書き、
@@ -108,7 +108,7 @@ public class ScreenDevice(public val display: DisplayDevice) : Device {
 
     /**
      * コンソールの出力 [bytes]（TTY を通った UTF-8 のバイト列）を、端末として解釈して [screen] に書く。
-     * この tick の上限を超えた分は取っておき、次の tick から書く（書いた順は変えない）。
+     * この tick の上限を超えた分は取っておき、次の tick 以降に書く（書いた順は変えない。マシンへの通知が予算（#356）で持ち越されれば、その分遅れる）。
      */
     public fun write(bytes: ByteArray): Unit = locked {
         if (bytes.isEmpty()) return@locked

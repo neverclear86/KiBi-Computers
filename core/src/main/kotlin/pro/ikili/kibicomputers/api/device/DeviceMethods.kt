@@ -28,7 +28,8 @@ public class DeviceMethods private constructor(private val entries: Map<String, 
         private val entries = LinkedHashMap<String, Entry>()
 
         /**
-         * メインスレッドで呼ぶメソッドを足す（既定の推奨。ワールドに触ってよい）。呼び出しは次の tick の中で実行する
+         * メインスレッドで呼ぶメソッドを足す（既定の推奨。ワールドに触ってよい）。呼び出しは次の tick 以降に実行する
+         * （混んでいれば後の tick。1台の件数の上限とサーバー全体の予算があるため）
          *
          * @throws IllegalArgumentException 名前が規則に合わない・もう登録してある
          */
