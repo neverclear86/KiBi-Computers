@@ -96,5 +96,17 @@
   "kibicomputers.configuration.keyboard.inputCapacityBytes": "入力を一度に受け取れる量（バイト）",
   "kibicomputers.configuration.keyboard.inputCapacityBytes.tooltip": "キーボードの入力を一度に受け取れる量（バイト）。変えた後に開いたキーボードから効く。",
   "kibicomputers.configuration.keyboard.inputRefillBytesPerTick": "入力の戻る量（バイト/tick）",
-  "kibicomputers.configuration.keyboard.inputRefillBytesPerTick.tooltip": "キーボードの入力の、1 tick ごとに戻る量（バイト）。変えた後に開いたキーボードから効く。"
+  "kibicomputers.configuration.keyboard.inputRefillBytesPerTick.tooltip": "キーボードの入力の、1 tick ごとに戻る量（バイト）。変えた後に開いたキーボードから効く。",
+  "message.kibicomputers.access.denied": "%s のコンピューターです",
+  "message.kibicomputers.access.denied_locked": "このコンピューターの持ち主を読めませんでした。OP だけが使えます",
+  "kibicomputers.configuration.access": "持ち主と権限",
+  "kibicomputers.configuration.access.tooltip": "コンピューターの持ち主と権限。",
+  "kibicomputers.configuration.access.opPermissionLevel": "OP とみなす権限レベル",
+  "kibicomputers.configuration.access.opPermissionLevel.tooltip": "この権限レベル以上のプレイヤーは、ほかの人が持ち主のコンピューターも操作・破壊・管理できる。",
+  "kibicomputers.configuration.access.pendingInviteHours": "保留のメンバーの期限（時間）",
+  "kibicomputers.configuration.access.pendingInviteHours.tooltip": "名前で足したメンバーが、そのプレイヤーがコンピューターを使うのを待つ時間（時間）。過ぎたら取り消す。",
+  "kibicomputers.configuration.access.maxMembers": "メンバーの上限",
+  "kibicomputers.configuration.access.maxMembers.tooltip": "1台のコンピューターのメンバーの数の上限。",
+  "kibicomputers.configuration.access.maxPendingInvites": "保留のメンバーの上限",
+  "kibicomputers.configuration.access.maxPendingInvites.tooltip": "1台のコンピューターの、名前で足してまだ待っているメンバーの数の上限。"
 }

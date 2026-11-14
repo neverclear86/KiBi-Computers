@@ -71,12 +71,15 @@ class CaseMenu private constructor(
 
     override fun clickMenuButton(player: Player, id: Int): Boolean {
         if (id != POWER_BUTTON) return false
+        // 権限はサーバーで確かめる（#131。メンバーから外れた人の押下を受けない）
+        if (blockEntity != null && !blockEntity.checkAccess(player)) return false
         blockEntity?.pressPowerButton()
         return true
     }
 
+    // サーバーでは権限も見る（#131。副作用のない判定。メンバーから外れたら次の操作・tick で閉じる）。クライアントでは blockEntity が null
     override fun stillValid(player: Player): Boolean =
-        blockEntity == null || Container.stillValidBlockEntity(blockEntity, player)
+        blockEntity == null || (Container.stillValidBlockEntity(blockEntity, player) && blockEntity.checkAccess(player))
 
     override fun quickMoveStack(player: Player, index: Int): ItemStack {
         val slot = slots.getOrNull(index) ?: return ItemStack.EMPTY

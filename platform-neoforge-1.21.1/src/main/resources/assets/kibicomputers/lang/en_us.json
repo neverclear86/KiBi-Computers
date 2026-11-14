@@ -96,5 +96,17 @@
   "kibicomputers.configuration.keyboard.inputCapacityBytes": "Input burst (bytes)",
   "kibicomputers.configuration.keyboard.inputCapacityBytes.tooltip": "Burst size of keyboard input a computer accepts, in bytes. Applies to keyboards opened after a change.",
   "kibicomputers.configuration.keyboard.inputRefillBytesPerTick": "Input refill (bytes/tick)",
-  "kibicomputers.configuration.keyboard.inputRefillBytesPerTick.tooltip": "Keyboard input allowance restored per tick, in bytes. Applies to keyboards opened after a change."
+  "kibicomputers.configuration.keyboard.inputRefillBytesPerTick.tooltip": "Keyboard input allowance restored per tick, in bytes. Applies to keyboards opened after a change.",
+  "message.kibicomputers.access.denied": "This computer belongs to %s",
+  "message.kibicomputers.access.denied_locked": "This computer's owner could not be read; only operators can use it",
+  "kibicomputers.configuration.access": "Access",
+  "kibicomputers.configuration.access.tooltip": "Owners and permissions of computers.",
+  "kibicomputers.configuration.access.opPermissionLevel": "Operator permission level",
+  "kibicomputers.configuration.access.opPermissionLevel.tooltip": "Players with at least this permission level can use, break and manage computers owned by others.",
+  "kibicomputers.configuration.access.pendingInviteHours": "Pending member expiry (hours)",
+  "kibicomputers.configuration.access.pendingInviteHours.tooltip": "Hours a member added by name waits for that player to use the computer before it expires.",
+  "kibicomputers.configuration.access.maxMembers": "Max members",
+  "kibicomputers.configuration.access.maxMembers.tooltip": "Maximum number of members of one computer.",
+  "kibicomputers.configuration.access.maxPendingInvites": "Max pending members",
+  "kibicomputers.configuration.access.maxPendingInvites.tooltip": "Maximum number of members added by name that are still waiting, per computer."
 }

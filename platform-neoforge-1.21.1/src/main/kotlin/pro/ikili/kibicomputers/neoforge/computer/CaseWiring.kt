@@ -4,6 +4,7 @@ import com.mojang.logging.LogUtils
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.core.GlobalPos
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.Level
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.core.device.ScreenDevice
@@ -38,8 +39,13 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * @param current ケースの今のマシンを返す関数（[rewire] で、この結線のマシンかを確かめる）。関数自体が `null` なら確かめない（テスト用）。
  *   関数が `null`（ケースがもうマシンを持っていない）を返したときは、この結線のマシンではないので、つなぎ直さない
+ * @param access ケースの持ち主と権限で、プレイヤーがこの結線のデバイス（キーボード）を使えるかを返す関数（#131）。2つ目の引数が
+ *   `true` ならアクセスに数える（保留の昇格。拒んだら知らせる）。`null` なら確かめない（テスト用）
  */
-internal class CaseWiring(private val current: (() -> Machine?)? = null) : MachineHost, MachineWiring.Host<GlobalPos> {
+internal class CaseWiring(
+    private val current: (() -> Machine?)? = null,
+    private val access: ((ServerPlayer, Boolean) -> Boolean)? = null,
+) : MachineHost, MachineWiring.Host<GlobalPos> {
     private val core = MachineWiring(DeviceWiring.registry, this)
 
     private var neighbors: List<GlobalPos> = emptyList()
@@ -60,6 +66,12 @@ internal class CaseWiring(private val current: (() -> Machine?)? = null) : Machi
     /** つなぐときに投げたので、同じ登録の間は試さない候補の数（テスト用） */
     val failedCandidates: Int get() = core.failedCount
     private var speakerAddress: String? = null
+
+    /**
+     * [player] が、このケースにつながったデバイス（キーボード）を使えるか（#131）。[touch] ならアクセスに数え（保留の昇格）、拒んだら
+     * actionbar で知らせる。[touch] でなければ副作用のない確かめ（入力のたび・tick ごと）
+     */
+    fun mayUse(player: ServerPlayer, touch: Boolean): Boolean = access?.invoke(player, touch) ?: true
 
     /** 今つないでいるマシン（テスト用） */
     val connectedMachine: Machine? get() = core.machine

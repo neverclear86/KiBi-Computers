@@ -21,7 +21,10 @@ import java.util.UUID
  * キーボードへの入力のセッション（#360）を、サーバーで管理する。サーバーのメインスレッドからだけ使う。
  *
  * - 入力 GUI はサーバーが開く。キーボードか画面の右クリックがサーバーに届いたら（保護 MOD が右クリックのイベントを
- *   取り消したなら届かない）、距離を確かめてセッションを作り、クライアントに開かせる（[open]）。持ち主と権限は #131
+ *   取り消したなら届かない）、距離を確かめてセッションを作り、クライアントに開かせる（[open]）
+ * - 持ち主と権限（#131、ADR 0131）: キーボードがケースにつながっていれば、そのケースの権限で確かめる。開くとき（アクセスに数え、
+ *   保留を昇格する）と、入力のたび・tick ごと（[isValid]）に見るので、つながっていない間に開いたセッションも、持ち主のあるケースに
+ *   つながったら閉じる。つながっていないキーボードは誰でも開ける（入力の届く先がない）。キーボード自体は持ち主を持たない
  * - 入力のパケットは、そのプレイヤーの開いているセッションからだけ受け付ける（[receive]）。セッションは1人に1つ
  * - 距離を外れた・キーボードが壊れた・別のディメンションに移った・ログアウトした、などで閉じる（tick ごとに見る。
  *   開いているセッションは GUI を開いている人の数だけなので、待っているだけのコンピューターには負荷がかからない）
@@ -63,13 +66,14 @@ object KeyboardSessions {
      * 前のセッションがあれば閉じる。GUI に中身を出す画面は、キーボードがつながったコンピューターの画面（[KeyboardInput.connectedScreen]）、
      * つながっていなければ [screenPos]（右クリックした画面。なければ null）。
      *
-     * @return 開いたセッション。届く距離にない、キーボードがないなら null
+     * @return 開いたセッション。届く距離にない、キーボードがない、つながったケースを使えないなら null
      */
     fun open(player: ServerPlayer, keyboardPos: BlockPos, screenPos: BlockPos?): KeyboardSession? {
         close(player.uuid, notifyClient = true)
         val level = player.serverLevel()
         if (!level.isLoaded(keyboardPos) || !KeyboardInput.canReach(player, keyboardPos)) return null
         val keyboard = level.getBlockEntity(keyboardPos) as? KeyboardBlockEntity ?: return null
+        if (keyboard.wiredTo?.mayUse(player, touch = true) == false) return null
         val tick = tickOf(player)
         val mine = budgets.getOrPut(player.uuid) { HashMap() }
         mine.values.removeIf { it.available(tick) >= it.capacity }
@@ -101,7 +105,7 @@ object KeyboardSessions {
 
     /**
      * [player] から届いた [payload] を、セッションのキーボードに渡す。セッションがない・番号が違う・届く距離にない、
-     * 量の上限を超えた、形が崩れている、などのときは捨てる（距離を外れたなら、セッションも閉じる）。
+     * つながったケースを使えない、量の上限を超えた、形が崩れている、などのときは捨てる（距離を外れた・使えなくなったなら、セッションも閉じる）。
      *
      * @return 配った入力の数。捨てたなら -1
      */
@@ -139,7 +143,9 @@ object KeyboardSessions {
         val player = open.player
         if (player.isRemoved || player.serverLevel() !== open.level || open.keyboard.isRemoved) return false
         if (!open.level.isLoaded(open.pos) || open.level.getBlockEntity(open.pos) !== open.keyboard) return false
-        return KeyboardInput.canReach(player, open.pos)
+        if (!KeyboardInput.canReach(player, open.pos)) return false
+        // つながった先のケースの権限（#131）。副作用のない確かめ
+        return open.keyboard.wiredTo?.mayUse(player, touch = false) != false
     }
 
     private fun close(playerId: UUID, notifyClient: Boolean) {
