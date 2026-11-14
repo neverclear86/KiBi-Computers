@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
@@ -97,6 +98,38 @@ class FuelSliceTest {
             val db = p2.get() - b0
             assertTrue(da >= 1000 && db >= 1000, "偏っている: $da / $db")
             assertTrue(h.scheduler.fuelYields.get() - yields0 >= 6, "譲った回数: ${h.scheduler.fuelYields.get() - yields0}")
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `譲った後にCPUを取り直して燃料が残っていなければ、WAITING_FUELにして燃料を待ったものとして数える`() = timeout(limit) {
+        Harness().use { h ->
+            // ブロッキング型 2 本・1 tick に 4 スライス。最後のスライスを取れなかった側は、譲った後に CPU を取り直して燃料がないと分かり、
+            // スレッドを持ったまま次の tick を待つ。そのときも RUNNING のままにせず、WAITING_FUEL にして fuelBlockingWaits に数える
+            val m = h.machine(fuelPerTick = 400, fuelSlice = 100)
+            val p1 = AtomicInteger()
+            val p2 = AtomicInteger()
+            val a = m.spawnTest(h.program(slowSpin(p1)), runDriver())
+            val b = m.spawnTest(h.program(slowSpin(p2)), runDriver())
+            h.scheduler.tick()
+            eventually(10_000) { p1.get() > 0 && p2.get() > 0 }
+            for (k in 1..4) {
+                val blocking0 = h.scheduler.fuelBlockingWaits.get()
+                val progress0 = p1.get() + p2.get()
+                h.scheduler.tick()
+                // その tick の燃料を使い切ると、燃料を待ったものとして数えられ、2 本とも燃料待ちの列で WAITING_FUEL になる
+                // （起こされたスレッドの起き上がりが遅れると、その tick を片方が使い切り、遅れた側は前の tick の WAITING_FUEL のまま待ち直すので、
+                // 数える回数は tick ごとに 1 か 2）
+                eventuallyDescribe(10_000, {
+                    "tick $k: 2 本とも WAITING_FUEL にならない（${m.stateOf(a)} / ${m.stateOf(b)}、" +
+                        "燃料を待った回数: ${h.scheduler.fuelBlockingWaits.get() - blocking0}）"
+                }) {
+                    p1.get() + p2.get() > progress0 && h.scheduler.fuelBlockingWaits.get() - blocking0 >= 1 &&
+                        m.fuelWaiterCount == 2 && m.lock.withLockValue { m.kernel.fuel <= 0 } &&
+                        m.stateOf(a) == ProcessState.WAITING_FUEL && m.stateOf(b) == ProcessState.WAITING_FUEL
+                }
+            }
             m.stop()
         }
     }

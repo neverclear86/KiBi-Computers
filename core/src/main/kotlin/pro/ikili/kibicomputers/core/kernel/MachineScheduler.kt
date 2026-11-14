@@ -216,7 +216,10 @@ public class MachineScheduler private constructor(
     /** 燃料切れで巻き戻し、スレッドを持たずに燃料を待った回数（数え口。#339） */
     internal val fuelUnwinds = AtomicLong()
 
-    /** 燃料切れで、スレッドを持ったまま燃料を待った回数（数え口。#339） */
+    /**
+     * 燃料切れで、スレッドを持ったまま燃料を待った回数（数え口。#339）。
+     * スレッドを持ったまま譲った（[fuelYields]）後、CPU を取り直したらその tick の燃料が残っていなかった（か一時停止）ときも、ここに数える（#47）
+     */
     internal val fuelBlockingWaits = AtomicLong()
 
     /** 止まりうる関数でない関数の中の燃料切れで、前借りして先へ進めた回数（数え口。#477） */
@@ -232,7 +235,8 @@ public class MachineScheduler private constructor(
      * スライスを使い切り、マシンの燃料がまだ残っている（一時停止でない）のに CPU と許可を返した回数（数え口。#47）。
      * ほかのプロセスに譲ったときと、手持ちを渡した tick が進んだので許可を回したときの両方。
      * 巻き戻して返したものも、スレッドを持ったまま返したものも数える。巻き戻すものは、巻き戻しの費用を引いた後の燃料が正のときだけ数える。
-     * 燃料が残っていない・一時停止のときは [fuelUnwinds]・[fuelBlockingWaits] に数え、ここには数えない
+     * 燃料が残っていない・一時停止のときは [fuelUnwinds]・[fuelBlockingWaits] に数え、ここには数えない。
+     * 譲った後、CPU を取り直したら燃料が残っていなかったものは、ここと [fuelBlockingWaits] の両方に数える
      */
     internal val fuelYields = AtomicLong()
 

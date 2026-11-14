@@ -2414,9 +2414,24 @@ public class Machine private constructor(
     /** 終わっていない燃料待ちがいるか（スライスを使い切ったときに、譲るかを決めるのに使う。#47）。カーネルロックの中で呼ぶ */
     internal fun hasFuelWaitersLocked(): Boolean = fuelWaiters.any { !it.process.state.isTerminal }
 
-    /** 燃料待ちに入れる。カーネルロックの中で呼ぶ */
-    internal fun addFuelWaiterLocked(rt: ProcessRuntime) {
-        if (fuelWaiters.none { it === rt }) fuelWaiters.add(rt)
+    /**
+     * 燃料待ちに入れる。カーネルロックの中で呼ぶ。
+     *
+     * [behindCpu] は、スライスを使い切って CPU を返す前に並ぶ待機点型（[ProcessRuntime.fuelWaitBehindCpu]）。CPU の待ち行列にいたプロセスは、
+     * この後で CPU を取って燃料がないと分かってから並ぶので、そのまま後ろに足すと、使い切った側がいつも先頭になり、次の tick も同じ順で
+     * 起こされる（プロセスの数が 1 tick のスライスの数 - 1 を割り切ると、配分が偏るか飢える。#47）。そこで、[behindCpu] の待ち手は列の後ろに置き、
+     * そうでない待ち手はその前に入れる。次の tick は、CPU の待ち行列にいた順の続きから起こすことになる（ラウンドロビン）
+     */
+    internal fun addFuelWaiterLocked(rt: ProcessRuntime, behindCpu: Boolean = false) {
+        if (fuelWaiters.none { it === rt }) {
+            rt.fuelWaitBehindCpu = behindCpu
+            if (behindCpu) {
+                fuelWaiters.add(rt)
+            } else {
+                val at = fuelWaiters.indexOfFirst { it.fuelWaitBehindCpu }
+                if (at < 0) fuelWaiters.add(rt) else fuelWaiters.add(at, rt)
+            }
+        }
         if (!inDispatcher) {
             inDispatcher = true
             scheduler.dispatcher.add(this)
@@ -2427,8 +2442,9 @@ public class Machine private constructor(
      * 燃料待ちを起こす（燃料があるか、燃料を計測しないプロセスで、一時停止でなければ）。カーネルロックの中で呼ぶ。
      * 起こすだけで燃料は渡さない（渡すのは、起こされたプロセスが CPU を取るとき）。起こした数を返す。
      *
-     * 起こす順は、燃料待ちの列に入った順（FIFO）。スレッドを持たないプロセスは、その順で CPU の待ち行列に並ぶ。
-     * 順をずらさないのは、ずらすと tick をまたぐ順番が実行の様子（巻き戻して譲るたびに起こす回数）で変わり、プロセスが
+     * 起こす順は、燃料待ちの列の順（入った順。ただし、スライスを使い切って巻き戻した待機点型は、CPU の待ち行列にいたプロセスの後ろ。
+     * [addFuelWaiterLocked]）。スレッドを持たないプロセスは、その順で CPU の待ち行列に並ぶ。
+     * 起こすたびに先頭をずらさないのは、ずらすと tick をまたぐ順番が実行の様子（巻き戻して譲るたびに起こす回数）で変わり、プロセスが
      * 1 tick のスライスの数より多いときに配分が偏るため（#47、ADR 0047）
      */
     internal fun wakeFuelWaitersLocked(): Int {
@@ -2442,6 +2458,7 @@ public class Machine private constructor(
             }
             if (!hasFuel && !rt.process.unmetered) continue
             fuelWaiters.remove(rt)
+            rt.fuelWaitBehindCpu = false
             woken++
             if (rt.fuelWaitThreadless) {
                 rt.fuelWaitThreadless = false

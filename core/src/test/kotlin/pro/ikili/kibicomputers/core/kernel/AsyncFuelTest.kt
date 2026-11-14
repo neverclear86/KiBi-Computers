@@ -177,28 +177,51 @@ class AsyncFuelTest {
 
     @Test
     fun `プロセスが1tickのスライスの数より多くても、tickをまたいで全員が同じ回数ずつ動く`() = timeout(limit) {
+        // 1 tick に 4 スライス。計算し続けるプロセスが 5 本（スライスの数より多い）
+        assertRoundRobin(processes = 5, slicesPerTick = 4, ticks = 15)
+    }
+
+    @Test
+    fun `プロセスの数が1tickのスライスの数-1を割り切っても、tickをまたいで全員が同じ回数ずつ動く`() = timeout(limit) {
+        // 3 本・4 スライス（既定の設定）。最後のスライスを使い切った側が燃料待ちの先頭になると、毎 tick 同じ順で 2:1:1 に偏る
+        assertRoundRobin(processes = 3, slicesPerTick = 4, ticks = 15)
+    }
+
+    @Test
+    fun `スライスがfuelPerTickと同じでも、計算し続ける2本が交互に動く`() = timeout(limit) {
+        // 1 tick に 1 スライス。使い切った側が毎 tick 先頭で起こされると、もう 1 本が動けない
+        assertRoundRobin(processes = 2, slicesPerTick = 1, ticks = 10)
+    }
+
+    /**
+     * 計算し続ける待機点型のプロセスを [processes] 本動かし、[ticks] tick の間に動いたスライスの数がそろうかを確かめる（#47）。
+     * 燃料待ちは入った順に起こすが、スライスを使い切って巻き戻した側は CPU の待ち行列にいたプロセスの後ろに回るので、tick をまたいで順番が回る。
+     * スライスを使い切って巻き戻す回数が、そのプロセスが動いたスライスの数
+     */
+    private fun assertRoundRobin(processes: Int, slicesPerTick: Int, ticks: Int) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
-            // 1 tick に 4 スライス。計算し続けるプロセスが 5 本（スライスの数より多い）。燃料待ちを列に入った順（FIFO）に起こすので、
-            // tick をまたいで順番が回る。スライスを使い切って巻き戻す回数が、そのプロセスが動いたスライスの数
-            val m = h.machine(fuelPerTick = 80_000, fuelSlice = 20_000)
+            val slice = 20_000L
+            val m = h.machine(fuelPerTick = slice * slicesPerTick, fuelSlice = slice)
             val runs = ConcurrentHashMap<Int, AtomicInteger>()
             h.scheduler.hooks.beforeFuelUnwound = { _, pid -> runs.computeIfAbsent(pid) { AtomicInteger() }.incrementAndGet() }
-            val spins = List(5) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
-            val ticks = 15
-            // 5 本とも、最初の燃料を待つところまで来てから始める（来る前に tick を進めると、起こす数がそろわない）
-            eventually(30_000, "5 本とも燃料待ちにならない") { m.fuelWaiterCount == 5 }
+            val spins = List(processes) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
+            // 全員が、最初の燃料を待つところまで来てから始める（来る前に tick を進めると、起こす数がそろわない）
+            eventually(30_000, "$processes 本とも燃料待ちにならない") { m.fuelWaiterCount == processes }
             for (k in 1..ticks) {
                 val woken0 = h.scheduler.dispatcher.woken.get()
                 h.scheduler.tick()
-                // 燃料待ちの全員（5本）を起こし、その tick の燃料を使い切って、また全員が燃料待ちに戻るまで待つ
+                // 燃料待ちの全員を起こし、その tick の燃料を使い切って、また全員が燃料待ちに戻るまで待つ
                 eventually(30_000, "tick $k: 燃料を使い切らない") {
-                    h.scheduler.dispatcher.woken.get() - woken0 >= 5 && m.fuelWaiterCount == 5 && m.lock.withLockValue { m.kernel.fuel <= 0 }
+                    h.scheduler.dispatcher.woken.get() - woken0 >= processes && m.fuelWaiterCount == processes &&
+                        m.lock.withLockValue { m.kernel.fuel <= 0 }
                 }
             }
             val counts = spins.map { runs[it.pid]?.get() ?: 0 }
-            // 15 tick × 4 スライス = 60 スライスを、5 本で 12 回ずつ。FIFO ならぴったり均等だが、tick の頭の入り方で 1 回ぶれうる
-            assertEquals(ticks * 4, counts.sum(), "スライスの数: $counts")
-            assertTrue(counts.all { it in 11..13 }, "全員が同じ回数動いていない: $counts")
+            val total = ticks * slicesPerTick
+            // 全部のスライスを、全員で同じ回数ずつ。tick の頭の入り方で 1 回ぶれうる
+            assertEquals(total, counts.sum(), "スライスの数: $counts")
+            val fair = total / processes
+            assertTrue(counts.all { it in fair - 1..fair + 1 }, "全員が同じ回数動いていない: $counts")
             for (s in spins) m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
         }
     }
