@@ -11,10 +11,10 @@ import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
 /** リンクのテストの道具（#263） */
 internal object LinkTesting {
-    /** 名前の形を見ない import の判定（テストの名前空間 `test:*` を通す） */
     /** [instantiate] が渡す燃料の既定値 */
     const val DEFAULT_FUEL = 10_000_000L
 
+    /** 名前の形を見ない import の判定（テストの名前空間 `test:*` を通す） */
     val ANY_IMPORT: ComponentImportPolicy = ComponentImportPolicy { null }
 
     val runtime: WasmRuntime by lazy { EndiveRuntime() }
