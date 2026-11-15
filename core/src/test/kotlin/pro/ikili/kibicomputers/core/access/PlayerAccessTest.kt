@@ -152,14 +152,31 @@ class PlayerAccessTest {
         val access = withMember().addPending("bob", 2L, rules).access
         assertEquals(AccessChange.NOT_FOUND, access.removeMember("alex").change, "持ち主は外せない")
         assertEquals(AccessChange.NOT_FOUND, access.removeMember("nobody").change)
-        val byName = access.removeMember("STEVE")
-        assertEquals(AccessChange.REMOVED, byName.change)
-        assertTrue(byName.access.members.isEmpty())
-        assertFalse(byName.access.mayUse(steve, false))
-        assertEquals(AccessChange.REMOVED, access.removeMember(steve.id.toString()).change)
+        assertEquals(AccessChange.NOT_FOUND, access.removeMember(alex.id.toString()).change, "持ち主は UUID でも外せない")
+        assertEquals(AccessChange.NOT_FOUND, access.removeMember("STEVE").change, "名前ではメンバーを外さない")
+        val byId = access.removeMember(steve.id.toString())
+        assertEquals(AccessChange.REMOVED, byId.change)
+        assertTrue(byId.access.members.isEmpty())
+        assertFalse(byId.access.mayUse(steve, false))
+        assertEquals(access.pending, byId.access.pending)
         val pending = access.removeMember("Bob")
         assertEquals(AccessChange.REMOVED, pending.change)
         assertTrue(pending.access.pending.isEmpty())
+        assertEquals(access.members, pending.access.members)
+    }
+
+    @Test
+    fun removeMemberByNameDoesNotTouchMembersWithAStaleName() {
+        // 改名前に「bob」だった 2 人のメンバー（まだアクセスしていないので名前が古い）と、今の bob（別人）の保留
+        val oldBob1 = AccessMember(UUID.randomUUID(), "bob")
+        val oldBob2 = AccessMember(UUID.randomUUID(), "Bob")
+        val access = PlayerAccess.of(AccessMember.of(alex), listOf(oldBob1, oldBob2), listOf(PendingInvite("bob", 0L)))
+        val removed = access.removeMember("bob")
+        assertEquals(AccessChange.REMOVED, removed.change)
+        assertEquals(listOf(oldBob1, oldBob2), removed.access.members, "古い名前が同じメンバーは残る")
+        assertTrue(removed.access.pending.isEmpty())
+        // 保留がなければ、名前が古いメンバーがいても見つからない
+        assertEquals(AccessChange.NOT_FOUND, removed.access.removeMember("BOB").change)
     }
 
     @Test

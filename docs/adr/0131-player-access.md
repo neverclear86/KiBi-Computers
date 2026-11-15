@@ -51,6 +51,9 @@ PlayerAccess: {
 - OP は `hasPermissions(access.opPermissionLevel)`（既定 2）
 - 管理の判定（`isManager`）と、#110・#206 が呼ぶ操作（`addPending`・`removeMember`・`transferOwner`）は core に作って単体テストした。
   #131 では、プレイヤーがメンバーを足す口はない
+- `removeMember` は、UUID の文字列ならその UUID のメンバーを、名前ならその名前の保留だけを外す。名前ではメンバーを外さない
+  （最後に見た名前は古くなりうるので、改名前に同じ名前だったメンバーを巻き込まない）。名前でメンバーを外す口（#110・#206）は、
+  サーバーで今の名前から UUID を引いて渡す
 - 画面の閲覧は制限しない
 
 ### 保留の追加

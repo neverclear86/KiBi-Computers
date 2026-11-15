@@ -164,16 +164,21 @@ public class PlayerAccess private constructor(
     }
 
     /**
-     * メンバーと保留から外す（#110・#206 が呼ぶ）。[nameOrId] は UUID の文字列か名前（大文字・小文字を無視）。持ち主は外せない
-     * （[transferOwner] を使う）
+     * メンバーか保留を外す（#110・#206 が呼ぶ）。持ち主は外せない（[transferOwner] を使う）。
+     *
+     * [nameOrId] が UUID の文字列ならその UUID のメンバーを、そうでなければその名前（大文字・小文字を無視）の保留を外す。
+     * 名前ではメンバーを外さない: [AccessMember.name] は最後に見た名前で古くなりうる（改名後にその名前を別のプレイヤーが使う）ので、
+     * 名前で照らすと、今その名前の別人を外すつもりで、改名前に同じ名前だったメンバーまで外れる（[addPending] と同じ考え）。
+     * 名前でメンバーを外したい呼び手は、サーバーで今の名前から UUID を引いて（オンラインのプレイヤー・プロフィールのキャッシュ）、
+     * その UUID を渡す
      */
     public fun removeMember(nameOrId: String): Result {
         if (locked) return Result(this, AccessChange.LOCKED)
         if (owner == null) return Result(this, AccessChange.NOT_FOUND)
         val id = runCatching { UUID.fromString(nameOrId) }.getOrNull()
         val key = normalize(nameOrId)
-        val newMembers = members.filterNot { it.id == id || normalize(it.name) == key }
-        val newPending = pending.filterNot { it.name == key }
+        val newMembers = if (id == null) members else members.filterNot { it.id == id }
+        val newPending = if (id != null) pending else pending.filterNot { it.name == key }
         val next = copyIfChanged(owner, newMembers, newPending)
         return Result(next, if (next === this) AccessChange.NOT_FOUND else AccessChange.REMOVED)
     }
