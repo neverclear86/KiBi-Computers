@@ -119,7 +119,6 @@ class PlayerAccessTest {
         assertEquals(AccessChange.INVALID_NAME, owned.addPending("test-player", 0L, rules).change)
         assertEquals(AccessChange.INVALID_NAME, owned.addPending("", 0L, rules).change)
         assertEquals(AccessChange.ADDED, owned.addPending("a".repeat(16), 0L, rules).change)
-        assertEquals(AccessChange.ALREADY_PRESENT, owned.addPending("ALEX", 0L, rules).change, "持ち主と同じ名前")
 
         val one = owned.addPending("bob", 0L, rules).access
         assertEquals(AccessChange.ALREADY_PRESENT, one.addPending("Bob", 0L, rules).change)
@@ -130,8 +129,22 @@ class PlayerAccessTest {
         assertEquals(AccessChange.ADDED, later.change)
         assertEquals(listOf("dave"), later.access.pending.map { it.name })
 
+    }
+
+    @Test
+    fun addPendingDoesNotCompareWithStaleOwnerAndMemberNames() {
+        // メンバー（steve）が改名して来ていない間に、旧名を別のプレイヤーが取っても、その人を保留に足せる
         val member = withMember()
-        assertEquals(AccessChange.ALREADY_PRESENT, member.addPending("STEVE", 2L, rules).change, "メンバーと同じ名前")
+        val added = member.addPending("STEVE", 2L, rules)
+        assertEquals(AccessChange.ADDED, added.change)
+        assertEquals(listOf("steve"), added.access.pending.map { it.name })
+        assertEquals(AccessChange.ADDED, PlayerAccess.ownedBy(alex).addPending("ALEX", 0L, rules).change)
+
+        // その人（別の UUID）がアクセスするとメンバーに昇格する。元のメンバーは UUID で残る
+        val impostor = PlayerRef(UUID.randomUUID(), "Steve")
+        val promoted = added.access.onAccess(impostor, 3L, rules)
+        assertEquals(setOf(steve.id, impostor.id), promoted.members.map { it.id }.toSet())
+        assertEquals(emptyList<PendingInvite>(), promoted.pending)
     }
 
     @Test

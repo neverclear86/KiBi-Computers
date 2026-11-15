@@ -41,7 +41,7 @@ public enum class AccessChange {
     /** 足した */
     ADDED,
 
-    /** もうある（同じ名前の保留、持ち主・メンバーと同じ名前） */
+    /** もうある（同じ名前の保留） */
     ALREADY_PRESENT,
 
     /** 保留に入れられない名前（[PlayerAccess.isValidPendingName]） */
@@ -147,8 +147,10 @@ public class PlayerAccess private constructor(
 
     /**
      * 名前 [name] のプレイヤーを、保留として足す（#110・#206 が呼ぶ）。期限切れの保留は先に捨てる。
-     * 名前の形（[isValidPendingName]）、重複（同じ名前の保留、持ち主・メンバーの今の名前と大文字・小文字を無視して一致）、
-     * 保留の上限を確かめる
+     * 名前の形（[isValidPendingName]）、重複（大文字・小文字を無視して同じ名前の保留）、保留の上限を確かめる。
+     * 持ち主・メンバーの名前とは照らさない（最後に見た名前で古くなりうる。改名後にその名前を別のプレイヤーが使うことがある）。
+     * 同じ名前の持ち主・メンバー本人が保留に入っても、[onAccess] は持ち主・メンバーとして扱うので、保留は昇格せず期限で消える。
+     * 呼び手が本人かを UUID で確かめたいときは、[owner]・[members] の [AccessMember.id] で照らす
      */
     public fun addPending(name: String, nowMillis: Long, rules: AccessRules): Result {
         if (locked) return Result(this, AccessChange.LOCKED)
@@ -156,9 +158,7 @@ public class PlayerAccess private constructor(
         if (!isValidPendingName(name)) return Result(this, AccessChange.INVALID_NAME)
         val key = normalize(name)
         val pruned = pruneExpired(nowMillis, rules)
-        val taken = normalize(currentOwner.name) == key || members.any { normalize(it.name) == key } ||
-            pruned.pending.any { it.name == key }
-        if (taken) return Result(pruned, AccessChange.ALREADY_PRESENT)
+        if (pruned.pending.any { it.name == key }) return Result(pruned, AccessChange.ALREADY_PRESENT)
         if (pruned.pending.size >= rules.maxPending) return Result(pruned, AccessChange.LIMIT_REACHED)
         return Result(PlayerAccess(currentOwner, members, pruned.pending + PendingInvite(key, nowMillis), false), AccessChange.ADDED)
     }
