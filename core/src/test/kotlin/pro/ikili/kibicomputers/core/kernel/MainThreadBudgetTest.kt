@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -510,7 +511,9 @@ class MainThreadBudgetTest {
             // 持ち越しの列にいる間も、待機点でスレッドを持たずに待ったまま（again を返さず、断らず、捨てない）
             assertTrue(m.isAtWaitPoint)
             assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid))
-            assertTrue(m.lock.withLockValue { m.runtime(pid)?.thread == null }, "待機点でスレッドを持たない")
+            // ワーカーは WAITING_EVENT にしてロックを放した後で、ロックを取り直して thread を外すので、外れるまで待つ
+            assertNotNull(m.lock.withLockValue { m.runtime(pid) }, "待機点のプロセスの runtime がある")
+            eventually(5_000, "待機点でスレッドが外れない") { m.lock.withLockValue { m.runtime(pid)?.thread == null } }
             val call = m.lock.withLockValue { m.kernel.objects[callId.get()] as PendingDeviceCall }
             assertTrue(m.lock.withLockValue { call.state } is PendingDeviceCall.State.Queued, "実行し始めるまでは Queued")
             // マシン全体の写しにも Queued で入る（実行中の interrupted にしない）
