@@ -218,8 +218,15 @@ class MachineRestoreBranchesTest {
     }
 
     /** [identity] の世代から新しいマシンに戻し、知らせが来るまで tick を回す */
-    private fun restore(h: Harness, store: MachineSaveStore, identity: MachineIdentity, finished: Finished = Finished(), fuelPerTick: Long = 10_000_000): Machine {
-        val m = h.machine(fuelPerTick = fuelPerTick)
+    private fun restore(
+        h: Harness,
+        store: MachineSaveStore,
+        identity: MachineIdentity,
+        finished: Finished = Finished(),
+        fuelPerTick: Long = 10_000_000,
+        fuelSlice: Long? = null,
+    ): Machine {
+        val m = h.machine(fuelPerTick = fuelPerTick, fuelSlice = fuelSlice)
         assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
         eventually(60_000, "知らせが来ない") {
             h.scheduler.tick()
@@ -361,6 +368,56 @@ class MachineRestoreBranchesTest {
             assertEquals(ProcessState.EXITED, m2.stateOf(s.pid), "${m2.rt(s.pid).lastError}")
             // 出力のストリームも写しに入っているので、保存の前の分と合わせて全文になる（頭から動かし直すと、1 行目が 2 回出る）
             assertEquals(all, output(m2, s.output))
+            m2.close()
+        }
+    }
+
+    @Test
+    fun `スライスを使い切って譲ったRUNNABLEのプロセスは、マシンの燃料が残ったまま保存して戻しても、退避した値から続けて最後まで動く`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            // 1 tick の燃料は最後まで足りる大きさ。スライスだけが切れて、2 本が交代する（#47）
+            val m = h.machine(fuelPerTick = 100_000_000, fuelSlice = 20_000)
+            // init（s）が終わると残りは止められるので、init の方を長くする
+            val s = start(m, TestMemoryFileSystem(), "fuel-spin-wasi.wasm", "/bin/spin", listOf("spin", "main", "10", "100000"), withInput = false)
+            val output2 = m.lock.withLockValue { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
+            val pid2 = m.exec("/bin/spin", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("spin", "main", "5", "100000"), stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(output2, HandleRights.WRITE), StdioSource.Closed)))
+            val yields0 = h.scheduler.fuelYields.get()
+            h.scheduler.tick()
+            eventually(60_000, "譲らない") { h.scheduler.fuelYields.get() - yields0 >= 3 }
+            // 止める（巻き戻して譲ったプロセスは、スレッドを持たずに CPU か燃料を待つ。tick は回さない: マシンの燃料は正のまま）
+            val hold = m.quiesce()
+            eventually(30_000, "2 本とも巻き戻した状態にならない") {
+                m.lock.withLockValue {
+                    m.kernel.fuel > 0 && listOf(s.pid, pid2).all { pid ->
+                        val p = m.kernel.processes[pid]!!
+                        val rt = m.rt(pid)
+                        p.state == ProcessState.RUNNABLE && rt.thread == null && !rt.stackActive && rt.waitSet == null && p.wait == null &&
+                            p.asyncStack?.isEmpty == false
+                    }
+                }
+            }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val written = stored(store, identity)
+            val kernel = kernelOf(written)
+            assertTrue(kernel.fuel > 0, "マシンの燃料が残っていない: ${kernel.fuel}")
+            for (pid in listOf(s.pid, pid2)) {
+                assertEquals(ProcessState.RUNNABLE, kernel.processes[pid]!!.state)
+                assertTrue(p1Of(written, pid).asyncStack.isNotEmpty(), "退避した値がない: pid $pid")
+            }
+            hold.close()
+            m.close()
+
+            val m2 = restore(h, store, identity, fuelPerTick = 100_000_000, fuelSlice = 20_000)
+            eventually(60_000, "最後まで動かない") {
+                h.scheduler.tick()
+                m2.stateOf(s.pid).isTerminal && m2.stateOf(pid2).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m2.stateOf(s.pid), "${m2.rt(s.pid).lastError}")
+            assertEquals(ProcessState.EXITED, m2.stateOf(pid2), "${m2.rt(pid2).lastError}")
+            assertEquals(expectedSpin(10, 100_000), output(m2, s.output))
+            assertEquals(expectedSpin(5, 100_000), output(m2, output2))
             m2.close()
         }
     }

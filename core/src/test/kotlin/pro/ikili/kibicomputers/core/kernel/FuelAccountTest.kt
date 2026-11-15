@@ -30,10 +30,10 @@ private class ReferenceFuel(val perTick: Long) {
         fuel = minOf(fuel, 0) + perTick
     }
 
-    fun take(): Long {
+    fun take(limit: Long = Long.MAX_VALUE): Long {
         if (fuel <= 0) return 0
-        val g = fuel
-        fuel = 0
+        val g = minOf(fuel, limit)
+        fuel -= g
         return g
     }
 
@@ -68,7 +68,7 @@ class FuelAccountTest {
                 for (j in listOf(0L, 1L, 3L)) {
                     val (state, acc) = account()
                     acc.refill(1)
-                    assertEquals(perTick, acc.take(1))
+                    assertEquals(perTick, acc.take(1, perTick))
                     assertEquals(0, state.fuel)
                     acc.giveBack(1 + k, r)
                     val expected = if (k == 0L) r else perTick + minOf(r, 0)
@@ -76,7 +76,7 @@ class FuelAccountTest {
                     // 続けて j tick 後に取ったときの grant
                     val ref = ReferenceFuel(perTick).apply { fuel = expected }
                     repeat(j.toInt()) { ref.tick() }
-                    assertEquals(ref.take(), acc.take(1 + k + j), "k=$k r=$r j=$j")
+                    assertEquals(ref.take(), acc.take(1 + k + j, perTick), "k=$k r=$r j=$j")
                 }
             }
         }
@@ -87,7 +87,7 @@ class FuelAccountTest {
         for (k in listOf(0L, 1L, 2L, 5L)) {
             for (r in listOf(-5L, -250L)) {
                 val (state, acc) = account()
-                acc.take(1)
+                acc.take(1, perTick)
                 acc.giveBack(1 + k, r)
                 assertEquals(if (k == 0L) r else perTick + r, state.fuel)
             }
@@ -97,7 +97,7 @@ class FuelAccountTest {
     @Test
     fun `例外で抜けたときはCPUを持っているときだけ補充し、何も書き戻さない`() {
         val (state, acc) = account()
-        acc.take(3)
+        acc.take(3, perTick)
         acc.onException(5, holdsCpu = false)
         assertEquals(0, state.fuel)
         assertEquals(3, acc.lastRefillTick)
@@ -107,7 +107,45 @@ class FuelAccountTest {
     }
 
     @Test
+    fun `スライスまでを渡し、残りはマシンに置く。返したときの規則は変わらない`() {
+        for (k in listOf(0L, 1L, 2L, 5L)) {
+            for (r in listOf(10L, 0L, -5L, -250L)) {
+                val (state, acc) = account()
+                acc.refill(1)
+                assertEquals(30, acc.take(1, 30))
+                assertEquals(70, state.fuel, "CPU を持っている間は、その tick の残りがマシンにある")
+                val predicted = acc.afterGiveBack(1 + k, r)
+                acc.giveBack(1 + k, r)
+                // 進んでいなければ残り 70 に手持ちを足す。進んでいれば、残りも手持ちも持ち越さず、行き過ぎた分だけ持ち越す
+                val expected = if (k == 0L) 70 + r else perTick + minOf(r, 0)
+                assertEquals(expected, state.fuel, "k=$k r=$r")
+                assertEquals(expected, predicted, "afterGiveBack は giveBack の結果と同じ: k=$k r=$r")
+            }
+        }
+    }
+
+    @Test
+    fun `スライスに分けて渡しても、1tickに渡す合計はfuelPerTickまで`() {
+        val (state, acc) = account()
+        acc.refill(1)
+        val grants = generateSequence { acc.take(1, 30).takeIf { it > 0 } }.toList()
+        assertEquals(listOf(30L, 30L, 30L, 10L), grants)
+        assertEquals(0, state.fuel)
+        assertEquals(0, acc.take(1, 30))
+        assertEquals(30, acc.take(2, 30), "次の tick にまた配られる")
+    }
+
+    @Test
     fun `素直な繰り返しの実装と10000手比べる`() {
+        compareWithReference(slice = perTick)
+    }
+
+    @Test
+    fun `スライスで渡しても素直な繰り返しの実装と10000手比べて同じ`() {
+        compareWithReference(slice = 30)
+    }
+
+    private fun compareWithReference(slice: Long) {
         val random = Random(43)
         val (state, acc) = account()
         val ref = ReferenceFuel(perTick)
@@ -130,8 +168,8 @@ class FuelAccountTest {
                 }
                 2 -> if (holder == null) {
                     val p = procs[random.nextInt(procs.size)]
-                    val g = acc.take(now)
-                    assertEquals(ref.take(), g, "手 $step: grant")
+                    val g = acc.take(now, slice)
+                    assertEquals(ref.take(slice), g, "手 $step: grant")
                     if (g > 0) {
                         p.holds = true
                         p.hand = g
@@ -141,6 +179,7 @@ class FuelAccountTest {
                 3 -> holder?.let { it.hand -= random.nextLong(0, 300) }
                 4 -> holder?.let {
                     if (now - it.grantTick >= 2) heldOverTwoTicks++
+                    assertEquals(acc.afterGiveBack(now, it.hand), ref.fuel + if (now == it.grantTick) it.hand else minOf(it.hand, 0))
                     acc.giveBack(now, it.hand)
                     ref.giveBack(now - it.grantTick, it.hand)
                     it.holds = false

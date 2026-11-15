@@ -8,7 +8,11 @@ package pro.ikili.kibicomputers.core.kernel
  * k 回くり返すのと同じ値になる閉じた式でまとめて当てはめる。
  *
  * マシンの燃料を読み書きするのは CPU を持つプロセスだけ（CPU は同時に1プロセス）。
- * CPU を持っている間の [KernelState.fuel] は 0 で、[lastRefillTick] は手持ちを渡した tick のまま。
+ *
+ * 1回に渡すのは、その tick の残りのうちスライス（[MachineConfig.fuelSlice]。#47、ADR 0047）まで。
+ * CPU を持っている間の [KernelState.fuel] は、その tick の残り（0 以上）で、[lastRefillTick] は手持ちを渡した tick のまま。
+ * 返すとき（[giveBack]）に tick が進んでいれば、残りは 0 以上なので `refilled` は `fuelPerTick` になり、そこへ手持ちの `min(r, 0)` を足す。
+ * 結果は「tick ごとに `min(fuel, 0) + fuelPerTick`」と同じ（使わなかった分は、手持ちもマシンの残りも持ち越さない）
  */
 internal class FuelAccount(private val state: KernelState, val fuelPerTick: Long, initialTick: Long) {
     init {
@@ -30,13 +34,24 @@ internal class FuelAccount(private val state: KernelState, val fuelPerTick: Long
     /** [refill] したらいくつになるか（書き換えない。ディスパッチャーが燃料待ちを起こすかを決めるのに使う） */
     fun estimate(now: Long): Long = refilled(state.fuel, now - lastRefillTick, fuelPerTick)
 
-    /** CPU を取る: 補充してから、燃料が正なら全部を渡して 0 にし、渡した量を返す。正でなければ 0 を返して何もしない */
-    fun take(now: Long): Long {
+    /**
+     * CPU を取る: 補充してから、燃料が正なら [limit]（スライス）までを渡して残りをマシンに置き、渡した量を返す。
+     * 正でなければ 0 を返して何もしない
+     */
+    fun take(now: Long, limit: Long): Long {
+        require(limit > 0) { "limit は正" }
         refill(now)
         val fuel = state.fuel
         if (fuel <= 0) return 0
-        state.fuel = 0
-        return fuel
+        val grant = minOf(fuel, limit)
+        state.fuel = fuel - grant
+        return grant
+    }
+
+    /** [giveBack] したらいくつになるか（書き換えない。スライスを使い切ったときに、その場で次を足すか・譲るかを決めるのに使う） */
+    fun afterGiveBack(now: Long, remaining: Long): Long {
+        val k = now - lastRefillTick
+        return refilled(state.fuel, k, fuelPerTick) + if (k <= 0) remaining else minOf(remaining, 0)
     }
 
     /**

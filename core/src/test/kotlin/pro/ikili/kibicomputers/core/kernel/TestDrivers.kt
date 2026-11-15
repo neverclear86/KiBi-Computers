@@ -159,6 +159,7 @@ internal class Harness(
         memoryBytes: Long? = null,
         maxProcessMemoryBytes: Long? = null,
         maxDevices: Int? = null,
+        fuelSlice: Long? = null,
     ): Machine =
         scheduler.createMachine(
             host ?: MachineHost { m, s, _ -> events += m.id to s },
@@ -166,6 +167,7 @@ internal class Harness(
                 memoryBytes?.let { memoryBytes(it) }
                 maxProcessMemoryBytes?.let { maxProcessMemoryBytes(it) }
                 maxDevices?.let { maxDevices(it) }
+                fuelSlice?.let { fuelSlice(it) }
             }.build(),
             environment,
         )
