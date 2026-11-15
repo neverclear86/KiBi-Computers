@@ -256,10 +256,9 @@ class WasiP1KibiDeviceRestoreTest {
             }
             assertTrue(m.pendingHostCalls >= 1, "呼び出しが列にある")
             // 1回 tick しても、hog が予算を使い切り、プロセスの台は持ち越しの列に残る（Running にしない）
-            val carried = h.scheduler.carriedMachines.get()
             tick()
-            if (calls.get() != 0 || pendingCall(m, pid)?.state !is PendingDeviceCall.State.Queued) fail("持ち越しの間に待機点に着かなかった")
-            assertTrue(h.scheduler.carriedMachines.get() > carried, "予算で持ち越した台がある")
+            assertEquals(0, calls.get(), "持ち越されずに呼び出しが実行された")
+            assertTrue(pendingCall(m, pid)?.state is PendingDeviceCall.State.Queued, "持ち越しの間は Queued のままのはず")
             assertTrue(m.pendingHostCalls >= 1, "呼び出しが持ち越しの列に残る")
             assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid))
 
