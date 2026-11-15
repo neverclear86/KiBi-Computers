@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -194,6 +195,120 @@ class FuelSliceTest {
                 val a0 = pa.get()
                 h.scheduler.tick()
                 eventually(10_000, "tick $k: A が進まない（CPU が漏れた）") { pa.get() >= a0 + 999 && m.fuelWaiterCount == 1 }
+            }
+            m.stop()
+            eventually(10_000) { m.cpu.currentOwner == null && h.scheduler.permits.availablePermits() == permitsBefore }
+        }
+    }
+
+    /**
+     * 起こされて CPU の待ち行列の位置を予約した（まだ渡っていない）スレッドを、CPU に着く前に止める。CPU は別のプロセス C が持っている。
+     * [swallowInterrupt] なら、割り込みを燃料待ちの後のフックで握って（印だけ戻して）、`cpu.acquire` に割り込みを持ったまま入らせる
+     * （acquireCpu の最初の catch）。そうでなければ、フックの中で割り込まれる（燃料待ちの後の catch）。どちらも予約を外す
+     */
+    private fun killReservedBehindOwner(swallowInterrupt: Boolean) = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1000)
+            val permitsBefore = h.scheduler.permits.availablePermits()
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val holder = FakeModule.builder()
+                .fuelMetered()
+                .export("run", VOID) { ctx, _ ->
+                    ctx.step(1)
+                    entered.countDown()
+                    release.await()
+                    LongArray(0)
+                }
+                .build()
+            val c = m.spawnTest(h.program(holder), runDriver())
+            eventually(10_000) { m.fuelWaiterCount == 1 }
+            val parked = CountDownLatch(1)
+            val never = CountDownLatch(1)
+            h.scheduler.hooks.afterFuelWait = { _, pid ->
+                if (pid != c) {
+                    parked.countDown()
+                    try {
+                        never.await()
+                    } catch (e: InterruptedException) {
+                        if (swallowInterrupt) Thread.currentThread().interrupt() else throw e
+                    }
+                }
+            }
+            val b = m.spawnTest(h.program(spinForever()), runDriver())
+            eventually(10_000) { m.fuelWaiterCount == 2 }
+            // 起こす順は C、B。C は渡され、B は C の後ろに予約が入る
+            h.scheduler.tick()
+            assertTrue(entered.await(10, TimeUnit.SECONDS), "C が動かない")
+            assertTrue(parked.await(10, TimeUnit.SECONDS), "B が起こされない")
+            val bRt = m.rt(b)
+            assertTrue(m.cpu.hasReservation(bRt))
+            assertEquals(1, m.cpu.waiting)
+            assertEquals(c, m.cpu.currentOwner?.pid)
+            m.lock.withLockValue { m.killLocked(b, KillSignal.KILL) }
+            eventually(10_000, "B が終わらない") { m.stateOf(b).isTerminal }
+            eventually(10_000, "予約が残っている") { !m.cpu.hasReservation(bRt) }
+            assertEquals(0, m.cpu.waiting, "止めた B が待ち行列に残っている")
+            assertEquals(c, m.cpu.currentOwner?.pid, "CPU の持ち主が変わった")
+            release.countDown()
+            eventually(10_000, "C が終わらない") { m.stateOf(c).isTerminal }
+            eventually(10_000) { m.cpu.currentOwner == null && h.scheduler.permits.availablePermits() == permitsBefore }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `まだ渡していない予約のスレッドを止めると、予約を外し、CPUを持つ側はそのまま`() = killReservedBehindOwner(swallowInterrupt = false)
+
+    @Test
+    fun `予約を受け取る前に割り込みを持ったままCPUを取りに行ったスレッドも、予約を外す`() = killReservedBehindOwner(swallowInterrupt = true)
+
+    @Test
+    fun `燃料待ちを抜けた後、終わる前に起こされても、止められたスレッドの予約は入らない`() = timeout(limit) {
+        Harness().use { h ->
+            // 止められた待ち手は、燃料待ちを例外で抜けた後、終わる（カーネルロックを取り直す）まで燃料待ちの列に残る。その間に起こされても、
+            // CPU の位置を予約してはいけない（予約しても、そのスレッドは CPU に着かず、取り消す者もいない。#742）
+            val m = h.machine(fuelPerTick = 1000)
+            val permitsBefore = h.scheduler.permits.availablePermits()
+            val caught = CountDownLatch(1)
+            val proceed = CountDownLatch(1)
+            val victim = FakeModule.builder()
+                .fuelMetered()
+                .export("run", VOID) { ctx, _ ->
+                    try {
+                        while (true) ctx.step(1)
+                    } catch (e: Throwable) {
+                        caught.countDown()
+                        proceed.await()
+                        throw e
+                    }
+                    @Suppress("UNREACHABLE_CODE")
+                    LongArray(0)
+                }
+                .build()
+            val a = m.spawnTest(h.program(victim), runDriver())
+            // 1 tick 目で A が燃料を使い切り、モジュールの中の ctx.step で燃料待ちになる
+            h.scheduler.tick()
+            eventually(10_000) { m.stateOf(a) == ProcessState.WAITING_FUEL && m.fuelWaiterCount == 1 }
+            val pb = AtomicInteger()
+            val b = m.spawnTest(h.program(spinForever(pb)), runDriver())
+            eventually(10_000) { m.fuelWaiterCount == 2 }
+            val aRt = m.rt(a)
+            m.lock.withLockValue { m.killLocked(a, KillSignal.KILL) }
+            assertTrue(caught.await(10, TimeUnit.SECONDS), "A が止められた例外を受けない")
+            assertFalse(m.stateOf(a).isTerminal, "A がもう終わっている（競争の窓を作れない）")
+            val b0 = pb.get()
+            h.scheduler.tick()
+            // 起こす順は A、B。A に予約が入ると、CPU が A のものになり、B が動けない
+            eventually(10_000, "B が進まない（CPU が終わった A のものになった）") { pb.get() >= b0 + 999 }
+            assertFalse(m.cpu.hasReservation(aRt), "止められた A に予約が入った")
+            proceed.countDown()
+            eventually(10_000, "A が終わらない") { m.stateOf(a).isTerminal }
+            assertFalse(m.cpu.hasReservation(aRt))
+            repeat(2) {
+                val before = pb.get()
+                h.scheduler.tick()
+                eventually(10_000, "次の tick で B が進まない") { pb.get() >= before + 999 }
             }
             m.stop()
             eventually(10_000) { m.cpu.currentOwner == null && h.scheduler.permits.availablePermits() == permitsBefore }

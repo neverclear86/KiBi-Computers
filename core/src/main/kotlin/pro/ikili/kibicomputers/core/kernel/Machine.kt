@@ -2466,8 +2466,11 @@ public class Machine private constructor(
                 rt.fuelWaitThreadless = false
                 scheduleThreadlessLocked(rt)
             } else {
-                // 起き上がりを待たずに、列の順で CPU の待ち行列の位置を取る（#742、#737）。スレッドは acquireCpu で受け取る
-                cpu.reserve(rt)
+                // 起き上がりを待たずに、列の順で CPU の待ち行列の位置を取る（#742、#737）。スレッドは acquireCpu で受け取る。
+                // 止められたスレッドは CPU に着かない（燃料待ちを例外で抜けた後、終わる前にここへ来うる）。ここで予約すると、
+                // 取り消す者がいなくなって CPU が終わったプロセスのものになったままになる。止める印の書き込みもここもカーネルロックの中なので、
+                // 印を見て予約しなければ、止められた後の予約は起こらない（印の前の予約は、割り込まれた側の cancelReservation が外す）
+                if (!rt.killed) cpu.reserve(rt)
                 rt.fuelReady = true
                 rt.fuelCondition.signalAll()
             }
