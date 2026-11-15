@@ -233,48 +233,75 @@ class AsyncFuelTest {
     }
 
     @Test
-    fun `計算し続ける待機点型2本と、スレッドを持って待つ型1本が混ざると、後者は少ない側に偏るが飢えない`() = timeout(limit) {
+    fun `計算し続ける待機点型2本と、スレッドを持って待つ型1本が混ざっても、取り分は偏らない`() = timeout(limit) {
+        // 1 tick に 4 スライス。燃料待ちの全員を起こすとき、スレッドを持たない側（巻き戻して待つ側）はカーネルロックの中でその順に
+        // CPU の待ち行列に並び、スレッドを持って待つ側も同じ順で CPU の位置を予約する（#737、#742、ADR 0047）。
+        // 予約がないと、スレッドを持つ側は起きてから CPU に着くので、毎 tick スレッドを持たない側の後ろになり、取り分が 25% に偏っていた
+        val ticks = 12
+        val (counts, perTick) = mixed(waitPoints = 2, slicesPerTick = 4, ticks = ticks)
+        val blockingSlices = perTick.sum()
+        // 飢えない: 毎 tick 少なくとも 1 スライスは動く（3 本で 4 スライスを回すので、どの tick も 1 か 2）
+        assertTrue(perTick.all { it >= 1 }, "スレッドを持って待つ側が動かなかった tick がある: $perTick（巻き戻す側 $counts）")
+        assertTrue(counts.all { it >= ticks }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
+        // 偏らない: 3 本とも 4/3 スライスずつ（12 tick で 16）に近い。tick の頭の入り方のぶれを見込む
+        val all = counts + blockingSlices
+        assertTrue(all.all { it in 13..19 }, "取り分が偏っている: 巻き戻す側 $counts、スレッドを持つ側 $blockingSlices（$perTick）")
+    }
+
+    @Test
+    fun `スレッドを持たない待ち手が1tickのスライスの数以上いても、スレッドを持って待つ側は飢えない`() = timeout(limit) {
+        // 4 スライスで巻き戻す側 4 本 + スレッドを持つ 1 本。予約がないと、巻き戻す側が先に 4 スライスを使い切り、スレッドを持つ側は
+        // 毎 tick 燃料のない CPU しか取れなかった（#737）
+        val ticks = 10
+        val (counts, perTick) = mixed(waitPoints = 4, slicesPerTick = 4, ticks = ticks)
+        // 5 本で 4 スライスを回すので、5 tick で 4 回ずつ。どこかで動いていれば飢えていない。
+        assertTrue(perTick.sum() >= ticks * 4 / 5 - 2, "スレッドを持って待つ側が飢えた: $perTick（巻き戻す側 $counts）")
+        assertTrue(counts.all { it >= ticks * 4 / 5 - 2 }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
+    }
+
+    @Test
+    fun `スライスがfuelPerTickと同じ台で、待機点型1本とスレッドを持って待つ型1本が交互に動く`() = timeout(limit) {
+        val ticks = 10
+        val (counts, perTick) = mixed(waitPoints = 1, slicesPerTick = 1, ticks = ticks)
+        assertTrue(perTick.sum() >= ticks / 2 - 1, "スレッドを持って待つ側が飢えた: $perTick（巻き戻す側 $counts）")
+        assertTrue(counts.all { it >= ticks / 2 - 1 }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
+    }
+
+    /**
+     * 計算し続ける待機点型（巻き戻して待つ）[waitPoints] 本と、燃料切れを待ち点にできずスレッドを持って待つ 1 本を、1 tick に
+     * [slicesPerTick] スライスの台で [ticks] tick 動かす。巻き戻す側それぞれが動いたスライスの数と、スレッドを持つ側が tick ごとに動いた
+     * スライスの数（全部のスライス - 巻き戻す側の数）を返す
+     */
+    private fun mixed(waitPoints: Int, slicesPerTick: Int, ticks: Int): Pair<List<Int>, List<Int>> {
         Harness(execRuntime = EndiveRuntime()).use { h ->
-            // 1 tick に 4 スライス。燃料待ちの全員を起こすとき、スレッドを持たない側（巻き戻して待つ側）は、カーネルロックの中でその順に
-            // CPU の待ち行列に並ぶが、スレッドを持って待つ側は、起きてロックを取り直してから CPU に着くので、同じ回で起こされた
-            // スレッドを持たない側の後ろになる（ADR 0047）。ずれではなく、決まった向きの偏りで、取り分は少ない側でも毎 tick 1 スライス
             val slice = 20_000L
-            val m = h.machine(fuelPerTick = slice * 4, fuelSlice = slice)
+            val m = h.machine(fuelPerTick = slice * slicesPerTick, fuelSlice = slice)
             val runs = ConcurrentHashMap<Int, AtomicInteger>()
             h.scheduler.hooks.beforeFuelUnwound = { _, pid -> runs.computeIfAbsent(pid) { AtomicInteger() }.incrementAndGet() }
-            val w1 = Spin(h, m, listOf("main", "1000000", "100"))
-            val w2 = Spin(h, m, listOf("main", "1000000", "100"), install = false)
+            val spins = List(waitPoints) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
             m.put("/bin/fallback", fallbackModule(100_000_000))
             val stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)
             val blocking = m.exec("/bin/fallback", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("fallback"), stdio = stdio))
             assertFalse(m.rt(blocking).program.fuelYield, "燃料切れを待ち点にできるモジュールになっている")
-            eventually(30_000, "3 本とも燃料待ちにならない") { m.fuelWaiterCount == 3 }
-            val ticks = 12
+            val processes = waitPoints + 1
+            eventually(30_000, "$processes 本とも燃料待ちにならない") { m.fuelWaiterCount == processes }
             val perTick = ArrayList<Int>()
             var prevW = 0
             for (k in 1..ticks) {
                 val woken0 = h.scheduler.dispatcher.woken.get()
                 h.scheduler.tick()
                 eventually(30_000, "tick $k: 燃料を使い切らない") {
-                    h.scheduler.dispatcher.woken.get() - woken0 >= 3 && m.fuelWaiterCount == 3 && m.lock.withLockValue { m.kernel.fuel <= 0 }
+                    h.scheduler.dispatcher.woken.get() - woken0 >= processes && m.fuelWaiterCount == processes &&
+                        m.lock.withLockValue { m.kernel.fuel <= 0 }
                 }
-                val w = listOf(w1.pid, w2.pid).sumOf { runs[it]?.get() ?: 0 }
-                perTick += 4 - (w - prevW)
+                val w = spins.sumOf { runs[it.pid]?.get() ?: 0 }
+                perTick += slicesPerTick - (w - prevW)
                 prevW = w
             }
-            // 巻き戻して待つ側が動いたスライスの数 = 全部のスライス - スレッドを持って待つ側の数（tick ごとのスレッドを持つ側の数）
-            val counts = listOf(w1.pid, w2.pid).map { runs[it]?.get() ?: 0 }
-            val blockingSlices = ticks * 4 - counts.sum()
-            assertEquals(blockingSlices, perTick.sum())
-            // 飢えない: 毎 tick 少なくとも 1 スライスは動く（巻き戻す側 2 本が先に 2 スライスを使い、スレッドを持つ側は 3 つ目を取る）。
-            // 巻き戻す側が 1 tick のスライスの数（4）以上いると、スレッドを持つ側は毎 tick 燃料のない CPU しか取れず飢える（ADR 0047、#737）。
-            // この並びはここでは確かめない
-            assertTrue(perTick.all { it >= 1 }, "スレッドを持って待つ側が動かなかった tick がある: $perTick（巻き戻す側 $counts）")
-            // 巻き戻す側も飢えない
-            assertTrue(counts.all { it >= ticks }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
-            // 偏りの向き: スレッドを持って待つ側は、巻き戻す側のどちらよりも少ない（手で追った結果は 1 : 1.5 : 1.5。実測も毎 tick 1 スライス）
-            assertTrue(blockingSlices <= counts.min(), "偏りの向きが変わった: スレッドを持つ側 $perTick、巻き戻す側 $counts")
-            for (pid in listOf(w1.pid, w2.pid, blocking)) m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
+            val counts = spins.map { runs[it.pid]?.get() ?: 0 }
+            assertEquals(ticks * slicesPerTick - counts.sum(), perTick.sum())
+            for (pid in spins.map { it.pid } + blocking) m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
+            return counts to perTick
         }
     }
 

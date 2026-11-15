@@ -30,6 +30,13 @@ internal class KernelTestHooks {
     @Volatile
     var beforeFuelUnwound: ((Machine, Int) -> Unit)? = null
 
+    /**
+     * スレッドを持つプロセスが燃料待ちから起こされた後・CPU を取りに行く前（カーネルロックの外。プロセスのスレッド。#742）。
+     * ここで止めると、起こされたスレッドが CPU の待ち行列に着くまでの間を広げられる
+     */
+    @Volatile
+    var afterFuelWait: ((Machine, Int) -> Unit)? = null
+
     /** プロセスがコンソールの TTY に書いた後・自分のスレッドで表示デバイスに書く前（#419。カーネルロックの外） */
     @Volatile
     var beforeConsoleFlush: ((Machine, Int) -> Unit)? = null

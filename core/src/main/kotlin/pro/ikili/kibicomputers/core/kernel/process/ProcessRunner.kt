@@ -306,11 +306,13 @@ internal class ProcessRunner(private val machine: Machine) {
     /**
      * 一時停止でなく燃料があれば、燃料を渡して grant を返す（燃料を計測しないプロセスは 0）。
      * なければ燃料待ちの列に入れて `null`。カーネルロックの中で、[observedTick] まで補充した後に呼ぶ。
+     * [behindCpu] は、列の後ろに置くか（[Machine.addFuelWaiterLocked]。スライスを使った直後に取れなかったスレッドを持つ待ち手。#742）。
+     * 一時停止で取れなかったときも同じ位置に入れる（再開のときは列の全員を起こすので、位置は配分に効かない）。
      *
      * 確かめた後に tick が進んだ（か一時停止が解けた）なら、ディスパッチャーが列を見終えた後かもしれないので、もう一度見直させる
      * （起こし忘れを防ぐ）。
      */
-    private fun tryGrantLocked(rt: ProcessRuntime, observedTick: Long, threadless: Boolean): Long? {
+    private fun tryGrantLocked(rt: ProcessRuntime, observedTick: Long, threadless: Boolean, behindCpu: Boolean = false): Long? {
         val paused = !scheduler.tryActivate(rt)
         if (!paused) {
             if (rt.process.unmetered) return 0L
@@ -318,7 +320,7 @@ internal class ProcessRunner(private val machine: Machine) {
             if (grant > 0) return grant
             scheduler.deactivate(rt)
         }
-        enqueueFuelWaitLocked(rt, threadless)
+        enqueueFuelWaitLocked(rt, threadless, behindCpu)
         if (now != observedTick || (paused && !scheduler.isPausedFor(machine))) scheduler.dispatcher.signal()
         return null
     }
@@ -384,18 +386,26 @@ internal class ProcessRunner(private val machine: Machine) {
      * CPU → 許可を取り、カーネルロックの中で遅延補充してから、停止の印・[precheck]・一時停止・燃料を確かめて grant を返す。
      * 一時停止か燃料がなければ、許可と CPU を返して燃料待ちの列で待ち、やり直す。
      * [precheck] が `false` を返したら、許可と CPU を返して `null` を返す（待ち直し）。
-     * [onNoFuelLocked] は、一時停止か燃料がなくて燃料待ちの列に入れたとき、待つ前にカーネルロックの中で呼ぶ（状態と数え口を合わせるのに使う）
+     * [onNoFuelLocked] は、一時停止か燃料がなくて燃料待ちの列に入れたとき、待つ前にカーネルロックの中で呼ぶ（状態と数え口を合わせるのに使う）。
+     *
+     * [afterSlice] は、その tick の最後のスライスを使い切った直後に取り直すところ（燃料切れの処理）。最初の1回で取れなければ、燃料待ちの列の後ろに置く
+     * （[Machine.addFuelWaiterLocked]。#742、ADR 0047）。燃料待ちから起こされた後に取れなかったときは、スライスを使っていないので前側に入れる
+     * （後ろのままだと、起こされても取れなかった側が毎回後ろに回る）
      */
     private fun acquireCpu(
         rt: ProcessRuntime,
         precheck: (() -> Boolean)?,
+        afterSlice: Boolean = false,
         onNoFuelLocked: (() -> Unit)? = null,
     ): Long? {
+        var behindCpu = afterSlice
         while (true) {
             if (!rt.holdsCpu) {
                 try {
                     machine.cpu.acquire(rt)
                 } catch (e: InterruptedException) {
+                    // 燃料待ちから起こされたときの予約を受け取る前に割り込まれたら、外す（受け取った後なら何もしない）
+                    machine.cpu.cancelReservation(rt)
                     throw ProcessKilledException(e)
                 }
                 rt.holdsCpu = true
@@ -408,7 +418,7 @@ internal class ProcessRunner(private val machine: Machine) {
                 machine.fuelAccount.refill(observed)
                 when {
                     precheck != null && !precheck() -> Outcome.REARM
-                    tryGrantLocked(rt, observed, threadless = false)?.also { grant = it } == null -> {
+                    tryGrantLocked(rt, observed, threadless = false, behindCpu)?.also { grant = it } == null -> {
                         onNoFuelLocked?.invoke()
                         Outcome.NO_FUEL
                     }
@@ -418,7 +428,16 @@ internal class ProcessRunner(private val machine: Machine) {
             if (outcome == Outcome.GO) return grant
             releasePermitAndCpu(rt)
             if (outcome == Outcome.REARM) return null
-            waitForFuel(rt)
+            try {
+                waitForFuel(rt)
+                behindCpu = false
+                hooks.afterFuelWait?.invoke(machine, rt.pid)
+            } catch (e: Throwable) {
+                // 起こされた（CPU の位置を予約された）後に止められたら、CPU に着かないので予約を外す（#742）
+                machine.cpu.cancelReservation(rt)
+                if (e is InterruptedException) throw ProcessKilledException(e)
+                throw e
+            }
         }
     }
 
@@ -582,7 +601,9 @@ internal class ProcessRunner(private val machine: Machine) {
             prev
         }
         releasePermitAndCpu(rt)
-        val grant = acquireCpu(rt, precheck = null) {
+        // その tick の最後のスライスを使い切った（譲るのではない）なら、取れなければ燃料待ちの列の後ろに並ぶ（#742）。
+        // 譲ったときは CPU の待ち行列の後ろに回るので、そこで燃料がないと分かったら、CPU の待ち行列にいたほかの待ち手と同じく前側に入る
+        val grant = acquireCpu(rt, precheck = null, afterSlice = waitingFuel) {
             // 譲った後、CPU を取り直したら燃料が残っていなかった: ここから次の tick（か再開）を待つ
             if (!waitingFuel) {
                 waitingFuel = true
