@@ -116,6 +116,6 @@
 ## テスト
 
 - `WasiP1KibiDeviceTest`: 直接 / メインスレッド × `UNWIND` / `BLOCK` / `NONE`、`start` → `poll_oneoff` → `take`、列挙と `/dev/device` の fd、外れた後・種類の違うデバイス、境界の値、`cabi_realloc` の中の `invoke` のトラップ、ハンドルの誤り、kill での取り消し、実行時の欄を忘れた巻き直し、デバイスを1回だけ引くこと（テスト用のフック `KernelTestHooks.afterDeviceInvokeResolve` で、引いた後に付け替える）
-- `WasiP1KibiDeviceRestoreTest`: 待つ間に保存して戻す（`Queued`・実行中・`Done`）。メソッドは保存の前後を通して1回だけ走り、実行中のものは `failed("interrupted")`
+- `WasiP1KibiDeviceRestoreTest`: 待つ間に保存して戻す（`Queued`・実行中・`Done`）。メソッドは保存の前後を通して1回だけ走り、実行中のものは `failed("interrupted")`。ほかの台が tick ごとの予算（#356）を使い切って、呼び出しが持ち越しの列にいる間に保存して戻すもの（#736）も確かめる
 - `WasiP1ImportCheckTest`・`KibiWitTableTest`・`KibiWitParseTest`: import の型・`cabi_realloc` の要否・p2・p3 の interface を断ること、WIT との突き合わせ
 - `GuestCallGuardTest`: `callGuest` の中からメインスレッドのメソッドを `beginDeviceInvoke` で呼ぶとトラップ（待機点型・ブロッキング型、`mayWait` が `false` でも）、直接のメソッドは呼べる
