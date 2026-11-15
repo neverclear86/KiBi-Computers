@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -208,13 +209,19 @@ class FuelSliceTest {
             m.spawnTest(h.program(spinForever(progress, sleepMillis = 1)), runDriver())
             h.scheduler.tick()
             eventually { progress.get() > 0 }
+            // 進み具合は、一時停止の印が立った後に読む（読んでから印が立つまでの間にテストのスレッドが止まると、
+            // プロセスはその間もその場でスライスを足して進むので、実時間に左右される）。印が立った後に読めば、
+            // テストのスレッドが止まっても、読んだ後に進む分は減るだけ
+            val pausing = CompletableFuture.supplyAsync { h.scheduler.pauseAll(5_000) }
+            eventually(10_000, "一時停止の印が立たない") { h.scheduler.isPaused }
             val start = progress.get()
-            h.scheduler.pauseAll(5_000).use {
+            pausing.get(10, TimeUnit.SECONDS).use {
                 assertTrue(progress.get() - start <= 20 + 1, "止まるまでに渡した燃料はスライスまで: ${progress.get() - start}")
                 assertEquals(0, h.scheduler.activeProcesses)
             }
+            val resumed = progress.get()
             h.scheduler.tick()
-            eventually { progress.get() > start + 21 }
+            eventually { progress.get() > resumed + 21 }
             m.stop()
         }
     }

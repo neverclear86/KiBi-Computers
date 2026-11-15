@@ -266,7 +266,9 @@ class AsyncFuelTest {
             val counts = listOf(w1.pid, w2.pid).map { runs[it]?.get() ?: 0 }
             val blockingSlices = ticks * 4 - counts.sum()
             assertEquals(blockingSlices, perTick.sum())
-            // 飢えない: 毎 tick 少なくとも 1 スライスは動く（スレッドを持つ側は燃料待ちから起きるたびに CPU を取り直すので、取り分は tick ごとに 1 以上）
+            // 飢えない: 毎 tick 少なくとも 1 スライスは動く（巻き戻す側 2 本が先に 2 スライスを使い、スレッドを持つ側は 3 つ目を取る）。
+            // 巻き戻す側が 1 tick のスライスの数（4）以上いると、スレッドを持つ側は毎 tick 燃料のない CPU しか取れず飢える（ADR 0047、#737）。
+            // この並びはここでは確かめない
             assertTrue(perTick.all { it >= 1 }, "スレッドを持って待つ側が動かなかった tick がある: $perTick（巻き戻す側 $counts）")
             // 巻き戻す側も飢えない
             assertTrue(counts.all { it >= ticks }, "巻き戻す側が飢えた: $counts（スレッドを持つ側 $perTick）")
