@@ -54,8 +54,10 @@
 
 - `MainThreadBudgetTest`: 巡回・持ち越し・数え口・致命的なエラー・重なった `tick()` に加えて、呼び出しを出す側から確かめる（ブロッキング型の `callOnMainThread`、待機点型の `HostWait`、待たずに積んだ `PendingDeviceCall`）。予算を使い切る台を先に並べて呼び出しを持ち越させ、出した側が待ち続けて結果を受け取ること、持ち越しの列にいる `PendingDeviceCall` の写しが Queued で、戻すと積み直して実行することを見る。
 - `WasiP1KibiDeviceTest`: p1 の `kibi:device` の invoke（メインスレッドのメソッド。巻き戻しとブロッキング）が、予算で後の tick に回っても結果まで待つこと。
+- `MainThreadBudgetTest`（#736）: 待機点型のプロセスが `beginDeviceInvoke`・`startDeviceCall`（address と fd）で積んだメインスレッドのメソッドの呼び出しが、持ち越されてもスレッドを持たずに待ち、Queued のまま（マシン全体の写しにも Queued で入る）で、結果を受け取って終わること。
+- `WasiP1KibiDeviceRestoreTest`（#736）: p1 の invoke の呼び出しが持ち越しの列にいる間にマシン全体を保存し（節の形は変わらない）、元の台を閉じると走らず、戻すと1回だけ積み直して（それもまた持ち越されてから）結果が届くこと。
 
-それ以外の core のテスト（デバイス・復元など）は予算が効かない状態で走る。予算との組み合わせは上の2つで見る。
+それ以外の core のテスト（デバイス・復元など）は予算が効かない状態で走る。予算との組み合わせは上の4つ（3クラス）で見る。
 
 ## 今の制限
 
