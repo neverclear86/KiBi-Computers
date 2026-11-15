@@ -104,7 +104,8 @@ internal class ProcessRuntime(
     var fuelWaitThreadless: Boolean = false
 
     /**
-     * 燃料待ちの列で、CPU の待ち行列にいたプロセスの後ろに回る（スライスを使い切って巻き戻した待機点型。#47、ADR 0047）。
+     * 燃料待ちの列で、CPU の待ち行列にいたプロセスの後ろに回る（スライスを使い切って巻き戻した待機点型と、その tick の最後のスライスを使い切った後に
+     * CPU を取り直して燃料がなかったスレッドを持つ待ち手。#47、#742、ADR 0047）。
      * カーネルロックの中で読み書きする
      */
     var fuelWaitBehindCpu: Boolean = false
