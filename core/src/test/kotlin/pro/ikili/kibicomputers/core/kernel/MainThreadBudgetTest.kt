@@ -6,16 +6,22 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.EnumSource
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.api.device.DeviceValue
 import pro.ikili.kibicomputers.core.device.CallResult
 import pro.ikili.kibicomputers.core.device.PendingDeviceCall
+import pro.ikili.kibicomputers.core.kernel.process.DeviceInvokeStart
 import pro.ikili.kibicomputers.core.kernel.process.HostWait
+import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
@@ -38,7 +44,8 @@ class MainThreadBudgetTest {
         )
         val log: MutableList<String> = Collections.synchronizedList(ArrayList())
 
-        fun machine(maxHostCallsPerTick: Int = 64): Machine = h.machine(host = { _, _, _ -> }, maxHostCallsPerTick = maxHostCallsPerTick)
+        fun machine(maxHostCallsPerTick: Int = 64, fuelPerTick: Long = 100): Machine =
+            h.machine(host = { _, _, _ -> }, maxHostCallsPerTick = maxHostCallsPerTick, fuelPerTick = fuelPerTick)
 
         /** [m] に、実行すると時計を [cost] 進めて [name] を記録する呼び出しを積む */
         fun call(m: Machine, name: String, cost: Long) = m.submitHostCall(0) {
@@ -435,6 +442,90 @@ class MainThreadBudgetTest {
             assertEquals(CallResult.Values(listOf(DeviceValue.of(9L))), restoredOn.lock.withLockValue { restored.result })
         }
     }
+
+    /** 待機点型のプロセスが、メインスレッドのメソッドを積む口 */
+    enum class DeviceCallPath { BEGIN_INVOKE, START_BY_ADDRESS, START_BY_FD }
+
+    /**
+     * 上の「待たずに積んだデバイスの呼び出し」と違い、プロセスを通して積む（p1 の `[method]device.invoke` の
+     * `beginDeviceInvoke`、WIT の `start` の `startDeviceCall`）。ほかの台が予算を使い切って呼び出しが持ち越されても、
+     * プロセスは待機点でスレッドを持たずに待ち続け、呼び出しは Queued のまま（写しにも Queued で入る）で、次の tick に結果を受け取って終わる
+     */
+    @ParameterizedTest
+    @EnumSource(DeviceCallPath::class)
+    fun `待機点型のプロセスが積んだメインスレッドのデバイス呼び出しは、予算で持ち越されてもQueuedのまま待ち、結果を受け取って終わる`(path: DeviceCallPath) = timeout(limit) {
+        Budgeted(100).use { b ->
+            val address = "00000000-0000-4000-8000-000000000736"
+            val hog = b.machine()
+            // 呼び出しの燃料（DeviceLimits.CALL_FUEL）を1 tick 分で払えるようにする（燃料の補充を待つ tick を挟まない）
+            val m = b.machine(fuelPerTick = 1_000_000)
+            assertTrue(m.devices.attach(address, ClockDevice(b, "dev", 1)))
+            m.fillFuel()
+            // 予算を使い切る呼び出しを先に積み、プロセスの呼び出しを同じ tick の後ろに並べる
+            b.call(hog, "hog", 1_000)
+            val callFd = AtomicReference<Int>()
+            val callId = AtomicReference<Int>()
+            val got = AtomicReference<CallResult>()
+            val driver = TestDriver(
+                ProcessKind.WAIT_POINT,
+                onResume = { ctx, ready ->
+                    val result = ctx.takeDeviceCall(callFd.get())
+                    if (result == null) {
+                        StepResult.Wait(ready)
+                    } else {
+                        got.set(result)
+                        StepResult.Exit(0)
+                    }
+                },
+            ) { ctx ->
+                val key = when (path) {
+                    DeviceCallPath.BEGIN_INVOKE -> {
+                        val s = ctx.beginDeviceInvoke(ctx.openDevice(address), "m", emptyList(), mayWait = true)
+                        assertTrue(s is DeviceInvokeStart.Waiting, "メインスレッドのメソッドは待つ")
+                        val w = s as DeviceInvokeStart.Waiting
+                        callFd.set(w.callFd)
+                        w.key
+                    }
+                    DeviceCallPath.START_BY_ADDRESS -> {
+                        val fd = ctx.startDeviceCall(address, "m", emptyList())
+                        callFd.set(fd)
+                        WaitKey(ctx.objectOf(fd), WaitCondition.READABLE)
+                    }
+                    DeviceCallPath.START_BY_FD -> {
+                        val fd = ctx.startDeviceCall(ctx.openDevice(address), "m", emptyList())
+                        callFd.set(fd)
+                        WaitKey(ctx.objectOf(fd), WaitCondition.READABLE)
+                    }
+                }
+                callId.set(key.objectId)
+                assertNull(ctx.takeDeviceCall(callFd.get()), "まだ実行していない")
+                StepResult.Wait(listOf(key))
+            }
+            val pid = m.spawnTest(b.h.program(emptyModule()), driver)
+            eventually { m.pendingHostCalls == 1 && m.isAtWaitPoint }
+            // hog が予算を使い切り、プロセスの台は手を付けずに持ち越す
+            assertEquals(listOf("hog"), b.tick())
+            assertEquals(1, b.h.scheduler.carriedMachines.get())
+            assertEquals(1, m.pendingHostCalls)
+            // 持ち越しの列にいる間も、待機点でスレッドを持たずに待ったまま（again を返さず、断らず、捨てない）
+            assertTrue(m.isAtWaitPoint)
+            assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid))
+            assertTrue(m.lock.withLockValue { m.runtime(pid)?.thread == null }, "待機点でスレッドを持たない")
+            val call = m.lock.withLockValue { m.kernel.objects[callId.get()] as PendingDeviceCall }
+            assertTrue(m.lock.withLockValue { call.state } is PendingDeviceCall.State.Queued, "実行し始めるまでは Queued")
+            // マシン全体の写しにも Queued で入る（実行中の interrupted にしない）
+            val copy = m.captureCopy(CapturePolicy.SKIP_IF_TRANSIENT)
+            assertTrue(copy != null, "待機点で待っている間は写せる")
+            assertEquals(PendingDeviceCall.Snapshot.Queued(address, "m", emptyList()), (copy!!.objects[callId.get()] as PendingDeviceCall).snapshot())
+            // 次の tick の先頭で実行し、プロセスは結果を受け取って終わる
+            assertEquals(listOf("dev"), b.tick())
+            eventually { m.stateOf(pid) == ProcessState.EXITED }
+            assertEquals(CallResult.Values(listOf(DeviceValue.of(9L))), got.get())
+        }
+    }
+
+    /** fd [fd] が指すオブジェクトの ID */
+    private fun ProcessContext.objectOf(fd: Int): Int = withKernelLock { kernel.processes[pid]!!.handles[fd]!!.objectId }
 
     @Test
     fun `重なったtickは持ち越しの列を触らずに返し、残りは後のtickで処理する`() = timeout(limit) {
