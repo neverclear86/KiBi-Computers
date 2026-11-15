@@ -132,8 +132,14 @@ public enum class MachineState {
  */
 @ApiStatus.Internal
 public class MachineConfig private constructor(builder: Builder) {
-    /** 1 tick に配る燃料。1回に渡す燃料の上限でもある（仮: 1 tick 約 2 ms 相当） */
+    /** 1 tick に配る燃料（仮: 1 tick 約 2 ms 相当）。1回に渡すのは、そのうち [fuelSlice] まで */
     public val fuelPerTick: Long = builder.fuelPerTick
+
+    /**
+     * 1回に渡す燃料（スライス。#47、ADR 0047）。使い切ったら、CPU を待つプロセスがいれば譲り、いなければその場で次を足して続ける。
+     * 既定は [defaultFuelSlice]。保存しない（[fuelPerTick] から毎回決める）
+     */
+    internal val fuelSlice: Long = minOf(builder.fuelSlice ?: defaultFuelSlice(builder.fuelPerTick), builder.fuelPerTick)
 
     /** プロセスの数の上限（終わっていないプロセスと、親が刈り取っていないゾンビの合計。仮: 64。#46） */
     public val maxProcesses: Int = builder.maxProcesses
@@ -172,6 +178,7 @@ public class MachineConfig private constructor(builder: Builder) {
     /** [MachineConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var fuelPerTick: Long = 1_000_000
+        internal var fuelSlice: Long? = null
         internal var maxProcesses: Int = 64
         internal var maxHostCallsPerTick: Int = 64
         internal var memoryBytes: Long = 32L * 1024 * 1024
@@ -182,6 +189,12 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun fuelPerTick(value: Long): Builder = apply {
             require(value >= 1) { "fuelPerTick は 1 以上" }
             fuelPerTick = value
+        }
+
+        /** 1回に渡す燃料（1 以上。[fuelPerTick] を超えた分は切り詰める。テスト用） */
+        internal fun fuelSlice(value: Long): Builder = apply {
+            require(value >= 1) { "fuelSlice は 1 以上" }
+            fuelSlice = value
         }
 
         /** プロセスの数の上限（1 以上） */
@@ -221,6 +234,15 @@ public class MachineConfig private constructor(builder: Builder) {
     public companion object {
         /** バイト数をページ数にする（切り捨て。32 ビットのメモリの上限まで） */
         private fun pagesOf(bytes: Long): Int = minOf(bytes / WasmMemory.PAGE_SIZE, WasmMemory.MAX_PAGES.toLong()).toInt()
+
+        /**
+         * スライスの下限（仮。#47、確定は #251）。確かめる点の間の行き過ぎ（lua.wasm で最大約 7,000 命令。ADR 0028）と
+         * 前借りの上限（[pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_LIMIT] = 50,000）より十分大きくして、区切りが崩れないようにする
+         */
+        internal const val MIN_FUEL_SLICE: Long = 250_000
+
+        /** 既定のスライス（仮）: `fuelPerTick` の 1/4 か [MIN_FUEL_SLICE] の大きいほう。ただし `fuelPerTick` まで */
+        internal fun defaultFuelSlice(fuelPerTick: Long): Long = minOf(maxOf(fuelPerTick / 4, MIN_FUEL_SLICE), fuelPerTick)
 
         /** 既定の設定 */
         @JvmField
@@ -2385,14 +2407,31 @@ public class Machine private constructor(
     /** 燃料待ち（・一時停止の解除待ち）のプロセス（カーネルロック） */
     private val fuelWaiters = ArrayList<ProcessRuntime>()
     private var inDispatcher = false
-    private var fuelRotation = 0
 
     /** 燃料待ちの数（テスト用） */
     internal val fuelWaiterCount: Int get() = lock.withLockValue { fuelWaiters.size }
 
-    /** 燃料待ちに入れる。カーネルロックの中で呼ぶ */
-    internal fun addFuelWaiterLocked(rt: ProcessRuntime) {
-        if (fuelWaiters.none { it === rt }) fuelWaiters.add(rt)
+    /** 終わっていない燃料待ちがいるか（スライスを使い切ったときに、譲るかを決めるのに使う。#47）。カーネルロックの中で呼ぶ */
+    internal fun hasFuelWaitersLocked(): Boolean = fuelWaiters.any { !it.process.state.isTerminal }
+
+    /**
+     * 燃料待ちに入れる。カーネルロックの中で呼ぶ。
+     *
+     * [behindCpu] は、スライスを使い切って CPU を返す前に並ぶ待機点型（[ProcessRuntime.fuelWaitBehindCpu]）。CPU の待ち行列にいたプロセスは、
+     * この後で CPU を取って燃料がないと分かってから並ぶので、そのまま後ろに足すと、使い切った側がいつも先頭になり、次の tick も同じ順で
+     * 起こされる（プロセスの数が 1 tick のスライスの数 - 1 を割り切ると、配分が偏るか飢える。#47）。そこで、[behindCpu] の待ち手は列の後ろに置き、
+     * そうでない待ち手はその前に入れる。次の tick は、CPU の待ち行列にいた順の続きから起こすことになる（ラウンドロビン）
+     */
+    internal fun addFuelWaiterLocked(rt: ProcessRuntime, behindCpu: Boolean = false) {
+        if (fuelWaiters.none { it === rt }) {
+            rt.fuelWaitBehindCpu = behindCpu
+            if (behindCpu) {
+                fuelWaiters.add(rt)
+            } else {
+                val at = fuelWaiters.indexOfFirst { it.fuelWaitBehindCpu }
+                if (at < 0) fuelWaiters.add(rt) else fuelWaiters.add(at, rt)
+            }
+        }
         if (!inDispatcher) {
             inDispatcher = true
             scheduler.dispatcher.add(this)
@@ -2402,21 +2441,24 @@ public class Machine private constructor(
     /**
      * 燃料待ちを起こす（燃料があるか、燃料を計測しないプロセスで、一時停止でなければ）。カーネルロックの中で呼ぶ。
      * 起こすだけで燃料は渡さない（渡すのは、起こされたプロセスが CPU を取るとき）。起こした数を返す。
+     *
+     * 起こす順は、燃料待ちの列の順（入った順。ただし、スライスを使い切って巻き戻した待機点型は、CPU の待ち行列にいたプロセスの後ろ。
+     * [addFuelWaiterLocked]）。スレッドを持たないプロセスは、その順で CPU の待ち行列に並ぶ。
+     * 起こすたびに先頭をずらさないのは、ずらすと tick をまたぐ順番が実行の様子（巻き戻して譲るたびに起こす回数）で変わり、プロセスが
+     * 1 tick のスライスの数より多いときに配分が偏るため（#47、ADR 0047）
      */
     internal fun wakeFuelWaitersLocked(): Int {
         if (fuelWaiters.isEmpty() || scheduler.isPausedFor(this)) return 0
         val hasFuel = fuelAccount.estimate(scheduler.now) > 0
-        val n = fuelWaiters.size
-        val start = Math.floorMod(fuelRotation++, n)
-        val order = List(n) { fuelWaiters[(start + it) % n] }
         var woken = 0
-        for (rt in order) {
+        for (rt in fuelWaiters.toList()) {
             if (rt.process.state.isTerminal) {
                 fuelWaiters.remove(rt)
                 continue
             }
             if (!hasFuel && !rt.process.unmetered) continue
             fuelWaiters.remove(rt)
+            rt.fuelWaitBehindCpu = false
             woken++
             if (rt.fuelWaitThreadless) {
                 rt.fuelWaitThreadless = false

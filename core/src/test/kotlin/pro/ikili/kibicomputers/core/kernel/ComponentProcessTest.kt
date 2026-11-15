@@ -102,6 +102,39 @@ class ComponentProcessTest {
     }
 
     @Test
+    fun `スライスを使い切っても、core インスタンスをまたぐ呼び出しはその場で足すか譲るかして最後まで進む`() {
+        for (contend in listOf(false, true)) {
+            Harness().use { h ->
+                // 1 tick の燃料 2,000 をスライス 200 に分ける（#47）。共有の燃料（WasmSharedFuel）の中でも、手持ちを足し直せること
+                val m = h.machine(fuelPerTick = 2_000, fuelSlice = 200)
+                if (contend) m.spawnTest(h.program(spinForever()), runDriver())
+                val renewals0 = h.scheduler.fuelSliceRenewals.get()
+                val yields0 = h.scheduler.fuelYields.get()
+                val result = AtomicInteger(-1)
+                val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    pids.set(ctx.pid)
+                    result.set((ctx.component!!.call("run", args = listOf(CanonValue.I32(50_000))) as CanonValue.I32).value)
+                    StepResult.Exit(7)
+                }
+                val rt = m.spawnRt(program(), driver)
+                eventually(30_000, "終わらない（contend=$contend）") {
+                    h.scheduler.tick()
+                    rt.process.state.isTerminal || m.state == MachineState.CRASHED
+                }
+                assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${rt.lastError}")
+                assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+                assertEquals(50_000 + 2 * pids.get(), result.get())
+                if (contend) {
+                    assertTrue(h.scheduler.fuelYields.get() > yields0, "譲っていない")
+                } else {
+                    assertTrue(h.scheduler.fuelSliceRenewals.get() > renewals0, "その場で足していない")
+                }
+                m.stop()
+            }
+        }
+    }
+
+    @Test
     fun `既定のドライバーはコンポーネントをNOEXECで断る`() {
         val e = assertThrows<FsException> { KernelDrivers.DEFAULT.create(program()) }
         assertEquals(Errno.NOEXEC, e.errno)
@@ -233,6 +266,27 @@ class ComponentProcessTest {
             h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
             assertCleanedUp(m, rt, before)
+        }
+    }
+
+    @Test
+    fun `作る途中でスライスを使い切って譲っているところをkillすると、KILLEDになり作ったものを返す`() = timeout(limit) {
+        Harness().use { h ->
+            // start 関数が回り続ける間、スレッドを持ったまま譲り合う（作る途中は巻き戻せない。#47）
+            val m = h.machine(fuelPerTick = 2_000_000, fuelSlice = 20_000)
+            val before = m.memoryAccount.usedBytes
+            m.spawnTest(h.program(spinForever()), runDriver())
+            val yields0 = h.scheduler.fuelYields.get()
+            val rt = m.spawnRt(startSpins, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
+            h.scheduler.tick()
+            eventually(30_000, "譲らない") { h.scheduler.fuelYields.get() - yields0 >= 3 }
+            assertTrue(m.memoryAccount.usedBytes > before, "1 つ目のインスタンスが書き込んだ分を数えている")
+            assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(rt.process.pid, KillSignal.TERMINATE) })
+            h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
+            assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
+            assertEquals(0L, rt.memory.usedBytes, "プロセスの RAM を返す")
+            lockedCheck(m) { assertTrue(rt.instances.isEmpty(), "作った core インスタンスを閉じる") }
+            m.stop()
         }
     }
 
