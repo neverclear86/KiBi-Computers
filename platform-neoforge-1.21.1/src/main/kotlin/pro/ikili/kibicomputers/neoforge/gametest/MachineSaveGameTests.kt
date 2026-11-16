@@ -487,7 +487,7 @@ object MachineSaveGameTests {
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "the case should run again but was ${be.computer}")
         be.pressPowerButton()
         // 部品の落とし物をチャンクに残さない（#746。同じチャンクを使うほかのテストの落とし物の確かめに出てくる）
-        removeCaseAndDrops(level, pos)
+        removeCaseWithoutDrops(level, pos)
         level.setChunkForced(chunk.x, chunk.z, false)
         level.setChunkForced(keeper.x, keeper.z, false)
     }

@@ -384,7 +384,7 @@ object PlayerAccessGameTests {
                 ServerMachines.drainSaves()
                 helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "${b.name}: the save directory should remain")
                 b.be.deleteSaves()
-                removeCaseAndDrops(level, b.pos)
+                removeCaseWithoutDrops(level, b.pos)
                 level.setChunkForced(b.chunk.x, b.chunk.z, false)
             }
             ServerMachines.drainSaves()
