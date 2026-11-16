@@ -45,4 +45,13 @@ void kibi_lua_free(void *ptr);
 #define realloc(p, n) kibi_lua_realloc(p, n)
 #define free(p) kibi_lua_free(p)
 
+/* 新しく数える区画があるときに、数えた後に残す分（kibi_wasi.c の kibi_lua_realloc） */
+#define KIBI_LUA_KEEP (16 * 1024)
+/*
+ * 残りが KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD より少ないとき、kibi_lua_realloc が確保の前に先に数える C のスタックの深さ
+ * （今のスタックポインターから下）。#729 の再現では、上限の近くで初めて書いたスタックが、スタックの上端から 8〜12 KiB の所だった。
+ * 確保する所より深く呼ぶ道（pull → take → convert）の分を足す
+ */
+#define KIBI_LUA_STACK_GUARD (16 * 1024)
+
 #endif

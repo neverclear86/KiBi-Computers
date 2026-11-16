@@ -75,8 +75,13 @@ void kibi_lua_arena_reset(void) {
     }
 }
 
-/* kibi_lua_realloc が残す分（KIBI_LUA_KEEP）と、確保ごとの頭・dlmalloc のチャンクの頭の分 */
-#define KIBI_LUA_MEMORY_MARGIN (24 * 1024)
+/*
+ * kibi_lua_realloc が残す分（KIBI_LUA_KEEP）と、確保ごとの頭・dlmalloc のチャンクの頭の分（8 KiB）に、
+ * 残りが KEEP + STACK_GUARD を切ったときに kibi_lua_realloc が先に数える C のスタックの分（KIBI_LUA_STACK_GUARD）を足す（#729）。
+ * 速い道を通った後の cabi_realloc の確保の途中で残りがその線を切ると、初めての count_stack がここで走り、
+ * その後の commit（keep KIBI_LUA_KEEP）が断られて OUT_OF_MEMORY → トラップになるため、確保の間は残りがその線を切らないようにする
+ */
+#define KIBI_LUA_MEMORY_MARGIN (KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD + 8 * 1024)
 
 int kibi_lua_reserve(size_t need) {
     if (kibi_memory_remaining() >= (uint64_t)need + KIBI_LUA_MEMORY_MARGIN) return 1;
