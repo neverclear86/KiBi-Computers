@@ -624,12 +624,29 @@ public class Machine private constructor(
 
     /**
      * 成功した復元（[completeRestore]）で `restored` イベント（#87、ADR 0087）を入れたキューの数。復元で出していなければ（冷えた起動、
-     * 取り消し、CRASHED、復元していないマシン）-1。0 なら、どのプロセスも `restored` を受けるキューを開いていなかった（シェルは描き直さない）。
-     * 入り直した後に画面が空のままになる件（#636）を切り分けるため、接続層が復元の受け手でログに出す
+     * 取り消し、CRASHED、復元していないマシン）-1。数えるのは入れられたキューだけで、捨てた分（溜めている量が上限を超えた・入れられなかった）は
+     * 数えない（`EventHub.post` の戻り値）。0 は、`restored` を受けるキューを開いたプロセスがなかったか、開いていても全部捨てた
+     * （捨てると、受け手は `dropped` で描き直す）かのどちらかで、この値だけでは見分けられない。
+     * 入り直した後に画面が空のままになる件（#636）を切り分けるため、接続層が復元の受け手でログに出す（プロセスの側は [describeProcesses]）
      */
     @Volatile
     public var restoredEventQueues: Int = -1
         private set
+
+    /**
+     * 終わっていないプロセスの pid・プログラム名・状態・待っている相手を1行にしたもの（ログ用。待つものがなければ `none`）。
+     * 例: `1:sh=WAITING_EVENT waits=[3:READABLE,7:READABLE]`。復元の受け手で見ると、`restored` を受けるはずのプロセスが
+     * 起きたか（`RUNNABLE`）、入力だけを待ったままか（`WAITING_EVENT`）が分かる（#636）
+     */
+    public fun describeProcesses(): String = lock.withLockValue {
+        kernel.processes.all()
+            .filter { !it.state.isTerminal }
+            .joinToString("; ") { p ->
+                val waits = p.wait?.joinToString(",", "[", "]") { "${it.objectId}:${it.condition}" } ?: "-"
+                "${p.pid}:${p.args.firstOrNull() ?: "?"}=${p.state} waits=$waits"
+            }
+            .ifEmpty { "none" }
+    }
 
     /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
     public val isRebootPending: Boolean get() = lock.withLockValue { rebootRequested || rebootNotified }

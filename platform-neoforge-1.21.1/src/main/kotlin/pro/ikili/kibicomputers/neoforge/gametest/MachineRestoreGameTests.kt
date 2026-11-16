@@ -267,16 +267,24 @@ object MachineRestoreGameTests {
     fun restoredShellRedrawsAfterEscape(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
-        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
-            val events = listOf(KeyboardEvent.Text("echo pending"), KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
-            for (packet in events.flatMap { KeyboardEventCodec.encode(listOf(it)) }) {
+        fun send(event: KeyboardEvent) {
+            for (packet in KeyboardEventCodec.encode(listOf(event))) {
                 helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
             }
+        }
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            send(KeyboardEvent.Text("echo pending"))
         }.thenWaitUntil {
             val text = lines(first.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "$ echo pending" }, "the typed text should be shown: $text")
-            // Esc まで読んで、続きを待っている
-            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next byte")
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next key")
+        }.thenExecute {
+            send(KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
+            // Esc は、シェルが読んでエスケープシーケンスの続きを待つまで保存しない。待機点かどうかだけでは、Esc を読み終えたかは分からない
+            // （Esc が TTY に残ったままでも待機点で、戻したシェルはキーの境目の待ちで描き直せてしまう）ので、Esc を届けて読ませるのに十分な
+            // 時間を置く。読み終えたことの決定的な確認は、core の StandardOsRestoreTest（TTY の入力が空であることを見る）
+        }.thenIdle(20).thenWaitUntil {
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the rest of the escape sequence")
         }.thenExecute {
             val tag = saveAndTag(helper, first)
             helper.setBlock(SCREEN, Blocks.AIR)

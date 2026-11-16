@@ -153,11 +153,13 @@ class RestoreEventTest {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val saved = save(h, store, before)
-            val r = restore(h, store, saved, after, probe = { it.restoredEventQueues })
+            val r = restore(h, store, saved, after, probe = { it.restoredEventQueues to it.describeProcesses() })
             assertEquals(RestoreOutcome.RESTORED, r.outcome)
             assertTrue(r.quiesced, "受け手の中は止めたまま")
             // 全部を受けるキューと restored だけを受けるキューの2つ（#636 の切り分けのログに出す数）
-            assertEquals(2, r.probe, "restored を入れたキューの数")
+            val (queueCount, processes) = r.probe as Pair<*, *>
+            assertEquals(2, queueCount, "restored を入れたキューの数")
+            assertTrue((processes as String).contains(":prompt="), "プロセスの状態（ログ用）: $processes")
             val expected = listOf(restored(realtime, world))
             assertEquals(expected, r.inListener["all"], "全部を受けるキュー")
             assertEquals(expected, r.inListener[RestoreEvents.TYPE], "restored だけを受けるキュー")

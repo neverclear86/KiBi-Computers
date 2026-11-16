@@ -353,20 +353,22 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     /**
      * 復元の受け手でつないだ結果を debug で1行出す（#636。入り直した後に画面が空のままになる件の切り分け用。復元1回につき1行）。
-     * ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。冷えた起動なら -1）。
+     * ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。冷えた起動なら -1）、
+     * プロセスの状態（[Machine.describeProcesses]。`restored` を受けるはずのシェルが起きたか、入力だけを待ったままかが分かる）。
      * 受け手の時点の画面はまだ描き直す前なので、中身は出さない
      */
     private fun logRestoreWiring(machine: Machine) {
         if (!LOGGER.isDebugEnabled) return
         val screenPos = wiring.connectedScreen?.blockPos
         LOGGER.debug(
-            "Wired the restored computer at {} (chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}",
+            "Wired the restored computer at {} (chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}, processes={}",
             blockPos,
             ChunkPos(blockPos),
             screenPos ?: "none",
             screenPos?.let(::ChunkPos) ?: "-",
             wiring.screenAttachCount,
             machine.restoredEventQueues,
+            machine.describeProcesses(),
         )
     }
 
