@@ -117,7 +117,13 @@ object CoreLogGameTests {
         helper.succeed()
     }
 
-    private const val TIMEOUT_TICKS = 200
+    /**
+     * [machineHostFailureReachesLog4j] の tick 数の上限。待つ相手は壁時計で進む起動用スレッド（`KiBi-boot-*`）の2往復で、
+     * GameTest のサーバーは tick の間で待たないので、tick が軽いと少ない上限は数十ミリ秒で過ぎてしまう。
+     * 起動用スレッドの生成と初回のクラス読み込みもこのテストの中で起きる（1.20.1 でカーネルのスレッドを使うテストはこれだけ）ので、
+     * 起動を待つほかのテスト（1.21.1 の `TestComputerGameTests`）と同じ大きさにする。条件がそろえばすぐ終わるので、大きくしても遅くはならない
+     */
+    private const val TIMEOUT_TICKS = 12_000
 
     /** [Machine] のロガー名（`Machine.kt` の `LOG`） */
     private const val MACHINE_LOG = "kibicomputers.machine"
@@ -179,15 +185,22 @@ object CoreLogGameTests {
                 }
             }
         }
-        // 1.20.1 の `GameTestHelper` は `testInfo` を隠していて、終わりを知らせるリスナーを付けられない。
-        // 成功の経路では、判定がすべて通ったところ（`succeedWhen` の最後）で片付ける。テストが終わると
-        // 予約した処理は走らない（`GameTestInfo.tick` は終わった後に `runAtTickTimeMap` を処理しない）ため。
-        // 判定が通らないままのときは、タイムアウトの少し前に片付け、そのままタイムアウトで失敗させる
-        helper.runAfterDelay(TIMEOUT_TICKS - 10L) { cleanUp() }
         try {
             val error = RuntimeException("CoreLogGameTests host failure (not a bug) $mark")
             val host = ThrowingHost(error)
             val machine = scheduler.createMachine(host, MachineConfig.DEFAULT)
+            // 1.20.1 の `GameTestHelper` は `testInfo` を隠していて、終わりを知らせるリスナーを付けられない。
+            // 成功の経路では、判定がすべて通ったところ（`succeedWhen` の最後）で片付ける。テストが終わると
+            // 予約した処理は走らない（`GameTestInfo.tick` は終わった後に `runAtTickTimeMap` を処理しない）ため。
+            // 判定が通らないままのときは、タイムアウトの少し前に、片付ける前の状態を控えてから片付け、その場で失敗させる
+            // （予約した処理が投げた例外で、`GameTestInfo` はテストを失敗にする）。片付けた後の状態（閉じたスケジューラなど）を
+            // 判定に見せず、片付けからタイムアウトまでの間に条件がそろって通ることもない
+            helper.runAfterDelay(TIMEOUT_TICKS - 10L) {
+                val state = "failure=${host.failure}, failures=${host.failures.get()}, state=${machine.state}, " +
+                    "events=${synchronized(events) { events.toList() }}"
+                cleanUp()
+                helper.fail("the host failure was not logged and delivered twice within ${TIMEOUT_TICKS - 10} ticks: $state")
+            }
             fun boot() = machine.boot(BootConfig.builder().firmwarePresent(false).addBootDisk("any").build())
             helper.assertTrue(boot(), "boot should be accepted")
             var rebooted = false

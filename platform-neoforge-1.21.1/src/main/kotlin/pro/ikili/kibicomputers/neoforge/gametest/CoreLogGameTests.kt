@@ -120,6 +120,13 @@ object CoreLogGameTests {
         helper.succeed()
     }
 
+    /**
+     * [machineHostFailureReachesLog4j] の tick 数の上限。待つ相手は壁時計で進む起動用スレッド（`KiBi-boot-*`）の2往復で、
+     * GameTest のサーバーは tick の間で待たないので、普通の上限（100 tick）は tick が軽いと数十ミリ秒で過ぎてしまう。
+     * 起動を待つほかのテスト（`TestComputerGameTests`）と同じ大きさにする。条件がそろえばすぐ終わるので、大きくしても遅くはならない
+     */
+    private const val HOST_FAILURE_TIMEOUT_TICKS = 12_000
+
     /** [Machine] のロガー名（`Machine.kt` の `LOG`） */
     private const val MACHINE_LOG = "kibicomputers.machine"
 
@@ -150,7 +157,7 @@ object CoreLogGameTests {
      * スケジューラを分けるので、スタックトレースを付けた場所の記録（`claimHostFailureTrace`）もほかのテストと共有しない。
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = HOST_FAILURE_TIMEOUT_TICKS)
     fun machineHostFailureReachesLog4j(helper: GameTestHelper) {
         val mark = UUID.randomUUID().toString()
         val events = Collections.synchronizedList(ArrayList<Triple<Log4jLevel, String, Throwable?>>())
