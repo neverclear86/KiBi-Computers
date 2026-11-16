@@ -141,7 +141,9 @@ internal object ComponentLoader {
      * [block] を、[watchdog] で [deadline] の上限まで見張って動かす（#666）。見張りが時間切れで割り込んだら、[block] が
      * どう終わっても（割り込みの [WasmTrapException]、WASI の入出力が割り込みで失敗した [WasmLoadException]、終わり際に届いて
      * 正常に戻った、のどれでも）、割り込みの印を下ろして、時間の上限を超えた [WasmLoadException] を投げる。
-     * 時間切れでなければ、[block] の結果をそのまま返す（ほかの理由の割り込みは [WasmTrapException] のまま、印も立てたまま）
+     * 時間切れでなければ、[block] の結果をそのまま返す（ほかの理由の割り込みは [WasmTrapException] のまま、印も立てたまま）。
+     * [VirtualMachineError]（`OutOfMemoryError` など）は、時間切れと重なっても内容の失敗に包まず、割り込みの印だけ下ろして
+     * そのまま投げる（ADR 0262。`ProgramCache` が VM のエラーを内容の失敗として覚えないため）
      */
     private inline fun watched(watchdog: ValidationWatchdog, deadline: LoadDeadline, phase: String, block: () -> Unit) {
         val watch = watchdog.watch(deadline)
@@ -151,7 +153,9 @@ internal object ComponentLoader {
         } catch (e: Throwable) {
             e
         }
-        if (watch.finish()) throw deadline.exceeded(phase, cause = failure)
+        val timedOut = watch.finish()
+        if (failure is VirtualMachineError) throw failure
+        if (timedOut) throw deadline.exceeded(phase, cause = failure)
         if (failure != null) throw failure
     }
 

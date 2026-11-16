@@ -17,8 +17,10 @@ import java.lang.management.ThreadMXBean
 internal class LoadDeadline(
     /** 上限（ナノ秒） */
     val limitNanos: Long,
+    /** CPU 時間の時計（テストで差し替える）。`null` なら経過時間で測る。既定は、このスレッドの CPU 時間（測れなければ `null`） */
+    cpuClock: (() -> Long)? = cpuClock(),
 ) {
-    private val clock: () -> Long = cpuClock() ?: WALL
+    private val clock: () -> Long = cpuClock ?: WALL
 
     /** CPU 時間で測っているか（`false` なら経過時間） */
     val usesCpuTime: Boolean = clock !== WALL

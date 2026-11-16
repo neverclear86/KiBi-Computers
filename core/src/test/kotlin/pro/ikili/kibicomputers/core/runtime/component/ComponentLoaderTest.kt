@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.runtime.component
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
@@ -1047,6 +1048,48 @@ class ComponentLoaderTest {
         assertTrue(timer.tasks.isNotEmpty())
         for ((_, task) in timer.tasks.toList()) task.run()
         assertTrue(!Thread.currentThread().isInterrupted)
+    }
+
+    /** 時間切れの発火の後に [fail] で終わる検証を [ComponentLoader.load] に渡して、出てきた失敗を返す */
+    private fun loadFailingAfterTimeout(fail: () -> Nothing): Throwable? {
+        val timer = ManualTimer()
+        var wall = 0L
+        val watchdog = ValidationWatchdog(timer, wallClock = { wall })
+        // 経過時間で測る上限（時計を進めて時間切れにする）
+        val deadline = LoadDeadline(1_000_000_000L, cpuClock = null)
+        val e = runCatching {
+            ComponentLoader.load(
+                full,
+                deadline = deadline,
+                watchdog = watchdog,
+                validate = {
+                    wall += 2_000_000_000L
+                    timer.tasks.last().second.run()
+                    assertTrue(Thread.currentThread().isInterrupted)
+                    fail()
+                },
+            )
+        }.exceptionOrNull()
+        // どの失敗でも、時間切れで立てた割り込みの印は下ろす
+        assertTrue(!Thread.currentThread().isInterrupted)
+        return e
+    }
+
+    @Test
+    fun `時間切れと重なった検証の失敗は時間の上限の失敗にする`() {
+        val cause = IllegalStateException("途中で止まった")
+        val e = loadFailingAfterTimeout { throw cause }
+        assertTrue(e is WasmLoadException) { "$e" }
+        assertMessage(e as Exception, "時間の上限")
+        assertSame(cause, e.cause)
+    }
+
+    @Test
+    fun `時間切れと重なってもVMのエラーは内容の失敗に包まずそのまま投げる`() {
+        val oom = OutOfMemoryError("検証の途中")
+        assertSame(oom, loadFailingAfterTimeout { throw oom })
+        val soe = StackOverflowError()
+        assertSame(soe, loadFailingAfterTimeout { throw soe })
     }
 
     @Test

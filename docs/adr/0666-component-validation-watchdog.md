@@ -29,8 +29,9 @@ Endive の事前コンパイル済みのマシン（`WasmToolsModule.create`）�
 
 - `watch(deadline)` で今のスレッドを見張り始め、処理が終わったら（例外のときも）必ず `Watch.finish()` を呼ぶ
 - 状態は RUNNING・TIMED_OUT・DONE の3つ。タイマーは同じロックの下で RUNNING → TIMED_OUT に変え、**ロックを持ったまま** `thread.interrupt()` を呼ぶ。`finish` も同じロックの下で DONE にし、TIMED_OUT だったら `Thread.interrupted()` で印を下ろして `true` を返す。だから、検証が終わった後に割り込みが遅れて届き、同じコンパイル用のスレッドの次の段（Endive の `runtime.load`、燃料の挿入、リンク、別の `ProgramCache` の仕事）を止めることはない（`ThreadPoolExecutor.runWorker` が仕事の前に印を消すのは当てにしない）
-- 予定は、全体で共有する `ScheduledThreadPoolExecutor`（1 本。`KiBi-wasm-watchdog`、daemon、`removeOnCancelPolicy`、仕事がなければ 1 秒で終わる）で待つ。最初に使うときに作る。`ComponentLoader` はスケジューラ（`MachineScheduler`）に依存しないので、`KiBi-timer` は使わない。統合サーバーでワールドを出入りしても、スレッドは溜まらない
-- テストでタイマーを差し替えられるよう、`ComponentLoader.load` は省略できる引数 `watchdog` を取る（既定は共有のもの）
+- 予定は、全体で共有する `ScheduledThreadPoolExecutor`（1 本。`KiBi-wasm-watchdog`、daemon、`removeOnCancelPolicy`、仕事がなければ 1 秒で終わる）で待つ。最初に使うときに作る。スレッドの優先度は通常（`NORM_PRIORITY`）に固定する。指定しないと、`schedule` を呼んだスレッド（本番では最低優先度のコンパイル用のスレッド）の優先度を引き継ぎ、上限を守らせる側が遅れうる。`ComponentLoader` はスケジューラ（`MachineScheduler`）に依存しないので、`KiBi-timer` は使わない。統合サーバーでワールドを出入りしても、スレッドは溜まらない
+- 時間切れと重なって検証が `VirtualMachineError`（`OutOfMemoryError` など）で終わったときは、割り込みの印を下ろしたうえで、そのまま投げる（時間の上限の失敗に包まない。ADR 0262 と、`ProgramCache` が VM のエラーを内容の失敗として覚えないことに合わせる）
+- テストでタイマー・CPU 時間の読み取り・経過時間の時計・`LoadDeadline` の CPU 時計を差し替えられるよう、`ValidationWatchdog` はそれらを引数に取り、`ComponentLoader.load` は省略できる引数 `watchdog` を取る（既定は共有のもの）
 
 ### 時計
 

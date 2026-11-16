@@ -26,7 +26,13 @@ import java.util.concurrent.TimeUnit
  * 同時に見張るのは、コンパイル用のスレッドの本数まで（既定 1 本）なので、台数が増えてもスレッドは増えない。
  * 取り消した予定はすぐ外す（普段の検証は数十 ms で終わり、そのたびに予定を取り消す）。
  */
-internal class ValidationWatchdog(private val timer: Timer) {
+internal class ValidationWatchdog(
+    private val timer: Timer,
+    /** 別のスレッドの CPU 時間を読む（テストで差し替える）。読めなければ -1 */
+    private val cpuReader: (Thread) -> Long = ::threadCpuNanos,
+    /** 経過時間の時計（テストで差し替える） */
+    private val wallClock: () -> Long = System::nanoTime,
+) {
     /** 予定を入れるもの（テストで差し替える）。[schedule] は [delayNanos] 後に [task] を動かし、取り消せる [Future] を返す */
     fun interface Timer {
         fun schedule(delayNanos: Long, task: Runnable): Future<*>
@@ -52,8 +58,8 @@ internal class ValidationWatchdog(private val timer: Timer) {
         private val base = deadline.elapsedNanos
 
         /** 見張りを始めた時点の時計の値（CPU 時間が読めなければ経過時間） */
-        private val cpuAtStart: Long = if (deadline.usesCpuTime) threadCpuNanos(thread) else -1
-        private val wallAtStart: Long = System.nanoTime()
+        private val cpuAtStart: Long = if (deadline.usesCpuTime) cpuReader(thread) else -1
+        private val wallAtStart: Long = wallClock()
 
         /** 時間切れで割り込んだか */
         val timedOut: Boolean get() = synchronized(lock) { state == State.TIMED_OUT }
@@ -105,12 +111,12 @@ internal class ValidationWatchdog(private val timer: Timer) {
         /** [LoadDeadline] の時計で見た、使った時間 */
         private fun effectiveElapsed(): Long {
             if (deadline.usesCpuTime) {
-                val cpu = if (cpuAtStart >= 0) threadCpuNanos(thread) else -1
+                val cpu = if (cpuAtStart >= 0) cpuReader(thread) else -1
                 if (cpu >= 0) return base + (cpu - cpuAtStart)
                 // 別のスレッドの CPU 時間が読めない: 経過時間で代え、早く切らないように割り引く
-                return base + (System.nanoTime() - wallAtStart) / WALL_FALLBACK_FACTOR
+                return base + (wallClock() - wallAtStart) / WALL_FALLBACK_FACTOR
             }
-            return base + (System.nanoTime() - wallAtStart)
+            return base + (wallClock() - wallAtStart)
         }
 
         /** 上限までの残りを、待つ経過時間にしたもの */
@@ -142,8 +148,8 @@ internal class ValidationWatchdog(private val timer: Timer) {
 
         private const val THREAD_NAME = "KiBi-wasm-watchdog"
 
-        /** 仕事がないときにタイマーのスレッドを残しておく時間（秒。検証が続くあいだは残り、止まればすぐ終わる） */
-        private const val IDLE_SECONDS = 1L
+        /** 仕事がないときにタイマーのスレッドを残しておく時間（ミリ秒。検証が続くあいだは残り、止まればすぐ終わる） */
+        private const val IDLE_MILLIS = 1_000L
 
         private val bean: ThreadMXBean? = try {
             ManagementFactory.getThreadMXBean().takeIf { it.isThreadCpuTimeSupported }
@@ -164,19 +170,28 @@ internal class ValidationWatchdog(private val timer: Timer) {
         private fun saturatedTimes(a: Long, b: Long): Long =
             if (a > Long.MAX_VALUE / b) Long.MAX_VALUE else a * b
 
-        private val executor: ScheduledThreadPoolExecutor by lazy {
+        /**
+         * タイマーのスレッド1本の実行器を作る。スレッドは daemon で、優先度は通常に固定する（指定しないと、`schedule` を呼んだスレッド、
+         * つまり本番では最低優先度のコンパイル用のスレッドから引き継ぎ、時間の上限を守らせる側が遅れうる）。
+         * 仕事がなければ [idleMillis] 後に終わる（作り直しは仕事が来たとき）
+         */
+        fun newExecutor(idleMillis: Long): ScheduledThreadPoolExecutor =
             ScheduledThreadPoolExecutor(1) { r ->
-                Thread(r, THREAD_NAME).apply { isDaemon = true }
+                Thread(r, THREAD_NAME).apply {
+                    isDaemon = true
+                    priority = Thread.NORM_PRIORITY
+                }
             }.apply {
                 removeOnCancelPolicy = true
-                setKeepAliveTime(IDLE_SECONDS, TimeUnit.SECONDS)
+                setKeepAliveTime(idleMillis, TimeUnit.MILLISECONDS)
                 allowCoreThreadTimeOut(true)
             }
-        }
+
+        private val executor: ScheduledThreadPoolExecutor by lazy { newExecutor(IDLE_MILLIS) }
 
         /** 全体で共有する見張り（タイマーのスレッド1本） */
         val shared: ValidationWatchdog by lazy {
-            ValidationWatchdog { delay, task -> executor.schedule(task, delay, TimeUnit.NANOSECONDS) }
+            ValidationWatchdog(timer = { delay, task -> executor.schedule(task, delay, TimeUnit.NANOSECONDS) })
         }
     }
 }
