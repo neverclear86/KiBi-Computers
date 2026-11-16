@@ -7,6 +7,7 @@ import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.Tag
 import net.minecraft.network.chat.Component
 import net.minecraft.server.level.ServerLevel
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.MenuProvider
 import net.minecraft.world.entity.player.Inventory
 import net.minecraft.world.entity.player.Player
@@ -14,6 +15,8 @@ import net.minecraft.world.inventory.AbstractContainerMenu
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.chunk.LevelChunk
+import pro.ikili.kibicomputers.core.access.PlayerAccess
+import pro.ikili.kibicomputers.core.access.PlayerAccessRecord
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -42,6 +45,7 @@ import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
+import java.util.UUID
 
 /**
  * ケースブロックのブロックエンティティ（#121）。部品スロット（[parts]）と、電源・状態（`core` の [ComputerCase]）を持つ。
@@ -67,6 +71,10 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
  * - 確定した ID があるときの [loadAdditional]（`/data merge` など）は、ID を変えない。読み込み済みで ID がまだなければ、その場で確かめる
  * - ID はマシンを初めて取り出すときに振る（電源を入れていないケースには振らない）
  *
+ * 持ち主と権限（#131、ADR 0131）: [playerAccess] を持ち、NBT の `PlayerAccess` に書く（持ち主がいなければ書かない。タグのない古い
+ * データは持ち主なし）。読めなかった記録は locked（OP だけが使える）にして、読んだ生のタグをそのまま書き戻す。ADR 0081 の
+ * 「owner」（[owner]、マシン ID を持つブロックの位置）とは別物。クライアントには送らない（[getUpdateTag] は上書きしない）
+ *
  * 書き込みのスレッド（#84、ADR 0084）: 取り出した写しは書き込みに回し（[captureAndSubmit]。予約は [pendingSave]）、NBT に書く [identity] は、
  * 書き込みの完了（[onSaveCompleted]）か、アンロードで予約の世代を採るとき（[adoptPendingSave]）にだけ進める。
  * 書き込み中の「今の ID」は [currentIdentity]（予約の ID。なければ [identity]）で、次の予約・削除・索引の外しはこれを使う
@@ -81,7 +89,13 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     val parts: CaseParts = CaseParts(tier) { onPartsChanged() }
 
     /** 隣のデバイスの結線（#129）。つなぎ直すのは、この結線のマシンがケースの今のマシンのときだけ */
-    internal val wiring: CaseWiring = CaseWiring { computer.machine }
+    internal val wiring: CaseWiring = CaseWiring({ computer.machine }) { player, touch ->
+        if (!touch) {
+            checkAccess(player)
+        } else {
+            touchAccess(player).also { if (!it) CaseAccess.deny(player, playerAccess) }
+        }
+    }
 
     /**
      * マシンからの通知を [wiring] に中継する。ケース（[computer]）が自分の判断でマシンを外した（CRASHED・ゲストが止めた。#640、
@@ -153,6 +167,60 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
     private val installedForBoot = ProvisionalBoot.withBootPart(tier, parts.installed)
+
+    // ---- 持ち主と権限（#131） ----
+
+    /** 持ち主と権限。サーバーのメインスレッドで読み書きする（クライアントでは常に [PlayerAccess.NONE]） */
+    internal var playerAccess: PlayerAccess = PlayerAccess.NONE
+        private set
+
+    /** 読めなかった `PlayerAccess` の生のタグ（[playerAccess] が locked のときだけ。そのまま書き戻す） */
+    private var rawPlayerAccess: Tag? = null
+
+    /** 読めなかった記録の WARN を出した（BE ごとに1回） */
+    private var warnedLockedAccess = false
+
+    /** 持ち主の UUID（持ち主なし・読めなかった記録なら `null`。#205 のプレイヤーごとの台数で使う） */
+    internal val ownerPlayerId: UUID? get() = playerAccess.owner?.id
+
+    /**
+     * 持ち主と権限を [access] に置き換える（設置・テスト・#110 の管理）。読めなかった生のタグは捨てる。
+     *
+     * locked（読めなかった記録）は読み込みからだけ作る。locked の今の値の変更の結果（[PlayerAccess.addPending] などは locked なら
+     * そのまま返す）を渡したときは何もせず、生のタグを持ち続ける。locked でないケースを locked にはできない（生のタグがないと保存で
+     * 何も書けず、読み直すと持ち主なしに戻ってしまう）ので、[IllegalArgumentException] を投げる
+     */
+    internal fun replacePlayerAccess(access: PlayerAccess) {
+        if (access.locked) {
+            require(playerAccess.locked) { "a locked access can only come from loading an unreadable record" }
+            return
+        }
+        if (access === playerAccess && rawPlayerAccess == null) return
+        playerAccess = access
+        rawPlayerAccess = null
+        setChanged()
+    }
+
+    /** [player] がこのケースを操作（GUI・キーボード・破壊）できるか。副作用はない（毎 tick の確かめにも使う） */
+    internal fun checkAccess(player: Player): Boolean {
+        val rules = CaseAccess.rules()
+        return playerAccess.mayUse(CaseAccess.ref(player), CaseAccess.isOp(player, rules))
+    }
+
+    /**
+     * [player] のアクセス（ケースの右クリック・キーボードのセッションを開く）: 保留の昇格と最後の名前の更新をしてから（変わったときだけ
+     * `setChanged`）、操作できるかを返す
+     */
+    internal fun touchAccess(player: ServerPlayer): Boolean {
+        val rules = CaseAccess.rules()
+        val ref = CaseAccess.ref(player)
+        val next = playerAccess.onAccess(ref, System.currentTimeMillis(), rules)
+        if (next !== playerAccess) {
+            playerAccess = next
+            setChanged()
+        }
+        return playerAccess.mayUse(ref, CaseAccess.isOp(player, rules))
+    }
 
     // ---- マシンの ID（#81） ----
 
@@ -474,6 +542,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         tag.put(PARTS_TAG, parts.serializeNBT(registries))
         speakerSlot.save(tag)
         tag.putBoolean(POWERED_ON_TAG, computer.poweredOn)
+        savePlayerAccess(tag)
         // 参照を書くだけ（チャンクの保存のほかに /data get block・/clone・ピックブロックからも呼ばれる。印は ChunkDataEvent.Save で付ける）
         val id = identity
         if (id != null) {
@@ -493,6 +562,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         speakerSlot.load(tag)
         // 古いセーブデータ（タグがない）は電源が切れている（#85）
         computer.loadPoweredOn(tag.getBoolean(POWERED_ON_TAG))
+        loadPlayerAccess(tag)
         val id = if (tag.contains(MACHINE_ID_TAG, Tag.TAG_STRING.toInt())) tag.getString(MACHINE_ID_TAG) else null
         val generation = if (tag.contains(SAVE_GENERATION_TAG, Tag.TAG_LONG.toInt())) tag.getLong(SAVE_GENERATION_TAG) else null
         val epoch = if (tag.contains(OWNER_EPOCH_TAG, Tag.TAG_LONG.toInt())) tag.getLong(OWNER_EPOCH_TAG) else null
@@ -509,6 +579,36 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         rawEpoch = epoch
         // 読み込み済みで ID がまだなかった（/data merge で ID を足したときなど）: その場で確かめる
         if (loadedOnServer) claimIdentity()
+    }
+
+    // 持ち主がいなければ書かない。期限切れの保留は書く前に捨てる（値が減るだけなので setChanged は要らない）
+    private fun savePlayerAccess(tag: CompoundTag) {
+        val access = playerAccess
+        if (access.locked) {
+            rawPlayerAccess?.let { tag.put(PLAYER_ACCESS_TAG, it.copy()) }
+            return
+        }
+        if (access.owner == null) return
+        val pruned = access.pruneExpired(System.currentTimeMillis(), CaseAccess.rules())
+        playerAccess = pruned
+        PlayerAccessRecord.of(pruned)?.let { tag.put(PLAYER_ACCESS_TAG, PlayerAccessNbt.write(it)) }
+    }
+
+    // タグがなければ持ち主なし（古いデータ・/setblock）。読めなければ locked にして、生のタグを持ち続ける
+    private fun loadPlayerAccess(tag: CompoundTag) {
+        val raw = tag.get(PLAYER_ACCESS_TAG)
+        if (raw == null) {
+            playerAccess = PlayerAccess.NONE
+            rawPlayerAccess = null
+            return
+        }
+        val access = if (raw is CompoundTag) PlayerAccessRecord.toAccess(PlayerAccessNbt.read(raw)) else PlayerAccess.LOCKED
+        playerAccess = access
+        rawPlayerAccess = if (access.locked) raw.copy() else null
+        if (access.locked && !warnedLockedAccess) {
+            warnedLockedAccess = true
+            LOGGER.warn("Could not read the owner of the computer at {} ({}); only operators can use it", blockPos, raw)
+        }
     }
 
     override fun getDisplayName(): Component = blockState.block.name
@@ -531,6 +631,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
         /** セーブデータの、持ち主の epoch のキー（#81） */
         const val OWNER_EPOCH_TAG: String = "OwnerEpoch"
+
+        /** セーブデータの、持ち主と権限のキー（#131、ADR 0131） */
+        const val PLAYER_ACCESS_TAG: String = "PlayerAccess"
 
         /** セーブデータの、電源が入っているかのキー（#85、ADR 0085） */
         const val POWERED_ON_TAG: String = "PoweredOn"

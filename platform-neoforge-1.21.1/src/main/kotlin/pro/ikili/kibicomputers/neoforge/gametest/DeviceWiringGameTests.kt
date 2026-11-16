@@ -170,7 +170,7 @@ object DeviceWiringGameTests {
         val manager = ServerMachines.current!!
         val key = MachineKey(helper.level.dimension(), helper.absolutePos(CASE.east()))
         var caseMachine: Machine? = null
-        val wiring = CaseWiring { caseMachine }
+        val wiring = CaseWiring({ caseMachine })
         val machine = manager.attach(key, wiring, MachineConfig.DEFAULT)
         caseMachine = machine
         // 起動して（動いている印がないと、つなぎ直さない）つなぐ

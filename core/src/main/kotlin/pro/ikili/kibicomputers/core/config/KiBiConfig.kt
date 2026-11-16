@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.config
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.access.AccessRules
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
@@ -233,6 +234,40 @@ public object KiBiConfig {
         "キーボードの入力の、1 tick ごとに戻る量（バイト）。変えた後に開いたキーボードから効く。",
     )
 
+    // ---- access: 持ち主と権限（#131、ADR 0131）。読み直しで効く ----
+
+    /** この権限レベル以上のプレイヤー（OP）は、持ち主のあるコンピューターも操作・破壊・管理できる */
+    @JvmField
+    public val ACCESS_OP_PERMISSION_LEVEL: IntEntry = serverInt(
+        "access", "opPermissionLevel", AccessRules.DEFAULT_OP_PERMISSION_LEVEL, 1, 4, ConfigApply.RELOAD,
+        "Players with at least this permission level can use, break and manage computers owned by others.",
+        "この権限レベル以上のプレイヤーは、ほかの人が持ち主のコンピューターも操作・破壊・管理できる。",
+    )
+
+    /** 保留の追加の期限（時間） */
+    @JvmField
+    public val ACCESS_PENDING_INVITE_HOURS: IntEntry = serverInt(
+        "access", "pendingInviteHours", AccessRules.DEFAULT_PENDING_TTL_HOURS, 1, 720, ConfigApply.RELOAD,
+        "Hours a member added by name waits for that player to use the computer before it expires.",
+        "名前で足したメンバーが、そのプレイヤーがコンピューターを使うのを待つ時間（時間）。過ぎたら取り消す。",
+    )
+
+    /** 1台のメンバーの上限 */
+    @JvmField
+    public val ACCESS_MAX_MEMBERS: IntEntry = serverInt(
+        "access", "maxMembers", AccessRules.DEFAULT_MAX_MEMBERS, 0, 256, ConfigApply.RELOAD,
+        "Maximum number of members of one computer.",
+        "1台のコンピューターのメンバーの数の上限。",
+    )
+
+    /** 1台の保留の上限 */
+    @JvmField
+    public val ACCESS_MAX_PENDING_INVITES: IntEntry = serverInt(
+        "access", "maxPendingInvites", AccessRules.DEFAULT_MAX_PENDING, 0, 64, ConfigApply.RELOAD,
+        "Maximum number of members added by name that are still waiting, per computer.",
+        "1台のコンピューターの、名前で足してまだ待っているメンバーの数の上限。",
+    )
+
     /** すべての項目（宣言の順） */
     @JvmField
     public val ENTRIES: List<ConfigEntry<*>> = entries.toList()
@@ -251,6 +286,7 @@ public object KiBiConfig {
         "save" to listOf("Saving and restoring running computers.", "動いているコンピューターの保存と復元。"),
         "screenSync" to listOf("Network budget for screen updates.", "画面の更新を送る量の予算。"),
         "keyboard" to listOf("Limits on keyboard input.", "キーボードの入力の上限。"),
+        "access" to listOf("Owners and permissions of computers.", "コンピューターの持ち主と権限。"),
     )
 
     /** [section] の区画の名前の lang のキー */
@@ -317,4 +353,13 @@ public object KiBiConfig {
             KeyboardInputBudget(capacity, refill)
         }
     }
+
+    /** [values] から持ち主と権限の仮値を作る（#131） */
+    @JvmStatic
+    public fun accessRules(values: ConfigValues): AccessRules = AccessRules(
+        values[ACCESS_OP_PERMISSION_LEVEL],
+        AccessRules.hoursToMillis(values[ACCESS_PENDING_INVITE_HOURS]),
+        values[ACCESS_MAX_MEMBERS],
+        values[ACCESS_MAX_PENDING_INVITES],
+    )
 }

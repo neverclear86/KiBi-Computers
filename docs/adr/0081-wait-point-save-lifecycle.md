@@ -45,7 +45,7 @@
 | アンロード | `ChunkEvent.Unload`（`LevelChunk`・`ServerLevel`）で、そのチャンクの全ケースを止める → 待つ（tick ごとの予算 `unloadWaitBudgetMillis` 仮 50 ms）→ `KILL_TRANSIENT` で取り出す → 書く → `chunk.setUnsaved(true)` → 続く `ChunkMap.save` が新しい世代を NBT に書く → `onChunkUnloaded` で捨てる |
 | 停止 | `ServerStoppingEvent`（`saveAllChunks` の前）で全台を止める → まとめて最大 `stopQuiesceMillis`（仮 500 ms）待つ → 全台を `KILL_TRANSIENT` で取り出して書く → `setChanged`。止めた台は `ServerStoppedEvent` まで止めたまま。後で来る `ChunkEvent.Unload` は「取り出し済み」として、NBT が古い世代を指すときだけ `setUnsaved(true)` を付ける |
 | 自動保存 | 周期（仮 6000 tick）ごとに、電源の入っている台の列を作り、tick ごとの予算で回して書く（下）。GameTest のサーバーでは切る（ほかのテストのケースを止めないように。負荷試験は試験の間だけ有効にする） |
-| プレイヤーの破壊・爆発 | `CaseBlock.playerWillDestroy`・`onBlockExploded` で `<uuid>/` を消す |
+| プレイヤーの破壊・爆発 | `CaseBlock.playerWillDestroy`・`onBlockExploded` で `<uuid>/` を消す。権限のない人の破壊は、その前の `BreakEvent` で止まる。持ち主のあるケースは爆発で壊れない（ADR 0131） |
 | そのほかの `setRemoved` | 取り出さずに捨てる。ディレクトリは消さない |
 
 - **アンロードで `setChanged` が効かず、`setUnsaved(true)` を直接付ける理由**: MC 1.21.1 の `ChunkMap` は `setLoaded(false)` → `ChunkEvent.Unload` → `save(chunk)` → `level.unload` の順に走る。`Level.blockEntityChanged` は `hasChunkAt` を見るので、`setLoaded(false)` の後の `setChanged` はチャンクに届かない。`save` は `isUnsaved()` を見て保存するかを決めるので、イベントのチャンクに直接付ける
