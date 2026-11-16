@@ -486,7 +486,8 @@ object MachineSaveGameTests {
         helper.assertTrue(be.identity?.id == id, "the case should keep its id but was ${be.identity}")
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "the case should run again but was ${be.computer}")
         be.pressPowerButton()
-        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+        // 部品の落とし物をチャンクに残さない（#746。同じチャンクを使うほかのテストの落とし物の確かめに出てくる）
+        removeCaseAndDrops(level, pos)
         level.setChunkForced(chunk.x, chunk.z, false)
         level.setChunkForced(keeper.x, keeper.z, false)
     }

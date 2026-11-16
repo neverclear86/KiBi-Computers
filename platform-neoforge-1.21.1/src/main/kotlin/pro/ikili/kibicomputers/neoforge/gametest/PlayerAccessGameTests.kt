@@ -60,6 +60,8 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.UUID
 
 /**
@@ -75,6 +77,18 @@ object PlayerAccessGameTests {
     private val KEYBOARD = BlockPos(1, 1, 2)
     private val HOUR = AccessRules.hoursToMillis(1)
     private val cleanups = java.util.IdentityHashMap<GameTestInfo, MutableList<() -> Unit>>()
+    private val LOGGER = System.getLogger("kibicomputers.gametest")
+
+    /**
+     * [ownedCasesSurviveExplosions] の爆発を置く離れたチャンク（テストの場所からのチャンク数）。ほかのテストの離れたチャンク
+     * （±400・±420・±440・+800 の向き。ChunkUnloadDrainGameTests は +400 から +x・+z へ）と、x・z の両方で 150 チャンク以上離す。
+     * GameTest の並び（1 行 8 件で x に約 4 チャンク、z はバッチをまたいで十数チャンク）の中で、ほかのテストと重ならない（#746）
+     */
+    private const val BLAST_CHUNKS_X = -600
+    private const val BLAST_CHUNKS_Z = 600
+
+    /** 爆発どうしの間（チャンク）。爆発の範囲（8 ブロック）が隣のチャンクの爆発に届かないように空ける */
+    private const val BLAST_CHUNK_STEP = 4
 
     /** 名前 [name] のプレイヤーをサーバーに入れ、ケースの隣に立たせる */
     private fun player(helper: GameTestHelper, name: String, op: Boolean = false, mode: GameType = GameType.SURVIVAL): ServerPlayer {
@@ -304,6 +318,10 @@ object PlayerAccessGameTests {
      * 持ち主のある（読めなかった記録を含む）ケースは、源が誰の爆発でも（BLOCK・TNT）壊れない。保存のディレクトリと部品が残り、
      * 何も落ちない。隣の土は壊れる（爆発耐性は変えていない）。持ち主のないケースが壊れることは
      * [MachineSaveGameTests.explosionDeletesTheSaves] が確かめる
+     *
+     * 4 つの爆発は、それぞれ別の離れたチャンク（[BLAST_CHUNKS_X]・[BLAST_CHUNKS_Z]、間は [BLAST_CHUNK_STEP]）に置く。
+     * 落とし物は、爆発の前からあった物を除いた、その爆発で増えた物だけを数える（#746。並んで動くほかのテストの落とし物が、
+     * 同じチャンクに残っていることがある）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
@@ -314,7 +332,7 @@ object PlayerAccessGameTests {
         val base = helper.absolutePos(CASE)
         val blasts = ArrayList<Blast>()
         fun setUp(name: String, index: Int, access: (CaseBlockEntity) -> Unit, explode: (Vec3) -> Unit) {
-            val chunk = ChunkPos(base.x / 16 - 400 - index * 2, base.z / 16 + 400)
+            val chunk = ChunkPos(base.x / 16 + BLAST_CHUNKS_X - index * BLAST_CHUNK_STEP, base.z / 16 + BLAST_CHUNKS_Z)
             val pos = BlockPos(chunk.minBlockX + 8, 200, chunk.minBlockZ + 8)
             level.setChunkForced(chunk.x, chunk.z, true)
             onEnd(helper) { level.setChunkForced(chunk.x, chunk.z, false) }
@@ -347,19 +365,26 @@ object PlayerAccessGameTests {
                 b.be.computer.endQuiesce()
                 val id = b.be.identity!!.id
                 val parts = (0 until b.be.parts.slots).map { b.be.parts.getStackInSlot(it).copy() }
+                val area = AABB(b.pos).inflate(8.0)
+                // 爆発の落とし物（ルートと onRemove の部品）は、この呼び出しの中で同期に出る。前からあった物を除けば、この爆発の物だけになる
+                val before = Collections.newSetFromMap(IdentityHashMap<ItemEntity, Boolean>())
+                before += level.getEntitiesOfClass(ItemEntity::class.java, area)
+                if (before.isNotEmpty()) {
+                    LOGGER.log(System.Logger.Level.WARNING, "${b.name}: other items were near the case before the blast: ${before.map { it.item }}")
+                }
                 b.explode()
                 helper.assertTrue(level.getBlockEntity(b.pos) === b.be && !b.be.isRemoved, "${b.name}: the owned case should survive")
                 helper.assertTrue(level.getBlockState(b.pos.east()).isAir, "${b.name}: the dirt next to the case should be blown up")
                 val now = (0 until b.be.parts.slots).map { b.be.parts.getStackInSlot(it) }
                 helper.assertTrue(parts.zip(now).all { (a, c) -> ItemStack.matches(a, c) }, "${b.name}: the parts should not change")
-                val drops = level.getEntitiesOfClass(ItemEntity::class.java, AABB(b.pos).inflate(8.0))
+                val drops = level.getEntitiesOfClass(ItemEntity::class.java, area).filter { it !in before }
                 val bad = drops.filter { it.item.`is`(Items.IRON_INGOT) || it.item.item is BlockItem && (it.item.item as BlockItem).block is CaseBlock }
                 helper.assertTrue(bad.isEmpty(), "${b.name}: nothing of the case should drop but dropped ${bad.map { it.item }}")
                 drops.forEach { it.discard() }
                 ServerMachines.drainSaves()
                 helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "${b.name}: the save directory should remain")
                 b.be.deleteSaves()
-                level.setBlock(b.pos, Blocks.AIR.defaultBlockState(), 3)
+                removeCaseAndDrops(level, b.pos)
                 level.setChunkForced(b.chunk.x, b.chunk.z, false)
             }
             ServerMachines.drainSaves()
