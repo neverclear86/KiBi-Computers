@@ -55,7 +55,7 @@ Java 17 と依存の大きさはどちらでも問題にならない（A は Jav
 
 - **層の置き場所**: `core` の内部（`internal`）に置く。公開 API（`pro.ikili.kibicomputers.api`）には出さない。Kotlin 2.2 の API 範囲、Java 17
 - **読み込みと検証（#262）**: コンポーネントのバイナリは自前のパーサーで読む（Component Model のバイナリ形式。endive-cm の parser の 2k 行程度の規模）。プレイヤーのコンポーネントは信用しないので、リンクの前に検証する。検証は Endive がリリースしている `run.endive:wasm-tools`（wasm-tools を WASM にしたもの）の `validate` を使う（endive-cm の `ComponentValidate` と同じ使い方）。重い（初回 1 秒）ので、#29 のコンパイル用のスレッドで行い、内容のハッシュで結果を共有する。jar が約 5.4 MiB 増えるので、自前の検証に置き換えるかは #262 で大きさを見て決める
-- **コアモジュールは #29 の一本道に流す**: コンポーネントの中のコアモジュールを取り出し、「挿入 → パース → コンパイル → 共有」をモジュールごとに行う。燃料の import（`kibi.fuel`）とグローバルは、リンカーがコアの import に足す（#270）。コンポーネント内のどのコアインスタンスも、同じコンピューターの燃料を引く
+- **コアモジュールは #29 の一本道に流す**: コンポーネントの中のコアモジュールを取り出し、「挿入 → パース → コンパイル → 共有」をモジュールごとに行う。燃料の import（`kibi.fuel`）とグローバルは、リンカーがコアの import に足す（#270）。追記（#263・#270）: 実際は、挿入（`FuelInjector.inject(sharedGlobal = true)`）が共有のグローバル `kibi.fuel_global` を import する形にした（ADR 0263）。コンポーネント内のどのコアインスタンスも、同じコンピューターの燃料を引く
 - **ホスト側の状態は、最初から保存できる形で持つ（#265・#266・#269）**: ハンドル表、borrow の数、タスク・subtask・waitable set・stream・future は、数値の ID と明示的なデータで持ち、Java のオブジェクトの参照（ラムダ、スレッド）に状態を閉じ込めない。待機点でコアインスタンスの状態と一緒に書き出す。保存形式そのものは #30・#269 で決める（人が決める項目）
 - **非同期はコールバック方式（stackless）を先に作る（#266）**: イベント待ちのたびにスタックが空になってホストに戻るので、待機点保存と相性がよい（#257）。ブロックする方式（`waitable-set.wait` を同期で呼ぶ、stackful）はスレッドを止める形になり、待機点が呼び出しの途中になるので、保存との兼ね合いを #266 で決める
 - **テスト**: Component Model の仕様のテスト（[component-model の `test/`](https://github.com/WebAssembly/component-model/tree/main/test) の wast）を `core` の単体テストで流す。endive-cm がやっているのと同じ形（`cm-test-gen-plugin`）。実際のツールチェーンのコンポーネントは、endive-cm のコーパスと同じ種類のもの（Rust の `wasm32-wasip2`）をテスト用に用意する

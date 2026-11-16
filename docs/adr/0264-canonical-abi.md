@@ -63,6 +63,7 @@ lift（`canonicalize_nan`）も lower（`maybe_scramble_nan`）も、NaN は正�
 
 - ゲストの呼び出しなので `ctx.callGuest { }` の中で呼び、燃料はゲストの分として数える。燃料が切れたら巻き戻さずにスレッドを持ったまま待つ（ADR 0073）。lift・lower の途中は待機点にならない
 - realloc・post-return が別の core インスタンスにあるなら、燃料の holder を切り替える（`ctx.switchFuelHolder`。#270）
+  - 追記（#270）: core インスタンスはみな燃料のグローバルを共有する（ADR 0263）ので、holder は切り替えない。`switchFuelHolder` は消した
 - realloc と post-return を呼んでいる間は、そのコンポーネントのインスタンスの `may_leave` を下ろし、その間の canon lower（どの import でも）をトラップにする。p1（止まりうる import だけをトラップにする。ADR 0073）より厳しい。印は実行時だけのもので、保存しない
 
 ### 関数の呼び方

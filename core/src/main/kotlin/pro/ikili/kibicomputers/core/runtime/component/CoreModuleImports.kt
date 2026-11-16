@@ -13,7 +13,8 @@ import java.nio.charset.StandardCharsets
 internal object CoreModuleImports {
     /**
      * カーネルが予約したモジュール名。燃料（`kibi.fuel`）と待機点（`kibi.async_*`）の import に使い（#28・#329）、
-     * コンポーネントでは #270 でリンカーがコアの import に足す。プレイヤーのモジュールが自分で import すると、
+     * コンポーネントでは燃料の挿入（`FuelInjector.inject(sharedGlobal = true)`）が共有のグローバル `kibi.fuel_global` を import する
+     * （#263・#270。ADR 0263）。プレイヤーのモジュールが自分で import すると、
      * 燃料の計測をすり抜けたり、カーネルの状態を壊したりできるので断る
      */
     const val RESERVED_MODULE: String = "kibi"

@@ -8,6 +8,7 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
@@ -485,6 +486,52 @@ class ComponentLinkTest {
         assertThrows<WasmTrapException> { instantiate(p, env) }
         assertEquals(1, created.size)
         assertThrows<IllegalStateException> { created[0].call("f") }
+    }
+
+    /** [LinkEnv.configure] と [LinkEnv.onInstanceCreated] の呼ばれた順を書き留める場所 */
+    private fun recordingEnv(events: MutableList<String>) = object : LinkEnv {
+        override fun configure(builder: WasmInstanceConfig.Builder) {
+            events += "configure"
+        }
+
+        override fun onInstanceCreated(instance: WasmInstance) {
+            events += "created"
+        }
+    }
+
+    @Test
+    fun `configureは、core インスタンス1つにつき作る直前に1回だけ呼ばれる`() {
+        // カーネルは configure で core インスタンスの固定費を RAM に数える（#270）。2 回呼ぶ・作らない段で呼ぶと二重に数える
+        val p = load(
+            """
+            (component
+              (core module ${'$'}a (func (export "f")))
+              (core module ${'$'}b (func (export "g")))
+              (core instance ${'$'}ia (instantiate ${'$'}a))
+              (core instance ${'$'}ib (instantiate ${'$'}b))
+              (core instance ${'$'}ic (instantiate ${'$'}a)))
+            """,
+        )
+        val events = ArrayList<String>()
+        instantiate(p, recordingEnv(events)).close()
+        assertEquals(listOf("configure", "created", "configure", "created", "configure", "created"), events)
+    }
+
+    @Test
+    fun `configureの後でインスタンスを作れなかったときも、そのインスタンスの分だけ1回呼ばれる`() {
+        val p = load(
+            """
+            (component
+              (core module ${'$'}a (func (export "f")))
+              (core instance ${'$'}ia (instantiate ${'$'}a))
+              (core module ${'$'}b (func ${'$'}s unreachable) (start ${'$'}s))
+              (core instance ${'$'}ib (instantiate ${'$'}b))
+              (core instance ${'$'}ic (instantiate ${'$'}a)))
+            """,
+        )
+        val events = ArrayList<String>()
+        assertThrows<WasmTrapException> { instantiate(p, recordingEnv(events)) }
+        assertEquals(listOf("configure", "created", "configure"), events, "作れなかった b は created にならず、c には進まない")
     }
 
     /** 呼ばれると、呼んだコンポーネントの "run" を入れ子で呼ぶホスト（#691）。[swallow] なら断られた例外を握りつぶして 0 を返す */

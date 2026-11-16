@@ -362,7 +362,7 @@ class FuelAccountTest {
     }
 
     @Test
-    fun `手持ちを持つインスタンスの差し替えとinstantiateでの受け渡し`() {
+    fun `instantiateでの受け渡し`() {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 100)
             val second = h.program(FakeModule.builder().fuelMetered().start { ctx, _ -> ctx.step(30); LongArray(0) }.build())
@@ -371,19 +371,17 @@ class FuelAccountTest {
                 b.host(ctx) { c, a, _ ->
                     val bInst = c.instantiate(second.module) { }
                     val afterInstantiate = listOf(a.fuel, bInst.fuel)
-                    c.switchFuelHolder(bInst)
-                    val afterSwitch = listOf(a.fuel, bInst.fuel)
-                    c.chargeFuel(20)
-                    c.switchFuelHolder(a)
+                    // 手持ちは元の holder のまま（持ち替えの口はない。#270）
                     assertSame(a, c.fuelHolder)
-                    record.set(afterInstantiate + afterSwitch + listOf(a.fuel, bInst.fuel))
+                    c.chargeFuel(20)
+                    record.set(afterInstantiate + listOf(a.fuel, bInst.fuel))
                     LongArray(0)
                 }
             })
             val pid = m.spawnTest(h.program(hostCallModule()), driver)
             h.scheduler.tick()
             eventually { m.stateOf(pid).isTerminal }
-            assertEquals(listOf(70L, 0L, 0L, 70L, 50L, 0L), record.get())
+            assertEquals(listOf(70L, 0L, 50L, 0L), record.get())
             assertEquals(50, m.lock.withLockValue { m.kernel.fuel })
         }
     }
@@ -516,26 +514,24 @@ class FuelAccountTest {
     }
 
     @Test
-    fun `作っている途中の入れ子のinstantiateとswitchFuelHolderはIllegalStateException`() {
+    fun `作っている途中の入れ子のinstantiateはIllegalStateException`() {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 100)
             val inner = h.program(emptyModule())
-            val errors = AtomicReference<List<Throwable?>>()
+            val error = AtomicReference<Throwable?>()
             val module = FakeModule.builder().fuelMetered().import("env", "h", VOID).start { ctx, _ -> ctx.callImport("env", "h") }.build()
             val driver = runDriver(configure = { ctx, b ->
-                b.host(ctx) { c, caller, _ ->
-                    val e1 = runCatching { c.instantiate(inner.module) { } }.exceptionOrNull()
-                    val e2 = runCatching { c.switchFuelHolder(caller) }.exceptionOrNull()
-                    errors.set(listOf(e1, e2))
+                b.host(ctx) { c, _, _ ->
+                    error.set(runCatching { c.instantiate(inner.module) { } }.exceptionOrNull())
                     LongArray(0)
                 }
             })
             val pid = m.spawnTest(h.program(module), TestDriver(ProcessKind.BLOCKING, onConfigure = { c, b -> driver.configure(c, b) }) { StepResult.Exit(0) })
             h.scheduler.tick()
             eventually { m.stateOf(pid).isTerminal }
-            val (e1, e2) = errors.get()
-            assertTrue(e1 is IllegalStateException, "$e1")
-            assertTrue(e2 is IllegalStateException, "$e2")
+            val e = error.get()
+            // 作っている途中の入れ子は許さない（#270。コンポーネントは計画だけが core インスタンスを作り、燃料も共有するので要らない）
+            assertTrue(e is IllegalStateException, "$e")
         }
     }
 }
