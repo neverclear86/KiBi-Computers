@@ -12,6 +12,7 @@ import net.minecraft.world.MenuProvider
 import net.minecraft.world.entity.player.Inventory
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.inventory.AbstractContainerMenu
+import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.chunk.LevelChunk
@@ -338,13 +339,47 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             environment,
             boot,
             source,
-            RestoreReady { machine -> wiring.attach(level, blockPos, machine, speakerAddress) },
+            RestoreReady { machine ->
+                wiring.attach(level, blockPos, machine, speakerAddress)
+                logRestoreWiring(machine, source != null)
+            },
             RestoreListener { _, outcome, cause ->
                 noteRestoreOutcome(serial, outcome)
                 ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
             },
         )
         if (computer.machine == null) wiring.disconnect()
+    }
+
+    /**
+     * チャンクの読み込みで動かした台の受け手（[RestoreReady]）でつないだ結果を debug で1行出す（#636。入り直した後に画面が空のままに
+     * なる件の切り分け用。[ComputerCase.startRestore] 1回につき1行）。受け手は戻せたときだけでなく、冷えた起動に落ちたときと、保存元が
+     * ない・受け付けられずにそのまま起動したときにも呼ばれるので、どれだったかを `result` に出す: `restored`（戻せた）、`cold-boot`
+     * （保存元はあったが戻せず冷えた起動にした・受け付けられなかった）、`no-source`（保存元がなく起動した）。
+     * ほかに、ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。
+     * 戻せたとき以外は -1）、プロセスの状態（[Machine.describeProcesses]。`restored` を受けるはずのシェルが起きたか、入力だけを
+     * 待ったままかが分かる）。受け手の時点の画面はまだ描き直す前なので、中身は出さない
+     */
+    private fun logRestoreWiring(machine: Machine, hadSource: Boolean) {
+        if (!LOGGER.isDebugEnabled) return
+        val screenPos = wiring.connectedScreen?.blockPos
+        val queues = machine.restoredEventQueues
+        val result = when {
+            !hadSource -> "no-source"
+            queues >= 0 -> "restored"
+            else -> "cold-boot"
+        }
+        LOGGER.debug(
+            "Wired the computer at {} after loading (result={}, chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}, processes={}",
+            blockPos,
+            result,
+            ChunkPos(blockPos),
+            screenPos ?: "none",
+            screenPos?.let(::ChunkPos) ?: "-",
+            wiring.screenAttachCount,
+            machine.restoredEventQueues,
+            machine.describeProcesses(),
+        )
     }
 
     /**
