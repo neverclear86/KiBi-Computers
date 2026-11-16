@@ -15,7 +15,6 @@ import pro.ikili.kibicomputers.core.kernel.VOID
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
-import pro.ikili.kibicomputers.core.kernel.tickUntilInitStarted
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -28,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.spawnRt
 import pro.ikili.kibicomputers.core.kernel.stateOf
+import pro.ikili.kibicomputers.core.kernel.tickUntilInitStarted
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -108,7 +108,7 @@ class WasiP1PowerTest {
             disk.write(node, 0, init, 0, init.size)
             h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
             assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
-            h.tickUntilInitStarted(m)
+            h.tickUntilInitStarted(m, limit.toMillis())
         }
 
         /**
