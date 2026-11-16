@@ -341,7 +341,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             source,
             RestoreReady { machine ->
                 wiring.attach(level, blockPos, machine, speakerAddress)
-                logRestoreWiring(machine)
+                logRestoreWiring(machine, source != null)
             },
             RestoreListener { _, outcome, cause ->
                 noteRestoreOutcome(serial, outcome)
@@ -352,17 +352,27 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /**
-     * 復元の受け手でつないだ結果を debug で1行出す（#636。入り直した後に画面が空のままになる件の切り分け用。復元1回につき1行）。
-     * ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。冷えた起動なら -1）、
-     * プロセスの状態（[Machine.describeProcesses]。`restored` を受けるはずのシェルが起きたか、入力だけを待ったままかが分かる）。
-     * 受け手の時点の画面はまだ描き直す前なので、中身は出さない
+     * チャンクの読み込みで動かした台の受け手（[RestoreReady]）でつないだ結果を debug で1行出す（#636。入り直した後に画面が空のままに
+     * なる件の切り分け用。[ComputerCase.startRestore] 1回につき1行）。受け手は戻せたときだけでなく、冷えた起動に落ちたときと、保存元が
+     * ない・受け付けられずにそのまま起動したときにも呼ばれるので、どれだったかを `result` に出す: `restored`（戻せた）、`cold-boot`
+     * （保存元はあったが戻せず冷えた起動にした・受け付けられなかった）、`no-source`（保存元がなく起動した）。
+     * ほかに、ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。
+     * 戻せたとき以外は -1）、プロセスの状態（[Machine.describeProcesses]。`restored` を受けるはずのシェルが起きたか、入力だけを
+     * 待ったままかが分かる）。受け手の時点の画面はまだ描き直す前なので、中身は出さない
      */
-    private fun logRestoreWiring(machine: Machine) {
+    private fun logRestoreWiring(machine: Machine, hadSource: Boolean) {
         if (!LOGGER.isDebugEnabled) return
         val screenPos = wiring.connectedScreen?.blockPos
+        val queues = machine.restoredEventQueues
+        val result = when {
+            !hadSource -> "no-source"
+            queues >= 0 -> "restored"
+            else -> "cold-boot"
+        }
         LOGGER.debug(
-            "Wired the restored computer at {} (chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}, processes={}",
+            "Wired the computer at {} after loading (result={}, chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}, processes={}",
             blockPos,
+            result,
             ChunkPos(blockPos),
             screenPos ?: "none",
             screenPos?.let(::ChunkPos) ?: "-",

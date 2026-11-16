@@ -636,14 +636,21 @@ public class Machine private constructor(
     /**
      * 終わっていないプロセスの pid・プログラム名・状態・待っている相手を1行にしたもの（ログ用。待つものがなければ `none`）。
      * 例: `1:sh=WAITING_EVENT waits=[3:READABLE,7:READABLE]`。復元の受け手で見ると、`restored` を受けるはずのプロセスが
-     * 起きたか（`RUNNABLE`）、入力だけを待ったままか（`WAITING_EVENT`）が分かる（#636）
+     * 起きたか（`RUNNABLE`）、入力だけを待ったままか（`WAITING_EVENT`）が分かる（#636）。
+     * プログラム名（argv[0]。プレイヤーが決められる）は [processLabel] と同じに制御文字を `?` にして切り（ログに偽の行を作らせない）、
+     * 待っている相手は1プロセスにつき [MAX_LOGGED_WAITS] 件まで出す（残りは `+n`）
      */
     public fun describeProcesses(): String = lock.withLockValue {
         kernel.processes.all()
             .filter { !it.state.isTerminal }
             .joinToString("; ") { p ->
-                val waits = p.wait?.joinToString(",", "[", "]") { "${it.objectId}:${it.condition}" } ?: "-"
-                "${p.pid}:${p.args.firstOrNull() ?: "?"}=${p.state} waits=$waits"
+                val waits = p.wait?.let { w ->
+                    val shown = w.take(MAX_LOGGED_WAITS).joinToString(",") { "${it.objectId}:${it.condition}" }
+                    val more = if (w.size > MAX_LOGGED_WAITS) ",+${w.size - MAX_LOGGED_WAITS}" else ""
+                    "[$shown$more]"
+                } ?: "-"
+                val name = p.args.firstOrNull()?.takeIf { it.isNotEmpty() }?.let(::sanitizeForConsole) ?: "?"
+                "${p.pid}:$name=${p.state} waits=$waits"
             }
             .ifEmpty { "none" }
     }
@@ -3894,6 +3901,9 @@ public class Machine private constructor(
 
         /** コンソールのメッセージに出すプロセスの名前の最大の文字数 */
         private const val MAX_LABEL_CHARS: Int = 64
+
+        /** [describeProcesses] が1プロセスにつき出す待っている相手の最大の数 */
+        private const val MAX_LOGGED_WAITS: Int = 8
 
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D

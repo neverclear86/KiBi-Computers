@@ -280,16 +280,16 @@ class StandardOsRestoreTest {
     }
 
     @Test
-    fun `shはESCの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("", "[D", 8)
+    fun `shはESCの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b", "[D", 8)
 
     @Test
-    fun `shはESCと開き角括弧の後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("[", "D", 8)
+    fun `shはESCと開き角括弧の後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b[", "D", 8)
 
     @Test
-    fun `shはESCと大文字Oの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("O", "D", 8)
+    fun `shはESCと大文字Oの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001bO", "D", 8)
 
     @Test
-    fun `shはCSIのパラメーターの途中で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("[1;", "5D", 7)
+    fun `shはCSIのパラメーターの途中で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b[1;", "5D", 7)
 
     @Test
     fun `nanoは戻ると代替画面に入り直して全体を描き直す`() = timeout(limit) {
