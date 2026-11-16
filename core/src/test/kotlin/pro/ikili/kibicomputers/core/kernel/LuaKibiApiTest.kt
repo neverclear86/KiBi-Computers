@@ -46,6 +46,9 @@ class LuaKibiApiTest {
     private class TestDev(override val kind: String = "test:dev") : Device {
         val mainCalls = AtomicInteger()
 
+        /** main-mark が動いた回数 */
+        val marks = AtomicInteger()
+
         @Volatile
         var context: DeviceContext? = null
 
@@ -76,6 +79,10 @@ class LuaKibiApiTest {
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
             }
+            .mainThread("main-mark") { _, _ ->
+                marks.incrementAndGet()
+                emptyArray()
+            }
             .mainThread("main-fail") { _, _ -> throw DeviceException("main boom") }
             .mainThread("main-gate") { ctx, args ->
                 gates.add(ctx.defer() to args.getLong(0))
@@ -100,8 +107,9 @@ class LuaKibiApiTest {
         val h: Harness = Harness(execRuntime = EndiveRuntime()),
         memoryBytes: Long? = null,
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+        maxHostCallsPerTick: Int = 64,
     ) : AutoCloseable {
-        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment)
+        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
         val dev = TestDev()
         private val output: Int
         private val text = StringBuilder()
@@ -139,7 +147,15 @@ class LuaKibiApiTest {
             condition()
         }
 
-        fun waitFor(line: String) = waitUntil("「$line」が出ない: $text") { text.contains(line) }
+        /** このプロセスが持つ device・pending-call の fd の数 */
+        fun openCallFds(): Int = m.lock.withLockValue {
+            m.kernel.processes[pid]!!.handles.entries().values.count {
+                val o = m.kernel.objects[it.objectId]
+                o is pro.ikili.kibicomputers.core.device.PendingDeviceCall || o is pro.ikili.kibicomputers.core.device.DeviceHandle
+            }
+        }
+
+        fun waitFor(line: String) = waitUntil("「$line」が出ない: $text（${m.stateOf(pid)}）") { text.contains(line) }
 
         fun finish(expected: ProcessState = ProcessState.EXITED): String {
             waitUntil("終わらない: $text") { m.stateOf(pid).isTerminal }
@@ -178,7 +194,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,needs-int,posted,types",
+                "echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -784,6 +800,132 @@ class LuaKibiApiTest {
             val first = out.lines()[0].split("\t")
             assertEquals(3, first.size, out)
             assertTrue(first.all { it == "true" || it.endsWith("not enough memory") }, out)
+        }
+    }
+
+    /**
+     * RAM をほぼ使い切って（4000 バイトの文字列を持つ要素を、Lua の使用量が 290 KB になるまで積む。RAM の上限は 512 KB）、
+     * 新しい 12 個（約 48 KB）だけ解放する Lua のコード。空きは 1 つながりの穴になり、take の結果の場所（約 66 KiB）には足りず、
+     * Lua の確保と take_kernel_events の分（約 39 KiB）は入る。RAM の残りが使い切る前で止まるのは、使い切ると Lua 自身も動けなくなるため
+     * （kibi_lua_realloc は残りが 8 KiB 未満なら、穴があっても断る）。
+     * 一度ここまで絞ると、解放しても大きな場所は取れなくなる（RAM は解放しても減らない。#370）ので、元に戻す関数は用意しない
+     */
+    private val squeeze = """
+        local keep = {}
+        local function squeeze()
+            while collectgarbage("count") < 290 do keep.head = {keep.head, string.rep("x", 4000)} end
+            for i = 1, 12 do keep.head = keep.head[1] end
+            collectgarbage()
+        end
+    """.trimIndent()
+
+    @Test
+    fun `RAMが足りないコルーチンの呼び出しは、メソッドを動かさずにnot enough memoryになり、fdを漏らさない`() = timeout(limit) {
+        Run(
+            """
+            $squeeze
+            local addr = "$ADDRESS"
+            local cos, res = {}, {}
+            for i = 1, 5 do
+                cos[i] = coroutine.create(function() return peripheral.call(addr, "main-echo", i) end)
+                res[i] = false
+            end
+            squeeze()
+            for i = 1, 5 do
+                local ok, e = coroutine.resume(cos[i])
+                res[i] = ok and "started" or e
+            end
+            print(table.concat(res, ","))
+            os.sleep(0.3)
+            print("done"); io.stdout:flush()
+            os.sleep(2)
+            """.trimIndent(),
+            memoryBytes = 512 * 1024L,
+        ).use { r ->
+            r.waitFor("done\n")
+            // 断られた呼び出しは積まれていない（積んでから断ると、fd も表に残る）
+            assertEquals(0, r.openCallFds())
+            // 断られたメソッドは動いていない（積まれていれば、待つ間に動く）
+            assertEquals(0, r.dev.mainCalls.get())
+            assertEquals("not enough memory,not enough memory,not enough memory,not enough memory,not enough memory\ndone\n", r.finish())
+        }
+    }
+
+    @Test
+    fun `RAMが足りなくて回収できないときは、Luaのエラーになって要素を表に残し、トラップにならない`() = timeout(limit) {
+        Run(
+            """
+            $squeeze
+            local addr = "$ADDRESS"
+            local cos = {}
+            for i = 1, 2 do cos[i] = coroutine.create(function() return peripheral.call(addr, "main-gate", 6 + i) end) end
+            local function pull() return os.pullEvent("task_complete") end
+            os.queueEvent("x"); os.pullEvent("x")
+            for i = 1, 2 do coroutine.resume(cos[i]) end
+            print("started"); io.stdout:flush()
+            repeat os.sleep(0.05) until peripheral.call(addr, "posted")
+            squeeze()
+            -- 回収の reserve が断られる（os.queueEvent も同じ回収を通る）。何度でも Lua のエラーになる
+            local ok1, e1 = pcall(pull)
+            local ok2, e2 = pcall(pull)
+            local ok3, e3 = pcall(os.queueEvent, "y")
+            print(tostring(ok1 or e1), tostring(ok2 or e2), tostring(ok3 or e3))
+            os.sleep(0.3)
+            print("done"); io.stdout:flush()
+            os.sleep(2)
+            """.trimIndent(),
+            memoryBytes = 512 * 1024L,
+        ).use { r ->
+            r.waitFor("started\n")
+            r.waitUntil("2つの呼び出しが来ない") { r.dev.gates.size == 2 }
+            r.dev.release()
+            r.dev.posted = true
+            r.waitFor("done\n")
+            // 終わった結果は写せるまで表に残る（写し終えていないものを閉じない）
+            assertEquals(2, r.openCallFds())
+            assertEquals("started\nnot enough memory\tnot enough memory\tnot enough memory\ndone\n", r.finish())
+        }
+    }
+
+
+    @Test
+    fun `startがagainを返したら、コルーチンの中でもinvokeでその場で待つ`() = timeout(limit) {
+        Run(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            local co = coroutine.create(function() return peripheral.call("$ADDRESS", "main-echo", 5), p.mainEcho(6) end)
+            print(coroutine.resume(co))
+            print(coroutine.status(co))
+            """.trimIndent(),
+        ).use { r ->
+            // 表は空のまま、カーネルの上限（1 プロセス 16 個）に当てる
+            r.m.lock.withLockValue {
+                repeat(16) { r.m.openPendingDeviceCallLocked(r.pid, pro.ikili.kibicomputers.core.device.PendingDeviceCall.State.Running) }
+            }
+            assertEquals("true\t5\t6\ndead\n", r.finish())
+            assertEquals(2, r.dev.mainCalls.get())
+        }
+    }
+
+    @Test
+    fun `terminateでプログラムが終わると、まだ実行していないメインスレッドの呼び出しは実行されない`() = timeout(limit) {
+        // 1 tick に 1 件しか実行しないので、先に積んだ 3 件の後ろにある main-mark は、プログラムが終わるまでに実行されない
+        Run(
+            """
+            local function start(method) local co = coroutine.create(function() return peripheral.call("$ADDRESS", method, 1) end); coroutine.resume(co); return co end
+            start("main-echo"); start("main-echo"); start("main-echo")
+            local co = start("main-mark")
+            print(coroutine.resume(co, "terminate"))
+            """.trimIndent(),
+            maxHostCallsPerTick = 1,
+        ).use { r ->
+            assertEquals("false\tTerminated\n", r.finish())
+            // 終わったプロセスの fd が閉じられ、列にあった呼び出しは外される
+            repeat(20) {
+                r.h.scheduler.tick()
+                Thread.sleep(5)
+            }
+            assertEquals(0, r.dev.marks.get())
         }
     }
 

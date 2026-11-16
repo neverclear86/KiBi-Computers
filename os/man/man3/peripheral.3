@@ -38,7 +38,7 @@ Method names are in kebab case (`get-size`). `wrap` also adds a camel case alias
 
 A call to a method that runs on the main thread of the server waits at least one game tick. Waiting does not use a thread.
 
-Inside a coroutine, such a call yields, as in CC: Tweaked: it starts the method, yields `task_complete` until the `task_complete` event with its own id arrives (os(3)), and returns the results or raises the error. Other coroutines (parallel(3)) run meanwhile. Other events that reach the coroutine meanwhile are thrown away, and `terminate` raises `Terminated`; the method still runs. Methods that do not run on the main thread return at once without yielding. In the main program, which is not a coroutine, the call waits in place; events that arrive meanwhile are kept.
+Inside a coroutine, such a call yields, as in CC: Tweaked: it starts the method, yields `task_complete` until the `task_complete` event with its own id arrives (os(3)), and returns the results or raises the error. Other coroutines (parallel(3)) run meanwhile. Other events that reach the coroutine meanwhile are thrown away, and `terminate` raises `Terminated`. The Lua side does not cancel the call, but if the program ends with that error, the call is closed with the process, and a call that has not started yet does not run. Methods that do not run on the main thread return at once without yielding. In the main program, which is not a coroutine, the call waits in place; events that arrive meanwhile are kept.
 
 ## VALUES
 

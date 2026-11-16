@@ -57,6 +57,10 @@ class LuaKibiApiRestoreTest {
                 ctx.defer()
                 emptyArray()
             }
+            .mainThread("main-echo") { _, args ->
+                calls.incrementAndGet()
+                Array(args.size()) { args.get(it) }
+            }
             .direct("echo") { _, args -> Array(args.size()) { args.get(it) } }
             .build()
     }
@@ -66,11 +70,19 @@ class LuaKibiApiRestoreTest {
     }
 
     /** [script] を動かし、[ready] が出て待機点で待つようになったら保存して、戻したマシンの出力を返す */
-    private fun saveAndRestore(script: String, ready: String, until: Regex, calls: AtomicInteger, callsBeforeSave: Int = 0): String {
+    private fun saveAndRestore(
+        script: String,
+        ready: String,
+        until: Regex,
+        calls: AtomicInteger,
+        callsBeforeSave: Int = 0,
+        maxHostCallsPerTick: Int = 64,
+        onSaved: (queuedHostCalls: Int) -> Unit = {},
+    ): String {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         return Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
-            val m = h.machine(fuelPerTick = 10_000_000)
+            val m = h.machine(fuelPerTick = 10_000_000, maxHostCallsPerTick = maxHostCallsPerTick)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
             fun write(path: String, bytes: ByteArray) {
@@ -89,11 +101,13 @@ class LuaKibiApiRestoreTest {
                 Thread.sleep(1)
                 ready in output(m, outId) && calls.get() >= callsBeforeSave && m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
             }
+            val queuedAtSave = m.pendingHostCalls
             val identity = store.assignNewId(owner)!!
             val snapshot = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)
             assertNotNull(snapshot, "待っている間は保存できる")
             val written = store.write(identity, owner, snapshot!!).identity
             m.close()
+            onSaved(queuedAtSave)
 
             val r = h.machine(fuelPerTick = 10_000_000)
             val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
@@ -169,6 +183,33 @@ class LuaKibiApiRestoreTest {
         assertTrue("\nb\trestored\n" in out, out)
         assertTrue(out.endsWith("after\t1\n"), out)
         assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun `parallelの中のperipheral_callがまだ実行されていない状態で保存して戻すと、戻した後に実行されて、どのコルーチンも結果を受け取る`() = timeout(limit) {
+        val calls = AtomicInteger()
+        var queued = 0
+        // 1 tick に 1 件しか実行しないので、保存するときは、積んだ 12 件のうち、ほとんどが列に残っている（Queued の pending-call）
+        val out = saveAndRestore(
+            """
+            local sums, fns = {}, {}
+            for i = 1, 12 do fns[i] = function() sums[i] = peripheral.call('$address', 'main-echo', i) end end
+            fns[13] = function() print('waiting'); io.stdout:flush(); os.pullEvent('restored') end
+            parallel.waitForAll(table.unpack(fns))
+            local sum = 0
+            for i = 1, 12 do sum = sum + sums[i] end
+            print('sum', sum)
+            """.trimIndent() + "\n",
+            "waiting\n",
+            Regex("sum\t78\n"),
+            calls,
+            maxHostCallsPerTick = 1,
+            onSaved = { queued = it },
+        )
+        assertTrue(queued > 0, "保存したとき、実行していない呼び出しが列にある: $queued")
+        assertTrue(Regex("sum\t78\n").containsMatchIn(out), out)
+        // 保存の前に実行したものと、戻した後に積み直して実行したものを合わせて、12 件が 1 回ずつ
+        assertEquals(12, calls.get())
     }
 
     @Test

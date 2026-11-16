@@ -459,7 +459,8 @@ void kibi_lua_tasks_collect(lua_State *L) {
         kibi_lua_arena_reset();
         if (!kibi_lua_reserve(INVOKE_RESULT_BYTES)) {
             collecting = 0;
-            kibi_lua_check_memory(L, INVOKE_RESULT_BYTES);
+            lua_pushliteral(L, "not enough memory");
+            lua_error(L);
         }
         kibi_device_option_result_values_t o;
         kibi_device_take((uint32_t)tasks[i].fd, &o);
@@ -512,13 +513,51 @@ static int call_k(lua_State *L, int status, lua_KContext ctx) {
     return lua_yieldk(L, 1, 0, call_k);
 }
 
+/* lua_pcall で呼ぶ。引数 1 の take の結果（lightuserdata）と、引数 2 の call_t から、成功なら値を、失敗なら文（位置なし）を積み、積んだ数を返す */
+static int copy_taken(lua_State *L) {
+    const kibi_device_option_result_values_t *o = (const kibi_device_option_result_values_t *)lua_touserdata(L, 1);
+    const call_t *c = (const call_t *)lua_touserdata(L, 2);
+    lua_settop(L, 0);
+    if (o->val.is_err) {
+        push_call_error(L, &o->val.val.err, c->m, c->mlen);
+        return 1;
+    }
+    return push_results(L, &o->val.val.ok);
+}
+
 /*
- * 開いた [fd] で [c] を start し、待っている呼び出しの表に入れる。fd（device）は閉じる。
- * その場で終わったもの（直接のメソッド、その場で失敗するもの）は結果を返し、終わっていなければ "task_complete" を yield する。
- * カーネルの上限（again）に当たったら、invoke でその場で待つ
+ * その場で終わった呼び出しの結果 [o]（take の結果。pending-call は閉じ済み）を、値として返すか、エラーにする。
+ * 写す途中の確保で GC が走ると、__gc の中から os.queueEvent などで kibi_lua_tasks_collect が入れ子で走り、arena（今写している結果の
+ * 場所）と表を動かすので、写す間は collecting で入れ子の回収を止める。写す途中でメモリ不足になってもフラグは戻す
+ */
+static int return_taken(lua_State *L, kibi_device_option_result_values_t *o, const call_t *c) {
+    int base = lua_gettop(L);
+    collecting = 1;
+    lua_pushcfunction(L, copy_taken);
+    lua_pushlightuserdata(L, o);
+    lua_pushlightuserdata(L, (void *)c);
+    int status = lua_pcall(L, 2, LUA_MULTRET, 0);
+    collecting = 0;
+    kibi_lua_arena_reset();
+    if (status != LUA_OK) return lua_error(L);
+    if (o->val.is_err) {
+        luaL_where(L, 1);
+        lua_insert(L, -2);
+        lua_concat(L, 2);
+        return lua_error(L);
+    }
+    return lua_gettop(L) - base;
+}
+
+/*
+ * 開いた [fd] で [c] を start し、すぐ take する。fd（device）は閉じる。
+ * その場で終わったもの（直接のメソッド、その場で失敗するもの）は結果を返し、終わっていなければ待っている呼び出しの表に入れて
+ * "task_complete" を yield する。カーネルの上限（again）に当たったら、invoke でその場で待つ。
+ * start の前に take の結果の場所（INVOKE_RESULT_BYTES）まで確かめる（invoke_now と同じ。足りなければメソッドは動かさずに
+ * "not enough memory" のエラー）。start の後は arena を戻さず、取った場所を take に使う（Lua の確保は間にない）
  */
 static int start_and_yield(lua_State *L, uint32_t fd, const call_t *c) {
-    reserve_or_close(L, fd, INFO_RESULT_BYTES);
+    reserve_or_close(L, fd, INVOKE_RESULT_BYTES);
     kibi_device_result_handle_t r;
     kibi_device_start(fd, c->m, c->mlen, c->args, (size_t)c->n, &r);
     if (r.is_err) {
@@ -530,32 +569,24 @@ static int start_and_yield(lua_State *L, uint32_t fd, const call_t *c) {
         return raise_call_error(L, &r.val.err, c->m, c->mlen);
     }
     kibi_device_drop(fd);
-    kibi_lua_arena_reset();
-    /* Lua の確保（longjmp しうる）より先に表へ入れる（fd を宙に浮かせない） */
     int32_t call = (int32_t)r.val.ok;
+
+    /* その場で終わったか（直接のメソッドと、その場で失敗するものは start の中で終わっている）。take は何度でも同じ結果を返すが、
+     * ここで表に入れずに閉じて写す（写す途中のメモリ不足で、持ち主のいない "task_complete" を後に残さない。invoke_now と同じ） */
+    kibi_device_option_result_values_t o;
+    kibi_device_take((uint32_t)call, &o);
+    if (o.is_some) {
+        kibi_device_pending_call_drop((uint32_t)call);
+        return return_taken(L, &o, c);
+    }
+    kibi_lua_arena_reset();
+    /* 表へ入れてから yield する（ここから yield までに Lua の確保で longjmp するものはない） */
     task_t *t = &tasks[task_count++];
     t->fd = call;
     t->id = ++next_task_id;
     t->method_len = (uint8_t)c->mlen;
     memcpy(t->method, c->m, c->mlen);
     int64_t id = t->id;
-
-    /* その場で終わったか（直接のメソッドと、その場で失敗するものは start の中で終わっている） */
-    kibi_lua_check_memory(L, INVOKE_RESULT_BYTES);
-    kibi_device_option_result_values_t o;
-    kibi_device_take((uint32_t)call, &o);
-    if (o.is_some) {
-        int i = task_count - 1; /* 今入れたもの（ここまでに表は動かない） */
-        if (o.val.is_err) {
-            finish_task(i);
-            return raise_call_error(L, &o.val.val.err, c->m, c->mlen);
-        }
-        int count = push_results(L, &o.val.val.ok);
-        kibi_lua_arena_reset();
-        finish_task(i);
-        return count;
-    }
-    kibi_lua_arena_reset();
     lua_settop(L, 0);
     lua_pushinteger(L, (lua_Integer)id);
     lua_pushliteral(L, "task_complete");
