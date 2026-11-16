@@ -1,5 +1,9 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
+import net.minecraft.core.BlockPos
+import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.item.ItemStack
+import net.minecraft.world.level.block.Blocks
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -7,6 +11,19 @@ import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+
+/**
+ * GameTest 用: 離れたチャンク（強制読み込みを外したあと、だれも見ない場所）に置いたケースを、落とし物を出さずに片付ける（#746）。
+ * `setBlock(AIR)` は `CaseBlock.onRemove` で部品を1スロットずつ落とす。そのまま強制読み込みを外すと、落とし物はチャンクと一緒に残り
+ * （6000 tick）、あとで同じチャンクを読み込んだほかのテストの「落とし物を数える」確かめに出てくる。
+ * 落とした後に探して消す方式は、エンティティのセクションがまだ見えない（チャンクの FULL への昇格が後からメインスレッドに積まれる）と
+ * 落とし物が検索に出ず、消せないまま残る（実際に 0 件だった）。そのため、ブロックを消す前に部品を空にして、落とす物をなくす
+ */
+internal fun removeCaseWithoutDrops(level: ServerLevel, pos: BlockPos) {
+    val be = checkNotNull(level.getBlockEntity(pos) as? CaseBlockEntity) { "there should be a case at $pos" }
+    for (i in 0 until be.parts.slots) be.parts.setStackInSlot(i, ItemStack.EMPTY)
+    level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+}
 
 /**
  * GameTest 用: [be] を取り出して書き込みに回し、書き込みのスレッドが空になるのを待って完了を受け取る（#84 の前の同期の書き込みと同じに見える）
