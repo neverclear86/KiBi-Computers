@@ -36,8 +36,21 @@ __asm__(
  * - 広げる realloc は、確保し直して写す（その場で広げると、数える前に書かれてしまい、取り消せない）。
  *   縮める realloc は新しい所を書かないので、そのまま realloc に渡す。
  *
+ * - 残りが KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD より少なくなったら、確保の前に、今のスタックポインターから下
+ *   KIBI_LUA_STACK_GUARD バイトの C のスタックを数えさせる（#729）。数えた後に KIBI_LUA_MIN を残せなければ NULL を返す
+ *   （commit が断られるので、プロセスが終わったときの「メモリ不足だった」の注記も出る）。
+ *   C のスタックの書き込みは包みを通らないので、上限の近くで初めてスタックが深くなる（pcall の中の pullEventRaw → take →
+ *   lua_pcall の入れ子、緊急の GC など）と、そのままトラップになっていた。数えた区画は最高値として残るので、
+ *   一度数えた深さ（stack_counted_low）より浅いところでは、もう import を呼ばない。普段の道（残りが多いとき）では何もしない。
+ *
+ * KEEP・MIN・STACK_GUARD は「包みの外で起きうる書き込み」の見積もり。内訳は、memory.grow が増やした所の両端に先に数える
+ * 2 区画（8 KiB。keep をかけない）、malloc がチャンクの頭と top の頭を書く 2 区画、C のスタックの伸び、ホストが
+ * スタックや静的な変数に書く結果（poll_oneoff の events、take の結果を受ける構造体など）。
+ * マシンの RAM は同じマシンのほかのプロセスや /tmp と共有するので、remaining() はその時点の値でしかなく、
+ * この見積もりが守れるのは、その台で RAM を食っているのが自分だけのとき（努力目標。規則はトラップ。#370）。
+ *
  * 解放しても数えた量は減らないので、上限に達した後に続けられるかは、穴の使い回しができるか次第（#370 の結果）。
- * 値は #370 の PoC のもの（KEEP 16 KiB、MIN 8 KiB、LOOKAHEAD 8 KiB）。
+ * 値は #370 の PoC のもの（KEEP 16 KiB、MIN 8 KiB、LOOKAHEAD 8 KiB）と、#729 で測ったもの（STACK_GUARD 16 KiB）。
  */
 #undef realloc
 #undef free
@@ -55,11 +68,40 @@ size_t malloc_usable_size(void *ptr);
 /* dlmalloc のチャンクの頭（前）と、次のチャンクの頭（後ろ）の分 */
 #define KIBI_LUA_HEAD 16
 #define KIBI_LUA_TAIL 16
+/*
+ * 上限の近くで先に数える C のスタックの深さ（今のスタックポインターから下）。#729 の再現では、上限の近くで
+ * 初めて書いたスタックが、スタックの上端から 8〜12 KiB の所だった。確保する所より深く呼ぶ道（pull → take → convert）の分を足す
+ */
+#define KIBI_LUA_STACK_GUARD (16 * 1024)
+
+/* リンカーが出すスタックの下端（wasm-ld。スタックは線形メモリの先頭に置かれ、下へ伸びる） */
+extern unsigned char __stack_low;
+
+/* 数えさせた C のスタックのいちばん低い番地（まだなら 0。スタックの上は実際に書いたので数えてある） */
+static uintptr_t stack_counted_low = 0;
+
+/* 今のスタックポインターから下 KIBI_LUA_STACK_GUARD バイトを数えさせる（後に KIBI_LUA_MIN を残す）。数えてあれば import を呼ばない。数えられれば 1 */
+static int count_stack(void) {
+    volatile unsigned char here = 0;
+    uintptr_t sp = (uintptr_t)&here;
+    uintptr_t floor = (uintptr_t)&__stack_low;
+    uintptr_t low = sp - floor > KIBI_LUA_STACK_GUARD ? sp - KIBI_LUA_STACK_GUARD : floor;
+    if (stack_counted_low != 0 && low >= stack_counted_low) return 1;
+    uintptr_t high = stack_counted_low != 0 && stack_counted_low < sp ? stack_counted_low : sp;
+    if (high > low && !kibi_memory_commit((void *)low, (uint32_t)(high - low), KIBI_LUA_MIN)) return 0;
+    stack_counted_low = low;
+    return 1;
+}
 
 void *kibi_lua_realloc(void *ptr, size_t size) {
     size_t old = ptr != NULL ? malloc_usable_size(ptr) : 0;
     if (ptr != NULL && size <= old) return realloc(ptr, size);
-    if (kibi_memory_remaining() < KIBI_LUA_MIN) return NULL;
+    uint64_t remaining = kibi_memory_remaining();
+    if (remaining < KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD) {
+        if (!count_stack()) return NULL;
+        remaining = kibi_memory_remaining();
+    }
+    if (remaining < KIBI_LUA_MIN) return NULL;
     void *result = malloc(size);
     if (result == NULL) return NULL;
     unsigned char *base = (unsigned char *)result - KIBI_LUA_HEAD;

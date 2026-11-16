@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceContext
 import pro.ikili.kibicomputers.api.device.DeviceException
@@ -44,6 +46,9 @@ class LuaKibiApiTest {
     private class TestDev(override val kind: String = "test:dev") : Device {
         val mainCalls = AtomicInteger()
 
+        /** `big` を呼んだ回数 */
+        val bigCalls = AtomicInteger()
+
         @Volatile
         var context: DeviceContext? = null
 
@@ -70,6 +75,10 @@ class LuaKibiApiTest {
                 emptyArray()
             }
             .direct("posted") { _, _ -> arrayOf(DeviceValue.of(posted)) }
+            .direct("big") { _, args ->
+                bigCalls.incrementAndGet()
+                arrayOf(DeviceValue.of("b".repeat(args.getLong(0).toInt())))
+            }
             .mainThread("main-echo") { _, args ->
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
@@ -123,6 +132,20 @@ class LuaKibiApiTest {
 
         fun waitFor(line: String) = waitUntil("「$line」が出ない: $text") { text.contains(line) }
 
+        /**
+         * Lua が待っている間に、マシンの RAM の残りがちょうど [remaining] バイトになるように、テストの側で予約する（#729）。
+         * 予約したバイト数を返す（[release] で戻す）。待っている間は Lua が書かないので、起きた後の残りが決まる
+         */
+        fun squeeze(remaining: Long): Long {
+            waitUntil("待たない: $text") { m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            val account = m.memoryAccount
+            val bytes = account.limitBytes - account.usedBytes - remaining
+            assertTrue(bytes >= 0 && account.tryReserveBytes(bytes), "残りを $remaining にできない: ${account.usedBytes}")
+            return bytes
+        }
+
+        fun release(bytes: Long) = m.memoryAccount.releaseBytes(bytes)
+
         fun finish(expected: ProcessState = ProcessState.EXITED): String {
             waitUntil("終わらない: $text") { m.stateOf(pid).isTerminal }
             val out = drain()
@@ -160,7 +183,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "echo,emit,emit-as,fail,get-size,main-echo,needs-int,posted,types",
+                "big,echo,emit,emit-as,fail,get-size,main-echo,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -650,6 +673,112 @@ class LuaKibiApiTest {
             val first = out.lines()[0].split("\t")
             assertEquals(3, first.size, out)
             assertTrue(first.all { it == "true" || it.endsWith("not enough memory") }, out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [8, 16, 20])
+    fun `RAMの上限の近くでイベントを読み続けても、Cのスタックが深くなる所でトラップにならない`(remainingKib: Long) = timeout(limit) {
+        // #729 の再現。上限の近くで、表に足す・queueEvent・pullEventRaw をくり返す。
+        // 直す前は、pullEventRaw の中で初めて深くなった C のスタック（上端から 8〜12 KiB）への書き込みがトラップになっていた
+        val script = """
+            local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
+            local t = {}
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 400 do
+                pc(function() t[#t + 1] = rep("y", 16) end)
+                pc(q, p)
+                pc(pe)
+            end
+            t = nil
+            collectgarbage()
+            print("done")
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            // CRASHED にならず、Lua として終わる。関数を作る所など pcall の外の確保が断られたら、Lua のエラーで終わる
+            val out = r.finish()
+            r.release(held)
+            assertTrue(out == "ready\ndone\n" || "not enough memory" in out, out)
+        }
+    }
+
+    @Test
+    fun `取り出した後のLuaの確保だけが失敗したら、写せなかったイベントをevents_droppedで知らせる`() = timeout(limit) {
+        // 結果の場所（take の見積もり）は解放した穴に入り、取り出したイベントを Lua の値に写す確保だけが断られる形（#727・#729）。
+        // 1回の pullEventRaw は、取れるイベントを 8 件ずつ全部 FIFO に移すので、4 KiB のイベントを 40 件出せば、どこかの件で必ず断られる
+        val script = """
+            local pull, sleep, pc = os.pullEventRaw, os.sleep, pcall
+            os.queueEvent("x")
+            pull("x")
+            -- take の見積もりより大きい穴を作っておく（上限の近くで、結果の場所は新しく数えずに取れる）
+            local s = ("z"):rep(48 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            sleep(2)
+            local ok, err = pc(pull)
+            io.write("failed\n")
+            io.stdout:flush()
+            sleep(2)
+            os.queueEvent("end")
+            local big, dropped = 0, 0
+            while true do
+                local ev, a = pull()
+                if ev == "end" then break end
+                if ev == "big" then big = big + 1 elseif ev == "events_dropped" then dropped = dropped + a end
+            end
+            print(ok, err, big, dropped)
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val text = DeviceValue.of("e".repeat(4000))
+            repeat(40) { assertTrue(r.dev.context!!.postEvent("big", text)) }
+            val held = r.squeeze(24 * 1024)
+            r.waitFor("failed\n")
+            r.waitUntil("また待たない") { r.m.stateOf(r.pid) == ProcessState.WAITING_EVENT }
+            r.release(held)
+            val last = r.finish().lines().dropLast(1).last().split("\t")
+            assertEquals(listOf("false", "not enough memory"), last.take(2), last.toString())
+            val big = last[2].toInt()
+            val dropped = last[3].toInt()
+            // どの件で失敗したかに左右されない: 受け取った件数と、写せなかった件数の合計が、出した件数になる
+            assertEquals(40, big + dropped, last.toString())
+            assertTrue(dropped > 0, last.toString())
+        }
+    }
+
+    @Test
+    fun `呼び出しの結果を写す確保だけが失敗しても、fdを閉じて呼び続けられる`() = timeout(limit) {
+        // 結果の場所は穴に入り、60 KiB の文字列を Lua に写す確保だけが断られる形を、fd の上限（256）より多く続ける（#727・#729）
+        val script = """
+            local call, pc, addr, big, echo = peripheral.call, pcall, "$ADDRESS", "big", "echo"
+            local s = ("z"):rep(72 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            local refused = 0
+            for i = 1, 300 do
+                local ok, err = pc(call, addr, big, 60 * 1024)
+                if not ok and err == "not enough memory" then refused = refused + 1 end
+            end
+            local ok, v = pc(call, addr, echo, 7)
+            print(refused, ok, v)
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(40 * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\n300\ttrue\t7\n", out)
+            // 断られたのは結果を Lua に写すときで、どの呼び出しもデバイスまで届いている
+            assertEquals(300, r.dev.bigCalls.get())
         }
     }
 
