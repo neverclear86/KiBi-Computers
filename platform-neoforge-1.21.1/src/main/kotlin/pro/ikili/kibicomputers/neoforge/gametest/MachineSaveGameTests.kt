@@ -361,8 +361,13 @@ object MachineSaveGameTests {
         }.thenWaitUntil {
             helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
             helper.assertTrue(be.computer.machine == null, "the machine should be released but was ${be.computer}")
-            // 書き込みの完了（ここで印が付く）は書き込みのスレッドから後の tick で戻るので、印が付くまで待つ
-            helper.assertTrue(be.demotedChunk!!.isUnsaved, "the demoted chunk should be marked unsaved")
+            // 印は、外すのと同じ呼び出しの中（saveForUnload の写した後のそろえ）で付く。ただし、続く tick のワールドの tick で
+            // バニラの急ぎの保存（ChunkMap.processUnloads → saveChunkIfNeeded）が書いて消すことがある（#722）。そのときは
+            // 電源の切れた NBT がもうディスク（書き込み待ちを含む）に行っているので、どちらかなら通す
+            helper.assertTrue(
+                demotedChunkSettled(helper, be, chunk, pos),
+                "the demoted chunk should be marked unsaved or saved powered off (waiting)",
+            )
         }.thenExecute {
             ServerMachines.afterCaptureForTest.remove(be)
             try {
@@ -370,7 +375,10 @@ object MachineSaveGameTests {
                 helper.assertTrue(!be.isRemoved, "the chunk should stay in memory")
                 helper.assertTrue(!be.computer.poweredOn, "the settle after the demotion capture should power the case off")
                 helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
-                helper.assertTrue(be.demotedChunk!!.isUnsaved, "the demoted chunk should be marked unsaved")
+                helper.assertTrue(
+                    demotedChunkSettled(helper, be, chunk, pos),
+                    "the demoted chunk should still be marked unsaved or saved powered off",
+                )
                 val tag = be.saveWithoutMetadata(level.registryAccess())
                 helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
                 // FULL に戻しても、電源が切れているので復元の順番待ちに入らない
@@ -730,10 +738,28 @@ object MachineSaveGameTests {
     private fun diskGeneration(helper: GameTestHelper, chunk: ChunkPos, pos: BlockPos): Long {
         val data = helper.level.chunkSource.chunkMap.read(chunk).join().orElse(null)
         helper.assertTrue(data != null, "the chunk should be on disk")
-        val tag = data!!.getList("block_entities", Tag.TAG_COMPOUND.toInt()).map { it as CompoundTag }
-            .firstOrNull { it.getInt("x") == pos.x && it.getInt("y") == pos.y && it.getInt("z") == pos.z }
+        val tag = caseTagIn(data!!, pos)
         helper.assertTrue(tag != null && tag.contains(CaseBlockEntity.SAVE_GENERATION_TAG), "the saved chunk should have the case with a generation: $tag")
         return tag!!.getLong(CaseBlockEntity.SAVE_GENERATION_TAG)
+    }
+
+    /** チャンクの NBT [data] の中の、[pos] のブロックエンティティのタグ */
+    private fun caseTagIn(data: CompoundTag, pos: BlockPos): CompoundTag? =
+        data.getList("block_entities", Tag.TAG_COMPOUND.toInt()).map { it as CompoundTag }
+            .firstOrNull { it.getInt("x") == pos.x && it.getInt("y") == pos.y && it.getInt("z") == pos.z }
+
+    /**
+     * FULL でなくなったチャンクで、止まった台のそろえが保存まで届いたか（#722）。チャンクに未保存の印が付いているか、
+     * 印がもう消えていれば、ディスク（IOWorker の書き込み待ちを含む）の [pos] のケースが `PoweredOn=false` を持っているか。
+     * 印は外すのと同じ呼び出しの中で付くが、バニラの急ぎの保存（`ChunkMap.processUnloads` → `saveChunkIfNeeded`）が
+     * 続く tick で書いて消すことがあるので、印だけでは揺れる。置いた直後の保存で `PoweredOn=true` が載っていることや、
+     * まだ書かれていないことがあるので、タグがないときと `PoweredOn=true` のときは通さない。ディスクは印がないときだけ読む
+     */
+    private fun demotedChunkSettled(helper: GameTestHelper, be: CaseBlockEntity, chunk: ChunkPos, pos: BlockPos): Boolean {
+        if (be.demotedChunk?.isUnsaved == true) return true
+        val data = helper.level.chunkSource.chunkMap.read(chunk).join().orElse(null) ?: return false
+        val tag = caseTagIn(data, pos) ?: return false
+        return tag.contains(CaseBlockEntity.POWERED_ON_TAG) && !tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG)
     }
 
     /**

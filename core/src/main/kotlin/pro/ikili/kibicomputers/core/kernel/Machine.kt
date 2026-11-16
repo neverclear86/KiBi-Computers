@@ -622,6 +622,39 @@ public class Machine private constructor(
      */
     public val isRestoring: Boolean get() = restoreHandle != null
 
+    /**
+     * 成功した復元（[completeRestore]）で `restored` イベント（#87、ADR 0087）を入れたキューの数。復元で出していなければ（冷えた起動、
+     * 取り消し、CRASHED、復元していないマシン）-1。数えるのは入れられたキューだけで、捨てた分（溜めている量が上限を超えた・入れられなかった）は
+     * 数えない（`EventHub.post` の戻り値）。0 は、`restored` を受けるキューを開いたプロセスがなかったか、開いていても全部捨てた
+     * （捨てると、受け手は `dropped` で描き直す）かのどちらかで、この値だけでは見分けられない。
+     * 入り直した後に画面が空のままになる件（#636）を切り分けるため、接続層が復元の受け手でログに出す（プロセスの側は [describeProcesses]）
+     */
+    @Volatile
+    public var restoredEventQueues: Int = -1
+        private set
+
+    /**
+     * 終わっていないプロセスの pid・プログラム名・状態・待っている相手を1行にしたもの（ログ用。待つものがなければ `none`）。
+     * 例: `1:sh=WAITING_EVENT waits=[3:READABLE,7:READABLE]`。復元の受け手で見ると、`restored` を受けるはずのプロセスが
+     * 起きたか（`RUNNABLE`）、入力だけを待ったままか（`WAITING_EVENT`）が分かる（#636）。
+     * プログラム名（argv[0]。プレイヤーが決められる）は [processLabel] と同じに制御文字を `?` にして切り（ログに偽の行を作らせない）、
+     * 待っている相手は1プロセスにつき [MAX_LOGGED_WAITS] 件まで出す（残りは `+n`）
+     */
+    public fun describeProcesses(): String = lock.withLockValue {
+        kernel.processes.all()
+            .filter { !it.state.isTerminal }
+            .joinToString("; ") { p ->
+                val waits = p.wait?.let { w ->
+                    val shown = w.take(MAX_LOGGED_WAITS).joinToString(",") { "${it.objectId}:${it.condition}" }
+                    val more = if (w.size > MAX_LOGGED_WAITS) ",+${w.size - MAX_LOGGED_WAITS}" else ""
+                    "[$shown$more]"
+                } ?: "-"
+                val name = p.args.firstOrNull()?.takeIf { it.isNotEmpty() }?.let(::sanitizeForConsole) ?: "?"
+                "${p.pid}:$name=${p.state} waits=$waits"
+            }
+            .ifEmpty { "none" }
+    }
+
     /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
     public val isRebootPending: Boolean get() = lock.withLockValue { rebootRequested || rebootNotified }
 
@@ -1060,7 +1093,7 @@ public class Machine private constructor(
         // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
         // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
         val values = listOf(EventValue.Integer(jump.realtimeNanos), EventValue.Integer(jump.worldTicks))
-        kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
+        restoredEventQueues = kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
         // 前段で開けずに表から落としたマウントを知らせる（#56。保存したときの位置で1回だけ。失敗・取り消し・冷えた起動では出さない）
         for ((diskId, point) in prepared.droppedDisks) postDiskEventLocked(DiskEvents.REMOVED, diskId, point)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
@@ -3868,6 +3901,9 @@ public class Machine private constructor(
 
         /** コンソールのメッセージに出すプロセスの名前の最大の文字数 */
         private const val MAX_LABEL_CHARS: Int = 64
+
+        /** [describeProcesses] が1プロセスにつき出す待っている相手の最大の数 */
+        private const val MAX_LOGGED_WAITS: Int = 8
 
         private const val LF_BYTE: Byte = 0x0A
         private const val CR_BYTE: Byte = 0x0D

@@ -750,12 +750,12 @@ fn readKeyByte() ?u8 {
 
 const Key = enum { none, up, down, left, right, home, end, delete, word_left, word_right };
 
-/// `ESC [` の後を読んで、キーにする
+/// `ESC [` の後を読んで、キーにする（続きは [readKeyByte] で読む。#636）
 fn readCsi() Key {
     var params: [16]u8 = undefined;
     var n: usize = 0;
     while (true) {
-        const c = readByte() orelse return .none;
+        const c = readKeyByte() orelse return .none;
         if (c >= 0x40 and c <= 0x7e) {
             const p = params[0..n];
             // 修飾キー（`1;5D` の 5 など）
@@ -795,13 +795,15 @@ fn readCsi() Key {
     }
 }
 
-/// ESC の後を読む
+/// ESC の後を読む。続きも [readKeyByte] で読み、続きを待っている間に保存から戻っても行を描き直す（#636）。
+/// Esc のキーだけ（キーボードの画面で Esc を押すとコンピューターに届く）だと、次のキーまでここで待つので、
+/// 入力だけを読むと、その間に保存・復元した画面が空のままになる
 fn readEscape() Key {
-    const c = readByte() orelse return .none;
+    const c = readKeyByte() orelse return .none;
     switch (c) {
         '[' => return readCsi(),
         'O' => {
-            const d = readByte() orelse return .none;
+            const d = readKeyByte() orelse return .none;
             return switch (d) {
                 'A' => .up,
                 'B' => .down,
@@ -915,7 +917,8 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     var utf8_rest: usize = 0;
     var utf8_start: usize = 0;
     while (true) {
-        // UTF-8 の続き・エスケープシーケンスの途中（readEscape・readCsi）は、従来どおり入力だけを読む
+        // UTF-8 の続きは、従来どおり入力だけを読む（先頭のバイトを行に入れた後なので、途中で描き直さない）。
+        // エスケープシーケンスの続き（readEscape・readCsi）は readKeyByte で読む（#636）
         const c = (if (utf8_rest > 0) readByte() else readKeyByte()) orelse {
             finishLine("");
             return .eof;
