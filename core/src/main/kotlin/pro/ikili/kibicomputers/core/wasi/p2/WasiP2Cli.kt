@@ -15,8 +15,9 @@ import java.util.concurrent.ThreadLocalRandom
 /**
  * `wasi:cli`・`wasi:clocks`・`wasi:random` の実装（#267。ADR 0267）。値は p1 の層と同じ土台から取る:
  *
- * - `get-arguments` は argv[0] を含む（p1 の `args_get` と同じ並び）。`get-environment` はプロセスの環境変数そのまま
- *   （p2 には `PWD` を足さない。ADR 0332）。`initial-cwd` は起動したときのカーネルの cwd
+ * - `get-arguments` は argv[0] を含む（p1 の `args_get` と同じ並び）。`get-environment` はプロセスの環境変数から `PWD` を除いたもの
+ *   （cwd は専用の `initial-cwd` で渡す。親が `PWD` を入れていても、古い値がゲストに見えて `initial-cwd` とずれないようにする。
+ *   p1 の `environ_*` が `PWD` を cwd にして見せるのとは違う。ADR 0267・0332）。`initial-cwd` は起動したときのカーネルの cwd
  * - `exit(ok)` → 0、`exit(err)` → 1、`exit-with-code(n)` → n（ADR 0074）。[WasiP2Exit] を投げ、ドライバーが終了コードにする
  * - `get-stdin`・`get-stdout`・`get-stderr` は、呼ぶたびに fd 0/1/2 のオブジェクトの参照を 1 つ増やした新しい stream を返す
  *   （dup と同じ。後で fd が閉じても stream は残る）。fd が閉じていれば、閉じた stream
@@ -41,7 +42,9 @@ internal object WasiP2Cli {
         return mapOf(
             "wasi:cli/environment" to mapOf(
                 "get-environment" to body { ctx, _ ->
-                    CanonValue.Items(ctx.env.map { (k, v) -> CanonValue.Fields(listOf(CanonValue.str(k), CanonValue.str(v))) })
+                    CanonValue.Items(
+                        ctx.env.filterKeys { it != WasiP1Basic.PWD }.map { (k, v) -> CanonValue.Fields(listOf(CanonValue.str(k), CanonValue.str(v))) },
+                    )
                 },
                 "get-arguments" to body { ctx, _ -> CanonValue.Items(ctx.args.map(CanonValue::str)) },
                 "initial-cwd" to body { ctx, _ -> CanonValue.some(CanonValue.str(initialCwd(ctx))) },

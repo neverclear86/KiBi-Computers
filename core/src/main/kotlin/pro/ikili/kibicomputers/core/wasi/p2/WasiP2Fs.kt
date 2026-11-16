@@ -27,6 +27,11 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Fd
  *   新しい descriptor）。flags は `read`・`mutate-directory`
  * - パスは基点の descriptor（ディレクトリの `OpenFile`。ほかは `not-directory`）から `VfsPath.resolveBeneath` で解く。絶対パスと外へ
  *   出る `..` は `not-permitted`（`NOTCAPABLE`）。基点の解決はカーネルロックの中、VFS の I/O はロックの外（ADR 0052）
+ * - ディレクトリの中身を変える関数（`create-directory-at`・`remove-directory-at`・`rename-at`・`unlink-file-at`・`set-times-at`、
+ *   `open-at` の作る・切り詰める・書く）は、基点の descriptor が `mutate-directory` を持つときだけ（なければ `read-only`）。
+ *   `open-at` が求められるのは、基点が持つ `mutate-directory` だけ（持たない基点で求めたら `read-only`）
+ * - `read-directory` の stream は、ディレクトリの参照と最後に返した名前だけを持ち、`read-directory-entry` のたびに読み直す
+ *   （p1 の `fd_readdir` と同じ。ゲストが大きなディレクトリで stream を多く持っても、ホストのヒープに中身の写しを留めない）
  * - 開くのは `FdTable.openObject` を通す（`/dev/tty`・`/dev/device/<address>` の差し替えは p1 と同じ口。ADR 0054）
  * - シンボリックリンク・ハードリンクはない（ADR 0051）: `symlink-at`・`link-at` は `unsupported`、`readlink-at` は `invalid`。
  *   `path-flags` の `symlink-follow` は受けて無視する
@@ -43,6 +48,9 @@ internal object WasiP2Fs {
     private const val FLAG_READ = 1
     private const val FLAG_WRITE = 2
     private const val FLAG_MUTATE = 32
+
+    /** `read-directory-entry` が読み直したときの、燃料 1 あたりの項目数（仮の値。確定は #251。呼び出しごとに 1 は別に引く） */
+    private const val DIRECTORY_ENTRIES_PER_FUEL = 64
 
     fun functions(t: WasiP2Types): Map<String, Map<String, HostFunctionBody>> {
         val w = t[TYPES]
@@ -152,13 +160,21 @@ internal object WasiP2Fs {
                 CanonValue.I64(n.toLong())
             },
             "[method]descriptor.read-directory" to fs { ctx, a ->
-                val dir = directory(ctx, a[0])
-                val entries = ctx.vfs.readDirectory(dir)
-                ctx.chargeFuel(entries.size.toLong())
-                P2.own(ctx, DirectoryStreamEntry(entries))
+                // 中身は持たない（ストリームは開いたディレクトリの参照だけ持ち、読むたびに読み直す）
+                ctx.withKernelLock {
+                    directoryLocked(ctx, a[0])
+                    val id = P2.entryLocked<DescriptorEntry>(ctx, a[0]).objectId
+                    ctx.kernel.objects.retain(id)
+                    try {
+                        P2.ownLocked(ctx, DirectoryStreamEntry(id))
+                    } catch (ex: Throwable) {
+                        ctx.kernel.objects.release(id, ctx.wakeSink)
+                        throw ex
+                    }
+                }
             },
             "[method]descriptor.create-directory-at" to fs { ctx, a ->
-                val target = resolve(ctx, a[0], a[1])
+                val target = resolveMutating(ctx, a[0], a[1])
                 if (target.lastIsDot) fsError(Errno.EXIST)
                 ctx.vfs.createDirectory(target.path)
                 null
@@ -175,7 +191,7 @@ internal object WasiP2Fs {
                 statValue(st)
             },
             "[method]descriptor.set-times-at" to fs { ctx, a ->
-                val target = resolve(ctx, a[0], a[2])
+                val target = resolveMutating(ctx, a[0], a[2])
                 ctx.vfs.setTimes(target.path, timestamp(ctx, a[3]), timestamp(ctx, a[4]), requireDirectory = target.trailingSlash)
                 null
             },
@@ -192,7 +208,7 @@ internal object WasiP2Fs {
                 fsError(Errno.INVAL)
             },
             "[method]descriptor.remove-directory-at" to fs { ctx, a ->
-                val target = resolve(ctx, a[0], a[1])
+                val target = resolveMutating(ctx, a[0], a[1])
                 when (target.lastName) {
                     "." -> fsError(Errno.INVAL)
                     ".." -> fsError(Errno.NOTEMPTY)
@@ -201,8 +217,8 @@ internal object WasiP2Fs {
                 null
             },
             "[method]descriptor.rename-at" to fs { ctx, a ->
-                val from = resolve(ctx, a[0], a[1])
-                val to = resolve(ctx, a[2], a[3])
+                val from = resolveMutating(ctx, a[0], a[1])
+                val to = resolveMutating(ctx, a[2], a[3])
                 if (from.lastIsDot || to.lastIsDot) fsError(Errno.INVAL)
                 ctx.vfs.rename(from.path, to.path, requireDirectory = from.trailingSlash || to.trailingSlash)
                 null
@@ -212,7 +228,7 @@ internal object WasiP2Fs {
                 fsError(Errno.NOTSUP)
             },
             "[method]descriptor.unlink-file-at" to fs { ctx, a ->
-                val target = resolve(ctx, a[0], a[1])
+                val target = resolveMutating(ctx, a[0], a[1])
                 if (target.trailingSlash) {
                     if (ctx.vfs.stat(target.path).type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
                     fsError(Errno.ISDIR)
@@ -243,14 +259,19 @@ internal object WasiP2Fs {
                 hash(ctx.vfs.stat(target.path))
             },
             "[method]directory-entry-stream.read-directory-entry" to fs { ctx, a ->
-                ctx.withKernelLock {
+                val (dir, last) = ctx.withKernelLock {
                     val s = P2.entryLocked<DirectoryStreamEntry>(ctx, a[0])
-                    if (s.index >= s.entries.size) {
-                        CanonValue.NONE
-                    } else {
-                        val e = s.entries[s.index++]
-                        CanonValue.some(dirEntry.value("type" to typeOf(e.type), "name" to CanonValue.str(e.name)))
-                    }
+                    (ctx.kernel.objects[s.objectId] as? OpenFile ?: fsError(Errno.BADF)) to s.last
+                }
+                // 読み直して、最後に返した名前より後の最初の 1 つを返す（VFS の I/O はロックの外。並びは名前の順）
+                val entries = ctx.vfs.readDirectory(dir)
+                ctx.chargeFuel(1L + entries.size / DIRECTORY_ENTRIES_PER_FUEL)
+                val next = entries.firstOrNull { last == null || it.name > last }
+                if (next == null) {
+                    CanonValue.NONE
+                } else {
+                    ctx.withKernelLock { P2.entryLocked<DirectoryStreamEntry>(ctx, a[0]).last = next.name }
+                    CanonValue.some(dirEntry.value("type" to typeOf(next.type), "name" to CanonValue.str(next.name)))
                 }
             },
             "filesystem-error-code" to body { ctx, a ->
@@ -301,6 +322,16 @@ internal object WasiP2Fs {
         return Target(resolved, VfsPath.hasTrailingSlash(text), last)
     }
 
+    /**
+     * [resolve] して、基点 [self] が `mutate-directory` を持つことを確かめる（なければ `read-only`。WIT の約束。
+     * ディレクトリの中身を変える関数に使う）
+     */
+    private fun resolveMutating(ctx: ProcessContext, self: CanonValue, path: CanonValue): Target {
+        val target = resolve(ctx, self, path)
+        if (P2.entry<DescriptorEntry>(ctx, self).flags and FLAG_MUTATE == 0) fsError(Errno.ROFS, "descriptor に mutate-directory がない")
+        return target
+    }
+
     /** `read-via-stream`・`write-via-stream`・`append-via-stream`。stream はファイルの参照を自分で持つ */
     private fun stream(ctx: ProcessContext, self: CanonValue, input: Boolean, offset: Long, append: Boolean): CanonValue = ctx.withKernelLock {
         val e = P2.entryLocked<DescriptorEntry>(ctx, self)
@@ -318,8 +349,8 @@ internal object WasiP2Fs {
     }
 
     /**
-     * `open-at(path-flags, path, open-flags, descriptor-flags)`。読み書きは `read`・`write` の flags で決める。`mutate-directory` は
-     * 基点が持つときだけ渡す。`file-integrity-sync`・`data-integrity-sync`・`requested-write-sync` は p1 の `DSYNC` などと同じく `unsupported`
+     * `open-at(path-flags, path, open-flags, descriptor-flags)`。読み書きは `read`・`write` の flags で決める。基点が `mutate-directory`
+     * を持たないのに、作る・切り詰める・書く・`mutate-directory` を求めたら `read-only`。`file-integrity-sync`・`data-integrity-sync`・`requested-write-sync` は p1 の `DSYNC` などと同じく `unsupported`
      */
     private fun openAt(ctx: ProcessContext, a: List<CanonValue>, openFlags: CanonType.Flags): CanonValue {
         val requested = (a[4] as CanonValue.Flags).bits
@@ -329,6 +360,9 @@ internal object WasiP2Fs {
         val read = requested and FLAG_READ != 0
         val write = requested and FLAG_WRITE != 0
         val of = a[3]
+        // 変える開き方（作る・切り詰める・書く）と、`mutate-directory` を求める開き方は、基点が `mutate-directory` を持つときだけ（`read-only`）
+        val mutates = write || openFlags.has(of, "create") || openFlags.has(of, "truncate")
+        if ((mutates || requested and FLAG_MUTATE != 0) && base.flags and FLAG_MUTATE == 0) fsError(Errno.ROFS, "descriptor に mutate-directory がない")
         val options = OpenOptions(
             read = read,
             write = write,
@@ -342,7 +376,7 @@ internal object WasiP2Fs {
             ctx.withKernelLock {
                 val id = FdTable.openObject(file, ctx.vfs, ctx.kernel.objects, ctx.kernel.consoleTtyId)
                 val rights = (if (read) HandleRights.READ else 0) or (if (write) HandleRights.WRITE else 0)
-                val flags = (requested and (FLAG_READ or FLAG_WRITE)) or (base.flags and requested and FLAG_MUTATE)
+                val flags = (requested and (FLAG_READ or FLAG_WRITE)) or (requested and FLAG_MUTATE)
                 try {
                     P2.ownLocked(ctx, DescriptorEntry(HandleEntry(id, rights = rights), flags))
                 } catch (ex: Throwable) {

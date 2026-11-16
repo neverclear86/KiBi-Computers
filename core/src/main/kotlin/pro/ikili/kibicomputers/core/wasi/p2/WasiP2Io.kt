@@ -22,6 +22,10 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Poll
  * - stream の約束（仕様のトラップ）: `write` は直前の `check-write` の許可量を超えたらトラップ、`blocking-write-and-flush` は
  *   4096 バイトを超えたらトラップ。読めるものがない `read` は空のリスト、書く側が閉じたら `closed`、I/O の失敗は
  *   `last-operation-failed`（errno を持つ `error`）
+ * - `splice`・`blocking-splice` は WIT の約束どおり、`check-write` → 許可量と `len` の小さい方で `read` → `write` の順で動く。
+ *   出力が受けられない（許可量 0）なら、入力を読まずに 0 を返す（`splice`）か、受けられるまで待つ（`blocking-splice`）。
+ *   出力が閉じている・失敗しているのは、入力を読む前に分かる。読んだ後の `write` の失敗は、読んだバイトが戻らないまま報告する（WIT の定義の
+ *   とおり。`write` は許可量以内なので、待つのは同じパイプへ書く別の書き手がいるときだけ）
  * - 書き込みは受け付けたらすぐ下へ書く（`flush` は何もしない）。パイプが一部しか受けなければ、全部書くまで待って書く
  *   （`FdIo.writeBlocking` と同じ。待つのは BLOCKING のプロセスのスレッドで `ctx.block`）
  * - `poll`: 空のリストはトラップ、上限は p1 の `poll_oneoff` と同じ [WasiP1Poll.MAX_SUBSCRIPTIONS]。待ち方は p1 と同じ
@@ -117,24 +121,45 @@ internal object WasiP2Io {
                 if (n > P2.MAX_BLOCKING_WRITE) P2.trap("blocking-write-zeroes-and-flush は ${P2.MAX_BLOCKING_WRITE} バイトまで（$n）")
                 writeResult(ctx, write(ctx, a[0], ByteArray(n.toInt()), n.toInt()))
             },
-            "[method]output-stream.splice" to body { ctx, a -> splice(ctx, a, blocking = false, ::readResult, ::writeResult, closed) },
-            "[method]output-stream.blocking-splice" to body { ctx, a -> splice(ctx, a, blocking = true, ::readResult, ::writeResult, closed) },
+            "[method]output-stream.splice" to body { ctx, a -> splice(ctx, a, blocking = false, ::readResult, ::writeResult, ::failed, closed) },
+            "[method]output-stream.blocking-splice" to body { ctx, a -> splice(ctx, a, blocking = true, ::readResult, ::writeResult, ::failed, closed) },
         )
         return mapOf(ERROR to error, POLL to poll, STREAMS to streams)
     }
 
     private fun rep(v: CanonValue): Int = (v as CanonValue.Handle).value
 
+    /**
+     * `splice`・`blocking-splice`。出力の `check-write`（[blocking] なら、許可量が 0 の間は待つ）→ 許可量と `len` の小さい方で入力を
+     * `read`（[blocking] なら少しでも読めるまで待つ）→ 出力へ `write`。運んだ数を返す
+     */
     private inline fun splice(
         ctx: ProcessContext,
         a: List<CanonValue>,
         blocking: Boolean,
         readResult: (ProcessContext, ReadOutcome, Boolean) -> CanonValue,
         writeResult: (ProcessContext, WriteOutcome, CanonValue?) -> CanonValue,
+        failed: (ProcessContext, Errno) -> CanonValue,
         closed: CanonValue,
     ): CanonValue {
-        output(ctx, a[0])
-        val r = read(ctx, a[1], P2.u64(a[2]), blocking)
+        val out = output(ctx, a[0])
+        input(ctx, a[1])
+        val len = P2.u64(a[2])
+        var allowed = 0L
+        while (true) {
+            when (val c = checkWrite(ctx, a[0])) {
+                CheckWrite.Closed -> return closed
+                is CheckWrite.Failed -> return failed(ctx, c.errno)
+                is CheckWrite.Allowed -> {
+                    allowed = c.bytes
+                    if (allowed > 0 || len == 0L) break
+                    val key = c.key
+                    if (!blocking || key == null) return CanonValue.ok(CanonValue.I64(0))
+                    ctx.block(listOf(key))
+                }
+            }
+        }
+        val r = read(ctx, a[1], minOf(allowed, len), blocking)
         if (r !is ReadOutcome.Bytes) {
             return when (r) {
                 ReadOutcome.Empty -> CanonValue.ok(CanonValue.I64(0))
@@ -142,7 +167,8 @@ internal object WasiP2Io {
             }
         }
         val w = write(ctx, a[0], r.buffer, r.count)
-        if (w != WriteOutcome.Done) return if (w == WriteOutcome.Closed) closed else writeResult(ctx, w, null)
+        if (w != WriteOutcome.Done) return writeResult(ctx, w, null)
+        ctx.withKernelLock { out.allowance = maxOf(0L, out.allowance - r.count) }
         ctx.chargeFuel(r.count.toLong() / WasiP1Fd.BYTES_PER_FUEL)
         return CanonValue.ok(CanonValue.I64(r.count.toLong()))
     }
@@ -211,7 +237,8 @@ internal object WasiP2Io {
     }
 
     internal sealed interface CheckWrite {
-        class Allowed(val bytes: Long) : CheckWrite
+        /** 今すぐ受けられる [bytes]。0 のとき、受けられるようになるのを待つ [key]（ファイルなど待たなくてよいものは `null`） */
+        class Allowed(val bytes: Long, val key: WaitKey? = null) : CheckWrite
         data object Closed : CheckWrite
         class Failed(val errno: Errno) : CheckWrite
     }
@@ -236,7 +263,7 @@ internal object WasiP2Io {
                 }
                 is FdReadiness.Pending -> {
                     e.allowance = 0
-                    CheckWrite.Allowed(0)
+                    CheckWrite.Allowed(0, r.key)
                 }
                 is FdReadiness.Error -> if (r.errno == Errno.PIPE) CheckWrite.Closed else CheckWrite.Failed(r.errno)
             }

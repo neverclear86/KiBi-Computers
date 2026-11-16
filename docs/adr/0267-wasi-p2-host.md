@@ -61,14 +61,14 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 
 - resource の rep は `HostResourceTable` の番号。中身（`P2Entry`）は stream・descriptor・directory-entry-stream・pollable・error と、中身のない印（`network` など）。中身はカーネルのオブジェクト（`HandleEntry` を通したファイル・パイプの端・TTY）を参照で持つ。
 - 表はプロセスにあり、カーネルロックの中で触る。プロセスの終わり（`finishLocked`）と、写しの中で殺すとき（`killInCopy`）に、fd の表と同じく全部閉じてオブジェクトの参照を返す。上限は 1 プロセスあたり 4096 個（`HostResourceTable.LIMIT`。仮。#251）で、超えたらトラップ。
-- 子（stream から作った pollable、descriptor から作った stream など）が残る親の `drop` はトラップ（WIT の約束。子を先に捨てる）。
+- 子として数えるのは pollable だけ（`subscribe` で作ったもの。親は stream）。子の pollable が残る stream の `drop` はトラップ（WIT の約束。子を先に捨てる）。descriptor から作った stream（`read-via-stream` など）は、ファイルの参照を自分で持つので子に数えない。descriptor は、stream が残っていても `drop` できる（`read-directory` の stream も、ディレクトリの参照を自分で持つ）。
 - pollable は待つ相手（期限か、親の stream）だけを持つ。待つときだけ、カーネルの一時的なタイマーを開き、待ち終わったら閉じる（pollable の数だけタイマーを持ち続けない）。
 
 #### stdio・preopen・引数・環境変数
 
 - `get-stdin`・`get-stdout`・`get-stderr` は fd 0・1・2 のオブジェクトを参照する stream（位置を持たない共有の stream）。`terminal-stdin` などは、その fd が TTY のときだけ `some`。
 - `preopens.get-directories` は p1 と同じく fd 3（`/`）を 1 つだけ、名前 `"/"` で返す（descriptor の flags は read と mutate-directory）。
-- `get-arguments` は argv[0] を含む引数そのまま（p1 と同じ）。`get-environment` は環境変数から `PWD` を除いたもの、`initial-cwd` は開始時の cwd（ADR 0332 で p1 は `PWD` で渡すが、p2 には専用の関数がある）。
+- `get-arguments` は argv[0] を含む引数そのまま（p1 と同じ）。`get-environment` は環境変数から `PWD` を除いたもの、`initial-cwd` は開始時の cwd（ADR 0332 で p1 は `PWD` で渡すが、p2 には専用の関数がある）。親が `PWD` を環境変数に入れて起動しても、ゲストには見せない（古い値が `initial-cwd` とずれないように）。アダプターで包んだ p1 のプログラムは `PWD` を受け取らないので、`kibi_cwd.c` による cwd の同期は働かない（p2 のコマンドは `initial-cwd` で cwd を知る）。
 
 #### エラーの写し方
 
@@ -82,9 +82,15 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 
 #### stream の上限
 
+- `read-directory` の stream は、中身の写しを持たない。開いたディレクトリの参照と、最後に返した名前（名前の順）だけを持ち、`read-directory-entry` のたびに VFS から読み直して、その名前より後の最初の 1 つを返す（p1 の `fd_readdir` と同じく読み直す。途中で足されたり消されたりしても、名前の順の続きから読める）。呼び出しごとの燃料は、1 回につき 1 と、読み直した項目 64 個ごとに 1（仮。#251）。1 プロセスが持てる stream の数は `HostResourceTable.LIMIT` で抑えられ、ホストのヒープに留まる量は stream の数に比例しない。
+- `splice`・`blocking-splice` は WIT の定義どおり、出力の `check-write` → 許可量と `len` の小さい方で入力を `read` → 出力へ `write` の順。出力が閉じている・失敗しているときは、入力を読む前に報告する。許可量が 0 なら、`splice` は 0 を返し（入力を読まない）、`blocking-splice` は受けられるまで待つ。読んだ後の `write` の失敗は、読んだバイトが入力に戻らないまま報告する（WIT の定義と同じ）。
 - `read` の長さは 64 KiB で切る（`P2.MAX_READ`。先に確保しない）。`check-write` が返した許可量を超える `write` はトラップ（WIT の約束）。`blocking-write-and-flush` は 4096 バイトまで（WIT の約束）。ファイルへの書き込みの許可量は 64 KiB（`P2.FILE_WRITE_ALLOWANCE`）。
 - `poll` は、空のリストと、p1 の `poll_oneoff` の上限（`WasiP1Poll.MAX_SUBSCRIPTIONS`）を超える数でトラップ。
 - 燃料は、ホストの関数 1 回あたり p1 と同じ `WasiP1Fd.CALL_FUEL`（仮。#251）。lift・lower の分は ADR 0264 のとおり別に引く。
+
+#### `mutate-directory`
+
+descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確かめる。ディレクトリの中身を変える関数（`create-directory-at`・`remove-directory-at`・`rename-at`（両方の基点）・`unlink-file-at`・`set-times-at`）と、`open-at` の作る・切り詰める・書く開き方は、基点の descriptor が `mutate-directory` を持たなければ `read-only`。`open-at` は、基点が持つ `mutate-directory` だけを新しい descriptor に渡せる（基点が持たないのに求めたら `read-only`）。ルートの preopen は `read`・`mutate-directory` を持つ。
 
 ### `wasi:sockets`
 

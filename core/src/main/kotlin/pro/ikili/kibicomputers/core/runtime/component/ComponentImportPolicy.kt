@@ -16,15 +16,6 @@ internal fun interface ComponentImportPolicy {
         const val KIBI_VERSION: String = "0.1.0"
 
         /**
-         * 既定の判定:
-         *
-         * - 種類はインスタンスだけ（core モジュール・関数・値・型・コンポーネントの import は断る。ホストはインターフェースの
-         *   インスタンスだけを出す）
-         * - 名前はインターフェースの名前（`<名前空間>:<パッケージ>/<インターフェース>[@<版>]`）
-         * - 名前空間は `wasi` と `kibi` だけ（ほかはホストが出さない）
-         * - `kibi:*` は版 `@0.1.0` の完全一致だけ。`wasi:*` は `@0.2.<n>` だけ（[rejectWasiVersion]。ADR 0267）
-         */
-        /**
          * `wasi:*` の名前 [name] の版を断る理由（ADR 0267）。受けるのは `@0.2.<n>` だけで、`<n>` は問わない（ホストの基準より
          * 新しくても古くてもよい。wasmtime の Linker と同じく semver の互換として扱う。ゲストが宣言した関数がホストになければ、
          * リンクが読み込みの失敗にする）。版なし・pre-release・`+build` 付き・`0.3.x`（#268 まで）・ほかの版は断る
@@ -42,6 +33,15 @@ internal fun interface ComponentImportPolicy {
 
         private val WASI_P2 = Regex("""0\.2\.(0|[1-9][0-9]*)""")
 
+        /**
+         * 既定の判定:
+         *
+         * - 種類はインスタンスだけ（core モジュール・関数・値・型・コンポーネントの import は断る。ホストはインターフェースの
+         *   インスタンスだけを出す）
+         * - 名前はインターフェースの名前（`<名前空間>:<パッケージ>/<インターフェース>[@<版>]`）
+         * - 名前空間は `wasi` と `kibi` だけ（ほかはホストが出さない）
+         * - `kibi:*` は版 `@0.1.0` の完全一致だけ。`wasi:*` は `@0.2.<n>` だけ（[rejectWasiVersion]。ADR 0267）
+         */
         val DEFAULT: ComponentImportPolicy = ComponentImportPolicy { import ->
             if (import.desc !is ExternDesc.Instance) {
                 return@ComponentImportPolicy "インスタンスでない import（${import.desc.sort.label}）"

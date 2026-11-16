@@ -70,7 +70,17 @@ class WasiP2StreamTest {
     }
 
     /** [body] をコンポーネントのプロセスの中で動かす。標準入力・出力はテストが持つパイプの端 */
-    private fun scenario(h: Harness, m: Machine, stdin: Int, stdout: Int, body: (ProcessContext) -> Unit): Int {
+    private fun scenario(
+        h: Harness,
+        m: Machine,
+        stdin: Int,
+        stdout: Int,
+        stdoutSource: StdioSource = StdioSource.Object(stdout, HandleRights.WRITE),
+        args: List<String> = emptyList(),
+        env: Map<String, String>? = null,
+        cwd: String? = null,
+        body: (ProcessContext) -> Unit,
+    ): Int {
         val failure = AtomicReference<Throwable>()
         val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
             try {
@@ -83,7 +93,10 @@ class WasiP2StreamTest {
             StepResult.Exit(0)
         }
         val options = SpawnOptions(
-            stdio = StdioSpec(StdioSource.Object(stdin, HandleRights.READ), StdioSource.Object(stdout, HandleRights.WRITE), StdioSource.Closed),
+            stdio = StdioSpec(StdioSource.Object(stdin, HandleRights.READ), stdoutSource, StdioSource.Closed),
+            args = args,
+            env = env,
+            cwd = cwd,
             fds = SpawnOptions.ROOT_PREOPEN,
         )
         val pid = m.spawn(empty, driver, options, 0)
@@ -327,6 +340,428 @@ class WasiP2StreamTest {
                 assertEquals(1, m.kernel.objects.refCount(input.readEnd))
             }
             assertEquals(ProcessState.KILLED, m.stateOf(pid))
+            m.stop()
+        }
+    }
+
+    // ---- 追加のテスト（レビューの指摘: 通っていなかった関数・約束の確認） ----
+
+    private val ty = "wasi:filesystem/types"
+
+    private val fsTypes get() = WasiP2Host.wit.getValue(ty)
+
+    private fun errName(v: CanonValue?): String {
+        val c = v as CanonValue.Case
+        assertEquals(1, c.index, "ok だった: $v")
+        return fsTypes.type<CanonType.Enum>("error-code").caseName(c.payload!!)
+    }
+
+    private fun root(ctx: ProcessContext): CanonValue =
+        ((ctx.p2("wasi:filesystem/preopens", "get-directories") as CanonValue.Items).items[0] as CanonValue.Fields).fields[0]
+
+    private fun openAt(
+        ctx: ProcessContext,
+        base: CanonValue,
+        path: String,
+        open: Array<String> = emptyArray(),
+        flags: Array<String> = arrayOf("read"),
+    ): CanonValue? = ctx.p2(
+        ty,
+        "[method]descriptor.open-at",
+        base,
+        fsTypes.type<CanonType.Flags>("path-flags").value(),
+        CanonValue.str(path),
+        fsTypes.type<CanonType.Flags>("open-flags").value(*open),
+        fsTypes.type<CanonType.Flags>("descriptor-flags").value(*flags),
+    )
+
+    /** パイプ [p] の書く側の ByteStream に [data] を書く（テストが入力を用意する） */
+    private fun feed(m: Machine, p: PipePair, data: ByteArray) {
+        m.lock.withLockValue {
+            val end = m.kernel.objects[p.writeEnd] as pro.ikili.kibicomputers.core.kernel.io.PipeEnd
+            (m.kernel.objects[end.streamId] as ByteStream).write(data, 0, data.size, m.wakeSink)
+        }
+    }
+
+    /** パイプ [p] の書く側にたまっているものを全部読む */
+    private fun take(m: Machine, p: PipePair): ByteArray = m.lock.withLockValue {
+        val end = m.kernel.objects[p.writeEnd] as pro.ikili.kibicomputers.core.kernel.io.PipeEnd
+        val stream = m.kernel.objects[end.streamId] as ByteStream
+        val buf = ByteArray(stream.available)
+        stream.read(buf, 0, buf.size, m.wakeSink)
+        buf
+    }
+
+    @Test
+    fun `get-environmentはPWDを除き、initial-cwdはカーネルのcwd、引数はargv0を含む`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/home"))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(
+                h,
+                m,
+                input.readEnd,
+                output.writeEnd,
+                args = listOf("prog", "ベータ"),
+                env = linkedMapOf("A" to "1", "PWD" to "/stale", "B" to "2"),
+                cwd = "/home",
+            ) { ctx ->
+                val env = (ctx.p2("wasi:cli/environment", "get-environment") as CanonValue.Items).items
+                assertEquals(
+                    listOf<CanonValue>(
+                        CanonValue.Fields(listOf(CanonValue.str("A"), CanonValue.str("1"))),
+                        CanonValue.Fields(listOf(CanonValue.str("B"), CanonValue.str("2"))),
+                    ),
+                    env,
+                )
+                assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
+                assertEquals(
+                    listOf<CanonValue>(CanonValue.str("prog"), CanonValue.str("ベータ")),
+                    (ctx.p2("wasi:cli/environment", "get-arguments") as CanonValue.Items).items,
+                )
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `get-terminalはTTYのときだけsome、wall-clockは実時間、wasi-socketsはnot-supported`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd, stdoutSource = StdioSource.Console) { ctx ->
+                // stdin はパイプ、stdout はコンソール（TTY）、stderr は閉じている
+                assertEquals(CanonValue.NONE, ctx.p2("wasi:cli/terminal-stdin", "get-terminal-stdin"))
+                val tty = ctx.p2("wasi:cli/terminal-stdout", "get-terminal-stdout") as CanonValue.Case
+                assertEquals(1, tty.index)
+                ctx.drop(tty.payload!!)
+                assertEquals(CanonValue.NONE, ctx.p2("wasi:cli/terminal-stderr", "get-terminal-stderr"))
+
+                val datetime = WasiP2Host.wit.getValue("wasi:clocks/wall-clock").type<CanonType.Record>("datetime")
+                val nanosOf = { v: CanonValue ->
+                    (datetime.field(v, "seconds") as CanonValue.I64).value * 1_000_000_000L + (datetime.field(v, "nanoseconds") as CanonValue.I32).value
+                }
+                val before = ctx.environment.clock.realtimeNanos()
+                val now = ctx.p2("wasi:clocks/wall-clock", "now")!!
+                val after = ctx.environment.clock.realtimeNanos()
+                assertTrue(nanosOf(now) in before..after, "$before <= ${nanosOf(now)} <= $after")
+                assertEquals(
+                    pro.ikili.kibicomputers.core.wasi.p1.WasiP1Basic.CLOCK_RESOLUTION_NANOS,
+                    nanosOf(ctx.p2("wasi:clocks/wall-clock", "resolution")!!),
+                )
+
+                // ソケットは作れない（実物は #164）。ネットワークの口は返る
+                val sockets = WasiP2Host.wit.getValue("wasi:sockets/network")
+                val family = sockets.type<CanonType.Enum>("ip-address-family").case("ipv4")
+                val notSupported = { v: CanonValue? ->
+                    val c = v as CanonValue.Case
+                    assertEquals(1, c.index)
+                    assertEquals("not-supported", sockets.type<CanonType.Enum>("error-code").caseName(c.payload!!))
+                }
+                notSupported(ctx.p2("wasi:sockets/tcp-create-socket", "create-tcp-socket", family))
+                notSupported(ctx.p2("wasi:sockets/udp-create-socket", "create-udp-socket", family))
+                val network = ctx.p2("wasi:sockets/instance-network", "instance-network")!!
+                notSupported(ctx.p2("wasi:sockets/ip-name-lookup", "resolve-addresses", network, CanonValue.str("example.com")))
+                ctx.drop(network)
+                assertEquals(0, ctx.withKernelLock { P2.tableLocked(ctx).size })
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `ファイルへのappend・write-via-streamとwrite-zeroes、set-size・set-times・is-same-object・metadata-hash`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            val f = m.vfs.open(VfsPath.parse("/a.txt"), OpenOptions(read = true, write = true, create = true))
+            m.vfs.write(f, "abcde".toByteArray(), 0, 5)
+            val g = m.vfs.open(VfsPath.parse("/b.txt"), OpenOptions(read = true, write = true, create = true))
+            m.vfs.write(g, "z".toByteArray(), 0, 1)
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val root = root(ctx)
+                val file = ok(openAt(ctx, root, "a.txt", flags = arrayOf("read", "write")))!!
+                val read = {
+                    (ok(ctx.p2(ty, "[method]descriptor.read", file, CanonValue.I64(100), CanonValue.I64(0))) as CanonValue.Fields).fields[0] as CanonValue.Bytes
+                }
+                val allowance = { s: CanonValue -> (ok(ctx.p2(streams, "[method]output-stream.check-write", s)) as CanonValue.I64).value }
+
+                // append-via-stream: 終わりに足す
+                val ap = ok(ctx.p2(ty, "[method]descriptor.append-via-stream", file))!!
+                assertEquals(P2.FILE_WRITE_ALLOWANCE, allowance(ap))
+                ok(ctx.p2(streams, "[method]output-stream.write", ap, CanonValue.Bytes("XY".toByteArray())))
+                ok(ctx.p2(streams, "[method]output-stream.flush", ap))
+                assertEquals("abcdeXY", String(read().bytes))
+                ctx.drop(ap)
+
+                // write-via-stream: 位置 1 から上書き
+                val ws = ok(ctx.p2(ty, "[method]descriptor.write-via-stream", file, CanonValue.I64(1)))!!
+                allowance(ws)
+                ok(ctx.p2(streams, "[method]output-stream.write", ws, CanonValue.Bytes("ZZ".toByteArray())))
+                assertEquals("aZZdeXY", String(read().bytes))
+                ctx.drop(ws)
+
+                // write-zeroes（許可量を超えるとトラップ）・blocking-write-zeroes-and-flush（4096 まで）
+                val wz = ok(ctx.p2(ty, "[method]descriptor.write-via-stream", file, CanonValue.I64(0)))!!
+                assertThrows<WasmTrapException> { ctx.p2(streams, "[method]output-stream.write-zeroes", wz, CanonValue.I64(2)) }
+                allowance(wz)
+                ok(ctx.p2(streams, "[method]output-stream.write-zeroes", wz, CanonValue.I64(2)))
+                assertThrows<WasmTrapException> { ctx.p2(streams, "[method]output-stream.write-zeroes", wz, CanonValue.I64(P2.FILE_WRITE_ALLOWANCE)) }
+                assertThrows<WasmTrapException> { ctx.p2(streams, "[method]output-stream.blocking-write-zeroes-and-flush", wz, CanonValue.I64(4097)) }
+                ok(ctx.p2(streams, "[method]output-stream.blocking-write-zeroes-and-flush", wz, CanonValue.I64(1)))
+                assertEquals("\u0000\u0000\u0000deXY", String(read().bytes))
+                ctx.drop(wz)
+
+                // set-size は切り詰める・伸ばす
+                ok(ctx.p2(ty, "[method]descriptor.set-size", file, CanonValue.I64(2)))
+                assertEquals(2, read().bytes.size)
+                ok(ctx.p2(ty, "[method]descriptor.set-size", file, CanonValue.I64(4)))
+                assertEquals(4, read().bytes.size)
+
+                // set-times: 変更時刻だけを決めた値にする（no-change は変えない）
+                val newTs = fsTypes.type<CanonType.Variant>("new-timestamp")
+                val datetime = WasiP2Host.wit.getValue("wasi:clocks/wall-clock").type<CanonType.Record>("datetime")
+                val at = datetime.value("seconds" to CanonValue.I64(1_000), "nanoseconds" to CanonValue.I32(5))
+                ok(ctx.p2(ty, "[method]descriptor.set-times", file, newTs.case("no-change"), newTs.case("timestamp", at)))
+                val stat = fsTypes.type<CanonType.Record>("descriptor-stat")
+                val st = ok(ctx.p2(ty, "[method]descriptor.stat", file))!!
+                assertEquals(CanonValue.some(at), stat.field(st, "data-modification-timestamp"))
+                assertEquals(CanonValue.I64(4), stat.field(st, "size"))
+                // 範囲外のナノ秒は invalid
+                val bad = datetime.value("seconds" to CanonValue.I64(1), "nanoseconds" to CanonValue.I32(1_000_000_000))
+                assertEquals("invalid", errName(ctx.p2(ty, "[method]descriptor.set-times", file, newTs.case("no-change"), newTs.case("timestamp", bad))))
+
+                // is-same-object・metadata-hash
+                val again = ok(openAt(ctx, root, "a.txt"))!!
+                val other = ok(openAt(ctx, root, "b.txt"))!!
+                assertEquals(CanonValue.TRUE, ctx.p2(ty, "[method]descriptor.is-same-object", file, again))
+                assertEquals(CanonValue.TRUE, ctx.p2(ty, "[method]descriptor.is-same-object", file, file))
+                assertEquals(CanonValue.FALSE, ctx.p2(ty, "[method]descriptor.is-same-object", file, other))
+                assertEquals(CanonValue.FALSE, ctx.p2(ty, "[method]descriptor.is-same-object", file, root))
+                val h1 = ok(ctx.p2(ty, "[method]descriptor.metadata-hash", file))
+                assertEquals(h1, ok(ctx.p2(ty, "[method]descriptor.metadata-hash", again)))
+                assertTrue(h1 != ok(ctx.p2(ty, "[method]descriptor.metadata-hash", other)))
+                val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
+                assertEquals(h1, ok(ctx.p2(ty, "[method]descriptor.metadata-hash-at", root, pf, CanonValue.str("a.txt"))))
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `ストリームの失敗はlast-operation-failedで、errorからerror-codeと説明を読める`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val file = ok(openAt(ctx, root(ctx), "f.txt", open = arrayOf("create"), flags = arrayOf("read", "write")))!!
+                // 位置が u64 の最大（Long の範囲に飽和）のところへ書くと、ファイルが大きすぎて失敗する
+                val s = ok(ctx.p2(ty, "[method]descriptor.write-via-stream", file, CanonValue.I64(-1)))!!
+                ok(ctx.p2(streams, "[method]output-stream.check-write", s))
+                val r = ctx.p2(streams, "[method]output-stream.write", s, CanonValue.Bytes("abc".toByteArray())) as CanonValue.Case
+                assertEquals(1, r.index)
+                val failed = r.payload as CanonValue.Case
+                assertEquals(0, failed.index, "last-operation-failed のはず")
+                val error = failed.payload!!
+                val code = ctx.p2(ty, "filesystem-error-code", error) as CanonValue.Case
+                assertEquals(1, code.index)
+                assertEquals("file-too-large", fsTypes.type<CanonType.Enum>("error-code").caseName(code.payload!!))
+                val text = (ctx.p2("wasi:io/error", "[method]error.to-debug-string", error) as CanonValue.Str).value
+                assertTrue(text.contains("fbig") && text.contains("file-too-large"), text)
+                ctx.drop(error)
+                ctx.drop(s)
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `spliceは出力の許可量だけ運び、出力が一杯なら待たずに0、閉じていれば入力を読まずにclosed`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val input = pipe(m, capacity = 8192)
+            val output = pipe(m, capacity = 1024)
+            val data = ByteArray(4000) { (it % 251).toByte() }
+            feed(m, input, data)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val inp = ctx.p2("wasi:cli/stdin", "get-stdin")!!
+                val out = ctx.p2("wasi:cli/stdout", "get-stdout")!!
+                val splice = { len: Long -> (ok(ctx.p2(streams, "[method]output-stream.splice", out, inp, CanonValue.I64(len))) as CanonValue.I64).value }
+                // 出力の空き（1024）だけ運ぶ。待たない
+                assertEquals(1024, splice(4000))
+                // 出力が一杯なら、入力を読まずに 0（スレッドを持ったまま待たない）
+                assertEquals(0, splice(4000))
+                assertEquals(0, splice(0))
+                val rest = ok(ctx.p2(streams, "[method]input-stream.read", inp, CanonValue.I64(10_000))) as CanonValue.Bytes
+                assertEquals(4000 - 1024, rest.bytes.size)
+                assertTrue(rest.bytes.contentEquals(data.copyOfRange(1024, 4000)), "入力の続きが運ばれていない")
+            }
+            assertTrue(take(m, output).contentEquals(data.copyOf(1024)))
+            m.stop()
+        }
+        // 出力の読み手が閉じていれば、入力を読む前に closed。入力は消費されない
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val input = pipe(m)
+            val output = pipe(m)
+            feed(m, input, "hello".toByteArray())
+            m.lock.withLockValue { m.kernel.objects.release(output.readEnd, m.wakeSink) }
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val inp = ctx.p2("wasi:cli/stdin", "get-stdin")!!
+                val out = ctx.p2("wasi:cli/stdout", "get-stdout")!!
+                assertTrue(isClosed(ctx.p2(streams, "[method]output-stream.splice", out, inp, CanonValue.I64(5))))
+                assertTrue(isClosed(ctx.p2(streams, "[method]output-stream.blocking-splice", out, inp, CanonValue.I64(5))))
+                val rest = ok(ctx.p2(streams, "[method]input-stream.read", inp, CanonValue.I64(100))) as CanonValue.Bytes
+                assertEquals("hello", String(rest.bytes))
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `blocking-spliceは出力に空きができるまで待ってから入力を読む`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val input = pipe(m, capacity = 1024)
+            val output = pipe(m, capacity = 16)
+            val data = ByteArray(40) { (it + 1).toByte() }
+            feed(m, input, data)
+            val results = java.util.concurrent.CopyOnWriteArrayList<Long>()
+            val failure = AtomicReference<Throwable>()
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                try {
+                    val inp = ctx.p2("wasi:cli/stdin", "get-stdin")!!
+                    val out = ctx.p2("wasi:cli/stdout", "get-stdout")!!
+                    // 1 回目は空き（16）だけ運ぶ。2 回目は出力が一杯なので、読み手が空けるまで待つ
+                    repeat(2) {
+                        results += (ok(ctx.p2(streams, "[method]output-stream.blocking-splice", out, inp, CanonValue.I64(40))) as CanonValue.I64).value
+                    }
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+                StepResult.Exit(0)
+            }
+            val options = SpawnOptions(
+                stdio = StdioSpec(StdioSource.Object(input.readEnd, HandleRights.READ), StdioSource.Object(output.writeEnd, HandleRights.WRITE), StdioSource.Closed),
+            )
+            val pid = m.spawn(empty, driver, options, 0)
+            eventually(10_000, "待たない") {
+                h.scheduler.tick()
+                m.stateOf(pid).let { s ->
+                    check(!s.isTerminal) { "終わった: $s ${failure.get()}" }
+                    s == ProcessState.WAITING_EVENT
+                }
+            }
+            assertEquals(listOf(16L), results.toList())
+            val first = take(m, output)
+            assertEquals(16, first.size)
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            failure.get()?.let { throw it }
+            assertEquals(listOf(16L, 16L), results.toList())
+            assertTrue((first + take(m, output)).contentEquals(data.copyOf(32)))
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `read-directoryのstreamは中身の写しを持たず、読むたびに名前の順の続きを返す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            for (n in listOf("b", "d", "a")) m.vfs.open(VfsPath.parse("/$n"), OpenOptions(read = true, write = true, create = true))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val root = root(ctx)
+                val entry = fsTypes.type<CanonType.Record>("directory-entry")
+                val next = { s: CanonValue ->
+                    (ok(ctx.p2(ty, "[method]directory-entry-stream.read-directory-entry", s)) as CanonValue.Case).payload
+                        ?.let { (entry.field(it, "name") as CanonValue.Str).value }
+                }
+                val s = ok(ctx.p2(ty, "[method]descriptor.read-directory", root))!!
+                // 写しを持たない: 持つのはディレクトリの参照と、最後に返した名前だけ
+                assertNull(ctx.withKernelLock { P2.entryLocked<DirectoryStreamEntry>(ctx, s) }.last)
+                assertEquals("a", next(s))
+                // 途中で足したものも、消したものも、名前の順の続きから読める
+                ctx.vfs.removeFile(VfsPath.parse("/b"))
+                ctx.vfs.open(VfsPath.parse("/c"), OpenOptions(read = true, write = true, create = true))
+                assertEquals("c", next(s))
+                assertEquals("d", next(s))
+                assertNull(next(s))
+                assertNull(next(s))
+                // descriptor は stream が残っていても drop できる（stream は自分でディレクトリの参照を持つ）
+                val dirId = ctx.withKernelLock { P2.entryLocked<DirectoryStreamEntry>(ctx, s).objectId }
+                val before = ctx.withKernelLock { ctx.kernel.objects.refCount(dirId) }
+                ctx.drop(root)
+                assertEquals(before - 1, ctx.withKernelLock { ctx.kernel.objects.refCount(dirId) })
+                assertNull(next(s))
+                ctx.drop(s)
+                // ファイルの descriptor は read-directory できない
+                val file = ok(openAt(ctx, root(ctx), "a"))!!
+                assertEquals("not-directory", errName(ctx.p2(ty, "[method]descriptor.read-directory", file)))
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `mutate-directoryのないdescriptorでは、ディレクトリの中身を変える操作がread-onlyになる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/sub"))
+            m.vfs.open(VfsPath.parse("/sub/x"), OpenOptions(read = true, write = true, create = true))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val root = root(ctx)
+                val flagsType = fsTypes.type<CanonType.Flags>("descriptor-flags")
+                val getFlags = { d: CanonValue -> (ok(ctx.p2(ty, "[method]descriptor.get-flags", d)) as CanonValue.Flags).bits }
+                assertEquals(flagsType.value("read", "mutate-directory").bits, getFlags(root))
+                // read だけで開いたサブディレクトリは mutate-directory を持たない（get-flags に出る）
+                val ro = ok(openAt(ctx, root, "sub", open = arrayOf("directory"), flags = arrayOf("read")))!!
+                assertEquals(flagsType.value("read").bits, getFlags(ro))
+                val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
+                val newTs = fsTypes.type<CanonType.Variant>("new-timestamp")
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.create-directory-at", ro, CanonValue.str("d"))))
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.remove-directory-at", ro, CanonValue.str("d"))))
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.unlink-file-at", ro, CanonValue.str("x"))))
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.rename-at", ro, CanonValue.str("x"), ro, CanonValue.str("y"))))
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.rename-at", root, CanonValue.str("sub/x"), ro, CanonValue.str("y"))))
+                assertEquals("read-only", errName(ctx.p2(ty, "[method]descriptor.rename-at", ro, CanonValue.str("x"), root, CanonValue.str("y"))))
+                assertEquals(
+                    "read-only",
+                    errName(ctx.p2(ty, "[method]descriptor.set-times-at", ro, pf, CanonValue.str("x"), newTs.case("now"), newTs.case("now"))),
+                )
+                assertEquals("read-only", errName(openAt(ctx, ro, "n", open = arrayOf("create"), flags = arrayOf("read"))))
+                assertEquals("read-only", errName(openAt(ctx, ro, "x", open = arrayOf("truncate"), flags = arrayOf("read"))))
+                assertEquals("read-only", errName(openAt(ctx, ro, "x", flags = arrayOf("read", "write"))))
+                // 基点が持たない mutate-directory は、open-at で求めても得られない
+                assertEquals("read-only", errName(openAt(ctx, ro, "x", flags = arrayOf("read", "mutate-directory"))))
+                // 何も変えない操作は通る
+                val x = ok(openAt(ctx, ro, "x"))!!
+                assertEquals(flagsType.value("read").bits, getFlags(x))
+                ok(ctx.p2(ty, "[method]descriptor.stat-at", ro, pf, CanonValue.str("x")))
+                // 基点が持つ mutate-directory は、求めれば渡せる。持つ descriptor からは変えられる
+                val rw = ok(openAt(ctx, root, "sub", open = arrayOf("directory"), flags = arrayOf("read", "mutate-directory")))!!
+                assertEquals(flagsType.value("read", "mutate-directory").bits, getFlags(rw))
+                ok(ctx.p2(ty, "[method]descriptor.create-directory-at", rw, CanonValue.str("d")))
+                ok(ctx.p2(ty, "[method]descriptor.remove-directory-at", rw, CanonValue.str("d")))
+                ok(ctx.p2(ty, "[method]descriptor.rename-at", rw, CanonValue.str("x"), rw, CanonValue.str("y")))
+                ok(ctx.p2(ty, "[method]descriptor.unlink-file-at", rw, CanonValue.str("y")))
+                ok(openAt(ctx, rw, "n", open = arrayOf("create"), flags = arrayOf("read", "write")))
+            }
             m.stop()
         }
     }

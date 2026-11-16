@@ -2,7 +2,6 @@ package pro.ikili.kibicomputers.core.wasi.p2
 
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.process.HostResourceEntry
-import pro.ikili.kibicomputers.core.kernel.vfs.DirEntry
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 
@@ -60,15 +59,19 @@ internal class DescriptorEntry(val handle: HandleEntry, val flags: Int) : P2Entr
     override fun copyForSnapshot(): HostResourceEntry = DescriptorEntry(handle, flags).also { it.children = children }
 }
 
-/** `directory-entry-stream`。`read-directory` のときに読んだ並び（カーネルのオブジェクトは持たない） */
-internal class DirectoryStreamEntry(val entries: List<DirEntry>) : P2Entry() {
-    var index: Int = 0
+/**
+ * `directory-entry-stream`。`read-directory` で開いたディレクトリ（[objectId]）の参照を自分で持ち、中身の写しは持たない。
+ * `read-directory-entry` のたびに VFS から読み直し、[last]（最後に返した名前。名前の順）より後の最初の 1 つを返す
+ * （p1 の `fd_readdir` と同じく読み直す。ディレクトリが大きくても、ホストのヒープに留まるのはこの小さな値だけ。ADR 0267）
+ */
+internal class DirectoryStreamEntry(override val objectId: Int) : P2Entry() {
+    /** 最後に返した名前（まだ返していなければ `null`） */
+    var last: String? = null
 
-    override val objectId: Int get() = 0
     override val label: String get() = "directory-entry-stream"
 
-    override fun copyForSnapshot(): HostResourceEntry = DirectoryStreamEntry(entries).also {
-        it.index = index
+    override fun copyForSnapshot(): HostResourceEntry = DirectoryStreamEntry(objectId).also {
+        it.last = last
         it.children = children
     }
 }
