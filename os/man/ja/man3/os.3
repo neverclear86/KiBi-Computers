@@ -23,11 +23,17 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 
 ### イベント
 
-イベントは、名前と、それに続く値です。`os.pullEvent` は次のイベントを待ち、名前と値を返します。`filter` があれば、ほかの名前のイベントは捨てます。`os.pullEvent` は `terminate` のイベントで `Terminated` のエラーにします。`os.pullEventRaw` はそれも返します。
+イベントは、名前と、それに続く値です。`os.pullEvent` は次のイベントを待ち、名前と値を返します。`filter` があれば、ほかの名前のイベントは捨てます（`terminate` は捨てません）。`os.pullEvent` は `terminate` のイベントで `Terminated` のエラーにします。`os.pullEventRaw` はそれも返します。
 
 システムのイベントは、プログラムが初めて `os.pullEvent` か `os.pullEventRaw` を呼んだときから受け取ります。それより前のイベントは受け取れません。読まない間は 64 件まで溜め、それを超えた新しいイベントは捨てて、捨てた数を持つ `events_dropped` のイベントを足します。
 
 `os.queueEvent` は、もう届いているイベントの後ろにイベントを足します。届くのはこのプログラムだけです。
+
+### コルーチン
+
+コルーチンの中では、`os.pullEventRaw(filter)` は自分では待たず、`filter`（nil でもよい）を yield し、コルーチンを resume したときの値をイベントとして返します。コルーチンを resume する側（parallel(3) か、自分で書いたスケジューラー）が次のイベントを取って渡します。`os.pullEvent` も同じで、`terminate` で resume されると `Terminated` のエラーにします。コルーチンではないメインのプログラム（と lua(1) の対話のプロンプト）では、どちらもその場で次のイベントを待ちます。
+
+コルーチンの中の `os.sleep` は、タイマーを始めて、自分のタイマーのイベントが来るまで `timer` を yield します。その間にそのコルーチンへ来たほかのイベントは捨てます。コルーチンが yield できないところ（`string.gsub` のコールバックの中など）では、その場で待ちます。
 
 - `peripheral` address: デバイスがつながった
 - `peripheral_detach` address: デバイスが外れた
@@ -53,8 +59,10 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 
 ## CC: Tweaked との違い
 
-- `os.pullEvent`・`os.pullEventRaw` はその場で待ち、コルーチンの中でも yield しない（コルーチンのスケジューラーで変わることがある）
-- `os.sleep` はほかのイベントを捨てない（キューに残る）
+- メインのプログラムはコルーチンで動かない。そこでは `os.pullEvent` はその場で待ち、トップレベルの `coroutine.yield()` はイベント待ちにならずエラーになる
+- メインのプログラムでは、`os.sleep` はほかのイベントを捨てない（キューに残る）。コルーチンの中では CC: Tweaked と同じく捨てる
+- コルーチンが yield できないところの `os.sleep` は、その場で待つ（CC: Tweaked はエラーにする）
+- `peripheral.call` は、ゲームを待つメソッドでも yield しない。結果が出るまで（長くて約 1 tick）プログラム全体が待ち、その間ほかのコルーチンは動かない。その間に来たイベントは残る
 - `os.time`・`os.clock`・`os.date` は標準の Lua のもの
 - `os.day`・`os.epoch` の値が違う。CC: Tweaked はゲーム内の日を 1 から数え、時刻を 6000 tick ずらす（1 日の始まりが 6 時）。また、ワールドの時刻（`/time set` で変わる）を使う。ここの `ingame` はワールドの tick の数え（進む一方）を使い、`os.day` はそれを 24000 で割ったもの（0 から）、`os.epoch` は 3600 倍したもの（CC: Tweaked は同じ値に 30000 tick、つまり 108000000 ミリ秒を足す）。`utc`・`local` の日数も 0（1970-01-01）から数える（CC: Tweaked は 1 から）。理由は、tick の数えは `/time set` で変わらないので、時間を測るのに使えるため
 - グローバルの `sleep` はなく、`os.sleep` だけ（CC: Tweaked は両方ある）。標準のグローバルは変えない
@@ -65,4 +73,4 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 
 ## 関連項目
 
-peripheral(3), lua(1), kibi(7)
+parallel(3), peripheral(3), lua(1), kibi(7)

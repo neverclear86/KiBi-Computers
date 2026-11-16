@@ -14,7 +14,7 @@ Runs Lua programs. Without a script, reads an interactive prompt (REPL) when sta
 
 There is no shell inside Lua: `os.execute`, `io.popen` and `os.tmpname` are not available.
 
-The `peripheral` library uses the devices of the computer (peripheral(3)), and the `os` library has events, timers, time and power functions (os(3)). They follow the Lua APIs of CC: Tweaked.
+The `peripheral` library uses the devices of the computer (peripheral(3)), the `os` library has events, timers, time and power functions (os(3)), and the `parallel` library runs functions together as coroutines (parallel(3)). They follow the Lua APIs of CC: Tweaked.
 
 ## OPTIONS
 
@@ -27,4 +27,4 @@ The `peripheral` library uses the devices of the computer (peripheral(3)), and t
 
 ## SEE ALSO
 
-peripheral(3), os(3), nano(1), sh(1)
+peripheral(3), os(3), parallel(3), nano(1), sh(1)

@@ -3,7 +3,7 @@
 - 状態: 採用
 - Issue: #94（task）。前提: ADR 0073（`kibi:*` の WIT と p1 の import）、0077（`kibi:device/bus`）、0072（`poll_oneoff`）、0329（待機点への変換）、0087（`restored`）、0067（接続・切断のイベント）、0306（電源）、0426（時計）、0106（man）
 - 方針: オーナーのコメント（#94）「Lua での書き方はできるだけ CC: Tweaked に合わせる」。合わせられないところは man に違いと理由を書く。CC 本体には依存しない
-- 後続: #95（コルーチンでイベントを待つ。`os.pullEventRaw` の置き換え）、#237（CC 互換ライブラリ。残る違いを埋める）、#251（仮の値の確定）
+- 後続: #95（コルーチンでイベントを待つ。ADR 0095）、#237（CC 互換ライブラリ。残る違いを埋める）、#251（仮の値の確定）
 
 ## 決めたこと（要約）
 
@@ -127,7 +127,7 @@
 
 ### #95 との境目
 
-`pullEventRaw` は今はその場でカーネルを待ち、コルーチンの中でも yield しない。#95 で、CC と同じく `coroutine.yield` に基づくスケジューラーに置き換える前提（`os.pullEventRaw` を Lua で包み直せば差し替えられる）。コルーチンの中での振る舞いはテストで固めない（`pcall`・コルーチン・`string.gsub` のコールバックの中で待てることだけを確かめる）。
+#95 で、コルーチンの中の `pullEventRaw`・`pullEvent`・`sleep` を CC と同じく yield する形にし、`parallel` を足した（ADR 0095）。メインスレッドでは、ここに書いたとおりその場で待つ。メインスレッドの `pullEvent`・`pullEventRaw` のフィルターは、#95 から `terminate` を素通りさせる。
 
 ### テストで確かめていないこと
 
@@ -135,7 +135,7 @@ RAM の上限の近くで、import の結果を読んだ後の Lua の確保だ�
 
 ## 範囲に入れなかったもの
 
-- `term`・`fs`・`colors`・`keys`（#326 が要る）・`parallel`（#95）: 別の Issue（Epic #90 の下、「依存: #94」）
+- `term`・`fs`・`colors`・`keys`（#326 が要る）・`parallel`（#95。ADR 0095）: 別の Issue（Epic #90 の下、「依存: #94」）
 - `os.getComputerID`・`getComputerLabel`・`setComputerLabel`: 返す import がない。足すならシステムコールの ABI（ラベルの保存は保存形式）の判断になる
 - ほかのプロセスに届く `queueEvent`: ゲストがイベントを出す import がない（ABI の判断）
 - `key`・`char` のイベント: #326 がまだ

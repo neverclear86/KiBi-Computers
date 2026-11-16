@@ -2,7 +2,7 @@
  * Lua の linit.c の代わり（#94。ADR 0094）。linit.c は、ライブラリを足すときに差し替える前提のファイルなので、
  * ビルドから外してこれを使う（Lua のソースは書き換えない）。
  *
- * 標準ライブラリを linit.c と同じ順に開いたあと、KiBi の peripheral（グローバルと package.loaded）を開き、
+ * 標準ライブラリを linit.c と同じ順に開いたあと、KiBi の peripheral・parallel（グローバルと package.loaded）を開き、
  * os のテーブルに KiBi の関数を足す。どれも C で作るので、起動のたびに Lua のコードを読み込まない（REPL 1,000 台の起動の時間とメモリを増やさない）
  */
 #include "lauxlib.h"
@@ -23,6 +23,7 @@ static const luaL_Reg LIBS[] = {
     {LUA_UTF8LIBNAME, luaopen_utf8},
     {LUA_DBLIBNAME, luaopen_debug},
     {"peripheral", luaopen_peripheral},
+    {"parallel", luaopen_parallel},
     {NULL, NULL},
 };
 

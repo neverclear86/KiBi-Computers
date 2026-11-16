@@ -1,0 +1,38 @@
+# parallel(3)
+
+## NAME
+
+parallel - run functions together as coroutines in Lua
+
+## SYNOPSIS
+
+    parallel.waitForAny(f, ...)
+    parallel.waitForAll(f, ...)
+
+## DESCRIPTION
+
+lua(1) has the `parallel` library (also `require("parallel")`). It follows the `parallel` API of CC: Tweaked.
+
+Each function runs in its own coroutine. When a function waits for an event with `os.pullEvent`, `os.pullEventRaw` or `os.sleep` (os(3)), its coroutine yields, and the other functions run. When all of them wait, the next event is taken and given to each function whose filter matches it (a function without a filter gets every event). A `terminate` event is given to every function.
+
+- `parallel.waitForAny(f, ...)` returns when one of the functions returns, with the position of that function (1 for the first). The other functions are stopped where they are
+- `parallel.waitForAll(f, ...)` returns when all of the functions have returned
+
+If a function raises an error, the error is raised again by `parallel`, and the other functions are stopped. All arguments must be functions.
+
+`parallel` can be used inside another `parallel` or inside a coroutine of your own: it then yields to wait for the next event, too. It takes events in its own way, even if `os.pullEventRaw` has been replaced.
+
+## EXAMPLES
+
+    parallel.waitForAny(
+        function() os.sleep(5); print("time out") end,
+        function() local _, addr = os.pullEvent("peripheral"); print("attached", addr) end
+    )
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- `peripheral.call` does not yield, so the other functions do not run while a device method runs (os(3))
+
+## SEE ALSO
+
+os(3), lua(1)

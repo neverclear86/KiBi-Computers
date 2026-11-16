@@ -404,20 +404,183 @@ class LuaKibiApiTest {
     }
 
     @Test
-    fun `pcallとコルーチンとgsubのコールバックの中で待てる`() = timeout(limit) {
+    fun `pcallとgsubのコールバックの中で待て、コルーチンの中ではyieldする`() = timeout(limit) {
         val out = run(
             """
             print(pcall(function() os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", "p") end))
             local co = coroutine.wrap(function()
-                os.queueEvent("c", 1)
                 local _, v = os.pullEvent("c")
                 coroutine.yield(v + peripheral.call("$ADDRESS", "main-echo", 1))
             end)
             print(co())
+            print(co("c", 1))
             print((string.gsub("ab", ".", function(ch) os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", ch:upper()) end)))
             """.trimIndent(),
         )
-        assertEquals("true\tp\n2\nAB\n", out)
+        assertEquals("true\tp\nc\n2\nAB\n", out)
+    }
+
+    @Test
+    fun `コルーチンの中のpullEventRawはfilterをyieldし、resumeの値をそのまま返す`() = timeout(limit) {
+        val out = run(
+            """
+            local co = coroutine.create(function(...)
+                print("raw", select("#", os.pullEventRaw()))
+                print("raw", os.pullEventRaw("x"))
+                print("ev", select("#", os.pullEvent()))
+                local t = table.pack(os.pullEvent("y"))
+                print("ev", t.n, t[1], t[2], t[3], t[4])
+                print("raw", os.pullEventRaw("z"))
+                os.pullEvent()
+                print("not reached")
+            end)
+            print(coroutine.resume(co))
+            print(coroutine.resume(co))
+            print(coroutine.resume(co, "anything", 1, 2))
+            print(coroutine.resume(co))
+            print(coroutine.resume(co, "y", nil, 3, nil))
+            print(coroutine.resume(co, "terminate"))
+            print(coroutine.resume(co, "terminate"))
+            print(coroutine.status(co))
+            -- yield できない文脈ではエラーになる（CC と同じ）
+            local co2 = coroutine.create(function()
+                return pcall(string.gsub, "a", ".", function() os.pullEvent() end)
+            end)
+            local ok, inner, msg = coroutine.resume(co2)
+            print(ok, inner, msg:find("yield across") ~= nil)
+            -- sleep は yield できない文脈ではその場で待ち、イベントを捨てない
+            os.queueEvent("kept")
+            local co3 = coroutine.create(function()
+                return (string.gsub("a", ".", function() os.sleep(0.05); return "b" end))
+            end)
+            print(coroutine.resume(co3))
+            print(os.pullEvent())
+            """.trimIndent(),
+        )
+        assertEquals(
+            "true\tnil\n" +
+                "raw\t0\ntrue\tx\n" +
+                "raw\tanything\t1\t2\ntrue\tnil\n" +
+                "ev\t0\ntrue\ty\n" +
+                "ev\t4\ty\tnil\t3\tnil\ntrue\tz\n" +
+                "raw\tterminate\ntrue\tnil\n" +
+                "false\tTerminated\n" +
+                "dead\n" +
+                "true\tfalse\ttrue\n" +
+                "true\tb\n" +
+                "kept\n",
+            out,
+        )
+    }
+
+    @Test
+    fun `メインスレッドのpullEventのフィルターはterminateを素通りさせる`() = timeout(limit) {
+        val out = run(
+            """
+            os.queueEvent("other")
+            os.queueEvent("terminate")
+            print(os.pullEventRaw("x"))
+            os.queueEvent("terminate")
+            print(pcall(os.pullEvent, "x"))
+            """.trimIndent(),
+        )
+        assertEquals("terminate\nfalse\tTerminated\n", out)
+    }
+
+    @Test
+    fun `コルーチンの中のsleepはtimerをyieldし、idが合うまで待つ`() = timeout(limit) {
+        val out = run(
+            """
+            local co = coroutine.create(function() os.sleep(1); return "woke" end)
+            local ok, f = coroutine.resume(co)
+            print(ok, f)
+            print(coroutine.resume(co, "timer", 12345))
+            print(coroutine.resume(co, "other"))
+            local _, id = os.pullEvent("timer")
+            print(coroutine.resume(co, "timer", id))
+            local co2 = coroutine.create(function() os.sleep(100) end)
+            coroutine.resume(co2)
+            print(coroutine.resume(co2, "terminate"))
+            """.trimIndent(),
+        )
+        assertEquals("true\ttimer\ntrue\ttimer\ntrue\ttimer\ntrue\twoke\nfalse\tTerminated\n", out)
+    }
+
+    @Test
+    fun `parallelは関数を並べて動かし、イベントをフィルターごとに配る`() = timeout(limit) {
+        val out = run(
+            """
+            -- 2つの sleep は並んで進む（合わせて約 0.4 秒。続けて待つと 0.6 秒）
+            local t0 = os.epoch("utc")
+            local order = {}
+            parallel.waitForAll(
+                function() os.sleep(0.4); order[#order + 1] = "b" end,
+                function() os.sleep(0.2); order[#order + 1] = "a" end
+            )
+            local dt = os.epoch("utc") - t0
+            print(table.concat(order), dt >= 350, dt < 590)
+            -- waitForAny は最初に終わった関数の番号を返す
+            print(parallel.waitForAny(
+                function() os.pullEvent("never") end,
+                function() os.sleep(0.05) end
+            ))
+            print(parallel.waitForAny(function() return 1 end, function() return 2 end))
+            print(select("#", parallel.waitForAll(function() return 1 end)), parallel.waitForAny())
+            -- フィルターと queueEvent: ほかのコルーチンへ届く
+            local got = {}
+            parallel.waitForAll(
+                function()
+                    local _, v = os.pullEvent("ping")
+                    got[#got + 1] = "ping" .. v
+                    os.queueEvent("pong", v + 1)
+                end,
+                function()
+                    os.queueEvent("noise")
+                    os.queueEvent("ping", 1)
+                    local _, v = os.pullEvent("pong")
+                    got[#got + 1] = "pong" .. v
+                end
+            )
+            print(table.concat(got, ","))
+            -- 入れ子
+            local seen = {}
+            parallel.waitForAll(
+                function()
+                    parallel.waitForAll(
+                        function() local _, v = os.pullEvent("n"); seen[#seen + 1] = "in1:" .. v end,
+                        function() os.sleep(0.05); seen[#seen + 1] = "in2" end
+                    )
+                    seen[#seen + 1] = "inner done"
+                end,
+                function() os.sleep(0.1); os.queueEvent("n", 7) end
+            )
+            print(table.concat(seen, ","))
+            -- エラーは伝わる（位置は関数の中のまま）
+            print(pcall(parallel.waitForAll, function() os.sleep(0.05) end, function() error("boom") end))
+            print(pcall(parallel.waitForAny, function() error({code = 1}) end))
+            print(select(2, pcall(parallel.waitForAny, function() end, 1)))
+            -- terminate はフィルターに関係なく届き、pullEvent は Terminated になる
+            print(pcall(parallel.waitForAll, function() os.pullEvent("never") end, function() os.queueEvent("terminate") end))
+            -- 上書きした os.pullEventRaw は parallel の中の待ちに使われない
+            local orig = os.pullEventRaw
+            os.pullEventRaw = function() error("overridden") end
+            parallel.waitForAll(function() os.sleep(0.05) end)
+            os.pullEventRaw = orig
+            print(package.loaded.parallel == parallel, "done")
+            """.trimIndent(),
+        )
+        val lines = out.lines()
+        assertEquals("ab\ttrue\ttrue", lines[0], out)
+        assertEquals("2", lines[1], out)
+        assertEquals("1", lines[2], out)
+        assertEquals("0\t0", lines[3], out)
+        assertEquals("ping1,pong2", lines[4], out)
+        assertEquals("in2,in1:7,inner done", lines[5], out)
+        assertTrue(Regex("^false\t.*:\\d+: boom$").matches(lines[6]), out)
+        assertTrue(lines[7].startsWith("false\ttable: "), out)
+        assertTrue(lines[8].contains("bad argument #2") && lines[8].contains("function expected"), out)
+        assertEquals("false\tTerminated", lines[9], out)
+        assertEquals("true\tdone", lines[10], out)
     }
 
     @Test

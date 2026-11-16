@@ -23,11 +23,17 @@ lua(1) adds these functions to the standard `os` library. They follow the `os` A
 
 ### Events
 
-An event is a name followed by values. `os.pullEvent` waits for the next event and returns its name and values. With `filter`, events with other names are thrown away. `os.pullEvent` raises the error `Terminated` on a `terminate` event; `os.pullEventRaw` returns it.
+An event is a name followed by values. `os.pullEvent` waits for the next event and returns its name and values. With `filter`, events with other names are thrown away, except `terminate`. `os.pullEvent` raises the error `Terminated` on a `terminate` event; `os.pullEventRaw` returns it.
 
 The program starts to receive the events of the system when it first calls `os.pullEvent` or `os.pullEventRaw`. Events from before that are not received. Up to 64 events are kept while the program does not read them; after that, new events are thrown away and an `events_dropped` event with the number of lost events is added.
 
 `os.queueEvent` adds an event after the events that have already arrived. It reaches only this program.
+
+### Coroutines
+
+Inside a coroutine, `os.pullEventRaw(filter)` does not wait by itself: it yields `filter` (which may be nil), and the values that the coroutine is resumed with are returned as the event. The code that resumes the coroutine (parallel(3), or a scheduler of your own) gets the next event and passes it on. `os.pullEvent` does the same and raises `Terminated` when it is resumed with `terminate`. In the main program (and in the interactive prompt of lua(1)), which is not a coroutine, both wait for the next event in place.
+
+Inside a coroutine, `os.sleep` starts a timer and yields `timer` until its own timer event arrives; other events that reach the coroutine meanwhile are thrown away. Where the coroutine cannot yield (for example in a callback of `string.gsub`), `os.sleep` waits in place instead.
 
 - `peripheral` address: a device was connected
 - `peripheral_detach` address: a device was disconnected
@@ -53,8 +59,10 @@ Other events of the system keep their names. When an event comes from a device, 
 
 ## DIFFERENCES FROM CC: TWEAKED
 
-- `os.pullEvent` and `os.pullEventRaw` wait in place and do not yield, even inside a coroutine (this may change with the coroutine scheduler)
-- `os.sleep` does not throw away other events; they wait in the queue
+- The main program is not run in a coroutine: `os.pullEvent` waits in place there, and `coroutine.yield()` at the top level is an error instead of waiting for an event
+- In the main program, `os.sleep` does not throw away other events; they wait in the queue. Inside a coroutine it throws them away, as in CC: Tweaked
+- `os.sleep` in a place where the coroutine cannot yield waits in place; CC: Tweaked raises an error
+- `peripheral.call` does not yield, even for methods that wait for the game; the whole program waits for the result (at most about one tick), and other coroutines do not run meanwhile. Events that arrive meanwhile are kept
 - `os.time`, `os.clock` and `os.date` are the standard Lua functions
 - `os.day` and `os.epoch` give different numbers. CC: Tweaked counts the in-game day from 1, and shifts the time of day by 6000 ticks (a day starts at 06:00). It uses the time of day of the world, which `/time set` changes. Here `ingame` uses the world tick counter, which only goes forward: `os.day` is the ticks divided by 24000 and starts at 0, and `os.epoch` is the ticks times 3600 (in CC: Tweaked, the same value plus 30000 ticks, which is 108000000 milliseconds). The `utc` and `local` days are counted from 0 (1970-01-01); CC: Tweaked starts at 1. The reason is that the tick counter is not changed by `/time set`, so programs can measure time with it
 - There is no global `sleep`, only `os.sleep` (CC: Tweaked has both). The standard globals are not changed
@@ -65,4 +73,4 @@ Other events of the system keep their names. When an event comes from a device, 
 
 ## SEE ALSO
 
-peripheral(3), lua(1), kibi(7)
+parallel(3), peripheral(3), lua(1), kibi(7)
