@@ -12,6 +12,7 @@ import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.chunk.LevelChunk
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -560,6 +561,169 @@ object MachineSaveGameTests {
                 helper.assertTrue(store.chunkGeneration(identity.id) == OptionalLong.of(identity.generation), "the mark should follow the chunk save")
             }.thenSucceed()
         }
+    }
+
+    /**
+     * 停止の手順（`saveForStop`）で、FULL でなくなったばかりのチャンク（1人プレイの「保存してタイトルに戻る」で、プレイヤーの
+     * チケットが先に外れたとき。tick の終わりの `saveForDemotion` はまだ回っていない）のケースも、書けた世代でチャンクに未保存の印が付く
+     * （#653。`setChanged` は FULL でないチャンクに届かないので呼ばず、`demotedChunk` もまだない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopMarksAChunkThatJustLeftFull(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 400, stopFirst = false) { be, latest, changes ->
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 1, "the stop should save the case")
+            val identity = be.identity
+            helper.assertTrue(identity != null, "the stop should adopt the written generation")
+            helper.assertTrue(latest.isUnsaved, "the stop should mark the chunk that left FULL unsaved")
+            helper.assertTrue(be.setChangedCalls == changes, "the stop should not call setChanged on a chunk that is not FULL")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(
+                tag.getString(CaseBlockEntity.MACHINE_ID_TAG) == identity!!.id.toString() &&
+                    tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG) == identity.generation,
+                "the NBT should point at $identity: $tag",
+            )
+            // 次の tick の終わりに、FULL でなくなった経路がマシンを外す
+            be.demotedChunk != null && be.computer.machine == null
+        }
+    }
+
+    /**
+     * 停止の手順（`saveForStop`）で、FULL でなくなったばかりのチャンクの止まった台（ゲストが止めた。知らせはまだ届いていない）は、
+     * `setChanged` を呼ばずに（`quiet` でそろえて）電源を切り、チャンクに直接未保存の印を付ける（#653・#698）。取り出しはしない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopMarksAChunkThatJustLeftFullForAStoppedMachine(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 440, stopFirst = true) { be, latest, changes ->
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 0, "a stopped machine should not be captured")
+            helper.assertTrue(be.setChangedCalls == changes, "the stop should not call setChanged on a chunk that is not FULL")
+            helper.assertTrue(!be.computer.poweredOn && be.computer.machine == null, "the stop should power the case off but was ${be.computer}")
+            helper.assertTrue(latest.isUnsaved, "the stop should mark the chunk that left FULL unsaved so that PoweredOn=false reaches the disk")
+            helper.assertTrue(be !in ServerMachines.unmarkedCases, "a visible chunk should be marked at once")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+            true
+        }
+    }
+
+    /**
+     * 離れたチャンクに動いている台を置き、強制読み込みを外して FULL でなくなったところ（tick の終わりの `saveForDemotion` の前）で
+     * [check] を呼ぶ（チャンクの印は外してから渡す。3つ目の引数は、その時点の `setChangedCalls`）。[check] が真を返すまで待ってから片付ける。
+     * [stopFirst] なら、FULL でなくす前にマシンを止める（ゲストが止めたのと同じ `stop()`。tick が回らないので知らせは届かない）。
+     * 並行するテストと重ならないように、チャンクは [chunkOffsetZ] でずらす
+     */
+    private fun stopOnChunkThatJustLeftFull(
+        helper: GameTestHelper,
+        chunkOffsetZ: Int,
+        stopFirst: Boolean,
+        check: (CaseBlockEntity, LevelChunk, Int) -> Boolean,
+    ) {
+        val level = helper.level
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + chunkOffsetZ)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 9, 200, chunk.minBlockZ + 6)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        val machine = be.computer.machine!!
+        fun cleanUp() {
+            level.setChunkForced(chunk.x, chunk.z, false)
+            level.setChunkForced(keeper.x, keeper.z, false)
+        }
+        var done = false
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenIdle(3).thenExecute {
+            try {
+                if (stopFirst) {
+                    machine.stop()
+                    helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+                    helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+                }
+                // 置くときの getChunk の一時的なチケット（UNKNOWN。1 tick で切れる）が切れるのを待ってから、
+                // チケットを外し、tick を待たずにチケットの段階を下げる（1人プレイの切断の後の pollTask と同じ）
+                level.setChunkForced(chunk.x, chunk.z, false)
+                var polls = 0
+                while (level.hasChunkAt(pos) && polls++ < 10_000) level.chunkSource.pollTask()
+                helper.assertTrue(
+                    !level.hasChunkAt(pos),
+                    "the chunk should no longer be FULL (ticket level ${level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.toLong())?.ticketLevel})",
+                )
+                helper.assertTrue(be.demotedChunk == null, "the tick end should not have handled the demotion yet")
+                val latest = level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.toLong())?.latestChunk as? LevelChunk
+                helper.assertTrue(latest != null && latest.blockEntities[pos] === be, "the chunk should stay in memory with the case")
+                // 置いたときの印を外し、停止の手順が付けるかを見る
+                latest!!.isUnsaved = false
+                done = check(be, latest, be.setChangedCalls)
+            } catch (t: Throwable) {
+                cleanUp()
+                throw t
+            }
+        }.thenWaitUntil {
+            done = done || (be.demotedChunk != null && be.computer.machine == null)
+            helper.assertTrue(done, "the demotion should release the machine but was ${be.computer}")
+        }.thenExecute {
+            try {
+                ServerMachines.drainSaves()
+                level.setChunkForced(chunk.x, chunk.z, true)
+                level.getChunk(chunk.x, chunk.z)
+                // 強制読み込みを外すとチャンクごと残るので、部品を落とさずに消す（#746）
+                removeCaseWithoutDrops(level, pos)
+            } finally {
+                cleanUp()
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * FULL になったチャンクの電源が入っていたケースでも、`onLoad`（ID の `claim`）の前なら、FULL に戻った経路（`restorePromoted`）は
+     * 復元の順番待ちに入れない（#653。入れると `claim` の前に順番が来て、ID がないとして冷えた起動になる。順番待ちには `onLoad` が入れる）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun promotedChunkWaitsForOnLoadBeforeRestoring(helper: GameTestHelper) {
+        val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
+        // ディスクから読み込んで FULL になったばかりのチャンクのケース（ブロックエンティティはあるが、onLoad はまだ）
+        val be = CaseBlockEntity(helper.absolutePos(CASE), state)
+        be.setLevel(helper.level)
+        be.loadCustomOnly(CompoundTag().apply { putBoolean(CaseBlockEntity.POWERED_ON_TAG, true) }, helper.level.registryAccess())
+        helper.assertTrue(be.computer.poweredOn && !be.isLoadedOnServer, "the case should be powered on and not loaded yet")
+        ServerMachines.restorePromotedCase(be)
+        helper.assertTrue(!be.computer.isRestorePending, "the case should wait for onLoad but was ${be.computer}")
+        helper.succeed()
+    }
+
+    /**
+     * チャンクの holder が見えないケース（アンロード待ち。`visibleChunkMap` から消えて、アンロードの仕事がまだ走っていない）は、
+     * `markChunkUnsaved` では印を付けられない。覚えておいて、続くアンロード（`saveForUnload`）がそのチャンクに `isUnsaved` を付ける（#653）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun unloadMarksACaseWhoseChunkHolderWasGone(helper: GameTestHelper) {
+        val level = helper.level
+        val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
+        // だれも読み込んでいないチャンクのケース（holder が見えない）
+        val far = BlockPos(helper.absolutePos(CASE).x + 16 * 900, 100, helper.absolutePos(CASE).z - 16 * 900)
+        helper.assertTrue(level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(far)) == null, "the far chunk should have no holder")
+        val be = CaseBlockEntity(far, state)
+        be.setLevel(level)
+        ServerMachines.markChunkUnsaved(be)
+        helper.assertTrue(be in ServerMachines.unmarkedCases, "a case without a visible chunk should be remembered")
+        // アンロードの手順が、そのチャンクに印を付けて忘れる
+        val chunk = level.getChunkAt(helper.absolutePos(CASE))
+        chunk.isUnsaved = false
+        ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
+        helper.assertTrue(chunk.isUnsaved, "the unload should mark the chunk unsaved")
+        helper.assertTrue(be !in ServerMachines.unmarkedCases, "the unload should forget the case")
+        helper.succeed()
     }
 
     /** ディスク（書き込み待ちを含む）のチャンク [chunk] の NBT で、[pos] のケースのタグが指す世代 */

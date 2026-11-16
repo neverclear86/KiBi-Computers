@@ -9,6 +9,7 @@ import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ChunkHolder
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
@@ -52,8 +53,10 @@ import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.UUID
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
@@ -71,7 +74,8 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *
  * - サーバーの起動（[ServerAboutToStartEvent]。ワールドとチャンクを読み込む前）に [MachineManager] を作る
  * - 毎 tick の始め（[ServerTickEvent.Pre]）に [MachineManager.tick] を呼び、自動保存（[AutosaveRotation]）を1 tick 分すすめる
- * - 毎 tick の始めに、書き込みのスレッドで終わった書き込みを受け取り（[processCompletions]）、ケースの NBT の世代を進める（#84）
+ * - 毎 tick の始めに、書き込みのスレッドで終わった書き込みを受け取り（[processCompletions]）、ケースの NBT の世代を進める（#84）。
+ *   印はチャンクが FULL なら `setChanged`、FULL でなければ `ChunkHolder` の最新のチャンクに直接 `setUnsaved(true)`（[markChunkUnsaved]。#653）
  * - チャンクのアンロード（[ChunkEvent.Unload]）: そのチャンクのケースを止め、待ち（tick ごとの予算）、取り出して書き込みに回し、
  *   予約した世代を NBT に載せてチャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が書く。書き終わりは待たない。#84 の規則 4）
  * - チャンクが FULL でなくなった（[ChunkTicketLevelUpdatedEvent] でチケットの段階が 33 を超えた。#545）: アンロードと同じく
@@ -82,7 +86,7 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *   流す前に FULL に戻ったチャンクは何もしない。FULL に戻ったチャンクのケースは、アンロードの後に読み込み直したのと同じく電源が切れている
  * - チャンクの保存（[ChunkDataEvent.Save]）: NBT に入ったケースの世代を、持ち主の位置のタグだけで `markChunkGeneration` に渡す
  * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き込みに回し、書き込みのスレッドが
- *   空になるのを待って（[drainSaves]）、書けた台に `setChanged` を付ける（#84 の規則 3）。
+ *   空になるのを待って（[drainSaves]）、書けた台のチャンクに印を付ける（#84 の規則 3。FULL でないチャンクにも付く。#653）。
  *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま。そのあと、チャンクのアンロードの列を流しきる（[ChunkUnloadDrain]。#540）
  * - サーバーが止まった後（[ServerStoppedEvent]）に全マシンを止め、スレッドが終わるのを待つ（上限 [SHUTDOWN_TIMEOUT_MILLIS]）
  *
@@ -429,6 +433,7 @@ object ServerMachines {
         rotation.clear()
         demoted.clear()
         promoted.clear()
+        unmarkedCases.clear()
         restoreQueue.clear()
         submitOf.clear()
         coldBootLog = ColdBootLog()
@@ -640,12 +645,47 @@ object ServerMachines {
                 continue
             }
             if (adopted) {
-                be.setChanged()
-                // FULL でないチャンクでは setChanged が届かない（規則 5）
+                markChunkUnsaved(be)
+                // FULL でなくなったときのチャンク（#545。規則 5）。markChunkUnsaved が FULL でないチャンクにも付けるが、ここは前からの印として残す
                 be.demotedChunk?.isUnsaved = true
             }
         }
     }
+
+    /**
+     * [be] のチャンクに未保存の印を付ける（続くチャンクの保存が NBT を書く。#653）。チャンクが FULL なら（`hasChunkAt`）`setChanged`。
+     * FULL でなければ `setChanged` が届かない（`Level.blockEntityChanged` は `hasChunkAt` のときだけ印を付ける）ので、そのチャンクの
+     * `ChunkHolder` の最新のチャンクに `setUnsaved(true)` を直接付ける（ADR 0084 の規則 5）。チャンクを読み込み直さない
+     * （チケットは足さない）。
+     *
+     * アンロード待ちのチャンク（`ChunkMap.processUnloads` が holder を外し、`visibleChunkMap` から消えたが、アンロードの仕事がまだ走っていない。
+     * tick に時間が残らないと残る）は、ブロックエンティティは生きているが holder が見つからない。このときは [unmarkedCases] に覚え、
+     * 続くアンロード（[saveForUnload]）がそのチャンクに印を付ける。チャンクの中のブロックエンティティが [be] でなければ
+     * （読み込み直した別のチャンク）付けない
+     */
+    internal fun markChunkUnsaved(be: CaseBlockEntity) {
+        val level = be.level as? ServerLevel ?: return
+        val pos = be.blockPos
+        if (level.hasChunkAt(pos)) {
+            be.setChanged()
+            return
+        }
+        val chunk = level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(pos))?.latestChunk as? LevelChunk
+        when {
+            chunk == null -> {
+                unmarkedCases += be
+                LOGGER.debug("No visible chunk holds the computer at {} (pending unload?); marking it unsaved on unload", pos)
+            }
+            chunk.blockEntities[pos] === be -> chunk.isUnsaved = true
+            else -> LOGGER.debug("Another chunk holds the position of the computer at {}; not marking it unsaved", pos)
+        }
+    }
+
+    /**
+     * [markChunkUnsaved] が印を付けられなかった（チャンクの holder が見えない。アンロード待ち）ケース。続くアンロード（[saveForUnload]）が
+     * チャンクに `isUnsaved` を付けて外す（メインスレッドだけで触る。消えたケースは残さない）
+     */
+    internal val unmarkedCases: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(WeakHashMap())
 
     /**
      * 書き込みのスレッドが空になるまで待ち（上限 [MachineSaveConfig.writerFlushMillis]）、終わった書き込みを受け取る（停止の手順と GameTest）
@@ -746,6 +786,8 @@ object ServerMachines {
         val store = WorldMachineSaves.current ?: return
         // 止まった台は電源を切ってから書く（アンロードでは setChanged が効かないので、変わったらチャンクに印を付ける。#698）
         for (be in cases) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
+        // アンロード待ちで印を付けられなかったケース（markChunkUnsaved。#653）の分を、このチャンクに付ける
+        if (unmarkedCases.isNotEmpty()) for (be in cases) if (unmarkedCases.remove(be)) chunk.isUnsaved = true
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -853,11 +895,19 @@ object ServerMachines {
         for (holder in list) {
             if (!holder.fullStatus.isOrAfter(FullChunkStatus.FULL)) continue
             val chunk = holder.latestChunk as? LevelChunk ?: continue
-            for (be in chunk.blockEntities.values) {
-                if (be !is CaseBlockEntity || be.isRemoved) continue
-                if (be.computer.beginRestore()) offerRestore(be)
-            }
+            for (be in chunk.blockEntities.values) if (be is CaseBlockEntity) restorePromotedCase(be)
         }
+    }
+
+    /**
+     * FULL に戻ったチャンクの [be] を、電源が入っていてマシンがなければ、復元の順番待ちに入れる（[restorePromoted]）。
+     * まだ `onLoad` の済んでいないケース（[CaseBlockEntity.isLoadedOnServer] が偽）は何もしない（#653）。
+     * ディスクから読み込んで FULL になったばかりのチャンクのケースは、`onLoad`（次の tick のブロックエンティティの処理）の前に
+     * ここに来ることがあり、ID の `claim` の前に順番が来ると、ID がないとして冷えた起動になる。そのケースは `onLoad` が順番待ちに入れる
+     */
+    internal fun restorePromotedCase(be: CaseBlockEntity) {
+        if (be.isRemoved || !be.isLoadedOnServer) return
+        if (be.computer.beginRestore()) offerRestore(be)
     }
 
     // ---- チャンクの保存（NBT が指す世代の印） ----
@@ -915,15 +965,16 @@ object ServerMachines {
     /**
      * [targets] を止め、まとめて待ち（上限 [MachineSaveConfig.stopQuiesceMillis]）、全台を `KILL_TRANSIENT` で取り出して書き込みに回し
      * （台ごとに書き込み待ちの上限を確かめる。期限は全体で共有）、書き込みのスレッドが空になるのを待って（[drainSaves]）、
-     * 書けた台に `setChanged` を付ける（続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く。#84 の規則 3）。
+     * 書けた台のチャンクに未保存の印を付ける（[markChunkUnsaved]。FULL のチャンクなら `setChanged`、FULL でなければ `setChanged` を呼ばずに
+     * チャンクに直接 `setUnsaved(true)`。続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く。#84 の規則 3・5、#653）。
      * [keepQuiesced] なら止めたままにする（サーバーの停止。取り出した後に状態が進まないように）。GameTest は `false` で続ける
      *
      * @return 書き込みに回した台の数
      */
     internal fun saveForStop(targets: List<CaseBlockEntity>, keepQuiesced: Boolean): Int {
         rotation.clear()
-        // 止まった台（CRASHED・ゲストが止めた）は、知らせがもう届かないので、ここで電源を切る（setChanged で NBT に載る。#698）
-        for (be in targets) if (!be.isRemoved) settleStopped(be, quiet = false)
+        // 止まった台（CRASHED・ゲストが止めた）は、知らせがもう届かないので、ここで電源を切る（チャンクに印を付けて NBT に載せる。#698・#653）
+        for (be in targets) if (!be.isRemoved) settleStoppedForStop(be)
         // 復元の途中の台は取り出さない（NBT は前の世代を指したまま。次に読み込んだときに戻し直す。#85）
         val running = targets.filter { !it.isRemoved && it.computer.machine != null && !it.computer.isRestoring }
         for (be in running) be.computer.prepareUnload()
@@ -943,12 +994,26 @@ object ServerMachines {
         }
         runAfterCaptureForTest(running)
         // 待ち・取り出しの間に止まった台も、電源を切った状態で NBT に載せる（写しは取らないか、取っても電源が切れているので戻されない。#698）
-        for (be in running) settleStopped(be, quiet = false)
-        // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
+        for (be in running) settleStoppedForStop(be)
+        // 書き終わってから NBT の世代を進めてチャンクに印を付ける（processCompletions → markChunkUnsaved。規則 3・5）
         drainSaves()
         if (!keepQuiesced) for (be in running) be.computer.endQuiesce()
         if (keepQuiesced && running.isNotEmpty()) LOGGER.info("Saved {} of {} running computers", saved, running.size)
         return saved
+    }
+
+    /**
+     * 停止の経路のそろえ（[settleStopped]）。FULL のチャンクなら今まで通り `setChanged` で NBT に載せる。FULL でないチャンク
+     * （1人プレイの「保存してタイトルに戻る」で、プレイヤーのチケットが先に外れたときなど）では `setChanged` が届かず、
+     * 隣のブロックにも触らせたくない（#698）ので `quiet` でそろえ、変わったらチャンクに直接印を付ける（[markChunkUnsaved]。アンロード待ちで holder が見えないときは、続くアンロードが付ける。#653）
+     */
+    private fun settleStoppedForStop(be: CaseBlockEntity) {
+        val level = be.level
+        if (level == null || level.hasChunkAt(be.blockPos)) {
+            settleStopped(be, quiet = false)
+        } else if (settleStopped(be, quiet = true)) {
+            markChunkUnsaved(be)
+        }
     }
 
     private fun onServerStopped(event: ServerStoppedEvent) {
@@ -960,6 +1025,7 @@ object ServerMachines {
         rotation.clear()
         demoted.clear()
         promoted.clear()
+        unmarkedCases.clear()
         restoreQueue.clear()
         afterCaptureForTest.clear()
         stop(m)

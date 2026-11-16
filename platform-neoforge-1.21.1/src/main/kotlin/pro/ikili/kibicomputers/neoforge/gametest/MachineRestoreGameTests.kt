@@ -174,6 +174,42 @@ object MachineRestoreGameTests {
     }
 
     /**
+     * 有効な ID と書けた世代を持つ電源の入ったケースが FULL になったばかりのチャンクにあり、`onLoad` の前に FULL に戻った経路
+     * （`restorePromoted`）が来ても、そこでは順番待ちに入らず、`onLoad` が ID の `claim` を通してから順番待ちに入って、
+     * 保存した世代から戻る（冷えた起動にならない。#653）。`restorePromoted` が呼ぶ `restorePromotedCase` を、置き直した直後
+     * （次の tick の `onLoad` の前）に呼んで、通しで確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoresAPromotedChunkCaseAfterOnLoad(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            helper.assertTrue(tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "a running case should save PoweredOn: $tag")
+            val be = reload(helper, tag)
+            copy = be
+            helper.assertTrue(!be.isLoadedOnServer, "onLoad should not have run yet")
+            // FULL に戻った経路が onLoad の前に来た
+            ServerMachines.restorePromotedCase(be)
+            helper.assertTrue(!be.computer.isRestorePending, "the promoted path should not queue the case before onLoad: ${be.computer}")
+        }.thenWaitUntil {
+            val be = copy!!
+            helper.assertTrue(be.isLoadedOnServer, "onLoad should run")
+            assertRestored(helper, be)
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreSource != null && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
+                    "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, ${be.computer}",
+            )
+            be.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
      * 戻すと、キーを打つ前にシェルがプロンプトと入力中の行を描き直す（`restored` イベント。#87、ADR 0087）。画面も置き直して
      * （ワールドを読み込み直したときと同じく、表示は空から始まる）、描き直しが前の画面の残りでないことを確かめる
      */
