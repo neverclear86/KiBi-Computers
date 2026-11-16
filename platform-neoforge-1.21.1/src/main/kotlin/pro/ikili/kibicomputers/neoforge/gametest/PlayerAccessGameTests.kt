@@ -321,7 +321,8 @@ object PlayerAccessGameTests {
      *
      * 4 つの爆発は、それぞれ別の離れたチャンク（[BLAST_CHUNKS_X]・[BLAST_CHUNKS_Z]、間は [BLAST_CHUNK_STEP]）に置く。
      * 落とし物は、爆発の前からあった物を除いた、その爆発で増えた物だけを数える（#746。並んで動くほかのテストの落とし物が、
-     * 同じチャンクに残っていることがある）
+     * 同じチャンクに残っていることがある）。検索がそのチャンクで働いていること（エンティティのセクションが見えること）は、
+     * 爆発の後に置く目印の物が検索に出ることで確かめる
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
@@ -357,7 +358,18 @@ object PlayerAccessGameTests {
             helper.assertTrue(be.playerAccess.locked, "an unknown version should be locked")
         }) { level.explode(null, it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.BLOCK) }
 
-        helper.runAfterDelay(1) {
+        // 強制読み込みしたチャンクが FULL に上がり、エンティティのセクションが見えるようになるまで待つ。見えないうちは
+        // 落とし物が検索に出ない（1 tick では上がりきらないことがある）
+        fun ready() = blasts.all { level.areEntitiesLoaded(it.chunk.toLong()) && level.isPositionEntityTicking(it.pos) }
+        fun blastWhenReady(ticksLeft: Int, run: () -> Unit) {
+            if (ready()) {
+                run()
+            } else {
+                helper.assertTrue(ticksLeft > 0, "the blast chunks should become entity ticking")
+                helper.runAfterDelay(1) { blastWhenReady(ticksLeft - 1, run) }
+            }
+        }
+        helper.runAfterDelay(1) { blastWhenReady(200) {
             val store = WorldMachineSaves.current!!
             for (b in blasts) {
                 b.be.computer.prepareUnload()
@@ -377,7 +389,14 @@ object PlayerAccessGameTests {
                 helper.assertTrue(level.getBlockState(b.pos.east()).isAir, "${b.name}: the dirt next to the case should be blown up")
                 val now = (0 until b.be.parts.slots).map { b.be.parts.getStackInSlot(it) }
                 helper.assertTrue(parts.zip(now).all { (a, c) -> ItemStack.matches(a, c) }, "${b.name}: the parts should not change")
-                val drops = level.getEntitiesOfClass(ItemEntity::class.java, area).filter { it !in before }
+                // 対照: チャンクのエンティティのセクションがまだ見えないと、落とし物があっても検索に出ず、下の確かめが素通りする。
+                // 爆発の後に目印の物を置き、それが検索に出ることを確かめてから数える
+                val probe = ItemEntity(level, b.pos.x + 0.5, b.pos.y + 2.0, b.pos.z + 0.5, ItemStack(Items.STICK))
+                helper.assertTrue(level.addFreshEntity(probe), "${b.name}: the probe item should be added")
+                val found = level.getEntitiesOfClass(ItemEntity::class.java, area).filter { it !in before }
+                helper.assertTrue(probe in found, "${b.name}: the entity search should see items in the blast chunk")
+                probe.discard()
+                val drops = found.filter { it !== probe }
                 val bad = drops.filter { it.item.`is`(Items.IRON_INGOT) || it.item.item is BlockItem && (it.item.item as BlockItem).block is CaseBlock }
                 helper.assertTrue(bad.isEmpty(), "${b.name}: nothing of the case should drop but dropped ${bad.map { it.item }}")
                 drops.forEach { it.discard() }
@@ -389,7 +408,7 @@ object PlayerAccessGameTests {
             }
             ServerMachines.drainSaves()
             helper.succeed()
-        }
+        } }
     }
 
     /** mob の破壊（ウィザーなど。`LivingDestroyBlockEvent`）は、持ち主のあるケースでは止まり、持ち主のないケースでは止まらない */
