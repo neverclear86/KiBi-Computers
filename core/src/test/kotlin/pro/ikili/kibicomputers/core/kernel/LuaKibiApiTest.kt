@@ -524,15 +524,16 @@ class LuaKibiApiTest {
     fun `parallelは関数を並べて動かし、イベントをフィルターごとに配る`() = timeout(limit) {
         val out = run(
             """
-            -- 2つの sleep は並んで進む（合わせて約 0.4 秒。続けて待つと 0.6 秒）
+            -- 2つの sleep は並んで進む。続けて動かすなら1つ目が先に終わって "ba" になるので、
+            -- 短いほうが先に終わる "ab" で確かめる（壁時計の上限は CI の遅れで不安定なので見ない）
             local t0 = os.epoch("utc")
             local order = {}
             parallel.waitForAll(
                 function() os.sleep(0.4); order[#order + 1] = "b" end,
-                function() os.sleep(0.2); order[#order + 1] = "a" end
+                function() os.sleep(0.05); order[#order + 1] = "a" end
             )
             local dt = os.epoch("utc") - t0
-            print(table.concat(order), dt >= 350, dt < 590)
+            print(table.concat(order), dt >= 350)
             -- waitForAny は最初に終わった関数の番号を返す
             print(parallel.waitForAny(
                 function() os.pullEvent("never") end,
@@ -584,7 +585,7 @@ class LuaKibiApiTest {
             """.trimIndent(),
         )
         val lines = out.lines()
-        assertEquals("ab\ttrue\ttrue", lines[0], out)
+        assertEquals("ab\ttrue", lines[0], out)
         assertEquals("2", lines[1], out)
         assertEquals("1", lines[2], out)
         assertEquals("0\t0", lines[3], out)
