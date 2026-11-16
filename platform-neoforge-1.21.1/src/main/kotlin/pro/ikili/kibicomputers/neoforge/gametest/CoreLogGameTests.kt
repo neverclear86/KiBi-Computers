@@ -2,6 +2,9 @@ package pro.ikili.kibicomputers.neoforge.gametest
 
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import org.apache.logging.log4j.LogManager
@@ -20,6 +23,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.neoforge.CoreLogBridge
 import java.util.Collections
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import org.apache.logging.log4j.Level as Log4jLevel
 
 /** core の `System.getLogger` のログが、ローダーの log4j（`latest.log`・`debug.log` の出口）に届く（#673）。 */
@@ -158,11 +162,30 @@ object CoreLogGameTests {
         val rootConfig = LoggerContext.getContext(false).configuration.rootLogger
         rootConfig.addAppender(appender, null, null)
         val scheduler = MachineScheduler()
+        // 成功・失敗・タイムアウトのどれでも1回だけ走らせる。判定が通らないままタイムアウトしたときも、
+        // スケジューラのスレッドとアペンダーを残さない（`LoadGameTests` が `KiBi-` のスレッドの数を数えるため）
+        val cleanedUp = AtomicBoolean(false)
         val cleanUp = {
-            scheduler.close()
-            rootConfig.removeAppender(appender.name)
-            appender.stop()
+            if (cleanedUp.compareAndSet(false, true)) {
+                try {
+                    scheduler.close()
+                } finally {
+                    rootConfig.removeAppender(appender.name)
+                    appender.stop()
+                }
+            }
         }
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = cleanUp()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = cleanUp()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
         try {
             val error = RuntimeException("CoreLogGameTests host failure (not a bug) $mark")
             val host = ThrowingHost(error)
@@ -176,7 +199,6 @@ object CoreLogGameTests {
                 helper.assertTrue(warn.size == 1, "the swallowed exception should reach log4j once as WARN: $events")
                 helper.assertTrue(warn[0].third === error, "the first WARNING should carry the stack trace: ${warn[0]}")
                 helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should keep running as stopped")
-                cleanUp()
             }
         } catch (t: Throwable) {
             cleanUp()
