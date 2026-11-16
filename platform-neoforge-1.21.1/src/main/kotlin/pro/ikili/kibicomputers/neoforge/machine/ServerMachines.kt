@@ -53,8 +53,10 @@ import pro.ikili.kibicomputers.core.util.CanonicalUuid
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.UUID
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
@@ -431,6 +433,7 @@ object ServerMachines {
         rotation.clear()
         demoted.clear()
         promoted.clear()
+        unmarkedCases.clear()
         restoreQueue.clear()
         submitOf.clear()
         coldBootLog = ColdBootLog()
@@ -653,7 +656,12 @@ object ServerMachines {
      * [be] のチャンクに未保存の印を付ける（続くチャンクの保存が NBT を書く。#653）。チャンクが FULL なら（`hasChunkAt`）`setChanged`。
      * FULL でなければ `setChanged` が届かない（`Level.blockEntityChanged` は `hasChunkAt` のときだけ印を付ける）ので、そのチャンクの
      * `ChunkHolder` の最新のチャンクに `setUnsaved(true)` を直接付ける（ADR 0084 の規則 5）。チャンクを読み込み直さない
-     * （チケットは足さない）。チャンクの中のブロックエンティティが [be] でなければ（読み込み直した別のチャンク）付けない
+     * （チケットは足さない）。
+     *
+     * アンロード待ちのチャンク（`ChunkMap.processUnloads` が holder を外し、`visibleChunkMap` から消えたが、アンロードの仕事がまだ走っていない。
+     * tick に時間が残らないと残る）は、ブロックエンティティは生きているが holder が見つからない。このときは [unmarkedCases] に覚え、
+     * 続くアンロード（[saveForUnload]）がそのチャンクに印を付ける。チャンクの中のブロックエンティティが [be] でなければ
+     * （読み込み直した別のチャンク）付けない
      */
     internal fun markChunkUnsaved(be: CaseBlockEntity) {
         val level = be.level as? ServerLevel ?: return
@@ -663,12 +671,21 @@ object ServerMachines {
             return
         }
         val chunk = level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(pos))?.latestChunk as? LevelChunk
-        if (chunk != null && chunk.blockEntities[pos] === be) {
-            chunk.isUnsaved = true
-        } else {
-            LOGGER.debug("No chunk in memory holds the computer at {}; not marking it unsaved", pos)
+        when {
+            chunk == null -> {
+                unmarkedCases += be
+                LOGGER.debug("No visible chunk holds the computer at {} (pending unload?); marking it unsaved on unload", pos)
+            }
+            chunk.blockEntities[pos] === be -> chunk.isUnsaved = true
+            else -> LOGGER.debug("Another chunk holds the position of the computer at {}; not marking it unsaved", pos)
         }
     }
+
+    /**
+     * [markChunkUnsaved] が印を付けられなかった（チャンクの holder が見えない。アンロード待ち）ケース。続くアンロード（[saveForUnload]）が
+     * チャンクに `isUnsaved` を付けて外す（メインスレッドだけで触る。消えたケースは残さない）
+     */
+    internal val unmarkedCases: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(WeakHashMap())
 
     /**
      * 書き込みのスレッドが空になるまで待ち（上限 [MachineSaveConfig.writerFlushMillis]）、終わった書き込みを受け取る（停止の手順と GameTest）
@@ -769,6 +786,8 @@ object ServerMachines {
         val store = WorldMachineSaves.current ?: return
         // 止まった台は電源を切ってから書く（アンロードでは setChanged が効かないので、変わったらチャンクに印を付ける。#698）
         for (be in cases) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
+        // アンロード待ちで印を付けられなかったケース（markChunkUnsaved。#653）の分を、このチャンクに付ける
+        if (unmarkedCases.isNotEmpty()) for (be in cases) if (unmarkedCases.remove(be)) chunk.isUnsaved = true
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -985,7 +1004,7 @@ object ServerMachines {
     /**
      * 停止の経路のそろえ（[settleStopped]）。FULL のチャンクなら今まで通り `setChanged` で NBT に載せる。FULL でないチャンク
      * （1人プレイの「保存してタイトルに戻る」で、プレイヤーのチケットが先に外れたときなど）では `setChanged` が届かず、
-     * 隣のブロックにも触らせたくない（#698）ので `quiet` でそろえ、変わったらチャンクに直接印を付ける（[markChunkUnsaved]。#653）
+     * 隣のブロックにも触らせたくない（#698）ので `quiet` でそろえ、変わったらチャンクに直接印を付ける（[markChunkUnsaved]。アンロード待ちで holder が見えないときは、続くアンロードが付ける。#653）
      */
     private fun settleStoppedForStop(be: CaseBlockEntity) {
         val level = be.level
@@ -1005,6 +1024,7 @@ object ServerMachines {
         rotation.clear()
         demoted.clear()
         promoted.clear()
+        unmarkedCases.clear()
         restoreQueue.clear()
         afterCaptureForTest.clear()
         stop(m)

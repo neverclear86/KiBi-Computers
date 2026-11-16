@@ -654,6 +654,31 @@ object MachineSaveGameTests {
         helper.succeed()
     }
 
+    /**
+     * チャンクの holder が見えないケース（アンロード待ち。`visibleChunkMap` から消えて、アンロードの仕事がまだ走っていない）は、
+     * `markChunkUnsaved` では印を付けられない。覚えておいて、続くアンロード（`saveForUnload`）がそのチャンクに `isUnsaved` を付ける（#653）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun unloadMarksACaseWhoseChunkHolderWasGone(helper: GameTestHelper) {
+        val level = helper.level
+        val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
+        // だれも読み込んでいないチャンクのケース（holder が見えない）
+        val far = BlockPos(helper.absolutePos(CASE).x + 16 * 900, 100, helper.absolutePos(CASE).z - 16 * 900)
+        helper.assertTrue(level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(far)) == null, "the far chunk should have no holder")
+        val be = CaseBlockEntity(far, state)
+        be.setLevel(level)
+        ServerMachines.markChunkUnsaved(be)
+        helper.assertTrue(be in ServerMachines.unmarkedCases, "a case without a visible chunk should be remembered")
+        // アンロードの手順が、そのチャンクに印を付けて忘れる
+        val chunk = level.getChunkAt(helper.absolutePos(CASE))
+        chunk.isUnsaved = false
+        ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
+        helper.assertTrue(chunk.isUnsaved, "the unload should mark the chunk unsaved")
+        helper.assertTrue(be !in ServerMachines.unmarkedCases, "the unload should forget the case")
+        helper.succeed()
+    }
+
     /** ディスク（書き込み待ちを含む）のチャンク [chunk] の NBT で、[pos] のケースのタグが指す世代 */
     private fun diskGeneration(helper: GameTestHelper, chunk: ChunkPos, pos: BlockPos): Long {
         val data = helper.level.chunkSource.chunkMap.read(chunk).join().orElse(null)
