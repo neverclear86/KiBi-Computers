@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.neoforge.CoreLogBridge
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import org.apache.logging.log4j.Level as Log4jLevel
 
 /** core の `System.getLogger` のログが、ローダーの log4j（`latest.log`・`debug.log` の出口）に届く（#673）。 */
@@ -127,18 +128,22 @@ object CoreLogGameTests {
         @Volatile
         var failure: BootFailure? = null
 
+        /** 起動の失敗の通知を受けた回数（投げた回数） */
+        val failures = AtomicInteger()
+
         // 状態の通知では投げない（WARNING は起動の失敗の1件だけにする）
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
 
         override fun onBootFailed(machine: Machine, failure: BootFailure, detail: String) {
             this.failure = failure
+            failures.incrementAndGet()
             throw error
         }
     }
 
     /**
      * 接続層の通知が投げた例外を `Machine.safely` が捨てるとき、`kibicomputers.machine` の WARNING が log4j の root
-     * （`latest.log` の出口）まで届く（#674・#673）。マシンは止まったまま動き続ける。
+     * （`latest.log` の出口）まで届く（#674・#673）。捨てた後も、マシンは次の起動を受け付け、その失敗の通知もまた配られる（同じ例外の2回目は DEBUG なので WARNING は1件のまま）。
      *
      * `ServerMachines`（`MachineManager`）を通すと、`ManagedHost` が接続層の例外を先に捕まえて ERROR に出すので、
      * `Machine.safely` まで届かない。ここでは自前のスケジューラでマシンを作り、包まない [MachineHost] を直に渡す。
@@ -190,7 +195,9 @@ object CoreLogGameTests {
             val error = RuntimeException("CoreLogGameTests host failure (not a bug) $mark")
             val host = ThrowingHost(error)
             val machine = scheduler.createMachine(host, MachineConfig.DEFAULT)
-            helper.assertTrue(machine.boot(BootConfig.builder().firmwarePresent(false).addBootDisk("any").build()), "boot should be accepted")
+            fun boot() = machine.boot(BootConfig.builder().firmwarePresent(false).addBootDisk("any").build())
+            helper.assertTrue(boot(), "boot should be accepted")
+            var rebooted = false
             helper.succeedWhen {
                 // 通知はこのスケジューラの tick で配る（サーバーの tick ごとに1回）
                 scheduler.tick()
@@ -198,7 +205,14 @@ object CoreLogGameTests {
                 val warn = synchronized(events) { events.filter { it.first == Log4jLevel.WARN } }
                 helper.assertTrue(warn.size == 1, "the swallowed exception should reach log4j once as WARN: $events")
                 helper.assertTrue(warn[0].third === error, "the first WARNING should carry the stack trace: ${warn[0]}")
-                helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should keep running as stopped")
+                helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be stopped after the failure: ${machine.state}")
+                // 例外を捨てた後も、マシンが次の起動を受け付けて通知を配り続けることを見る（捨てずに伝えていたら、ここまで来ない）
+                if (!rebooted) {
+                    rebooted = true
+                    helper.assertTrue(boot(), "the machine should accept another boot after the swallowed failure")
+                }
+                helper.assertTrue(host.failures.get() == 2, "the later notification should still be delivered: ${host.failures.get()}")
+                helper.assertTrue(synchronized(events) { events.count { it.first == Log4jLevel.WARN } } == 1, "a repeat of the same exception should not warn again: $events")
             }
         } catch (t: Throwable) {
             cleanUp()
