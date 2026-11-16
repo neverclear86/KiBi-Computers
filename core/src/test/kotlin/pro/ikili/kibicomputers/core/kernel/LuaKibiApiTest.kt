@@ -677,21 +677,31 @@ class LuaKibiApiTest {
     }
 
     @ParameterizedTest
-    @ValueSource(longs = [8, 16, 20])
+    @ValueSource(longs = [24, 28, 31, 40])
     fun `RAMの上限の近くでイベントを読み続けても、Cのスタックが深くなる所でトラップにならない`(remainingKib: Long) = timeout(limit) {
         // #729 の再現。上限の近くで、表に足す・queueEvent・pullEventRaw をくり返す。
-        // 直す前は、pullEventRaw の中で初めて深くなった C のスタック（上端から 8〜12 KiB）への書き込みがトラップになっていた
+        // 直す前は、pullEventRaw の中で初めて深くなった C のスタック（上端から 8〜12 KiB）への書き込みがトラップになっていた。
+        // 関数は pcall の外で先に作る（ループの本体で作ると、確保が断られたときに、pullEventRaw の入れ子を一度も通らずに終わる）。
+        // ループが最後まで回ったことと、pullEventRaw が1回でも成功した（入れ子を通った）ことを確かめる。
+        // 残りが約 22 KiB 以下だと、スタックを数える commit（残りを MIN の 8 KiB 残す）が最初の確保から断られ、入れ子まで届かないので、それより上の値だけを使う
         val script = """
             local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
             local t = {}
+            local grow = function() t[#t + 1] = rep("y", 16) end
+            local pulled, called = 0, 0
             print("ready")
             io.stdout:flush()
             os.sleep(2)
             for i = 1, 400 do
-                pc(function() t[#t + 1] = rep("y", 16) end)
+                pc(grow)
                 pc(q, p)
-                pc(pe)
+                local ok = pc(pe)
+                called = called + 1
+                if ok then pulled = pulled + 1 end
             end
+            -- 上限の近くでは数値の文字列化も断られるので、結果は確保しない文字列（定数）で出す
+            io.stdout:write(called == 400 and "loop-ok\n" or "loop-short\n")
+            io.stdout:write(pulled > 0 and "pulled\n" or "not-pulled\n")
             t = nil
             collectgarbage()
             print("done")
@@ -699,10 +709,46 @@ class LuaKibiApiTest {
         Run(script, memoryBytes = 512 * 1024L).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
-            // CRASHED にならず、Lua として終わる。関数を作る所など pcall の外の確保が断られたら、Lua のエラーで終わる
+            // CRASHED にならず、Lua として終わる。ループの回数と、pullEventRaw が1回でも通ったかを見る
             val out = r.finish()
             r.release(held)
-            assertTrue(out == "ready\ndone\n" || "not enough memory" in out, out)
+            assertEquals("ready\nloop-ok\npulled\ndone\n", out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [30, 40, 44, 52, 60])
+    fun `RAMの残りがスタックを数える線（32 KiB）の近くで、深いCのスタックから小さな結果のimportを呼んでもトラップにならない`(remainingKib: Long) = timeout(limit) {
+        // #729。結果が小さい import（peripheral.getType = open と info。見積もり 512 バイト）は、kibi_lua_reserve の速い道（何も取らない）を通る。
+        // その先の cabi_realloc の確保で、初めての C のスタックの計数（最大 16 KiB）が走ると、残りが KEEP を割って OUT_OF_MEMORY → トラップになる。
+        // これを起こすには、import の直前まで Lua の確保が起きず（起きれば、そこで先にスタックを数える）、
+        // そのスタックが、まだ触っていない深さまで伸びていること。
+        // 先に Lua だけの再帰で CallInfo と Lua のスタックを伸ばしておき（C のスタックは使わない）、残りを絞ってから、string.gsub のコールバックの入れ子（C のスタックを使う）で深くする。
+        // 速い道の余裕に計数の分を含めるので、断られる（"not enough memory"）か成功するかのどちらかで、CRASHED にならない。
+        // 深くするだけで残りが減る（触った区画も数える）ので、計数が走る残りの幅に当たる値をいくつか並べる（旧い余裕 24 KiB で必ずトラップになることまでは再現できていない。この経路を通して CRASHED にならないことを確かめる）
+        val script = """
+            local gt, pc, addr = peripheral.getType, pcall, "$ADDRESS"
+            local function warm(n) if n == 0 then return 0 end return 1 + warm(n - 1) end
+            warm(400)
+            local gsub = string.gsub
+            local function deep(n)
+                if n == 0 then return gt(addr) end
+                local r
+                gsub("x", "x", function() r = deep(n - 1) end)
+                return r
+            end
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 3 do pc(deep, 20) end
+            print("done")
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\ndone\n", out)
         }
     }
 

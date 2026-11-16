@@ -62,17 +62,12 @@ __asm__(
 
 size_t malloc_usable_size(void *ptr);
 
-#define KIBI_LUA_KEEP (16 * 1024)
 #define KIBI_LUA_MIN (8 * 1024)
 #define KIBI_LUA_LOOKAHEAD (8 * 1024)
 /* dlmalloc のチャンクの頭（前）と、次のチャンクの頭（後ろ）の分 */
 #define KIBI_LUA_HEAD 16
 #define KIBI_LUA_TAIL 16
-/*
- * 上限の近くで先に数える C のスタックの深さ（今のスタックポインターから下）。#729 の再現では、上限の近くで
- * 初めて書いたスタックが、スタックの上端から 8〜12 KiB の所だった。確保する所より深く呼ぶ道（pull → take → convert）の分を足す
- */
-#define KIBI_LUA_STACK_GUARD (16 * 1024)
+/* KIBI_LUA_KEEP・KIBI_LUA_STACK_GUARD は kibi_wasi.h（kibi_lua_canon.c の reserve の余裕と合わせるため） */
 
 /* リンカーが出すスタックの下端（wasm-ld。スタックは線形メモリの先頭に置かれ、下へ伸びる） */
 extern unsigned char __stack_low;
