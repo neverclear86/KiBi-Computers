@@ -964,6 +964,8 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
+        // ホストの resource（p2 の stream・descriptor など）の参照を返す（#267。ゲストの表の dtor は呼ばない。ADR 0265）
+        process.hostResources.closeAll(machine.kernel.objects, machine.wakeSink)
         // 一時的なタイマーを閉じる（持ち主は process.waitTimers だけ。待機点型で kill されたときなど。#329）。
         // 後から来た closeWaitTimer は集合にないので何もしない（同じ ID が別のオブジェクトに使い回されていても閉じない）
         process.waitTimers.forEach { machine.kernel.objects.release(it, machine.wakeSink) }

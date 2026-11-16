@@ -549,7 +549,7 @@ class ComponentLoaderTest {
             (component
               (type ${'$'}ta (instance $exports))
               (type ${'$'}tb (instance $exports))
-              (import "wasi:a/b" (instance ${'$'}a (type ${'$'}ta)))
+              (import "wasi:a/b@0.2.0" (instance ${'$'}a (type ${'$'}ta)))
               (component ${'$'}c
                 (alias outer 1 ${'$'}tb (type ${'$'}tb))
                 $imports
@@ -693,7 +693,7 @@ class ComponentLoaderTest {
         val aliased = wat(
             """
             (component
-              (import "wasi:a/b" (instance ${'$'}i (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr)))))
+              (import "wasi:a/b@0.2.0" (instance ${'$'}i (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr)))))
               (alias export ${'$'}i "r" (type ${'$'}r))
               (type (list ${'$'}r))
             )

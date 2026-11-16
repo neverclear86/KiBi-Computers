@@ -4,8 +4,8 @@ package pro.ikili.kibicomputers.core.runtime.component
  * コンポーネントのトップレベルの import を許すかの判定（#262。#40 の「許可しない import の拒否」をコンポーネントに広げたもの）。
  *
  * ここで見るのは形だけ（種類と名前の文法、予約した名前）。インスタンスの型がホストの出す型に合うか（部分型か）の照合は、
- * リンク（#263）の仕事。ホストが出すインターフェースの一覧と、`wasi:*` の版の受け付け方（semver の互換を認めるか）は
- * システムコールの ABI に関わるので、#267・#268 で決めて、この判定を差し替える。
+ * リンク（#263）の仕事。`wasi:*` の版の受け付け方は ADR 0267（#267）で決めた: `@0.2.<n>` だけを受け、`<n>` は問わない
+ * （[rejectWasiVersion]）。`wasi:*` の 0.3 は #268 で足す。
  */
 internal fun interface ComponentImportPolicy {
     /** [import] を断る理由。許すなら `null` */
@@ -16,13 +16,31 @@ internal fun interface ComponentImportPolicy {
         const val KIBI_VERSION: String = "0.1.0"
 
         /**
+         * `wasi:*` の名前 [name] の版を断る理由（ADR 0267）。受けるのは `@0.2.<n>` だけで、`<n>` は問わない（ホストの基準より
+         * 新しくても古くてもよい。wasmtime の Linker と同じく semver の互換として扱う。ゲストが宣言した関数がホストになければ、
+         * リンクが読み込みの失敗にする）。版なし・pre-release・`+build` 付き・`0.3.x`（#268 まで）・ほかの版は断る
+         */
+        fun rejectWasiVersion(name: InterfaceName): String? {
+            val v = name.version ?: return "wasi:* には版が要る（@0.2.<n>）"
+            return when {
+                WASI_P2.matches(v) -> null
+                v.contains('-') -> "wasi:* の pre-release の版は受け付けない（@$v）"
+                v.contains('+') -> "wasi:* のビルドの付いた版は受け付けない（@$v）"
+                v.startsWith("0.3.") -> "wasi:* の 0.3 は #268 まで受け付けない（@$v）"
+                else -> "wasi:* の版は @0.2.<n> だけ（@$v）"
+            }
+        }
+
+        private val WASI_P2 = Regex("""0\.2\.(0|[1-9][0-9]*)""")
+
+        /**
          * 既定の判定:
          *
          * - 種類はインスタンスだけ（core モジュール・関数・値・型・コンポーネントの import は断る。ホストはインターフェースの
          *   インスタンスだけを出す）
          * - 名前はインターフェースの名前（`<名前空間>:<パッケージ>/<インターフェース>[@<版>]`）
          * - 名前空間は `wasi` と `kibi` だけ（ほかはホストが出さない）
-         * - `kibi:*` は版 `@0.1.0` の完全一致だけ。`wasi:*` の版はここでは見ない（#267・#268）
+         * - `kibi:*` は版 `@0.1.0` の完全一致だけ。`wasi:*` は `@0.2.<n>` だけ（[rejectWasiVersion]。ADR 0267）
          */
         val DEFAULT: ComponentImportPolicy = ComponentImportPolicy { import ->
             if (import.desc !is ExternDesc.Instance) {
@@ -31,7 +49,7 @@ internal fun interface ComponentImportPolicy {
             val name = InterfaceName.parse(import.name)
                 ?: return@ComponentImportPolicy "インターフェースの名前（名前空間:パッケージ/インターフェース@版）でない"
             when (name.namespace) {
-                "wasi" -> null
+                "wasi" -> rejectWasiVersion(name)
                 "kibi" -> if (name.version == KIBI_VERSION) null else "kibi:* の版は @$KIBI_VERSION だけ（${name.version ?: "版なし"}）"
                 else -> "ホストが出さない名前空間 ${name.namespace}"
             }
