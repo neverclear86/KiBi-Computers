@@ -223,16 +223,18 @@ internal fun eventuallyDescribe(timeoutMillis: Long = 5_000, describe: () -> Str
  *
  * RUNNING が見えても、init の専用スレッドはまだ `register()` の前のことがある。その間に reboot・stop・写しの kill が入ると、
  * register が KILLED にして unregister（beforeUnregister のフック）を通らないので、止まり切る前の場面を作れない（#542、#624、#683）。
- * CREATED を抜けるのは register → CPU の取得 → load の後なので、CREATED の条件だけでも BLOCKING の init には足りる。
- * 待機点型の init は燃料切れで巻き戻すと RUNNABLE のままスレッドを手放すので、登録済み（`thread != null`）も見る。
+ * CREATED を抜けるのは register → CPU の取得 → load の後なので、BLOCKING の init（専用スレッドを実行の間ずっと登録している。
+ * FakeModule の init など）なら、CREATED でも終了でもないことが、登録済みであることの保証になる。
+ * 待機点型の init（step の間だけスレッドを登録する）には使えない。イベント待ちや燃料待ちでは、どの瞬間もスレッドが外れていて、
+ * この条件は「step の最中」の保証にならない。待機点型で reboot などを step の最中に当てたいテストは、別の同期を使う。
  * CREATED の条件は落とさない（写しは CREATED を待機点として殺さないので、写しのテストがそれに頼る）。
- * 状態とスレッドはカーネルロックの中で一度に読む。テストのスレッドがカーネルロックを持ったまま呼ばない
+ * 状態はカーネルロックの中で読む。テストのスレッドがカーネルロックを持ったまま呼ばない
  */
 internal fun Machine.isInitStarted(): Boolean = lock.withLockValue {
     val pid = kernel.initPid
     val p = if (pid == 0) null else kernel.processes[pid]
     state == MachineState.RUNNING && !isBooting && p != null &&
-        p.state != ProcessState.CREATED && !p.state.isTerminal && runtimes[pid]?.thread != null
+        p.state != ProcessState.CREATED && !p.state.isTerminal
 }
 
 /** [Machine.isInitStarted] になるまで tick を進める */
