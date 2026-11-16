@@ -766,6 +766,7 @@ internal class ProcessRunner(private val machine: Machine) {
         val env = object : KernelLinkEnv(ctx) {
             override fun configure(builder: WasmInstanceConfig.Builder) {
                 refusalsBefore = rt.memory.refusalCount
+                reserveCoreInstanceOverhead(rt)
                 applyKernelLimits(rt, builder)
                 if (metered) builder.fuel(0, rt.fuelHandler)
             }
@@ -802,6 +803,21 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.fuelHolder = first
             rt.loading = null
             rt.process.state = ProcessState.RUNNING
+        }
+    }
+
+    /**
+     * コンポーネントの core インスタンスを 1 つ作る前に、その固定費（[CORE_INSTANCE_OVERHEAD_BYTES]）を RAM の 3 段に数える（#270）。
+     * 断られたら [WasmLinkException]（断った回数が増えるので、異常終了の文はメモリ不足になる）。数えた分はプロセスの終わりにまとめて返す。
+     * プロセスの終わり（別のスレッドの kill でも来る）と取り違えないよう、カーネルロックの中で数えて記録する（作るたびに 1 回だけ）
+     */
+    private fun reserveCoreInstanceOverhead(rt: ProcessRuntime) {
+        lock.withLockValue {
+            if (rt.killed || rt.process.state.isTerminal) throw ProcessKilledException()
+            if (!rt.memory.tryReserveBytes(CORE_INSTANCE_OVERHEAD_BYTES)) {
+                throw WasmLinkException("core インスタンスの固定費（$CORE_INSTANCE_OVERHEAD_BYTES バイト）を RAM に確保できない")
+            }
+            rt.coreInstanceOverheadBytes += CORE_INSTANCE_OVERHEAD_BYTES
         }
     }
 
@@ -940,6 +956,11 @@ internal class ProcessRunner(private val machine: Machine) {
         rt.instances.clear()
         rt.component = null
         rt.fuelHolder = null
+        // コンポーネントの core インスタンスの固定費を返す（#270。数えるのも返すのもカーネルロックの中なので、1 回だけ返る）
+        if (rt.coreInstanceOverheadBytes > 0) {
+            rt.memory.releaseBytes(rt.coreInstanceOverheadBytes)
+            rt.coreInstanceOverheadBytes = 0
+        }
         // fd をすべて閉じる（ゾンビは fd を持たない。#58）
         FdTable(process, machine.kernel.objects, machine.wakeSink).closeAll()
         // 一時的なタイマーを閉じる（持ち主は process.waitTimers だけ。待機点型で kill されたときなど。#329）。
@@ -1232,21 +1253,6 @@ internal class ProcessRunner(private val machine: Machine) {
                 verifyInstanceLocked(rt, caller)
             }
             f.call(this, caller, args)
-        }
-
-        override fun switchFuelHolder(target: WasmInstance) {
-            checkThread()
-            lock.withLockValue {
-                check(rt.loading == null) { "作っている途中は switchFuelHolder を呼べない" }
-                require(rt.instances.containsSame(target)) { "このプロセスのインスタンスでない" }
-                val holder = rt.fuelHolder!!
-                if (!rt.process.unmetered && holder !== target) {
-                    val r = holder.fuel
-                    holder.fuel = 0
-                    target.fuel = r
-                }
-                rt.fuelHolder = target
-            }
         }
 
         override fun instantiate(module: WasmModule, configurer: InstanceConfigurer): WasmInstance {
@@ -1732,6 +1738,14 @@ private val TIMER_EVENT_PROBE = KernelEvent(TimerLimits.EVENT_TYPE)
  * 64 MiB（#370 の PoC と同じ）。マシンの RAM がこれより大きければ、RAM の大きさまで広げる
  */
 internal const val ADDRESS_SPACE_PAGES: Int = 1024
+
+/**
+ * コンポーネントの core インスタンス 1 つあたりに RAM へ数える固定費（バイト。#270。仮の値で、確定は #251）。
+ * Endive のインスタンス（関数・グローバル・テーブルの配列など）やリンクの表は線形メモリの外にあり、書き込んだ区画では数えられない。
+ * 1 つのコンポーネントは core インスタンスを最大 `ComponentLimits.maxExpandedCoreInstances` 個作れるので、数で抑える。
+ * 書き込みの区画と同じ 4 KiB にする（p1 の単体のモジュールには数えない）
+ */
+internal const val CORE_INSTANCE_OVERHEAD_BYTES: Long = 4096
 
 /**
  * 止まりうる関数でない関数の中で燃料が切れたとき、止まりうる関数に戻って巻き戻すまでに前借りしてよい燃料の上限（#477）。

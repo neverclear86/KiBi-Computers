@@ -288,7 +288,12 @@ internal interface ProcessContext {
     /** 最初に作ったインスタンス（p1 ではこれだけ）。`LOADING` の間（configure の中、start 関数の中）は呼べない（`IllegalStateException`） */
     val instance: WasmInstance
 
-    /** 今、手持ちの燃料を持つインスタンス。ほかのインスタンスの `kibi_fuel` は 0。作っている途中の仮の holder は含まない */
+    /**
+     * 今、手持ちの燃料を持つインスタンス。作っている途中の仮の holder は含まない。
+     * core モジュールのプロセスでは、ほかのインスタンス（[instantiate] で作ったもの）の `kibi_fuel` は 0。
+     * コンポーネントのプロセスでは、core インスタンスがみな燃料のグローバルを共有するので、最初のインスタンスのまま変えない
+     * （インスタンスをまたぐたびに手持ちを移す形は採らない。#270。ADR 0263）
+     */
     val fuelHolder: WasmInstance
 
     /**
@@ -307,18 +312,11 @@ internal interface ProcessContext {
     fun hostFunction(f: KernelHostFunction): WasmHostFunction
 
     /**
-     * ホスト関数の中で、手持ちを [target] へ移す（残りを読んで元を 0 にし、target に入れる）。
-     * Canonical ABI の層が、コアインスタンスをまたぐたびに呼ぶ（#270）。燃料を計測しないプロセスでは holder だけ差し替える。
-     * 作っている途中（`LOADING`）に呼ぶと `IllegalStateException`
-     */
-    fun switchFuelHolder(target: WasmInstance)
-
-    /**
      * start・resume かホスト関数の中で、コアインスタンスを1つ作る。[configurer] でホスト import を登録させ
      * （`builder.fuel` を呼んでいたら `IllegalStateException`）、今の手持ちを initialFuel として渡して元を 0 にし、
      * start 関数の間は仮の holder の規則で動かし、作り終えたら残りを元の holder に戻す。
      * 作っている途中の例外は、CPU と許可を返さず、燃料だけ捨てて（元の holder は 0 のまま）呼び出し元へ投げる。
-     * 作っている途中に入れ子で呼ぶと `IllegalStateException`
+     * 作っている途中に入れ子で呼ぶと `IllegalStateException`（#270 で、許さないことにした。コンポーネントのプロセスでは呼べない）
      */
     @Throws(WasmLinkException::class, WasmTrapException::class, ProcessKilledException::class)
     fun instantiate(module: WasmModule, configurer: InstanceConfigurer): WasmInstance

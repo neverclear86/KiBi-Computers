@@ -304,4 +304,49 @@ class ComponentProcessTest {
             assertCleanedUp(m, rt, before)
         }
     }
+    // ---- 燃料（#270） ----
+
+    /** 2 つの core インスタンスの start 関数が、それぞれ [na]・[nb] 回まわる（計測あり） */
+    private fun twoStarts(na: Int, nb: Int): Program {
+        fun module(name: String, n: Int) = """
+          (core module ${'$'}$name
+            (func ${'$'}s
+              (local ${'$'}i i32)
+              (loop ${'$'}l
+                (local.set ${'$'}i (i32.add (local.get ${'$'}i) (i32.const 1)))
+                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const $n)))))
+            (start ${'$'}s))
+        """
+        val text = """
+            (component
+              ${module("a", na)}
+              ${module("b", nb)}
+              (core instance (instantiate ${'$'}a))
+              (core instance (instantiate ${'$'}b)))
+        """
+        return Program.component(LinkTesting.load(text, ComponentHost.NONE, metered = true))
+    }
+
+    /** [program] を 1 tick 分の配分の中で最後まで動かし、終わった後のマシンの燃料（[KernelState.fuel]）を返す */
+    private fun fuelLeftAfter(program: Program): Long = Harness().use { h ->
+        val m = h.machine(fuelPerTick = 10_000_000)
+        val rt = m.spawnRt(program, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
+        h.scheduler.tick()
+        // 補充させないよう、tick を進めずに待つ
+        eventually(20_000, "終わらない") { rt.process.state.isTerminal }
+        assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+        m.lock.withLockValue { m.kernel.fuel }
+    }
+
+    @Test
+    fun `どのcoreインスタンスのstart関数の消費も、マシンの1つの配分から引かれる`() = timeout(limit) {
+        val base = fuelLeftAfter(twoStarts(1, 1))
+        val onlyA = fuelLeftAfter(twoStarts(100_000, 1))
+        val onlyB = fuelLeftAfter(twoStarts(1, 100_000))
+        val both = fuelLeftAfter(twoStarts(100_000, 100_000))
+        assertTrue(base - onlyA > 100_000, "a の start 関数の分が引かれていない: ${base - onlyA}")
+        assertTrue(base - onlyB > 100_000, "b の start 関数の分が引かれていない: ${base - onlyB}")
+        // 保存則: a と b の消費の和が、両方を回したときの消費になる（どちらの分も漏れず、二重にも引かない）
+        assertEquals((base - onlyA) + (base - onlyB), base - both)
+    }
 }

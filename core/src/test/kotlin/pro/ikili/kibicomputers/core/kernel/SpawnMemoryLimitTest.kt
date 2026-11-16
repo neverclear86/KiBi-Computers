@@ -20,6 +20,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -339,7 +341,7 @@ class SpawnMemoryLimitTest {
     """
 
     /**
-     * 先に作る core インスタンス a の start 関数が 15 区画を書いて 1 ページ増やし、断られても続ける（`memory.grow` は -1）。
+     * 先に作る core インスタンス a の start 関数が 14 区画を書いて 1 ページ増やし（固定費の 1 区画と合わせて 15 区画。#270）、断られても続ける（`memory.grow` は -1）。
      * 後に作る b は、線形メモリの外に書く data セグメントを持ち、RAM と関係なく作れない
      */
     private val unrelatedLinkFailureComponent = """
@@ -351,7 +353,7 @@ class SpawnMemoryLimitTest {
               (loop ${'$'}l
                 (i32.store8 (i32.mul (local.get ${'$'}i) (i32.const 4096)) (i32.const 1))
                 (local.set ${'$'}i (i32.add (local.get ${'$'}i) (i32.const 1)))
-                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const 15))))
+                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const 14))))
               (drop (memory.grow (i32.const 1))))
             (start ${'$'}start))
           (core module ${'$'}b
@@ -411,6 +413,125 @@ class SpawnMemoryLimitTest {
             // 先に断った grow の注記は付くが、作れなかった理由をメモリ不足とは書かない
             assertFalse(host.console.contains("cannot instantiate module (out of memory"), host.console.toString())
             assertTrue(host.console.contains("cannot instantiate module (memory.grow was refused: out of memory, RAM limit 64 KiB)"), host.console.toString())
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    // ---- コンポーネントの core インスタンスをまたぐ RAM（#270） ----
+
+    /** [n] 区画（4 KiB）を書く start 関数を持つ core モジュール（自分のメモリを持つ） */
+    private fun writerModule(name: String, n: Int, exportMemory: Boolean = false) = """
+          (core module ${'$'}$name
+            (memory ${if (exportMemory) "(export \"mem\")" else ""} 1)
+            (func ${'$'}start
+              (local ${'$'}i i32)
+              (loop ${'$'}l
+                (i32.store8 (i32.mul (local.get ${'$'}i) (i32.const 4096)) (i32.const 1))
+                (local.set ${'$'}i (i32.add (local.get ${'$'}i) (i32.const 1)))
+                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const $n))))
+              )
+            (start ${'$'}start))
+    """
+
+    @Test
+    fun `後のcoreインスタンスの書き込みは前のインスタンスの分と合わせて数え、RAMを超えるとメモリ不足でトラップする`() = timeout(limit) {
+        harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = page)
+            // RAM は 16 区画。固定費 2 区画（core インスタンス 2 つ）+ a の 8 区画 + b の 8 区画は収まらない
+            val text = """
+                (component
+                  ${writerModule("a", 8)}
+                  ${writerModule("b", 8)}
+                  (core instance ${'$'}ia (instantiate ${'$'}a))
+                  (core instance ${'$'}ib (instantiate ${'$'}b)))
+            """
+            val pid = m.spawnComponent(text, "comp")
+            h.awaitCrash(m, host, pid, "kibi: comp (pid $pid) crashed: out of memory (RAM limit 64 KiB)")
+            val e = m.rt(pid).lastError
+            assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.OUT_OF_MEMORY, "$e")
+            assertEquals(0L, m.memoryAccount.usedBytes, "どの core インスタンスの分も、固定費も返る")
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `後のcoreインスタンスの書き込みがサーバー全体の上限でトラップすると、サーバー全体の上限と書く`() = timeout(limit) {
+        harness(totalBytes = page).use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = 16 * page)
+            val text = """
+                (component
+                  ${writerModule("a", 8)}
+                  ${writerModule("b", 8)}
+                  (core instance ${'$'}ia (instantiate ${'$'}a))
+                  (core instance ${'$'}ib (instantiate ${'$'}b)))
+            """
+            val pid = m.spawnComponent(text, "comp")
+            h.awaitCrash(m, host, pid, "kibi: comp (pid $pid) crashed: out of memory (server memory limit reached)")
+            assertEquals(0L, m.memoryAccount.usedBytes)
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `importして共有したメモリは1回だけ数え、coreインスタンスの固定費と一緒にプロセスの終わりに返る`() = timeout(limit) {
+        harness().use { h ->
+            val m = h.machine(memoryBytes = 16 * page)
+            // a がメモリを定義して 3 区画書き、b は a のメモリを import して別の 2 区画を書く
+            val text = """
+                (component
+                  ${writerModule("a", 3, exportMemory = true)}
+                  (core module ${'$'}b
+                    (import "a" "mem" (memory 1))
+                    (func ${'$'}start
+                      (i32.store8 (i32.const 40960) (i32.const 1))
+                      (i32.store8 (i32.const 45056) (i32.const 1)))
+                    (start ${'$'}start))
+                  (core instance ${'$'}ia (instantiate ${'$'}a))
+                  (core instance ${'$'}ib (instantiate ${'$'}b (with "a" (instance ${'$'}ia)))))
+            """
+            val seen = AtomicReference<Pair<Long, Long>>()
+            val pid = m.spawn(
+                Program.component(LinkTesting.load(text, metered = false)),
+                TestDriver(ProcessKind.BLOCKING) { ctx ->
+                    val rt = m.rt(ctx.pid)
+                    seen.set(rt.memory.usedBytes to m.lock.withLockValue { rt.coreInstanceOverheadBytes })
+                    StepResult.Exit(0)
+                },
+                SpawnOptions(args = listOf("comp"), allowUnmetered = true),
+            )
+            h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
+            assertState(ProcessState.EXITED, m, pid)
+            val overhead = 2 * CORE_INSTANCE_OVERHEAD_BYTES
+            assertEquals(overhead + 5 * 4096L to overhead, seen.get(), "共有したメモリは定義したインスタンスで 1 回だけ数える")
+            assertEquals(0L, m.memoryAccount.usedBytes, "固定費もプロセスの終わりに返る")
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `coreインスタンスの固定費がRAMに収まらないと、作れずにメモリ不足と出る`() = timeout(limit) {
+        harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = page)
+            // メモリを持たない core インスタンスを 17 個作る（固定費は 1 つ 4 KiB。RAM は 16 個分）
+            val instances = (0 until 17).joinToString(" ") { "(core instance (instantiate ${'$'}a))" }
+            val text = """
+                (component
+                  (core module ${'$'}a (func (export "f")))
+                  $instances)
+            """
+            val pid = m.spawnComponent(text, "comp")
+            h.awaitCrash(m, host, pid, "kibi: comp (pid $pid) crashed: cannot instantiate module (out of memory, RAM limit 64 KiB)")
+            assertTrue(m.rt(pid).lastError is WasmLinkException, "${m.rt(pid).lastError}")
+            assertEquals(0L, m.memoryAccount.usedBytes, "数えた固定費は返る")
             m.stop()
             assertTrue(m.awaitTermination(5_000))
         }
