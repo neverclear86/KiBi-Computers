@@ -684,6 +684,8 @@ class LuaKibiApiTest {
         // 関数は pcall の外で先に作る（ループの本体で作ると、確保が断られたときに、pullEventRaw の入れ子を一度も通らずに終わる）。
         // ループが最後まで回ったことと、pullEventRaw が1回でも成功した（入れ子を通った）ことを確かめる。
         // 残りが約 22 KiB 以下だと、スタックを数える commit（残りを MIN の 8 KiB 残す）が最初の確保から断られ、入れ子まで届かないので、それより上の値だけを使う
+        // （その下の帯は、次のテストで確かめる）。この形は、直す前の kibi_wasi.c・kibi_lua_canon.c で回しても CRASHED にならないことがあり、
+        // 直したことの決め手ではない。上限の近くの経路を通して CRASHED にならないことを確かめる
         val script = """
             local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
             local t = {}
@@ -713,6 +715,47 @@ class LuaKibiApiTest {
             val out = r.finish()
             r.release(held)
             assertEquals("ready\nloop-ok\npulled\ndone\n", out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [8, 12, 16, 20])
+    fun `RAMの残りがスタックを数えられないほど少なくても、イベントを読み続けてトラップにならず、穴の使い回しも断られる`(remainingKib: Long) = timeout(limit) {
+        // #729 の元の形（512 KiB を埋め続ける）が必ず通る、低い残りの帯で、CRASHED にならない（Lua として終わる）ことを確かめる。
+        // 残りが約 22 KiB 以下だと、スタックを数える commit（後に MIN の 8 KiB を残す）が断られるので、kibi_lua_realloc は
+        // 解放した穴に収まる確保も含めてすべて NULL を返す（ADR 0094。スタックを守れないまま続けると、深くなったスタックがトラップになるため）。
+        // 起きてすぐの、穴（先に作った 48 KiB）に収まる小さな確保が断られること（スタックを数えない形なら、この帯でも使い回せる）と、
+        // ループが確保を断られながら最後まで回ることを見る。
+        // この形は、直す前の kibi_wasi.c・kibi_lua_canon.c でも CRASHED にはならなかった（この帯でトラップを決まった形で再現できてはいない）
+        val script = """
+            local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
+            local t = {}
+            local grow = function() t[#t + 1] = rep("y", 16) end
+            local called = 0
+            local s = ("z"):rep(48 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            local hole = pc(rep, "h", 1024)
+            for i = 1, 400 do
+                pc(grow)
+                pc(q, p)
+                pc(pe)
+                called = called + 1
+            end
+            -- 上限の近くでは数値の文字列化も断られるので、結果は確保しない文字列（定数）で出す
+            io.stdout:write(called == 400 and "loop-ok\n" or "loop-short\n")
+            io.stdout:write(hole and "hole-reused\n" or "hole-refused\n")
+            io.stdout:flush()
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\nloop-ok\nhole-refused\n", out)
         }
     }
 
