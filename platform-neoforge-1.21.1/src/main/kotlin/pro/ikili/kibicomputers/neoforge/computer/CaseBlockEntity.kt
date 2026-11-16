@@ -258,6 +258,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** サーバーで読み込まれた（[onLoad] の後。アンロード・`setRemoved` で下ろす） */
     private var loadedOnServer = false
 
+    /**
+     * サーバーで [onLoad] を済ませた（ID の `claim` を通した）か。チャンクが FULL になってから `onLoad` が呼ばれるまで
+     * （次の tick のブロックエンティティの処理まで）は偽（#653）
+     */
+    internal val isLoadedOnServer: Boolean get() = loadedOnServer
+
     /** このブロックエンティティの位置（持ち主の照合に使う。`owner.bin` と同じ書き方） */
     val owner: MachineOwner?
         get() = level?.let { MachineOwner(it.dimension().location().toString(), blockPos.x, blockPos.y, blockPos.z) }
