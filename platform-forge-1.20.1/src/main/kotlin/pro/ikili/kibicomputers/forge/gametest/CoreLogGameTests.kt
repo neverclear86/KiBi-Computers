@@ -175,7 +175,9 @@ object CoreLogGameTests {
             }
         }
         // 1.20.1 の `GameTestHelper` は `testInfo` を隠していて、終わりを知らせるリスナーを付けられない。
-        // 代わりに、タイムアウトの少し前に後片付けを走らせる。判定が通らなければ、そのままタイムアウトで失敗する
+        // 成功の経路では、判定がすべて通ったところ（`succeedWhen` の最後）で片付ける。テストが終わると
+        // 予約した処理は走らない（`GameTestInfo.tick` は終わった後に `runAtTickTimeMap` を処理しない）ため。
+        // 判定が通らないままのときは、タイムアウトの少し前に片付け、そのままタイムアウトで失敗させる
         helper.runAfterDelay(TIMEOUT_TICKS - 10L) { cleanUp() }
         try {
             val error = RuntimeException("CoreLogGameTests host failure (not a bug) $mark")
@@ -190,6 +192,8 @@ object CoreLogGameTests {
                 helper.assertTrue(warn.size == 1, "the swallowed exception should reach log4j once as WARN: $events")
                 helper.assertTrue(warn[0].third === error, "the first WARNING should carry the stack trace: ${warn[0]}")
                 helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should keep running as stopped")
+                // ここまで通れば成功する（この関数はもう呼ばれない）
+                cleanUp()
             }
         } catch (t: Throwable) {
             cleanUp()
