@@ -174,6 +174,28 @@ class LuaKibiApiRestoreTest {
     }
 
     @Test
+    fun `parallelの中でタイマーとイベントを待っている間に保存して戻すと、どのコルーチンも続く`() = timeout(limit) {
+        val out = saveAndRestore(
+            """
+            parallel.waitForAll(
+                function() local e = os.pullEvent('restored'); print('a', e) end,
+                function() os.sleep(3); print('b slept') end,
+                function()
+                    print('waiting'); io.stdout:flush()
+                    local e = os.pullEvent('restored'); print('c', e)
+                    parallel.waitForAll(function() os.sleep(0.1); print('d') end)
+                end
+            )
+            print('all')
+            """.trimIndent() + "\n",
+            "waiting\n",
+            Regex("all\n"),
+            AtomicInteger(),
+        )
+        assertEquals("waiting\na\trestored\nc\trestored\nd\nb slept\nall\n", out)
+    }
+
+    @Test
     fun `sleepで待っている間に保存して戻すと、期限まで待って続ける`() = timeout(limit) {
         val out = saveAndRestore(
             "print('waiting'); io.stdout:flush()\nos.sleep(1.5)\nprint('slept')\nprint(peripheral.call('$address', 'echo', 9))\n",

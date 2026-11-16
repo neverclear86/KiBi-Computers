@@ -9,7 +9,9 @@
  * - 時刻: os.epoch・os.day。標準の os.time・os.clock・os.date は上書きしない（意味が CC と違うため。ADR 0094）
  * - 電源: os.shutdown・os.reboot（kibi:computer/power）
  *
- * os.pullEventRaw は、今はその場でカーネルを待つ（コルーチンの中でも yield しない）。#95 でコルーチンのスケジューラーに置き換える前提
+ * コルーチンの中（#95。ADR 0095）: os.pullEventRaw・pullEvent は CC と同じく filter を yield し、resume の値をイベントとして返す
+ * （フィルターをかけるのは resume する側。parallel か、ユーザーのスケジューラー）。os.sleep は startTimer して "timer" を yield し、
+ * id が合うまでくり返す。メインスレッド（メインのチャンクと REPL。コルーチンではない）では、今までどおりその場でカーネルを待つ
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -338,7 +340,23 @@ static void wait_for(lua_State *L, int32_t fd, int64_t deadline) {
 
 /* ---- os の関数 ---- */
 
-/* os.pullEventRaw([filter]) の中身。filter に合わないイベントは捨てる（CC と同じ） */
+/* 今動いているのがメインスレッドなら 1（メインスレッドは yield できないので、その場で待つ） */
+static int on_main_thread(lua_State *L) {
+    int main = lua_pushthread(L);
+    lua_pop(L, 1);
+    return main;
+}
+
+/* "terminate" なら 1 */
+static int is_terminate(lua_State *L, int idx) {
+    if (lua_type(L, idx) != LUA_TSTRING) return 0;
+    return strcmp(lua_tostring(L, idx), "terminate") == 0;
+}
+
+/*
+ * メインスレッドの os.pullEventRaw([filter]) の中身。filter に合わないイベントは捨てる（CC と同じ）。
+ * "terminate" は filter に関係なく返す（CC のスケジューラーと parallel と同じ）
+ */
 static int pull(lua_State *L) {
     const char *filter = luaL_optstring(L, 1, NULL);
     lua_settop(L, 1);
@@ -347,7 +365,7 @@ static int pull(lua_State *L) {
         int n;
         while ((n = fifo_pop(L)) > 0) {
             const char *name = lua_tostring(L, -n);
-            if (filter == NULL || (name != NULL && strcmp(name, filter) == 0)) return n;
+            if (filter == NULL || (name != NULL && (strcmp(name, filter) == 0 || strcmp(name, "terminate") == 0))) return n;
             lua_settop(L, 1);
         }
         collect(L);
@@ -360,15 +378,41 @@ static int pull(lua_State *L) {
     }
 }
 
-static int l_pullEventRaw(lua_State *L) {
-    return pull(L);
+/*
+ * コルーチンの中で filter（nil か文字列）を yield する。resume で渡された値が、そのままイベント（名前, 引数...）になる。
+ * キューはここでも開く（parallel やユーザーのスケジューラーが初めてメインで待つまでに来たイベントを失わないように）。
+ * yield できない文脈（gsub のコールバックなど）では Lua の "attempt to yield across a C-call boundary" のエラーになる
+ */
+static int yield_filter(lua_State *L, lua_KFunction k) {
+    luaL_optstring(L, 1, NULL);
+    lua_settop(L, 1);
+    open_queue(L);
+    return lua_yieldk(L, 1, 0, k);
+}
+
+/* os.pullEventRaw([filter]) */
+int kibi_lua_pull_raw(lua_State *L) {
+    if (on_main_thread(L)) return pull(L);
+    return yield_filter(L, NULL);
+}
+
+/* resume されたイベントが "terminate" なら "Terminated" のエラーにする（位置なし。CC と同じ） */
+static int pull_event_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    (void)ctx;
+    int n = lua_gettop(L);
+    if (n >= 1 && is_terminate(L, 1)) {
+        lua_pushliteral(L, "Terminated");
+        return lua_error(L);
+    }
+    return n;
 }
 
 /* os.pullEvent([filter]): pullEventRaw と同じだが、"terminate" を受けたら "Terminated" のエラーにする（CC と同じ） */
 static int l_pullEvent(lua_State *L) {
+    if (!on_main_thread(L)) return yield_filter(L, pull_event_k);
     int n = pull(L);
-    const char *name = lua_tostring(L, -n);
-    if (name != NULL && strcmp(name, "terminate") == 0) {
+    if (is_terminate(L, -n)) {
         lua_pushliteral(L, "Terminated");
         return lua_error(L);
     }
@@ -386,17 +430,21 @@ static int l_queueEvent(lua_State *L) {
     return 0;
 }
 
-/* os.startTimer(seconds) -> id */
-static int l_startTimer(lua_State *L) {
-    int64_t delay = delay_of(L, 1);
-    int64_t deadline = monotonic_now() + delay;
+/* 期限 [deadline] のタイマーを足して id を返す */
+static lua_Integer add_timer(lua_State *L, int64_t deadline) {
     lua_Integer id = ++next_timer_id;
     push_registry(L, &TIMERS_KEY);
     lua_pushinteger(L, (lua_Integer)deadline);
     lua_rawseti(L, -2, id);
     lua_pop(L, 1);
     timer_count++;
-    lua_pushinteger(L, id);
+    return id;
+}
+
+/* os.startTimer(seconds) -> id */
+static int l_startTimer(lua_State *L) {
+    int64_t delay = delay_of(L, 1);
+    lua_pushinteger(L, add_timer(L, monotonic_now() + delay));
     return 1;
 }
 
@@ -406,11 +454,45 @@ static int l_cancelTimer(lua_State *L) {
     return 0;
 }
 
-/* os.sleep(seconds): その間、時計だけを待つ（イベントは取り出さないので捨てない。CC と違う） */
+/*
+ * コルーチンの中の os.sleep の続き。スタックは [タイマーの id, resume の値...]。
+ * id の合う "timer" なら終わり、"terminate" ならタイマーを外して "Terminated" のエラー、ほかは捨ててまた yield する（CC と同じ）
+ */
+static int sleep_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    (void)ctx;
+    lua_Integer id = lua_tointeger(L, 1);
+    int n = lua_gettop(L);
+    if (n >= 2 && is_terminate(L, 2)) {
+        remove_timer(L, id);
+        lua_pushliteral(L, "Terminated");
+        return lua_error(L);
+    }
+    /* id は float（3.0）で resume されても合う。CC の param == timer と同じく、Lua の数値の等しさで見る */
+    if (n >= 3 && lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "timer") == 0 &&
+        lua_type(L, 3) == LUA_TNUMBER && lua_compare(L, 1, 3, LUA_OPEQ))
+        return 0;
+    lua_settop(L, 1);
+    lua_pushliteral(L, "timer");
+    return lua_yieldk(L, 1, 0, sleep_k);
+}
+
+/*
+ * os.sleep(seconds)
+ * - メインスレッドと、yield できない文脈（コルーチンの中の gsub のコールバックなど）: その場で時計だけを待つ
+ *   （イベントは取り出さないので捨てない。CC と違う。時計しか見ないので、ほかのコルーチンのイベントを奪わない）
+ * - コルーチンの中: startTimer して "timer" を yield し、id が合うまでくり返す（待つ間にこのコルーチンへ来たほかのイベントは捨てる。CC と同じ）
+ */
 static int l_sleep(lua_State *L) {
     int64_t deadline = monotonic_now() + delay_of(L, 1);
-    while (monotonic_now() < deadline) wait_for(L, -1, deadline);
-    return 0;
+    if (on_main_thread(L) || !lua_isyieldable(L)) {
+        while (monotonic_now() < deadline) wait_for(L, -1, deadline);
+        return 0;
+    }
+    lua_settop(L, 0);
+    lua_pushinteger(L, add_timer(L, deadline));
+    lua_pushliteral(L, "timer");
+    return lua_yieldk(L, 1, 0, sleep_k);
 }
 
 static const char *const EPOCH_KINDS[] = {"ingame", "utc", "local", NULL};
@@ -457,7 +539,7 @@ static int l_reboot(lua_State *L) {
 
 static const luaL_Reg FUNCS[] = {
     {"pullEvent", l_pullEvent},
-    {"pullEventRaw", l_pullEventRaw},
+    {"pullEventRaw", kibi_lua_pull_raw},
     {"queueEvent", l_queueEvent},
     {"startTimer", l_startTimer},
     {"cancelTimer", l_cancelTimer},

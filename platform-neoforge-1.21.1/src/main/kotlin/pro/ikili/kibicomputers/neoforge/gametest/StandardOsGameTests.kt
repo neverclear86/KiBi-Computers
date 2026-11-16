@@ -266,4 +266,29 @@ object StandardOsGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+
+    /**
+     * Lua の parallel（#95、ADR 0095）: 標準 OS の `/bin/lua` から、2つのコルーチンが sleep とイベントで待ち合わせて終わる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaParallelRunsCoroutinesTogether(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val script = "local t = {}; parallel.waitForAll(function() os.sleep(0.2); t[#t+1] = 'a'; os.queueEvent('go', 'b') end, " +
+            "function() local _, v = os.pullEvent('go'); t[#t+1] = v end); print('par,' .. table.concat(t))"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, "lua -e \"$script\"")
+                typed = true
+                helper.fail("typed the line")
+            }
+            helper.assertTrue(text.any { it == "par,ab" }, "lua should run parallel: $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
 }

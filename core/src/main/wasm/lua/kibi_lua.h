@@ -4,6 +4,7 @@
  * - kibi_lua_canon.c: cabi_realloc と、呼び出し1回分の確保の記録（arena）、error-code の名前
  * - kibi_lua_peripheral.c: peripheral ライブラリ（kibi:device/bus）
  * - kibi_lua_os.c: os ライブラリの拡張（kibi:kernel/events・kibi:computer/clock・power と poll_oneoff）
+ * - kibi_lua_parallel.c: parallel ライブラリ（#95。ADR 0095）
  * - kibi_linit.c: Lua の linit.c の代わり。標準ライブラリと上の2つを開く
  */
 #ifndef KIBI_LUA_H
@@ -40,5 +41,11 @@ int kibi_lua_utf8_valid(const char *s, size_t len);
 int luaopen_peripheral(lua_State *L);
 /* os のテーブルに KiBi の関数を足す（スタックの上に os のテーブルがあること） */
 void kibi_lua_os_extend(lua_State *L);
+/*
+ * os.pullEventRaw の C 関数。メインスレッドならその場で待ち、コルーチンの中なら filter を yield する。
+ * parallel が次のイベントを取るのに使う（ユーザーが上書きした os.pullEventRaw を通さないため）
+ */
+int kibi_lua_pull_raw(lua_State *L);
+int luaopen_parallel(lua_State *L);
 
 #endif
