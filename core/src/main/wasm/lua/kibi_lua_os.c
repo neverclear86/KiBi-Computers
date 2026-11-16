@@ -468,8 +468,9 @@ static int sleep_k(lua_State *L, int status, lua_KContext ctx) {
         lua_pushliteral(L, "Terminated");
         return lua_error(L);
     }
-    if (n >= 3 && lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "timer") == 0 && lua_isinteger(L, 3) &&
-        lua_tointeger(L, 3) == id)
+    /* id は float（3.0）で resume されても合う。CC の param == timer と同じく、Lua の数値の等しさで見る */
+    if (n >= 3 && lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "timer") == 0 &&
+        lua_type(L, 3) == LUA_TNUMBER && lua_compare(L, 1, 3, LUA_OPEQ))
         return 0;
     lua_settop(L, 1);
     lua_pushliteral(L, "timer");

@@ -507,6 +507,20 @@ class LuaKibiApiTest {
     }
 
     @Test
+    fun `コルーチンの中のsleepはtimerのidがfloatで来ても合う`() = timeout(limit) {
+        val out = run(
+            """
+            local co = coroutine.create(function() os.sleep(1); return "woke" end)
+            coroutine.resume(co)
+            local _, id = os.pullEvent("timer")
+            print(math.type(id), math.type(id + 0.0))
+            print(coroutine.resume(co, "timer", id + 0.0))
+            """.trimIndent(),
+        )
+        assertEquals("integer\tfloat\ntrue\twoke\n", out)
+    }
+
+    @Test
     fun `parallelは関数を並べて動かし、イベントをフィルターごとに配る`() = timeout(limit) {
         val out = run(
             """
