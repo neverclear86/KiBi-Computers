@@ -77,7 +77,14 @@ class BasicCommandsTest {
     /** [run] の結果: コンソールの出力、シェルの終わり方、終わった後のマシンの状態 */
     private class Run(val text: String, val shell: ProcessState?, val machine: MachineState)
 
-    /** `/bin/sh -c [script]` を動かし、シェルが終わる（かマシンが止まる）まで待つ */
+    /**
+     * `/bin/sh -c [script]` を動かし、シェルが終わる（かマシンが止まる）まで待つ。
+     *
+     * [awaitStopped] が true のときは、シェルの終わりでは抜けず、マシンが STOPPED になるまで待つ（#648）。
+     * shutdown はシェルを KILLED にした後、shutdown 自身のプロセスが巻き戻ってから STOPPED になるので、
+     * シェルの終わりだけで抜けると、負荷のときに STOPPING のまま結果を取ってしまう。
+     * 背景プロセスを残すテストで true にすると上限まで止まるので、マシンを止めるテストでだけ使う。
+     */
     private fun run(
         script: String,
         files: Map<String, String> = emptyMap(),
@@ -85,6 +92,7 @@ class BasicCommandsTest {
         maxProcesses: Int = 64,
         memoryBytes: Long = 32L * 1024 * 1024,
         devices: Map<String, Device> = emptyMap(),
+        awaitStopped: Boolean = false,
     ): Run = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
@@ -103,12 +111,21 @@ class BasicCommandsTest {
                 SpawnOptions(args = listOf("sh", "-c", script.trimIndent()), env = env, cwd = "/", fds = SpawnOptions.ROOT_PREOPEN),
             )
             val shell = m.runtime(pid)
-            eventuallyDescribe(200_000, { "終わらない: ${host.text()}" }) {
-                h.scheduler.tick()
-                Thread.sleep(1)
-                m.state == MachineState.STOPPED || m.stateOf(pid).isTerminal
+            if (awaitStopped) {
+                // tick を回し続ける（燃料のスライスや CPU 枠を待つプロセスが巻き戻るのに要る）ので、awaitTermination は使わない
+                eventuallyDescribe(200_000, { "止まらない: state=${m.state} shell=${m.stateOf(pid)} ${host.text()}" }) {
+                    h.scheduler.tick()
+                    Thread.sleep(1)
+                    m.state == MachineState.STOPPED
+                }
+            } else {
+                eventuallyDescribe(200_000, { "終わらない: ${host.text()}" }) {
+                    h.scheduler.tick()
+                    Thread.sleep(1)
+                    m.state == MachineState.STOPPED || m.stateOf(pid).isTerminal
+                }
             }
-            // シェルが終わった後も、止める処理が残っているプロセス（shutdown 自身など）が片付いてマシンが STOPPED になるまで、少し待つ
+            // シェルが終わった後も、止める処理が残っているプロセス（shutdown 自身など）が片付いてマシンが STOPPED になるまで、少し待つ（shutdown のテストは awaitStopped で STOPPED まで待つ）
             val settleDeadline = System.currentTimeMillis() + 2_000
             do {
                 h.scheduler.tick()
@@ -1184,6 +1201,7 @@ class BasicCommandsTest {
             shutdown -h now
             echo after
             """,
+            awaitStopped = true,
         )
         assertEquals(listOf("before", ""), r.text.lines())
         assertEquals(MachineState.STOPPED, r.machine)

@@ -53,7 +53,7 @@ M=.claude/skills/run-minecraft/scripts/mc.sh   # mc.sh <1.21.1|1.20.1> <endpoint
    | `quit` | - | このクライアントを正常に終了する |
    | `screen` | `{"x":0,"y":-60,"z":0,"lines":["hello","こんにちは"],"fg":16777215,"bg":0}`（`pattern: "gradient"` でピクセル画面にグラデーション） | クライアント側の画面ブロックのバッファに直接書く（1.21.1 だけ。画面の同期 #140 ができるまでの描画の確認用） |
 
-5. ログも確認する:
+5. ログも確認する（debug の行は既定では出ない。調べるときは 1.21.1 の `runClient` に `-PdevLogLevel=DEBUG` を付けて起動すると、`run/logs/debug.log` に出る。1.20.1 にはこの指定がなく、付けても無視される。チャンクの読み込みで動かした台は `Wired the computer at ... after loading (result=...)` を1行出す。`result` が `restored` なら戻せた、`cold-boot` なら保存元はあったが冷えた起動にした、`no-source` なら保存元がなく起動した。戻せたとき以外は `restoredEventQueues=-1`）:
    ```bash
    grep -E "kibicomputers|KiBi|self-check|ERROR|Exception" platform-neoforge-1.21.1/run/logs/latest.log
    ```

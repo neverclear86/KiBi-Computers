@@ -47,7 +47,8 @@ neoForge {
     runs {
         configureEach {
             systemProperty("neoforge.enabledGameTestNamespaces", modId)
-            logLevel = org.slf4j.event.Level.INFO
+            // 調べるときは -PdevLogLevel=DEBUG（debug.log に debug の行が出る。#636）
+            logLevel = providers.gradleProperty("devLogLevel").map { org.slf4j.event.Level.valueOf(it.uppercase()) }.getOrElse(org.slf4j.event.Level.INFO)
         }
         register("client") {
             client()

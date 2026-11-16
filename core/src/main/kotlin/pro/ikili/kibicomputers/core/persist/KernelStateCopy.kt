@@ -141,6 +141,7 @@ internal class KernelStateCopy private constructor(
         process.asyncWait = null
         process.asyncStack?.clear()
         FdTable(process, objects, NoopWakeSink).closeAll()
+        process.hostResources.closeAll(objects, NoopWakeSink)
         process.waitTimers.forEach { id -> if (objects[id] != null) objects.release(id, NoopWakeSink) }
         process.waitTimers.clear()
         hostWaits.remove(pid)?.forEach { id -> if (objects[id] != null) objects.release(id, NoopWakeSink) }

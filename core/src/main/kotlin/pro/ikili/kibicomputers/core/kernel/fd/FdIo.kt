@@ -7,6 +7,7 @@ import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.PipeEnd
 import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.io.WriteResult
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
@@ -61,17 +62,30 @@ internal object FdIo {
      * ロックの中で位置を進める（ファイルシステムの I/O をロックの外で行うため。#52。ADR 0052）。
      * その間は [OpenFile.withPositionLock] の中で行い、同じ開いたファイルへのほかの読み書きと重ならないようにする（#431）
      */
-    fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult {
+    fun read(ctx: ProcessContext, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult =
+        readHandle(ctx, dst, off, len) { kernel -> kernel.processes[ctx.pid]?.handles?.get(fd) }
+
+    /**
+     * [read] の中身。ハンドルのエントリを、fd 表ではなく [resolve]（カーネルロックの中で呼ぶ。なければ `null` で `BADF`）から引く
+     * （p2 の stream は、ホストの resource の表に同じ形のエントリを持つ。#267）
+     */
+    inline fun readHandle(ctx: ProcessContext, dst: ByteArray, off: Int, len: Int, crossinline resolve: (KernelState) -> HandleEntry?): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
         var file: OpenFile? = null
         val r = ctx.withKernelLock {
-            val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.READ)
-            if (f == null) return@withKernelLock readLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, dst, off, len)
+            val entry = resolve(ctx.kernel) ?: return@withKernelLock IoResult.Error(Errno.BADF)
+            val f = openFileOf(ctx.kernel, entry, HandleRights.READ)
+            if (f == null) return@withKernelLock readEntryLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, entry, dst, off, len)
             file = f
             null
         }
         if (r != null) return r
-        val f = file!!
+        return readFile(ctx, file!!, dst, off, len)
+    }
+
+    /** ファイルの読み（カーネルロックの外。[read] を見よ） */
+    @PublishedApi
+    internal fun readFile(ctx: ProcessContext, f: OpenFile, dst: ByteArray, off: Int, len: Int): IoResult {
         return f.withPositionLock {
             val position = ctx.withKernelLock { f.position }
             val n = try {
@@ -84,17 +98,17 @@ internal object FdIo {
         }
     }
 
-    /** [fd] が読み・書きの権利 [right] を持つファイル（[OpenFile]）を指していれば、それ（カーネルロックの中）。ほかは `null` */
-    private fun openFileLocked(kernel: KernelState, pid: Int, fd: Int, right: Int): OpenFile? {
-        val process = kernel.processes[pid] ?: return null
-        val entry = process.handles[fd] ?: return null
+    /** [entry] が読み・書きの権利 [right] を持つファイル（[OpenFile]）を指していれば、それ（カーネルロックの中）。ほかは `null` */
+    @PublishedApi
+    internal fun openFileOf(kernel: KernelState, entry: HandleEntry, right: Int): OpenFile? {
         if (entry.rights and right == 0) return null
         return kernel.objects[entry.objectId] as? OpenFile
     }
 
     // ファイルへの書き込み（カーネルロックの外。位置はロックの中で読み書きする）。[OpenFile.withPositionLock] で、同じ開いたファイルへの
     // ほかの読み書きと重ならないようにする（位置を読んでから進めるまでに割り込まれると、互いのバイトを上書きする。#431）
-    private fun writeFile(ctx: ProcessContext, file: OpenFile, src: ByteArray, off: Int, len: Int): IoResult = file.withPositionLock {
+    @PublishedApi
+    internal fun writeFile(ctx: ProcessContext, file: OpenFile, src: ByteArray, off: Int, len: Int): IoResult = file.withPositionLock {
         try {
             if (file.append) {
                 val w = ctx.vfs.append(file, src, off, len)
@@ -116,18 +130,23 @@ internal object FdIo {
      * （[ProcessContext.flushConsole]。#355）。書くことは、書いたのと同じカーネルロックの中で予約する
      * （[ProcessContext.reserveConsoleFlushLocked]。その間に、メインスレッドが書き手のいない出力として取り出さないように。#419）
      */
-    fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
+    fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult =
+        writeHandle(ctx, src, off, len) { kernel -> kernel.processes[ctx.pid]?.handles?.get(fd) }
+
+    /** [write] の中身。エントリの引き方は [readHandle] と同じ */
+    inline fun writeHandle(ctx: ProcessContext, src: ByteArray, off: Int, len: Int, crossinline resolve: (KernelState) -> HandleEntry?): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         var flush = false
         var file: OpenFile? = null
         val r = ctx.withKernelLock {
-            val f = openFileLocked(ctx.kernel, ctx.pid, fd, HandleRights.WRITE)
+            val entry = resolve(ctx.kernel) ?: return@withKernelLock IoResult.Error(Errno.BADF)
+            val f = openFileOf(ctx.kernel, entry, HandleRights.WRITE)
             if (f != null) {
                 file = f
                 return@withKernelLock null
             }
-            val console = isConsoleLocked(ctx.kernel, ctx.pid, fd)
-            val written = writeLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, ctx.pid, fd, src, off, len)
+            val console = isConsole(ctx.kernel, entry)
+            val written = writeEntryLocked(ctx.kernel, ctx.vfs, ctx.wakeSink, entry, src, off, len)
             if (console && written is IoResult.Bytes && written.count > 0) {
                 ctx.reserveConsoleFlushLocked()
                 flush = true
@@ -139,13 +158,11 @@ internal object FdIo {
         return r
     }
 
-    // fd [fd] がコンソールの TTY を指すか
-    private fun isConsoleLocked(kernel: KernelState, pid: Int, fd: Int): Boolean {
+    /** [entry] がコンソールの TTY を指すか（カーネルロックの中） */
+    @PublishedApi
+    internal fun isConsole(kernel: KernelState, entry: HandleEntry): Boolean {
         val id = kernel.consoleTtyId
-        if (id == 0) return false
-        val process = kernel.processes[pid] ?: return false
-        val entry = process.handles[fd] ?: return false
-        return entry.objectId == id
+        return id != 0 && entry.objectId == id
     }
 
     /** 読めるまで待って読む（`BLOCKING` のプロセスのスレッドから）。[IoResult.WouldBlock] は返さない */
@@ -186,12 +203,21 @@ internal object FdIo {
         require(condition == WaitCondition.READABLE || condition == WaitCondition.WRITABLE) { "fd で待てる条件ではない: $condition" }
         val reading = condition == WaitCondition.READABLE
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
-        // 判定は状態を変えないので、知らせ口は使わない
-        val table = FdTable(process, kernel.objects, WakeSink.NONE)
+        val entry = process.handles[fd] ?: return FdReadiness.Error(Errno.BADF)
+        return pollEntryLocked(kernel, vfs, entry, condition)
+    }
+
+    /**
+     * [pollLocked] の中身。fd 表ではなく、解決済みの [entry] で判定する（p2 の pollable。#267）。ファイルの読みの残りの目安は
+     * [OpenFile.position] からのもの
+     */
+    fun pollEntryLocked(kernel: KernelState, vfs: Vfs, entry: HandleEntry, condition: WaitCondition): FdReadiness {
+        require(condition == WaitCondition.READABLE || condition == WaitCondition.WRITABLE) { "fd で待てる条件ではない: $condition" }
+        val reading = condition == WaitCondition.READABLE
         return try {
-            val entry = table.entry(fd)
             if (entry.rights and (if (reading) HandleRights.READ else HandleRights.WRITE) == 0) return FdReadiness.Error(Errno.BADF)
-            val obj = resolvePipe(kernel, table.objectOf(fd), reading) ?: return FdReadiness.Error(Errno.BADF)
+            val target = checkNotNull(kernel.objects[entry.objectId]) { "ハンドルが指すオブジェクト ${entry.objectId} がない" }
+            val obj = resolvePipe(kernel, target, reading) ?: return FdReadiness.Error(Errno.BADF)
             when (obj) {
                 is ByteStream -> when {
                     !obj.isReady(condition) -> FdReadiness.Pending(WaitKey(obj.id, condition))
@@ -231,11 +257,17 @@ internal object FdIo {
     fun readLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, pid: Int, fd: Int, dst: ByteArray, off: Int, len: Int): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
-        val table = FdTable(process, kernel.objects, sink)
+        val entry = process.handles[fd] ?: return IoResult.Error(Errno.BADF)
+        return readEntryLocked(kernel, vfs, sink, entry, dst, off, len)
+    }
+
+    /** [readLocked] の中身（解決済みの [entry] から読む。ファイルはその場で読むので、プロセスからは [readHandle] を使う） */
+    fun readEntryLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, entry: HandleEntry, dst: ByteArray, off: Int, len: Int): IoResult {
+        if (off < 0 || len < 0 || off.toLong() + len > dst.size) return IoResult.Error(Errno.FAULT)
         return try {
-            val entry = table.entry(fd)
             if (entry.rights and HandleRights.READ == 0) return IoResult.Error(Errno.BADF)
-            val obj = resolvePipe(kernel, table.objectOf(fd), reading = true) ?: return IoResult.Error(Errno.BADF)
+            val target = checkNotNull(kernel.objects[entry.objectId]) { "ハンドルが指すオブジェクト ${entry.objectId} がない" }
+            val obj = resolvePipe(kernel, target, reading = true) ?: return IoResult.Error(Errno.BADF)
             when (obj) {
                 is ByteStream -> when (val r = obj.read(dst, off, len, sink)) {
                     is ReadResult.Bytes -> IoResult.Bytes(r.count)
@@ -264,11 +296,17 @@ internal object FdIo {
     fun writeLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, pid: Int, fd: Int, src: ByteArray, off: Int, len: Int): IoResult {
         if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
-        val table = FdTable(process, kernel.objects, sink)
+        val entry = process.handles[fd] ?: return IoResult.Error(Errno.BADF)
+        return writeEntryLocked(kernel, vfs, sink, entry, src, off, len)
+    }
+
+    /** [writeLocked] の中身（解決済みの [entry] へ書く） */
+    fun writeEntryLocked(kernel: KernelState, vfs: Vfs, sink: WakeSink, entry: HandleEntry, src: ByteArray, off: Int, len: Int): IoResult {
+        if (off < 0 || len < 0 || off.toLong() + len > src.size) return IoResult.Error(Errno.FAULT)
         return try {
-            val entry = table.entry(fd)
             if (entry.rights and HandleRights.WRITE == 0) return IoResult.Error(Errno.BADF)
-            val obj = resolvePipe(kernel, table.objectOf(fd), reading = false) ?: return IoResult.Error(Errno.BADF)
+            val target = checkNotNull(kernel.objects[entry.objectId]) { "ハンドルが指すオブジェクト ${entry.objectId} がない" }
+            val obj = resolvePipe(kernel, target, reading = false) ?: return IoResult.Error(Errno.BADF)
             when (obj) {
                 is ByteStream -> when (val r = obj.write(src, off, len, sink)) {
                     is WriteResult.Bytes -> IoResult.Bytes(r.count)

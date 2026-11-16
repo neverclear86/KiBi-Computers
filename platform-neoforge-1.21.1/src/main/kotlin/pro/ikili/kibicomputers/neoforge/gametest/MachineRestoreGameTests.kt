@@ -174,6 +174,42 @@ object MachineRestoreGameTests {
     }
 
     /**
+     * 有効な ID と書けた世代を持つ電源の入ったケースが FULL になったばかりのチャンクにあり、`onLoad` の前に FULL に戻った経路
+     * （`restorePromoted`）が来ても、そこでは順番待ちに入らず、`onLoad` が ID の `claim` を通してから順番待ちに入って、
+     * 保存した世代から戻る（冷えた起動にならない。#653）。`restorePromoted` が呼ぶ `restorePromotedCase` を、置き直した直後
+     * （次の tick の `onLoad` の前）に呼んで、通しで確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoresAPromotedChunkCaseAfterOnLoad(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            helper.assertTrue(tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "a running case should save PoweredOn: $tag")
+            val be = reload(helper, tag)
+            copy = be
+            helper.assertTrue(!be.isLoadedOnServer, "onLoad should not have run yet")
+            // FULL に戻った経路が onLoad の前に来た
+            ServerMachines.restorePromotedCase(be)
+            helper.assertTrue(!be.computer.isRestorePending, "the promoted path should not queue the case before onLoad: ${be.computer}")
+        }.thenWaitUntil {
+            val be = copy!!
+            helper.assertTrue(be.isLoadedOnServer, "onLoad should run")
+            assertRestored(helper, be)
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreSource != null && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
+                    "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, ${be.computer}",
+            )
+            be.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
      * 戻すと、キーを打つ前にシェルがプロンプトと入力中の行を描き直す（`restored` イベント。#87、ADR 0087）。画面も置き直して
      * （ワールドを読み込み直したときと同じく、表示は空から始まる）、描き直しが前の画面の残りでないことを確かめる
      */
@@ -204,6 +240,8 @@ object MachineRestoreGameTests {
             helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
             val screen = be.wiring.connectedScreen
             helper.assertTrue(screen != null, "the screen should be connected after restoring")
+            // シェルが restored を受けるキューを開いていた（#636 の切り分けのログに出す数。0 なら描き直さない）
+            helper.assertTrue(machine!!.restoredEventQueues >= 1, "restored should reach the shell's queue: ${machine.restoredEventQueues}")
             val text = lines(screen!!.text)
             helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line without a key: $text")
         }.thenExecute {
@@ -214,6 +252,55 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(copy!!.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "pending" }, "the restored shell should run the redrawn line: $text")
+        }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * Esc を押した後（シェルがエスケープシーケンスの続きを待っている間）に保存しても、戻すとキーを打つ前に行を描き直す（#636）。
+     * キーボードの画面で Esc を押して閉じようとすると Esc がコンピューターに届くので、この形で保存されることがある
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoredShellRedrawsAfterEscape(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        fun send(event: KeyboardEvent) {
+            for (packet in KeyboardEventCodec.encode(listOf(event))) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
+            }
+        }
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            send(KeyboardEvent.Text("echo pending"))
+        }.thenWaitUntil {
+            val text = lines(first.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the typed text should be shown: $text")
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next key")
+        }.thenExecute {
+            send(KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
+            // Esc は、シェルが読んでエスケープシーケンスの続きを待つまで保存しない。待機点かどうかだけでは、Esc を読み終えたかは分からない
+            // （Esc が TTY に残ったままでも待機点で、戻したシェルはキーの境目の待ちで描き直せてしまう）ので、Esc を届けて読ませるのに十分な
+            // 時間を置く。読み終えたことの決定的な確認は、core の StandardOsRestoreTest（TTY の入力が空であることを見る）
+        }.thenIdle(20).thenWaitUntil {
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the rest of the escape sequence")
+        }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            helper.setBlock(SCREEN, Blocks.AIR)
+            helper.setBlock(
+                SCREEN,
+                KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+            )
+            copy = reload(helper, tag)
+        }.thenWaitUntil {
+            val be = copy!!
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
+            val screen = be.wiring.connectedScreen
+            helper.assertTrue(screen != null, "the screen should be connected after restoring")
+            val text = lines(screen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line after Esc: $text")
         }.thenExecute {
             copy!!.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)

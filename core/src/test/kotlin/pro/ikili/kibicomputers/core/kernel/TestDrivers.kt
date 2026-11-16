@@ -219,6 +219,33 @@ internal fun eventuallyDescribe(timeoutMillis: Long = 5_000, describe: () -> Str
 }
 
 /**
+ * init が CPU を取って動き出し、専用スレッドの登録を済ませた（`register()` の後・`unregister()` の前）か。
+ *
+ * RUNNING が見えても、init の専用スレッドはまだ `register()` の前のことがある。その間に reboot・stop・写しの kill が入ると、
+ * register が KILLED にして unregister（beforeUnregister のフック）を通らないので、止まり切る前の場面を作れない（#542、#624、#683）。
+ * CREATED を抜けるのは register → CPU の取得 → load の後なので、BLOCKING の init（専用スレッドを実行の間ずっと登録している。
+ * FakeModule の init など）なら、CREATED でも終了でもないことが、登録済みであることの保証になる。
+ * 待機点型の init（step の間だけスレッドを登録する）には使えない。イベント待ちや燃料待ちでは、どの瞬間もスレッドが外れていて、
+ * この条件は「step の最中」の保証にならない。待機点型で reboot などを step の最中に当てたいテストは、別の同期を使う。
+ * CREATED の条件は落とさない（写しは CREATED を待機点として殺さないので、写しのテストがそれに頼る）。
+ * 状態はカーネルロックの中で読む。テストのスレッドがカーネルロックを持ったまま呼ばない
+ */
+internal fun Machine.isInitStarted(): Boolean = lock.withLockValue {
+    val pid = kernel.initPid
+    val p = if (pid == 0) null else kernel.processes[pid]
+    state == MachineState.RUNNING && !isBooting && p != null &&
+        p.state != ProcessState.CREATED && !p.state.isTerminal
+}
+
+/** [Machine.isInitStarted] になるまで tick を進める */
+internal fun Harness.tickUntilInitStarted(m: Machine, timeoutMillis: Long = 10_000) =
+    eventually(timeoutMillis, "init が CPU を取らない") {
+        scheduler.tick()
+        Thread.sleep(1)
+        m.isInitStarted()
+    }
+
+/**
  * 後段の失敗で CRASHED を見た後、後始末が終わるまで待ってから tick する（#669。MachineRestoreTest と MachineRestoreBranchesTest が使う）。
  *
  * state はロックを取らずに読むので、stopLocked の途中（setStateLocked(CRASHED) の直後で、復元の quiesce を閉じる前、

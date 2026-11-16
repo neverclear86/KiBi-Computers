@@ -550,9 +550,12 @@ static int return_taken(lua_State *L, kibi_device_option_result_values_t *o, con
  * その場で終わったもの（直接のメソッド、その場で失敗するもの）は結果を返し、終わっていなければ待っている呼び出しの表に入れて
  * "task_complete" を yield する。カーネルの上限（again）に当たったら、invoke でその場で待つ。
  * start の前に take の結果の場所（INVOKE_RESULT_BYTES）まで確かめる（invoke_now と同じ。足りなければメソッドは動かさずに
- * "not enough memory" のエラー）。start の後は arena を戻さず、取った場所を take に使う（Lua の確保は間にない）
+ * "not enough memory" のエラー）。start の後は arena を戻さず、取った場所を take に使う（Lua の確保は間にない）。
+ * yield する "task_complete" の文字列は、呼び出し側（call_device）が device を開く前にスタックの一番上へ積んである
+ * （lua_pushliteral は内部化の確保や GC の 1 歩で longjmp しうるので、start の後・表に入れた後には積まない）
  */
 static int start_and_yield(lua_State *L, uint32_t fd, const call_t *c) {
+    const int complete = lua_gettop(L);
     reserve_or_close(L, fd, INVOKE_RESULT_BYTES);
     kibi_device_result_handle_t r;
     kibi_device_start(fd, c->m, c->mlen, c->args, (size_t)c->n, &r);
@@ -576,16 +579,19 @@ static int start_and_yield(lua_State *L, uint32_t fd, const call_t *c) {
         return return_taken(L, &o, c);
     }
     kibi_lua_arena_reset();
-    /* 表へ入れてから yield する（ここから yield までに Lua の確保で longjmp するものはない） */
+    /* 表へ入れてから yield する。ここから yield までは Lua の確保を伴う API（pushstring・pushliteral など）を呼ばない
+     * （lua_pushvalue・lua_pushinteger・lua_copy・lua_settop は確保も GC もしない）。"task_complete" は積んである文字列を使う */
     task_t *t = &tasks[task_count++];
     t->fd = call;
     t->id = ++next_task_id;
     t->method_len = (uint8_t)c->mlen;
     memcpy(t->method, c->m, c->mlen);
     int64_t id = t->id;
-    lua_settop(L, 0);
+    lua_pushvalue(L, complete);
     lua_pushinteger(L, (lua_Integer)id);
-    lua_pushliteral(L, "task_complete");
+    lua_copy(L, -1, 1);
+    lua_copy(L, -2, 2);
+    lua_settop(L, 2);
     return lua_yieldk(L, 1, 0, call_k);
 }
 
@@ -604,6 +610,8 @@ static int call_device(lua_State *L, const address_t *a, const char *kind, size_
     /* 表がいっぱいなら、終わったものを回収してから（device を開く前に。回収のエラーで fd を漏らさない） */
     if (yield && task_count >= MAX_TASKS) kibi_lua_tasks_collect(L);
     if (task_count >= MAX_TASKS) yield = 0;
+    /* yield する文字列は、device を開く前に積む（longjmp しても fd を漏らさず、start の後に Lua の確保をしない） */
+    if (yield) lua_pushliteral(L, "task_complete");
     uint32_t fd = open_checked(L, a, kind, kind_len);
     if (!yield) return invoke_now(L, fd, &c);
     return start_and_yield(L, fd, &c);

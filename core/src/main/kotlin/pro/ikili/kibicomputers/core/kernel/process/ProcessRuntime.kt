@@ -51,7 +51,11 @@ internal class ProcessRuntime(
     /** WASM のスタックがある（step の途中、専用スレッドが動いている間）。待機点かの判定に使う */
     var stackActive: Boolean = false
 
-    /** 線形メモリの使用量（#39。すべてのインスタンスの合計。インスタンスを閉じると減る） */
+    /**
+     * 線形メモリの使用量（#39。すべてのインスタンスの合計。インスタンスを閉じると減る）。
+     * コンポーネントの core インスタンスの固定費（#270。[coreInstanceOverheadBytes]）もここに含む。
+     * 固定費はインスタンスを閉じても減らず、プロセスの終わり（`finishLocked`）にまとめて返す
+     */
     val memory: ProcessMemory = machine.memoryAccount.process(machine.config.maxProcessMemoryPages)
 
     /**
@@ -77,6 +81,12 @@ internal class ProcessRuntime(
      * プロセスのスレッドだけが使う（中の core インスタンスは [instances] にも入れてある）
      */
     var component: LinkedComponent? = null
+
+    /**
+     * コンポーネントの core インスタンスの固定費として RAM（[memory]）に数えたバイト数（#270。[CORE_INSTANCE_OVERHEAD_BYTES] × 作り始めた数）。
+     * カーネルロックの中で読み書きし、プロセスの終わり（`finishLocked`）にまとめて返して 0 にする
+     */
+    var coreInstanceOverheadBytes: Long = 0
 
     /** 今の待ち */
     var waitSet: WaitSet? = null

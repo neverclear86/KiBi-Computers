@@ -23,7 +23,15 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
  * テストでは既定のまま（何もしない）でよい
  */
 internal interface LinkEnv {
-    /** core インスタンスを作る設定に、場所が決めるもの（メモリ・テーブルの上限、燃料切れの処理）を足す */
+    /**
+     * core インスタンスを作る設定に、場所が決めるもの（メモリ・テーブルの上限、燃料切れの処理）を足す。
+     *
+     * 口の約束: core インスタンス 1 つにつき、そのインスタンスを作る直前にちょうど 1 回呼ぶ（作らない段では呼ばない。同じインスタンスに 2 回呼ばない）。
+     * 作ったら [onInstanceCreated] が続く（start 関数のトラップなどで作り終えられなければ続かない）。
+     * 場所は、この呼び出しを「これから core インスタンスを 1 つ作る」知らせとして使ってよい。カーネルは、ここで core インスタンスの固定費を RAM に
+     * 数える（#270）ので、[pro.ikili.kibicomputers.core.runtime.WasmLinkException]（RAM が足りない）や
+     * `ProcessKilledException`（止められた）を投げることがある。投げたら、そのインスタンスは作らない
+     */
     fun configure(builder: WasmInstanceConfig.Builder) {}
 
     /** canon lower で作るホストの関数（core の import）を包む（カーネルなら、呼んだインスタンスの照合） */

@@ -22,8 +22,8 @@ internal enum class CanonStringEncoding(val code: Int) {
  * ゲストの `realloc`（canon の `realloc` option。`(old_ptr, old_size, align, new_size) -> ptr`）。値はどれも u32 のビット列。
  *
  * ゲストの呼び出しなので、呼ぶ側（#263 のリンカー）が `ctx.callGuest { }` の中で呼び、燃料はゲストの分として数える
- * （ADR 0073 の「cabi_realloc の呼び出し」）。realloc が別の core インスタンスにあるなら燃料の holder を切り替え
- * （`ctx.switchFuelHolder`。#270）、呼んでいる間はそのインスタンスの `may_leave` を下ろす（ADR 0264）。
+ * （ADR 0073 の「cabi_realloc の呼び出し」）。core インスタンスはみな燃料のグローバルを共有するので、realloc が別の core インスタンスに
+ * あっても燃料の holder は切り替えない（#270。ADR 0263）。呼んでいる間はそのインスタンスの `may_leave` を下ろす（ADR 0264）。
  * 返した場所の align と範囲は [CanonContext] が確かめる
  */
 internal fun interface CanonRealloc {

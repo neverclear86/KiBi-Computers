@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceCompletion
 import pro.ikili.kibicomputers.api.device.DeviceContext
@@ -49,6 +51,9 @@ class LuaKibiApiTest {
         /** main-mark が動いた回数 */
         val marks = AtomicInteger()
 
+        /** `big` を呼んだ回数 */
+        val bigCalls = AtomicInteger()
+
         @Volatile
         var context: DeviceContext? = null
 
@@ -75,6 +80,10 @@ class LuaKibiApiTest {
                 emptyArray()
             }
             .direct("posted") { _, _ -> arrayOf(DeviceValue.of(posted)) }
+            .direct("big") { _, args ->
+                bigCalls.incrementAndGet()
+                arrayOf(DeviceValue.of("b".repeat(args.getLong(0).toInt())))
+            }
             .mainThread("main-echo") { _, args ->
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
@@ -173,6 +182,20 @@ class LuaKibiApiTest {
             return out
         }
 
+        /**
+         * Lua が待っている間に、マシンの RAM の残りがちょうど [remaining] バイトになるように、テストの側で予約する（#729）。
+         * 予約したバイト数を返す（[release] で戻す）。待っている間は Lua が書かないので、起きた後の残りが決まる
+         */
+        fun squeeze(remaining: Long): Long {
+            waitUntil("待たない: $text") { m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            val account = m.memoryAccount
+            val bytes = account.limitBytes - account.usedBytes - remaining
+            assertTrue(bytes >= 0 && account.tryReserveBytes(bytes), "残りを $remaining にできない: ${account.usedBytes}")
+            return bytes
+        }
+
+        fun release(bytes: Long) = m.memoryAccount.releaseBytes(bytes)
+
         fun finish(expected: ProcessState = ProcessState.EXITED): String {
             waitUntil("終わらない: $text") { m.stateOf(pid).isTerminal }
             val out = drain()
@@ -210,7 +233,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
+                "big,echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -820,16 +843,17 @@ class LuaKibiApiTest {
     }
 
     /**
-     * RAM をほぼ使い切って（4000 バイトの文字列を持つ要素を、Lua の使用量が 290 KB になるまで積む。RAM の上限は 512 KB）、
-     * 新しい 12 個（約 48 KB）だけ解放する Lua のコード。空きは 1 つながりの穴になり、take の結果の場所（約 66 KiB）には足りず、
-     * Lua の確保と take_kernel_events の分（約 39 KiB）は入る。RAM の残りが使い切る前で止まるのは、使い切ると Lua 自身も動けなくなるため
-     * （kibi_lua_realloc は残りが 8 KiB 未満なら、穴があっても断る）。
-     * 一度ここまで絞ると、解放しても大きな場所は取れなくなる（RAM は解放しても減らない。#370）ので、元に戻す関数は用意しない
+     * 結果の場所（約 66 KiB）が入る解放済みの穴を、先に潰しておく Lua のコード。4000 バイトの文字列を持つ要素を、Lua の使用量が [kb] KB になるまで積み、
+     * 新しい 12 個（約 48 KB）だけ解放する。空きは 1 つながりの 48 KB の穴になり、take の結果の場所（約 39 KiB）には足りるが、
+     * 回収の結果の場所（約 66 KiB）には足りない（それまでの呼び出しが残した大きな穴は、この積みで使われる）。
+     * これは穴の形を整えるだけで、残りは決めない。残りは、この後 Lua が os.sleep で待つ間に、[Run.squeeze] でバイト単位に合わせる
+     * （埋めながら試す形は、残りが 4 KiB 単位で減り、スレッドの動き方で結果が変わるので使わない。ADR 0094）。
+     * 一度絞ると、解放しても大きな場所は取れなくなる（RAM は解放しても減らない。#370）ので、元に戻す関数は用意しない
      */
-    private val squeeze = """
+    private val shapeHole = """
         local keep = {}
-        local function squeeze()
-            while collectgarbage("count") < 290 do keep.head = {keep.head, string.rep("x", 4000)} end
+        local function shapeHole(kb)
+            while collectgarbage("count") < kb do keep.head = {keep.head, string.rep("x", 4000)} end
             for i = 1, 12 do keep.head = keep.head[1] end
             collectgarbage()
         end
@@ -837,16 +861,19 @@ class LuaKibiApiTest {
 
     @Test
     fun `RAMが足りないコルーチンの呼び出しは、メソッドを動かさずにnot enough memoryになり、fdを漏らさない`() = timeout(limit) {
+        // 残りは 76 KiB: 結果の場所（約 66 KiB）を取る kibi_lua_reserve は断られ（kibi_lua_realloc は KIBI_LUA_KEEP の 16 KiB を残す）、
+        // 残りが KEEP + STACK_GUARD（32 KiB）より上なので、C のスタックは数えず、Lua 自身の小さな確保は通る（ADR 0094 の #729）。
+        // 残りは、Lua が os.sleep で待つ間に、テストの側でバイト単位に合わせる（埋めながら試す形は使わない）
         Run(
             """
-            $squeeze
             local addr = "$ADDRESS"
             local cos, res = {}, {}
             for i = 1, 5 do
                 cos[i] = coroutine.create(function() return peripheral.call(addr, "main-echo", i) end)
                 res[i] = false
             end
-            squeeze()
+            print("ready"); io.stdout:flush()
+            os.sleep(2)
             for i = 1, 5 do
                 local ok, e = coroutine.resume(cos[i])
                 res[i] = ok and "started" or e
@@ -858,20 +885,26 @@ class LuaKibiApiTest {
             """.trimIndent(),
             memoryBytes = 512 * 1024L,
         ).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(76 * 1024)
             r.waitFor("done\n")
             // 断られた呼び出しは積まれていない（積んでから断ると、fd も表に残る）
             assertEquals(0, r.openCallFds())
             // 断られたメソッドは動いていない（積まれていれば、待つ間に動く）
             assertEquals(0, r.dev.mainCalls.get())
-            assertEquals("not enough memory,not enough memory,not enough memory,not enough memory,not enough memory\ndone\n", r.finish())
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\nnot enough memory,not enough memory,not enough memory,not enough memory,not enough memory\ndone\n", out)
         }
     }
 
     @Test
     fun `RAMが足りなくて回収できないときは、Luaのエラーになって要素を表に残し、トラップにならない`() = timeout(limit) {
+        // 残りは 76 KiB（上のテストと同じ理由で、結果の場所の reserve だけが断られる。イベントを取り出す分の約 39 KiB は取れる）。
+        // 2つの呼び出しが終わった後に絞り、回収（pullEvent・queueEvent）を通す
         Run(
             """
-            $squeeze
+            $shapeHole
             local addr = "$ADDRESS"
             local cos = {}
             for i = 1, 2 do cos[i] = coroutine.create(function() return peripheral.call(addr, "main-gate", 6 + i) end) end
@@ -880,7 +913,9 @@ class LuaKibiApiTest {
             for i = 1, 2 do coroutine.resume(cos[i]) end
             print("started"); io.stdout:flush()
             repeat os.sleep(0.05) until peripheral.call(addr, "posted")
-            squeeze()
+            shapeHole(200)
+            print("ready"); io.stdout:flush()
+            os.sleep(2)
             -- 回収の reserve が断られる（os.queueEvent も同じ回収を通る）。何度でも Lua のエラーになる
             local ok1, e1 = pcall(pull)
             local ok2, e2 = pcall(pull)
@@ -896,13 +931,16 @@ class LuaKibiApiTest {
             r.waitUntil("2つの呼び出しが来ない") { r.dev.gates.size == 2 }
             r.dev.release()
             r.dev.posted = true
+            r.waitFor("ready\n")
+            val held = r.squeeze(76 * 1024)
             r.waitFor("done\n")
             // 終わった結果は写せるまで表に残る（写し終えていないものを閉じない）
             assertEquals(2, r.openCallFds())
-            assertEquals("started\nnot enough memory\tnot enough memory\tnot enough memory\ndone\n", r.finish())
+            val out = r.finish()
+            r.release(held)
+            assertEquals("started\nready\nnot enough memory\tnot enough memory\tnot enough memory\ndone\n", out)
         }
     }
-
 
     @Test
     fun `startがagainを返したら、コルーチンの中でもinvokeでその場で待つ`() = timeout(limit) {
@@ -920,6 +958,125 @@ class LuaKibiApiTest {
             }
             assertEquals("true\t5\t6\ndead\n", r.finish())
             assertEquals(2, r.dev.mainCalls.get())
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [24, 28, 31, 40])
+    fun `RAMの上限の近くでイベントを読み続けても、Cのスタックが深くなる所でトラップにならない`(remainingKib: Long) = timeout(limit) {
+        // #729 の再現。上限の近くで、表に足す・queueEvent・pullEventRaw をくり返す。
+        // 直す前は、pullEventRaw の中で初めて深くなった C のスタック（上端から 8〜12 KiB）への書き込みがトラップになっていた。
+        // 関数は pcall の外で先に作る（ループの本体で作ると、確保が断られたときに、pullEventRaw の入れ子を一度も通らずに終わる）。
+        // ループが最後まで回ったことと、pullEventRaw が1回でも成功した（入れ子を通った）ことを確かめる。
+        // 残りが約 22 KiB 以下だと、スタックを数える commit（残りを MIN の 8 KiB 残す）が最初の確保から断られ、入れ子まで届かないので、それより上の値だけを使う
+        // （その下の帯は、次のテストで確かめる）。この形は、直す前の kibi_wasi.c・kibi_lua_canon.c で回しても CRASHED にならないことがあり、
+        // 直したことの決め手ではない。上限の近くの経路を通して CRASHED にならないことを確かめる
+        val script = """
+            local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
+            local t = {}
+            local grow = function() t[#t + 1] = rep("y", 16) end
+            local pulled, called = 0, 0
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 400 do
+                pc(grow)
+                pc(q, p)
+                local ok = pc(pe)
+                called = called + 1
+                if ok then pulled = pulled + 1 end
+            end
+            -- 上限の近くでは数値の文字列化も断られるので、結果は確保しない文字列（定数）で出す
+            io.stdout:write(called == 400 and "loop-ok\n" or "loop-short\n")
+            io.stdout:write(pulled > 0 and "pulled\n" or "not-pulled\n")
+            t = nil
+            collectgarbage()
+            print("done")
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            // CRASHED にならず、Lua として終わる。ループの回数と、pullEventRaw が1回でも通ったかを見る
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\nloop-ok\npulled\ndone\n", out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [8, 12, 16, 20])
+    fun `RAMの残りがスタックを数えられないほど少なくても、イベントを読み続けてトラップにならず、穴の使い回しも断られる`(remainingKib: Long) = timeout(limit) {
+        // #729 の元の形（512 KiB を埋め続ける）が必ず通る、低い残りの帯で、CRASHED にならない（Lua として終わる）ことを確かめる。
+        // 残りが約 22 KiB 以下だと、スタックを数える commit（後に MIN の 8 KiB を残す）が断られるので、kibi_lua_realloc は
+        // 解放した穴に収まる確保も含めてすべて NULL を返す（ADR 0094。スタックを守れないまま続けると、深くなったスタックがトラップになるため）。
+        // 起きてすぐの、穴（先に作った 48 KiB）に収まる小さな確保が断られること（スタックを数えない形なら、この帯でも使い回せる）と、
+        // ループが確保を断られながら最後まで回ることを見る。
+        // この形は、直す前の kibi_wasi.c・kibi_lua_canon.c でも CRASHED にはならなかった（この帯でトラップを決まった形で再現できてはいない）
+        val script = """
+            local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
+            local t = {}
+            local grow = function() t[#t + 1] = rep("y", 16) end
+            local called = 0
+            local s = ("z"):rep(48 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            local hole = pc(rep, "h", 1024)
+            for i = 1, 400 do
+                pc(grow)
+                pc(q, p)
+                pc(pe)
+                called = called + 1
+            end
+            -- 上限の近くでは数値の文字列化も断られるので、結果は確保しない文字列（定数）で出す
+            io.stdout:write(called == 400 and "loop-ok\n" or "loop-short\n")
+            io.stdout:write(hole and "hole-reused\n" or "hole-refused\n")
+            io.stdout:flush()
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\nloop-ok\nhole-refused\n", out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [30, 40, 44, 52, 60])
+    fun `RAMの残りがスタックを数える線（32 KiB）の近くで、深いCのスタックから小さな結果のimportを呼んでもトラップにならない`(remainingKib: Long) = timeout(limit) {
+        // #729。結果が小さい import（peripheral.getType = open と info。見積もり 512 バイト）は、kibi_lua_reserve の速い道（何も取らない）を通る。
+        // その先の cabi_realloc の確保で、初めての C のスタックの計数（最大 16 KiB）が走ると、残りが KEEP を割って OUT_OF_MEMORY → トラップになる。
+        // これを起こすには、import の直前まで Lua の確保が起きず（起きれば、そこで先にスタックを数える）、
+        // そのスタックが、まだ触っていない深さまで伸びていること。
+        // 先に Lua だけの再帰で CallInfo と Lua のスタックを伸ばしておき（C のスタックは使わない）、残りを絞ってから、string.gsub のコールバックの入れ子（C のスタックを使う）で深くする。
+        // 速い道の余裕に計数の分を含めるので、断られる（"not enough memory"）か成功するかのどちらかで、CRASHED にならない。
+        // 深くするだけで残りが減る（触った区画も数える）ので、計数が走る残りの幅に当たる値をいくつか並べる（旧い余裕 24 KiB で必ずトラップになることまでは再現できていない。この経路を通して CRASHED にならないことを確かめる）
+        val script = """
+            local gt, pc, addr = peripheral.getType, pcall, "$ADDRESS"
+            local function warm(n) if n == 0 then return 0 end return 1 + warm(n - 1) end
+            warm(400)
+            local gsub = string.gsub
+            local function deep(n)
+                if n == 0 then return gt(addr) end
+                local r
+                gsub("x", "x", function() r = deep(n - 1) end)
+                return r
+            end
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 3 do pc(deep, 20) end
+            print("done")
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\ndone\n", out)
         }
     }
 
@@ -943,6 +1100,52 @@ class LuaKibiApiTest {
                 Thread.sleep(5)
             }
             assertEquals(0, r.dev.marks.get())
+        }
+    }
+
+    @Test
+    fun `取り出した後のLuaの確保だけが失敗したら、写せなかったイベントをevents_droppedで知らせる`() = timeout(limit) {
+        // 結果の場所（take の見積もり）は解放した穴に入り、取り出したイベントを Lua の値に写す確保だけが断られる形（#727・#729）。
+        // 1回の pullEventRaw は、取れるイベントを 8 件ずつ全部 FIFO に移すので、4 KiB のイベントを 40 件出せば、どこかの件で必ず断られる
+        val script = """
+            local pull, sleep, pc = os.pullEventRaw, os.sleep, pcall
+            os.queueEvent("x")
+            pull("x")
+            -- take の見積もりより大きい穴を作っておく（上限の近くで、結果の場所は新しく数えずに取れる）
+            local s = ("z"):rep(48 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            sleep(2)
+            local ok, err = pc(pull)
+            io.write("failed\n")
+            io.stdout:flush()
+            sleep(2)
+            os.queueEvent("end")
+            local big, dropped = 0, 0
+            while true do
+                local ev, a = pull()
+                if ev == "end" then break end
+                if ev == "big" then big = big + 1 elseif ev == "events_dropped" then dropped = dropped + a end
+            end
+            print(ok, err, big, dropped)
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val text = DeviceValue.of("e".repeat(4000))
+            repeat(40) { assertTrue(r.dev.context!!.postEvent("big", text)) }
+            val held = r.squeeze(24 * 1024)
+            r.waitFor("failed\n")
+            r.waitUntil("また待たない") { r.m.stateOf(r.pid) == ProcessState.WAITING_EVENT }
+            r.release(held)
+            val last = r.finish().lines().dropLast(1).last().split("\t")
+            assertEquals(listOf("false", "not enough memory"), last.take(2), last.toString())
+            val big = last[2].toInt()
+            val dropped = last[3].toInt()
+            // どの件で失敗したかに左右されない: 受け取った件数と、写せなかった件数の合計が、出した件数になる
+            assertEquals(40, big + dropped, last.toString())
+            assertTrue(dropped > 0, last.toString())
         }
     }
 
@@ -981,6 +1184,92 @@ class LuaKibiApiTest {
             """.trimIndent(),
         ).use { it.finish() }
         assertEquals("0\ttrue\ttrue\n", out)
+    }
+
+    @Test
+    fun `カーネルのイベントを写す間に__gcからpullEventRawを呼ぶと、待たずにエラーになり、イベントは壊れずに届く`() = timeout(limit) {
+        // メインスレッドの take_kernel_events が、取り出したイベント（arena にある結果）を Lua の値に写す間は、kibi_lua_arena_hold で入れ子の回収を止める（#755）。
+        // その間に __gc が os.pullEventRaw を呼ぶと、回収（collect）はタイマーだけ移し、待たずに
+        // "cannot wait for events while a result is being copied" のエラーにする（待つと、取り出せるものがなく止まる）。
+        // 止めていなければ、入れ子の取り出しが写している結果の場所（arena）を戻して取り直し、写した値が壊れる。
+        // イベントは、デバイスの emit-as で、480 文字の文字列 8 個を持つもの（1 つのイベントの大きさの上限は 4 KiB）を出す。写す間の確保で GC が走り、__gc が入る。
+        // __gc が写す前の位置で pullEventRaw を呼ぶと、そのイベントを自分で受け取る（check に通す）ので、どちらで受け取っても、壊れていないことと件数を見る。
+        // テストの側が pad を出し続けて、入れ子の pullEventRaw が待ち続けないようにする
+        val out = Run(
+            """
+            local addr, call, pull, pc = "$ADDRESS", peripheral.call, os.pullEventRaw, pcall
+            local parts = {}
+            for i = 1, 8 do parts[i] = string.rep(string.char(65 + i % 26), 480) .. i end
+            local bigs, bad, held, armed, hits = 0, 0, 0, false, 0
+            local function check(name, ...)
+                if name ~= "big" then return end
+                -- デバイスのイベントは、最初の値がデバイスの address
+                local a = { ... }
+                bigs = bigs + 1
+                if #a ~= 9 or a[1] ~= addr then bad = bad + 1; return end
+                for i = 1, 8 do if a[i + 1] ~= parts[i] then bad = bad + 1; return end end
+            end
+            local mt = {}
+            mt.__gc = function()
+                hits = hits + 1
+                if armed then
+                    local r = table.pack(pc(pull))
+                    if r[1] then check(table.unpack(r, 2, r.n))
+                    elseif tostring(r[2]):find("while a result is being copied", 1, true) then held = held + 1 end
+                end
+                if hits < 3000 then setmetatable({}, mt) end
+            end
+            -- イベントのキューを先に開く（開く前に来たイベントは届かない）
+            os.queueEvent("x"); os.pullEventRaw()
+            for i = 1, 16 do setmetatable({}, mt) end
+            collectgarbage("incremental", 0, 1000)
+            armed = true
+            for round = 1, 20 do
+                call(addr, "emit-as", "big", table.unpack(parts))
+                while bigs < round do check(pull()) end
+            end
+            armed = false
+            collectgarbage("incremental", 200, 100)
+            print(bad, bigs, held > 0)
+            """.trimIndent(),
+        ).use { r ->
+            r.waitUntil("終わらない") {
+                r.dev.context?.postEvent("pad")
+                r.m.stateOf(r.pid).isTerminal
+            }
+            r.finish()
+        }
+        assertEquals("0\t20\ttrue\n", out)
+    }
+
+    @Test
+    fun `呼び出しの結果を写す確保だけが失敗しても、fdを閉じて呼び続けられる`() = timeout(limit) {
+        // 結果の場所は穴に入り、60 KiB の文字列を Lua に写す確保だけが断られる形を、fd の上限（256）より多く続ける（#727・#729）
+        val script = """
+            local call, pc, addr, big, echo = peripheral.call, pcall, "$ADDRESS", "big", "echo"
+            local s = ("z"):rep(72 * 1024)
+            s = nil
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            local refused = 0
+            for i = 1, 300 do
+                local ok, err = pc(call, addr, big, 60 * 1024)
+                if not ok and err == "not enough memory" then refused = refused + 1 end
+            end
+            local ok, v = pc(call, addr, echo, 7)
+            print(refused, ok, v)
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(40 * 1024)
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\n300\ttrue\t7\n", out)
+            // 断られたのは結果を Lua に写すときで、どの呼び出しもデバイスまで届いている
+            assertEquals(300, r.dev.bigCalls.get())
+        }
     }
 
     /** 長い失敗の文と、上限いっぱいの数のメソッドを持つデバイス */
