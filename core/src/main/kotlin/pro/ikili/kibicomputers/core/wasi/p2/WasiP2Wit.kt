@@ -5,7 +5,7 @@ package pro.ikili.kibicomputers.core.wasi.p2
 // 中身は、テストに使う wasmtime のアダプター（`gradle/wasi-adapter.properties`。wasmtime 50.0.1）が持つ
 // `wasi:cli/command@0.2.12` の世界の WIT を、`wasm-tools component wit` で書き出したものそのまま（手で書き換えない）。
 // WASI の WIT は Apache-2.0 WITH LLVM-exception（https://github.com/WebAssembly/WASI）。
-// アダプターを上げたら、`WasiP2WitTest` が差分を示すので、書き出し直して [WasiP2Wit.BASE_VERSION] も合わせる。
+// アダプターを上げたら、`WasiP2HostTest` の「ホストのWITはアダプターが持つWITと同じ」が差分を示すので、書き出し直して [WasiP2Wit.BASE_VERSION] も合わせる。
 
 /** ホストの WASI 0.2 の WIT */
 internal object WasiP2Wit {

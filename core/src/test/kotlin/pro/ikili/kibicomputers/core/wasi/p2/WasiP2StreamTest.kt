@@ -14,7 +14,9 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.io.Pipes
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.HostResourceTable
 import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -24,6 +26,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.stateOf
+import pro.ikili.kibicomputers.core.kernel.time.TimerLimits
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -729,8 +732,13 @@ class WasiP2StreamTest {
                 val flagsType = fsTypes.type<CanonType.Flags>("descriptor-flags")
                 val getFlags = { d: CanonValue -> (ok(ctx.p2(ty, "[method]descriptor.get-flags", d)) as CanonValue.Flags).bits }
                 assertEquals(flagsType.value("read", "mutate-directory").bits, getFlags(root))
-                // read だけで開いたサブディレクトリは mutate-directory を持たない（get-flags に出る）
-                val ro = ok(openAt(ctx, root, "sub", open = arrayOf("directory"), flags = arrayOf("read")))!!
+                // mutate-directory を持たないディレクトリの descriptor（今の preopen からは作れないので、表に直接置く）
+                val sub = ok(openAt(ctx, root, "sub", open = arrayOf("directory")))!!
+                val ro = ctx.withKernelLock {
+                    val id = P2.entryLocked<DescriptorEntry>(ctx, sub).objectId
+                    ctx.kernel.objects.retain(id)
+                    P2.ownLocked(ctx, DescriptorEntry(HandleEntry(id, rights = HandleRights.READ), flagsType.value("read").bits))
+                }
                 assertEquals(flagsType.value("read").bits, getFlags(ro))
                 val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
                 val newTs = fsTypes.type<CanonType.Variant>("new-timestamp")
@@ -749,18 +757,92 @@ class WasiP2StreamTest {
                 assertEquals("read-only", errName(openAt(ctx, ro, "x", flags = arrayOf("read", "write"))))
                 // 基点が持たない mutate-directory は、open-at で求めても得られない
                 assertEquals("read-only", errName(openAt(ctx, ro, "x", flags = arrayOf("read", "mutate-directory"))))
-                // 何も変えない操作は通る
+                // 何も変えない操作は通る。持たない基点から開いたディレクトリも持たない
                 val x = ok(openAt(ctx, ro, "x"))!!
                 assertEquals(flagsType.value("read").bits, getFlags(x))
                 ok(ctx.p2(ty, "[method]descriptor.stat-at", ro, pf, CanonValue.str("x")))
-                // 基点が持つ mutate-directory は、求めれば渡せる。持つ descriptor からは変えられる
-                val rw = ok(openAt(ctx, root, "sub", open = arrayOf("directory"), flags = arrayOf("read", "mutate-directory")))!!
-                assertEquals(flagsType.value("read", "mutate-directory").bits, getFlags(rw))
-                ok(ctx.p2(ty, "[method]descriptor.create-directory-at", rw, CanonValue.str("d")))
-                ok(ctx.p2(ty, "[method]descriptor.remove-directory-at", rw, CanonValue.str("d")))
-                ok(ctx.p2(ty, "[method]descriptor.rename-at", rw, CanonValue.str("x"), rw, CanonValue.str("y")))
-                ok(ctx.p2(ty, "[method]descriptor.unlink-file-at", rw, CanonValue.str("y")))
-                ok(openAt(ctx, rw, "n", open = arrayOf("create"), flags = arrayOf("read", "write")))
+                assertEquals(flagsType.value("read").bits, getFlags(ok(openAt(ctx, ro, ".", open = arrayOf("directory")))!!))
+                // read だけで開いたサブディレクトリも、基点（preopen）の mutate-directory を引き継ぐ（wasmtime と同じ）。ファイルは持たない
+                assertEquals(flagsType.value("read", "mutate-directory").bits, getFlags(sub))
+                assertEquals(flagsType.value("read").bits, getFlags(ok(openAt(ctx, root, "sub/x", flags = arrayOf("read")))!!))
+                ok(ctx.p2(ty, "[method]descriptor.create-directory-at", sub, CanonValue.str("d")))
+                ok(ctx.p2(ty, "[method]descriptor.remove-directory-at", sub, CanonValue.str("d")))
+                ok(ctx.p2(ty, "[method]descriptor.rename-at", sub, CanonValue.str("x"), sub, CanonValue.str("y")))
+                ok(ctx.p2(ty, "[method]descriptor.unlink-file-at", sub, CanonValue.str("y")))
+                ok(openAt(ctx, sub, "n", open = arrayOf("create"), flags = arrayOf("read", "write")))
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `ホストのresourceの表が満杯なら、作りかけの参照を返してトラップし、open-atはファイルを作る前に断る`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            val f = m.vfs.open(VfsPath.parse("/a.txt"), OpenOptions(read = true, write = true, create = true))
+            m.vfs.write(f, "abcde".toByteArray(), 0, 5)
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val root = root(ctx)
+                val file = ok(openAt(ctx, root, "a.txt"))!!
+                val rootId = ctx.withKernelLock { P2.entryLocked<DescriptorEntry>(ctx, root).objectId }
+                val fileId = ctx.withKernelLock { P2.entryLocked<DescriptorEntry>(ctx, file).objectId }
+                val stdinId = ctx.withKernelLock { ctx.kernel.processes[ctx.pid]!!.handles[0]!!.objectId }
+                // 表を満杯にする（中身のない印で埋める）
+                ctx.withKernelLock {
+                    val table = P2.tableLocked(ctx)
+                    while (table.size < HostResourceTable.LIMIT) P2.ownLocked(ctx, MarkerEntry("filler"))
+                }
+                val refs = { ctx.withKernelLock { listOf(rootId, fileId, stdinId).map { ctx.kernel.objects.refCount(it) } } }
+                val objects = { ctx.withKernelLock { ctx.kernel.objects.size } }
+                val before = refs()
+                val count = objects()
+                val calls = listOf<() -> Unit>(
+                    { ctx.p2("wasi:cli/stdin", "get-stdin") },
+                    { ctx.p2("wasi:filesystem/preopens", "get-directories") },
+                    { ctx.p2(ty, "[method]descriptor.read-via-stream", file, CanonValue.I64(0)) },
+                    { ctx.p2(ty, "[method]descriptor.read-directory", root) },
+                    { openAt(ctx, root, "a.txt") },
+                    { openAt(ctx, root, "new.txt", open = arrayOf("create"), flags = arrayOf("read", "write")) },
+                    { openAt(ctx, root, "a.txt", open = arrayOf("truncate"), flags = arrayOf("read", "write")) },
+                )
+                for (call in calls) {
+                    assertThrows<WasmTrapException> { call() }
+                    // 参照もオブジェクトも残らない
+                    assertEquals(before, refs())
+                    assertEquals(count, objects())
+                }
+                // open-at はファイルを作らず、切り詰めない
+                val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
+                assertEquals("no-entry", errName(ctx.p2(ty, "[method]descriptor.stat-at", root, pf, CanonValue.str("new.txt"))))
+                assertEquals(5L, ctx.vfs.stat(VfsPath.parse("/a.txt")).size)
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `動いているタイマーが上限なら、時計のpollableのpollとblockはトラップせず早めに返る`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val ms = 1_000_000L
+                repeat(TimerLimits.MAX_ARMED_TIMERS) { ctx.setTimer(ctx.createTimer(), 60_000 * ms) }
+                val far = ctx.p2("wasi:clocks/monotonic-clock", "subscribe-duration", CanonValue.I64(30_000 * ms))!!
+                val stdin = ctx.p2("wasi:cli/stdin", "get-stdin")!!
+                val readable = ctx.p2(streams, "[method]input-stream.subscribe", stdin)!!
+                val start = ctx.monotonicNanos()
+                // そろっていない入力と並べても、時計の pollable の添字だけがそろったものとして返る
+                val r = ctx.p2("wasi:io/poll", "poll", CanonValue.Items(listOf(readable, far))) as CanonValue.Items
+                assertEquals(listOf<CanonValue>(CanonValue.I32(1)), r.items)
+                ctx.p2("wasi:io/poll", "[method]pollable.block", far)
+                assertTrue(ctx.monotonicNanos() - start < 10_000 * ms)
+                assertEquals(CanonValue.FALSE, ctx.p2("wasi:io/poll", "[method]pollable.ready", far))
+                assertTrue(ctx.withKernelLock { ctx.kernel.processes[ctx.pid]!!.waitTimers.isEmpty })
             }
             m.stop()
         }

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
+import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.fd.FdIo
 import pro.ikili.kibicomputers.core.kernel.fd.FdReadiness
 import pro.ikili.kibicomputers.core.kernel.fd.IoResult
@@ -353,7 +354,8 @@ internal object WasiP2Io {
     /** いつもそろった pollable（親 [parent] の子）を作る */
     fun alwaysReady(ctx: ProcessContext, parent: Int): CanonValue = ctx.withKernelLock { P2.childLocked(ctx, parent, PollableEntry.Ready(parent)) }
 
-    private class Evaluation(val ready: List<Int>, val keys: List<WaitKey>, val deadline: Long?)
+    /** [timed] は、まだ期限の来ていない時計の pollable の添字 */
+    private class Evaluation(val ready: List<Int>, val keys: List<WaitKey>, val deadline: Long?, val timed: List<Int>)
 
     /** 全部の pollable を 1 回判定する（待たない） */
     private fun evaluate(ctx: ProcessContext, reps: List<Int>): Evaluation {
@@ -363,12 +365,18 @@ internal object WasiP2Io {
             val table = P2.tableLocked(ctx)
             val ready = ArrayList<Int>()
             val keys = ArrayList<WaitKey>()
+            val timed = ArrayList<Int>()
             var deadline: Long? = null
             for ((i, rep) in reps.withIndex()) {
                 val p = table[rep] as? PollableEntry ?: P2.trap("ホストの resource $rep は pollable でない")
                 when (p) {
                     is PollableEntry.Ready -> ready += i
-                    is PollableEntry.Deadline -> if (now >= p.nanos) ready += i else deadline = minOf(deadline ?: Long.MAX_VALUE, p.nanos)
+                    is PollableEntry.Deadline -> if (now >= p.nanos) {
+                        ready += i
+                    } else {
+                        timed += i
+                        deadline = minOf(deadline ?: Long.MAX_VALUE, p.nanos)
+                    }
                     is PollableEntry.Stream -> {
                         val s = table[p.parent] as? StreamEntry ?: P2.trap("pollable の親 ${p.parent} がない")
                         val handle = s.handle
@@ -383,13 +391,20 @@ internal object WasiP2Io {
                     }
                 }
             }
-            Evaluation(ready, keys, deadline)
+            Evaluation(ready, keys, deadline, timed)
         }
     }
 
     private fun readyOnce(ctx: ProcessContext, reps: List<Int>): Boolean = evaluate(ctx, reps).ready.isNotEmpty()
 
-    /** どれかがそろうまで待ち、そろった添字を返す。一時的なタイマーは待つときにだけ開き、返るとき（例外のときも）に閉じる */
+    /**
+     * どれかがそろうまで待ち、そろった添字を返す。一時的なタイマーは待つときにだけ開き、返るとき（例外のときも）に閉じる。
+     *
+     * マシンの動いているタイマーが上限（`TimerLimits.MAX_ARMED_TIMERS`）でタイマーを動かせないときは、トラップにせず、期限の来ていない
+     * 時計の pollable を早めにそろったものとして返す（ADR 0267）。p1 の `poll_oneoff` が同じ状況を一時的な不足（`AGAIN`）として返すのに
+     * 当たる。p2 の `poll`・`block` にはエラーを返す道がないので、ほかのプロセスがタイマーを使い切っただけでプロセスを落とさないように、
+     * 早く起きたものとして扱う（ゲストは時計を読んで待ち直せる）
+     */
     fun await(ctx: ProcessContext, reps: List<Int>): List<Int> {
         var timer: WaitKey? = null
         var timerDeadline = 0L
@@ -403,10 +418,14 @@ internal object WasiP2Io {
                 val deadline = ev.deadline
                 if (deadline != null) {
                     val t = timer
-                    if (t == null) {
-                        timer = ctx.openWaitTimer(deadline)
-                    } else if (timerStale || deadline != timerDeadline) {
-                        ctx.resetWaitTimer(t, deadline)
+                    try {
+                        if (t == null) {
+                            timer = ctx.openWaitTimer(deadline)
+                        } else if (timerStale || deadline != timerDeadline) {
+                            ctx.resetWaitTimer(t, deadline)
+                        }
+                    } catch (_: ResourceLimitException) {
+                        return ev.timed
                     }
                     timerDeadline = deadline
                     timerStale = false

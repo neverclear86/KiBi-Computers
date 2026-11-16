@@ -135,6 +135,15 @@ internal object P2 {
     fun tableLocked(ctx: ProcessContext): HostResourceTable =
         (ctx.kernel.processes[ctx.pid] ?: throw ProcessKilledException()).hostResources
 
+    /**
+     * 表にあと 1 つ入れられることを確かめる（カーネルロックの中。満杯なら [ResourceLimitException] → [guard] がトラップにする）。
+     * 戻せない副作用（ファイルを作る・切り詰める）の前に呼ぶ
+     */
+    @Throws(ResourceLimitException::class)
+    fun checkRoomLocked(ctx: ProcessContext) {
+        if (tableLocked(ctx).size >= HostResourceTable.LIMIT) throw ResourceLimitException("ホストの resource の数が上限（${HostResourceTable.LIMIT}）")
+    }
+
     /** [entry] を表に入れて own の値にする（カーネルロックの中。参照の持ち主は表になる） */
     fun ownLocked(ctx: ProcessContext, entry: P2Entry): CanonValue.Handle = CanonValue.Handle(tableLocked(ctx).add(entry))
 

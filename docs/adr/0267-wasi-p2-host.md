@@ -60,9 +60,10 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 #### resource の中身
 
 - resource の rep は `HostResourceTable` の番号。中身（`P2Entry`）は stream・descriptor・directory-entry-stream・pollable・error と、中身のない印（`network` など）。中身はカーネルのオブジェクト（`HandleEntry` を通したファイル・パイプの端・TTY）を参照で持つ。
-- 表はプロセスにあり、カーネルロックの中で触る。プロセスの終わり（`finishLocked`）と、写しの中で殺すとき（`killInCopy`）に、fd の表と同じく全部閉じてオブジェクトの参照を返す。上限は 1 プロセスあたり 4096 個（`HostResourceTable.LIMIT`。仮。#251）で、超えたらトラップ。
+- 表はプロセスにあり、カーネルロックの中で触る。プロセスの終わり（`finishLocked`）と、写しの中で殺すとき（`killInCopy`）に、fd の表と同じく全部閉じてオブジェクトの参照を返す。上限は 1 プロセスあたり 4096 個（`HostResourceTable.LIMIT`。仮。#251）で、超えたらトラップ。超えるときは、作りかけの資源の参照（stream・descriptor・directory-entry-stream が持つ参照、開いたファイル）を返してからトラップする。`open-at` は、戻せない副作用（作る・切り詰める）の前に表の空きを確かめる（p1 の `path_open` が開く前に `MFILE` を確かめるのと同じ）。
 - 子として数えるのは pollable だけ（`subscribe` で作ったもの。親は stream）。子の pollable が残る stream の `drop` はトラップ（WIT の約束。子を先に捨てる）。descriptor から作った stream（`read-via-stream` など）は、ファイルの参照を自分で持つので子に数えない。descriptor は、stream が残っていても `drop` できる（`read-directory` の stream も、ディレクトリの参照を自分で持つ）。
 - pollable は待つ相手（期限か、親の stream）だけを持つ。待つときだけ、カーネルの一時的なタイマーを開き、待ち終わったら閉じる（pollable の数だけタイマーを持ち続けない）。
+- マシンの動いているタイマーが上限（`TimerLimits.MAX_ARMED_TIMERS`）で、待つための一時的なタイマーを動かせないときは、`poll`・`pollable.block` はトラップにせず、期限の来ていない時計の pollable をそろったものとして早めに返す（`block` はそのまま返る）。p1 の `poll_oneoff` は同じ状況を一時的な不足（`AGAIN`）として返すが、p2 の `poll`・`block` にはエラーを返す道がない。ほかのプロセスがタイマーを使い切っただけで、時計を待つプロセス（アダプターで包んだ p1 の `sleep`・`poll` を含む）を落とさないため、早く起きたもの（時計を読めば分かる）として扱う。
 
 #### stdio・preopen・引数・環境変数
 
@@ -90,7 +91,7 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 
 #### `mutate-directory`
 
-descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確かめる。ディレクトリの中身を変える関数（`create-directory-at`・`remove-directory-at`・`rename-at`（両方の基点）・`unlink-file-at`・`set-times-at`）と、`open-at` の作る・切り詰める・書く開き方は、基点の descriptor が `mutate-directory` を持たなければ `read-only`。`open-at` は、基点が持つ `mutate-directory` だけを新しい descriptor に渡せる（基点が持たないのに求めたら `read-only`）。ルートの preopen は `read`・`mutate-directory` を持つ。
+descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確かめる。ディレクトリの中身を変える関数（`create-directory-at`・`remove-directory-at`・`rename-at`（両方の基点）・`unlink-file-at`・`set-times-at`）と、`open-at` の作る・切り詰める・書く開き方は、基点の descriptor が `mutate-directory` を持たなければ `read-only`。`open-at` で開いたディレクトリの descriptor は、求めた flags に依らず基点の `mutate-directory` を引き継ぐ（基点が持たないのに求めたら `read-only`）。ファイルの descriptor は持たない。wasmtime のホストと同じく、変えられるかは preopen の権限で決め、開いたディレクトリごとには絞らない。wasmtime のアダプターの `path_open` は `mutate-directory` を求めないので、絞ると、アダプターで包んだ p1 のプログラムがサブディレクトリの fd を基点に変える操作（`unlinkat`・`openat(O_CREAT)` など）が失敗し、同じカーネルの p1 の層（`path_*` は基点の fd に変更の権利を求めない）と食い違うため。ルートの preopen は `read`・`mutate-directory` を持つので、今は `read-only` になる descriptor はない（確かめは、`mutate-directory` を持たない preopen を足すときのため）。
 
 ### `wasi:sockets`
 

@@ -29,7 +29,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Fd
  *   出る `..` は `not-permitted`（`NOTCAPABLE`）。基点の解決はカーネルロックの中、VFS の I/O はロックの外（ADR 0052）
  * - ディレクトリの中身を変える関数（`create-directory-at`・`remove-directory-at`・`rename-at`・`unlink-file-at`・`set-times-at`、
  *   `open-at` の作る・切り詰める・書く）は、基点の descriptor が `mutate-directory` を持つときだけ（なければ `read-only`）。
- *   `open-at` が求められるのは、基点が持つ `mutate-directory` だけ（持たない基点で求めたら `read-only`）
+ *   `open-at` で開いたディレクトリは、基点の `mutate-directory` を引き継ぐ（wasmtime と同じ。持たない基点で求めたら `read-only`）
  * - `read-directory` の stream は、ディレクトリの参照と最後に返した名前だけを持ち、`read-directory-entry` のたびに読み直す
  *   （p1 の `fd_readdir` と同じ。ゲストが大きなディレクトリで stream を多く持っても、ホストのヒープに中身の写しを留めない）
  * - 開くのは `FdTable.openObject` を通す（`/dev/tty`・`/dev/device/<address>` の差し替えは p1 と同じ口。ADR 0054）
@@ -350,7 +350,8 @@ internal object WasiP2Fs {
 
     /**
      * `open-at(path-flags, path, open-flags, descriptor-flags)`。読み書きは `read`・`write` の flags で決める。基点が `mutate-directory`
-     * を持たないのに、作る・切り詰める・書く・`mutate-directory` を求めたら `read-only`。`file-integrity-sync`・`data-integrity-sync`・`requested-write-sync` は p1 の `DSYNC` などと同じく `unsupported`
+     * を持たないのに、作る・切り詰める・書く・`mutate-directory` を求めたら `read-only`。開いたディレクトリは、求めたかに依らず
+     * 基点の `mutate-directory` を引き継ぐ。ホストの resource の表が満杯なら、開く前にトラップ。`file-integrity-sync`・`data-integrity-sync`・`requested-write-sync` は p1 の `DSYNC` などと同じく `unsupported`
      */
     private fun openAt(ctx: ProcessContext, a: List<CanonValue>, openFlags: CanonType.Flags): CanonValue {
         val requested = (a[4] as CanonValue.Flags).bits
@@ -371,12 +372,17 @@ internal object WasiP2Fs {
             truncate = openFlags.has(of, "truncate"),
             directory = openFlags.has(of, "directory"),
         )
+        // 表が満杯なら、開く前に断る（作る・切り詰めるを済ませてから失敗しないように。p1 の path_open が開く前に MFILE を確かめるのと同じ）
+        ctx.withKernelLock { P2.checkRoomLocked(ctx) }
         val file = ctx.vfs.open(target.path, options, target.trailingSlash)
         return try {
             ctx.withKernelLock {
                 val id = FdTable.openObject(file, ctx.vfs, ctx.kernel.objects, ctx.kernel.consoleTtyId)
                 val rights = (if (read) HandleRights.READ else 0) or (if (write) HandleRights.WRITE else 0)
-                val flags = (requested and (FLAG_READ or FLAG_WRITE)) or (requested and FLAG_MUTATE)
+                // 開いたディレクトリは、基点の mutate-directory を引き継ぐ（wasmtime のホストと同じく、変えられるかは preopen の権限で決め、
+                // 開いたディレクトリごとには絞らない。アダプターの path_open は mutate-directory を求めないため）。ファイルは持たない
+                val mutate = if (file.isDirectory) base.flags and FLAG_MUTATE else 0
+                val flags = (requested and (FLAG_READ or FLAG_WRITE)) or mutate
                 try {
                     P2.ownLocked(ctx, DescriptorEntry(HandleEntry(id, rights = rights), flags))
                 } catch (ex: Throwable) {
