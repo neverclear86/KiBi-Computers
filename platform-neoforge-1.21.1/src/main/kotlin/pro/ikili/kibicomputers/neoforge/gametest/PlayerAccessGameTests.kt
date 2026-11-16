@@ -8,6 +8,9 @@ import net.minecraft.core.component.DataComponents
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestAssertException
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.IntTag
 import net.minecraft.network.Connection
@@ -68,6 +71,7 @@ object PlayerAccessGameTests {
     private val CASE = BlockPos(1, 1, 1)
     private val KEYBOARD = BlockPos(1, 1, 2)
     private val HOUR = AccessRules.hoursToMillis(1)
+    private val cleanups = java.util.IdentityHashMap<GameTestInfo, MutableList<() -> Unit>>()
 
     /** 名前 [name] のプレイヤーをサーバーに入れ、ケースの隣に立たせる */
     private fun player(helper: GameTestHelper, name: String, op: Boolean = false, mode: GameType = GameType.SURVIVAL): ServerPlayer {
@@ -79,15 +83,44 @@ object PlayerAccessGameTests {
         val connection = Connection(PacketFlow.SERVERBOUND)
         EmbeddedChannel(connection)
         level.server.playerList.placeNewPlayer(connection, player, cookie)
+        onEnd(helper) {
+            KeyboardSessions.loggedOut(player)
+            level.server.playerList.remove(player)
+        }
         player.setGameMode(mode)
         player.moveTo(Vec3.atCenterOf(helper.absolutePos(CASE.east())))
         return player
     }
 
-    private fun leave(helper: GameTestHelper, vararg players: ServerPlayer) {
-        for (p in players) {
-            KeyboardSessions.loggedOut(p)
-            helper.level.server.playerList.remove(p)
+    /** テストが終わったとき（成功・失敗・タイムアウトのどれでも）に走らせる後始末。失敗したテストの残りものが、あとのテストに響かないようにする */
+    private fun onEnd(helper: GameTestHelper, action: () -> Unit) {
+        val info = helper.testInfo
+        val list = cleanups.getOrPut(info) {
+            val actions = ArrayList<() -> Unit>()
+            info.addListener(
+                object : GameTestListener {
+                    override fun testStructureLoaded(info: GameTestInfo) {}
+
+                    override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = runCleanups(info)
+
+                    override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = runCleanups(info)
+
+                    override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+                },
+            )
+            actions
+        }
+        list += action
+    }
+
+    private fun runCleanups(info: GameTestInfo) {
+        val actions = cleanups.remove(info) ?: return
+        for (action in actions.asReversed()) {
+            try {
+                action()
+            } catch (e: Exception) {
+                System.getLogger("kibicomputers.gametest").log(System.Logger.Level.WARNING, "GameTest cleanup failed", e)
+            }
         }
     }
 
@@ -147,7 +180,6 @@ object PlayerAccessGameTests {
         helper.assertTrue(result.consumesAction(), "the case item should be placed but was $result")
         val fromItem = helper.getBlockEntity<CaseBlockEntity>(CASE)
         helper.assertTrue(fromItem.playerAccess.owner?.id == alex.uuid, "the placer should replace the copied owner: ${fromItem.playerAccess}")
-        leave(helper, alex, other)
         helper.succeed()
     }
 
@@ -182,7 +214,6 @@ object PlayerAccessGameTests {
         be.replacePlayerAccess(be.playerAccess.removeMember(steve.uuid.toString()).access)
         helper.assertTrue(!menu.stillValid(steve), "a removed member's menu should be closed")
         helper.assertTrue(!menu.clickMenuButton(steve, CaseMenu.POWER_BUTTON), "a removed member should not press the power button")
-        leave(helper, alex, steve, stranger, op)
         helper.succeed()
     }
 
@@ -210,7 +241,6 @@ object PlayerAccessGameTests {
         helper.assertTrue(be.playerAccess.pending.map { it.name } == listOf("fresh131c"), "the expired invite should be dropped: ${be.playerAccess}")
         helper.assertTrue(be.touchAccess(fresh), "a fresh invite should let the player in")
         helper.assertTrue(be.playerAccess.members.map { it.id } == listOf(fresh.uuid) && be.playerAccess.pending.isEmpty(), "promoted: ${be.playerAccess}")
-        leave(helper, alex, fresh, late)
         helper.succeed()
     }
 
@@ -261,7 +291,6 @@ object PlayerAccessGameTests {
             helper.assertTrue(survival.gameMode.destroyBlock(abs), "anyone should break an ownerless case")
             helper.assertTrue(owned.isRemoved, "the owner's case should be gone")
             for (e in helper.level.getEntitiesOfClass(ItemEntity::class.java, AABB(abs).inflate(3.0))) e.discard()
-            leave(helper, alex, steve, survival, creative, op)
             helper.succeed()
         }
     }
@@ -285,6 +314,7 @@ object PlayerAccessGameTests {
             val chunk = ChunkPos(base.x / 16 - 400 - index * 2, base.z / 16 + 400)
             val pos = BlockPos(chunk.minBlockX + 8, 200, chunk.minBlockZ + 8)
             level.setChunkForced(chunk.x, chunk.z, true)
+            onEnd(helper) { level.setChunkForced(chunk.x, chunk.z, false) }
             level.getChunk(chunk.x, chunk.z)
             level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
             level.setBlock(pos.east(), Blocks.DIRT.defaultBlockState(), 3)
@@ -330,7 +360,6 @@ object PlayerAccessGameTests {
                 level.setChunkForced(b.chunk.x, b.chunk.z, false)
             }
             ServerMachines.drainSaves()
-            leave(helper, alex, stranger)
             helper.succeed()
         }
     }
@@ -346,7 +375,6 @@ object PlayerAccessGameTests {
         helper.assertTrue(!EventHooks.onEntityDestroyBlock(wither, abs, helper.level.getBlockState(abs)), "a mob should not break an owned case")
         be.replacePlayerAccess(PlayerAccess.NONE)
         helper.assertTrue(EventHooks.onEntityDestroyBlock(wither, abs, helper.level.getBlockState(abs)), "a mob may break an ownerless case")
-        leave(helper, alex)
         helper.succeed()
     }
 
@@ -382,7 +410,6 @@ object PlayerAccessGameTests {
         helper.assertTrue(!copy.checkAccess(alex) && !copy.checkAccess(stranger) && copy.checkAccess(op), "only operators should use a locked case")
         val written = copy.saveWithoutMetadata(registries).getCompound(CaseBlockEntity.PLAYER_ACCESS_TAG)
         helper.assertTrue(written == unknown, "the unknown tag should be written back as read: $written")
-        leave(helper, alex, stranger, op)
         helper.succeed()
     }
 
@@ -413,7 +440,6 @@ object PlayerAccessGameTests {
         helper.assertTrue(KeyboardSessions.open(stranger, keyboard, null) == null, "a keyboard wired to someone else's case should not open")
         helper.assertTrue(KeyboardSessions.open(alex, keyboard, null) != null, "the owner should reopen the keyboard")
         be.pressPowerButton()
-        leave(helper, alex, stranger)
         helper.succeed()
     }
 }
