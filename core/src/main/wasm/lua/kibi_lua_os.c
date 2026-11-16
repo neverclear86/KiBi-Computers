@@ -293,7 +293,10 @@ static int take_kernel_events(lua_State *L) {
         convert_done = 0;
         lua_pushcfunction(L, convert_batch);
         lua_pushlightuserdata(L, &r);
+        /* 写す間の __gc から入れ子で取り出して、r の場所（arena）を戻さないようにする */
+        kibi_lua_arena_hold();
         int status = lua_pcall(L, 1, 0, 0);
+        kibi_lua_arena_release();
         add_lost(r.val.ok.dropped); /* あふれて捨てたイベントの数 */
         if (status != LUA_OK) {
             add_lost(n - convert_done);
@@ -306,9 +309,14 @@ static int take_kernel_events(lua_State *L) {
     }
 }
 
-/* 期限の来たタイマーと、取れるカーネルのイベントと、終わった peripheral.call（"task_complete"）を FIFO に移す */
+/*
+ * 期限の来たタイマーと、取れるカーネルのイベントと、終わった peripheral.call（"task_complete"）を FIFO に移す。
+ * 結果を arena から写している途中（kibi_lua_arena_held。写す途中の __gc から入れ子で来たとき）は、タイマーだけ移す
+ * （カーネルのイベントと終わった呼び出しはカーネルの側に残り、外側が写し終えた後の回収で移る）
+ */
 static void collect(lua_State *L) {
     fire_timers(L);
+    if (kibi_lua_arena_held()) return;
     take_kernel_events(L);
     kibi_lua_tasks_collect(L);
 }
@@ -384,6 +392,11 @@ static int pull(lua_State *L) {
         }
         collect(L);
         if (fifo_head != fifo_tail) continue;
+        /* 結果を写している途中の __gc からは、カーネルのイベントを取り出せない（collect がしない）ので、待たずにエラーにする */
+        if (kibi_lua_arena_held()) {
+            lua_pushliteral(L, "cannot wait for events while a result is being copied");
+            return lua_error(L);
+        }
         int64_t deadline = 0;
         lua_Integer id;
         if (!earliest_timer(L, &deadline, &id)) deadline = 0;

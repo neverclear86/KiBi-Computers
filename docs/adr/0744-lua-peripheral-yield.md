@@ -26,7 +26,7 @@
 
 - `kibi_lua_peripheral.c` の C の静的配列（`.bss`）。要素は pending-call の fd・task id・メソッドの名前（64 バイト。後から返る `no-such-method` の文に使う。復元の後の積み直しは address だけで引き直すので、メソッドがないと分かるのが後になることがある）。数はカーネルの上限 `DeviceLimits.MAX_PENDING_CALLS` と同じ 16
 - 線形メモリにあるので、スナップショットにそのまま入る。fd 番号は保存をまたいで変わらない（`queue_fd` を static に持つのと同じ）。起動時には何も作らない（起動の RAM は増えない）
-- **終わっていない呼び出しを表に入れるのは `take` の直後で、yield まで Lua の確保（longjmp しうる）はない。** その場で終わった呼び出しは表に入れず、pending-call を閉じてから値に写す（`invoke` と同じ。写す途中のメモリ不足や入れ子の回収で、持ち主のいない `task_complete` や二重の drop が起きない）。写す間は `collecting` を立て、`__gc` から `os.queueEvent` などで入れ子の回収が走って arena（写している結果の場所）と表を動かすのを止める
+- **終わっていない呼び出しを表に入れるのは `take` の直後で、yield まで Lua の確保（longjmp しうる）はない。** その場で終わった呼び出しは表に入れず、pending-call を閉じてから値に写す（`invoke` と同じ。写す途中のメモリ不足や入れ子の回収で、持ち主のいない `task_complete` や二重の drop が起きない）。写す間は `kibi_lua_arena_hold` で囲む（`lua_pcall` の外で `release` する）。囲んでいる間の os の `collect` は、タイマーだけ移し、arena を使うもの（`take_kernel_events` と `kibi_lua_tasks_collect`）をしない。`__gc` から `os.queueEvent` などで入れ子の回収が走って、arena（写している結果の場所）を戻して取り直したり、表を詰めたりするのを止める（#755 のレビュー）。`take_kernel_events` がイベントを写す間も同じく囲む。囲んでいる間の `__gc` からメインスレッドで `os.pullEvent` などで待つと、取り出せるものがないので `cannot wait for events while a result is being copied` のエラーにする
 - **表から消す（pending-call を drop する）のは、結果を Lua の値に写し終えてから。** 写す途中でメモリ不足になっても、`take` は何度でも同じ結果を返す（ADR 0077）ので、次の回収でやり直せる（ADR 0094 の「読んだらすぐ drop」は、記録の残らない同期の呼び出しの話）。消すときは後ろを詰めて、積んだ順を保つ
 - `__gc` では閉じない（ADR 0094 が退けた理由と同じ）
 - pending-call の fd は、その場で終わった・回収して写し終えた・プロセスが終わった（カーネルが閉じる）のどれかで閉じる
@@ -37,7 +37,7 @@
 - メインスレッドの `pull` の `poll_oneoff` は、キューと時計に加えて、表の fd を `FD_READ` で購読する（購読は最大 2＋16 個。`WasiP1Poll` の上限 1,024 より十分小さい）。これがないと、yield したコルーチンを起こすものがなくなる
 - メインスレッドの `os.sleep` の待ちは、表の fd を購読しない（回収しないので、終わった呼び出しがあると busy loop になる）
 - **表が空なら、回収も購読も何もしない**（`take` も `reserve` も呼ばない）。呼び出しのない台に費用を出さない
-- `os.queueEvent` も同じ `collect` を通る（その時点で届いているものの後ろに積む順を保つ）
+- `os.queueEvent` も同じ `collect` を通る（その時点で届いているものの後ろに積む順を保つ。結果を写している途中の `__gc` から呼んだときは、カーネルのイベントと終わった呼び出しを移さずに積む）
 
 ## その場で待つところ（CC と違う）
 

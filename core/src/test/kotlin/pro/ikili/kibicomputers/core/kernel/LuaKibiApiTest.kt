@@ -157,6 +157,22 @@ class LuaKibiApiTest {
 
         fun waitFor(line: String) = waitUntil("「$line」が出ない: $text（${m.stateOf(pid)}）") { text.contains(line) }
 
+        /**
+         * [finish] と同じだが、ホスト呼び出しが列にある間は、燃料が尽きて待つプロセスがいるときだけ tick を進める
+         * （tick の中で列の呼び出しが実行されるので、Lua の速さと tick の間隔によらず、終わるまで列に残す）
+         */
+        fun finishHoldingHostCalls(expected: ProcessState = ProcessState.EXITED): String {
+            eventually(60_000, "終わらない: $text") {
+                if (m.pendingHostCalls == 0 || m.fuelWaiterCount > 0) h.scheduler.tick()
+                Thread.sleep(1)
+                drain()
+                m.stateOf(pid).isTerminal
+            }
+            val out = drain()
+            assertEquals(expected, m.stateOf(pid), out)
+            return out
+        }
+
         fun finish(expected: ProcessState = ProcessState.EXITED): String {
             waitUntil("終わらない: $text") { m.stateOf(pid).isTerminal }
             val out = drain()
@@ -909,7 +925,8 @@ class LuaKibiApiTest {
 
     @Test
     fun `terminateでプログラムが終わると、まだ実行していないメインスレッドの呼び出しは実行されない`() = timeout(limit) {
-        // 1 tick に 1 件しか実行しないので、先に積んだ 3 件の後ろにある main-mark は、プログラムが終わるまでに実行されない
+        // 1 tick に 1 件しか実行せず、列に積んだ後は燃料が尽きたときしか tick を進めないので、先に積んだ 3 件の後ろにある main-mark は、
+        // プログラムが終わるまでに実行されない
         Run(
             """
             local function start(method) local co = coroutine.create(function() return peripheral.call("$ADDRESS", method, 1) end); coroutine.resume(co); return co end
@@ -919,7 +936,7 @@ class LuaKibiApiTest {
             """.trimIndent(),
             maxHostCallsPerTick = 1,
         ).use { r ->
-            assertEquals("false\tTerminated\n", r.finish())
+            assertEquals("false\tTerminated\n", r.finishHoldingHostCalls())
             // 終わったプロセスの fd が閉じられ、列にあった呼び出しは外される
             repeat(20) {
                 r.h.scheduler.tick()
@@ -927,6 +944,43 @@ class LuaKibiApiTest {
             }
             assertEquals(0, r.dev.marks.get())
         }
+    }
+
+    @Test
+    fun `コルーチンの中の結果を写す間に__gcがos_queueEventを呼んでも、結果は壊れず、積んだイベントも届く`() = timeout(limit) {
+        // GC を止めずに回し続け、__gc のたびに次の __gc を持つごみを作る。結果の文字列（長い文字列は 1 つずつ確保する）を写す間に
+        // __gc が走り、os.queueEvent が回収（take_kernel_events・kibi_lua_tasks_collect）を入れ子で呼ぼうとする。
+        // キューは parallel が開くので、止めなければ take_kernel_events が写している結果の場所（arena）を戻して取り直す（#755）。
+        // __gc は結果と同じくらいの大きさの文字列を作り、戻された場所を使い回させる（止めないと、写した値が "Z" などで壊れる）。
+        // __gc の連鎖は 3,000 回で止める（GC の分の時間を抑える）
+        val out = Run(
+            """
+            local hits, junk = 0, {}
+            local mt = {}
+            mt.__gc = function() hits = hits + 1; os.queueEvent("g"); for k = 1, 8 do junk[k] = string.rep("Z", 1500 + k) end; if hits < 3000 then setmetatable({}, mt) end end
+            for i = 1, 16 do setmetatable({}, mt) end
+            local big = {}
+            for i = 1, 32 do big[i] = string.rep(string.char(65 + i % 26), 1500) .. i end
+            local bad, g = 0, 0
+            collectgarbage("incremental", 0, 1000)
+            parallel.waitForAll(function()
+                for round = 1, 10 do
+                    local a = { peripheral.call("$ADDRESS", "echo", table.unpack(big)) }
+                    local b = { peripheral.call("$ADDRESS", "main-echo", table.unpack(big)) }
+                    for i = 1, 32 do
+                        if a[i] ~= big[i] then bad = bad + 1 end
+                        if b[i] ~= big[i] then bad = bad + 1 end
+                    end
+                end
+                collectgarbage("incremental", 200, 100)
+                os.queueEvent("end")
+            end, function()
+                while os.pullEvent() ~= "end" do g = g + 1 end
+            end)
+            print(bad, hits > 0, g > 0)
+            """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\ttrue\ttrue\n", out)
     }
 
     /** 長い失敗の文と、上限いっぱいの数のメソッドを持つデバイス */

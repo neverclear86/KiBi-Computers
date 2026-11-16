@@ -77,6 +77,7 @@ class LuaKibiApiRestoreTest {
         calls: AtomicInteger,
         callsBeforeSave: Int = 0,
         maxHostCallsPerTick: Int = 64,
+        holdQueuedHostCalls: Boolean = false,
         onSaved: (queuedHostCalls: Int) -> Unit = {},
     ): String {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
@@ -97,7 +98,9 @@ class LuaKibiApiRestoreTest {
             val pid = m.exec("/bin/t", KernelDrivers.DEFAULT, SpawnOptions(stdio = stdio, fds = SpawnOptions.ROOT_PREOPEN))
             m.lock.withLockValue { m.kernel.initPid = pid }
             eventually(60_000, "待たない: ${output(m, outId)}") {
-                h.scheduler.tick()
+                // holdQueuedHostCalls なら、ホスト呼び出しが列にある間は、燃料が尽きて待つプロセスがいるときだけ tick を進める
+                // （tick の中で列の呼び出しが実行されるので、Lua の速さと tick の間隔によらず、保存するまで列に残す）
+                if (!holdQueuedHostCalls || m.pendingHostCalls == 0 || m.fuelWaiterCount > 0) h.scheduler.tick()
                 Thread.sleep(1)
                 ready in output(m, outId) && calls.get() >= callsBeforeSave && m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
             }
@@ -189,7 +192,8 @@ class LuaKibiApiRestoreTest {
     fun `parallelの中のperipheral_callがまだ実行されていない状態で保存して戻すと、戻した後に実行されて、どのコルーチンも結果を受け取る`() = timeout(limit) {
         val calls = AtomicInteger()
         var queued = 0
-        // 1 tick に 1 件しか実行しないので、保存するときは、積んだ 12 件のうち、ほとんどが列に残っている（Queued の pending-call）
+        // 1 tick に 1 件しか実行せず、列に積んだ後は燃料が尽きたときしか tick を進めないので、保存するときは、
+        // 積んだ 12 件のうち、ほとんどが列に残っている（Queued の pending-call）
         val out = saveAndRestore(
             """
             local sums, fns = {}, {}
@@ -204,6 +208,7 @@ class LuaKibiApiRestoreTest {
             Regex("sum\t78\n"),
             calls,
             maxHostCallsPerTick = 1,
+            holdQueuedHostCalls = true,
             onSaved = { queued = it },
         )
         assertTrue(queued > 0, "保存したとき、実行していない呼び出しが列にある: $queued")

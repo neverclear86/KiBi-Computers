@@ -22,6 +22,19 @@
 void kibi_lua_arena_reset(void);
 
 /*
+ * arena にある結果を Lua の値に写している間は、hold から release までで囲む（入れ子にできる。数で数える）。
+ * 写す途中の Lua の確保で GC が走ると、__gc の中から os.queueEvent・os.pullEvent などで回収（kibi_lua_os.c の collect）が入れ子で走り、
+ * arena を戻して取り直したり、待っている呼び出しの表を詰めたりする。写している場所と表が動かないよう、囲んでいる間の回収は
+ * arena を使うもの（カーネルのイベントの取り出しと、終わった peripheral.call の回収）をしない（#755）。
+ * 写す処理は lua_pcall の中で行い、エラーで抜けても release する
+ */
+void kibi_lua_arena_hold(void);
+void kibi_lua_arena_release(void);
+
+/* kibi_lua_arena_hold の中なら 1 */
+int kibi_lua_arena_held(void);
+
+/*
  * 可変長の結果を返す import を呼ぶ前に、結果の最大の大きさ [need] が RAM に入るようにする。入れば 1。
  * RAM の残りが十分ならそれだけで 1。少なければ [need] の場所を先に取り（解放した穴を使い回せる）、cabi_realloc はそこから切り出す。
  * 取れなければ 0（cabi_realloc の中で足りなくなるとトラップになり、プロセスが CRASHED になるため、先に断る）。

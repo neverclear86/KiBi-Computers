@@ -75,6 +75,21 @@ void kibi_lua_arena_reset(void) {
     }
 }
 
+/* kibi_lua_arena_hold の入れ子の数 */
+static int arena_holds = 0;
+
+void kibi_lua_arena_hold(void) {
+    arena_holds++;
+}
+
+void kibi_lua_arena_release(void) {
+    arena_holds--;
+}
+
+int kibi_lua_arena_held(void) {
+    return arena_holds > 0;
+}
+
 /* kibi_lua_realloc が残す分（KIBI_LUA_KEEP）と、確保ごとの頭・dlmalloc のチャンクの頭の分 */
 #define KIBI_LUA_MEMORY_MARGIN (24 * 1024)
 

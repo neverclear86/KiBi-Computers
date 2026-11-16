@@ -65,8 +65,6 @@ static task_t tasks[MAX_TASKS];
 static int task_count = 0;
 /* task id（単調に増やす。タイマーの id とは別） */
 static int64_t next_task_id = 0;
-/* kibi_lua_tasks_collect の中なら 1 */
-static int collecting = 0;
 
 /* ---- 名前（address） ---- */
 
@@ -451,14 +449,13 @@ static int push_task_complete(lua_State *L) {
  * なっても、take は何度でも同じ結果を返すので、次の回収でやり直せる）。表が空なら何もしない
  */
 void kibi_lua_tasks_collect(lua_State *L) {
-    /* 写す途中の確保で GC が __gc を呼び、その中で os.queueEvent などから入れ子で回収すると、表と arena が動くので入れ子では回収しない */
-    if (collecting) return;
-    collecting = 1;
+    /* 写す途中の確保で GC が __gc を呼び、その中で os.queueEvent などから入れ子で回収すると、表と arena が動くので入れ子では回収しない
+     * （写す間は kibi_lua_arena_hold で囲む。os.c の collect も、その間はここを呼ばない） */
+    if (kibi_lua_arena_held()) return;
     int i = 0;
     while (i < task_count) {
         kibi_lua_arena_reset();
         if (!kibi_lua_reserve(INVOKE_RESULT_BYTES)) {
-            collecting = 0;
             lua_pushliteral(L, "not enough memory");
             lua_error(L);
         }
@@ -472,15 +469,13 @@ void kibi_lua_tasks_collect(lua_State *L) {
         lua_pushcfunction(L, push_task_complete);
         lua_pushlightuserdata(L, &o);
         lua_pushlightuserdata(L, &tasks[i]);
+        kibi_lua_arena_hold();
         int status = lua_pcall(L, 2, 0, 0);
+        kibi_lua_arena_release();
         kibi_lua_arena_reset();
-        if (status != LUA_OK) {
-            collecting = 0;
-            lua_error(L);
-        }
+        if (status != LUA_OK) lua_error(L);
         finish_task(i);
     }
-    collecting = 0;
 }
 
 /*
@@ -527,17 +522,18 @@ static int copy_taken(lua_State *L) {
 
 /*
  * その場で終わった呼び出しの結果 [o]（take の結果。pending-call は閉じ済み）を、値として返すか、エラーにする。
- * 写す途中の確保で GC が走ると、__gc の中から os.queueEvent などで kibi_lua_tasks_collect が入れ子で走り、arena（今写している結果の
- * 場所）と表を動かすので、写す間は collecting で入れ子の回収を止める。写す途中でメモリ不足になってもフラグは戻す
+ * 写す途中の確保で GC が走ると、__gc の中から os.queueEvent などで回収（カーネルのイベントの取り出しと kibi_lua_tasks_collect）が
+ * 入れ子で走り、arena（今写している結果の場所）と表を動かすので、写す間は kibi_lua_arena_hold で入れ子の回収を止める。
+ * 写す途中でメモリ不足になっても、pcall で受けてから release する
  */
 static int return_taken(lua_State *L, kibi_device_option_result_values_t *o, const call_t *c) {
     int base = lua_gettop(L);
-    collecting = 1;
     lua_pushcfunction(L, copy_taken);
     lua_pushlightuserdata(L, o);
     lua_pushlightuserdata(L, (void *)c);
+    kibi_lua_arena_hold();
     int status = lua_pcall(L, 2, LUA_MULTRET, 0);
-    collecting = 0;
+    kibi_lua_arena_release();
     kibi_lua_arena_reset();
     if (status != LUA_OK) return lua_error(L);
     if (o->val.is_err) {
