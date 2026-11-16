@@ -566,14 +566,63 @@ object MachineSaveGameTests {
     /**
      * 停止の手順（`saveForStop`）で、FULL でなくなったばかりのチャンク（1人プレイの「保存してタイトルに戻る」で、プレイヤーの
      * チケットが先に外れたとき。tick の終わりの `saveForDemotion` はまだ回っていない）のケースも、書けた世代でチャンクに未保存の印が付く
-     * （#653。`setChanged` は FULL でないチャンクに届かず、`demotedChunk` もまだない）
+     * （#653。`setChanged` は FULL でないチャンクに届かないので呼ばず、`demotedChunk` もまだない）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun stopMarksAChunkThatJustLeftFull(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 400, stopFirst = false) { be, latest, changes ->
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 1, "the stop should save the case")
+            val identity = be.identity
+            helper.assertTrue(identity != null, "the stop should adopt the written generation")
+            helper.assertTrue(latest.isUnsaved, "the stop should mark the chunk that left FULL unsaved")
+            helper.assertTrue(be.setChangedCalls == changes, "the stop should not call setChanged on a chunk that is not FULL")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(
+                tag.getString(CaseBlockEntity.MACHINE_ID_TAG) == identity!!.id.toString() &&
+                    tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG) == identity.generation,
+                "the NBT should point at $identity: $tag",
+            )
+            // 次の tick の終わりに、FULL でなくなった経路がマシンを外す
+            be.demotedChunk != null && be.computer.machine == null
+        }
+    }
+
+    /**
+     * 停止の手順（`saveForStop`）で、FULL でなくなったばかりのチャンクの止まった台（ゲストが止めた。知らせはまだ届いていない）は、
+     * `setChanged` を呼ばずに（`quiet` でそろえて）電源を切り、チャンクに直接未保存の印を付ける（#653・#698）。取り出しはしない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun stopMarksAChunkThatJustLeftFullForAStoppedMachine(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 440, stopFirst = true) { be, latest, changes ->
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 0, "a stopped machine should not be captured")
+            helper.assertTrue(be.setChangedCalls == changes, "the stop should not call setChanged on a chunk that is not FULL")
+            helper.assertTrue(!be.computer.poweredOn && be.computer.machine == null, "the stop should power the case off but was ${be.computer}")
+            helper.assertTrue(latest.isUnsaved, "the stop should mark the chunk that left FULL unsaved so that PoweredOn=false reaches the disk")
+            helper.assertTrue(be !in ServerMachines.unmarkedCases, "a visible chunk should be marked at once")
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+            helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
+            true
+        }
+    }
+
+    /**
+     * 離れたチャンクに動いている台を置き、強制読み込みを外して FULL でなくなったところ（tick の終わりの `saveForDemotion` の前）で
+     * [check] を呼ぶ（チャンクの印は外してから渡す。3つ目の引数は、その時点の `setChangedCalls`）。[check] が真を返すまで待ってから片付ける。
+     * [stopFirst] なら、FULL でなくす前にマシンを止める（ゲストが止めたのと同じ `stop()`。tick が回らないので知らせは届かない）。
+     * 並行するテストと重ならないように、チャンクは [chunkOffsetZ] でずらす
+     */
+    private fun stopOnChunkThatJustLeftFull(
+        helper: GameTestHelper,
+        chunkOffsetZ: Int,
+        stopFirst: Boolean,
+        check: (CaseBlockEntity, LevelChunk, Int) -> Boolean,
+    ) {
         val level = helper.level
         // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + 400)
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + chunkOffsetZ)
         val keeper = ChunkPos(chunk.x + 5, chunk.z)
         val pos = BlockPos(chunk.minBlockX + 9, 200, chunk.minBlockZ + 6)
         level.setChunkForced(keeper.x, keeper.z, true)
@@ -588,11 +637,17 @@ object MachineSaveGameTests {
             level.setChunkForced(chunk.x, chunk.z, false)
             level.setChunkForced(keeper.x, keeper.z, false)
         }
+        var done = false
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
             helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
         }.thenIdle(3).thenExecute {
             try {
+                if (stopFirst) {
+                    machine.stop()
+                    helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
+                    helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
+                }
                 // 置くときの getChunk の一時的なチケット（UNKNOWN。1 tick で切れる）が切れるのを待ってから、
                 // チケットを外し、tick を待たずにチケットの段階を下げる（1人プレイの切断の後の pollTask と同じ）
                 level.setChunkForced(chunk.x, chunk.z, false)
@@ -607,29 +662,21 @@ object MachineSaveGameTests {
                 helper.assertTrue(latest != null && latest.blockEntities[pos] === be, "the chunk should stay in memory with the case")
                 // 置いたときの印を外し、停止の手順が付けるかを見る
                 latest!!.isUnsaved = false
-                helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 1, "the stop should save the case")
-                val identity = be.identity
-                helper.assertTrue(identity != null, "the stop should adopt the written generation")
-                helper.assertTrue(latest.isUnsaved, "the stop should mark the chunk that left FULL unsaved")
-                val tag = be.saveWithoutMetadata(level.registryAccess())
-                helper.assertTrue(
-                    tag.getString(CaseBlockEntity.MACHINE_ID_TAG) == identity!!.id.toString() &&
-                        tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG) == identity.generation,
-                    "the NBT should point at $identity: $tag",
-                )
+                done = check(be, latest, be.setChangedCalls)
             } catch (t: Throwable) {
                 cleanUp()
                 throw t
             }
         }.thenWaitUntil {
-            // 次の tick の終わりに、FULL でなくなった経路がマシンを外す
-            helper.assertTrue(be.demotedChunk != null && be.computer.machine == null, "the demotion should release the machine but was ${be.computer}")
+            done = done || (be.demotedChunk != null && be.computer.machine == null)
+            helper.assertTrue(done, "the demotion should release the machine but was ${be.computer}")
         }.thenExecute {
             try {
                 ServerMachines.drainSaves()
                 level.setChunkForced(chunk.x, chunk.z, true)
                 level.getChunk(chunk.x, chunk.z)
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+                // 強制読み込みを外すとチャンクごと残るので、部品を落とさずに消す（#746）
+                removeCaseWithoutDrops(level, pos)
             } finally {
                 cleanUp()
             }

@@ -28,7 +28,8 @@
 4. **アンロード（`ChunkEvent.Unload`）だけは、書き込みの終わりを待たない。** 予約した世代を `identity` にして `setUnsaved(true)` を付ける（NBT は書き込み中の世代を指しうる）。
    自動保存の予約が書き込み中のときも、その予約の世代を採る。クラッシュ・書き込みの失敗で NBT の世代のファイルがないときは、規則 9 に落ちる
 5. **FULL でなくなったチャンク（#545）**: 2. と同じく、終わってから `identity` を進め、チャンクに `setUnsaved(true)` を付ける。終わる前にアンロードが来たら 4.
-   完了で印を付けるときは、チャンクが FULL（`hasChunkAt`）なら `setChanged`、FULL でなければ（`setChanged` が届かない）`ChunkHolder` の最新の `LevelChunk` に直接 `setUnsaved(true)` を付ける（チャンクを読み込み直さない）。停止（3.）で、プレイヤーのチケットが先に外れて FULL でなくなったばかりのチャンク（`saveForDemotion` がまだ回っていない）も同じ（#653）
+   完了で印を付けるときは、チャンクが FULL（`hasChunkAt`）なら `setChanged`、FULL でなければ（`setChanged` が届かない）`ChunkHolder` の最新の `LevelChunk` に直接 `setUnsaved(true)` を付ける（チャンクを読み込み直さない）。停止（3.）で、プレイヤーのチケットが先に外れて FULL でなくなったばかりのチャンク（`saveForDemotion` がまだ回っていない）も同じ（#653）。
+   アンロード待ちのチャンク（`processUnloads` が holder を外して `visibleChunkMap` から見えないが、アンロードの仕事がまだ走っていない）では印を付けられないので、ケースを覚えておき（`unmarkedCases`）、続くアンロード（`saveForUnload`）がそのチャンクに `setUnsaved(true)` を付ける。holder の最新のチャンクの中のブロックエンティティがそのケースでなければ（読み込み直した別のチャンク）付けない
 6. **読み込み直し**: 世代のファイルを読む側（#85）は先に `awaitWrites(id)` でその ID の仕事を待つ。`claim` はメモリの `owners` を先に見る（予約の時点で入れる）
 7. **同じ ID の仕事の順**: 世代の書き込み・新しい ID の `owner.bin`・掃除・ディレクトリの削除は、列に入れた順に走る。削除より前に入れた書き込みは削除より先に走り、削除で消える。
    「消した ID」の集合は持たない。走らせなかった仕事（閉じた後に入れた仕事、7b の後続）と仕事の中の例外は、すべて失敗の完了（`SaveCompletion`）で返す。

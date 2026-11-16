@@ -965,7 +965,8 @@ object ServerMachines {
     /**
      * [targets] を止め、まとめて待ち（上限 [MachineSaveConfig.stopQuiesceMillis]）、全台を `KILL_TRANSIENT` で取り出して書き込みに回し
      * （台ごとに書き込み待ちの上限を確かめる。期限は全体で共有）、書き込みのスレッドが空になるのを待って（[drainSaves]）、
-     * 書けた台に `setChanged` を付ける（続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く。#84 の規則 3）。
+     * 書けた台のチャンクに未保存の印を付ける（[markChunkUnsaved]。FULL のチャンクなら `setChanged`、FULL でなければ `setChanged` を呼ばずに
+     * チャンクに直接 `setUnsaved(true)`。続く `saveAllChunks(true)` が、強制読み込みのチャンクも含めて NBT を書く。#84 の規則 3・5、#653）。
      * [keepQuiesced] なら止めたままにする（サーバーの停止。取り出した後に状態が進まないように）。GameTest は `false` で続ける
      *
      * @return 書き込みに回した台の数
@@ -994,7 +995,7 @@ object ServerMachines {
         runAfterCaptureForTest(running)
         // 待ち・取り出しの間に止まった台も、電源を切った状態で NBT に載せる（写しは取らないか、取っても電源が切れているので戻されない。#698）
         for (be in running) settleStoppedForStop(be)
-        // 書き終わってから NBT の世代を進めて setChanged する（規則 3）
+        // 書き終わってから NBT の世代を進めてチャンクに印を付ける（processCompletions → markChunkUnsaved。規則 3・5）
         drainSaves()
         if (!keepQuiesced) for (be in running) be.computer.endQuiesce()
         if (keepQuiesced && running.isNotEmpty()) LOGGER.info("Saved {} of {} running computers", saved, running.size)
