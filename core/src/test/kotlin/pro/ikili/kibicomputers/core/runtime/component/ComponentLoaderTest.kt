@@ -1053,17 +1053,19 @@ class ComponentLoaderTest {
     /** 時間切れの発火の後に [fail] で終わる検証を [ComponentLoader.load] に渡して、出てきた失敗を返す */
     private fun loadFailingAfterTimeout(fail: () -> Nothing): Throwable? {
         val timer = ManualTimer()
-        var wall = 0L
-        val watchdog = ValidationWatchdog(timer, wallClock = { wall })
-        // 経過時間で測る上限（時計を進めて時間切れにする）
-        val deadline = LoadDeadline(1_000_000_000L, cpuClock = null)
+        var now = 0L
+        // 上限も見張りも、差し替えの時計だけで測る（進めるのは validate の中だけ）。本物の時計で測ると、
+        // full の初回の評価や load の先頭の検証器の初期化（初回は 1 秒ほど）が上限に入り、テストの順番しだいで
+        // validate に届く前にパーサー側の確認で断られる
+        val watchdog = ValidationWatchdog(timer, cpuReader = { now }, wallClock = { now })
+        val deadline = LoadDeadline(1_000_000_000L, cpuClock = { now })
         val e = runCatching {
             ComponentLoader.load(
                 full,
                 deadline = deadline,
                 watchdog = watchdog,
                 validate = {
-                    wall += 2_000_000_000L
+                    now += 2_000_000_000L
                     timer.tasks.last().second.run()
                     assertTrue(Thread.currentThread().isInterrupted)
                     fail()
