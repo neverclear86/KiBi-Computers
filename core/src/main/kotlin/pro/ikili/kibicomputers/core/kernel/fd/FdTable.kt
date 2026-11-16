@@ -88,16 +88,27 @@ internal class FdTable(
      *
      * 満杯なら `MFILE`（[file] は表に足さない。閉じるのは呼び出し側）
      */
-    fun openFile(file: OpenFile, vfs: Vfs, terminalId: Int, rights: Int, flags: Long = 0): Int = when (val special = vfs.specialLocked(file)) {
-        null -> open(file, rights, flags)
-        SpecialFile.Terminal -> {
-            if (terminalId == 0 || objects[terminalId] !is Tty) fsError(Errno.NXIO, "制御端末がない")
-            if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
-            objects.retain(terminalId)
-            handles.insert(HandleEntry(terminalId, flags, rights))
+    fun openFile(file: OpenFile, vfs: Vfs, terminalId: Int, rights: Int, flags: Long = 0): Int {
+        if (handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${handles.limit}）")
+        return install(openObject(file, vfs, objects, terminalId), rights, flags)
+    }
+
+    companion object {
+        /**
+         * [Vfs.open] で開いた [file] を、fd 表に入れずにオブジェクト表に置き、参照を 1 つ持ったオブジェクトID を返す
+         * （[openFile] の差し替えの中身。p2 の descriptor も同じ口を通る。#267、ADR 0054）。差し替え先のあるファイルなら [file] は
+         * 置かない（閉じるのは呼び出し側）。制御端末がなければ `NXIO`、デバイスが外れていれば `NOENT`
+         */
+        fun openObject(file: OpenFile, vfs: Vfs, objects: ObjectTable, terminalId: Int): Int = when (val special = vfs.specialLocked(file)) {
+            null -> objects.add(file)
+            SpecialFile.Terminal -> {
+                if (terminalId == 0 || objects[terminalId] !is Tty) fsError(Errno.NXIO, "制御端末がない")
+                objects.retain(terminalId)
+                terminalId
+            }
+            is SpecialFile.Device -> objects.add(DeviceHandle(special.address, special.kind))
+            SpecialFile.Detached -> fsError(Errno.NOENT, "デバイスが外れた")
         }
-        is SpecialFile.Device -> open(DeviceHandle(special.address, special.kind), rights, flags)
-        SpecialFile.Detached -> fsError(Errno.NOENT, "デバイスが外れた")
     }
 
     /**

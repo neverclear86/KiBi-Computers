@@ -91,6 +91,19 @@ int main(void) {
     CHECK(fd >= 0 && write(fd, "R", 1) == 1 && close(fd) == 0);
     CHECK(stat("/data/rel.txt", &st) == 0 && st.st_size == 1);
 
+    // 読むだけで開いたサブディレクトリの fd を基点に変える（p2 では、開いた descriptor が preopen の mutate-directory を引き継ぐ。#267）
+    CHECK(mkdir("/data/s", 0755) == 0);
+    int dfd = open("/data/s", O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0);
+    CHECK(mkdirat(dfd, "sd", 0755) == 0);
+    fd = openat(dfd, "f.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0 && write(fd, "F", 1) == 1 && close(fd) == 0);
+    CHECK(renameat(dfd, "f.txt", dfd, "sd/g.txt") == 0);
+    CHECK(unlinkat(dfd, "sd/g.txt", 0) == 0);
+    CHECK(unlinkat(dfd, "sd", AT_REMOVEDIR) == 0);
+    CHECK(close(dfd) == 0);
+    CHECK(rmdir("/data/s") == 0);
+
     printf("OK\n");
     return 0;
 }

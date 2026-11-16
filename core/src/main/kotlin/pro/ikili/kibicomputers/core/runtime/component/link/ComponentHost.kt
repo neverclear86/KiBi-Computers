@@ -8,8 +8,8 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
  * ホスト（カーネル）が出すインターフェースの一覧（#263）。コンポーネントのトップレベルの import（インターフェースの名前）を、
  * リンクのとき（読み込みのスレッド）に引く。
  *
- * どの名前・どの版を受け付けるか（`wasi:*` の `@0.2.x` の違いを互換として受けるかなど）はシステムコールの ABI に関わるので、
- * 実物の一覧は #267（`wasi:*`）・#685（`kibi:*`）が決める。この口は差し替えられる形にしておき、#263 ではテスト用のものだけを渡す
+ * `wasi:*` の実物は `WasiP2Host`（版の受け付け方とホストの一覧は ADR 0267）。`kibi:*` は #685 が足す。
+ * テストは、宣言に合わせたホストを渡してよい
  */
 internal fun interface ComponentHost {
     /** import の名前 [name]（`ns:pkg/iface@版`）のインターフェース。出さないなら `null` */
