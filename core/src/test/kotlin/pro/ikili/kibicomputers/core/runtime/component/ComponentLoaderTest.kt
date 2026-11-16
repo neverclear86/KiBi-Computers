@@ -14,6 +14,10 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.runtime.validation.ModulePrescan
+import pro.ikili.kibicomputers.core.runtime.validation.ValidationWatchdog
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
@@ -481,7 +485,7 @@ class ComponentLoaderTest {
     fun `wasm-toolsの検証をまたいだ時間も上限に数える`() {
         val limit = 500_000_000L
         val limits = ComponentLimits(moduleLimits = ModuleLimits(timeLimitNanos = limit))
-        // 検証が終わった後の確認で断る（検証の間は止められないので、終わった後で確かめる）
+        // 割り込みで止まらない差し替えの検証は、見張りが時間切れにし、終わった後で断る
         val e = assertThrows<WasmLoadException> {
             ComponentLoader.load(full, limits) { image ->
                 ComponentValidator.validate(image)
@@ -746,6 +750,102 @@ class ComponentLoaderTest {
         assertDoesNotThrow { ComponentValidator.validate(ValidationImage.of(c, root)) }
     }
 
+    /** WAT の一番外の `(component ...)` の中の、トップレベルの形（括弧の対応で切り出す。文字列とコメントは飛ばす） */
+    private fun topLevelForms(text: String): List<String> {
+        val forms = ArrayList<String>()
+        var i = text.indexOf("(component") + "(component".length
+        var depth = 0
+        var start = -1
+        var inString = false
+        while (i < text.length) {
+            val ch = text[i]
+            when {
+                inString -> if (ch == '\\') i++ else if (ch == '"') inString = false
+                ch == '"' -> inString = true
+                ch == ';' && text.startsWith(";;", i) -> i = text.indexOf('\n', i).let { if (it < 0) text.length else it }
+                ch == '(' && text.startsWith("(;", i) -> i = text.indexOf(";)", i) + 1
+                ch == '(' -> {
+                    if (depth == 0) start = i
+                    depth++
+                }
+                ch == ')' -> {
+                    if (depth == 0) break
+                    depth--
+                    if (depth == 0) forms += text.substring(start, i + 1)
+                }
+            }
+            i++
+        }
+        return forms
+    }
+
+    /**
+     * wac の plug と同じ形の合成。filesystem に近い規模のインターフェースを [k] 個 import して同じものを export する
+     * コンポーネント（ツールチェーンで作る）を、前のインスタンスの export を次の引数にして [n] 回つなぐ
+     */
+    private fun composedComponent(k: Int, n: Int): ByteArray {
+        val fields = (0 until 12).joinToString(", ") { "f$it: u64" }
+        val cases = (0 until 37).joinToString(", ") { "e$it" }
+        val funcs = (0 until 40).joinToString("\n") { "m$it: func(d: borrow<descriptor>, s: stat, o: option<list<stat>>) -> result<tuple<stat, u64>, error-code>;" }
+        val interfaces = (0 until k).joinToString("\n") { j ->
+            """
+            interface i$j {
+                record stat { $fields }
+                enum error-code { $cases }
+                flags open-flags { create, directory, exclusive, truncate }
+                variant entry { file(stat), dir(list<stat>), link(string), other }
+                resource descriptor {
+                    open: func(f: open-flags) -> result<descriptor, error-code>;
+                    read-dir: func() -> result<list<entry>, error-code>;
+                }
+                $funcs
+            }
+            """
+        }
+        val world = (0 until k).joinToString("\n") { "import i$it; export i$it;" }
+        val wit = "package test:fs@0.2.0;\n$interfaces\nworld w {\n$world\n}"
+        val embed = WitTool.run(
+            listOf("component", "embed", "--dummy", "-w", "w", "${WitTool.WORK}/w.wit", "-o", "${WitTool.WORK}/core.wasm"),
+            mapOf("w.wit" to wit.toByteArray()),
+            listOf("core.wasm"),
+        )
+        assertEquals(0, embed.exitCode) { embed.stderr }
+        val made = WitTool.run(
+            listOf("component", "new", "${WitTool.WORK}/core.wasm", "-o", "${WitTool.WORK}/c.wasm"),
+            mapOf("core.wasm" to embed.outputs.getValue("core.wasm")),
+            listOf("c.wasm"),
+        )
+        assertEquals(0, made.exitCode) { made.stderr }
+        val printed = WitTool.run(listOf("print", "${WitTool.WORK}/c.wasm"), mapOf("c.wasm" to made.outputs.getValue("c.wasm")))
+        assertEquals(0, printed.exitCode) { printed.stderr }
+        val text = printed.stdout.trim()
+        // 外側も同じ型で import する（部品の先頭の型・import・alias を写す。import は instance 0..k-1 になる）
+        val prelude = topLevelForms(text).takeWhile { it.startsWith("(type") || it.startsWith("(import") || it.startsWith("(alias") }
+        val out = StringBuilder("(component\n")
+        prelude.forEach { out.append(it).append('\n') }
+        out.append("(component ${'$'}c ").append(text.removePrefix("(component")).append('\n')
+        for (x in 1..n) {
+            val args = (0 until k).joinToString(" ") { j ->
+                val from = if (x == 1) "$j" else "${'$'}e${x - 1}_$j"
+                """(with "test:fs/i$j@0.2.0" (instance $from))"""
+            }
+            out.append("(instance ${'$'}x$x (instantiate ${'$'}c $args))\n")
+            for (j in 0 until k) out.append("""(alias export ${'$'}x$x "test:fs/i$j@0.2.0" (instance ${'$'}e${x}_$j))""").append('\n')
+        }
+        return wat(out.append(")").toString())
+    }
+
+    @Test
+    fun `wacで合成した形の見積もりの余裕`() {
+        // 実物の確かめ（#666。ADR 0262 の「検証の時間の見積もり」）。見積もりは引数ごとに部品の型の大きさ（最大 3,620）を数えるので、
+        // 引数の総数に比例して大きくなる。インターフェース 4 個 × 4 段は上限の 1/6、10 個 × 10 段は上限の手前（約 1.9M）で、
+        // 実際の検証は 0.3 秒ほど。余裕は 10 倍を切る（ADR に書いた）
+        val small = composedComponent(k = 4, n = 4)
+        val e = estimateOf(small)
+        assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
+        assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+    }
+
     @Test
     fun `検証中にスレッドが割り込まれたらloadは内容の失敗にしない`() {
         ComponentValidator.warmUp()
@@ -781,6 +881,172 @@ class ComponentLoaderTest {
         val e = failure
         assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED) { "$e" }
         assertTrue(flag)
+    }
+
+    /** 見積もりを外し、時間の上限を [limitMillis] ms にした上限 */
+    private fun timeLimited(limitMillis: Long) =
+        ComponentLimits(moduleLimits = ModuleLimits(timeLimitNanos = limitMillis * 1_000_000L), maxValidationCost = Long.MAX_VALUE)
+
+    /** 見積もりを外すと検証が秒単位で膨らむ形（部分型、record、関数型） */
+    private val slowShapes: List<Pair<String, ByteArray>> by lazy {
+        val fields = (0 until 4000).joinToString(" ") { """(field "f$it" u32)""" }
+        val params = (0 until 1000).joinToString(" ") { """(param "p$it" u32)""" }
+        listOf(
+            "部分型" to subtypeComponent(n = 2000, k = 100, m = 100),
+            "record" to typedArgComponent("(record $fields)", k = 100, m = 100, prelude = "", import = "(type (eq ${'$'}tb))", arg = "(type ${'$'}ta)"),
+            "関数型" to typedArgComponent(
+                "(func $params)", k = 100, m = 100,
+                prelude = """(import "g" (func ${'$'}g (type ${'$'}ta)))""", import = "(func (type ${'$'}tb))", arg = "(func ${'$'}g)",
+            ),
+        )
+    }
+
+    @Test
+    fun `見積もりをすり抜けて重い検証も時間の上限で止めて内容の失敗にする`() {
+        ComponentValidator.warmUp()
+        val limitMillis = 300L
+        // 同じスレッドで続けて読む（時間切れの割り込みが遅れて届き、次の読み込みを止めないこと）
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            for ((name, bytes) in slowShapes) {
+                val result = pool.submit(
+                    Callable {
+                        val start = System.nanoTime()
+                        val e = runCatching { ComponentLoader.load(bytes, timeLimited(limitMillis)) }.exceptionOrNull()
+                        val took = System.nanoTime() - start
+                        val flag = Thread.currentThread().isInterrupted
+                        // すぐ後の、正しいコンポーネントの読み込みは通る
+                        val next = runCatching { ComponentLoader.load(full) }.exceptionOrNull()
+                        listOf(e, took, flag, next)
+                    },
+                ).get(60, TimeUnit.SECONDS)
+                val e = result[0] as Throwable?
+                assertTrue(e is WasmLoadException) { "$name: $e" }
+                assertMessage(e as Exception, "時間の上限（$limitMillis ms）を超えた（コンポーネントの検証、")
+                assertTrue((result[1] as Long) < 5_000_000_000L) { "$name: ${(result[1] as Long) / 1_000_000} ms" }
+                assertTrue(!(result[2] as Boolean)) { "$name: 割り込みの印が残っている" }
+                assertNull(result[3]) { "$name: 次の読み込みが失敗した: ${result[3]}" }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `coreのインスタンス化の引数が多い形も時間の上限で止める`() {
+        // import 10,000 個の core モジュールを、export を並べた core インスタンスで 500 回インスタンス化する（約 440 KB）。
+        // 見積もりには入れていない形（import ごとに確かめるので入力の大きさに比例し、wasm-tools の core インスタンスの上限
+        // 1,000 個までで CPU 約 3.5 秒に収まる）。見張りで止まることを確かめる
+        val exports = (0 until 10_000).joinToString(" ") { """(func (export "f$it"))""" }
+        val imports = (0 until 10_000).joinToString(" ") { """(import "env" "f$it" (func))""" }
+        val inline = (0 until 10_000).joinToString(" ") { """(export "f$it" (func ${'$'}i "f$it"))""" }
+        val instances = (0 until 500).joinToString(" ") { """(core instance (instantiate ${'$'}m (with "env" (instance ${'$'}x))))""" }
+        val bytes = wat(
+            """
+            (component
+              (core module ${'$'}e $exports)
+              (core instance ${'$'}i (instantiate ${'$'}e))
+              (core instance ${'$'}x $inline)
+              (core module ${'$'}m $imports)
+              $instances
+            )
+            """,
+        )
+        assertEquals(0L, estimateOf(bytes).cost)
+        ComponentValidator.warmUp()
+        val start = System.nanoTime()
+        val e = assertThrows<WasmLoadException> { ComponentLoader.load(bytes, timeLimited(200)) }
+        assertMessage(e, "時間の上限（200 ms）を超えた")
+        assertTrue(System.nanoTime() - start < 5_000_000_000L)
+        assertTrue(!Thread.currentThread().isInterrupted)
+    }
+
+    @Test
+    fun `ComponentProgramの読み込みでも検証を同じ上限で止める`() {
+        ComponentValidator.warmUp()
+        val bytes = slowShapes.first().second
+        val start = System.nanoTime()
+        val e = assertThrows<WasmLoadException> {
+            ComponentProgram.load(LinkTesting.runtime, bytes, ComponentHost.NONE, limits = timeLimited(300))
+        }
+        assertMessage(e, "コンポーネントの検証、")
+        assertTrue(System.nanoTime() - start < 5_000_000_000L)
+        assertTrue(!Thread.currentThread().isInterrupted)
+    }
+
+    @Test
+    fun `時間の上限で止めた検証は、ほかの理由の割り込みと区別する`() {
+        ComponentValidator.warmUp()
+        // 見張りが時間切れにする前に割り込まれたら、今どおり INTERRUPTED（印も立てたまま）
+        val slow = slowShapes.first().second
+        var failure: Throwable? = null
+        var flag = false
+        val t = Thread {
+            failure = runCatching { ComponentLoader.load(slow, timeLimited(60_000)) }.exceptionOrNull()
+            flag = Thread.currentThread().isInterrupted
+        }
+        t.start()
+        Thread.sleep(300)
+        t.interrupt()
+        t.join(10_000)
+        assertTrue(!t.isAlive)
+        val e = failure
+        assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED) { "$e" }
+        assertTrue(flag)
+    }
+
+    /** 手で動かすタイマー（予定を貯めるだけ） */
+    private class ManualTimer : ValidationWatchdog.Timer {
+        val tasks = ArrayList<Pair<Long, Runnable>>()
+
+        override fun schedule(delayNanos: Long, task: Runnable): java.util.concurrent.Future<*> {
+            tasks += delayNanos to task
+            return java.util.concurrent.CompletableFuture<Unit>()
+        }
+    }
+
+    @Test
+    fun `見張りは終わった後に発火しても割り込まない`() {
+        val timer = ManualTimer()
+        val watchdog = ValidationWatchdog(timer)
+        // 上限が負: 最初の発火で時間切れになる
+        val w = watchdog.watch(LoadDeadline(-1))
+        assertEquals(1, timer.tasks.size)
+        assertTrue(timer.tasks[0].first >= ValidationWatchdog.MIN_DELAY_NANOS)
+        assertTrue(!w.finish())
+        timer.tasks[0].second.run()
+        assertTrue(!Thread.currentThread().isInterrupted)
+        assertTrue(!w.timedOut)
+
+        // 終わる前に発火すれば、割り込んで、finish が印を下ろす
+        val w2 = watchdog.watch(LoadDeadline(-1))
+        timer.tasks.last().second.run()
+        assertTrue(Thread.currentThread().isInterrupted)
+        assertTrue(w2.finish())
+        assertTrue(!Thread.currentThread().isInterrupted)
+        // 終わった後の発火は何もしない
+        timer.tasks.last().second.run()
+        assertTrue(!Thread.currentThread().isInterrupted)
+    }
+
+    @Test
+    fun `見張りは上限に届くまで予定を入れ直す`() {
+        val timer = ManualTimer()
+        val w = ValidationWatchdog(timer).watch(LoadDeadline(Long.MAX_VALUE / 2))
+        timer.tasks.last().second.run()
+        assertEquals(2, timer.tasks.size)
+        assertTrue(!Thread.currentThread().isInterrupted)
+        assertTrue(!w.finish())
+    }
+
+    @Test
+    fun `見張りがloadの検証の後に発火しても割り込まない`() {
+        val timer = ManualTimer()
+        ComponentValidator.warmUp()
+        ComponentLoader.load(full, watchdog = ValidationWatchdog(timer))
+        assertTrue(timer.tasks.isNotEmpty())
+        for ((_, task) in timer.tasks.toList()) task.run()
+        assertTrue(!Thread.currentThread().isInterrupted)
     }
 
     @Test

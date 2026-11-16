@@ -3,8 +3,9 @@ package pro.ikili.kibicomputers.core.runtime.component
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 
 /**
- * wasm-tools の検証にかかる時間の見積もり（#262）。検証は、時間の上限（`LoadDeadline`）では途中で止まらない
- * （止められるのはスレッドの割り込みだけ。時間で止める形は #666）ので、始める前に、時間が膨らむ形を見積もりで断る。
+ * wasm-tools の検証にかかる時間の見積もり（#262）。検証は、見張り（`ValidationWatchdog`）が時間の上限（`LoadDeadline`）で
+ * 割り込んで止める（#666）が、それでも1件でコンパイル用のスレッドを上限の時間まで占有できる。わかっている、時間が膨らむ形は、
+ * 始める前に見積もりで、すぐ決定的に断る（見張りの前の、最初の防御）。
  *
  * 検証が、入力の大きさに対して大きく膨らむ形のうち、確かめて分かっているのは次の1つ:
  * 型の確認（渡す値の型が、受ける側の型の部分型か）を、同じ大きな型について何度もさせる。型の確認は、型を展開した
@@ -23,7 +24,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
  *   （参照できる型は、バイナリの中でそれより前に定義されているので、実際より小さくならない）
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
- * ほかの形の膨らみは、見つけていない（探すのは #666）。上限は、見つけたときに足す。
+ * ほかの形の膨らみは、#666 で探して見つからなかった（core のインスタンス化の引数、resource と canon。入力の大きさに比例するだけ。
+ * ADR 0262）。見積もりにない形は、見張りが時間の上限で止める。
  */
 internal object ComponentValidationCost {
     /** 型の大きさの上限。wasmparser は、これ（`MAX_WASM_TYPE_SIZE`）を超える型を、型を定義したときに断る */

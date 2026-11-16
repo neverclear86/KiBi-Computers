@@ -12,9 +12,17 @@ import java.lang.management.ThreadMXBean
  *
  * ランタイム（Endive）のパースと検証は途中で止められないので、その間は [check] を呼べない。
  * そこにかかる時間は、[ModuleLimits] の大きさの上限で抑え、終わった後の [check] で超えていれば断る。
+ * コンポーネントの wasm-tools の検証だけは、別のスレッド（[ValidationWatchdog]）が時間を見て割り込み、途中で止める（#666）。
  */
-internal class LoadDeadline(private val limitNanos: Long) {
-    private val clock: () -> Long = cpuClock() ?: System::nanoTime
+internal class LoadDeadline(
+    /** 上限（ナノ秒） */
+    val limitNanos: Long,
+) {
+    private val clock: () -> Long = cpuClock() ?: WALL
+
+    /** CPU 時間で測っているか（`false` なら経過時間） */
+    val usesCpuTime: Boolean = clock !== WALL
+
     private val start = clock()
 
     /** 使った時間（ナノ秒） */
@@ -24,12 +32,20 @@ internal class LoadDeadline(private val limitNanos: Long) {
     @Throws(WasmLoadException::class)
     fun check(phase: String) {
         val elapsed = elapsedNanos
-        if (elapsed > limitNanos) {
-            throw WasmLoadException("WASM の検証が時間の上限（${limitNanos / 1_000_000} ms）を超えた（$phase、${elapsed / 1_000_000} ms）")
-        }
+        if (elapsed > limitNanos) throw exceeded(phase, elapsed)
     }
 
+    /**
+     * 上限を超えたときの例外（[check] と同じメッセージ）。[elapsed] は使った時間（ナノ秒）。
+     * [ValidationWatchdog] が途中で止めたときに、呼んだ側がこれを投げる
+     */
+    fun exceeded(phase: String, elapsed: Long = elapsedNanos, cause: Throwable? = null): WasmLoadException =
+        WasmLoadException("WASM の検証が時間の上限（${limitNanos / 1_000_000} ms）を超えた（$phase、${elapsed / 1_000_000} ms）", cause)
+
     private companion object {
+        /** 経過時間の時計（[usesCpuTime] の見分けに使う） */
+        val WALL: () -> Long = System::nanoTime
+
         /** このスレッドの CPU 時間を測る時計。測れなければ `null` */
         fun cpuClock(): (() -> Long)? = try {
             val bean: ThreadMXBean = ManagementFactory.getThreadMXBean()
