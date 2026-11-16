@@ -63,7 +63,7 @@
 
 ### exec
 
-コンポーネントを `exec` で動かす（ABI 層のドライバーを選び、`ModulePrescan` の `NOEXEC` の分岐を外す）のは、`wasi:cli/run` の版の扱い（#267・#268）と、検証の時間の止め方（#666）が決まってからにし、#687 で行う。`KernelDrivers.DEFAULT` は、コンポーネントの `Program` を `NOEXEC` で断る。
+コンポーネントを `exec` で動かす（ABI 層のドライバーを選び、`ModulePrescan` の `NOEXEC` の分岐を外す）のは、`wasi:cli/run` の版の扱い（#267・#268）が決まってからにし、#687 で行う（検証の時間の止め方は #666 で決まった。ADR 0666）。`KernelDrivers.DEFAULT` は、コンポーネントの `Program` を `NOEXEC` で断る。
 
 ## テスト
 

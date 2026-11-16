@@ -30,10 +30,10 @@ import java.util.Random
  * - 機能は [FEATURES] で明示する（wasm-tools の既定や `all` にしない）
  * - ゲストの線形メモリに上限（[MAX_MEMORY_PAGES]）を付ける
  * - 失敗は [WasmLoadException] にする。メッセージには標準エラー出力の先頭を入れる
- * - 検証の時間の上限は持たない（`LoadDeadline` は検証の間は確かめられない。呼ぶ側が見積もりで重いものを断る。
- *   時間で止める形は #666）。スレッドの割り込み（`Thread.interrupt`。スケジューラの停止が使う）では途中で止まり、
- *   内容の失敗ではないので [WasmLoadException] ではなく [WasmTrapException]（[WasmTrapKind.INTERRUPTED]）にする
- *   （割り込みの印は立てたまま返す）
+ * - 検証の時間の上限は、ここでは持たない。スレッドの割り込み（`Thread.interrupt`）で途中で止まり、ここでは
+ *   [WasmTrapException]（[WasmTrapKind.INTERRUPTED]。割り込みの印は立てたまま）にする。時間で止めるのは呼ぶ側
+ *   （`ComponentLoader` が `ValidationWatchdog` で見張り、時間切れの割り込みなら、時間の上限を超えた [WasmLoadException] に変える。#666）。
+ *   それ以外の割り込み（スケジューラの停止）は内容の失敗ではないので、[WasmTrapException] のまま
  *
  * 状態を持たないので、どのスレッドから同時に呼んでもよい（呼び出しごとに WASI とインスタンスを作って閉じる）。
  * 重い（2回目以降で数十 ms）ので、コンパイル用のスレッド（#29・#37）から呼ぶ。メインスレッドと tick からは呼ばない。
