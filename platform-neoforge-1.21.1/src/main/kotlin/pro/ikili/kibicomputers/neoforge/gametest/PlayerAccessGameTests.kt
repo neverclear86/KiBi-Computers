@@ -46,12 +46,15 @@ import pro.ikili.kibicomputers.core.access.PlayerRef
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.input.KeyboardEvent
+import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.PlayerAccessNbt
+import pro.ikili.kibicomputers.neoforge.input.KeyboardInputPayload
 import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
@@ -410,30 +413,50 @@ object PlayerAccessGameTests {
         helper.assertTrue(!copy.checkAccess(alex) && !copy.checkAccess(stranger) && copy.checkAccess(op), "only operators should use a locked case")
         val written = copy.saveWithoutMetadata(registries).getCompound(CaseBlockEntity.PLAYER_ACCESS_TAG)
         helper.assertTrue(written == unknown, "the unknown tag should be written back as read: $written")
+
+        // locked の記録への変更（locked ならそのまま返る）を渡しても、生のタグは捨てず、読み直しても locked のまま
+        copy.replacePlayerAccess(copy.playerAccess.addPending("bob", System.currentTimeMillis(), CaseAccess.rules()).access)
+        helper.assertTrue(copy.playerAccess.locked, "a change to a locked record should keep it locked")
+        val rewritten = copy.saveWithoutMetadata(registries)
+        helper.assertTrue(rewritten.getCompound(CaseBlockEntity.PLAYER_ACCESS_TAG) == unknown, "the raw tag should survive: $rewritten")
+        val reloaded = placeCase(helper, CASE.below())
+        reloaded.loadWithComponents(rewritten, registries)
+        helper.assertTrue(reloaded.playerAccess.locked, "the locked case should stay locked after a save and reload")
+        // locked でないケースを locked にはできない（保存すると持ち主なしに戻ってしまう）
+        val refused = runCatching { ownerless.replacePlayerAccess(PlayerAccess.LOCKED) }.exceptionOrNull()
+        helper.assertTrue(refused is IllegalArgumentException, "making a readable case locked should be refused but was $refused")
+        helper.assertTrue(!ownerless.playerAccess.hasOwner, "the refused replacement should not change the access")
         helper.succeed()
     }
 
     /**
      * キーボード: 他人のケースにつながったキーボードは開けない。つながっていない間に開いたセッションは、持ち主のあるケースが電源を
-     * 入れてつないだら次の tick で閉じる。持ち主のセッションは続く
+     * 入れてつないだら、次の入力で（ケースに届く前に捨てて）閉じるか、次の tick で閉じる。持ち主のセッションは続き、入力も届く
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200)
     fun keyboardSessionsFollowTheWiredCase(helper: GameTestHelper) {
         val alex = player(helper, "Alex131h")
         val stranger = player(helper, "Stranger131h")
+        val typist = player(helper, "Typist131h")
         val be = placeBy(helper, alex)
         be.fallbackBootDisk = pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot.TEST_BOOT_DISK
         installRequired(be)
         helper.setBlock(KEYBOARD, KiBiBlocks.KEYBOARD.get())
         val keyboard = helper.absolutePos(KEYBOARD)
-        for (p in listOf(alex, stranger)) p.moveTo(Vec3.atCenterOf(keyboard.east()))
+        for (p in listOf(alex, stranger, typist)) p.moveTo(Vec3.atCenterOf(keyboard.east()))
 
         // つながっていない間は誰でも開ける
         helper.assertTrue(KeyboardSessions.open(stranger, keyboard, null) != null, "an unwired keyboard should open for anyone")
-        helper.assertTrue(KeyboardSessions.open(alex, keyboard, null) != null, "the owner should open the keyboard")
+        val typing = KeyboardSessions.open(typist, keyboard, null) ?: throw GameTestAssertException("an unwired keyboard should open for anyone")
+        val owners = KeyboardSessions.open(alex, keyboard, null) ?: throw GameTestAssertException("the owner should open the keyboard")
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         helper.assertTrue(be.wiring.connectedKeyboard != null, "the keyboard should be wired to the case")
+        // tick の前に届いた入力も、入力のたびの確かめで捨て、セッションを閉じる。持ち主の入力は届く
+        val data = KeyboardEventCodec.encode(listOf(KeyboardEvent.Text("x"))).single()
+        helper.assertTrue(KeyboardSessions.receive(typist, KeyboardInputPayload(typing.id, data)) == -1, "input from a player who may not use the case should be rejected")
+        helper.assertTrue(KeyboardSessions.sessionOf(typist) == null, "the rejected player's session should be closed")
+        helper.assertTrue(KeyboardSessions.receive(alex, KeyboardInputPayload(owners.id, data)) == 1, "the owner's input should reach the case")
         KeyboardSessions.tick()
         helper.assertTrue(KeyboardSessions.sessionOf(stranger) == null, "the stranger's session should close once the keyboard is wired to an owned case")
         helper.assertTrue(KeyboardSessions.sessionOf(alex) != null, "the owner's session should stay")

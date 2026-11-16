@@ -183,8 +183,18 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /** 持ち主の UUID（持ち主なし・読めなかった記録なら `null`。#205 のプレイヤーごとの台数で使う） */
     internal val ownerPlayerId: UUID? get() = playerAccess.owner?.id
 
-    /** 持ち主と権限を [access] に置き換える（設置・テスト・#110 の管理）。読めなかった生のタグは捨てる */
+    /**
+     * 持ち主と権限を [access] に置き換える（設置・テスト・#110 の管理）。読めなかった生のタグは捨てる。
+     *
+     * locked（読めなかった記録）は読み込みからだけ作る。locked の今の値の変更の結果（[PlayerAccess.addPending] などは locked なら
+     * そのまま返す）を渡したときは何もせず、生のタグを持ち続ける。locked でないケースを locked にはできない（生のタグがないと保存で
+     * 何も書けず、読み直すと持ち主なしに戻ってしまう）ので、[IllegalArgumentException] を投げる
+     */
     internal fun replacePlayerAccess(access: PlayerAccess) {
+        if (access.locked) {
+            require(playerAccess.locked) { "a locked access can only come from loading an unreadable record" }
+            return
+        }
         if (access === playerAccess && rawPlayerAccess == null) return
         playerAccess = access
         rawPlayerAccess = null
