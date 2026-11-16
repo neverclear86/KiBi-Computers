@@ -146,6 +146,32 @@ class LuaKibiApiRestoreTest {
     }
 
     @Test
+    fun `parallelの中のperipheral_callで実行中に保存して戻すと、そのコルーチンはinterruptedになり、ほかも続く`() = timeout(limit) {
+        val calls = AtomicInteger()
+        val out = saveAndRestore(
+            """
+            parallel.waitForAll(
+                function() print(pcall(peripheral.call, '$address', 'defer')) end,
+                function()
+                    os.sleep(0.05); print('waiting'); io.stdout:flush()
+                    local e = os.pullEvent('restored'); print('b', e)
+                end
+            )
+            print('after', peripheral.call('$address', 'echo', 1))
+            """.trimIndent() + "\n",
+            "waiting\n",
+            Regex("after\t1\n"),
+            calls,
+            callsBeforeSave = 1,
+        )
+        assertTrue(out.startsWith("waiting\n"), out)
+        assertTrue(Regex("\nfalse\t[^\n]*interrupted\n").containsMatchIn(out), out)
+        assertTrue("\nb\trestored\n" in out, out)
+        assertTrue(out.endsWith("after\t1\n"), out)
+        assertEquals(1, calls.get())
+    }
+
+    @Test
     fun `startTimerで待っている間に保存して戻すと、同じ期限のtimerが鳴り、タイマーの表とFIFOが続く`() = timeout(limit) {
         val out = saveAndRestore(
             """

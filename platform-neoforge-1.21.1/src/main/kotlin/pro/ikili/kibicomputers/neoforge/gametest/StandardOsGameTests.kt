@@ -291,4 +291,31 @@ object StandardOsGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+
+    /**
+     * Lua の peripheral.call をコルーチンの中で呼ぶ（#744、ADR 0744）: 標準 OS の `/bin/lua` から、`parallel` の2つのコルーチンで
+     * 隣の画面のメソッドを `peripheral.call`（start → take の道）と `wrap` の関数で呼びながら、もう一方で `os.sleep` する
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaPeripheralCallRunsInsideParallel(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val script = "local s = peripheral.find('screen'); local n = peripheral.getName(s); local c = 0; " +
+            "parallel.waitForAll(function() for i = 1, 300 do local w = peripheral.call(n, 'getSize'); local w2 = s.getSize(); " +
+            "if w == w2 then c = c + 1 end end end, function() os.sleep(0.1); c = c + 1000 end); print('pc,' .. c)"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, "lua -e \"$script\"")
+                typed = true
+                helper.fail("typed the line")
+            }
+            helper.assertTrue(text.any { it == "pc,1300" }, "lua should call the screen inside parallel: $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
 }

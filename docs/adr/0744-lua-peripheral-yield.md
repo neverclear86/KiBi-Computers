@@ -1,0 +1,97 @@
+# 0744: Lua の peripheral.call をコルーチンの中で yield させる
+
+- 状態: 採用
+- Issue: #744（task）。前提: ADR 0077（kibi:device/bus と p1 の import）、0094（Lua 向けの KiBi API）、0095（Lua のコルーチンでイベントを待つ）
+- 方針: オーナーのコメント（#95・#94）「Lua での書き方はできるだけ CC: Tweaked に合わせる」。CC のコードは写さず、振る舞いだけを合わせる
+
+## 決めたこと（要約）
+
+- コルーチンの中（yield できるところ）の `peripheral.call` と `wrap` の関数は、メインスレッドのメソッドの結果を待つ間、CC と同じく `"task_complete"` を yield する。その間にほかのコルーチン（`parallel` など）が動く
+- 使う import は、ADR 0077 の p1 の `[method]device.start`・`[method]pending-call.take`・`[resource-drop]pending-call` と `poll_oneoff`（`FD_READ`）だけ。**ABI・カーネル・保存形式・公開 API は変えない**。変えたのは `lua.wasm`（C）だけ
+- メインスレッド（メインのチャンクと REPL）は今までどおり `invoke` でその場で待つ（ADR 0094）。メインかどうかは `lua_pushthread` で分ける（ADR 0095）
+
+## 呼び出しの流れ（コルーチンの中）
+
+1. 引数を写す（今までと同じ。上限の検査も同じ）
+2. open →（`wrap` の関数なら）`info` で種類を照合 → `start` → device の fd をすぐ drop（pending-call は device の fd から独立している。`Queued(address, method, args)`）
+3. すぐ1回 `take` する。直接のメソッドと、その場で失敗するもの（外れた・メソッドがない・種類が違う）は `start` の中で終わっているので、ここで値を返すかエラーにする（**yield しない**。CC も直接のメソッドは yield しない。`coroutine.wrap` でイテレーターを作るコードを壊さない）
+4. 終わっていなければ、task id（単調に増やす 64 ビット。タイマーの id とは別）を取り、`[task id]` をスタックの底に置いて `"task_complete"` を `lua_yieldk` で yield する
+5. 続き（`call_k`）: 次のどれか
+   - `"task_complete", id, true, 値...`（id は Lua の数値の等しさで比べる。float でも合う）: 値を返す
+   - `"task_complete", id, false, 文`: 文に呼んだ Lua の行の位置（`luaL_where(L, 1)`）を付けてエラーにする（今の同期の呼び出しと同じ文になる）
+   - `terminate`: `Terminated`（位置なし）のエラー。呼び出しは取り消さない（CC と同じ。取り消すと、積んだメソッドが走るかどうかが変わる）。結果は後で迷子の `task_complete` として届く
+   - ほか: 捨ててまた `"task_complete"` を yield する
+
+## 待っている呼び出しの表
+
+- `kibi_lua_peripheral.c` の C の静的配列（`.bss`）。要素は pending-call の fd・task id・メソッドの名前（64 バイト。後から返る `no-such-method` の文に使う。復元の後の積み直しは address だけで引き直すので、メソッドがないと分かるのが後になることがある）。数はカーネルの上限 `DeviceLimits.MAX_PENDING_CALLS` と同じ 16
+- 線形メモリにあるので、スナップショットにそのまま入る。fd 番号は保存をまたいで変わらない（`queue_fd` を static に持つのと同じ）。起動時には何も作らない（起動の RAM は増えない）
+- **表に入れるのは `start` の直後で、Lua の確保（longjmp しうる）より前。** 以降のメモリ不足で fd が宙に浮かない
+- **表から消す（pending-call を drop する）のは、結果を Lua の値に写し終えてから。** 写す途中でメモリ不足になっても、`take` は何度でも同じ結果を返す（ADR 0077）ので、次の回収でやり直せる（ADR 0094 の「読んだらすぐ drop」は、記録の残らない同期の呼び出しの話）。消すときは後ろを詰めて、積んだ順を保つ
+- `__gc` では閉じない（ADR 0094 が退けた理由と同じ）
+- pending-call の fd は、その場で終わった・回収して写し終えた・プロセスが終わった（カーネルが閉じる）のどれかで閉じる
+
+## 回収と待ち
+
+- os の `collect`（`fire_timers` → `take_kernel_events` → `kibi_lua_tasks_collect`）が、表の各要素を `take` し、終わったものを `"task_complete", id, true, 値...` か `"task_complete", id, false, 文`（位置なし）にして FIFO に積む。積むのは `lua_pcall` の中で、失敗したら arena を戻してエラーを投げ直す（`take_kernel_events` と同じ形）
+- メインスレッドの `pull` の `poll_oneoff` は、キューと時計に加えて、表の fd を `FD_READ` で購読する（購読は最大 2＋16 個。`WasiP1Poll` の上限 1,024 より十分小さい）。これがないと、yield したコルーチンを起こすものがなくなる
+- メインスレッドの `os.sleep` の待ちは、表の fd を購読しない（回収しないので、終わった呼び出しがあると busy loop になる）
+- **表が空なら、回収も購読も何もしない**（`take` も `reserve` も呼ばない）。呼び出しのない台に費用を出さない
+- `os.queueEvent` も同じ `collect` を通る（その時点で届いているものの後ろに積む順を保つ）
+
+## その場で待つところ（CC と違う）
+
+- **yield できない文脈**（コルーチンの中の `string.gsub`・`table.sort` のコールバック、`__gc` など）: CC はエラーにするが、`invoke` でその場で待つ。`invoke` はイベントを取り出さない（キューに残る）ので、ほかのコルーチンのイベントを奪わない。`os.sleep` と同じ扱い（ADR 0095）
+- **表がいっぱい（16 個）**: まず回収して空きを作り、それでもいっぱいなら `invoke` でその場で待つ（`invoke` の待ちはカーネルの上限に数えない。ADR 0077）。`start` が `kernel(again)` を返したときも同じ。エラーにはしない（`parallel` で 17 個並べただけで壊れないように）。正しさは保たれ、そのコルーチンの間だけほかが止まる
+- `waitForAny` で残したコルーチン・GC されたコルーチンの呼び出しも、回収されるまで枠を使う。回収はメインスレッドがイベントを待つたびと、枠が尽きたときに行う
+
+## wrap の直接のメソッド
+
+`start`＋`take`＋drop は、fd と pending-call を作る（ADR 0077 は直接の `invoke` の道を軽く保つと決めている）。`wrap` はもう `methods` を読んでいるので、メソッドごとに「メインスレッドのメソッドか」を上位値に持たせ、**直接のメソッドは今の `invoke` で呼ぶ**。印が古くなっても（同じ種類の別のデバイスがつながっても）どちらの道でも正しく動く（直接のものを `start` で呼べばすぐ `take` で返る。メインのものを `invoke` で呼べば yield せずに待つだけ）。印を持たない `peripheral.call(name, method)` は、コルーチンの中では常に `start` → `take` で呼ぶ。
+
+## RAM の約束（ADR 0094）
+
+- import の前に `reserve`（`reserve_or_close`・`kibi_lua_check_memory`）を呼ぶ。見積もりは、`start` がエラーの文の分（`INFO_RESULT_BYTES`。`start` が返すのはカーネルのエラーだけ）、`take` が `INVOKE_RESULT_BYTES`
+- 写し終えたら `arena_reset` する
+
+## 保存・復元
+
+保存の形は変わらない（ADR 0077 の pending-call の形と、線形メモリの表のまま）。
+
+- 保存したとき実行中の呼び出しは `Done(failed("interrupted"))` で戻る。回収されて `"task_complete", id, false, "interrupted"` になり、待っていたコルーチンでは `<位置>: interrupted` のエラーになる。メソッドは1回だけ走る
+- `Queued` のものは、戻すと `redispatchRestoredDeviceCalls` が積み直す。`Done` はそのまま戻る
+- `lua.wasm` の import が増え、ModuleHash が変わるので、古い `lua.wasm` で保存した Lua のプロセスは `MODULE_MISMATCH` で冷えた起動に落ちる（ADR 0088。v0.1.0 の前なので互換は要らない）
+
+## 待機点
+
+`lua.wasm` は待機点型（WAIT_POINT）のまま。止まりうる import は `poll_oneoff` と `invoke` だけで、足した `start`・`take`・`[resource-drop]pending-call` は止まらない。yield したコルーチンの C のフレームは外れているので、巻き戻すスタックは増えない（ADR 0095）。
+
+## 規模（1,000 台）
+
+`LuaParallelScaleTest`（`-Pkibi.luaReplMachines=1000`）に、2 つのコルーチンがメインスレッドのメソッドの呼び出し（1 回と 2 回）と `os.sleep(1)` をくり返す場合を足した。
+
+| 場合 | 増えたスレッド | tick の時間（平均・最大） | 約 3 秒の CPU 時間 |
+| --- | --- | --- | --- |
+| `parallel`（sleep・pullEvent。#95 と同じ） | 4 | 19 us・57 us | 7.4 秒 |
+| `parallel` ＋ `peripheral.call`（呼び出し 11,436 回） | 4 | 773 us・3.6 ms | 13.8 秒 |
+
+- 呼び出しを待つ台も `poll_oneoff` の中で巻き戻り、スレッドを持たない（BLOCKING に落ちると台数分増える）
+- tick の時間の増えは、毎秒約 3,000 件のメインスレッドのメソッドを tick の中で動かす分。1 台が同時に積めるのは 16 個までで、tick あたりの件数はマシンごとの `maxHostCallsPerTick` とサーバー全体の時間の予算（ADR 0356）が抑える
+- 待つだけの台には、tick ごとの処理を足していない（回収は Lua が起きたときだけ）
+
+## テスト
+
+- `LuaKibiApiTest`:
+  - `parallel` の中で、返さないメインスレッドのメソッド（`defer`）を待つ間に、もう一方のコルーチンの `sleep` が進む。`wrap` の関数と `call` の両方
+  - 自前のコルーチン: 直接のメソッドは yield しない。メインのメソッドは `task_complete` を yield し、id の合わないものとほかのイベントを捨て、float の id でも合う。途中の nil を含む値。失敗は `false` と文で届き、続きで呼んだ行の位置が付く。`terminate` は `Terminated` で、呼び出しは取り消されずに後で届く。その場の失敗（メソッドがない・外れた）は yield せずにエラー。yield できない文脈（gsub）はその場で待つ
+  - 20 個のコルーチンが 15 回ずつ（300 回。fd の上限 256 を超える）呼んでも正しく動き（16 個を超えた分はその場で待つ）、`waitForAny` で残したコルーチンの呼び出しも後で回収されて、プロセスの device・pending-call の fd が 0 に戻る
+  - 今までの「コルーチンの中でメインのメソッドを呼んでも yield しない」テストは、`task_complete` を yield する形に書き直した（CC と同じ）
+- `LuaKibiApiRestoreTest`: `parallel` の中で `defer` の実行中に保存して戻すと、そのコルーチンは `interrupted` のエラーになり、メソッドは1回だけ走り、もう一方のコルーチン（`restored` を待つ）も続く
+- `LuaParallelScaleTest`: 上の規模
+- `LuaWasmTest`: 素の Endive に足した import のスタブ
+- GameTest（NeoForge 1.21.1 `StandardOsGameTests.luaPeripheralCallRunsInsideParallel`）: 標準 OS の `lua -e` で、`parallel` の中から隣の画面のメソッドを `peripheral.call`（start → take の道）と `wrap` の関数で 300 回ずつ呼びながら、もう一方で `os.sleep` する。ゲームの中のデバイスにはまだメインスレッドのメソッドがないので、yield する道は core のテストで確かめる
+
+## 範囲に入れなかったもの
+
+- p2 の `bus-poll`・新しい import・`MAX_PENDING_CALLS` の変更（ABI と仮の値に触れるため）
+- メインのチャンクをコルーチンで動かすこと（ADR 0095）

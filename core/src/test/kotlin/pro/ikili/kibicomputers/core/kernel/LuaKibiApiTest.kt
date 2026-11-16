@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceCompletion
 import pro.ikili.kibicomputers.api.device.DeviceContext
 import pro.ikili.kibicomputers.api.device.DeviceException
 import pro.ikili.kibicomputers.api.device.DeviceMethods
@@ -21,6 +22,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -74,7 +76,23 @@ class LuaKibiApiTest {
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
             }
+            .mainThread("main-fail") { _, _ -> throw DeviceException("main boom") }
+            .mainThread("main-gate") { ctx, args ->
+                gates.add(ctx.defer() to args.getLong(0))
+                emptyArray()
+            }
             .build()
+
+        /** main-gate が後で返すと決めた呼び出しと、その引数。テストの側が [release] で返す */
+        val gates = ConcurrentLinkedQueue<Pair<DeviceCompletion, Long>>()
+
+        /** main-gate の呼び出しを、受けた順にすべて返す（値は引数そのまま） */
+        fun release() {
+            while (true) {
+                val (c, v) = gates.poll() ?: return
+                c.complete(DeviceValue.of(v))
+            }
+        }
     }
 
     private inner class Run(
@@ -160,7 +178,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "echo,emit,emit-as,fail,get-size,main-echo,needs-int,posted,types",
+                "echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -413,11 +431,127 @@ class LuaKibiApiTest {
                 coroutine.yield(v + peripheral.call("$ADDRESS", "main-echo", 1))
             end)
             print(co())
+            -- メインスレッドのメソッドは task_complete を yield する（#744。CC と同じ）
             print(co("c", 1))
+            local ev = table.pack(os.pullEvent("task_complete"))
+            print(co(table.unpack(ev, 1, ev.n)))
             print((string.gsub("ab", ".", function(ch) os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", ch:upper()) end)))
             """.trimIndent(),
         )
-        assertEquals("true\tp\nc\n2\nAB\n", out)
+        assertEquals("true\tp\nc\ntask_complete\n2\nAB\n", out)
+    }
+
+    @Test
+    fun `parallelの中のメインスレッドのメソッドは結果を待つ間にほかのコルーチンを動かす`() = timeout(limit) {
+        Run(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            parallel.waitForAll(
+                function() print("call", p.mainGate(5), peripheral.call("$ADDRESS", "main-gate", 6)) end,
+                function() os.sleep(0.05); print("slept"); io.stdout:flush() end
+            )
+            print("all")
+            """.trimIndent(),
+        ).use { r ->
+            // 1つ目の呼び出しを返さないうちに、もう一方のコルーチンの sleep が進む（yield しなければここで止まる）
+            r.waitUntil("sleep が進まない") { r.drain().contains("slept\n") && r.dev.gates.size == 1 }
+            r.dev.release()
+            r.waitUntil("2つ目の呼び出しが来ない") { r.dev.gates.size == 1 }
+            r.dev.release()
+            assertEquals("slept\ncall\t5\t6\nall\n", r.finish())
+        }
+    }
+
+    @Test
+    fun `コルーチンの中の呼び出しはtask_completeをyieldし、直接のメソッドとその場の失敗とyieldできない文脈では待たない`() = timeout(limit) {
+        val out = run(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            -- 直接のメソッド（wrap は invoke、call は start してすぐ take）は yield しない
+            local co = coroutine.create(function() return peripheral.call("$ADDRESS", "echo", 2), p.echo(1, "a") end)
+            print(coroutine.resume(co))
+            -- メインスレッドのメソッドは task_complete を yield し、id の合わないものと別のイベントは捨てる
+            local co2 = coroutine.create(function() return p.mainEcho(7, nil, "z") end)
+            print(coroutine.resume(co2))
+            print(coroutine.resume(co2, "task_complete", -1, true, "wrong"))
+            print(coroutine.resume(co2, "other"))
+            local ev = table.pack(os.pullEvent("task_complete"))
+            print(math.type(ev[2]), ev[3], ev.n)
+            print(coroutine.resume(co2, ev[1], ev[2] + 0.0, table.unpack(ev, 3, ev.n)))
+            print(coroutine.status(co2))
+            -- 失敗は task_complete の false と文。続きでは呼んだ行の位置が付く
+            local co3 = coroutine.create(function() return peripheral.call("$ADDRESS", "main-fail") end)
+            coroutine.resume(co3)
+            local e3 = table.pack(os.pullEvent("task_complete"))
+            print(e3[3], e3[4], e3.n)
+            print(coroutine.resume(co3, table.unpack(e3, 1, e3.n)))
+            -- terminate は Terminated（位置なし）。呼び出しは取り消さず、後で task_complete が届く
+            local co4 = coroutine.create(function() return peripheral.call("$ADDRESS", "main-echo", 4) end)
+            coroutine.resume(co4)
+            print(coroutine.resume(co4, "terminate"))
+            print(select(3, os.pullEvent("task_complete")))
+            -- その場の失敗は yield せずにエラー
+            print(coroutine.resume(coroutine.create(function() return peripheral.call("$ADDRESS", "nope") end)))
+            print(coroutine.resume(coroutine.create(function() return peripheral.call("$OTHER", "x") end)))
+            -- yield できない文脈（gsub のコールバック）では、その場で待つ
+            print(coroutine.wrap(function()
+                return (string.gsub("ab", ".", function(ch) return peripheral.call("$ADDRESS", "main-echo", ch:upper()) end))
+            end)())
+            """.trimIndent(),
+        )
+        val lines = out.lines()
+        assertEquals("true\t2\t1\ta", lines[0], out)
+        assertEquals("true\ttask_complete", lines[1], out)
+        assertEquals("true\ttask_complete", lines[2], out)
+        assertEquals("true\ttask_complete", lines[3], out)
+        assertEquals("integer\ttrue\t6", lines[4], out)
+        assertEquals("true\t7\tnil\tz", lines[5], out)
+        assertEquals("dead", lines[6], out)
+        assertEquals("false\tmain boom\t4", lines[7], out)
+        assertTrue(Regex("^false\t.*:\\d+: main boom$").matches(lines[8]), out)
+        assertEquals("false\tTerminated", lines[9], out)
+        assertEquals("true\t4", lines[10], out)
+        assertTrue(Regex("^false\t.*:\\d+: No such method nope$").matches(lines[11]), out)
+        assertTrue(Regex("^false\t.*:\\d+: No such peripheral$").matches(lines[12]), out)
+        assertEquals("AB", lines[13], out)
+    }
+
+    @Test
+    fun `上限を超えて並べてもその場で待って動き、fdを漏らさず、捨てたコルーチンの呼び出しも後で閉じる`() = timeout(limit) {
+        Run(
+            """
+            -- 20 個のコルーチンが 15 回ずつ（300 回。fd の上限 256 を超える）。同時に 16 個を超えた分は invoke でその場で待つ
+            local fns, sums = {}, {}
+            for i = 1, 20 do
+                fns[i] = function()
+                    local s = 0
+                    for j = 1, 15 do s = s + peripheral.call("$ADDRESS", "main-echo", j) end
+                    sums[i] = s
+                end
+            end
+            parallel.waitForAll(table.unpack(fns))
+            local sum = 0
+            for i = 1, 20 do sum = sum + sums[i] end
+            print("sum", sum)
+            -- waitForAny で残したコルーチンの呼び出しは、表に残り、後の待ちで回収されて閉じる
+            print(parallel.waitForAny(function() peripheral.call("$ADDRESS", "main-echo", 1) end, function() end))
+            print("waiting"); io.stdout:flush()
+            os.pullEvent("finish")
+            print("finished")
+            """.trimIndent(),
+        ).use { r ->
+            fun open(): Int = r.m.lock.withLockValue {
+                r.m.kernel.processes[r.pid]!!.handles.entries().values.count {
+                    val o = r.m.kernel.objects[it.objectId]
+                    o is pro.ikili.kibicomputers.core.device.PendingDeviceCall || o is pro.ikili.kibicomputers.core.device.DeviceHandle
+                }
+            }
+            r.waitFor("waiting")
+            r.waitUntil("残した呼び出しが閉じない: ${open()}") { open() == 0 }
+            r.dev.context!!.postEvent("finish")
+            assertEquals("sum\t2400\n2\nwaiting\nfinished\n", r.finish())
+            assertEquals(301, r.dev.mainCalls.get())
+        }
     }
 
     @Test

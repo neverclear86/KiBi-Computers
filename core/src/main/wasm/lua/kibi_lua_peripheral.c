@@ -2,10 +2,16 @@
  * Lua の peripheral ライブラリ（#94。ADR 0094）。CC:Tweaked の peripheral を手本にし、kibi:device/bus（ADR 0077）の上に作る。
  *
  * - 名前（CC の側面・ネットワーク名）は、デバイスの address（小文字の UUID）。大文字は小文字に直してから開く
- * - fd を持ち続けない。call・wrap で作った関数は、呼ぶたびに open → invoke → drop する（fd はプロセスあたり 256、デバイスは最大 256 なので、
+ * - fd を持ち続けない。call・wrap で作った関数は、呼ぶたびに open → invoke → drop する（コルーチンの中は下のとおり）（fd はプロセスあたり 256、デバイスは最大 256 なので、
  *   全デバイスの fd を持ちっぱなしにすると mfile に当たるため）
  * - wrap の関数は、作ったときの種類を覚えておき、呼ぶときに種類が違えば（同じ address に別のデバイスがつながったら）"No such peripheral"
  * - 値の写し方・エラーの文は ADR 0094 の表のとおり
+ *
+ * コルーチンの中（#744。ADR 0744）: メインスレッドのメソッドは CC と同じく task id を取って "task_complete" を yield し、
+ * 待つ間にほかのコルーチンが動く。open → start → device を drop → すぐ take（直接のメソッドと、その場で失敗するものはここで返る）→
+ * 終わっていなければ pending-call の fd を「待っている呼び出しの表」（C の静的配列）に入れて yield する。
+ * 表の fd は、os の待ち（kibi_lua_os.c の pull）が poll_oneoff の FD_READ で待ち、終わったものを kibi_lua_tasks_collect が
+ * "task_complete" のイベントにして FIFO に積む（写し終えてから drop して表から消す）
  */
 #include <stdint.h>
 #include <string.h>
@@ -39,6 +45,28 @@
 /* methods は 1 件あたり 12 バイト＋名前 64 バイト（最大 MAX_METHODS 件）＋並びの揃え */
 #define METHODS_RESULT_BYTES (MAX_METHODS * (12 + MAX_METHOD_BYTES) + 1024)
 #define INFO_RESULT_BYTES 512
+
+/* ---- 待っている呼び出しの表（#744。ADR 0744） ---- */
+
+/*
+ * start で積んだ、まだ結果を Lua に写していない呼び出し。数はカーネルの上限（DeviceLimits.MAX_PENDING_CALLS）と同じ。
+ * 線形メモリ（.bss）にあるので、保存・復元をまたいで fd・id とそろったまま戻る。起動時には何も作らない
+ */
+#define MAX_TASKS 16
+
+typedef struct {
+    int32_t fd;            /* pending-call の fd */
+    int64_t id;            /* task id（"task_complete" の 2 つ目の値） */
+    uint8_t method_len;    /* メソッドの名前（"No such method" の文に使う） */
+    char method[MAX_METHOD_BYTES];
+} task_t;
+
+static task_t tasks[MAX_TASKS];
+static int task_count = 0;
+/* task id（単調に増やす。タイマーの id とは別） */
+static int64_t next_task_id = 0;
+/* kibi_lua_tasks_collect の中なら 1 */
+static int collecting = 0;
 
 /* ---- 名前（address） ---- */
 
@@ -93,9 +121,8 @@ static void check_address(lua_State *L, int idx, address_t *a) {
 
 /* ---- エラー ---- */
 
-/* call-error を Lua のエラーにする（戻らない）。message は cabi_realloc の場所にあるので、積んだ後に戻す */
-static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, const char *method, size_t method_len) {
-    luaL_where(L, 1);
+/* call-error の文（位置なし）を積む。message は cabi_realloc の場所にあるので、積んだ後に呼んだ側が戻す */
+static void push_call_error(lua_State *L, const kibi_device_call_error_t *e, const char *method, size_t method_len) {
     switch (e->tag) {
     case KIBI_DEVICE_CALL_ERROR_DETACHED:
         lua_pushliteral(L, "No such peripheral");
@@ -113,6 +140,12 @@ static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, con
         lua_pushfstring(L, "device call failed: %s", kibi_lua_error_name(e->val.kernel));
         break;
     }
+}
+
+/* call-error を Lua のエラーにする（戻らない）。位置は呼んだ Lua の行 */
+static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, const char *method, size_t method_len) {
+    luaL_where(L, 1);
+    push_call_error(L, e, method, method_len);
     kibi_lua_arena_reset();
     lua_concat(L, 2);
     return lua_error(L);
@@ -308,29 +341,39 @@ static int push_camel_alias(lua_State *L, const char *m, size_t len) {
 
 /* ---- 呼び出し ---- */
 
-/*
- * [a] のデバイスの [method] を、スタックの [first] から上の引数で呼び、結果を積んで数を返す。
- * [kind] が NULL でなければ、開いたデバイスの種類がそれと違うとき "No such peripheral"。
- * 引数の番号は [first] を [argbase] として数える
- */
-static int invoke(lua_State *L, const address_t *a, const char *kind, size_t kind_len, const char *method, size_t method_len,
-                  int first, int argbase) {
-    char mbuf[MAX_METHOD_BYTES * 2];
-    size_t mlen;
-    const char *m = method_name(method, method_len, mbuf, sizeof mbuf, &mlen);
-    if (m == NULL || mlen > MAX_METHOD_BYTES) return luaL_error(L, "method name too long (max %d bytes)", MAX_METHOD_BYTES);
-    int top = lua_gettop(L);
-    int n = top >= first ? top - first + 1 : 0;
-    if (n > MAX_VALUES) return luaL_error(L, "too many arguments (max %d)", MAX_VALUES);
-    kibi_device_value_t args[MAX_VALUES];
-    size_t payload = 0;
-    for (int i = 0; i < n; i++) {
-        payload += to_value(L, first + i, argbase + i, &args[i]);
-    }
-    if (payload > MAX_PAYLOAD_BYTES) return luaL_error(L, "arguments too large (max %d bytes of strings)", MAX_PAYLOAD_BYTES);
+/* kibi:kernel/types の error-code の again（判別子） */
+#define ERROR_CODE_AGAIN 5
 
+/* 引数を value に写した、呼び出し1回分（文字列は Lua のスタックの値を指すので、引数が積まれている間だけ有効） */
+typedef struct {
+    char mbuf[MAX_METHOD_BYTES * 2];
+    const char *m;
+    size_t mlen;
+    kibi_device_value_t args[MAX_VALUES];
+    int n;
+} call_t;
+
+/* メソッドの名前と、スタックの [first] から上の引数を [c] に写す。引数の番号は [first] を [argbase] として数える */
+static void prepare_call(lua_State *L, const char *method, size_t method_len, int first, int argbase, call_t *c) {
+    c->m = method_name(method, method_len, c->mbuf, sizeof c->mbuf, &c->mlen);
+    if (c->m == NULL || c->mlen > MAX_METHOD_BYTES) luaL_error(L, "method name too long (max %d bytes)", MAX_METHOD_BYTES);
+    int top = lua_gettop(L);
+    c->n = top >= first ? top - first + 1 : 0;
+    if (c->n > MAX_VALUES) luaL_error(L, "too many arguments (max %d)", MAX_VALUES);
+    size_t payload = 0;
+    for (int i = 0; i < c->n; i++) {
+        payload += to_value(L, first + i, argbase + i, &c->args[i]);
+    }
+    if (payload > MAX_PAYLOAD_BYTES) luaL_error(L, "arguments too large (max %d bytes of strings)", MAX_PAYLOAD_BYTES);
+}
+
+/*
+ * [a] のデバイスを開いて fd を返す。外れていれば "No such peripheral"。
+ * [kind] が NULL でなければ、開いたデバイスの種類がそれと違うとき（fd を閉じてから）"No such peripheral"
+ */
+static uint32_t open_checked(lua_State *L, const address_t *a, const char *kind, size_t kind_len) {
     int64_t fd = open_device(L, a);
-    if (fd < 0) return luaL_error(L, "No such peripheral");
+    if (fd < 0) return (uint32_t)luaL_error(L, "No such peripheral");
     if (kind != NULL) {
         reserve_or_close(L, (uint32_t)fd, INFO_RESULT_BYTES);
         kibi_device_info_t info;
@@ -339,22 +382,204 @@ static int invoke(lua_State *L, const address_t *a, const char *kind, size_t kin
         kibi_lua_arena_reset();
         if (!same) {
             kibi_device_drop((uint32_t)fd);
-            return luaL_error(L, "No such peripheral");
+            return (uint32_t)luaL_error(L, "No such peripheral");
         }
     }
-    reserve_or_close(L, (uint32_t)fd, INVOKE_RESULT_BYTES);
-    kibi_device_result_values_t r;
-    kibi_device_invoke((uint32_t)fd, m, mlen, args, (size_t)n, &r);
-    kibi_device_drop((uint32_t)fd);
-    if (r.is_err) return raise_call_error(L, &r.val.err, m, mlen);
-    size_t count = r.val.ok.len;
+    return (uint32_t)fd;
+}
+
+/* 結果の値を積んで数を返す（写し終えたら arena を戻すのは呼んだ側） */
+static int push_results(lua_State *L, const kibi_device_list_value_t *ok) {
+    size_t count = ok->len;
     if (count > INT32_MAX || !lua_checkstack(L, (int)count + LUA_MINSTACK)) {
         kibi_lua_arena_reset();
         return luaL_error(L, "too many results");
     }
-    for (size_t i = 0; i < count; i++) push_value(L, &r.val.ok.ptr[i]);
-    kibi_lua_arena_reset();
+    for (size_t i = 0; i < count; i++) push_value(L, &ok->ptr[i]);
     return (int)count;
+}
+
+/* 開いた [fd] で [c] を invoke し、結果を積んで数を返す（結果が出るまでプロセスごと待つ）。fd は閉じる */
+static int invoke_now(lua_State *L, uint32_t fd, const call_t *c) {
+    reserve_or_close(L, fd, INVOKE_RESULT_BYTES);
+    kibi_device_result_values_t r;
+    kibi_device_invoke(fd, c->m, c->mlen, c->args, (size_t)c->n, &r);
+    kibi_device_drop(fd);
+    if (r.is_err) return raise_call_error(L, &r.val.err, c->m, c->mlen);
+    int count = push_results(L, &r.val.ok);
+    kibi_lua_arena_reset();
+    return count;
+}
+
+/* 表の [i] 番目の pending-call を閉じて、表から外す（後ろを詰めて、積んだ順を保つ） */
+static void finish_task(int i) {
+    kibi_device_pending_call_drop((uint32_t)tasks[i].fd);
+    task_count--;
+    if (i < task_count) memmove(&tasks[i], &tasks[i + 1], (size_t)(task_count - i) * sizeof tasks[0]);
+}
+
+int kibi_lua_task_count(void) {
+    return task_count;
+}
+
+int32_t kibi_lua_task_fd(int i) {
+    return tasks[i].fd;
+}
+
+/* lua_pcall で呼ぶ。引数 1 の take の結果（lightuserdata）と、引数 2 の表の要素から "task_complete" を作って FIFO に積む */
+static int push_task_complete(lua_State *L) {
+    const kibi_device_option_result_values_t *o = (const kibi_device_option_result_values_t *)lua_touserdata(L, 1);
+    const task_t *t = (const task_t *)lua_touserdata(L, 2);
+    lua_settop(L, 0);
+    lua_pushliteral(L, "task_complete");
+    lua_pushinteger(L, (lua_Integer)t->id);
+    if (o->val.is_err) {
+        lua_pushboolean(L, 0);
+        push_call_error(L, &o->val.val.err, t->method, t->method_len);
+        kibi_lua_fifo_push(L, 4);
+        return 0;
+    }
+    lua_pushboolean(L, 1);
+    int n = push_results(L, &o->val.val.ok);
+    kibi_lua_fifo_push(L, 3 + n);
+    return 0;
+}
+
+/*
+ * 表の呼び出しのうち、終わったものを "task_complete", id, true, 値... か "task_complete", id, false, 文 にして FIFO に積む
+ * （表の順に。文に位置は付けない。位置は待っていた側が付ける）。写し終えてから drop して表から消す（写す途中でメモリ不足に
+ * なっても、take は何度でも同じ結果を返すので、次の回収でやり直せる）。表が空なら何もしない
+ */
+void kibi_lua_tasks_collect(lua_State *L) {
+    /* 写す途中の確保で GC が __gc を呼び、その中で os.queueEvent などから入れ子で回収すると、表と arena が動くので入れ子では回収しない */
+    if (collecting) return;
+    collecting = 1;
+    int i = 0;
+    while (i < task_count) {
+        kibi_lua_arena_reset();
+        if (!kibi_lua_reserve(INVOKE_RESULT_BYTES)) {
+            collecting = 0;
+            kibi_lua_check_memory(L, INVOKE_RESULT_BYTES);
+        }
+        kibi_device_option_result_values_t o;
+        kibi_device_take((uint32_t)tasks[i].fd, &o);
+        if (!o.is_some) {
+            kibi_lua_arena_reset();
+            i++;
+            continue;
+        }
+        lua_pushcfunction(L, push_task_complete);
+        lua_pushlightuserdata(L, &o);
+        lua_pushlightuserdata(L, &tasks[i]);
+        int status = lua_pcall(L, 2, 0, 0);
+        kibi_lua_arena_reset();
+        if (status != LUA_OK) {
+            collecting = 0;
+            lua_error(L);
+        }
+        finish_task(i);
+    }
+    collecting = 0;
+}
+
+/*
+ * yield した呼び出しの続き。スタックは [task id, resume の値...]。
+ * id の合う "task_complete" なら、成功は値を返し、失敗は文に呼んだ Lua の行を付けたエラーにする。
+ * "terminate" なら "Terminated" のエラー（位置なし。呼び出しは取り消さない。CC と同じ）。ほかは捨ててまた yield する
+ */
+static int call_k(lua_State *L, int status, lua_KContext ctx) {
+    (void)status;
+    (void)ctx;
+    int n = lua_gettop(L);
+    if (n >= 2 && lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "terminate") == 0) {
+        lua_pushliteral(L, "Terminated");
+        return lua_error(L);
+    }
+    /* id は float で resume されても合う（sleep と同じく Lua の数値の等しさで見る） */
+    if (n >= 4 && lua_type(L, 2) == LUA_TSTRING && strcmp(lua_tostring(L, 2), "task_complete") == 0 &&
+        lua_type(L, 3) == LUA_TNUMBER && lua_compare(L, 1, 3, LUA_OPEQ)) {
+        if (lua_toboolean(L, 4)) return n - 4;
+        lua_settop(L, 5);
+        if (lua_type(L, 5) == LUA_TSTRING) {
+            luaL_where(L, 1);
+            lua_insert(L, 5);
+            lua_concat(L, 2);
+        }
+        return lua_error(L);
+    }
+    lua_settop(L, 1);
+    lua_pushliteral(L, "task_complete");
+    return lua_yieldk(L, 1, 0, call_k);
+}
+
+/*
+ * 開いた [fd] で [c] を start し、待っている呼び出しの表に入れる。fd（device）は閉じる。
+ * その場で終わったもの（直接のメソッド、その場で失敗するもの）は結果を返し、終わっていなければ "task_complete" を yield する。
+ * カーネルの上限（again）に当たったら、invoke でその場で待つ
+ */
+static int start_and_yield(lua_State *L, uint32_t fd, const call_t *c) {
+    reserve_or_close(L, fd, INFO_RESULT_BYTES);
+    kibi_device_result_handle_t r;
+    kibi_device_start(fd, c->m, c->mlen, c->args, (size_t)c->n, &r);
+    if (r.is_err) {
+        if (r.val.err.tag == KIBI_DEVICE_CALL_ERROR_KERNEL && r.val.err.val.kernel == ERROR_CODE_AGAIN) {
+            kibi_lua_arena_reset();
+            return invoke_now(L, fd, c);
+        }
+        kibi_device_drop(fd);
+        return raise_call_error(L, &r.val.err, c->m, c->mlen);
+    }
+    kibi_device_drop(fd);
+    kibi_lua_arena_reset();
+    /* Lua の確保（longjmp しうる）より先に表へ入れる（fd を宙に浮かせない） */
+    int32_t call = (int32_t)r.val.ok;
+    task_t *t = &tasks[task_count++];
+    t->fd = call;
+    t->id = ++next_task_id;
+    t->method_len = (uint8_t)c->mlen;
+    memcpy(t->method, c->m, c->mlen);
+    int64_t id = t->id;
+
+    /* その場で終わったか（直接のメソッドと、その場で失敗するものは start の中で終わっている） */
+    kibi_lua_check_memory(L, INVOKE_RESULT_BYTES);
+    kibi_device_option_result_values_t o;
+    kibi_device_take((uint32_t)call, &o);
+    if (o.is_some) {
+        int i = task_count - 1; /* 今入れたもの（ここまでに表は動かない） */
+        if (o.val.is_err) {
+            finish_task(i);
+            return raise_call_error(L, &o.val.val.err, c->m, c->mlen);
+        }
+        int count = push_results(L, &o.val.val.ok);
+        kibi_lua_arena_reset();
+        finish_task(i);
+        return count;
+    }
+    kibi_lua_arena_reset();
+    lua_settop(L, 0);
+    lua_pushinteger(L, (lua_Integer)id);
+    lua_pushliteral(L, "task_complete");
+    return lua_yieldk(L, 1, 0, call_k);
+}
+
+/*
+ * [a] のデバイスの [method] を、スタックの [first] から上の引数で呼び、結果を積んで数を返す。
+ * [kind] が NULL でなければ、開いたデバイスの種類がそれと違うとき "No such peripheral"。
+ * 引数の番号は [first] を [argbase] として数える。
+ * [may_yield] なら、コルーチンの中（yield できるところ）では start して "task_complete" を yield する（#744）。
+ * メインスレッドと yield できない文脈（gsub のコールバックなど）、表がいっぱいのときは invoke でその場で待つ
+ */
+static int call_device(lua_State *L, const address_t *a, const char *kind, size_t kind_len, const char *method,
+                       size_t method_len, int first, int argbase, int may_yield) {
+    call_t c;
+    prepare_call(L, method, method_len, first, argbase, &c);
+    int yield = may_yield && !kibi_lua_on_main_thread(L) && lua_isyieldable(L);
+    /* 表がいっぱいなら、終わったものを回収してから（device を開く前に。回収のエラーで fd を漏らさない） */
+    if (yield && task_count >= MAX_TASKS) kibi_lua_tasks_collect(L);
+    if (task_count >= MAX_TASKS) yield = 0;
+    uint32_t fd = open_checked(L, a, kind, kind_len);
+    if (!yield) return invoke_now(L, fd, &c);
+    return start_and_yield(L, fd, &c);
 }
 
 /* peripheral.call(name, method, ...) */
@@ -363,10 +588,13 @@ static int l_call(lua_State *L) {
     check_address(L, 1, &a);
     size_t mlen;
     const char *m = luaL_checklstring(L, 2, &mlen);
-    return invoke(L, &a, NULL, 0, m, mlen, 3, 3);
+    return call_device(L, &a, NULL, 0, m, mlen, 3, 3, 1);
 }
 
-/* wrap が作る関数。上位値は address・種類・メソッドの名前 */
+/*
+ * wrap が作る関数。上位値は address・種類・メソッドの名前・メインスレッドのメソッドか。
+ * 直接のメソッドは start せずに invoke する（fd も pending-call も作らない。印が古くても、どちらの道でも正しく動く）
+ */
 static int l_wrapped(lua_State *L) {
     size_t alen;
     size_t klen;
@@ -374,9 +602,10 @@ static int l_wrapped(lua_State *L) {
     const char *addr = lua_tolstring(L, lua_upvalueindex(1), &alen);
     const char *kind = lua_tolstring(L, lua_upvalueindex(2), &klen);
     const char *m = lua_tolstring(L, lua_upvalueindex(3), &mlen);
+    int main = lua_toboolean(L, lua_upvalueindex(4));
     address_t a;
     address_of(&a, addr, alen);
-    return invoke(L, &a, kind, klen, m, mlen, 1, 1);
+    return call_device(L, &a, kind, klen, m, mlen, 1, 1, main);
 }
 
 /* ---- 列挙 ---- */
@@ -456,11 +685,12 @@ static int l_hasType(lua_State *L) {
 }
 
 /*
- * 開いた fd のメソッドの並びと種類を積む（methods, kind の順）。fd は閉じる。
+ * 開いた fd のメソッドの並びと種類を積む（methods, kind の順。[with_main] なら methods, メインスレッドのメソッドかの並び, kind）。
+ * fd は閉じる。
  * メモリが足りないときも fd を閉じてから Lua のエラーにする。import の結果を読んだらすぐ fd を閉じてから Lua の値に写す
  * （写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れないように）
  */
-static void push_methods_and_kind(lua_State *L, uint32_t fd) {
+static void push_methods_and_kind(lua_State *L, uint32_t fd, int with_main) {
     reserve_or_close(L, fd, METHODS_RESULT_BYTES + INFO_RESULT_BYTES);
     kibi_device_list_method_info_t l;
     kibi_device_methods(fd, &l);
@@ -471,6 +701,13 @@ static void push_methods_and_kind(lua_State *L, uint32_t fd) {
     for (size_t i = 0; i < l.len; i++) {
         lua_pushlstring(L, l.ptr[i].name.ptr, l.ptr[i].name.len);
         lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    if (with_main) {
+        lua_createtable(L, (int)l.len, 0);
+        for (size_t i = 0; i < l.len; i++) {
+            lua_pushboolean(L, l.ptr[i].main_thread != 0);
+            lua_rawseti(L, -2, (lua_Integer)i + 1);
+        }
     }
     lua_pushlstring(L, info.kind.ptr, info.kind.len);
     kibi_lua_arena_reset();
@@ -485,7 +722,7 @@ static int l_getMethods(lua_State *L) {
         lua_pushnil(L);
         return 1;
     }
-    push_methods_and_kind(L, (uint32_t)fd); /* fd は閉じる */
+    push_methods_and_kind(L, (uint32_t)fd, 0); /* fd は閉じる */
     lua_pop(L, 1);
     return 1;
 }
@@ -500,8 +737,9 @@ static int l_getName(lua_State *L) {
 static int wrap(lua_State *L, const address_t *a) {
     int64_t fd = open_device(L, a);
     if (fd < 0) return 0;
-    push_methods_and_kind(L, (uint32_t)fd); /* methods, kind。fd は閉じる */
-    int methods = lua_gettop(L) - 1;
+    push_methods_and_kind(L, (uint32_t)fd, 1); /* methods, mains, kind。fd は閉じる */
+    int methods = lua_gettop(L) - 2;
+    int mains = lua_gettop(L) - 1;
     int kind = lua_gettop(L);
     lua_Integer n = luaL_len(L, methods);
     lua_createtable(L, 0, (int)n);
@@ -512,7 +750,8 @@ static int wrap(lua_State *L, const address_t *a) {
         lua_pushlstring(L, a->ptr, a->len);
         lua_pushvalue(L, kind);
         lua_pushvalue(L, name);
-        lua_pushcclosure(L, l_wrapped, 3);
+        lua_rawgeti(L, mains, i);
+        lua_pushcclosure(L, l_wrapped, 4);
         int fn = lua_gettop(L);
         size_t len;
         const char *s = lua_tolstring(L, name, &len);
