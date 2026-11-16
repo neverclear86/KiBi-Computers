@@ -126,6 +126,10 @@ internal class Process(
     var handles: HandleTable<HandleEntry> = HandleTable(DEFAULT_HANDLE_LIMIT)
         private set
 
+    /** ホストの resource の表（p2 の stream・descriptor など。fd 表とは別。#267、ADR 0267）。閉じるのは fd 表と同じところ */
+    var hostResources: HostResourceTable = HostResourceTable()
+        private set
+
     /** 保存データから読んだハンドル表を入れる（#82） */
     fun restoreHandles(table: HandleTable<HandleEntry>) {
         handles = table
@@ -147,6 +151,7 @@ internal class Process(
         copy.asyncWait = asyncWait
         waitTimers.forEach(copy.waitTimers::add)
         copy.handles = handles.copyForSnapshot()
+        copy.hostResources = hostResources.copyForSnapshot()
         return copy
     }
 }

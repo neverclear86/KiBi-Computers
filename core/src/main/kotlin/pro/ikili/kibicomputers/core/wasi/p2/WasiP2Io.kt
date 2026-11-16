@@ -1,0 +1,396 @@
+package pro.ikili.kibicomputers.core.wasi.p2
+
+import pro.ikili.kibicomputers.core.kernel.fd.FdIo
+import pro.ikili.kibicomputers.core.kernel.fd.FdReadiness
+import pro.ikili.kibicomputers.core.kernel.fd.IoResult
+import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
+import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
+import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
+import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
+import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Fd
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Poll
+
+/**
+ * `wasi:io`（error・poll・streams）の実装（#267。ADR 0267）。読み書きは p1 と同じ [FdIo]（パイプ・TTY）と VFS（ファイル）を使う。
+ *
+ * - stream の約束（仕様のトラップ）: `write` は直前の `check-write` の許可量を超えたらトラップ、`blocking-write-and-flush` は
+ *   4096 バイトを超えたらトラップ。読めるものがない `read` は空のリスト、書く側が閉じたら `closed`、I/O の失敗は
+ *   `last-operation-failed`（errno を持つ `error`）
+ * - 書き込みは受け付けたらすぐ下へ書く（`flush` は何もしない）。パイプが一部しか受けなければ、全部書くまで待って書く
+ *   （`FdIo.writeBlocking` と同じ。待つのは BLOCKING のプロセスのスレッドで `ctx.block`）
+ * - `poll`: 空のリストはトラップ、上限は p1 の `poll_oneoff` と同じ [WasiP1Poll.MAX_SUBSCRIPTIONS]。待ち方は p1 と同じ
+ *   （そろったかを見る → まだなら key を集め、時計があれば一時的なタイマーを 1 つ開いて `ctx.block` → 見直す。ADR 0329）
+ */
+internal object WasiP2Io {
+    const val ERROR: String = "wasi:io/error"
+    const val POLL: String = "wasi:io/poll"
+    const val STREAMS: String = "wasi:io/streams"
+
+    /** `poll` の判定ごとに、pollable 1 つにかかる燃料（p1 と同じ仮の値。確定は #251） */
+    private const val POLLABLE_FUEL: Long = WasiP1Poll.SUBSCRIPTION_FUEL
+
+    private val EMPTY = CanonValue.Bytes(ByteArray(0))
+
+    fun functions(t: WasiP2Types): Map<String, Map<String, HostFunctionBody>> {
+        val streamError = t[STREAMS].type<CanonType.Variant>("stream-error")
+        val closed = CanonValue.err(streamError.case("closed"))
+        fun failed(ctx: ProcessContext, errno: Errno): CanonValue =
+            CanonValue.err(streamError.case("last-operation-failed", P2.own(ctx, ErrorEntry(errno))))
+
+        /** 読みの結果を、`result<list<u8>, stream-error>` にする（[skip] なら数だけ） */
+        fun readResult(ctx: ProcessContext, r: ReadOutcome, skip: Boolean): CanonValue = when (r) {
+            is ReadOutcome.Bytes -> {
+                ctx.chargeFuel(r.count.toLong() / WasiP1Fd.BYTES_PER_FUEL)
+                CanonValue.ok(if (skip) CanonValue.I64(r.count.toLong()) else CanonValue.Bytes(r.buffer.copyOf(r.count)))
+            }
+            ReadOutcome.Empty -> CanonValue.ok(if (skip) CanonValue.I64(0) else EMPTY)
+            ReadOutcome.Closed -> closed
+            is ReadOutcome.Failed -> failed(ctx, r.errno)
+        }
+
+        fun writeResult(ctx: ProcessContext, r: WriteOutcome, value: CanonValue? = null): CanonValue = when (r) {
+            WriteOutcome.Done -> CanonValue.ok(value)
+            WriteOutcome.Closed -> closed
+            is WriteOutcome.Failed -> failed(ctx, r.errno)
+        }
+
+        fun body(f: (ProcessContext, List<CanonValue>) -> CanonValue?) = HostFunctionBody { call, args -> f(P2.ctx(call), args) }
+
+        val error = mapOf(
+            "[method]error.to-debug-string" to body { ctx, a ->
+                val e = P2.entry<ErrorEntry>(ctx, a[0])
+                CanonValue.str("${e.errno.name.lowercase()}（${WasiP2Errors.name(e.errno)}）")
+            },
+        )
+        val poll = mapOf(
+            "[method]pollable.ready" to body { ctx, a -> CanonValue.Bool(readyOnce(ctx, listOf(rep(a[0])))) },
+            "[method]pollable.block" to body { ctx, a ->
+                await(ctx, listOf(rep(a[0])))
+                null
+            },
+            "poll" to body { ctx, a ->
+                val items = (a[0] as CanonValue.Items).items
+                if (items.isEmpty()) P2.trap("poll に pollable が 1 つもない")
+                if (items.size > WasiP1Poll.MAX_SUBSCRIPTIONS) P2.trap("poll の pollable が多すぎる（${items.size}）")
+                CanonValue.Items(await(ctx, items.map(::rep)).map { CanonValue.I32(it) })
+            },
+        )
+        val streams = mapOf(
+            "[method]input-stream.read" to body { ctx, a -> readResult(ctx, read(ctx, a[0], P2.u64(a[1]), blocking = false), skip = false) },
+            "[method]input-stream.blocking-read" to body { ctx, a -> readResult(ctx, read(ctx, a[0], P2.u64(a[1]), blocking = true), skip = false) },
+            "[method]input-stream.skip" to body { ctx, a -> readResult(ctx, read(ctx, a[0], P2.u64(a[1]), blocking = false), skip = true) },
+            "[method]input-stream.blocking-skip" to body { ctx, a -> readResult(ctx, read(ctx, a[0], P2.u64(a[1]), blocking = true), skip = true) },
+            "[method]input-stream.subscribe" to body { ctx, a -> subscribe(ctx, a[0], input = true) },
+            "[method]output-stream.check-write" to body { ctx, a ->
+                when (val r = checkWrite(ctx, a[0])) {
+                    is CheckWrite.Allowed -> CanonValue.ok(CanonValue.I64(r.bytes))
+                    CheckWrite.Closed -> closed
+                    is CheckWrite.Failed -> failed(ctx, r.errno)
+                }
+            },
+            "[method]output-stream.write" to body { ctx, a ->
+                val data = (a[1] as CanonValue.Bytes).bytes
+                takeAllowance(ctx, a[0], data.size.toLong(), "write")
+                writeResult(ctx, write(ctx, a[0], data, data.size))
+            },
+            "[method]output-stream.blocking-write-and-flush" to body { ctx, a ->
+                val data = (a[1] as CanonValue.Bytes).bytes
+                if (data.size > P2.MAX_BLOCKING_WRITE) P2.trap("blocking-write-and-flush は ${P2.MAX_BLOCKING_WRITE} バイトまで（${data.size}）")
+                writeResult(ctx, write(ctx, a[0], data, data.size))
+            },
+            "[method]output-stream.flush" to body { ctx, a -> writeResult(ctx, flush(ctx, a[0])) },
+            "[method]output-stream.blocking-flush" to body { ctx, a -> writeResult(ctx, flush(ctx, a[0])) },
+            "[method]output-stream.subscribe" to body { ctx, a -> subscribe(ctx, a[0], input = false) },
+            "[method]output-stream.write-zeroes" to body { ctx, a ->
+                val n = P2.u64(a[1])
+                takeAllowance(ctx, a[0], n, "write-zeroes")
+                writeResult(ctx, write(ctx, a[0], ByteArray(n.toInt()), n.toInt()))
+            },
+            "[method]output-stream.blocking-write-zeroes-and-flush" to body { ctx, a ->
+                val n = P2.u64(a[1])
+                if (n > P2.MAX_BLOCKING_WRITE) P2.trap("blocking-write-zeroes-and-flush は ${P2.MAX_BLOCKING_WRITE} バイトまで（$n）")
+                writeResult(ctx, write(ctx, a[0], ByteArray(n.toInt()), n.toInt()))
+            },
+            "[method]output-stream.splice" to body { ctx, a -> splice(ctx, a, blocking = false, ::readResult, ::writeResult, closed) },
+            "[method]output-stream.blocking-splice" to body { ctx, a -> splice(ctx, a, blocking = true, ::readResult, ::writeResult, closed) },
+        )
+        return mapOf(ERROR to error, POLL to poll, STREAMS to streams)
+    }
+
+    private fun rep(v: CanonValue): Int = (v as CanonValue.Handle).value
+
+    private inline fun splice(
+        ctx: ProcessContext,
+        a: List<CanonValue>,
+        blocking: Boolean,
+        readResult: (ProcessContext, ReadOutcome, Boolean) -> CanonValue,
+        writeResult: (ProcessContext, WriteOutcome, CanonValue?) -> CanonValue,
+        closed: CanonValue,
+    ): CanonValue {
+        output(ctx, a[0])
+        val r = read(ctx, a[1], P2.u64(a[2]), blocking)
+        if (r !is ReadOutcome.Bytes) {
+            return when (r) {
+                ReadOutcome.Empty -> CanonValue.ok(CanonValue.I64(0))
+                else -> readResult(ctx, r, true)
+            }
+        }
+        val w = write(ctx, a[0], r.buffer, r.count)
+        if (w != WriteOutcome.Done) return if (w == WriteOutcome.Closed) closed else writeResult(ctx, w, null)
+        ctx.chargeFuel(r.count.toLong() / WasiP1Fd.BYTES_PER_FUEL)
+        return CanonValue.ok(CanonValue.I64(r.count.toLong()))
+    }
+
+    // ---- 読み ----
+
+    internal sealed interface ReadOutcome {
+        class Bytes(val buffer: ByteArray, val count: Int) : ReadOutcome
+        data object Empty : ReadOutcome
+        data object Closed : ReadOutcome
+        class Failed(val errno: Errno) : ReadOutcome
+    }
+
+    private fun input(ctx: ProcessContext, self: CanonValue): StreamEntry {
+        val e = P2.entry<StreamEntry>(ctx, self)
+        if (!e.input) P2.trap("output-stream を input-stream として使った")
+        return e
+    }
+
+    private fun output(ctx: ProcessContext, self: CanonValue): StreamEntry {
+        val e = P2.entry<StreamEntry>(ctx, self)
+        if (e.input) P2.trap("input-stream を output-stream として使った")
+        return e
+    }
+
+    /**
+     * [self] から [len]（[P2.MAX_READ] で切る）まで読む。[blocking] なら少しでも読めるまで待つ。
+     * 確保は切った長さの分だけ（ゲストの決める長さで先に確保しない）
+     */
+    fun read(ctx: ProcessContext, self: CanonValue, len: Long, blocking: Boolean): ReadOutcome {
+        val rep = rep(self)
+        val e = input(ctx, self)
+        val handle = e.handle
+        if (e.closed || handle == null) return ReadOutcome.Closed
+        val n = minOf(len, P2.MAX_READ.toLong()).toInt()
+        if (n == 0) return ReadOutcome.Empty
+        val buf = ByteArray(n)
+        val file = if (e.shared) null else ctx.withKernelLock { FdIo.openFileOf(ctx.kernel, handle, HandleRights.READ) }
+        if (file != null) {
+            val got = try {
+                ctx.vfs.pread(file, e.offset, buf, 0, n)
+            } catch (ex: FsException) {
+                return ReadOutcome.Failed(ex.errno)
+            }
+            if (got == 0) return ReadOutcome.Closed
+            ctx.withKernelLock { e.offset += got }
+            return ReadOutcome.Bytes(buf, got)
+        }
+        while (true) {
+            val r = FdIo.readHandle(ctx, buf, 0, n) { k -> handle.takeIf { k.processes[ctx.pid]?.hostResources?.get(rep) === e } }
+            when (r) {
+                is IoResult.Bytes -> return if (r.count == 0) ReadOutcome.Empty else ReadOutcome.Bytes(buf, r.count)
+                IoResult.Eof -> return ReadOutcome.Closed
+                is IoResult.Error -> return ReadOutcome.Failed(r.errno)
+                is IoResult.WouldBlock -> if (blocking) ctx.block(listOf(r.key)) else return ReadOutcome.Empty
+            }
+        }
+    }
+
+    // ---- 書き ----
+
+    internal sealed interface WriteOutcome {
+        data object Done : WriteOutcome
+        data object Closed : WriteOutcome
+        class Failed(val errno: Errno) : WriteOutcome
+    }
+
+    internal sealed interface CheckWrite {
+        class Allowed(val bytes: Long) : CheckWrite
+        data object Closed : CheckWrite
+        class Failed(val errno: Errno) : CheckWrite
+    }
+
+    /** `check-write`。今すぐ受けられる量を許可量として覚えて返す */
+    fun checkWrite(ctx: ProcessContext, self: CanonValue): CheckWrite {
+        val e = output(ctx, self)
+        return ctx.withKernelLock {
+            val handle = e.handle
+            if (e.closed || handle == null) return@withKernelLock CheckWrite.Closed
+            if (FdIo.openFileOf(ctx.kernel, handle, HandleRights.WRITE) != null) {
+                e.allowance = P2.FILE_WRITE_ALLOWANCE
+                return@withKernelLock CheckWrite.Allowed(e.allowance)
+            }
+            when (val r = FdIo.pollEntryLocked(ctx.kernel, ctx.vfs, handle, WaitCondition.WRITABLE)) {
+                is FdReadiness.Ready -> if (r.hangup) {
+                    e.closed = true
+                    CheckWrite.Closed
+                } else {
+                    e.allowance = minOf(r.nbytes, P2.FILE_WRITE_ALLOWANCE)
+                    CheckWrite.Allowed(e.allowance)
+                }
+                is FdReadiness.Pending -> {
+                    e.allowance = 0
+                    CheckWrite.Allowed(0)
+                }
+                is FdReadiness.Error -> if (r.errno == Errno.PIPE) CheckWrite.Closed else CheckWrite.Failed(r.errno)
+            }
+        }
+    }
+
+    /** `write`・`write-zeroes` の許可量を引く。超えたらトラップ（仕様） */
+    private fun takeAllowance(ctx: ProcessContext, self: CanonValue, n: Long, what: String) {
+        val e = output(ctx, self)
+        ctx.withKernelLock {
+            if (n > e.allowance) P2.trap("$what が check-write の許可量（${e.allowance}）を超えた（$n）")
+            e.allowance -= n
+        }
+    }
+
+    /** [data] の先頭 [len] バイトを全部書く（パイプが一部しか受けなければ待って続ける） */
+    fun write(ctx: ProcessContext, self: CanonValue, data: ByteArray, len: Int): WriteOutcome {
+        val rep = rep(self)
+        val e = output(ctx, self)
+        val handle = e.handle
+        if (e.closed || handle == null) return WriteOutcome.Closed
+        if (len == 0) return WriteOutcome.Done
+        ctx.chargeFuel(len.toLong() / WasiP1Fd.BYTES_PER_FUEL)
+        val file = if (e.shared) null else ctx.withKernelLock { FdIo.openFileOf(ctx.kernel, handle, HandleRights.WRITE) }
+        if (file != null) return writeFile(ctx, e, file, data, len)
+        var done = 0
+        while (done < len) {
+            val r = FdIo.writeHandle(ctx, data, done, len - done) { k -> handle.takeIf { k.processes[ctx.pid]?.hostResources?.get(rep) === e } }
+            when (r) {
+                is IoResult.Bytes -> done += r.count
+                is IoResult.WouldBlock -> ctx.block(listOf(r.key))
+                IoResult.Eof -> return WriteOutcome.Closed
+                is IoResult.Error -> {
+                    if (r.errno != Errno.PIPE) return WriteOutcome.Failed(r.errno)
+                    ctx.withKernelLock { e.closed = true }
+                    return WriteOutcome.Closed
+                }
+            }
+        }
+        return WriteOutcome.Done
+    }
+
+    /** ファイルへ、stream の位置（追記なら終わり）から書く（VFS の I/O はカーネルロックの外。ADR 0052） */
+    private fun writeFile(ctx: ProcessContext, e: StreamEntry, file: OpenFile, data: ByteArray, len: Int): WriteOutcome {
+        var done = 0
+        try {
+            while (done < len) {
+                if (e.append) {
+                    val w = ctx.vfs.append(file, data, done, len - done)
+                    if (w.count <= 0) return WriteOutcome.Failed(Errno.IO)
+                    done += w.count
+                    ctx.withKernelLock { e.offset = w.position + w.count }
+                } else {
+                    val n = ctx.vfs.pwrite(file, e.offset, data, done, len - done)
+                    if (n <= 0) return WriteOutcome.Failed(Errno.IO)
+                    done += n
+                    ctx.withKernelLock { e.offset += n }
+                }
+            }
+        } catch (ex: FsException) {
+            return WriteOutcome.Failed(ex.errno)
+        }
+        return WriteOutcome.Done
+    }
+
+    private fun flush(ctx: ProcessContext, self: CanonValue): WriteOutcome {
+        val e = output(ctx, self)
+        return if (e.closed || e.handle == null) WriteOutcome.Closed else WriteOutcome.Done
+    }
+
+    // ---- pollable ----
+
+    private fun subscribe(ctx: ProcessContext, self: CanonValue, input: Boolean): CanonValue {
+        val parent = rep(self)
+        val e = if (input) input(ctx, self) else output(ctx, self)
+        return ctx.withKernelLock {
+            val handle = e.handle
+            val always = handle == null || ctx.kernel.objects[handle.objectId] is OpenFile
+            val p = if (always) PollableEntry.Ready(parent) else PollableEntry.Stream(parent, if (input) WaitCondition.READABLE else WaitCondition.WRITABLE)
+            P2.childLocked(ctx, parent, p)
+        }
+    }
+
+    /** 期限 [deadline]（単調時計のナノ秒）の pollable を作る */
+    fun deadline(ctx: ProcessContext, deadline: Long): CanonValue = P2.own(ctx, PollableEntry.Deadline(deadline))
+
+    /** いつもそろった pollable（親 [parent] の子）を作る */
+    fun alwaysReady(ctx: ProcessContext, parent: Int): CanonValue = ctx.withKernelLock { P2.childLocked(ctx, parent, PollableEntry.Ready(parent)) }
+
+    private class Evaluation(val ready: List<Int>, val keys: List<WaitKey>, val deadline: Long?)
+
+    /** 全部の pollable を 1 回判定する（待たない） */
+    private fun evaluate(ctx: ProcessContext, reps: List<Int>): Evaluation {
+        ctx.chargeFuel(POLLABLE_FUEL * reps.size)
+        val now = ctx.monotonicNanos()
+        return ctx.withKernelLock {
+            val table = P2.tableLocked(ctx)
+            val ready = ArrayList<Int>()
+            val keys = ArrayList<WaitKey>()
+            var deadline: Long? = null
+            for ((i, rep) in reps.withIndex()) {
+                val p = table[rep] as? PollableEntry ?: P2.trap("ホストの resource $rep は pollable でない")
+                when (p) {
+                    is PollableEntry.Ready -> ready += i
+                    is PollableEntry.Deadline -> if (now >= p.nanos) ready += i else deadline = minOf(deadline ?: Long.MAX_VALUE, p.nanos)
+                    is PollableEntry.Stream -> {
+                        val s = table[p.parent] as? StreamEntry ?: P2.trap("pollable の親 ${p.parent} がない")
+                        val handle = s.handle
+                        if (s.closed || handle == null) {
+                            ready += i
+                            continue
+                        }
+                        when (val r = FdIo.pollEntryLocked(ctx.kernel, ctx.vfs, handle, p.condition)) {
+                            is FdReadiness.Ready, is FdReadiness.Error -> ready += i
+                            is FdReadiness.Pending -> if (r.key !in keys) keys += r.key
+                        }
+                    }
+                }
+            }
+            Evaluation(ready, keys, deadline)
+        }
+    }
+
+    private fun readyOnce(ctx: ProcessContext, reps: List<Int>): Boolean = evaluate(ctx, reps).ready.isNotEmpty()
+
+    /** どれかがそろうまで待ち、そろった添字を返す。一時的なタイマーは待つときにだけ開き、返るとき（例外のときも）に閉じる */
+    fun await(ctx: ProcessContext, reps: List<Int>): List<Int> {
+        var timer: WaitKey? = null
+        var timerDeadline = 0L
+        var timerStale = false
+        try {
+            while (true) {
+                val ev = evaluate(ctx, reps)
+                if (ev.ready.isNotEmpty()) return ev.ready
+                val keys = ArrayList<WaitKey>(ev.keys.size + 1)
+                keys += ev.keys
+                val deadline = ev.deadline
+                if (deadline != null) {
+                    val t = timer
+                    if (t == null) {
+                        timer = ctx.openWaitTimer(deadline)
+                    } else if (timerStale || deadline != timerDeadline) {
+                        ctx.resetWaitTimer(t, deadline)
+                    }
+                    timerDeadline = deadline
+                    timerStale = false
+                    keys += timer!!
+                }
+                check(keys.isNotEmpty()) { "待つものがない" }
+                val woke = ctx.block(keys)
+                if (timer != null && timer in woke) timerStale = true
+            }
+        } finally {
+            timer?.let { ctx.closeWaitTimer(it) }
+        }
+    }
+}

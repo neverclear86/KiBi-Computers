@@ -41,7 +41,7 @@ component-model の `design/mvp/canonical-abi/definitions.py`（main、コミッ
 
 ホストの実装（#263 のリンクで `kibi:*`・`wasi:*` の import に当てるもの）は、場合・フィールド・ビットの番号を手で数えずに、型の名前で値を作る・読む。`CanonType.Record` の `value("name" to v, …)`・`field(v, "name")`、`Variant`・`Enum` の `case("name", 中身)`・`caseName(v)`、`Flags` の `value("a", "b")`・`has(v, "a")`・`namesOf(v)`。option・result・文字列は `CanonValue.some`・`ok`・`err`・`str`。名前の表は初めて引いたときに作る（型は多く作るので、作るときには作らない）。名前がない・中身が型に合わないのはホストの誤りなので `IllegalArgumentException`。
 
-値は汎用の `CanonValue` を経由する。型付きの codec（ホストの Kotlin の型へ直接 lift する形）は、使いやすさのためには要らず、負荷が重いと分かったとき（#267 で測る）にだけ足す。
+値は汎用の `CanonValue` を経由する。型付きの codec（ホストの Kotlin の型へ直接 lift する形）は、使いやすさのためには要らず、負荷が重いと分かったときにだけ足す（追記（#267）: `write(list<u8>)` を測り、要らないと分かった。ADR 0267）。
 
 ### 浮動小数点数は決定的なプロファイル
 
@@ -114,4 +114,4 @@ own・borrow の resource は、その resource を定義・import した型の�
 ## 測っていないこと
 
 - 実際のゲスト（ツールチェーンが作ったコンポーネント）を動かす統合テストと、仕様の wast のテストは、リンクのできる #263 で行う。#264 のテストは、ByteArray のメモリと、呼んだ順と引数を記録する realloc で、配置・トラップの順・realloc の呼び方を固定したもの
-- 予算の値と、燃料への換算は仮（#251）。1,000 台規模で頻繁に呼ばれる関数（`wasi:io/streams` の `write(list<u8>)` など）の割り当ては、`list<u8>` を `ByteArray` で写す形で抑えたが、汎用の値（`CanonValue`）を経由する分の負荷は #267 の実装で測る。重ければ、型付きの codec（ホストの値へ直接 lift する形）を足す
+- 予算の値と、燃料への換算は仮（#251）。1,000 台規模で頻繁に呼ばれる関数（`wasi:io/streams` の `write(list<u8>)` など）の割り当ては、`list<u8>` を `ByteArray` で写す形で抑えたが、汎用の値（`CanonValue`）を経由する分の負荷は #267 で測り、p1 の `fd_write` と同じ程度だったので型付きの codec は足さない（ADR 0267）
