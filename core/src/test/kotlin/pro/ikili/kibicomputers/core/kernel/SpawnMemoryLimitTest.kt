@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -21,7 +22,6 @@ import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
-import pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -341,10 +341,14 @@ class SpawnMemoryLimitTest {
     """
 
     /**
-     * 先に作る core インスタンス a の start 関数が 14 区画を書いて 1 ページ増やし（固定費の 1 区画と合わせて 15 区画。#270）、断られても続ける（`memory.grow` は -1）。
+     * 先に作る core インスタンス a の start 関数が、a・b の固定費と合わせて RAM（1 ページ）にちょうど収まる区画数を書いて 1 ページ増やし
+     * （固定費は [CORE_INSTANCE_OVERHEAD_BYTES]。仮の値で、確定は #251）、断られても続ける（`memory.grow` は -1）。
      * 後に作る b は、線形メモリの外に書く data セグメントを持ち、RAM と関係なく作れない
      */
-    private val unrelatedLinkFailureComponent = """
+    private val unrelatedLinkFailureComponent = run {
+        val written = ((page - 2 * CORE_INSTANCE_OVERHEAD_BYTES) / 4096L).toInt()
+        check(written in 1..16) { "固定費が大きすぎて、この試験は成り立たない" }
+        """
         (component
           (core module ${'$'}a
             (memory (export "mem") 1)
@@ -353,7 +357,7 @@ class SpawnMemoryLimitTest {
               (loop ${'$'}l
                 (i32.store8 (i32.mul (local.get ${'$'}i) (i32.const 4096)) (i32.const 1))
                 (local.set ${'$'}i (i32.add (local.get ${'$'}i) (i32.const 1)))
-                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const 14))))
+                (br_if ${'$'}l (i32.lt_u (local.get ${'$'}i) (i32.const $written))))
               (drop (memory.grow (i32.const 1))))
             (start ${'$'}start))
           (core module ${'$'}b
@@ -361,7 +365,8 @@ class SpawnMemoryLimitTest {
             (data (i32.const 65536) "x"))
           (core instance ${'$'}ia (instantiate ${'$'}a))
           (core instance ${'$'}ib (instantiate ${'$'}b)))
-    """
+        """
+    }
 
     private fun Machine.spawnComponent(text: String, name: String): Int =
         spawn(
@@ -434,16 +439,29 @@ class SpawnMemoryLimitTest {
             (start ${'$'}start))
     """
 
+    /**
+     * 書き込んだ分だけで RAM（[ramSections] 区画）を超える、2 つの core インスタンスの 1 つあたりの区画数（固定費を含めずに超える）。
+     * 固定費（[CORE_INSTANCE_OVERHEAD_BYTES]。仮の値で、確定は #251）が変わっても、この試験は「前の分と合わせて数える」ことだけを確かめる。
+     * 前のインスタンスが固定費と合わせて RAM に収まらない値になったら、試験の前提が崩れるので気づけるようにする
+     */
+    private fun sectionsPerWriter(ramSections: Long): Int {
+        val n = (ramSections / 2 + 1).toInt()
+        val first = CORE_INSTANCE_OVERHEAD_BYTES + n * 4096L
+        assertTrue(first <= ramSections * 4096L, "前のインスタンスが固定費と合わせて収まらない: 試験の前提を見直す")
+        return n
+    }
+
     @Test
     fun `後のcoreインスタンスの書き込みは前のインスタンスの分と合わせて数え、RAMを超えるとメモリ不足でトラップする`() = timeout(limit) {
         harness().use { h ->
             val host = ConsoleRecorder()
             val m = h.machine(host = host, memoryBytes = page)
-            // RAM は 16 区画。固定費 2 区画（core インスタンス 2 つ）+ a の 8 区画 + b の 8 区画は収まらない
+            // RAM は 16 区画。a・b がそれぞれ 9 区画を書くと、固定費を数えなくても合わせて 18 区画で収まらない（a だけなら収まる）
+            val n = sectionsPerWriter(16)
             val text = """
                 (component
-                  ${writerModule("a", 8)}
-                  ${writerModule("b", 8)}
+                  ${writerModule("a", n)}
+                  ${writerModule("b", n)}
                   (core instance ${'$'}ia (instantiate ${'$'}a))
                   (core instance ${'$'}ib (instantiate ${'$'}b)))
             """
@@ -462,10 +480,11 @@ class SpawnMemoryLimitTest {
         harness(totalBytes = page).use { h ->
             val host = ConsoleRecorder()
             val m = h.machine(host = host, memoryBytes = 16 * page)
+            val n = sectionsPerWriter(16)
             val text = """
                 (component
-                  ${writerModule("a", 8)}
-                  ${writerModule("b", 8)}
+                  ${writerModule("a", n)}
+                  ${writerModule("b", n)}
                   (core instance ${'$'}ia (instantiate ${'$'}a))
                   (core instance ${'$'}ib (instantiate ${'$'}b)))
             """
@@ -521,8 +540,10 @@ class SpawnMemoryLimitTest {
         harness().use { h ->
             val host = ConsoleRecorder()
             val m = h.machine(host = host, memoryBytes = page)
-            // メモリを持たない core インスタンスを 17 個作る（固定費は 1 つ 4 KiB。RAM は 16 個分）
-            val instances = (0 until 17).joinToString(" ") { "(core instance (instantiate ${'$'}a))" }
+            // メモリを持たない core インスタンスを、固定費だけで RAM に収まらない数だけ作る
+            check(CORE_INSTANCE_OVERHEAD_BYTES > 0) { "固定費が 0 だと、この試験は成り立たない" }
+            val count = (page / CORE_INSTANCE_OVERHEAD_BYTES + 1).toInt()
+            val instances = (0 until count).joinToString(" ") { "(core instance (instantiate ${'$'}a))" }
             val text = """
                 (component
                   (core module ${'$'}a (func (export "f")))

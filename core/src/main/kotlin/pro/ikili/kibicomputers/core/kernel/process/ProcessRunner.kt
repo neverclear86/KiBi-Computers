@@ -809,7 +809,8 @@ internal class ProcessRunner(private val machine: Machine) {
     /**
      * コンポーネントの core インスタンスを 1 つ作る前に、その固定費（[CORE_INSTANCE_OVERHEAD_BYTES]）を RAM の 3 段に数える（#270）。
      * 断られたら [WasmLinkException]（断った回数が増えるので、異常終了の文はメモリ不足になる）。数えた分はプロセスの終わりにまとめて返す。
-     * プロセスの終わり（別のスレッドの kill でも来る）と取り違えないよう、カーネルロックの中で数えて記録する（作るたびに 1 回だけ）
+     * プロセスの終わり（別のスレッドの kill でも来る）と取り違えないよう、カーネルロックの中で数えて記録する（作るたびに 1 回だけ）。
+     * `LinkEnv.configure` が「core インスタンス 1 つにつき、作る直前にちょうど 1 回」呼ばれる約束（`LinkEnv.configure` の KDoc）に頼っている
      */
     private fun reserveCoreInstanceOverhead(rt: ProcessRuntime) {
         lock.withLockValue {

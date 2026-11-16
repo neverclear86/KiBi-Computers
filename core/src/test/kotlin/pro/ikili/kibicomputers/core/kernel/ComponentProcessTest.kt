@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -22,6 +23,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.HostFunction
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.Assertions.assertNull
 import pro.ikili.kibicomputers.core.kernel.process.KillResult
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
@@ -241,6 +243,16 @@ class ComponentProcessTest {
 
     private fun lockedCheck(m: Machine, block: () -> Unit) = m.lock.withLockValue { block() }
 
+    /**
+     * 作っている途中のプロセスが、core インスタンスの固定費（[pro.ikili.kibicomputers.core.kernel.process.CORE_INSTANCE_OVERHEAD_BYTES]。
+     * 仮の値で、確定は #251）に加えて、1 つ目のインスタンスが書き込んだ分も RAM に数えていること
+     */
+    private fun assertWrittenCounted(m: Machine, rt: ProcessRuntime, before: Long) {
+        val overhead = m.lock.withLockValue { rt.coreInstanceOverheadBytes }
+        assertTrue(overhead > 0, "固定費を数えていない")
+        assertTrue(m.memoryAccount.usedBytes > before + overhead, "固定費のほかに、1 つ目のインスタンスが書き込んだ分を数えている")
+    }
+
     @Test
     fun `2つ目のcoreインスタンスのstart関数がトラップしたら、プロセスだけがCRASHEDになり作ったものを返す`() = timeout(limit) {
         Harness().use { h ->
@@ -261,7 +273,7 @@ class ComponentProcessTest {
             val before = m.memoryAccount.usedBytes
             val rt = m.spawnRt(startSpins, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
             h.tickUntilTrue("燃料待ちにならない: ${rt.process.state}") { rt.process.state == ProcessState.WAITING_FUEL }
-            assertTrue(m.memoryAccount.usedBytes > before, "1 つ目のインスタンスが書き込んだ分を数えている")
+            assertWrittenCounted(m, rt, before)
             assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(rt.process.pid, KillSignal.TERMINATE) })
             h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
@@ -280,7 +292,7 @@ class ComponentProcessTest {
             val rt = m.spawnRt(startSpins, TestDriver(ProcessKind.BLOCKING) { StepResult.Exit(0) })
             h.scheduler.tick()
             eventually(30_000, "譲らない") { h.scheduler.fuelYields.get() - yields0 >= 3 }
-            assertTrue(m.memoryAccount.usedBytes > before, "1 つ目のインスタンスが書き込んだ分を数えている")
+            assertWrittenCounted(m, rt, before)
             assertEquals(KillResult.DELIVERED, m.lock.withLockValue { m.killLocked(rt.process.pid, KillSignal.TERMINATE) })
             h.tickUntilTrue("終わらない") { rt.process.state.isTerminal }
             assertEquals(ProcessState.KILLED, rt.process.state, "${rt.lastError}")
@@ -304,6 +316,7 @@ class ComponentProcessTest {
             assertCleanedUp(m, rt, before)
         }
     }
+
     // ---- 燃料（#270） ----
 
     /** 2 つの core インスタンスの start 関数が、それぞれ [na]・[nb] 回まわる（計測あり） */
@@ -348,5 +361,31 @@ class ComponentProcessTest {
         assertTrue(base - onlyB > 100_000, "b の start 関数の分が引かれていない: ${base - onlyB}")
         // 保存則: a と b の消費の和が、両方を回したときの消費になる（どちらの分も漏れず、二重にも引かない）
         assertEquals((base - onlyA) + (base - onlyB), base - both)
+    }
+
+    @Test
+    fun `コンポーネントのプロセスはctxのinstantiateを呼べず、固定費を払わずにcoreインスタンスを足せない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            val inner = h.program(emptyModule())
+            val error = AtomicReference<Throwable?>()
+            val counted = AtomicReference<Pair<Int, Long>>()
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                val rt = m.rt(ctx.pid)
+                val state = { m.lock.withLockValue { rt.instances.size to rt.coreInstanceOverheadBytes } }
+                val before = state()
+                error.set(runCatching { ctx.instantiate(inner.module) { } }.exceptionOrNull())
+                counted.set(before)
+                assertEquals(before, state(), "断られたら、core インスタンスも固定費も増えない")
+                StepResult.Exit(0)
+            }
+            val rt = m.spawnRt(program(), driver)
+            h.tickUntilTrue("終わらない") { rt.process.state.isTerminal || m.state == MachineState.CRASHED }
+            assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+            val e = error.get()
+            assertTrue(e is IllegalStateException && e.message!!.contains("コンポーネントのプロセスは instantiate を呼べない"), "$e")
+            assertEquals(2, counted.get().first, "プログラムの 2 つの core インスタンスだけ")
+            assertEquals(2 * CORE_INSTANCE_OVERHEAD_BYTES, counted.get().second, "固定費もその 2 つ分だけ")
+        }
     }
 }
