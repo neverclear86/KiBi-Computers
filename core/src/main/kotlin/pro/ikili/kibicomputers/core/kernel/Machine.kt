@@ -622,6 +622,15 @@ public class Machine private constructor(
      */
     public val isRestoring: Boolean get() = restoreHandle != null
 
+    /**
+     * 成功した復元（[completeRestore]）で `restored` イベント（#87、ADR 0087）を入れたキューの数。復元で出していなければ（冷えた起動、
+     * 取り消し、CRASHED、復元していないマシン）-1。0 なら、どのプロセスも `restored` を受けるキューを開いていなかった（シェルは描き直さない）。
+     * 入り直した後に画面が空のままになる件（#636）を切り分けるため、接続層が復元の受け手でログに出す
+     */
+    @Volatile
+    public var restoredEventQueues: Int = -1
+        private set
+
     /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
     public val isRebootPending: Boolean get() = lock.withLockValue { rebootRequested || rebootNotified }
 
@@ -1060,7 +1069,7 @@ public class Machine private constructor(
         // 起きたプロセスは、この復元の quiesce が閉じる（受け手が返る）まで割り当てられない。受け手より前に入れるので、受け手の中で
         // つなぎ直したデバイスのイベントや tty-resize より先に並ぶ
         val values = listOf(EventValue.Integer(jump.realtimeNanos), EventValue.Integer(jump.worldTicks))
-        kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
+        restoredEventQueues = kernel.events.post(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, values), kernel.objects, wakeSink)
         // 前段で開けずに表から落としたマウントを知らせる（#56。保存したときの位置で1回だけ。失敗・取り消し・冷えた起動では出さない）
         for ((diskId, point) in prepared.droppedDisks) postDiskEventLocked(DiskEvents.REMOVED, diskId, point)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)

@@ -12,6 +12,7 @@ import net.minecraft.world.MenuProvider
 import net.minecraft.world.entity.player.Inventory
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.inventory.AbstractContainerMenu
+import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.chunk.LevelChunk
@@ -338,13 +339,35 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             environment,
             boot,
             source,
-            RestoreReady { machine -> wiring.attach(level, blockPos, machine, speakerAddress) },
+            RestoreReady { machine ->
+                wiring.attach(level, blockPos, machine, speakerAddress)
+                logRestoreWiring(machine)
+            },
             RestoreListener { _, outcome, cause ->
                 noteRestoreOutcome(serial, outcome)
                 ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
             },
         )
         if (computer.machine == null) wiring.disconnect()
+    }
+
+    /**
+     * 復元の受け手でつないだ結果を debug で1行出す（#636。入り直した後に画面が空のままになる件の切り分け用。復元1回につき1行）。
+     * ケースと画面の位置・チャンク、画面をつないだ回数、`restored` を入れたキューの数（[Machine.restoredEventQueues]。冷えた起動なら -1）。
+     * 受け手の時点の画面はまだ描き直す前なので、中身は出さない
+     */
+    private fun logRestoreWiring(machine: Machine) {
+        if (!LOGGER.isDebugEnabled) return
+        val screenPos = wiring.connectedScreen?.blockPos
+        LOGGER.debug(
+            "Wired the restored computer at {} (chunk {}): screen={} (chunk {}), screenAttaches={}, restoredEventQueues={}",
+            blockPos,
+            ChunkPos(blockPos),
+            screenPos ?: "none",
+            screenPos?.let(::ChunkPos) ?: "-",
+            wiring.screenAttachCount,
+            machine.restoredEventQueues,
+        )
     }
 
     /**

@@ -240,6 +240,8 @@ object MachineRestoreGameTests {
             helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
             val screen = be.wiring.connectedScreen
             helper.assertTrue(screen != null, "the screen should be connected after restoring")
+            // シェルが restored を受けるキューを開いていた（#636 の切り分けのログに出す数。0 なら描き直さない）
+            helper.assertTrue(machine!!.restoredEventQueues >= 1, "restored should reach the shell's queue: ${machine.restoredEventQueues}")
             val text = lines(screen!!.text)
             helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line without a key: $text")
         }.thenExecute {
@@ -250,6 +252,47 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(copy!!.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "pending" }, "the restored shell should run the redrawn line: $text")
+        }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * Esc を押した後（シェルがエスケープシーケンスの続きを待っている間）に保存しても、戻すとキーを打つ前に行を描き直す（#636）。
+     * キーボードの画面で Esc を押して閉じようとすると Esc がコンピューターに届くので、この形で保存されることがある
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoredShellRedrawsAfterEscape(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            val events = listOf(KeyboardEvent.Text("echo pending"), KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
+            for (packet in events.flatMap { KeyboardEventCodec.encode(listOf(it)) }) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the input")
+            }
+        }.thenWaitUntil {
+            val text = lines(first.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the typed text should be shown: $text")
+            // Esc まで読んで、続きを待っている
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next byte")
+        }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            helper.setBlock(SCREEN, Blocks.AIR)
+            helper.setBlock(
+                SCREEN,
+                KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+            )
+            copy = reload(helper, tag)
+        }.thenWaitUntil {
+            val be = copy!!
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null && !machine.isRestoring, "the case should finish restoring: ${be.computer}")
+            val screen = be.wiring.connectedScreen
+            helper.assertTrue(screen != null, "the screen should be connected after restoring")
+            val text = lines(screen!!.text)
+            helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line after Esc: $text")
         }.thenExecute {
             copy!!.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)

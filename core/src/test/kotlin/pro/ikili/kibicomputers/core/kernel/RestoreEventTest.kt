@@ -153,9 +153,11 @@ class RestoreEventTest {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
             val saved = save(h, store, before)
-            val r = restore(h, store, saved, after)
+            val r = restore(h, store, saved, after, probe = { it.restoredEventQueues })
             assertEquals(RestoreOutcome.RESTORED, r.outcome)
             assertTrue(r.quiesced, "受け手の中は止めたまま")
+            // 全部を受けるキューと restored だけを受けるキューの2つ（#636 の切り分けのログに出す数）
+            assertEquals(2, r.probe, "restored を入れたキューの数")
             val expected = listOf(restored(realtime, world))
             assertEquals(expected, r.inListener["all"], "全部を受けるキュー")
             assertEquals(expected, r.inListener[RestoreEvents.TYPE], "restored だけを受けるキュー")
@@ -284,6 +286,7 @@ class RestoreEventTest {
             val pid = m.lock.withLockValue { m.kernel.initPid }
             assertEquals(ProcessState.WAITING_EVENT, m.stateOf(pid), "init が起きた")
             assertEquals(emptyList<KernelEvent>(), queues(m)[RestoreEvents.TYPE], "冷えた起動で restored を出した")
+            assertEquals(-1, m.restoredEventQueues, "冷えた起動では restored を入れたキューの数を記録しない")
             m.close()
         }
     }
@@ -314,6 +317,7 @@ class RestoreEventTest {
             assertEquals(listOf(RestoreOutcome.CANCELLED), outcomes.toList())
             assertEquals(MachineState.STOPPED, m.state)
             assertTrue(queues(m).values.all { q -> q.none { it.type == RestoreEvents.TYPE } }, "取り消したのに restored を出した")
+            assertEquals(-1, m.restoredEventQueues, "取り消したときは restored を入れたキューの数を記録しない")
             h.scheduler.hooks.beforeRestoreInstall = null
             m.close()
         }
