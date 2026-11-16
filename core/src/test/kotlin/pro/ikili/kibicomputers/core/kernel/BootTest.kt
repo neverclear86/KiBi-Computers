@@ -125,16 +125,8 @@ class BootTest {
             condition()
         }
 
-        /**
-         * init が CPU を取って動き出す（pid 1 が CREATED を抜ける）まで tick を回す。
-         * RUNNING が見えても、init の専用スレッドはまだ `register()` の前のことがある。その間に reboot や写しの kill が入ると、
-         * register が KILLED にして unregister（beforeUnregister のフック）を通らないので、場面を作れない（#542、#624）。
-         * CREATED を抜けていれば、register を通って runBlocking の try/finally の中にいる（tick で燃料を配らないと抜けない）
-         */
-        fun tickUntilInitStarted() = tickUntil("init が CPU を取らない") {
-            m.state == MachineState.RUNNING && !m.isBooting &&
-                process(1)?.state.let { it != null && it != ProcessState.CREATED && !it.isTerminal }
-        }
+        /** init が CPU を取って、専用スレッドの登録を済ませるまで tick を回す（[Harness.tickUntilInitStarted]） */
+        fun tickUntilInitStarted() = h.tickUntilInitStarted(m)
 
         /** しばらく tick を回す */
         fun tickFor(millis: Long) {

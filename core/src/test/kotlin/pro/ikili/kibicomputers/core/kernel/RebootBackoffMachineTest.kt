@@ -51,14 +51,8 @@ class RebootBackoffMachineTest {
         /** tick を進めずに、init が動いている（起動の途中でない）のを待つ */
         fun awaitRunning() = eventually(10_000, "起動しない") { m.state == MachineState.RUNNING && !m.isBooting }
 
-        /**
-         * init が CPU を取って、専用スレッドの登録を済ませる（CREATED を抜ける）まで tick を進める。
-         * CREATED のまま reboot すると register が KILLED にして unregister（beforeUnregister のフック）を通らず、止める場面を作れない
-         */
-        fun tickUntilInitStarted() = tickUntil("init が CPU を取らない") {
-            m.state == MachineState.RUNNING && !m.isBooting &&
-                m.lock.withLockValue { m.kernel.processes[1] }?.state.let { it != null && it != ProcessState.CREATED && !it.isTerminal }
-        }
+        /** init が CPU を取って、専用スレッドの登録を済ませるまで tick を進める（[Harness.tickUntilInitStarted]） */
+        fun tickUntilInitStarted() = h.tickUntilInitStarted(m)
 
         /**
          * [Machine.reboot] を求め、止まって、再起動の求めを通知に積む（か、待ちに入る）ところまで進める。tick は進めない。
@@ -124,15 +118,11 @@ class RebootBackoffMachineTest {
         }
     }
 
-    /** init の `_start` が回った回数。init がスレッドを持って動いているかを見る */
-    private val initLoops = java.util.concurrent.atomic.AtomicInteger()
-
     private fun foreverInit(): FakeModule = FakeModule.builder()
         .fuelMetered()
         .export("_start", VOID) { ctx, _ ->
             while (true) {
                 ctx.step(1)
-                initLoops.incrementAndGet()
                 Thread.sleep(1)
             }
             @Suppress("UNREACHABLE_CODE")
@@ -196,12 +186,9 @@ class RebootBackoffMachineTest {
         } finally {
             release.countDown()
         }
+        // init の専用スレッドが register を通ってから reboot する。register の前に reboot が入ると、
+        // register が KILLED にして beforeUnregister を通らない（#683。#624 と同じ原因）
         tickUntilInitStarted()
-        // 燃料は tick でしか届かず、起動した直後の init はスレッドを持たずに燃料待ちのことがある。
-        // 1 tick 進めて、init がスレッドを持って回っているのを確かめてから reboot する（持たない init は止める時に登録を外す所を通らない）
-        val loops = initLoops.get()
-        h.scheduler.tick()
-        eventually(10_000, "init が回らない") { initLoops.get() >= loops + 3 }
 
         // reboot を受け付けて、init のスレッドが止まり切る前（求めの印だけ）: プロセスのスレッドが進めば解ける
         val atGate = CountDownLatch(1)
@@ -237,9 +224,6 @@ class RebootBackoffMachineTest {
     fun `rebootを受け付けて止まり切る前にCRASHEDになった台は、保存を待たず、写さない`() = env {
         // #698: 再起動の求めの印が立ったまま CRASHED になると saveReadiness は TRANSIENT のまま残るが、待っても解けない
         tickUntilInitStarted()
-        val loops = initLoops.get()
-        h.scheduler.tick()
-        eventually(10_000, "init が回らない") { initLoops.get() >= loops + 3 }
         val atGate = CountDownLatch(1)
         val gate = CountDownLatch(1)
         h.scheduler.hooks.beforeUnregister = { machine, pid ->

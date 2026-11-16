@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.VOID
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
+import pro.ikili.kibicomputers.core.kernel.tickUntilInitStarted
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -107,10 +108,7 @@ class WasiP1PowerTest {
             disk.write(node, 0, init, 0, init.size)
             h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
             assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
-            tickUntil("init が動き出さない") {
-                m.state == MachineState.RUNNING && !m.isBooting &&
-                    m.processState(1).let { it != null && it != ProcessState.CREATED && !it.isTerminal }
-            }
+            h.tickUntilInitStarted(m)
         }
 
         /**
