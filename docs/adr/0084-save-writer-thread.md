@@ -25,6 +25,7 @@
 2. **自動保存**: ケースの `identity`（NBT に書く世代）を進めて `setChanged` するのは、書き込みのスレッドで rename が終わったと分かってから。書き込み中にチャンクが保存されても、NBT は前の世代を指す
 3. **停止**: `ServerStoppingEvent` で全台を取り出して書き込みに回した後、列が空になるまで待ち（`flush`。上限 `writerFlushMillis`、仮 30 秒）、終わった分を受け取って `identity` を進め `setChanged` してから、
    `ChunkUnloadDrain` と `saveAllChunks` に進む。`ServerStoppedEvent` でスレッドを閉じて join する（チャンクの保存が積んだ掃除を流すため。上限は同じ、超えたら warn）
+   取り出しの前に、読み込みの `claim` で予約した印（`changedLater`。NBT と違う ID・世代・epoch になったケース。ふだんは次の tick の始めに流す）を `markChunkUnsaved` で流す。読み込んだ直後の tick に止まると予約が流れず、取り出さない台（電源の切れた台・復元の途中の台）の NBT が `claim` の前の値のまま残るため。`ChunkUnloadDrain` のアンロード（`untrack`）は予約を捨てるので、それより前に流す。tick の合間のアンロード（`saveForUnload`）も、流れていない予約があればそのチャンクに `setUnsaved(true)` を付けて外す（#762）
 4. **アンロード（`ChunkEvent.Unload`）だけは、書き込みの終わりを待たない。** 予約した世代を `identity` にして `setUnsaved(true)` を付ける（NBT は書き込み中の世代を指しうる）。
    自動保存の予約が書き込み中のときも、その予約の世代を採る。クラッシュ・書き込みの失敗で NBT の世代のファイルがないときは、規則 9 に落ちる
 5. **FULL でなくなったチャンク（#545）**: 2. と同じく、終わってから `identity` を進め、チャンクに `setUnsaved(true)` を付ける。終わる前にアンロードが来たら 4.
