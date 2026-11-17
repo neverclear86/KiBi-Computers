@@ -12,6 +12,9 @@
  * コルーチンの中（#95。ADR 0095）: os.pullEventRaw・pullEvent は CC と同じく filter を yield し、resume の値をイベントとして返す
  * （フィルターをかけるのは resume する側。parallel か、ユーザーのスケジューラー）。os.sleep は startTimer して "timer" を yield し、
  * id が合うまでくり返す。メインスレッド（メインのチャンクと REPL。コルーチンではない）では、今までどおりその場でカーネルを待つ
+ *
+ * コルーチンの中の peripheral.call（#744。ADR 0744）: 待っている呼び出しの pending-call の fd も、メインスレッドの待ち（pull）が
+ * poll_oneoff の FD_READ で待ち、終わったものを "task_complete" のイベントにして FIFO に積む（kibi_lua_tasks_collect）
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -81,7 +84,7 @@ static void push_registry(lua_State *L, const void *key) {
 }
 
 /* スタックの上の [n] 個の値（名前, 引数...）を FIFO の後ろに積む（値は取り除く） */
-static void fifo_push(lua_State *L, int n) {
+void kibi_lua_fifo_push(lua_State *L, int n) {
     int base = lua_gettop(L) - n + 1;
     lua_createtable(L, n, 1);
     for (int i = 1; i <= n; i++) {
@@ -157,7 +160,7 @@ static void fire_timers(lua_State *L) {
         /* 先に積む（積む途中でメモリ不足になっても、タイマーは残って次に鳴る） */
         lua_pushliteral(L, "timer");
         lua_pushinteger(L, id);
-        fifo_push(L, 2);
+        kibi_lua_fifo_push(L, 2);
         remove_timer(L, id);
     }
 }
@@ -220,18 +223,18 @@ static void push_kernel_event(lua_State *L, const kibi_event_t *e) {
     if (no_source && str_is(&e->kind, "device-attached") && nvals >= 1) {
         lua_pushliteral(L, "peripheral");
         push_event_value(L, &vals[0]);
-        fifo_push(L, 2);
+        kibi_lua_fifo_push(L, 2);
         return;
     }
     if (no_source && str_is(&e->kind, "device-detached") && nvals >= 1) {
         lua_pushliteral(L, "peripheral_detach");
         push_event_value(L, &vals[0]);
-        fifo_push(L, 2);
+        kibi_lua_fifo_push(L, 2);
         return;
     }
     if (str_is(&e->source, "console") && str_is(&e->kind, "tty-resize")) {
         lua_pushliteral(L, "term_resize");
-        fifo_push(L, 1);
+        kibi_lua_fifo_push(L, 1);
         return;
     }
     int n = 1;
@@ -241,7 +244,7 @@ static void push_kernel_event(lua_State *L, const kibi_event_t *e) {
         n++;
     }
     for (uint32_t i = 0; i < nvals; i++) push_event_value(L, &vals[i]);
-    fifo_push(L, n + (int)nvals);
+    kibi_lua_fifo_push(L, n + (int)nvals);
 }
 
 /* lua_pcall で呼ぶ。取り出したイベント（引数 1 の lightuserdata が指す結果）を、FIFO に移し終えたものの次から移す */
@@ -264,7 +267,7 @@ static int flush_lost(lua_State *L) {
     if (events_lost == 0) return 0;
     lua_pushliteral(L, "events_dropped");
     lua_pushinteger(L, events_lost > (uint64_t)INT64_MAX ? INT64_MAX : (lua_Integer)events_lost);
-    fifo_push(L, 2);
+    kibi_lua_fifo_push(L, 2);
     events_lost = 0;
     return 1;
 }
@@ -290,7 +293,10 @@ static int take_kernel_events(lua_State *L) {
         convert_done = 0;
         lua_pushcfunction(L, convert_batch);
         lua_pushlightuserdata(L, &r);
+        /* 写す間の __gc から入れ子で取り出して、r の場所（arena）を戻さないようにする */
+        kibi_lua_arena_hold();
         int status = lua_pcall(L, 1, 0, 0);
+        kibi_lua_arena_release();
         add_lost(r.val.ok.dropped); /* あふれて捨てたイベントの数 */
         if (status != LUA_OK) {
             add_lost(n - convert_done);
@@ -303,19 +309,28 @@ static int take_kernel_events(lua_State *L) {
     }
 }
 
-/* 期限の来たタイマーと、取れるカーネルのイベントを FIFO に移す */
+/*
+ * 期限の来たタイマーと、取れるカーネルのイベントと、終わった peripheral.call（"task_complete"）を FIFO に移す。
+ * 結果を arena から写している途中（kibi_lua_arena_held。写す途中の __gc から入れ子で来たとき）は、タイマーだけ移す
+ * （カーネルのイベントと終わった呼び出しはカーネルの側に残り、外側が写し終えた後の回収で移る）
+ */
 static void collect(lua_State *L) {
     fire_timers(L);
+    if (kibi_lua_arena_held()) return;
     take_kernel_events(L);
+    kibi_lua_tasks_collect(L);
 }
 
+/* poll_oneoff の購読の数: キュー・時計と、待っている呼び出し（kibi_lua_peripheral.c の表。カーネルの上限と同じ 16） */
+#define MAX_SUBSCRIPTIONS (2 + 16)
+
 /*
- * キュー [fd]（-1 なら見ない）が読めるか、単調時計が [deadline]（0 以下なら見ない）に達するまで待つ。
- * どちらもなければ何もしない。起きた理由は見ない（呼んだ側が調べ直す）
+ * キュー [fd]（-1 なら見ない）が読めるか、単調時計が [deadline]（0 以下なら見ない）に達するか、[tasks] なら待っている呼び出しの
+ * どれかが終わるまで待つ。どれもなければ何もしない。起きた理由は見ない（呼んだ側が調べ直す）
  */
-static void wait_for(lua_State *L, int32_t fd, int64_t deadline) {
-    __wasi_subscription_t subs[2];
-    __wasi_event_t events[2];
+static void wait_for(lua_State *L, int32_t fd, int64_t deadline, int tasks) {
+    __wasi_subscription_t subs[MAX_SUBSCRIPTIONS];
+    __wasi_event_t events[MAX_SUBSCRIPTIONS];
     __wasi_size_t n = 0;
     memset(subs, 0, sizeof subs);
     if (fd >= 0) {
@@ -332,6 +347,13 @@ static void wait_for(lua_State *L, int32_t fd, int64_t deadline) {
         subs[n].u.u.clock.flags = __WASI_SUBCLOCKFLAGS_SUBSCRIPTION_CLOCK_ABSTIME;
         n++;
     }
+    int count = tasks ? kibi_lua_task_count() : 0;
+    for (int i = 0; i < count && n < MAX_SUBSCRIPTIONS; i++) {
+        subs[n].userdata = 3;
+        subs[n].u.tag = __WASI_EVENTTYPE_FD_READ;
+        subs[n].u.u.fd_read.file_descriptor = (__wasi_fd_t)kibi_lua_task_fd(i);
+        n++;
+    }
     if (n == 0) return;
     __wasi_size_t got = 0;
     __wasi_errno_t err = __wasi_poll_oneoff(subs, events, n, &got);
@@ -341,7 +363,7 @@ static void wait_for(lua_State *L, int32_t fd, int64_t deadline) {
 /* ---- os の関数 ---- */
 
 /* 今動いているのがメインスレッドなら 1（メインスレッドは yield できないので、その場で待つ） */
-static int on_main_thread(lua_State *L) {
+int kibi_lua_on_main_thread(lua_State *L) {
     int main = lua_pushthread(L);
     lua_pop(L, 1);
     return main;
@@ -370,11 +392,16 @@ static int pull(lua_State *L) {
         }
         collect(L);
         if (fifo_head != fifo_tail) continue;
+        /* 結果を写している途中の __gc からは、カーネルのイベントを取り出せない（collect がしない）ので、待たずにエラーにする */
+        if (kibi_lua_arena_held()) {
+            lua_pushliteral(L, "cannot wait for events while a result is being copied");
+            return lua_error(L);
+        }
         int64_t deadline = 0;
         lua_Integer id;
         if (!earliest_timer(L, &deadline, &id)) deadline = 0;
         else if (deadline <= 0) deadline = 1;
-        wait_for(L, queue_fd, deadline);
+        wait_for(L, queue_fd, deadline, 1);
     }
 }
 
@@ -392,7 +419,7 @@ static int yield_filter(lua_State *L, lua_KFunction k) {
 
 /* os.pullEventRaw([filter]) */
 int kibi_lua_pull_raw(lua_State *L) {
-    if (on_main_thread(L)) return pull(L);
+    if (kibi_lua_on_main_thread(L)) return pull(L);
     return yield_filter(L, NULL);
 }
 
@@ -410,7 +437,7 @@ static int pull_event_k(lua_State *L, int status, lua_KContext ctx) {
 
 /* os.pullEvent([filter]): pullEventRaw と同じだが、"terminate" を受けたら "Terminated" のエラーにする（CC と同じ） */
 static int l_pullEvent(lua_State *L) {
-    if (!on_main_thread(L)) return yield_filter(L, pull_event_k);
+    if (!kibi_lua_on_main_thread(L)) return yield_filter(L, pull_event_k);
     int n = pull(L);
     if (is_terminate(L, -n)) {
         lua_pushliteral(L, "Terminated");
@@ -426,7 +453,7 @@ static int l_queueEvent(lua_State *L) {
     /* その時点で届いているイベントの後ろに積む（CC と同じ順） */
     collect(L);
     lua_settop(L, n);
-    fifo_push(L, n);
+    kibi_lua_fifo_push(L, n);
     return 0;
 }
 
@@ -485,8 +512,8 @@ static int sleep_k(lua_State *L, int status, lua_KContext ctx) {
  */
 static int l_sleep(lua_State *L) {
     int64_t deadline = monotonic_now() + delay_of(L, 1);
-    if (on_main_thread(L) || !lua_isyieldable(L)) {
-        while (monotonic_now() < deadline) wait_for(L, -1, deadline);
+    if (kibi_lua_on_main_thread(L) || !lua_isyieldable(L)) {
+        while (monotonic_now() < deadline) wait_for(L, -1, deadline, 0);
         return 0;
     }
     lua_settop(L, 0);

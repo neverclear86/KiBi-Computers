@@ -13,9 +13,9 @@ parallel - Lua で関数をコルーチンにして並べて動かす
 
 lua(1) には `parallel` ライブラリがあります（`require("parallel")` でも使えます）。CC: Tweaked の `parallel` の API に合わせています。
 
-関数はそれぞれ別のコルーチンで動きます。関数が `os.pullEvent`・`os.pullEventRaw`・`os.sleep`（os(3)）でイベントを待つと、そのコルーチンは yield し、ほかの関数が動きます。すべてが待つと、次のイベントを取り、フィルターが合う関数に渡します（フィルターのない関数にはすべてのイベントを渡します）。`terminate` のイベントは、すべての関数に渡します。
+関数はそれぞれ別のコルーチンで動きます。関数が `os.pullEvent`・`os.pullEventRaw`・`os.sleep`（os(3)）でイベントを待つと、またはサーバーのメインスレッドで動くデバイスのメソッドの結果を待つと（peripheral(3)）、そのコルーチンは yield し、ほかの関数が動きます。すべてが待つと、次のイベントを取り、フィルターが合う関数に渡します（フィルターのない関数にはすべてのイベントを渡します）。`terminate` のイベントは、すべての関数に渡します。
 
-- `parallel.waitForAny(f, ...)` は、どれかの関数が戻ったら、その関数の位置（最初が 1）を返します。ほかの関数はその場で止めます
+- `parallel.waitForAny(f, ...)` は、どれかの関数が戻ったら、その関数の位置（最初が 1）を返します。ほかの関数はその場で止めます。止めた関数がメインスレッドのメソッドの結果を待っていた（peripheral(3)）ときは、その呼び出しはまだ実行されていなければ、プログラムが終わると取り消されます（CC: Tweaked は実行します）
 - `parallel.waitForAll(f, ...)` は、すべての関数が戻ったら戻ります
 
 関数がエラーを出すと、`parallel` が同じエラーを出し直し、ほかの関数は止めます。引数はすべて関数でなければなりません。
@@ -28,10 +28,6 @@ lua(1) には `parallel` ライブラリがあります（`require("parallel")` 
         function() os.sleep(5); print("time out") end,
         function() local _, addr = os.pullEvent("peripheral"); print("attached", addr) end
     )
-
-## CC: Tweaked との違い
-
-- `peripheral.call` は yield しないので、デバイスのメソッドが動く間、ほかの関数は動かない（os(3)）
 
 ## 関連項目
 

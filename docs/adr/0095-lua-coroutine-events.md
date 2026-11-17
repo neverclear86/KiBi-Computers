@@ -56,7 +56,7 @@
 - メインのプログラムはコルーチンで動かない。トップレベルの `coroutine.yield()` はイベント待ちにならずエラーになる（`lua.c` を直さない。REPL の `fd_read` の待ちとも合わないため）
 - メインスレッドの `os.sleep` はイベントを捨てない（ADR 0094）
 - yield できない文脈の `os.sleep` はその場で待つ
-- `peripheral.call` は yield しない。CC では、メインスレッドのメソッドは `task_complete` を待って yield し、ほかのコルーチンが動く。KiBi の `invoke` はプロセスごと待つ（最大で約 1 tick。その間に来たイベントはカーネルのキューに残る）。p1 の `[method]device.start` → `poll_oneoff` → `take`（ADR 0077）を使えば ABI を変えずに yield する形も作れるが、待つ fd の管理と復元のときの積み直しが絡むので、#95 には入れず #744 にした
+- `peripheral.call` は yield しない。CC では、メインスレッドのメソッドは `task_complete` を待って yield し、ほかのコルーチンが動く。KiBi の `invoke` はプロセスごと待つ（最大で約 1 tick。その間に来たイベントはカーネルのキューに残る）。p1 の `[method]device.start` → `poll_oneoff` → `take`（ADR 0077）を使えば ABI を変えずに yield する形も作れるが、待つ fd の管理と復元のときの積み直しが絡むので、#95 には入れず #744 にした（→ ADR 0744 で yield するようにした。この違いはなくなった）
 
 ## 規模（1,000 台）
 
@@ -76,6 +76,6 @@
 
 ## 範囲に入れなかったもの
 
-- `peripheral.call` の yield 化（上の「CC との違い」）: #744
+- `peripheral.call` の yield 化（上の「CC との違い」）: #744（ADR 0744）
 - グローバルの `sleep`、`os.time`・`os.clock` の CC 互換の上書き: #237
 - メインのチャンクをコルーチンで動かすこと（`lua.c` を直すことになる）

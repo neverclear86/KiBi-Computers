@@ -43,14 +43,14 @@
 | `getType(name)` | kind。なければ nil |
 | `hasType(name, type)` | kind が `type` と同じか、`:` の後ろが `type` と同じか（`type` に `:` がないとき）。なければ nil |
 | `getMethods(name)` | メソッドの名前（ケバブケースのまま）。なければ nil |
-| `call(name, method, ...)` | open → invoke → drop |
+| `call(name, method, ...)` | open → invoke → drop（コルーチンの中は start → take。ADR 0744） |
 | `wrap(name)` | メソッドごとの関数を入れたテーブル。なければ nil |
 | `find(type [, filter])` | kind が合う（`hasType` と同じ）ものを wrap して複数の値で返す |
 | `getName(wrapped)` | wrap したテーブルの address |
 | `bytes(s)` | bytes として渡す文字列を包む（KiBi だけ。CC にはない） |
 
 - 名前は address。36 バイトなら大文字を小文字に直してから開く（カーネルは大文字を受けない）
-- **fd を持ち続けない。** `call` も `wrap` の関数も、呼ぶたびに open → invoke → drop する。import の結果（`info`・`methods`・`invoke`）を読んだらすぐ drop してから Lua の値に写す（写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れない。漏れると 256 個で `mfile` になり peripheral 全体が使えなくなる）。fd はプロセスあたり 256、デバイスは最大 256 なので、全部の fd を持つと `mfile` に当たる。`__gc` で閉じる形にすると、二重の drop（トラップ）と GC の遅れによる fd の枯渇を気にすることになる
+- **fd を持ち続けない。** `call` も `wrap` の関数も、呼ぶたびに open → invoke → drop する（コルーチンの中のメインスレッドのメソッドは、待つ間だけ pending-call の fd を持つ。ADR 0744）。import の結果（`info`・`methods`・`invoke`）を読んだらすぐ drop してから Lua の値に写す（写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れない。漏れると 256 個で `mfile` になり peripheral 全体が使えなくなる）。fd はプロセスあたり 256、デバイスは最大 256 なので、全部の fd を持つと `mfile` に当たる。`__gc` で閉じる形にすると、二重の drop（トラップ）と GC の遅れによる fd の枯渇を気にすることになる
 - `wrap` は作ったときの kind を覚え、呼ぶたびに `info` で確かめる。違えば（同じ address に別の種類がつながったら）`No such peripheral`（fd を持つ場合に kind が変わると届かないのと同じ振る舞い）
 - `wrap` のテーブルのメタテーブル: `__name = "peripheral"`・`name`・`type`。`getType`・`hasType`・`getMethods`・`getName` は wrap したテーブルも受ける（CC と同じ）
 - メソッドの別名: ケバブケース（`get-size`）は Lua の識別子にならないので、`wrap` のテーブルにキャメルケース（`getSize`）も入れる。「`-`＋英小文字」を大文字にし、`-` の後が英小文字でないもの（`a-1`・`a--b`・末尾の `-`）には付けない。本来の名前は大文字を含まない（`[a-z][a-z0-9_-]*`）ので、ぶつからない。`call` は大文字を「`-`＋小文字」に直してから呼ぶ（両方の形を受ける）
