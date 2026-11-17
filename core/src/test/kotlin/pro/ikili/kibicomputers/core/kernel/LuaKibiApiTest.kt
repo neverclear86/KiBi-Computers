@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceCompletion
 import pro.ikili.kibicomputers.api.device.DeviceContext
 import pro.ikili.kibicomputers.api.device.DeviceException
 import pro.ikili.kibicomputers.api.device.DeviceMethods
@@ -23,6 +24,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -45,6 +47,9 @@ class LuaKibiApiTest {
     /** テスト用のデバイス。直接のメソッドとメインスレッドのメソッドを持つ */
     private class TestDev(override val kind: String = "test:dev") : Device {
         val mainCalls = AtomicInteger()
+
+        /** main-mark が動いた回数 */
+        val marks = AtomicInteger()
 
         /** `big` を呼んだ回数 */
         val bigCalls = AtomicInteger()
@@ -83,7 +88,27 @@ class LuaKibiApiTest {
                 mainCalls.incrementAndGet()
                 Array(args.size()) { args.get(it) }
             }
+            .mainThread("main-mark") { _, _ ->
+                marks.incrementAndGet()
+                emptyArray()
+            }
+            .mainThread("main-fail") { _, _ -> throw DeviceException("main boom") }
+            .mainThread("main-gate") { ctx, args ->
+                gates.add(ctx.defer() to args.getLong(0))
+                emptyArray()
+            }
             .build()
+
+        /** main-gate が後で返すと決めた呼び出しと、その引数。テストの側が [release] で返す */
+        val gates = ConcurrentLinkedQueue<Pair<DeviceCompletion, Long>>()
+
+        /** main-gate の呼び出しを、受けた順にすべて返す（値は引数そのまま） */
+        fun release() {
+            while (true) {
+                val (c, v) = gates.poll() ?: return
+                c.complete(DeviceValue.of(v))
+            }
+        }
     }
 
     private inner class Run(
@@ -91,8 +116,9 @@ class LuaKibiApiTest {
         val h: Harness = Harness(execRuntime = EndiveRuntime()),
         memoryBytes: Long? = null,
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
+        maxHostCallsPerTick: Int = 64,
     ) : AutoCloseable {
-        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment)
+        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
         val dev = TestDev()
         private val output: Int
         private val text = StringBuilder()
@@ -130,7 +156,51 @@ class LuaKibiApiTest {
             condition()
         }
 
-        fun waitFor(line: String) = waitUntil("「$line」が出ない: $text") { text.contains(line) }
+        /** このプロセスが持つ device・pending-call の fd の数 */
+        fun openCallFds(): Int = m.lock.withLockValue {
+            m.kernel.processes[pid]!!.handles.entries().values.count {
+                val o = m.kernel.objects[it.objectId]
+                o is pro.ikili.kibicomputers.core.device.PendingDeviceCall || o is pro.ikili.kibicomputers.core.device.DeviceHandle
+            }
+        }
+
+        fun waitFor(line: String) = waitUntil("「$line」が出ない: $text（${m.stateOf(pid)}）") { text.contains(line) }
+
+        /**
+         * [finish] と同じだが、ホスト呼び出しが列にある間は、燃料が尽きて待つプロセスがいるときだけ tick を進める
+         * （tick の中で列の呼び出しが実行されるので、Lua の速さと tick の間隔によらず、終わるまで列に残す）
+         */
+        fun finishHoldingHostCalls(expected: ProcessState = ProcessState.EXITED): String {
+            eventually(60_000, "終わらない: $text") {
+                if (m.pendingHostCalls == 0 || m.fuelWaiterCount > 0) h.scheduler.tick()
+                Thread.sleep(1)
+                drain()
+                m.stateOf(pid).isTerminal
+            }
+            val out = drain()
+            assertEquals(expected, m.stateOf(pid), out)
+            return out
+        }
+
+        /**
+         * [finish] と同じだが、プロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める（1 tick に実行する呼び出しは
+         * `maxHostCallsPerTick = 1` で 1 件にする）。start と直後の take の間に tick が入ってメソッドが終わり、コルーチンが
+         * task_complete を yield せずに値を返すことがないようにする（Lua が動いている間は tick を進めないので、メインスレッドの
+         * メソッドは必ず yield する）
+         */
+        fun finishTickingWhileWaiting(expected: ProcessState = ProcessState.EXITED): String {
+            eventually(60_000, "終わらない: $text") {
+                val state = m.stateOf(pid)
+                val waiting = state == ProcessState.WAITING_EVENT || state == ProcessState.WAITING_HOST || state == ProcessState.WAITING_FUEL
+                if (waiting || m.fuelWaiterCount > 0) h.scheduler.tick()
+                Thread.sleep(1)
+                drain()
+                m.stateOf(pid).isTerminal
+            }
+            val out = drain()
+            assertEquals(expected, m.stateOf(pid), out)
+            return out
+        }
 
         /**
          * Lua が待っている間に、マシンの RAM の残りがちょうど [remaining] バイトになるように、テストの側で予約する（#729）。
@@ -158,6 +228,9 @@ class LuaKibiApiTest {
 
     private fun run(script: String): String = Run(script).use { it.finish() }
 
+    /** [run] と同じだが、メインスレッドのメソッドが start の直後に終わらないように tick を進める（[Run.finishTickingWhileWaiting]） */
+    private fun runYielding(script: String): String = Run(script, maxHostCallsPerTick = 1).use { it.finishTickingWhileWaiting() }
+
     @Test
     fun `peripheralで列挙して種類とメソッドを読み、callで呼べる`() = timeout(limit) {
         val out = run(
@@ -183,7 +256,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "big,echo,emit,emit-as,fail,get-size,main-echo,needs-int,posted,types",
+                "big,echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -428,7 +501,7 @@ class LuaKibiApiTest {
 
     @Test
     fun `pcallとgsubのコールバックの中で待て、コルーチンの中ではyieldする`() = timeout(limit) {
-        val out = run(
+        val out = runYielding(
             """
             print(pcall(function() os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", "p") end))
             local co = coroutine.wrap(function()
@@ -436,11 +509,127 @@ class LuaKibiApiTest {
                 coroutine.yield(v + peripheral.call("$ADDRESS", "main-echo", 1))
             end)
             print(co())
+            -- メインスレッドのメソッドは task_complete を yield する（#744。CC と同じ）
             print(co("c", 1))
+            local ev = table.pack(os.pullEvent("task_complete"))
+            print(co(table.unpack(ev, 1, ev.n)))
             print((string.gsub("ab", ".", function(ch) os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", ch:upper()) end)))
             """.trimIndent(),
         )
-        assertEquals("true\tp\nc\n2\nAB\n", out)
+        assertEquals("true\tp\nc\ntask_complete\n2\nAB\n", out)
+    }
+
+    @Test
+    fun `parallelの中のメインスレッドのメソッドは結果を待つ間にほかのコルーチンを動かす`() = timeout(limit) {
+        Run(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            parallel.waitForAll(
+                function() print("call", p.mainGate(5), peripheral.call("$ADDRESS", "main-gate", 6)) end,
+                function() os.sleep(0.05); print("slept"); io.stdout:flush() end
+            )
+            print("all")
+            """.trimIndent(),
+        ).use { r ->
+            // 1つ目の呼び出しを返さないうちに、もう一方のコルーチンの sleep が進む（yield しなければここで止まる）
+            r.waitUntil("sleep が進まない") { r.drain().contains("slept\n") && r.dev.gates.size == 1 }
+            r.dev.release()
+            r.waitUntil("2つ目の呼び出しが来ない") { r.dev.gates.size == 1 }
+            r.dev.release()
+            assertEquals("slept\ncall\t5\t6\nall\n", r.finish())
+        }
+    }
+
+    @Test
+    fun `コルーチンの中の呼び出しはtask_completeをyieldし、直接のメソッドとその場の失敗とyieldできない文脈では待たない`() = timeout(limit) {
+        val out = runYielding(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            -- 直接のメソッド（wrap は invoke、call は start してすぐ take）は yield しない
+            local co = coroutine.create(function() return peripheral.call("$ADDRESS", "echo", 2), p.echo(1, "a") end)
+            print(coroutine.resume(co))
+            -- メインスレッドのメソッドは task_complete を yield し、id の合わないものと別のイベントは捨てる
+            local co2 = coroutine.create(function() return p.mainEcho(7, nil, "z") end)
+            print(coroutine.resume(co2))
+            print(coroutine.resume(co2, "task_complete", -1, true, "wrong"))
+            print(coroutine.resume(co2, "other"))
+            local ev = table.pack(os.pullEvent("task_complete"))
+            print(math.type(ev[2]), ev[3], ev.n)
+            print(coroutine.resume(co2, ev[1], ev[2] + 0.0, table.unpack(ev, 3, ev.n)))
+            print(coroutine.status(co2))
+            -- 失敗は task_complete の false と文。続きでは呼んだ行の位置が付く
+            local co3 = coroutine.create(function() return peripheral.call("$ADDRESS", "main-fail") end)
+            coroutine.resume(co3)
+            local e3 = table.pack(os.pullEvent("task_complete"))
+            print(e3[3], e3[4], e3.n)
+            print(coroutine.resume(co3, table.unpack(e3, 1, e3.n)))
+            -- terminate は Terminated（位置なし）。呼び出しは取り消さず、後で task_complete が届く
+            local co4 = coroutine.create(function() return peripheral.call("$ADDRESS", "main-echo", 4) end)
+            coroutine.resume(co4)
+            print(coroutine.resume(co4, "terminate"))
+            print(select(3, os.pullEvent("task_complete")))
+            -- その場の失敗は yield せずにエラー
+            print(coroutine.resume(coroutine.create(function() return peripheral.call("$ADDRESS", "nope") end)))
+            print(coroutine.resume(coroutine.create(function() return peripheral.call("$OTHER", "x") end)))
+            -- yield できない文脈（gsub のコールバック）では、その場で待つ
+            print(coroutine.wrap(function()
+                return (string.gsub("ab", ".", function(ch) return peripheral.call("$ADDRESS", "main-echo", ch:upper()) end))
+            end)())
+            """.trimIndent(),
+        )
+        val lines = out.lines()
+        assertEquals("true\t2\t1\ta", lines[0], out)
+        assertEquals("true\ttask_complete", lines[1], out)
+        assertEquals("true\ttask_complete", lines[2], out)
+        assertEquals("true\ttask_complete", lines[3], out)
+        assertEquals("integer\ttrue\t6", lines[4], out)
+        assertEquals("true\t7\tnil\tz", lines[5], out)
+        assertEquals("dead", lines[6], out)
+        assertEquals("false\tmain boom\t4", lines[7], out)
+        assertTrue(Regex("^false\t.*:\\d+: main boom$").matches(lines[8]), out)
+        assertEquals("false\tTerminated", lines[9], out)
+        assertEquals("true\t4", lines[10], out)
+        assertTrue(Regex("^false\t.*:\\d+: No such method nope$").matches(lines[11]), out)
+        assertTrue(Regex("^false\t.*:\\d+: No such peripheral$").matches(lines[12]), out)
+        assertEquals("AB", lines[13], out)
+    }
+
+    @Test
+    fun `上限を超えて並べてもその場で待って動き、fdを漏らさず、捨てたコルーチンの呼び出しも後で閉じる`() = timeout(limit) {
+        Run(
+            """
+            -- 20 個のコルーチンが 15 回ずつ（300 回。fd の上限 256 を超える）。同時に 16 個を超えた分は invoke でその場で待つ
+            local fns, sums = {}, {}
+            for i = 1, 20 do
+                fns[i] = function()
+                    local s = 0
+                    for j = 1, 15 do s = s + peripheral.call("$ADDRESS", "main-echo", j) end
+                    sums[i] = s
+                end
+            end
+            parallel.waitForAll(table.unpack(fns))
+            local sum = 0
+            for i = 1, 20 do sum = sum + sums[i] end
+            print("sum", sum)
+            -- waitForAny で残したコルーチンの呼び出しは、表に残り、後の待ちで回収されて閉じる
+            print(parallel.waitForAny(function() peripheral.call("$ADDRESS", "main-echo", 1) end, function() end))
+            print("waiting"); io.stdout:flush()
+            os.pullEvent("finish")
+            print("finished")
+            """.trimIndent(),
+        ).use { r ->
+            fun open(): Int = r.m.lock.withLockValue {
+                r.m.kernel.processes[r.pid]!!.handles.entries().values.count {
+                    val o = r.m.kernel.objects[it.objectId]
+                    o is pro.ikili.kibicomputers.core.device.PendingDeviceCall || o is pro.ikili.kibicomputers.core.device.DeviceHandle
+                }
+            }
+            r.waitFor("waiting")
+            r.waitUntil("残した呼び出しが閉じない: ${open()}") { open() == 0 }
+            r.dev.context!!.postEvent("finish")
+            assertEquals("sum\t2400\n2\nwaiting\nfinished\n", r.finish())
+            assertEquals(301, r.dev.mainCalls.get())
+        }
     }
 
     @Test
@@ -676,6 +865,125 @@ class LuaKibiApiTest {
         }
     }
 
+    /**
+     * 結果の場所（約 66 KiB）が入る解放済みの穴を、先に潰しておく Lua のコード。4000 バイトの文字列を持つ要素を、Lua の使用量が [kb] KB になるまで積み、
+     * 新しい 12 個（約 48 KB）だけ解放する。空きは 1 つながりの 48 KB の穴になり、take の結果の場所（約 39 KiB）には足りるが、
+     * 回収の結果の場所（約 66 KiB）には足りない（それまでの呼び出しが残した大きな穴は、この積みで使われる）。
+     * これは穴の形を整えるだけで、残りは決めない。残りは、この後 Lua が os.sleep で待つ間に、[Run.squeeze] でバイト単位に合わせる
+     * （埋めながら試す形は、残りが 4 KiB 単位で減り、スレッドの動き方で結果が変わるので使わない。ADR 0094）。
+     * 一度絞ると、解放しても大きな場所は取れなくなる（RAM は解放しても減らない。#370）ので、元に戻す関数は用意しない
+     */
+    private val shapeHole = """
+        local keep = {}
+        local function shapeHole(kb)
+            while collectgarbage("count") < kb do keep.head = {keep.head, string.rep("x", 4000)} end
+            for i = 1, 12 do keep.head = keep.head[1] end
+            collectgarbage()
+        end
+    """.trimIndent()
+
+    @Test
+    fun `RAMが足りないコルーチンの呼び出しは、メソッドを動かさずにnot enough memoryになり、fdを漏らさない`() = timeout(limit) {
+        // 残りは 76 KiB: 結果の場所（約 66 KiB）を取る kibi_lua_reserve は断られ（kibi_lua_realloc は KIBI_LUA_KEEP の 16 KiB を残す）、
+        // 残りが KEEP + STACK_GUARD（32 KiB）より上なので、C のスタックは数えず、Lua 自身の小さな確保は通る（ADR 0094 の #729）。
+        // 残りは、Lua が os.sleep で待つ間に、テストの側でバイト単位に合わせる（埋めながら試す形は使わない）
+        Run(
+            """
+            local addr = "$ADDRESS"
+            local cos, res = {}, {}
+            for i = 1, 5 do
+                cos[i] = coroutine.create(function() return peripheral.call(addr, "main-echo", i) end)
+                res[i] = false
+            end
+            print("ready"); io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 5 do
+                local ok, e = coroutine.resume(cos[i])
+                res[i] = ok and "started" or e
+            end
+            print(table.concat(res, ","))
+            os.sleep(0.3)
+            print("done"); io.stdout:flush()
+            os.sleep(2)
+            """.trimIndent(),
+            memoryBytes = 512 * 1024L,
+        ).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(76 * 1024)
+            r.waitFor("done\n")
+            // 断られた呼び出しは積まれていない（積んでから断ると、fd も表に残る）
+            assertEquals(0, r.openCallFds())
+            // 断られたメソッドは動いていない（積まれていれば、待つ間に動く）
+            assertEquals(0, r.dev.mainCalls.get())
+            val out = r.finish()
+            r.release(held)
+            assertEquals("ready\nnot enough memory,not enough memory,not enough memory,not enough memory,not enough memory\ndone\n", out)
+        }
+    }
+
+    @Test
+    fun `RAMが足りなくて回収できないときは、Luaのエラーになって要素を表に残し、トラップにならない`() = timeout(limit) {
+        // 残りは 76 KiB（上のテストと同じ理由で、結果の場所の reserve だけが断られる。イベントを取り出す分の約 39 KiB は取れる）。
+        // 2つの呼び出しが終わった後に絞り、回収（pullEvent・queueEvent）を通す
+        Run(
+            """
+            $shapeHole
+            local addr = "$ADDRESS"
+            local cos = {}
+            for i = 1, 2 do cos[i] = coroutine.create(function() return peripheral.call(addr, "main-gate", 6 + i) end) end
+            local function pull() return os.pullEvent("task_complete") end
+            os.queueEvent("x"); os.pullEvent("x")
+            for i = 1, 2 do coroutine.resume(cos[i]) end
+            print("started"); io.stdout:flush()
+            repeat os.sleep(0.05) until peripheral.call(addr, "posted")
+            shapeHole(200)
+            print("ready"); io.stdout:flush()
+            os.sleep(2)
+            -- 回収の reserve が断られる（os.queueEvent も同じ回収を通る）。何度でも Lua のエラーになる
+            local ok1, e1 = pcall(pull)
+            local ok2, e2 = pcall(pull)
+            local ok3, e3 = pcall(os.queueEvent, "y")
+            print(tostring(ok1 or e1), tostring(ok2 or e2), tostring(ok3 or e3))
+            os.sleep(0.3)
+            print("done"); io.stdout:flush()
+            os.sleep(2)
+            """.trimIndent(),
+            memoryBytes = 512 * 1024L,
+        ).use { r ->
+            r.waitFor("started\n")
+            r.waitUntil("2つの呼び出しが来ない") { r.dev.gates.size == 2 }
+            r.dev.release()
+            r.dev.posted = true
+            r.waitFor("ready\n")
+            val held = r.squeeze(76 * 1024)
+            r.waitFor("done\n")
+            // 終わった結果は写せるまで表に残る（写し終えていないものを閉じない）
+            assertEquals(2, r.openCallFds())
+            val out = r.finish()
+            r.release(held)
+            assertEquals("started\nready\nnot enough memory\tnot enough memory\tnot enough memory\ndone\n", out)
+        }
+    }
+
+    @Test
+    fun `startがagainを返したら、コルーチンの中でもinvokeでその場で待つ`() = timeout(limit) {
+        Run(
+            """
+            local p = peripheral.wrap("$ADDRESS")
+            local co = coroutine.create(function() return peripheral.call("$ADDRESS", "main-echo", 5), p.mainEcho(6) end)
+            print(coroutine.resume(co))
+            print(coroutine.status(co))
+            """.trimIndent(),
+        ).use { r ->
+            // 表は空のまま、カーネルの上限（1 プロセス 16 個）に当てる
+            r.m.lock.withLockValue {
+                repeat(16) { r.m.openPendingDeviceCallLocked(r.pid, pro.ikili.kibicomputers.core.device.PendingDeviceCall.State.Running) }
+            }
+            assertEquals("true\t5\t6\ndead\n", r.finish())
+            assertEquals(2, r.dev.mainCalls.get())
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(longs = [24, 28, 31, 40])
     fun `RAMの上限の近くでイベントを読み続けても、Cのスタックが深くなる所でトラップにならない`(remainingKib: Long) = timeout(limit) {
@@ -796,6 +1104,29 @@ class LuaKibiApiTest {
     }
 
     @Test
+    fun `terminateでプログラムが終わると、まだ実行していないメインスレッドの呼び出しは実行されない`() = timeout(limit) {
+        // 1 tick に 1 件しか実行せず、列に積んだ後は燃料が尽きたときしか tick を進めないので、先に積んだ 3 件の後ろにある main-mark は、
+        // プログラムが終わるまでに実行されない
+        Run(
+            """
+            local function start(method) local co = coroutine.create(function() return peripheral.call("$ADDRESS", method, 1) end); coroutine.resume(co); return co end
+            start("main-echo"); start("main-echo"); start("main-echo")
+            local co = start("main-mark")
+            print(coroutine.resume(co, "terminate"))
+            """.trimIndent(),
+            maxHostCallsPerTick = 1,
+        ).use { r ->
+            assertEquals("false\tTerminated\n", r.finishHoldingHostCalls())
+            // 終わったプロセスの fd が閉じられ、列にあった呼び出しは外される
+            repeat(20) {
+                r.h.scheduler.tick()
+                Thread.sleep(5)
+            }
+            assertEquals(0, r.dev.marks.get())
+        }
+    }
+
+    @Test
     fun `取り出した後のLuaの確保だけが失敗したら、写せなかったイベントをevents_droppedで知らせる`() = timeout(limit) {
         // 結果の場所（take の見積もり）は解放した穴に入り、取り出したイベントを Lua の値に写す確保だけが断られる形（#727・#729）。
         // 1回の pullEventRaw は、取れるイベントを 8 件ずつ全部 FIFO に移すので、4 KiB のイベントを 40 件出せば、どこかの件で必ず断られる
@@ -839,6 +1170,99 @@ class LuaKibiApiTest {
             assertEquals(40, big + dropped, last.toString())
             assertTrue(dropped > 0, last.toString())
         }
+    }
+
+    @Test
+    fun `コルーチンの中の結果を写す間に__gcがos_queueEventを呼んでも、結果は壊れず、積んだイベントも届く`() = timeout(limit) {
+        // GC を止めずに回し続け、__gc のたびに次の __gc を持つごみを作る。結果の文字列（長い文字列は 1 つずつ確保する）を写す間に
+        // __gc が走り、os.queueEvent が回収（take_kernel_events・kibi_lua_tasks_collect）を入れ子で呼ぼうとする。
+        // キューは parallel が開くので、止めなければ take_kernel_events が写している結果の場所（arena）を戻して取り直す（#755）。
+        // __gc は結果と同じくらいの大きさの文字列を作り、戻された場所を使い回させる（止めないと、写した値が "Z" などで壊れる）。
+        // __gc の連鎖は 3,000 回で止める（GC の分の時間を抑える）
+        val out = Run(
+            """
+            local hits, junk = 0, {}
+            local mt = {}
+            mt.__gc = function() hits = hits + 1; os.queueEvent("g"); for k = 1, 8 do junk[k] = string.rep("Z", 1500 + k) end; if hits < 3000 then setmetatable({}, mt) end end
+            for i = 1, 16 do setmetatable({}, mt) end
+            local big = {}
+            for i = 1, 32 do big[i] = string.rep(string.char(65 + i % 26), 1500) .. i end
+            local bad, g = 0, 0
+            collectgarbage("incremental", 0, 1000)
+            parallel.waitForAll(function()
+                for round = 1, 10 do
+                    local a = { peripheral.call("$ADDRESS", "echo", table.unpack(big)) }
+                    local b = { peripheral.call("$ADDRESS", "main-echo", table.unpack(big)) }
+                    for i = 1, 32 do
+                        if a[i] ~= big[i] then bad = bad + 1 end
+                        if b[i] ~= big[i] then bad = bad + 1 end
+                    end
+                end
+                collectgarbage("incremental", 200, 100)
+                os.queueEvent("end")
+            end, function()
+                while os.pullEvent() ~= "end" do g = g + 1 end
+            end)
+            print(bad, hits > 0, g > 0)
+            """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\ttrue\ttrue\n", out)
+    }
+
+    @Test
+    fun `カーネルのイベントを写す間に__gcからpullEventRawを呼ぶと、待たずにエラーになり、イベントは壊れずに届く`() = timeout(limit) {
+        // メインスレッドの take_kernel_events が、取り出したイベント（arena にある結果）を Lua の値に写す間は、kibi_lua_arena_hold で入れ子の回収を止める（#755）。
+        // その間に __gc が os.pullEventRaw を呼ぶと、回収（collect）はタイマーだけ移し、待たずに
+        // "cannot wait for events while a result is being copied" のエラーにする（待つと、取り出せるものがなく止まる）。
+        // 止めていなければ、入れ子の取り出しが写している結果の場所（arena）を戻して取り直し、写した値が壊れる。
+        // イベントは、デバイスの emit-as で、480 文字の文字列 8 個を持つもの（1 つのイベントの大きさの上限は 4 KiB）を出す。写す間の確保で GC が走り、__gc が入る。
+        // __gc が写す前の位置で pullEventRaw を呼ぶと、そのイベントを自分で受け取る（check に通す）ので、どちらで受け取っても、壊れていないことと件数を見る。
+        // テストの側が pad を出し続けて、入れ子の pullEventRaw が待ち続けないようにする
+        val out = Run(
+            """
+            local addr, call, pull, pc = "$ADDRESS", peripheral.call, os.pullEventRaw, pcall
+            local parts = {}
+            for i = 1, 8 do parts[i] = string.rep(string.char(65 + i % 26), 480) .. i end
+            local bigs, bad, held, armed, hits = 0, 0, 0, false, 0
+            local function check(name, ...)
+                if name ~= "big" then return end
+                -- デバイスのイベントは、最初の値がデバイスの address
+                local a = { ... }
+                bigs = bigs + 1
+                if #a ~= 9 or a[1] ~= addr then bad = bad + 1; return end
+                for i = 1, 8 do if a[i + 1] ~= parts[i] then bad = bad + 1; return end end
+            end
+            local mt = {}
+            mt.__gc = function()
+                hits = hits + 1
+                if armed then
+                    local r = table.pack(pc(pull))
+                    if r[1] then check(table.unpack(r, 2, r.n))
+                    elseif tostring(r[2]):find("while a result is being copied", 1, true) then held = held + 1 end
+                end
+                if hits < 3000 then setmetatable({}, mt) end
+            end
+            -- イベントのキューを先に開く（開く前に来たイベントは届かない）
+            os.queueEvent("x"); os.pullEventRaw()
+            for i = 1, 16 do setmetatable({}, mt) end
+            collectgarbage("incremental", 0, 1000)
+            armed = true
+            for round = 1, 20 do
+                call(addr, "emit-as", "big", table.unpack(parts))
+                while bigs < round do check(pull()) end
+            end
+            armed = false
+            collectgarbage("incremental", 200, 100)
+            print(bad, bigs, held > 0)
+            """.trimIndent(),
+        ).use { r ->
+            r.waitUntil("終わらない") {
+                r.dev.context?.postEvent("pad")
+                r.m.stateOf(r.pid).isTerminal
+            }
+            r.finish()
+        }
+        assertEquals("0\t20\ttrue\n", out)
     }
 
     @Test
