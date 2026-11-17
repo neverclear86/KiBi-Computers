@@ -1,6 +1,6 @@
 package kibi:io@0.1.0;
 
-/// p2 のパイプ（ADR 0075。#685 で確定、ADR 0685）。
+/// p2 のパイプ（ADR 0075。#685 で実装（ABI は確認待ち）、ADR 0685）。
 /// 2つの stream は同じカーネルのパイプ（ADR 0059）の両端を指す。
 interface pipe-streams {
     use kibi:kernel/types@0.1.0.{error-code};

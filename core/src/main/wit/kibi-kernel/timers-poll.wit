@@ -1,6 +1,6 @@
 package kibi:kernel@0.1.0;
 
-/// p2 でタイマーを待つ（ADR 0426。#685 で確定、ADR 0685）。pollable はタイマーの子で、子の pollable が残るタイマーを捨てるとトラップ。
+/// p2 でタイマーを待つ（ADR 0426。#685 で実装（ABI は確認待ち）、ADR 0685）。pollable はタイマーの子で、子の pollable が残るタイマーを捨てるとトラップ。
 interface timers-poll {
     use timers.{timer};
     use wasi:io/poll@0.2.12.{pollable};

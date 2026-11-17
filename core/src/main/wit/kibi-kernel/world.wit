@@ -8,7 +8,7 @@ world imports {
     import timers;
 }
 
-/// p2 のゲスト向け（#685 で確定。ADR 0685・ADR 0426）
+/// p2 のゲスト向け（#685 で実装（ABI は確認待ち）。ADR 0685・ADR 0426）
 world imports-p2 {
     include imports;
     import timers-poll;

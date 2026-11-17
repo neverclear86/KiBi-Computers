@@ -2,9 +2,11 @@ package pro.ikili.kibicomputers.core.wasi.p2
 
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.io.PipeEnd
 import pro.ikili.kibicomputers.core.kernel.io.Pipes
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.HostResourceTable
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -149,12 +151,20 @@ internal object KibiP2Kernel {
 
     /**
      * パイプを作り、読む端を input-stream、書く端を output-stream で返す（大きさは既定）。表に 2 つ分の空きがなければ、何も作らずに `mfile`
-     * （p1 の `FdTable.pipe` と同じ）。パイプの数は表の上限で抑えられるので `nfile` は返さない
+     * （p1 の `FdTable.pipe` と同じ）。
+     *
+     * パイプの中身は RAM の勘定（`MemoryAccount`）に入れないので、数は p1 と同じ fd の上限（[DEFAULT_HANDLE_LIMIT]）で抑える
+     * （ADR 0059・0685）: この表にあるパイプの端の stream が足して [DEFAULT_HANDLE_LIMIT] を超えるなら `mfile`。
+     * `HostResourceTable.LIMIT` だけで抑えると、書いてから書く端を drop したパイプを読む端 1 つで保てるので、
+     * プロセスあたり p1（約 1 MiB）の 16 倍のバッファが勘定の外に載る。マシン全体の上限はないので `nfile` は返さない
      */
     @Throws(FsException::class)
     private fun pipe(ctx: ProcessContext): CanonValue = ctx.withKernelLock {
         val table = P2.tableLocked(ctx)
         if (HostResourceTable.LIMIT - table.size < 2) fsError(Errno.MFILE, "ホストの resource の数が上限（${HostResourceTable.LIMIT}）")
+        val objects = ctx.kernel.objects
+        val ends = table.count { it is StreamEntry && it.handle != null && objects[it.objectId] is PipeEnd }
+        if (ends + 2 > DEFAULT_HANDLE_LIMIT) fsError(Errno.MFILE, "パイプの端が上限（$DEFAULT_HANDLE_LIMIT）")
         val ids = Pipes.create(ctx.kernel.objects, Pipes.DEFAULT_CAPACITY)
         val read = table.add(StreamEntry(HandleEntry(ids.read, rights = HandleRights.READ), input = true))
         val write = table.add(StreamEntry(HandleEntry(ids.write, rights = HandleRights.WRITE), input = false))

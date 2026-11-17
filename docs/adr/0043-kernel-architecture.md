@@ -82,7 +82,7 @@ ADR 0027 は「実行中のコンピューター1台に1スレッド」だった
 - `WaitSet` の登録は、待ちが終わると決まるまで外さない。**起こされたのに、そろった key が空なら待ち直す**（印を下ろす）。カーネルは `resume` にも `block` の戻り値にも空の並びを渡さない。待機点型は `resume` を呼ばず、許可も燃料も使わずに `WAITING_EVENT` に戻る
 - 閉じられたオブジェクト（参照カウント 0）・見つからないオブジェクトの key は「そろった」扱い。待ちは参照カウントを持たない
 - 復元のときは `WaitRegistry` を空から作り、`Process.wait` から `WaitSet` を作り直す
-- Component Model: p2 の `pollable` はハンドルのエントリに `WaitKey` を1つ持たせ、p3 の waitable-set は `WaitKey` の並びを持つ `KernelObject` にする（#685・#266）
+- Component Model: p2 の `pollable` はハンドルのエントリに `WaitKey` を持たせず、親（stream か `kibi:*` の resource）が指すオブジェクトの `WaitKey` を `poll` のたびに引いて待つ（#685 で、最初の「エントリに `WaitKey` を1つ持たせる」から変えた。ADR 0685）。p3 の waitable-set は `WaitKey` の並びを持つ `KernelObject` にする（#266）
 
 ## 一時停止と停止
 

@@ -26,13 +26,13 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:kernel` | `types` | 共通の型（`error-code`） | #73 |
 | `kibi:kernel` | `events` | イベントキュー（resource `event-queue`） | #73 |
 | `kibi:kernel` | `timers` | タイマー（イベントのキューにイベントを届ける、カーネルのイベントのしくみの一部。ADR 0426） | #426 |
-| `kibi:kernel` | `timers-poll`・`events-poll`・`timers-async`・`events-async` | p2・p3 でタイマー・イベントキューを待つ（p2 の `*-poll` は #685 で確定、p3 の `*-async` は仮置き。ADR 0426・0685） | #426 |
+| `kibi:kernel` | `timers-poll`・`events-poll`・`timers-async`・`events-async` | p2・p3 でタイマー・イベントキューを待つ（p2 の `*-poll` は #685 で実装（ABI は確認待ち）、p3 の `*-async` は仮置き。ADR 0426・0685） | #426 |
 | `kibi:process` | `process` | プロセスの生成・待機・強制終了、カーネルの cwd、プロセスの一覧（p1・p2・p3 で共通。ADR 0074・0332・0452） | #74・#452 |
-| `kibi:process` | `process-poll`・`process-async` | p2・p3 で子を待つ・ハンドルを渡して子を作る（p2 の `process-poll` は #685 で確定、p3 の `process-async` は仮置き。ADR 0074・0685） | #74 |
+| `kibi:process` | `process-poll`・`process-async` | p2・p3 で子を待つ・ハンドルを渡して子を作る（p2 の `process-poll` は #685 で実装（ABI は確認待ち）、p3 の `process-async` は仮置き。ADR 0074・0685） | #74 |
 | `kibi:io` | `fd`・`pipe` | fd の複製とパイプ（p1 だけ。ADR 0075） | #75 |
-| `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（p2 の `pipe-streams` は #685 で確定、p3 の `pipe-async` は仮置き。ADR 0075・0685） | #75 |
+| `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（p2 の `pipe-streams` は #685 で実装（ABI は確認待ち）、p3 の `pipe-async` は仮置き。ADR 0075・0685） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
-| `kibi:device` | `types`・`bus`・`bus-poll`（p2）・`bus-async`（p3） | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。p1 に `bus` を出した。ADR 0077。p2 の `bus-poll` は #685 で確定、p3 の `bus-async` は仮置き。ADR 0685） | #65・#77 |
+| `kibi:device` | `types`・`bus`・`bus-poll`（p2）・`bus-async`（p3） | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。p1 に `bus` を出した。ADR 0077。p2 の `bus-poll` は #685 で実装（ABI は確認待ち）、p3 の `bus-async` は仮置き。ADR 0685） | #65・#77 |
 | `kibi:computer` | `memory` | 残りの RAM（#408） | #73 で移した |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | `power` | 電源（停止・再起動。ADR 0306） | #306 |
@@ -173,7 +173,7 @@ interface events {
 ## 決めないこと
 
 - タイマー・sleep・uptime・ゲーム内時間の関数の形と、`timer` のイベントの値の写し方: #426（この ADR の規則で WIT から導く）
-  - 追記（#426）: ADR 0426 で決めた。`events` の p2・p3 での待ち方（`events-poll`・`events-async`。`events-poll` は #685 で確定、`events-async` は仮置き）も ADR 0426
+  - 追記（#426）: ADR 0426 で決めた。`events` の p2・p3 での待ち方（`events-poll`・`events-async`。`events-poll` は #685 で実装（ABI は確認待ち）、`events-async` は仮置き）も ADR 0426
 - TTY のモード・大きさ・前のプロセスの見せ方、画面の大きさの変更のイベント: #427
   - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77（ADR 0077）・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）

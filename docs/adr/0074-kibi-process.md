@@ -15,14 +15,14 @@
 - 子への fd は `fds: list<fd-assign>`。fd 0/1/2 は書かなければ引き継ぎ、fd 3 以降（preopen を含む）は書いたものだけ（Q4-A。ADR 0045）
 - interface は1つ（生成・待機・シグナル・pid・cwd。Q5-A）。pid で操作するのは `kill-pid`・`self-pid`・`parent-pid`・`set-signal-ignored` だけで、プロセスの一覧は出さない（Q6-A）。一覧は後に #452（ADR 0452）で `list-processes` として同じ interface に足した
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。新しく持つ状態は、親の fd 表の項目が既存の `ProcessObject`（ADR 0046）を指すことだけ
-- **p3 は WIT とこの ADR だけで、実装しない。仮置き**: p3 での形（interface・関数・型・依存する `wasi:*` の版）は、p3 の層（#266・#268）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。p2 の `process-poll` は #685 で確定し、実装した（`wasi:*` は `@0.2.12`。ADR 0685）。p1 の ABI は対象外
+- **p3 は WIT とこの ADR だけで、実装しない。仮置き**: p3 での形（interface・関数・型・依存する `wasi:*` の版）は、p3 の層（#266・#268）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。p2 の `process-poll` は #685 で実装した（ABI はオーナーの確認待ち。PR #778）（`wasi:*` は `@0.2.12`。ADR 0685）。p1 の ABI は対象外
 
 ## WIT
 
 `core/src/main/wit/kibi-process/`:
 
 - `process.wit`: `enum signal { interrupt, quit, terminate, kill }`、`variant exit-status`、`variant fd-source { parent(u32), closed }`、`record fd-assign { fd, source }`、`record spawn-options { args, env: option<list<tuple<string, string>>>, cwd: option<string>, fds }`、`resource process { spawn: static func, pid, status, kill }`、`kill-pid`・`self-pid`・`parent-pid`・`set-signal-ignored`・`get-cwd`・`set-cwd`。`wasi:*` を参照しない
-- `process-poll.wit`（p2。#685 で確定）: `subscribe(borrow<process>) -> pollable`（刈り取らない）、`spawn-with-handles`（`handle-source` で stream・descriptor・process を渡す）。`wasi:io@0.2.12`・`wasi:filesystem@0.2.12`
+- `process-poll.wit`（p2。#685 で実装（ABI は確認待ち））: `subscribe(borrow<process>) -> pollable`（刈り取らない）、`spawn-with-handles`（`handle-source` で stream・descriptor・process を渡す）。`wasi:io@0.2.12`・`wasi:filesystem@0.2.12`
 - `process-async.wit`（p3、仮置き）: `spawn: async func`（`handle-source` に `stream<u8>`・`capture`）、`wait: async func(borrow<process>) -> exit-status`（親なら刈り取る）。`wasi:filesystem@0.3.0`
 - `world.wit`: `imports`（`process` だけ。`wasi:*` をたどらない）、`imports-p2`（＋`process-poll`）、`imports-p3`（＋`process-async`）
 
@@ -117,7 +117,7 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 
 - 呼び出しごとに `WasiP1Fd.CALL_FUEL`（仮の値。確定は #251）。読み込みの間は燃料を使わない
 
-## p2/p3 への写し方（p2 は #685 で確定、p3 は仮置き）
+## p2/p3 への写し方（p2 は #685 で実装（ABI は確認待ち）、p3 は仮置き）
 
 | `process` の項目 | p1 | p2 | p3 |
 | --- | --- | --- | --- |

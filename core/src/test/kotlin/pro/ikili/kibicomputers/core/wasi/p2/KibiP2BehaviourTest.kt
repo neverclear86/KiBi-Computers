@@ -17,9 +17,12 @@ import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
+import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
 import pro.ikili.kibicomputers.core.kernel.process.HostResourceTable
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -28,6 +31,7 @@ import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.rt
 import pro.ikili.kibicomputers.core.kernel.stateOf
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -569,6 +573,177 @@ class KibiP2BehaviourTest {
             failure.get()?.let { throw it }
             assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
             m.stop()
+        }
+    }
+
+    @Test
+    fun `pipe-streamsで持てるパイプの端はfdの上限と同じ数までで、超えたらmfile`() = timeout(limit) {
+        Harness().use { h ->
+            val m = machine(h)
+            scenario(h, m) { ctx ->
+                val base = hostSize(ctx)
+                val ends = ArrayList<CanonValue>()
+                var failure: String? = null
+                for (i in 0..DEFAULT_HANDLE_LIMIT) {
+                    val r = ctx.call("kibi:io/pipe-streams", "create") as CanonValue.Case
+                    if (r.index != 0) {
+                        failure = errName(r)
+                        break
+                    }
+                    val (input, output) = (r.payload as CanonValue.Fields).fields
+                    // 書いてから書く端を drop しても、読む端は数える（中身を持ったまま残るので）
+                    ok(ctx.call("wasi:io/streams", "[method]output-stream.blocking-write-and-flush", output, CanonValue.Bytes("x".toByteArray())))
+                    ctx.drop(output)
+                    ends += input
+                    // 読む端だけなら 1 本につき 1 つ。上限まで作れる
+                }
+                assertEquals(name(Errno.MFILE), failure)
+                // 読む端は上限 - 1 個（次の create には 2 つ分の空きが要る）
+                assertEquals(DEFAULT_HANDLE_LIMIT - 1, ends.size)
+                // 表（4096）にはまだ空きがある
+                assertTrue(HostResourceTable.LIMIT - hostSize(ctx) >= 2)
+                ctx.drop(ends.removeAt(0))
+                ctx.drop(ends.removeAt(0))
+                val pair = ok(ctx.call("kibi:io/pipe-streams", "create")) as CanonValue.Fields
+                ends += pair.fields
+                for (e in ends) ctx.drop(e)
+                assertEquals(base, hostSize(ctx))
+            }
+        }
+    }
+
+    @Test
+    fun `spawn-with-handlesでdescriptorとprocessを渡すと子のfdに権利つきで入り、process-killで子を止められる`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
+            write(m, "/bin/prompt", P2Testing.wrap("prompt-wasi"))
+            scenario(h, m) { ctx ->
+                val base = hostSize(ctx)
+                fun pidOf(p: CanonValue) = (ctx.call("kibi:process/process", "[method]process.pid", p) as CanonValue.I32).value
+                fun exists(pid: Int) = ctx.withKernelLock { ctx.kernel.processes[pid] != null }
+
+                val done = ok(ctx.call("kibi:process/process", "[static]process.spawn", CanonValue.str("/bin/ok"), spawnOptions()))!!
+                val donePid = pidOf(done)
+                ctx.waitChild(done)
+                val doneObj = childObject(ctx, done)
+
+                val dirs = (ctx.call("wasi:filesystem/preopens", "get-directories") as CanonValue.Items).items
+                val root = (dirs[0] as CanonValue.Fields).fields[0]
+                fun openAt(path: String, openFlags: Int, flags: Int) = ok(
+                    ctx.call(
+                        "wasi:filesystem/types", "[method]descriptor.open-at", root,
+                        CanonValue.Flags(0), CanonValue.str(path), CanonValue.Flags(openFlags), CanonValue.Flags(flags),
+                    ),
+                )!!
+                fun entryOf(v: CanonValue) = ctx.withKernelLock { P2.tableLocked(ctx)[(v as CanonValue.Handle).value] as DescriptorEntry }
+                // flags の read → READ、read・write → READ|WRITE、どちらもない（mutate-directory だけ）→ 開いたときの権利
+                val readOnly = openAt("bin/ok", 0, 1)
+                val readWrite = openAt("bin/ok", 0, 3)
+                val mutateOnly = openAt("bin", 2, 32)
+                val mutateHandle = entryOf(mutateOnly).handle
+
+                val pipe = ok(ctx.call("kibi:io/pipe-streams", "create")) as CanonValue.Fields
+                val (input, output) = pipe.fields
+                val c = ok(
+                    ctx.call(
+                        "kibi:process/process-poll", "spawn-with-handles", CanonValue.str("/bin/prompt"), spawnOptions(),
+                        CanonValue.Items(
+                            listOf(
+                                handleAssign(0, 0, input),
+                                handleAssign(4, 2, readOnly),
+                                handleAssign(5, 2, readWrite),
+                                handleAssign(6, 2, mutateOnly),
+                                handleAssign(7, 3, done),
+                            ),
+                        ),
+                    ),
+                )!!
+                val cPid = pidOf(c)
+                // 子は標準入力（パイプ。書く端はこちらが持つ）を待っているので、まだ生きている
+                ctx.withKernelLock {
+                    val child = checkNotNull(ctx.kernel.processes[cPid])
+                    fun at(fd: Int) = checkNotNull(child.handles[fd]) { "子の fd $fd がない" }
+                    assertEquals(entryOf(readOnly).handle.objectId, at(4).objectId)
+                    assertEquals(HandleRights.READ, at(4).rights)
+                    assertEquals(HandleRights.READ or HandleRights.WRITE, at(5).rights)
+                    assertEquals(mutateHandle.objectId, at(6).objectId)
+                    assertEquals(mutateHandle.rights, at(6).rights)
+                    assertEquals(doneObj, at(7).objectId)
+                    assertTrue(ctx.kernel.objects[at(7).objectId] is ProcessObject)
+                }
+                // 刈り取りは親のハンドルだけで決まる（p1 と同じ。ADR 0074）: 子に渡していても、親の最後のハンドルを drop したら刈り取る
+                ctx.drop(done)
+                assertFalse(exists(donePid), "親の最後のハンドルを drop しても刈り取らない")
+
+                // enum の signal: kill（3）で止める
+                ok(ctx.call("kibi:process/process", "[method]process.kill", c, CanonValue.Case(3, null)))
+                ctx.waitChild(c)
+                val status = ok(ctx.call("kibi:process/process", "[method]process.status", c)) as CanonValue.Case
+                assertEquals(1, status.index)
+                val exit = status.payload as CanonValue.Case
+                assertEquals(1, exit.index, "シグナルで終わる: $exit")
+                assertEquals(CanonValue.some(CanonValue.Case(3, null)), exit.payload)
+
+                for (v in listOf(c, input, output, readOnly, readWrite, mutateOnly, root)) ctx.drop(v)
+                assertEquals(base, hostSize(ctx))
+            }
+        }
+    }
+
+    @Test
+    fun `タイマーのset-at・cancel、TTYのモード・大きさ・前面、unmount・list-disks`() = timeout(limit) {
+        Harness().use { h ->
+            val m = machine(h)
+            m.vfs.createDirectory(VfsPath.parse("/mnt"))
+            m.vfs.mount(VfsPath.parse("/mnt"), TestMemoryFileSystem(), readOnly = false, source = "test:mnt")
+            val tty = m.lock.withLockValue { m.kernel.objects.add(Tty(64, 64)) }
+            scenario(h, m, stdout = tty) { ctx ->
+                val base = hostSize(ctx)
+                // set-at: 過ぎた時刻なら、すぐ鳴る
+                val t = ok(ctx.call("kibi:kernel/timers", "[static]timer.create", CanonValue.NONE))!!
+                val tp = ctx.call("kibi:kernel/timers-poll", "subscribe", t)!!
+                ok(ctx.call("kibi:kernel/timers", "[method]timer.set-at", t, CanonValue.I64(0), CanonValue.I64(0)))
+                ctx.await(tp)
+                assertTrue((ok(ctx.call("kibi:kernel/timers", "[method]timer.read", t)) as CanonValue.I64).value >= 1)
+                // cancel: 止めたタイマーは鳴らない
+                val u = ok(ctx.call("kibi:kernel/timers", "[static]timer.create", CanonValue.NONE))!!
+                ok(ctx.call("kibi:kernel/timers", "[method]timer.set-after", u, CanonValue.I64(1_000_000_000_000_000), CanonValue.I64(0)))
+                ok(ctx.call("kibi:kernel/timers", "[method]timer.cancel", u))
+                val up = ctx.call("kibi:kernel/timers-poll", "subscribe", u)!!
+                assertEquals(CanonValue.Bool(false), ctx.call("wasi:io/poll", "[method]pollable.ready", up))
+                assertEquals(CanonValue.I64(0), ok(ctx.call("kibi:kernel/timers", "[method]timer.read", u)))
+                for (v in listOf(tp, up, t, u)) ctx.drop(v)
+
+                // TTY（fd 1）
+                assertEquals(CanonValue.Bool(true), ctx.call("kibi:io/tty", "is-tty", CanonValue.I32(1)))
+                val mode = ok(ctx.call("kibi:io/tty", "get-mode", CanonValue.I32(1))) as CanonValue.Flags
+                ok(ctx.call("kibi:io/tty", "set-mode", CanonValue.I32(1), CanonValue.Flags(0)))
+                assertEquals(CanonValue.Flags(0), ok(ctx.call("kibi:io/tty", "get-mode", CanonValue.I32(1))))
+                ok(ctx.call("kibi:io/tty", "set-mode", CanonValue.I32(1), mode))
+                assertEquals(mode, ok(ctx.call("kibi:io/tty", "get-mode", CanonValue.I32(1))))
+                assertEquals(3, (ok(ctx.call("kibi:io/tty", "get-size", CanonValue.I32(1))) as CanonValue.Fields).fields.size)
+                ok(ctx.call("kibi:io/tty", "set-foreground", CanonValue.I32(1), CanonValue.I32(ctx.pid)))
+                assertEquals(CanonValue.I32(ctx.pid), ok(ctx.call("kibi:io/tty", "get-foreground", CanonValue.I32(1))))
+                // TTY でない fd は no-tty、開いていない fd も no-tty（p1 と同じ）
+                assertEquals(1, (ctx.call("kibi:io/tty", "get-mode", CanonValue.I32(3)) as CanonValue.Case).index)
+                // 0..2 でない fd でも、TTY なら受ける
+                val fd = 5
+                ctx.withKernelLock { FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink).installAt(fd, HandleEntry(tty)) }
+                assertEquals(CanonValue.Bool(true), ctx.call("kibi:io/tty", "is-tty", CanonValue.I32(fd)))
+                assertEquals(CanonValue.I32(ctx.pid), ok(ctx.call("kibi:io/tty", "get-foreground", CanonValue.I32(fd))))
+                ctx.withKernelLock { FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink).close(fd) }
+
+                // マウント
+                fun points() = (ctx.call("kibi:fs/mounts", "list-mounts") as CanonValue.Items).items.map { (it as CanonValue.Fields).fields[0] }
+                assertTrue(CanonValue.str("/mnt") in points())
+                ok(ctx.call("kibi:fs/mounts", "unmount", CanonValue.str("/mnt")))
+                assertFalse(CanonValue.str("/mnt") in points())
+                assertEquals(1, (ctx.call("kibi:fs/mounts", "unmount", CanonValue.str("/mnt")) as CanonValue.Case).index)
+                assertEquals(name(Errno.NAMETOOLONG), errName(ctx.call("kibi:fs/mounts", "unmount", CanonValue.str("a".repeat(4097)))))
+                assertEquals(0, (ctx.call("kibi:fs/mounts", "list-disks") as CanonValue.Items).items.size)
+                assertEquals(base, hostSize(ctx))
+            }
         }
     }
 

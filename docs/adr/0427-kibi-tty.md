@@ -94,7 +94,7 @@ event { kind: "tty-resize", source: "console", values: [ integer(columns), integ
 - `source` は TTY の名前（fd 番号は子で変わるので使わない）。名前は `TtyLimits.RESIZE_EVENT_TYPE`・`TtyLimits.CONSOLE_SOURCE`
 - キューがなければ捨てる（ADR 0063 の同報）。同じ大きさを渡しても入れない
 
-## p2/p3 への写し方（p2 は #685 で確定、p3 は仮置き）
+## p2/p3 への写し方（p2 は #685 で実装（ABI は確認待ち）、p3 は仮置き）
 
 | | p1 | p2 | p3 |
 | --- | --- | --- | --- |
