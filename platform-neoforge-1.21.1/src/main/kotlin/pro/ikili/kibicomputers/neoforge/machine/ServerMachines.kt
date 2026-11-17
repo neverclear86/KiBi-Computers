@@ -1015,7 +1015,7 @@ object ServerMachines {
     private fun onServerStopping(event: ServerStoppingEvent) {
         // 読み込んだ直後の tick に止まると、claim で予約した印（markChangedLater）が tick の始めに流れないまま saveAllChunks に進む。
         // 電源の切れた台・復元の途中の台は saveForStop が取り出さないので、ここで付けないと NBT が claim の前の値のまま残る（#762）。
-        // ChunkUnloadDrain.drainAll より前に流す（流したアンロードの untrack が予約を捨てるため）
+        // 位置の条件は saveAllChunks より前（ServerStoppingEvent の中）だけ。drainAll が流すアンロード（saveForUnload）も、流れていない予約を見てチャンクに印を付けてから外す
         flushChangedLater()
         if (manager != null) saveForStop(tracked.toList(), keepQuiesced = true)
         // 取り出した後に流す（流した分のアンロードは、取り出し済みの台の印を見るだけ）。止める手順が回り続けないように（#540）
