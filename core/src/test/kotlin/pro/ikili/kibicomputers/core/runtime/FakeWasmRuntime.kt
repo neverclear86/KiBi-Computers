@@ -243,7 +243,8 @@ internal class FakeInstance(override val module: FakeModule, private val config:
 /**
  * 書き換えた 4 KiB の区画を数える（#407。Endive の `WrittenPagesMemory` と同じ規則のダミー）。
  * 書き込みで数えられなければ [WasmTrapKind.OUT_OF_MEMORY] のトラップ。grow は増やした所の最初と最後の区画を数え、
- * 数えられなければ -1 にして [onGrowRefused] を呼ぶ
+ * 数えられなければ -1 にして [onGrowRefused] を呼ぶ。区画の表（#753。1 ページ 128 バイト）は数えない
+ * （カーネルの試験が、区画の数だけで境界を決められるように。表を数える規則は `WrittenPagesMemoryTest` と Endive で動かす試験で確かめる）
  */
 internal class FakeWrittenCount(val budget: WasmTableBudget?, val onGrowRefused: Runnable?) {
     val written = java.util.BitSet()

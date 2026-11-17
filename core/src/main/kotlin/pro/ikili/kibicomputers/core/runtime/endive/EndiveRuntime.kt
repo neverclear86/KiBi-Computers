@@ -407,8 +407,13 @@ private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, creat
     if (config.writtenMemory) {
         // #407: ページ数は数えず、初めて書き込んだ 4 KiB の区画を数える。共有メモリは書き込みを数えられないので作らない
         if (limits.shared()) throw MemoryLimitFailure("共有メモリは使えない")
-        return WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
-            .also { created += WrittenRelease(it) }
+        // 区画の表の最初の分は作るときに数える（#753）。断られたら作らない（何も数えていない）
+        val memory = try {
+            WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
+        } catch (e: PageTableRefused) {
+            throw MemoryLimitFailure(e.message!!)
+        }
+        return memory.also { created += WrittenRelease(it) }
     }
     val budget = config.memoryBudget
     if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))

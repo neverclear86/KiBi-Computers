@@ -10,6 +10,7 @@ import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
@@ -24,6 +25,9 @@ import kotlin.random.Random
 class WrittenPagesMemoryTest {
     private val page = WasmMemory.PAGE_SIZE
     private val chunk = WrittenPagesMemory.CHUNK_SIZE
+
+    /** 1 ページの区画の表（#753） */
+    private val table = WrittenPagesMemory.TABLE_BYTES_PER_PAGE
 
     /** 上限 [limitBytes] のバイト数の勘定 */
     private class Budget(val limitBytes: Long) : WasmTableBudget {
@@ -60,7 +64,7 @@ class WrittenPagesMemoryTest {
         m.writeLong(3 * chunk - 4, -1L)
         assertEquals(3, m.writtenChunks)
         assertEquals(-1L, m.readLong(3 * chunk - 4))
-        assertEquals(3L * chunk, budget.used)
+        assertEquals(3L * chunk + 2 * table, budget.used)
     }
 
     @Test
@@ -82,7 +86,7 @@ class WrittenPagesMemoryTest {
 
     @Test
     fun `上限を超える書き込みはRamExhaustedになり、数は上限を超えない`() {
-        val budget = Budget(2L * chunk)
+        val budget = Budget(2L * chunk + table)
         val m = WrittenPagesMemory(MemoryLimits(1, 1), budget)
         m.writeByte(0, 1)
         m.writeByte(chunk, 1)
@@ -90,7 +94,7 @@ class WrittenPagesMemoryTest {
         assertTrue("out of memory" in e.message!!, e.message)
         assertThrows<RamExhausted> { m.fill(3, 3 * chunk, 3 * chunk + 1) }
         assertEquals(2, m.writtenChunks)
-        assertEquals(2L * chunk, budget.used)
+        assertEquals(2L * chunk + table, budget.used)
         // 数えたページへの書き込みはできる
         m.writeLong(chunk + 8, 5)
         assertEquals(5L, m.readLong(chunk + 8))
@@ -110,7 +114,7 @@ class WrittenPagesMemoryTest {
             // ROM の区画（0 番）とゼロの区画（1 番）
             assertTrue(memory.commit(0, 2 * chunk, 0))
             assertEquals(2, writtenChunks(memory))
-            assertEquals(2L * chunk, budget.used)
+            assertEquals(2L * chunk + table, budget.used)
             assertEquals("hello", String(memory.read(16, 5)))
             // 数えた区画は数え直さず、書いても数えない
             assertTrue(memory.commit(0, 2 * chunk, Long.MAX_VALUE))
@@ -134,13 +138,13 @@ class WrittenPagesMemoryTest {
 
     @Test
     fun `commitRangeは残りがkeep未満になるなら何も数えず、区画は後の書き込みで普通に数える`() {
-        val budget = Budget(4L * chunk)
+        val budget = Budget(4L * chunk + table)
         val m = WrittenPagesMemory(MemoryLimits(1, 1), budget)
         m.writeByte(0, 1)
         // 残りは 3 区画。2 区画を数えると残り 1 区画
         assertFalse(m.commitRange(chunk, 2 * chunk, 2L * chunk))
         assertEquals(1, m.writtenChunks)
-        assertEquals(chunk.toLong(), budget.used)
+        assertEquals(chunk + table, budget.used)
         // 2^63 以上の keep（負の値）は、どの上限より大きい
         assertFalse(m.commitRange(chunk, 1, -1L))
         // 新しく数える区画がなければ keep を見ない
@@ -152,7 +156,7 @@ class WrittenPagesMemoryTest {
         assertEquals(4, m.writtenChunks)
         // 上限ちょうどまで数えた区画への書き込みはトラップしない
         m.fill(7, 0, 4 * chunk)
-        assertEquals(4L * chunk, budget.used)
+        assertEquals(4L * chunk + table, budget.used)
         assertFalse(m.commitRange(4 * chunk, 1, 0))
         assertThrows<RamExhausted> { m.writeByte(4 * chunk, 1) }
     }
@@ -178,7 +182,7 @@ class WrittenPagesMemoryTest {
         // 「解放」してゼロに戻しても、数は最高値のまま
         m.fill(0, 0, page)
         assertEquals(4, m.writtenChunks)
-        assertEquals(4L * chunk, budget.used)
+        assertEquals(4L * chunk + table, budget.used)
         m.releaseAll()
         m.releaseAll()
         assertEquals(0L, budget.used)
@@ -199,8 +203,8 @@ class WrittenPagesMemoryTest {
         assertEquals(1, m.grow(2))
         assertEquals(3, m.pages())
         assertEquals(-1, m.grow(1))
-        // 増やした所の最初と最後の 4 KiB（アロケーターが管理の情報を書く所）だけを先に数える
-        assertEquals(2L * chunk, budget.used)
+        // 増やした所の最初と最後の 4 KiB（アロケーターが管理の情報を書く所）だけを先に数える（区画の表は 3 ページ分。#753）
+        assertEquals(2L * chunk + 3 * table, budget.used)
         m.writeByte(3 * page - 1, 5)
         m.writeByte(page, 5)
         assertEquals(5.toByte(), m.read(3 * page - 1))
@@ -212,12 +216,12 @@ class WrittenPagesMemoryTest {
 
     @Test
     fun `両端の4KiBを数えられなければgrowは失敗し、断ったことを知らせる`() {
-        val budget = Budget(chunk.toLong())
+        val budget = Budget(chunk + table)
         var refused = 0
         val m = WrittenPagesMemory(MemoryLimits(1, 4), budget) { refused++ }
         assertEquals(-1, m.grow(1))
         assertEquals(1, m.pages())
-        assertEquals(0L, budget.used)
+        assertEquals(table, budget.used)
         assertEquals(1, refused)
         // アドレス空間の上限で断ったときは、RAM のせいではないので知らせない
         val wide = WrittenPagesMemory(MemoryLimits(1, 2), Budget(Long.MAX_VALUE)) { refused++ }
@@ -242,7 +246,7 @@ class WrittenPagesMemoryTest {
             memory.writeU8(200, 2)
             assertEquals(1, writtenChunks(memory))
             assertEquals("hello", String(memory.read(16, 5)))
-            assertEquals(chunk.toLong(), budget.used)
+            assertEquals(chunk + table, budget.used)
         }
         assertEquals(0L, budget.used)
     }
@@ -352,7 +356,7 @@ class WrittenPagesMemoryTest {
         val module = EndiveRuntime().load(TestModules.MEMORY)
         val config = WasmInstanceConfig.builder()
             .hostFunction("env", "print", module.imports.single().functionType!!) { _, _ -> LongArray(0) }
-            .writtenMemoryLimit(4, Budget(chunk.toLong()))
+            .writtenMemoryLimit(4, Budget(chunk + table))
             .build()
         module.instantiate(config).use { instance ->
             val memory = instance.memory!!
@@ -384,5 +388,105 @@ class WrittenPagesMemoryTest {
             val e = assertThrows<WasmTrapException> { instance.call("_start") }
             assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind)
         }
+    }
+
+    // ---- 区画の表（#753） ----
+
+    @Test
+    fun `作るときに最初のページ数の区画の表を数え、閉じると返す`() {
+        assertEquals(128L, table, "区画 16 個 × 参照 8 バイト（仮の値。確定は #251）")
+        val budget = Budget(Long.MAX_VALUE)
+        val m = WrittenPagesMemory(MemoryLimits(3, 8), budget)
+        assertEquals(3 * table, budget.used)
+        assertEquals(3 * table, m.tableBytes)
+        // 区画の数には混ぜない
+        assertEquals(0, m.writtenChunks)
+        assertEquals(0L, m.countedBytes)
+        m.writeByte(0, 1)
+        assertEquals(chunk + 3 * table, budget.used)
+        m.releaseAll()
+        m.releaseAll()
+        assertEquals(0L, budget.used)
+        // 最初のページが 0 なら表も 0（数えない）
+        val empty = Budget(0)
+        WrittenPagesMemory(MemoryLimits(0, 1), empty).releaseAll()
+        assertEquals(0L, empty.used)
+    }
+
+    @Test
+    fun `最初の区画の表を数えられなければ、何も数えずにPageTableRefused`() {
+        val budget = Budget(2 * table - 1)
+        val e = assertThrows<PageTableRefused> { WrittenPagesMemory(MemoryLimits(2, 4), budget) }
+        assertTrue("2 ページ" in e.message!!, e.message)
+        assertEquals(0L, budget.used)
+        // budget がなければ数えない
+        assertEquals(0L, WrittenPagesMemory(MemoryLimits(2, 4), null).tableBytes)
+    }
+
+    @Test
+    fun `growは端の区画と表を1回で数え、表の分だけ足りなくても増やさずに知らせる`() {
+        // 端の区画（2 つ）は入るが、増やす 2 ページの表の分が 1 バイト足りない
+        val budget = Budget(table + 2L * chunk + 2 * table - 1)
+        var refused = 0
+        val m = WrittenPagesMemory(MemoryLimits(1, 4), budget) { refused++ }
+        assertEquals(-1, m.grow(2))
+        assertEquals(1, refused)
+        assertEquals(1, m.pages())
+        assertEquals(table, budget.used, "片方だけ数えた状態を残さない")
+        assertEquals(0, m.writtenChunks)
+        // 1 ページなら入る（端の区画 2 つと表 1 ページ）
+        assertEquals(1, m.grow(1))
+        assertEquals(2 * table + 2L * chunk, budget.used)
+        assertEquals(2 * table, m.tableBytes)
+        m.releaseAll()
+        assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `閉じた後のgrowとrestorePagesは表を数えない`() {
+        val budget = Budget(Long.MAX_VALUE)
+        val m = WrittenPagesMemory(MemoryLimits(1, 4), budget)
+        m.releaseAll()
+        assertEquals(1, m.grow(1))
+        assertTrue(m.restorePages(3))
+        assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `restorePagesは増やしたページの表だけを数え、生きている間の勘定と戻した後の勘定が合う`() {
+        val live = Budget(Long.MAX_VALUE)
+        val m = WrittenPagesMemory(MemoryLimits(1, 8), live)
+        assertEquals(1, m.grow(3))
+        m.writeByte(2 * page, 1)
+        val (indices, data) = m.writtenChunkSnapshot()
+
+        val restoredBudget = Budget(Long.MAX_VALUE)
+        val r = WrittenPagesMemory(MemoryLimits(1, 8), restoredBudget)
+        assertTrue(r.restorePages(m.pages()))
+        assertEquals(4 * table, restoredBudget.used, "端の区画は数えず、表だけを数える")
+        for ((i, index) in indices.withIndex()) assertTrue(r.restoreChunk(index, data[i]))
+        assertEquals(live.used, restoredBudget.used)
+        assertEquals(m.tableBytes, r.tableBytes)
+        assertEquals(m.writtenChunks, r.writtenChunks)
+
+        // 表の分を断られたら false（何も数えない・大きさも変えない）
+        val tight = Budget(table + 2 * table - 1)
+        val t = WrittenPagesMemory(MemoryLimits(1, 8), tight)
+        assertFalse(t.restorePages(3))
+        assertEquals(1, t.pages())
+        assertEquals(table, tight.used)
+    }
+
+    @Test
+    fun `インスタンスを作るときに区画の表を数えられなければWasmLinkExceptionになり、何も残らない`() {
+        val module = EndiveRuntime().load(TestModules.MEMORY)
+        val budget = Budget(table - 1)
+        val config = WasmInstanceConfig.builder()
+            .hostFunction("env", "print", module.imports.single().functionType!!) { _, _ -> LongArray(0) }
+            .writtenMemoryLimit(4, budget)
+            .build()
+        val e = assertThrows<WasmLinkException> { module.instantiate(config) }
+        assertTrue("区画の表" in e.message!!, e.message)
+        assertEquals(0L, budget.used)
     }
 }

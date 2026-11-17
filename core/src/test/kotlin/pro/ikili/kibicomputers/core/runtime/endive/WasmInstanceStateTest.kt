@@ -80,6 +80,7 @@ class WasmInstanceStateTest {
         val rt = EndiveRuntime()
         val module = rt.load(module())
         val budget = Budget()
+        var liveUsed = -1L
         val state = module.instantiate(config(budget)).use { inst ->
             // 何もしていなければ ROM の区画は書いた区画に入らない
             val fresh = inst.captureState()
@@ -91,6 +92,7 @@ class WasmInstanceStateTest {
             inst.call("store", (WasmMemory.PAGE_SIZE + 8).toLong(), 77)
             inst.call("store", 4096L * 3 + 16, 5)
             inst.call("dropP")
+            liveUsed = budget.used
             inst.captureState()
         }
         assertEquals(2, state.memoryPages)
@@ -127,8 +129,13 @@ class WasmInstanceStateTest {
             assertEquals(20, inst.i64("callAt", 1))
             // drop したパッシブなセグメントは使えない（長さ 0 なので範囲外のトラップ）
             assertThrows<WasmTrapException> { inst.call("initP") }
-            // 数えた区画の数は、書いた区画の数と同じ
-            assertEquals(state.writtenChunkCount.toLong() * WasmInstanceState.CHUNK_BYTES, budget2.used)
+            // 数えた区画の数は、書いた区画の数と同じ。区画の表（#753）はページ数の分を数える
+            assertEquals(
+                state.writtenChunkCount.toLong() * WasmInstanceState.CHUNK_BYTES + WrittenPagesMemory.tableBytesOf(2),
+                budget2.used,
+            )
+            // 生きている間の勘定と、戻した後の勘定は同じ
+            assertEquals(liveUsed, budget2.used)
         }
     }
 
