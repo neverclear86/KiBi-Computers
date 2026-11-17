@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.fd.HandlePlacement
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -25,10 +26,10 @@ internal object KibiEvents {
     /**
      * キューを開いて、そのハンドル（= fd）を返す。[kinds] が空ならすべての種類。[capacity] は `u32` を符号なしで広げた値（`null` なら既定）。
      * 確かめる順は kinds の数 → 各要素のバイト数 → capacity。外れれば `INVAL`。マシンのキューの数が上限なら `NFILE`、
-     * ハンドル表が満杯なら `MFILE`
+     * ハンドル表が満杯なら `MFILE`。[place] を渡したら、fd 表ではなくそこに置いて番号を返す（p2。#685）
      */
     @Throws(FsException::class)
-    fun open(ctx: ProcessContext, kinds: List<String>, capacity: Long?): Int {
+    fun open(ctx: ProcessContext, kinds: List<String>, capacity: Long?, place: HandlePlacement? = null): Int {
         if (kinds.size > EventLimits.MAX_FILTER_TYPES) fsError(Errno.INVAL, "kinds は ${EventLimits.MAX_FILTER_TYPES} 個まで（${kinds.size}）")
         for (k in kinds) {
             val n = k.toByteArray(Charsets.UTF_8).size
@@ -37,7 +38,8 @@ internal object KibiEvents {
         val cap = capacity ?: EventLimits.DEFAULT_CAPACITY.toLong()
         if (cap !in 1L..EventLimits.MAX_CAPACITY.toLong()) fsError(Errno.INVAL, "capacity は 1..${EventLimits.MAX_CAPACITY}（$cap）")
         return try {
-            ctx.openEventQueue(EventFilter(kinds.toSet()), cap.toInt())
+            val filter = EventFilter(kinds.toSet())
+            if (place == null) ctx.openEventQueue(filter, cap.toInt()) else ctx.openEventQueue(filter, cap.toInt(), place)
         } catch (e: ResourceLimitException) {
             fsError(Errno.NFILE, e.message)
         }

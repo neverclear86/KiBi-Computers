@@ -27,7 +27,11 @@ import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.time.Timer
 import pro.ikili.kibicomputers.core.kernel.time.TimerLimits
 import pro.ikili.kibicomputers.core.kernel.time.saturatingAdd
+import pro.ikili.kibicomputers.core.kernel.fd.FdPlacement
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.fd.HandlePlacement
+import pro.ikili.kibicomputers.core.kernel.fd.openLocked
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
@@ -1061,7 +1065,7 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions): ProcessHandle {
             checkMayBlock("exec")
-            return machine.execWithHandle(path, drivers, options, rt.pid) { future -> awaitHost(future) }
+            return machine.execWithHandle(path, drivers, options, rt.pid, await = { future -> awaitHost(future) })
         }
 
         override fun finishExecWithHandle(wait: ExecWait): ProcessHandle {
@@ -1085,6 +1089,29 @@ internal class ProcessRunner(private val machine: Machine) {
         }
 
         override fun processHandlePid(fd: Int): Int = lock.withLockValue { processObjectLocked(fd).pid }
+
+        override fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions, place: HandlePlacement): ProcessHandle {
+            checkMayBlock("exec")
+            return machine.execWithHandle(path, drivers, options, rt.pid, { future -> awaitHost(future) }, place)
+        }
+
+        override fun processHandleStatus(handle: HandleEntry): ExitStatus? =
+            lock.withLockValue { machine.lifecycle.processHandleStatusLocked(rt.process, processObjectOfLocked(handle)) }
+
+        override fun killProcessHandle(handle: HandleEntry, signal: KillSignal): KillResult {
+            val (target, result) = lock.withLockValue {
+                val obj = processObjectOfLocked(handle)
+                obj.pid to machine.lifecycle.killProcessHandleLocked(obj, signal)
+            }
+            if (target == rt.pid && result == KillResult.DELIVERED) throw ProcessKilledException()
+            return result
+        }
+
+        override fun processHandlePid(handle: HandleEntry): Int = lock.withLockValue { processObjectOfLocked(handle).pid }
+
+        /** 解決済みのハンドル [h] の子のハンドル。子のハンドルでなければ `BADF` */
+        private fun processObjectOfLocked(h: HandleEntry): ProcessObject =
+            machine.kernel.objects[h.objectId] as? ProcessObject ?: fsError(Errno.BADF, "ハンドル（オブジェクト ${h.objectId}）は子のハンドルではない")
 
         /** 自分の fd [fd] が指す子のハンドル（カーネルロックの中）。開いていない・子のハンドルでなければ `BADF` */
         private fun processObjectLocked(fd: Int): ProcessObject =
@@ -1127,6 +1154,23 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun openEventQueue(filter: EventFilter, capacity: Int): Int =
             lock.withLockValue { machine.openEventQueueLocked(rt.pid, filter, capacity) }
 
+        override fun openEventQueue(filter: EventFilter, capacity: Int, place: HandlePlacement): Int =
+            lock.withLockValue { machine.openEventQueueLocked(rt.pid, filter, capacity, place) }
+
+        override fun takeEvents(queue: HandleEntry, max: Int): EventBatch {
+            if (max < 1) fsError(Errno.INVAL, "取り出す数は 1 以上（$max）")
+            return lock.withLockValue { eventQueueOfLocked(queue).take(max) }
+        }
+
+        /** 解決済みのハンドル [h] のイベントキュー。読む権利がない・キューでなければ `BADF` */
+        private fun eventQueueOfLocked(h: HandleEntry): EventQueue {
+            if (h.rights and HandleRights.READ == 0) fsError(Errno.BADF, "ハンドル（オブジェクト ${h.objectId}）は読めない")
+            return machine.kernel.objects[h.objectId] as? EventQueue ?: fsError(Errno.BADF, "ハンドル（オブジェクト ${h.objectId}）はイベントキューではない")
+        }
+
+        /** 自分の fd 表に置く（p1） */
+        private fun fdPlacement(): HandlePlacement = FdPlacement(rt.process, machine.kernel.objects, machine.wakeSink)
+
         override fun takeEvents(handle: Int, max: Int): EventBatch {
             if (max < 1) fsError(Errno.INVAL, "取り出す数は 1 以上（$max）")
             return lock.withLockValue { eventQueueLocked(handle).take(max) }
@@ -1160,15 +1204,32 @@ internal class ProcessRunner(private val machine: Machine) {
         override fun uptimeTicks(): Long = machine.uptimeTicks()
 
         override fun createTimer(eventQueue: Int?, tag: Long): Int = lock.withLockValue {
-            val queueId = if (eventQueue == null) {
-                0
-            } else {
-                val q = eventQueueLocked(eventQueue)
-                if (!q.filter.accepts(TIMER_EVENT_PROBE)) fsError(Errno.INVAL, "fd $eventQueue のキューは ${TimerLimits.EVENT_TYPE} を受け取らない")
-                q.id
-            }
-            FdTable(rt.process, machine.kernel.objects, machine.wakeSink).open(Timer(queueId, tag), HandleRights.READ)
+            createTimerLocked(eventQueue?.let { eventQueueLocked(it) }, tag, fdPlacement())
         }
+
+        override fun createTimer(eventQueue: HandleEntry?, tag: Long, place: HandlePlacement): Int = lock.withLockValue {
+            createTimerLocked(eventQueue?.let { eventQueueOfLocked(it) }, tag, place)
+        }
+
+        /** タイマーを作って [place] に置く（[q] はイベントを送るキュー）。キューが `timer` を受け取らなければ `INVAL` */
+        private fun createTimerLocked(q: EventQueue?, tag: Long, place: HandlePlacement): Int {
+            if (q != null && !q.filter.accepts(TIMER_EVENT_PROBE)) fsError(Errno.INVAL, "キュー ${q.id} は ${TimerLimits.EVENT_TYPE} を受け取らない")
+            return place.openLocked(machine.kernel.objects, machine.wakeSink, Timer(q?.id ?: 0, tag), HandleRights.READ)
+        }
+
+        override fun setTimer(timer: HandleEntry, time: Long, intervalNanos: Long, absolute: Boolean) = lock.withLockValue {
+            val t = timerOfLocked(timer)
+            val deadline = if (absolute) time else saturatingAdd(machine.monotonicNanosLocked(), time.coerceAtLeast(0))
+            machine.armTimerLocked(t, deadline, intervalNanos)
+        }
+
+        override fun cancelTimer(timer: HandleEntry) = lock.withLockValue { machine.disarmTimerLocked(timerOfLocked(timer)) }
+
+        override fun readTimer(timer: HandleEntry): Long = lock.withLockValue { machine.readTimerLocked(timerOfLocked(timer)) }
+
+        /** 解決済みのハンドル [h] のタイマー。タイマーでなければ `BADF` */
+        private fun timerOfLocked(h: HandleEntry): Timer =
+            machine.kernel.objects[h.objectId] as? Timer ?: fsError(Errno.BADF, "ハンドル（オブジェクト ${h.objectId}）はタイマーではない")
 
         override fun setTimer(handle: Int, time: Long, intervalNanos: Long, absolute: Boolean) = lock.withLockValue {
             val timer = timerLocked(handle)
@@ -1508,14 +1569,60 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun listDevices(): List<DeviceInfo> = machine.devices.list()
 
-        override fun openDevice(address: String): Int {
+        override fun openDevice(address: String): Int = openDevice(address, fdPlacement())
+
+        override fun openDevice(address: String, place: HandlePlacement): Int {
             checkThread()
             val attached = machine.devices.find(address) ?: throw DeviceCallException(CallError.Detached)
             return lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
-                FdTable(rt.process, machine.kernel.objects, machine.wakeSink).open(DeviceHandle(attached.address, attached.kind), HandleRights.READ)
+                place.openLocked(machine.kernel.objects, machine.wakeSink, DeviceHandle(attached.address, attached.kind), HandleRights.READ)
             }
         }
+
+        override fun deviceInfo(device: HandleEntry): DeviceInfo = lock.withLockValue { deviceHandleOfLocked(device) }.info
+
+        override fun deviceMethods(device: HandleEntry): List<MethodInfo> {
+            val handle = lock.withLockValue { deviceHandleOfLocked(device) }
+            return machine.devices.dispatcher.resolve(handle.address, handle.kind)?.methodInfos ?: emptyList()
+        }
+
+        override fun invokeDevice(device: HandleEntry, method: String, args: List<DeviceValue>): List<DeviceValue> {
+            checkThread()
+            val handle = lock.withLockValue { deviceHandleOfLocked(device) }
+            return invokeResolved(machine.devices.dispatcher.resolve(handle.address, handle.kind), method, args)
+        }
+
+        override fun startDeviceCall(device: HandleEntry, method: String, args: List<DeviceValue>, place: HandlePlacement): Int {
+            checkThread()
+            val (slot, obj, kind) = lock.withLockValue {
+                if (rt.killed) throw ProcessKilledException()
+                val handle = deviceHandleOfLocked(device)
+                val (slot, obj) = machine.openPendingDeviceCallLocked(
+                    rt.pid,
+                    PendingDeviceCall.State.Queued(handle.address, method, args.toList()),
+                    place = place,
+                )
+                Triple(slot, obj, handle.kind)
+            }
+            payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj, kind))
+            return slot
+        }
+
+        override fun takeDeviceCall(call: HandleEntry): CallResult? {
+            checkThread()
+            val result = lock.withLockValue {
+                val obj = machine.kernel.objects[call.objectId] as? PendingDeviceCall
+                    ?: fsError(Errno.BADF, "ハンドル（オブジェクト ${call.objectId}）は pending-call でない")
+                obj.result
+            }
+            if (result is CallResult.Values) payDeviceFuel(DeviceLimits.payloadBytes(result.values) * DeviceLimits.FUEL_PER_BYTE)
+            return result
+        }
+
+        /** 解決済みのハンドル [h] の device。device でなければ `BADF` */
+        private fun deviceHandleOfLocked(h: HandleEntry): DeviceHandle =
+            machine.kernel.objects[h.objectId] as? DeviceHandle ?: fsError(Errno.BADF, "ハンドル（オブジェクト ${h.objectId}）は device でない")
 
         override fun invokeDevice(address: String, method: String, args: List<DeviceValue>): List<DeviceValue> {
             checkThread()
