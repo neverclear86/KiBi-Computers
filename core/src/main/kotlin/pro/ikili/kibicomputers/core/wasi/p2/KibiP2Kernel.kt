@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
+import pro.ikili.kibicomputers.core.access.AccessRequestKind
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.io.PipeEnd
@@ -15,6 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiAccess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiClock
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
@@ -23,7 +25,7 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
 import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
 
 /**
- * `kibi:kernel`（events・timers・`*-poll`）、`kibi:io`（tty・pipe-streams）、`kibi:fs/mounts`、`kibi:computer`（clock・power）の
+ * `kibi:kernel`（events・timers・`*-poll`）、`kibi:io`（tty・pipe-streams）、`kibi:fs/mounts`、`kibi:computer`（clock・power・access）の
  * p2 の実装（#685。ADR 0685）。意味は p1 と同じ層（`wasi/kibi/Kibi*`）とカーネルの口を使う。文字列の上限は p1 の lift と同じ
  * （超えたら同じ errno）。燃料は p1 と同じ（`take` はイベントの数、一覧は件数）
  */
@@ -37,6 +39,7 @@ internal object KibiP2Kernel {
     const val MOUNTS: String = "kibi:fs/mounts"
     const val CLOCK: String = "kibi:computer/clock"
     const val POWER: String = "kibi:computer/power"
+    const val ACCESS: String = "kibi:computer/access"
 
     const val EVENT_QUEUE: String = "event-queue"
     const val TIMER: String = "timer"
@@ -138,11 +141,37 @@ internal object KibiP2Kernel {
             "shutdown" to body { ctx, _ -> KibiPower.shutdown(ctx) },
             "reboot" to body { ctx, _ -> CanonValue.err(CanonValue.Case(KibiPower.reboot(ctx), null)) },
         )
+        val access = mapOf(
+            "get-access" to body { ctx, _ -> KibiP2.result { accessInfo(KibiAccess.getAccess(ctx)) } },
+            "request-add" to body { ctx, a -> accessRequest(ctx, a, AccessRequestKind.ADD) },
+            "request-remove" to body { ctx, a -> accessRequest(ctx, a, AccessRequestKind.REMOVE) },
+            "request-transfer" to body { ctx, a -> accessRequest(ctx, a, AccessRequestKind.TRANSFER) },
+        )
         return mapOf(
             EVENTS to events, TIMERS to timers, EVENTS_POLL to eventsPoll, TIMERS_POLL to timersPoll,
-            TTY to tty, PIPE_STREAMS to pipeStreams, MOUNTS to mounts, CLOCK to clock, POWER to power,
+            TTY to tty, PIPE_STREAMS to pipeStreams, MOUNTS to mounts, CLOCK to clock, POWER to power, ACCESS to access,
         )
     }
+
+    /** `request-*`。文字列の上限は p1 の lift と同じ（超えたら `invalid`） */
+    private fun accessRequest(ctx: ProcessContext, a: List<CanonValue>, kind: AccessRequestKind): CanonValue = KibiP2.result {
+        val argument = P2.str(a[0])
+        KibiP2.checkBytes(argument, KibiAccess.MAX_ARGUMENT_BYTES, Errno.INVAL, "argument")
+        KibiAccess.request(ctx, kind, argument)
+        null
+    }
+
+    /** `access-info` */
+    private fun accessInfo(info: KibiAccess.AccessInfo): CanonValue = CanonValue.Fields(
+        listOf(
+            CanonValue.Case(info.state.ordinal, null),
+            info.owner?.let { CanonValue.some(player(it)) } ?: CanonValue.NONE,
+            CanonValue.Items(info.members.map(::player)),
+            CanonValue.Items(info.invites.map { CanonValue.str(it) }),
+        ),
+    )
+
+    private fun player(p: KibiAccess.Player): CanonValue = CanonValue.Fields(listOf(CanonValue.str(p.name), CanonValue.str(p.id)))
 
     private fun setTimer(ctx: ProcessContext, a: List<CanonValue>, absolute: Boolean): CanonValue = KibiP2.result {
         ctx.setTimer(KibiP2.handle(ctx, a[0], TIMER), P2.u64(a[1]), P2.u64(a[2]), absolute)

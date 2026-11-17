@@ -73,7 +73,7 @@ sh [-eufxvC] [-s] [-i] [引数...]       # 標準入力から読む
 ほか: `history`（#102。ADR 0102） `true` `false` `echo`（`-n`）`printf`（`%s %b %c %d %i %u %o %x %X %%`、フラグ・幅・精度、書式の繰り返し）`cd`（`-`・`HOME`・`PWD`・`OLDPWD`）`pwd` `read`（`-r`）`test`/`[` `wait` `jobs`（`-l`・`-p`。#486）`command`（`-v`・`-V`）`type` `source`。
 
 - `exec cmd` は置き換えられないので、動かしてその終了コードで終わる。`exec` だけならリダイレクトをシェルに残す
-- `test -r/-w/-x` は、持ち主・権限がまだない（#110）ので、あれば真
+- `test -r/-w/-x` は、ファイルには持ち主・権限がない（マシンの中では権限を分けない。ADR 0046。#110 はケースの持ち主・権限で、ファイルのものではない）ので、あれば真
 - `local` は関数の中だけ。値を書かなければ今の値のまま
 - `.` で読めるファイルは、残る領域の半分（256 KiB）まで。超えたら `file too large`、残る領域が足りなければ `not enough memory to read the file`
 

@@ -34,7 +34,7 @@ internal object KernelComponentHost : ComponentHost {
 /**
  * `kibi:*` の p2 のホスト（#685。ADR 0685）。出すのは各パッケージの `imports-p2` の world の interface（[KibiP2Wit.TEXT]）:
  * `kibi:kernel/{types,events,timers,events-poll,timers-poll}`、`kibi:process/{process,process-poll}`、`kibi:io/{tty,pipe-streams}`、
- * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{clock,power}`。
+ * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{clock,power,access}`。
  * p1 だけの `kibi:io/fd`・`kibi:io/pipe`、p3 の `*-async`、`kibi:computer/memory` は出さない（`null`。読み込みの失敗 → `NOEXEC`）。
  *
  * - 型は [KibiP2Wit.TEXT] を [WitReader] で読んだもの。`use wasi:…@0.2.12` の型は [WasiP2Host] が読んだものに解決するので、

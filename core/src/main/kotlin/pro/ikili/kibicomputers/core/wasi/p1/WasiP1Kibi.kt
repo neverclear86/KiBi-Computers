@@ -14,6 +14,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.access.AccessRequestKind
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiAccess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiClock
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
@@ -49,6 +51,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * | [CLOCK] | `world-ticks` | `() -> i64` |
  * | [POWER] | `shutdown` | `() -> ()`（戻らない） |
  * | [POWER] | `reboot` | `(ret_ptr: i32) -> ()`（受け付けたら戻らない。断ったときだけ書く） |
+ * | [ACCESS] | `get-access` | `(ret_ptr: i32) -> ()`（`cabi_realloc` が要る。#110） |
+ * | [ACCESS] | `request-add`・`request-remove`・`request-transfer` | `(ptr, len, ret_ptr: i32) -> ()` |
  * | [IO_FD] | `dup` | `(fd, ret_ptr: i32) -> ()` |
  * | [IO_FD] | `dup-to` | `(fd, to, ret_ptr: i32) -> ()` |
  * | [IO_PIPE] | `create` | `(ret_ptr: i32) -> ()` |
@@ -78,6 +82,8 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
  * `kibi:process` の `list-processes` は加えて件数 × [KibiProcess.PROCESS_LIST_FUEL_PER_ENTRY]（#452）、
  * `kibi:fs/mounts` の `list-mounts`・`list-disks` は加えて件数 × [KibiFs.MOUNT_LIST_FUEL_PER_ENTRY]（#453）。
  * `list-mounts`・`list-disks` は待たず、`cabi_realloc` の中からも呼べる（一覧はカーネルロックの中で写し、ロックを放してから `cabi_realloc` を呼ぶ）。
+ * `kibi:computer/access`（#110。ADR 0110）はどれも待たず、`cabi_realloc` の中からも呼べる。`get-access` は加えて
+ * (1 + メンバー + 保留) × [KibiAccess.ENTRY_FUEL]。
  */
 internal object WasiP1Kibi {
     /** `kibi:kernel/events` のモジュール名 */
@@ -94,6 +100,9 @@ internal object WasiP1Kibi {
 
     /** `kibi:computer/power` のモジュール名（#306） */
     const val POWER: String = "kibi:computer/power@0.1.0"
+
+    /** `kibi:computer/access` のモジュール名（#110） */
+    const val ACCESS: String = "kibi:computer/access@0.1.0"
 
     /** `kibi:io/fd` のモジュール名 */
     const val IO_FD: String = "kibi:io/fd@0.1.0"
@@ -256,6 +265,20 @@ internal object WasiP1Kibi {
             P1Canonical.lowerUnitResult(memoryOf(caller), a[0].i(), error)
             NONE
         },
+        Fn(ACCESS, "get-access", WasmFunctionType.of(listOf(I32), emptyList()), true) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val info = try {
+                KibiAccess.getAccess(ctx)
+            } catch (e: FsException) {
+                P1Canonical.lowerAccessInfoResult(memory, realloc(ctx, caller), a[0].i(), null, KibiErrors.code(e))
+                return@Fn NONE
+            }
+            P1Canonical.lowerAccessInfoResult(memory, realloc(ctx, caller), a[0].i(), info, 0)
+            NONE
+        },
+        accessRequest("request-add", AccessRequestKind.ADD),
+        accessRequest("request-remove", AccessRequestKind.REMOVE),
+        accessRequest("request-transfer", AccessRequestKind.TRANSFER),
         Fn(IO_FD, "dup", WasmFunctionType.of(listOf(I32, I32), emptyList()), false) { ctx, caller, a ->
             val memory = memoryOf(caller)
             val fd = try {
@@ -385,6 +408,20 @@ internal object WasiP1Kibi {
             NONE
         },
     )
+
+    /** `kibi:computer/access` の `request-*`: `(ptr, len, ret_ptr: i32)`。文字列が長すぎる・正しくない UTF-8 なら `invalid` */
+    private fun accessRequest(name: String, kind: AccessRequestKind): Fn =
+        Fn(ACCESS, name, WasmFunctionType.of(listOf(I32, I32, I32), emptyList()), false) { ctx, caller, a ->
+            val memory = memoryOf(caller)
+            val error = try {
+                KibiAccess.request(ctx, kind, P1Canonical.liftString(memory, a[0].i(), a[1].i(), KibiAccess.MAX_ARGUMENT_BYTES, Errno.INVAL))
+                null
+            } catch (e: FsException) {
+                KibiErrors.code(e)
+            }
+            P1Canonical.lowerUnitResult(memory, a[2].i(), error)
+            NONE
+        }
 
     /** `set-after`・`set-at`: `(self: i32, time: i64, interval: i64, ret_ptr: i32)`。時間は頭打ちにしてから渡す */
     private fun setTimer(ctx: ProcessContext, caller: WasmInstance, a: LongArray, absolute: Boolean): LongArray {
