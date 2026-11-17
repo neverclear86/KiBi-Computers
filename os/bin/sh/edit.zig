@@ -748,14 +748,48 @@ fn readKeyByte() ?u8 {
     return readByte();
 }
 
+/// 標準入力が今すぐ読めるか（待たない。#769）。`poll_oneoff` で標準入力の FD_READ と、相対 0 の時計を 1 回で購読する。
+/// 時計がすぐ鳴るので待機点にならず、タイマーも作らない（カーネルはまず判定し、そろっていればそのまま返す）。
+/// 失敗したら読めないと見る（ESC の続きがないとして区切るだけ）
+fn inputReadyNow() bool {
+    const subs = [_]kibi.wasi.Subscription{
+        .{ .userdata = 0, .tag = kibi.wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = IN } } },
+        .{ .userdata = 1, .tag = kibi.wasi.EVENTTYPE_CLOCK, .u = .{ .clock = .{ .id = kibi.wasi.CLOCK_MONOTONIC, .timeout = 0, .precision = 0, .flags = 0 } } },
+    };
+    var evs: [2]kibi.wasi.Event = undefined;
+    while (true) {
+        var n: kibi.wasi.Size = 0;
+        kibi.errno.check(kibi.wasi.poll_oneoff(&subs, &evs, subs.len, &n)) catch |e| {
+            if (e == error.INTR) continue;
+            return false;
+        };
+        // 読むとエラー・終わりが分かるときも「読める」（readByte が null を返し、呼び手が区切る）
+        for (evs[0..n]) |ev| if (ev.userdata == 0) return true;
+        return false;
+    }
+}
+
+/// エスケープシーケンスの続きの 1 バイト。今読めるときだけ読み、なければ null（待たない。#769）。
+/// 1 つのキーのバイト列は 1 回の入力としてまとめて TTY に入る（ADR 0060 の `splittable`、ADR 0105）ので、
+/// 続きが今ないなら、そこでキーは終わっている（Esc だけ、Alt+[ など）
+fn readContinuation() ?u8 {
+    if (!inputReadyNow()) return null;
+    return readByte();
+}
+
 const Key = enum { none, up, down, left, right, home, end, delete, word_left, word_right };
 
-/// `ESC [` の後を読んで、キーにする（続きは [readKeyByte] で読む。#636）
-fn readCsi() Key {
+/// エスケープシーケンスを読んだ結果。[again] は、シーケンスの一部ではなかったので、次のキーとして処理し直すバイト
+/// （同じ回の入力でつながって届いた「Esc の後のキー」。#769）
+const Escape = struct { key: Key = .none, again: ?u8 = null };
+
+/// `ESC [` の後を読んで、キーにする（続きは [readContinuation] で読む。#769）。
+/// 続きが今なければ区切って何もしない。途中に制御文字（ESC を含む）が来たら、区切ってそのバイトを処理し直させる
+fn readCsi() Escape {
     var params: [16]u8 = undefined;
     var n: usize = 0;
     while (true) {
-        const c = readKeyByte() orelse return .none;
+        const c = readContinuation() orelse return .{};
         if (c >= 0x40 and c <= 0x7e) {
             const p = params[0..n];
             // 修飾キー（`1;5D` の 5 など）
@@ -771,7 +805,7 @@ fn readCsi() Key {
                 }
             }
             const ctrl_or_alt = modifier == 3 or modifier == 5;
-            return switch (c) {
+            return .{ .key = switch (c) {
                 'A' => .up,
                 'B' => .down,
                 'C' => if (ctrl_or_alt) .word_right else .right,
@@ -785,9 +819,9 @@ fn readCsi() Key {
                     else => .none,
                 },
                 else => .none,
-            };
+            } };
         }
-        if (c < 0x20) return .none;
+        if (c < 0x20) return .{ .again = c };
         if (n < params.len) {
             params[n] = c;
             n += 1;
@@ -795,16 +829,20 @@ fn readCsi() Key {
     }
 }
 
-/// ESC の後を読む。続きも [readKeyByte] で読み、続きを待っている間に保存から戻っても行を描き直す（#636）。
-/// Esc のキーだけ（キーボードの画面で Esc を押すとコンピューターに届く）だと、次のキーまでここで待つので、
-/// 入力だけを読むと、その間に保存・復元した画面が空のままになる
-fn readEscape() Key {
-    const c = readKeyByte() orelse return .none;
+/// ESC の後を読む（ADR 0102 の #769 の追記）。続きは [readContinuation] で読み、今なければ待たずに区切る。
+/// - 続きがない: Esc のキーだけ。何もしない（次のキーを捨てない）
+/// - ESC の後が制御文字・ESC: Esc と次のキー（同じ回の入力でつながって届いた）。次のキーを処理し直させる
+///   （`0x7f`・`0x08` は Alt+Backspace）
+/// - ESC の後が印字できる文字: Alt+文字（知らないものは捨てる）
+fn readEscape() Escape {
+    const c = readContinuation() orelse return .{};
     switch (c) {
         '[' => return readCsi(),
         'O' => {
-            const d = readKeyByte() orelse return .none;
-            return switch (d) {
+            // 続きがなければ Alt+O（何もしない）
+            const d = readContinuation() orelse return .{};
+            if (d < 0x20) return .{ .again = d };
+            return .{ .key = switch (d) {
                 'A' => .up,
                 'B' => .down,
                 'C' => .right,
@@ -812,21 +850,24 @@ fn readEscape() Key {
                 'H' => .home,
                 'F' => .end,
                 else => .none,
-            };
+            } };
         },
-        'b', 'B' => return .word_left,
-        'f', 'F' => return .word_right,
+        'b', 'B' => return .{ .key = .word_left },
+        'f', 'F' => return .{ .key = .word_right },
         'd', 'D' => {
             remove(pos, nextWord(pos), true);
             refresh();
-            return .none;
+            return .{};
         },
         0x7f, 0x08 => {
             remove(prevWord(pos), pos, true);
             refresh();
-            return .none;
+            return .{};
         },
-        else => return .none,
+        else => {
+            if (c < 0x20) return .{ .again = c };
+            return .{};
+        },
     }
 }
 
@@ -916,10 +957,16 @@ pub fn readLine(p: []const u8, out: []u8) Result {
     // UTF-8 の 1 文字の続きの残り
     var utf8_rest: usize = 0;
     var utf8_start: usize = 0;
+    // エスケープシーケンスの後ろにつながって届いた、次のキーとして処理し直すバイト（#769。readEscape が返す。
+    // エスケープはキーの境目でしか始まらないので、utf8_rest が 0 のときにだけ入る）
+    var again: ?u8 = null;
     while (true) {
         // UTF-8 の続きは、従来どおり入力だけを読む（先頭のバイトを行に入れた後なので、途中で描き直さない）。
-        // エスケープシーケンスの続き（readEscape・readCsi）は readKeyByte で読む（#636）
-        const c = (if (utf8_rest > 0) readByte() else readKeyByte()) orelse {
+        // キーの境目では readKeyByte で入力と「保存から戻った」を待つ。エスケープシーケンスの続きは待たずに読む（readEscape。#769）
+        const c = if (again) |b| blk: {
+            again = null;
+            break :blk b;
+        } else (if (utf8_rest > 0) readByte() else readKeyByte()) orelse {
             finishLine("");
             return .eof;
         };
@@ -1028,7 +1075,11 @@ pub fn readLine(p: []const u8, out: []u8) Result {
                 last_tab = was_tab;
                 completeWord();
             },
-            0x1b => applyKey(readEscape()),
+            0x1b => {
+                const e = readEscape();
+                applyKey(e.key);
+                again = e.again;
+            },
             else => {
                 if (c < 0x20) continue;
                 if (c >= 0x80) {
