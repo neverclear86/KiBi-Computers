@@ -67,6 +67,12 @@ internal interface LinkEnv {
  * その中から [call] を呼ぶと [IllegalStateException] になる。ホストの関数の中から呼べると、core の関数が [LinkEnv.callGuest] で
  * 包まれずに動き、ホスト関数の途中で止まる口を使えてしまう（ADR 0073）。仕様の「同じコンポーネントのインスタンスに入れ子で入らない」にも合う
  *
+ * 一時的な値（#753。ADR 0264「予算」）: lift した引数（[CanonValue] のリスト）は、callee の線形メモリへ lower し終えたら、callee が動いている間は
+ * 持たない（[LiftedArgs] で参照を切る）。なので、ゲストからゲストへの呼び出しを深くしても（A→B→C…、再入する A→B→A… でも）、ホストが
+ * 同時に持つ一時的な値は「いま lift・lower している 1 段」の分で頭打ちになる。守りとして、外側の段がまだ持っている量（[heldBytes]・[heldValues]）を
+ * 入れ子の段の予算から引く（値を持ったまま下の段へ降りる経路ができても、上限が深さに比例しない）。
+ * 一時的な値は RAM（ADR 0048）には数えない（解放しても減らない最高値の勘定なので、大きな呼び出し 1 回がプロセスの終わりまで RAM を引いてしまう）
+ *
  * resource（#265。ADR 0265）: ハンドル表はコンポーネントのインスタンスごとに 1 つ（[ResourceTable]。使ったインスタンスの分だけ作る）。
  * borrow の範囲は、同期の呼び出しのスタック（仕様の Task の番号と borrow の数、Subtask の lenders）で持ち、引数に borrow を含む
  * 関数の呼び出しのときだけ積む。閉じるとき（[close]）は、表に残ったハンドルの dtor を呼ばない
@@ -106,6 +112,20 @@ internal class LinkedComponent private constructor(
     private var lenderInstances = IntArray(4)
     private var lenderHandles = IntArray(4)
     private var lenderTop = 0
+
+    // ---- 一時的な値（#753） ----
+
+    /** 外側の段が lift してまだ持っている（callee へ lower し終えていない）バイト数（プロセスのスレッドだけが読み書きする） */
+    internal var heldBytes: Long = 0
+        private set
+
+    /** [heldBytes] と同じく、値の数 */
+    internal var heldValues: Long = 0
+        private set
+
+    /** [heldBytes] の最高値（テスト用） */
+    internal var peakHeldBytes: Long = 0
+        private set
 
     /** 作った core インスタンス（作った順） */
     val coreInstances: List<WasmInstance> get() = instances
@@ -203,7 +223,8 @@ internal class LinkedComponent private constructor(
         try {
             return guarded {
                 val budget = CanonBudget()
-                val r = callFunc(func, args, budget) { it }
+                // ホストが渡したリストはホストのもの（参照を切るだけで、中身は消さない）
+                val r = callFunc(func, LiftedArgs(args, heldBytes, heldValues), budget) { it }
                 env.chargeFuel(cost(budget))
                 r
             }
@@ -217,23 +238,50 @@ internal class LinkedComponent private constructor(
     /** ゲストの core が canon lower した import を呼んだ */
     private fun callLowered(spec: LowerSpec, args: LongArray): LongArray = guarded {
         if (!mayLeave[spec.instance]) CanonTraps.trap("realloc・post-return の中から import を呼んだ（may_leave）")
-        val budget = CanonBudget()
+        // 外側の段がまだ持っている分を、この段の予算から引く（#753。深くしても、同時に持つ量が 1 回の予算を超えない）
+        val outerBytes = heldBytes
+        val outerValues = heldValues
+        val budget = CanonBudget(CanonLimits.DEFAULT_MAX_BYTES - outerBytes, CanonLimits.DEFAULT_MAX_VALUES - outerValues)
         val cx = context(spec.options, spec.instance, budget)
         // 仕様の Subtask: 引数の borrow の lift で貸したハンドルを、呼び出しが済んだら（post-return の後）戻す（deliver_resolve）
         val lenders = lenderTop
         val out = try {
-            val values = spec.function.liftParams(cx, args)
-            callFunc(spec.callee, values, budget) { spec.function.lowerResult(cx, it, args) }
+            // lift した値は名前のある変数に置かない（callee が動いている間、このフレームから参照を残さない。#753）
+            callFunc(spec.callee, liftArgs(spec, cx, args, outerBytes, outerValues), budget) { spec.function.lowerResult(cx, it, args) }
         } finally {
             if (lenderTop != lenders) returnLenders(lenders)
+            heldBytes = outerBytes
+            heldValues = outerValues
         }
         env.chargeFuel(cost(budget))
         out
     }
 
+    /** [spec] の引数を lift し、持っている量を [heldBytes]・[heldValues] に足して包む */
+    private fun liftArgs(spec: LowerSpec, cx: CanonContext, args: LongArray, outerBytes: Long, outerValues: Long): LiftedArgs {
+        val lifted = LiftedArgs(spec.function.liftParams(cx, args), outerBytes, outerValues)
+        heldBytes = outerBytes + cx.budget.usedBytes
+        heldValues = outerValues + cx.budget.usedValues
+        if (heldBytes > peakHeldBytes) peakHeldBytes = heldBytes
+        return lifted
+    }
+
+    /**
+     * lift した引数（#753）。callee へ渡すときに [take] で参照を切る（callee が lift した関数なら、lower し終えた後は誰も持たない）。
+     * [outerBytes]・[outerValues] は、この段より外側が持っている量（lower し終えたら [heldBytes]・[heldValues] をここへ戻す）
+     */
+    private class LiftedArgs(private var values: List<CanonValue>?, val outerBytes: Long, val outerValues: Long) {
+        fun take(): List<CanonValue> {
+            val v = checkNotNull(values) { "lift した引数を 2 回渡した（内部の誤り）" }
+            values = null
+            return v
+        }
+    }
+
     /** [func] を呼び、結果を [onResult] に渡す（lift した関数なら、その後に post-return を呼ぶ） */
-    private inline fun <T> callFunc(func: FuncRef, args: List<CanonValue>, budget: CanonBudget, onResult: (CanonValue?) -> T): T = when (func) {
-        is FuncRef.Host -> onResult(func.host.body.call(ComponentCall(this, env, func.interfaceName, func.name), args))
+    private inline fun <T> callFunc(func: FuncRef, args: LiftedArgs, budget: CanonBudget, onResult: (CanonValue?) -> T): T = when (func) {
+        // ホストの関数は、ホストの処理の間ずっと値を持つ（ホストの関数の中からはゲストへ入れないので、入れ子にはならない。#691）
+        is FuncRef.Host -> onResult(func.host.body.call(ComponentCall(this, env, func.interfaceName, func.name), args.take()))
         is FuncRef.Lifted -> {
             val spec = plan.lifts[func.lift]
             val cx = context(spec.options, spec.instance, budget)
@@ -243,7 +291,10 @@ internal class LinkedComponent private constructor(
             val results: LongArray
             val value: CanonValue?
             try {
-                val coreArgs = spec.function.lowerParams(cx, args)
+                val coreArgs = spec.function.lowerParams(cx, args.take())
+                // callee の線形メモリへ写し終えた: この段はもう値を持たない（#753）
+                heldBytes = args.outerBytes
+                heldValues = args.outerValues
                 results = callCore(spec.core, coreArgs)
                 value = spec.function.liftResult(cx, results)
                 // Task.return_: 受けた borrow をすべて drop してから返る。呼ぶ側への lower（呼ぶ側の realloc が動く）より前に確かめる

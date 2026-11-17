@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.WrittenPagesMemory
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -346,7 +347,8 @@ class SpawnMemoryLimitTest {
      * 後に作る b は、線形メモリの外に書く data セグメントを持ち、RAM と関係なく作れない
      */
     private val unrelatedLinkFailureComponent = run {
-        val written = ((page - 2 * CORE_INSTANCE_OVERHEAD_BYTES) / 4096L).toInt()
+        // 区画の表（#753）は a と b の 1 ページずつ
+        val written = ((page - 2 * CORE_INSTANCE_OVERHEAD_BYTES - 2 * WrittenPagesMemory.TABLE_BYTES_PER_PAGE) / 4096L).toInt()
         check(written in 1..16) { "固定費が大きすぎて、この試験は成り立たない" }
         """
         (component
@@ -527,7 +529,8 @@ class SpawnMemoryLimitTest {
             h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
             assertState(ProcessState.EXITED, m, pid)
             val overhead = 2 * CORE_INSTANCE_OVERHEAD_BYTES
-            assertEquals(overhead + 5 * 4096L to overhead, seen.get(), "共有したメモリは定義したインスタンスで 1 回だけ数える")
+            // 区画の表（#753）も、定義したインスタンスの 1 ページ分だけ
+            assertEquals(overhead + 5 * 4096L + WrittenPagesMemory.tableBytesOf(1) to overhead, seen.get(), "共有したメモリは定義したインスタンスで 1 回だけ数える")
             assertEquals(0L, m.memoryAccount.usedBytes, "固定費もプロセスの終わりに返る")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
@@ -582,6 +585,37 @@ class SpawnMemoryLimitTest {
             assertEquals(0L, m.memoryAccount.usedBytes, "作りかけの分も RAM に残らない")
             assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             assertFalse(m.rt(pid).lastError is WasmTrapException)
+            m.stop()
+            assertTrue(m.awaitTermination(5_000))
+        }
+    }
+
+    @Test
+    fun `線形メモリの区画の表がRAMに収まらない子は、作れずにメモリ不足と出て、RAMが戻る`() = timeout(limit) {
+        harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(host = host, memoryBytes = page)
+            // 区画の表は 1 ページ 128 バイト（#753）。600 ページ（約 37 MiB の宣言）の表は 64 KiB に収まらない（区画そのものは数えない）
+            val pages = 600
+            check(WrittenPagesMemory.tableBytesOf(pages) > page) { "表が RAM に収まると、この試験は成り立たない" }
+            val wasm = WasmBinary().run {
+                memory(pages)
+                build()
+            }
+            val started = CountDownLatch(1)
+            val pid = m.spawn(
+                Program.load(EndiveRuntime(), wasm),
+                TestDriver(ProcessKind.BLOCKING) {
+                    started.countDown()
+                    StepResult.Exit(0)
+                },
+                SpawnOptions(args = listOf("wide"), allowUnmetered = true),
+            )
+            h.awaitCrash(m, host, pid, "kibi: wide (pid $pid) crashed: cannot instantiate module (out of memory, RAM limit 64 KiB)")
+            assertEquals(1L, started.count, "インスタンスを作れないので、本体は動かない")
+            assertTrue(m.rt(pid).lastError is WasmLinkException, "${m.rt(pid).lastError}")
+            assertEquals(0L, m.memoryAccount.usedBytes, "断った分は RAM に残らない")
+            assertEquals(0L, h.scheduler.memoryAccount.usedBytes)
             m.stop()
             assertTrue(m.awaitTermination(5_000))
         }

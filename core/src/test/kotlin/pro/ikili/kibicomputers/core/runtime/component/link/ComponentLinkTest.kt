@@ -604,4 +604,59 @@ class ComponentLinkTest {
         assertEquals(1, created.size)
         assertThrows<IllegalStateException> { created[0].call("f", 1L) }
     }
+
+    @Test
+    fun `lift した引数は callee へ写し終えたら持たず、段を深くしてもホストが同時に持つ量は1段分`() {
+        // #753: 外側（main → inner.pass）で lift した文字列は、inner の線形メモリへ写し終えたら持たない。
+        // inner が host の take を呼ぶ段で持つのは、その段で lift した分だけ
+        val n = 1000
+        val heldAtHost = AtomicInteger(-1)
+        val sinkHost = ComponentHost.of(
+            host(
+                "test:host/sink",
+                "take" to HostFunction(fn(listOf(CanonType.Str), CanonType.U32)) { call, args ->
+                    heldAtHost.set(call.component.heldBytes.toInt())
+                    u32((args[0] as CanonValue.Str).value.length)
+                },
+            ),
+        )
+        val p = load(
+            """
+            (component
+              (import "test:host/sink" (instance ${'$'}h (export "take" (func (param "s" string) (result u32)))))
+              (alias export ${'$'}h "take" (func ${'$'}take))
+              (component ${'$'}inner
+                (import "sink" (func ${'$'}sink (param "s" string) (result u32)))
+                $stringParts
+                (core func ${'$'}sink_lower (canon lower (func ${'$'}sink) (memory ${'$'}memory)))
+                (core module ${'$'}body
+                  (import "host" "sink" (func ${'$'}s (param i32 i32) (result i32)))
+                  (func (export "pass") (param i32 i32) (result i32) (call ${'$'}s (local.get 0) (local.get 1))))
+                (core instance ${'$'}si (export "sink" (func ${'$'}sink_lower)))
+                (core instance ${'$'}bi (instantiate ${'$'}body (with "host" (instance ${'$'}si))))
+                (func (export "pass") (param "s" string) (result u32)
+                  (canon lift (core func ${'$'}bi "pass") (memory ${'$'}memory) (realloc ${'$'}realloc))))
+              (instance ${'$'}in (instantiate ${'$'}inner (with "sink" (func ${'$'}take))))
+              $stringParts
+              (alias export ${'$'}in "pass" (func ${'$'}pass))
+              (core func ${'$'}pass_lower (canon lower (func ${'$'}pass) (memory ${'$'}memory)))
+              (core module ${'$'}main
+                (import "env" "mem" (memory 1))
+                (import "inner" "pass" (func ${'$'}p (param i32 i32) (result i32)))
+                (func (export "run") (param i32) (result i32) (call ${'$'}p (i32.const 0) (local.get 0))))
+              (core instance ${'$'}env (export "mem" (memory ${'$'}memory)))
+              (core instance ${'$'}pi (export "pass" (func ${'$'}pass_lower)))
+              (core instance ${'$'}mi (instantiate ${'$'}main (with "env" (instance ${'$'}env)) (with "inner" (instance ${'$'}pi))))
+              (func (export "run") (param "n" u32) (result u32) (canon lift (core func ${'$'}mi "run"))))
+            """,
+            sinkHost,
+        )
+        instantiate(p).use { c ->
+            assertEquals(u32(n), c.call("run", args = listOf(u32(n))))
+            assertEquals(n, heldAtHost.get(), "host の段で持つのは、その段で lift した分だけ（外側の段の分を持ち越さない）")
+            assertEquals(n.toLong(), c.peakHeldBytes, "同時に持った量の最高値は 1 段分")
+            assertEquals(0L, c.heldBytes)
+            assertEquals(0L, c.heldValues)
+        }
+    }
 }
