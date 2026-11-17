@@ -80,7 +80,7 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *   予約した世代を NBT に載せてチャンクに `setUnsaved(true)` を付ける（続く `ChunkMap.save` が書く。書き終わりは待たない。#84 の規則 4）
  * - チャンクが FULL でなくなった（[ChunkTicketLevelUpdatedEvent] でチケットの段階が 33 を超えた。#545）: アンロードと同じく
  *   止め、待ち、取り出して書き込みに回してから、マシンを外す（[CaseBlockEntity.chunkDemoted]）。書き終わったら、そのチャンクに
- *   `setUnsaved(true)` を付ける（#84 の規則 5）。
+ *   `setUnsaved(true)` を付け、holder の `wasAccessibleSinceLastSave` も立て直す（#84 の規則 5。[markDemotedChunkUnsaved]。#761）。
  *   スポーンのチャンク・強制読み込み・チャンクローダーのまわりのチャンクは、FULL でなくなってもアンロードされずメモリに残るため。
  *   イベントの中では印を付けるだけで、tick の終わり（[ServerTickEvent.Post]）に、tick の時間が残っている間だけ流す（1 tick に最低1チャンク）。
  *   流す前に FULL に戻ったチャンクは何もしない。FULL に戻ったチャンクのケースは、アンロードの後に読み込み直したのと同じく電源が切れている
@@ -647,7 +647,7 @@ object ServerMachines {
             if (adopted) {
                 markChunkUnsaved(be)
                 // FULL でなくなったときのチャンク（#545。規則 5）。markChunkUnsaved が FULL でないチャンクにも付けるが、ここは前からの印として残す
-                be.demotedChunk?.isUnsaved = true
+                be.demotedChunk?.let(::markDemotedChunkUnsaved)
             }
         }
     }
@@ -655,8 +655,8 @@ object ServerMachines {
     /**
      * [be] のチャンクに未保存の印を付ける（続くチャンクの保存が NBT を書く。#653）。チャンクが FULL なら（`hasChunkAt`）`setChanged`。
      * FULL でなければ `setChanged` が届かない（`Level.blockEntityChanged` は `hasChunkAt` のときだけ印を付ける）ので、そのチャンクの
-     * `ChunkHolder` の最新のチャンクに `setUnsaved(true)` を直接付ける（ADR 0084 の規則 5）。チャンクを読み込み直さない
-     * （チケットは足さない）。
+     * `ChunkHolder` の最新のチャンクに `setUnsaved(true)` を直接付け、holder の `wasAccessibleSinceLastSave` も立て直す
+     * （[markDemotedChunkUnsaved]。ADR 0084 の規則 5、#761）。チャンクを読み込み直さない（チケットは足さない）。
      *
      * アンロード待ちのチャンク（`ChunkMap.processUnloads` が holder を外し、`visibleChunkMap` から消えたが、アンロードの仕事がまだ走っていない。
      * tick に時間が残らないと残る）は、ブロックエンティティは生きているが holder が見つからない。このときは [unmarkedCases] に覚え、
@@ -676,9 +676,28 @@ object ServerMachines {
                 unmarkedCases += be
                 LOGGER.debug("No visible chunk holds the computer at {} (pending unload?); marking it unsaved on unload", pos)
             }
-            chunk.blockEntities[pos] === be -> chunk.isUnsaved = true
+            chunk.blockEntities[pos] === be -> markDemotedChunkUnsaved(chunk)
             else -> LOGGER.debug("Another chunk holds the position of the computer at {}; not marking it unsaved", pos)
         }
+    }
+
+    /**
+     * FULL でないままメモリに残る [chunk] に未保存の印を付ける（#761。ADR 0084 の規則 5）。`isUnsaved` を付け、そのチャンクを最新に持つ
+     * `ChunkHolder` が見えれば、その `wasAccessibleSinceLastSave` も立て直す。
+     * バニラの tick の保存（`ChunkMap.saveChunkIfNeeded`）と `saveAllChunks` は、このフラグが立った holder しか書かず、FULL でない holder の
+     * フラグは一度保存を試すと偽になって、FULL に戻るまで立たない。立て直さないと、印がアンロードか停止までディスクに行かない。
+     * 立て直した後は、FULL のチャンクの `setChanged` と同じく、tick の急ぎの保存（時間が残る tick に最大 20 チャンク）か自動保存が書く
+     * （書いた後、フラグはまた偽になる）。
+     *
+     * holder の最新のチャンクが [chunk] でなければ（読み込み直した別のチャンク・アンロード待ちで holder が見えない）フラグには触らない。
+     * 1 回につきハッシュを 1 回引くだけ（全 holder はなめない）。メインスレッドで呼ぶ
+     */
+    internal fun markDemotedChunkUnsaved(chunk: LevelChunk) {
+        chunk.isUnsaved = true
+        val level = chunk.level as? ServerLevel ?: return
+        val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.pos.toLong()) ?: return
+        // フィールドへの代入（AT で public にした）。同じ名前の public メソッド wasAccessibleSinceLastSave() は読み取り
+        if (holder.latestChunk === chunk) holder.wasAccessibleSinceLastSave = true
     }
 
     /**
@@ -784,10 +803,13 @@ object ServerMachines {
      */
     internal fun saveForUnload(chunk: LevelChunk, cases: List<CaseBlockEntity>, adopt: Boolean) {
         val store = WorldMachineSaves.current ?: return
+        // FULL でなくなっただけでメモリに残るチャンクは、holder の保存のフラグも立て直す（#761）。アンロードでは holder が外れていて、
+        // 続く ChunkMap.save がフラグを見ずに書くので、印だけでよい
+        val markUnsaved = { if (adopt) chunk.isUnsaved = true else markDemotedChunkUnsaved(chunk) }
         // 止まった台は電源を切ってから書く（アンロードでは setChanged が効かないので、変わったらチャンクに印を付ける。#698）
-        for (be in cases) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
+        for (be in cases) if (settleStopped(be, quiet = true)) markUnsaved()
         // アンロード待ちで印を付けられなかったケース（markChunkUnsaved。#653）の分を、このチャンクに付ける
-        if (unmarkedCases.isNotEmpty()) for (be in cases) if (unmarkedCases.remove(be)) chunk.isUnsaved = true
+        if (unmarkedCases.isNotEmpty()) for (be in cases) if (unmarkedCases.remove(be)) markUnsaved()
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -796,7 +818,7 @@ object ServerMachines {
             if (be.computer.isCaptured) {
                 // 停止の手順で取り出し済み: チャンクの NBT がまだ古い世代を指していれば、保存させる
                 val id = be.identity
-                if (id != null && store.chunkGeneration(id.id).let { !it.isPresent || it.asLong != id.generation }) chunk.isUnsaved = true
+                if (id != null && store.chunkGeneration(id.id).let { !it.isPresent || it.asLong != id.generation }) markUnsaved()
                 continue
             }
             // 自動保存で止めていた台は、アンロードの手順が引き継ぐ（止め直してから、自動保存の印を返す）
@@ -821,7 +843,7 @@ object ServerMachines {
             }
             runAfterCaptureForTest(targets)
             // 待ち・取り出しの間に止まった台（別のスレッドで CRASHED になる・ゲストが止める）も、電源を切った状態で NBT に載せる（#698）
-            for (be in targets) if (settleStopped(be, quiet = true)) chunk.isUnsaved = true
+            for (be in targets) if (settleStopped(be, quiet = true)) markUnsaved()
         }
         // 書き終わりは待たずに、予約した世代を NBT に載せる（書き込み中だった自動保存の予約も同じ。規則 4）
         if (adopt) for (be in cases) if (be.adoptPendingSave()) chunk.isUnsaved = true

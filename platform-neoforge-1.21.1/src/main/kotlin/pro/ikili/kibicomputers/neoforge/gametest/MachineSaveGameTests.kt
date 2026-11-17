@@ -572,6 +572,77 @@ object MachineSaveGameTests {
     }
 
     /**
+     * #761: FULL でないままメモリに残るチャンクに完了で付けた印が、アンロードを待たずにバニラの保存でディスクに行く。
+     * バニラの保存（`saveChunkIfNeeded`・`saveAllChunks`）は `ChunkHolder.wasAccessibleSinceLastSave` が立った holder しか書かず、
+     * FULL でない holder のフラグは一度保存を通ると偽になる。書き込みのスレッドを止めたまま FULL でなくし、保存を1回通して
+     * フラグを下ろしてから完了を受け取る。受け取った後はフラグが立ち直り、チャンクがメモリに残ったままの `save(true)` で、
+     * ディスクのチャンクの NBT と印が新しい世代を指す（立て直さないと前の世代のまま）。
+     * 書き込みのスレッドを tick をまたいで止めるので、ほかのテストと同じバッチにしない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "demoted_chunk_holder_flag")
+    fun demotedChunkCompletionReachesDiskWhileInMemory(helper: GameTestHelper) {
+        val store = store(helper)
+        val level = helper.level
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 800, helper.absolutePos(CASE).z / 16 + 800)
+        val keeper = ChunkPos(chunk.x + 5, chunk.z)
+        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
+        level.setChunkForced(keeper.x, keeper.z, true)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        installRequired(be)
+        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        // onLoad（追跡と索引）を待ってから、前の世代を書いてディスクのチャンクに載せる
+        helper.runAfterDelay(1) {
+            be.computer.prepareUnload()
+            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+            be.computer.endQuiesce()
+            val first = be.identity!!
+            level.chunkSource.save(true)
+            helper.assertTrue(diskGeneration(helper, chunk, pos) == first.generation, "the chunk on disk should point at ${first.generation}")
+
+            val gate = WriterGate()
+            level.setChunkForced(chunk.x, chunk.z, false)
+            var pending: PendingSave? = null
+            helper.startSequence().thenWaitUntil {
+                helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
+                helper.assertTrue(be.computer.machine == null, "the machine should be stopped but was ${be.computer}")
+            }.thenExecute {
+                try {
+                    val demoted = be.demotedChunk!!
+                    helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
+                    pending = be.pendingSave
+                    helper.assertTrue(pending != null, "the demotion should leave a pending save")
+                    val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.toLong())
+                    helper.assertTrue(holder != null && holder.latestChunk === demoted, "the demoted chunk should stay in its holder")
+                    // バニラの保存を1回通すと、FULL でない holder のフラグが下りる（以後、バニラの保存はこの holder を書かない）
+                    level.chunkSource.save(true)
+                    helper.assertTrue(!holder!!.wasAccessibleSinceLastSave(), "a save should clear the flag of a holder below FULL")
+                    helper.assertTrue(be.identity == first, "nothing should complete while the writer is held")
+                } finally {
+                    gate.close()
+                }
+                ServerMachines.drainSaves()
+                val identity = pending!!.identity
+                helper.assertTrue(be.identity == identity, "the completion should advance to $identity but was ${be.identity}")
+                val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.toLong())!!
+                helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the completion should raise the flag of the demoted holder")
+                // チャンクはメモリに残ったまま、バニラの保存が新しい世代を書く
+                level.chunkSource.save(true)
+                helper.assertTrue(!be.isRemoved, "the chunk should stay in memory")
+                val generation = diskGeneration(helper, chunk, pos)
+                helper.assertTrue(generation == identity.generation, "the chunk on disk should point at ${identity.generation} but was $generation")
+                helper.assertTrue(store.chunkGeneration(identity.id) == OptionalLong.of(identity.generation), "the mark should follow the chunk save")
+                helper.assertTrue(!holder.wasAccessibleSinceLastSave(), "the save should clear the flag again")
+                level.setChunkForced(keeper.x, keeper.z, false)
+            }.thenSucceed()
+        }
+    }
+
+    /**
      * 停止の手順（`saveForStop`）で、FULL でなくなったばかりのチャンク（1人プレイの「保存してタイトルに戻る」で、プレイヤーの
      * チケットが先に外れたとき。tick の終わりの `saveForDemotion` はまだ回っていない）のケースも、書けた世代でチャンクに未保存の印が付く
      * （#653。`setChanged` は FULL でないチャンクに届かないので呼ばず、`demotedChunk` もまだない）
