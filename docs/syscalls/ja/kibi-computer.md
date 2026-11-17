@@ -96,7 +96,7 @@ interface access {
 | このコンピューターに持ち主と権限がない（ゲームの外で作ったマシンなど） | `not-supported` |
 | 承認待ちの依頼が上限 | `again` |
 
-- `request-*` の文字列の範囲が線形メモリの外なら、`fault` を返します（トラップにはなりません）。`get-access` の書き先（retptr）は、依頼を受け付けた後に確かめます（書き先が外なら、トラップになります）
+- `request-*` の文字列の範囲が線形メモリの外なら、`fault` を返します（トラップにはなりません）。`request-*` の書き先（retptr）は、依頼を受け付けた後に確かめます（書き先が外なら、依頼は届いたうえでトラップになります）。`get-access` は依頼を出さないので、書き先を最初に確かめます
 - `get-access` は `cabi_realloc` の中からも呼べます。`cabi_realloc` は、Canonical ABI の項目の順（持ち主の名前 → 持ち主の ID → `members` の配列 → 各メンバーの名前・ID → `invites` の配列 → 各保留）に呼びます
 
 ## p1 向けの import

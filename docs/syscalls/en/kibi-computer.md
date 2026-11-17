@@ -96,7 +96,7 @@ interface access {
 | This computer has no owner and permissions (such as a machine created outside the game) | `not-supported` |
 | Too many requests waiting for approval | `again` |
 
-- If the string range of a `request-*` is outside the linear memory, it returns `fault` (no trap). The retptr is checked after the request is accepted (if it is outside, the request is delivered and then it traps)
+- If the string range of a `request-*` is outside the linear memory, it returns `fault` (no trap). The retptr of a `request-*` is checked after the request is accepted (if it is outside, the request is delivered and then it traps). `get-access` sends no request, so it checks its retptr first
 - `get-access` can also be called from inside `cabi_realloc`. `cabi_realloc` is called in Canonical ABI field order (owner name, owner id, the `members` array, each member's name and id, the `invites` array, each invite)
 
 ## p1 imports
