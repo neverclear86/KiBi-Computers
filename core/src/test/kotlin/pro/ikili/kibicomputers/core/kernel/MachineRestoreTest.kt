@@ -51,7 +51,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
 import pro.ikili.kibicomputers.core.runtime.WasmLinkException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.WrittenPagesMemory
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
@@ -211,6 +213,53 @@ class MachineRestoreTest {
             return object : WasmModule by module {
                 override fun instantiateForRestore(config: WasmInstanceConfig, state: WasmInstanceState): WasmInstance =
                     throw WasmLinkException("テスト: 状態が合わない")
+            }
+        }
+    }
+
+    /**
+     * 作り直し（instantiateForRestore）で、区画の表の増えた分（`restorePages`）の確保だけを、RAM の勘定が断ったことにするランタイム（#753）。
+     * 最初の表（作るときの分）は通し、その次に来る「保存したページ数との差の分」の確保で、本物の勘定に断らせる
+     * （[ProcessMemory.refusedReservation] が立つので、冷えた起動の原因が NO_MEMORY になる）
+     */
+    private class TableRefusingRestoreRuntime(private val inner: WasmRuntime) : WasmRuntime by inner {
+        @Volatile
+        var refused = false
+
+        override fun load(bytes: ByteArray): WasmModule {
+            val module = inner.load(bytes)
+            return object : WasmModule by module {
+                override fun instantiateForRestore(config: WasmInstanceConfig, state: WasmInstanceState): WasmInstance {
+                    val real = checkNotNull(config.writtenMemoryBudget)
+                    val wrapped = object : WasmTableBudget by real {
+                        private var initialBytes = -1L
+
+                        override fun tryReserveBytes(bytes: Long): Boolean {
+                            if (initialBytes < 0) {
+                                initialBytes = bytes
+                            } else if (bytes == WrittenPagesMemory.tableBytesOf(state.memoryPages) - initialBytes) {
+                                refused = true
+                                // 上限を超える keep を渡すと、本物の勘定が断って、断った記録（lastRefusal）を残す
+                                return real.tryReserveBytes(bytes, Long.MAX_VALUE)
+                            }
+                            return real.tryReserveBytes(bytes)
+                        }
+                    }
+                    val b = WasmInstanceConfig.builder()
+                    config.hostImports.forEach { b.hostFunction(it) }
+                    b.fuel(config.initialFuel, config.fuelHandler)
+                    b.maxMemoryPages = config.maxMemoryPages
+                    b.memoryBudget = config.memoryBudget
+                    b.asyncStack = config.asyncStack
+                    b.maxTableElements = config.maxTableElements
+                    b.tableBudget = config.tableBudget
+                    b.writtenMemory = config.writtenMemory
+                    b.writtenMemoryBudget = wrapped
+                    b.onMemoryGrowRefused = config.onMemoryGrowRefused
+                    b.sharedFuel = config.sharedFuel
+                    b.externImports.putAll(config.externImports)
+                    return module.instantiateForRestore(b.build(), state)
+                }
             }
         }
     }
@@ -784,6 +833,27 @@ class MachineRestoreTest {
             assertEquals(ColdBootCause.NO_MEMORY, finished.outcomes.single().third)
             m.close()
             total.releaseBytes(filler)
+        }
+    }
+
+    @Test
+    fun `区画の表の増えた分を断られてインスタンスを作り直せなければNO_MEMORY`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val runtime = TableRefusingRestoreRuntime(EndiveRuntime())
+        Harness(execRuntime = runtime, moduleStore = MemoryModuleStore()).use { h ->
+            val saved = saveWaitingPrompt(h, store, TestMemoryFileSystem())
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val finished = Finished()
+            assertTrue(m.restore(request(saved, store, finished)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            assertTrue(runtime.refused, "表の増えた分の確保を断っていない（保存したページ数が最初のページ数と同じ）")
+            assertEquals(RestoreOutcome.COLD_BOOT, finished.outcomes.single().second)
+            assertEquals(ColdBootCause.NO_MEMORY, finished.outcomes.single().third)
+            m.close()
         }
     }
 

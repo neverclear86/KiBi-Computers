@@ -50,7 +50,7 @@ public fun interface KeyboardListener {
      * [event] が届いた。
      *
      * @param typist 打ったプレイヤー（入力のセッション [KeyboardSession] を開いた人）の UUID。
-     *   プロセスに渡すかどうかは ABI の論点なので、#63・#326 で決める
+     *   プロセスには渡さない（キーのイベントに載せない。#326、ADR 0326）
      */
     public fun onKeyboardEvent(typist: UUID, event: KeyboardEvent)
 }

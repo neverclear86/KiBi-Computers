@@ -36,6 +36,12 @@ import run.endive.runtime.Memory as EndiveMemory
  *
  * 区画の表は `pages()` に合わせて伸ばす（上限の分を先に作らない）。共有メモリ（threads）には使わない。
  *
+ * 区画の表そのもの（#753）: 1 ページあたり [TABLE_BYTES_PER_PAGE] を、作るとき（最初のページ数の分）・`memory.grow`（増やした分。端の区画と
+ * 1 回で数える）・[restorePages]（増やした分）に [budget] で数える。数えた分は [tableBytes] に持ち、[releaseAll] で区画の分と一緒に返す。
+ * 最初の分を数えられなければ、作らずに [PageTableRefused] を投げる。宣言しただけの大きさの区画（4 KiB）は今までどおり数えない
+ * （表は区画の 1/512 なので、小さい RAM でも起動を妨げない）。数えないもの: [parked]（保存の待機点で作るので断れない。保存できるのは p1 だけ）と、
+ * grow のときに古い表と新しい表が一瞬並ぶ分（一時的なもの）
+ *
  * 変わった区画の追跡（#83、ADR 0083）: [parkWritten] は、書き換えた区画を同じ配列を指す読み取り専用の見え方に差し替え、
  * 元の書ける区画を [parked] に置く。次に書いたときの例外で [parked] から戻す（数え直さない・写さない）。なので
  * 「書ける区画 = 最後の [parkWritten] から変わった区画」「[parked] にある区画 = その時と同じ区画」になる。
@@ -50,6 +56,19 @@ internal class WrittenPagesMemory(
     }
 
     private val maxPages: Int = minOf(limits.maximumPages(), EndiveMemory.RUNTIME_MAX_PAGES)
+
+    /** RAM として数えた区画の表のバイト数（#753。[countedBytes] には入れない） */
+    @Volatile
+    var tableBytes: Long = 0
+        private set
+
+    init {
+        val initialTable = tableBytesOf(limits.initialPages())
+        if (budget != null && initialTable > 0) {
+            if (!budget.tryReserveBytes(initialTable)) throw PageTableRefused(limits.initialPages())
+            tableBytes = initialTable
+        }
+    }
 
     /** 4 KiB の区画の表。範囲内でまだ書いていない区画は [ZERO_CHUNK]、範囲外は表の外 */
     @Volatile
@@ -99,7 +118,10 @@ internal class WrittenPagesMemory(
         val headChunk = prev * CHUNKS_PER_PAGE
         val tailChunk = next * CHUNKS_PER_PAGE - 1
         val edges = if (headChunk == tailChunk) 1 else 2
-        if (!released && budget != null && !budget.tryReserveBytes(edges.toLong() * CHUNK_SIZE)) {
+        // 区画の表の増えた分も、端の区画と 1 回で数える（片方だけ数えた状態を作らない。#753）
+        val growTable = tableBytesOf(size)
+        val counting = !released && budget != null
+        if (counting && !budget!!.tryReserveBytes(edges.toLong() * CHUNK_SIZE + growTable)) {
             onGrowRefused?.run()
             return -1
         }
@@ -110,6 +132,7 @@ internal class WrittenPagesMemory(
         fresh[headChunk] = newChunk()
         fresh[tailChunk] = newChunk()
         if (!released) writtenChunks += edges
+        if (counting) tableBytes += growTable
         growParked(fresh.size)
         chunks = fresh
         nPages = next
@@ -322,12 +345,17 @@ internal class WrittenPagesMemory(
 
     /**
      * 大きさを [pages] に戻す（#82。保存した状態からインスタンスを作り直すとき）。`memory.grow` と違い、端の区画を数えない
-     * （区画は [restoreChunk] で1つずつ数える）。縮められない・上限を超えるなら `false`
+     * （区画は [restoreChunk] で1つずつ数える）。区画の表の増えた分は数える（#753。生きている間の勘定と合わせる）。
+     * 縮められない・上限を超える・表の分を断られたら `false`
      */
     @Synchronized
     fun restorePages(pages: Int): Boolean {
         if (pages < nPages || pages > maximumPages()) return false
         if (pages == nPages) return true
+        val growTable = tableBytesOf(pages - nPages)
+        val counting = !released && budget != null
+        if (counting && !budget!!.tryReserveBytes(growTable)) return false
+        if (counting) tableBytes += growTable
         val old = chunks
         val fresh = arrayOfNulls<ByteBuffer>(pages * CHUNKS_PER_PAGE)
         System.arraycopy(old, 0, fresh, 0, old.size)
@@ -366,7 +394,7 @@ internal class WrittenPagesMemory(
     fun releaseAll() {
         if (released) return
         released = true
-        val bytes = countedBytes
+        val bytes = countedBytes + tableBytes
         if (bytes > 0 && budget != null) budget.releaseBytes(bytes)
     }
 
@@ -634,6 +662,15 @@ internal class WrittenPagesMemory(
         private const val CHUNK_MASK = CHUNK_SIZE - 1
         private const val CHUNKS_PER_PAGE = EndiveMemory.PAGE_SIZE / CHUNK_SIZE
 
+        /**
+         * 区画の表の 1 ページあたりのバイト数（#753。仮の値。確定は #251）。区画 16 個 × 参照 8 バイト（圧縮しない参照。
+         * テーブルの要素の見積もり `tableElementBytes`（#361）と同じ前提）
+         */
+        const val TABLE_BYTES_PER_PAGE: Long = CHUNKS_PER_PAGE * 8L
+
+        /** [pages] ページ分の区画の表のバイト数 */
+        fun tableBytesOf(pages: Int): Long = pages.toLong() * TABLE_BYTES_PER_PAGE
+
         /** すべての [WrittenPagesMemory] で共有する、読み取り専用のゼロの区画。位置を動かす操作は使わない */
         private val ZERO_CHUNK: ByteBuffer = ByteBuffer.allocate(CHUNK_SIZE).asReadOnlyBuffer()
 
@@ -651,6 +688,9 @@ internal class WrittenPagesMemory(
         }
     }
 }
+
+/** 区画の表の最初の分（[pages] ページ）を RAM に数えられなかった（#753）。インスタンスを作れない */
+internal class PageTableRefused(pages: Int) : RuntimeException("線形メモリの最初の $pages ページの区画の表を確保できない（RAM が足りない）")
 
 /**
  * 書き換えた区画が RAM の上限を超えた（#407）。Endive のトラップとしてプロセスを止める。

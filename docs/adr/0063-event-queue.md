@@ -116,6 +116,7 @@ footprint = EVENT_OVERHEAD_BYTES(96)                 KernelEvent 自体、値の
   - 追記（#427）: 画面の大きさは `tty-resize`（出したもの `console`、値は列・行・世代の s64。ADR 0427）
   - 追記（#87）: 保存から戻ったことは `restored`（出したもの `""`、値は実時間の飛び ns・ゲーム内時間の飛び tick の s64。成功した復元のたびに1件。ADR 0087）
   - 追記（#67）: デバイスの接続・切断は `device-attached`・`device-detached`（出したもの `""`、値は address・種類の text。成功した接続・切断ごとに1件。ADR 0067）
+  - 追記（#326）: キーの押下・離しは `key-pressed`・`key-released`（出したものはキーボードの address、値はキー名の text・修飾キーの s64・押下だけ繰り返しの bool。ADR 0326）
 - 保存のバイト形式: #81・#82
 - 他 MOD 向けの公開 API: #65
 - 燃料の費用: #47・#251

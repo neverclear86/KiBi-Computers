@@ -30,7 +30,8 @@ import java.util.UUID
  * （[relayable]）、そのケースのマシンにつながり、相手はそのマシンのキーボードのデバイス（[KeyboardDevice]）になる。
  * つながるマシンは1台だけで、ほかのケースは、手放されるまでつながない（他人のキーボードの隣に置いたケースに、打ったものが
  * 漏れないように。#360）。マシンから外れるときは、開いている入力のセッションを閉じる（押したままのキーの離しは、外れる前の
- * マシンに届く。持ち主が替わった後に、打ったものが別のマシンに届かないように）。
+ * マシンに届く。持ち主が替わった後に、打ったものが別のマシンに届かないように）。ブロックが壊れたときも、[setRemoved] が
+ * `isRemoved` を立てる前にセッションを閉じるので、離しは `device-detached` の前に届く（#326、ADR 0326）。
  *
  * つながる相手は1つだけ（#360）。先に [claim] した相手が、[release] するまで持つ。2つ目からは断る。
  *
@@ -111,7 +112,7 @@ class KeyboardBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     override fun onDisconnected(device: Device, removed: Boolean) {
-        // 押したままのキーの離しを、外す前のマシンに届けてから外す
+        // 押したままのキーの離しを、外す前のマシンに届けてから外す（ADR 0326）
         KeyboardSessions.closeFor(this)
         if ((owner as? DeviceInput)?.device === device) owner = null
     }
@@ -148,6 +149,9 @@ class KeyboardBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     override fun setRemoved() {
+        // 壊れた・運ばれたときも、押したままのキーの離しを、外す前の相手に届ける（#326、ADR 0326）。
+        // `super.setRemoved` が `isRemoved` を立てると [KeyboardSessions] は配らないので、その前に閉じる
+        if (level?.isClientSide == false) KeyboardSessions.closeFor(this)
         super.setRemoved()
         unregister()
         owner = null
