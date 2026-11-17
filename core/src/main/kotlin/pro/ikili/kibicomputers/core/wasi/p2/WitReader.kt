@@ -29,9 +29,17 @@ internal class WitInterface(
  * world は読み飛ばす。`include`・入れ子の package・`@since` などの注釈・`own<…>` 以外の書き方の省略形は扱わない
  * （書き出す形に出てこない）。読めないものは [IllegalArgumentException]（ホストの作りの誤り。テストが落とす）。
  *
- * resource には、出てきた順に [firstResourceId] から番号を振る（`HostResource.id`。ホスト全体で一意）
+ * resource には、出てきた順に [firstResourceId] から番号を振る（`HostResource.id`。ホスト全体で一意）。
+ *
+ * [imported] は、[text] の外で読み済みのインターフェース（`ns:pkg/iface@版` → 中身。#685）。[text] にない `use` の先はここから引き、
+ * 型と resource の識別子をそのまま使う（`kibi:*` の WIT が `use wasi:io/poll@0.2.12.{pollable}` するとき、`pollable` を
+ * `WasiP2Host` と同じ識別子にする。番号を振り直すと、`wasi:io/poll.poll` に並べて渡せない）。版は完全一致で引く
  */
-internal class WitReader private constructor(private val text: String, firstResourceId: Int) {
+internal class WitReader private constructor(
+    private val text: String,
+    firstResourceId: Int,
+    private val imported: Map<String, WitInterface>,
+) {
     private var pos = 0
     private var nextResource = firstResourceId
 
@@ -51,9 +59,13 @@ internal class WitReader private constructor(private val text: String, firstReso
     private val scopes = HashMap<String, Map<String, Named>>()
 
     companion object {
-        /** [text] を読み、インターフェースの表と、resource の識別子 → 名前の表を返す */
-        fun read(text: String, firstResourceId: Int): Pair<Map<String, WitInterface>, Map<Int, String>> {
-            val r = WitReader(text, firstResourceId)
+        /** [text] を読み、インターフェースの表と、resource の識別子 → 名前の表（[text] で定義したものだけ）を返す */
+        fun read(
+            text: String,
+            firstResourceId: Int,
+            imported: Map<String, WitInterface> = emptyMap(),
+        ): Pair<Map<String, WitInterface>, Map<Int, String>> {
+            val r = WitReader(text, firstResourceId, imported)
             r.readAll()
             return r.interfaces to r.resourceNames
         }
@@ -176,6 +188,7 @@ internal class WitReader private constructor(private val text: String, firstReso
         val full = "$ns:$pkg/$iface"
         val scope = LinkedHashMap<String, Named>()
         val functions = LinkedHashMap<String, CanonFunction>()
+        val deferred = ArrayList<() -> Unit>()
         // resource は定義より前のメソッドの型からも指されるので、先に番号を振っておく
         val declared = predeclareResources(full)
         for ((n, id) in declared) scope[n] = Named.Resource(id)
@@ -184,8 +197,8 @@ internal class WitReader private constructor(private val text: String, firstReso
             when {
                 peekWord("use") -> {
                     ident()
-                    val path = usePath(ns, pkg)
-                    val from = scopes[path] ?: fail("use の先 $path がまだない")
+                    val (path, version) = usePath(ns, pkg)
+                    val from = scopes[path] ?: importedScope(path, version) ?: fail("use の先 $path がまだない")
                     expect(".")
                     expect("{")
                     do {
@@ -246,8 +259,11 @@ internal class WitReader private constructor(private val text: String, firstReso
                     val id = declared.getValue(n)
                     scope[n] = Named.Resource(id)
                     if (!accept(";")) {
-                        expect("{")
-                        while (!accept("}")) readResourceItem(scope, n, id, functions)
+                        // 中身は後で読む（メソッドの型が、後で定義する record などを指すことがある。wasm-tools は resource を先に書く）
+                        skipSpace()
+                        val at = pos
+                        deferred += { pos = at; expect("{"); while (!accept("}")) readResourceItem(scope, n, id, functions) }
+                        skipBlock()
                     }
                 }
                 else -> {
@@ -255,11 +271,17 @@ internal class WitReader private constructor(private val text: String, firstReso
                     expect(":")
                     if (!peekWord("func")) fail("$n: func がない")
                     ident()
-                    functions[n] = func(scope, null)
-                    expect(";")
+                    skipSpace()
+                    val at = pos
+                    deferred += { pos = at; functions[n] = func(scope, null); expect(";") }
+                    pos = text.indexOf(';', pos).also { if (it < 0) fail("; がない") } + 1
                 }
             }
         }
+        // 関数の型は、インターフェースの型をすべて読んでから読む（定義より前の型を指せるように）
+        val end = pos
+        for (d in deferred) d()
+        pos = end
         scopes[full] = scope
         val resources = LinkedHashMap<String, Int>()
         val types = LinkedHashMap<String, CanonType>()
@@ -315,15 +337,24 @@ internal class WitReader private constructor(private val text: String, firstReso
         expect(";")
     }
 
-    /** `use` の先の名前（同じパッケージのインターフェースか、`ns:pkg/iface@版`）。版は見ない */
-    private fun usePath(ns: String, pkg: String): String {
+    /** `use` の先の名前（同じパッケージのインターフェースか、`ns:pkg/iface@版`）と版（なければ `null`）。[text] の中の先は版を見ない */
+    private fun usePath(ns: String, pkg: String): Pair<String, String?> {
         val first = ident()
-        if (!accept(":")) return "$ns:$pkg/$first"
+        if (!accept(":")) return "$ns:$pkg/$first" to null
         val p = ident()
         expect("/")
         val i = ident()
-        if (accept("@")) version()
-        return "$first:$p/$i"
+        val v = if (accept("@")) version() else null
+        return "$first:$p/$i" to v
+    }
+
+    /** 読み済みの外のインターフェース（[imported]）[path]@[version] の名前の表。なければ `null` */
+    private fun importedScope(path: String, version: String?): Map<String, Named>? {
+        val w = imported[if (version == null) path else "$path@$version"] ?: return null
+        val out = LinkedHashMap<String, Named>()
+        for ((n, id) in w.resources) out[n] = Named.Resource(id)
+        for ((n, t) in w.types) out[n] = Named.Value(t)
+        return out
     }
 
     /** `func` の後ろの `(引数) [-> 結果]`。[self] はメソッドの最初の引数 */

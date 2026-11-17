@@ -5,7 +5,7 @@ world imports {
     import mounts;
 }
 
-/// p2 のゲスト向け（仮置き。ADR 0056）
+/// p2 のゲスト向け（#685 で確定。ADR 0685・ADR 0056）
 world imports-p2 {
     import mounts;
 }

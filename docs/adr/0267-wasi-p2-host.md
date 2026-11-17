@@ -4,6 +4,7 @@
 - Issue: #267（Epic #259）。前提は ADR 0262（読み込みと import の確認）、ADR 0263（リンク）、ADR 0264（Canonical ABI）、ADR 0265（resource のハンドル表）、ADR 0043（カーネル。`BLOCKING`）、ADR 0332（p1 の cwd）
 - 後続: #164（`wasi:sockets` の実物）、#757（スレッドを持たない待ち）、#268（p3）、#269（コンポーネントのプロセスの保存）、#687（コンポーネントの exec）、#685（`kibi:*` の p2）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
+- 追記（#685）: `kibi:*` の p2 は `KibiP2Host`（ADR 0685）。`WitReader` は外で読んだ interface（`wasi:*`）を `use` で引けるようにし、関数の型をインターフェースの型を読み終えてから読むようにした
 
 ## 背景
 

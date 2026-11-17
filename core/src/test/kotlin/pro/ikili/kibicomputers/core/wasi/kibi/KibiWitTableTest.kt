@@ -99,7 +99,7 @@ class KibiWitTableTest {
             assertFalse(useLines(witText("kibi-io/$f")).any { "wasi:" in it }, "$f が wasi:* を使っている")
         }
         val uses = useLines(witText("kibi-io/pipe-streams.wit")).filter { "wasi:" in it }
-        assertEquals(listOf("use wasi:io/streams@0.2.3.{input-stream, output-stream};"), uses)
+        assertEquals(listOf("use wasi:io/streams@0.2.12.{input-stream, output-stream};"), uses)
     }
 
     @Test
@@ -164,7 +164,7 @@ class KibiWitTableTest {
         assertFalse(useLines(witText("kibi-computer/clock.wit")).any { "wasi:" in it })
         for (f in listOf("timers-poll.wit", "events-poll.wit")) {
             val uses = useLines(witText("kibi-kernel/$f")).filter { "wasi:" in it }
-            assertEquals(listOf("use wasi:io/poll@0.2.3.{pollable};"), uses, f)
+            assertEquals(listOf("use wasi:io/poll@0.2.12.{pollable};"), uses, f)
         }
         // pipe-streams（ADR 0075）と同じ wasi:io の版（同じゲストの中で pollable の型をそろえる。ADR 0426）
         val ioVersion = Regex("""wasi:io/[a-z-]+@([0-9]+\.[0-9]+\.[0-9]+)""")
@@ -214,9 +214,9 @@ class KibiWitTableTest {
         assertFalse(useLines(witText("kibi-process/process.wit")).any { "wasi:" in it }, "process.wit が wasi:* を使っている")
         assertEquals(
             listOf(
-                "use wasi:io/poll@0.2.3.{pollable};",
-                "use wasi:io/streams@0.2.3.{input-stream, output-stream};",
-                "use wasi:filesystem/types@0.2.3.{descriptor};",
+                "use wasi:io/poll@0.2.12.{pollable};",
+                "use wasi:io/streams@0.2.12.{input-stream, output-stream};",
+                "use wasi:filesystem/types@0.2.12.{descriptor};",
             ),
             useLines(witText("kibi-process/process-poll.wit")).filter { "wasi:" in it },
         )

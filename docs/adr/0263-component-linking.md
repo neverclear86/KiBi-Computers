@@ -4,6 +4,7 @@
 - Issue: #263（Epic #259）。前提は ADR 0260（Component Model は `core` に自前で実装）、ADR 0262（コンポーネントの読み込みと検証）、ADR 0264（Canonical ABI の lift・lower）、ADR 0028（燃料）
 - 後続: #265（resource のハンドル表）、#266（非同期・stream・future）、#267（`wasi:*` のホストのインターフェース）、#685（`kibi:*` の p2）、#270（インスタンスをまたぐ燃料の扱いの残り）、#269（コンポーネントのプロセスの保存）、#251（仮の値の確定）、コンポーネントの exec（#687）
 - 番号は Issue 番号にそろえている
+- 追記（#685）: `KernelDrivers.COMPONENT_HOST` は合成ホスト `KernelComponentHost`（`wasi:*` → `WasiP2Host`、`kibi:*` → `KibiP2Host`）になった（ADR 0685）
 
 ## 背景
 

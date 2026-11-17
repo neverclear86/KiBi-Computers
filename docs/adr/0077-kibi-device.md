@@ -3,6 +3,7 @@
 - 状態: 採用
 - Issue: #77（task）。前提: ADR 0065（デバイスのモデルと WIT `kibi:device@0.1.0`）、0066（接続数の上限とハンドルの呼び出し。デバイスは1回だけ引く）、0054（`/dev/device`）、0073（`kibi:*` の WIT と p1 の import の導き方）、0264（Canonical ABI）、0329（待機点への変換）
 - 後続: #108（標準 OS のコマンドと Zig の束縛。ADR 0067 の接続・切断のイベントを受けるのもここ）、#94（Lua の `device`）、#116（SDK の束縛）、#685・#266（p2・p3 の層）、#251（仮の値の確定）
+- 追記（#685）: `bus-poll` の仮置きを確定した（`wasi:io/poll@0.2.12`。ADR 0685）。`bus-async`（p3）は仮置きのまま
 
 ## 決めたこと（要約）
 
@@ -103,7 +104,7 @@
 
 `core/src/main/wit/kibi-device/`:
 
-- `bus-poll.wit`（p2）: `subscribe: func(call: borrow<pending-call>) -> pollable`（結果が出ると ready。p1 の `FD_READ` と同じ条件）。`wasi:io/poll@0.2.3`
+- `bus-poll.wit`（p2）: `subscribe: func(call: borrow<pending-call>) -> pollable`（結果が出ると ready。p1 の `FD_READ` と同じ条件）。`wasi:io/poll@0.2.12`
 - `bus-async.wit`（p3。`wasi:*` に依存しない）: `invoke: async func(...)`（メインスレッドのメソッドも待てる）と、`start` で積んだ呼び出しを待つ `wait: async func(call: borrow<pending-call>) -> result<list<value>, call-error>`（p3 には pollable がないため。`take` と同じく閉じない）
 - `world.wit`: `imports-p2`（`include imports` ＋ `bus-poll`）・`imports-p3`（`include imports` ＋ `bus-async`）
 

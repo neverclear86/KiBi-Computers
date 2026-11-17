@@ -4,6 +4,7 @@
 - Issue: #426（task）。前提: ADR 0063（イベントキュー）、0064（タイマーと時計）、0072（p1 の `poll_oneoff`）、0073（`kibi:*` の WIT と p1 の import の導き方）、0075（`kibi:io`。`wasi:io` の版）
 - 後続: #439（接続層からゲーム内時間を渡す）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#265（Component Model の resource のハンドル）、#267（対象の `wasi:*` の版）、#116（SDK の束縛）、#94・#95（Lua の `os.sleep`・`event`）、#251（仮の値の確定）
 - ABI の選択（`set-after`・`set-at` の2関数、ナノ秒の `u64`、`interval = 0` で1回だけ、`create` の引数、2^63 以上の頭打ち、`uptime-ticks`・`world-ticks`、sleep の import を足さない、p2/p3 の待ち方は別 interface、p3 は `async func`）は、#426 のプランへのオーナーの回答（論点1〜7、A・B）で決めた。p2/p3 の WIT は仮置きで、細部はエージェントに任された
+- 追記（#685）: `timers-poll`・`events-poll` の仮置きを確定した（`wasi:io/poll@0.2.12`。ADR 0685）。`*-async`（p3）は仮置きのまま
 
 ## 決めたこと（要約）
 
@@ -108,13 +109,13 @@ interface clock {
 ```wit
 interface timers-poll {        // p2
     use timers.{timer};
-    use wasi:io/poll@0.2.3.{pollable};
+    use wasi:io/poll@0.2.12.{pollable};
     subscribe: func(t: borrow<timer>) -> pollable;
 }
 
 interface events-poll {        // p2
     use events.{event-queue};
-    use wasi:io/poll@0.2.3.{pollable};
+    use wasi:io/poll@0.2.12.{pollable};
     subscribe: func(q: borrow<event-queue>) -> pollable;
 }
 

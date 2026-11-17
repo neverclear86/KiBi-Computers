@@ -7,7 +7,7 @@ world imports {
     import bus;
 }
 
-/// p2 のゲスト向け（仮置き。ADR 0077）
+/// p2 のゲスト向け（#685 で確定。ADR 0685・ADR 0077）
 world imports-p2 {
     include imports;
     import bus-poll;

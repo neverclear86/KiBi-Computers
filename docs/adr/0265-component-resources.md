@@ -4,6 +4,7 @@
 - Issue: #265（Epic #259）。前提は ADR 0260（Component Model は `core` に自前で実装。ホスト側の状態は保存できる形で持つ）、ADR 0263（リンク）、ADR 0264（Canonical ABI。仕様の版）、ADR 0043（カーネル全体）、ADR 0075（p2/p3 のハンドルはカーネルの fd 表に入れない）
 - 後続: #266（非同期。Waitable などを同じハンドル表に足す）、#267（`wasi:*` のホストの resource）、#685（`kibi:*` の p2 の resource）、#269（コンポーネントのプロセスの保存）、#251（仮の値の確定）
 - 番号は Issue 番号にそろえている
+- 追記（#685）: `kibi:*` の p2 の resource（`event-queue`・`timer`・`process`・`device`・`pending-call`）は、`HostResourceTable` の `KernelEntry` としてカーネルのオブジェクトに結び付けた（ADR 0685）。保存は #269
 
 ## 背景
 

@@ -7,7 +7,7 @@ world imports {
     import tty;
 }
 
-/// p2 のゲスト向け（仮置き。ADR 0075・0427）
+/// p2 のゲスト向け（#685 で確定。ADR 0685・ADR 0075・0427）
 world imports-p2 {
     import pipe-streams;
     import tty;

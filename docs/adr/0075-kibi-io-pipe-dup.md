@@ -4,6 +4,7 @@
 - Issue: #75（task）。前提: ADR 0058（fd 表）、0059（パイプ）、0070（p1 の fd_*）、0072（p1 の `poll_oneoff`）、0073（`kibi:*` の WIT と p1 の import の導き方）
 - 後続: #427（`kibi:io/tty`）、#74（`spawn-options.fds` で子に渡す）、#101（シェルの `|`）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#116（SDK の `dup`・`dup2`・`pipe`）、#251（仮の値の確定）
 - ABI の選択（p1 だけの `fd`・`pipe`、p2/p3 は仮置き、複製は p1 だけ など）は、#75 のプランへのオーナーの回答（Q1〜Q8）で決めた
+- 追記（#685）: `pipe-streams` の仮置きを確定した（`wasi:io/streams@0.2.12`。ADR 0685）。`pipe-async`（p3）は仮置きのまま
 
 ## 決めたこと（要約）
 
@@ -31,7 +32,7 @@ interface pipe {              // p1 だけ
 
 interface pipe-streams {      // p2 だけ（仮置き）
     use kibi:kernel/types@0.1.0.{error-code};
-    use wasi:io/streams@0.2.3.{input-stream, output-stream};
+    use wasi:io/streams@0.2.12.{input-stream, output-stream};
     create: func() -> result<tuple<input-stream, output-stream>, error-code>;
 }
 

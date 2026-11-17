@@ -4,6 +4,7 @@
 - Issue: #74（task）。前提: ADR 0045（プロセスの生成・引数・fd の渡し方）、0046（終了待ち・kill・親なしのゾンビ）、0073（`kibi:*` の WIT と p1 の import の導き方）、0329（待機点への変換）、0332（p1 の cwd）。#358（読み込みをスレッドなしで待つ `beginExec`/`finishExec`）
 - 後続: #101（シェル）、#116（SDK の `posix_spawn`・`waitpid`・`kill`・`chdir` 風の束縛）、#262〜#268（p2・p3 の層）、#251（仮の値の確定）
 - ABI の選択（Q1〜Q9）は、#74 のプランへのオーナーの回答（すべて A。p2/p3 の WIT は仮置き）で決めた
+- 追記（#685）: `process-poll` の仮置きを確定した（関数・型はそのまま、`wasi:*` は `@0.2.12`）。`spawn-with-handles` の規則と p2 での `fds` の扱いは ADR 0685
 
 ## 決めたこと（要約）
 
@@ -21,7 +22,7 @@
 `core/src/main/wit/kibi-process/`:
 
 - `process.wit`: `enum signal { interrupt, quit, terminate, kill }`、`variant exit-status`、`variant fd-source { parent(u32), closed }`、`record fd-assign { fd, source }`、`record spawn-options { args, env: option<list<tuple<string, string>>>, cwd: option<string>, fds }`、`resource process { spawn: static func, pid, status, kill }`、`kill-pid`・`self-pid`・`parent-pid`・`set-signal-ignored`・`get-cwd`・`set-cwd`。`wasi:*` を参照しない
-- `process-poll.wit`（p2、仮置き）: `subscribe(borrow<process>) -> pollable`（刈り取らない）、`spawn-with-handles`（`handle-source` で stream・descriptor・process を渡す）。`wasi:io@0.2.3`・`wasi:filesystem@0.2.3`
+- `process-poll.wit`（p2、仮置き）: `subscribe(borrow<process>) -> pollable`（刈り取らない）、`spawn-with-handles`（`handle-source` で stream・descriptor・process を渡す）。`wasi:io@0.2.12`・`wasi:filesystem@0.2.12`
 - `process-async.wit`（p3、仮置き）: `spawn: async func`（`handle-source` に `stream<u8>`・`capture`）、`wait: async func(borrow<process>) -> exit-status`（親なら刈り取る）。`wasi:filesystem@0.3.0`
 - `world.wit`: `imports`（`process` だけ。`wasi:*` をたどらない）、`imports-p2`（＋`process-poll`）、`imports-p3`（＋`process-async`）
 

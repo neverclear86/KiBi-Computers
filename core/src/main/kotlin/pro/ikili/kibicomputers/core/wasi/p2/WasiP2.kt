@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.process.HostResourceTable
 import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
@@ -52,7 +53,7 @@ internal object WasiP2Versions {
  * - 燃料は、呼び出しごとに p1 と同じ [WasiP1Fd.CALL_FUEL]、大きな量には [WasiP1Fd.BYTES_PER_FUEL] ごとに 1（仮。確定は #251）
  */
 internal object WasiP2Host : ComponentHost {
-    private class Built(val interfaces: Map<String, HostInterface>, val wit: Map<String, WitInterface>)
+    private class Built(val interfaces: Map<String, HostInterface>, val wit: Map<String, WitInterface>, val resources: Map<Int, HostResource>)
 
     private val built: Built by lazy { build() }
 
@@ -65,10 +66,13 @@ internal object WasiP2Host : ComponentHost {
     /** 版を外した名前 → 読んだ WIT */
     val wit: Map<String, WitInterface> get() = built.wit
 
+    /** 識別子 → ホストの resource（`kibi:*` のホストが `use` した `pollable` などを同じものにする。#685） */
+    val resources: Map<Int, HostResource> get() = built.resources
+
     override fun interfaceOf(name: String): HostInterface? = WasiP2Versions.key(name)?.let { built.interfaces[it] }
 
     /** 1 つの dtor（どの resource も、表から外して参照を返す。子の残る親はトラップ） */
-    private val DROP = HostResourceDrop { call, rep -> P2.drop(P2.ctx(call), rep) }
+    val DROP: HostResourceDrop = HostResourceDrop { call, rep -> P2.drop(P2.ctx(call), rep) }
 
     private fun build(): Built {
         val (wit, names) = WitReader.read(WasiP2Wit.TEXT, HostResourceIds.WASI_FIRST)
@@ -92,7 +96,7 @@ internal object WasiP2Host : ComponentHost {
             out[key] = HostInterface("$key@${WasiP2Wit.BASE_VERSION}", functions, w.resources.mapValues { resources.getValue(it.value) })
         }
         check(bodies.isEmpty()) { "WIT にないインターフェースの実装: ${bodies.keys}" }
-        return Built(out, wit)
+        return Built(out, wit, resources)
     }
 }
 
@@ -162,17 +166,24 @@ internal object P2 {
 
     /**
      * rep [rep] の resource を表から外し、持っている参照を返す（dtor・own の引数を受けたとき）。子の残る親はトラップ
-     * （仕様は「親を先に drop したらトラップしてよい」。wasmtime と同じ。ADR 0267）。pollable なら親の子の数を減らす
+     * （仕様は「親を先に drop したらトラップしてよい」。wasmtime と同じ。ADR 0267）。pollable なら親の子の数を減らす。
+     * 子のハンドル（`ProcessObject`）なら、fd を閉じるときと同じく、外した後・参照を返す前に `WakeSink.processHandleClosed` で知らせる
+     * （最後のハンドルなら子を付け替える。#685。`FdTable.releaseRemoved` と同じ順）
      */
     fun drop(ctx: ProcessContext, rep: Int) {
         ctx.withKernelLock {
-            val table = tableLocked(ctx)
+            val process = ctx.kernel.processes[ctx.pid] ?: throw ProcessKilledException()
+            val table = process.hostResources
             val e = table[rep] as? P2Entry ?: trap("ホストの resource $rep がない")
             if (e.children > 0) trap("${e.label} に子の pollable が残っている")
             table.remove(rep)
             if (e is PollableEntry && e.parent != 0) (table[e.parent] as? P2Entry)?.let { it.children-- }
             val id = e.objectId
-            if (id != 0 && ctx.kernel.objects[id] != null) ctx.kernel.objects.release(id, ctx.wakeSink)
+            val obj = if (id != 0) ctx.kernel.objects[id] else null
+            if (obj != null) {
+                if (obj is ProcessObject) ctx.wakeSink.processHandleClosed(process, obj)
+                ctx.kernel.objects.release(id, ctx.wakeSink)
+            }
         }
     }
 
