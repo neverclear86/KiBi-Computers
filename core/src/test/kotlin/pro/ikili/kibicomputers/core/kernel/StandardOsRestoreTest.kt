@@ -234,15 +234,13 @@ class StandardOsRestoreTest {
     }
 
     /**
-     * `sh` がキー（`ESC` など）の途中まで読んで続きを待っている間に保存して戻す。戻した直後（キーを打つ前）に行を描き直し、
-     * 続きの入力で、そのキーとして動く（#636）。途中までの入力は TTY から読み切られている（`ESC` が TTY に残っていると、キーの境目の
-     * 待ちで描き直すので、続きの待ちの中で受けられているかを確かめられない）
+     * `sh` に、続きのないエスケープシーケンス（Esc のキーだけ、Alt+[ など）を送ってから保存して戻す。`sh` は続きを待たずに
+     * そこでキーを区切り（#769）、キーの境目の待ちに戻っているので、戻した直後（キーを打つ前）に行を描き直し、次のキーも
+     * 捨てずに効く（#636 では続きを待っている間の復元を確かめていたが、#769 の後は続きを待たない）
      *
-     * @param prefix 保存前に打つエスケープシーケンスの途中まで
-     * @param rest 戻した後に打つ続き
-     * @param cursorAfter 続きを打った後のカーソルの列（`$ echo hi` は 9 列。左 1 つで 8、単語の左で 7）
+     * @param prefix 保存前に、1 回の入力で送るエスケープシーケンスの途中まで
      */
-    private fun restoredShellRedrawsInsideEscape(prefix: String, rest: String, cursorAfter: Int) = timeout(limit) {
+    private fun restoredShellRedrawsAfterEscape(prefix: String) = timeout(limit) {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val (saved, pid) = saveRunning(h, store, "sh") { m, host, p ->
@@ -252,9 +250,10 @@ class StandardOsRestoreTest {
                 assertEquals("$ echo hi", host.row(0))
                 m.offerConsoleInput(prefix.toByteArray())
                 settle(h, m, host, p)
-                // 途中までを読み切って、続きを待っている（読み切っていないなら、キーの境目の待ちで描き直せてしまう）
+                // 読み切って区切り、行は変わっていない
                 val pendingInput = m.lock.withLockValue { m.consoleTtyLocked().inputAvailable }
                 assertEquals(0, pendingInput, "途中までの入力を読み切っていない")
+                assertEquals("$ echo hi", host.row(0))
             }
             var stateInListener: ProcessState? = null
             val (m, host) = restore(h, store, saved, pid) { state, _, _ -> stateInListener = state }
@@ -267,29 +266,29 @@ class StandardOsRestoreTest {
             settle(h, m, host, pid)
             assertEquals("$ echo hi", host.row(0))
             assertEquals(9, host.terminal.cursorX, "カーソルは入力中の行の後ろ")
-            // 続きを打つと、途中まで読んだ分と合わせて 1 つのキーになる
-            m.offerConsoleInput(rest.toByteArray())
-            eventuallyDescribe(60_000, { "続きが効かない: ${host.screen()}" }) {
+            // 次のキーは、エスケープシーケンスの続きとして捨てられず、それぞれのキーとして効く
+            m.offerConsoleInput("!\r".toByteArray())
+            eventuallyDescribe(60_000, { "次のキーが効かない: ${host.screen()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
-                host.terminal.cursorX == cursorAfter
+                host.row(1) == "hi!" && host.row(2) == "$"
             }
-            assertEquals("$ echo hi", host.row(0))
+            assertEquals("$ echo hi!", host.row(0))
             m.close()
         }
     }
 
     @Test
-    fun `shはESCの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b", "[D", 8)
+    fun `shはEscだけの後で戻っても行を描き直し、次のキーも効く`() = restoredShellRedrawsAfterEscape("\u001b")
 
     @Test
-    fun `shはESCと開き角括弧の後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b[", "D", 8)
+    fun `shは続きのないESCと開き角括弧の後で戻っても行を描き直し、次のキーも効く`() = restoredShellRedrawsAfterEscape("\u001b[")
 
     @Test
-    fun `shはESCと大文字Oの後で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001bO", "D", 8)
+    fun `shは続きのないESCと大文字Oの後で戻っても行を描き直し、次のキーも効く`() = restoredShellRedrawsAfterEscape("\u001bO")
 
     @Test
-    fun `shはCSIのパラメーターの途中で戻っても行を描き直し、続きの入力でキーになる`() = restoredShellRedrawsInsideEscape("\u001b[1;", "5D", 7)
+    fun `shはCSIのパラメーターの途中で区切った後で戻っても行を描き直し、次のキーも効く`() = restoredShellRedrawsAfterEscape("\u001b[1;")
 
     @Test
     fun `nanoは戻ると代替画面に入り直して全体を描き直す`() = timeout(limit) {
