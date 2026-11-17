@@ -39,7 +39,7 @@
 
 ### 修飾キー
 
-`KeyModifiers` の値と同じビット（SHIFT `0x01`・CONTROL `0x02`・ALT `0x04`・SUPER `0x08`・CAPS_LOCK `0x10`・NUM_LOCK `0x20`）。CAPS_LOCK・NUM_LOCK は、位置は決めるが、付くとは約束しない。出す前に `and KeyModifiers.ALL` で知らないビットを落とす（通信から来たものは `KeyboardEventCodec` が断るが、`KeyboardDevice.input` を直接呼ぶ経路にはその確かめがないため）。
+`KeyModifiers` の値と同じビット（SHIFT `0x01`・CONTROL `0x02`・ALT `0x04`・SUPER `0x08`・CAPS_LOCK `0x10`・NUM_LOCK `0x20`）。CAPS_LOCK・NUM_LOCK は、位置は決めるが、付くとは約束しない。修飾キー自身（`left-shift` など）の押下・離しで、自分のビットが付くかどうかも約束しない（クライアントの GLFW の実装が OS ごとに違い、`KeyboardInputScreen.withHeldModifiers` は押した時点の自分を含めないため。デバイスは届いた値をそのまま出す）。出す前に `and KeyModifiers.ALL` で知らないビットを落とす（通信から来たものは `KeyboardEventCodec` が断るが、`KeyboardDevice.input` を直接呼ぶ経路にはその確かめがないため）。
 
 ### 出す場所と条件
 
@@ -55,10 +55,13 @@
   - 入力のセッション（#360）を閉じたとき（GUI を閉じた、離れた、ログアウトした、別のケースにつなぎ替えた）は、押したままのキーの離しを、修飾キー `0` で合成して、外れる前のマシンに届ける（`KeyboardSession.close`）
   - 1つのキーボードを2人が使うと、片方の GUI を閉じたときに、もう片方がまだ押しているキーの離しも届く（`KeyboardSession` ごとに押したままのキーを覚えているため）
   - 別々の GLFW のキーが同じ `unknown` に写るので、`unknown` の押下と離しは対にならない
-- **キーボードのブロックが壊れたときは、合成した離しが届かない。** `KeyboardBlockEntity.setRemoved` は、`isRemoved` を立ててから登録表から外し、`KeyboardSessions.close` は取り除かれたキーボードには配らない。ゲストに見えるのは、離しのないまま来る `device-detached` だけ。チャンクのアンロードは違う。NeoForge の `LevelChunk.clearAllBlockEntities` は、全ブロックエンティティの `onChunkUnloaded` を呼んでから `setRemoved` を呼ぶので、`onChunkUnloaded` の時点では `isRemoved` が立っておらず、離しは外れる前のマシンに届いてから（`unregister` → `MachineWiring.disconnectOne` → `onDisconnected` → `KeyboardSessions.closeFor` と同期で進む）`device-detached` が届く。どちらでも受け手は「そのキーボードの address の `device-detached` を受けたら、そのキーボードのキーをすべて離したとみなす」（離しが先に届いても困らない）。これは回答の「対になっていない離し」「`restored`・`dropped` のとき全部離したとみなす」と同じ方向の約束の追加で、接続層を変えずに済むのでこちらを選んだ（エージェントが決めた）
+- キーボードが外れるとき（ブロックが壊れた、チャンクのアンロード、つなぎ替え）も、押したままのキーの離しは外れる前のマシンに届き、その後に `device-detached` が届く（最初のプランの「ブロックが壊れたときも、外す前に離しが届く」のとおり）
+  - チャンクのアンロード: NeoForge の `LevelChunk.clearAllBlockEntities` は、全ブロックエンティティの `onChunkUnloaded` を呼んでから `setRemoved` を呼ぶ。`onChunkUnloaded` → `unregister` → `MachineWiring.disconnectOne` → `onDisconnected` → `KeyboardSessions.closeFor` と同期で進み、離しを配ってから外す
+  - ブロックが壊れた（運ばれた）: `KeyboardBlockEntity.setRemoved` が、`super.setRemoved` で `isRemoved` を立てる前に `KeyboardSessions.closeFor` を呼ぶ（`KeyboardSessions.close` は取り除かれたキーボードには配らないため）。その後の `unregister` で `device-detached` が出る
+  - 受け手に「`device-detached` を受けたら全部離したとみなす」という約束は足さない（オーナーの回答に含まれていないため）
 - `restored` を受けたとき、`dropped > 0` のときも、全キーを離したものとみなす
 - 知らないキー名・修飾キーのビットは無視する（増えることがある）
-- 他のデバイスも同じ種類名を出せるので、受け手は source で見分ける
+- 他のデバイスも同じ種類名を出せるので、受け手は source の address の種類が `kibicomputers:keyboard` かを `kibi:device` の一覧で照らして見分ける（source だけではキーボードかどうかは分からない）
 
 ### 標準 OS と Lua
 
@@ -82,3 +85,4 @@
 
 - `core` の `KeyboardEventsTest`: バイト列が空の入力（Q・LEFT_SHIFT・CAPS_LOCK・Ctrl+Alt+A・離し）で返り値 0 のままイベントが出ること、F5（返り値 5）・Enter（返り値 1）でもイベントが出ること、文字の入力と貼り付けでは出ないこと、種類で絞ったキューにだけ入ること、外した後は出ないこと、キューがなくても例外にならないこと、知らないビットを落とすこと、セッションを閉じて合成した離しが修飾キー 0 で届くこと、キー名の表
 - GameTest（NeoForge 1.21.1 `StandardOsGameTests.luaReceivesKeyEvents`）: `lua -e` で `os.pullEvent('key-pressed')` を待っている間に `q` を押すと、`kp,q,0,false,true`（キー名・修飾キー・繰り返し・source がキーボードの address と一致するか）が画面に出る。1.20.1 にはまだキーボードがないので、移植は #224 の配下
+- GameTest（NeoForge 1.21.1 `StandardOsGameTests.luaReceivesSyntheticKeyReleases`・`luaReceivesReleasesBeforeDetachWhenKeyboardIsBroken`）: 押したままのキーのある GUI を閉じると `key-released` が届くこと、チャンクのアンロードとブロックを壊したときに、`key-released` が `device-detached` の前に届くこと

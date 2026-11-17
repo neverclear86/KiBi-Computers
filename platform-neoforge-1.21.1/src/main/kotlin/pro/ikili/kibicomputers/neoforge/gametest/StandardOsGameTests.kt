@@ -438,11 +438,12 @@ object StandardOsGameTests {
     }
 
     /**
-     * キーボードのブロックを壊したとき（#326、ADR 0326）: 押したままのキーの離しは届かず、`device-detached` だけが届く
+     * キーボードのブロックを壊したとき（#326、ADR 0326）: 押したままのキーの離しが、`device-detached` の前に届く
+     * （`setRemoved` が `isRemoved` を立てる前にセッションを閉じる）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
-    fun luaReceivesOnlyDetachWhenKeyboardIsBroken(helper: GameTestHelper) {
+    fun luaReceivesReleasesBeforeDetachWhenKeyboardIsBroken(helper: GameTestHelper) {
         val (case, screen, keyboard) = placeComputer(helper)
         val player = helper.makeMockServerPlayerInLevel()
         var step = 0
@@ -469,8 +470,11 @@ object StandardOsGameTests {
                     helper.fail("broke the keyboard")
                 }
             }
-            helper.assertTrue(text.any { it == "ev,detached" }, "breaking the keyboard should detach it: $text")
-            helper.assertTrue(text.none { it == "ev,key-released,q" }, "no release should arrive for a broken keyboard: $text")
+            val released = text.indexOf("ev,key-released,q")
+            val detached = text.indexOf("ev,detached")
+            helper.assertTrue(released >= 0, "breaking the keyboard should release q: $text")
+            helper.assertTrue(detached > released, "device-detached should come after the release: $text")
+            helper.assertTrue(KeyboardSessions.sessionOf(player) == null, "breaking the keyboard should close the session")
             KeyboardSessions.loggedOut(player)
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)

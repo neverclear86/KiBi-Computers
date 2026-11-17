@@ -52,6 +52,8 @@ class KeyboardEventsTest {
             m.devices.attach(address, keyboard)
             val q = m.subscribe(keyKinds)
             assertEquals(0, keyboard.input(KeyboardEvent.KeyDown(Key.Q, 0, false)))
+            // デバイスは届いた修飾キーをそのまま出す。修飾キー自身の押下に自分のビットが付くかは、クライアント（GLFW の OS ごとの
+            // 実装と KeyboardInputScreen）次第で、ゲストには約束しない（ADR 0326）。ここでは付いて届いた場合を流すだけ
             assertEquals(0, keyboard.input(KeyboardEvent.KeyDown(Key.LEFT_SHIFT, KeyModifiers.SHIFT, false)))
             assertEquals(0, keyboard.input(KeyboardEvent.KeyDown(Key.CAPS_LOCK, KeyModifiers.CAPS_LOCK, false)))
             val ctrlAlt = KeyModifiers.CONTROL or KeyModifiers.ALT

@@ -120,10 +120,17 @@ class LuaKibiApiTest {
         /**
          * true なら、[waitUntil]・[finish] はプロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める。
          * Lua が動いている間に tick が入ると、start と直後の take の間でメインスレッドのメソッドが終わり、コルーチンが
-         * task_complete を yield せずに値を返す（CI の遅い実行で、waitForAny の戻り値が変わる）
+         * task_complete を yield せずに値を返す（CI の遅い実行で、waitForAny の戻り値が変わる）。
+         * `maxHostCallsPerTick = 1` と組にする（[finishTickingWhileWaiting] と同じ）。`Machine.runHostCalls` は tick の途中で
+         * 積まれた呼び出しも同じ tick の中で実行するので、上限が 2 以上だと、待っている間に始めた tick の中で Lua が起きて
+         * 積んだ start が、直後の take より前に実行されうる
          */
         private val tickOnlyWhileWaiting: Boolean = false,
     ) : AutoCloseable {
+        init {
+            require(!tickOnlyWhileWaiting || maxHostCallsPerTick == 1) { "tickOnlyWhileWaiting は maxHostCallsPerTick = 1 と組にする" }
+        }
+
         val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
         val dev = TestDev()
         private val output: Int
@@ -630,6 +637,7 @@ class LuaKibiApiTest {
             os.pullEvent("finish")
             print("finished")
             """.trimIndent(),
+            maxHostCallsPerTick = 1,
             tickOnlyWhileWaiting = true,
         ).use { r ->
             fun open(): Int = r.m.lock.withLockValue {

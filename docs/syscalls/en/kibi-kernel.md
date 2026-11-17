@@ -281,7 +281,7 @@ Key names are the physical key positions (named after the US layout) in lowercas
 - `left-shift` `left-control` `left-alt` `left-super` `right-shift` `right-control` `right-alt` `right-super` `menu`
 - Any other key is `unknown`
 
-The modifiers are a set of bits describing the state when the key was pressed or released.
+The modifiers are a set of bits describing the state when the key was pressed or released. Whether pressing or releasing a modifier key itself (such as `left-shift`) sets that key's own bit is not promised (it depends on the client's OS and so on).
 
 | Bit | Meaning |
 | --- | --- |
@@ -296,5 +296,7 @@ The modifiers are a set of bits describing the state when the key was pressed or
 - Typed text (including IME commits) and pastes are not sent as events for now (they only go to the TTY). The typist is not included
 - Some keys never arrive. Shift+Esc and the last key of a paste shortcut (Ctrl+V, Shift+Insert) are handled by the client
 - Presses and releases are not guaranteed to pair up. When the input screen is closed, releases for keys still held are synthesized with modifiers `0`. If several people use the same keyboard, you may get a release for a key someone else is still holding. `unknown` covers different keys with the same name, so it does not pair up
-- When the keyboard block is broken, no releases arrive; only `device-detached` does. When its chunk is unloaded, the releases arrive first and then `device-detached`. Either way, when you get `device-detached` for the keyboard address, treat every key of that keyboard as released. Do the same when you get `restored` and when `dropped` is not 0
-- Ignore key names and modifier bits you do not know (more may be added). Other devices may send the same kind names, so tell them apart by `source`
+- When a keyboard is disconnected (its block is broken, its chunk is unloaded, and so on), the releases for keys still held arrive first and then `device-detached`
+- When you get `restored`, and when `dropped` is not 0, treat every key as released
+- Ignore key names and modifier bits you do not know (more may be added)
+- Other devices may send the same kind names. To tell whether an event comes from a keyboard, check in the `kibi:device` list that the kind of the `source` address is `kibicomputers:keyboard`
