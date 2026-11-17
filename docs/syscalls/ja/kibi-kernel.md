@@ -259,3 +259,42 @@ interface timers {
 - `restored` は「保存から戻った」という意味だけです。画面の中身が残っているかは約束しません
 - `restored` の2つ目の値（ゲーム内時間の飛び）は、今は常に 0 です。接続層がまだゲーム内時間をマシンに渡していないためです（[#439](https://github.com/neverclear86/KiBi-Computers/issues/439)。`world-ticks` と同じ）
 - **デバイスは、上の表にない独自の種類のイベントも出せます**（`source` はそのデバイスのアドレス）。種類と値の意味は、そのデバイスの説明を見てください。この表は閉じた一覧ではありません
+
+### キーボードのイベント
+
+キーボード（デバイスの種類 `kibicomputers:keyboard`）は、キーを押す・離すたびに、次のイベントを出します（[#326](https://github.com/neverclear86/KiBi-Computers/issues/326)）。`source` はキーボードのアドレスで、カーネルのものではありません。
+
+| 種類 | `source` | `values` | いつ |
+| --- | --- | --- | --- |
+| `key-pressed` | キーボードのアドレス | `[text(キー名), integer(修飾キー), boolean(繰り返し)]` | キーを押したとき。押し続けたときの繰り返しも同じ種類で、3つ目が `true` |
+| `key-released` | キーボードのアドレス | `[text(キー名), integer(修飾キー)]` | キーを離したとき |
+
+キー名は、物理的なキーの位置（US 配列での名前）を小文字のケバブにしたものです。
+
+- 英字 `a`〜`z`、数字 `digit-0`〜`digit-9`
+- `space` `apostrophe` `comma` `minus` `period` `slash` `semicolon` `equal` `left-bracket` `backslash` `right-bracket` `grave-accent`
+- `world-1`（ISO 配列の左 Shift の隣など）、`world-2`（日本語配列の「ろ」「¥」など、その他の国別のキー）
+- `escape` `enter` `tab` `backspace` `insert` `delete` `right` `left` `down` `up` `page-up` `page-down` `home` `end`
+- `caps-lock` `scroll-lock` `num-lock` `print-screen` `pause`
+- `f1`〜`f12`
+- `keypad-0`〜`keypad-9` `keypad-decimal` `keypad-divide` `keypad-multiply` `keypad-subtract` `keypad-add` `keypad-enter` `keypad-equal`
+- `left-shift` `left-control` `left-alt` `left-super` `right-shift` `right-control` `right-alt` `right-super` `menu`
+- 上のどれにも当たらないキーは `unknown`
+
+修飾キーは、押した・離したときの状態のビットの組です。
+
+| ビット | 意味 |
+| --- | --- |
+| `0x01` | Shift |
+| `0x02` | Ctrl |
+| `0x04` | Alt |
+| `0x08` | Super |
+| `0x10` | Caps Lock（位置は決めてありますが、付くとは約束しません） |
+| `0x20` | Num Lock（同上） |
+
+- 端末（TTY）のバイト列とは別に出ます。英字の押下（修飾キーなし）、修飾キーだけの押下、Caps Lock、Ctrl+Alt（AltGr）の組み合わせ、離しのように、TTY には何も流れないキーでも出ます。F5・Enter・矢印などは、TTY のバイト列とイベントの両方に出ます。TTY のバイト列とイベントの間の順番は約束しません
+- 打った文字（IME の確定を含む）と貼り付けは、今はイベントにしていません（TTY にだけ流れます）。打った人は載せません
+- 届かないキーがあります。Shift+Esc や、貼り付けの操作（Ctrl+V・Shift+Insert）の最後のキーはクライアントが受け持つので届きません
+- 押下と離しは対になるとは限りません。入力の画面を閉じたときは、押したままのキーの離しを修飾キー `0` で合成して届けます。複数の人が同じキーボードを使うと、ほかの人がまだ押しているキーの離しが届くことがあります。`unknown` は別々のキーが同じ名前になるので、対になりません
+- キーボードのブロックが壊れた・アンロードしたときは、離しが届かず、`device-detached` だけが届きます。そのキーボードのアドレスの `device-detached` を受けたら、そのキーボードのキーはすべて離したものとみなしてください。`restored` を受けたとき、`dropped` が 0 でないときも同じです
+- 知らないキー名・修飾キーのビットは無視してください（増えることがあります）。ほかのデバイスも同じ種類名を出せるので、`source` で見分けてください

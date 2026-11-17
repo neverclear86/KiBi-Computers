@@ -318,4 +318,41 @@ object StandardOsGameTests {
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
+    /**
+     * キーの押下のイベント（#326、ADR 0326）: 標準 OS の `/bin/lua` で `os.pullEvent('key-pressed')` を待っている間に
+     * キーボードで `q` を押すと、キー名・修飾キー・繰り返しと、source（キーボードの address）が届く。`q` の押下は TTY に何も流さない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaReceivesKeyEvents(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        // 最初の pullEvent でカーネルのキューが開くので、kready が出た時点でキーのイベントを受けられる
+        val script = "os.queueEvent('r0'); os.pullEvent('r0'); print('kready'); local e; " +
+            "repeat e = {os.pullEvent('key-pressed')} until e[3] == 'q'; " +
+            "print(table.concat({'kp', e[3], e[4], tostring(e[5]), tostring(e[2] == peripheral.getName(peripheral.find('keyboard')))}, ','))"
+        var step = 0
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            when (step) {
+                0 -> {
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                    typeLine(helper, keyboard, "lua -e \"$script\"")
+                    step = 1
+                    helper.fail("typed the line")
+                }
+                1 -> {
+                    helper.assertTrue(text.any { it == "kready" }, "lua should be waiting for keys: $text")
+                    for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.KeyDown(Key.Q, 0, false)))) {
+                        helper.assertTrue(keyboard.receive(UUID(0, 1), packet) == 1, "keyboard should accept the key")
+                    }
+                    step = 2
+                    helper.fail("pressed q")
+                }
+            }
+            helper.assertTrue(text.any { it == "kp,q,0,false,true" }, "lua should receive the key event: $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
 }

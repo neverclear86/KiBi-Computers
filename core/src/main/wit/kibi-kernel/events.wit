@@ -14,6 +14,9 @@ package kibi:kernel@0.1.0;
 /// 保存から戻ったときは、"restored" の後に、戻した先でつなぎ直した全デバイスの "device-attached" が届く（保存の前に
 /// つないでいた分と重なりうる。消えた分の "device-detached" は出ない）。受け手は "restored" を受けたとき・dropped が 0 でないときに一覧を読み直す。
 /// デバイスも同じ種類名を出せるので、カーネルのものは source "" で見分ける。
+/// キーボードのデバイスは、キーを押す・離すたびに種類 "key-pressed"・"key-released"、source（キーボードの address）、
+/// 値 [text(キー名), integer(修飾キー), boolean(繰り返し)]・[text(キー名), integer(修飾キー)] のイベントを1件出す（#326、ADR 0326）。
+/// キー名・修飾キーのビットと、受け手の約束（対にならない離し、device-detached で全部離したとみなすことなど）は ADR 0326 と文書に書く。
 interface events {
     use types.{error-code};
 

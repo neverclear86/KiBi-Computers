@@ -259,3 +259,42 @@ Events from the kernel have `source` `""` (`"console"` for the TTY). Devices may
 - `restored` only means "restored from a save". It does not promise anything about whether the screen contents are kept
 - The second value of `restored` (the in-game time jump) is always 0 for now, because the platform layers do not pass the in-game time to the machine yet ([#439](https://github.com/neverclear86/KiBi-Computers/issues/439); same as `world-ticks`)
 - **Devices can also send events of their own kinds not in the table above** (with `source` set to the device address). See the device's documentation for the kinds and values. This table is not a closed list
+
+### Keyboard events
+
+A keyboard (device kind `kibicomputers:keyboard`) sends the following events each time a key is pressed or released ([#326](https://github.com/neverclear86/KiBi-Computers/issues/326)). `source` is the keyboard address; these are not kernel events.
+
+| Kind | `source` | `values` | When |
+| --- | --- | --- | --- |
+| `key-pressed` | Keyboard address | `[text(key name), integer(modifiers), boolean(repeat)]` | A key is pressed. Auto-repeat while held uses the same kind, with the third value `true` |
+| `key-released` | Keyboard address | `[text(key name), integer(modifiers)]` | A key is released |
+
+Key names are the physical key positions (named after the US layout) in lowercase kebab case.
+
+- Letters `a` to `z`, digits `digit-0` to `digit-9`
+- `space` `apostrophe` `comma` `minus` `period` `slash` `semicolon` `equal` `left-bracket` `backslash` `right-bracket` `grave-accent`
+- `world-1` (such as the key next to the left Shift on ISO layouts), `world-2` (other national keys, such as the Japanese "ro" and yen keys)
+- `escape` `enter` `tab` `backspace` `insert` `delete` `right` `left` `down` `up` `page-up` `page-down` `home` `end`
+- `caps-lock` `scroll-lock` `num-lock` `print-screen` `pause`
+- `f1` to `f12`
+- `keypad-0` to `keypad-9` `keypad-decimal` `keypad-divide` `keypad-multiply` `keypad-subtract` `keypad-add` `keypad-enter` `keypad-equal`
+- `left-shift` `left-control` `left-alt` `left-super` `right-shift` `right-control` `right-alt` `right-super` `menu`
+- Any other key is `unknown`
+
+The modifiers are a set of bits describing the state when the key was pressed or released.
+
+| Bit | Meaning |
+| --- | --- |
+| `0x01` | Shift |
+| `0x02` | Ctrl |
+| `0x04` | Alt |
+| `0x08` | Super |
+| `0x10` | Caps Lock (the position is fixed, but it is not promised to be set) |
+| `0x20` | Num Lock (same as above) |
+
+- These are sent separately from the terminal (TTY) bytes. They are sent even for keys that put nothing into the TTY, such as a letter pressed without modifiers, a modifier key alone, Caps Lock, Ctrl+Alt (AltGr) combinations, and releases. F5, Enter, the arrow keys and so on go to both the TTY bytes and the events. The order between the TTY bytes and the events is not promised
+- Typed text (including IME commits) and pastes are not sent as events for now (they only go to the TTY). The typist is not included
+- Some keys never arrive. Shift+Esc and the last key of a paste shortcut (Ctrl+V, Shift+Insert) are handled by the client
+- Presses and releases are not guaranteed to pair up. When the input screen is closed, releases for keys still held are synthesized with modifiers `0`. If several people use the same keyboard, you may get a release for a key someone else is still holding. `unknown` covers different keys with the same name, so it does not pair up
+- When the keyboard block is broken or unloaded, no releases arrive; only `device-detached` does. When you get `device-detached` for the keyboard address, treat every key of that keyboard as released. Do the same when you get `restored` and when `dropped` is not 0
+- Ignore key names and modifier bits you do not know (more may be added). Other devices may send the same kind names, so tell them apart by `source`
