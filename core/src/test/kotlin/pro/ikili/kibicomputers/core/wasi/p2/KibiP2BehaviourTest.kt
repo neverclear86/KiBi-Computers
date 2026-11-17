@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -12,6 +13,8 @@ import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.TestDriver
 import pro.ikili.kibicomputers.core.kernel.eventually
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
+import pro.ikili.kibicomputers.core.kernel.fd.FdTable
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
@@ -36,7 +39,11 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentCall
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -250,9 +257,9 @@ class KibiP2BehaviourTest {
                 val base = hostSize(ctx)
                 val spawn = "[static]process.spawn"
                 assertEquals(name(Errno.NOENT), errName(ctx.call("kibi:process/process", spawn, CanonValue.str("/bin/none"), spawnOptions())))
-                // p2 の fds の parent は 0..2 だけ
+                // p2 の fds の parent は 0..2 だけ（process.wit の fd-source.parent のとおり bad-descriptor）
                 assertEquals(
-                    name(Errno.INVAL),
+                    name(Errno.BADF),
                     errName(ctx.call("kibi:process/process", spawn, CanonValue.str("/bin/ok"), spawnOptions(listOf(fdAssign(3, 3))))),
                 )
                 val pipe = ok(ctx.call("kibi:io/pipe-streams", "create")) as CanonValue.Fields
@@ -380,6 +387,188 @@ class KibiP2BehaviourTest {
                 assertEquals(name(Errno.NOTSUP), errName(ctx.call("kibi:computer/power", "reboot")))
                 assertTrue(ctx.call("kibi:io/tty", "is-tty", CanonValue.I32(0)) == CanonValue.Bool(false))
             }
+        }
+    }
+
+    @Test
+    fun `マシン全体のキューの上限はトラップでなくnfileのerrで返る`() = timeout(limit) {
+        Harness().use { h ->
+            val m = machine(h)
+            scenario(h, m) { ctx ->
+                val base = hostSize(ctx)
+                val queues = ArrayList<CanonValue>()
+                var failure: String? = null
+                // マシンのキューの上限（EventLimits.MAX_QUEUES）まで開く。超えたら nfile の err（トラップにならない）
+                for (i in 0..EventLimits.MAX_QUEUES + 1) {
+                    val r = ctx.call("kibi:kernel/events", "[static]event-queue.open", CanonValue.Items(emptyList()), CanonValue.NONE) as CanonValue.Case
+                    if (r.index == 0) {
+                        queues += r.payload!!
+                    } else {
+                        failure = errName(r)
+                        break
+                    }
+                }
+                assertEquals(name(Errno.NFILE), failure)
+                assertTrue(queues.isNotEmpty() && queues.size <= EventLimits.MAX_QUEUES, "${queues.size}")
+                for (q in queues) ctx.drop(q)
+                assertEquals(base, hostSize(ctx))
+            }
+        }
+    }
+
+    @Test
+    fun `subscribeは表が満杯だとトラップになり、親に子の数を残さない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = machine(h)
+            scenario(h, m) { ctx ->
+                val q = ok(ctx.call("kibi:kernel/events", "[static]event-queue.open", CanonValue.Items(emptyList()), CanonValue.NONE))!!
+                val t = ok(ctx.call("kibi:kernel/timers", "[static]timer.create", CanonValue.NONE))!!
+                val fillers = ctx.withKernelLock {
+                    val table = P2.tableLocked(ctx)
+                    List(HostResourceTable.LIMIT - table.size) { table.add(MarkerEntry("filler")) }
+                }
+                // 戻り値が pollable だけでエラーを返せないので、満杯なら ResourceLimitException が P2.guard でトラップになる
+                assertThrows<WasmTrapException> { ctx.call("kibi:kernel/events-poll", "subscribe", q) }
+                assertThrows<WasmTrapException> { ctx.call("kibi:kernel/timers-poll", "subscribe", t) }
+                ctx.withKernelLock { for (r in fillers) P2.tableLocked(ctx).remove(r) }
+                // 子が残っていない（残っていれば drop がトラップになる）
+                ctx.drop(q)
+                ctx.drop(t)
+            }
+        }
+    }
+
+    @Test
+    fun `タイマーのpollableは、キューなしならそろい、キューありならそろわない`() = timeout(limit) {
+        Harness().use { h ->
+            val m = machine(h)
+            scenario(h, m) { ctx ->
+                val q = ok(ctx.call("kibi:kernel/events", "[static]event-queue.open", CanonValue.Items(listOf(CanonValue.str("timer"))), CanonValue.NONE))!!
+                val plain = ok(ctx.call("kibi:kernel/timers", "[static]timer.create", CanonValue.NONE))!!
+                val queued = ok(ctx.call("kibi:kernel/timers", "[static]timer.create", CanonValue.some(CanonValue.Fields(listOf(q, CanonValue.I64(7))))))!!
+                val pp = ctx.call("kibi:kernel/timers-poll", "subscribe", plain)!!
+                val pq = ctx.call("kibi:kernel/timers-poll", "subscribe", queued)!!
+                val qp = ctx.call("kibi:kernel/events-poll", "subscribe", q)!!
+                fun ready(p: CanonValue) = (ctx.call("wasi:io/poll", "[method]pollable.ready", p) as CanonValue.Bool).value
+                assertFalse(ready(pp), "動かす前はそろわない")
+                ok(ctx.call("kibi:kernel/timers", "[method]timer.set-after", plain, CanonValue.I64(1_000_000), CanonValue.I64(0)))
+                ok(ctx.call("kibi:kernel/timers", "[method]timer.set-after", queued, CanonValue.I64(1_000_000), CanonValue.I64(0)))
+                ctx.await(pp)
+                assertTrue(ready(pp))
+                // キューにイベントが届いた（キューを渡したタイマーが鳴った）後も、そのタイマーの pollable はそろわない
+                ctx.await(qp)
+                assertFalse(ready(pq))
+                for (p in listOf(pp, pq, qp)) ctx.drop(p)
+                for (v in listOf(plain, queued, q)) ctx.drop(v)
+            }
+        }
+    }
+
+    /** 子 [p]（p2 のハンドル）のカーネルの ProcessObject の id */
+    private fun childObject(ctx: ProcessContext, p: CanonValue): Int =
+        ctx.withKernelLock { (P2.tableLocked(ctx)[(p as CanonValue.Handle).value] as KernelEntry).objectId }
+
+    /** 子の終わりを待つ */
+    private fun ProcessContext.waitChild(p: CanonValue) {
+        val pp = call("kibi:process/process-poll", "subscribe", p)!!
+        await(pp)
+        drop(pp)
+    }
+
+    @Test
+    fun `fdとp2のハンドルで同じ子を持つとき、片方を閉じても子は付け替えられず、最後の1つで刈り取る`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
+            scenario(h, m) { ctx ->
+                fun fdTable() = FdTable(ctx.kernel.processes[ctx.pid]!!, ctx.kernel.objects, ctx.wakeSink)
+                fun pidOf(p: CanonValue) = (ctx.call("kibi:process/process", "[method]process.pid", p) as CanonValue.I32).value
+                fun exists(pid: Int) = ctx.withKernelLock { ctx.kernel.processes[pid] != null }
+
+                // p2 のハンドルを先に閉じる: fd のハンドルが残るので、子は残る（刈り取らない）
+                val a = ok(ctx.call("kibi:process/process", "[static]process.spawn", CanonValue.str("/bin/ok"), spawnOptions()))!!
+                val aPid = pidOf(a)
+                ctx.waitChild(a)
+                val aFd = ctx.withKernelLock {
+                    val id = childObject(ctx, a)
+                    ctx.kernel.objects.retain(id)
+                    fdTable().install(id)
+                }
+                ctx.drop(a)
+                assertTrue(exists(aPid), "fd のハンドルが残るのに刈り取った")
+                ctx.withKernelLock { fdTable().close(aFd) }
+                assertFalse(exists(aPid), "最後のハンドル（fd）を閉じたら刈り取る")
+
+                // fd のハンドルを先に閉じる: p2 のハンドルが残るので、子は残る
+                val b = ok(ctx.call("kibi:process/process", "[static]process.spawn", CanonValue.str("/bin/ok"), spawnOptions()))!!
+                val bPid = pidOf(b)
+                ctx.waitChild(b)
+                val bFd = ctx.withKernelLock {
+                    val id = childObject(ctx, b)
+                    ctx.kernel.objects.retain(id)
+                    fdTable().install(id)
+                }
+                ctx.withKernelLock { fdTable().close(bFd) }
+                assertTrue(exists(bPid), "p2 のハンドルが残るのに刈り取った")
+                ctx.drop(b)
+                assertFalse(exists(bPid), "最後のハンドル（p2）を閉じたら刈り取る")
+            }
+        }
+    }
+
+    @Test
+    fun `写しの中で、processのハンドルを持つコンポーネントの親を殺しても、元のマシンは変わらない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
+            val ready = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val childObj = AtomicInteger()
+            val failure = AtomicReference<Throwable>()
+            val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+                try {
+                    val p = ok(ctx.call("kibi:process/process", "[static]process.spawn", CanonValue.str("/bin/ok"), spawnOptions()))!!
+                    ctx.waitChild(p)
+                    childObj.set(childObject(ctx, p))
+                    ready.countDown()
+                    check(release.await(60, TimeUnit.SECONDS)) { "放されない" }
+                    ctx.drop(p)
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+                StepResult.Exit(0)
+            }
+            val options = SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed), fds = SpawnOptions.ROOT_PREOPEN)
+            val pid = m.spawn(empty, driver, options, 0)
+            eventually(60_000, "子を作らない") {
+                h.scheduler.tick()
+                ready.count == 0L
+            }
+            val obj = childObj.get()
+            val before = m.lock.withLockValue { m.kernel.objects.refCount(obj) }
+            assertTrue(before >= 2, "子自身と親のハンドルが参照する（$before）")
+
+            val copy = m.captureCopy(CapturePolicy.KILL_TRANSIENT)!!
+            assertTrue(pid in copy.killedPids, "コンポーネントのプロセスは写しの中で殺す")
+            val killed = copy.processes[pid]!!
+            assertEquals(ProcessState.KILLED, killed.state)
+            assertEquals(0, killed.hostResources.size, "写しの表は閉じる")
+            assertTrue(copy.objects.refCount(obj) < before, "写しの中で参照を返す（${copy.objects.refCount(obj)} < $before）")
+
+            // 元は変わらない: 表も参照の数もそのまま、プロセスも生きている
+            m.lock.withLockValue {
+                assertEquals(before, m.kernel.objects.refCount(obj))
+                assertTrue(m.kernel.processes[pid]!!.hostResources.size >= 1)
+                assertFalse(m.kernel.processes[pid]!!.state.isTerminal)
+            }
+            release.countDown()
+            eventually(60_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            failure.get()?.let { throw it }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+            m.stop()
         }
     }
 

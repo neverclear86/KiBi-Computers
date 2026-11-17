@@ -27,7 +27,7 @@ interface process-poll {
     }
 
     /// process.spawn と同じ。options.fds の後に handles を当てる（同じ fd を両方に書いた・handles に同じ fd を2回書いたら invalid）。
-    /// p2 の options.fds の parent(n) は n が 0・1・2 のときだけ（ほかは invalid。ほかのハンドルは handles で渡す）。
+    /// p2 の options.fds の parent(n) は n が 0・1・2 のときだけ（ほかは bad-descriptor。process.wit の fd-source.parent のとおり。ほかのハンドルは handles で渡す）。
     /// input・output に渡せるのは、パイプの端・TTY・標準入出力の stream（get-stdin などで取ったもの）。
     /// 自分の位置で読み書きするファイルの stream（read-via-stream など）は not-supported、閉じた stream は bad-descriptor。
     /// directory は descriptor の flags（read・write）を子の fd の権利に写す。process は子に同じプロセスのハンドルを渡す

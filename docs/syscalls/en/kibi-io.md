@@ -3,7 +3,7 @@ title: kibi:io
 description: Duplicating file descriptors (dup, dup2), pipes, and the TTY mode, size, and foreground process.
 ---
 
-`kibi:io@0.1.0` holds fd operations that WASI p1 lacks. `fd` and `pipe` are for p1 only; p2 and p3 are planned to use other (provisional) interfaces. `tty` is planned to have the same shape in p1, p2, and p3.
+`kibi:io@0.1.0` holds fd operations that WASI p1 lacks. `fd` and `pipe` are for p1 only; p2 uses `pipe-streams`, and p3 is planned to use another (provisional) interface. `tty` is planned to have the same shape in p1, p2, and p3.
 
 An fd argument is the process's kernel fd number (the same number as the p1 fd).
 

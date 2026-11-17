@@ -25,7 +25,7 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
  * `kibi:process/process`・`kibi:process/process-poll` の p2 の実装（#685。ADR 0685）。意味は p1 と同じ（[KibiProcess]）。
  *
  * - `spawn` の引数の上限は p1 の lift と同じ順・同じコード（path → args → env → cwd → fds）。p2 のゲストの fd 表は 0/1/2 だけなので、
- *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `invalid`）
+ *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `bad-descriptor`。process.wit の `fd-source.parent` のとおり）
  * - 読み込みを待つのは `ctx.execWithHandle`（p1 の BLOCK と同じ待ち方。読み込みの間は CPU と許可を返す）
  * - `spawn-with-handles`: `options.fds` を当ててから `handles` を当てる。同じ fd を2回（`handles` の中で、または `fds` と `handles` で）
  *   書いたら `invalid`。渡せるのはパイプの端・`Tty`・共有の位置の stream（`get-stdin` など）・`descriptor`（権利は flags から）・`process`。
@@ -139,7 +139,7 @@ internal object KibiP2Process {
             val s = source as CanonValue.Case
             val parent = if (s.index == 0) KibiP2.u32(s.payload!!) else null
             // p2 のゲストの fd 表は 0/1/2 だけ（fd 3 以降は wasi:filesystem の descriptor にある。handles で渡す）
-            if (parent != null && parent > STDERR) fsError(Errno.INVAL, "p2 の fds の parent は 0..2（$parent）")
+            if (parent != null && parent > STDERR) fsError(Errno.BADF, "p2 の fds の parent は 0..2（$parent）")
             KibiProcess.FdAssign(KibiP2.u32(fd), parent)
         }
         return KibiProcess.Request(path, args, env, cwd, fds)

@@ -25,7 +25,12 @@ internal object KibiP2WitTool {
     /** [extraWorld] の中身（`import …;` など）を足した world `all` の WIT と、`src/main/wit` を deps にした仮想 FS */
     private fun files(extraWorld: String): Map<String, ByteArray> {
         val includes = P2_WORLDS.joinToString("\n") { "  include $it;" }
-        val world = "package test:all;\n\nworld all {\n$includes\n$extraWorld\n}\n\n" + WasiP2Wit.TEXT
+        return worldFiles("$includes\n$extraWorld")
+    }
+
+    /** world `all` の中身 [worldBody] の WIT と、`src/main/wit` を deps にした仮想 FS */
+    private fun worldFiles(worldBody: String): Map<String, ByteArray> {
+        val world = "package test:all;\n\nworld all {\n$worldBody\n}\n\n" + WasiP2Wit.TEXT
         val out = HashMap<String, ByteArray>()
         out["w/all.wit"] = world.toByteArray()
         for (dir in root.listFiles { f -> f.isDirectory }.orEmpty()) {
@@ -48,6 +53,22 @@ internal object KibiP2WitTool {
         val c = WitTool.run(listOf("component", "new", "work/m.wasm", "-o", "work/c.wasm"), mapOf("m.wasm" to e.outputs.getValue("m.wasm")), listOf("c.wasm"))
         assertEquals(0, c.exitCode, c.stderr)
         c.outputs.getValue("c.wasm")
+    }
+
+    /**
+     * world `all` を [worldBody]（`import kibi:kernel/events@0.1.0;` や `export run: func() -> u32;` など）にして、
+     * WAT のコアモジュール [wat] からコンポーネントを作る（#685。ゲストが実際に Canonical ABI で `kibi:*` を呼ぶテスト用）
+     */
+    fun component(worldBody: String, wat: String): ByteArray {
+        val e = WitTool.run(
+            listOf("component", "embed", "--world", "all", "${WitTool.WORK}/w", "${WitTool.WORK}/m.wat", "-o", "${WitTool.WORK}/m.wasm"),
+            worldFiles(worldBody) + ("m.wat" to wat.toByteArray()),
+            listOf("m.wasm"),
+        )
+        assertEquals(0, e.exitCode, e.stderr)
+        val c = WitTool.run(listOf("component", "new", "work/m.wasm", "-o", "work/c.wasm"), mapOf("m.wasm" to e.outputs.getValue("m.wasm")), listOf("c.wasm"))
+        assertEquals(0, c.exitCode, c.stderr)
+        return c.outputs.getValue("c.wasm")
     }
 
     /** [dummy] の WIT のうち、`package kibi:` の塊だけを並べたもの（ホストの [KibiP2Wit.TEXT] と比べる） */

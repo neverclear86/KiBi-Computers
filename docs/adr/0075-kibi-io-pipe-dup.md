@@ -10,7 +10,7 @@
 
 - `kibi:io@0.1.0` に、p1 だけの `fd`（`dup`・`dup-to`）と `pipe`（`create`）、p2 だけの `pipe-streams`、p3 だけの `pipe-async` を置く
 - p1 向けの import は ADR 0073 の規則で WIT から導く。どれも待たず、`cabi_realloc` も要らない
-- p2・p3 の分（`pipe-streams`・`pipe-async`）は WIT とこの ADR だけで、実装しない。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#685・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）
+- p3 の分（`pipe-async`）は WIT とこの ADR だけで、実装しない。**仮置き**: interface・関数・型は、p3 の層（#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。p2 の分（`pipe-streams`）は #685 で確定し、実装した（`wasi:io/streams@0.2.12`。ADR 0685）
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。足した型はすべて Kotlin の `internal`。新しく持つ状態はない（パイプの端・中身は既に `KernelState` のオブジェクト表にあり、fd 表の項目の形も同じ）
 
 ## WIT
@@ -30,7 +30,7 @@ interface pipe {              // p1 だけ
     create: func() -> result<pipe-ends, error-code>;
 }
 
-interface pipe-streams {      // p2 だけ（仮置き）
+interface pipe-streams {      // p2 だけ（#685 で確定）
     use kibi:kernel/types@0.1.0.{error-code};
     use wasi:io/streams@0.2.12.{input-stream, output-stream};
     create: func() -> result<tuple<input-stream, output-stream>, error-code>;
@@ -82,7 +82,7 @@ world imports-p3 { import pipe-async; }
 - **エラー**: `BADF` → `bad-descriptor`、`MFILE` → `mfile`。`fd` が開いていない・`to` が範囲外（上限以上、2^31 以上）なら `bad-descriptor` で、`to` は閉じない。パイプの数は fd の上限で抑えられる（ADR 0059）ので `nfile` は返さない
 - **POSIX との違い**: `NONBLOCK` はこのカーネルでは fd ごとの属性（ADR 0070）。`dup`・`dup-to` は写すが共有しないので、複製の後はそれぞれ別に変えられる（POSIX ではファイルの記述の属性で、複製と共有する）
 
-## p2/p3 への写し方（仮置き）
+## p2/p3 への写し方（p2 は #685 で確定、p3 は仮置き）
 
 | | p1 | p2 | p3 |
 | --- | --- | --- | --- |
@@ -95,7 +95,7 @@ world imports-p3 { import pipe-async; }
 | 子に渡す | #74 の `spawn-options.fds` | #74 の `handle-source` | #74 の `handle-source` |
 
 - どの層でも下にあるのは同じカーネルのパイプ（`Pipes.DEFAULT_CAPACITY`）。p2/p3 のハンドルはカーネルの fd 表に入らない（#74 の回答に合わせる。#74 の回答が違えばこの ADR を直す）
-- `wasi:io/streams@0.2.3` の版は仮。p3 は `wasi:*` に依存しない
+- `wasi:io/streams` の版は、#685 で `@0.2.12` に確定した。p3 は `wasi:*` に依存しない
 - p2/p3 の細かい選択は、p2/p3 の層を作るときにエージェントが決めてこの ADR に残す
 
 ## 実装
@@ -119,6 +119,6 @@ world imports-p3 { import pipe-async; }
 
 - TTY: #427
 - 子プロセスへの渡し方: #74
-- p2・p3 の層の実装と、仮置きの WIT の確定: p2 は #685、p3 は #266
+- p2 の層の実装と WIT の確定は #685 で済んだ。p3 の層の実装と、仮置きの WIT の確定は #266
 - 生成した束縛と libc 風の関数: SDK #116
 - パイプの容量と燃料の確定: #251
