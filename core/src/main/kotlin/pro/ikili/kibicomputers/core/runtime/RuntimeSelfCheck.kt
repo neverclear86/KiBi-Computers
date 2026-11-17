@@ -1,6 +1,10 @@
 package pro.ikili.kibicomputers.core.runtime
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.runtime.component.ComponentLoader
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
@@ -9,7 +13,10 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkEnv
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
+import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
+import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Driver
+import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Host
 
 /**
  * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
@@ -113,6 +120,55 @@ public object RuntimeSelfCheck {
         return LinkedComponent.instantiate(program.plan, LinkEnv.NONE, WasmSharedFuel(1_000_000)).use { c ->
             val twice = checkNotNull(c.function("twice")) { "twice がない" }
             c.call(twice, listOf(CanonValue.I32(40), CanonValue.I32(1))) == CanonValue.I32(42)
+        }
+    }
+
+    /**
+     * 何もせずに `ok` を返す p2 のコマンド（`wasi:cli/run@0.2.0` の `run: func() -> result`）。`wasm-tools parse` で次から作った:
+     * `(core module ${'$'}m (func (export "run") (result i32) i32.const 0)) (core instance ${'$'}i (instantiate ${'$'}m))
+     * (func ${'$'}run (result (result)) (canon lift (core func ${'$'}i "run"))) (instance ${'$'}inst (export "run" (func ${'$'}run)))
+     * (export "wasi:cli/run@0.2.0" (instance ${'$'}inst))`
+     */
+    internal val RUN_COMMAND_COMPONENT: ByteArray = intArrayOf(
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x01, 0x2f, 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00,
+        0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01,
+        0x03, 0x72, 0x75, 0x6e, 0x00, 0x00, 0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0b, 0x00, 0x09,
+        0x04, 0x6e, 0x61, 0x6d, 0x65, 0x00, 0x02, 0x01, 0x6d, 0x02, 0x04, 0x01, 0x00, 0x00, 0x00, 0x07,
+        0x08, 0x02, 0x6a, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x06, 0x09, 0x01, 0x00, 0x00, 0x01, 0x00,
+        0x03, 0x72, 0x75, 0x6e, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0x0a, 0x01, 0x01,
+        0x01, 0x00, 0x03, 0x72, 0x75, 0x6e, 0x01, 0x00, 0x0b, 0x18, 0x01, 0x00, 0x12, 0x77, 0x61, 0x73,
+        0x69, 0x3a, 0x63, 0x6c, 0x69, 0x2f, 0x72, 0x75, 0x6e, 0x40, 0x30, 0x2e, 0x32, 0x2e, 0x30, 0x05,
+        0x00, 0x00, 0x00, 0x32, 0x0e, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x2d, 0x6e,
+        0x61, 0x6d, 0x65, 0x01, 0x06, 0x00, 0x11, 0x01, 0x00, 0x01, 0x6d, 0x01, 0x06, 0x00, 0x12, 0x01,
+        0x00, 0x01, 0x69, 0x01, 0x07, 0x01, 0x01, 0x00, 0x03, 0x72, 0x75, 0x6e, 0x01, 0x08, 0x05, 0x01,
+        0x00, 0x04, 0x69, 0x6e, 0x73, 0x74,
+    ).let { ints -> ByteArray(ints.size) { ints[it].toByte() } }
+
+    /**
+     * p2 のコマンドのコンポーネントを、`exec` と同じ読み方（`Program.loadExecutable`。`wasi:*` のホスト `KernelDrivers.COMPONENT_HOST` を
+     * 渡し、燃料の計測コードを挿入する）で読み込み、`exec` の既定のドライバーの選び方（`KernelDrivers.DEFAULT`）で p2 のドライバーを選べて、
+     * インスタンス化して `run` を呼ぶと `ok` が返れば `true`（#687）。あわせて、`wasi:*` のホストを実際に組み立てる
+     * （`WasiP2Host.interfaceOf` で WIT の読み取りと、各インターフェースの実装との照合を走らせる）。
+     * このコンポーネントは import を持たないので、リンクのときにはホストの組み立ては走らない。ここで明示的に呼んで、
+     * 検証器・リンカー・`wasi:*` のホストのクラスが実行環境で読めるかを GameTest で確かめる。
+     * 重い（初回は 1 秒ほど）ので、起動時には呼ばない。
+     *
+     * @throws WasmLoadException 読み込めない
+     * @throws WasmTrapException 実行がトラップした
+     * @throws FsException p2 のドライバーを選べない（`NOEXEC`）
+     */
+    @JvmStatic
+    @Throws(WasmLoadException::class, WasmTrapException::class, FsException::class)
+    public fun loadsComponentCommand(): Boolean {
+        val program = Program.loadExecutable(EndiveRuntime(), RUN_COMMAND_COMPONENT, ModuleLimits.DEFAULT, true, emptySet(), KernelDrivers.COMPONENT_HOST)
+        val driver = KernelDrivers.DEFAULT.create(program)
+        val component = program.component ?: return false
+        if (driver.kind != ProcessKind.BLOCKING) return false
+        // import のないコンポーネントではホストを引かないので、ここで組み立てる（WIT の読み取りと実装の照合）
+        if (WasiP2Host.interfaceOf("wasi:cli/stdout@0.2.0") == null) return false
+        val run = WasiP2Driver.runOf(component.plan)
+        return LinkedComponent.instantiate(component.plan, LinkEnv.NONE, WasmSharedFuel(1_000_000)).use { c ->
+            (c.call(run, emptyList()) as? CanonValue.Case)?.index == 0
         }
     }
 

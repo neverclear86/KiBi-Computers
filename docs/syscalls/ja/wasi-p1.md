@@ -9,7 +9,7 @@ KiBi Computers は WASI p1（モジュール名 `wasi_snapshot_preview1`）を�
 
 - **コマンド形式だけ**を動かします。関数 `_start` を export していないモジュールは、読み込みで `NOEXEC` です。reactor 形式（イベントを受け取る export）の入口は定義していません。イベントは、キューの fd を `poll_oneoff` で待って受け取ります
 - `_start` から戻ると終了コード 0、`proc_exit(n)` を呼ぶと終了コード `n`（32 ビットそのまま）で終わります
-- Component Model のコンポーネントは、まだ動かせません（`NOEXEC`。[p2・p3 の予定](./p2-p3.md)）
+- p1 のモジュールではない Component Model のコンポーネントは、p1 の層では扱いません。`wasi:cli/run@0.2.x` を export するコマンドのコンポーネントは p2 の層で動き、それ以外は `NOEXEC` です（[p2・p3 の予定](./p2-p3.md)）
 - 線形メモリを export してください。メモリのない呼び出しは `FAULT` か、トラップになります
 
 ## 関数ごとの対応

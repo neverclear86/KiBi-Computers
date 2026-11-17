@@ -137,7 +137,7 @@ class ComponentProcessTest {
     }
 
     @Test
-    fun `既定のドライバーはコンポーネントをNOEXECで断る`() {
+    fun `既定のドライバーはwasi-cli-runを持たないコンポーネントをNOEXECで断る`() {
         val e = assertThrows<FsException> { KernelDrivers.DEFAULT.create(program()) }
         assertEquals(Errno.NOEXEC, e.errno)
     }

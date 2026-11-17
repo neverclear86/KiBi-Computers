@@ -53,7 +53,7 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 `WasiP2Driver` は、export の `wasi:cli/run@0.2.<n>` のインスタンスの `run`（`func() -> result`）を 1 つだけ持つコンポーネントを動かす。ない・2 つ以上・型が違うときは `NOEXEC`。
 
 - `run` が `ok` なら終了コード 0、`err` なら 1。`exit(result)` は `ok` で 0・`err` で 1、`exit-with-code(c)` は `c`。
-- コンポーネントの `exec`（`KernelDrivers.DEFAULT` から選ぶこと）は #687 でつなぐ。#267 ではドライバーまで。
+- コンポーネントの `exec` は #687 でつないだ（済み）。`KernelDrivers.DEFAULT` が、コンポーネントの `Program` にこのドライバーを選ぶ（ADR 0263 の追記）。
 
 ### カーネルへの写し方
 

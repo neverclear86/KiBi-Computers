@@ -71,9 +71,23 @@
 
 ### exec
 
-コンポーネントを `exec` で動かす（ABI 層のドライバーを選び、`ModulePrescan` の `NOEXEC` の分岐を外す）のは、`wasi:cli/run` の版の扱い（p2 は ADR 0267 で決めた。p3 は #268）が決まってからにし、#687 で行う（検証の時間の止め方は #666 で決まった。ADR 0666）。`KernelDrivers.DEFAULT` は、コンポーネントの `Program` を `NOEXEC` で断る。
+コンポーネントを `exec` で動かす（ABI 層のドライバーを選び、`ModulePrescan` の `NOEXEC` の分岐を外す）のは、`wasi:cli/run` の版の扱い（p2 は ADR 0267 で決めた。p3 は #268）が決まってからにし、#687 で行う（検証の時間の止め方は #666 で決まった。ADR 0666）。
+
+### 追記（#687）: exec につなぐ
+
+- **読み込みの見分けは 1 か所。** `Program.loadExecutable` がヘッダー（`WasmBinaryHeader`）で見分け、コンポーネントは `ComponentProgram.load`、core モジュールは今までの `Program.loadMetered`・`load` で読む。`Machine.beginExec` と復元（`MachineRestore`）の `ProgramCache` の loader は、どちらもこれを使う（同じキーで別の読み方をして、片方の結果・失敗を別の読み方に返さないため）。復元で保存データがコンポーネントを指していたら、読み込めても p1 のプロセスには戻せないので冷えた起動になる。
+- **キーの止まりうる import は空にそろえる。** コンポーネントは待機点への変換を使わない（`Program.cacheWaitImports`）。ドライバーの集合や `asyncifyExecutables` ごとに別のキーになって二重に読み込まないため。燃料は p1 と同じ `meterExecutables` で、キーの `metered` に入る。
+- **ホストは固定で、状態を持たない。** exec のホストはサーバー全体で 1 つ（`KernelDrivers.COMPONENT_HOST`。今は `WasiP2Host`。`kibi:*`（#685）を足すときも、同じ固定の合成ホストにする）。ホストの解決は読み込みのときに 1 回だけで、計画（ホストの関数の本体・dtor を含む）は全マシンが共有するので、`ComponentHost`・`HostFunctionBody`・`HostResourceDrop` は状態を持たず、スレッド安全にする（KDoc に書いた）。プロセスの状態は `ComponentCall.env` から引く。`ProgramCache` のキーにはホストを入れない。マシンやデバイスの構成でホストを変えると、リンクの失敗（`WasmLoadException`）が覚えられて別のマシンにも返るので、デバイスがあるかどうかはリンクのときではなく呼び出しのときに見る。
+- **ドライバー。** `KernelDrivers.DEFAULT` は、コンポーネントの `Program` に `WasiP2Driver`（`BLOCKING`。ADR 0267）を選ぶ。`wasi:cli/run@0.2.<n>` の `run` がなければ `NOEXEC`（読み込みは成功して共有したまま、ドライバーが毎回断る）。
+- **割り込み。** 検証の途中でコンパイル用のスレッドが割り込まれた（`WasmTrapException` の `INTERRUPTED`。ADR 0262）ら、`Machine.loadedProgram` は `AGAIN` にする（内容の失敗ではないので `ProgramCache` も覚えない）。呼んだプロセスやマシンは壊さない。ほかの種類のトラップは来ない想定なので、内部の誤り（`IllegalStateException`）にする。
+- **キャッシュの重さ。** `ProgramCache` は重さを `Program.cacheWeight` から取る（強い参照に入れるときと、弱い参照から持ち直すときの 2 か所で同じ値）。core モジュールは今までどおり読み込む前のバイト数。コンポーネントは「中の core モジュール（同じ中身は 1 つ）のランタイムに渡したバイト数 ＋ core モジュールの数 × 64 KiB ＋ 計画の項目（手順・lift・lower・resource）の数 × 256 バイト」（`ComponentProgram.weightOf`。定数は仮の値で、確定は #251）。core モジュールを最大 1,000 個持てるので、元のバイト数だけで数えると、小さな入力でコンパイル結果（Metaspace）を大量に使えるため。
+- **制約（1,000 台規模）。** 待っている p2 のコマンド 1 つにつきスレッドを 1 本使う（`BLOCKING`）。上限はサーバー全体の `SchedulerConfig.maxBlockingProcesses`（既定 2048）と、1 台の `MachineConfig.maxBlockingProcesses`（仮: 8。確定は #251）の 2 つで、どちらかを超えると作れない（`ResourceLimitException`。`kibi:process` の `spawn` は `NFILE`）。1 台の上限は、少数の台（1 台は `maxProcesses` の 64 まで作れる）がサーバー全体の枠を使い切って、ほかの全台の p2 のコマンドを `NFILE` にすることを防ぐ。それでも、多くの台が 1 台の上限まで待つ p2 のコマンドを置けば全体の枠は尽きうる（2048 / 8 = 256 台）ので、規模の目標（待っているだけの台はスレッドをほぼ使わない）を満たすのは、スレッドを持たない待ち（#757）が済んでから。計画の共有で、ヒープとコンパイルは同じコンポーネントにつき 1 回で済む。
+- 保存は今までどおり `UNSAVEABLE`（#269）。モジュールの置き場には元のバイト列を、既存の形（`<sha256>.wasm`）で書く。
+- 確かめていないこと: ネイティブの `wasm32-wasip2`・`wasm32-wasip3` のツールチェーンで作ったコンポーネント（テストはアダプターで包んだもの）、製品の jar（jarJar）での検証器・リンカー・ホストのクラスの読み込み（GameTest `componentCommandLoadsOnServer` は開発環境の実行時クラスパスで、読み込み・ホストの組み立て・`run` の呼び出しまで確かめる）。この 2 件は #775 で追う。
 
 ## テスト
+
+- `ComponentExecTest`（#687）: アダプターで包んだ p2 のコマンドを `Machine.exec` で動かす、別のマシン・別のドライバーの集合から exec しても読み込みは 1 回、`run` のないものは `NOEXEC`（読み込みは共有）、リンクできないもの（p3・ホストにない import）は `NOEXEC` で失敗を覚える、読み込みの割り込みは `AGAIN` で覚えない、重さの見積もり、p1 の `kibi:process` の `spawn` でコンポーネントの子を作る、ブロッキング型の上限（サーバー全体・1 台）で `NFILE`、共有した計画とホストを 6 台のプロセスが同時に動かす。
 
 - `ComponentLinkTest`: ホストの関数、core インスタンスどうしのメモリ・グローバル・テーブル・関数、文字列と realloc・post-return の順、`may_leave`（realloc の中と post-return の中。post-return から core どうしで直接呼ぶのはトラップしない）、トラップの後、入れ子のコンポーネント、同じ中身のモジュールのまとめ、燃料の共有、元のバイト列の検証。インスタンスの間の受け渡し（メモリ・グローバル・テーブル・関数、文字列、入れ子）は、計測なしとありの両方で回し、計測ありでは燃料が減って、どのインスタンスから読んでも同じことも確かめる（#692）。
 - `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。計測なしとあり（燃料を共有する形）の両方で動かし、計測ありで燃料が切れたトラップは `assert_trap` の成功に数えない（#692。`json-from-wast` はファイルごとに 1 回）。通らないもの（map、async、複数のメモリ）は理由と一緒に挙げる（resource は #265 で通るようにした。`test/resources` の wast も足した）。

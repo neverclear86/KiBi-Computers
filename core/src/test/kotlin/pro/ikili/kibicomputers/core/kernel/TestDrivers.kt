@@ -160,6 +160,7 @@ internal class Harness(
         maxProcessMemoryBytes: Long? = null,
         maxDevices: Int? = null,
         fuelSlice: Long? = null,
+        maxBlockingProcesses: Int? = null,
     ): Machine =
         scheduler.createMachine(
             host ?: MachineHost { m, s, _ -> events += m.id to s },
@@ -168,6 +169,8 @@ internal class Harness(
                 maxProcessMemoryBytes?.let { maxProcessMemoryBytes(it) }
                 maxDevices?.let { maxDevices(it) }
                 fuelSlice?.let { fuelSlice(it) }
+                // テストの駆動役は多くがブロッキング型なので、既定は maxProcesses まで（製品の既定の 1 台の上限は ComponentExecTest で確かめる）
+                maxBlockingProcesses(maxBlockingProcesses ?: maxProcesses)
             }.build(),
             environment,
         )

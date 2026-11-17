@@ -38,7 +38,7 @@ ADR 0027 は「実行中のコンピューター1台に1スレッド」だった
 
 | 型 | スレッド | 待つとき |
 | --- | --- | --- |
-| `BLOCKING` | プロセスごとに専用スレッド `KiBi-m<マシン>-p<pid>` 1本。上限 `SchedulerConfig.maxBlockingProcesses`（超えると `spawn` が `ResourceLimitException`） | `ProcessContext.block`（スレッドを持ったまま） |
+| `BLOCKING` | プロセスごとに専用スレッド `KiBi-m<マシン>-p<pid>` 1本。上限はサーバー全体の `SchedulerConfig.maxBlockingProcesses` と 1 台の `MachineConfig.maxBlockingProcesses`（#687。超えると `spawn` が `ResourceLimitException`） | `ProcessContext.block`（スレッドを持ったまま） |
 | `WAIT_POINT` | 1回の step（作って `start`、または `resume`）を共有のワーカーで動かす。step の途中の燃料待ち・`awaitHost` の間はワーカーを持つ | `StepResult.Wait`。待っている間はスレッドを持たない |
 
 - ワーカーのプールは `ThreadPoolExecutor`（コア 0、上限なし、`SynchronousQueue`、アイドル 30 秒）。上限を付けないのは、step の途中で燃料待ち・許可待ちのワーカーが仕事を塞いでデッドロックしないため
@@ -110,7 +110,7 @@ ADR 0027 は「実行中のコンピューター1台に1スレッド」だった
 
 | コスト | 抑え方 | 1,000 台のときの見込み |
 | --- | --- | --- |
-| OS スレッドの数 | 待機点型は step の途中だけ。ブロッキング型は1プロセス1本で、上限 `maxBlockingProcesses`。ほかにディスパッチャー1本 | 待っているだけの待機点型の台は 0 本 |
+| OS スレッドの数 | 待機点型は step の途中だけ。ブロッキング型は1プロセス1本で、上限はサーバー全体と1台の `maxBlockingProcesses`。ほかにディスパッチャー1本 | 待っているだけの待機点型の台は 0 本 |
 | 待っているだけの台に tick ごとにかかる処理 | 0。`tick()` は tick の番号を進めるだけ。燃料は CPU を取るときに遅延補充する。通知は通知のあるマシンだけ | `tick()` は O(1)＋O(通知の数) |
 | 燃料待ちを起こす処理 | ディスパッチャーが燃料待ちのいるマシンだけを見る（メインスレッドの外） | メインスレッドには乗らない |
 | CPU の全体の上限 | 公平なセマフォ（同時に実行するマシンの数。仮に CPU のスレッド数の半分） | 計算に使うコアの数は台数によらず一定 |

@@ -141,6 +141,8 @@ jar は約 5.5 MiB 増える（`wasm-tools-1.2.0.jar` 5,635,996 バイト、`was
 
 `Machine.beginExec` の読み込み（`Program.load*`・`ProgramCache`）は変えない。コンポーネントを exec したときは、`ModulePrescan` がヘッダーで見分けて、重い検証をせずにすぐ「Component Model のコンポーネントは、まだ実行できない」で断る（`NOEXEC`。exec の経路を通すテストは `ComponentExecTest`）。`Program` は #263 で扱った（`Program.component`）。`ProgramCache` は #687、保存データ（`ModuleSource`・スナップショットの節）は #269 で扱う。
 
+追記（#687）: exec につないだ。`ModulePrescan` のコンポーネントの分岐は外し、`Program.loadExecutable` がヘッダーで見分けて `ComponentProgram.load` で読む（ADR 0263 の追記）。`Machine.loadedProgram` は `WasmTrapException`（`INTERRUPTED`）を `AGAIN` にする。
+
 ## 測定
 
 Windows・Java 17（Gradle のテスト。温まっていない JVM）。

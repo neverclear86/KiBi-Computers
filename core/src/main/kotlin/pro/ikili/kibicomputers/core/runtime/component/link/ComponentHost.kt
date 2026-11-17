@@ -10,6 +10,15 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
  *
  * `wasi:*` の実物は `WasiP2Host`（版の受け付け方とホストの一覧は ADR 0267）。`kibi:*` は #685 が足す。
  * テストは、宣言に合わせたホストを渡してよい
+ *
+ * スレッド（#687。ADR 0263）: `exec` で使うホスト（`KernelDrivers.COMPONENT_HOST`）は、サーバー全体で 1 つの固定のもので、
+ * 状態を持たない。ホストの解決は読み込みのとき（コンパイル用のスレッド）に 1 回だけ行い、その結果（[HostFunctionBody]・
+ * [HostResourceDrop]）は計画（[ComponentPlan]）に入って `ProgramCache` で全マシンが共有する。そのため、
+ *
+ * - [interfaceOf] は、どのスレッドから何度呼んでも同じ答えを返す（マシンやデバイスの構成で変えない。`ProgramCache` のキーは
+ *   ホストを含まないので、変えるとリンクの失敗が覚えられて別のマシンにも返る）
+ * - 関数の本体・dtor は、多数のプロセスのスレッドから同時に呼ばれる。プロセスの状態は呼び出しの文脈（[ComponentCall.env]）から
+ *   引き、ホストの中に可変の状態を持たない。デバイスがあるかどうかも、リンクのときではなく呼び出しのときに見る
  */
 internal fun interface ComponentHost {
     /** import の名前 [name]（`ns:pkg/iface@版`）のインターフェース。出さないなら `null` */
@@ -66,6 +75,7 @@ internal class HostResource(val id: Int, val drop: HostResourceDrop? = null)
  * 呼んだ組み込みの中から呼ばれる（[ComponentCall.functionName] は `[resource-drop]<名前>`）。
  *
  * 待たない・すぐ戻る。カーネルロックが要るなら自分で短く取る。状態は持たず、[rep] で引く。
+ * 計画を共有する全マシンのプロセスのスレッドから同時に呼ばれるので、スレッド安全にする（[ComponentHost]）。
  * ゲストの入力の誤りは [WasmTrapException]
  */
 internal fun interface HostResourceDrop {
@@ -80,6 +90,8 @@ internal class HostFunction(val type: CanonFunction, val body: HostFunctionBody)
  * ホストの関数の処理（#263）。引数は lift した後の値（全引数の lift の後に呼ぶ。#616）、戻り値は結果の値（結果のない関数は `null`）。
  *
  * プロセスのスレッドで、ゲストの canon lower の呼び出しの中から呼ばれる。ゲストのメモリには触らない（値は写してある）。
+ * 計画を共有する全マシンのプロセスのスレッドから同時に呼ばれるので、状態を持たず（プロセスの状態は [ComponentCall.env] から引く）、
+ * スレッド安全にする（[ComponentHost]）。
  * ゲストの入力の誤りは [WasmTrapException]、ホストの誤り（型に合わない値を返したなど）は [IllegalArgumentException]
  *
  * own・borrow の値（[CanonValue.Handle]）は、ハンドルの番号ではなく rep（#265）:

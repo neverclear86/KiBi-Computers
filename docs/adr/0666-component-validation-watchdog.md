@@ -106,5 +106,5 @@ core のインスタンス化の引数は、import ごとに1回確かめるの�
 ## 残ること
 
 - 時間で止めても、1件で上限の時間（8 秒）まではコンパイル用のスレッド（既定 1 本）を占有できる。失敗は内容のハッシュで覚えるので、少しずつ変えた重い入力を次々に出されると、全マシンの exec の読み込みが遅れる（TPS は落ちない）。持ち主の間の公平さは #750 で扱う
-- `ProgramCache` と `Machine.loadedProgram` の `INTERRUPTED` の扱いと、exec への配線は #687
+- `ProgramCache` と `Machine.loadedProgram` の `INTERRUPTED` の扱いと、exec への配線は #687（済み。`ProgramCache` は覚えず、`Machine.loadedProgram` は `AGAIN` にする。ADR 0263 の追記）
 - Java 21（NeoForge）での見張りの測定はしていない（単体テストは Java 17）

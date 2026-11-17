@@ -35,7 +35,8 @@ import java.util.concurrent.atomic.AtomicLong
  * - [load] が返す future は呼び出しごとに別のもの。待つのをやめたら `cancel` する。待つ側がすべていなくなった読み込みは、
  *   始まる前なら待ち行列から外して読み込まない（始まっていれば最後まで読み込み、結果は共有する）
  * - 読み込みが [WasmLoadException] で失敗したら、そのキーを [failureTtlNanos] の間（最大 [maxFailures] 個）覚え、
- *   その間に頼まれたら読み込まずに同じ失敗を返す。それ以外の失敗（スレッドの停止など）は覚えない
+ *   その間に頼まれたら読み込まずに同じ失敗を返す。それ以外の失敗（スレッドの停止、コンポーネントの検証の途中の割り込み
+ *   `WasmTrapException` など）は覚えない
  * - [close] の後は読み込まない。読み込み中・待ち行列にあったものの future も、その場で失敗させる（#344。待つ側を止めないため）
  * - 保持: 最近使った [maxEntries] 個（かつ重さの合計が [maxWeight] まで）を強い参照で持つ。あふれたら、最も長く使っていないものから
  *   強い参照を外す。外したものも、どこかのプロセスがまだ使っていれば（弱い参照が生きていれば）同じものを返す。
@@ -46,7 +47,10 @@ import java.util.concurrent.atomic.AtomicLong
 internal class ProgramCache(
     /** 強い参照で持つ数の上限（1 以上） */
     private val maxEntries: Int,
-    /** 強い参照で持つものの重さ（読み込む前のバイト数）の合計の上限（1 以上）。1 つでこれを超えるものも、最新の 1 つなら持つ */
+    /**
+     * 強い参照で持つものの重さ（[Program.cacheWeight]。core モジュールは読み込む前のバイト数、コンポーネントは中の core モジュールの
+     * 数と計画の大きさを足した見積もり）の合計の上限（1 以上）。1 つでこれを超えるものも、最新の 1 つなら持つ
+     */
     private val maxWeight: Long,
     /** 読み込みを行う Executor */
     private val executor: Executor,
@@ -149,7 +153,7 @@ internal class ProgramCache(
             retained[key]?.let { return CompletableFuture.completedFuture(it.program) }
             alive[key]?.get()?.let { program ->
                 // 強い参照から外れた後も使われていた。もう一度持つ
-                retainLocked(key, program, bytes.size.toLong())
+                retainLocked(key, program)
                 return CompletableFuture.completedFuture(program)
             }
             recentFailureLocked(key)?.let { return CompletableFuture.failedFuture(it) }
@@ -278,7 +282,7 @@ internal class ProgramCache(
                 result.fold(
                     { program ->
                         alive[job.key] = Ref(job.key, program, queue)
-                        retainLocked(job.key, program, job.bytes.size.toLong())
+                        retainLocked(job.key, program)
                     },
                     { e -> if (e is WasmLoadException) rememberFailureLocked(job.key, e) },
                 )
@@ -337,8 +341,9 @@ internal class ProgramCache(
 
     private fun closedException(cause: Throwable?) = IllegalStateException("WASM を読み込むスレッドが止まっている", cause)
 
-    /** 強い参照で持つ。あふれたら古いものから外す（最新の 1 つは残す） */
-    private fun retainLocked(key: Key, program: Program, weight: Long) {
+    /** 強い参照で持つ。重さは [Program.cacheWeight]（#687）。あふれたら古いものから外す（最新の 1 つは残す） */
+    private fun retainLocked(key: Key, program: Program) {
+        val weight = program.cacheWeight
         retained.remove(key)?.let { retainedWeight -= it.weight }
         retained[key] = Retained(program, weight)
         retainedWeight += weight

@@ -6,7 +6,7 @@ kibi - WASI の対応範囲と kibi の拡張
 
 ## 説明
 
-プログラムは、WASI preview 1（p1、`wasi_snapshot_preview1`）を使う WebAssembly のモジュールです。動くのはコマンド形式（`_start` を export するモジュール）だけです。WASI preview 2・preview 3 と Component Model はまだ未実装で、コンポーネントを実行しようとすると、読み込みで `NOEXEC` になります。
+プログラムは、WASI preview 1（p1、`wasi_snapshot_preview1`）を使う WebAssembly のモジュールです。動くのはコマンド形式（`_start` を export するモジュール）だけです。WASI preview 2 のコマンドのコンポーネント（`wasi:cli/run@0.2.x` を export するもの）も動きますが、import できるのは `wasi:*@0.2.x` だけで、待つ間もスレッドを使い、状態は保存されません。WASI preview 3 はまだ未実装で、読み込みで `NOEXEC` になります。
 
 WASI にない機能は、`kibi:*` という名前の WIT のパッケージで出しています。パッケージの版はすべて `@0.1.0` で、版が完全に一致するものだけを受け付けます。p1 のプログラムには、関数を `kibi:パッケージ/インターフェース@版` という名前の import で出しています。
 
@@ -21,7 +21,7 @@ WASI にない機能は、`kibi:*` という名前の WIT のパッケージで�
 
 ## 注意
 
-p2・p3 と Component Model は、カーネルの同じ土台の上の薄い層として後で足す予定で、`kibi:*` の同じ WIT を使います。名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けの仮置きで、p1 からは import できません（`NOEXEC`）。
+p2・p3 と Component Model は、カーネルの同じ土台の上の薄い層で、`kibi:*` の同じ WIT を使う予定です。p2 のコマンド（`wasi:cli/run` を export するコンポーネント）は exec で動きますが、`kibi:*` はまだ import できません（`NOEXEC`）。p3 などの残りは後で足す予定です。名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けの仮置きで、p1 からは import できません（`NOEXEC`）。
 
 ソケットは未実装です。p1 の `sock_*` は `NOSYS` を返します。
 
