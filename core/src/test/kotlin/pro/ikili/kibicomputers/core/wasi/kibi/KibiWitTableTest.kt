@@ -139,6 +139,19 @@ class KibiWitTableTest {
     }
 
     @Test
+    fun `kibi_computer_accessの関数はすべてp1に出していて、2つのworldがaccessをimportし、wasiを参照しない`() {
+        val access = setOf("get-access", "request-add", "request-remove", "request-transfer").map { WasiP1Kibi.ACCESS to it }.toSet()
+        assertEquals(access, derived().filter { it.first == WasiP1Kibi.ACCESS }.toSet())
+        for (fn in access) assertTrue(fn in WasiP1Kibi.functions, "$fn を p1 に出していない")
+        val world = witText("kibi-computer/world.wit")
+        for (w in listOf("imports", "imports-p2")) {
+            val body = Regex("""world\s+$w\s*\{([^}]*)}""").find(world)!!.groupValues[1]
+            assertTrue(Regex("""(?m)^\s*import\s+access\s*;""").containsMatchIn(body), "$w が access を import していない: $body")
+        }
+        assertFalse(useLines(witText("kibi-computer/access.wit")).any { "wasi:" in it })
+    }
+
+    @Test
     fun `kibi_kernelのp2とp3のinterfaceはWITにあり、p1には出さない`() {
         val wit = derived()
         val expected = mapOf(

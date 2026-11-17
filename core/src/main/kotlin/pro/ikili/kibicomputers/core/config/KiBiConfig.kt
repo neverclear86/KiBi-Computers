@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.config
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.access.AccessRequestRules
 import pro.ikili.kibicomputers.core.access.AccessRules
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
@@ -268,6 +269,22 @@ public object KiBiConfig {
         "1台のコンピューターの、名前で足してまだ待っているメンバーの数の上限。",
     )
 
+    /** OS からの依頼（#110）の期限（秒） */
+    @JvmField
+    public val ACCESS_REQUEST_TTL_SECONDS: IntEntry = serverInt(
+        "access", "requestTtlSeconds", AccessRequestRules.DEFAULT_TTL_SECONDS, 30, 86400, ConfigApply.RELOAD,
+        "Seconds a change requested by a program on a computer waits for the owner or an operator to approve it.",
+        "コンピューターのプログラムが出した変更の依頼が、持ち主か OP の承認を待つ時間（秒）。過ぎたら取り消す。",
+    )
+
+    /** 1台の承認待ちの依頼の上限（#110） */
+    @JvmField
+    public val ACCESS_MAX_REQUESTS_PER_COMPUTER: IntEntry = serverInt(
+        "access", "maxRequestsPerComputer", AccessRequestRules.DEFAULT_MAX_OUTSTANDING, 1, 32, ConfigApply.RELOAD,
+        "Maximum number of change requests from one computer that are waiting for approval.",
+        "1台のコンピューターの、承認を待っている変更の依頼の数の上限。",
+    )
+
     /** すべての項目（宣言の順） */
     @JvmField
     public val ENTRIES: List<ConfigEntry<*>> = entries.toList()
@@ -361,5 +378,12 @@ public object KiBiConfig {
         AccessRules.hoursToMillis(values[ACCESS_PENDING_INVITE_HOURS]),
         values[ACCESS_MAX_MEMBERS],
         values[ACCESS_MAX_PENDING_INVITES],
+    )
+
+    /** [values] から OS からの依頼の期限と件数の仮値を作る（#110） */
+    @JvmStatic
+    public fun accessRequestRules(values: ConfigValues): AccessRequestRules = AccessRequestRules(
+        values[ACCESS_REQUEST_TTL_SECONDS] * 1000L,
+        values[ACCESS_MAX_REQUESTS_PER_COMPUTER],
     )
 }

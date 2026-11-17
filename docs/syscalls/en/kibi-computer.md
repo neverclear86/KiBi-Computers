@@ -1,6 +1,6 @@
 ---
 title: kibi:computer
-description: Remaining RAM, uptime and in-game time, and power (shutdown and reboot).
+description: Remaining RAM, uptime and in-game time, power (shutdown and reboot), and the owner and permissions (read and request changes).
 ---
 
 `kibi:computer@0.1.0` covers the computer (machine) as a whole. None of its functions wait.
@@ -54,6 +54,51 @@ interface power {
 - Rebooting repeatedly in a short time makes the delay before booting again longer (the return value does not change)
 - The retptr of `reboot` is written only when refused. So even if the retptr is outside the linear memory, an accepted reboot happens (no trap). If it is refused and the retptr is outside, it traps
 
+## access
+
+```wit
+// kibi-computer/access.wit
+package kibi:computer@0.1.0;
+interface access {
+    use kibi:kernel/types@0.1.0.{error-code};
+    enum access-state {
+        unowned,
+        owned,
+        locked,
+    }
+    record player {
+        name: string,
+        id: string,
+    }
+    record access-info {
+        state: access-state,
+        owner: option<player>,
+        members: list<player>,
+        invites: list<string>,
+    }
+    get-access: func() -> result<access-info, error-code>;
+    request-add: func(name: string) -> result<_, error-code>;
+    request-remove: func(name-or-id: string) -> result<_, error-code>;
+    request-transfer: func(name: string) -> result<_, error-code>;
+}
+```
+
+- Shows the owner, members and pending invites of the computer (case) ([ADR 0131](../adr/0131-player-access.md)) and **requests** changes to them (#110, [ADR 0110](../adr/0110-player-access-commands.md)). A program cannot change them directly
+- `get-access` returns the current state. When `unowned` (no owner) or `locked` (the saved record could not be read), `owner` is none and `members` and `invites` are empty. `invites` are pending entries added by name (lowercase); expired ones are left out. Requests waiting for approval are not included
+- `request-add`, `request-remove` and `request-transfer` return ok once the request is accepted. ok does not mean "applied". A request is applied when the owner or an operator approves it in the game with `/kibicomputers access approve <ID>` (for a `transfer` on a case without an owner, the player who becomes the owner; for a `locked` case, operators only); read the result with `get-access`. When the owner is online, approve and deny buttons appear in their chat
+- Requests waiting for approval are limited per computer (4 by default, config `access.maxRequestsPerComputer`) and expire (300 seconds by default, `access.requestTtlSeconds`). Identical requests (same kind and argument; names ignore case) are merged into one and return ok. Waiting requests are not saved (they are gone when the server stops)
+- The argument of `remove` is a name (the pending entry, and members currently online with that name) or a UUID in canonical form (36 characters with hyphens; uppercase is accepted)
+- A `transfer` is not applied if the target player is not online when it is approved
+
+| Situation | Result |
+| --- | --- |
+| Wrong name form (`[A-Za-z0-9_]{1,16}`), a `remove` argument that is neither a name nor a UUID, more than 64 bytes, not UTF-8 | `invalid` |
+| This computer has no owner and permissions (such as a machine created outside the game) | `not-supported` |
+| Too many requests waiting for approval | `again` |
+
+- A string range outside the linear memory traps. The retptr is checked after the request is accepted (if it is outside, the request is delivered and then it traps)
+- `get-access` can also be called from inside `cabi_realloc`. `cabi_realloc` is called in Canonical ABI field order (owner name, owner id, the `members` array, each member's name and id, the `invites` array, each invite)
+
 ## p1 imports
 
 Module: `kibi:computer/memory@0.1.0`
@@ -84,3 +129,24 @@ Module: `kibi:computer/power@0.1.0`
 <!-- /check -->
 
 The retptr of `reboot` is a `result<_, error-code>` (discriminant `u8 @0`; if err, `u8 @1`; 2 bytes, align 1).
+
+Module: `kibi:computer/access@0.1.0`
+
+<!-- check:imports kibi:computer/access@0.1.0 -->
+| Function | Core type | cabi_realloc | Blocks |
+| --- | --- | --- | --- |
+| `get-access` | `(ret_ptr: i32) -> ()` | required | — |
+| `request-add` | `(name_ptr: i32, name_len: i32, ret_ptr: i32) -> ()` | — | — |
+| `request-remove` | `(arg_ptr: i32, arg_len: i32, ret_ptr: i32) -> ()` | — | — |
+| `request-transfer` | `(name_ptr: i32, name_len: i32, ret_ptr: i32) -> ()` | — | — |
+<!-- /check -->
+
+The retptr of `request-*` is a `result<_, error-code>`, the same as `reboot`. The retptr of `get-access` has this shape (strings are `ptr`, `len`; `list<T>` is `ptr`, `len`; padding and unused value space are 0).
+
+| Type | Layout | Size / align |
+| --- | --- | --- |
+| `result<access-info, error-code>` | Discriminant `u8 @0`; if ok, `access-info @4`; if err, `u8 @4` | 44 / 4 |
+| `access-info` | `state: u8 @0`; the `owner` discriminant `u8 @4` and `player @8`; `members @24`, `@28`; `invites @32`, `@36` | 40 / 4 |
+| `player` | `name @0`, `@4`; `id @8`, `@12` | 16 / 4 |
+
+The `access-state` discriminants are `unowned` = 0, `owned` = 1, `locked` = 2.

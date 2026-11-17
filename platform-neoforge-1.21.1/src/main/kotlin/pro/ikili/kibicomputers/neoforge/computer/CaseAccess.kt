@@ -8,6 +8,7 @@ import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.common.util.FakePlayer
 import net.neoforged.neoforge.event.entity.living.LivingDestroyBlockEvent
 import net.neoforged.neoforge.event.level.BlockEvent
+import pro.ikili.kibicomputers.core.access.AccessRequestRules
 import pro.ikili.kibicomputers.core.access.AccessRules
 import pro.ikili.kibicomputers.core.access.PlayerAccess
 import pro.ikili.kibicomputers.core.access.PlayerRef
@@ -36,6 +37,9 @@ internal object CaseAccess {
 
     /** 今のコンフィグの仮値 */
     fun rules(): AccessRules = KiBiConfig.accessRules(KiBiConfigs.server)
+
+    /** 今のコンフィグの、OS からの依頼（#110）の期限と件数。どのスレッドから呼んでもよい（[KiBiConfigs.server] は `@Volatile`） */
+    fun requestRules(): AccessRequestRules = KiBiConfig.accessRequestRules(KiBiConfigs.server)
 
     /** [player] の識別 */
     fun ref(player: Player): PlayerRef = PlayerRef(player.uuid, player.gameProfile.name)

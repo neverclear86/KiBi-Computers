@@ -6,6 +6,15 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.api.device.Device
 import pro.ikili.kibicomputers.api.device.DeviceMethods
+import pro.ikili.kibicomputers.core.access.AccessPort
+import pro.ikili.kibicomputers.core.access.AccessRequest
+import pro.ikili.kibicomputers.core.access.AccessRequestKind
+import pro.ikili.kibicomputers.core.access.AccessRequestLimiter
+import pro.ikili.kibicomputers.core.access.AccessRequestRules
+import pro.ikili.kibicomputers.core.access.AccessRules
+import pro.ikili.kibicomputers.core.access.AccessView
+import pro.ikili.kibicomputers.core.access.PlayerAccess
+import pro.ikili.kibicomputers.core.access.PlayerRef
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
@@ -49,6 +58,8 @@ class BasicCommandsTest {
         "sleep", "env", "printenv", "date", "seq", "yes", "sort", "uniq", "tee", "xargs", "basename", "dirname", "which",
         // #454
         "ps", "df", "mount", "umount", "reboot", "shutdown",
+        // #110
+        "access",
     )
 
     private fun imageFile(path: String): ByteArray {
@@ -1166,6 +1177,98 @@ class BasicCommandsTest {
             ),
             lines.drop(23).filter { it.isNotEmpty() },
             out,
+        )
+    }
+
+    // ---- #110: access ----
+
+    /** 偽の `kibi:computer/access` の口（届いた依頼を覚える） */
+    private class FakeAccessPort(val access: PlayerAccess) : AccessPort {
+        override val limiter: AccessRequestLimiter = AccessRequestLimiter()
+        val delivered = java.util.concurrent.CopyOnWriteArrayList<AccessRequest>()
+
+        override fun view(): AccessView = AccessView(access, AccessRules.DEFAULT)
+
+        override fun requestRules(): AccessRequestRules = AccessRequestRules(60_000, 2)
+
+        override fun deliver(request: AccessRequest) {
+            delivered += request
+        }
+    }
+
+    @Test
+    fun `accessは持ち主・メンバー・保留を書き、依頼を出し、断られたら1、使い方の誤りは2`() {
+        val alex = PlayerRef(java.util.UUID.fromString("00000000-0000-0000-0000-00000000000a"), "Alex")
+        val steve = PlayerRef(java.util.UUID.fromString("00000000-0000-0000-0000-00000000000b"), "Steve")
+        val now = System.currentTimeMillis()
+        val rules = AccessRules.DEFAULT
+        val access = PlayerAccess.ownedBy(alex).addPending("Steve", now, rules).access.onAccess(steve, now, rules)
+            .addPending("Fresh", now, rules).access
+        val port = FakeAccessPort(access)
+        val out = sh(
+            """
+            access
+            access add Bob; echo ${'$'}?
+            access add bad-name 2>&1; echo ${'$'}?
+            access remove 1-2-3-4-5 2>&1; echo ${'$'}?
+            access add Bob; echo ${'$'}?
+            access transfer Steve; echo ${'$'}?
+            access remove Carl 2>&1; echo ${'$'}?
+            access frob x 2>&1; echo ${'$'}?
+            access add 2>&1; echo ${'$'}?
+            access add a b 2>&1; echo ${'$'}?
+            """,
+            environment = MachineEnvironment.builder().access(port).build(),
+        )
+        val usage = "usage: access [add NAME | remove NAME|UUID | transfer NAME]"
+        assertEquals(
+            """
+            state: owned
+            owner: Alex 00000000-0000-0000-0000-00000000000a
+            members:
+              Steve 00000000-0000-0000-0000-00000000000b
+            invites:
+              fresh
+            access: requested: add Bob; the owner approves it in the game
+            0
+            access: bad-name: not a player name
+            1
+            access: 1-2-3-4-5: not a player name or UUID
+            1
+            access: requested: add Bob; the owner approves it in the game
+            0
+            access: requested: transfer to Steve; the owner approves it in the game
+            0
+            access: Carl: too many requests are waiting for approval
+            1
+            access: unknown command
+            $usage
+            2
+            access: missing operand
+            $usage
+            2
+            access: extra operand
+            $usage
+            2
+            """.trimIndent() + "\n",
+            out,
+        )
+        assertEquals(listOf(AccessRequestKind.ADD to "Bob", AccessRequestKind.TRANSFER to "Steve"), port.delivered.map { it.kind to it.argument })
+    }
+
+    @Test
+    fun `持ち主と権限のないコンピューターではaccessはnot supportedで1`() {
+        assertOutput(
+            """
+            access: not supported on this computer
+            1
+            access: Bob: not supported on this computer
+            1
+            """,
+            """
+            access 2>&1; echo ${'$'}?
+            access add Bob 2>&1; echo ${'$'}?
+            """,
         )
     }
 

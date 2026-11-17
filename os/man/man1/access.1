@@ -1,0 +1,34 @@
+# access(1)
+
+## NAME
+
+access - show the owner and members of the computer, and request changes
+
+## SYNOPSIS
+
+    access
+    access add NAME
+    access remove NAME|UUID
+    access transfer NAME
+
+## DESCRIPTION
+
+Without operands, prints the state (`unowned`, `owned` or `locked`), the owner, the members (name and UUID) and the invites (players added by name who have not used the computer yet).
+
+`add`, `remove` and `transfer` only send a request. Nothing changes until the owner (or an operator) approves it in the game: the owner gets a chat message with Approve and Deny buttons while online. Run `access` again to see the result.
+
+- `add NAME`: invite the player. They become a member when they next use the computer.
+- `remove NAME|UUID`: remove a member by UUID, or an invite by name. With a name, an online member of that name is removed too.
+- `transfer NAME`: make the online player NAME the owner. The old owner does not stay a member. On a computer without an owner, NAME must approve it.
+
+Requests expire after a while, and only a few can wait at once. Repeating the same request does not send another message.
+
+This is about players in the game, not files: programs on the computer are not separated by user.
+
+## EXIT STATUS
+
+0 when the request was sent. 1 when it was refused (`too many requests are waiting for approval`, `not supported on this computer`, `not a player name`). 2 for a usage error.
+
+## SEE ALSO
+
+ls(1)
