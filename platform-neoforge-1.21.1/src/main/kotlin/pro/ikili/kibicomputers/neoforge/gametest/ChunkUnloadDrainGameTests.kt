@@ -1,6 +1,5 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
-import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.server.level.ServerChunkCache
@@ -17,13 +16,6 @@ import java.util.concurrent.TimeUnit
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object ChunkUnloadDrainGameTests {
-    /** テストの場所から離れた（読み込まれていない）チャンクまでの距離 */
-    private const val FAR_CHUNKS = 400
-
-    /** 読み込まれていないチャンクを探すときの、候補の数と、候補ごとに遠ざける距離（チャンク） */
-    private const val FAR_CANDIDATES = 16
-    private const val FAR_STEP = 37
-
     /** 離れたチャンクを読み込ませるチケット（チャンクを FULL にする段階） */
     private val TICKET: TicketType<ChunkPos> = TicketType.create("kibicomputers_drain_test", Comparator.comparingLong(ChunkPos::toLong))
 
@@ -36,7 +28,7 @@ object ChunkUnloadDrainGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
     fun drainRunsMainThreadTasksBetweenRequeues(helper: GameTestHelper) {
-        val far = farChunk(helper)
+        val far = FarChunks.reserve(helper)
         val result = drainWithRequeueing(helper.level.chunkSource, far, ticket = true, timeoutNanos = TimeUnit.SECONDS.toNanos(30))
         helper.assertTrue(result.drained, "the unload queue should drain (ran the requeueing task ${result.runs} times)")
         helper.assertTrue(result.loadedAfter, "the far chunk should load while draining")
@@ -52,28 +44,13 @@ object ChunkUnloadDrainGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
     fun requeueingTaskLeavesQueueWhenDrainTimesOut(helper: GameTestHelper) {
-        val far = farChunk(helper)
+        val far = FarChunks.reserve(helper)
         // チケットを付けないので、チャンクは読み込まれず、上限（0）ですぐに諦める
         val result = drainWithRequeueing(helper.level.chunkSource, far, ticket = false, timeoutNanos = 0)
         helper.assertFalse(result.drained, "the drain should give up when the chunk never loads")
         helper.assertTrue(result.runs >= 1, "the requeueing task should have run (ran ${result.runs} times)")
         helper.assertFalse(result.leftInQueue, "the requeueing task should not be left in the unload queue")
         helper.succeed()
-    }
-
-    /**
-     * テストの場所から離れた、読み込まれていないチャンク。ほかのテストが読み込んだ（まだアンロードされていない）チャンクと
-     * 重なることがあるので、読み込まれていないものが見つかるまで、遠ざけながら探す
-     */
-    private fun farChunk(helper: GameTestHelper): ChunkPos {
-        val origin = ChunkPos(helper.absolutePos(BlockPos.ZERO))
-        var far = ChunkPos(origin.x + FAR_CHUNKS, origin.z + FAR_CHUNKS)
-        for (attempt in 1 until FAR_CANDIDATES) {
-            if (!helper.level.hasChunk(far.x, far.z)) return far
-            far = ChunkPos(far.x + FAR_STEP, far.z + FAR_STEP)
-        }
-        helper.assertFalse(helper.level.hasChunk(far.x, far.z), "the far chunk $far should not be loaded yet")
-        return far
     }
 
     private class DrainResult(val drained: Boolean, val loadedAfter: Boolean, val runs: Int, val leftInQueue: Boolean)

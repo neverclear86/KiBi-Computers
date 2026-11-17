@@ -5,7 +5,6 @@ import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
-import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
 import net.neoforged.neoforge.gametest.GameTestHolder
@@ -242,10 +241,10 @@ object AsyncSaveGameTests {
     fun unloadCapacityWaitSharesTheDeadline(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 400, helper.absolutePos(CASE).z / 16 - 400)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
-        val positions = (0 until 3).map { BlockPos(chunk.minBlockX + 2 + it * 4, 200, chunk.minBlockZ + 7) }
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper)
+        val chunk = slot.chunk
+        val positions = (0 until 3).map { slot.pos(2 + it * 4, 200, 7) }
         val cases = positions.map { pos ->
             level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
             (level.getBlockEntity(pos) as CaseBlockEntity).also {
@@ -279,8 +278,9 @@ object AsyncSaveGameTests {
                 be.computer.endQuiesce()
                 be.pressPowerButton()
             }
-            for (pos in positions) level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
-            level.setChunkForced(chunk.x, chunk.z, false)
+            // 部品の落とし物をチャンクに残さない（#746）
+            for (pos in positions) removeCaseWithoutDrops(level, pos)
+            slot.release()
             helper.succeed()
         }
     }

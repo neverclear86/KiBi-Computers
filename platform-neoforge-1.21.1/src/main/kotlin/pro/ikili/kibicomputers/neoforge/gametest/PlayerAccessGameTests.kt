@@ -26,7 +26,6 @@ import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.item.component.CustomData
 import net.minecraft.world.item.context.BlockPlaceContext
-import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
@@ -78,17 +77,6 @@ object PlayerAccessGameTests {
     private val HOUR = AccessRules.hoursToMillis(1)
     private val cleanups = java.util.IdentityHashMap<GameTestInfo, MutableList<() -> Unit>>()
     private val LOGGER = System.getLogger("kibicomputers.gametest")
-
-    /**
-     * [ownedCasesSurviveExplosions] の爆発を置く離れたチャンク（テストの場所からのチャンク数）。ほかのテストの離れたチャンク
-     * （±400・±420・±440・+800 の向き。ChunkUnloadDrainGameTests は +400 から +x・+z へ）と、x・z の両方で 150 チャンク以上離す。
-     * GameTest の並び（1 行 8 件で x に約 4 チャンク、z はバッチをまたいで十数チャンク）の中で、ほかのテストと重ならない（#746）
-     */
-    private const val BLAST_CHUNKS_X = -600
-    private const val BLAST_CHUNKS_Z = 600
-
-    /** 爆発どうしの間（チャンク）。爆発の範囲（8 ブロック）が隣のチャンクの爆発に届かないように空ける */
-    private const val BLAST_CHUNK_STEP = 4
 
     /** 名前 [name] のプレイヤーをサーバーに入れ、ケースの隣に立たせる */
     private fun player(helper: GameTestHelper, name: String, op: Boolean = false, mode: GameType = GameType.SURVIVAL): ServerPlayer {
@@ -312,14 +300,14 @@ object PlayerAccessGameTests {
         }
     }
 
-    private class Blast(val name: String, val pos: BlockPos, val chunk: ChunkPos, val be: CaseBlockEntity, val explode: () -> Unit)
+    private class Blast(val name: String, val pos: BlockPos, val slot: FarSlot, val be: CaseBlockEntity, val explode: () -> Unit)
 
     /**
      * 持ち主のある（読めなかった記録を含む）ケースは、源が誰の爆発でも（BLOCK・TNT）壊れない。保存のディレクトリと部品が残り、
      * 何も落ちない。隣の土は壊れる（爆発耐性は変えていない）。持ち主のないケースが壊れることは
      * [MachineSaveGameTests.explosionDeletesTheSaves] が確かめる
      *
-     * 4 つの爆発は、それぞれ別の離れたチャンク（[BLAST_CHUNKS_X]・[BLAST_CHUNKS_Z]、間は [BLAST_CHUNK_STEP]）に置く。
+     * 4 つの爆発は、それぞれ別の離れたチャンク（[FarChunks] で1つずつ割り当てる。#747）に置く。
      * 落とし物は、爆発の前からあった物を除いた、その爆発で増えた物だけを数える（#746。並んで動くほかのテストの落とし物が、
      * 同じチャンクに残っていることがある）。検索がそのチャンクで働いていること（エンティティのセクションが見えること）は、
      * 爆発の後に置く目印の物が検索に出ることで確かめる
@@ -330,28 +318,24 @@ object PlayerAccessGameTests {
         val alex = player(helper, "Alex131e")
         val stranger = player(helper, "Stranger131e")
         val level = helper.level
-        val base = helper.absolutePos(CASE)
         val blasts = ArrayList<Blast>()
-        fun setUp(name: String, index: Int, access: (CaseBlockEntity) -> Unit, explode: (Vec3) -> Unit) {
-            val chunk = ChunkPos(base.x / 16 + BLAST_CHUNKS_X - index * BLAST_CHUNK_STEP, base.z / 16 + BLAST_CHUNKS_Z)
-            val pos = BlockPos(chunk.minBlockX + 8, 200, chunk.minBlockZ + 8)
-            level.setChunkForced(chunk.x, chunk.z, true)
-            onEnd(helper) { level.setChunkForced(chunk.x, chunk.z, false) }
-            level.getChunk(chunk.x, chunk.z)
+        fun setUp(name: String, access: (CaseBlockEntity) -> Unit, explode: (Vec3) -> Unit) {
+            val slot = FarChunks.allocate(helper)
+            val pos = slot.pos(8, 200, 8)
             level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
             level.setBlock(pos.east(), Blocks.DIRT.defaultBlockState(), 3)
             val be = level.getBlockEntity(pos) as CaseBlockEntity
             access(be)
             installRequired(be)
             helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-            blasts += Blast(name, pos, chunk, be) { explode(Vec3.atCenterOf(pos)) }
+            blasts += Blast(name, pos, slot, be) { explode(Vec3.atCenterOf(pos)) }
         }
         val owned: (CaseBlockEntity) -> Unit = { it.replacePlayerAccess(PlayerAccess.ownedBy(ref(alex))) }
         fun tnt(at: Vec3, by: ServerPlayer?) = PrimedTnt(level, at.x, at.y, at.z, by)
-        setUp("block, no source", 0, owned) { level.explode(null, it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.BLOCK) }
-        setUp("tnt by a stranger", 1, owned) { level.explode(tnt(it, stranger), it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.TNT) }
-        setUp("tnt by the owner", 2, owned) { level.explode(tnt(it, alex), it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.TNT) }
-        setUp("locked", 3, { be ->
+        setUp("block, no source", owned) { level.explode(null, it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.BLOCK) }
+        setUp("tnt by a stranger", owned) { level.explode(tnt(it, stranger), it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.TNT) }
+        setUp("tnt by the owner", owned) { level.explode(tnt(it, alex), it.x, it.y, it.z, 4.0f, Level.ExplosionInteraction.TNT) }
+        setUp("locked", { be ->
             val tag = be.saveWithoutMetadata(level.registryAccess())
             tag.put(CaseBlockEntity.PLAYER_ACCESS_TAG, CompoundTag().apply { put("Version", IntTag.valueOf(99)) })
             be.loadWithComponents(tag, level.registryAccess())
@@ -360,7 +344,7 @@ object PlayerAccessGameTests {
 
         // 強制読み込みしたチャンクが FULL に上がり、エンティティのセクションが見えるようになるまで待つ。見えないうちは
         // 落とし物が検索に出ない（1 tick では上がりきらないことがある）
-        fun ready() = blasts.all { level.areEntitiesLoaded(it.chunk.toLong()) && level.isPositionEntityTicking(it.pos) }
+        fun ready() = blasts.all { level.areEntitiesLoaded(it.slot.chunk.toLong()) && level.isPositionEntityTicking(it.pos) }
         fun blastWhenReady(ticksLeft: Int, run: () -> Unit) {
             if (ready()) {
                 run()
@@ -404,7 +388,7 @@ object PlayerAccessGameTests {
                 helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "${b.name}: the save directory should remain")
                 b.be.deleteSaves()
                 removeCaseWithoutDrops(level, b.pos)
-                level.setChunkForced(b.chunk.x, b.chunk.z, false)
+                b.slot.release()
             }
             ServerMachines.drainSaves()
             helper.succeed()
