@@ -51,6 +51,7 @@ M=.claude/skills/run-minecraft/scripts/mc.sh   # mc.sh <1.21.1|1.20.1> <endpoint
    | `leave` | - | ワールドを保存して出る（タイトル画面に戻る。1.21.1 だけ）。同じ名前で `world` を呼ぶと入り直す |
    | `screenshot` | `{"name":"my-check.png"}` | Minecraft の描画から撮る（前面に出さない）。返ったパスの画像を Read で見る |
    | `quit` | - | このクライアントを正常に終了する |
+   | `sound` | `{"master":1.0}` | マスター音量を変える（0.0〜1.0）。音を確かめるときだけ上げる |
    | `screen` | `{"x":0,"y":-60,"z":0,"lines":["hello","こんにちは"],"fg":16777215,"bg":0}`（`pattern: "gradient"` でピクセル画面にグラデーション） | クライアント側の画面ブロックのバッファに直接書く（1.21.1 だけ。画面の同期 #140 ができるまでの描画の確認用） |
 
 5. ログも確認する（debug の行は既定では出ない。調べるときは 1.21.1 の `runClient` に `-PdevLogLevel=DEBUG` を付けて起動すると、`run/logs/debug.log` に出る。1.20.1 にはこの指定がなく、付けても無視される。チャンクの読み込みで動かした台は `Wired the computer at ... after loading (result=...)` を1行出す。`result` が `restored` なら戻せた、`cold-boot` なら保存元はあったが冷えた起動にした、`no-source` なら保存元がなく起動した。戻せたとき以外は `restoredEventQueues=-1`）:
@@ -60,6 +61,9 @@ M=.claude/skills/run-minecraft/scripts/mc.sh   # mc.sh <1.21.1|1.20.1> <endpoint
 6. 終わったら必ず `bash $M 1.21.1 quit` で閉じる。応答しないときだけ、`stop-client.ps1`（**すべての** Minecraft のクライアントを強制終了する。並行作業中の他のクライアントも閉じるので注意）を使う。
 
 ## 注意
+
+- 開発クライアントは、既定で起動時にマスター音量を 0 にする（#786）。音を確かめるときは `-PdevSound=true` を付けて起動するか、`sound` で上げる。`status` の `master` が今の音量。
+- 自動操作でゲームの画面に戻ったときにつかまれたマウスは、すぐ放す（#786）。人がゲームの画面をクリックしてつかんだときは放さない。`status` の `mouseGrabbed` で確かめられる。
 
 - ウィンドウの上にユーザーの実際のマウスカーソルがあると、ホバー表示（ツールチップ）が撮影に写ることがある。
 - 1.20.1 も同じ操作で動く（`mc.sh 1.20.1 ...`、`:platform-forge-1.20.1:runClient`）。

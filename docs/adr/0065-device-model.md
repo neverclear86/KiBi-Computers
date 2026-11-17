@@ -33,7 +33,7 @@
 | もの | kind（予定を含む） | 呼び方 | Issue |
 | --- | --- | --- | --- |
 | 画面 | `kibicomputers:screen` | `get-size`（直接）。中身は表示デバイス（ADR 0355）。コンソールの出力は最初につないだ画面に書く | #65・#138 |
-| キーボード | `kibicomputers:keyboard` | メソッドなし。入力は TTY へ。イベントは #326 | #65・#326 |
+| キーボード | `kibicomputers:keyboard` | メソッドなし。入力は TTY へ。イベントは #326（追記: `key-pressed`・`key-released`。ADR 0326） | #65・#326 |
 | スピーカー（ケース） | `kibicomputers:speaker` | `beep(frequency, duration-ms) -> boolean`（直接。通知の列に積むだけ） | #65 |
 | GPU | `kibicomputers:gpu` | 描画の命令（直接。表示デバイスのロックを持って書く）。速さが要れば型付きの層 | #137・#141 |
 | ディスクドライブ | `kibicomputers:disk-drive` | 入っているメディアの情報（メインスレッド）。中身はディスクの FS（#56） | #56 |
