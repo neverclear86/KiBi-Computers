@@ -659,9 +659,11 @@ object ServerMachines {
      * （[markDemotedChunkUnsaved]。ADR 0084 の規則 5、#761）。チャンクを読み込み直さない（チケットは足さない）。
      *
      * アンロード待ちのチャンク（`ChunkMap.processUnloads` が holder を外し、`visibleChunkMap` から消えたが、アンロードの仕事がまだ走っていない。
-     * tick に時間が残らないと残る）は、ブロックエンティティは生きているが holder が見つからない。このときは [unmarkedCases] に覚え、
-     * 続くアンロード（[saveForUnload]）がそのチャンクに印を付ける。チャンクの中のブロックエンティティが [be] でなければ
-     * （読み込み直した別のチャンク）付けない
+     * tick に時間が残らないと残る）は、`visibleChunkMap` では見つからないので、アンロード待ちの表（`pendingUnloads`）の holder から引いて
+     * 同じく印を付ける（[findHolder]）。アンロードの仕事が走る前にチケットが戻ると、バニラはその holder を使い直し、アンロードの仕事は
+     * 何もせず終わる（`ChunkEvent.Unload` も来ない）ので、「続くアンロードが書く」には頼れない（#761）。
+     * どこにも holder が見つからないときだけ [unmarkedCases] に覚え、続くアンロード（[saveForUnload]）がそのチャンクに印を付ける。
+     * チャンクの中のブロックエンティティが [be] でなければ（読み込み直した別のチャンク）付けない
      */
     internal fun markChunkUnsaved(be: CaseBlockEntity) {
         val level = be.level as? ServerLevel ?: return
@@ -670,11 +672,11 @@ object ServerMachines {
             be.setChanged()
             return
         }
-        val chunk = level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(pos))?.latestChunk as? LevelChunk
+        val chunk = findHolder(level, ChunkPos.asLong(pos))?.latestChunk as? LevelChunk
         when {
             chunk == null -> {
                 unmarkedCases += be
-                LOGGER.debug("No visible chunk holds the computer at {} (pending unload?); marking it unsaved on unload", pos)
+                LOGGER.debug("No chunk holder holds the computer at {}; marking it unsaved on unload", pos)
             }
             chunk.blockEntities[pos] === be -> markDemotedChunkUnsaved(chunk)
             else -> LOGGER.debug("Another chunk holds the position of the computer at {}; not marking it unsaved", pos)
@@ -689,19 +691,33 @@ object ServerMachines {
      * 立て直した後は、FULL のチャンクの `setChanged` と同じく、tick の急ぎの保存（時間が残る tick に最大 20 チャンク）か自動保存が書く
      * （書いた後、フラグはまた偽になる）。
      *
-     * holder の最新のチャンクが [chunk] でなければ（読み込み直した別のチャンク・アンロード待ちで holder が見えない）フラグには触らない。
-     * 1 回につきハッシュを 1 回引くだけ（全 holder はなめない）。メインスレッドで呼ぶ
+     * アンロード待ちで `visibleChunkMap` から見えない holder（[findHolder]）のフラグも立てる。アンロードの仕事が走れば、
+     * `ChunkMap.save` はフラグを見ずに印だけで書くので、立てても害はない。走る前にチケットが戻ると、バニラはその holder を
+     * 使い直す（アンロードの仕事は何もせず終わる）。FULL でない段階で戻ったときは、フラグを立てておかないと、印が次の本物の
+     * アンロードか停止までディスクに行かない（#761）。
+     * holder の最新のチャンクが [chunk] でなければ（読み込み直した別のチャンク）フラグには触らない。どこにも holder が
+     * なければ印だけ付ける。1 回につきハッシュを高々 3 回引くだけ（全 holder はなめない）。メインスレッドで呼ぶ
      */
     internal fun markDemotedChunkUnsaved(chunk: LevelChunk) {
         chunk.isUnsaved = true
         val level = chunk.level as? ServerLevel ?: return
-        val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.pos.toLong()) ?: return
+        val holder = findHolder(level, chunk.pos.toLong()) ?: return
         // フィールドへの代入（AT で public にした）。同じ名前の public メソッド wasAccessibleSinceLastSave() は読み取り
         if (holder.latestChunk === chunk) holder.wasAccessibleSinceLastSave = true
     }
 
     /**
-     * [markChunkUnsaved] が印を付けられなかった（チャンクの holder が見えない。アンロード待ち）ケース。続くアンロード（[saveForUnload]）が
+     * チャンク [pos] の `ChunkHolder`。`visibleChunkMap`（見える holder）→ `updatingChunkMap`（チケットが戻って、まだ見える表に移っていない）→
+     * `pendingUnloads`（アンロード待ち。アンロードの仕事がまだ走っていない）の順に引く（どれも AT で読めるようにした。#761）。
+     * メインスレッドで呼ぶ
+     */
+    private fun findHolder(level: ServerLevel, pos: Long): ChunkHolder? {
+        val map = level.chunkSource.chunkMap
+        return map.getVisibleChunkIfPresent(pos) ?: map.getUpdatingChunkIfPresent(pos) ?: map.pendingUnloads.get(pos)
+    }
+
+    /**
+     * [markChunkUnsaved] が印を付けられなかった（チャンクの holder がどこにも見つからない）ケース。続くアンロード（[saveForUnload]）が
      * チャンクに `isUnsaved` を付けて外す（メインスレッドだけで触る。消えたケースは残さない）
      */
     internal val unmarkedCases: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(WeakHashMap())

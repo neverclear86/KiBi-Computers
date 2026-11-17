@@ -7,6 +7,7 @@ import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
 import net.minecraft.server.level.ChunkHolder
+import net.minecraft.server.level.TicketType
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.ChunkPos
@@ -30,6 +31,7 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
+import java.util.Comparator
 import java.util.OptionalLong
 import java.util.UUID
 
@@ -295,9 +297,11 @@ object MachineSaveGameTests {
             var changes = -1
             var holder: ChunkHolder? = null
             val stopped = stoppingAfterCapture(helper, be, afterStop = {
-                // 取り出しの間に付いた印（とバニラの保存が下ろしたフラグ）を外し、そろえが付けるかを見る
+                // 取り出しの間に付いた印（とバニラの保存が下ろしたフラグ）を外し、そろえが付けるかを見る。
+                // フックの中なので投げない（lowerHolderFlag は使わない）。holder がそのチャンクを持つかは後で確かめる
                 chunk.isUnsaved = false
-                holder = lowerHolderFlag(helper, chunk)
+                holder = helper.level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.pos.toLong())
+                holder?.wasAccessibleSinceLastSave = false
                 changes = be.setChangedCalls
             }) {
                 ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
@@ -309,6 +313,7 @@ object MachineSaveGameTests {
             helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
             helper.assertTrue(be.setChangedCalls == changes, "the settle should not call setChanged on the unload path")
             helper.assertTrue(chunk.isUnsaved, "the settle after the capture should mark the chunk unsaved")
+            helper.assertTrue(holder != null && holder!!.latestChunk === chunk, "the chunk should be the latest chunk of its holder")
             helper.assertTrue(holder!!.wasAccessibleSinceLastSave(), "the settle after the capture should raise the holder flag so that the vanilla save writes the chunk")
             val tag = be.saveWithoutMetadata(helper.level.registryAccess())
             helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
@@ -875,6 +880,79 @@ object MachineSaveGameTests {
         helper.assertTrue(be !in ServerMachines.unmarkedCases, "the unload should forget the case")
         helper.succeed()
     }
+
+    /**
+     * アンロード待ちのチャンク（`processUnloads` が holder をアンロード待ちの表に移し、`visibleChunkMap` から消えたが、アンロードの仕事が
+     * まだ走っていない）のケースも、`markChunkUnsaved` がその holder を引いて、チャンクの印と holder の保存のフラグを付ける（#761）。
+     * アンロードの仕事が走る前に FULL でない段階のチケットが戻ると、バニラは同じ holder を使い直し、アンロードの仕事は何もせず終わる
+     * （`ChunkEvent.Unload` は来ない）。フラグが下りたままだと、メモリに残ったままの `save(true)` がこのチャンクを書かない。
+     * 時間が残らない tick を作るため、`processUnloads` には「時間がない」を渡し（アンロードの仕事は列に積まれたまま走らない）、
+     * チケットの更新は `runDistanceManagerUpdates` で進める（どちらも AT で呼べるようにした）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
+    fun pendingUnloadChunkRevivedBelowFullReachesDisk(helper: GameTestHelper) {
+        val level = helper.level
+        val cache = level.chunkSource
+        val map = cache.chunkMap
+        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
+        val chunkPos = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + 800)
+        val key = chunkPos.toLong()
+        val pos = BlockPos(chunkPos.minBlockX + 3, 200, chunkPos.minBlockZ + 5)
+        level.setChunkForced(chunkPos.x, chunkPos.z, true)
+        val chunk = level.getChunk(chunkPos.x, chunkPos.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        // 置いたケースをディスクに載せておく（後で印が書かれたかを、チャンクの印が消えたかで見る）
+        cache.save(true)
+        // getChunk が付けた一時のチケット（UNKNOWN）が次の tick で外れるのを待ってから、強制読み込みを外す
+        helper.runAfterDelay(2) {
+            val holder = map.getVisibleChunkIfPresent(key)
+            helper.assertTrue(holder != null && holder.latestChunk === chunk, "the chunk should be the latest chunk of its holder")
+            var revived = false
+            try {
+                // チケットを外し、アンロード待ちにする（時間がないので、アンロードの仕事は列に積まれたまま走らない）。
+                // この呼び出しの中では tick が回らないので、アンロードの仕事は走らない
+                level.setChunkForced(chunkPos.x, chunkPos.z, false)
+                cache.runDistanceManagerUpdates()
+                for (attempt in 0 until 20) {
+                    if (map.pendingUnloads.containsKey(key)) break
+                    map.processUnloads { false }
+                }
+                cache.runDistanceManagerUpdates()
+                helper.assertTrue(
+                    map.pendingUnloads.get(key) === holder,
+                    "the holder should wait for its unload (ticket level ${holder!!.ticketLevel}, generation refs ${holder.generationRefCount})",
+                )
+                helper.assertTrue(map.getVisibleChunkIfPresent(key) == null, "the holder should no longer be visible")
+                helper.assertTrue(!be.isRemoved, "the block entity should stay while the unload waits")
+                // バニラの保存が一度試してフラグを下ろし、印も書いた後の状態
+                chunk.isUnsaved = false
+                holder.wasAccessibleSinceLastSave = false
+                ServerMachines.markChunkUnsaved(be)
+                helper.assertTrue(chunk.isUnsaved, "the chunk waiting for its unload should be marked unsaved")
+                helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the holder waiting for its unload should get the save flag")
+                helper.assertTrue(be !in ServerMachines.unmarkedCases, "a case whose holder waits for its unload should be marked at once")
+                // アンロードの仕事が走る前に、FULL でない段階（34）のチケットで戻す。同じ holder が使い直される
+                cache.addRegionTicket(REVIVE_TICKET, chunkPos, -1, chunkPos)
+                revived = true
+                cache.runDistanceManagerUpdates()
+                helper.assertTrue(map.getVisibleChunkIfPresent(key) === holder, "the same holder should be revived")
+                helper.assertTrue(!level.isLoaded(pos), "the revived chunk should stay below FULL")
+                // メモリに残ったまま、バニラの保存がチャンクを書く（積んであったアンロードの仕事は何もせず終わる）
+                cache.save(true)
+                helper.assertTrue(!chunk.isUnsaved, "the vanilla save should write the revived chunk")
+                helper.assertTrue(map.getVisibleChunkIfPresent(key) === holder, "the revived holder should stay")
+            } finally {
+                if (revived) cache.removeRegionTicket(REVIVE_TICKET, chunkPos, -1, chunkPos)
+            }
+            helper.succeed()
+        }
+    }
+
+    /** アンロード待ちのチャンクを FULL でない段階で戻すチケット（#761） */
+    private val REVIVE_TICKET: TicketType<ChunkPos> =
+        TicketType.create("kibicomputers_revive_test", Comparator.comparingLong(ChunkPos::toLong))
 
     /** ディスク（書き込み待ちを含む）のチャンク [chunk] の NBT で、[pos] のケースのタグが指す世代 */
     private fun diskGeneration(helper: GameTestHelper, chunk: ChunkPos, pos: BlockPos): Long {
