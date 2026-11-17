@@ -11,6 +11,8 @@ import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.process.ProgramLoadBusyException
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
@@ -82,6 +84,18 @@ class ProgramCacheTest {
         now = 1_000
         cache.load(1, bytes(1), true, emptySet(), flaky).get()
         assertEquals(3, cache.loads.get())
+    }
+
+    @Test
+    fun `読み込みの途中の割り込みは覚えない`() {
+        val cache = ProgramCache(4, Long.MAX_VALUE, direct)
+        var fail = true
+        val flaky = { b: ByteArray -> if (fail) throw WasmTrapException(WasmTrapKind.INTERRUPTED, "割り込み") else loader(b) }
+        val e = assertThrows<ExecutionException> { cache.load(1, bytes(1), true, emptySet(), flaky).get() }
+        assertTrue(e.cause is WasmTrapException)
+        fail = false
+        cache.load(1, bytes(1), true, emptySet(), flaky).get()
+        assertEquals(2, cache.loads.get())
     }
 
     @Test
@@ -249,10 +263,17 @@ class ProgramCacheTest {
 
     @Test
     fun `重さの合計の上限を超えたら古いものから外す`() {
-        val size = bytes(1).size.toLong()
+        // 重さは読み込んだ Program の cacheWeight（#687。p1 は読み込む前のバイト数）
+        val size = loader(bytes(0)).cacheWeight
+        assertEquals(TestModules.ADD.size.toLong(), size)
         val cache = ProgramCache(100, size * 2, direct)
-        (1..5).forEach { cache.load(1, bytes(it), true, emptySet(), ::loader).get() }
+        val first = cache.load(1, bytes(1), true, emptySet(), ::loader).get()
+        (2..5).forEach { cache.load(1, bytes(it), true, emptySet(), ::loader).get() }
         assertEquals(2, cache.retainedCount)
+        // 強い参照から外れた後に持ち直しても、重さは変わらない（上限の 2 つのまま）
+        assertSame(first, cache.load(1, bytes(1), true, emptySet(), ::loader).get())
+        assertEquals(2, cache.retainedCount)
+        assertEquals(5, cache.loads.get())
         // 1 つで上限を超えるものも、最新の 1 つは持つ
         val tiny = ProgramCache(100, 1, direct)
         tiny.load(1, bytes(1), true, emptySet(), ::loader).get()

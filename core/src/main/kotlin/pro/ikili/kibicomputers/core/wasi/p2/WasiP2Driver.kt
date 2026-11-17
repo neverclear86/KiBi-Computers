@@ -21,7 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
  *   中の `run` は `func() -> result` であること
  * - 終了コード（ADR 0074 の表）: `run` が `ok` → 0、`err` → 1。`wasi:cli/exit` の `exit(ok)` → 0、`exit(err)` → 1、
  *   `exit-with-code(n)` → n
- * - `KernelDrivers.DEFAULT` へのつなぎ込み（exec でコンポーネントを動かす）は #687
+ * - `Machine.exec` でコンポーネントを動かすときは、`KernelDrivers.DEFAULT` がこれを選ぶ（#687）
  */
 internal class WasiP2Driver private constructor(private val run: FuncRef) : ProcessDriver {
     override val kind: ProcessKind get() = ProcessKind.BLOCKING

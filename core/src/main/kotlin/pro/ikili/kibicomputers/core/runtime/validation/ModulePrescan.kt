@@ -1,8 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime.validation
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
-import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryHeader
-import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryKind
 
 /**
  * ランタイムに渡す前の、WASM のバイナリの軽い確認（#40）。
@@ -10,7 +8,9 @@ import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryKind
  * ランタイムのパーサーは、宣言された数に合わせて確保したり繰り返したりするので、小さなバイト列でも
  * 大きな確保や長い処理をさせられる。ここではバイト列を1回なめて、次を確かめる（どれも [ModuleLimits]）。
  *
- * - ヘッダー（WASM のコアモジュールの version 1。Component Model のバイナリは対象外）
+ * - ヘッダー（WASM のコアモジュールの version 1）。Component Model のコンポーネント（layer 1）は「version 1 ではない」で断る
+ *   （コンポーネントは `Program.loadExecutable` がヘッダーで見分けて `ComponentLoader` で読むので、ここには来ない。#687。
+ *   `ComponentLoader` は中の core モジュールの1つずつにこれを当てる）
  * - セクションの大きさが残りに収まる
  * - 各セクションの要素の数が上限以下で、残りのバイト数以下（要素は 1 バイト以上なので、それより多いのは壊れている）
  * - 関数の本体の大きさと、宣言するローカル変数の数
@@ -42,10 +42,6 @@ internal object ModulePrescan {
         if (bytes.size > limits.maxBytes) fail("大きすぎる（${bytes.size} バイト。上限 ${limits.maxBytes}）")
         if (bytes.size < HEADER.size) fail("WASM のヘッダーがない")
         for (i in 0 until 4) if (bytes[i] != HEADER[i]) fail("WASM のヘッダーがない")
-        if (WasmBinaryHeader.kindOf(bytes) == WasmBinaryKind.COMPONENT) {
-            // コンポーネント（layer 1）は、重い検証をせずにすぐ断る（exec につなぐのは #687）
-            throw WasmLoadException("Component Model のコンポーネントは、まだ実行できない")
-        }
         for (i in 4 until 8) if (bytes[i] != HEADER[i]) fail("WASM のコアモジュール（version 1）ではない")
         val r = Reader(bytes, HEADER.size, bytes.size)
         while (r.pos < r.end) {

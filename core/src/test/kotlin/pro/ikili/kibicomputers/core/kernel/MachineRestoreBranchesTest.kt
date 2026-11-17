@@ -56,6 +56,7 @@ import pro.ikili.kibicomputers.core.persist.snapshot.KernelSectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.P1SectionCodec
 import pro.ikili.kibicomputers.core.persist.snapshot.SnapshotReader
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.nio.file.Files
 import java.nio.file.Path
@@ -960,6 +961,22 @@ class MachineRestoreBranchesTest {
             openFreshRoot(h)
             val identity = savePrompt(h, store)
             modules.swap = ModuleStore.hex(ModuleStore.sha256(resource("prompt-wasi.wasm"))) to resource("fuel-spin-wasi.wasm")
+            val finished = Finished()
+            val m = restore(h, store, identity, finished)
+            assertColdBoot(m, finished, ColdBootCause.MODULE_MISMATCH)
+            m.close()
+        }
+    }
+
+    @Test
+    fun `置き場のモジュールがコンポーネントに変わっていたら冷えた起動`() = timeout(limit) {
+        val store = newStore()
+        val modules = SwappingModuleStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h ->
+            openFreshRoot(h)
+            val identity = savePrompt(h, store)
+            // 復元も exec と同じ読み方（#687）なので、コンポーネントとして読み込めるが、p1 のプロセスには戻せない
+            modules.swap = ModuleStore.hex(ModuleStore.sha256(resource("prompt-wasi.wasm"))) to P2Testing.wrap("hello-wasi")
             val finished = Finished()
             val m = restore(h, store, identity, finished)
             assertColdBoot(m, finished, ColdBootCause.MODULE_MISMATCH)

@@ -305,9 +305,12 @@ internal class MachineRestore(private val machine: Machine, private val request:
         }
         val runtime = machine.scheduler.options.runtime
         val limits = machine.scheduler.options.moduleLimits
-        val waitImports = source.waitImports.toSet()
+        // exec と同じ読み方・同じキー（#687）。保存データが（改ざんなどで）コンポーネントを指していても、exec と別の読み方で
+        // 同じキーの結果・失敗を作らない。コンポーネントの Program は、下の prepare で戻せないもの（冷えた起動）になる
+        val waitImports = Program.cacheWaitImports(bytes, source.waitImports.toSet())
+        val host = KernelDrivers.COMPONENT_HOST
         return machine.scheduler.programs.load(machine.id, bytes, source.metered, waitImports) { b ->
-            if (source.metered) Program.loadMetered(runtime, b, limits, waitImports) else Program.load(runtime, b, limits)
+            Program.loadExecutable(runtime, b, limits, source.metered, waitImports, host)
         }
     }
 

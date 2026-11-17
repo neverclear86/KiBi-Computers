@@ -32,6 +32,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.DEFAULT_HANDLE_LIMIT
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillResult
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.PendingExec
@@ -97,6 +98,8 @@ import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CompletableFuture
@@ -1594,6 +1597,11 @@ public class Machine private constructor(
      *   待つのをやめたら（止められた・起動の取り消し）、ほかに待つ側がなく、まだ始まっていない読み込みは取り消す。
      *   ほかの台が相乗りしていても、このマシンの数からは外す（#383。始まっていない読み込みは相乗りした台の数に移る）。
      *   最近 WASM として読めなかったものは、読み込み直さずに `NOEXEC`
+     * - Component Model のコンポーネント（layer 1）は、ヘッダーで見分けて `ComponentProgram.load` で読み込み、リンクの計画まで作る
+     *   （#687。[Program.loadExecutable]。ホストは固定の [KernelDrivers.COMPONENT_HOST]）。計画は p1 と同じく `ProgramCache` で全マシンが
+     *   共有する。待機点への変換はかけない。ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は
+     *   p2 のコマンドとして `BLOCKING` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
+     *   （内容の失敗ではないので覚えない）。コンポーネントのプロセスは保存できない（#269）
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
      */
@@ -1669,9 +1677,11 @@ public class Machine private constructor(
         val runtime = scheduler.options.runtime
         val limits = scheduler.options.moduleLimits
         val metered = scheduler.options.meterExecutables
-        val waitImports = if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet()
+        // コンポーネントは待機点への変換を使わないので、キーの止まりうる import を空にそろえる（#687。二重に読み込まない）
+        val waitImports = Program.cacheWaitImports(executable.bytes, if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet())
+        val host = KernelDrivers.COMPONENT_HOST
         val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
-            if (metered) Program.loadMetered(runtime, bytes, limits, waitImports) else Program.load(runtime, bytes, limits)
+            Program.loadExecutable(runtime, bytes, limits, metered, waitImports, host)
         }
         // 読み込みが終わったら、元のバイト列をモジュールの置き場に書く（#82。読み込みのスレッドで。メインスレッドでは書かない）
         val original = executable.bytes
@@ -1718,7 +1728,10 @@ public class Machine private constructor(
         return spawnWithHandle(program, driver, pending.options.copy(args = pending.args), pending.parentPid)
     }
 
-    /** 終わった読み込み [pending] の [Program]。失敗は errno にして投げる。終わっていなければ [IllegalStateException] */
+    /**
+     * 終わった読み込み [pending] の [Program]。失敗は errno にして投げる（読めない → `NOEXEC`、混んでいる・コンポーネントの検証の途中で
+     * 割り込まれた（[WasmTrapKind.INTERRUPTED]。#687）→ `AGAIN`）。終わっていなければ [IllegalStateException]
+     */
     @Throws(FsException::class)
     private fun loadedProgram(pending: PendingExec): Program {
         val future = pending.future
@@ -1730,6 +1743,11 @@ public class Machine private constructor(
             fsError(Errno.NOEXEC, "${pending.path} は WASM として読めない: ${e.message}")
         } catch (e: ProgramLoadBusyException) {
             fsError(Errno.AGAIN, "${pending.path} を読み込めない: ${e.message}")
+        } catch (e: WasmTrapException) {
+            // コンポーネントの検証の途中で、コンパイル用のスレッドが割り込まれた（スケジューラの停止など。#687・ADR 0262）。
+            // 内容の失敗ではない（ProgramCache も覚えない）ので、一時的な失敗にする。呼んだプロセス・マシンは壊さない
+            if (e.kind != WasmTrapKind.INTERRUPTED) throw IllegalStateException("読み込みが予期しないトラップで終わった（内部の誤り）", e)
+            fsError(Errno.AGAIN, "${pending.path} の読み込みが割り込まれた: ${e.message}")
         }
     }
 

@@ -6,7 +6,7 @@ kibi - WASI support and the kibi extensions
 
 ## DESCRIPTION
 
-Programs are WebAssembly modules that use WASI preview 1 (p1, `wasi_snapshot_preview1`). Only commands (modules that export `_start`) run. WASI preview 2, preview 3 and the Component Model are not implemented yet: running a component fails at load time with `NOEXEC`.
+Programs are WebAssembly modules that use WASI preview 1 (p1, `wasi_snapshot_preview1`). Only commands (modules that export `_start`) run. Command components of WASI preview 2 (components that export `wasi:cli/run@0.2.x`) also run, but they can import only `wasi:*@0.2.x`, keep a thread while they wait, and their state is not saved. WASI preview 3 is not implemented yet and fails at load time with `NOEXEC`.
 
 Features that WASI does not have are provided as WIT packages named `kibi:*`. Every package is `@0.1.0`, and only an exact version match is accepted. p1 programs get their functions as imports named `kibi:PACKAGE/INTERFACE@VERSION`.
 

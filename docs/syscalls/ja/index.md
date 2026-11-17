@@ -16,7 +16,7 @@ KiBi Computers のコンピューターでは、プログラムは WebAssembly�
 | --- | --- |
 | WASI p1（`wasi_snapshot_preview1`） | **対応**。コマンド形式（`_start` を export するモジュール）だけを動かします。関数ごとの対応と標準との差は [WASI p1](./wasi-p1.md) |
 | `kibi:*` の p1 向けの import | **対応**。共通の規則は [kibi:* の共通の規則](./kibi-abi.md)、パッケージごとのページは下の表 |
-| WASI p2・Component Model | **未実装**。コンポーネントを実行しようとすると、読み込みで `NOEXEC` になります（[#687](https://github.com/neverclear86/KiBi-Computers/issues/687)・[#267](https://github.com/neverclear86/KiBi-Computers/issues/267)） |
+| WASI p2・Component Model | **一部対応**。`wasi:cli/run@0.2.x` を export するコマンドのコンポーネントを exec で動かせます。`kibi:*` は p2 からはまだ使えず、状態は保存されません（[p2・p3](./p2-p3.md)） |
 | WASI p3（非同期） | **未実装**（[#266](https://github.com/neverclear86/KiBi-Computers/issues/266)・[#268](https://github.com/neverclear86/KiBi-Computers/issues/268)） |
 | `kibi:*` の p2・p3 向けの interface | **仮置き**。WIT はありますが、形は p2・p3 の層を作るときに変わります（[p2・p3 の予定](./p2-p3.md)） |
 | ソケット（`sock_*`・`wasi:sockets`） | **未実装**。p1 の `sock_*` は `NOSYS` を返します（[#76](https://github.com/neverclear86/KiBi-Computers/issues/76)） |

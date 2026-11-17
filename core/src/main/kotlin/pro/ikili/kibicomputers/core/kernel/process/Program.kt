@@ -7,7 +7,12 @@ import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.asyncify.AsyncifyUnsupported
+import pro.ikili.kibicomputers.core.runtime.component.ComponentLimits
+import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryHeader
+import pro.ikili.kibicomputers.core.runtime.component.WasmBinaryKind
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
@@ -101,6 +106,11 @@ internal class Program private constructor(
     val fuelYieldRejection: String? = null,
     /** コンポーネント（#263）なら、読み込んでリンクの計画まで済ませたもの。core モジュールなら `null` */
     val component: ComponentProgram? = null,
+    /**
+     * [ProgramCache] で強い参照で持つときの重さ（#687）。core モジュールは読み込む前のバイト数、コンポーネントは
+     * [ComponentProgram.cacheWeight]（中の core モジュールの数と計画の大きさを足した見積もり）
+     */
+    val cacheWeight: Long,
 ) {
     /**
      * core モジュール（p1 のプログラム）。
@@ -121,8 +131,47 @@ internal class Program private constructor(
         fun component(component: ComponentProgram): Program {
             val sha = component.sha256
             val source = ModuleSource(sha, component.metered, emptyList(), if (component.metered) Instrumentation.VERSION else 0, false)
-            return Program(ModuleHash.fromBytes(sha), null, source, component = component)
+            return Program(ModuleHash.fromBytes(sha), null, source, component = component, cacheWeight = component.cacheWeight)
         }
+
+        /** [bytes] が Component Model のコンポーネント（layer 1）か（ヘッダーだけを見る。[loadExecutable] の見分けと同じ） */
+        fun isComponent(bytes: ByteArray): Boolean = WasmBinaryHeader.kindOf(bytes) == WasmBinaryKind.COMPONENT
+
+        /**
+         * 実行ファイル [bytes] を読み込む（#687）。`Machine.exec` と復元（`MachineRestore`）の `ProgramCache` の loader はどちらもこれを使う
+         * （同じキーで別の読み方をしないように、見分けをここ 1 か所に置く）。ヘッダーで見分け（[isComponent]）、
+         *
+         * - コンポーネント: [ComponentProgram.load] で読み込んでリンクの計画まで作る（ホストは [host]。[waitImports] は使わない。
+         *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
+         *   中の core モジュールに当てる。上限を外す道は作らない（検証の時間の上限と見張りの前提。ADR 0666）
+         * - core モジュール: [metered] なら [loadMetered]、でなければ [load]（今までどおり）
+         *
+         * 重いので、コンパイル用のスレッド（`ProgramCache` の loader）から呼ぶ
+         *
+         * @throws WasmLoadException 読めない・検証に通らない・ホストにない import・上限を超えた・待機点に変換できない
+         * @throws WasmTrapException コンポーネントの検証の途中でスレッドが割り込まれた（`INTERRUPTED`。読み込みの失敗として覚えない）
+         */
+        @Throws(WasmLoadException::class, WasmTrapException::class)
+        fun loadExecutable(
+            runtime: WasmRuntime,
+            bytes: ByteArray,
+            limits: ModuleLimits?,
+            metered: Boolean,
+            waitImports: Set<String>,
+            host: ComponentHost,
+        ): Program {
+            if (isComponent(bytes)) {
+                val componentLimits = ComponentLimits(moduleLimits = limits ?: ModuleLimits.DEFAULT)
+                return component(ComponentProgram.load(runtime, bytes, host, metered, componentLimits))
+            }
+            return if (metered) loadMetered(runtime, bytes, limits, waitImports) else load(runtime, bytes, limits)
+        }
+
+        /**
+         * [bytes] を [loadExecutable] で読むときの、`ProgramCache` のキーに入れる止まりうる import。コンポーネントは待機点への変換を
+         * 使わないので空にそろえる（ドライバーの集合や設定ごとに別のキーになって、同じコンポーネントを二重に読み込まないように）
+         */
+        fun cacheWaitImports(bytes: ByteArray, waitImports: Set<String>): Set<String> = if (isComponent(bytes)) emptySet() else waitImports
 
         /**
          * [bytes] をそのまま [runtime] に読み込ませ、同じ bytes からハッシュを作る（読み込んだものと識別子がずれない）。
@@ -137,7 +186,7 @@ internal class Program private constructor(
             val module = runtime.load(copy)
             deadline?.check("パース・検証・コンパイル")
             val hash = ModuleHash.of(copy)
-            return Program(hash, module, ModuleSource(hash.bytes(), false, emptyList(), 0, false))
+            return Program(hash, module, ModuleSource(hash.bytes(), false, emptyList(), 0, false), cacheWeight = copy.size.toLong())
         }
 
         /**
@@ -171,7 +220,7 @@ internal class Program private constructor(
             val hash = ModuleHash.of(injected)
             applied.fuelYieldRejection?.let { FuelYieldRejectionLog.report(hash, it) }
             val source = ModuleSource(ModuleSource.sha256(bytes), true, waitImports, Instrumentation.VERSION, applied.fuelYield)
-            return Program(hash, module, source, applied.fuelYield, applied.fuelYieldRejection)
+            return Program(hash, module, source, applied.fuelYield, applied.fuelYieldRejection, cacheWeight = bytes.size.toLong())
         }
 
         /** [e] が、待機点に変換できない作りのために [loadMetered] が断ったものなら、その理由（どの命令・どの機能か）。違えば `null` */

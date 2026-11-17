@@ -211,8 +211,9 @@ class ComponentLoaderTest {
 
     @Test
     fun `p1の読み込みはコンポーネントをすぐ断る`() {
+        // コンポーネントは Program.loadExecutable が見分けて ComponentLoader で読む（#687）。p1 の読み込みに来たら version で断る
         val e = assertThrows<WasmLoadException> { ModulePrescan.check(full, ModuleLimits.DEFAULT, null) }
-        assertMessage(e, "コンポーネント")
+        assertMessage(e, "version 1")
     }
 
     @Test

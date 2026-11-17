@@ -70,5 +70,16 @@ object SmokeGameTests {
         helper.succeed()
     }
 
+    /**
+     * p2 のコマンドのコンポーネントを `exec` と同じ読み方（実物の `wasi:*` のホストでリンク）で読み込み、既定のドライバーの選び方で
+     * p2 のドライバーを選べる（#687）。検証器・リンカー・ホストのクラスが、ゲームの実行環境で一緒に読めるかを確かめる。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun componentCommandLoadsOnServer(helper: GameTestHelper) {
+        helper.assertTrue(RuntimeSelfCheck.loadsComponentCommand(), "a p2 command component should load for exec and get the p2 driver")
+        helper.succeed()
+    }
+
     const val EMPTY: String = "empty"
 }
