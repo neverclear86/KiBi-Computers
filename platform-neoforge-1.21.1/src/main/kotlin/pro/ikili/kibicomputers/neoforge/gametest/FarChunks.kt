@@ -71,7 +71,18 @@ internal object FarChunks {
      */
     fun allocate(helper: GameTestHelper, keeper: Boolean = false): FarSlot {
         val chunk = reserve(helper)
-        val slot = FarSlot(helper.level, chunk, if (keeper) ChunkPos(chunk.x + KEEPER_DISTANCE, chunk.z) else null)
+        val level = helper.level
+        val slot = FarSlot(level, chunk, if (keeper) ChunkPos(chunk.x + KEEPER_DISTANCE, chunk.z) else null)
+        // 重なりを見つけたら、ほかのテストの強制読み込みを外さないように、自分が付けたものだけを外して落とす。
+        // 終わりに外すリスナーは、付けるのに全部成功してから付ける（失敗するとテストの失敗でリスナーが走り、相手のものまで外れるため）
+        slot.keeper?.let {
+            helper.assertTrue(!level.chunkSource.hasChunk(it.x, it.z), "the keeper chunk $it should not be loaded yet")
+            helper.assertTrue(level.setChunkForced(it.x, it.z, true), "the keeper chunk $it should not be forced by anyone else")
+        }
+        if (!level.setChunkForced(chunk.x, chunk.z, true)) {
+            slot.releaseKeeper()
+            helper.fail("the far chunk $chunk should not be forced by anyone else")
+        }
         helper.testInfo.addListener(
             object : GameTestListener {
                 override fun testStructureLoaded(info: GameTestInfo) {}
@@ -83,12 +94,7 @@ internal object FarChunks {
                 override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
             },
         )
-        slot.keeper?.let {
-            helper.assertTrue(!helper.level.chunkSource.hasChunk(it.x, it.z), "the keeper chunk $it should not be loaded yet")
-            helper.assertTrue(helper.level.setChunkForced(it.x, it.z, true), "the keeper chunk $it should not be forced by anyone else")
-        }
-        helper.assertTrue(helper.level.setChunkForced(chunk.x, chunk.z, true), "the far chunk $chunk should not be forced by anyone else")
-        helper.level.getChunk(chunk.x, chunk.z)
+        level.getChunk(chunk.x, chunk.z)
         return slot
     }
 }
