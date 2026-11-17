@@ -333,13 +333,10 @@ object MachineSaveGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun demotedChunkSettlesAMachineStoppedAfterCapture(helper: GameTestHelper) {
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 400, helper.absolutePos(CASE).z / 16 - 800)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 7, 200, chunk.minBlockZ + 3)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(7, 200, 3)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -348,8 +345,7 @@ object MachineSaveGameTests {
         var stopped = false
         fun cleanUp() {
             ServerMachines.afterCaptureForTest.remove(be)
-            level.setChunkForced(chunk.x, chunk.z, false)
-            level.setChunkForced(keeper.x, keeper.z, false)
+            slot.release()
         }
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
@@ -366,7 +362,7 @@ object MachineSaveGameTests {
             }
             // 置いたときの印を外し、そろえ（FULL でなくなった経路では setChanged が届かない）が付けるかを見る
             level.getChunk(chunk.x, chunk.z).isUnsaved = false
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
         }.thenWaitUntil {
             helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
             helper.assertTrue(be.computer.machine == null, "the machine should be released but was ${be.computer}")
@@ -391,8 +387,7 @@ object MachineSaveGameTests {
                 val tag = be.saveWithoutMetadata(level.registryAccess())
                 helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
                 // FULL に戻しても、電源が切れているので復元の順番待ちに入らない
-                level.setChunkForced(chunk.x, chunk.z, true)
-                level.getChunk(chunk.x, chunk.z)
+                slot.setFull(true)
             } catch (t: Throwable) {
                 cleanUp()
                 throw t
@@ -403,7 +398,8 @@ object MachineSaveGameTests {
                 helper.assertTrue(!be.computer.isRestorePending && be.computer.machine == null, "the case should not restore but was ${be.computer}")
                 helper.assertTrue(!be.computer.poweredOn && be.computer.status == ComputerStatus.OFF, "the case should stay off but was ${be.computer}")
                 ServerMachines.drainSaves()
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
+                // 部品の落とし物をチャンクに残さない（#746）
+                removeCaseWithoutDrops(level, pos)
             } finally {
                 cleanUp()
             }
@@ -419,16 +415,15 @@ object MachineSaveGameTests {
     fun chunkUnloadSavesTheMachine(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 400, helper.absolutePos(CASE).z / 16 + 400)
-        val pos = BlockPos(chunk.minBlockX + 3, 200, chunk.minBlockZ + 5)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper)
+        val chunk = slot.chunk
+        val pos = slot.pos(3, 200, 5)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-        level.setChunkForced(chunk.x, chunk.z, false)
+        slot.setFull(false)
         helper.succeedWhen {
             helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
             // 共有のカウンター（ServerMachines.Stats.unloadCaptures）は並行するほかのテストのチャンクでも動くので見ない（#548・#708）。
@@ -459,13 +454,10 @@ object MachineSaveGameTests {
     fun demotedChunkSavesAndStopsTheMachine(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 400, helper.absolutePos(CASE).z / 16 + 400)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(6, 200, 9)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -475,7 +467,7 @@ object MachineSaveGameTests {
         // onLoad（追跡と索引）を待ってから外す
         helper.runAfterDelay(1) {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
             var id: UUID? = null
             helper.startSequence().thenWaitUntil {
                 // アンロードされていない: アンロードなら setRemoved され、追跡からも外れる。FULL でなくなっただけなら両方そのまま
@@ -490,24 +482,22 @@ object MachineSaveGameTests {
                 helper.assertTrue(Files.isRegularFile(store.generationFile(identity!!.id, identity.generation)), "the generation file should exist")
                 helper.assertTrue(store.latestGeneration(identity.id).asLong == identity.generation, "the case should point at the latest generation")
                 id = identity.id
-            }.thenExecute { afterDemotion(helper, chunk, keeper, pos, be, id!!) }.thenSucceed()
+            }.thenExecute { afterDemotion(helper, slot, pos, be, id!!) }.thenSucceed()
         }
     }
 
-    private fun afterDemotion(helper: GameTestHelper, chunk: ChunkPos, keeper: ChunkPos, pos: BlockPos, be: CaseBlockEntity, id: UUID) {
+    private fun afterDemotion(helper: GameTestHelper, slot: FarSlot, pos: BlockPos, be: CaseBlockEntity, id: UUID) {
         val level = helper.level
         // FULL に戻す: 同じブロックエンティティが ID を保ち、電源は切れている。電源はまた入る
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        slot.setFull(true)
         helper.assertTrue(level.getBlockEntity(pos) === be, "the block entity should stay in memory")
         helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should stay off after the chunk is FULL again")
         helper.assertTrue(be.identity?.id == id, "the case should keep its id but was ${be.identity}")
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "the case should run again but was ${be.computer}")
         be.pressPowerButton()
-        // 部品の落とし物をチャンクに残さない（#746。同じチャンクを使うほかのテストの落とし物の確かめに出てくる）
+        // 部品の落とし物をチャンクに残さない（#746）
         removeCaseWithoutDrops(level, pos)
-        level.setChunkForced(chunk.x, chunk.z, false)
-        level.setChunkForced(keeper.x, keeper.z, false)
+        slot.release()
     }
 
     /**
@@ -522,13 +512,10 @@ object MachineSaveGameTests {
     fun demotedChunkIsMarkedUnsavedOnCompletion(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 800, helper.absolutePos(CASE).z / 16)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 4, 200, chunk.minBlockZ + 11)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(4, 200, 11)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -544,7 +531,7 @@ object MachineSaveGameTests {
 
             // FULL でなくすと、取り出した書き込みが書き込みのスレッドで止まる（受け取るまで tick をまたぐ）
             val gate = WriterGate()
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
             var pending: PendingSave? = null
             helper.startSequence().thenWaitUntil {
                 helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
@@ -569,7 +556,7 @@ object MachineSaveGameTests {
                 helper.assertTrue(be.identity == pending!!.identity, "the completion should advance to ${pending!!.identity} but was ${be.identity}")
                 helper.assertTrue(demoted.isUnsaved, "the completion should mark the demoted chunk unsaved")
                 // そのままアンロードする（ケースはマシンを持たないので、アンロードの手順は何もしない）
-                level.setChunkForced(keeper.x, keeper.z, false)
+                slot.releaseKeeper()
             }.thenWaitUntil {
                 helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
                 val identity = pending!!.identity
@@ -593,13 +580,10 @@ object MachineSaveGameTests {
     fun demotedChunkCompletionReachesDiskWhileInMemory(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 800, helper.absolutePos(CASE).z / 16 + 800)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(6, 200, 9)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -614,7 +598,7 @@ object MachineSaveGameTests {
             helper.assertTrue(diskGeneration(helper, chunk, pos) == first.generation, "the chunk on disk should point at ${first.generation}")
 
             val gate = WriterGate()
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
             var pending: PendingSave? = null
             helper.startSequence().thenWaitUntil {
                 helper.assertTrue(be.demotedChunk != null, "the chunk should be demoted")
@@ -646,7 +630,7 @@ object MachineSaveGameTests {
                 helper.assertTrue(generation == identity.generation, "the chunk on disk should point at ${identity.generation} but was $generation")
                 helper.assertTrue(store.chunkGeneration(identity.id) == OptionalLong.of(identity.generation), "the mark should follow the chunk save")
                 helper.assertTrue(!holder.wasAccessibleSinceLastSave(), "the save should clear the flag again")
-                level.setChunkForced(keeper.x, keeper.z, false)
+                slot.releaseKeeper()
             }.thenSucceed()
         }
     }
@@ -659,7 +643,7 @@ object MachineSaveGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun stopMarksAChunkThatJustLeftFull(helper: GameTestHelper) {
-        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 400, stopFirst = false) { be, latest, changes ->
+        stopOnChunkThatJustLeftFull(helper, stopFirst = false) { be, latest, changes ->
             helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 1, "the stop should save the case")
             val identity = be.identity
             helper.assertTrue(identity != null, "the stop should adopt the written generation")
@@ -683,7 +667,7 @@ object MachineSaveGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun stopMarksAChunkThatJustLeftFullForAStoppedMachine(helper: GameTestHelper) {
-        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 440, stopFirst = true) { be, latest, changes ->
+        stopOnChunkThatJustLeftFull(helper, stopFirst = true) { be, latest, changes ->
             helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
             helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 0, "a stopped machine should not be captured")
             helper.assertTrue(be.setChangedCalls == changes, "the stop should not call setChanged on a chunk that is not FULL")
@@ -701,32 +685,25 @@ object MachineSaveGameTests {
      * [check] を呼ぶ（チャンクの印は外してから渡す。3つ目の引数は、その時点の `setChangedCalls`）。[check] が真を返すまで待ってから片付ける。
      * [stopFirst] なら、FULL でなくす前にマシンを止める（ゲストが止めたのと同じ `stop()`。tick が回らないので知らせは届かない）。
      * [powered] が偽なら、電源を入れずに置く（[stopFirst] は見ない）。
-     * 並行するテストと重ならないように、チャンクは [chunkOffsetZ] でずらす
+     * チャンクは [FarChunks] で割り当てる（#747）
      */
     private fun stopOnChunkThatJustLeftFull(
         helper: GameTestHelper,
-        chunkOffsetZ: Int,
         stopFirst: Boolean,
         powered: Boolean = true,
         check: (CaseBlockEntity, LevelChunk, Int) -> Boolean,
     ) {
         val level = helper.level
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + chunkOffsetZ)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 9, 200, chunk.minBlockZ + 6)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(9, 200, 6)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
         if (powered) helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         val machine = be.computer.machine
-        fun cleanUp() {
-            level.setChunkForced(chunk.x, chunk.z, false)
-            level.setChunkForced(keeper.x, keeper.z, false)
-        }
+        fun cleanUp() = slot.release()
         var done = false
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
@@ -742,7 +719,7 @@ object MachineSaveGameTests {
                 }
                 // 置くときの getChunk の一時的なチケット（UNKNOWN。1 tick で切れる）が切れるのを待ってから、
                 // チケットを外し、tick を待たずにチケットの段階を下げる（1人プレイの切断の後の pollTask と同じ）
-                level.setChunkForced(chunk.x, chunk.z, false)
+                slot.setFull(false)
                 var polls = 0
                 while (level.hasChunkAt(pos) && polls++ < 10_000) level.chunkSource.pollTask()
                 helper.assertTrue(
@@ -765,8 +742,7 @@ object MachineSaveGameTests {
         }.thenExecute {
             try {
                 ServerMachines.drainSaves()
-                level.setChunkForced(chunk.x, chunk.z, true)
-                level.getChunk(chunk.x, chunk.z)
+                slot.setFull(true)
                 // 強制読み込みを外すとチャンクごと残るので、部品を落とさずに消す（#746）
                 removeCaseWithoutDrops(level, pos)
             } finally {
@@ -808,11 +784,10 @@ object MachineSaveGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
     fun flushingTheClaimMarksReachesTheDisk(helper: GameTestHelper) {
         val level = helper.level
-        // ほかのテストのチャンクと重ならないように、離れたチャンクに置く
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 400, helper.absolutePos(CASE).z / 16 + 840)
-        val pos = BlockPos(chunk.minBlockX + 4, 200, chunk.minBlockZ + 11)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // ほかのテストのチャンクと重ならないように、離れたチャンクに置く（#747）
+        val slot = FarChunks.allocate(helper)
+        val chunk = slot.chunk
+        val pos = slot.pos(4, 200, 11)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         // onLoad を待つ
@@ -836,7 +811,7 @@ object MachineSaveGameTests {
                 assertTagHasIdentity(helper, be, caseTagIn(data!!, pos))
                 removeCaseWithoutDrops(level, pos)
             } finally {
-                level.setChunkForced(chunk.x, chunk.z, false)
+                slot.release()
             }
         }.thenSucceed()
     }
@@ -848,7 +823,7 @@ object MachineSaveGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun flushingTheClaimMarksAChunkThatJustLeftFull(helper: GameTestHelper) {
-        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 520, stopFirst = false, powered = false) { be, latest, _ ->
+        stopOnChunkThatJustLeftFull(helper, stopFirst = false, powered = false) { be, latest, _ ->
             claimANewId(helper, be)
             val holder = lowerHolderFlag(helper, latest)
             latest.isUnsaved = false
@@ -872,7 +847,7 @@ object MachineSaveGameTests {
         val level = helper.level
         val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
         // 電源の切れた、どのチャンクにも入っていないケース（取り出しの対象にならない）
-        val far = BlockPos(helper.absolutePos(CASE).x - 16 * 900, 100, helper.absolutePos(CASE).z + 16 * 900)
+        val far = FarChunks.reserve(helper).getBlockAt(0, 100, 0)
         val be = CaseBlockEntity(far, state)
         be.setLevel(level)
         ServerMachines.markChangedLater(be)
@@ -922,7 +897,7 @@ object MachineSaveGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun demotionSettleOfAStoppedMachineRaisesTheHolderFlag(helper: GameTestHelper) {
-        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 480, stopFirst = true) { be, latest, _ ->
+        stopOnChunkThatJustLeftFull(helper, stopFirst = true) { be, latest, _ ->
             helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
             val holder = lowerHolderFlag(helper, latest)
             ServerMachines.saveForUnload(latest, listOf(be), adopt = false)
@@ -976,8 +951,8 @@ object MachineSaveGameTests {
     fun unloadMarksACaseWhoseChunkHolderWasGone(helper: GameTestHelper) {
         val level = helper.level
         val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
-        // だれも読み込んでいないチャンクのケース（holder が見えない）
-        val far = BlockPos(helper.absolutePos(CASE).x + 16 * 900, 100, helper.absolutePos(CASE).z - 16 * 900)
+        // だれも読み込んでいないチャンクのケース（holder が見えない。#747）
+        val far = FarChunks.reserve(helper).getBlockAt(0, 100, 0)
         helper.assertTrue(level.chunkSource.chunkMap.getVisibleChunkIfPresent(ChunkPos.asLong(far)) == null, "the far chunk should have no holder")
         val be = CaseBlockEntity(far, state)
         be.setLevel(level)
@@ -1008,11 +983,11 @@ object MachineSaveGameTests {
         val level = helper.level
         val cache = level.chunkSource
         val map = cache.chunkMap
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストと重ならない向き）
-        val chunkPos = ChunkPos(helper.absolutePos(CASE).x / 16 - 800, helper.absolutePos(CASE).z / 16 + 800)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper)
+        val chunkPos = slot.chunk
         val key = chunkPos.toLong()
-        val pos = BlockPos(chunkPos.minBlockX + 3, 200, chunkPos.minBlockZ + 5)
-        level.setChunkForced(chunkPos.x, chunkPos.z, true)
+        val pos = slot.pos(3, 200, 5)
         val chunk = level.getChunk(chunkPos.x, chunkPos.z)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
@@ -1026,7 +1001,7 @@ object MachineSaveGameTests {
             try {
                 // チケットを外し、アンロード待ちにする（時間がないので、アンロードの仕事は列に積まれたまま走らない）。
                 // この呼び出しの中では tick が回らないので、アンロードの仕事は走らない
-                level.setChunkForced(chunkPos.x, chunkPos.z, false)
+                slot.setFull(false)
                 cache.runDistanceManagerUpdates()
                 for (attempt in 0 until 20) {
                     if (map.pendingUnloads.containsKey(key)) break
@@ -1104,10 +1079,8 @@ object MachineSaveGameTests {
     fun explosionDeletesTheSaves(helper: GameTestHelper) {
         val store = store(helper)
         val level = helper.level
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + 400, helper.absolutePos(CASE).z / 16 - 400)
-        val pos = BlockPos(chunk.minBlockX + 8, 200, chunk.minBlockZ + 8)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        val slot = FarChunks.allocate(helper)
+        val pos = slot.pos(8, 200, 8)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -1121,7 +1094,7 @@ object MachineSaveGameTests {
             helper.assertTrue(Files.isDirectory(store.directoryOf(id)), "the save directory should exist")
             // 中心のブロックは必ず壊れる強さ（ケースの爆発耐性 6）
             level.explode(null, pos.x + 0.5, pos.y + 0.5, pos.z + 0.5, 4.0f, Level.ExplosionInteraction.BLOCK)
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.release()
             helper.assertTrue(level.getBlockEntity(pos) !is CaseBlockEntity, "the explosion should destroy the case")
             ServerMachines.drainSaves()
             helper.assertTrue(!Files.exists(store.directoryOf(id)), "an exploded case should delete its directory")

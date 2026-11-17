@@ -1,9 +1,7 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
-import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
-import net.minecraft.world.level.ChunkPos
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -28,8 +26,6 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object AccessDemotionGameTests {
-    private val ORIGIN = BlockPos(1, 1, 1)
-
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600)
     fun demotedCasesKeepTheirRequests(helper: GameTestHelper) {
@@ -37,25 +33,20 @@ object AccessDemotionGameTests {
         val alex = AccessRequestGameTests.player(helper, "Alex110z")
         val stranger = AccessRequestGameTests.player(helper, "Stranger110z")
         val op = AccessRequestGameTests.player(helper, "Op110z", op = true)
-        // テストの場所から離れた、だれも読み込んでいないチャンク（ほかのテストの離れたチャンクと重ならない向き）
-        val chunk = ChunkPos(helper.absolutePos(ORIGIN).x / 16 + 460, helper.absolutePos(ORIGIN).z / 16 - 460)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 3, 200, chunk.minBlockZ + 7)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val pos = slot.pos(3, 200, 7)
         AccessRequestGameTests.onEnd(helper) {
             if (level.getBlockEntity(pos) is CaseBlockEntity) removeCaseWithoutDrops(level, pos)
-            level.setChunkForced(chunk.x, chunk.z, false)
-            level.setChunkForced(keeper.x, keeper.z, false)
+            slot.release()
         }
-        level.getChunk(chunk.x, chunk.z)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         be.replacePlayerAccess(PlayerAccess.ownedBy(CaseAccess.ref(alex)))
         val id = AccessRequestGameTests.request(be, AccessRequestKind.ADD, "Bob110z")!!
         helper.runAfterDelay(1) {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
             helper.startSequence().thenWaitUntil {
                 helper.assertTrue(!be.isRemoved, "the chunk should stay in memory (the block entity was removed)")
                 helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
@@ -78,8 +69,7 @@ object AccessDemotionGameTests {
                 helper.assertTrue(!level.isLoaded(pos), "the commands should not load the chunk")
 
                 // FULL に戻すと、同じ BE で、同じ ID を承認でき、枠が返る
-                level.setChunkForced(chunk.x, chunk.z, true)
-                level.getChunk(chunk.x, chunk.z)
+                slot.setFull(true)
                 helper.assertTrue(level.isLoaded(pos), "the chunk should be FULL again")
                 helper.assertTrue(level.getBlockEntity(pos) === be, "the block entity should stay the same")
                 alex.clear()

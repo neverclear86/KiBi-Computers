@@ -5,7 +5,6 @@ import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.nbt.CompoundTag
-import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.block.Blocks
@@ -369,12 +368,9 @@ object MachineRestoreGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400, batch = "demoted_pending_restore")
     fun demotedChunkDropsAPendingRestore(helper: GameTestHelper) {
         val level = helper.level
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 420, helper.absolutePos(CASE).z / 16 + 420)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
-        level.setChunkForced(keeper.x, keeper.z, true)
-        level.setChunkForced(chunk.x, chunk.z, true)
-        level.getChunk(chunk.x, chunk.z)
+        // だれも読み込んでいない離れたチャンク（#747）
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val pos = slot.pos(6, 200, 9)
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
@@ -394,7 +390,7 @@ object MachineRestoreGameTests {
             starts = be.restoreStarts
             helper.assertTrue(be.computer.beginRestore(), "the powered-on case should wait for a restore")
             ServerMachines.offerRestore(be)
-            level.setChunkForced(chunk.x, chunk.z, false)
+            slot.setFull(false)
             helper.startSequence().thenWaitUntil {
                 helper.assertTrue(!level.isLoaded(pos), "the chunk should no longer be FULL")
                 helper.assertTrue(!be.computer.isRestorePending, "the pending restore should be dropped: ${be.computer}")
@@ -412,17 +408,17 @@ object MachineRestoreGameTests {
                 helper.assertTrue(be.computer.poweredOn, "the power state should be kept for the next load")
                 ServerMachines.saveConfig = config
                 // FULL に戻すと、tick の終わりに順番待ちに入る（書き込みは終わっているので、次の tick には始まりうる）
-                level.setChunkForced(chunk.x, chunk.z, true)
-                level.getChunk(chunk.x, chunk.z)
+                slot.setFull(true)
             }.thenWaitUntil {
                 helper.assertTrue(
                     be.computer.isRestorePending || be.computer.machine != null,
                     "the case should wait for a restore after the chunk is FULL again: ${be.computer}",
                 )
             }.thenExecute {
-                level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)
-                level.setChunkForced(chunk.x, chunk.z, false)
-                level.setChunkForced(keeper.x, keeper.z, false)
+                // 動いていれば電源を切ってから（順番待ちの台に電源ボタンを押すと起動するので押さない）、部品の落とし物を残さずに消す（#746）
+                if (be.computer.status == ComputerStatus.RUNNING) be.pressPowerButton()
+                removeCaseWithoutDrops(level, pos)
+                slot.release()
             }.thenSucceed()
         }
     }
@@ -430,19 +426,17 @@ object MachineRestoreGameTests {
     // ---- FULL に戻ったチャンクの復元（#575） ----
 
     /**
-     * だれも読み込んでいないチャンク（テストの場所から [dx]・[dz] チャンク離す。テストごとに変える）に、ケース・画面・キーボードを置く。
-     * 5 チャンク離れたチャンクを強制読み込みにしておくので、ケースのチャンクの強制読み込みを外すと、FULL でなくなるがアンロードはされない（#545）
+     * だれも読み込んでいないチャンク（[FarChunks] で割り当てる。#747）に、ケース・画面・キーボードを置く。
+     * 5 チャンク離れたチャンク（keeper）を強制読み込みにしておくので、ケースのチャンクの強制読み込みを外すと、FULL でなくなるが
+     * アンロードはされない（#545）
      */
-    private class FarComputer(helper: GameTestHelper, dx: Int, dz: Int) {
+    private class FarComputer(helper: GameTestHelper) {
         val level = helper.level
-        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 + dx, helper.absolutePos(CASE).z / 16 + dz)
-        val keeper = ChunkPos(chunk.x + 5, chunk.z)
-        val pos = BlockPos(chunk.minBlockX + 6, 200, chunk.minBlockZ + 9)
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val pos = slot.pos(6, 200, 9)
         val case: CaseBlockEntity
 
         init {
-            level.setChunkForced(keeper.x, keeper.z, true)
-            setFull(true)
             level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
             level.setBlock(
                 pos.above(),
@@ -457,10 +451,7 @@ object MachineRestoreGameTests {
         val keyboard: KeyboardBlockEntity get() = level.getBlockEntity(pos.south()) as KeyboardBlockEntity
 
         /** ケースのチャンクを FULL にする・FULL でなくす（強制読み込みの付け外し） */
-        fun setFull(full: Boolean) {
-            level.setChunkForced(chunk.x, chunk.z, full)
-            if (full) level.getChunk(chunk.x, chunk.z)
-        }
+        fun setFull(full: Boolean) = slot.setFull(full)
 
         /** FULL でなくなって、マシンが外された */
         fun assertDemoted(helper: GameTestHelper) {
@@ -472,10 +463,11 @@ object MachineRestoreGameTests {
         /** 電源を切り、置いたものを外して、強制読み込みを戻す */
         fun remove() {
             setFull(true)
-            if (case.computer.poweredOn) case.pressPowerButton()
-            for (p in listOf(pos, pos.above(), pos.south())) level.setBlock(p, Blocks.AIR.defaultBlockState(), 3)
-            level.setChunkForced(chunk.x, chunk.z, false)
-            level.setChunkForced(keeper.x, keeper.z, false)
+            if (case.computer.status == ComputerStatus.RUNNING) case.pressPowerButton()
+            // 画面とキーボードは何も落とさない。ケースは部品を落とさずに消す（#746）
+            for (p in listOf(pos.above(), pos.south())) level.setBlock(p, Blocks.AIR.defaultBlockState(), 3)
+            removeCaseWithoutDrops(level, pos)
+            slot.release()
         }
     }
 
@@ -506,7 +498,7 @@ object MachineRestoreGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun restoresTheDemotionSaveWhenTheChunkIsFullAgain(helper: GameTestHelper) {
-        val far = FarComputer(helper, 440, 440)
+        val far = FarComputer(helper)
         val be = far.case
         // onLoad の前に、検査に外れる ID と、電源が入っていた印を読ませる（onLoad で新しい ID を振り、冷えた起動になる）
         val tag = be.saveWithFullMetadata(helper.level.registryAccess())
@@ -552,7 +544,7 @@ object MachineRestoreGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "restore_pending_generation")
     fun restoresTheReservedGenerationBeforeTheCompletionArrives(helper: GameTestHelper) {
-        val far = FarComputer(helper, -440, -440)
+        val far = FarComputer(helper)
         val be = far.case
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         val config = ServerMachines.saveConfig
@@ -616,7 +608,7 @@ object MachineRestoreGameTests {
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "restore_write_timeout")
     fun coldBootsWhenTheWriteDoesNotFinishInTime(helper: GameTestHelper) {
-        val far = FarComputer(helper, 440, -440)
+        val far = FarComputer(helper)
         val be = far.case
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         val config = ServerMachines.saveConfig
