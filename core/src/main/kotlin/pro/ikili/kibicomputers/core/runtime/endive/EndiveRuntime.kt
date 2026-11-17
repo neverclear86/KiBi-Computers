@@ -1006,7 +1006,11 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         if (mem != null) {
             val raw = (mem as EndiveWasmMemory).raw
             if (raw is WrittenPagesMemory) {
-                if (!raw.restorePages(state.memoryPages)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（今 ${raw.pages()}）")
+                // 形が合わない（縮める・上限を超える）失敗と、区画の表の分を RAM に数えられなかった失敗を、文言で分ける（#753）
+                if (state.memoryPages < raw.pages() || state.memoryPages > raw.maximumPages()) {
+                    throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（今 ${raw.pages()}、上限 ${raw.maximumPages()}）")
+                }
+                if (!raw.restorePages(state.memoryPages)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（区画の表の分の RAM が足りない）")
                 state.forEachChunk { index, bytes ->
                     if (!raw.restoreChunk(index, bytes)) throw WasmLinkException("メモリの区画 $index を戻せない（RAM が足りない）")
                 }

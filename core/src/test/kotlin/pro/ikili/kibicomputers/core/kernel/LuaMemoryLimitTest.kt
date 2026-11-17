@@ -89,4 +89,24 @@ class LuaMemoryLimitTest {
         assertTrue("not enough memory" in r.console, r.console)
         assertTrue("kibi: lua (pid ${r.pid}) exited with code 1 (kibi:memory commit was refused: out of memory, RAM limit $ramKib KiB)\n" in r.console, r.console)
     }
+
+    @ParameterizedTest
+    @ValueSource(ints = [0, 30, 60, 90, 100, 110])
+    fun `上限の近くで大きな確保をしてもトラップにならず、not enough memoryのエラーになる`(fill: Int) = timeout(limit) {
+        // memory.grow が区画の表（#753）を一度に数えて残りが落ちても、C のスタックを数えないまま尽きない。
+        // まず 1 KiB の文字列を fill 個持って残りを減らし（RAM 512 KiB では約 130 個で尽きるので、その手前まで）、その後で数十 MiB の string.rep を pcall で受ける
+        val script = """
+            local t = {}
+            pcall(function() for i = 1, $fill do t[i] = ('x'):rep(1000) .. i end end)
+            local ok, err = pcall(function() return ('y'):rep(64 * 1024 * 1024) end)
+            t = nil
+            collectgarbage()
+            io.write('caught ', tostring(not ok), ' ', tostring(err), '\n')
+            os.exit(ok and 3 or 0)
+        """.trimIndent()
+        val r = runLua(script, 512 * kib)
+        assertEquals(ProcessState.EXITED, r.state, r.console)
+        assertEquals(0, r.exitCode, r.console)
+        assertTrue("caught true not enough memory\n" in r.console, r.console)
+    }
 }

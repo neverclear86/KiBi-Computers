@@ -163,6 +163,21 @@ class WasmInstanceStateTest {
     }
 
     @Test
+    fun `区画の表の増えた分を数えられなければ、restoreStateはRAMが足りないと言うWasmLinkExceptionになり、何も残らない`() {
+        val module = EndiveRuntime().load(module())
+        val state = module.instantiate(config(Budget())).use { inst ->
+            inst.call("grow")
+            inst.captureState()
+        }
+        assertEquals(2, state.memoryPages)
+        // 作るときの表（1 ページ）だけ入る上限: 戻すときの増えた分（1 ページ）を断られる
+        val budget = Budget(WrittenPagesMemory.tableBytesOf(1))
+        val e = assertThrows<WasmLinkException> { module.instantiateForRestore(config(budget), state) }
+        assertTrue("区画の表の分の RAM が足りない" in e.message!!, e.message)
+        assertEquals(0L, budget.used, "断られたインスタンスは数えた分を返す")
+    }
+
+    @Test
     fun `start関数を持つモジュールは取り出せず、作り直せない`() {
         val b = WasmBinary()
         b.memory(1)

@@ -50,6 +50,11 @@ __asm__(
  * KEEP・MIN・STACK_GUARD は「包みの外で起きうる書き込み」の見積もり。内訳は、memory.grow が増やした所の両端に先に数える
  * 2 区画（8 KiB。keep をかけない）、malloc がチャンクの頭と top の頭を書く 2 区画、C のスタックの伸び、ホストが
  * スタックや静的な変数に書く結果（poll_oneoff の events、take の結果を受ける構造体など）。
+ * memory.grow は、増やしたページ数の分の区画の表（1 ページ 128 バイト。#753）も、端の区画と一緒に keep なしで数える。
+ * 大きな確保 1 回では、これが数十 KiB（アドレス空間の上限の 1,024 ページなら 128 KiB）になり、残りが一度に落ちうるので、
+ * 確保の大きさから見積もって（grow_table_bytes）、スタックを数える線（KEEP + STACK_GUARD）と、確保してよい線（MIN）に足す。
+ * 失敗した大きな確保が grow を通したときは、その表の分が（ページは縮まないので）プロセスの終わりまで残る。
+ * 同じ所は再び grow しないので増えず、全体でもアドレス空間の分（最大 128 KiB）で頭打ちになる。
  * マシンの RAM は同じマシンのほかのプロセスや /tmp と共有するので、remaining() はその時点の値でしかなく、
  * この見積もりが守れるのは、その台で RAM を食っているのが自分だけのとき（努力目標。規則はトラップ。#370）。
  *
@@ -72,6 +77,19 @@ size_t malloc_usable_size(void *ptr);
 #define KIBI_LUA_HEAD 16
 #define KIBI_LUA_TAIL 16
 /* KIBI_LUA_KEEP・KIBI_LUA_STACK_GUARD は kibi_wasi.h（kibi_lua_canon.c の reserve の余裕と合わせるため） */
+
+/*
+ * malloc が memory.grow したときに、区画の表として数えられる量の見積もり（#753。core の WrittenPagesMemory.TABLE_BYTES_PER_PAGE と合わせる）。
+ * size バイトの確保が増やすページ数は、切り上げと dlmalloc の余白で size / 64 KiB + 2 ページ以内とみなす。
+ * 大きすぎる size は、残りより大きい値になって断られる（grow も断られるので同じ結果）
+ */
+#define KIBI_LUA_PAGE_SIZE 65536
+#define KIBI_LUA_TABLE_PER_PAGE 128
+static uint64_t grow_table_bytes(size_t size) {
+    /* 64 KiB 未満の確保が増やす表は 1〜2 ページ分（256 バイト以下）で、KEEP・MIN の余裕に収まる（今までの線を動かさない） */
+    if (size < KIBI_LUA_PAGE_SIZE) return 0;
+    return ((uint64_t)size / KIBI_LUA_PAGE_SIZE + 2) * KIBI_LUA_TABLE_PER_PAGE;
+}
 
 /* リンカーが出すスタックの下端（wasm-ld。スタックは線形メモリの先頭に置かれ、下へ伸びる） */
 extern unsigned char __stack_low;
@@ -96,11 +114,12 @@ void *kibi_lua_realloc(void *ptr, size_t size) {
     size_t old = ptr != NULL ? malloc_usable_size(ptr) : 0;
     if (ptr != NULL && size <= old) return realloc(ptr, size);
     uint64_t remaining = kibi_memory_remaining();
-    if (remaining < KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD) {
+    uint64_t table = grow_table_bytes(size);
+    if (remaining < KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD + table) {
         if (!count_stack()) return NULL;
         remaining = kibi_memory_remaining();
     }
-    if (remaining < KIBI_LUA_MIN) return NULL;
+    if (remaining < KIBI_LUA_MIN + table) return NULL;
     void *result = malloc(size);
     if (result == NULL) return NULL;
     unsigned char *base = (unsigned char *)result - KIBI_LUA_HEAD;
