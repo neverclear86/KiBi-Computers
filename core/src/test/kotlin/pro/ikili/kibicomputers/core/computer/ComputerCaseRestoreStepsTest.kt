@@ -227,16 +227,19 @@ class ComputerCaseRestoreStepsTest {
                 manager, case, RestoreReady { throw OutOfMemoryError("つなぎ") },
                 RestoreListener { _, outcome, _ -> finished += outcome },
             )
+            // tickUntil は条件が偽のたびに囲まずに tick するので、ここでは使わない（知らせがその tick から出ると catch を抜ける）
             var thrown: Throwable? = null
-            tickUntil(manager, "致命的なエラーが tick の外へ届かない") {
+            val deadline = System.currentTimeMillis() + 10_000
+            while (thrown == null) {
+                if (System.currentTimeMillis() > deadline) throw AssertionError("致命的なエラーが tick の外へ届かない")
                 try {
                     manager.tick()
                 } catch (e: OutOfMemoryError) {
                     thrown = e
                 }
-                thrown != null
+                Thread.sleep(1)
             }
-            assertEquals("つなぎ", thrown!!.message)
+            assertEquals("つなぎ", thrown.message)
             assertTrue(finished.isEmpty(), "finished は呼ばない")
             assertFalse(machine.isBooting, "冷えた起動を始めない")
             assertFalse(machine.isRestoring, "復元の印は Machine が閉じる")
