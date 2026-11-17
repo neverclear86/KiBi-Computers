@@ -183,6 +183,25 @@ class LuaKibiApiTest {
         }
 
         /**
+         * [finish] と同じだが、メインスレッドのメソッドが列にある間は、プロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める。
+         * start と直後の take の間に tick が入ってメソッドが終わり、コルーチンが task_complete を yield せずに値を返すことがないようにする
+         * （Lua が動いている間は列の呼び出しを実行しないので、メインスレッドのメソッドは必ず yield する）
+         */
+        fun finishTickingWhileWaiting(expected: ProcessState = ProcessState.EXITED): String {
+            eventually(60_000, "終わらない: $text") {
+                val state = m.stateOf(pid)
+                val waiting = state == ProcessState.WAITING_EVENT || state == ProcessState.WAITING_HOST || state == ProcessState.WAITING_FUEL
+                if (m.pendingHostCalls == 0 || waiting) h.scheduler.tick()
+                Thread.sleep(1)
+                drain()
+                m.stateOf(pid).isTerminal
+            }
+            val out = drain()
+            assertEquals(expected, m.stateOf(pid), out)
+            return out
+        }
+
+        /**
          * Lua が待っている間に、マシンの RAM の残りがちょうど [remaining] バイトになるように、テストの側で予約する（#729）。
          * 予約したバイト数を返す（[release] で戻す）。待っている間は Lua が書かないので、起きた後の残りが決まる
          */
@@ -207,6 +226,9 @@ class LuaKibiApiTest {
     }
 
     private fun run(script: String): String = Run(script).use { it.finish() }
+
+    /** [run] と同じだが、メインスレッドのメソッドが start の直後に終わらないように tick を進める（[Run.finishTickingWhileWaiting]） */
+    private fun runYielding(script: String): String = Run(script).use { it.finishTickingWhileWaiting() }
 
     @Test
     fun `peripheralで列挙して種類とメソッドを読み、callで呼べる`() = timeout(limit) {
@@ -478,7 +500,7 @@ class LuaKibiApiTest {
 
     @Test
     fun `pcallとgsubのコールバックの中で待て、コルーチンの中ではyieldする`() = timeout(limit) {
-        val out = run(
+        val out = runYielding(
             """
             print(pcall(function() os.sleep(0.05); return peripheral.call("$ADDRESS", "main-echo", "p") end))
             local co = coroutine.wrap(function()
@@ -519,7 +541,7 @@ class LuaKibiApiTest {
 
     @Test
     fun `コルーチンの中の呼び出しはtask_completeをyieldし、直接のメソッドとその場の失敗とyieldできない文脈では待たない`() = timeout(limit) {
-        val out = run(
+        val out = runYielding(
             """
             local p = peripheral.wrap("$ADDRESS")
             -- 直接のメソッド（wrap は invoke、call は start してすぐ take）は yield しない

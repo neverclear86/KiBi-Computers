@@ -15,7 +15,7 @@ lua(1) has the `parallel` library (also `require("parallel")`). It follows the `
 
 Each function runs in its own coroutine. When a function waits for an event with `os.pullEvent`, `os.pullEventRaw` or `os.sleep` (os(3)), or for the result of a device method that runs on the main thread of the server (peripheral(3)), its coroutine yields, and the other functions run. When all of them wait, the next event is taken and given to each function whose filter matches it (a function without a filter gets every event). A `terminate` event is given to every function.
 
-- `parallel.waitForAny(f, ...)` returns when one of the functions returns, with the position of that function (1 for the first). The other functions are stopped where they are
+- `parallel.waitForAny(f, ...)` returns when one of the functions returns, with the position of that function (1 for the first). The other functions are stopped where they are. If a stopped function was waiting for the result of a method on the main thread (peripheral(3)), the call is cancelled when the program ends, unless it has run already (CC: Tweaked runs it)
 - `parallel.waitForAll(f, ...)` returns when all of the functions have returned
 
 If a function raises an error, the error is raised again by `parallel`, and the other functions are stopped. All arguments must be functions.

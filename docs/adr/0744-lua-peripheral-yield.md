@@ -14,12 +14,12 @@
 
 1. 引数を写す（今までと同じ。上限の検査も同じ）
 2. open →（`wrap` の関数なら）`info` で種類を照合 → `start` → device の fd をすぐ drop（pending-call は device の fd から独立している。`Queued(address, method, args)`）
-3. すぐ1回 `take` する。直接のメソッドと、その場で失敗するもの（外れた・メソッドがない・種類が違う）は `start` の中で終わっているので、ここで値を返すかエラーにする（**yield しない**。CC も直接のメソッドは yield しない。`coroutine.wrap` でイテレーターを作るコードを壊さない）
+3. すぐ1回 `take` する。直接のメソッドと、その場で失敗するもの（外れた・メソッドがない・種類が違う）は `start` の中で終わっているので、ここで値を返すかエラーにする（**yield しない**。CC も直接のメソッドは yield しない。`coroutine.wrap` でイテレーターを作るコードを壊さない）。メインスレッドのメソッドでも、`start` と直後の `take` の間にサーバーの tick が入ってメソッドが終わっていれば、ここで値を返す（yield しない。結果は同じで、待たずに済んだだけ。CC は常に yield する）。だから、メインスレッドのメソッドの呼び出しが必ず yield するとは約束しない。テストで yield を確かめるときは、Lua が動いている間は tick を進めない（`LuaKibiApiTest` の `finishTickingWhileWaiting`）
 4. 終わっていなければ、task id（単調に増やす 64 ビット。タイマーの id とは別）を取り、`[task id]` をスタックの底に置いて `"task_complete"` を `lua_yieldk` で yield する
 5. 続き（`call_k`）: 次のどれか
    - `"task_complete", id, true, 値...`（id は Lua の数値の等しさで比べる。float でも合う）: 値を返す
    - `"task_complete", id, false, 文`: 文に呼んだ Lua の行の位置（`luaL_where(L, 1)`）を付けてエラーにする（今の同期の呼び出しと同じ文になる）
-   - `terminate`: `Terminated`（位置なし）のエラー。Lua の側は呼び出しを取り消さない（CC と同じ）。pending-call の fd は表に残るので、プログラムが続けば、メソッドは動き、結果は後で迷子の `task_complete` として届く。**プログラムが `Terminated` で終わる（ふつうの terminate の流れ）と、プロセスの終了で表の fd が閉じられる。カーネルは pending-call の最後の fd が閉じられると、まだ実行していないメインスレッドの呼び出しを列から外す（#532）ので、その tick でまだ走っていない呼び出しは実行されない**（`waitForAny` で残したコルーチンの呼び出しも、直後にプログラムが終われば同じ）。すでに実行した呼び出しは取り消されない
+   - `terminate`: `Terminated`（位置なし）のエラー。Lua の側は呼び出しを取り消さない（CC と同じ）。pending-call の fd は表に残るので、プログラムが続けば、メソッドは動き、結果は後で迷子の `task_complete` として届く。**プログラムが `Terminated` で終わる（ふつうの terminate の流れ）と、プロセスの終了で表の fd が閉じられる。カーネルは pending-call の最後の fd が閉じられると、まだ実行していないメインスレッドの呼び出しを列から外す（#532）ので、その tick でまだ走っていない呼び出しは実行されない**（`waitForAny` で残したコルーチンの呼び出しも、直後にプログラムがふつうに終われば同じ）。すでに実行した呼び出しは取り消されない。CC: Tweaked は積んだメインスレッドの呼び出しをプログラムが終わっても実行するので、利用者から見える違い（peripheral(3)・parallel(3) の man に書く）
    - ほか: 捨ててまた `"task_complete"` を yield する
 
 ## 待っている呼び出しの表
