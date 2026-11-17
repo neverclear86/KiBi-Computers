@@ -24,12 +24,14 @@
 1. 世代のファイル・`owner.bin` は、名前が見えた時点で中身が全部ある（tmp → fsync → `ATOMIC_MOVE`。#81 のまま）
 2. **自動保存**: ケースの `identity`（NBT に書く世代）を進めて `setChanged` するのは、書き込みのスレッドで rename が終わったと分かってから。書き込み中にチャンクが保存されても、NBT は前の世代を指す
 3. **停止**: `ServerStoppingEvent` で全台を取り出して書き込みに回した後、列が空になるまで待ち（`flush`。上限 `writerFlushMillis`、仮 30 秒）、終わった分を受け取って `identity` を進め `setChanged` してから、
-   `ChunkUnloadDrain` と `saveAllChunks` に進む。`ServerStoppedEvent` でスレッドを閉じて join する（チャンクの保存が積んだ掃除を流すため。上限は同じ、超えたら warn）
+   `ChunkUnloadDrain` と `saveAllChunks` に進む。`ServerStoppedEvent` でスレッドを閉じて join する（チャンクの保存が積んだ掃除を流すため。上限は同じ、超えたら warn）。
+   取り出しの前に、読み込みの `claim` で予約した印（`changedLater`。NBT と違う ID・世代・epoch になったケース。ふだんは次の tick の始めに流す）を `markChunkUnsaved` で流す。読み込んだ直後の tick に止まると予約が流れず、取り出さない台（電源の切れた台・復元の途中の台）の NBT が `claim` の前の値のまま残るため。流す位置の条件は `saveAllChunks` より前（`ServerStoppingEvent` の中）だけで、`ChunkUnloadDrain` との前後は正しさに関係しない。アンロード（`saveForUnload`）は `untrack` で予約を捨てる前に、流れていない予約があればそのチャンクに `setUnsaved(true)` を付けて外す（tick の合間のアンロードも同じ。#762）
 4. **アンロード（`ChunkEvent.Unload`）だけは、書き込みの終わりを待たない。** 予約した世代を `identity` にして `setUnsaved(true)` を付ける（NBT は書き込み中の世代を指しうる）。
    自動保存の予約が書き込み中のときも、その予約の世代を採る。クラッシュ・書き込みの失敗で NBT の世代のファイルがないときは、規則 9 に落ちる
 5. **FULL でなくなったチャンク（#545）**: 2. と同じく、終わってから `identity` を進め、チャンクに `setUnsaved(true)` を付ける。終わる前にアンロードが来たら 4.
    完了で印を付けるときは、チャンクが FULL（`hasChunkAt`）なら `setChanged`、FULL でなければ（`setChanged` が届かない）`ChunkHolder` の最新の `LevelChunk` に直接 `setUnsaved(true)` を付ける（チャンクを読み込み直さない）。停止（3.）で、プレイヤーのチケットが先に外れて FULL でなくなったばかりのチャンク（`saveForDemotion` がまだ回っていない）も同じ（#653）。
-   アンロード待ちのチャンク（`processUnloads` が holder を外して `visibleChunkMap` から見えないが、アンロードの仕事がまだ走っていない）では印を付けられないので、ケースを覚えておき（`unmarkedCases`）、続くアンロード（`saveForUnload`）がそのチャンクに `setUnsaved(true)` を付ける。holder の最新のチャンクの中のブロックエンティティがそのケースでなければ（読み込み直した別のチャンク）付けない
+   FULL でないチャンクに印を付けるときは、そのチャンクを最新に持つ holder の `wasAccessibleSinceLastSave` も立て直す（AT で public にしたフィールド。`markDemotedChunkUnsaved`）。バニラの tick の保存（`saveChunkIfNeeded`）と `saveAllChunks` はこのフラグが立った holder しか書かず、FULL でない holder のフラグは一度保存を試すと偽になって FULL に戻るまで立たないため、立て直さないと印がアンロードか停止までディスクに行かない（#761）。完了の印のほか、`saveForUnload` の FULL でなくなった経路のそろえの印（取り出しの前・写した後、`unmarkedCases`、停止で取り出し済みの台）も同じにする（FULL でなくなった tick のうちに、バニラの急ぎの保存がそのチャンクを書いてフラグを下ろすことがあるため）。立て直した後の保証は、FULL のチャンクの `setChanged` と同じ（時間が残る tick の急ぎの保存か、自動保存が書く）。チャンクを直接書く（`ChunkMap.save`）方式は、書き出しが予算の外でメインスレッドに固まるので採らない。
+   アンロード待ちのチャンク（`processUnloads` が holder を外して `visibleChunkMap` から見えないが、アンロードの仕事がまだ走っていない）は、アンロード待ちの表（`pendingUnloads`。AT で読めるようにした）の holder から引いて、同じく印とフラグを付ける（`findHolder`。チケットが戻ってまだ見える表に移っていない holder は `updatingChunkMap` から引く）。アンロードの仕事が走る前にチケットが戻ると、バニラは同じ holder を使い直し、積んであったアンロードの仕事は何もせず終わる（`ChunkEvent.Unload` も来ない）ので、「続くアンロードが書く」には頼れない。FULL でない段階で戻ったときにフラグが下りたままだと、印が次の本物のアンロードか停止までディスクに行かない（#761）。アンロードの仕事が走れば `ChunkMap.save` はフラグを見ないので、立てても害はない。どこにも holder が見つからないときだけケースを覚えておき（`unmarkedCases`）、続くアンロード（`saveForUnload`）がそのチャンクに `setUnsaved(true)` を付ける。holder の最新のチャンクの中のブロックエンティティがそのケースでなければ（読み込み直した別のチャンク）付けない
 6. **読み込み直し**: 世代のファイルを読む側（#85）は先に `awaitWrites(id)` でその ID の仕事を待つ。`claim` はメモリの `owners` を先に見る（予約の時点で入れる）
 7. **同じ ID の仕事の順**: 世代の書き込み・新しい ID の `owner.bin`・掃除・ディレクトリの削除は、列に入れた順に走る。削除より前に入れた書き込みは削除より先に走り、削除で消える。
    「消した ID」の集合は持たない。走らせなかった仕事（閉じた後に入れた仕事、7b の後続）と仕事の中の例外は、すべて失敗の完了（`SaveCompletion`）で返す。
