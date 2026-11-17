@@ -9,7 +9,7 @@ KiBi Computers provides WASI p1 (module name `wasi_snapshot_preview1`) with the 
 
 - **Only commands** run. A module that does not export the function `_start` fails at load time with `NOEXEC`. There is no reactor entry point (an export that receives events); to receive events, wait on a queue's fd with `poll_oneoff`
 - Returning from `_start` ends the process with exit code 0; calling `proc_exit(n)` ends it with exit code `n` (all 32 bits)
-- Component Model components cannot run yet (`NOEXEC`; see [p2 and p3 plans](./p2-p3.md))
+- Component Model components are not handled by the p1 layer. A command component that exports `wasi:cli/run@0.2.x` runs in the p2 layer; any other component fails with `NOEXEC` (see [p2 and p3 plans](./p2-p3.md))
 - Export your linear memory. Calls without a memory return `FAULT` or trap
 
 ## Per-function support

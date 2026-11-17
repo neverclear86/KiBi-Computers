@@ -15,6 +15,8 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
+import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Driver
+import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Host
 
 /**
  * WASMランタイム（Endive）が読み込めて実行できるかを確かめる最小のチェック。
@@ -143,20 +145,31 @@ public object RuntimeSelfCheck {
     ).let { ints -> ByteArray(ints.size) { ints[it].toByte() } }
 
     /**
-     * p2 のコマンドのコンポーネントを、`exec` と同じ読み方（`Program.loadExecutable`。実物の `wasi:*` のホストでリンクし、燃料の
-     * 計測コードを挿入する）で読み込み、`exec` の既定のドライバーの選び方（`KernelDrivers.DEFAULT`）で p2 のドライバーを選べたら `true`（#687）。
-     * 検証器・リンカー・`wasi:*` のホストのクラスが実行環境で読めるかを GameTest で確かめるために使う。
+     * p2 のコマンドのコンポーネントを、`exec` と同じ読み方（`Program.loadExecutable`。`wasi:*` のホスト `KernelDrivers.COMPONENT_HOST` を
+     * 渡し、燃料の計測コードを挿入する）で読み込み、`exec` の既定のドライバーの選び方（`KernelDrivers.DEFAULT`）で p2 のドライバーを選べて、
+     * インスタンス化して `run` を呼ぶと `ok` が返れば `true`（#687）。あわせて、`wasi:*` のホストを実際に組み立てる
+     * （`WasiP2Host.interfaceOf` で WIT の読み取りと、各インターフェースの実装との照合を走らせる）。
+     * このコンポーネントは import を持たないので、リンクのときにはホストの組み立ては走らない。ここで明示的に呼んで、
+     * 検証器・リンカー・`wasi:*` のホストのクラスが実行環境で読めるかを GameTest で確かめる。
      * 重い（初回は 1 秒ほど）ので、起動時には呼ばない。
      *
      * @throws WasmLoadException 読み込めない
+     * @throws WasmTrapException 実行がトラップした
      * @throws FsException p2 のドライバーを選べない（`NOEXEC`）
      */
     @JvmStatic
-    @Throws(WasmLoadException::class, FsException::class)
+    @Throws(WasmLoadException::class, WasmTrapException::class, FsException::class)
     public fun loadsComponentCommand(): Boolean {
         val program = Program.loadExecutable(EndiveRuntime(), RUN_COMMAND_COMPONENT, ModuleLimits.DEFAULT, true, emptySet(), KernelDrivers.COMPONENT_HOST)
         val driver = KernelDrivers.DEFAULT.create(program)
-        return program.component != null && driver.kind == ProcessKind.BLOCKING
+        val component = program.component ?: return false
+        if (driver.kind != ProcessKind.BLOCKING) return false
+        // import のないコンポーネントではホストを引かないので、ここで組み立てる（WIT の読み取りと実装の照合）
+        if (WasiP2Host.interfaceOf("wasi:cli/stdout@0.2.0") == null) return false
+        val run = WasiP2Driver.runOf(component.plan)
+        return LinkedComponent.instantiate(component.plan, LinkEnv.NONE, WasmSharedFuel(1_000_000)).use { c ->
+            (c.call(run, emptyList()) as? CanonValue.Case)?.index == 0
+        }
     }
 
     private const val LUA_RESOURCE: String = "/kibicomputers/wasm/lua.wasm"

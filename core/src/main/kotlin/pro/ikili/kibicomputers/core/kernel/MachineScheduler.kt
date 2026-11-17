@@ -648,7 +648,11 @@ public class SchedulerConfig private constructor(builder: Builder) {
      */
     public val programCacheEntries: Int = builder.programCacheEntries
 
-    /** [programCacheEntries] で残すものの、WASM のバイト数の合計の上限（仮: 32 MiB。#37） */
+    /**
+     * [programCacheEntries] で残すものの、重さ（`Program.cacheWeight`）の合計の上限（仮: 32 MiB。#37）。
+     * core モジュールの重さは読み込む前の WASM のバイト数。コンポーネントは、燃料の計測コードを挿入した後の中の core モジュールの
+     * バイト数の合計 ＋ モジュール数 × 64 KiB ＋ 計画の項目数 × 256 の見積もり（#687）
+     */
     public val programCacheBytes: Long = builder.programCacheBytes
 
     /**
@@ -714,7 +718,10 @@ public class SchedulerConfig private constructor(builder: Builder) {
             programCacheEntries = value
         }
 
-        /** 使われていなくても残す、読み込んだ実行ファイルのバイト数の合計（1 以上） */
+        /**
+         * 使われていなくても残す、読み込んだ実行ファイルの重さの合計（1 以上）。core モジュールは読み込む前のバイト数、
+         * コンポーネントは中の core モジュールの大きさと数、計画の大きさからの見積もり（`Program.cacheWeight`）
+         */
         public fun programCacheBytes(value: Long): Builder = apply {
             require(value >= 1) { "programCacheBytes は 1 以上" }
             programCacheBytes = value

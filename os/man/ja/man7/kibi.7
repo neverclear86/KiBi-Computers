@@ -21,7 +21,7 @@ WASI にない機能は、`kibi:*` という名前の WIT のパッケージで�
 
 ## 注意
 
-p2・p3 と Component Model は、カーネルの同じ土台の上の薄い層として後で足す予定で、`kibi:*` の同じ WIT を使います。名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けの仮置きで、p1 からは import できません（`NOEXEC`）。
+p2・p3 と Component Model は、カーネルの同じ土台の上の薄い層で、`kibi:*` の同じ WIT を使います。p2 のコマンド（`wasi:cli/run` を export するコンポーネント）は exec で動き、p3 などの残りは後で足す予定です。名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けの仮置きで、p1 からは import できません（`NOEXEC`）。
 
 ソケットは未実装です。p1 の `sock_*` は `NOSYS` を返します。
 

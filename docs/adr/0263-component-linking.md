@@ -83,7 +83,7 @@
 - **キャッシュの重さ。** `ProgramCache` は重さを `Program.cacheWeight` から取る（強い参照に入れるときと、弱い参照から持ち直すときの 2 か所で同じ値）。core モジュールは今までどおり読み込む前のバイト数。コンポーネントは「中の core モジュール（同じ中身は 1 つ）のランタイムに渡したバイト数 ＋ core モジュールの数 × 64 KiB ＋ 計画の項目（手順・lift・lower・resource）の数 × 256 バイト」（`ComponentProgram.weightOf`。定数は仮の値で、確定は #251）。core モジュールを最大 1,000 個持てるので、元のバイト数だけで数えると、小さな入力でコンパイル結果（Metaspace）を大量に使えるため。
 - **制約（1,000 台規模）。** 待っている p2 のコマンド 1 つにつきスレッドを 1 本使う（`BLOCKING`）。上限（`maxBlockingProcesses`、既定 2048）を超えると作れない（`ResourceLimitException`。`kibi:process` の `spawn` は `NFILE`）。スレッドを持たない待ちは #757。計画の共有で、ヒープとコンパイルは同じコンポーネントにつき 1 回で済む。
 - 保存は今までどおり `UNSAVEABLE`（#269）。モジュールの置き場には元のバイト列を、既存の形（`<sha256>.wasm`）で書く。
-- 確かめていないこと: ネイティブの `wasm32-wasip2`・`wasm32-wasip3` のツールチェーンで作ったコンポーネント（テストはアダプターで包んだもの）、製品の jar（jarJar）での検証器・リンカー・ホストのクラスの読み込み（GameTest `componentCommandLoadsOnServer` は開発環境の実行時クラスパスで確かめる）。
+- 確かめていないこと: ネイティブの `wasm32-wasip2`・`wasm32-wasip3` のツールチェーンで作ったコンポーネント（テストはアダプターで包んだもの）、製品の jar（jarJar）での検証器・リンカー・ホストのクラスの読み込み（GameTest `componentCommandLoadsOnServer` は開発環境の実行時クラスパスで、読み込み・ホストの組み立て・`run` の呼び出しまで確かめる）。この 2 件は #775 で追う。
 
 ## テスト
 

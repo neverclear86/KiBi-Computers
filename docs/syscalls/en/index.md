@@ -21,7 +21,7 @@ This reference is for people who write programs (in C, Zig, Rust, or anything el
 | p2 and p3 interfaces for `kibi:*` | **Provisional**. The WIT exists, but its shape will change when the p2 and p3 layers are built ([p2 and p3 plans](./p2-p3.md)) |
 | Sockets (`sock_*`, `wasi:sockets`) | **Not implemented**. The p1 `sock_*` functions return `NOSYS` ([#76](https://github.com/neverclear86/KiBi-Computers/issues/76)) |
 
-p2, p3, and the Component Model will be added as thin layers over the same kernel foundation (file descriptors, event waiting, streams). p2 and p3 will use the same `kibi:*` WIT.
+p2, p3, and the Component Model are thin layers over the same kernel foundation (file descriptors, event waiting, streams). p2 commands run now; p3 and the rest will be added later. p2 and p3 will use the same `kibi:*` WIT.
 
 ## Pages
 

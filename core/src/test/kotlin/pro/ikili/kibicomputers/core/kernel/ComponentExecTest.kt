@@ -14,6 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -25,6 +26,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
@@ -32,6 +34,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
+import java.util.concurrent.Executor
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -169,11 +172,82 @@ class ComponentExecTest {
         }
     }
 
+    /** 読み込ませた core モジュールのバイト数を記録するランタイム（燃料の計測コードを挿入した後の大きさを知るため） */
+    private class CountingRuntime(private val inner: WasmRuntime = EndiveRuntime()) : WasmRuntime {
+        val sizes = ArrayList<Int>()
+        override val name: String get() = "counting-" + inner.name
+
+        override fun load(bytes: ByteArray): WasmModule {
+            sizes += bytes.size
+            return inner.load(bytes)
+        }
+    }
+
+    /** [dataBytes] バイトのデータを持つ core モジュールを、[count] 回（同じ中身で）定義して、インスタンス化するコンポーネントの WAT */
+    private fun modulesText(count: Int, dataBytes: Int): String {
+        val data = "a".repeat(dataBytes)
+        val modules = (1..count).joinToString("\n") { "(core module (memory 1) (data (i32.const 0) \"$data\") (func (export \"f\")))" }
+        val instances = (0 until count).joinToString("\n") { "(core instance (instantiate $it))" }
+        return "(component\n$modules\n$instances)"
+    }
+
+    private fun items(p: ComponentProgram): Long = p.plan.steps.size.toLong() + p.plan.lifts.size + p.plan.lowers.size + p.plan.resources.size
+
+    private fun loadCounting(text: String): Pair<ComponentProgram, CountingRuntime> {
+        val runtime = CountingRuntime()
+        return ComponentProgram.load(runtime, WitTool.wat(text), ComponentHost.NONE, metered = true) to runtime
+    }
+
     @Test
-    fun `コンポーネントの重さは中のcoreモジュールの数と計画の大きさから見積もる`() {
-        val p = P2Testing.load(hello)
-        assertTrue(p.cacheWeight >= p.moduleCount * ComponentProgram.WEIGHT_PER_MODULE, "${p.cacheWeight}")
+    fun `コンポーネントの重さはランタイムに渡したバイト数の合計と、モジュールの数と、計画の項目の数から見積もる`() {
+        val (p, runtime) = loadCounting(modulesText(2, 1000))
+        // 同じ中身は 1 つ。重さは「渡したバイト数の合計 + モジュール数 × 固定 + 項目数 × 項目の固定」ちょうど
+        assertEquals(1, p.moduleCount)
+        assertEquals(1, runtime.sizes.size)
+        val expected = runtime.sizes.sumOf { it.toLong() } + p.moduleCount * ComponentProgram.WEIGHT_PER_MODULE + items(p) * ComponentProgram.WEIGHT_PER_PLAN_ITEM
+        assertEquals(expected, p.cacheWeight)
         assertEquals(p.cacheWeight, Program.component(p).cacheWeight)
+        assertTrue(p.cacheWeight >= 1000 + ComponentProgram.WEIGHT_PER_MODULE, "${p.cacheWeight}")
+    }
+
+    @Test
+    fun `コンポーネントの重さは中のモジュールの大きさに比例し、同じ中身は1つに数える`() {
+        val small = loadCounting(modulesText(1, 100)).first
+        val big = loadCounting(modulesText(1, 100_000)).first
+        // 大きさの差がそのまま重さの差になる（計画の項目の数は同じ）
+        assertEquals(items(small), items(big))
+        assertTrue(big.cacheWeight - small.cacheWeight >= 99_000, "${small.cacheWeight} ${big.cacheWeight}")
+        // 同じ中身の定義を 3 つ並べても、モジュールは 1 つで、重さはモジュールの分が増えない（計画の項目の分だけ）
+        val (triple, runtime) = loadCounting(modulesText(3, 100))
+        assertEquals(1, triple.moduleCount)
+        assertEquals(1, runtime.sizes.size)
+        assertEquals(small.cacheWeight + (items(triple) - items(small)) * ComponentProgram.WEIGHT_PER_PLAN_ITEM, triple.cacheWeight)
+        // 中身が違えば別のモジュールで、モジュールの数の分の固定の重さがかかる
+        val different = ComponentProgram.load(
+            EndiveRuntime(),
+            WitTool.wat("(component (core module (func (export \"a\"))) (core module (func (export \"b\"))) (core instance (instantiate 0)) (core instance (instantiate 1)))"),
+            ComponentHost.NONE,
+            metered = true,
+        )
+        assertEquals(2, different.moduleCount)
+        assertTrue(different.cacheWeight >= 2 * ComponentProgram.WEIGHT_PER_MODULE)
+    }
+
+    @Test
+    fun `ProgramCacheはコンポーネントの重さで古いものを外す`() {
+        val heavy = loadCounting(modulesText(1, 200_000)).first
+        val light = loadCounting(modulesText(1, 100)).first
+        val direct = Executor { it.run() }
+        // 上限は重いもの 2 つ分の少し手前。重いものは 1 つしか持てない
+        val cache = ProgramCache(100, heavy.cacheWeight * 2 - 1, direct)
+        fun loadHeavy(n: Int) = cache.load(1, "heavy-$n".toByteArray(), true, emptySet()) { Program.component(heavy) }.get()
+        loadHeavy(1)
+        loadHeavy(2)
+        assertEquals(1, cache.retainedCount)
+        // 軽いものは何個でも収まる（バイト数は小さくても、固定の分だけ重さがある）
+        val cache2 = ProgramCache(100, light.cacheWeight * 3, direct)
+        (1..5).forEach { n -> cache2.load(1, "light-$n".toByteArray(), true, emptySet()) { Program.component(light) }.get() }
+        assertEquals(3, cache2.retainedCount)
     }
 
     private val kibiProcess: ByteArray by lazy {

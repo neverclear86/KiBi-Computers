@@ -21,7 +21,7 @@ KiBi Computers のコンピューターでは、プログラムは WebAssembly�
 | `kibi:*` の p2・p3 向けの interface | **仮置き**。WIT はありますが、形は p2・p3 の層を作るときに変わります（[p2・p3 の予定](./p2-p3.md)） |
 | ソケット（`sock_*`・`wasi:sockets`） | **未実装**。p1 の `sock_*` は `NOSYS` を返します（[#76](https://github.com/neverclear86/KiBi-Computers/issues/76)） |
 
-p2・p3 と Component Model は、カーネルの同じ土台（fd、イベント待ち、ストリーム）の上の薄い層として足す予定です。p2・p3 でも、`kibi:*` の同じ WIT を使います。
+p2・p3 と Component Model は、カーネルの同じ土台（fd、イベント待ち、ストリーム）の上の薄い層です。p2 のコマンドは動き、p3 などの残りは後で足す予定です。p2・p3 でも、`kibi:*` の同じ WIT を使います。
 
 ## ページ
 
