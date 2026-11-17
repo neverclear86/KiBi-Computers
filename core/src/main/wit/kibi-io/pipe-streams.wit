@@ -1,10 +1,10 @@
 package kibi:io@0.1.0;
 
-/// p2 のパイプ（ADR 0075）。仮置き: interface・関数・型・`wasi:*` の版は、p2 の層（#685）を作るときに直してよい（v0.1.0 までは版を変えずに直す）。
+/// p2 のパイプ（ADR 0075。#685 で実装（ABI は確認待ち）、ADR 0685）。
 /// 2つの stream は同じカーネルのパイプ（ADR 0059）の両端を指す。
 interface pipe-streams {
     use kibi:kernel/types@0.1.0.{error-code};
-    use wasi:io/streams@0.2.3.{input-stream, output-stream};
+    use wasi:io/streams@0.2.12.{input-stream, output-stream};
 
     /// パイプを作り、読む端を input-stream、書く端を output-stream で返す。大きさは既定（仮の値 4096 バイト。確定は #251）。
     /// 書く端をすべて捨てると読む側は残りを読んだ後に stream-error.closed、読む端をすべて捨てると書く側は stream-error.closed。

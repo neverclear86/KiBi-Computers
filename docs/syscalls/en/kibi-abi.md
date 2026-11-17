@@ -14,7 +14,7 @@ The extensions are defined as WIT packages named `kibi:<area>`. WASI p1 programs
 | `kibi:computer@0.1.0` | `memory`, `clock`, `power` | [kibi:computer](./kibi-computer.md) |
 | `kibi:fs@0.1.0` | `mounts` | [kibi:fs](./kibi-fs.md) |
 
-Interfaces whose names end in `-poll`, `-async`, or `-streams` are provisional ones for p2 and p3 and cannot be imported from p1 ([p2 and p3 plans](./p2-p3.md)). The current time and the monotonic clock come from WASI `clock_time_get`; they are not in `kibi:*`.
+Interfaces whose names end in `-poll`, `-async`, or `-streams` are for p2 and p3 and cannot be imported from p1. `-poll` and `-streams` work in p2 (#685); `-async` is a provisional one for p3 ([p2 and p3 plans](./p2-p3.md)). The current time and the monotonic clock come from WASI `clock_time_get`; they are not in `kibi:*`.
 
 The original WIT files (with descriptive comments, in Japanese) are in [`core/src/main/wit/`](https://github.com/neverclear86/KiBi-Computers/tree/main/core/src/main/wit) in the repository. The WIT on each page is that WIT with the comments removed.
 

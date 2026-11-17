@@ -343,7 +343,7 @@ internal object WasiP2Io {
         return ctx.withKernelLock {
             val handle = e.handle
             val always = handle == null || ctx.kernel.objects[handle.objectId] is OpenFile
-            val p = if (always) PollableEntry.Ready(parent) else PollableEntry.Stream(parent, if (input) WaitCondition.READABLE else WaitCondition.WRITABLE)
+            val p = if (always) PollableEntry.Ready(parent) else PollableEntry.Object(parent, if (input) WaitCondition.READABLE else WaitCondition.WRITABLE)
             P2.childLocked(ctx, parent, p)
         }
     }
@@ -353,6 +353,14 @@ internal object WasiP2Io {
 
     /** いつもそろった pollable（親 [parent] の子）を作る */
     fun alwaysReady(ctx: ProcessContext, parent: Int): CanonValue = ctx.withKernelLock { P2.childLocked(ctx, parent, PollableEntry.Ready(parent)) }
+
+    /**
+     * `kibi:*` の resource（親 [parent]。[KernelEntry]）の pollable を作る（`events-poll`・`timers-poll`・`bus-poll`・`process-poll` の
+     * `subscribe`。#685）。そろう条件は p1 の `FD_READ` と同じ（`FdIo.pollEntryLocked` の `READABLE`。`ProcessObject` は終わったら）
+     */
+    fun subscribeKernel(ctx: ProcessContext, parent: Int): CanonValue = ctx.withKernelLock {
+        P2.childLocked(ctx, parent, PollableEntry.Object(parent, WaitCondition.READABLE))
+    }
 
     /** [timed] は、まだ期限の来ていない時計の pollable の添字 */
     private class Evaluation(val ready: List<Int>, val keys: List<WaitKey>, val deadline: Long?, val timed: List<Int>)
@@ -377,10 +385,14 @@ internal object WasiP2Io {
                         timed += i
                         deadline = minOf(deadline ?: Long.MAX_VALUE, p.nanos)
                     }
-                    is PollableEntry.Stream -> {
-                        val s = table[p.parent] as? StreamEntry ?: P2.trap("pollable の親 ${p.parent} がない")
-                        val handle = s.handle
-                        if (s.closed || handle == null) {
+                    is PollableEntry.Object -> {
+                        val handle = when (val parent = table[p.parent]) {
+                            is StreamEntry -> if (parent.closed) null else parent.handle
+                            is KernelEntry -> parent.handle
+                            else -> P2.trap("pollable の親 ${p.parent} がない")
+                        }
+                        // 閉じた stream はそろったものとする（読み書きは closed を返す）
+                        if (handle == null) {
                             ready += i
                             continue
                         }

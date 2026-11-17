@@ -5,7 +5,7 @@ world imports {
     import process;
 }
 
-/// p2 のゲスト向け（仮置き。ADR 0074）
+/// p2 のゲスト向け（#685 で実装（ABI は確認待ち）。ADR 0685・ADR 0074）
 world imports-p2 {
     import process;
     import process-poll;

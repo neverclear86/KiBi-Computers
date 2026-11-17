@@ -7,19 +7,19 @@ import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
 import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Driver
-import pro.ikili.kibicomputers.core.wasi.p2.WasiP2Host
+import pro.ikili.kibicomputers.core.wasi.p2.KernelComponentHost
 
 /** カーネルが自分で実行ファイルを動かすとき（起動の init など）のドライバーの選び方 */
 internal object KernelDrivers {
     /**
-     * コンポーネントの実行ファイルをリンクするホスト（#687）。サーバー全体で 1 つの固定のもの（今は [WasiP2Host]。`kibi:*` を
-     * 足すとき（#685）も、同じ固定の合成ホストにする）。
+     * コンポーネントの実行ファイルをリンクするホスト（#687）。サーバー全体で 1 つの固定のもの（[KernelComponentHost]: `wasi:*` は
+     * `WasiP2Host`、`kibi:*` は `KibiP2Host`。#685）。
      *
      * リンクは読み込みのときに 1 回だけで、計画（`ComponentPlan`）は `ProgramCache` で全マシンが共有する。`ProgramCache` のキーは
      * ホストを含まないので、マシンやデバイスの構成でホストを変えない（変えると、リンクの失敗が覚えられて別のマシンにも返る）。
      * デバイスがあるかどうかは、リンクのときではなく呼び出しのとき（`ComponentCall.env`）に見る
      */
-    val COMPONENT_HOST: ComponentHost get() = WasiP2Host
+    val COMPONENT_HOST: ComponentHost get() = KernelComponentHost
 
     /**
      * 既定: `_start` を export する p1 のコマンドは [WasiP1Driver]、それ以外は `NOEXEC`。

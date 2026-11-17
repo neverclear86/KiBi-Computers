@@ -77,10 +77,22 @@ internal class DirectoryStreamEntry(override val objectId: Int) : P2Entry() {
 }
 
 /**
+ * `kibi:*` の resource（`event-queue`・`timer`・`process`・`device`・`pending-call`。#685。ADR 0685）。[handle] は p1 の fd と同じ
+ * カーネルのオブジェクト（`EventQueue`・`Timer`・`ProcessObject`・`DeviceHandle`・`PendingDeviceCall`）の参照と権利。
+ * [label] は WIT の resource の名前（誤ったハンドルのトラップの文言と、種類の見分けに使う）
+ */
+internal class KernelEntry(val handle: HandleEntry, override val label: String) : P2Entry() {
+    override val objectId: Int get() = handle.objectId
+
+    override fun copyForSnapshot(): HostResourceEntry = KernelEntry(handle, label).also { it.children = children }
+}
+
+/**
  * `pollable`。カーネルのオブジェクトは持たない（時計の pollable のたびにタイマーを作らない。ADR 0267）。
  *
  * - [Deadline]: 単調時計（`ctx.monotonicNanos`）が [Deadline.nanos] に着いたらそろう
- * - [Stream]: 親の stream（rep [Stream.parent]）が [Stream.condition] でそろったら（親は子が残る間 drop できない）
+ * - [Object]: 親（rep [Object.parent]。stream か [KernelEntry]）が指すカーネルのオブジェクトが [Object.condition] でそろったら。
+ *   `poll` のたびに親から引く `WaitKey` 1 つで待つ（エントリには持たせない。ADR 0043 の追記・ADR 0685）。参照は親が持ち、pollable は持たない（親は子が残る間 drop できない。#685）
  * - [Ready]: いつもそろっている（ファイルの stream、ソケットの口など）
  */
 internal sealed class PollableEntry(val parent: Int) : P2Entry() {
@@ -91,7 +103,7 @@ internal sealed class PollableEntry(val parent: Int) : P2Entry() {
         override fun copyForSnapshot(): HostResourceEntry = this
     }
 
-    class Stream(parent: Int, val condition: WaitCondition) : PollableEntry(parent) {
+    class Object(parent: Int, val condition: WaitCondition) : PollableEntry(parent) {
         override fun copyForSnapshot(): HostResourceEntry = this
     }
 

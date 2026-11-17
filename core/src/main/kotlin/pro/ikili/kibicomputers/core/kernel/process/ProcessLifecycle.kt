@@ -132,8 +132,9 @@ internal class ProcessLifecycle(private val machine: Machine) {
     }
 
     /**
-     * [holder] の fd 表から子のハンドル [obj] を1つ外した（`FdTable` の `close`・`dup2`・`renumber`。`WakeSink.processHandleClosed`）。
-     * [holder] がその子の親で、表にもう [obj] を指す fd がなければ（最後のハンドル）、子を付け替える:
+     * [holder] の fd 表から子のハンドル [obj] を1つ外した（`FdTable` の `close`・`dup2`・`renumber`、p2 の `[resource-drop]process`。
+     * `WakeSink.processHandleClosed`）。[holder] がその子の親で、fd 表にもホストの resource の表（p2。#685）にも [obj] を指すハンドルが
+     * もうなければ（最後のハンドル）、子を付け替える:
      * 終わっていれば刈り取り、動いていれば親なし（`parentPid = 0`）にする（親なしのまま終われば、親のないゾンビとして古い順に刈り取られる）。
      * pid が使い回された別のプロセス（`objectId` が違う）・親でない持ち主が閉じたときは何もしない
      */
@@ -141,6 +142,8 @@ internal class ProcessLifecycle(private val machine: Machine) {
         val child = currentOf(obj) ?: return
         if (holder.pid == 0 || child.parentPid != holder.pid) return
         if (holder.handles.entries().values.any { it.objectId == obj.id }) return
+        // p2 の `process` のハンドル（ホストの resource の表。#685）も、まだ持っているハンドルとして数える
+        if (holder.hostResources.any { it.objectId == obj.id }) return
         if (child.state.isTerminal) machine.reapLocked(child.pid) else child.parentPid = 0
     }
 

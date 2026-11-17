@@ -16,6 +16,8 @@ import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.event.EventBatch
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
 import pro.ikili.kibicomputers.core.kernel.event.EventLimits
+import pro.ikili.kibicomputers.core.kernel.fd.HandlePlacement
+import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -547,6 +549,81 @@ internal interface ProcessContext {
      * 待機点型の p1 の `invoke` が、巻き直して着いたときに、起こした key から前の呼び出しを引くのに使う（#77）
      */
     fun pendingDeviceCallFdOf(key: WaitKey): Int?
+
+    // ---- p2 のハンドルの口（#685） ----
+    // p2 の resource（`event-queue`・`timer`・`process`・`device`・`pending-call`）は fd 表に入れず、プロセスのホストの resource の表
+    // （`HostResourceTable`）に置く（ADR 0075・0267）。カーネルの中身は fd 版と同じもので、新しいハンドルの置き場は [HandlePlacement]、
+    // 既にあるハンドルは解決済みの [HandleEntry] で受ける。検査の順・エラーは fd 版と同じ（BADF は「その種類のオブジェクトでない」）
+
+    /** [openEventQueue] と同じだが、キューのハンドルを [place] に置いてその番号を返す */
+    @Throws(FsException::class, ResourceLimitException::class)
+    fun openEventQueue(filter: EventFilter, capacity: Int, place: HandlePlacement): Int
+
+    /** [takeEvents] と同じだが、キューを解決済みのハンドル [queue] で受ける */
+    @Throws(FsException::class)
+    fun takeEvents(queue: HandleEntry, max: Int): EventBatch
+
+    /** [createTimer] と同じだが、キューを解決済みのハンドル [eventQueue] で受け、タイマーのハンドルを [place] に置いてその番号を返す */
+    @Throws(FsException::class)
+    fun createTimer(eventQueue: HandleEntry?, tag: Long, place: HandlePlacement): Int
+
+    /** [setTimer] と同じだが、タイマーを解決済みのハンドル [timer] で受ける */
+    @Throws(FsException::class, ResourceLimitException::class)
+    fun setTimer(timer: HandleEntry, time: Long, intervalNanos: Long, absolute: Boolean)
+
+    /** [cancelTimer] と同じ（ハンドル [timer]） */
+    @Throws(FsException::class)
+    fun cancelTimer(timer: HandleEntry)
+
+    /** [readTimer] と同じ（ハンドル [timer]） */
+    @Throws(FsException::class)
+    fun readTimer(timer: HandleEntry): Long
+
+    /**
+     * [execWithHandle] と同じだが、子のハンドルを [place] に置く（返す [ProcessHandle.fd] はその番号）。置き場の空きは読み込みの前と
+     * 子を作る前に確かめる（`MFILE`）
+     */
+    @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
+    fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions, place: HandlePlacement): ProcessHandle
+
+    /** [processHandleStatus] と同じ（子のハンドル [handle]） */
+    @Throws(FsException::class)
+    fun processHandleStatus(handle: HandleEntry): ExitStatus?
+
+    /** [killProcessHandle] と同じ（子のハンドル [handle]） */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun killProcessHandle(handle: HandleEntry, signal: KillSignal): KillResult
+
+    /** [processHandlePid] と同じ（子のハンドル [handle]） */
+    @Throws(FsException::class)
+    fun processHandlePid(handle: HandleEntry): Int
+
+    /** [openDevice] と同じだが、device のハンドルを [place] に置いてその番号を返す */
+    @Throws(DeviceCallException::class, FsException::class)
+    fun openDevice(address: String, place: HandlePlacement): Int
+
+    /** [deviceInfo] と同じ（device のハンドル [device]） */
+    @Throws(FsException::class)
+    fun deviceInfo(device: HandleEntry): DeviceInfo
+
+    /** [deviceMethods] と同じ（device のハンドル [device]） */
+    @Throws(FsException::class)
+    fun deviceMethods(device: HandleEntry): List<MethodInfo>
+
+    /** [invokeDevice] と同じ（device のハンドル [device]） */
+    @Throws(FsException::class, DeviceCallException::class, ProcessKilledException::class, WasmTrapException::class)
+    fun invokeDevice(device: HandleEntry, method: String, args: List<DeviceValue>): List<DeviceValue>
+
+    /**
+     * [startDeviceCall] と同じだが、`pending-call` のハンドルを [place] に置いてその番号を返す。
+     * 上限 `MAX_PENDING_CALLS` は fd 表と p2 のハンドルを合わせて数える
+     */
+    @Throws(FsException::class)
+    fun startDeviceCall(device: HandleEntry, method: String, args: List<DeviceValue>, place: HandlePlacement): Int
+
+    /** [takeDeviceCall] と同じ（`pending-call` のハンドル [call]） */
+    @Throws(FsException::class)
+    fun takeDeviceCall(call: HandleEntry): CallResult?
 
     /**
      * マシンを止める（`Machine.stop`。#49・#306。ADR 0306）。必ず受け付け、このプロセスも止まるので戻らない

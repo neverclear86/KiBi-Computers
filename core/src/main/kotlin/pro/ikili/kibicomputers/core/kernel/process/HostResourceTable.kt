@@ -60,6 +60,12 @@ internal class HostResourceTable {
         entries?.forEach { (k, v) -> action(k, v) }
     }
 
+    /** [predicate] に当たるエントリがあるか */
+    fun any(predicate: (HostResourceEntry) -> Boolean): Boolean = entries?.values?.any(predicate) == true
+
+    /** [predicate] に当たるエントリの数 */
+    fun count(predicate: (HostResourceEntry) -> Boolean): Int = entries?.values?.count(predicate) ?: 0
+
     /** すべてのエントリを外し、持っている参照を返す（プロセスの終わり。オブジェクトが既にない参照は飛ばす） */
     fun closeAll(objects: ObjectTable, sink: WakeSink) {
         val map = entries ?: return
