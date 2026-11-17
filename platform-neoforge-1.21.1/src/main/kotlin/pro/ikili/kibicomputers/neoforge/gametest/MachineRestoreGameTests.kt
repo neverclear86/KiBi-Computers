@@ -259,8 +259,9 @@ object MachineRestoreGameTests {
     }
 
     /**
-     * Esc を押した後（シェルがエスケープシーケンスの続きを待っている間）に保存しても、戻すとキーを打つ前に行を描き直す（#636）。
-     * キーボードの画面で Esc を押して閉じようとすると Esc がコンピューターに届くので、この形で保存されることがある
+     * Esc を押した後に保存しても、戻すとキーを打つ前に行を描き直し（#636）、次の Enter で行を実行する（#769。シェルは Esc の続きを
+     * 待たずに区切り、キーの境目の待ちに戻っている）。キーボードの画面で Esc を押して閉じようとすると Esc がコンピューターに届くので、
+     * この形で保存されることがある
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -280,11 +281,11 @@ object MachineRestoreGameTests {
             helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next key")
         }.thenExecute {
             send(KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
-            // Esc は、シェルが読んでエスケープシーケンスの続きを待つまで保存しない。待機点かどうかだけでは、Esc を読み終えたかは分からない
-            // （Esc が TTY に残ったままでも待機点で、戻したシェルはキーの境目の待ちで描き直せてしまう）ので、Esc を届けて読ませるのに十分な
-            // 時間を置く。読み終えたことの決定的な確認は、core の StandardOsRestoreTest（TTY の入力が空であることを見る）
+            // Esc は、シェルが読んで区切るまで保存しない。待機点かどうかだけでは、Esc を読み終えたかは分からないので、Esc を届けて
+            // 読ませるのに十分な時間を置く。読み終えたことの決定的な確認は、core の StandardOsRestoreTest・ShellEscapeKeyTest
+            // （TTY の入力が空であることを見る）
         }.thenIdle(20).thenWaitUntil {
-            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the rest of the escape sequence")
+            helper.assertTrue(first.computer.machine!!.isAtWaitPoint, "the shell should wait for the next key after Esc")
         }.thenExecute {
             val tag = saveAndTag(helper, first)
             helper.setBlock(SCREEN, Blocks.AIR)
@@ -301,6 +302,12 @@ object MachineRestoreGameTests {
             helper.assertTrue(screen != null, "the screen should be connected after restoring")
             val text = lines(screen!!.text)
             helper.assertTrue(text.any { it == "$ echo pending" }, "the restored shell should redraw the line after Esc: $text")
+        }.thenExecute {
+            // Esc の後の Enter は、エスケープシーケンスの続きとして捨てられず、行を実行する（#769）
+            send(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "pending" }, "Enter after Esc should run the line: $text")
         }.thenExecute {
             copy!!.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
