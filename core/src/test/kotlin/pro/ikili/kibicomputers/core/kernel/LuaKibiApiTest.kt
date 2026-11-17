@@ -117,6 +117,12 @@ class LuaKibiApiTest {
         memoryBytes: Long? = null,
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
         maxHostCallsPerTick: Int = 64,
+        /**
+         * true なら、[waitUntil]・[finish] はプロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める。
+         * Lua が動いている間に tick が入ると、start と直後の take の間でメインスレッドのメソッドが終わり、コルーチンが
+         * task_complete を yield せずに値を返す（CI の遅い実行で、waitForAny の戻り値が変わる）
+         */
+        private val tickOnlyWhileWaiting: Boolean = false,
     ) : AutoCloseable {
         val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
         val dev = TestDev()
@@ -149,8 +155,15 @@ class LuaKibiApiTest {
             text.toString()
         }
 
+        private fun shouldTick(): Boolean {
+            if (!tickOnlyWhileWaiting) return true
+            val state = m.stateOf(pid)
+            return state == ProcessState.WAITING_EVENT || state == ProcessState.WAITING_HOST || state == ProcessState.WAITING_FUEL ||
+                m.fuelWaiterCount > 0
+        }
+
         fun waitUntil(message: String, condition: () -> Boolean) = eventually(60_000, message) {
-            h.scheduler.tick()
+            if (shouldTick()) h.scheduler.tick()
             Thread.sleep(1)
             drain()
             condition()
@@ -617,6 +630,7 @@ class LuaKibiApiTest {
             os.pullEvent("finish")
             print("finished")
             """.trimIndent(),
+            tickOnlyWhileWaiting = true,
         ).use { r ->
             fun open(): Int = r.m.lock.withLockValue {
                 r.m.kernel.processes[r.pid]!!.handles.entries().values.count {
