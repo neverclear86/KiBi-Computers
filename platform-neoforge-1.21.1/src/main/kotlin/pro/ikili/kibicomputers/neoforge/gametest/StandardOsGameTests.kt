@@ -4,10 +4,12 @@ import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.GameType
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.phys.Vec3
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -29,6 +31,8 @@ import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
+import pro.ikili.kibicomputers.neoforge.input.KeyboardInputPayload
+import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -351,6 +355,123 @@ object StandardOsGameTests {
                 }
             }
             helper.assertTrue(text.any { it == "kp,q,0,false,true" }, "lua should receive the key event: $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * キーのイベントを順に画面に出す Lua（#326）。`kready` が出たらキーのイベントを受けられる。`key-pressed`・`key-released` は
+     * `ev,<名前>,<キー>`、キーボードの `device-detached`（Lua では `peripheral_detach`。ADR 0094）は `ev,detached`
+     */
+    private const val KEY_LOG_SCRIPT = "os.queueEvent('r0'); os.pullEvent('r0'); " +
+        "local kn = peripheral.getName(peripheral.find('keyboard')); print('kready'); " +
+        "while true do local e = {os.pullEvent()}; " +
+        "if e[1] == 'key-pressed' or e[1] == 'key-released' then print('ev,' .. e[1] .. ',' .. e[3]) " +
+        "elseif e[1] == 'peripheral_detach' and e[2] == kn then print('ev,detached') end end"
+
+    /** 入力のセッションを開いて、[key] を押す（サーバーに届いた入力と同じ道。[KeyboardSessions]） */
+    private fun pressThroughSession(helper: GameTestHelper, player: ServerPlayer, key: Key) {
+        val abs = helper.absolutePos(KEYBOARD)
+        player.moveTo(Vec3.atCenterOf(abs.east()))
+        val session = KeyboardSessions.open(player, abs, null)
+        helper.assertTrue(session != null, "should open a session")
+        val packet = KeyboardEventCodec.encode(listOf(KeyboardEvent.KeyDown(key, 0, false))).single()
+        helper.assertTrue(KeyboardSessions.receive(player, KeyboardInputPayload(session!!.id, packet)) == 1, "input should be accepted")
+    }
+
+    /**
+     * キーの離しのイベント（#326、ADR 0326）: 押したままのキーのある入力の GUI を閉じると、合成した `key-released` が届く。
+     * チャンクのアンロード（`onChunkUnloaded` は `setRemoved` より先に来る）では、`key-released` が `device-detached` の前に届く
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaReceivesSyntheticKeyReleases(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val player = helper.makeMockServerPlayerInLevel()
+        var step = 0
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            when (step) {
+                0 -> {
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                    typeLine(helper, keyboard, "lua -e \"$KEY_LOG_SCRIPT\"")
+                    step = 1
+                    helper.fail("typed the line")
+                }
+                1 -> {
+                    helper.assertTrue(text.any { it == "kready" }, "lua should be waiting for keys: $text")
+                    pressThroughSession(helper, player, Key.Q)
+                    step = 2
+                    helper.fail("pressed q")
+                }
+                2 -> {
+                    helper.assertTrue(text.any { it == "ev,key-pressed,q" }, "q should be pressed: $text")
+                    // GUI を閉じる（クライアントからの閉じる）
+                    KeyboardSessions.closeFromClient(player, KeyboardSessions.sessionOf(player)!!.id)
+                    step = 3
+                    helper.fail("closed the session")
+                }
+                3 -> {
+                    helper.assertTrue(text.any { it == "ev,key-released,q" }, "closing the session should release q: $text")
+                    helper.assertTrue(text.none { it == "ev,detached" }, "the keyboard should still be connected: $text")
+                    pressThroughSession(helper, player, Key.W)
+                    step = 4
+                    helper.fail("pressed w")
+                }
+                4 -> {
+                    helper.assertTrue(text.any { it == "ev,key-pressed,w" }, "w should be pressed: $text")
+                    keyboard.onChunkUnloaded()
+                    step = 5
+                    helper.fail("unloaded the keyboard")
+                }
+            }
+            val released = text.indexOf("ev,key-released,w")
+            val detached = text.indexOf("ev,detached")
+            helper.assertTrue(released >= 0, "unloading should release w: $text")
+            helper.assertTrue(detached > released, "device-detached should come after the release: $text")
+            KeyboardSessions.loggedOut(player)
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
+     * キーボードのブロックを壊したとき（#326、ADR 0326）: 押したままのキーの離しは届かず、`device-detached` だけが届く
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun luaReceivesOnlyDetachWhenKeyboardIsBroken(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val player = helper.makeMockServerPlayerInLevel()
+        var step = 0
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            when (step) {
+                0 -> {
+                    helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                    typeLine(helper, keyboard, "lua -e \"$KEY_LOG_SCRIPT\"")
+                    step = 1
+                    helper.fail("typed the line")
+                }
+                1 -> {
+                    helper.assertTrue(text.any { it == "kready" }, "lua should be waiting for keys: $text")
+                    pressThroughSession(helper, player, Key.Q)
+                    step = 2
+                    helper.fail("pressed q")
+                }
+                2 -> {
+                    helper.assertTrue(text.any { it == "ev,key-pressed,q" }, "q should be pressed: $text")
+                    helper.setBlock(KEYBOARD, Blocks.AIR)
+                    step = 3
+                    helper.fail("broke the keyboard")
+                }
+            }
+            helper.assertTrue(text.any { it == "ev,detached" }, "breaking the keyboard should detach it: $text")
+            helper.assertTrue(text.none { it == "ev,key-released,q" }, "no release should arrive for a broken keyboard: $text")
+            KeyboardSessions.loggedOut(player)
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }

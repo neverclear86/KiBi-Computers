@@ -55,7 +55,7 @@
   - 入力のセッション（#360）を閉じたとき（GUI を閉じた、離れた、ログアウトした、別のケースにつなぎ替えた）は、押したままのキーの離しを、修飾キー `0` で合成して、外れる前のマシンに届ける（`KeyboardSession.close`）
   - 1つのキーボードを2人が使うと、片方の GUI を閉じたときに、もう片方がまだ押しているキーの離しも届く（`KeyboardSession` ごとに押したままのキーを覚えているため）
   - 別々の GLFW のキーが同じ `unknown` に写るので、`unknown` の押下と離しは対にならない
-- **キーボードのブロックが壊れた・アンロードしたときは、合成した離しが届かない。** `KeyboardBlockEntity.setRemoved` は、`isRemoved` を立ててから登録表から外し、`KeyboardSessions.close` は取り除かれたキーボードには配らない。ゲストに見えるのは、離しのないまま来る `device-detached` だけなので、受け手は「そのキーボードの address の `device-detached` を受けたら、そのキーボードのキーをすべて離したとみなす」。これは回答の「対になっていない離し」「`restored`・`dropped` のとき全部離したとみなす」と同じ方向の約束の追加で、接続層を変えずに済むのでこちらを選んだ（エージェントが決めた）
+- **キーボードのブロックが壊れたときは、合成した離しが届かない。** `KeyboardBlockEntity.setRemoved` は、`isRemoved` を立ててから登録表から外し、`KeyboardSessions.close` は取り除かれたキーボードには配らない。ゲストに見えるのは、離しのないまま来る `device-detached` だけ。チャンクのアンロードは違う。NeoForge の `LevelChunk.clearAllBlockEntities` は、全ブロックエンティティの `onChunkUnloaded` を呼んでから `setRemoved` を呼ぶので、`onChunkUnloaded` の時点では `isRemoved` が立っておらず、離しは外れる前のマシンに届いてから（`unregister` → `MachineWiring.disconnectOne` → `onDisconnected` → `KeyboardSessions.closeFor` と同期で進む）`device-detached` が届く。どちらでも受け手は「そのキーボードの address の `device-detached` を受けたら、そのキーボードのキーをすべて離したとみなす」（離しが先に届いても困らない）。これは回答の「対になっていない離し」「`restored`・`dropped` のとき全部離したとみなす」と同じ方向の約束の追加で、接続層を変えずに済むのでこちらを選んだ（エージェントが決めた）
 - `restored` を受けたとき、`dropped > 0` のときも、全キーを離したものとみなす
 - 知らないキー名・修飾キーのビットは無視する（増えることがある）
 - 他のデバイスも同じ種類名を出せるので、受け手は source で見分ける
