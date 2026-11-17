@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.machine.MachineSlot
+import pro.ikili.kibicomputers.core.machine.isFatal
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -258,6 +259,11 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      * [Machine.coldBootAfterRestore] を呼ぶ。[source] がない（ID がない・新しい ID・書き込みが終わらない）か、受け付けられなければ、
      * [onReady] の後に [bootConfig] で起動する。
      *
+     * [onReady] が投げても（接続層の不具合）、後の手順（回し直し・冷えた起動・`finished`・同期の起動）は必ず走らせる（#677）。
+     * つなぎかけのまま続けるので、つながらなかったデバイスへの呼び出しは `detached` で終わる。例外は捨てずに投げ直す:
+     * 復元の知らせの中なら [Machine] が「復元の受け手」としてログに出し（ADR 0044。マシンは続く）、同期の起動なら起動した後に
+     * この関数から投げる。JVM の致命的なエラーだけは、後の手順を走らせずにそのまま投げる。
+     *
      * @return 始めた後の状態
      */
     @JvmOverloads
@@ -278,27 +284,54 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         val machine = load(manager, key, parts, hasPower, config, environment) ?: return status
         setPoweredOn(true)
         val listener = RestoreListener { m, outcome, cause ->
+            // onReady（接続層）が投げても、後の手順（配り直し・冷えた起動・finished）は必ず走らせる（#677）
+            val steps = RestoreSteps()
             // 知らせは close の後も届く: 今のマシンでなければ（電源を切った・アンロードした）何もしない（ADR 0085）
-            if (m === slot.machine) {
-                when (outcome) {
-                    RestoreOutcome.RESTORED -> {
-                        onReady.onReady(m)
-                        m.redispatchRestoredDeviceCalls()
+            if (m === slot.machine && outcome != RestoreOutcome.CANCELLED) {
+                steps.attempt { onReady.onReady(m) }
+                // onReady の中でケースがマシンを外したら、外したマシンは動かさない
+                if (m === slot.machine) {
+                    when (outcome) {
+                        RestoreOutcome.RESTORED -> steps.attempt { m.redispatchRestoredDeviceCalls() }
+                        RestoreOutcome.COLD_BOOT -> steps.attempt { m.coldBootAfterRestore() }
+                        RestoreOutcome.CANCELLED -> {}
                     }
-                    RestoreOutcome.COLD_BOOT -> {
-                        onReady.onReady(m)
-                        m.coldBootAfterRestore()
-                    }
-                    RestoreOutcome.CANCELLED -> {}
                 }
             }
-            finished?.onRestoreFinished(m, outcome, cause)
+            steps.attempt { finished?.onRestoreFinished(m, outcome, cause) }
+            // ログは Machine が受け手の種類で出す（間引き付き。#674）。ここでは出さずに投げ直す
+            steps.rethrow()
         }
         if (source == null || !machine.restore(RestoreRequest(source, bootConfig, listener))) {
-            onReady.onReady(machine)
-            machine.boot(bootConfig)
+            // onReady が投げても起動する。例外は起動の後に呼び手へ投げ直す（#677）
+            val steps = RestoreSteps()
+            steps.attempt { onReady.onReady(machine) }
+            steps.attempt { machine.boot(bootConfig) }
+            steps.rethrow()
         }
         return status
+    }
+
+    /**
+     * 復元の後の手順を、前の手順が投げても続けて走らせる（#677）。JVM の致命的なエラー（[isFatal]）はその場で投げ、後の手順は走らせない。
+     * それ以外は最初の例外を覚えておき（2つ目からは [Throwable.addSuppressed]）、[rethrow] で投げ直す
+     */
+    private class RestoreSteps {
+        private var failure: Throwable? = null
+
+        inline fun attempt(step: () -> Unit) {
+            try {
+                step()
+            } catch (t: Throwable) {
+                if (isFatal(t)) throw t
+                val first = failure
+                if (first == null) failure = t else if (first !== t) first.addSuppressed(t)
+            }
+        }
+
+        fun rethrow() {
+            failure?.let { throw it }
+        }
     }
 
     /** 電源を切る。マシンを止めて [ComputerStatus.OFF] にする（エラーの表示も消す）。 */
@@ -498,6 +531,9 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 /** [ComputerCase.startRestore] の、マシンの用意ができた知らせ（デバイスをつなぐ。#85） */
 @ApiStatus.Internal
 public fun interface RestoreReady {
-    /** [machine] にデバイスをつなぐ（メインスレッドで。この後に、戻したマシンが続くか、冷えた起動を始める） */
+    /**
+     * [machine] にデバイスをつなぐ（メインスレッドで。この後に、戻したマシンが続くか、冷えた起動を始める）。
+     * 投げても後の手順は走り、例外は受け手の外（[Machine] のログ、同期の起動なら [ComputerCase.startRestore] の呼び手）に出る（#677）
+     */
     public fun onReady(machine: Machine)
 }
