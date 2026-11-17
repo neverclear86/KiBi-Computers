@@ -289,7 +289,8 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
             // 知らせは close の後も届く: 今のマシンでなければ（電源を切った・アンロードした）何もしない（ADR 0085）
             if (m === slot.machine && outcome != RestoreOutcome.CANCELLED) {
                 steps.attempt { onReady.onReady(m) }
-                // onReady の中でケースがマシンを外したら、外したマシンは動かさない
+                // onReady の中でケースがマシンを外したら、外したマシンは動かさない（外すと閉じるので、今は Machine の側でも
+                // 冷えた起動待ちが消え、プロセスも終わっている。閉じ方の細部に頼らず、ここでも確かめる）
                 if (m === slot.machine) {
                     when (outcome) {
                         RestoreOutcome.RESTORED -> steps.attempt { m.redispatchRestoredDeviceCalls() }

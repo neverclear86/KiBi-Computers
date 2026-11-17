@@ -2,6 +2,8 @@ package pro.ikili.kibicomputers.core.computer
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -40,6 +42,7 @@ import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
+import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.RestoreListener
@@ -49,6 +52,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.logging.Handler
 import java.util.logging.Level
 import java.util.logging.LogRecord
@@ -275,41 +279,60 @@ class ComputerCaseRestoreStepsTest {
     }
 
     private class TestDevice : Device {
+        /** `d` を実行した回数 */
+        val calls = AtomicInteger()
         override val kind = "test:device"
-        override val methods: DeviceMethods = DeviceMethods.builder().direct("d") { _, _ -> arrayOf(DeviceValue.of(42L)) }.build()
+        override val methods: DeviceMethods = DeviceMethods.builder().direct("d") { _, _ ->
+            calls.incrementAndGet()
+            arrayOf(DeviceValue.of(42L))
+        }.build()
+    }
+
+    private val address = "00000000-0000-4000-8000-000000000677"
+
+    /**
+     * デバイスをつなぎ、まだ実行していない呼び出しを1つ積んだマシンを保存して、その ID と呼び出しのオブジェクト ID を返す
+     * （DeviceLimitRestoreTest と同じ手順）
+     */
+    private fun saveWithQueuedCall(h: Harness, store: MachineSaveStore): Pair<MachineIdentity, Int> {
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 10_000_000)
+        val bytes = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/prompt-wasi.wasm")) { "prompt-wasi.wasm がない" }.use { it.readBytes() }
+        m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
+        m.vfs.createDirectory(VfsPath.parse("/bin"))
+        val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
+        m.vfs.write(f, bytes, 0, bytes.size)
+        val input = m.lock.withLock { ByteStream(4096).also { m.kernel.objects.add(it) }.id }
+        val output = m.lock.withLock { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
+        val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
+        val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio))
+        m.lock.withLock { m.kernel.initPid = pid }
+        eventually(60_000, "入力を待たない") {
+            h.scheduler.tick()
+            m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
+        }
+        assertTrue(m.devices.attach(address, TestDevice()))
+        val call = m.lock.withLock { m.openPendingDeviceCallLocked(pid, PendingDeviceCall.State.Queued(address, "d", emptyList())).second.id }
+        val assigned = store.assignNewId(MachineOwner("minecraft:overworld", 0, 64, 0))!!
+        val written = store.write(assigned, MachineOwner("minecraft:overworld", 0, 64, 0), m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
+        m.close()
+        return written to call
+    }
+
+    /** [manager] を [count] 回 tick する（起きてはいけないことが起きる機会を与える） */
+    private fun tickFor(manager: MachineManager<String>, count: Int) {
+        repeat(count) {
+            manager.tick()
+            Thread.sleep(1)
+        }
     }
 
     @Test
     fun `戻せたときにonReadyが投げても、積んだ呼び出しを配り直してdetachedで終え、finishedを呼ぶ`() = timeout(limit) {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
-        val address = "00000000-0000-4000-8000-000000000677"
         Captured().use { logs ->
             Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
-                h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "root") BootVolume(TestMemoryFileSystem(), readOnly = false) else null }
-                // 保存するマシン: デバイスをつなぎ、まだ実行していない呼び出しを1つ積む（DeviceLimitRestoreTest と同じ手順）
-                val (identity, callId) = run {
-                    val m = h.machine(fuelPerTick = 10_000_000)
-                    val bytes = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/prompt-wasi.wasm")) { "prompt-wasi.wasm がない" }.use { it.readBytes() }
-                    m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "disk:root")
-                    m.vfs.createDirectory(VfsPath.parse("/bin"))
-                    val f = m.vfs.open(VfsPath.parse("/bin/prompt"), OpenOptions(read = true, write = true, create = true, truncate = true))
-                    m.vfs.write(f, bytes, 0, bytes.size)
-                    val input = m.lock.withLock { ByteStream(4096).also { m.kernel.objects.add(it) }.id }
-                    val output = m.lock.withLock { ByteStream(64 * 1024).also { m.kernel.objects.add(it) }.id }
-                    val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Object(output, HandleRights.WRITE), StdioSource.Closed)
-                    val pid = m.exec("/bin/prompt", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("prompt"), stdio = stdio))
-                    m.lock.withLock { m.kernel.initPid = pid }
-                    eventually(60_000, "入力を待たない") {
-                        h.scheduler.tick()
-                        m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
-                    }
-                    assertTrue(m.devices.attach(address, TestDevice()))
-                    val call = m.lock.withLock { m.openPendingDeviceCallLocked(pid, PendingDeviceCall.State.Queued(address, "d", emptyList())).second.id }
-                    val assigned = store.assignNewId(MachineOwner("minecraft:overworld", 0, 64, 0))!!
-                    val written = store.write(assigned, MachineOwner("minecraft:overworld", 0, 64, 0), m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT)!!).identity
-                    m.close()
-                    written to call
-                }
+                val (identity, callId) = saveWithQueuedCall(h, store)
 
                 // ケースで戻す。onReady はデバイスをつながずに投げる
                 val manager = MachineManager<String>(h.scheduler, MachineErrorListener { _, _ -> })
@@ -337,6 +360,75 @@ class ComputerCaseRestoreStepsTest {
                 assertEquals(1, warnings.size, warnings.map { it.message }.toString())
                 case.turnOff()
             }
+        }
+    }
+
+    @Test
+    fun `戻せたときにonReadyの中で電源を切ったら、外したマシンの呼び出しは配り直さず、finishedは呼ぶ`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Captured().use { logs ->
+            Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+                val (identity, _) = saveWithQueuedCall(h, store)
+
+                val manager = MachineManager<String>(h.scheduler, MachineErrorListener { _, _ -> })
+                val case = ComputerCase<String>(CaseTier.BASIC)
+                case.loadPoweredOn(true)
+                assertTrue(case.beginRestore())
+                val device = TestDevice()
+                val finished = ArrayList<Pair<Machine, RestoreOutcome>>()
+                case.startRestore(
+                    manager, "a", required(case.tier), true, config, MachineEnvironment.DEFAULT, BootConfig.builder().addBootDisk("none").build(),
+                    RestoreSource(store, identity.id, identity.generation),
+                    // デバイスをつないでから、つなぎの途中で電源を切る（ケースがマシンを外して閉じる）
+                    RestoreReady { m ->
+                        assertTrue(m.devices.attach(address, device))
+                        case.turnOff()
+                    },
+                    RestoreListener { m, outcome, _ -> finished += m to outcome },
+                )
+                val machine = case.machine!!
+                tickUntil(manager, "知らせが来ない") { finished.isNotEmpty() }
+                assertEquals(listOf(machine to RestoreOutcome.RESTORED), finished, "外しても finished は呼ぶ")
+                assertNull(case.machine)
+                assertFalse(case.poweredOn)
+                assertEquals(ComputerStatus.OFF, case.status)
+                // 外したマシンの呼び出しは配り直さない（つないだデバイスでも実行しない）
+                tickFor(manager, 50)
+                assertEquals(0, device.calls.get(), "外したマシンの呼び出しを配り直した")
+                assertTrue(logs.restoreListenerWarnings(machine).isEmpty(), "投げていないので出さない")
+            }
+        }
+    }
+
+    @Test
+    fun `冷えた起動でonReadyの中で電源を切ったら、外したマシンは起動せず、finishedは呼ぶ`() = timeout(limit) {
+        val manager = newManager()
+        try {
+            Captured().use { logs ->
+                val case = ComputerCase<String>(CaseTier.BASIC)
+                val finished = ArrayList<RestoreOutcome>()
+                var coldBootPendingInOnReady = false
+                val machine = startColdBootRestore(
+                    manager, case,
+                    RestoreReady { m ->
+                        coldBootPendingInOnReady = m.isColdBootPending
+                        case.turnOff()
+                    },
+                    RestoreListener { _, outcome, _ -> finished += outcome },
+                )
+                tickUntil(manager, "知らせが来ない") { finished.isNotEmpty() }
+                assertTrue(coldBootPendingInOnReady, "onReady の時点では冷えた起動待ち")
+                assertEquals(listOf(RestoreOutcome.COLD_BOOT), finished, "外しても finished は呼ぶ")
+                assertNull(case.machine)
+                assertFalse(case.poweredOn)
+                assertEquals(ComputerStatus.OFF, case.status)
+                tickFor(manager, 50)
+                assertFalse(machine.isBooting, "外したマシンの冷えた起動を始めた")
+                assertNotEquals(MachineState.RUNNING, machine.state, "外したマシンが動いた")
+                assertTrue(logs.restoreListenerWarnings(machine).isEmpty(), "投げていないので出さない")
+            }
+        } finally {
+            manager.shutdown(10_000)
         }
     }
 }
