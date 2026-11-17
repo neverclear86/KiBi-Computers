@@ -3,6 +3,8 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
+import org.junit.jupiter.params.provider.MethodSource
 import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
@@ -91,14 +93,18 @@ class LuaMemoryLimitTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = [0, 30, 60, 90, 100, 110])
-    fun `上限の近くで大きな確保をしてもトラップにならず、not enough memoryのエラーになる`(fill: Int) = timeout(limit) {
-        // memory.grow が区画の表（#753）を一度に数えて残りが落ちても、C のスタックを数えないまま尽きない。
-        // まず 1 KiB の文字列を fill 個持って残りを減らし（RAM 512 KiB では約 130 個で尽きるので、その手前まで）、その後で数十 MiB の string.rep を pcall で受ける
+    @MethodSource("largeNearLimit")
+    fun `上限の近くで大きな確保をしてもトラップにならず、not enough memoryのエラーになる`(mib: Int, fill: Int) = timeout(limit) {
+        // 1 KiB の文字列を fill 個持って残りを減らし（RAM 512 KiB では約 130 個で尽きる）、アドレス空間（64 MiB）に収まる
+        // mib MiB の string.rep を pcall で受ける。確保は memory.grow を通り、端の区画と区画の表（#753。1 MiB なら 32 ページ分の 4 KiB）が
+        // keep なしで数えられて、残りが一度に落ちる。fill を細かく振って、grow の後の残りが「MIN + 表」の少し上・下になる場合を含める。
+        // その後も小さな確保と GC を続け、空きリストに書く free（kibi_wasi.c の free_node）でトラップにならないことも見る。
+        // 残りが尽きると、pcall の外の確保も not enough memory になりうる（Lua のエラーで終わる。ADR 0094）。どちらでも CRASHED にはしない
         val script = """
             local t = {}
             pcall(function() for i = 1, $fill do t[i] = ('x'):rep(1000) .. i end end)
-            local ok, err = pcall(function() return ('y'):rep(64 * 1024 * 1024) end)
+            local ok, err = pcall(function() return ('y'):rep($mib * 1024 * 1024) end)
+            pcall(function() local u = {} for i = 1, 200 do u[i] = ('z'):rep(100) .. i end end)
             t = nil
             collectgarbage()
             io.write('caught ', tostring(not ok), ' ', tostring(err), '\n')
@@ -106,7 +112,17 @@ class LuaMemoryLimitTest {
         """.trimIndent()
         val r = runLua(script, 512 * kib)
         assertEquals(ProcessState.EXITED, r.state, r.console)
-        assertEquals(0, r.exitCode, r.console)
-        assertTrue("caught true not enough memory\n" in r.console, r.console)
+        when (r.exitCode) {
+            0 -> assertTrue("caught true not enough memory\n" in r.console, r.console)
+            1 -> assertTrue("lua: not enough memory\n" in r.console, r.console)
+            else -> throw AssertionError("終了コードが ${r.exitCode}: ${r.console}")
+        }
+    }
+
+    companion object {
+        /** 確保する MiB と、先に持つ 1 KiB の文字列の数の組。数は、grow の後の残りが線の前後を通るように細かく振る */
+        @JvmStatic
+        fun largeNearLimit(): List<Arguments> =
+            listOf(1, 4, 16).flatMap { mib -> (80..110 step 2).map { fill -> Arguments.of(mib, fill) } }
     }
 }
