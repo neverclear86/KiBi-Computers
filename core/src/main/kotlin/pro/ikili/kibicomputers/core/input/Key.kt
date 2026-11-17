@@ -6,7 +6,7 @@ import org.jetbrains.annotations.ApiStatus
  * キーボードのキー（#142）。物理的なキーの位置を表す（US 配列での名前）。打った文字は [KeyboardEvent.Text] で別に送る。
  *
  * ローダーやウィンドウのライブラリ（GLFW）のキーコードとは独立させ、接続層で対応づける。
- * プログラムから見えるキーの番号（イベントの ABI）は、イベントキュー（#63）で決める。ここでの並び（[ordinal]）は
+ * プログラムから見えるのは番号ではなくキー名（`KeyEvents.name`。#326、ADR 0326）。ここでの並び（[ordinal]）は
  * キーボードの通信（[KeyboardEventCodec]）でだけ使う。並びを変えたら、通信のプロトコルの版を上げる。
  */
 @ApiStatus.Internal

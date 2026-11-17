@@ -178,6 +178,7 @@ interface events {
   - 追記（#427）: ADR 0427 で決めた（`kibi:io/tty` と `tty-resize` のイベント）
 - プロセス・ソケット・デバイス・電源・キーの押下: #74・#76・#77（ADR 0077）・#306・#326（パイプと fd の複製は #75 で決めた。ADR 0075）
   - 追記（#306）: 電源は ADR 0306 で決めた（`kibi:computer/power`）
+  - 追記（#326）: キーの押下は、新しい interface を足さず、`kibi:kernel/events` のイベント `key-pressed`・`key-released` にした（ADR 0326。`events.wit` は doc コメントだけ足した）
 - p2・p3 の層: Canonical ABI の一般の実装は #264（ADR 0264）、`kibi:*` の p2 の `pollable` は #685、async は #266
 - 生成した束縛（wit-bindgen）: SDK #116
 - 燃料とキューの既定の容量の確定: #251
