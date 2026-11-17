@@ -23,8 +23,8 @@ import net.minecraft.world.level.ChunkPos
  * - slot は -x に [STRIDE] ずつ進み、使い回さない（アンロードは後から非同期に起き、落とし物やディスクのチャンクも残るため）。
  * - 強制読み込みのチャンクのチケットの段階は 31 ＋ 距離で、読み込まれたまま残るのは距離 13 まで。keeper（+x に [KEEPER_DISTANCE]）を
  *   含めても、隣の slot とは 50 チャンク以上離れる。
- * - 払い出すときに、そのチャンクがまだ読み込まれていないこと、強制読み込みが新しく付いたことを確かめる。外れたら（重なったら）
- *   ずらさずに落とす。
+ * - 払い出すときに、そのチャンクがまだ読み込まれていないこと（FULL でない段階も含めて `ChunkHolder` がないこと。[isTracked]）、
+ *   強制読み込みが新しく付いたことを確かめる。外れたら（重なったら）ずらさずに落とす。
  * - [allocate] は、テストが終わったとき（成功・失敗・タイムアウト）に強制読み込みを外す。途中の付け外しはテストに任せる。
  *
  * テストの関数・シーケンスはメインスレッドで走るので、カウンターは素の変数でよい
@@ -61,8 +61,22 @@ internal object FarChunks {
         val b = base!!
         val chunk = ChunkPos(b.x - next++ * STRIDE, b.z)
         LOGGER.log(System.Logger.Level.DEBUG) { "far chunk slot ${next - 1} at $chunk for ${helper.testInfo.testName}" }
-        helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the far chunk $chunk should not be loaded yet")
+        helper.assertTrue(!isTracked(level, chunk), "the far chunk $chunk should not be loaded yet")
         return chunk
+    }
+
+    /**
+     * チャンク [chunk] の `ChunkHolder` があるか（どの段階でも読み込まれているか、アンロード待ちか）。
+     * `ServerChunkCache.hasChunk` は FULL のチャンクでしか真にならず、ほかのチケットの縁で読み込まれた段階 34〜44 のチャンクを
+     * 見落とすので、`ServerMachines.findHolder` と同じく、見える表・更新中の表・アンロード待ちの表を引く（AT で読めるようにしたもの）。
+     * まだ処理されていないチケットの変化は数えない
+     */
+    private fun isTracked(level: ServerLevel, chunk: ChunkPos): Boolean {
+        val map = level.chunkSource.chunkMap
+        val key = chunk.toLong()
+        return map.getVisibleChunkIfPresent(key) != null ||
+            map.getUpdatingChunkIfPresent(key) != null ||
+            map.pendingUnloads.containsKey(key)
     }
 
     /**
@@ -76,7 +90,7 @@ internal object FarChunks {
         // 重なりを見つけたら、ほかのテストの強制読み込みを外さないように、自分が付けたものだけを外して落とす。
         // 終わりに外すリスナーは、付けるのに全部成功してから付ける（失敗するとテストの失敗でリスナーが走り、相手のものまで外れるため）
         slot.keeper?.let {
-            helper.assertTrue(!level.chunkSource.hasChunk(it.x, it.z), "the keeper chunk $it should not be loaded yet")
+            helper.assertTrue(!isTracked(level, it), "the keeper chunk $it should not be loaded yet")
             helper.assertTrue(level.setChunkForced(it.x, it.z, true), "the keeper chunk $it should not be forced by anyone else")
         }
         if (!level.setChunkForced(chunk.x, chunk.z, true)) {
