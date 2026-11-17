@@ -1,4 +1,4 @@
-package wasi:io@0.2.3;
+package wasi:io@0.2.12;
 
 // KibiWitParseTest（#75・#426）が kibi:* の WIT を wasm-tools で解析するためだけの、wasi:io/poll の最小のスタブ。
 // 本物の WIT ではない（kibi:* が参照する型の名前だけを置く）。src/main/wit には置かない。

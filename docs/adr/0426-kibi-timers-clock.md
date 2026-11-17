@@ -3,13 +3,14 @@
 - 状態: 採用
 - Issue: #426（task）。前提: ADR 0063（イベントキュー）、0064（タイマーと時計）、0072（p1 の `poll_oneoff`）、0073（`kibi:*` の WIT と p1 の import の導き方）、0075（`kibi:io`。`wasi:io` の版）
 - 後続: #439（接続層からゲーム内時間を渡す）、#264（Canonical ABI。ADR 0264）・#685・#266（p2・p3 の層）、#265（Component Model の resource のハンドル）、#267（対象の `wasi:*` の版）、#116（SDK の束縛）、#94・#95（Lua の `os.sleep`・`event`）、#251（仮の値の確定）
-- ABI の選択（`set-after`・`set-at` の2関数、ナノ秒の `u64`、`interval = 0` で1回だけ、`create` の引数、2^63 以上の頭打ち、`uptime-ticks`・`world-ticks`、sleep の import を足さない、p2/p3 の待ち方は別 interface、p3 は `async func`）は、#426 のプランへのオーナーの回答（論点1〜7、A・B）で決めた。p2/p3 の WIT は仮置きで、細部はエージェントに任された
+- ABI の選択（`set-after`・`set-at` の2関数、ナノ秒の `u64`、`interval = 0` で1回だけ、`create` の引数、2^63 以上の頭打ち、`uptime-ticks`・`world-ticks`、sleep の import を足さない、p2/p3 の待ち方は別 interface、p3 は `async func`）は、#426 のプランへのオーナーの回答（論点1〜7、A・B）で決めた。p2/p3 の WIT は仮置きで、細部はエージェントに任された（p2 の `*-poll` は #685 で実装した（ABI はオーナーの確認待ち））
+- 追記（#685）: `timers-poll`・`events-poll` の仮置きを確定した（`wasi:io/poll@0.2.12`。ADR 0685）。`*-async`（p3）は仮置きのまま
 
 ## 決めたこと（要約）
 
 - `kibi:kernel@0.1.0` に `interface timers`（resource `timer`）、`kibi:computer@0.1.0` に `interface clock` を置き、p1 向けの import を ADR 0073 の規則で導いて実装した
 - 現在時刻と単調時計は `wasi:clocks`（p1 の `clock_time_get`）のままで、`kibi:*` には入れない。sleep の独自の import も足さない
-- p2・p3 の待ち方は、`wasi:io` に依存しないよう別の interface（`timers-poll`・`events-poll`・`timers-async`・`events-async`）に置く。**仮置き**: interface・関数・型・`wasi:*` の版は、p2/p3 の層（#685・#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。WIT とこの ADR だけで、実装しない
+- p2・p3 の待ち方は、`wasi:io` に依存しないよう別の interface（`timers-poll`・`events-poll`・`timers-async`・`events-async`）に置く。**仮置き**: p3 の `*-async` は、p3 の層（#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073 の Q5-A）。WIT とこの ADR だけで、実装しない。p2 の `*-poll` は #685 で実装した（ABI はオーナーの確認待ち。PR #778）（`wasi:io` は `@0.2.12`。ADR 0685）
 - 公開 API（`pro.ikili.kibicomputers.api`）と保存のバイト形式は変えない。足した型（`KibiTimers`・`KibiClock`）はすべて Kotlin の `internal object`。タイマーは既存の `KernelState.objects` の `Timer`、時計は `ClockSnapshot`（ADR 0064）で、新しく持つ状態はない
 
 ## WIT（p1 で実装するもの）
@@ -103,18 +104,18 @@ interface clock {
 
 独自の import は足さない（論点7-A）。p1 は `poll_oneoff` の時計の購読（#72。wasi-libc の `nanosleep`・`clock_nanosleep`・`usleep` はこれで動く）、p2 は `wasi:clocks/monotonic-clock` の `subscribe-*`、p3 は `wait-for`・`wait-until` を使う。タイマーの fd と並べて待ちたいときは、`poll_oneoff` に時計の購読とタイマーの `FD_READ` を並べる。
 
-## WIT（p2/p3。仮置き。実装しない）
+## WIT（p2 は #685 で実装（ABI は確認待ち）、p3 は仮置きで実装しない）
 
 ```wit
 interface timers-poll {        // p2
     use timers.{timer};
-    use wasi:io/poll@0.2.3.{pollable};
+    use wasi:io/poll@0.2.12.{pollable};
     subscribe: func(t: borrow<timer>) -> pollable;
 }
 
 interface events-poll {        // p2
     use events.{event-queue};
-    use wasi:io/poll@0.2.3.{pollable};
+    use wasi:io/poll@0.2.12.{pollable};
     subscribe: func(q: borrow<event-queue>) -> pollable;
 }
 
@@ -142,11 +143,11 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 - `timers`・`events` 自体は p1・p2・p3 共通なので、`imports-p2`・`imports-p3` は `include imports;` に待ち方の interface を足したものにした（ADR 0075 の `kibi:io` と同じ名前の付け方）
 - 同梱の wasm-tools は `async func` を解析できた（`KibiWitParseTest`）ので、p3 の2関数は `async func` のまま置く
 
-### `wasi:io` の版を 0.2.3 にした理由
+### `wasi:io` の版を 0.2.3 にした理由（当時。#685 で 0.2.12 に上げた）
 
-プランの第2版では 0.2.0 だったが、その後に main に入った #75（ADR 0075）の `kibi:io/pipe-streams` が `wasi:io/streams@0.2.3` を使っている。`pipe-streams` の stream の `subscribe()` が返す `pollable` は `wasi:io/poll@0.2.3` の型なので、`timers-poll` が 0.2.0 の `pollable` を返すと、1つのゲストの中で型が別になり、同じ `poll()` に並べて渡せない。オーナーの回答（p2/p3 の形と `wasi:*` の版は仮置きで、細かい選択はエージェントが決めてよい）の範囲として、リポジトリの中で版を1つにそろえた。#267 で対象の版が決まったら、`pipe-streams` と一緒に直す。`KibiWitTableTest` が、`*-poll` の `wasi:io` の版が `pipe-streams` と同じであることを確かめる。
+プランの第2版では 0.2.0 だったが、その後に main に入った #75（ADR 0075）の `kibi:io/pipe-streams` が `wasi:io/streams@0.2.3` を使っている。`pipe-streams` の stream の `subscribe()` が返す `pollable` は `wasi:io/poll@0.2.3` の型なので、`timers-poll` が 0.2.0 の `pollable` を返すと、1つのゲストの中で型が別になり、同じ `poll()` に並べて渡せない。オーナーの回答（p2/p3 の形と `wasi:*` の版は仮置きで、細かい選択はエージェントが決めてよい）の範囲として、リポジトリの中で版を1つにそろえた。#267 で対象の版が 0.2.12 に決まったので、#685 で `pipe-streams` と一緒に直した（ADR 0685）。`KibiWitTableTest` が、`*-poll` の `wasi:io` の版が `pipe-streams` と同じであることを確かめる。
 
-### p2/p3 への写し方（仮置き）
+### p2/p3 への写し方（p2 は #685 で実装（ABI は確認待ち）、p3 は仮置き）
 
 | 項目 | p1 | p2 | p3 |
 | --- | --- | --- | --- |
@@ -173,13 +174,13 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 - `KibiClockTest`: `uptime-ticks` が tick とともに進む、`world-ticks` が環境の `worldTicks` を返す（負は 0、ワールドがなければ 0）
 - `P1CanonicalTest`: `lowerU64Result` の配置と詰め物、範囲外・align 違いのトラップ、`liftOptionDisc`、`u64Arg` の頭打ち
 - `WasiP1ImportCheckTest`: 8 関数の型が合えば `cabi_realloc` なしで通り、型違い・版違い・表にない名前・p2/p3 の interface は `NOEXEC`
-- `KibiWitTableTest`: 関数の正規表現を `async func` に対応させた。`timers`・`clock` の関数がすべて p1 にある、p2/p3 の interface が WIT にあって p1 に出していない、`kibi:kernel` の p1・p3 の部分と `clock` が `wasi:*` を参照しない、`*-poll` の `wasi:` の `use` は `wasi:io/poll@0.2.3.{pollable}` だけで、`pipe-streams` と同じ版
+- `KibiWitTableTest`: 関数の正規表現を `async func` に対応させた。`timers`・`clock` の関数がすべて p1 にある、p2/p3 の interface が WIT にあって p1 に出していない、`kibi:kernel` の p1・p3 の部分と `clock` が `wasi:*` を参照しない、`*-poll` の `wasi:` の `use` は `wasi:io/poll@0.2.12.{pollable}`（#685 で 0.2.3 から上げた）だけで、`pipe-streams` と同じ版
 - `KibiWitParseTest`: 新しい WIT を含めて wasm-tools で解析できる（`wit-stubs/wasi-io/poll.wit` を足した）
 - `WasiP1TimersTest`（`kibi_timers.c` を Endive とカーネルで。待機点型・ブロッキング型の両方）: `set-after` を `poll_oneoff` で待って `read`、待機点型は待つ間スレッドを持たない、繰り返しと `cancel`、`set-at` と過ぎた時刻、キューへのイベント、不正な入力の error-code、判別子 0 なら後ろの値を読まない、`[resource-drop]`・`fd_close` の後は `bad-descriptor`、不正な `[resource-drop]timer` がトラップ、`uptime-ticks`・`world-ticks`
 
 ## 決めないこと
 
-- p2/p3 の層の実装（`pollable`・async、resource のハンドル）: #685（p2）・#265（resource）・#266（p3）。上の p2/p3 の WIT は仮置き
+- p2/p3 の層の実装（`pollable`・async、resource のハンドル）: #685（p2。済んだ）・#265（resource）・#266（p3）。上の p3 の WIT は仮置き
 - 対象の `wasi:*` の版: #267
 - 接続層からゲーム内時間を渡すこと: #439
 - Lua の `os.sleep`・`event` との対応: #94・#95

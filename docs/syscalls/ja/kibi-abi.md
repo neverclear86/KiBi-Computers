@@ -14,7 +14,7 @@ description: 独自拡張 kibi:* の WIT から WASI p1 向けの import を導�
 | `kibi:computer@0.1.0` | `memory`・`clock`・`power` | [kibi:computer](./kibi-computer.md) |
 | `kibi:fs@0.1.0` | `mounts` | [kibi:fs](./kibi-fs.md) |
 
-名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けの仮置きで、p1 では import できません（[p2・p3 の予定](./p2-p3.md)）。現在時刻と単調時計は WASI の `clock_time_get` を使い、`kibi:*` には入れていません。
+名前が `-poll`・`-async`・`-streams` で終わる interface は p2・p3 向けで、p1 では import できません。`-poll`・`-streams` は p2 で使えます（#685）。`-async` は p3 向けの仮置きです（[p2・p3 の予定](./p2-p3.md)）。現在時刻と単調時計は WASI の `clock_time_get` を使い、`kibi:*` には入れていません。
 
 WIT の元のファイル（説明のコメントつき）は、リポジトリの [`core/src/main/wit/`](https://github.com/neverclear86/KiBi-Computers/tree/main/core/src/main/wit) にあります。各ページの WIT は、そこからコメントを除いたものです。
 

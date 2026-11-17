@@ -16,9 +16,10 @@ This reference is for people who write programs (in C, Zig, Rust, or anything el
 | --- | --- |
 | WASI p1 (`wasi_snapshot_preview1`) | **Supported**. Only commands (modules that export `_start`) run. Per-function support and differences from the standard: [WASI p1](./wasi-p1.md) |
 | p1 imports for `kibi:*` | **Supported**. Common rules: [Common rules for kibi:*](./kibi-abi.md). Per-package pages are listed below |
-| WASI p2 and the Component Model | **Partly supported**. Command components that export `wasi:cli/run@0.2.x` run with exec. `kibi:*` is not available from p2 yet, and their state is not saved ([p2 and p3](./p2-p3.md)) |
+| WASI p2 and the Component Model | **Partly supported**. Command components that export `wasi:cli/run@0.2.x` run with exec. They can also import the p2 interfaces of `kibi:*` (the `imports-p2` worlds), and their state is not saved ([p2 and p3](./p2-p3.md)) |
 | WASI p3 (async) | **Not implemented** ([#266](https://github.com/neverclear86/KiBi-Computers/issues/266), [#268](https://github.com/neverclear86/KiBi-Computers/issues/268)) |
-| p2 and p3 interfaces for `kibi:*` | **Provisional**. The WIT exists, but its shape will change when the p2 and p3 layers are built ([p2 and p3 plans](./p2-p3.md)) |
+| p2 interfaces for `kibi:*` (`events-poll`, `timers-poll`, `process-poll`, `pipe-streams`, `bus-poll`, and the shared ones) | **Supported** (#685). Components can import them ([p2 and p3 plans](./p2-p3.md)) |
+| p3 interfaces for `kibi:*` (`*-async`) | **Provisional**. The WIT exists, but its shape will change when the p3 layer is built ([p2 and p3 plans](./p2-p3.md)) |
 | Sockets (`sock_*`, `wasi:sockets`) | **Not implemented**. The p1 `sock_*` functions return `NOSYS` ([#76](https://github.com/neverclear86/KiBi-Computers/issues/76)) |
 
 p2, p3, and the Component Model are thin layers over the same kernel foundation (file descriptors, event waiting, streams). p2 commands run now; p3 and the rest will be added later. p2 and p3 will use the same `kibi:*` WIT.
@@ -35,7 +36,7 @@ p2, p3, and the Component Model are thin layers over the same kernel foundation 
 | [kibi:device](./kibi-device.md) | Listing and calling devices |
 | [kibi:computer](./kibi-computer.md) | Remaining RAM, uptime and in-game time, power |
 | [kibi:fs](./kibi-fs.md) | Mounting disks, listing mounts and disks |
-| [p2 and p3 plans](./p2-p3.md) | Current status and plans for p2, p3, and the Component Model; provisional interfaces |
+| [p2 and p3 plans](./p2-p3.md) | Current status and plans for p2, p3, and the Component Model; the p2 interfaces of `kibi:*` and the provisional p3 ones |
 
 ## Versions and compatibility
 

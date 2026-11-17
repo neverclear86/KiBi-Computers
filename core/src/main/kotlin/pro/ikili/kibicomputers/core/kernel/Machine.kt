@@ -23,7 +23,10 @@ import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
+import pro.ikili.kibicomputers.core.kernel.fd.FdPlacement
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.fd.HandlePlacement
+import pro.ikili.kibicomputers.core.kernel.fd.openLocked
 import pro.ikili.kibicomputers.core.kernel.fd.STDERR
 import pro.ikili.kibicomputers.core.kernel.fd.STDIN
 import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
@@ -1416,12 +1419,19 @@ public class Machine private constructor(
     /**
      * [spawn] と同じだが、子の `ProcessObject` を指す fd（読む権利だけ）を親 [parentPid] の fd 表に入れ、子の pid と一緒に返す
      * （`kibi:process` の `[static]process.spawn`。#74、ADR 0074）。fd は子を表に足すのと同じカーネルロックの中で入れるので、
-     * 子は fd が入る前に動き出さない。親の fd 表が満杯なら、子を作らずに `MFILE`。[parentPid] は 0 にできない
+     * 子は fd が入る前に動き出さない。親の fd 表が満杯なら、子を作らずに `MFILE`。[parentPid] は 0 にできない。
+     * [place] を渡したら、fd 表ではなくそこに入れる（p2 の `process` のハンドル。#685。返す [ProcessHandle.fd] はその番号）
      */
     @Throws(FsException::class)
-    internal fun spawnWithHandle(program: Program, driver: ProcessDriver, options: SpawnOptions, parentPid: Int): ProcessHandle {
+    internal fun spawnWithHandle(
+        program: Program,
+        driver: ProcessDriver,
+        options: SpawnOptions,
+        parentPid: Int,
+        place: HandlePlacement? = null,
+    ): ProcessHandle {
         require(parentPid != 0) { "親のないプロセスにはハンドルを返せない" }
-        return spawnInternal(program, driver, options, parentPid, asInit = false, withHandle = true)
+        return spawnInternal(program, driver, options, parentPid, asInit = false, withHandle = true, place = place)
     }
 
     @Throws(FsException::class)
@@ -1432,6 +1442,7 @@ public class Machine private constructor(
         parentPid: Int,
         asInit: Boolean,
         withHandle: Boolean,
+        place: HandlePlacement? = null,
     ): ProcessHandle {
         val paths = resolveSpawnPaths(options, parentPid)
         lock.lock()
@@ -1451,7 +1462,8 @@ public class Machine private constructor(
             val cwd = paths?.cwd ?: (parent?.cwd ?: VfsPath.ROOT)
             val fdEntries = resolveFdsLocked(options, parent, paths)
             // 親に返すハンドルの空きは、表を変える前に確かめる（子を作ってから MFILE で断らない）
-            if (withHandle && checkNotNull(parent).handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${parent.handles.limit}）")
+            val handlePlace = if (withHandle) place ?: FdPlacement(checkNotNull(parent), kernel.objects, wakeSink) else null
+            handlePlace?.checkRoomLocked()
             val kind = driver.kind
             // 1 台の枠を先に見る（サーバー全体の枠を少数の台で使い切らない）。終わっていないブロッキング型を数える
             if (kind == ProcessKind.BLOCKING &&
@@ -1488,7 +1500,7 @@ public class Machine private constructor(
                     kernel.objects.retain(p.objectId)
                     handleRetained = true
                     spawnStage(SpawnStage.HANDLE_RETAINED)
-                    handleFd = FdTable(checkNotNull(parent), kernel.objects, wakeSink).install(p.objectId, HandleRights.READ)
+                    handleFd = checkNotNull(handlePlace).placeLocked(HandleEntry(p.objectId, rights = HandleRights.READ))
                     spawnStage(SpawnStage.HANDLE)
                 }
                 val r = ProcessRuntime(this, p, program, driver)
@@ -1515,7 +1527,7 @@ public class Machine private constructor(
                     cpu.enqueueThreadless(r)
                 }
             } catch (t: Throwable) {
-                rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, parent, rt, thread, enqueued)
+                rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, handlePlace, rt, thread, enqueued)
                 throw t
             }
             // ここからは投げない処理だけ（巻き戻せないので）
@@ -1553,7 +1565,7 @@ public class Machine private constructor(
         process: Process?,
         handleRetained: Boolean,
         handleFd: Int,
-        parent: Process?,
+        handlePlace: HandlePlacement?,
         rt: ProcessRuntime?,
         thread: KernelThread?,
         enqueued: Boolean,
@@ -1567,7 +1579,7 @@ public class Machine private constructor(
             rollbackStep(cause) { if (kernel.processes[pid] === process) kernel.processes.remove(pid) }
             // 子の fd（installFdsLocked が途中で投げても、入った分はここで拾う）
             rollbackStep(cause) { FdTable(process, kernel.objects, wakeSink).closeAll() }
-            if (handleFd >= 0) rollbackStep(cause) { checkNotNull(parent).handles.remove(handleFd) }
+            if (handleFd >= 0) rollbackStep(cause) { checkNotNull(handlePlace).unplaceLocked(handleFd) }
             if (handleRetained) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
             // カーネルが持つ ProcessObject の参照（最後の1つ）
             if (process.objectId != 0) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
@@ -1649,18 +1661,22 @@ public class Machine private constructor(
         options: SpawnOptions,
         parentPid: Int,
         await: ((CompletableFuture<Program>) -> Program)? = null,
+        place: HandlePlacement? = null,
     ): ProcessHandle {
-        checkHandleRoom(parentPid)
+        checkHandleRoom(parentPid, place)
         val pending = beginExec(path, drivers, options, parentPid)
         awaitExecLoad(pending, asInit = false, await)
-        return finishExecWithHandle(pending)
+        return finishExecWithHandle(pending, place)
     }
 
-    /** 親 [parentPid] の fd 表に、子のハンドルを入れる空きがあるか確かめる（なければ `MFILE`）。カーネルロックを自分で取る */
+    /**
+     * 親 [parentPid] の置き場 [place]（`null` なら fd 表）に、子のハンドルを入れる空きがあるか確かめる（なければ `MFILE`）。
+     * カーネルロックを自分で取る
+     */
     @Throws(FsException::class)
-    internal fun checkHandleRoom(parentPid: Int): Unit = lock.withLockValue {
+    internal fun checkHandleRoom(parentPid: Int, place: HandlePlacement? = null): Unit = lock.withLockValue {
         val parent = requireNotNull(parentLocked(parentPid)) { "親のないプロセスにはハンドルを返せない" }
-        if (parent.handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${parent.handles.limit}）")
+        (place ?: FdPlacement(parent, kernel.objects, wakeSink)).checkRoomLocked()
     }
 
     /** [exec] の読み込みの終わりを待つ（[await] がなければこのスレッドで）。待つのをやめたら、始まっていない読み込みは取り消す */
@@ -1740,11 +1756,11 @@ public class Machine private constructor(
 
     /** [finishExec] と同じだが、子のハンドルを親の fd 表に入れて返す（[spawnWithHandle]。#74） */
     @Throws(FsException::class)
-    internal fun finishExecWithHandle(pending: PendingExec): ProcessHandle {
+    internal fun finishExecWithHandle(pending: PendingExec, place: HandlePlacement? = null): ProcessHandle {
         val program = loadedProgram(pending)
         storeModule(program, pending.originalBytes)
         val driver = pending.drivers.create(program)
-        return spawnWithHandle(program, driver, pending.options.copy(args = pending.args), pending.parentPid)
+        return spawnWithHandle(program, driver, pending.options.copy(args = pending.args), pending.parentPid, place)
     }
 
     /**
@@ -2155,24 +2171,28 @@ public class Machine private constructor(
      * （読む権利だけ）。カーネルロックの中で呼ぶ。実行に回すのは、ロックを放してから [dispatchPendingDeviceCall] で行う。
      * [countTowardLimit] なら、そのプロセスの `pending-call` が [DeviceLimits.MAX_PENDING_CALLS] 個あるときに `AGAIN`
      * （`false` は p1 の待機点型の `invoke` が結果を待つ間に持つもの。1プロセスに同時に1つしかないので数えない。#77、ADR 0077）。
-     * fd 表が満杯なら `MFILE`
+     * 上限は fd 表と p2 のハンドル（[Process.hostResources]）の分を合わせて数える（#685）。
+     * 置き場 [place]（`null` なら fd 表）が満杯なら `MFILE`
      */
     @Throws(FsException::class)
     internal fun openPendingDeviceCallLocked(
         pid: Int,
         state: PendingDeviceCall.State,
         countTowardLimit: Boolean = true,
+        place: HandlePlacement? = null,
     ): Pair<Int, PendingDeviceCall> {
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
-        val fds = FdTable(process, kernel.objects, wakeSink)
         if (countTowardLimit) {
-            val open = fds.entries().values.count { kernel.objects[it.objectId] is PendingDeviceCall }
+            // fd 表と p2 のハンドル（ホストの resource の表）の両方を数える（#685。p2 の `start` で上限を素通りさせない）
+            var open = process.handles.entries().values.count { kernel.objects[it.objectId] is PendingDeviceCall }
+            process.hostResources.forEach { _, e -> if (e.objectId != 0 && kernel.objects[e.objectId] is PendingDeviceCall) open++ }
             if (open >= DeviceLimits.MAX_PENDING_CALLS) {
                 fsError(Errno.AGAIN, "待たずに積んだデバイスの呼び出しは ${DeviceLimits.MAX_PENDING_CALLS} 個まで")
             }
         }
         val obj = PendingDeviceCall(state)
-        return fds.open(obj, HandleRights.READ) to obj
+        val slot = (place ?: FdPlacement(process, kernel.objects, wakeSink)).openLocked(kernel.objects, wakeSink, obj, HandleRights.READ)
+        return slot to obj
     }
 
     /**
@@ -2219,14 +2239,15 @@ public class Machine private constructor(
     /**
      * プロセス [pid] にイベントキューを作ってハンドル表に入れ、ハンドル番号を返す（読む権利だけ）。カーネルロックの中で呼ぶ。
      * 確かめる順は capacity（範囲外は `INVAL`）→ マシンのキューの数（[ResourceLimitException]）→ ハンドル表（満杯は `MFILE`）。
+     * ハンドルは [place]（`null` なら fd 表。p2 はホストの resource の表。#685）に置く。
      * 失敗したら何も残さない
      */
-    internal fun openEventQueueLocked(pid: Int, filter: EventFilter, capacity: Int): Int {
+    internal fun openEventQueueLocked(pid: Int, filter: EventFilter, capacity: Int, place: HandlePlacement? = null): Int {
         if (capacity !in 1..EventLimits.MAX_CAPACITY) fsError(Errno.INVAL, "キューの件数は 1..${EventLimits.MAX_CAPACITY}（$capacity）")
         val process = checkNotNull(kernel.processes[pid]) { "プロセス $pid がない" }
         kernel.events.ensureCapacity(kernel.objects)
         val queue = EventQueue(filter, capacity)
-        val fd = FdTable(process, kernel.objects, wakeSink).open(queue, HandleRights.READ)
+        val fd = (place ?: FdPlacement(process, kernel.objects, wakeSink)).openLocked(kernel.objects, wakeSink, queue, HandleRights.READ)
         kernel.events.subscribe(queue, kernel.objects)
         return fd
     }

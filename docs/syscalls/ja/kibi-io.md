@@ -3,7 +3,7 @@ title: kibi:io
 description: fd の複製（dup・dup2）、パイプ、TTY のモード・大きさ・前のプロセス。
 ---
 
-`kibi:io@0.1.0` は、WASI p1 にない fd の操作です。`fd` と `pipe` は p1 だけのもので、p2・p3 では別の interface（仮置き）を使う予定です。`tty` は p1・p2・p3 で同じ形にする予定です。
+`kibi:io@0.1.0` は、WASI p1 にない fd の操作です。`fd` と `pipe` は p1 だけのもので、p2 では `pipe-streams`、p3 では別の interface（仮置き）を使います。`tty` は p1・p2・p3 で同じ形にする予定です。
 
 fd の引数は、そのプロセスのカーネルの fd 番号（p1 の fd と同じ番号）です。
 

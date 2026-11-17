@@ -11,6 +11,9 @@ internal object HostResourceIds {
     /** `wasi:*` の範囲の終わり（含まない） */
     const val WASI_END: Int = 0x2000
 
-    /** `kibi:*`（#685） */
+    /** `kibi:*`（WIT に出てくる順に振る。`KibiP2Host`。#685） */
     const val KIBI_FIRST: Int = 0x2000
+
+    /** `kibi:*` の範囲の終わり（含まない） */
+    const val KIBI_END: Int = 0x3000
 }

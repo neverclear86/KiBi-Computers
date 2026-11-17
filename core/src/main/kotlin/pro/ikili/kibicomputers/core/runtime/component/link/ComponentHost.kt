@@ -8,7 +8,7 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
  * ホスト（カーネル）が出すインターフェースの一覧（#263）。コンポーネントのトップレベルの import（インターフェースの名前）を、
  * リンクのとき（読み込みのスレッド）に引く。
  *
- * `wasi:*` の実物は `WasiP2Host`（版の受け付け方とホストの一覧は ADR 0267）。`kibi:*` は #685 が足す。
+ * `wasi:*` の実物は `WasiP2Host`（版の受け付け方とホストの一覧は ADR 0267）。`kibi:*` は `KibiP2Host`（ADR 0685）。カーネルは両方をまとめた `KernelComponentHost` を使う。
  * テストは、宣言に合わせたホストを渡してよい
  *
  * スレッド（#687。ADR 0263）: `exec` で使うホスト（`KernelDrivers.COMPONENT_HOST`）は、サーバー全体で 1 つの固定のもので、
