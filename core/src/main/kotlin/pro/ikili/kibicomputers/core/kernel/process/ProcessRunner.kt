@@ -1470,6 +1470,8 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override val environment: MachineEnvironment get() = machine.environment
 
+        override fun postHostCallback(callback: Runnable) = machine.postHostCallback(callback)
+
         override fun <T> watchHost(future: CompletableFuture<T>): HostWait<T> {
             checkThread()
             return watch(future, null)

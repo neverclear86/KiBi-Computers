@@ -407,8 +407,13 @@ private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, creat
     if (config.writtenMemory) {
         // #407: ページ数は数えず、初めて書き込んだ 4 KiB の区画を数える。共有メモリは書き込みを数えられないので作らない
         if (limits.shared()) throw MemoryLimitFailure("共有メモリは使えない")
-        return WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
-            .also { created += WrittenRelease(it) }
+        // 区画の表の最初の分は作るときに数える（#753）。断られたら作らない（何も数えていない）
+        val memory = try {
+            WrittenPagesMemory(MemoryLimits(initial, max, false), config.writtenMemoryBudget, config.onMemoryGrowRefused)
+        } catch (e: PageTableRefused) {
+            throw MemoryLimitFailure(e.message!!)
+        }
+        return memory.also { created += WrittenRelease(it) }
     }
     val budget = config.memoryBudget
     if (budget == null) return newMemory(MemoryLimits(initial, max, limits.shared()))
@@ -1001,7 +1006,11 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         if (mem != null) {
             val raw = (mem as EndiveWasmMemory).raw
             if (raw is WrittenPagesMemory) {
-                if (!raw.restorePages(state.memoryPages)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（今 ${raw.pages()}）")
+                // 形が合わない（縮める・上限を超える）失敗と、区画の表の分を RAM に数えられなかった失敗を、文言で分ける（#753）
+                if (state.memoryPages < raw.pages() || state.memoryPages > raw.maximumPages()) {
+                    throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（今 ${raw.pages()}、上限 ${raw.maximumPages()}）")
+                }
+                if (!raw.restorePages(state.memoryPages)) throw WasmLinkException("メモリを ${state.memoryPages} ページに戻せない（区画の表の分の RAM が足りない）")
                 state.forEachChunk { index, bytes ->
                     if (!raw.restoreChunk(index, bytes)) throw WasmLinkException("メモリの区画 $index を戻せない（RAM が足りない）")
                 }

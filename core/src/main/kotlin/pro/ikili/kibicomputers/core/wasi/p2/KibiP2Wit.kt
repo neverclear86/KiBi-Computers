@@ -392,6 +392,35 @@ package kibi:computer@0.1.0 {
 
     reboot: func() -> result<_, error-code>;
   }
+  interface access {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    enum access-state {
+      unowned,
+      owned,
+      locked,
+    }
+
+    record player {
+      name: string,
+      id: string,
+    }
+
+    record access-info {
+      state: access-state,
+      owner: option<player>,
+      members: list<player>,
+      invites: list<string>,
+    }
+
+    get-access: func() -> result<access-info, error-code>;
+
+    request-add: func(name: string) -> result<_, error-code>;
+
+    request-remove: func(name-or-id: string) -> result<_, error-code>;
+
+    request-transfer: func(name: string) -> result<_, error-code>;
+  }
 }
 """.trimStart()
 }

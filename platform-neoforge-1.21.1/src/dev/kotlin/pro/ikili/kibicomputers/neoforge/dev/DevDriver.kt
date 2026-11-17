@@ -30,6 +30,10 @@ import net.minecraft.world.phys.HitResult
 import net.minecraft.world.phys.Vec3
 import net.neoforged.fml.loading.FMLEnvironment
 import org.lwjgl.glfw.GLFW
+import net.minecraft.sounds.SoundSource
+import net.neoforged.neoforge.client.event.ClientTickEvent
+import net.neoforged.neoforge.client.event.InputEvent
+import net.neoforged.neoforge.common.NeoForge
 import pro.ikili.kibicomputers.devdriver.DevDriverServer
 import pro.ikili.kibicomputers.core.display.CharWidth
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
@@ -51,12 +55,18 @@ object DevDriver {
     private var server: DevDriverServer? = null
     private var screenshotCount = 0
 
+    // 人がゲームの画面をクリックしてマウスをつかませたか。そのときは放さない（#786）
+    private var userGrabbed = false
+    private var volumeApplied = false
+
     @JvmStatic
     fun start(port: Int, portFile: String?) {
         if (!FMLEnvironment.dist.isClient || server != null) return
         val s = DevDriverServer(port, portFile?.let { Path.of(it) }, ::handle)
         val actual = s.start()
         server = s
+        NeoForge.EVENT_BUS.addListener(::onMouseButton)
+        NeoForge.EVENT_BUS.addListener(::onClientTick)
         LOGGER.info("Dev driver listening on 127.0.0.1:{}", actual)
     }
 
@@ -79,6 +89,8 @@ object DevDriver {
             "POST /screen" -> onMain { screen(body) }
             // クライアントを正常に終了する（このクライアントだけを閉じる）
             "POST /quit" -> onMain { mc().stop(); ok() }
+            // マスター音量を変える（0.0〜1.0。既定の起動では 0。#786）
+            "POST /sound" -> onMain { sound(body) }
             else -> DevResponse.error(404, "unknown endpoint: ${request.method} ${request.path}")
         }
     }
@@ -92,6 +104,36 @@ object DevDriver {
         } catch (e: TimeoutException) {
             DevResponse.error(503, "client main thread is busy (still loading?)")
         }
+    }
+
+    private fun onMouseButton(event: InputEvent.MouseButton.Pre) {
+        if (event.action == GLFW.GLFW_PRESS && mc().screen == null) userGrabbed = true
+    }
+
+    private fun onClientTick(@Suppress("UNUSED_PARAMETER") event: ClientTickEvent.Pre) {
+        quietTick(mc())
+    }
+
+    /**
+     * 開発クライアントを静かにする（#786）。
+     * - 最初の tick で、マスター音量を 0 にする（`-PdevSound=true` で起動したときは 1）。
+     * - 自動操作（`world`・`close` など）でゲームの画面に戻るとマウスがつかまれ、ウィンドウの外に出せなくなるので、すぐ放す。
+     *   人がゲームの画面をクリックしてつかんだときは放さない（画面が開いたら、その印を消す）。
+     */
+    private fun quietTick(mc: Minecraft) {
+        if (!volumeApplied) {
+            volumeApplied = true
+            val volume = if (System.getProperty("kibicomputers.dev.sound") == "true") 1.0 else 0.0
+            mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(volume)
+        }
+        if (mc.screen != null) userGrabbed = false
+        if (mc.mouseHandler.isMouseGrabbed && !userGrabbed) mc.mouseHandler.releaseMouse()
+    }
+
+    private fun sound(body: JsonObject): DevResponse {
+        val volume = body.get("master")?.asDouble ?: return DevResponse.error(400, "master is required")
+        mc().options.getSoundSourceOptionInstance(SoundSource.MASTER).set(volume.coerceIn(0.0, 1.0))
+        return ok { addProperty("master", mc().options.getSoundSourceOptionInstance(SoundSource.MASTER).get()) }
     }
 
     private fun ok(extra: JsonObject.() -> Unit = {}): DevResponse =
@@ -113,6 +155,8 @@ object DevDriver {
             addProperty("screen", mc.screen?.javaClass?.simpleName)
             addProperty("title", mc.screen?.title?.string)
             addProperty("inWorld", mc.level != null && mc.player != null)
+            addProperty("master", mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).get())
+            addProperty("mouseGrabbed", mc.mouseHandler.isMouseGrabbed)
             mc.player?.let { p ->
                 addProperty("x", p.x)
                 addProperty("y", p.y)

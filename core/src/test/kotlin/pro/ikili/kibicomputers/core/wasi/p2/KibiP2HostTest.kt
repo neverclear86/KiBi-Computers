@@ -34,7 +34,7 @@ class KibiP2HostTest {
             "kibi:io/tty", "kibi:io/pipe-streams",
             "kibi:fs/mounts",
             "kibi:device/types", "kibi:device/bus", "kibi:device/bus-poll",
-            "kibi:computer/clock", "kibi:computer/power",
+            "kibi:computer/clock", "kibi:computer/power", "kibi:computer/access",
         )
         assertEquals(expected, KibiP2Host.interfaces.keys)
         assertTrue(KibiP2Host.interfaces.values.all { it.fallback == null })

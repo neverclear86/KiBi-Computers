@@ -194,6 +194,12 @@ kibiWasm {
         includeDirs.from("src/main/wasm/common")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 独自拡張 kibi:computer/access（#110）の p1 の import を確かめる CLI
+    module("kibi-access-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/kibi_access.c")
+        includeDirs.from("src/main/wasm/common")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // 独自拡張 kibi:io/tty（#427）の p1 の import を確かめる CLI
     module("kibi-tty-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_tty.c")
@@ -327,7 +333,7 @@ val osLibrarySources = fileTree(osLibrary) { include("**/*.zig") }
 // 可変長の結果を返す import（`kibi.events` の `take`・`process.listProcesses`・`mounts.listMounts`/`listDisks`）を使い、
 // `cabi_realloc`（`os/lib/kibi/canon.zig`）を export する必要があるプログラム。使うものを足したら、ここにも足す
 // （足し忘れると、読み込みで NOEXEC になる。`StandardOsRestoreTest` が import から検出する）
-val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount", "man"))
+val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount", "man", "access"))
 
 // `os/<dir>/` の `.zig` を1つずつ WASM にする（sourceSet が null ならリソースに入れない）
 fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir(dir).asFile

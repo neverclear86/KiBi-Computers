@@ -11,7 +11,7 @@ The extensions are defined as WIT packages named `kibi:<area>`. WASI p1 programs
 | `kibi:process@0.1.0` | `process` | [kibi:process](./kibi-process.md) |
 | `kibi:io@0.1.0` | `fd`, `pipe`, `tty` | [kibi:io](./kibi-io.md) |
 | `kibi:device@0.1.0` | `types`, `bus` | [kibi:device](./kibi-device.md) |
-| `kibi:computer@0.1.0` | `memory`, `clock`, `power` | [kibi:computer](./kibi-computer.md) |
+| `kibi:computer@0.1.0` | `memory`, `clock`, `power`, `access` | [kibi:computer](./kibi-computer.md) |
 | `kibi:fs@0.1.0` | `mounts` | [kibi:fs](./kibi-fs.md) |
 
 Interfaces whose names end in `-poll`, `-async`, or `-streams` are for p2 and p3 and cannot be imported from p1. `-poll` and `-streams` work in p2 (#685); `-async` is a provisional one for p3 ([p2 and p3 plans](./p2-p3.md)). The current time and the monotonic clock come from WASI `clock_time_get`; they are not in `kibi:*`.

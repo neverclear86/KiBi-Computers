@@ -1,0 +1,51 @@
+package kibi:computer@0.1.0;
+
+/// コンピューターの持ち主・メンバー・保留（#110。ADR 0110・0131）。
+///
+/// 変更は「依頼」だけで、プログラムが直接は変えられない。依頼はゲーム内で、持ち主（持ち主がオンラインならチャットに承認・拒否のボタンが出る）
+/// か OP が承認したときに反映する（持ち主のいないケースの持ち主の変更は、新しい持ち主になる本人が承認する）。結果は `get-access` で見る。
+/// どの関数も待たない。p1・p2・p3 で同じ形。
+///
+/// p1 向けには、ADR 0073 の規則でモジュール `kibi:computer/access@0.1.0` の import として出している。
+interface access {
+    use kibi:kernel/types@0.1.0.{error-code};
+
+    /// 持ち主の状態。`locked` は保存した記録が読めなかったケース（OP だけが使える）
+    enum access-state {
+        unowned,
+        owned,
+        locked,
+    }
+
+    /// プレイヤー。`name` は最後に見た名前（表示用）、`id` は UUID の小文字の正規形
+    record player {
+        name: string,
+        id: string,
+    }
+
+    /// 今の持ち主と権限。`unowned`・`locked` のとき `owner` は none、`members`・`invites` は空。
+    /// `invites` は名前で足した保留（小文字）で、その名前のプレイヤーが次にケースを使ったときにメンバーになる。期限の切れた保留は含まない。
+    /// 承認待ちの依頼は含まない
+    record access-info {
+        state: access-state,
+        owner: option<player>,
+        members: list<player>,
+        invites: list<string>,
+    }
+
+    /// 今の持ち主と権限。`not-supported`: このコンピューターには持ち主と権限がない
+    get-access: func() -> result<access-info, error-code>;
+
+    /// 名前 `name` のプレイヤーを保留として足すよう依頼する（承認されると保留に入り、本人がケースを使うとメンバーになる）。
+    /// ok は「受け付けた」の意味。`invalid`: 名前の形が違う（`[A-Za-z0-9_]{1,16}`）、`not-supported`: 持ち主と権限がない、
+    /// `again`: このコンピューターの承認待ちが上限
+    request-add: func(name: string) -> result<_, error-code>;
+
+    /// メンバー（UUID）か保留（名前）を外すよう依頼する。名前のときは、その名前で今オンラインのメンバーも外す。
+    /// エラーは `request-add` と同じ（`invalid` は、名前の形でも UUID の正規の形でもないとき）
+    request-remove: func(name-or-id: string) -> result<_, error-code>;
+
+    /// 持ち主を、名前 `name` の（オンラインの）プレイヤーに変えるよう依頼する。元の持ち主はメンバーに残らない。
+    /// エラーは `request-add` と同じ
+    request-transfer: func(name: string) -> result<_, error-code>;
+}
