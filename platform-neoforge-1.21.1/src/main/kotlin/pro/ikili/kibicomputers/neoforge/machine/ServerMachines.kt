@@ -552,9 +552,18 @@ object ServerMachines {
 
     // ---- tick と自動保存 ----
 
-    /** 自動保存の周期を、今すぐ1つ始める（負荷試験用。周期の数え方は変えない） */
-    internal fun startAutosaveCycle() {
-        rotation.startCycle(tracked.filter { it.computer.machine != null && !it.computer.isRestoring })
+    /**
+     * 自動保存の周期を、今すぐ1つ始める。周期に入れるのは、読み込まれているケースのうち [only] にあり、動いていて復元中でない台だけ
+     * （負荷試験用。本番では呼ばない。周期の数え方は変えない）。
+     *
+     * 前の回の GameTest が残した強制読み込みなどで、試験と関係のない台が動いていても、その台は数えない（#749）。
+     * 同じ台かどうかは参照で比べる。[only] にない台の前の周期からの持ち越し（`carry`）は捨てられる
+     * （[AutosaveRotation.startCycle]）ので、本番の周期には使わない。
+     */
+    internal fun startAutosaveCycle(only: Collection<CaseBlockEntity>) {
+        val onlySet: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
+        onlySet.addAll(only)
+        rotation.startCycle(tracked.filter { it in onlySet && it.computer.machine != null && !it.computer.isRestoring })
     }
 
     /** 自動保存の周期が終わっている（負荷試験用） */

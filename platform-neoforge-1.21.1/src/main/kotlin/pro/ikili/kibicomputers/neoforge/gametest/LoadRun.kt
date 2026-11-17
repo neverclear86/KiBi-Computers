@@ -27,6 +27,8 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import java.lang.management.ManagementFactory
 import java.lang.management.ThreadInfo
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
@@ -889,7 +891,18 @@ internal class LoadRun(
             }
             LoadPhase.AUTOSAVE -> {
                 ServerMachines.Stats.reset()
-                ServerMachines.startAutosaveCycle()
+                // この試験で置いた台だけを周期に入れる。前の回の強制読み込みが残ったワールドでは、よその台も動いている（#749）
+                val own: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
+                for (c in computers) own += c.case
+                val others = ServerMachines.trackedCases().filter { it !in own && it.computer.machine != null }
+                if (others.isNotEmpty()) {
+                    LOGGER.warn(
+                        "{} running machines that this load test did not place are loaded; the autosave cycle leaves them out: {}",
+                        others.size,
+                        others.take(5).joinToString(" ") { "(${it.blockPos.toShortString()})" },
+                    )
+                }
+                ServerMachines.startAutosaveCycle(own)
                 recording = true
             }
             LoadPhase.COMPUTE -> for (c in computeSet) type(c, settings.os.computeCommand)
