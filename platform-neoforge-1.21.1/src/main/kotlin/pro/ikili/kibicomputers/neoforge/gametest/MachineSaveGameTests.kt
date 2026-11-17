@@ -700,12 +700,14 @@ object MachineSaveGameTests {
      * 離れたチャンクに動いている台を置き、強制読み込みを外して FULL でなくなったところ（tick の終わりの `saveForDemotion` の前）で
      * [check] を呼ぶ（チャンクの印は外してから渡す。3つ目の引数は、その時点の `setChangedCalls`）。[check] が真を返すまで待ってから片付ける。
      * [stopFirst] なら、FULL でなくす前にマシンを止める（ゲストが止めたのと同じ `stop()`。tick が回らないので知らせは届かない）。
+     * [powered] が偽なら、電源を入れずに置く（[stopFirst] は見ない）。
      * 並行するテストと重ならないように、チャンクは [chunkOffsetZ] でずらす
      */
     private fun stopOnChunkThatJustLeftFull(
         helper: GameTestHelper,
         chunkOffsetZ: Int,
         stopFirst: Boolean,
+        powered: Boolean = true,
         check: (CaseBlockEntity, LevelChunk, Int) -> Boolean,
     ) {
         val level = helper.level
@@ -719,8 +721,8 @@ object MachineSaveGameTests {
         level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
         val be = level.getBlockEntity(pos) as CaseBlockEntity
         installRequired(be)
-        helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
-        val machine = be.computer.machine!!
+        if (powered) helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
+        val machine = be.computer.machine
         fun cleanUp() {
             level.setChunkForced(chunk.x, chunk.z, false)
             level.setChunkForced(keeper.x, keeper.z, false)
@@ -728,10 +730,12 @@ object MachineSaveGameTests {
         var done = false
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(be in ServerMachines.trackedCases(), "the case should be tracked after onLoad")
-            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+            if (machine != null) {
+                helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+            }
         }.thenIdle(3).thenExecute {
             try {
-                if (stopFirst) {
+                if (stopFirst && machine != null) {
                     machine.stop()
                     helper.assertTrue(machine.awaitTermination(5_000), "the machine should stop")
                     helper.assertTrue(machine.state == MachineState.STOPPED, "the machine should be STOPPED but was ${machine.state}")
@@ -769,6 +773,115 @@ object MachineSaveGameTests {
                 cleanUp()
             }
         }.thenSucceed()
+    }
+
+    /**
+     * 読み込み済みのケースに、`claim` で新しい ID を振られる NBT（検査に外れる ID）を読ませる。`onLoad` の後なのでその場で `claim` が走り、
+     * NBT と違う ID になるので、印が次の tick（か停止）に予約される（[ServerMachines.markChangedLater]）
+     */
+    private fun claimANewId(helper: GameTestHelper, be: CaseBlockEntity) {
+        helper.assertTrue(be.isLoadedOnServer && be.identity == null, "the case should be loaded without an id")
+        val tag = be.saveWithoutMetadata(helper.level.registryAccess())
+        tag.putString(CaseBlockEntity.MACHINE_ID_TAG, "not-a-uuid")
+        be.loadWithComponents(tag, helper.level.registryAccess())
+        helper.assertTrue(be.lastClaim == ClaimResult.NEW_ID_INVALID, "the case should get a new id but was ${be.lastClaim}")
+        helper.assertTrue(be.identity != null, "the claim should give the case an id")
+        helper.assertTrue(ServerMachines.isChangedLater(be), "the claim should reserve the mark for later")
+    }
+
+    /** NBT [tag] が、[be] の `claim` で振られた ID を指している */
+    private fun assertTagHasIdentity(helper: GameTestHelper, be: CaseBlockEntity, tag: CompoundTag?) {
+        val identity = be.identity!!
+        helper.assertTrue(
+            tag != null && tag.getString(CaseBlockEntity.MACHINE_ID_TAG) == identity.id.toString() &&
+                tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG) == identity.generation &&
+                tag.getLong(CaseBlockEntity.OWNER_EPOCH_TAG) == identity.epoch,
+            "the NBT should point at $identity: $tag",
+        )
+    }
+
+    /**
+     * 停止の始め（と tick の始め）に流す `claim` の印（#762）: 電源の切れた台（停止で取り出さない）が読み込みの `claim` で新しい ID を
+     * 振られ、tick が来ないうちに流すと、FULL のチャンクに未保存の印が付き、続くチャンクの保存が新しい ID をディスクに書く
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
+    fun flushingTheClaimMarksReachesTheDisk(helper: GameTestHelper) {
+        val level = helper.level
+        // ほかのテストのチャンクと重ならないように、離れたチャンクに置く
+        val chunk = ChunkPos(helper.absolutePos(CASE).x / 16 - 400, helper.absolutePos(CASE).z / 16 + 840)
+        val pos = BlockPos(chunk.minBlockX + 4, 200, chunk.minBlockZ + 11)
+        level.setChunkForced(chunk.x, chunk.z, true)
+        level.getChunk(chunk.x, chunk.z)
+        level.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val be = level.getBlockEntity(pos) as CaseBlockEntity
+        // onLoad を待つ
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(be.isLoadedOnServer, "the case should run onLoad")
+        }.thenExecute {
+            try {
+                val levelChunk = level.getChunkAt(pos)
+                // 予約と流すのは同じ tick の中で行う（次の tick の始めも同じものを流すため）
+                claimANewId(helper, be)
+                // 読ませたときの印を外し、流す手順が付けるかを見る
+                levelChunk.isUnsaved = false
+                ServerMachines.flushChangedLater()
+                helper.assertTrue(!ServerMachines.isChangedLater(be), "the flush should consume the reservation")
+                helper.assertTrue(levelChunk.isUnsaved, "the flush should mark the FULL chunk unsaved")
+                assertTagHasIdentity(helper, be, be.saveWithoutMetadata(level.registryAccess()))
+                // 続くチャンクの保存（停止では saveAllChunks）が、新しい ID をディスクに書く
+                level.chunkSource.save(true)
+                val data = level.chunkSource.chunkMap.read(chunk).join().orElse(null)
+                helper.assertTrue(data != null, "the chunk should be on disk")
+                assertTagHasIdentity(helper, be, caseTagIn(data!!, pos))
+                removeCaseWithoutDrops(level, pos)
+            } finally {
+                level.setChunkForced(chunk.x, chunk.z, false)
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * FULL でなくなったチャンク（`onLoad` の後、次の tick までにチケットの段階が下がった。1人プレイの「保存してタイトルに戻る」など）の
+     * 電源の切れた台の `claim` の印も、流すと `setChanged` を呼ばずに（#698）チャンクに直接付き、holder の保存のフラグも立つ（#762・#761）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun flushingTheClaimMarksAChunkThatJustLeftFull(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 520, stopFirst = false, powered = false) { be, latest, _ ->
+            claimANewId(helper, be)
+            val holder = lowerHolderFlag(helper, latest)
+            latest.isUnsaved = false
+            val changes = be.setChangedCalls
+            ServerMachines.flushChangedLater()
+            helper.assertTrue(!ServerMachines.isChangedLater(be), "the flush should consume the reservation")
+            helper.assertTrue(be.setChangedCalls == changes, "the flush should not call setChanged on a chunk that is not FULL")
+            helper.assertTrue(latest.isUnsaved, "the flush should mark the chunk that left FULL unsaved")
+            helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the flush should raise the holder flag")
+            assertTagHasIdentity(helper, be, be.saveWithoutMetadata(helper.level.registryAccess()))
+            true
+        }
+    }
+
+    /**
+     * アンロード（`saveForUnload`）は、まだ流れていない `claim` の印をそのチャンクに付けて外す（#762。アンロードの `untrack` が予約を捨てるため）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun unloadMarksAChunkForAReservedClaimMark(helper: GameTestHelper) {
+        val level = helper.level
+        val state = KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState()
+        // 電源の切れた、どのチャンクにも入っていないケース（取り出しの対象にならない）
+        val far = BlockPos(helper.absolutePos(CASE).x - 16 * 900, 100, helper.absolutePos(CASE).z + 16 * 900)
+        val be = CaseBlockEntity(far, state)
+        be.setLevel(level)
+        ServerMachines.markChangedLater(be)
+        val chunk = level.getChunkAt(helper.absolutePos(CASE))
+        chunk.isUnsaved = false
+        ServerMachines.saveForUnload(chunk, listOf(be), adopt = true)
+        helper.assertTrue(chunk.isUnsaved, "the unload should mark the chunk for the reserved mark")
+        helper.assertTrue(!ServerMachines.isChangedLater(be), "the unload should consume the reservation")
+        helper.succeed()
     }
 
     /**

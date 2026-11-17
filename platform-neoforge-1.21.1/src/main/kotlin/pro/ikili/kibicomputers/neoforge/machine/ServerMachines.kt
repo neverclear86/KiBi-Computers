@@ -85,7 +85,8 @@ data class MachineKey(val dimension: ResourceKey<Level>, val pos: BlockPos) {
  *   イベントの中では印を付けるだけで、tick の終わり（[ServerTickEvent.Post]）に、tick の時間が残っている間だけ流す（1 tick に最低1チャンク）。
  *   流す前に FULL に戻ったチャンクは何もしない。FULL に戻ったチャンクのケースは、アンロードの後に読み込み直したのと同じく電源が切れている
  * - チャンクの保存（[ChunkDataEvent.Save]）: NBT に入ったケースの世代を、持ち主の位置のタグだけで `markChunkGeneration` に渡す
- * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: 全台を止め、待ち、取り出して書き込みに回し、書き込みのスレッドが
+ * - サーバーの停止（[ServerStoppingEvent]。`saveAllChunks` の前）: まず、`claim` で予約した印（[markChangedLater]）を流す
+ *   （[flushChangedLater]。読み込んだ直後の tick に止まると、tick の始めに流れないため。#762）。全台を止め、待ち、取り出して書き込みに回し、書き込みのスレッドが
  *   空になるのを待って（[drainSaves]）、書けた台のチャンクに印を付ける（#84 の規則 3。FULL でないチャンクにも付く。#653）。
  *   止めた台は [ServerStoppedEvent] で捨てるまで止めたまま。そのあと、チャンクのアンロードの列を流しきる（[ChunkUnloadDrain]。#540）
  * - サーバーが止まった後（[ServerStoppedEvent]）に全マシンを止め、スレッドが終わるのを待つ（上限 [SHUTDOWN_TIMEOUT_MILLIS]）
@@ -197,7 +198,10 @@ object ServerMachines {
     /** サーバーで読み込まれているケース（読み込んだ順）。メインスレッドだけで使う */
     private val tracked = LinkedHashSet<CaseBlockEntity>()
 
-    /** 次の tick の始めに `setChanged` するケース（`onLoad` の中ではチャンクに触らないため） */
+    /**
+     * 次の tick の始めに未保存の印を付けるケース（`onLoad` の中ではチャンクに触らないため）。tick の始めとサーバーの停止の始めに
+     * [flushChangedLater] が流す。アンロード（[saveForUnload]）はそのチャンクに印を付けて外す
+     */
     private val changedLater = LinkedHashSet<CaseBlockEntity>()
 
     private var rotation = AutosaveRotation<CaseBlockEntity>(saveConfig)
@@ -522,9 +526,25 @@ object ServerMachines {
         rotation.remove(be)?.close()
     }
 
-    /** 次の tick の始めに [be] の `setChanged` を呼ぶ */
+    /** 次の tick の始め（それより先にサーバーが止まれば、停止の始め）に [be] のチャンクに未保存の印を付ける（[flushChangedLater]） */
     internal fun markChangedLater(be: CaseBlockEntity) {
         changedLater += be
+    }
+
+    /** [be] が [markChangedLater] で印を待っているか（GameTest 用） */
+    internal fun isChangedLater(be: CaseBlockEntity): Boolean = be in changedLater
+
+    /**
+     * [markChangedLater] で予約した印を、今すぐ付ける（tick の始めとサーバーの停止の始め。#762）。印は [markChunkUnsaved] で付ける:
+     * チャンクが FULL なら `setChanged`、FULL でなければ（`onLoad` の後、次の tick までに `pollTask` でチケットの段階が下がったときなど）
+     * `setChanged` を呼ばずに（届かず、隣のブロックにも触らせたくない。#698）チャンクに直接 `setUnsaved(true)` を付ける（ADR 0084 の規則 5）。
+     * 消えたケースは飛ばす。対象は予約したケースだけ（普段は空。全台はなめない）。メインスレッドで呼ぶ
+     */
+    internal fun flushChangedLater() {
+        if (changedLater.isEmpty()) return
+        val list = changedLater.toList()
+        changedLater.clear()
+        for (be in list) if (!be.isRemoved) markChunkUnsaved(be)
     }
 
     /** 読み込まれているケース（写し） */
@@ -552,11 +572,7 @@ object ServerMachines {
             }
         }
         unloadWaitedNanos = 0
-        if (changedLater.isNotEmpty()) {
-            val list = changedLater.toList()
-            changedLater.clear()
-            for (be in list) if (!be.isRemoved) be.setChanged()
-        }
+        flushChangedLater()
         if (manager != null && autosaveEnabled) autosaveTick()
     }
 
@@ -826,6 +842,8 @@ object ServerMachines {
         for (be in cases) if (settleStopped(be, quiet = true)) markUnsaved()
         // アンロード待ちで印を付けられなかったケース（markChunkUnsaved。#653）の分を、このチャンクに付ける
         if (unmarkedCases.isNotEmpty()) for (be in cases) if (unmarkedCases.remove(be)) markUnsaved()
+        // claim で予約した印（markChangedLater）がまだ流れていない分も、このチャンクに付ける（アンロードの untrack が予約を捨てるため。#762）
+        if (changedLater.isNotEmpty()) for (be in cases) if (changedLater.remove(be)) markUnsaved()
         val targets = ArrayList<CaseBlockEntity>()
         for (be in cases) {
             if (be.computer.machine == null) continue
@@ -995,6 +1013,10 @@ object ServerMachines {
     // ---- サーバーの停止 ----
 
     private fun onServerStopping(event: ServerStoppingEvent) {
+        // 読み込んだ直後の tick に止まると、claim で予約した印（markChangedLater）が tick の始めに流れないまま saveAllChunks に進む。
+        // 電源の切れた台・復元の途中の台は saveForStop が取り出さないので、ここで付けないと NBT が claim の前の値のまま残る（#762）。
+        // 位置の条件は saveAllChunks より前（ServerStoppingEvent の中）だけ。drainAll が流すアンロード（saveForUnload）も、流れていない予約を見てチャンクに印を付けてから外す
+        flushChangedLater()
         if (manager != null) saveForStop(tracked.toList(), keepQuiesced = true)
         // 取り出した後に流す（流した分のアンロードは、取り出し済みの台の印を見るだけ）。止める手順が回り続けないように（#540）
         ChunkUnloadDrain.drainAll(event.server)

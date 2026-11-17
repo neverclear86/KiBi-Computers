@@ -390,7 +390,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (serial == restoreStarts) lastRestoreOutcome = outcome
     }
 
-    /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick に `setChanged` する */
+    /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick の始め（か停止の始め）にチャンクに印を付ける（#762） */
     private fun claimIdentity() {
         // 先に取り出して ID が決まっていれば（書き込み中を含む）、それを使う（置いた直後の tick に取り出したときなど）
         if (currentIdentity != null) return
