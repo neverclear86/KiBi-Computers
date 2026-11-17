@@ -21,7 +21,7 @@
 
 - `get-access: func() -> result<access-info, error-code>`、`request-add: func(name: string)`、`request-remove: func(name-or-id: string)`、`request-transfer: func(name: string)`（どれも `-> result<_, error-code>`）
 - `access-info` は `state`（`unowned`・`owned`・`locked`）、`owner: option<player>`、`members: list<player>`、`invites: list<string>`。`player` は名前と UUID の文字列（小文字の正規形）。期限の切れた保留は返さない（BE の値は変えない）。承認待ちの依頼は返さない
-- 同期のエラーは `invalid`（形・64 バイト超・UTF-8 でない）、`not-supported`（口がない）、`again`（承認待ちが上限）だけ。文字列の範囲が外ならトラップ
+- 同期のエラーは `invalid`（形・64 バイト超・UTF-8 でない）、`not-supported`（口がない）、`again`（承認待ちが上限）、`fault`（`request-*` の文字列の範囲が線形メモリの外。`P1Canonical.liftString` が返す。ABI の表のとおり）。トラップになるのは書き先（retptr）が外のときだけ
 - p1: モジュール `kibi:computer/access@0.1.0`。`get-access` は `cabi_realloc` が要る。p2・p3 も同じ interface（待たないので `-poll`・`-async` は作らない）
 - `get-access` の燃料は、`(1 + メンバー数 + 保留数) × KibiFs.MOUNT_LIST_FUEL_PER_ENTRY`（仮の値）
 - 書き先（retptr）は、依頼を受け付けて届けを積んだ後に確かめる。外なら依頼は届いたうえでトラップになる（`reboot` と同じく、効果を先に決める）
@@ -56,7 +56,9 @@
 | APPLIED | 外す | 返す |
 | NO_CHANGE（もう入っている・上限・見つからない など） | 外す | 返す |
 | NOT_PERMITTED | 残す | 返さない |
-| TARGET_OFFLINE（transfer の相手がいない） | 残す | 返さない |
+| TARGET_OFFLINE（`target` がない） | 残す | 返さない |
+
+TARGET_OFFLINE は core の防御の分岐で、接続層からは届かない。transfer の相手は届け（`AccessRequests.deliver`）でオンラインのプレイヤーから引いて UUID を固定し、いなければその場で捨てるので、表に載る transfer は必ず `target` を持つ。承認のときは固定した UUID に渡すだけで、相手がその後ログアウトしていても持ち主は変わる（相手のオンラインを見るのは届けのときだけ）。
 
 ### BE の確かめ（チャンクを読み込まない）
 

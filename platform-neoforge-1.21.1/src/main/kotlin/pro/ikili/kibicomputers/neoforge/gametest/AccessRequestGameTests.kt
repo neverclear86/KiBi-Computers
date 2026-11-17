@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.neoforge.gametest
 
 import com.mojang.authlib.GameProfile
 import io.netty.channel.embedded.EmbeddedChannel
+import net.minecraft.commands.CommandSource
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
@@ -139,7 +140,7 @@ object AccessRequestGameTests {
     }
 
     /** [c] の中の、クリックで走るコマンド */
-    private fun commandsOf(c: Component): List<String> {
+    internal fun commandsOf(c: Component): List<String> {
         val out = ArrayList<String>()
         fun walk(x: Component) {
             x.style.clickEvent?.takeIf { it.action == ClickEvent.Action.RUN_COMMAND }?.let { out += it.value }
@@ -342,6 +343,126 @@ object AccessRequestGameTests {
         command(helper, alex, "list")
         val listed = alex.listedIds()
         helper.assertTrue(listed == listOf(mine), "only Alex's request should be listed ($mine, not $theirs): $listed ${alex.messages}")
+        helper.succeed()
+    }
+
+    /** 持ち主のいる（owned）ケースの持ち主の変更は、持ち主に知らせ、届けで相手を固定し、持ち主の approve で持ち主が替わる（元の持ち主はメンバーに残らない） */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun ownedTransferNotifiesTheOwnerAndPinsTheTarget(helper: GameTestHelper) {
+        val alex = player(helper, "Alex110h")
+        val target = player(helper, "Target110h")
+        val be = placeBy(helper, alex)
+        val id = request(be, AccessRequestKind.TRANSFER, "target110h")!!
+        helper.assertTrue(AccessRequests.KEY_REQUEST_TRANSFER in alex.keys(), "the owner should be told: ${alex.messages}")
+        helper.assertTrue(alex.messages.flatMap(::commandsOf) == listOf("/kibicomputers access approve $id", "/kibicomputers access deny $id"), "the message should carry the buttons")
+        helper.assertTrue(target.messages.isEmpty(), "the target should not be told while the case has an owner: ${target.messages}")
+        helper.assertTrue(AccessRequests.peek(id)?.target?.id == target.uuid, "the target should be pinned at delivery")
+        // 相手本人は、持ち主のいるケースの依頼を決められない
+        command(helper, target, "approve $id")
+        helper.assertTrue(target.keys() == listOf(AccessRequests.KEY_UNKNOWN) && AccessRequests.peek(id) != null, "the target should not decide: ${target.messages}")
+        command(helper, alex, "approve $id")
+        helper.assertTrue(AccessRequests.KEY_APPROVED_TRANSFER in alex.keys(), "the owner should see the result: ${alex.messages}")
+        helper.assertTrue(be.playerAccess.owner?.id == target.uuid, "the target should own the case: ${be.playerAccess}")
+        helper.assertTrue(be.playerAccess.members.none { it.id == alex.uuid }, "the old owner should not stay a member: ${be.playerAccess}")
+        helper.assertTrue(be.accessPort.limiter.size == 0, "the slot should be released")
+        helper.succeed()
+    }
+
+    /**
+     * 名前での remove は、届けのときにその名前のオンラインのプレイヤーを `target` に固定し、approve でそのメンバーも外れる。
+     * オンラインにいない名前なら `target` はなく、保留だけが対象になる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun removeByNamePinsTheOnlinePlayer(helper: GameTestHelper) {
+        val alex = player(helper, "Alex110i")
+        val steve = player(helper, "Steve110i")
+        val be = placeBy(helper, alex)
+        val now = System.currentTimeMillis()
+        val rules = CaseAccess.rules()
+        be.replacePlayerAccess(be.playerAccess.addPending("Steve110i", now, rules).access.onAccess(CaseAccess.ref(steve), now, rules).addPending("Gone110i", now, rules).access)
+        helper.assertTrue(be.playerAccess.members.any { it.id == steve.uuid }, "Steve should be a member: ${be.playerAccess}")
+        val byName = request(be, AccessRequestKind.REMOVE, "steve110i")!!
+        val offline = request(be, AccessRequestKind.REMOVE, "Gone110i")!!
+        helper.assertTrue(AccessRequests.peek(byName)?.target?.id == steve.uuid, "the online player should be pinned")
+        helper.assertTrue(AccessRequests.peek(offline)?.target == null, "an offline name should have no target")
+        command(helper, alex, "approve $byName")
+        helper.assertTrue(AccessRequests.KEY_APPROVED_REMOVE in alex.keys(), "the owner should see the result: ${alex.messages}")
+        helper.assertTrue(be.playerAccess.members.isEmpty(), "the online member should be removed: ${be.playerAccess}")
+        command(helper, alex, "approve $offline")
+        helper.assertTrue(be.playerAccess.pending.isEmpty(), "the pending entry should be removed: ${be.playerAccess}")
+        helper.succeed()
+    }
+
+    /** 変わらなかった承認（NO_CHANGE）は、表から外し、枠を返し、理由の文言を返す。すでに持ち主への transfer も同じ */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun approvingANoChangeRequestReleasesTheSlot(helper: GameTestHelper) {
+        val alex = player(helper, "Alex110j")
+        val be = placeBy(helper, alex)
+        val first = request(be, AccessRequestKind.ADD, "Bob110j")!!
+        command(helper, alex, "approve $first")
+        helper.assertTrue(AccessRequests.KEY_APPROVED_ADD in alex.keys(), "the first add should apply: ${alex.messages}")
+        val second = request(be, AccessRequestKind.ADD, "Bob110j")!!
+        alex.clear()
+        command(helper, alex, "approve $second")
+        val keys = alex.keys()
+        helper.assertTrue(AccessRequests.KEY_UNCHANGED in keys && AccessRequests.KEY_REASON_PREFIX + "already_present" in keys, "the reason should be shown: $keys")
+        helper.assertTrue(AccessRequests.peek(second) == null, "the request should be taken")
+        helper.assertTrue(be.accessPort.limiter.size == 0, "the slot should be released")
+        helper.assertTrue(be.playerAccess.pending.size == 1, "nothing should change: ${be.playerAccess}")
+        // すでに持ち主への transfer
+        val self = request(be, AccessRequestKind.TRANSFER, "Alex110j")!!
+        alex.clear()
+        command(helper, alex, "approve $self")
+        helper.assertTrue(alex.keys() == listOf(AccessRequests.KEY_UNCHANGED, AccessRequests.KEY_REASON_PREFIX + "already_present"), "a transfer to the owner should change nothing: ${alex.messages}")
+        helper.assertTrue(AccessRequests.peek(self) == null && be.accessPort.limiter.size == 0, "the request should be taken and the slot released")
+        helper.succeed()
+    }
+
+    /** プレイヤーでない実行者（コンソール）は、approve・deny・list のどれも `players_only` で断られ、表は変わらない */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun consoleCannotDecide(helper: GameTestHelper) {
+        val alex = player(helper, "Alex110k")
+        val be = placeBy(helper, alex)
+        val id = request(be, AccessRequestKind.ADD, "Bob110k")!!
+        val captured = ArrayList<Component>()
+        val source = object : CommandSource {
+            override fun sendSystemMessage(component: Component) {
+                captured += component
+            }
+
+            override fun acceptsSuccess(): Boolean = true
+
+            override fun acceptsFailure(): Boolean = true
+
+            override fun shouldInformAdmins(): Boolean = false
+        }
+        val console = helper.level.server.createCommandSourceStack().withSource(source)
+        for (c in listOf("approve $id", "deny $id", "list")) {
+            helper.level.server.commands.performPrefixedCommand(console, "kibicomputers access $c")
+        }
+        val keys = captured.flatMap(::keysOf)
+        helper.assertTrue(keys == List(3) { AccessRequests.KEY_PLAYERS_ONLY }, "the console should be refused: $keys")
+        helper.assertTrue(AccessRequests.peek(id) != null && be.playerAccess.pending.isEmpty() && be.accessPort.limiter.size == 1, "nothing should change")
+        helper.succeed()
+    }
+
+    /** OP の `list` には、持ち主のいないケースの持ち主の変更が出ない（相手本人にだけ見せる）。相手本人の `list` には出る */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun listHidesAnUnownedTransferFromOperators(helper: GameTestHelper) {
+        val target = player(helper, "Target110l")
+        val op = player(helper, "Op110l", op = true)
+        val be = placeBy(helper, null)
+        helper.assertTrue(!be.playerAccess.hasOwner, "the case should be ownerless")
+        val id = request(be, AccessRequestKind.TRANSFER, "Target110l")!!
+        command(helper, op, "list")
+        helper.assertTrue(id !in op.listedIds(), "an operator should not see it: ${op.messages}")
+        command(helper, target, "list")
+        helper.assertTrue(id in target.listedIds(), "the target should see it: ${target.messages}")
         helper.succeed()
     }
 }

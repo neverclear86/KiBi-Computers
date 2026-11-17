@@ -17,9 +17,9 @@ Without operands, prints the state (`unowned`, `owned` or `locked`), the owner, 
 
 `add`, `remove` and `transfer` only send a request. Nothing changes until the owner (or an operator) approves it in the game: the owner gets a chat message with Approve and Deny buttons while online. Run `access` again to see the result.
 
-- `add NAME`: invite the player. They become a member when they next use the computer.
-- `remove NAME|UUID`: remove a member by UUID, or an invite by name. With a name, an online member of that name is removed too.
-- `transfer NAME`: make the online player NAME the owner. The old owner does not stay a member. On a computer without an owner, NAME must approve it.
+- `add NAME`: invite the player. On a computer without an owner (`unowned`) or a locked one (`locked`) the game would drop it, so the command sends nothing and exits with 1. They become a member when they next use the computer.
+- `remove NAME|UUID`: remove a member by UUID, or an invite by name. With a name, an online member of that name is removed too. Like `add`, it exits with 1 on `unowned` and `locked` computers.
+- `transfer NAME`: make the online player NAME the owner. The old owner does not stay a member. On a computer without an owner, NAME must approve it (on a `locked` one, only an operator can). If NAME is not online when the request reaches the game, it is dropped; the command cannot tell, so check that the player is online if no message arrives.
 
 Requests expire after a while, and only a few can wait at once. Repeating the same request does not send another message.
 
@@ -27,7 +27,7 @@ This is about players in the game, not files: programs on the computer are not s
 
 ## EXIT STATUS
 
-0 when the request was sent. 1 when it was refused (`too many requests are waiting for approval`, `not supported on this computer`, `not a player name`). 2 for a usage error.
+0 when the request was sent. 1 when it was refused (`too many requests are waiting for approval`, `not supported on this computer`, `not a player name`, `the computer has no owner`, `the computer is locked`). 2 for a usage error.
 
 ## SEE ALSO
 

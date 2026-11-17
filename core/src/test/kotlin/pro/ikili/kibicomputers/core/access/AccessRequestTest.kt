@@ -70,7 +70,7 @@ class AccessRequestTest {
     }
 
     @Test
-    fun `並行のtryReserveとreleaseで、上限を超えて取らない`() {
+    fun `並行のtryReserveだけでは、上限を超えて取らない`() {
         val limiter = AccessRequestLimiter()
         val r = AccessRequestRules(60_000, 4)
         val pool = Executors.newFixedThreadPool(8)
@@ -90,6 +90,67 @@ class AccessRequestTest {
         }
         assertEquals(4, accepted.get())
         assertEquals(4, limiter.size)
+    }
+
+    @Test
+    fun `ワーカーのtryReserveとメインスレッドのreleaseが重なっても、上限を超えず、数が合う`() {
+        val limiter = AccessRequestLimiter()
+        val max = 4
+        val r = AccessRequestRules(60_000, max)
+        val workers = Executors.newFixedThreadPool(6)
+        val releaser = Executors.newSingleThreadExecutor()
+        val start = CountDownLatch(1)
+        val accepted = AtomicInteger()
+        val released = AtomicInteger()
+        val maxSeen = AtomicInteger()
+        val waiting = java.util.concurrent.ConcurrentLinkedQueue<AccessRequest>()
+        val workersDone = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val release = releaser.submit {
+                start.await()
+                // 届いた順に承認（枠を返す）。ワーカーが終わり、待ちが空になるまで続ける
+                while (!workersDone.get() || waiting.isNotEmpty()) {
+                    maxSeen.accumulateAndGet(limiter.size, ::maxOf)
+                    val request = waiting.poll()
+                    if (request != null) {
+                        limiter.release(request)
+                        released.incrementAndGet()
+                    } else {
+                        Thread.onSpinWait()
+                    }
+                }
+            }
+            val tasks = (0 until 8).map { w ->
+                workers.submit {
+                    start.await()
+                    // 1人 25 件が受け付けられるまで、FULL なら取り直す（承認で枠が戻るのを待つ）
+                    repeat(25) { i ->
+                        val request = req(AccessRequestKind.ADD, "w${w}n$i")
+                        while (true) {
+                            val result = limiter.tryReserve(request, now, r)
+                            maxSeen.accumulateAndGet(limiter.size, ::maxOf)
+                            if (result == AccessRequestLimiter.Reserve.ACCEPTED) {
+                                accepted.incrementAndGet()
+                                waiting += request
+                                break
+                            }
+                            Thread.onSpinWait()
+                        }
+                    }
+                }
+            }
+            start.countDown()
+            tasks.forEach { it.get(30, TimeUnit.SECONDS) }
+            workersDone.set(true)
+            release.get(30, TimeUnit.SECONDS)
+        } finally {
+            workers.shutdownNow()
+            releaser.shutdownNow()
+        }
+        assertTrue(maxSeen.get() <= max, "上限 $max を超えて取った: ${maxSeen.get()}")
+        assertEquals(8 * 25, accepted.get())
+        assertEquals(accepted.get(), released.get())
+        assertEquals(0, limiter.size)
     }
 
     // ---- 承認 ----

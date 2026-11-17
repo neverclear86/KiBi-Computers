@@ -1229,15 +1229,15 @@ class BasicCommandsTest {
               Steve 00000000-0000-0000-0000-00000000000b
             invites:
               fresh
-            access: requested: add Bob; the owner approves it in the game
+            access: requested: add Bob; the owner (or an operator) approves it in the game
             0
             access: bad-name: not a player name
             1
             access: 1-2-3-4-5: not a player name or UUID
             1
-            access: requested: add Bob; the owner approves it in the game
+            access: requested: add Bob; the owner (or an operator) approves it in the game
             0
-            access: requested: transfer to Steve; the owner approves it in the game
+            access: requested: transfer to Steve; the owner (or an operator) approves it in the game; it is dropped unless the player is online
             0
             access: Carl: too many requests are waiting for approval
             1
@@ -1254,6 +1254,37 @@ class BasicCommandsTest {
             out,
         )
         assertEquals(listOf(AccessRequestKind.ADD to "Bob", AccessRequestKind.TRANSFER to "Steve"), port.delivered.map { it.kind to it.argument })
+    }
+
+    @Test
+    fun `持ち主のいないコンピューターと読めなかったコンピューターでは、addとremoveは依頼を出さず1で終わり、transferは出す`() {
+        for ((access, state, approver) in listOf(
+            Triple(PlayerAccess.NONE, "no owner; only transfer works", "the player approves it in the game"),
+            Triple(PlayerAccess.LOCKED, "locked (its saved record could not be read); only transfer works", "an operator approves it in the game"),
+        )) {
+            val port = FakeAccessPort(access)
+            val out = sh(
+                """
+                access add Bob 2>&1; echo ${'$'}?
+                access remove Bob 2>&1; echo ${'$'}?
+                access transfer Bob; echo ${'$'}?
+                """,
+                environment = MachineEnvironment.builder().access(port).build(),
+            )
+            val what = if (access.locked) "the computer is $state" else "the computer has $state"
+            assertEquals(
+                """
+                access: Bob: $what
+                1
+                access: Bob: $what
+                1
+                access: requested: transfer to Bob; $approver; it is dropped unless the player is online
+                0
+                """.trimIndent() + "\n",
+                out,
+            )
+            assertEquals(listOf(AccessRequestKind.TRANSFER to "Bob"), port.delivered.map { it.kind to it.argument })
+        }
     }
 
     @Test

@@ -88,7 +88,7 @@ interface access {
 - `request-add`, `request-remove` and `request-transfer` return ok once the request is accepted. ok does not mean "applied". A request is applied when the owner or an operator approves it in the game with `/kibicomputers access approve <ID>` (for a `transfer` on a case without an owner, the player who becomes the owner; for a `locked` case, operators only); read the result with `get-access`. When the owner is online, approve and deny buttons appear in their chat
 - Requests waiting for approval are limited per computer (4 by default, config `access.maxRequestsPerComputer`) and expire (300 seconds by default, `access.requestTtlSeconds`). Identical requests (same kind and argument; names ignore case) are merged into one and return ok. Waiting requests are not saved (they are gone when the server stops)
 - The argument of `remove` is a name (the pending entry, and members currently online with that name) or a UUID in canonical form (36 characters with hyphens; uppercase is accepted)
-- A `transfer` is not applied if the target player is not online when it is approved
+- The target of a `transfer` is looked up by name among the online players when the request reaches the game, and fixed to that UUID. If the player is not online then, the request is dropped (ok only means "accepted", so a dropped request is not reported). Approval applies to the fixed UUID, so it is applied even if the player has logged out since
 
 | Situation | Result |
 | --- | --- |
@@ -96,7 +96,7 @@ interface access {
 | This computer has no owner and permissions (such as a machine created outside the game) | `not-supported` |
 | Too many requests waiting for approval | `again` |
 
-- A string range outside the linear memory traps. The retptr is checked after the request is accepted (if it is outside, the request is delivered and then it traps)
+- If the string range of a `request-*` is outside the linear memory, it returns `fault` (no trap). The retptr is checked after the request is accepted (if it is outside, the request is delivered and then it traps)
 - `get-access` can also be called from inside `cabi_realloc`. `cabi_realloc` is called in Canonical ABI field order (owner name, owner id, the `members` array, each member's name and id, the `invites` array, each invite)
 
 ## p1 imports
