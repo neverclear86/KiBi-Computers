@@ -56,6 +56,8 @@ legacyForge {
             // 開発クライアントの自動操作の口（#252）。ポートは既定で自動、実際の番号は run/dev-driver.port に書く
             systemProperty("kibicomputers.devDriver.port", providers.gradleProperty("devDriverPort").getOrElse("0"))
             systemProperty("kibicomputers.devDriver.portFile", file("run/dev-driver.port").absolutePath)
+            // 既定では起動時にマスター音量を 0 にする。音を確かめるときは -PdevSound=true（#786）
+            systemProperty("kibicomputers.dev.sound", providers.gradleProperty("devSound").getOrElse("false"))
         }
         register("server") {
             server()
