@@ -52,8 +52,8 @@ class ComponentExecTest {
         m.vfs.write(f, bytes, 0, bytes.size)
     }
 
-    private fun machine(h: Harness): Machine {
-        val m = h.machine(fuelPerTick = 10_000_000)
+    private fun machine(h: Harness, maxBlockingProcesses: Int? = null): Machine {
+        val m = h.machine(fuelPerTick = 10_000_000, maxBlockingProcesses = maxBlockingProcesses)
         m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
         m.vfs.createDirectory(VfsPath.parse("/bin"))
         return m
@@ -112,6 +112,63 @@ class ComponentExecTest {
             }
             assertEquals("Hello from WASI\n", execAndWait(h, b, "/bin/hello", other).first)
             assertEquals(1, h.scheduler.programs.loads.get())
+        }
+    }
+
+    /** wasmtime のアダプターで包んだ path-wasi（wasi:filesystem を通ってパスを操作する p2 のコマンド） */
+    private val pathWasi: ByteArray by lazy { P2Testing.wrap("path-wasi") }
+
+    /** path-wasi の置き場（WasiP2ProgramTest と同じ） */
+    private fun preparePathWasi(m: Machine) {
+        m.vfs.createDirectory(VfsPath.parse("/data"))
+        write(m, "/data/a.txt", "abcde".toByteArray())
+        m.vfs.mount(VfsPath.parse("/ro"), TestMemoryFileSystem(), readOnly = true, source = "test:ro")
+        write(m, "/bin/path", pathWasi)
+    }
+
+    @Test
+    fun `共有した計画とホストを複数のマシンのプロセスが同時に動かしても壊れない`() = timeout(limit) {
+        val machines = 6
+        val config = SchedulerConfig.builder().maxConcurrentMachines(machines).build()
+        Harness(schedulerConfig = config, execRuntime = EndiveRuntime()).use { h ->
+            repeat(3) { round ->
+                // path-wasi は作ったファイルを残すので、回ごとに新しい台にする
+                val ms = (1..machines).map { machine(h).also(::preparePathWasi) }
+                // 全台で先に exec してから回す（専用スレッドが、同じ ComponentPlan・WasiP2Host を同時に通る）
+                val runs = ms.map { m ->
+                    val out = P2Testing.outputStream(m)
+                    val stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(out, HandleRights.WRITE), StdioSource.Object(out, HandleRights.WRITE))
+                    Triple(m, out, m.exec("/bin/path", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("path-wasi"), stdio = stdio, fds = SpawnOptions.ROOT_PREOPEN)))
+                }
+                val texts = runs.map { StringBuilder() }
+                eventually(60_000, "終わらない（${round + 1} 回目）") {
+                    h.scheduler.tick()
+                    runs.forEachIndexed { i, (m, out, _) -> texts[i].append(P2Testing.drain(m, out)) }
+                    runs.all { (m, _, pid) -> m.stateOf(pid).isTerminal }
+                }
+                runs.forEachIndexed { i, (m, out, pid) ->
+                    texts[i].append(P2Testing.drain(m, out))
+                    assertEquals("OK\n", texts[i].toString(), "マシン ${i + 1}・${round + 1} 回目")
+                    assertEquals(0, m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }, "マシン ${i + 1}・${round + 1} 回目")
+                }
+            }
+            // 計画は全台・全回で 1 つ
+            assertEquals(1, h.scheduler.programs.loads.get())
+        }
+    }
+
+    @Test
+    fun `1台のブロッキング型の上限に達していたらコンポーネントの子のspawnはNFILEで、ほかの台は動く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val full = machine(h, maxBlockingProcesses = 0)
+            write(full, "/bin/kp", hello)
+            val out = runParent(h, full, "run")
+            assertTrue("spawn ${-Errno.NFILE.code}\n" in out, out)
+            // サーバー全体の枠は使っていないので、同じスケジューラーの別の台では動く
+            val other = machine(h)
+            write(other, "/bin/hello", hello)
+            assertEquals("Hello from WASI\n" to 0, execAndWait(h, other, "/bin/hello"))
+            assertEquals(0, h.scheduler.blockingProcesses)
         }
     }
 

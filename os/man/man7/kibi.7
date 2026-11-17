@@ -21,7 +21,7 @@ Features that WASI does not have are provided as WIT packages named `kibi:*`. Ev
 
 ## NOTES
 
-p2, p3 and the Component Model are thin layers over the same kernel, and they use the same `kibi:*` WIT. p2 commands (components that export `wasi:cli/run`) run with exec; p3 and the rest will be added later. The interfaces whose names end in `-poll`, `-async` or `-streams` are provisional ones for p2 and p3; p1 programs cannot import them (`NOEXEC`).
+p2, p3 and the Component Model are thin layers over the same kernel, and they will use the same `kibi:*` WIT. p2 commands (components that export `wasi:cli/run`) run with exec, but they cannot import `kibi:*` yet (`NOEXEC`); p3 and the rest will be added later. The interfaces whose names end in `-poll`, `-async` or `-streams` are provisional ones for p2 and p3; p1 programs cannot import them (`NOEXEC`).
 
 Sockets are not implemented. The p1 `sock_*` functions return `NOSYS`.
 

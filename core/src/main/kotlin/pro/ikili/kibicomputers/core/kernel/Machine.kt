@@ -148,6 +148,12 @@ public class MachineConfig private constructor(builder: Builder) {
     public val maxProcesses: Int = builder.maxProcesses
 
     /**
+     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。p2 のコマンドのコンポーネントなど）の数の上限（仮: 8。確定は #251）。
+     * サーバー全体の枠（[SchedulerConfig.maxBlockingProcesses]）を少数の台で使い切らないためのもの。スレッドを持たない待ちは #757
+     */
+    public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
+
+    /**
      * 1 tick にメインスレッドで実行するホスト呼び出し（ワールド操作など）の数の上限（仮: 64）。残りは次の tick へ。
      * サーバー全体の時間の予算（[SchedulerConfig.mainThreadBudgetNanos]。#356）は、これに重ねてかかる
      */
@@ -183,6 +189,7 @@ public class MachineConfig private constructor(builder: Builder) {
         internal var fuelPerTick: Long = 1_000_000
         internal var fuelSlice: Long? = null
         internal var maxProcesses: Int = 64
+        internal var maxBlockingProcesses: Int = 8
         internal var maxHostCallsPerTick: Int = 64
         internal var memoryBytes: Long = 32L * 1024 * 1024
         internal var maxProcessMemoryBytes: Long? = null
@@ -204,6 +211,12 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun maxProcesses(value: Int): Builder = apply {
             require(value >= 1) { "maxProcesses は 1 以上" }
             maxProcesses = value
+        }
+
+        /** 1 台のブロッキング型プロセスの数の上限（0 以上） */
+        public fun maxBlockingProcesses(value: Int): Builder = apply {
+            require(value >= 0) { "maxBlockingProcesses は 0 以上" }
+            maxBlockingProcesses = value
         }
 
         /** 1 tick に実行するホスト呼び出しの数の上限（1 以上） */
@@ -1440,6 +1453,12 @@ public class Machine private constructor(
             // 親に返すハンドルの空きは、表を変える前に確かめる（子を作ってから MFILE で断らない）
             if (withHandle && checkNotNull(parent).handles.isFull) fsError(Errno.MFILE, "fd の数が上限（${parent.handles.limit}）")
             val kind = driver.kind
+            // 1 台の枠を先に見る（サーバー全体の枠を少数の台で使い切らない）。終わっていないブロッキング型を数える
+            if (kind == ProcessKind.BLOCKING &&
+                kernel.processes.all().count { it.kind == ProcessKind.BLOCKING && !it.state.isTerminal } >= config.maxBlockingProcesses
+            ) {
+                throw ResourceLimitException("このコンピューターのブロッキング型のプロセスの数が上限（${config.maxBlockingProcesses}）")
+            }
             if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
                 throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
             }
