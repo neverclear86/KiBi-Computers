@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.wasi.WasiUtf8
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiAccess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiProcess
@@ -58,6 +59,9 @@ import java.nio.charset.CodingErrorAction
  *   `bad-arguments`・`failed` は string）。`result<list<value>, call-error>`・`result<device, call-error>`・`result<pending-call, call-error>`:
  *   `{ tag @0, payload @4 }`（16 / 4）。`option<result<list<value>, call-error>>`: `{ tag @0, result @4 }`（20 / 4）。
  *   `device-info`: `{ address @0/@4, kind @8/@12 }`（16 / 4）。`method-info`: `{ name @0/@4, main-thread: u8 @8 }`（12 / 4）
+ * - `kibi:computer/access`（#110、ADR 0110）の `result<access-info, error-code>`: `{ tag: u8 @0, ok: access-info @4 | err: u8 @4 }`（44 / 4）。
+ *   `access-info` は `{ state: u8 @0, owner.tag: u8 @4, owner.some: player @8, members @24/@28, invites @32/@36 }`（40 / 4）、
+ *   `player` は `{ name @0/@4, id @8/@12 }`（16 / 4）
  *
  * ゲストの引数の誤り（上限・UTF-8・範囲外）は [FsException]（`INVAL`・`FAULT`）で返し、呼んだ側が `error-code` にする。
  * 書き先（retptr）や `cabi_realloc` が返した場所の誤りは、書き先がないのでトラップ（Canonical ABI と同じ）。
@@ -183,6 +187,14 @@ internal object P1Canonical {
     /** `method-info` の大きさ・align */
     const val METHOD_INFO_SIZE: Int = 12
     const val METHOD_INFO_ALIGN: Int = 4
+
+    /** `result<access-info, error-code>` の大きさと align（#110） */
+    const val ACCESS_RESULT_SIZE: Int = 44
+    const val ACCESS_RESULT_ALIGN: Int = 4
+
+    /** `player` の大きさと align（#110） */
+    const val PLAYER_SIZE: Int = 16
+    const val PLAYER_ALIGN: Int = 4
 
     /**
      * `list<string>` を読む。[ptr] が align 4 に揃っていなければトラップ、[len] が [maxCount] を超えたら要素を読まずに `INVAL`、要素のバイト数が [maxBytes] の外なら中身を読まずに `INVAL`、
@@ -498,6 +510,51 @@ internal object P1Canonical {
         }
         memory.writeI32(retPtr, listPtr)
         memory.writeI32(retPtr + 4, entries.size)
+    }
+
+    /**
+     * `result<access-info, error-code>`（`get-access`。#110、ADR 0110）を [retPtr] に書く。[info] が `null` なら err（[error] は判別子）。
+     * retptr の範囲と align を先に確かめ、場所は Canonical ABI の lower の順（record の項目の順）に [realloc] で取る:
+     * `owner`（some なら name → id）→ `members` の配列（align 4、16 × 件数）→ 各メンバーの name → id → `invites` の配列（align 4、8 × 件数）
+     * → 各文字列。配列は 0 件でも呼ぶ。詰め物と使わない payload（none の owner、err のときの ok 側）は 0。結果の 44 バイトは最後に書く
+     */
+    fun lowerAccessInfoResult(memory: WasmMemory, realloc: Realloc, retPtr: Int, info: KibiAccess.AccessInfo?, error: Int) {
+        checkStore(memory, retPtr, ACCESS_RESULT_SIZE, ACCESS_RESULT_ALIGN)
+        val out = ByteBuffer.allocate(ACCESS_RESULT_SIZE).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        if (info == null) {
+            out.put(0, 1.toByte())
+            out.put(4, error.toByte())
+            memory.write(retPtr, out.array())
+            return
+        }
+        out.put(4, info.state.ordinal.toByte())
+        val owner = info.owner
+        if (owner != null) {
+            val (np, nl) = lowerBytes(memory, realloc, utf8(owner.name))
+            val (ip, il) = lowerBytes(memory, realloc, utf8(owner.id))
+            out.put(8, 1.toByte())
+            out.putInt(12, np).putInt(16, nl).putInt(20, ip).putInt(24, il)
+        }
+        val membersPtr = alloc(memory, realloc, PLAYER_ALIGN, allocSize(info.members.size, PLAYER_SIZE))
+        for ((i, m) in info.members.withIndex()) {
+            val at = membersPtr + i * PLAYER_SIZE
+            memory.write(at, ByteArray(PLAYER_SIZE))
+            val (np, nl) = lowerBytes(memory, realloc, utf8(m.name))
+            memory.writeI32(at, np)
+            memory.writeI32(at + 4, nl)
+            val (ip, il) = lowerBytes(memory, realloc, utf8(m.id))
+            memory.writeI32(at + 8, ip)
+            memory.writeI32(at + 12, il)
+        }
+        val invitesPtr = alloc(memory, realloc, LIST_ELEMENT_ALIGN, allocSize(info.invites.size, STRING_SIZE))
+        for ((i, name) in info.invites.withIndex()) {
+            val at = invitesPtr + i * STRING_SIZE
+            val (p, l) = lowerBytes(memory, realloc, utf8(name))
+            memory.writeI32(at, p)
+            memory.writeI32(at + 4, l)
+        }
+        out.putInt(28, membersPtr).putInt(32, info.members.size).putInt(36, invitesPtr).putInt(40, info.invites.size)
+        memory.write(retPtr, out.array())
     }
 
     // ---- kibi:device（#77、ADR 0077） ----

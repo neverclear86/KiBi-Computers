@@ -425,8 +425,14 @@ internal interface ProcessContext {
 
     // ---- 接続層との境界（#44） ----
 
-    /** マシンが動く環境（時計、乱数、ディスク、保存先）。どのスレッドから使ってもよい */
+    /** マシンが動く環境（時計、乱数、ディスク、保存先、持ち主と権限の口）。どのスレッドから使ってもよい */
     val environment: MachineEnvironment
+
+    /**
+     * [callback] を次の `tick()` 以降に、メインスレッドから、ほかの通知と起きた順に呼ぶ（`Machine.postHostCallback`。
+     * `kibi:computer/access` の依頼を接続層に届ける。#110）。待たない。結果は受け取らない。マシンを閉じると、配られずに捨てられることがある
+     */
+    fun postHostCallback(callback: Runnable)
 
     /**
      * ブロッキング型だけ（と、どちらの型でも作っている途中のとき）: [call] を次の `tick()` 以降にメインスレッドから実行し（混んでいれば後の tick。1台の件数の上限とサーバー全体の予算がある。#356）、その結果を待つ

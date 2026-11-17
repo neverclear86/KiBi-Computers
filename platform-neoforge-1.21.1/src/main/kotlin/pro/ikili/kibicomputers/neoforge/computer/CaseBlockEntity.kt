@@ -171,9 +171,19 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     // ---- 持ち主と権限（#131） ----
 
-    /** 持ち主と権限。サーバーのメインスレッドで読み書きする（クライアントでは常に [PlayerAccess.NONE]） */
+    /**
+     * 持ち主と権限。サーバーのメインスレッドで書く（クライアントでは常に [PlayerAccess.NONE]）。変わらない値なので、プロセスのスレッドも
+     * `@Volatile` で1回読めば一貫した写しになる（`kibi:computer/access` の `get-access`。[accessPort]。#110）
+     */
+    @Volatile
     internal var playerAccess: PlayerAccess = PlayerAccess.NONE
         private set
+
+    /**
+     * `kibi:computer/access` の口（#110、ADR 0110）。BE が生きている間、同じインスタンスをマシンの環境に渡す（作り直したマシンにも。
+     * 承認待ちの枠が再起動をまたいで続く）。保存しない
+     */
+    internal val accessPort: CaseAccessPort = CaseAccessPort(this)
 
     /** 読めなかった `PlayerAccess` の生のタグ（[playerAccess] が locked のときだけ。そのまま書き戻す） */
     private var rawPlayerAccess: Tag? = null
@@ -312,7 +322,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (!computer.isRestorePending || isRemoved) return
         val config = MachineSpecs.configOf(tier, parts.tiers)
         val disks = prepareDisks()
-        val environment = MachineEnvironment.builder().disks(disks.snapshot).build()
+        val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
         val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
         val store = WorldMachineSaves.current
         // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
@@ -489,11 +499,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = MachineSpecs.configOf(tier, parts.tiers)
-        var environment = MachineEnvironment.DEFAULT
+        var environment = MachineEnvironment.builder().access(accessPort).build()
         var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             val disks = prepareDisks()
-            environment = MachineEnvironment.builder().disks(disks.snapshot).build()
+            environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
             boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
         }
         val status = computer.pressPowerButton(

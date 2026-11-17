@@ -34,7 +34,7 @@ p2・p3 と Component Model は、カーネルの同じ土台（fd、イベン�
 | [kibi:process](./kibi-process.md) | プロセスの生成・待機・シグナル、作業ディレクトリ、プロセスの一覧 |
 | [kibi:io](./kibi-io.md) | fd の複製、パイプ、TTY |
 | [kibi:device](./kibi-device.md) | デバイスの一覧と呼び出し |
-| [kibi:computer](./kibi-computer.md) | 残りの RAM、起動からの経過とゲーム内時間、電源 |
+| [kibi:computer](./kibi-computer.md) | 残りの RAM、起動からの経過とゲーム内時間、電源、プレイヤーの権限の確認と依頼 |
 | [kibi:fs](./kibi-fs.md) | ディスクのマウント、マウントとディスクの一覧 |
 | [p2・p3 の予定](./p2-p3.md) | p2・p3 と Component Model の今の状況と予定、`kibi:*` の p2 の interface と仮置きの p3 の interface |
 

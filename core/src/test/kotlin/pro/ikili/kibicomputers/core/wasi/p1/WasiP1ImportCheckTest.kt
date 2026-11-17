@@ -286,6 +286,23 @@ class WasiP1ImportCheckTest {
     }
 
     @Test
+    fun `kibi_computer_accessのget-accessはcabi_reallocが要り、request-だけなら要らず、どれも待たない`() {
+        val a = WasiP1Kibi.ACCESS
+        val get = Triple(a, "get-access", listOf(I32) to emptyList<Int>())
+        val requests = listOf("request-add", "request-remove", "request-transfer").map { Triple(a, it, List(3) { I32 } to emptyList<Int>()) }
+        assertDoesNotThrow { WasiP1.checkImports(load(command(*requests.toTypedArray()))) }
+        assertDoesNotThrow { WasiP1.checkImports(load(commandWithRealloc(listOf(I32, I32, I32, I32), listOf(I32), get, *requests.toTypedArray()))) }
+        assertNoexec(load(command(get)), WasiP1Kibi.REALLOC)
+        for (fn in requests + get) {
+            assertEquals(fn === get, WasiP1Kibi.needsRealloc(fn.first, fn.second), fn.second)
+            assertFalse("${fn.first}.${fn.second}" in WasiP1.WAIT_IMPORTS, fn.second)
+        }
+        assertNoexec(load(command(Triple(a, "request-add", List(2) { I32 } to emptyList()))), "型が違う")
+        assertNoexec(load(command(Triple("kibi:computer/access@0.2.0", "request-add", List(3) { I32 } to emptyList()))), "版が違う")
+        assertNoexec(load(command(Triple(a, "add-player", List(3) { I32 } to emptyList()))), "許可していない")
+    }
+
+    @Test
     fun `kibi_computer_powerは型が一致するときだけ通り、版違い・版なし・表にない関数は断る`() {
         val shutdown = Triple(WasiP1Kibi.POWER, "shutdown", emptyList<Int>() to emptyList<Int>())
         val reboot = Triple(WasiP1Kibi.POWER, "reboot", listOf(I32) to emptyList<Int>())

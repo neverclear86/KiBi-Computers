@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.access.AccessPort
 import java.nio.file.Path
 import java.security.SecureRandom
 
@@ -167,12 +168,19 @@ public class MachineEnvironment private constructor(builder: Builder) {
      */
     public val storageDirectory: Path? = builder.storageDirectory
 
+    /**
+     * 持ち主と権限の口（`kibi:computer/access`。#110、ADR 0110）。`null` なら、`get-access`・`request-*` は `not-supported`
+     * （持ち主と権限を持たない環境: 1.20.1・テスト・ワールドのない環境）。接続層はケースごとに同じインスタンスを渡し続ける
+     */
+    public val access: AccessPort? = builder.access
+
     /** [MachineEnvironment] を組み立てる。 */
     public class Builder internal constructor() {
         internal var clock: MachineClock = MachineClock.SYSTEM
         internal var entropy: EntropySource = EntropySource.SECURE
         internal var disks: DiskSnapshot = DiskSnapshot.EMPTY
         internal var storageDirectory: Path? = null
+        internal var access: AccessPort? = null
 
         /** 時計（既定は [MachineClock.SYSTEM]） */
         public fun clock(value: MachineClock): Builder = apply { clock = value }
@@ -186,12 +194,15 @@ public class MachineEnvironment private constructor(builder: Builder) {
         /** 保存先のディレクトリ（既定は `null` = 保存しない） */
         public fun storageDirectory(value: Path?): Builder = apply { storageDirectory = value }
 
+        /** 持ち主と権限の口（既定は `null` = `kibi:computer/access` は `not-supported`。#110） */
+        public fun access(value: AccessPort?): Builder = apply { access = value }
+
         /** 環境を作る。 */
         public fun build(): MachineEnvironment = MachineEnvironment(this)
     }
 
     public companion object {
-        /** 既定の環境（JVM の時計、[SecureRandom]、ディスクなし、保存しない） */
+        /** 既定の環境（JVM の時計、[SecureRandom]、ディスクなし、保存しない、持ち主と権限の口なし） */
         @JvmField
         public val DEFAULT: MachineEnvironment = Builder().build()
 

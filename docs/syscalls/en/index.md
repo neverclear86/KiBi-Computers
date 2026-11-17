@@ -34,7 +34,7 @@ p2, p3, and the Component Model are thin layers over the same kernel foundation 
 | [kibi:process](./kibi-process.md) | Spawning, waiting for, and signalling processes; the working directory; the process list |
 | [kibi:io](./kibi-io.md) | Duplicating file descriptors, pipes, the TTY |
 | [kibi:device](./kibi-device.md) | Listing and calling devices |
-| [kibi:computer](./kibi-computer.md) | Remaining RAM, uptime and in-game time, power |
+| [kibi:computer](./kibi-computer.md) | Remaining RAM, uptime and in-game time, power, checking and requesting player access |
 | [kibi:fs](./kibi-fs.md) | Mounting disks, listing mounts and disks |
 | [p2 and p3 plans](./p2-p3.md) | Current status and plans for p2, p3, and the Component Model; the p2 interfaces of `kibi:*` and the provisional p3 ones |
 

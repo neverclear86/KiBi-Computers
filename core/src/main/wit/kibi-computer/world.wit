@@ -5,10 +5,12 @@ world imports {
     import memory;
     import clock;
     import power;
+    import access;
 }
 
 /// p2 のゲスト向け（#685。ADR 0685）。memory は p2 では出さない（commit が線形メモリの番地を受けるため。p2/p3 での形は #777 で決める）
 world imports-p2 {
     import clock;
     import power;
+    import access;
 }

@@ -1,5 +1,15 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
+import pro.ikili.kibicomputers.core.access.AccessPort
+import pro.ikili.kibicomputers.core.access.AccessRequest
+import pro.ikili.kibicomputers.core.access.AccessRequestLimiter
+import pro.ikili.kibicomputers.core.access.AccessRequestRules
+import pro.ikili.kibicomputers.core.access.AccessRules
+import pro.ikili.kibicomputers.core.access.AccessView
+import pro.ikili.kibicomputers.core.access.PlayerAccess
+import pro.ikili.kibicomputers.core.access.PlayerRef
+import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
+import java.util.UUID
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -391,6 +401,45 @@ class KibiP2BehaviourTest {
                 assertEquals(name(Errno.NOTSUP), errName(ctx.call("kibi:computer/power", "reboot")))
                 assertTrue(ctx.call("kibi:io/tty", "is-tty", CanonValue.I32(0)) == CanonValue.Bool(false))
             }
+        }
+    }
+
+    @Test
+    fun `accessは口がなければnot-supportedで、あればaccess-infoを返し、依頼を受け付ける`() = timeout(limit) {
+        Harness().use { h ->
+            scenario(h, machine(h)) { ctx ->
+                assertEquals(name(Errno.NOTSUP), errName(ctx.call("kibi:computer/access", "get-access")))
+                assertEquals(name(Errno.NOTSUP), errName(ctx.call("kibi:computer/access", "request-add", CanonValue.str("Alex"))))
+            }
+            val alex = PlayerRef(UUID.fromString("00000000-0000-0000-0000-00000000000a"), "Alex")
+            val delivered = java.util.concurrent.CopyOnWriteArrayList<AccessRequest>()
+            val port = object : AccessPort {
+                override val limiter = AccessRequestLimiter()
+
+                override fun view() = AccessView(PlayerAccess.ownedBy(alex).addPending("Bob", System.currentTimeMillis(), AccessRules.DEFAULT).access, AccessRules.DEFAULT)
+
+                override fun requestRules() = AccessRequestRules(60_000, 1)
+
+                override fun deliver(request: AccessRequest) {
+                    delivered += request
+                }
+            }
+            val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().access(port).build())
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            scenario(h, m) { ctx ->
+                val info = ok(ctx.call("kibi:computer/access", "get-access")) as CanonValue.Fields
+                assertEquals(CanonValue.Case(1, null), info.fields[0])
+                assertEquals(CanonValue.some(CanonValue.Fields(listOf(CanonValue.str("Alex"), CanonValue.str(alex.id.toString())))), info.fields[1])
+                assertEquals(CanonValue.Items(emptyList()), info.fields[2])
+                assertEquals(CanonValue.Items(listOf(CanonValue.str("bob"))), info.fields[3])
+                assertEquals(name(Errno.INVAL), errName(ctx.call("kibi:computer/access", "request-add", CanonValue.str("x".repeat(65)))))
+                assertEquals(name(Errno.INVAL), errName(ctx.call("kibi:computer/access", "request-remove", CanonValue.str("1-2-3-4-5"))))
+                ok(ctx.call("kibi:computer/access", "request-transfer", CanonValue.str("Steve")))
+                ok(ctx.call("kibi:computer/access", "request-transfer", CanonValue.str("steve")))
+                assertEquals(name(Errno.AGAIN), errName(ctx.call("kibi:computer/access", "request-add", CanonValue.str("Carl"))))
+            }
+            repeat(3) { h.scheduler.tick() }
+            assertEquals(listOf("Steve"), delivered.map { it.argument })
         }
     }
 

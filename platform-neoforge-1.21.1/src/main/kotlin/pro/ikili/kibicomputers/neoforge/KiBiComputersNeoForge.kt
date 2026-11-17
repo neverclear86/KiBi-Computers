@@ -4,7 +4,9 @@ import com.mojang.logging.LogUtils
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.neoforge.client.KiBiClient
+import pro.ikili.kibicomputers.neoforge.computer.AccessRequests
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
+import pro.ikili.kibicomputers.neoforge.command.KiBiCommands
 import pro.ikili.kibicomputers.neoforge.computer.DeviceAttachments
 import pro.ikili.kibicomputers.neoforge.computer.DeviceWiring
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
@@ -50,6 +52,8 @@ object KiBiComputersNeoForge {
         WorldDisks.register()
         WorldMachineSaves.register()
         CaseAccess.register()
+        AccessRequests.register()
+        KiBiCommands.register()
         // クライアントのクラスは、クライアントでだけ読み込む
         if (FMLEnvironment.dist.isClient) KiBiClient.register(container, MOD_BUS)
         startDevDriver()

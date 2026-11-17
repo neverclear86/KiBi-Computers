@@ -455,7 +455,7 @@ class StandardOsRestoreTest {
         }
         // 名前を並べた検査ではないが、取り違え（import がなくなった・増えた）に気づけるよう、今の集合も確かめる
         // /bin/lua は C の lua.wasm（#94 の peripheral・os が `cabi_realloc` を export する。osReallocPrograms ではない）
-        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua"), realloc)
+        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua", "/bin/access"), realloc)
         assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }
