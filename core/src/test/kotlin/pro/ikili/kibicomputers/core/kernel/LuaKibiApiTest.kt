@@ -183,15 +183,16 @@ class LuaKibiApiTest {
         }
 
         /**
-         * [finish] と同じだが、メインスレッドのメソッドが列にある間は、プロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める。
-         * start と直後の take の間に tick が入ってメソッドが終わり、コルーチンが task_complete を yield せずに値を返すことがないようにする
-         * （Lua が動いている間は列の呼び出しを実行しないので、メインスレッドのメソッドは必ず yield する）
+         * [finish] と同じだが、プロセスが待っている（イベント・接続層・燃料）ときだけ tick を進める（1 tick に実行する呼び出しは
+         * `maxHostCallsPerTick = 1` で 1 件にする）。start と直後の take の間に tick が入ってメソッドが終わり、コルーチンが
+         * task_complete を yield せずに値を返すことがないようにする（Lua が動いている間は tick を進めないので、メインスレッドの
+         * メソッドは必ず yield する）
          */
         fun finishTickingWhileWaiting(expected: ProcessState = ProcessState.EXITED): String {
             eventually(60_000, "終わらない: $text") {
                 val state = m.stateOf(pid)
                 val waiting = state == ProcessState.WAITING_EVENT || state == ProcessState.WAITING_HOST || state == ProcessState.WAITING_FUEL
-                if (m.pendingHostCalls == 0 || waiting) h.scheduler.tick()
+                if (waiting || m.fuelWaiterCount > 0) h.scheduler.tick()
                 Thread.sleep(1)
                 drain()
                 m.stateOf(pid).isTerminal
@@ -228,7 +229,7 @@ class LuaKibiApiTest {
     private fun run(script: String): String = Run(script).use { it.finish() }
 
     /** [run] と同じだが、メインスレッドのメソッドが start の直後に終わらないように tick を進める（[Run.finishTickingWhileWaiting]） */
-    private fun runYielding(script: String): String = Run(script).use { it.finishTickingWhileWaiting() }
+    private fun runYielding(script: String): String = Run(script, maxHostCallsPerTick = 1).use { it.finishTickingWhileWaiting() }
 
     @Test
     fun `peripheralで列挙して種類とメソッドを読み、callで呼べる`() = timeout(limit) {
