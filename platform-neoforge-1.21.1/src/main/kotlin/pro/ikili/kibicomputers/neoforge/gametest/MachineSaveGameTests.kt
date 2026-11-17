@@ -6,6 +6,7 @@ import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
+import net.minecraft.server.level.ChunkHolder
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.ChunkPos
@@ -292,9 +293,11 @@ object MachineSaveGameTests {
             val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
             chunk.isUnsaved = false
             var changes = -1
+            var holder: ChunkHolder? = null
             val stopped = stoppingAfterCapture(helper, be, afterStop = {
-                // 取り出しの間に付いた印を外し、そろえが付けるかを見る
+                // 取り出しの間に付いた印（とバニラの保存が下ろしたフラグ）を外し、そろえが付けるかを見る
                 chunk.isUnsaved = false
+                holder = lowerHolderFlag(helper, chunk)
                 changes = be.setChangedCalls
             }) {
                 ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
@@ -306,6 +309,7 @@ object MachineSaveGameTests {
             helper.assertTrue(be.computer.status == ComputerStatus.OFF, "the case should show OFF but was ${be.computer}")
             helper.assertTrue(be.setChangedCalls == changes, "the settle should not call setChanged on the unload path")
             helper.assertTrue(chunk.isUnsaved, "the settle after the capture should mark the chunk unsaved")
+            helper.assertTrue(holder!!.wasAccessibleSinceLastSave(), "the settle after the capture should raise the holder flag so that the vanilla save writes the chunk")
             val tag = be.saveWithoutMetadata(helper.level.registryAccess())
             helper.assertTrue(!tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG), "the NBT should say powered off: $tag")
         }.thenExecuteAfter(3) {
@@ -781,6 +785,71 @@ object MachineSaveGameTests {
     }
 
     /**
+     * [chunk] を最新に持つ `ChunkHolder` の保存のフラグ（`wasAccessibleSinceLastSave`）を下ろして返す（#761）。
+     * FULL でなくなった holder のフラグは、バニラの急ぎの保存が一度試すと偽になる。その状態を作り、
+     * 未保存の印を付ける経路が立て直すかを見る
+     */
+    private fun lowerHolderFlag(helper: GameTestHelper, chunk: LevelChunk): ChunkHolder {
+        val holder = helper.level.chunkSource.chunkMap.getVisibleChunkIfPresent(chunk.pos.toLong())
+        helper.assertTrue(holder != null && holder.latestChunk === chunk, "the chunk should be the latest chunk of its holder")
+        holder!!.wasAccessibleSinceLastSave = false
+        helper.assertTrue(!holder.wasAccessibleSinceLastSave(), "the holder flag should be lowered")
+        return holder
+    }
+
+    /**
+     * FULL でなくなったチャンクの止まった台（取り出す前のそろえ。`saveForUnload(adopt = false)`）は、電源を切ってチャンクに印を付けるとき、
+     * holder の保存のフラグも立て直す（#761）。バニラの急ぎの保存がフラグを下ろした後でも、`PoweredOn=false` がディスクに行く
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun demotionSettleOfAStoppedMachineRaisesTheHolderFlag(helper: GameTestHelper) {
+        stopOnChunkThatJustLeftFull(helper, chunkOffsetZ = 480, stopFirst = true) { be, latest, _ ->
+            helper.assertTrue(be.computer.poweredOn, "the case should still be powered before the notification")
+            val holder = lowerHolderFlag(helper, latest)
+            ServerMachines.saveForUnload(latest, listOf(be), adopt = false)
+            helper.assertTrue(!be.computer.poweredOn && be.computer.machine == null, "the save should power the case off but was ${be.computer}")
+            helper.assertTrue(latest.isUnsaved, "the save should mark the chunk unsaved")
+            helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the settle before the capture should raise the holder flag")
+            true
+        }
+    }
+
+    /**
+     * 停止の手順で取り出し済みの台（`isCaptured`）で、チャンクの NBT が古い世代を指すとき、`saveForUnload(adopt = false)` は
+     * チャンクの印と holder の保存のフラグを立て直す（#761）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun demotionOfACapturedMachineRaisesTheHolderFlag(helper: GameTestHelper) {
+        val be = placeRunning(helper, CASE)
+        val machine = be.computer.machine!!
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(machine.state == MachineState.RUNNING && !machine.isBooting, "the machine should boot but was ${machine.state}")
+        }.thenExecute {
+            try {
+                // 取り出す（止めたまま）。書けた後の印は processCompletions が付けるので、チャンクにはまだ書いていない（NBT は古い世代のまま）
+                helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = true) == 1, "the stop should save the case")
+                helper.assertTrue(be.computer.isCaptured && be.computer.machine != null, "the case should be captured but was ${be.computer}")
+                val chunk = helper.level.getChunkAt(helper.absolutePos(CASE))
+                val id = be.identity!!
+                helper.assertTrue(
+                    WorldMachineSaves.current!!.chunkGeneration(id.id).let { !it.isPresent || it.asLong != id.generation },
+                    "the chunk mark should not follow the written generation yet",
+                )
+                chunk.isUnsaved = false
+                val holder = lowerHolderFlag(helper, chunk)
+                ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
+                helper.assertTrue(chunk.isUnsaved, "the save should mark the chunk unsaved")
+                helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the save should raise the holder flag for a captured machine")
+            } finally {
+                be.computer.endQuiesce()
+            }
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
      * チャンクの holder が見えないケース（アンロード待ち。`visibleChunkMap` から消えて、アンロードの仕事がまだ走っていない）は、
      * `markChunkUnsaved` では印を付けられない。覚えておいて、続くアンロード（`saveForUnload`）がそのチャンクに `isUnsaved` を付ける（#653）
      */
@@ -799,8 +868,10 @@ object MachineSaveGameTests {
         // アンロードの手順が、そのチャンクに印を付けて忘れる
         val chunk = level.getChunkAt(helper.absolutePos(CASE))
         chunk.isUnsaved = false
+        val holder = lowerHolderFlag(helper, chunk)
         ServerMachines.saveForUnload(chunk, listOf(be), adopt = false)
         helper.assertTrue(chunk.isUnsaved, "the unload should mark the chunk unsaved")
+        helper.assertTrue(holder.wasAccessibleSinceLastSave(), "the unload should raise the holder flag so that the vanilla save writes the chunk")
         helper.assertTrue(be !in ServerMachines.unmarkedCases, "the unload should forget the case")
         helper.succeed()
     }
