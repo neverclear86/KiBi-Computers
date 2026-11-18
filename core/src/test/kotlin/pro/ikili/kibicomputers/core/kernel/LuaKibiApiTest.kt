@@ -1289,20 +1289,38 @@ class LuaKibiApiTest {
     }
 
     /**
-     * 写す間の __gc から呼ぶ、入れ子の peripheral.call（#756）。直接のメソッド echo に [nsize] + k 文字の文字列を渡し、
-     * 成功なら値が合うか、失敗なら「写している途中」のエラーかを数える（nbad・refused）。__gc のたびに次の __gc を持つごみを作り、
-     * 連鎖は 3,000 回で止める。__gc は結果と同じくらいの大きさの文字列も作り、戻された場所を使い回させる
+     * 写す間の __gc から呼ぶ、入れ子の peripheral の関数（#756）。call（直接のメソッド echo に [nsize] + k 文字の文字列を渡す）と、
+     * open_device を通る isPresent・wrap・getMethods、push_device_list を通る getNames・find を順に呼び、
+     * 成功なら値が合うか、失敗なら「写している途中」のエラーかを数える（nbad・refused）。どの関数が拒否されたかは byOp に数える。
+     * __gc のたびに次の __gc を持つごみを作り、連鎖は 3,000 回で止める。__gc は結果と同じくらいの大きさの文字列も作り、戻された場所を使い回させる
      */
     private fun nestedCallPrelude(nsize: Int) = """
         local addr, call, pc = "$ADDRESS", peripheral.call, pcall
         local hits, junk, refused, nbad = 0, {}, 0, 0
+        local byOp = {}
+        local ops = {
+            function(k)
+                local s = string.rep("Z", $nsize + k)
+                return s, call(addr, "echo", s)
+            end,
+            function() local n = peripheral.getNames(); return #n == 1 and n[1] == addr end,
+            function() local r = { peripheral.find("test:dev") }; return #r == 1 and type(r[1]) == "table" end,
+            function() return peripheral.isPresent(addr) end,
+            function() return type(peripheral.wrap(addr)) == "table" end,
+            function() return #peripheral.getMethods(addr) == 14 end,
+        }
         local function nested(k)
-            local s = string.rep("Z", $nsize + k)
-            local ok, v = pc(call, addr, "echo", s)
+            local op = k % #ops + 1
+            local ok, a, b = pc(ops[op], k)
             if ok then
-                if v ~= s then nbad = nbad + 1 end
-            elseif tostring(v):find("cannot call a peripheral while a result is being copied", 1, true) then
+                if op == 1 then
+                    if a ~= b then nbad = nbad + 1 end
+                elseif a ~= true then
+                    nbad = nbad + 1
+                end
+            elseif tostring(a):find("cannot call a peripheral while a result is being copied", 1, true) then
                 refused = refused + 1
+                byOp[op] = (byOp[op] or 0) + 1
             else
                 nbad = nbad + 1
             end
@@ -1311,7 +1329,7 @@ class LuaKibiApiTest {
         mt.__gc = function()
             hits = hits + 1
             for k = 1, 8 do junk[k] = string.rep("Y", $nsize + k) end
-            nested(hits % 8)
+            nested(hits)
             if hits < 3000 then setmetatable({}, mt) end
         end
         for i = 1, 16 do setmetatable({}, mt) end
