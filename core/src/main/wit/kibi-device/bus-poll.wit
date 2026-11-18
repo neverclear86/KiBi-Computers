@@ -1,7 +1,7 @@
 package kibi:device@0.1.0;
 
 /// p2 で、待たずに積んだ呼び出しの終わりを待つ（#77。ADR 0077）。p1 では使わない（p1 では pending-call の fd を poll_oneoff で待つ）。
-/// #685 で実装（ABI は確認待ち）（ADR 0685）。pollable は呼び出しの子で、子の pollable が残る pending-call を捨てるとトラップ。
+/// #685 で実装（ADR 0685）。pollable は呼び出しの子で、子の pollable が残る pending-call を捨てるとトラップ。
 interface bus-poll {
     use wasi:io/poll@0.2.12.{pollable};
     use bus.{pending-call};

@@ -1,6 +1,6 @@
 package kibi:kernel@0.1.0;
 
-/// p2 でイベントキューを待つ（ADR 0426。#685 で実装（ABI は確認待ち）、ADR 0685）。pollable はキューの子で、子の pollable が残るキューを捨てるとトラップ。
+/// p2 でイベントキューを待つ（ADR 0426。#685 で実装、ADR 0685）。pollable はキューの子で、子の pollable が残るキューを捨てるとトラップ。
 interface events-poll {
     use events.{event-queue};
     use wasi:io/poll@0.2.12.{pollable};
