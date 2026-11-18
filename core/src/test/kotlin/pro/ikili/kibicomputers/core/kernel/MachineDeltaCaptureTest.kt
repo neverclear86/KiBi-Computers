@@ -18,6 +18,8 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.SnapshotInspection
@@ -81,7 +83,7 @@ class MachineDeltaCaptureTest {
             assertTrue(m.isCommitted(a.pid, id1, 1))
 
             val b = h.waiting(m, gate)
-            val delta = m.captureSnapshot(policy, base(id1, 1), 1.0)!!
+            val delta = m.captureSnapshot(policy, base(id1, 1), FullSaveRule(1.0))!!
             assertEquals(base(id1, 1), delta.deltaBase)
             assertEquals(StateCaptureMode.CHANGED, a.driver.modes.last())
             assertEquals(StateCaptureMode.FULL, b.driver.modes.last(), "基準の後に作ったプロセスは全体の形")
@@ -107,7 +109,7 @@ class MachineDeltaCaptureTest {
             // 2 回目の全体は書けなかった（committed を呼ばない）
             m.captureSnapshot(policy)!!
             assertTrue(m.base(a.pid) is MemoryBase.Pending)
-            m.captureSnapshot(policy, base(id1, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id1, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             gate.open()
             m.stop()
@@ -123,17 +125,83 @@ class MachineDeltaCaptureTest {
             m.captureSnapshot(policy)!!.committed(id1, 1)
             val instance = m.rt(a.pid).instances.first() as FakeInstance
             instance.chunkCounts = MemoryChunkCounts(10, 6)
-            val over = m.captureSnapshot(policy, base(id1, 1), 0.5)!!
+            val over = m.captureSnapshot(policy, base(id1, 1), FullSaveRule(0.5, 0))!!
             assertNull(over.deltaBase)
             assertEquals(StateCaptureMode.FULL_AND_TRACK, a.driver.modes.last())
             over.committed(id1, 2)
             instance.chunkCounts = MemoryChunkCounts(10, 5)
-            val under = m.captureSnapshot(policy, base(id1, 2), 0.5)!!
+            val under = m.captureSnapshot(policy, base(id1, 2), FullSaveRule(0.5, 0))!!
             assertEquals(base(id1, 2), under.deltaBase)
             assertEquals(StateCaptureMode.CHANGED, a.driver.modes.last())
             gate.open()
             m.stop()
         }
+    }
+
+    @Test
+    fun `比が境目を超えても、変わった区画が下限以下なら差分。下限を超えたら全体`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val a = h.waiting(m, gate)
+            m.captureSnapshot(policy)!!.committed(id1, 1)
+            val instance = m.rt(a.pid).instances.first() as FakeInstance
+            // 比は 1.0（境目 0.5 を超える）だが、変わった区画 8 は下限 8 以下
+            instance.chunkCounts = MemoryChunkCounts(8, 8)
+            val small = m.captureSnapshot(policy, base(id1, 1), FullSaveRule(0.5, 8))!!
+            assertEquals(base(id1, 1), small.deltaBase)
+            assertEquals(StateCaptureMode.CHANGED, a.driver.modes.last())
+            small.committed(id1, 2)
+            assertTrue(m.isCommitted(a.pid, id1, 1), "差分を書いても基準は進まない")
+            // 変わった区画 9 は下限 8 を超え、比も超える
+            instance.chunkCounts = MemoryChunkCounts(9, 9)
+            val large = m.captureSnapshot(policy, base(id1, 1), FullSaveRule(0.5, 8))!!
+            assertNull(large.deltaBase)
+            assertEquals(StateCaptureMode.FULL_AND_TRACK, a.driver.modes.last())
+            large.committed(id1, 3)
+            assertTrue(m.isCommitted(a.pid, id1, 3))
+            // 下限を超えても、比が境目以下なら差分
+            instance.chunkCounts = MemoryChunkCounts(20, 10)
+            val half = m.captureSnapshot(policy, base(id1, 3), FullSaveRule(0.5, 8))!!
+            assertEquals(base(id1, 3), half.deltaBase)
+            gate.open()
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `既定の規則では、小さな台の変わった区画は比によらず差分`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val a = h.waiting(m, gate)
+            m.captureSnapshot(policy)!!.committed(id1, 1)
+            val instance = m.rt(a.pid).instances.first() as FakeInstance
+            // 標準 OS の init と sh が 1 行で変える程度（30 区画のうち 16。比 0.53）
+            instance.chunkCounts = MemoryChunkCounts(30, 16)
+            assertEquals(base(id1, 1), m.captureSnapshot(policy, base(id1, 1))!!.deltaBase)
+            assertEquals(StateCaptureMode.CHANGED, a.driver.modes.last())
+            gate.open()
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `全体か差分かの規則の境目`() {
+        val rule = FullSaveRule(0.5, 4)
+        assertTrue(!rule.isFull(4, 4), "下限ちょうどは差分")
+        assertTrue(rule.isFull(5, 5))
+        assertTrue(!rule.isFull(5, 10), "比ちょうどは差分")
+        assertTrue(rule.isFull(6, 10))
+        assertTrue(!rule.isFull(0, 0), "書き換えた区画がなければ差分")
+        // 下限 0 は比だけで決める（#668 より前と同じ）
+        val ratioOnly = FullSaveRule(0.5, 0)
+        assertTrue(ratioOnly.isFull(1, 1))
+        assertTrue(!ratioOnly.isFull(0, 0))
+        assertTrue(!FullSaveRule(0.0, 0).isFull(0, 10), "変わった区画が 0 なら、境目 0 でも差分")
+        assertTrue(FullSaveRule(0.0, 0).isFull(1, 10))
+        assertTrue(!FullSaveRule(1.0, 0).isFull(10, 10), "境目 1.0 なら全体にならない")
+        assertEquals(FullSaveRule(MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO, MachineSaveConfig.DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS), MachineSaveConfig.DEFAULT.fullSaveRule)
     }
 
     @Test
@@ -154,7 +222,7 @@ class MachineDeltaCaptureTest {
             assertTrue(m.base(a.pid) is MemoryBase.None, "冷えた起動の写しは基準を進めない")
             // 次の差分の取り出しで A は全体の形
             initDriver.abiPayload = ByteArray(0)
-            m.captureSnapshot(policy, base(id1, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id1, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             gate.open()
             m.stop()
@@ -170,7 +238,7 @@ class MachineDeltaCaptureTest {
             m.captureSnapshot(policy)!!.committed(id1, 1)
             assertTrue(m.isCommitted(a.pid, id1, 1))
             // 殺さずに振り直しただけ: (id1, 1) を基準にしているが、基準は (id2, 1)
-            m.captureSnapshot(policy, base(id2, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id2, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             assertTrue(m.isCommitted(a.pid, id1, 1), "差分の写しでは基準を変えない")
 
@@ -182,7 +250,7 @@ class MachineDeltaCaptureTest {
             killed.toSource().committed(id2, 1)
             assertTrue(m.base(a.pid) is MemoryBase.None)
             a.driver.abiPayload = ByteArray(0)
-            m.captureSnapshot(policy, base(id2, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id2, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             gate.open()
             m.stop()
@@ -199,7 +267,7 @@ class MachineDeltaCaptureTest {
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             full.committed(id1, 1)
             assertTrue(m.base(a.pid) is MemoryBase.None)
-            m.captureSnapshot(policy, base(id1, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id1, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             gate.open()
             m.stop()
@@ -220,7 +288,7 @@ class MachineDeltaCaptureTest {
             replacement.tracks = true
             replacement.chunkCounts = MemoryChunkCounts(1, 1)
             val original = m.lock.withLockValue { m.rt(a.pid).instances.set(0, replacement) }
-            m.captureSnapshot(policy, base(id1, 1), 1.0)!!
+            m.captureSnapshot(policy, base(id1, 1), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.FULL, a.driver.modes.last())
             m.lock.withLockValue { m.rt(a.pid).instances.set(0, original) }
             replacement.close()
@@ -285,7 +353,7 @@ class MachineDeltaCaptureTest {
             assertTrue(m.isCommitted(pid, id, 1))
             val base = stored(baseBytes)
 
-            val delta = m.captureCopy(policy, base.asDeltaBase(), 1.0)!!
+            val delta = m.captureCopy(policy, base.asDeltaBase(), FullSaveRule(1.0))!!
             assertEquals(StateCaptureMode.CHANGED, driver.modes.last())
             assertEquals(emptyList<Int>(), delta.killedPids, "差分の写しの中で殺さない")
             val snapshot = delta.toSource().build(id, 2, "test")

@@ -7,7 +7,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
-import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
 
@@ -97,11 +97,11 @@ public class MachineSlot<K : Any> {
     public fun capture(
         policy: CapturePolicy,
         deltaBase: DeltaBase? = null,
-        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+        fullSaveRule: FullSaveRule = FullSaveRule.DEFAULT,
     ): MachineSnapshotSource? {
         val manager = manager ?: return null
         val key = key ?: return null
-        return manager.capture(key, policy, deltaBase, fullSaveChangedRatio)
+        return manager.capture(key, policy, deltaBase, fullSaveRule)
     }
 
     /** 全体の写しを取り直す（[MachineManager.recapture]。#83）。マシンがなければ `null` */

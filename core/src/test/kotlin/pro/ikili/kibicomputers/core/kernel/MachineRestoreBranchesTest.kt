@@ -36,6 +36,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
@@ -182,7 +183,7 @@ class MachineRestoreBranchesTest {
     private fun capture(m: Machine, deltaBase: pro.ikili.kibicomputers.core.persist.DeltaBase? = null): MachineSnapshotSource {
         var source: MachineSnapshotSource? = null
         eventually(10_000, "写しが取れない") {
-            source = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, 1.0)
+            source = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, FullSaveRule(1.0))
             source != null
         }
         return source!!
