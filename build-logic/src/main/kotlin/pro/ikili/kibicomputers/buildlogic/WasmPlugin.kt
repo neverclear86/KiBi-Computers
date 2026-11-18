@@ -111,6 +111,42 @@ abstract class WasmExtension @Inject constructor(private val project: Project) {
         return task
     }
 
+    private val wasiSdk: WasiSdkDistribution by lazy {
+        WasiSdkDistribution.load(project.rootDir.resolve("gradle/wasi-sdk.properties"))
+    }
+
+    /**
+     * C のソースを wasi-sdk の clang でネイティブのツールチェーンのコンポーネント（[WasiSdkCcWasm.target] の既定は `wasm32-wasip2`）にする
+     * タスク `compile<Name>Wasm`（[WasiSdkCcWasm]）を登録し、`<resourceDir>/<name>.wasm` に出力して [sourceSet] のリソースに加える（#775）。
+     *
+     * wasi-sdk の版とハッシュはルートの `gradle/wasi-sdk.properties` で固定し、取得したものは `<Gradle ホーム>/kibicomputers/wasi-sdk/` に置く
+     * （CI はここをキャッシュする）。
+     */
+    @JvmOverloads
+    fun wasiSdkModule(
+        name: String,
+        sourceSet: String = "test",
+        resourceDir: String = "kibicomputers/wasm-native",
+        action: Action<WasiSdkCcWasm>,
+    ): TaskProvider<WasiSdkCcWasm> {
+        val gradleHome = project.gradle.gradleUserHomeDir.resolve("kibicomputers")
+        val task = project.tasks.register(taskName("compile", name, "Wasm"), WasiSdkCcWasm::class.java) {
+            group = "build"
+            description = "Compiles the $name WASM component with the wasi-sdk clang."
+            wasiSdkDistribution.set(project.provider { wasiSdk })
+            wasiSdkVersion.set(project.provider { wasiSdk.version })
+            toolchainsDir.set(gradleHome)
+            target.convention("wasm32-wasip2")
+            outputPath.convention("$resourceDir/$name.wasm")
+            outputDir.convention(project.layout.buildDirectory.dir("generated/wasi-sdk/$name"))
+            action.execute(this)
+        }
+        project.extensions.getByType(SourceSetContainer::class.java).named(sourceSet) {
+            resources.srcDir(task)
+        }
+        return task
+    }
+
     /**
      * MoonBit のモジュールを `moon build --target wasm` でビルドするタスク `compile<Name>MoonBit`（[MoonBuildWasm]）を登録し、
      * その出力を [sourceSet] のリソースに加える（#32）。出力するパッケージは [MoonBuildWasm.packages] で指定する。

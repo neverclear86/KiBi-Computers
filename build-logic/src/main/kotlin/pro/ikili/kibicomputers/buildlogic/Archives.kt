@@ -93,21 +93,26 @@ internal object Archives {
         extractTar(XZInputStream(BufferedInputStream(Files.newInputStream(archive))), dir)
     }
 
-    /** .tar.gz を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。 */
-    fun extractTarGz(archive: Path, dir: Path, stripFirst: Boolean = true) {
-        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir, stripFirst)
+    /**
+     * .tar.gz を、先頭のディレクトリを取り除いて（[stripFirst] が `false` ならそのまま）[dir] に展開する。
+     * [include] が `false` を返すもの（先頭を取り除いた相対パスで判定する）は展開しない。
+     */
+    fun extractTarGz(archive: Path, dir: Path, stripFirst: Boolean = true, include: (String) -> Boolean = { true }) {
+        extractTar(GZIPInputStream(BufferedInputStream(Files.newInputStream(archive))), dir, stripFirst, include)
     }
 
-    private fun extractTar(input: InputStream, dir: Path, stripFirst: Boolean = true) {
+    private fun extractTar(input: InputStream, dir: Path, stripFirst: Boolean = true, include: (String) -> Boolean = { true }) {
         TarArchiveInputStream(input).use { tar ->
             while (true) {
                 val entry = tar.nextEntry ?: break
                 val relative = relativeName(entry.name, stripFirst) ?: continue
+                if (!include(relative)) continue
                 val path = resolveInside(dir, relative)
                 when {
                     entry.isDirectory -> Files.createDirectories(path)
                     entry.isSymbolicLink -> {
                         Files.createDirectories(path.parent)
+                        Files.deleteIfExists(path)
                         Files.createSymbolicLink(path, Path.of(entry.linkName))
                     }
                     entry.isFile -> {
