@@ -70,6 +70,8 @@ kibiWasm.module("lua_host") {
         // ここまで core と同じ。以下は reactor 用
         "-mexec-model=reactor",
         "-Wl,--export=poc_alloc,--export=poc_load,--export=poc_resume",
+        // キー待ちの間の端末のモード（#798。core の kibi_lua_tty.c）は入れないので、io.read の前の差し替えを外す
+        "-DKIBI_LUA_NO_KEY_TTY",
     )
 }
 

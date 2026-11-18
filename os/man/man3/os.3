@@ -29,6 +29,8 @@ The program starts to receive the events of the system when it first calls `os.p
 
 `os.queueEvent` adds an event after the events that have already arrived. It reaches only this program.
 
+While the main program waits with no filter, `key` or `key_up`, and the standard input is the terminal in its default mode, the terminal does not show what is typed, and it is thrown away. The terminal goes back to normal when the program reads the standard input or ends (keys(3)).
+
 ### Coroutines
 
 Inside a coroutine, `os.pullEventRaw(filter)` does not wait by itself: it yields `filter` (which may be nil), and the values that the coroutine is resumed with are returned as the event. The code that resumes the coroutine (parallel(3), or a scheduler of your own) gets the next event and passes it on. `os.pullEvent` does the same and raises `Terminated` when it is resumed with `terminate`. In the main program (and in the interactive prompt of lua(1)), which is not a coroutine, both wait for the next event in place.
@@ -72,6 +74,7 @@ Other events of the system keep their names. When an event comes from a device, 
 - `os.queueEvent` does not reach other programs
 - `os.getComputerID`, `os.getComputerLabel`, `os.setComputerLabel`, `os.run` and `os.loadAPI` are not available
 - There are no `char` and `paste` events (keys(3))
+- While the program waits for keys, what is typed is not shown and is thrown away, until the program reads the standard input or ends (keys(3))
 
 ## SEE ALSO
 

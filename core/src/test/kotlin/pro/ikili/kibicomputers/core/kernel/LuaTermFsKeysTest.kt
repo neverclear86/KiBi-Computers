@@ -16,6 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
@@ -65,7 +66,8 @@ class LuaTermFsKeysTest {
 
     /**
      * イメージ `os` を `/` に読み取り専用で、メモリの FS を `/home`・`/tmp` に書ける形でマウントし、[script] を `lua` で動かす。
-     * コンソールは [columns] x [rows]。[setup] はマウントの後・起動の前にマシンへ足すもの（マウントを増やすなど）。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ
+     * コンソールは [columns] x [rows]。[setup] はマウントの後・起動の前にマシンへ足すもの（マウントを増やすなど）。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ。
+     * [after] は終わった後、マシンを閉じる前に呼ぶ（TTY の状態を見るなど）
      */
     private fun lua(
         script: String,
@@ -73,6 +75,7 @@ class LuaTermFsKeysTest {
         rows: Int = 5,
         setup: (Machine) -> Unit = {},
         driver: (Machine, String) -> Unit = { _, _ -> },
+        after: (Machine) -> Unit = {},
     ): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
@@ -95,6 +98,7 @@ class LuaTermFsKeysTest {
         }
         val exitCode = m.lock.withLockValue { m.kernel.processes[pid]!!.exitCode }
         repeat(5) { h.scheduler.tick() }
+        after(m)
         Result(host.bytes(), host.text(), m.stateOf(pid), exitCode)
     }
 
@@ -193,7 +197,7 @@ class LuaTermFsKeysTest {
                 }
             },
         ).assertOk()
-        // コンソールの TTY は打ったキー（Esc・Enter・Tab など）をエコーするので、行の頭ではなく形で拾う
+        // キー待ちの間の TTY はエコーしない（#798）が、待っていない間に届いたキーは後から出力に混ざりうるので、行の頭ではなく形で拾う
         val pressed = pressedLine.findAll(r.text).map { it.value.split(" ") }.toList()
         assertEquals(all.size, pressed.size, r.text)
         // 番号は重ならず、名前に戻る
@@ -214,6 +218,171 @@ class LuaTermFsKeysTest {
         assertEquals(listOf("false", "true"), pressed.take(2).map { it[3] })
         assertEquals(listOf("up:menu"), Regex("up:[A-Za-z0-9]+").findAll(r.text).map { it.value }.toList())
         assertFalse(r.text.contains("raw "), r.text)
+    }
+
+    // ---- キー待ちの間の TTY（#798） ----
+
+    /** キー待ちの間のモード（signals | nl-to-crnl） */
+    private val KEYS_MODE = TtyMode(0x14)
+
+    private fun Machine.consoleMode(): TtyMode = lock.withLockValue { consoleTtyLocked().mode }
+
+    /** コンソールの TTY に残っている入力（読める入力・編集中の行・待ちの列）のバイト数 */
+    private fun Machine.consoleLeftover(): Int = lock.withLockValue {
+        val t = consoleTtyLocked()
+        t.inputAvailable + t.editingLength + t.pendingInputBytes
+    }
+
+    @Test
+    fun `キー待ちの間に打ったキーはエコーされず、遅れて届いた文字も溜まらず、終わるとcookedに戻る`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        var mode: TtyMode? = null
+        var leftover = -1
+        val r = lua(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            while true do
+              local _, code = os.pullEvent('key')
+              print('k' .. code)
+              if code == keys.q then break end
+            end
+            """,
+            columns = 40,
+            rows = 10,
+            driver = { m, text ->
+                when {
+                    step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE -> {
+                        assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                        step = 1
+                    }
+                    // 英字の文字は押下の後から届く（クライアントは Text を後で送る）。Lua が key を受けた後に送る
+                    step == 1 && text.contains("k65") -> {
+                        keyboard.input(KeyboardEvent.Text("zz"))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.ESCAPE, 0, false))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.UP, 0, false))
+                        step = 2
+                    }
+                    step == 2 && text.contains("k265") -> {
+                        // 終わる前に届いた分は、終わるときに読み捨てる（押下の後に送ると、終わった後に届くことがある）
+                        keyboard.input(KeyboardEvent.Text("yy"))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.Q, 0, false))
+                        step = 3
+                    }
+                }
+            },
+            after = { m ->
+                mode = m.consoleMode()
+                leftover = m.consoleLeftover()
+            },
+        ).assertOk()
+        assertEquals(3, step, r.text)
+        assertTrue(r.text.contains("k65\nk257\nk256\nk265\nk81\n"), r.text)
+        for (s in listOf("zz", "yy", "^[", "\u001b[A")) assertFalse(r.text.contains(s), "$s がエコーされた: ${r.text}")
+        assertEquals(TtyMode.COOKED, mode)
+        assertEquals(0, leftover, "TTY に入力が残っている")
+    }
+
+    @Test
+    fun `キー待ちの後のio_readはエコーと行の編集が戻り、待つ間に打ったものは混ざらない`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        val r = lua(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.pullEvent('key')
+            print('read')
+            local line = io.read()
+            print('got[' .. tostring(line) .. ']')
+            """,
+            columns = 40,
+            rows = 10,
+            driver = { m, text ->
+                if (step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                    // 文字を先に送る（押下の後に送ると、Lua が io.read でモードを戻した後に届くことがある。ADR 0798 の「残ること」）
+                    keyboard.input(KeyboardEvent.Text("zz"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    step = 1
+                } else if (step == 1 && text.contains("\nread\n") && m.consoleMode() == TtyMode.COOKED) {
+                    // io.read がモードを戻した後に打つ
+                    keyboard.input(KeyboardEvent.Text("helo"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.BACKSPACE, 0, false))
+                    keyboard.input(KeyboardEvent.Text("lo"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                    step = 2
+                }
+            },
+        ).assertOk()
+        assertTrue(r.text.contains("got[hello]"), r.text)
+        // 打ったものはエコーされる
+        assertTrue(r.text.contains("hel"), r.text)
+        assertFalse(r.text.contains("zz"), r.text)
+    }
+
+    @Test
+    fun `キー待ちの後にerrorやos_exitで終わってもcookedに戻る`() = timeout(limit) {
+        for (end in listOf("error('boom')", "os.exit(3)")) {
+            val keyboard = KeyboardDevice()
+            var sent = false
+            var mode: TtyMode? = null
+            var leftover = -1
+            val r = lua(
+                """
+                os.queueEvent('ready')
+                os.pullEvent('ready')
+                print('ready')
+                os.pullEvent('key')
+                $end
+                """,
+                driver = { m, text ->
+                    if (!sent && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                        assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                        keyboard.input(KeyboardEvent.Text("bb"))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.B, 0, false))
+                        sent = true
+                    }
+                },
+                after = { m ->
+                    mode = m.consoleMode()
+                    leftover = m.consoleLeftover()
+                },
+            )
+            assertEquals(ProcessState.EXITED, r.state, r.text)
+            assertFalse(r.text.contains("bb"), r.text)
+            assertEquals(TtyMode.COOKED, mode, end)
+            assertEquals(0, leftover, end)
+        }
+    }
+
+    @Test
+    fun `timerだけを待つときはモードを変えず、打ったものは先打ちとして残る`() = timeout(limit) {
+        var sent = false
+        var modeWhileWaiting: TtyMode? = null
+        var leftover = -1
+        lua(
+            """
+            os.startTimer(0.5)
+            print('ready')
+            os.pullEvent('timer')
+            """,
+            driver = { m, text ->
+                if (!sent && text.contains("ready")) {
+                    modeWhileWaiting = m.consoleMode()
+                    m.offerConsoleInput("ab".toByteArray())
+                    sent = true
+                }
+            },
+            after = { m -> leftover = m.consoleLeftover() },
+        ).assertOk()
+        assertEquals(TtyMode.COOKED, modeWhileWaiting)
+        assertEquals(2, leftover)
     }
 
     // ---- term ----

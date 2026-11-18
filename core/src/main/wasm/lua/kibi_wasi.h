@@ -19,12 +19,28 @@
  * 対話型の REPL（lua.c の doREPL。#96）。
  * - 引数なしで起動したとき、標準入力が端末なら REPL、そうでなければ標準入力をスクリプトとして読む。
  *   端末かどうかは wasi-libc の isatty（fd_fdstat_get の種類が CHARACTER_DEVICE）で見る
- * - 行編集と履歴はカーネルの TTY（canonical モード）が受け持つので、lua_readline は標準の fgets のまま
+ * - 行編集と履歴はカーネルの TTY（canonical モード）が受け持つので、lua_readline は標準の fgets で読む。
+ *   読む前に、キー待ちで切った端末のモードを戻す（#798。kibi_lua_tty.c。切っていなければ何もしない）
  * - 1行の上限は TTY の1行の上限（4095 バイト＋改行）にそろえる
  */
 int isatty(int fd);
 #define lua_stdin_is_tty() isatty(0)
 #define LUA_MAXINPUT 4097
+void kibi_lua_tty_restore(void);
+#define lua_initreadline(L) ((void)L)
+#define lua_readline(L, b, p)     ((void)L, kibi_lua_tty_restore(), fputs(p, stdout), fflush(stdout), fgets(b, LUA_MAXINPUT, stdin) != NULL)
+#define lua_saveline(L, line) { (void)L; (void)line; }
+#define lua_freeline(L, b) { (void)L; (void)b; }
+
+/*
+ * io.read・io.lines・file:read はどれも liolib.c の g_read を通り、その先頭で clearerr(f) を呼ぶ。
+ * そこで、標準入力なら、キー待ちで切った端末のモードを戻してから読ませる（#798。kibi_lua_tty.c）。
+ * stdio.h の clearerr の宣言もこのマクロで kibi_lua_before_read の宣言になる。
+ * kibi_lua_tty.c を入れないビルド（poc/wait-point-save）は KIBI_LUA_NO_KEY_TTY を定義して外す
+ */
+#ifndef KIBI_LUA_NO_KEY_TTY
+#define clearerr(f) kibi_lua_before_read(f)
+#endif
 
 /*
  * io.popen は LUA_USE_POSIX を定義しないので、Lua 標準の "'popen' not supported" になる。

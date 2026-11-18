@@ -33,7 +33,7 @@ The names are those of CC: Tweaked, for example `leftCtrl`, `rightShift`, `numPa
 - `keys.escape` (256), `keys.world1` (161), `keys.world2` (162) and `keys.rightSuper` (347) are added. A key that is not in the table does not give an event
 - A `key_up` may arrive without a `key` before it, and a `key` may have no `key_up` (for example after the world is loaded). After a `restored` event, treat all keys as released
 - The events do not tell which keyboard was used. Events of other devices with the names `key-pressed` and `key-released` and the same values are also given as `key` and `key_up`
-- The terminal still gets what is typed. While the program waits for `key`, the keys that make text (letters, Enter, Esc, the arrows and so on) are also shown on the terminal, and what is left is read by the shell after the program ends
+- The terminal also gets what is typed. While the main program waits with `os.pullEvent` or `os.pullEventRaw` with no filter, `key` or `key_up`, the terminal does not show the keys that make text (letters, Enter, Esc, the arrows and so on), and what was typed is thrown away. The terminal shows and keeps what is typed again when the program reads the standard input (`io.read`, the interactive prompt) or ends. This is done only when the standard input is the terminal and its mode is the default one. When the program is stopped (for example with Ctrl+C or kill(1)), the interactive shell restores the terminal. Text that arrives just after the program has started to read or has ended may still be shown and kept
 
 ## SEE ALSO
 
