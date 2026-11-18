@@ -30,7 +30,7 @@ lua(1) には `colors` と `colours` のライブラリがあります（`requir
 - `colors.packRGB(r, g, b)` は 0〜1 の 3 つの数から `0xRRGGBB` を作り、`colors.unpackRGB(rgb)` はその逆をします（`colors.rgb8` は CC: Tweaked と同じく、どちらにもなります）
 - `colors.toBlit(colour)` は、`term.blit` で使う色の 16 進の数字（`white` は `0`、`black` は `f`）を返し、`colors.fromBlit(hex)` はその逆をします（`hex` が数字 1 つでなければ nil）
 
-RGB の既定の値は CC: Tweaked と同じです（`white` は 0xF0F0F0、`black` は 0x111111 など）。`term.setPaletteColour` で変えられます。
+RGB の既定の値は CC: Tweaked と同じです（`white` は 0xF0F0F0、`black` は 0x111111 など）。`term.setPaletteColour` で変えられます。この値のままの色は、端末の基本の色で描きます（term(3)）。
 
 ## CC: Tweaked との違い
 

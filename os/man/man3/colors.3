@@ -30,7 +30,7 @@ The 16 colours are the bits 1 (`white`) to 32768 (`black`), in the order above. 
 - `colors.packRGB(r, g, b)` makes `0xRRGGBB` from three numbers from 0 to 1, and `colors.unpackRGB(rgb)` does the opposite (`colors.rgb8` does either, as in CC: Tweaked)
 - `colors.toBlit(colour)` returns the hexadecimal digit of the colour for `term.blit` (`white` is `0`, `black` is `f`), and `colors.fromBlit(hex)` does the opposite (nil if `hex` is not one digit)
 
-The default RGB values are those of CC: Tweaked (`white` is 0xF0F0F0, `black` is 0x111111, and so on). `term.setPaletteColour` changes them.
+The default RGB values are those of CC: Tweaked (`white` is 0xF0F0F0, `black` is 0x111111, and so on). `term.setPaletteColour` changes them. The colours that keep these values are drawn with the basic colours of the terminal (term(3)).
 
 ## DIFFERENCES FROM CC: TWEAKED
 

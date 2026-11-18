@@ -9,8 +9,8 @@
  * - write・blit は、論理カーソルから画面に入る分だけを切り出し、その前に毎回カーソルの位置（CUP）と色（SGR）を書く。右端で折り返さない
  *   （CC と同じ）。端末の状態が保存から戻した後に初めの状態になっていても、次の出力で直る
  * - setCursorPos・setTextColour・setBackgroundColour・setCursorBlink は、その場でエスケープを書く（後の print にも効くように）
- * - 色は CC の 16 色のビットで受け、この中のパレットの RGB（SGR 38;2・48;2）で書く。端末がティアの色数に丸める。
- *   setPaletteColour は、その後に書く分にだけ効く（もう描いたセルの色は変わらない）
+ * - 色は CC の 16 色のビットで受ける。既定のパレットのままの色は端末の基本の 16 色で、setPaletteColour で変えた色は RGB
+ *   （SGR 38;2・48;2）で書き、端末がティアの色数に丸める。setPaletteColour は、その後に書く分にだけ効く（もう描いたセルの色は変わらない）
  * - 文字は UTF-8 で、全角は 2 セル（core の CharWidth・os/lib/kibi/text.zig と同じ表）。C0・DEL・C1 の制御文字と不正なバイト列は
  *   U+FFFD にして書く（エスケープを注入させない）
  * - 出力は 1 回の呼び出しで 1 回にまとめ、stdout（print と同じバッファ）に書いてすぐ fflush する（print との順番を保つ）
@@ -132,13 +132,32 @@ static void out_init(lua_State *L, out_t *o) {
     o->begun = 0;
 }
 
+/*
+ * 既定のパレットのままの色を書く端末の基本の 16 色の番号（[i] は 2^i の色）。色数の少ない画面（16 色）は RGB をいちばん近い基本の色に
+ * 丸めるが、CC の既定の色はくすんでいて、赤・緑・水色などが灰色に丸まる。色の名前どおりに見えるよう、既定のままの色は基本の色で書く
+ */
+static const unsigned char ANSI_OF[16] = {15, 3, 13, 12, 11, 10, 13, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+
+/* 色 [i] の SGR の引数を [s] に書く（[base] は前景 30・背景 40）。既定のままなら基本の 16 色、変えたなら RGB */
+static int sgr_colour(char *s, size_t size, int i, int base) {
+    uint32_t c = palette[i];
+    if (c == kibi_lua_default_palette[i]) {
+        int a = ANSI_OF[i];
+        return snprintf(s, size, "%d", a < 8 ? base + a : base + 60 + a - 8);
+    }
+    return snprintf(s, size, "%d;2;%u;%u;%u", base + 8, (unsigned)(c >> 16 & 0xFF), (unsigned)(c >> 8 & 0xFF), (unsigned)(c & 0xFF));
+}
+
 static void add_sgr(out_t *o, int fg, int bg) {
     ensure_palette();
-    char s[64];
-    uint32_t f = palette[fg], g = palette[bg];
-    int n = snprintf(s, sizeof s, "\x1b[38;2;%u;%u;%u;48;2;%u;%u;%um", (unsigned)(f >> 16 & 0xFF), (unsigned)(f >> 8 & 0xFF),
-                     (unsigned)(f & 0xFF), (unsigned)(g >> 16 & 0xFF), (unsigned)(g >> 8 & 0xFF), (unsigned)(g & 0xFF));
-    luaL_addlstring(&o->b, s, (size_t)n);
+    char f[24], b[24];
+    sgr_colour(f, sizeof f, fg, 30);
+    sgr_colour(b, sizeof b, bg, 40);
+    luaL_addstring(&o->b, "\x1b[");
+    luaL_addstring(&o->b, f);
+    luaL_addchar(&o->b, ';');
+    luaL_addstring(&o->b, b);
+    luaL_addchar(&o->b, 'm');
     register_cleanup();
 }
 

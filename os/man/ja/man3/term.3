@@ -41,7 +41,7 @@ lua(1) には `term` ライブラリがあります（`require("term")` でも�
 
 `term.clear` は画面全体を、`term.clearLine` はカーソルの行を、背景色で塗ります。`term.scroll(n)` は中身を `n` 行上へ（負なら下へ）ずらします。どれもカーソルは動かしません。
 
-色は colors(3) の値です。`term.setTextColour` と `term.setBackgroundColour` はすぐに効き、`print` と `io.write` の色も変わります。色は、パレットの RGB の値で描きます。`term.setPaletteColour(colour, r, g, b)`（0〜1 の数）か `term.setPaletteColour(colour, 0xRRGGBB)` で変え、`term.nativePaletteColour` で既定の値を得ます。色の少ない画面では、いちばん近い色で表示します。`term.isColour` はいつも true です。
+色は colors(3) の値です。`term.setTextColour` と `term.setBackgroundColour` はすぐに効き、`print` と `io.write` の色も変わります。16 色は、端末の基本の 16 色で描きます（`red` は赤、`lime` は明るい緑など）。16 色の画面でも色の名前どおりに見えるようにするためです。`term.setPaletteColour(colour, r, g, b)`（0〜1 の数）か `term.setPaletteColour(colour, 0xRRGGBB)` で色に RGB の値を与えると、その値で描きます（色の少ない画面では、いちばん近い色で表示します）。`term.getPaletteColour` はパレットの RGB の値を、`term.nativePaletteColour` は既定の値（CC: Tweaked と同じ）を返します。`term.isColour` はいつも true です。
 
 `term.setCursorBlink(false)` はカーソルを隠します。プログラムが普通に終わると、カーソルを表示し直し、端末の色を元に戻します。
 
@@ -60,6 +60,7 @@ lua(1) には `term` ライブラリがあります（`require("term")` でも�
 - `print`・`io.write`・`io.read` は `term` を通りません。端末の今の位置に書き、`term` のカーソルを動かしません。`print` の後の `term.getCursorPos` は変わりません。`print` は右端で折り返してスクロールしますが、`term.write` はしません
 - 最初の `term.setCursorPos` までは、端末の上の位置が分かりません。`term.write` は端末の今の位置に書き、`term.getCursorPos` は 1, 1 から数えた見積もりです
 - 文字列は UTF-8 で、全角の文字は 2 セルを使います。CC: Tweaked 独自の文字（128〜159。罫線やテレテキストの文字など）はありません
+- `term.setPaletteColour` で変えていない色は、CC: Tweaked の RGB の値ではなく、端末の基本の色で描きます（16 色の画面では、CC: Tweaked の値は灰色に丸まるため）
 - `term.setPaletteColour` は、その後に描く分にだけ効きます。もう画面にあるものの色は変わりません
 - `term.isColour` は、色の少ない画面でもいつも true です（端末がいちばん近い色で表示します）
 - 始めはカーソルが表示されています（CC: Tweaked は `term.setCursorBlink(true)` まで隠します）

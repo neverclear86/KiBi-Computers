@@ -41,7 +41,7 @@ lua(1) has a `term` library (also `require("term")`). It follows the `term` API 
 
 `term.clear` fills the screen, and `term.clearLine` the line of the cursor, with the background colour. `term.scroll(n)` moves the contents up by `n` lines (down if `n` is negative). They do not move the cursor.
 
-Colours are the values of colors(3). `term.setTextColour` and `term.setBackgroundColour` take effect at once, also for `print` and `io.write`. A colour is drawn with its RGB value in the palette: `term.setPaletteColour(colour, r, g, b)` (numbers from 0 to 1) or `term.setPaletteColour(colour, 0xRRGGBB)` changes it, and `term.nativePaletteColour` returns the default. A screen with fewer colours shows the nearest colour that it has. `term.isColour` is always true.
+Colours are the values of colors(3). `term.setTextColour` and `term.setBackgroundColour` take effect at once, also for `print` and `io.write`. The 16 colours are drawn with the 16 basic colours of the terminal (`red` with red, `lime` with bright green, and so on), so that they keep their names on a screen with 16 colours. `term.setPaletteColour(colour, r, g, b)` (numbers from 0 to 1) or `term.setPaletteColour(colour, 0xRRGGBB)` gives a colour its own RGB value, which a screen with fewer colours shows as the nearest colour that it has. `term.getPaletteColour` returns the RGB value of the palette, and `term.nativePaletteColour` the default (that of CC: Tweaked). `term.isColour` is always true.
 
 `term.setCursorBlink(false)` hides the cursor. When the program ends normally, the cursor is shown again and the colours of the terminal are reset.
 
@@ -60,6 +60,7 @@ Colours are the values of colors(3). `term.setTextColour` and `term.setBackgroun
 - `print`, `io.write` and `io.read` do not go through `term`. They write where the terminal is, and do not move the cursor of `term`: after `print`, `term.getCursorPos` is not updated. `print` wraps at the right edge and scrolls; `term.write` does not
 - Until the first `term.setCursorPos`, the position on the terminal is not known: `term.write` writes where the terminal is, and `term.getCursorPos` is a guess that starts at 1, 1
 - The text is UTF-8, and a wide character takes 2 cells. The special characters of CC: Tweaked (128 to 159, such as box drawing and teletext characters) are not available
+- The colours that are not changed with `term.setPaletteColour` are drawn with the basic colours of the terminal, not with the RGB values of CC: Tweaked (on a screen with 16 colours, those would turn into grey)
 - `term.setPaletteColour` changes only what is drawn afterwards. What is already on the screen keeps its colour
 - `term.isColour` is always true, also on a screen with fewer colours (the terminal shows the nearest colour)
 - The cursor is shown at the start (CC: Tweaked hides it until `term.setCursorBlink(true)`)

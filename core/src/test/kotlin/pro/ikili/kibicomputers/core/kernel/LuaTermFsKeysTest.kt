@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.device.KeyboardDevice
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
+import pro.ikili.kibicomputers.core.display.terminal.TerminalColors
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
@@ -238,11 +239,12 @@ class LuaTermFsKeysTest {
         assertEquals("                 abc", s.row(2))
         assertEquals("z                   ", s.row(3))
         assertEquals("5,2,24 20x5         ", s.row(4))
-        assertEquals(0xCC4C4C, s.fg(2, 1))
-        assertEquals(0x3366CC, s.bg(0, 0))
-        assertEquals(0x3366CC, s.bg(2, 1))
-        assertEquals(0xF0F0F0, s.fg(0, 4))
-        assertEquals(0x111111, s.bg(0, 4))
+        // 既定のパレットのままの色は、端末の基本の 16 色（red は 1 番、blue は 4 番、white は 15 番、black は 0 番）
+        assertEquals(TerminalColors.palette(1), s.fg(2, 1))
+        assertEquals(TerminalColors.palette(4), s.bg(0, 0))
+        assertEquals(TerminalColors.palette(4), s.bg(2, 1))
+        assertEquals(TerminalColors.palette(15), s.fg(0, 4))
+        assertEquals(TerminalColors.palette(0), s.bg(0, 4))
     }
 
     @Test
@@ -286,10 +288,10 @@ class LuaTermFsKeysTest {
         ).assertOk()
         val s = r.screen(20, 12)
         assertEquals("abc", s.row(0).take(3))
-        assertEquals(0xCC4C4C, s.fg(0, 0))
-        assertEquals(0xF0F0F0, s.fg(1, 0))
-        assertEquals(0x3366CC, s.fg(2, 0))
-        assertEquals(0x7FCC19, s.bg(1, 0))
+        assertEquals(TerminalColors.palette(1), s.fg(0, 0))
+        assertEquals(TerminalColors.palette(15), s.fg(1, 0))
+        assertEquals(TerminalColors.palette(4), s.fg(2, 0))
+        assertEquals(TerminalColors.palette(10), s.bg(1, 0))
         assertTrue(r.text.contains("false\tArguments must be the same length"), r.text)
         assertTrue(r.text.contains("1\t32768\ttrue\ttrue"), r.text)
     }
@@ -311,7 +313,8 @@ class LuaTermFsKeysTest {
         ).assertOk()
         val s = r.screen(20, 12)
         assertEquals("green", s.row(0).trimEnd())
-        assertEquals(0x7FCC19, s.fg(0, 0))
+        assertEquals(TerminalColors.palette(10), s.fg(0, 0))
+        // パレットを変えた色は RGB で書く
         assertEquals(0x123456, s.fg(0, 1))
         assertTrue(r.text.contains("false\t0.0705"), r.text)
         val raw = String(r.bytes, Charsets.UTF_8)
