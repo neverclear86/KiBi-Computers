@@ -84,5 +84,41 @@ object SmokeGameTests {
         helper.succeed()
     }
 
+    /**
+     * 製品の jar（Jar-in-Jar で Endive を同梱したもの）から読んだときに、Endive のクラス（ランタイム・コンパイラ・WASI・wasm-tools）が
+     * 開発環境のクラスパスではなく、jar に同梱したもの（FML がモジュールとして読む）から来ている（#775）。
+     *
+     * `runJarGameTestServer`（`kibicomputers.jarTest=true`）でだけ確かめる。開発環境の run では Endive を実行時クラスパスから読むので、
+     * 何もせずに成功にする。jar の run で、ほかの GameTest（`componentCommandLoadsOnServer` など）が通っても、Endive がクラスパスから
+     * 読まれていたら同梱を確かめたことにならないため、その偽の合格を防ぐ。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun bundledLibrariesComeFromJarInJar(helper: GameTestHelper) {
+        if (!java.lang.Boolean.getBoolean("kibicomputers.jarTest")) {
+            helper.succeed()
+            return
+        }
+        // wasm-tools の jar は module-info を持たない（自動モジュール。名前は FML が付ける）ので、名前は見ない
+        val classes = listOf<Pair<String, String?>>(
+            "run.endive.runtime.Instance" to "run.endive.runtime",
+            "run.endive.compiler.MachineFactoryCompiler" to "run.endive.compiler",
+            "run.endive.wasi.WasiPreview1" to "run.endive.wasi",
+            "run.endive.tools.wasm.WasmToolsModule" to null,
+        )
+        for ((name, module) in classes) {
+            val c = Class.forName(name, false, SmokeGameTests::class.java.classLoader)
+            val where = "${c.module.name} ${c.classLoader} ${c.protectionDomain?.codeSource?.location}"
+            org.slf4j.LoggerFactory.getLogger("kibicomputers.jarTest").info("{}: {}", name, where)
+            // クラスパス（無名モジュール・アプリケーションのクラスローダー）ではなく、MOD の jar の META-INF/jarjar/ から読んだ名前付きモジュール
+            helper.assertTrue(c.module.isNamed && (module == null || c.module.name == module), "$name should be in a named module ${module ?: ""}: $where")
+            val location = c.protectionDomain?.codeSource?.location?.toString().orEmpty()
+            helper.assertTrue("/META-INF/jarjar/" in location, "$name should be loaded from a jar bundled with Jar-in-Jar: $where")
+            helper.assertTrue(c.classLoader !== ClassLoader.getSystemClassLoader(), "$name should not come from the class path: $where")
+        }
+        helper.assertTrue(RuntimeSelfCheck.loadsComponentCommand(), "a p2 command component should load from the bundled jars")
+        helper.succeed()
+    }
+
     const val EMPTY: String = "empty"
 }

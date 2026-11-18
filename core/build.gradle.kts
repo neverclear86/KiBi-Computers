@@ -214,6 +214,26 @@ kibiWasm {
     }
 }
 
+// ネイティブのツールチェーン（wasi-sdk の clang と wasm-component-ld。gradle/wasi-sdk.properties）で作るコンポーネント（#775）。
+// アダプターで包んだ p1 のプログラムではなく、wasi-libc が p2・p3 の import を直接呼ぶ形。テストのリソースにだけ入れる（MOD には入れない）
+kibiWasm {
+    wasiSdkModule("hello-wasi-p2") {
+        sources.from("src/test/wasm/hello_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // 0・1 以外の終了コード（p2 の exit は ok・err だけ）
+    wasiSdkModule("exit3-p2") {
+        sources.from("src/test/wasm/exit3.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // p3 は #268 まで読み込みで断る（NOEXEC）ことを確かめる
+    wasiSdkModule("hello-wasi-p3") {
+        sources.from("src/test/wasm/hello_wasi.c")
+        target = "wasm32-wasip3"
+        compilerArgs.addAll("-O2", "-s")
+    }
+}
+
 // WASI p1 のモジュールを p2 のコンポーネントにするアダプター（wasmtime の配布物。#263）。
 // テストで `wasm-tools component new --adapt` に渡し、実際のツールチェーンの形のコンポーネントを作る（MOD には入れない）
 val wasiAdapterProps = Properties().apply {

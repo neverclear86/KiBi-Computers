@@ -87,6 +87,13 @@
 - 保存は今までどおり `UNSAVEABLE`（#269）。モジュールの置き場には元のバイト列を、既存の形（`<sha256>.wasm`）で書く。
 - 確かめていないこと: ネイティブの `wasm32-wasip2`・`wasm32-wasip3` のツールチェーンで作ったコンポーネント（テストはアダプターで包んだもの）、製品の jar（jarJar）での検証器・リンカー・ホストのクラスの読み込み（GameTest `componentCommandLoadsOnServer` は開発環境の実行時クラスパスで、読み込み・ホストの組み立て・`run` の呼び出しまで確かめる）。この 2 件は #775 で追う。
 
+### 追記（#775）: ネイティブのツールチェーンと製品の jar で確かめた
+
+- **ネイティブの `wasm32-wasip2`。** wasi-sdk 34（clang 23、`wasm-component-ld`。`gradle/wasi-sdk.properties` で版と全 OS 分の SHA-256 を固定し、`~/.gradle/kibicomputers/wasi-sdk/` に p2・p3 のビルドに要るものだけを展開する）で `hello_wasi.c` をビルドしたコンポーネント（約 28 KiB）を、アダプターなしで `exec` で動かした（`NativeToolchainComponentTest`）。wasi-libc が直接 import するのは `wasi:io/{error,poll,streams}`・`wasi:cli/{stdin,stdout,stderr,terminal-*}`・`wasi:clocks/{monotonic-clock,wall-clock}` で、版はすべて `@0.2.12`（基準と同じ）。LLVM の既定の機能（bulk-memory など）を有効にした core モジュールも、燃料の計測コードの挿入（`metered = true`）と `ModuleLimits` を通った。2 回目の exec は読み込み直さない。main が 0 以外（3）を返すと、wasi-libc は `wasi:cli/exit` の `exit(err)` を呼び、カーネルの終了コードは 1 になる（p2 の exit は ok・err だけ）。読み込みから終了まで約 270 ms（Windows、Java 21、新しい JVM で検証器の暖めを含む）。
+- **ネイティブの `wasm32-wasip3`。** wasi-sdk 34 には `wasm32-wasip3` の sysroot がある。同じソースをビルドしたものは `wasi:cli/types@0.3.0` などを import し（pre-release の版ではない）、読み込みで `WasmLoadException`（「wasi:* の 0.3 は #268 まで受け付けない」）になる。`exec` は `NOEXEC` で、失敗を覚えて読み込み直さない。
+- **製品の jar。** 両バージョンに `runJarGameTestServer` を足した。ゲームのディレクトリは `run/jar-gametest`、`mods/` に今のビルドの jar（1.20.1 は reobf の前のもの）を `Sync` で置き、run のソースセットは空の `jarRun`（KFF とゲームの依存だけ）、`loadedMods` は空、Endive は全 run 共通のレガシーのクラスパスから外す（`jarGameTestServerLegacyClasspath` で `run.endive` を除く）。jar に入った main の GameTest がすべて通った（1.21.1 は 168 件、1.20.1 は 12 件）。GameTest `bundledLibrariesComeFromJarInJar` が、jar の run でだけ、Endive のランタイム・コンパイラ・WASI・wasm-tools のクラスが MOD の jar の `META-INF/jarjar/` から読んだ名前付きモジュール（wasm-tools は自動モジュール `wasm.tools`）であることと、`RuntimeSelfCheck.loadsComponentCommand()` が通ることを確かめる（Endive がクラスパスから読まれて偽の合格になるのを防ぐ）。1.21.1 は FML のモジュールのクラスローダー、1.20.1 は modlauncher の `TransformingClassLoader` から読まれた。同梱の漏れ・`requires` の不足・リソース（`WasmToolsModule.meta` など）の封じ込めの問題は出なかった。
+- 確かめていないこと: インストーラーで入れた本物の製品サーバーでの起動（Mojang の EULA への同意が要るので、開発環境の GameTest の run で jar を読む形にした）。1.20.1 の製品物（reobfJar。SRG 名）そのものは読んでいない（reobf は MC の参照だけを付け替え、core と Endive には触れない前提）。
+
 ## テスト
 
 - `ComponentExecTest`（#687）: アダプターで包んだ p2 のコマンドを `Machine.exec` で動かす、別のマシン・別のドライバーの集合から exec しても読み込みは 1 回、`run` のないものは `NOEXEC`（読み込みは共有）、リンクできないもの（p3・ホストにない import）は `NOEXEC` で失敗を覚える、読み込みの割り込みは `AGAIN` で覚えない、重さの見積もり、p1 の `kibi:process` の `spawn` でコンポーネントの子を作る、ブロッキング型の上限（サーバー全体・1 台）で `NFILE`、共有した計画とホストを 6 台のプロセスが同時に動かす。

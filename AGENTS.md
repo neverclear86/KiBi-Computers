@@ -26,6 +26,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
 | `gradle/zig.properties` | WASM のビルドに使う Zig のバージョンと、配布アーカイブの SHA-256 |
 | `gradle/moonbit.properties` | MoonBit（標準 OS の言語の PoC #32 で使う）の版と、配布アーカイブの SHA-256。MoonBit は CI か `-Pkibi.moonbit=true` のときだけビルドする |
+| `gradle/wasi-sdk.properties` | テストでネイティブの `wasm32-wasip2`・`wasm32-wasip3` のコンポーネントをビルドする wasi-sdk の版と、全 OS 分のアーカイブの SHA-256（#775）。取得したものは `~/.gradle/kibicomputers/wasi-sdk/` に置く |
 | `gradle/lua.properties` | `lua.wasm` にビルドする Lua のバージョンと、ソースの tar.gz の SHA-256 |
 | `platform-*/gradle.properties` | Minecraft・ローダー・KFF のバージョン |
 | `gradle.properties` | MOD ID、名前、バージョン、グループ |
@@ -41,12 +42,13 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | ビルドと単体テスト | `./gradlew build` |
 | core の単体テストだけ | `./gradlew :core:test` |
 | ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
+| 製品の jar（Jar-in-Jar で同梱したもの）を読んで GameTest（#775） | `./gradlew :platform-neoforge-1.21.1:runJarGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runJarGameTestServer` |
 | ゲーム内の多数台の負荷試験（手順と結果は `docs/load-test.md`） | `./gradlew :platform-neoforge-1.21.1:runLoadTestServer -PloadTestCounts=1000` |
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
 
 - 起動ログは `platform-*/run/logs/latest.log`。起動すると `WASM runtime self-check passed` が出る。
-- CI（`.github/workflows/build.yml`）は `build` と、両バージョンの `runGameTestServer` を実行する。
+- CI（`.github/workflows/build.yml`）は `build` と、両バージョンの `runGameTestServer`・`runJarGameTestServer` を実行する。`runJarGameTestServer` は `run/jar-gametest/mods/` に今のビルドの jar（1.20.1 は reobf の前のもの）を置き、MOD のソースセットと Endive をクラスパスに載せずに起動する。Endive の依存を変えたら、こちらも通す。
 
 ## 完了の条件
 
