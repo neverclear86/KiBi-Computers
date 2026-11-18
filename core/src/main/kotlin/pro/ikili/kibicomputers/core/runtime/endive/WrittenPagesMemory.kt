@@ -31,7 +31,7 @@ import run.endive.runtime.Memory as EndiveMemory
  * 数えた分は、インスタンスを閉じるまで返さない（解放しても減らない。使った量の最高値になる）。閉じたら [releaseAll] でまとめて返す。
  *
  * `memory.grow` は、増やした大きさを RAM として数えず、アドレス空間の上限（[maximumPages]）だけを見る。
- * ただし、増やした所の最初と最後の 4 KiB だけは grow のときに数える（dlmalloc などのアロケーターが増やした直後に書く所。#370 の PoC）。
+ * ただし、増やした所の最初と最後の 4 KiB だけは grow のときに数える（アロケーターが増やした直後に書く所。#370 の PoC。Lua などが使う Zig の libc の malloc（BrkAllocator）は、区画の先頭に頭を、free のときに区画の最後に空きリストの次を書く）。
  * 数えられなければ grow を -1 にして [onGrowRefused] を呼ぶ（アロケーターは NULL を返して優しく失敗できる）。
  *
  * 区画の表は `pages()` に合わせて伸ばす（上限の分を先に作らない）。共有メモリ（threads）には使わない。
