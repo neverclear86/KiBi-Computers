@@ -380,6 +380,11 @@ package kibi:device@0.1.0 {
 }
 
 package kibi:computer@0.1.0 {
+  interface memory {
+    remaining: func() -> u64;
+
+    commit: func(ptr: u32, len: u32, keep: u64) -> bool;
+  }
   interface clock {
     uptime-ticks: func() -> u64;
 

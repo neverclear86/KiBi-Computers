@@ -5,6 +5,9 @@ package kibi:computer@0.1.0;
 /// 1 ページ 128 バイト（仮の値）数える（#753）。宣言しただけでも少し減る。
 ///
 /// p1 向けには、ADR 0073 の規則でモジュール `kibi:computer/memory@0.1.0` の import（`remaining`・`commit`）として出している。
+/// p2 向けには、`imports-p2` の world でそのまま出す（#777。ADR 0777）。`commit` の ptr は、canon lower した `commit` を直接呼んだ
+/// core インスタンスの 0 番の線形メモリの番地（p1 の「呼んだモジュールのメモリ」と同じ意味）。その core インスタンスがメモリを
+/// 定義していない、または core から直接呼ばれていないときは false。
 interface memory {
     /// 残りの RAM（バイト）。プロセスの上限とマシンの RAM のうち、小さい方の残り。
     remaining: func() -> u64;

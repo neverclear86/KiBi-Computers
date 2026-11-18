@@ -224,7 +224,7 @@ internal class LinkedComponent private constructor(
                 is CoreRef.Lowered -> {
                     val spec = plan.lowers[ref.lower]
                     val results = ref.functionType.results.size
-                    builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { _, args -> callLowered(spec, args, results) })
+                    builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { caller, args -> callLowered(spec, args, results, caller.memory) })
                 }
                 is CoreRef.ResourceOp ->
                     builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { _, args -> guarded { resourceOp(ref, args) } })
@@ -335,8 +335,11 @@ internal class LinkedComponent private constructor(
 
     // ---- 呼び出しの中身 ----
 
-    /** ゲストの core が canon lower した import を呼んだ */
-    private fun callLowered(spec: LowerSpec, args: LongArray, coreResults: Int): LongArray = guarded {
+    /**
+     * ゲストの core が canon lower した import を呼んだ。[callerMemory] は、呼んだ core インスタンスの 0 番の線形メモリ
+     * （core から直接呼ばれたときだけ。ホストの関数の [ComponentCall.callerMemory] に渡す。#777）
+     */
+    private fun callLowered(spec: LowerSpec, args: LongArray, coreResults: Int, callerMemory: WasmMemory?): LongArray = guarded {
         if (!mayLeave[spec.instance]) CanonTraps.trap("realloc・post-return の中から import を呼んだ（may_leave）")
         if (rewinding) {
             // 巻き直しで、巻き戻したホストの関数の呼び出しに着いた（変換したコードは、止まった呼び出しのほかは呼ばない。#757）
@@ -354,7 +357,7 @@ internal class LinkedComponent private constructor(
         val lenders = lenderTop
         val out = try {
             // lift した値は名前のある変数に置かない（callee が動いている間、このフレームから参照を残さない。#753）
-            callFunc(spec.callee, liftArgs(spec, cx, args, outerBytes, outerValues), budget) {
+            callFunc(spec.callee, liftArgs(spec, cx, args, outerBytes, outerValues), budget, callerMemory) {
                 // 巻き戻すなら、結果を lower しない（retptr に書かず、realloc も呼ばない）。core の関数の型どおりの数の 0 を返す（捨てられる）
                 if (unwinding) LongArray(coreResults) else spec.function.lowerResult(cx, it, args)
             }
@@ -388,10 +391,19 @@ internal class LinkedComponent private constructor(
         }
     }
 
-    /** [func] を呼び、結果を [onResult] に渡す（lift した関数なら、その後に post-return を呼ぶ） */
-    private inline fun <T> callFunc(func: FuncRef, args: LiftedArgs, budget: CanonBudget, onResult: (CanonValue?) -> T): T = when (func) {
+    /**
+     * [func] を呼び、結果を [onResult] に渡す（lift した関数なら、その後に post-return を呼ぶ）。
+     * [callerMemory] は、ホストの関数なら [ComponentCall.callerMemory] に渡す（lift した関数には渡さない）
+     */
+    private inline fun <T> callFunc(
+        func: FuncRef,
+        args: LiftedArgs,
+        budget: CanonBudget,
+        callerMemory: WasmMemory? = null,
+        onResult: (CanonValue?) -> T,
+    ): T = when (func) {
         // ホストの関数は、ホストの処理の間ずっと値を持つ（ホストの関数の中からはゲストへ入れないので、入れ子にはならない。#691）
-        is FuncRef.Host -> onResult(func.host.body.call(ComponentCall(this, env, func.interfaceName, func.name), args.take()))
+        is FuncRef.Host -> onResult(func.host.body.call(ComponentCall(this, env, func.interfaceName, func.name, callerMemory), args.take()))
         is FuncRef.Lifted -> {
             val spec = plan.lifts[func.lift]
             val cx = context(spec.options, spec.instance, budget)
@@ -429,7 +441,8 @@ internal class LinkedComponent private constructor(
     /** core の関数 [ref] を呼ぶ */
     private fun callCore(ref: CoreRef, args: LongArray): LongArray = when (ref) {
         is CoreRef.Export -> instanceOf(ref).call(ref.name, *args)
-        is CoreRef.Lowered -> callLowered(plan.lowers[ref.lower], args, ref.functionType.results.size)
+        // lift した関数の中身・realloc・post-return として呼ぶ lower は、呼び手の core インスタンスがない（#777）
+        is CoreRef.Lowered -> callLowered(plan.lowers[ref.lower], args, ref.functionType.results.size, null)
         is CoreRef.ResourceOp -> resourceOp(ref, args)
     }
 

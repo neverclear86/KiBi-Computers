@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.component.ComponentImportPolicy
 import pro.ikili.kibicomputers.core.runtime.component.InterfaceName
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentCall
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.component.link.HostFunction
 import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
@@ -35,8 +36,10 @@ internal object KernelComponentHost : ComponentHost {
 /**
  * `kibi:*` の p2 のホスト（#685。ADR 0685）。出すのは各パッケージの `imports-p2` の world の interface（[KibiP2Wit.TEXT]）:
  * `kibi:kernel/{types,events,timers,events-poll,timers-poll}`、`kibi:process/{process,process-poll}`、`kibi:io/{tty,pipe-streams}`、
- * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{clock,power,access}`。
- * p1 だけの `kibi:io/fd`・`kibi:io/pipe`、p3 の `*-async`、`kibi:computer/memory` は出さない（`null`。読み込みの失敗 → `NOEXEC`）。
+ * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{memory,clock,power,access}`。
+ * p1 だけの `kibi:io/fd`・`kibi:io/pipe`、p3 の `*-async` は出さない（`null`。読み込みの失敗 → `NOEXEC`）。
+ * `kibi:computer/memory` の `commit` は、呼んだ core インスタンスの線形メモリ（[ComponentCall.callerMemory]）の区画を数える（#777。ADR 0777）。
+ * 待たないので [HostWait.NONE]（[BLOCKING_FUNCTIONS] に入れない。入れると memory を import するコンポーネントがすべて `BLOCKING` になる）
  *
  * - 型は [KibiP2Wit.TEXT] を [WitReader] で読んだもの。`use wasi:…@0.2.12` の型は [WasiP2Host] が読んだものに解決するので、
  *   `pollable`・`input-stream`・`output-stream`・`descriptor` は `wasi:*` と同じ resource（同じ識別子・同じ dtor）になる

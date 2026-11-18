@@ -68,6 +68,7 @@ spawn（`kibi:process spawn`・`Machine.exec`）は、読み込み（コンパ�
 - インスタンスをまたぐ燃料と上限の残り: #270
   - 追記（#270）: 線形メモリ・テーブルは、core インスタンスごとに同じ `ProcessMemory` に数える（#263 から）。#270 で、コンポーネントの core インスタンス 1 つあたりの固定費（`CORE_INSTANCE_OVERHEAD_BYTES`。仮に 4 KiB、確定は #251）を、作る前に 3 段に数えるようにした（断られたら作れず、メモリ不足と出る）。返すのはプロセスの終わりにまとめて。p1 の単体のモジュールには数えない。ホスト側の一時的な確保（lift した値）と、線形メモリのページの表は #753 に残す
   - 追記（#753）: 線形メモリの区画の表（`WrittenPagesMemory` が 4 KiB の区画ごとに持つ参照）を、1 ページあたり `TABLE_BYTES_PER_PAGE`（区画 16 個 × 参照 8 バイト = 128 バイト。テーブルの要素の見積もり #361 と同じく圧縮しない参照の前提。仮の値で、確定は #251）で 3 段に数える。p1 とコンポーネントで同じ規則。
+  - 追記（#777）: p2 のコンポーネントの `kibi:computer/memory` の `commit` も、p1 と同じ `ProcessContext.commitMemory` を通り、同じ `ProcessMemory` に数える。区画を数えるメモリは `commit` を呼んだ core インスタンスの線形メモリ。RAM の上限で断ったら `memoryCommitRefusal` に残し、異常終了の理由に添える（p1 と同じ文。ADR 0777）
     - 作るとき: 最初のページ数の分を、作る前に数える。断られたら作れず（`WasmLinkException`）、メモリ不足（`cannot instantiate module (out of memory, …)`）と出る。
     - `memory.grow`: 増やしたページ数の分を、増やした所の端の区画と 1 回の CAS で一緒に数える（片方だけ数えた状態を作らない）。断られたら今までどおり -1 と `onGrowRefused`。カーネルロックは使わない（メモリのモニターの中で数え、閉じた後は数えない）。
     - 戻すとき（`restorePages`）: 増やしたページ数の分だけ数える（端の区画は写しから `restoreChunk` で数える）。生きている間の勘定と、戻した後の勘定は同じになる。断られたら戻せず `NO_MEMORY`。
