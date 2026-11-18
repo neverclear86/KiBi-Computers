@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
@@ -57,19 +58,31 @@ class StandardOsDeltaRuleTest {
         CRC32C().also { it.update(bytes) }.value.toInt(),
     )
 
-    /** 出力が [prompt] で終わり、全プロセスが待機点で止まって出力が止まるまで回す */
+    /**
+     * 出力が [prompt] で終わり、入力を読み切って、生きている全プロセスが入力を待って（`WAITING_EVENT`）止まり、出力が止まるまで回す。
+     * [Machine.isAtWaitPoint] だけだと、入力で起こされてまだワーカーが拾っていないプロセス（`RUNNABLE`）でも真になり、
+     * 前のプロンプトが出力の末尾に残っているので、コマンドが動く前に返ることがある
+     */
     private fun settle(h: Harness, m: Machine, host: Host, what: String, prompt: String = "$ ") {
         var last = -1
         var still = 0
-        eventuallyDescribe(90_000, { "$what: 止まらない\n${host.text().takeLast(2000)}" }) {
+        eventuallyDescribe(90_000, { "$what: 止まらない ${m.describeProcesses()}\n${host.text().takeLast(2000)}" }) {
             h.scheduler.tick()
             Thread.sleep(1)
+            val idle = m.lock.withLockValue {
+                m.consoleTtyLocked().inputAvailable == 0 &&
+                    m.kernel.processes.all().filter { !it.state.isTerminal }.all { it.state == ProcessState.WAITING_EVENT }
+            }
             val now = host.bytes()
-            still = if (m.isAtWaitPoint && now == last && host.text().endsWith(prompt)) still + 1 else 0
+            still = if (idle && m.isAtWaitPoint && now == last && host.text().endsWith(prompt)) still + 1 else 0
             last = now
             still >= 5
         }
     }
+
+    /** 既定の比で、下限を既定と [changed] の大きいほうにした規則（測った場面が必ず下限以下になる） */
+    private fun atLeast(changed: Long): FullSaveRule =
+        FullSaveRule(FullSaveRule.DEFAULT.changedRatio, maxOf(FullSaveRule.DEFAULT.minChangedChunks, changed))
 
     private class Measured(val case: String, val changed: Long, val total: Long, val deltaBytes: Int, val fullBytes: Int) {
         override fun toString(): String =
@@ -127,8 +140,9 @@ class StandardOsDeltaRuleTest {
             val restoredSmall = m.changedChunks(unknown)
             println("[#668] 復元の直後の init と sh（全プロセスが基準なし）: $restoredSmall")
             assertTrue(restoredSmall.total > 0 && restoredSmall.unbased == restoredSmall.total, "全プロセスが基準なしになっていない: $restoredSmall")
-            assertTrue(restoredSmall.changed <= FullSaveRule.DEFAULT.minChangedChunks, "下限以下の場面でない: $restoredSmall")
             assertEquals(null, m.captureSnapshot(policy, unknown)!!.deltaBase, "既定の規則で全体にならない: $restoredSmall")
+            // 変わった区画の数は OS の変更でずれる（#667）ので、下限を測った値以上にした規則でも全体になる（下限が効かない）ことを確かめる
+            assertEquals(null, m.captureSnapshot(policy, unknown, atLeast(restoredSmall.changed))!!.deltaBase, "下限が効いた: $restoredSmall")
             val (echo, echoBase) = measure("sh: echo 1 line", "echo delta-one\n")
             // 既定の規則では、init と sh の 1 行は差分（#668。比は境目 0.5 の近くにあるが、変わった区画が下限以下）
             assertTrue(echo.changed <= FullSaveRule.DEFAULT.minChangedChunks / 2, "下限に倍の余裕がない: $echo")
@@ -145,8 +159,8 @@ class StandardOsDeltaRuleTest {
             val late = m.changedChunks(beforeLua)
             println("[#668] lua を基準の後に起こす: $late")
             assertTrue(late.unbased > 0, "基準の後に起こした lua が基準なしになっていない: $late")
-            assertTrue(late.changed <= FullSaveRule.DEFAULT.minChangedChunks, "下限以下の場面でない: $late")
             assertEquals(null, m.captureSnapshot(policy, beforeLua)!!.deltaBase, "既定の規則で全体にならない: $late")
+            assertEquals(null, m.captureSnapshot(policy, beforeLua, atLeast(late.changed))!!.deltaBase, "下限が効いた: $late")
             // 全体の写しで基準が付いた後は、REPL で 1 行動かしても差分
             val (lua, luaBase) = measure("lua: 1 line", "print(1 + 1)\n", "> ")
             assertTrue(host.text().contains("\n2\r\n"), host.text().takeLast(2000))
