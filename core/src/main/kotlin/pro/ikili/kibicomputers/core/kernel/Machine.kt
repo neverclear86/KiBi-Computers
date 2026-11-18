@@ -91,7 +91,7 @@ import pro.ikili.kibicomputers.core.kernel.process.BaseRef
 import pro.ikili.kibicomputers.core.kernel.process.MemoryBase
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
-import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.KernelStateCopy
@@ -789,7 +789,9 @@ public class Machine private constructor(
      *   冷えた起動の理由（[ColdBootReason.REBOOT_PENDING]、なければ [ColdBootReason.BOOTING]）を立てる
      *
      * [deltaBase] があれば差分の写しにする（#83、ADR 0083）: その基準に全体の形で入っているプロセスは、そこから変わった区画だけを取る。
-     * ただし「基準から変わった区画の数 ÷ 書き換えた区画の数」が [fullSaveChangedRatio] を超えたら全体の写しにする。
+     * ただし [fullSaveRule] が全体と決めたら（基準なしのプロセスがいない場合に変わった区画が下限を超え、かつ「変わった区画 ÷ 書き換えた区画」が
+     * 境目を超えたら。基準なしのプロセスがいれば比だけで決める。#668）
+     * 全体の写しにする。基準がない（[deltaBase] が `null`）ときは、規則によらず全体。
      * 全体の写しでは、変わった区画を追えるプロセスの区画を読み取り専用に戻し、置き場が書けたら（[MachineSnapshotSource.committed]）
      * その世代を基準にする
      */
@@ -797,8 +799,8 @@ public class Machine private constructor(
     public fun captureSnapshot(
         policy: CapturePolicy,
         deltaBase: DeltaBase? = null,
-        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
-    ): MachineSnapshotSource? = captureCopy(policy, deltaBase, fullSaveChangedRatio)?.toSource()
+        fullSaveRule: FullSaveRule = FullSaveRule.DEFAULT,
+    ): MachineSnapshotSource? = captureCopy(policy, deltaBase, fullSaveRule)?.toSource()
 
     /** 取り出しの番号（#83。カーネルロックの中で増やす） */
     private var captureToken = 0L
@@ -807,7 +809,7 @@ public class Machine private constructor(
     internal fun captureCopy(
         policy: CapturePolicy,
         deltaBase: DeltaBase? = null,
-        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+        fullSaveRule: FullSaveRule = FullSaveRule.DEFAULT,
     ): KernelStateCopy? = lock.withLockValue {
         // 復元の途中（知らせが返るまで）・冷えた起動待ちは写さない（表が空か、入れたばかりで、前の世代を残す。#85、#589）
         // CRASHED の台は写さない（#698）。ケースが知らせを受けて外すまでの間に呼ばれうる。CRASHED は抜けないので、ここで見れば足りる
@@ -833,7 +835,8 @@ public class Machine private constructor(
         }
         // 全体か差分かを決める（#83）
         val token = ++captureToken
-        val full = deltaBase == null || changedRatioLocked(BaseRef(deltaBase.id, deltaBase.generation)) > fullSaveChangedRatio
+        val full = deltaBase == null ||
+            changedChunksLocked(BaseRef(deltaBase.id, deltaBase.generation)).let { fullSaveRule.isFull(it.changed, it.total, it.unbased) }
         copy.token = token
         copy.fullSave = full
         copy.deltaBase = if (full) null else deltaBase
@@ -855,21 +858,38 @@ public class Machine private constructor(
     }
 
     /**
-     * 差分の写しで書く量の比（#83）: 生きているプロセスのうち、[ref] を基準にしているものは変わった区画、ほかは書き換えた区画すべてを
-     * 「変わった量」、全プロセスの書き換えた区画を「全体の量」とする。区画を数えられないプロセスは毎回全体の形なので数えない
+     * 差分の写しで書く量（#83、#668）: 生きているプロセスのうち、[ref] を基準にしているものは変わった区画、ほかは書き換えた区画すべてを
+     * 「変わった量」、全プロセスの書き換えた区画を「全体の量」とする。区画を数えられないプロセスは毎回全体の形なので数えない。
+     * 基準に入っていない（区画を数えられる）プロセスの書き換えた区画の合計は「基準なし」として別に持つ（下限は効かない。[FullSaveRule]）。
+     * 区画の表をなめるのはプロセスごとに1回（[FullSaveRule] はこの合計だけで決める）
      */
-    private fun changedRatioLocked(ref: BaseRef): Double {
+    private fun changedChunksLocked(ref: BaseRef): ChangedChunks {
         var changed = 0L
         var total = 0L
+        var unbased = 0L
         for (rt in runtimes.values) {
             if (rt.process.state.isTerminal) continue
             val instance = rt.instances.firstOrNull() ?: continue
             val counts = instance.memoryChunkCounts() ?: continue
-            changed += if (MemoryBase.matches(rt.memoryBase, ref, instance)) counts.changed else counts.written
+            if (MemoryBase.matches(rt.memoryBase, ref, instance)) {
+                changed += counts.changed
+            } else {
+                changed += counts.written
+                unbased += counts.written
+            }
             total += counts.written
         }
-        return if (total == 0L) 0.0 else changed.toDouble() / total
+        return ChangedChunks(changed, total, unbased)
     }
+
+    /** 差分の写しで書く量（[changedChunksLocked]）。区画の数 */
+    internal class ChangedChunks(val changed: Long, val total: Long, val unbased: Long = 0) {
+        override fun toString(): String = "ChangedChunks(changed=$changed, total=$total, unbased=$unbased)"
+    }
+
+    /** [deltaBase] を基準にしたときの [changedChunksLocked]（テスト用。#668 の測定） */
+    internal fun changedChunks(deltaBase: DeltaBase): ChangedChunks =
+        lock.withLockValue { changedChunksLocked(BaseRef(deltaBase.id, deltaBase.generation)) }
 
     /**
      * 置き場が [copy] の写しを [id] の世代 [generation] として書けた（#83）。全体の写しで冷えた起動でなければ、その写しで

@@ -434,7 +434,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal fun captureAndSubmit(policy: CapturePolicy): PendingSave? {
         val store = WorldMachineSaves.current ?: return null
         val self = owner ?: return null
-        val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveChangedRatio)
+        val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveRule)
         val submitted = store.captureAndSubmit(currentIdentity, self, capturer, this) ?: return null
         pendingSave = submitted.pending
         ServerMachines.recordSubmit(submitted)

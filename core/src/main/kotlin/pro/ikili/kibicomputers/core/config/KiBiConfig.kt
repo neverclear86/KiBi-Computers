@@ -162,6 +162,15 @@ public object KiBiConfig {
         ),
     )
 
+    /** 全体保存に切り替えるのに要る、変わった区画の数の下限（#668） */
+    @JvmField
+    public val FULL_SAVE_MIN_CHANGED_CHUNKS: IntEntry = serverInt(
+        "save", "fullSaveMinChangedChunks", MachineSaveConfig.DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS.toInt(), 0, 1_048_576,
+        ConfigApply.RELOAD,
+        "Write a delta regardless of the threshold when at most this many 4 KiB pages changed from the base. Pages of processes not in the base (started after it, or after a restore) are not counted as under this limit: the threshold decides, so a full save can give them a base. 0 uses the threshold alone.",
+        "基準から変わった区画（4 KiB）がこの数以下なら、割合によらず差分を保存する。基準に入っていないプロセス（基準の後に起こした、復元した）がいるときは、全体保存で基準を付け直すため、この下限によらず割合で決める。0 なら割合だけで決める。",
+    )
+
     /** 書き込み待ちの写しの合計の上限（MiB） */
     @JvmField
     public val WRITER_MAX_PENDING_MIB: IntEntry = serverInt(
@@ -339,6 +348,7 @@ public object KiBiConfig {
         unloadWaitBudgetMillis = values[UNLOAD_WAIT_BUDGET_MILLIS].toLong(),
         stopQuiesceMillis = values[STOP_QUIESCE_MILLIS].toLong(),
         fullSaveChangedRatio = values[FULL_SAVE_CHANGED_RATIO],
+        fullSaveMinChangedChunks = values[FULL_SAVE_MIN_CHANGED_CHUNKS].toLong(),
         writerMaxPendingBytes = values[WRITER_MAX_PENDING_MIB] * MIB,
         writerFlushMillis = values[WRITER_FLUSH_MILLIS].toLong(),
         restoresPerTick = values[RESTORES_PER_TICK],
