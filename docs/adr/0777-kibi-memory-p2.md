@@ -23,6 +23,7 @@ WIT（関数と型）は #370 の論点 3 の回答で決まっている。p2・
 ### 呼んだ core インスタンスのメモリの渡し方
 
 - 計画（`ComponentPlanner`）では決めない。実行時に、`LinkedComponent.instantiateStep` で lower した関数を包むときに捨てていた呼び手（`WasmHostFunction` の `instance`）の `memory` を、`callLowered` → `callFunc` → `ComponentCall.callerMemory` に通す。
+- **呼び手は「lower を import した core インスタンス」。** ランタイム（`EndiveRuntime.instantiate`）は、ホストの関数を呼ぶときに import を結んだインスタンスを固定で渡す。wit-component が作る形（main が `commit` を直接 import する）では、それが呼んだインスタンスと一致する。core モジュール A が import した `commit` を関数として export し直し、別の core インスタンス B が呼ぶと、ptr は B ではなく A のメモリで解かれる。A がメモリを定義していなければ `null`（`false`）。A の export し直しを `canon lift` した道も、core の呼び手がなくても A のメモリが渡る。ランタイムの口が変わらない限りこの形で、`ComponentCallerMemoryTest` で固定している。
 - 計画は全マシンで共有するので、メモリの実物を持たせられない。呼び手は呼び出しごとに引くので、同じ lower を複数の core インスタンスが import していても、それぞれのメモリになる（「最初のメモリ」などの推測はしない）。
 - lift した関数の中身として lower した関数を呼ぶ道（`callCore` の `CoreRef.Lowered`。lift(lower)、realloc・post-return に lower を渡したもの）、ホストから直接呼んだ export し直しのホストの関数、resource の dtor では、呼び手の core インスタンスがないので `null`。
 - `WasmInstance.memory` は、そのインスタンスが自分で定義した 0 番のメモリ（import したメモリだけのインスタンスでは `null`）。multi-memory は検査で無効なので、メモリは高々 1 つ。
@@ -55,8 +56,8 @@ WIT（関数と型）は #370 の論点 3 の回答で決まっている。p2・
 
 ## テスト
 
-- `ComponentCallerMemoryTest`: `callerMemory` が直接呼んだ core インスタンスのメモリ（export していないものも）で、同じ lower を別のインスタンスが呼べばそのメモリ、メモリのないインスタンス・lift(lower)・export し直したホストの関数では `null`。
-- `KibiP2MemoryTest`: WIT から作ったコンポーネントで、`commit` が main モジュールに直接 lower され canon の `memory` を持たないこと、区画を数えること、keep（u64 の最大・2^63）・範囲外・長さ 0 の意味、`remaining`。RAM の上限で断った後の `err`・トラップで、メモリ不足の文が付くこと。待機点型で動くこと。アダプターで包んだ p1 の C（`kibi-memory-wasi.wasm`）の `commit` と、断ったときの表示。
+- `ComponentCallerMemoryTest`: `callerMemory` が lower を import した core インスタンスのメモリ（export していないものも）で、同じ lower を別のインスタンスが import すればそのメモリ、メモリを定義していないインスタンス（メモリを import しただけのものも）・lift(lower)・export し直したホストの関数では `null`。import した関数を export し直して別の core インスタンスが呼ぶと、渡るのは import したインスタンスのメモリ（呼んだインスタンスのメモリではない）で、export し直しを `canon lift` した道もそのメモリが渡る。
+- `KibiP2MemoryTest`: WIT から作ったコンポーネントで、`commit` が main モジュールに直接 lower され canon の `memory` を持たないこと、区画を数えること、keep（u64 の最大・2^63）・範囲外・長さ 0 の意味、`remaining`。RAM の上限で断った後の `err`・トラップで、メモリ不足の文が付くこと。待機点型で動くこと。メモリを定義していない main モジュールからの `commit` と、lower した `commit` をそのまま lift して外から呼んだ `commit`（`callerMemory` が `null`）が、トラップも例外もなく `false` を返すこと。アダプターで包んだ p1 の C（`kibi-memory-wasi.wasm`）の `commit` と、断ったときの表示。
 - `KibiP2HostTest`: 出す interface の一覧に `kibi:computer/memory` を足し、待たないこと。`HostWaitTest` の一覧は変わらない。
 
 ## 完了の条件

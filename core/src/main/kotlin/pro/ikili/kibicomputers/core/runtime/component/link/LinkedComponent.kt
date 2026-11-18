@@ -336,8 +336,8 @@ internal class LinkedComponent private constructor(
     // ---- 呼び出しの中身 ----
 
     /**
-     * ゲストの core が canon lower した import を呼んだ。[callerMemory] は、呼んだ core インスタンスの 0 番の線形メモリ
-     * （core から直接呼ばれたときだけ。ホストの関数の [ComponentCall.callerMemory] に渡す。#777）
+     * ゲストの core が canon lower した import を呼んだ。[callerMemory] は、その lower を import した core インスタンスの 0 番の線形メモリ
+     * （ランタイムが import を結んだインスタンスで、export し直して別の core インスタンスが呼んでも変わらない。ホストの関数の [ComponentCall.callerMemory] に渡す。#777）
      */
     private fun callLowered(spec: LowerSpec, args: LongArray, coreResults: Int, callerMemory: WasmMemory?): LongArray = guarded {
         if (!mayLeave[spec.instance]) CanonTraps.trap("realloc・post-return の中から import を呼んだ（may_leave）")

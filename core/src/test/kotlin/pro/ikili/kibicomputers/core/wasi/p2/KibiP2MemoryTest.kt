@@ -28,7 +28,9 @@ import pro.ikili.kibicomputers.core.runtime.component.link.CoreRef
 import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
@@ -115,28 +117,78 @@ class KibiP2MemoryTest {
         }
     }
 
-    @Test
-    fun `remainingとcommitがp1と同じ意味で動く`() = timeout(limit) {
+    /** [program] をプロセスで動かし、[body] が返した値（例外なら投げ直す）を返す */
+    private fun <T> inProcess(program: ComponentProgram, body: (LinkedComponent) -> T): T {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
             val result = AtomicReference<Any>()
             val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
                 try {
-                    result.set((ctx.component!!.call("run") as CanonValue.I32).value)
+                    result.set(body(ctx.component!!))
                 } catch (t: Throwable) {
                     result.set(t)
                 }
                 StepResult.Exit(0)
             }
-            val pid = m.spawn(Program.component(load(semantics)), driver, SpawnOptions(), 0)
+            val pid = m.spawn(Program.component(program), driver, SpawnOptions(), 0)
             eventually(120_000, "終わらない") {
                 h.scheduler.tick()
                 m.stateOf(pid).isTerminal
             }
-            (result.get() as? Throwable)?.let { throw it }
-            assertEquals(0, result.get(), "WAT の段 ${result.get()} で失敗した")
+            val failure = m.rt(pid).lastError
             m.stop()
+            (result.get() as? Throwable)?.let { throw it }
+            check(result.get() != null) { "プロセスが本体に着かずに終わった: $failure" }
+            @Suppress("UNCHECKED_CAST")
+            return result.get() as T
         }
+    }
+
+    @Test
+    fun `remainingとcommitがp1と同じ意味で動く`() = timeout(limit) {
+        val r = inProcess(load(semantics)) { (it.call("run") as CanonValue.I32).value }
+        assertEquals(0, r, "WAT の段 $r で失敗した")
+    }
+
+    @Test
+    fun `メモリを定義していないmainモジュールからのcommitは、トラップせずfalseを返す`() = timeout(limit) {
+        // 長さ 0 の範囲は、メモリがあれば（大きさちょうどまで）true になる。メモリがないので呼び手のメモリが null になり、false
+        val noMemory = KibiP2WitTool.component(
+            """
+            import kibi:computer/memory@0.1.0;
+            export run: func() -> u32;
+            """.trimIndent(),
+            """
+            (module
+              $imports
+              (func (export "run") (result i32)
+                (call ${s}commit (i32.const 0) (i32.const 0) (i64.const 0))))
+            """.trimIndent(),
+        )
+        assertEquals(0, inProcess(load(noMemory)) { (it.call("run") as CanonValue.I32).value })
+    }
+
+    @Test
+    fun `lowerしたcommitをそのままliftして外から呼ぶと、トラップせずfalseを返す`() = timeout(limit) {
+        // core の呼び手がない（callerMemory が null）。メモリがあれば true になる引数（長さ 0）でも false
+        val lifted = load(
+            WitTool.wat(
+                """
+                (component
+                  (import "kibi:computer/memory@0.1.0" (instance ${s}m
+                    (export "commit" (func (param "ptr" u32) (param "len" u32) (param "keep" u64) (result bool)))))
+                  (alias export ${s}m "commit" (func ${s}commit))
+                  ;; プロセスで動かすには core インスタンスが 1 つ要る（呼び手にはならない）
+                  (core module ${s}idle)
+                  (core instance (instantiate ${s}idle))
+                  (core func ${s}commit_lower (canon lower (func ${s}commit)))
+                  (func (export "commit") (param "ptr" u32) (param "len" u32) (param "keep" u64) (result bool)
+                    (canon lift (core func ${s}commit_lower))))
+                """.trimIndent(),
+            ),
+        )
+        val r = inProcess(lifted) { it.call("commit", args = listOf(CanonValue.I32(0), CanonValue.I32(0), CanonValue.I64(0))) }
+        assertEquals(false, (r as CanonValue.Bool).value)
     }
 
     private class ConsoleHost : MachineHost {

@@ -139,7 +139,9 @@ internal class ComponentCall(
     /** 呼ばれた関数の名前 */
     val functionName: String,
     /**
-     * canon lower した関数を core インスタンスが直接呼んだときの、その core インスタンスの 0 番の線形メモリ（自分で定義したもの。#777。ADR 0777）。
+     * canon lower した関数を import した core インスタンスの 0 番の線形メモリ（自分で定義したもの。#777。ADR 0777）。
+     * ランタイムが import を結んだインスタンスを呼び手として渡すので、wit-component が作る形（main が直接 import する）では呼んだインスタンスと一致するが、
+     * import した関数を export し直して別の core インスタンスが呼ぶと、呼んだインスタンスではなく import したインスタンスのメモリになる。
      * 呼び手が core インスタンスでない（lift した関数の中身・realloc・post-return として呼ばれた）、メモリを定義していない、
      * resource の dtor の呼び出しのときは `null`。この呼び出しの中でだけ使う
      */
