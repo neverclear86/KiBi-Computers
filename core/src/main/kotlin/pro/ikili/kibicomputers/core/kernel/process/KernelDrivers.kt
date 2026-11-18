@@ -25,14 +25,15 @@ internal object KernelDrivers {
      * 既定: `_start` を export する p1 のコマンドは [WasiP1Driver]、それ以外は `NOEXEC`。
      * p1 に許していない import（[WasiP1.checkImports]。#40）があっても `NOEXEC`。
      * p1 の止まりうる import（[WasiP1.WAIT_IMPORTS]）で待機点への変換をかけさせ（#329）、変換できたものは `WAIT_POINT` で動かす。
-     * コンポーネント（[Program.component]）は p2 のコマンドとして [WasiP2Driver] で動かす（#687。`BLOCKING`。
+     * コンポーネント（[Program.component]）は p2 のコマンドとして [WasiP2Driver] で動かす（#687。待機点への変換をかけたものは
+     * `WAIT_POINT`、かけられなかったものは `BLOCKING`。#757。
      * `wasi:cli/run@0.2.<n>` の `run` がなければ `NOEXEC`。ADR 0267）
      */
     val DEFAULT: ProcessDriverFactory = object : ProcessDriverFactory {
         override val waitImports: Set<String> get() = WasiP1.WAIT_IMPORTS
 
         override fun create(program: Program): ProcessDriver {
-            program.component?.let { return WasiP2Driver.create(it.plan) }
+            program.component?.let { return WasiP2Driver.create(it) }
             val module = program.module
             val isCommand = module.exports.any { it.name == WasiP1Driver.START && it.kind == WasmExternKind.FUNCTION }
             if (!isCommand) fsError(Errno.NOEXEC, "動かせる形でない（${WasiP1Driver.START} がない）")

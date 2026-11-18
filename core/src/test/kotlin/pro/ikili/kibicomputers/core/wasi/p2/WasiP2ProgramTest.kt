@@ -17,7 +17,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class WasiP2ProgramTest {
     private fun program(name: String): Program = Program.component(P2Testing.load(P2Testing.wrap(name)))
 
-    private fun driver(p: Program): WasiP2Driver = WasiP2Driver.create(p.component!!.plan)
+    private fun driver(p: Program): WasiP2Driver = WasiP2Driver.create(p.component!!)
 
     @Test
     fun `アダプターで包んだhello-wasiが実物のホストで最後まで動く`() = timeout(Duration.ofSeconds(120)) {

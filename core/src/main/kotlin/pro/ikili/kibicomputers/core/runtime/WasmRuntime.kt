@@ -23,16 +23,34 @@ public interface WasmRuntime {
      */
     @Throws(WasmLoadException::class)
     public fun load(bytes: ByteArray): WasmModule
+
+    /**
+     * WASM のバイト列の import と export だけを読む（#757。コンパイルしない）。[load] したときの [WasmModule.imports]・
+     * [WasmModule.exports] と同じものを返す（燃料・待機点のためにランタイムがつなぐものは除く）。
+     * コンポーネントのリンクの計画を、待機点への変換の前に作るのに使う。既定は [load] する
+     */
+    @Throws(WasmLoadException::class)
+    public fun describe(bytes: ByteArray): WasmModuleShape = load(bytes)
 }
 
-/** 読み込んだモジュール。何度でもインスタンスを作れる。 */
+/** モジュールの import と export（#757。[WasmRuntime.describe]） */
 @ApiStatus.Internal
-public interface WasmModule {
+public interface WasmModuleShape {
     /** モジュールが求める import（宣言の順） */
     public val imports: List<WasmImportDescriptor>
 
     /** モジュールが出す export（宣言の順） */
     public val exports: List<WasmExportDescriptor>
+}
+
+/** 読み込んだモジュール。何度でもインスタンスを作れる。 */
+@ApiStatus.Internal
+public interface WasmModule : WasmModuleShape {
+    /** モジュールが求める import（宣言の順） */
+    override val imports: List<WasmImportDescriptor>
+
+    /** モジュールが出す export（宣言の順） */
+    override val exports: List<WasmExportDescriptor>
 
     /**
      * 燃料を計測するモジュールなら `true`（#28）。

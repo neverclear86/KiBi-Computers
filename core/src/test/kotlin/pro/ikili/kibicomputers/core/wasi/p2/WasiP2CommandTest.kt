@@ -43,7 +43,7 @@ class WasiP2CommandTest {
         """.trimIndent()
     }
 
-    private fun create(text: String): WasiP2Driver = WasiP2Driver.create(P2Testing.loadWat(text).plan)
+    private fun create(text: String): WasiP2Driver = WasiP2Driver.create(P2Testing.loadWat(text))
 
     private fun assertNoexec(text: String) {
         val e = assertThrows<FsException> { create(text) }
@@ -82,7 +82,7 @@ class WasiP2CommandTest {
     private fun exitCodeOf(text: String): Int? {
         Harness().use { h ->
             val p = Program.component(P2Testing.loadWat(text))
-            val r = P2Testing.run(h, p, WasiP2Driver.create(p.component!!.plan))
+            val r = P2Testing.run(h, p, WasiP2Driver.create(p.component!!))
             assertEquals("", r.output)
             return r.exitCode
         }

@@ -128,12 +128,55 @@ internal object Asyncify {
         yieldImport: String? = null,
         originalFunc: (Int) -> Int = { it },
         checkpoint: () -> Unit = {},
-    ): Result {
-        val module = parse(wasm)
-        checkpoint()
-        checkReserved(module)
-        return try {
-            Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint).run()
+    ): Result = prepare(wasm, checkpoint).transform(waitImports, emptySet(), yieldImport, originalFunc, checkpoint)
+
+    /**
+     * 関数の型（引数と結果の値の型の並び。値の型は WASM のバイナリの型の番号）。コンポーネントの core モジュールをまたいで、
+     * 止まりうる関数の型を集めるのに使う（#757。[Prepared.analyze]）
+     */
+    data class Signature(val params: List<Int>, val results: List<Int>)
+
+    /**
+     * [Prepared.analyze] の結果（#757）。
+     *
+     * @property suspendableExports 止まりうる関数の export の名前（import を export し直したものも含む）
+     * @property suspendTypes 止まりうる関数（止まりうる import を含む）の型
+     */
+    class Analysis(val suspendableExports: Set<String>, val suspendTypes: Set<Signature>)
+
+    /**
+     * 読んだモジュール（#757）。同じモジュールに、止まりうる import を変えて何度も解析（[analyze]）してから、最後に 1 回変換（[transform]）する。
+     * コンポーネントの core モジュールは、止まりうる import がほかの core モジュールの解析の結果で決まるので、全体で答えが変わらなくなるまで
+     * 解析を繰り返す（`ComponentAsyncify`）
+     */
+    class Prepared internal constructor(private val wasm: ByteArray, private val module: WasmModule) {
+        /**
+         * 止まりうる関数を求めるだけで、書き換えない。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（[transform]）
+         *
+         * @throws AsyncifyUnsupported 解析できない作り
+         */
+        fun analyze(waitImports: Set<String>, externalSuspendTypes: Set<Signature>): Analysis =
+            guard { Transformer(wasm, module, waitImports, null, { it }, {}, externalSuspendTypes).analysis() }
+
+        /**
+         * 変換する（[Asyncify.transform] と同じ）。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（#757）。
+         * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかでも止まりうるとみなす
+         * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。空なら今までと同じ出力になる
+         *
+         * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（[Asyncify.transform]）
+         * @throws WasmLoadException 時間の上限を超えた
+         */
+        @Throws(WasmLoadException::class)
+        fun transform(
+            waitImports: Set<String>,
+            externalSuspendTypes: Set<Signature> = emptySet(),
+            yieldImport: String? = null,
+            originalFunc: (Int) -> Int = { it },
+            checkpoint: () -> Unit = {},
+        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes).run() }
+
+        private inline fun <T> guard(block: () -> T): T = try {
+            block()
         } catch (e: WasmLoadException) {
             throw e
         } catch (e: AsyncifyUnsupported) {
@@ -143,6 +186,19 @@ internal object Asyncify {
         } catch (e: StackOverflowError) {
             throw AsyncifyUnsupported("変換できない: 入れ子が深すぎる").also { it.initCause(e) }
         }
+    }
+
+    /**
+     * [wasm] を読み、予約した名前を使っていないか確かめる（#757。解析と変換は [Prepared] で）。[checkpoint] は読んだ後に 1 回呼ぶ
+     *
+     * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた
+     */
+    @Throws(WasmLoadException::class)
+    fun prepare(wasm: ByteArray, checkpoint: () -> Unit = {}): Prepared {
+        val module = parse(wasm)
+        checkpoint()
+        checkReserved(module)
+        return Prepared(wasm, module)
     }
 
     /** 予約した名前をすでに使っていたら断る（プレイヤーが退避した値や状態を自分で書き換えられてしまう） */
@@ -224,6 +280,8 @@ private class Transformer(
     yieldImport: String?,
     private val originalFunc: (Int) -> Int,
     private val checkpoint: () -> Unit,
+    /** モジュールの外から止まりうるとみなす関数の型（#757。[Asyncify.Prepared.transform]） */
+    private val externalSuspendTypes: Set<Asyncify.Signature> = emptySet(),
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
@@ -265,6 +323,9 @@ private class Transformer(
     /** 定義済みの関数の番号のずれ（足す import の数） */
     private val shift: Int
 
+    /** テーブルの番号 → import か export したテーブルか（#757。中身をほかのモジュールが入れられる） */
+    private val sharedTables = ArrayList<Boolean>()
+
     init {
         val types = module.typeSection()
         for (i in 0 until types.typeCount()) {
@@ -280,7 +341,10 @@ private class Transformer(
             // 関数でない import は、番号の空間（グローバル・テーブル・タグ）に先に並ぶ。メモリは型の追跡に関わらない（#384）
             when (imp) {
                 is GlobalImport -> globalTypes += codeOrBot(imp.type())
-                is TableImport -> tableTypes += codeOrBot(imp.entryType())
+                is TableImport -> {
+                    tableTypes += codeOrBot(imp.entryType())
+                    sharedTables += true
+                }
                 is TagImport -> tagSigs += typeSigs[imp.tagType().typeIdx()]
             }
             if (imp !is FunctionImport) continue
@@ -303,7 +367,16 @@ private class Transformer(
         val gs = module.globalSection()
         for (i in 0 until gs.globalCount()) globalTypes += codeOrBot(gs.getGlobal(i).valueType())
         val ts = module.tableSection()
-        for (i in 0 until ts.tableCount()) tableTypes += codeOrBot(ts.getTable(i).elementType())
+        for (i in 0 until ts.tableCount()) {
+            tableTypes += codeOrBot(ts.getTable(i).elementType())
+            sharedTables += false
+        }
+        val es = module.exportSection()
+        for (i in 0 until es.exportCount()) {
+            val e = es.getExport(i)
+            val t = e.index()
+            if (e.exportType() == ExternalType.TABLE && t < sharedTables.size) sharedTables[t] = true
+        }
         module.tagSection().ifPresent { tags -> tags.types().forEach { tagSigs += typeSigs[it.typeIdx()] } }
         pushFunc = importedFuncs
         popFunc = importedFuncs + 1
@@ -315,7 +388,29 @@ private class Transformer(
     /** 止まりうる関数の型（引数と結果の並び）。間接呼び出しは、型が同じ関数しか呼べないので、この型のときだけ止まりうる */
     private val suspendTypes = HashSet<Pair<List<Int>, List<Int>>>()
 
-    private fun indirectMaySuspend(typeIdx: Int): Boolean = typeSigs[typeIdx].let { it.params to it.results } in suspendTypes
+    private fun indirectMaySuspend(ins: AnnotatedInstruction): Boolean {
+        val sig = typeSigs[ins.operand(0).toInt()]
+        if (sig.params to sig.results in suspendTypes) return true
+        if (externalSuspendTypes.isEmpty() || Asyncify.Signature(sig.params, sig.results) !in externalSuspendTypes) return false
+        // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）
+        return when (ins.opcode()) {
+            OpCode.CALL_INDIRECT, OpCode.RETURN_CALL_INDIRECT -> sharedTables.getOrElse(ins.operand(1).toInt()) { true }
+            else -> true
+        }
+    }
+
+    /** 止まりうる関数を求め、export の名前と型を返す（書き換えない。#757） */
+    fun analysis(): Asyncify.Analysis {
+        analyze(bodies())
+        val es = module.exportSection()
+        val names = LinkedHashSet<String>()
+        for (i in 0 until es.exportCount()) {
+            val e = es.getExport(i)
+            if (e.exportType() == ExternalType.FUNCTION && e.index() in suspendable) names += e.name()
+        }
+        val types = suspendable.mapTo(LinkedHashSet()) { Asyncify.Signature(funcSigs[it].params, funcSigs[it].results) }
+        return Asyncify.Analysis(names, types)
+    }
 
     private fun remap(idx: Long): Long = if (idx >= importedFuncs) idx + shift else idx
 
@@ -323,7 +418,7 @@ private class Transformer(
         (0 until module.codeSection().functionBodyCount()).map { module.codeSection().getFunctionBody(it).instructions() }
 
     private fun analyze(bodies: List<List<AnnotatedInstruction>>) {
-        if (asyncFuncs.isEmpty()) return
+        if (asyncFuncs.isEmpty() && externalSuspendTypes.isEmpty()) return
         suspendable += asyncFuncs
         var changed = true
         while (changed) {
@@ -336,7 +431,7 @@ private class Transformer(
                     when (ins.opcode()) {
                         OpCode.CALL, OpCode.RETURN_CALL -> ins.operand(0).toInt() in suspendable
                         OpCode.CALL_INDIRECT, OpCode.CALL_REF, OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
-                            indirectMaySuspend(ins.operand(0).toInt())
+                            indirectMaySuspend(ins)
                         else -> false
                     }
                 }
@@ -759,10 +854,10 @@ private class Transformer(
 
         private fun isSuspendCall(ins: AnnotatedInstruction): Boolean = when (ins.opcode()) {
             OpCode.CALL -> ins.operand(0).toInt() in suspendable || isYieldCall(ins)
-            OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins.operand(0).toInt())
+            OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins)
             OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
-                if (indirectMaySuspend(ins.operand(0).toInt())) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
+                if (indirectMaySuspend(ins)) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             else -> false
         }
 

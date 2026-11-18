@@ -108,7 +108,7 @@ descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確
 
 ## 制約と残り
 
-- `WasiP2Driver` は `BLOCKING` で、待っている間は OS のスレッドを 1 本持つ。p1 の待機点の方式（ADR 0316・0329）はコンポーネントにまだない。1,000 台がプロンプトで待つ形には向かないので、スレッドを持たない待ち方は #757 で扱う。
+- `WasiP2Driver` は、コンポーネントを待機点に変換できれば `WAIT_POINT` で動き、待っている間スレッドを持たない（#757。ADR 0757）。巻き戻せない待ちのホストの関数（`kibi:device` の `invoke`、`kibi:process` の `spawn`）を import するものは `BLOCKING` のまま。
 - 仮の値（`CALL_FUEL`・`HostResourceTable.LIMIT`・`MAX_READ`・`FILE_WRITE_ALLOWANCE`・`MAX_RANDOM_BYTES`）の確定は #251。
 - `symlink-at`・`link-at` は `unsupported`、`readlink-at` は `invalid`（VFS にリンクがない）。
 - `wasi:clocks/timezone` は出さない（`@unstable`）。

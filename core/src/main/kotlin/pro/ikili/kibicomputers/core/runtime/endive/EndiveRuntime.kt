@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryAccessException
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmModuleShape
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmStateException
@@ -97,6 +98,28 @@ public class EndiveRuntime internal constructor(
 
     @Throws(WasmLoadException::class)
     override fun load(bytes: ByteArray): WasmModule {
+        val interpreted = parseModule(bytes)
+        if (!compile) return interpreted
+        // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
+        val compiled = compileOrNull(interpreted.module) ?: return interpreted
+        // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
+        // コンパイル結果だけ
+        return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
+    }
+
+    /** パースだけして、import と export を返す（#757。コンパイルしない） */
+    @Throws(WasmLoadException::class)
+    override fun describe(bytes: ByteArray): WasmModuleShape {
+        val m = parseModule(bytes)
+        return object : WasmModuleShape {
+            override val imports = m.imports
+            override val exports = m.exports
+        }
+    }
+
+    /** パースして、インタプリタで動かすモジュールにする */
+    @Throws(WasmLoadException::class)
+    private fun parseModule(bytes: ByteArray): EndiveWasmModule {
         val module = try {
             Parser.parse(bytes)
         } catch (e: MalformedException) {
@@ -111,7 +134,7 @@ public class EndiveRuntime internal constructor(
         } catch (e: StackOverflowError) {
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
-        val interpreted = try {
+        return try {
             EndiveWasmModule(module, null)
         } catch (e: WasmLoadException) {
             throw e
@@ -119,12 +142,6 @@ public class EndiveRuntime internal constructor(
             // Endive の検証は export の番号の範囲などを確かめないことがある（#40 で見つけた）。ここで分かったものも断る
             throw WasmLoadException("WASM の検証に通らない: $e", e)
         }
-        if (!compile) return interpreted
-        // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
-        val compiled = compileOrNull(module) ?: return interpreted
-        // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
-        // コンパイル結果だけ
-        return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
     }
 
     /** コンパイルの結果。[interpreted] は、インタプリタで動かす関数の番号（import を含めた番号） */

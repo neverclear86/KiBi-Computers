@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.runtime.component.link
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmModuleShape
 import pro.ikili.kibicomputers.core.runtime.component.Alias
 import pro.ikili.kibicomputers.core.runtime.component.ByteRange
 import pro.ikili.kibicomputers.core.runtime.component.Canon
@@ -45,7 +46,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
  * core の import の種類・型の違い）は [WasmLoadException] にする（読み込みの失敗として覚えてよい）
  */
 internal class ComponentPlanner private constructor(
-    private val modules: List<WasmModule>,
+    private val modules: List<WasmModuleShape>,
     private val moduleIndex: Map<ByteRange, Int>,
     private val host: ComponentHost,
     private val deadline: LoadDeadline?,
@@ -70,24 +71,41 @@ internal class ComponentPlanner private constructor(
 
     companion object {
         /**
-         * [component] の計画を作る。[modules] は読み込んだ core モジュール、[moduleIndex] は core モジュールの範囲 → [modules] の番号
+         * [component] の計画を作る。[modules] は core モジュールの import と export（[WasmModuleShape]。読み込む前に作れる。#757）、
+         * [moduleIndex] は core モジュールの範囲 → [modules] の番号。読み込んだモジュールは [Planned.link] で渡す
          */
         @Throws(WasmLoadException::class)
         fun plan(
             component: LoadedComponent,
-            modules: List<WasmModule>,
+            modules: List<WasmModuleShape>,
             moduleIndex: Map<ByteRange, Int>,
             host: ComponentHost,
             deadline: LoadDeadline? = null,
-        ): ComponentPlan {
+        ): Planned {
             val p = ComponentPlanner(modules, moduleIndex, host, deadline)
             val root = p.instantiate(component.root, null, null)
             val exports = LinkedHashMap<String, ExportItem>()
             for ((name, item) in root) exports[name] = p.exportItem(item)
-            return ComponentPlan(modules, p.steps.toList(), p.lifts.toList(), p.lowers.toList(), p.frames, exports, p.resources.toList())
+            return Planned(p.steps.toList(), p.lifts.toList(), p.lowers.toList(), p.frames, exports, p.resources.toList())
         }
 
         private fun fail(message: String): Nothing = throw WasmLoadException(message)
+    }
+
+    /**
+     * 読み込む前の計画（#757）。core モジュールを読み込んだら [link] で [ComponentPlan] にする（待機点への変換で計画は変わらない。
+     * ランタイムは変換が足した import・export を見せないので）
+     */
+    class Planned(
+        val steps: List<CoreStep>,
+        val lifts: List<LiftSpec>,
+        val lowers: List<LowerSpec>,
+        val componentInstances: Int,
+        val exports: Map<String, ExportItem>,
+        val resources: List<ResourceInfo?>,
+    ) {
+        /** 読み込んだ core モジュール [modules]（[plan] に渡した形と同じ並び）で計画にする */
+        fun link(modules: List<WasmModule>): ComponentPlan = ComponentPlan(modules, steps, lifts, lowers, componentInstances, exports, resources)
     }
 
     // ---- 値 ----
@@ -460,7 +478,7 @@ internal class ComponentPlanner private constructor(
                     val declared = iface.functions[member]
                     val hf = when {
                         declared != null -> declared.also { if (!sameFunction(guest, it.type)) fail("ホストのインターフェース $name の関数 $member の型が違う") }
-                        else -> iface.fallback?.function(member, guest)?.let { HostFunction(guest, it) }
+                        else -> iface.fallback?.function(member, guest)?.let { HostFunction(guest, body = it) }
                             ?: fail("ホストのインターフェース $name に関数 $member がない")
                     }
                     Item.Func(FuncRef.Host(name, member, hf, guest))
