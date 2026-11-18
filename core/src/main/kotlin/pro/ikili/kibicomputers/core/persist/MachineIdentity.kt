@@ -296,9 +296,12 @@ public fun adoptsCompletion(identity: MachineIdentity?, current: MachineIdentity
  *
  * 「変わった区画」は、基準に全体の形で入っているプロセスでは基準から変わった区画、ほかのプロセスでは書き換えた区画すべて。
  * 「書き換えた区画」は全プロセスの書き換えた区画（数え方は `Machine` の取り出し）。
+ * 「基準なしの区画」は、基準に入っていない（区画を数えられる）プロセスの書き換えた区画。差分の写しの中では、そのプロセスは毎回
+ * 全体の形で写され、基準を付け直せるのは全体の写しだけなので、下限は基準なしの区画がないときにだけ効かせる。
  *
  * @property changedRatio 「変わった区画 ÷ 書き換えた区画」の境目。これを**超えたら**全体（ちょうどなら差分）
- * @property minChangedChunks 変わった区画の数の下限。変わった区画が**これ以下なら**、比を見ずに差分。0 なら比だけで決める
+ * @property minChangedChunks 変わった区画の数の下限。基準なしの区画がなく、変わった区画が**これ以下なら**、比を見ずに差分。
+ *   0 なら比だけで決める
  */
 @ApiStatus.Internal
 public data class FullSaveRule @JvmOverloads constructor(
@@ -311,11 +314,13 @@ public data class FullSaveRule @JvmOverloads constructor(
     }
 
     /**
-     * 変わった区画が [changed]、書き換えた区画が [total] のとき、全体の写しにするか。[changed] が [minChangedChunks] 以下なら `false`。
-     * そうでなければ `changed / total` が [changedRatio] を超えたら `true`（[total] が 0 なら比は 0）
+     * 変わった区画が [changed]（基準なしの区画 [unbased] を含む）、書き換えた区画が [total] のとき、全体の写しにするか。
+     * [unbased] が 0 で [changed] が [minChangedChunks] 以下なら `false`。そうでなければ `changed / total` が [changedRatio] を超えたら
+     * `true`（[total] が 0 なら比は 0）。[unbased] が 1 以上なら下限は効かない（全体の写しでしか基準を付け直せないため。#668）
      */
-    public fun isFull(changed: Long, total: Long): Boolean {
-        if (changed <= minChangedChunks) return false
+    @JvmOverloads
+    public fun isFull(changed: Long, total: Long, unbased: Long = 0): Boolean {
+        if (unbased <= 0L && changed <= minChangedChunks) return false
         val ratio = if (total <= 0L) 0.0 else changed.toDouble() / total
         return ratio > changedRatio
     }

@@ -789,7 +789,8 @@ public class Machine private constructor(
      *   冷えた起動の理由（[ColdBootReason.REBOOT_PENDING]、なければ [ColdBootReason.BOOTING]）を立てる
      *
      * [deltaBase] があれば差分の写しにする（#83、ADR 0083）: その基準に全体の形で入っているプロセスは、そこから変わった区画だけを取る。
-     * ただし [fullSaveRule] が全体と決めたら（変わった区画が下限を超え、かつ「変わった区画 ÷ 書き換えた区画」が境目を超えたら。#668）
+     * ただし [fullSaveRule] が全体と決めたら（基準なしのプロセスがいない場合に変わった区画が下限を超え、かつ「変わった区画 ÷ 書き換えた区画」が
+     * 境目を超えたら。基準なしのプロセスがいれば比だけで決める。#668）
      * 全体の写しにする。基準がない（[deltaBase] が `null`）ときは、規則によらず全体。
      * 全体の写しでは、変わった区画を追えるプロセスの区画を読み取り専用に戻し、置き場が書けたら（[MachineSnapshotSource.committed]）
      * その世代を基準にする
@@ -835,7 +836,7 @@ public class Machine private constructor(
         // 全体か差分かを決める（#83）
         val token = ++captureToken
         val full = deltaBase == null ||
-            changedChunksLocked(BaseRef(deltaBase.id, deltaBase.generation)).let { fullSaveRule.isFull(it.changed, it.total) }
+            changedChunksLocked(BaseRef(deltaBase.id, deltaBase.generation)).let { fullSaveRule.isFull(it.changed, it.total, it.unbased) }
         copy.token = token
         copy.fullSave = full
         copy.deltaBase = if (full) null else deltaBase
@@ -859,24 +860,31 @@ public class Machine private constructor(
     /**
      * 差分の写しで書く量（#83、#668）: 生きているプロセスのうち、[ref] を基準にしているものは変わった区画、ほかは書き換えた区画すべてを
      * 「変わった量」、全プロセスの書き換えた区画を「全体の量」とする。区画を数えられないプロセスは毎回全体の形なので数えない。
+     * 基準に入っていない（区画を数えられる）プロセスの書き換えた区画の合計は「基準なし」として別に持つ（下限は効かない。[FullSaveRule]）。
      * 区画の表をなめるのはプロセスごとに1回（[FullSaveRule] はこの合計だけで決める）
      */
     private fun changedChunksLocked(ref: BaseRef): ChangedChunks {
         var changed = 0L
         var total = 0L
+        var unbased = 0L
         for (rt in runtimes.values) {
             if (rt.process.state.isTerminal) continue
             val instance = rt.instances.firstOrNull() ?: continue
             val counts = instance.memoryChunkCounts() ?: continue
-            changed += if (MemoryBase.matches(rt.memoryBase, ref, instance)) counts.changed else counts.written
+            if (MemoryBase.matches(rt.memoryBase, ref, instance)) {
+                changed += counts.changed
+            } else {
+                changed += counts.written
+                unbased += counts.written
+            }
             total += counts.written
         }
-        return ChangedChunks(changed, total)
+        return ChangedChunks(changed, total, unbased)
     }
 
     /** 差分の写しで書く量（[changedChunksLocked]）。区画の数 */
-    internal class ChangedChunks(val changed: Long, val total: Long) {
-        override fun toString(): String = "ChangedChunks(changed=$changed, total=$total)"
+    internal class ChangedChunks(val changed: Long, val total: Long, val unbased: Long = 0) {
+        override fun toString(): String = "ChangedChunks(changed=$changed, total=$total, unbased=$unbased)"
     }
 
     /** [deltaBase] を基準にしたときの [changedChunksLocked]（テスト用。#668 の測定） */

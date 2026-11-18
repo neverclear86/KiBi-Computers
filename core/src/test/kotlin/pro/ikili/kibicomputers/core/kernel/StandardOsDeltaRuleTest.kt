@@ -25,7 +25,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 /**
  * 標準 OS（本物の `/sbin/init` と `/bin/sh`）で、全体か差分かの規則（[FullSaveRule]。#668、ADR 0083 の規則 3）を確かめる。
  *
- * 全体の保存の後に、シェルで 1 行・数行のコマンド、子プロセスを起こすコマンド、Lua の REPL の 1 行を動かし、変わった区画と書き換えた区画の数
+ * 全体の保存の後に、シェルで 1 行・数行のコマンド、子プロセスを起こすコマンド、Lua の REPL の 1 行を動かし（基準の後に起こしたプロセスと、
+ * 基準を持たない台＝復元の直後も試す）、変わった区画と書き換えた区画の数
  * （`Machine.changedChunks`）と、差分・全体の世代の大きさを測って標準出力に出す（測った値は ADR 0083 の付録に残す）。
  * 確かめるのは判断の結果と余裕のある上限だけにする（区画の数は OS の変更でずれる。#667）
  */
@@ -120,6 +121,14 @@ class StandardOsDeltaRuleTest {
             }
 
             measure("idle", "")
+            // 基準を持たない台（チャンクの読み直しの後。置き場は基準を覚えているが、プロセスの基準は None）は、init と sh だけの小さな台でも全体にする
+            // （下限だけだと、2 プロセスの全区画を毎回の差分に書き続ける）
+            val unknown = DeltaBase(UUID.randomUUID(), 1, 0, 0)
+            val restoredSmall = m.changedChunks(unknown)
+            println("[#668] 復元の直後の init と sh（全プロセスが基準なし）: $restoredSmall")
+            assertTrue(restoredSmall.total > 0 && restoredSmall.unbased == restoredSmall.total, "全プロセスが基準なしになっていない: $restoredSmall")
+            assertTrue(restoredSmall.changed <= FullSaveRule.DEFAULT.minChangedChunks, "下限以下の場面でない: $restoredSmall")
+            assertEquals(null, m.captureSnapshot(policy, unknown)!!.deltaBase, "既定の規則で全体にならない: $restoredSmall")
             val (echo, echoBase) = measure("sh: echo 1 line", "echo delta-one\n")
             // 既定の規則では、init と sh の 1 行は差分（#668。比は境目 0.5 の近くにあるが、変わった区画が下限以下）
             assertTrue(echo.changed <= FullSaveRule.DEFAULT.minChangedChunks / 2, "下限に倍の余裕がない: $echo")
@@ -128,12 +137,26 @@ class StandardOsDeltaRuleTest {
             assertEquals(echoBase, byDefault!!.deltaBase, "既定の規則で差分にならない: $echo")
             measure("sh: 5 lines", (1..5).joinToString("") { "echo line-$it\n" })
             measure("sh: ls (child process)", "ls /\n")
-            // Lua の REPL を起こしてから全体を取り、REPL で 1 行
+            // 基準の後に Lua の REPL を起こす（基準に入っていないプロセスが加わる）。変わった区画が下限以下でも、既定の規則は全体にする
+            // （全体の写しでしかプロセスに基準を付けられない。下限だけだと、lua の全区画を毎回の差分に書き続ける）
+            val (_, beforeLua) = full()
             m.offerConsoleInput("lua\n".toByteArray())
             settle(h, m, host, "lua の起動", "> ")
+            val late = m.changedChunks(beforeLua)
+            println("[#668] lua を基準の後に起こす: $late")
+            assertTrue(late.unbased > 0, "基準の後に起こした lua が基準なしになっていない: $late")
+            assertTrue(late.changed <= FullSaveRule.DEFAULT.minChangedChunks, "下限以下の場面でない: $late")
+            assertEquals(null, m.captureSnapshot(policy, beforeLua)!!.deltaBase, "既定の規則で全体にならない: $late")
+            // 全体の写しで基準が付いた後は、REPL で 1 行動かしても差分
             val (lua, luaBase) = measure("lua: 1 line", "print(1 + 1)\n", "> ")
             assertTrue(host.text().contains("\n2\r\n"), host.text().takeLast(2000))
             assertEquals(luaBase, m.captureSnapshot(policy, luaBase)!!.deltaBase, "既定の規則で差分にならない: $lua")
+
+            // lua がいる台でも同じ
+            val restored = m.changedChunks(unknown)
+            println("[#668] 復元の直後の init・sh・lua（全プロセスが基準なし）: $restored")
+            assertTrue(restored.total > 0 && restored.unbased == restored.total, "全プロセスが基準なしになっていない: $restored")
+            assertEquals(null, m.captureSnapshot(policy, unknown)!!.deltaBase, "既定の規則で全体にならない: $restored")
 
             for (r in results) println("[#668] $r")
             for (r in results) assertTrue(r.deltaBytes <= r.fullBytes, "差分が全体より大きい: $r")

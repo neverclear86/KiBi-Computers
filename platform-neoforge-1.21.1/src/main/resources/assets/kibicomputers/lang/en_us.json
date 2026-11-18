@@ -82,7 +82,7 @@
   "kibicomputers.configuration.save.fullSaveChangedRatio": "Full save threshold",
   "kibicomputers.configuration.save.fullSaveChangedRatio.tooltip": "Write a full save instead of a delta when more than this fraction of the rewritten pages changed from the base.",
   "kibicomputers.configuration.save.fullSaveMinChangedChunks": "Full save minimum pages",
-  "kibicomputers.configuration.save.fullSaveMinChangedChunks.tooltip": "Write a delta regardless of the threshold when at most this many 4 KiB pages changed from the base. 0 uses the threshold alone.",
+  "kibicomputers.configuration.save.fullSaveMinChangedChunks.tooltip": "Write a delta regardless of the threshold when at most this many 4 KiB pages changed from the base. Pages of processes not in the base (started after it, or after a restore) are not counted as under this limit: the threshold decides, so a full save can give them a base. 0 uses the threshold alone.",
   "kibicomputers.configuration.save.writerMaxPendingMiB": "Pending save limit (MiB)",
   "kibicomputers.configuration.save.writerMaxPendingMiB.tooltip": "Maximum total size of saves waiting to be written, in MiB. Above this, autosaves are postponed.",
   "kibicomputers.configuration.save.writerFlushMillis": "Save writer wait (ms)",

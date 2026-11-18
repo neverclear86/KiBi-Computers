@@ -82,7 +82,7 @@
   "kibicomputers.configuration.save.fullSaveChangedRatio": "全体保存に切り替える割合",
   "kibicomputers.configuration.save.fullSaveChangedRatio.tooltip": "書き換えた区画のうち、基準から変わった区画の割合がこれを超えたら、差分ではなく全体を保存する。",
   "kibicomputers.configuration.save.fullSaveMinChangedChunks": "全体保存に切り替える区画の下限",
-  "kibicomputers.configuration.save.fullSaveMinChangedChunks.tooltip": "基準から変わった区画（4 KiB）がこの数以下なら、割合によらず差分を保存する。0 なら割合だけで決める。",
+  "kibicomputers.configuration.save.fullSaveMinChangedChunks.tooltip": "基準から変わった区画（4 KiB）がこの数以下なら、割合によらず差分を保存する。基準に入っていないプロセス（基準の後に起こした、復元した）がいるときは、全体保存で基準を付け直すため、この下限によらず割合で決める。0 なら割合だけで決める。",
   "kibicomputers.configuration.save.writerMaxPendingMiB": "書き込み待ちの上限（MiB）",
   "kibicomputers.configuration.save.writerMaxPendingMiB.tooltip": "書き込み待ちの保存の大きさの合計の上限（MiB）。これ以上なら、自動保存を先に延ばす。",
   "kibicomputers.configuration.save.writerFlushMillis": "書き込みを待つ上限（ms）",

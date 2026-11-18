@@ -187,6 +187,53 @@ class MachineDeltaCaptureTest {
     }
 
     @Test
+    fun `基準に入っていないプロセスがいれば、下限によらず比で決める`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val a = h.waiting(m, gate)
+            m.captureSnapshot(policy)!!.committed(id1, 1)
+            val instanceA = m.rt(a.pid).instances.first() as FakeInstance
+            instanceA.chunkCounts = MemoryChunkCounts(10, 2)
+            // 基準の後に起こしたプロセス: 基準なしの 12 区画が加わり、changed = 14、total = 22（比 0.64）。下限（64）以下でも全体
+            val b = h.waiting(m, gate)
+            val instanceB = m.rt(b.pid).instances.first() as FakeInstance
+            instanceB.chunkCounts = MemoryChunkCounts(12, 12)
+            val counts = m.changedChunks(base(id1, 1))
+            assertEquals(14L, counts.changed)
+            assertEquals(22L, counts.total)
+            assertEquals(12L, counts.unbased)
+            val full = m.captureSnapshot(policy, base(id1, 1))!!
+            assertEquals(null, full.deltaBase, "基準なしのプロセスがいるのに、下限で差分になった")
+            full.committed(id1, 2)
+            // 全体の写しで基準が付いたので、次は小さな差分
+            instanceB.chunkCounts = MemoryChunkCounts(12, 1)
+            instanceA.chunkCounts = MemoryChunkCounts(10, 2)
+            assertEquals(0L, m.changedChunks(base(id1, 2)).unbased)
+            assertEquals(base(id1, 2), m.captureSnapshot(policy, base(id1, 2))!!.deltaBase)
+            gate.open()
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `基準が合わない台（復元の直後）は、小さくても比で全体になる`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine()
+            val gate = Gate(m)
+            val a = h.waiting(m, gate)
+            val instance = m.rt(a.pid).instances.first() as FakeInstance
+            // 復元した台: 置き場は基準を持つが、プロセスの基準は None。全部の区画が changed に入る（23 区画。下限以下）
+            instance.chunkCounts = MemoryChunkCounts(23, 23)
+            val counts = m.changedChunks(base(id1, 1))
+            assertEquals(23L, counts.unbased)
+            assertEquals(null, m.captureSnapshot(policy, base(id1, 1))!!.deltaBase)
+            gate.open()
+            m.stop()
+        }
+    }
+
+    @Test
     fun `全体か差分かの規則の境目`() {
         val rule = FullSaveRule(0.5, 4)
         assertTrue(!rule.isFull(4, 4), "下限ちょうどは差分")
@@ -201,6 +248,10 @@ class MachineDeltaCaptureTest {
         assertTrue(!FullSaveRule(0.0, 0).isFull(0, 10), "変わった区画が 0 なら、境目 0 でも差分")
         assertTrue(FullSaveRule(0.0, 0).isFull(1, 10))
         assertTrue(!FullSaveRule(1.0, 0).isFull(10, 10), "境目 1.0 なら全体にならない")
+        // 基準なしの区画があれば下限は効かない（全体の写しでしか基準を付け直せない。#668）
+        assertTrue(rule.isFull(4, 4, 4), "基準なしの区画は下限で隠さない")
+        assertTrue(!rule.isFull(4, 10, 4), "基準なしの区画があっても、比が境目以下なら差分")
+        assertTrue(!rule.isFull(4, 4, 0))
         assertEquals(FullSaveRule(MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO, MachineSaveConfig.DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS), MachineSaveConfig.DEFAULT.fullSaveRule)
     }
 
