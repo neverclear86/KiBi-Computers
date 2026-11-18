@@ -221,9 +221,14 @@ kibiWasm {
         sources.from("src/test/wasm/hello_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
-    // 0・1 以外の終了コード（p2 の exit は ok・err だけ）
+    // main が 0・1 以外を返す。wasi-libc の crt1 は wasi:cli/exit を呼ばず、wasi:cli/run の run から err を返す
     wasiSdkModule("exit3-p2") {
         sources.from("src/test/wasm/exit3.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // main から戻らずに exit() を呼ぶ。wasi-libc が wasi:cli/exit の exit を直接呼ぶ経路（exit3-p2 は run の err で、exit を呼ばない）
+    wasiSdkModule("exit-native-p2") {
+        sources.from("src/test/wasm/exit_native.c")
         compilerArgs.addAll("-O2", "-s")
     }
     // wasi-libc が p2 の wasi:filesystem（preopen・descriptor）を直接呼ぶ形で、パスの操作を確かめる（path_wasi.c はアダプター経由の p1 と同じソース）

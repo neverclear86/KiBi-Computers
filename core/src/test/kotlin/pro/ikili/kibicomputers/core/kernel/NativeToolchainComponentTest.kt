@@ -37,6 +37,7 @@ class NativeToolchainComponentTest {
 
     private val helloP2: ByteArray by lazy { resource("hello-wasi-p2") }
     private val exit3P2: ByteArray by lazy { resource("exit3-p2") }
+    private val exitNativeP2: ByteArray by lazy { resource("exit-native-p2") }
     private val helloP3: ByteArray by lazy { resource("hello-wasi-p3") }
     private val pathP2: ByteArray by lazy { resource("path-wasi-p2") }
     private val basicP2: ByteArray by lazy { resource("basic-native-p2") }
@@ -95,7 +96,7 @@ class NativeToolchainComponentTest {
         // （wasi-sdk を上げて wasm-component-ld がアダプターを挟む形に戻ったら、ここで落ちる）
         assertTrue(hasP1AdapterMark(P2Testing.wrap("hello-wasi")), "対照（アダプターで包んだもの）に p1 の印がない。検査が効いていない")
         assertTrue(!hasP1AdapterMark(helloP2), "ネイティブの成果物に wasi_snapshot_preview1 がある（アダプターを挟んでいる）")
-        assertTrue(!hasP1AdapterMark(pathP2) && !hasP1AdapterMark(basicP2) && !hasP1AdapterMark(exit3P2))
+        assertTrue(!hasP1AdapterMark(pathP2) && !hasP1AdapterMark(basicP2) && !hasP1AdapterMark(exit3P2) && !hasP1AdapterMark(exitNativeP2))
     }
 
     /** コンポーネントの中のどこかに、p1 のアダプターの印（`wasi_snapshot_preview1` の名前。core モジュールの import・アダプターの export）があるか */
@@ -151,13 +152,29 @@ class NativeToolchainComponentTest {
     }
 
     @Test
-    fun `0と1以外の終了コードはp2のexitのerrで1になる`() = timeout(limit) {
+    fun `mainが0と1以外を返すとrunのerrで終了コード1になる`() = timeout(limit) {
+        // wasm32-wasip2 の wasi-libc の crt1 は、main の戻り値が 0 でなければ wasi:cli/exit を呼ばず、wasi:cli/run の run から err を
+        // 返すだけ（exit を import すらしない）。終了コード 1 は WasiP2Driver の「run が err → 1」で決まる
+        assertTrue(importsOf(exit3P2).none { it.startsWith("import wasi:cli/exit@") }, "exit3-p2 が wasi:cli/exit を import している")
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = machine(h)
             write(m, "/bin/exit3", exit3P2)
-            // wasi-sdk 34 の wasi-libc は、main の戻り値が 0 でなければ wasi:cli/exit の exit(err) を呼ぶ。p2 の exit は ok・err だけ
-            // なので、err はカーネルの終了コード 1 になる（WasiP2Cli）
             assertEquals("exit 3\n" to 1, execAndWait(h, m, "/bin/exit3"))
+        }
+    }
+
+    @Test
+    fun `exitを呼ぶとwasi-libcがwasiのcliのexitを直接呼び終了コードになる`() = timeout(limit) {
+        // main から戻らずに exit() を呼ぶと、wasi-libc は wasi:cli/exit を直接呼ぶ（WasiP2Exit を投げて WasiP2Driver が終了コードにする）。
+        // ホストの写し方は WasiP2Cli（exit(ok) → 0、exit(err) → 1、exit-with-code(n) → n）。exit(3) が 3 になるのは exit-with-code を
+        // 通ったときだけ（exit(err) なら 1）なので、exit-with-code の経路はここで通る。0・1 で exit・exit-with-code のどちらを呼ぶかは見分けない
+        assertTrue(importsOf(exitNativeP2).any { it.startsWith("import wasi:cli/exit@") }, "exit-native-p2 が wasi:cli/exit を import していない")
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/exit", exitNativeP2)
+            for ((code, expected) in EXIT_CASES) {
+                assertEquals("exit($code)\n" to expected, execAndWait(h, m, "/bin/exit", args = listOf("exit", "$code")), "exit($code)")
+            }
         }
     }
 
@@ -176,5 +193,10 @@ class NativeToolchainComponentTest {
             assertEquals(Errno.NOEXEC, assertThrows<FsException> { m.exec("/bin/p3", KernelDrivers.DEFAULT) }.errno)
             assertEquals(1, h.scheduler.programs.loads.get())
         }
+    }
+
+    private companion object {
+        /** exit() に渡す値と、期待する終了コード */
+        val EXIT_CASES: List<Pair<Int, Int>> = listOf(0 to 0, 1 to 1, 3 to 3)
     }
 }
