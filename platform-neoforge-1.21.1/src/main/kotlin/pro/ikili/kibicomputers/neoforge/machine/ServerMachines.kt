@@ -213,7 +213,10 @@ object ServerMachines {
     private val promoted = LinkedHashMap<ChunkHolder, ServerLevel>()
 
     /** 復元の順番待ち（#85）。メインスレッドだけで使う */
-    private val restoreQueue = RestoreQueue<CaseBlockEntity>()
+    // ログに出す台の書き方: ディメンション・位置・ID（ブロックエンティティの toString は位置を含まない。#785）
+    private val restoreQueue = RestoreQueue<CaseBlockEntity> { be ->
+        "${be.owner ?: "位置不明"} id=${be.currentIdentity?.id ?: "なし"}"
+    }
 
     /** 自動保存の周期を数える tick */
     private var autosaveTicks = 0L
