@@ -1,0 +1,40 @@
+# keys(3)
+
+## 名前
+
+keys - Lua のキーの番号とキーのイベント
+
+## 書式
+
+    keys.a ... keys.z
+    keys.zero ... keys.nine
+    keys.enter, keys.space, keys.backspace, keys.tab, keys.escape, keys.up, ...
+    keys.getName(code)
+    os.pullEvent("key")       -- "key", code, held
+    os.pullEvent("key_up")    -- "key_up", code
+
+## 説明
+
+lua(1) には `keys` ライブラリがあります（`require("keys")` でも使えます）。CC: Tweaked の `keys` の API に合わせています。番号は同じ（GLFW のキーコード）で、`keys.getName(code)` は番号の名前を返します（なければ nil）。
+
+コンピューターにつないだキーボードのキーを押すと、プログラムは `key` のイベント（os(3)）を、番号と `held`（押し続けて繰り返したときは true）とともに受けます。離すと、番号とともに `key_up` を受けます。番号は `keys` と比べます。
+
+    while true do
+        local _, code = os.pullEvent("key")
+        if code == keys.q then break end
+        print(keys.getName(code))
+    end
+
+名前は CC: Tweaked と同じです（`leftCtrl`・`rightShift`・`numPad0`・`pageUp`・`grave`・`equals`・`f1` など）。`keys["return"]` は `keys.enter` と、`keys.scollLock`（昔の綴り違い）は `keys.scrollLock` と同じです。キーボードが送らないキー（`f13`〜`f25`）も表にあります。
+
+## CC: Tweaked との違い
+
+- `char` と `paste` のイベントはありません。打った文字は、Lua にイベントとしては届きません。文字列を読むときは `io.read` を使ってください（行は端末が編集します）
+- `keys.escape`（256）・`keys.world1`（161）・`keys.world2`（162）・`keys.rightSuper`（347）を足しています。表にないキーは、イベントになりません
+- 前に `key` のない `key_up` や、`key_up` の来ない `key` があります（ワールドを読み込んだ後など）。`restored` のイベントを受けたら、すべてのキーを離したものとして扱ってください
+- どのキーボードのキーかは分かりません。ほかのデバイスが `key-pressed`・`key-released` の名前で同じ形の値を出すと、それも `key`・`key_up` になります
+- 打ったものは端末にも届きます。プログラムが `key` を待つ間に、文字になるキー（英字・Enter・Esc・矢印など）は端末にも表示され、残ったものはプログラムが終わった後にシェルが読みます
+
+## 関連項目
+
+os(3), term(3), lua(1)

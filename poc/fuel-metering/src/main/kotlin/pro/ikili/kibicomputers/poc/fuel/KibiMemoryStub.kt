@@ -36,5 +36,9 @@ fun kibiLuaApiStubs(): List<HostFunction> {
         stub("kibi:computer/clock@0.1.0", "world-ticks", listOf(), listOf(ValType.I64)),
         stub("kibi:computer/power@0.1.0", "shutdown", listOf()),
         stub("kibi:computer/power@0.1.0", "reboot", listOf(i32)),
+        // term・fs（#724）
+        stub("kibi:io/tty@0.1.0", "is-tty", listOf(i32), listOf(i32)),
+        stub("kibi:io/tty@0.1.0", "get-size", listOf(i32, i32)),
+        stub("kibi:fs/mounts@0.1.0", "list-mounts", listOf(i32)),
     )
 }

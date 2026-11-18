@@ -14,7 +14,7 @@ Lua のプログラムを動かします。スクリプトがなければ、標�
 
 Lua の中からシェルは使えません。`os.execute`・`io.popen`・`os.tmpname` は使えません。
 
-`peripheral` ライブラリでコンピューターのデバイスを使えます（peripheral(3)）。`os` ライブラリにはイベント・タイマー・時刻・電源の関数があります（os(3)）。`parallel` ライブラリは、関数をコルーチンにして並べて動かします（parallel(3)）。どれも CC: Tweaked の Lua の API に合わせています。
+`peripheral` ライブラリでコンピューターのデバイスを使えます（peripheral(3)）。`os` ライブラリにはイベント・タイマー・時刻・電源の関数があります（os(3)）。`parallel` ライブラリは、関数をコルーチンにして並べて動かします（parallel(3)）。`term` ライブラリは位置と色を指定して端末に描き（term(3)、colors(3)）、`keys` はキーのイベントの番号を持ち（keys(3)）、`fs` はファイルとディレクトリを扱います（fs(3)）。どれも CC: Tweaked の Lua の API に合わせています。
 
 ## オプション
 
@@ -27,4 +27,4 @@ Lua の中からシェルは使えません。`os.execute`・`io.popen`・`os.tm
 
 ## 関連項目
 
-peripheral(3), os(3), parallel(3), nano(1), sh(1)
+peripheral(3), os(3), parallel(3), term(3), colors(3), keys(3), fs(3), nano(1), sh(1)

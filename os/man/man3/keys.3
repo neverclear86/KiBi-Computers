@@ -1,0 +1,40 @@
+# keys(3)
+
+## NAME
+
+keys - key codes and key events for Lua
+
+## SYNOPSIS
+
+    keys.a ... keys.z
+    keys.zero ... keys.nine
+    keys.enter, keys.space, keys.backspace, keys.tab, keys.escape, keys.up, ...
+    keys.getName(code)
+    os.pullEvent("key")       -- "key", code, held
+    os.pullEvent("key_up")    -- "key_up", code
+
+## DESCRIPTION
+
+lua(1) has a `keys` library (also `require("keys")`). It follows the `keys` API of CC: Tweaked: the codes are the same numbers (the key codes of GLFW), and `keys.getName(code)` returns the name of a code, or nil.
+
+When a key of a keyboard that is connected to the computer is pressed, the program gets the event `key` (os(3)) with the code and `held` (true when the key repeats because it is held down). When the key is released, it gets `key_up` with the code. Compare the codes with `keys`:
+
+    while true do
+        local _, code = os.pullEvent("key")
+        if code == keys.q then break end
+        print(keys.getName(code))
+    end
+
+The names are those of CC: Tweaked, for example `leftCtrl`, `rightShift`, `numPad0`, `pageUp`, `grave`, `equals` and `f1`. `keys["return"]` is the same as `keys.enter`, and `keys.scollLock` (an old misspelling) the same as `keys.scrollLock`. Keys that the keyboard does not send (`f13` to `f25`) are also in the table.
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- There are no `char` and `paste` events: the text that is typed is not given to Lua as events. To read text, use `io.read` (the terminal edits the line)
+- `keys.escape` (256), `keys.world1` (161), `keys.world2` (162) and `keys.rightSuper` (347) are added. A key that is not in the table does not give an event
+- A `key_up` may arrive without a `key` before it, and a `key` may have no `key_up` (for example after the world is loaded). After a `restored` event, treat all keys as released
+- The events do not tell which keyboard was used. Events of other devices with the names `key-pressed` and `key-released` and the same values are also given as `key` and `key_up`
+- The terminal still gets what is typed. While the program waits for `key`, the keys that make text (letters, Enter, Esc, the arrows and so on) are also shown on the terminal, and what is left is read by the shell after the program ends
+
+## SEE ALSO
+
+os(3), term(3), lua(1)

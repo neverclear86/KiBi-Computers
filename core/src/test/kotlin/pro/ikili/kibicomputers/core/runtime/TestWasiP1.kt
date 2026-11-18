@@ -147,7 +147,7 @@ class TestWasiP1(private val args: List<String>, stdin: String = "") {
         const val KIBI = "kibi:computer/memory@0.1.0"
 
         /** Lua 向けの KiBi API（#94）が使う import のモジュール */
-        val KIBI_LUA_API: Set<String> = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0")
+        val KIBI_LUA_API: Set<String> = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0", "kibi:io/tty@0.1.0", "kibi:fs/mounts@0.1.0")
         private const val SUCCESS = 0
         private const val EBADF = 8
         private const val ENOSYS = 52

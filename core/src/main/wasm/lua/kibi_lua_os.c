@@ -237,6 +237,29 @@ static void push_kernel_event(lua_State *L, const kibi_event_t *e) {
         kibi_lua_fifo_push(L, 1);
         return;
     }
+    /*
+     * キーボードの押下・離し（ADR 0326）を CC の "key", 番号, 繰り返し・"key_up", 番号 にする（#724。ADR 0724）。
+     * 形（source があり、値が text・integer（・boolean））だけで見分ける。"unknown" と表にないキー名は捨てる
+     */
+    int pressed = str_is(&e->kind, "key-pressed");
+    if ((pressed || str_is(&e->kind, "key-released")) && !no_source && nvals >= (pressed ? 3u : 2u) &&
+        vals[0].tag == KIBI_EVENT_VALUE_TEXT && vals[1].tag == KIBI_EVENT_VALUE_INTEGER &&
+        (!pressed || vals[2].tag == KIBI_EVENT_VALUE_BOOLEAN)) {
+        int code = kibi_lua_key_code((const char *)vals[0].val.text.ptr, vals[0].val.text.len);
+        if (code < 0) return;
+        if (pressed) {
+            lua_pushliteral(L, "key");
+            lua_pushinteger(L, code);
+            lua_pushboolean(L, vals[2].val.boolean != 0);
+            kibi_lua_fifo_push(L, 3);
+        } else {
+            lua_pushliteral(L, "key_up");
+            lua_pushinteger(L, code);
+            kibi_lua_fifo_push(L, 2);
+        }
+        return;
+    }
+    if (no_source && str_is(&e->kind, "restored")) kibi_lua_term_restored();
     int n = 1;
     lua_pushlstring(L, (const char *)e->kind.ptr, e->kind.len);
     if (!no_source) {
