@@ -155,7 +155,7 @@ const PLAN_REVIEW_SCHEMA = {
 const IMPLEMENT_SCHEMA = {
   type: 'object',
   properties: {
-    status: { type: 'string', enum: ['pr_opened', 'blocked'] },
+    status: { type: 'string', enum: ['pr_opened', 'blocked', 'already_done'] },
     pr: { type: ['integer', 'null'] },
     branch: { type: ['string', 'null'] },
     worktree: { type: ['string', 'null'], description: 'worktree の絶対パス' },
@@ -390,6 +390,8 @@ function implement(info, approvedPlan, guidance, advice) {
 4. PR を \`gh pr create\` で作る（1つの Issue を複数の PR に分けるときは、AGENTS.md の手順で Stacked PRs にする）。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
+着手する前に \`gh issue view ${info.number} --json state,closedByPullRequestsReferences\` で Issue の状態を取り直す。もう閉じていたら（同じ実行の別の PR が一緒に閉じた、など）、worktree・ブランチ・PR を作らず、コメントもせずに status=already_done で終え、summary に閉じた PR を書く。
+
 未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて status=blocked で終える。summary に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。
 PR を作ったうえで、人に確かめてほしい点が残る（PR 本文に「確認してほしいこと」を書いた）なら、論点・選択肢・推奨を1件ずつ openQuestions に入れる。なければ空にする（マージの前に、このスクリプトが確かめる）。
 publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。touchesConcurrency には、スレッド・ロック・非同期の完了待ちなど、並行して動く処理の振る舞いを変えたかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}${advice ? `\n\n着手前の設計の助言（別のモデル。鵜呑みにせず、コードと突き合わせて使う）:\n${advice}` : ''}`,
@@ -586,6 +588,8 @@ async function runIssue(info) {
     }
 
     if (!impl) impl = await implement(info, approvedPlan, null, advice)
+    // 着手の前に閉じていた Issue は、人に聞かずに飛ばす
+    if (impl && impl.status === 'already_done') return { issue: info.number, status: 'skipped', reason: impl.summary, question: null }
     if (impl && impl.status === 'blocked') {
       const e = await escalate('issue', info.number, impl.summary, '実装の段階で、人が決めることか未決の decision に当たって止まった', true)
       if (!e.guidance) return { issue: info.number, status: 'needs_human', reason: e.question, question: e.question }
