@@ -152,6 +152,12 @@ kibiWasm {
         sources.from("src/test/wasm/oom_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // Lua のアロケーターの包みが写した malloc（BrkAllocator）の区画の計算（kibi_brk.h。#784）が、実際の malloc と合うかを確かめる CLI
+    module("brk-slots-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/brk_slots_wasi.c")
+        includeDirs.from("src/main/wasm/lua")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // 独自拡張 kibi:computer/memory（#408・#73）の p1 の import を確かめる CLI
     module("kibi-memory-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/kibi_memory_wasi.c")
