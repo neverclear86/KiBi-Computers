@@ -176,6 +176,7 @@ p1 には作業ディレクトリ（cwd）を読み書きする関数があり�
 
 - `environ_get` が見せる環境変数には、`PWD=<カーネルの cwd>` が必ず1つ入ります（渡された環境に `PWD` があればその位置で値を置き換え、なければ最後に足します）。値は最初に `environ_*` を呼んだ時点の cwd で、その後は変わりません
 - wasi-libc は起動時に `PWD` を読みません。相対パスをカーネルの cwd から辿らせるには、プログラムの起動時に `getenv("PWD")` へ `chdir` してください
+- アダプター（`wasi_snapshot_preview1`）で p2 のコンポーネントに包んだ p1 のプログラムでも同じです。p2 の `get-environment` が同じ `PWD` を返します（値は起動時の cwd。[WASI p2・p3](./p2-p3.md)）
 - libc の `chdir` はカーネルに伝わりません。子プロセスに引き継がせたいときは、`kibi:process` の `set-cwd` も呼んでください（[kibi:process](./kibi-process.md)）
 
 ## 待ち方と保存

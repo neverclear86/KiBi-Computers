@@ -46,7 +46,7 @@ class WasiP2ProgramTest {
     }
 
     /**
-     * 引数（argv[0] を含む）・環境変数（`PWD` を足さない）・単調時計・壁時計は p1 と同じに見える。`CLOCK_PROCESS_CPUTIME_ID` は、
+     * 引数（argv[0] を含む）・環境変数（`PWD=<起動時の cwd>` を足す。#760。basic_wasi.c は件数を数えない）・単調時計・壁時計は p1 と同じに見える。`CLOCK_PROCESS_CPUTIME_ID` は、
      * アダプターが p2 の時計に写さない（p2 に CPU 時間の時計はない）ので、その行で止まる
      */
     @Test

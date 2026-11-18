@@ -71,6 +71,7 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 - `get-stdin`・`get-stdout`・`get-stderr` は fd 0・1・2 のオブジェクトを参照する stream（位置を持たない共有の stream）。`terminal-stdin` などは、その fd が TTY のときだけ `some`。
 - `preopens.get-directories` は p1 と同じく fd 3（`/`）を 1 つだけ、名前 `"/"` で返す（descriptor の flags は read と mutate-directory）。
 - `get-arguments` は argv[0] を含む引数そのまま（p1 と同じ）。`get-environment` は環境変数から `PWD` を除いたもの、`initial-cwd` は開始時の cwd（ADR 0332 で p1 は `PWD` で渡すが、p2 には専用の関数がある）。親が `PWD` を環境変数に入れて起動しても、ゲストには見せない（古い値が `initial-cwd` とずれないように）。アダプターで包んだ p1 のプログラムは `PWD` を受け取らないので、`kibi_cwd.c` による cwd の同期は働かない（p2 のコマンドは `initial-cwd` で cwd を知る）。
+  - 追記（#760）: `PWD` を除く規則をやめ、`get-environment` に `PWD=<initial-cwd>` を入れる。規則は p1 の `WasiP1Basic.p1Environment` と同じ（親が渡した `PWD` は同じ位置で値を置き換え、なければ最後に足す。`Process.env` は変えず、`PWD` の分は環境変数の大きさの上限に数えない）。値は起動時に固定した `initial-cwd`（`HostResourceTable.initialCwd`）で、`kibi:process` の `set-cwd` の後も変わらない。理由: wasmtime のアダプターは `initial-cwd` を import せず、wasi-libc と Rust の std も `initial-cwd` を読まないので、`PWD` で渡さないとアダプターで包んだ p1 のプログラムが cwd を知る方法がない。値を固定するので `initial-cwd` とずれず、アダプターが `environ_sizes_get` と `environ_get` で `get-environment` を 2 回呼んでも大きさと中身が合う。これで、包んだ p1 のプログラムでも `kibi_cwd.c` の同期が働く。
 
 #### エラーの写し方
 
@@ -105,6 +106,8 @@ descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確
 ### 保存
 
 コンポーネントのプロセスは、今までどおり保存できないもの（`UNSAVEABLE`。ADR 0263）。保存のときは写しの中で殺し、ホストの resource の表も閉じて、オブジェクトの参照を残さない。表の中身（rep → 中身）を保存する形は #269 で決める（中身はカーネルのオブジェクトの参照と小さな値だけなので、fd の表と同じ形で書ける）。
+
+追記（#760）: #269 でコンポーネントのプロセスを保存するときは、`HostResourceTable.initialCwd` も保存する。保存しないと、戻した後に今の cwd で決め直され、`get-environment` の `PWD` と `initial-cwd` が起動時の値から変わる。
 
 ## 制約と残り
 

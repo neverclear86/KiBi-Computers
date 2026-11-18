@@ -176,6 +176,7 @@ p1 has no function to read or change the working directory (cwd). The kernel kee
 
 - The environment shown by `environ_get` always contains exactly one `PWD=<kernel cwd>` (if the given environment has `PWD`, its value is replaced in place; otherwise it is appended). The value is the cwd at the first `environ_*` call and does not change after that
 - wasi-libc does not read `PWD` at startup. To make relative paths start from the kernel cwd, `chdir` to `getenv("PWD")` when your program starts
+- The same holds for p1 programs wrapped into p2 components with the adapter (`wasi_snapshot_preview1`): p2's `get-environment` returns the same `PWD` (the cwd at startup. See [WASI p2 and p3](./p2-p3.md))
 - libc's `chdir` is not passed to the kernel. To have children inherit it, also call `set-cwd` in `kibi:process` ([kibi:process](./kibi-process.md))
 
 ## Waiting and saving
