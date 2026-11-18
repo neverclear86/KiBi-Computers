@@ -1,7 +1,7 @@
 package kibi:process@0.1.0;
 
 /// p2 で、プロセスの終わりを待つ・p2 のハンドルを子に渡す（ADR 0074）。p1 では使わない。
-/// #685 で実装（ABI は確認待ち）（ADR 0685）。pollable はプロセスのハンドルの子で、子の pollable が残る process を捨てるとトラップ。
+/// #685 で実装（ADR 0685）。pollable はプロセスのハンドルの子で、子の pollable が残る process を捨てるとトラップ。
 interface process-poll {
     use wasi:io/poll@0.2.12.{pollable};
     use wasi:io/streams@0.2.12.{input-stream, output-stream};
@@ -16,6 +16,7 @@ interface process-poll {
     variant handle-source {
         input(borrow<input-stream>),
         output(borrow<output-stream>),
+        /// ディレクトリに限らず、ファイルの descriptor も渡せる（子の fd はそのファイルを開いたものを指す。権利は flags の read・write から。どちらもなければ開いたときの権利）
         directory(borrow<descriptor>),
         process(borrow<process>),
     }
@@ -30,6 +31,6 @@ interface process-poll {
     /// p2 の options.fds の parent(n) は n が 0・1・2 のときだけ（ほかは bad-descriptor。process.wit の fd-source.parent のとおり。ほかのハンドルは handles で渡す）。
     /// input・output に渡せるのは、パイプの端・TTY・標準入出力の stream（get-stdin などで取ったもの）。
     /// 自分の位置で読み書きするファイルの stream（read-via-stream など）は not-supported、閉じた stream は bad-descriptor。
-    /// directory は descriptor の flags（read・write）を子の fd の権利に写す。process は子に同じプロセスのハンドルを渡す
+    /// directory は descriptor の flags（read・write）を子の fd の権利に写す（どちらもなければ開いたときの権利をそのまま渡す）。process は子に同じプロセスのハンドルを渡す
     spawn-with-handles: func(path: string, options: spawn-options, handles: list<handle-assign>) -> result<process, error-code>;
 }

@@ -13,7 +13,7 @@
 - 待機点型の `invoke` は、待つ間の状態を呼んだプロセスの fd 表に入れた `PendingDeviceCall` に持つ。**保存形式は変えない**（#65 の Q6 のまま当てはまる）
 - `invoke` の道でデバイスを引くのは1回だけ（ADR 0066）。「メインスレッドか」を確かめたデバイスで実行する
 - 公開 API（`pro.ikili.kibicomputers.api`）は変えない。足したカーネルの口はすべて internal
-- p3 の WIT（`bus-async`）は仮置き。実装しない。p3 の層（#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073）。p2 の `bus-poll` は #685 で実装した（ABI はオーナーの確認待ち。PR #778）（ADR 0685）
+- p3 の WIT（`bus-async`）は仮置き。実装しない。p3 の層（#266）を作るときに直してよい（v0.1.0 までは版を変えずに直す。ADR 0073）。p2 の `bus-poll` は #685 で実装した（ADR 0685）
 
 ## p1 の import（`kibi:device/bus@0.1.0`）
 
@@ -100,7 +100,7 @@
 - `list-devices`・`methods` は件数 × `KibiDevice.DEVICE_LIST_FUEL_PER_ENTRY`（10。`list-processes` の前例）を加える
 - `invoke`・`start`・`take` は、カーネルが `DeviceLimits` の分（呼び出しの分と結果のバイト数）を払う
 
-## p2・p3 の WIT（p2 の `bus-poll` は #685 で実装（ABI は確認待ち）、p3 の `bus-async` は仮置きで実装しない）
+## p2・p3 の WIT（p2 の `bus-poll` は #685 で実装、p3 の `bus-async` は仮置きで実装しない）
 
 `core/src/main/wit/kibi-device/`:
 

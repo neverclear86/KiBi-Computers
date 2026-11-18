@@ -28,7 +28,7 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
  *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `bad-descriptor`。process.wit の `fd-source.parent` のとおり）
  * - 読み込みを待つのは `ctx.execWithHandle`（p1 の BLOCK と同じ待ち方。読み込みの間は CPU と許可を返す）
  * - `spawn-with-handles`: `options.fds` を当ててから `handles` を当てる。同じ fd を2回（`handles` の中で、または `fds` と `handles` で）
- *   書いたら `invalid`。渡せるのはパイプの端・`Tty`・共有の位置の stream（`get-stdin` など）・`descriptor`（権利は flags から）・`process`。
+ *   書いたら `invalid`。渡せるのはパイプの端・`Tty`・共有の位置の stream（`get-stdin` など）・`descriptor`（権利は flags の read・write から。どちらもなければ開いたときの権利）・`process`。
  *   自分の位置を持つファイルの stream は `not-supported`、閉じた stream は `bad-descriptor`
  */
 internal object KibiP2Process {
