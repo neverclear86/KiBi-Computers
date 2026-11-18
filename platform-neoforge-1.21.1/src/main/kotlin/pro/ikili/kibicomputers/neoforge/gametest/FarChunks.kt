@@ -18,7 +18,8 @@ import net.minecraft.world.level.ChunkPos
  * 払い出す。
  *
  * - 基点は、最初に頼んだテストの起点のチャンクから [BASE_OFFSET] だけ x・z の両方にずらした所。GameTest の起点は実行ごとにランダム
- *   （`GameTestServer.startTests`）なので、前の実行の残りもの（ディスクのチャンク、`chunks.dat` の強制読み込み）を踏まない。
+ *   （`GameTestServer.startTests`）なので、前の実行の残りもの（ディスクのチャンク、`chunks.dat` の強制読み込み）を踏まない。Gradle の run は毎回
+ *   ワールドを消す（#792）が、`-PkeepGameTestWorld` や IDE からの起動で使い回したときの保険として残す。
  *   GameTest の並び（x に数チャンク、z に十数チャンク）や、負荷試験の見る人の移動先（x に +62,500 チャンク）とも重ならない。
  * - slot は -x に [STRIDE] ずつ進み、使い回さない（アンロードは後から非同期に起き、落とし物やディスクのチャンクも残るため）。
  * - 強制読み込みのチャンクのチケットの段階は 31 ＋ 距離で、読み込まれたまま残るのは距離 13 まで。keeper（+x に [KEEPER_DISTANCE]）を
