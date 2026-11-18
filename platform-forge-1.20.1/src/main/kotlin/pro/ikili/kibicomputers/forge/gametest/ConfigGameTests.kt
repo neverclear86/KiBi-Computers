@@ -51,7 +51,7 @@ object ConfigGameTests {
      * そのたびに `serverconfig` の TOML を書き、ファイルを見張るスレッドが本物の `Reloading` を遅れて出す。
      * それがテストの読み直しと重なると、古い値の写しで上書きされて落ちる（#773）。
      * そこで、テストの間だけ spec をファイルを持たない写し（[detachedCopy]）につなぎ替えて値を変え、
-     * 終わったらファイルの設定に戻す。ファイルは書かない（内容が変わらないことも確かめる）。
+     * 終わったらファイルの設定に戻す。ファイルは書かない（更新時刻と内容が変わらないことを確かめる。内容だけだと、途中で書いて元の値に戻した場合を見逃す）。
      * `ModConfig` の `configData` は差し替えないので、`KiBiConfigs` はファイルの読み直しとして扱う
      */
     @JvmStatic
@@ -62,7 +62,10 @@ object ConfigGameTests {
         val modConfig = serverModConfig()
         val spec = modConfig.getSpec<ForgeConfigSpec>() as ForgeConfigSpec
         val fileData = modConfig.configData
+        // 内容だけでなく更新時刻も見る。途中で書いて元の値に戻しても、TOML の書き出しが安定していれば
+        // 前後のバイト列は同じになるが、書き込みがあれば更新時刻は進む
         val fileBefore = Files.readAllBytes(modConfig.fullPath)
+        val modifiedBefore = Files.getLastModifiedTime(modConfig.fullPath)
         val original = KiBiConfigs.server[entry]
         val bumped = otherValue(entry, original)
         try {
@@ -88,8 +91,12 @@ object ConfigGameTests {
             "restoring the value should be reflected (was ${KiBiConfigs.server[entry]}, expected $original)",
         )
         helper.assertTrue(
+            Files.getLastModifiedTime(modConfig.fullPath) == modifiedBefore,
+            "the test should not write the server config file (its modification time changed)",
+        )
+        helper.assertTrue(
             Files.readAllBytes(modConfig.fullPath).contentEquals(fileBefore),
-            "the test should not write the server config file",
+            "the test should not change the server config file",
         )
         helper.succeed()
     }
