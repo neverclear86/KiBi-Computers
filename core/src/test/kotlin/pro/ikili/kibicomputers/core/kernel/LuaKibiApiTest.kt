@@ -71,6 +71,7 @@ class LuaKibiApiTest {
             .direct("get-size") { _, _ -> arrayOf(DeviceValue.of(80L), DeviceValue.of(25L)) }
             .direct("needs-int") { _, args -> arrayOf(DeviceValue.of(args.getLong(0))) }
             .direct("fail") { _, _ -> throw DeviceException("boom") }
+            .direct("fail-with") { _, args -> throw DeviceException(args.getText(0)) }
             .direct("emit") { _, args ->
                 context!!.postEvent("ping", DeviceValue.of(args.getLong(0)))
                 emptyArray()
@@ -276,7 +277,7 @@ class LuaKibiApiTest {
                 "true\tfalse\tfalse",
                 "test:dev\tnil",
                 "true\ttrue\tfalse\tnil",
-                "big,echo,emit,emit-as,fail,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
+                "big,echo,emit,emit-as,fail,fail-with,get-size,main-echo,main-fail,main-gate,main-mark,needs-int,posted,types",
                 "1\ta\ttrue",
                 "80\t25",
                 "80\t25",
@@ -1285,6 +1286,211 @@ class LuaKibiApiTest {
             r.finish()
         }
         assertEquals("0\t20\ttrue\n", out)
+    }
+
+    /**
+     * 写す間の __gc から呼ぶ、入れ子の peripheral の関数（#756）。call（直接のメソッド echo に [nsize] + k 文字の文字列を渡す）と、
+     * open_device を通る isPresent・wrap・getMethods、push_device_list を通る getNames・find を順に呼び、
+     * 成功なら値が合うか、失敗なら「写している途中」のエラーかを数える（nbad・refused）。どの関数が拒否されたかは byOp に数える。
+     * __gc のたびに次の __gc を持つごみを作り、連鎖は 3,000 回で止める。__gc は結果と同じくらいの大きさの文字列も作り、戻された場所を使い回させる
+     */
+    private fun nestedCallPrelude(nsize: Int) = """
+        local addr, call, pc = "$ADDRESS", peripheral.call, pcall
+        local hits, junk, refused, nbad = 0, {}, 0, 0
+        local byOp = {}
+        local ops = {
+            function(k)
+                local s = string.rep("Z", $nsize + k)
+                return s, call(addr, "echo", s)
+            end,
+            function() local n = peripheral.getNames(); return #n == 1 and n[1] == addr end,
+            function() local r = { peripheral.find("test:dev") }; return #r == 1 and type(r[1]) == "table" end,
+            function() return peripheral.isPresent(addr) end,
+            function() return type(peripheral.wrap(addr)) == "table" end,
+            function() return #peripheral.getMethods(addr) == 14 end,
+        }
+        local function nested(k)
+            local op = k % #ops + 1
+            local ok, a, b = pc(ops[op], k)
+            if ok then
+                if op == 1 then
+                    if a ~= b then nbad = nbad + 1 end
+                elseif a ~= true then
+                    nbad = nbad + 1
+                end
+            elseif tostring(a):find("cannot call a peripheral while a result is being copied", 1, true) then
+                refused = refused + 1
+                byOp[op] = (byOp[op] or 0) + 1
+            else
+                nbad = nbad + 1
+            end
+        end
+        local mt = {}
+        mt.__gc = function()
+            hits = hits + 1
+            for k = 1, 8 do junk[k] = string.rep("Y", $nsize + k) end
+            nested(hits)
+            if hits < 3000 then setmetatable({}, mt) end
+        end
+        for i = 1, 16 do setmetatable({}, mt) end
+    """.trimIndent()
+
+    @Test
+    fun `メインスレッドの結果を写す間に__gcがperipheral_callを呼ぶと、エラーになり、結果は壊れない`() = timeout(limit) {
+        // その場で待つ呼び出し（invoke_now）と getNames・getMethods・getType が arena にある結果を写す間は kibi_lua_arena_hold で囲み、
+        // 入れ子の peripheral の関数はエラーにする（#756）。止めなければ、入れ子の open_device が arena を戻して取り直し、写している結果が壊れる
+        val out = Run(
+            nestedCallPrelude(1500) + "\n" +
+                """
+                local big = {}
+                for i = 1, 32 do big[i] = string.rep(string.char(65 + i % 26), 1500) .. i end
+                local bad = 0
+                collectgarbage("incremental", 0, 1000)
+                for round = 1, 20 do
+                    local a = { call(addr, "echo", table.unpack(big)) }
+                    for i = 1, 32 do if a[i] ~= big[i] then bad = bad + 1 end end
+                    local names = peripheral.getNames()
+                    if #names ~= 1 or names[1] ~= addr then bad = bad + 1 end
+                    local ms = peripheral.getMethods(addr)
+                    if #ms ~= 14 then bad = bad + 1 end
+                    if peripheral.getType(addr) ~= "test:dev" then bad = bad + 1 end
+                end
+                collectgarbage("incremental", 200, 100)
+                print(bad, nbad, refused > 0)
+                """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\t0\ttrue\n", out)
+    }
+
+    @Test
+    fun `コルーチンの中の結果を写す間に__gcがperipheral_callを呼ぶと、エラーになり、結果は壊れない`() = timeout(limit) {
+        // コルーチンの中の echo（その場で終わる。return_taken）と main-echo（回収。kibi_lua_tasks_collect か return_taken）の結果を写す間の
+        // __gc から、入れ子の peripheral.call を呼ぶ（#756）。どちらの道を通ったかは tick 次第なので見ない
+        val out = Run(
+            nestedCallPrelude(1500) + "\n" +
+                """
+                local big = {}
+                for i = 1, 32 do big[i] = string.rep(string.char(65 + i % 26), 1500) .. i end
+                local bad = 0
+                collectgarbage("incremental", 0, 1000)
+                parallel.waitForAll(function()
+                    for round = 1, 10 do
+                        local a = { call(addr, "echo", table.unpack(big)) }
+                        local b = { call(addr, "main-echo", table.unpack(big)) }
+                        for i = 1, 32 do
+                            if a[i] ~= big[i] then bad = bad + 1 end
+                            if b[i] ~= big[i] then bad = bad + 1 end
+                        end
+                    end
+                end, function()
+                    for round = 1, 10 do
+                        local ms = peripheral.getMethods(addr)
+                        if #ms ~= 14 then bad = bad + 1 end
+                        os.sleep(0)
+                    end
+                end)
+                collectgarbage("incremental", 200, 100)
+                print(bad, nbad, refused > 0)
+                """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\t0\ttrue\n", out)
+    }
+
+    @Test
+    fun `失敗の文を写す前に__gcがperipheral_callを呼んでも、文は壊れない`() = timeout(limit) {
+        // call-error の文（arena にある）に位置を付ける luaL_where の確保で GC が走ると、前は文を写す前に __gc の入れ子の呼び出しが
+        // arena を戻していた（#756）。今は文を写して arena を戻してから位置を付ける。文は 1,000 バイト（ホストの上限は 1,024）
+        val out = Run(
+            nestedCallPrelude(1000) + "\n" +
+                """
+                local msg = string.rep("E", 1000)
+                local bad = 0
+                collectgarbage("incremental", 0, 1000)
+                for round = 1, 300 do
+                    local ok, e = pc(call, addr, "fail-with", msg)
+                    if ok or type(e) ~= "string" or e:sub(-1000) ~= msg then bad = bad + 1 end
+                end
+                parallel.waitForAll(function()
+                    for round = 1, 100 do
+                        local ok, e = pc(call, addr, "fail-with", msg)
+                        if ok or type(e) ~= "string" or e:sub(-1000) ~= msg then bad = bad + 1 end
+                    end
+                end)
+                collectgarbage("incremental", 200, 100)
+                print(bad, nbad, hits > 0)
+                """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\t0\ttrue\n", out)
+    }
+
+    @Test
+    fun `カーネルのイベントを写す間に__gcがperipheral_callを呼ぶと、エラーになり、イベントは壊れない`() = timeout(limit) {
+        // take_kernel_events がイベントを写す間（kibi_lua_arena_hold の中）の __gc から、入れ子の peripheral.call を呼ぶ（#756）。
+        // 止めなければ、入れ子の open_device が arena を戻し、写しているイベントの場所を解放する
+        val out = Run(
+            nestedCallPrelude(480) + "\n" +
+                """
+                local pull = os.pullEventRaw
+                local parts = {}
+                for i = 1, 8 do parts[i] = string.rep(string.char(65 + i % 26), 480) .. i end
+                local bigs, bad = 0, 0
+                local function check(name, ...)
+                    if name ~= "big" then return end
+                    local a = { ... }
+                    bigs = bigs + 1
+                    if #a ~= 9 or a[1] ~= addr then bad = bad + 1; return end
+                    for i = 1, 8 do if a[i + 1] ~= parts[i] then bad = bad + 1; return end end
+                end
+                -- イベントのキューを先に開く（開く前に来たイベントは届かない）
+                os.queueEvent("x"); pull()
+                collectgarbage("incremental", 0, 1000)
+                for round = 1, 20 do
+                    call(addr, "emit-as", "big", table.unpack(parts))
+                    while bigs < round do check(pull()) end
+                end
+                collectgarbage("incremental", 200, 100)
+                print(bad, bigs, nbad, refused > 0)
+                """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\t20\t0\ttrue\n", out)
+    }
+
+    @Test
+    fun `メインスレッドの結果を写す間に__gcがos_queueEventを呼んでも、結果は壊れない`() = timeout(limit) {
+        // キューを開いた後、その場で待つ呼び出しと getNames・getMethods の結果を写す間の __gc から os.queueEvent を呼ぶ（#759）。
+        // 写す間は kibi_lua_arena_hold で囲むので、os の回収（collect）は arena を使うもの（take_kernel_events）をしない。
+        // 止めなければ、入れ子の take_kernel_events が arena を戻して取り直し、写している結果が壊れる
+        val out = Run(
+            """
+            local addr, call = "$ADDRESS", peripheral.call
+            local hits, junk = 0, {}
+            local mt = {}
+            mt.__gc = function()
+                hits = hits + 1
+                os.queueEvent("g")
+                for k = 1, 8 do junk[k] = string.rep("Z", 1500 + k) end
+                if hits < 3000 then setmetatable({}, mt) end
+            end
+            -- イベントのキューを先に開く（開いていないと、回収はカーネルのイベントを取り出さない）
+            os.queueEvent("x"); os.pullEventRaw()
+            for i = 1, 16 do setmetatable({}, mt) end
+            local big = {}
+            for i = 1, 32 do big[i] = string.rep(string.char(65 + i % 26), 1500) .. i end
+            local bad = 0
+            collectgarbage("incremental", 0, 1000)
+            for round = 1, 20 do
+                local a = { call(addr, "echo", table.unpack(big)) }
+                for i = 1, 32 do if a[i] ~= big[i] then bad = bad + 1 end end
+                local names = peripheral.getNames()
+                if #names ~= 1 or names[1] ~= addr then bad = bad + 1 end
+                local ms = peripheral.getMethods(addr)
+                if #ms ~= 14 then bad = bad + 1 end
+            end
+            collectgarbage("incremental", 200, 100)
+            print(bad, hits > 0)
+            """.trimIndent(),
+        ).use { it.finish() }
+        assertEquals("0\ttrue\n", out)
     }
 
     @Test
