@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.HostResourceIds
+import pro.ikili.kibicomputers.core.runtime.component.link.HostWait
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.ResourceImpl
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
@@ -34,7 +35,7 @@ class KibiP2HostTest {
             "kibi:io/tty", "kibi:io/pipe-streams",
             "kibi:fs/mounts",
             "kibi:device/types", "kibi:device/bus", "kibi:device/bus-poll",
-            "kibi:computer/clock", "kibi:computer/power", "kibi:computer/access",
+            "kibi:computer/memory", "kibi:computer/clock", "kibi:computer/power", "kibi:computer/access",
         )
         assertEquals(expected, KibiP2Host.interfaces.keys)
         assertTrue(KibiP2Host.interfaces.values.all { it.fallback == null })
@@ -70,24 +71,28 @@ class KibiP2HostTest {
     }
 
     @Test
-    fun `kibiは0点1点0の完全一致だけで、p1だけ・p3・memoryのinterfaceは出さない`() {
+    fun `kibiは0点1点0の完全一致だけで、p1だけ・p3のinterfaceは出さない`() {
         assertNotNull(KernelComponentHost.interfaceOf("kibi:kernel/events@0.1.0"))
         assertSame(KibiP2Host.interfaceOf("kibi:io/tty@0.1.0"), KernelComponentHost.interfaceOf("kibi:io/tty@0.1.0"))
         assertSame(WasiP2Host.interfaceOf("wasi:io/poll@0.2.3"), KernelComponentHost.interfaceOf("wasi:io/poll@0.2.3"))
         for (bad in listOf(
             "kibi:kernel/events@0.1.1", "kibi:kernel/events", "kibi:kernel/events@0.2.0",
-            "kibi:io/fd@0.1.0", "kibi:io/pipe@0.1.0", "kibi:computer/memory@0.1.0",
+            "kibi:io/fd@0.1.0", "kibi:io/pipe@0.1.0", "kibi:computer/memory@0.1.1",
             "kibi:kernel/events-async@0.1.0", "kibi:process/process-async@0.1.0", "kibi:device/bus-async@0.1.0",
             "other:pkg/iface@0.1.0",
         )) {
             assertNull(KernelComponentHost.interfaceOf(bad), bad)
         }
         assertSame(KernelComponentHost, KernelDrivers.COMPONENT_HOST)
+        // memory は p2 でも出す（#777。ADR 0777）。待たない
+        val memory = KernelComponentHost.interfaceOf("kibi:computer/memory@0.1.0")!!
+        assertEquals(setOf("remaining", "commit"), memory.functions.keys)
+        assertTrue(memory.functions.values.all { it.wait == HostWait.NONE })
     }
 
     @Test
     fun `出さないkibiのimportは読み込みの失敗`() {
-        for (name in listOf("kibi:computer/memory@0.1.0", "kibi:io/fd@0.1.0", "kibi:computer/clock@0.1.1")) {
+        for (name in listOf("kibi:io/pipe@0.1.0", "kibi:io/fd@0.1.0", "kibi:computer/clock@0.1.1")) {
             assertThrows<WasmLoadException>(name) {
                 loadWat("""(component (import "$name" (instance (export "uptime-ticks" (func (result u64))))))""")
             }

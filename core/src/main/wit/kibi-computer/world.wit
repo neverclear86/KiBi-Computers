@@ -8,8 +8,10 @@ world imports {
     import access;
 }
 
-/// p2 のゲスト向け（#685。ADR 0685）。memory は p2 では出さない（commit が線形メモリの番地を受けるため。p2/p3 での形は #777 で決める）
+/// p2 のゲスト向け（#685。ADR 0685）。memory の commit の ptr は、lower した commit を import した core インスタンスの線形メモリの番地（p1 と同じ。#777。ADR 0777）。
+/// p3 の world はまだ置かない（#266 で足す。それまでは p3 のゲストもこの形を使う想定）
 world imports-p2 {
+    import memory;
     import clock;
     import power;
     import access;

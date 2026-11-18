@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime.component.link
 
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonFunction
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
@@ -111,6 +112,8 @@ internal enum class HostWait {
  * ホストの関数の処理（#263）。引数は lift した後の値（全引数の lift の後に呼ぶ。#616）、戻り値は結果の値（結果のない関数は `null`）。
  *
  * プロセスのスレッドで、ゲストの canon lower の呼び出しの中から呼ばれる。ゲストのメモリには触らない（値は写してある）。
+ * 例外は `kibi:computer/memory` の `commit`（#777。ADR 0777）だけで、[ComponentCall.callerMemory] の区画を数える（中身は読み書きしない）。
+ * その参照は、呼び出しの外に持ち出さない。
  * 計画を共有する全マシンのプロセスのスレッドから同時に呼ばれるので、状態を持たず（プロセスの状態は [ComponentCall.env] から引く）、
  * スレッド安全にする（[ComponentHost]）。
  * ゲストの入力の誤りは [WasmTrapException]、ホストの誤り（型に合わない値を返したなど）は [IllegalArgumentException]
@@ -135,4 +138,12 @@ internal class ComponentCall(
     val interfaceName: String,
     /** 呼ばれた関数の名前 */
     val functionName: String,
+    /**
+     * canon lower した関数を import した core インスタンスの 0 番の線形メモリ（自分で定義したもの。#777。ADR 0777）。
+     * ランタイムが import を結んだインスタンスを呼び手として渡すので、wit-component が作る形（main が直接 import する）では呼んだインスタンスと一致するが、
+     * import した関数を export し直して別の core インスタンスが呼ぶと、呼んだインスタンスではなく import したインスタンスのメモリになる。
+     * 呼び手が core インスタンスでない（lift した関数の中身・realloc・post-return として呼ばれた）、メモリを定義していない、
+     * resource の dtor の呼び出しのときは `null`。この呼び出しの中でだけ使う
+     */
+    val callerMemory: WasmMemory? = null,
 )
