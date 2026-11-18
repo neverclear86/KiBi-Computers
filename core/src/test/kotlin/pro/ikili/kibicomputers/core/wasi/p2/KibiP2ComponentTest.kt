@@ -342,7 +342,7 @@ class KibiP2ComponentTest {
             h.tickUntilInitStarted(m, limit.toMillis())
 
             val program = load(shutdownCommand)
-            val rt = m.spawnRt(program, WasiP2Driver.create(program.component!!.plan), SpawnOptions(), parentPid = 1)
+            val rt = m.spawnRt(program, WasiP2Driver.create(program.component!!), SpawnOptions(), parentPid = 1)
             eventually(limit.toMillis(), "止まらない") {
                 h.scheduler.tick()
                 m.state == MachineState.STOPPED

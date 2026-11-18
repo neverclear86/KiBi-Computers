@@ -96,7 +96,7 @@ class WasiP2HostTest {
         assertEquals(0, c.exitCode, c.stderr)
         val p = P2Testing.load(c.outputs.getValue("c.wasm"))
         // export の run がドライバーの規則に合う
-        WasiP2Driver.create(p.plan)
+        WasiP2Driver.create(p)
         // ホストの resource はどれも、ホストの番号ごとに 1 つの正規の番号にまとまる
         val hostResources = p.plan.resources.filterNotNull().filter { it.impl is ResourceImpl.Host }
         assertTrue(hostResources.isNotEmpty())

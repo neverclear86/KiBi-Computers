@@ -38,6 +38,15 @@ internal class StreamEntry(
     /** 前の書き込みで閉じたと分かった（以後はすべて `closed`） */
     var closed: Boolean = false
 
+    /**
+     * 巻き戻して待っている書き込みの、書き終えたバイト数（#757。出力の stream だけ。待っていなければ 0）。
+     * 巻き直して着いた呼び出しは、同じデータのここから書き続ける（一部だけ書いて返せない `blocking-write-and-flush` のため）
+     */
+    var writeProgress: Int = 0
+
+    /** 巻き戻して待っている `splice`・`blocking-splice` の、入力から読んだバイト（#757。出力の stream だけ。待っていなければ `null`） */
+    var pendingSplice: ByteArray? = null
+
     override val objectId: Int get() = handle?.objectId ?: 0
     override val label: String get() = if (input) "input-stream" else "output-stream"
 
@@ -45,6 +54,8 @@ internal class StreamEntry(
         it.allowance = allowance
         it.closed = closed
         it.children = children
+        it.writeProgress = writeProgress
+        it.pendingSplice = pendingSplice
     }
 }
 

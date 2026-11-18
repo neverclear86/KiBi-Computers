@@ -11,45 +11,54 @@ internal class AsyncStackOverflowException(message: String) : RuntimeException(m
  * i64 の並び（後入れ先出し）。待っている間は、ここと線形メモリ・可変のグローバルに続きがある（ADR 0316）。
  * 番号だけを持ち、ランタイムの型を参照しない（保存できる。書き出す形は #81・#82）。
  *
- * スレッド: プロセスを動かしているスレッド（WASM の実行の中）が読み書きする。スレッドを持たないときは、カーネルロックの中で読み書きしてよい。
+ * スレッド: 積む・取り出すのは、プロセスを動かしているスレッド（WASM の実行の中）。スレッドを持たないときは、カーネルロックの中で読み書きしてよい。
+ * 読み書きはどれもこのインスタンスのモニターの中で行うので、走っている途中のプロセスのものを、カーネルロックの中から写しても
+ * 壊れない（[copyForSnapshot]。待機点型のコンポーネントは静的に保存できず、step の終わりを待たずに写して殺す。#757）。
+ * そのとき写した中身は巻き戻し・巻き直しの途中のものでありうるが、写しの中で殺すので使わない
  */
 internal class AsyncStack {
     private var values = LongArray(INITIAL_CAPACITY)
 
+    private var count = 0
+
     /** 積んでいる値の数 */
-    var size: Int = 0
-        private set
+    val size: Int
+        get() = synchronized(this) { count }
 
     val isEmpty: Boolean get() = size == 0
 
     /** [value] を積む。上限を超えたら [AsyncStackOverflowException] */
-    fun push(value: Long) {
-        if (size == values.size) {
-            if (size >= MAX_VALUES) throw AsyncStackOverflowException("退避する値が上限（$MAX_VALUES 個）を超えた")
+    fun push(value: Long): Unit = synchronized(this) {
+        if (count == values.size) {
+            if (count >= MAX_VALUES) throw AsyncStackOverflowException("退避する値が上限（$MAX_VALUES 個）を超えた")
             values = values.copyOf(minOf(values.size * 2, MAX_VALUES))
         }
-        values[size++] = value
+        values[count++] = value
     }
 
     /** 最後に積んだ値を取り出す。空なら [IllegalStateException] */
-    fun pop(): Long {
-        check(size > 0) { "退避した値がない" }
-        return values[--size]
+    fun pop(): Long = synchronized(this) {
+        check(count > 0) { "退避した値がない" }
+        values[--count]
     }
 
     /** 積んでいる値の写し（下から順。テストと保存用） */
-    fun toLongArray(): LongArray = values.copyOf(size)
+    fun toLongArray(): LongArray = synchronized(this) { values.copyOf(count) }
 
     /** 同じ値を積んだ別のインスタンス（保存の写し。#81） */
-    fun copyForSnapshot(): AsyncStack = AsyncStack().also { copy ->
-        if (size > copy.values.size) copy.values = LongArray(size)
-        values.copyInto(copy.values, 0, 0, size)
-        copy.size = size
+    fun copyForSnapshot(): AsyncStack {
+        val copy = AsyncStack()
+        synchronized(this) {
+            if (count > copy.values.size) copy.values = LongArray(count)
+            values.copyInto(copy.values, 0, 0, count)
+            copy.count = count
+        }
+        return copy
     }
 
     /** 空にする（プロセスが終わったとき） */
-    fun clear() {
-        size = 0
+    fun clear(): Unit = synchronized(this) {
+        count = 0
         if (values.size > INITIAL_CAPACITY) values = LongArray(INITIAL_CAPACITY)
     }
 

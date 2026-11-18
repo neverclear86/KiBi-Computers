@@ -531,4 +531,58 @@ class AsyncifyTest {
         assertArrayEquals(bytes(0x01, 0x00, 0x41, 0x00, 0x0B, 0x01, 0x04), out.single { it.first == 9 }.second)
         assertTrue(EndiveRuntime().load(r.bytes).isAsyncified)
     }
+
+    /**
+     * 外の型（[Asyncify.Prepared.analyze] の `externalSuspendTypes`。コンポーネントのほかのモジュールの止まりうる関数の型。#757）を
+     * `call_indirect`・`call_ref` に当てる範囲。`call_ref` は参照が外から来るので常に当てる。`call_indirect` は、
+     * import・export したテーブル、または、ほかのモジュールの関数の参照が入りうる形のモジュール（funcref のグローバルの import など）のときに当てる
+     */
+    @Test
+    fun `外の型はcall_refと、外の参照が入りうるテーブルへのcall_indirectに当てる`() {
+        val external = setOf(Asyncify.Signature(emptyList(), listOf(0x7F)))
+        val none = emptySet<Asyncify.Signature>()
+        fun exports(wasm: ByteArray, types: Set<Asyncify.Signature>): Set<String> = Asyncify.prepare(wasm).analyze(emptySet(), types).suspendableExports
+
+        // call_ref（ref.func 0; call_ref 0）
+        val callRef = module(
+            1 to vec(listOf(typeRunI32)),
+            3 to vec(listOf(bytes(0x00))),
+            7 to vec(listOf(name("run") + bytes(0x00, 0x00))),
+            // (elem declare func 0)
+            9 to vec(listOf(bytes(0x03, 0x00, 0x01, 0x00))),
+            10 to vec(listOf(body(bytes(0xD2, 0x00, 0x14, 0x00)))),
+        )
+        assertEquals(setOf("run"), exports(callRef, external))
+        assertEquals(emptySet<String>(), exports(callRef, none))
+
+        // call_indirect (type 0) 0。表は [table]（セクション 4）、[extra] は足すセクション
+        fun indirect(table: ByteArray?, vararg extra: Pair<Int, ByteArray>): ByteArray {
+            val sections = mutableListOf(1 to vec(listOf(typeRunI32)))
+            extra.filter { it.first < 3 }.forEach { sections += it }
+            sections += 3 to vec(listOf(bytes(0x00)))
+            if (table != null) sections += 4 to vec(listOf(table))
+            extra.filter { it.first in 5..7 }.forEach { sections += it }
+            sections += 10 to vec(listOf(body(bytes(0x41, 0x00, 0x11, 0x00, 0x00))))
+            return module(*sections.sortedBy { it.first }.toTypedArray())
+        }
+        val localTable = bytes(0x70, 0x00, 0x01)
+        val run = 7 to vec(listOf(name("run") + bytes(0x00, 0x00)))
+        // 閉じたテーブル: ほかのモジュールの参照は入らないので、当てない
+        assertEquals(emptySet<String>(), exports(indirect(localTable, run), external))
+        // export したテーブル・import したテーブル
+        assertEquals(setOf("run"), exports(indirect(localTable, 7 to vec(listOf(name("run") + bytes(0x00, 0x00), name("t") + bytes(0x01, 0x00)))), external))
+        assertEquals(setOf("run"), exports(indirect(null, run, 2 to vec(listOf(name("e") + name("t") + bytes(0x01, 0x70, 0x00, 0x01)))), external))
+        // 閉じたテーブルでも、funcref のグローバルを import していれば、table.get などで外の参照が入りうる
+        assertEquals(setOf("run"), exports(indirect(localTable, run, 2 to vec(listOf(name("e") + name("g") + bytes(0x03, 0x70, 0x00)))), external))
+        // funcref を引数に受ける関数を export していれば、table.set で入れられる
+        val withFuncrefParam = module(
+            1 to vec(listOf(typeRunI32, bytes(0x60, 0x01, 0x70, 0x00))),
+            3 to vec(listOf(bytes(0x00), bytes(0x01))),
+            4 to vec(listOf(localTable)),
+            7 to vec(listOf(name("run") + bytes(0x00, 0x00), name("set") + bytes(0x00, 0x01))),
+            10 to vec(listOf(body(bytes(0x41, 0x00, 0x11, 0x00, 0x00)), body(bytes()))),
+        )
+        assertEquals(setOf("run"), exports(withFuncrefParam, external))
+        assertEquals(emptySet<String>(), exports(withFuncrefParam, none))
+    }
 }

@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
 import pro.ikili.kibicomputers.core.runtime.component.link.HostInterface
 import pro.ikili.kibicomputers.core.runtime.component.link.HostResource
 import pro.ikili.kibicomputers.core.runtime.component.link.HostResourceIds
+import pro.ikili.kibicomputers.core.runtime.component.link.HostWait
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 
 /**
@@ -73,19 +74,37 @@ internal object KibiP2Host : ComponentHost {
         bodies.putAll(KibiP2Kernel.functions(t))
         bodies.putAll(KibiP2Process.functions(t))
         bodies.putAll(KibiP2Device.functions(t))
+        // 待ちうる関数の名前が WIT とずれると、待たないもの（NONE）とみなされ、待機点型のプロセスが止まろうとして CRASHED になる（#757）
+        for ((iface, names) in BLOCKING_FUNCTIONS) {
+            val unknown = names - wit[iface]?.functions?.keys.orEmpty()
+            check(unknown.isEmpty()) { "待ちうる関数 $iface の $unknown が WIT にない" }
+        }
         val out = LinkedHashMap<String, HostInterface>()
         for ((key, w) in wit) {
             val impl = bodies.remove(key) ?: emptyMap()
             val missing = w.functions.keys - impl.keys
             val extra = impl.keys - w.functions.keys
             check(missing.isEmpty() && extra.isEmpty()) { "$key の実装が WIT と合わない（ない: $missing、余り: $extra）" }
-            val functions = w.functions.mapValues { (n, type) -> HostFunction(type, P2.guard(impl.getValue(n))) }
+            val functions = w.functions.mapValues { (n, type) -> HostFunction(type, waitOf(key, n), P2.guard(impl.getValue(n))) }
             out[key] = HostInterface("$key@${ComponentImportPolicy.KIBI_VERSION}", functions, w.resources.mapValues { resources.getValue(it.value) })
         }
         check(bodies.isEmpty()) { "WIT にないインターフェースの実装: ${bodies.keys}" }
         return Built(out, wit)
     }
 }
+
+/**
+ * `kibi:*` のホストの関数のうち、待ちうるもの（#757）。どれも巻き戻せない（[HostWait.BLOCK]。デバイスの呼び出しと子の読み込みを
+ * スレッドを持って待つ）ので、これを import するコンポーネントは `BLOCKING` で動く
+ */
+private val BLOCKING_FUNCTIONS: Map<String, Set<String>> = mapOf(
+    KibiP2Device.BUS to setOf("[method]device.invoke"),
+    KibiP2Process.PROCESS to setOf("[static]process.spawn"),
+    KibiP2Process.PROCESS_POLL to setOf("spawn-with-handles"),
+)
+
+private fun waitOf(iface: String, name: String): HostWait =
+    if (BLOCKING_FUNCTIONS[iface]?.contains(name) == true) HostWait.BLOCK else HostWait.NONE
 
 /** `kibi:*` の p2 の実装の共通の部品（#685） */
 internal object KibiP2 {

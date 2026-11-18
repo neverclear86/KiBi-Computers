@@ -657,7 +657,12 @@ internal data class ProcessHandle(val pid: Int, val fd: Int)
  * カーネルがコンポーネントをインスタンス化するときの [LinkEnv]（#263）。ホストの関数（`HostFunctionBody`）は、
  * `call.env` をこの型として [ctx] からプロセスの口を使う
  */
-internal abstract class KernelLinkEnv(val ctx: ProcessContext) : LinkEnv
+internal abstract class KernelLinkEnv(val ctx: ProcessContext) : LinkEnv {
+    /** 待機点型のコンポーネントのプロセスの、待ちうるホストの関数の入口と出口（#757。プロセスごとに 1 つ） */
+    val suspend: ComponentSuspend = ComponentSuspend(ctx)
+
+    override fun onRewound() = suspend.onArrived()
+}
 
 /** 作っている途中の記録（実行時だけ。[ProcessRuntime.loading]） */
 internal class LoadingFrame(

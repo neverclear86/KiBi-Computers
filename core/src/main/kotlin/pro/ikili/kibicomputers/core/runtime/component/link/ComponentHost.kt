@@ -83,8 +83,29 @@ internal fun interface HostResourceDrop {
     fun drop(call: ComponentCall, rep: Int)
 }
 
-/** ホストの関数 1 つ。[type] はホストの宣言した型（own・borrow はホストの resource の識別子を指す） */
-internal class HostFunction(val type: CanonFunction, val body: HostFunctionBody)
+/**
+ * ホストの関数 1 つ。[type] はホストの宣言した型（own・borrow はホストの resource の識別子を指す）。
+ * [wait] は、その関数がプロセスを待たせうるか、待つときに巻き戻せるか（#757。待機点への変換に使う）
+ */
+internal class HostFunction(val type: CanonFunction, val wait: HostWait = HostWait.NONE, val body: HostFunctionBody)
+
+/**
+ * ホストの関数の待ち方（#757。ADR 0757）。コンポーネントを待機点型（`WAIT_POINT`）で動かせるかの判定と、
+ * 変換で止まりうるとみなす import を決めるのに使う
+ */
+internal enum class HostWait {
+    /** 待たない */
+    NONE,
+
+    /**
+     * 待ちうるが、巻き戻して待てる（待つ前に、結果の resource を作らず、own の引数を受けない。巻き直しで同じ引数でやり直す）。
+     * 変換したコンポーネントでは止まりうる import になる
+     */
+    UNWIND,
+
+    /** 待ちうるが、巻き戻せない（スレッドを持って待つ）。これを import するコンポーネントは `BLOCKING` で動かす */
+    BLOCK,
+}
 
 /**
  * ホストの関数の処理（#263）。引数は lift した後の値（全引数の lift の後に呼ぶ。#616）、戻り値は結果の値（結果のない関数は `null`）。
