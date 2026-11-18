@@ -12,9 +12,9 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.load
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.u32
 
 /**
- * ホストの関数に渡す [ComponentCall.callerMemory]（#777。ADR 0777）: canon lower した関数を core インスタンスが直接呼んだときだけ、
- * その core インスタンスが定義した 0 番の線形メモリ。同じ lower を別の core インスタンスが呼べば、そのインスタンスのメモリ。
- * メモリのないインスタンス（メモリを import しただけのものも）・lift(lower) の道（core の呼び手がない）では `null`。
+ * ホストの関数に渡す [ComponentCall.callerMemory]（#777。ADR 0777）: canon lower した関数を import した core インスタンスが
+ * 定義した 0 番の線形メモリ。同じ lower を別の core インスタンスが import すれば、そのインスタンスのメモリ。
+ * メモリのないインスタンス（メモリを import しただけのものも）・lift(lower) の道（間に core インスタンスがない）では `null`。
  * 渡るのは「その lower を import した core インスタンス」のメモリで、import した関数を export し直して別の core インスタンスが呼んでも、
  * 呼んだインスタンスではなく import したインスタンスのメモリになる（ランタイムが import を結んだインスタンスを呼び手として渡すため。
  * wit-component が作る形は main が直接 import するので、この二つは一致する）
@@ -56,7 +56,7 @@ class ComponentCallerMemoryTest {
     """
 
     @Test
-    fun `callerMemoryは直接呼んだcoreインスタンスのメモリで、メモリのないインスタンスとliftした道ではnull`() {
+    fun `callerMemoryはlowerをimportしたcoreインスタンスのメモリで、メモリのないインスタンスとliftした道ではnull`() {
         instantiate(load(component, probeHost)).use { c ->
             // export していないメモリも、定義したものなら渡す
             assertEquals(u32(3), c.call("three"))

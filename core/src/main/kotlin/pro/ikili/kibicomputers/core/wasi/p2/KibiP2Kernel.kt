@@ -136,7 +136,7 @@ internal object KibiP2Kernel {
         )
         val memory = mapOf(
             "remaining" to body { ctx, _ -> CanonValue.I64(KibiMemory.remaining(ctx)) },
-            // ptr は、commit を直接呼んだ core インスタンスの線形メモリの番地（#777。ADR 0777）。メモリがない・core から直接呼ばれていないなら false。
+            // ptr は、lower した commit を import した core インスタンスの線形メモリの番地（#777。ADR 0777）。メモリがない・間に core インスタンスがないなら false。
             // u32 の ptr・len はビットのまま、u64 の keep もビットのまま渡す（p1 と同じ。2^63 以上は必ず断る）
             "commit" to HostFunctionBody { call, a ->
                 val m = call.callerMemory

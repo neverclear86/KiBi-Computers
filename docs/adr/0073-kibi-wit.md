@@ -33,7 +33,7 @@ WIT は `core/src/main/wit/<ns>-<pkg>/` に置き、パッケージごとに `wo
 | `kibi:io` | `pipe-streams`・`pipe-async` | p2・p3 のパイプ（p2 の `pipe-streams` は #685 で実装（ABI は確認待ち）、p3 の `pipe-async` は仮置き。ADR 0075・0685） | #75 |
 | `kibi:io` | `tty` | TTY（raw モード・大きさ・前のプロセス。p1・p2・p3 で共通。ADR 0427） | #427 |
 | `kibi:device` | `types`・`bus`・`bus-poll`（p2）・`bus-async`（p3） | デバイスの列挙と操作（#65 で WIT を置いた。ADR 0065。p1 に `bus` を出した。ADR 0077。p2 の `bus-poll` は #685 で実装（ABI は確認待ち）、p3 の `bus-async` は仮置き。ADR 0685） | #65・#77 |
-| `kibi:computer` | `memory` | 残りの RAM（#408。p1・p2 で共通。p2 の `commit` の ptr は、呼んだ core インスタンスの線形メモリの番地。ADR 0777） | #73 で移した・#777 |
+| `kibi:computer` | `memory` | 残りの RAM（#408。p1・p2 で共通。p2 の `commit` の ptr は、lower した `commit` を import した core インスタンスの線形メモリの番地。ADR 0777） | #73 で移した・#777 |
 | `kibi:computer` | `clock` | 起動からの経過（uptime）とゲーム内時間（ADR 0426） | #426 |
 | `kibi:computer` | `power` | 電源（停止・再起動。ADR 0306） | #306 |
 | `kibi:computer` | `access` | プレイヤーの権限の確認と、追加・削除・持ち主の譲渡の依頼（ゲーム内で承認。p1・p2・p3 で共通。ADR 0110） | #110 |

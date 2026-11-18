@@ -38,7 +38,7 @@ internal object KernelComponentHost : ComponentHost {
  * `kibi:kernel/{types,events,timers,events-poll,timers-poll}`、`kibi:process/{process,process-poll}`、`kibi:io/{tty,pipe-streams}`、
  * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{memory,clock,power,access}`。
  * p1 だけの `kibi:io/fd`・`kibi:io/pipe`、p3 の `*-async` は出さない（`null`。読み込みの失敗 → `NOEXEC`）。
- * `kibi:computer/memory` の `commit` は、呼んだ core インスタンスの線形メモリ（[ComponentCall.callerMemory]）の区画を数える（#777。ADR 0777）。
+ * `kibi:computer/memory` の `commit` は、lower した `commit` を import した core インスタンスの線形メモリ（[ComponentCall.callerMemory]）の区画を数える（#777。ADR 0777）。
  * 待たないので [HostWait.NONE]（[BLOCKING_FUNCTIONS] に入れない。入れると memory を import するコンポーネントがすべて `BLOCKING` になる）
  *
  * - 型は [KibiP2Wit.TEXT] を [WitReader] で読んだもの。`use wasi:…@0.2.12` の型は [WasiP2Host] が読んだものに解決するので、

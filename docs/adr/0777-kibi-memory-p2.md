@@ -17,10 +17,10 @@ WIT（関数と型）は #370 の論点 3 の回答で決まっている。p2・
 
 - `kibi:computer` の `imports-p2` の world に `import memory;` を足す。WIT の型は変えない（p1 の import の形 ADR 0073 Q2-B も変わらない）。
 - p3 の world（`imports-p3`）はまだ置かない。p3 も同じ形を仮置きとし、#266 で p3 の層を作るときに見直してよい。
-- `commit` の `ptr` は、**canon lower した `commit` を直接呼んだ core インスタンスの 0 番の線形メモリ**の番地。p1 の「呼んだモジュールのメモリ」（`WasiP1Kibi` の `caller.memory`）と同じ意味。
+- `commit` の `ptr` は、**canon lower した `commit` を import した core インスタンスの 0 番の線形メモリ**の番地。wit-component が作る形では import した main モジュールが呼ぶので、p1 の「呼んだモジュールのメモリ」（`WasiP1Kibi` の `caller.memory`）と同じ意味になる（export し直したときの違いは下の「渡し方」）。
 - `remaining` は線形メモリに依らない（プロセス単位の `rt.memory` の残り。p1 と同じ）。
 
-### 呼んだ core インスタンスのメモリの渡し方
+### lower を import した core インスタンスのメモリの渡し方
 
 - 計画（`ComponentPlanner`）では決めない。実行時に、`LinkedComponent.instantiateStep` で lower した関数を包むときに捨てていた呼び手（`WasmHostFunction` の `instance`）の `memory` を、`callLowered` → `callFunc` → `ComponentCall.callerMemory` に通す。
 - **呼び手は「lower を import した core インスタンス」。** ランタイム（`EndiveRuntime.instantiate`）は、ホストの関数を呼ぶときに import を結んだインスタンスを固定で渡す。wit-component が作る形（main が `commit` を直接 import する）では、それが呼んだインスタンスと一致する。core モジュール A が import した `commit` を関数として export し直し、別の core インスタンス B が呼ぶと、ptr は B ではなく A のメモリで解かれる。A がメモリを定義していなければ `null`（`false`）。A の export し直しを `canon lift` した道も、core の呼び手がなくても A のメモリが渡る。ランタイムの口が変わらない限りこの形で、`ComponentCallerMemoryTest` で固定している。
@@ -31,7 +31,7 @@ WIT（関数と型）は #370 の論点 3 の回答で決まっている。p2・
 
 ### 振る舞い
 
-- 呼び手のメモリがない（メモリを定義していない、core から直接呼ばれていない）ときは `false`。範囲外も `false`（区画の燃料も払わない。p1 と同じ `KibiMemory.commit`）。
+- 呼び手のメモリがない（メモリを定義していない、lift(lower) など間に core インスタンスがない）ときは `false`。範囲外も `false`（区画の燃料も払わない。p1 と同じ `KibiMemory.commit`）。
 - RAM の上限で断ったら `false` で、`ProcessContext.commitMemory` が `memoryCommitRefusal` に残す。異常終了（`err` での 0 以外の終了・トラップ）の表示に `kibi:memory commit was refused: out of memory, …` が付く（#370 の追加の要件。コンポーネントのプロセスでも同じ文）。
 - `ptr`・`len`（u32）と `keep`（u64）はビットのまま `KibiMemory.commit` に渡す（p1 と同じ。2^63 以上の `keep` は必ず断る。`P2.u64` の丸めは使わない）。
 - 燃料は呼び出しごとの `CALL_FUEL`（`P2.guard`）と、範囲にかかる区画の数（`KibiMemory.commitFuel`）。どちらも仮の値（#251）。
