@@ -40,11 +40,14 @@ class LuaShrinkReallocTest {
         fun text(): String = synchronized(out) { out.toString(Charsets.UTF_8).replace("\r\n", "\n") }
     }
 
+    private data class Squeezed(val state: ProcessState, val console: String, val refusals: Int)
+
     /**
      * RAM [ramBytes] のマシンで `lua -e <script>` を動かす。スクリプトが初めて os.sleep で待ったときに、RAM の残りがちょうど
-     * [remaining] バイトになるように予約し、終わるまで待つ。終わったときの状態とコンソールを返す
+     * [remaining] バイトになるように予約し、終わるまで待つ。終わったときの状態とコンソールと、予約してから終わるまでに RAM の勘定が
+     * 確保を断った回数（kibi_wasi.c の counted_alloc が失敗した回数の目安）を返す
      */
-    private fun runSqueezed(script: String, ramBytes: Long, remaining: Long): Pair<ProcessState, String> = Harness(execRuntime = EndiveRuntime()).use { h ->
+    private fun runSqueezed(script: String, ramBytes: Long, remaining: Long): Squeezed = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
         run {
@@ -60,22 +63,25 @@ class LuaShrinkReallocTest {
             Thread.sleep(1)
             m.stateOf(pid) == ProcessState.WAITING_EVENT || m.stateOf(pid).isTerminal
         }
+        val rt = requireNotNull(m.runtime(pid)) { "プロセスの状態がない" }
         val account = m.memoryAccount
         val held = account.limitBytes - account.usedBytes - remaining
         assertTrue(held >= 0 && account.tryReserveBytes(held), "残りを $remaining にできない: ${account.usedBytes} ${m.stateOf(pid)} ${host.text()}")
+        val refusalsBefore = m.lock.withLockValue { rt.memory.refusalCount }
         eventually(60_000, "終わらない: ${host.text()}") {
             h.scheduler.tick()
             Thread.sleep(1)
             m.stateOf(pid).isTerminal
         }
         val state = m.stateOf(pid)
+        val refusals = m.lock.withLockValue { rt.memory.refusalCount } - refusalsBefore
         account.releaseBytes(held)
         eventually(60_000, "RAM が戻らない: ${account.usedBytes}") {
             h.scheduler.tick()
             account.usedBytes == 0L
         }
         h.scheduler.tick()
-        state to host.text()
+        Squeezed(state, host.text(), refusals)
     }
 
     @Test
@@ -111,6 +117,19 @@ class LuaShrinkReallocTest {
         // 残りが少ないと、縮めの前後の別の確保（ハッシュの部分、文字列）が not enough memory になりうる（pcall の外なら Lua のエラーで終わる）
         assertEquals(ProcessState.EXITED, state, console)
         assertTrue("done\n" in console || "lua: not enough memory\n" in console, console)
+    }
+
+    @ParameterizedTest(name = "{0} 残り {1} KiB")
+    @MethodSource("retreatCases")
+    fun `新しい区画を数えられない縮めは、NULLではなく元のブロックを返して続けられる`(kind: String, remainingKib: Long) = timeout(limit) {
+        // 縮めを pcall で包まない。kibi_wasi.c の「if (result == NULL) return ptr;」が NULL を返すようになると、
+        // luaH_resize の配列の縮め（luaM_saferealloc_）が not enough memory を投げ、pcall の外なので "done" が出ずに終わる
+        val r = runSqueezed(strictArrayScript(kind), 1024 * kib, remainingKib * kib)
+        assertEquals(ProcessState.EXITED, r.state, r.console)
+        assertEquals("ready\ndone\n", r.console)
+        // 残りが縮めの新しい区画（kind の半分の配列）と keep に足りないので、縮めの counted_alloc が断られて、退路を通った。
+        // 通らなかったなら（区画を数え済みの穴に置けた、など）この試験は何も確かめていない
+        assertTrue(r.refusals >= 1, "縮めで確保を断っていない（退路を通っていない）: ${r.refusals}")
     }
 
     private val scripts: Map<String, String> = mapOf(
@@ -165,7 +184,34 @@ class LuaShrinkReallocTest {
         io.stdout:write("done\n")
     """.trimIndent()
 
+    /** [arrayScript] と同じ縮めを、pcall なしでやる（大きさは kind の末尾の数字） */
+    private fun strictArrayScript(kind: String): String {
+        val n = kind.removePrefix("array").toInt()
+        return """
+            local t = load("return {" .. ("0,"):rep($n) .. "}")()
+            collectgarbage()
+            print("ready")
+            io.stdout:flush()
+            os.sleep(1)
+            for i = ${n / 2 + 1}, $n do t[i] = nil end
+            t.x = 1
+            t = nil
+            collectgarbage()
+            io.stdout:write("done\n")
+        """.trimIndent()
+    }
+
     companion object {
+        /**
+         * 縮めの新しい区画（4096 は 1 ページ = 64 KiB）が、残り（keep の 16 KiB を含めて）に収まらない組。
+         * 小さい確保（ハッシュの 1 ノードなど）は通り、縮めだけが断られる残りを選ぶ。
+         * 残りは 40・48 KiB（64 KiB だと縮めが通る穴があり、退路を壊しても通ってしまうことを、退路を壊して確かめた）。
+         * array16384 は入れない: 縮め先の 4 ページの区画が、構成子を読み込む間に解放された数え済みの穴で足りてしまい、断られない（退路を通らない）
+         */
+        @JvmStatic
+        fun retreatCases(): List<Arguments> =
+            listOf("array4096").flatMap { kind -> listOf(40L, 48L).map { Arguments.of(kind, it) } }
+
         /** 縮めの種類と、縮める直前の RAM の残り（KiB）。残りは、スタックを数える線（32 KiB）と MIN（8 KiB）の前後を通るように振る */
         @JvmStatic
         fun cases(): List<Arguments> =
