@@ -162,8 +162,9 @@ const IMPLEMENT_SCHEMA = {
     publicApiChanged: { type: 'boolean' },
     touchesConcurrency: { type: 'boolean' },
     summary: { type: 'string' },
+    openQuestions: { type: 'array', items: { type: 'string' }, description: 'PR を作ったが、人の確認が要るかもしれない点（PR 本文の「確認してほしいこと」と同じもの）。なければ空' },
   },
-  required: ['status', 'pr', 'branch', 'worktree', 'publicApiChanged', 'touchesConcurrency', 'summary'],
+  required: ['status', 'pr', 'branch', 'worktree', 'publicApiChanged', 'touchesConcurrency', 'summary', 'openQuestions'],
 }
 
 const CI_SCHEMA = {
@@ -390,6 +391,7 @@ function implement(info, approvedPlan, guidance, advice) {
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
 未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて status=blocked で終える。summary に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。
+PR を作ったうえで、人に確かめてほしい点が残る（PR 本文に「確認してほしいこと」を書いた）なら、論点・選択肢・推奨を1件ずつ openQuestions に入れる。なければ空にする（マージの前に、このスクリプトが確かめる）。
 publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。touchesConcurrency には、スレッド・ロック・非同期の完了待ちなど、並行して動く処理の振る舞いを変えたかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}${advice ? `\n\n着手前の設計の助言（別のモデル。鵜呑みにせず、コードと突き合わせて使う）:\n${advice}` : ''}`,
     { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
@@ -597,6 +599,27 @@ async function runIssue(info) {
       return { issue: info.number, status: 'failed', reason: impl?.summary ?? '実装の段階が失敗した', question: null }
     }
 
+    // 実装のエージェントが PR に残した確認事項は、マージの前に確かめる。人の判断が要るならマージせずに止まる
+    if (impl.openQuestions?.length) {
+      const listed = impl.openQuestions.map(x => `- ${x}`).join('\n')
+      const q = `実装のエージェントが PR に確認事項を残した:\n${listed}`
+      const e = await escalate('pr', impl.pr, q, `実装の段階で PR を作ったあと（ブランチ ${impl.branch}）`, true)
+      if (!e.guidance) return { issue: info.number, status: 'needs_human', pr: impl.pr, reason: e.question, question: e.question }
+      const applied = await agent(
+        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）に、実装のエージェントが確認事項を残した。人に聞く前の確かめ（別のモデル）が、人を待たずに進められると判断し、次の進め方を示した。これに従う。
+コードを変える必要があれば worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してからコミットして push する。変える必要がなければ push しない。
+どちらの場合も、PR 本文の「確認してほしいこと」を、確かめた結果と結論（決めたこととその根拠）に書き換える（\`gh pr edit ${impl.pr} --body-file <ファイル>\`）。
+
+確認事項:
+${listed}
+
+進め方:
+${e.guidance}`,
+        { label: `resolve:${impl.pr}`, phase: 'Fix', schema: FIX_SCHEMA, ...M.fixFirst },
+      )
+      if (!applied) return { issue: info.number, status: 'failed', pr: impl.pr, reason: '確認事項の反映に失敗した', question: null }
+    }
+
     const tag = `#${info.number}`
     let ci = await untilGreen(impl, tag)
     const rounds = []
@@ -688,6 +711,8 @@ async function prepareResume({ issue, pr }) {
     resumeImpl: {
       status: 'pr_opened', pr, branch: r.branch, worktree: r.worktree,
       publicApiChanged: r.publicApiChanged, touchesConcurrency: r.touchesConcurrency, summary: r.summary,
+      // 止まった PR の確認事項は、人が回答して needs-human を外してから続けるので、ここでは確かめ直さない
+      openQuestions: [],
     },
   }
 }
