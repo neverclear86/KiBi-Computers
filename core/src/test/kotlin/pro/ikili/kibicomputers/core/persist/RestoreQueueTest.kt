@@ -96,7 +96,7 @@ class RestoreQueueTest {
         fun of(level: Level): List<LogRecord> =
             records.toList().filter { it.level == level && it.message.startsWith("順番待ちの復元の開始") }
 
-        /** tick ごとの、投げた台数の WARNING */
+        /** 投げた台数の WARNING（数の報告） */
         fun summaries(): List<LogRecord> =
             records.toList().filter { it.level == Level.WARNING && it.message.startsWith("順番待ちの復元: ") }
 
@@ -219,26 +219,75 @@ class RestoreQueueTest {
     }
 
     @Test
-    fun `繰り返しを省いたtickには、投げた台数のWARNINGを1本出す`() {
+    fun `数のWARNINGは時間で間引き、台数やtickごとの上限に比例しない`() {
         Captured().use { log ->
             val queue = RestoreQueue<Int>()
-            for (i in 0 until 100) queue.offer(i, null, 0)
-            // 1tick に 40 台ずつ
+            for (i in 0 until 1000) queue.offer(i, null, 0)
             val starter = RestoreQueue.Starter<Int> { _, _ -> boom() }
-            queue.tick(0, null, limit(40), starter)
-            val first = log.summaries().single()
-            assertTrue(first.message.contains("40 台"), first.message)
-            assertTrue(first.message.contains("1 件"), first.message)
-            queue.tick(0, null, limit(40), starter)
+            val minute = TimeUnit.MINUTES.toNanos(1)
+            // 1tick に 1 台ずつ（コンフィグの下限）: 最初の省いた台ですぐ1本、以後は1分経つまで出さない
+            var now = 0L
+            for (tick in 0 until 1000) {
+                queue.tick(now, null, limit(1), starter)
+                now += TimeUnit.MILLISECONDS.toNanos(50)
+            }
+            // 1,000 台を 50 秒で回したので、数の WARNING は最初の1本だけ（台を書いた WARNING は1件）
+            assertEquals(1, log.summaries().size)
+            assertTrue(log.summaries()[0].message.contains("2 台"), log.summaries()[0].message)
+            assertEquals(1, log.of(Level.WARNING).size)
+
+            // 列が空のままでも、1分過ぎた tick で残りをまとめて出す
+            queue.tick(minute * 2, null, limit(1), starter)
             val all = log.summaries()
             assertEquals(2, all.size)
-            // 2 回目は場所が済んでいるので、詳しい WARNING は 0 件
-            assertTrue(all[1].message.contains("40 台") && all[1].message.contains("0 件"), all[1].message)
-            // 1 台だけ投げた tick は、詳しい WARNING が全部なので、数の WARNING は出ない
-            queue.clear()
-            queue.offer(1000, null, 0)
-            queue.tick(0, null, limit(40), starter)
+            assertTrue(all[1].message.contains("998 台"), all[1].message)
+            assertTrue(all[1].message.contains("繰り返し 998 台"), all[1].message)
+            assertTrue(all[1].message.contains("WARNING は 0 件"), all[1].message)
+
+            // 書くものがなければ出さない
+            queue.tick(minute * 2 + 1, null, limit(1), starter)
             assertEquals(2, log.summaries().size)
+
+            // clear は待たずに出す
+            queue.offer(2000, null, 0)
+            queue.tick(minute * 2 + 2, null, limit(1), starter)
+            assertEquals(2, log.summaries().size)
+            queue.clear()
+            assertEquals(3, log.summaries().size)
+            assertTrue(log.summaries()[2].message.contains("1 台の開始"), log.summaries()[2].message)
+        }
+    }
+
+    @Test
+    fun `数のWARNINGは、省いた台の内訳を書き分ける`() {
+        Captured().use { log ->
+            val queue = RestoreQueue<Int>()
+            // 場所の上限を超える: 64 件は詳しい WARNING、65 件目は上限の知らせ、残り 2 件は新しい場所（DEBUG）
+            for (i in 0 until 64 + 3) queue.offer(i, null, 0)
+            queue.tick(0, null, limit(1000), perSiteThrower)
+            val summary = log.summaries().single()
+            assertTrue(summary.message.contains("67 台"), summary.message)
+            assertTrue(summary.message.contains("上限に達した後の新しい場所 2 台"), summary.message)
+            assertFalse(summary.message.contains("繰り返し"), summary.message)
+        }
+        Captured().use { log ->
+            val queue = RestoreQueue<String>()
+            for (name in listOf("a", "b")) queue.offer(name, null, 0)
+            val nasty = object : RuntimeException() {
+                override fun toString(): String = throw IllegalStateException("toString")
+            }
+            queue.tick(0, null, config) { _, _ -> throw nasty }
+            val summary = log.summaries().single()
+            assertTrue(summary.message.contains("書けなかったもの 2 台"), summary.message)
+            assertFalse(summary.message.contains("繰り返し"), summary.message)
+        }
+        Captured().use { log ->
+            // 1 台だけ投げたときは、詳しい WARNING が全部なので、数の WARNING は出ない
+            val queue = RestoreQueue<Int>()
+            queue.offer(1, null, 0)
+            queue.tick(0, null, config) { _, _ -> boom() }
+            queue.clear()
+            assertEquals(0, log.summaries().size)
         }
     }
 
