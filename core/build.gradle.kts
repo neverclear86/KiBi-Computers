@@ -287,6 +287,11 @@ val compileLua = kibiWasm.module("lua") {
         "src/main/wasm/lua/kibi_lua_peripheral.c",
         "src/main/wasm/lua/kibi_lua_os.c",
         "src/main/wasm/lua/kibi_lua_parallel.c",
+        // term・colors・colours・keys・fs（#724。ADR 0724）
+        "src/main/wasm/lua/kibi_lua_colors.c",
+        "src/main/wasm/lua/kibi_lua_keys.c",
+        "src/main/wasm/lua/kibi_lua_term.c",
+        "src/main/wasm/lua/kibi_lua_fs.c",
     )
     includeDirs.from(luaSource.map { task -> task.outputDir.dir("src") })
     // 起動時に PWD（カーネルの cwd）へ chdir する（#332）

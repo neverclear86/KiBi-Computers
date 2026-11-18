@@ -5,7 +5,11 @@
  * - kibi_lua_peripheral.c: peripheral ライブラリ（kibi:device/bus）と、コルーチンの中の呼び出しが待つ表（#744）
  * - kibi_lua_os.c: os ライブラリの拡張（kibi:kernel/events・kibi:computer/clock・power と poll_oneoff）
  * - kibi_lua_parallel.c: parallel ライブラリ（#95。ADR 0095）
- * - kibi_linit.c: Lua の linit.c の代わり。標準ライブラリと上の2つを開く
+ * - kibi_lua_colors.c: colors・colours ライブラリと、ライブラリの表を初めて触ったときに詰める仕組み（#724。ADR 0724）
+ * - kibi_lua_keys.c: keys ライブラリと、カーネルのキー名から CC のキーの番号への表（#724）
+ * - kibi_lua_term.c: term ライブラリ（#724）
+ * - kibi_lua_fs.c: fs ライブラリ（#724）
+ * - kibi_linit.c: Lua の linit.c の代わり。標準ライブラリと上のライブラリを開く
  */
 #ifndef KIBI_LUA_H
 #define KIBI_LUA_H
@@ -75,5 +79,32 @@ int kibi_lua_task_count(void);
 int32_t kibi_lua_task_fd(int i);
 /* 終わった呼び出しを "task_complete" のイベントにして FIFO に積み、pending-call を閉じる。表が空なら何もしない */
 void kibi_lua_tasks_collect(lua_State *L);
+
+/*
+ * 中身を初めて触ったときに詰めるライブラリの表（#724。ADR 0724）。空のテーブルを積み、メタテーブルの __index・__pairs で
+ * 初めて触られたときに [fill]（スタックの上の表に関数・値を足す）を呼んで、メタテーブルを外す。
+ * 起動のたびに REPL 1,000 台が keys・colors などの表を作らないため。[fill] はもうある key を上書きしない
+ */
+void kibi_lua_lazy_lib(lua_State *L, lua_CFunction fill);
+/* スタックの上の表の [name] がまだなければ [fn] を入れる（fill から使う） */
+void kibi_lua_lazy_set(lua_State *L, const char *name, lua_CFunction fn);
+
+int luaopen_colors(lua_State *L);
+int luaopen_colours(lua_State *L);
+int luaopen_keys(lua_State *L);
+int luaopen_term(lua_State *L);
+int luaopen_fs(lua_State *L);
+
+/* CC の色（2 の 0〜15 乗）の既定のパレット（0xRRGGBB）。[i] は 2^i の色 */
+extern const uint32_t kibi_lua_default_palette[16];
+
+/*
+ * カーネルのキー名（ADR 0326。[name] は NUL で終わらなくてよい）を CC の keys の番号（GLFW のキーコード）にする。
+ * 表にない名前と "unknown" は -1。import を呼ばず、Lua の確保もしない（kibi_lua_arena_hold の中から呼ぶ）
+ */
+int kibi_lua_key_code(const char *name, size_t len);
+
+/* 保存から戻した（"restored" を受けた）ことを term に知らせる。印を立てるだけで、何も書かない（kibi_lua_arena_hold の中から呼ぶ） */
+void kibi_lua_term_restored(void);
 
 #endif

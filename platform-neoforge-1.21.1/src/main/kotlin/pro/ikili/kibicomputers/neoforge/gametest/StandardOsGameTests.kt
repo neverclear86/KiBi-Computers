@@ -323,8 +323,8 @@ object StandardOsGameTests {
         }
     }
     /**
-     * キーの押下のイベント（#326、ADR 0326）: 標準 OS の `/bin/lua` で `os.pullEvent('key-pressed')` を待っている間に
-     * キーボードで `q` を押すと、キー名・修飾キー・繰り返しと、source（キーボードの address）が届く。`q` の押下は TTY に何も流さない
+     * キーの押下のイベント（#326、ADR 0326）: 標準 OS の `/bin/lua` で `os.pullEvent('key')` を待っている間に
+     * キーボードで `q` を押すと、CC と同じ `key`, `keys.q`, 繰り返し が届く（#724。ADR 0724）。`q` の押下は TTY に何も流さない
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -332,8 +332,8 @@ object StandardOsGameTests {
         val (case, screen, keyboard) = placeComputer(helper)
         // 最初の pullEvent でカーネルのキューが開くので、kready が出た時点でキーのイベントを受けられる
         val script = "os.queueEvent('r0'); os.pullEvent('r0'); print('kready'); local e; " +
-            "repeat e = {os.pullEvent('key-pressed')} until e[3] == 'q'; " +
-            "print(table.concat({'kp', e[3], e[4], tostring(e[5]), tostring(e[2] == peripheral.getName(peripheral.find('keyboard')))}, ','))"
+            "repeat e = {os.pullEvent('key')} until e[2] == keys.q; " +
+            "print(table.concat({'kp', keys.getName(e[2]), tostring(e[3]), #e}, ','))"
         var step = 0
         helper.succeedWhen {
             val text = lines(screen.text)
@@ -354,20 +354,20 @@ object StandardOsGameTests {
                     helper.fail("pressed q")
                 }
             }
-            helper.assertTrue(text.any { it == "kp,q,0,false,true" }, "lua should receive the key event: $text")
+            helper.assertTrue(text.any { it == "kp,q,false,3" }, "lua should receive the key event: $text")
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }
     }
 
     /**
-     * キーのイベントを順に画面に出す Lua（#326）。`kready` が出たらキーのイベントを受けられる。`key-pressed`・`key-released` は
+     * キーのイベントを順に画面に出す Lua（#326）。`kready` が出たらキーのイベントを受けられる。`key`・`key_up`（#724）は
      * `ev,<名前>,<キー>`、キーボードの `device-detached`（Lua では `peripheral_detach`。ADR 0094）は `ev,detached`
      */
     private const val KEY_LOG_SCRIPT = "os.queueEvent('r0'); os.pullEvent('r0'); " +
         "local kn = peripheral.getName(peripheral.find('keyboard')); print('kready'); " +
         "while true do local e = {os.pullEvent()}; " +
-        "if e[1] == 'key-pressed' or e[1] == 'key-released' then print('ev,' .. e[1] .. ',' .. e[3]) " +
+        "if e[1] == 'key' or e[1] == 'key_up' then print('ev,' .. e[1] .. ',' .. keys.getName(e[2])) " +
         "elseif e[1] == 'peripheral_detach' and e[2] == kn then print('ev,detached') end end"
 
     /** 入力のセッションを開いて、[key] を押す（サーバーに届いた入力と同じ道。[KeyboardSessions]） */
@@ -407,27 +407,27 @@ object StandardOsGameTests {
                     helper.fail("pressed q")
                 }
                 2 -> {
-                    helper.assertTrue(text.any { it == "ev,key-pressed,q" }, "q should be pressed: $text")
+                    helper.assertTrue(text.any { it == "ev,key,q" }, "q should be pressed: $text")
                     // GUI を閉じる（クライアントからの閉じる）
                     KeyboardSessions.closeFromClient(player, KeyboardSessions.sessionOf(player)!!.id)
                     step = 3
                     helper.fail("closed the session")
                 }
                 3 -> {
-                    helper.assertTrue(text.any { it == "ev,key-released,q" }, "closing the session should release q: $text")
+                    helper.assertTrue(text.any { it == "ev,key_up,q" }, "closing the session should release q: $text")
                     helper.assertTrue(text.none { it == "ev,detached" }, "the keyboard should still be connected: $text")
                     pressThroughSession(helper, player, Key.W)
                     step = 4
                     helper.fail("pressed w")
                 }
                 4 -> {
-                    helper.assertTrue(text.any { it == "ev,key-pressed,w" }, "w should be pressed: $text")
+                    helper.assertTrue(text.any { it == "ev,key,w" }, "w should be pressed: $text")
                     keyboard.onChunkUnloaded()
                     step = 5
                     helper.fail("unloaded the keyboard")
                 }
             }
-            val released = text.indexOf("ev,key-released,w")
+            val released = text.indexOf("ev,key_up,w")
             val detached = text.indexOf("ev,detached")
             helper.assertTrue(released >= 0, "unloading should release w: $text")
             helper.assertTrue(detached > released, "device-detached should come after the release: $text")
@@ -464,13 +464,13 @@ object StandardOsGameTests {
                     helper.fail("pressed q")
                 }
                 2 -> {
-                    helper.assertTrue(text.any { it == "ev,key-pressed,q" }, "q should be pressed: $text")
+                    helper.assertTrue(text.any { it == "ev,key,q" }, "q should be pressed: $text")
                     helper.setBlock(KEYBOARD, Blocks.AIR)
                     step = 3
                     helper.fail("broke the keyboard")
                 }
             }
-            val released = text.indexOf("ev,key-released,q")
+            val released = text.indexOf("ev,key_up,q")
             val detached = text.indexOf("ev,detached")
             helper.assertTrue(released >= 0, "breaking the keyboard should release q: $text")
             helper.assertTrue(detached > released, "device-detached should come after the release: $text")
