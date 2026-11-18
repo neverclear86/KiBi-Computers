@@ -51,10 +51,10 @@ public class MachineScheduler private constructor(
         private const val TIMER_STACK_BYTES: Long = 1L * 1024 * 1024
 
         /** 接続層の例外の投げた場所を決めるスタックの段数（標準ライブラリのフレームは数えない。#674） */
-        private const val HOST_FAILURE_FRAMES = 3
+        internal const val HOST_FAILURE_FRAMES = 3
 
         /** スタックトレースを出した、接続層の例外の場所を覚える数の上限（#674。仮の値） */
-        private const val HOST_FAILURE_TRACE_LIMIT = 64
+        internal const val HOST_FAILURE_TRACE_LIMIT = 64
 
         /** 内部の設定（テスト用の差し替え）を付けてスケジューラを作る。 */
         @JvmSynthetic
@@ -101,33 +101,14 @@ public class MachineScheduler private constructor(
     /**
      * 接続層の例外 [t]（種類は `Machine` の `HostFailureKind` の ordinal [kind]）の投げた場所で、スタックトレースを出すのが
      * スケジューラ全体で最初なら [HostFailureTrace.NEW]（以後は [HostFailureTrace.KNOWN]。#674）。
-     * 場所は、種類・例外のクラス・スタックの上から [HOST_FAILURE_FRAMES] 個で決める。ただし、JDK と Kotlin の標準ライブラリの
-     * フレーム（`ArrayList.get` が `Objects.checkIndex` を通って投げるなど）は数えず、それより下の呼んだ側のフレームを使う
-     * （標準ライブラリの中だけで決めると、別々の呼び出し元からの例外が同じ場所になる）。スタックがすべて標準ライブラリなら、上から使う。
+     * 場所は、種類・例外のクラス・スタックの上から [HOST_FAILURE_FRAMES] 個で決める（標準ライブラリのフレームは数えない。[hostFailureSite]）。
      * 覚える場所は [HOST_FAILURE_TRACE_LIMIT] 個まで（超えたら、新しい場所は [HostFailureTrace.LIMIT_REACHED]）
      */
     internal fun claimHostFailureTrace(kind: Int, t: Throwable): HostFailureTrace {
-        val frames = t.stackTrace
-        val site = ArrayList<Any>(HOST_FAILURE_FRAMES + 2)
-        site += kind
-        site += t.javaClass
-        for (frame in frames) {
-            if (site.size - 2 >= HOST_FAILURE_FRAMES) break
-            if (!isLibraryFrame(frame)) site += frame
-        }
-        if (site.size == 2) {
-            for (i in 0 until minOf(HOST_FAILURE_FRAMES, frames.size)) site += frames[i]
-        }
+        val site = hostFailureSite(kind, t, HOST_FAILURE_FRAMES)
         if (site in hostFailureTraced) return HostFailureTrace.KNOWN
         if (hostFailureTraced.size >= HOST_FAILURE_TRACE_LIMIT) return HostFailureTrace.LIMIT_REACHED
         return if (hostFailureTraced.add(site)) HostFailureTrace.NEW else HostFailureTrace.KNOWN
-    }
-
-    /** JDK か Kotlin の標準ライブラリのフレーム（[claimHostFailureTrace] の場所に数えない） */
-    private fun isLibraryFrame(frame: StackTraceElement): Boolean {
-        val name = frame.className
-        return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") ||
-            name.startsWith("sun.") || name.startsWith("com.sun.") || name.startsWith("kotlin.")
     }
 
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
