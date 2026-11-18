@@ -71,6 +71,27 @@ internal object KibiP2WitTool {
         return c.outputs.getValue("c.wasm")
     }
 
+    /**
+     * p1 のコアモジュール [module]（wasi-libc でビルドしたもの）に world `all` を [worldBody] にして WIT を埋め込み、wasmtime の
+     * アダプター（コマンド用）で p2 のコマンドのコンポーネントにする（wasi-sdk の wasm32-wasip2 と同じ作り方。#777）
+     */
+    fun adapt(worldBody: String, module: ByteArray): ByteArray {
+        val e = WitTool.run(
+            listOf("component", "embed", "--world", "all", "${WitTool.WORK}/w", "${WitTool.WORK}/m.wasm", "-o", "${WitTool.WORK}/e.wasm"),
+            worldFiles(worldBody) + ("m.wasm" to module),
+            listOf("e.wasm"),
+        )
+        assertEquals(0, e.exitCode, e.stderr)
+        val adapter = checkNotNull(javaClass.getResourceAsStream("/kibicomputers/wasi-adapter/wasi_snapshot_preview1.command.wasm")).use { it.readBytes() }
+        val c = WitTool.run(
+            listOf("component", "new", "work/e.wasm", "--adapt", "wasi_snapshot_preview1=work/a.wasm", "-o", "work/c.wasm"),
+            mapOf("e.wasm" to e.outputs.getValue("e.wasm"), "a.wasm" to adapter),
+            listOf("c.wasm"),
+        )
+        assertEquals(0, c.exitCode, c.stderr)
+        return c.outputs.getValue("c.wasm")
+    }
+
     /** [dummy] の WIT のうち、`package kibi:` の塊だけを並べたもの（ホストの [KibiP2Wit.TEXT] と比べる） */
     val kibiText: String by lazy {
         val r = WitTool.run(listOf("component", "wit", "work/c.wasm"), mapOf("c.wasm" to dummy))

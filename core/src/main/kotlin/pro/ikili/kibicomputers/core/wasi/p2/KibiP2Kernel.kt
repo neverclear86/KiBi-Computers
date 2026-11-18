@@ -20,12 +20,13 @@ import pro.ikili.kibicomputers.core.wasi.kibi.KibiAccess
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiClock
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiEvents
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiFs
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiMemory
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiPower
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiTty
 import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
 
 /**
- * `kibi:kernel`（events・timers・`*-poll`）、`kibi:io`（tty・pipe-streams）、`kibi:fs/mounts`、`kibi:computer`（clock・power・access）の
+ * `kibi:kernel`（events・timers・`*-poll`）、`kibi:io`（tty・pipe-streams）、`kibi:fs/mounts`、`kibi:computer`（memory・clock・power・access）の
  * p2 の実装（#685。ADR 0685）。意味は p1 と同じ層（`wasi/kibi/Kibi*`）とカーネルの口を使う。文字列の上限は p1 の lift と同じ
  * （超えたら同じ errno）。燃料は p1 と同じ（`take` はイベントの数、一覧は件数）
  */
@@ -37,6 +38,7 @@ internal object KibiP2Kernel {
     const val TTY: String = "kibi:io/tty"
     const val PIPE_STREAMS: String = "kibi:io/pipe-streams"
     const val MOUNTS: String = "kibi:fs/mounts"
+    const val MEMORY: String = "kibi:computer/memory"
     const val CLOCK: String = "kibi:computer/clock"
     const val POWER: String = "kibi:computer/power"
     const val ACCESS: String = "kibi:computer/access"
@@ -132,6 +134,18 @@ internal object KibiP2Kernel {
             "list-mounts" to body { ctx, _ -> CanonValue.Items(KibiFs.listMounts(ctx).map(::mountInfo)) },
             "list-disks" to body { ctx, _ -> CanonValue.Items(KibiFs.listDisks(ctx).map(::diskInfo)) },
         )
+        val memory = mapOf(
+            "remaining" to body { ctx, _ -> CanonValue.I64(KibiMemory.remaining(ctx)) },
+            // ptr は、lower した commit を import した core インスタンスの線形メモリの番地（#777。ADR 0777）。メモリがない・間に core インスタンスがないなら false。
+            // u32 の ptr・len はビットのまま、u64 の keep もビットのまま渡す（p1 と同じ。2^63 以上は必ず断る）
+            "commit" to HostFunctionBody { call, a ->
+                val m = call.callerMemory
+                val ptr = (a[0] as CanonValue.I32).value
+                val len = (a[1] as CanonValue.I32).value
+                val keep = (a[2] as CanonValue.I64).value
+                CanonValue.Bool(m != null && KibiMemory.commit(P2.ctx(call), m, ptr, len, keep))
+            },
+        )
         val clock = mapOf(
             "uptime-ticks" to body { ctx, _ -> CanonValue.I64(KibiClock.uptimeTicks(ctx)) },
             "world-ticks" to body { ctx, _ -> CanonValue.I64(KibiClock.worldTicks(ctx)) },
@@ -149,7 +163,7 @@ internal object KibiP2Kernel {
         )
         return mapOf(
             EVENTS to events, TIMERS to timers, EVENTS_POLL to eventsPoll, TIMERS_POLL to timersPoll,
-            TTY to tty, PIPE_STREAMS to pipeStreams, MOUNTS to mounts, CLOCK to clock, POWER to power, ACCESS to access,
+            TTY to tty, PIPE_STREAMS to pipeStreams, MOUNTS to mounts, MEMORY to memory, CLOCK to clock, POWER to power, ACCESS to access,
         )
     }
 
