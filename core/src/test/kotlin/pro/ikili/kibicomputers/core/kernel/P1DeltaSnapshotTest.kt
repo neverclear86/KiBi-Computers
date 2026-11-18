@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
 import pro.ikili.kibicomputers.core.persist.SnapshotInspection
@@ -105,7 +106,7 @@ class P1DeltaSnapshotTest {
             assertTrue(drain().contains("hello"), drain())
 
             val deltaBase: DeltaBase = base.asDeltaBase()
-            val deltaSource = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, 1.0)!!
+            val deltaSource = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, FullSaveRule(1.0))!!
             assertEquals(deltaBase, deltaSource.deltaBase)
             val deltaSnapshot = deltaSource.build(id, 2, "test")
             val deltaBytes = bytesOf(deltaSnapshot)

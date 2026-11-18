@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.DeltaBase
-import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineSnapshotSource
 import pro.ikili.kibicomputers.core.persist.QuiesceHandle
 import pro.ikili.kibicomputers.core.persist.SaveReadiness
@@ -221,11 +221,11 @@ public class MachineManager<K : Any> internal constructor(
         key: K,
         policy: CapturePolicy,
         deltaBase: DeltaBase? = null,
-        fullSaveChangedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+        fullSaveRule: FullSaveRule = FullSaveRule.DEFAULT,
     ): MachineSnapshotSource? {
         val entry = entries[key] ?: return null
         if (entry.captured) return null
-        val source = entry.machine.captureSnapshot(policy, deltaBase, fullSaveChangedRatio) ?: return null
+        val source = entry.machine.captureSnapshot(policy, deltaBase, fullSaveRule) ?: return null
         if (entry.quiesce != null) entry.captured = true
         return source
     }

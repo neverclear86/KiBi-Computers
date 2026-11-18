@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 
@@ -138,6 +139,17 @@ class KiBiConfigTest {
             setOf(KiBiConfig.COMPILER_THREADS, KiBiConfig.FULL_SAVE_CHANGED_RATIO, KiBiConfig.RESTORES_PER_TICK),
             values.rejected.toSet(),
         )
+    }
+
+    @Test
+    fun fullSaveRuleComesFromTheRatioAndTheMinimumChunks() {
+        val values = ConfigValues.resolve(
+            mapSource(KiBiConfig.FULL_SAVE_CHANGED_RATIO to 0.25, KiBiConfig.FULL_SAVE_MIN_CHANGED_CHUNKS to 0),
+        )
+        assertEquals(FullSaveRule(0.25, 0), KiBiConfig.machineSaveConfig(values).fullSaveRule)
+        val negative = ConfigValues.resolve(mapSource(KiBiConfig.FULL_SAVE_MIN_CHANGED_CHUNKS to -1))
+        assertEquals(MachineSaveConfig.DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS, KiBiConfig.machineSaveConfig(negative).fullSaveMinChangedChunks)
+        assertEquals(listOf<ConfigEntry<*>>(KiBiConfig.FULL_SAVE_MIN_CHANGED_CHUNKS), negative.rejected)
     }
 
     @Test

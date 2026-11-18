@@ -292,6 +292,47 @@ public fun adoptsCompletion(identity: MachineIdentity?, current: MachineIdentity
 }
 
 /**
+ * 差分の写しを頼まれたとき、全体の写しに切り替えるかの規則（#83、#668、ADR 0083 の規則 3）。
+ *
+ * 「変わった区画」は、基準に全体の形で入っているプロセスでは基準から変わった区画、ほかのプロセスでは書き換えた区画すべて。
+ * 「書き換えた区画」は全プロセスの書き換えた区画（数え方は `Machine` の取り出し）。
+ * 「基準なしの区画」は、基準に入っていない（区画を数えられる）プロセスの書き換えた区画。差分の写しの中では、そのプロセスは毎回
+ * 全体の形で写され、基準を付け直せるのは全体の写しだけなので、下限は基準なしの区画がないときにだけ効かせる。
+ *
+ * @property changedRatio 「変わった区画 ÷ 書き換えた区画」の境目。これを**超えたら**全体（ちょうどなら差分）
+ * @property minChangedChunks 変わった区画の数の下限。基準なしの区画がなく、変わった区画が**これ以下なら**、比を見ずに差分。
+ *   0 なら比だけで決める
+ */
+@ApiStatus.Internal
+public data class FullSaveRule @JvmOverloads constructor(
+    public val changedRatio: Double = MachineSaveConfig.DEFAULT_FULL_SAVE_CHANGED_RATIO,
+    public val minChangedChunks: Long = MachineSaveConfig.DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS,
+) {
+    init {
+        require(changedRatio in 0.0..1.0) { "全体保存に切り替える比は 0 以上 1 以下" }
+        require(minChangedChunks >= 0) { "全体保存に切り替える区画の下限は 0 以上" }
+    }
+
+    /**
+     * 変わった区画が [changed]（基準なしの区画 [unbased] を含む）、書き換えた区画が [total] のとき、全体の写しにするか。
+     * [unbased] が 0 で [changed] が [minChangedChunks] 以下なら `false`。そうでなければ `changed / total` が [changedRatio] を超えたら
+     * `true`（[total] が 0 なら比は 0）。[unbased] が 1 以上なら下限は効かない（全体の写しでしか基準を付け直せないため。#668）
+     */
+    @JvmOverloads
+    public fun isFull(changed: Long, total: Long, unbased: Long = 0): Boolean {
+        if (unbased <= 0L && changed <= minChangedChunks) return false
+        val ratio = if (total <= 0L) 0.0 else changed.toDouble() / total
+        return ratio > changedRatio
+    }
+
+    public companion object {
+        /** 仮の既定値の規則 */
+        @JvmField
+        public val DEFAULT: FullSaveRule = FullSaveRule()
+    }
+}
+
+/**
  * 待機点保存の仮の値（#81。確定は #251）。
  *
  * @property autosavePeriodTicks 自動保存の周期（tick）
@@ -303,6 +344,10 @@ public fun adoptsCompletion(identity: MachineIdentity?, current: MachineIdentity
  * @property stopQuiesceMillis サーバーの停止で、全台が待機点に来るのを待つ上限
  * @property fullSaveChangedRatio 差分の世代を書く代わりに全体保存にする、「基準から変わった区画の数 ÷ 書き換えた区画の数」の境目（#83）。
  *   これを超えたら全体保存。仮の値 0.5（確定は #251）
+ * @property fullSaveMinChangedChunks 全体保存に切り替えるのに要る、変わった区画（4 KiB）の数の下限（#668）。変わった区画の合計が
+ *   これ以下なら、比を見ずに差分にする（[FullSaveRule]）。ただし、基準に入っていないプロセス（基準の後に起こしたもの、復元の直後のもの）が
+ *   いるときは下限を見ず、比だけで決める（全体の写しでしか基準を付け直せないため）。0 なら比だけで決める（#668 より前と同じ）。
+ *   仮の値 64 = 256 KiB（確定は #251）
  * @property writerMaxPendingBytes 書き込み待ちの写しの見積もりの合計の上限（バイト。#84）。これ以上なら、自動保存は次の tick に回し、
  *   アンロード・停止は書き込みのスレッドが進むのを待つ。仮の値 256 MiB（確定は #251）
  * @property writerFlushMillis 書き込みのスレッドを待つ上限（ミリ秒。#84）: 停止の `flush`・スレッドの join、アンロード・停止の
@@ -324,6 +369,7 @@ public data class MachineSaveConfig @JvmOverloads constructor(
     public val writerFlushMillis: Long = DEFAULT_WRITER_FLUSH_MILLIS,
     public val restoresPerTick: Int = 16,
     public val restoreWriteWaitMillis: Long = 2000,
+    public val fullSaveMinChangedChunks: Long = DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS,
 ) {
     init {
         require(autosavePeriodTicks > 0) { "自動保存の周期は 1 以上" }
@@ -336,11 +382,21 @@ public data class MachineSaveConfig @JvmOverloads constructor(
         require(writerFlushMillis >= 0) { "書き込みのスレッドを待つ上限は 0 以上" }
         require(restoresPerTick > 0) { "復元を始める台数は 1 以上" }
         require(restoreWriteWaitMillis >= 0) { "書き込みの終わりを待つ上限は 0 以上" }
+        require(fullSaveMinChangedChunks >= 0) { "全体保存に切り替える区画の下限は 0 以上" }
     }
+
+    /** 全体か差分かを決める規則（#83、#668） */
+    public val fullSaveRule: FullSaveRule get() = FullSaveRule(fullSaveChangedRatio, fullSaveMinChangedChunks)
 
     public companion object {
         /** [fullSaveChangedRatio] の仮の既定値（#83。確定は #251） */
         public const val DEFAULT_FULL_SAVE_CHANGED_RATIO: Double = 0.5
+
+        /**
+         * [fullSaveMinChangedChunks] の仮の既定値（#668。確定は #251）。64 区画 = 256 KiB。標準 OS の init と sh だけの台が
+         * 1 行のコマンドで変える区画（十数区画。ADR 0083 の付録）に、余裕を持たせた数
+         */
+        public const val DEFAULT_FULL_SAVE_MIN_CHANGED_CHUNKS: Long = 64
 
         /** [writerMaxPendingBytes] の仮の既定値（256 MiB。#84） */
         public const val DEFAULT_WRITER_MAX_PENDING_BYTES: Long = 256L * 1024 * 1024
