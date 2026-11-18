@@ -140,11 +140,71 @@ static void push_call_error(lua_State *L, const kibi_device_call_error_t *e, con
     }
 }
 
-/* call-error を Lua のエラーにする（戻らない）。位置は呼んだ Lua の行 */
-static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, const char *method, size_t method_len) {
-    luaL_where(L, 1);
-    push_call_error(L, e, method, method_len);
+/* ---- 結果を写す（#756。ADR 0744） ---- */
+
+/*
+ * 写す関数 [f] を、引数 [a]・[b]（lightuserdata）で lua_pcall し、積んだ値（[nresults] 個。LUA_MULTRET なら全部）を残して、その数を返す。
+ * import の結果（arena にある）を Lua の値に写すところは、すべてここを通す。写す途中の Lua の確保で GC が走ると、__gc の中から
+ * peripheral の関数や os.queueEvent などが入れ子で arena を戻したり、待っている呼び出しの表を詰めたりするので、写す間は
+ * kibi_lua_arena_hold で囲む（囲んでいる間は、入れ子の peripheral の関数がエラーになり、os の回収は arena を使うものをしない）。
+ * 写し終えたら（エラーでも）release して arena を戻し、エラーなら投げ直す。
+ * 積む 3 つ（軽い C 関数と lightuserdata）は確保しないが、スタックの余裕は呼ぶ側が import の前に確かめておく（ensure_copy_stack）。
+ * import の結果を受け取ってからここまでの間は、Lua の確保を伴う API を呼ばない
+ */
+static int copy_held(lua_State *L, lua_CFunction f, const void *a, const void *b, int nresults) {
+    int base = lua_gettop(L);
+    lua_pushcfunction(L, f);
+    lua_pushlightuserdata(L, (void *)a);
+    lua_pushlightuserdata(L, (void *)b);
+    kibi_lua_arena_hold();
+    int status = lua_pcall(L, 2, nresults, 0);
+    kibi_lua_arena_release();
     kibi_lua_arena_reset();
+    if (status != LUA_OK) return lua_error(L);
+    return lua_gettop(L) - base;
+}
+
+/* copy_held が積む分（関数と引数 2 つ）のスタックの余裕を確かめる。import の前（fd を開く前）に呼ぶ */
+static void ensure_copy_stack(lua_State *L) {
+    luaL_checkstack(L, 3, NULL);
+}
+
+/*
+ * 結果を写している途中（写す途中の __gc から入れ子で呼ばれたとき）なら、エラーにする。arena を戻す前、fd を開く前に呼ぶ。
+ * 入れ子の呼び出しは arena を戻して取り直し、外側が写している結果の場所を解放してしまうため（#756）。
+ * os.pullEvent の "cannot wait for events while a result is being copied" と同じ形（位置なし）
+ */
+static void refuse_while_copying(lua_State *L) {
+    if (kibi_lua_arena_held()) {
+        lua_pushliteral(L, "cannot call a peripheral while a result is being copied");
+        lua_error(L);
+    }
+}
+
+/* メソッドの名前（copy_call_error に渡す） */
+typedef struct {
+    const char *ptr;
+    size_t len;
+} method_ref_t;
+
+/* copy_held で呼ぶ。引数 1 の call-error と、引数 2 のメソッドの名前から、文（位置なし）を積む */
+static int copy_call_error(lua_State *L) {
+    const kibi_device_call_error_t *e = (const kibi_device_call_error_t *)lua_touserdata(L, 1);
+    const method_ref_t *m = (const method_ref_t *)lua_touserdata(L, 2);
+    lua_settop(L, 0);
+    push_call_error(L, e, m->ptr, m->len);
+    return 1;
+}
+
+/*
+ * call-error を Lua のエラーにする（戻らない）。位置は呼んだ Lua の行。
+ * message（arena にある）を写して arena を戻してから位置を付ける（luaL_where の確保で走る __gc に、写す前の message を壊させない）
+ */
+static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, const char *method, size_t method_len) {
+    method_ref_t m = {method, method_len};
+    copy_held(L, copy_call_error, e, &m, 1);
+    luaL_where(L, 1);
+    lua_insert(L, -2);
     lua_concat(L, 2);
     return lua_error(L);
 }
@@ -153,6 +213,8 @@ static int raise_call_error(lua_State *L, const kibi_device_call_error_t *e, con
 
 /* 開いて fd を返す。外れている（見つからない）なら -1。ほかの誤りは Lua のエラー */
 static int64_t open_device(lua_State *L, const address_t *a) {
+    refuse_while_copying(L);
+    ensure_copy_stack(L);
     kibi_lua_arena_reset();
     kibi_lua_check_memory(L, INFO_RESULT_BYTES);
     kibi_device_result_handle_t r;
@@ -178,6 +240,14 @@ static void reserve_or_close(lua_State *L, uint32_t fd, size_t need) {
     }
 }
 
+/* copy_held で呼ぶ。引数 1 の info の種類を積む */
+static int copy_kind(lua_State *L) {
+    const kibi_device_info_t *info = (const kibi_device_info_t *)lua_touserdata(L, 1);
+    lua_settop(L, 0);
+    lua_pushlstring(L, info->kind.ptr, info->kind.len);
+    return 1;
+}
+
 /*
  * 開いたデバイスの種類を積む。fd は閉じる（import の結果を読んだらすぐ閉じてから Lua の値に写す。
  * 写す途中の Lua の確保でメモリ不足の longjmp が起きても、fd が漏れないように）
@@ -187,8 +257,7 @@ static void push_kind(lua_State *L, uint32_t fd) {
     kibi_device_info_t info;
     kibi_device_info(fd, &info);
     kibi_device_drop(fd);
-    lua_pushlstring(L, info.kind.ptr, info.kind.len);
-    kibi_lua_arena_reset();
+    copy_held(L, copy_kind, &info, NULL, 1);
 }
 
 /* ---- 値の写し方 ---- */
@@ -386,15 +455,19 @@ static uint32_t open_checked(lua_State *L, const address_t *a, const char *kind,
     return (uint32_t)fd;
 }
 
-/* 結果の値を積んで数を返す（写し終えたら arena を戻すのは呼んだ側） */
+/* 結果の値を積んで数を返す。copy_held の中で呼ぶ（写し終えたら・エラーでも、arena を戻すのは copy_held） */
 static int push_results(lua_State *L, const kibi_device_list_value_t *ok) {
     size_t count = ok->len;
-    if (count > INT32_MAX || !lua_checkstack(L, (int)count + LUA_MINSTACK)) {
-        kibi_lua_arena_reset();
-        return luaL_error(L, "too many results");
-    }
+    if (count > INT32_MAX || !lua_checkstack(L, (int)count + LUA_MINSTACK)) return luaL_error(L, "too many results");
     for (size_t i = 0; i < count; i++) push_value(L, &ok->ptr[i]);
     return (int)count;
+}
+
+/* copy_held で呼ぶ。引数 1 の値の並びを積んで、その数を返す */
+static int copy_values(lua_State *L) {
+    const kibi_device_list_value_t *ok = (const kibi_device_list_value_t *)lua_touserdata(L, 1);
+    lua_settop(L, 0);
+    return push_results(L, ok);
 }
 
 /* 開いた [fd] で [c] を invoke し、結果を積んで数を返す（結果が出るまでプロセスごと待つ）。fd は閉じる */
@@ -404,9 +477,7 @@ static int invoke_now(lua_State *L, uint32_t fd, const call_t *c) {
     kibi_device_invoke(fd, c->m, c->mlen, c->args, (size_t)c->n, &r);
     kibi_device_drop(fd);
     if (r.is_err) return raise_call_error(L, &r.val.err, c->m, c->mlen);
-    int count = push_results(L, &r.val.ok);
-    kibi_lua_arena_reset();
-    return count;
+    return copy_held(L, copy_values, &r.val.ok, NULL, LUA_MULTRET);
 }
 
 /* 表の [i] 番目の pending-call を閉じて、表から外す（後ろを詰めて、積んだ順を保つ） */
@@ -451,7 +522,8 @@ static int push_task_complete(lua_State *L) {
 void kibi_lua_tasks_collect(lua_State *L) {
     /* 写す途中の確保で GC が __gc を呼び、その中で os.queueEvent などから入れ子で回収すると、表と arena が動くので入れ子では回収しない
      * （写す間は kibi_lua_arena_hold で囲む。os.c の collect も、その間はここを呼ばない） */
-    if (kibi_lua_arena_held()) return;
+    if (kibi_lua_arena_held() || task_count == 0) return;
+    ensure_copy_stack(L);
     int i = 0;
     while (i < task_count) {
         kibi_lua_arena_reset();
@@ -466,14 +538,7 @@ void kibi_lua_tasks_collect(lua_State *L) {
             i++;
             continue;
         }
-        lua_pushcfunction(L, push_task_complete);
-        lua_pushlightuserdata(L, &o);
-        lua_pushlightuserdata(L, &tasks[i]);
-        kibi_lua_arena_hold();
-        int status = lua_pcall(L, 2, 0, 0);
-        kibi_lua_arena_release();
-        kibi_lua_arena_reset();
-        if (status != LUA_OK) lua_error(L);
+        copy_held(L, push_task_complete, &o, &tasks[i], 0);
         finish_task(i);
     }
 }
@@ -527,22 +592,14 @@ static int copy_taken(lua_State *L) {
  * 写す途中でメモリ不足になっても、pcall で受けてから release する
  */
 static int return_taken(lua_State *L, kibi_device_option_result_values_t *o, const call_t *c) {
-    int base = lua_gettop(L);
-    lua_pushcfunction(L, copy_taken);
-    lua_pushlightuserdata(L, o);
-    lua_pushlightuserdata(L, (void *)c);
-    kibi_lua_arena_hold();
-    int status = lua_pcall(L, 2, LUA_MULTRET, 0);
-    kibi_lua_arena_release();
-    kibi_lua_arena_reset();
-    if (status != LUA_OK) return lua_error(L);
+    int count = copy_held(L, copy_taken, o, c, LUA_MULTRET);
     if (o->val.is_err) {
         luaL_where(L, 1);
         lua_insert(L, -2);
         lua_concat(L, 2);
         return lua_error(L);
     }
-    return lua_gettop(L) - base;
+    return count;
 }
 
 /*
@@ -645,21 +702,30 @@ static int l_wrapped(lua_State *L) {
 
 /* ---- 列挙 ---- */
 
+/* copy_held で呼ぶ。引数 1 の一覧を、address の並びと種類の並びの2つのテーブルにして積む */
+static int copy_device_list(lua_State *L) {
+    const kibi_device_list_info_t *l = (const kibi_device_list_info_t *)lua_touserdata(L, 1);
+    lua_settop(L, 0);
+    lua_createtable(L, (int)l->len, 0);
+    lua_createtable(L, (int)l->len, 0);
+    for (size_t i = 0; i < l->len; i++) {
+        lua_pushlstring(L, l->ptr[i].address.ptr, l->ptr[i].address.len);
+        lua_rawseti(L, -3, (lua_Integer)i + 1);
+        lua_pushlstring(L, l->ptr[i].kind.ptr, l->ptr[i].kind.len);
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    return 2;
+}
+
 /* デバイスの一覧を、address の並びと種類の並びの2つのテーブルにして積む */
 static void push_device_list(lua_State *L) {
+    refuse_while_copying(L);
+    ensure_copy_stack(L);
     kibi_lua_arena_reset();
     kibi_lua_check_memory(L, LIST_RESULT_BYTES);
     kibi_device_list_info_t l;
     kibi_device_list_devices(&l);
-    lua_createtable(L, (int)l.len, 0);
-    lua_createtable(L, (int)l.len, 0);
-    for (size_t i = 0; i < l.len; i++) {
-        lua_pushlstring(L, l.ptr[i].address.ptr, l.ptr[i].address.len);
-        lua_rawseti(L, -3, (lua_Integer)i + 1);
-        lua_pushlstring(L, l.ptr[i].kind.ptr, l.ptr[i].kind.len);
-        lua_rawseti(L, -2, (lua_Integer)i + 1);
-    }
-    kibi_lua_arena_reset();
+    copy_held(L, copy_device_list, &l, NULL, 2);
 }
 
 /* peripheral.getNames() */
@@ -719,6 +785,37 @@ static int l_hasType(lua_State *L) {
     return 1;
 }
 
+/* copy_methods_kind・copy_methods_mains_kind の中身。引数 1 のメソッドの一覧と引数 2 の info から積む */
+static int copy_methods(lua_State *L, int with_main) {
+    const kibi_device_list_method_info_t *l = (const kibi_device_list_method_info_t *)lua_touserdata(L, 1);
+    const kibi_device_info_t *info = (const kibi_device_info_t *)lua_touserdata(L, 2);
+    lua_settop(L, 0);
+    lua_createtable(L, (int)l->len, 0);
+    for (size_t i = 0; i < l->len; i++) {
+        lua_pushlstring(L, l->ptr[i].name.ptr, l->ptr[i].name.len);
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    if (with_main) {
+        lua_createtable(L, (int)l->len, 0);
+        for (size_t i = 0; i < l->len; i++) {
+            lua_pushboolean(L, l->ptr[i].main_thread != 0);
+            lua_rawseti(L, -2, (lua_Integer)i + 1);
+        }
+    }
+    lua_pushlstring(L, info->kind.ptr, info->kind.len);
+    return with_main ? 3 : 2;
+}
+
+/* copy_held で呼ぶ。methods, kind を積む */
+static int copy_methods_kind(lua_State *L) {
+    return copy_methods(L, 0);
+}
+
+/* copy_held で呼ぶ。methods, メインスレッドのメソッドかの並び, kind を積む */
+static int copy_methods_mains_kind(lua_State *L) {
+    return copy_methods(L, 1);
+}
+
 /*
  * 開いた fd のメソッドの並びと種類を積む（methods, kind の順。[with_main] なら methods, メインスレッドのメソッドかの並び, kind）。
  * fd は閉じる。
@@ -732,20 +829,7 @@ static void push_methods_and_kind(lua_State *L, uint32_t fd, int with_main) {
     kibi_device_info_t info;
     kibi_device_info(fd, &info);
     kibi_device_drop(fd);
-    lua_createtable(L, (int)l.len, 0);
-    for (size_t i = 0; i < l.len; i++) {
-        lua_pushlstring(L, l.ptr[i].name.ptr, l.ptr[i].name.len);
-        lua_rawseti(L, -2, (lua_Integer)i + 1);
-    }
-    if (with_main) {
-        lua_createtable(L, (int)l.len, 0);
-        for (size_t i = 0; i < l.len; i++) {
-            lua_pushboolean(L, l.ptr[i].main_thread != 0);
-            lua_rawseti(L, -2, (lua_Integer)i + 1);
-        }
-    }
-    lua_pushlstring(L, info.kind.ptr, info.kind.len);
-    kibi_lua_arena_reset();
+    copy_held(L, with_main ? copy_methods_mains_kind : copy_methods_kind, &l, &info, with_main ? 3 : 2);
 }
 
 /* peripheral.getMethods(name) */

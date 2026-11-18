@@ -26,7 +26,8 @@ void kibi_lua_arena_reset(void);
  * 写す途中の Lua の確保で GC が走ると、__gc の中から os.queueEvent・os.pullEvent などで回収（kibi_lua_os.c の collect）が入れ子で走り、
  * arena を戻して取り直したり、待っている呼び出しの表を詰めたりする。写している場所と表が動かないよう、囲んでいる間の回収は
  * arena を使うもの（カーネルのイベントの取り出しと、終わった peripheral.call の回収）をしない（#755）。
- * 写す処理は lua_pcall の中で行い、エラーで抜けても release する
+ * 写す処理は lua_pcall の中で行い、エラーで抜けても release する（kibi_lua_peripheral.c の copy_held）。
+ * 囲んでいる間に呼ばれた peripheral の関数は、arena を戻す前に "cannot call a peripheral while a result is being copied" のエラーにする（#756）
  */
 void kibi_lua_arena_hold(void);
 void kibi_lua_arena_release(void);
