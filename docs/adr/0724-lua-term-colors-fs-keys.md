@@ -51,7 +51,7 @@
 - `fs.list` は名前の順に並べる（標準の `table.sort`。`package.loaded.table` から取り、ユーザーが差し替えたグローバルは使わない）
 - **再帰**（`delete`・`copy`・`move` のマウントをまたぐとき）: ディレクトリを一覧にして fd を閉じてから中を見るので、同時に持つ fd は 1〜2 個。深さは 128 まで（C のスタック 256 KiB と Lua のスタックを食いすぎない。超えたら `Too many nested directories`）。ファイルの写しは 4 KiB の userdata を先に取ってから 2 つの fd を開き、開いている間は Lua の確保をしない
 - `fs.delete` はないパスなら何もしない。根（`/`）は `Access denied`。途中で失敗すると、そこまで消した分は残る（読み取り専用の同梱イメージ（ADR 0461）の中では最初の `unlink` で失敗する）。マウントの位置か、その上にマウントの位置を含むディレクトリは、何も消さずに `Access denied` にする（先に下りると、挿したディスクの中身だけ消えてしまうため。CC のドライブの根と同じ）
-- `fs.copy`・`fs.move` は、行き先があれば `File exists`、自分の中へは `Can't copy a directory inside itself`・`Can't move a directory inside itself`（CC と同じ文）。行き先の親は作る。`move` は `rename` で、`EXDEV`（マウントをまたぐ）なら写してから消す
+- `fs.copy`・`fs.move` は、行き先があれば `File exists`、自分の中へは `Can't copy a directory inside itself`・`Can't move a directory inside itself`（CC と同じ文）。行き先の親は作る。`move` は `rename` で、`EXDEV`（マウントをまたぐ）なら写してから消す。写す途中で失敗したら（空きが足りないなど）、写した分を消してから元のエラーを返す（`copy` も同じ。行き先は無いと確かめた後なので、消すのは写した分だけ）。CC は途中まで写した分を残すが、残すと `move` の元と行き先の両方に中身ができ、空きも戻らないので、ここは CC と変える。写し終えた後に元を消す途中で失敗したときは、CC と同じく、そこで止めてエラーにする
 - `fs.makeDir` は親も作り、もうあるディレクトリはそのまま。途中にファイルがあれば `File exists`
 - **容量・読み取り専用・ドライブ**: `list-mounts` で、パスがいちばん長く合うマウントの点を引く（ないパスでも引ける。`stat` の `st_dev` と照らす `df` の形より単純）。import の前に `kibi_lua_arena_reset` と `kibi_lua_check_memory(L, 見積もり)` を呼び、結果を読む間は Lua の確保をせず C の変数に写してから `arena_reset` する。見積もりは 32 個 ×（72 ＋ 文字列 2 つ × 256）＋ 1 KiB（仮の値。マウントの数に上限はないが、RAM に余裕があるときは見積もりを使わない）。arena を握っている中（`__gc` から）では呼ばずにエラー
   - `getDrive` はマウントの種類（`disk`・`image`・`tmp`・`dev`）。CC の `hdd`・`rom`・`disk` とは違う（KiBi の種類の方が、何がつながっているかを表すため）

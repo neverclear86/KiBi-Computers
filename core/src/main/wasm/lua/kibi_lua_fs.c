@@ -561,11 +561,38 @@ static void check_transfer(lua_State *L, const char *src, const char *dst, const
     }
 }
 
+static int copy_tree_entry(lua_State *L) {
+    copy_tree(L, lua_tostring(L, 1), lua_tostring(L, 2), 0);
+    return 0;
+}
+
+static int delete_tree_entry(lua_State *L) {
+    delete_tree(L, lua_tostring(L, 1), 0);
+    return 0;
+}
+
+/*
+ * [src] を [dst] へ写す。途中で失敗したら（空きが足りないなど）、写した分を消してから元のエラーを投げる。
+ * [dst] は check_transfer で無いと確かめた後なので、消すのは写した分だけ。CC は途中まで写した分を残すが、
+ * 残すと move の元と行き先の両方に中身ができ、空きも戻らないので消す（ADR 0724）
+ */
+static void copy_or_undo(lua_State *L, const char *src, const char *dst) {
+    lua_pushcfunction(L, copy_tree_entry);
+    lua_pushstring(L, src);
+    lua_pushstring(L, dst);
+    if (lua_pcall(L, 2, 0, 0) == LUA_OK) return;
+    /* 元のエラーは積んだまま、後片付けの失敗は捨てる（何も作れずに失敗したときは、消すものがない） */
+    lua_pushcfunction(L, delete_tree_entry);
+    lua_pushstring(L, dst);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) lua_pop(L, 1);
+    lua_error(L);
+}
+
 static int l_copy(lua_State *L) {
     const char *src = check_abs(L, 1);
     const char *dst = check_abs(L, 2);
     check_transfer(L, src, dst, "copy");
-    copy_tree(L, src, dst, 0);
+    copy_or_undo(L, src, dst);
     return 0;
 }
 
@@ -577,7 +604,7 @@ static int l_move(lua_State *L) {
     int e = errno;
     /* マウントをまたぐときは、写してから消す */
     if (e != EXDEV) return fs_error(L, src, e);
-    copy_tree(L, src, dst, 0);
+    copy_or_undo(L, src, dst);
     delete_tree(L, src, 0);
     return 0;
 }

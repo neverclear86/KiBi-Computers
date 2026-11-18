@@ -16,10 +16,14 @@ import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.kernel.vfs.Written
+import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
 import java.time.Duration
@@ -253,6 +257,77 @@ class LuaTermFsKeysTest {
     }
 
     @Test
+    fun `term_scrollは中身を上下にずらし、空いた行を背景色で埋め、行数を画面の高さで切る`() = timeout(limit) {
+        val r = lua(
+            """
+            for i = 1, 5 do term.setCursorPos(1, i) term.write('line' .. i) end
+            term.setCursorPos(7, 4)
+            term.setBackgroundColor(colors.blue)
+            term.scroll(2)
+            term.scroll(-1)
+            term.scroll(0)
+            local x, y = term.getCursorPos()
+            assert(x == 7 and y == 4, x .. ',' .. y)
+            """,
+        ).assertOk()
+        // 2 行上げて [3,4,5,_,_]、1 行下げて [_,3,4,5,_]。0 行は何も書かない
+        val s = r.screen(20, 5)
+        assertEquals(" ".repeat(20), s.row(0))
+        assertEquals("line3               ", s.row(1))
+        assertEquals("line5               ", s.row(3))
+        assertEquals(" ".repeat(20), s.row(4))
+        assertEquals(TerminalColors.palette(4), s.bg(0, 0))
+        assertEquals(TerminalColors.palette(4), s.bg(19, 4))
+        assertEquals(TerminalColors.palette(0), s.bg(0, 1))
+        assertTrue(r.text.contains("\u001b[2S") && r.text.contains("\u001b[1T"), r.text)
+        assertFalse(r.text.contains("[0S") || r.text.contains("[0T"), r.text)
+
+        // 画面の高さより多い行数は、高さで切る
+        val big = lua("term.scroll(99) term.scroll(-99)").assertOk()
+        assertTrue(big.text.contains("\u001b[5S") && big.text.contains("\u001b[5T"), big.text)
+        assertFalse(big.text.contains("[99"), big.text)
+    }
+
+    @Test
+    fun `term_clearLineはカーソルの行を背景色で消し、列を端に寄せ、画面の外の行では何も書かない`() = timeout(limit) {
+        val r = lua(
+            """
+            for i = 1, 6 do term.setCursorPos(1, i) term.write(string.rep(tostring(i), 20)) end
+            term.setBackgroundColor(colors.red)
+            term.setCursorPos(5, 2)
+            term.clearLine()
+            term.setCursorPos(30, 3)
+            term.clearLine()
+            local x = term.getCursorPos()
+            assert(x == 30, x)
+            term.setCursorPos(-3, 4)
+            term.clearLine()
+            term.setCursorPos(1, 0)
+            term.clearLine()
+            term.setCursorPos(1, 7)
+            term.clearLine()
+            """,
+            rows = 6,
+        ).assertOk()
+        val s = r.screen(20, 6)
+        assertEquals("1".repeat(20), s.row(0))
+        for (y in 1..3) {
+            assertEquals(" ".repeat(20), s.row(y))
+            assertEquals(TerminalColors.palette(1), s.bg(0, y))
+            assertEquals(TerminalColors.palette(1), s.bg(19, y))
+        }
+        assertEquals("5".repeat(20), s.row(4))
+        // 画面の下の外（7 行目）を 6 行目に寄せて消さない
+        assertEquals("6".repeat(20), s.row(5))
+        // 列は 1〜幅に寄せた CUP
+        assertTrue(r.text.contains("\u001b[2;5H\u001b[2K"), r.text)
+        assertTrue(r.text.contains("\u001b[3;20H\u001b[2K"), r.text)
+        assertTrue(r.text.contains("\u001b[4;1H\u001b[2K"), r.text)
+        assertFalse(r.text.contains("[0;1H") || r.text.contains("[7;1H"), r.text)
+        assertEquals(3, Regex("\u001b\\[2K").findAll(r.text).count(), r.text)
+    }
+
+    @Test
     fun `termのwriteは制御文字を置き換え、全角は2セルで数え、端にかかる半分は空白にする`() = timeout(limit) {
         val r = lua(
             """
@@ -483,6 +558,55 @@ class LuaTermFsKeysTest {
             12	false	false	number	number
             hello world
             !
+            """.trimIndent() + "\n",
+            out,
+        )
+    }
+
+    /** 書いたバイトの合計が [limit] を超える書き込みを `NOSPC` にする FS（消しても空きは戻らないので、後の copy は最初のファイルで失敗する） */
+    private class SmallFileSystem(private val limit: Int, private val inner: TestMemoryFileSystem = TestMemoryFileSystem()) : FileSystem by inner {
+        private var used = 0
+
+        private fun reserve(len: Int) {
+            if (used + len > limit) fsError(Errno.NOSPC)
+            used += len
+        }
+
+        override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int {
+            reserve(len)
+            return inner.write(node, position, src, off, len)
+        }
+
+        override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written {
+            reserve(len)
+            return inner.append(node, src, off, len)
+        }
+    }
+
+    @Test
+    fun `fs_moveはマウントをまたぐと写してから消し、途中で失敗すると写した分を残さない`() = timeout(limit) {
+        val r = lua(
+            """
+            local function put(p, s) local f = fs.open(p, 'w') f.write(s) f.close() end
+            put('/tmp/m/a.txt', 'aaaaaa')
+            put('/tmp/m/sub/b.txt', 'bbbbbb')
+            fs.move('/tmp/m', '/home/out/m')
+            print(fs.exists('/tmp/m'), fs.open('/home/out/m/a.txt', 'r').readAll(), fs.open('/home/out/m/sub/b.txt', 'r').readAll())
+            print(pcall(fs.move, '/home/out/m', '/small/m'))
+            print(fs.exists('/small/m'), fs.exists('/home/out/m/a.txt'), fs.exists('/home/out/m/sub/b.txt'))
+            print(pcall(fs.copy, '/home/out/m', '/small/c'))
+            print(fs.exists('/small/c'), #fs.list('/small'))
+            """,
+            setup = { m -> m.vfs.mount(VfsPath.parse("/small"), SmallFileSystem(limit = 10), readOnly = false, source = "test:small") },
+        ).assertOk()
+        val out = r.text.replace(Regex("[^\\n\\t]*\\.lua:\\d+: "), "")
+        assertEquals(
+            """
+            false	aaaaaa	bbbbbb
+            false	/small/m/sub/b.txt: Out of space
+            false	true	true
+            false	/small/c/a.txt: Out of space
+            false	0
             """.trimIndent() + "\n",
             out,
         )
