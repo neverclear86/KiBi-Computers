@@ -149,14 +149,18 @@ internal object Asyncify {
      * コンポーネントの core モジュールは、止まりうる import がほかの core モジュールの解析の結果で決まるので、全体で答えが変わらなくなるまで
      * 解析を繰り返す（`ComponentAsyncify`）
      */
-    class Prepared internal constructor(private val wasm: ByteArray, private val module: WasmModule) {
+    class Prepared internal constructor(
+        private val wasm: ByteArray,
+        private val module: WasmModule,
+        private val numbering: (Int) -> Int = { it },
+    ) {
         /**
          * 止まりうる関数を求めるだけで、書き換えない。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（[transform]）
          *
          * @throws AsyncifyUnsupported 解析できない作り
          */
         fun analyze(waitImports: Set<String>, externalSuspendTypes: Set<Signature>): Analysis =
-            guard { Transformer(wasm, module, waitImports, null, { it }, {}, externalSuspendTypes).analysis() }
+            guard { Transformer(wasm, module, waitImports, null, numbering, {}, externalSuspendTypes).analysis() }
 
         /**
          * 変換する（[Asyncify.transform] と同じ）。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（#757）。
@@ -171,7 +175,7 @@ internal object Asyncify {
             waitImports: Set<String>,
             externalSuspendTypes: Set<Signature> = emptySet(),
             yieldImport: String? = null,
-            originalFunc: (Int) -> Int = { it },
+            originalFunc: (Int) -> Int = numbering,
             checkpoint: () -> Unit = {},
         ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes).run() }
 
@@ -191,14 +195,16 @@ internal object Asyncify {
     /**
      * [wasm] を読み、予約した名前を使っていないか確かめる（#757。解析と変換は [Prepared] で）。[checkpoint] は読んだ後に 1 回呼ぶ
      *
+     * [originalFunc] は、断る理由に書く関数の番号を元のモジュールの番号に戻す（[transform] と同じ。#398）。[Prepared] の解析と変換の既定になる
+     *
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた
      */
     @Throws(WasmLoadException::class)
-    fun prepare(wasm: ByteArray, checkpoint: () -> Unit = {}): Prepared {
+    fun prepare(wasm: ByteArray, checkpoint: () -> Unit = {}, originalFunc: (Int) -> Int = { it }): Prepared {
         val module = parse(wasm)
         checkpoint()
         checkReserved(module)
-        return Prepared(wasm, module)
+        return Prepared(wasm, module, originalFunc)
     }
 
     /** 予約した名前をすでに使っていたら断る（プレイヤーが退避した値や状態を自分で書き換えられてしまう） */
@@ -226,6 +232,9 @@ private const val F32 = 0x7D
 private const val F64 = 0x7C
 private const val V128 = 0x7B
 private const val BOT = -1
+
+/** funcref（略記の `(ref null func)` も同じ番号になる。[code]） */
+private const val FUNCREF = 0x70
 
 private fun isRef(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128 && t != BOT
 
@@ -392,10 +401,43 @@ private class Transformer(
         val sig = typeSigs[ins.operand(0).toInt()]
         if (sig.params to sig.results in suspendTypes) return true
         if (externalSuspendTypes.isEmpty() || Asyncify.Signature(sig.params, sig.results) !in externalSuspendTypes) return false
-        // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）
+        // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）。
+        // ほかのモジュールの関数の参照が入りうる形のモジュールでは、import も export もしていないテーブルにも入れられる
+        // （[foreignFuncRefs]）ので、どのテーブルにも当てる
         return when (ins.opcode()) {
-            OpCode.CALL_INDIRECT, OpCode.RETURN_CALL_INDIRECT -> sharedTables.getOrElse(ins.operand(1).toInt()) { true }
+            OpCode.CALL_INDIRECT, OpCode.RETURN_CALL_INDIRECT -> foreignFuncRefs || sharedTables.getOrElse(ins.operand(1).toInt()) { true }
             else -> true
+        }
+    }
+
+    /**
+     * ほかのモジュールの関数の参照が、モジュールの中に入りうる形か（#757）。次のどれかなら `true`:
+     * import・export したテーブルがある（`table.get`・`table.copy` で、import も export もしていないテーブルに移せる）、
+     * funcref のグローバルを import・export している、import・export した関数の引数・結果に funcref がある（`table.set` で入れられる）、
+     * funcref を運ぶタグがある（例外の値で渡せる）。型を追えない参照型（[BOT]）は funcref かもしれないので、同じく `true` にする。
+     * 参照が入りうるかだけを見る（テーブルへの命令の流れは追わない）ので、実際には入らなくても `true` になることがある
+     * （そのときは止まりうるとみなす関数が増えるだけで、変換は正しい）
+     */
+    private val foreignFuncRefs: Boolean by lazy {
+        fun mayHoldFunc(t: Int) = t == FUNCREF || t == BOT
+        fun sigMayHoldFunc(s: Sig) = s.params.any(::mayHoldFunc) || s.results.any(::mayHoldFunc)
+        if (sharedTables.any { it }) return@lazy true
+        if (tagSigs.any(::sigMayHoldFunc)) return@lazy true
+        // import したグローバルは、グローバルの番号の先頭に並ぶ
+        var importedGlobals = 0
+        for (i in 0 until module.importSection().importCount()) {
+            if (module.importSection().getImport(i) is GlobalImport) importedGlobals++
+        }
+        if ((0 until importedGlobals).any { mayHoldFunc(globalTypes[it]) }) return@lazy true
+        // import した関数の型
+        if ((0 until importedFuncs).any { sigMayHoldFunc(funcSigs[it]) }) return@lazy true
+        val es = module.exportSection()
+        (0 until es.exportCount()).map { es.getExport(it) }.any { e ->
+            when (e.exportType()) {
+                ExternalType.GLOBAL -> mayHoldFunc(globalTypes[e.index()])
+                ExternalType.FUNCTION -> sigMayHoldFunc(funcSigs[e.index()])
+                else -> false
+            }
         }
     }
 

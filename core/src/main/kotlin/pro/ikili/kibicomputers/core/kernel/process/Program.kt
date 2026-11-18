@@ -141,7 +141,7 @@ internal class Program private constructor(
          * 実行ファイル [bytes] を読み込む（#687）。`Machine.exec` と復元（`MachineRestore`）の `ProgramCache` の loader はどちらもこれを使う
          * （同じキーで別の読み方をしないように、見分けをここ 1 か所に置く）。ヘッダーで見分け（[isComponent]）、
          *
-         * - コンポーネント: [ComponentProgram.load] で読み込んでリンクの計画まで作る（ホストは [host]。[waitImports] は使わない。
+         * - コンポーネント: [ComponentProgram.load] で読み込んでリンクの計画まで作る（ホストは [host]。[waitImports] は使わず、コンポーネント全体の解析で決めて、常に待機点への変換をかける（#757）。
          *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
          *   中の core モジュールに当てる。上限を外す道は作らない（検証の時間の上限と見張りの前提。ADR 0666）
          * - core モジュール: [metered] なら [loadMetered]、でなければ [load]（今までどおり）
@@ -168,8 +168,9 @@ internal class Program private constructor(
         }
 
         /**
-         * [bytes] を [loadExecutable] で読むときの、`ProgramCache` のキーに入れる止まりうる import。コンポーネントは待機点への変換を
-         * 使わないので空にそろえる（ドライバーの集合や設定ごとに別のキーになって、同じコンポーネントを二重に読み込まないように）
+         * [bytes] を [loadExecutable] で読むときの、`ProgramCache` のキーに入れる止まりうる import。コンポーネントは、ドライバーが
+         * 渡す [waitImports] や `asyncifyExecutables` に関係なく、常にコンポーネント全体で止まりうる import を決めて待機点への変換をかける
+         * （#757。ADR 0757）ので、空にそろえる（ドライバーの集合や設定ごとに別のキーになって、同じコンポーネントを二重に読み込まないように）
          */
         fun cacheWaitImports(bytes: ByteArray, waitImports: Set<String>): Set<String> = if (isComponent(bytes)) emptySet() else waitImports
 

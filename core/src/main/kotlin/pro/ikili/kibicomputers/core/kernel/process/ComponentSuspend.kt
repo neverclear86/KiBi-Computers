@@ -7,7 +7,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
  * p1 の `WasiP1Suspend` に当たる。プロセスごとに 1 つ（[KernelLinkEnv.suspend]）で、ホストの関数（サーバー全体で 1 つ）は
  * 状態を持たずにここを使う。
  *
- * - 入口（[enter]）: 巻き直して着いた呼び出しなら、前に巻き戻したときの [AsyncWait] と、起こした key を返す（[Arrival]）。
+ * - 入口（[enter]）: 巻き直して着いた呼び出しなら、前に巻き戻したときの [AsyncWait] を返す（[Arrival]）。
  *   着いたことは `LinkedComponent` が知らせる（[onArrived]。そのときに退避した値が空になっていることを確かめる）
  * - 出口（[unwind]）: 待つ key と [AsyncWait] を記録し、`LinkedComponent` に巻き戻しを求める。ホストの関数はそのまま戻る
  *   （戻り値は捨てられる）。`WasiP2Driver` が `run` から戻ったところで [takePendingKeys] を `StepResult.Wait` にする
@@ -21,17 +21,11 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
  * 状態はプロセスのスレッドだけが読み書きする（step の受け渡しはカーネルロックを通る）
  */
 internal class ComponentSuspend(private val ctx: ProcessContext) {
-    /** 巻き直して着いた呼び出しの情報。[wait] は前に巻き戻したときのもの、[ready] は起こした key（空のこともある） */
-    class Arrival(val wait: AsyncWait?, val ready: List<WaitKey>)
+    /** 巻き直して着いた呼び出しの情報。[wait] は前に巻き戻したときのもの */
+    class Arrival(val wait: AsyncWait?)
 
     private var pendingKeys: List<WaitKey>? = null
     private var arrival: Arrival? = null
-    private var readyOnResume: List<WaitKey> = emptyList()
-
-    /** ドライバーが巻き直す前に呼ぶ。[ready] は `resume` に渡されたそろった key */
-    fun onResume(ready: List<WaitKey>) {
-        readyOnResume = ready
-    }
 
     /** `LinkedComponent` の巻き直しが、巻き戻したホストの関数の呼び出しに着いた（`LinkEnv.onRewound`） */
     fun onArrived() {
@@ -44,8 +38,7 @@ internal class ComponentSuspend(private val ctx: ProcessContext) {
             process.asyncWait = null
             w
         }
-        arrival = Arrival(wait, readyOnResume)
-        readyOnResume = emptyList()
+        arrival = Arrival(wait)
     }
 
     /** 待ちうるホストの関数の入口。巻き直して着いた呼び出しなら [Arrival]、そうでなければ `null` */

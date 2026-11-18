@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
+import pro.ikili.kibicomputers.core.kernel.io.ReadResult
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
@@ -21,7 +22,9 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.p2.KibiP2WitTool
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
+import pro.ikili.kibicomputers.core.wasi.p2.StreamEntry
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -245,6 +248,225 @@ class AsyncP2Test {
             assertEquals(0, s.process.exitCode)
             val expected = String(CharArray(n) { 'a' + it % 26 }) + "\ndone\n"
             assertEquals(expected, s.drain())
+        }
+    }
+
+    // ---- 巻き戻して待つ、ほかの stream の関数（#757。アダプターを通らないゲストで 1 つずつ動かす） ----
+
+    /**
+     * stdin・stdout の stream を直接使う p2 のコマンド。[run] は `run` の本体（ローカル `$in`・`$out`・`$p` が使える）。
+     * 戻り値の領域は 64 以降（結果の tag は +0、`u64` は +8、`list<u8>` の ptr・len は +4・+8）、データは 1024 の `ABCDEFGHIJKLMNOP`、
+     * `$mark` は stdout に 1 文字を書く。`run` は 0（ok）で終わる
+     */
+    private fun streamsGuest(run: String): ByteArray {
+        val s = "$"
+        val streams = "wasi:io/streams@0.2.12"
+        return KibiP2WitTool.component(
+            """
+            import wasi:cli/stdin@0.2.12;
+            import wasi:cli/stdout@0.2.12;
+            import wasi:io/streams@0.2.12;
+            import wasi:io/poll@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            """
+            (module
+              (import "wasi:cli/stdin@0.2.12" "get-stdin" (func ${s}stdin (result i32)))
+              (import "wasi:cli/stdout@0.2.12" "get-stdout" (func ${s}stdout (result i32)))
+              (import "$streams" "[method]input-stream.blocking-read" (func ${s}bread (param i32 i64 i32)))
+              (import "$streams" "[method]input-stream.blocking-skip" (func ${s}bskip (param i32 i64 i32)))
+              (import "$streams" "[method]input-stream.subscribe" (func ${s}isub (param i32) (result i32)))
+              (import "$streams" "[method]output-stream.check-write" (func ${s}cw (param i32 i32)))
+              (import "$streams" "[method]output-stream.write" (func ${s}write (param i32 i32 i32 i32)))
+              (import "$streams" "[method]output-stream.blocking-write-and-flush" (func ${s}bwrite (param i32 i32 i32 i32)))
+              (import "$streams" "[method]output-stream.write-zeroes" (func ${s}wz (param i32 i64 i32)))
+              (import "$streams" "[method]output-stream.blocking-splice" (func ${s}bsplice (param i32 i32 i64 i32)))
+              (import "wasi:io/poll@0.2.12" "[method]pollable.block" (func ${s}pblock (param i32)))
+              (memory (export "memory") 1)
+              (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 2048))
+              (data (i32.const 1024) "ABCDEFGHIJKLMNOP")
+              (func ${s}mark (param ${s}out i32) (param ${s}c i32)
+                (i32.store8 (i32.const 3000) (local.get ${s}c))
+                (call ${s}bwrite (local.get ${s}out) (i32.const 3000) (i32.const 1) (i32.const 3008)))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}in i32) (local ${s}out i32) (local ${s}p i32)
+                (local.set ${s}in (call ${s}stdin))
+                (local.set ${s}out (call ${s}stdout))
+                $run
+                (i32.const 0)))
+            """.trimIndent(),
+        )
+    }
+
+    /** プロセスが入力・出力・時計などを待って、スレッドを持たずに待機点にいる */
+    private fun parked(s: Session) {
+        s.tickUntil("待たない") { s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+        eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
+        assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
+    }
+
+    private fun inputAvailable(s: Session): Int = s.m.lock.withLockValue { (s.m.kernel.objects[s.input] as ByteStream).available }
+
+    private fun outputAvailable(s: Session): Int = s.m.lock.withLockValue { (s.m.kernel.objects[s.output] as ByteStream).available }
+
+    /** 出力の pipe に [text] を直接書く（ゲストが書く場所を埋める） */
+    private fun fill(s: Session, text: String) = s.m.lock.withLockValue {
+        val b = text.toByteArray()
+        (s.m.kernel.objects[s.output] as ByteStream).write(b, 0, b.size, s.m.wakeSink)
+        Unit
+    }
+
+    /** 出力の pipe から先頭の [n] バイトだけ読む（ゲストが書き続ける空きを作る） */
+    private fun readSome(s: Session, n: Int): String = s.m.lock.withLockValue {
+        val buf = ByteArray(n)
+        val r = (s.m.kernel.objects[s.output] as ByteStream).read(buf, 0, n, s.m.wakeSink)
+        check(r is ReadResult.Bytes && r.count == n) { "出力から $n バイト読めない: $r" }
+        String(buf, Charsets.UTF_8)
+    }
+
+    private fun finish(s: Session) {
+        s.tickUntil("終わらない") { s.m.stateOf(s.pid).isTerminal }
+        assertEquals(ProcessState.EXITED, s.m.stateOf(s.pid), "${s.rt.lastError}")
+        assertEquals(0, s.process.exitCode)
+    }
+
+    /** 出力の stream の項目（ゲストが `get-stdout` で得たもの） */
+    private fun outputEntry(s: Session): StreamEntry = s.m.lock.withLockValue {
+        var found: StreamEntry? = null
+        s.process.hostResources.forEach { _, e -> if (e is StreamEntry && !e.input) found = e }
+        checkNotNull(found) { "出力の stream がない" }
+    }
+
+    @Test
+    fun `writeとwrite-zeroesは、巻き直したら許可量をもう一度引かず、残りだけを順に書く`() = timeout(limit) {
+        // check-write で許可量 16 をもらった後、入力を待つ間に出力の pipe が埋まる（古い許可量のまま書く）。write は書けないので巻き戻し、
+        // 空いた分だけ書いては巻き戻す。許可量を巻き直しでもう一度引けば（16 - 16 の残りを超えて）トラップする
+        val run = """
+            (call ${'$'}cw (local.get ${'$'}out) (i32.const 64))
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}write (local.get ${'$'}out) (i32.const 1024) (i32.const 16) (i32.const 96))
+            (if (i32.load8_u (i32.const 96)) (then (return (i32.const 1))))
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}cw (local.get ${'$'}out) (i32.const 64))
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}wz (local.get ${'$'}out) (i64.const 16) (i32.const 96))
+            (if (i32.load8_u (i32.const 96)) (then (return (i32.const 2))))
+        """
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run), emptyList(), outCapacity = 16)
+            val seen = StringBuilder()
+            parked(s)
+            // write: 出力が埋まっている
+            fill(s, "0123456789abcdef")
+            s.send("1")
+            s.tickUntil("write で待たない") { inputAvailable(s) == 0 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
+            assertEquals(0, s.m.lock.withLockValue { outputEntry(s).writeProgress })
+            seen.append(readSome(s, 8))
+            s.tickUntil("空いた分を書かない") { outputAvailable(s) == 16 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            assertEquals(8, s.m.lock.withLockValue { outputEntry(s).writeProgress }, "書いた数を持っていない")
+            seen.append(readSome(s, 8))
+            // 書き終えて、次の入力を待つ
+            s.tickUntil("書き終えない") { outputAvailable(s) == 16 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            assertEquals(0, s.m.lock.withLockValue { outputEntry(s).writeProgress })
+            seen.append(readSome(s, 16))
+            assertEquals("0123456789abcdefABCDEFGHIJKLMNOP", seen.toString(), "二重に書いたか、順が違う")
+
+            // write-zeroes: 出力が空になってから許可量をもらい、入力を待つ間にまた埋まる
+            s.send("2")
+            s.tickUntil("入力を待たない") { inputAvailable(s) == 0 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            fill(s, "FEDCBA9876543210")
+            s.send("3")
+            s.tickUntil("write-zeroes で待たない") { inputAvailable(s) == 0 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
+            seen.setLength(0)
+            seen.append(readSome(s, 8))
+            s.tickUntil("空いた分を書かない") { outputAvailable(s) == 16 && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            assertEquals(8, s.m.lock.withLockValue { outputEntry(s).writeProgress }, "書いた数を持っていない")
+            seen.append(readSome(s, 8))
+            finish(s)
+            seen.append(readSome(s, 16))
+            assertEquals("FEDCBA9876543210" + "\u0000".repeat(16), seen.toString(), "二重に書いたか、順が違う")
+        }
+    }
+
+    @Test
+    fun `blocking-skipとpollable-blockは入力を待つ間巻き戻す`() = timeout(limit) {
+        val run = """
+            (call ${'$'}bskip (local.get ${'$'}in) (i64.const 3) (i32.const 64))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.const 49))
+            (local.set ${'$'}p (call ${'$'}isub (local.get ${'$'}in)))
+            (call ${'$'}pblock (local.get ${'$'}p))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.const 50))
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}bwrite (local.get ${'$'}out) (i32.load (i32.const 84)) (i32.load (i32.const 88)) (i32.const 96))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.add (i32.const 65) (i32.wrap_i64 (i64.load (i32.const 72)))))
+        """
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run), emptyList())
+            // 空の入力を skip で待つ
+            parked(s)
+            assertEquals("", s.drain())
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            // 3 バイト skip して、次は pollable.block で待つ
+            s.send("abc")
+            s.tickUntil("pollable.block で待たない") { s.drain() == "1" && s.m.stateOf(s.pid) == ProcessState.WAITING_EVENT }
+            eventually(5_000, "スレッドが外れない") { s.rt.thread == null }
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            s.send("x")
+            finish(s)
+            assertEquals("12xD", s.drain())
+        }
+    }
+
+    @Test
+    fun `blocking-spliceは入力待ちでも出力の空き待ちでも、巻き直して最初からやり直す`() = timeout(limit) {
+        val run = """
+            (call ${'$'}bsplice (local.get ${'$'}out) (local.get ${'$'}in) (i64.const 100) (i32.const 64))
+            (if (i32.load8_u (i32.const 64)) (then (return (i32.const 1))))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.add (i32.const 65) (i32.wrap_i64 (i64.load (i32.const 72)))))
+        """
+        // 入力が空: 読めるまで待つ。着いたら、出力の許可量を取り直して読み、書く
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run), emptyList())
+            parked(s)
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            assertEquals(null, s.m.lock.withLockValue { outputEntry(s).pendingSplice }, "書いていないのに読んだバイトを持っている")
+            s.send("hello")
+            finish(s)
+            assertEquals("helloF", s.drain())
+        }
+        // 出力が一杯: 空きができるまで待つ（入力は読まない）。空いたら、取り直した許可量で読んで書く
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run), emptyList(), outCapacity = 16)
+            fill(s, "0123456789abcdef")
+            s.send("hello")
+            parked(s)
+            assertEquals(5, inputAvailable(s), "出力に空きがないのに入力を読んだ")
+            assertEquals(null, s.m.lock.withLockValue { outputEntry(s).pendingSplice })
+            assertEquals("0123456789abcdef", readSome(s, 16))
+            finish(s)
+            assertEquals("helloF", s.drain())
+        }
+    }
+
+    @Test
+    fun `巻き戻した書き込みに読んだバイトが残っていれば、巻き直しで入力を読まずにそれを書く`() = timeout(limit) {
+        // splice が入力から読んだ後に書けずに巻き戻したときの状態（StreamEntry.pendingSplice）を、入力を待っている間に置く。
+        // 巻き直したら、入力を読まずに残りのバイトを書き、その数を返す
+        val run = """
+            (call ${'$'}bsplice (local.get ${'$'}out) (local.get ${'$'}in) (i64.const 100) (i32.const 64))
+            (if (i32.load8_u (i32.const 64)) (then (return (i32.const 1))))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.add (i32.const 65) (i32.wrap_i64 (i64.load (i32.const 72)))))
+        """
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run), emptyList())
+            parked(s)
+            s.m.lock.withLockValue { outputEntry(s).pendingSplice = "XYZ".toByteArray() }
+            s.send("hello")
+            finish(s)
+            assertEquals("XYZD", s.drain())
+            assertEquals(5, inputAvailable(s), "入力を読んでしまった")
         }
     }
 }

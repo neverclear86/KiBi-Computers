@@ -73,7 +73,7 @@ internal object ComponentAsyncify {
                 val a = try {
                     modules[m].analyze(imports, types)
                 } catch (e: AsyncifyUnsupported) {
-                    return reject(modules, e.message ?: "理由不明")
+                    return reject(modules, "core モジュール $m: ${e.message ?: "理由不明"}")
                 }
                 if (imports != waitImports[m] || a.suspendableExports != suspendExports[m]) changed = true
                 waitImports[m] = imports

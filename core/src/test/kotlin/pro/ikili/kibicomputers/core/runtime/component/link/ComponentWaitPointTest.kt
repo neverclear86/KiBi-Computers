@@ -97,6 +97,34 @@ class ComponentWaitPointTest {
     }
 
     @Test
+    fun `importもexportもしていないテーブルに移された参照への間接呼び出しも変換する`() {
+        // shim が、export した表の参照を、export していない表に table.copy してから call_indirect する（fixup が lower した import で埋めた参照が、
+        // 別のモジュールの関数でも、ここに入る）。この表への call_indirect を変換しないと、巻き戻した後も変換していないフレームが動き続ける
+        val shape = shimShape
+            .replace(
+                "(table (export \"${'$'}imports\") 1 1 funcref)",
+                "(table ${'$'}imp (export \"${'$'}imports\") 1 1 funcref) (table ${'$'}loc 1 1 funcref)",
+            )
+            .replace(
+                "(i32.add (call_indirect (type ${'$'}t) (i32.const 0)) (global.get ${'$'}n))",
+                "(table.copy ${'$'}loc ${'$'}imp (i32.const 0) (i32.const 0) (i32.const 1)) " +
+                    "(i32.add (call_indirect ${'$'}loc (type ${'$'}t) (i32.const 0)) (global.get ${'$'}n))",
+            )
+        assertTrue(shape.contains("table.copy") && shape.contains("${'$'}loc 1 1 funcref"), "テストの書き換えが当たっていない")
+        val g = GetHost(HostWait.UNWIND)
+        val p = load(shape, g.host)
+        assertTrue(p.waitPoints, "変換していない: ${p.waitPointRejection}")
+        instantiate(p).use { c ->
+            val run = c.function("run")!!
+            assertNull(c.call(run, emptyList()))
+            assertTrue(c.unwound, "巻き戻していない")
+            c.beginRewind()
+            assertEquals(u32(43), c.call(run, emptyList()), "shim の足し算が 2 回動いた（shim の call_indirect が変換されていない）")
+            assertFalse(c.unwound)
+        }
+    }
+
+    @Test
     fun `待たないホストだけなら、巻き戻さずに動く`() {
         val g = GetHost(HostWait.NONE)
         val p = load(shimShape, g.host)
@@ -164,6 +192,49 @@ class ComponentWaitPointTest {
             g.calls = 1
             assertEquals(u32(2), c.call(c.function("run")!!, emptyList()))
         }
+    }
+
+    /** 待ちを呼ぶ関数の中に SIMD のローカルがあって、`Asyncify` が変換を断る形（解析では通る）は、`BLOCKING` に落とし、理由をログにも出す */
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `モジュールを変換できない作りなら変換せず、元の番号とモジュールを理由に残す`(metered: Boolean) {
+        val shape = shimShape.replace("(local ${'$'}x i32)", "(local ${'$'}x i32) (local ${'$'}v v128)")
+        assertTrue(shape.contains("v128"), "テストの書き換えが当たっていない")
+        val g = GetHost(HostWait.UNWIND)
+        val p = load(shape, g.host, metered = metered)
+        assertFalse(p.waitPoints)
+        val reason = p.waitPointRejection!!
+        assertTrue(reason.contains("core モジュール") && reason.contains("v128"), reason)
+        // main の run は元のモジュールの 1 番（import した get が 0 番）。燃料の計測コードが import を足しても、元の番号で書く（p1 と同じ。#398）
+        assertTrue(reason.contains("#1（export run）"), reason)
+        assertFalse(WaitPointRejectionLog.report(p.sha256, "同じコンポーネントでは 1 回だけ出す"), "読み込みで理由を出していない")
+        instantiate(p).use { c ->
+            assertFalse(c.canUnwind())
+            assertEquals(u32(43), c.call(c.function("run")!!, emptyList()))
+        }
+    }
+
+    /** ゲストが実装した resource の dtor が待ちを呼ぶなら、`resource.drop` の Kotlin の層から呼ぶので巻き戻せない */
+    @Test
+    fun `止まりうるdtorを持つresourceがあれば変換しない`() {
+        val text = """
+            (component
+              (import "test:host/wait" (instance ${'$'}h (export "get" (func (result u32)))))
+              (alias export ${'$'}h "get" (func ${'$'}get))
+              (core func ${'$'}get_lower (canon lower (func ${'$'}get)))
+              (core module ${'$'}m
+                (import "host" "get" (func ${'$'}g (result i32)))
+                (func (export "dtor") (param i32) (drop (call ${'$'}g)))
+                (func (export "run") (result i32) (i32.const 0)))
+              (core instance ${'$'}hi (export "get" (func ${'$'}get_lower)))
+              (core instance ${'$'}i (instantiate ${'$'}m (with "host" (instance ${'$'}hi))))
+              (type ${'$'}r (resource (rep i32) (dtor (func ${'$'}i "dtor"))))
+              (core func ${'$'}new (canon resource.new ${'$'}r))
+              (func (export "run") (result u32) (canon lift (core func ${'$'}i "run"))))
+        """
+        val p = load(text, GetHost(HostWait.UNWIND).host)
+        assertFalse(p.waitPoints)
+        assertTrue(p.waitPointRejection!!.contains("dtor"), p.waitPointRejection)
     }
 
     @Test

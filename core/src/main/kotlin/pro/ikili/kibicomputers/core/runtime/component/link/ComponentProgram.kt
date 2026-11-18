@@ -67,6 +67,9 @@ internal class ComponentProgram private constructor(
          *    かけられなければ、どのモジュールにもかけない（理由は [waitPointRejection]。`BLOCKING` で動く）
          * 5. ランタイムに読み込ませる（パース・検証・コンパイル。各モジュール 1 回だけ）
          *
+         * 変換をかけられなかったときは、理由をログに出す（同じコンポーネントでは 1 回だけ。[WaitPointRejectionLog]）。`BLOCKING` のコンポーネントは
+         * 待つ間スレッドを持ち、`maxBlockingProcesses`（1 台・全体）に数えられるので、運用の側から原因を追えるようにする。
+         *
          * 燃料の挿入と変換の順は p1 と同じ（[pro.ikili.kibicomputers.core.runtime.Instrumentation]。#341）。燃料切れは待ち点にしない
          * （燃料切れの巻き戻しは、呼んだインスタンス 1 つの状態しか変えないため。燃料を待つ間はスレッドを持つ。ADR 0757）。
          *
@@ -95,15 +98,20 @@ internal class ComponentProgram private constructor(
             val deadline = LoadDeadline(limits.moduleLimits.timeLimitNanos)
             val loaded = ComponentLoader.load(bytes, limits, policy, deadline = deadline, validate = validate)
             val injected = ArrayList<ByteArray>()
+            // 元のモジュールの関数の番号への戻し方（燃料の挿入が足した import の分。断る理由に書く番号を p1 と同じ元の番号にする。#398）
+            val numbering = ArrayList<(Int) -> Int>()
             val byContent = HashMap<ByteBuffer, Int>()
             val moduleIndex = HashMap<ByteRange, Int>()
             for (range in loaded.coreModules) {
                 val original = loaded.coreModuleBytes(range)
                 val id = byContent.getOrPut(ByteBuffer.wrap(original)) {
-                    injected += if (metered) {
-                        FuelInjector.inject(original, sharedGlobal = true) { deadline.check("燃料の計測コードの挿入") }.bytes
+                    if (metered) {
+                        val r = FuelInjector.inject(original, sharedGlobal = true) { deadline.check("燃料の計測コードの挿入") }
+                        injected += r.bytes
+                        numbering += r::originalFunc
                     } else {
-                        original
+                        injected += original
+                        numbering += { it }
                     }
                     injected.size - 1
                 }
@@ -115,8 +123,9 @@ internal class ComponentProgram private constructor(
             deadline.check("コンポーネントのリンク")
             var rejection: String? = null
             val finalBytes = if (asyncify) {
-                val r = transform(injected, planned, deadline)
+                val r = transform(injected, numbering, planned, deadline)
                 rejection = r.second
+                rejection?.let { WaitPointRejectionLog.report(loaded.sha256, it) }
                 r.first ?: injected
             } else {
                 injected
@@ -137,9 +146,14 @@ internal class ComponentProgram private constructor(
         }
 
         /** 待機点への変換をかけた全モジュールのバイト列。かけられなければ `null` と理由 */
-        private fun transform(injected: List<ByteArray>, planned: ComponentPlanner.Planned, deadline: LoadDeadline): Pair<List<ByteArray>?, String?> {
+        private fun transform(
+            injected: List<ByteArray>,
+            numbering: List<(Int) -> Int>,
+            planned: ComponentPlanner.Planned,
+            deadline: LoadDeadline,
+        ): Pair<List<ByteArray>?, String?> {
             val checkpoint = { deadline.check(STAGE_ASYNCIFY) }
-            val prepared = injected.map { Asyncify.prepare(it, checkpoint) }
+            val prepared = injected.mapIndexed { i, b -> Asyncify.prepare(b, checkpoint, numbering[i]) }
             val analysis = ComponentAsyncify.analyze(planned, prepared, checkpoint)
             analysis.rejection?.let { return null to it }
             val out = ArrayList<ByteArray>(injected.size)
@@ -147,12 +161,46 @@ internal class ComponentProgram private constructor(
                 out += try {
                     p.transform(analysis.waitImports[i], analysis.externalTypes, checkpoint = checkpoint).bytes
                 } catch (e: AsyncifyUnsupported) {
-                    return null to (e.message ?: "理由不明")
+                    return null to "core モジュール $i: ${e.message ?: "理由不明"}"
                 }
             }
             return out to null
         }
 
         private const val STAGE_ASYNCIFY = "待機点への変換"
+    }
+}
+
+/**
+ * コンポーネントを待機点に変換できなかった（[ComponentProgram.waitPointRejection]）ときの、理由のログ（#757。p1 の `FuelYieldRejectionLog` に当たる）。
+ *
+ * 変換できなかったコンポーネントは `BLOCKING` で動き、待つ間スレッドを持つ。スレッドは `maxBlockingProcesses`（1 台・サーバー全体。ADR 0263）に
+ * 数えられ、超えると子の `spawn` が `NFILE` になるので、運用の側から原因（どの core モジュールの、どの関数か）を追えるように出す。
+ * 同じコンポーネント（元のバイト列の SHA-256）では 1 回だけ出す。読み込みは `ProgramCache` で共有するので普通は 1 回だが、キャッシュから外れて
+ * 読み込み直したときにも出さないように、出したものを最近の [MAX_REMEMBERED] 個まで覚えておく。
+ *
+ * スレッド: どのスレッドから呼んでもよい（読み込みのスレッドから呼ぶ）。
+ */
+internal object WaitPointRejectionLog {
+    /** 覚えておくコンポーネントの数の上限（あふれたら、最も前に出したものから忘れる） */
+    const val MAX_REMEMBERED: Int = 1024
+
+    private val LOG: System.Logger = System.getLogger("kibicomputers.kernel")
+
+    private val reported = object : LinkedHashMap<String, Unit>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>?): Boolean = size > MAX_REMEMBERED
+    }
+
+    /** [sha256] のコンポーネントを変換できなかった理由 [reason] をログに出す。同じコンポーネントでもう出していれば出さずに `false` */
+    fun report(sha256: ByteArray, reason: String): Boolean {
+        val key = sha256.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val first = synchronized(reported) { reported.put(key, Unit) == null }
+        if (first) {
+            LOG.log(
+                System.Logger.Level.INFO,
+                "WASM コンポーネント $key は待機点に変換できないので、待つ間スレッドを持つ（`maxBlockingProcesses` に数える）: $reason",
+            )
+        }
+        return first
     }
 }

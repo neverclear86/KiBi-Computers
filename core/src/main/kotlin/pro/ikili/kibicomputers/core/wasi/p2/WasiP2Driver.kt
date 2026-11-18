@@ -46,8 +46,6 @@ internal class WasiP2Driver private constructor(private val run: FuncRef, waitPo
 
     override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
         check(kind == ProcessKind.WAIT_POINT) { "BLOCKING のドライバーは resume しない" }
-        // 起こした key を、巻き直して着いたホストの関数に渡す
-        suspend(ctx).onResume(ready)
         ctx.component.beginRewind()
         return run(ctx)
     }
