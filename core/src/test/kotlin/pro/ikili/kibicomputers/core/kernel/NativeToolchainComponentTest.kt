@@ -38,6 +38,8 @@ class NativeToolchainComponentTest {
     private val helloP2: ByteArray by lazy { resource("hello-wasi-p2") }
     private val exit3P2: ByteArray by lazy { resource("exit3-p2") }
     private val helloP3: ByteArray by lazy { resource("hello-wasi-p3") }
+    private val pathP2: ByteArray by lazy { resource("path-wasi-p2") }
+    private val basicP2: ByteArray by lazy { resource("basic-native-p2") }
 
     /** `wasm-tools component wit` で読んだ、コンポーネントの world の import の行 */
     private fun importsOf(component: ByteArray): List<String> {
@@ -59,10 +61,16 @@ class NativeToolchainComponentTest {
     }
 
     /** [path] を exec して、標準出力を集めながら終わるまで待つ。標準出力と終了コード */
-    private fun execAndWait(h: Harness, m: Machine, path: String): Pair<String, Int?> {
+    private fun execAndWait(
+        h: Harness,
+        m: Machine,
+        path: String,
+        args: List<String> = emptyList(),
+        env: Map<String, String>? = null,
+    ): Pair<String, Int?> {
         val out = P2Testing.outputStream(m)
         val stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(out, HandleRights.WRITE), StdioSource.Object(out, HandleRights.WRITE))
-        val pid = m.exec(path, KernelDrivers.DEFAULT, SpawnOptions(stdio = stdio, fds = SpawnOptions.ROOT_PREOPEN))
+        val pid = m.exec(path, KernelDrivers.DEFAULT, SpawnOptions(args = args, env = env, stdio = stdio, fds = SpawnOptions.ROOT_PREOPEN))
         val text = StringBuilder()
         eventually(60_000, "終わらない") {
             h.scheduler.tick()
@@ -77,11 +85,22 @@ class NativeToolchainComponentTest {
     fun `wasm32-wasip2でビルドしたものはアダプターを通さないp2のコマンドのコンポーネント`() {
         assertTrue(Program.isComponent(helloP2))
         val imports = importsOf(helloP2)
-        // wasi-libc が直接 import する p2 のインターフェース（アダプター由来の wasi_snapshot_preview1 の core モジュールは持たない）
+        // wasi-libc が直接 import する p2 のインターフェース。world の import は、アダプターで包んだものも `wasi:*@0.2.x` だけになるので、
+        // これだけでは「アダプターを通さない」とは言えない（下の、アダプターの印の検査が分ける）
         assertTrue(imports.isNotEmpty() && imports.all { it.startsWith("import wasi:") && it.contains("@0.2.") }, "$imports")
         assertTrue(imports.any { it.startsWith("import wasi:cli/stdout@") }, "$imports")
         println("wasi-sdk の wasm32-wasip2 の import（#775）: $imports")
+        // アダプターで包んだ p1 のプログラムは、中の core モジュールが p1 の `wasi_snapshot_preview1` を import し、アダプターの core モジュールが
+        // それを受ける。ネイティブの成果物には、どちらの core モジュールもない。対照として、アダプターで包んだ同じソースには印が入っていることを先に確かめる
+        // （wasi-sdk を上げて wasm-component-ld がアダプターを挟む形に戻ったら、ここで落ちる）
+        assertTrue(hasP1AdapterMark(P2Testing.wrap("hello-wasi")), "対照（アダプターで包んだもの）に p1 の印がない。検査が効いていない")
+        assertTrue(!hasP1AdapterMark(helloP2), "ネイティブの成果物に wasi_snapshot_preview1 がある（アダプターを挟んでいる）")
+        assertTrue(!hasP1AdapterMark(pathP2) && !hasP1AdapterMark(basicP2) && !hasP1AdapterMark(exit3P2))
     }
+
+    /** コンポーネントの中のどこかに、p1 のアダプターの印（`wasi_snapshot_preview1` の名前。core モジュールの import・アダプターの export）があるか */
+    private fun hasP1AdapterMark(component: ByteArray): Boolean =
+        String(component, Charsets.ISO_8859_1).contains("wasi_snapshot_preview1")
 
     @Test
     fun `wasm32-wasip2でビルドしたコマンドをexecで動かす`() = timeout(limit) {
@@ -96,6 +115,38 @@ class NativeToolchainComponentTest {
             // 2 回目は読み込み直さない
             assertEquals("Hello from WASI\n" to 0, execAndWait(h, m, "/bin/hello"))
             assertEquals(1, h.scheduler.programs.loads.get())
+        }
+    }
+
+    /**
+     * wasi-libc がアダプターと違う呼び方（preopen を `wasi:filesystem/preopens` の `get-directories` で取る、descriptor の open-at・
+     * read-via-stream・write-via-stream・read-directory など）をするパス操作を、p1（アダプター経由）と同じ `path_wasi.c` で確かめる
+     */
+    @Test
+    fun `wasm32-wasip2でビルドしたpath-wasiがwasi-filesystemを直接通ってパスを操作する`() = timeout(limit) {
+        assertTrue(importsOf(pathP2).any { it.startsWith("import wasi:filesystem/") }, "wasi:filesystem を import していない")
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            m.vfs.createDirectory(VfsPath.parse("/data"))
+            write(m, "/data/a.txt", "abcde".toByteArray())
+            m.vfs.mount(VfsPath.parse("/ro"), TestMemoryFileSystem(), readOnly = true, source = "test:ro")
+            write(m, "/bin/path", pathP2)
+            assertEquals("OK\n" to 0, execAndWait(h, m, "/bin/path", args = listOf("path-wasi")))
+        }
+    }
+
+    /** args・environ・時計・乱数・sched_yield（`wasi:cli/environment`・`wasi:clocks`・`wasi:random`）を、ネイティブの wasi-libc の呼び方で確かめる */
+    @Test
+    fun `wasm32-wasip2でビルドしたものの引数・環境変数・時計・乱数が届く`() = timeout(limit) {
+        val imports = importsOf(basicP2)
+        for (name in listOf("wasi:cli/environment@", "wasi:clocks/wall-clock@", "wasi:random/random@")) {
+            assertTrue(imports.any { it.startsWith("import $name") }, "$name を import していない: $imports")
+        }
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/basic", basicP2)
+            val env = linkedMapOf("GREETING" to "hello", "EMPTY" to "")
+            assertEquals("OK\n" to 0, execAndWait(h, m, "/bin/basic", args = listOf("basic", "alpha", "ベータ"), env = env))
         }
     }
 

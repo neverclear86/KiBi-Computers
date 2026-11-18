@@ -226,6 +226,16 @@ kibiWasm {
         sources.from("src/test/wasm/exit3.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // wasi-libc が p2 の wasi:filesystem（preopen・descriptor）を直接呼ぶ形で、パスの操作を確かめる（path_wasi.c はアダプター経由の p1 と同じソース）
+    wasiSdkModule("path-wasi-p2") {
+        sources.from("src/test/wasm/path_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // args・environ・時計・乱数・sched_yield を、wasi-libc が wasi:cli・wasi:clocks・wasi:random を直接呼ぶ形で確かめる
+    wasiSdkModule("basic-native-p2") {
+        sources.from("src/test/wasm/basic_native.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // p3 は #268 まで読み込みで断る（NOEXEC）ことを確かめる
     wasiSdkModule("hello-wasi-p3") {
         sources.from("src/test/wasm/hello_wasi.c")
