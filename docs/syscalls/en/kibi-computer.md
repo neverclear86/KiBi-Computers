@@ -19,6 +19,7 @@ interface memory {
 - RAM is counted as the number of 4 KiB chunks a process has written to for the first time. Merely reserving a large linear memory does not count any chunks. However, the chunk table of the linear memory is counted in proportion to the pages declared (or grown with `memory.grow`), at 128 bytes per page (a provisional value). So even a large declaration alone uses a little RAM, and on a machine with little RAM a module that declares too much cannot be instantiated (out of memory). The number of written chunks does not include the table
 - `remaining` is the smaller of what is left of the process limit and of the machine's RAM (in bytes)
 - `commit` counts the chunks of `[ptr, ptr + len)` now. If the remainder after counting would be below `keep`, it counts nothing and returns `false`. It returns `true` if there are no new chunks to count, and `false` if the range is outside the linear memory. Use it to check that there is enough before writing a large buffer
+- In p1, `ptr` is an address in the calling module's linear memory; in p2, in the linear memory of the core module that calls `commit` ([p2 and p3](./p2-p3.md))
 
 ## clock
 

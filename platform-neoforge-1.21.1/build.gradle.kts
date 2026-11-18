@@ -43,6 +43,30 @@ val syncJarGameTestMods = tasks.register<Sync>("syncJarGameTestMods") {
     from(tasks.jar.flatMap { it.archiveFile })
     into(file("run/jar-gametest/mods"))
 }
+// GameTest の run のワールドを、起動の前に消す（#792）。ワールドを回をまたいで使い回すと、途中で止めた回の強制読み込み
+// （data/chunks.dat）が残り、次の回の起動でそのチャンクのケースが復元されて動き出す。CI と同じく、毎回まっさらなワールドで走らせる。
+// 消すのは GameTest 専用のワールドだけ（run/world は runServer のもの）。失敗した回のワールドを調べるときは -PkeepGameTestWorld=true
+val keepGameTestWorld = providers.gradleProperty("keepGameTestWorld").map { it.toBoolean() }.getOrElse(false)
+fun cleanWorldTask(name: String, world: File) = tasks.register(name) {
+    group = "verification"
+    description = "Deletes the world of a GameTest run before it starts"
+    doLast {
+        if (keepGameTestWorld || !world.exists()) return@doLast
+        // deleteRecursively は失敗しても止まらないので、残っていないことを確かめる。半分消えたワールドでは起動しない
+        if (!world.deleteRecursively() || world.exists()) {
+            throw GradleException(
+                "GameTest のワールド $world を消せなかった。前の GameTest サーバーのプロセスが残っていないか確かめる",
+            )
+        }
+    }
+}
+// run/ の中のワールドの名前。--world で渡す（gameDirectory は変えない。ログとコンフィグは run/ のものを使う）
+val gameTestWorld = "gametest-world"
+val cleanGameTestWorld = cleanWorldTask("cleanGameTestWorld", file("run/$gameTestWorld"))
+val loadTestWorld = "loadtest-world"
+val cleanLoadTestWorld = cleanWorldTask("cleanLoadTestWorld", file("run/$loadTestWorld"))
+// jar の GameTest（#775）は専用の run/jar-gametest で動くので、既定の名前のワールドをそのまま消す
+val cleanJarGameTestWorld = cleanWorldTask("cleanJarGameTestWorld", file("run/jar-gametest/world"))
 // Endive は全 run 共通の additionalRuntimeClasspath（レガシーのクラスパス）に載っている。jar の run ではそこから外し、jar に同梱したものだけを読ませる
 configurations.matching { it.name == "jarGameTestServerLegacyClasspath" }.configureEach {
     exclude(group = "run.endive")
@@ -79,6 +103,8 @@ neoForge {
         }
         register("gameTestServer") {
             type = "gameTestServer"
+            programArguments.addAll("--world", gameTestWorld)
+            taskBefore(cleanGameTestWorld)
             // 他 MOD 役の試験用デバイス（dev ソースセット。#153）を登録する
             systemProperty("kibicomputers.dev.testDevices", "true")
             // CI のランナー（2コア）と同じ条件で試すときは -PgameTestProcessors=2（JVM に見せるコア数を絞る）
@@ -88,6 +114,8 @@ neoForge {
         // 台数は -PloadTestCounts=100,500,1000 で渡す（既定は 1000）。初回のコンパイルを測るため、台数ごとに起動し直すとよい
         register("loadTestServer") {
             type = "gameTestServer"
+            programArguments.addAll("--world", loadTestWorld)
+            taskBefore(cleanLoadTestWorld)
             systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
             // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る
@@ -110,6 +138,7 @@ neoForge {
             gameDirectory = file("run/jar-gametest")
             systemProperty("kibicomputers.jarTest", "true")
             taskBefore(syncJarGameTestMods)
+            taskBefore(cleanJarGameTestWorld)
         }
         register("data") {
             data()

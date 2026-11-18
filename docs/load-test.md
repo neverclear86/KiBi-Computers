@@ -24,6 +24,9 @@
 - `runLoadTestServer` は GameTest のサーバーで、測定用のテスト（`LoadGameTests` が台数ごとに作る）だけを動かす。
   テンプレートは名前空間 `kibicomputers_load`（`src/dev/resources`。jar には入らない）のもので、その名前空間だけを有効にして、ほかの GameTest を混ぜない
 - 結果はサーバーのコンフィグ（`platform-neoforge-1.21.1/run/config/kibicomputers-server.toml`。#202）の値に左右される。`runClient`・`runGameTestServer` と同じ `run/` を使うので、開発クライアントの設定画面などで変えた値がそのまま効く。既定と違う値があると、試験の始めに `The load test runs with non-default values in ...` が WARN で出る。結果を比べるときは、ファイルを消すか既定に戻してから測る
+- ワールドは毎回新しく作る。`runLoadTestServer` は `run/loadtest-world`、`runGameTestServer` は `run/gametest-world` を使い、起動の前に消す（#792）。
+  ログとコンフィグは `run/` のものを共有する。#792 より前の記録は `run/world` を回をまたいで使い回していた（起動時の `machines/` の名前の読みの件数などが違う）。
+  失敗した回のワールドを次の回でも残すときは `-PkeepGameTestWorld=true`
 - `-PloadTestOs` は `lua`（既定。テスト用の起動ディスクの Lua の REPL）か `standard`（標準 OS のシェル。ゲームの既定。#461）
 - `-PloadTestDevices=<n>` で、n 台に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。dev ソースセットの `TestDevices`。#153）を置く。既定は 0（置かない）。
   電源を入れた後、置いた台がそのデバイスにつながっていなければ失敗にする
