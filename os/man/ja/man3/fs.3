@@ -1,0 +1,63 @@
+# fs(3)
+
+## 名前
+
+fs - Lua のファイルとディレクトリ
+
+## 書式
+
+    fs.list(path)
+    fs.exists(path)
+    fs.isDir(path)
+    fs.isReadOnly(path)
+    fs.getSize(path)
+    fs.attributes(path)
+    fs.makeDir(path)
+    fs.delete(path)
+    fs.copy(path, dest)
+    fs.move(path, dest)
+    fs.open(path, mode)
+    fs.combine(path, ...)
+    fs.getName(path)
+    fs.getDir(path)
+    fs.find(pattern)
+    fs.complete(part, location [, files [, dirs]])
+    fs.getDrive(path)
+    fs.isDriveRoot(path)
+    fs.getFreeSpace(path)
+    fs.getCapacity(path)
+
+## 説明
+
+lua(1) には `fs` ライブラリがあります（`require("fs")` でも使えます）。CC: Tweaked の `fs` の API に合わせています。
+
+パスはいつも根から数えます。`"bin/lua"` と `"/bin/lua"` は同じで、カレントディレクトリは使いません。`\` は `/` と同じで、`.` は飛ばし、`..` は 1 つ上に上がります。`fs.combine` はパスをつなぎ、この形（先頭の `/` なし）で返します。`fs.getName("")` は `root`、`fs.getDir("")` は `..` です。根より上に出るパスはエラー（`Invalid Path`）です。
+
+ほとんどの関数は、パスと理由を含むエラーを出します（`/tmp/x: No such file`・`Not a directory`・`File exists`・`Access denied` など。標準のイメージの根は読み取り専用です）。
+
+- `fs.list(path)` は、ディレクトリの中の名前を並べて返します
+- `fs.getSize(path)` は、大きさをバイトで返します（ディレクトリは 0）
+- `fs.attributes(path)` は、`size`・`isDir`・`isReadOnly`・`created`・`modified`（1970 年からのミリ秒）を持つテーブルを返します
+- `fs.makeDir(path)` は、ディレクトリを親も含めて作ります
+- `fs.delete(path)` は、ファイルか、ディレクトリを中身ごと消します。ないパスはエラーになりません
+- `fs.copy(path, dest)`・`fs.move(path, dest)` は、ファイルか、ディレクトリを中身ごと写し、または動かします。`dest` はあってはいけません。`dest` の親のディレクトリは作ります
+- `fs.open(path, mode)` は、ファイルを開いてハンドルを返します。開けなければ nil と理由を返します。`mode` は `r`・`w`・`a`・`r+`・`w+` で、`b` を足すとバイナリのモードです。書くときは親のディレクトリを作ります。ハンドルは、モードに応じて `read([count])`・`readAll()`・`readLine([withTrailing])`・`write(value)`・`writeLine(text)`・`flush()`・`seek([whence [, offset]])`・`close()` を持ちます。バイナリのモードでは、`read()` は 1 バイトを数で返し、`write(数)` は 1 バイトを書きます
+- `fs.find(pattern)` は、`pattern` に合うパスを並べて返します。`*` は任意の文字の並びに、`?` は 1 文字に合い、パスの 1 区間の中だけで合わせます
+- `fs.complete(part, location [, files [, dirs]])` は、ディレクトリ `location` の中で `part` を補う続きを返します。`files`・`dirs` の代わりに、`include_files`・`include_dirs`・`include_hidden` を持つテーブルも渡せます
+- `fs.getDrive(path)` は、マウント（mount(1)）の種類 `image`・`disk`・`tmp`・`dev` を返します。パスがなければ nil です。`fs.isDriveRoot(path)` は、`path` がマウントの始まりかを返します
+- `fs.getFreeSpace(path)` はマウントの空きのバイト数（読み取り専用なら 0、上限がなければ `"unlimited"`）を、`fs.getCapacity(path)` はその大きさ（読み取り専用か上限がなければ nil）を返します。`tmp` の空きは目安です（df(1)）
+- `fs.isReadOnly(path)` は、マウントが読み取り専用かを返します
+
+## CC: Tweaked との違い
+
+- 標準の `io.open` は、相対のパスをカレントディレクトリから数えます。`fs` はいつも根から数えます（CC: Tweaked にはカレントディレクトリがありません）
+- `fs.getDrive` は、`hdd`・`rom`・`disk` などの名前ではなく、マウントの種類（`image`・`disk`・`tmp`・`dev`）を返します
+- `fs.attributes` の `created` は、ファイルの状態が最後に変わった時刻です。ファイルシステムが作った時刻を持たないためです
+- CC: Tweaked がパスから除く文字（`"`・`:`・`<`・`>`・`|` など）は、そのまま残します
+- ディレクトリを写す・動かす・消すのは、深さ 128 までです
+- `fs.delete`・`fs.copy`・`fs.move` が途中で失敗すると、そこまでに済んだ分はそのまま残ります
+- 同時に開けるファイルは、プログラムごとに 256 個までです。ハンドルは `close()` するか、回収されるまで開いたままです
+
+## 関連項目
+
+df(1), mount(1), lua(1)

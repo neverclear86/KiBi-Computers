@@ -38,6 +38,8 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 - `peripheral` address: デバイスがつながった
 - `peripheral_detach` address: デバイスが外れた
 - `term_resize`: 端末の大きさが変わった
+- `key` code held: キーボードのキーを押した。`held` は押し続けて繰り返したときに true（keys(3)）
+- `key_up` code: キーボードのキーを離した（keys(3)）
 - `timer` id: `os.startTimer` のタイマーが鳴った
 - `restored` ns ticks: ワールドを読み込んだ。飛んだ実時間（ナノ秒）とゲーム内時間（tick）
 - `events_dropped` 数: イベントを捨てた
@@ -69,8 +71,8 @@ lua(1) は、標準の `os` ライブラリにこれらの関数を足します�
 - タイムゾーンはない。`local` は UTC
 - `os.queueEvent` はほかのプログラムに届かない
 - `os.getComputerID`・`os.getComputerLabel`・`os.setComputerLabel`・`os.run`・`os.loadAPI` はない
-- `key`・`char` のイベントはまだない
+- `char`・`paste` のイベントはない（keys(3)）
 
 ## 関連項目
 
-parallel(3), peripheral(3), lua(1), kibi(7)
+keys(3), parallel(3), peripheral(3), term(3), lua(1), kibi(7)

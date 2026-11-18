@@ -1,0 +1,73 @@
+# term(3)
+
+## 名前
+
+term - Lua からカーソルの位置と色を指定して端末に描く
+
+## 書式
+
+    term.write(text)
+    term.blit(text, textColours, backgroundColours)
+    term.clear()
+    term.clearLine()
+    term.scroll(n)
+    term.getCursorPos()
+    term.setCursorPos(x, y)
+    term.getCursorBlink()
+    term.setCursorBlink(blink)
+    term.getSize()
+    term.getTextColour()
+    term.setTextColour(colour)
+    term.getBackgroundColour()
+    term.setBackgroundColour(colour)
+    term.isColour()
+    term.getPaletteColour(colour)
+    term.setPaletteColour(colour, r, g, b)
+    term.setPaletteColour(colour, rgb)
+    term.nativePaletteColour(colour)
+    term.redirect(target)
+    term.current()
+    term.native()
+
+## 説明
+
+lua(1) には `term` ライブラリがあります（`require("term")` でも使えます）。CC: Tweaked の `term` の API に合わせています。名前に `Colour` を含む関数には、`Color` の綴りもあります。
+
+`term` は、プログラムの端末（コンピューターのコンソール）にエスケープシーケンスで描きます。位置は左上が 1, 1 です。`term.getSize` は端末の桁数と行数を返します。端末につながっていないときは 51 と 19 を返します。
+
+`term.setCursorPos` はカーソルを動かします。位置は画面の外でもかまいません。`term.write` はカーソルの位置に文字列を書き、カーソルをその終わりに進めます。描くのは画面に入る部分だけで、右端で折り返しません。端にかかる全角の文字（2 セル）は、入る側のセルを空白にします。制御文字と、UTF-8 として正しくないバイトは、U+FFFD として描きます。
+
+`term.blit` は、`text` を文字ごとの色で書きます。`textColours` と `backgroundColours` には、`text` の文字ごとに 16 進の数字 1 つ（`0`〜`f`。colors(3)）を書き、3 つの長さはそろっていなければなりません（`Arguments must be the same length`）。16 進の数字でない文字の所は、今の色のままです。
+
+`term.clear` は画面全体を、`term.clearLine` はカーソルの行を、背景色で塗ります。`term.scroll(n)` は中身を `n` 行上へ（負なら下へ）ずらします。どれもカーソルは動かしません。
+
+色は colors(3) の値です。`term.setTextColour` と `term.setBackgroundColour` はすぐに効き、`print` と `io.write` の色も変わります。色は、パレットの RGB の値で描きます。`term.setPaletteColour(colour, r, g, b)`（0〜1 の数）か `term.setPaletteColour(colour, 0xRRGGBB)` で変え、`term.nativePaletteColour` で既定の値を得ます。色の少ない画面では、いちばん近い色で表示します。`term.isColour` はいつも true です。
+
+`term.setCursorBlink(false)` はカーソルを隠します。プログラムが普通に終わると、カーソルを表示し直し、端末の色を元に戻します。
+
+`term.redirect(target)` は、`term` の関数の呼び出しを、同じ関数を持つテーブル `target`（自分で作ったウィンドウなど）に渡すようにし、前の出力先を返します。`term.current` は今の出力先を、`term.native` は端末そのものを返します。
+
+## 例
+
+    term.setBackgroundColour(colours.blue)
+    term.clear()
+    term.setCursorPos(3, 2)
+    term.setTextColour(colours.yellow)
+    term.write("Hello")
+
+## CC: Tweaked との違い
+
+- `print`・`io.write`・`io.read` は `term` を通りません。端末の今の位置に書き、`term` のカーソルを動かしません。`print` の後の `term.getCursorPos` は変わりません。`print` は右端で折り返してスクロールしますが、`term.write` はしません
+- 最初の `term.setCursorPos` までは、端末の上の位置が分かりません。`term.write` は端末の今の位置に書き、`term.getCursorPos` は 1, 1 から数えた見積もりです
+- 文字列は UTF-8 で、全角の文字は 2 セルを使います。CC: Tweaked 独自の文字（128〜159。罫線やテレテキストの文字など）はありません
+- `term.setPaletteColour` は、その後に描く分にだけ効きます。もう画面にあるものの色は変わりません
+- `term.isColour` は、色の少ない画面でもいつも true です（端末がいちばん近い色で表示します）
+- 始めはカーソルが表示されています（CC: Tweaked は `term.setCursorBlink(true)` まで隠します）
+- ワールドを読み込んだとき、プログラムの画面は描き直されません。`restored` のイベント（os(3)）を受けたら描き直してください
+- プログラムを止めたとき（Ctrl+C など）は、色と隠したカーソルが戻りません。`lua -e "term.setCursorBlink(true)"` で戻ります
+- `window` の API はなく、モニターへの `term.redirect` もできません
+- プログラムが `key` のイベントを待つ間に打ったキーは、端末にも表示されます（keys(3)）
+
+## 関連項目
+
+colors(3), keys(3), os(3), lua(1)

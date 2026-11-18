@@ -1,0 +1,63 @@
+# fs(3)
+
+## NAME
+
+fs - files and directories for Lua
+
+## SYNOPSIS
+
+    fs.list(path)
+    fs.exists(path)
+    fs.isDir(path)
+    fs.isReadOnly(path)
+    fs.getSize(path)
+    fs.attributes(path)
+    fs.makeDir(path)
+    fs.delete(path)
+    fs.copy(path, dest)
+    fs.move(path, dest)
+    fs.open(path, mode)
+    fs.combine(path, ...)
+    fs.getName(path)
+    fs.getDir(path)
+    fs.find(pattern)
+    fs.complete(part, location [, files [, dirs]])
+    fs.getDrive(path)
+    fs.isDriveRoot(path)
+    fs.getFreeSpace(path)
+    fs.getCapacity(path)
+
+## DESCRIPTION
+
+lua(1) has an `fs` library (also `require("fs")`). It follows the `fs` API of CC: Tweaked.
+
+Paths are always counted from the root: `"bin/lua"` and `"/bin/lua"` are the same, and the current directory is not used. `\` is the same as `/`, `.` is skipped and `..` goes up one level. `fs.combine` joins paths and returns them in this form (without the first `/`). `fs.getName("")` is `root` and `fs.getDir("")` is `..`. A path that goes above the root is an error (`Invalid Path`).
+
+Most functions raise an error with the path and the reason, such as `/tmp/x: No such file`, `Not a directory`, `File exists` or `Access denied` (the root of the standard image is read-only).
+
+- `fs.list(path)` returns the names in a directory, sorted
+- `fs.getSize(path)` returns the size in bytes (0 for a directory)
+- `fs.attributes(path)` returns a table with `size`, `isDir`, `isReadOnly`, `created` and `modified` (milliseconds since 1970)
+- `fs.makeDir(path)` makes a directory and its parents
+- `fs.delete(path)` deletes a file, or a directory with everything in it. A path that does not exist is not an error
+- `fs.copy(path, dest)` and `fs.move(path, dest)` copy or move a file, or a directory with everything in it. `dest` must not exist; its parent directories are made
+- `fs.open(path, mode)` opens a file and returns a handle, or nil and the reason. `mode` is `r`, `w`, `a`, `r+` or `w+`, with `b` added for binary mode. Writing makes the parent directories. A handle has `read([count])`, `readAll()`, `readLine([withTrailing])`, `write(value)`, `writeLine(text)`, `flush()`, `seek([whence [, offset]])` and `close()`, as far as the mode allows. In binary mode, `read()` returns a byte as a number, and `write(number)` writes a byte
+- `fs.find(pattern)` returns the paths that match `pattern`, sorted. `*` matches any characters and `?` matches one character, within one part of the path
+- `fs.complete(part, location [, files [, dirs]])` returns the endings that complete `part` in the directory `location`. Instead of `files` and `dirs`, a table with `include_files`, `include_dirs` and `include_hidden` can be given
+- `fs.getDrive(path)` returns the kind of the mount (mount(1)): `image`, `disk`, `tmp` or `dev`, or nil if the path does not exist. `fs.isDriveRoot(path)` tells whether a mount starts at `path`
+- `fs.getFreeSpace(path)` returns the free bytes of the mount (0 when it is read-only, `"unlimited"` when it has no limit), and `fs.getCapacity(path)` its size (nil when it is read-only or has no limit). The free space of `tmp` is an estimate (df(1))
+- `fs.isReadOnly(path)` tells whether the mount is read-only
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- The standard `io.open` counts relative paths from the current directory; `fs` always counts them from the root (CC: Tweaked has no current directory)
+- `fs.getDrive` returns the kind of the mount (`image`, `disk`, `tmp`, `dev`) instead of names such as `hdd`, `rom` and `disk`
+- `created` in `fs.attributes` is the time when the state of the file last changed: the file system does not keep the time of creation
+- Characters that CC: Tweaked removes from paths (such as `"`, `:`, `<`, `>` and `|`) are kept
+- Directories are copied, moved and deleted up to 128 levels deep
+- When `fs.delete`, `fs.copy` or `fs.move` fails in the middle, what was already done is kept
+- A program can have 256 files open at the same time; a handle stays open until `close()` or until it is collected
+
+## SEE ALSO
+
+df(1), mount(1), lua(1)

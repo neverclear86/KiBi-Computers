@@ -153,6 +153,7 @@ RAM の上限の近くの経路は、Lua が `os.sleep` で待っている間に
 - ほかのプロセスに届く `queueEvent`: ゲストがイベントを出す import がない（ABI の判断）
 - `key`・`char` のイベント: #326 がまだ
   - 追記（#326）: カーネルの `key-pressed`・`key-released` はできた（ADR 0326）。今は `os.pullEvent` に名前のまま（`"key-pressed", address, キー名, 修飾キー, 繰り返し`）届く。CC の `key`・`key_up` に写すのは #724 で、名前のままの形は約束しない
+  - 追記（#724）: `term`・`colors`・`colours`・`keys`・`fs` を足し、`key-pressed`・`key-released` を CC の `"key", 番号, 繰り返し`・`"key_up", 番号` に写した（ADR 0724）。上の「イベントの名前の写し方」の表に、この 2 行が加わる。`char` はまだない
 - 外部サイトのページ: #220（構築）の後。別の Issue にした
 
 ## 規模（1,000 台）

@@ -1,0 +1,41 @@
+# colors(3)
+
+## NAME
+
+colors, colours - colour values for Lua
+
+## SYNOPSIS
+
+    colors.white      colors.orange     colors.magenta    colors.lightBlue
+    colors.yellow     colors.lime       colors.pink       colors.gray
+    colors.lightGray  colors.cyan       colors.purple     colors.blue
+    colors.brown      colors.green      colors.red        colors.black
+    colors.combine(...)
+    colors.subtract(colours, ...)
+    colors.test(colours, colour)
+    colors.packRGB(r, g, b)
+    colors.unpackRGB(rgb)
+    colors.toBlit(colour)
+    colors.fromBlit(hex)
+
+## DESCRIPTION
+
+lua(1) has the libraries `colors` and `colours` (also `require("colors")`). They follow the `colors` API of CC: Tweaked. `colours` is the same, but has `grey` and `lightGrey` instead of `gray` and `lightGray`.
+
+The 16 colours are the bits 1 (`white`) to 32768 (`black`), in the order above. term(3) uses them for the colours of the text and the background. A set of colours is the colours added together:
+
+- `colors.combine(...)` returns the set with all the colours
+- `colors.subtract(colours, ...)` returns `colours` without the other colours
+- `colors.test(colours, colour)` returns true if `colours` has all of `colour`
+- `colors.packRGB(r, g, b)` makes `0xRRGGBB` from three numbers from 0 to 1, and `colors.unpackRGB(rgb)` does the opposite (`colors.rgb8` does either, as in CC: Tweaked)
+- `colors.toBlit(colour)` returns the hexadecimal digit of the colour for `term.blit` (`white` is `0`, `black` is `f`), and `colors.fromBlit(hex)` does the opposite (nil if `hex` is not one digit)
+
+The default RGB values are those of CC: Tweaked (`white` is 0xF0F0F0, `black` is 0x111111, and so on). `term.setPaletteColour` changes them.
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- The tables are filled when they are first used. Before that, `next(colors)` returns nil; `pairs` works
+
+## SEE ALSO
+
+colours(3), term(3), lua(1)

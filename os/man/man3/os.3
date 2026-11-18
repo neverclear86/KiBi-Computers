@@ -38,6 +38,8 @@ Inside a coroutine, `os.sleep` starts a timer and yields `timer` until its own t
 - `peripheral` address: a device was connected
 - `peripheral_detach` address: a device was disconnected
 - `term_resize`: the size of the terminal changed
+- `key` code held: a key of a keyboard was pressed; `held` is true when it repeats (keys(3))
+- `key_up` code: a key of a keyboard was released (keys(3))
 - `timer` id: a timer of `os.startTimer` went off
 - `restored` ns ticks: the world was loaded; the real time (nanoseconds) and the game time (ticks) that were skipped
 - `events_dropped` count: events were lost
@@ -69,8 +71,8 @@ Other events of the system keep their names. When an event comes from a device, 
 - There is no time zone: `local` is UTC
 - `os.queueEvent` does not reach other programs
 - `os.getComputerID`, `os.getComputerLabel`, `os.setComputerLabel`, `os.run` and `os.loadAPI` are not available
-- There are no `key` and `char` events yet
+- There are no `char` and `paste` events (keys(3))
 
 ## SEE ALSO
 
-parallel(3), peripheral(3), lua(1), kibi(7)
+keys(3), parallel(3), peripheral(3), term(3), lua(1), kibi(7)

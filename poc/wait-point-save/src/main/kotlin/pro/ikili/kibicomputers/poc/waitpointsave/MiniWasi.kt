@@ -168,7 +168,7 @@ class MiniWasi(private val kernel: MiniKernel) {
         const val WASI = "wasi_snapshot_preview1"
         const val KIBI_POC = "kibi_poc"
         const val KIBI = "kibi:computer/memory@0.1.0"
-        val KIBI_LUA_API = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0")
+        val KIBI_LUA_API = setOf("kibi:kernel/events@0.1.0", "kibi:device/bus@0.1.0", "kibi:computer/clock@0.1.0", "kibi:computer/power@0.1.0", "kibi:io/tty@0.1.0", "kibi:fs/mounts@0.1.0")
         const val SUCCESS = 0
         const val EBADF = 8
         const val ENOSYS = 52

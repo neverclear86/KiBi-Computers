@@ -1,0 +1,73 @@
+# term(3)
+
+## NAME
+
+term - draw on the terminal with cursor positions and colours from Lua
+
+## SYNOPSIS
+
+    term.write(text)
+    term.blit(text, textColours, backgroundColours)
+    term.clear()
+    term.clearLine()
+    term.scroll(n)
+    term.getCursorPos()
+    term.setCursorPos(x, y)
+    term.getCursorBlink()
+    term.setCursorBlink(blink)
+    term.getSize()
+    term.getTextColour()
+    term.setTextColour(colour)
+    term.getBackgroundColour()
+    term.setBackgroundColour(colour)
+    term.isColour()
+    term.getPaletteColour(colour)
+    term.setPaletteColour(colour, r, g, b)
+    term.setPaletteColour(colour, rgb)
+    term.nativePaletteColour(colour)
+    term.redirect(target)
+    term.current()
+    term.native()
+
+## DESCRIPTION
+
+lua(1) has a `term` library (also `require("term")`). It follows the `term` API of CC: Tweaked. Every function whose name has `Colour` also has the spelling `Color`.
+
+`term` draws on the terminal of the program (the console of the computer) with escape sequences. Positions start at 1, at the top left. `term.getSize` returns the number of columns and rows of the terminal; when the program is not connected to a terminal, it returns 51 and 19.
+
+`term.setCursorPos` moves the cursor; the position may be outside the screen. `term.write` writes the text at the cursor and moves the cursor to its end. Only the part that is on the screen is drawn: the text does not wrap at the right edge. A wide character (2 cells) that would cross an edge is drawn as a blank cell. Control characters, and bytes that are not valid UTF-8, are drawn as U+FFFD.
+
+`term.blit` writes `text` with colours for each character: `textColours` and `backgroundColours` have one hexadecimal digit (`0` to `f`, see colors(3)) for each character of `text`, and all three must have the same length (`Arguments must be the same length`). A character that is not a hexadecimal digit keeps the current colour.
+
+`term.clear` fills the screen, and `term.clearLine` the line of the cursor, with the background colour. `term.scroll(n)` moves the contents up by `n` lines (down if `n` is negative). They do not move the cursor.
+
+Colours are the values of colors(3). `term.setTextColour` and `term.setBackgroundColour` take effect at once, also for `print` and `io.write`. A colour is drawn with its RGB value in the palette: `term.setPaletteColour(colour, r, g, b)` (numbers from 0 to 1) or `term.setPaletteColour(colour, 0xRRGGBB)` changes it, and `term.nativePaletteColour` returns the default. A screen with fewer colours shows the nearest colour that it has. `term.isColour` is always true.
+
+`term.setCursorBlink(false)` hides the cursor. When the program ends normally, the cursor is shown again and the colours of the terminal are reset.
+
+`term.redirect(target)` sends the `term` functions to the table `target` (a table with the same functions, such as a window of your own) and returns the previous target. `term.current` returns the current target, and `term.native` the terminal itself.
+
+## EXAMPLES
+
+    term.setBackgroundColour(colours.blue)
+    term.clear()
+    term.setCursorPos(3, 2)
+    term.setTextColour(colours.yellow)
+    term.write("Hello")
+
+## DIFFERENCES FROM CC: TWEAKED
+
+- `print`, `io.write` and `io.read` do not go through `term`. They write where the terminal is, and do not move the cursor of `term`: after `print`, `term.getCursorPos` is not updated. `print` wraps at the right edge and scrolls; `term.write` does not
+- Until the first `term.setCursorPos`, the position on the terminal is not known: `term.write` writes where the terminal is, and `term.getCursorPos` is a guess that starts at 1, 1
+- The text is UTF-8, and a wide character takes 2 cells. The special characters of CC: Tweaked (128 to 159, such as box drawing and teletext characters) are not available
+- `term.setPaletteColour` changes only what is drawn afterwards. What is already on the screen keeps its colour
+- `term.isColour` is always true, also on a screen with fewer colours (the terminal shows the nearest colour)
+- The cursor is shown at the start (CC: Tweaked hides it until `term.setCursorBlink(true)`)
+- The screen is not redrawn for the program when the world is loaded: draw it again when the `restored` event arrives (os(3))
+- When the program is stopped (for example with Ctrl+C), the colours and the hidden cursor are not reset; `lua -e "term.setCursorBlink(true)"` resets them
+- There is no `window` API, and `term.redirect` to a monitor is not available
+- Keys that are typed while the program waits for `key` events are also shown on the terminal (see keys(3))
+
+## SEE ALSO
+
+colors(3), keys(3), os(3), lua(1)

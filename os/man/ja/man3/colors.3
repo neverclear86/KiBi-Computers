@@ -1,0 +1,41 @@
+# colors(3)
+
+## 名前
+
+colors, colours - Lua の色の値
+
+## 書式
+
+    colors.white      colors.orange     colors.magenta    colors.lightBlue
+    colors.yellow     colors.lime       colors.pink       colors.gray
+    colors.lightGray  colors.cyan       colors.purple     colors.blue
+    colors.brown      colors.green      colors.red        colors.black
+    colors.combine(...)
+    colors.subtract(colours, ...)
+    colors.test(colours, colour)
+    colors.packRGB(r, g, b)
+    colors.unpackRGB(rgb)
+    colors.toBlit(colour)
+    colors.fromBlit(hex)
+
+## 説明
+
+lua(1) には `colors` と `colours` のライブラリがあります（`require("colors")` でも使えます）。CC: Tweaked の `colors` の API に合わせています。`colours` は同じものですが、`gray`・`lightGray` の代わりに `grey`・`lightGrey` を持ちます。
+
+16 色は、上の順に 1（`white`）から 32768（`black`）までのビットです。term(3) の文字と背景の色に使います。色の組は、色を足し合わせたものです。
+
+- `colors.combine(...)` は、すべての色を含む組を返します
+- `colors.subtract(colours, ...)` は、`colours` からほかの色を除いた組を返します
+- `colors.test(colours, colour)` は、`colours` が `colour` をすべて含めば true を返します
+- `colors.packRGB(r, g, b)` は 0〜1 の 3 つの数から `0xRRGGBB` を作り、`colors.unpackRGB(rgb)` はその逆をします（`colors.rgb8` は CC: Tweaked と同じく、どちらにもなります）
+- `colors.toBlit(colour)` は、`term.blit` で使う色の 16 進の数字（`white` は `0`、`black` は `f`）を返し、`colors.fromBlit(hex)` はその逆をします（`hex` が数字 1 つでなければ nil）
+
+RGB の既定の値は CC: Tweaked と同じです（`white` は 0xF0F0F0、`black` は 0x111111 など）。`term.setPaletteColour` で変えられます。
+
+## CC: Tweaked との違い
+
+- 表の中身は、初めて使ったときに詰めます。それまでは `next(colors)` が nil を返します。`pairs` は使えます
+
+## 関連項目
+
+colours(3), term(3), lua(1)
