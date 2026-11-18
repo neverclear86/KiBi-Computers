@@ -227,6 +227,24 @@ static void find_mount(lua_State *L, const char *abs, mount_t *m) {
     kibi_lua_arena_reset();
 }
 
+/* [abs] 自身か、その下にマウントの位置があれば 1（消すと、挿したディスクの中身まで消えるパス）。結果を読む間は Lua の確保をしない */
+static int has_mount_within(lua_State *L, const char *abs) {
+    if (kibi_lua_arena_held()) luaL_error(L, "cannot use fs while a result is being copied");
+    size_t alen = strlen(abs);
+    kibi_lua_arena_reset();
+    kibi_lua_check_memory(L, MOUNTS_RESULT_BYTES);
+    kibi_fs_list_mount_info_t r;
+    kibi_fs_list_mounts(&r);
+    int found = 0;
+    for (size_t i = 0; i < r.len && !found; i++) {
+        const char *p = (const char *)r.ptr[i].point.ptr;
+        size_t plen = r.ptr[i].point.len;
+        found = plen >= alen && memcmp(p, abs, alen) == 0 && (plen == alen || p[alen] == '/');
+    }
+    kibi_lua_arena_reset();
+    return found;
+}
+
 static int l_isReadOnly(lua_State *L) {
     const char *abs = check_abs(L, 1);
     mount_t m;
@@ -456,6 +474,8 @@ static int l_delete(lua_State *L) {
         return fs_error(L, abs, errno);
     }
     if (abs[1] == '\0') return fs_error(L, abs, EACCES);
+    /* マウントの位置か、その上のディレクトリは、中身（挿したディスク）を先に消さないよう、何も消さずに断る（CC のドライブの根と同じ） */
+    if (S_ISDIR(st.st_mode) && has_mount_within(L, abs)) return fs_error(L, abs, EACCES);
     delete_tree(L, abs, 0);
     return 0;
 }

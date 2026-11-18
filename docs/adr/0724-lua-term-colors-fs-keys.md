@@ -50,7 +50,7 @@
 - **包みの外の malloc を避ける**: `fs.list` は `opendir`（中で libc の malloc を使い、RAM を数える包みを通らない。#729・#753 と同じ種類の危険）を使わず、`open(O_DIRECTORY)` と `__wasi_fd_readdir` を直に使う。受ける領域（4 KiB）は Lua の userdata。確保は fd を開く前に済ませ、読む部分は `lua_pcall` で包んで、エラーでも fd を閉じる
 - `fs.list` は名前の順に並べる（標準の `table.sort`。`package.loaded.table` から取り、ユーザーが差し替えたグローバルは使わない）
 - **再帰**（`delete`・`copy`・`move` のマウントをまたぐとき）: ディレクトリを一覧にして fd を閉じてから中を見るので、同時に持つ fd は 1〜2 個。深さは 128 まで（C のスタック 256 KiB と Lua のスタックを食いすぎない。超えたら `Too many nested directories`）。ファイルの写しは 4 KiB の userdata を先に取ってから 2 つの fd を開き、開いている間は Lua の確保をしない
-- `fs.delete` はないパスなら何もしない。根（`/`）は `Access denied`。途中で失敗すると、そこまで消した分は残る（読み取り専用の同梱イメージ（ADR 0461）の中では最初の `unlink` で失敗する）
+- `fs.delete` はないパスなら何もしない。根（`/`）は `Access denied`。途中で失敗すると、そこまで消した分は残る（読み取り専用の同梱イメージ（ADR 0461）の中では最初の `unlink` で失敗する）。マウントの位置か、その上にマウントの位置を含むディレクトリは、何も消さずに `Access denied` にする（先に下りると、挿したディスクの中身だけ消えてしまうため。CC のドライブの根と同じ）
 - `fs.copy`・`fs.move` は、行き先があれば `File exists`、自分の中へは `Can't copy a directory inside itself`・`Can't move a directory inside itself`（CC と同じ文）。行き先の親は作る。`move` は `rename` で、`EXDEV`（マウントをまたぐ）なら写してから消す
 - `fs.makeDir` は親も作り、もうあるディレクトリはそのまま。途中にファイルがあれば `File exists`
 - **容量・読み取り専用・ドライブ**: `list-mounts` で、パスがいちばん長く合うマウントの点を引く（ないパスでも引ける。`stat` の `st_dev` と照らす `df` の形より単純）。import の前に `kibi_lua_arena_reset` と `kibi_lua_check_memory(L, 見積もり)` を呼び、結果を読む間は Lua の確保をせず C の変数に写してから `arena_reset` する。見積もりは 32 個 ×（72 ＋ 文字列 2 つ × 256）＋ 1 KiB（仮の値。マウントの数に上限はないが、RAM に余裕があるときは見積もりを使わない）。arena を握っている中（`__gc` から）では呼ばずにエラー

@@ -10,6 +10,9 @@ import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
 import pro.ikili.kibicomputers.core.display.terminal.TerminalColors
 import pro.ikili.kibicomputers.core.input.Key
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
+import pro.ikili.kibicomputers.core.kernel.event.EventValue
+import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
+import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
@@ -58,12 +61,13 @@ class LuaTermFsKeysTest {
 
     /**
      * イメージ `os` を `/` に読み取り専用で、メモリの FS を `/home`・`/tmp` に書ける形でマウントし、[script] を `lua` で動かす。
-     * コンソールは [columns] x [rows]。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ
+     * コンソールは [columns] x [rows]。[setup] はマウントの後・起動の前にマシンへ足すもの（マウントを増やすなど）。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ
      */
     private fun lua(
         script: String,
         columns: Int = 20,
         rows: Int = 5,
+        setup: (Machine) -> Unit = {},
         driver: (Machine, String) -> Unit = { _, _ -> },
     ): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
         val host = ConsoleHost()
@@ -71,6 +75,7 @@ class LuaTermFsKeysTest {
         m.vfs.mount(VfsPath.ROOT, image, readOnly = true, source = "disk:image:os")
         m.vfs.mount(VfsPath.parse("/home"), TestMemoryFileSystem(), readOnly = false, source = "test:home")
         m.vfs.mount(VfsPath.parse("/tmp"), TestMemoryFileSystem(), readOnly = false, source = "test:tmp")
+        setup(m)
         m.resizeConsole(columns, rows)
         m.put("/home/t.lua", script.trimIndent() + "\n")
         val pid = m.exec(
@@ -548,5 +553,76 @@ class LuaTermFsKeysTest {
             """,
         ).assertOk()
         assertEquals("ok\t3\n", r.text)
+    }
+
+    @Test
+    fun `fsのdeleteは、マウントの位置とそれを含むディレクトリを、中身を消さずに断る`() = timeout(limit) {
+        val r = lua(
+            """
+            fs.makeDir('/home/outer')
+            fs.open('/tmp/keep', 'w').close()
+            print(fs.isDriveRoot('/home/outer/inner'))
+            print(pcall(fs.delete, '/home/outer'))
+            print(pcall(fs.delete, '/home/outer/inner'))
+            print(pcall(fs.delete, '/tmp'))
+            print(fs.exists('/home/outer/inner/data'), fs.exists('/home/outer/inner/sub/deep'), fs.exists('/tmp/keep'))
+            fs.delete('/home/outer/inner/data')
+            print(fs.exists('/home/outer/inner/data'))
+            """,
+            setup = { m ->
+                m.vfs.mount(VfsPath.parse("/home/outer/inner"), TestMemoryFileSystem(), readOnly = false, source = "test:inner")
+                m.vfs.createDirectory(VfsPath.parse("/home/outer/inner/sub"))
+                m.put("/home/outer/inner/data", "x")
+                m.put("/home/outer/inner/sub/deep", "y")
+            },
+        ).assertOk()
+        val out = r.text.replace(Regex("[^\\n\\t]*\\.lua:\\d+: "), "")
+        assertEquals(
+            """
+            true
+            false	/home/outer: Access denied
+            false	/home/outer/inner: Access denied
+            false	/tmp: Access denied
+            true	true	true
+            false
+            """.trimIndent() + "\n",
+            out,
+        )
+    }
+
+    @Test
+    fun `保存から戻した後の最初の描画で、カーソルを隠していればCSI 25lを書き直す`() = timeout(limit) {
+        fun run(hide: Boolean): String {
+            var sent = false
+            val r = lua(
+                """
+                os.queueEvent('ready')
+                os.pullEvent('ready')
+                ${if (hide) "term.setCursorBlink(false)" else ""}
+                print('ready')
+                local e, jumpReal, jumpWorld = os.pullEvent('restored')
+                print('got', e, jumpReal, jumpWorld)
+                term.setCursorPos(1, 1)
+                term.write('a')
+                term.write('b')
+                print('done')
+                """,
+                driver = { m, text ->
+                    if (!sent && text.contains("ready")) {
+                        sent = true
+                        m.postEvent(KernelEvent(RestoreEvents.TYPE, RestoreEvents.SOURCE, listOf(EventValue.Integer(5), EventValue.Integer(7))))
+                    }
+                },
+            ).assertOk()
+            assertTrue(r.text.contains("got\trestored\t5\t7"), r.text)
+            return String(r.bytes, Charsets.UTF_8)
+        }
+        val hidden = run(hide = true)
+        // 隠したときの 1 回と、戻した後の最初の描画の 1 回だけ（2 回目の描画では書き直さない）
+        assertEquals(2, Regex(Regex.escape("\u001b[?25l")).findAll(hidden).count(), hidden)
+        val gotAt = hidden.indexOf("got")
+        assertTrue(hidden.indexOf("\u001b[?25l", gotAt) > gotAt, hidden)
+        // 隠していなければ、何も書き足さない
+        assertFalse(run(hide = false).contains("\u001b[?25l"))
     }
 }
