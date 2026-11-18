@@ -138,26 +138,43 @@ static void out_init(lua_State *L, out_t *o) {
  */
 static const unsigned char ANSI_OF[16] = {15, 3, 13, 12, 11, 10, 13, 8, 7, 6, 5, 4, 3, 2, 1, 0};
 
-/* 色 [i] の SGR の引数を [s] に書く（[base] は前景 30・背景 40）。既定のままなら基本の 16 色、変えたなら RGB */
-static int sgr_colour(char *s, size_t size, int i, int base) {
+/* [v]（0〜255）を 10 進で [s] に書き、次の位置を返す */
+static char *put_uint(char *s, unsigned v) {
+    if (v >= 100) *s++ = (char)('0' + v / 100);
+    if (v >= 10) *s++ = (char)('0' + v / 10 % 10);
+    *s++ = (char)('0' + v % 10);
+    return s;
+}
+
+/* 色 [i] の SGR の引数を [s] に書き、次の位置を返す（[base] は前景 30・背景 40）。既定のままなら基本の 16 色、変えたなら RGB */
+static char *put_colour(char *s, int i, unsigned base) {
     uint32_t c = palette[i];
     if (c == kibi_lua_default_palette[i]) {
-        int a = ANSI_OF[i];
-        return snprintf(s, size, "%d", a < 8 ? base + a : base + 60 + a - 8);
+        unsigned a = ANSI_OF[i];
+        return put_uint(s, a < 8 ? base + a : base + 60 + a - 8);
     }
-    return snprintf(s, size, "%d;2;%u;%u;%u", base + 8, (unsigned)(c >> 16 & 0xFF), (unsigned)(c >> 8 & 0xFF), (unsigned)(c & 0xFF));
+    s = put_uint(s, base + 8);
+    *s++ = ';';
+    *s++ = '2';
+    for (int shift = 16; shift >= 0; shift -= 8) {
+        *s++ = ';';
+        s = put_uint(s, (unsigned)(c >> shift & 0xFF));
+    }
+    return s;
 }
 
 static void add_sgr(out_t *o, int fg, int bg) {
     ensure_palette();
-    char f[24], b[24];
-    sgr_colour(f, sizeof f, fg, 30);
-    sgr_colour(b, sizeof b, bg, 40);
-    luaL_addstring(&o->b, "\x1b[");
-    luaL_addstring(&o->b, f);
-    luaL_addchar(&o->b, ';');
-    luaL_addstring(&o->b, b);
-    luaL_addchar(&o->b, 'm');
+    /* "\x1b[" + 2 色（それぞれ最大 "48;2;255;255;255"）+ ";" + "m" */
+    char buf[48];
+    char *s = buf;
+    *s++ = '\x1b';
+    *s++ = '[';
+    s = put_colour(s, fg, 30);
+    *s++ = ';';
+    s = put_colour(s, bg, 40);
+    *s++ = 'm';
+    luaL_addlstring(&o->b, buf, (size_t)(s - buf));
     register_cleanup();
 }
 
