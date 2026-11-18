@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentCall
 import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
 import pro.ikili.kibicomputers.core.runtime.component.link.HostWait
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Fd
@@ -35,7 +36,7 @@ import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Poll
  * - `poll`: 空のリストはトラップ、上限は p1 の `poll_oneoff` と同じ [WasiP1Poll.MAX_SUBSCRIPTIONS]。待ち方は p1 と同じ
  *   （そろったかを見る → まだなら key を集め、時計があれば一時的なタイマーを 1 つ開いて `ctx.block` → 見直す。ADR 0329）
  *
- * 待機点（#757。ADR 0757）: 待ちうる関数（[WAIT_FUNCTIONS]）は、巻き戻せるとき（[ComponentSuspend.canUnwind]）は `ctx.block` の代わりに
+ * 待機点（#757。ADR 0757）: 待ちうる関数（[WaitingBody]）は、巻き戻せるとき（[ComponentSuspend.canUnwind]）は `ctx.block` の代わりに
  * 巻き戻して待つ（p1 の `poll_oneoff` と同じ形: 時計の一時的なタイマーは閉じずに [AsyncWait] に引き継ぎ、巻き直したら期限を合わせ直す）。
  * 巻き戻すときは、結果の resource を作らず、ゲストに見える状態も変えない（巻き直しで、同じ引数のまま最初からやり直す）。
  * ただし、パイプへの書き込みは一部まで書いてから待つことがあるので、書き終えた数（[StreamEntry.writeProgress]）と、`splice` で
@@ -52,23 +53,17 @@ internal object WasiP2Io {
 
     private val EMPTY = CanonValue.Bytes(ByteArray(0))
 
-    /** 待ちうる関数（インターフェース → 関数の名前。#757）。どれも巻き戻して待てる（[HostWait.UNWIND]） */
-    val WAIT_FUNCTIONS: Map<String, Set<String>> = mapOf(
-        POLL to setOf("[method]pollable.block", "poll"),
-        STREAMS to setOf(
-            "[method]input-stream.blocking-read",
-            "[method]input-stream.blocking-skip",
-            "[method]output-stream.write",
-            "[method]output-stream.blocking-write-and-flush",
-            "[method]output-stream.write-zeroes",
-            "[method]output-stream.blocking-write-zeroes-and-flush",
-            "[method]output-stream.splice",
-            "[method]output-stream.blocking-splice",
-        ),
-    )
+    /**
+     * 待ちうる関数の本体（#757）。巻き戻して待てる（[HostWait.UNWIND]）。待ち方は本体がこれかどうかで決まる（[waitOf]）ので、
+     * 名前の表と本体が食い違うことはない（巻き戻すのに `UNWIND` と宣言していない・宣言したのに巻き直しの [ComponentSuspend.Arrival] を
+     * 受け取らない、のどちらも作れない）
+     */
+    class WaitingBody(private val body: HostFunctionBody) : HostFunctionBody {
+        override fun call(call: ComponentCall, args: List<CanonValue>): CanonValue? = body.call(call, args)
+    }
 
-    /** `wasi:*` のホストの関数（版を外したインターフェース [iface] の [name]）の待ち方（#757） */
-    fun waitOf(iface: String, name: String): HostWait = if (WAIT_FUNCTIONS[iface]?.contains(name) == true) HostWait.UNWIND else HostWait.NONE
+    /** `wasi:*` のホストの関数の本体 [body] の待ち方（#757） */
+    fun waitOf(body: HostFunctionBody): HostWait = if (body is WaitingBody) HostWait.UNWIND else HostWait.NONE
 
     /**
      * 待ちうる関数の呼び出し 1 回の、待ち方（#757）。[arrival] は、巻き直して着いた呼び出しなら前に巻き戻したときの情報
@@ -121,11 +116,11 @@ internal object WasiP2Io {
 
         fun body(f: (ProcessContext, List<CanonValue>) -> CanonValue?) = HostFunctionBody { call, args -> f(P2.ctx(call), args) }
 
-        /** 待ちうる関数（[WAIT_FUNCTIONS]）の本体。入口で、巻き直して着いた呼び出しかを受け取る（#757） */
-        fun waiting(f: (ProcessContext, Waiter, List<CanonValue>) -> CanonValue?) = HostFunctionBody { call, args ->
+        /** 待ちうる関数（[WaitingBody]）の本体。入口で、巻き直して着いた呼び出しかを受け取る（#757） */
+        fun waiting(f: (ProcessContext, Waiter, List<CanonValue>) -> CanonValue?) = WaitingBody(HostFunctionBody { call, args ->
             val suspend = P2.suspend(call)
             f(P2.ctx(call), Waiter(suspend, suspend.enter()), args)
-        }
+        })
 
         val error = mapOf(
             "[method]error.to-debug-string" to body { ctx, a ->

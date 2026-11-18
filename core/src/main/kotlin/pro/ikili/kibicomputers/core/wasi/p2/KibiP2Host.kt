@@ -74,6 +74,11 @@ internal object KibiP2Host : ComponentHost {
         bodies.putAll(KibiP2Kernel.functions(t))
         bodies.putAll(KibiP2Process.functions(t))
         bodies.putAll(KibiP2Device.functions(t))
+        // 待ちうる関数の名前が WIT とずれると、待たないもの（NONE）とみなされ、待機点型のプロセスが止まろうとして CRASHED になる（#757）
+        for ((iface, names) in BLOCKING_FUNCTIONS) {
+            val unknown = names - wit[iface]?.functions?.keys.orEmpty()
+            check(unknown.isEmpty()) { "待ちうる関数 $iface の $unknown が WIT にない" }
+        }
         val out = LinkedHashMap<String, HostInterface>()
         for ((key, w) in wit) {
             val impl = bodies.remove(key) ?: emptyMap()
@@ -94,7 +99,8 @@ internal object KibiP2Host : ComponentHost {
  */
 private val BLOCKING_FUNCTIONS: Map<String, Set<String>> = mapOf(
     KibiP2Device.BUS to setOf("[method]device.invoke"),
-    KibiP2Process.PROCESS to setOf("[static]process.spawn", "spawn-with-handles"),
+    KibiP2Process.PROCESS to setOf("[static]process.spawn"),
+    KibiP2Process.PROCESS_POLL to setOf("spawn-with-handles"),
 )
 
 private fun waitOf(iface: String, name: String): HostWait =

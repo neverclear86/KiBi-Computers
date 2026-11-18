@@ -256,11 +256,18 @@ class AsyncP2Test {
     /**
      * stdin・stdout の stream を直接使う p2 のコマンド。[run] は `run` の本体（ローカル `$in`・`$out`・`$p` が使える）。
      * 戻り値の領域は 64 以降（結果の tag は +0、`u64` は +8、`list<u8>` の ptr・len は +4・+8）、データは 1024 の `ABCDEFGHIJKLMNOP`、
-     * `$mark` は stdout に 1 文字を書く。`run` は 0（ok）で終わる
+     * `$mark` は stdout に 1 文字を書く。`run` は 0（ok）で終わる。[start] があれば、core モジュールの start 関数の本体にする
+     * （`run` と同じローカルが使える。インスタンス化の中、`LOADING` で動く）
      */
-    private fun streamsGuest(run: String): ByteArray {
+    private fun streamsGuest(run: String, start: String = ""): ByteArray {
         val s = "$"
         val streams = "wasi:io/streams@0.2.12"
+        val init = if (start.isEmpty()) {
+            ""
+        } else {
+            "(func ${s}init (local ${s}in i32) (local ${s}out i32) (local ${s}p i32) " +
+                "(local.set ${s}in (call ${s}stdin)) (local.set ${s}out (call ${s}stdout)) $start) (start ${s}init)"
+        }
         return KibiP2WitTool.component(
             """
             import wasi:cli/stdin@0.2.12;
@@ -282,12 +289,15 @@ class AsyncP2Test {
               (import "$streams" "[method]output-stream.write-zeroes" (func ${s}wz (param i32 i64 i32)))
               (import "$streams" "[method]output-stream.blocking-splice" (func ${s}bsplice (param i32 i32 i64 i32)))
               (import "wasi:io/poll@0.2.12" "[method]pollable.block" (func ${s}pblock (param i32)))
+              (import "wasi:io/poll@0.2.12" "[resource-drop]pollable" (func ${s}pdrop (param i32)))
+              (import "$streams" "[resource-drop]input-stream" (func ${s}isdrop (param i32)))
               (memory (export "memory") 1)
               (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 2048))
               (data (i32.const 1024) "ABCDEFGHIJKLMNOP")
               (func ${s}mark (param ${s}out i32) (param ${s}c i32)
                 (i32.store8 (i32.const 3000) (local.get ${s}c))
                 (call ${s}bwrite (local.get ${s}out) (i32.const 3000) (i32.const 1) (i32.const 3008)))
+              $init
               (func (export "wasi:cli/run@0.2.12#run") (result i32)
                 (local ${s}in i32) (local ${s}out i32) (local ${s}p i32)
                 (local.set ${s}in (call ${s}stdin))
@@ -467,6 +477,105 @@ class AsyncP2Test {
             finish(s)
             assertEquals("XYZD", s.drain())
             assertEquals(5, inputAvailable(s), "入力を読んでしまった")
+        }
+    }
+
+    @Test
+    fun `WAIT_POINTのコンポーネントでも、start関数の中の待ちは巻き戻さずスレッドを持って待つ`() = timeout(limit) {
+        // start 関数は LOADING で動くので巻き戻せない（ComponentSuspend.canUnwind が偽）。pollable.block は ctx.block で待ち
+        // （await の巻き戻さない側）、run に入ってからの読みは巻き戻して待つ。start の中で呼べるのは、メモリを使わない lower だけ
+        // （wit-component はメモリ・realloc を使う lower を、main のインスタンスの後に fixup が埋める表を通すので、start からは呼べない）
+        val start = """
+            (local.set ${'$'}p (call ${'$'}isub (local.get ${'$'}in)))
+            (call ${'$'}pblock (local.get ${'$'}p))
+            (call ${'$'}pdrop (local.get ${'$'}p))
+            (call ${'$'}isdrop (local.get ${'$'}in))
+        """
+        val run = """
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}bwrite (local.get ${'$'}out) (i32.load (i32.const 84)) (i32.load (i32.const 88)) (i32.const 96))
+            (call ${'$'}bread (local.get ${'$'}in) (i64.const 1) (i32.const 80))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.const 82))
+        """
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val s = Session(h, h.machine(fuelPerTick = 10_000_000), streamsGuest(run, start), emptyList())
+            fun state() = s.m.stateOf(s.pid)
+            s.tickUntil("start で pollable.block を待たない: ${state()} ${s.rt.lastError}") {
+                state() == ProcessState.WAITING_EVENT && s.rt.thread != null
+            }
+            assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
+            assertTrue(s.rt.program.component!!.waitPoints, "${s.rt.program.component!!.waitPointRejection}")
+            assertTrue(s.m.lock.withLockValue { s.process.asyncStack!!.isEmpty }, "start の中で巻き戻した")
+            assertNull(s.m.lock.withLockValue { s.process.asyncWait })
+            // 入力が来たら start を終え、run の読みで 1 バイト読んで書き、次の読みは巻き戻して待つ
+            s.send("Q")
+            s.tickUntil("run で巻き戻して待たない: ${state()} ${s.rt.lastError}") {
+                s.drain() == "Q" && state() == ProcessState.WAITING_EVENT && s.rt.thread == null
+            }
+            assertTrue(s.m.lock.withLockValue { s.process.asyncStack!!.size } > 0, "退避した値がない")
+            s.send("!")
+            finish(s)
+            assertEquals("QR", s.drain())
+        }
+    }
+
+    /** [m] の写し [copy] の中の [pid] が殺され、待機点の続き（退避した値・やり直しの値・一時的なタイマー・ホストの resource）が残っていない */
+    private fun assertKilledInCopy(m: Machine, copy: pro.ikili.kibicomputers.core.persist.KernelStateCopy, pid: Int, timersBefore: Int) {
+        assertTrue(pid in copy.killedPids, "写しの中で殺していない")
+        copy.processes[pid]?.let { p ->
+            assertEquals(ProcessState.KILLED, p.state)
+            assertTrue(p.asyncStack?.isEmpty != false, "写しに退避した値が残った")
+            assertNull(p.asyncWait, "写しにやり直しの値が残った")
+            assertTrue(p.waitTimers.isEmpty, "写しに一時的なタイマーが残った")
+            assertEquals(0, p.hostResources.size, "写しにホストの resource が残った")
+        }
+        var timers = 0
+        copy.objects.forEachObject { if (it is Timer) timers++ }
+        assertEquals(timersBefore, timers, "写しに一時的なタイマーが残った")
+        assertTrue(copy.abiCaptures[pid] == null, "殺したプロセスの ABI 層を写した")
+    }
+
+    @Test
+    fun `待機点型のコンポーネントが時計で待っている台の写しでは、プロセスを殺し続きを残さず、元は動き続ける`() = timeout(limit) {
+        manual { h, timers, m ->
+            val before = timerCount(m)
+            val s = Session(h, m, prompt, listOf("sleep", "100"))
+            parked(s)
+            assertNotNull(m.lock.withLockValue { s.process.asyncWait })
+            assertEquals(before + 1, timerCount(m))
+            // コンポーネントは静的に保存できない（UNSAVEABLE）ので、待機点型でも写しの中で殺す
+            val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+            assertKilledInCopy(m, copy, s.pid, before)
+            // 元のプロセスはそのまま待ち、期限で終わる
+            assertTrue(m.lock.withLockValue { s.process.asyncStack!!.size } > 0, "元の退避した値を消した")
+            timers.advance(100 * ms)
+            s.tickUntil("終わらない") { m.stateOf(s.pid).isTerminal }
+            assertEquals(ProcessState.EXITED, m.stateOf(s.pid), "${s.rt.lastError}")
+            assertEquals("slept\n", s.drain())
+            assertEquals(before, timerCount(m))
+        }
+    }
+
+    @Test
+    fun `書きかけのspliceを持って待つ台の写しでは、読んだバイトを写しに残さない`() = timeout(limit) {
+        val run = """
+            (call ${'$'}bsplice (local.get ${'$'}out) (local.get ${'$'}in) (i64.const 100) (i32.const 64))
+            (if (i32.load8_u (i32.const 64)) (then (return (i32.const 1))))
+            (call ${'$'}mark (local.get ${'$'}out) (i32.add (i32.const 65) (i32.wrap_i64 (i64.load (i32.const 72)))))
+        """
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val before = timerCount(m)
+            val s = Session(h, m, streamsGuest(run), emptyList())
+            parked(s)
+            s.m.lock.withLockValue { outputEntry(s).pendingSplice = "XYZ".toByteArray() }
+            val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+            assertKilledInCopy(m, copy, s.pid, before)
+            // 元の書きかけはそのまま
+            assertEquals("XYZ", s.m.lock.withLockValue { outputEntry(s).pendingSplice?.toString(Charsets.UTF_8) })
+            s.send("hello")
+            finish(s)
+            assertEquals("XYZD", s.drain())
         }
     }
 }

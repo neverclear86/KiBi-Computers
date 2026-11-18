@@ -30,7 +30,7 @@ internal object ComponentAsyncify {
      */
     class Result(val waitImports: List<Set<String>>, val externalTypes: Set<Asyncify.Signature>, val rejection: String?)
 
-    /** [planned] の core モジュール [modules]（計画の番号の順）を解析する。[checkpoint] は 1 周ごとに呼ぶ（時間の上限） */
+    /** [planned] の core モジュール [modules]（計画の番号の順）を解析する。[checkpoint] は 1 周ごとと、長い連鎖をたどる途中で呼ぶ（時間の上限） */
     fun analyze(planned: ComponentPlanner.Planned, modules: List<Asyncify.Prepared>, checkpoint: () -> Unit = {}): Result {
         for (lower in planned.lowers) {
             val callee = lower.callee
@@ -44,19 +44,47 @@ internal object ComponentAsyncify {
 
         fun exportWaits(ref: CoreRef.Export): Boolean = ref.name in suspendExports[planned.steps[ref.step].module]
 
-        fun lowerWaits(lower: Int): Boolean = when (val callee = planned.lowers[lower].callee) {
-            is FuncRef.Host -> callee.host.wait != HostWait.NONE
-            is FuncRef.Lifted -> when (val core = planned.lifts[callee.lift].core) {
-                is CoreRef.Export -> exportWaits(core)
-                is CoreRef.Lowered -> lowerWaits(core.lower)
-                is CoreRef.ResourceOp -> false
+        // lower の答えの覚え（0: まだ、1: 止まりうる、2: 止まらない、3: たどっている途中）。答えは suspendExports で変わるので、
+        // 不動点のループの 1 周ごとと、最後の検査の前に消す。lift と lower を交互につないだ連鎖を、再帰せず 1 回ずつたどる（#757）
+        val memo = ByteArray(planned.lowers.size)
+        val chain = ArrayList<Int>()
+        var visits = 0L
+
+        fun lowerWaits(lower: Int): Boolean {
+            if (memo[lower] == 1.toByte() || memo[lower] == 2.toByte()) return memo[lower] == 1.toByte()
+            chain.clear()
+            var i = lower
+            var answer: Boolean
+            while (true) {
+                when (memo[i]) {
+                    1.toByte() -> { answer = true; break }
+                    2.toByte() -> { answer = false; break }
+                    // 自分に戻る連鎖（計画では作れないはず）: 待ちに着かないので止まらない
+                    3.toByte() -> { answer = false; break }
+                }
+                memo[i] = 3
+                chain += i
+                if (++visits and 0xFFFF == 0L) checkpoint()
+                val next = when (val callee = planned.lowers[i].callee) {
+                    is FuncRef.Host -> { answer = callee.host.wait != HostWait.NONE; break }
+                    is FuncRef.Lifted -> when (val core = planned.lifts[callee.lift].core) {
+                        is CoreRef.Export -> { answer = exportWaits(core); break }
+                        is CoreRef.Lowered -> core.lower
+                        is CoreRef.ResourceOp -> { answer = false; break }
+                    }
+                }
+                i = next
             }
+            val mark: Byte = if (answer) 1 else 2
+            for (j in chain) memo[j] = mark
+            return answer
         }
 
         var changed = true
         while (changed) {
             changed = false
             checkpoint()
+            memo.fill(0)
             for (m in modules.indices) {
                 val imports = LinkedHashSet<String>()
                 for (step in planned.steps) {
@@ -81,7 +109,9 @@ internal object ComponentAsyncify {
                 if (types.addAll(a.suspendTypes)) changed = true
             }
         }
+        memo.fill(0)
         for ((i, lower) in planned.lowers.withIndex()) {
+            if (i and 0xFFFF == 0) checkpoint()
             if (lower.callee is FuncRef.Lifted && lowerWaits(i)) {
                 return reject(modules, "待ちが、ゲストからゲストへの呼び出し（canon lower $i）の下にある")
             }

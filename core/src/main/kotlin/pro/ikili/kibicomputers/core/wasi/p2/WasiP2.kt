@@ -93,7 +93,10 @@ internal object WasiP2Host : ComponentHost {
             val missing = w.functions.keys - impl.keys
             val extra = impl.keys - w.functions.keys
             check(missing.isEmpty() && extra.isEmpty()) { "$key の実装が WIT と合わない（ない: $missing、余り: $extra）" }
-            val functions = w.functions.mapValues { (n, type) -> HostFunction(type, WasiP2Io.waitOf(key, n), P2.guard(impl.getValue(n))) }
+            val functions = w.functions.mapValues { (n, type) ->
+                val body = impl.getValue(n)
+                HostFunction(type, WasiP2Io.waitOf(body), P2.guard(body))
+            }
             out[key] = HostInterface("$key@${WasiP2Wit.BASE_VERSION}", functions, w.resources.mapValues { resources.getValue(it.value) })
         }
         check(bodies.isEmpty()) { "WIT にないインターフェースの実装: ${bodies.keys}" }

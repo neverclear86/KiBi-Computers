@@ -6,7 +6,7 @@
 ## 決めたこと（要約）
 
 - コンポーネントの中の core モジュールを、p1 と同じ待機点への変換（asyncify。ADR 0316・0329）で変換し、`WasiP2Driver` を待機点型（`WAIT_POINT`）で動かす。待っている p2 のコマンドはスレッドを持たない（p1 と同じく、イベントのキーとタイマーだけを持つ）。
-- 巻き戻せない待ちのホストの関数（`kibi:device/bus` の `[method]device.invoke`、`kibi:process` の `[static]process.spawn`・`spawn-with-handles`）を import するコンポーネントは、変換せずに今までどおりブロッキング型（`BLOCKING`）で動かす。理由は `ComponentProgram.waitPointRejection` に残る。
+- 巻き戻せない待ちのホストの関数（`kibi:device/bus` の `[method]device.invoke`、`kibi:process/process` の `[static]process.spawn`、`kibi:process/process-poll` の `spawn-with-handles`）を import するコンポーネントは、変換せずに今までどおりブロッキング型（`BLOCKING`）で動かす。理由は `ComponentProgram.waitPointRejection` に残る。
 - **ABI・保存形式・公開 API は変えない。** コンポーネントは今までどおり `UNSAVEABLE`。p1 の変換の出力（`Instrumentation.VERSION`）も変わらない。
 
 ## 変換
@@ -37,8 +37,15 @@
 | --- | --- |
 | `wasi:io/poll` の `poll`・`[method]pollable.block` | `UNWIND` |
 | `wasi:io/streams` の `blocking-read`・`blocking-skip`・`write`・`blocking-write-and-flush`・`write-zeroes`・`blocking-write-zeroes-and-flush`・`splice`・`blocking-splice` | `UNWIND` |
-| `kibi:device/bus` の `[method]device.invoke`、`kibi:process` の `[static]process.spawn`・`spawn-with-handles` | `BLOCK` |
+| `kibi:device/bus` の `[method]device.invoke`、`kibi:process/process` の `[static]process.spawn`、`kibi:process/process-poll` の `spawn-with-handles` | `BLOCK` |
 | ほか | `NONE` |
+
+- `wasi:*` の `UNWIND` は名前の表を持たず、本体が `WasiP2Io.WaitingBody`（`waiting { }`）かどうかで決める（巻き戻す本体と宣言が食い違わない）。`kibi:*` の `BLOCK` は名前の表で、ホストを作るときに WIT にある名前かを確かめる。どちらの一覧も `HostWaitTest` で固定する。
+- 止まりうる import の解析（`ComponentAsyncify`）は、lift と lower の連鎖を再帰せず、覚えながら 1 回ずつたどり（1 周あたり lower の数に比例）、長い連鎖の途中でも読み込みの時間の上限（`checkpoint`）を確かめる。
+
+## スレッド
+
+- 待機点型のコンポーネントは静的に保存できない（`UNSAVEABLE`）ので、チャンクのアンロード・サーバーの停止の写し（`captureCopy(KILL_TRANSIENT)`）は step の終わりを待たない。走っている途中のプロセスの `AsyncStack` をカーネルロックの中から写すことがあるので、`AsyncStack` の読み書きはそのインスタンスのモニターの中で行う（写した中身は途中のものでありうるが、写しの中で殺すので使わない）。
 
 ## 制約と残り
 
@@ -52,4 +59,5 @@
 
 - `ComponentWaitPointTest`: shim の形のモジュールをまたいだ巻き戻し・巻き直し（燃料あり・なし）、export していない表に移した参照への `call_indirect`、`NONE` のホスト、`BLOCK` のホストで変換しない、変換しない指定、ゲストからゲストの下の待ち、dtor が止まりうる、変換できない作り（`AsyncifyUnsupported`。元の関数の番号とモジュールが理由に入る）、変換の決定性、巻き戻しでハンドルを作らない。
 - `AsyncifyTest`: 外の型を `call_ref` と、外の参照が入りうる表への `call_indirect` に当てる範囲。
-- `AsyncP2Test`: プロンプトで待つ p2 のコマンドがスレッドを持たない、p1 の `BLOCKING` と出力が同じ（深い再帰・並べ替えを含む）、燃料、`poll` のタイマーの引き継ぎ、待っている間に殺したときの片付け、パイプがいっぱいのときの書き込み。アダプターを通らない WAT のコマンドで、`write`・`write-zeroes`（巻き直したら許可量をもう一度引かず、残りだけを順に書く）、`blocking-skip`、`pollable.block`、`blocking-splice`（入力待ち・出力の空き待ちで巻き直して最初からやり直す。巻き戻した書き込みに読んだバイト（`pendingSplice`）が残っていれば読まずに書く）。`splice` が読んだ後に書けずに巻き戻す道（`pendingSplice` を作るところ）は、読んだ後の書き込みの前に出力を埋める手段が race 以外にないので、置いた状態から巻き直す道だけを確かめている。
+- `AsyncP2Test`: プロンプトで待つ p2 のコマンドがスレッドを持たない、p1 の `BLOCKING` と出力が同じ（深い再帰・並べ替えを含む）、燃料、`poll` のタイマーの引き継ぎ、待っている間に殺したときの片付け、パイプがいっぱいのときの書き込み。アダプターを通らない WAT のコマンドで、`write`・`write-zeroes`（巻き直したら許可量をもう一度引かず、残りだけを順に書く）、`blocking-skip`、`pollable.block`、`blocking-splice`（入力待ち・出力の空き待ちで巻き直して最初からやり直す。巻き戻した書き込みに読んだバイト（`pendingSplice`）が残っていれば読まずに書く）。`splice` が読んだ後に書けずに巻き戻す道（`pendingSplice` を作るところ）は、読んだ後の書き込みの前に出力を埋める手段が race 以外にないので、置いた状態から巻き直す道だけを確かめている。core モジュールの start 関数（`LOADING`）の中の待ちは巻き戻さずスレッドを持って待つこと。時計で待っている・書きかけの `splice` を持つ待機点型のコンポーネントの台の写しで、プロセスを殺し、退避した値・やり直しの値・一時的なタイマー・ホストの resource を写しに残さないこと。
+- `HostWaitTest`: 実物のホストの `UNWIND`・`BLOCK` の一覧。

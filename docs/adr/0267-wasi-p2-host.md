@@ -23,7 +23,7 @@
 | `WasiP2Wit` | ホストの型の一次情報。WASI 0.2.12 の WIT を文字列で持つ（下記） |
 | `WitReader` | 上の WIT を `CanonType`・`CanonFunction` に読む小さな読み手（この WIT が使う構文だけ） |
 | `WasiP2Host` | `ComponentHost` の実物。WIT の関数ごとに本体（`WasiP2Io`・`WasiP2Cli`・`WasiP2Fs`・`WasiP2Sockets`）を付け、過不足をビルド時（初回の参照）に確かめる |
-| `WasiP2Driver` | p2 のコマンドを動かす ABI 層のドライバー（`BLOCKING`）。export の `wasi:cli/run#run` を呼ぶ |
+| `WasiP2Driver` | p2 のコマンドを動かす ABI 層のドライバー（待機点に変換できれば `WAIT_POINT`、できなければ `BLOCKING`。#757・ADR 0757）。export の `wasi:cli/run#run` を呼ぶ |
 | `HostResourceTable` | プロセスごとのホストの resource の表（rep → 中身）。fd の表とは別 |
 
 ### ホストの型は WIT から作る
