@@ -220,6 +220,41 @@ kibiWasm {
     }
 }
 
+// ネイティブのツールチェーン（wasi-sdk の clang と wasm-component-ld。gradle/wasi-sdk.properties）で作るコンポーネント（#775）。
+// アダプターで包んだ p1 のプログラムではなく、wasi-libc が p2・p3 の import を直接呼ぶ形。テストのリソースにだけ入れる（MOD には入れない）
+kibiWasm {
+    wasiSdkModule("hello-wasi-p2") {
+        sources.from("src/test/wasm/hello_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // main が 0・1 以外を返す。wasi-libc の crt1 は wasi:cli/exit を呼ばず、wasi:cli/run の run から err を返す
+    wasiSdkModule("exit3-p2") {
+        sources.from("src/test/wasm/exit3.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // main から戻らずに exit() を呼ぶ。wasi-libc が wasi:cli/exit の exit を直接呼ぶ経路（exit3-p2 は run の err で、exit を呼ばない）
+    wasiSdkModule("exit-native-p2") {
+        sources.from("src/test/wasm/exit_native.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // wasi-libc が p2 の wasi:filesystem（preopen・descriptor）を直接呼ぶ形で、パスの操作を確かめる（path_wasi.c はアダプター経由の p1 と同じソース）
+    wasiSdkModule("path-wasi-p2") {
+        sources.from("src/test/wasm/path_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // args・environ・時計・乱数・sched_yield を、wasi-libc が wasi:cli・wasi:clocks・wasi:random を直接呼ぶ形で確かめる
+    wasiSdkModule("basic-native-p2") {
+        sources.from("src/test/wasm/basic_native.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // p3 は #268 まで読み込みで断る（NOEXEC）ことを確かめる
+    wasiSdkModule("hello-wasi-p3") {
+        sources.from("src/test/wasm/hello_wasi.c")
+        target = "wasm32-wasip3"
+        compilerArgs.addAll("-O2", "-s")
+    }
+}
+
 // WASI p1 のモジュールを p2 のコンポーネントにするアダプター（wasmtime の配布物。#263）。
 // テストで `wasm-tools component new --adapt` に渡し、実際のツールチェーンの形のコンポーネントを作る（MOD には入れない）
 val wasiAdapterProps = Properties().apply {

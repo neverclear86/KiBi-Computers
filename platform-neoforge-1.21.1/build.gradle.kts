@@ -34,10 +34,25 @@ kotlin.target.compilations.named("dev") {
     associateWith(kotlin.target.compilations.getByName("main"))
 }
 
+// 製品の jar を読む GameTest の run（runJarGameTestServer。#775）のクラスパス。MOD のソースセット（main・core など）と Endive を
+// 載せず、KFF（MOD として読まれる）とゲームの依存だけにする。KiBi Computers 自身は mods/ に置いた jar から読む
+val jarRun: SourceSet = sourceSets.create("jarRun")
+
+// jar の GameTest（runJarGameTestServer。#775）の mods/ に、今のビルドの jar だけを置く（古い版の jar を残さない）
+val syncJarGameTestMods = tasks.register<Sync>("syncJarGameTestMods") {
+    from(tasks.jar.flatMap { it.archiveFile })
+    into(file("run/jar-gametest/mods"))
+}
+// Endive は全 run 共通の additionalRuntimeClasspath（レガシーのクラスパス）に載っている。jar の run ではそこから外し、jar に同梱したものだけを読ませる
+configurations.matching { it.name == "jarGameTestServerLegacyClasspath" }.configureEach {
+    exclude(group = "run.endive")
+}
+
 neoForge {
     version = prop("neoforge_version")
     // バージョンを決めたあとでないと呼べない
     addModdingDependenciesTo(dev)
+    addModdingDependenciesTo(jarRun)
 
     parchment {
         minecraftVersion = mcVersion
@@ -85,6 +100,17 @@ neoForge {
                 jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")
             }
         }
+        // 製品の jar（Jar-in-Jar で Endive を同梱したもの）を mods/ に置いて読み、GameTest を流す（#775）。
+        // 開発環境の run と違い、MOD のソースセットも Endive もクラスパスに載せないので、同梱の漏れ・モジュールとしての読み込みの
+        // 問題（開発環境の additionalRuntimeClasspath では気づけないもの）が出る。試験用のデバイス（dev ソースセット）は jar にないので登録しない
+        register("jarGameTestServer") {
+            type = "gameTestServer"
+            sourceSet = jarRun
+            loadedMods = emptySet()
+            gameDirectory = file("run/jar-gametest")
+            systemProperty("kibicomputers.jarTest", "true")
+            taskBefore(syncJarGameTestMods)
+        }
         register("data") {
             data()
             programArguments.addAll(
@@ -117,6 +143,7 @@ dependencies {
     "devCompileOnly"(project(":dev-driver"))
 
     implementation("thedarkcolour:kotlinforforge-neoforge:${prop("kff_version")}")
+    "jarRunRuntimeOnly"("thedarkcolour:kotlinforforge-neoforge:${prop("kff_version")}")
 
     // MOD ではない外部ライブラリは Jar-in-Jar で同梱する
     for (lib in listOf(libs.endive.runtime, libs.endive.wasm)) {

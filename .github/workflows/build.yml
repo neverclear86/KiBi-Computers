@@ -31,6 +31,12 @@ jobs:
           path: ~/.gradle/kibicomputers/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/zig.properties') }}
 
+      # ネイティブの p2・p3 のコンポーネントをビルドする wasi-sdk（gradle/wasi-sdk.properties で固定。#775）。Gradle が初回に取得して ~/.gradle/kibicomputers/wasi-sdk に置く
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/wasi-sdk
+          key: wasi-sdk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/wasi-sdk.properties') }}
+
       # WASM にビルドする C のソース（Lua など。gradle/lua.properties で固定。#91）。Gradle が取得して ~/.gradle/kibicomputers/downloads に置く
       - uses: actions/cache@v6
         with:
@@ -49,6 +55,16 @@ jobs:
       - name: GameTest (Forge 1.20.1)
         timeout-minutes: 30
         run: ./gradlew :platform-forge-1.20.1:runGameTestServer --console=plain
+
+      # 製品の jar（Jar-in-Jar で Endive を同梱したもの）を mods/ に置いて読み、GameTest を流す（#775）。
+      # 開発環境の run は Endive を実行時クラスパスから読むので、同梱の漏れやモジュールとしての読み込みの問題はここで見つける
+      - name: GameTest from the mod jar (NeoForge 1.21.1)
+        timeout-minutes: 30
+        run: ./gradlew :platform-neoforge-1.21.1:runJarGameTestServer --console=plain
+
+      - name: GameTest from the mod jar (Forge 1.20.1)
+        timeout-minutes: 30
+        run: ./gradlew :platform-forge-1.20.1:runJarGameTestServer --console=plain
 
       - uses: actions/upload-artifact@v7
         with:

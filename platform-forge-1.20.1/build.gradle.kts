@@ -36,10 +36,26 @@ val dev: SourceSet = sourceSets.create("dev") {
     runtimeClasspath += sourceSets.main.get().output
 }
 
+// 製品の jar を読む GameTest の run（runJarGameTestServer。#775）のクラスパス。MOD のソースセット（main・core など）と Endive を
+// 載せず、KFF（MOD として読まれる）とゲームの依存だけにする。KiBi Computers 自身は mods/ に置いた jar から読む
+val jarRun: SourceSet = sourceSets.create("jarRun")
+
+// jar の GameTest の mods/ に、今のビルドの jar だけを置く（古い版の jar を残さない）。
+// 製品物は reobfJar（SRG 名）だが、開発環境の実行時は Mojang 名なので、reobf の前の jar（tasks.jar）を使う
+val syncJarGameTestMods = tasks.register<Sync>("syncJarGameTestMods") {
+    from(tasks.jar.flatMap { it.archiveFile })
+    into(file("run/jar-gametest/mods"))
+}
+// Endive は全 run 共通の additionalRuntimeClasspath（レガシーのクラスパス）に載っている。jar の run ではそこから外し、jar に同梱したものだけを読ませる
+configurations.matching { it.name == "jarGameTestServerLegacyClasspath" }.configureEach {
+    exclude(group = "run.endive")
+}
+
 legacyForge {
     version = prop("forge_version")
     // バージョンを決めたあとでないと呼べない
     addModdingDependenciesTo(dev)
+    addModdingDependenciesTo(jarRun)
 
     parchment {
         minecraftVersion = mcVersion
@@ -65,6 +81,17 @@ legacyForge {
         }
         register("gameTestServer") {
             type = "gameTestServer"
+        }
+        // 製品の jar（Jar-in-Jar で Endive を同梱したもの）を mods/ に置いて読み、GameTest を流す（#775）。
+        // 開発環境の run と違い、MOD のソースセットも Endive もクラスパスに載せないので、同梱の漏れ・モジュールとしての読み込みの
+        // 問題（開発環境の additionalRuntimeClasspath では気づけないもの）が出る
+        register("jarGameTestServer") {
+            type = "gameTestServer"
+            sourceSet = jarRun
+            loadedMods = emptySet()
+            gameDirectory = file("run/jar-gametest")
+            systemProperty("kibicomputers.jarTest", "true")
+            taskBefore(syncJarGameTestMods)
         }
         register("data") {
             data()
@@ -98,6 +125,9 @@ dependencies {
     "devCompileOnly"(project(":dev-driver"))
 
     modImplementation("thedarkcolour:kotlinforforge:${prop("kff_version")}")
+    // jar の GameTest の run（#775）のクラスパスにも、Mojang 名に付け替えた KFF を載せる
+    obfuscation.createRemappingConfiguration(configurations.getByName("jarRunRuntimeOnly"))
+    "modJarRunRuntimeOnly"("thedarkcolour:kotlinforforge:${prop("kff_version")}")
 
     // MOD ではない外部ライブラリは Jar-in-Jar で同梱する
     for (lib in listOf(libs.endive.runtime, libs.endive.wasm)) {
