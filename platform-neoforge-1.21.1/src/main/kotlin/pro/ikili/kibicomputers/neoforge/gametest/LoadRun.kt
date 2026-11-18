@@ -891,7 +891,8 @@ internal class LoadRun(
             }
             LoadPhase.AUTOSAVE -> {
                 ServerMachines.Stats.reset()
-                // この試験で置いた台だけを周期に入れる。前の回の強制読み込みが残ったワールドでは、よその台も動いている（#749）
+                // この試験で置いた台だけを周期に入れる。前の回の強制読み込みが残ったワールドでは、よその台も動いている（#749）。
+                // Gradle の run は毎回ワールドを消す（#792）ので、これは -PkeepGameTestWorld や IDE から起動して使い回したときの保険
                 val own: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
                 for (c in computers) own += c.case
                 val others = ServerMachines.trackedCases().filter { it !in own && it.computer.machine != null }
