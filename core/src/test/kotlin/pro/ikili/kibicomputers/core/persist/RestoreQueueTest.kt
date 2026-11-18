@@ -96,6 +96,10 @@ class RestoreQueueTest {
         fun of(level: Level): List<LogRecord> =
             records.toList().filter { it.level == level && it.message.startsWith("順番待ちの復元の開始") }
 
+        /** tick ごとの、投げた台数の WARNING */
+        fun summaries(): List<LogRecord> =
+            records.toList().filter { it.level == Level.WARNING && it.message.startsWith("順番待ちの復元: ") }
+
         override fun close() {
             logger.removeHandler(handler)
             logger.level = oldLevel
@@ -138,7 +142,9 @@ class RestoreQueueTest {
             val queue = RestoreQueue<Int>()
             for (i in 0 until 100) queue.offer(i, null, 0)
             val many = limit(1000)
-            assertEquals(100, queue.tick(0, null, many) { _, _ -> boom() })
+            // 同じラムダで呼ぶ: clear 以外では、投げた場所が変わらない
+            val sameSite = RestoreQueue.Starter<Int> { _, _ -> boom() }
+            assertEquals(100, queue.tick(0, null, many, sameSite))
             assertEquals(1, log.of(Level.WARNING).size)
             assertEquals(99, log.of(Level.FINE).size)
 
@@ -147,10 +153,16 @@ class RestoreQueueTest {
             assertEquals(2, log.of(Level.WARNING).size)
             assertNotNull(log.of(Level.WARNING)[1].thrown)
 
-            queue.clear()
+            // clear の前は、同じ場所の繰り返しは出ない
             queue.offer(101, null, 0)
-            queue.tick(0, null, many) { _, _ -> boom() }
+            queue.tick(0, null, many, sameSite)
+            assertEquals(2, log.of(Level.WARNING).size)
+
+            queue.clear()
+            queue.offer(102, null, 0)
+            queue.tick(0, null, many, sameSite)
             assertEquals(3, log.of(Level.WARNING).size)
+            assertNotNull(log.of(Level.WARNING)[2].thrown)
         }
     }
 
@@ -159,17 +171,74 @@ class RestoreQueueTest {
         Captured().use { log ->
             val queue = RestoreQueue<Int>()
             for (i in 0 until 64 + 3) queue.offer(i, null, 0)
-            // 場所ごとに別のスタック（スタックトレースを差し替える）
-            queue.tick(0, null, limit(1000)) { i, _ ->
-                val e = IllegalStateException("site $i")
-                e.stackTrace = arrayOf(StackTraceElement("test.Site$i", "run", "Site.kt", i + 1))
-                throw e
-            }
+            queue.tick(0, null, limit(1000), perSiteThrower)
             val warnings = log.of(Level.WARNING)
             assertEquals(65, warnings.size)
             assertTrue(warnings.take(64).all { it.thrown != null })
             assertNull(warnings[64].thrown)
             assertEquals(2, log.of(Level.FINE).size)
+
+            // clear は上限の知らせも戻す: 場所を数え直し、もう一度上限に達したらまたスタックトレースなしの WARNING が1回出る
+            queue.clear()
+            for (i in 0 until 64 + 3) queue.offer(i, null, 0)
+            queue.tick(0, null, limit(1000), perSiteThrower)
+            val again = log.of(Level.WARNING)
+            assertEquals(130, again.size)
+            assertTrue(again.subList(65, 129).all { it.thrown != null })
+            assertNull(again[129].thrown)
+            assertEquals(4, log.of(Level.FINE).size)
+        }
+    }
+
+    /** 台ごとに別のスタック（スタックトレースを差し替える）で投げる */
+    private val perSiteThrower = RestoreQueue.Starter<Int> { i, _ ->
+        val e = IllegalStateException("site $i")
+        e.stackTrace = arrayOf(StackTraceElement("test.Site$i", "run", "Site.kt", i + 1))
+        throw e
+    }
+
+    @Test
+    fun `ログには台の書き方を使い、書き方が投げたらtoStringに戻す`() {
+        Captured().use { log ->
+            val queue = RestoreQueue<Int> { "case#$it" }
+            for (i in 0 until 3) queue.offer(i, null, 0)
+            queue.tick(0, null, limit(1000)) { _, _ -> boom() }
+            val warning = log.of(Level.WARNING).single()
+            assertTrue(warning.message.contains("case#0"), warning.message)
+            val debug = log.of(Level.FINE)
+            assertEquals(2, debug.size)
+            assertTrue(debug[0].message.contains("case#1") && debug[1].message.contains("case#2"))
+        }
+        Captured().use { log ->
+            val queue = RestoreQueue<Int> { throw IllegalStateException("describe") }
+            queue.offer(7, null, 0)
+            assertEquals(1, queue.tick(0, null, limit(1000)) { _, _ -> boom() })
+            val warning = log.of(Level.WARNING).single()
+            assertTrue(warning.message.contains("7"), warning.message)
+        }
+    }
+
+    @Test
+    fun `繰り返しを省いたtickには、投げた台数のWARNINGを1本出す`() {
+        Captured().use { log ->
+            val queue = RestoreQueue<Int>()
+            for (i in 0 until 100) queue.offer(i, null, 0)
+            // 1tick に 40 台ずつ
+            val starter = RestoreQueue.Starter<Int> { _, _ -> boom() }
+            queue.tick(0, null, limit(40), starter)
+            val first = log.summaries().single()
+            assertTrue(first.message.contains("40 台"), first.message)
+            assertTrue(first.message.contains("1 件"), first.message)
+            queue.tick(0, null, limit(40), starter)
+            val all = log.summaries()
+            assertEquals(2, all.size)
+            // 2 回目は場所が済んでいるので、詳しい WARNING は 0 件
+            assertTrue(all[1].message.contains("40 台") && all[1].message.contains("0 件"), all[1].message)
+            // 1 台だけ投げた tick は、詳しい WARNING が全部なので、数の WARNING は出ない
+            queue.clear()
+            queue.offer(1000, null, 0)
+            queue.tick(0, null, limit(40), starter)
+            assertEquals(2, log.summaries().size)
         }
     }
 
@@ -211,9 +280,9 @@ class RestoreQueueTest {
         val queue = RestoreQueue<String>()
         queue.offer("first", null, 0)
         queue.offer("waiting", identity.id, 0)
-        // 書き込みはまだないので、2台とも始める枠に入る
+        // 書き込みはまだないので、2台とも始める枠に入る。投げる tick の時刻は、積んだ時刻（0）と違う値にする
         assertThrows(OutOfMemoryError::class.java) {
-            queue.tick(0, store, config) { t, _ -> if (t == "first") throw OutOfMemoryError("test") }
+            queue.tick(TimeUnit.MILLISECONDS.toNanos(10), store, config) { t, _ -> if (t == "first") throw OutOfMemoryError("test") }
         }
         assertTrue("waiting" in queue)
         // 戻した後に書き込みを溜める: 期限は元の積んだ時刻（0）から数える

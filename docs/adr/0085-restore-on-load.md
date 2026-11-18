@@ -172,6 +172,10 @@
       1回だけ WARNING とスタックトレースにし、同じ場所の繰り返しは DEBUG（スタックトレースなし）。覚える場所は 64 個まで（`MachineScheduler` と同じ値）。
       超えたら、スタックトレースなしの WARNING を1回出し、以後の新しい場所は DEBUG。`clear`（サーバーの開始・停止）で記録を消すので、サーバーの起動ごとに
       最初の WARNING がまた出る。ロガーは `kibicomputers.persist`。ログに出す処理が投げても捨てる（致命的なエラーは投げる）
+    - ログの台の書き方: `RestoreQueue` のコンストラクターに渡す `describe` で書く。接続層（`ServerMachines`）はディメンション・位置・ID
+      （`MachineOwner.toString` と `currentIdentity`）を渡す（`BlockEntity` の `toString` は位置を含まず、どの台が残ったか分からないため）。
+      `describe` が投げたら `toString`、それも投げたらクラス名にする。繰り返しを省いた tick（投げた台数が、詳しい WARNING の数より多い）は、
+      投げた台数と詳しい WARNING の数を書いた WARNING を1本足す（1,000 台が同じ場所で投げたとき、既定のログレベルでも何台が残ったか分かる。台の特定は DEBUG）
 
 ## 比べた案
 

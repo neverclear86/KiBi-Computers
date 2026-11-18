@@ -15,15 +15,17 @@ import java.util.concurrent.TimeUnit
  *
  * 始める処理（[Starter]。接続層）が投げても、ほかの台の開始は続ける（#785。ADR 0044 と同じ考え方）。投げた台は積み直さず、
  * 例外はログに出して捨てる。ログは列全体で、投げた場所ごとに最初の1回だけ WARNING とスタックトレースにし、同じ場所の繰り返しは
- * DEBUG にする（1,000 台が同じ不具合で投げてもログを埋めない）。JVM の致命的なエラー（[isFatal]）は捨てずに投げ、まだ始めていない台は
+ * DEBUG にする（1,000 台が同じ不具合で投げてもログを埋めない）。繰り返しを省いた tick には、投げた台数を数えた WARNING を1本足す
+ * （既定のログレベルでも、何台が残ったか分かる）。どの台かは [describe] で書く（位置・ディメンション・ID）。JVM の致命的なエラー（[isFatal]）は捨てずに投げ、まだ始めていない台は
  * 列に戻して次の tick に回す。
  *
  * スレッド: メインスレッドだけで使う。
  *
  * @param T 積むもの（接続層のブロックエンティティ）
+ * @param describe ログに出す台の書き方（位置・ディメンション・ID など。既定は `toString`）。投げたら `toString` に戻す
  */
 @ApiStatus.Internal
-public class RestoreQueue<T : Any> {
+public class RestoreQueue<T : Any>(private val describe: (T) -> String = { it.toString() }) {
     /** 始める（[tick] から） */
     public fun interface Starter<T> {
         /** [target] の復元を始める。[writesTimedOut] なら、書き込みが期限までに終わらなかった（冷えた起動にする） */
@@ -78,6 +80,7 @@ public class RestoreQueue<T : Any> {
         var started = 0
         val it = entries.entries.iterator()
         val ready = ArrayList<Ready<T>>()
+        val failures = Failures()
         while (it.hasNext() && started < config.restoresPerTick) {
             val (target, entry) = it.next()
             val id = entry.id
@@ -99,43 +102,93 @@ public class RestoreQueue<T : Any> {
                     starter.start(r.target, r.timedOut)
                 } catch (t: Throwable) {
                     if (isFatal(t)) throw t
-                    reportStartFailure(r.target, t)
+                    failures.count++
+                    if (reportStartFailure(r.target, t)) failures.detailed++
                 }
             }
+            reportFailureSummary(failures)
         } catch (t: Throwable) {
             // ここまで来るのは致命的なエラーだけ: まだ始めていない台を次の tick に回す（投げた台は途中まで始めたので戻さない。
             // ループの中で積み直された台は上書きしない）
             for (j in next until ready.size) entries.putIfAbsent(ready[j].target, ready[j].entry)
+            reportFailureSummary(failures)
             throw t
         }
         return started
     }
 
-    /** [starter][Starter] が [target] で投げた [t] をログに出す（投げた場所ごとに最初の1回だけ WARNING。#785） */
-    private fun reportStartFailure(target: T, t: Throwable) {
+    /** 1回の [tick] で、開始が投げた台数と、そのうち台を書いた WARNING を出した数 */
+    private class Failures {
+        var count = 0
+        var detailed = 0
+    }
+
+    /** [target] の書き方（[describe]。投げたら `toString`、それも投げたらクラス名） */
+    private fun nameOf(target: T): String {
         try {
+            return describe(target)
+        } catch (e: Throwable) {
+            if (isFatal(e)) throw e
+        }
+        return try {
+            target.toString()
+        } catch (e: Throwable) {
+            if (isFatal(e)) throw e
+            target.javaClass.name
+        }
+    }
+
+    /**
+     * 繰り返しを省いた分がある tick に、投げた台数の WARNING を1本出す（既定のログレベルでも、何台が残ったか分かるように。#785）。
+     * 台の特定は、場所ごとの最初の WARNING と DEBUG が受け持つ。
+     */
+    private fun reportFailureSummary(failures: Failures) {
+        if (failures.count <= failures.detailed) return
+        try {
+            LOG.log(
+                System.Logger.Level.WARNING,
+                "順番待ちの復元: この tick で ${failures.count} 台の開始が例外を投げた（積み直さない）。" +
+                    "台と例外を書いた WARNING は ${failures.detailed} 件で、残りは同じ場所の繰り返しなので省いた（台は DEBUG に出る）",
+            )
+        } catch (e: Throwable) {
+            if (isFatal(e)) throw e
+        }
+    }
+
+    /**
+     * [starter][Starter] が [target] で投げた [t] をログに出す（投げた場所ごとに最初の1回だけ WARNING。#785）。
+     *
+     * @return 台と例外を書いた WARNING を出したか
+     */
+    private fun reportStartFailure(target: T, t: Throwable): Boolean {
+        try {
+            val name = nameOf(target)
             val site = hostFailureSite(SITE_KIND, t, MachineScheduler.HOST_FAILURE_FRAMES)
             if (site in tracedSites) {
                 if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
-                    LOG.log(System.Logger.Level.DEBUG, "順番待ちの復元の開始がまた例外を投げた（捨てて続ける）: $target: $t")
+                    LOG.log(System.Logger.Level.DEBUG, "順番待ちの復元の開始がまた例外を投げた（捨てて続ける）: $name: $t")
                 }
-                return
+                return false
             }
             if (tracedSites.size < MachineScheduler.HOST_FAILURE_TRACE_LIMIT) {
                 tracedSites += site
-                val message = "順番待ちの復元の開始が例外を投げた（その台は積み直さず、ほかの台は続ける。同じ場所の繰り返しは DEBUG）: $target: $t"
+                val message = "順番待ちの復元の開始が例外を投げた（その台は積み直さず、ほかの台は続ける。同じ場所の繰り返しは DEBUG）: $name: $t"
                 LOG.log(System.Logger.Level.WARNING, message, t)
+                return true
             } else if (!traceLimitReported) {
                 traceLimitReported = true
                 val message = "順番待ちの復元の開始が例外を投げた（その台は積み直さず、ほかの台は続ける。スタックトレースを出した場所の数が" +
-                    "上限に達したので、スタックトレースは省き、以後の新しい場所は DEBUG）: $target: $t"
+                    "上限に達したので、スタックトレースは省き、以後の新しい場所は DEBUG）: $name: $t"
                 LOG.log(System.Logger.Level.WARNING, message)
+                return true
             } else if (LOG.isLoggable(System.Logger.Level.DEBUG)) {
-                LOG.log(System.Logger.Level.DEBUG, "順番待ちの復元の開始が別の場所で例外を投げた（捨てて続ける）: $target: $t")
+                LOG.log(System.Logger.Level.DEBUG, "順番待ちの復元の開始が別の場所で例外を投げた（捨てて続ける）: $name: $t")
             }
+            return false
         } catch (e: Throwable) {
             // ログに出せない（例外の toString が投げたなど）: 捨てる。致命的なエラーは投げる
             if (isFatal(e)) throw e
+            return false
         }
     }
 
