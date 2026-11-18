@@ -23,6 +23,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmModuleShape
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
@@ -32,6 +33,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Driver
+import pro.ikili.kibicomputers.core.wasi.p2.KibiP2WitTool
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
 import java.util.concurrent.Executor
@@ -39,13 +41,33 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * コンポーネント（layer 1）を `exec` で動かす（#687）。読み込みは `ProgramCache` で全マシンが共有し（計画は不変）、
- * `KernelDrivers.DEFAULT` が p2 のコマンドとして `WasiP2Driver`（`BLOCKING`）で動かす
+ * `KernelDrivers.DEFAULT` が p2 のコマンドとして `WasiP2Driver`（変換できれば `WAIT_POINT`、できなければ `BLOCKING`。#757）で動かす
  */
 class ComponentExecTest {
     private val limit = Duration.ofSeconds(120)
 
     /** wasmtime のアダプターで包んだ hello-wasi（p2 のコマンド） */
     private val hello: ByteArray by lazy { P2Testing.wrap("hello-wasi") }
+
+    /**
+     * 巻き戻せない待ちのホストの関数（`kibi:process` の `spawn`）を import するので、待機点に変換されず `BLOCKING` で動く p2 のコマンド
+     * （#757）。`spawn` は呼ばずに、すぐ ok で終わる
+     */
+    private val blockingCommand: ByteArray by lazy {
+        KibiP2WitTool.component(
+            """
+            import kibi:process/process@0.1.0;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            """
+            (module
+              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (memory (export "memory") 1)
+              (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32) (i32.const 0)))
+            """.trimIndent(),
+        )
+    }
 
     private fun write(m: Machine, path: String, bytes: ByteArray) {
         val f = m.vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
@@ -161,7 +183,7 @@ class ComponentExecTest {
     fun `1台のブロッキング型の上限に達していたらコンポーネントの子のspawnはNFILEで、ほかの台は動く`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val full = machine(h, maxBlockingProcesses = 0)
-            write(full, "/bin/kp", hello)
+            write(full, "/bin/kp", blockingCommand)
             val out = runParent(h, full, "run")
             assertTrue("spawn ${-Errno.NFILE.code}\n" in out, out)
             // サーバー全体の枠は使っていないので、同じスケジューラーの別の台では動く
@@ -238,6 +260,9 @@ class ComponentExecTest {
             sizes += bytes.size
             return inner.load(bytes)
         }
+
+        // 計画のための形の読み取り（#757）はコンパイルしないので数えない
+        override fun describe(bytes: ByteArray): WasmModuleShape = inner.describe(bytes)
     }
 
     /** [dataBytes] バイトのデータを持つ core モジュールを、[count] 回（同じ中身で）定義して、インスタンス化するコンポーネントの WAT */
@@ -350,11 +375,17 @@ class ComponentExecTest {
         val config = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(0).build()
         Harness(schedulerConfig = config, execRuntime = EndiveRuntime()).use { h ->
             val m = machine(h)
-            write(m, "/bin/kp", hello)
+            write(m, "/bin/kp", blockingCommand)
             // 親は待機点型なので数に入らない。子のコンポーネントは BLOCKING なので上限で断られる
             val out = runParent(h, m, "run")
             assertTrue("spawn ${-Errno.NFILE.code}\n" in out, out)
-            assertEquals(ProcessKind.BLOCKING, KernelDrivers.DEFAULT.create(Program.component(P2Testing.load(hello))).kind)
+            assertEquals(ProcessKind.BLOCKING, KernelDrivers.DEFAULT.create(Program.component(ComponentProgram.load(EndiveRuntime(), blockingCommand, KernelDrivers.COMPONENT_HOST))).kind)
+            // 待機点に変換できるもの（hello）は WAIT_POINT なので、上限に関係なく動く（#757）
+            assertEquals(ProcessKind.WAIT_POINT, KernelDrivers.DEFAULT.create(Program.component(P2Testing.load(hello))).kind)
+            write(m, "/bin/kp", hello)
+            val ok = runParent(h, m, "run")
+            assertTrue("Hello from WASI\n" in ok, ok)
+            assertTrue("status1 exited 0\n" in ok, ok)
         }
     }
 }

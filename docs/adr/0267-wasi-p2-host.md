@@ -23,7 +23,7 @@
 | `WasiP2Wit` | ホストの型の一次情報。WASI 0.2.12 の WIT を文字列で持つ（下記） |
 | `WitReader` | 上の WIT を `CanonType`・`CanonFunction` に読む小さな読み手（この WIT が使う構文だけ） |
 | `WasiP2Host` | `ComponentHost` の実物。WIT の関数ごとに本体（`WasiP2Io`・`WasiP2Cli`・`WasiP2Fs`・`WasiP2Sockets`）を付け、過不足をビルド時（初回の参照）に確かめる |
-| `WasiP2Driver` | p2 のコマンドを動かす ABI 層のドライバー（`BLOCKING`）。export の `wasi:cli/run#run` を呼ぶ |
+| `WasiP2Driver` | p2 のコマンドを動かす ABI 層のドライバー（待機点に変換できれば `WAIT_POINT`、できなければ `BLOCKING`。#757・ADR 0757）。export の `wasi:cli/run#run` を呼ぶ |
 | `HostResourceTable` | プロセスごとのホストの resource の表（rep → 中身）。fd の表とは別 |
 
 ### ホストの型は WIT から作る
@@ -108,7 +108,7 @@ descriptor の `mutate-directory` は `get-flags` で返すだけでなく、確
 
 ## 制約と残り
 
-- `WasiP2Driver` は `BLOCKING` で、待っている間は OS のスレッドを 1 本持つ。p1 の待機点の方式（ADR 0316・0329）はコンポーネントにまだない。1,000 台がプロンプトで待つ形には向かないので、スレッドを持たない待ち方は #757 で扱う。
+- `WasiP2Driver` は、コンポーネントを待機点に変換できれば `WAIT_POINT` で動き、待っている間スレッドを持たない（#757。ADR 0757）。巻き戻せない待ちのホストの関数（`kibi:device` の `invoke`、`kibi:process` の `spawn`）を import するものは `BLOCKING` のまま。
 - 仮の値（`CALL_FUEL`・`HostResourceTable.LIMIT`・`MAX_READ`・`FILE_WRITE_ALLOWANCE`・`MAX_RANDOM_BYTES`）の確定は #251。
 - `symlink-at`・`link-at` は `unsupported`、`readlink-at` は `invalid`（VFS にリンクがない）。
 - `wasi:clocks/timezone` は出さない（`@unstable`）。

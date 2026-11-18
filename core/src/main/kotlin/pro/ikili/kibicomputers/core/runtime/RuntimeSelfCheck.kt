@@ -163,7 +163,8 @@ public object RuntimeSelfCheck {
         val program = Program.loadExecutable(EndiveRuntime(), RUN_COMMAND_COMPONENT, ModuleLimits.DEFAULT, true, emptySet(), KernelDrivers.COMPONENT_HOST)
         val driver = KernelDrivers.DEFAULT.create(program)
         val component = program.component ?: return false
-        if (driver.kind != ProcessKind.BLOCKING) return false
+        // import のない最小のコマンドは待機点に変換でき、待機点型で動く（#757）
+        if (!component.waitPoints || driver.kind != ProcessKind.WAIT_POINT) return false
         // import のないコンポーネントではホストを引かないので、ここで組み立てる（WIT の読み取りと実装の照合）
         if (WasiP2Host.interfaceOf("wasi:cli/stdout@0.2.0") == null) return false
         val run = WasiP2Driver.runOf(component.plan)

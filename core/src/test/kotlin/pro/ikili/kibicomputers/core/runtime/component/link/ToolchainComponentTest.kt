@@ -56,7 +56,7 @@ class ToolchainComponentTest {
                 CanonValue.Handle(nextRep++)
             }
             val declared = if (name.startsWith("wasi:cli/exit@")) {
-                mapOf("exit" to HostFunction(LinkTesting.fn(listOf(CanonType.Result(null, null)), null), stop))
+                mapOf("exit" to HostFunction(LinkTesting.fn(listOf(CanonType.Result(null, null)), null), body = stop))
             } else {
                 emptyMap()
             }

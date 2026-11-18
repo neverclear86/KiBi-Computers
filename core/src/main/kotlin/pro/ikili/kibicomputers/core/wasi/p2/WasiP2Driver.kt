@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
+import pro.ikili.kibicomputers.core.kernel.process.ComponentSuspend
+import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -11,11 +13,17 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentPlan
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.ExportItem
 import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
 
 /**
- * p2 のコマンド（`wasi:cli/run` を export するコンポーネント）のドライバー（#267。ADR 0267）。`BLOCKING` で動き、`run` を 1 回呼ぶ。
+ * p2 のコマンド（`wasi:cli/run` を export するコンポーネント）のドライバー（#267。ADR 0267）。`run` を呼ぶ。
+ *
+ * 待機点への変換をかけたコンポーネント（[ComponentProgram.waitPoints]。#757、ADR 0757）は `WAIT_POINT` で動く: 待ちうるホストの関数が
+ * 巻き戻すと `run` から戻るので、待つ key を `StepResult.Wait` にする。再開（[resume]）は巻き直して `run` を呼び直す。
+ * かけられなかったものは今までどおり `BLOCKING` で、`run` を 1 回呼ぶ（待つ間はスレッドを持つ）。
+ *
  *
  * - 呼ぶ export は、import と同じ規則（[WasiP2Versions]）に合う `wasi:cli/run@0.2.<n>` のどれか 1 つ（2 つ以上あれば断る）。
  *   中の `run` は `func() -> result` であること
@@ -23,33 +31,44 @@ import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
  *   `exit-with-code(n)` → n
  * - `Machine.exec` でコンポーネントを動かすときは、`KernelDrivers.DEFAULT` がこれを選ぶ（#687）
  */
-internal class WasiP2Driver private constructor(private val run: FuncRef) : ProcessDriver {
-    override val kind: ProcessKind get() = ProcessKind.BLOCKING
+internal class WasiP2Driver private constructor(private val run: FuncRef, waitPoints: Boolean) : ProcessDriver {
+    override val kind: ProcessKind = if (waitPoints) ProcessKind.WAIT_POINT else ProcessKind.BLOCKING
 
     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
         // コンポーネントのプロセスでは呼ばれない（ホストの関数はリンクの計画が持つ）
     }
 
     override fun start(ctx: ProcessContext): StepResult {
-        // `initial-cwd` は起動したときの cwd
+        // `initial-cwd` は起動したときの cwd（最初の start だけで決める）
         WasiP2Cli.initialCwd(ctx)
-        return try {
-            val r = ctx.component.call(run, emptyList()) as CanonValue.Case
-            StepResult.Exit(if (r.index == 0) 0 else 1)
-        } catch (e: WasiP2Exit) {
-            StepResult.Exit(e.code)
-        }
+        return run(ctx)
     }
 
-    override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult =
-        throw IllegalStateException("BLOCKING のドライバーは resume しない")
+    override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
+        check(kind == ProcessKind.WAIT_POINT) { "BLOCKING のドライバーは resume しない" }
+        ctx.component.beginRewind()
+        return run(ctx)
+    }
+
+    private fun run(ctx: ProcessContext): StepResult {
+        val component = ctx.component
+        val r = try {
+            component.call(run, emptyList())
+        } catch (e: WasiP2Exit) {
+            return StepResult.Exit(e.code)
+        }
+        if (component.unwound) return StepResult.Wait(suspend(ctx).takePendingKeys())
+        return StepResult.Exit(if ((r as CanonValue.Case).index == 0) 0 else 1)
+    }
+
+    private fun suspend(ctx: ProcessContext): ComponentSuspend = (ctx.component.env as KernelLinkEnv).suspend
 
     companion object {
         /**
-         * [plan] のコマンドのドライバー。`wasi:cli/run@0.2.<n>` の `run`（`func() -> result`）がなければ、
+         * [program] のコマンドのドライバー（待機点への変換をかけたものは `WAIT_POINT`）。`wasi:cli/run@0.2.<n>` の `run`（`func() -> result`）がなければ、
          * または規則に合う export が 2 つ以上あれば `NOEXEC`
          */
-        fun create(plan: ComponentPlan): WasiP2Driver = WasiP2Driver(runOf(plan))
+        fun create(program: ComponentProgram): WasiP2Driver = WasiP2Driver(runOf(program.plan), program.waitPoints)
 
         /** [plan] の `run`（[create] の規則）。合わなければ `NOEXEC` の `FsException` */
         fun runOf(plan: ComponentPlan): FuncRef {

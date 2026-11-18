@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.component.link
 
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmExternKind
 import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -46,6 +48,12 @@ internal interface LinkEnv {
     /** lift・lower で写した量の費用 [amount] を燃料から引く */
     fun chargeFuel(amount: Long) {}
 
+    /**
+     * 巻き直し（[LinkedComponent.beginRewind]）が、巻き戻したホストの関数の呼び出しに着いた（#757）。状態はもう `NORMAL` に戻してある。
+     * そのホストの関数を呼ぶ直前に呼ぶ
+     */
+    fun onRewound() {}
+
     companion object {
         /** 何もしない場所 */
         val NONE: LinkEnv = object : LinkEnv {}
@@ -54,7 +62,15 @@ internal interface LinkEnv {
 
 /**
  * インスタンス化したコンポーネント（#263。ADR 0263）。[ComponentPlan] のとおりに core インスタンスを作り、canon の lift・lower で
- * つなぐ。1 つのプロセス（スレッド 1 本）からだけ使う（スレッドをまたいで共有しない）。
+ * つなぐ。1 つのプロセスからだけ、同時に 1 本のスレッドで使う。待機点型（#757）では step ごとに別のワーカーのスレッドで動くが、
+ * step の受け渡しはカーネルロックを通る（前の step の書き込みが次の step から見える）ので、中の変数はただの変数のままでよい。
+ *
+ * 待機点（#757。ADR 0757）: 中の core モジュールすべてに待機点への変換をかけた計画（[asyncified]）では、ホストの関数が [requestUnwind] で
+ * 巻き戻せる。core インスタンスの状態のグローバルはインスタンスごとにあるので、巻き戻し・巻き直し・着いたときに全インスタンスをそろえて
+ * 書き換え、退避した値は全インスタンスで 1 つのスタック（[instantiate] の `asyncStack`）に積む（内側から積み、外側から取り出すので、
+ * モジュールをまたいでも順番が合う）。巻き戻すと、ホストの関数の結果は lower せず（ダミーの 0 を返す）、外からの [call] は結果を
+ * lift せず post-return も呼ばずに `null` で戻る（[unwound]）。再開は [beginRewind] の後に同じ関数を [call] で呼び直す。
+ * 巻き戻せるのは、外からの [call] の 1 段の下で、ホストの関数を core から直接呼んだときだけ（[canUnwind]）。
  *
  * Canonical ABI の約束（仕様の `definitions.py`）のうち、同期の呼び出しに要るものを守る:
  * - 呼ぶ側のコンポーネントのインスタンスの `may_leave` が下りている（realloc・post-return の中）ときの lower の呼び出しはトラップ
@@ -79,7 +95,7 @@ internal interface LinkEnv {
  */
 internal class LinkedComponent private constructor(
     val plan: ComponentPlan,
-    private val env: LinkEnv,
+    val env: LinkEnv,
 ) : AutoCloseable {
     private val instances = ArrayList<WasmInstance>(plan.steps.size)
     private val mayLeave = BooleanArray(plan.componentInstances) { true }
@@ -130,20 +146,60 @@ internal class LinkedComponent private constructor(
     /** 作った core インスタンス（作った順） */
     val coreInstances: List<WasmInstance> get() = instances
 
+    // ---- 待機点（#757） ----
+
+    /** 中の core モジュールすべてに待機点への変換をかけたか */
+    val asyncified: Boolean = plan.modules.isNotEmpty() && plan.modules.all { it.isAsyncified }
+
+    init {
+        check(asyncified || plan.modules.none { it.isAsyncified }) { "待機点への変換をかけたモジュールとかけていないモジュールが混ざっている" }
+    }
+
+    /** ホストの関数が巻き戻しを求めてから、外からの [call] が戻るまで */
+    private var unwinding = false
+
+    /** [beginRewind] から、巻き戻したホストの関数の呼び出しに着くまで */
+    private var rewinding = false
+
+    /** 外からの [call] が巻き戻して戻った（次の [call] か [beginRewind] で下ろす） */
+    var unwound: Boolean = false
+        private set
+
+    /** lift した関数の呼び出しの入れ子の深さ（外からの [call] が 1。ゲストからゲストへの呼び出しで増える） */
+    private var liftDepth = 0
+
+    /** 退避した値の置き場所を渡されなかったときに使う、この中だけのスタック（カーネルの外。テストなど） */
+    private class LocalStack : WasmAsyncStack {
+        private val values = ArrayList<Long>()
+
+        override fun push(value: Long) {
+            values += value
+        }
+
+        override fun pop(): Long = values.removeAt(values.size - 1)
+    }
+
     companion object {
         /**
          * [plan] をインスタンス化する。core モジュールが燃料を共有する（[pro.ikili.kibicomputers.core.runtime.WasmModule.sharesFuel]）なら
-         * [sharedFuel] が要る。core のモジュールの start 関数はここで動く（その中からホストの関数が呼ばれうる）
+         * [sharedFuel] が要る。待機点への変換をかけた計画（[asyncified]）なら、全インスタンスが退避した値を [asyncStack] に積む
+         * （`null` なら、この中だけのスタックを使う。#757）。core のモジュールの start 関数はここで動く（その中からホストの関数が呼ばれうる）
          *
          * @throws WasmLinkException core インスタンスを作れない（上限・型の違いなど）
          * @throws WasmTrapException start 関数がトラップした
          */
         @Throws(WasmLinkException::class, WasmTrapException::class)
-        fun instantiate(plan: ComponentPlan, env: LinkEnv = LinkEnv.NONE, sharedFuel: WasmSharedFuel? = null): LinkedComponent {
+        fun instantiate(
+            plan: ComponentPlan,
+            env: LinkEnv = LinkEnv.NONE,
+            sharedFuel: WasmSharedFuel? = null,
+            asyncStack: WasmAsyncStack? = null,
+        ): LinkedComponent {
             val c = LinkedComponent(plan, env)
+            val stack = if (c.asyncified) asyncStack ?: LocalStack() else null
             c.entered = true
             try {
-                for (step in plan.steps) c.instantiateStep(step, sharedFuel)
+                for (step in plan.steps) c.instantiateStep(step, sharedFuel, stack)
             } catch (t: Throwable) {
                 c.close()
                 throw t
@@ -156,17 +212,19 @@ internal class LinkedComponent private constructor(
         private val EMPTY = LongArray(0)
     }
 
-    private fun instantiateStep(step: CoreStep, sharedFuel: WasmSharedFuel?) {
+    private fun instantiateStep(step: CoreStep, sharedFuel: WasmSharedFuel?, asyncStack: WasmAsyncStack?) {
         val module = plan.modules[step.module]
         val builder = WasmInstanceConfig.builder()
         env.configure(builder)
         if (module.sharesFuel) builder.sharedFuel(requireNotNull(sharedFuel) { "燃料を共有するモジュールに、共有の残りを渡していない" })
+        if (module.isAsyncified) builder.asyncStack(asyncStack)
         for ((imp, ref) in step.imports) {
             when (ref) {
                 is CoreRef.Export -> builder.importExtern(imp.module, imp.name, extern(ref))
                 is CoreRef.Lowered -> {
                     val spec = plan.lowers[ref.lower]
-                    builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { _, args -> callLowered(spec, args) })
+                    val results = ref.functionType.results.size
+                    builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { _, args -> callLowered(spec, args, results) })
                 }
                 is CoreRef.ResourceOp ->
                     builder.hostFunction(imp.module, imp.name, ref.functionType, env.wrapHost { _, args -> guarded { resourceOp(ref, args) } })
@@ -215,6 +273,10 @@ internal class LinkedComponent private constructor(
     @Throws(WasmTrapException::class)
     fun call(func: FuncRef, args: List<CanonValue>): CanonValue? {
         check(!entered) { "ホストの関数の中（またはインスタンス化の途中）から LinkedComponent.call を呼んだ" }
+        check(!unwinding) { "巻き戻しの途中で call を呼んだ（内部の誤り）" }
+        // 巻き直しでは、引数を callee の線形メモリへ lower しない（realloc を巻き直しの途中で動かさない）
+        if (rewinding) require(func.function.params.isEmpty()) { "巻き直しで呼べるのは引数のない関数だけ" }
+        unwound = false
         for (r in func.function.paramResources) {
             val info = plan.resource(r)
             require(info.impl !is ResourceImpl.Guest) { "ゲストが実装した resource（${info.canonical}）の own・borrow をホストから渡した" }
@@ -226,18 +288,63 @@ internal class LinkedComponent private constructor(
                 // ホストが渡したリストはホストのもの（参照を切るだけで、中身は消さない）
                 val r = callFunc(func, LiftedArgs(args, heldBytes, heldValues), budget) { it }
                 env.chargeFuel(cost(budget))
-                r
+                if (unwinding) {
+                    // 巻き戻して戻った: 状態をそろえて NORMAL に戻す（待っている間は常に NORMAL）
+                    unwinding = false
+                    setAsyncState(WasmAsyncState.NORMAL)
+                    unwound = true
+                    null
+                } else {
+                    check(!rewinding) { "巻き直しが止まった呼び出しに着かずに戻った" }
+                    r
+                }
             }
         } finally {
             entered = false
         }
     }
 
+    /**
+     * 今のホストの関数の呼び出しで巻き戻せるか（#757）: 変換した計画で、外からの [call] の 1 段の下で、core から直接呼ばれた
+     * ホストの関数の中（ゲストからゲストへの呼び出しの下でない。インスタンス化の途中でない。realloc・post-return の中でない）
+     */
+    fun canUnwind(): Boolean = asyncified && !unwinding && !rewinding && liftDepth == 1 && mayLeave.all { it }
+
+    /**
+     * 巻き戻しを求める（#757。ホストの関数の中から）。ホストの関数はそのまま戻り（戻り値は捨てる）、core のコードが退避しながら
+     * 外からの [call] まで戻る
+     */
+    fun requestUnwind() {
+        check(canUnwind()) { "巻き戻せないところで巻き戻しを求めた" }
+        unwinding = true
+        setAsyncState(WasmAsyncState.UNWINDING)
+    }
+
+    /** 巻き直しを始める（#757）。この後に、巻き戻した外からの呼び出しと同じ関数を [call] で呼び直す */
+    fun beginRewind() {
+        check(asyncified && !unwinding && !rewinding && !entered) { "巻き直しを始められない" }
+        check(unwound) { "巻き戻していないのに巻き直した" }
+        unwound = false
+        rewinding = true
+        setAsyncState(WasmAsyncState.REWINDING)
+    }
+
+    private fun setAsyncState(state: WasmAsyncState) {
+        for (i in instances) i.asyncState = state
+    }
+
     // ---- 呼び出しの中身 ----
 
     /** ゲストの core が canon lower した import を呼んだ */
-    private fun callLowered(spec: LowerSpec, args: LongArray): LongArray = guarded {
+    private fun callLowered(spec: LowerSpec, args: LongArray, coreResults: Int): LongArray = guarded {
         if (!mayLeave[spec.instance]) CanonTraps.trap("realloc・post-return の中から import を呼んだ（may_leave）")
+        if (rewinding) {
+            // 巻き直しで、巻き戻したホストの関数の呼び出しに着いた（変換したコードは、止まった呼び出しのほかは呼ばない。#757）
+            check(spec.callee is FuncRef.Host) { "巻き直しがホストの関数でない呼び出しに着いた" }
+            rewinding = false
+            setAsyncState(WasmAsyncState.NORMAL)
+            env.onRewound()
+        }
         // 外側の段がまだ持っている分を、この段の予算から引く（#753。深くしても、同時に持つ量が 1 回の予算を超えない）
         val outerBytes = heldBytes
         val outerValues = heldValues
@@ -247,7 +354,10 @@ internal class LinkedComponent private constructor(
         val lenders = lenderTop
         val out = try {
             // lift した値は名前のある変数に置かない（callee が動いている間、このフレームから参照を残さない。#753）
-            callFunc(spec.callee, liftArgs(spec, cx, args, outerBytes, outerValues), budget) { spec.function.lowerResult(cx, it, args) }
+            callFunc(spec.callee, liftArgs(spec, cx, args, outerBytes, outerValues), budget) {
+                // 巻き戻すなら、結果を lower しない（retptr に書かず、realloc も呼ばない）。core の関数の型どおりの数の 0 を返す（捨てられる）
+                if (unwinding) LongArray(coreResults) else spec.function.lowerResult(cx, it, args)
+            }
         } finally {
             if (lenderTop != lenders) returnLenders(lenders)
             heldBytes = outerBytes
@@ -290,20 +400,28 @@ internal class LinkedComponent private constructor(
             if (task) pushTask()
             val results: LongArray
             val value: CanonValue?
+            liftDepth++
             try {
                 val coreArgs = spec.function.lowerParams(cx, args.take())
                 // callee の線形メモリへ写し終えた: この段はもう値を持たない（#753）
                 heldBytes = args.outerBytes
                 heldValues = args.outerValues
                 results = callCore(spec.core, coreArgs)
-                value = spec.function.liftResult(cx, results)
-                // Task.return_: 受けた borrow をすべて drop してから返る。呼ぶ側への lower（呼ぶ側の realloc が動く）より前に確かめる
-                if (task && taskBorrows[taskDepth - 1] > 0) CanonTraps.trap("borrow のハンドルを drop せずに返った")
+                if (unwinding) {
+                    // 巻き戻して戻った（#757。巻き戻せるのは外からの call の 1 段だけ）: 結果を lift せず、post-return も呼ばない
+                    check(liftDepth == 1) { "ゲストからゲストへの呼び出しの下で巻き戻した（内部の誤り）" }
+                    value = null
+                } else {
+                    value = spec.function.liftResult(cx, results)
+                    // Task.return_: 受けた borrow をすべて drop してから返る。呼ぶ側への lower（呼ぶ側の realloc が動く）より前に確かめる
+                    if (task && taskBorrows[taskDepth - 1] > 0) CanonTraps.trap("borrow のハンドルを drop せずに返った")
+                }
             } finally {
+                liftDepth--
                 if (task) taskDepth--
             }
             val r = onResult(value)
-            spec.options.postReturn?.let { pr -> withoutLeave(spec.instance) { callCore(pr, results) } }
+            if (!unwinding) spec.options.postReturn?.let { pr -> withoutLeave(spec.instance) { callCore(pr, results) } }
             r
         }
     }
@@ -311,7 +429,7 @@ internal class LinkedComponent private constructor(
     /** core の関数 [ref] を呼ぶ */
     private fun callCore(ref: CoreRef, args: LongArray): LongArray = when (ref) {
         is CoreRef.Export -> instanceOf(ref).call(ref.name, *args)
-        is CoreRef.Lowered -> callLowered(plan.lowers[ref.lower], args)
+        is CoreRef.Lowered -> callLowered(plan.lowers[ref.lower], args, ref.functionType.results.size)
         is CoreRef.ResourceOp -> resourceOp(ref, args)
     }
 

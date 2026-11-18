@@ -789,8 +789,20 @@ internal class ProcessRunner(private val machine: Machine) {
 
             override fun chargeFuel(amount: Long) = ctx.chargeFuel(amount)
         }
+        // 待機点への変換をかけたもの（#757）: 全 core インスタンスが退避した値を、プロセスの 1 つのスタック（Process.asyncStack）に積む
+        val asyncStack = if (program.waitPoints) {
+            val stack = AsyncStack()
+            lock.withLockValue { rt.process.asyncStack = stack }
+            object : WasmAsyncStack {
+                override fun push(value: Long) = stack.push(value)
+
+                override fun pop(): Long = stack.pop()
+            }
+        } else {
+            null
+        }
         val linked = try {
-            LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null)
+            LinkedComponent.instantiate(program.plan, env, if (metered) WasmSharedFuel(grant) else null, asyncStack)
         } catch (t: Throwable) {
             // 失敗した core インスタンスを作る間に RAM の上限で断られたなら、その後に異常終了したときにメモリ不足と書く（#48）
             if (t is WasmLinkException && rt.memory.refusalCount != refusalsBefore) rt.instantiateRefusedMemory = true

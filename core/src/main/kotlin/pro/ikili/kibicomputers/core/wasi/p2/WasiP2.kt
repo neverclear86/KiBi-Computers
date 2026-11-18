@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.wasi.p2
 import pro.ikili.kibicomputers.core.kernel.ProcessKilledException
 import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
 import pro.ikili.kibicomputers.core.kernel.process.HostResourceTable
+import pro.ikili.kibicomputers.core.kernel.process.ComponentSuspend
 import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
@@ -92,7 +93,10 @@ internal object WasiP2Host : ComponentHost {
             val missing = w.functions.keys - impl.keys
             val extra = impl.keys - w.functions.keys
             check(missing.isEmpty() && extra.isEmpty()) { "$key の実装が WIT と合わない（ない: $missing、余り: $extra）" }
-            val functions = w.functions.mapValues { (n, type) -> HostFunction(type, P2.guard(impl.getValue(n))) }
+            val functions = w.functions.mapValues { (n, type) ->
+                val body = impl.getValue(n)
+                HostFunction(type, WasiP2Io.waitOf(body), P2.guard(body))
+            }
             out[key] = HostInterface("$key@${WasiP2Wit.BASE_VERSION}", functions, w.resources.mapValues { resources.getValue(it.value) })
         }
         check(bodies.isEmpty()) { "WIT にないインターフェースの実装: ${bodies.keys}" }
@@ -123,6 +127,9 @@ internal object P2 {
 
     /** [call] のプロセスの口（カーネルの外で動かしたコンポーネントからは呼べない） */
     fun ctx(call: ComponentCall): ProcessContext = (call.env as? KernelLinkEnv)?.ctx ?: trap("wasi:* はカーネルの中でだけ呼べる")
+
+    /** [call] のプロセスの、待ちうるホストの関数の入口と出口（#757） */
+    fun suspend(call: ComponentCall): ComponentSuspend = (call.env as? KernelLinkEnv)?.suspend ?: trap("wasi:* はカーネルの中でだけ呼べる")
 
     /** 呼び出しごとの燃料と、ホストの限界（[ResourceLimitException]）のトラップへの書き換え */
     fun guard(body: HostFunctionBody): HostFunctionBody = HostFunctionBody { call, args ->
