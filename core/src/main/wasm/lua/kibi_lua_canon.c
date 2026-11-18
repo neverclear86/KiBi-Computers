@@ -21,7 +21,7 @@
 /* 足りないときに返す場所（線形メモリの外。align 8 に揃えてあるので、ホストは範囲外としてトラップする。canon.zig と同じ値） */
 #define KIBI_LUA_OUT_OF_MEMORY ((void *)(uintptr_t)0xFFFFFFF8u)
 
-/* 確保ごとの頭（前の確保へのつなぎ）。結果の揃えは 8 まで（Canonical ABI の最大）。malloc は 8 に揃えて返すので、頭も 8 の倍数にする */
+/* 確保ごとの頭（前の確保へのつなぎ）。結果の揃えは 8 まで（Canonical ABI の最大）。malloc は 16 に揃えて返す（kibi_brk.h）ので、頭を 8 の倍数にすれば揃う */
 #define KIBI_LUA_ARENA_HEAD 8
 #define KIBI_LUA_MAX_ALIGN 8
 
@@ -91,7 +91,7 @@ int kibi_lua_arena_held(void) {
 }
 
 /*
- * kibi_lua_realloc が残す分（KIBI_LUA_KEEP）と、確保ごとの頭・dlmalloc のチャンクの頭の分（8 KiB）に、
+ * kibi_lua_realloc が残す分（KIBI_LUA_KEEP）と、確保ごとの頭・malloc の頭の分（8 KiB）に、
  * 残りが KEEP + STACK_GUARD を切ったときに kibi_lua_realloc が先に数える C のスタックの分（KIBI_LUA_STACK_GUARD）を足す（#729）。
  * 速い道を通った後の cabi_realloc の確保の途中で残りがその線を切ると、初めての count_stack がここで走り、
  * その後の commit（keep KIBI_LUA_KEEP）が断られて OUT_OF_MEMORY → トラップになるため、確保の間は残りがその線を切らないようにする
