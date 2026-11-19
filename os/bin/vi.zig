@@ -1011,13 +1011,21 @@ fn applyUndo() bool {
         st.setError("Already at oldest change");
         return false;
     }
-    // 戻すのに入れる分を、先に取る（途中まで戻して止まらないように）
+    // 戻すのに要る分を、先に取る（途中まで戻して止まらないように）。消した分を入れ、入れた分を取り除く順に足し引きして、途中でいちばん増えたところまで
     var need: usize = 0;
+    var grown: isize = 0;
     var off = undo.undo_end;
     while (off > 0) {
         const r = undo.recordBefore(off);
         if (r.kind == .group) break;
-        if (r.kind == .delete) need += r.data.len;
+        switch (r.kind) {
+            .delete => {
+                grown += @intCast(r.data.len);
+                if (grown > 0) need = @max(need, @as(usize, @intCast(grown)));
+            },
+            .insert => grown -= @intCast(r.data.len),
+            .group => {},
+        }
         off = r.start;
     }
     buffer.reserve(need) catch |e| {
@@ -1051,12 +1059,21 @@ fn applyRedo() bool {
         return false;
     }
     const g = undo.recordAt(undo.undo_end);
+    // 順に入れ・取り除いて、途中でいちばん増えたところまで要る（[applyUndo] と同じ）
     var need: usize = 0;
+    var grown: isize = 0;
     var off = g.end;
     while (off < undo.log_end) {
         const r = undo.recordAt(off);
         if (r.kind == .group) break;
-        if (r.kind == .insert) need += r.data.len;
+        switch (r.kind) {
+            .insert => {
+                grown += @intCast(r.data.len);
+                if (grown > 0) need = @max(need, @as(usize, @intCast(grown)));
+            },
+            .delete => grown -= @intCast(r.data.len),
+            .group => {},
+        }
         off = r.end;
     }
     buffer.reserve(need) catch |e| {
@@ -1181,7 +1198,8 @@ const Found = struct { pos: usize, wrapped: bool };
 fn findForward(p: usize) ?Found {
     const lines = buffer.lineCount();
     var ls = buffer.lineStart(p);
-    var from = p - ls + 1;
+    // 今の文字の次の文字から探す
+    var from = @max(view.nextGlyph(ls, p), p + 1) - ls;
     var k: usize = 0;
     var wrapped = false;
     while (k <= lines) : (k += 1) {
@@ -1217,8 +1235,8 @@ fn findBackward(p: usize) ?Found {
         while (re.find(l, from)) |m| {
             if (limit) |lim| if (m.start >= lim) break;
             last = m.start;
-            from = m.start + 1;
-            if (from > l.len) break;
+            if (ls + m.start >= le) break;
+            from = view.nextGlyph(ls, ls + m.start) - ls;
         }
         if (last) |s| return .{ .pos = glyphStart(ls + s), .wrapped = wrapped };
         if (buffer.prevLine(ls)) |pl| {
@@ -1646,6 +1664,7 @@ fn substitute(range: Range, spec: []const u8) void {
     if (!compileSearch()) return;
 
     var subs: usize = 0;
+    var aborted = false;
     var lines_changed: usize = 0;
     var ls = lineStartOf(range.first);
     var line_no = range.first;
@@ -1654,8 +1673,17 @@ fn substitute(range: Range, spec: []const u8) void {
         var le = buffer.lineEnd(ls);
         var from: usize = 0;
         var changed = false;
+        // 直前の一致（空でないもの）の終わり。そこにつながる空の一致は置き換えない（vim・sed と同じ）
+        var prev_end: ?usize = null;
         while (from <= le - ls) {
             const m = re.find(buffer.line(ls, le), from) orelse break;
+            const empty = m.end == m.start;
+            if (empty and prev_end != null and prev_end.? == m.start) {
+                if (ls + m.start >= le) break;
+                from = view.nextGlyph(ls, ls + m.start) - ls;
+                prev_end = null;
+                continue;
+            }
             const ma = ls + m.start;
             const mb = ls + m.end;
             // 置き換えを作る
@@ -1669,28 +1697,41 @@ fn substitute(range: Range, spec: []const u8) void {
                     if (c == 'r' or c == 'n') c = '\n';
                 } else if (c == '&') {
                     const ml = mb - ma;
-                    if (rl + ml > rep_buf.len) break;
+                    if (rl + ml > rep_buf.len) {
+                        st.setError("Replacement is too long");
+                        aborted = true;
+                        break :outer;
+                    }
                     _ = buffer.copy(ma, rep_buf[rl..][0..ml]);
                     rl += ml;
                     continue;
                 }
-                if (rl >= rep_buf.len) break;
+                if (rl >= rep_buf.len) {
+                    st.setError("Replacement is too long");
+                    aborted = true;
+                    break :outer;
+                }
                 rep_buf[rl] = c;
                 rl += 1;
             }
             if (rl > mb - ma) {
                 buffer.reserve(rl - (mb - ma)) catch |e| {
                     reportFull(e);
+                    aborted = true;
                     break :outer;
                 };
             }
             edRemove(ma, mb);
-            if (!edInsert(ma, rep_buf[0..rl])) break :outer;
+            if (!edInsert(ma, rep_buf[0..rl])) {
+                aborted = true;
+                break :outer;
+            }
             le = le - (mb - ma) + rl;
             subs += 1;
             changed = true;
             from = m.start + rl;
-            if (m.end == m.start) {
+            prev_end = if (empty) null else from;
+            if (empty) {
                 // 空の一致: 1 文字進める
                 if (ls + from >= le) break;
                 from = view.nextGlyph(ls, ls + from) - ls;
@@ -1710,6 +1751,8 @@ fn substitute(range: Range, spec: []const u8) void {
         return;
     }
     setCursor(firstNonBlank(buffer.lineStart(last_line_start)), true);
+    // 途中でやめたときは、その理由の知らせを残す
+    if (aborted) return;
     if (lines_changed > 1 or subs > 1) {
         st.clearMsg();
         st.msgNum(subs);

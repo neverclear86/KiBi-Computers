@@ -511,6 +511,90 @@ class ViEditorTest {
     }
 
     @Test
+    fun `探すと置き換えは UTF-8 の文字を単位にし、文字を割らない`() = vi(
+        listOf("m.txt"),
+        files = mapOf("/home/m.txt" to "あいう\nxあy\n".toByteArray()),
+    ) {
+        keys(":1s/^./X/\r")
+        assertEquals("Xいう", row(0))
+        keys(":2s/[^x]/_/g\r")
+        assertEquals("x__", row(1))
+        keys("u")
+        assertEquals("xあy", row(1))
+        keys(":2s/[あい]/Z/g\r")
+        assertEquals("xZy", row(1))
+        keys(":1s/[あい]/Z/g\r")
+        assertEquals("XZう", row(0))
+        keys(":wq\r")
+        assertEquals(0, finish())
+        assertArrayEquals("XZう\nxZy\n".toByteArray(), file("/home/m.txt"))
+    }
+
+    @Test
+    fun `多バイトの文字の上でも、探すと次の文字へ進む`() = vi(
+        listOf("n.txt"),
+        files = mapOf("/home/n.txt" to "あいう\n".toByteArray()),
+    ) {
+        keys("/.\r")
+        assertEquals(2 to 0, host.cursor())
+        keys("n")
+        assertEquals(4 to 0, host.cursor())
+        keys("n")
+        assertEquals(0 to 0, host.cursor())
+        keys("/[^a]\r")
+        assertEquals(2 to 0, host.cursor())
+        keys("N")
+        assertEquals(0 to 0, host.cursor())
+        keys(":q!\r")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `gの置き換えは、直前の一致につながる空の一致を飛ばし、行の終わりの空の一致は置き換える`() = vi(
+        listOf("g.txt"),
+        files = mapOf("/home/g.txt" to "baaac\naaa\n".toByteArray()),
+    ) {
+        keys(":%s/a*/-/g\r")
+        assertEquals(listOf("-b-c-", "-"), rows.subList(0, 2))
+        keys(":q!\r")
+        assertEquals(0, finish())
+    }
+
+    @Test
+    fun `置き換えが作業の領域に入りきらなければ、置き換えずに知らせる`() {
+        val original = ("a".repeat(3000) + "\n").toByteArray()
+        vi(listOf("l.txt"), files = mapOf("/home/l.txt" to original)) {
+            keys(":1s/a*/&&/\r")
+            assertTrue(status.contains("Replacement is too long"), screen)
+            keys(":wq\r")
+            assertEquals(0, finish())
+            assertArrayEquals(original, file("/home/l.txt"))
+        }
+    }
+
+    @Test
+    fun `テキストが上限の近くでも、大きさの変わらない組は戻せて、やり直せる`() {
+        val a = "a".repeat(4000)
+        val b = "b".repeat(4000)
+        val filler = "c".repeat(999) + "\n"
+        val text = "$a\n".repeat(100) + filler.repeat(3750)
+        val replaced = "$b\n".repeat(100) + filler.repeat(3750)
+        vi(listOf("big.txt"), files = mapOf("/home/big.txt" to text.toByteArray())) {
+            keys(":1,100s/a*/$b/\r")
+            assertTrue(row(0).startsWith("bbbb"), screen)
+            keys("u")
+            assertFalse(status.contains("buffer is full"), screen)
+            assertTrue(row(0).startsWith("aaaa"), screen)
+            keys("\u0012")
+            assertFalse(status.contains("buffer is full"), screen)
+            assertTrue(row(0).startsWith("bbbb"), screen)
+            keys(":wq\r")
+            assertEquals(0, finish())
+            assertEquals(replaced, file("/home/big.txt")!!.decodeToString())
+        }
+    }
+
+    @Test
     fun `行の番号を出し、行の番号のコマンドで行へ移る。画面を送る`() = vi(
         listOf("pg.txt"),
         files = mapOf("/home/pg.txt" to (1..100).joinToString("") { "line $it\n" }.toByteArray()),

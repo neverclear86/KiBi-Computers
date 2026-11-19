@@ -4,31 +4,78 @@
 //! ERE（`-E`）は `+`・`?` も、BRE は GNU と同じく `\+`・`\?` も繰り返しになる。
 //! 組（`(...)`・`\(...\)`）・選択（`|`・`\|`）・回数（`{m,n}`・`\{m,n\}`）・後方参照はまだない（使うと `Unsupported`）。
 //! 照合は後ろに戻る素朴な方式（深さは要素の数まで）。
+//! 文字は UTF-8 の 1 文字（コードポイント）が単位: `.`・`[...]`・`[^...]` は多バイトの文字を丸ごと 1 つとして合わせ、文字の途中のバイトには合わせない。
+//! 多バイトの文字への `*` なども 1 文字にかかる。不正なバイト列のバイトは、1 バイトで 1 文字として合わせる。大文字小文字を無視するのは ASCII だけ。
 //!
 //! 照合する文字列は、スライスのほかに「`len` と `at(i)` を持つ型」でも渡せる（[find]）。`vi` はギャップバッファの 1 行を写さずに照合する。
 
+const utf8 = @import("text.zig");
+
 pub const MAX_NODES = 128;
+/// 1 つの `[...]` に書ける、ASCII でない文字の範囲の数（超えたら `TooLong`）
+const MAX_WIDE = 8;
 
 pub const CompileError = error{ Unsupported, BadPattern, TooLong };
 
 const Rep = enum { one, opt, star, plus };
 const Kind = enum { literal, any, class };
 
+/// ASCII でない文字の範囲（コードポイント）
+const Wide = struct { lo: u21, hi: u21 };
+
 const Node = struct {
     kind: Kind,
     rep: Rep = .one,
     c: u8 = 0,
-    /// 文字の集合（256 ビット）
+    /// バイトの集合（256 ビット）。ASCII と、不正なバイト列のバイトを見る
     set: [32]u8 = @splat(0),
+    /// ASCII でない文字の範囲（`class` だけ）
+    wide: [MAX_WIDE]Wide = undefined,
+    nwide: u8 = 0,
+    /// `[^...]`（ASCII でない文字の判定を逆にする。[set] は読むときに反転済み）
+    negate: bool = false,
 
-    fn matches(self: *const Node, ch: u8, icase: bool) bool {
-        return switch (self.kind) {
-            .any => ch != '\n',
-            .literal => if (icase) lower(ch) == self.c else ch == self.c,
-            .class => self.set[ch >> 3] & (@as(u8, 1) << @intCast(ch & 7)) != 0,
-        };
+    /// [t] の [ti] の 1 文字がこの要素に合うなら、そのバイト数。合わなければ 0
+    fn width(self: *const Node, t: anytype, ti: usize, icase: bool) usize {
+        if (ti >= t.len) return 0;
+        const ch = t.at(ti);
+        switch (self.kind) {
+            .literal => {
+                const ok = if (icase) lower(ch) == self.c else ch == self.c;
+                return if (ok) 1 else 0;
+            },
+            .any => {
+                if (ch == '\n') return 0;
+                return decode(t, ti).len;
+            },
+            .class => {
+                const d = decode(t, ti);
+                if (d.len == 1) return if (getBit(&self.set, ch)) 1 else 0;
+                var in = false;
+                for (self.wide[0..self.nwide]) |w| {
+                    if (d.cp >= w.lo and d.cp <= w.hi) in = true;
+                }
+                return if (in != self.negate) d.len else 0;
+            },
+        }
     }
 };
+
+/// [decode] の結果
+const Dec = struct { cp: u21, len: usize, valid: bool };
+
+/// [t] の [i] の 1 文字を読む。ASCII か、正しい UTF-8 の 1 文字。不正なら 1 バイト（`valid` が偽）
+fn decode(t: anytype, i: usize) Dec {
+    const c = t.at(i);
+    if (c < 0x80) return .{ .cp = c, .len = 1, .valid = true };
+    const n: usize = utf8.sequenceLength(c);
+    if (n < 2 or i + n > t.len) return .{ .cp = c, .len = 1, .valid = false };
+    var b: [4]u8 = undefined;
+    var k: usize = 0;
+    while (k < n) : (k += 1) b[k] = t.at(i + k);
+    const cp = utf8.decode(b[0..n]) orelse return .{ .cp = c, .len = 1, .valid = false };
+    return .{ .cp = cp, .len = n, .valid = true };
+}
 
 pub const Regex = struct {
     nodes: [MAX_NODES]Node = undefined,
@@ -67,6 +114,10 @@ pub const Regex = struct {
                     }
                     if (!extended and (e == '(' or e == ')' or e == '{' or e == '}' or e == '|')) return error.Unsupported;
                     if (e >= '1' and e <= '9') return error.Unsupported;
+                    if (e >= 0x80) {
+                        i = try self.literalAt(pattern, i - 1);
+                        continue;
+                    }
                     try self.literal(e);
                 },
                 '*' => {
@@ -84,12 +135,20 @@ pub const Regex = struct {
                     try self.literal(c);
                     i += 1;
                 },
-                else => {
-                    try self.literal(c);
-                    i += 1;
-                },
+                else => i = try self.literalAt(pattern, i),
             }
         }
+    }
+
+    /// [pattern] の [i] の 1 文字を、そのまま合わせる要素にして、次の位置を返す。ASCII でない文字は 1 つの要素にする（`*` なども 1 文字にかかる）
+    fn literalAt(self: *Regex, pattern: []const u8, i: usize) CompileError!usize {
+        const d = decode(Slice.of(pattern), i);
+        if (d.valid and d.len > 1) {
+            var n = Node{ .kind = .class };
+            try addWide(&n, d.cp, d.cp);
+            try self.add(n);
+        } else try self.literal(pattern[i]);
+        return i + d.len;
     }
 
     fn add(self: *Regex, n: Node) CompileError!void {
@@ -126,8 +185,10 @@ pub const Regex = struct {
             i += 1;
         }
         var first = true;
+        const sl = Slice.of(p);
         while (true) {
             if (i >= p.len) return error.BadPattern;
+            const d = decode(sl, i);
             const c = p[i];
             if (c == ']' and !first) {
                 i += 1;
@@ -141,16 +202,15 @@ pub const Regex = struct {
                 i = end + 2;
                 continue;
             }
-            if (i + 2 < p.len and p[i + 1] == '-' and p[i + 2] != ']') {
-                const hi = p[i + 2];
-                if (hi < c) return error.BadPattern;
-                var x: u16 = c;
-                while (x <= hi) : (x += 1) setBit(&n.set, @intCast(x));
-                i += 3;
+            const next = i + d.len;
+            if (next + 1 < p.len and p[next] == '-' and p[next + 1] != ']') {
+                const dh = decode(sl, next + 1);
+                try addRange(&n, d, dh);
+                i = next + 1 + dh.len;
                 continue;
             }
-            setBit(&n.set, c);
-            i += 1;
+            try addRange(&n, d, d);
+            i = next;
         }
         if (self.icase) {
             var x: u16 = 'a';
@@ -163,6 +223,7 @@ pub const Regex = struct {
             }
         }
         if (negate) {
+            n.negate = true;
             for (&n.set) |*b| b.* = ~b.*;
             // 改行には合わせない
             n.set['\n' >> 3] &= ~(@as(u8, 1) << ('\n' & 7));
@@ -184,10 +245,11 @@ pub const Regex = struct {
             return .{ .start = 0, .end = e };
         }
         var s: usize = from;
-        while (s <= t.len) : (s += 1) {
+        while (true) {
             if (self.matchHere(0, t, s)) |e| return .{ .start = s, .end = e };
+            if (s >= t.len) return null;
+            s += decode(t, s).len;
         }
-        return null;
     }
 
     /// [ni] 番目の要素から [ti] で合わせる。合えば合ったところの終わり
@@ -196,29 +258,52 @@ pub const Regex = struct {
         const n = &self.nodes[ni];
         switch (n.rep) {
             .one => {
-                if (ti < t.len and n.matches(t.at(ti), self.icase)) return self.matchHere(ni + 1, t, ti + 1);
+                const w = n.width(t, ti, self.icase);
+                if (w > 0) return self.matchHere(ni + 1, t, ti + w);
                 return null;
             },
             .opt => {
-                if (ti < t.len and n.matches(t.at(ti), self.icase)) {
-                    if (self.matchHere(ni + 1, t, ti + 1)) |e| return e;
+                const w = n.width(t, ti, self.icase);
+                if (w > 0) {
+                    if (self.matchHere(ni + 1, t, ti + w)) |e| return e;
                 }
                 return self.matchHere(ni + 1, t, ti);
             },
             .star, .plus => {
-                var k: usize = 0;
-                while (ti + k < t.len and n.matches(t.at(ti + k), self.icase)) k += 1;
-                const min: usize = if (n.rep == .plus) 1 else 0;
+                var lo = ti;
+                if (n.rep == .plus) {
+                    const w = n.width(t, ti, self.icase);
+                    if (w == 0) return null;
+                    lo = ti + w;
+                }
+                var p = ti;
                 while (true) {
-                    if (k < min) return null;
-                    if (self.matchHere(ni + 1, t, ti + k)) |e| return e;
-                    if (k == 0) return null;
-                    k -= 1;
+                    const w = n.width(t, p, self.icase);
+                    if (w == 0) break;
+                    p += w;
+                }
+                // 長い方から順に、1 文字ずつ戻す
+                while (true) {
+                    if (self.matchHere(ni + 1, t, p)) |e| return e;
+                    if (p <= lo) return null;
+                    p = stepBack(t, ti, p);
                 }
             },
         }
     }
 };
+
+/// [p] の 1 文字前（[lo] 以降）の位置
+fn stepBack(t: anytype, lo: usize, p: usize) usize {
+    var q = p - 1;
+    var back: usize = 0;
+    while (q > lo and back < 3 and utf8.isContinuation(t.at(q))) : (back += 1) q -= 1;
+    if (q < p - 1) {
+        const d = decode(t, q);
+        if (d.valid and q + d.len == p) return q;
+    }
+    return p - 1;
+}
 
 /// 合ったところ（[start, end)）
 pub const Match = struct { start: usize, end: usize };
@@ -236,6 +321,33 @@ pub const Slice = struct {
         return self.s[i];
     }
 };
+
+/// [n] に ASCII でない文字の範囲 [lo, hi] を足す
+fn addWide(n: *Node, lo: u21, hi: u21) CompileError!void {
+    if (n.nwide == MAX_WIDE) return error.TooLong;
+    n.wide[n.nwide] = .{ .lo = lo, .hi = hi };
+    n.nwide += 1;
+}
+
+/// `[...]` の 1 つの文字（[lo]）か範囲（[lo]-[hi]）を [n] に足す。ASCII と不正なバイトはバイトの集合、ほかはコードポイントの範囲に入れる
+fn addRange(n: *Node, lo: Dec, hi: Dec) CompileError!void {
+    const lo_byte = !lo.valid or lo.cp < 0x80;
+    const hi_byte = !hi.valid or hi.cp < 0x80;
+    if (lo_byte and hi_byte) {
+        if (hi.cp < lo.cp) return error.BadPattern;
+        var x: u16 = @intCast(lo.cp);
+        while (x <= hi.cp) : (x += 1) setBit(&n.set, @intCast(x));
+        return;
+    }
+    // 片方だけ不正なバイトの範囲は読めない
+    if (!lo.valid or !hi.valid) return error.BadPattern;
+    if (hi.cp < lo.cp) return error.BadPattern;
+    if (lo.cp < 0x80) {
+        var x: u16 = @intCast(lo.cp);
+        while (x < 0x80) : (x += 1) setBit(&n.set, @intCast(x));
+        try addWide(n, 0x80, hi.cp);
+    } else try addWide(n, lo.cp, hi.cp);
+}
 
 fn named(set: *[32]u8, name: []const u8) CompileError!void {
     var x: u16 = 0;
