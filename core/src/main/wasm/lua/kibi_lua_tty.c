@@ -5,7 +5,7 @@
  * echo と canonical を切る（signals と nl-to-crnl は残す）。待つ間に打ったキーはエコーされず、TTY の入力に溜まったものは、
  * 待つ前に毎回、待たずに読み捨てる。
  *
- * - 一度切ったら、標準入力を読むとき（io.read などの g_read と、REPL の lua_readline）か、終わるとき（atexit）まで戻さない。
+ * - 一度切ったら、標準入力を読むとき（io.read などの g_read、REPL の lua_readline、引数なしの dofile・loadfile の getc）か、終わるとき（atexit）まで戻さない。
  *   キーを受けてすぐ戻すと、英字のキーは押下（KeyDown）の後から文字（Text）が届くので、その文字が cooked の TTY に入って漏れる
  * - 戻すときは、切ったままで読み捨ててから元のモードに戻し、戻したことで残った塊があればもう一度読み捨てる
  *   （先に戻すと、待ちの列の続きが canonical の編集中の行に入り、次の io.read の行に混ざる）
@@ -27,6 +27,8 @@
 /* kibi_wasi.h の clearerr のマクロを外して、本物を呼ぶ（stdio.h の宣言はマクロで名前が変わっているので、ここで宣言し直す） */
 #undef clearerr
 void clearerr(FILE *f);
+#undef getc
+int getc(FILE *f);
 
 /* kibi:io/tty の mode のビット（ADR 0427） */
 #define MODE_COOKED 0x1f
@@ -137,4 +139,10 @@ void kibi_lua_tty_restore(void) {
 void kibi_lua_before_read(FILE *f) {
     if (f == stdin) kibi_lua_tty_restore();
     clearerr(f);
+}
+
+/* 引数なしの dofile()・loadfile() の読み取り（lauxlib.c の luaL_loadfilex。最初の getc が標準入力を読む） */
+int kibi_lua_getc(FILE *f) {
+    if (f == stdin) kibi_lua_tty_restore();
+    return getc(f);
 }

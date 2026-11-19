@@ -40,6 +40,12 @@ void kibi_lua_tty_restore(void);
  */
 #ifndef KIBI_LUA_NO_KEY_TTY
 #define clearerr(f) kibi_lua_before_read(f)
+/*
+ * 引数なしの dofile()・loadfile() は、lauxlib.c の luaL_loadfilex が標準入力を getc・fread で直接読み、g_read を通らない。
+ * その最初の読み取りが getc（skipBOM）なので、getc も同じように包み、標準入力なら戻してから読ませる（#798）。
+ * stdio.h の getc の宣言もこのマクロで kibi_lua_getc の宣言になる
+ */
+#define getc(f) kibi_lua_getc(f)
 #endif
 
 /*

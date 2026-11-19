@@ -13,7 +13,10 @@ import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.KernelEvent
 import pro.ikili.kibicomputers.core.kernel.event.RestoreEvents
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
@@ -66,7 +69,7 @@ class LuaTermFsKeysTest {
 
     /**
      * イメージ `os` を `/` に読み取り専用で、メモリの FS を `/home`・`/tmp` に書ける形でマウントし、[script] を `lua` で動かす。
-     * コンソールは [columns] x [rows]。[setup] はマウントの後・起動の前にマシンへ足すもの（マウントを増やすなど）。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ。
+     * コンソールは [columns] x [rows]。[setup] はマウントの後・起動の前にマシンへ足すもの（マウントを増やすなど）。[stdio] は標準入出力の割り当て。[driver] はテストの側の操作（出力を見てキーを押すなど）で、終わるまで tick ごとに呼ぶ。
      * [after] は終わった後、マシンを閉じる前に呼ぶ（TTY の状態を見るなど）
      */
     private fun lua(
@@ -74,6 +77,7 @@ class LuaTermFsKeysTest {
         columns: Int = 20,
         rows: Int = 5,
         setup: (Machine) -> Unit = {},
+        stdio: StdioSpec = StdioSpec.INHERIT,
         driver: (Machine, String) -> Unit = { _, _ -> },
         after: (Machine) -> Unit = {},
     ): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -88,7 +92,7 @@ class LuaTermFsKeysTest {
         val pid = m.exec(
             "/bin/lua",
             KernelDrivers.DEFAULT,
-            SpawnOptions(args = listOf("lua", "/home/t.lua"), env = mapOf("PATH" to "/bin", "HOME" to "/home"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN),
+            SpawnOptions(stdio = stdio, args = listOf("lua", "/home/t.lua"), env = mapOf("PATH" to "/bin", "HOME" to "/home"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN),
         )
         eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
             h.scheduler.tick()
@@ -327,6 +331,42 @@ class LuaTermFsKeysTest {
     }
 
     @Test
+    fun `キー待ちの後の引数なしのdofileも、モードが戻ってから標準入力を読む`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        val r = lua(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.pullEvent('key')
+            print('read')
+            local v = dofile()
+            print('got' .. tostring(v))
+            """,
+            columns = 40,
+            rows = 10,
+            driver = { m, text ->
+                if (step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                    keyboard.input(KeyboardEvent.Text("zz"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    step = 1
+                } else if (step == 1 && text.contains("\nread\n") && m.consoleMode() == TtyMode.COOKED) {
+                    // dofile がモードを戻した後に打つ（canonical なので Ctrl+D で EOF）
+                    m.offerConsoleInput("return 42\n\u0004".toByteArray())
+                    step = 2
+                }
+            },
+        ).assertOk()
+        assertEquals(2, step, r.text)
+        assertTrue(r.text.contains("got42"), r.text)
+        // 打ったスクリプトはエコーされ、待つ間に打ったものは混ざらない
+        assertTrue(r.text.contains("return 42"), r.text)
+        assertFalse(r.text.contains("zz"), r.text)
+    }
+
+    @Test
     fun `キー待ちの後にerrorやos_exitで終わってもcookedに戻る`() = timeout(limit) {
         for (end in listOf("error('boom')", "os.exit(3)")) {
             val keyboard = KeyboardDevice()
@@ -383,6 +423,126 @@ class LuaTermFsKeysTest {
         ).assertOk()
         assertEquals(TtyMode.COOKED, modeWhileWaiting)
         assertEquals(2, leftover)
+    }
+
+    @Test
+    fun `標準入力が端末でないとき（閉じた fd）は、キーを待ってもモードを変えず、打ったものも捨てない`() = timeout(limit) {
+        var sent = false
+        var modeWhileWaiting: TtyMode? = null
+        var leftoverWhileWaiting = -1
+        var mode: TtyMode? = null
+        lua(
+            """
+            os.startTimer(0.5)
+            print('ready')
+            os.pullEvent()
+            """,
+            stdio = StdioSpec(stdin = StdioSource.Closed, stdout = StdioSource.Console, stderr = StdioSource.Console),
+            driver = { m, text ->
+                if (!sent && text.contains("ready")) {
+                    modeWhileWaiting = m.consoleMode()
+                    m.offerConsoleInput("ab".toByteArray())
+                    sent = true
+                } else if (sent && leftoverWhileWaiting < 0) {
+                    leftoverWhileWaiting = m.consoleLeftover()
+                }
+            },
+            after = { m -> mode = m.consoleMode() },
+        ).assertOk()
+        assertTrue(sent)
+        assertEquals(TtyMode.COOKED, modeWhileWaiting)
+        assertEquals(TtyMode.COOKED, mode)
+        // 待っている間（タイマーが鳴るまで）、打ったものは TTY に残っている
+        assertEquals(2, leftoverWhileWaiting)
+    }
+
+    @Test
+    fun `元のモードがcookedでないときは、キーを待ってもモードを変えず、終わっても元のまま`() = timeout(limit) {
+        // ほかのプログラムが変えたモード（echo を切った cooked）
+        val custom = TtyMode(TtyMode.ALL and TtyMode.ECHO.inv())
+        var sent = false
+        var modeWhileWaiting: TtyMode? = null
+        var mode: TtyMode? = null
+        var leftoverWhileWaiting = -1
+        lua(
+            """
+            os.startTimer(0.5)
+            print('ready')
+            os.pullEvent()
+            """,
+            setup = { m -> m.lock.withLockValue { m.consoleTtyLocked().setMode(custom, m.wakeSink) } },
+            driver = { m, text ->
+                if (!sent && text.contains("ready")) {
+                    modeWhileWaiting = m.consoleMode()
+                    m.offerConsoleInput("ab\n".toByteArray())
+                    sent = true
+                } else if (sent && leftoverWhileWaiting < 0) {
+                    leftoverWhileWaiting = m.consoleLeftover()
+                }
+            },
+            after = { m -> mode = m.consoleMode() },
+        ).assertOk()
+        assertTrue(sent)
+        assertEquals(custom, modeWhileWaiting)
+        assertEquals(custom, mode)
+        // 打ったものは捨てられていない（canonical の行が確定して読める）
+        assertEquals(3, leftoverWhileWaiting)
+    }
+
+    /**
+     * 標準 OS の対話型 `sh` から `lua` でキーを待たせ、[stop] で止めた後に、次のコマンドが動いている間は端末が cooked に戻っている（`sh` が戻した）ことを確かめる
+     * （シグナルで殺されると atexit が走らないので、戻すのは `sh` の仕事。ADR 0798 の「殺されたとき」）
+     */
+    private fun assertShRestoresAfterStop(stop: (Machine, Int) -> Unit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 32L * 1024 * 1024)
+            m.vfs.mount(VfsPath.ROOT, image, readOnly = true, source = "disk:image:os")
+            m.vfs.mount(VfsPath.parse("/home"), TestMemoryFileSystem(), readOnly = false, source = "test:home")
+            m.vfs.mount(VfsPath.parse("/tmp"), TestMemoryFileSystem(), readOnly = false, source = "test:tmp")
+            m.resizeConsole(40, 10)
+            m.put("/home/t.lua", "print('ready')\nwhile true do os.pullEvent('key') end\n")
+            val sh = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh"), env = mapOf("PATH" to "/bin", "HOME" to "/home"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN))
+
+            fun luaPid() = m.lock.withLockValue { m.kernel.processes.all().firstOrNull { !it.state.isTerminal && it.args.firstOrNull() == "lua" }?.pid }
+            fun step(describe: () -> String, done: () -> Boolean) = eventuallyDescribe(150_000, describe) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                done()
+            }
+
+            step({ "プロンプトが出ない: ${host.text()}" }) { host.text().endsWith("$ ") }
+            m.offerConsoleInput("lua /home/t.lua\n".toByteArray())
+            step({ "キー待ちに入らない: ${host.text()} / ${m.consoleMode()}" }) { host.text().contains("ready") && luaPid() != null && m.consoleMode() == KEYS_MODE }
+            val lua = luaPid()!!
+            // 前景が lua になってから止める
+            step({ "lua が前景にならない" }) { m.lock.withLockValue { m.consoleTtyLocked().foregroundPid } == lua }
+            val seen = host.text().length
+            stop(m, lua)
+            step({ "プロンプトに戻らない: ${host.text()}" }) { host.text().length > seen && host.text().endsWith("$ ") }
+            assertTrue(luaPid() == null, "lua が残っている")
+
+            // 次のコマンドが動いている間、端末は cooked に戻っている（sh は行を編集する間だけモードを変える）
+            fun sleepPid() = m.lock.withLockValue { m.kernel.processes.all().firstOrNull { !it.state.isTerminal && it.args.firstOrNull() == "sleep" }?.pid }
+            m.offerConsoleInput("sleep 100\n".toByteArray())
+            step({ "sleep が動かない: ${host.text()}" }) { sleepPid() != null }
+            step({ "モードが戻らない: ${m.consoleMode()}" }) { m.consoleMode() == TtyMode.COOKED }
+            val mark = host.text().length
+            m.offerConsoleInput(byteArrayOf(0x03))
+            step({ "プロンプトに戻らない: ${host.text()}" }) { host.text().length > mark && host.text().endsWith("$ ") }
+            m.offerConsoleInput("exit\n".toByteArray())
+            step({ "終わらない: ${host.text()}" }) { m.stateOf(sh).isTerminal }
+        }
+    }
+
+    @Test
+    fun `キー待ちの間にCtrl+Cで止めると、shが端末をcookedに戻す`() = timeout(limit) {
+        assertShRestoresAfterStop { m, _ -> m.offerConsoleInput(byteArrayOf(0x03)) }
+    }
+
+    @Test
+    fun `キー待ちの間にkillで止めると、shが端末をcookedに戻す`() = timeout(limit) {
+        assertShRestoresAfterStop { m, lua -> m.lock.withLockValue { m.killLocked(lua, KillSignal.TERMINATE) } }
     }
 
     // ---- term ----

@@ -19,6 +19,7 @@
 - 切っている間は、`pull()` が `poll_oneoff` で待つ直前に毎回、標準入力の今読める分を待たずに読み捨てる
 - 一度切ったら、**標準入力を読む前**か**終わるとき**まで戻さない
   - `io.read`・`io.lines`・`file:read` の入り口（liolib.c の `g_read` の先頭の `clearerr(f)`）を、`kibi_wasi.h` の `#define clearerr(f) kibi_lua_before_read(f)` で包む。`f == stdin` なら戻してから本物の `clearerr` を呼ぶ
+  - 引数なしの `dofile()`・`loadfile()` は、lauxlib.c の `luaL_loadfilex` が標準入力を `getc`・`fread` で直接読み、`g_read` を通らない。最初の読み取りが `getc`（`skipBOM`）なので、`#define getc(f) kibi_lua_getc(f)` でも包み、`f == stdin` なら戻してから本物の `getc` を呼ぶ（`g_read` の後の `getc` も通るが、戻した後は状態を見るだけ）
   - REPL（lua.c の `lua_readline`）は `kibi_wasi.h` で定義し直し、`fgets` の前に戻す（`lua_readline` を定義したので `lua_initreadline`・`lua_saveline`・`lua_freeline` も定義する。中身は Lua の既定と同じ）
   - 終わるとき（`main` から戻る、`os.exit`、捕まえられなかったエラー）は `atexit`。登録は初めて切るときに1回だけ。登録できなければ切らない
 - 戻す手順: 切ったまま読み捨てる → 今のモードがまだ `0x14` なら元のモードに戻す（ほかのプロセスが変えたものは上書きしない）→ canonical に戻したことで残った「確定した1つの塊」があれば、もう一度読み捨てる
@@ -79,5 +80,8 @@
   - 待ちの後の `io.read` は、エコーと行の編集（Backspace）が戻り、待つ間に打ったものが行に混ざらない
   - `error()`・`os.exit()` で終わっても cooked に戻り、入力が空
   - `pullEvent("timer")` だけを待つときはモードを変えず、打ったものが残る
+  - 標準入力が閉じている（端末でない）とき、元のモードが cooked でないときは、モードを変えず、打ったものを捨てない
+  - 待った後の引数なしの `dofile()` は、モードが戻ってから標準入力を読む（エコーされ、待つ間に打ったものは混ざらない）
+  - 対話型の `sh` から起動した `lua` を、キー待ちの間に Ctrl+C・kill で止めても、次のコマンドが動く間は端末が cooked に戻っている
 - `LuaReplTest`: REPL で filter なしで待つ間に打ったものはエコーされず捨てられ、次の行はエコーされて評価され、履歴（上の矢印）も使える
 - `LuaWasmTest`・PoC のスタブに `get-mode`・`set-mode` を足した
