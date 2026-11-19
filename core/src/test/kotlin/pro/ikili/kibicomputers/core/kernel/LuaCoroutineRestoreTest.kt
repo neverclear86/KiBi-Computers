@@ -411,6 +411,9 @@ class LuaCoroutineRestoreTest {
                     }
                 }
                 h.scheduler.tick()
+                // tick の燃料でワーカーが動く間に次の tick を回すと、燃料待ちを見ないまま先へ進んでしまう（遅い CI で計算が終わっていた）。燃料を使い切って待つまで待つ
+                val deadline = System.nanoTime() + 500_000_000L
+                while (m.fuelWaiterCount == 0 && END !in output(m, s.output) && System.nanoTime() < deadline) Thread.sleep(1)
                 false
             }
             assertEquals("ready\n", output(m, s.output), "計算の途中で保存する")
