@@ -1,9 +1,11 @@
-//! `grep` の正規表現（#103）: POSIX の基本正規表現（BRE）・拡張正規表現（ERE）のうち、よく使う部分だけ。
+//! 正規表現（#103。`grep` と `vi`（#104）が使う）: POSIX の基本正規表現（BRE）・拡張正規表現（ERE）のうち、よく使う部分だけ。
 //!
 //! 読むもの: 文字、`.`、`[...]`（`^` の否定・範囲・`[:alpha:]` などの名前）、`*`、`^`（頭だけ）、`$`（末尾だけ）、`\` の引用。
 //! ERE（`-E`）は `+`・`?` も、BRE は GNU と同じく `\+`・`\?` も繰り返しになる。
 //! 組（`(...)`・`\(...\)`）・選択（`|`・`\|`）・回数（`{m,n}`・`\{m,n\}`）・後方参照はまだない（使うと `Unsupported`）。
 //! 照合は後ろに戻る素朴な方式（深さは要素の数まで）。
+//!
+//! 照合する文字列は、スライスのほかに「`len` と `at(i)` を持つ型」でも渡せる（[find]）。`vi` はギャップバッファの 1 行を写さずに照合する。
 
 pub const MAX_NODES = 128;
 
@@ -171,35 +173,67 @@ pub const Regex = struct {
 
     /// [text] のどこかに合うか
     pub fn search(self: *const Regex, text: []const u8) bool {
-        if (self.bol) return self.matchHere(0, text, 0);
-        var s: usize = 0;
-        while (s <= text.len) : (s += 1) {
-            if (self.matchHere(0, text, s)) return true;
-        }
-        return false;
+        return self.find(Slice.of(text), 0) != null;
     }
 
-    fn matchHere(self: *const Regex, ni: usize, text: []const u8, ti: usize) bool {
-        if (ni == self.len) return !self.eol or ti == text.len;
+    /// [t]（`len: usize` と `fn at(usize) u8` を持つもの）の [from] 以降で、最初に合うところ。`^` は [t] の頭にだけ合う
+    pub fn find(self: *const Regex, t: anytype, from: usize) ?Match {
+        if (self.bol) {
+            if (from != 0) return null;
+            const e = self.matchHere(0, t, 0) orelse return null;
+            return .{ .start = 0, .end = e };
+        }
+        var s: usize = from;
+        while (s <= t.len) : (s += 1) {
+            if (self.matchHere(0, t, s)) |e| return .{ .start = s, .end = e };
+        }
+        return null;
+    }
+
+    /// [ni] 番目の要素から [ti] で合わせる。合えば合ったところの終わり
+    fn matchHere(self: *const Regex, ni: usize, t: anytype, ti: usize) ?usize {
+        if (ni == self.len) return if (!self.eol or ti == t.len) ti else null;
         const n = &self.nodes[ni];
         switch (n.rep) {
-            .one => return ti < text.len and n.matches(text[ti], self.icase) and self.matchHere(ni + 1, text, ti + 1),
+            .one => {
+                if (ti < t.len and n.matches(t.at(ti), self.icase)) return self.matchHere(ni + 1, t, ti + 1);
+                return null;
+            },
             .opt => {
-                if (ti < text.len and n.matches(text[ti], self.icase) and self.matchHere(ni + 1, text, ti + 1)) return true;
-                return self.matchHere(ni + 1, text, ti);
+                if (ti < t.len and n.matches(t.at(ti), self.icase)) {
+                    if (self.matchHere(ni + 1, t, ti + 1)) |e| return e;
+                }
+                return self.matchHere(ni + 1, t, ti);
             },
             .star, .plus => {
                 var k: usize = 0;
-                while (ti + k < text.len and n.matches(text[ti + k], self.icase)) k += 1;
+                while (ti + k < t.len and n.matches(t.at(ti + k), self.icase)) k += 1;
                 const min: usize = if (n.rep == .plus) 1 else 0;
                 while (true) {
-                    if (k < min) return false;
-                    if (self.matchHere(ni + 1, text, ti + k)) return true;
-                    if (k == 0) return false;
+                    if (k < min) return null;
+                    if (self.matchHere(ni + 1, t, ti + k)) |e| return e;
+                    if (k == 0) return null;
                     k -= 1;
                 }
             },
         }
+    }
+};
+
+/// 合ったところ（[start, end)）
+pub const Match = struct { start: usize, end: usize };
+
+/// スライスを [Regex.find] に渡す形
+pub const Slice = struct {
+    s: []const u8,
+    len: usize,
+
+    pub fn of(s: []const u8) Slice {
+        return .{ .s = s, .len = s.len };
+    }
+
+    pub fn at(self: Slice, i: usize) u8 {
+        return self.s[i];
     }
 };
 

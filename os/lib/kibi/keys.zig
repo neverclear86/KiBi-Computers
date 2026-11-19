@@ -3,6 +3,9 @@
 //! 1 つのキーのバイト列は、1 回の入力としてまとめて TTY に入る。そのため、読んだかたまりの最後が ESC なら、
 //! 素の Esc と見る（続きを待たない。時計で待つと、待っているだけの間も起きることになるため）。
 //! かたまりがエスケープシーケンスや UTF-8 の途中で切れていたら（読む領域が埋まったとき）、続きを読んでからつなぐ。
+//!
+//! `Reader.split_escape`（vi が使う。#104）を立てると、ESC の後に続く文字を Alt+文字にせず、素の Esc と次のキーに分ける
+//! （速く打った「Esc → :」が 1 回の入力で届いても、Esc と `:` に読む）。既定（nano・sh）の読み方は変えない。
 const io = @import("io.zig");
 const text = @import("text.zig");
 
@@ -69,6 +72,8 @@ pub const Reader = struct {
     end: usize = 0,
     /// 前の読み込みで領域が埋まった（続きが TTY に残っているかもしれない）
     filled: bool = false,
+    /// ESC の後の文字を Alt+文字にせず、素の Esc と次のキーに分ける（[parseWith]）
+    split_escape: bool = false,
 
     pub fn init(fd: io.Fd) Reader {
         return .{ .fd = fd };
@@ -79,7 +84,7 @@ pub const Reader = struct {
     /// （続きが来るまで待つので、待つ前に今ある分を描けるようにする）
     pub fn pending(self: *const Reader) bool {
         if (self.start >= self.end) return false;
-        return parse(self.buf[self.start..self.end], !self.filled).used > 0;
+        return parseWith(self.buf[self.start..self.end], !self.filled, self.split_escape).used > 0;
     }
 
     /// 読んだまま残っているバイトが 1 つもないか（途中で切れたシーケンスも含めて）。真なら、次の [next] は読み込みから始まる
@@ -95,7 +100,7 @@ pub const Reader = struct {
                 self.end = 0;
                 if (!self.fill()) return null;
             }
-            const r = parse(self.buf[self.start..self.end], !self.filled);
+            const r = parseWith(self.buf[self.start..self.end], !self.filled, self.split_escape);
             if (r.used > 0) {
                 self.start += r.used;
                 return r.key;
@@ -108,7 +113,7 @@ pub const Reader = struct {
                 self.end = rest;
             }
             if (self.end == self.buf.len or !self.fill()) {
-                const f = parse(self.buf[self.start..self.end], true);
+                const f = parseWith(self.buf[self.start..self.end], true, self.split_escape);
                 self.start += f.used;
                 return f.key;
             }
@@ -137,6 +142,12 @@ fn one(key: Key, used: usize) Parsed {
 
 /// [s] の頭の 1 キー。[final] なら [s] の後に続きはないと見る（続きが要るなら used = 0）
 pub fn parse(s: []const u8, final: bool) Parsed {
+    return parseWith(s, final, false);
+}
+
+/// [parse] と同じ。[split_escape] なら、ESC の後の文字（印字できる文字・UTF-8 の先頭バイト）と、
+/// `ESC O` の後の表にない文字・続きのない `ESC O` を、素の Esc（1 バイト）と次のキーに分ける。`ESC [` は CSI のまま読む
+pub fn parseWith(s: []const u8, final: bool, split_escape: bool) Parsed {
     const c = s[0];
     if (c == 0x1b) {
         if (s.len == 1) return if (final) one(.{ .kind = .escape }, 1) else .{};
@@ -144,11 +155,17 @@ pub fn parse(s: []const u8, final: bool) Parsed {
         switch (d) {
             '[' => return parseCsi(s, final),
             'O' => {
-                if (s.len < 3) return if (final) one(.{ .kind = .alt, .c = 'O' }, 2) else .{};
-                return one(ss3(s[2], .{}), 3);
+                if (s.len < 3) {
+                    if (!final) return .{};
+                    return if (split_escape) one(.{ .kind = .escape }, 1) else one(.{ .kind = .alt, .c = 'O' }, 2);
+                }
+                const k = ss3(s[2], .{});
+                if (split_escape and k.kind == .unknown) return one(.{ .kind = .escape }, 1);
+                return one(k, 3);
             },
             0x1b => return one(.{ .kind = .escape }, 1),
             else => {
+                if (split_escape) return one(.{ .kind = .escape }, 1);
                 if (d >= 0x20) return one(.{ .kind = .alt, .c = d }, 2);
                 // ESC の後の制御文字は、Esc と次のキー
                 return one(.{ .kind = .escape }, 1);

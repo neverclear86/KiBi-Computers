@@ -477,6 +477,42 @@ class StandardOsRestoreTest {
     }
 
     @Test
+    fun `viは戻ると代替画面に入り直して全体を描き直し、挿入を続けられる`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val (saved, pid) = saveRunning(h, store, "vi", listOf("note.txt")) { m, host, _ ->
+                assertTrue(host.terminal.alternateScreen)
+                m.offerConsoleInput("ihello".toByteArray())
+            }
+            val (m, host) = restore(h, store, saved)
+            eventuallyDescribe(60_000, { "描き直さない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.row(0) == "hello"
+            }
+            settle(h, m, host, pid)
+            assertTrue(host.text().startsWith("[?1049h[?7l"), host.text())
+            assertTrue(host.terminal.alternateScreen)
+            assertEquals("~", host.row(1))
+            assertEquals("-- INSERT --", host.row(24))
+            assertEquals(5 to 0, host.terminal.cursorX to host.terminal.cursorY)
+            // 挿入の続きと、Esc の後のコマンドも効く
+            m.offerConsoleInput(" world0x".toByteArray())
+            eventuallyDescribe(60_000, { "打てない: ${host.screen()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.row(0) == "ello world"
+            }
+            m.close()
+        }
+    }
+
+    @Test
+    fun `キューのハンドルが不正になってもviは落ちずに入力だけを待つ`() = survivesBrokenQueue("vi", listOf("note.txt"), "ihello") { host ->
+        host.row(0) == "hello"
+    }
+
+    @Test
     fun `cabi_reallocの要るimportを持つプログラムだけがcabi_reallocをexportし、ほかの export は増えない`() {
         val runtime = EndiveRuntime()
         val realloc = mutableSetOf<String>()
@@ -499,7 +535,7 @@ class StandardOsRestoreTest {
         }
         // 名前を並べた検査ではないが、取り違え（import がなくなった・増えた）に気づけるよう、今の集合も確かめる
         // /bin/lua は C の lua.wasm（#94 の peripheral・os が `cabi_realloc` を export する。osReallocPrograms ではない）
-        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua", "/bin/access", "/bin/lsdev", "/bin/devcall"), realloc)
+        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua", "/bin/access", "/bin/lsdev", "/bin/devcall", "/bin/vi"), realloc)
         assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }
