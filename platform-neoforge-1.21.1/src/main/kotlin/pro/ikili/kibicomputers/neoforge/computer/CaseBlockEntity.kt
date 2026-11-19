@@ -289,6 +289,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (computer.beginRestore()) ServerMachines.offerRestore(this)
     }
 
+    /**
+     * [startRestore] の用意（設定・ディスク・保存元）の最初に呼ぶ（テスト用。#808）。ゲーム内で用意を投げさせる口がないので、
+     * GameTest がここで例外を投げて、`finally` の後始末（順番待ちを抜ける・つなぎを外す）を通す。普段は `null`
+     */
+    internal var restorePreparationHook: Runnable? = null
+
     /** 最後に [startRestore] で決めた戻す世代（テスト・#575 用。冷えた起動なら `null`。まだなら `null`） */
     internal var lastRestoreSource: RestoreSource? = null
         private set
@@ -324,6 +330,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // 順番待ちのままなら startRestore の前で投げたので、エラーにして順番待ちを抜ける（PoweredOn は残す）。例外はそのまま
         // RestoreQueue に返し、場所ごとに間引いてログに出させる（#785）
         try {
+            restorePreparationHook?.run()
             val config = MachineSpecs.configOf(tier, parts.tiers)
             val disks = prepareDisks()
             val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
