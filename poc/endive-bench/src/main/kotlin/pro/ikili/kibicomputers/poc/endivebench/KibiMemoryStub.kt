@@ -39,6 +39,9 @@ fun kibiLuaApiStubs(): List<HostFunction> {
         // term・fs（#724）
         stub("kibi:io/tty@0.1.0", "is-tty", listOf(i32), listOf(i32)),
         stub("kibi:io/tty@0.1.0", "get-size", listOf(i32, i32)),
+        // キー待ちの間の端末のモード（#798）
+        stub("kibi:io/tty@0.1.0", "get-mode", listOf(i32, i32)),
+        stub("kibi:io/tty@0.1.0", "set-mode", listOf(i32, i32, i32)),
         stub("kibi:fs/mounts@0.1.0", "list-mounts", listOf(i32)),
     )
 }

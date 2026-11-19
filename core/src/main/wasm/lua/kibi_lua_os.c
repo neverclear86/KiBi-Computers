@@ -406,6 +406,8 @@ static int pull(lua_State *L) {
     const char *filter = luaL_optstring(L, 1, NULL);
     lua_settop(L, 1);
     open_queue(L);
+    /* キーを待つなら、待つ間に打ったキーをエコーさせず、溜めない（#798。ADR 0798） */
+    if (filter == NULL || strcmp(filter, "key") == 0 || strcmp(filter, "key_up") == 0) kibi_lua_tty_keys();
     for (;;) {
         int n;
         while ((n = fifo_pop(L)) > 0) {
@@ -424,6 +426,7 @@ static int pull(lua_State *L) {
         lua_Integer id;
         if (!earliest_timer(L, &deadline, &id)) deadline = 0;
         else if (deadline <= 0) deadline = 1;
+        kibi_lua_tty_before_wait();
         wait_for(L, queue_fd, deadline, 1);
     }
 }

@@ -67,7 +67,7 @@ Colours are the values of colors(3). `term.setTextColour` and `term.setBackgroun
 - The screen is not redrawn for the program when the world is loaded: draw it again when the `restored` event arrives (os(3))
 - When the program is stopped (for example with Ctrl+C), the colours and the hidden cursor are not reset; `lua -e "term.setCursorBlink(true)"` resets them
 - There is no `window` API, and `term.redirect` to a monitor is not available
-- Keys that are typed while the program waits for `key` events are also shown on the terminal (see keys(3))
+- While the program waits for `key` events, the keys that are typed are not shown on the terminal and are thrown away (see keys(3))
 
 ## SEE ALSO
 
