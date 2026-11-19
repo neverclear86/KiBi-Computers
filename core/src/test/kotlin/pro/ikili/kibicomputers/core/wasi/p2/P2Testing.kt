@@ -58,8 +58,7 @@ internal object P2Testing {
     class Run(val pid: Int, val output: String, val exitCode: Int?)
 
     /**
-     * [program] を [driver] で、標準出力を stream にして動かし、終わるまで待つ。[prepare] はマシンを作った後に呼ぶ（VFS の用意など）。
-     * [cwd] はプロセスの cwd（null なら既定）、[stdin] は標準入力
+     * [program] を [driver] で、標準出力を stream にして動かし、終わるまで待つ。[prepare] はマシンを作った後に呼ぶ（VFS の用意など）
      */
     fun run(
         h: Harness,
@@ -67,8 +66,6 @@ internal object P2Testing {
         driver: ProcessDriver,
         args: List<String> = listOf("prog"),
         env: Map<String, String>? = null,
-        cwd: String? = null,
-        stdin: StdioSource = StdioSource.Closed,
         fuelPerTick: Long = 5_000_000,
         prepare: (Machine) -> Unit = {},
     ): Run {
@@ -78,8 +75,7 @@ internal object P2Testing {
         val options = SpawnOptions(
             args = args,
             env = env,
-            cwd = cwd,
-            stdio = StdioSpec(stdin, StdioSource.Object(out, HandleRights.WRITE), StdioSource.Object(out, HandleRights.WRITE)),
+            stdio = StdioSpec(StdioSource.Closed, StdioSource.Object(out, HandleRights.WRITE), StdioSource.Object(out, HandleRights.WRITE)),
             fds = SpawnOptions.ROOT_PREOPEN,
         )
         val pid = m.spawn(program, driver, options, 0)

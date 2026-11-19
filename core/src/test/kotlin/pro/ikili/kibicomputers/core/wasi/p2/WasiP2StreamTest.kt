@@ -471,6 +471,55 @@ class WasiP2StreamTest {
         }
     }
 
+    /** 本物の [WasiP2Driver.start]（`initial-cwd` を決める）の後に、[after] をプロセスの中で動かすドライバー */
+    private class AfterStartDriver(private val inner: WasiP2Driver, private val after: (ProcessContext) -> Unit) :
+        pro.ikili.kibicomputers.core.kernel.process.ProcessDriver by inner {
+        override fun start(ctx: ProcessContext): StepResult = inner.start(ctx).also { after(ctx) }
+    }
+
+    @Test
+    fun `実物のドライバーで起動すると、ゲストが初めてget-environmentを呼ぶ前にcwdを変えても、PWDは起動時の値`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/home"))
+            val program = Program.component(
+                P2Testing.loadWat(
+                    """
+                    (component
+                      (core module ${'$'}m (memory (export "memory") 1) (func (export "run") (result i32) i32.const 0))
+                      (core instance ${'$'}i (instantiate ${'$'}m))
+                      (func ${'$'}run (result (result)) (canon lift (core func ${'$'}i "run") (memory ${'$'}i "memory")))
+                      (instance ${'$'}inst (export "run" (func ${'$'}run)))
+                      (export "wasi:cli/run@0.2.12" (instance ${'$'}inst))
+                    )
+                    """.trimIndent(),
+                ),
+            )
+            val failure = AtomicReference<Throwable>()
+            val driver = AfterStartDriver(WasiP2Driver.create(program.component!!)) { ctx ->
+                try {
+                    // start の後（ゲストはまだ get-environment を呼んでいない）に cwd を変える。PWD を決めたのは start の initialCwd
+                    ctx.changeDirectory("/")
+                    assertEquals("/", ctx.cwd.toString())
+                    assertEquals(listOf(envPair("PWD", "/home")), ctx.environment())
+                    assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+            }
+            val options = SpawnOptions(env = linkedMapOf("PWD" to "/stale"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN)
+            val pid = m.spawn(program, driver, options, 0)
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            failure.get()?.let { throw it }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
+            m.stop()
+        }
+    }
+
     @Test
     fun `get-terminalはTTYのときだけsome、wall-clockは実時間、wasi-socketsはnot-supported`() = timeout(limit) {
         Harness().use { h ->
