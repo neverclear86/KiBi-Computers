@@ -28,7 +28,9 @@ import org.junit.jupiter.api.Assertions.assertNull
 import pro.ikili.kibicomputers.core.kernel.process.KillResult
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.process.crashReason
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -386,6 +388,145 @@ class ComponentProcessTest {
             assertTrue(e is IllegalStateException && e.message!!.contains("コンポーネントのプロセスは instantiate を呼べない"), "$e")
             assertEquals(2, counted.get().first, "プログラムの 2 つの core インスタンスだけ")
             assertEquals(2 * CORE_INSTANCE_OVERHEAD_BYTES, counted.get().second, "固定費もその 2 つ分だけ")
+        }
+    }
+
+    // ---- 深い相互再帰（#705） ----
+
+    /**
+     * 親の `f`（`n` が 0 なら 100、そうでなければ子の `g` を `n - 1` で呼んで 1 足す）と、子の `g`（親の `f` を呼ぶだけ）の相互再帰。
+     * 仕様は同期の再入をトラップにしない（ADR 0265）ので、深さに上限はなく、Java のスタックが尽きるまで続く
+     */
+    private val mutualRecursion = """
+        (component
+          (core module ${'$'}M1
+            (type ${'$'}ft (func (param i32) (result i32)))
+            (table (export "tbl") 1 1 funcref)
+            (func (export "f") (param i32) (result i32)
+              (if (result i32) (i32.eqz (local.get 0))
+                (then (i32.const 100))
+                (else (i32.add
+                        (call_indirect (type ${'$'}ft) (i32.sub (local.get 0) (i32.const 1)) (i32.const 0))
+                        (i32.const 1))))))
+          (core instance ${'$'}m1 (instantiate ${'$'}M1))
+          (func ${'$'}f (export "run") (param "n" u32) (result u32) (canon lift (core func ${'$'}m1 "f")))
+          (component ${'$'}B
+            (import "f" (func ${'$'}f (param "n" u32) (result u32)))
+            (core func ${'$'}fl (canon lower (func ${'$'}f)))
+            (core module ${'$'}MB
+              (import "" "f" (func ${'$'}f (param i32) (result i32)))
+              (func (export "g") (param i32) (result i32) (call ${'$'}f (local.get 0))))
+            (core instance ${'$'}mb (instantiate ${'$'}MB (with "" (instance (export "f" (func ${'$'}fl))))))
+            (func (export "g") (param "n" u32) (result u32) (canon lift (core func ${'$'}mb "g"))))
+          (instance ${'$'}b (instantiate ${'$'}B (with "f" (func ${'$'}f))))
+          (core func ${'$'}gl (canon lower (func ${'$'}b "g")))
+          (core module ${'$'}M2
+            (import "" "tbl" (table 1 1 funcref))
+            (import "" "g" (func ${'$'}g (param i32) (result i32)))
+            (elem (i32.const 0) func ${'$'}g))
+          (core instance ${'$'}m2 (instantiate ${'$'}M2 (with "" (instance
+            (export "tbl" (table ${'$'}m1 "tbl"))
+            (export "g" (func ${'$'}gl)))))))
+    """
+
+    /** 相互再帰を [depth] で呼ぶプロセス。step を動かしたスレッドを [thread] に残す */
+    private fun recursing(
+        depth: Int,
+        result: AtomicInteger,
+        kind: ProcessKind,
+        thread: AtomicReference<Thread>? = null,
+    ): Pair<Program, TestDriver> {
+        val program = Program.component(LinkTesting.load(mutualRecursion, ComponentHost.NONE, metered = true))
+        val driver = TestDriver(kind) { ctx ->
+            thread?.set(Thread.currentThread())
+            result.set((ctx.component!!.call("run", args = listOf(CanonValue.I32(depth))) as CanonValue.I32).value)
+            StepResult.Exit(0)
+        }
+        return program to driver
+    }
+
+    /**
+     * 浅い再帰が最後まで進み、深い再帰がそのプロセスだけスタック切れで CRASHED になり、ほかのプロセスが動き続けることを確かめる。
+     * 深い再帰の step を動かしたスレッドを返す
+     */
+    private fun Harness.deepRecursionCrashesOnlyItself(m: Machine, kind: ProcessKind): Thread {
+        val progress = AtomicInteger()
+        m.spawnTest(program(spinForever(progress)), runDriver())
+        tickUntilTrue("spin が動かない") { progress.get() > 0 }
+
+        val shallow = AtomicInteger(-1)
+        val (shallowProgram, shallowDriver) = recursing(50, shallow, kind)
+        val ok = m.spawnRt(shallowProgram, shallowDriver)
+        tickUntilTrue("浅い再帰が終わらない") { ok.process.state.isTerminal || m.state == MachineState.CRASHED }
+        assertEquals(ProcessState.EXITED, ok.process.state, "${ok.lastError}")
+        assertEquals(150, shallow.get())
+
+        val deep = AtomicInteger(-1)
+        val deepThread = AtomicReference<Thread>()
+        val (deepProgram, deepDriver) = recursing(Int.MAX_VALUE, deep, kind, deepThread)
+        val bad = m.spawnRt(deepProgram, deepDriver)
+        assertEquals(kind, bad.process.kind)
+        tickUntilTrue("深い再帰が終わらない") { bad.process.state.isTerminal || m.state == MachineState.CRASHED }
+        assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${bad.lastError}")
+        assertEquals(ProcessState.CRASHED, bad.process.state, "${bad.lastError}")
+        // スタックが尽きた場所が Endive の中なら STACK_OVERFLOW のトラップ、リンカーの中なら StackOverflowError のまま上がる。どちらでもよい
+        val e = bad.lastError
+        assertTrue(e is StackOverflowError || (e is WasmTrapException && e.kind == WasmTrapKind.STACK_OVERFLOW), "$e")
+        assertEquals("call stack exhausted", crashReason(e!!), "コンソールに出す理由は、どちらでも同じ")
+        assertEquals(-1, deep.get())
+
+        // ほかのプロセスは動き続ける
+        val before = progress.get()
+        tickUntilTrue("ほかのプロセスが止まった") { progress.get() > before + 2 }
+        assertEquals(MachineState.RUNNING, m.state)
+        return deepThread.get()!!
+    }
+
+    @Test
+    fun `BLOCKINGのコンポーネントで深すぎる相互再帰は、そのプロセスだけがスタック切れでCRASHEDになり、ほかのプロセスは動き続ける`() = timeout(limit) {
+        Harness().use { h ->
+            // 燃料は十分に配る（スタックが先に尽きる）。共有の燃料と KernelLinkEnv の計測の下で動かす
+            val m = h.machine(fuelPerTick = 50_000_000)
+            h.deepRecursionCrashesOnlyItself(m, ProcessKind.BLOCKING)
+            // BLOCKING は spawn のたびに専用のスレッドを作る。同じ種類の次のプロセスも、続けて最後まで動く
+            val again = AtomicInteger(-1)
+            val (againProgram, againDriver) = recursing(50, again, ProcessKind.BLOCKING)
+            val next = m.spawnRt(againProgram, againDriver)
+            h.tickUntilTrue("次のプロセスが終わらない") { next.process.state.isTerminal || m.state == MachineState.CRASHED }
+            assertEquals(ProcessState.EXITED, next.process.state, "${next.lastError}")
+            assertEquals(150, again.get())
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `WAIT_POINTのコンポーネントがプールのワーカーでスタックを使い切っても、そのワーカーは生きていて次のstepを最後まで動かす`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 50_000_000)
+            val worker = h.deepRecursionCrashesOnlyItself(m, ProcessKind.WAIT_POINT)
+            // 動かしたのは、待機点への変換をかけたプログラム（ADR 0757）
+            assertTrue(recursing(50, AtomicInteger(), ProcessKind.WAIT_POINT).first.component!!.waitPoints)
+            // 深い再帰の step は WorkerPool のワーカー（専用のスレッドでない）で動いた
+            assertTrue(worker.name.startsWith("KiBi-worker-"), worker.name)
+            assertTrue(worker.isAlive, "スタック切れでワーカーのスレッドが死んだ")
+            // 同じワーカーに次の step が回るまで、同じ種類のプロセスを続けて動かす。どれも最後まで進む
+            var reused = false
+            for (i in 0 until 50) {
+                val again = AtomicInteger(-1)
+                val ran = AtomicReference<Thread>()
+                val (againProgram, againDriver) = recursing(50, again, ProcessKind.WAIT_POINT, ran)
+                val next = m.spawnRt(againProgram, againDriver)
+                h.tickUntilTrue("次のプロセスが終わらない") { next.process.state.isTerminal || m.state == MachineState.CRASHED }
+                assertEquals(ProcessState.EXITED, next.process.state, "${next.lastError}")
+                assertEquals(150, again.get())
+                if (ran.get() === worker) {
+                    reused = true
+                    break
+                }
+            }
+            assertTrue(reused, "スタックを使い切ったワーカーに、次の step が回らなかった")
+            assertTrue(worker.isAlive)
+            m.stop()
         }
     }
 }

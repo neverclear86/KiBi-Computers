@@ -12,7 +12,7 @@ import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
 /**
- * Component Model の仕様のテスト（`test/values`・`test/linking`・`test/resources` の wast）を、リンカーで動かす（#263・#265）。
+ * Component Model の仕様のテスト（`test/values`・`test/linking`・`test/resources` の wast と `test/async/reentrance.wast`）を、リンカーで動かす（#263・#265・#705）。
  *
  * wast は仕様のリポジトリ（https://github.com/WebAssembly/component-model 、コミット dd1fefc0c618382359feca6f2c758a2b3ef21c36、
  * Apache-2.0 WITH LLVM-exception）から写したもの（`src/test/resources/component-spec/`。`values/post-return.wast` は仕様の
@@ -40,6 +40,7 @@ class ComponentSpecTest {
         "resources-borrows",
         "resources-handle-table",
         "resources-multiple-resources",
+        "async-reentrance",
     )
 
     /** 通らないと分かっているもの（`ファイル:行` → 理由） */
@@ -338,6 +339,7 @@ class ComponentSpecTest {
             fun add(file: String, reason: String, vararg lines: Int) = lines.forEach { put("$file:$it", reason) }
             add("values-concat", MAP, 463, 723, 729, 732, 741, 748, 755, 762, 770, 788)
             add("values-variants", ASYNC, 83, 183, 184, 185, 186)
+            add("async-reentrance", ASYNC, 202, 237, 242, 346, 352, 429, 441, 521, 530, 658, 674, 786, 790, 864)
             add("linking-unit", MULTI_MEMORY, 261, 295, 296, 297, 298, 299, 300, 301, 302, 308, 344, 345, 346, 347, 348, 349, 350, 351, 355, 374, 375)
         }
     }
