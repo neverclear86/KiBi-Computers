@@ -388,7 +388,7 @@ val osLibrarySources = fileTree(osLibrary) { include("**/*.zig") }
 // 可変長の結果を返す import（`kibi.events` の `take`・`process.listProcesses`・`mounts.listMounts`/`listDisks`・`kibi.device`）を使い、
 // `cabi_realloc`（`os/lib/kibi/canon.zig`）を export する必要があるプログラム。使うものを足したら、ここにも足す
 // （足し忘れると、読み込みで NOEXEC になる。`StandardOsRestoreTest` が import から検出する）
-val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount", "man", "access", "lsdev", "devcall"))
+val osReallocPrograms = mapOf("bin" to setOf("sh", "nano", "ps", "df", "mount", "man", "access", "lsdev", "devcall", "vi"))
 
 // `os/<dir>/` の `.zig` を1つずつ WASM にする（sourceSet が null ならリソースに入れない）
 fun osPrograms(dir: String, sourceSet: String?, resourceDir: String) = osDir.dir(dir).asFile
