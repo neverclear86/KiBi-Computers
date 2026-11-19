@@ -80,7 +80,7 @@ __asm__(
  *   その差が LOOKAHEAD に収まるときだけ: 8 KiB 以下の区画では常に、16 KiB の区画では actual（kibi_brk.h）が 8,212 バイト以上のとき
  *   （ほぼ常に）、32 KiB の区画では actual が 24,596 バイト以上のとき（数える単位は 4 KiB の区画なので、境目は少し前後する）。それより埋まりが少ない 32 KiB の区画や、64 KiB 以上の
  *   大きな区画（次の確保が直後に来るとは限らない）では、次の頭は数えた範囲の外になる。そのときも頭の書き込みは keep なしで数えられて
- *   MIN で受けるのでトラップにはならないが、注記は出ないことがある。
+ *   MIN で受けるのでトラップにはならない。MIN の線で断るときは note_refusal が断られた commit を残すので、注記も出る（#802）。
  *   dlmalloc を前提にしていたころの、確保した所の後ろの余分（TAIL 16 バイト。次のチャンクの頭）は、#784 で外した
  *   （BrkAllocator は確保した所の後ろに頭を書かない。直後の区画の頭は LOOKAHEAD に含まれる）。
  *
@@ -122,6 +122,18 @@ static int count_stack(void) {
 }
 
 /*
+ * 残りが KIBI_LUA_MIN を割っていて確保を断るとき、commit が断られた記録を残す（#802）。
+ * 断る道のうち、commit を呼ばずに NULL を返す所（確保の前の MIN の線と、grow の後の見直し）では、プロセスが終わったときの
+ * 「メモリ不足だった」の注記（kibi:memory commit was refused。断られた commit の数で決まる）が出なかった。
+ * スタックの下端（深い再帰でしか書かれず、ふつうは数えていない区画）の 1 バイトを keep KEEP で数えさせる。残りが MIN 未満なら、
+ * 新しく数える区画があれば必ず断られ、何も数えない（ほかのプロセスが同時に RAM を返したときだけ、その 1 区画を数えうる。スタックの所なので害はない）。
+ * 下端まで数えてあれば（スタックが底まで深くなった後）commit は何も数えずに通り、注記は出ないことがある。失敗の道だけで呼ぶので、普段の道の import は増えない
+ */
+static void note_refusal(void) {
+    (void)kibi_memory_commit(&__stack_low, 1, KIBI_LUA_KEEP);
+}
+
+/*
  * free が空きリストの次を書く所（#753。kibi_brk.h）。区画はその大きさに揃えて置かれるので、4 KiB 以下の区画は 4 KiB の区画の中に収まり、
  * 確保した所と一緒に数えてある。64 KiB 以上の区画の最後は、memory.grow が先に数えた端か、前に free が書いた所。
  * 8〜32 KiB の区画だけ、最後が数えていない区画に残りうるので、その番地を返す（ほかは NULL）。数えないまま上限の近くで free すると、そこでトラップになる
@@ -146,13 +158,21 @@ static void *counted_alloc(size_t size) {
         if (!count_stack()) return NULL;
         remaining = kibi_memory_remaining();
     }
-    if (remaining < KIBI_LUA_MIN) return NULL;
+    if (remaining < KIBI_LUA_MIN) {
+        note_refusal();
+        return NULL;
+    }
     size_t pages = __builtin_wasm_memory_size(0);
     void *result = malloc(size);
     if (result == NULL) return NULL;
     /* memory.grow は区画の表（#753）と両端の区画を keep なしで数える。残りが線を割ったら、ここでスタックを数え直す */
     if (__builtin_wasm_memory_size(0) != pages && kibi_memory_remaining() < KIBI_LUA_KEEP + KIBI_LUA_STACK_GUARD) {
-        if (!count_stack() || kibi_memory_remaining() < KIBI_LUA_MIN) {
+        if (!count_stack()) {
+            discard(result);
+            return NULL;
+        }
+        if (kibi_memory_remaining() < KIBI_LUA_MIN) {
+            note_refusal();
             discard(result);
             return NULL;
         }

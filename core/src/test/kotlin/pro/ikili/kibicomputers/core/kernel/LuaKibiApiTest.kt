@@ -1008,14 +1008,17 @@ class LuaKibiApiTest {
     }
 
     @ParameterizedTest
-    @ValueSource(longs = [24, 28, 31, 40])
+    @ValueSource(longs = [28, 31, 40])
     fun `RAMの上限の近くでイベントを読み続けても、Cのスタックが深くなる所でトラップにならない`(remainingKib: Long) = timeout(limit) {
         // #729 の再現。上限の近くで、表に足す・queueEvent・pullEventRaw をくり返す。
         // 直す前は、pullEventRaw の中で初めて深くなった C のスタック（上端から 8〜12 KiB）への書き込みがトラップになっていた。
         // 関数は pcall の外で先に作る（ループの本体で作ると、確保が断られたときに、pullEventRaw の入れ子を一度も通らずに終わる）。
         // ループが最後まで回ったことと、pullEventRaw が1回でも成功した（入れ子を通った）ことを確かめる。
-        // 残りが約 22 KiB 以下だと、スタックを数える commit（残りを MIN の 8 KiB 残す）が最初の確保から断られ、入れ子まで届かないので、それより上の値だけを使う
-        // （その下の帯は、次のテストで確かめる）。この形は、直す前の kibi_wasi.c・kibi_lua_canon.c で回しても CRASHED にならないことがあり、
+        // スタックの計数は、まだ数えていない区画を最大 16 KiB 数え、その後に MIN の 8 KiB を残す。続けられると言えるのは、
+        // 残りがその線（24 KiB）に、包みを通らない書き込みの分（起きた後に初めて書く静的な変数やスタックの区画。少なくとも 1 区画の
+        // 4 KiB）を足した値より上のときだけなので、28 KiB 以上の値を使う（#802。24 KiB ちょうどは余裕が 0 で、lua.wasm の
+        // 静的な変数の配置が 16 バイトずれただけで、確保がすべて断られて Lua のエラーで終わった）。線の上下の帯は、次の 2 つのテストで確かめる。
+        // この形は、直す前の kibi_wasi.c・kibi_lua_canon.c で回しても CRASHED にならないことがあり、
         // 直したことの決め手ではない。上限の近くの経路を通して CRASHED にならないことを確かめる
         val script = """
             local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
@@ -1046,6 +1049,39 @@ class LuaKibiApiTest {
             val out = r.finish()
             r.release(held)
             assertEquals("ready\nloop-ok\npulled\ndone\n", out)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [22, 24, 26])
+    fun `RAMの残りがスタックを数える線の上下でも、イベントを読み続けてトラップにならない`(remainingKib: Long) = timeout(limit) {
+        // 前のテストと同じループを、スタックの計数の線（数える 16 KiB ＋ MIN の 8 KiB = 24 KiB）の前後で回す（#729・#802）。
+        // この帯では、スタックを数えられるか、数えた後に起きる包みの外の書き込み（静的な変数の区画など）で残りが MIN を割るかが、
+        // lua.wasm の配置やスタックの深さで変わる。割れば確保はすべて断られ、pcall の外の確保（CallInfo など）も
+        // not enough memory になって、Lua のエラーで終わりうる。どちらでも CRASHED にならない（EXITED で終わる）ことだけを確かめる
+        val script = """
+            local rep, q, p, pe, pc = string.rep, os.queueEvent, "p", os.pullEventRaw, pcall
+            local t = {}
+            local grow = function() t[#t + 1] = rep("y", 16) end
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            for i = 1, 400 do
+                pc(grow)
+                pc(q, p)
+                pc(pe)
+            end
+        """.trimIndent()
+        Run(script, memoryBytes = 512 * 1024L).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            // finish は EXITED でなければ落ちる（Lua のエラーで終わっても EXITED）
+            try {
+                r.finish()
+            } finally {
+                r.release(held)
+            }
+            Unit
         }
     }
 
@@ -1149,14 +1185,26 @@ class LuaKibiApiTest {
         }
     }
 
-    @Test
-    fun `取り出した後のLuaの確保だけが失敗したら、写せなかったイベントをevents_droppedで知らせる`() = timeout(limit) {
+    @ParameterizedTest
+    @ValueSource(longs = [20, 24, 28, 32])
+    fun `取り出した後のLuaの確保だけが失敗したら、写せなかったイベントをevents_droppedで知らせる`(remainingKib: Long) = timeout(limit) {
         // 結果の場所（take の見積もり）は解放した穴に入り、取り出したイベントを Lua の値に写す確保だけが断られる形（#727・#729）。
-        // 1回の pullEventRaw は、取れるイベントを 8 件ずつ全部 FIFO に移すので、4 KiB のイベントを 40 件出せば、どこかの件で必ず断られる
+        // 1回の pullEventRaw は、取れるイベントを 8 件ずつ全部 FIFO に移すので、4 KiB のイベントを 40 件出せば、どこかの件で必ず断られる。
+        // 残りの値で結果を決めないよう、絞る前に次の 2 つをしておく（#802）:
+        // - C のスタックを、起きた後の pullEventRaw より深くまで書いておく（string.gsub のコールバックの入れ子）。上限の近くの
+        //   スタックの計数（kibi_wasi.c の count_stack）が新しく数える区画をなくし、結果がヒープの穴とイベントの写しだけで決まる
+        //   （スタックの数え方は、ほかの上限の近くのテストが受け持つ）
+        // - 起きた後と同じ形（フィルターなし）の pullEventRaw を一度通しておく。その道が初めて書く静的な変数（tty のキーの状態など）の
+        //   区画を先に数えさせる。どの変数がまだ書いていない 4 KiB の区画に入るかは lua.wasm のリンクの配置で決まり、
+        //   関係のないコードの変更で、起きた後の残りが 4 KiB 変わっていた
+        // 残り 20 KiB では、スタックの計数で区画を数えると（16 KiB と MIN の 8 KiB が要る）見積もりから断られるので、
+        // 上の前提が崩れれば [false, not enough memory, 40, 0] で落ちる
         val script = """
-            local pull, sleep, pc = os.pullEventRaw, os.sleep, pcall
+            local pull, sleep, pc, gsub = os.pullEventRaw, os.sleep, pcall, string.gsub
+            local function deep(n) if n > 0 then gsub("x", "x", function() deep(n - 1) end) end end
+            deep(40)
             os.queueEvent("x")
-            pull("x")
+            pull()
             -- take の見積もりより大きい穴を作っておく（上限の近くで、結果の場所は新しく数えずに取れる）
             local s = ("z"):rep(48 * 1024)
             s = nil
@@ -1181,7 +1229,7 @@ class LuaKibiApiTest {
             r.waitFor("ready\n")
             val text = DeviceValue.of("e".repeat(4000))
             repeat(40) { assertTrue(r.dev.context!!.postEvent("big", text)) }
-            val held = r.squeeze(24 * 1024)
+            val held = r.squeeze(remainingKib * 1024)
             r.waitFor("failed\n")
             r.waitUntil("また待たない") { r.m.stateOf(r.pid) == ProcessState.WAITING_EVENT }
             r.release(held)
