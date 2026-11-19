@@ -356,8 +356,9 @@ object StandardOsGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun luaReceivesKeyEvents(helper: GameTestHelper) {
         val (case, screen, keyboard) = placeComputer(helper)
-        // 最初の pullEvent でカーネルのキューが開くので、kready が出た時点でキーのイベントを受けられる
-        val script = "os.queueEvent('r0'); os.pullEvent('r0'); print('kready'); local e; " +
+        // 最初の pullEvent でカーネルのキューが開く。filter なしで待つので、端末のエコーもここで切れる（ADR 0798。
+        // filter 付きだと切れるのは次の待ちで、kready を見て打った文字がその前に届くとエコーされてしまう）
+        val script = "os.queueEvent('r0'); os.pullEvent(); print('kready'); local e; " +
             "repeat e = {os.pullEvent('key')} until e[2] == keys.q; " +
             "print(table.concat({'kp', keys.getName(e[2]), tostring(e[3]), #e}, ','))"
         var step = 0
