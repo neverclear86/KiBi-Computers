@@ -592,6 +592,17 @@ internal interface ProcessContext {
     @Throws(FsException::class, ProcessKilledException::class, WasmTrapException::class)
     fun execWithHandle(path: String, drivers: ProcessDriverFactory, options: SpawnOptions, place: HandlePlacement): ProcessHandle
 
+    /**
+     * [finishExecWithHandle] と同じだが、子のハンドルを [place] に置く（p2 の待機点型の `spawn`。#800）。置き場が満杯なら、子を作らずに `MFILE`。
+     * カーネルロックを持たずに呼ぶ
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun finishExecWithHandle(wait: ExecWait, place: HandlePlacement): ProcessHandle
+
+    /** 置き場 [place] に、子のハンドルを入れる空きがあるか確かめる（なければ `MFILE`。#800）。カーネルロックを持たずに呼ぶ */
+    @Throws(FsException::class)
+    fun checkHandleRoom(place: HandlePlacement)
+
     /** [processHandleStatus] と同じ（子のハンドル [handle]） */
     @Throws(FsException::class)
     fun processHandleStatus(handle: HandleEntry): ExitStatus?
@@ -626,6 +637,13 @@ internal interface ProcessContext {
      */
     @Throws(FsException::class)
     fun startDeviceCall(device: HandleEntry, method: String, args: List<DeviceValue>, place: HandlePlacement): Int
+
+    /**
+     * [beginDeviceInvoke] と同じだが、device を解決済みのハンドル [device] で受け、待つときの `pending-call` を [place] に置く
+     * （p2 の待機点型の `invoke`。#800）。[DeviceInvokeStart.Waiting.callFd] はその番号。上限 `MAX_PENDING_CALLS` には数えない
+     */
+    @Throws(FsException::class, ProcessKilledException::class)
+    fun beginDeviceInvoke(device: HandleEntry, method: String, args: List<DeviceValue>, mayWait: Boolean, place: HandlePlacement): DeviceInvokeStart
 
     /** [takeDeviceCall] と同じ（`pending-call` のハンドル [call]） */
     @Throws(FsException::class)

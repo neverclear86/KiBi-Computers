@@ -39,7 +39,11 @@ internal object KernelComponentHost : ComponentHost {
  * `kibi:fs/mounts`、`kibi:device/{types,bus,bus-poll}`、`kibi:computer/{memory,clock,power,access}`。
  * p1 だけの `kibi:io/fd`・`kibi:io/pipe`、p3 の `*-async` は出さない（`null`。読み込みの失敗 → `NOEXEC`）。
  * `kibi:computer/memory` の `commit` は、lower した `commit` を import した core インスタンスの線形メモリ（[ComponentCall.callerMemory]）の区画を数える（#777。ADR 0777）。
- * 待たないので [HostWait.NONE]（[BLOCKING_FUNCTIONS] に入れない。入れると memory を import するコンポーネントがすべて `BLOCKING` になる）
+ * 待たないので [HostWait.NONE]（[WasiP2Io.waiting] で作らない）
+ *
+ * 待ちうる関数（#757・#800）は、`kibi:device/bus` の `[method]device.invoke` と、`kibi:process` の `[static]process.spawn`・
+ * `spawn-with-handles` だけ。どれも [WasiP2Io.waiting] で作り（[HostWait.UNWIND]）、巻き戻せるときは巻き戻して待つ。待ち方は
+ * `wasi:*` と同じく本体から決める（[WasiP2Io.waitOf]。名前の表を持たないので、本体と食い違わない）
  *
  * - 型は [KibiP2Wit.TEXT] を [WitReader] で読んだもの。`use wasi:…@0.2.12` の型は [WasiP2Host] が読んだものに解決するので、
  *   `pollable`・`input-stream`・`output-stream`・`descriptor` は `wasi:*` と同じ resource（同じ識別子・同じ dtor）になる
@@ -77,37 +81,23 @@ internal object KibiP2Host : ComponentHost {
         bodies.putAll(KibiP2Kernel.functions(t))
         bodies.putAll(KibiP2Process.functions(t))
         bodies.putAll(KibiP2Device.functions(t))
-        // 待ちうる関数の名前が WIT とずれると、待たないもの（NONE）とみなされ、待機点型のプロセスが止まろうとして CRASHED になる（#757）
-        for ((iface, names) in BLOCKING_FUNCTIONS) {
-            val unknown = names - wit[iface]?.functions?.keys.orEmpty()
-            check(unknown.isEmpty()) { "待ちうる関数 $iface の $unknown が WIT にない" }
-        }
         val out = LinkedHashMap<String, HostInterface>()
         for ((key, w) in wit) {
             val impl = bodies.remove(key) ?: emptyMap()
             val missing = w.functions.keys - impl.keys
             val extra = impl.keys - w.functions.keys
             check(missing.isEmpty() && extra.isEmpty()) { "$key の実装が WIT と合わない（ない: $missing、余り: $extra）" }
-            val functions = w.functions.mapValues { (n, type) -> HostFunction(type, waitOf(key, n), P2.guard(impl.getValue(n))) }
+            // 待ち方は本体から決める（`wasi:*` と同じ。#800）。P2.guard で包む前の本体に当てる
+            val functions = w.functions.mapValues { (n, type) ->
+                val body = impl.getValue(n)
+                HostFunction(type, WasiP2Io.waitOf(body), P2.guard(body))
+            }
             out[key] = HostInterface("$key@${ComponentImportPolicy.KIBI_VERSION}", functions, w.resources.mapValues { resources.getValue(it.value) })
         }
         check(bodies.isEmpty()) { "WIT にないインターフェースの実装: ${bodies.keys}" }
         return Built(out, wit)
     }
 }
-
-/**
- * `kibi:*` のホストの関数のうち、待ちうるもの（#757）。どれも巻き戻せない（[HostWait.BLOCK]。デバイスの呼び出しと子の読み込みを
- * スレッドを持って待つ）ので、これを import するコンポーネントは `BLOCKING` で動く
- */
-private val BLOCKING_FUNCTIONS: Map<String, Set<String>> = mapOf(
-    KibiP2Device.BUS to setOf("[method]device.invoke"),
-    KibiP2Process.PROCESS to setOf("[static]process.spawn"),
-    KibiP2Process.PROCESS_POLL to setOf("spawn-with-handles"),
-)
-
-private fun waitOf(iface: String, name: String): HostWait =
-    if (BLOCKING_FUNCTIONS[iface]?.contains(name) == true) HostWait.BLOCK else HostWait.NONE
 
 /** `kibi:*` の p2 の実装の共通の部品（#685） */
 internal object KibiP2 {
@@ -140,6 +130,18 @@ internal object KibiP2 {
 
         override fun unplaceLocked(slot: Int) {
             P2.tableLocked(ctx).remove(slot)
+        }
+    }
+
+    /**
+     * ゲストに rep を渡していない表の項目 [slot]（巻き戻して待つ `invoke` の `pending-call`。#800）を外し、持っている参照を返す。
+     * もうなければ何もしない
+     */
+    fun discard(ctx: ProcessContext, slot: Int) {
+        ctx.withKernelLock {
+            val e = P2.tableLocked(ctx).remove(slot) ?: return@withKernelLock
+            val id = e.objectId
+            if (id != 0 && ctx.kernel.objects[id] != null) ctx.kernel.objects.release(id, ctx.wakeSink)
         }
     }
 
