@@ -52,6 +52,7 @@ class KibiP2LiftOrderTest {
     private val nameTooLong = KibiErrors.code(Errno.NAMETOOLONG)
     private val tooBig = KibiErrors.code(Errno.TOOBIG)
     private val inval = KibiErrors.code(Errno.INVAL)
+    private val badDescriptor = KibiErrors.code(Errno.BADF)
 
     private val realloc = """
         (memory (export "memory") 1)
@@ -193,8 +194,28 @@ class KibiP2LiftOrderTest {
     }
 
     @Test
-    fun `spawn-with-handlesのhandlesの個数は、fdsまでの引数の後に確かめる`() = timeout(limit) {
-        // handles = 257 個の { fd: i, source: input(borrow stdin) }（record handle-assign: fd +0、判別子 +4、ハンドル +8）
+    fun `spawn-with-handlesのhandlesの個数は、fdsまでの引数とKibiProcess-optionsの後に確かめる`() = timeout(limit) {
+        // handles = 257 個の { fd: i, source: input(borrow stdin) }（record handle-assign: fd +0、判別子 +4、ハンドル +8）。個数だけが誤り
+        // 各 export は、257 個の handles に、別の誤りを 1 つ足して呼ぶ。引数: path(ptr,len) args(ptr,len) cwd(disc,ptr,len) fds(ptr,len)
+        // メモリ: 4096 から 5000 バイトの 0（長すぎる path・cwd）、20480 から 4097 個の空の string（args）、
+        // 64 に fds の要素 { fd: 5, source: parent(3) }（p2 は 0..2 だけ）、80 に { fd: 2^31, source: closed }（fd が範囲外）
+        fun export(name: String, vararg args: Int): String = """
+              (func (export "$name") (result i32)
+                (call ${s}sh ${args.joinToString(" ") { "(i32.const $it)" }}))
+        """
+        val okPath = intArrayOf(32, 7)
+        val longPath = intArrayOf(4096, 5000)
+        val noArgs = intArrayOf(0, 0)
+        val noCwd = intArrayOf(0, 0, 0)
+        val noFds = intArrayOf(0, 0)
+        val exports = listOf(
+            export("long-path", *longPath, *noArgs, *noCwd, *noFds),
+            export("ok-path", *okPath, *noArgs, *noCwd, *noFds),
+            export("many-args", *okPath, 20480, 4097, *noCwd, *noFds),
+            export("long-cwd", *okPath, *noArgs, 1, 4096, 5000, *noFds),
+            export("bad-parent", *okPath, *noArgs, *noCwd, 64, 1),
+            export("fd-out-of-range", *okPath, *noArgs, *noCwd, 80, 1),
+        )
         val wat = """
             (module
               (import "kibi:process/process-poll@0.1.0" "spawn-with-handles" (func ${s}spawnh (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
@@ -202,7 +223,11 @@ class KibiP2LiftOrderTest {
               (import "wasi:io/streams@0.2.12" "[resource-drop]input-stream" (func ${s}idrop (param i32)))
               $realloc
               (data (i32.const 32) "/bin/ok")
-              (func ${s}sh (param ${s}pp i32) (param ${s}pl i32) (result i32)
+              (data (i32.const 64) "\05\00\00\00\00\00\00\00\03\00\00\00")
+              (data (i32.const 80) "\00\00\00\80\01\00\00\00\00\00\00\00")
+              (func ${s}sh
+                (param ${s}pp i32) (param ${s}pl i32) (param ${s}ap i32) (param ${s}al i32)
+                (param ${s}cd i32) (param ${s}cp i32) (param ${s}cl i32) (param ${s}fp i32) (param ${s}fl i32) (result i32)
                 (local ${s}in i32) (local ${s}i i32) (local ${s}r i32)
                 (local.set ${s}in (call ${s}stdin))
                 (loop ${s}fill
@@ -213,32 +238,36 @@ class KibiP2LiftOrderTest {
                   (br_if ${s}fill (i32.lt_u (local.get ${s}i) (i32.const 257))))
                 (call ${s}spawnh
                   (local.get ${s}pp) (local.get ${s}pl)
-                  (i32.const 0) (i32.const 0)
+                  (local.get ${s}ap) (local.get ${s}al)
                   (i32.const 0) (i32.const 0) (i32.const 0)
-                  (i32.const 0) (i32.const 0) (i32.const 0)
-                  (i32.const 0) (i32.const 0)
+                  (local.get ${s}cd) (local.get ${s}cp) (local.get ${s}cl)
+                  (local.get ${s}fp) (local.get ${s}fl)
                   (i32.const 16384) (i32.const 257)
                   (i32.const 96))
                 (local.set ${s}r (if (result i32) (i32.load8_u (i32.const 96)) (then (i32.load8_u (i32.const 100))) (else (i32.const -1))))
                 (call ${s}idrop (local.get ${s}in))
                 (local.get ${s}r))
-              (func (export "long-path") (result i32) (call ${s}sh (i32.const 4096) (i32.const 5000)))
-              (func (export "ok-path") (result i32) (call ${s}sh (i32.const 32) (i32.const 7))))
+              ${exports.joinToString("\n")})
         """.trimIndent()
         val bytes = KibiP2WitTool.component(
             """
             import kibi:process/process-poll@0.1.0;
             import wasi:cli/stdin@0.2.12;
             import wasi:io/streams@0.2.12;
-            export long-path: func() -> s32;
-            export ok-path: func() -> s32;
+            ${exports.joinToString("\n") { "export ${Regex("\"(.*?)\"").find(it)!!.groupValues[1]}: func() -> s32;" }}
             """.trimIndent(),
             wat,
         )
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = machine(h)
-            // 引数の順（path → … → fds → handles）なので、長すぎる path が先
+            // 引数の順（path → args → cwd → fds → KibiProcess.options → handles）なので、handles の個数（invalid）より前の誤りが先
             assertEquals(nameTooLong, runGuest(h, m, bytes, "long-path"))
+            assertEquals(tooBig, runGuest(h, m, bytes, "many-args"))
+            assertEquals(nameTooLong, runGuest(h, m, bytes, "long-cwd"))
+            // fds の parent(3) は p2 の規則（request）、fd の範囲は KibiProcess.options。どちらも handles の個数より先
+            assertEquals(badDescriptor, runGuest(h, m, bytes, "bad-parent"))
+            assertEquals(badDescriptor, runGuest(h, m, bytes, "fd-out-of-range"))
+            // ほかに誤りがなければ handles の個数
             assertEquals(inval, runGuest(h, m, bytes, "ok-path"))
             m.stop()
         }

@@ -27,7 +27,8 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
  * `kibi:process/process`・`kibi:process/process-poll` の p2 の実装（#685。ADR 0685）。意味は p1 と同じ（[KibiProcess]）。
  *
  * - `spawn` の引数は、Canonical ABI が全引数を lift してから（align・範囲・UTF-8・判別子の誤りはそこでトラップ）この本体を呼ぶ（#616。ADR 0616）。
- *   本体の検査は引数の順（path → args → env → cwd → fds → handles）で、上限とコードは p1 と同じ。p2 のゲストが番号で知っている fd は 0/1/2 だけなので
+ *   本体の検査は、`request()` が path → args・env（個数と合計バイト数）→ cwd → fds（個数と `parent(n)`）の順に確かめ、その後に `KibiProcess.options`
+ *   （fd の範囲・fd の重複・args と env の NUL・env の名前の誤り。args・env の一部の検査はここなので fds より後）、最後に `handles` の個数。上限とコードは p1 と同じ。p2 のゲストが番号で知っている fd は 0/1/2 だけなので
  *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `bad-descriptor`。process.wit の `fd-source.parent` のとおり）
  * - `spawn`・`spawn-with-handles` は待ちうる関数（[WasiP2Io.waiting]。#800）。待機点型では p1 の UNWIND と同じく巻き戻して読み込みを待ち、
  *   ブロッキング型（と作っている途中）は `ctx.execWithHandle` で待つ（読み込みの間は CPU と許可を返す）
@@ -153,8 +154,9 @@ internal object KibiP2Process {
     /**
      * `spawn` の引数を確かめ、`handles` を当てて、実行ファイルのパスと [SpawnOptions] にする。
      *
-     * 引数はすべて lift 済み（Component Model の順。#616）なので、ここで確かめるのはホストの検査だけで、順は引数の順
-     * （`path` → `args` → `env` → `cwd` → `fds` → `handles`）。`handles` の個数も `fds` の後に確かめる
+     * 引数はすべて lift 済み（Component Model の順。#616）なので、ここで確かめるのはホストの検査だけ。順は [request]（`path` → `args`・`env` の個数と合計 →
+     * `cwd` → `fds` の個数と `parent(n)`）→ [KibiProcess.options]（fd の範囲・重複、NUL、env の名前）→ `handles` の個数（`spawn-with-handles` だけ）。
+     * `handles` の個数は `KibiProcess.options` の後に確かめる
      */
     @Throws(FsException::class)
     private fun spawnOptions(ctx: ProcessContext, pathValue: CanonValue, optionsValue: CanonValue, handles: List<CanonValue>): Pair<String, SpawnOptions> {

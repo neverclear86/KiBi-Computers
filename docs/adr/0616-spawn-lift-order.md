@@ -37,8 +37,8 @@ Issue は「p1 の層も揃えるか（全引数の align を先に確かめる�
    3. `env`: 4096 組を超えたら `too-big`。合計は `args` と同じ予算から引く
    4. `cwd`: 4096 バイトを超えたら `name-too-long`
    5. `fds`: 256 個を超えたら `invalid`。前から順に、`parent(n)` の n が 0..2 の外なら `bad-descriptor`（p2 だけの規則。#74 の Q8-A）
-   6. `fds` の fd の重複、NUL を含む文字列、env の名前の誤り（`KibiProcess.options`）は `invalid`
-   7. `handles`（`spawn-with-handles` だけ）: 256 個を超えたら `invalid`（このタスクで `fds` の後に移した）。前から順に、fd の重複（`fds` と合わせて）は `invalid`、渡せないものは `bad-descriptor`・`not-supported`
+   6. `KibiProcess.options`: fd・親の fd が 2^31 以上なら `bad-descriptor`、`fds` の fd の重複、NUL を含む文字列、env の名前の誤りは `invalid`（args・env の NUL と名前の検査はここなので、5 の `fds` より後）
+   7. `handles`（`spawn-with-handles` だけ）: 256 個を超えたら `invalid`（このタスクで 6 の後に移した）。前から順に、fd の重複（`fds` と合わせて）は `invalid`、渡せないものは `bad-descriptor`・`not-supported`
    8. 置き場の空き（`mfile`。待機点型は読み込みの前に `checkHandleRoom`）
    9. カーネル（実行ファイルの `no-entry`・`noexec` など）
 3. 待機点型で巻き戻したら、巻き直しで同じ引数を lift し直す（ADR 0757）が、着いた呼び出しは `pendingSpawn` を使い、ホストの検査をやり直さない（ADR 0800）。トラップは本体より前に起きるので、`pendingSpawn` は作られない。
@@ -63,6 +63,7 @@ Issue は「p1 の層も揃えるか（全引数の align を先に確かめる�
 
 ## 確かめたこと
 
-- `KibiP2LiftOrderTest`（WAT のコアモジュールと WIT の world から作るコンポーネント。ブロッキング型）: 上の表の Component Model の層の列。トラップはメッセージ（`list の場所が align 4 に揃っていない`・`判別子が範囲の外`・UTF-8）まで照合し、子を作っていないこと・ホストの表が元の大きさのことも確かめる。対照として、揃っていて `path` だけ長すぎれば `name-too-long`、`args` が 4097 個だけなら `too-big`、`env` が none なら揃っていない `env_ptr` でも `name-too-long`。`spawn-with-handles` の 257 個の `handles` は、`path` が長すぎれば `name-too-long`、そうでなければ `invalid`。`invoke` の長すぎる `method` と揃っていない `args` は、トラップ（align 8）
+- `KibiP2LiftOrderTest`（WAT のコアモジュールと WIT の world から作るコンポーネント。ブロッキング型）: 上の表の上 6 行（長すぎる `path` や 4097 個の `args` と、後の引数の align・判別子・UTF-8 の誤りの組み合わせ）の Component Model の層の列。トラップはメッセージ（`list の場所が align 4 に揃っていない`・`判別子が範囲の外`・UTF-8）まで照合し、子を作っていないこと・ホストの表が元の大きさのことも確かめる。対照として、揃っていて `path` だけ長すぎれば `name-too-long`、`args` が 4097 個だけなら `too-big`、`env` が none なら揃っていない `env_ptr` でも `name-too-long`。`spawn-with-handles` の 257 個の `handles` は、長すぎる `path`（`name-too-long`）・4097 個の `args`（`too-big`）・長すぎる `cwd`（`name-too-long`）・`parent(3)` の `fds`（`bad-descriptor`）・範囲外の fd（`KibiProcess.options` の `bad-descriptor`）が先で、ほかに誤りがなければ `invalid`（手順 2 の 1・2・4・5・6 の後に 7 が来ることの固定）。`invoke` の長すぎる `method` と揃っていない `args` は、トラップ（align 8）
+- このテストで確かめていないもの: 表の「判別子の誤りだけ」「UTF-8 の誤りだけ」「範囲外のポインタ」の行、`device.start`（本文で `invoke` と同じ形と書いたが、テストは `invoke` だけ）、手順 1 の `handle-source` の判別子・`handles` の中の不正な borrow のハンドル・lift の予算超えのトラップ。lift の側の決まり（ADR 0264）に従う動きで、このタスクでは固定していない
 - `KibiP2WaitPointTest`: 待機点型でも、長すぎる `path` と揃っていない `args` はトラップになり、`pendingSpawn` も子も残らない
 - `WasiP1KibiProcessTest`: p1 の順（`misaligned-order`・`nowait-misaligned`）は、期待値を変えずに通る

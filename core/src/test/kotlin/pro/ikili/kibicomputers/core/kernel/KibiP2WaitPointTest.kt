@@ -787,23 +787,17 @@ class KibiP2WaitPointTest {
     }
 
     @Test
-    fun `待機点型でも、後の引数のliftの誤りは先の引数のホストの検査より先にトラップになり、pendingSpawnも子も残さない`() = timeout(limit) {
-        Harness(execRuntime = EndiveRuntime()).use { h ->
-            val m = h.machine(fuelPerTick = 10_000_000)
-            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
-            m.vfs.createDirectory(VfsPath.parse("/bin"))
-            writeFile(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
-            val r = Run(h, m, spawnLiftTrapCommand)
-            assertTrue(r.program.component!!.waitPoints, "${r.program.component!!.waitPointRejection}")
-            // 1 つ目の spawn の読み込みで巻き戻して待つ（このとき ComponentSuspend を覚えておく）
-            r.tickUntil("spawn で待たない: ${r.state()}") { r.state().isTerminal || (r.state() == ProcessState.WAITING_EVENT && r.suspend.pendingSpawn != null) }
-            r.finish(ProcessState.CRASHED)
-            val e = r.rt.lastError
-            assertTrue(e is WasmTrapException && e.message.orEmpty().contains("list の場所が align 4 に揃っていない"), "別の終わり方: $e")
-            assertNull(r.suspend.pendingSpawn)
-            // 子は 1 つ目の spawn の 1 つだけ（drop したので、刈り取られるか親なしで残る）
-            assertTrue(r.others().all { it == r.pid + 1 }, "余計な子がある: ${r.others()}")
-        }
+    fun `待機点型でも、後の引数のliftの誤りは先の引数のホストの検査より先にトラップになり、pendingSpawnも子も残さない`() = gated(spawnLiftTrapCommand) { runtime ->
+        // 1 つ目の spawn の読み込みを止めたまま、巻き戻して待っていること（pendingSpawn がある）を確かめる。待機点型の巻き戻しの後の spawn の場面
+        assertParked()
+        assertNotNull(suspend.pendingSpawn)
+        runtime.gate.countDown()
+        finish(ProcessState.CRASHED)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && e.message.orEmpty().contains("list の場所が align 4 に揃っていない"), "別の終わり方: $e")
+        assertNull(suspend.pendingSpawn)
+        // 子は 1 つ目の spawn の 1 つだけ（drop したので、刈り取られるか親なしで残る）
+        assertTrue(others().all { it == pid + 1 }, "余計な子がある: ${others()}")
     }
 
     /** 終わるか、[parked] の形で時計を待つところまで進め、待機点で待っていることを確かめる */
