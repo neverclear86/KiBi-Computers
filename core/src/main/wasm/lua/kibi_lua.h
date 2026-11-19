@@ -9,6 +9,7 @@
  * - kibi_lua_keys.c: keys ライブラリと、カーネルのキー名から CC のキーの番号への表（#724）
  * - kibi_lua_term.c: term ライブラリ（#724）
  * - kibi_lua_fs.c: fs ライブラリ（#724）
+ * - kibi_lua_tty.c: キー待ちの間の端末のモード（#798。ADR 0798）
  * - kibi_linit.c: Lua の linit.c の代わり。標準ライブラリと上のライブラリを開く
  */
 #ifndef KIBI_LUA_H
@@ -106,5 +107,15 @@ int kibi_lua_key_code(const char *name, size_t len);
 
 /* 保存から戻した（"restored" を受けた）ことを term に知らせる。印を立てるだけで、何も書かない（kibi_lua_arena_hold の中から呼ぶ） */
 void kibi_lua_term_restored(void);
+
+/*
+ * キー待ちの間の端末のモード（#798。ADR 0798。kibi_lua_tty.c）。
+ * - kibi_lua_tty_keys: メインスレッドがキーを待ち始めるときに呼ぶ。標準入力が端末で cooked なら、echo と canonical を切る
+ * - kibi_lua_tty_before_wait: poll_oneoff で待つ直前に呼ぶ。切っている間は、今読める標準入力を待たずに読み捨てる
+ * - kibi_lua_tty_restore: 標準入力を読む前と終わるときに呼ぶ（kibi_wasi.h の lua_readline・clearerr と atexit）。切っていなければ何もしない
+ */
+void kibi_lua_tty_keys(void);
+void kibi_lua_tty_before_wait(void);
+void kibi_lua_tty_restore(void);
 
 #endif

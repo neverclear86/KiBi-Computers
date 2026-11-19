@@ -324,7 +324,8 @@ object StandardOsGameTests {
     }
     /**
      * キーの押下のイベント（#326、ADR 0326）: 標準 OS の `/bin/lua` で `os.pullEvent('key')` を待っている間に
-     * キーボードで `q` を押すと、CC と同じ `key`, `keys.q`, 繰り返し が届く（#724。ADR 0724）。`q` の押下は TTY に何も流さない
+     * キーボードで `q` を押すと、CC と同じ `key`, `keys.q`, 繰り返し が届く（#724。ADR 0724）。`q` の押下は TTY に何も流さない。
+     * キーを待つ間に打った文字はエコーされず、終わった後の `sh` のプロンプトにも残らない（#798。ADR 0798）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
@@ -347,14 +348,26 @@ object StandardOsGameTests {
                 }
                 1 -> {
                     helper.assertTrue(text.any { it == "kready" }, "lua should be waiting for keys: $text")
+                    // 待つ間に打った文字と、エコーされると見える Enter
+                    val typed = listOf(KeyboardEvent.KeyDown(Key.W, 0, false), KeyboardEvent.Text("ww"), KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                    for (packet in KeyboardEventCodec.encode(typed)) {
+                        helper.assertTrue(keyboard.receive(UUID(0, 1), packet) > 0, "keyboard should accept the keys")
+                    }
+                    step = 2
+                    helper.fail("typed ww")
+                }
+                2 -> {
                     for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.KeyDown(Key.Q, 0, false)))) {
                         helper.assertTrue(keyboard.receive(UUID(0, 1), packet) == 1, "keyboard should accept the key")
                     }
-                    step = 2
+                    step = 3
                     helper.fail("pressed q")
                 }
             }
             helper.assertTrue(text.any { it == "kp,q,false,3" }, "lua should receive the key event: $text")
+            helper.assertTrue(text.none { it.contains("ww") }, "the typed text should not be echoed: $text")
+            // 終わった後の sh のプロンプトの行は空（打った文字が先打ちとして残らない）
+            helper.assertTrue(text.lastOrNull { it.isNotEmpty() } == "$", "the shell prompt should be empty: $text")
             case.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }

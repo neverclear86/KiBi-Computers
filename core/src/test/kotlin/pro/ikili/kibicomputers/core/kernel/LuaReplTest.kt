@@ -11,6 +11,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -101,6 +102,40 @@ class LuaReplTest {
             h.tickUntil("エラーが出ない") { host.text().contains("boom") }
 
             // 空の行で Ctrl+D を押すと終わる
+            m.offerConsoleInput(byteArrayOf(0x04))
+            h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid))
+        }
+    }
+
+    @Test
+    fun `REPLでキーを待った後の行は、エコーされて評価され、待つ間に打ったものは混ざらない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host)
+            m.installLua()
+            val pid = m.exec("/bin/lua", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lua")))
+            h.awaitOutput(host, "\r\n> ")
+            m.offerConsoleInput("1+1\r".toByteArray())
+            h.awaitOutput(host, "2\r\n> ")
+
+            // タイマーを nil の filter で待つ間（#798。キー待ちと同じくモードを切る）に打ったものは、エコーされず捨てられる
+            var mark = host.text().length
+            m.offerConsoleInput("os.startTimer(1) print((os.pullEvent()))\r".toByteArray())
+            h.tickUntil("モードが切り替わらない") { m.lock.withLockValue { m.consoleTtyLocked().mode != TtyMode.COOKED } }
+            m.offerConsoleInput("zz\r".toByteArray())
+            h.awaitOutput(host, "timer\r\n> ")
+            assertEquals("os.startTimer(1) print((os.pullEvent()))\r\ntimer\r\n> ", host.text().substring(mark))
+            assertEquals(TtyMode.COOKED, m.lock.withLockValue { m.consoleTtyLocked().mode })
+
+            // 次の行はエコーされて評価され、履歴（上の矢印で 2 つ前の 1+1）も使える
+            mark = host.text().length
+            m.offerConsoleInput("2+3\r".toByteArray())
+            h.awaitOutput(host, "5\r\n> ")
+            m.offerConsoleInput("\u001b[A\u001b[A\u001b[A\r".toByteArray())
+            h.awaitOutput(host, "2\r\n> ")
+            assertTrue(host.text().substring(mark).startsWith("2+3\r\n5\r\n> "), host.text().substring(mark))
+
             m.offerConsoleInput(byteArrayOf(0x04))
             h.tickUntil("終わらない") { m.stateOf(pid).isTerminal }
             assertEquals(ProcessState.EXITED, m.stateOf(pid))
