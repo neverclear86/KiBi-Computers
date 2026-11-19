@@ -1094,6 +1094,8 @@ class LuaKibiApiTest {
         // note_refusal がなければ、プロセスが終わったときの「kibi:memory commit was refused」の注記（断られた commit の数で決まる）が出ない。
         // 絞る前に C のスタックを深くまで書いておき（string.gsub のコールバックの入れ子）、絞った後のスタックの計数が新しく区画を数えないようにする。
         // そうすると、計数は何も数えずに通り、残りが MIN 未満のまま MIN の線に着く。pcall の外で確保して、Lua のエラー（not enough memory）で終わらせる
+        // もう 1 か所の note_refusal（memory.grow の後の見直しで MIN を割る道）は、Lua からでは通る道が決まらない（緊急の GC のやり直しが MIN の線で断る）ので、
+        // 包みを直接呼ぶ LuaAllocProgramTest で確かめる
         val script = """
             local gsub = string.gsub
             local function deep(n) if n > 0 then gsub("x", "x", function() deep(n - 1) end) end end
