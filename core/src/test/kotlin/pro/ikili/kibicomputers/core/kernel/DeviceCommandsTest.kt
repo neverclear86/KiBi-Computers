@@ -8,6 +8,7 @@ import pro.ikili.kibicomputers.api.device.DeviceContext
 import pro.ikili.kibicomputers.api.device.DeviceException
 import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -170,9 +171,9 @@ class DeviceCommandsTest {
             text
             text
             ---
-            inf
-            -inf
-            nan
+            f:inf
+            f:-inf
+            f:nan
             1e20
             1e-7
             0.00001
@@ -359,6 +360,43 @@ class DeviceCommandsTest {
                 m.stateOf(pid).isTerminal
             }
             assertEquals("$A test:dev\n+ $C test:screen\n- $A test:dev\n", host.text())
+        }
+    }
+
+    @Test
+    fun `lsdev -wはキューがあふれたら一覧を読み直して、捨てた分の差を書く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val host = ConsoleHost()
+            val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 8L * 1024 * 1024, maxDevices = 100)
+            m.vfs.mount(VfsPath.ROOT, image, readOnly = true, source = "disk:image:os")
+            assertTrue(m.devices.attach(A, TestDev()))
+            val pid = m.exec("/bin/lsdev", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lsdev", "-w"), cwd = "/", fds = SpawnOptions.ROOT_PREOPEN))
+            eventuallyDescribe(60_000, { "書かない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.text() == "$A test:dev\n" && m.stateOf(pid) == ProcessState.WAITING_EVENT
+            }
+            // tick を進めない間に、キューの容量（64）を超えて接続し、A も外す（あふれた分は捨てられ、切断も捨てられる）
+            val count = EventLimits.DEFAULT_CAPACITY + 6
+            val added = (1..count).map { "00000000-0000-4000-8000-%012x".format(0x1000 + it) }
+            for (address in added) assertTrue(m.devices.attach(address, TestDev("test:bulk")))
+            assertTrue(m.devices.detach(A))
+            val expected = listOf("$A test:dev", "- $A test:dev") + added.map { "+ $it test:bulk" }
+            eventuallyDescribe(60_000, { "読み直さない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.text().lines().filter { it.isNotEmpty() }.size >= expected.size
+            }
+            repeat(20) { h.scheduler.tick() }
+            val lines = host.text().lines().filter { it.isNotEmpty() }
+            // 捨てた接続も切断も、差として 1 回ずつ書く
+            assertEquals(expected.sorted(), lines.sorted(), host.text())
+            m.lock.withLockValue { m.killLocked(pid, KillSignal.INTERRUPT) }
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                m.stateOf(pid).isTerminal
+            }
         }
     }
 }

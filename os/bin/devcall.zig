@@ -306,8 +306,10 @@ fn writeInteger(out: *cli.Writer, v: i64) void {
     out.write(io.formatUnsigned(&tmp, @abs(v)));
 }
 
-/// 小数を、読み直すと同じ値になる最短の形で書く。`.`・`e` を含まなければ `.0` を足す（引数に戻すと float と推されるように）
+/// 小数を、読み直すと同じ値になる最短の形で書く。`.`・`e` を含まなければ `.0` を足す（引数に戻すと float と推されるように）。
+/// `inf`・`-inf`・`nan` は前置きなしでは text と読まれるので、`f:` を付ける（`f:inf`）
 fn writeFloat(out: *cli.Writer, v: f64) void {
+    if (std.math.isNan(v) or std.math.isInf(v)) out.write("f:");
     var buf: [64]u8 = undefined;
     const a = @abs(v);
     const mode: std.fmt.float.Mode = if (a == 0 or (a >= 1e-5 and a < 1e16)) .decimal else .scientific;

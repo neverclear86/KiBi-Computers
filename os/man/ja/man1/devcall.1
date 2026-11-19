@@ -24,7 +24,7 @@ devcall - デバイスのメソッドを呼ぶ
 
 前置きがなければ、`none` は none、`true`・`false` は boolean、整数は integer、`.` か `e` を含む数は float、ほかは text です。
 
-結果も同じ形で書きます: `none`、整数、小数（`2.0` のように必ず `.` か `e` を含む）、`true`・`false`、text、bytes は `x:` と 16 進。text の制御文字は `?` にします。
+結果も同じ形で書きます: `none`、整数、小数（`2.0` のように必ず `.` か `e` を含む。`inf`・`-inf`・`nan` は `f:inf`・`f:-inf`・`f:nan`）、`true`・`false`、text、bytes は `x:` と 16 進。text の制御文字は `?` にします。
 
 引数は 32 個まで、text と bytes は合わせて 64 KiB まで、メソッドの名前は 64 バイトまでです。
 

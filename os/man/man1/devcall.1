@@ -24,7 +24,7 @@ An argument can name its type with a prefix:
 
 Without a prefix, `none` is none, `true` and `false` are booleans, a whole number is an integer, a number with `.` or `e` is a float, and anything else is text.
 
-Results are written the same way: `none`, integers, floats (always with `.` or `e`, such as `2.0`), `true` or `false`, text, and bytes as `x:` followed by hexadecimal. Control characters in text are written as `?`.
+Results are written the same way: `none`, integers, floats (always with `.` or `e`, such as `2.0`; `f:inf`, `f:-inf` and `f:nan` with the prefix), `true` or `false`, text, and bytes as `x:` followed by hexadecimal. Control characters in text are written as `?`.
 
 At most 32 arguments, 64 KiB of text and bytes in all, and a method name of 64 bytes are allowed.
 
