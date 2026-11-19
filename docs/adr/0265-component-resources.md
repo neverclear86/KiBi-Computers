@@ -68,7 +68,7 @@ ADR 0043 は「`HandleTable` は fd と resource ハンドルの共通の形」�
 - なので、同期の再入はトラップにせず、検査を足さない。`ComponentSpecTest` に `reentrance.wast` を書き換えずに入れ、前半が計測なし・ありの両方で通ることを確かめた。
 - ゲストの dtor は、今のまま実装したインスタンスの core 関数を直接呼ぶ。同期では、仕様の lift/lower を通すのと観測できる差はない（`canon_lower` の `may_leave` は drop の入口で検査済み。引数は rep の i32 だけで borrow を受けないので、新しい Task の borrow の検査は何もしない。threads 表への登録は #266 の範囲）。lift の道に通すと、`liftDepth`（ADR 0757 の巻き戻しの判定）・post-return・燃料の勘定が変わるので、通さない。
 - 呼び出しごとの状態（スタックの上のインスタンスなど）も足さない。仕様が要らないとしている検査のために、すべての lift・lower の道に費用を足すことになるため。
-- 相互再帰の深さに上限はない。Java のスタックが尽きたら、Endive の中なら `STACK_OVERFLOW` のトラップ、リンカーの中なら `StackOverflowError` のまま上がる。どちらでもコンポーネントは使えなくなり、プロセスのクラッシュ（`CrashReason` の `STACK_OVERFLOW`）になる。サーバーは止めない（`isFatal` は `StackOverflowError` を除く）。
+- 相互再帰の深さに上限はない。Java のスタックが尽きたら、Endive の中なら `STACK_OVERFLOW` のトラップ、リンカーの中なら `StackOverflowError` のまま上がる（どちらになるかは尽きた位置で決まり、テストはどちらでも通す）。どちらでもコンポーネントは使えなくなり、プロセスのクラッシュ（`CrashReason` の `call stack exhausted`）になる。サーバーは止めない（`isFatal` は `StackOverflowError` を除く）。`ComponentLinkTest` はリンカー単体で、`ComponentProcessTest` はカーネルの下（`KernelLinkEnv` の計測・共有の燃料・ワーカーのスレッド）で、深い相互再帰がそのプロセスだけを `call stack exhausted` で終わらせ、ほかのプロセスと次のプロセスは動き続けることを確かめる。スタックが尽きる位置がカーネルのロックの途中だと、ロックが壊れる恐れがある。これは #828 で調べる。
 - ホストからの入れ子の `call`（#691）を断るのは、ADR 0073 の安全のための独自の規則で、仕様の再入の検査ではない。残す。
 - #266 への申し送り: async 型の関数の再入は、仕様の `enter_implicit_thread` のとおり、exclusive lock（`needs_exclusive`・`exclusive_thread`）と自動の backpressure（`backpressure`・`num_waiting_to_enter`）、同期で待つときの deadlock のトラップで写す。`reentrance.wast` の 202 行より後（async の関数・`task.return`・`subtask.cancel`・`thread.*`・`waitable-set.*` を使う部分。今は `KNOWN` に `ASYNC` で挙げた）で確かめる。
 
