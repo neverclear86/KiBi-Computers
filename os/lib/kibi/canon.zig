@@ -1,6 +1,6 @@
 //! 標準 OS の `cabi_realloc`（Canonical ABI。#87・#454）。可変長の結果を返す `kibi:*` の import は、ホストがゲストのこの関数で場所を取って書く。
 //!
-//! 使う包み: `events.Queue.takeOne`（`kibi:kernel/events` の `take`）・`process.listProcesses`・`mounts.listMounts`・`mounts.listDisks`・`access.getAccess`。
+//! 使う包み: `events.Queue.takeOne`（`kibi:kernel/events` の `take`）・`process.listProcesses`・`mounts.listMounts`・`mounts.listDisks`・`access.getAccess`・`device` の drop 以外。
 //! これらを使うプログラムだけが `cabi_realloc` を export する（`core/build.gradle.kts` の `osReallocPrograms` に足し、`--export=cabi_realloc`
 //! でビルドする）。`needsRealloc` の import を持つのに export していなければ、読み込みで NOEXEC になる（`StandardOsRestoreTest` が検出する）。
 //! 記号は 1 つしか置けないので、`cabi_realloc` はここにだけ書く（ほかのファイルに `export fn cabi_realloc` を書かない）。
