@@ -71,6 +71,8 @@
 - `LuaKibiApiTest`: コルーチンの中の `pullEventRaw` が filter を yield し、resume の値をそのまま返すこと（0 個、途中と末尾に nil、`n` 付き）。`pullEvent` の `terminate`。yield できない文脈でのエラーと、`sleep` がその場で待ってイベントを捨てないこと。コルーチンの中の `sleep` の続き（違う id・違う名前・`terminate`）。メインのフィルターが `terminate` を素通りさせること。`parallel`: 2 つの `sleep` が並んで進む（約 0.4 秒）、`waitForAny` の戻り値、引数なし、フィルターと `queueEvent` がほかのコルーチンに届く、入れ子、エラーの伝わり方、引数の誤り、`terminate`、上書きした `os.pullEventRaw` を通さないこと。今までの「コルーチンの中で待てる」テストは、yield する形に書き直した（ADR 0094 で「コルーチンの中の振る舞いはテストで固めない」としていた）
 - `LuaKibiApiRestoreTest`: `parallel` の中で、タイマー待ちとイベント待ちのコルーチンがいる間に保存して戻すと、`restored` が両方のイベント待ちに届き、タイマー待ちも続く
 - `LuaParallelScaleTest`: 上の規模
+- `LuaCoroutineRestoreTest`（#89）: ブロッキングするスタイルの Lua を丸ごと保存して戻す。ユーザーのコルーチン・上位値・メタテーブル・弱いテーブル・`__gc`・乱数の状態が、保存しなかった実行と同じ出力で続く。yield できない文脈（`table.sort` の比較関数の `os.sleep`、`string.gsub` のコールバックの `peripheral.call`。後者はメソッドが列にある間に保存）と、コルーチンの中・メインの `io.read` の待ちを、C のフレームごと巻き戻して続ける（開いたディスクと `/tmp` のファイルにも続けて書ける）。燃料切れで巻き戻った計算の途中から続ける。同じプロセスを何回も保存して戻す（差分の世代から戻すものを含む）。スケジューラと置き場を開き直して戻し、戻した直後にまた保存できる
+- GameTest（NeoForge 1.21.1 `MachineRestoreGameTests.restoresALuaProgramWaitingInParallel`）: 標準 OS の `lua -e` で、`parallel.waitForAll` の3つのコルーチン（`restored` 待ち、`os.sleep` で数える、キー待ち）が待つ間に書いて置き直すと、戻した後にどれも続く
 - `ManCommandTest`: `parallel(3)` があること
 - GameTest（NeoForge 1.21.1 `StandardOsGameTests.luaParallelRunsCoroutinesTogether`）: 標準 OS のシェルから `lua -e` で、`sleep` とイベントで待ち合わせる 2 つの関数を `parallel.waitForAll` で動かす
 

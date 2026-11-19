@@ -27,6 +27,7 @@ import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -252,6 +253,56 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(copy!!.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "pending" }, "the restored shell should run the redrawn line: $text")
+        }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * Lua のプログラムを丸ごと保存して戻す（#89）: 標準 OS のシェルから `lua -e` で、`parallel.waitForAll` の中の3つのコルーチン
+     * （`restored` を待つもの、`os.sleep` をくり返して数えるもの、キーを待つもの）が待っている間に書き、置き直して戻す。
+     * 戻した後に、`restored` を受けた行、数え終えた行、戻した後に押したキーを受けた行が画面に出る。画面の中身は保存しないので
+     * （ADR 0087、#630）、確かめるのは戻した後に出た行だけ。印は連結で作り、打った行（画面に残る）と一致させない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoresALuaProgramWaitingInParallel(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        val script = "os.queueEvent('o'); os.pullEvent('o'); local n = 0; parallel.waitForAll(" +
+            "function() local e = os.pullEvent('restored'); print('lr,' .. e) end, " +
+            "function() for i = 1, 60 do os.sleep(0.05); n = n + 1 end; print('ln,' .. n) end, " +
+            "function() print('lw' .. 'ait'); repeat local _, k = os.pullEvent('key') until k == keys.q; print('lk,' .. n) end)"
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            typeLine(helper, helper.getBlockEntity(KEYBOARD), "lua -e \"$script\"")
+        }.thenWaitUntil {
+            val text = lines(first.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lwait" }, "lua should wait in parallel: $text")
+            // step の途中で書くと、写しの中で Lua が殺されてシェルだけが戻る
+            helper.assertTrue(first.computer.saveReadiness() == SaveReadiness.READY, "lua should be at a wait point: ${first.computer.saveReadiness()}")
+        }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            copy = reload(helper, tag)
+        }.thenWaitUntil {
+            assertRestored(helper, copy!!)
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, outcome=${be.lastRestoreOutcome}, ${be.computer}",
+            )
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lr,restored" }, "the restored lua should receive restored: $text")
+            helper.assertTrue(text.any { it == "ln,60" }, "the restored lua should keep counting: $text")
+        }.thenExecute {
+            for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.KeyDown(Key.Q, 0, false)))) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the key")
+            }
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lk,60" }, "the restored lua should receive the key: $text")
         }.thenExecute {
             copy!!.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
