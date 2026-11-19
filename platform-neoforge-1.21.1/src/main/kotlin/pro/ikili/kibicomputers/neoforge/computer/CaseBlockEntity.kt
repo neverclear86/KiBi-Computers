@@ -320,45 +320,52 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal fun startRestore(writesTimedOut: Boolean) {
         val level = level as? ServerLevel ?: return
         if (!computer.isRestorePending || isRemoved) return
-        val config = MachineSpecs.configOf(tier, parts.tiers)
-        val disks = prepareDisks()
-        val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
-        val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
-        val store = WorldMachineSaves.current
-        // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
-        val id = currentIdentity
-        val source = when {
-            store == null || id == null -> null
-            writesTimedOut -> null
-            // 新しい ID は振った直後（世代 0）だけ冷えた起動にする。その後に書いた世代があれば戻す（FULL に戻ったときなど。#575）
-            lastClaim?.isNewId == true && id.generation == 0L -> null
-            else -> RestoreSource(store, id.id, id.generation)
+        // 用意（ディスク・設定・保存元）や ComputerCase.startRestore が投げても、表示を RUNNING・順番待ちのまま残さない（#808）。
+        // 順番待ちのままなら startRestore の前で投げたので、エラーにして順番待ちを抜ける（PoweredOn は残す）。例外はそのまま
+        // RestoreQueue に返し、場所ごとに間引いてログに出させる（#785）
+        try {
+            val config = MachineSpecs.configOf(tier, parts.tiers)
+            val disks = prepareDisks()
+            val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
+            val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
+            val store = WorldMachineSaves.current
+            // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
+            val id = currentIdentity
+            val source = when {
+                store == null || id == null -> null
+                writesTimedOut -> null
+                // 新しい ID は振った直後（世代 0）だけ冷えた起動にする。その後に書いた世代があれば戻す（FULL に戻ったときなど。#575）
+                lastClaim?.isNewId == true && id.generation == 0L -> null
+                else -> RestoreSource(store, id.id, id.generation)
+            }
+            lastRestoreSource = source
+            lastRestoreTimedOut = writesTimedOut
+            lastRestoreOutcome = null
+            val serial = ++restoreStarts
+            if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
+            ServerMachines.recordRestoreStart(source != null, writesTimedOut)
+            computer.startRestore(
+                ServerMachines.current,
+                MachineKey.of(level, blockPos),
+                installedForBoot,
+                true,
+                config,
+                environment,
+                boot,
+                source,
+                RestoreReady { machine ->
+                    wiring.attach(level, blockPos, machine, speakerAddress)
+                    logRestoreWiring(machine, source != null)
+                },
+                RestoreListener { _, outcome, cause ->
+                    noteRestoreOutcome(serial, outcome)
+                    ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
+                },
+            )
+        } finally {
+            if (computer.isRestorePending) computer.abandonRestore()
+            if (computer.machine == null) wiring.disconnect()
         }
-        lastRestoreSource = source
-        lastRestoreTimedOut = writesTimedOut
-        lastRestoreOutcome = null
-        val serial = ++restoreStarts
-        if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
-        ServerMachines.recordRestoreStart(source != null, writesTimedOut)
-        computer.startRestore(
-            ServerMachines.current,
-            MachineKey.of(level, blockPos),
-            installedForBoot,
-            true,
-            config,
-            environment,
-            boot,
-            source,
-            RestoreReady { machine ->
-                wiring.attach(level, blockPos, machine, speakerAddress)
-                logRestoreWiring(machine, source != null)
-            },
-            RestoreListener { _, outcome, cause ->
-                noteRestoreOutcome(serial, outcome)
-                ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
-            },
-        )
-        if (computer.machine == null) wiring.disconnect()
     }
 
     /**
