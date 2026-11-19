@@ -294,15 +294,19 @@ class AsyncFuelP2Test {
             val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val unwinds0 = h.scheduler.fuelUnwinds.get()
             var maxThreads = 0
-            repeat(40) {
+            // 遅い CI では 1 tick に回せる台が少ないので、tick の回数を決め打ちせず、全員分より多く巻き戻すまで（最低 40 tick）測る
+            val deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos()
+            var ticks = 0
+            while (ticks < 40 || (h.scheduler.fuelUnwinds.get() - unwinds0 <= spins.size && System.nanoTime() < deadline)) {
                 h.scheduler.tick()
                 Thread.sleep(5)
+                ticks++
                 val threads = spins.count { s -> s.m.lock.withLockValue { s.rt.thread != null } }
                 if (threads > maxThreads) maxThreads = threads
             }
             val unwinds = h.scheduler.fuelUnwinds.get() - unwinds0
             val blocking = h.scheduler.fuelBlockingWaits.get() - blocking0
-            println("多数台の p2 の燃料切れ: 巻き戻し $unwinds 回、スレッドを持って待った $blocking 回、スレッドを持つプロセスの最大 $maxThreads（${spins.size} 本）")
+            println("多数台の p2 の燃料切れ: $ticks tick で巻き戻し $unwinds 回、スレッドを持って待った $blocking 回、スレッドを持つプロセスの最大 $maxThreads（${spins.size} 本）")
             assertTrue(unwinds > spins.size, "燃料切れで巻き戻していない")
             assertEquals(0, blocking, "スレッドを持ったまま燃料を待った")
             // 動いている（許可を持つ）分だけがスレッドを持つ。許可を返してから登録を外すまでの間の重なりを見込んで 2 倍まで
