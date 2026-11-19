@@ -12,7 +12,8 @@
 //   kp realloc-spawn        get-cwd の cabi_realloc の中で spawn を呼ぶ（トラップになるはず）
 //   kp nowait               待たない設定で spawn（again になるはず）
 //   kp misaligned <list>    align 4 に揃っていない list の ptr（長さ 0）で spawn する（トラップになるはず。#430）。list は args・env・fds。env-cwd は揃っていない env と不正な cwd の判別子（env のトラップが先）
-//   kp misaligned-order     揃っていない list より先に読む引数（path・args・env・cwd）の誤りが、トラップより先に返る（#430。ADR 0074）
+//   kp misaligned-order     揃っていない list より先に読む引数（path・args・env・cwd）の誤りが、トラップより先に返る（#430。ADR 0074）。
+//                           p1 の順として固定（Component Model の層ではトラップになる。#616 で p1 は揃えないと決めた。ADR 0616）
 //   kp nowait-misaligned    待たない設定で、揃っていない args の ptr で spawn（引数を読む前に again になるはず）
 //   kp self                 self-pid・parent-pid
 //   kp ps                   眠る子・終わった子（ゾンビ）・親なしのゾンビ・シバンの子を作ってから list-processes を表示する（#452）

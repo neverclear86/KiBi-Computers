@@ -74,7 +74,7 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
 
 - 子は `Machine.exec` と同じく VFS の実行ファイルから作る（ドライバーは `KernelDrivers.DEFAULT`。子の ABI は実行ファイルの形で決まり、親の ABI と関係ない）。子の `ProcessObject` を親の fd 表に `READ` の権利で入れて、その fd を返す
 - fd 表の空きは読み込みの前と、子を表に足すのと同じカーネルロックの中の両方で確かめる（満杯なら子を作らずに `mfile`）。fd は子が動き出す前に入る
-- 引数の検査（ゲストの入力で例外を出さない）: 文字列が UTF-8 でなければ `invalid`。`args` 4096 個・`env` 4096 組・`fds` 256 個まで（仮の値。確定は #251）を要素を読む前に確かめる（`args`・`env` は `too-big`、`fds` は `invalid`）。文字列の合計は、中身を読む前に `ProcessArgs.MAX_BYTES` から引いて超えたら `too-big`。`path`・`cwd` は 4096 バイトまで（`name-too-long`）。範囲外は `fault`。`args`・`env`・`fds` の配列の ptr が align 4 に揃っていなければ、長さ 0 でもその list のほかの検査より先にトラップ（ADR 0073 の「エラー」。#430。`env` は `option` が none なら読まないので確かめない）。検査は引数の順（`path` → `args` → `env` → `cwd` → `fds`）なので、先の引数の error-code（`path` が長すぎれば `name-too-long`、`args` が 4096 個を超えれば `too-big`、`option` の判別子が不正なら `invalid`）は、あとの list の align のトラップより先に返り、待たない設定の `again` は引数を読む前に返る。Component Model では全引数の lift がホストの検査より前なので、これらの組み合わせはトラップになる（既知の差。#264 の層で、#616 で揃える）。`option`・`fd-source` の判別子の誤りと、`fds` の fd の重複は `invalid`
+- 引数の検査（ゲストの入力で例外を出さない）: 文字列が UTF-8 でなければ `invalid`。`args` 4096 個・`env` 4096 組・`fds` 256 個まで（仮の値。確定は #251）を要素を読む前に確かめる（`args`・`env` は `too-big`、`fds` は `invalid`）。文字列の合計は、中身を読む前に `ProcessArgs.MAX_BYTES` から引いて超えたら `too-big`。`path`・`cwd` は 4096 バイトまで（`name-too-long`）。範囲外は `fault`。`args`・`env`・`fds` の配列の ptr が align 4 に揃っていなければ、長さ 0 でもその list のほかの検査より先にトラップ（ADR 0073 の「エラー」。#430。`env` は `option` が none なら読まないので確かめない）。検査は引数の順（`path` → `args` → `env` → `cwd` → `fds`）なので、先の引数の error-code（`path` が長すぎれば `name-too-long`、`args` が 4096 個を超えれば `too-big`、`option` の判別子が不正なら `invalid`）は、あとの list の align のトラップより先に返り、待たない設定の `again` は引数を読む前に返る。Component Model では全引数の lift がホストの検査より前なので、これらの組み合わせはトラップになる。p1 はこの順として固定する（#616 で、p1 は揃えないと決めた。ADR 0616）。`option`・`fd-source` の判別子の誤りと、`fds` の fd の重複は `invalid`
 - カーネルのエラー（`no-entry`・`access`・`no-exec`・`bad-descriptor`・`not-directory` など）はそのまま写す。プロセスの数の上限は `nfile`
 - `cabi_realloc` の中で呼んだらトラップ
 
@@ -141,7 +141,7 @@ C の手書きの宣言は `core/src/main/wasm/common/kibi_process.h`（`_Static
   - `misaligned`: args・env・fds の list の ptr が align に揃っていなければ、長さ 0 でもトラップ（`UNWIND`・`BLOCK`）。揃っていない `env` のトラップは、後の `cwd` の `option` の判別子の誤りより先（`env-cwd`）
   - `misaligned-order`: 先の引数の誤り（`path` の `name-too-long`、`args` の個数の `too-big`、`env` の `option` の判別子の `invalid`、`cwd` の `name-too-long` と `option` の判別子の `invalid`）は、後の list（`args`・`env`・`fds`）の ptr が揃っていないトラップより先に error-code で返る。`fds` の `fd-source` の判別子の誤りは、このテストでは確かめない。`env` が none なら、揃っていない `env_ptr` でも確かめない
   - `nowait`・`nowait-misaligned`: `P1Wait.NONE` の `again` は、引数を読む前に返る
-  - 検査順を Component Model に揃えるとき（#616）は、`misaligned-order`・`nowait-misaligned` の期待値も合わせて直す
+  - `misaligned-order`・`nowait-misaligned` の期待値は、p1 の順として固定する（#616 で p1 は揃えないと決めた。ADR 0616）。Component Model の層の側は `KibiP2LiftOrderTest` が確かめる
 - `GuestCallGuardTest`: `callGuest` の中の `exec`・`execWithHandle` がトラップになる（ADR 0073）
 
 ## 保存

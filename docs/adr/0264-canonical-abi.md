@@ -70,7 +70,7 @@ lift（`canonicalize_nan`）も lower（`maybe_scramble_nan`）も、NaN は正�
 
 `CanonFunction` が `flatten_functype` の 2 つの向きを持つ。
 
-- canon lower（ゲストが import を呼ぶ）: `liftParams` で引数をすべて lift してから、ホストの処理を呼ぶ（Component Model の層では、ホストの検査は全引数の lift の後。#616 がこの順で `spawn` を揃える）。結果は `lowerResult` で返す。結果をポインタで渡す形では、書き先（ゲストの最後の引数）の align と範囲を、ホストの処理が済んでから、書く直前（realloc を呼ぶ前）に確かめる（ADR 0306 と同じ）
+- canon lower（ゲストが import を呼ぶ）: `liftParams` で引数をすべて lift してから、ホストの処理を呼ぶ（Component Model の層では、ホストの検査は全引数の lift の後。#616 でこの順をテストで固定した。ADR 0616）。結果は `lowerResult` で返す。結果をポインタで渡す形では、書き先（ゲストの最後の引数）の align と範囲を、ホストの処理が済んでから、書く直前（realloc を呼ぶ前）に確かめる（ADR 0306 と同じ）
 - canon lift（ホストがゲストの export を呼ぶ）: `lowerParams` で引数を渡し（17 個以上なら realloc で場所を取って書く）、`liftResult` で結果を読む。結果は post-return を呼ぶ前にすべてホスト側へ写す（メモリを指すビューを返さない）
 
 ### 予算
@@ -106,11 +106,11 @@ own・borrow の resource は、その resource を定義・import した型の�
 `P1Canonical` の KDoc と ADR 0073 は「#264 ができたら置き換える」としていたが、p1 は次の点で意図して Component Model と違う。置き換えると p1 のシステムコールの ABI の振る舞いが変わるので、#264 では置き換えない。
 
 - 範囲外は `fault`、UTF-8 の誤りは `invalid` を返す（Component Model ではトラップ）
-- 引数を順に lift しながらホストの検査をする（#616 の既知の差）
+- 引数を順に lift しながらホストの検査をする（#616 で、p1 の順として揃えないと決めた。ADR 0616）
 - 関数ごとの上限で、要素を読む前に止める
 - NaN は生のビットのまま書く
 
-置き換えるなら、p1 の振る舞いを変えずに既存のテストを無修正で通す形で、別の Issue（#616 の後）で行う。
+置き換えるなら、p1 の振る舞いを変えずに既存のテストを無修正で通す形で、別の Issue で行う。
 
 ## 測っていないこと
 
