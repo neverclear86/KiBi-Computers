@@ -13,6 +13,8 @@
  * - 読み捨ては poll_oneoff（標準入力の FD_READ と相対 0 の時計）で今読めるかを見てから fd_read する。待機点にならず、タイマーも作らない
  * - 使う import は kibi:io/tty の is-tty・get-mode・set-mode だけ（新しい口は足さない）。切った後と、切っていないときの読み取りでは
  *   import を呼ばない（静的な状態を見るだけ）
+ * - 元のモードが cooked でなかったときも、そう覚えて、次に標準入力を読むか終わるまでは get-mode を呼び直さない
+ *   （filter なしの待ちでイベントを1つ受けるたびに import を呼ばない。読んだ後は、モードが変わっているかもしれないので見直す）
  * - シグナルで殺されたときは atexit が走らない。対話型の sh は、子が canonical を外したまま終わったら cooked に戻す（ADR 0102）
  */
 #include <stdint.h>
@@ -48,6 +50,8 @@ enum {
     STATE_IDLE,
     /* 切っている */
     STATE_SWITCHED,
+    /* 端末だが、見たときのモードが cooked でなかったので切らなかった。次に標準入力を読むまで見直さない */
+    STATE_OTHER,
 };
 
 static int state = STATE_UNKNOWN;
@@ -99,14 +103,17 @@ static void restore_at_exit(void) {
 }
 
 void kibi_lua_tty_keys(void) {
-    if (state == STATE_SWITCHED || state == STATE_NOT_TTY) return;
+    if (state != STATE_UNKNOWN && state != STATE_IDLE) return;
     if (state == STATE_UNKNOWN) {
         state = kibi_io_tty_is_tty(0) ? STATE_IDLE : STATE_NOT_TTY;
         if (state == STATE_NOT_TTY) return;
     }
     /* 既定のモードのときだけ切る（REPL・sh の行編集の上で、ほかのモードにしたプログラムの設定を壊さない） */
     int32_t mode = current_mode();
-    if (mode != MODE_COOKED) return;
+    if (mode != MODE_COOKED) {
+        state = STATE_OTHER;
+        return;
+    }
     /* 戻す手段がないまま切らない */
     if (!exit_registered) {
         if (atexit(restore_at_exit) != 0) return;
@@ -125,6 +132,8 @@ void kibi_lua_tty_before_wait(void) {
 }
 
 void kibi_lua_tty_restore(void) {
+    /* 切らなかったときは、次の待ちでモードを見直すだけにする */
+    if (state == STATE_OTHER) state = STATE_IDLE;
     if (state != STATE_SWITCHED) return;
     state = STATE_IDLE;
     drain();

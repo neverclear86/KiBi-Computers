@@ -402,6 +402,114 @@ class LuaTermFsKeysTest {
     }
 
     @Test
+    fun `parallelのコルーチンがkeyを待つときも、メインのfilterなしの待ちで切れ、エコーされない`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        var mode: TtyMode? = null
+        var leftover = -1
+        val r = lua(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            parallel.waitForAny(function()
+              while true do
+                local _, code = os.pullEvent('key')
+                print('k' .. code)
+                if code == keys.q then return end
+              end
+            end)
+            """,
+            columns = 40,
+            rows = 10,
+            driver = { m, text ->
+                when {
+                    // 'ready' の待ちでは切らないので、KEYS_MODE になったのは parallel のメインの待ち
+                    step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE -> {
+                        assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                        step = 1
+                    }
+                    step == 1 && text.contains("k65") -> {
+                        keyboard.input(KeyboardEvent.Text("zz"))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.UP, 0, false))
+                        step = 2
+                    }
+                    step == 2 && text.contains("k265") -> {
+                        keyboard.input(KeyboardEvent.Text("yy"))
+                        keyboard.input(KeyboardEvent.KeyDown(Key.Q, 0, false))
+                        step = 3
+                    }
+                }
+            },
+            after = { m ->
+                mode = m.consoleMode()
+                leftover = m.consoleLeftover()
+            },
+        ).assertOk()
+        assertEquals(3, step, r.text)
+        assertTrue(r.text.contains("k65\nk257\nk265\nk81\n"), r.text)
+        for (s in listOf("zz", "yy", "\u001b[A")) assertFalse(r.text.contains(s), "$s がエコーされた: ${r.text}")
+        assertEquals(TtyMode.COOKED, mode)
+        assertEquals(0, leftover, "TTY に入力が残っている")
+    }
+
+    @Test
+    fun `pcallでキー待ちのエラーを受けた後や、timerとsleepだけを待った後も、次のio_readの前にモードが戻る`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        var modeAfterCatch: TtyMode? = null
+        var modeWhileTimer: TtyMode? = null
+        val r = lua(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.queueEvent('terminate')
+            local ok, err = pcall(os.pullEvent, 'key')
+            print('caught ' .. tostring(ok) .. ' ' .. tostring(err))
+            os.startTimer(0.5)
+            os.pullEvent('timer')
+            print('slept1')
+            os.sleep(0.3)
+            print('read')
+            local line = io.read()
+            print('got[' .. tostring(line) .. ']')
+            """,
+            columns = 40,
+            rows = 10,
+            driver = { m, text ->
+                if (step == 0 && text.contains("caught false Terminated")) {
+                    // pull() の出口では戻さないので、エラーを受けた後も切ったまま（'timer' の待ちでも切ったまま）
+                    modeAfterCatch = m.consoleMode()
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000798", keyboard))
+                    // timer を待つ間に打ったもの（エコーされず、待ちの前か読む前に捨てる）
+                    keyboard.input(KeyboardEvent.Text("zz"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.Z, 0, false))
+                    step = 1
+                } else if (step == 1 && text.contains("slept1")) {
+                    // os.sleep の間に打ったもの（pull() を通らないので、読む前の読み捨てで消える）
+                    modeWhileTimer = m.consoleMode()
+                    keyboard.input(KeyboardEvent.Text("ww"))
+                    step = 2
+                } else if (step == 2 && text.contains("\nread\n") && m.consoleMode() == TtyMode.COOKED) {
+                    keyboard.input(KeyboardEvent.Text("hello"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.ENTER, 0, false))
+                    step = 3
+                }
+            },
+        ).assertOk()
+        assertEquals(3, step, r.text)
+        assertEquals(KEYS_MODE, modeAfterCatch, r.text)
+        assertEquals(KEYS_MODE, modeWhileTimer, r.text)
+        assertTrue(r.text.contains("got[hello]"), r.text)
+        // io.read の前に戻ったので、打ったものはエコーされ、待つ間に打ったものは混ざらない
+        assertTrue(r.text.contains("hello\n"), r.text)
+        for (s in listOf("zz", "ww")) assertFalse(r.text.contains(s), "$s が混ざった: ${r.text}")
+    }
+
+    @Test
     fun `timerだけを待つときはモードを変えず、打ったものは先打ちとして残る`() = timeout(limit) {
         var sent = false
         var modeWhileWaiting: TtyMode? = null
