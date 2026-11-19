@@ -94,7 +94,7 @@ interface process {
 ### 作業ディレクトリ
 
 - `get-cwd`・`set-cwd` は、カーネルの cwd を読み書きします。子の `cwd` の既定と、相対パスの基点に使います
-- p1 の `PWD`（[WASI p1](./wasi-p1.md#作業ディレクトリ)）は最初の値のままです。libc の `chdir` と `set-cwd` は別のものなので、両方を合わせたいときは両方を呼んでください
+- p1 の `PWD`（[WASI p1](./wasi-p1.md#作業ディレクトリ)）と、p2 の `get-environment` の `PWD`・`initial-cwd`（[WASI p2・p3](./p2-p3.md)）は、最初の値のままです。libc の `chdir` と `set-cwd` は別のものなので、両方を合わせたいときは両方を呼んでください
 
 ### list-processes
 

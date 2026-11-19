@@ -39,7 +39,7 @@ internal class WasiP2Driver private constructor(private val run: FuncRef, waitPo
     }
 
     override fun start(ctx: ProcessContext): StepResult {
-        // `initial-cwd` は起動したときの cwd（最初の start だけで決める）
+        // `initial-cwd` と `get-environment` の `PWD` は起動したときの cwd（最初の start だけで決める）
         WasiP2Cli.initialCwd(ctx)
         return run(ctx)
     }

@@ -25,6 +25,7 @@
 - `environ_sizes_get`・`environ_get` が見せる並びに、`PWD=<カーネルの cwd>` を1つだけ入れる（`WasiP1Basic.p1Environment`）
   - 呼び出し元が `PWD` を渡していれば、その位置のまま値を置き換える。なければ最後に足す（POSIX でもカーネルの cwd が正で、`PWD` はそれに合わせる慣習。ずれた値を見せない）
 - 足すのは p1 の層が見せるビューだけ。`Process.env`（保存される。#82）とカーネルの状態は変えない。p2・p3 は `wasi:cli/environment` の `initial-cwd` で渡す（#267・#268）ので、p1 だけの都合として p1 の層に置く
+  - 追記（#760）: p2 の `get-environment` も、同じ `WasiP1Basic.p1Environment` で `PWD=<initial-cwd>` を入れるようにした（ADR 0267 の追記）。`PWD` の規約は p1・p2 で共通になり、p3（#268 の `get-initial-cwd`）も同じにする予定。値の固め方だけが違う: p1 は最初に `environ_*` を呼んだ時点の cwd、p2 は起動時に固定した `initial-cwd`
 - 値は、最初に `environ_*` を呼んだ時点の `Process.cwd`（正規化した絶対パス）。p1 の中から cwd を変える方法はないので、その後は変わらない
 - 環境変数の大きさの上限（64 KiB、ADR 0045）は生成時に `Process.env` だけで数える。`PWD` の分（最大で `4 + 4096 + 1` バイト）は上限の外で、少し超えることがある
 - ABI（関数の形）は witx のまま。新しい import は足さない
@@ -35,6 +36,7 @@
 - `lua.wasm` と、テスト用のプログラム `cwd-wasi` にリンクする。`io.open("相対パス")` などが cwd から辿るようになる
 - 起動処理を持たないプログラム（素の wasi-sdk でビルドしたもの）は、今までどおり cwd が `/` になる。`getenv("PWD")` で自分で合わせられる
 - **SDK への申し送り**: C（#116）は `kibi_cwd.c` と同じものを入れる。Rust（#114）・Zig（#115）も起動時に `PWD` へ `chdir` する同じ規約に従う
+  - 追記（#760）: p2 も `get-environment` に同じ `PWD` を入れるので、SDK の起動処理は p1 とコンポーネント（アダプターで包んだものを含む）で同じものでよい
 
 ### p1 のプログラムの `chdir` はカーネルの cwd に反映しない
 

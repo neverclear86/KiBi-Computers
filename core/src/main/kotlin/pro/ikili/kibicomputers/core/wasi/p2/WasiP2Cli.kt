@@ -5,6 +5,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.STDIN
 import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.HostFunctionBody
@@ -15,9 +16,10 @@ import java.util.concurrent.ThreadLocalRandom
 /**
  * `wasi:cli`・`wasi:clocks`・`wasi:random` の実装（#267。ADR 0267）。値は p1 の層と同じ土台から取る:
  *
- * - `get-arguments` は argv[0] を含む（p1 の `args_get` と同じ並び）。`get-environment` はプロセスの環境変数から `PWD` を除いたもの
- *   （cwd は専用の `initial-cwd` で渡す。親が `PWD` を入れていても、古い値がゲストに見えて `initial-cwd` とずれないようにする。
- *   p1 の `environ_*` が `PWD` を cwd にして見せるのとは違う。ADR 0267・0332）。`initial-cwd` は起動したときのカーネルの cwd
+ * - `get-arguments` は argv[0] を含む（p1 の `args_get` と同じ並び）。`get-environment` はプロセスの環境変数に `PWD=<initial-cwd>` を
+ *   含めたもの（規則は p1 の `environ_*` と同じ [WasiP1Basic.p1Environment]: 親が入れた `PWD` は同じ位置で値を置き換え、なければ最後に足す。
+ *   値は起動時に固定した `initial-cwd` で、`set-cwd` の後も変わらない。アダプターで包んだ p1 の起動処理が cwd を合わせられるようにする。
+ *   #760、ADR 0267・0332）。`initial-cwd` は起動したときのカーネルの cwd
  * - `exit(ok)` → 0、`exit(err)` → 1、`exit-with-code(n)` → n（ADR 0074）。[WasiP2Exit] を投げ、ドライバーが終了コードにする
  * - `get-stdin`・`get-stdout`・`get-stderr` は、呼ぶたびに fd 0/1/2 のオブジェクトの参照を 1 つ増やした新しい stream を返す
  *   （dup と同じ。後で fd が閉じても stream は残る）。fd が閉じていれば、閉じた stream
@@ -42,8 +44,10 @@ internal object WasiP2Cli {
         return mapOf(
             "wasi:cli/environment" to mapOf(
                 "get-environment" to body { ctx, _ ->
+                    // ロックの中で取るのは cwd だけ。ctx.env は作った後は変わらないので、並びはロックの外で組み立てる
+                    val cwd = initialCwdPath(ctx)
                     CanonValue.Items(
-                        ctx.env.filterKeys { it != WasiP1Basic.PWD }.map { (k, v) -> CanonValue.Fields(listOf(CanonValue.str(k), CanonValue.str(v))) },
+                        WasiP1Basic.p1Environment(ctx.env, cwd).map { (k, v) -> CanonValue.Fields(listOf(CanonValue.str(k), CanonValue.str(v))) },
                     )
                 },
                 "get-arguments" to body { ctx, _ -> CanonValue.Items(ctx.args.map(CanonValue::str)) },
@@ -90,11 +94,17 @@ internal object WasiP2Cli {
         )
     }
 
-    /** `initial-cwd`（初めて使うときのカーネルの cwd を覚える。ドライバーは起動のときに入れる） */
-    fun initialCwd(ctx: ProcessContext): String = ctx.withKernelLock {
+    /**
+     * 起動時の cwd（初めて使うときのカーネルの cwd を覚える。ドライバーは起動のときに入れる）。`initial-cwd` と
+     * `get-environment` の `PWD` はこの値を使うので、`set-cwd` の後も変わらず、2 つがずれない（#760）
+     */
+    fun initialCwdPath(ctx: ProcessContext): VfsPath = ctx.withKernelLock {
         val table = P2.tableLocked(ctx)
-        (table.initialCwd ?: ctx.cwd.also { table.initialCwd = it }).toString()
+        table.initialCwd ?: ctx.cwd.also { table.initialCwd = it }
     }
+
+    /** `initial-cwd` の値（[initialCwdPath] の文字列） */
+    fun initialCwd(ctx: ProcessContext): String = initialCwdPath(ctx).toString()
 
     private fun stdioStream(ctx: ProcessContext, fd: Int, input: Boolean): CanonValue = ctx.withKernelLock {
         val process = ctx.kernel.processes[ctx.pid] ?: P2.trap("プロセスがない")

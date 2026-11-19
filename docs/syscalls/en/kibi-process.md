@@ -94,7 +94,7 @@ interface process {
 ### Working directory
 
 - `get-cwd` and `set-cwd` read and change the kernel cwd. It is the default `cwd` for children and the base of relative paths
-- p1's `PWD` ([WASI p1](./wasi-p1.md#working-directory)) keeps its first value. libc's `chdir` and `set-cwd` are separate, so call both to keep them in step
+- p1's `PWD` ([WASI p1](./wasi-p1.md#working-directory)) and p2's `PWD` in `get-environment` and `initial-cwd` ([WASI p2 and p3](./p2-p3.md)) keep their first values. libc's `chdir` and `set-cwd` are separate, so call both to keep them in step
 
 ### list-processes
 
