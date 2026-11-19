@@ -54,7 +54,8 @@ kibi: init could not be saved; starting fresh
 
 - 画面がつながっていない台（`primaryScreen == null`）では、`host.onConsoleOutput` に流れて失われる（ADR 0087 の描き直しと同じ）
 - `nano` などの代替画面のプログラムは、`restored` で全体を描き直すので、知らせが上書きされうる
+- 標準の `sh` でも、入力中の行が折り返した状態（`cur_row >= 1`）で保存された台では消える。`restored` を受けた `sh` の `refresh()`（`os/bin/sh/edit.zig`）は、`cur_row > 0` なら `cur_row` 行ぶん上に戻り、行頭から画面の終わりまで消す（CR と `ESC [ J`）ので、知らせの最後の `cur_row` 行（1行だけなら全部）が、戻した直後に消える。この場合はテストで確かめておらず、直すのは #832
 
 ## 確かめ方
 
-- `core` の `KilledOnSaveNoticeTest`: 待機点型の init（`prompt`）の子に保存できないブロッキング型の子を2つ作って書く（元のマシンの子は殺さない）。戻すと子は `KILLED`・`SIGKILL` のゾンビで、親の `pendingChildExits` が子の数。受け手の中ではまだ配っておらず、受け手の後に名前つき（制御文字は `?`）と `pid n` の2行が出る。次の保存の `killedPids` は空で、それを戻しても出ない。上限を超える数を殺したら、8 行と数の1行。init を殺した写しの冷えた起動では、起動のメッセージより前に1行だけ出て、受け手の中で止めたら出ない。殺していない写しの冷えた起動（UNSUPPORTED_PROCESS）では出ない
+- `core` の `KilledOnSaveNoticeTest`: 待機点型の init（`prompt`）の子に保存できないブロッキング型の子を2つ作って書く（元のマシンの子は殺さない）。戻すと子は `KILLED`・`SIGKILL` のゾンビで、親の `pendingChildExits` が子の数。受け手の中ではまだ配っておらず、受け手の後に名前つき（制御文字は `?`）と `pid n` の2行が出る。次の保存の `killedPids` は空で、それを戻しても出ない。上限を超える数を殺したら、8 行と数の1行。init を殺した写しの冷えた起動では、起動のメッセージより前に1行だけ出る。受け手の中で止めたら冷えた起動を始めず（`coldBootAfterRestore` が `false`）、何も書かない（印を捨てる `stopLocked` の1行は、取り消した台が `restore` を二度と受け付けず外から観測できないので、直接は確かめない）。理由が非 null の別の写し（`BOOTING`・`REBOOT_PENDING`。理由は節の値で確かめる）の冷えた起動と、殺していない写しの冷えた起動（UNSUPPORTED_PROCESS）では出ない

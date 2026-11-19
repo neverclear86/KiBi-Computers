@@ -34,11 +34,15 @@ import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.RestoreSource
+import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
@@ -221,7 +225,7 @@ class KilledOnSaveNoticeTest {
     }
 
     @Test
-    fun `initを写しの中で殺した写しは、冷えた起動の前に1行出し、取り消せば出さない`() = timeout(limit) {
+    fun `initを写しの中で殺した写しは、冷えた起動の前に1行出し、取り消せば冷えた起動を始めず出さない`() = timeout(limit) {
         val store = newStore()
         Harness().use { h ->
             val m = h.machine()
@@ -249,12 +253,70 @@ class KilledOnSaveNoticeTest {
             assertTrue(text.trimStart().startsWith(Machine.INIT_KILLED_NOTICE), "起動のメッセージより後に出た: $text")
             m2.close()
 
-            // 冷えた起動を始めずに止めたら（取り消し）出さない。その後の別の起動にも残らない
+            // 冷えた起動を始めずに止めたら（取り消し）出さない。止めた後は冷えた起動待ちでなく、始めようとしても何も書かない。
+            // 印（coldBootNotice）を捨てる `stopLocked` の1行そのものは、取り消した Machine が restore を二度と受け付けず
+            // （coldBootPending も立たない）、外から観測できないので、ここでは確かめない
             val console3 = Console()
-            val finished3 = Finished(console3) { machine, _ -> machine.stop() }
+            val started = AtomicBoolean(true)
+            val finished3 = Finished(console3) { machine, _ ->
+                machine.stop()
+                started.set(machine.coldBootAfterRestore())
+            }
             val m3 = restore(h, store, identity, console3, finished3)
+            assertFalse(started.get(), "取り消した後に冷えた起動を始めた")
+            assertFalse(m3.isColdBootPending)
+            repeat(5) { h.scheduler.tick() }
             assertFalse(console3.text.contains(Machine.INIT_KILLED_NOTICE), console3.text)
             m3.close()
+        }
+    }
+
+    /** 起動の途中（[reboot] を求めていれば再起動の待ち）で、殺さずに写した冷えた起動の写しを書く。書いた世代の識別を返す */
+    private fun saveWholeTransient(h: Harness, store: MachineSaveStore, reboot: Boolean): MachineIdentity {
+        val fs = TestMemoryFileSystem()
+        fs.createDirectory(VfsPath.parse("/sbin"))
+        val bytes = "fake-init".toByteArray()
+        h.runtime.define(bytes, FakeModule.builder().fuelMetered().export("_start", VOID) { _, _ -> LongArray(0) }.build())
+        val node = fs.createFile(VfsPath.parse(BootConfig.INIT_PATH))
+        fs.write(node, 0, bytes, 0, bytes.size)
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(fs, readOnly = false) else null }
+        val reached = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        h.scheduler.hooks.beforeInitExec = { _ ->
+            reached.countDown()
+            release.await()
+        }
+        val m = h.machine()
+        assertTrue(m.boot(BootConfig.builder().addBootDisk("d").build()))
+        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        if (reboot) assertTrue(m.reboot())
+        val source = requireNotNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT, null, FullSaveRule(1.0))) { "写しが取れない" }
+        val identity = store.write(store.assignNewId(owner)!!, owner, source).identity
+        release.countDown()
+        h.scheduler.hooks.beforeInitExec = null
+        m.stop()
+        assertTrue(m.awaitTermination(5_000))
+        m.close()
+        return identity
+    }
+
+    @Test
+    fun `起動の途中・再起動の待ちの写しの冷えた起動では、initを殺した1行を出さない`() = timeout(limit) {
+        for ((reboot, reason) in listOf(false to ColdBootReason.BOOTING, true to ColdBootReason.REBOOT_PENDING)) {
+            val store = newStore()
+            Harness().use { h ->
+                val identity = saveWholeTransient(h, store, reboot)
+                // 理由は非 null で、init を殺した写しと同じ KILLED 節に書く（ColdBootCause は KILLED_SECTION のまま）
+                assertEquals(reason.code, store.readGeneration(identity.id, identity.generation).snapshot.coldBootCode, "理由が違う")
+
+                val console = Console()
+                val finished = Finished(console) { machine, outcome -> if (outcome == RestoreOutcome.COLD_BOOT) machine.coldBootAfterRestore() }
+                val m = restore(h, store, identity, console, finished)
+                assertEquals(listOf(RestoreOutcome.COLD_BOOT to ColdBootCause.KILLED_SECTION), finished.outcomes.toList(), "$reason")
+                repeat(5) { h.scheduler.tick() }
+                assertTrue(killedLines(console.text).isEmpty() && !console.text.contains(Machine.INIT_KILLED_NOTICE), "$reason: ${console.text}")
+                m.close()
+            }
         }
     }
 
