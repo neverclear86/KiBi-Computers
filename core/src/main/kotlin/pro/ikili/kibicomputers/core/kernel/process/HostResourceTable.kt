@@ -32,7 +32,10 @@ internal class HostResourceTable {
     private var entries: HashMap<Int, HostResourceEntry>? = null
     private var nextRep = 1
 
-    /** `wasi:cli/environment.initial-cwd` が返す、起動したときの作業ディレクトリ（ABI 層が初めて使うときに入れる） */
+    /**
+     * 起動したときの作業ディレクトリ（ABI 層が初めて使うときに入れる）。`wasi:cli/environment.initial-cwd` が返し、
+     * `get-environment` の `PWD` の値にも使う（#760）
+     */
     var initialCwd: VfsPath? = null
 
     /** 入っているエントリの数 */

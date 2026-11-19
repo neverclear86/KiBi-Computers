@@ -395,8 +395,12 @@ class WasiP2StreamTest {
         buf
     }
 
+    private fun envPair(k: String, v: String): CanonValue = CanonValue.Fields(listOf(CanonValue.str(k), CanonValue.str(v)))
+
+    private fun ProcessContext.environment(): List<CanonValue> = (p2("wasi:cli/environment", "get-environment") as CanonValue.Items).items
+
     @Test
-    fun `get-environmentはPWDを除き、initial-cwdはカーネルのcwd、引数はargv0を含む`() = timeout(limit) {
+    fun `get-environmentは親のPWDを同じ位置でinitial-cwdに置き換え、引数はargv0を含む`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
@@ -412,20 +416,106 @@ class WasiP2StreamTest {
                 env = linkedMapOf("A" to "1", "PWD" to "/stale", "B" to "2"),
                 cwd = "/home",
             ) { ctx ->
-                val env = (ctx.p2("wasi:cli/environment", "get-environment") as CanonValue.Items).items
-                assertEquals(
-                    listOf<CanonValue>(
-                        CanonValue.Fields(listOf(CanonValue.str("A"), CanonValue.str("1"))),
-                        CanonValue.Fields(listOf(CanonValue.str("B"), CanonValue.str("2"))),
-                    ),
-                    env,
-                )
+                assertEquals(listOf(envPair("A", "1"), envPair("PWD", "/home"), envPair("B", "2")), ctx.environment())
                 assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
                 assertEquals(
                     listOf<CanonValue>(CanonValue.str("prog"), CanonValue.str("ベータ")),
                     (ctx.p2("wasi:cli/environment", "get-arguments") as CanonValue.Items).items,
                 )
+                // 環境変数そのもの（保存される Process.env）は変えない
+                assertEquals(
+                    mapOf("A" to "1", "PWD" to "/stale", "B" to "2"),
+                    ctx.withKernelLock { ctx.kernel.processes[ctx.pid]!!.env.toMap() },
+                )
             }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `get-environmentはPWDがなければ最後に足す`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/home"))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd, env = linkedMapOf("A" to "1", "B" to "2"), cwd = "/home") { ctx ->
+                assertEquals(listOf(envPair("A", "1"), envPair("B", "2"), envPair("PWD", "/home")), ctx.environment())
+                assertEquals(mapOf("A" to "1", "B" to "2"), ctx.withKernelLock { ctx.kernel.processes[ctx.pid]!!.env.toMap() })
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `get-environmentのPWDは起動時の値に固定され、カーネルのcwdを変えてもinitial-cwdと同じ`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/home"))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd, env = linkedMapOf("PWD" to "/stale"), cwd = "/home") { ctx ->
+                // TestDriver は WasiP2Driver.start を通らないので、initial-cwd を先に呼んで値を決める
+                assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
+                ctx.changeDirectory("/")
+                assertEquals("/", ctx.cwd.toString())
+                // 2 回呼んでも同じ（アダプターは environ_sizes_get と environ_get で 1 回ずつ呼ぶ）
+                assertEquals(listOf(envPair("PWD", "/home")), ctx.environment())
+                assertEquals(listOf(envPair("PWD", "/home")), ctx.environment())
+                assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
+                assertEquals(mapOf("PWD" to "/stale"), ctx.withKernelLock { ctx.kernel.processes[ctx.pid]!!.env.toMap() })
+            }
+            m.stop()
+        }
+    }
+
+    /** 本物の [WasiP2Driver.start]（`initial-cwd` を決める）の後に、[after] をプロセスの中で動かすドライバー */
+    private class AfterStartDriver(private val inner: WasiP2Driver, private val after: (ProcessContext) -> Unit) :
+        pro.ikili.kibicomputers.core.kernel.process.ProcessDriver by inner {
+        override fun start(ctx: ProcessContext): StepResult = inner.start(ctx).also { after(ctx) }
+    }
+
+    @Test
+    fun `実物のドライバーで起動すると、ゲストが初めてget-environmentを呼ぶ前にcwdを変えても、PWDは起動時の値`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/home"))
+            val program = Program.component(
+                P2Testing.loadWat(
+                    """
+                    (component
+                      (core module ${'$'}m (memory (export "memory") 1) (func (export "run") (result i32) i32.const 0))
+                      (core instance ${'$'}i (instantiate ${'$'}m))
+                      (func ${'$'}run (result (result)) (canon lift (core func ${'$'}i "run") (memory ${'$'}i "memory")))
+                      (instance ${'$'}inst (export "run" (func ${'$'}run)))
+                      (export "wasi:cli/run@0.2.12" (instance ${'$'}inst))
+                    )
+                    """.trimIndent(),
+                ),
+            )
+            val failure = AtomicReference<Throwable>()
+            val driver = AfterStartDriver(WasiP2Driver.create(program.component!!)) { ctx ->
+                try {
+                    // start の後（ゲストはまだ get-environment を呼んでいない）に cwd を変える。PWD を決めたのは start の initialCwd
+                    ctx.changeDirectory("/")
+                    assertEquals("/", ctx.cwd.toString())
+                    assertEquals(listOf(envPair("PWD", "/home")), ctx.environment())
+                    assertEquals(CanonValue.some(CanonValue.str("/home")), ctx.p2("wasi:cli/environment", "initial-cwd"))
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+            }
+            val options = SpawnOptions(env = linkedMapOf("PWD" to "/stale"), cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN)
+            val pid = m.spawn(program, driver, options, 0)
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            failure.get()?.let { throw it }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
             m.stop()
         }
     }

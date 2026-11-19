@@ -132,7 +132,8 @@ internal class WasiP1Basic(private val ctx: ProcessContext) {
 
         /**
          * p1 に見せる環境変数の並び。[env] に `PWD` があればその位置で値を [cwd] に置き換え、なければ最後に足す。
-         * [env] 自体（`Process.env`。保存される）は変えない。`PWD` の分は環境変数の大きさの上限（ADR 0045）に数えない
+         * [env] 自体（`Process.env`。保存される）は変えない。`PWD` の分は環境変数の大きさの上限（ADR 0045）に数えない。
+         * p2 の `wasi:cli/environment.get-environment` も、起動時の cwd を [cwd] にして使う（#760）
          */
         fun p1Environment(env: Map<String, String>, cwd: VfsPath): List<Pair<String, String>> {
             val pwd = cwd.toString()
