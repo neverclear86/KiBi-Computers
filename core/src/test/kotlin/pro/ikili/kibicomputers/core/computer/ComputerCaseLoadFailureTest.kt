@@ -116,6 +116,41 @@ class ComputerCaseLoadFailureTest {
     }
 
     @Test
+    fun `マシンを作る処理が IllegalStateException を投げても握らずにエラーにして投げ直す`() {
+        val c = Counted()
+        c.case.loadPoweredOn(true)
+        c.case.beginRestore()
+        val thrown = assertThrows<IllegalStateException> {
+            c.case.startRestoreWith(throwingEnvironment { IllegalStateException("壊れた時計") })
+        }
+        assertEquals("壊れた時計", thrown.message)
+        assertEquals(ComputerStatus.ERROR, c.case.status)
+        assertEquals(ComputerError.UNAVAILABLE, c.case.error)
+        assertFalse(c.case.isRestorePending)
+        assertNull(c.case.machine)
+        assertTrue(c.case.poweredOn)
+        assertEquals(0, c.changes)
+
+        // 電源ボタンでも同じ（電源は入れたまま変えない）
+        val d = Counted()
+        assertThrows<IllegalStateException> {
+            d.case.pressPowerButton(manager, "b", required(d.case.tier), true, config, throwingEnvironment { IllegalStateException("壊れた時計") })
+        }
+        assertEquals(ComputerError.UNAVAILABLE, d.case.error)
+        assertFalse(d.case.poweredOn)
+    }
+
+    @Test
+    fun `閉じた管理には作らず投げずにエラーにする`() {
+        val closed = MachineManager<String>(SchedulerConfig.builder().maxConcurrentMachines(1).build(), MachineErrorListener { _, _ -> })
+        closed.shutdown(10_000)
+        val c = Counted()
+        assertEquals(ComputerStatus.ERROR, c.case.turnOn(closed, "a", required(c.case.tier), true, config))
+        assertEquals(ComputerError.UNAVAILABLE, c.case.error)
+        assertFalse(c.case.poweredOn)
+    }
+
+    @Test
     fun `StackOverflowError は致命的でない扱いでエラーにする`() {
         val c = Counted()
         c.case.loadPoweredOn(true)

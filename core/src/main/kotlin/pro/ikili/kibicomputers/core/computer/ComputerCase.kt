@@ -50,7 +50,8 @@ public enum class ComputerError {
 
     /**
      * マシンを作れなかった（サーバーの停止の途中など）。マシンを作る処理や、復元を始める前の用意（接続層）が投げたときもこれにする
-     * （#808。電源の状態は変えないので、次の読み込みで復元し直す）
+     * （#808）。どちらも電源の状態（[ComputerCase.poweredOn]）は変えない。復元の途中（[ComputerCase.startRestore]・
+     * [ComputerCase.abandonRestore]）なら電源が入ったままなので次の読み込みで復元し直し、[ComputerCase.turnOn] なら電源は入らないまま
      */
     UNAVAILABLE,
 
@@ -108,7 +109,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public var poweredOn: Boolean = false
         private set
 
-    /** チャンクの読み込みで復元を待っている（[beginRestore] から [startRestore] まで） */
+    /** チャンクの読み込みで復元を待っている（[beginRestore] から [startRestore]・[abandonRestore] まで） */
     public var isRestorePending: Boolean = false
         private set
 
@@ -157,6 +158,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * 電源ボタン: 動いていれば [turnOff]、そうでなければ [turnOn]。
+     * マシンを作る処理が投げたら、[turnOn] と同じく [ComputerError.UNAVAILABLE] にして例外を投げ直す（#808）。
      *
      * @return 押した後の状態
      */
@@ -178,6 +180,9 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * 電源を入れる。もう動いていれば何もしない。
+     *
+     * マシンを作る処理が投げたら、[ComputerStatus.ERROR]（[ComputerError.UNAVAILABLE]）にして例外を投げ直す（#808）。
+     * 電源は入れない（[poweredOn] は偽のまま）。ログは呼び手に任せる。JVM の致命的なエラーは、状態を触らずにそのまま投げる。
      *
      * @param manager マシンを作る先。`null`（サーバーが動いていない）なら [ComputerError.UNAVAILABLE]
      * @param key このケースのマシンのキー
@@ -202,7 +207,10 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         return status
     }
 
-    /** [turnOn]・[startRestore] の共通: 部品・電力・マシンを確かめてマシンを作る。作れなければ状態をエラーなどにして `null` */
+    /**
+     * [turnOn]・[startRestore] の共通: 部品・電力・マシンを確かめてマシンを作る。作れなければ状態をエラーなどにして `null`。
+     * マシンを作る処理が投げたら、[ComputerError.UNAVAILABLE] にして例外を投げ直す（JVM の致命的なエラーは状態を触らずに投げる。#808）
+     */
     private fun load(
         manager: MachineManager<K>?,
         key: K,

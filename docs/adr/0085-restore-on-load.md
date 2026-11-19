@@ -184,8 +184,9 @@
     `PoweredOn` は真のまま（表の「マシンを作れなかった → 変えない」。`poweredOnChanged` も呼ばない）なので、次の読み込みで復元し直す。
     電源を切る形（`setPoweredOn(false)`）・CRASHED にする形は取らない（#677 と同じく、接続層の一時的な不具合で台が止まったままになるため）。
     `ComputerStatus`・`ComputerError` は保存しないので、保存形式は変わらない
-    - `ComputerCase.load`（`turnOn`・`startRestore` の共通）で `MachineSlot.load` が投げたら（`IllegalStateException` は今までどおり握られて
-      `null`。それ以外の例外）、UNAVAILABLE にして投げ直す。JVM の致命的なエラー（`isFatal`）は状態を触らずにそのまま投げる。
+    - `ComputerCase.load`（`turnOn`・`startRestore` の共通）で `MachineSlot.load` が投げたら、UNAVAILABLE にして投げ直す。
+      `MachineSlot.load` が握って `null` にするのは、確かめた後に `MachineManager` が閉じたことによる `IllegalStateException` だけにする
+      （閉じていなければ、マシンのコンストラクターの `check`・`error` などが投げたものなので投げ直す。握ったままだとどこにもログが出ないため）。JVM の致命的なエラー（`isFatal`）は状態を触らずにそのまま投げる。
       `startRestore` は `load` の前に印を下ろすので、順番待ちも抜けている
     - `ComputerCase.startRestore` の前の用意（1.21.1 の `CaseBlockEntity.startRestore` の `prepareDisks`・`MachineSpecs.configOf` など）が投げたら、
       `finally` で、まだ順番待ちなら `ComputerCase.abandonRestore`（印を下ろして UNAVAILABLE にする。順番待ちでなければ何もしない）を呼ぶ。

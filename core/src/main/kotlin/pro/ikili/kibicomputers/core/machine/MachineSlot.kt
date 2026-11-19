@@ -39,6 +39,7 @@ public class MachineSlot<K : Any> {
     /**
      * [manager] に [key] のマシンを作る。もう持っていれば、それを外してから作る。
      * [manager] が閉じていれば何もせず `null` を返す（サーバーの停止の途中など）。
+     * マシンを作る処理が投げた例外は、そのまま投げる（閉じたことによる [IllegalStateException] だけ `null` にする）。
      *
      * @return 作ったマシン
      */
@@ -55,8 +56,9 @@ public class MachineSlot<K : Any> {
         val machine = try {
             manager.attach(key, host, config, environment)
         } catch (e: IllegalStateException) {
-            // 確かめた後に閉じた
-            return null
+            // 確かめた後に閉じたときだけ握る。閉じていなければ、マシンを作る処理（`check`・`error` など）が投げたものなので投げ直す（#808）
+            if (manager.isClosed) return null
+            throw e
         }
         this.manager = manager
         this.key = key
