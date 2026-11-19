@@ -66,9 +66,18 @@ internal object WasiP2Io {
     fun waitOf(body: HostFunctionBody): HostWait = if (body is WaitingBody) HostWait.UNWIND else HostWait.NONE
 
     /**
+     * 待ちうる関数（[WaitingBody]）の本体。入口で、巻き直して着いた呼び出しかを受け取る（#757）。`kibi:*` の待ちうる関数
+     * （`invoke`・`spawn`。#800）もこれで作る
+     */
+    fun waiting(f: (ProcessContext, Waiter, List<CanonValue>) -> CanonValue?): WaitingBody = WaitingBody(HostFunctionBody { call, args ->
+        val suspend = P2.suspend(call)
+        f(P2.ctx(call), Waiter(suspend, suspend.enter()), args)
+    })
+
+    /**
      * 待ちうる関数の呼び出し 1 回の、待ち方（#757）。[arrival] は、巻き直して着いた呼び出しなら前に巻き戻したときの情報
      */
-    class Waiter(private val suspend: ComponentSuspend, val arrival: ComponentSuspend.Arrival?) {
+    class Waiter(val suspend: ComponentSuspend, val arrival: ComponentSuspend.Arrival?) {
         /** 巻き直して着いた呼び出しか */
         val resumed: Boolean get() = arrival != null
 
@@ -115,12 +124,6 @@ internal object WasiP2Io {
         }
 
         fun body(f: (ProcessContext, List<CanonValue>) -> CanonValue?) = HostFunctionBody { call, args -> f(P2.ctx(call), args) }
-
-        /** 待ちうる関数（[WaitingBody]）の本体。入口で、巻き直して着いた呼び出しかを受け取る（#757） */
-        fun waiting(f: (ProcessContext, Waiter, List<CanonValue>) -> CanonValue?) = WaitingBody(HostFunctionBody { call, args ->
-            val suspend = P2.suspend(call)
-            f(P2.ctx(call), Waiter(suspend, suspend.enter()), args)
-        })
 
         val error = mapOf(
             "[method]error.to-debug-string" to body { ctx, a ->

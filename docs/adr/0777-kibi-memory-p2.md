@@ -35,7 +35,7 @@ WIT（関数と型）は #370 の論点 3 の回答で決まっている。p2・
 - RAM の上限で断ったら `false` で、`ProcessContext.commitMemory` が `memoryCommitRefusal` に残す。異常終了（`err` での 0 以外の終了・トラップ）の表示に `kibi:memory commit was refused: out of memory, …` が付く（#370 の追加の要件。コンポーネントのプロセスでも同じ文）。
 - `ptr`・`len`（u32）と `keep`（u64）はビットのまま `KibiMemory.commit` に渡す（p1 と同じ。2^63 以上の `keep` は必ず断る。`P2.u64` の丸めは使わない）。
 - 燃料は呼び出しごとの `CALL_FUEL`（`P2.guard`）と、範囲にかかる区画の数（`KibiMemory.commitFuel`）。どちらも仮の値（#251）。
-- 待たない（`HostWait.NONE`）。`BLOCKING_FUNCTIONS` に入れないので、`memory` を import するコンポーネントも待機点型（`WAIT_POINT`）で動く。
+- 待たない（`HostWait.NONE`）。`BLOCKING_FUNCTIONS` に入れない（#800 の後は、待ちうる関数の本体 `WasiP2Io.waiting` で作らない）ので、`memory` を import するコンポーネントも待機点型（`WAIT_POINT`）で動く。
 
 ### 読み込みで `NOEXEC` にしない理由
 

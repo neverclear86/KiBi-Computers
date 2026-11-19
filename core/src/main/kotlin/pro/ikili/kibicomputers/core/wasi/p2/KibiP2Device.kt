@@ -7,6 +7,8 @@ import pro.ikili.kibicomputers.core.device.DeviceCallException
 import pro.ikili.kibicomputers.core.device.DeviceInfo
 import pro.ikili.kibicomputers.core.device.DeviceLimits
 import pro.ikili.kibicomputers.core.kernel.ResourceLimitException
+import pro.ikili.kibicomputers.core.kernel.process.ComponentSuspend
+import pro.ikili.kibicomputers.core.kernel.process.DeviceInvokeStart
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
@@ -22,7 +24,10 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
  *
  * - `open`: 36 バイトでない address は `detached`。マシン全体の上限は `kernel(nfile)`、表が満杯なら `kernel(mfile)`
  * - `invoke`・`start` の引数は p1 の lift と同じ順・同じコード（method が 64 バイトを超えたら `name-too-long`、引数が 32 個を超える・
- *   text・bytes の合計が 64 KiB を超えたら `too-big`）。`invoke` は p1 の BLOCK と同じく `ctx.invokeDevice` で待つ
+ *   text・bytes の合計が 64 KiB を超えたら `too-big`）
+ * - `invoke` は待ちうる関数（[WasiP2Io.waiting]。#800）。待機点型では p1 の UNWIND と同じく巻き戻して待ち、ブロッキング型（と作っている途中）は
+ *   `ctx.invokeDevice` で待つ。待機点型で、メインスレッドのメソッドを呼んだときにホストの表が満杯なら `kernel(mfile)`（`pending-call` を置けない。
+ *   ブロッキング型では置かないのでならない。p1 の待機点型と同じ差）
  * - `start` の `pending-call` の数（`MAX_PENDING_CALLS`）は fd 表と p2 の表を合わせて数え、超えたら `kernel(again)`
  * - 燃料は p1 と同じ（`list-devices`・`methods` は件数分、`invoke`・`start`・`take` はカーネルが払う）
  */
@@ -61,12 +66,7 @@ internal object KibiP2Device {
                 ctx.chargeFuel(list.size * KibiDevice.DEVICE_LIST_FUEL_PER_ENTRY)
                 CanonValue.Items(list.map { CanonValue.Fields(listOf(CanonValue.str(it.name), CanonValue.Bool(it.mainThread))) })
             },
-            "[method]device.invoke" to body { ctx, a ->
-                callResult {
-                    val (method, args) = callArgs(a[1], a[2])
-                    values(ctx.invokeDevice(KibiP2.handle(ctx, a[0], DEVICE), method, args))
-                }
-            },
+            "[method]device.invoke" to WasiP2Io.waiting { ctx, w, a -> invoke(ctx, w, a) },
             "[method]device.start" to body { ctx, a ->
                 callResult {
                     val (method, args) = callArgs(a[1], a[2])
@@ -90,9 +90,82 @@ internal object KibiP2Device {
         return mapOf(TYPES to emptyMap(), BUS to bus, BUS_POLL to busPoll)
     }
 
+    /**
+     * `[method]device.invoke`。巻き戻せるとき（#800）は、デバイスを 1 回だけ引いて始め（`ctx.beginDeviceInvoke`）、メインスレッドのメソッドは
+     * `pending-call` をホストの表の隠れた項目に置いて巻き戻す。巻き直して着いたら、引数を確かめ直さずにその結果を受け取って閉じる
+     * （メソッドは 1 回だけ走る）。巻き戻せないとき（ブロッキング型・作っている途中）は `ctx.invokeDevice` でスレッドを持って待つ。
+     * 巻き戻したら `null`（戻り値は捨てられる）
+     */
+    private fun invoke(ctx: ProcessContext, w: WasiP2Io.Waiter, a: List<CanonValue>): CanonValue? {
+        val s = w.suspend
+        if (w.resumed) {
+            // 巻き直して着いたのに待ちがない（コンポーネントは保存できないので起きないはず）: やり直すとメソッドが二重に走りうるので、やり直さない
+            val pending = s.pendingInvoke ?: return CanonValue.err(callError(CallError.INTERRUPTED))
+            return takeOrUnwind(ctx, w, pending)
+        }
+        s.pendingInvoke?.let {
+            // 新しい呼び出しなのに前の呼び出しが残っている（起きないはず）。閉じてから最初から行う
+            s.pendingInvoke = null
+            KibiP2.discard(ctx, it.slot)
+        }
+        if (!w.canUnwind()) {
+            return callResult {
+                val (method, args) = callArgs(a[1], a[2])
+                values(ctx.invokeDevice(KibiP2.handle(ctx, a[0], DEVICE), method, args))
+            }
+        }
+        return callFailure {
+            val (method, args) = callArgs(a[1], a[2])
+            val device = KibiP2.handle(ctx, a[0], DEVICE)
+            when (val started = ctx.beginDeviceInvoke(device, method, args, mayWait = true, KibiP2.placement(ctx, PENDING_CALL))) {
+                is DeviceInvokeStart.Done -> fromResult(started.result)
+                is DeviceInvokeStart.Waiting -> {
+                    val p = ComponentSuspend.PendingInvoke(started.callFd, started.key)
+                    s.pendingInvoke = p
+                    takeOrUnwind(ctx, w, p)
+                }
+            }
+        }
+    }
+
+    /** [pending] の結果があれば受け取って表から外し、なければその key で巻き戻して `null` */
+    private fun takeOrUnwind(ctx: ProcessContext, w: WasiP2Io.Waiter, pending: ComponentSuspend.PendingInvoke): CanonValue? {
+        val s = w.suspend
+        val interrupted = CanonValue.err(callError(CallError.INTERRUPTED))
+        val handle = ctx.withKernelLock { (P2.tableLocked(ctx)[pending.slot] as? KernelEntry)?.takeIf { it.label == PENDING_CALL }?.handle }
+        if (handle == null) {
+            // 表の項目がもうない（起きないはず）
+            s.pendingInvoke = null
+            return interrupted
+        }
+        val result = try {
+            ctx.takeDeviceCall(handle)
+        } catch (e: FsException) {
+            // 項目がもう pending-call でない（起きないはず）
+            s.pendingInvoke = null
+            KibiP2.discard(ctx, pending.slot)
+            return interrupted
+        }
+        if (result == null) {
+            w.unwind(listOf(pending.key), null)
+            return null
+        }
+        s.pendingInvoke = null
+        KibiP2.discard(ctx, pending.slot)
+        return fromResult(result)
+    }
+
+    private fun fromResult(r: CallResult): CanonValue = when (r) {
+        is CallResult.Values -> CanonValue.ok(values(r.values))
+        is CallResult.Error -> CanonValue.err(callError(r.error))
+    }
+
     /** `result<T, call-error>`。カーネルの失敗は `kernel(error-code)`、マシン全体の上限は `kernel(nfile)` */
-    private inline fun callResult(block: () -> CanonValue): CanonValue = try {
-        CanonValue.ok(block())
+    private inline fun callResult(block: () -> CanonValue): CanonValue = checkNotNull(callFailure { CanonValue.ok(block()) })
+
+    /** [block] の失敗を `err(call-error)` にする（[callResult] と同じ書き換え。[block] は結果の値をそのまま返す） */
+    private inline fun callFailure(block: () -> CanonValue?): CanonValue? = try {
+        block()
     } catch (e: FsException) {
         CanonValue.err(callError(KibiDevice.kernelError(e)))
     } catch (e: DeviceCallException) {

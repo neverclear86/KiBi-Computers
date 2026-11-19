@@ -35,15 +35,16 @@ class HostWaitTest {
     }
 
     @Test
-    fun `kibiの巻き戻せない待ちは、デバイスの呼び出しと子の読み込み`() {
+    fun `kibiの巻き戻して待つ関数は、デバイスの呼び出しと子の読み込みで、巻き戻せない待ちはない`() {
+        // #800: invoke・spawn・spawn-with-handles も巻き戻して待つ
         assertEquals(
             mapOf(
                 KibiP2Device.BUS to setOf("[method]device.invoke"),
                 KibiP2Process.PROCESS to setOf("[static]process.spawn"),
                 KibiP2Process.PROCESS_POLL to setOf("spawn-with-handles"),
             ),
-            waits(KibiP2Host.interfaces, HostWait.BLOCK),
+            waits(KibiP2Host.interfaces, HostWait.UNWIND),
         )
-        assertEquals(emptyMap<String, Set<String>>(), waits(KibiP2Host.interfaces, HostWait.UNWIND))
+        assertEquals(emptyMap<String, Set<String>>(), waits(KibiP2Host.interfaces, HostWait.BLOCK))
     }
 }

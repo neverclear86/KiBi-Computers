@@ -50,21 +50,24 @@ class ComponentExecTest {
     private val hello: ByteArray by lazy { P2Testing.wrap("hello-wasi") }
 
     /**
-     * 巻き戻せない待ちのホストの関数（`kibi:process` の `spawn`）を import するので、待機点に変換されず `BLOCKING` で動く p2 のコマンド
-     * （#757）。`spawn` は呼ばずに、すぐ ok で終わる
+     * 待機点に変換できない作り（止まりうる関数 `run` が v128 のローカルを持つ。`AsyncifyUnsupported`）なので、`BLOCKING` で動く p2 のコマンド
+     * （#757）。`run` は `blocking-read` を呼ぶ（通らない枝）ので止まりうる。呼ばずに、すぐ ok で終わる
      */
     private val blockingCommand: ByteArray by lazy {
         KibiP2WitTool.component(
             """
-            import kibi:process/process@0.1.0;
+            import wasi:io/streams@0.2.12;
             export wasi:cli/run@0.2.12;
             """.trimIndent(),
             """
             (module
-              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "wasi:io/streams@0.2.12" "[method]input-stream.blocking-read" (func ${'$'}read (param i32 i64 i32)))
               (memory (export "memory") 1)
               (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
-              (func (export "wasi:cli/run@0.2.12#run") (result i32) (i32.const 0)))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local v128)
+                (if (i32.eqz (i32.const 1)) (then (call ${'$'}read (i32.const 0) (i64.const 1) (i32.const 64))))
+                (i32.const 0)))
             """.trimIndent(),
         )
     }

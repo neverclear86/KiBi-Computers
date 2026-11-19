@@ -1,0 +1,452 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceCompletion
+import pro.ikili.kibicomputers.api.device.DeviceMethods
+import pro.ikili.kibicomputers.api.device.DeviceValue
+import pro.ikili.kibicomputers.core.device.PendingDeviceCall
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
+import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
+import pro.ikili.kibicomputers.core.kernel.process.ComponentSuspend
+import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
+import pro.ikili.kibicomputers.core.kernel.process.KernelLinkEnv
+import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
+import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
+import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
+import pro.ikili.kibicomputers.core.wasi.p2.KernelComponentHost
+import pro.ikili.kibicomputers.core.wasi.p2.KibiP2WitTool
+import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
+import java.time.Duration
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
+import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+
+/**
+ * 待機点型（`WAIT_POINT`）の p2 のコマンドが、`kibi:device/bus` の `invoke` と `kibi:process` の `spawn`・`spawn-with-handles` を
+ * 巻き戻して待つ（#800。ADR 0800）。待つ間はスレッドもブロッキング型の枠も使わず、巻き直してもメソッド・子は 1 回だけ。
+ *
+ * コマンドは WAT のコアモジュールから作る（`wasi:cli/run` を export する）。失敗した段は `exit-with-code` の終了コードにする
+ */
+class KibiP2WaitPointTest {
+    private val limit = Duration.ofSeconds(180)
+    private val s = "\$"
+
+    private val realloc = """
+        (memory (export "memory") 1)
+        (global ${s}bump (mut i32) (i32.const 2048))
+        (func (export "cabi_realloc") (param ${s}old i32) (param ${s}oldsize i32) (param ${s}align i32) (param ${s}new i32) (result i32)
+          (local ${s}p i32)
+          (local.set ${s}p (i32.and (i32.add (global.get ${s}bump) (i32.sub (local.get ${s}align) (i32.const 1))) (i32.sub (i32.const 0) (local.get ${s}align))))
+          (global.set ${s}bump (i32.add (local.get ${s}p) (local.get ${s}new)))
+          (local.get ${s}p))
+        (func ${s}fail (param ${s}n i32) (call ${s}exit (local.get ${s}n)) (unreachable))
+    """.trimIndent()
+
+    /** テスト用のデバイス。直接のメソッド `echo` と、後で返すメインスレッドのメソッド `defer` */
+    private class Dev : Device {
+        override val kind: String = "test:dev"
+        val calls: MutableMap<String, AtomicInteger> = ConcurrentHashMap()
+        val deferred: MutableList<DeviceCompletion> = Collections.synchronizedList(ArrayList())
+
+        fun calls(name: String): Int = calls[name]?.get() ?: 0
+
+        private fun count(name: String) = calls.getOrPut(name) { AtomicInteger() }.incrementAndGet()
+
+        override val methods: DeviceMethods = DeviceMethods.builder()
+            .direct("echo") { _, args ->
+                count("echo")
+                Array(args.size()) { args.get(it) }
+            }
+            .mainThread("defer") { ctx, _ ->
+                count("defer")
+                deferred += ctx.defer()
+                emptyArray()
+            }
+            .build()
+    }
+
+    /**
+     * デバイスのコマンド。`open` → 直接のメソッド `echo([3])`（3 が返る）→ メインスレッドのメソッド `defer` を 2 回（1 回目は 5、2 回目は 6 が返る）。
+     * [fill] なら、`echo` の前にホストの表を `open` で満杯にし（最後の失敗は `kernel(mfile)`）、`defer` は `kernel(mfile)` になることを確かめる
+     */
+    private fun deviceCommand(fill: Boolean): ByteArray {
+        val mfile = KibiErrors.code(Errno.MFILE)
+        val fillCode = if (!fill) "" else """
+            (loop ${s}more
+              (call ${s}open (i32.const 16) (i32.const 36) (i32.const 128))
+              (br_if ${s}more (i32.eqz (i32.load8_u (i32.const 128)))))
+            ;; result<device, call-error> の err: call-error の判別子 +4（kernel = 0）、error-code +8
+            (if (i32.load8_u (i32.const 132)) (then (call ${s}fail (i32.const 30))))
+            (if (i32.ne (i32.load8_u (i32.const 136)) (i32.const $mfile)) (then (call ${s}fail (i32.const 31))))
+        """
+        val deferCode = if (fill) """
+            (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+            (if (i32.ne (i32.load8_u (i32.const 160)) (i32.const 1)) (then (call ${s}fail (i32.const 32))))
+            (if (i32.load8_u (i32.const 164)) (then (call ${s}fail (i32.const 33))))
+            (if (i32.ne (i32.load8_u (i32.const 168)) (i32.const $mfile)) (then (call ${s}fail (i32.const 34))))
+        """ else """
+            (call ${s}defer (local.get ${s}d) (i64.const 5) (i32.const 20))
+            (call ${s}defer (local.get ${s}d) (i64.const 6) (i32.const 40))
+        """
+        val wat = """
+            (module
+              (import "kibi:device/bus@0.1.0" "[static]device.open" (func ${s}open (param i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[method]device.invoke" (func ${s}invoke (param i32 i32 i32 i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[resource-drop]device" (func ${s}ddrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "$ADDRESS")
+              (data (i32.const 56) "echo")
+              (data (i32.const 64) "defer")
+              ;; defer を呼び、結果が [integer(want)] でなければ段 base + n で終わる
+              (func ${s}defer (param ${s}d i32) (param ${s}want i64) (param ${s}base i32)
+                (local ${s}l i32)
+                (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+                (if (i32.load8_u (i32.const 160)) (then (call ${s}fail (i32.add (local.get ${s}base) (i32.const 1)))))
+                (if (i32.ne (i32.load (i32.const 168)) (i32.const 1)) (then (call ${s}fail (i32.add (local.get ${s}base) (i32.const 2)))))
+                (local.set ${s}l (i32.load (i32.const 164)))
+                (if (i32.ne (i32.load8_u (local.get ${s}l)) (i32.const 1)) (then (call ${s}fail (i32.add (local.get ${s}base) (i32.const 3)))))
+                (if (i64.ne (i64.load offset=8 (local.get ${s}l)) (local.get ${s}want)) (then (call ${s}fail (i32.add (local.get ${s}base) (i32.const 4))))))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}d i32) (local ${s}l i32)
+                (call ${s}open (i32.const 16) (i32.const 36) (i32.const 128))
+                (if (i32.load8_u (i32.const 128)) (then (call ${s}fail (i32.const 10))))
+                (local.set ${s}d (i32.load (i32.const 132)))
+                $fillCode
+                ;; 直接のメソッド echo([integer 3])（list<value> の 1 つ 16 バイト。判別子 +0、中身 +8）
+                (i32.store8 (i32.const 512) (i32.const 1))
+                (i64.store (i32.const 520) (i64.const 3))
+                (call ${s}invoke (local.get ${s}d) (i32.const 56) (i32.const 4) (i32.const 512) (i32.const 1) (i32.const 160))
+                (if (i32.load8_u (i32.const 160)) (then (call ${s}fail (i32.const 11))))
+                (if (i32.ne (i32.load (i32.const 168)) (i32.const 1)) (then (call ${s}fail (i32.const 12))))
+                (local.set ${s}l (i32.load (i32.const 164)))
+                (if (i64.ne (i64.load offset=8 (local.get ${s}l)) (i64.const 3)) (then (call ${s}fail (i32.const 13))))
+                $deferCode
+                (call ${s}ddrop (local.get ${s}d))
+                (i32.const 0)))
+        """.trimIndent()
+        return KibiP2WitTool.component(
+            """
+            import kibi:device/bus@0.1.0;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
+    /**
+     * 子を作るコマンド。パイプを作り、`spawn-with-handles` で `/bin/hello` の標準出力をパイプの書く端にして、読む端から 16 バイト読む。
+     * 続けて `spawn` で `/bin/ok` を作り、どちらのハンドルも drop する
+     */
+    private val spawnCommand: ByteArray by lazy {
+        val wat = """
+            (module
+              (import "kibi:io/pipe-streams@0.1.0" "create" (func ${s}pipe (param i32)))
+              (import "kibi:process/process-poll@0.1.0" "spawn-with-handles" (func ${s}spawnh (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func ${s}spawn (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "kibi:process/process@0.1.0" "[resource-drop]process" (func ${s}procdrop (param i32)))
+              (import "wasi:io/streams@0.2.12" "[method]input-stream.blocking-read" (func ${s}read (param i32 i64 i32)))
+              (import "wasi:io/streams@0.2.12" "[resource-drop]input-stream" (func ${s}idrop (param i32)))
+              (import "wasi:io/streams@0.2.12" "[resource-drop]output-stream" (func ${s}odrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "/bin/hello")
+              (data (i32.const 32) "/bin/ok")
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}in i32) (local ${s}out i32) (local ${s}c i32) (local ${s}total i32)
+                (call ${s}pipe (i32.const 64))
+                (if (i32.load8_u (i32.const 64)) (then (call ${s}fail (i32.const 1))))
+                (local.set ${s}in (i32.load (i32.const 68)))
+                (local.set ${s}out (i32.load (i32.const 72)))
+                ;; handles = [{ fd: 1, source: output(borrow out) }]
+                (i32.store (i32.const 48) (i32.const 1))
+                (i32.store8 (i32.const 52) (i32.const 1))
+                (i32.store (i32.const 56) (local.get ${s}out))
+                (call ${s}spawnh
+                  (i32.const 16) (i32.const 10)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 48) (i32.const 1)
+                  (i32.const 96))
+                (if (i32.load8_u (i32.const 96)) (then (call ${s}fail (i32.add (i32.const 100) (i32.load8_u (i32.const 100))))))
+                (local.set ${s}c (i32.load (i32.const 100)))
+                (call ${s}odrop (local.get ${s}out))
+                (loop ${s}more
+                  (call ${s}read (local.get ${s}in) (i64.const 256) (i32.const 128))
+                  (if (i32.eqz (i32.load8_u (i32.const 128)))
+                    (then
+                      (local.set ${s}total (i32.add (local.get ${s}total) (i32.load (i32.const 136))))
+                      (br ${s}more))))
+                (if (i32.ne (local.get ${s}total) (i32.const 16)) (then (call ${s}fail (i32.const 3))))
+                (call ${s}idrop (local.get ${s}in))
+                (call ${s}procdrop (local.get ${s}c))
+                (call ${s}spawn
+                  (i32.const 32) (i32.const 7)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 96))
+                (if (i32.load8_u (i32.const 96)) (then (call ${s}fail (i32.add (i32.const 200) (i32.load8_u (i32.const 100))))))
+                (call ${s}procdrop (i32.load (i32.const 100)))
+                (i32.const 0)))
+        """.trimIndent()
+        KibiP2WitTool.component(
+            """
+            import kibi:io/pipe-streams@0.1.0;
+            import kibi:process/process@0.1.0;
+            import kibi:process/process-poll@0.1.0;
+            import wasi:io/streams@0.2.12;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
+    /** 読み込みを [gate] が開くまで止めるランタイム（子の読み込みを確実に待たせる） */
+    private class GatedRuntime(private val inner: WasmRuntime) : WasmRuntime {
+        val gate = CountDownLatch(1)
+        val loads = AtomicInteger()
+        override val name: String get() = "gated-" + inner.name
+
+        override fun load(bytes: ByteArray): WasmModule {
+            loads.incrementAndGet()
+            gate.await()
+            return inner.load(bytes)
+        }
+    }
+
+    /** [bytes] のコマンドを待機点型のプロセスとして動かす */
+    private class Run(val h: Harness, val m: Machine, bytes: ByteArray) {
+        val program: Program = Program.component(ComponentProgram.load(LinkTesting.runtime, bytes, KernelComponentHost))
+        val pid: Int = m.spawn(program, KernelDrivers.DEFAULT.create(program), SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)))
+
+        val rt get() = m.rt(pid)
+        private var cachedSuspend: ComponentSuspend? = null
+
+        /** プロセスの [ComponentSuspend]（作り終えた後に初めて引いたものを覚える。終わった後も読めるように） */
+        val suspend: ComponentSuspend
+            get() = cachedSuspend ?: (rt.component!!.env as KernelLinkEnv).suspend.also { cachedSuspend = it }
+
+        fun state(): ProcessState = m.stateOf(pid)
+
+        fun tickUntil(message: String, condition: () -> Boolean) = eventually(60_000, message) {
+            h.scheduler.tick()
+            condition()
+        }
+
+        fun hostResources(): Int = m.lock.withLockValue { m.kernel.processes[pid]!!.hostResources.size }
+
+        /** 待機点で、スレッドもブロッキング型の枠も使わずに待っている */
+        fun assertParked() {
+            assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
+            assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
+            eventually(5_000, "スレッドが外れない") { rt.thread == null }
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            assertTrue(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncStack!!.size } > 0, "退避した値がない")
+            // 待ちは実行時だけの状態で、カーネルの AsyncWait には入れない
+            assertNull(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncWait })
+            assertTrue(m.isAtWaitPoint, "待機点でない")
+        }
+
+        fun finish(expected: ProcessState = ProcessState.EXITED, code: Int = 0) {
+            tickUntil("終わらない: ${state()}") { state().isTerminal }
+            assertEquals(expected, state(), "${rt.lastError}")
+            if (expected == ProcessState.EXITED) assertEquals(code, m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }, "段 ${m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }} で失敗した")
+        }
+    }
+
+    private fun pendingCallObjects(m: Machine): Int = m.lock.withLockValue {
+        var n = 0
+        m.kernel.objects.forEachObject { if (it is PendingDeviceCall) n++ }
+        n
+    }
+
+    private fun device(block: (Harness, Machine, Dev) -> Unit) = Harness(execRuntime = EndiveRuntime()).use { h ->
+        val m = h.machine(fuelPerTick = 10_000_000)
+        val dev = Dev()
+        assertTrue(m.devices.attach(ADDRESS, dev))
+        block(h, m, dev)
+    }
+
+    /** `defer` の [n] 回目の呼び出しで、巻き戻して待つまで進める */
+    private fun Run.awaitDefer(dev: Dev, n: Int) = tickUntil("defer で待たない: ${state()} ${rt.lastError}") {
+        dev.deferred.size == n && state() == ProcessState.WAITING_EVENT && suspend.pendingInvoke != null
+    }
+
+    @Test
+    fun `メインスレッドのメソッドのinvokeは巻き戻して待ち、メソッドは1回だけ走り、終わればpending-callを外す`() = timeout(limit) {
+        device { h, m, dev ->
+            val r = Run(h, m, deviceCommand(fill = false))
+            r.awaitDefer(dev, 1)
+            r.assertParked()
+            // device と、隠れた pending-call
+            assertEquals(2, r.hostResources())
+            assertEquals(1, pendingCallObjects(m))
+            // 起こしても結果がまだなら、同じ key で巻き戻し直す（メソッドを呼び直さない）
+            m.lock.withLockValue { m.wakeSink.wake(r.suspend.pendingInvoke!!.key) }
+            repeat(20) { h.scheduler.tick() }
+            assertEquals(1, dev.calls("defer"))
+            dev.deferred[0].complete(DeviceValue.of(5L))
+            // 2 回目の defer で待つ。1 回目の pending-call は外れていて、表の大きさは元に戻っている
+            r.awaitDefer(dev, 2)
+            r.assertParked()
+            assertEquals(2, r.hostResources(), "1 回目の pending-call が残った")
+            assertEquals(1, pendingCallObjects(m))
+            dev.deferred[1].complete(DeviceValue.of(6L))
+            r.finish()
+            assertEquals(1, dev.calls("echo"), "直接のメソッド")
+            assertEquals(2, dev.calls("defer"), "巻き直しでメソッドが二重に走った")
+            assertNull(r.suspend.pendingInvoke)
+            assertEquals(0, pendingCallObjects(m))
+        }
+    }
+
+    @Test
+    fun `invokeで待っているプロセスをkillすると、呼び出しは取り消される`() = timeout(limit) {
+        device { h, m, dev ->
+            val r = Run(h, m, deviceCommand(fill = false))
+            r.awaitDefer(dev, 1)
+            m.lock.withLockValue { m.killLocked(r.pid, KillSignal.KILL) }
+            r.finish(ProcessState.KILLED)
+            assertTrue(dev.deferred.single().isCancelled, "結果が要らなくなったら取り消す")
+            assertEquals(0, pendingCallObjects(m))
+        }
+    }
+
+    @Test
+    fun `ホストの表が満杯なら、待機点型のメインスレッドのメソッドのinvokeはmfileで、直接のメソッドは呼べる`() = timeout(limit) {
+        device { h, m, dev ->
+            val r = Run(h, m, deviceCommand(fill = true))
+            r.finish()
+            assertEquals(1, dev.calls("echo"))
+            assertEquals(0, dev.calls("defer"), "満杯で断ったのにメソッドを走らせた")
+        }
+    }
+
+    @Test
+    fun `invokeで待っている台の写しでは、プロセスを殺しpending-callを残さず、元の呼び出しは取り消さない`() = timeout(limit) {
+        device { h, m, dev ->
+            val r = Run(h, m, deviceCommand(fill = false))
+            r.awaitDefer(dev, 1)
+            r.assertParked()
+            val copy = m.captureCopy(CapturePolicy.KILL_TRANSIENT)!!
+            assertTrue(r.pid in copy.killedPids, "写しの中で殺していない")
+            copy.processes[r.pid]?.let { p ->
+                assertTrue(p.asyncStack?.isEmpty != false, "写しに退避した値が残った")
+                assertNull(p.asyncWait)
+                assertEquals(0, p.hostResources.size, "写しにホストの resource が残った")
+            }
+            var copied = 0
+            copy.objects.forEachObject { if (it is PendingDeviceCall) copied++ }
+            assertEquals(0, copied, "写しに pending-call が残った")
+            // 元はそのまま待ち、結果を受け取って続ける
+            assertFalse(dev.deferred.single().isCancelled, "写しの後始末が元の呼び出しを取り消した")
+            assertNotNull(r.suspend.pendingInvoke)
+            dev.deferred[0].complete(DeviceValue.of(5L))
+            r.awaitDefer(dev, 2)
+            dev.deferred[1].complete(DeviceValue.of(6L))
+            r.finish()
+            assertEquals(2, dev.calls("defer"))
+        }
+    }
+
+    private fun writeFile(m: Machine, path: String, bytes: ByteArray) {
+        val f = m.vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
+        m.vfs.write(f, bytes, 0, bytes.size)
+    }
+
+    /** 子の読み込みを止めたまま、親が `spawn-with-handles` で待つところまで進める */
+    private fun gated(block: Run.(GatedRuntime) -> Unit) = timeout(limit) {
+        val runtime = GatedRuntime(EndiveRuntime())
+        Harness(execRuntime = runtime).use { h ->
+            try {
+                val m = h.machine(fuelPerTick = 10_000_000)
+                m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+                m.vfs.createDirectory(VfsPath.parse("/bin"))
+                writeFile(m, "/bin/hello", P2Testing.wrap("hello-wasi"))
+                writeFile(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
+                val r = Run(h, m, spawnCommand)
+                r.tickUntil("読み込みに入らない: ${r.state()} ${r.rt.lastError}") { runtime.loads.get() > 0 }
+                r.tickUntil("spawn で待たない: ${r.state()}") { r.state() == ProcessState.WAITING_EVENT && r.suspend.pendingSpawn != null }
+                r.block(runtime)
+            } finally {
+                runtime.gate.countDown()
+            }
+        }
+    }
+
+    private fun Run.others(): Set<Int> = m.lock.withLockValue { m.kernel.processes.all().map { it.pid }.toSet() - pid }
+
+    @Test
+    fun `spawn-with-handlesとspawnは読み込みを巻き戻して待ち、開くと子を1つずつ作る`() = gated { runtime ->
+        assertParked()
+        // 子はまだない（ハンドルも置いていない。パイプの 2 つの端だけ）
+        assertEquals(emptySet<Int>(), others())
+        assertEquals(2, hostResources())
+        runtime.gate.countDown()
+        // 子の標準出力をパイプにでき、読み終えるまで子は 1 つだけ（16 バイトちょうどを読む）
+        finish()
+        assertNull(suspend.pendingSpawn)
+        // 作った子は 2 つ（pid は親の後の 2 つ）だけで、どちらも終わる（drop したハンドルの子は刈り取られるか、親のない終わったプロセスとして残る）
+        tickUntil("子が終わらない: ${others()}") { m.lock.withLockValue { others().all { m.kernel.processes[it]?.state?.isTerminal != false } } }
+        assertTrue(others().all { it == pid + 1 || it == pid + 2 }, "余計な子がある: ${others()}")
+    }
+
+    @Test
+    fun `spawnで待っている親をkillすると、読み込みが終わっても子を作らない`() = gated { runtime ->
+        m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
+        finish(ProcessState.KILLED)
+        runtime.gate.countDown()
+        repeat(50) {
+            h.scheduler.tick()
+            Thread.sleep(5)
+        }
+        assertEquals(emptySet<Int>(), others())
+    }
+
+    @Test
+    fun `spawnで待っている台の写しでは、プロセスを殺し、元の読み込みはそのまま続く`() = gated { runtime ->
+        assertParked()
+        val copy = m.captureCopy(CapturePolicy.KILL_TRANSIENT)!!
+        assertTrue(pid in copy.killedPids, "写しの中で殺していない")
+        copy.processes[pid]?.let { p ->
+            assertNull(p.asyncWait)
+            assertEquals(0, p.hostResources.size, "写しにホストの resource が残った")
+        }
+        assertNotNull(suspend.pendingSpawn)
+        runtime.gate.countDown()
+        finish()
+    }
+
+    private companion object {
+        const val ADDRESS = "00000000-0000-4000-8000-0000000000e2"
+    }
+}
