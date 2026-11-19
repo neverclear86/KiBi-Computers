@@ -127,12 +127,14 @@ class LuaKibiApiTest {
          * 積んだ start が、直後の take より前に実行されうる
          */
         private val tickOnlyWhileWaiting: Boolean = false,
+        /** マシンのコンソール出力（プロセスが終わるときの注記など）を受けたいときに渡す */
+        host: MachineHost? = null,
     ) : AutoCloseable {
         init {
             require(!tickOnlyWhileWaiting || maxHostCallsPerTick == 1) { "tickOnlyWhileWaiting は maxHostCallsPerTick = 1 と組にする" }
         }
 
-        val m: Machine = h.machine(fuelPerTick = 10_000_000, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
+        val m: Machine = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
         val dev = TestDev()
         private val output: Int
         private val text = StringBuilder()
@@ -1082,6 +1084,46 @@ class LuaKibiApiTest {
                 r.release(held)
             }
             Unit
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = [2, 4, 7])
+    fun `RAMの残りがMINを割った状態で確保が断られたら、commitを呼ばない道でも、メモリ不足だった注記が出る`(remainingKib: Long) = timeout(limit) {
+        // kibi_wasi.c の counted_alloc の、確保の前の MIN の線（remaining < KIBI_LUA_MIN）で断る道（#802）。この道は commit を呼ばずに NULL を返すので、
+        // note_refusal がなければ、プロセスが終わったときの「kibi:memory commit was refused」の注記（断られた commit の数で決まる）が出ない。
+        // 絞る前に C のスタックを深くまで書いておき（string.gsub のコールバックの入れ子）、絞った後のスタックの計数が新しく区画を数えないようにする。
+        // そうすると、計数は何も数えずに通り、残りが MIN 未満のまま MIN の線に着く。pcall の外で確保して、Lua のエラー（not enough memory）で終わらせる
+        val script = """
+            local gsub = string.gsub
+            local function deep(n) if n > 0 then gsub("x", "x", function() deep(n - 1) end) end end
+            deep(40)
+            print("ready")
+            io.stdout:flush()
+            os.sleep(2)
+            local t = {}
+            for i = 1, 100 do t[i] = ("y"):rep(16) end
+            print("unreachable")
+        """.trimIndent()
+        val console = StringBuilder()
+        val host = object : MachineHost {
+            override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
+
+            override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+                synchronized(console) { console.append(String(bytes, Charsets.UTF_8)) }
+            }
+        }
+        Run(script, memoryBytes = 512 * 1024L, host = host).use { r ->
+            r.waitFor("ready\n")
+            val held = r.squeeze(remainingKib * 1024)
+            val out = r.finish()
+            r.release(held)
+            // コンソールの行は、プロセスが終わるときに書く。書き出しを待つ
+            r.h.scheduler.tick()
+            val text = synchronized(console) { console.toString().replace("\r\n", "\n") }
+            assertTrue("unreachable" !in out, out)
+            assertEquals(1, r.m.lock.withLockValue { r.m.kernel.processes[r.pid]!!.exitCode }, "$out / $text")
+            assertTrue("kibi:memory commit was refused: out of memory, RAM limit 512 KiB)\n" in text, "$out / $text")
         }
     }
 
