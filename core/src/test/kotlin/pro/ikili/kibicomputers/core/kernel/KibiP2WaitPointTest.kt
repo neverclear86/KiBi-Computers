@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNotSame
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -234,6 +235,7 @@ class KibiP2WaitPointTest {
     /**
      * `invoke` の失敗の道を確かめるコマンド。`open` の後、メソッド名が長すぎる（`name-too-long`）・引数が多すぎる（`too-big`）は待たずに `kernel(...)` で返り、
      * メインスレッドのメソッド `defer` は 1 回目が `failed(..)`（デバイスが失敗を返した）、2 回目が `detached`（呼ぶ前にデバイスが外れた）で返る。
+     * 最後に、来ない時計の pollable を `block` で待つ（その間に、失敗の結果を受け取った後の表を確かめる）。
      * 食い違った段は `exit-with-code` の終了コードにする
      */
     private fun deviceErrorCommand(): ByteArray {
@@ -244,6 +246,8 @@ class KibiP2WaitPointTest {
               (import "kibi:device/bus@0.1.0" "[static]device.open" (func ${s}open (param i32 i32 i32)))
               (import "kibi:device/bus@0.1.0" "[method]device.invoke" (func ${s}invoke (param i32 i32 i32 i32 i32 i32)))
               (import "kibi:device/bus@0.1.0" "[resource-drop]device" (func ${s}ddrop (param i32)))
+              (import "wasi:clocks/monotonic-clock@0.2.12" "subscribe-duration" (func ${s}after (param i64) (result i32)))
+              (import "wasi:io/poll@0.2.12" "[method]pollable.block" (func ${s}pblock (param i32)))
               (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
               $realloc
               (data (i32.const 16) "$ADDRESS")
@@ -271,12 +275,16 @@ class KibiP2WaitPointTest {
                 (call ${s}expect (i32.const 4) (i32.const 0) (i32.const 40))
                 (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
                 (call ${s}expect (i32.const 1) (i32.const 0) (i32.const 50))
+                ;; 来ない時計（u64 の最大）を待つ。テストが表を確かめてから殺す
+                (call ${s}pblock (call ${s}after (i64.const -1)))
                 (call ${s}ddrop (local.get ${s}d))
                 (i32.const 0)))
         """.trimIndent()
         return KibiP2WitTool.component(
             """
             import kibi:device/bus@0.1.0;
+            import wasi:clocks/monotonic-clock@0.2.12;
+            import wasi:io/poll@0.2.12;
             import wasi:cli/exit@0.2.12;
             export wasi:cli/run@0.2.12;
             """.trimIndent(),
@@ -360,6 +368,115 @@ class KibiP2WaitPointTest {
         )
     }
 
+    /**
+     * `invoke` の「起きないはず」の守りを確かめるコマンド。`defer` を呼んで `failed("interrupted")` を受け取り（テストが待ちを忘れさせる）、
+     * 時計で 100 ms 待ち（その間にテストが古い待ちを戻す）、もう一度 `defer` を呼んで ok を受け取る。食い違った段は終了コードにする
+     */
+    private val deviceGuardCommand: ByteArray by lazy {
+        val wat = """
+            (module
+              (import "kibi:device/bus@0.1.0" "[static]device.open" (func ${s}open (param i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[method]device.invoke" (func ${s}invoke (param i32 i32 i32 i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[resource-drop]device" (func ${s}ddrop (param i32)))
+              (import "wasi:clocks/monotonic-clock@0.2.12" "subscribe-duration" (func ${s}after (param i64) (result i32)))
+              (import "wasi:io/poll@0.2.12" "[method]pollable.block" (func ${s}pblock (param i32)))
+              (import "wasi:io/poll@0.2.12" "[resource-drop]pollable" (func ${s}pdrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "$ADDRESS")
+              (data (i32.const 64) "defer")
+              (data (i32.const 80) "interrupted")
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}d i32) (local ${s}p i32) (local ${s}i i32)
+                (call ${s}open (i32.const 16) (i32.const 36) (i32.const 128))
+                (if (i32.load8_u (i32.const 128)) (then (call ${s}fail (i32.const 10))))
+                (local.set ${s}d (i32.load (i32.const 132)))
+                ;; 1 回目: err(failed("interrupted"))（call-error の判別子 +4 が 4、文字列 +8・+12）
+                (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+                (if (i32.ne (i32.load8_u (i32.const 160)) (i32.const 1)) (then (call ${s}fail (i32.const 20))))
+                (if (i32.ne (i32.load8_u (i32.const 164)) (i32.const 4)) (then (call ${s}fail (i32.const 21))))
+                (if (i32.ne (i32.load (i32.const 172)) (i32.const 11)) (then (call ${s}fail (i32.const 22))))
+                (loop ${s}cmp
+                  (if (i32.ne (i32.load8_u (i32.add (i32.load (i32.const 168)) (local.get ${s}i))) (i32.load8_u (i32.add (i32.const 80) (local.get ${s}i))))
+                    (then (call ${s}fail (i32.const 23))))
+                  (local.set ${s}i (i32.add (local.get ${s}i) (i32.const 1)))
+                  (br_if ${s}cmp (i32.lt_u (local.get ${s}i) (i32.const 11))))
+                ;; 時計で 100 ms 待つ
+                (local.set ${s}p (call ${s}after (i64.const 100000000)))
+                (call ${s}pblock (local.get ${s}p))
+                (call ${s}pdrop (local.get ${s}p))
+                ;; 2 回目: ok
+                (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+                (if (i32.load8_u (i32.const 160)) (then (call ${s}fail (i32.const 30))))
+                (call ${s}ddrop (local.get ${s}d))
+                (i32.const 0)))
+        """.trimIndent()
+        KibiP2WitTool.component(
+            """
+            import kibi:device/bus@0.1.0;
+            import wasi:clocks/monotonic-clock@0.2.12;
+            import wasi:io/poll@0.2.12;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
+    /**
+     * `spawn` の「起きないはず」の守りを確かめるコマンド。`/bin/ok` を `spawn`（読み込みで巻き戻る。テストが待ちを忘れさせる）し、
+     * 時計で 100 ms 待ち（その間にテストが古い待ちを戻す）、子のハンドルを drop して `/bin/none` を `spawn`（`no-entry`）し、来ない時計で待つ。
+     * 食い違った段は終了コードにする
+     */
+    private val spawnGuardCommand: ByteArray by lazy {
+        val noent = KibiErrors.code(Errno.NOENT)
+        val wat = """
+            (module
+              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func ${s}spawn (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "kibi:process/process@0.1.0" "[resource-drop]process" (func ${s}procdrop (param i32)))
+              (import "wasi:clocks/monotonic-clock@0.2.12" "subscribe-duration" (func ${s}after (param i64) (result i32)))
+              (import "wasi:io/poll@0.2.12" "[method]pollable.block" (func ${s}pblock (param i32)))
+              (import "wasi:io/poll@0.2.12" "[resource-drop]pollable" (func ${s}pdrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "/bin/none")
+              (data (i32.const 32) "/bin/ok")
+              (func ${s}spawnPath (param ${s}ptr i32) (param ${s}len i32)
+                (call ${s}spawn
+                  (local.get ${s}ptr) (local.get ${s}len)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 96)))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}c i32) (local ${s}p i32)
+                (call ${s}spawnPath (i32.const 32) (i32.const 7))
+                (if (i32.load8_u (i32.const 96)) (then (call ${s}fail (i32.add (i32.const 100) (i32.load8_u (i32.const 100))))))
+                (local.set ${s}c (i32.load (i32.const 100)))
+                (local.set ${s}p (call ${s}after (i64.const 100000000)))
+                (call ${s}pblock (local.get ${s}p))
+                (call ${s}pdrop (local.get ${s}p))
+                (call ${s}procdrop (local.get ${s}c))
+                (call ${s}spawnPath (i32.const 16) (i32.const 9))
+                (if (i32.ne (i32.load8_u (i32.const 96)) (i32.const 1)) (then (call ${s}fail (i32.const 20))))
+                (if (i32.ne (i32.load8_u (i32.const 100)) (i32.const $noent)) (then (call ${s}fail (i32.const 21))))
+                ;; 来ない時計（u64 の最大）を待つ。テストが確かめてから殺す
+                (call ${s}pblock (call ${s}after (i64.const -1)))
+                (i32.const 0)))
+        """.trimIndent()
+        KibiP2WitTool.component(
+            """
+            import kibi:process/process@0.1.0;
+            import wasi:clocks/monotonic-clock@0.2.12;
+            import wasi:io/poll@0.2.12;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
     /** 読み込みを [gate] が開くまで止めるランタイム（子の読み込みを確実に待たせる） */
     private class GatedRuntime(private val inner: WasmRuntime) : WasmRuntime {
         val gate = CountDownLatch(1)
@@ -399,16 +516,16 @@ class KibiP2WaitPointTest {
 
         fun hostResources(): Int = m.lock.withLockValue { m.kernel.processes[pid]!!.hostResources.size }
 
-        /** 待機点で、スレッドもブロッキング型の枠も使わずに待っている */
-        fun assertParked() {
+        /** 待機点で、スレッドもブロッキング型の枠も使わずに待っている。[clock] なら時計の待ち（やり直しの値に期限を持つ） */
+        fun assertParked(clock: Boolean = false) {
             assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
             assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
             eventually(5_000, "スレッドが外れない") { rt.thread == null }
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
             assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
             assertTrue(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncStack!!.size } > 0, "退避した値がない")
-            // 待ちは実行時だけの状態で、カーネルの AsyncWait には入れない
-            assertNull(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncWait })
+            // kibi の待ちは実行時だけの状態で、カーネルの AsyncWait には入れない
+            if (!clock) assertNull(m.lock.withLockValue { m.kernel.processes[pid]!!.asyncWait })
             assertTrue(m.isAtWaitPoint, "待機点でない")
         }
 
@@ -599,11 +716,18 @@ class KibiP2WaitPointTest {
             detach.set(true)
             // デバイスの失敗: 巻き直して着いた後に failed(..) で返る
             dev.deferred[0].fail("boom")
-            r.finish()
+            // 段を最後まで通って、来ない時計で待つ（表は device と pollable の 2 つ。pending-call が残っていれば 3 以上）
+            r.tickUntil("時計で待たない: ${r.state()}") {
+                r.state().isTerminal || (r.state() == ProcessState.WAITING_EVENT && r.suspend.pendingInvoke == null)
+            }
+            assertFalse(r.state().isTerminal, "時計で待つ前に終わった: 終了コード ${m.lock.withLockValue { m.kernel.processes[r.pid]?.exitCode }} ${r.rt.lastError}")
+            r.assertParked(clock = true)
             assertEquals(1, dev.calls("defer"), "外れたデバイスのメソッドを呼んだ")
-            assertNull(r.suspend.pendingInvoke)
-            assertEquals(0, pendingCallObjects(m))
-            assertEquals(0, r.hostResources(), "表に項目が残った")
+            // プロセスが生きている間に確かめる（終わると表は閉じられて、外し忘れていても 0 になる）
+            assertEquals(2, r.hostResources(), "failed・detached の pending-call が表に残った")
+            assertEquals(0, pendingCallObjects(m), "failed・detached の pending-call が残った")
+            m.lock.withLockValue { m.killLocked(r.pid, KillSignal.KILL) }
+            r.finish(ProcessState.KILLED)
         }
     }
 
@@ -620,6 +744,68 @@ class KibiP2WaitPointTest {
         assertNull(suspend.pendingSpawn)
         assertEquals(loadsWhileWaiting, runtime.loads.get(), "満杯で断ったのに読み込みに入った")
         assertEquals(emptySet<Int>(), others(), "失敗したのに子ができた")
+    }
+
+    /** 終わるか、[parked] の形で時計を待つところまで進め、待機点で待っていることを確かめる */
+    private fun Run.awaitParked(message: String, parked: () -> Boolean) {
+        tickUntil("$message: ${state()}") { state().isTerminal || (state() == ProcessState.WAITING_EVENT && parked()) }
+        assertFalse(state().isTerminal, "$message: 待つ前に終わった（終了コード ${m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }}）")
+        assertParked(clock = true)
+    }
+
+    @Test
+    fun `巻き直して着いたのにinvokeの待ちがなければinterruptedで返してメソッドを呼び直さず、新しい呼び出しは残った待ちを閉じてから始める`() = timeout(limit) {
+        device { h, m, dev ->
+            val r = Run(h, m, deviceGuardCommand)
+            r.awaitDefer(dev, 1)
+            r.assertParked()
+            assertEquals(2, r.hostResources())
+            val stale = r.suspend.pendingInvoke!!
+            // (1) 巻き戻している間に待ちを忘れる（起きないはず）: 巻き直して着いても、メソッドを呼び直さずに failed("interrupted")
+            r.suspend.pendingInvoke = null
+            dev.deferred[0].complete(DeviceValue.of(5L))
+            // 時計で待つ。隠れた pending-call は外されずに残る（device・残った pending-call・pollable）
+            r.awaitParked("時計で待たない") { r.hostResources() == 3 }
+            assertEquals(1, dev.calls("defer"), "待ちがないのにメソッドを呼び直した")
+            assertEquals(1, pendingCallObjects(m))
+            // (2) 新しい invoke の時点で前の待ちが残っている（起きないはず）: 閉じてから最初から行う
+            r.suspend.pendingInvoke = stale
+            r.awaitDefer(dev, 2)
+            r.assertParked()
+            assertNotSame(stale, r.suspend.pendingInvoke, "残っていた待ちをそのまま使った")
+            // device と新しい pending-call だけ（残っていた pending-call は閉じた）
+            assertEquals(2, r.hostResources(), "残っていた pending-call を閉じていない")
+            assertEquals(1, pendingCallObjects(m), "残っていた pending-call を閉じていない")
+            dev.deferred[1].complete(DeviceValue.of(6L))
+            r.finish()
+            assertEquals(2, dev.calls("defer"))
+        }
+    }
+
+    @Test
+    fun `巻き直して着いたのにspawnの読み込みがなければbeginExecからやり直して子は1つだけ、新しい呼び出しは残った読み込みを閉じてから始める`() = gated(spawnGuardCommand) { runtime ->
+        assertParked()
+        val spawned = Collections.synchronizedList(ArrayList<Int>())
+        h.scheduler.hooks.duringSpawn = { _, child -> spawned += child }
+        val stale = suspend.pendingSpawn!!
+        val staleId = stale.key.objectId
+        // (1) 巻き戻している間に読み込みを忘れる（起きないはず）: 巻き直して着いたら beginExec からやり直す（子はまだ作っていない）
+        suspend.pendingSpawn = null
+        runtime.gate.countDown()
+        // 子を 1 つ作り、時計で待つ（子のハンドルと pollable）
+        awaitParked("時計で待たない") { hostResources() == 2 }
+        assertEquals(1, spawned.size, "子の数: $spawned")
+        assertNull(suspend.pendingSpawn)
+        assertNotNull(m.lock.withLockValue { m.kernel.objects[staleId] }, "忘れた読み込みの待ちがもう閉じている（前提が崩れた）")
+        // (2) 新しい spawn の時点で前の読み込みが残っている（起きないはず）: 閉じてから最初から行う（残っていた読み込みで子を作らない）
+        suspend.pendingSpawn = stale
+        // /bin/none の spawn が no-entry で返り、来ない時計で待つ（表は pollable だけ）
+        awaitParked("2 回目の spawn の後で待たない") { hostResources() == 1 }
+        assertEquals(1, spawned.size, "残っていた読み込みで子を作った: $spawned")
+        assertNull(suspend.pendingSpawn)
+        assertNull(m.lock.withLockValue { m.kernel.objects[staleId] }, "残っていた読み込みの待ちを閉じていない")
+        m.lock.withLockValue { m.killLocked(pid, KillSignal.KILL) }
+        finish(ProcessState.KILLED)
     }
 
     private companion object {
