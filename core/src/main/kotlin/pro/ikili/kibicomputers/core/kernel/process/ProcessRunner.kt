@@ -699,6 +699,10 @@ internal class ProcessRunner(private val machine: Machine) {
         rt.fuelUnwound = true
         rt.fuelUnwindRemaining = remaining
         rt.fuelUnwindYield = yielding
+        // 計測コードは、残りを関数の中のローカルに控えていて、巻き戻して戻るときはグローバルに書き戻さない（古いままになる）。
+        // waitFuelUnwound は lift の燃料を引いた後のグローバルを読むので、ここで今の残りを入れておく
+        // （入れないと、グローバルに残った古い手持ちを、使い切ったはずの燃料としてマシンへ返してしまう）
+        lock.withLockValue { rt.currentHolder?.fuel = remaining }
         component.requestUnwind()
         return remaining
     }
