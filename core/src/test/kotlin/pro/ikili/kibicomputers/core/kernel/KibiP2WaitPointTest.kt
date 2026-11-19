@@ -802,7 +802,11 @@ class KibiP2WaitPointTest {
 
     /** 終わるか、[parked] の形で時計を待つところまで進め、待機点で待っていることを確かめる */
     private fun Run.awaitParked(message: String, parked: () -> Boolean) {
-        tickUntil("$message: ${state()}") { state().isTerminal || (state() == ProcessState.WAITING_EVENT && parked()) }
+        // 子が走っている間は台が待機点でない（isAtWaitPoint は全プロセスを見る）ので、子が終わるのも待つ
+        tickUntil("$message: ${state()}") {
+            state().isTerminal || (state() == ProcessState.WAITING_EVENT && parked() &&
+                m.lock.withLockValue { others().all { m.kernel.processes[it]?.state?.isTerminal != false } })
+        }
         assertFalse(state().isTerminal, "$message: 待つ前に終わった（終了コード ${m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }}）")
         assertParked(clock = true)
     }
