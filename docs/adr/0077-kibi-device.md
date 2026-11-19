@@ -43,7 +43,7 @@
 
 ## 引数とハンドルの誤り
 
-- 確かめる順は引数の順: `method` → `args` → ハンドル。Component Model（全引数を lift してから呼ぶ）とは、どの誤りが先に出るかが違うことがある（既知。#616）
+- 確かめる順は引数の順: `method` → `args` → ハンドル。Component Model の層（全引数を lift してから呼ぶ）とは、どの誤りが先に出るかが違うことがある（長すぎる `method` と揃っていない `args` は、p1 は `kernel(name-too-long)`、Component Model の層はトラップ）。p1 はこの順のまま揃えない（#616。ADR 0616）
 - `method` が 64 バイトを超えたら読まずに `kernel(name-too-long)`。`args` が 32 個を超えたら要素を読まずに `kernel(too-big)`。text・bytes の長さの合計が 64 KiB を超えたら中身を読む前に `kernel(too-big)`（上限は `DeviceLimits` の定数をそのまま使い、`DeviceDispatcher.start` と揃える）
 - `args` の ptr は align 8。揃っていなければ、長さ 0 でもほかの検査より先にトラップ（#430）
 - `value` の判別子が 0..5 の外、UTF-8 の誤りは `kernel(invalid)`。範囲外のメモリは `kernel(fault)`。bool は 0 でなければ true
