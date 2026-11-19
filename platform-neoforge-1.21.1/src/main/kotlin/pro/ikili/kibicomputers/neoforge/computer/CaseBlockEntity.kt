@@ -289,6 +289,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (computer.beginRestore()) ServerMachines.offerRestore(this)
     }
 
+    /**
+     * [startRestore] の用意（設定・ディスク・保存元）の最初に呼ぶ（テスト用。#808）。ゲーム内で用意を投げさせる口がないので、
+     * GameTest がここで例外を投げて、`finally` の後始末（順番待ちを抜ける・つなぎを外す）を通す。普段は `null`
+     */
+    internal var restorePreparationHook: Runnable? = null
+
     /** 最後に [startRestore] で決めた戻す世代（テスト・#575 用。冷えた起動なら `null`。まだなら `null`） */
     internal var lastRestoreSource: RestoreSource? = null
         private set
@@ -320,45 +326,53 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     internal fun startRestore(writesTimedOut: Boolean) {
         val level = level as? ServerLevel ?: return
         if (!computer.isRestorePending || isRemoved) return
-        val config = MachineSpecs.configOf(tier, parts.tiers)
-        val disks = prepareDisks()
-        val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
-        val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
-        val store = WorldMachineSaves.current
-        // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
-        val id = currentIdentity
-        val source = when {
-            store == null || id == null -> null
-            writesTimedOut -> null
-            // 新しい ID は振った直後（世代 0）だけ冷えた起動にする。その後に書いた世代があれば戻す（FULL に戻ったときなど。#575）
-            lastClaim?.isNewId == true && id.generation == 0L -> null
-            else -> RestoreSource(store, id.id, id.generation)
+        // 用意（ディスク・設定・保存元）や ComputerCase.startRestore が投げても、表示を RUNNING・順番待ちのまま残さない（#808）。
+        // 順番待ちのままなら startRestore の前で投げたので、エラーにして順番待ちを抜ける（PoweredOn は残す）。例外はそのまま
+        // RestoreQueue に返し、場所ごとに間引いてログに出させる（#785）
+        try {
+            restorePreparationHook?.run()
+            val config = MachineSpecs.configOf(tier, parts.tiers)
+            val disks = prepareDisks()
+            val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
+            val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
+            val store = WorldMachineSaves.current
+            // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
+            val id = currentIdentity
+            val source = when {
+                store == null || id == null -> null
+                writesTimedOut -> null
+                // 新しい ID は振った直後（世代 0）だけ冷えた起動にする。その後に書いた世代があれば戻す（FULL に戻ったときなど。#575）
+                lastClaim?.isNewId == true && id.generation == 0L -> null
+                else -> RestoreSource(store, id.id, id.generation)
+            }
+            lastRestoreSource = source
+            lastRestoreTimedOut = writesTimedOut
+            lastRestoreOutcome = null
+            val serial = ++restoreStarts
+            if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
+            ServerMachines.recordRestoreStart(source != null, writesTimedOut)
+            computer.startRestore(
+                ServerMachines.current,
+                MachineKey.of(level, blockPos),
+                installedForBoot,
+                true,
+                config,
+                environment,
+                boot,
+                source,
+                RestoreReady { machine ->
+                    wiring.attach(level, blockPos, machine, speakerAddress)
+                    logRestoreWiring(machine, source != null)
+                },
+                RestoreListener { _, outcome, cause ->
+                    noteRestoreOutcome(serial, outcome)
+                    ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
+                },
+            )
+        } finally {
+            if (computer.isRestorePending) computer.abandonRestore()
+            if (computer.machine == null) wiring.disconnect()
         }
-        lastRestoreSource = source
-        lastRestoreTimedOut = writesTimedOut
-        lastRestoreOutcome = null
-        val serial = ++restoreStarts
-        if (source == null) LOGGER.info("Cold-booting the computer at {} (id={}, claim={}, writesTimedOut={})", blockPos, id, lastClaim, writesTimedOut)
-        ServerMachines.recordRestoreStart(source != null, writesTimedOut)
-        computer.startRestore(
-            ServerMachines.current,
-            MachineKey.of(level, blockPos),
-            installedForBoot,
-            true,
-            config,
-            environment,
-            boot,
-            source,
-            RestoreReady { machine ->
-                wiring.attach(level, blockPos, machine, speakerAddress)
-                logRestoreWiring(machine, source != null)
-            },
-            RestoreListener { _, outcome, cause ->
-                noteRestoreOutcome(serial, outcome)
-                ServerMachines.recordRestoreFinished(blockPos, outcome, cause)
-            },
-        )
-        if (computer.machine == null) wiring.disconnect()
     }
 
     /**

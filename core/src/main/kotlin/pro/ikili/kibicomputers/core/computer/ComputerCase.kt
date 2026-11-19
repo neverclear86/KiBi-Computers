@@ -48,7 +48,11 @@ public enum class ComputerError {
     /** カーネルの不整合でマシンが止まった */
     CRASHED,
 
-    /** マシンを作れなかった（サーバーの停止の途中など） */
+    /**
+     * マシンを作れなかった（サーバーの停止の途中など）。マシンを作る処理や、復元を始める前の用意（接続層）が投げたときもこれにする
+     * （#808）。どちらも電源の状態（[ComputerCase.poweredOn]）は変えない。復元の途中（[ComputerCase.startRestore]・
+     * [ComputerCase.abandonRestore]）なら電源が入ったままなので次の読み込みで復元し直し、[ComputerCase.turnOn] なら電源は入らないまま
+     */
     UNAVAILABLE,
 
     /** 起動に失敗した（起動できるディスクがない・init を実行できないなど。理由の詳細は画面のコンソールに出る。#641） */
@@ -81,7 +85,7 @@ public enum class ComputerError {
  * | [turnOff]・[partsChanged] で止めた・[powerLost] で止めた | `false` |
  * | マシンが CRASHED になった・ゲストが止めた（再起動の途中でない STOPPED）・起動に失敗した | `false` |
  * | 部品が足りない・電力がないので [turnOn]・[startRestore] で作れなかった | `false` |
- * | [chunkUnloaded]・[removed]・マシンを作れなかった（サーバーの停止の途中など） | 変えない |
+ * | [chunkUnloaded]・[removed]・マシンを作れなかった（サーバーの停止の途中など。作る処理・復元の前の用意が投げた [abandonRestore] を含む） | 変えない |
  *
  * スレッド: メインスレッドから呼ぶ（マシンの通知もメインスレッドで届く）。
  *
@@ -105,7 +109,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     public var poweredOn: Boolean = false
         private set
 
-    /** チャンクの読み込みで復元を待っている（[beginRestore] から [startRestore] まで） */
+    /** チャンクの読み込みで復元を待っている（[beginRestore] から [startRestore]・[abandonRestore] まで） */
     public var isRestorePending: Boolean = false
         private set
 
@@ -154,6 +158,7 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * 電源ボタン: 動いていれば [turnOff]、そうでなければ [turnOn]。
+     * マシンを作る処理が投げたら、[turnOn] と同じく [ComputerError.UNAVAILABLE] にして例外を投げ直す（#808）。
      *
      * @return 押した後の状態
      */
@@ -175,6 +180,9 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
 
     /**
      * 電源を入れる。もう動いていれば何もしない。
+     *
+     * マシンを作る処理が投げたら、[ComputerStatus.ERROR]（[ComputerError.UNAVAILABLE]）にして例外を投げ直す（#808）。
+     * 電源は入れない（[poweredOn] は偽のまま）。ログは呼び手に任せる。JVM の致命的なエラーは、状態を触らずにそのまま投げる。
      *
      * @param manager マシンを作る先。`null`（サーバーが動いていない）なら [ComputerError.UNAVAILABLE]
      * @param key このケースのマシンのキー
@@ -199,7 +207,10 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
         return status
     }
 
-    /** [turnOn]・[startRestore] の共通: 部品・電力・マシンを確かめてマシンを作る。作れなければ状態をエラーなどにして `null` */
+    /**
+     * [turnOn]・[startRestore] の共通: 部品・電力・マシンを確かめてマシンを作る。作れなければ状態をエラーなどにして `null`。
+     * マシンを作る処理が投げたら、[ComputerError.UNAVAILABLE] にして例外を投げ直す（JVM の致命的なエラーは状態を触らずに投げる。#808）
+     */
     private fun load(
         manager: MachineManager<K>?,
         key: K,
@@ -220,7 +231,15 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
             }
             manager == null -> fail(ComputerError.UNAVAILABLE)
             else -> {
-                val machine = slot.load(manager, key, host, config, environment)
+                // 作る処理が投げたら（接続層・スケジューラーの不具合など。#808）、表示を RUNNING のまま残さずエラーにして投げ直す。
+                // 電源の状態は変えない（ADR 0085 の「マシンを作れなかった」）。ログは呼び手（RestoreQueue の間引きなど）に任せる。
+                // JVM の致命的なエラーは、状態を触らずにそのまま投げる
+                val machine = try {
+                    slot.load(manager, key, host, config, environment)
+                } catch (t: Throwable) {
+                    if (!isFatal(t)) fail(ComputerError.UNAVAILABLE)
+                    throw t
+                }
                 if (machine == null) {
                     fail(ComputerError.UNAVAILABLE)
                 } else {
@@ -253,6 +272,21 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
     }
 
     /**
+     * 復元の順番待ちを、マシンを作らずに抜ける（#808）。[startRestore] の前の用意（接続層。ディスクの用意・設定の組み立てなど）が
+     * 投げたときに呼ぶ。順番待ちなら印を下ろして [ComputerStatus.ERROR]（[ComputerError.UNAVAILABLE]）にし、`true` を返す。
+     * [poweredOn] は変えない（`poweredOnChanged` も呼ばない）ので、次の読み込みで復元し直す（ADR 0085 の「マシンを作れなかった」）。
+     * 順番待ちでなければ何もしない（OFF・ERROR・動いているマシンの表示を上書きしない）。
+     *
+     * @return 順番待ちを抜けた
+     */
+    public fun abandonRestore(): Boolean {
+        if (!isRestorePending) return false
+        isRestorePending = false
+        fail(ComputerError.UNAVAILABLE)
+        return true
+    }
+
+    /**
      * 復元を始める（#85、ADR 0085）。[beginRestore] で順番待ちでなければ何もしない。部品・電力・マシンを [turnOn] と同じに確かめて
      * マシンを作り、[source] があれば [Machine.restore] で戻す。終わったら（戻せた・冷えた起動にする）メインスレッドで、まだこのケースの
      * 今のマシンなら [onReady] を呼び（デバイスをつなぐ）、戻せたらまだ実行していないデバイスの呼び出しを回し直し、冷えた起動なら
@@ -263,6 +297,8 @@ public class ComputerCase<K : Any> @JvmOverloads constructor(
      * つなぎかけのまま続けるので、つながらなかったデバイスへの呼び出しは `detached` で終わる。例外は捨てずに投げ直す:
      * 復元の知らせの中なら [Machine] が「復元の受け手」としてログに出し（ADR 0044。マシンは続く）、同期の起動なら起動した後に
      * この関数から投げる。JVM の致命的なエラーだけは、後の手順を走らせずにそのまま投げる。
+     *
+     * マシンを作る処理が投げたら、順番待ちを抜けて [ComputerError.UNAVAILABLE] にし（[poweredOn] は変えない）、例外を投げ直す（#808）。
      *
      * @return 始めた後の状態
      */

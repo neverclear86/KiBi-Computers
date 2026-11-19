@@ -13,6 +13,7 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerError
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenTier
@@ -745,5 +746,45 @@ object MachineRestoreGameTests {
             be.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }.thenSucceed()
+    }
+
+    /**
+     * 復元の用意が投げた台（#808）: `startRestore` の前の用意（設定・ディスク・保存元）が投げても、順番待ちのまま RUNNING と表示し続けず、
+     * ERROR（UNAVAILABLE）にして順番待ちを抜ける。`PoweredOn` は残し（次の読み込みで復元し直す）、つなぎは外れ、例外は呼び手
+     * （`RestoreQueue`）に返る。マシンは作らない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun failedRestorePreparationLeavesAnErrorNotRunning(helper: GameTestHelper) {
+        helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState())
+        val be = helper.getBlockEntity(CASE) as CaseBlockEntity
+        installRequired(be)
+        be.computer.loadPoweredOn(true)
+        helper.assertTrue(be.computer.beginRestore(), "a powered-on case should wait for a restore")
+        helper.assertTrue(
+            be.computer.isRestorePending && be.computer.status == ComputerStatus.RUNNING,
+            "should show RUNNING while waiting: ${be.computer}",
+        )
+        val boom = IllegalStateException("preparation failed (test)")
+        be.restorePreparationHook = Runnable { throw boom }
+        var thrown: Throwable? = null
+        try {
+            be.startRestore(false)
+        } catch (e: IllegalStateException) {
+            thrown = e
+        } finally {
+            be.restorePreparationHook = null
+        }
+        helper.assertTrue(thrown === boom, "the preparation failure should reach the caller but was $thrown")
+        helper.assertTrue(!be.computer.isRestorePending, "the case should leave the restore wait")
+        helper.assertTrue(
+            be.computer.status == ComputerStatus.ERROR && be.computer.error == ComputerError.UNAVAILABLE,
+            "the case should show ERROR/UNAVAILABLE but was ${be.computer}",
+        )
+        helper.assertTrue(be.computer.poweredOn, "PoweredOn should stay so the next load restores again")
+        helper.assertTrue(be.computer.machine == null, "no machine should be created")
+        helper.assertTrue(be.wiring.connectedMachine == null, "nothing should be wired")
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
     }
 }
