@@ -272,6 +272,31 @@ object StandardOsGameTests {
     }
 
     /**
+     * デバイス操作のコマンド（#108、ADR 0108）: 標準 OS のシェルから `lsdev` でケースのスピーカーと隣の画面・キーボードを列挙し、
+     * `devcall` で画面の `get-size` を呼ぶ
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun shellListsAndCallsAdjacentDevices(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val expected = "dv 3 1 ${screen.text.width} ${screen.text.height}"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, "echo dv \$(lsdev | wc -l) \$(lsdev speaker | grep -c kibicomputers:speaker) \$(devcall screen get-size)")
+                typed = true
+                helper.fail("typed the line")
+            }
+            helper.assertTrue(text.any { it == expected }, "lsdev and devcall should list and call the devices ($expected): $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
      * Lua の parallel（#95、ADR 0095）: 標準 OS の `/bin/lua` から、2つのコルーチンが sleep とイベントで待ち合わせて終わる
      */
     @JvmStatic
@@ -331,8 +356,9 @@ object StandardOsGameTests {
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun luaReceivesKeyEvents(helper: GameTestHelper) {
         val (case, screen, keyboard) = placeComputer(helper)
-        // 最初の pullEvent でカーネルのキューが開くので、kready が出た時点でキーのイベントを受けられる
-        val script = "os.queueEvent('r0'); os.pullEvent('r0'); print('kready'); local e; " +
+        // 最初の pullEvent でカーネルのキューが開く。filter なしで待つので、端末のエコーもここで切れる（ADR 0798。
+        // filter 付きだと切れるのは次の待ちで、kready を見て打った文字がその前に届くとエコーされてしまう）
+        val script = "os.queueEvent('r0'); os.pullEvent(); print('kready'); local e; " +
             "repeat e = {os.pullEvent('key')} until e[2] == keys.q; " +
             "print(table.concat({'kp', keys.getName(e[2]), tostring(e[3]), #e}, ','))"
         var step = 0

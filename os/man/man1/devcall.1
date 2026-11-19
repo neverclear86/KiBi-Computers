@@ -1,0 +1,41 @@
+# devcall(1)
+
+## NAME
+
+devcall - call a method of a device
+
+## SYNOPSIS
+
+    devcall device method [arg ...]
+
+## DESCRIPTION
+
+Calls `method` of a device with the arguments, waits for the result, and writes each result value on its own line.
+
+The device is named as in lsdev(1): its whole address, the start of its address, or its kind (`screen` matches `kibicomputers:screen`). Upper-case letters are turned into lower case. If the name matches no device or more than one, nothing is called.
+
+An argument can name its type with a prefix:
+
+- `s:text`: text
+- `i:123`: integer (64-bit)
+- `f:1.5`: float (`f:inf` and `f:nan` too)
+- `b:true`, `b:false`: boolean
+- `x:00ff`: bytes, in hexadecimal
+
+Without a prefix, `none` is none, `true` and `false` are booleans, a whole number is an integer, a number with `.` or `e` is a float, and anything else is text.
+
+Results are written the same way: `none`, integers, floats (always with `.` or `e`, such as `2.0`; `f:inf`, `f:-inf` and `f:nan` with the prefix), `true` or `false`, text, and bytes as `x:` followed by hexadecimal. Control characters in text are written as `?`.
+
+At most 32 arguments, 64 KiB of text and bytes in all, and a method name of 64 bytes are allowed.
+
+## EXIT STATUS
+
+0 on success, 1 if the call failed (no such device or method, or an error from the device), 2 for a malformed argument.
+
+## NOTES
+
+A failed call is not retried. A method that runs on the main thread may already have run when the computer is saved and restored during the call; it then fails with `interrupted`. Stopping devcall with Ctrl+C cancels a call that has not run yet, but does not undo one that has.
+
+## SEE ALSO
+
+lsdev(1), kibi(7), peripheral(3)

@@ -1,0 +1,25 @@
+# lsdev(1)
+
+## NAME
+
+lsdev - list connected devices
+
+## SYNOPSIS
+
+    lsdev [-l] [device ...]
+    lsdev -w
+
+## DESCRIPTION
+
+Lists the devices connected to the computer, one per line, as `address kind`. An address is a lower-case UUID; a kind looks like `kibicomputers:screen`.
+
+With devices, only the matching ones are listed. A device is named by its whole address, the start of its address, or its kind (`screen` matches `kibicomputers:screen`). Upper-case letters are turned into lower case. A name that matches nothing is reported, and the exit status is 1.
+
+## OPTIONS
+
+- `-l`: list the methods of each device below it, one per line. Methods that run on the game's main thread are marked `(main)`; their results come back on a later tick
+- `-w`: after the list, keep watching. A connected device is written as `+ address kind` and a disconnected one as `- address kind`. Stop with Ctrl+C. After the computer is restored from a save, the list is read again and only the differences are written
+
+## SEE ALSO
+
+devcall(1), kibi(7), peripheral(3)

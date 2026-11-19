@@ -58,6 +58,8 @@ class BasicCommandsTest {
         "sleep", "env", "printenv", "date", "seq", "yes", "sort", "uniq", "tee", "xargs", "basename", "dirname", "which",
         // #454
         "ps", "df", "mount", "umount", "reboot", "shutdown",
+        // #108
+        "lsdev", "devcall",
         // #110
         "access",
     )

@@ -4,7 +4,7 @@
 //! Zig の標準ライブラリの高い層（`std.Io`・アロケーター）は版ごとに形が変わり、大きさも増えるので使わない。
 //! バッファは静的に置く（.bss はゼロなので、触るまで RAM に数えない。#407）。
 //!
-//! 可変長の結果を返す import（`events` の `take`・`process.listProcesses`・`mounts.listMounts`・`mounts.listDisks`・`access.getAccess`）を使うプログラムは、
+//! 可変長の結果を返す import（`events` の `take`・`process.listProcesses`・`mounts.listMounts`・`mounts.listDisks`・`access.getAccess`・`device` の包み）を使うプログラムは、
 //! `cabi_realloc`（`canon`。静的な領域から切り出すだけ）も export する（`core/build.gradle.kts` の `osReallocPrograms` に足したプログラムだけに出る）。
 //!
 //! 出していないもの（使うプログラムができたときに足す）: `kibi:kernel/timers`・
@@ -28,5 +28,6 @@ pub const canon = @import("canon.zig");
 pub const mounts = @import("mounts.zig");
 pub const power = @import("power.zig");
 pub const access = @import("access.zig");
+pub const device = @import("device.zig");
 
 pub const Error = errno.Error;

@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.core.display.CharWidth
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.display.terminal.AnsiTerminal
@@ -160,6 +162,8 @@ class StandardOsRestoreTest {
         h: Harness,
         store: MachineSaveStore,
         identity: MachineIdentity,
+        // 受け手の中（プロセスが動き出す前）で呼ぶ。接続層が受け手でデバイスをつなぎ直すのと同じ（ADR 0067）
+        onReady: ((Machine) -> Unit)? = null,
         pid: Int? = null,
         probe: ((ProcessState, String, Int) -> Unit)? = null,
     ): Pair<Machine, ScreenHost> {
@@ -167,6 +171,7 @@ class StandardOsRestoreTest {
         val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
         val outcomes = Collections.synchronizedList(ArrayList<RestoreOutcome>())
         val listener = RestoreListener { machine, outcome, _ ->
+            onReady?.invoke(machine)
             if (pid != null && probe != null) {
                 Thread.sleep(300)
                 val pendingTty = machine.lock.withLockValue {
@@ -196,7 +201,7 @@ class StandardOsRestoreTest {
             var inListener: ProcessState? = null
             var drawnInListener: String? = null
             var pendingInListener: Int? = null
-            val (m, host) = restore(h, store, saved, pid) { state, text, pending ->
+            val (m, host) = restore(h, store, saved, pid = pid) { state, text, pending ->
                 inListener = state
                 drawnInListener = text
                 pendingInListener = pending
@@ -256,7 +261,7 @@ class StandardOsRestoreTest {
                 assertEquals("$ echo hi", host.row(0))
             }
             var stateInListener: ProcessState? = null
-            val (m, host) = restore(h, store, saved, pid) { state, _, _ -> stateInListener = state }
+            val (m, host) = restore(h, store, saved, pid = pid) { state, _, _ -> stateInListener = state }
             assertEquals(ProcessState.RUNNABLE, stateInListener, "受け手の中の sh は、restored で起こされている")
             eventuallyDescribe(60_000, { "描き直さない: ${host.screen()}" }) {
                 h.scheduler.tick()
@@ -317,6 +322,46 @@ class StandardOsRestoreTest {
                 Thread.sleep(1)
                 host.row(1) == "hello world"
             }
+            m.close()
+        }
+    }
+
+    /** `lsdev -w`（#108）の試験用のデバイス */
+    private class Gadget : Device {
+        override val kind = "test:gadget"
+        override val methods: DeviceMethods = DeviceMethods.empty()
+    }
+
+    @Test
+    fun `lsdev -wは戻ると一覧を読み直して差を書き、続きの接続も書く`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val a = "00000000-0000-4000-8000-0000000001a1"
+        val b = "00000000-0000-4000-8000-0000000001b2"
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val (saved, pid) = saveRunning(h, store, "lsdev", listOf("-w")) { m, host, _ ->
+                assertTrue(m.devices.attach(a, Gadget()))
+                assertTrue(m.devices.attach(b, Gadget()))
+                eventuallyDescribe(60_000, { "書かない: ${host.text()}" }) {
+                    h.scheduler.tick()
+                    Thread.sleep(1)
+                    host.text().replace("\r\n", "\n") == "+ $a test:gadget\n+ $b test:gadget\n"
+                }
+            }
+            // 戻したマシンには b だけをつなぎ直す（デバイスの一覧は保存しない）。a は外れたと書き、b は重ねて書かない
+            val (m, host) = restore(h, store, saved, onReady = { assertTrue(it.devices.attach(b, Gadget())) })
+            eventuallyDescribe(60_000, { "読み直さない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.text().replace("\r\n", "\n").contains("- $a test:gadget\n")
+            }
+            settle(h, m, host, pid)
+            assertTrue(m.devices.attach(a, Gadget()))
+            eventuallyDescribe(60_000, { "続きを書かない: ${host.text()}" }) {
+                h.scheduler.tick()
+                Thread.sleep(1)
+                host.text().replace("\r\n", "\n").endsWith("+ $a test:gadget\n")
+            }
+            assertEquals(listOf("- $a test:gadget", "+ $a test:gadget"), host.text().replace("\r\n", "\n").lines().filter { it.isNotEmpty() })
             m.close()
         }
     }
@@ -454,7 +499,7 @@ class StandardOsRestoreTest {
         }
         // 名前を並べた検査ではないが、取り違え（import がなくなった・増えた）に気づけるよう、今の集合も確かめる
         // /bin/lua は C の lua.wasm（#94 の peripheral・os が `cabi_realloc` を export する。osReallocPrograms ではない）
-        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua", "/bin/access"), realloc)
+        assertEquals(setOf("/bin/sh", "/bin/nano", "/bin/ps", "/bin/df", "/bin/mount", "/bin/man", "/bin/lua", "/bin/access", "/bin/lsdev", "/bin/devcall"), realloc)
         assertTrue(checked > 2, "イメージのプログラムを見ていない")
     }
 }
