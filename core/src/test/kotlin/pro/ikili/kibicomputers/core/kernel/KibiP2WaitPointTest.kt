@@ -27,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
@@ -40,6 +41,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -229,15 +231,149 @@ class KibiP2WaitPointTest {
         )
     }
 
+    /**
+     * `invoke` の失敗の道を確かめるコマンド。`open` の後、メソッド名が長すぎる（`name-too-long`）・引数が多すぎる（`too-big`）は待たずに `kernel(...)` で返り、
+     * メインスレッドのメソッド `defer` は 1 回目が `failed(..)`（デバイスが失敗を返した）、2 回目が `detached`（呼ぶ前にデバイスが外れた）で返る。
+     * 食い違った段は `exit-with-code` の終了コードにする
+     */
+    private fun deviceErrorCommand(): ByteArray {
+        val nameTooLong = KibiErrors.code(Errno.NAMETOOLONG)
+        val tooBig = KibiErrors.code(Errno.TOOBIG)
+        val wat = """
+            (module
+              (import "kibi:device/bus@0.1.0" "[static]device.open" (func ${s}open (param i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[method]device.invoke" (func ${s}invoke (param i32 i32 i32 i32 i32 i32)))
+              (import "kibi:device/bus@0.1.0" "[resource-drop]device" (func ${s}ddrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "$ADDRESS")
+              (data (i32.const 56) "echo")
+              (data (i32.const 64) "defer")
+              ;; 結果が err(call-error) で、call-error の判別子が disc（kernel(0) なら error-code が code）でなければ、段 stage（+1、+2）で終わる
+              (func ${s}expect (param ${s}disc i32) (param ${s}code i32) (param ${s}stage i32)
+                (if (i32.ne (i32.load8_u (i32.const 160)) (i32.const 1)) (then (call ${s}fail (local.get ${s}stage))))
+                (if (i32.ne (i32.load8_u (i32.const 164)) (local.get ${s}disc)) (then (call ${s}fail (i32.add (local.get ${s}stage) (i32.const 1)))))
+                (if (i32.eqz (local.get ${s}disc))
+                  (then (if (i32.ne (i32.load8_u (i32.const 168)) (local.get ${s}code)) (then (call ${s}fail (i32.add (local.get ${s}stage) (i32.const 2))))))))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}d i32)
+                (call ${s}open (i32.const 16) (i32.const 36) (i32.const 128))
+                (if (i32.load8_u (i32.const 128)) (then (call ${s}fail (i32.const 10))))
+                (local.set ${s}d (i32.load (i32.const 132)))
+                ;; method が 64 バイトを超える（0 のバイトは正しい UTF-8）
+                (call ${s}invoke (local.get ${s}d) (i32.const 1024) (i32.const 65) (i32.const 0) (i32.const 0) (i32.const 160))
+                (call ${s}expect (i32.const 0) (i32.const $nameTooLong) (i32.const 20))
+                ;; 引数が 32 個を超える（0 の判別子は none）
+                (call ${s}invoke (local.get ${s}d) (i32.const 56) (i32.const 4) (i32.const 4096) (i32.const 33) (i32.const 160))
+                (call ${s}expect (i32.const 0) (i32.const $tooBig) (i32.const 30))
+                ;; defer: 1 回目は failed（判別子 4）、2 回目は detached（1）
+                (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+                (call ${s}expect (i32.const 4) (i32.const 0) (i32.const 40))
+                (call ${s}invoke (local.get ${s}d) (i32.const 64) (i32.const 5) (i32.const 0) (i32.const 0) (i32.const 160))
+                (call ${s}expect (i32.const 1) (i32.const 0) (i32.const 50))
+                (call ${s}ddrop (local.get ${s}d))
+                (i32.const 0)))
+        """.trimIndent()
+        return KibiP2WitTool.component(
+            """
+            import kibi:device/bus@0.1.0;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
+    /**
+     * `spawn`・`spawn-with-handles` の失敗の道を確かめるコマンド。順に、(1) 存在しない実行ファイル（`no-entry`。読み込みの前）、
+     * (2) `handles` に閉じた標準入力の stream（`bad-descriptor`。読み込みの前）、(3) WASM として読めない実行ファイル（読み込みを待って巻き直した後に
+     * `not-executable`）、(4) ホストの表を `open` で満杯にして `spawn`（`too-many-open-files`。読み込みの前に断る）。食い違った段は終了コードにする
+     */
+    private val spawnErrorCommand: ByteArray by lazy {
+        val noent = KibiErrors.code(Errno.NOENT)
+        val badf = KibiErrors.code(Errno.BADF)
+        val noexec = KibiErrors.code(Errno.NOEXEC)
+        val mfile = KibiErrors.code(Errno.MFILE)
+        val wat = """
+            (module
+              (import "kibi:device/bus@0.1.0" "[static]device.open" (func ${s}open (param i32 i32 i32)))
+              (import "kibi:process/process-poll@0.1.0" "spawn-with-handles" (func ${s}spawnh (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func ${s}spawn (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "wasi:cli/stdin@0.2.12" "get-stdin" (func ${s}stdin (result i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 16) "/bin/none")
+              (data (i32.const 32) "/bin/ok")
+              (data (i32.const 40) "/bin/bad")
+              (data (i32.const 256) "$ADDRESS")
+              ;; 結果が err(error-code) で、error-code が code でなければ、段 stage（+1）で終わる
+              (func ${s}expect (param ${s}code i32) (param ${s}stage i32)
+                (if (i32.ne (i32.load8_u (i32.const 96)) (i32.const 1)) (then (call ${s}fail (local.get ${s}stage))))
+                (if (i32.ne (i32.load8_u (i32.const 100)) (local.get ${s}code)) (then (call ${s}fail (i32.add (local.get ${s}stage) (i32.const 1))))))
+              (func ${s}spawnPath (param ${s}ptr i32) (param ${s}len i32)
+                (call ${s}spawn
+                  (local.get ${s}ptr) (local.get ${s}len)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 96)))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (local ${s}in i32)
+                (call ${s}spawnPath (i32.const 16) (i32.const 9))
+                (call ${s}expect (i32.const $noent) (i32.const 10))
+                ;; handles = [{ fd: 0, source: input(borrow stdin) }]。標準入力は閉じている
+                (local.set ${s}in (call ${s}stdin))
+                (i32.store (i32.const 48) (i32.const 0))
+                (i32.store8 (i32.const 52) (i32.const 0))
+                (i32.store (i32.const 56) (local.get ${s}in))
+                (call ${s}spawnh
+                  (i32.const 32) (i32.const 7)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 48) (i32.const 1)
+                  (i32.const 96))
+                (call ${s}expect (i32.const $badf) (i32.const 20))
+                ;; 読み込みを待つ（ここで巻き戻る）。読めない実行ファイルなので、巻き直した後に失敗する
+                (call ${s}spawnPath (i32.const 40) (i32.const 8))
+                (call ${s}expect (i32.const $noexec) (i32.const 30))
+                ;; 表を満杯にして spawn（読み込みの前の確かめで断る）
+                (loop ${s}more
+                  (call ${s}open (i32.const 256) (i32.const 36) (i32.const 128))
+                  (br_if ${s}more (i32.eqz (i32.load8_u (i32.const 128)))))
+                (call ${s}spawnPath (i32.const 32) (i32.const 7))
+                (call ${s}expect (i32.const $mfile) (i32.const 40))
+                (i32.const 0)))
+        """.trimIndent()
+        KibiP2WitTool.component(
+            """
+            import kibi:device/bus@0.1.0;
+            import kibi:process/process@0.1.0;
+            import kibi:process/process-poll@0.1.0;
+            import wasi:cli/stdin@0.2.12;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
     /** 読み込みを [gate] が開くまで止めるランタイム（子の読み込みを確実に待たせる） */
     private class GatedRuntime(private val inner: WasmRuntime) : WasmRuntime {
         val gate = CountDownLatch(1)
         val loads = AtomicInteger()
+
+        /** 立てると、門が開いた後の読み込みが `WasmLoadException`（WASM として読めない）で失敗する */
+        @Volatile
+        var failLoad = false
         override val name: String get() = "gated-" + inner.name
 
         override fun load(bytes: ByteArray): WasmModule {
             loads.incrementAndGet()
             gate.await()
+            if (failLoad) throw WasmLoadException("test: WASM として読めない")
             return inner.load(bytes)
         }
     }
@@ -384,7 +520,7 @@ class KibiP2WaitPointTest {
     }
 
     /** 子の読み込みを止めたまま、親が `spawn-with-handles` で待つところまで進める */
-    private fun gated(block: Run.(GatedRuntime) -> Unit) = timeout(limit) {
+    private fun gated(command: ByteArray = spawnCommand, block: Run.(GatedRuntime) -> Unit) = timeout(limit) {
         val runtime = GatedRuntime(EndiveRuntime())
         Harness(execRuntime = runtime).use { h ->
             try {
@@ -393,8 +529,12 @@ class KibiP2WaitPointTest {
                 m.vfs.createDirectory(VfsPath.parse("/bin"))
                 writeFile(m, "/bin/hello", P2Testing.wrap("hello-wasi"))
                 writeFile(m, "/bin/ok", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
-                val r = Run(h, m, spawnCommand)
-                r.tickUntil("読み込みに入らない: ${r.state()} ${r.rt.lastError}") { runtime.loads.get() > 0 }
+                // 読み込みだけが失敗する実行ファイル（読み込みを失敗させるのは GatedRuntime.failLoad）
+                writeFile(m, "/bin/bad", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
+                assertTrue(m.devices.attach(ADDRESS, Dev()))
+                val r = Run(h, m, command)
+                r.tickUntil("読み込みに入らない") { runtime.loads.get() > 0 || r.state().isTerminal }
+                assertTrue(runtime.loads.get() > 0, "読み込みに入る前に終わった: ${r.state()} 終了コード ${m.lock.withLockValue { m.kernel.processes[r.pid]?.exitCode }} ${r.rt.lastError}")
                 r.tickUntil("spawn で待たない: ${r.state()}") { r.state() == ProcessState.WAITING_EVENT && r.suspend.pendingSpawn != null }
                 r.block(runtime)
             } finally {
@@ -444,6 +584,42 @@ class KibiP2WaitPointTest {
         assertNotNull(suspend.pendingSpawn)
         runtime.gate.countDown()
         finish()
+    }
+
+    @Test
+    fun `invokeの失敗は巻き戻す道でもerr(call-error)で返る`() = timeout(limit) {
+        device { h, m, dev ->
+            val detach = AtomicBoolean()
+            // 2 回目の defer は、デバイスを引いた後・メソッドを呼ぶ前に外す
+            h.scheduler.hooks.afterDeviceInvokeResolve = { machine, _ -> if (detach.get()) machine.devices.detach(ADDRESS) }
+            val r = Run(h, m, deviceErrorCommand())
+            // 引数の誤り（name-too-long・too-big）は待たずに返り、defer で初めて待つ
+            r.awaitDefer(dev, 1)
+            r.assertParked()
+            detach.set(true)
+            // デバイスの失敗: 巻き直して着いた後に failed(..) で返る
+            dev.deferred[0].fail("boom")
+            r.finish()
+            assertEquals(1, dev.calls("defer"), "外れたデバイスのメソッドを呼んだ")
+            assertNull(r.suspend.pendingInvoke)
+            assertEquals(0, pendingCallObjects(m))
+            assertEquals(0, r.hostResources(), "表に項目が残った")
+        }
+    }
+
+    @Test
+    fun `spawnの失敗は巻き戻す道でもerror-codeで返り、子を作らない`() = gated(spawnErrorCommand) { runtime ->
+        // (1)(2) は読み込みの前に断るので、ここで待っているのは (3) の読み込み
+        assertParked()
+        val loadsWhileWaiting = runtime.loads.get()
+        assertEquals(emptySet<Int>(), others())
+        runtime.failLoad = true
+        runtime.gate.countDown()
+        // 巻き直した後の失敗（pendingSpawn を消して err）と、置き場の満杯（読み込みの前）の後で、段を最後まで通る
+        finish()
+        assertNull(suspend.pendingSpawn)
+        assertEquals(loadsWhileWaiting, runtime.loads.get(), "満杯で断ったのに読み込みに入った")
+        assertEquals(emptySet<Int>(), others(), "失敗したのに子ができた")
     }
 
     private companion object {
