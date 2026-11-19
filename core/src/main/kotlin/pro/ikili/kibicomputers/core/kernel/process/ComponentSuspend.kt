@@ -18,14 +18,32 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
  * そのため、待ちうる関数は、待つ前に結果の resource を作らず、own の引数を受けない（[pro.ikili.kibicomputers.core.runtime.component.link.HostWait.UNWIND]）。
  * 一部まで進めてから待つもの（パイプへの書き込み）の進み具合は、ホストの resource（`StreamEntry`）に持つ。
  *
- * 状態はプロセスのスレッドだけが読み書きする（step の受け渡しはカーネルロックを通る）
+ * 状態はプロセスのスレッドだけが読み書きする（step の受け渡しはカーネルロックを通る。待機点型は step ごとにワーカーのスレッドが変わるので、
+ * ホストの関数が持つ待ち（[pendingInvoke]・[pendingSpawn]）は念のため `@Volatile` にする）
  */
 internal class ComponentSuspend(private val ctx: ProcessContext) {
     /** 巻き直して着いた呼び出しの情報。[wait] は前に巻き戻したときのもの */
     class Arrival(val wait: AsyncWait?)
 
+    /** 巻き戻して結果を待っている `kibi:device` の `invoke` の `pending-call`（ホストの resource の表の rep [slot] と、その `READABLE` の [key]） */
+    class PendingInvoke(val slot: Int, val key: WaitKey)
+
     private var pendingKeys: List<WaitKey>? = null
     private var arrival: Arrival? = null
+
+    /**
+     * 巻き戻して結果を待っている `invoke`（#800）。実行時だけの状態で、[AsyncWait] には入れない（カーネルの状態・写しに混ぜない）。
+     * `pending-call` はゲストに rep を渡さない、表の隠れた項目（結果を受け取ったら外して閉じる。殺されたら表を閉じるときに取り消される）
+     */
+    @Volatile
+    var pendingInvoke: PendingInvoke? = null
+
+    /**
+     * 巻き戻して読み込みを待っている `kibi:process` の `spawn`・`spawn-with-handles`（#800）。実行時だけの状態（[AsyncWait] には入れない）。
+     * 殺されたら、カーネルの後始末（`finishLocked` が `HostCompletion` を閉じ、始まっていない読み込みを取り消す）に任せる
+     */
+    @Volatile
+    var pendingSpawn: ExecWait? = null
 
     /** `LinkedComponent` の巻き直しが、巻き戻したホストの関数の呼び出しに着いた（`LinkEnv.onRewound`） */
     fun onArrived() {

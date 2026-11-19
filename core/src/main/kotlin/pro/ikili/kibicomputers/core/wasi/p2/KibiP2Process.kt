@@ -5,6 +5,8 @@ import pro.ikili.kibicomputers.core.kernel.fd.STDIN
 import pro.ikili.kibicomputers.core.kernel.fd.STDOUT
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
+import pro.ikili.kibicomputers.core.kernel.process.ComponentSuspend
+import pro.ikili.kibicomputers.core.kernel.process.ExecWait
 import pro.ikili.kibicomputers.core.kernel.process.ExitStatus
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessArgs
@@ -26,7 +28,8 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
  *
  * - `spawn` の引数の上限は p1 の lift と同じ順・同じコード（path → args → env → cwd → fds）。p2 のゲストが番号で知っている fd は 0/1/2 だけなので
  *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `bad-descriptor`。process.wit の `fd-source.parent` のとおり）
- * - 読み込みを待つのは `ctx.execWithHandle`（p1 の BLOCK と同じ待ち方。読み込みの間は CPU と許可を返す）
+ * - `spawn`・`spawn-with-handles` は待ちうる関数（[WasiP2Io.waiting]。#800）。待機点型では p1 の UNWIND と同じく巻き戻して読み込みを待ち、
+ *   ブロッキング型（と作っている途中）は `ctx.execWithHandle` で待つ（読み込みの間は CPU と許可を返す）
  * - `spawn-with-handles`: `options.fds` を当ててから `handles` を当てる。同じ fd を2回（`handles` の中で、または `fds` と `handles` で）
  *   書いたら `invalid`。渡せるのはパイプの端・`Tty`・共有の位置の stream（`get-stdin` など）・`descriptor`（権利は flags の read・write から。どちらもなければ開いたときの権利）・`process`。
  *   自分の位置を持つファイルの stream は `not-supported`、閉じた stream は `bad-descriptor`
@@ -43,7 +46,7 @@ internal object KibiP2Process {
 
     fun functions(t: WasiP2Types): Map<String, Map<String, HostFunctionBody>> {
         val process = mapOf(
-            "[static]process.spawn" to body { ctx, a -> KibiP2.result { spawn(ctx, a[0], a[1], emptyList()) } },
+            "[static]process.spawn" to WasiP2Io.waiting { ctx, w, a -> spawnResult { spawn(ctx, w, a[0], a[1], emptyList()) } },
             "[method]process.pid" to body { ctx, a -> CanonValue.I32(ctx.processHandlePid(KibiP2.handle(ctx, a[0], LABEL))) },
             "[method]process.status" to body { ctx, a ->
                 KibiP2.result {
@@ -85,25 +88,80 @@ internal object KibiP2Process {
         )
         val poll = mapOf(
             "subscribe" to body { ctx, a -> KibiP2.subscribe(ctx, a[0], LABEL) },
-            "spawn-with-handles" to body { ctx, a ->
-                KibiP2.result {
+            "spawn-with-handles" to WasiP2Io.waiting { ctx, w, a ->
+                spawnResult {
                     val handles = (a[2] as CanonValue.Items).items
                     if (handles.size > KibiProcess.MAX_FDS) fsError(Errno.INVAL, "handles は ${KibiProcess.MAX_FDS} 個まで（${handles.size}）")
-                    spawn(ctx, a[0], a[1], handles)
+                    spawn(ctx, w, a[0], a[1], handles)
                 }
             },
         )
         return mapOf(PROCESS to process, PROCESS_POLL to poll)
     }
 
-    /** `spawn`・`spawn-with-handles`。子のハンドルを表に置いて own の値を返す */
+    /** [spawn] の結果を `result<process, error-code>` にする。巻き戻したら（[spawn] が `null`）`null`（戻り値は捨てられる） */
+    private inline fun spawnResult(block: () -> CanonValue.Handle?): CanonValue? {
+        var unwound = false
+        val r = KibiP2.result { block().also { if (it == null) unwound = true } }
+        return if (unwound) null else r
+    }
+
+    /**
+     * `spawn`・`spawn-with-handles`。子のハンドルを表に置いて own の値を返す。
+     *
+     * 巻き戻せるとき（#800。p1 の UNWIND と同じ形）: `ctx.beginExec` の [ExecWait] を [ComponentSuspend.pendingSpawn] に持って巻き戻し、
+     * 巻き直して着いたら、引数を確かめ直さず（`handles` の borrow も解決し直さず）にそれで子を作る（`ctx.finishExecWithHandle`）。子のハンドルは
+     * 待ち終わってから置く（[pro.ikili.kibicomputers.core.runtime.component.link.HostWait.UNWIND] の約束）。読み込みが始めから終わっていれば
+     * 巻き戻さずに子を作る。巻き直して着いたのに手元にない（起きないはず）なら、`beginExec` からやり直す（子はまだ作っていない）。
+     * 待っている間ゲストは止まっているので、`handles` で借りたハンドルは閉じられない（解決した [StdioSource.Object] はそのまま使える）。
+     * 巻き戻せないとき（ブロッキング型・作っている途中）は `ctx.execWithHandle`（読み込みの間は CPU と許可を返す）。
+     * 巻き戻したら `null`
+     */
     @Throws(FsException::class)
-    private fun spawn(ctx: ProcessContext, pathValue: CanonValue, optionsValue: CanonValue, handles: List<CanonValue>): CanonValue {
+    private fun spawn(
+        ctx: ProcessContext,
+        w: WasiP2Io.Waiter,
+        pathValue: CanonValue,
+        optionsValue: CanonValue,
+        handles: List<CanonValue>,
+    ): CanonValue.Handle? {
+        val place = KibiP2.placement(ctx, LABEL)
+        if (!w.resumed && !w.canUnwind()) {
+            val options = spawnOptions(ctx, pathValue, optionsValue, handles)
+            val h = KibiProcess.limits { ctx.execWithHandle(options.first, KernelDrivers.DEFAULT, options.second, place) }
+            return CanonValue.Handle(h.fd)
+        }
+        val s = w.suspend
+        var pending = s.pendingSpawn
+        if (pending != null && !w.resumed) {
+            // 新しい呼び出しなのに前の読み込みが残っている（起きないはず）。閉じてから最初から行う
+            s.pendingSpawn = null
+            ctx.closeHostWait(pending.wait)
+            pending = null
+        }
+        if (pending == null) {
+            val (path, options) = spawnOptions(ctx, pathValue, optionsValue, handles)
+            // 置き場の空きは読み込みの前に確かめる（子を作る前にカーネルがもう一度確かめる）
+            ctx.checkHandleRoom(place)
+            pending = KibiProcess.limits { ctx.beginExec(path, KernelDrivers.DEFAULT, options) }
+            s.pendingSpawn = pending
+        }
+        if (!pending.wait.future.isDone) {
+            w.unwind(listOf(pending.key), null)
+            return null
+        }
+        s.pendingSpawn = null
+        val h = KibiProcess.limits { ctx.finishExecWithHandle(pending, place) }
+        return CanonValue.Handle(h.fd)
+    }
+
+    /** `spawn` の引数を確かめ、`handles` を当てて、実行ファイルのパスと [SpawnOptions] にする */
+    @Throws(FsException::class)
+    private fun spawnOptions(ctx: ProcessContext, pathValue: CanonValue, optionsValue: CanonValue, handles: List<CanonValue>): Pair<String, SpawnOptions> {
         val request = request(pathValue, optionsValue)
         var options = KibiProcess.options(request)
         if (handles.isNotEmpty()) options = withHandles(ctx, options, request.fds.mapTo(HashSet()) { it.fd }, handles)
-        val h = KibiProcess.limits { ctx.execWithHandle(request.path, KernelDrivers.DEFAULT, options, KibiP2.placement(ctx, LABEL)) }
-        return CanonValue.Handle(h.fd)
+        return request.path to options
     }
 
     /** `spawn` の引数を、p1 の lift と同じ順・同じ上限で確かめて [KibiProcess.Request] にする */

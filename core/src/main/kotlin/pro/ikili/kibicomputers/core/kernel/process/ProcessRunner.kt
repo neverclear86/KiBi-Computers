@@ -1088,6 +1088,14 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun checkHandleRoom() = machine.checkHandleRoom(rt.pid)
 
+        override fun finishExecWithHandle(wait: ExecWait, place: HandlePlacement): ProcessHandle {
+            checkThread()
+            lock.withLockValue { takeLocked(wait.wait) }
+            return machine.finishExecWithHandle(wait.pending, place)
+        }
+
+        override fun checkHandleRoom(place: HandlePlacement) = machine.checkHandleRoom(rt.pid, place)
+
         override fun processHandleStatus(fd: Int): ExitStatus? =
             lock.withLockValue { machine.lifecycle.processHandleStatusLocked(rt.process, processObjectLocked(fd)) }
 
@@ -1700,7 +1708,28 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun beginDeviceInvoke(fd: Int, method: String, args: List<DeviceValue>, mayWait: Boolean): DeviceInvokeStart {
             checkThread()
-            val handle = deviceHandleOf(fd)
+            return beginDeviceInvoke(deviceHandleOf(fd), method, args, mayWait, null)
+        }
+
+        override fun beginDeviceInvoke(
+            device: HandleEntry,
+            method: String,
+            args: List<DeviceValue>,
+            mayWait: Boolean,
+            place: HandlePlacement,
+        ): DeviceInvokeStart {
+            checkThread()
+            return beginDeviceInvoke(lock.withLockValue { deviceHandleOfLocked(device) }, method, args, mayWait, place)
+        }
+
+        /** [beginDeviceInvoke] の本体。待つときの `pending-call` は [place]（`null` なら fd 表）に置く */
+        private fun beginDeviceInvoke(
+            handle: DeviceHandle,
+            method: String,
+            args: List<DeviceValue>,
+            mayWait: Boolean,
+            place: HandlePlacement?,
+        ): DeviceInvokeStart {
             // デバイスを引くのはここの1回だけ（ADR 0066）。確かめと実行に同じものを使う
             val device = machine.devices.dispatcher.resolve(handle.address, handle.kind)
             hooks.afterDeviceInvokeResolve?.invoke(machine, rt.pid)
@@ -1723,6 +1752,7 @@ internal class ProcessRunner(private val machine: Machine) {
                     rt.pid,
                     PendingDeviceCall.State.Queued(handle.address, method, args.toList()),
                     countTowardLimit = false,
+                    place = place,
                 )
             }
             payDeviceFuel(machine.dispatchPendingDeviceCall(rt.pid, obj, device))
