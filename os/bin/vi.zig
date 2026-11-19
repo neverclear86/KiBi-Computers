@@ -1148,10 +1148,15 @@ fn readCmdline(prefix: u8) ?[]const u8 {
 /// `/`・`?` で語を読む。空なら前の語。読めたら true
 fn searchPrompt(prefix: u8) bool {
     const input = readCmdline(prefix) orelse return false;
+    // 切り詰めて探さない（文字や `\` の途中で切れて、別の語になるため）。`:s` と同じく断る
+    if (input.len > search_buf.len) {
+        st.setError("Pattern is too long");
+        return false;
+    }
     search_backward = prefix == '?';
     if (input.len > 0) {
-        search_len = @min(input.len, search_buf.len);
-        @memcpy(search_buf[0..search_len], input[0..search_len]);
+        search_len = input.len;
+        @memcpy(search_buf[0..search_len], input);
     }
     return true;
 }

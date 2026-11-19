@@ -561,6 +561,45 @@ class ViEditorTest {
     }
 
     @Test
+    fun `とても長い1行でも、文字ごとに進む探す・置き換え・回数付きの削除が行の長さの2乗にならない`() {
+        // 前は文字を 1 つ進めるたびに行の頭から数えていたので、ここで止まった（settle が時間切れになる）
+        val text = "あ".repeat(100_000) + "\n" + "a".repeat(200_000) + "\n"
+        vi(listOf("long.txt"), files = mapOf("/home/long.txt" to text.toByteArray())) {
+            keys("\$?.\r")
+            assertFalse(status.contains("Pattern not found"), screen)
+            keys("99998X")
+            assertEquals("ああ", row(0))
+            keys("j:2s/z*/-/g\r")
+            assertTrue(status.contains("200001 substitutions on 1 line"), screen)
+            assertTrue(row(1).startsWith("-a-a-a"), screen)
+            keys("0999999x")
+            assertEquals("", row(1))
+            keys(":wq\r")
+            assertEquals(0, finish())
+            assertEquals("ああ\n\n", file("/home/long.txt")!!.decodeToString())
+        }
+    }
+
+    @Test
+    fun `長すぎる探す語は切り詰めずに断り、前の語を変えない`() = vi(
+        listOf("p.txt"),
+        files = mapOf("/home/p.txt" to "abc\n".toByteArray()),
+    ) {
+        keys("/" + "あ".repeat(100) + "\r")
+        assertTrue(status.contains("Pattern is too long"), screen)
+        keys("n")
+        assertTrue(status.contains("No previous regular expression"), screen)
+        keys("/c\r")
+        assertEquals(2 to 0, host.cursor())
+        keys("/" + "x".repeat(300) + "\r")
+        assertTrue(status.contains("Pattern is too long"), screen)
+        keys("0n")
+        assertEquals(2 to 0, host.cursor())
+        keys(":q!\r")
+        assertEquals(0, finish())
+    }
+
+    @Test
     fun `置き換えが作業の領域に入りきらなければ、置き換えずに知らせる`() {
         val original = ("a".repeat(3000) + "\n").toByteArray()
         vi(listOf("l.txt"), files = mapOf("/home/l.txt" to original)) {

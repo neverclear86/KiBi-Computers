@@ -449,6 +449,40 @@ class BasicCommandsTest {
     }
 
     @Test
+    fun `grepはUTF-8の1文字を単位に合わせる`() {
+        // `.`・`[...]`・`[^...]`・`*` は多バイトの文字を丸ごと 1 文字として扱う（kibi.regex。#104）
+        assertOutput(
+            """
+            あ
+            a
+            カ
+            い
+            あ
+            い
+            あ
+            カ
+            い
+            あ
+            ああ
+            ab
+            grep: [あいうえおかきくけ]: regular expression too long
+            2
+            2
+            """,
+            """
+            grep -x '.' /tmp/u
+            grep -x '[あ-ん]' /tmp/u
+            grep -x '[^a]' /tmp/u
+            grep -x 'あ*' /tmp/u
+            grep -x '[^あ]b' /tmp/u
+            grep '[あいうえおかきくけ]' /tmp/u 2>&1; echo ${'$'}?
+            grep -c -x '[あいうえおかきく]' /tmp/u
+            """,
+            mapOf("/tmp/u" to "あ\nab\na\nカ\nい\nああ\n"),
+        )
+    }
+
+    @Test
     fun `duとtouchとclear`() {
         val out = sh(
             """

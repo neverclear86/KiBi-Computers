@@ -198,25 +198,54 @@ pub fn positionAt(start: usize, want: usize) usize {
     }
 }
 
-/// [pos] の前の文字の位置（行の頭なら [pos]）
+/// [q] の文字（UTF-8 の 1 文字。不正なら null）
+fn charAt(q: usize) ?u21 {
+    var b: [4]u8 = undefined;
+    const n = buffer.copy(q, &b);
+    return text.decode(b[0..n]);
+}
+
+/// [q] が文字（グリフ）の頭だと、前を読まずに言えるか。[glyph] の区切り方と同じ決まりで見る:
+/// ASCII、どの文字の続きでもない続きのバイト、不正な先頭、幅のある文字・C1 の制御文字の頭は、前の文字にまとめられない
+fn isGlyphStart(start: usize, q: usize) bool {
+    if (q <= start) return true;
+    const c = buffer.at(q);
+    if (c < 0x80) return true;
+    if (text.isContinuation(c)) {
+        // 3 バイト前までにある先頭が、正しい 1 文字として [q] を含むなら文字の途中
+        var k: usize = 1;
+        while (k <= 3 and k <= q - start) : (k += 1) {
+            const lead = buffer.at(q - k);
+            if (text.isContinuation(lead)) continue;
+            return !(text.sequenceLength(lead) > k and charAt(q - k) != null);
+        }
+        return true;
+    }
+    const cp = charAt(q) orelse return true;
+    return cp < 0xa0 or text.width(cp) != 0;
+}
+
+/// [pos] の前の文字の位置（行の頭なら [pos]）。
+/// 前へ、文字の頭だと言える位置まで戻ってから読む（行の頭から読まない。長い 1 行で回数を付けても O(行の長さ²) にしない）
 pub fn prevGlyph(start: usize, pos: usize) usize {
-    var p = start;
-    var col: usize = 0;
-    var last = start;
+    if (pos <= start) return start;
+    var q = pos - 1;
+    while (q > start and !isGlyphStart(start, q)) q -= 1;
+    var p = q;
+    var last = q;
     while (p < pos) {
-        const g = glyph(p, col);
+        const g = glyph(p, 0);
         if (g.kind == .end) break;
         last = p;
         p += g.len;
-        col += g.width;
     }
     return last;
 }
 
-/// [pos] の文字の次の位置（行の終わりなら [pos]）
+/// [pos] の文字の次の位置（行の終わりなら [pos]）。文字のバイト数は桁によらないので、行の頭から数えない
 pub fn nextGlyph(start: usize, pos: usize) usize {
-    const g = glyph(pos, columnOf(start, pos));
-    return pos + g.len;
+    _ = start;
+    return pos + glyph(pos, 0).len;
 }
 
 // ---- 割り付け ----
