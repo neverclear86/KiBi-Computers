@@ -1,5 +1,5 @@
 // 独自拡張 kibi:device/bus（#77。WIT は core/src/main/wit/kibi-device/、ABI は docs/adr/0077-kibi-device.md）を、
-// WASI p1 のプログラムから呼ぶための手書きの宣言（wit-bindgen で作る束縛は SDK #116、標準 OS の束縛は #108）。
+// WASI p1 のプログラムから呼ぶための手書きの宣言（wit-bindgen で作る束縛は SDK #116、標準 OS の束縛は os/lib/kibi/device.zig。#108）。
 //
 // 構造体の配置は Canonical ABI と同じ。結果の文字列・リストはプログラムが export する cabi_realloc で場所を取るので、
 // drop 以外を import するプログラムは cabi_realloc を export しなければならない（なければ読み込みで NOEXEC）。

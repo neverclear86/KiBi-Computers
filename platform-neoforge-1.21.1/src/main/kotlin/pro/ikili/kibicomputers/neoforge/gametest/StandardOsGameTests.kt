@@ -272,6 +272,31 @@ object StandardOsGameTests {
     }
 
     /**
+     * デバイス操作のコマンド（#108、ADR 0108）: 標準 OS のシェルから `lsdev` でケースのスピーカーと隣の画面・キーボードを列挙し、
+     * `devcall` で画面の `get-size` を呼ぶ
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun shellListsAndCallsAdjacentDevices(helper: GameTestHelper) {
+        val (case, screen, keyboard) = placeComputer(helper)
+        val expected = "dv 3 1 ${screen.text.width} ${screen.text.height}"
+        var typed = false
+        helper.succeedWhen {
+            val text = lines(screen.text)
+            helper.assertTrue(case.wiring.bootFailure == null, "boot should not fail but was ${case.wiring.bootFailure}: $text")
+            if (!typed) {
+                helper.assertTrue(text.any { it == "$" }, "the shell prompt should be shown: $text")
+                typeLine(helper, keyboard, "echo dv \$(lsdev | wc -l) \$(lsdev speaker | grep -c kibicomputers:speaker) \$(devcall screen get-size)")
+                typed = true
+                helper.fail("typed the line")
+            }
+            helper.assertTrue(text.any { it == expected }, "lsdev and devcall should list and call the devices ($expected): $text")
+            case.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }
+    }
+
+    /**
      * Lua の parallel（#95、ADR 0095）: 標準 OS の `/bin/lua` から、2つのコルーチンが sleep とイベントで待ち合わせて終わる
      */
     @JvmStatic

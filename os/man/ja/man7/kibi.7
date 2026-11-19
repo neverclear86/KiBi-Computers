@@ -17,7 +17,7 @@ WASI にない機能は、`kibi:*` という名前の WIT のパッケージで�
 - `kibi:io`: ファイル記述子の複製、パイプ、端末（`tty`: raw モード・大きさ・前景）
 - `kibi:fs`: ディスクのマウントと、マウント・ディスクの一覧（`mounts`）
 - `kibi:computer`: 残りのメモリ（`memory`）、起動からの時間とゲーム内の時間（`clock`）、電源（`power`）
-- `kibi:device`: デバイスの一覧と操作（`bus`）
+- `kibi:device`: デバイスの一覧と操作（`bus`。シェルからは lsdev(1)・devcall(1)）
 
 ## 注意
 
@@ -29,4 +29,4 @@ p2・p3 と Component Model は、カーネルの同じ土台の上の薄い層�
 
 ## 関連項目
 
-intro(7), peripheral(3), os(3), parallel(3)
+intro(7), lsdev(1), devcall(1), peripheral(3), os(3), parallel(3)
