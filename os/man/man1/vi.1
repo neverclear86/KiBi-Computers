@@ -1,0 +1,60 @@
+# vi(1)
+
+## NAME
+
+vi - a small vi-style text editor
+
+## SYNOPSIS
+
+    vi [+LINE | +] [FILE]
+
+## DESCRIPTION
+
+Edits a text file on the terminal, with the commonly used commands of POSIX vi. It starts in normal mode, where keys are commands. Press `i` to type text and `Esc` to go back to normal mode. Type `:wq` and press Enter to save and quit, or `:q!` to quit without saving. Standard input and output must be a terminal.
+
+`+LINE` starts at that line, and `+` alone at the last line.
+
+## MOTIONS
+
+- `h j k l`, arrows: left, down, up, right
+- `w b e`, `W B E`: words
+- `0 ^ $`: start, first non-blank, end of the line
+- `gg G`, `NG`: first, last, N-th line
+- `f t F T` + char, `; ,`: find a character on the line
+- `%`: matching bracket
+- `H M L`: top, middle, bottom of the screen
+- `Ctrl+F Ctrl+B`, `PgDn PgUp`: page down, up
+- `Ctrl+D Ctrl+U Ctrl+E Ctrl+Y`: scroll
+
+## EDITING
+
+- `i a I A o O`: insert text (Esc ends)
+- `x X`: delete a character
+- `d c y` + motion, `dd cc yy`, `D C Y`: delete, change, yank
+- `p P`: put after, before
+- `r` + char, `s S`, `J`, `~`: replace, substitute, join lines, toggle case
+- `u`, `Ctrl+R`: undo, redo
+- `.`: repeat the last change
+- `/ ?` + pattern, `n N`: search forward, backward (basic regular expressions)
+- `ZZ`: save and quit
+
+A count before a command repeats it, for example `3dd`.
+
+## COMMANDS
+
+- `:w [FILE]`, `:w! FILE`: write
+- `:q`, `:q!`: quit
+- `:wq`, `:x`: write and quit
+- `:e!`: reload the file
+- `:N`: go to line N
+- `:[RANGE]s/PATTERN/REPLACEMENT/[g]`: substitute (RANGE is `N`, `N,M`, `.`, `$` or `%`)
+- `:[RANGE]d`: delete lines
+- `:set nu`, `:set nonu`, `:set ic`, `:set noic`: line numbers, ignore case
+
+## NOTES
+
+Ctrl+V and Shift+Insert paste in the client, and a paste in normal mode runs as commands. Press `i` first. There are no macros, visual mode, multiple files, or shell commands.
+
+## SEE ALSO
+
+nano(1), grep(1)

@@ -23,6 +23,7 @@ pub const tree = @import("tree.zig");
 pub const stack = @import("stack.zig");
 pub const text = @import("text.zig");
 pub const keys = @import("keys.zig");
+pub const regex = @import("regex.zig");
 pub const events = @import("events.zig");
 pub const canon = @import("canon.zig");
 pub const mounts = @import("mounts.zig");
