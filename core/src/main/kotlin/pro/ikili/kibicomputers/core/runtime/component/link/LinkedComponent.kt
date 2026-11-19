@@ -81,7 +81,8 @@ internal interface LinkEnv {
  *
  * ホストからの [call] は入れ子にできない（#691）。ホストの関数（[HostFunctionBody]）は必ず [call] かインスタンス化の下で動くので、
  * その中から [call] を呼ぶと [IllegalStateException] になる。ホストの関数の中から呼べると、core の関数が [LinkEnv.callGuest] で
- * 包まれずに動き、ホスト関数の途中で止まる口を使えてしまう（ADR 0073）。仕様の「同じコンポーネントのインスタンスに入れ子で入らない」にも合う
+ * 包まれずに動き、ホスト関数の途中で止まる口を使えてしまう（ADR 0073）。これは安全のための独自の規則で、仕様の再入の検査ではない。
+ * ゲストからゲストへの再入（A→B→A…、donut の相互再帰、dtor の再入）は、固定した仕様（dd1fefc）のとおりトラップにしない（#705。ADR 0265）
  *
  * 一時的な値（#753。ADR 0264「予算」）: lift した引数（[CanonValue] のリスト）は、callee の線形メモリへ lower し終えたら、callee が動いている間は
  * 持たない（[LiftedArgs] で参照を切る）。なので、ゲストからゲストへの呼び出しを深くしても（A→B→C…、再入する A→B→A… でも）、ホストが
@@ -595,8 +596,8 @@ internal class LinkedComponent private constructor(
             return
         }
         // own なら dtor を呼ぶ（同じインスタンスでも呼ぶ。ゲストからゲストへの呼び出しなので callGuest では包まない）
-        // 仕様の canon_resource_drop は dtor を canon_lower → canon_lift で呼び（実装したインスタンスへの再入を検査）、dtor がなければ
-        // trap_if_on_the_stack する。ここでは写していない（通常の呼び出しにも再入の検査がない。#705。ADR 0265）
+        // 仕様の canon_resource_drop は dtor を store.lift → store.lower で呼ぶ（dtor がなければ何もしない関数）。同期の呼び出しでは、
+        // 再入をトラップにする検査はなく（dd1fefc）、core 関数を直接呼ぶのと観測できる差はない（#705。ADR 0265）
         when (val impl = plan.resource(ref.resource).impl) {
             is ResourceImpl.Guest -> impl.dtor?.let { callCore(it, longArrayOf(u32(rep))) }
             is ResourceImpl.Host -> impl.resource.drop?.drop(ComponentCall(this, env, impl.interfaceName, "[resource-drop]${impl.name}"), rep)
