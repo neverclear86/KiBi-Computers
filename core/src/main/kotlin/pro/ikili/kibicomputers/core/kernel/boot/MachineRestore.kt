@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
+import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
@@ -40,8 +41,16 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/** 復元を冷えた起動に切り替える（前段の失敗。カーネルの表は空のまま） */
-internal class RestoreFallbackException(val cause0: ColdBootCause, message: String, cause: Throwable? = null) : Exception(message, cause)
+/**
+ * 復元を冷えた起動に切り替える（前段の失敗。カーネルの表は空のまま）。
+ * [reason] は、写しが冷えた起動を求めていたときの理由（`KILLED` 節の u8。#86 で init を殺した写しを知らせるのに使う）。それ以外は `null`
+ */
+internal class RestoreFallbackException(
+    val cause0: ColdBootCause,
+    message: String,
+    cause: Throwable? = null,
+    val reason: ColdBootReason? = null,
+) : Exception(message, cause)
 
 /** 復元が取り消された（前段の途中） */
 internal class RestoreCancelledException : RuntimeException("復元を取り消した")
@@ -56,6 +65,7 @@ internal class RestoreCancelledException : RuntimeException("復元を取り消�
  * @property droppedDisks 前段で開けずに表から落としたマウントの [識別子, 保存したときの位置]（#56。戻せたら `disk-removed` で知らせる）
  * @property droppedMountIds 表から落としたマウントの ID（後段が表に入れない）
  * @property claims 開き直したディスクの段の予約（#56）。後段が戻せたら `completeRestore` が外し、戻さなかったら呼び手が外す
+ * @property killedPids 写しの中で殺した pid（最上位の世代の `KILLED` 節。差分の基準のものは混ぜない）。戻せたらコンソールに知らせる（#86、ADR 0086）
  */
 internal class PreparedRestore(
     val decoded: DecodedSnapshot,
@@ -64,6 +74,7 @@ internal class PreparedRestore(
     val droppedDisks: List<Pair<String, String>> = emptyList(),
     val droppedMountIds: Set<Int> = emptySet(),
     val claims: List<Machine.DiskClaim> = emptyList(),
+    val killedPids: List<Int> = emptyList(),
 ) {
     /**
      * 作ったものを返す（インスタンスを閉じ、ファイルシステムを閉じ、`/tmp` の RAM を返す）。カーネルロックの外で呼ぶ。
@@ -173,7 +184,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
             // MOD のバージョン違いは更新直後に全台が当たるので、1台ごとは DEBUG（要約は接続層が1回出す。ADR 0088）
             val level = if (e.cause0 == ColdBootCause.MOD_VERSION) System.Logger.Level.DEBUG else System.Logger.Level.WARNING
             LOG.log(level, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
-            machine.restoreFellBack(e.cause0)
+            machine.restoreFellBack(e.cause0, e.reason)
             return
         } catch (t: Throwable) {
             LOG.log(System.Logger.Level.WARNING, "マシン ${request.source.id} を戻す途中で例外。冷えた起動にする: $t")
@@ -235,7 +246,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val snapshot = stored.snapshot
         if (snapshot.requiresColdBoot) {
             val cause = if (snapshot.coldBootReason == null) ColdBootCause.UNREADABLE else ColdBootCause.KILLED_SECTION
-            fallback(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）")
+            throw RestoreFallbackException(cause, "冷えた起動の写し（理由 ${snapshot.coldBootCode}）", reason = snapshot.coldBootReason)
         }
         base = snapshot.deltaBase?.let { ref ->
             checkModVersion(peekModVersion(ref.id, ref.generation), "差分の基準 ${ref.generation}")
@@ -432,7 +443,7 @@ internal class MachineRestore(private val machine: Machine, private val request:
             machine.releaseDiskClaims(mounts.claims)
             throw t
         }
-        return PreparedRestore(decoded, runtimes, fileSystems, mounts.dropped, mounts.droppedIds, mounts.claims)
+        return PreparedRestore(decoded, runtimes, fileSystems, mounts.dropped, mounts.droppedIds, mounts.claims, stored.snapshot.killedPids)
     }
 
     /** [openMounts] が集めるもの（#56） */

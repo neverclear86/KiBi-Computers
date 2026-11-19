@@ -119,7 +119,7 @@ public class SnapshotSection private constructor(
  * @property generation 世代
  * @property modVersion 書いた MOD のバージョン
  * @property sections `KILLED` 以外の節（書く順）
- * @property killedPids 写しの中で殺した pid（#86 が使う）
+ * @property killedPids 写しの中で殺した pid（復元の後にコンソールで知らせる。#86、ADR 0086）
  * @property coldBootCode 冷えた起動が要る理由の値（[ColdBootReason.code]。知らない値もそのまま持つ）
  * @property deltaBase 差分の世代なら、指す基準（UUID は [machineId] と同じ）。全体の世代なら `null`
  */
