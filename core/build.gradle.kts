@@ -247,6 +247,11 @@ kibiWasm {
         sources.from("src/test/wasm/basic_native.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // 計算し続ける CLI（fuel_spin_wasi.c）を、wasi-libc が p2 の import を直接呼ぶ形で。燃料切れの待ち点（#803）を確かめる
+    wasiSdkModule("fuel-spin-p2") {
+        sources.from("src/test/wasm/fuel_spin_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // p3 は #268 まで読み込みで断る（NOEXEC）ことを確かめる
     wasiSdkModule("hello-wasi-p3") {
         sources.from("src/test/wasm/hello_wasi.c")

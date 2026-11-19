@@ -95,7 +95,9 @@ internal class ModuleSource(
  *
  * [fuelYield] は、燃料切れも待ち点にして読み込んだか（#339。[loadMetered] の段1）。[fuelYieldRejection] は、段1を断られて
  * 入力待ちだけの待ち点にした（段2）ときの、段1を断った理由（ログと調べもの用）。段2に落ちたモジュールは、止まりうる関数の中の
- * 燃料切れでもスレッドを持ったまま燃料を待つので、読み込んだときに理由をログに出す（同じモジュールは1回だけ。[FuelYieldRejectionLog]）
+ * 燃料切れでもスレッドを持ったまま燃料を待つので、読み込んだときに理由をログに出す（同じモジュールは1回だけ。[FuelYieldRejectionLog]）。
+ * コンポーネントなら、[fuelYield] は中の core モジュールに燃料切れの待ち点を作ったか、[fuelYieldRejection] は段2に落ちたモジュールの理由
+ * （#803。[ComponentProgram.fuelYield]。保存しないので [moduleSource] には入れない）
  */
 internal class Program private constructor(
     val hash: ModuleHash,
@@ -131,7 +133,15 @@ internal class Program private constructor(
         fun component(component: ComponentProgram): Program {
             val sha = component.sha256
             val source = ModuleSource(sha, component.metered, emptyList(), if (component.metered) Instrumentation.VERSION else 0, false)
-            return Program(ModuleHash.fromBytes(sha), null, source, component = component, cacheWeight = component.cacheWeight)
+            return Program(
+                ModuleHash.fromBytes(sha),
+                null,
+                source,
+                component.fuelYield,
+                component.fuelYieldRejection,
+                component = component,
+                cacheWeight = component.cacheWeight,
+            )
         }
 
         /** [bytes] が Component Model のコンポーネント（layer 1）か（ヘッダーだけを見る。[loadExecutable] の見分けと同じ） */

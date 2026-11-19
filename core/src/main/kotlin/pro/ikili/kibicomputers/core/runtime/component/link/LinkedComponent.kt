@@ -71,6 +71,8 @@ internal interface LinkEnv {
  * モジュールをまたいでも順番が合う）。巻き戻すと、ホストの関数の結果は lower せず（ダミーの 0 を返す）、外からの [call] は結果を
  * lift せず post-return も呼ばずに `null` で戻る（[unwound]）。再開は [beginRewind] の後に同じ関数を [call] で呼び直す。
  * 巻き戻せるのは、外からの [call] の 1 段の下で、ホストの関数を core から直接呼んだときだけ（[canUnwind]）。
+ * 燃料切れの待ち点（`kibi.async_fuel`。#803）も、カーネルの燃料切れの処理が同じ [requestUnwind] で巻き戻し、巻き直しが着いたら
+ * [endFuelRewind] で戻す（ホストの関数の呼び出しに着いたのではないので、[LinkEnv.onRewound] は呼ばない）。
  *
  * Canonical ABI の約束（仕様の `definitions.py`）のうち、同期の呼び出しに要るものを守る:
  * - 呼ぶ側のコンポーネントのインスタンスの `may_leave` が下りている（realloc・post-return の中）ときの lower の呼び出しはトラップ
@@ -311,8 +313,9 @@ internal class LinkedComponent private constructor(
     fun canUnwind(): Boolean = asyncified && !unwinding && !rewinding && liftDepth == 1 && mayLeave.all { it }
 
     /**
-     * 巻き戻しを求める（#757。ホストの関数の中から）。ホストの関数はそのまま戻り（戻り値は捨てる）、core のコードが退避しながら
-     * 外からの [call] まで戻る
+     * 巻き戻しを求める（#757。ホストの関数の中から。#803 からは燃料切れの待ち点 `kibi.async_fuel` の処理からも）。
+     * ホストの関数（燃料切れの処理）はそのまま戻り（戻り値は捨てる。燃料切れの処理なら残りの燃料を返す）、core のコードが退避しながら
+     * 外からの [call] まで戻る。全インスタンスの状態を同時に `UNWINDING` にする
      */
     fun requestUnwind() {
         check(canUnwind()) { "巻き戻せないところで巻き戻しを求めた" }
@@ -327,6 +330,23 @@ internal class LinkedComponent private constructor(
         unwound = false
         rewinding = true
         setAsyncState(WasmAsyncState.REWINDING)
+    }
+
+    /** 巻き直しの途中（[beginRewind] から、止まった呼び出しに着くまで。#803） */
+    val isRewinding: Boolean get() = rewinding
+
+    /**
+     * 燃料待ちからの巻き直しが、止まった燃料切れの呼び出し（`kibi.async_fuel`）に着いた（#803）。全インスタンスの状態を `NORMAL` に戻す。
+     *
+     * ホストの関数の巻き直しが着いたとき（[callLowered]）と違い、[LinkEnv.onRewound] は呼ばない（着いたのはホストの関数ではないので、
+     * 次に呼ばれた待ちうるホストの関数を「巻き直して着いた呼び出し」と取り違えないように）。
+     * 燃料切れで巻き戻せるのは [canUnwind] のとき（外からの [call] の 1 段の下）だけなので、巻き直しの途中に lower した呼び出しはない
+     */
+    fun endFuelRewind() {
+        check(asyncified && rewinding && entered) { "燃料切れの呼び出しに着いたのに、巻き直しの途中でない" }
+        check(liftDepth == 1) { "燃料切れの巻き直しが、ゲストからゲストへの呼び出しの下に着いた" }
+        rewinding = false
+        setAsyncState(WasmAsyncState.NORMAL)
     }
 
     private fun setAsyncState(state: WasmAsyncState) {

@@ -21,7 +21,7 @@
   - 待ちが、ゲストからゲストへの呼び出し（lift した関数を lower した import）の下にある（中の lift を巻き戻すと、結果の lower・post-return の途中を残すため）
   - 止まりうる関数がゲストの resource の dtor になる
   - asyncify が扱えない形（`AsyncifyUnsupported`）
-- 燃料の使い切りでの yield（`kibi.async_fuel`）は、コンポーネントには使わない（`Program.fuelYield` が偽。燃料はプロセスの燃料を共有し、燃料切れの巻き戻しは呼んだインスタンス 1 つの状態しか変えないため）。燃料が尽きてもトラップせず、`ProcessRunner.onFuelExhaustedPlain` → `onFuelExhausted` に落ちて、ワーカーのスレッドを持ったまま `WAITING_FUEL` で次の tick の補充を待つ（`ComponentProgram.load` の KDoc も同じ）。待機点（入力・出力・時計）で待つときだけスレッドを手放す。
+- 燃料の使い切りでの yield（`kibi.async_fuel`）も、p1 と同じ 2 段で使う（#803。下の「燃料切れの待ち点（#803）」）。#757 の時点では使わず、燃料が尽きるとワーカーのスレッドを持ったまま `WAITING_FUEL` で待っていた。
 
 ## 巻き戻しと巻き直し
 
@@ -47,11 +47,24 @@
 
 - 待機点型のコンポーネントは静的に保存できない（`UNSAVEABLE`）ので、チャンクのアンロード・サーバーの停止の写し（`captureCopy(KILL_TRANSIENT)`）は step の終わりを待たない。走っている途中のプロセスの `AsyncStack` をカーネルロックの中から写すことがあるので、`AsyncStack` の読み書きはそのインスタンスのモニターの中で行う（写した中身は途中のものでありうるが、写しの中で殺すので使わない）。
 
+## 燃料切れの待ち点（#803）
+
+- **変換は p1 と同じ 2 段**（ADR 0329 の「燃料切れの待ち点化」）。`ComponentProgram.transform` は、core モジュールごとに、止まりうる関数の中の `kibi.fuel` も待ち点にする変換（段1。`Asyncify.Prepared.transform` の `yieldImport` に `Instrumentation.YIELD_IMPORT`）を試し、`AsyncifyUnsupported` で断られたら、**そのモジュールだけ**燃料切れを待ち点にせずに変換する（段2。#757 と同じ）。段2も断られたら、#757 と同じくどのモジュールにもかけず `BLOCKING` に落とす。段1・段2は同じ `Prepared` から変換する（`Transformer` を呼ぶたびに作り、読んだモジュールは書き換えない）。
+  - 止まりうる関数の判定（`ComponentAsyncify` の不動点と `externalTypes`）は段1でも変えない。`kibi.fuel` を止まりうる import に入れると、ほぼ全関数が止まりうる関数になり、dtor やゲストからゲストの下の待ちとして断られて `BLOCKING` に落ちるものが増えるため。状態は全インスタンスに同時に入るので、`kibi.async_fuel` を持つモジュールと持たないモジュールが混ざってもよい。
+  - 段1で燃料切れの待ち点（`yieldSites`）が 1 つ以上できたら `ComponentProgram.fuelYield` が真で、`Program.component` が `Program.fuelYield` に渡す（前借りはこれが真のときだけ）。段2に落ちたモジュールがあれば、最初の理由を `ComponentProgram.fuelYieldRejection` に残し、`FuelYieldRejectionLog`（コンポーネントの。同じコンポーネントでは 1 回だけ。`WaitPointRejectionLog` とは別に覚える）でログに出す。
+  - `ModuleSource`（`fuelYield` は偽のまま）・`Instrumentation.VERSION`・p1 の変換の出力は変えない（コンポーネントは保存しない）。
+- **巻き戻しは全インスタンスに同時に入れる。** `ProcessRunner.onFuelExhaustedUnwindable` は、コンポーネントのプロセスなら `onComponentFuelExhaustedUnwindable` に分ける（p1 の道は変えない）。プロセスの状態で巻き戻せて（待機点型・作っている途中でない・ホスト関数の中からゲストを呼んでいない）、`LinkedComponent.canUnwind`（トップレベルの lift の 1 段の下で、`may_leave` がすべて立っている）なら、`LinkedComponent.requestUnwind` で全インスタンスを `UNWINDING` にする。ホストの関数の巻き戻しと同じく、外の `call` は結果を lift せず post-return も呼ばずに戻り、`WasiP2Driver` は `takeFuelUnwind` を見て `StepResult.WaitFuel` を返す（ホストの待ちの key は持たない）。その後は p1 と同じく、`RUNNABLE`・スタックなしで、スレッドを持たない燃料待ちの列に入る（`ProcessRunner.waitFuelUnwound`）。その場で足す・譲る・列の置き方（ADR 0047）は p1 と同じ処理を通る。
+- **着いたときは `LinkedComponent.endFuelRewind`。** 燃料待ちからの巻き直し（`rewindingForFuel`）が `kibi.async_fuel` の呼び出しに着いたら、`rewinding` を下ろし全インスタンスを `NORMAL` に戻す。`LinkEnv.onRewound`（= `ComponentSuspend.onArrived`）は呼ばない。呼ぶと、次に呼ばれた待ちうるホストの関数（`blocking-write-and-flush` など）を「巻き直して着いた呼び出し」と取り違え、前の `asyncWait` や書き込みの進み具合を誤るため。巻き戻せるのはトップレベルの lift の 1 段の下だけなので、燃料の巻き直しが lower した呼び出し（`callLowered` の巻き直しの分岐）を通ることはない。
+- **巻き戻せないところ**（ゲストからゲストへの呼び出しの下、realloc・post-return の中、core モジュールの start 関数の中（`LOADING`）、ホスト関数が呼んだゲストの中）では、今までどおり `onFuelExhausted` でスレッドを持って待つ。前借り（`onFuelExhaustedPlain`）も、コンポーネントでは `canUnwind` のときだけする（巻き戻せないところで前借りしても、結局スレッドを持って待つため）。p2 のコマンドでは、起動の途中（アダプターが引数・環境変数を受け取るときにホストの関数が呼ぶ realloc の中）で燃料が切れたときに、ここに当たる。
+- **燃料の勘定。** 巻き戻して `run` から戻るとき、`LinkedComponent.call` は外の lift の燃料（`chargeFuel`）を手持ちから引く。`waitFuelUnwound` は、コンポーネントでは巻き戻すと決めたときの残りでなく今の手持ちを書き戻す（この分を落とさない）。p1 は巻き戻しの間に燃料を引かないので、読み方を変えない。巻き直しのたびに `run` の lift の燃料がもう一度かかるのは、ホストの待ちの巻き直しと同じ（上の「巻き戻しと巻き直し」、ADR 0800）。
+- **選ばなかったもの。** 燃料待ちで持つスレッドを `maxBlockingProcesses` に数える案（Issue の 2 つ目の案）は採らない。燃料が尽きたプロセスはどこかで待つしかなく、上限に当たったときにできるのは「数えずに待つ」（抑えられない）か「殺す・トラップする」（ふるまいが変わる）だけで、スレッドの数を本当には減らせない。exec のときに数える形にすると、プロンプトで待つだけのシェルまで 1 台 8 の枠を使い、子の `spawn` が `NFILE` になる（#757・#800 の後戻り）。優先順位（TPS → 状態保存 → 単純さ）でも、待ち点にする案が勝つ（保存は両案とも関係しない。実装は p1 の #339 の仕組みをほぼそのまま使える）。
+- 速さ: 段1で止まりうる関数の loop の先頭が待ち点になる分、生成コードが増える。`AsyncP2Test`・`KibiP2WaitPointTest`・`NativeToolchainComponentTest` の時間は、段1を試すときと試さないときでほぼ同じだった（Windows・Java 17。それぞれ約 19.2 秒・12.1 秒・6.1 秒）。
+
 ## 制約と残り
 
 - `kibi:device`・`kibi:process` を使うコンポーネントも、#800（ADR 0800）で巻き戻して待つようになった。
 - p1 では、変換できない WASM を `NOEXEC` で断る（#364・#367）。コンポーネントでは `BLOCKING` に落とす（Issue #757 の本文の指定。`exec` の ABI は変えない）。そろえるかどうかは #801 で決める。それまでは `BLOCKING` に落とす。変換できない理由は、ホスト側の制限（`HostWait.BLOCK` の `invoke`・`spawn`。p1 では巻き戻せるので対応する場合がない。#800 で解消し、実物のホストには残っていない）と、ゲスト側の作り（`AsyncifyUnsupported`、ゲストからゲストの下の待ち、dtor。#364 と同じ性質）に分かれる。
-- **燃料待ちのスレッドは `maxBlockingProcesses` に数えられない。** 上のとおり、計算し続ける p2 のコマンドは、燃料が尽きると `WAITING_FUEL` でスレッドを持つ。そのコマンドは `WAIT_POINT` なので、`maxBlockingProcesses`（1 台 8・サーバー全体 2048。ADR 0263 が「少数の台が枠を使い切らない」根拠にしている上限）に数えられず、1 台あたり `maxProcesses`（64）まで持てる。#757 の前は全コンポーネントが `BLOCKING` で数えられていたので、この上限が効かなくなる分が増える。p1 の段2（燃料切れを待ち点にできないモジュール）・前借りの上限（`FUEL_OVERDRAFT_LIMIT`）と同じ性質だが、p1 のように燃料待ちを待ち点にする道はまだない。待ち点にするか、同じ上限に数えるかは #803 で扱う。
+- **燃料待ちでスレッドを持つのは、巻き戻せないところだけ。** #757 の時点では、計算し続ける p2 のコマンドは燃料が尽きると `WAITING_FUEL` でスレッドを持ち、`WAIT_POINT` なので `maxBlockingProcesses`（1 台 8・サーバー全体 2048。ADR 0263）に数えられず、1 台あたり `maxProcesses`（64）まで持てた。#803 で燃料切れを待ち点にした（下の「燃料切れの待ち点（#803）」）ので、止まりうる関数の中の燃料切れはスレッドを持たない。残るのは p1 と同じ性質のもの（葉の関数で前借りの上限 `FUEL_OVERDRAFT_LIMIT` を超えて計算し続けたとき、段2に落ちたモジュールの中、巻き戻せないところ）で、これらは今までどおり `maxBlockingProcesses` に数えずにスレッドを持って待つ。数える上限は足さない（下の「選ばなかったもの」）。
 - 変換できなかったコンポーネントは、理由を `WaitPointRejectionLog`（同じコンポーネントでは 1 回だけ。p1 の `FuelYieldRejectionLog` に当たる）でログに出す。`BLOCKING` に落ちたものは、待つ間スレッドを持ち、`maxBlockingProcesses` に数えられる（1 台 8 の枠で子の `spawn` が `NFILE` になる）ので、運用の側から原因を追えるようにする。理由には、どの core モジュール（計画の番号）の、どの関数（燃料の計測コードが足した import を除いた元の番号。p1 と同じ。#398）かを書く。
 - 保存（#269）は今までどおり扱わない。
 
@@ -61,3 +74,5 @@
 - `AsyncifyTest`: 外の型を `call_ref` と、外の参照が入りうる表への `call_indirect` に当てる範囲。
 - `AsyncP2Test`: プロンプトで待つ p2 のコマンドがスレッドを持たない、p1 の `BLOCKING` と出力が同じ（深い再帰・並べ替えを含む）、燃料、`poll` のタイマーの引き継ぎ、待っている間に殺したときの片付け、パイプがいっぱいのときの書き込み。アダプターを通らない WAT のコマンドで、`write`・`write-zeroes`（巻き直したら許可量をもう一度引かず、残りだけを順に書く）、`blocking-skip`、`pollable.block`、`blocking-splice`（入力待ち・出力の空き待ちで巻き直して最初からやり直す。巻き戻した書き込みに読んだバイト（`pendingSplice`）が残っていれば読まずに書く）。`splice` が読んだ後に書けずに巻き戻す道（`pendingSplice` を作るところ）は、読んだ後の書き込みの前に出力を埋める手段が race 以外にないので、置いた状態から巻き直す道だけを確かめている。core モジュールの start 関数（`LOADING`）の中の待ちは巻き戻さずスレッドを持って待つこと。時計で待っている・書きかけの `splice` を持つ待機点型のコンポーネントの台の写しで、プロセスを殺し、退避した値・やり直しの値・一時的なタイマー・ホストの resource を写しに残さないこと。
 - `HostWaitTest`: 実物のホストの `UNWIND`・`BLOCK` の一覧（#800 の後は `BLOCK` は空）。
+- `ComponentFuelYieldTest`（#803）: カーネルを通さず、モジュールをまたいだ燃料切れの巻き戻し・巻き直し（`endFuelRewind` で戻り、`onRewound` を呼ばない）、段1を断られたモジュールだけ段2で変換して待機点型のまま動くこと、理由のログが 1 回だけで `WaitPointRejectionLog` と別であること、段1を試さない指定。
+- `AsyncFuelP2Test`（#803）: アダプターで包んだ p2 とネイティブの p2（`fuel-spin-p2`）で、止まりうる関数の中の燃料切れはスレッドを持たずに待機点で待つこと、2 本が譲り合うこと、書き込みの待ちと燃料の巻き直しが交互に来ても出力が正しいこと、葉の関数の前借りと、前借りの上限を超えたときにスレッドを持って待つこと（残る性質）、燃料待ちの間の kill（退避した値と RAM を残さない）と写し、多数の台（12 台 × 4 本、許可 4）でスレッドを持つプロセスが許可の数程度に収まること（変える前は 48 本すべてが持った）。
