@@ -429,54 +429,103 @@ class ComponentProcessTest {
             (export "g" (func ${'$'}gl)))))))
     """
 
-    private fun recursing(depth: Int, result: AtomicInteger): Pair<Program, TestDriver> {
+    /** 相互再帰を [depth] で呼ぶプロセス。step を動かしたスレッドを [thread] に残す */
+    private fun recursing(
+        depth: Int,
+        result: AtomicInteger,
+        kind: ProcessKind,
+        thread: AtomicReference<Thread>? = null,
+    ): Pair<Program, TestDriver> {
         val program = Program.component(LinkTesting.load(mutualRecursion, ComponentHost.NONE, metered = true))
-        val driver = TestDriver(ProcessKind.BLOCKING) { ctx ->
+        val driver = TestDriver(kind) { ctx ->
+            thread?.set(Thread.currentThread())
             result.set((ctx.component!!.call("run", args = listOf(CanonValue.I32(depth))) as CanonValue.I32).value)
             StepResult.Exit(0)
         }
         return program to driver
     }
 
+    /**
+     * 浅い再帰が最後まで進み、深い再帰がそのプロセスだけスタック切れで CRASHED になり、ほかのプロセスが動き続けることを確かめる。
+     * 深い再帰の step を動かしたスレッドを返す
+     */
+    private fun Harness.deepRecursionCrashesOnlyItself(m: Machine, kind: ProcessKind): Thread {
+        val progress = AtomicInteger()
+        m.spawnTest(program(spinForever(progress)), runDriver())
+        tickUntilTrue("spin が動かない") { progress.get() > 0 }
+
+        val shallow = AtomicInteger(-1)
+        val (shallowProgram, shallowDriver) = recursing(50, shallow, kind)
+        val ok = m.spawnRt(shallowProgram, shallowDriver)
+        tickUntilTrue("浅い再帰が終わらない") { ok.process.state.isTerminal || m.state == MachineState.CRASHED }
+        assertEquals(ProcessState.EXITED, ok.process.state, "${ok.lastError}")
+        assertEquals(150, shallow.get())
+
+        val deep = AtomicInteger(-1)
+        val deepThread = AtomicReference<Thread>()
+        val (deepProgram, deepDriver) = recursing(Int.MAX_VALUE, deep, kind, deepThread)
+        val bad = m.spawnRt(deepProgram, deepDriver)
+        assertEquals(kind, bad.process.kind)
+        tickUntilTrue("深い再帰が終わらない") { bad.process.state.isTerminal || m.state == MachineState.CRASHED }
+        assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${bad.lastError}")
+        assertEquals(ProcessState.CRASHED, bad.process.state, "${bad.lastError}")
+        // スタックが尽きた場所が Endive の中なら STACK_OVERFLOW のトラップ、リンカーの中なら StackOverflowError のまま上がる。どちらでもよい
+        val e = bad.lastError
+        assertTrue(e is StackOverflowError || (e is WasmTrapException && e.kind == WasmTrapKind.STACK_OVERFLOW), "$e")
+        assertEquals("call stack exhausted", crashReason(e!!), "コンソールに出す理由は、どちらでも同じ")
+        assertEquals(-1, deep.get())
+
+        // ほかのプロセスは動き続ける
+        val before = progress.get()
+        tickUntilTrue("ほかのプロセスが止まった") { progress.get() > before + 2 }
+        assertEquals(MachineState.RUNNING, m.state)
+        return deepThread.get()!!
+    }
+
     @Test
-    fun `浅い相互再帰は最後まで進み、深すぎる相互再帰はそのプロセスだけがスタック切れでCRASHEDになり、ほかのプロセスとワーカーは動き続ける`() = timeout(limit) {
+    fun `BLOCKINGのコンポーネントで深すぎる相互再帰は、そのプロセスだけがスタック切れでCRASHEDになり、ほかのプロセスは動き続ける`() = timeout(limit) {
         Harness().use { h ->
             // 燃料は十分に配る（スタックが先に尽きる）。共有の燃料と KernelLinkEnv の計測の下で動かす
             val m = h.machine(fuelPerTick = 50_000_000)
-            val progress = AtomicInteger()
-            m.spawnTest(h.program(spinForever(progress)), runDriver())
-            h.tickUntilTrue("spin が動かない") { progress.get() > 0 }
-
-            val shallow = AtomicInteger(-1)
-            val (shallowProgram, shallowDriver) = recursing(50, shallow)
-            val ok = m.spawnRt(shallowProgram, shallowDriver)
-            h.tickUntilTrue("浅い再帰が終わらない") { ok.process.state.isTerminal || m.state == MachineState.CRASHED }
-            assertEquals(ProcessState.EXITED, ok.process.state, "${ok.lastError}")
-            assertEquals(150, shallow.get())
-
-            val deep = AtomicInteger(-1)
-            val (deepProgram, deepDriver) = recursing(Int.MAX_VALUE, deep)
-            val bad = m.spawnRt(deepProgram, deepDriver)
-            h.tickUntilTrue("深い再帰が終わらない") { bad.process.state.isTerminal || m.state == MachineState.CRASHED }
-            assertNotEquals(MachineState.CRASHED, m.state, "マシンが壊れた: ${bad.lastError}")
-            assertEquals(ProcessState.CRASHED, bad.process.state, "${bad.lastError}")
-            // スタックが尽きた場所が Endive の中なら STACK_OVERFLOW のトラップ、リンカーの中なら StackOverflowError のまま上がる。どちらでもよい
-            val e = bad.lastError
-            assertTrue(e is StackOverflowError || (e is WasmTrapException && e.kind == WasmTrapKind.STACK_OVERFLOW), "$e")
-            assertEquals("call stack exhausted", crashReason(e!!), "コンソールに出す理由は、どちらでも同じ")
-            assertEquals(-1, deep.get())
-
-            // ほかのプロセスは動き続ける
-            val before = progress.get()
-            h.tickUntilTrue("ほかのプロセスが止まった") { progress.get() > before + 2 }
-            assertEquals(MachineState.RUNNING, m.state)
-            // ワーカーのスレッドも壊れていない（同じ種類の次のプロセスが、続けて最後まで動く）
+            h.deepRecursionCrashesOnlyItself(m, ProcessKind.BLOCKING)
+            // BLOCKING は spawn のたびに専用のスレッドを作る。同じ種類の次のプロセスも、続けて最後まで動く
             val again = AtomicInteger(-1)
-            val (againProgram, againDriver) = recursing(50, again)
+            val (againProgram, againDriver) = recursing(50, again, ProcessKind.BLOCKING)
             val next = m.spawnRt(againProgram, againDriver)
             h.tickUntilTrue("次のプロセスが終わらない") { next.process.state.isTerminal || m.state == MachineState.CRASHED }
             assertEquals(ProcessState.EXITED, next.process.state, "${next.lastError}")
             assertEquals(150, again.get())
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `WAIT_POINTのコンポーネントがプールのワーカーでスタックを使い切っても、そのワーカーは生きていて次のstepを最後まで動かす`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 50_000_000)
+            val worker = h.deepRecursionCrashesOnlyItself(m, ProcessKind.WAIT_POINT)
+            // 動かしたのは、待機点への変換をかけたプログラム（ADR 0757）
+            assertTrue(recursing(50, AtomicInteger(), ProcessKind.WAIT_POINT).first.component!!.waitPoints)
+            // 深い再帰の step は WorkerPool のワーカー（専用のスレッドでない）で動いた
+            assertTrue(worker.name.startsWith("KiBi-worker-"), worker.name)
+            assertTrue(worker.isAlive, "スタック切れでワーカーのスレッドが死んだ")
+            // 同じワーカーに次の step が回るまで、同じ種類のプロセスを続けて動かす。どれも最後まで進む
+            var reused = false
+            for (i in 0 until 50) {
+                val again = AtomicInteger(-1)
+                val ran = AtomicReference<Thread>()
+                val (againProgram, againDriver) = recursing(50, again, ProcessKind.WAIT_POINT, ran)
+                val next = m.spawnRt(againProgram, againDriver)
+                h.tickUntilTrue("次のプロセスが終わらない") { next.process.state.isTerminal || m.state == MachineState.CRASHED }
+                assertEquals(ProcessState.EXITED, next.process.state, "${next.lastError}")
+                assertEquals(150, again.get())
+                if (ran.get() === worker) {
+                    reused = true
+                    break
+                }
+            }
+            assertTrue(reused, "スタックを使い切ったワーカーに、次の step が回らなかった")
+            assertTrue(worker.isAlive)
             m.stop()
         }
     }
