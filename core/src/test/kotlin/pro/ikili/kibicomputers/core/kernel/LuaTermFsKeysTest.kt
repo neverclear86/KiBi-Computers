@@ -17,7 +17,11 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
+import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessDriver
+import pro.ikili.kibicomputers.core.kernel.process.ProcessDriverFactory
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
 import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
@@ -28,6 +32,11 @@ import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.Written
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
+import pro.ikili.kibicomputers.core.kernel.io.ReadResult
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
+import pro.ikili.kibicomputers.core.runtime.WasmHostImport
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.p1.P1
 import java.io.ByteArrayOutputStream
@@ -308,6 +317,8 @@ class LuaTermFsKeysTest {
         others: List<List<String>>,
         files: Map<String, String> = emptyMap(),
         fuelSlice: Long? = null,
+        luaDrivers: ProcessDriverFactory = KernelDrivers.DEFAULT,
+        waitMillis: Long = 150_000,
         beforeRun: (Machine, Int) -> Unit = { _, _ -> },
         driver: (Machine, Int, List<Int>, String) -> Unit,
         after: (Machine, List<Int>) -> Unit = { _, _ -> },
@@ -320,15 +331,15 @@ class LuaTermFsKeysTest {
         m.put("/home/t.lua", script.trimIndent() + "\n")
         for ((path, text) in files) m.put(path, text.trimIndent() + "\n")
         val env = mapOf("PATH" to "/bin", "HOME" to "/home")
-        fun spawn(args: List<String>): Int = m.exec(
+        fun spawn(args: List<String>, drivers: ProcessDriverFactory = KernelDrivers.DEFAULT): Int = m.exec(
             "/bin/${args[0]}",
-            KernelDrivers.DEFAULT,
+            drivers,
             SpawnOptions(stdio = StdioSpec.INHERIT, args = args, env = env, cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN),
         )
         val otherPids = others.map { spawn(it) }
-        val pid = spawn(listOf("lua", "/home/t.lua"))
+        val pid = spawn(listOf("lua", "/home/t.lua"), luaDrivers)
         beforeRun(m, pid)
-        eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
+        eventuallyDescribe(waitMillis, { "終わらない: ${host.text()}" }) {
             h.scheduler.tick()
             driver(m, pid, otherPids, host.text())
             Thread.sleep(1)
@@ -340,6 +351,71 @@ class LuaTermFsKeysTest {
         for (o in otherPids) m.lock.withLockValue { m.killLocked(o, KillSignal.KILL) }
         repeat(5) { h.scheduler.tick() }
         Result(host.bytes(), host.text(), m.stateOf(pid), exitCode)
+    }
+
+    /**
+     * Lua のプロセスの `poll_oneoff` を包んだ [ProcessDriverFactory]（#838）。読み捨ての「読めるかを見る」呼び出し（`kibi_lua_tty.c` の
+     * `ready_now`。fd_read と待たない時計の2つの購読）が fd 0 を「読める」と返した直後に、ほかの読み手が先に読み切った形にするため、
+     * コンソールの TTY の入力を空にする。見てから読むまでの間に入る順を、本番のコードを変えずに、決めて作れる。
+     * [stolen] は、読み切った回数（読めるものがあって取った回数）
+     */
+    private fun stealAfterReadyCheck(m: () -> Machine, stolen: java.util.concurrent.atomic.AtomicInteger): ProcessDriverFactory =
+        object : ProcessDriverFactory {
+            override val waitImports: Set<String> get() = KernelDrivers.DEFAULT.waitImports
+
+            override fun create(program: Program): ProcessDriver {
+                val inner = KernelDrivers.DEFAULT.create(program)
+                return object : ProcessDriver by inner {
+                    override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
+                        inner.configure(ctx, builder)
+                        val index = builder.hostImports.indexOfFirst { it.module == P1.MODULE && it.name == "poll_oneoff" }
+                        check(index >= 0) { "poll_oneoff がない" }
+                        val original = builder.hostImports[index]
+                        builder.hostImports[index] = WasmHostImport(
+                            original.module,
+                            original.name,
+                            original.type,
+                            WasmHostFunction { instance, args ->
+                                val result = original.function.call(instance, args)
+                                if (result[0] == 0L && instance.asyncState == WasmAsyncState.NORMAL && readyCheckSawReadable(instance, args)) {
+                                    val machine = m()
+                                    val took = machine.lock.withLockValue {
+                                        val tty = machine.consoleTtyLocked()
+                                        val buf = ByteArray(4096)
+                                        var total = 0
+                                        while (true) {
+                                            val r = tty.read(buf, 0, buf.size, machine.wakeSink)
+                                            if (r !is ReadResult.Bytes || r.count == 0) break
+                                            total += r.count
+                                        }
+                                        total
+                                    }
+                                    if (took > 0) stolen.incrementAndGet()
+                                }
+                                result
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+    /** `poll_oneoff(in, out, nsubscriptions, nevents)` が、fd 0 の fd_read と時計（待たない）の2つの購読で、fd 0 を「読める」と返したか */
+    private fun readyCheckSawReadable(instance: pro.ikili.kibicomputers.core.runtime.WasmInstance, args: LongArray): Boolean {
+        val mem = instance.memory ?: return false
+        val subs = args[0].toInt()
+        val events = args[1].toInt()
+        if (args[2].toInt() != 2) return false
+        // 購読は 48 バイト。userdata u64 @0、種類 u8 @8（0 が時計、1 が fd_read）、fd_read は fd u32 @16、時計は時計の ID u32 @16・待ち時間 u64 @24
+        if (mem.readU8(subs + 8) != 1 || mem.readI32(subs + 16) != 0) return false
+        if (mem.readU8(subs + 48 + 8) != 0 || mem.readI64(subs + 48 + 24) != 0L) return false
+        val count = mem.readI32(args[3].toInt())
+        // 事象は 32 バイト。userdata u64 @0、エラー u16 @8
+        for (i in 0 until count) {
+            val at = events + i * 32
+            if (mem.readI64(at) == 1L && (mem.readU8(at + 8) or (mem.readU8(at + 9) shl 8)) == 0) return true
+        }
+        return false
     }
 
     private val timerLine = Regex("t([0-9]+)\\n")
@@ -359,7 +435,7 @@ class LuaTermFsKeysTest {
         // キーと文字を1回送るたびに、次の入力を送らずに、Lua がタイマーで2回起きるのを待つ（止まれば、そこで進まなくなる）。
         // 割り込みは、Lua が見てから読むまでの間（燃料を確かめるところ1つ分）で CPU を譲り、その間にもう1つの読み手が残りを読んだときに起きる。
         // スライスを小さくし、読み手は1バイトずつ読ませ、文字の長さを変えて、行き来を増やす。窓が狭く順は決められないので、
-        // 直す前のコードでも手元では止まらなかった（止まる順を作るには本番のコードにフックが要る）。ここで確かめるのは、
+        // 止まる順は次のテスト（poll_oneoff の包みで決めて作る）に任せる。ここで確かめるのは、
         // ほかの読み手と一緒でも止まらないこと、ほかの読み手の fd 0 が NONBLOCK にならないこと、待つ間の Lua の fd 0 が元に戻っていること
         val r = luaWith(
             """
@@ -423,6 +499,56 @@ class LuaTermFsKeysTest {
         assertFalse(luaNonblockWhileWaiting, "待っている間の Lua の fd 0 が NONBLOCK のまま")
         assertFalse(readerNonblock, "もう1つの読み手の fd 0 が NONBLOCK になった")
         assertEquals(TtyMode.COOKED, mode)
+    }
+
+    @Test
+    fun `読み捨てで読めると見た後にほかの読み手が読み切っても、次の入力を待たない`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        val stolen = java.util.concurrent.atomic.AtomicInteger()
+        lateinit var machine: Machine
+        var attached = false
+        var bursts = 0
+        var waitFor = 0
+        // 見てから別の呼び出しで待つ fd_read だと、取られた後の fd_read が次の入力まで止まる。止まれば Lua は先に進まず、次のキーも送られない。
+        // poll_oneoff が「読める」と返した直後に TTY を空にする（ほかの読み手が間に読み切った順）。直す前のコードはここで止まる
+        val r = luaWith(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            local n = 0
+            os.startTimer(0.05)
+            while n < 20 do
+              local e = os.pullEvent()
+              if e == 'timer' then
+                n = n + 1
+                print('t' .. n)
+                os.startTimer(0.02)
+              end
+            end
+            print('done')
+            """,
+            others = emptyList(),
+            luaDrivers = stealAfterReadyCheck({ machine }, stolen),
+            waitMillis = 30_000,
+            beforeRun = { m, _ -> machine = m },
+            driver = { m, _, _, text ->
+                if (!attached && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000838", keyboard))
+                    attached = true
+                }
+                val timers = timerLine.findAll(text).lastOrNull()?.groupValues?.get(1)?.toInt() ?: 0
+                if (attached && bursts < 8 && timers >= waitFor) {
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    keyboard.input(KeyboardEvent.Text("b".repeat(1 + bursts)))
+                    bursts++
+                    waitFor = timers + 2
+                }
+            },
+        ).assertOk()
+        assertTrue(r.text.contains("done\n"), r.text)
+        assertEquals(8, bursts, r.text)
+        assertTrue(stolen.get() > 0, "読み切る順を作れなかった（poll_oneoff の包みが効いていない）")
     }
 
     @Test
