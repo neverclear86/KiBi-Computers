@@ -129,6 +129,12 @@ neoForge {
             }
             // -PloadTestQuietProgress=true で、GameTest のサーバーの進み具合のログ（20 tick ごと）を試験の間だけ止める（#600 の比べる回）
             systemProperty("kibicomputers.loadTest.quietProgress", providers.gradleProperty("loadTestQuietProgress").getOrElse("false"))
+            // -PloadTestProductionAutosave=true で、自動保存の段階を本番の形（周期を止めず、バニラの自動保存と同じ tick に始める）で測る（#834）。
+            // -PloadTestVanillaSaveOffset=<tick> でバニラの自動保存を一巡の始めから何 tick 後にするか、
+            // -PloadTestSyntheticLogTicks=<tick> でメインスレッドに合成のログを何 tick ごとに書かせるか（0 は書かない）を決める
+            systemProperty("kibicomputers.loadTest.productionAutosave", providers.gradleProperty("loadTestProductionAutosave").getOrElse("false"))
+            systemProperty("kibicomputers.loadTest.vanillaSaveOffset", providers.gradleProperty("loadTestVanillaSaveOffset").getOrElse("0"))
+            systemProperty("kibicomputers.loadTest.syntheticLogTicks", providers.gradleProperty("loadTestSyntheticLogTicks").getOrElse("0"))
             // -PloadTestJvmLog=<ファイル> で、GC と safepoint の JVM のログ（時刻と uptime つき）を取る（長い tick の突き合わせ。#600）。
             // -Xlog のファイル名にドライブの「:」を書くと区切りと混ざる（引用符は起動の引数ファイルで崩れる）ので、run/ からの相対パスで渡す
             providers.gradleProperty("loadTestJvmLog").orNull?.let {

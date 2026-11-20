@@ -164,6 +164,13 @@ internal enum class LoadPhase(val label: String) {
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
  * @property quietProgress 試験の間、GameTest のサーバーの進み具合のログを止めるか（#600）
  * @property devicesEvery この台数に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。#153）を置く（`-PloadTestDevices`。0 なら置かない）
+ * @property productionAutosave 自動保存の段階を本番の形で測るか（`-PloadTestProductionAutosave`。#834）。周期を止めずに、数え口を合わせて
+ *   本物の経路（`ServerMachines.autosaveTick` の `% autosavePeriodTicks`）で一巡を始め、バニラの自動保存（`MinecraftServer.tickServer` の
+ *   `saveEverything`）を同じ tick（[vanillaSaveOffset] が 0 のとき）に走らせる。一巡の終わりはメインスレッドを止めずに毎 tick 見る。
+ *   この段階で試験を終える（計算・出力・アンロードは測らない）
+ * @property vanillaSaveOffset [productionAutosave] のとき、バニラの自動保存を一巡の始めの tick から何 tick 後にするか（`-PloadTestVanillaSaveOffset`）。
+ *   0 が本番の既定（周期 6000 tick・tick rate 20 のまま）の重なり方。正の値は、周期を変えた・tick rate を変えたときなどに一巡の途中に入る形
+ * @property syntheticLogTicks [productionAutosave] の段階の間、メインスレッドに合成のログを何 tick ごとに書かせるか（`-PloadTestSyntheticLogTicks`。0 なら書かない）
  */
 internal data class LoadSettings(
     val os: LoadOs,
@@ -177,6 +184,9 @@ internal data class LoadSettings(
     val massUnload: Boolean = false,
     val devicesEvery: Int = System.getProperty(DEVICES_PROPERTY)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
     val quietProgress: Boolean = System.getProperty(QUIET_PROGRESS_PROPERTY).toBoolean(),
+    val productionAutosave: Boolean = false,
+    val vanillaSaveOffset: Int = 0,
+    val syntheticLogTicks: Int = 0,
 ) {
     companion object {
         /**
@@ -187,6 +197,18 @@ internal data class LoadSettings(
 
         /** 他 MOD 役のデバイスを置く割合を渡すシステムプロパティ（`-PloadTestDevices`） */
         const val DEVICES_PROPERTY: String = "kibicomputers.loadTest.devices"
+
+        /** 自動保存の段階を本番の形で測るシステムプロパティ（`-PloadTestProductionAutosave=true`。#834） */
+        const val PRODUCTION_AUTOSAVE_PROPERTY: String = "kibicomputers.loadTest.productionAutosave"
+
+        /** バニラの自動保存を一巡の始めから何 tick 後にするかのシステムプロパティ（`-PloadTestVanillaSaveOffset`） */
+        const val VANILLA_SAVE_OFFSET_PROPERTY: String = "kibicomputers.loadTest.vanillaSaveOffset"
+
+        /** 合成のログの間隔（tick）のシステムプロパティ（`-PloadTestSyntheticLogTicks`） */
+        const val SYNTHETIC_LOG_TICKS_PROPERTY: String = "kibicomputers.loadTest.syntheticLogTicks"
+
+        /** 0 以上の整数のシステムプロパティ（なければ・読めなければ 0） */
+        fun intProperty(name: String): Int = System.getProperty(name)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
     }
 }
 
@@ -351,6 +373,8 @@ internal data class AvgMax(val avg: Double, val max: Double) {
  * @property fullBytesTotal 全体の世代のファイルの大きさの合計
  * @property deltaSaves 差分の世代を書いた回数（#83）
  * @property deltaBytesTotal 差分の世代のファイルの大きさの合計
+ * @property submitted 段階に予約した書き込みの数（[ServerMachines.Stats.windowSubmits]。#602）。
+ *   段階に予約した書き込みを全部待ってから数えるので、[saves] と書けなかった数（[WriterStats.failures]）の和と同じになる
  */
 internal data class SaveCost(
     val saves: Int,
@@ -373,6 +397,7 @@ internal data class SaveCost(
     val deltaSaves: Int = 0,
     val deltaBytesTotal: Long = 0,
     val writer: WriterStats = WriterStats(),
+    val submitted: Long = 0,
 )
 
 /**
@@ -438,6 +463,37 @@ internal data class UnloadResult(
     val cost: SaveCost,
 )
 
+/**
+ * 本番の形の自動保存の段階（#834）の結果。
+ *
+ * @property periodTicks 一巡を始めた周期（`autosavePeriodTicks`）
+ * @property vanillaSaveOffset バニラの自動保存を、一巡の始めの tick から何 tick 後にしたか
+ * @property serverTickAtStart 段階の始めのサーバーの tick（`getTickCount`。6000 以上なら、その前にバニラの自動保存が走っている）
+ * @property cycleStartTick 周期の数え口が一巡を始めた `ServerTickEvent.Pre` を含む tick の、測った tick の中の番号（0 から。-1 なら見えなかった）。
+ *   [vanillaSaveTick] と同じ数え方で、バニラの保存は `Pre` の tick の終わりに走るので、次の tick の番号になる
+ *   （[vanillaSaveTick] ＝ [cycleStartTick] ＋ 1 ＋ [vanillaSaveOffset] が、狙った重なり方。外れたら段階が落ちる）
+ * @property vanillaSaveTick バニラの自動保存が走った tick の、測った tick の中の番号（0 から。-1 なら走らなかった）
+ * @property vanillaSaveNanos その tick の時間（MSPT と同じ数え方）
+ * @property vanillaSaveSections その tick の区間の内訳（[LongTick.sectionSummary] と同じ書き方）
+ * @property vanillaSavePending バニラの自動保存の中（オーバーワールドの `LevelEvent.Save`）の、KiBi の書き込み待ちの仕事の数
+ * @property syntheticLog 合成のログの数え口（書かなければ `null`）
+ * @property mainThreadLog 測った区間にメインスレッドが書いたログの行（「レベル ロガー名」→ 行数。多い順）
+ * @property tickCount 測った tick の数
+ */
+internal class ProductionAutosaveResult(
+    val periodTicks: Long,
+    val vanillaSaveOffset: Int,
+    val serverTickAtStart: Int,
+    val cycleStartTick: Int,
+    val vanillaSaveTick: Int,
+    val vanillaSaveNanos: Long,
+    val vanillaSaveSections: String,
+    val vanillaSavePending: Int,
+    val syntheticLog: LoadTickProbe.SyntheticLogStats?,
+    val mainThreadLog: List<Pair<String, Int>>,
+    val tickCount: Int,
+)
+
 /** 負荷試験の結果。 */
 internal class LoadReport(
     val settings: LoadSettings,
@@ -456,6 +512,8 @@ internal class LoadReport(
     val autosave: AutosaveResult?,
     /** [LoadPhase.UNLOAD] の結果（測らなければ `null`） */
     val unload: UnloadResult? = null,
+    /** 本番の形の自動保存の結果（#834。測らなければ `null`） */
+    val production: ProductionAutosaveResult? = null,
 ) {
     fun phase(phase: LoadPhase): PhaseResult = phases.first { it.phase == phase }
 
@@ -469,6 +527,39 @@ internal class LoadReport(
         sb.append("- OS: ").append(s.os.label).append('\n')
         sb.append(String.format(Locale.ROOT, "- 台数: %d（計算・出力はそれぞれ %d 台）、tick を 50 ms にそろえる: %s\n", s.count, s.busy, s.paced))
         if (s.quietProgress) sb.append("- GameTest のサーバーの進み具合のログ: 止めた（#600 の比べる回）\n")
+        production?.let {
+            sb.append(
+                String.format(
+                    Locale.ROOT,
+                    "- 本番の形の自動保存（#834）: 周期 %d tick、バニラの自動保存は一巡の始めから %d tick 後、合成のログ %s、段階の始めのサーバーの tick %d\n",
+                    it.periodTicks, it.vanillaSaveOffset, if (s.syntheticLogTicks > 0) "${s.syntheticLogTicks} tick ごと" else "なし", it.serverTickAtStart,
+                ),
+            )
+            if (it.vanillaSaveTick >= 0) {
+                sb.append(
+                    String.format(
+                        Locale.ROOT, "- バニラの自動保存の tick: 測った %d tick のうち %d 番目（一巡が始まった tick は %d 番目。差 %d、狙いは %d）、%.2f ms = [%s] ms、その保存の中の KiBi の書き込み待ち %d 件\n",
+                        it.tickCount, it.vanillaSaveTick, it.cycleStartTick, it.vanillaSaveTick - it.cycleStartTick, 1 + it.vanillaSaveOffset, it.vanillaSaveNanos / 1e6, it.vanillaSaveSections, it.vanillaSavePending,
+                    ),
+                )
+            } else {
+                sb.append("- バニラの自動保存の tick: 測った区間に走らなかった\n")
+            }
+            it.syntheticLog?.let { l ->
+                sb.append(
+                    String.format(
+                        Locale.ROOT, "- 合成のログ: %d 行、うち %d ms 以上 %d 行、平均 %.3f ms、最大 %.2f ms\n",
+                        l.lines, LoadTickProbe.STALL_MILLIS, l.slowLines, if (l.lines > 0) l.totalNanos / 1e6 / l.lines else 0.0, l.maxNanos / 1e6,
+                    ),
+                )
+            }
+            val total = it.mainThreadLog.sumOf { e -> e.second }
+            sb.append("- 測った区間にメインスレッドが書いたログ: ").append(total).append(" 行")
+            if (it.mainThreadLog.isNotEmpty()) {
+                sb.append("（").append(it.mainThreadLog.take(10).joinToString("、") { (k, v) -> "$k $v" }).append("）")
+            }
+            sb.append('\n')
+        }
         if (s.devicesEvery > 0) {
             sb.append(String.format(Locale.ROOT, "- 他 MOD 役のデバイス（樽）: %d 台に1台（%d 個）\n", s.devicesEvery, (s.count + s.devicesEvery - 1) / s.devicesEvery))
         }
@@ -486,9 +577,9 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- 自動保存の一巡: %d tick、書き込みに回した台 %d、飛ばした台 %d、1 tick で回した最大 %d 回、回すのにかかった時間の合計 %.0f ms（取り出しと予約）、" +
-                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
-                    it.cycleTicks, it.written, it.skipped, it.maxTickWrites, it.writeMillis,
+                    "- 自動保存の一巡: %d tick、書き込みに回した台 %d、飛ばした台 %d、予約した書き込み %d、1 tick で回した最大 %d 回、" +
+                        "回すのにかかった時間の合計 %.0f ms（取り出しと予約）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    it.cycleTicks, it.written, it.skipped, it.cost.submitted, it.maxTickWrites, it.writeMillis,
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
@@ -497,9 +588,9 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- まとめてアンロード: %d tick、取り出して書き込みに回した台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、アンロードされなかった %d / %d チャンク（ケースのあるもの）、" +
-                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
-                    it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
+                    "- まとめてアンロード: %d tick、取り出して書き込みに回した台 %d（書き込み %d 回、予約した書き込み %d）、1 tick の最大 %d 台・%d 回、" +
+                        "アンロードされなかった %d / %d チャンク（ケースのあるもの）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    it.ticks, it.captures, it.writes, it.cost.submitted, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
@@ -633,6 +724,9 @@ internal class LoadRun(
     private var measureFrom: Int? = 0
     private var outputWaitTicks = 0
     private var phaseStartNanos = 0L
+
+    /** 保存の数え口を段階の始めに reset した後の区間の番号（[verifyCounted] が、途中で reset されていないかを見る。#602） */
+    private var phaseWindow = -1L
     private var recording = false
     private var samples = LongArray(1024)
 
@@ -712,6 +806,28 @@ internal class LoadRun(
     private val longTicks = ArrayList<LongTick>()
     private var longTickCount = 0
 
+    /** 本番の形の自動保存（#834）: バニラの `ticksUntilAutosave`（反射で読み書きする。試験のコードの中だけ） */
+    private val vanillaAutosave = if (settings.productionAutosave) VanillaAutosave(level.server) else null
+    private var prevVanillaTicks = -1
+    private var vanillaSaveTick = -1
+
+    /** 本番の形の自動保存（#834）: 周期の数え口が一巡を始めた tick の番号（[vanillaSaveTick] と同じ数え方。-1 は見ていない）と、前の呼び出しでの始めた回数 */
+    private var cycleStartTick = -1
+    private var prevCycleStarts = 0L
+
+    /** 本番の形の自動保存（#834）: 仕掛けたときの、周期の数え口が一巡を始めた回数。これより増えたら、一巡が始まった */
+    private var cycleStartsAtArm = 0L
+    private var vanillaSaveNanos = 0L
+    private var vanillaSaveSections = ""
+    private var vanillaSavePending = 0
+    private var serverTickAtStart = 0
+    private var productionPeriod = 0L
+
+    /** 本番の形の自動保存（#834）で、一巡が始まった後に周期を止めた */
+    private var productionPeriodStopped = false
+    private var productionResult: ProductionAutosaveResult? = null
+    private val logCounter = if (settings.productionAutosave) MainThreadLogCounter(level.server.runningThread.name) else null
+
     /** [LoadSettings.quietProgress] のときに止めた、進み具合のロガーの元のレベル */
     private var savedProgressLevel: Log4jLevel? = null
 
@@ -742,6 +858,7 @@ internal class LoadRun(
             Configurator.setLevel(PROGRESS_LOGGER, Log4jLevel.WARN)
         }
         probe.start()
+        logCounter?.start()
         helper.onEachTick(::onTick)
     }
 
@@ -756,6 +873,7 @@ internal class LoadRun(
             work = (now - prevCallback - prevHarness - prevSleep).coerceAtLeast(0)
             // 自動保存（ServerTickEvent.Pre）・アンロード（チャンクのアンロード、ServerTickEvent.Post）の保存は、前の呼び出しからの間に入っている
             val s = ServerMachines.Stats
+            vanillaAutosave?.let { observeVanillaSave(it, work) }
             if (recording) {
                 record(work, s.captureNanos - prevCapture)
                 for (i in tickMarks.indices) sectionMarks[i] += tickMarks[i]
@@ -791,6 +909,26 @@ internal class LoadRun(
             // 区間の合計との差になる。GC の数え口を読む間にメインスレッドが止まると、数 ms ずれる）
             prevSleep = tickStart - end
         }
+    }
+
+    /**
+     * バニラの自動保存が、前の呼び出しからの間（試験の後の区間。`tickServer` の `saveEverything`）に走ったかを見る（#834）。
+     * 走ると `ticksUntilAutosave` が次の間隔に戻る（増える）。走った tick の時間（[work]）と区間の内訳を覚える
+     */
+    private fun observeVanillaSave(vanilla: VanillaAutosave, work: Long) {
+        val ticks = vanilla.ticksUntilAutosave
+        // 一巡を始めるのは tick の始め（Pre）なので、始まったなら、この呼び出しの tick の中（直前の区間）
+        val starts = ServerMachines.Stats.autosaveCycleStarts
+        if (phase == LoadPhase.AUTOSAVE && recording && cycleStartTick < 0 && starts > prevCycleStarts) cycleStartTick = sampleCount
+        prevCycleStarts = starts
+        if (phase == LoadPhase.AUTOSAVE && recording && prevVanillaTicks >= 0 && ticks > prevVanillaTicks && vanillaSaveTick < 0) {
+            vanillaSaveTick = sampleCount
+            vanillaSaveNanos = work
+            vanillaSaveSections = LoadTickProbe.Section.entries.filter { sectionNanos[it.ordinal] >= 1_000_000 }
+                .joinToString(" ") { String.format(Locale.ROOT, "%s %.1f", it.label, sectionNanos[it.ordinal] / 1e6) }
+            vanillaSavePending = probe.pendingAtLevelSave
+        }
+        prevVanillaTicks = ticks
     }
 
     private fun gcCount(): Long = gcBeans.sumOf { it.collectionCount.coerceAtLeast(0) }
@@ -863,7 +1001,12 @@ internal class LoadRun(
             while (i < samples.size) {
                 val first = samples[i]
                 var j = i + 1
-                while (j < samples.size && samples[j].serverStack == first.serverStack && samples[j].writerStack == first.writerStack) j++
+                while (
+                    j < samples.size && samples[j].serverStack == first.serverStack && samples[j].writerStack == first.writerStack &&
+                    samples[j].ioWorkers == first.ioWorkers
+                ) {
+                    j++
+                }
                 val last = samples[j - 1]
                 sb.append(
                     String.format(
@@ -875,6 +1018,10 @@ internal class LoadRun(
                 if (first.writerStack.isNotEmpty()) {
                     sb.append("      -- writer\n")
                     for (f in first.writerStack) sb.append("      at ").append(f).append('\n')
+                }
+                for ((name, stack) in first.ioWorkers) {
+                    sb.append("      -- ").append(name).append('\n')
+                    for (f in stack) sb.append("      at ").append(f).append('\n')
                 }
                 i = j
             }
@@ -928,6 +1075,7 @@ internal class LoadRun(
             deltaSaves = saves.count { it.delta },
             deltaBytesTotal = saves.filter { it.delta }.sumOf { it.fileBytes.toLong() },
             writer = WriterStats.current(),
+            submitted = ServerMachines.Stats.windowSubmits,
         )
     }
 
@@ -941,7 +1089,7 @@ internal class LoadRun(
             if (phaseTick == 0) setUp(p)
             when (p) {
                 LoadPhase.BOOT -> boot()
-                LoadPhase.AUTOSAVE -> autosave()
+                LoadPhase.AUTOSAVE -> if (settings.productionAutosave) productionAutosave() else autosave()
                 LoadPhase.UNLOAD -> unload()
                 else -> steady(p)
             }
@@ -956,12 +1104,15 @@ internal class LoadRun(
         add(LoadPhase.BOOT)
         add(LoadPhase.IDLE)
         add(LoadPhase.AUTOSAVE)
-        if (settings.busy > 0) add(LoadPhase.COMPUTE)
-        if (settings.busy > 0 && settings.count > settings.busy) {
-            add(LoadPhase.OUTPUT)
-            add(LoadPhase.WATCHED)
+        // 本番の形の自動保存（#834）は、その段階で終える（ほかの段階に、次の周期やバニラの自動保存が混ざらないように）
+        if (!settings.productionAutosave) {
+            if (settings.busy > 0) add(LoadPhase.COMPUTE)
+            if (settings.busy > 0 && settings.count > settings.busy) {
+                add(LoadPhase.OUTPUT)
+                add(LoadPhase.WATCHED)
+            }
+            if (settings.massUnload) add(LoadPhase.UNLOAD)
         }
-        if (settings.massUnload) add(LoadPhase.UNLOAD)
     }
 
     private fun next(p: LoadPhase) {
@@ -1006,6 +1157,79 @@ internal class LoadRun(
             tick = tick,
             cost = saveCost(),
         )
+        next(LoadPhase.AUTOSAVE)
+    }
+
+    /**
+     * 本番の形の自動保存（#834）: 一巡が終わり、段階に予約した書き込みが全部終わって受け取るまでと、バニラの自動保存が走るまで、毎 tick 見る。
+     * メインスレッドを止めて書き込みのスレッドを待たない（待つと、ログの書き込みやバニラの保存と重なる時間そのものが変わる）。
+     * 書き込みの完了は、毎 tick の始め（`ServerTickEvent.Pre`）の受け取りに任せる
+     */
+    private fun productionAutosave() {
+        if (phaseTick == 0) return
+        val s = ServerMachines.Stats
+        if (measuredTick == null) {
+            // 一巡の始まりは、cycleStartTick と同じく周期の数え口が一巡を始めた回数で見る（一巡の1 tick 目は止めるだけで、書き込みの予約はまだない）
+            val started = s.autosaveCycleStarts > cycleStartsAtArm
+            // 一巡が本物の経路で始まったら、その tick のうちに周期を止める（周期は次の一巡を始める tick を決めるだけで、一巡の進め方には使わない）。
+            // 一巡の残り・書き込みの残り・バニラの保存を待つ間に 2 つ目の一巡が始まらないので、止めた後の上限は PRODUCTION_TIMEOUT_TICKS。
+            // 止める前（一巡が始まる前）は、2 つ目の一巡が来る tick の前に打ち切る（始まると、数え口が 2 周分たまって別の理由で落ちる）
+            if (started && !productionPeriodStopped) {
+                ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
+                productionPeriodStopped = true
+            }
+            val done = started && ServerMachines.isAutosaveCycleDone && s.windowOutstanding <= 0 && vanillaSaveTick >= 0
+            if (!done) {
+                val limit = if (productionPeriodStopped) {
+                    PRODUCTION_TIMEOUT_TICKS
+                } else {
+                    minOf(PRODUCTION_TIMEOUT_TICKS.toLong(), productionPeriod + PRODUCTION_LEAD_TICKS - 1).toInt()
+                }
+                if (phaseTick >= limit) {
+                    fail(
+                        "the production-shaped autosave did not finish within $limit ticks " +
+                            "(cycle done ${ServerMachines.isAutosaveCycleDone}, outstanding ${s.windowOutstanding}, vanilla save tick $vanillaSaveTick)",
+                    )
+                }
+                return
+            }
+            stopMeasuring()
+        }
+        if (!awaitPhaseSaves()) return
+        // バニラの保存が、狙ったとおり「一巡の始めの tick（+ offset）」の終わりに走ったか。数え口の進め方が変わると、別の形を黙って測ることになる
+        val expectedGap = 1 + settings.vanillaSaveOffset
+        if (cycleStartTick < 0 || vanillaSaveTick - cycleStartTick != expectedGap) {
+            fail(
+                "the vanilla autosave did not overlap the cycle start as planned: cycle start tick $cycleStartTick, " +
+                    "vanilla save tick $vanillaSaveTick (expected the difference to be $expectedGap)",
+            )
+        }
+        probe.syntheticLogEveryTicks = 0
+        val tick = measuredTick!!
+        autosaveResult = AutosaveResult(
+            cycleTicks = s.autosaveCycleTicks.lastOrNull() ?: measuredTicks,
+            written = s.autosaveWritten,
+            skipped = s.autosaveSkipped,
+            maxTickWrites = s.autosaveMaxTickWrites,
+            writeMillis = s.autosaveWriteNanos / 1e6,
+            tick = tick,
+            cost = saveCost(),
+        )
+        productionResult = ProductionAutosaveResult(
+            periodTicks = productionPeriod,
+            vanillaSaveOffset = settings.vanillaSaveOffset,
+            serverTickAtStart = serverTickAtStart,
+            cycleStartTick = cycleStartTick,
+            vanillaSaveTick = vanillaSaveTick,
+            vanillaSaveNanos = vanillaSaveNanos,
+            vanillaSaveSections = vanillaSaveSections,
+            vanillaSavePending = vanillaSavePending,
+            syntheticLog = if (settings.syntheticLogTicks > 0) probe.takeSyntheticLog() else null,
+            mainThreadLog = logCounter?.end() ?: emptyList(),
+            tickCount = tick.ticks,
+        )
+        // 次の周期を止める（試験はこの段階で終わるが、片付けまでに周期が来ないように）
+        ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
         next(LoadPhase.AUTOSAVE)
     }
 
@@ -1195,7 +1419,12 @@ internal class LoadRun(
         when (p) {
             LoadPhase.EMPTY -> Unit
             // 一部の台に `/tmp` へファイルを書かせる（保存の `TMPFS` 節を測るため。#553）。書き終わるまで待ってから測る
-            LoadPhase.IDLE -> for (c in tmpSet) type(c, settings.os.tmpCommand)
+            LoadPhase.IDLE -> {
+                for (c in tmpSet) type(c, settings.os.tmpCommand)
+                // 本番の形（#834）: 測るバニラの自動保存を、新しいワールドの最初の保存（読み込んだチャンクを全部書く）にしないよう、
+                // この tick の終わりに1回走らせておく（測る区間の外。全台が入力待ちの段階は、この後で測りはじめる）
+                vanillaAutosave?.ticksUntilAutosave = 1
+            }
             LoadPhase.PLACED -> {
                 val t0 = System.nanoTime()
                 for (i in 0 until settings.count) LoadGameTests.Layout.placeComputer(helper, LoadGameTests.Layout.casePos(i, columns), settings.os)
@@ -1233,11 +1462,21 @@ internal class LoadRun(
             }
             LoadPhase.AUTOSAVE -> {
                 ServerMachines.Stats.reset()
+                phaseWindow = ServerMachines.Stats.window
                 // この試験で置いた台だけを周期に入れる。前の回の強制読み込みが残ったワールドでは、よその台も動いている（#749）。
                 // Gradle の run は毎回ワールドを消す（#792）ので、これは -PkeepGameTestWorld や IDE から起動して使い回したときの保険
                 val own: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
                 for (c in computers) own += c.case
                 val others = ServerMachines.trackedCases().filter { it !in own && it.computer.machine != null }
+                if (others.isNotEmpty() && settings.productionAutosave) {
+                    // 本番の形は本物の経路（ServerMachines.autosaveTick）で一巡を始めるので、よその台を周期から外せない。
+                    // 台数が合わずに後で落ちるより、ここで理由を書いて落とす
+                    fail(
+                        "${others.size} running machines that this load test did not place are loaded; the production-shaped autosave " +
+                            "starts the cycle on the real path and cannot leave them out (run it on a fresh world): " +
+                            others.take(5).joinToString(" ") { "(${it.blockPos.toShortString()})" },
+                    )
+                }
                 if (others.isNotEmpty()) {
                     LOGGER.warn(
                         "{} running machines that this load test did not place are loaded; the autosave cycle leaves them out: {}",
@@ -1245,7 +1484,7 @@ internal class LoadRun(
                         others.take(5).joinToString(" ") { "(${it.blockPos.toShortString()})" },
                     )
                 }
-                ServerMachines.startAutosaveCycle(own)
+                if (settings.productionAutosave) startProductionAutosave() else ServerMachines.startAutosaveCycle(own)
                 recording = true
             }
             LoadPhase.COMPUTE -> for (c in computeSet) type(c, settings.os.computeCommand)
@@ -1263,6 +1502,7 @@ internal class LoadRun(
                     level.chunkSource.move(it)
                 }
                 ServerMachines.Stats.reset()
+                phaseWindow = ServerMachines.Stats.window
                 // スポーンチャンクに重なると読み込まれたままになるので、この段階だけスポーンチャンクをなくす
                 val rule = level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS)
                 savedSpawnChunkRadius = rule.get()
@@ -1282,12 +1522,43 @@ internal class LoadRun(
         }
     }
 
+    /**
+     * 本番の形の自動保存（#834）を仕掛ける（試験の呼び出し、つまり `tickChildren` の中で呼ぶ。この tick の `ServerTickEvent.Pre` は済んでいる）。
+     *
+     * - 周期を本番の値（試験の前のコンフィグの `autosavePeriodTicks`。既定 6000）に戻し、数え口を [PRODUCTION_LEAD_TICKS] tick 後の
+     *   `ServerTickEvent.Pre` に周期が来るように合わせる（`ServerMachines.alignAutosaveCounter`）。周期は本物の経路で始まる
+     * - バニラの `ticksUntilAutosave` を `PRODUCTION_LEAD_TICKS + 1 + offset` にする。この tick の `tickServer` の終わりから1つずつ減るので、
+     *   周期が来た tick（+ offset）の `tickServer` の終わりに 0 になり、`saveEverything` が走る。
+     *   本番（起動から 6000 tick 目の `Pre` で KiBi の周期が始まり、同じ tick の終わりにバニラの自動保存が走る）と同じ重なり方
+     */
+    private fun startProductionAutosave() {
+        val vanilla = vanillaAutosave ?: fail("the production-shaped autosave needs MinecraftServer.ticksUntilAutosave")
+        val period = savedSaveConfig?.autosavePeriodTicks ?: ServerMachines.saveConfig.autosavePeriodTicks
+        if (period <= PRODUCTION_LEAD_TICKS + 1) fail("the autosave period ($period ticks) is too short for the production-shaped autosave")
+        productionPeriod = period
+        serverTickAtStart = level.server.tickCount
+        ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = period)
+        ServerMachines.alignAutosaveCounter(PRODUCTION_LEAD_TICKS.toLong())
+        // この tick の終わりに1つ減るので、+1 して、周期が来る tick（PRODUCTION_LEAD_TICKS 後）の終わりに 0 にする
+        vanilla.ticksUntilAutosave = PRODUCTION_LEAD_TICKS + 1 + settings.vanillaSaveOffset
+        probe.armLevelSave()
+        prevVanillaTicks = vanilla.ticksUntilAutosave
+        vanillaSaveTick = -1
+        cycleStartTick = -1
+        prevCycleStarts = ServerMachines.Stats.autosaveCycleStarts
+        cycleStartsAtArm = prevCycleStarts
+        probe.takeSyntheticLog()
+        probe.syntheticLogEveryTicks = settings.syntheticLogTicks
+        logCounter?.begin()
+    }
+
     private fun verify(p: LoadPhase) {
         when (p) {
             LoadPhase.EMPTY, LoadPhase.PLACED, LoadPhase.BOOT -> Unit
             LoadPhase.AUTOSAVE -> {
                 val r = autosaveResult!!
                 if (r.written + r.skipped != settings.count.toLong()) fail("the autosave should visit all ${settings.count} machines: $r")
+                verifyCounted(p, r.cost, handedToWriter = r.written, exact = false)
                 val notRunning = computers.count { it.case.computer.machine?.state != MachineState.RUNNING }
                 if (notRunning > 0) fail("$notRunning computers stopped during the autosave")
             }
@@ -1301,11 +1572,36 @@ internal class LoadRun(
                 // 計算している間はプロンプトに戻らない
                 if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
-            LoadPhase.UNLOAD -> Unit
+            LoadPhase.UNLOAD -> unloadResult!!.let { verifyCounted(p, it.cost, handedToWriter = it.captures, exact = true) }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
                 if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
             }
+        }
+    }
+
+    /**
+     * 段階に予約した書き込みが、すべて保存の手間と大きさの表（書けた・書けなかった）に入ったか（#602）。次の3つを確かめる。
+     * 1. 段階の途中で [ServerMachines.Stats.reset] が呼ばれていない（区間の番号が段階の始めのまま）。reset は予約・完了・書けた数を同時に 0 にし、
+     *    前の区間の完了は数え口に入れないので、途中で呼ばれても 2. は成り立ったままになり、2. だけでは気づけない
+     * 2. 書けた数 + 書けなかった数 == 予約した数。#614 の前は、書き込みのスレッドを `writerFlushMillis`（30 秒）まで待って打ち切っていたので、
+     *    待ち切れなかった分が表から落ちていた。[awaitPhaseSaves] が全部の完了を待つので、これは作りの上で成り立つ。落ちるのは、
+     *    待ちを打ち切りに戻したときだけ
+     * 3. 予約した数と、段階が書き込みに回した台の数（[handedToWriter]。予約の数え口とは別のところで数える）の関係。
+     *    アンロードは、取り出しに成功した台だけを数える（`unloadCaptures`）ので、予約した数と一致する（[exact]）。
+     *    自動保存の `written` は、`captureAndSubmit` が null を返した台（CRASHED・復元中など）も「回した」に数える（AutosaveRotation）ので、
+     *    予約した数は `written` 以下であればよい。予約が回した台より多ければ、数え口か回し方のどちらかが壊れている。
+     *    「回した台に対して表が足りない」差は、報告の「書き込みに回した台」と「予約した書き込み」を並べて読む
+     */
+    private fun verifyCounted(p: LoadPhase, cost: SaveCost, handedToWriter: Long, exact: Boolean) {
+        val window = ServerMachines.Stats.window
+        if (window != phaseWindow) fail("the save statistics were reset in the middle of the $p phase (window $phaseWindow -> $window)")
+        val counted = cost.saves + cost.writer.failures
+        if (counted != cost.submitted) {
+            fail("${cost.submitted} saves were queued in the $p phase, but $counted were counted (${cost.saves} written, ${cost.writer.failures} failed)")
+        }
+        if (if (exact) cost.submitted != handedToWriter else cost.submitted > handedToWriter) {
+            fail("${cost.submitted} saves were queued in the $p phase, but the phase handed ${if (exact) "" else "at most "}$handedToWriter machines to the writer")
         }
     }
 
@@ -1367,7 +1663,9 @@ internal class LoadRun(
     }
 
     private fun done() {
-        val report = LoadReport(settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList(), autosaveResult, unloadResult)
+        val report = LoadReport(
+            settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList(), autosaveResult, unloadResult, productionResult,
+        )
         cleanUp()
         onDone(report)
         helper.succeed()
@@ -1418,7 +1716,9 @@ internal class LoadRun(
         if (finished) return
         finished = true
         recording = false
+        probe.syntheticLogEveryTicks = 0
         probe.stop()
+        logCounter?.stop()
         savedProgressLevel?.let { Configurator.setLevel(PROGRESS_LOGGER, it) }
         savedProgressLevel = null
         for (i in 0 until settings.count) {
@@ -1496,6 +1796,20 @@ internal class LoadRun(
 
         /** GameTest のサーバーが 20 tick ごとに進み具合を書くロガー */
         private const val PROGRESS_LOGGER = "net.minecraft.gametest.framework.GameTestServer"
+
+        /**
+         * 本番の形の自動保存（#834）で、仕掛けてから一巡とバニラの自動保存が始まるまでの tick 数。
+         * 短くして、測る区間のほとんどを一巡の間にする
+         */
+        private const val PRODUCTION_LEAD_TICKS = 20
+
+        /**
+         * 本番の形の自動保存（#834）で、一巡と書き込みが全部終わるまで待つ上限（tick）。メインスレッドを止めて待たないので、
+         * 一巡の後の書き込みの残りも tick を数えて待つ（1,000 台で 1〜2 分かかる回がある）。
+         * 一巡が本物の経路で始まった tick（周期の数え口が一巡を始めた tick）に周期を止める（2 つ目の一巡は始まらない）ので、一巡の残り・書き込みの残り・バニラの保存を待つ間は、
+         * この値（段階の始めから数える）が上限になる。一巡が始まる前だけは、上限が「周期 + [PRODUCTION_LEAD_TICKS] - 1」を超えない
+         */
+        private const val PRODUCTION_TIMEOUT_TICKS = 12_000
 
         /** 段階ごとに覚える長い tick の上限 */
         private const val MAX_LONG_TICKS = 32

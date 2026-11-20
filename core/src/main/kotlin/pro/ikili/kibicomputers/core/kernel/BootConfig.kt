@@ -56,8 +56,15 @@ public class BootConfig private constructor(builder: Builder) {
      */
     public val homeDisk: String? = builder.homeDisk
 
+    /**
+     * OS の既定の言語（#661、ADR 0661）。POSIX の形（例: `ja_JP.UTF-8`。[BootLanguage.isValid] に合うもの）。
+     * あれば init に環境変数 `LANG` として渡す。`null` なら渡さない（英語）。再起動は前回の設定を使うので、同じ値を引き継ぐ
+     */
+    public val language: String? = builder.language
+
     override fun toString(): String =
-        "BootConfig(firmware=$isFirmwarePresent, disks=$bootDisks, preferred=$preferredBootDisk, home=$homeDisk, program=${programBytes?.size})"
+        "BootConfig(firmware=$isFirmwarePresent, disks=$bootDisks, preferred=$preferredBootDisk, home=$homeDisk, " +
+            "program=${programBytes?.size}, language=$language)"
 
     /** [BootConfig] を組み立てる。 */
     public class Builder internal constructor() {
@@ -66,6 +73,7 @@ public class BootConfig private constructor(builder: Builder) {
         internal var homeDisk: String? = null
         internal var preferredBootDisk: String? = null
         internal var firmwareProgram: ByteArray? = null
+        internal var language: String? = null
 
         /** 起動部品が挿さっているか（既定 `true`） */
         public fun firmwarePresent(value: Boolean): Builder = apply { firmwarePresent = value }
@@ -97,6 +105,17 @@ public class BootConfig private constructor(builder: Builder) {
                 "起動部品のプログラムが大きすぎる（${code?.size} バイト。上限 $MAX_FIRMWARE_PROGRAM_BYTES）"
             }
             firmwareProgram = code
+        }
+
+        /**
+         * OS の既定の言語（[BootConfig.language]。既定 `null` ＝ 言語なし）。POSIX の形で渡す（[BootLanguage.fromMinecraft] の結果）
+         *
+         * @throws IllegalArgumentException [BootLanguage.isValid] に合わない
+         */
+        @Throws(IllegalArgumentException::class)
+        public fun language(value: String?): Builder = apply {
+            require(value == null || BootLanguage.isValid(value)) { "起動の言語の形が合わない: $value" }
+            language = value
         }
 
         /** 設定を作る。 */
