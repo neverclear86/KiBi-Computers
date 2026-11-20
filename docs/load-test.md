@@ -43,8 +43,12 @@
 - 測るバニラの自動保存が新しいワールドの最初の保存（読み込んだチャンクを全部書く）にならないよう、「全台が入力待ち」の段階の始めに1回走らせておく（測る区間の外）
 - 測る区間は、仕掛けた次の tick から、一巡が終わって段階に予約した書き込みが全部終わり、バニラの自動保存が走るまで。メインスレッドを止めて書き込みのスレッドを待たない（ふだんの段階の 50 ms ずつの待ちは使わない）。
   全部の tick に長い tick の記録と止まりの見張りを掛ける。見張りは、動いている（`RUNNABLE` の）バニラの I/O のスレッド（`IO-Worker-`。リージョンファイル・`SavedData` の書き込み）のスタックも取る
-- 合成のログは `ServerTickEvent.Post`（区間「Post」）で、ロガー `LoadTestSyntheticLog` に INFO を1行書き、1行ごとの時間を数える。本番と同じ FML の log4j の設定のまま（`latest.log`・`debug.log` に、呼んだスレッドが書く）
-- 測る区間にメインスレッドが書いたログを、log4j の root の設定に付けたアペンダーで、ロガーとレベルごとに数える（KiBi の DEBUG も入る）
+- 合成のログは `ServerTickEvent.Post`（区間「Post」）で、ロガー `LoadTestSyntheticLog` に INFO を1行書き、1行ごとの時間を数える。log4j の設定は `runLoadTestServer` のもの（ModDevGradle が作る `build/moddev/loadTestServerLog4j2.xml` を `-Dlog4j2.configurationFile` で読む）で、
+  アペンダー（`latest.log`・`debug.log` の同期の `RollingRandomAccessFile`。呼んだスレッドが書く）は本番の FML の `log4j2.xml` と同じ。
+  違うのは Root のレベルで、本番は `all`（`debug.log` が DEBUG 以上を受ける）、`runLoadTestServer` は既定で `INFO`（`-PdevLogLevel=DEBUG` で `DEBUG`）。
+  INFO のままだと、本番で `debug.log` に同期に書かれる DEBUG の行（KiBi・NeoForge・他 MOD）が出ないので、ログの量を本番に近づけるときは `-PdevLogLevel=DEBUG` を付ける
+- 測る区間にメインスレッドが書いたログを、log4j の root の設定に付けたアペンダーで、ロガーとレベルごとに数える。数えられるのはロガーのレベルを通った行だけなので、DEBUG の行まで数えるときは `-PdevLogLevel=DEBUG` を付ける
+  （付けないと Root が INFO で、DEBUG の行はロガーの段階で捨てられ、アペンダーに届かない。`net.minecraft`・`com.mojang` は本番と同じく INFO まで）
 - この段階で試験を終える（計算・出力・アンロードは測らない）
 
 - `runLoadTestServer` は GameTest のサーバーで、測定用のテスト（`LoadGameTests` が台数ごとに作る）だけを動かす。
@@ -667,8 +671,10 @@ Lua の 1,000 台、`-PloadTestQuietProgress=true`、Windows・NTFS（同じボ�
   **なので既定では、バニラの `saveEverything` の間、KiBi の書き込みのスレッドには一巡の仕事がまだない。** 測った 5 回とも、保存の中（オーバーワールドの `LevelEvent.Save`）の KiBi の書き込み待ちは 0 件で、見張りのスタックでも書き込みのスレッドは待ち（`park`）だった
 - バニラの保存が一巡の途中に入るのは、周期を 6000 以外にしたとき、`/tick rate`・`/tick sprint` で間隔が変わったとき（`onTickRateChanged` が `ticksUntilAutosave` を縮める）、
   一巡（書き込みの残りを含む）が周期より長いとき。`-PloadTestVanillaSaveOffset=200` がこの形（一巡の始めから 200 tick 後。書き込み待ち 200〜370 件の最中）
-- 一巡の間に KiBi がメインスレッドで書いたログは、どの回も **0 行**（測る区間のメインスレッドのログを、log4j の root の設定に付けたアペンダーで数えた。DEBUG を含む）。
-  KiBi が自分で減らせるメインスレッドのログはない
+- 一巡の間に KiBi がメインスレッドで書いたログは、どの回も **0 行**（測る区間のメインスレッドのログを、log4j の root の設定に付けたアペンダーで数えた）。
+  表の 23 回は `-PdevLogLevel` なし（Root が INFO）なので、数えたのは INFO 以上だけ。DEBUG の分は、レビューの後に `-PdevLogLevel=DEBUG` で 1 回測り直した（既定の重なり方、合成のログなし）。
+  測る区間（1,193 tick）のメインスレッドのログは 1 行で、NeoForge の `CommonHooks` の DEBUG（バニラの保存の `level.dat` を書くときの `Gathered mod list to write to world save`）だけ。KiBi の行は DEBUG を含めて 0 行だった。
+  KiBi が自分で減らせるメインスレッドのログはない（他 MOD の DEBUG の量はサーバーによるので測っていない）
 
 ### バニラの自動保存の tick
 
@@ -692,7 +698,7 @@ Lua の 1,000 台、`-PloadTestQuietProgress=true`、Windows・NTFS（同じボ�
 
 ### メインスレッドのログ（合成のログ）
 
-一巡の間（一巡の始めから、書き込みが全部終わるまで）に、メインスレッドが `ServerTickEvent.Post` で INFO を1行ずつ書いた（`latest.log`・`debug.log` の両方。本番と同じ log4j の設定）。
+一巡の間（一巡の始めから、書き込みが全部終わるまで）に、メインスレッドが `ServerTickEvent.Post` で INFO を1行ずつ書いた（`latest.log`・`debug.log` の両方。アペンダーは本番と同じ同期の書き込みで、Root は INFO。INFO の行なので、Root のレベルの違いは効かない）。
 
 | 合成のログ | 回数 | 書いた行 | 50 ms 以上かかった行 | 割合 | 最大 |
 | --- | --: | --: | --: | --: | --: |

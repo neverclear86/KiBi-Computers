@@ -731,6 +731,9 @@ internal class LoadRun(
     private var vanillaSavePending = 0
     private var serverTickAtStart = 0
     private var productionPeriod = 0L
+
+    /** 本番の形の自動保存（#834）で、一巡が始まった後に周期を止めた */
+    private var productionPeriodStopped = false
     private var productionResult: ProductionAutosaveResult? = null
     private val logCounter = if (settings.productionAutosave) MainThreadLogCounter(level.server.runningThread.name) else null
 
@@ -1071,10 +1074,20 @@ internal class LoadRun(
         val s = ServerMachines.Stats
         if (measuredTick == null) {
             val started = s.windowSubmits > 0 || s.autosaveCycleTicks.isNotEmpty()
+            // 一巡が本物の経路で始まったら、すぐに周期を止める（周期は次の一巡を始める tick を決めるだけで、一巡の進め方には使わない）。
+            // 一巡の残り・書き込みの残り・バニラの保存を待つ間に 2 つ目の一巡が始まらないので、止めた後の上限は PRODUCTION_TIMEOUT_TICKS。
+            // 止める前（一巡が始まる前）は、2 つ目の一巡が来る tick の前に打ち切る（始まると、数え口が 2 周分たまって別の理由で落ちる）
+            if (started && !productionPeriodStopped) {
+                ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
+                productionPeriodStopped = true
+            }
             val done = started && ServerMachines.isAutosaveCycleDone && s.windowOutstanding <= 0 && vanillaSaveTick >= 0
             if (!done) {
-                // 2 つ目の一巡（周期が来る tick）が本物の経路で始まる前に打ち切る。始まると、数え口が 2 周分たまって別の理由で落ちる
-                val limit = minOf(PRODUCTION_TIMEOUT_TICKS.toLong(), productionPeriod + PRODUCTION_LEAD_TICKS - 1).toInt()
+                val limit = if (productionPeriodStopped) {
+                    PRODUCTION_TIMEOUT_TICKS
+                } else {
+                    minOf(PRODUCTION_TIMEOUT_TICKS.toLong(), productionPeriod + PRODUCTION_LEAD_TICKS - 1).toInt()
+                }
                 if (phaseTick >= limit) {
                     fail(
                         "the production-shaped autosave did not finish within $limit ticks " +
@@ -1083,8 +1096,6 @@ internal class LoadRun(
                 }
                 return
             }
-            // 一巡が終わったら、書き込みの残りを待つ間に次の周期が来ないように止める
-            ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
             stopMeasuring()
         }
         if (!awaitPhaseSaves()) return
@@ -1305,6 +1316,15 @@ internal class LoadRun(
                 val own: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
                 for (c in computers) own += c.case
                 val others = ServerMachines.trackedCases().filter { it !in own && it.computer.machine != null }
+                if (others.isNotEmpty() && settings.productionAutosave) {
+                    // 本番の形は本物の経路（ServerMachines.autosaveTick）で一巡を始めるので、よその台を周期から外せない。
+                    // 台数が合わずに後で落ちるより、ここで理由を書いて落とす
+                    fail(
+                        "${others.size} running machines that this load test did not place are loaded; the production-shaped autosave " +
+                            "starts the cycle on the real path and cannot leave them out (run it on a fresh world): " +
+                            others.take(5).joinToString(" ") { "(${it.blockPos.toShortString()})" },
+                    )
+                }
                 if (others.isNotEmpty()) {
                     LOGGER.warn(
                         "{} running machines that this load test did not place are loaded; the autosave cycle leaves them out: {}",
@@ -1595,8 +1615,8 @@ internal class LoadRun(
         /**
          * 本番の形の自動保存（#834）で、一巡と書き込みが全部終わるまで待つ上限（tick）。メインスレッドを止めて待たないので、
          * 一巡の後の書き込みの残りも tick を数えて待つ（1,000 台で 1〜2 分かかる回がある）。
-         * 周期を止めていない間は 2 つ目の一巡が始まってしまうので、実際の上限は「周期 + [PRODUCTION_LEAD_TICKS] - 1」（既定の 6000 tick なら約 6,019）を超えない。
-         * 一巡が終わった後は周期を止めるので、書き込みの残りを待つ間の上限にはならない
+         * 一巡が本物の経路で始まった tick に周期を止める（2 つ目の一巡は始まらない）ので、一巡の残り・書き込みの残り・バニラの保存を待つ間は、
+         * この値（段階の始めから数える）が上限になる。一巡が始まる前だけは、上限が「周期 + [PRODUCTION_LEAD_TICKS] - 1」を超えない
          */
         private const val PRODUCTION_TIMEOUT_TICKS = 12_000
 
