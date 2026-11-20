@@ -399,16 +399,19 @@ publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputer
   )
 }
 
-// CI の結果を待つ。passed が偽なのに落ちたチェックの名前がない結果は、まだ走っている間に返したものとみなして待ち直す
+// CI の結果を待つ。passed が偽なのに落ちたチェックの名前がない結果や、まだ終わっていないチェックを落ちたものに入れた結果は、
+// まだ走っている間に返したものとみなして待ち直す（ランナーの待ちが長いと、途中で返すことがある）
+const UNFINISHED_CHECK = /in[_ ]?progress|pending|queued|waiting|not finished|still running|未完了|実行中/i
 async function waitCi(pr, label) {
   let ci = null
   for (let attempt = 0; attempt < 3; attempt++) {
     ci = await agent(
-      `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。\`gh pr checks ${pr} --watch --interval 30\` を使う（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。コードは変更しない。`,
+      `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。\`gh pr checks ${pr} --watch --interval 30\` を使う（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。コードは変更しない。`,
       { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
     )
-    if (!ci || ci.passed || ci.failingChecks.length) return ci
-    log(`PR #${pr}: CI の結果に落ちたチェックの名前がない。待ち直す（${attempt + 1}/3）`)
+    const unfinished = !!ci && ci.failingChecks.some(c => UNFINISHED_CHECK.test(c))
+    if (!ci || ci.passed || (ci.failingChecks.length && !unfinished)) return ci
+    log(`PR #${pr}: ${unfinished ? 'まだ終わっていないチェックを落ちたものとして返した' : 'CI の結果に落ちたチェックの名前がない'}。待ち直す（${attempt + 1}/3）`)
   }
   return ci
 }

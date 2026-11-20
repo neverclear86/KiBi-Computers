@@ -13,6 +13,7 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.ComputerError
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenTier
@@ -26,6 +27,7 @@ import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
+import pro.ikili.kibicomputers.core.persist.SaveReadiness
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -111,6 +113,22 @@ object MachineRestoreGameTests {
     private fun saveAndTag(helper: GameTestHelper, be: CaseBlockEntity): CompoundTag {
         be.computer.prepareUnload()
         try {
+            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+        } finally {
+            be.computer.endQuiesce()
+        }
+        return be.saveWithFullMetadata(helper.level.registryAccess())
+    }
+
+    /**
+     * 止めてから保存の判定を見て、READY なら止めたまま書いてケースの NBT を返す。READY でなければ放して `null`
+     * （止めたままだと燃料待ちが起こされず、READY に近づかないことがある）。止めた後は新しい step が始まらないので、
+     * 確かめた判定のまま写しが取られる
+     */
+    private fun saveAndTagIfReady(helper: GameTestHelper, be: CaseBlockEntity): CompoundTag? {
+        be.computer.prepareUnload()
+        try {
+            if (be.computer.saveReadiness() != SaveReadiness.READY) return null
             helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
         } finally {
             be.computer.endQuiesce()
@@ -251,6 +269,62 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(copy!!.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "pending" }, "the restored shell should run the redrawn line: $text")
+        }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
+     * Lua のプログラムを丸ごと保存して戻す（#89）: 標準 OS のシェルから `lua -e` で、`parallel.waitForAll` の中の3つのコルーチン
+     * （`restored` を待つもの、`os.sleep` をくり返して数えるもの、キーを待つもの）が待っている間に書き、置き直して戻す。
+     * 戻した後に、`restored` を受けた行、数え終えた行、戻した後に押したキーを受けた行が画面に出る。画面の中身は保存しないので
+     * （ADR 0087、#630）、確かめるのは戻した後に出た行だけ。印は連結で作り、打った行（画面に残る）と一致させない。
+     *
+     * 数えるコルーチンは、`restored` を受けるまで `os.sleep` をくり返し（書く時点で必ず眠りの途中にいる）、受けてから3回眠って数える。
+     * 回数を決め打ちにすると、GameTest のサーバーは tick の間で待たないので、`os.sleep`（実時間）を待つ間に tick の上限を使い切るか、
+     * 遅いランナーでは書く前に数え終えてしまう
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoresALuaProgramWaitingInParallel(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        val script = "os.queueEvent('o'); os.pullEvent('o'); local r, m = false, 0; parallel.waitForAll(" +
+            "function() local e = os.pullEvent('restored'); r = true; print('lr,' .. e) end, " +
+            "function() while not r do os.sleep(0.05) end; for i = 1, 3 do os.sleep(0.05); m = m + 1 end; " +
+            "print('ln,' .. m) end, " +
+            "function() print('lw' .. 'ait'); repeat local _, k = os.pullEvent('key') until k == keys.q; print('lk,' .. m) end)"
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            typeLine(helper, helper.getBlockEntity(KEYBOARD), "lua -e \"$script\"")
+        }.thenWaitUntil {
+            val text = lines(first.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lwait" }, "lua should wait in parallel: $text")
+        }.thenWaitUntil {
+            // step の途中で書くと、写しの中で Lua が殺されてシェルだけが戻る。数えるコルーチンのタイマーは tick と無関係に鳴るので、
+            // 止めてから READY を確かめ、止めたまま書く（READY でなければ放して次の tick にやり直す）
+            val tag = saveAndTagIfReady(helper, first)
+            helper.assertTrue(tag != null, "lua should be at a wait point: ${first.computer.saveReadiness()}")
+            copy = reload(helper, tag!!)
+        }.thenWaitUntil {
+            assertRestored(helper, copy!!)
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, outcome=${be.lastRestoreOutcome}, ${be.computer}",
+            )
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lr,restored" }, "the restored lua should receive restored: $text")
+            helper.assertTrue(text.any { it == "ln,3" }, "the restored lua should keep counting: $text")
+        }.thenExecute {
+            for (packet in KeyboardEventCodec.encode(listOf(KeyboardEvent.KeyDown(Key.Q, 0, false)))) {
+                helper.assertTrue(helper.getBlockEntity<KeyboardBlockEntity>(KEYBOARD).receive(UUID(0, 1), packet) == 1, "keyboard should accept the key")
+            }
+        }.thenWaitUntil {
+            val text = lines(copy!!.wiring.connectedScreen!!.text)
+            helper.assertTrue(text.any { it == "lk,3" }, "the restored lua should receive the key: $text")
         }.thenExecute {
             copy!!.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
@@ -745,5 +819,45 @@ object MachineRestoreGameTests {
             be.pressPowerButton()
             helper.setBlock(CASE, Blocks.AIR)
         }.thenSucceed()
+    }
+
+    /**
+     * 復元の用意が投げた台（#808）: `startRestore` の前の用意（設定・ディスク・保存元）が投げても、順番待ちのまま RUNNING と表示し続けず、
+     * ERROR（UNAVAILABLE）にして順番待ちを抜ける。`PoweredOn` は残し（次の読み込みで復元し直す）、つなぎは外れ、例外は呼び手
+     * （`RestoreQueue`）に返る。マシンは作らない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun failedRestorePreparationLeavesAnErrorNotRunning(helper: GameTestHelper) {
+        helper.setBlock(CASE, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState())
+        val be = helper.getBlockEntity(CASE) as CaseBlockEntity
+        installRequired(be)
+        be.computer.loadPoweredOn(true)
+        helper.assertTrue(be.computer.beginRestore(), "a powered-on case should wait for a restore")
+        helper.assertTrue(
+            be.computer.isRestorePending && be.computer.status == ComputerStatus.RUNNING,
+            "should show RUNNING while waiting: ${be.computer}",
+        )
+        val boom = IllegalStateException("preparation failed (test)")
+        be.restorePreparationHook = Runnable { throw boom }
+        var thrown: Throwable? = null
+        try {
+            be.startRestore(false)
+        } catch (e: IllegalStateException) {
+            thrown = e
+        } finally {
+            be.restorePreparationHook = null
+        }
+        helper.assertTrue(thrown === boom, "the preparation failure should reach the caller but was $thrown")
+        helper.assertTrue(!be.computer.isRestorePending, "the case should leave the restore wait")
+        helper.assertTrue(
+            be.computer.status == ComputerStatus.ERROR && be.computer.error == ComputerError.UNAVAILABLE,
+            "the case should show ERROR/UNAVAILABLE but was ${be.computer}",
+        )
+        helper.assertTrue(be.computer.poweredOn, "PoweredOn should stay so the next load restores again")
+        helper.assertTrue(be.computer.machine == null, "no machine should be created")
+        helper.assertTrue(be.wiring.connectedMachine == null, "nothing should be wired")
+        helper.setBlock(CASE, Blocks.AIR)
+        helper.succeed()
     }
 }

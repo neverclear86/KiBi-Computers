@@ -659,4 +659,52 @@ class ComponentLinkTest {
             assertEquals(0L, c.heldValues)
         }
     }
+
+    @Test
+    fun `インスタンスへの再入は許し、深すぎる相互再帰はスタックのトラップになってコンポーネントだけが使えなくなる`() {
+        // #705: 固定した仕様（dd1fefc）は同期の再入をトラップにしない（test/async/reentrance.wast の前半は ComponentSpecTest で確かめる）。
+        // 親と子の donut の相互再帰に上限はなく、Java のスタックが尽きたらトラップとして扱う
+        val p = load(
+            """
+            (component
+              (core module ${'$'}M1
+                (type ${'$'}ft (func (param i32) (result i32)))
+                (table (export "tbl") 1 1 funcref)
+                (func (export "f") (param i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 100))
+                    (else (i32.add
+                            (call_indirect (type ${'$'}ft) (i32.sub (local.get 0) (i32.const 1)) (i32.const 0))
+                            (i32.const 1))))))
+              (core instance ${'$'}m1 (instantiate ${'$'}M1))
+              (func ${'$'}f (export "f") (param "n" u32) (result u32) (canon lift (core func ${'$'}m1 "f")))
+              (component ${'$'}B
+                (import "f" (func ${'$'}f (param "n" u32) (result u32)))
+                (core func ${'$'}fl (canon lower (func ${'$'}f)))
+                (core module ${'$'}MB
+                  (import "" "f" (func ${'$'}f (param i32) (result i32)))
+                  (func (export "g") (param i32) (result i32) (call ${'$'}f (local.get 0))))
+                (core instance ${'$'}mb (instantiate ${'$'}MB (with "" (instance (export "f" (func ${'$'}fl))))))
+                (func (export "g") (param "n" u32) (result u32) (canon lift (core func ${'$'}mb "g"))))
+              (instance ${'$'}b (instantiate ${'$'}B (with "f" (func ${'$'}f))))
+              (core func ${'$'}gl (canon lower (func ${'$'}b "g")))
+              (core module ${'$'}M2
+                (import "" "tbl" (table 1 1 funcref))
+                (import "" "g" (func ${'$'}g (param i32) (result i32)))
+                (elem (i32.const 0) func ${'$'}g))
+              (core instance ${'$'}m2 (instantiate ${'$'}M2 (with "" (instance
+                (export "tbl" (table ${'$'}m1 "tbl"))
+                (export "g" (func ${'$'}gl)))))))
+            """,
+        )
+        instantiate(p).use { c ->
+            assertEquals(u32(150), c.call("f", args = listOf(u32(50))))
+            // スタックが尽きた場所が Endive の中なら STACK_OVERFLOW のトラップ、リンカーの中なら StackOverflowError のまま上がる。
+            // どちらもプロセスのクラッシュ（CrashReason の STACK_OVERFLOW）になり、サーバーは止めない（isFatal は SOE を除く）
+            val e = assertThrows<Throwable> { c.call("f", args = listOf(u32(Int.MAX_VALUE))) }
+            assertTrue(e is StackOverflowError || (e is WasmTrapException && e.kind == WasmTrapKind.STACK_OVERFLOW), e.toString())
+            // 一度トラップしたコンポーネントは、それ以上は呼べない
+            assertThrows<WasmTrapException> { c.call("f", args = listOf(u32(0))) }
+        }
+    }
 }

@@ -1,6 +1,6 @@
 //! `grep [-EFcHhilnqsvx] [-e パターン]... [パターン] [ファイル...]`: パターンに合う行を書く。
 //!
-//! - `-E` 拡張正規表現、`-F` ただの文字列（正規表現で読めるものは `grep/regex.zig`）
+//! - `-E` 拡張正規表現、`-F` ただの文字列（正規表現で読めるものは `kibi.regex`）
 //! - `-i` 大文字と小文字を区別しない、`-v` 合わない行、`-x` 行全体が合う行
 //! - `-c` 行の数だけ、`-l` 合ったファイルの名前だけ、`-q` 何も書かない、`-n` 行の番号を付ける
 //! - `-H`・`-h` ファイルの名前を付ける・付けない（既定はファイルが 2 つ以上なら付ける）、`-s` 読めないファイルを知らせない
@@ -9,7 +9,7 @@
 //! 1 行は [LINE_MAX] バイトまで（長い行はそこで切って、続きを別の行として見る）
 const kibi = @import("kibi");
 const cli = kibi.cli;
-const regex = @import("grep/regex.zig");
+const regex = kibi.regex;
 
 const SYNOPSIS = "grep [-EFcHhilnqsvx] [-e pattern]... [pattern] [file...]";
 

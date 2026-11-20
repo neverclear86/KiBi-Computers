@@ -26,7 +26,9 @@ import pro.ikili.kibicomputers.core.wasi.p2.KibiP2.body
 /**
  * `kibi:process/process`・`kibi:process/process-poll` の p2 の実装（#685。ADR 0685）。意味は p1 と同じ（[KibiProcess]）。
  *
- * - `spawn` の引数の上限は p1 の lift と同じ順・同じコード（path → args → env → cwd → fds）。p2 のゲストが番号で知っている fd は 0/1/2 だけなので
+ * - `spawn` の引数は、Canonical ABI が全引数を lift してから（align・範囲・UTF-8・判別子の誤りはそこでトラップ）この本体を呼ぶ（#616。ADR 0616）。
+ *   本体の検査は、`request()` が path → args・env（個数と合計バイト数）→ cwd → fds（個数と `parent(n)`）の順に確かめ、その後に `KibiProcess.options`
+ *   （fd の範囲・fd の重複・args と env の NUL・env の名前の誤り。args・env の一部の検査はここなので fds より後）、最後に `handles` の個数。上限とコードは p1 と同じ。p2 のゲストが番号で知っている fd は 0/1/2 だけなので
  *   `fds` の `parent(n)` は n が 0..2 のときだけ（それ以外は `bad-descriptor`。process.wit の `fd-source.parent` のとおり）
  * - `spawn`・`spawn-with-handles` は待ちうる関数（[WasiP2Io.waiting]。#800）。待機点型では p1 の UNWIND と同じく巻き戻して読み込みを待ち、
  *   ブロッキング型（と作っている途中）は `ctx.execWithHandle` で待つ（読み込みの間は CPU と許可を返す）
@@ -88,13 +90,7 @@ internal object KibiP2Process {
         )
         val poll = mapOf(
             "subscribe" to body { ctx, a -> KibiP2.subscribe(ctx, a[0], LABEL) },
-            "spawn-with-handles" to WasiP2Io.waiting { ctx, w, a ->
-                spawnResult {
-                    val handles = (a[2] as CanonValue.Items).items
-                    if (handles.size > KibiProcess.MAX_FDS) fsError(Errno.INVAL, "handles は ${KibiProcess.MAX_FDS} 個まで（${handles.size}）")
-                    spawn(ctx, w, a[0], a[1], handles)
-                }
-            },
+            "spawn-with-handles" to WasiP2Io.waiting { ctx, w, a -> spawnResult { spawn(ctx, w, a[0], a[1], (a[2] as CanonValue.Items).items) } },
         )
         return mapOf(PROCESS to process, PROCESS_POLL to poll)
     }
@@ -155,16 +151,23 @@ internal object KibiP2Process {
         return CanonValue.Handle(h.fd)
     }
 
-    /** `spawn` の引数を確かめ、`handles` を当てて、実行ファイルのパスと [SpawnOptions] にする */
+    /**
+     * `spawn` の引数を確かめ、`handles` を当てて、実行ファイルのパスと [SpawnOptions] にする。
+     *
+     * 引数はすべて lift 済み（Component Model の順。#616）なので、ここで確かめるのはホストの検査だけ。順は [request]（`path` → `args`・`env` の個数と合計 →
+     * `cwd` → `fds` の個数と `parent(n)`）→ [KibiProcess.options]（fd の範囲・重複、NUL、env の名前）→ `handles` の個数（`spawn-with-handles` だけ）。
+     * `handles` の個数は `KibiProcess.options` の後に確かめる
+     */
     @Throws(FsException::class)
     private fun spawnOptions(ctx: ProcessContext, pathValue: CanonValue, optionsValue: CanonValue, handles: List<CanonValue>): Pair<String, SpawnOptions> {
         val request = request(pathValue, optionsValue)
         var options = KibiProcess.options(request)
+        if (handles.size > KibiProcess.MAX_FDS) fsError(Errno.INVAL, "handles は ${KibiProcess.MAX_FDS} 個まで（${handles.size}）")
         if (handles.isNotEmpty()) options = withHandles(ctx, options, request.fds.mapTo(HashSet()) { it.fd }, handles)
         return request.path to options
     }
 
-    /** `spawn` の引数を、p1 の lift と同じ順・同じ上限で確かめて [KibiProcess.Request] にする */
+    /** `spawn` の引数（lift 済み）を、引数の順に p1 と同じ上限・同じコードで確かめて [KibiProcess.Request] にする */
     @Throws(FsException::class)
     private fun request(pathValue: CanonValue, optionsValue: CanonValue): KibiProcess.Request {
         val path = P2.str(pathValue)

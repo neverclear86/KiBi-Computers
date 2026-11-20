@@ -17,7 +17,7 @@ Features that WASI does not have are provided as WIT packages named `kibi:*`. Ev
 - `kibi:io`: duplicating file descriptors, pipes, and the terminal (`tty`: raw mode, size, foreground)
 - `kibi:fs`: mounting disks and listing mounts and disks (`mounts`)
 - `kibi:computer`: free memory (`memory`), uptime and game time (`clock`), power (`power`)
-- `kibi:device`: listing and using devices (`bus`)
+- `kibi:device`: listing and using devices (`bus`; from the shell, lsdev(1) and devcall(1))
 
 ## NOTES
 
@@ -29,4 +29,4 @@ The full definitions are the WIT files of the mod and its system call reference 
 
 ## SEE ALSO
 
-intro(7), peripheral(3), os(3), parallel(3)
+intro(7), lsdev(1), devcall(1), peripheral(3), os(3), parallel(3)

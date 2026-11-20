@@ -31,6 +31,7 @@ import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
@@ -361,6 +362,45 @@ class KibiP2WaitPointTest {
             import kibi:process/process@0.1.0;
             import kibi:process/process-poll@0.1.0;
             import wasi:cli/stdin@0.2.12;
+            import wasi:cli/exit@0.2.12;
+            export wasi:cli/run@0.2.12;
+            """.trimIndent(),
+            wat,
+        )
+    }
+
+    /**
+     * 待機点型の `spawn` の lift の順（#616。ADR 0616）を確かめるコマンド。`/bin/ok` を 1 回 spawn して（読み込みを巻き戻して待つ）、
+     * 次に長すぎる path と揃っていない args の ptr で spawn する。後のほうは lift でトラップになる（p1 は `name-too-long`）
+     */
+    private val spawnLiftTrapCommand: ByteArray by lazy {
+        val wat = """
+            (module
+              (import "kibi:process/process@0.1.0" "[static]process.spawn" (func ${s}spawn (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+              (import "kibi:process/process@0.1.0" "[resource-drop]process" (func ${s}procdrop (param i32)))
+              (import "wasi:cli/exit@0.2.12" "exit-with-code" (func ${s}exit (param i32)))
+              $realloc
+              (data (i32.const 32) "/bin/ok")
+              (func ${s}sp (param ${s}pp i32) (param ${s}pl i32) (param ${s}ap i32)
+                (call ${s}spawn
+                  (local.get ${s}pp) (local.get ${s}pl)
+                  (local.get ${s}ap) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0) (i32.const 0)
+                  (i32.const 0) (i32.const 0)
+                  (i32.const 96)))
+              (func (export "wasi:cli/run@0.2.12#run") (result i32)
+                (call ${s}sp (i32.const 32) (i32.const 7) (i32.const 0))
+                (if (i32.load8_u (i32.const 96)) (then (call ${s}fail (i32.const 10))))
+                (call ${s}procdrop (i32.load (i32.const 100)))
+                ;; path は 4096 からの 5000 バイト（上限 4096 を超える）、args の ptr は 17（align 4 に揃っていない）
+                (call ${s}sp (i32.const 4096) (i32.const 5000) (i32.const 17))
+                (call ${s}fail (i32.const 20))
+                (i32.const 0)))
+        """.trimIndent()
+        KibiP2WitTool.component(
+            """
+            import kibi:process/process@0.1.0;
             import wasi:cli/exit@0.2.12;
             export wasi:cli/run@0.2.12;
             """.trimIndent(),
@@ -746,9 +786,27 @@ class KibiP2WaitPointTest {
         assertEquals(emptySet<Int>(), others(), "失敗したのに子ができた")
     }
 
+    @Test
+    fun `待機点型でも、後の引数のliftの誤りは先の引数のホストの検査より先にトラップになり、pendingSpawnも子も残さない`() = gated(spawnLiftTrapCommand) { runtime ->
+        // 1 つ目の spawn の読み込みを止めたまま、巻き戻して待っていること（pendingSpawn がある）を確かめる。待機点型の巻き戻しの後の spawn の場面
+        assertParked()
+        assertNotNull(suspend.pendingSpawn)
+        runtime.gate.countDown()
+        finish(ProcessState.CRASHED)
+        val e = rt.lastError
+        assertTrue(e is WasmTrapException && e.message.orEmpty().contains("list の場所が align 4 に揃っていない"), "別の終わり方: $e")
+        assertNull(suspend.pendingSpawn)
+        // 子は 1 つ目の spawn の 1 つだけ（drop したので、刈り取られるか親なしで残る）
+        assertTrue(others().all { it == pid + 1 }, "余計な子がある: ${others()}")
+    }
+
     /** 終わるか、[parked] の形で時計を待つところまで進め、待機点で待っていることを確かめる */
     private fun Run.awaitParked(message: String, parked: () -> Boolean) {
-        tickUntil("$message: ${state()}") { state().isTerminal || (state() == ProcessState.WAITING_EVENT && parked()) }
+        // 子が走っている間は台が待機点でない（isAtWaitPoint は全プロセスを見る）ので、子が終わるのも待つ
+        tickUntil("$message: ${state()}") {
+            state().isTerminal || (state() == ProcessState.WAITING_EVENT && parked() &&
+                m.lock.withLockValue { others().all { m.kernel.processes[it]?.state?.isTerminal != false } })
+        }
         assertFalse(state().isTerminal, "$message: 待つ前に終わった（終了コード ${m.lock.withLockValue { m.kernel.processes[pid]?.exitCode }}）")
         assertParked(clock = true)
     }

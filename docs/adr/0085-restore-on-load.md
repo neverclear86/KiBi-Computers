@@ -2,7 +2,7 @@
 
 - 状態: 採用
 - Issue: #85（task）。前提: ADR 0081（待機点保存のライフサイクル）、ADR 0082（節の中身）、ADR 0083（差分）、ADR 0084（書き込みのスレッド）、ADR 0049（起動）
-- 後続: #86（殺したプロセスへの通知）、#87（止まっていた時間のイベント・画面の再描画）、#88（MOD のバージョン違い）、#132（アンロード中の休止）、#251（仮の値の確定）
+- 後続: #86（殺したプロセスへの通知。ADR 0086）、#87（止まっていた時間のイベント・画面の再描画）、#88（MOD のバージョン違い）、#132（アンロード中の休止）、#251（仮の値の確定）
 
 ## 決めたこと（要約）
 
@@ -21,7 +21,7 @@
 | 電源を切った（`turnOff`）・起動に要る部品・`/`・`/home` のディスクが抜けて止めた（ADR 0056）（`partsChanged`）・電力が尽きた（`powerLost`） | 偽 |
 | マシンが CRASHED になった・ゲストが止めた（再起動の途中でない STOPPED。`poweroff`・init の終了）・起動に失敗した（`onBootFailed`） | 偽 |
 | 部品が足りない・電力がないので作れなかった | 偽 |
-| チャンクのアンロード・FULL でなくなった・`setRemoved`・マシンを作れなかった（サーバーの停止の途中など） | 変えない |
+| チャンクのアンロード・FULL でなくなった・`setRemoved`・マシンを作れなかった（サーバーの停止の途中など。作る処理・復元の前の用意が投げた。#808） | 変えない |
 
 変わったら `setChanged` する（チャンクの NBT に載る）。
 
@@ -168,6 +168,7 @@
       状態と費用のわりに得るものが少ない。後者の台は、表示は RUNNING（`beginRestore` のまま）、マシンなし、`isRestorePending` が真で残る。
       自動保存・アンロードの取り出しはマシンのある台だけを選ぶので対象外で、`PoweredOn` は真のまま NBT に書かれ、次の読み込みでもう一度復元される。
       電源ボタン（RUNNING なので切る）・アンロード（`chunkUnloaded` が印を下ろす）・FULL でなくなる（`chunkDemoted`）で抜けられる
+      - 追記（#808）: 「表示は RUNNING、マシンなし」のまま残さないようにした。後者の台は印を下ろして ERROR にする（下の #808 の追記）
     - ログ: 列全体で、投げた場所（`Machine` と同じ規則。種類・例外のクラス・標準ライブラリを除くスタックの上3段。`hostFailureSite`）ごとに最初の
       1回だけ WARNING とスタックトレースにし、同じ場所の繰り返しは DEBUG（スタックトレースなし）。覚える場所は 64 個まで（`MachineScheduler` と同じ値）。
       超えたら、スタックトレースなしの WARNING を1回出し、以後の新しい場所は DEBUG。`clear`（サーバーの開始・停止）で記録を消すので、サーバーの起動ごとに
@@ -179,6 +180,24 @@
       投げたとき、既定のログレベルでも何台が残ったか分かる。台の特定は DEBUG）。数の報告は時間で間引く: まだ出していなければすぐ1本、以後は前の1本から
       1分過ぎるまで足し合わせて待ち、過ぎた tick（列が空でも）でまとめて出す。`clear` は待たずに残りを出す。tick ごとに1本にすると、本数が
       台数 ÷ `restoresPerTick`（下限の 1 なら1台ごとに1本）になり、チャンクが少しずつ読み込まれるときも投げた台のある tick ごとに出るため
+  - 追記（#808）: 始める処理が途中で投げた台は、表示を RUNNING のまま残さず、ERROR（`ComputerError.UNAVAILABLE`。GUI は「起動できない」）にする。
+    `PoweredOn` は真のまま（表の「マシンを作れなかった → 変えない」。`poweredOnChanged` も呼ばない）なので、次の読み込みで復元し直す。
+    電源を切る形（`setPoweredOn(false)`）・CRASHED にする形は取らない（#677 と同じく、接続層の一時的な不具合で台が止まったままになるため）。
+    `ComputerStatus`・`ComputerError` は保存しないので、保存形式は変わらない
+    - `ComputerCase.load`（`turnOn`・`startRestore` の共通）で `MachineSlot.load` が投げたら、UNAVAILABLE にして投げ直す。
+      `MachineSlot.load` が握って `null` にするのは、確かめた後に `MachineManager` が閉じたことによる `IllegalStateException` だけにする
+      （閉じていなければ、マシンのコンストラクターの `check`・`error` などが投げたものなので投げ直す。握ったままだとどこにもログが出ないため）。JVM の致命的なエラー（`isFatal`）は状態を触らずにそのまま投げる。
+      `startRestore` は `load` の前に印を下ろすので、順番待ちも抜けている
+    - `ComputerCase.startRestore` の前の用意（1.21.1 の `CaseBlockEntity.startRestore` の `prepareDisks`・`MachineSpecs.configOf` など）が投げたら、
+      `finally` で、まだ順番待ちなら `ComputerCase.abandonRestore`（印を下ろして UNAVAILABLE にする。順番待ちでなければ何もしない）を呼ぶ。
+      `ComputerCase.startRestore` は順番待ちなら必ず最初に印を下ろすので、`finally` で印が残っていれば前の用意で投げたと分かる。
+      同じ `finally` で、マシンがなければデバイスを外す。例外はどちらも `RestoreQueue.tick` に返し、場所ごとに間引いたログに任せる
+      （ケース・接続層ではログに出さない）。積み直さない（#785 のとおり）
+    - 抜け道が変わる: ERROR なので、電源ボタンは切るのでなく起動し直し（`turnOn`）になる（RUNNING でないので `prepareDisks` を呼ぶ。決まって投げる
+      不具合なら、ボタンでも起動できず投げる）。電源を切りたければ、不具合が直った後に起動してから切る。アンロード・FULL でなくなる→戻る・読み込み直しで
+      `beginRestore` がまた順番待ちに入れる（出来事ごとに1回で、tick ごとには回らない）
+    - 数え口: `ServerMachines.recordRestoreStart` は `ComputerCase.startRestore` の前で数えるので、その中の `load` が投げた台は「始めた」だけ増え、
+      「終わった」は来ない（失敗の経路だけ数が合わない。位置は動かさない）
 
 ## 比べた案
 

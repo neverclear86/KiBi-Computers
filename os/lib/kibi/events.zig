@@ -188,6 +188,25 @@ pub fn waitInputOrQueue(fd: io.Fd, q: Queue) Error!Ready {
     }
 }
 
+/// [q] にイベントか、あふれて捨てた分ができるまで待つ（`poll_oneoff` の FD_READ を 1 つ。時計では起きない）。
+/// キューの側がエラーで起きたら `IO`
+pub fn waitQueue(q: Queue) Error!void {
+    const subs = [_]wasi.Subscription{
+        .{ .userdata = 0, .tag = wasi.EVENTTYPE_FD_READ, .u = .{ .fd = .{ .fd = q.handle } } },
+    };
+    var evs: [1]wasi.Event = undefined;
+    while (true) {
+        var n: wasi.Size = 0;
+        errno.check(wasi.poll_oneoff(&subs, &evs, subs.len, &n)) catch |e| {
+            if (e == error.INTR) continue;
+            return e;
+        };
+        if (n == 0) continue;
+        if (evs[0].@"error" != 0) return error.IO;
+        return;
+    }
+}
+
 fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;

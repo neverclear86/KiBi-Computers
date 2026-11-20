@@ -286,6 +286,53 @@ class ComponentResourceTest {
         }
     }
 
+    /**
+     * 実装したインスタンス A（dtor のない resource `r` を定義する）の `run` が子の B の `g` を呼び、B は A の `make` を呼んで
+     * （A への再入）受けた own をその場で drop する。A はスタックの上にあるが、固定した仕様（`dd1fefc`）の `canon_resource_drop` は
+     * dtor のない own でも何もしない関数を lift/lower で呼ぶだけで、`trap_if_on_the_stack` はない（ADR 0265 の「再入」）。
+     * `g` は受けたハンドルの番号を返す（drop で表から外れれば、次もまた 1 番になる）
+     */
+    private val dropWithoutDtorUnderImplementer = """
+        (component
+          (type ${'$'}r (resource (rep i32)))
+          (core func ${'$'}new (canon resource.new ${'$'}r))
+          (core module ${'$'}MA
+            (import "r" "new" (func ${'$'}new (param i32) (result i32)))
+            (func (export "mk") (result i32) (call ${'$'}new (i32.const 42))))
+          (core instance ${'$'}ma (instantiate ${'$'}MA (with "r" (instance (export "new" (func ${'$'}new))))))
+          (func ${'$'}make (result (own ${'$'}r)) (canon lift (core func ${'$'}ma "mk")))
+          (component ${'$'}B
+            (import "r" (type ${'$'}r (sub resource)))
+            (import "make" (func ${'$'}make (result (own ${'$'}r))))
+            (core func ${'$'}make_l (canon lower (func ${'$'}make)))
+            (core func ${'$'}drop (canon resource.drop ${'$'}r))
+            (core module ${'$'}MB
+              (import "" "make" (func ${'$'}make (result i32)))
+              (import "" "drop" (func ${'$'}drop (param i32)))
+              (func (export "g") (result i32) (local ${'$'}h i32)
+                (local.set ${'$'}h (call ${'$'}make))
+                (call ${'$'}drop (local.get ${'$'}h))
+                (local.get ${'$'}h)))
+            (core instance ${'$'}mb (instantiate ${'$'}MB (with "" (instance (export "make" (func ${'$'}make_l)) (export "drop" (func ${'$'}drop))))))
+            (func (export "g") (result u32) (canon lift (core func ${'$'}mb "g"))))
+          (instance ${'$'}b (instantiate ${'$'}B (with "r" (type ${'$'}r)) (with "make" (func ${'$'}make))))
+          (core func ${'$'}g (canon lower (func ${'$'}b "g")))
+          (core module ${'$'}MR
+            (import "" "g" (func ${'$'}g (result i32)))
+            (func (export "run") (result i32) (call ${'$'}g)))
+          (core instance ${'$'}mr (instantiate ${'$'}MR (with "" (instance (export "g" (func ${'$'}g))))))
+          (func (export "run") (result u32) (canon lift (core func ${'$'}mr "run"))))
+    """
+
+    @Test
+    fun `実装したインスタンスがスタックの上にあっても、dtorのないresourceのownのdropはトラップしない`() {
+        instantiate(load(dropWithoutDtorUnderImplementer)).use { c ->
+            assertEquals(u32(1), c.call("run"))
+            // drop で B の表から外れたので、次もまた 1 番。コンポーネントも使えなくなっていない
+            assertEquals(u32(1), c.call("run"))
+        }
+    }
+
     @Test
     fun `reallocの中のresource_newはトラップし、resource_repは通る`() {
         instantiate(load(guestResource)).use { c ->

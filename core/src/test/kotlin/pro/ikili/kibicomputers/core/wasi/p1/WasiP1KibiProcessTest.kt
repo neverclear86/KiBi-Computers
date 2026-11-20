@@ -288,6 +288,10 @@ class WasiP1KibiProcessTest {
         waitNoChildren()
     }
 
+    /**
+     * p1 の順（#430）。Component Model の層は全引数を lift してから確かめるので、同じ入力がトラップになる（`KibiP2LiftOrderTest`）。
+     * #616 で p1 は揃えないと決めたので、期待値は p1 の順として固定する（ADR 0616）
+     */
     @ParameterizedTest
     @EnumSource(Mode::class, names = ["UNWIND", "BLOCK"])
     fun `spawnは引数の順に読むので、先の引数のerror-codeが揃っていないlistのトラップより先に返り、noneのenvのptrは確かめない`(mode: Mode) =
@@ -302,6 +306,7 @@ class WasiP1KibiProcessTest {
             waitNoChildren()
         }
 
+    /** p1 の順として固定する（#616。ADR 0616）。p2 には待たない設定がない */
     @Test
     fun `待たない設定では、揃っていないlistのptrでもspawnは引数を読む前にagain`() = run(Mode.NONE, "nowait-misaligned") {
         assertLine("nowait ${err(Errno.AGAIN)}", finish())
