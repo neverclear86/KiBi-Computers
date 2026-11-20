@@ -145,7 +145,7 @@ class LuaCoroutineRestoreTest {
 
     /**
      * 写しを取って書く（[current] がなければ新しい ID を振る）。[deltaBase] を渡すと、比を 1.0 にして差分を書く（全体に化けない）。
-     * 待機点で取るので `null` にならない（燃料待ちのときは [captureRetrying] を使う）。
+     * 待機点で取るので `null` にならない（燃料待ちで取るテストは、`null` の間 tick を回して取り直すループを中に書いている）。
      * [fullSaveRule] を変えたときは、差分を頼んでも全体になりうるので、[deltaBase] が写しに残ることは確かめない
      */
     private fun save(
@@ -250,6 +250,8 @@ class LuaCoroutineRestoreTest {
             val expected = reference(h, script)
             assertTrue(expected.contains("c\tdone\t"), expected)
             assertTrue(expected.contains("weak\t1\tkept\tgc\t0\n"), expected)
+            // keep を放した後の collectgarbage で __gc が1回だけ走る（戻した実行も同じ出力なので、戻した後に1回走ったことになる）
+            assertTrue(Regex("(^|\n)gc\t1\t\\d+\n").containsMatchIn(expected), expected)
 
             val fs = TestMemoryFileSystem()
             volumes(h, fs)

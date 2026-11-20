@@ -120,6 +120,22 @@ object MachineRestoreGameTests {
         return be.saveWithFullMetadata(helper.level.registryAccess())
     }
 
+    /**
+     * 止めてから保存の判定を見て、READY なら止めたまま書いてケースの NBT を返す。READY でなければ放して `null`
+     * （止めたままだと燃料待ちが起こされず、READY に近づかないことがある）。止めた後は新しい step が始まらないので、
+     * 確かめた判定のまま写しが取られる
+     */
+    private fun saveAndTagIfReady(helper: GameTestHelper, be: CaseBlockEntity): CompoundTag? {
+        be.computer.prepareUnload()
+        try {
+            if (be.computer.saveReadiness() != SaveReadiness.READY) return null
+            helper.assertTrue(saveNow(be, CapturePolicy.KILL_TRANSIENT) > 0, "the case should be saved")
+        } finally {
+            be.computer.endQuiesce()
+        }
+        return be.saveWithFullMetadata(helper.level.registryAccess())
+    }
+
     /** ケースを外し（`setRemoved`。ディレクトリは残る）、置き直して [tag] を読ませる（次の tick の `onLoad` で復元の順番待ちに入る） */
     private fun reload(helper: GameTestHelper, tag: CompoundTag): CaseBlockEntity {
         helper.setBlock(CASE, Blocks.AIR)
@@ -284,11 +300,12 @@ object MachineRestoreGameTests {
         }.thenWaitUntil {
             val text = lines(first.wiring.connectedScreen!!.text)
             helper.assertTrue(text.any { it == "lwait" }, "lua should wait in parallel: $text")
-            // step の途中で書くと、写しの中で Lua が殺されてシェルだけが戻る
-            helper.assertTrue(first.computer.saveReadiness() == SaveReadiness.READY, "lua should be at a wait point: ${first.computer.saveReadiness()}")
-        }.thenExecute {
-            val tag = saveAndTag(helper, first)
-            copy = reload(helper, tag)
+        }.thenWaitUntil {
+            // step の途中で書くと、写しの中で Lua が殺されてシェルだけが戻る。数えるコルーチンのタイマーは tick と無関係に鳴るので、
+            // 止めてから READY を確かめ、止めたまま書く（READY でなければ放して次の tick にやり直す）
+            val tag = saveAndTagIfReady(helper, first)
+            helper.assertTrue(tag != null, "lua should be at a wait point: ${first.computer.saveReadiness()}")
+            copy = reload(helper, tag!!)
         }.thenWaitUntil {
             assertRestored(helper, copy!!)
         }.thenExecute {
