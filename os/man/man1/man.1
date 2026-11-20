@@ -17,6 +17,8 @@ When both standard input and standard output are terminals, a long page is shown
 
 The language is taken from `-L`, or from the first non-empty of `LC_ALL`, `LC_MESSAGES` and `LANG`. For `ja_JP.UTF-8`, man tries `ja_JP.UTF-8`, `ja_JP`, `ja` and then English. `C`, `POSIX` and an unset value mean English. If a page has no translation, the English page is shown.
 
+By default, `LANG` is the language of the player who turned the computer on (English if it is not known). Set `env LANG=C` in `/etc/inittab` to always use English.
+
 ## OPTIONS
 
 - `-L lang`: use this language

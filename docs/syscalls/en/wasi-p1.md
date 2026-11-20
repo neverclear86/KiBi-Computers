@@ -88,6 +88,7 @@ An executable that is not a regular file returns `ACCES`; one that is too large 
 
 - fds 0, 1, and 2 are standard input, standard output, and standard error. Whoever creates the process decides what they are connected to (the console, a pipe, or nothing)
 - The first process started at boot (init) gets exactly one preopen: the directory `/` at fd 3. Every mount (disks, `/tmp`, `/dev`) appears under `/`, so this one preopen reaches everything
+- init's environment is either empty or just `LANG` (plus `PWD`, below). `LANG` is the language of the player who turned the computer on (for example `ja_JP.UTF-8`); it is left out when that is not known (#661)
 - Whether a child gets fds 3 and up is decided by its creator (with `spawn` in `kibi:process`, only the fds 3 and up that are listed are passed)
 
 ### Preopens

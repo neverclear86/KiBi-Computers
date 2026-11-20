@@ -9,7 +9,7 @@
 
 - 起動はカーネル（`core`）の仕事。接続層は `BootConfig`（起動部品が挿さっているか、起動ディスクの候補の識別子）を渡すだけ。どのディスクがつながっているかはワールドの情報なので、接続層がメインスレッドで集める
 - `Machine.boot(config)` は待たずに返す。ディスクを探し、`/sbin/init` を読み込むのは、スケジューラのワーカーのスレッド（重いため）
-- init は常に pid 1、親なし、argv `["/sbin/init"]`、環境変数なし、cwd `/`、標準入出力はコンソール
+- init は常に pid 1、親なし、argv `["/sbin/init"]`、環境変数なし（訂正 #661: 空か `LANG` の1つだけ。下の追記）、cwd `/`、標準入出力はコンソール
 - 起動のたびに、ゾンビを表から外し、pid を 1 から振り直し、マウントをすべて外す。コンソールの TTY は残す（前景のプロセスは 0 に戻す）
 - init が `stop()`・再起動によらずに終わったら、コンソールに書いて残りのプロセスをすべて止め、`STOPPED` にする。自動では再起動しない（すぐ落ちる init で起動を繰り返さないため）
 - 再起動は「すべて止まってから `MachineHost.onRebootRequested` を知らせる」形。既定の実装は前回の `BootConfig` で `boot` する。接続層は上書きして、その時点のディスクで設定を作り直せる
@@ -90,6 +90,15 @@ ADR 0043・0044 と同じく、`pro.ikili.kibicomputers.api` には何も足さ�
   - 起動の途中・再起動の途中（`reboot()` を受け付けてから `onRebootRequested` を呼ぶまで）は保存しない。この間は `isAtWaitPoint` が `false`
   - 戻したマシンでは、接続層が `BootConfig` を渡し直す（`lastBootConfig` を決め直す）。渡し直すまでは `reboot()` が `false` を返す。渡し直す口の形は #81 で決める。`BootConfig` は保存しない（その時点のワールドで作り直すほうが正しい）
     - 訂正（#306）: 今のコードでは、復元（`Machine.restore`）が復元の求めの `bootConfig` を `lastBootConfig` に入れるので、戻したマシンでも `reboot()` を受け付ける。`false` になるのは、起動も復元も通らずに作ったマシン・スケジューラが閉じている・`CRASHED` のとき（ADR 0306）。戻したマシンでのプロセスの再起動・停止の求めは `MachineRestoreTest` で確かめる
+
+## 追記（#661）: init に渡す `LANG`
+
+- カーネルが init に渡す環境変数は、空か `LANG` の1つだけ。`BootConfig.language`（POSIX の形。例: `ja_JP.UTF-8`）があれば `LANG=<値>` を渡し、なければ今までどおり空
+  （p1・p2 の層は `PWD=<cwd>` を足して見せる。#760）。`LC_ALL`・`LANGUAGE` などほかの変数は渡さない
+- 値は電源ボタンで起動したプレイヤーの言語（クライアントの設定）。接続層が `BootLanguage.fromMinecraft` で正規化して渡す。決め方・優先順位・保存は ADR 0661
+- 再起動・復元の後の再起動は前回の `BootConfig`（`lastBootConfig`）を使うので、同じ値を引き継ぐ。`BootConfig.Builder.language` は形の合わない値を
+  `IllegalArgumentException` で断る（`ProcessArgs.check` に断られて `INIT_START_FAILED` になる値を通さない）
+- プログラムだけの起動（ADR 0099）・試験用のイメージ `testboot`・p2・p3 のコンポーネントの init にも同じく見える
 
 ## 今の制限
 
