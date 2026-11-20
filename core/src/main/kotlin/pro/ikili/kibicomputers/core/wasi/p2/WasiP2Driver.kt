@@ -24,6 +24,9 @@ import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
  * 巻き戻すと `run` から戻るので、待つ key を `StepResult.Wait` にする。再開（[resume]）は巻き直して `run` を呼び直す。
  * かけられなかったものは今までどおり `BLOCKING` で、`run` を 1 回呼ぶ（待つ間はスレッドを持つ）。
  *
+ * 止まりうる関数の中の燃料切れ（`kibi.async_fuel`。[ComponentProgram.fuelYield]。#803）で巻き戻したときも `run` から戻るので、
+ * そのときは `StepResult.WaitFuel` にする（スレッドを持たずに燃料を待つ。p1 の `WasiP1` と同じ）。再開は燃料のあとでも
+ * ホストの待ちのあとでも同じく、巻き直して `run` を呼び直す（燃料のあとは、カーネルが巻き直しの印を立ててから [resume] を呼ぶ）
  *
  * - 呼ぶ export は、import と同じ規則（[WasiP2Versions]）に合う `wasi:cli/run@0.2.<n>` のどれか 1 つ（2 つ以上あれば断る）。
  *   中の `run` は `func() -> result` であること
@@ -57,7 +60,14 @@ internal class WasiP2Driver private constructor(private val run: FuncRef, waitPo
         } catch (e: WasiP2Exit) {
             return StepResult.Exit(e.code)
         }
-        if (component.unwound) return StepResult.Wait(suspend(ctx).takePendingKeys())
+        if (component.unwound) {
+            val s = suspend(ctx)
+            if (ctx.takeFuelUnwind()) {
+                check(!s.hasPendingKeys) { "燃料切れとホストの待ちの巻き戻しが重なった" }
+                return StepResult.WaitFuel
+            }
+            return StepResult.Wait(s.takePendingKeys())
+        }
         return StepResult.Exit(if ((r as CanonValue.Case).index == 0) 0 else 1)
     }
 

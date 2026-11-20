@@ -34,7 +34,7 @@
 
 ## 制約と残り
 
-- `kibi:device`・`kibi:process` を使う p2 のコマンドも `WAIT_POINT` になり、`maxBlockingProcesses` に数えられなくなる。燃料待ちのスレッドが数えられない穴（ADR 0757 の「制約と残り」、#803）の対象になるコマンドが増える。直すのは #803 の範囲。
+- `kibi:device`・`kibi:process` を使う p2 のコマンドも `WAIT_POINT` になり、`maxBlockingProcesses` に数えられなくなる。燃料待ちのスレッドが数えられない穴の対象になるコマンドが増えたが、#803 で止まりうる関数の中の燃料切れも待ち点にしたので、残るのは p1 と同じ巻き戻せないところだけ（ADR 0757 の「燃料切れの待ち点（#803）」）。
 - ほかに、tick ごとに台数に比例するコストは増えない。待つ間に持つのは、`pending-call` の key か `HostCompletion` の key だけ。
 - core モジュールの start 関数の中の `invoke`・`spawn`（`LOADING`。巻き戻さずにスレッドを持って待つ）は、コンポーネントの単体テストでは確かめていない。wit-component は、メモリ・realloc を使う lower を main のインスタンスの後に fixup が埋める表を通すので、start 関数からは呼べない（ADR 0757 のテストの注記と同じ）。巻き戻せるかの判定（`ComponentSuspend.canUnwind`）は `wasi:*` と同じものを使う。
 

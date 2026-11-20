@@ -273,6 +273,10 @@ internal class ProcessRunner(private val machine: Machine) {
             val stack = checkNotNull(rt.process.asyncStack) { "退避先がない" }
             check(!stack.isEmpty) { "燃料切れで巻き戻したのに退避した値がない" }
             val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
+            // コンポーネントは、巻き戻して `run` から戻るときに、外からの呼び出しの lift の燃料（LinkedComponent.call の chargeFuel）を
+            // 手持ちから引いている（#803）。その分も書き戻すよう、巻き戻すと決めたときの残りでなく、今の手持ちを読む。
+            // p1 は巻き戻しの間に燃料を引かないので、手持ちは決めたときの残りのまま（読み方を変えない）
+            val left = if (rt.program.component != null) holder.fuel else rt.fuelUnwindRemaining
             holder.fuel = 0
             // CPU を持っている間は、最後に補充した tick が手持ちを渡した tick（FuelAccount）。giveBack で書き換わる前に読む
             val grantedTick = machine.fuelAccount.lastRefillTick
@@ -280,7 +284,7 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.stackActive = false
             // CPU を返す前に並ぶので、CPU の待ち行列にいるプロセス（この後で燃料がないと分かって並ぶ）の後ろに回る（#47）
             enqueueFuelWaitLocked(rt, threadless = true, behindCpu = true)
-            giveBackLocked(rt.fuelUnwindRemaining - stack.size.toLong() * FuelCosts.ASYNC_VALUE)
+            giveBackLocked(left - stack.size.toLong() * FuelCosts.ASYNC_VALUE)
             rt.fuelUnwindRemaining = 0
             scheduler.deactivate(rt)
             // 巻き戻すと決めたときにマシンの燃料が残っていて（譲るための巻き戻し。#47）、巻き戻しの費用を引いた後も正で、一時停止でなければ、
@@ -552,6 +556,8 @@ internal class ProcessRunner(private val machine: Machine) {
      * 残りを負のまま返して先へ進める（前借り。#477）。残りが負の間は、次に燃料を確かめるところ（関数の入口・loop の先頭）でまた呼ばれるので、
      * 止まりうる関数の中で確かめたところ（`kibi.async_fuel`。[onFuelExhaustedUnwindable]）で巻き戻し、スレッドを持たずに燃料を待つ。
      * 前借りが [FUEL_OVERDRAFT_LIMIT] に届いたら（止まりうる関数に戻らずに計算し続けている）、前と同じくスレッドを持ったまま待つ。
+     * コンポーネント（#803）では、ゲストからゲストへの呼び出しの下の callee の中でも前借りする（callee から戻れば、外からの call の
+     * 1 段目の止まりうる関数で巻き戻せる）。
      * 前借りした分は残り（負）として書き戻すので、マシンの燃料の借りになり、後の補充で返す
      */
     private fun onFuelExhaustedPlain(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
@@ -561,7 +567,11 @@ internal class ProcessRunner(private val machine: Machine) {
                 if (rt.killed) throw ProcessKilledException()
                 // 譲る相手がいなければ、前借りせずにその場で次のスライスを足す（#47）
                 renewSliceLocked(rt, remaining)?.let { return it }
-                rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
+                // コンポーネントでは、ゲストからゲストへの呼び出しの下（LinkedComponent.canUnwind が偽）でも前借りする（#803）。
+                // 前借りは巻き戻さないので Kotlin の層を巻き戻すことはなく、callee が上限の中で戻れば、外の止まりうる関数の次の
+                // kibi.async_fuel で巻き戻せる。戻らなければ、上限に届いたところで p1 の葉の関数と同じくスレッドを持って待つ。
+                // realloc・post-return の中（ホストの関数・canon が呼んだゲスト）は guestCallDepth で弾く（戻った先でも巻き戻せないため）
+                unwindableLocked(rt)
             }
             if (overdraft) {
                 if (!rt.fuelOverdraft) {
@@ -623,15 +633,16 @@ internal class ProcessRunner(private val machine: Machine) {
      * 止まりうる関数の中の燃料切れ（#339。`kibi.async_fuel`）。巻き戻せるなら、状態を `UNWINDING` にして戻る
      * （`_start` まで戻ったら、ドライバーが [StepResult.WaitFuel] を返す）。
      * 燃料待ちからの巻き直し（`REWINDING`）で呼ばれたら、止まった呼び出しに着いたので `NORMAL` に戻し、step が渡した手持ちを返す。
-     * 巻き戻せないところ（モジュールの start 関数の中、ホスト関数の中から呼んだゲストの中。#73）では、[onFuelExhausted] と同じくスレッドを持ったまま待つ
+     * 巻き戻せないところ（モジュールの start 関数の中、ホスト関数の中から呼んだゲストの中。#73）では、[onFuelExhausted] と同じくスレッドを持ったまま待つ。
+     * コンポーネントのプロセスは [onComponentFuelExhaustedUnwindable] に分ける（#803）
      */
     private fun onFuelExhaustedUnwindable(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
         val unwindable = lock.withLockValue {
             verifyInstanceLocked(rt, instance)
             if (rt.killed) throw ProcessKilledException()
-            // ホスト関数の中からゲストを呼んでいる間（#73。cabi_realloc など）は、ホスト関数の途中を巻き戻せないので待つ
-            rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
+            unwindableLocked(rt)
         }
+        if (rt.program.component != null) return onComponentFuelExhaustedUnwindable(rt, instance, remaining, unwindable)
         if (!unwindable) return onFuelExhausted(rt, instance, remaining)
         if (instance.asyncState == WasmAsyncState.REWINDING) {
             check(rt.rewindingForFuel) { "燃料待ちからでない巻き直しが、燃料切れの呼び出しに着いた" }
@@ -651,6 +662,55 @@ internal class ProcessRunner(private val machine: Machine) {
         rt.fuelUnwindRemaining = remaining
         rt.fuelUnwindYield = yielding
         instance.asyncState = WasmAsyncState.UNWINDING
+        return remaining
+    }
+
+    /**
+     * 燃料切れを巻き戻せるプロセスの状態か（待機点型で、作っている途中でなく、ホスト関数の中からゲストを呼んでいる間でない）。
+     * ホスト関数の中からゲストを呼んでいる間（#73。cabi_realloc、コンポーネントの realloc・post-return など）は、ホスト関数の途中を
+     * 巻き戻せないので待つ。カーネルロックの中で呼ぶ
+     */
+    private fun unwindableLocked(rt: ProcessRuntime): Boolean =
+        rt.process.kind == ProcessKind.WAIT_POINT && rt.loading == null && rt.guestCallDepth == 0
+
+    /**
+     * コンポーネントのプロセスの、止まりうる関数の中の燃料切れ（#803。`kibi.async_fuel`）。[onFuelExhaustedUnwindable] のコンポーネント版で、
+     * 状態は 1 つのインスタンスでなく、[LinkedComponent] を通して全インスタンスを同時に変える（巻き戻しは [LinkedComponent.requestUnwind]、
+     * 着いたときは [LinkedComponent.endFuelRewind]）。ホストの関数の巻き戻しと同じく、退避した値はプロセスに 1 つのスタックに積み、
+     * `WasiP2Driver` が `run` から戻ったところで [StepResult.WaitFuel] を返す。
+     *
+     * [unwindable] はプロセスの状態で巻き戻せるか（[unwindableLocked]）。それに加えて、コンポーネントが巻き戻せるところ
+     * （[LinkedComponent.canUnwind]。ゲストからゲストへの呼び出しの下、realloc・post-return の中でない）でなければ、
+     * [onFuelExhausted] と同じくスレッドを持ったまま待つ
+     */
+    private fun onComponentFuelExhaustedUnwindable(rt: ProcessRuntime, instance: WasmInstance, remaining: Long, unwindable: Boolean): Long {
+        val component = rt.component
+        if (!unwindable || component == null) return onFuelExhausted(rt, instance, remaining)
+        if (component.isRewinding) {
+            // 燃料待ちからの巻き直しが、止まった燃料切れの呼び出しに着いた（ホストの関数の巻き直しは、燃料の確かめを通らない）
+            check(rt.rewindingForFuel) { "燃料待ちからでない巻き直しが、燃料切れの呼び出しに着いた" }
+            check(rt.process.asyncStack?.isEmpty != false) { "巻き直しの後に退避した値が残っている" }
+            rt.rewindingForFuel = false
+            component.endFuelRewind()
+            return lock.withLockValue { instance.fuel }
+        }
+        // 守りの分岐。今は通らない: ゲストからゲストへの呼び出しの下に止まりうる関数があれば、変換を断る（ComponentAsyncify）ので、
+        // 止まりうる関数の燃料切れ（kibi.async_fuel）は外からの call の 1 段目でしか起きず、realloc・post-return の中は guestCallDepth で弾く
+        if (!component.canUnwind()) return onFuelExhausted(rt, instance, remaining)
+        val yielding = lock.withLockValue {
+            if (rt.killed) throw ProcessKilledException()
+            renewSliceLocked(rt, remaining)?.let { return it }
+            yieldingLocked(remaining)
+        }
+        rt.fuelOverdraft = false
+        rt.fuelUnwound = true
+        rt.fuelUnwindRemaining = remaining
+        rt.fuelUnwindYield = yielding
+        // 計測コードは、残りを関数の中のローカルに控えていて、巻き戻して戻るときはグローバルに書き戻さない（古いままになる）。
+        // waitFuelUnwound は lift の燃料を引いた後のグローバルを読むので、ここで今の残りを入れておく
+        // （入れないと、グローバルに残った古い手持ちを、使い切ったはずの燃料としてマシンへ返してしまう）
+        lock.withLockValue { rt.currentHolder?.fuel = remaining }
+        component.requestUnwind()
         return remaining
     }
 
