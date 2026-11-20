@@ -571,6 +571,9 @@ internal class LoadRun(
     private var measureFrom: Int? = 0
     private var outputWaitTicks = 0
     private var phaseStartNanos = 0L
+
+    /** 保存の数え口を段階の始めに reset した後の区間の番号（[verifyCounted] が、途中で reset されていないかを見る。#602） */
+    private var phaseWindow = -1L
     private var recording = false
     private var samples = LongArray(1024)
 
@@ -1118,6 +1121,7 @@ internal class LoadRun(
             }
             LoadPhase.AUTOSAVE -> {
                 ServerMachines.Stats.reset()
+                phaseWindow = ServerMachines.Stats.window
                 // この試験で置いた台だけを周期に入れる。前の回の強制読み込みが残ったワールドでは、よその台も動いている（#749）。
                 // Gradle の run は毎回ワールドを消す（#792）ので、これは -PkeepGameTestWorld や IDE から起動して使い回したときの保険
                 val own: MutableSet<CaseBlockEntity> = Collections.newSetFromMap(IdentityHashMap())
@@ -1148,6 +1152,7 @@ internal class LoadRun(
                     level.chunkSource.move(it)
                 }
                 ServerMachines.Stats.reset()
+                phaseWindow = ServerMachines.Stats.window
                 // スポーンチャンクに重なると読み込まれたままになるので、この段階だけスポーンチャンクをなくす
                 val rule = level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS)
                 savedSpawnChunkRadius = rule.get()
@@ -1173,7 +1178,7 @@ internal class LoadRun(
             LoadPhase.AUTOSAVE -> {
                 val r = autosaveResult!!
                 if (r.written + r.skipped != settings.count.toLong()) fail("the autosave should visit all ${settings.count} machines: $r")
-                verifyCounted(p, r.cost)
+                verifyCounted(p, r.cost, handedToWriter = r.written, exact = false)
                 val notRunning = computers.count { it.case.computer.machine?.state != MachineState.RUNNING }
                 if (notRunning > 0) fail("$notRunning computers stopped during the autosave")
             }
@@ -1187,7 +1192,7 @@ internal class LoadRun(
                 // 計算している間はプロンプトに戻らない
                 if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
-            LoadPhase.UNLOAD -> verifyCounted(p, unloadResult!!.cost)
+            LoadPhase.UNLOAD -> unloadResult!!.let { verifyCounted(p, it.cost, handedToWriter = it.captures, exact = true) }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
                 if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
@@ -1196,14 +1201,27 @@ internal class LoadRun(
     }
 
     /**
-     * 段階に予約した書き込みが、すべて保存の手間と大きさの表（書けた・書けなかった）に入ったか（#602）。
-     * #614 の前は、書き込みのスレッドを `writerFlushMillis`（30 秒）まで待って打ち切っていたので、待ち切れなかった分が表から落ちていた。
-     * [awaitPhaseSaves] を通った後なら作りの上で成り立つので、遅いマシンでも揺れない
+     * 段階に予約した書き込みが、すべて保存の手間と大きさの表（書けた・書けなかった）に入ったか（#602）。次の3つを確かめる。
+     * 1. 段階の途中で [ServerMachines.Stats.reset] が呼ばれていない（区間の番号が段階の始めのまま）。reset は予約・完了・書けた数を同時に 0 にし、
+     *    前の区間の完了は数え口に入れないので、途中で呼ばれても 2. は成り立ったままになり、2. だけでは気づけない
+     * 2. 書けた数 + 書けなかった数 == 予約した数。#614 の前は、書き込みのスレッドを `writerFlushMillis`（30 秒）まで待って打ち切っていたので、
+     *    待ち切れなかった分が表から落ちていた。[awaitPhaseSaves] が全部の完了を待つので、これは作りの上で成り立つ。落ちるのは、
+     *    待ちを打ち切りに戻したときだけ
+     * 3. 予約した数と、段階が書き込みに回した台の数（[handedToWriter]。予約の数え口とは別のところで数える）の関係。
+     *    アンロードは、取り出しに成功した台だけを数える（`unloadCaptures`）ので、予約した数と一致する（[exact]）。
+     *    自動保存の `written` は、`captureAndSubmit` が null を返した台（CRASHED・復元中など）も「回した」に数える（AutosaveRotation）ので、
+     *    予約した数は `written` 以下であればよい。予約が回した台より多ければ、数え口か回し方のどちらかが壊れている。
+     *    「回した台に対して表が足りない」差は、報告の「書き込みに回した台」と「予約した書き込み」を並べて読む
      */
-    private fun verifyCounted(p: LoadPhase, cost: SaveCost) {
+    private fun verifyCounted(p: LoadPhase, cost: SaveCost, handedToWriter: Long, exact: Boolean) {
+        val window = ServerMachines.Stats.window
+        if (window != phaseWindow) fail("the save statistics were reset in the middle of the $p phase (window $phaseWindow -> $window)")
         val counted = cost.saves + cost.writer.failures
         if (counted != cost.submitted) {
             fail("${cost.submitted} saves were queued in the $p phase, but $counted were counted (${cost.saves} written, ${cost.writer.failures} failed)")
+        }
+        if (if (exact) cost.submitted != handedToWriter else cost.submitted > handedToWriter) {
+            fail("${cost.submitted} saves were queued in the $p phase, but the phase handed ${if (exact) "" else "at most "}$handedToWriter machines to the writer")
         }
     }
 
