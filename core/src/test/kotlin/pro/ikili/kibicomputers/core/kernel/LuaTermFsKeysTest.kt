@@ -29,6 +29,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.Written
 import pro.ikili.kibicomputers.core.kernel.vfs.fsError
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.wasi.p1.P1
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -289,6 +290,187 @@ class LuaTermFsKeysTest {
         for (s in listOf("zz", "yy", "^[", "\u001b[A")) assertFalse(r.text.contains(s), "$s がエコーされた: ${r.text}")
         assertEquals(TtyMode.COOKED, mode)
         assertEquals(0, leftover, "TTY に入力が残っている")
+    }
+
+    // ---- 同じ TTY のほかの読み手（#838） ----
+
+    private fun Machine.fd0Flags(pid: Int): Long? = lock.withLockValue { kernel.processes[pid]?.handles?.get(0)?.flags }
+
+    private fun Long?.nonblock(): Boolean = this != null && this and P1.FDFLAGS_NONBLOCK.toLong() != 0L
+
+    /**
+     * [script] を `lua` で、[others] の各コマンドと一緒に動かす。どれも親のない exec に [StdioSpec.INHERIT] を渡し、コンソールの TTY を
+     * fd 0 に持たせる。[beforeRun] は exec の後、最初の tick の前に呼ぶ。[driver] は Lua が終わるまで tick ごとに呼ぶ。
+     * [after] は Lua が終わった後、ほかのプロセスを殺す前に呼ぶ
+     */
+    private fun luaWith(
+        script: String,
+        others: List<List<String>>,
+        files: Map<String, String> = emptyMap(),
+        fuelSlice: Long? = null,
+        beforeRun: (Machine, Int) -> Unit = { _, _ -> },
+        driver: (Machine, Int, List<Int>, String) -> Unit,
+        after: (Machine, List<Int>) -> Unit = { _, _ -> },
+    ): Result = Harness(execRuntime = EndiveRuntime()).use { h ->
+        val host = ConsoleHost()
+        val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024, fuelSlice = fuelSlice)
+        m.vfs.mount(VfsPath.ROOT, image, readOnly = true, source = "disk:image:os")
+        m.vfs.mount(VfsPath.parse("/home"), TestMemoryFileSystem(), readOnly = false, source = "test:home")
+        m.resizeConsole(40, 10)
+        m.put("/home/t.lua", script.trimIndent() + "\n")
+        for ((path, text) in files) m.put(path, text.trimIndent() + "\n")
+        val env = mapOf("PATH" to "/bin", "HOME" to "/home")
+        fun spawn(args: List<String>): Int = m.exec(
+            "/bin/${args[0]}",
+            KernelDrivers.DEFAULT,
+            SpawnOptions(stdio = StdioSpec.INHERIT, args = args, env = env, cwd = "/home", fds = SpawnOptions.ROOT_PREOPEN),
+        )
+        val otherPids = others.map { spawn(it) }
+        val pid = spawn(listOf("lua", "/home/t.lua"))
+        beforeRun(m, pid)
+        eventuallyDescribe(150_000, { "終わらない: ${host.text()}" }) {
+            h.scheduler.tick()
+            driver(m, pid, otherPids, host.text())
+            Thread.sleep(1)
+            m.stateOf(pid).isTerminal
+        }
+        val exitCode = m.lock.withLockValue { m.kernel.processes[pid]!!.exitCode }
+        repeat(5) { h.scheduler.tick() }
+        after(m, otherPids)
+        for (o in otherPids) m.lock.withLockValue { m.killLocked(o, KillSignal.KILL) }
+        repeat(5) { h.scheduler.tick() }
+        Result(host.bytes(), host.text(), m.stateOf(pid), exitCode)
+    }
+
+    private val timerLine = Regex("t([0-9]+)\\n")
+
+    @Test
+    fun `同じTTYのほかの読み手が先に読み切っても、読み捨ては次の入力を待たず、ほかの読み手のfdはNONBLOCKにならない`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var attached = false
+        var bursts = 0
+        var waitFor = 0
+        var luaChecked = 0
+        var readerNonblock = false
+        var luaNonblockWhileWaiting = false
+        var mode: TtyMode? = null
+        var readerAlive = false
+        // 読めることを見てから別の呼び出しで待つ fd_read をすると、その間にもう1つの読み手が読み切ったとき、次の入力まで止まる（#838）。
+        // キーと文字を1回送るたびに、次の入力を送らずに、Lua がタイマーで2回起きるのを待つ（止まれば、そこで進まなくなる）。
+        // 割り込みは、Lua が見てから読むまでの間（燃料を確かめるところ1つ分）で CPU を譲り、その間にもう1つの読み手が残りを読んだときに起きる。
+        // スライスを小さくし、読み手は1バイトずつ読ませ、文字の長さを変えて、行き来を増やす。窓が狭く順は決められないので、
+        // 直す前のコードでも手元では止まらなかった（止まる順を作るには本番のコードにフックが要る）。ここで確かめるのは、
+        // ほかの読み手と一緒でも止まらないこと、ほかの読み手の fd 0 が NONBLOCK にならないこと、待つ間の Lua の fd 0 が元に戻っていること
+        val r = luaWith(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            local n = 0
+            os.startTimer(0.05)
+            while n < 70 do
+              local e = os.pullEvent()
+              if e == 'timer' then
+                n = n + 1
+                print('t' .. n)
+                os.startTimer(0.02)
+              end
+            end
+            print('done')
+            """,
+            // バッファなしで1バイトずつ読む（Lua は待たないので、TTY のモードには触らない）
+            others = listOf(listOf("lua", "/home/r.lua")),
+            files = mapOf(
+                "/home/r.lua" to """
+                io.stdin:setvbuf('no')
+                while io.read(1) do end
+                """,
+            ),
+            fuelSlice = 200,
+            driver = { m, pid, others, text ->
+                if (others.any { m.fd0Flags(it).nonblock() }) readerNonblock = true
+                // イベントを待っている間（読み捨ての外）は、Lua の fd 0 も元のフラグに戻っている
+                m.lock.withLockValue {
+                    val p = m.kernel.processes[pid]
+                    if (p != null && p.state == ProcessState.WAITING_EVENT && m.consoleTtyLocked().mode == KEYS_MODE) {
+                        if (p.handles[0]?.flags.nonblock()) luaNonblockWhileWaiting = true
+                        luaChecked++
+                    }
+                }
+                if (!attached && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000838", keyboard))
+                    attached = true
+                }
+                val timers = timerLine.findAll(text).lastOrNull()?.groupValues?.get(1)?.toInt() ?: 0
+                if (attached && bursts < 30 && timers >= waitFor) {
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    keyboard.input(KeyboardEvent.Text("b".repeat(1 + bursts)))
+                    bursts++
+                    waitFor = timers + 2
+                }
+            },
+            after = { m, others ->
+                mode = m.consoleMode()
+                if (others.any { m.fd0Flags(it).nonblock() }) readerNonblock = true
+                readerAlive = others.all { !m.stateOf(it).isTerminal }
+            },
+        ).assertOk()
+        assertTrue(r.text.contains("t70\n"), r.text)
+        assertTrue(r.text.contains("done\n"), r.text)
+        assertEquals(30, bursts, r.text)
+        assertTrue(readerAlive, "読み手が先に終わった: ${r.text}")
+        assertTrue(luaChecked > 0, "Lua が待っているところを見られなかった")
+        assertFalse(luaNonblockWhileWaiting, "待っている間の Lua の fd 0 が NONBLOCK のまま")
+        assertFalse(readerNonblock, "もう1つの読み手の fd 0 が NONBLOCK になった")
+        assertEquals(TtyMode.COOKED, mode)
+    }
+
+    @Test
+    fun `fd 0が元からNONBLOCKなら、読み捨ての後もNONBLOCKのまま`() = timeout(limit) {
+        val keyboard = KeyboardDevice()
+        var step = 0
+        var flagsWhileWaiting: Long? = null
+        val r = luaWith(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.pullEvent('key')
+            print('got')
+            os.startTimer(0.3)
+            os.pullEvent('timer')
+            print('done')
+            """,
+            others = emptyList(),
+            beforeRun = { m, pid ->
+                // 親が NONBLOCK を立てた fd 0 を受け継いだ形
+                m.lock.withLockValue {
+                    val hs = m.kernel.processes[pid]!!.handles
+                    val e = hs[0]!!
+                    hs.insertAt(0, e.copy(flags = e.flags or P1.FDFLAGS_NONBLOCK.toLong()))
+                }
+            },
+            driver = { m, pid, _, text ->
+                if (step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000838", keyboard))
+                    keyboard.input(KeyboardEvent.Text("zz"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    step = 1
+                } else if (step == 1 && text.contains("got\n")) {
+                    // timer を待つ前の読み捨てで消える分
+                    keyboard.input(KeyboardEvent.Text("yy"))
+                    step = 2
+                } else if (step == 2) {
+                    m.lock.withLockValue {
+                        val p = m.kernel.processes[pid]
+                        if (p != null && p.state == ProcessState.WAITING_EVENT) flagsWhileWaiting = p.handles[0]?.flags
+                    }
+                }
+            },
+        ).assertOk()
+        assertTrue(r.text.contains("done"), r.text)
+        assertTrue(flagsWhileWaiting.nonblock(), "元の NONBLOCK が外れた: $flagsWhileWaiting")
+        assertFalse(r.text.contains("zz") || r.text.contains("yy"), r.text)
     }
 
     @Test
