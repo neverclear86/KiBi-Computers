@@ -3,9 +3,13 @@ package pro.ikili.kibicomputers.neoforge.gametest
 import net.minecraft.server.level.ServerLevel
 import net.neoforged.bus.api.EventPriority
 import net.neoforged.neoforge.common.NeoForge
+import net.minecraft.world.level.Level
+import net.neoforged.neoforge.event.level.LevelEvent
 import net.neoforged.neoforge.event.tick.LevelTickEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
+import org.slf4j.LoggerFactory
 import pro.ikili.kibicomputers.core.persist.SaveWriter
+import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import java.lang.management.ManagementFactory
 
 /**
@@ -20,7 +24,11 @@ import java.lang.management.ManagementFactory
  *   見張りは volatile の時刻だけを読み、[pro.ikili.kibicomputers.neoforge.machine.ServerMachines.Stats]（メインスレッドだけで使う）には触らない。
  *   名前は `KiBi-` で始めない（カーネルのスレッドに数えない）
  *
- * tick の中ではログに書かない（メインスレッドのファイルの書き込みそのものが止まりの候補なので）。結果は [takeSections]・[takeSamples] で取り、
+ * - 合成のログ（[syntheticLogEveryTicks] が 1 以上のとき。#834）: 本番のサーバーでメインスレッドが書くログ（プレイヤーの出入り・チャット・
+ *   他 MOD の info など）の代わりに、`ServerTickEvent.Post`（既定の優先度。区間 [Section.POST]）で [SYNTHETIC_LOGGER] に INFO を1行書き、
+ *   1行ごとの時間を数える（[takeSyntheticLog]）。INFO なので、本番と同じ log4j の設定で `latest.log`・`debug.log` の両方に書かれる
+ *
+ * tick の中では、合成のログのほかはログに書かない（メインスレッドのファイルの書き込みそのものが止まりの候補なので）。結果は [takeSections]・[takeSamples] で取り、
  * 段階の終わり（試験の処理の時間。MSPT に入らない）にまとめて出す。tick ごとの処理は区切りの数だけで、台数によらない。
  */
 internal class LoadTickProbe(private val serverThread: Thread, private val sampleStalls: Boolean) {
@@ -54,6 +62,7 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
      * @property tickStartNanos 止まった tick の始め（試験の呼び出しの後。[harnessEnd] の時刻）。長い tick の記録と突き合わせる
      * @property elapsedNanos 取ったときの、tick の始めからの時間
      * @property lastSection 取ったときに、最後に通った区切りの手前の区間（この後の区間の途中で止まっている）
+     * @property ioWorkers 取ったときに動いていた（`RUNNABLE` の）バニラの I/O のスレッド（`IO-Worker-`。リージョンファイルの書き込み）の名前とスタック（#834）
      */
     class StallSample(
         val tickStartNanos: Long,
@@ -65,7 +74,13 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
         val serverStack: List<StackTraceElement>,
         val writerState: Thread.State?,
         val writerStack: List<StackTraceElement>,
+        val ioWorkers: List<Pair<String, List<StackTraceElement>>> = emptyList(),
     )
+
+    /**
+     * 合成のログの数え口（#834）: 書いた行数、そのうち [STALL_MILLIS] 以上かかった行数、時間の合計と最大（ナノ秒）
+     */
+    class SyntheticLogStats(val lines: Int, val slowLines: Int, val totalNanos: Long, val maxNanos: Long)
 
     private val sections = LongArray(Section.entries.size)
 
@@ -87,6 +102,49 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
 
     @Volatile
     private var stopped = false
+
+    /** 合成のログを書く間隔（tick。0 なら書かない。#834）。メインスレッドだけで使う */
+    var syntheticLogEveryTicks: Int = 0
+    private var syntheticTick = 0L
+    private var syntheticLines = 0
+    private var syntheticSlow = 0
+    private var syntheticTotal = 0L
+    private var syntheticMax = 0L
+
+    /**
+     * オーバーワールドの `LevelEvent.Save`（バニラの保存の中。`saveAllChunks` の始め）が最後に来たときの、KiBi の書き込み待ちの仕事の数（#834）。
+     * -1 はまだ来ていない。[armLevelSave] で -1 に戻す。メインスレッドだけで使う
+     */
+    var pendingAtLevelSave: Int = -1
+        private set
+
+    fun armLevelSave() {
+        pendingAtLevelSave = -1
+    }
+
+    /** ここまでの合成のログの数え口を渡して 0 に戻す */
+    fun takeSyntheticLog(): SyntheticLogStats {
+        val r = SyntheticLogStats(syntheticLines, syntheticSlow, syntheticTotal, syntheticMax)
+        syntheticLines = 0
+        syntheticSlow = 0
+        syntheticTotal = 0
+        syntheticMax = 0
+        return r
+    }
+
+    private fun syntheticLog() {
+        val every = syntheticLogEveryTicks
+        if (every <= 0) return
+        syntheticTick++
+        if (syntheticTick % every != 0L) return
+        val t0 = System.nanoTime()
+        SYNTHETIC.info("Synthetic main thread log line {} (load test, #834)", syntheticTick)
+        val d = System.nanoTime() - t0
+        syntheticLines++
+        syntheticTotal += d
+        if (d > syntheticMax) syntheticMax = d
+        if (d >= STALL_MILLIS * 1_000_000L) syntheticSlow++
+    }
 
     fun start() {
         active = this
@@ -185,6 +243,7 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
                 serverStack = serverStack,
                 writerState = w?.state,
                 writerStack = w?.stackTrace?.take(WRITER_STACK_DEPTH) ?: emptyList(),
+                ioWorkers = runningIoWorkers(),
             )
             synchronized(samples) {
                 if (samples.size < MAX_SAMPLES) samples += sample else droppedSamples++
@@ -211,6 +270,13 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
         private const val SERVER_STACK_DEPTH = 48
         private const val WRITER_STACK_DEPTH = 16
 
+        /** バニラの I/O のスレッドの名前の始め（`Util.ioPool`。`IOWorker` のリージョンファイルの読み書き） */
+        private const val IO_WORKER_PREFIX = "IO-Worker-"
+
+        /** 合成のログのロガーの名前（#834）。`kibicomputers` の下にしない（core のログの JUL の写しに混ぜない） */
+        const val SYNTHETIC_LOGGER: String = "LoadTestSyntheticLog"
+        private val SYNTHETIC = LoggerFactory.getLogger(SYNTHETIC_LOGGER)
+
         @Volatile
         private var active: LoadTickProbe? = null
         private var installed = false
@@ -225,15 +291,30 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
             bus.addListener(EventPriority.HIGHEST, false, LevelTickEvent.Pre::class.java) { if (it.level is ServerLevel) active?.mark(Section.SERVER) }
             bus.addListener(EventPriority.LOWEST, false, LevelTickEvent.Post::class.java) { if (it.level is ServerLevel) active?.mark(Section.LEVELS) }
             bus.addListener(EventPriority.HIGHEST, false, ServerTickEvent.Post::class.java) { active?.mark(Section.AFTER_HARNESS) }
+            bus.addListener(EventPriority.NORMAL, false, ServerTickEvent.Post::class.java) { active?.syntheticLog() }
+            bus.addListener(EventPriority.NORMAL, false, LevelEvent.Save::class.java) {
+                val level = it.level
+                if (level is ServerLevel && level.dimension() == Level.OVERWORLD) {
+                    active?.let { a -> a.pendingAtLevelSave = WorldMachineSaves.current?.pendingCount ?: -1 }
+                }
+            }
             bus.addListener(EventPriority.LOWEST, false, ServerTickEvent.Post::class.java) { active?.mark(Section.POST) }
         }
 
-        private fun findThread(name: String): Thread? {
+        private fun allThreads(): List<Thread> {
             var group = Thread.currentThread().threadGroup
             while (group.parent != null) group = group.parent
             val threads = arrayOfNulls<Thread>(group.activeCount() * 2 + 16)
             val n = group.enumerate(threads, true)
-            return (0 until n).mapNotNull { threads[it] }.firstOrNull { it.name == name }
+            return (0 until n).mapNotNull { threads[it] }
         }
+
+        private fun findThread(name: String): Thread? = allThreads().firstOrNull { it.name == name }
+
+        /** 動いている（`RUNNABLE` の）バニラの I/O のスレッドのスタック。待っているものは入れない */
+        private fun runningIoWorkers(): List<Pair<String, List<StackTraceElement>>> =
+            allThreads().filter { it.name.startsWith(IO_WORKER_PREFIX) && it.state == Thread.State.RUNNABLE }
+                .map { it.name to it.stackTrace.take(WRITER_STACK_DEPTH) }
+                .filter { it.second.isNotEmpty() }
     }
 }

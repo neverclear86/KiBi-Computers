@@ -586,6 +586,17 @@ object ServerMachines {
         rotation.startCycle(tracked.filter { it in onlySet && it.computer.machine != null && !it.computer.isRestoring })
     }
 
+    /**
+     * 自動保存の周期の数え口を、[ticksUntilCycle] tick 後の tick の始め（`ServerTickEvent.Pre`）に周期が来るように合わせる
+     * （負荷試験の本番の形の段階用。#834。本番では呼ばない）。周期は本物の経路（[autosaveTick] の `% autosavePeriodTicks`）で始まる。
+     * 1 は次の tick。[MachineSaveConfig.autosavePeriodTicks] より小さくする
+     */
+    internal fun alignAutosaveCounter(ticksUntilCycle: Long) {
+        val period = saveConfig.autosavePeriodTicks
+        require(ticksUntilCycle in 1 until period) { "ticksUntilCycle must be in 1 until $period: $ticksUntilCycle" }
+        autosaveTicks = period - ticksUntilCycle
+    }
+
     /** 自動保存の周期が終わっている（負荷試験用） */
     internal val isAutosaveCycleDone: Boolean
         get() = rotation.isCycleDone
