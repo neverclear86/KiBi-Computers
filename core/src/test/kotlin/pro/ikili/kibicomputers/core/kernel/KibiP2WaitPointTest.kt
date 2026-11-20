@@ -22,6 +22,8 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.time.ManualClock
+import pro.ikili.kibicomputers.core.kernel.time.ManualTimerService
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -410,7 +412,7 @@ class KibiP2WaitPointTest {
 
     /**
      * `invoke` の「起きないはず」の守りを確かめるコマンド。`defer` を呼んで `failed("interrupted")` を受け取り（テストが待ちを忘れさせる）、
-     * 時計で 100 ms 待ち（その間にテストが古い待ちを戻す）、もう一度 `defer` を呼んで ok を受け取る。食い違った段は終了コードにする
+     * 時計で 100 ms 待ち（手で進める時計。テストが古い待ちを戻してから進める）、もう一度 `defer` を呼んで ok を受け取る。食い違った段は終了コードにする
      */
     private val deviceGuardCommand: ByteArray by lazy {
         val wat = """
@@ -465,7 +467,7 @@ class KibiP2WaitPointTest {
 
     /**
      * `spawn` の「起きないはず」の守りを確かめるコマンド。`/bin/ok` を `spawn`（読み込みで巻き戻る。テストが待ちを忘れさせる）し、
-     * 時計で 100 ms 待ち（その間にテストが古い待ちを戻す）、子のハンドルを drop して `/bin/none` を `spawn`（`no-entry`）し、来ない時計で待つ。
+     * 時計で 100 ms 待ち（手で進める時計。テストが古い待ちを戻してから進める）、子のハンドルを drop して `/bin/none` を `spawn`（`no-entry`）し、来ない時計で待つ。
      * 食い違った段は終了コードにする
      */
     private val spawnGuardCommand: ByteArray by lazy {
@@ -535,8 +537,12 @@ class KibiP2WaitPointTest {
         }
     }
 
-    /** [bytes] のコマンドを待機点型のプロセスとして動かす */
-    private class Run(val h: Harness, val m: Machine, bytes: ByteArray) {
+    /**
+     * [bytes] のコマンドを待機点型のプロセスとして動かす。
+     * [timers] は、台が手で進める時計（[manualTimers]）を使うときの、その時計のタイマー。
+     * テストのスレッドがカーネルロックの外で `advance` して、時計の待ちを起こす
+     */
+    private class Run(val h: Harness, val m: Machine, bytes: ByteArray, val timers: ManualTimerService? = null) {
         val program: Program = Program.component(ComponentProgram.load(LinkTesting.runtime, bytes, KernelComponentHost))
         val pid: Int = m.spawn(program, KernelDrivers.DEFAULT.create(program), SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)))
 
@@ -582,8 +588,19 @@ class KibiP2WaitPointTest {
         n
     }
 
-    private fun device(block: (Harness, Machine, Dev) -> Unit) = Harness(execRuntime = EndiveRuntime()).use { h ->
-        val m = h.machine(fuelPerTick = 10_000_000)
+    /** 手で進める時計のタイマー。時計の待ちを、テストが [ManualTimerService.advance] するまで起こさない */
+    private fun manualTimers() = ManualTimerService(ManualClock())
+
+    /** [timers] があれば、台の時計とタイマーをそれにする */
+    private fun Harness.machineWith(timers: ManualTimerService?): Machine =
+        if (timers == null) {
+            machine(fuelPerTick = 10_000_000)
+        } else {
+            machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().clock(timers.clock).build())
+        }
+
+    private fun device(timers: ManualTimerService? = null, block: (Harness, Machine, Dev) -> Unit) = Harness(execRuntime = EndiveRuntime(), timers = timers).use { h ->
+        val m = h.machineWith(timers)
         val dev = Dev()
         assertTrue(m.devices.attach(ADDRESS, dev))
         block(h, m, dev)
@@ -676,12 +693,16 @@ class KibiP2WaitPointTest {
         m.vfs.write(f, bytes, 0, bytes.size)
     }
 
-    /** 子の読み込みを止めたまま、親が `spawn-with-handles` で待つところまで進める */
-    private fun gated(command: ByteArray = spawnCommand, block: Run.(GatedRuntime) -> Unit) = timeout(limit) {
+    /**
+     * 子の読み込みを止めたまま、親が `spawn-with-handles` で待つところまで進める。
+     * [manualClock] なら、台の時計を手で進める時計にする（[Run.timers]。時計の待ちはテストが進めるまで起きない）
+     */
+    private fun gated(command: ByteArray = spawnCommand, manualClock: Boolean = false, block: Run.(GatedRuntime) -> Unit) = timeout(limit) {
         val runtime = GatedRuntime(EndiveRuntime())
-        Harness(execRuntime = runtime).use { h ->
+        val timers = if (manualClock) manualTimers() else null
+        Harness(execRuntime = runtime, timers = timers).use { h ->
             try {
-                val m = h.machine(fuelPerTick = 10_000_000)
+                val m = h.machineWith(timers)
                 m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
                 m.vfs.createDirectory(VfsPath.parse("/bin"))
                 writeFile(m, "/bin/hello", P2Testing.wrap("hello-wasi"))
@@ -689,7 +710,7 @@ class KibiP2WaitPointTest {
                 // 読み込みだけが失敗する実行ファイル（読み込みを失敗させるのは GatedRuntime.failLoad）
                 writeFile(m, "/bin/bad", RuntimeSelfCheck.RUN_COMMAND_COMPONENT)
                 assertTrue(m.devices.attach(ADDRESS, Dev()))
-                val r = Run(h, m, command)
+                val r = Run(h, m, command, timers)
                 r.tickUntil("読み込みに入らない") { runtime.loads.get() > 0 || r.state().isTerminal }
                 assertTrue(runtime.loads.get() > 0, "読み込みに入る前に終わった: ${r.state()} 終了コード ${m.lock.withLockValue { m.kernel.processes[r.pid]?.exitCode }} ${r.rt.lastError}")
                 r.tickUntil("spawn で待たない: ${r.state()}") { r.state() == ProcessState.WAITING_EVENT && r.suspend.pendingSpawn != null }
@@ -813,8 +834,9 @@ class KibiP2WaitPointTest {
 
     @Test
     fun `巻き直して着いたのにinvokeの待ちがなければinterruptedで返してメソッドを呼び直さず、新しい呼び出しは残った待ちを閉じてから始める`() = timeout(limit) {
-        device { h, m, dev ->
-            val r = Run(h, m, deviceGuardCommand)
+        val timers = manualTimers()
+        device(timers) { h, m, dev ->
+            val r = Run(h, m, deviceGuardCommand, timers)
             r.awaitDefer(dev, 1)
             r.assertParked()
             assertEquals(2, r.hostResources())
@@ -828,6 +850,8 @@ class KibiP2WaitPointTest {
             assertEquals(1, pendingCallObjects(m))
             // (2) 新しい invoke の時点で前の待ちが残っている（起きないはず）: 閉じてから最初から行う
             r.suspend.pendingInvoke = stale
+            // 待ちを戻してから時計を 100 ms 進める（手で進める時計なので、戻す前に親が起きて 2 回目の invoke に進むことはない）
+            timers.advance(100_000_000L)
             r.awaitDefer(dev, 2)
             r.assertParked()
             assertNotSame(stale, r.suspend.pendingInvoke, "残っていた待ちをそのまま使った")
@@ -841,7 +865,7 @@ class KibiP2WaitPointTest {
     }
 
     @Test
-    fun `巻き直して着いたのにspawnの読み込みがなければbeginExecからやり直して子は1つだけ、新しい呼び出しは残った読み込みを閉じてから始める`() = gated(spawnGuardCommand) { runtime ->
+    fun `巻き直して着いたのにspawnの読み込みがなければbeginExecからやり直して子は1つだけ、新しい呼び出しは残った読み込みを閉じてから始める`() = gated(spawnGuardCommand, manualClock = true) { runtime ->
         assertParked()
         val spawned = Collections.synchronizedList(ArrayList<Int>())
         h.scheduler.hooks.duringSpawn = { _, child -> spawned += child }
@@ -857,6 +881,8 @@ class KibiP2WaitPointTest {
         assertNotNull(m.lock.withLockValue { m.kernel.objects[staleId] }, "忘れた読み込みの待ちがもう閉じている（前提が崩れた）")
         // (2) 新しい spawn の時点で前の読み込みが残っている（起きないはず）: 閉じてから最初から行う（残っていた読み込みで子を作らない）
         suspend.pendingSpawn = stale
+        // 読み込みを戻してから時計を 100 ms 進める（手で進める時計なので、子が終わるのを待つ間や戻す前に、親が起きて 2 回目の spawn に進むことはない）
+        timers!!.advance(100_000_000L)
         // /bin/none の spawn が no-entry で返り、来ない時計で待つ（表は pollable だけ）
         awaitParked("2 回目の spawn の後で待たない") { hostResources() == 1 }
         assertEquals(1, spawned.size, "残っていた読み込みで子を作った: $spawned")

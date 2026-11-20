@@ -152,7 +152,12 @@ internal class Program private constructor(
          * （同じキーで別の読み方をしないように、見分けをここ 1 か所に置く）。ヘッダーで見分け（[isComponent]）、
          *
          * - コンポーネント: [ComponentProgram.load] で読み込んでリンクの計画まで作る（ホストは [host]。[waitImports] は使わず、コンポーネント全体の解析で決めて、常に待機点への変換をかける（#757）。
-         *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
+         *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。待機点に変換できない作り（asyncify が扱えない命令、ゲストからゲストへの呼び出しの
+         *   下の待ち、resource の dtor の中の待ち）は、`BLOCKING` で動かさずに [WasmLoadException] で断る（#844。#801 の結論。p1 の [loadMetered] と同じく、
+         *   原因は [AsyncifyUnsupported] で [unsuspendableReason] で取り出せる。失敗は `ProgramCache` が覚える）。断る判断はここで渡す
+         *   `requireWaitPoints` で、中のコンパイルの前に止める。止まりうる関数がないものは、止まりうる関数の中の作り（v128 のローカルなど）では断らない（#384 と同じ）。
+         *   ただし、グローバル・要素セグメントの定数式の `v128.const` は、止まりうる関数がなくても、計測コードの挿入（`FuelInjector`）と変換で断られる
+         *   （p1 と同じ。#851）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
          *   中の core モジュールに当てる。上限を外す道は作らない（検証の時間の上限と見張りの前提。ADR 0666）
          * - core モジュール: [metered] なら [loadMetered]、でなければ [load]（今までどおり）
          *
@@ -172,7 +177,7 @@ internal class Program private constructor(
         ): Program {
             if (isComponent(bytes)) {
                 val componentLimits = ComponentLimits(moduleLimits = limits ?: ModuleLimits.DEFAULT)
-                return component(ComponentProgram.load(runtime, bytes, host, metered, componentLimits))
+                return component(ComponentProgram.load(runtime, bytes, host, metered, componentLimits, requireWaitPoints = true))
             }
             return if (metered) loadMetered(runtime, bytes, limits, waitImports) else load(runtime, bytes, limits)
         }
@@ -234,7 +239,11 @@ internal class Program private constructor(
             return Program(hash, module, source, applied.fuelYield, applied.fuelYieldRejection, cacheWeight = bytes.size.toLong())
         }
 
-        /** [e] が、待機点に変換できない作りのために [loadMetered] が断ったものなら、その理由（どの命令・どの機能か）。違えば `null` */
+        /**
+         * [e] が、待機点に変換できない作りのために断ったもの（p1 の [loadMetered]、コンポーネントの [loadExecutable]（`requireWaitPoints`））なら、その理由。
+         * p1 では、どの関数の、どの命令・どの機能か。コンポーネントでは、それに加えて、ゲストからゲストへの呼び出しの下の待ち・dtor の中の待ちなど、
+         * コンポーネントのリンクに関わる理由も入る。違えば `null`
+         */
         fun unsuspendableReason(e: WasmLoadException): String? = (e.cause as? AsyncifyUnsupported)?.let { it.message ?: "理由不明" }
     }
 }
