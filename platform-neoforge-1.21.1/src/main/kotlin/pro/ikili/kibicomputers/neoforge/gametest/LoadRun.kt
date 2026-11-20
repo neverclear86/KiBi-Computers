@@ -604,6 +604,12 @@ internal class LoadRun(
 ) {
     private class Computer(val case: CaseBlockEntity, val screen: ScreenBlockEntity, val keyboard: KeyboardBlockEntity) {
         var ready = false
+
+        /** 段階に入ったときの、この台の燃料切れの巻き戻しの回数（[LoadOs.computeProcess] の起動を台ごとに待つため） */
+        var unwindsAtPhase = 0L
+
+        /** 段階に入ってからの、この台の燃料切れの巻き戻しの回数（台のマシンがまだなければ 0） */
+        fun unwindsSincePhase(): Long = (case.computer.machine?.fuelUnwindCount ?: 0L) - unwindsAtPhase
     }
 
     private val level = helper.level
@@ -1115,7 +1121,7 @@ internal class LoadRun(
         if (waiting == 0) {
             if (!computeStarted()) {
                 if (phaseTick >= settings.outputTimeoutTicks) {
-                    val c = computeSet.firstOrNull { !hasComputeProcess(it) }
+                    val c = computeSet.firstOrNull { !hasComputeProcess(it) || it.unwindsSincePhase() <= 0 }
                     fail(
                         "the compute command did not start within ${settings.outputTimeoutTicks} ticks " +
                             "(fuel since the phase began: ${FuelCounts.current() - fuelAtPhase}; " +
@@ -1132,14 +1138,15 @@ internal class LoadRun(
     }
 
     /**
-     * [LoadOs.computeProcess] のある OS で、計算させる台の全部にそのプロセスがあり、段階に入ってから燃料切れの巻き戻しが
-     * 計算させる台の数より多く増えたか（#821）。コマンドの読み込み（検証・変換・コンパイル）と起動の途中（realloc の中の燃料切れは
-     * 巻き戻せないので、スレッドを持って待つ。ADR 0757）を測らないため。ないなら、いつも真
+     * [LoadOs.computeProcess] のある OS で、計算させる台の全部にそのプロセスがあり、全部の台が段階に入ってから燃料切れで巻き戻したか（#821）。
+     * コマンドの読み込み（検証・変換・コンパイル）と起動の途中（realloc の中の燃料切れは巻き戻せないので、スレッドを持って待つ。ADR 0757）を
+     * 測らないため。起動が済んで main のループに入った台だけが巻き戻すので、台ごとの回数で見る（サーバー全体の累計だと、先に起動した
+     * 少数の台だけで超える）。ないなら、いつも真
      */
     private fun computeStarted(): Boolean {
         if (settings.os.computeProcess == null) return true
         if (!computeSet.all(::hasComputeProcess)) return false
-        return (FuelCounts.current() - fuelAtPhase).unwinds > computeSet.size
+        return computeSet.all { it.unwindsSincePhase() > 0 }
     }
 
     /** 台の、終わっていないプロセスの名前と状態（`Machine.describeProcesses` の `<pid>:<名前>=<状態> waits=...` から） */
@@ -1321,6 +1328,7 @@ internal class LoadRun(
         threads.resetPeakThreadCount()
         baselineKernelThreads = kernelThreadInfos().mapTo(HashSet()) { it.threadId }
         fuelAtPhase = FuelCounts.current()
+        for (c in computers) c.unwindsAtPhase = c.case.computer.machine?.fuelUnwindCount ?: 0L
         fuelAtMeasure = null
         peakFuelThreadWaits = 0
     }

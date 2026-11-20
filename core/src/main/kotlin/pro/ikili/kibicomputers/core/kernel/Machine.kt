@@ -303,6 +303,19 @@ public class Machine private constructor(
     /** 燃料の遅延補充 */
     internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
 
+    /** このマシンのプロセスが、燃料切れで巻き戻した回数（譲るための巻き戻しも数える。数え口） */
+    private val fuelUnwindsDone = AtomicLong()
+
+    /**
+     * このマシンのプロセスが、燃料切れ・譲るために巻き戻した回数（#821）。接続層の負荷試験が、台ごとに計算するコマンドの起動が済んだか
+     * （起動の途中は巻き戻せず、スレッドを持って待つことがある。ADR 0757）を見るために読む
+     */
+    public val fuelUnwindCount: Long get() = fuelUnwindsDone.get()
+
+    internal fun countFuelUnwind() {
+        fuelUnwindsDone.incrementAndGet()
+    }
+
     /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
     internal val memoryAccount = MemoryAccount(config.memoryPages, scheduler.memoryAccount)
 

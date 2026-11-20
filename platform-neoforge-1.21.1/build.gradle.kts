@@ -187,10 +187,19 @@ val zipLoadTestP2Image = tasks.register<Zip>("zipLoadTestP2Image") {
     group = "build"
     description = "Builds the load test image (loadtest-p2.zip): the standard OS image plus a computing p2 command as /bin/spin."
     from(coreOsImage.flatMap { it.archiveFile }.map { zipTree(it) })
-    from(files(core.layout.buildDirectory.dir("generated/wasi-sdk/fuel-spin-p2")) { builtBy(coreFuelSpinP2) }) {
-        include("kibicomputers/wasm-native/fuel-spin-p2.wasm")
+    // core のタスクの出力ディレクトリ（コンポーネントの .wasm はその1つだけ）を、タスクの出力から取る。出力先や名前が変わっても追従する
+    from(coreFuelSpinP2.map { it.outputs.files }) {
+        include("**/*.wasm")
         eachFile { path = "bin/spin" }
         includeEmptyDirs = false
+    }
+    // `/bin/spin` が入らない（include が何にも当たらない）イメージをエラーなしで作らない。それだと、`-PloadTestOs=standard-p2` の時間切れまで気づけない
+    doLast {
+        val image = archiveFile.get().asFile
+        val entries = zipTree(image).matching { include("bin/spin") }.files
+        if (entries.size != 1 || entries.single().length() == 0L) {
+            throw GradleException("${image.name} に /bin/spin（fuel-spin-p2.wasm）が入っていない。core の compileFuelSpinP2Wasm の出力を確かめる")
+        }
     }
     archiveFileName = "loadtest-p2.zip"
     destinationDirectory = layout.buildDirectory.dir("generated/loadtest-images/kibicomputers/images")

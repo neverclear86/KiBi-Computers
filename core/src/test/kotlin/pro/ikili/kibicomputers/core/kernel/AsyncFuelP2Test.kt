@@ -550,14 +550,23 @@ class AsyncFuelP2Test {
             println("多数台の p2 の燃料切れ: $ticks tick で巻き戻し $unwinds 回、スレッドを持って待った $blocking 回、スレッドを持つプロセスの最大 $maxThreads（${spins.size} 本）")
             assertTrue(unwinds > spins.size, "燃料切れで巻き戻していない")
             assertEquals(0, blocking, "スレッドを持ったまま燃料を待った")
-            // 接続層の負荷試験（#821）が読む口は、数え口と同じ値を返す
-            assertEquals(h.scheduler.fuelUnwinds.get(), h.scheduler.fuelUnwindCount)
-            assertEquals(h.scheduler.fuelBlockingWaits.get(), h.scheduler.fuelBlockingWaitCount)
-            assertEquals(h.scheduler.fuelOverdrafts.get(), h.scheduler.fuelOverdraftCount)
             // 動いている（許可を持つ）分だけがスレッドを持つ。許可を返してから登録を外すまでの間の重なりを見込んで 2 倍まで
             assertTrue(maxThreads <= permits * 2, "スレッドを持つプロセスが多すぎる: $maxThreads（${spins.size} 本）")
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
             for (s in spins) s.m.lock.withLockValue { s.m.killLocked(s.pid, KillSignal.KILL) }
+            // 接続層の負荷試験（#821）が読む口は、数え口と同じ値を返す。動いている間は別スレッドが数え口を増やすので、
+            // 全部殺して、走っているステップが終わり、数え口が止まってから比べる（2 回の読みの間の増分で落ちない）
+            eventually(30_000, "殺したのに数え口が止まらない") {
+                val a = h.scheduler.fuelUnwinds.get()
+                Thread.sleep(50)
+                val b = h.scheduler.fuelUnwinds.get()
+                a == b && h.scheduler.fuelUnwindCount == b && h.scheduler.fuelBlockingWaitCount == h.scheduler.fuelBlockingWaits.get() &&
+                    h.scheduler.fuelOverdraftCount == h.scheduler.fuelOverdrafts.get()
+            }
+            // 台ごとの巻き戻しの数（接続層の負荷試験が、台ごとに起動が済んだかを見る）の合計は、スケジューラ全体の巻き戻しと譲りの数と合う
+            val perMachine = spins.map { it.m }.distinct()
+            assertTrue(perMachine.all { it.fuelUnwindCount > 0 }, "巻き戻していない台がある")
+            assertEquals(h.scheduler.fuelUnwinds.get() + h.scheduler.fuelYields.get(), perMachine.sumOf { it.fuelUnwindCount })
         }
     }
 }
