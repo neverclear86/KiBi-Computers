@@ -295,6 +295,7 @@ internal class ProcessRunner(private val machine: Machine) {
             } else {
                 scheduler.fuelUnwinds.incrementAndGet()
             }
+            machine.countFuelUnwind()
             rt.fuelUnwindYield = false
             if (now != grantedTick) scheduler.dispatcher.signal()
         }

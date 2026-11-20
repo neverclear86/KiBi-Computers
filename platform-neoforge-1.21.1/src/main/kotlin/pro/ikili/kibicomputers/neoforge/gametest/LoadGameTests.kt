@@ -17,7 +17,6 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenSyncSender
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
-import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -30,7 +29,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる。Lua の REPL と標準 OS のシェルの両方で1回ずつ動かす（#476）。
  *   標準 OS の試験では最後にまとめてアンロードし、ケースのあるチャンクが全部アンロードされることも確かめる（#540）
  * - 測定用: `runLoadTestServer -PloadTestCounts=100,500,1000` で動く。台数ごとに MSPT・スレッド数・ヒープ使用量をログに書く。
- *   OS は `-PloadTestOs=lua|standard`（[LoadOs]。既定は Lua の REPL）。
+ *   OS は `-PloadTestOs=lua|standard|standard-p2`（[LoadOs]。既定は Lua の REPL。`standard-p2` は測定用だけ。#821）。
  *   テンプレートを名前空間 [MEASURE_NAMESPACE] のもの（`src/dev/resources`。jar には入らない）にして、
  *   測定用の起動（その名前空間だけを有効にする）でほかの GameTest が混ざらないようにする
  */
@@ -99,7 +98,8 @@ object LoadGameTests {
         val tests = ArrayList<TestFunction>()
         // 別のバッチにして、ほかのテストと同時に動かない（並べる範囲がテンプレートの外にはみ出すため）
         // OS ごとにも別のバッチにする（同じ範囲に並べるため）
-        for (os in LoadOs.entries) {
+        // CI で動かさない OS（p2 の計算。#821）は、jar の GameTest にない開発用のイメージを使う
+        for (os in LoadOs.entries.filter { it.ci }) {
             val suffix = if (os == LoadOs.LUA) "" else "_${os.id}"
             tests += TestFunction(
                 "kibicomputers_load_ci$suffix", "loadgametests.ci$suffix", "${KiBiComputers.MOD_ID}:${SmokeGameTests.EMPTY}",
@@ -246,8 +246,8 @@ object LoadGameTests {
             )
             helper.setBlock(case.south(), KiBiBlocks.KEYBOARD.get())
             val be = helper.getBlockEntity<CaseBlockEntity>(case)
-            // Lua の REPL で測るときは、テスト用の起動ディスクから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
-            if (os == LoadOs.LUA) be.fallbackBootDisk = ProvisionalBoot.TEST_BOOT_DISK
+            // Lua の REPL はテスト用の起動ディスク、p2 の計算（#821）は開発用のイメージから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
+            os.bootDisk?.let { be.fallbackBootDisk = it }
             // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる（TestComputerGameTests と同じ）
             for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
                 be.parts.setStackInSlot(be.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))
