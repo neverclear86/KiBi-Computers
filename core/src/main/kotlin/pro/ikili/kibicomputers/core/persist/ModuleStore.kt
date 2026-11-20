@@ -70,7 +70,12 @@ public interface ModuleStore {
 
 /**
  * ワールドごとのモジュールの置き場（#82）。`<root>/<SHA-256 の16進小文字>.wasm` に元のバイト列をそのまま置く。
- * 書くときは一時ファイル → fsync → `ATOMIC_MOVE`。同じハッシュはメモリの集合で1回だけ書く。消すのは #84（世代の掃除と一緒に）。
+ * 書くときは一時ファイル → fsync → `ATOMIC_MOVE`。同じハッシュはメモリの集合で1回だけ書く。
+ *
+ * 掃除（#564、ADR 0564）: 消してよいのは、作ったときに置き場にあったファイル（[sweepCandidates]）のうち、このセッションで [put]・[get] に
+ * 来ておらず（[touched]）、どの世代のファイルからも参照されていないものだけ（[deleteIfUnused]）。動いていて、まだ保存していない
+ * プロセスのモジュールはファイルに載っていないが、必ず [put]（起動・exec）か [get]（復元）を通るので [touched] で守る。
+ * 置き場はサーバーの起動ごとに作るので、[touched] はそのサーバーのすべての使用を覆う。
  */
 @ApiStatus.Internal
 public class FileModuleStore(private val root: Path) : ModuleStore {
@@ -79,6 +84,18 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
 
     /** 中身を確かめたハッシュ（16進。[put] はこれにあるときだけ書かずに戻る。種は入らない） */
     private val verified: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** このセッションで [put]・[get] に来たハッシュ（16進。掃除で消さない。#564） */
+    private val touched: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** 掃除が消そうとしているハッシュ（16進。[put] は、これにあるとき速い道を使わない。#564） */
+    private val deleting: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** 作ったときに置き場にあったファイルのハッシュ（16進。掃除の候補。#564。作った後は変えない） */
+    private val seeds = ArrayList<String>()
+
+    /** 作った時刻（ミリ秒。これより後に更新されたファイルは掃除しない。#564） */
+    private val createdMillis = System.currentTimeMillis()
 
     init {
         // 置き場にあるファイルの名前を集合の種にする（中身は get で確かめる）
@@ -89,7 +106,10 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
                         val name = p.fileName.toString()
                         if (name.endsWith(SUFFIX)) {
                             val hex = name.removeSuffix(SUFFIX)
-                            if (isHexName(hex) && Files.isRegularFile(p)) known += hex
+                            if (isHexName(hex) && Files.isRegularFile(p)) {
+                                known += hex
+                                seeds += hex
+                            }
                         }
                     }
                 }
@@ -101,11 +121,14 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
 
     override fun put(sha256: ByteArray, bytes: ByteArray): Boolean {
         val hex = ModuleStore.hex(sha256)
-        if (hex in verified) return true
+        // 使ったことを先に記す（掃除は「消す印 → touched を見る」の順。こちらは「touched → 消す印 → verified」の順に見る。#564）
+        touched += hex
+        if (hex !in deleting && hex in verified) return true
         require(ModuleStore.sha256(bytes).contentEquals(sha256)) { "バイト列のハッシュが $hex でない" }
         return try {
             synchronized(lockFor(hex)) {
-                if (hex in verified) return true
+                // 掃除はこの錠の中でファイルを消すので、ここでは消えた後の状態を見る
+                if (hex in verified && Files.isRegularFile(root.resolve(hex + SUFFIX))) return true
                 val file = root.resolve(hex + SUFFIX)
                 // 既にあって中身が合えば書かない（合わなければ書き直す）
                 if (Files.isRegularFile(file) && ModuleStore.sha256(Files.readAllBytes(file)).contentEquals(sha256)) {
@@ -144,6 +167,7 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
     @Throws(IOException::class)
     override fun get(sha256: ByteArray): ByteArray? {
         val hex = ModuleStore.hex(sha256)
+        touched += hex
         val file = root.resolve(hex + SUFFIX)
         if (!Files.isRegularFile(file)) {
             known -= hex
@@ -159,6 +183,69 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
         verified += hex
         known += hex
         return bytes
+    }
+
+    /** 掃除の候補（作ったときに置き場にあったファイルのハッシュ。16進。#564） */
+    public fun sweepCandidates(): List<String> = seeds.toList()
+
+    /** このセッションで [put]・[get] に来たか（#564。テスト・掃除の数え口） */
+    public fun isTouched(hex: String): Boolean = hex in touched
+
+    /**
+     * どの世代のファイルからも参照されていないと分かったハッシュ [hex] のファイルを消す（#564。書き込みのスレッドから呼ぶ）。
+     * このセッションで使った（[touched]）・作った後に更新された・ないなら消さない。消したらそのバイト数、消さなければ -1。
+     *
+     * 順: 消す印を立てる → [touched] を見る → ハッシュの錠の中で [touched] を見直し、集合から外してファイルを消す → 印を外す。
+     * [put] は「[touched] に入れる → 印を見る → [verified] を見る」の順なので、どちらかが必ず相手を見る（[put] は錠の中の遅い道で書き直す）。
+     * 集合（[known]）から外すのは [touched] を見た後なので、使っているプロセスの [contains] は偽にならない
+     */
+    public fun deleteIfUnused(hex: String): Long {
+        if (!isHexName(hex)) return -1
+        deleting += hex
+        try {
+            if (hex in touched) return -1
+            synchronized(lockFor(hex)) {
+                if (hex in touched) return -1
+                val file = root.resolve(hex + SUFFIX)
+                return try {
+                    if (!Files.isRegularFile(file)) return -1
+                    if (Files.getLastModifiedTime(file).toMillis() > createdMillis) return -1
+                    val size = Files.size(file)
+                    known -= hex
+                    verified -= hex
+                    Files.delete(file)
+                    size
+                } catch (e: IOException) {
+                    LOG.log(System.Logger.Level.WARNING, "モジュール $hex を置き場 $root から消せない: $e")
+                    -1
+                }
+            }
+        } finally {
+            deleting -= hex
+        }
+    }
+
+    /**
+     * 置き場に残った一時ファイル（`*.tmp`。[put] の途中で落ちたもの）のうち、作ったときより前のものを消す（#564。書き込みのスレッドから呼ぶ）。
+     * 消した数
+     */
+    public fun deleteStaleTemps(): Int {
+        var count = 0
+        try {
+            if (!Files.isDirectory(root)) return 0
+            Files.newDirectoryStream(root, "*.tmp").use { stream ->
+                for (path in stream) {
+                    try {
+                        if (Files.isRegularFile(path) && Files.getLastModifiedTime(path).toMillis() < createdMillis && Files.deleteIfExists(path)) count++
+                    } catch (e: IOException) {
+                        LOG.log(System.Logger.Level.WARNING, "置き場の一時ファイル $path を消せない: $e")
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            LOG.log(System.Logger.Level.WARNING, "置き場 $root の一時ファイルを読めない: $e")
+        }
+        return count
     }
 
     override fun toString(): String = "FileModuleStore($root)"

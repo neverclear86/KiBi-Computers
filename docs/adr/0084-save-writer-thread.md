@@ -116,6 +116,7 @@ claim は、ブロックエンティティの読み込み（`CaseBlockEntity.onL
 | `KEPT`（`owner.bin` なし）・`TAKEN_OVER` | `owner.bin` の書き込み（tmp → fsync → rename）1 回 | 0 回（書き込みのスレッドで書く。7a） |
 | `NEW_ID_*` | `assignNewId` の `owner.bin` の書き込み 1 回 | 0 回（最初の世代の前に書き込みのスレッドで書く） |
 | その ID の仕事が列に残っている | `awaitIdle` の待ち（上限 `writerFlushMillis`）。運んだ先の引き取りでも起きた | 読む前だけ（7b で外した ID のときだけ起きる） |
+| 掃除（#564、ADR 0564）がその ID を調べている | — | 読む前だけ、調べの仕事 1 件の待ち（先読みの値がある ID・掃除が消した ID は待たない） |
 
 **測った結果（#585。`runLoadTestServer -PloadTestClaimPaste=100,1000`、`docs/load-test.md` の「#585 の結果」）**: ケースだけを 1 tick に貼り、次の tick の claim を数えた（開発機、Windows・NTFS）。
 #585 の前は、写し 1,000 台で 1,000 回の fsync（合計 125.5 秒、1 回約 125 ms）、知らない ID 1,000 台で 1,000 回の読みと 1,000 回の fsync（合計 95 秒）、
@@ -221,4 +222,5 @@ claim は、その ID をこのサーバーで触っていない（claim・`dele
   NBT が欠番（失敗した予約）を指すこともある。戻した後に初めて書く世代は NBT の世代より大きい（`nextGeneration` のまま）
 - #564: 残ったディレクトリ（ID のない・印のない台）とモジュールの置き場の掃除。この Issue はクラッシュで残った `*.tmp` だけを片付ける。
   掃除でディレクトリを消しても、新しい ID の重なりの集合（`knownDirectories`）から外さなくてよい（多めに持つだけ）。外すなら、消せたと分かった後にメインスレッドで外す
+  - 追記（#564）: ADR 0564 で済んだ。`knownDirectories` からは外さない。調べ・削除・参照の読みは書き込みの列の仕事で、同時に 8 件（仮）まで
 - #251: `writerMaxPendingBytes`（仮 256 MiB）、`writerFlushMillis`（仮 30 秒）、`autosaveWritesPerTick`（仮 4）。圧縮のレベル（1 のまま）を上げるかは負荷試験の後に決める

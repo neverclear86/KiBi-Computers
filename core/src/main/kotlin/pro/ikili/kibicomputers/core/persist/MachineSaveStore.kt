@@ -9,7 +9,9 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.OptionalLong
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -124,6 +126,9 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 新しく振った `owner.bin` が書けなかったときに消えても、多めに持つ側に倒す）。動いている間に外から置かれたディレクトリは見ない
      */
     private val knownDirectories = HashSet<UUID>()
+
+    /** 開いたときに [root] にあった、UUID として読める名前（大文字も。そのままの綴り。#564 の掃除が使う。開いた後は変えない） */
+    private val scannedNames = ArrayList<String>()
 
     // ---- 書き込みのスレッドの持ち物 ----
 
@@ -303,6 +308,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                         if (name.length != UUID_NAME_LENGTH) continue
                         try {
                             knownDirectories += UUID.fromString(name)
+                            scannedNames += name
                         } catch (_: IllegalArgumentException) {
                             // UUID の名前でないものは読み飛ばす
                         }
@@ -1051,6 +1057,191 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
     }
 
+    // ---- 残ったディレクトリとモジュールの置き場の掃除（#564、ADR 0564） ----
+
+    /**
+     * 掃除の候補: 開いたときに [root] にあった名前のうち、正規の小文字の UUID のもの（[CanonicalUuid]）。大文字の名前は候補にしない
+     * （NTFS では、大文字の名前で消すと小文字の本物を消しうる）。メインスレッドだけが呼ぶ
+     */
+    public fun cleanupCandidates(): List<UUID> = scannedNames.mapNotNull { CanonicalUuid.parse(it) }.distinct()
+
+    /**
+     * [id] をこのサーバーで見たか（claim・振った・`delete`・掃除で消した・予約した・書けた・印を付けた・索引にある）。
+     * 見た ID のディレクトリは掃除しない（アンロードで索引から外れても、登録・印は残るので見たまま）。メインスレッドだけが呼ぶ
+     */
+    public fun seenThisSession(id: UUID): Boolean =
+        id in touched || owners.containsKey(id) || registrations.containsKey(id) || marks.containsKey(id) ||
+            reserved.containsKey(id) || inFlight.containsKey(id) || latest.containsKey(id) || index.ownerOf(id) != null
+
+    /**
+     * [id] のディレクトリを調べる仕事を書き込みの列に入れる（`owner.bin`・最新の更新時刻・世代のファイルの数・大きさ）。
+     * 結果は書き込みのスレッドで [sink] に1回渡す（列が閉じていれば、呼んだスレッドで [CleanupInspection.skipped] を渡す）。
+     * [cancelled] が真なら調べずに [CleanupInspection.skipped] を渡す。メインスレッドの表は触らない。復元の待ちには数えない
+     */
+    public fun inspectForCleanup(id: UUID, cancelled: () -> Boolean, sink: (CleanupInspection) -> Unit) {
+        enqueue(id, 0, {
+            sink(if (cancelled()) CleanupInspection.skipped(id) else inspectDirectory(id))
+            null
+        }, {
+            sink(CleanupInspection.skipped(id))
+            null
+        }, blocksRestore = false)
+    }
+
+    /**
+     * どの NBT からも指されていないと判定した [id] のディレクトリを消す仕事を、書き込みの列に入れる（#564）。このサーバーで見た ID
+     * （[seenThisSession]）なら何もせずに `false`。入れたら、その ID は「このサーバーで消した」として扱い（claim はディスクを読まずに
+     * `owner.bin` がないとする。[delete] と同じ）、見た ID になる。
+     *
+     * 仕事の中で調べ直し、判定に使った最新の更新時刻 [judgedNewestMillis] より新しいものがある・調べられないときは消さない。
+     * [sink] には消したバイト数（もうなかったら 0、消さなかったら -1）を書き込みのスレッドで1回渡す。消さなかったときは、
+     * メインスレッドで [cleanupDeletionSkipped] を呼ぶ
+     */
+    public fun deleteUnreferenced(id: UUID, judgedNewestMillis: Long, sink: (Long) -> Unit): Boolean {
+        if (seenThisSession(id)) return false
+        deletedIds += id
+        touch(id)
+        enqueue(id, 0, {
+            val now = inspectDirectory(id)
+            when {
+                !now.exists -> sink(0)
+                now.error != null || now.newestMillis > judgedNewestMillis -> {
+                    LOG.log(System.Logger.Level.INFO, "Keeping the directory of $id: it changed after the cleanup judged it (${now.error ?: "newer files"})")
+                    sink(-1)
+                }
+                else -> {
+                    deleteDirectory(id)
+                    sink(if (Files.exists(directoryOf(id))) -1 else now.bytes)
+                }
+            }
+            null
+        }, {
+            sink(-1)
+            null
+        })
+        return true
+    }
+
+    /**
+     * [deleteUnreferenced] の仕事が消さなかった [id] を、「このサーバーで消した」から外す（claim がディスクの `owner.bin` を読むように）。
+     * その間に claim していれば（覚えている `owner.bin` がある）何もしない。メインスレッドだけが呼ぶ
+     */
+    public fun cleanupDeletionSkipped(id: UUID) {
+        if (!owners.containsKey(id)) deletedIds -= id
+    }
+
+    /**
+     * モジュールの参照を読むディレクトリの名前: 開いたときに [root] にあった名前（大文字も、そのままの綴り）と、このストアがディレクトリを
+     * 作りうる ID（[knownDirectories]）。メインスレッドだけが呼ぶ
+     */
+    public fun referenceDirectories(): List<String> {
+        val names = LinkedHashSet<String>(scannedNames)
+        for (id in knownDirectories) names += id.toString()
+        return names.toList()
+    }
+
+    /**
+     * ディレクトリ [name]（[referenceDirectories] の1つ）の世代のファイルが参照するモジュールを読む仕事を、書き込みの列に入れる（#564）。
+     * その ID の書き込み・掃除と同じ列で順に走る。[sink] には書き込みのスレッドで1回、16進のハッシュの集合（読めなければ `null`）を渡す。
+     * 読んでいる間に消えたファイル（[NoSuchFileException]）は「ない」として飛ばす。[cancelled] が真なら読まずに `null`
+     */
+    public fun readModuleReferences(name: String, cancelled: () -> Boolean, sink: (Set<String>?) -> Unit) {
+        val id = try {
+            UUID.fromString(name)
+        } catch (_: IllegalArgumentException) {
+            sink(null)
+            return
+        }
+        enqueue(id, 0, {
+            sink(if (cancelled()) null else readReferencesIn(root.resolve(name)))
+            null
+        }, {
+            sink(null)
+            null
+        }, blocksRestore = false)
+    }
+
+    /**
+     * [task] を書き込みの列の最後に入れる（#564。モジュールの置き場の掃除の仕事。マシンの ID を持たない仕事なので、使われない ID
+     * [CLEANUP_ID] で並べる）。閉じていれば走らせずに `false`
+     */
+    public fun runOnWriter(task: Runnable): Boolean {
+        var ran = true
+        enqueue(CLEANUP_ID, 0, {
+            task.run()
+            null
+        }, {
+            ran = false
+            null
+        }, blocksRestore = false)
+        return ran
+    }
+
+    /** 書き込みのスレッドで、[id] のディレクトリを調べる（[inspectForCleanup]・[deleteUnreferenced]） */
+    private fun inspectDirectory(id: UUID): CleanupInspection {
+        val dir = directoryOf(id)
+        if (!Files.isDirectory(dir)) return CleanupInspection(id, exists = false)
+        var newest: Long
+        var bytes = 0L
+        var generations = 0
+        try {
+            newest = Files.getLastModifiedTime(dir).toMillis()
+            Files.newDirectoryStream(dir).use { entries ->
+                for (entry in entries) {
+                    val attrs = Files.readAttributes(entry, BasicFileAttributes::class.java)
+                    newest = maxOf(newest, attrs.lastModifiedTime().toMillis())
+                    bytes += attrs.size()
+                    if (attrs.isRegularFile && parseGeneration(entry.fileName.toString()) != null) generations++
+                }
+            }
+        } catch (e: IOException) {
+            return CleanupInspection(id, exists = true, error = "$e")
+        } catch (e: RuntimeException) {
+            return CleanupInspection(id, exists = true, error = "$e")
+        }
+        var owner: OwnerRecord? = null
+        var ownerError: String? = null
+        try {
+            owner = OwnerRecord.read(dir.resolve(OwnerRecord.FILE_NAME))
+        } catch (e: IOException) {
+            ownerError = "${e.message}"
+        } catch (e: RuntimeException) {
+            ownerError = "$e"
+        }
+        return CleanupInspection(id, true, owner, ownerError, newest, bytes, generations)
+    }
+
+    /** 書き込みのスレッドで、ディレクトリ [dir] の世代のファイルが参照するモジュールを読む。読めなければ `null`（warn） */
+    private fun readReferencesIn(dir: Path): Set<String>? {
+        val result = HashSet<String>()
+        val files = ArrayList<Path>()
+        try {
+            if (!Files.isDirectory(dir)) return result
+            Files.newDirectoryStream(dir).use { entries ->
+                for (entry in entries) if (parseGeneration(entry.fileName.toString()) != null) files.add(entry)
+            }
+        } catch (e: IOException) {
+            LOG.log(System.Logger.Level.WARNING, "Cannot list the generations in $dir for the module cleanup: $e")
+            return null
+        }
+        for (file in files) {
+            try {
+                DataInputStream(BufferedInputStream(Files.newInputStream(file), 8192)).use { input ->
+                    MachineSnapshot.readModuleReferences(input) { hash -> result += ModuleStore.hex(hash) }
+                }
+            } catch (_: NoSuchFileException) {
+                // 読む前に消えた世代（世代の掃除）は、もう参照しない
+            } catch (e: IOException) {
+                LOG.log(System.Logger.Level.WARNING, "Cannot read the module references of $file; keeping all modules this time: $e")
+                return null
+            } catch (e: RuntimeException) {
+                LOG.log(System.Logger.Level.WARNING, "Cannot read the module references of $file; keeping all modules this time: $e")
+                return null
+            }
+        }
+        return result
+    }
+
     // ---- 印と掃除 ----
 
     /**
@@ -1202,6 +1393,9 @@ public class MachineSaveStore @JvmOverloads constructor(
         val LOG: System.Logger = System.getLogger("kibicomputers.persist")
 
         const val GENERATION_SUFFIX = ".bin"
+
+        /** モジュールの置き場の掃除の仕事を並べる ID（マシンの ID には使われない。[newUuid] は列に仕事がある ID を避ける） */
+        val CLEANUP_ID: UUID = UUID(0, 0)
 
         /** UUID の名前（`8-4-4-4-12`）の長さ */
         const val UUID_NAME_LENGTH = 36
