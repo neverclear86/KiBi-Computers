@@ -1555,6 +1555,8 @@ internal class ProcessRunner(private val machine: Machine) {
             val waiter = ThreadWaiter(lock.newCondition())
             var previous = ProcessState.RUNNING
             val ws: WaitSet
+            // CPU・許可を返して取り直す深い道に入る前に、状態を何も変えないうちに確かめる（#828。燃料切れの処理と同じ）
+            StackHeadroom.ensure(StackHeadroom.FUEL_YIELD_FRAMES)
             lock.lock()
             try {
                 check(rt.process.kind == ProcessKind.BLOCKING || rt.loading != null) { "待機点型は StepResult.Wait で待つ" }
@@ -1616,6 +1618,8 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun <T> awaitHost(future: CompletableFuture<T>): T {
             checkMayBlock("awaitHost")
+            // CPU・許可を返して取り直す深い道に入る前に、状態を何も変えないうちに確かめる（#828。燃料切れの処理と同じ）
+            StackHeadroom.ensure(StackHeadroom.FUEL_YIELD_FRAMES)
             var previous = ProcessState.RUNNING
             lock.withLockValue {
                 if (rt.killed) throw ProcessKilledException()
