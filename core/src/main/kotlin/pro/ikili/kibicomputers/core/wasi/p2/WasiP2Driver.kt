@@ -22,7 +22,8 @@ import pro.ikili.kibicomputers.core.runtime.component.link.FuncRef
  *
  * 待機点への変換をかけたコンポーネント（[ComponentProgram.waitPoints]。#757、ADR 0757）は `WAIT_POINT` で動く: 待ちうるホストの関数が
  * 巻き戻すと `run` から戻るので、待つ key を `StepResult.Wait` にする。再開（[resume]）は巻き直して `run` を呼び直す。
- * かけられなかったものは今までどおり `BLOCKING` で、`run` を 1 回呼ぶ（待つ間はスレッドを持つ）。
+ * かけられなかったものは `BLOCKING` で、`run` を 1 回呼ぶ（待つ間はスレッドを持つ）。`exec` では変換できないものを読み込みで断る（#844）ので、
+ * `BLOCKING` になるのは直接読み込んだもの（テスト・ブロッキングとの比較）だけ。
  *
  * 止まりうる関数の中の燃料切れ（`kibi.async_fuel`。[ComponentProgram.fuelYield]。#803）で巻き戻したときも `run` から戻るので、
  * そのときは `StepResult.WaitFuel` にする（スレッドを持たずに燃料を待つ。p1 の `WasiP1` と同じ）。再開は燃料のあとでも

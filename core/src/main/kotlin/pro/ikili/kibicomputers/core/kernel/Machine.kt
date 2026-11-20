@@ -151,7 +151,7 @@ public class MachineConfig private constructor(builder: Builder) {
     public val maxProcesses: Int = builder.maxProcesses
 
     /**
-     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。p2 のコマンドのコンポーネントなど）の数の上限（仮: 8。確定は #251）。
+     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。待機点に変換しない道で動かすもの。`exec` したコンポーネントは変換できなければ断るので、これには入らない（#844））の数の上限（仮: 8。確定は #251）。
      * サーバー全体の枠（[SchedulerConfig.maxBlockingProcesses]）を少数の台で使い切らないためのもの。スレッドを持たない待ちは #757
      */
     public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
@@ -1683,8 +1683,8 @@ public class Machine private constructor(
      * - Component Model のコンポーネント（layer 1）は、ヘッダーで見分けて `ComponentProgram.load` で読み込み、リンクの計画まで作る
      *   （#687。[Program.loadExecutable]。ホストは固定の [KernelDrivers.COMPONENT_HOST]）。計画は p1 と同じく `ProgramCache` で全マシンが
      *   共有する。p1 の待機点への変換（`asyncifyExecutables`）はかけず、コンポーネント全体の変換を常にかける（#757。ADR 0757）。
-     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして、
-     *   変換できれば `WAIT_POINT`、できなければ `BLOCKING` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
+     *   待機点に変換できない作りは、p1 と同じく読み込みで断り `NOEXEC`（#844。理由はメッセージに書く。失敗は覚える）。
+     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして `WAIT_POINT` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
      *   （内容の失敗ではないので覚えない）。コンポーネントのプロセスは保存できない（#269）
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
