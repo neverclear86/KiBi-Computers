@@ -534,6 +534,12 @@ public class Machine private constructor(
     private var coldBootPending = false
 
     /**
+     * 冷えた起動の前にコンソールに書く知らせ（#86、ADR 0086。init を写しの中で殺した写しから戻したときだけ）。
+     * [coldBootPending] と一緒に立て、一緒に下ろす（[coldBootAfterRestore] が書くか、取り消しで捨てる）。カーネルロックの中で触る
+     */
+    private var coldBootNotice: String? = null
+
+    /**
      * 復元が `stop()`・`close()` で取り消された（前段が見る）。一度立ったら下ろさない（その Machine の [restore] は断る。#576）。
      * 取り消された古い前段がまだ起動用スレッドで走っていても、この印で止まる
      */
@@ -1060,6 +1066,8 @@ public class Machine private constructor(
         try {
             if (!coldBootPending) return false
             coldBootPending = false
+            val notice = coldBootNotice
+            coldBootNotice = null
             config = lastBootConfigValue ?: return false
             if (scheduler.isClosed || closedValue || stateValue != MachineState.STOPPED || bootingValue) return false
             bootingValue = true
@@ -1071,6 +1079,8 @@ public class Machine private constructor(
             pendingRebootRanTicks = -1L
             initStartTick = -1L
             beginPhaseDisksLocked()
+            // 起動のメッセージより前に、通知の列で受け手（この関数を呼ぶ知らせ）より後ろに並べる（#86）
+            if (notice != null) writeConsoleLine(notice)
         } finally {
             lock.unlock()
         }
@@ -1136,7 +1146,25 @@ public class Machine private constructor(
         // 前段で開けずに表から落としたマウントを知らせる（#56。保存したときの位置で1回だけ。失敗・取り消し・冷えた起動では出さない）
         for ((diskId, point) in prepared.droppedDisks) postDiskEventLocked(DiskEvents.REMOVED, diskId, point)
         postRestoreFinishedLocked(RestoreOutcome.RESTORED, null)
+        // 写しの中で殺したプロセスを知らせる（#86、ADR 0086）。受け手（画面をつなぐ）より後ろに並べるので、つないだ画面に出る
+        noticeKilledOnSaveLocked(prepared.killedPids)
         true
+    }
+
+    /**
+     * 写しの中で殺したプロセス [pids]（`KILLED` 節）を、1つずつコンソールに書く（#86、ADR 0086。カーネルロックの中、[completeRestore] から）。
+     * 名前は戻した表から引く（殺したものはゾンビとして残る）。表にない（刈り取られた）・KILLED でない（pid の使い回し）なら `pid n`。
+     * 書くのは [MAX_KILLED_NOTICES] 行までで、残りは数だけ1行にまとめる
+     */
+    private fun noticeKilledOnSaveLocked(pids: List<Int>) {
+        if (pids.isEmpty()) return
+        for (pid in pids.take(MAX_KILLED_NOTICES)) {
+            val process = kernel.processes[pid]?.takeIf { it.state == ProcessState.KILLED }
+            val label = if (process == null) "pid $pid" else processLabel(process)
+            writeConsoleLine("kibi: $label was killed: could not be saved")
+        }
+        val more = pids.size - MAX_KILLED_NOTICES
+        if (more > 0) writeConsoleLine("kibi: $more more ${if (more == 1) "process was" else "processes were"} killed: could not be saved")
     }
 
     /**
@@ -1180,11 +1208,15 @@ public class Machine private constructor(
      */
     private var endUnadoptedOnStop = false
 
-    /** 前段から（#85）: 戻せなかったので冷えた起動待ちにして知らせる（取り消されていたら何もしない） */
-    internal fun restoreFellBack(cause: ColdBootCause): Unit = lock.withLockValue {
+    /**
+     * 前段から（#85）: 戻せなかったので冷えた起動待ちにして知らせる（取り消されていたら何もしない）。
+     * [reason] が [ColdBootReason.INIT_KILLED]（写しの中で init を殺した）なら、冷えた起動の前にそうコンソールに書く（#86、ADR 0086）
+     */
+    internal fun restoreFellBack(cause: ColdBootCause, reason: ColdBootReason? = null): Unit = lock.withLockValue {
         if (!restoringValue || restoreCancelled) return@withLockValue
         restoringValue = false
         coldBootPending = true
+        coldBootNotice = if (reason == ColdBootReason.INIT_KILLED) INIT_KILLED_NOTICE else null
         // 前段が終わった: 取り消しの登録を外す（#587）
         restoreCancelSignal.complete(Unit)
         postRestoreFinishedLocked(RestoreOutcome.COLD_BOOT, cause)
@@ -2400,6 +2432,7 @@ public class Machine private constructor(
             restoreCancelled = true
             restoringValue = false
             coldBootPending = false
+            coldBootNotice = null
             restoreHandle = null
             restoreCancelSignal.complete(Unit)
         }
@@ -3980,6 +4013,12 @@ public class Machine private constructor(
 
         /** コンソールのメッセージに出すプロセスの名前の最大の文字数 */
         private const val MAX_LABEL_CHARS: Int = 64
+
+        /** 復元の後に、写しの中で殺したプロセスを1行ずつ知らせる最大の数（残りは数だけ。#86） */
+        internal const val MAX_KILLED_NOTICES: Int = 8
+
+        /** init を写しの中で殺した写しから、冷えた起動にするときの知らせ（#86） */
+        internal const val INIT_KILLED_NOTICE: String = "kibi: init could not be saved; starting fresh"
 
         /** [describeProcesses] が1プロセスにつき出す待っている相手の最大の数 */
         private const val MAX_LOGGED_WAITS: Int = 8
