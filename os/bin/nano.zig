@@ -506,10 +506,38 @@ fn lineCount() usize {
     return buffer.lines - 1 + @intFromBool(last_open);
 }
 
-fn writeDirect(path: []const u8) kibi.Error!void {
-    const fd = try fs.open(path, .{ .read = false, .write = true, .create = true, .truncate = true });
-    defer io.close(fd) catch {};
-    try buffer.writeTo(fd);
+/// [path] を、置き換えずにそのまま書き換える（ADR 0105「保存」。追記 #837）。
+/// 切り詰めずに先頭から上書きし、書き終えてから新しい長さに切る。途中で失敗しても、ファイルは空にならない。
+/// [allow_grow] が false なら、開いたファイルが今のバッファより短いときは何も書かずに false を返す
+/// （書いたら true。書く途中で出たエラーは、短かったときと区別できるよう、そのままエラーで返す）。
+/// [allow_grow] が false のとき（一時ファイルに書けなかったときの代わり）は、ファイルがある前提なので作らない。
+/// `lstat` の後に消されていたら `NOENT` で返し、元のファイルがなかった所に空のファイルを残さない
+fn writeDirect(path: []const u8, allow_grow: bool) kibi.Error!bool {
+    const fd = try fs.open(path, .{ .read = false, .write = true, .create = allow_grow });
+    const wrote = overwrite(fd, allow_grow) catch |e| {
+        io.close(fd) catch {};
+        return e;
+    };
+    try io.close(fd);
+    return wrote;
+}
+
+fn overwrite(fd: io.Fd, allow_grow: bool) kibi.Error!bool {
+    // 大きさは lstat の値でなく、開いたもので確かめ直す（その間に縮められた・置き換えられた、リンクの先）
+    const old = (try fs.fstat(fd)).size;
+    const len: u64 = buffer.len;
+    if (len > old) {
+        if (!allow_grow) return false;
+        // 先に伸ばす（容量が足りなければ、上書きする前に断られる）
+        try fs.setSize(fd, len);
+    }
+    buffer.writeTo(fd) catch |e| {
+        // 伸ばした分（0 で埋まった後ろ）は残さず、元の長さに戻す（戻せなくても、もとのエラーを知らせる）
+        if (len > old) fs.setSize(fd, old) catch {};
+        return e;
+    };
+    if (len < old) try fs.setSize(fd, len);
+    return true;
 }
 
 /// 同じディレクトリの一時ファイルに書いてから、名前を変えて置き換える
@@ -565,14 +593,17 @@ fn save(path: []const u8) bool {
     }
     if (link) {
         // シンボリックリンクは置き換えると切れるので、リンクの先にそのまま書く
-        writeDirect(path) catch |e| return saveFailed(path, e);
+        _ = writeDirect(path, true) catch |e| return saveFailed(path, e);
     } else {
         writeReplace(path) catch |e| {
             // 一時ファイルの分の容量・名前がないとき、元より大きくならないなら上書きで書く
             const fallback = (e == error.NOSPC or e == error.DQUOT or e == error.NAMETOOLONG) and
                 old_size != null and buffer.len <= old_size.?;
             if (!fallback) return saveFailed(path, e);
-            writeDirect(path) catch |e2| return saveFailed(path, e2);
+            // 開いたものが短くて何も書かなかったときだけ、一時ファイルで出たエラーを知らせる。
+            // 書く途中で出たエラー（`NOSPC` を含む）は、ファイルが書き換わっているので、そのまま知らせる
+            const wrote = writeDirect(path, false) catch |e2| return saveFailed(path, e2);
+            if (!wrote) return saveFailed(path, e);
         };
     }
     st.modified = false;
