@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
@@ -88,6 +89,19 @@ class AsyncFuelP2Test {
                 p.asyncStack?.isEmpty == false
         }
 
+        /**
+         * 起動が済む（最初のラウンドの出力が出る）まで tick を進め、その時点の `fuelBlockingWaits` を返す。
+         * 起動の途中の燃料切れは、巻き戻せないところ（realloc の中など）に当たるとスレッドを持って待つので、数えない
+         */
+        fun awaitStartup(h: Harness): Long {
+            eventually(60_000, "起動が終わらない") {
+                h.scheduler.tick()
+                Thread.sleep(5)
+                drain().isNotEmpty() || m.stateOf(pid).isTerminal
+            }
+            return h.scheduler.fuelBlockingWaits.get()
+        }
+
         fun finish(): String {
             eventually(60_000, "終わらない") {
                 h.scheduler.tick()
@@ -115,15 +129,20 @@ class AsyncFuelP2Test {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 20_000)
             val unwinds0 = h.scheduler.fuelUnwinds.get()
-            val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val s = Spin(h, m, listOf("main", "3", "100000"), bytes(nativeBuild))
             assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
             val program = s.rt.program
             assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
             assertTrue(program.fuelYield, "燃料切れを待ち点にしていない: ${program.fuelYieldRejection}")
             assertNull(program.fuelYieldRejection)
-            h.scheduler.tick()
-            eventually(30_000, "燃料切れで巻き戻さない") { s.waitingFuelThreadless() && m.isAtWaitPoint }
+            // 起動（アダプターが引数を受け取るときにホストが呼ぶ realloc の中など）は巻き戻せないところで燃料を使い切ることがあり、
+            // tick との前後でスレッドを持って待つことがある。起動が済んだ（最初のラウンドの出力が出た）後の待ちだけを数える
+            val blocking0 = s.awaitStartup(h)
+            eventually(30_000, "燃料切れで巻き戻さない") {
+                h.scheduler.tick()
+                Thread.sleep(20)
+                s.waitingFuelThreadless() && m.isAtWaitPoint
+            }
             assertTrue(h.scheduler.fuelUnwinds.get() > unwinds0)
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
             assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
@@ -169,16 +188,21 @@ class AsyncFuelP2Test {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 7_000)
             val unwinds0 = h.scheduler.fuelUnwinds.get()
-            val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val s = Spin(h, m, listOf("main", "12", "20000"), outCapacity = 4)
             var sawWriteWait = false
+            // 起動の途中の燃料切れは、巻き戻せないところ（realloc の中など）に当たるとスレッドを持って待つので、
+            // 起動が済んだ（最初の出力が出た）後の待ちだけを数える
+            var blocking0 = -1L
             eventually(120_000, "終わらない") {
                 h.scheduler.tick()
                 if (m.stateOf(s.pid) == ProcessState.WAITING_EVENT) sawWriteWait = true
-                // 毎回は読まず、書き込みで待つ間を作る
-                if (sawWriteWait || h.scheduler.fuelUnwinds.get() % 3 == 0L) s.drain()
+                // 起動が済むまでは毎回読む。済んだ後は毎回は読まず、書き込みで待つ間を作る
+                if (blocking0 < 0 || sawWriteWait || h.scheduler.fuelUnwinds.get() % 3 == 0L) {
+                    if (s.drain().isNotEmpty() && blocking0 < 0) blocking0 = h.scheduler.fuelBlockingWaits.get()
+                }
                 m.stateOf(s.pid).isTerminal
             }
+            assertTrue(blocking0 >= 0, "起動が済んだ時点を測っていない")
             assertEquals(ProcessState.EXITED, m.stateOf(s.pid), "${s.rt.lastError}")
             assertEquals(expected(12, 20_000), s.drain())
             assertTrue(sawWriteWait, "書き込みで待っていない")
@@ -226,6 +250,72 @@ class AsyncFuelP2Test {
             assertTrue(h.scheduler.fuelBlockingWaits.get() > before)
             assertFalse(m.isAtWaitPoint)
             assertEquals(expected(2, 100_000), s.finish())
+        }
+    }
+
+    /**
+     * ゲストからゲストへの呼び出し（lift した関数を lower した import）の下で計算し続ける p2 のコマンド。`run` は `inner` の `spin` を呼び、
+     * `spin` が計算する。`run` は（実行時は呼ばない）`pollable.block` を呼ぶので止まりうる関数になり、変換は待ち点型・燃料切れも待ち点
+     * （`fuelYield`）になる。`spin` は待たないので止まりうる関数でなく、燃料は `kibi.fuel`（前借りの道）で確かめる。
+     * `spin` は外からの `run` の下の 2 段目なので、`LinkedComponent.canUnwind` が偽
+     */
+    private fun guestToGuestSpin(): ByteArray {
+        val d = "$"
+        return LinkTesting.wat(
+        """
+        (component
+          (import "wasi:io/poll@0.2.12" (instance ${d}poll
+            (export "pollable" (type ${d}pollable (sub resource)))
+            (export "[method]pollable.block" (func (param "self" (borrow ${d}pollable))))))
+          (alias export ${d}poll "[method]pollable.block" (func ${d}block))
+          (core func ${d}block_lower (canon lower (func ${d}block)))
+          (core module ${d}inner
+            (func (export "spin") (param ${d}n i32) (result i32)
+              (local ${d}x i32)
+              (loop ${d}l
+                (local.set ${d}x (i32.add (i32.mul (local.get ${d}x) (i32.const 31)) (local.get ${d}n)))
+                (local.set ${d}n (i32.sub (local.get ${d}n) (i32.const 1)))
+                (br_if ${d}l (local.get ${d}n)))
+              (i32.const 1)))
+          (core module ${d}outer
+            (import "inner" "spin" (func ${d}spin (param i32) (result i32)))
+            (import "poll" "block" (func ${d}block (param i32)))
+            (func (export "run") (result i32)
+              ;; spin は常に 1 を返すので、block は実行時には呼ばれない（止まりうる関数にするためだけの呼び出し）
+              (if (i32.eqz (call ${d}spin (i32.const 20000))) (then (call ${d}block (i32.const 0))))
+              (i32.const 0)))
+          (core instance ${d}i (instantiate ${d}inner))
+          (func ${d}spin_lifted (param "n" u32) (result u32) (canon lift (core func ${d}i "spin")))
+          (core func ${d}spin_lower (canon lower (func ${d}spin_lifted)))
+          (core instance ${d}spin_exports (export "spin" (func ${d}spin_lower)))
+          (core instance ${d}poll_exports (export "block" (func ${d}block_lower)))
+          (core instance ${d}o (instantiate ${d}outer (with "inner" (instance ${d}spin_exports)) (with "poll" (instance ${d}poll_exports))))
+          (func ${d}run (result (result)) (canon lift (core func ${d}o "run")))
+          (instance ${d}run_i (export "run" (func ${d}run)))
+          (export "wasi:cli/run@0.2.12" (instance ${d}run_i)))
+        """.trimIndent(),
+        )
+    }
+
+    /**
+     * ゲストからゲストへの呼び出しの下（コンポーネントが巻き戻せない。`LinkedComponent.canUnwind` が偽）の、止まりうる関数でない関数の燃料切れは、
+     * 前借りせず、スレッドを持って待つ（#803）。前借りしても、結局巻き戻せずにスレッドを持って待つので、前借りは巻き戻せるときだけにしている
+     */
+    @Test
+    fun `ゲストからゲストへの呼び出しの下の燃料切れは、前借りせずスレッドを持って待つ`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 5_000)
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val overdrafts0 = h.scheduler.fuelOverdrafts.get()
+            val s = Spin(h, m, emptyList(), guestToGuestSpin())
+            assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
+            val program = s.rt.program
+            assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
+            assertTrue(program.fuelYield, "燃料切れを待ち点にしていない: ${program.fuelYieldRejection}")
+            assertEquals("", s.finish())
+            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0, "ゲストからゲストへの呼び出しの下の燃料切れでスレッドを持って待っていない")
+            assertEquals(overdrafts0, h.scheduler.fuelOverdrafts.get(), "巻き戻せないところで前借りした")
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
         }
     }
 

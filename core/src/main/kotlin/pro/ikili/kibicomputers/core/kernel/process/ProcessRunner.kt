@@ -689,6 +689,8 @@ internal class ProcessRunner(private val machine: Machine) {
             component.endFuelRewind()
             return lock.withLockValue { instance.fuel }
         }
+        // 守りの分岐。今は通らない: ゲストからゲストへの呼び出しの下に止まりうる関数があれば、変換を断る（ComponentAsyncify）ので、
+        // 止まりうる関数の燃料切れ（kibi.async_fuel）は外からの call の 1 段目でしか起きず、realloc・post-return の中は guestCallDepth で弾く
         if (!component.canUnwind()) return onFuelExhausted(rt, instance, remaining)
         val yielding = lock.withLockValue {
             if (rt.killed) throw ProcessKilledException()
