@@ -118,7 +118,7 @@ neoForge {
             taskBefore(cleanLoadTestWorld)
             systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
-            // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る
+            // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る。standard-p2 は、標準 OS のシェルから p2 のコマンドで計算させる（#821）
             systemProperty("kibicomputers.loadTest.os", providers.gradleProperty("loadTestOs").getOrElse("lua"))
             // -PloadTestDevices=<n> で、n 台に1台の割合でケースの隣に他 MOD 役のデバイス（#153）を置く（既定は 0 = 置かない）
             systemProperty("kibicomputers.dev.testDevices", "true")
@@ -177,6 +177,27 @@ neoForge {
 sourceSets.main {
     resources.srcDir("src/generated/resources")
 }
+
+// 負荷試験の p2 の計算（#821。-PloadTestOs=standard-p2）の起動ディスク `image:loadtest-p2`。標準 OS のイメージ（core の os.zip）に、
+// 計算し続ける p2 のコマンド（core のテストの fuel-spin-p2.wasm。wasi-sdk でビルドする）を `/bin/spin` として足す。
+// dev ソースセットのリソースに入れる（開発の run だけで読める。jar には入らない）
+val coreOsImage = core.tasks.named<Zip>("zipOsImage")
+val coreFuelSpinP2 = core.tasks.named("compileFuelSpinP2Wasm")
+val zipLoadTestP2Image = tasks.register<Zip>("zipLoadTestP2Image") {
+    group = "build"
+    description = "Builds the load test image (loadtest-p2.zip): the standard OS image plus a computing p2 command as /bin/spin."
+    from(coreOsImage.flatMap { it.archiveFile }.map { zipTree(it) })
+    from(files(core.layout.buildDirectory.dir("generated/wasi-sdk/fuel-spin-p2")) { builtBy(coreFuelSpinP2) }) {
+        include("kibicomputers/wasm-native/fuel-spin-p2.wasm")
+        eachFile { path = "bin/spin" }
+        includeEmptyDirs = false
+    }
+    archiveFileName = "loadtest-p2.zip"
+    destinationDirectory = layout.buildDirectory.dir("generated/loadtest-images/kibicomputers/images")
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+dev.resources.srcDir(files(layout.buildDirectory.dir("generated/loadtest-images")) { builtBy(zipLoadTestP2Image) })
 
 dependencies {
     // core は MOD の一部として jar に直接入れるので、ここではコンパイル時だけ参照する
