@@ -151,7 +151,7 @@ public class MachineConfig private constructor(builder: Builder) {
     public val maxProcesses: Int = builder.maxProcesses
 
     /**
-     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。p2 のコマンドのコンポーネントなど）の数の上限（仮: 8。確定は #251）。
+     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。待機点に変換しない道で動かすもの。`exec` したコンポーネントは変換できなければ断るので、これには入らない（#844））の数の上限（仮: 8。確定は #251）。
      * サーバー全体の枠（[SchedulerConfig.maxBlockingProcesses]）を少数の台で使い切らないためのもの。スレッドを持たない待ちは #757
      */
     public val maxBlockingProcesses: Int = builder.maxBlockingProcesses

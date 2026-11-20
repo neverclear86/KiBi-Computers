@@ -305,6 +305,31 @@ class ComponentWaitPointTest {
         assertTrue(q.waitPoints, "${q.waitPointRejection}")
     }
 
+    /**
+     * 止まりうる関数がなくても、グローバルの初期値の式に `v128.const` があれば、読み込みは断られる（#851）。
+     * 計測あり（`exec`）では `FuelInjector` が断る（原因は `AsyncifyUnsupported` ではない）。計測なしでは `Asyncify` が断るので、
+     * `requireWaitPoints` なら理由が取り出せ、直接の読み込みなら `BLOCKING` に落ちる
+     */
+    @Test
+    fun `止まりうる関数がなくても定数式のv128グローバルがあれば断られる`() {
+        val constGlobal = shimShape.replace(
+            "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n", "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n            (global v128 (v128.const i32x4 0 0 0 0))\n",
+        )
+        check(constGlobal != shimShape)
+        val bytes = LinkTesting.wat(constGlobal)
+        val host = GetHost(HostWait.NONE).host
+        val metered = assertThrows<WasmLoadException> {
+            ComponentProgram.load(LinkTesting.runtime, bytes, host, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        }
+        assertNull(Program.unsuspendableReason(metered), "${metered.message} / ${metered.cause}")
+        val e = assertThrows<WasmLoadException> {
+            ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        }
+        assertTrue(Program.unsuspendableReason(e)?.contains("0xFD") == true, "${e.message} / ${e.cause}")
+        val direct = ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT)
+        assertFalse(direct.waitPoints)
+    }
+
     @Test
     fun `変換は決定的（同じ入力から同じ計画のモジュール）`() {
         val a = load(shimShape, GetHost(HostWait.UNWIND).host)
