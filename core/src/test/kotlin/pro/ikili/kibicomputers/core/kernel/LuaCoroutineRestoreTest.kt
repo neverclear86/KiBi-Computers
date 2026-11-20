@@ -145,12 +145,18 @@ class LuaCoroutineRestoreTest {
 
     /**
      * 写しを取って書く（[current] がなければ新しい ID を振る）。[deltaBase] を渡すと、比を 1.0 にして差分を書く（全体に化けない）。
-     * 待機点で取るので `null` にならない（燃料待ちのときは [captureRetrying] を使う）
+     * 待機点で取るので `null` にならない（燃料待ちのときは [captureRetrying] を使う）。
+     * [fullSaveRule] を変えたときは、差分を頼んでも全体になりうるので、[deltaBase] が写しに残ることは確かめない
      */
-    private fun save(store: MachineSaveStore, m: Machine, current: MachineIdentity? = null, deltaBase: DeltaBase? = null): WriteResult {
-        val snapshot = m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, FullSaveRule(1.0))
-        assertNotNull(snapshot, "待っている間は保存できる")
-        assertEquals(deltaBase, snapshot!!.deltaBase)
+    private fun save(
+        store: MachineSaveStore,
+        m: Machine,
+        current: MachineIdentity? = null,
+        deltaBase: DeltaBase? = null,
+        fullSaveRule: FullSaveRule = FullSaveRule(1.0),
+    ): WriteResult {
+        val snapshot = requireNotNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT, deltaBase, fullSaveRule)) { "待っている間は保存できる" }
+        if (fullSaveRule.changedRatio == 1.0) assertEquals(deltaBase, snapshot.deltaBase)
         return store.write(current ?: store.assignNewId(owner)!!, owner, snapshot)
     }
 
@@ -306,7 +312,9 @@ class LuaCoroutineRestoreTest {
             tickUntil(h, r, s, "コールバックの中で待たない", holdQueuedHostCalls = true) {
                 "ingsub\ta\n" in output(r, s.output) && r.pendingHostCalls > 0 && r.isAtWaitPoint
             }
-            assertEquals(0, calls.get(), "保存するときは、まだ実行していない")
+            // 列の呼び出しを保存するのが狙い。tick の合間に 'a' の呼び出しが先に走ることがあるので、実行した回数は決めつけない
+            // （どちらでも、合計は 'a' と 'b' の 2 回になる）
+            assertTrue(calls.get() <= 1, "保存するときに、列の呼び出しを実行しすぎている")
             val second = save(store, r, first.identity)
             r.close()
             val r2 = restore(h, store, second.identity, calls)
@@ -462,8 +470,10 @@ class LuaCoroutineRestoreTest {
             val m2 = restore(h, store, g1.identity, calls)
             send(m2, s.input, "ab\n")
             tickUntil(h, m2, s, "2 行目を待たない") { waiting(m2, s, "wait2\n") }
-            // 戻した直後のプロセスは基準がないので、次は全体（これが次の差分の基準になる）
-            val g2 = save(store, m2, g1.identity)
+            // 戻した直後のプロセスは基準がないので、置き場の基準を渡して差分を頼んでも、既定の規則では全体になる（これが次の差分の基準になる）
+            val base1 = store.deltaBaseFor(g1.identity, owner)
+            assertNotNull(base1, "全体を書いた後なのに基準がない")
+            val g2 = save(store, m2, g1.identity, base1, FullSaveRule.DEFAULT)
             assertFalse(g2.delta, "戻した直後の保存は全体")
             send(m2, s.input, "cde\n")
             tickUntil(h, m2, s, "3 行目を待たない") { waiting(m2, s, "wait3\n") }
