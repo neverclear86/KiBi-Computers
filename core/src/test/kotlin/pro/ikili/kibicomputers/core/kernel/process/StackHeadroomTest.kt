@@ -31,14 +31,14 @@ class StackHeadroomTest {
         // 温めてから、3 通りを交互に何回か測り、それぞれの最大を比べる。
         // 全体のテストで CPU が混むと、JIT のコンパイルが測定の途中で終わり、インタプリタのフレーム（大きい）で測った回が混ざって浅くなる。
         // 最大を取れば、コンパイル後の（フレームが小さい）回どうしの比べになる
-        repeat(3) { depth(null); depth(StackHeadroom.HOST_CALL_FRAMES); depth(StackHeadroom.FUEL_HANDLER_FRAMES) }
+        repeat(3) { depth(null); depth(StackHeadroom.HOST_CALL_FRAMES); depth(StackHeadroom.FUEL_YIELD_FRAMES) }
         var plain = 0
         var host = 0
         var fuel = 0
         repeat(15) {
             plain = maxOf(plain, depth(null))
             host = maxOf(host, depth(StackHeadroom.HOST_CALL_FRAMES))
-            fuel = maxOf(fuel, depth(StackHeadroom.FUEL_HANDLER_FRAMES))
+            fuel = maxOf(fuel, depth(StackHeadroom.FUEL_YIELD_FRAMES))
         }
         assertTrue(host < plain, "host $host, plain $plain")
         assertTrue(fuel < host, "fuel $fuel, host $host")

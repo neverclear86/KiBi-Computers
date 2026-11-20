@@ -81,7 +81,9 @@ internal class ProcessRunner(private val machine: Machine) {
     /** 作ったばかりの [ProcessRuntime] に、燃料切れの処理と [ProcessContext] を付ける */
     fun initRuntime(rt: ProcessRuntime) {
         rt.fuelHandler = object : WasmFuelHandler {
-            // ゲストのどの深さからでも呼ばれ、中で CPU・許可・カーネルロックを取り直すので、先にスタックの余裕を確かめる（#828）
+            // ゲストのどの深さからでも呼ばれ、カーネルロックを取るので、先にスタックの余裕を確かめる（#828）。
+            // CPU・許可を返して取り直す道は、その手前（[onFuelExhausted]）でもっと大きく確かめる。前借り（#477）の間は、
+            // 残りが負の間じゅう関数の入口・loop の先頭ごとに呼ばれるので、この入口は軽く（ロックの区間の分だけ）する
             override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
                 StackHeadroom.ensure(StackHeadroom.FUEL_HANDLER_FRAMES)
                 return onFuelExhaustedPlain(rt, instance, remaining)
@@ -183,8 +185,7 @@ internal class ProcessRunner(private val machine: Machine) {
         repeat(maxOf(0, permitLeak)) { scheduler.permits.unlockLeaked() }
         repeat(maxOf(0, cpuLeak)) { machine.cpu.unlockLeaked() }
         repeat(maxOf(0, machineLeak)) { lock.unlock() }
-        // 終わったプロセスは CPU を持たない（待機点型の次の step に渡ったのなら、プロセスは終わっていない）
-        val cpuOwned = held.machine == 0 && rt.process.state.isTerminal && machine.cpu.currentOwner === rt
+        val cpuOwned = held.machine == 0 && finishedHoldingCpu(rt)
         if (machineLeak <= 0 && cpuLeak <= 0 && permitLeak <= 0 && !cpuOwned) return
         val message = "プロセス ${rt.pid} のスレッドが、終わりにカーネルのロックを持ったままだった" +
             "（マシン $machineLeak、CPU $cpuLeak、許可 $permitLeak、CPU の持ち主のまま $cpuOwned。原因: ${rt.lastError}）"
@@ -198,6 +199,24 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         if (machineLeak > 0 || cpuLeak > 0 || cpuOwned) {
             lock.withLockValue { machine.inconsistencyLocked(message) }
+        }
+    }
+
+    /**
+     * 終わったプロセスが、このスレッドの step のものとして CPU を持ったままか（[recoverLeaks]。終わったプロセスは CPU を持たない）。
+     *
+     * 待機点型は、このスレッドが登録を外した後（`rt.thread = null`）に、同じ `rt` の次の step が別のワーカーで始まり、
+     * `exit`・`exceptionExit` で終えた（`finishLocked`）後、CPU を返す前までの間がある。そこでは「終わったプロセスが CPU の持ち主」は
+     * 正しい状態なので、持ち主かどうかだけでは見分けられない。次の step のスレッドは `rt.thread` に登録されている
+     * （登録を外すのは CPU を返した後）ので、`rt.thread` が別のスレッドなら、このスレッドの漏れではない。
+     * 終わっていないプロセスは、ロックを取らずに先に外す（ふつうの step の終わりに、ロックを足さない）。
+     * 終わったかどうかと持ち主は、カーネルロックの中でそろえて読む
+     */
+    private fun finishedHoldingCpu(rt: ProcessRuntime): Boolean {
+        if (!rt.process.state.isTerminal) return false
+        return lock.withLockValue {
+            val thread = rt.thread
+            rt.process.state.isTerminal && (thread == null || thread === Thread.currentThread()) && machine.cpu.currentOwner === rt
         }
     }
 
@@ -669,6 +688,9 @@ internal class ProcessRunner(private val machine: Machine) {
             verifyInstanceLocked(rt, instance)
             if (rt.killed) throw ProcessKilledException()
             renewSliceLocked(rt, remaining)?.let { return it }
+            // 譲る・待つ道（CPU・許可を返して取り直す。深い）に入る前に、状態を何も変えないうちに確かめる（#828）。
+            // ここまでの入口の確かめで、このロックの区間を放すだけの余裕はあるので、尽きたらロックを放して StackOverflowError が上がる
+            StackHeadroom.ensure(StackHeadroom.FUEL_YIELD_FRAMES)
             val yielding = yieldingLocked(remaining)
             giveBackLocked(remaining)
             scheduler.deactivate(rt)
@@ -1013,6 +1035,7 @@ internal class ProcessRunner(private val machine: Machine) {
             rt.stackActive = false
             finishLocked(rt, ProcessState.EXITED, code)
         }
+        hooks.afterFinish?.invoke(machine, rt.pid)
         releasePermitAndCpu(rt, endOfStep = true)
     }
 
@@ -1035,6 +1058,7 @@ internal class ProcessRunner(private val machine: Machine) {
         } finally {
             lock.unlock()
         }
+        hooks.afterFinish?.invoke(machine, rt.pid)
         releasePermitAndCpu(rt, endOfStep = true)
     }
 

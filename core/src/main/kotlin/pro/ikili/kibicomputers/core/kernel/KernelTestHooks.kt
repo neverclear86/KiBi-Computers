@@ -18,6 +18,13 @@ internal class KernelTestHooks {
     @Volatile
     var afterUnregister: ((Machine, Int) -> Unit)? = null
 
+    /**
+     * プロセスを終えた（`finishLocked`。`exit`・`exceptionExit`）後・CPU と許可を返す前（ロックの外。プロセスのスレッド）。
+     * 終わったプロセスが CPU の持ち主のままの間を広げられる（#828。`recoverLeaks` が、次の step のその間を漏れと見誤らないことの確かめ）
+     */
+    @Volatile
+    var afterFinish: ((Machine, Int) -> Unit)? = null
+
     /** 待機点型の step を始める前（起こされて CPU を受け取った後、`readyKeys` を求める前） */
     @Volatile
     var beforeStepStart: ((Machine, Int) -> Unit)? = null
