@@ -38,7 +38,6 @@ import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
-import kotlin.math.abs
 import org.apache.logging.log4j.Level as Log4jLevel
 import org.apache.logging.log4j.LogManager as Log4jManager
 
@@ -220,8 +219,6 @@ internal data class PhaseResult(
     val longTicks: List<LongTick> = emptyList(),
     /** 長い tick の数（上限を超えた分も） */
     val longTickCount: Int = 0,
-    /** 測った tick の時間と、区間（[LoadTickProbe.Section]）の合計の差の最大（ナノ秒）。区間の置き場所と MSPT の計算が合っているかの確かめ */
-    val sectionMismatchNanos: Long = 0,
     /** 区間（[LoadTickProbe.Section] の順）ごとの、段階の間に区切りを通った回数。0 の区間は、区切りのイベントが届いていない */
     val sectionMarks: IntArray = IntArray(0),
 )
@@ -644,9 +641,6 @@ internal class LoadRun(
     /** [LoadSettings.quietProgress] のときに止めた、進み具合のロガーの元のレベル */
     private var savedProgressLevel: Log4jLevel? = null
 
-    /** 測った tick の時間と、区間の合計の差の最大（ナノ秒）。区間の置き場所と MSPT の計算が合っているかの確かめ */
-    private var sectionMismatch = 0L
-
     /** 段階の間に、区間ごとの区切りを通った回数（今の tick の分は [tickMarks] に取り、測っている間だけ足す） */
     private val sectionMarks = IntArray(LoadTickProbe.Section.entries.size)
     private val tickMarks = IntArray(LoadTickProbe.Section.entries.size)
@@ -679,7 +673,8 @@ internal class LoadRun(
 
     private fun onTick() {
         if (finished) return
-        // 区間の終わりと tick の時間の終わりを同じ時刻にする（別々に取ると、間でメインスレッドが止まったぶんだけ差になる）
+        // 区間の終わりと tick の時間の終わりを同じ時刻にする。始めも [LoadTickProbe.harnessEnd] の時刻を共有するので（下の prevSleep）、
+        // work は前の tickStart からの差そのものになり、区間の合計（sectionNanos）と作りの上でちょうど同じになる
         val now = probe.harnessStart()
         var work = 0L
         probe.takeSections(sectionNanos, tickMarks)
@@ -689,7 +684,6 @@ internal class LoadRun(
             val s = ServerMachines.Stats
             if (recording) {
                 record(work, s.captureNanos - prevCapture)
-                sectionMismatch = maxOf(sectionMismatch, abs(work - sectionNanos.sum()))
                 for (i in tickMarks.indices) sectionMarks[i] += tickMarks[i]
                 if (work >= LoadTickProbe.LONG_TICK_MILLIS * 1_000_000) recordLongTick(work, s.captureNanos - prevCapture)
             }
@@ -1207,7 +1201,6 @@ internal class LoadRun(
         countSent = false
         longTicks.clear()
         longTickCount = 0
-        sectionMismatch = 0
         sectionMarks.fill(0)
         sampleCount = 0
         sentBytes = 0
@@ -1243,7 +1236,6 @@ internal class LoadRun(
             kernelThreadNames = names,
             longTicks = longTicks.toList(),
             longTickCount = longTickCount,
-            sectionMismatchNanos = sectionMismatch,
             sectionMarks = sectionMarks.copyOf(),
         )
         results += result

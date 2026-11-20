@@ -58,13 +58,6 @@ object LoadGameTests {
     private const val CI_MAX_AVG_TICK_MILLIS = 50.0
 
     /**
-     * 測った tick の時間と、区間（#600。[LoadTickProbe.Section]）の合計の差の上限（ナノ秒）。区間は作りの上で、試験の呼び出しの終わりから次の始めまでを
-     * 必ず分けるので、この差は試験の呼び出しの始め・終わりの置き場所と、MSPT の計算（`work`）が合っているかしか見ない。
-     * 差の元は時刻を取る順のずれ（数マイクロ秒）だけなので、1 ms を超えるのは、その間にメインスレッドが止まったとき（ランナーの横取り）で、区間の誤りではない
-     */
-    private const val CI_MAX_SECTION_MISMATCH_NANOS = 1_000_000L
-
-    /**
      * CI で、待っている間のカーネルのスレッド（`KiBi-` で始まるもの）のうち、プールで次の仕事を待っているワーカーを除いた数の上限。
      * 台数（[CI_COUNT]）より十分少ない。待っている台はスレッドを持たない（#37・#329）ので、
      * ディスパッチャー・タイマー・コンパイラーだけになる。プールで待つワーカーは、起動の間に増えた分がしばらく残るので数えない
@@ -204,16 +197,12 @@ object LoadGameTests {
                     "(limit ${ciMaxBootKernelThreads()})",
             )
             // 長い tick の内訳（#600）: 区間の区切り（イベントの受け口）が、どの段階でも全部届いている（0 の区間があれば、その受け口が呼ばれていない）。
-            // 区間の合計は作りの上で MSPT と同じになるので、差は試験の呼び出しの置き場所の確かめにすぎない
+            // 区間の合計と MSPT の差は見ない。区間の終わりと始めは MSPT の計算と同じ時刻を使うので、作りの上でいつも 0 になる（LoadRun.onTick）
             for (p in report.phases) {
                 val unmarked = LoadTickProbe.Section.entries.filter { p.sectionMarks.getOrElse(it.ordinal) { 0 } == 0 }
                 helper.assertTrue(
                     unmarked.isEmpty(),
                     "every tick section should be marked in the ${p.phase} phase, but never reached: $unmarked",
-                )
-                helper.assertTrue(
-                    p.sectionMismatchNanos <= CI_MAX_SECTION_MISMATCH_NANOS,
-                    "the tick sections should add up to the measured tick in the ${p.phase} phase: off by ${p.sectionMismatchNanos} ns",
                 )
             }
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
