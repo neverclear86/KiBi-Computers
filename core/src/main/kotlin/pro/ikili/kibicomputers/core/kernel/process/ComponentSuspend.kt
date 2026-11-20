@@ -85,6 +85,9 @@ internal class ComponentSuspend(private val ctx: ProcessContext) {
         pendingKeys = keys
     }
 
+    /** 巻き戻したときに記録した key がある（ホストの待ちで巻き戻した。燃料切れで巻き戻したなら `false`。#803） */
+    val hasPendingKeys: Boolean get() = pendingKeys != null
+
     /** 巻き戻したときに記録した key を取り出す（`WasiP2Driver` が `run` から戻ったところで） */
     fun takePendingKeys(): List<WaitKey> {
         val keys = checkNotNull(pendingKeys) { "巻き戻したのに待つ key がない" }

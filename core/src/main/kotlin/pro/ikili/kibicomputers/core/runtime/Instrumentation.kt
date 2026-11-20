@@ -65,8 +65,8 @@ internal object Instrumentation {
     fun apply(wasm: ByteArray, waitImports: Set<String>, checkpoint: (stage: String) -> Unit = {}): ByteArray =
         applyDetailed(wasm, waitImports, checkpoint).bytes
 
-    /** 段1で待ち点にする燃料切れの import */
-    private const val YIELD_IMPORT: String = "${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_NAME}"
+    /** 段1で待ち点にする燃料切れの import（コンポーネントの core モジュールにも同じものを使う。#803） */
+    const val YIELD_IMPORT: String = "${WasmFuel.IMPORT_MODULE}.${WasmFuel.IMPORT_NAME}"
 
     /** [apply] の [checkpoint] に渡す段階の名前: 燃料の計測コードの挿入 */
     const val STAGE_FUEL: String = "燃料の計測コードの挿入"

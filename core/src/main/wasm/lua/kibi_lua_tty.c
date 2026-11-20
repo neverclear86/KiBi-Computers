@@ -10,9 +10,11 @@
  * - 戻すときは、切ったままで読み捨ててから元のモードに戻し、戻したことで残った塊があればもう一度読み捨てる
  *   （先に戻すと、待ちの列の続きが canonical の編集中の行に入り、次の io.read の行に混ざる）
  * - 戻すのは、今のモードがまだ自分の切ったモードのときだけ（ほかのプロセスが変えたものを上書きしない）
- * - 読み捨ては poll_oneoff（標準入力の FD_READ と相対 0 の時計）で今読めるかを見てから fd_read する。待機点にならず、タイマーも作らない
- * - 使う import は kibi:io/tty の is-tty・get-mode・set-mode だけ（新しい口は足さない）。切った後と、切っていないときの読み取りでは
- *   import を呼ばない（静的な状態を見るだけ）
+ * - 読み捨ては poll_oneoff（標準入力の FD_READ と相対 0 の時計）で今読めるかを見て、読めるときだけ、読み捨ての間だけ fd 0 に
+ *   NONBLOCK を立てて AGAIN まで fd_read し、元の fdflags に戻す（#838。見てから読むまでに同じ TTY のほかの読み手が読み切っても
+ *   待たない）。待機点にならず、タイマーも作らない。NONBLOCK はこのプロセスの fd 表の項目にだけ立つ
+ * - 使う import は kibi:io/tty の is-tty・get-mode・set-mode と、WASI p1 の poll_oneoff・fd_read・fd_fdstat_get・fd_fdstat_set_flags
+ *   （新しい口は足さない）。切った後と、切っていないときの読み取りでは import を呼ばない（静的な状態を見るだけ）
  * - 元のモードが cooked でなかったときも、そう覚えて、次に標準入力を読むか終わるまでは get-mode を呼び直さない
  *   （filter なしの待ちでイベントを1つ受けるたびに import を呼ばない。読んだ後は、モードが変わっているかもしれないので見直す）
  * - シグナルで殺されたときは atexit が走らない。対話型の sh は、子が canonical を外したまま終わったら cooked に戻す（ADR 0102）
@@ -80,14 +82,29 @@ static int ready_now(void) {
     return 0;
 }
 
-/* 今読める標準入力を読み捨てる（待たない）。領域はスタックに置く（Lua の確保を通さない） */
+/*
+ * 今読める標準入力を読み捨てる（待たない）。領域はスタックに置く（Lua の確保を通さない）。
+ *
+ * 読めるものがないとき（待つ前のほとんど）は poll_oneoff の1回だけで戻る。読めるときは、読み捨ての間だけ fd 0 に NONBLOCK を立てて
+ * AGAIN・0（EOF・Ctrl+D の印）・エラー・回数の上限のどれかまで読み、元の fdflags に戻す（#838）。見てから読むまでの間に、同じ TTY の
+ * ほかの読み手が読み切っても、AGAIN で止まり、次の入力を待たない。立ててから戻すまでは C だけで Lua を呼ばないので、longjmp では
+ * 抜けない。抜けるのはプロセスが死ぬときだけで、そのときは fd 表の項目もプロセスと一緒に消える
+ */
 static void drain(void) {
+    if (!ready_now()) return;
+    __wasi_fdstat_t st;
+    if (__wasi_fd_fdstat_get(0, &st) != 0) return;
+    /* 元から NONBLOCK なら（親から受け継いだなど）立てる・戻すを飛ばす。APPEND などのほかのビットは元の値どおりに書く */
+    int set = (st.fs_flags & __WASI_FDFLAGS_NONBLOCK) == 0;
+    if (set && __wasi_fd_fdstat_set_flags(0, st.fs_flags | __WASI_FDFLAGS_NONBLOCK) != 0) return;
     uint8_t buf[DRAIN_CHUNK];
-    for (int i = 0; i < DRAIN_MAX_READS && ready_now(); i++) {
+    for (int i = 0; i < DRAIN_MAX_READS; i++) {
         __wasi_iovec_t iov = {buf, sizeof buf};
         __wasi_size_t n = 0;
-        if (__wasi_fd_read(0, &iov, 1, &n) != 0 || n == 0) return;
+        if (__wasi_fd_read(0, &iov, 1, &n) != 0 || n == 0) break;
     }
+    /* 戻せなかったときにできることはない（このプロセスの項目だけなので、ほかの読み手には漏れない） */
+    if (set) (void)__wasi_fd_fdstat_set_flags(0, st.fs_flags);
 }
 
 /* 今のモード。読めなければ -1 */
