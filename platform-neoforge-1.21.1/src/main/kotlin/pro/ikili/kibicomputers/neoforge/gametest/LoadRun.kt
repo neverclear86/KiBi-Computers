@@ -220,15 +220,17 @@ internal data class PhaseResult(
     val longTicks: List<LongTick> = emptyList(),
     /** 長い tick の数（上限を超えた分も） */
     val longTickCount: Int = 0,
-    /** 測った tick の時間と、区間（[LoadTickProbe.Section]）の合計の差の最大（ナノ秒） */
+    /** 測った tick の時間と、区間（[LoadTickProbe.Section]）の合計の差の最大（ナノ秒）。区間の置き場所と MSPT の計算が合っているかの確かめ */
     val sectionMismatchNanos: Long = 0,
+    /** 区間（[LoadTickProbe.Section] の順）ごとの、段階の間に区切りを通った回数。0 の区間は、区切りのイベントが届いていない */
+    val sectionMarks: IntArray = IntArray(0),
 )
 
 /**
  * 長い tick の記録（#600）。時刻は JFR・`-Xlog` と突き合わせるため、壁時計（ミリ秒）と JVM の uptime の両方を持つ（どちらも tick の終わり）。
  * [sections] は [LoadTickProbe.Section] の順の区間ごとの時間（ナノ秒）。KiBi の `ServerTickEvent.Pre` の内訳は [completionNanos]
  * （完了の受け取り。[completions] 件）・[managerNanos]（管理の tick）・[autosaveNanos]（自動保存の tick。取り出し [captureNanos] を含む）。
- * [pendingCount]・[pendingBytes] は tick の終わりの書き込み待ち、[gcCount]・[gcMillis] は tick の間の GC の回数と時間
+ * [pendingCount]・[pendingBytes] は tick の終わりの書き込み待ち、[gcCount]・[gcMillis] はその tick の間（tick をそろえる待ちを除く。MSPT と同じ範囲）の GC の回数と時間
  */
 internal class LongTick(
     val phase: LoadPhase,
@@ -642,8 +644,12 @@ internal class LoadRun(
     /** [LoadSettings.quietProgress] のときに止めた、進み具合のロガーの元のレベル */
     private var savedProgressLevel: Log4jLevel? = null
 
-    /** 測った tick の時間と、区間の合計の差の最大（ナノ秒）。区間の切り方に抜け・重なりがないことの確かめ */
+    /** 測った tick の時間と、区間の合計の差の最大（ナノ秒）。区間の置き場所と MSPT の計算が合っているかの確かめ */
     private var sectionMismatch = 0L
+
+    /** 段階の間に、区間ごとの区切りを通った回数（今の tick の分は [tickMarks] に取り、測っている間だけ足す） */
+    private val sectionMarks = IntArray(LoadTickProbe.Section.entries.size)
+    private val tickMarks = IntArray(LoadTickProbe.Section.entries.size)
 
     fun start() {
         // 結果はコンフィグの値に左右される（runClient などと同じ run/config を使う）。既定と違う値があれば、結果と一緒に残す
@@ -676,7 +682,7 @@ internal class LoadRun(
         probe.harnessStart()
         val now = System.nanoTime()
         var work = 0L
-        probe.takeSections(sectionNanos)
+        probe.takeSections(sectionNanos, tickMarks)
         if (prevCallback != 0L) {
             work = (now - prevCallback - prevHarness - prevSleep).coerceAtLeast(0)
             // 自動保存（ServerTickEvent.Pre）・アンロード（チャンクのアンロード、ServerTickEvent.Post）の保存は、前の呼び出しからの間に入っている
@@ -684,6 +690,7 @@ internal class LoadRun(
             if (recording) {
                 record(work, s.captureNanos - prevCapture)
                 sectionMismatch = maxOf(sectionMismatch, abs(work - sectionNanos.sum()))
+                for (i in tickMarks.indices) sectionMarks[i] += tickMarks[i]
                 if (work >= LoadTickProbe.LONG_TICK_MILLIS * 1_000_000) recordLongTick(work, s.captureNanos - prevCapture)
             }
         }
@@ -710,7 +717,10 @@ internal class LoadRun(
                 prevSleep = System.nanoTime() - end
             }
         }
-        if (!finished) tickStart = probe.harnessEnd()
+        if (!finished) {
+            rememberGcCounters()
+            tickStart = probe.harnessEnd()
+        }
     }
 
     private fun gcCount(): Long = gcBeans.sumOf { it.collectionCount.coerceAtLeast(0) }
@@ -723,6 +733,10 @@ internal class LoadRun(
         prevCompletions = s.completionsReceived
         prevManagerTick = s.managerTickNanos
         prevAutosaveTick = s.autosaveTickNanos
+    }
+
+    /** GC の数え口は、tick をそろえる待ちの後（tick の始め）で覚える。待ちの間の GC を、次の tick の GC に混ぜないため */
+    private fun rememberGcCounters() {
         prevGcCount = gcCount()
         prevGcMillis = gcMillis()
     }
@@ -1192,6 +1206,7 @@ internal class LoadRun(
         longTicks.clear()
         longTickCount = 0
         sectionMismatch = 0
+        sectionMarks.fill(0)
         sampleCount = 0
         sentBytes = 0
         peakKernelThreads = 0
@@ -1227,6 +1242,7 @@ internal class LoadRun(
             longTicks = longTicks.toList(),
             longTickCount = longTickCount,
             sectionMismatchNanos = sectionMismatch,
+            sectionMarks = sectionMarks.copyOf(),
         )
         results += result
     }

@@ -132,7 +132,12 @@ neoForge {
             // -PloadTestJvmLog=<ファイル> で、GC と safepoint の JVM のログ（時刻と uptime つき）を取る（長い tick の突き合わせ。#600）。
             // -Xlog のファイル名にドライブの「:」を書くと区切りと混ざる（引用符は起動の引数ファイルで崩れる）ので、run/ からの相対パスで渡す
             providers.gradleProperty("loadTestJvmLog").orNull?.let {
-                val log = file("run").toPath().relativize(file(it).toPath()).toString().replace(File.separatorChar, '/')
+                val runDir = file("run").toPath()
+                val target = file(it).toPath()
+                if (runDir.root != target.root) {
+                    throw GradleException("-PloadTestJvmLog must be on the same drive as ${runDir.root} (the run/ directory): $it")
+                }
+                val log = runDir.relativize(target).toString().replace(File.separatorChar, '/')
                 jvmArgument("-Xlog:gc*,safepoint:file=$log:time,uptime,level,tags")
             }
         }

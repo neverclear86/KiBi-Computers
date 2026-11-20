@@ -23,6 +23,7 @@
 
 長い tick の原因を探すときは、`-PloadTestJvmLog=<ファイル>` で GC と safepoint の JVM のログ（`-Xlog:gc*,safepoint`。壁時計と uptime つき）を取る（#600）。
 長い tick の記録（下の「測るもの」）の時刻・uptime と突き合わせると、その tick に GC・safepoint の止まりがあったかが分かる。
+ファイルは `run/` と同じドライブのパスに限る（`-Xlog` のファイル名に「:」を書けないので、`run/` からの相対パスで渡す。別のドライブだと設定の評価で止める）。
 `-PloadTestQuietProgress=true` で、GameTest のサーバーが 20 tick ごとに書く進み具合のログを試験の間だけ止める（#600 の比べる回。下の「#600 の結果」）。
 
 - `runLoadTestServer` は GameTest のサーバーで、測定用のテスト（`LoadGameTests` が台数ごとに作る）だけを動かす。
@@ -77,10 +78,10 @@ Lua の REPL で測るときはテスト用の起動ディスク（init が Lua 
   途中までの数になり、残りは次の段階（アンロード）の数に混ざっていた。下の表のうち、ログに `Computer saves did not finish within 30000 ms` が出た回は、そのぶん数がずれている
 - **長い tick**（#600。`LoadTickProbe`）: 測った tick のうち 50 ms 以上のものを、段階ごとに最大 32 個覚え、報告の「長い tick」の表と、段階の終わりの
   `Long ticks in the <段階> phase` のログに出す。項目は、段階の中の tick の番号、tick の終わりの時刻（壁時計、ミリ秒）と JVM の uptime、tick の時間、
-  区間の内訳、KiBi の `ServerTickEvent.Pre` の内訳（完了の受け取り・管理の tick・自動保存の tick と、その中の取り出し）、tick の終わりの書き込み待ち、その tick の GC の回数と時間。
+  区間の内訳、KiBi の `ServerTickEvent.Pre` の内訳（完了の受け取り・管理の tick・自動保存の tick と、その中の取り出し）、tick の終わりの書き込み待ち、その tick の GC の回数と時間（tick をそろえる待ちの間の GC は入らない。MSPT と同じ範囲）。
   区間は tick の中のイベントの最初と最後の優先度で区切る: tick の間（`ServerTickEvent.Post` の後から次の `Pre` まで。GameTest のサーバーの後処理・タスクの実行）・
   `Pre`・サーバー（`Pre` の後からディメンションの前まで）・ディメンション（`LevelTickEvent` を含む。チャンクの保存・アンロード）・試験の前（通信・プレイヤー）・
-  試験の後（チャンクの送信・バニラの自動保存）・`Post`。区間の合計は MSPT と同じになる（CI の試験が、差が 1 ms 以内かを確かめる）。
+  試験の後（チャンクの送信・バニラの自動保存）・`Post`。区間の合計は作りの上で MSPT と同じになる（CI の試験は、どの段階でも全部の区切りが通ったことと、差が 1 ms 以内であること（試験の呼び出しの置き場所の確かめ）を見る）。
   tick をそろえる手元の測定では、あわせて見張りのスレッド（`LoadTest stall sampler`。カーネルのスレッドには数えない）が 10 ms ごとに tick の始めからの時間を見て、
   50 ms を超えたら `Server thread` と書き込みのスレッドのスタックを取り（1回の止まりに 40 個まで）、段階の終わりにまとめて出す。
   記録とスタックは tick の中ではログに書かない（メインスレッドのログの書き込みそのものが止まりになるため。下の「#600 の結果」）。tick ごとの処理は台数によらない

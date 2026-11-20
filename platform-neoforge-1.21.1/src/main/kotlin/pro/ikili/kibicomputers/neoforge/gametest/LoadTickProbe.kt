@@ -68,6 +68,9 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
     )
 
     private val sections = LongArray(Section.entries.size)
+
+    /** 区間ごとに、区切りを通った回数（[takeSections] で 0 に戻す） */
+    private val marks = IntArray(Section.entries.size)
     private var lastMark = 0L
 
     /** 試験の呼び出しの後の時刻（`System.nanoTime`）。試験の呼び出しの間は 0。見張りが読む */
@@ -118,10 +121,12 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
         return now
     }
 
-    /** 区間ごとの時間（ナノ秒。[Section] の順）を [into] に写し、0 に戻す */
-    fun takeSections(into: LongArray) {
+    /** 区間ごとの時間（ナノ秒。[Section] の順）を [into] に、区切りを通った回数を [intoMarks] に写し、0 に戻す */
+    fun takeSections(into: LongArray, intoMarks: IntArray) {
         sections.copyInto(into)
         sections.fill(0)
+        marks.copyInto(intoMarks)
+        marks.fill(0)
     }
 
     /** ここまでに取ったスタックを渡して空にする。あわせて、上限で捨てた数を返す */
@@ -136,6 +141,7 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
     private fun mark(section: Section) {
         val now = System.nanoTime()
         if (lastMark != 0L) sections[section.ordinal] += now - lastMark
+        marks[section.ordinal]++
         lastMark = now
         lastSection = section.ordinal
     }
