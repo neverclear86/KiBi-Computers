@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.neoforge.computer
 import net.minecraft.network.RegistryFriendlyByteBuf
 import net.minecraft.world.Container
 import net.minecraft.world.entity.player.Inventory
+import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.inventory.AbstractContainerMenu
 import net.minecraft.world.inventory.ContainerData
@@ -73,7 +74,8 @@ class CaseMenu private constructor(
         if (id != POWER_BUTTON) return false
         // 権限はサーバーで確かめる（#131。メンバーから外れた人の押下を受けない）
         if (blockEntity != null && !blockEntity.checkAccess(player)) return false
-        blockEntity?.pressPowerButton()
+        // 押したプレイヤーの言語を、起動する OS の既定の言語にする（#661）
+        blockEntity?.pressPowerButton(player as? ServerPlayer)
         return true
     }
 

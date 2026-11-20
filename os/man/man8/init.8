@@ -14,6 +14,8 @@ init is started first when the computer boots (pid 1). It reads `/etc/inittab`, 
 
 Without `/etc/inittab`, init starts `/bin/sh` only.
 
+Programs get `PATH=/bin:/sbin`, `HOME=/` and, when the computer knows it, `LANG` set to the language of the player who turned it on. `env` lines in `/etc/inittab` override them.
+
 ## FILES
 
 - `/etc/inittab`: what to start at boot
