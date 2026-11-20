@@ -734,6 +734,9 @@ internal class LoadRun(
     /** 本番の形の自動保存（#834）: 周期の数え口が一巡を始めた tick の番号（[vanillaSaveTick] と同じ数え方。-1 は見ていない）と、前の呼び出しでの始めた回数 */
     private var cycleStartTick = -1
     private var prevCycleStarts = 0L
+
+    /** 本番の形の自動保存（#834）: 仕掛けたときの、周期の数え口が一巡を始めた回数。これより増えたら、一巡が始まった */
+    private var cycleStartsAtArm = 0L
     private var vanillaSaveNanos = 0L
     private var vanillaSaveSections = ""
     private var vanillaSavePending = 0
@@ -1085,8 +1088,9 @@ internal class LoadRun(
         if (phaseTick == 0) return
         val s = ServerMachines.Stats
         if (measuredTick == null) {
-            val started = s.windowSubmits > 0 || s.autosaveCycleTicks.isNotEmpty()
-            // 一巡が本物の経路で始まったら、すぐに周期を止める（周期は次の一巡を始める tick を決めるだけで、一巡の進め方には使わない）。
+            // 一巡の始まりは、cycleStartTick と同じく周期の数え口が一巡を始めた回数で見る（一巡の1 tick 目は止めるだけで、書き込みの予約はまだない）
+            val started = s.autosaveCycleStarts > cycleStartsAtArm
+            // 一巡が本物の経路で始まったら、その tick のうちに周期を止める（周期は次の一巡を始める tick を決めるだけで、一巡の進め方には使わない）。
             // 一巡の残り・書き込みの残り・バニラの保存を待つ間に 2 つ目の一巡が始まらないので、止めた後の上限は PRODUCTION_TIMEOUT_TICKS。
             // 止める前（一巡が始まる前）は、2 つ目の一巡が来る tick の前に打ち切る（始まると、数え口が 2 周分たまって別の理由で落ちる）
             if (started && !productionPeriodStopped) {
@@ -1414,6 +1418,7 @@ internal class LoadRun(
         vanillaSaveTick = -1
         cycleStartTick = -1
         prevCycleStarts = ServerMachines.Stats.autosaveCycleStarts
+        cycleStartsAtArm = prevCycleStarts
         probe.takeSyntheticLog()
         probe.syntheticLogEveryTicks = settings.syntheticLogTicks
         logCounter?.begin()
@@ -1638,7 +1643,7 @@ internal class LoadRun(
         /**
          * 本番の形の自動保存（#834）で、一巡と書き込みが全部終わるまで待つ上限（tick）。メインスレッドを止めて待たないので、
          * 一巡の後の書き込みの残りも tick を数えて待つ（1,000 台で 1〜2 分かかる回がある）。
-         * 一巡が本物の経路で始まった tick に周期を止める（2 つ目の一巡は始まらない）ので、一巡の残り・書き込みの残り・バニラの保存を待つ間は、
+         * 一巡が本物の経路で始まった tick（周期の数え口が一巡を始めた tick）に周期を止める（2 つ目の一巡は始まらない）ので、一巡の残り・書き込みの残り・バニラの保存を待つ間は、
          * この値（段階の始めから数える）が上限になる。一巡が始まる前だけは、上限が「周期 + [PRODUCTION_LEAD_TICKS] - 1」を超えない
          */
         private const val PRODUCTION_TIMEOUT_TICKS = 12_000
