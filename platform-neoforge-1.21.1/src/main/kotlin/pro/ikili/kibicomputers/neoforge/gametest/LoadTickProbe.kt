@@ -107,10 +107,11 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
         sampler = null
     }
 
-    /** 試験の呼び出しの始め（メインスレッド）。ここまでを [Section.BEFORE_HARNESS] に足し、見張りを止める */
-    fun harnessStart() {
-        mark(Section.BEFORE_HARNESS)
+    /** 試験の呼び出しの始め（メインスレッド）。ここまでを [Section.BEFORE_HARNESS] に足し、見張りを止める。区切った時刻を返す */
+    fun harnessStart(): Long {
+        val now = mark(Section.BEFORE_HARNESS)
         workSince = 0
+        return now
     }
 
     /** 試験の呼び出しの終わり（tick をそろえて待った後。メインスレッド）。ここから次の区間を数える。tick の始めの時刻を返す */
@@ -138,12 +139,13 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
         taken to dropped
     }
 
-    private fun mark(section: Section) {
+    private fun mark(section: Section): Long {
         val now = System.nanoTime()
         if (lastMark != 0L) sections[section.ordinal] += now - lastMark
         marks[section.ordinal]++
         lastMark = now
         lastSection = section.ordinal
+        return now
     }
 
     private fun watch() {

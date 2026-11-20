@@ -679,8 +679,8 @@ internal class LoadRun(
 
     private fun onTick() {
         if (finished) return
-        probe.harnessStart()
-        val now = System.nanoTime()
+        // 区間の終わりと tick の時間の終わりを同じ時刻にする（別々に取ると、間でメインスレッドが止まったぶんだけ差になる）
+        val now = probe.harnessStart()
         var work = 0L
         probe.takeSections(sectionNanos, tickMarks)
         if (prevCallback != 0L) {
@@ -714,12 +714,14 @@ internal class LoadRun(
             val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
             if (wait > 0) {
                 LockSupport.parkNanos(wait)
-                prevSleep = System.nanoTime() - end
             }
         }
         if (!finished) {
             rememberGcCounters()
             tickStart = probe.harnessEnd()
+            // 待ちと GC の数え口を読む時間も、試験の呼び出しの間として引く（区間は harnessEnd から数えるので、ここを引かないと
+            // 区間の合計との差になる。GC の数え口を読む間にメインスレッドが止まると、数 ms ずれる）
+            prevSleep = tickStart - end
         }
     }
 
