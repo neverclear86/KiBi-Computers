@@ -59,7 +59,8 @@ private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
  * @property tmpBytes [tmpCommand] が書くファイルの大きさ（バイト）。`TMPFS` 節はこれより大きくなる
  * @property bootDisk ケースの既定の起動ディスク（`fallbackBootDisk`）。`null` ならゲームの既定（標準 OS。#461）
  * @property computeProcess [computeCommand] が動かすプロセスの名前（`argv[0]`）。`null` でなければ、[LoadPhase.COMPUTE] は、
- *   計算させる台の全部にこのプロセスがあり、燃料切れの巻き戻しが計算させる台の数より多く増えてから測りはじめる（読み込み・起動の途中を測らない。#821）
+ *   計算させる台の全部にこのプロセスがあり、全部の台で段階に入ってからの台ごとの燃料切れの巻き戻し（`Machine.fuelUnwindCount`）が
+ *   1 回以上になってから測りはじめる（読み込み・起動の途中を測らない。#821）
  * @property ci CI の試験（`runGameTestServer`）でも動かすか。`false` のものは測定用（`-PloadTestOs`）だけ
  */
 internal enum class LoadOs(
@@ -739,7 +740,7 @@ internal class LoadRun(
     private var peakKernelThreads = 0
     private var peakPhaseKernelThreads = 0
 
-    /** 段階に入ったときの燃料の数え口（[LoadOs.computeProcess] の起動を待つため） */
+    /** 段階に入ったときの燃料の数え口（[LoadOs.computeProcess] が起動しないときの失敗メッセージに、段階に入ってからの増分を出すため） */
     private var fuelAtPhase = FuelCounts.ZERO
 
     /** 測りはじめたときの燃料の数え口（測っていなければ `null`） */

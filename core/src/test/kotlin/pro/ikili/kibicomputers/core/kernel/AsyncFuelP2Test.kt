@@ -563,10 +563,18 @@ class AsyncFuelP2Test {
                 a == b && h.scheduler.fuelUnwindCount == b && h.scheduler.fuelBlockingWaitCount == h.scheduler.fuelBlockingWaits.get() &&
                     h.scheduler.fuelOverdraftCount == h.scheduler.fuelOverdrafts.get()
             }
-            // 台ごとの巻き戻しの数（接続層の負荷試験が、台ごとに起動が済んだかを見る）の合計は、スケジューラ全体の巻き戻しと譲りの数と合う
+            // 台ごとの巻き戻しの数（接続層の負荷試験が、台ごとに起動が済んだかを見る）は、巻き戻した燃料切れ（燃料待ちの fuelUnwinds と、
+            // 巻き戻して譲った分）を数える。fuelYields には、巻き戻せないところ（起動の途中の realloc の中など）でスレッドを持ったまま
+            // 譲った分も入るので、合計は fuelUnwinds 以上、fuelUnwinds + fuelYields 以下になる（等しいとは限らない）
             val perMachine = spins.map { it.m }.distinct()
             assertTrue(perMachine.all { it.fuelUnwindCount > 0 }, "巻き戻していない台がある")
-            assertEquals(h.scheduler.fuelUnwinds.get() + h.scheduler.fuelYields.get(), perMachine.sumOf { it.fuelUnwindCount })
+            val perMachineSum = perMachine.sumOf { it.fuelUnwindCount }
+            val unwindTotal = h.scheduler.fuelUnwinds.get()
+            val yieldTotal = h.scheduler.fuelYields.get()
+            assertTrue(
+                perMachineSum in unwindTotal..(unwindTotal + yieldTotal),
+                "台ごとの巻き戻しの合計 $perMachineSum が、巻き戻し $unwindTotal と譲り $yieldTotal の範囲にない",
+            )
         }
     }
 }
