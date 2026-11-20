@@ -112,7 +112,10 @@ internal class LoadTickProbe(private val serverThread: Thread, private val sampl
     private var syntheticMax = 0L
 
     /**
-     * オーバーワールドの `LevelEvent.Save`（バニラの保存の中。`saveAllChunks` の始め）が最後に来たときの、KiBi の書き込み待ちの仕事の数（#834）。
+     * オーバーワールドの `LevelEvent.Save`（バニラの保存の中）が最後に来たときの、KiBi の書き込み待ちの仕事の数（#834）。
+     * このイベントは `ServerLevel.save` の終わりに post される（`saveLevelData`・チャンクの保存・エンティティの保存の後。ネザー・エンドと `level.dat` の書き込みの前）。
+     * なので、取っている値は保存の始めの数ではなく、「オーバーワールドのチャンクを保存し終えた時点」の数で、
+     * チャンクの保存の `ChunkDataEvent.Save` が積んだ仕事は入り、その間に書き込みのスレッドがさばいた分は減っている。
      * -1 はまだ来ていない。[armLevelSave] で -1 に戻す。メインスレッドだけで使う
      */
     var pendingAtLevelSave: Int = -1

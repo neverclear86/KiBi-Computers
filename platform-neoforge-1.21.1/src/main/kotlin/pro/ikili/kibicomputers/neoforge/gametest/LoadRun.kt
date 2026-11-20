@@ -1073,14 +1073,18 @@ internal class LoadRun(
             val started = s.windowSubmits > 0 || s.autosaveCycleTicks.isNotEmpty()
             val done = started && ServerMachines.isAutosaveCycleDone && s.windowOutstanding <= 0 && vanillaSaveTick >= 0
             if (!done) {
-                if (phaseTick >= PRODUCTION_TIMEOUT_TICKS) {
+                // 2 つ目の一巡（周期が来る tick）が本物の経路で始まる前に打ち切る。始まると、数え口が 2 周分たまって別の理由で落ちる
+                val limit = minOf(PRODUCTION_TIMEOUT_TICKS.toLong(), productionPeriod + PRODUCTION_LEAD_TICKS - 1).toInt()
+                if (phaseTick >= limit) {
                     fail(
-                        "the production-shaped autosave did not finish within $PRODUCTION_TIMEOUT_TICKS ticks " +
+                        "the production-shaped autosave did not finish within $limit ticks " +
                             "(cycle done ${ServerMachines.isAutosaveCycleDone}, outstanding ${s.windowOutstanding}, vanilla save tick $vanillaSaveTick)",
                     )
                 }
                 return
             }
+            // 一巡が終わったら、書き込みの残りを待つ間に次の周期が来ないように止める
+            ServerMachines.saveConfig = ServerMachines.saveConfig.copy(autosavePeriodTicks = Long.MAX_VALUE)
             stopMeasuring()
         }
         if (!awaitPhaseSaves()) return
@@ -1589,8 +1593,10 @@ internal class LoadRun(
         private const val PRODUCTION_LEAD_TICKS = 20
 
         /**
-         * 本番の形の自動保存（#834）で、書き込みが全部終わるまで待つ上限（tick）。メインスレッドを止めて待たないので、
-         * 一巡の後の書き込みの残りも tick を数えて待つ（1,000 台で 1〜2 分かかる回がある）
+         * 本番の形の自動保存（#834）で、一巡と書き込みが全部終わるまで待つ上限（tick）。メインスレッドを止めて待たないので、
+         * 一巡の後の書き込みの残りも tick を数えて待つ（1,000 台で 1〜2 分かかる回がある）。
+         * 周期を止めていない間は 2 つ目の一巡が始まってしまうので、実際の上限は「周期 + [PRODUCTION_LEAD_TICKS] - 1」（既定の 6000 tick なら約 6,019）を超えない。
+         * 一巡が終わった後は周期を止めるので、書き込みの残りを待つ間の上限にはならない
          */
         private const val PRODUCTION_TIMEOUT_TICKS = 12_000
 
