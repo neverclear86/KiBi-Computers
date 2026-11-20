@@ -418,6 +418,9 @@ internal data class UnloadResult(
  * @property periodTicks 一巡を始めた周期（`autosavePeriodTicks`）
  * @property vanillaSaveOffset バニラの自動保存を、一巡の始めの tick から何 tick 後にしたか
  * @property serverTickAtStart 段階の始めのサーバーの tick（`getTickCount`。6000 以上なら、その前にバニラの自動保存が走っている）
+ * @property cycleStartTick 周期の数え口が一巡を始めた `ServerTickEvent.Pre` を含む tick の、測った tick の中の番号（0 から。-1 なら見えなかった）。
+ *   [vanillaSaveTick] と同じ数え方で、バニラの保存は `Pre` の tick の終わりに走るので、次の tick の番号になる
+ *   （[vanillaSaveTick] ＝ [cycleStartTick] ＋ 1 ＋ [vanillaSaveOffset] が、狙った重なり方。外れたら段階が落ちる）
  * @property vanillaSaveTick バニラの自動保存が走った tick の、測った tick の中の番号（0 から。-1 なら走らなかった）
  * @property vanillaSaveNanos その tick の時間（MSPT と同じ数え方）
  * @property vanillaSaveSections その tick の区間の内訳（[LongTick.sectionSummary] と同じ書き方）
@@ -430,6 +433,7 @@ internal class ProductionAutosaveResult(
     val periodTicks: Long,
     val vanillaSaveOffset: Int,
     val serverTickAtStart: Int,
+    val cycleStartTick: Int,
     val vanillaSaveTick: Int,
     val vanillaSaveNanos: Long,
     val vanillaSaveSections: String,
@@ -483,8 +487,8 @@ internal class LoadReport(
             if (it.vanillaSaveTick >= 0) {
                 sb.append(
                     String.format(
-                        Locale.ROOT, "- バニラの自動保存の tick: 測った %d tick のうち %d 番目、%.2f ms = [%s] ms、その保存の中の KiBi の書き込み待ち %d 件\n",
-                        it.tickCount, it.vanillaSaveTick, it.vanillaSaveNanos / 1e6, it.vanillaSaveSections, it.vanillaSavePending,
+                        Locale.ROOT, "- バニラの自動保存の tick: 測った %d tick のうち %d 番目（一巡が始まった tick は %d 番目。差 %d、狙いは %d）、%.2f ms = [%s] ms、その保存の中の KiBi の書き込み待ち %d 件\n",
+                        it.tickCount, it.vanillaSaveTick, it.cycleStartTick, it.vanillaSaveTick - it.cycleStartTick, 1 + it.vanillaSaveOffset, it.vanillaSaveNanos / 1e6, it.vanillaSaveSections, it.vanillaSavePending,
                     ),
                 )
             } else {
@@ -726,6 +730,10 @@ internal class LoadRun(
     private val vanillaAutosave = if (settings.productionAutosave) VanillaAutosave(level.server) else null
     private var prevVanillaTicks = -1
     private var vanillaSaveTick = -1
+
+    /** 本番の形の自動保存（#834）: 周期の数え口が一巡を始めた tick の番号（[vanillaSaveTick] と同じ数え方。-1 は見ていない）と、前の呼び出しでの始めた回数 */
+    private var cycleStartTick = -1
+    private var prevCycleStarts = 0L
     private var vanillaSaveNanos = 0L
     private var vanillaSaveSections = ""
     private var vanillaSavePending = 0
@@ -826,6 +834,10 @@ internal class LoadRun(
      */
     private fun observeVanillaSave(vanilla: VanillaAutosave, work: Long) {
         val ticks = vanilla.ticksUntilAutosave
+        // 一巡を始めるのは tick の始め（Pre）なので、始まったなら、この呼び出しの tick の中（直前の区間）
+        val starts = ServerMachines.Stats.autosaveCycleStarts
+        if (phase == LoadPhase.AUTOSAVE && recording && cycleStartTick < 0 && starts > prevCycleStarts) cycleStartTick = sampleCount
+        prevCycleStarts = starts
         if (phase == LoadPhase.AUTOSAVE && recording && prevVanillaTicks >= 0 && ticks > prevVanillaTicks && vanillaSaveTick < 0) {
             vanillaSaveTick = sampleCount
             vanillaSaveNanos = work
@@ -1099,6 +1111,14 @@ internal class LoadRun(
             stopMeasuring()
         }
         if (!awaitPhaseSaves()) return
+        // バニラの保存が、狙ったとおり「一巡の始めの tick（+ offset）」の終わりに走ったか。数え口の進め方が変わると、別の形を黙って測ることになる
+        val expectedGap = 1 + settings.vanillaSaveOffset
+        if (cycleStartTick < 0 || vanillaSaveTick - cycleStartTick != expectedGap) {
+            fail(
+                "the vanilla autosave did not overlap the cycle start as planned: cycle start tick $cycleStartTick, " +
+                    "vanilla save tick $vanillaSaveTick (expected the difference to be $expectedGap)",
+            )
+        }
         probe.syntheticLogEveryTicks = 0
         val tick = measuredTick!!
         autosaveResult = AutosaveResult(
@@ -1114,6 +1134,7 @@ internal class LoadRun(
             periodTicks = productionPeriod,
             vanillaSaveOffset = settings.vanillaSaveOffset,
             serverTickAtStart = serverTickAtStart,
+            cycleStartTick = cycleStartTick,
             vanillaSaveTick = vanillaSaveTick,
             vanillaSaveNanos = vanillaSaveNanos,
             vanillaSaveSections = vanillaSaveSections,
@@ -1391,6 +1412,8 @@ internal class LoadRun(
         probe.armLevelSave()
         prevVanillaTicks = vanilla.ticksUntilAutosave
         vanillaSaveTick = -1
+        cycleStartTick = -1
+        prevCycleStarts = ServerMachines.Stats.autosaveCycleStarts
         probe.takeSyntheticLog()
         probe.syntheticLogEveryTicks = settings.syntheticLogTicks
         logCounter?.begin()
