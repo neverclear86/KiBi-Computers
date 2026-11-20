@@ -137,6 +137,11 @@ pub fn fstat(fd: Fd) Error!Stat {
     return toStat(s);
 }
 
+/// 開いた fd のファイルの長さを [size] にする（縮めると後ろを捨て、伸ばすと 0 で埋める）。書く権利が要る
+pub fn setSize(fd: Fd, size: u64) Error!void {
+    try errno.check(wasi.fd_filestat_set_size(fd, size));
+}
+
 pub const OpenFlags = struct {
     read: bool = true,
     write: bool = false,
@@ -163,7 +168,7 @@ pub fn open(path: []const u8, flags: OpenFlags) Error!Fd {
     if (flags.directory) oflags |= wasi.O_DIRECTORY;
     var rights: wasi.Rights = wasi.RIGHT_FD_FILESTAT_GET | wasi.RIGHT_FD_SEEK | wasi.RIGHT_FD_TELL;
     if (flags.read) rights |= wasi.RIGHT_FD_READ;
-    if (flags.write) rights |= wasi.RIGHT_FD_WRITE;
+    if (flags.write) rights |= wasi.RIGHT_FD_WRITE | wasi.RIGHT_FD_FILESTAT_SET_SIZE;
     if (flags.directory) rights |= wasi.RIGHT_FD_READDIR | wasi.RIGHT_FD_READ;
     const fdflags: u16 = if (flags.append) wasi.FDFLAG_APPEND else 0;
     var fd: Fd = 0;

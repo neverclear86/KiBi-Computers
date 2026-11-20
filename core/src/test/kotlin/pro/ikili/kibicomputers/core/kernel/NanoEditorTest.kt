@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.kernel.tty.TtyMode
 import pro.ikili.kibicomputers.core.kernel.vfs.ImageFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
+import pro.ikili.kibicomputers.core.kernel.vfs.TightFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.io.ByteArrayOutputStream
@@ -187,6 +188,7 @@ class NanoEditorTest {
     private val ctrlX = "\u0018"
     private val ctrlS = "\u0013"
     private val ctrlO = "\u000f"
+    private val ctrlK = "\u000b"
 
     @Test
     fun `開いたファイルを描き、下にキーの案内を出す。書いて保存して終わると、元の画面とモードに戻る`() = nano(
@@ -328,6 +330,89 @@ class NanoEditorTest {
         assertEquals("data\n", file("/ro/a.txt")!!.decodeToString())
         // 一時ファイルを残していない
         assertEquals(null, file("/tmp/.b.txt.nano0"))
+    }
+
+    /** 空きのない `/d`（[TightFileSystem]）に [content] の `/d/a.txt` を置く */
+    private fun tightDisk(fs: TightFileSystem, content: String): (Machine) -> Unit = { m ->
+        m.vfs.createDirectory(VfsPath.parse("/d"))
+        m.vfs.mount(VfsPath.parse("/d"), fs, readOnly = false, source = "test:tight")
+        m.put("/d/a.txt", content.toByteArray())
+        fs.free = 0
+    }
+
+    @Test
+    fun `一時ファイルの空きがなく直接書くとき、縮めて空いた分をほかに取られても、元を空にせず保存できる`() {
+        val fs = TightFileSystem().apply { stealFreed = true }
+        nano(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\nsecond\n")) {
+            // 昔の形（切り詰めてから書く）だと、切り詰めて空いた分を取られて NOSPC になり、ファイルが空になる
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Wrote 1 line"), screen)
+            assertEquals("second\n", file("/d/a.txt")!!.decodeToString())
+            assertEquals(null, file("/d/.a.txt.nano0"))
+            keys(ctrlX)
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
+    fun `直接書く前に元が縮められていたら、何も書かずに一時ファイルのエラーを知らせる`() {
+        val fs = TightFileSystem()
+        // 一時ファイルに書けなかった直後（lstat の後）に、ほかのプロセスが元を 3 バイトに縮める
+        fs.onNoSpace = { inner -> inner.setSize(inner.stat(VfsPath.parse("/a.txt")).node, 3) }
+        nano(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\nsecond\n")) {
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Error writing /d/a.txt: No space left on device"), screen)
+            assertEquals("hel", file("/d/a.txt")!!.decodeToString())
+            assertEquals(null, file("/d/.a.txt.nano0"))
+            assertTrue(row(0).contains("Modified"), row(0))
+            keys(ctrlX)
+            assertTrue(row(22).contains("Save modified buffer?"), screen)
+            keys("n")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
+    fun `直接書く前に元が消されていたら、空のファイルを作らずにエラーを知らせる`() {
+        val fs = TightFileSystem()
+        fs.onNoSpace = { inner -> inner.removeFile(VfsPath.parse("/a.txt")) }
+        nano(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\nsecond\n")) {
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Error writing /d/a.txt: No such file or directory"), screen)
+            assertEquals(null, file("/d/a.txt"))
+            assertEquals(null, file("/d/.a.txt.nano0"))
+            keys(ctrlX)
+            assertTrue(row(22).contains("Save modified buffer?"), screen)
+            keys("n")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
+    fun `直接書く途中でIOエラーになっても、ファイルを空にせず、変えた印を残す`() {
+        val fs = TightFileSystem()
+        nano(
+            listOf("/d/a.txt"),
+            setup = { m ->
+                tightDisk(fs, "hello world\nsecond\n")(m)
+                fs.failWriteNode = fs.stat(VfsPath.parse("/a.txt")).node
+                fs.failWriteAfter = 4
+            },
+        ) {
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Error writing /d/a.txt: I/O error"), screen)
+            // 先頭は途中まで新しい中身で、後ろは元のまま（長さは変わらない）
+            assertEquals("secoo world\nsecond\n", file("/d/a.txt")!!.decodeToString())
+            assertTrue(row(0).contains("Modified"), row(0))
+            keys(ctrlX)
+            assertTrue(row(22).contains("Save modified buffer?"), screen)
+            keys("n")
+            assertEquals(0, finish())
+        }
     }
 
     @Test

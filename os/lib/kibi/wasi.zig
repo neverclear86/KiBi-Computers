@@ -105,6 +105,7 @@ pub const RIGHT_FD_TELL: Rights = 1 << 5;
 pub const RIGHT_FD_WRITE: Rights = 1 << 6;
 pub const RIGHT_FD_READDIR: Rights = 1 << 14;
 pub const RIGHT_FD_FILESTAT_GET: Rights = 1 << 21;
+pub const RIGHT_FD_FILESTAT_SET_SIZE: Rights = 1 << 22;
 /// 開くときに求める権利（全部。カーネルは持てない権利を黙って落とす）
 pub const RIGHTS_ALL: Rights = (1 << 29) - 1;
 
@@ -119,6 +120,7 @@ pub extern "wasi_snapshot_preview1" fn fd_read(fd: Fd, iovs: [*]const Iovec, n: 
 pub extern "wasi_snapshot_preview1" fn fd_write(fd: Fd, iovs: [*]const Ciovec, n: Size, written: *Size) u16;
 pub extern "wasi_snapshot_preview1" fn fd_seek(fd: Fd, offset: i64, whence: u8, newoffset: *Filesize) u16;
 pub extern "wasi_snapshot_preview1" fn fd_filestat_get(fd: Fd, buf: *Filestat) u16;
+pub extern "wasi_snapshot_preview1" fn fd_filestat_set_size(fd: Fd, size: Filesize) u16;
 pub extern "wasi_snapshot_preview1" fn fd_readdir(fd: Fd, buf: [*]u8, len: Size, cookie: u64, used: *Size) u16;
 pub extern "wasi_snapshot_preview1" fn path_open(dirfd: Fd, dirflags: u32, path: [*]const u8, path_len: Size, oflags: u16, base: Rights, inheriting: Rights, fdflags: u16, fd: *Fd) u16;
 pub extern "wasi_snapshot_preview1" fn path_filestat_get(dirfd: Fd, flags: u32, path: [*]const u8, path_len: Size, buf: *Filestat) u16;
