@@ -137,16 +137,19 @@ public class MachineSaveStore @JvmOverloads constructor(
     private val initialized: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
     /**
-     * 新しく振った `owner.bin` が書けなかった UUID（後続の仕事は書かずに失敗で返す。#84 の規則 7b）。外すのは、メインスレッドが失敗を
-     * 受け取り（[dropped]）、かつその UUID の仕事が残っていないとき（#566。仕事が尽きた時点で外すと、受け取る前に入れた後続が書かれる）
+     * 新しく振った `owner.bin` が書けなかった UUID（後続の仕事は書かずに失敗で返す。#84 の規則 7b）。外すのは、メインスレッドが
+     * 「使えない」の失敗の完了を全部受け取り（[unreceivedUnusable] にない）、かつその UUID の仕事が残っていないとき
+     * （#566。仕事が尽きた時点で外すと、受け取る前に入れた後続が書かれる）。`owner.bin` の書き込みが成功したときも外す
      */
     private val unusable: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
     /**
-     * [unusable] のうち、メインスレッドが失敗の完了を受け取ったもの（#566）。[accept] は「ここに入れる → 仕事が残っているか見る」、
-     * [finishTask] は「仕事の数を減らす → ここにあるか見る」の順なので、どちらかが必ず最後の仕事の後に [unusable] から外す
+     * UUID → 積んだが、メインスレッドがまだ受け取っていない「使えない」の失敗の完了（[Done.unusable]）の数（#566・#585）。
+     * 受け入れ直しで同じ ID の `owner.bin` の失敗が 2 回以上続いても、最後の失敗を受け取るまで [unusable] を外さないよう、集合でなく数で持つ。
+     * [accept] は「数を減らす → 仕事が残っているか見る」、[finishTask] は「数を増やす → 完了を積む → 仕事の数を減らす → ここにあるか見る」
+     * の順なので、どちらかが必ず最後の仕事・最後の受け取りの後に [unusable] から外す
      */
-    private val dropped: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
+    private val unreceivedUnusable = ConcurrentHashMap<UUID, Int>()
 
     // ---- 両方が触る ----
 
@@ -190,37 +193,94 @@ public class MachineSaveStore @JvmOverloads constructor(
     @Volatile
     private var prefetched: HashMap<UUID, Prefetched>? = null
 
+    /**
+     * 先読みのスレッドが読まない ID（このサーバーで触った ID。[touched] の写しで、どのスレッドからも読める。#585）。
+     * 触った ID は、書き込みのスレッドが `owner.bin` を置き換えうる。Windows では、開いているファイルへの置き換え（`ATOMIC_MOVE`）が
+     * 失敗するので、触った ID は先読みで開かない（[awaitPrefetchRead]）
+     */
+    private val prefetchSkip: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
+
+    /** 先読みのスレッドが今読んでいる ID（[prefetchReading]）と、[prefetchSkip] の確かめを守る錠（#585） */
+    private val prefetchLock = ReentrantLock()
+    private val prefetchIdle = prefetchLock.newCondition()
+
+    /** 先読みのスレッドが今開いている `owner.bin` の ID（[prefetchLock] の中で読み書きする） */
+    private var prefetchReading: UUID? = null
+
+    /** 先読みの仕事を作ってから、その仕事が終わるまで真 */
+    @Volatile
+    private var prefetchRunning: Boolean = false
+
     /** 先読みの値で claim した回数（数え口。#585） */
     public var prefetchHits: Long = 0
         private set
+
+    /** 先読みのスレッドが `owner.bin` を読む口（テストが、読みの途中で止めるために差し替える。#585） */
+    internal var prefetchOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
 
     /** 先読みが終わったか（数え口・テスト用） */
     public val ownerPrefetchDone: Boolean get() = prefetched != null
 
     /**
      * 開いたときに [root] にあった ID（[knownDirectories] の今の中身）の `owner.bin` を読む仕事を作り、[runner] で走らせる（#585）。
-     * 読むのは別のスレッドで、メインスレッドは結果が入った後にだけ見る。このサーバーで触った ID（claim・`delete`）には使わない
+     * 読むのは別のスレッドで、メインスレッドは結果が入った後にだけ見る。このサーバーで触った ID（claim・`delete`）には使わず、
+     * 読む前に触っていたら開かない（書き込みのスレッドの `owner.bin` の置き換えと重ねない。[awaitPrefetchRead]）
      */
     internal fun startOwnerPrefetch(runner: (Runnable) -> Unit) {
         val ids = knownDirectories.toList()
+        prefetchRunning = true
         runner(
             Runnable {
                 val start = System.nanoTime()
                 val out = HashMap<UUID, Prefetched>(ids.size * 2)
-                for (id in ids) {
-                    out[id] = try {
-                        OwnerRecord.read(directoryOf(id).resolve(OwnerRecord.FILE_NAME))?.let { Prefetched.Found(it) } ?: Prefetched.Missing
-                    } catch (e: IOException) {
-                        Prefetched.Unreadable("${e.message}")
-                    } catch (e: RuntimeException) {
-                        Prefetched.Unreadable("$e")
+                try {
+                    for (id in ids) {
+                        val skip = prefetchLock.withLock {
+                            (id in prefetchSkip).also { if (!it) prefetchReading = id }
+                        }
+                        if (skip) continue
+                        try {
+                            out[id] = try {
+                                prefetchOwnerReader(directoryOf(id).resolve(OwnerRecord.FILE_NAME))?.let { Prefetched.Found(it) } ?: Prefetched.Missing
+                            } catch (e: IOException) {
+                                Prefetched.Unreadable("${e.message}")
+                            } catch (e: RuntimeException) {
+                                Prefetched.Unreadable("$e")
+                            }
+                        } finally {
+                            prefetchLock.withLock {
+                                prefetchReading = null
+                                prefetchIdle.signalAll()
+                            }
+                        }
                     }
+                } finally {
+                    prefetchRunning = false
                 }
                 prefetched = out
                 val millis = (System.nanoTime() - start) / 1_000_000.0
                 LOG.log(System.Logger.Level.INFO, "Prefetched owner.bin of ${ids.size} machines in $root (${"%.1f".format(millis)} ms)")
             },
         )
+    }
+
+    /** [id] を触った（claim・`delete`・振った）。先読みの値を使わず、先読みのスレッドもその ID を開かない（#585） */
+    private fun touch(id: UUID) {
+        touched += id
+        prefetchSkip += id
+    }
+
+    /**
+     * 書き込みのスレッドで、[id] の `owner.bin` を置き換える・消す前に、先読みのスレッドがそのファイルを読み終えるのを待つ（#585）。
+     * Windows では、開いているファイルへの `ATOMIC_MOVE`（`REPLACE_EXISTING`）が `AccessDeniedException` になるため。
+     * メインスレッドは、その仕事を入れる前に [touch] で [prefetchSkip] に入れているので、ここを抜けた後に先読みが [id] を開くことはない。
+     * 待つのは読みの 1 回分まで（1 件数 ms）で、先読みが終わった後は錠を取らない
+     */
+    private fun awaitPrefetchRead(id: UUID) {
+        if (!prefetchRunning) return
+        prefetchLock.withLock {
+            while (prefetchReading == id) prefetchIdle.awaitUninterruptibly()
+        }
     }
 
     /**
@@ -379,12 +439,12 @@ public class MachineSaveStore @JvmOverloads constructor(
                 is Prefetched.Found -> p.record.also { prefetchHits++ }
                 Prefetched.Missing -> null.also { prefetchHits++ }
                 is Prefetched.Unreadable -> {
-                    touched += id
+                    touch(id)
                     return fresh(self, ClaimResult.NEW_ID_UNREADABLE, "owner.bin of $id is unreadable: ${p.reason}")
                 }
                 null -> {
                     if (!awaitIdle(id)) return fresh(self, ClaimResult.NEW_ID_UNREADABLE, busy(id))
-                    touched += id
+                    touch(id)
                     try {
                         readOwner(id)
                     } catch (e: IOException) {
@@ -395,7 +455,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                 }
             }
         }
-        touched += id
+        touch(id)
         val epoch: Long
         val result: ClaimResult
         when {
@@ -464,6 +524,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         val registration = registrations.getOrPut(id) { Registration() }
         enqueue(id, 0, {
             prepareDirectory(id)
+            awaitPrefetchRead(id)
             try {
                 OwnerRecord.write(directoryOf(id).resolve(OwnerRecord.FILE_NAME), record)
                 // 書けたので、前の登録の失敗の印が残っていても外す（後に入れた世代は書ける）
@@ -516,7 +577,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         val record = OwnerRecord(0, self)
         owners[id] = record
         unwrittenOwners[id] = record
-        touched += id
+        touch(id)
         register(id, self)
         return MachineIdentity(id, 0, 0)
     }
@@ -682,6 +743,7 @@ public class MachineSaveStore @JvmOverloads constructor(
             var fileWriteNanos = 0L
             if (ownerRecord != null) {
                 val start = System.nanoTime()
+                awaitPrefetchRead(id)
                 try {
                     OwnerRecord.write(directoryOf(id).resolve(OwnerRecord.FILE_NAME), ownerRecord)
                 } catch (e: IOException) {
@@ -756,20 +818,21 @@ public class MachineSaveStore @JvmOverloads constructor(
     private fun finishTask(id: UUID, bytes: Long, done: Done?, blocksRestore: Boolean, writesOwner: Boolean) {
         // 印を付けた後（仕事の中）に減らす。[renewRegistrationIfOwnerPending] が、仕事の数 → 印の順に見るため
         if (writesOwner) ownerWriteJobs.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
+        // 「使えない」の失敗は、積む前に数える（受け取る側が減らす。#566）
+        if (done?.unusable == true) unreceivedUnusable.merge(id, 1, Int::plus)
         // 完了を先に積む（その UUID を待っていた呼び出しが、起きたときに完了を受け取れるように）
         if (done != null) completed.add(done)
         if (blocksRestore) restoreBlocking.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
         pendingBytesCounter.addAndGet(-bytes)
         pendingTasks.decrementAndGet()
         val left = outstanding.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
-        if (left == null && id in dropped) forgetUnusable(id)
+        if (left == null && id in unusable && !unreceivedUnusable.containsKey(id)) forgetUnusable(id)
         waitLock.withLock { progress.signalAll() }
     }
 
-    /** [id] の「使えない」の印を外す（#566） */
+    /** [id] の「使えない」の印を外す（#566。受け取っていない失敗の数は、受け取る側が減らすので触らない） */
     private fun forgetUnusable(id: UUID) {
         unusable.remove(id)
-        dropped.remove(id)
     }
 
     /** UUID → 列に入れて終わっていない、`owner.bin` を書く仕事（世代の仕事に付くものも含む）の数（#585） */
@@ -837,9 +900,10 @@ public class MachineSaveStore @JvmOverloads constructor(
             }
         }
         if (done.unusable) {
-            // 印を外すのは、受け取った後に、その UUID の仕事が残っていないときだけ（受け取る前に入れた後続も書かずに失敗で返す。#566）
-            dropped += id
-            if (!outstanding.containsKey(id)) forgetUnusable(id)
+            // 印を外すのは、その UUID の「使えない」の失敗を全部受け取り、かつ仕事が残っていないときだけ
+            // （受け取る前に入れた後続も書かずに失敗で返す。受け入れ直しで失敗が 2 回続いても、最後の失敗を受け取るまで外さない。#566・#585）
+            val left = unreceivedUnusable.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
+            if (left == null && !outstanding.containsKey(id)) forgetUnusable(id)
         }
         if (done.registration != null && registrations[id] === done.registration) {
             val result = done.result
@@ -916,7 +980,7 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /**
      * 戻す世代（#84 の規則 9、回答 2）: [generation] のファイルがあればそれ。なければ、ディスクにある、それより小さい最大の世代。
-     * それもなければ空（冷えた起動）。#85 が NBT の世代で呼ぶ（読む前に [awaitWrites] で待つ）
+     * それもなければ空（冷えた起動）。#85 が NBT の世代で呼ぶ（読む前に [awaitRestorable] で待つ）
      */
     public fun restorableGeneration(id: UUID, generation: Long): OptionalLong {
         val onDisk = generationsOnDisk(id)
@@ -958,7 +1022,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         owners.remove(id)
         unwrittenOwners.remove(id)
         deletedIds += id
-        touched += id
+        touch(id)
         marks.remove(id)
         latest.remove(id)
         reserved.remove(id)
@@ -977,6 +1041,7 @@ public class MachineSaveStore @JvmOverloads constructor(
     private fun deleteDirectory(id: UUID) {
         baseOf.remove(id)
         initialized.remove(id)
+        awaitPrefetchRead(id)
         val dir = directoryOf(id)
         try {
             if (!Files.exists(dir)) return

@@ -564,6 +564,46 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
+    fun `受け入れ直しを挟んでowner_binが2回続けて書けなくても、2回目の失敗を受け取る前に入れた後続の世代は書かない`() {
+        // 開いたときに根がない（claim はディスクを読まない）。その後、根をファイルにして owner.bin を書けなくする
+        val root = dir.resolve("root")
+        val s = MachineSaveStore(root, index, "test", manual)
+        Files.write(root, byteArrayOf(1))
+        val id = UUID.randomUUID()
+        val a = s.claim(id.toString(), 0, 0, p)
+        // J1: owner.bin と最初の世代（登録 R1）
+        val first = s.submit(a.identity!!, p, src(), null)
+        index.removeIfOwner(id, p)
+        // 同じ位置で読み込み直す（登録を R2 にし、owner.bin だけの J2 を入れる）
+        val b = s.claim(id.toString(), 0, 0, p)
+        assertEquals(ClaimResult.KEPT, b.result)
+        // J1 が失敗し、その失敗を受け取る（登録が違うので ID は外さず、J2 が残っているので印も残す）
+        assertTrue(manual.runNext())
+        assertEquals(listOf(first), s.pollCompleted().map { it.pending })
+        assertEquals(p, s.ownerOf(id))
+        assertTrue(s.isUnusable(id))
+        // J2 も失敗する。仕事は尽きるが、J2 の失敗はまだ受け取っていないので印は残す
+        assertTrue(manual.runNext())
+        assertEquals(0, manual.size)
+        assertTrue(s.isUnusable(id), "2 回目の失敗を受け取るまで印を外さない")
+        // 根を直してから、受け取る前に同じ ID の世代を入れる（owner.bin を書かない世代）
+        Files.delete(root)
+        Files.createDirectories(root)
+        val later = s.submit(b.identity!!, p, src(), null)
+        assertFalse(later.reassigned)
+        assertEquals(1, later.writes)
+        manual.runAll()
+        assertFalse(exists(later, s), "owner.bin のないディレクトリに世代を書かない")
+        assertFalse(s.pollCompleted().single().succeeded)
+        // J2 の失敗を受け取ったので、ID も印も外れる
+        assertNull(s.ownerOf(id))
+        assertNull(index.ownerOf(id))
+        assertFalse(s.isUnusable(id))
+        val next = s.submit(b.identity!!, p, src(), null)
+        assertTrue(next.reassigned, "外した ID には書かない")
+    }
+
+    @Test
     fun `メモリの上限は書き込みに回す前の合計で判定し、列が空なら大きな1件も通る`() {
         val s = MachineSaveStore(dir, index, "test", manual, maxPendingBytes = 100)
         val identity = s.assignNewId(p)!!

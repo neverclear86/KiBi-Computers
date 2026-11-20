@@ -1,14 +1,19 @@
 package pro.ikili.kibicomputers.core.persist
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Collections
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** 持ち主の規則（`MachineSaveStore.claim`。回答 A の epoch 方式）のテスト（#81、ADR 0081） */
 class MachineClaimTest {
@@ -260,6 +265,49 @@ class MachineClaimTest {
         assertEquals(ClaimResult.KEPT, fresh.claim(id.toString(), 0, 0, at(3)).result)
         assertEquals(0, fresh.prefetchHits)
         assertEquals(1, fresh.mainOwnerReads)
+    }
+
+    @Test
+    fun `先読みが読んでいるowner_binは、読み終えるまで書き込みのスレッドが置き換えず、触ったIDは先読みが開かない`() {
+        val reading = UUID.randomUUID()
+        val other = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(reading.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, at(0)))
+        OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, at(0)))
+        val manual = ManualSaveExecutor()
+        val fresh = MachineSaveStore(dir, MachineIdIndex(), "test", manual)
+        val opened = Collections.synchronizedList(ArrayList<UUID>())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        // 最初に開いた ID の読みの途中で止める
+        fresh.prefetchOwnerReader = { path ->
+            val id = UUID.fromString(path.parent.fileName.toString())
+            opened += id
+            if (opened.size == 1) {
+                entered.countDown()
+                release.await(10, TimeUnit.SECONDS)
+            }
+            OwnerRecord.read(path)
+        }
+        var prefetch: Thread? = null
+        fresh.startOwnerPrefetch { prefetch = Thread(it).apply { start() } }
+        assertTrue(entered.await(10, TimeUnit.SECONDS))
+        val first = opened.single()
+        val second = if (first == reading) other else reading
+        // 読んでいる ID と、まだ開いていない ID を引き取る（どちらも owner.bin を書く仕事が列に入る。後者は先読みの前にメインスレッドで読む）
+        assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(first.toString(), 0, 0, at(1)).result)
+        assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(second.toString(), 0, 0, at(1)).result)
+        val writer = Thread { manual.runAll() }.apply { start() }
+        writer.join(300)
+        assertTrue(writer.isAlive, "先読みが読み終えるまで、その owner.bin を置き換えない")
+        release.countDown()
+        writer.join(10_000)
+        prefetch!!.join(10_000)
+        assertFalse(writer.isAlive)
+        assertEquals(listOf(first), opened.toList(), "触った ID は先読みが開かない")
+        assertFalse(fresh.isUnusable(first))
+        assertFalse(fresh.isUnusable(second))
+        assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(dir.resolve(first.toString()).resolve(OwnerRecord.FILE_NAME)))
+        assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(dir.resolve(second.toString()).resolve(OwnerRecord.FILE_NAME)))
     }
 
     @Test
