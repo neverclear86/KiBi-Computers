@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
@@ -254,12 +255,12 @@ class AsyncFuelP2Test {
     }
 
     /**
-     * ゲストからゲストへの呼び出し（lift した関数を lower した import）の下で計算し続ける p2 のコマンド。`run` は `inner` の `spin` を呼び、
-     * `spin` が計算する。`run` は（実行時は呼ばない）`pollable.block` を呼ぶので止まりうる関数になり、変換は待ち点型・燃料切れも待ち点
-     * （`fuelYield`）になる。`spin` は待たないので止まりうる関数でなく、燃料は `kibi.fuel`（前借りの道）で確かめる。
-     * `spin` は外からの `run` の下の 2 段目なので、`LinkedComponent.canUnwind` が偽
+     * ゲストからゲストへの呼び出し（lift した関数を lower した import）の下で計算し続ける p2 のコマンド。`run` は `inner` の `spin` を
+     * [calls] 回呼び、`spin` が 1 回に [n] 回まわる。`run` は（実行時は呼ばない）`pollable.block` を呼ぶので止まりうる関数になり、変換は
+     * 待ち点型・燃料切れも待ち点（`fuelYield`）になる。`spin` は待たないので止まりうる関数でなく、燃料は `kibi.fuel`（前借りの道）で確かめる。
+     * `spin` は外からの `run` の下の 2 段目なので、`LinkedComponent.canUnwind` が偽。`run` の loop の先頭（1 段目）では真
      */
-    private fun guestToGuestSpin(): ByteArray {
+    private fun guestToGuestSpin(calls: Int, n: Int): ByteArray {
         val d = "$"
         return LinkTesting.wat(
         """
@@ -281,8 +282,13 @@ class AsyncFuelP2Test {
             (import "inner" "spin" (func ${d}spin (param i32) (result i32)))
             (import "poll" "block" (func ${d}block (param i32)))
             (func (export "run") (result i32)
-              ;; spin は常に 1 を返すので、block は実行時には呼ばれない（止まりうる関数にするためだけの呼び出し）
-              (if (i32.eqz (call ${d}spin (i32.const 20000))) (then (call ${d}block (i32.const 0))))
+              (local ${d}k i32)
+              (local.set ${d}k (i32.const $calls))
+              (loop ${d}l
+                ;; spin は常に 1 を返すので、block は実行時には呼ばれない（止まりうる関数にするためだけの呼び出し）
+                (if (i32.eqz (call ${d}spin (i32.const $n))) (then (call ${d}block (i32.const 0))))
+                (local.set ${d}k (i32.sub (local.get ${d}k) (i32.const 1)))
+                (br_if ${d}l (local.get ${d}k)))
               (i32.const 0)))
           (core instance ${d}i (instantiate ${d}inner))
           (func ${d}spin_lifted (param "n" u32) (result u32) (canon lift (core func ${d}i "spin")))
@@ -298,23 +304,162 @@ class AsyncFuelP2Test {
     }
 
     /**
-     * ゲストからゲストへの呼び出しの下（コンポーネントが巻き戻せない。`LinkedComponent.canUnwind` が偽）の、止まりうる関数でない関数の燃料切れは、
-     * 前借りせず、スレッドを持って待つ（#803）。前借りしても、結局巻き戻せずにスレッドを持って待つので、前借りは巻き戻せるときだけにしている
+     * ゲストからゲストへの呼び出しの下（コンポーネントが巻き戻せない。`LinkedComponent.canUnwind` が偽）の、止まりうる関数でない関数の
+     * 燃料切れは、p1 の葉の関数と同じく前借りで先へ進め、callee から戻った後の外の止まりうる関数（1 段目）で巻き戻す（#803）。
+     * スレッドを持って燃料を待たない
      */
     @Test
-    fun `ゲストからゲストへの呼び出しの下の燃料切れは、前借りせずスレッドを持って待つ`() = timeout(limit) {
+    fun `ゲストからゲストへの呼び出しの下の燃料切れは前借りで戻り、外の止まりうる関数で巻き戻す`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 5_000)
             val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val overdrafts0 = h.scheduler.fuelOverdrafts.get()
-            val s = Spin(h, m, emptyList(), guestToGuestSpin())
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            // 1 回の spin は前借りの上限（FUEL_OVERDRAFT_LIMIT）より十分小さく、1 tick の燃料より大きい
+            val s = Spin(h, m, emptyList(), guestToGuestSpin(calls = 60, n = 1_000))
             assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
             val program = s.rt.program
             assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
             assertTrue(program.fuelYield, "燃料切れを待ち点にしていない: ${program.fuelYieldRejection}")
             assertEquals("", s.finish())
-            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0, "ゲストからゲストへの呼び出しの下の燃料切れでスレッドを持って待っていない")
-            assertEquals(overdrafts0, h.scheduler.fuelOverdrafts.get(), "巻き戻せないところで前借りした")
+            assertTrue(h.scheduler.fuelOverdrafts.get() > overdrafts0, "ゲストからゲストへの呼び出しの下で前借りしていない")
+            assertTrue(h.scheduler.fuelUnwinds.get() > unwinds0, "callee から戻った後に巻き戻していない")
+            assertEquals(blocking0, h.scheduler.fuelBlockingWaits.get(), "スレッドを持ったまま燃料を待った")
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+        }
+    }
+
+    /**
+     * ゲストからゲストへの呼び出しの下で、前借りの上限を超えて計算し続けたら（callee から戻らない）、p1 の葉の関数と同じくスレッドを持って待つ
+     * （残る性質。ADR 0757 の「制約と残り」）
+     */
+    @Test
+    fun `ゲストからゲストへの呼び出しの下で前借りの上限を超えて計算し続けたら、スレッドを持って待つ`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 5_000)
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val s = Spin(h, m, emptyList(), guestToGuestSpin(calls = 1, n = 200_000))
+            assertTrue(s.rt.program.fuelYield, "燃料切れを待ち点にしていない: ${s.rt.program.fuelYieldRejection}")
+            assertEquals("", s.finish())
+            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0, "前借りの上限を超えてもスレッドを持って待っていない")
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+        }
+    }
+
+    /**
+     * ホストの関数・canon が呼んだゲスト（realloc・post-return。`guestCallDepth > 0`）の中で計算し続ける p2 のコマンド。
+     * `run` は `get-arguments`（`list<string>` を realloc で受ける）を呼び、受けた引数を確かめて返る。`run` の lift には post-return がある。
+     * [reallocSpin]・[postSpin] は realloc（1 回の呼び出しごと）・post-return の中で回す数。[mayBlock] なら、回す関数（realloc か post-return）は
+     * （実行時は呼ばない）`pollable.block` を呼ぶので止まりうる関数になり、燃料は `kibi.async_fuel` で確かめる。偽なら `kibi.fuel`（前借りの道）
+     */
+    private fun guestCallSpin(reallocSpin: Int, postSpin: Int, mayBlock: Boolean): ByteArray {
+        val d = "$"
+        fun spin(count: Int, blockIf: String): String {
+            if (count <= 0) return ""
+            val loop = """
+                (local.set ${d}n (i32.const $count))
+                (loop ${d}l
+                  (local.set ${d}x (i32.add (i32.mul (local.get ${d}x) (i32.const 31)) (local.get ${d}n)))
+                  (local.set ${d}n (i32.sub (local.get ${d}n) (i32.const 1)))
+                  (br_if ${d}l (local.get ${d}n)))
+            """
+            // 実行時は呼ばない（引数が -1 になることはない）。止まりうる関数にするためだけの呼び出し
+            return if (mayBlock) loop + "(if (i32.eq $blockIf (i32.const -1)) (then (call ${d}block (i32.const 0))))" else loop
+        }
+        return LinkTesting.wat(
+        """
+        (component
+          (import "wasi:io/poll@0.2.12" (instance ${d}poll
+            (export "pollable" (type ${d}pollable (sub resource)))
+            (export "[method]pollable.block" (func (param "self" (borrow ${d}pollable))))))
+          (import "wasi:cli/environment@0.2.12" (instance ${d}env
+            (export "get-arguments" (func (result (list string))))))
+          (alias export ${d}poll "[method]pollable.block" (func ${d}block))
+          (core func ${d}block_lower (canon lower (func ${d}block)))
+          (core module ${d}mem
+            (import "poll" "block" (func ${d}block (param i32)))
+            (memory (export "mem") 1)
+            (global ${d}next (mut i32) (i32.const 1024))
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+              (local ${d}n i32) (local ${d}x i32) (local ${d}p i32)
+              ${spin(reallocSpin, "(local.get 3)")}
+              ;; 前から順に切り出す（解放しない）
+              (local.set ${d}p (i32.and (i32.add (global.get ${d}next) (i32.sub (local.get 2) (i32.const 1)))
+                (i32.sub (i32.const 0) (local.get 2))))
+              (global.set ${d}next (i32.add (local.get ${d}p) (local.get 3)))
+              (local.get ${d}p))
+            (func (export "post") (param i32)
+              (local ${d}n i32) (local ${d}x i32)
+              ${spin(postSpin, "(local.get 0)")}))
+          (core instance ${d}poll_exports (export "block" (func ${d}block_lower)))
+          (core instance ${d}m (instantiate ${d}mem (with "poll" (instance ${d}poll_exports))))
+          (alias core export ${d}m "mem" (core memory ${d}memory))
+          (alias core export ${d}m "realloc" (core func ${d}realloc))
+          (alias export ${d}env "get-arguments" (func ${d}args))
+          (core func ${d}args_lower (canon lower (func ${d}args) (memory ${d}memory) (realloc ${d}realloc)))
+          (core module ${d}main
+            (import "cli" "get-arguments" (func ${d}args (param i32)))
+            (import "poll" "block" (func ${d}block (param i32)))
+            (import "env" "mem" (memory 1))
+            (func (export "run") (result i32)
+              (call ${d}args (i32.const 16))
+              ;; 引数は argv[0]（"spin"）の 1 つだけ（realloc が返した場所に lower できている）
+              (if (i32.ne (i32.load offset=4 (i32.const 16)) (i32.const 1)) (then unreachable))
+              (if (i32.ne (i32.load offset=4 (i32.load (i32.const 16))) (i32.const 4)) (then unreachable))
+              ;; 実行時は呼ばない。run を止まりうる関数にする（燃料切れの待ち点を作る）ための呼び出し
+              (if (i32.eq (i32.load (i32.const 16)) (i32.const -1)) (then (call ${d}block (i32.const 0))))
+              (i32.const 0)))
+          (core instance ${d}env_exports (export "mem" (memory ${d}memory)))
+          (core instance ${d}cli_exports (export "get-arguments" (func ${d}args_lower)))
+          (core instance ${d}o (instantiate ${d}main
+            (with "cli" (instance ${d}cli_exports)) (with "poll" (instance ${d}poll_exports)) (with "env" (instance ${d}env_exports))))
+          (alias core export ${d}m "post" (core func ${d}post))
+          (func ${d}run (result (result)) (canon lift (core func ${d}o "run") (post-return ${d}post)))
+          (instance ${d}run_i (export "run" (func ${d}run)))
+          (export "wasi:cli/run@0.2.12" (instance ${d}run_i)))
+        """.trimIndent(),
+        )
+    }
+
+    /**
+     * ホストの関数・canon が呼んだゲスト（realloc・post-return。`guestCallDepth > 0`）の中の燃料切れは、`fuelYield` が真のコンポーネントでも
+     * 前借りも巻き戻しもせず、スレッドを持って待つ（#803。巻き戻すと canon の Kotlin の層（lower・post-return の途中）を巻き戻してしまう）。
+     * 止まりうる関数でない realloc・post-return は前借りの判定（`onFuelExhaustedPlain`）で、止まりうるものは
+     * `onComponentFuelExhaustedUnwindable` の `!unwindable` で、`onFuelExhausted` に落ちる。p1 の `WasiP1KibiTest` の
+     * 「cabi_realloc の中で燃料が切れても、巻き戻さずに燃料を待って続ける」に当たる
+     */
+    @ParameterizedTest(name = "{0}, mayBlock={1}")
+    @CsvSource("realloc, false", "realloc, true", "post-return, false", "post-return, true")
+    fun `ホストの関数が呼んだゲストの中の燃料切れは、巻き戻さず前借りもせず、スレッドを持って待って続ける`(place: String, mayBlock: Boolean) = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 5_000)
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val overdrafts0 = h.scheduler.fuelOverdrafts.get()
+            val bytes = if (place == "realloc") {
+                guestCallSpin(reallocSpin = 20_000, postSpin = 0, mayBlock = mayBlock)
+            } else {
+                guestCallSpin(reallocSpin = 0, postSpin = 40_000, mayBlock = mayBlock)
+            }
+            val s = Spin(h, m, emptyList(), bytes)
+            assertEquals(ProcessKind.WAIT_POINT, s.process.kind)
+            val program = s.rt.program
+            assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
+            assertTrue(program.fuelYield, "燃料切れを待ち点にしていない: ${program.fuelYieldRejection}")
+            val rt = s.rt
+            var waitedInGuestCall = false
+            eventually(60_000, "終わらない") {
+                h.scheduler.tick()
+                Thread.sleep(2)
+                m.lock.withLockValue {
+                    if (s.process.state == ProcessState.WAITING_FUEL && rt.guestCallDepth > 0) waitedInGuestCall = true
+                }
+                m.stateOf(s.pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(s.pid), "${rt.lastError}")
+            assertEquals(0, m.lock.withLockValue { s.process.exitCode }, "run が失敗した")
+            assertTrue(waitedInGuestCall, "$place の中で、スレッドを持って燃料を待っていない")
+            assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0)
+            assertEquals(overdrafts0, h.scheduler.fuelOverdrafts.get(), "ホストの関数が呼んだゲストの中で前借りした")
             assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
         }
     }

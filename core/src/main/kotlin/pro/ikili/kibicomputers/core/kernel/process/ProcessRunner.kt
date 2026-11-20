@@ -556,6 +556,8 @@ internal class ProcessRunner(private val machine: Machine) {
      * 残りを負のまま返して先へ進める（前借り。#477）。残りが負の間は、次に燃料を確かめるところ（関数の入口・loop の先頭）でまた呼ばれるので、
      * 止まりうる関数の中で確かめたところ（`kibi.async_fuel`。[onFuelExhaustedUnwindable]）で巻き戻し、スレッドを持たずに燃料を待つ。
      * 前借りが [FUEL_OVERDRAFT_LIMIT] に届いたら（止まりうる関数に戻らずに計算し続けている）、前と同じくスレッドを持ったまま待つ。
+     * コンポーネント（#803）では、ゲストからゲストへの呼び出しの下の callee の中でも前借りする（callee から戻れば、外からの call の
+     * 1 段目の止まりうる関数で巻き戻せる）。
      * 前借りした分は残り（負）として書き戻すので、マシンの燃料の借りになり、後の補充で返す
      */
     private fun onFuelExhaustedPlain(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
@@ -565,8 +567,11 @@ internal class ProcessRunner(private val machine: Machine) {
                 if (rt.killed) throw ProcessKilledException()
                 // 譲る相手がいなければ、前借りせずにその場で次のスライスを足す（#47）
                 renewSliceLocked(rt, remaining)?.let { return it }
-                // コンポーネントは、ゲストからゲストへの呼び出しの下でも巻き戻せない（前借りしても、結局スレッドを持って待つ。#803）
-                unwindableLocked(rt) && (rt.program.component == null || rt.component?.canUnwind() == true)
+                // コンポーネントでは、ゲストからゲストへの呼び出しの下（LinkedComponent.canUnwind が偽）でも前借りする（#803）。
+                // 前借りは巻き戻さないので Kotlin の層を巻き戻すことはなく、callee が上限の中で戻れば、外の止まりうる関数の次の
+                // kibi.async_fuel で巻き戻せる。戻らなければ、上限に届いたところで p1 の葉の関数と同じくスレッドを持って待つ。
+                // realloc・post-return の中（ホストの関数・canon が呼んだゲスト）は guestCallDepth で弾く（戻った先でも巻き戻せないため）
+                unwindableLocked(rt)
             }
             if (overdraft) {
                 if (!rt.fuelOverdraft) {
