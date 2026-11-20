@@ -9,7 +9,7 @@
 - 待ち方の判定は、`wasi:*` と同じく本体から決める（`WasiP2Io.waitOf`）。`kibi:*` の名前の表（`BLOCKING_FUNCTIONS`）と、その WIT の名前の検査は消した。
 - 待ち方は p1 の UNWIND（`WasiP1KibiDevice`・`WasiP1KibiProcess`）と同じ。巻き戻せないとき（ブロッキング型、core モジュールの start 関数の中の `LOADING`、ゲストからゲストの下）は、今までどおり `ctx.invokeDevice`・`ctx.execWithHandle` でスレッドを持って待つ。
 - **ABI・保存形式・公開 API は変えない。** コンポーネントは今までどおり `UNSAVEABLE`。足した口（`ProcessContext.beginDeviceInvoke(HandleEntry, …, place)`・`finishExecWithHandle(ExecWait, place)`・`checkHandleRoom(place)`）は内部のもの。
-- 変換できなかったコンポーネントを `BLOCKING` に落とす扱い（#757 のオーナーの回答）は変えない。そろえるかは #801 で決める（このタスクで、ホスト側の理由はなくなった。残るのはゲスト側の作りだけ）。
+- 変換できなかったコンポーネントを `BLOCKING` に落とす扱い（#757 のオーナーの回答）は、このタスクでは変えなかった（このタスクで、ホスト側の理由はなくなった。残るのはゲスト側の作りだけ）。#801 の結論 (B) で、#844 から `exec` では `NOEXEC` で断る（ADR 0757 の「追記（#844）」）。
 
 ## invoke
 
@@ -43,4 +43,4 @@
 - `KibiP2WaitPointTest`: メインスレッドのメソッドの `invoke` が巻き戻して待つ（スレッド・専用スレッド・ブロッキング型の枠を使わない、待機点にある、`AsyncWait` に入れない）。起こされても結果がまだなら巻き戻し直し、メソッドは 1 回だけ。受け取ったら隠れた `pending-call` を外す（2 回目の待ちで表の大きさが元に戻っている）。直接のメソッドはその場で返る。待っている間に殺すと取り消される。表が満杯なら `kernel(mfile)` でメソッドを走らせない。待っている台の写しは、プロセスを殺し、ホストの resource・`pending-call` を残さず、元の呼び出しを取り消さない。`spawn-with-handles`・`spawn` は読み込みをゲートで止めて巻き戻して待ち、子の標準出力をパイプにでき、開くと子を 1 つずつ作る。待っている間に殺すと子を作らない。待っている台の写しで元の読み込みは続く。
 - `KibiP2WaitPointTest`（失敗と「起きないはず」の守り）: `invoke` の `failed`・`detached` を巻き直して受け取った後、プロセスが生きている間（来ない時計で待たせて）に、隠れた `pending-call` が表からもカーネルからも外れている（終わった後の表は `closeAll` で必ず空になるので、終わる前に見る）。巻き直して着いたのに `pendingInvoke` がなければ、メソッドを呼び直さずに `failed("interrupted")`。新しい `invoke` の時点で `pendingInvoke` が残っていれば、それを閉じてから始める。`spawn` で巻き直して着いたのに `pendingSpawn` がなければ `beginExec` からやり直して子は 1 つだけ。新しい `spawn` の時点で残っていれば、その読み込みの待ちを閉じてから始め、残っていた読み込みで子を作らない（p1 の `forgetPendingInvokeForTest`・`forgetPendingSpawnForTest` のテストに当たる。p2 は `ComponentSuspend` の値を直接書き換える）。
 - `HostWaitTest`: kibi の `UNWIND` が 3 つ、`BLOCK` は空。
-- `ComponentExecTest`: `BLOCKING` のコマンドを、ゲスト側の理由（止まりうる関数の v128 のローカル）で変換できないものに差し替え、「`BLOCKING` は上限で `NFILE`」「`WAIT_POINT` は上限に関係なく動く」の両方を確かめ続ける。
+- `ComponentExecTest`: `BLOCKING` のコマンドを、ゲスト側の理由（止まりうる関数の v128 のローカル）で変換できないものに差し替え、「`BLOCKING` は上限で `NFILE`」「`WAIT_POINT` は上限に関係なく動く」の両方を確かめ続ける（#844 からは、このコマンドは `exec` で `NOEXEC`。上限の `NFILE` は p1 の子で確かめる）。

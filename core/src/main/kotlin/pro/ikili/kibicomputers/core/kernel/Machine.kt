@@ -1683,8 +1683,8 @@ public class Machine private constructor(
      * - Component Model のコンポーネント（layer 1）は、ヘッダーで見分けて `ComponentProgram.load` で読み込み、リンクの計画まで作る
      *   （#687。[Program.loadExecutable]。ホストは固定の [KernelDrivers.COMPONENT_HOST]）。計画は p1 と同じく `ProgramCache` で全マシンが
      *   共有する。p1 の待機点への変換（`asyncifyExecutables`）はかけず、コンポーネント全体の変換を常にかける（#757。ADR 0757）。
-     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして、
-     *   変換できれば `WAIT_POINT`、できなければ `BLOCKING` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
+     *   待機点に変換できない作りは、p1 と同じく読み込みで断り `NOEXEC`（#844。理由はメッセージに書く。失敗は覚える）。
+     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして `WAIT_POINT` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
      *   （内容の失敗ではないので覚えない）。コンポーネントのプロセスは保存できない（#269）
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。

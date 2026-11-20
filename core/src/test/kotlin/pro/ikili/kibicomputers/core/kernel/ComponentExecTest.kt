@@ -41,7 +41,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
  * コンポーネント（layer 1）を `exec` で動かす（#687）。読み込みは `ProgramCache` で全マシンが共有し（計画は不変）、
- * `KernelDrivers.DEFAULT` が p2 のコマンドとして `WasiP2Driver`（変換できれば `WAIT_POINT`、できなければ `BLOCKING`。#757）で動かす
+ * `KernelDrivers.DEFAULT` が p2 のコマンドとして `WasiP2Driver`（`WAIT_POINT`。#757）で動かす。待機点に変換できない作りは、
+ * 読み込みで `NOEXEC` にする（#844。#801 の結論）
  */
 class ComponentExecTest {
     private val limit = Duration.ofSeconds(120)
@@ -50,8 +51,9 @@ class ComponentExecTest {
     private val hello: ByteArray by lazy { P2Testing.wrap("hello-wasi") }
 
     /**
-     * 待機点に変換できない作り（止まりうる関数 `run` が v128 のローカルを持つ。`AsyncifyUnsupported`）なので、`BLOCKING` で動く p2 のコマンド
-     * （#757）。`run` は `blocking-read` を呼ぶ（通らない枝）ので止まりうる。呼ばずに、すぐ ok で終わる
+     * 待機点に変換できない作り（止まりうる関数 `run` が v128 のローカルを持つ。`AsyncifyUnsupported`）の p2 のコマンド。
+     * `exec` では `NOEXEC` で断る（#844）。直接 `ComponentProgram.load` すれば、今までどおり `BLOCKING` で動く（#757）。
+     * `run` は `blocking-read` を呼ぶ（通らない枝）ので止まりうる。呼ばずに、すぐ ok で終わる
      */
     private val blockingCommand: ByteArray by lazy {
         KibiP2WitTool.component(
@@ -182,11 +184,15 @@ class ComponentExecTest {
         }
     }
 
+    /**
+     * 1 台のブロッキング型の上限（`MachineConfig.maxBlockingProcesses`）で子の `spawn` が `NFILE` になる。コンポーネントは `BLOCKING` で
+     * 動かなくなった（#844）ので、変換しない設定（`asyncify = false`）の p1 の子で確かめる。親（[runParent]）は直接読むので待機点型のまま
+     */
     @Test
-    fun `1台のブロッキング型の上限に達していたらコンポーネントの子のspawnはNFILEで、ほかの台は動く`() = timeout(limit) {
-        Harness(execRuntime = EndiveRuntime()).use { h ->
+    fun `1台のブロッキング型の上限に達していたら子のspawnはNFILEで、ほかの台は動く`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime(), asyncify = false).use { h ->
             val full = machine(h, maxBlockingProcesses = 0)
-            write(full, "/bin/kp", blockingCommand)
+            write(full, "/bin/kp", kibiProcess)
             val out = runParent(h, full, "run")
             assertTrue("spawn ${-Errno.NFILE.code}\n" in out, out)
             // サーバー全体の枠は使っていないので、同じスケジューラーの別の台では動く
@@ -194,6 +200,26 @@ class ComponentExecTest {
             write(other, "/bin/hello", hello)
             assertEquals("Hello from WASI\n" to 0, execAndWait(h, other, "/bin/hello"))
             assertEquals(0, h.scheduler.blockingProcesses)
+        }
+    }
+
+    @Test
+    fun `待機点に変換できないコンポーネントのexecはNOEXECで、失敗を覚え、プロセスもBLOCKINGの枠も使わない`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = machine(h)
+            write(m, "/bin/kp", blockingCommand)
+            val closed = SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed))
+            // 2 回目は、覚えている失敗（ProgramCache）から同じ理由で断る（p1 と同じ。#367）
+            repeat(2) {
+                val e = assertThrows<FsException> { m.exec("/bin/kp", KernelDrivers.DEFAULT, closed) }
+                assertEquals(Errno.NOEXEC, e.errno)
+                val msg = e.message!!
+                assertTrue(msg.contains("待機点に変換できない") && msg.contains("v128") && msg.contains("core モジュール"), msg)
+            }
+            assertEquals(1, h.scheduler.programs.loads.get())
+            assertEquals(emptyList<Int>(), m.lock.withLockValue { m.kernel.processes.all().map { it.pid } })
+            assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
         }
     }
 
@@ -374,14 +400,15 @@ class ComponentExecTest {
     }
 
     @Test
-    fun `ブロッキング型の上限に達していたらコンポーネントの子のspawnはNFILE`() = timeout(limit) {
+    fun `p1のプロセスがkibi-processのspawnで待機点に変換できないコンポーネントを子にするとNOEXEC`() = timeout(limit) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(4).maxBlockingProcesses(0).build()
         Harness(schedulerConfig = config, execRuntime = EndiveRuntime()).use { h ->
             val m = machine(h)
             write(m, "/bin/kp", blockingCommand)
-            // 親は待機点型なので数に入らない。子のコンポーネントは BLOCKING なので上限で断られる
+            // 枠が 0 でも、上限（NFILE）より前に読み込みで断る（#844）
             val out = runParent(h, m, "run")
-            assertTrue("spawn ${-Errno.NFILE.code}\n" in out, out)
+            assertTrue("spawn ${-Errno.NOEXEC.code}\n" in out, out)
+            // 直接読み込めば、今までどおり BLOCKING（テストとブロッキングとの比較の道。#757）
             assertEquals(ProcessKind.BLOCKING, KernelDrivers.DEFAULT.create(Program.component(ComponentProgram.load(EndiveRuntime(), blockingCommand, KernelDrivers.COMPONENT_HOST))).kind)
             // 待機点に変換できるもの（hello）は WAIT_POINT なので、上限に関係なく動く（#757）
             assertEquals(ProcessKind.WAIT_POINT, KernelDrivers.DEFAULT.create(Program.component(P2Testing.load(hello))).kind)

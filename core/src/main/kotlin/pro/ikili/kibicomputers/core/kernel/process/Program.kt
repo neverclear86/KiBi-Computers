@@ -152,7 +152,10 @@ internal class Program private constructor(
          * （同じキーで別の読み方をしないように、見分けをここ 1 か所に置く）。ヘッダーで見分け（[isComponent]）、
          *
          * - コンポーネント: [ComponentProgram.load] で読み込んでリンクの計画まで作る（ホストは [host]。[waitImports] は使わず、コンポーネント全体の解析で決めて、常に待機点への変換をかける（#757）。
-         *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
+         *   キャッシュのキーでも空にそろえる: [cacheWaitImports]）。待機点に変換できない作り（asyncify が扱えない命令、ゲストからゲストへの呼び出しの
+         *   下の待ち、resource の dtor の中の待ち）は、`BLOCKING` で動かさずに [WasmLoadException] で断る（#844。#801 の結論。p1 の [loadMetered] と同じく、
+         *   原因は [AsyncifyUnsupported] で [unsuspendableReason] で取り出せる。失敗は `ProgramCache` が覚える）。断る判断はここで渡す
+         *   `requireWaitPoints` で、中のコンパイルの前に止める。止まりうる関数がないものは断らない（#384 と同じ）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
          *   中の core モジュールに当てる。上限を外す道は作らない（検証の時間の上限と見張りの前提。ADR 0666）
          * - core モジュール: [metered] なら [loadMetered]、でなければ [load]（今までどおり）
          *
@@ -172,7 +175,7 @@ internal class Program private constructor(
         ): Program {
             if (isComponent(bytes)) {
                 val componentLimits = ComponentLimits(moduleLimits = limits ?: ModuleLimits.DEFAULT)
-                return component(ComponentProgram.load(runtime, bytes, host, metered, componentLimits))
+                return component(ComponentProgram.load(runtime, bytes, host, metered, componentLimits, requireWaitPoints = true))
             }
             return if (metered) loadMetered(runtime, bytes, limits, waitImports) else load(runtime, bytes, limits)
         }
