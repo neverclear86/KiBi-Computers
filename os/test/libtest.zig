@@ -268,6 +268,17 @@ fn caseFile(dir: []const u8) void {
     const s2 = fs.stat("sub/a.txt") catch |e| return fail("stat", e);
     expect("stat size after append", s2.size == 17);
 
+    // 長さを変える
+    const tf = fs.open("sub/a.txt", .{ .read = true, .write = true }) catch |e| return fail("open setsize", e);
+    fs.setSize(tf, 5) catch |e| return fail("setsize", e);
+    const s3 = fs.fstat(tf) catch |e| return fail("fstat setsize", e);
+    expect("setsize shrink", s3.size == 5);
+    const n3 = io.readAll(tf, &buf) catch |e| return fail("read setsize", e);
+    expect("setsize keeps head", eql(buf[0..n3], "hello"));
+    io.close(tf) catch {};
+    const s4 = fs.stat("sub/a.txt") catch |e| return fail("stat setsize", e);
+    expect("stat size after setsize", s4.size == 5);
+
     // 排他の作成
     if (fs.open("sub/a.txt", .{ .write = true, .create = true, .exclusive = true })) |_| fail("exclusive create", null) else |e| expect("EXIST", e == error.EXIST);
 
