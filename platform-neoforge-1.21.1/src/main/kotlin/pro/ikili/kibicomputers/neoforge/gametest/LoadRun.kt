@@ -303,6 +303,8 @@ internal data class AvgMax(val avg: Double, val max: Double) {
  * @property fullBytesTotal 全体の世代のファイルの大きさの合計
  * @property deltaSaves 差分の世代を書いた回数（#83）
  * @property deltaBytesTotal 差分の世代のファイルの大きさの合計
+ * @property submitted 段階に予約した書き込みの数（[ServerMachines.Stats.windowSubmits]。#602）。
+ *   段階に予約した書き込みを全部待ってから数えるので、[saves] と書けなかった数（[WriterStats.failures]）の和と同じになる
  */
 internal data class SaveCost(
     val saves: Int,
@@ -325,6 +327,7 @@ internal data class SaveCost(
     val deltaSaves: Int = 0,
     val deltaBytesTotal: Long = 0,
     val writer: WriterStats = WriterStats(),
+    val submitted: Long = 0,
 )
 
 /**
@@ -438,9 +441,9 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- 自動保存の一巡: %d tick、書き込みに回した台 %d、飛ばした台 %d、1 tick で回した最大 %d 回、回すのにかかった時間の合計 %.0f ms（取り出しと予約）、" +
-                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
-                    it.cycleTicks, it.written, it.skipped, it.maxTickWrites, it.writeMillis,
+                    "- 自動保存の一巡: %d tick、書き込みに回した台 %d、飛ばした台 %d、予約した書き込み %d、1 tick で回した最大 %d 回、" +
+                        "回すのにかかった時間の合計 %.0f ms（取り出しと予約）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    it.cycleTicks, it.written, it.skipped, it.cost.submitted, it.maxTickWrites, it.writeMillis,
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
@@ -449,9 +452,9 @@ internal class LoadReport(
             sb.append(
                 String.format(
                     Locale.ROOT,
-                    "- まとめてアンロード: %d tick、取り出して書き込みに回した台 %d（書き込み %d 回）、1 tick の最大 %d 台・%d 回、アンロードされなかった %d / %d チャンク（ケースのあるもの）、" +
-                        "MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
-                    it.ticks, it.captures, it.writes, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
+                    "- まとめてアンロード: %d tick、取り出して書き込みに回した台 %d（書き込み %d 回、予約した書き込み %d）、1 tick の最大 %d 台・%d 回、" +
+                        "アンロードされなかった %d / %d チャンク（ケースのあるもの）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
+                    it.ticks, it.captures, it.writes, it.cost.submitted, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
@@ -854,6 +857,7 @@ internal class LoadRun(
             deltaSaves = saves.count { it.delta },
             deltaBytesTotal = saves.filter { it.delta }.sumOf { it.fileBytes.toLong() },
             writer = WriterStats.current(),
+            submitted = ServerMachines.Stats.windowSubmits,
         )
     }
 
@@ -1169,6 +1173,7 @@ internal class LoadRun(
             LoadPhase.AUTOSAVE -> {
                 val r = autosaveResult!!
                 if (r.written + r.skipped != settings.count.toLong()) fail("the autosave should visit all ${settings.count} machines: $r")
+                verifyCounted(p, r.cost)
                 val notRunning = computers.count { it.case.computer.machine?.state != MachineState.RUNNING }
                 if (notRunning > 0) fail("$notRunning computers stopped during the autosave")
             }
@@ -1182,11 +1187,23 @@ internal class LoadRun(
                 // 計算している間はプロンプトに戻らない
                 if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
-            LoadPhase.UNLOAD -> Unit
+            LoadPhase.UNLOAD -> verifyCounted(p, unloadResult!!.cost)
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
                 if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
             }
+        }
+    }
+
+    /**
+     * 段階に予約した書き込みが、すべて保存の手間と大きさの表（書けた・書けなかった）に入ったか（#602）。
+     * #614 の前は、書き込みのスレッドを `writerFlushMillis`（30 秒）まで待って打ち切っていたので、待ち切れなかった分が表から落ちていた。
+     * [awaitPhaseSaves] を通った後なら作りの上で成り立つので、遅いマシンでも揺れない
+     */
+    private fun verifyCounted(p: LoadPhase, cost: SaveCost) {
+        val counted = cost.saves + cost.writer.failures
+        if (counted != cost.submitted) {
+            fail("${cost.submitted} saves were queued in the $p phase, but $counted were counted (${cost.saves} written, ${cost.writer.failures} failed)")
         }
     }
 
