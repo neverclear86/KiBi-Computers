@@ -509,9 +509,11 @@ fn lineCount() usize {
 /// [path] を、置き換えずにそのまま書き換える（ADR 0105「保存」。追記 #837）。
 /// 切り詰めずに先頭から上書きし、書き終えてから新しい長さに切る。途中で失敗しても、ファイルは空にならない。
 /// [allow_grow] が false なら、開いたファイルが今のバッファより短いときは何も書かずに false を返す
-/// （書いたら true。書く途中で出たエラーは、短かったときと区別できるよう、そのままエラーで返す）
+/// （書いたら true。書く途中で出たエラーは、短かったときと区別できるよう、そのままエラーで返す）。
+/// [allow_grow] が false のとき（一時ファイルに書けなかったときの代わり）は、ファイルがある前提なので作らない。
+/// `lstat` の後に消されていたら `NOENT` で返し、元のファイルがなかった所に空のファイルを残さない
 fn writeDirect(path: []const u8, allow_grow: bool) kibi.Error!bool {
-    const fd = try fs.open(path, .{ .read = false, .write = true, .create = true });
+    const fd = try fs.open(path, .{ .read = false, .write = true, .create = allow_grow });
     const wrote = overwrite(fd, allow_grow) catch |e| {
         io.close(fd) catch {};
         return e;

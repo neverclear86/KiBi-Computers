@@ -504,6 +504,37 @@ class ViEditorTest {
     }
 
     @Test
+    fun `直接書く前に元が縮められていたら、何も書かずに一時ファイルのエラーを知らせる`() {
+        val fs = TightFileSystem()
+        // 一時ファイルに書けなかった直後（lstat の後）に、ほかのプロセスが元を 3 バイトに縮める
+        fs.onNoSpace = { inner -> inner.setSize(inner.stat(VfsPath.parse("/a.txt")).node, 3) }
+        vi(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\n")) {
+            keys("x:w\r")
+            assertTrue(status.contains("Error writing /d/a.txt: No space left on device"), screen)
+            assertEquals("hel", file("/d/a.txt")!!.decodeToString())
+            assertEquals(null, file("/d/.a.txt.vi0"))
+            keys(":q\r")
+            assertTrue(status.contains("No write since last change"), screen)
+            keys(":q!\r")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
+    fun `直接書く前に元が消されていたら、空のファイルを作らずにエラーを知らせる`() {
+        val fs = TightFileSystem()
+        fs.onNoSpace = { inner -> inner.removeFile(VfsPath.parse("/a.txt")) }
+        vi(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\n")) {
+            keys("x:w\r")
+            assertTrue(status.contains("Error writing /d/a.txt: No such file or directory"), screen)
+            assertEquals(null, file("/d/a.txt"))
+            assertEquals(null, file("/d/.a.txt.vi0"))
+            keys(":q!\r")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
     fun `直接書く途中でIOエラーになっても、ファイルを空にせず、変えた印を残す`() {
         val fs = TightFileSystem()
         vi(

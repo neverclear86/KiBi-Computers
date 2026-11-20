@@ -356,6 +356,42 @@ class NanoEditorTest {
     }
 
     @Test
+    fun `直接書く前に元が縮められていたら、何も書かずに一時ファイルのエラーを知らせる`() {
+        val fs = TightFileSystem()
+        // 一時ファイルに書けなかった直後（lstat の後）に、ほかのプロセスが元を 3 バイトに縮める
+        fs.onNoSpace = { inner -> inner.setSize(inner.stat(VfsPath.parse("/a.txt")).node, 3) }
+        nano(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\nsecond\n")) {
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Error writing /d/a.txt: No space left on device"), screen)
+            assertEquals("hel", file("/d/a.txt")!!.decodeToString())
+            assertEquals(null, file("/d/.a.txt.nano0"))
+            assertTrue(row(0).contains("Modified"), row(0))
+            keys(ctrlX)
+            assertTrue(row(22).contains("Save modified buffer?"), screen)
+            keys("n")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
+    fun `直接書く前に元が消されていたら、空のファイルを作らずにエラーを知らせる`() {
+        val fs = TightFileSystem()
+        fs.onNoSpace = { inner -> inner.removeFile(VfsPath.parse("/a.txt")) }
+        nano(listOf("/d/a.txt"), setup = tightDisk(fs, "hello world\nsecond\n")) {
+            keys(ctrlK)
+            keys(ctrlS)
+            assertTrue(row(22).contains("Error writing /d/a.txt: No such file or directory"), screen)
+            assertEquals(null, file("/d/a.txt"))
+            assertEquals(null, file("/d/.a.txt.nano0"))
+            keys(ctrlX)
+            assertTrue(row(22).contains("Save modified buffer?"), screen)
+            keys("n")
+            assertEquals(0, finish())
+        }
+    }
+
+    @Test
     fun `直接書く途中でIOエラーになっても、ファイルを空にせず、変えた印を残す`() {
         val fs = TightFileSystem()
         nano(

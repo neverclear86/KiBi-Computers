@@ -7,6 +7,8 @@ package pro.ikili.kibicomputers.core.kernel.vfs
  * - [stealFreed] が true なら、縮めて空いた分を、すぐにほかのプロセスが使ったことにする（[free] を増やさない）
  * - [failWriteNode] への書き込みは、位置 [failWriteAfter] から先で `IO` になる（そこまでは短い書き込み）
  * - [failStat] があれば、`stat` はどのパスでもそのエラーになる
+ * - [onNoSpace] があれば、最初に `NOSPC` を返す直前に一度だけ、中身の [FileSystem] を渡して呼ぶ
+ *   （空きの検査の後に、ほかのプロセスがファイルを縮めた・消したことにする）
  */
 internal class TightFileSystem(private val inner: FileSystem = TestMemoryFileSystem()) : FileSystem by inner {
     @Volatile var free: Long = Long.MAX_VALUE
@@ -19,12 +21,20 @@ internal class TightFileSystem(private val inner: FileSystem = TestMemoryFileSys
 
     @Volatile var failStat: Errno? = null
 
+    @Volatile var onNoSpace: ((FileSystem) -> Unit)? = null
+
     private fun sizeOf(node: Long): Long = inner.statNode(node).size
 
     /** 長さが [from] から [to] に変わる分を、空きから引く・空きに戻す */
     private fun account(from: Long, to: Long) {
         if (to > from) {
-            if (to - from > free) fsError(Errno.NOSPC)
+            if (to - from > free) {
+                onNoSpace?.let {
+                    onNoSpace = null
+                    it(inner)
+                }
+                fsError(Errno.NOSPC)
+            }
             free -= to - from
         } else if (!stealFreed) {
             free += from - to
