@@ -19,7 +19,8 @@ import java.io.ByteArrayOutputStream
  * （`exec` は `NOEXEC`。#367）。
  *
  * [message] は断った理由（どの関数の、どの命令・どの機能か。`exec` のエラーメッセージに入る）。
- * 止まりうる関数がないモジュールは断らない（#384）。
+ * 止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。ただし、グローバル・要素セグメントの定数式に
+ * `v128.const` などの命令があれば、止まりうる関数がなくても断る（#851）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -118,7 +119,7 @@ internal object Asyncify {
      *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
-     *   止まりうる関数がないモジュールは、これでは断らない（#384）
+     *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は、止まりうる関数がなくても断る（#851）
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)

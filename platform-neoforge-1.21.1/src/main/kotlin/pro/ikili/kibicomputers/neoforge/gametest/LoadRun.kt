@@ -19,7 +19,9 @@ import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
+import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
@@ -55,6 +57,11 @@ private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
  * @property tmpCommand `/tmp` にファイルを1つ書いて、プロンプトに戻るコマンド（#553）。画面の幅（単色の画面は 50 桁）に収まる長さにする
  * @property tmpDoneLine [tmpCommand] が終わったときに画面に出る行
  * @property tmpBytes [tmpCommand] が書くファイルの大きさ（バイト）。`TMPFS` 節はこれより大きくなる
+ * @property bootDisk ケースの既定の起動ディスク（`fallbackBootDisk`）。`null` ならゲームの既定（標準 OS。#461）
+ * @property computeProcess [computeCommand] が動かすプロセスの名前（`argv[0]`）。`null` でなければ、[LoadPhase.COMPUTE] は、
+ *   計算させる台の全部にこのプロセスがあり、全部の台で段階に入ってからの台ごとの燃料切れの巻き戻し（`Machine.fuelUnwindCount`）が
+ *   1 回以上になってから測りはじめる（読み込み・起動の途中を測らない。#821）
+ * @property ci CI の試験（`runGameTestServer`）でも動かすか。`false` のものは測定用（`-PloadTestOs`）だけ
  */
 internal enum class LoadOs(
     val id: String,
@@ -65,17 +72,33 @@ internal enum class LoadOs(
     val tmpCommand: String,
     val tmpDoneLine: String,
     val tmpBytes: Int,
+    val bootDisk: String? = null,
+    val computeProcess: String? = null,
+    val ci: Boolean = true,
 ) {
     /** テスト用の起動ディスク（#307）の Lua の REPL。`close` の戻り値 `true` を REPL が出す */
     LUA(
         "lua", "Lua の REPL", '>', "while true do end", "local i = 0 while true do i = i + 1 print(i) end",
-        "io.output\"/tmp/l\":write((\"x\"):rep(4^7)):close()", "true", 16_384,
+        "io.output\"/tmp/l\":write((\"x\"):rep(4^7)):close()", "true", 16_384, bootDisk = ProvisionalBoot.TEST_BOOT_DISK,
     ),
 
     /** 標準 OS（#98。ゲームの既定。#461）のシェル。`seq 3300` は 15,393 バイト */
     STANDARD(
         "standard", "標準 OS のシェル", '$', "while :; do :; done", "i=0; while :; do i=$((i+1)); echo \$i; done",
         "seq 3300 >/tmp/l; echo ok", "ok", 15_393,
+    ),
+
+    /**
+     * 標準 OS のシェルから、計算し続ける p2 のコマンド（コンポーネント）を動かす（#821）。起動ディスクは、標準 OS のイメージに
+     * `/bin/spin`（core のテストの `fuel-spin-p2.wasm`。wasi-sdk で wasi-libc が p2 の import を直接呼ぶ形）を足した `image:loadtest-p2`
+     * （接続層の dev ソースセットのリソース。jar には入らない）。`spin main 9 4000000000` は main の中のループ（止まりうる関数。
+     * 燃料切れを巻き戻せる。ADR 0757）で、1 ラウンドに約 4×10⁹ 回まわし、ラウンドが終わるまで画面に何も出さない
+     * （既定の燃料 1 tick 100 万では、1 ラウンドに数万 tick かかる）。jar の GameTest にはイメージがないので、CI では動かさない
+     */
+    STANDARD_P2(
+        "standard-p2", "標準 OS のシェル（p2 のコマンドで計算）", '$', "spin main 9 4000000000", "i=0; while :; do i=$((i+1)); echo \$i; done",
+        "seq 3300 >/tmp/l; echo ok", "ok", 15_393,
+        bootDisk = BootConfig.IMAGE_DISK_PREFIX + "loadtest-p2", computeProcess = "spin", ci = false,
     ),
     ;
 
@@ -205,6 +228,25 @@ internal data class TickStats(val ticks: Int, val avg: Double, val p50: Double, 
     }
 }
 
+/**
+ * スケジューラの燃料切れの数え口（サーバー全体の累計。#821）: 巻き戻してスレッドを持たずに待った回数、スレッドを持ったまま待った回数、
+ * 止まりうる関数でない関数の中で前借りした回数（`MachineScheduler` の `fuelUnwinds`・`fuelBlockingWaits`・`fuelOverdrafts`）
+ */
+internal data class FuelCounts(val unwinds: Long, val blockingWaits: Long, val overdrafts: Long) {
+    operator fun minus(o: FuelCounts): FuelCounts = FuelCounts(unwinds - o.unwinds, blockingWaits - o.blockingWaits, overdrafts - o.overdrafts)
+
+    override fun toString(): String = "巻き戻し $unwinds 回 / スレッドを持って待った $blockingWaits 回 / 前借り $overdrafts 回"
+
+    companion object {
+        val ZERO = FuelCounts(0, 0, 0)
+
+        /** 動いているサーバーのスケジューラの今の値（サーバーが動いていなければ 0） */
+        fun current(): FuelCounts = ServerMachines.current?.scheduler?.let {
+            FuelCounts(it.fuelUnwindCount, it.fuelBlockingWaitCount, it.fuelOverdraftCount)
+        } ?: ZERO
+    }
+}
+
 /** 1つの段階の結果。 */
 internal data class PhaseResult(
     val phase: LoadPhase,
@@ -243,6 +285,13 @@ internal data class PhaseResult(
     val longTickCount: Int = 0,
     /** 区間（[LoadTickProbe.Section] の順）ごとの、段階の間に区切りを通った回数。0 の区間は、区切りのイベントが届いていない */
     val sectionMarks: IntArray = IntArray(0),
+    /** 測った区間（ウォームアップの後から段階の終わりまで）の、燃料切れの数え口の増分（#821）。測る区間のない段階は `null` */
+    val fuel: FuelCounts? = null,
+    /**
+     * 測っている間に、計算させる台の中で、燃料をスレッドを持ったまま待っていた（`WAITING_FUEL`）プロセスの数の最大
+     * （10 tick ごとに数えた中で。[LoadPhase.COMPUTE] だけ。ほかは -1）。巻き戻して待つプロセスは `RUNNABLE` なので数えない（#821）
+     */
+    val peakFuelThreadWaits: Int = -1,
 )
 
 /**
@@ -616,6 +665,17 @@ internal class LoadReport(
                 }
             }
         }
+        val withFuel = phases.filter { it.fuel != null }
+        if (withFuel.isNotEmpty()) {
+            sb.append("\n燃料切れの数え口（#821。測った区間の増分。サーバー全体）:\n\n")
+            for (p in withFuel) {
+                sb.append("- ").append(p.phase.label).append(": ").append(p.fuel)
+                if (p.peakFuelThreadWaits >= 0) {
+                    sb.append("。計算させる台で、スレッドを持って燃料を待つプロセスの最大 ").append(p.peakFuelThreadWaits)
+                }
+                sb.append('\n')
+            }
+        }
         sb.append("\nカーネルのスレッドの内訳（段階の終わり）:\n")
         for (p in phases) sb.append("- ").append(p.phase.label).append(": ").append(p.kernelThreadNames).append('\n')
         return sb.toString()
@@ -636,6 +696,12 @@ internal class LoadRun(
 ) {
     private class Computer(val case: CaseBlockEntity, val screen: ScreenBlockEntity, val keyboard: KeyboardBlockEntity) {
         var ready = false
+
+        /** 段階に入ったときの、この台の燃料切れの巻き戻しの回数（[LoadOs.computeProcess] の起動を台ごとに待つため） */
+        var unwindsAtPhase = 0L
+
+        /** 段階に入ってからの、この台の燃料切れの巻き戻しの回数（台のマシンがまだなければ 0） */
+        fun unwindsSincePhase(): Long = (case.computer.machine?.fuelUnwindCount ?: 0L) - unwindsAtPhase
     }
 
     private val level = helper.level
@@ -673,6 +739,15 @@ internal class LoadRun(
     private var prevCapture = 0L
     private var peakKernelThreads = 0
     private var peakPhaseKernelThreads = 0
+
+    /** 段階に入ったときの燃料の数え口（[LoadOs.computeProcess] が起動しないときの失敗メッセージに、段階に入ってからの増分を出すため） */
+    private var fuelAtPhase = FuelCounts.ZERO
+
+    /** 測りはじめたときの燃料の数え口（測っていなければ `null`） */
+    private var fuelAtMeasure: FuelCounts? = null
+
+    /** [PhaseResult.peakFuelThreadWaits] */
+    private var peakFuelThreadWaits = 0
 
     /** 段階に入ったときにあったカーネルのスレッドの ID。これらのうち、プールで待っているワーカーは [peakPhaseKernelThreads] に数えない */
     private var baselineKernelThreads: Set<Long> = emptySet()
@@ -1233,8 +1308,13 @@ internal class LoadRun(
             threads.resetPeakThreadCount()
             peakKernelThreads = 0
             peakPhaseKernelThreads = 0
+            peakFuelThreadWaits = 0
+            fuelAtMeasure = FuelCounts.current()
         }
-        if (recording && phaseTick % 10 == 0) sampleKernelThreads()
+        if (recording && phaseTick % 10 == 0) {
+            sampleKernelThreads()
+            if (p == LoadPhase.COMPUTE) peakFuelThreadWaits = maxOf(peakFuelThreadWaits, computeSet.sumOf { fuelThreadWaits(it) })
+        }
         if (t == settings.warmupTicks + settings.measureTicks) next(p)
     }
 
@@ -1264,12 +1344,52 @@ internal class LoadRun(
         if (phaseTick % 10 != 0) return
         val waiting = computeSet.count { !runsLoop(it) }
         if (waiting == 0) {
+            if (!computeStarted()) {
+                if (phaseTick >= settings.outputTimeoutTicks) {
+                    val c = computeSet.firstOrNull { !hasComputeProcess(it) || it.unwindsSincePhase() <= 0 }
+                    fail(
+                        "the compute command did not start within ${settings.outputTimeoutTicks} ticks " +
+                            "(fuel since the phase began: ${FuelCounts.current() - fuelAtPhase}; " +
+                            "processes: ${c?.case?.computer?.machine?.describeProcesses()})",
+                    )
+                }
+                return
+            }
             measureFrom = phaseTick
         } else if (phaseTick >= settings.outputTimeoutTicks) {
             val c = computeSet.first { !runsLoop(it) }
             fail("$waiting of ${computeSet.size} computing machines did not show the command within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
         }
     }
+
+    /**
+     * [LoadOs.computeProcess] のある OS で、計算させる台の全部にそのプロセスがあり、全部の台が段階に入ってから燃料切れで巻き戻したか（#821）。
+     * コマンドの読み込み（検証・変換・コンパイル）と起動の途中（realloc の中の燃料切れは巻き戻せないので、スレッドを持って待つ。ADR 0757）を
+     * 測らないため。起動が済んで main のループに入った台だけが巻き戻すので、台ごとの回数で見る（サーバー全体の累計だと、先に起動した
+     * 少数の台だけで超える）。ないなら、いつも真
+     */
+    private fun computeStarted(): Boolean {
+        if (settings.os.computeProcess == null) return true
+        if (!computeSet.all(::hasComputeProcess)) return false
+        return computeSet.all { it.unwindsSincePhase() > 0 }
+    }
+
+    /** 台の、終わっていないプロセスの名前と状態（`Machine.describeProcesses` の `<pid>:<名前>=<状態> waits=...` から） */
+    private fun processStates(c: Computer): List<Pair<String, String>> {
+        val text = c.case.computer.machine?.describeProcesses() ?: return emptyList()
+        if (text == "none") return emptyList()
+        return text.split("; ").mapNotNull { entry ->
+            val head = entry.substringBefore(" waits=")
+            val colon = head.indexOf(':')
+            val eq = head.lastIndexOf('=')
+            if (colon < 0 || eq < colon) null else head.substring(colon + 1, eq) to head.substring(eq + 1)
+        }
+    }
+
+    private fun hasComputeProcess(c: Computer): Boolean = processStates(c).any { it.first.substringAfterLast('/') == settings.os.computeProcess }
+
+    /** 台の中で、燃料をスレッドを持ったまま待っているプロセス（`WAITING_FUEL`）の数 */
+    private fun fuelThreadWaits(c: Computer): Int = processStates(c).count { it.second == WAITING_FUEL }
 
     private fun runsLoop(c: Computer): Boolean =
         lines(c.screen.text).lastOrNull { it.isNotEmpty() } == "${settings.os.prompt} ${settings.os.computeCommand}"
@@ -1504,6 +1624,10 @@ internal class LoadRun(
         peakPhaseKernelThreads = 0
         threads.resetPeakThreadCount()
         baselineKernelThreads = kernelThreadInfos().mapTo(HashSet()) { it.threadId }
+        fuelAtPhase = FuelCounts.current()
+        for (c in computers) c.unwindsAtPhase = c.case.computer.machine?.fuelUnwindCount ?: 0L
+        fuelAtMeasure = null
+        peakFuelThreadWaits = 0
     }
 
     private fun finish() {
@@ -1533,6 +1657,8 @@ internal class LoadRun(
             longTicks = longTicks.toList(),
             longTickCount = longTickCount,
             sectionMarks = sectionMarks.copyOf(),
+            fuel = fuelAtMeasure?.let { FuelCounts.current() - it },
+            peakFuelThreadWaits = if (p == LoadPhase.COMPUTE && fuelAtMeasure != null) peakFuelThreadWaits else -1,
         )
         results += result
     }
@@ -1662,6 +1788,9 @@ internal class LoadRun(
         private const val SAVE_WAIT_STEP_MILLIS = 50L
 
         private val DIGITS = Regex("[0-9]+")
+
+        /** `Machine.describeProcesses` に出る、燃料をスレッドを持ったまま待つプロセスの状態（core の `ProcessState.WAITING_FUEL`。内部の型なので名前で見る） */
+        private const val WAITING_FUEL = "WAITING_FUEL"
 
         /** プールで仕事を待っているワーカーを見分けるのに読むスタックの深さ */
         private const val STACK_DEPTH = 32

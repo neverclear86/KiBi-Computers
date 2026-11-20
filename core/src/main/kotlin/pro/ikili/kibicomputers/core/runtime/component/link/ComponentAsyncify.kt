@@ -16,7 +16,7 @@ import pro.ikili.kibicomputers.core.runtime.asyncify.AsyncifyUnsupported
  *
  * 同じ中身のモジュールを 2 回以上インスタンス化していれば、止まりうる import は使われ方の和にする（変換は 1 回）。
  *
- * 次のどれかなら変換しない（[Result.rejection]。コンポーネントは今までどおり `BLOCKING` で動く）:
+ * 次のどれかなら変換しない（[Result.rejection]。`exec` では `NOEXEC` で断る（#844）。直接読み込んだものは `BLOCKING` で動く）:
  * - 巻き戻せない待ち（[HostWait.BLOCK]）のホストの関数を lower している
  * - 待ちが、ゲストからゲストへの呼び出し（lift した関数を lower した import）の下にある。間に canon の Kotlin の層があり、
  *   callee の線形メモリへの lower・Task・borrow の範囲が呼び出しの途中の状態になるので、巻き戻せない

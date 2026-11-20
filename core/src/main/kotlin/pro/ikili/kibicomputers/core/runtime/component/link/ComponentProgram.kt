@@ -70,14 +70,16 @@ internal class ComponentProgram private constructor(
          * 2. 中の core モジュールを、同じ中身は 1 つにまとめ、[metered] なら燃料の計測コードを共有の形で挿入する
          * 3. import と export だけを読み（[WasmRuntime.describe]）、リンクの計画を作る（[ComponentPlanner]）
          * 4. [asyncify] なら、計画から止まりうる import を決めて（[ComponentAsyncify]）、全モジュールに待機点への変換をかける。
-         *    かけられなければ、どのモジュールにもかけない（理由は [waitPointRejection]。`BLOCKING` で動く）。
+         *    かけられなければ、[requireWaitPoints] なら [WasmLoadException] で断る（#844。`exec` の道。次の段のコンパイルはしない）。
+         *    そうでなければ、どのモジュールにもかけない（理由は [waitPointRejection]。`BLOCKING` で動く。直接の読み込みとテストの道）。
          *    変換はモジュールごとに 2 段で試す（#803。p1 の [Instrumentation] と同じ）: 止まりうる関数の中の燃料切れ（`kibi.fuel`）も
          *    待ち点にする（段1）→ 断られたら、そのモジュールだけ燃料切れを待ち点にせずに変換する（段2）。段2も断られたら上のとおり
          *    どのモジュールにもかけない。[fuelYield] が偽なら（か燃料を計測しないなら）段1は試さない
          * 5. ランタイムに読み込ませる（パース・検証・コンパイル。各モジュール 1 回だけ）
          *
-         * 変換をかけられなかったときは、理由をログに出す（同じコンポーネントでは 1 回だけ。[WaitPointRejectionLog]）。`BLOCKING` のコンポーネントは
-         * 待つ間スレッドを持ち、`maxBlockingProcesses`（1 台・全体）に数えられるので、運用の側から原因を追えるようにする。
+         * [requireWaitPoints] が偽で変換をかけられなかったときは、理由をログに出す（同じコンポーネントでは 1 回だけ。[WaitPointRejectionLog]）。
+         * `BLOCKING` のコンポーネントは待つ間スレッドを持ち、`maxBlockingProcesses`（1 台・全体）に数えられるので、運用の側から原因を追えるようにする。
+         * [requireWaitPoints] が真なら、ログは出さず、理由は例外で呼んだ側に返す（p1 の `Program.loadMetered` と同じ。#367・#844）。
          *
          * 燃料の挿入と変換の順は p1 と同じ（[Instrumentation]。#341）。燃料切れの待ち点（`kibi.async_fuel`）で巻き戻すときは、
          * カーネルが `LinkedComponent.requestUnwind` を通して全インスタンスの状態を同時に変える（#803。ADR 0757 の「燃料切れの待ち点」）。
@@ -91,7 +93,8 @@ internal class ComponentProgram private constructor(
          *
          * 重いので、コンパイル用のスレッドから呼ぶ。[validate] は wasm-tools の検証の差し替え（テスト用。[ComponentLoader.load]）
          *
-         * @throws WasmLoadException 読めない・検証に通らない・ホストにない import・まだ扱えない機能・上限を超えた
+         * @throws WasmLoadException 読めない・検証に通らない・ホストにない import・まだ扱えない機能・上限を超えた・
+         *   [requireWaitPoints] で待機点に変換できない（原因（`cause`）は [AsyncifyUnsupported]。文面は p1 の `Program.loadMetered` と同じ）
          * @throws WasmTrapException 検証の途中でスレッドが割り込まれた（[pro.ikili.kibicomputers.core.runtime.WasmTrapKind.INTERRUPTED]。
          *   内容の失敗ではないので、読み込みの失敗として覚えない）
          */
@@ -106,7 +109,9 @@ internal class ComponentProgram private constructor(
             validate: ((ByteArray) -> Unit)? = null,
             asyncify: Boolean = true,
             fuelYield: Boolean = true,
+            requireWaitPoints: Boolean = false,
         ): ComponentProgram {
+            require(!requireWaitPoints || asyncify) { "requireWaitPoints には asyncify が要る" }
             ComponentLoader.warmUp()
             val deadline = LoadDeadline(limits.moduleLimits.timeLimitNanos)
             val loaded = ComponentLoader.load(bytes, limits, policy, deadline = deadline, validate = validate)
@@ -141,7 +146,11 @@ internal class ComponentProgram private constructor(
                 // 燃料切れの import（`kibi.fuel`）は、計測コードを挿入したときだけある
                 val r = transform(injected, numbering, planned, deadline, fuelYield && metered)
                 rejection = r.rejection
-                rejection?.let { WaitPointRejectionLog.report(loaded.sha256, it) }
+                rejection?.let {
+                    // exec の道（#844）: 全モジュールをコンパイルする前に断る（捨てるもののコンパイルと、うその「スレッドを持つ」ログを避ける）
+                    if (requireWaitPoints) throw WasmLoadException("待機点に変換できない: $it", AsyncifyUnsupported(it))
+                    WaitPointRejectionLog.report(loaded.sha256, it)
+                }
                 if (r.bytes != null) {
                     yielded = r.fuelYield
                     yieldRejection = r.fuelYieldRejection
@@ -260,6 +269,7 @@ internal abstract class ComponentOnceLog {
 
 /**
  * コンポーネントを待機点に変換できなかった（[ComponentProgram.waitPointRejection]）ときの、理由のログ（#757）。
+ * `requireWaitPoints` で読む `exec` の道（#844）では断るので出さない。直接の読み込み（テストなど）の道だけで出る。
  *
  * 変換できなかったコンポーネントは `BLOCKING` で動き、待つ間スレッドを持つ。スレッドは `maxBlockingProcesses`（1 台・サーバー全体。ADR 0263）に
  * 数えられ、超えると子の `spawn` が `NFILE` になるので、運用の側から原因（どの core モジュールの、どの関数か）を追えるように出す。

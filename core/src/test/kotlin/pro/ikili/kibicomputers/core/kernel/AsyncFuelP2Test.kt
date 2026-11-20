@@ -554,6 +554,27 @@ class AsyncFuelP2Test {
             assertTrue(maxThreads <= permits * 2, "スレッドを持つプロセスが多すぎる: $maxThreads（${spins.size} 本）")
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
             for (s in spins) s.m.lock.withLockValue { s.m.killLocked(s.pid, KillSignal.KILL) }
+            // 接続層の負荷試験（#821）が読む口は、数え口と同じ値を返す。動いている間は別スレッドが数え口を増やすので、
+            // 全部殺して、走っているステップが終わり、数え口が止まってから比べる（2 回の読みの間の増分で落ちない）
+            eventually(30_000, "殺したのに数え口が止まらない") {
+                val a = h.scheduler.fuelUnwinds.get()
+                Thread.sleep(50)
+                val b = h.scheduler.fuelUnwinds.get()
+                a == b && h.scheduler.fuelUnwindCount == b && h.scheduler.fuelBlockingWaitCount == h.scheduler.fuelBlockingWaits.get() &&
+                    h.scheduler.fuelOverdraftCount == h.scheduler.fuelOverdrafts.get()
+            }
+            // 台ごとの巻き戻しの数（接続層の負荷試験が、台ごとに起動が済んだかを見る）は、巻き戻した燃料切れ（燃料待ちの fuelUnwinds と、
+            // 巻き戻して譲った分）を数える。fuelYields には、巻き戻せないところ（起動の途中の realloc の中など）でスレッドを持ったまま
+            // 譲った分も入るので、合計は fuelUnwinds 以上、fuelUnwinds + fuelYields 以下になる（等しいとは限らない）
+            val perMachine = spins.map { it.m }.distinct()
+            assertTrue(perMachine.all { it.fuelUnwindCount > 0 }, "巻き戻していない台がある")
+            val perMachineSum = perMachine.sumOf { it.fuelUnwindCount }
+            val unwindTotal = h.scheduler.fuelUnwinds.get()
+            val yieldTotal = h.scheduler.fuelYields.get()
+            assertTrue(
+                perMachineSum in unwindTotal..(unwindTotal + yieldTotal),
+                "台ごとの巻き戻しの合計 $perMachineSum が、巻き戻し $unwindTotal と譲り $yieldTotal の範囲にない",
+            )
         }
     }
 }

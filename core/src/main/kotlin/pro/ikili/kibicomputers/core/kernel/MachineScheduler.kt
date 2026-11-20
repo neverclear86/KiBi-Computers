@@ -221,6 +221,15 @@ public class MachineScheduler private constructor(
      */
     internal val fuelYields = AtomicLong()
 
+    /** [fuelUnwinds] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelUnwindCount: Long get() = fuelUnwinds.get()
+
+    /** [fuelBlockingWaits] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelBlockingWaitCount: Long get() = fuelBlockingWaits.get()
+
+    /** [fuelOverdrafts] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelOverdraftCount: Long get() = fuelOverdrafts.get()
+
     init {
         dispatcher.start()
     }
