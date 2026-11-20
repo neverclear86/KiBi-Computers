@@ -39,6 +39,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmHostImport
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.p1.P1
+import pro.ikili.kibicomputers.core.wasi.p1.WasiP1Kibi
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -354,13 +355,33 @@ class LuaTermFsKeysTest {
     }
 
     /**
-     * Lua のプロセスの `poll_oneoff` を包んだ [ProcessDriverFactory]（#838）。読み捨ての「読めるかを見る」呼び出し（`kibi_lua_tty.c` の
-     * `ready_now`。fd_read と待たない時計の2つの購読）が fd 0 を「読める」と返した直後に、ほかの読み手が先に読み切った形にするため、
-     * コンソールの TTY の入力を空にする。見てから読むまでの間に入る順を、本番のコードを変えずに、決めて作れる。
-     * [stolen] は、読み切った回数（読めるものがあって取った回数）
+     * Lua のプロセスの import を包んで、読み捨て（`kibi_lua_tty.c` の `drain`）の中を見て、順を決めて作る（#838）。本番のコードは変えない。
+     *
+     * - `poll_oneoff`: [steal] なら、読み捨ての「読めるかを見る」呼び出し（`ready_now`。fd_read と待たない時計の2つの購読）が fd 0 を
+     *   「読める」と返した直後に、コンソールの TTY の入力を空にする（ほかの読み手が、見てから読むまでの間に読み切った順）
+     * - `kibi:io/tty` の `set-mode`: [refillAfterCooked] なら、cooked に戻した直後に、確定した1行を TTY に入れる。戻した後の2回目の
+     *   読み捨て（戻したことで残った塊を捨てるもの）にも、読めると見てから取られる順を通すため
+     * - `fd_read`: Lua の fd 0 に NONBLOCK が立っている間（読み捨ての中）に呼ばれたら、そのときのほかのプロセスの fd 0 を見る
      */
-    private fun stealAfterReadyCheck(m: () -> Machine, stolen: java.util.concurrent.atomic.AtomicInteger): ProcessDriverFactory =
-        object : ProcessDriverFactory {
+    private inner class DrainProbe(
+        private val machine: () -> Machine,
+        private val steal: Boolean,
+        private val refillAfterCooked: Boolean = false,
+    ) {
+        /** 読み切ったときの TTY のモード（読めるものがあって取った回数だけ並ぶ） */
+        val stolenModes: MutableList<TtyMode> = java.util.concurrent.CopyOnWriteArrayList()
+
+        /** cooked に戻した後に1行を入れた回数 */
+        val refills = java.util.concurrent.atomic.AtomicInteger()
+
+        /** 読み捨ての中（Lua の fd 0 に NONBLOCK が立っている間）の fd_read の回数 */
+        val drainReads = java.util.concurrent.atomic.AtomicInteger()
+
+        /** 読み捨ての中で、ほかのプロセスの fd 0 に NONBLOCK が立っていたら true */
+        @Volatile
+        var othersNonblockInDrain = false
+
+        val drivers: ProcessDriverFactory = object : ProcessDriverFactory {
             override val waitImports: Set<String> get() = KernelDrivers.DEFAULT.waitImports
 
             override fun create(program: Program): ProcessDriver {
@@ -368,37 +389,70 @@ class LuaTermFsKeysTest {
                 return object : ProcessDriver by inner {
                     override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) {
                         inner.configure(ctx, builder)
-                        val index = builder.hostImports.indexOfFirst { it.module == P1.MODULE && it.name == "poll_oneoff" }
-                        check(index >= 0) { "poll_oneoff がない" }
-                        val original = builder.hostImports[index]
-                        builder.hostImports[index] = WasmHostImport(
-                            original.module,
-                            original.name,
-                            original.type,
-                            WasmHostFunction { instance, args ->
-                                val result = original.function.call(instance, args)
-                                if (result[0] == 0L && instance.asyncState == WasmAsyncState.NORMAL && readyCheckSawReadable(instance, args)) {
-                                    val machine = m()
-                                    val took = machine.lock.withLockValue {
-                                        val tty = machine.consoleTtyLocked()
-                                        val buf = ByteArray(4096)
-                                        var total = 0
-                                        while (true) {
-                                            val r = tty.read(buf, 0, buf.size, machine.wakeSink)
-                                            if (r !is ReadResult.Bytes || r.count == 0) break
-                                            total += r.count
-                                        }
-                                        total
-                                    }
-                                    if (took > 0) stolen.incrementAndGet()
+                        wrap(builder, P1.MODULE, "poll_oneoff") { original, instance, args ->
+                            val result = original.call(instance, args)
+                            if (steal && result[0] == 0L && instance.asyncState == WasmAsyncState.NORMAL && readyCheckSawReadable(instance, args)) {
+                                stealAll()
+                            }
+                            result
+                        }
+                        wrap(builder, WasiP1Kibi.IO_TTY, "set-mode") { original, instance, args ->
+                            val result = original.call(instance, args)
+                            if (refillAfterCooked && args[1].toInt() == TtyMode.COOKED.bits) {
+                                machine().offerConsoleInput("s\n".toByteArray())
+                                refills.incrementAndGet()
+                            }
+                            result
+                        }
+                        wrap(builder, P1.MODULE, "fd_read") { original, instance, args ->
+                            val m = machine()
+                            m.lock.withLockValue {
+                                if (m.kernel.processes[ctx.pid]?.handles?.get(0)?.flags.nonblock()) {
+                                    drainReads.incrementAndGet()
+                                    val others = m.kernel.processes.all().filter { it.pid != ctx.pid && !it.state.isTerminal }
+                                    if (others.any { it.handles[0]?.flags.nonblock() }) othersNonblockInDrain = true
                                 }
-                                result
-                            },
-                        )
+                            }
+                            original.call(instance, args)
+                        }
                     }
                 }
             }
         }
+
+        private fun stealAll() {
+            val m = machine()
+            val (took, mode) = m.lock.withLockValue {
+                val tty = m.consoleTtyLocked()
+                val buf = ByteArray(4096)
+                var total = 0
+                while (true) {
+                    val r = tty.read(buf, 0, buf.size, m.wakeSink)
+                    if (r !is ReadResult.Bytes || r.count == 0) break
+                    total += r.count
+                }
+                total to tty.mode
+            }
+            if (took > 0) stolenModes.add(mode)
+        }
+
+        private fun wrap(
+            builder: WasmInstanceConfig.Builder,
+            module: String,
+            name: String,
+            body: (WasmHostFunction, pro.ikili.kibicomputers.core.runtime.WasmInstance, LongArray) -> LongArray,
+        ) {
+            val index = builder.hostImports.indexOfFirst { it.module == module && it.name == name }
+            check(index >= 0) { "$module.$name がない" }
+            val original = builder.hostImports[index]
+            builder.hostImports[index] = WasmHostImport(
+                original.module,
+                original.name,
+                original.type,
+                WasmHostFunction { instance, args -> body(original.function, instance, args) },
+            )
+        }
+    }
 
     /** `poll_oneoff(in, out, nsubscriptions, nevents)` が、fd 0 の fd_read と時計（待たない）の2つの購読で、fd 0 を「読める」と返したか */
     private fun readyCheckSawReadable(instance: pro.ikili.kibicomputers.core.runtime.WasmInstance, args: LongArray): Boolean {
@@ -431,12 +485,16 @@ class LuaTermFsKeysTest {
         var luaNonblockWhileWaiting = false
         var mode: TtyMode? = null
         var readerAlive = false
+        lateinit var machine: Machine
+        val probe = DrainProbe({ machine }, steal = false)
         // 読めることを見てから別の呼び出しで待つ fd_read をすると、その間にもう1つの読み手が読み切ったとき、次の入力まで止まる（#838）。
         // キーと文字を1回送るたびに、次の入力を送らずに、Lua がタイマーで2回起きるのを待つ（止まれば、そこで進まなくなる）。
         // 割り込みは、Lua が見てから読むまでの間（燃料を確かめるところ1つ分）で CPU を譲り、その間にもう1つの読み手が残りを読んだときに起きる。
         // スライスを小さくし、読み手は1バイトずつ読ませ、文字の長さを変えて、行き来を増やす。窓が狭く順は決められないので、
         // 止まる順は次のテスト（poll_oneoff の包みで決めて作る）に任せる。ここで確かめるのは、
-        // ほかの読み手と一緒でも止まらないこと、ほかの読み手の fd 0 が NONBLOCK にならないこと、待つ間の Lua の fd 0 が元に戻っていること
+        // ほかの読み手と一緒でも止まらないこと、ほかの読み手の fd 0 が NONBLOCK にならないこと、待つ間の Lua の fd 0 が元に戻っていること。
+        // 読み捨ての最中（Lua が NONBLOCK を立てている間）のほかの読み手の fd 0 は、fd_read の包み（DrainProbe）で見る。
+        // tick の境目では、立てた NONBLOCK はもう戻っているので、driver・after で見るだけでは、漏れて戻ったものを区別できない
         val r = luaWith(
             """
             os.queueEvent('ready')
@@ -463,6 +521,8 @@ class LuaTermFsKeysTest {
                 """,
             ),
             fuelSlice = 200,
+            luaDrivers = probe.drivers,
+            beforeRun = { m, _ -> machine = m },
             driver = { m, pid, others, text ->
                 if (others.any { m.fd0Flags(it).nonblock() }) readerNonblock = true
                 // イベントを待っている間（読み捨ての外）は、Lua の fd 0 も元のフラグに戻っている
@@ -498,14 +558,15 @@ class LuaTermFsKeysTest {
         assertTrue(luaChecked > 0, "Lua が待っているところを見られなかった")
         assertFalse(luaNonblockWhileWaiting, "待っている間の Lua の fd 0 が NONBLOCK のまま")
         assertFalse(readerNonblock, "もう1つの読み手の fd 0 が NONBLOCK になった")
+        assertFalse(probe.othersNonblockInDrain, "読み捨ての最中に、もう1つの読み手の fd 0 が NONBLOCK になった")
         assertEquals(TtyMode.COOKED, mode)
     }
 
     @Test
     fun `読み捨てで読めると見た後にほかの読み手が読み切っても、次の入力を待たない`() = timeout(limit) {
         val keyboard = KeyboardDevice()
-        val stolen = java.util.concurrent.atomic.AtomicInteger()
         lateinit var machine: Machine
+        val probe = DrainProbe({ machine }, steal = true)
         var attached = false
         var bursts = 0
         var waitFor = 0
@@ -529,7 +590,7 @@ class LuaTermFsKeysTest {
             print('done')
             """,
             others = emptyList(),
-            luaDrivers = stealAfterReadyCheck({ machine }, stolen),
+            luaDrivers = probe.drivers,
             waitMillis = 30_000,
             beforeRun = { m, _ -> machine = m },
             driver = { m, _, _, text ->
@@ -548,7 +609,88 @@ class LuaTermFsKeysTest {
         ).assertOk()
         assertTrue(r.text.contains("done\n"), r.text)
         assertEquals(8, bursts, r.text)
-        assertTrue(stolen.get() > 0, "読み切る順を作れなかった（poll_oneoff の包みが効いていない）")
+        assertTrue(probe.stolenModes.isNotEmpty(), "読み切る順を作れなかった（poll_oneoff の包みが効いていない）")
+        // ここで通るのは待つ前の読み捨て（キー待ちのモードのまま）だけ。戻すときの読み捨ては次の2つのテストで確かめる
+        assertTrue(probe.stolenModes.all { it == KEYS_MODE }, "${probe.stolenModes}")
+    }
+
+    /**
+     * 戻すときの読み捨て（`kibi_lua_tty_restore`）を、読めると見てから取られる順で通す（#838）。[script] は `pullEvent('key')` を1回待ち、
+     * その後は待たずに戻す（終わる、または標準入力を読む）。キー待ちの間に文字を先に送るので、戻すときの1回目の読み捨て（キー待ちの
+     * モードのまま）が読めると見る。cooked に戻した直後に1行を入れるので、2回目の読み捨て（cooked）も読めると見る。どちらも見た直後に
+     * TTY を空にする。直す前のコード（待つ fd_read）は、空になった TTY を読んで次の入力まで止まる。
+     * ほかに、`os.sleep` で寝ているだけの `lua` を同じ TTY で動かし、読み捨ての最中にその fd 0 が NONBLOCK にならないことを見る
+     */
+    private fun restoreAfterSteal(script: String, onCooked: ((Machine) -> Unit)? = null): Pair<Result, DrainProbe> {
+        val keyboard = KeyboardDevice()
+        lateinit var machine: Machine
+        val probe = DrainProbe({ machine }, steal = true, refillAfterCooked = true)
+        var step = 0
+        val r = luaWith(
+            script,
+            others = listOf(listOf("lua", "/home/s.lua")),
+            files = mapOf("/home/s.lua" to "os.sleep(600)"),
+            luaDrivers = probe.drivers,
+            waitMillis = 30_000,
+            beforeRun = { m, _ -> machine = m },
+            driver = { m, pid, _, text ->
+                val waiting = m.lock.withLockValue { m.kernel.processes[pid]?.state == ProcessState.WAITING_EVENT }
+                if (step == 0 && text.contains("ready") && m.consoleMode() == KEYS_MODE && waiting) {
+                    assertTrue(m.devices.attach("00000000-0000-4000-8000-000000000838", keyboard))
+                    // 文字を押下より先に送る（キーを受けた後は待たないので、戻すときの読み捨てまで TTY に残る）
+                    keyboard.input(KeyboardEvent.Text("zz"))
+                    keyboard.input(KeyboardEvent.KeyDown(Key.A, 0, false))
+                    step = 1
+                } else if (step == 1 && onCooked != null && probe.stolenModes.size >= 2 && m.consoleMode() == TtyMode.COOKED) {
+                    onCooked(m)
+                    step = 2
+                }
+            },
+        ).assertOk()
+        return r to probe
+    }
+
+    private fun assertRestoreStolen(r: Result, probe: DrainProbe) {
+        // 1回目はキー待ちのモードのまま、2回目は cooked に戻した後。どちらも取られた後の fd_read が待たずに戻ったので、ここまで進んだ
+        assertEquals(listOf(KEYS_MODE, TtyMode.COOKED), probe.stolenModes.toList(), r.text)
+        assertEquals(1, probe.refills.get(), r.text)
+        assertTrue(probe.drainReads.get() >= 2, "読み捨ての最中の fd_read を見られなかった: ${probe.drainReads.get()}")
+        assertFalse(probe.othersNonblockInDrain, "読み捨ての最中に、寝ている lua の fd 0 が NONBLOCK になった")
+        assertFalse(r.text.contains("zz"), r.text)
+    }
+
+    @Test
+    fun `終わるときの戻しは、読めると見た後にほかの読み手が読み切っても待たない`() = timeout(limit) {
+        val (r, probe) = restoreAfterSteal(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.pullEvent('key')
+            print('got')
+            """,
+        )
+        assertTrue(r.text.contains("got\n"), r.text)
+        assertRestoreStolen(r, probe)
+    }
+
+    @Test
+    fun `io_readの前の戻しは、読めると見た後にほかの読み手が読み切っても待たない`() = timeout(limit) {
+        val (r, probe) = restoreAfterSteal(
+            """
+            os.queueEvent('ready')
+            os.pullEvent('ready')
+            print('ready')
+            os.pullEvent('key')
+            print('read')
+            local line = io.read()
+            print('got[' .. tostring(line) .. ']')
+            """,
+            // 戻した後に1行を打つ。cooked に戻した直後に入れた行は2回目の読み捨てが取ったので、io.read には混ざらない
+            onCooked = { m -> m.offerConsoleInput("hello\n".toByteArray()) },
+        )
+        assertTrue(r.text.contains("got[hello]"), r.text)
+        assertRestoreStolen(r, probe)
     }
 
     @Test
