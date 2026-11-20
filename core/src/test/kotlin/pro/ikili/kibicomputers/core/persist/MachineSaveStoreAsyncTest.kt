@@ -252,7 +252,7 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
-    fun `owner_binの失敗を受け取る前に、deleteの後のclaimが同じIDのowner_binを同期で書けば、印が外れて後続は書ける`() {
+    fun `owner_binの失敗を受け取る前に、deleteの後のclaimが同じIDを受け入れれば、次の世代の前にowner_binを書けて印が外れる`() {
         val root = dir.resolve("root")
         Files.write(root, byteArrayOf(1))
         val s = MachineSaveStore(root, index, "test", manual)
@@ -262,19 +262,23 @@ class MachineSaveStoreAsyncTest {
         assertTrue(s.isUnusable(id), "失敗をまだ受け取っていないので印が残る")
         Files.delete(root)
         Files.createDirectories(root)
-        // 受け取る前に壊して消し、コピーした NBT を置き直す（owner.bin がないので KEPT で同じ ID。owner.bin は claim が同期で書く）
+        // 受け取る前に壊して消し、コピーした NBT を置き直す（消した ID なので読まずに KEPT で同じ ID。owner.bin は次の世代の前に書く。#585）
         s.delete(id)
         index.removeIfOwner(id, p)
         manual.runAll()
         val claim = s.claim(id.toString(), 1, 0, q)
         assertEquals(ClaimResult.KEPT, claim.result)
         assertEquals(id, claim.identity!!.id)
-        assertEquals(OwnerRecord(0, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
-        assertFalse(s.isUnusable(id), "owner.bin が同期で書けたので印を外す")
+        assertEquals(0, s.mainOwnerReads, "消した ID の owner.bin は読まない")
+        assertNull(OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)), "claim では書かない")
+        assertTrue(s.isUnusable(id), "まだ書いていないので印は残る")
         // 1つ目の失敗を受け取る前に、次を書かせる（受け取ると、仕事がなければそこでも印が外れるため）
         val second = s.submit(claim.identity!!, q, src(), null)
         assertEquals(id, second.identity.id)
+        assertEquals(2, second.writes, "owner.bin と世代")
         manual.runAll()
+        assertEquals(OwnerRecord(0, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        assertFalse(s.isUnusable(id), "owner.bin が書けたので印を外す")
         assertTrue(exists(second, s), "印が外れたので世代のファイルを書く")
         val completions = s.pollCompleted()
         assertEquals(listOf(first, second), completions.map { it.pending })
@@ -285,7 +289,7 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
-    fun `owner_binの失敗を受け取る前に、引き取りのclaimが同じIDのowner_binを同期で書けば、印が外れて後続は書ける`() {
+    fun `owner_binの失敗を受け取る前に、引き取りのclaimが同じIDのowner_binを列で書けば、印が外れて後続は書ける`() {
         val root = dir.resolve("root")
         Files.write(root, byteArrayOf(1))
         val s = MachineSaveStore(root, index, "test", manual)
@@ -295,22 +299,26 @@ class MachineSaveStoreAsyncTest {
         assertTrue(s.isUnusable(id))
         Files.delete(root)
         Files.createDirectories(root)
-        // 受け取る前にアンロードされ、NBT が別の場所に置かれる（覚えている owner.bin の epoch 以上なので引き取り、epoch 1 を同期で書く）
+        // 受け取る前にアンロードされ、NBT が別の場所に置かれる（覚えている owner.bin の epoch 以上なので引き取り、epoch 1 を列で書く。#585）
         index.removeIfOwner(id, p)
         val claim = s.claim(id.toString(), 1, 0, q)
         assertEquals(ClaimResult.TAKEN_OVER, claim.result)
         assertEquals(id, claim.identity!!.id)
-        assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
-        assertFalse(s.isUnusable(id), "owner.bin が同期で書けたので印を外す")
+        assertNull(OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)), "claim では書かない")
         val second = s.submit(claim.identity!!, q, src(), null)
         assertEquals(id, second.identity.id)
         assertFalse(second.reassigned)
+        assertEquals(1, second.writes, "引き取りの owner.bin は claim が列に入れた")
         manual.runAll()
+        assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        assertFalse(s.isUnusable(id), "owner.bin が書けたので印を外す")
         assertTrue(exists(second, s), "印が外れたので世代のファイルを書く")
         val completions = s.pollCompleted()
-        assertEquals(listOf(first, second), completions.map { it.pending })
+        assertEquals(listOf(first, second), completions.map { it.pending }, "owner.bin だけの仕事の完了は返さない")
         assertFalse(completions[0].succeeded)
         assertTrue(completions[1].succeeded, "後続は成功で返る")
+        assertEquals(q, index.ownerOf(id), "古い失敗を受け取っても、引き取った登録は外さない")
+        assertEquals(OptionalLong.of(second.identity.generation), s.latestGeneration(id))
     }
 
     private fun exists(pending: PendingSave, s: MachineSaveStore) =
@@ -381,7 +389,7 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
-    fun `claimはそのIDの仕事が残っていれば終わるまで待ってからowner_binを書く`() = timeout(limit) {
+    fun `claimは列が詰まっていても待たずに返り、引き取りのowner_binは前の世代の後に列で書く`() = timeout(limit) {
         val gate = CountDownLatch(1)
         val writer = SaveWriter("gated")
         val s = MachineSaveStore(dir, index, "test", writer)
@@ -390,15 +398,18 @@ class MachineSaveStoreAsyncTest {
             writer.execute(identity.id) { gate.await() }
             s.submit(identity, p, src(), null)
             index.removeIfOwner(identity.id, p)
-            Thread {
-                Thread.sleep(200)
-                gate.countDown()
-            }.start()
             val claim = s.claim(identity.id.toString(), 1, 0, q)
             assertEquals(ClaimResult.TAKEN_OVER, claim.result)
-            assertTrue(Files.exists(s.generationFile(identity.id, 1)), "世代の書き込みが先に済んでいる")
-            assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)))
-            assertTrue(s.claimWaitNanos >= TimeUnit.MILLISECONDS.toNanos(100), "待った時間を数える")
+            assertEquals(1, claim.identity!!.epoch)
+            assertEquals(0, s.claimWaitNanos, "待たない")
+            assertEquals(0, s.mainOwnerReads, "覚えている owner.bin は読まない")
+            assertNull(OwnerRecord.read(s.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)), "列が止まっている間は何も書かない")
+            assertFalse(s.awaitRestorable(identity.id, 0), "世代の書き込みが残っている間は、復元を待たせる")
+            gate.countDown()
+            assertTrue(s.flush(10_000))
+            assertTrue(Files.exists(s.generationFile(identity.id, 1)), "前の世代の書き込みも済む")
+            assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)), "引き取りの owner.bin が後に書かれる")
+            assertEquals(1, s.pollCompleted().size, "owner.bin だけの仕事の完了は返さない")
         } finally {
             gate.countDown()
             writer.close(10_000)
@@ -406,28 +417,83 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
-    fun `claimの待ちが上限を過ぎたら新しいID、仕事がなければ待たない`() = timeout(limit) {
-        val gate = CountDownLatch(1)
-        val writer = SaveWriter("gated")
-        val s = MachineSaveStore(dir, index, "test", writer, claimWaitMillis = 50)
-        try {
-            val identity = s.assignNewId(p)!!
-            writer.execute(identity.id) { gate.await() }
-            s.submit(identity, p, src(), null)
-            index.removeIfOwner(identity.id, p)
-            val claim = s.claim(identity.id.toString(), 1, 0, q)
-            assertEquals(ClaimResult.NEW_ID_UNREADABLE, claim.result)
-            assertNotEquals(identity.id, claim.identity!!.id)
-            gate.countDown()
-            assertTrue(s.flush(10_000))
-            val before = s.claimWaitNanos
-            index.removeIfOwner(claim.identity!!.id, q)
-            assertEquals(ClaimResult.KEPT, s.claim(claim.identity!!.id.toString(), 0, 0, q).result)
-            assertEquals(before, s.claimWaitNanos, "仕事がなければ待たない")
-        } finally {
-            gate.countDown()
-            writer.close(10_000)
-        }
+    fun `覚えていないIDに仕事が残っていれば、読む前に待ち、上限を過ぎたら新しいID、仕事がなければ待たない`() {
+        // owner.bin が書けずに外した ID（規則 7b）は覚えていないが、後続の仕事が列に残りうる
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual, claimWaitMillis = 50)
+        val first = s.submit(null, p, src(), null)
+        val id = first.identity.id
+        s.submit(first.identity, p, src(), null)
+        manual.runNext()
+        assertFalse(s.pollCompleted().single().succeeded)
+        assertNull(s.ownerOf(id), "外した")
+        val claim = s.claim(id.toString(), 1, 0, q)
+        assertEquals(ClaimResult.NEW_ID_UNREADABLE, claim.result)
+        assertNotEquals(id, claim.identity!!.id)
+        assertTrue(s.claimWaitNanos >= TimeUnit.MILLISECONDS.toNanos(40), "待った時間を数える")
+        manual.runAll()
+        s.pollCompleted()
+        val before = s.claimWaitNanos
+        assertEquals(ClaimResult.KEPT, s.claim(id.toString(), 1, 0, q).result)
+        assertEquals(before, s.claimWaitNanos, "仕事がなければ待たない")
+        assertEquals(1, s.mainOwnerReads, "このときだけ読む")
+    }
+
+    @Test
+    fun `復元の待ちは、引き取りのowner_binだけが残っていれば待たない`() {
+        val identity = store.assignNewId(p)!!
+        store.submit(identity, p, src(), null)
+        manual.runAll()
+        store.pollCompleted()
+        index.removeIfOwner(identity.id, p)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(identity.id.toString(), 1, 0, q).result)
+        assertEquals(1, manual.size, "owner.bin の仕事")
+        assertFalse(store.awaitWrites(identity.id, 0))
+        assertTrue(store.awaitRestorable(identity.id, 0), "復元は世代のファイルだけを読む")
+        manual.runAll()
+        assertTrue(store.awaitWrites(identity.id, 0))
+    }
+
+    @Test
+    fun `引き取りのowner_binが書けなければ、受け取ったときにIDを外し、次のsubmitが振り直す`() {
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val identity = s.assignNewId(p)!!
+        index.removeIfOwner(identity.id, p)
+        val claim = s.claim(identity.id.toString(), 0, 0, q)
+        assertEquals(ClaimResult.TAKEN_OVER, claim.result)
+        assertEquals(q, index.ownerOf(identity.id))
+        manual.runAll()
+        assertTrue(s.isUnusable(identity.id))
+        assertTrue(s.pollCompleted().isEmpty(), "owner.bin だけの仕事の失敗は外に返さない")
+        assertNull(s.ownerOf(identity.id), "受け取ったので外す")
+        assertNull(index.ownerOf(identity.id))
+        assertFalse(s.isUnusable(identity.id), "仕事が残っていないので印も外す")
+        val pending = s.submit(claim.identity!!, q, src(), null)
+        assertTrue(pending.reassigned, "外した ID には書かない")
+        assertNotEquals(identity.id, pending.identity.id)
+    }
+
+    @Test
+    fun `引き取りのowner_binが書けなくても、受け取る前に入れた後続の世代は書かない`() {
+        val root = dir.resolve("root")
+        Files.write(root, byteArrayOf(1))
+        val s = MachineSaveStore(root, index, "test", manual)
+        val identity = s.assignNewId(p)!!
+        index.removeIfOwner(identity.id, p)
+        val claim = s.claim(identity.id.toString(), 0, 0, q)
+        manual.runNext()
+        Files.delete(root)
+        Files.createDirectories(root)
+        // 失敗を受け取る前に、引き取った台を保存する
+        val pending = s.submit(claim.identity!!, q, src(), null)
+        assertFalse(pending.reassigned)
+        manual.runAll()
+        assertFalse(exists(pending, s), "前の owner.bin（持ち主 p）のままの ID に、q の世代を書かない")
+        assertFalse(s.pollCompleted().single().succeeded)
+        assertNull(s.ownerOf(identity.id))
     }
 
     @Test

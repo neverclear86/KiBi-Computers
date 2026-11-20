@@ -118,6 +118,8 @@ neoForge {
             taskBefore(cleanLoadTestWorld)
             systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
+            // -PloadTestClaimPaste=100,1000 で、ほかの段階の代わりに、N 台を 1 tick で貼ったときと置き場を開き直した後の claim を測る（#585）
+            systemProperty("kibicomputers.loadTest.claimPaste", providers.gradleProperty("loadTestClaimPaste").getOrElse(""))
             // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る
             systemProperty("kibicomputers.loadTest.os", providers.gradleProperty("loadTestOs").getOrElse("lua"))
             // -PloadTestDevices=<n> で、n 台に1台の割合でケースの隣に他 MOD 役のデバイス（#153）を置く（既定は 0 = 置かない）

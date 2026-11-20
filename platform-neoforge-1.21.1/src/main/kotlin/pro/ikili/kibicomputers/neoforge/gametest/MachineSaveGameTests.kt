@@ -141,9 +141,13 @@ object MachineSaveGameTests {
             "the chunk save should mark ${afterStop.generation} but was ${store.chunkGeneration(id)}",
         )
 
-        // setRemoved だけ（ブロックを運ぶ MOD と同じ）ではディレクトリを消さない
+        // claim は owner.bin を書かない（新しい ID の owner.bin は最初の世代の前に書く。#585）
+        helper.assertTrue(!Files.exists(store.directoryOf(copyId!!)), "the claim should not create the directory of the new id")
+        // setRemoved だけ（ブロックを運ぶ MOD と同じ）ではディレクトリを消さない（書いた後の台と同じく、ディレクトリを置いて確かめる）
+        Files.createDirectories(store.directoryOf(copyId))
         helper.setBlock(OTHER, Blocks.AIR)
-        helper.assertTrue(Files.isDirectory(store.directoryOf(copyId!!)), "setRemoved alone should keep the directory")
+        ServerMachines.drainSaves()
+        helper.assertTrue(Files.isDirectory(store.directoryOf(copyId)), "setRemoved alone should keep the directory")
         // プレイヤーの破壊では消す
         be.pressPowerButton()
         val player = helper.makeMockPlayer(GameType.SURVIVAL)

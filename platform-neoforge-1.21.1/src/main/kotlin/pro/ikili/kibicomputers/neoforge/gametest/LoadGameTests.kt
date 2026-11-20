@@ -106,6 +106,17 @@ object LoadGameTests {
                 CI_TIMEOUT_TICKS, 0, true,
             ) { ci(it, os) }
         }
+        val pasteCounts = countsOf(ClaimPasteRun.PROPERTY)
+        if (pasteCounts.isNotEmpty()) {
+            // claim の測定（#585）だけを動かす
+            for (count in pasteCounts) {
+                tests += TestFunction(
+                    "kibicomputers_claim_paste_$count", "loadgametests.claim_paste_$count", "$MEASURE_NAMESPACE:${SmokeGameTests.EMPTY}",
+                    MEASURE_TIMEOUT_TICKS, 0, true,
+                ) { ClaimPasteRun(it, count).start() }
+            }
+            return tests
+        }
         val counts = measureCounts()
         if (counts.isNotEmpty()) {
             val os = LoadOs.fromProperty()
@@ -119,8 +130,10 @@ object LoadGameTests {
         return tests
     }
 
-    private fun measureCounts(): List<Int> =
-        System.getProperty(COUNTS_PROPERTY).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
+    private fun measureCounts(): List<Int> = countsOf(COUNTS_PROPERTY)
+
+    private fun countsOf(property: String): List<Int> =
+        System.getProperty(property).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
 
     private fun ci(helper: GameTestHelper, os: LoadOs) {
         // まとめてアンロードは標準 OS の試験でだけ動かす（アンロードの書き込みは台数 × fsync を 1 tick でするので、1回にとどめる）

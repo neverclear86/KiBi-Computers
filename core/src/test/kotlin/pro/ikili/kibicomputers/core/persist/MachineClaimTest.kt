@@ -176,4 +176,127 @@ class MachineClaimTest {
         a.epoch = Long.MAX_VALUE
         assertEquals(ClaimResult.NEW_ID_INVALID, a.load())
     }
+
+    // ---- メインスレッドの I/O（#585） ----
+
+    @Test
+    fun `開いたときに根になかったIDは、owner_binを読まずにKEPTにし、書くのは最初の世代の前`() {
+        val id = UUID.randomUUID()
+        val claim = store.claim(id.toString(), 3, 2, at(1))
+        assertEquals(ClaimResult.KEPT, claim.result)
+        assertEquals(MachineIdentity(id, 3, 2), claim.identity)
+        assertEquals(0, store.mainOwnerReads)
+        assertEquals(false, Files.exists(store.directoryOf(id)), "claim では書かない")
+        assertEquals(at(1), store.ownerOf(id))
+        store.write(claim.identity!!, at(1)) { i, g, v -> MachineSnapshot(i, g, v) }
+        assertEquals(OwnerRecord(2, at(1)), OwnerRecord.read(store.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+    }
+
+    @Test
+    fun `写しは何台貼っても、claimではディスクに触れない`() {
+        val a = original()
+        assertEquals(ClaimResult.KEPT, a.load())
+        val copies = (1..20).map { a.copyTo(it) }
+        assertEquals(List(20) { ClaimResult.NEW_ID_DUPLICATE_LOADED }, copies.map { it.load() })
+        assertEquals(0, store.mainOwnerReads)
+        Files.newDirectoryStream(dir).use { assertEquals(0, it.count(), "ディレクトリも作らない") }
+    }
+
+    @Test
+    fun `根の名前を読みきれなかったときは、知らないIDでもowner_binを読む`() {
+        val id = UUID.randomUUID()
+        val fresh = MachineSaveStore(dir, MachineIdIndex())
+        // 開いた後に置かれた owner.bin（列挙が欠けたときに見落としうるものの代わり）
+        OwnerRecord.write(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(4, at(0)))
+        fresh.scanComplete = false
+        val claim = fresh.claim(id.toString(), 0, 0, at(1))
+        assertEquals(ClaimResult.NEW_ID_STALE, claim.result, "読んだので、古い写しが状態を奪わない")
+        assertEquals(1, fresh.mainOwnerReads)
+    }
+
+    @Test
+    fun `先読みが終わっていれば、開いたときにあったIDもowner_binを読まない`() {
+        val mine = UUID.randomUUID()
+        val other = UUID.randomUUID()
+        val bare = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(mine.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(1, at(1)))
+        OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(5, at(0)))
+        Files.createDirectories(dir.resolve(bare.toString()))
+        val fresh = MachineSaveStore(dir, MachineIdIndex())
+        fresh.startOwnerPrefetch { it.run() }
+        assertEquals(true, fresh.ownerPrefetchDone)
+        assertEquals(ClaimResult.KEPT, fresh.claim(mine.toString(), 0, 0, at(1)).result)
+        assertEquals(ClaimResult.NEW_ID_STALE, fresh.claim(other.toString(), 0, 0, at(1)).result)
+        assertEquals(ClaimResult.KEPT, fresh.claim(bare.toString(), 0, 0, at(2)).result, "owner.bin のないディレクトリ")
+        assertEquals(3, fresh.prefetchHits)
+        assertEquals(0, fresh.mainOwnerReads)
+    }
+
+    @Test
+    fun `先読みが終わる前のclaimは読み、触ったIDには先読みの値を使わない`() {
+        val id = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, at(0)))
+        val fresh = MachineSaveStore(dir, MachineIdIndex())
+        var prefetch: Runnable? = null
+        fresh.startOwnerPrefetch { prefetch = it }
+        assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(id.toString(), 0, 0, at(1)).result)
+        assertEquals(1, fresh.mainOwnerReads)
+        // 先読みはディスクの (0, at(0)) を見るが、引き取った後は覚えている (1, at(1)) が勝つ
+        prefetch!!.run()
+        fresh.index.removeIfOwner(id, at(1))
+        assertEquals(ClaimResult.NEW_ID_STALE, fresh.claim(id.toString(), 0, 0, at(0)).result)
+        // 消した後も、先読みの値（持ち主 at(0)）は使わない
+        fresh.delete(id)
+        assertEquals(ClaimResult.KEPT, fresh.claim(id.toString(), 0, 0, at(3)).result)
+        assertEquals(0, fresh.prefetchHits)
+        assertEquals(1, fresh.mainOwnerReads)
+    }
+
+    @Test
+    fun `先読みで読めなかったowner_binはNEW_ID_UNREADABLE`() {
+        val id = UUID.randomUUID()
+        Files.createDirectories(dir.resolve(id.toString()))
+        Files.write(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME), byteArrayOf(1, 2, 3))
+        val fresh = MachineSaveStore(dir, MachineIdIndex())
+        fresh.startOwnerPrefetch { it.run() }
+        val claim = fresh.claim(id.toString(), 0, 0, at(1))
+        assertEquals(ClaimResult.NEW_ID_UNREADABLE, claim.result)
+        assertNotEquals(id, claim.identity!!.id)
+    }
+
+    @Test
+    fun `引き取りのowner_binを書く前に落ちても、次の起動で引き取り直し、原本は古い写しになる`() {
+        // 原本 A（at(0)、epoch 0）の owner.bin がディスクにある
+        val id = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, at(0)))
+        // 運んだ先 B（at(1)）が引き取り、NBT は epoch 1 になったが、owner.bin を書く前に落ちた（列の仕事を走らせない）
+        val crashed = MachineSaveStore(dir, MachineIdIndex(), "test", ManualSaveExecutor())
+        val taken = crashed.claim(id.toString(), 0, 0, at(1))
+        assertEquals(ClaimResult.TAKEN_OVER, taken.result)
+        assertEquals(1, taken.identity!!.epoch)
+        assertEquals(OwnerRecord(0, at(0)), OwnerRecord.read(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME)))
+        // 次の起動: B が先に読み込まれれば、もう一度引き取る（epoch 1）。A は古い写し
+        val next = MachineSaveStore(dir, MachineIdIndex())
+        val again = next.claim(id.toString(), 0, 1, at(1))
+        assertEquals(ClaimResult.TAKEN_OVER, again.result)
+        assertEquals(1, again.identity!!.epoch)
+        assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME)))
+        next.index.removeIfOwner(id, at(1))
+        assertEquals(ClaimResult.NEW_ID_STALE, next.claim(id.toString(), 0, 0, at(0)).result)
+    }
+
+    @Test
+    fun `KEPTや新しいIDのowner_binを書く前に落ちても、次の起動でまたKEPTになる`() {
+        val crashed = MachineSaveStore(dir, MachineIdIndex(), "test", ManualSaveExecutor())
+        val kept = UUID.randomUUID()
+        assertEquals(ClaimResult.KEPT, crashed.claim(kept.toString(), 0, 0, at(1)).result)
+        val assigned = crashed.assignNewId(at(2))!!
+        // 世代を書く前に落ちた（owner.bin もディレクトリもない）。NBT は ID を持つ
+        val next = MachineSaveStore(dir, MachineIdIndex())
+        assertEquals(ClaimResult.KEPT, next.claim(kept.toString(), 0, 0, at(1)).result)
+        val claim = next.claim(assigned.id.toString(), 0, 0, at(2))
+        assertEquals(ClaimResult.KEPT, claim.result)
+        assertEquals(assigned, claim.identity)
+        assertEquals(0, next.mainOwnerReads)
+    }
 }
