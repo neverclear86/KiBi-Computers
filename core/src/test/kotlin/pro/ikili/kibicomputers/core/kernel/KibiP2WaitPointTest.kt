@@ -537,9 +537,9 @@ class KibiP2WaitPointTest {
         }
     }
 
-    /** [bytes] のコマンドを待機点型のプロセスとして動かす */
     /**
-     * 1 つのプロセスを動かす。[timers] は、台が手で進める時計（[manualTimers]）を使うときの、その時計のタイマー。
+     * [bytes] のコマンドを待機点型のプロセスとして動かす。
+     * [timers] は、台が手で進める時計（[manualTimers]）を使うときの、その時計のタイマー。
      * テストのスレッドがカーネルロックの外で `advance` して、時計の待ちを起こす
      */
     private class Run(val h: Harness, val m: Machine, bytes: ByteArray, val timers: ManualTimerService? = null) {
