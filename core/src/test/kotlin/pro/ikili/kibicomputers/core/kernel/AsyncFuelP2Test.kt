@@ -192,9 +192,15 @@ class AsyncFuelP2Test {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 7_000)
             val unwinds0 = h.scheduler.fuelUnwinds.get()
-            val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val overdrafts0 = h.scheduler.fuelOverdrafts.get()
             val s = Spin(h, m, listOf("leaf", "300", "500"))
+            // 起動（アダプターの初期化など）は巻き戻せないところで燃料を使い切ることがあり、tick との前後でスレッドを持って待つことがある。
+            // 起動が済んだ（最初のラウンドの出力が出た）後の待ちだけを数える
+            eventually(60_000, "最初のラウンドが終わらない") {
+                h.scheduler.tick()
+                s.drain().isNotEmpty() || m.stateOf(s.pid).isTerminal
+            }
+            val blocking0 = h.scheduler.fuelBlockingWaits.get()
             assertEquals(expected(300, 500), s.finish())
             val overdrafts = h.scheduler.fuelOverdrafts.get() - overdrafts0
             assertTrue(overdrafts > 0, "前借りしていない")
