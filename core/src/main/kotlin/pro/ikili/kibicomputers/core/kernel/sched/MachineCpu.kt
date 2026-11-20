@@ -33,6 +33,12 @@ internal class MachineCpu(
     /** 予約したが、スレッドがまだ [acquire] で受け取っていない待ち手（渡した後のものも含む） */
     private val reserved = HashMap<ProcessRuntime, Node>()
 
+    /** 今のスレッドが中のロックを持っている数（#828。step の入口と出口を比べ、スタックが尽きてロックが残ったのを見つける） */
+    val lockHoldCount: Int get() = lock.holdCount
+
+    /** 残った中のロックを 1 つ放す（#828。[lockHoldCount] が入口より多いときに、浅いところで呼ぶ） */
+    fun unlockLeaked() = lock.unlock()
+
     /** 今の持ち主（テスト用） */
     val currentOwner: ProcessRuntime? get() = lock.withLockValue { owner }
 

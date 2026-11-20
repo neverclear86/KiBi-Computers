@@ -25,6 +25,12 @@ internal class PermitPool(permits: Int, private val workers: WorkerPool) {
     private val queue = ArrayDeque<Node>()
     private var available = permits
 
+    /** 今のスレッドが中のロックを持っている数（#828。step の入口と出口を比べ、スタックが尽きてロックが残ったのを見つける） */
+    val lockHoldCount: Int get() = lock.holdCount
+
+    /** 残った中のロックを 1 つ放す（#828。[lockHoldCount] が入口より多いときに、浅いところで呼ぶ） */
+    fun unlockLeaked() = lock.unlock()
+
     /** 空いている許可の数（テスト用） */
     fun availablePermits(): Int = lock.withLockValue { available }
 

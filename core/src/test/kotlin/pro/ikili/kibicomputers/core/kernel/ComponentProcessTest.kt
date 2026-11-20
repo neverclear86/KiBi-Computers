@@ -529,4 +529,21 @@ class ComponentProcessTest {
             m.stop()
         }
     }
+
+    @Test
+    fun `深すぎる相互再帰を専用スレッドとワーカーで繰り返しても、マシンのロック・CPU・許可は壊れない`() = timeout(Duration.ofSeconds(120)) {
+        // 尽きる位置は実行ごと・JIT の前後で変わるので、何度も繰り返す（#828）。毎回の後に、テストのスレッドからマシンのロックが取れる
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 50_000_000)
+            for (i in 0 until 12) {
+                h.deepRecursionCrashesOnlyItself(m, if (i % 2 == 0) ProcessKind.BLOCKING else ProcessKind.WAIT_POINT)
+                assertTrue(m.lock.tryLock(5, java.util.concurrent.TimeUnit.SECONDS), "$i 回目の後にマシンのロックが取れない: ${m.lock}")
+                m.lock.unlock()
+            }
+            m.stop()
+            h.tickUntilTrue("止まらない") { m.state == MachineState.STOPPED }
+            eventually { m.cpu.currentOwner == null && m.cpu.waiting == 0 }
+            eventually(message = "許可が戻らない") { h.scheduler.permits.availablePermits() == h.scheduler.config.maxConcurrentMachines }
+        }
+    }
 }
