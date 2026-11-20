@@ -20,6 +20,16 @@ class MachineClaimTest {
 
     private fun at(x: Int) = MachineOwner("minecraft:overworld", x, 64, 0)
 
+    private fun snapshot(): MachineSnapshotSource = object : MachineSnapshotSource {
+        override val deltaBase: DeltaBase? get() = null
+        override val estimatedBytes: Long get() = 0
+
+        override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot =
+            MachineSnapshot(id, generation, modVersion, listOf(SnapshotSection(SnapshotSection.KERNEL, 1, ByteArray(16))), deltaBase = null)
+
+        override fun committed(id: UUID, generation: Long) = Unit
+    }
+
     /** ブロックエンティティ1つ（NBT の値と位置）。[load] で claim し、[unload] で索引から外す */
     private inner class Block(var id: String, var generation: Long, var epoch: Long, val pos: MachineOwner) {
         fun load(): ClaimResult {
@@ -298,5 +308,97 @@ class MachineClaimTest {
         assertEquals(ClaimResult.KEPT, claim.result)
         assertEquals(assigned, claim.identity)
         assertEquals(0, next.mainOwnerReads)
+    }
+
+    @Test
+    fun `scanDirectoriesは、根がなければ読みきれた、根がファイルなら読みきれなかったとする`() {
+        val missing = MachineSaveStore(dir.resolve("missing"), MachineIdIndex())
+        assertEquals(true, missing.scanComplete, "根がないと確かに分かる")
+        val file = dir.resolve("file")
+        Files.write(file, byteArrayOf(1))
+        assertEquals(false, MachineSaveStore(file, MachineIdIndex()).scanComplete, "根がファイルなら、claim は読む側に倒す")
+        val empty = dir.resolve("empty")
+        Files.createDirectories(empty)
+        assertEquals(true, MachineSaveStore(empty, MachineIdIndex()).scanComplete)
+    }
+
+    @Test
+    fun `scanDirectoriesは、列挙を開けなかった・途中で失敗したときは読みきれなかったとし、読めた分は覚える`() {
+        val listed = UUID.randomUUID()
+        Files.createDirectories(dir.resolve(listed.toString()))
+        val original = openRootEntries
+        try {
+            // 開けない
+            openRootEntries = { throw java.io.IOException("cannot open") }
+            assertEquals(false, MachineSaveStore(dir, MachineIdIndex()).scanComplete)
+            // 途中で失敗する（1つ返した後、反復中の IOException）
+            openRootEntries = { path ->
+                object : java.nio.file.DirectoryStream<Path> {
+                    override fun iterator(): MutableIterator<Path> {
+                        var n = 0
+                        return object : MutableIterator<Path> {
+                            override fun hasNext(): Boolean {
+                                if (n >= 1) throw java.nio.file.DirectoryIteratorException(java.io.IOException("broken"))
+                                return true
+                            }
+
+                            override fun next(): Path = path.resolve(listed.toString()).also { n++ }
+
+                            override fun remove() = throw UnsupportedOperationException()
+                        }
+                    }
+
+                    override fun close() = Unit
+                }
+            }
+            val partial = MachineSaveStore(dir, MachineIdIndex())
+            assertEquals(false, partial.scanComplete, "途中の失敗の後に真にならない")
+            // 欠けたかもしれないので、知らない ID でも owner.bin を読む
+            val other = UUID.randomUUID()
+            OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(4, at(0)))
+            assertEquals(ClaimResult.NEW_ID_STALE, partial.claim(other.toString(), 0, 0, at(1)).result)
+            assertEquals(1, partial.mainOwnerReads)
+        } finally {
+            openRootEntries = original
+        }
+        assertEquals(true, MachineSaveStore(dir, MachineIdIndex()).scanComplete)
+    }
+
+    @Test
+    fun `実スレッドの先読み（prefetchOwners）が終われば、開いたときにあったIDもowner_binを読まない`() {
+        val mine = UUID.randomUUID()
+        val other = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(mine.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(1, at(1)))
+        OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(5, at(0)))
+        val fresh = MachineSaveStore(dir, MachineIdIndex(), prefetchOwners = true)
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (!fresh.ownerPrefetchDone && System.nanoTime() < deadline) Thread.sleep(5)
+        assertEquals(true, fresh.ownerPrefetchDone, "先読みのスレッドが結果を渡す")
+        assertEquals(ClaimResult.KEPT, fresh.claim(mine.toString(), 0, 0, at(1)).result)
+        assertEquals(ClaimResult.NEW_ID_STALE, fresh.claim(other.toString(), 0, 0, at(1)).result)
+        assertEquals(2, fresh.prefetchHits)
+        assertEquals(0, fresh.mainOwnerReads)
+    }
+
+    @Test
+    fun `claimが受け入れてまだ書いていないIDと振ったIDは、次のsubmitがowner_binも書く`() {
+        val crashed = MachineSaveStore(dir, MachineIdIndex(), "test", ManualSaveExecutor())
+        val kept = UUID.randomUUID()
+        assertEquals(false, crashed.hasUnwrittenOwner(kept))
+        assertEquals(ClaimResult.KEPT, crashed.claim(kept.toString(), 0, 0, at(1)).result)
+        assertEquals(true, crashed.hasUnwrittenOwner(kept), "owner.bin のなかった ID（KEPT）")
+        val assigned = crashed.assignNewId(at(2))!!
+        assertEquals(true, crashed.hasUnwrittenOwner(assigned.id), "claim が振った ID")
+        val taken = UUID.randomUUID()
+        OwnerRecord.write(dir.resolve(taken.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, at(0)))
+        val reading = MachineSaveStore(dir, MachineIdIndex(), "test", ManualSaveExecutor())
+        assertEquals(ClaimResult.TAKEN_OVER, reading.claim(taken.toString(), 0, 0, at(3)).result)
+        assertEquals(false, reading.hasUnwrittenOwner(taken), "引き取りの owner.bin は claim が列に入れた")
+        // 書いたら外れる
+        val direct = MachineSaveStore(dir, MachineIdIndex())
+        val identity = direct.assignNewId(at(4))!!
+        assertEquals(true, direct.hasUnwrittenOwner(identity.id))
+        direct.submit(identity, at(4), snapshot(), null)
+        assertEquals(false, direct.hasUnwrittenOwner(identity.id), "submit が owner.bin を書く仕事に回した")
     }
 }

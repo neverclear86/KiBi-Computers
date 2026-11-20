@@ -7,6 +7,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.nio.file.DirectoryStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.OptionalLong
@@ -19,6 +20,9 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.CRC32C
 import kotlin.concurrent.withLock
+
+/** 根の名前の列挙を開く口（テストが、列挙の失敗を差し込むために差し替える。#585） */
+internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirectoryStream(it) }
 
 /**
  * マシンの保存データの置き場（#81、ADR 0081）。根は `<world>/kibicomputers/machines`。
@@ -233,7 +237,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                 // 根がないと確かに分かるときだけ、全部読めたとする（根がファイル・入れないなどは、claim が読む側に倒す）
                 scanComplete = Files.notExists(root)
             } else {
-                Files.newDirectoryStream(root).use { entries ->
+                openRootEntries(root).use { entries ->
                     for (entry in entries) {
                         val name = entry.fileName?.toString() ?: continue
                         if (name.length != UUID_NAME_LENGTH) continue
@@ -325,11 +329,17 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
     }
 
+    /**
+     * 次の [submit] が [id] の `owner.bin` も書く（claim が受け入れた ID・振った ID で、まだ書いていない。#585）。メインスレッドだけが呼ぶ。
+     * 自動保存の書き込みの見積もり（2 回）に使う
+     */
+    public fun hasUnwrittenOwner(id: UUID): Boolean = id in unwrittenOwners
+
     /** [claim] を呼んだ回数（数え口。#585） */
     public var claimCount: Long = 0
         private set
 
-    /** [claim] にかかった時間の合計（ナノ秒。`owner.bin` の読み書きと待ちを含む。数え口。#585） */
+    /** [claim] にかかった時間の合計（ナノ秒。`owner.bin` の読み（先読みがなかったとき）と、その UUID の仕事の待ちを含む。書きは含まない。数え口。#585） */
     public var claimNanos: Long = 0
         private set
 
@@ -392,7 +402,7 @@ public class MachineSaveStore @JvmOverloads constructor(
             record == null -> {
                 // owner.bin は最初の世代の前に書く（#585）
                 val next = OwnerRecord(rawEpoch, self)
-                renewRegistrationIfUnusable(id)
+                renewRegistrationIfOwnerPending(id)
                 owners[id] = next
                 unwrittenOwners[id] = next
                 knownDirectories += id
@@ -403,6 +413,8 @@ public class MachineSaveStore @JvmOverloads constructor(
             record.owner == self -> {
                 // NBT の epoch が古いのは、引き取って owner.bin を書いた後、チャンクの保存の前に落ちたとき。記録の値に直す
                 owners[id] = record
+                // 前の持ち主の仕事が残っているなら、その owner.bin の書き込みが失敗しても自分の状態を外さないよう、登録を新しくして書き直す
+                if (renewRegistrationIfOwnerPending(id) && id !in unwrittenOwners) enqueueOwnerWrite(id, record, self)
                 epoch = record.epoch
                 result = ClaimResult.KEPT
             }
@@ -411,7 +423,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                     return fresh(self, ClaimResult.NEW_ID_INVALID, "epoch of $id cannot be advanced")
                 }
                 val next = OwnerRecord(record.epoch + 1, self)
-                renewRegistrationIfUnusable(id)
+                renewRegistrationIfOwnerPending(id)
                 owners[id] = next
                 unwrittenOwners.remove(id)
                 knownDirectories += id
@@ -432,11 +444,16 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
-     * [id] が「使えない」の印を持つ（前の登録の `owner.bin` が書けず、その失敗をまだ受け取っていないかもしれない）なら、登録を新しくする。
-     * 前の登録の失敗を受け取ったときに、claim し直した登録まで外さないように（#585）
+     * [id] の `owner.bin` を書く仕事が列に残っている（まだ書いていない）か、書けなかった失敗がまだ受け取られていない（「使えない」の印が
+     * 付いている）なら、登録を新しくして `true`。その仕事の失敗を後から受け取っても、引き取り直した登録の状態を外さないように（#585）。
+     * `owner.bin` を書かない世代の仕事だけが残っているときは新しくしない（その完了は、今の登録の最新の世代・基準に進める）。
+     * 印は、後の `owner.bin` の書き込みの成功で外れる。書き込みのスレッドは、印を付けてから [ownerWriteJobs] を減らすので、
+     * ここでは [ownerWriteJobs] → 印の順に見る
      */
-    private fun renewRegistrationIfUnusable(id: UUID) {
-        if (id in unusable) registrations[id] = Registration()
+    private fun renewRegistrationIfOwnerPending(id: UUID): Boolean {
+        if (!ownerWriteJobs.containsKey(id) && id !in unusable) return false
+        registrations[id] = Registration()
+        return true
     }
 
     /**
@@ -460,7 +477,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         }, {
             LOG.log(System.Logger.Level.WARNING, "The save writer is closed; owner.bin of $id is not written")
             null
-        }, blocksRestore = false)
+        }, blocksRestore = false, writesOwner = true)
     }
 
     private fun busy(id: UUID) = "writes of $id did not finish within $claimWaitMillis ms"
@@ -592,6 +609,7 @@ public class MachineSaveStore @JvmOverloads constructor(
             estimated,
             { writeGeneration(pending, registration, self, snapshot, ownerRecord, if (reassigned) current?.id else null) },
             { Done(pending, registration, self, snapshot, null, IOException("the save writer is closed; generation $generation of $id is not written")) },
+            writesOwner = ownerRecord != null,
         )
         return pending
     }
@@ -713,7 +731,8 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /** [task] を列に入れる。閉じていれば [rejected] の完了で返す。終わったら（どちらでも）見積もりと数を戻し、待ち手を起こす */
-    private fun enqueue(id: UUID, bytes: Long, task: () -> Done?, rejected: () -> Done?, blocksRestore: Boolean = true) {
+    private fun enqueue(id: UUID, bytes: Long, task: () -> Done?, rejected: () -> Done?, blocksRestore: Boolean = true, writesOwner: Boolean = false) {
+        if (writesOwner) ownerWriteJobs.merge(id, 1, Int::plus)
         if (blocksRestore) restoreBlocking.merge(id, 1, Int::plus)
         outstanding.merge(id, 1, Int::plus)
         pendingTasks.incrementAndGet()
@@ -724,17 +743,19 @@ public class MachineSaveStore @JvmOverloads constructor(
                 try {
                     done = task()
                 } finally {
-                    finishTask(id, bytes, done, blocksRestore)
+                    finishTask(id, bytes, done, blocksRestore, writesOwner)
                 }
             }
         } catch (e: RuntimeException) {
             LOG.log(System.Logger.Level.WARNING, "Failed to queue a save task of $id", e)
             false
         }
-        if (!accepted) finishTask(id, bytes, rejected(), blocksRestore)
+        if (!accepted) finishTask(id, bytes, rejected(), blocksRestore, writesOwner)
     }
 
-    private fun finishTask(id: UUID, bytes: Long, done: Done?, blocksRestore: Boolean) {
+    private fun finishTask(id: UUID, bytes: Long, done: Done?, blocksRestore: Boolean, writesOwner: Boolean) {
+        // 印を付けた後（仕事の中）に減らす。[renewRegistrationIfOwnerPending] が、仕事の数 → 印の順に見るため
+        if (writesOwner) ownerWriteJobs.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
         // 完了を先に積む（その UUID を待っていた呼び出しが、起きたときに完了を受け取れるように）
         if (done != null) completed.add(done)
         if (blocksRestore) restoreBlocking.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
@@ -750,6 +771,9 @@ public class MachineSaveStore @JvmOverloads constructor(
         unusable.remove(id)
         dropped.remove(id)
     }
+
+    /** UUID → 列に入れて終わっていない、`owner.bin` を書く仕事（世代の仕事に付くものも含む）の数（#585） */
+    private val ownerWriteJobs = ConcurrentHashMap<UUID, Int>()
 
     /** 列で `owner.bin` だけを書く仕事を除いた、[id] の仕事の数（[awaitRestorable]。#585） */
     private val restoreBlocking = ConcurrentHashMap<UUID, Int>()

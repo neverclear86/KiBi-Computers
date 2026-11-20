@@ -321,6 +321,73 @@ class MachineSaveStoreAsyncTest {
         assertEquals(OptionalLong.of(second.identity.generation), s.latestGeneration(id))
     }
 
+    @Test
+    fun `owner_binを書く仕事がまだ走らないうちに引き取ると、前の仕事の失敗を後から受け取っても引き取った登録は外れない`() {
+        // 開いたときに根がない（claim はディスクを読まない）。その後、根をファイルにして最初の owner.bin を書けなくする
+        val root = dir.resolve("root")
+        val s = MachineSaveStore(root, index, "test", manual)
+        Files.write(root, byteArrayOf(1))
+        val id = UUID.randomUUID()
+        val a = s.claim(id.toString(), 0, 0, p)
+        assertEquals(ClaimResult.KEPT, a.result)
+        assertTrue(s.hasUnwrittenOwner(id))
+        // A が最初の世代（owner.bin と世代。T1）を入れ、同じ tick にアンロードされて、B が別の位置で引き取る（owner.bin だけ。T2）
+        val first = s.submit(a.identity!!, p, src(), null)
+        assertEquals(2, first.writes)
+        assertFalse(s.hasUnwrittenOwner(id), "submit が owner.bin を書く仕事に回した")
+        index.removeIfOwner(id, p)
+        val b = s.claim(id.toString(), 0, 0, q)
+        assertEquals(ClaimResult.TAKEN_OVER, b.result)
+        // T1 は書けず（印が付く）、その後 T2 は書ける（印を外す）
+        assertTrue(manual.runNext())
+        assertTrue(s.isUnusable(id))
+        Files.delete(root)
+        Files.createDirectories(root)
+        manual.runAll()
+        assertFalse(s.isUnusable(id), "T2 が書けたので印を外す")
+        assertEquals(OwnerRecord(1, q), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        // T1 の失敗を受け取っても、B の登録・持ち主の記録・索引は外さない
+        val completions = s.pollCompleted()
+        assertEquals(listOf(first), completions.map { it.pending })
+        assertFalse(completions.single().succeeded)
+        assertEquals(q, index.ownerOf(id))
+        assertEquals(q, s.ownerOf(id))
+        val second = s.submit(b.identity!!, q, src(), null)
+        assertEquals(id, second.identity.id, "B は振り直されない")
+        assertFalse(second.reassigned)
+        assertEquals(1, second.writes)
+        manual.runAll()
+        assertTrue(s.pollCompleted().single().succeeded)
+        assertTrue(exists(second, s))
+    }
+
+    @Test
+    fun `owner_binを書く仕事がまだ走らないうちに同じ位置で読み込み直すと、前の仕事の失敗を後から受け取っても登録は外れず、owner_binは書き直す`() {
+        val root = dir.resolve("root")
+        val s = MachineSaveStore(root, index, "test", manual)
+        Files.write(root, byteArrayOf(1))
+        val id = UUID.randomUUID()
+        val a = s.claim(id.toString(), 0, 0, p)
+        val first = s.submit(a.identity!!, p, src(), null)
+        index.removeIfOwner(id, p)
+        // 同じ位置で読み込み直す（持ち主は自分。記録は覚えているので KEPT で、前の owner.bin の失敗に備えて書き直す仕事を入れる）
+        val b = s.claim(id.toString(), 0, 0, p)
+        assertEquals(ClaimResult.KEPT, b.result)
+        assertTrue(manual.runNext())
+        assertTrue(s.isUnusable(id))
+        Files.delete(root)
+        Files.createDirectories(root)
+        manual.runAll()
+        assertFalse(s.isUnusable(id))
+        assertEquals(OwnerRecord(0, p), OwnerRecord.read(s.directoryOf(id).resolve(OwnerRecord.FILE_NAME)))
+        assertEquals(listOf(first), s.pollCompleted().map { it.pending })
+        assertEquals(p, index.ownerOf(id))
+        assertEquals(p, s.ownerOf(id))
+        val second = s.submit(b.identity!!, p, src(), null)
+        assertEquals(id, second.identity.id)
+        assertFalse(second.reassigned)
+    }
+
     private fun exists(pending: PendingSave, s: MachineSaveStore) =
         Files.exists(s.generationFile(pending.identity.id, pending.identity.generation))
 

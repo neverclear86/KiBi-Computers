@@ -12,7 +12,7 @@ public interface AutosaveTarget<T> {
     /** [machine] を止める。止められない（マシンがない・電源が切れた）なら `null`（その台は今回の周期では終わり） */
     public fun quiesce(machine: T): QuiesceHandle?
 
-    /** 止めるときの書き込みの回数の見積もり。ID があれば 1、ID を振る（`owner.bin` を書く）台は 2 */
+    /** 止めるときの書き込みの回数の見積もり。ID があって `owner.bin` も書いてあれば 1、ID を振る台・`owner.bin` をまだ書いていない台（claim が受け入れた ID・振った ID。#585）は 2 */
     public fun plannedWrites(machine: T): Int
 
     /**
