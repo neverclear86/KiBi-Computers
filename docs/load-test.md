@@ -21,6 +21,10 @@
 `jfr print --events jdk.ExecutionSample` の `Server thread` の分を段階の時間で区切って数えると、段階ごとの重いところが分かる。
 ロックを待って止まった時間は `jdk.ThreadPark`（10 ms 以上のもの）に出る。
 
+長い tick の原因を探すときは、`-PloadTestJvmLog=<ファイル>` で GC と safepoint の JVM のログ（`-Xlog:gc*,safepoint`。壁時計と uptime つき）を取る（#600）。
+長い tick の記録（下の「測るもの」）の時刻・uptime と突き合わせると、その tick に GC・safepoint の止まりがあったかが分かる。
+`-PloadTestQuietProgress=true` で、GameTest のサーバーが 20 tick ごとに書く進み具合のログを試験の間だけ止める（#600 の比べる回。下の「#600 の結果」）。
+
 - `runLoadTestServer` は GameTest のサーバーで、測定用のテスト（`LoadGameTests` が台数ごとに作る）だけを動かす。
   テンプレートは名前空間 `kibicomputers_load`（`src/dev/resources`。jar には入らない）のもので、その名前空間だけを有効にして、ほかの GameTest を混ぜない
 - 結果はサーバーのコンフィグ（`platform-neoforge-1.21.1/run/config/kibicomputers-server.toml`。#202）の値に左右される。`runClient`・`runGameTestServer` と同じ `run/` を使うので、開発クライアントの設定画面などで変えた値がそのまま効く。既定と違う値があると、試験の始めに `The load test runs with non-default values in ...` が WARN で出る。結果を比べるときは、ファイルを消すか既定に戻してから測る
@@ -71,6 +75,15 @@ Lua の REPL で測るときはテスト用の起動ディスク（init が Lua 
   待った tick は MSPT に入れないが、段階の長さ（tick 数と秒）には入る。段階の前に予約して段階の間に終わった書き込みは「前の段階の完了」に出し、数えない。
   #614 の前は、段階の終わりに書き込みのスレッドが空になるのを `writerFlushMillis`（仮 30 秒）まで待つだけで、待ちきれなかったとき（遅いマシンで 1,000 台の自動保存など）は
   途中までの数になり、残りは次の段階（アンロード）の数に混ざっていた。下の表のうち、ログに `Computer saves did not finish within 30000 ms` が出た回は、そのぶん数がずれている
+- **長い tick**（#600。`LoadTickProbe`）: 測った tick のうち 50 ms 以上のものを、段階ごとに最大 32 個覚え、報告の「長い tick」の表と、段階の終わりの
+  `Long ticks in the <段階> phase` のログに出す。項目は、段階の中の tick の番号、tick の終わりの時刻（壁時計、ミリ秒）と JVM の uptime、tick の時間、
+  区間の内訳、KiBi の `ServerTickEvent.Pre` の内訳（完了の受け取り・管理の tick・自動保存の tick と、その中の取り出し）、tick の終わりの書き込み待ち、その tick の GC の回数と時間。
+  区間は tick の中のイベントの最初と最後の優先度で区切る: tick の間（`ServerTickEvent.Post` の後から次の `Pre` まで。GameTest のサーバーの後処理・タスクの実行）・
+  `Pre`・サーバー（`Pre` の後からディメンションの前まで）・ディメンション（`LevelTickEvent` を含む。チャンクの保存・アンロード）・試験の前（通信・プレイヤー）・
+  試験の後（チャンクの送信・バニラの自動保存）・`Post`。区間の合計は MSPT と同じになる（CI の試験が、差が 1 ms 以内かを確かめる）。
+  tick をそろえる手元の測定では、あわせて見張りのスレッド（`LoadTest stall sampler`。カーネルのスレッドには数えない）が 10 ms ごとに tick の始めからの時間を見て、
+  50 ms を超えたら `Server thread` と書き込みのスレッドのスタックを取り（1回の止まりに 40 個まで）、段階の終わりにまとめて出す。
+  記録とスタックは tick の中ではログに書かない（メインスレッドのログの書き込みそのものが止まりになるため。下の「#600 の結果」）。tick ごとの処理は台数によらない
 
 ## 結果（2026-11-01、main 674d2f6 + この試験）
 
@@ -558,7 +571,8 @@ Issue #598 では、同じコミットの 1,000 台で、ヒープ（395 → 769
   この行の世代の合計・平均は、ほかの回と比べない
 - **自動保存の一巡の 1 tick だけの長い止まり（220〜490 ms。#599 の後の Lua の回でも 401 ms が出た）は、ヒープの大きさと関係なく出る。** ヒープが 401 MiB の標準 OS の回にも出た。
   JFR を取った 2 回（前と調査中の直しの Lua の 1 回目）には長い tick が出ず、G1 の若い世代の止まりは最大 36 ms（長いのは段階の終わりの `System.gc()` の Full GC だけ）。
-  GC によるものとは考えにくいが、長い tick を JFR で捕まえていないので原因は分かっていない（#600）
+  GC によるものとは考えにくいが、長い tick を JFR で捕まえていないので原因は分かっていない（#600）。
+  → #600 で、GameTest のサーバーの進み具合のログ（メインスレッドがログのファイルに書く）が、書き込みのスレッドの fsync・rename に巻き込まれて止まるものと分かった（下の「#600 の結果」）
 - まとめてアンロードの最大は、これまでどおり 1 tick にアンロードされた台数に比例して揺れる（88〜900 台）。ヒープとは別の話
 
 **比べるときの注意**: 測った回を比べるときは、必ずログの見出し `Load test (N computers, <OS>)` か報告の最初の行（`- OS:`）で OS を確かめ、同じ OS どうしで比べる。
@@ -570,6 +584,48 @@ cp platform-neoforge-1.21.1/run/logs/latest.log lua.log
 ./gradlew :platform-neoforge-1.21.1:runLoadTestServer -PloadTestCounts=1000 -PloadTestOs=standard # 標準 OS
 cp platform-neoforge-1.21.1/run/logs/latest.log standard.log
 ```
+
+## #600 の結果: 自動保存の一巡の長い tick は、メインスレッドのログの書き込みが書き込みのスレッドの I/O に巻き込まれたもの（2026-11-20、main aa3ee30 + #600）
+
+#598 から、自動保存の一巡で 1 tick だけ 100〜500 ms になる回が、OS・ヒープの大きさによらず、まれに出ていた（p95 はどれも約 6 ms）。
+#600 で、試験に長い tick の記録・区間の内訳・止まりの見張り（上の「測るもの」の「長い tick」）と、JVM のログ（`-PloadTestJvmLog`）を足して、Lua の 1,000 台を測った。
+
+**原因**: GameTest のサーバーが 20 tick ごとに書く進み具合のログ（`GameTestServer.tickServer` の `LOGGER.info(progressBar)`。メインスレッド）が、
+`latest.log`・`debug.log` への `WriteFile`（log4j の `RollingRandomAccessFile`。呼んだスレッドがそのまま書く）の中で止まっていた。
+止まっている間、書き込みのスレッドは世代のファイル・`owner.bin` の fsync（`FileChannel.force`）か rename（`MoveFileEx`）の中にいた。
+#579 の `Files.exists` と同じ、Windows・NTFS で同じボリュームの fsync・rename に、ほかのスレッドの同期のファイル I/O が巻き込まれる止まり。
+KiBi のメインスレッドの処理（取り出し・予約・完了の受け取り）は、長い tick の中でも 1 ms 未満だった。
+
+同じ機械で、ほかに GameTest・負荷試験が動いていない時に測った（回ごとに java のプロセスを記録した。動いていたのは Gradle と Kotlin のデーモンだけ）。
+
+| 測定 | ワールド | 自動保存の一巡の MSPT p95 / 最大 | 50 ms 以上の止まり（一巡の間） | 止まっていたところ |
+| --- | --- | --: | --- | --- |
+| 1 回目 | 新しい | 6.01 / 34.40 ms | なし | - |
+| 2 回目 | 新しい | 6.13 / **69.63 ms** | 1 回（tick の間 63.3 ms） | 進み具合のログの `WriteFile`。書き込みのスレッドは fsync |
+| 3 回目 | 新しい | 5.95 / **175.94 ms** | 1 回（tick の間 173.2 ms） | 同上。書き込みのスレッドは fsync → rename → `owner.bin` の fsync |
+| 4 回目 | 残す（`machines/` 1,000 個） | 6.05 / 38.81 ms | なし | - |
+| 5 回目 | 残す（同 2,000 個） | 5.76 / 35.91 ms | 1 回（138 ms。一巡の後、書き込みの終わりを待つ tick で、MSPT には入らない） | 同上 |
+| 6 回目 | 残す（同 3,000 個） | 5.85 / 36.67 ms | なし | - |
+| 進み具合のログを止めた・1〜4 回目（`-PloadTestQuietProgress=true`） | 新しい | 5.86〜6.60 / 32.40〜41.87 ms | **4 回ともなし** | - |
+| JFR あり・1 回目（`-PloadTestJfr`） | 新しい | 6.00 / 48.84 ms | なし（50 ms 未満） | JFR の `jdk.FileWrite` に、`Server thread` の `latest.log` の書き込み 42 ms。同じ時に書き込みのスレッドの `jdk.FileForce` が 361 ms |
+| JFR あり・2 回目 | 新しい | 6.02 / 36.56 ms | 1 回（52 ms。一巡の後、書き込みの終わりを待つ tick） | 進み具合のログ。`jdk.FileWrite` の `latest.log` 52 ms |
+| JFR あり・3 回目 | 新しい | 6.06 / 37.07 ms | なし | - |
+
+- 長い tick の時間は、ほぼ全部が区間「tick の間」（`ServerTickEvent.Post` の後から次の tick の `Pre` まで。`GameTestServer.tickServer` の後処理がここに入る）だった。
+  KiBi の `Pre`（完了の受け取り・自動保存の取り出し）は 1 ms 未満、ディメンションの tick も 1 ms 未満
+- 見張りが取った `Server thread` のスタックは、3 回とも `RandomAccessFile.writeBytes0` ← log4j の `RollingRandomAccessFileManager` ← `GameTestServer.tickServer`（178 行。進み具合のログ）。
+  そのときの書き込みのスレッドは `FileDispatcherImpl.force0`（`OwnerRecordKt.writeAtomically`）か `WindowsNativeDispatcher.MoveFileEx0`
+- JFR を付けた回でも同じものが出た（JFR では長い tick が出ないのではなく、出る確率が同じ程度に低いだけとみている）。
+  JFR の `jdk.FileWrite`（10 ms 以上のもの）の `Server thread` の分は、どの回もログのファイル（`latest.log`・`debug.log`）への書き込みと、終わりの保存だけだった
+- JVM のログ（`-Xlog:gc*,safepoint`）では、止まった時間に GC も safepoint の止まりもなかった（その前後は 1 秒ごとの `Cleanup` だけ）
+- 進み具合のログを止めた 4 回は、長い tick が一度も出なかった（止めない 6 回では 3 回。出る回でも 1 巡に 1 回）。
+  進み具合のログは一巡（約 500 tick）の間に約 25 回書かれ、そのうち1回が書き込みのスレッドの長い fsync と重なると止まる、という出方と合う
+- ワールドを残して `machines/` を増やした回（1,000〜3,000 個）でも出方は変わらない。前の測定が `run/world` を使い回していたことは原因ではない
+- **これは試験に固有の止まりで、KiBi のメインスレッドの処理の問題ではない**（メインスレッドに残す仕事は ADR 0084 の規則 2 のとおりで、ファイルに触らない）。
+  ただし、本番のサーバー（NeoForge のログの設定も同じく同期）でも、一巡の間にメインスレッドがログを書いたり、バニラの自動保存が同期にファイルを書いたりすると、同じ止まりは起こりうる。
+  この試験では、バニラの自動保存（サーバーの 6000 tick 目）が、まとめてアンロードの書き込みを待つ間に重なり、`saveEverything`（`saveAllChunks` と `saveLevelData` の fsync・rename）で約 380 ms 止まった回があった（JFR の 1 回目。MSPT には入らない）。
+  本番では KiBi の周期とバニラの自動保存が同じ 6000 tick ごとに始まる。本番の形での確かめと、要るなら直すのは #834
+- 「#598 の結果」の表の長い tick（220〜490 ms）、#579 の後・#599 の後の回も、同じ試験の同じ段階なので、同じものとみている（その回のスタックはない）
 
 ## 分かったこと
 

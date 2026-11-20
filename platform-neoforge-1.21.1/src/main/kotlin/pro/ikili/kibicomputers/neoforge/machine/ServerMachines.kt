@@ -314,6 +314,23 @@ object ServerMachines {
         /** 消えたケース（アンロード済み・壊した）への完了の数（#84。数えるだけ） */
         var completionsForGone: Long = 0
 
+        /*
+         * tick の始め（ServerTickEvent.Pre）の区間ごとの時間の累計（ナノ秒）と、受け取った完了の数の累計（#600）。
+         * 負荷試験が長い tick の内訳を出すのに、tick ごとの増分を取る。[reset] では戻さない（増分だけを使う）
+         */
+
+        /** 書き込みの完了の受け取り（[processCompletions]。毎 tick の始めの分だけ） */
+        var completionTickNanos: Long = 0
+
+        /** マシンの管理の tick（`manager.tick()`） */
+        var managerTickNanos: Long = 0
+
+        /** 自動保存の tick（取り出しと予約を含む） */
+        var autosaveTickNanos: Long = 0
+
+        /** [processCompletions] で受け取った完了の数（どこから呼んだかによらない） */
+        var completionsReceived: Long = 0
+
         /**
          * 世代のファイルを書くたびに [saves] に1件残すか（負荷試験が有効にする。ふだんは残さない）。
          * 有効な間は、予約を区間（[window]。[reset] で次に進む）ごとに分け、前の区間に予約した完了（と、無効な間に予約した完了）は
@@ -575,8 +592,13 @@ object ServerMachines {
 
     private fun onServerTick(event: ServerTickEvent.Pre) {
         applyConfigIfChanged()
+        val t0 = System.nanoTime()
         processCompletions()
+        val t1 = System.nanoTime()
         manager?.tick()
+        val t2 = System.nanoTime()
+        Stats.completionTickNanos += t1 - t0
+        Stats.managerTickNanos += t2 - t1
         // 復元を始める（#85。tick ごとの台数の上限つき。書き込みの終わっていない台は後回し）
         if (manager != null) {
             restoreQueue.tick(System.nanoTime(), WorldMachineSaves.current, saveConfig) { be, timedOut ->
@@ -585,7 +607,9 @@ object ServerMachines {
         }
         unloadWaitedNanos = 0
         flushChangedLater()
+        val t3 = System.nanoTime()
         if (manager != null && autosaveEnabled) autosaveTick()
+        Stats.autosaveTickNanos += System.nanoTime() - t3
     }
 
     private fun autosaveTick() {
@@ -657,6 +681,7 @@ object ServerMachines {
     internal fun processCompletions() {
         val store = WorldMachineSaves.current ?: return
         for (completion in store.pollCompleted()) {
+            Stats.completionsReceived++
             val be = completion.pending.tag as? CaseBlockEntity
             val info = submitOf.remove(completion.pending)
             val result = completion.result

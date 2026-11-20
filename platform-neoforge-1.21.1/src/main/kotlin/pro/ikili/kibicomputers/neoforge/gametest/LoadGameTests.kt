@@ -58,6 +58,12 @@ object LoadGameTests {
     private const val CI_MAX_AVG_TICK_MILLIS = 50.0
 
     /**
+     * 測った tick の時間と、区間（#600。[LoadTickProbe.Section]）の合計の差の上限（ナノ秒）。差は時刻を取る順のずれ（数マイクロ秒）だけなので、
+     * 1 ms を超えたら区間の切り方に抜け・重なりがある
+     */
+    private const val CI_MAX_SECTION_MISMATCH_NANOS = 1_000_000L
+
+    /**
      * CI で、待っている間のカーネルのスレッド（`KiBi-` で始まるもの）のうち、プールで次の仕事を待っているワーカーを除いた数の上限。
      * 台数（[CI_COUNT]）より十分少ない。待っている台はスレッドを持たない（#37・#329）ので、
      * ディスパッチャー・タイマー・コンパイラーだけになる。プールで待つワーカーは、起動の間に増えた分がしばらく残るので数えない
@@ -196,6 +202,13 @@ object LoadGameTests {
                     "created or working during the boot " +
                     "(limit ${ciMaxBootKernelThreads()})",
             )
+            // 長い tick の内訳（#600）の区間は、測った tick の時間を抜けも重なりもなく分ける
+            for (p in report.phases) {
+                helper.assertTrue(
+                    p.sectionMismatchNanos <= CI_MAX_SECTION_MISMATCH_NANOS,
+                    "the tick sections should add up to the measured tick in the ${p.phase} phase: off by ${p.sectionMismatchNanos} ns",
+                )
+            }
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
             // 1人に送る量は、見ている画面の数によらず、プレイヤーごとの予算に収まる（#352）
             // 組み込みの既定ではなく、動いているサーバーの予算（コンフィグの値）と比べる
