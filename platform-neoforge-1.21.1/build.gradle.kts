@@ -22,6 +22,16 @@ java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 kotlin {
     jvmToolchain(21)
     compilerOptions.jvmTarget = JvmTarget.JVM_21
+    // 公開 API のダンプ（api/<プロジェクト名>.api）と食い違ったら check（build）で落とす（#845）。
+    // 公開 API を変えたら ./gradlew updateKotlinAbi で作り直してコミットする。
+    @OptIn(org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation::class)
+    abiValidation {
+        filters {
+            include {
+                byNames.add("pro.ikili.kibicomputers.neoforge.api.**")
+            }
+        }
+    }
 }
 
 // 開発環境でだけ読み込むコード（クライアントの自動操作の口など）。jar には入れない

@@ -19,5 +19,11 @@ indent_size = 2
 [*.md]
 trim_trailing_whitespace = false
 
+# 公開 API のダンプ（#845）。updateKotlinAbi が作るタブ字下げの書式のまま保つ
+[*.api]
+indent_style = tab
+trim_trailing_whitespace = false
+insert_final_newline = unset
+
 [*.bat]
 end_of_line = crlf
