@@ -112,6 +112,7 @@ void kibi_lua_term_restored(void);
  * キー待ちの間の端末のモード（#798。ADR 0798。kibi_lua_tty.c）。
  * - kibi_lua_tty_keys: メインスレッドがキーを待ち始めるときに呼ぶ。標準入力が端末で cooked なら、echo と canonical を切る
  * - kibi_lua_tty_before_wait: poll_oneoff で待つ直前に呼ぶ。切っている間は、今読める標準入力を待たずに読み捨てる
+ *   （読めるときだけ、読み捨ての間だけ fd 0 に NONBLOCK を立てる。#838）
  * - kibi_lua_tty_restore: 標準入力を読む前と終わるときに呼ぶ（kibi_wasi.h の lua_readline・clearerr と atexit）。切っていなければ何もしない
  */
 void kibi_lua_tty_keys(void);
