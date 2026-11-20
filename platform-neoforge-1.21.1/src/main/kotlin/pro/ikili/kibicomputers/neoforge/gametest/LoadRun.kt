@@ -8,6 +8,7 @@ import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.GameRules
 import net.minecraft.world.level.block.Blocks
+import org.apache.logging.log4j.core.config.Configurator
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.input.Key
@@ -27,6 +28,9 @@ import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import java.lang.management.ManagementFactory
 import java.lang.management.ThreadInfo
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.Locale
@@ -34,6 +38,8 @@ import java.util.UUID
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
+import org.apache.logging.log4j.Level as Log4jLevel
+import org.apache.logging.log4j.LogManager as Log4jManager
 
 /** 負荷試験で打つ人（偽物） */
 private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
@@ -134,6 +140,7 @@ internal enum class LoadPhase(val label: String) {
  *   [LoadPhase.COMPUTE] で、計算させる台が全部、打ち込んだ命令を画面に出すまで待つ上限にも使う
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
+ * @property quietProgress 試験の間、GameTest のサーバーの進み具合のログを止めるか（#600）
  * @property devicesEvery この台数に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。#153）を置く（`-PloadTestDevices`。0 なら置かない）
  */
 internal data class LoadSettings(
@@ -147,8 +154,15 @@ internal data class LoadSettings(
     val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
     val massUnload: Boolean = false,
     val devicesEvery: Int = System.getProperty(DEVICES_PROPERTY)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+    val quietProgress: Boolean = System.getProperty(QUIET_PROGRESS_PROPERTY).toBoolean(),
 ) {
     companion object {
+        /**
+         * GameTest のサーバーの進み具合のログ（20 tick ごと。メインスレッドがログのファイルに書く）を止めるシステムプロパティ
+         * （`-PloadTestQuietProgress=true`。#600 の比べる回のため）
+         */
+        const val QUIET_PROGRESS_PROPERTY: String = "kibicomputers.loadTest.quietProgress"
+
         /** 他 MOD 役のデバイスを置く割合を渡すシステムプロパティ（`-PloadTestDevices`） */
         const val DEVICES_PROPERTY: String = "kibicomputers.loadTest.devices"
     }
@@ -201,7 +215,58 @@ internal data class PhaseResult(
     val wallSeconds: Double,
     /** 段階の終わりの、カーネルのスレッドの内訳（名前の数字を `#` にしたもの → 数） */
     val kernelThreadNames: Map<String, Int>,
+    /** 測った tick のうち長いもの（[LoadTickProbe.LONG_TICK_MILLIS] 以上。上限まで。#600） */
+    val longTicks: List<LongTick> = emptyList(),
+    /** 長い tick の数（上限を超えた分も） */
+    val longTickCount: Int = 0,
+    /** 区間（[LoadTickProbe.Section] の順）ごとの、段階の間に区切りを通った回数。0 の区間は、区切りのイベントが届いていない */
+    val sectionMarks: IntArray = IntArray(0),
 )
+
+/**
+ * 長い tick の記録（#600）。時刻は JFR・`-Xlog` と突き合わせるため、壁時計（ミリ秒）と JVM の uptime の両方を持つ（どちらも tick の終わり）。
+ * [sections] は [LoadTickProbe.Section] の順の区間ごとの時間（ナノ秒）。KiBi の `ServerTickEvent.Pre` の内訳は [completionNanos]
+ * （完了の受け取り。[completions] 件）・[managerNanos]（管理の tick）・[autosaveNanos]（自動保存の tick。取り出し [captureNanos] を含む）。
+ * [pendingCount]・[pendingBytes] は tick の終わりの書き込み待ち、[gcCount]・[gcMillis] はその tick の間（tick をそろえる待ちを除く。MSPT と同じ範囲）の GC の回数と時間
+ */
+internal class LongTick(
+    val phase: LoadPhase,
+    val phaseTick: Int,
+    val wallMillis: Long,
+    val uptimeMillis: Long,
+    val tickStartNanos: Long,
+    val nanos: Long,
+    val sections: LongArray,
+    val completionNanos: Long,
+    val completions: Long,
+    val managerNanos: Long,
+    val autosaveNanos: Long,
+    val captureNanos: Long,
+    val pendingCount: Int,
+    val pendingBytes: Long,
+    val gcCount: Long,
+    val gcMillis: Long,
+) {
+    /** 区間の内訳（1 ms 以上のものだけ） */
+    fun sectionSummary(): String =
+        LoadTickProbe.Section.entries.filter { sections[it.ordinal] >= 1_000_000 }
+            .joinToString(" ") { String.format(Locale.ROOT, "%s %.1f", it.label, sections[it.ordinal] / 1e6) }
+
+    fun describe(): String = String.format(
+        Locale.ROOT,
+        "phase tick %d, ended %s (uptime %d ms): %.2f ms = [%s] ms; Pre: completions %.1f ms (%d), manager %.1f ms, autosave %.1f ms (capture %.1f ms); " +
+            "pending %d jobs / %d bytes; GC %d / %d ms",
+        phaseTick, formatWall(wallMillis), uptimeMillis, nanos / 1e6, sectionSummary(),
+        completionNanos / 1e6, completions, managerNanos / 1e6, autosaveNanos / 1e6, captureNanos / 1e6,
+        pendingCount, pendingBytes, gcCount, gcMillis,
+    )
+
+    companion object {
+        private val WALL = DateTimeFormatter.ofPattern("HH:mm:ss.SSS", Locale.ROOT).withZone(ZoneId.systemDefault())
+
+        fun formatWall(millis: Long): String = WALL.format(Instant.ofEpochMilli(millis))
+    }
+}
 
 /** 平均と最大（ミリ秒） */
 internal data class AvgMax(val avg: Double, val max: Double) {
@@ -355,6 +420,7 @@ internal class LoadReport(
         val sb = StringBuilder()
         sb.append("- OS: ").append(s.os.label).append('\n')
         sb.append(String.format(Locale.ROOT, "- 台数: %d（計算・出力はそれぞれ %d 台）、tick を 50 ms にそろえる: %s\n", s.count, s.busy, s.paced))
+        if (s.quietProgress) sb.append("- GameTest のサーバーの進み具合のログ: 止めた（#600 の比べる回）\n")
         if (s.devicesEvery > 0) {
             sb.append(String.format(Locale.ROOT, "- 他 MOD 役のデバイス（樽）: %d 台に1台（%d 個）\n", s.devicesEvery, (s.count + s.devicesEvery - 1) / s.devicesEvery))
         }
@@ -438,6 +504,26 @@ internal class LoadReport(
                     p.kernelThreads, p.idleWorkerThreads, p.peakKernelThreads, p.jvmThreads, p.peakJvmThreads, p.heapUsedBytes / mib, sent,
                 ),
             )
+        }
+        val withLong = phases.filter { it.longTickCount > 0 }
+        if (withLong.isNotEmpty()) {
+            sb.append(String.format(Locale.ROOT, "\n長い tick（%d ms 以上。#600。時刻は tick の終わり。区間の内訳はミリ秒）:\n\n", LoadTickProbe.LONG_TICK_MILLIS))
+            sb.append("| 段階 | 段階の中の tick | 時刻 | uptime | MSPT | 区間の内訳 | 取り出し | 書き込み待ち | GC |\n")
+            sb.append("| --- | --: | --- | --: | --: | --- | --: | --: | --: |\n")
+            for (p in withLong) {
+                for (t in p.longTicks) {
+                    sb.append(
+                        String.format(
+                            Locale.ROOT, "| %s | %d | %s | %d ms | %.2f | %s | %.1f ms | %d 件 | %d 回・%d ms |\n",
+                            p.phase.label, t.phaseTick, LongTick.formatWall(t.wallMillis), t.uptimeMillis, t.nanos / 1e6, t.sectionSummary(),
+                            t.captureNanos / 1e6, t.pendingCount, t.gcCount, t.gcMillis,
+                        ),
+                    )
+                }
+                if (p.longTickCount > p.longTicks.size) {
+                    sb.append("| ").append(p.phase.label).append(" | ほか ").append(p.longTickCount - p.longTicks.size).append(" 回 | | | | | | | |\n")
+                }
+            }
         }
         sb.append("\nカーネルのスレッドの内訳（段階の終わり）:\n")
         for (p in phases) sb.append("- ").append(p.phase.label).append(": ").append(p.kernelThreadNames).append('\n')
@@ -531,6 +617,34 @@ internal class LoadRun(
     private var prevHarness = 0L
     private var prevSleep = 0L
 
+    /** 長い tick の調べ（#600）。区間の時間は毎 tick、止まりの見張りは tick をそろえるとき（手元の測定）だけ */
+    private val probe = LoadTickProbe(level.server.runningThread, sampleStalls = settings.paced)
+    private val sectionNanos = LongArray(LoadTickProbe.Section.entries.size)
+    private val gcBeans = ManagementFactory.getGarbageCollectorMXBeans()
+    private val runtime = ManagementFactory.getRuntimeMXBean()
+
+    /** 今の tick の始め（[LoadTickProbe.harnessEnd] の時刻）。止まりのスタックと突き合わせる */
+    private var tickStart = 0L
+
+    /** 前の呼び出しの終わりの数え口（tick ごとの増分を出すため。[prevCapture] と同じく step() の後で覚える） */
+    private var prevCompletionTick = 0L
+    private var prevCompletions = 0L
+    private var prevManagerTick = 0L
+    private var prevAutosaveTick = 0L
+    private var prevGcCount = 0L
+    private var prevGcMillis = 0L
+
+    /** 今の段階の長い tick（[LoadTickProbe.LONG_TICK_MILLIS] 以上。[MAX_LONG_TICKS] まで）と、その数（上限を超えた分も） */
+    private val longTicks = ArrayList<LongTick>()
+    private var longTickCount = 0
+
+    /** [LoadSettings.quietProgress] のときに止めた、進み具合のロガーの元のレベル */
+    private var savedProgressLevel: Log4jLevel? = null
+
+    /** 段階の間に、区間ごとの区切りを通った回数（今の tick の分は [tickMarks] に取り、測っている間だけ足す） */
+    private val sectionMarks = IntArray(LoadTickProbe.Section.entries.size)
+    private val tickMarks = IntArray(LoadTickProbe.Section.entries.size)
+
     fun start() {
         // 結果はコンフィグの値に左右される（runClient などと同じ run/config を使う）。既定と違う値があれば、結果と一緒に残す
         val nonDefault = KiBiConfig.entries(ConfigSide.SERVER).filter { KiBiConfigs.server[it] != it.default }
@@ -549,18 +663,30 @@ internal class LoadRun(
         ServerMachines.autosaveEnabled = true
         // 保存1回ごとの記録を残す（保存の手間と大きさを測る。#553）
         ServerMachines.Stats.recordSaves = true
+        if (settings.quietProgress) {
+            savedProgressLevel = Log4jManager.getLogger(PROGRESS_LOGGER).level
+            Configurator.setLevel(PROGRESS_LOGGER, Log4jLevel.WARN)
+        }
+        probe.start()
         helper.onEachTick(::onTick)
     }
 
     private fun onTick() {
         if (finished) return
-        val now = System.nanoTime()
+        // 区間の終わりと tick の時間の終わりを同じ時刻にする。始めも [LoadTickProbe.harnessEnd] の時刻を共有するので（下の prevSleep）、
+        // work は前の tickStart からの差そのものになり、区間の合計（sectionNanos）と作りの上でちょうど同じになる
+        val now = probe.harnessStart()
         var work = 0L
+        probe.takeSections(sectionNanos, tickMarks)
         if (prevCallback != 0L) {
             work = (now - prevCallback - prevHarness - prevSleep).coerceAtLeast(0)
             // 自動保存（ServerTickEvent.Pre）・アンロード（チャンクのアンロード、ServerTickEvent.Post）の保存は、前の呼び出しからの間に入っている
             val s = ServerMachines.Stats
-            if (recording) record(work, s.captureNanos - prevCapture)
+            if (recording) {
+                record(work, s.captureNanos - prevCapture)
+                for (i in tickMarks.indices) sectionMarks[i] += tickMarks[i]
+                if (work >= LoadTickProbe.LONG_TICK_MILLIS * 1_000_000) recordLongTick(work, s.captureNanos - prevCapture)
+            }
         }
         prevCallback = now
         try {
@@ -571,6 +697,7 @@ internal class LoadRun(
         }
         // step() が Stats.reset() したときも、次の増分がこの時点からになるように、step() の後で覚える
         prevCapture = ServerMachines.Stats.captureNanos
+        rememberCounters()
         val end = System.nanoTime()
         prevHarness = end - now
         prevSleep = 0
@@ -581,9 +708,105 @@ internal class LoadRun(
             val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
             if (wait > 0) {
                 LockSupport.parkNanos(wait)
-                prevSleep = System.nanoTime() - end
             }
         }
+        if (!finished) {
+            rememberGcCounters()
+            tickStart = probe.harnessEnd()
+            // 待ちと GC の数え口を読む時間も、試験の呼び出しの間として引く（区間は harnessEnd から数えるので、ここを引かないと
+            // 区間の合計との差になる。GC の数え口を読む間にメインスレッドが止まると、数 ms ずれる）
+            prevSleep = tickStart - end
+        }
+    }
+
+    private fun gcCount(): Long = gcBeans.sumOf { it.collectionCount.coerceAtLeast(0) }
+
+    private fun gcMillis(): Long = gcBeans.sumOf { it.collectionTime.coerceAtLeast(0) }
+
+    private fun rememberCounters() {
+        val s = ServerMachines.Stats
+        prevCompletionTick = s.completionTickNanos
+        prevCompletions = s.completionsReceived
+        prevManagerTick = s.managerTickNanos
+        prevAutosaveTick = s.autosaveTickNanos
+    }
+
+    /** GC の数え口は、tick をそろえる待ちの後（tick の始め）で覚える。待ちの間の GC を、次の tick の GC に混ぜないため */
+    private fun rememberGcCounters() {
+        prevGcCount = gcCount()
+        prevGcMillis = gcMillis()
+    }
+
+    /** 長い tick を1つ覚える（#600）。ログには段階の終わりにまとめて書く（tick の中でファイルに書かない） */
+    private fun recordLongTick(nanos: Long, captureNanos: Long) {
+        val p = phase ?: return
+        longTickCount++
+        if (longTicks.size >= MAX_LONG_TICKS) return
+        val s = ServerMachines.Stats
+        val store = WorldMachineSaves.current
+        longTicks += LongTick(
+            phase = p,
+            phaseTick = phaseTick,
+            wallMillis = System.currentTimeMillis(),
+            uptimeMillis = runtime.uptime,
+            tickStartNanos = tickStart,
+            nanos = nanos,
+            sections = sectionNanos.copyOf(),
+            completionNanos = s.completionTickNanos - prevCompletionTick,
+            completions = s.completionsReceived - prevCompletions,
+            managerNanos = s.managerTickNanos - prevManagerTick,
+            autosaveNanos = s.autosaveTickNanos - prevAutosaveTick,
+            captureNanos = captureNanos,
+            pendingCount = store?.pendingCount ?: -1,
+            pendingBytes = store?.pendingBytes ?: -1,
+            gcCount = gcCount() - prevGcCount,
+            gcMillis = gcMillis() - prevGcMillis,
+        )
+    }
+
+    /**
+     * 段階の長い tick と、その間に取ったスタックをログに書く（#600。段階の終わりで、測る区間の外）。
+     * スタックは止まりごとに、続けて同じものをまとめる
+     */
+    private fun logLongTicks(p: LoadPhase) {
+        val (stalls, dropped) = probe.takeSamples()
+        if (longTickCount == 0 && stalls.isEmpty()) return
+        val sb = StringBuilder()
+        sb.append(String.format(Locale.ROOT, "Long ticks in the %s phase: %d at or over %d ms", p.name, longTickCount, LoadTickProbe.LONG_TICK_MILLIS))
+        if (longTickCount > longTicks.size) sb.append(" (first ").append(longTicks.size).append(" listed)")
+        sb.append('\n')
+        for (t in longTicks) sb.append("  ").append(t.describe()).append('\n')
+        for ((start, samples) in stalls.groupBy { it.tickStartNanos }) {
+            val tick = longTicks.firstOrNull { it.tickStartNanos == start }
+            sb.append(
+                String.format(
+                    Locale.ROOT, "  stall at %s (uptime %d ms)%s: %d samples\n",
+                    LongTick.formatWall(samples.first().wallMillis), samples.first().uptimeMillis,
+                    tick?.let { " in phase tick ${it.phaseTick}" } ?: " (tick not recorded)", samples.size,
+                ),
+            )
+            var i = 0
+            while (i < samples.size) {
+                val first = samples[i]
+                var j = i + 1
+                while (j < samples.size && samples[j].serverStack == first.serverStack && samples[j].writerStack == first.writerStack) j++
+                val last = samples[j - 1]
+                sb.append(
+                    String.format(
+                        Locale.ROOT, "    +%.0f..%.0f ms (x%d), after %s, server %s, writer %s\n",
+                        first.elapsedNanos / 1e6, last.elapsedNanos / 1e6, j - i, first.lastSection?.name ?: "-", first.serverState, first.writerState ?: "-",
+                    ),
+                )
+                for (f in first.serverStack) sb.append("      at ").append(f).append('\n')
+                if (first.writerStack.isNotEmpty()) {
+                    sb.append("      -- writer\n")
+                    for (f in first.writerStack) sb.append("      at ").append(f).append('\n')
+                }
+                i = j
+            }
+        }
+        if (dropped > 0) sb.append("  (").append(dropped).append(" stall samples dropped)\n")
+        LOGGER.info("{}", sb)
     }
 
     private fun record(nanos: Long, captureNanos: Long) {
@@ -976,6 +1199,9 @@ internal class LoadRun(
         measuredTick = null
         measuredTicks = 0
         countSent = false
+        longTicks.clear()
+        longTickCount = 0
+        sectionMarks.fill(0)
         sampleCount = 0
         sentBytes = 0
         peakKernelThreads = 0
@@ -992,6 +1218,7 @@ internal class LoadRun(
         val names = infos.groupingBy { it.threadName.replace(DIGITS, "#") }.eachCount().toSortedMap()
         val kernel = infos.size
         val idleWorkers = infos.count(::isIdleWorker)
+        logLongTicks(p)
         val result = PhaseResult(
             phase = p,
             running = computers.count { it.case.computer.machine?.state == MachineState.RUNNING },
@@ -1007,6 +1234,9 @@ internal class LoadRun(
             durationTicks = phaseTick + 1,
             wallSeconds = wall,
             kernelThreadNames = names,
+            longTicks = longTicks.toList(),
+            longTickCount = longTickCount,
+            sectionMarks = sectionMarks.copyOf(),
         )
         results += result
     }
@@ -1063,6 +1293,9 @@ internal class LoadRun(
         if (finished) return
         finished = true
         recording = false
+        probe.stop()
+        savedProgressLevel?.let { Configurator.setLevel(PROGRESS_LOGGER, it) }
+        savedProgressLevel = null
         for (i in 0 until settings.count) {
             val pos = LoadGameTests.Layout.casePos(i, columns)
             helper.setBlock(pos, Blocks.AIR)
@@ -1132,6 +1365,12 @@ internal class LoadRun(
 
         /** プールで仕事を待っているワーカーを見分けるのに読むスタックの深さ */
         private const val STACK_DEPTH = 32
+
+        /** GameTest のサーバーが 20 tick ごとに進み具合を書くロガー */
+        private const val PROGRESS_LOGGER = "net.minecraft.gametest.framework.GameTestServer"
+
+        /** 段階ごとに覚える長い tick の上限 */
+        private const val MAX_LONG_TICKS = 32
 
         private const val TARGET_NANOS = (LoadGameTests.TARGET_TICK_MILLIS * 1_000_000).toLong()
 

@@ -196,6 +196,15 @@ object LoadGameTests {
                     "created or working during the boot " +
                     "(limit ${ciMaxBootKernelThreads()})",
             )
+            // 長い tick の内訳（#600）: 区間の区切り（イベントの受け口）が、どの段階でも全部届いている（0 の区間があれば、その受け口が呼ばれていない）。
+            // 区間の合計と MSPT の差は見ない。区間の終わりと始めは MSPT の計算と同じ時刻を使うので、作りの上でいつも 0 になる（LoadRun.onTick）
+            for (p in report.phases) {
+                val unmarked = LoadTickProbe.Section.entries.filter { p.sectionMarks.getOrElse(it.ordinal) { 0 } == 0 }
+                helper.assertTrue(
+                    unmarked.isEmpty(),
+                    "every tick section should be marked in the ${p.phase} phase, but never reached: $unmarked",
+                )
+            }
             helper.assertTrue(output.sentBytes > 0, "the watched screens should send their output")
             // 1人に送る量は、見ている画面の数によらず、プレイヤーごとの予算に収まる（#352）
             // 組み込みの既定ではなく、動いているサーバーの予算（コンフィグの値）と比べる
