@@ -4,6 +4,7 @@
 //! `<名前> fg=<self|other> stdin=<tty|none> mode=<cooked|other> FOO=<値> HOME=<値> args=<引数の数> cwd=<cwd>`
 //! - `raw`: 終わる前にコンソールを raw にする（init が次の子の前に cooked に戻すかを見る）
 //! - `forever`: 書いた後、終わらずに眠り続ける
+//! - `lang`: 行の最後に ` LANG=<値>` を足す（#661。なければ `(none)`）
 const kibi = @import("kibi");
 const io = kibi.io;
 const tty = kibi.tty;
@@ -18,11 +19,14 @@ pub fn main() u8 {
     var code: u8 = 0;
     var raw = false;
     var forever = false;
+    var lang = false;
     for (opts) |a| {
         if (eql(a, "raw")) {
             raw = true;
         } else if (eql(a, "forever")) {
             forever = true;
+        } else if (eql(a, "lang")) {
+            lang = true;
         } else if (io.parseUnsigned(a)) |v| {
             code = @intCast(v & 0xff);
         }
@@ -53,6 +57,10 @@ pub fn main() u8 {
     io.out(io.formatUnsigned(&b, argv.len));
     io.out(" cwd=");
     io.out(kibi.fs.cwd());
+    if (lang) {
+        io.out(" LANG=");
+        io.out(process.getenv("LANG") orelse "(none)");
+    }
     io.out("\n");
 
     if (raw) tty.setMode(io.STDOUT, tty.Mode.raw) catch {};

@@ -79,20 +79,25 @@ class InitTest {
     }
 
     /** [files] を置いたディスクから起動し、[until] がそろうまで tick を回してから止める。コンソールの行を返す */
-    private fun boot(files: Map<String, ByteArray>, dirs: List<String> = emptyList(), until: (List<String>) -> Boolean): List<String> =
-        bootTimed(files, dirs, until).map { it.first }
+    private fun boot(
+        files: Map<String, ByteArray>,
+        dirs: List<String> = emptyList(),
+        language: String? = null,
+        until: (List<String>) -> Boolean,
+    ): List<String> = bootTimed(files, dirs, language, until).map { it.first }
 
     /** [boot] と同じだが、行が届いた時刻（System.nanoTime）も返す */
     private fun bootTimed(
         files: Map<String, ByteArray>,
         dirs: List<String> = emptyList(),
+        language: String? = null,
         until: (List<String>) -> Boolean,
     ): List<Pair<String, Long>> = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ConsoleHost()
             h.scheduler.hooks.bootVolumes = Disk(imageFile(BootConfig.INIT_PATH), files, dirs)
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 8L * 1024 * 1024)
-            assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+            assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).language(language).build()))
             eventuallyDescribe(90_000, { "そろわない: ${host.text()}" }) {
                 h.scheduler.tick()
                 Thread.sleep(1)
@@ -200,6 +205,23 @@ class InitTest {
         val shells = lines.filter { it.startsWith("shell ") }
         assertTrue(shells.all { it == "shell fg=self stdin=tty mode=cooked FOO=bar HOME=/ args=3 cwd=/" }, text)
         assertTrue(lines.none { it.startsWith("second ") }, text)
+    }
+
+    @Test
+    fun `カーネルが渡したLANGを子の既定にし、inittabのenv_LANGが勝ち、なければ子にLANGはない`() {
+        val probeOnly = mapOf("/bin/initprobe" to probe)
+        val given = boot(probeOnly + inittab("run /bin/initprobe given lang"), language = "ja_JP.UTF-8") { l ->
+            l.any { it.startsWith("given ") }
+        }
+        assertTrue("given fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=3 cwd=/ LANG=ja_JP.UTF-8" in given, given.toString())
+
+        val overridden = boot(probeOnly + inittab("run /bin/initprobe tab lang\nenv LANG=C"), language = "ja_JP.UTF-8") { l ->
+            l.any { it.startsWith("tab ") }
+        }
+        assertTrue("tab fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=3 cwd=/ LANG=C" in overridden, overridden.toString())
+
+        val none = boot(probeOnly + inittab("run /bin/initprobe none lang")) { l -> l.any { it.startsWith("none ") } }
+        assertTrue("none fg=self stdin=tty mode=cooked FOO=(none) HOME=/ args=3 cwd=/ LANG=(none)" in none, none.toString())
     }
 
     @Test
