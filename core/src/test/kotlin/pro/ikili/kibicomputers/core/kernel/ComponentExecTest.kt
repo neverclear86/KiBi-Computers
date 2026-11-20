@@ -214,7 +214,9 @@ class ComponentExecTest {
                 val e = assertThrows<FsException> { m.exec("/bin/kp", KernelDrivers.DEFAULT, closed) }
                 assertEquals(Errno.NOEXEC, e.errno)
                 val msg = e.message!!
-                assertTrue(msg.contains("待機点に変換できない") && msg.contains("v128") && msg.contains("core モジュール"), msg)
+                // p1（#367）と同じ文面。原因が AsyncifyUnsupported でないと「WASM として読めない: …」になるので、頭で見分ける
+                assertTrue(msg.startsWith("/bin/kp は待機点に変換できない作りなので動かせない: "), msg)
+                assertTrue(msg.contains("v128") && msg.contains("core モジュール"), msg)
             }
             assertEquals(1, h.scheduler.programs.loads.get())
             assertEquals(emptyList<Int>(), m.lock.withLockValue { m.kernel.processes.all().map { it.pid } })
