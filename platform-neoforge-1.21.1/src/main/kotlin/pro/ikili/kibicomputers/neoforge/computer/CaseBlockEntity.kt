@@ -502,8 +502,15 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         return true
     }
 
-    /** 自動保存の書き込みの回数の見積もり（今の ID があれば 1、ID を振る台は 2） */
-    internal val plannedWrites: Int get() = if (currentIdentity == null) 2 else 1
+    /**
+     * 自動保存の書き込みの回数の見積もり（今の ID があって `owner.bin` も書いてあれば 1。ID を振る台と、claim が受け入れた・振った ID で
+     * `owner.bin` をまだ書いていない台は、最初の [submit][pro.ikili.kibicomputers.core.persist.MachineSaveStore.submit] が `owner.bin` も書くので 2。#585）
+     */
+    internal val plannedWrites: Int
+        get() {
+            val id = currentIdentity ?: return 2
+            return if (WorldMachineSaves.current?.hasUnwrittenOwner(id.id) == true) 2 else 1
+        }
 
     /**
      * プレイヤーの破壊・爆発: このマシンの保存データのディレクトリを消す（ほかの経路で消えたブロックのディレクトリは残る）。

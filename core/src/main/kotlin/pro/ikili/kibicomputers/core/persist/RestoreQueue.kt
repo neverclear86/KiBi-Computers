@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
  * 復元を始める順番待ち（#85、ADR 0085）。チャンクの読み込みで電源が入っていたケースを積み、tick ごとに
  * [MachineSaveConfig.restoresPerTick] 台まで始める。その ID の書き込みが終わっていない台は、終わるまで（上限
  * [MachineSaveConfig.restoreWriteWaitMillis]）後回しにし、超えたら冷えた起動として始める（ADR 0084 の規則 9）。
- * 書き込みの終わりは待たずに確かめる（[MachineSaveStore.awaitWrites] に 0 を渡す）ので、メインスレッドを止めない。
+ * 書き込みの終わりは待たずに確かめる（[MachineSaveStore.awaitRestorable] に 0 を渡す。`owner.bin` だけの書き込みは待たない。#585）ので、メインスレッドを止めない。
  *
  * 始める処理（[Starter]。接続層）が投げても、ほかの台の開始は続ける（#785。ADR 0044 と同じ考え方）。投げた台は積み直さず、
  * 例外はログに出して捨てる。ログは列全体で、投げた場所ごとに最初の1回だけ WARNING とスタックトレースにし、同じ場所の繰り返しは
@@ -101,7 +101,7 @@ public class RestoreQueue<T : Any>(private val describe: (T) -> String = { it.to
             val (target, entry) = it.next()
             val id = entry.id
             var timedOut = false
-            if (id != null && store != null && !store.awaitWrites(id, 0)) {
+            if (id != null && store != null && !store.awaitRestorable(id, 0)) {
                 if (nowNanos - entry.since < waitNanos) continue
                 timedOut = true
             }

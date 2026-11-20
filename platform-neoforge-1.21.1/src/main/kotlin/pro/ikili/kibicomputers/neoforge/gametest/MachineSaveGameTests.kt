@@ -129,6 +129,9 @@ object MachineSaveGameTests {
         helper.assertTrue(copy.lastClaim == ClaimResult.NEW_ID_DUPLICATE_LOADED, "a duplicate should get a new id but was ${copy.lastClaim}")
         val copyId = copy.identity?.id
         helper.assertTrue(copyId != null && copyId != id, "the duplicate should not share the id: $copyId")
+        // 見積もり: owner.bin を書いてある台は 1、claim が振った ID の owner.bin をまだ書いていない台は 2（#585）
+        helper.assertTrue(be.plannedWrites == 1, "a case whose owner.bin is written plans 1 write but planned ${be.plannedWrites}")
+        helper.assertTrue(copy.plannedWrites == 2, "a case with an id from the claim plans owner.bin too but planned ${copy.plannedWrites}")
 
         // 停止の手順: 書いて setChanged し、チャンクの保存の後に印が新しい世代を指す
         helper.assertTrue(ServerMachines.saveForStop(listOf(be), keepQuiesced = false) == 1, "the stop save should write the machine")
@@ -141,9 +144,13 @@ object MachineSaveGameTests {
             "the chunk save should mark ${afterStop.generation} but was ${store.chunkGeneration(id)}",
         )
 
-        // setRemoved だけ（ブロックを運ぶ MOD と同じ）ではディレクトリを消さない
+        // claim は owner.bin を書かない（新しい ID の owner.bin は最初の世代の前に書く。#585）
+        helper.assertTrue(!Files.exists(store.directoryOf(copyId!!)), "the claim should not create the directory of the new id")
+        // setRemoved だけ（ブロックを運ぶ MOD と同じ）ではディレクトリを消さない（書いた後の台と同じく、ディレクトリを置いて確かめる）
+        Files.createDirectories(store.directoryOf(copyId))
         helper.setBlock(OTHER, Blocks.AIR)
-        helper.assertTrue(Files.isDirectory(store.directoryOf(copyId!!)), "setRemoved alone should keep the directory")
+        ServerMachines.drainSaves()
+        helper.assertTrue(Files.isDirectory(store.directoryOf(copyId)), "setRemoved alone should keep the directory")
         // プレイヤーの破壊では消す
         be.pressPowerButton()
         val player = helper.makeMockPlayer(GameType.SURVIVAL)

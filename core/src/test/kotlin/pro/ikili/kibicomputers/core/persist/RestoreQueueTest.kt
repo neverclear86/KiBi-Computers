@@ -71,6 +71,25 @@ class RestoreQueueTest {
         assertTrue(store.awaitWrites(identity.id, 0))
     }
 
+    @Test
+    fun `引き取りのowner_binの書き込みだけが残っている台は待たずに始める`() {
+        val executor = ManualSaveExecutor()
+        val index = MachineIdIndex()
+        val store = MachineSaveStore(dir, index, "test", executor)
+        val from = MachineOwner("o", 0, 0, 0)
+        val to = MachineOwner("o", 9, 0, 0)
+        val identity = store.assignNewId(from)!!
+        index.removeIfOwner(identity.id, from)
+        // 運んだ先が引き取る（owner.bin の書き込みが列に残る。#585）
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(identity.id.toString(), 0, 0, to).result)
+        assertEquals(1, executor.size)
+        val queue = RestoreQueue<String>()
+        queue.offer("moved", identity.id, 0)
+        val started = ArrayList<Pair<String, Boolean>>()
+        assertEquals(1, queue.tick(0, store, config) { t, timedOut -> started += t to timedOut })
+        assertEquals(listOf("moved" to false), started, "冷えた起動にしない")
+    }
+
     /** `kibicomputers.persist` のログを拾う（core のテストでは System.Logger が JUL に流れる。DEBUG は FINE） */
     private class Captured : AutoCloseable {
         // JUL のロガーは弱参照で持たれるので、ここで持ったままにする
