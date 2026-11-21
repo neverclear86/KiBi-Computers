@@ -135,6 +135,12 @@ internal class ProcessRuntime(
      */
     var fuelUnwindYield: Boolean = false
 
+    /**
+     * このプロセスが燃料のスライスを受け取った回数（燃料待ち・CPU の列から取ったものと、その場で足したもの。#740）。実行時だけの数え口で、保存しない。
+     * カーネルロックの中で書く。接続層の負荷試験が、同じ台の中で計算し続けるプロセスが全部進んでいるか（1本だけが回り続けていないか）を見るために読む
+     */
+    var fuelGrants: Long = 0
+
     /** 燃料待ちからの巻き直しの途中（#339）。止まった燃料切れの呼び出しに着いたら消す。プロセスのスレッドだけが読み書きする */
     var rewindingForFuel: Boolean = false
 

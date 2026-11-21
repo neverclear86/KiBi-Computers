@@ -713,6 +713,15 @@ public class Machine private constructor(
             .ifEmpty { "none" }
     }
 
+    /**
+     * 終わっていないプロセスごとの、燃料のスライスを受け取った回数（pid → 回数。実行時だけの数え口で、保存しない。戻した後は 0 から数える。#740）。
+     * 接続層の負荷試験が、同じ台の中で計算し続けるプロセスが全部進んでいるか（譲り合いが壊れて1本だけが回り続けていないか）を見るために、
+     * 測る区間の始めと終わりに読む。カーネルロックを取るので、毎 tick は呼ばない
+     */
+    public fun fuelGrantsByProcess(): Map<Int, Long> = lock.withLockValue {
+        runtimes.values.filter { !it.process.state.isTerminal }.associate { it.pid to it.fuelGrants }
+    }
+
     /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
     public val isRebootPending: Boolean get() = lock.withLockValue { rebootRequested || rebootNotified }
 

@@ -198,12 +198,19 @@ object LoadGameTests {
             )
             // 計算し続ける台は燃料を使う（#740。数え口がつながっている）。回数や比の大きさは CI の機械に左右されるので見ない
             helper.assertTrue(compute.fuel!!.consumed > 0 && compute.fuel.permits > 0, "the computing machines should use fuel: ${compute.fuel}")
-            // 1台に計算するプロセスが複数（#740）: 標準 OS のシェルだけで動かす。同じ台の中でスライスごとに譲り合う
+            // 1台に計算するプロセスが複数（#740）: 標準 OS のシェルだけで動かす。同じ台の中でスライスごとに譲り合う。
+            // 「譲った」（fuelYields）は、tick をそろえない CI ではプロセスが1本の台でも増える（手持ちを渡した tick が進んだので許可を回した分）ので、
+            // 譲り合いの検査にならない。測りはじめにあった計算するシェルが1本残らず、測った区間にスライスを受け取ったか（飢えていないか）で見る
             val multi = report.phaseOrNull(LoadPhase.COMPUTE_MULTI)
             if (os.backgroundCommand != null) {
                 helper.assertTrue(multi != null, "the multi-process phase should run with ${os.id}")
                 val f = multi!!.fuel!!
-                helper.assertTrue(f.consumed > 0 && f.yields > 0, "$COMPUTE_PROCESSES computing processes on a machine should take turns: $f")
+                helper.assertTrue(f.consumed > 0, "$COMPUTE_PROCESSES computing processes on a machine should use fuel: $f")
+                helper.assertTrue(
+                    multi.minProcessGrants > 0,
+                    "every one of the $COMPUTE_PROCESSES computing shells on each machine should get fuel slices while measured: " +
+                        "min ${multi.minProcessGrants}, max ${multi.maxProcessGrants} ($f)",
+                )
                 helper.assertTrue(
                     multi.tick.avg < CI_MAX_AVG_TICK_MILLIS,
                     "ticks with $COMPUTE_PROCESSES computing processes on each of $CI_BUSY machines should stay under " +

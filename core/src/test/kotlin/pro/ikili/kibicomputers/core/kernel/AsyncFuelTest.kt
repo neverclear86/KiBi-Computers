@@ -238,6 +238,7 @@ class AsyncFuelTest {
             val spins = List(processes) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
             // 全員が、最初の燃料を待つところまで来てから始める（来る前に tick を進めると、起こす数がそろわない）
             eventually(30_000, "$processes 本とも燃料待ちにならない") { m.fuelWaiterCount == processes }
+            val grants0 = m.fuelGrantsByProcess()
             for (k in 1..ticks) {
                 val woken0 = h.scheduler.dispatcher.woken.get()
                 h.scheduler.tick()
@@ -253,6 +254,9 @@ class AsyncFuelTest {
             assertEquals(total, counts.sum(), "スライスの数: $counts")
             val fair = total / processes
             assertTrue(counts.all { it in fair - 1..fair + 1 }, "全員が同じ回数動いていない: $counts")
+            // プロセスごとのスライスの数え口（接続層の負荷試験が読む。#740）は、動いたスライスの数と同じ（全員が燃料待ちの間に読む）
+            val grants = m.fuelGrantsByProcess()
+            assertEquals(counts, spins.map { (grants[it.pid] ?: 0L) - (grants0[it.pid] ?: 0L) }.map { it.toInt() }, "プロセスごとのスライスの数え口")
             for (s in spins) m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
         }
     }

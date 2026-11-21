@@ -437,7 +437,10 @@ internal class ProcessRunner(private val machine: Machine) {
         if (!paused) {
             if (rt.process.unmetered) return 0L
             val grant = machine.fuelAccount.take(observedTick, machine.config.fuelSlice)
-            if (grant > 0) return grant
+            if (grant > 0) {
+                rt.fuelGrants++
+                return grant
+            }
             scheduler.deactivate(rt)
         }
         enqueueFuelWaitLocked(rt, threadless, behindCpu)
@@ -649,6 +652,7 @@ internal class ProcessRunner(private val machine: Machine) {
         check(grant > 0) { "書き戻した後の燃料が正なのに、スライスを渡せない" }
         // 前借りしていたら、ここで返した（巻き戻せるところを探さなくてよい）
         rt.fuelOverdraft = false
+        rt.fuelGrants++
         scheduler.fuelSliceRenewals.incrementAndGet()
         return grant
     }
