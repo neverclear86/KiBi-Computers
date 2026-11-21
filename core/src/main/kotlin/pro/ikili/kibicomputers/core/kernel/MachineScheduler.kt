@@ -455,6 +455,8 @@ public class MachineScheduler private constructor(
         machines.values.forEach { it.stop() }
         wakeLock.withLockValue { wakeQueue.clear() }
         dispatcher.close()
+        // 最後の要約の後に数えた、デバイスのメソッドの失敗の繰り返しを出す（#679）
+        deviceFailureLog.flushPending()
         timerService.close()
         workers.shutdown()
         bootExecutor.shutdown()

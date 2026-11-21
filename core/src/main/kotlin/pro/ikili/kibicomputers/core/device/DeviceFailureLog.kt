@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicLong
  * - キーごとに最初の1回だけ WARNING（例外ならスタックトレースつき）。2回目からは数えるだけで、台は DEBUG に出す
  * - 覚えるキーは [keyLimit] 個まで。超えたら、そのことを書いた WARNING を1回だけ出し、後は「上限の後」としてまとめて数える
  * - 数えた繰り返しは、最初の繰り返しから [summaryIntervalTicks] tick が過ぎたら、要約の WARNING 1本に出して数え直す
- *   （失敗したときと [tick] の頭で確かめる。どちらも O(1)）
+ *   （失敗したときと [tick] の頭で確かめる。どちらも O(1)）。スケジューラを閉じるときは、間を待たずに残りを出す（[flushPending]）
  *
  * どのスレッドから呼んでもよい（直接のメソッドは呼んだスレッドで、メインスレッドのメソッドは `tick()` の中で失敗する）。
  * ログに出す処理は投げない（JVM の致命的なエラーだけ投げ直す）。他 MOD のコード（例外の `toString` など）は、ログに出すときだけ try の中で呼ぶ
@@ -85,6 +85,19 @@ internal class DeviceFailureLog(
         val since = pendingSince.get()
         if (since == NONE || now - since < summaryIntervalTicks) return
         if (!pendingSince.compareAndSet(since, NONE)) return
+        try {
+            flush()
+        } catch (e: Throwable) {
+            if (isFatal(e)) throw e
+        }
+    }
+
+    /**
+     * まだ要約に出していない繰り返しを、間を待たずに出す（`MachineScheduler.close()` から呼ぶ。サーバーを止めると、
+     * 最後の要約の後に数えた繰り返しの件数が、どこにも残らないままになるため）。なければ何も出さない。投げない（JVM の致命的なエラーを除く）
+     */
+    fun flushPending() {
+        pendingSince.set(NONE)
         try {
             flush()
         } catch (e: Throwable) {

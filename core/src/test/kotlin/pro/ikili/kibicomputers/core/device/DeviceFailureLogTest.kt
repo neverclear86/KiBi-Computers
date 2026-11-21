@@ -96,6 +96,46 @@ class DeviceFailureLogTest {
     }
 
     @Test
+    fun `閉じるときに、間が過ぎていない繰り返しの件数を出し、なければ何も出さない`() {
+        val rec = Recorder()
+        val log = DeviceFailureLog(summaryIntervalTicks = 1200, log = rec.logger)
+        log.flushPending()
+        assertTrue(rec.lines.isEmpty())
+        repeat(5) { log.report(1, "a", "test:device", "bug", IllegalStateException(), now = 0) }
+        log.tick(10)
+        assertEquals(1, rec.of(warning).size, "間が過ぎるまで要約は出ない")
+        log.flushPending()
+        val w = rec.of(warning)
+        assertEquals(2, w.size, w.toString())
+        assertTrue(w[1].message.contains("種類 test:device のメソッド bug（java.lang.IllegalStateException）4 回"), w[1].message)
+        // 出した分は数え直す
+        log.flushPending()
+        assertEquals(2, rec.of(warning).size)
+    }
+
+    @Test
+    fun `スケジューラを閉じると、間が過ぎていない失敗の繰り返しの件数が出る`() = timeout(limit) {
+        Captured().use { cap ->
+            val h = Harness()
+            val methods = DeviceMethods.builder()
+                .direct("bug") { _, _ -> throw IllegalStateException("バグ") }
+                .build()
+            val machine = h.machine()
+            val address = "00000000-0000-4000-8000-000000000679"
+            machine.devices.attach(address, TestDevice(methods))
+            repeat(10) {
+                val r = DeviceDispatcher.resultOf(machine.devices.dispatcher.start(0, address, "bug", emptyList()).future)
+                assertEquals(CallResult.Error(CallError.INTERNAL_ERROR), r)
+            }
+            assertEquals(1, cap.of(Level.WARNING).size)
+            h.close()
+            val warnings = cap.of(Level.WARNING)
+            assertEquals(2, warnings.size, warnings.map { it.message }.toString())
+            assertTrue(warnings[1].message.contains("9 回"), warnings[1].message)
+        }
+    }
+
+    @Test
     fun `失敗がなければ要約は出ず、1回だけの失敗にも要約は出ない`() {
         val rec = Recorder()
         val log = DeviceFailureLog(summaryIntervalTicks = 10, log = rec.logger)
