@@ -30,9 +30,12 @@ import pro.ikili.kibicomputers.core.persist.SaveCleanup
 import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.io.IOException
+import java.nio.file.DirectoryIteratorException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.RejectedExecutionException
 import java.util.function.Consumer
 
@@ -66,6 +69,7 @@ internal object SaveCleanups {
             running = null
             last = null
             autoOverride = null
+            commandOverride = null
             ticksUntilAuto = if (event.server is GameTestServer) -1 else START_DELAY_TICKS
         }
         NeoForge.EVENT_BUS.addListener<ServerTickEvent.Post> { tick() }
@@ -93,6 +97,22 @@ internal object SaveCleanups {
     }
 
     private var autoOverride: Pair<MachineSaveStore, FileModuleStore?>? = null
+
+    /**
+     * コマンド（`/kibicomputers saves cleanup`）が始める掃除の置き場・モジュールの置き場の差し替え（テスト用。`null` なら今のサーバーのもの）。
+     * コマンドの経路をサーバーの本物の置き場を消さずに試す
+     */
+    internal var commandOverride: Pair<MachineSaveStore, FileModuleStore?>? = null
+
+    /** コマンドから掃除を始める（[start]。置き場は [commandOverride] があればそれ） */
+    fun startFromCommand(dryRun: Boolean, force: Boolean): SaveCleanup? {
+        val override = commandOverride
+        return if (override != null) {
+            start(dryRun, force, store = override.first, modules = override.second)
+        } else {
+            start(dryRun, force)
+        }
+    }
 
     /**
      * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules] はテストが差し替える（既定は今のサーバーのもの）
@@ -161,8 +181,9 @@ internal object SaveCleanups {
  * - それ以外: `ChunkMap.read`（IOWorker。書き込み待ちのデータを返す）の `block_entities` に、その座標のケースのタグがあり、
  *   その ID を持つなら [MachineReference.PRESENT]、なければ（チャンクがディスクにないときも）[MachineReference.ABSENT]。読みが失敗したら [MachineReference.UNKNOWN]。
  *   ディスクの確認と読みは IO のスレッド（`Util.ioPool`）の仕事で、メインスレッドは stat も読みもしない（答えは次の tick 以降に返る）。
- *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`ChunkMap` が実際に開く保存先の `r.X.Z.mca`。[regionFile]）がなければ読まずに
- *   [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
+ *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`ChunkMap` が実際に開く保存先の `r.X.Z.mca`。[regionFile]）がないと確かめられ、
+ *   同じ保存先にバニラの名前のリージョンファイルがあれば、読まずに [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。
+ *   確かめられない・保存先にバニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら [MachineReference.UNKNOWN]（[regionAbsence]）。リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
  *   このセッションで生成したチャンクだけで、そこにあるケースはこのセッションで置いた（ID を振った・claim した）もの、つまり「見た ID」なので、ここには問われない
  *   （消す直前にも見直す）。リージョンファイルがあれば、書き込み待ちは `ChunkMap.read` が返す
  *
@@ -206,9 +227,9 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
 
     /** IO のスレッドで、チャンクの保存先の確認と読みをする（[probe]） */
     private fun readFromStorage(level: ServerLevel, chunk: ChunkPos, region: Path, id: UUID, pos: BlockPos, answer: Consumer<MachineReference>) {
-        // リージョンファイルがなければ読まない（読みが空のリージョンファイルを作るため）
-        if (!Files.exists(region)) {
-            answer.accept(MachineReference.ABSENT)
+        // リージョンファイルがなければ読まない（読みが空のリージョンファイルを作るため）。ないと確かめられたときだけ「ない」にする
+        regionAbsence(region, vanillaFolders)?.let {
+            answer.accept(it)
             return
         }
         level.chunkSource.chunkMap.read(chunk).whenComplete { data, error ->
@@ -222,7 +243,42 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
         }
     }
 
+    /** バニラの名前（`r.X.Z.mca`）のリージョンファイルが1つでもあると分かった保存先（[regionAbsence]。どのスレッドからも使う） */
+    private val vanillaFolders: MutableSet<Path> = ConcurrentHashMap.newKeySet()
+
     companion object {
+        /** バニラのリージョンファイルの名前 */
+        private val REGION_NAME = Regex("""r\.-?\d+\.-?\d+\.mca""")
+
+        /**
+         * リージョンファイル [region] がないときの答え（IO のスレッドで呼ぶ）。読んでよい（ファイルがある）なら `null`。
+         *
+         * - ファイルがあると確かめられた: `null`（`ChunkMap.read` で読む）
+         * - ないと確かめられ（`Files.notExists`）、同じ保存先にバニラの名前のリージョンファイルが1つでもある: [MachineReference.ABSENT]
+         * - それ以外（stat の I/O エラー・アクセス拒否で確かめられない、保存先にバニラの名前のファイルが1つもない）: [MachineReference.UNKNOWN]。
+         *   保存先にバニラの名前のファイルがないのは、このディメンションでまだチャンクを保存していないか、リージョンの名前・形式を変える環境で、
+         *   どちらもファイル名からは判定できないので、消す側に倒さない（ADR 0564 の「判定できないものは残す」）
+         *
+         * [known] は、バニラの名前のファイルがあると分かった保存先の覚え（同じ保存先を何度も一覧しない）
+         */
+        fun regionAbsence(region: Path, known: MutableSet<Path>): MachineReference? {
+            if (Files.exists(region)) return null
+            if (!Files.notExists(region)) return MachineReference.UNKNOWN
+            val folder = region.parent ?: return MachineReference.UNKNOWN
+            if (folder !in known) {
+                val vanilla = try {
+                    Files.newDirectoryStream(folder, "r.*.mca").use { dir -> dir.any { REGION_NAME.matches(it.fileName.toString()) } }
+                } catch (e: IOException) {
+                    false
+                } catch (e: DirectoryIteratorException) {
+                    false
+                }
+                if (!vanilla) return MachineReference.UNKNOWN
+                known.add(folder)
+            }
+            return MachineReference.ABSENT
+        }
+
         /**
          * ディメンション [level] のチャンク [chunk] のリージョンファイル。`ChunkMap` が実際に開く保存先（`RegionFileStorage` の `folder`。
          * バニラでは `<dimension>/region`）の `r.X.Z.mca`。パスを自分で組み立てず、チャンクを読み書きする側の保存先を直接引くので、

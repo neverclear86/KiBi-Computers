@@ -292,6 +292,38 @@ class SaveCleanupTest {
     }
 
     @Test
+    fun `同じ置き場で2回目の掃除は、前に消したモジュールを数えない`() {
+        val (referenced, unused) = oldModules("referenced", "unused")
+        answers[p] = MachineReference.PRESENT
+        previousMachine(p, sourceOf(abiSection(hashOf(referenced))))
+        val modules = FileModuleStore(modulesRoot)
+        val first = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), modules)).report
+        assertEquals(2, first.moduleCandidates)
+        assertEquals(1, first.modulesDeleted)
+        assertFalse(Files.exists(modulesRoot.resolve("$unused.wasm")))
+        assertEquals(listOf(referenced), modules.sweepCandidates())
+
+        // 本番の後の試しの実行（同じサーバー＝同じモジュールの置き場）は、消すものがないと数える
+        val dry = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), modules, dryRun = true)).report
+        assertEquals(1, dry.moduleCandidates)
+        assertEquals(1, dry.modulesReferenced)
+        assertEquals(0, dry.modulesUnreferenced)
+        val second = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), modules)).report
+        assertEquals(1, second.moduleCandidates)
+        assertEquals(0, second.modulesUnreferenced)
+        assertEquals(0, second.modulesDeleted)
+    }
+
+    @Test
+    fun `種のファイルが外から消えていれば、消せなかった後の候補から外す`() {
+        val (gone) = oldModules("gone")
+        val modules = FileModuleStore(modulesRoot)
+        Files.delete(modulesRoot.resolve("$gone.wasm"))
+        assertEquals(-1, modules.deleteIfUnused(gone))
+        assertEquals(emptyList<String>(), modules.sweepCandidates())
+    }
+
+    @Test
     fun `知らないABI層の世代があればモジュールを1つも消さない`() {
         val (unused) = oldModules("unused")
         answers[p] = MachineReference.PRESENT

@@ -94,6 +94,9 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
     /** 作ったときに置き場にあったファイルのハッシュ（16進。掃除の候補。#564。作った後は変えない） */
     private val seeds = ArrayList<String>()
 
+    /** 種のうち、掃除で消した・もうないと分かったハッシュ（16進。[sweepCandidates] から外す。#564） */
+    private val swept: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     /** 作った時刻（ミリ秒。これより後に更新されたファイルは掃除しない。#564） */
     private val createdMillis = System.currentTimeMillis()
 
@@ -185,8 +188,11 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
         return bytes
     }
 
-    /** 掃除の候補（作ったときに置き場にあったファイルのハッシュ。16進。#564） */
-    public fun sweepCandidates(): List<String> = seeds.toList()
+    /**
+     * 掃除の候補（作ったときに置き場にあったファイルのハッシュ。16進。#564）。前の掃除で消した・もうないと分かったもの（[deleteIfUnused]）は外す
+     * （同じサーバーで2回目の掃除の数を実態に合わせる）
+     */
+    public fun sweepCandidates(): List<String> = seeds.filter { it !in swept }
 
     /** このセッションで [put]・[get] に来たか（#564。テスト・掃除の数え口） */
     public fun isTouched(hex: String): Boolean = hex in touched
@@ -208,12 +214,17 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
                 if (hex in touched) return -1
                 val file = root.resolve(hex + SUFFIX)
                 return try {
-                    if (!Files.isRegularFile(file)) return -1
+                    if (!Files.isRegularFile(file)) {
+                        // ないと確かめられたら、次の掃除の候補から外す（確かめられないだけなら残す）
+                        if (Files.notExists(file)) swept += hex
+                        return -1
+                    }
                     if (Files.getLastModifiedTime(file).toMillis() > createdMillis) return -1
                     val size = Files.size(file)
                     known -= hex
                     verified -= hex
                     Files.delete(file)
+                    swept += hex
                     size
                 } catch (e: IOException) {
                     LOG.log(System.Logger.Level.WARNING, "モジュール $hex を置き場 $root から消せない: $e")

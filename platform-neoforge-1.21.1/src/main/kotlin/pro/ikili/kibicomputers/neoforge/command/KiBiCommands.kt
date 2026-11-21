@@ -48,7 +48,7 @@ internal object KiBiCommands {
 
     /** 残ったディレクトリとモジュールの置き場の掃除を始める（#564。結果はログと `status`） */
     private fun cleanup(ctx: CommandContext<CommandSourceStack>, dryRun: Boolean, force: Boolean): Int {
-        val started = SaveCleanups.start(dryRun, force)
+        val started = SaveCleanups.startFromCommand(dryRun, force)
             ?: return reply(ctx.source, Component.translatable(KEY_CLEANUP_BUSY), false)
         val mode = when {
             started.dryRun -> "dry-run"

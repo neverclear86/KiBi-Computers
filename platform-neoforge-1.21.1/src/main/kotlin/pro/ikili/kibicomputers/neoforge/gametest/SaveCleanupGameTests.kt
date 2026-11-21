@@ -1,8 +1,12 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
+import com.mojang.brigadier.exceptions.CommandSyntaxException
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
@@ -28,6 +32,7 @@ import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.OwnerRecord
 import pro.ikili.kibicomputers.core.persist.SaveCleanup
 import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
+import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ChunkReferenceProbe
 import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
@@ -65,6 +70,17 @@ object SaveCleanupGameTests {
         val old = FileTime.fromMillis(System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000)
         Files.setLastModifiedTime(file, old)
         Files.setLastModifiedTime(dir, old)
+    }
+
+    /**
+     * 今のディメンションの保存先に、バニラの名前のリージョンファイルを確かに作る（どのテストも読まない離れたチャンクに空のチャンクの NBT を書き、IOWorker を流す）。
+     * チャンクの問いは、保存先にバニラの名前のリージョンファイルが1つもなければ「判定できない」にする（[ChunkReferenceProbe.regionAbsence]）ので、
+     * まだチャンクを保存していない新しいワールドで「ない」を確かめるテストの前に呼ぶ
+     */
+    private fun ensureVanillaRegion(helper: GameTestHelper) {
+        val map = helper.level.chunkSource.chunkMap
+        map.write(FarChunks.reserve(helper), CompoundTag().apply { put("block_entities", ListTag()) })
+        map.flushWorker()
     }
 
     private fun deleteTree(root: Path) {
@@ -141,11 +157,12 @@ object SaveCleanupGameTests {
         }.thenSucceed()
     }
 
-    /** コマンドの経路（[SaveCleanups.start]）の試しの実行は消さずに数え、`saves status` が結果を返す */
+    /** [SaveCleanups.start] の試しの実行は消さずに数え、`saves status` が結果を返す（コマンドの `cleanup` の経路は [cleanupCommandsRequireOpAndPassModes]） */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
     fun dryRunCountsWithoutDeleting(helper: GameTestHelper) {
         val level = helper.level
+        ensureVanillaRegion(helper)
         val root = tempRoot(helper)
         val absent = UUID.randomUUID()
         val far = FarChunks.reserve(helper)
@@ -269,6 +286,7 @@ object SaveCleanupGameTests {
         val level = helper.level
         val dimension = level.dimension().location().toString()
         val probe = ChunkReferenceProbe(level.server)
+        ensureVanillaRegion(helper)
         val empty = FarChunks.reserve(helper)
         val emptyRegion = ChunkReferenceProbe.regionFile(level, empty)
         helper.assertTrue(!Files.exists(emptyRegion), "the region of the reserved chunk should not exist yet: $emptyRegion")
@@ -394,6 +412,119 @@ object SaveCleanupGameTests {
     }
 
     /**
+     * リージョンファイルがないときの答え（[ChunkReferenceProbe.regionAbsence]）は、ないと確かめられ、同じ保存先にバニラの名前のリージョンファイルが
+     * あるときだけ「ない」。保存先がない・バニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら「判定できない」。ファイルがあれば読む（`null`）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun regionAbsenceNeedsVanillaRegionFiles(helper: GameTestHelper) {
+        val folder = tempRoot(helper).resolve("region")
+        try {
+            val target = folder.resolve("r.3.-4.mca")
+            fun check(expected: MachineReference?, what: String) {
+                val actual = ChunkReferenceProbe.regionAbsence(target, HashSet())
+                helper.assertTrue(actual == expected, "$what should be $expected but was $actual")
+            }
+            check(MachineReference.UNKNOWN, "a missing folder")
+            Files.createDirectories(folder)
+            check(MachineReference.UNKNOWN, "an empty folder")
+            Files.write(folder.resolve("c.0.0.mcc"), ByteArray(0))
+            Files.write(folder.resolve("r.0.0.region"), ByteArray(0))
+            Files.write(folder.resolve("r.a.b.mca"), ByteArray(0))
+            check(MachineReference.UNKNOWN, "a folder with only other region names")
+            Files.write(folder.resolve("r.-1.2.mca"), ByteArray(0))
+            check(MachineReference.ABSENT, "a folder with a vanilla region file")
+            Files.write(target, ByteArray(0))
+            check(null, "an existing region file")
+        } finally {
+            deleteTree(folder)
+        }
+        helper.succeed()
+    }
+
+    /**
+     * `/kibicomputers saves cleanup`・`cleanup dry-run`・`cleanup force`・`saves status` は、OP の権限（コンフィグの `opPermissionLevel`）のない実行者を弾き、
+     * OP なら、それぞれ正しい組（dryRun・force）で [SaveCleanups.startFromCommand] に届く。サーバーの本物の置き場を消さないよう、
+     * 置き場は [SaveCleanups.commandOverride] で差し替える。共有の [SaveCleanups] を使うので、ほかの掃除のテストと重ならないよう別の batch にする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600, batch = "kibicomputers_save_cleanup_command")
+    fun cleanupCommandsRequireOpAndPassModes(helper: GameTestHelper) {
+        val level = helper.level
+        val server = level.server
+        val dispatcher = server.commands.dispatcher
+        val root = tempRoot(helper)
+        val absent = UUID.randomUUID()
+        ensureVanillaRegion(helper)
+        val far = FarChunks.reserve(helper)
+        previousDirectory(root, absent, MachineOwner(level.dimension().location().toString(), far.minBlockX, 64, far.minBlockZ))
+        SaveCleanups.commandOverride = MachineSaveStore(root, MachineIdIndex(), "test") to null
+        // 成功・失敗・タイムアウトのどれでも差し替えを外す（後のコマンドが別の置き場を使わないように）
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = clear()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = clear()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+
+                private fun clear() {
+                    SaveCleanups.commandOverride = null
+                    deleteTree(root)
+                }
+            },
+        )
+        val opLevel = CaseAccess.rules().opPermissionLevel
+        val op = server.createCommandSourceStack().withPermission(opLevel)
+        val notOp = server.createCommandSourceStack().withPermission(opLevel - 1)
+        // OP でない実行者には、saves の下のコマンドが見えない（Brigadier の requires で弾かれ、何も始まらない）
+        val before = SaveCleanups.last
+        for (command in listOf("saves cleanup", "saves cleanup dry-run", "saves cleanup force", "saves status")) {
+            val rejected = try {
+                dispatcher.execute("kibicomputers $command", notOp)
+                false
+            } catch (e: CommandSyntaxException) {
+                true
+            }
+            helper.assertTrue(rejected, "'$command' should be rejected without the op permission")
+        }
+        helper.assertTrue(SaveCleanups.last === before, "a rejected command should not start a cleanup")
+        // OP なら、リテラルごとの組（dryRun・force）で始まる。1つずつ終わるのを待つ（走っている間は次を始めない）
+        val modes = listOf(
+            Triple("saves cleanup dry-run", true, false),
+            Triple("saves cleanup", false, false),
+            Triple("saves cleanup force", false, true),
+        )
+        var sequence = helper.startSequence()
+        var started: SaveCleanup? = null
+        for ((command, dryRun, force) in modes) {
+            sequence = sequence.thenExecute {
+                val previous = SaveCleanups.last
+                val result = dispatcher.execute("kibicomputers $command", op)
+                helper.assertTrue(result == 1, "'$command' should start a cleanup")
+                started = SaveCleanups.last
+                val s = started
+                helper.assertTrue(s != null && s !== previous, "'$command' should start a new cleanup")
+                helper.assertTrue(s!!.dryRun == dryRun && s.force == force, "'$command' should start dryRun=$dryRun force=$force but was ${s.dryRun}/${s.force}")
+            }.thenWaitUntil {
+                helper.assertTrue(started!!.finished, "'$command' should finish (${started!!.phase})")
+            }.thenExecute {
+                val report = started!!.report
+                val directory = root.resolve(absent.toString())
+                when {
+                    dryRun -> helper.assertTrue(report.unreferenced == 1 && report.deleted == 0 && Files.isDirectory(directory), "the dry run should count only: $report")
+                    !force -> helper.assertTrue(report.deleted == 1 && !Files.exists(directory), "the cleanup should delete: $report")
+                    else -> helper.assertTrue(report.deleted == 0 && !Files.exists(directory), "nothing should be left to delete for the forced cleanup: $report")
+                }
+                helper.assertTrue(dispatcher.execute("kibicomputers saves status", op) == 1, "saves status should report the last cleanup")
+            }
+        }
+        sequence.thenSucceed()
+    }
+
+    /**
      * チャンクの問いが見るリージョンファイルの保存先（[ChunkReferenceProbe.regionFile]）は、今のサーバーのどのディメンションでも、
      * バニラの保存先（`DimensionType.getStorageFolder` の `region`）と同じ
      */
@@ -426,6 +557,7 @@ object SaveCleanupGameTests {
         val dryRoot = tempRoot(helper)
         val autoId = UUID.randomUUID()
         val dryId = UUID.randomUUID()
+        ensureVanillaRegion(helper)
         val far = FarChunks.reserve(helper)
         previousDirectory(autoRoot, autoId, MachineOwner(dimension, far.minBlockX, 64, far.minBlockZ))
         previousDirectory(dryRoot, dryId, MachineOwner(dimension, far.minBlockX + 1, 64, far.minBlockZ))
