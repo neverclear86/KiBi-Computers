@@ -199,7 +199,11 @@ internal class PermitHandOffFailureTest {
         Fixture(1).use { f ->
             val done = CountDownLatch(1)
             val ranA = CountDownLatch(1)
+            // submit の直接の道は、渡した後に retryStranded を呼ぶ。それが終わるまで a を動かさない
+            // （先に a が抜けて b を取り残しの列に入れると、その retryStranded が b を渡し直してしまう）
+            val submitted = CountDownLatch(1)
             f.pool.submit("a") {
+                check(submitted.await(5, TimeUnit.SECONDS))
                 f.pool.submit("b", f.task("b", done))
                 // b を今のワーカーの続きにしてから、例外で抜ける。続きを渡し直すところで失敗させる
                 f.pool.release(inline = true)
@@ -207,6 +211,7 @@ internal class PermitHandOffFailureTest {
                 ranA.countDown()
                 throw IllegalStateException("テストの失敗")
             }
+            submitted.countDown()
             assertTrue(ranA.await(5, TimeUnit.SECONDS))
             waitUntil("続きが取り残しの列に入らない") { f.pool.strandedTasks == 1 }
             assertEquals(0, f.pool.availablePermits())
@@ -293,14 +298,17 @@ internal class PermitHandOffFailureTest {
             f.pool.acquire()
             f.pool.acquire()
             f.pool.submit("a", f.task("a", done))
-            // 1回目は release の渡し、2回目は 2 つ目の release の中の retryStranded で、どちらも失敗させる。
-            // 許可は1つ空き、a は取り残しの先頭に残る
-            f.executor.failuresLeft.set(2)
+            // release の渡しを失敗させ、a を取り残しの列に入れる
+            f.executor.failuresLeft.set(1)
             f.pool.release()
+            assertEquals(1, f.pool.strandedTasks)
+            // 次の release は許可を空きに戻すだけ（ワーカーに渡していない）。渡し直しを試みない（失敗を積まない）
+            f.executor.alwaysFail = true
             f.pool.release()
+            f.executor.alwaysFail = false
             assertEquals(1, f.pool.strandedTasks, "a は取り残されたまま")
             assertEquals(1, f.pool.availablePermits())
-            assertEquals(2L, f.pool.handOffFailures.get())
+            assertEquals(1L, f.pool.handOffFailures.get(), "許可を空きに戻しただけの release は渡し直さない")
             assertEquals(0, f.executor.failuresLeft.get())
             // 空いた許可で直接渡す。渡せたら a も渡し直される（retryStranded も tick も呼ばない）
             // b は許可を持ったまま止める（b が許可を返す release が渡し直すのではなく、submit が渡し直すことを確かめる）

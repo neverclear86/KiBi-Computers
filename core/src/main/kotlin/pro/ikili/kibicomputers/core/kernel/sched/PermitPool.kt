@@ -20,6 +20,8 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * 許可を渡し終えた仕事をワーカーに渡せなかったとき（スレッドを作れないときなど。#870）は、呼び手に投げない。
  * その仕事は許可を持ったまま「取り残しの列」に入り、[retryStranded]（毎 tick と、次にワーカーへ渡せたとき）で前から渡し直す。
+ * 「ワーカーへ渡せたとき」は、`execute` が通ったときだけ（許可を空きに戻しただけ・スレッドを起こしただけ・今のワーカーの続きにしただけの
+ * [release] は数えない。スレッドを作れない状態が続く間に、release のたびに作成を試みて失敗を積まないため）。
  * ワーカーが遅れて動き出すのと同じ扱いなので、動き出した step が今の道筋どおりに許可を1回だけ返す
  * （止められていれば WASM を動かさずに返す）。渡し直しは仕事の順（先に取り残したものが先）を保つ。
  * 運用の側へは、取り残しの始まり（スタックトレース付きの WARNING 1本）、続いている間の要約（[summaryIntervalTicks] tick ごとの WARNING）、
@@ -61,22 +63,24 @@ internal class PermitPool(
 
     /**
      * 取り残しが続いているか。最初の失敗でスタックトレース付きの WARNING を出して立て、取り残しを全部渡し直せたら下ろす
-     * （続いている間の失敗は数えるだけ。下ろした後の再発は、もう一度スタックトレース付きで出す）
+     * （続いている間の失敗は数えるだけ。下ろした後の再発は、もう一度スタックトレース付きで出す）。
+     * 書くのは中のロックの中だけで、[stranded] への出し入れと一緒に変える（[episodeStart]・[lastReportTick] を書き終える前に
+     * [tick] が立ったのを見て、古い始まりの要約を出さないため）。[tick] はロックを取らずに読んで、立っているときだけロックを取る
      */
-    private val episode = AtomicBoolean()
+    @Volatile
+    private var episode = false
 
-    /** 今の取り残しが始まってからの失敗の数（復旧で数え直す） */
-    private val episodeFailures = AtomicLong()
+    /** 今の取り残しが始まってからの失敗の数（復旧で数え直す。中のロックの中で読み書きする） */
+    private var episodeFailures = 0L
 
     /** 最後に [tick] が見た tick の番号（取り残しが始まった時を、前の要約の時にするため） */
     @Volatile
     private var lastTick = 0L
 
-    /** 取り残しが続いている間の、前の要約（または始まり）の tick */
-    private val lastReportTick = AtomicLong()
+    /** 取り残しが続いている間の、前の要約（または始まり）の tick（中のロックの中で読み書きする） */
+    private var lastReportTick = 0L
 
-    /** 今の取り残しが始まった tick */
-    @Volatile
+    /** 今の取り残しが始まった tick（中のロックの中で読み書きする） */
     private var episodeStart = 0L
 
     /** 許可を渡し終えた後に、ワーカーへ渡せなかった回数（数え口。#870。渡し直しの失敗も数える） */
@@ -215,8 +219,9 @@ internal class PermitPool(
      * @param inline 次がスレッドを持たない仕事なら、今のワーカーの続きにする（ワーカーの中で、step の終わりにだけ使う）
      */
     fun release(inline: Boolean = false) {
-        val dispatch = lock.withLockValue { handOffLocked(inline) }
-        if (dispatch == null || dispatchGranted(dispatch)) retryStranded()
+        val dispatch = lock.withLockValue { handOffLocked(inline) } ?: return
+        // ワーカーに渡せたときだけ、取り残しを渡し直す（空きに戻しただけ・続きにしただけのときは、tick を待つ）
+        if (dispatchGranted(dispatch)) retryStranded()
     }
 
     /**
@@ -226,14 +231,15 @@ internal class PermitPool(
     fun tick(now: Long) {
         lastTick = now
         retryStranded()
-        if (!episode.get()) return
-        val last = lastReportTick.get()
-        if (now - last < summaryIntervalTicks || !lastReportTick.compareAndSet(last, now)) return
-        logSafely(System.Logger.Level.WARNING, null) {
+        if (!episode) return
+        val summary = lock.withLockValue {
+            if (!episode || now - lastReportTick < summaryIntervalTicks) return
+            lastReportTick = now
             "許可を渡した仕事のワーカーへの引き渡しが、取り残しの始まりから ${now - episodeStart} tick 経っても戻らない" +
-                "（取り残し $strandedSize 件、この間の失敗 ${episodeFailures.get()} 回、累計 ${handOffFailures.get()} 回）。" +
+                "（取り残し ${stranded.size} 件、この間の失敗 $episodeFailures 回、累計 ${handOffFailures.get()} 回）。" +
                 "スレッドを作れない状態が続いているとみられる。毎 tick 渡し直している"
         }
+        logSafely(System.Logger.Level.WARNING, null) { summary }
     }
 
     /**
@@ -259,11 +265,12 @@ internal class PermitPool(
                     workers.execute(task)
                     delivered = true
                 } catch (t: Throwable) {
-                    lock.withLockValue {
+                    val started = lock.withLockValue {
                         stranded.addFirst(task)
                         strandedSize = stranded.size
+                        noteFailureLocked()
                     }
-                    noteFailure(t)
+                    if (started) logEpisodeStart(t)
                     return
                 }
             }
@@ -289,20 +296,30 @@ internal class PermitPool(
 
     /** 許可を持ったままワーカーに渡せなかった [task] を、取り残しの列の後ろに入れる。投げない */
     private fun strand(task: Runnable, failure: Throwable) {
-        lock.withLockValue {
+        val started = lock.withLockValue {
             stranded.addLast(task)
             strandedSize = stranded.size
+            noteFailureLocked()
         }
-        noteFailure(failure)
+        if (started) logEpisodeStart(failure)
     }
 
-    /** ワーカーへの引き渡しの失敗を数え、取り残しの始まりなら（最初の失敗か、復旧の後の再発）スタックトレース付きで WARNING に出す */
-    private fun noteFailure(failure: Throwable) {
+    /**
+     * ワーカーへの引き渡しの失敗を数える（中のロックの中で、取り残しの列に入れたのと一緒に呼ぶ）。
+     * 取り残しの始まり（最初の失敗か、復旧の後の再発）なら、始まりの tick を記録して `true`（呼び手がロックの外で [logEpisodeStart] を呼ぶ）
+     */
+    private fun noteFailureLocked(): Boolean {
         handOffFailures.incrementAndGet()
-        episodeFailures.incrementAndGet()
-        if (!episode.compareAndSet(false, true)) return
+        episodeFailures++
+        if (episode) return false
         episodeStart = lastTick
-        lastReportTick.set(lastTick)
+        lastReportTick = lastTick
+        episode = true
+        return true
+    }
+
+    /** 取り残しの始まりを、スタックトレース付きで WARNING に出す（中のロックの外で呼ぶ） */
+    private fun logEpisodeStart(failure: Throwable) {
         logSafely(System.Logger.Level.WARNING, failure) {
             "許可を渡した仕事をワーカーに渡せない（スレッドを作れないなど）。仕事は許可を持ったまま取り残し、毎 tick 渡し直す。" +
                 "続いている間は、この失敗を数えるだけにして、$summaryIntervalTicks tick ごとに要約を出す"
@@ -311,8 +328,11 @@ internal class PermitPool(
 
     /** 取り残しを全部渡し直せた。続いていたなら、復旧を INFO に出して、次の失敗をまた最初として扱う */
     private fun recovered() {
-        if (strandedSize != 0 || !episode.compareAndSet(true, false)) return
-        val failures = episodeFailures.getAndSet(0)
+        val failures = lock.withLockValue {
+            if (stranded.isNotEmpty() || !episode) return
+            episode = false
+            episodeFailures.also { episodeFailures = 0 }
+        }
         logSafely(System.Logger.Level.INFO, null) {
             "許可を渡した仕事のワーカーへの引き渡しが復旧した（取り残しを全部渡し直した。この間の失敗 $failures 回、累計 ${handOffFailures.get()} 回）"
         }
