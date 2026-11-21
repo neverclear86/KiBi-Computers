@@ -53,6 +53,9 @@ class FakeContext internal constructor(private val instance: FakeInstance) {
     /** 燃料切れの処理を、グローバルに触れずに直接呼ぶ（残り [remaining]）。戻り値は新しい残り */
     fun callFuelHandler(remaining: Long): Long = instance.callFuelHandler(remaining)
 
+    /** 止まりうる関数の中の燃料切れ（`kibi.async_fuel`）の口を呼ぶ（#828。巻き戻せないところでは、ふつうの燃料切れと同じく待つ） */
+    fun callUnwindableFuelHandler(remaining: Long): Long = instance.callUnwindableFuelHandler(remaining)
+
     /** このインスタンス */
     val self: WasmInstance get() = instance
 
@@ -213,6 +216,11 @@ internal class FakeInstance(override val module: FakeModule, private val config:
     fun callFuelHandler(remaining: Long): Long {
         val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
         return handler.onFuelExhausted(this, remaining)
+    }
+
+    fun callUnwindableFuelHandler(remaining: Long): Long {
+        val handler = config.fuelHandler ?: throw WasmTrapException(WasmTrapKind.FUEL_EXHAUSTED, "燃料が切れた")
+        return handler.onFuelExhaustedUnwindable(this, remaining)
     }
 
     fun callImport(moduleName: String, name: String, args: LongArray): LongArray {
