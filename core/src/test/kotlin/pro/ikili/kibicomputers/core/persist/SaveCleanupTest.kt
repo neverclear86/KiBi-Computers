@@ -345,4 +345,202 @@ class SaveCleanupTest {
         run(cleanup)
         assertFalse(Files.exists(machines.resolve(id.toString())))
     }
+
+    // ---- 安全側の経路（レビューの指摘） ----
+
+    @Test
+    fun `根の列挙が不完全なら、参照を読み切れないのでモジュールを1つも消さない`() {
+        val (unused) = oldModules("unused")
+        previousMachine(p)
+        val original = openRootEntries
+        try {
+            openRootEntries = { throw java.io.IOException("cannot open") }
+            val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+            assertFalse(store.scanComplete)
+            val report = run(cleanup(store, FileModuleStore(modulesRoot))).report
+            assertTrue(report.modulesAborted)
+            assertEquals(0, report.modulesDeleted)
+            assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+        } finally {
+            openRootEntries = original
+        }
+    }
+
+    @Test
+    fun `世代のディレクトリがディレクトリでなければ参照を読めなかったことにして、モジュールを消さない`() {
+        val (unused) = oldModules("unused")
+        // UUID の名前のファイル（ディレクトリかどうか判定できない・入れないものの代わり）
+        Files.createDirectories(machines)
+        Files.writeString(machines.resolve(UUID.randomUUID().toString()), "not a directory")
+        val report = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), FileModuleStore(modulesRoot))).report
+        assertTrue(report.modulesAborted)
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+    }
+
+    @Test
+    fun `結果が返らない仕事があれば、打ち切って終わる`() {
+        val id = previousMachine(p)
+        var time = now
+        val never = MachineReferenceProbe { _, _, _ -> }
+        val cleanup = SaveCleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), null, never, SaveCleanupSettings(stallMillis = 1000)) { time }
+        repeat(5) { cleanup.tick() }
+        assertFalse(cleanup.finished)
+        time += 500
+        cleanup.tick()
+        assertFalse(cleanup.finished)
+        time += 1000
+        cleanup.tick()
+        assertTrue(cleanup.finished)
+        assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        // 返らない結果は、止めた後も待ち続けない
+        assertTrue(cleanup.settling)
+        time += 2000
+        cleanup.tick()
+        assertFalse(cleanup.settling)
+    }
+
+    @Test
+    fun `止めると、列に残った調べは何もせず、削除を入れない`() {
+        val id = previousMachine(p)
+        val later = ArrayList<Consumer<MachineReference>>()
+        val cleanup = SaveCleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), null, { _, _, answer -> later += answer }) { now }
+        repeat(5) { cleanup.tick() }
+        assertEquals(1, later.size)
+        cleanup.cancel()
+        assertTrue(cleanup.finished)
+        assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
+        later.single().accept(MachineReference.ABSENT)
+        repeat(5) { cleanup.tick() }
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertEquals(0, cleanup.report.deleted)
+        assertFalse(cleanup.settling)
+
+        // 調べを入れた直後に止める: 調べの仕事は何もせずに戻る
+        val other = SaveCleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), null, probe) { now }
+        other.tick()
+        other.cancel()
+        repeat(20) { other.tick() }
+        assertTrue(asked.isEmpty())
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertFalse(other.settling)
+    }
+
+    @Test
+    fun `判定の後で削除の前にclaimが来たIDは消さない`() {
+        val id = previousMachine(p)
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+        val later = ArrayList<Consumer<MachineReference>>()
+        val cleanup = SaveCleanup(store, null, { _, _, answer -> later += answer }) { now }
+        repeat(5) { cleanup.tick() }
+        assertEquals(1, later.size)
+        // 位置の答えを待つ間に claim が来る（このサーバーで見た ID になる）
+        assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+        later.single().accept(MachineReference.ABSENT)
+        run(cleanup)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertEquals(0, cleanup.report.deleted)
+    }
+
+    @Test
+    fun `止めた後に返った消さなかった結果でも、消したことから外す`() {
+        val id = previousMachine(p)
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+        val judged = Files.getLastModifiedTime(machines.resolve(id.toString())).toMillis()
+        val answersLater = ArrayList<Consumer<MachineReference>>()
+        val cleanup = SaveCleanup(store, null, { _, _, answer -> answersLater += answer }) { now }
+        repeat(5) { cleanup.tick() }
+        answersLater.single().accept(MachineReference.ABSENT)
+        // 削除を入れたところまで進める（削除の仕事は、判定の後に更新されたファイルがあるので消さずに -1 を返す）
+        Files.setLastModifiedTime(store0Generation(id), FileTime.fromMillis(judged + 10_000))
+        var ticks = 0
+        while (cleanup.phase != SaveCleanup.Phase.DELETE && ++ticks < 100) cleanup.tick()
+        assertEquals(SaveCleanup.Phase.DELETE, cleanup.phase)
+        cleanup.cancel()
+        assertTrue(cleanup.finished)
+        ticks = 0
+        while (cleanup.settling && ++ticks < 10_000) {
+            cleanup.tick()
+            Thread.sleep(1)
+        }
+        assertFalse(cleanup.settling)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        // 「消した」から外れているので、claim はディスクの owner.bin を読む
+        assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+    }
+
+    @Test
+    fun `古い一時ファイルだけを消し、置き場を作った後のものは残す`() {
+        Files.createDirectories(modulesRoot)
+        val stale = modulesRoot.resolve("stale.tmp")
+        Files.writeString(stale, "x")
+        Files.setLastModifiedTime(stale, FileTime.fromMillis(old))
+        val modules = FileModuleStore(modulesRoot)
+        val fresh = modulesRoot.resolve("fresh.tmp")
+        Files.writeString(fresh, "y")
+        Files.setLastModifiedTime(fresh, FileTime.fromMillis(System.currentTimeMillis() + 60_000))
+        assertEquals(1, modules.deleteStaleTemps())
+        assertFalse(Files.exists(stale))
+        assertTrue(Files.exists(fresh))
+    }
+
+    @Test
+    fun `消す途中で失敗してもowner_binは残り、次の掃除が回収できる`() {
+        val id = previousMachine(p)
+        val dirOfId = machines.resolve(id.toString())
+        // 消せないファイル（読み取り専用。DOS 属性が使えない環境ではやらない）
+        val locked = dirOfId.resolve("0.bin")
+        Files.writeString(locked, "locked")
+        val view = Files.getFileAttributeView(locked, java.nio.file.attribute.DosFileAttributeView::class.java)
+        org.junit.jupiter.api.Assumptions.assumeTrue(view != null)
+        view.setReadOnly(true)
+        try {
+            val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+            age(id.toString())
+            var result = 0L
+            val judged = Files.getLastModifiedTime(dirOfId).toMillis()
+            assertTrue(store.deleteUnreferenced(id, judged) { result = it })
+            store.flush(5000)
+            org.junit.jupiter.api.Assumptions.assumeTrue(Files.exists(locked), "読み取り専用のファイルが消えるファイルシステム")
+            assertEquals(-1, result)
+            assertTrue(Files.exists(dirOfId.resolve(OwnerRecord.FILE_NAME)), "owner.bin は最後に消す")
+            // 次のセッション: owner.bin があるので、また掃除の候補として判定される
+            age(id.toString())
+            val next = MachineSaveStore(machines, MachineIdIndex(), "test")
+            val report = run(cleanup(next, dryRun = true)).report
+            assertEquals(1, report.unreferenced)
+        } finally {
+            view.setReadOnly(false)
+        }
+    }
+
+    @Test
+    fun `putと消す仕事を同時に走らせても、putしたモジュールのファイルは残る`() {
+        val hexes = oldModules("a", "b", "c", "d")
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+        try {
+            repeat(50) { round ->
+                // 毎回、新しい置き場（種になる）で、消す仕事と put を同時に走らせる
+                val i = round % hexes.size
+                val hex = hexes[i]
+                val content = "abcd"[i].toString()
+                if (!Files.exists(modulesRoot.resolve("$hex.wasm"))) {
+                    Files.write(modulesRoot.resolve("$hex.wasm"), content.toByteArray())
+                    Files.setLastModifiedTime(modulesRoot.resolve("$hex.wasm"), FileTime.fromMillis(old))
+                }
+                val fresh = FileModuleStore(modulesRoot)
+                val latch = java.util.concurrent.CountDownLatch(1)
+                val deleter = pool.submit<Long> { latch.await(); fresh.deleteIfUnused(hex) }
+                val putter = pool.submit<Boolean> { latch.await(); fresh.put(hashOf(hex), content.toByteArray()) }
+                latch.countDown()
+                deleter.get()
+                assertTrue(putter.get())
+                // put が来たら、消す仕事との順によらず、ファイルがあり contains が真
+                assertTrue(fresh.contains(hashOf(hex)), "round $round")
+                assertTrue(Files.exists(modulesRoot.resolve("$hex.wasm")), "round $round")
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
 }

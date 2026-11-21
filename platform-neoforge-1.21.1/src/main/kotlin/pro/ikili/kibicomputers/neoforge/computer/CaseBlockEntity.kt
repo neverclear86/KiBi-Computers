@@ -289,6 +289,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     val owner: MachineOwner?
         get() = level?.let { MachineOwner(it.dimension().location().toString(), blockPos.x, blockPos.y, blockPos.z) }
 
+    /** このケースが [id] のマシンを指しているか（確定した ID か、NBT から読んだ生の ID。掃除の問い用。#564） */
+    internal fun referencesMachine(id: UUID): Boolean = identity?.id == id || rawId == id.toString()
+
     override fun onLoad() {
         super.onLoad()
         val level = level as? ServerLevel ?: return

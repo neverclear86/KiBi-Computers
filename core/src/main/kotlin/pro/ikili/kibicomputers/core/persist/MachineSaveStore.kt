@@ -1051,7 +1051,13 @@ public class MachineSaveStore @JvmOverloads constructor(
         val dir = directoryOf(id)
         try {
             if (!Files.exists(dir)) return
-            Files.walk(dir).use { paths -> paths.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) } }
+            // owner.bin は最後（ディレクトリの前）に消す。途中で落ちた・1つが消せなかったときに「owner.bin なし・世代あり」の残骸
+            // （掃除が外からの書き換えとして残す形）を作らず、次の掃除が owner.bin から回収できる
+            val ownerFile = dir.resolve(OwnerRecord.FILE_NAME)
+            val paths = Files.walk(dir).use { walk -> walk.sorted(Comparator.reverseOrder()).toList() }
+            for (path in paths) if (path != dir && path != ownerFile) Files.deleteIfExists(path)
+            Files.deleteIfExists(ownerFile)
+            Files.deleteIfExists(dir)
         } catch (e: Exception) {
             LOG.log(System.Logger.Level.WARNING, "Failed to delete the directory of $id", e)
         }
@@ -1080,7 +1086,17 @@ public class MachineSaveStore @JvmOverloads constructor(
      */
     public fun inspectForCleanup(id: UUID, cancelled: () -> Boolean, sink: (CleanupInspection) -> Unit) {
         enqueue(id, 0, {
-            sink(if (cancelled()) CleanupInspection.skipped(id) else inspectDirectory(id))
+            sink(
+                when {
+                    cancelled() -> CleanupInspection.skipped(id)
+                    else -> try {
+                        inspectDirectory(id)
+                    } catch (e: RuntimeException) {
+                        // 結果が返らないと掃除が終わらない（SaveCleanup.inFlight が戻らない）ので、調べられなかったことにする
+                        CleanupInspection(id, exists = true, error = "$e")
+                    }
+                },
+            )
             null
         }, {
             sink(CleanupInspection.skipped(id))
@@ -1102,24 +1118,35 @@ public class MachineSaveStore @JvmOverloads constructor(
         deletedIds += id
         touch(id)
         enqueue(id, 0, {
-            val now = inspectDirectory(id)
-            when {
-                !now.exists -> sink(0)
-                now.error != null || now.newestMillis > judgedNewestMillis -> {
-                    LOG.log(System.Logger.Level.INFO, "Keeping the directory of $id: it changed after the cleanup judged it (${now.error ?: "newer files"})")
-                    sink(-1)
-                }
-                else -> {
-                    deleteDirectory(id)
-                    sink(if (Files.exists(directoryOf(id))) -1 else now.bytes)
-                }
+            val bytes = try {
+                deleteIfUnchanged(id, judgedNewestMillis)
+            } catch (e: RuntimeException) {
+                LOG.log(System.Logger.Level.WARNING, "Failed to delete the unreferenced directory of $id", e)
+                -1L
             }
+            sink(bytes)
             null
         }, {
             sink(-1)
             null
         })
         return true
+    }
+
+    /** 書き込みのスレッドで、判定の後に変わっていなければ [id] のディレクトリを消す。消したバイト数（もうなかったら 0、消さなかったら -1） */
+    private fun deleteIfUnchanged(id: UUID, judgedNewestMillis: Long): Long {
+        val now = inspectDirectory(id)
+        return when {
+            !now.exists -> 0
+            now.error != null || now.newestMillis > judgedNewestMillis -> {
+                LOG.log(System.Logger.Level.INFO, "Keeping the directory of $id: it changed after the cleanup judged it (${now.error ?: "newer files"})")
+                -1
+            }
+            else -> {
+                deleteDirectory(id)
+                if (Files.exists(directoryOf(id))) -1 else now.bytes
+            }
+        }
     }
 
     /**
@@ -1153,7 +1180,13 @@ public class MachineSaveStore @JvmOverloads constructor(
             return
         }
         enqueue(id, 0, {
-            sink(if (cancelled()) null else readReferencesIn(root.resolve(name)))
+            val hashes = try {
+                if (cancelled()) null else readReferencesIn(root.resolve(name))
+            } catch (e: RuntimeException) {
+                LOG.log(System.Logger.Level.WARNING, "Cannot read the module references in $name; keeping all modules this time: $e")
+                null
+            }
+            sink(hashes)
             null
         }, {
             sink(null)
@@ -1216,11 +1249,20 @@ public class MachineSaveStore @JvmOverloads constructor(
         val result = HashSet<String>()
         val files = ArrayList<Path>()
         try {
-            if (!Files.isDirectory(dir)) return result
+            // 「確かにない」ときだけ参照なし。ディレクトリでない・判定できない（権限・I/O エラー）ときは、読めなかったことにする
+            if (Files.notExists(dir)) return result
+            if (!Files.isDirectory(dir)) {
+                LOG.log(System.Logger.Level.WARNING, "Cannot list the generations in $dir for the module cleanup: it is not a readable directory")
+                return null
+            }
             Files.newDirectoryStream(dir).use { entries ->
                 for (entry in entries) if (parseGeneration(entry.fileName.toString()) != null) files.add(entry)
             }
         } catch (e: IOException) {
+            LOG.log(System.Logger.Level.WARNING, "Cannot list the generations in $dir for the module cleanup: $e")
+            return null
+        } catch (e: RuntimeException) {
+            // DirectoryIteratorException（反復中の IOException）・SecurityException など
             LOG.log(System.Logger.Level.WARNING, "Cannot list the generations in $dir for the module cleanup: $e")
             return null
         }

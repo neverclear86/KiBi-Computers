@@ -20,7 +20,8 @@ public enum class MachineReference {
 
 /**
  * ディレクトリの掃除（#564、ADR 0564）が、`owner.bin` の位置のチャンクにその ID のケースがあるかを接続層に問う口。
- * 接続層は、読み込まれていないチャンクならディスクの NBT（書き込み待ちを含む）を、読み込まれているなら [MachineReference.UNKNOWN] を答える。
+ * 接続層は、読み込まれていないチャンクならディスクの NBT（書き込み待ちを含む）を、FULL まで読み込まれているチャンクならメモリのブロックエンティティを見て答える
+ * （FULL でない段階・アンロード待ちは [MachineReference.UNKNOWN]）。
  */
 @ApiStatus.Internal
 public fun interface MachineReferenceProbe {
@@ -67,6 +68,7 @@ public class CleanupInspection(
  * @property maxProbesInFlight 答えを待つ [MachineReferenceProbe] の問いの数の上限（チャンクの読みでプレイヤーの読み込みを詰まらせない）
  * @property safetyMinimum 安全の上限: 消す候補がこれ以上で、かつ調べたディレクトリの [safetyRatio] 以上なら、1つも消さない
  * @property safetyRatio 安全の上限の割合
+ * @property stallMillis 列に入れた仕事・問いの結果が1つも返らないまま、これだけ経ったら、掃除を打ち切る（結果が返らない仕事で、掃除が終わらなくならないように）
  */
 @ApiStatus.Internal
 public data class SaveCleanupSettings @JvmOverloads constructor(
@@ -75,6 +77,7 @@ public data class SaveCleanupSettings @JvmOverloads constructor(
     public val maxProbesInFlight: Int = 8,
     public val safetyMinimum: Int = 32,
     public val safetyRatio: Double = 0.5,
+    public val stallMillis: Long = DEFAULT_STALL_MILLIS,
 ) {
     init {
         require(graceMillis >= 0) { "graceMillis must be >= 0: $graceMillis" }
@@ -82,11 +85,15 @@ public data class SaveCleanupSettings @JvmOverloads constructor(
         require(maxProbesInFlight >= 1) { "maxProbesInFlight must be >= 1: $maxProbesInFlight" }
         require(safetyMinimum >= 1) { "safetyMinimum must be >= 1: $safetyMinimum" }
         require(safetyRatio > 0 && safetyRatio <= 1) { "safetyRatio must be in (0, 1]: $safetyRatio" }
+        require(stallMillis >= 1) { "stallMillis must be >= 1: $stallMillis" }
     }
 
     public companion object {
         /** 猶予の仮の値（7 日） */
         public const val DEFAULT_GRACE_MILLIS: Long = 7L * 24 * 60 * 60 * 1000
+
+        /** 打ち切りまでの時間の仮の値（5 分） */
+        public const val DEFAULT_STALL_MILLIS: Long = 5L * 60 * 1000
 
         @JvmField
         public val DEFAULT: SaveCleanupSettings = SaveCleanupSettings()
@@ -185,7 +192,7 @@ public class SaveCleanupReport {
  * 3. 消す: 安全の上限（[SaveCleanupSettings.safetyMinimum]・[SaveCleanupSettings.safetyRatio]）に当たれば、[force] でない限り1つも消さない。
  *    消す直前にメインスレッドで「見た ID」を見直し、[MachineSaveStore.deleteUnreferenced] で列に入れる（仕事の中で更新時刻を調べ直す）
  * 4. モジュールの参照を読む: 置き場があれば、残ったディレクトリ（[MachineSaveStore.referenceDirectories]）の世代のファイルの参照を列で読む。
- *    読めないファイルが1つでもあれば、その回はモジュールを消さない
+ *    読めないファイルが1つでもあれば（根の列挙が不完全なときも）、その回はモジュールを消さない
  * 5. モジュールを消す: 作ったときにあったファイルのうち、参照されておらず、このセッションで使っていないものを列の仕事で消す
  *    （[FileModuleStore.deleteIfUnused]）。置き場の古い一時ファイルも消す
  *
@@ -232,6 +239,12 @@ public class SaveCleanup @JvmOverloads constructor(
     private val events = ConcurrentLinkedQueue<Event>()
     private var inFlight = 0
 
+    /** 結果が最後に返った（または、何も待っていない状態から仕事を入れた）時刻（打ち切りの判定。[SaveCleanupSettings.stallMillis]） */
+    private var lastProgress = 0L
+
+    /** [cancel] した時刻 */
+    private var cancelledAt = 0L
+
     private val candidates: List<UUID> = store.cleanupCandidates()
     private var next = 0
     private var now = 0L
@@ -265,19 +278,39 @@ public class SaveCleanup @JvmOverloads constructor(
         report.candidates = candidates.size
     }
 
-    /** 止める（列に入れた調べ・読みの仕事は何もせずに戻る。入れた削除の仕事は走る）。メインスレッドだけが呼ぶ */
+    /**
+     * 止める（列に入れた調べ・読みの仕事は何もせずに戻る。入れた削除の仕事は走る）。メインスレッドだけが呼ぶ。
+     * 止めた後も、入れた削除の仕事の結果を受け取るために、[settling] の間は [tick] を呼ぶ
+     */
     public fun cancel() {
         if (finished) return
         cancelled = true
         phase = Phase.CANCELLED
+        cancelledAt = clock()
         finish()
     }
 
+    /** 止めた後で、列に入れた仕事・問いの結果がまだ返っていない（結果を受け取るために [tick] を呼び続ける） */
+    public val settling: Boolean get() = phase == Phase.CANCELLED && inFlight > 0
+
     /** 1 tick 分すすめる（メインスレッド）。結果を受け取り、列・問いの余地の分だけ次を入れる */
     public fun tick() {
+        if (phase == Phase.CANCELLED) {
+            settle()
+            return
+        }
         if (finished) return
-        while (true) handle(events.poll() ?: break)
+        while (true) {
+            val event = events.poll() ?: break
+            lastProgress = clock()
+            handle(event)
+        }
         if (finished) return
+        if (inFlight > 0 && clock() - lastProgress > settings.stallMillis) {
+            LOG.log(System.Logger.Level.WARNING, "The computer save cleanup got no result for ${settings.stallMillis} ms ($inFlight pending); cancelling it ($phase)")
+            cancel()
+            return
+        }
         when (phase) {
             Phase.INSPECT -> tickInspect()
             Phase.PROBE -> tickProbe()
@@ -286,6 +319,29 @@ public class SaveCleanup @JvmOverloads constructor(
             Phase.MODULE_DELETE -> tickModuleDelete()
             Phase.DONE, Phase.CANCELLED -> Unit
         }
+    }
+
+    /**
+     * 止めた後に返った結果を受け取る。消さなかった削除（-1）は「このサーバーで消した」から外す（外さないと、ディレクトリが残ったまま、
+     * claim が読まずに `owner.bin` なしとして扱う）。ほかの結果は捨てる。上限の間に返らなかった仕事は諦める
+     */
+    private fun settle() {
+        while (true) {
+            val event = events.poll() ?: break
+            inFlight--
+            lastProgress = clock()
+            if (event is Event.Deleted && event.bytes < 0) store.cleanupDeletionSkipped(event.id)
+        }
+        if (inFlight > 0 && clock() - maxOf(lastProgress, cancelledAt) > settings.stallMillis) {
+            LOG.log(System.Logger.Level.WARNING, "Giving up waiting for $inFlight results of the cancelled computer save cleanup")
+            inFlight = 0
+        }
+    }
+
+    /** 結果を待つ仕事・問いを1つ増やす（何も待っていなかったなら、そこから打ち切りの時間を数える） */
+    private fun submitted() {
+        if (inFlight == 0) lastProgress = clock()
+        inFlight++
     }
 
     private fun handle(event: Event) {
@@ -326,7 +382,7 @@ public class SaveCleanup @JvmOverloads constructor(
                 report.seen++
                 continue
             }
-            inFlight++
+            submitted()
             store.inspectForCleanup(id, isCancelled) { events += Event.Inspected(it) }
         }
         if (next >= candidates.size && inFlight == 0) {
@@ -376,7 +432,7 @@ public class SaveCleanup @JvmOverloads constructor(
                 report.seen++
                 continue
             }
-            inFlight++
+            submitted()
             val answered = java.util.concurrent.atomic.AtomicBoolean()
             try {
                 probe.probe(inspection.id, inspection.owner!!.owner) { answer ->
@@ -413,7 +469,7 @@ public class SaveCleanup @JvmOverloads constructor(
     private fun tickDelete() {
         while (inFlight < settings.maxQueuedTasks && next < deleteQueue.size) {
             val (id, newest) = deleteQueue[next++]
-            inFlight++
+            submitted()
             val queued = store.deleteUnreferenced(id, newest) { bytes -> events += Event.Deleted(id, bytes) }
             if (!queued) {
                 inFlight--
@@ -433,6 +489,14 @@ public class SaveCleanup @JvmOverloads constructor(
             return
         }
         phase = Phase.MODULE_REFS
+        if (!store.scanComplete) {
+            // 根の一覧が不完全（読めた分だけで始めた）。漏れたディレクトリの世代が参照するモジュールを「参照なし」にしてしまうので、消さない
+            LOG.log(System.Logger.Level.WARNING, "The machine directories could not be listed completely; the module cleanup keeps all modules")
+            report.modulesAborted = true
+            referenceDirs = emptyList()
+            tickModuleRefs()
+            return
+        }
         referenceDirs = store.referenceDirectories()
         tickModuleRefs()
     }
@@ -440,7 +504,7 @@ public class SaveCleanup @JvmOverloads constructor(
     private fun tickModuleRefs() {
         while (!report.modulesAborted && inFlight < settings.maxQueuedTasks && next < referenceDirs.size) {
             val name = referenceDirs[next++]
-            inFlight++
+            submitted()
             store.readModuleReferences(name, isCancelled) { events += Event.References(it) }
         }
         if ((report.modulesAborted || next >= referenceDirs.size) && inFlight == 0) startModuleDelete()
@@ -453,7 +517,7 @@ public class SaveCleanup @JvmOverloads constructor(
         next = 0
         phase = Phase.MODULE_DELETE
         if (report.modulesAborted) {
-            LOG.log(System.Logger.Level.INFO, "Skipping the module cleanup: some generations could not be read")
+            LOG.log(System.Logger.Level.INFO, "Skipping the module cleanup: some generations could not be read or listed")
             moduleQueue = emptyList()
             done()
             return
@@ -473,8 +537,8 @@ public class SaveCleanup @JvmOverloads constructor(
         }
         moduleQueue = if (dryRun) emptyList() else queue
         if (!dryRun) {
-            inFlight++
-            if (!store.runOnWriter { events += Event.TempsDeleted(if (cancelled) 0 else m.deleteStaleTemps()) }) inFlight--
+            submitted()
+            if (!store.runOnWriter { events += Event.TempsDeleted(guarded(0) { if (cancelled) 0 else m.deleteStaleTemps() }) }) inFlight--
         }
         tickModuleDelete()
     }
@@ -483,10 +547,18 @@ public class SaveCleanup @JvmOverloads constructor(
         val m = modules ?: return done()
         while (inFlight < settings.maxQueuedTasks && next < moduleQueue.size) {
             val hex = moduleQueue[next++]
-            inFlight++
-            if (!store.runOnWriter { events += Event.ModuleDeleted(if (cancelled) -1 else m.deleteIfUnused(hex)) }) inFlight--
+            submitted()
+            if (!store.runOnWriter { events += Event.ModuleDeleted(guarded(-1) { if (cancelled) -1 else m.deleteIfUnused(hex) }) }) inFlight--
         }
         if (next >= moduleQueue.size && inFlight == 0) done()
+    }
+
+    /** 書き込みのスレッドの仕事 [block] が例外で抜けても、結果（[fallback]）を返す（結果が返らないと掃除が終わらない） */
+    private fun <T> guarded(fallback: T, block: () -> T): T = try {
+        block()
+    } catch (e: RuntimeException) {
+        LOG.log(System.Logger.Level.WARNING, "A computer save cleanup task failed", e)
+        fallback
     }
 
     private fun done() {

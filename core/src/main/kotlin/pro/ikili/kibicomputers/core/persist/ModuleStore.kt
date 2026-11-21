@@ -244,6 +244,9 @@ public class FileModuleStore(private val root: Path) : ModuleStore {
             }
         } catch (e: IOException) {
             LOG.log(System.Logger.Level.WARNING, "置き場 $root の一時ファイルを読めない: $e")
+        } catch (e: RuntimeException) {
+            // DirectoryIteratorException（反復中の IOException）・SecurityException など。結果が返らないと掃除が終わらない
+            LOG.log(System.Logger.Level.WARNING, "置き場 $root の一時ファイルを読めない: $e")
         }
         return count
     }

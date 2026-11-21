@@ -11,6 +11,8 @@ import net.minecraft.resources.ResourceLocation
 import net.minecraft.server.MinecraftServer
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
+import net.minecraft.server.level.FullChunkStatus
+import net.minecraft.world.level.chunk.LevelChunk
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.server.ServerStartedEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
@@ -57,19 +59,34 @@ internal object SaveCleanups {
             server = event.server
             running = null
             last = null
+            autoOverride = null
             ticksUntilAuto = if (event.server is GameTestServer) -1 else START_DELAY_TICKS
         }
         NeoForge.EVENT_BUS.addListener<ServerTickEvent.Post> { tick() }
-        NeoForge.EVENT_BUS.addListener<ServerStoppingEvent> {
-            ticksUntilAuto = -1
-            running?.cancel()
-            running = null
-        }
+        NeoForge.EVENT_BUS.addListener<ServerStoppingEvent> { stop() }
         NeoForge.EVENT_BUS.addListener<ServerStoppedEvent> {
             server = null
             last = null
         }
     }
+
+    /** 停止（[ServerStoppingEvent]）: 自動の掃除を取り消し、走っている掃除を止める（テストもここを通す） */
+    internal fun stop() {
+        ticksUntilAuto = -1
+        running?.cancel()
+        running = null
+    }
+
+    /**
+     * 自動の掃除を [ticks] tick 後に始めるようにする（テスト用。本番は [ServerStartedEvent] が [START_DELAY_TICKS] で仕掛ける）。
+     * 始めるときの置き場・モジュールの置き場は [store]・[modules]
+     */
+    internal fun armAuto(ticks: Int, store: MachineSaveStore, modules: FileModuleStore?) {
+        autoOverride = store to modules
+        ticksUntilAuto = ticks
+    }
+
+    private var autoOverride: Pair<MachineSaveStore, FileModuleStore?>? = null
 
     /**
      * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules] はテストが差し替える（既定は今のサーバーのもの）
@@ -82,7 +99,8 @@ internal object SaveCleanups {
         settings: SaveCleanupSettings = SaveCleanupSettings.DEFAULT,
     ): SaveCleanup? {
         val s = server ?: return null
-        if (running?.finished == false || store == null) return null
+        // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
+        if (running?.let { !it.finished || it.settling } == true || store == null) return null
         val cleanup = SaveCleanup(store, modules, ChunkReferenceProbe(s), settings, dryRun, force)
         running = cleanup
         last = cleanup
@@ -90,10 +108,18 @@ internal object SaveCleanups {
         return cleanup
     }
 
-    private fun tick() {
+    /** サーバーの tick ごとに呼ぶ（[ServerTickEvent.Post]。テストも呼べる） */
+    internal fun tick() {
         if (ticksUntilAuto > 0 && --ticksUntilAuto == 0) {
             ticksUntilAuto = -1
-            if (start(dryRun = false, force = false) == null) LOGGER.debug("Skipping the automatic computer save cleanup")
+            val override = autoOverride
+            autoOverride = null
+            val started = if (override != null) {
+                start(dryRun = false, force = false, store = override.first, modules = override.second)
+            } else {
+                start(dryRun = false, force = false)
+            }
+            if (started == null) LOGGER.debug("Skipping the automatic computer save cleanup")
         }
         val cleanup = running ?: return
         try {
@@ -102,7 +128,8 @@ internal object SaveCleanups {
             LOGGER.error("The computer save cleanup failed", e)
             cleanup.cancel()
         }
-        if (cleanup.finished) running = null
+        // 止めた掃除は、入れた削除の結果を受け取り終えるまで tick を続ける
+        if (cleanup.finished && !cleanup.settling) running = null
     }
 }
 
@@ -128,8 +155,11 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
         }
         val pos = BlockPos(owner.x, owner.y, owner.z)
         val chunk = ChunkPos(pos)
-        if (ServerMachines.findHolder(level, chunk.toLong()) != null) {
-            answer.accept(MachineReference.UNKNOWN)
+        val holder = ServerMachines.findHolder(level, chunk.toLong())
+        if (holder != null) {
+            // 読み込まれている: メモリのブロックエンティティが正しい（ディスクの NBT は古いかもしれない）。FULL でない段階・アンロード待ちは判定しない
+            val loaded = (holder.latestChunk as? LevelChunk)?.takeIf { holder.fullStatus.isOrAfter(FullChunkStatus.FULL) }
+            answer.accept(if (loaded == null) MachineReference.UNKNOWN else referenceInMemory(loaded, id, pos))
             return
         }
         level.chunkSource.chunkMap.read(chunk).whenComplete { data, error ->
@@ -144,6 +174,15 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
     }
 
     companion object {
+        /**
+         * 読み込まれた（FULL の）チャンク [chunk] の [pos] に、[id] のケースがあるか（メインスレッドで呼ぶ）。
+         * まだブロックエンティティにならずに保留されている NBT は、バニラと同じく引いた時点で取り込まれる（取り込まれたケースは claim して「見た ID」になる）
+         */
+        fun referenceInMemory(chunk: LevelChunk, id: UUID, pos: BlockPos): MachineReference {
+            val be = chunk.getBlockEntity(pos, LevelChunk.EntityCreationType.CHECK)
+            return if (be is CaseBlockEntity && be.referencesMachine(id)) MachineReference.PRESENT else MachineReference.ABSENT
+        }
+
         /** チャンクの NBT [data] の `block_entities` に、[pos] のケースのタグがあり ID が [id] か（どのスレッドから呼んでもよい） */
         fun referenceIn(data: CompoundTag, id: UUID, pos: BlockPos): MachineReference {
             val caseId = BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get())?.toString() ?: return MachineReference.UNKNOWN
