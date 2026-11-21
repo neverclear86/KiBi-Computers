@@ -38,7 +38,8 @@ const OVERLOAD_GAMETEST_SECONDS = 600
 function gradleRules(number, stage) {
   const logs = `.worktrees/.logs/issue-${number}`
   return `Gradle（\`./gradlew\`）の動かし方（#855。必ず守る）:
-- \`./gradlew\` は Bash の \`run_in_background\` で起動する。出力はリポジトリのルートの \`${logs}/\`（worktree の外）に \`${stage}-<内容>-<連番>.log\` として書き、終わったら終了コードを同じ名前の \`.exit\` に書く。例: \`mkdir -p <ルート>/${logs} && cd <worktree> && (./gradlew build --console=plain > <ルート>/${logs}/${stage}-build-1.log 2>&1; echo $? > <ルート>/${logs}/${stage}-build-1.exit)\`
+- \`./gradlew\` は Bash の \`run_in_background\` で起動する。出力はリポジトリのルートの \`${logs}/\`（worktree の外）に \`${stage}-<内容>-<連番>.log\` として書き、終わったら終了コードを同じ名前の \`.exit\` に書く。
+- **ログの名前は、毎回まだ使っていないものにする（例の \`-1\` をそのまま使わない）。** 同じ Issue の中では段階の名前が重なる（CI の直しや衝突の取り込みは呼ばれるたびに同じ名前で、確かめのあとの再実装や resume でも同じ段階をもう一度通る）。前の回の \`.exit\` が残っている名前を使うと、「\`.exit\` ができるまで待つ」が動いている最中にすぐ満たされ、古い終了コードを読んでしまう。起動の前に前景で、\`.log\`・\`.exit\` のどちらもない連番を選ぶ: \`d=<ルート>/${logs}; mkdir -p $d; n=1; while [ -e $d/${stage}-build-$n.log ] || [ -e $d/${stage}-build-$n.exit ]; do n=$((n+1)); done; echo $d/${stage}-build-$n\`。出た名前で起動する: \`cd <worktree> && (./gradlew build --console=plain > <名前>.log 2>&1; echo $? > <名前>.exit)\`
 - \`.exit\` ができるまで、Monitor などで待つ（前景の \`sleep\` は使えない）。**Gradle が終わって終了コードを読むまで、この段階を終えて返さない。** バックグラウンドで動かしたまま返さない。
 - GameTest（\`runGameTestServer\`・\`runJarGameTestServer\`・\`runLoadTestServer\`）は、マシンの中で同時に 1 本だけ動く（Gradle がユーザーホームの \`kibicomputers/locks/gametest.lock\` を取る）。ほかが動いていれば「Waiting for the GameTest lock ... Held by: ...」を 30 秒ごとに出して待つので、止めずに待つ。待ちの時間は失敗ではない。
 - GameTest が落ちたら、\`<worktree>/platform-*/run/logs/latest.log\` を \`${logs}/${stage}-<内容>-<連番>-<バージョン>-latest.log\` に写す（worktree を片付けても調べられるように）。
@@ -244,6 +245,17 @@ const FIX_SCHEMA = {
     summary: { type: 'string' },
   },
   required: ['pushed', 'summary'],
+}
+
+// main の取り込み（CI の段階の衝突）の結果。取り込むものがなかった・字面で解けない・build が直せない、を分ける（#855）
+const MERGE_MAIN_SCHEMA = {
+  type: 'object',
+  properties: {
+    outcome: { type: 'string', enum: ['merged', 'up_to_date', 'conflict', 'build_failed'] },
+    pushed: { type: 'boolean' },
+    summary: { type: 'string' },
+  },
+  required: ['outcome', 'pushed', 'summary'],
 }
 
 const MERGE_SCHEMA = {
@@ -480,12 +492,14 @@ mergeable には、最後に取った \`mergeable\` の値を入れる。`,
 function mergeMain(info, impl, n) {
   return agent(
     `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）が main と衝突していて、CI が動かない。worktree で main を取り込む。
+返す outcome は次のどれか1つ（pushed は outcome=merged のときだけ true）。
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` する（rebase と force push はしない）。
-2. 衝突が字面の解消で済む（両方の変更を残せば済む、など）なら解いてコミットする。ロジックの判断が要るなら \`git merge --abort\` で戻し、push せず pushed=false で、summary に衝突したファイルと、判断が要る理由を書く。
-3. 取り込んだ結果で \`./gradlew build\` を通す（GameTest はマージの段階でもう一度回るので、ここでは回さない）。build が落ちたら、取り込みで壊れた分を直す。直せなければ push せず pushed=false で、summary に理由を書く。
-4. 通ったら push して pushed=true で返す。
+   - Already up to date（取り込むものがない。衝突の読み違いや、GitHub の \`mergeable\` が古い値だった、ほかの段階がもう取り込んでいた、など）なら、何もせず outcome=up_to_date・pushed=false で返す。ローカルにまだ push していないコミットがあれば push してから返す。
+2. 衝突が字面の解消で済む（両方の変更を残せば済む、など）なら解いてコミットする。ロジックの判断が要るなら \`git merge --abort\` で戻し、push せず outcome=conflict・pushed=false で、summary に衝突したファイルと、判断が要る理由を書く。
+3. 取り込んだ結果で \`./gradlew build\` を通す（GameTest はマージの段階でもう一度回るので、ここでは回さない）。build が落ちたら、取り込みで壊れた分を直す。直せなければ push せず outcome=build_failed・pushed=false で、summary に理由を書く。
+4. 通ったら push して outcome=merged・pushed=true で返す。
 ${gradleRules(info.number, `conflict${n}`)}`,
-    { label: `conflict:${impl.pr}#${n}`, phase: 'CI', schema: FIX_SCHEMA, ...M.fixFirst },
+    { label: `conflict:${impl.pr}#${n}`, phase: 'CI', schema: MERGE_MAIN_SCHEMA, ...M.fixFirst },
   )
 }
 
@@ -499,8 +513,15 @@ async function waitCiResolvingConflicts(info, impl, label, conflictState) {
     conflictState.count++
     log(`PR #${impl.pr}: main と衝突していて CI が動かない。main を取り込む（${conflictState.count}/${MAX_CONFLICT_MERGES}）`)
     const merged = await mergeMain(info, impl, conflictState.count)
-    if (!merged || !merged.pushed) {
-      return { ...ci, passed: false, failingChecks: ['main との衝突（字面で解けない）'], failureLog: merged?.summary ?? 'main の取り込みに失敗した' }
+    // 取り込むものがなかった（CONFLICTING の読み違いや、GitHub の mergeable が古い値だった）なら、衝突として止めずに待ち直す。
+    // 待ち直してもまだ CONFLICTING なら、上限に達したところで「まだ衝突している」として返る
+    if (merged && merged.outcome === 'up_to_date') {
+      log(`PR #${impl.pr}: main に取り込むものがなかった（衝突の読み違いか、mergeable が古い値）。待ち直す`)
+    } else if (!merged || !merged.pushed) {
+      const reason = merged?.outcome === 'build_failed'
+        ? 'main を取り込んだ後の build（直せなかった）'
+        : merged?.outcome === 'conflict' ? 'main との衝突（字面で解けない）' : 'main の取り込みに失敗した'
+      return { ...ci, passed: false, failingChecks: [reason], failureLog: merged?.summary ?? 'main の取り込みのエージェントが結果を返さなかった' }
     }
     ci = await waitCi(impl.pr, `${label}+m${conflictState.count}`)
   }
