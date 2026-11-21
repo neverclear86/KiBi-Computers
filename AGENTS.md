@@ -24,6 +24,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `dev-driver/` | 開発クライアントを外から操作する HTTP の口（MC 非依存の部分）。各接続層の `src/dev/` が MC 側の操作を実装する。開発環境でだけ読み込み、jar には入れない |
 | `build-logic/` | ビルド用の Gradle プラグイン（included build）。`kibicomputers.wasm` は C を `zig cc` で WASM にビルドし、ソースセットのリソースに入れる |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
+| `*/api/*.api` | 公開 API のダンプ（#845）。`core/api/core.api`、`platform-*/api/platform-*.api`。`updateKotlinAbi` で作り、手で直さない |
 | `gradle/zig.properties` | WASM のビルドに使う Zig のバージョンと、配布アーカイブの SHA-256 |
 | `gradle/moonbit.properties` | MoonBit（標準 OS の言語の PoC #32 で使う）の版と、配布アーカイブの SHA-256。MoonBit は CI か `-Pkibi.moonbit=true` のときだけビルドする |
 | `gradle/wasi-sdk.properties` | テストでネイティブの `wasm32-wasip2`・`wasm32-wasip3` のコンポーネントをビルドする wasi-sdk の版と、全 OS 分のアーカイブの SHA-256（#775）。取得したものは `~/.gradle/kibicomputers/wasi-sdk/` に置く |
@@ -43,6 +44,8 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | core の単体テストだけ | `./gradlew :core:test` |
 | ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
 | 製品の jar（Jar-in-Jar で同梱したもの）を読んで GameTest（#775） | `./gradlew :platform-neoforge-1.21.1:runJarGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runJarGameTestServer` |
+| 公開 API のダンプを今のコードに合わせて作り直す（#845） | `./gradlew updateKotlinAbi` |
+| 公開 API とダンプの食い違いの検査（`build` の `check` にも入っている） | `./gradlew checkKotlinAbi` |
 | ゲーム内の多数台の負荷試験（手順と結果は `docs/load-test.md`） | `./gradlew :platform-neoforge-1.21.1:runLoadTestServer -PloadTestCounts=1000` |
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
@@ -79,6 +82,10 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - デフォルト引数を持つ公開関数・コンストラクターには `@JvmOverloads`。
 - 公開 API に `suspend` 関数、value class、Kotlin の関数型（`(A) -> B`）を出さない。コールバックは `fun interface` にする。
 - 例外を投げる公開関数には `@Throws` を付ける。
+- **公開 API の一覧（ダンプ）を `<モジュール>/api/<プロジェクト名>.api` に置いている**（#845。Kotlin Gradle Plugin の ABI 検証）。対象は `core` の `pro.ikili.kibicomputers.api.**` と、接続層の `pro.ikili.kibicomputers.<ローダー>.api.**`。コードとダンプが食い違うと `build`（`check` → `checkKotlinAbi`）が落ちる。
+  - 公開 API を足す・変える・消すときは `./gradlew updateKotlinAbi` でダンプを作り直し、その差分を同じ PR でコミットする。差分が API の変更の一覧になるので、PR のレビューで見る。
+  - ダンプは手で直さない（タブで字下げした書式。いつも `updateKotlinAbi` で作る）。
+  - Kotlin を上げて、API を変えていないのにダンプの書式だけが変わったときも、`updateKotlinAbi` で作り直す。ABI 検証の DSL は実験的なので、Kotlin を上げたら build スクリプトの `abiValidation {}` が通るかも確かめる。
 - `api` の宣言を足したら、`core/src/test/java/` に Java から呼ぶテストを足す（コンパイルできることが検査になる）。内部の型には Java のテストを足さない。今ある内部の型の Java テスト（`*JavaTest.java`）は振る舞いの確認も兼ねるので残すが、内部の型を変えて合わなくなったら、Kotlin のテストに移すか消してよい。
 
 ## コードスタイル
@@ -139,7 +146,9 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 4. CI: 落ちたら最大2回直す。
 5. レビュー: 正しさ・ルール違反のレビューを1本（area が kernel・persistence・runtime・storage の Issue と、スレッド・並行処理に触れた PR は Fable、それ以外は Opus。公開 API の変更があれば Java 相互運用のレビューも）→ 別のエージェント（Opus）が指摘を検証 → 残った指摘を must・should を問わず直す。最大2ラウンド。
 6. マージ: 1件ずつ直列に、main を取り込んだ結果で `build` と GameTest を通してから squash マージする（`merge: false` で飛ばせる）。
-7. 報告: PR に結果をコメントし、worktree を片付ける。
+7. 報告: PR に結果をコメントする。マージ済みなら、その worktree の Gradle と GameTest のサーバーが終わってから worktree を片付ける（それ以外は resume のために残す）。
+
+Gradle を動かす段階は、`./gradlew` をバックグラウンドで動かし、ログと終了コード（`.exit`）を worktree の外の `.worktrees/.logs/issue-<番号>/` に残して、終わるまで待ってから返す（#855）。CI の段階では、PR が main と衝突している（GitHub が CI を動かさない）なら、先に main を取り込む。マージの段階で GameTest だけが落ち、過負荷の兆候（`Can't keep up!` が 300 tick 以上遅れた、または GameTest が 10 分以上かかった）があるときだけ、1 回だけ回し直す。それでも落ちたら、今までどおり止まる。
 
 人に質問して止まる前には、どの段階でも、別のモデル（Fable）が論点を確かめる。前提（何が問題で、なぜ止まったか）が正しいか、推奨が妥当か、そもそも人の判断が要るものかを、コード・ADR・仕様と突き合わせる。エージェントで直せるもの（プランの書き漏れなど）なら、その直し方でもう1回進める。人に聞くときは、確かめた結果を質問に添える。
 
@@ -164,4 +173,5 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - 1.20.1（Forge）は 1.21.1 と細部が違う: GameTest の構造物は `data/kibicomputers/structures/`（複数形）に置く。データを読ませるには `pack.mcmeta` が必要。`mods.toml` は `META-INF/mods.toml` で、依存の指定は `mandatory = true`。jar は `reobfJar` で SRG 名に変換される。
 - core のログ（`System.getLogger`、名前は `kibicomputers.*`）は、`CoreLogRouting`（JUL の `kibicomputers` ロガーに付けたハンドラー）から接続層の `CoreLogBridge` を通って SLF4J（`latest.log`・`debug.log`）に出る（#673）。JUL 側のレベルは log4j の設定（`kibicomputers` とその下の `LoggerConfig`）を写したもので、設定の読み直しに追従する。`kibicomputers` の JUL ロガーのレベル・ハンドラーをいじらない（`Configurator.setLevel` で変えたら `CoreLogBridge.refresh()` を呼ぶ）。GameTest でログを確かめるときは、log4j の root の設定にアペンダーを付けて名前で絞る（`Logger.addAppender` だと、その名前の行がファイルに出なくなる）。
 - GameTest の run のワールドは `run/gametest-world`（負荷試験は `run/loadtest-world`、jar の GameTest は `run/jar-gametest/world`）で、Gradle が起動の前に消す（#792。残すときは `-PkeepGameTestWorld=true`）。消せないときは前の GameTest サーバーのプロセスが残っている。`run/world` は `runServer` のもので、GameTest は使わない。IDE の起動設定から動かすと消されない。
+- **GameTest のサーバー（`runGameTestServer`・`runJarGameTestServer`・`runLoadTestServer`）は、マシンの中で同時に 1 本だけ動く**（#855。ルートに適用した build-logic の `kibicomputers.gametest-lock`）。同じ起動の中では両バージョンが直列になり、worktree・起動をまたぐ分は Gradle のユーザーホームの `kibicomputers/locks/gametest.lock`（OS のロック。プロセスが死ねば外れる）で待つ。待つ間は 30 秒ごとに `Waiting for the GameTest lock ... Held by: <タスク> in <worktree> (Gradle pid ..., since ...)` を出す。持ち主は同じ場所の `gametest.owner` で分かる。終わると `GameTest lock released by <タスク> after holding it for N s` を出す。待ちの上限は既定 90 分（`-PgameTestLockTimeoutMinutes=<分>`）、`-PgameTestLock=false` でロックを使わない。デーモンは worktree をまたいで共有しているので、片付けに `./gradlew --stop` を使わない。
 - GameTest はクラスに `@GameTestHolder(KiBiComputers.MOD_ID)` と `@PrefixGameTestTemplate(false)`、メソッドに `@JvmStatic` と `@GameTest(template = "empty")` を付ける。`empty` は `data/kibicomputers/structure/empty.nbt`（空の 3x3x3）。例: `platform-neoforge-1.21.1/src/main/kotlin/pro/ikili/kibicomputers/neoforge/gametest/SmokeGameTests.kt`。
