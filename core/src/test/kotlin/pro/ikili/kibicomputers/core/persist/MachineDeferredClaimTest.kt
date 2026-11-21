@@ -347,4 +347,53 @@ class MachineDeferredClaimTest {
         assertTrue(store.pollCompleted().isEmpty())
         assertEquals(at(2), store.ownerOf(id))
     }
+
+    @Test
+    fun `書き込みの列が空かないまま上限を過ぎた待ちは、読みを待たずに新しいIDになり、後から来た読みの結果は捨てる`() {
+        val id = UUID.randomUUID()
+        writeOwner(id, OwnerRecord(0, at(0)))
+        val manual = ManualSaveExecutor()
+        // 列はほかの台の仕事で詰まっている（読みの仕事を走らせない）
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test", manual, claimWaitMillis = 50)
+        val first = Key("first")
+        val second = Key("second")
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(0), first))
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(1), second))
+        assertEquals(1, store.writerOwnerReadRequests)
+        assertTrue(store.pollDeferredClaims().isEmpty(), "上限の前は待つ")
+        Thread.sleep(120)
+        val done = store.pollDeferredClaims()
+        assertEquals(listOf(first, second), done.map { it.key }, "来た順に、上限を過ぎた分を新しい ID にする")
+        for (d in done) {
+            assertEquals(ClaimResult.NEW_ID_UNREADABLE, d.claim.result)
+            assertNotEquals(id, d.claim.identity!!.id)
+        }
+        assertEquals(2, store.deferredClaimTimeouts)
+        assertEquals(0, store.waitingClaims)
+        assertNull(store.index.ownerOf(id), "元の ID は索引に入れない")
+        // 遅れて走った読みの結果は捨てる（待ちはもうない）
+        manual.runAll()
+        assertTrue(store.pollDeferredClaims().isEmpty())
+        assertNull(store.index.ownerOf(id))
+        assertEquals(0, store.mainOwnerReads)
+        assertEquals(OwnerRecord(0, at(0)), readOwner(id), "元の owner.bin は変えない")
+    }
+
+    @Test
+    fun `書き込みのスレッドの読みがErrorで落ちても、待ちは読めなかったとして次のpollで決まる`() {
+        val id = UUID.randomUUID()
+        writeOwner(id, OwnerRecord(0, at(0)))
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test", manual)
+        store.writerOwnerReader = { throw StackOverflowError("test") }
+        val key = Key("error")
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(0), key))
+        // SaveWriter と同じく、仕事の外に出た Error は列の側で捕まえる
+        assertThrows(StackOverflowError::class.java) { manual.runNext() }
+        val done = store.pollDeferredClaims()
+        assertEquals(key, done.single().key)
+        assertEquals(ClaimResult.NEW_ID_UNREADABLE, done.single().claim.result)
+        assertEquals(0, store.deferredClaimTimeouts, "上限を待たずに決まる")
+        assertEquals(0, store.waitingClaims)
+    }
 }

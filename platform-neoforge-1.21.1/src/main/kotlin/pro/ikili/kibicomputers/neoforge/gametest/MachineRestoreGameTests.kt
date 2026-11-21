@@ -274,6 +274,165 @@ object MachineRestoreGameTests {
     }
 
     /**
+     * 規則 7a の例外（#869、ADR 0084）: マシンのある台（ID を持たずに動いている台）が `/data merge` で読みの要る ID を得ると、
+     * 待たずに同期の claim で確定する（メインスレッドで `owner.bin` を 1 回読む）。待ちにならないので取り出しも効き、
+     * 動いている状態を失わない（その ID で書いた世代から、置き直した後に戻る）。数え口を比べるので、専用のバッチにする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "claim_sync_exception")
+    fun runningCaseClaimsAMergedIdSynchronously(helper: GameTestHelper) {
+        val be = placeComputer(helper)
+        val store = WorldMachineSaves.current!!
+        val merged = UUID.randomUUID()
+        var copy: CaseBlockEntity? = null
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(be.isLoadedOnServer, "onLoad should run")
+        }.thenExecute {
+            val machine = be.computer.machine
+            helper.assertTrue(machine != null, "the case should run: ${be.computer}")
+            helper.assertTrue(be.currentIdentity == null, "the running case should not have an id yet: ${be.currentIdentity}")
+            // 覚えていない ID（再起動の後と同じく、claim は owner.bin を読む）
+            store.forgetOwnerForTest(merged)
+            val reads = store.mainOwnerReads
+            val deferred = store.deferredClaims
+            val tag = be.saveWithoutMetadata(helper.level.registryAccess()).also { tag ->
+                tag.putString(CaseBlockEntity.MACHINE_ID_TAG, merged.toString())
+                tag.putLong(CaseBlockEntity.SAVE_GENERATION_TAG, 0)
+                tag.putLong(CaseBlockEntity.OWNER_EPOCH_TAG, 0)
+            }
+            be.loadWithComponents(tag, helper.level.registryAccess())
+            helper.assertTrue(!be.isClaimDeferred && store.deferredClaims == deferred, "a case with a machine should not wait")
+            helper.assertTrue(
+                be.lastClaim == ClaimResult.KEPT && be.identity?.id == merged,
+                "the merged id should be kept: ${be.lastClaim}, ${be.identity}",
+            )
+            helper.assertTrue(
+                store.mainOwnerReads == reads + 1,
+                "the synchronous claim reads owner.bin once: ${store.mainOwnerReads - reads}",
+            )
+            helper.assertTrue(be.computer.machine === machine, "the machine should keep running")
+        }.thenWaitUntil { assertPrompt(helper, be) }.thenExecute {
+            typeLine(helper, keyboardAt(helper), WRITE_MARKER)
+        }.thenWaitUntil { assertScreenShows(helper, be, MARKED) }.thenExecute {
+            val tag = saveAndTag(helper, be)
+            helper.assertTrue(
+                be.identity?.id == merged && be.identity!!.generation > 0,
+                "the state should be written under $merged: ${be.identity}",
+            )
+            copy = reload(helper, tag)
+        }.thenWaitUntil { assertRestored(helper, copy!!) }.thenExecute {
+            val c = copy!!
+            helper.assertTrue(c.lastRestoreSource?.id == merged, "the case should restore from $merged but was ${c.lastRestoreSource}")
+            typeLine(helper, keyboardAt(helper), "cat /tmp/m575")
+        }.thenWaitUntil { assertScreenShows(helper, copy!!, MARKER) }.thenExecute {
+            copy!!.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    private fun keyboardAt(helper: GameTestHelper): KeyboardBlockEntity = helper.getBlockEntity(KEYBOARD)
+
+    /**
+     * claim が読みを待つ間に、チャンクが FULL でなくなる（#869、ADR 0084・0085）: 待つ台は取り出さず、`chunkDemoted` が順番待ちの印を下ろす。
+     * FULL でないまま確定すると、順番待ちには入れない（`offerRestoreAfterClaim` の `hasChunkAt`）。FULL に戻ったときに
+     * `restorePromotedCase` が入れ、保存した世代から戻る（`/tmp` の印が残る）。待つ間のケースの NBT（チャンクの保存が書くもの）は
+     * 生の値（MachineId・SaveGeneration・OwnerEpoch）のままで、次の読み込みは同じ値で同じ判定をする。
+     * 書き込みのスレッドを tick をまたいで止める（読みを待たせる）ので、専用のバッチにする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "deferred_claim_demotion")
+    fun deferredClaimWhileTheChunkLeavesFull(helper: GameTestHelper) {
+        val far = FarComputer(helper)
+        val level = helper.level
+        val first = far.case
+        helper.assertTrue(first.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${first.computer}")
+        val store = WorldMachineSaves.current!!
+        var saved: MachineIdentity? = null
+        var copy: CaseBlockEntity? = null
+        var gate: WriterGate? = null
+        var reads = 0L
+
+        fun assertRawTag(be: CaseBlockEntity, what: String) {
+            val id = saved!!
+            val tag = be.saveWithoutMetadata(level.registryAccess())
+            helper.assertTrue(
+                tag.getString(CaseBlockEntity.MACHINE_ID_TAG) == id.id.toString() &&
+                    tag.getLong(CaseBlockEntity.SAVE_GENERATION_TAG) == id.generation &&
+                    tag.getLong(CaseBlockEntity.OWNER_EPOCH_TAG) == id.epoch &&
+                    tag.getBoolean(CaseBlockEntity.POWERED_ON_TAG),
+                "$what: the NBT should keep the raw values of $id but was $tag",
+            )
+        }
+
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            typeLine(helper, far.keyboard, WRITE_MARKER)
+        }.thenWaitUntil { assertScreenShows(helper, first, MARKED) }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            saved = first.identity
+            // 置き直して、覚えていない ID（再起動の後と同じ）の NBT を onLoad の前に読ませる。読みは書き込みのスレッドに回り、門の後ろで待つ
+            level.setBlock(far.pos, Blocks.AIR.defaultBlockState(), 3)
+            level.setBlock(far.pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+            val be = level.getBlockEntity(far.pos) as CaseBlockEntity
+            be.loadWithComponents(tag, level.registryAccess())
+            store.forgetOwnerForTest(saved!!.id)
+            gate = WriterGate()
+            reads = store.mainOwnerReads
+            copy = be
+        }.thenWaitUntil {
+            helper.assertTrue(copy!!.isLoadedOnServer, "onLoad should run")
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(be.isClaimDeferred, "the claim should wait for owner.bin")
+            helper.assertTrue(
+                be.computer.isRestorePending && !ServerMachines.isRestoreQueued(be),
+                "only the restore mark is set: ${be.computer}",
+            )
+            assertRawTag(be, "while waiting")
+            far.setFull(false)
+        }.thenWaitUntil {
+            helper.assertTrue(!level.isLoaded(far.pos), "the chunk should no longer be FULL")
+            // FULL でなくなったチャンクは tick の終わりに流す（saveForDemotion → chunkDemoted）
+            helper.assertTrue(!copy!!.computer.isRestorePending, "the demotion should drop the restore mark: ${copy!!.computer}")
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(!be.isRemoved && be.isClaimDeferred, "the case should still wait in memory")
+            helper.assertTrue(be.computer.machine == null && be.pendingSave == null, "a waiting case is not captured: ${be.computer}")
+            helper.assertTrue(
+                !be.computer.isRestorePending && !ServerMachines.isRestoreQueued(be),
+                "the demotion should drop the restore mark: ${be.computer}",
+            )
+            // 取り出さなかったので、チャンクの保存が書く NBT も生の値のまま（次の読み込みは同じ値で claim する）
+            assertRawTag(be, "after the demotion")
+            gate!!.close()
+            gate = null
+        }.thenWaitUntil {
+            helper.assertTrue(!copy!!.isClaimDeferred, "the waiting claim should be decided")
+        }.thenExecute {
+            val be = copy!!
+            val id = saved!!
+            helper.assertTrue(be.lastClaim == ClaimResult.KEPT && be.identity == id, "the case should keep $id: ${be.lastClaim}, ${be.identity}")
+            helper.assertTrue(
+                !ServerMachines.isRestoreQueued(be) && be.computer.machine == null,
+                "a case outside FULL chunks is not offered: ${be.computer}",
+            )
+            far.setFull(true)
+        }.thenWaitUntil { assertRestored(helper, copy!!) }.thenExecute {
+            val be = copy!!
+            val id = saved!!
+            val source = be.lastRestoreSource
+            helper.assertTrue(
+                source != null && source.id == id.id && source.generation == id.generation,
+                "the case should restore $id but was $source",
+            )
+            helper.assertTrue(store.mainOwnerReads == reads, "claim should not read owner.bin on the main thread")
+            typeLine(helper, far.keyboard, "cat /tmp/m575")
+        }.thenWaitUntil { assertScreenShows(helper, copy!!, MARKER) }.thenExecute {
+            copy!!.pressPowerButton()
+            far.remove()
+        }.thenSucceed()
+    }
+
+    /**
      * 戻すと、キーを打つ前にシェルがプロンプトと入力中の行を描き直す（`restored` イベント。#87、ADR 0087）。画面も置き直して
      * （ワールドを読み込み直したときと同じく、表示は空から始まる）、描き直しが前の画面の残りでないことを確かめる
      */

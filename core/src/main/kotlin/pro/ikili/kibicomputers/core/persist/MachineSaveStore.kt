@@ -47,7 +47,8 @@ internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirec
  * その場で列に入れ、`owner.bin` がなかった ID と新しく振った ID の `owner.bin` は、最初の世代の書き込みの前に書く（[submit]）。
  * claim がディスクを読むのは、覚えておらず、先読み（`prefetchOwners`）でも分からない ID だけ。サーバーのメインスレッドは
  * [claimOrDefer] を使い、その読みもしない（#869）: 読みを先読みのスレッドか書き込みのスレッドに回して claim を待ちにし、
- * 読み終わった後の tick に [pollDeferredClaims] で確定する。
+ * 読み終わった後の tick に [pollDeferredClaims] で確定する。例外は、マシンのある台（動いている・復元の途中）が `/data merge` で
+ * ID を得たときで、接続層は同期の [claim] を呼ぶ（待つと取り出しが飛ばされ状態を失うため。ADR 0084 の規則 7a）。
  *
  * スレッド: 列の仕事のほかは、メインスレッドだけで使う。[hasCapacity]・[pendingBytes]・[pendingCount] はどのスレッドから読んでもよい。
  *
@@ -56,7 +57,8 @@ internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirec
  * @property modVersion 保存データに書く MOD のバージョン（戻すときは保存データのものと比べる。#88）
  * @param executor 保存の仕事を走らせる口（既定は呼んだスレッドでその場で走らせる [SaveExecutor.DIRECT]）
  * @param maxPendingBytes 書き込み待ちの写しの見積もりの合計の上限（[hasCapacity]）
- * @param claimWaitMillis [claim] がその UUID の仕事を待つ上限（`owner.bin` を読む前だけ。過ぎたら新しい UUID にする）
+ * @param claimWaitMillis [claim] がその UUID の仕事を待つ上限（`owner.bin` を読む前だけ。過ぎたら新しい UUID にする）。
+ *   [claimOrDefer] が待ちにした claim の待ちの上限も兼ねる（#869。過ぎたら新しい UUID にする）
  * @param prefetchOwners 開いたときに、根にあった ID の `owner.bin` を別のスレッドで先読みするか（#585。サーバーの置き場は真。
  *   既定は偽で、テストは [startOwnerPrefetch] で走らせ方を決める）
  */
@@ -74,7 +76,7 @@ public class MachineSaveStore @JvmOverloads constructor(
     @Volatile
     public var maxPendingBytes: Long = maxPendingBytes
 
-    /** [claim] が `owner.bin` を読む前に、その UUID の仕事を待つ上限（ミリ秒） */
+    /** [claim] が `owner.bin` を読む前に、その UUID の仕事を待つ上限（ミリ秒）。待ちにした claim の待ちの上限も兼ねる（#869） */
     public var claimWaitMillis: Long = claimWaitMillis
 
     // ---- メインスレッドだけが触る ----
@@ -393,7 +395,10 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 先読みの値も使えないときだけ。そのときその UUID の仕事が列に残っていれば、終わるのを待ってから読む（上限 [claimWaitMillis]。
      * 過ぎたら新しい UUID）。
      *
-     * この口は、読みが要れば呼んだスレッドで読む（テスト・同期の置き場用）。サーバーのメインスレッドは [claimOrDefer] を使う（#869）
+     * この口は、読みが要れば呼んだスレッドで読む（テスト・スレッドのない置き場用）。サーバーのメインスレッドは [claimOrDefer] を使う（#869）。
+     * ただし、マシンのある台（動いている・復元の途中）が `/data merge` で ID を得たときは、サーバーのメインスレッドもこの口を使う
+     * （待つと、待つ間の取り出しが飛ばされて状態を失い、電源ボタンも効かなくなるため。読みの要る ID なら、メインスレッドで読み、
+     * その前に列の仕事を最大 [claimWaitMillis] 待つ。数え口は [mainOwnerReads]。ADR 0084 の規則 7a）
      */
     public fun claim(rawId: String?, rawGeneration: Long, rawEpoch: Long, self: MachineOwner): Claim {
         val start = System.nanoTime()
@@ -460,12 +465,18 @@ public class MachineSaveStore @JvmOverloads constructor(
     public var writerOwnerReadRequests: Long = 0
         private set
 
+    /** 待ちにした claim が [claimWaitMillis] を過ぎ、読みを待たずに新しい UUID にした回数（数え口。#869） */
+    public var deferredClaimTimeouts: Long = 0
+        private set
+
     /**
      * [claim] と同じ判定をするが、メインスレッドで `owner.bin` を読まない（#869。ADR 0084 の規則 7a）。メインスレッドだけが呼ぶ。
      *
      * メモリで決まる（値の検査・索引の重複・覚えている `owner.bin`・消した ID・根になかった ID・先読みの値がある）なら、その場で結果を返す。
      * 読みが要るときは `null` を返して待ちにし、読みを先読みのスレッド（まだ読んでいなければ順番より先に）か、書き込みのスレッド
-     * （その ID の仕事の後ろ。先読みで決まらない ID）に回す。結果は後の tick の [pollDeferredClaims] が [key] と一緒に返す。
+     * （列は全 ID で 1 本なので、そのとき列にあるすべての仕事の後ろ。先読みで決まらない ID）に回す。結果は後の tick の
+     * [pollDeferredClaims] が [key] と一緒に返す。待ちが [claimWaitMillis] を過ぎたら、読みを待たずに新しい UUID にする
+     * （`NEW_ID_UNREADABLE`、warn。同期の [claim] の待ちの上限と同じ）。
      * 同じ ID に待ちがあれば、後ろに並ぶ（確定は ID ごとに来た順）。同じ [key] の待ちがあれば、取り消してから出し直す。
      * 待っている間は索引に入れず、`owner.bin` も書かない。待ちを取り消すときは [cancelDeferredClaim]
      *
@@ -522,6 +533,7 @@ public class MachineSaveStore @JvmOverloads constructor(
     /**
      * 待っている claim のうち、読みの結果がそろったものを確定して返す（#869。メインスレッドで毎 tick、[pollCompleted] の後に呼ぶ）。
      * 確定は ID ごとに来た順で、そのたびに [claim] と同じ判定（索引の重複・覚えている `owner.bin` を含む）をやり直す。
+     * 待ちにしてから [claimWaitMillis] を過ぎた claim は、読みを待たずに新しい UUID にする（`NEW_ID_UNREADABLE`、warn）。
      * 返したものは待ちから外れている（索引にも入っている）ので、呼び手はその場で受け取る。待ちがなければ何もしない
      */
     public fun pollDeferredClaims(): List<DeferredClaim> {
@@ -536,16 +548,20 @@ public class MachineSaveStore @JvmOverloads constructor(
         val start = System.nanoTime()
         val ids = deferredById.entries.iterator()
         val left = ArrayList<UUID>()
+        val waitLimit = TimeUnit.MILLISECONDS.toNanos(claimWaitMillis.coerceAtLeast(0))
         while (ids.hasNext()) {
             val (id, queue) = ids.next()
-            // 判定の材料が何も変わっていなければ、判定をやり直さない（待ちの台数 × tick の、UUID の読み直しと索引の引きを避ける）
-            if (!mayDecide(id)) {
+            // 判定の材料が何も変わっていなければ、判定をやり直さない（待ちの台数 × tick の、UUID の読み直しと索引の引きを避ける）。
+            // 先頭の待ちが上限を過ぎていれば、下で新しい UUID にする
+            if (!mayDecide(id) && start - queue.first().since <= waitLimit) {
                 left += id
                 continue
             }
             while (queue.isNotEmpty()) {
                 val entry = queue.first()
-                val claim = claimInner(entry.rawId, entry.rawGeneration, entry.rawEpoch, entry.self, defer = true) ?: break
+                val claim = claimInner(entry.rawId, entry.rawGeneration, entry.rawEpoch, entry.self, defer = true)
+                    ?: timedOut(id, entry, start, waitLimit)
+                    ?: break
                 queue.removeFirst()
                 deferredByKey.remove(entry.key)
                 maxDeferredClaimNanos = maxOf(maxDeferredClaimNanos, System.nanoTime() - entry.since)
@@ -561,6 +577,17 @@ public class MachineSaveStore @JvmOverloads constructor(
         for (id in left) ensureOwnerRead(id)
         if (out.isNotEmpty()) claimNanos += System.nanoTime() - start
         return out
+    }
+
+    /**
+     * 待ちが上限（[claimWaitMillis]）を過ぎた [entry] を、読みを待たずに新しい UUID にする（同期の [claim] が列の仕事を待ちきれなかったときと
+     * 同じ `NEW_ID_UNREADABLE`。触った ID にはしない）。過ぎていなければ `null`。書き込みの列が長い（ほかの台の書き込みが詰まっている）・
+     * 読みの仕事が落ちた・先読みが止まった、のどれでも、ケースが動かせないまま残らないようにする（#869）
+     */
+    private fun timedOut(id: UUID, entry: DeferredEntry, now: Long, waitLimit: Long): Claim? {
+        if (now - entry.since <= waitLimit) return null
+        deferredClaimTimeouts++
+        return fresh(entry.self, ClaimResult.NEW_ID_UNREADABLE, "owner.bin of $id was not read within $claimWaitMillis ms")
     }
 
     /**
@@ -586,7 +613,9 @@ public class MachineSaveStore @JvmOverloads constructor(
     /**
      * 待っている [id] の `owner.bin` の読みを手配する（#869）。先読みのスレッドがまだ読みうる（動いていて、開いたときの ID で、触っていない）
      * なら、順番より先に読んでもらう。そうでなければ（先読みが終わった・触った ID・根の列挙が欠けて先読みにない ID）、書き込みのスレッドの
-     * その ID の列の後ろに読む仕事を入れる（前の仕事の後のディスクを読むので、仕事の終わりを待たなくてよい）。頼んであれば何もしない
+     * 列に読む仕事を入れる（前の仕事の後のディスクを読むので、仕事の終わりを待たなくてよい）。列は全 ID で 1 本なので、読みはそのとき列にある
+     * すべての仕事（ほかの台の世代・`owner.bin` の書き込みも）の後に走る。待ちの長さは [claimWaitMillis] で抑える（[pollDeferredClaims]）。
+     * 頼んであれば何もしない
      */
     private fun ensureOwnerRead(id: UUID) {
         if (id in requestedReads || id in ownerReads) return
@@ -601,7 +630,14 @@ public class MachineSaveStore @JvmOverloads constructor(
         requestedReads[id] = seq
         writerOwnerReadRequests++
         enqueue(id, 0, {
-            ownerReadResults.add(OwnerRead(id, seq, readOwnerOffMain(writerOwnerReader, id)))
+            // 読みが IOException・RuntimeException 以外で落ちても結果を返す（返さないと、頼み済みのままその ID の待ちが上限まで残る）
+            val value = try {
+                readOwnerOffMain(writerOwnerReader, id)
+            } catch (e: Throwable) {
+                ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("$e")))
+                throw e
+            }
+            ownerReadResults.add(OwnerRead(id, seq, value))
             null
         }, {
             ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("the save writer is closed")))

@@ -25,6 +25,15 @@ import java.util.UUID
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object ClaimIoGameTests {
+    /**
+     * 待ちの確定を待つ上限（壁時計）。読みは書き込みのスレッドの列（全 ID で 1 本）の後ろに並び、前のバッチの書き込みが残っていると
+     * tick の数では足りないことがある（GameTest のサーバーは tick を詰めて回すことがある）
+     */
+    private val DECIDE_LIMIT_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(20)
+
+    /** [DECIDE_LIMIT_NANOS] を待てる tick 数 */
+    private const val DECIDE_TIMEOUT_TICKS = 1_200
+
     private val ORIGINAL = BlockPos(1, 1, 1)
     private val COPIES = listOf(BlockPos(0, 1, 0), BlockPos(1, 1, 0), BlockPos(2, 1, 0), BlockPos(0, 1, 1))
     private val UNKNOWN = listOf(BlockPos(2, 1, 1), BlockPos(0, 1, 2), BlockPos(1, 1, 2), BlockPos(2, 1, 2))
@@ -94,7 +103,7 @@ object ClaimIoGameTests {
      * 待っている間に外した台は索引に残らない。覚えている ID の台は、同じ tick でもその場で決まる（動かした先なので引き取る）
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
     fun claimsThatNeedAReadWaitOffTheMainThread(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -105,6 +114,7 @@ object ClaimIoGameTests {
         val knownId = UUID.randomUUID()
         val seeds = listOf(place(helper, COPIES[0], forgotten), place(helper, COPIES[1], removedId), place(helper, COPIES[2], knownId))
         val start = helper.tick
+        val startNanos = System.nanoTime()
         var phase = 0
         var reads = 0L
         var deferredBefore = 0L
@@ -139,7 +149,8 @@ object ClaimIoGameTests {
                         helper.assertTrue(be.lastClaim == null && be.identity == null, "a waiting case has no id yet: ${be.lastClaim}, ${be.identity}")
                     }
                     helper.assertTrue(store.index.ownerOf(forgotten) == null, "waiting claims should not be indexed")
-                    helper.assertTrue(store.deferredClaims - deferredBefore == 3L, "three claims should wait: ${store.deferredClaims - deferredBefore}")
+                    // 数え口は置き場で共有で、同じバッチのほかのテストの待ちも入りうるので、少なくとも 3 を見る（台ごとの待ちは上で見た）
+                    helper.assertTrue(store.deferredClaims - deferredBefore >= 3L, "three claims should wait: ${store.deferredClaims - deferredBefore}")
                     helper.assertTrue(known.lastClaim == ClaimResult.TAKEN_OVER && !known.isClaimDeferred, "a remembered id is decided at once: ${known.lastClaim}")
                     // 待っている間に外す
                     helper.setBlock(UNKNOWN[2], Blocks.AIR)
@@ -148,7 +159,7 @@ object ClaimIoGameTests {
                 2 -> {
                     val (first, second, removed) = placed
                     if (first.isClaimDeferred || second.isClaimDeferred) {
-                        if (helper.tick > start + 80) helper.fail("the waiting claims should be decided")
+                        if (System.nanoTime() - startNanos > DECIDE_LIMIT_NANOS) helper.fail("the waiting claims should be decided")
                         return@onEachTick
                     }
                     phase = 3
@@ -266,7 +277,7 @@ object ClaimIoGameTests {
      * （ID のないまま順番が来ると冷えた起動になる）。確定したら、その ID で順番待ちに入り直す
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
     fun claimDeferredWhileQueuedLeavesTheRestoreQueue(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -276,6 +287,7 @@ object ClaimIoGameTests {
         store.forgetOwnerForTest(id)
         val be = place(helper, ORIGINAL, null, poweredOn = true)
         val start = helper.tick
+        val startNanos = System.nanoTime()
         var phase = 0
         helper.onEachTick {
             when (phase) {
@@ -290,7 +302,7 @@ object ClaimIoGameTests {
                 }
                 1 -> {
                     if (be.isClaimDeferred) {
-                        if (helper.tick > start + 80) helper.fail("the waiting claim should be decided")
+                        if (System.nanoTime() - startNanos > DECIDE_LIMIT_NANOS) helper.fail("the waiting claim should be decided")
                         return@onEachTick
                     }
                     helper.assertTrue(be.identity?.id == id, "the case should keep the merged id: ${be.identity}, ${be.lastClaim}")
@@ -302,6 +314,48 @@ object ClaimIoGameTests {
                     helper.succeed()
                 }
             }
+        }
+    }
+
+    /**
+     * 確定を受け取ったときに、もう待ちでない台（#869。`onDeferredClaim` の守り）: 置き場が入れた索引の項を外して捨て、ID も判定もつけない。
+     * 消えた台（`setRemoved` の後）に届いたときも同じ。ふつうは取り消しが置き場の待ちも外すので来ないが、来ても索引に残らない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_drop")
+    fun deferredClaimForACaseNoLongerWaitingIsDropped(helper: GameTestHelper) {
+        val store: MachineSaveStore = WorldMachineSaves.current ?: run {
+            helper.fail("no machine save store")
+            return
+        }
+        val idle = place(helper, COPIES[0], null)
+        val removed = place(helper, COPIES[1], null)
+        var done = false
+        helper.onEachTick {
+            if (done || !idle.isLoadedOnServer || !removed.isLoadedOnServer) return@onEachTick
+            done = true
+            // 待っていない台: 置き場が確定して索引に入れた（のと同じ）結果が届く
+            val idleId = UUID.randomUUID()
+            val idleOwner = idle.owner!!
+            val idleClaim = store.claim(idleId.toString(), 0, 0, idleOwner)
+            helper.assertTrue(store.index.ownerOf(idleId) == idleOwner, "the store should index the decided claim")
+            helper.assertTrue(!idle.isClaimDeferred, "the case should not wait")
+            idle.onDeferredClaim(idleClaim)
+            helper.assertTrue(idle.identity == null && idle.lastClaim == null, "a case not waiting should ignore it: ${idle.identity}, ${idle.lastClaim}")
+            helper.assertTrue(store.index.ownerOf(idleId) == null, "the dropped claim should leave the index")
+            helper.assertTrue(!ServerMachines.isRestoreQueued(idle), "a dropped claim should not offer a restore")
+            // 消えた台
+            val removedOwner = removed.owner!!
+            helper.setBlock(COPIES[1], Blocks.AIR)
+            helper.assertTrue(removed.isRemoved, "the case should be removed")
+            val removedId = UUID.randomUUID()
+            val removedClaim = store.claim(removedId.toString(), 0, 0, removedOwner)
+            helper.assertTrue(store.index.ownerOf(removedId) == removedOwner, "the store should index the decided claim")
+            removed.onDeferredClaim(removedClaim)
+            helper.assertTrue(removed.identity == null, "a removed case should ignore it: ${removed.identity}")
+            helper.assertTrue(store.index.ownerOf(removedId) == null, "the claim of a removed case should leave the index")
+            helper.setBlock(COPIES[0], Blocks.AIR)
+            helper.succeed()
         }
     }
 }

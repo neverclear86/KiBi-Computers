@@ -465,7 +465,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val raw = rawId ?: return
         // 動いている台（ID がまだない。置いた後に起動した台など）が `/data merge` で ID を得たときは、待たずに同期で確定する（これまでと同じ）。
         // 待つと、待つ間の取り出し（アンロード・停止）が飛ばされて状態を失い、電源ボタンも効かなくなる。
-        // 復元の途中の台も同じ（マシンがある）。起動の直後の台に限られるので、メインスレッドの読みは普段は起きない
+        // 復元の途中の台も同じ（マシンがある）。ADR 0084 の規則 7a の例外で、読みの要る ID ならメインスレッドで owner.bin を読み、
+        // その前に列の仕事を最大 claimWaitMillis 待つ（ID を持たずに動いている台にコマンドで ID を足したときだけ。数え口は mainOwnerReads）
         if (computer.machine != null) {
             applyClaim(store.claim(raw, rawGeneration ?: 0, rawEpoch ?: 0, self), raw)
             return
@@ -614,7 +615,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     fun pressPowerButton(player: ServerPlayer? = null): ComputerStatus {
         val level = level as? ServerLevel ?: return computer.status
-        // claim が待っている間（読み込みの直後の数 tick）は効かない（動かすと、取り出せない台が ID のないまま動く。#869）
+        // claim が待っている間（ふつうは読み込みの直後の数 tick。上限 claimWaitMillis）は効かない（動かすと、取り出せない台が ID のないまま動く。#869）
         if (isClaimDeferred) return computer.status
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
