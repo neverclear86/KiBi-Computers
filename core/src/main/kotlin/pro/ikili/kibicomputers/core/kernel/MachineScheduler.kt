@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.device.DeviceFailureLog
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
@@ -110,6 +111,9 @@ public class MachineScheduler private constructor(
         if (hostFailureTraced.size >= HOST_FAILURE_TRACE_LIMIT) return HostFailureTrace.LIMIT_REACHED
         return if (hostFailureTraced.add(site)) HostFailureTrace.NEW else HostFailureTrace.KNOWN
     }
+
+    /** デバイスのメソッドの失敗（internal error）のログ。スケジューラ全体で間引く（#679） */
+    internal val deviceFailureLog = DeviceFailureLog()
 
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
     private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
@@ -292,6 +296,8 @@ public class MachineScheduler private constructor(
     public fun tick() {
         val now = tickCounter.incrementAndGet()
         dispatcher.signal()
+        // 間引いたデバイスの失敗の要約（時が来ていなければ AtomicLong を1回読むだけ。#679）
+        deviceFailureLog.tick(now)
         val batch = ArrayList<Machine>()
         // マシンのロックの中で列のロックを取る（wakeAtTick）ので、列のロックを放してからマシンを呼ぶ
         wakeLock.withLockValue {

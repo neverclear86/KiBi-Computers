@@ -25,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
  *   閉じた（[Started.cancelLocked]。#532）
  *
  * ハンドラーが投げたものは、JVM が続けられないエラー（`StackOverflowError` 以外の `VirtualMachineError`。`isFatal`）を除き、
- * `Error` も含めて `failed("internal error")` にし、ログに出す（#532）。JVM が続けられないエラーは捕まえずにそのまま投げる
+ * `Error` も含めて `failed("internal error")` にし、ログに出す（#532。間引きは [DeviceFailureLog]、#679）。JVM が続けられないエラーは捕まえずにそのまま投げる
  * （直接のメソッドは呼んだプロセスへ。メインスレッドのメソッドは、呼び出しを `failed("internal error")` で終えてから `tick()` へ。`PendingHostCall` と同じ）。
  *
  * 結果は future で返す。失敗は [DeviceCallException]（[CallError]）で終える。上限は [DeviceLimits]。
@@ -144,7 +144,7 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
                 context.deferred?.finish(CallError.INTERNAL_ERROR)
                 throw t
             }
-            LOG.log(System.Logger.Level.WARNING, "デバイス ${context.address} のメソッド ${context.method} が例外を投げた", t)
+            reportFailure(context, t)
             error = CallError.INTERNAL_ERROR
         }
         // 後で返すと決めてから投げたら、その呼び出しを失敗で終える
@@ -157,13 +157,23 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
         val list = ArrayList<DeviceValue>(values.size)
         for (v in values) {
             if (v == null) {
-                LOG.log(System.Logger.Level.WARNING, "デバイス ${context.address} のメソッド ${context.method} が null の値を返した")
+                reportFailure(context, null)
                 return failed(CallError.INTERNAL_ERROR)
             }
             list += v
         }
         if (!DeviceLimits.fits(list)) return failed(CallError.Kernel(Errno.TOOBIG))
         return CompletableFuture.completedFuture(list)
+    }
+
+    /**
+     * internal error にした失敗（[t] を投げた、`null` = `null` の値を返した）をログに出す。スケジューラ全体で間引く（#679。[DeviceFailureLog]）。
+     * 投げない（JVM の致命的なエラーを除く）
+     */
+    private fun reportFailure(context: CallContext, t: Throwable?) {
+        val machine = bus.machine
+        val scheduler = machine.scheduler
+        scheduler.deviceFailureLog.report(machine.id, context.address, context.kind, context.method, t, scheduler.now)
     }
 
     /** 呼び出し1回の [DeviceCallContext] */
@@ -175,6 +185,9 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
         private val ticket: Ticket? = null,
     ) : DeviceCallContext {
         override val address: String get() = device.address
+
+        /** デバイスの種類（つないだときに読んだもの。他 MOD のコードを呼ばない） */
+        val kind: String get() = device.kind
 
         override val isMainThread: Boolean = mainThread
 
@@ -260,8 +273,6 @@ internal class DeviceDispatcher(private val bus: DeviceBus) {
     }
 
     companion object {
-        private val LOG: System.Logger = System.getLogger("kibicomputers.device")
-
         /** [error] で終えた future */
         fun failed(error: CallError): CompletableFuture<List<DeviceValue>> =
             CompletableFuture<List<DeviceValue>>().also { it.completeExceptionally(DeviceCallException(error)) }
