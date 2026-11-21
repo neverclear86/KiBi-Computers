@@ -510,7 +510,8 @@ class SaveCleanupTest {
             val report = run(cleanup(next, dryRun = true)).report
             assertEquals(1, report.unreferenced)
         } finally {
-            view.setReadOnly(false)
+            // 読み取り専用でも消えるファイルシステムでは、ファイルがもうない（assume で飛ばした場合）
+            if (Files.exists(locked)) view.setReadOnly(false)
         }
     }
 
