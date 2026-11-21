@@ -432,7 +432,10 @@ object MachineSaveGameTests {
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${be.computer}")
         slot.setFull(false)
         helper.succeedWhen {
-            helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
+            // 重いと tick に時間が残らず、バニラはアンロードの列を流さない。テストの中で今ある分を流す（#854）。
+            // hasChunk は FULL でなくなっただけで偽になるので、holder が表から消えたこと（アンロードして書きに回したこと）を見る
+            runQueuedUnloads(level)
+            helper.assertTrue(!FarChunks.isTracked(level, chunk), "the chunk should unload")
             // 共有のカウンター（ServerMachines.Stats.unloadCaptures）は並行するほかのテストのチャンクでも動くので見ない（#548・#708）。
             // 取り出されたことは、このケースの ID がディスク上のチャンクに載り、その世代のファイルと印がそろうことで確かめる
             // （電源を入れただけでは ID は振られない）
@@ -536,8 +539,8 @@ object MachineSaveGameTests {
             level.chunkSource.save(true)
             helper.assertTrue(diskGeneration(helper, chunk, pos) == first.generation, "the chunk on disk should point at ${first.generation}")
 
-            // FULL でなくすと、取り出した書き込みが書き込みのスレッドで止まる（受け取るまで tick をまたぐ）
-            val gate = WriterGate()
+            // FULL でなくすと、取り出した書き込みが書き込みのスレッドで止まる（受け取るまで tick をまたぐ。テストが落ちても放す）
+            val gate = WriterGate(helper)
             slot.setFull(false)
             var pending: PendingSave? = null
             helper.startSequence().thenWaitUntil {
@@ -565,7 +568,13 @@ object MachineSaveGameTests {
                 // そのままアンロードする（ケースはマシンを持たないので、アンロードの手順は何もしない）
                 slot.releaseKeeper()
             }.thenWaitUntil {
-                helper.assertTrue(!level.chunkSource.hasChunk(chunk.x, chunk.z), "the chunk should unload")
+                // 重いと tick に時間が残らず、バニラはアンロードの列を流さない。テストの中で今ある分を流す（#854）。
+                // hasChunk は FULL でなくなった時点で偽になるので、holder が表から消えたこと（アンロードの仕事が ChunkMap.save に回したこと）を待つ。
+                // 世代と印は下で1回だけ確かめる（ここで確かめると、付け忘れも時間切れと同じに見える）
+                runQueuedUnloads(level)
+                helper.assertTrue(!FarChunks.isTracked(level, chunk), "the chunk should unload")
+            }.thenExecute {
+                // アンロードの仕事は ChunkMap.save で書き込み待ちに入れるので、読み直すと新しい NBT が返る。印もその保存で付く
                 val identity = pending!!.identity
                 val generation = diskGeneration(helper, chunk, pos)
                 helper.assertTrue(generation == identity.generation, "the chunk on disk should point at ${identity.generation} but was $generation")
@@ -604,7 +613,8 @@ object MachineSaveGameTests {
             level.chunkSource.save(true)
             helper.assertTrue(diskGeneration(helper, chunk, pos) == first.generation, "the chunk on disk should point at ${first.generation}")
 
-            val gate = WriterGate()
+            // tick をまたいで止める（テストが落ちても放す。#854）
+            val gate = WriterGate(helper)
             slot.setFull(false)
             var pending: PendingSave? = null
             helper.startSequence().thenWaitUntil {

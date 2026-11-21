@@ -1,6 +1,10 @@
 package pro.ikili.kibicomputers.neoforge.gametest
 
 import net.minecraft.core.BlockPos
+import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.block.Blocks
@@ -37,15 +41,33 @@ internal fun saveNow(be: CaseBlockEntity, policy: CapturePolicy): Int {
 }
 
 /**
- * GameTest 用: 書き込みのスレッドを止めておく仕事を差し込む（#84）。[close] で放す。同じ tick の中で放すこと
- * （ほかのテストの [ServerMachines.drainSaves] がメインスレッドで待つため。`use {}` で囲む）
+ * GameTest 用: 書き込みのスレッドを止めておく仕事を差し込む（#84）。[close] で放す。
+ *
+ * [helper] を渡さないときは、同じ tick の中で放すこと（ほかのテストの [ServerMachines.drainSaves] がメインスレッドで待つため。`use {}` で囲む）。
+ * 放し忘れても、壁時計の [SHORT_LIMIT_SECONDS] で書き込みのスレッドが動き出す。
+ *
+ * [helper] を渡すと、tick をまたいで止めてよい（#854）。テストが終わったとき（成功・失敗・タイムアウト）に必ず放すので、
+ * 上限は、重いマシンで tick の待ちより先に切れない長さ（[HELD_LIMIT_SECONDS]）にする。tick を待つ間に壁時計の上限でゲートが勝手に開くと、
+ * 完了が先に届いて「止めている間は完了しない」の確かめが落ちる。ほかのテストと同じバッチにしない（並ぶテストの [ServerMachines.drainSaves] が待つ）
  */
-internal class WriterGate : AutoCloseable {
+internal class WriterGate(helper: GameTestHelper? = null) : AutoCloseable {
     private val latch = CountDownLatch(1)
 
     init {
         val writer = checkNotNull(WorldMachineSaves.writer) { "the server should have a save writer" }
-        check(writer.execute(UUID.randomUUID()) { latch.await(GATE_LIMIT_SECONDS, TimeUnit.SECONDS) }) { "the save writer should accept a task" }
+        val limit = if (helper == null) SHORT_LIMIT_SECONDS else HELD_LIMIT_SECONDS
+        check(writer.execute(UUID.randomUUID()) { latch.await(limit, TimeUnit.SECONDS) }) { "the save writer should accept a task" }
+        helper?.testInfo?.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
     }
 
     override fun close() {
@@ -53,7 +75,22 @@ internal class WriterGate : AutoCloseable {
     }
 
     private companion object {
-        /** 放し忘れても、書き込みのスレッドが止まりきらない上限 */
-        const val GATE_LIMIT_SECONDS = 30L
+        /** 同じ tick の中で放すゲートを、放し忘れても書き込みのスレッドが止まりきらない上限 */
+        const val SHORT_LIMIT_SECONDS = 30L
+
+        /** テストの終わりに必ず放すゲートの、念のための上限 */
+        const val HELD_LIMIT_SECONDS = 1_800L
     }
+}
+
+/**
+ * GameTest 用: [level] のチャンクのアンロードの列（`ChunkMap.unloadQueue`）に今ある仕事を1回ずつ流す（#854）。
+ * バニラの `processUnloads` は、tick に時間が残らないと列を流さない（2,000 件を超えるまで溜める）ので、重いマシンではアンロードを待つテストが
+ * 何 tick 待っても進まない。tick に時間が残っていたのと同じことを、テストの中で起こす。
+ * 積み直された仕事（#540）は流さずに次の呼び出しに回し、メインスレッドの仕事（`pollTask`）も進めない（ほかの仕事は tick に任せる）。
+ * 列の仕事はそのディメンションの全部のチャンクのものなので、並ぶほかのテストのアンロードも早まる（tick に時間が残っていたときと同じで、バニラの範囲の振る舞い）
+ */
+internal fun runQueuedUnloads(level: ServerLevel) {
+    val queue = level.chunkSource.chunkMap.unloadQueue
+    repeat(queue.size) { (queue.poll() ?: return).run() }
 }

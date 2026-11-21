@@ -2,6 +2,9 @@ package pro.ikili.kibicomputers.neoforge.gametest
 
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.server.level.ServerChunkCache
 import net.minecraft.server.level.TicketType
 import net.minecraft.world.level.ChunkPos
@@ -19,22 +22,53 @@ object ChunkUnloadDrainGameTests {
     /** 離れたチャンクを読み込ませるチケット（チャンクを FULL にする段階） */
     private val TICKET: TicketType<ChunkPos> = TicketType.create("kibicomputers_drain_test", Comparator.comparingLong(ChunkPos::toLong))
 
+    /** 先に生成しておくときのチケットの距離（段階 34。FULL でないが、生成したチャンクを残す） */
+    private const val PRELOAD_DISTANCE = -1
+
     /**
      * 読み込まれていないチャンクにチケットを付け、それが読み込まれるまで自分を積み直す仕事を、アンロードの列に入れる
      * （読み込み直されたチャンクの、古いアンロードの仕事と同じふるまい。世代のタスクがメインスレッドで進まないと終わらない）。
      * `stopServer` と同じく列を流すだけだと回り続けるが、[ChunkUnloadDrain.drain] はメインスレッドの仕事を進めながら流すので、
-     * チャンクが読み込まれて列が空になる
+     * チャンクが読み込まれて列が空になる。
+     *
+     * 時間のかかるワールド生成は、`drain` の外で先に済ませる（#854）。重いマシンでは、離れたチャンクの生成が `drain` の壁時計の上限
+     * （30 秒）に間に合わなかった。FULL でない段階（34）のチケットを付けて同期に生成し、`getChunk` の一時のチケットが外れて FULL でなくなるのを
+     * tick で待つ。`drain` に残る仕事は、FULL のチケットの更新と FULL への昇格（どちらもメインスレッドの仕事）だけになる。
+     * 昇格は、FULL のチケットを付けたのと同じ tick の、1回の `drain` の中で起きなければならない（tick の間のサーバーの `pollTask` に先を越されると、
+     * メインスレッドの仕事を進めない `drain` でも通ってしまう）
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun drainRunsMainThreadTasksBetweenRequeues(helper: GameTestHelper) {
         val far = FarChunks.reserve(helper)
-        val result = drainWithRequeueing(helper.level.chunkSource, far, ticket = true, timeoutNanos = TimeUnit.SECONDS.toNanos(30))
-        helper.assertTrue(result.drained, "the unload queue should drain (ran the requeueing task ${result.runs} times)")
-        helper.assertTrue(result.loadedAfter, "the far chunk should load while draining")
-        helper.assertFalse(result.leftInQueue, "the requeueing task should be gone")
-        helper.assertTrue(result.runs >= 2, "the task should have requeued itself at least once (ran ${result.runs} times)")
-        helper.succeed()
+        val cache = helper.level.chunkSource
+        // テストが途中で落ちても（タイムアウトを含む）、先に生成するためのチケットを外す（FULL のチケットは drainWithRequeueing が外す）
+        val cleanUp = { cache.removeRegionTicket(TICKET, far, PRELOAD_DISTANCE, far) }
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = cleanUp()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = cleanUp()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
+        // FULL でないまま残す段階のチケットを付けて、壁時計の上限なしに生成する
+        cache.addRegionTicket(TICKET, far, PRELOAD_DISTANCE, far)
+        helper.level.getChunk(far.x, far.z)
+        helper.startSequence().thenWaitUntil {
+            // getChunk が付けた一時のチケット（UNKNOWN）が外れ、FULL でなくなるのを待つ
+            helper.assertTrue(cache.getChunkNow(far.x, far.z) == null, "the far chunk should leave FULL after the temporary ticket expires")
+        }.thenExecute {
+            val result = drainWithRequeueing(cache, far, ticket = true, timeoutNanos = TimeUnit.SECONDS.toNanos(30))
+            helper.assertFalse(result.loadedBefore, "the far chunk should not be FULL before the drain")
+            helper.assertTrue(result.drained, "the unload queue should drain (ran the requeueing task ${result.runs} times)")
+            helper.assertTrue(result.loadedAfter, "the far chunk should load while draining")
+            helper.assertFalse(result.leftInQueue, "the requeueing task should be gone")
+            helper.assertTrue(result.runs >= 2, "the task should have requeued itself at least once (ran ${result.runs} times)")
+        }.thenSucceed()
     }
 
     /**
@@ -53,7 +87,7 @@ object ChunkUnloadDrainGameTests {
         helper.succeed()
     }
 
-    private class DrainResult(val drained: Boolean, val loadedAfter: Boolean, val runs: Int, val leftInQueue: Boolean)
+    private class DrainResult(val loadedBefore: Boolean, val drained: Boolean, val loadedAfter: Boolean, val runs: Int, val leftInQueue: Boolean)
 
     /**
      * [far] が読み込まれるまで自分を積み直す仕事を列に入れて、[ChunkUnloadDrain.drain] で流す。
@@ -64,6 +98,7 @@ object ChunkUnloadDrainGameTests {
         // チケットの更新・世代のタスクの開始・メインスレッドの段は、どれもメインスレッドの仕事（pollTask）で進む
         if (ticket) cache.addRegionTicket(TICKET, far, 0, far)
         val loaded = { cache.getChunkNow(far.x, far.z) != null }
+        val loadedBefore = loaded()
         val queue = cache.chunkMap.unloadQueue
         var runs = 0
         var finished = false
@@ -85,6 +120,6 @@ object ChunkUnloadDrainGameTests {
             while (queue.remove(requeueing)) Unit
             if (ticket) cache.removeRegionTicket(TICKET, far, 0, far)
         }
-        return DrainResult(drained, loadedAfter, runs, queue.contains(requeueing))
+        return DrainResult(loadedBefore, drained, loadedAfter, runs, queue.contains(requeueing))
     }
 }

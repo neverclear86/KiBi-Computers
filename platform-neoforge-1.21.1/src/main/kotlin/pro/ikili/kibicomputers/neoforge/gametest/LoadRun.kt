@@ -1023,8 +1023,17 @@ internal class LoadRun(
     /** 測る区間を終えたときの段階の中の tick（この後は書き込みの終わりを待つ） */
     private var measuredTicks = 0
 
-    /** 段階に予約した書き込みの終わりを待つ期限（`System.nanoTime` の値。[stopMeasuring] で決める） */
-    private var saveWaitDeadline = 0L
+    /** 段階に予約した書き込みの終わりを待ち始めたとき（`System.nanoTime` の値。失敗の文言に出すだけ。[stopMeasuring] で決める） */
+    private var saveWaitStartNanos = 0L
+
+    /** 段階に予約した書き込みの終わりを待った tick の数（[awaitPhaseSaves]） */
+    private var saveWaitTicks = 0
+
+    /** 終わった書き込みが増えないまま待った tick の数（[awaitPhaseSaves]） */
+    private var saveWaitIdleTicks = 0
+
+    /** これまでに見た、残っている書き込みの数の最小（減ったら [saveWaitIdleTicks] を数え直す） */
+    private var saveWaitLastOutstanding = Long.MAX_VALUE
     private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
@@ -1577,7 +1586,10 @@ internal class LoadRun(
         val tick = tickStats()
         measuredTick = tick
         measuredTicks = phaseTick
-        saveWaitDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SAVE_WAIT_TIMEOUT_MILLIS)
+        saveWaitStartNanos = System.nanoTime()
+        saveWaitTicks = 0
+        saveWaitIdleTicks = 0
+        saveWaitLastOutstanding = Long.MAX_VALUE
         recording = false
         return tick
     }
@@ -1586,7 +1598,9 @@ internal class LoadRun(
      * 段階に予約した書き込み（[ServerMachines.Stats.windowOutstanding]）がすべて終わったか（#614）。終わっていなければ、書き込みのスレッドが
      * 空になるのを 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待って、終わった書き込みを受け取る。tick をまたいで待つので、
      * 1回でメインスレッドを長く止めず、急いで回す試験（`paced` でない）でも tick の数が増えすぎない。待つ tick は測らない（[stopMeasuring]）。
-     * 壁時計の上限（[SAVE_WAIT_TIMEOUT_MILLIS]）を過ぎたら失敗する
+     * 上限は tick で数える（#854。重いマシンで書き込みのスレッドが I/O で遅れても、進んでいるうちは落とさない）:
+     * 終わった書き込みが1件も増えない tick が [SAVE_WAIT_IDLE_TICKS] 続くか、待つ tick が全部で [SAVE_WAIT_TIMEOUT_TICKS] に達したら失敗する。
+     * 1 tick に [SAVE_WAIT_STEP_MILLIS] まで待つので、どちらも壁時計では元の上限（120 秒）より短くならない
      */
     private fun awaitPhaseSaves(): Boolean {
         val s = ServerMachines.Stats
@@ -1599,14 +1613,25 @@ internal class LoadRun(
             }
         }
         ServerMachines.processCompletions()
-        if (s.windowOutstanding <= 0) return true
-        if (System.nanoTime() - saveWaitDeadline >= 0) {
-            fail(
-                "${s.windowOutstanding} of ${s.windowSubmits} saves queued in the $phase phase did not finish within $SAVE_WAIT_TIMEOUT_MILLIS ms " +
-                    "(pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
-            )
+        val outstanding = s.windowOutstanding
+        if (outstanding <= 0) return true
+        saveWaitTicks++
+        if (outstanding < saveWaitLastOutstanding) {
+            saveWaitLastOutstanding = outstanding
+            saveWaitIdleTicks = 0
+        } else {
+            saveWaitIdleTicks++
         }
-        return false
+        val reason = when {
+            saveWaitIdleTicks >= SAVE_WAIT_IDLE_TICKS -> "made no progress for $SAVE_WAIT_IDLE_TICKS ticks"
+            saveWaitTicks >= SAVE_WAIT_TIMEOUT_TICKS -> "did not finish within $SAVE_WAIT_TIMEOUT_TICKS ticks"
+            else -> return false
+        }
+        val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - saveWaitStartNanos)
+        fail(
+            "$outstanding of ${s.windowSubmits} saves queued in the $phase phase $reason " +
+                "(waited $saveWaitTicks ticks, $elapsed ms; pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
+        )
     }
 
     private fun unload() {
@@ -2383,10 +2408,16 @@ internal class LoadRun(
         private const val UNLOAD_TIMEOUT_TICKS = 2_000
 
         /**
-         * 段階に予約した書き込みが終わるのを待つ上限（壁時計。#614）。遅いマシン（CI、ほかのビルドと並んだ手元）でも余裕のある長さにする。
-         * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] 待つので、待つ tick は多くて 2,400 で、試験の上限（`CI_TIMEOUT_TICKS`）に収まる
+         * 段階に予約した書き込みが終わるのを待つ間、終わった書き込みが1件も増えない tick の上限（#614・#854）。
+         * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待つので、壁時計では 120 秒以上になる（以前の壁時計の上限と同じ）
          */
-        private const val SAVE_WAIT_TIMEOUT_MILLIS = 120_000L
+        private const val SAVE_WAIT_IDLE_TICKS = 2_400
+
+        /**
+         * 段階に予約した書き込みが終わるのを待つ tick の全体の上限（#854）。進んでいても、ここで打ち切る。
+         * 待つ段階は多くて 3 つ（AUTOSAVE・UNLOAD・本番の形の自動保存）。試験の上限（`CI_TIMEOUT_TICKS`）は、その分を足しても収まるようにしてある
+         */
+        private const val SAVE_WAIT_TIMEOUT_TICKS = 6_000
 
         /** 段階に予約した書き込みの終わりを待つ間、1 tick で書き込みのスレッドを待つ上限 */
         private const val SAVE_WAIT_STEP_MILLIS = 50L
