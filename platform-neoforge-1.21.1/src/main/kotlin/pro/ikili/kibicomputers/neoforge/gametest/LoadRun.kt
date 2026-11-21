@@ -517,15 +517,20 @@ internal class ProductionAutosaveResult(
  * @property fallbacks 戻せずに冷えた起動にした数
  * @property versionMismatches [fallbacks] のうち、MOD のバージョンが違ったもの
  * @property forceMillis 強制読み込みを戻すのにかかった時間（試験の呼び出しの中、1 tick。`setChunkForced` はその場でチャンクを読み込むので、
- *   ディスクからの読み込みと、ケースの `onLoad`（復元の順番待ちに入る）を含む。MSPT には入らない）
+ *   ディスクからの読み込みまでを含む。MSPT には入らない）。ケースの `onLoad`（復元の順番待ちに入る。ブロックエンティティの
+ *   `onLoad` は次の tick のブロックエンティティの処理で呼ばれる。#653）は含まず、測る区間の最初の tick（[firstTickMillis]）に入る
+ * @property firstTickMillis 測る区間の最初の tick の時間（強制読み込みを戻した次の tick。ブロックエンティティの `onLoad`・claim が入る）
  * @property chunksTick ケース・画面・キーボードのあるチャンクが全部 FULL で読み込まれた tick
  * @property startedTick 戻るはずの台が全部、復元を始めた（か、残っていた）tick
  * @property doneTick 戻るはずの台が全部 [done] になった tick
  * @property doneSeconds [doneTick] までの壁時計の秒（届かなければ段階を打ち切るまで）
  * @property timedOut [RESTORE_TIMEOUT_TICKS] で打ち切った
  * @property maxQueue 復元の順番待ちの列の長さの最大（毎 tick 数えた中で）
- * @property peakBootThreads `KiBi-boot-*` のスレッドの数の最大（毎 tick 数えた中で）
- * @property maxConcurrentMachines 動いているサーバーの `maxConcurrentMachines`（`KiBi-boot-*` の上限）
+ * @property peakBootThreads `KiBi-boot-*` のスレッドの数の最大（毎 tick 数えた中で）。プールで次の仕事を待つスレッドも数えるので、
+ *   作りの上で [maxConcurrentMachines] を超えない（上限が守られているかの検査にはならない。参考の値）
+ * @property peakInFlight 復元を受け付けてから終わりの知らせが返るまで（`Machine.isRestoring`）の台数の最大（毎 tick 数えた中で）。
+ *   起動用の待ち行列・`KiBi-boot-*` のスレッド・コンパイル待ち・通知の列のどこにいる台も数える。「同時に前段にいる台数」
+ * @property maxConcurrentMachines 動いているサーバーの `maxConcurrentMachines`（`KiBi-boot-*` の本数の上限）
  * @property tick 測った tick の時間（強制読み込みを戻した次の tick から、全台が戻るまで）
  */
 internal data class RestoreResult(
@@ -539,6 +544,7 @@ internal data class RestoreResult(
     val fallbacks: Long,
     val versionMismatches: Long,
     val forceMillis: Double,
+    val firstTickMillis: Double,
     val chunksTick: Int,
     val startedTick: Int,
     val doneTick: Int,
@@ -546,6 +552,7 @@ internal data class RestoreResult(
     val timedOut: Boolean,
     val maxQueue: Int,
     val peakBootThreads: Int,
+    val peakInFlight: Int,
     val maxConcurrentMachines: Int,
     val tick: TickStats,
 ) {
@@ -664,14 +671,14 @@ internal class LoadReport(
                 String.format(
                     Locale.ROOT,
                     "- 強制読み込みを戻して全台が戻る（#582）: 戻るはずの台 %d、戻った台 %d（うち、アンロードされずに残った %d）%s。" +
-                        "強制読み込みを戻す %.1f ms（1 tick の中。チャンクの読み込みを含む）、チャンクが全部読み込まれるまで %s、全台が復元を始めるまで %s、全台が戻るまで %s（%.1f s）。" +
+                        "強制読み込みを戻す %.1f ms（1 tick の中。チャンクの読み込みを含む。ケースの onLoad は次の tick）、最初の tick %.1f ms、チャンクが全部読み込まれるまで %s、全台が復元を始めるまで %s、全台が戻るまで %s（%.1f s）。" +
                         "復元を始めた台: 保存した世代から %d・最初から冷えた起動 %d（うち書き込み待ちの期限切れ %d）。" +
                         "知らせ: 戻せた %d・冷えた起動 %d（うち MOD のバージョン違い %d）。順番待ちの最大 %d 台、" +
-                        "KiBi-boot-* の最大 %d 本（上限 maxConcurrentMachines %d）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms（%d tick）\n",
+                        "前段にいる台の最大 %d 台、KiBi-boot-* の最大 %d 本（上限 maxConcurrentMachines %d）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms（%d tick）\n",
                     it.expected, it.done, it.kept, if (it.timedOut) "、${RestoreResult.RESTORE_TIMEOUT_TICKS} tick で打ち切った" else "",
-                    it.forceMillis, at(it.chunksTick), at(it.startedTick), at(it.doneTick), it.doneSeconds,
+                    it.forceMillis, it.firstTickMillis, at(it.chunksTick), at(it.startedTick), at(it.doneTick), it.doneSeconds,
                     it.fromSave, it.coldStart, it.writeTimeouts, it.restored, it.fallbacks, it.versionMismatches, it.maxQueue,
-                    it.peakBootThreads, it.maxConcurrentMachines, it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max, it.tick.ticks,
+                    it.peakInFlight, it.peakBootThreads, it.maxConcurrentMachines, it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max, it.tick.ticks,
                 ),
             )
         }
@@ -881,6 +888,12 @@ internal class LoadRun(
     private var restoreMaxQueue = 0
     private var restoreForceMillis = 0.0
     private var restorePeakBootThreads = 0
+    private var restorePeakInFlight = 0
+
+    /** [LoadPhase.RESTORE] の前に、サーバーが遅れを取り戻して tick の予定に追いついたか待つ（[settlePace]）ために数える */
+    private var paceRun = 0
+    private var paceSettleTicks = 0
+    private var paceSettled = false
     private var restoreResult: RestoreResult? = null
 
     private var prevCallback = 0L
@@ -1000,8 +1013,17 @@ internal class LoadRun(
             // 1 tick の長さだけで待つと、重い tick（アンロードの書き込みなど）で遅れた分が戻らず、tick の残り時間（haveTime）が
             // ずっとなくなる。するとチャンクのアンロードの列が 2,000 件を超えるまで流れず、アンロードが進まない（#540）
             val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
+            // 予定より先にいる（待てた）tick が続けば、遅れを取り戻している（settlePace）
+            paceRun = if (wait > 0) paceRun + 1 else 0
             if (wait > 0) {
-                LockSupport.parkNanos(wait)
+                // parkNanos は、ほかのスレッドの unpark（サーバーのスレッドへ仕事を積むたびに起こす。復元の完了の知らせなど）で早く返る。
+                // 1 回だけだと、仕事が続く間は待ちが短くなり、tick が 50 ms より詰まる。予定の時刻まで待ち直す
+                val deadline = System.nanoTime() + wait
+                var left = wait
+                while (left > 0) {
+                    LockSupport.parkNanos(left)
+                    left = deadline - System.nanoTime()
+                }
             }
         }
         if (!finished) {
@@ -1188,6 +1210,7 @@ internal class LoadRun(
             baselineHeap = heapAfterGc()
             enter(sequence.first())
         } else {
+            if (p == LoadPhase.RESTORE && phaseTick == 0 && settings.paced && !paceSettled && !settlePace()) return
             if (phaseTick == 0) setUp(p)
             when (p) {
                 LoadPhase.BOOT -> boot()
@@ -1198,6 +1221,33 @@ internal class LoadRun(
             }
         }
         phaseTick++
+    }
+
+    /**
+     * [LoadPhase.RESTORE] を始める前に、サーバーが tick の予定（`nextTickTime`）に追いついているのを待つ。直前のアンロードの段階は、
+     * 長い tick と書き込みの終わりの待ち（[awaitPhaseSaves]）で予定より遅れて終わる。遅れたまま始めると、待ちが効かない（[onTick] の待ちは
+     * 予定までしか待たない）ので tick が詰めて回り、tick の数や秒数が 20 TPS のサーバーの値にならない。
+     * 試験の呼び出しで何もせず（測らない）、予定より先にいる tick が [PACE_SETTLE_TICKS] 続いたら始める。
+     * [PACE_SETTLE_TIMEOUT_TICKS] 待っても追いつかなければ WARN を出して始める
+     *
+     * @return 始めてよければ `true`（この呼び出しで段階の準備に進む）
+     */
+    private fun settlePace(): Boolean {
+        if (paceRun >= PACE_SETTLE_TICKS) {
+            LOGGER.info("The server caught up with its tick schedule after {} ticks; starting the {} phase", paceSettleTicks, phase)
+        } else if (++paceSettleTicks < PACE_SETTLE_TIMEOUT_TICKS) {
+            return false
+        } else {
+            LOGGER.warn(
+                "The server did not catch up with its tick schedule within {} ticks; the {} phase runs behind schedule (its tick counts and seconds are not 20 TPS values)",
+                PACE_SETTLE_TIMEOUT_TICKS,
+                phase,
+            )
+        }
+        paceSettled = true
+        // 待った時間は段階の秒に入れない（doneSeconds・finish の壁時計は、ここから数える）
+        phaseStartNanos = System.nanoTime()
+        return true
     }
 
     /** 段階の順番。計算・出力させる台がなければ、その段階は飛ばす */
@@ -1412,6 +1462,7 @@ internal class LoadRun(
         if (restoreChunksTick < 0 && restoreChunks.all { level.chunkSource.getChunkNow(it.x, it.z) != null }) restoreChunksTick = phaseTick
         var started = 0
         var done = 0
+        var inFlight = 0
         for (k in restoreTargets.indices) {
             if (!restoreDone[k]) {
                 val c = refresh(restoreTargets[k])
@@ -1420,6 +1471,7 @@ internal class LoadRun(
                     val starts = if (c.case === old.case) c.case.restoreStarts - restoreBaseline[k] else c.case.restoreStarts
                     if (starts > 0) restoreStarted[k] = true
                     val computer = c.case.computer
+                    if (computer.isRestoring) inFlight++
                     if (computer.machine != null && !computer.isRestorePending && !computer.isRestoring) {
                         restoreDone[k] = true
                         restoreKept[k] = !restoreStarted[k] && c.case === old.case
@@ -1429,6 +1481,7 @@ internal class LoadRun(
             if (restoreDone[k]) done++
             if (restoreDone[k] || restoreStarted[k]) started++
         }
+        restorePeakInFlight = maxOf(restorePeakInFlight, inFlight)
         if (restoreStartedTick < 0 && started == restoreTargets.size) restoreStartedTick = phaseTick
         val all = done == restoreTargets.size
         if (all) {
@@ -1451,6 +1504,7 @@ internal class LoadRun(
             fallbacks = s.restoreFallbacks,
             versionMismatches = s.restoreVersionMismatches,
             forceMillis = restoreForceMillis,
+            firstTickMillis = if (sampleCount > 0) samples[0] / 1e6 else 0.0,
             chunksTick = restoreChunksTick,
             startedTick = restoreStartedTick,
             doneTick = restoreDoneTick,
@@ -1458,6 +1512,7 @@ internal class LoadRun(
             timedOut = !all,
             maxQueue = restoreMaxQueue,
             peakBootThreads = restorePeakBootThreads,
+            peakInFlight = restorePeakInFlight,
             maxConcurrentMachines = (ServerMachines.schedulerConfig ?: SchedulerConfig.DEFAULT).maxConcurrentMachines,
             tick = tick,
         )
@@ -1793,9 +1848,6 @@ internal class LoadRun(
                 }
                 // アンロードの段階は予約した書き込みを全部待ってから終わるので、書き込み待ちで冷えた起動にする台はないはず
                 if (it.writeTimeouts > 0) LOGGER.warn("{} computers cold-booted because their writes did not finish: {}", it.writeTimeouts, it)
-                if (it.peakBootThreads > it.maxConcurrentMachines) {
-                    LOGGER.warn("{} KiBi-boot threads ran at once, over maxConcurrentMachines ({})", it.peakBootThreads, it.maxConcurrentMachines)
-                }
             }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
@@ -2015,6 +2067,12 @@ internal class LoadRun(
 
         /** 復元の前段のスレッドの名前（core の `MachineScheduler`） */
         private const val BOOT_THREAD_PREFIX = "KiBi-boot-"
+
+        /** [LoadPhase.RESTORE] の前に、予定より先にいる tick がこれだけ続くのを待つ（[settlePace]。1 秒） */
+        private const val PACE_SETTLE_TICKS = 20
+
+        /** 追いつくのを待つ上限（tick。サーバーは 2 秒以上遅れると予定を飛ばして追いつくので、ふつうはもっと早い） */
+        private const val PACE_SETTLE_TIMEOUT_TICKS = 1_200
 
         /** `Machine.describeProcesses` に出る、燃料をスレッドを持ったまま待つプロセスの状態（core の `ProcessState.WAITING_FUEL`。内部の型なので名前で見る） */
         private const val WAITING_FUEL = "WAITING_FUEL"
