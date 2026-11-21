@@ -196,6 +196,11 @@ object ServerMachines {
     @Volatile
     internal var autosaveEnabled: Boolean = true
 
+    /** 動いているサーバーのモジュールの置き場（#82。掃除が使う。#564）。サーバーの起動ごとに作り直す */
+    @Volatile
+    internal var moduleStore: FileModuleStore? = null
+        private set
+
     /** サーバーで読み込まれているケース（読み込んだ順）。メインスレッドだけで使う */
     private val tracked = LinkedHashSet<CaseBlockEntity>()
 
@@ -474,6 +479,7 @@ object ServerMachines {
         // 待機点保存が指すモジュールの置き場（#82）: <world>/kibicomputers/modules
         val world = event.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
         val modules = FileModuleStore(world.resolve(KiBiComputers.MOD_ID).resolve("modules"))
+        moduleStore = modules
         // コンフィグ（#202）。SERVER のコンフィグは、このイベントの前（ServerLifecycleHooks.handleServerAboutToStart）に読まれる。
         // スレッドの数などは、ここで作るときに決まる（読み直しでは変えない。ADR 0202）
         configLoadedAtStart = KiBiConfigs.isLoaded(ConfigSide.SERVER)
@@ -823,7 +829,7 @@ object ServerMachines {
      * `pendingUnloads`（アンロード待ち。アンロードの仕事がまだ走っていない）の順に引く（どれも AT で読めるようにした。#761）。
      * メインスレッドで呼ぶ
      */
-    private fun findHolder(level: ServerLevel, pos: Long): ChunkHolder? {
+    internal fun findHolder(level: ServerLevel, pos: Long): ChunkHolder? {
         val map = level.chunkSource.chunkMap
         return map.getVisibleChunkIfPresent(pos) ?: map.getUpdatingChunkIfPresent(pos) ?: map.pendingUnloads.get(pos)
     }

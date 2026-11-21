@@ -473,6 +473,10 @@ class ShellTest {
         assertTrue(text.contains("[1] Exit 3  exitwith 3\n"), text)
     }
 
+    private fun catRunning(m: Machine): Boolean = m.lock.withLockValue {
+        m.kernel.processes.all().any { it.args.firstOrNull() == "cat" }
+    }
+
     @Test
     fun `会話的なシェルでは、Ctrl+Cは前景の子だけを止める`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
@@ -492,12 +496,14 @@ class ShellTest {
                         m.offerConsoleInput("cat\n".toByteArray())
                         step = 1
                     }
-                    // cat が前景になるまで、Ctrl+C を何度か送る（シェルは無視する）
+                    // cat が前景になるまで、Ctrl+C を何度か送る（シェルは無視する）。
+                    // cat を打った直後はまだ「$ 」で終わっているので、cat が実際に起動するまで次へ進めない
+                    step == 1 && lastSent == 0L && !catRunning(m) -> Unit
                     step == 1 && !text.endsWith("$ ") && now - lastSent > 200_000_000 -> {
                         m.offerConsoleInput(byteArrayOf(3))
                         lastSent = now
                     }
-                    step == 1 && text.endsWith("$ ") -> {
+                    step == 1 && lastSent != 0L && text.endsWith("$ ") -> {
                         m.offerConsoleInput("echo after ${'$'}?\n".toByteArray())
                         step = 2
                     }

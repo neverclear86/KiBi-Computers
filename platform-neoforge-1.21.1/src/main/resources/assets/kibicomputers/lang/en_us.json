@@ -137,5 +137,9 @@
   "kibicomputers.configuration.access.requestTtlSeconds": "Request expiry (seconds)",
   "kibicomputers.configuration.access.requestTtlSeconds.tooltip": "Seconds a change requested by a program on a computer waits for the owner or an operator to approve it.",
   "kibicomputers.configuration.access.maxRequestsPerComputer": "Max requests per computer",
-  "kibicomputers.configuration.access.maxRequestsPerComputer.tooltip": "Maximum number of change requests from one computer that are waiting for approval."
+  "kibicomputers.configuration.access.maxRequestsPerComputer.tooltip": "Maximum number of change requests from one computer that are waiting for approval.",
+  "message.kibicomputers.saves.cleanup.started": "Started the computer save cleanup (%s)",
+  "message.kibicomputers.saves.cleanup.busy": "The computer save cleanup is already running or computer saves are not available",
+  "message.kibicomputers.saves.cleanup.none": "The computer save cleanup has not run on this server",
+  "message.kibicomputers.saves.cleanup.status": "Computer save cleanup: %s (%s)"
 }
