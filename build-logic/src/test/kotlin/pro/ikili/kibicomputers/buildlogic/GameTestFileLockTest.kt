@@ -12,7 +12,10 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 class GameTestFileLockTest {
@@ -24,9 +27,8 @@ class GameTestFileLockTest {
     @Test
     fun `takes a free lock at once and writes the owner`() {
         val lock = newLock()
-        val waited = lock.acquire("task A", Duration.ofSeconds(5), {})
+        lock.acquire("task A", Duration.ofSeconds(5), {})
         assertTrue(lock.isHeld)
-        assertTrue(waited < Duration.ofSeconds(2))
         assertEquals("task A", lock.readOwner())
         assertNotNull(lock.release())
         assertFalse(lock.isHeld)
@@ -55,32 +57,36 @@ class GameTestFileLockTest {
     fun `a waiter takes the lock once the holder releases it`() {
         val first = newLock()
         first.acquire("task A", Duration.ofSeconds(5), {})
+        // 待つ側が 1 回取れずに報告したのを見てから外す（時間には頼らない）
+        val waiting = CountDownLatch(1)
         val releaser = thread {
-            Thread.sleep(300)
+            assertTrue(waiting.await(30, TimeUnit.SECONDS))
             first.release()
         }
         val second = newLock()
-        val waited = second.acquire("task B", Duration.ofSeconds(10), {}, Duration.ofMillis(50))
+        val messages = CopyOnWriteArrayList<String>()
+        second.acquire("task B", Duration.ofSeconds(60), { messages += it; waiting.countDown() }, Duration.ofMillis(50))
         releaser.join()
         assertTrue(second.isHeld)
-        assertTrue(waited >= Duration.ofMillis(200), waited.toString())
+        assertTrue(messages.first().contains("Held by: task A"), messages.toString())
         assertEquals("task B", second.readOwner())
         second.release()
     }
 
     @Test
     fun `handing over keeps the lock, rewrites the owner and restarts the held time`() {
-        val lock = newLock()
+        val clock = AtomicLong(1_000)
+        val lock = GameTestFileLock(dir.resolve("locks/gametest.lock"), dir.resolve("locks/gametest.owner")) { clock.get() }
         lock.acquire("task A", Duration.ofSeconds(5), {})
-        Thread.sleep(300)
+        clock.addAndGet(Duration.ofMillis(300).toNanos())
         val heldByA = lock.handOver("task B")
-        assertTrue(heldByA >= Duration.ofMillis(300), heldByA.toString())
+        assertEquals(Duration.ofMillis(300), heldByA)
         assertTrue(lock.isHeld)
         assertEquals("task B", lock.readOwner())
         // ほかからは取れないまま
         assertFalse(newLock().tryAcquire())
-        val heldByB = lock.release()!!
-        assertTrue(heldByB < heldByA, "$heldByB should be counted from the handover")
+        clock.addAndGet(Duration.ofMillis(50).toNanos())
+        assertEquals(Duration.ofMillis(50), lock.release(), "the held time should be counted from the handover")
     }
 
     @Test
@@ -113,13 +119,21 @@ class GameTestFileLockTest {
     }
 }
 
-/** 別のプロセスでロックを取り、殺されるまで持ち続ける（[GameTestFileLockTest] から起動する）。 */
+/**
+ * 別のプロセスでロックを取り、殺されるまで持ち続ける（[GameTestFileLockTest] から起動する）。
+ * 親（テストのワーカー）が finally を通らずに終わっても残らないよう、親が終わったら自分も終わり、親がいなくても [MAX_LIFETIME] で終わる
+ * （残ると、コマンドラインに worktree のパスを含む java のプロセスとして、worktree の片付けを止める）。
+ */
 object HoldLockMain {
+    private val MAX_LIFETIME = Duration.ofMinutes(5)
+
     @JvmStatic
     fun main(args: Array<String>) {
+        ProcessHandle.current().parent().ifPresent { parent -> parent.onExit().thenRun { Runtime.getRuntime().halt(0) } }
         val lock = GameTestFileLock(Path.of(args[0]), Path.of(args[1]))
         lock.acquire("child", Duration.ofSeconds(30), {})
         Files.writeString(Path.of(args[2]), "ok")
-        Thread.sleep(Long.MAX_VALUE)
+        Thread.sleep(MAX_LIFETIME.toMillis())
+        Runtime.getRuntime().halt(0)
     }
 }

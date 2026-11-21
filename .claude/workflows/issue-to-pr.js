@@ -26,9 +26,11 @@ const MAX_REVIEW_ROUNDS = 2
 // CI の段階で main との衝突を取り込む回数の上限（#855）
 const MAX_CONFLICT_MERGES = 2
 // マージの段階で GameTest だけが落ちたとき、過負荷とみなして 1 回だけ回し直すしきい値（#855）。
-// ふだんの起動でも、ワールドを読んだ直後に「Can't keep up!」が数十 tick 程度で 1 回出ることがあるので、出たかどうかでなく大きさで決める。
-// 11/20〜21 の過負荷では最大 32,800 tick 遅れ、ふだん 1.5〜2.5 分の NeoForge の GameTest が 1 時間を超えた
-const OVERLOAD_TICKS_BEHIND = 200
+// ふだんの起動でも、ワールドを読んだ直後に「Can't keep up!」が 1 回出ることがあるので、出たかどうかでなく大きさで決める。
+// 手元の worktree の latest.log の最大値（約 40 件）は、ふだんは NeoForge 1.21.1 が 70〜110 tick、Forge 1.20.1 が 55〜141 tick（最大 189）で、
+// 過負荷と分かる回は 350 tick 以上だった（11/20〜21 の過負荷では最大 32,800 tick 遅れ、ふだん 1.5〜2.5 分の NeoForge の GameTest が 1 時間を超えた）。
+// ふだんの最大（189）と過負荷の最小（350）の間に置く。ふだんの値に近すぎると、少し重いだけの回の本物の失敗まで回し直しに入る
+const OVERLOAD_TICKS_BEHIND = 300
 const OVERLOAD_GAMETEST_SECONDS = 600
 
 // Gradle を動かす段階に共通の決まり（#855）。ログは worktree の外（.worktrees/.logs/issue-<n>/）に残し、片付けで消えないようにする。
@@ -651,7 +653,7 @@ function cleanupWorktree(info, impl) {
     `${REPO} の PR #${impl.pr} はマージ済み。worktree ${impl.worktree} を片付ける。リポジトリのルートで作業する。
 1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分、Monitor などで待つ（前景の \`sleep\` は使えない）:
    - \`${logs}/\` の \`.log\` のうち、\`-latest.log\` で終わらないものすべてに、同じ名前の \`.exit\` がある（Gradle が終わった）。
-   - コマンドラインに worktree のパスを含む java のプロセスがない（PowerShell の \`Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -like '*issue-${info.number}*' }\`。\`/\`・\`\\\` の両方の書き方で探す）。
+   - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]issue-${info.number}(?![0-9])' }\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
    - ただし \`.exit\` のない \`.log\` でも、上の java のプロセスがなく、そのログの最終更新から ${STALE_LOG_MINUTES} 分以上たっていれば、終わった（ジョブが殺されて \`.exit\` を書けなかった）とみなす。最終更新との差は \`date +%s\` と \`stat -c %Y <ログ>\` で測る。そうみなしたログの名前は note に書く。
    15 分たっても終わらなければ、消さずに removed=false で、残っているもの（ログの名前・プロセスの ID とコマンドラインの先頭）を note に書いて返す。プロセスは殺さない。\`./gradlew --stop\` は使わない（ほかの worktree のビルドまで止まる）。
 2. 終わっていたら \`git worktree remove --force ${impl.worktree}\` を実行する。

@@ -148,7 +148,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 6. マージ: 1件ずつ直列に、main を取り込んだ結果で `build` と GameTest を通してから squash マージする（`merge: false` で飛ばせる）。
 7. 報告: PR に結果をコメントする。マージ済みなら、その worktree の Gradle と GameTest のサーバーが終わってから worktree を片付ける（それ以外は resume のために残す）。
 
-Gradle を動かす段階は、`./gradlew` をバックグラウンドで動かし、ログと終了コード（`.exit`）を worktree の外の `.worktrees/.logs/issue-<番号>/` に残して、終わるまで待ってから返す（#855）。CI の段階では、PR が main と衝突している（GitHub が CI を動かさない）なら、先に main を取り込む。マージの段階で GameTest だけが落ち、過負荷の兆候（`Can't keep up!` が 200 tick 以上遅れた、または GameTest が 10 分以上かかった）があるときだけ、1 回だけ回し直す。それでも落ちたら、今までどおり止まる。
+Gradle を動かす段階は、`./gradlew` をバックグラウンドで動かし、ログと終了コード（`.exit`）を worktree の外の `.worktrees/.logs/issue-<番号>/` に残して、終わるまで待ってから返す（#855）。CI の段階では、PR が main と衝突している（GitHub が CI を動かさない）なら、先に main を取り込む。マージの段階で GameTest だけが落ち、過負荷の兆候（`Can't keep up!` が 300 tick 以上遅れた、または GameTest が 10 分以上かかった）があるときだけ、1 回だけ回し直す。それでも落ちたら、今までどおり止まる。
 
 人に質問して止まる前には、どの段階でも、別のモデル（Fable）が論点を確かめる。前提（何が問題で、なぜ止まったか）が正しいか、推奨が妥当か、そもそも人の判断が要るものかを、コード・ADR・仕様と突き合わせる。エージェントで直せるもの（プランの書き漏れなど）なら、その直し方でもう1回進める。人に聞くときは、確かめた結果を質問に添える。
 

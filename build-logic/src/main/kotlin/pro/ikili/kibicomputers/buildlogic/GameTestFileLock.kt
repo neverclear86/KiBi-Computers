@@ -23,6 +23,8 @@ import java.time.Duration
 class GameTestFileLock(
     private val lockFile: Path,
     private val ownerFile: Path,
+    /** 経過時間を測る時計（テストで差し替える）。 */
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private var channel: FileChannel? = null
     private var lock: FileLock? = null
@@ -49,15 +51,15 @@ class GameTestFileLock(
     ): Duration {
         check(!isHeld) { "the GameTest lock is already held by this instance" }
         Files.createDirectories(lockFile.toAbsolutePath().parent)
-        val start = System.nanoTime()
+        val start = nanoTime()
         var lastReport = Long.MIN_VALUE
         while (true) {
             if (tryAcquire()) {
-                acquiredAtNanos = System.nanoTime()
+                acquiredAtNanos = nanoTime()
                 writeOwner(owner)
                 return Duration.ofNanos(acquiredAtNanos - start)
             }
-            val now = System.nanoTime()
+            val now = nanoTime()
             val waited = Duration.ofNanos(now - start)
             if (waited >= timeout) {
                 throw IOException(
@@ -93,7 +95,7 @@ class GameTestFileLock(
         }
         channel = ch
         lock = l
-        acquiredAtNanos = System.nanoTime()
+        acquiredAtNanos = nanoTime()
         return true
     }
 
@@ -103,7 +105,7 @@ class GameTestFileLock(
      */
     fun handOver(owner: String): Duration {
         check(isHeld) { "the GameTest lock is not held by this instance" }
-        val now = System.nanoTime()
+        val now = nanoTime()
         val held = Duration.ofNanos(now - acquiredAtNanos)
         acquiredAtNanos = now
         writeOwner(owner)
@@ -113,7 +115,7 @@ class GameTestFileLock(
     /** ロックを外す。持っていなければ何もしない。持っていた時間を返す（持っていなければ null）。 */
     fun release(): Duration? {
         val l = lock ?: return null
-        val held = Duration.ofNanos(System.nanoTime() - acquiredAtNanos)
+        val held = Duration.ofNanos(nanoTime() - acquiredAtNanos)
         // 持ち主のファイルは、ロックを持っている間に消す（外したあとに消すと、次の持ち主が書いたものを消しうる）
         try {
             Files.deleteIfExists(ownerFile)
