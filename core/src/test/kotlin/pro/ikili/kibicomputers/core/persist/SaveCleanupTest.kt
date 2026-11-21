@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
@@ -12,7 +13,10 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.DosFileAttributeView
 import java.nio.file.attribute.FileTime
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.UUID
 import java.util.function.Consumer
 
@@ -488,12 +492,23 @@ class SaveCleanupTest {
     fun `消す途中で失敗してもowner_binは残り、次の掃除が回収できる`() {
         val id = previousMachine(p)
         val dirOfId = machines.resolve(id.toString())
-        // 消せないファイル（読み取り専用。DOS 属性が使えない環境ではやらない）
-        val locked = dirOfId.resolve("0.bin")
+        // 消せないファイル。POSIX では書き込めないディレクトリの中のファイル（CI の Linux）、Windows では読み取り専用のファイル。
+        // ディレクトリの名前は、逆順の削除で世代のファイルより後、owner.bin より前に来るものにする
+        val lockedDir = dirOfId.resolve("0-locked")
+        val locked = lockedDir.resolve("0.bin")
+        Files.createDirectories(lockedDir)
         Files.writeString(locked, "locked")
-        val view = Files.getFileAttributeView(locked, java.nio.file.attribute.DosFileAttributeView::class.java)
-        org.junit.jupiter.api.Assumptions.assumeTrue(view != null)
-        view.setReadOnly(true)
+        val posix = Files.getFileAttributeView(lockedDir, PosixFileAttributeView::class.java)
+        val dos = if (posix == null) Files.getFileAttributeView(locked, DosFileAttributeView::class.java) else null
+        assumeTrue(posix != null || dos != null, "消せないファイルを作れないファイルシステム")
+        val lock = { on: Boolean ->
+            if (posix != null) {
+                posix.setPermissions(PosixFilePermissions.fromString(if (on) "r-xr-xr-x" else "rwxr-xr-x"))
+            } else {
+                dos!!.setReadOnly(on)
+            }
+        }
+        lock(true)
         try {
             val store = MachineSaveStore(machines, MachineIdIndex(), "test")
             age(id.toString())
@@ -501,17 +516,18 @@ class SaveCleanupTest {
             val judged = Files.getLastModifiedTime(dirOfId).toMillis()
             assertTrue(store.deleteUnreferenced(id, judged) { result = it })
             store.flush(5000)
-            org.junit.jupiter.api.Assumptions.assumeTrue(Files.exists(locked), "読み取り専用のファイルが消えるファイルシステム")
+            // root で動かす・読み取り専用でも消えるファイルシステムでは、消せてしまう
+            assumeTrue(Files.exists(locked), "消せないはずのファイルが消えた（root など）")
             assertEquals(-1, result)
             assertTrue(Files.exists(dirOfId.resolve(OwnerRecord.FILE_NAME)), "owner.bin は最後に消す")
+            assertFalse(Files.exists(store0Generation(id)), "世代のファイルは owner.bin より先に消える")
             // 次のセッション: owner.bin があるので、また掃除の候補として判定される
             age(id.toString())
             val next = MachineSaveStore(machines, MachineIdIndex(), "test")
             val report = run(cleanup(next, dryRun = true)).report
             assertEquals(1, report.unreferenced)
         } finally {
-            // 読み取り専用でも消えるファイルシステムでは、ファイルがもうない（assume で飛ばした場合）
-            if (Files.exists(locked)) view.setReadOnly(false)
+            if (Files.exists(lockedDir)) lock(false)
         }
     }
 

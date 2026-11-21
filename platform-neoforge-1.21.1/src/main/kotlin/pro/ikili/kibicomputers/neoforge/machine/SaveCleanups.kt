@@ -11,8 +11,12 @@ import net.minecraft.resources.ResourceLocation
 import net.minecraft.server.MinecraftServer
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
+import net.minecraft.server.level.ChunkHolder
 import net.minecraft.server.level.FullChunkStatus
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.dimension.DimensionType
+import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.server.ServerStartedEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
@@ -27,6 +31,8 @@ import pro.ikili.kibicomputers.core.persist.SaveCleanup
 import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.UUID
 import java.util.function.Consumer
 
@@ -137,11 +143,17 @@ internal object SaveCleanups {
  * `owner.bin` の位置のチャンクに、その ID のケースがあるかを答える（#564。[MachineReferenceProbe]）。メインスレッドで問われる。
  *
  * - ディメンションが今のサーバーにない（MOD を外しただけかもしれない）: [MachineReference.UNKNOWN]
- * - チャンクの `ChunkHolder` がある（読み込まれている・アンロード待ち。ディスクより、メモリが正しい）: [MachineReference.UNKNOWN]。
- *   読み込まれたケースは claim するので、ふつうは「このサーバーで見た ID」として先に外れる
- * - それ以外: `ChunkMap.read`（IOWorker。書き込み待ちのデータを返す。リージョンファイルを直接開かない）の `block_entities` に、
- *   その座標のケースのタグがあり、その ID を持つなら [MachineReference.PRESENT]、なければ（チャンクがディスクにないときも）
- *   [MachineReference.ABSENT]。読みが失敗したら [MachineReference.UNKNOWN]
+ * - チャンクの `ChunkHolder` がある（見える表・更新中の表・アンロード待ち。[ServerMachines.findHolder]）: ディスクの NBT は古いかもしれないので、ディスクは読まない（[referenceInHolder]）。
+ *   - holder が FULL のチャンク（`fullStatus` が FULL 以上で、最新のチャンクが `LevelChunk`）を持っていれば、メモリのブロックエンティティで判定する:
+ *     その座標にその ID のケースがあれば [MachineReference.PRESENT]、なければ [MachineReference.ABSENT]（ディレクトリを消す側）。
+ *     読み込まれたケースは claim するので、ふつうは「このサーバーで見た ID」として先に外れる（ここで ABSENT になるのは、その位置にもうケースがない ID）
+ *   - FULL でない（途中の段階・INACCESSIBLE に降りた `LevelChunk`・アンロード待ち）: [MachineReference.UNKNOWN]
+ * - それ以外: `ChunkMap.read`（IOWorker。書き込み待ちのデータを返す）の `block_entities` に、その座標のケースのタグがあり、
+ *   その ID を持つなら [MachineReference.PRESENT]、なければ（チャンクがディスクにないときも）[MachineReference.ABSENT]。読みが失敗したら [MachineReference.UNKNOWN]。
+ *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`r.X.Z.mca`）がなければ読まずに
+ *   [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
+ *   このセッションで生成したチャンクだけで、そこにあるケースはこのセッションで置いた（ID を振った・claim した）もの、つまり「見た ID」なので、ここには問われない
+ *   （消す直前にも見直す）。リージョンファイルがあれば、書き込み待ちは `ChunkMap.read` が返す
  *
  * チャンクの NBT は覚えない（1,000 件分を持つと大きいため。同じチャンクを何度か読むことはある。問いの数は [SaveCleanupSettings.maxProbesInFlight] まで）
  */
@@ -157,9 +169,12 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
         val chunk = ChunkPos(pos)
         val holder = ServerMachines.findHolder(level, chunk.toLong())
         if (holder != null) {
-            // 読み込まれている: メモリのブロックエンティティが正しい（ディスクの NBT は古いかもしれない）。FULL でない段階・アンロード待ちは判定しない
-            val loaded = (holder.latestChunk as? LevelChunk)?.takeIf { holder.fullStatus.isOrAfter(FullChunkStatus.FULL) }
-            answer.accept(if (loaded == null) MachineReference.UNKNOWN else referenceInMemory(loaded, id, pos))
+            answer.accept(referenceInHolder(holder, id, pos))
+            return
+        }
+        // リージョンファイルがなければ読まない（読みが空のリージョンファイルを作るため）
+        if (!Files.exists(regionFile(level, chunk))) {
+            answer.accept(MachineReference.ABSENT)
             return
         }
         level.chunkSource.chunkMap.read(chunk).whenComplete { data, error ->
@@ -174,6 +189,20 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
     }
 
     companion object {
+        /** ディメンション [level] のチャンク [chunk] のリージョンファイル（`ChunkMap` が開く `<dimension>/region/r.X.Z.mca` と同じ場所） */
+        fun regionFile(level: ServerLevel, chunk: ChunkPos): Path =
+            DimensionType.getStorageFolder(level.dimension(), level.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize())
+                .resolve("region").resolve("r.${chunk.regionX}.${chunk.regionZ}.mca")
+
+        /**
+         * holder [holder] のあるチャンクの [pos] に、[id] のケースがあるか（メインスレッドで呼ぶ）。FULL のチャンクを持っていればメモリで判定し（[referenceInMemory]）、
+         * FULL でない段階・アンロード待ちなら [MachineReference.UNKNOWN]（メモリにだけ新しい状態があるかもしれず、ディスクの NBT では判定しない）
+         */
+        fun referenceInHolder(holder: ChunkHolder, id: UUID, pos: BlockPos): MachineReference {
+            val loaded = (holder.latestChunk as? LevelChunk)?.takeIf { holder.fullStatus.isOrAfter(FullChunkStatus.FULL) }
+            return if (loaded == null) MachineReference.UNKNOWN else referenceInMemory(loaded, id, pos)
+        }
+
         /**
          * 読み込まれた（FULL の）チャンク [chunk] の [pos] に、[id] のケースがあるか（メインスレッドで呼ぶ）。
          * まだブロックエンティティにならずに保留されている NBT は、バニラと同じく引いた時点で取り込まれる（取り込まれたケースは claim して「見た ID」になる）

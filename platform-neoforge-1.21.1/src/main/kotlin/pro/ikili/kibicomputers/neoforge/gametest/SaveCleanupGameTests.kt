@@ -4,9 +4,14 @@ import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.nbt.CompoundTag
+import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
+import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.block.entity.BlockEntityType
+import net.minecraft.world.level.chunk.LevelChunk
 import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -16,6 +21,7 @@ import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineReference
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.OwnerRecord
 import pro.ikili.kibicomputers.core.persist.SaveCleanup
@@ -23,12 +29,14 @@ import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ChunkReferenceProbe
 import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
 import java.util.Comparator
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 残ったディレクトリの掃除（#564、ADR 0564）の GameTest。サーバーの置き場（開いたときの候補）は触らず、ワールドの下の別の根に
@@ -193,6 +201,108 @@ object SaveCleanupGameTests {
             } finally {
                 deleteTree(root)
             }
+        }.thenSucceed()
+    }
+
+    /** [probe] に問い、答え（どのスレッドから来てもよい）を受け取る入れ物を返す */
+    private fun ask(probe: ChunkReferenceProbe, id: UUID, dimension: String, pos: BlockPos): AtomicReference<MachineReference?> {
+        val answer = AtomicReference<MachineReference?>(null)
+        probe.probe(id, MachineOwner(dimension, pos.x, pos.y, pos.z)) { answer.set(it) }
+        return answer
+    }
+
+    /**
+     * holder はあるが FULL でないチャンク（keeper で INACCESSIBLE に降りた `LevelChunk`、続くアンロード待ち）では、ケースがなくても
+     * 「判定できない」になる（メモリにだけ新しい状態があるかもしれないので、消す側に倒さない）。FULL のうちは「ない」、アンロードされてディスクから読めば「ない」
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 2400)
+    fun notFullChunkIsUndetermined(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        val slot = FarChunks.allocate(helper, keeper = true)
+        val chunk = slot.chunk
+        val pos = slot.pos(4, 100, 4)
+        val id = UUID.randomUUID()
+        val probe = ChunkReferenceProbe(level.server)
+        var unloadingProbes = 0
+        var unloaded: AtomicReference<MachineReference?>? = null
+        helper.startSequence().thenExecute {
+            val full = ask(probe, id, dimension, pos).get()
+            helper.assertTrue(full == MachineReference.ABSENT, "a FULL chunk without the case should be absent: $full")
+            slot.setFull(false)
+        }.thenWaitUntil {
+            // keeper がアンロードを止めるので、holder は残ったまま FULL でなくなる
+            val holder = ServerMachines.findHolder(level, chunk.toLong())
+            helper.assertTrue(holder != null && !holder.fullStatus.isOrAfter(FullChunkStatus.FULL), "the chunk should drop below FULL: ${holder?.fullStatus}")
+            helper.assertTrue(holder!!.latestChunk is LevelChunk, "the holder should keep the LevelChunk: ${holder.latestChunk}")
+        }.thenExecute {
+            val answer = ask(probe, id, dimension, pos).get()
+            helper.assertTrue(answer == MachineReference.UNKNOWN, "an inaccessible LevelChunk should be undetermined: $answer")
+            slot.releaseKeeper()
+        }.thenWaitUntil {
+            // アンロードが終わるまで（アンロード待ちの表に入っている間も）、tick ごとに問い、ずっと「判定できない」
+            if (ServerMachines.findHolder(level, chunk.toLong()) != null) {
+                val answer = ask(probe, id, dimension, pos).get()
+                helper.assertTrue(answer == MachineReference.UNKNOWN, "a chunk with a holder below FULL should be undetermined: $answer")
+                unloadingProbes++
+                helper.fail("the chunk should unload")
+            }
+            val pending = unloaded ?: ask(probe, id, dimension, pos).also { unloaded = it }
+            helper.assertTrue(pending.get() != null, "the probe of the unloaded chunk should answer")
+        }.thenExecute {
+            helper.assertTrue(unloadingProbes > 0, "the probe should be asked while unloading")
+            val answer = unloaded!!.get()
+            helper.assertTrue(answer == MachineReference.ABSENT, "the saved chunk without the case should be absent: $answer")
+        }.thenSucceed()
+    }
+
+    /**
+     * リージョンファイルのない位置は、読んでリージョンファイルを作らずに「ない」と答える。リージョンファイルのある所の、IOWorker の書き込み待ち
+     * （まだリージョンに出ていないかもしれないチャンクの NBT）にケースがあれば「ある」と答える
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 2400)
+    fun regionlessPositionsAreAbsentWithoutCreatingRegions(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        val probe = ChunkReferenceProbe(level.server)
+        val empty = FarChunks.reserve(helper)
+        val emptyRegion = ChunkReferenceProbe.regionFile(level, empty)
+        helper.assertTrue(!Files.exists(emptyRegion), "the region of the reserved chunk should not exist yet: $emptyRegion")
+        val absent = ask(probe, UUID.randomUUID(), dimension, BlockPos(empty.minBlockX, 64, empty.minBlockZ))
+        // リージョンファイルを作る: 離れたチャンクを読み込んでアンロードさせる
+        val slot = FarChunks.allocate(helper)
+        slot.setFull(false)
+        val region = ChunkReferenceProbe.regionFile(level, slot.chunk)
+        // 同じリージョンの、読み込みの届かない（16 チャンク離れた）チャンクに、書き込み待ちのケースを入れる
+        val minX = slot.chunk.regionX * 32
+        val pending = ChunkPos(minX + (slot.chunk.x - minX + 16) % 32, slot.chunk.z)
+        val id = UUID.randomUUID()
+        val pos = BlockPos(pending.minBlockX + 1, 70, pending.minBlockZ + 2)
+        var present: AtomicReference<MachineReference?>? = null
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(absent.get() != null, "the probe of the regionless position should answer")
+            helper.assertTrue(ServerMachines.findHolder(level, slot.chunk.toLong()) == null, "the far chunk should unload")
+            helper.assertTrue(Files.exists(region), "the region file $region should be written")
+        }.thenExecute {
+            helper.assertTrue(absent.get() == MachineReference.ABSENT, "a position without a region file should be absent: ${absent.get()}")
+            helper.assertTrue(!Files.exists(emptyRegion), "the probe should not create the region file $emptyRegion")
+            helper.assertTrue(ServerMachines.findHolder(level, pending.toLong()) == null, "the pending chunk $pending should not be loaded")
+            val caseTag = CompoundTag().apply {
+                putString("id", BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString())
+                putInt("x", pos.x)
+                putInt("y", pos.y)
+                putInt("z", pos.z)
+                putString(CaseBlockEntity.MACHINE_ID_TAG, id.toString())
+            }
+            // アンロード直後と同じく、IOWorker に NBT を入れた直後に問う
+            level.chunkSource.chunkMap.write(pending, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+            present = ask(probe, id, dimension, pos)
+        }.thenWaitUntil {
+            helper.assertTrue(present!!.get() != null, "the probe of the pending chunk should answer")
+        }.thenExecute {
+            helper.assertTrue(present!!.get() == MachineReference.PRESENT, "the pending chunk with the case should be present: ${present!!.get()}")
         }.thenSucceed()
     }
 }
