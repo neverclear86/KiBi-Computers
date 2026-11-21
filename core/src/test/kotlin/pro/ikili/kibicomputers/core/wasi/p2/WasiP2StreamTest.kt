@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.TestDriver
@@ -642,6 +643,35 @@ class WasiP2StreamTest {
                 assertTrue(h1 != ok(ctx.p2(ty, "[method]descriptor.metadata-hash", other)))
                 val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
                 assertEquals(h1, ok(ctx.p2(ty, "[method]descriptor.metadata-hash-at", root, pf, CanonValue.str("a.txt"))))
+            }
+            m.stop()
+        }
+    }
+
+    @Test
+    fun `デバイスのfdのstreamは、readとblocking-write-and-flushがnosysで、check-writeはinval（ADR 0054の保つ形。#695）`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val device = m.lock.withLockValue { DeviceHandle("123e4567-e89b-12d3-a456-426614174000", "kibi:screen").also { m.kernel.objects.add(it) } }
+            scenario(h, m, device.id, device.id) { ctx ->
+                // 失敗（last-operation-failed）のエラーの説明（errno の名前で始まる）を返す
+                fun failure(v: CanonValue?): String {
+                    val r = v as CanonValue.Case
+                    assertEquals(1, r.index, "err のはず: $v")
+                    val failed = r.payload as CanonValue.Case
+                    assertEquals(0, failed.index, "last-operation-failed のはず: $v")
+                    return (ctx.p2("wasi:io/error", "[method]error.to-debug-string", failed.payload!!) as CanonValue.Str).value
+                }
+                // 入力の read は FdIo.readHandle を通り、NOSYS
+                val inp = ctx.p2("wasi:cli/stdin", "get-stdin")!!
+                assertTrue(failure(ctx.p2(streams, "[method]input-stream.read", inp, CanonValue.I64(8))).startsWith("nosys"))
+                // 出力の check-write は FdIo.pollEntryLocked(WRITABLE) を通り、デバイスは INVAL（NOSYS ではない）
+                val out = ctx.p2("wasi:cli/stdout", "get-stdout")!!
+                assertTrue(failure(ctx.p2(streams, "[method]output-stream.check-write", out)).startsWith("inval"))
+                // blocking-write-and-flush は check-write を通らず FdIo.writeHandle を通り、NOSYS
+                val out2 = ctx.p2("wasi:cli/stdout", "get-stdout")!!
+                val written = ctx.p2(streams, "[method]output-stream.blocking-write-and-flush", out2, CanonValue.Bytes("hi".toByteArray()))
+                assertTrue(failure(written).startsWith("nosys"))
             }
             m.stop()
         }

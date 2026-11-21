@@ -2750,6 +2750,9 @@ public class Machine private constructor(
     /** 自動マウントの仕事を走らせた回数（テスト用） */
     internal val autoMountRuns = AtomicInteger()
 
+    /** 自動マウントの仕事を最後まで走らせ終えた回数（後始末 [unmountStaleDisksLocked] とマウントの後。テスト用） */
+    internal val autoMountFinished = AtomicInteger()
+
     /** 開いている途中の予約の数（テスト用） */
     internal val diskClaimCount: Int get() = lock.withLockValue { diskClaims.size }
 
@@ -3045,7 +3048,11 @@ public class Machine private constructor(
             // 印を下ろしてから状態を読む（下ろした後の挿し込みは、もう1回積まれる）
             autoMountScheduled.set(false)
             autoMountRuns.incrementAndGet()
-            reconcileMounts()
+            try {
+                reconcileMounts()
+            } finally {
+                autoMountFinished.incrementAndGet()
+            }
         }
         try {
             scheduler.bootExecutor.execute(job)
