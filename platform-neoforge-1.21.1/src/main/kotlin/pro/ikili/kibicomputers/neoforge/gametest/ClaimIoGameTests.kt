@@ -8,9 +8,11 @@ import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
+import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
@@ -27,16 +29,28 @@ object ClaimIoGameTests {
     private val COPIES = listOf(BlockPos(0, 1, 0), BlockPos(1, 1, 0), BlockPos(2, 1, 0), BlockPos(0, 1, 1))
     private val UNKNOWN = listOf(BlockPos(2, 1, 1), BlockPos(0, 1, 2), BlockPos(1, 1, 2), BlockPos(2, 1, 2))
 
-    private fun place(helper: GameTestHelper, pos: BlockPos, id: UUID): CaseBlockEntity {
+    /** [id] を NBT の生の値に持つケースを置く（`null` なら ID なし）。[poweredOn] なら電源が入っていた台（復元の順番待ちに入る） */
+    private fun place(helper: GameTestHelper, pos: BlockPos, id: UUID?, poweredOn: Boolean = false): CaseBlockEntity {
         helper.setBlock(pos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get())
         val be = helper.getBlockEntity<CaseBlockEntity>(pos)
-        val tag = be.saveWithoutMetadata(helper.level.registryAccess())
-        tag.putString(CaseBlockEntity.MACHINE_ID_TAG, id.toString())
-        tag.putLong(CaseBlockEntity.SAVE_GENERATION_TAG, 0)
-        tag.putLong(CaseBlockEntity.OWNER_EPOCH_TAG, 0)
-        be.loadWithComponents(tag, helper.level.registryAccess())
+        be.loadWithComponents(rawTag(helper, be, id?.toString(), poweredOn), helper.level.registryAccess())
         return be
     }
+
+    /** [be] の NBT の ID・電源を [id]・[poweredOn] に書き換えたもの（`/data merge` と同じ。[id] が `null` なら ID なし） */
+    private fun rawTag(helper: GameTestHelper, be: CaseBlockEntity, id: String?, poweredOn: Boolean) =
+        be.saveWithoutMetadata(helper.level.registryAccess()).also { tag ->
+            if (id != null) {
+                tag.putString(CaseBlockEntity.MACHINE_ID_TAG, id)
+                tag.putLong(CaseBlockEntity.SAVE_GENERATION_TAG, 0)
+                tag.putLong(CaseBlockEntity.OWNER_EPOCH_TAG, 0)
+            } else {
+                tag.remove(CaseBlockEntity.MACHINE_ID_TAG)
+                tag.remove(CaseBlockEntity.SAVE_GENERATION_TAG)
+                tag.remove(CaseBlockEntity.OWNER_EPOCH_TAG)
+            }
+            tag.putBoolean(CaseBlockEntity.POWERED_ON_TAG, poweredOn)
+        }
 
     /** 別のバッチにして、ほかのテストの claim（読み）を数え口に混ぜない */
     @JvmStatic
@@ -148,6 +162,143 @@ object ClaimIoGameTests {
                     helper.assertTrue(!removed.isClaimDeferred && store.index.ownerOf(removedId) == null, "a removed waiting case should not be indexed")
                     helper.assertTrue(store.mainOwnerReads == reads, "claim should not read owner.bin on the main thread: ${store.mainOwnerReads - reads} reads")
                     for (pos in UNKNOWN) helper.setBlock(pos, Blocks.AIR)
+                    helper.succeed()
+                }
+            }
+        }
+    }
+
+    /**
+     * 待つ間の台（#869）: 取り出さず（`captureAndSubmit` が `null`）、電源ボタンも効かない（状態が変わらない）。アンロード
+     * （`onChunkUnloaded`）で待ちを取り消し、後の tick に確定しない（索引に入らない・ID がつかない・順番待ちに入らない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    fun deferredClaimCaseIsInertAndUnloadCancelsIt(helper: GameTestHelper) {
+        val store: MachineSaveStore = WorldMachineSaves.current ?: run {
+            helper.fail("no machine save store")
+            return
+        }
+        val id = UUID.randomUUID()
+        store.forgetOwnerForTest(id)
+        val be = place(helper, ORIGINAL, id, poweredOn = true)
+        val start = helper.tick
+        var phase = 0
+        helper.onEachTick {
+            when (phase) {
+                0 -> {
+                    if (!be.isLoadedOnServer) return@onEachTick
+                    helper.assertTrue(be.isClaimDeferred, "the claim should wait for owner.bin")
+                    helper.assertTrue(be.computer.isRestorePending, "a powered-on case shows the restore wait: ${be.computer}")
+                    helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should not be offered to the restore queue")
+                    val status = be.computer.status
+                    for (policy in CapturePolicy.entries) {
+                        helper.assertTrue(be.captureAndSubmit(policy) == null, "a waiting case should not be captured ($policy)")
+                    }
+                    helper.assertTrue(be.currentIdentity == null, "capturing should not assign a new id: ${be.currentIdentity}")
+                    helper.assertTrue(be.pressPowerButton() == status, "the power button should not work while the claim waits")
+                    helper.assertTrue(
+                        be.computer.machine == null && be.computer.isRestorePending && be.isClaimDeferred,
+                        "the power button should change nothing: ${be.computer}",
+                    )
+                    // チャンクのアンロード
+                    be.onChunkUnloaded()
+                    helper.assertTrue(!be.isClaimDeferred && !store.isClaimDeferred(be), "unloading should cancel the waiting claim")
+                    phase = 1
+                }
+                1 -> {
+                    // 取り消した待ちは、読みが終わっても確定しない
+                    if (helper.tick < start + 30) return@onEachTick
+                    helper.assertTrue(be.identity == null && be.lastClaim == null, "a cancelled claim should not be decided: ${be.identity}, ${be.lastClaim}")
+                    helper.assertTrue(store.index.ownerOf(id) == null, "a cancelled claim should not be indexed")
+                    helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a cancelled claim should not join the restore queue")
+                    helper.setBlock(ORIGINAL, Blocks.AIR)
+                    helper.succeed()
+                }
+            }
+        }
+    }
+
+    /**
+     * `onLoad` で待ちになって、順番待ちへの offer を見送った台（印だけ立てた）が、待つ間の `loadAdditional`（`/data merge`）でメモリで
+     * 決まる値（形の合わない ID）に出し直されると、その場で確定して順番待ちに入る（`onDeferredClaim` は来ないので、見送った offer を
+     * ここで出す。入らないと、FULL の出入りかアンロードまで復元されない）。ID を消した（生の値がなくなった）ときも同じ
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    fun reclaimDuringTheWaitOffersTheSkippedRestore(helper: GameTestHelper) {
+        val store: MachineSaveStore = WorldMachineSaves.current ?: run {
+            helper.fail("no machine save store")
+            return
+        }
+        val first = UUID.randomUUID()
+        val second = UUID.randomUUID()
+        store.forgetOwnerForTest(first)
+        store.forgetOwnerForTest(second)
+        val invalid = place(helper, COPIES[0], first, poweredOn = true)
+        val removed = place(helper, COPIES[1], second, poweredOn = true)
+        helper.onEachTick {
+            if (!invalid.isLoadedOnServer || !removed.isLoadedOnServer) return@onEachTick
+            for (be in listOf(invalid, removed)) {
+                helper.assertTrue(be.isClaimDeferred && be.computer.isRestorePending, "the claim should wait: ${be.computer}")
+                helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should not be offered yet")
+            }
+            // 生の値が、メモリで決まる値（形の合わない ID・ID なし）に変わる
+            invalid.loadWithComponents(rawTag(helper, invalid, "not-a-uuid", true), helper.level.registryAccess())
+            removed.loadWithComponents(rawTag(helper, removed, null, true), helper.level.registryAccess())
+            helper.assertTrue(
+                !invalid.isClaimDeferred && invalid.lastClaim == ClaimResult.NEW_ID_INVALID,
+                "the invalid id should be decided at once: ${invalid.lastClaim}",
+            )
+            helper.assertTrue(!removed.isClaimDeferred, "a case without an id should not wait")
+            for (be in listOf(invalid, removed)) {
+                helper.assertTrue(!store.isClaimDeferred(be), "the old wait should be cancelled")
+                helper.assertTrue(ServerMachines.isRestoreQueued(be), "the skipped restore should be offered when the claim is decided: ${be.computer}")
+            }
+            helper.setBlock(COPIES[0], Blocks.AIR)
+            helper.setBlock(COPIES[1], Blocks.AIR)
+            helper.succeed()
+        }
+    }
+
+    /**
+     * ID のないまま復元の順番待ちに入っている台が、`/data merge` で（読みの要る）ID を得て待ちになると、順番待ちから外れる
+     * （ID のないまま順番が来ると冷えた起動になる）。確定したら、その ID で順番待ちに入り直す
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    fun claimDeferredWhileQueuedLeavesTheRestoreQueue(helper: GameTestHelper) {
+        val store: MachineSaveStore = WorldMachineSaves.current ?: run {
+            helper.fail("no machine save store")
+            return
+        }
+        val id = UUID.randomUUID()
+        store.forgetOwnerForTest(id)
+        val be = place(helper, ORIGINAL, null, poweredOn = true)
+        val start = helper.tick
+        var phase = 0
+        helper.onEachTick {
+            when (phase) {
+                0 -> {
+                    if (!be.isLoadedOnServer) return@onEachTick
+                    helper.assertTrue(!be.isClaimDeferred && ServerMachines.isRestoreQueued(be), "a case without an id should be queued: ${be.computer}")
+                    be.loadWithComponents(rawTag(helper, be, id.toString(), true), helper.level.registryAccess())
+                    helper.assertTrue(be.isClaimDeferred, "the new id should need a read")
+                    helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should leave the restore queue")
+                    helper.assertTrue(be.computer.isRestorePending, "the restore wait should stay visible: ${be.computer}")
+                    phase = 1
+                }
+                1 -> {
+                    if (be.isClaimDeferred) {
+                        if (helper.tick > start + 80) helper.fail("the waiting claim should be decided")
+                        return@onEachTick
+                    }
+                    helper.assertTrue(be.identity?.id == id, "the case should keep the merged id: ${be.identity}, ${be.lastClaim}")
+                    helper.assertTrue(
+                        ServerMachines.isRestoreQueued(be) || be.restoreStarts == 1,
+                        "the case should join the restore queue after the claim is decided: ${be.computer}",
+                    )
+                    helper.setBlock(ORIGINAL, Blocks.AIR)
                     helper.succeed()
                 }
             }

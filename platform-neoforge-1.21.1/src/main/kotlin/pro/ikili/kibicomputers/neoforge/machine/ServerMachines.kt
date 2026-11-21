@@ -499,6 +499,9 @@ object ServerMachines {
         restoreQueue.remove(be)
     }
 
+    /** [be] が復元の順番待ちに積まれている（テスト用） */
+    internal fun isRestoreQueued(be: CaseBlockEntity): Boolean = be in restoreQueue
+
     /** 復元の順番待ちの台数（テスト用） */
     internal val pendingRestores: Int get() = restoreQueue.size
 

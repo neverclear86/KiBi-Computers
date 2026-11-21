@@ -39,6 +39,7 @@ import pro.ikili.kibicomputers.core.persist.Claim
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
@@ -451,15 +452,40 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // 先に取り出して ID が決まっていれば（書き込み中を含む）、それを使う（置いた直後の tick に取り出したときなど）
         if (currentIdentity != null) return
         val store = WorldMachineSaves.current ?: return
+        val wasDeferred = isClaimDeferred
         cancelDeferredClaim()
+        resolveClaim(store)
+        // onLoad で待ちになって順番待ちへの offer を見送った台が、待つ間の loadAdditional で出し直されてその場で決まったとき
+        // （[onDeferredClaim] は来ない）。生の値がなくなって待たなくなったときも同じ
+        if (wasDeferred && !isClaimDeferred) offerRestoreAfterClaim()
+    }
+
+    private fun resolveClaim(store: MachineSaveStore) {
         val self = owner ?: return
         val raw = rawId ?: return
+        // 動いている台（ID がまだない。置いた後に起動した台など）が `/data merge` で ID を得たときは、待たずに同期で確定する（これまでと同じ）。
+        // 待つと、待つ間の取り出し（アンロード・停止）が飛ばされて状態を失い、電源ボタンも効かなくなる。
+        // 復元の途中の台も同じ（マシンがある）。起動の直後の台に限られるので、メインスレッドの読みは普段は起きない
+        if (computer.machine != null) {
+            applyClaim(store.claim(raw, rawGeneration ?: 0, rawEpoch ?: 0, self), raw)
+            return
+        }
         val claim = store.claimOrDefer(raw, rawGeneration ?: 0, rawEpoch ?: 0, self, this)
         if (claim == null) {
             isClaimDeferred = true
+            // ID のないまま復元の順番待ちに入っていた台は、順番を外す（ID のないまま順番が来ると、冷えた起動になる）。
+            // 順番待ちの印（RUNNING の表示）は残し、確定したら [onDeferredClaim] が入れ直す
+            ServerMachines.cancelRestore(this)
             return
         }
         applyClaim(claim, raw)
+    }
+
+    /** 待っていた claim が決まった後に、電源が入っていてチャンクが FULL なら、復元の順番待ちに入れる（FULL でなければ、FULL に戻ったときに入る） */
+    private fun offerRestoreAfterClaim() {
+        val level = level as? ServerLevel ?: return
+        if (isRemoved || !loadedOnServer) return
+        if (level.hasChunkAt(blockPos) && computer.beginRestore()) ServerMachines.offerRestore(this)
     }
 
     private fun applyClaim(claim: Claim, raw: String?) {
@@ -484,8 +510,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         }
         isClaimDeferred = false
         applyClaim(claim, rawId)
-        val level = level as? ServerLevel ?: return
-        if (level.hasChunkAt(blockPos) && computer.beginRestore()) ServerMachines.offerRestore(this)
+        offerRestoreAfterClaim()
     }
 
     /** 待っている claim を取り消す（#869。アンロード・`setRemoved`・出し直し） */

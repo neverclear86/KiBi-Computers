@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -262,5 +263,88 @@ class MachineDeferredClaimTest {
         val id = UUID.randomUUID()
         assertEquals(ClaimResult.KEPT, store.claimOrDefer(id.toString(), 0, 0, at(0), Key("k"))?.result)
         assertEquals(0, store.deferredClaims)
+    }
+
+    @Test
+    fun `先読みのスレッドに頼んだ後、結果が入らないまま先読みが終われば、次のpollが書き込みのスレッドに回し直す`() {
+        val id = UUID.randomUUID()
+        writeOwner(id, OwnerRecord(0, at(0)))
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test", manual)
+        // 先読みのスレッドが、結果を入れずに落ちる（Error は読みの失敗として拾わず、結果が入らない）
+        store.prefetchOwnerReader = { throw AssertionError("the prefetch thread died") }
+        var prefetch: Runnable? = null
+        store.startOwnerPrefetch { prefetch = it }
+        val key = Key("late")
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(0), key))
+        assertEquals(1, store.prefetchRequests, "先読みが動いているので、先に読んでもらう")
+        assertEquals(0, store.writerOwnerReadRequests)
+        assertThrows(AssertionError::class.java) { prefetch!!.run() }
+        assertTrue(store.pollDeferredClaims().isEmpty(), "結果がないので、まだ決まらない")
+        assertEquals(1, store.writerOwnerReadRequests, "先読みが終わったので、書き込みのスレッドに回し直す")
+        manual.runAll()
+        val done = store.pollDeferredClaims()
+        assertEquals(listOf(key), done.map { it.key })
+        assertEquals(ClaimResult.KEPT, done.single().claim.result)
+        assertEquals(0, store.mainOwnerReads)
+    }
+
+    @Test
+    fun `根の列挙が欠けて先読みのIDにないIDは、先読みに頼まず書き込みのスレッドが読む`() {
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test", manual)
+        store.scanComplete = false
+        var prefetch: Runnable? = null
+        store.startOwnerPrefetch { prefetch = it }
+        // 先読みの対象を決めた後に現れた ID（列挙が欠けていて分からなかった）
+        val id = UUID.randomUUID()
+        writeOwner(id, OwnerRecord(0, at(0)))
+        val key = Key("unlisted")
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(0), key))
+        assertEquals(0, store.prefetchRequests, "先読みの ID にないので頼まない")
+        assertEquals(1, store.writerOwnerReadRequests)
+        manual.runAll()
+        val done = store.pollDeferredClaims()
+        assertEquals(ClaimResult.KEPT, done.single().claim.result)
+        assertEquals(id, done.single().claim.identity!!.id)
+        assertEquals(0, store.mainOwnerReads)
+        prefetch!!.run()
+    }
+
+    @Test
+    fun `owner_binの書き込みの失敗を受け取る前に読みの仕事を後ろに入れても、確定が登録を新しくして、失敗を受け取っても外れない`() {
+        val id = UUID.randomUUID()
+        writeOwner(id, OwnerRecord(0, at(0)))
+        // 引き取りの owner.bin を書けなくする（一時ファイルの場所が空でないディレクトリ）
+        val blocker = dir.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME + ".tmp")
+        Files.createDirectories(blocker)
+        Files.write(blocker.resolve("x"), byteArrayOf(1))
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test", manual)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 0, 0, at(1)).result)
+        manual.runAll()
+        assertTrue(store.isUnusable(id), "書けなかった失敗はまだ受け取っていない（規則 7b の印）")
+        // 引き取った台がアンロードされ、覚えている owner.bin を忘れた（読みが要る）ところに、別の写しが来る
+        store.index.removeIfOwner(id, at(1))
+        store.forgetOwnerForTest(id)
+        val key = Key("copy")
+        assertNull(store.claimOrDefer(id.toString(), 0, 0, at(2), key))
+        assertEquals(1, store.writerOwnerReadRequests, "印が付いたままでも、読みの仕事を列の後ろに入れる")
+        // 読みの仕事が先に走り、書けなかった前の owner.bin（持ち主 at(0)）を読む
+        manual.runAll()
+        Files.delete(blocker.resolve("x"))
+        Files.delete(blocker)
+        // 失敗を受け取る前に確定する（確定が登録を新しくするので、後から失敗を受け取っても外れない）
+        val done = store.pollDeferredClaims()
+        assertEquals(ClaimResult.TAKEN_OVER, done.single().claim.result)
+        assertTrue(store.pollCompleted().isEmpty())
+        assertEquals(at(2), store.ownerOf(id), "古い失敗を受け取っても、引き取り直した ID を外さない")
+        assertEquals(at(2), store.index.ownerOf(id))
+        // 引き取り直しの owner.bin は、書ける状態になってから走る
+        manual.runAll()
+        assertEquals(OwnerRecord(1, at(2)), readOwner(id))
+        assertFalse(store.isUnusable(id), "書けたので印が外れる")
+        assertTrue(store.pollCompleted().isEmpty())
+        assertEquals(at(2), store.ownerOf(id))
     }
 }
