@@ -961,6 +961,10 @@ internal class LoadRun(
 
     /** 測りはじめたときの、このプロセスの CPU 時間（ナノ秒。#740。測っていない・取れなければ -1） */
     private var cpuAtMeasure = -1L
+
+    /** 段階の終わりに読んだ燃料の数え口と JVM の CPU 時間（[next]。検証や GC の前）。[finish] が測りはじめ（[fuelAtMeasure]・[cpuAtMeasure]）との差を取る */
+    private var endFuel: FuelCounts = FuelCounts.ZERO
+    private var endCpu = -1L
     private val osBean = ManagementFactory.getOperatingSystemMXBean() as? com.sun.management.OperatingSystemMXBean
 
     /** 計算させた台の燃料の設定（#740。結果に書く） */
@@ -1415,6 +1419,9 @@ internal class LoadRun(
     }
 
     private fun next(p: LoadPhase) {
+        // CPU 時間と燃料は、検証（全台の describeProcesses）・スレッドの数え・強制 GC より前に読む（その分の CPU 時間を、測った区間に入れない）
+        endFuel = FuelCounts.current()
+        endCpu = osBean?.processCpuTime ?: -1
         verify(p)
         finish()
         val i = sequence.indexOf(p) + 1
@@ -2160,9 +2167,9 @@ internal class LoadRun(
             longTicks = longTicks.toList(),
             longTickCount = longTickCount,
             sectionMarks = sectionMarks.copyOf(),
-            fuel = fuelAtMeasure?.let { FuelCounts.current() - it },
+            fuel = fuelAtMeasure?.let { endFuel - it },
             peakFuelThreadWaits = if ((p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) && fuelAtMeasure != null) peakFuelThreadWaits else -1,
-            cpuNanos = if (cpuAtMeasure >= 0 && fuelAtMeasure != null) (osBean?.processCpuTime ?: -1).let { if (it >= 0) it - cpuAtMeasure else -1 } else -1,
+            cpuNanos = if (cpuAtMeasure >= 0 && fuelAtMeasure != null && endCpu >= 0) endCpu - cpuAtMeasure else -1,
             busyMachines = when (p) {
                 LoadPhase.COMPUTE, LoadPhase.COMPUTE_MULTI -> computingSet.size
                 LoadPhase.OUTPUT, LoadPhase.WATCHED -> outputSet.size
