@@ -9,6 +9,7 @@ import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import java.time.Duration
 import java.util.Collections
+import java.util.ResourceBundle
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -34,10 +35,48 @@ internal class PermitHandOffFailureTest {
         }
     }
 
-    private class Fixture(permits: Int) : AutoCloseable {
-        val executor = FailingExecutor(Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+    /** 出したものを拾う [System.Logger] */
+    private class RecordingLogger : System.Logger {
+        data class Line(val level: System.Logger.Level, val message: String, val thrown: Throwable?)
+
+        val lines: MutableList<Line> = Collections.synchronizedList(ArrayList())
+
+        override fun getName(): String = "test"
+
+        override fun isLoggable(level: System.Logger.Level): Boolean = true
+
+        override fun log(level: System.Logger.Level, bundle: ResourceBundle?, msg: String?, thrown: Throwable?) {
+            lines += Line(level, msg ?: "", thrown)
+        }
+
+        // 既定の log(level, msg) は params に null の配列を渡して、下の vararg の Kotlin の実装が NPE になるので、ここで受ける
+        override fun log(level: System.Logger.Level, msg: String?) {
+            lines += Line(level, msg ?: "", null)
+        }
+
+        override fun log(level: System.Logger.Level, bundle: ResourceBundle?, format: String?, vararg params: Any?) {
+            lines += Line(level, format ?: "", null)
+        }
+
+        fun of(level: System.Logger.Level): List<Line> = lines.toList().filter { it.level == level }
+    }
+
+    /** [single] なら、ワーカーは1本だけ（渡した順に動く） */
+    private class Fixture(
+        permits: Int,
+        single: Boolean = false,
+        summaryIntervalTicks: Long = 1200,
+        val log: RecordingLogger = RecordingLogger(),
+    ) : AutoCloseable {
+        val executor = FailingExecutor(
+            if (single) {
+                Executors.newSingleThreadExecutor { r -> KernelThreadsProbe.thread(r) }
+            } else {
+                Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) }
+            },
+        )
         val workers = WorkerPool(1L shl 20, 1_000, executor)
-        val pool = PermitPool(permits, workers)
+        val pool = PermitPool(permits, workers, summaryIntervalTicks, log)
         val order: MutableList<String> = Collections.synchronizedList(ArrayList())
 
         /** 動いたら名前を残し、許可を返す仕事 */
@@ -175,6 +214,40 @@ internal class PermitHandOffFailureTest {
             assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.strandedTasks)
+            // a と b の2つ。続きとして置いた時と、渡し直せた時で、b を二重に数えない
+            waitUntil("数えない") { f.workers.submitted.get() >= 2L }
+            Thread.sleep(50)
+            assertEquals(2L, f.workers.submitted.get(), "続きを渡し直しても1回だけ数える")
+        }
+    }
+
+    @Test
+    fun `例外で抜けたワーカーの続きを、すぐ渡せたときも1回だけ数える`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(1).use { f ->
+            val done = CountDownLatch(1)
+            f.pool.submit("a") {
+                f.pool.submit("b", f.task("b", done))
+                f.pool.release(inline = true)
+                throw IllegalStateException("テストの失敗")
+            }
+            assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
+            waitUntil("数えない") { f.workers.submitted.get() >= 2L }
+            Thread.sleep(50)
+            assertEquals(2L, f.workers.submitted.get(), "a と b を1回ずつ")
+        }
+    }
+
+    @Test
+    fun `ワーカーの続きにした仕事も1回だけ数える`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(1).use { f ->
+            val done = CountDownLatch(1)
+            f.pool.submit("a") {
+                f.pool.submit("b", f.task("b", done))
+                f.pool.release(inline = true)
+            }
+            assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
+            assertEquals(2L, f.workers.submitted.get(), "a と b を1回ずつ")
         }
     }
 
@@ -191,6 +264,134 @@ internal class PermitHandOffFailureTest {
             f.pool.retryStranded()
             assertTrue(done.await(5, TimeUnit.SECONDS))
             assertEquals(before + 1, f.workers.submitted.get(), "渡し直しで1回だけ数える")
+        }
+    }
+
+    @Test
+    fun `releaseで次の仕事を渡せたら、取り残していた仕事も渡し直す（tickを待たない）`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(2).use { f ->
+            val done = CountDownLatch(2)
+            f.pool.acquire()
+            f.pool.acquire()
+            f.pool.submit("a", f.task("a", done))
+            f.pool.submit("b", f.task("b", done))
+            f.executor.failuresLeft.set(1)
+            f.pool.release()
+            assertEquals(1, f.pool.strandedTasks, "a は取り残される")
+            // b は渡せる。そのときに a も渡し直される（retryStranded も tick も呼ばない）
+            f.pool.release()
+            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            assertEquals(0, f.pool.strandedTasks)
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 2 }
+        }
+    }
+
+    @Test
+    fun `submitでワーカーに渡せたら、取り残していた仕事も渡し直す（tickを待たない）`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(2).use { f ->
+            val done = CountDownLatch(1)
+            f.pool.acquire()
+            f.pool.acquire()
+            f.pool.submit("a", f.task("a", done))
+            // 1回目は release の渡し、2回目は 2 つ目の release の中の retryStranded で、どちらも失敗させる。
+            // 許可は1つ空き、a は取り残しの先頭に残る
+            f.executor.failuresLeft.set(2)
+            f.pool.release()
+            f.pool.release()
+            assertEquals(1, f.pool.strandedTasks, "a は取り残されたまま")
+            assertEquals(1, f.pool.availablePermits())
+            assertEquals(2L, f.pool.handOffFailures.get())
+            assertEquals(0, f.executor.failuresLeft.get())
+            // 空いた許可で直接渡す。渡せたら a も渡し直される（retryStranded も tick も呼ばない）
+            // b は許可を持ったまま止める（b が許可を返す release が渡し直すのではなく、submit が渡し直すことを確かめる）
+            val gate = CountDownLatch(1)
+            f.pool.submit("b") {
+                f.order += "b"
+                gate.await(10, TimeUnit.SECONDS)
+                f.pool.release()
+            }
+            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            assertEquals(0, f.pool.strandedTasks)
+            assertEquals(1, f.order.count { it == "a" })
+            gate.countDown()
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 2 }
+        }
+    }
+
+    @Test
+    fun `取り残しが複数あっても、前から順に渡し直す（失敗したら先頭に戻す）`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(3, single = true).use { f ->
+            val done = CountDownLatch(3)
+            repeat(3) { f.pool.acquire() }
+            f.pool.submit("a", f.task("a", done))
+            f.pool.submit("b", f.task("b", done))
+            f.pool.submit("c", f.task("c", done))
+            // release ごとに次の仕事が渡せず、a・b・c の順に取り残しの列へ入る
+            f.executor.failuresLeft.set(3)
+            repeat(3) { f.pool.release() }
+            assertEquals(3, f.pool.strandedTasks)
+            assertEquals(3L, f.pool.handOffFailures.get())
+            // 先頭の a が渡せなければ、a を先頭に戻して打ち切る（b・c を先に渡さない）
+            f.executor.failuresLeft.set(1)
+            f.pool.retryStranded()
+            assertEquals(3, f.pool.strandedTasks, "渡せなければ戻す")
+            assertEquals(4L, f.pool.handOffFailures.get())
+            assertEquals(emptyList<String>(), f.order.toList())
+            // 1回の呼び出しで、残りを前から渡し切る
+            f.pool.retryStranded()
+            assertEquals(0, f.pool.strandedTasks)
+            assertTrue(done.await(5, TimeUnit.SECONDS), "全部進まない")
+            assertEquals(listOf("a", "b", "c"), f.order.toList(), "先に取り残したものが先に動く")
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 3 }
+        }
+    }
+
+    // ---- 運用の側のログ ----
+
+    @Test
+    fun `取り残しの始まりに1回、続く間は要約、復旧で1回、再発でまたスタックトレース付きで出す`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(1, summaryIntervalTicks = 100).use { f ->
+            val log = f.log
+            val done = CountDownLatch(2)
+            f.pool.acquire()
+            f.pool.submit("a", f.task("a", done))
+            f.pool.tick(1_000)
+            f.executor.alwaysFail = true
+            f.pool.release()
+            val warnings = log.of(System.Logger.Level.WARNING)
+            assertEquals(1, warnings.size, "始まりに1回")
+            assertTrue(warnings[0].thrown is OutOfMemoryError, "スタックトレース付き")
+            // 続く間: 毎 tick の渡し直しの失敗はログに出さず数える。間が過ぎるまで要約も出ない
+            f.pool.tick(1_050)
+            f.pool.tick(1_099)
+            assertEquals(1, log.of(System.Logger.Level.WARNING).size)
+            assertEquals(3L, f.pool.handOffFailures.get())
+            f.pool.tick(1_100)
+            val summary = log.of(System.Logger.Level.WARNING)
+            assertEquals(2, summary.size, "間が過ぎたら要約")
+            assertEquals(null, summary[1].thrown)
+            assertTrue("取り残し 1 件" in summary[1].message && "4 回" in summary[1].message, summary[1].message)
+            f.pool.tick(1_150)
+            assertEquals(2, log.of(System.Logger.Level.WARNING).size, "要約の間は繰り返さない")
+            // 復旧
+            f.executor.alwaysFail = false
+            f.pool.tick(1_151)
+            assertEquals(0, f.pool.strandedTasks)
+            assertEquals(1, log.of(System.Logger.Level.INFO).size, "復旧で1回")
+            f.pool.tick(2_000)
+            assertEquals(1, log.of(System.Logger.Level.INFO).size)
+            assertEquals(2, log.of(System.Logger.Level.WARNING).size, "復旧後は要約を出さない")
+            // 再発
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
+            f.pool.acquire()
+            f.pool.submit("b", f.task("b", done))
+            f.executor.failuresLeft.set(1)
+            f.pool.release()
+            val again = log.of(System.Logger.Level.WARNING)
+            assertEquals(3, again.size, "再発はもう一度スタックトレース付きで出す")
+            assertTrue(again[2].thrown is OutOfMemoryError)
+            f.pool.retryStranded()
+            assertTrue(done.await(5, TimeUnit.SECONDS))
         }
     }
 

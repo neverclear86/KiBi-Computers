@@ -58,7 +58,10 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
     /** step を動かしているワーカーの数（数え口） */
     val activeSteps: AtomicInteger = AtomicInteger()
 
-    /** 渡した step の数（数え口）。渡せなかった（投げた）ものは数えない */
+    /**
+     * 渡した step の数（数え口）。1つの step を1回だけ数える。渡せなかった（投げた）ものは数えず、渡し直して渡せた回に数える。
+     * 続き（[offerContinuation]）は、置いた時ではなく、ワーカーが続きとして動かす時（例外で抜けたときは [execute] で渡し直せた時）に数える
+     */
     val submitted: AtomicLong = AtomicLong()
 
     /** [offerContinuation] で置いた続きを、例外で抜けたワーカーから渡し直せなかったときの受け口（#870） */
@@ -94,7 +97,6 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
      */
     fun offerContinuation(task: Runnable): Boolean {
         if (!inWorker.get() || continuation.get() != null) return false
-        submitted.incrementAndGet()
         continuation.set(task)
         return true
     }
@@ -105,7 +107,7 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
         try {
             while (current != null) {
                 runOne(current)
-                current = takeContinuation()
+                current = takeContinuation()?.also { submitted.incrementAndGet() }
             }
         } finally {
             inWorker.set(false)
