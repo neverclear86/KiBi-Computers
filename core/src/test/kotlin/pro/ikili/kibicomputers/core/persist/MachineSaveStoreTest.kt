@@ -41,18 +41,19 @@ class MachineSaveStoreTest {
     }
 
     @Test
-    fun `IDを振るとowner_binが書かれ、索引に入り、世代のファイルを書ける`() {
+    fun `IDを振ると索引に入り、最初の世代の前にowner_binが書かれる`() {
         val identity = store.assignNewId(p)!!
         assertEquals(0, identity.generation)
         assertEquals(0, identity.epoch)
         assertEquals(p, index.ownerOf(identity.id))
-        val record = OwnerRecord.read(store.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME))!!
-        assertEquals(OwnerRecord(0, p), record)
+        assertEquals(p, store.ownerOf(identity.id))
+        assertEquals(null, OwnerRecord.read(store.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)), "振った時点では書かない（#585）")
         assertEquals(OptionalLong.empty(), store.chunkGeneration(identity.id), "ID を振った台は印なしから始める")
 
         val result = store.write(identity, p, source)
         assertFalse(result.reassigned)
-        assertEquals(1, result.writes)
+        assertEquals(2, result.writes, "owner.bin と世代")
+        assertEquals(OwnerRecord(0, p), OwnerRecord.read(store.directoryOf(identity.id).resolve(OwnerRecord.FILE_NAME)))
         assertEquals(1, result.identity.generation)
         val file = store.generationFile(identity.id, 1)
         val snapshot = DataInputStream(Files.newInputStream(file)).use { MachineSnapshot.readFrom(it) }
