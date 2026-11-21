@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.computer.WorldDisks
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInput
+import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -51,6 +52,7 @@ object KiBiComputersNeoForge {
         DeviceWiring.register()
         WorldDisks.register()
         WorldMachineSaves.register()
+        SaveCleanups.register()
         CaseAccess.register()
         AccessRequests.register()
         KiBiCommands.register()
