@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.persist
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -644,6 +645,282 @@ class SaveCleanupTest {
             }
         } finally {
             pool.shutdownNow()
+        }
+    }
+
+    // ---- 待っている claim（#869・#874） ----
+
+    @Test
+    fun `owner_binの読みを待つclaimのIDは見たIDとして残し、待ちはTAKEN_OVERで確定する`() {
+        // 前の位置は p。運んだ先 q での claim が、書き込みのスレッドの owner.bin の読みを待っている間に掃除が走る
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val key = Any()
+        assertNull(store.claimOrDefer(id.toString(), 1, 0, q, key))
+        assertTrue(store.isClaimDeferred(key))
+        assertTrue(store.seenThisSession(id))
+        // 読みの仕事は列で走るが、結果はまだ受け取らない（pollDeferredClaims を呼ばない）
+        val cleanup = runManual(cleanup(store), manual)
+        assertTrue(store.isClaimDeferred(key))
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertEquals(1, cleanup.report.seen)
+        assertEquals(0, cleanup.report.deleted)
+        assertTrue(asked.isEmpty())
+        // 掃除が消していないので、待ちは owner.bin を読んだ結果で引き取りになる
+        val claims = store.pollDeferredClaims()
+        assertEquals(ClaimResult.TAKEN_OVER, claims.single().claim.result)
+        assertEquals(id, claims.single().claim.identity?.id)
+    }
+
+    // ---- 仕事が列に残る置き場・閉じた列・書き込みのスレッド ----
+
+    /** [cleanup] を、tick のたびに [manual] の列を流して終わるまで進める */
+    private fun runManual(cleanup: SaveCleanup, manual: ManualSaveExecutor): SaveCleanup {
+        var ticks = 0
+        while (!cleanup.finished) {
+            cleanup.tick()
+            manual.runAll()
+            check(++ticks < 10_000) { "the cleanup did not finish" }
+        }
+        return cleanup
+    }
+
+    /** [cleanup] を、[until] が真になるまで進める（真になった tick の後は列を流さずに返す） */
+    private fun advanceManual(cleanup: SaveCleanup, manual: ManualSaveExecutor, until: () -> Boolean) {
+        var ticks = 0
+        while (true) {
+            cleanup.tick()
+            if (until()) return
+            check(!cleanup.finished) { "the cleanup finished before the condition (${cleanup.phase})" }
+            manual.runAll()
+            check(++ticks < 10_000) { "the condition did not hold" }
+        }
+    }
+
+    /** 止めた後、結果を受け取りきるまで [manual] を流しながら tick する */
+    private fun settleManual(cleanup: SaveCleanup, manual: ManualSaveExecutor) {
+        var ticks = 0
+        while (cleanup.settling) {
+            manual.runAll()
+            cleanup.tick()
+            check(++ticks < 10_000) { "the cleanup did not settle" }
+        }
+    }
+
+    private fun staleTemp(): Path {
+        Files.createDirectories(modulesRoot)
+        val stale = modulesRoot.resolve("stale.tmp")
+        Files.writeString(stale, "x")
+        Files.setLastModifiedTime(stale, FileTime.fromMillis(old))
+        return stale
+    }
+
+    @Test
+    fun `列に残った調べ・参照の読みは、止めた後に走ると何もせずに結果を返す`() {
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        var stopped = false
+        val inspections = ArrayList<CleanupInspection>()
+        store.inspectForCleanup(id, { stopped }) { inspections += it }
+        val references = ArrayList<Set<String>?>()
+        store.readModuleReferences(id.toString(), { stopped }) { references += it }
+        assertEquals(2, manual.size)
+        assertTrue(inspections.isEmpty() && references.isEmpty())
+        // 列に入った後で止める
+        stopped = true
+        manual.runAll()
+        assertTrue(inspections.single().skipped)
+        assertFalse(inspections.single().exists)
+        assertNull(references.single())
+        // 止めなければ調べる
+        store.inspectForCleanup(id, { false }) { inspections += it }
+        manual.runAll()
+        assertTrue(inspections[1].exists && !inspections[1].skipped && inspections[1].owner != null)
+    }
+
+    @Test
+    fun `仕事が列に残る置き場で調べの途中に止めると、問いも削除も入れずに結果を受け取りきる`() {
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val cleanup = cleanup(store)
+        cleanup.tick()
+        // 調べの仕事が列に残っている（まだ走っていない）
+        assertEquals(1, manual.size)
+        cleanup.cancel()
+        assertTrue(cleanup.settling)
+        settleManual(cleanup, manual)
+        assertFalse(cleanup.settling)
+        repeat(5) { cleanup.tick() }
+        assertEquals(0, manual.size)
+        assertTrue(asked.isEmpty())
+        assertEquals(0, cleanup.report.deleted)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        // 「消した」にしていないので、claim はディスクの owner.bin を読む
+        assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+    }
+
+    @Test
+    fun `仕事が列に残る置き場でモジュールの参照の読みの途中に止めると、モジュールを消さない`() {
+        val (unused) = oldModules("unused")
+        answers[q] = MachineReference.PRESENT
+        previousMachine(q)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val cleanup = cleanup(store, FileModuleStore(modulesRoot))
+        advanceManual(cleanup, manual) { cleanup.phase == SaveCleanup.Phase.MODULE_REFS && manual.size > 0 }
+        cleanup.cancel()
+        settleManual(cleanup, manual)
+        repeat(5) { cleanup.tick() }
+        assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
+        assertEquals(0, cleanup.report.modulesDeleted)
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+    }
+
+    @Test
+    fun `仕事が列に残る置き場でモジュールの削除の途中に止めると、列に残ったモジュールと一時ファイルの仕事は何もしない`() {
+        val (unused) = oldModules("unused")
+        val stale = staleTemp()
+        answers[q] = MachineReference.PRESENT
+        previousMachine(q)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val cleanup = cleanup(store, FileModuleStore(modulesRoot))
+        advanceManual(cleanup, manual) { cleanup.phase == SaveCleanup.Phase.MODULE_DELETE && manual.size > 0 }
+        // 一時ファイルの仕事と、モジュールを消す仕事
+        assertEquals(2, manual.size)
+        cleanup.cancel()
+        settleManual(cleanup, manual)
+        assertFalse(cleanup.settling)
+        assertEquals(0, cleanup.report.modulesDeleted)
+        assertEquals(0, cleanup.report.tempsDeleted)
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+        assertTrue(Files.exists(stale))
+    }
+
+    @Test
+    fun `列が閉じていれば、調べ・参照の読みは結果を返し、何も消さずに終わる`() {
+        val gone = previousMachine(p)
+        val (unused) = oldModules("unused")
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        manual.closed = true
+        val cleanup = runManual(cleanup(store, FileModuleStore(modulesRoot)), manual)
+        assertEquals(SaveCleanup.Phase.DONE, cleanup.phase)
+        assertEquals(1, cleanup.report.undetermined)
+        assertEquals(0, cleanup.report.deleted)
+        assertTrue(cleanup.report.modulesAborted)
+        assertEquals(0, cleanup.report.modulesDeleted)
+        assertTrue(asked.isEmpty())
+        assertTrue(Files.exists(machines.resolve(gone.toString())))
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+    }
+
+    @Test
+    fun `列が閉じていれば、削除の仕事は消さなかったと返し、モジュールの仕事は入らない`() {
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        manual.closed = true
+        val bytes = ArrayList<Long>()
+        assertTrue(store.deleteUnreferenced(id, Long.MAX_VALUE) { bytes += it })
+        assertEquals(listOf(-1L), bytes)
+        store.cleanupDeletionSkipped(id)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        var ran = false
+        assertFalse(store.runOnWriter { ran = true })
+        assertFalse(ran)
+    }
+
+    @Test
+    fun `モジュールの削除の前に列が閉じれば、モジュールも一時ファイルも消さずに終わる`() {
+        val (unused) = oldModules("unused")
+        val stale = staleTemp()
+        answers[q] = MachineReference.PRESENT
+        previousMachine(q)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val cleanup = cleanup(store, FileModuleStore(modulesRoot))
+        advanceManual(cleanup, manual) { cleanup.phase == SaveCleanup.Phase.MODULE_REFS && manual.size > 0 }
+        // 参照の読みは済ませ（結果は次の tick に受け取る）、モジュールの削除を入れる前に列を閉じる
+        manual.runAll()
+        manual.closed = true
+        cleanup.tick()
+        assertEquals(SaveCleanup.Phase.DONE, cleanup.phase)
+        assertFalse(cleanup.report.modulesAborted)
+        assertEquals(1, cleanup.report.modulesUnreferenced)
+        assertEquals(0, cleanup.report.modulesDeleted)
+        assertEquals(0, cleanup.report.tempsDeleted)
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+        assertTrue(Files.exists(stale))
+    }
+
+    /** 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する */
+    private fun runThreaded(cleanup: SaveCleanup, done: () -> Boolean = { cleanup.finished }) {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
+        while (!done()) {
+            cleanup.tick()
+            check(System.nanoTime() < deadline) { "the cleanup did not finish (${cleanup.phase})" }
+            Thread.sleep(1)
+        }
+    }
+
+    @Test
+    fun `書き込みのスレッドの置き場で、ディレクトリとモジュールを掃除する`() {
+        val (referenced, unused) = oldModules("referenced", "unused")
+        val stale = staleTemp()
+        val gone = previousMachine(p)
+        val kept = previousMachine(q, sourceOf(abiSection(hashOf(referenced))))
+        answers[q] = MachineReference.PRESENT
+        val writer = SaveWriter("kibicomputers-cleanup-test")
+        try {
+            val store = MachineSaveStore(machines, MachineIdIndex(), "test", writer)
+            val cleanup = cleanup(store, FileModuleStore(modulesRoot))
+            runThreaded(cleanup)
+            assertEquals(SaveCleanup.Phase.DONE, cleanup.phase)
+            assertFalse(Files.exists(machines.resolve(gone.toString())))
+            assertTrue(Files.exists(machines.resolve(kept.toString())))
+            assertEquals(1, cleanup.report.deleted)
+            assertFalse(cleanup.report.modulesAborted)
+            assertEquals(1, cleanup.report.modulesReferenced)
+            assertEquals(1, cleanup.report.modulesDeleted)
+            assertEquals(1, cleanup.report.tempsDeleted)
+            assertTrue(Files.exists(modulesRoot.resolve("$referenced.wasm")))
+            assertFalse(Files.exists(modulesRoot.resolve("$unused.wasm")))
+            assertFalse(Files.exists(stale))
+        } finally {
+            writer.close(10_000)
+        }
+    }
+
+    @Test
+    fun `書き込みのスレッドの置き場で止めると、列に残った調べは問いも削除も入れず、結果を受け取りきる`() {
+        val (unused) = oldModules("unused")
+        val ids = List(20) { previousMachine(MachineOwner("minecraft:overworld", it * 16, 64, 0)) }
+        val writer = SaveWriter("kibicomputers-cleanup-test")
+        val gate = java.util.concurrent.CountDownLatch(1)
+        try {
+            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める
+            assertTrue(writer.execute(UUID.randomUUID()) { gate.await(10, java.util.concurrent.TimeUnit.SECONDS) })
+            val store = MachineSaveStore(machines, MachineIdIndex(), "test", writer)
+            val cleanup = cleanup(store, FileModuleStore(modulesRoot))
+            cleanup.tick()
+            cleanup.cancel()
+            assertTrue(cleanup.settling)
+            gate.countDown()
+            runThreaded(cleanup) { !cleanup.settling }
+            assertTrue(writer.flush(10_000))
+            repeat(5) { cleanup.tick() }
+            assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
+            assertTrue(asked.isEmpty())
+            assertEquals(0, cleanup.report.deleted)
+            for (id in ids) assertTrue(Files.exists(machines.resolve(id.toString())))
+            assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+        } finally {
+            gate.countDown()
+            writer.close(10_000)
         }
     }
 }

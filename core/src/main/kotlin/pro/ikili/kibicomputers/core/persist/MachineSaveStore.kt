@@ -1345,12 +1345,17 @@ public class MachineSaveStore @JvmOverloads constructor(
     public fun cleanupCandidates(): List<UUID> = scannedNames.mapNotNull { CanonicalUuid.parse(it) }.distinct()
 
     /**
-     * [id] をこのサーバーで見たか（claim・振った・`delete`・掃除で消した・予約した・書けた・印を付けた・索引にある）。
-     * 見た ID のディレクトリは掃除しない（アンロードで索引から外れても、登録・印は残るので見たまま）。メインスレッドだけが呼ぶ
+     * [id] をこのサーバーで見たか（claim・振った・`delete`・掃除で消した・予約した・書けた・印を付けた・索引にある・claim が待っている）。
+     * 見た ID のディレクトリは掃除しない（アンロードで索引から外れても、登録・印は残るので見たまま）。メインスレッドだけが呼ぶ。
+     *
+     * 待っている claim（[claimOrDefer]）は、確定するまで索引・登録・触った ID のどれにも入らないので、[deferredById] で見る。
+     * 見ないと、`owner.bin` の位置と違う場所の claim（運んだ先の引き取り）が読みを待つ間に、元の位置が「ない」と判定されて消え、
+     * 待っていた claim が `TAKEN_OVER` でなく `owner.bin` なしの `KEPT`（冷えた起動）に確定する
      */
     public fun seenThisSession(id: UUID): Boolean =
         id in touched || owners.containsKey(id) || registrations.containsKey(id) || marks.containsKey(id) ||
-            reserved.containsKey(id) || inFlight.containsKey(id) || latest.containsKey(id) || index.ownerOf(id) != null
+            reserved.containsKey(id) || inFlight.containsKey(id) || latest.containsKey(id) || index.ownerOf(id) != null ||
+            deferredById.containsKey(id)
 
     /**
      * [id] のディレクトリを調べる仕事を書き込みの列に入れる（`owner.bin`・最新の更新時刻・世代のファイルの数・大きさ）。

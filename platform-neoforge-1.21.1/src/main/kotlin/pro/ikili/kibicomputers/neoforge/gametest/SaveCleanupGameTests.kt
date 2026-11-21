@@ -25,13 +25,16 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineIdIndex
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineReference
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.persist.OwnerRecord
 import pro.ikili.kibicomputers.core.persist.SaveCleanup
 import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
+import pro.ikili.kibicomputers.core.persist.SaveWriter
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ChunkReferenceProbe
@@ -182,6 +185,50 @@ object SaveCleanupGameTests {
                 val result = server.commands.dispatcher.execute("kibicomputers saves status", server.createCommandSourceStack())
                 helper.assertTrue(result == 1, "saves status should report the last cleanup")
             } finally {
+                deleteTree(root)
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * サーバーと同じ形の置き場（書き込みのスレッド [SaveWriter] で仕事を走らせる）とモジュールの置き場で掃除すると、指されていないディレクトリと、
+     * 参照されていないモジュール・古い一時ファイルを、書き込みのスレッドの仕事（[MachineSaveStore.readModuleReferences]・[MachineSaveStore.runOnWriter]）で消す
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun cleanupOnWriterThreadDeletesDirectoriesAndModules(helper: GameTestHelper) {
+        val level = helper.level
+        ensureVanillaRegion(helper)
+        val root = tempRoot(helper)
+        val modulesRoot = root.resolveSibling("modules")
+        val absent = UUID.randomUUID()
+        val far = FarChunks.reserve(helper)
+        previousDirectory(root, absent, MachineOwner(level.dimension().location().toString(), far.minBlockX, 64, far.minBlockZ))
+        // 前のセッションのモジュール（どの世代も参照しない）と、古い一時ファイル
+        val bytes = "unused-${UUID.randomUUID()}".toByteArray()
+        val hash = ModuleStore.sha256(bytes)
+        helper.assertTrue(FileModuleStore(modulesRoot).put(hash, bytes), "the module should be written")
+        val module = modulesRoot.resolve("${ModuleStore.hex(hash)}.wasm")
+        val stale = modulesRoot.resolve("stale.tmp")
+        Files.writeString(stale, "x")
+        val old = FileTime.fromMillis(System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000)
+        Files.setLastModifiedTime(module, old)
+        Files.setLastModifiedTime(stale, old)
+        val writer = SaveWriter("kibicomputers-cleanup-gametest")
+        val store = MachineSaveStore(root, MachineIdIndex(), "test", writer)
+        val cleanup = SaveCleanup(store, FileModuleStore(modulesRoot), ChunkReferenceProbe(level.server), SaveCleanupSettings(safetyMinimum = 100))
+        helper.startSequence().thenWaitUntil {
+            cleanup.tick()
+            helper.assertTrue(cleanup.finished, "the cleanup should finish (${cleanup.phase})")
+        }.thenExecute {
+            try {
+                val report = cleanup.report
+                helper.assertTrue(cleanup.phase == SaveCleanup.Phase.DONE, "the cleanup should be done: ${cleanup.phase}")
+                helper.assertTrue(report.deleted == 1 && !Files.exists(root.resolve(absent.toString())), "the unreferenced directory should be deleted: $report")
+                helper.assertTrue(!report.modulesAborted && report.modulesDeleted == 1 && !Files.exists(module), "the unreferenced module should be deleted: $report")
+                helper.assertTrue(report.tempsDeleted == 1 && !Files.exists(stale), "the stale temporary file should be deleted: $report")
+            } finally {
+                writer.close(10_000)
                 deleteTree(root)
             }
         }.thenSucceed()
