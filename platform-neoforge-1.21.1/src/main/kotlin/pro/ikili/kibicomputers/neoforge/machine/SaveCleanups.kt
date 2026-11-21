@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.neoforge.machine
 
 import com.mojang.logging.LogUtils
+import net.minecraft.Util
 import net.minecraft.core.BlockPos
 import net.minecraft.core.registries.Registries
 import net.minecraft.gametest.framework.GameTestServer
@@ -15,8 +16,6 @@ import net.minecraft.server.level.ChunkHolder
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.chunk.LevelChunk
-import net.minecraft.world.level.dimension.DimensionType
-import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.server.ServerStartedEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
@@ -34,6 +33,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
+import java.util.concurrent.RejectedExecutionException
 import java.util.function.Consumer
 
 /**
@@ -110,13 +110,19 @@ internal object SaveCleanups {
         val cleanup = SaveCleanup(store, modules, ChunkReferenceProbe(s), settings, dryRun, force)
         running = cleanup
         last = cleanup
-        ticksUntilAuto = -1
+        // 何も消さない試しの実行では、自動の掃除（本番）を取り消さない（自動は、走っている掃除が終わるのを待って始める）
+        if (!dryRun) ticksUntilAuto = -1
         return cleanup
     }
 
     /** サーバーの tick ごとに呼ぶ（[ServerTickEvent.Post]。テストも呼べる） */
     internal fun tick() {
         if (ticksUntilAuto > 0 && --ticksUntilAuto == 0) {
+            if (running?.let { !it.finished || it.settling } == true) {
+                // 試しの実行が走っている間は、終わるまで待つ（自動の掃除を飛ばさない）
+                ticksUntilAuto = 1
+                return tickRunning()
+            }
             ticksUntilAuto = -1
             val override = autoOverride
             autoOverride = null
@@ -127,6 +133,10 @@ internal object SaveCleanups {
             }
             if (started == null) LOGGER.debug("Skipping the automatic computer save cleanup")
         }
+        tickRunning()
+    }
+
+    private fun tickRunning() {
         val cleanup = running ?: return
         try {
             cleanup.tick()
@@ -140,7 +150,7 @@ internal object SaveCleanups {
 }
 
 /**
- * `owner.bin` の位置のチャンクに、その ID のケースがあるかを答える（#564。[MachineReferenceProbe]）。メインスレッドで問われる。
+ * `owner.bin` の位置のチャンクに、その ID のケースがあるかを答える（#564。[MachineReferenceProbe]）。メインスレッドで問われ、答えはどのスレッドからでも返る。
  *
  * - ディメンションが今のサーバーにない（MOD を外しただけかもしれない）: [MachineReference.UNKNOWN]
  * - チャンクの `ChunkHolder` がある（見える表・更新中の表・アンロード待ち。[ServerMachines.findHolder]）: ディスクの NBT は古いかもしれないので、ディスクは読まない（[referenceInHolder]）。
@@ -150,7 +160,8 @@ internal object SaveCleanups {
  *   - FULL でない（途中の段階・INACCESSIBLE に降りた `LevelChunk`・アンロード待ち）: [MachineReference.UNKNOWN]
  * - それ以外: `ChunkMap.read`（IOWorker。書き込み待ちのデータを返す）の `block_entities` に、その座標のケースのタグがあり、
  *   その ID を持つなら [MachineReference.PRESENT]、なければ（チャンクがディスクにないときも）[MachineReference.ABSENT]。読みが失敗したら [MachineReference.UNKNOWN]。
- *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`r.X.Z.mca`）がなければ読まずに
+ *   ディスクの確認と読みは IO のスレッド（`Util.ioPool`）の仕事で、メインスレッドは stat も読みもしない（答えは次の tick 以降に返る）。
+ *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`ChunkMap` が実際に開く保存先の `r.X.Z.mca`。[regionFile]）がなければ読まずに
  *   [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
  *   このセッションで生成したチャンクだけで、そこにあるケースはこのセッションで置いた（ID を振った・claim した）もの、つまり「見た ID」なので、ここには問われない
  *   （消す直前にも見直す）。リージョンファイルがあれば、書き込み待ちは `ChunkMap.read` が返す
@@ -172,8 +183,31 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
             answer.accept(referenceInHolder(holder, id, pos))
             return
         }
+        // ここから先のディスクの確認（stat）と読みは、メインスレッドでしない（遅いディスクで tick を止めない）。IO のスレッドの仕事にする
+        val region = try {
+            regionFile(level, chunk)
+        } catch (e: RuntimeException) {
+            // 保存先が分からない（ChunkMap の中身が想定と違う）なら、削除側には倒さない
+            answer.accept(MachineReference.UNKNOWN)
+            return
+        }
+        try {
+            Util.ioPool().execute {
+                try {
+                    readFromStorage(level, chunk, region, id, pos, answer)
+                } catch (e: RuntimeException) {
+                    answer.accept(MachineReference.UNKNOWN)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            answer.accept(MachineReference.UNKNOWN)
+        }
+    }
+
+    /** IO のスレッドで、チャンクの保存先の確認と読みをする（[probe]） */
+    private fun readFromStorage(level: ServerLevel, chunk: ChunkPos, region: Path, id: UUID, pos: BlockPos, answer: Consumer<MachineReference>) {
         // リージョンファイルがなければ読まない（読みが空のリージョンファイルを作るため）
-        if (!Files.exists(regionFile(level, chunk))) {
+        if (!Files.exists(region)) {
             answer.accept(MachineReference.ABSENT)
             return
         }
@@ -189,10 +223,13 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
     }
 
     companion object {
-        /** ディメンション [level] のチャンク [chunk] のリージョンファイル（`ChunkMap` が開く `<dimension>/region/r.X.Z.mca` と同じ場所） */
+        /**
+         * ディメンション [level] のチャンク [chunk] のリージョンファイル。`ChunkMap` が実際に開く保存先（`RegionFileStorage` の `folder`。
+         * バニラでは `<dimension>/region`）の `r.X.Z.mca`。パスを自分で組み立てず、チャンクを読み書きする側の保存先を直接引くので、
+         * チャンクの保存先を変える環境でも食い違わない（引けなければ例外。呼び出し側は「判定できない」にする）。ファイルの有無は調べない（I/O をしない）
+         */
         fun regionFile(level: ServerLevel, chunk: ChunkPos): Path =
-            DimensionType.getStorageFolder(level.dimension(), level.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize())
-                .resolve("region").resolve("r.${chunk.regionX}.${chunk.regionZ}.mca")
+            level.chunkSource.chunkMap.worker.storage.folder.resolve("r.${chunk.regionX}.${chunk.regionZ}.mca")
 
         /**
          * holder [holder] のあるチャンクの [pos] に、[id] のケースがあるか（メインスレッドで呼ぶ）。FULL のチャンクを持っていればメモリで判定し（[referenceInMemory]）、

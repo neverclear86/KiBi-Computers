@@ -265,6 +265,33 @@ class SaveCleanupTest {
     }
 
     @Test
+    fun `試しの実行のモジュールの数は、本番と同じになる`() {
+        // 消す候補のディレクトリだけが参照するモジュールは、本番では消えるので、試しの実行も「参照なし」に数える
+        val (onlyInGone, inKept, unused) = oldModules("only-in-gone", "in-kept", "unused")
+        answers[p] = MachineReference.ABSENT
+        answers[q] = MachineReference.PRESENT
+        previousMachine(p, sourceOf(abiSection(hashOf(onlyInGone))))
+        previousMachine(q, sourceOf(abiSection(hashOf(inKept))))
+
+        val dry = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), FileModuleStore(modulesRoot), dryRun = true)).report
+        assertEquals(1, dry.unreferenced)
+        assertEquals(0, dry.deleted)
+        assertEquals(3, dry.moduleCandidates)
+        assertEquals(1, dry.modulesReferenced)
+        assertEquals(2, dry.modulesUnreferenced)
+        assertEquals(0, dry.modulesDeleted)
+        assertTrue(Files.exists(modulesRoot.resolve("$onlyInGone.wasm")))
+        assertTrue(Files.exists(modulesRoot.resolve("$unused.wasm")))
+
+        val real = run(cleanup(MachineSaveStore(machines, MachineIdIndex(), "test"), FileModuleStore(modulesRoot))).report
+        assertEquals(dry.modulesReferenced, real.modulesReferenced)
+        assertEquals(dry.modulesUnreferenced, real.modulesUnreferenced)
+        assertEquals(dry.modulesUnreferenced, real.modulesDeleted)
+        assertTrue(Files.exists(modulesRoot.resolve("$inKept.wasm")))
+        assertFalse(Files.exists(modulesRoot.resolve("$onlyInGone.wasm")))
+    }
+
+    @Test
     fun `知らないABI層の世代があればモジュールを1つも消さない`() {
         val (unused) = oldModules("unused")
         answers[p] = MachineReference.PRESENT

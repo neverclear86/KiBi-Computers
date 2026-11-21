@@ -196,7 +196,7 @@ public class SaveCleanupReport {
  * 5. モジュールを消す: 作ったときにあったファイルのうち、参照されておらず、このセッションで使っていないものを列の仕事で消す
  *    （[FileModuleStore.deleteIfUnused]）。置き場の古い一時ファイルも消す
  *
- * [dryRun] なら 3. と 5. で数えるだけで、何も消さない（4. は読む）。
+ * [dryRun] なら 3. と 5. で数えるだけで、何も消さない（4. は読む。ただし消す候補のディレクトリは、本番と数を合わせるために読まない）。
  *
  * スレッド: [tick]・[cancel] と、数え口はメインスレッドだけ。書き込みのスレッド・接続層からの結果は、並行の列に入れて [tick] が受け取る
  *
@@ -498,6 +498,17 @@ public class SaveCleanup @JvmOverloads constructor(
             return
         }
         referenceDirs = store.referenceDirectories()
+        if (dryRun && toDelete.isNotEmpty()) {
+            // 本番は消す候補のディレクトリを消してから参照を読むので、そのディレクトリだけが参照していたモジュールは「参照なし」になる。試しの実行も、消す候補は読まずに数を合わせる
+            referenceDirs = referenceDirs.filter { name ->
+                val id = try {
+                    UUID.fromString(name)
+                } catch (_: IllegalArgumentException) {
+                    null
+                }
+                id == null || id !in toDelete
+            }
+        }
         tickModuleRefs()
     }
 

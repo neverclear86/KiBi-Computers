@@ -9,9 +9,11 @@ import net.minecraft.nbt.Tag
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
+import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.dimension.DimensionType
 import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
@@ -281,6 +283,8 @@ object SaveCleanupGameTests {
         val id = UUID.randomUUID()
         val pos = BlockPos(pending.minBlockX + 1, 70, pending.minBlockZ + 2)
         var present: AtomicReference<MachineReference?>? = null
+        var otherId: AtomicReference<MachineReference?>? = null
+        var otherType: AtomicReference<MachineReference?>? = null
         helper.startSequence().thenWaitUntil {
             helper.assertTrue(absent.get() != null, "the probe of the regionless position should answer")
             helper.assertTrue(ServerMachines.findHolder(level, slot.chunk.toLong()) == null, "the far chunk should unload")
@@ -296,13 +300,156 @@ object SaveCleanupGameTests {
                 putInt("z", pos.z)
                 putString(CaseBlockEntity.MACHINE_ID_TAG, id.toString())
             }
+            // 同じ ID のタグを持つ、別の種類のブロックエンティティ（隣の位置）
+            val chestTag = caseTag.copy().apply {
+                putString("id", BlockEntityType.getKey(BlockEntityType.CHEST).toString())
+                putInt("x", pos.x + 1)
+            }
             // アンロード直後と同じく、IOWorker に NBT を入れた直後に問う
-            level.chunkSource.chunkMap.write(pending, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+            level.chunkSource.chunkMap.write(pending, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag); add(chestTag) }) })
             present = ask(probe, id, dimension, pos)
         }.thenWaitUntil {
             helper.assertTrue(present!!.get() != null, "the probe of the pending chunk should answer")
         }.thenExecute {
-            helper.assertTrue(present!!.get() == MachineReference.PRESENT, "the pending chunk with the case should be present: ${present!!.get()}")
+            helper.assertTrue(present!!.get() == MachineReference.PRESENT, "the pending chunk with the case should be present: ${present.get()}")
+            // 同じ位置でも、ID が違えば「ない」（ID の振り直しの残骸の形）。別の種類のブロックエンティティは、ID のタグが同じでも「ない」
+            otherId = ask(probe, UUID.randomUUID(), dimension, pos)
+            otherType = ask(probe, id, dimension, BlockPos(pos.x + 1, pos.y, pos.z))
+        }.thenWaitUntil {
+            helper.assertTrue(otherId!!.get() != null && otherType!!.get() != null, "the probes of the pending chunk should answer")
+        }.thenExecute {
+            helper.assertTrue(otherId!!.get() == MachineReference.ABSENT, "another id at the case position should be absent: ${otherId.get()}")
+            helper.assertTrue(otherType!!.get() == MachineReference.ABSENT, "another block entity type with the same id tag should be absent: ${otherType.get()}")
+        }.thenSucceed()
+    }
+
+    /**
+     * ディスクのチャンクの NBT（[ChunkReferenceProbe.referenceIn]）は、位置・ブロックエンティティの種類・ID がそろったときだけ「ある」。
+     * ID が違う（振り直し）・位置が違う・種類が違う（ID のタグが同じでも）は「ない」
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun diskReferenceRequiresPositionTypeAndId(helper: GameTestHelper) {
+        val pos = BlockPos(10, 70, 20)
+        val id = UUID.randomUUID()
+        fun tag(type: String, at: BlockPos, machineId: UUID) = CompoundTag().apply {
+            putString("id", type)
+            putInt("x", at.x)
+            putInt("y", at.y)
+            putInt("z", at.z)
+            putString(CaseBlockEntity.MACHINE_ID_TAG, machineId.toString())
+        }
+        val caseType = BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString()
+        val chestType = BlockEntityType.getKey(BlockEntityType.CHEST).toString()
+        val data = CompoundTag().apply {
+            put(
+                "block_entities",
+                ListTag().apply {
+                    add(tag(caseType, pos, id))
+                    add(tag(chestType, pos.east(), id))
+                    add(tag(caseType, pos.north(), UUID.randomUUID()))
+                },
+            )
+        }
+        fun check(expected: MachineReference, at: BlockPos, machineId: UUID, what: String) {
+            val actual = ChunkReferenceProbe.referenceIn(data, machineId, at)
+            helper.assertTrue(actual == expected, "$what should be $expected but was $actual")
+        }
+        check(MachineReference.PRESENT, pos, id, "the case with the same id")
+        check(MachineReference.ABSENT, pos, UUID.randomUUID(), "the case with another id")
+        check(MachineReference.ABSENT, pos.east(), id, "another block entity type with the same id tag")
+        check(MachineReference.ABSENT, pos.north(), id, "the case at that position with another id")
+        check(MachineReference.ABSENT, pos.above(), id, "a position without a block entity")
+        helper.succeed()
+    }
+
+    /**
+     * 読み込まれたチャンク（メモリ）の問いも、ID が違うケース・別の種類のブロックエンティティは「ない」。
+     * 同じ ID は「ある」。ID の振り直しの残骸が、読み込まれているチャンクで消える側になる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun memoryReferenceRequiresTypeAndId(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        val probe = ChunkReferenceProbe(level.server)
+        val casePos = helper.absolutePos(BlockPos(1, 1, 1))
+        level.setBlock(casePos, KiBiBlocks.CASES.getValue(CaseTier.BASIC).get().defaultBlockState(), 3)
+        val case = level.getBlockEntity(casePos) as CaseBlockEntity
+        val id = UUID.randomUUID()
+        case.loadCustomOnly(CompoundTag().apply { putString(CaseBlockEntity.MACHINE_ID_TAG, id.toString()) }, level.registryAccess())
+        val chestPos = helper.absolutePos(BlockPos(1, 1, 0))
+        level.setBlock(chestPos, Blocks.CHEST.defaultBlockState(), 3)
+        helper.assertTrue(level.getBlockEntity(chestPos) != null, "the chest should have a block entity")
+        fun check(expected: MachineReference, at: BlockPos, machineId: UUID, what: String) {
+            // holder があるチャンクはメインスレッドで同期に答える
+            val actual = ask(probe, machineId, dimension, at).get()
+            helper.assertTrue(actual == expected, "$what should be $expected but was $actual")
+        }
+        check(MachineReference.PRESENT, casePos, id, "the loaded case with the same id")
+        check(MachineReference.ABSENT, casePos, UUID.randomUUID(), "the loaded case with another id")
+        check(MachineReference.ABSENT, chestPos, id, "another block entity type at the position")
+        check(MachineReference.ABSENT, helper.absolutePos(BlockPos(2, 1, 2)), id, "a position without a block entity")
+        helper.succeed()
+    }
+
+    /**
+     * チャンクの問いが見るリージョンファイルの保存先（[ChunkReferenceProbe.regionFile]）は、今のサーバーのどのディメンションでも、
+     * バニラの保存先（`DimensionType.getStorageFolder` の `region`）と同じ
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun regionFileMatchesStorageOfEveryDimension(helper: GameTestHelper) {
+        val server = helper.level.server
+        val root = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
+        var count = 0
+        for (level in server.allLevels) {
+            val expected = DimensionType.getStorageFolder(level.dimension(), root).resolve("region").resolve("r.0.-1.mca").toAbsolutePath().normalize()
+            val actual = ChunkReferenceProbe.regionFile(level, ChunkPos(3, -5)).toAbsolutePath().normalize()
+            helper.assertTrue(actual == expected, "the region file of ${level.dimension().location()} should be $expected but was $actual")
+            count++
+        }
+        helper.assertTrue(count >= 1, "the server should have a level")
+        helper.succeed()
+    }
+
+    /**
+     * 起動から [SaveCleanups.START_DELAY_TICKS] tick 以内の試しの実行（`dry-run`）は、自動の掃除（本番）を取り消さない。
+     * 試しの実行が走っている間に自動の時機が来ても、終わるのを待って始める。共有の [SaveCleanups] を使うので、ほかの掃除のテストと重ならないよう別の batch にする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400, batch = "kibicomputers_save_cleanup_auto_dry")
+    fun dryRunDoesNotCancelAutomaticCleanup(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        val autoRoot = tempRoot(helper)
+        val dryRoot = tempRoot(helper)
+        val autoId = UUID.randomUUID()
+        val dryId = UUID.randomUUID()
+        val far = FarChunks.reserve(helper)
+        previousDirectory(autoRoot, autoId, MachineOwner(dimension, far.minBlockX, 64, far.minBlockZ))
+        previousDirectory(dryRoot, dryId, MachineOwner(dimension, far.minBlockX + 1, 64, far.minBlockZ))
+        var dry: SaveCleanup? = null
+        helper.startSequence().thenExecute {
+            SaveCleanups.armAuto(2, MachineSaveStore(autoRoot, MachineIdIndex(), "test"), null)
+            // 自動の前に始めた試しの実行（走っている間に自動の時機が来る）
+            dry = SaveCleanups.start(dryRun = true, force = false, store = MachineSaveStore(dryRoot, MachineIdIndex(), "test"), modules = null)
+            helper.assertTrue(dry != null, "the dry run should start")
+        }.thenWaitUntil {
+            helper.assertTrue(SaveCleanups.last !== dry, "the automatic cleanup should start after the dry run")
+        }.thenWaitUntil {
+            helper.assertTrue(SaveCleanups.last!!.finished, "the automatic cleanup should finish (${SaveCleanups.last!!.phase})")
+        }.thenExecute {
+            try {
+                val auto = SaveCleanups.last!!
+                helper.assertTrue(!auto.dryRun && auto.report.deleted == 1, "the automatic cleanup should delete: ${auto.report}")
+                helper.assertTrue(!Files.exists(autoRoot.resolve(autoId.toString())), "the automatic cleanup should delete its directory")
+                helper.assertTrue(dry!!.finished && Files.isDirectory(dryRoot.resolve(dryId.toString())), "the dry run should delete nothing")
+            } finally {
+                SaveCleanups.stop()
+                deleteTree(autoRoot)
+                deleteTree(dryRoot)
+            }
         }.thenSucceed()
     }
 }
