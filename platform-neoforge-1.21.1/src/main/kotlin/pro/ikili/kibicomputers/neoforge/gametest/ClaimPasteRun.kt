@@ -22,7 +22,10 @@ import java.util.UUID
  * - 写し: 読み込まれている原本と同じ `MachineId` の NBT（全部 `NEW_ID_DUPLICATE_LOADED`）
  * - 知らない ID: このワールドにない UUID（`owner.bin` がないので `KEPT`）
  * - 開き直した後: 貼る位置を持ち主にした `owner.bin` を置いてから置き場を開き直し（再起動の後と同じく、覚えている `owner.bin` が空）、
- *   その ID を貼る（読んで `KEPT`）
+ *   先読みが終わるのを待ってから、その ID を貼る（先読みの値で `KEPT`）
+ * - 開き直した直後（#869）: 同じく開き直し、先読みを待たずに同じ tick に貼る。先読みが読み終えた ID はその場で決まり、未読の ID は
+ *   claim を待ちにして（メインスレッドで読まない）、先読みに先に読んでもらってから後の tick に確定する。直前に書いた `owner.bin` は
+ *   OS のキャッシュに載っていて先読みがすぐ終わりうるので、貼った時点で先読みが終わっていたかも表に出す
  *
  * 部品を入れないので電源は入らず、復元は走らない。結果は Markdown の表でログに出す。
  */
@@ -31,6 +34,7 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         DUPLICATE("写し（読み込まれている原本と同じ ID）"),
         UNKNOWN("知らない ID（owner.bin なし）"),
         REOPENED("開き直した後（owner.bin あり、持ち主が自分）"),
+        REOPENED_NO_WAIT("開き直した直後（先読みを待たない）"),
     }
 
     private class Row(
@@ -44,6 +48,11 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         val pendingAfter: Int,
         val drainMillis: Double,
         val results: Map<String, Int>,
+        val deferred: Long,
+        val maxDeferredMillis: Double,
+        val prefetchRequests: Long,
+        val writerReads: Long,
+        val prefetchDoneAtPaste: Boolean,
     )
 
     private val level = helper.level
@@ -65,14 +74,28 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
     private var lastTick = 0L
     private var reopenedIds: List<UUID> = emptyList()
     private var prefetchWaitStart = 0L
+    private var prefetchDoneAtPaste = true
+    private var pasteNanos = 0L
 
     private enum class Step { SETUP, WAIT_PREFETCH, PASTE, WAIT_CLAIMS, CLEAR, DONE }
 
-    private data class Counters(val claims: Long, val claimNanos: Long, val reads: Long, val readNanos: Long, val prefetchHits: Long) {
+    private data class Counters(
+        val claims: Long,
+        val claimNanos: Long,
+        val reads: Long,
+        val readNanos: Long,
+        val prefetchHits: Long,
+        val deferred: Long,
+        val prefetchRequests: Long,
+        val writerReads: Long,
+    ) {
         companion object {
-            val ZERO = Counters(0, 0, 0, 0, 0)
+            val ZERO = Counters(0, 0, 0, 0, 0, 0, 0, 0)
 
-            fun of(s: MachineSaveStore) = Counters(s.claimCount, s.claimNanos, s.mainOwnerReads, s.mainOwnerReadNanos, s.prefetchHits)
+            fun of(s: MachineSaveStore) = Counters(
+                s.claimCount, s.claimNanos, s.mainOwnerReads, s.mainOwnerReadNanos, s.prefetchHits, s.deferredClaims, s.prefetchRequests,
+                s.writerOwnerReadRequests,
+            )
         }
     }
 
@@ -98,6 +121,10 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
                     prefetchWaitStart = System.nanoTime()
                     step = Step.WAIT_PREFETCH
                     waitTicks = 0
+                } else if (Scene.entries[scene] == Scene.REOPENED_NO_WAIT) {
+                    // 開き直したのと同じ tick に貼る（先読みを待たない。#869）
+                    prepareReopen()
+                    paste()
                 } else {
                     step = Step.PASTE
                 }
@@ -111,7 +138,8 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
             Step.WAIT_CLAIMS -> {
                 waitTicks++
                 if (pasted.any { it.lastClaim == null }) {
-                    if (waitTicks > 200) helper.fail("claims did not run within 200 ticks")
+                    // 待ちにした claim は、先読み・書き込みのスレッドの読みを待つ（#869）。GameTest のサーバーは tick を待たずに回すので、時間でも見る
+                    if (waitTicks > 200 && System.nanoTime() - pasteNanos > 60_000_000_000L) helper.fail("claims did not run within 200 ticks and 60 s")
                     return
                 }
                 record()
@@ -166,9 +194,11 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         val ids = when (s) {
             Scene.DUPLICATE -> List(count) { original!!.identity!!.id }
             Scene.UNKNOWN -> List(count) { UUID.randomUUID() }
-            Scene.REOPENED -> reopenedIds
+            Scene.REOPENED, Scene.REOPENED_NO_WAIT -> reopenedIds
         }
         before = Counters.of(store())
+        prefetchDoneAtPaste = store().ownerPrefetchDone
+        pasteNanos = System.nanoTime()
         tickMax = 0
         lastTick = System.nanoTime()
         pasted = positions.mapIndexed { i, rel -> place(rel, ids[i]) }
@@ -196,6 +226,12 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
             pendingAfter,
             drainMillis,
             results,
+            after.deferred - before.deferred,
+            // 最大は置き場ごとの値なので、この場面で待ちにしたときだけ出す
+            if (after.deferred > before.deferred) st.maxDeferredClaimNanos / 1e6 else 0.0,
+            after.prefetchRequests - before.prefetchRequests,
+            after.writerReads - before.writerReads,
+            prefetchDoneAtPaste,
         )
         LOGGER.info("Claim paste ({} cases): {} done", count, Scene.entries[scene])
     }
@@ -219,13 +255,18 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         original?.let { helper.setBlock(originalPos, Blocks.AIR) }
         for (chunk in forced) level.setChunkForced(chunk.x, chunk.z, false)
         val sb = StringBuilder()
-        sb.append("| 場面 | claim | claim の合計 (ms) | メインスレッドの読み（回 / ms） | 先読みの値を使った | tick の間隔の最大 (ms) | 直後の書き込み待ち | 流しきるまで (ms) | 判定 |\n")
-        sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --- |\n")
+        sb.append(
+            "| 場面 | claim | claim の合計 (ms) | メインスレッドの読み（回 / ms） | 先読みの値を使った | 待ちにした | 確定までの最大 (ms) | " +
+                "先読みに頼んだ / 書き込みのスレッドに頼んだ | 貼った時点で先読みが終わっていた | tick の間隔の最大 (ms) | 直後の書き込み待ち | " +
+                "流しきるまで (ms) | 判定 |\n",
+        )
+        sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --- | --: | --: | --: | --- |\n")
         for (r in rows) {
             sb.append(
                 String.format(
-                    Locale.ROOT, "| %s | %d | %.1f | %d / %.1f | %d | %.1f | %d | %.0f | %s |\n",
-                    r.scene.label, r.claims, r.claimMillis, r.reads, r.readMillis, r.prefetchHits, r.maxTickMillis, r.pendingAfter,
+                    Locale.ROOT, "| %s | %d | %.1f | %d / %.1f | %d | %d | %.1f | %d / %d | %s | %.1f | %d | %.0f | %s |\n",
+                    r.scene.label, r.claims, r.claimMillis, r.reads, r.readMillis, r.prefetchHits, r.deferred, r.maxDeferredMillis,
+                    r.prefetchRequests, r.writerReads, if (r.prefetchDoneAtPaste) "はい" else "いいえ", r.maxTickMillis, r.pendingAfter,
                     r.drainMillis, r.results,
                 ),
             )
