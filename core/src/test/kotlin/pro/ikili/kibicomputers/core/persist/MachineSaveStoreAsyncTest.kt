@@ -437,6 +437,48 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
+    fun `使えない印の付いたIDの仕事が失敗の完了を組み立てられずに投げても、その失敗を受け取るまで印を外さない`() {
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val identity = store.assignNewId(p)!!
+        val written = store.submit(identity, p, src(), null)
+        manual.runAll()
+        store.pollCompleted()
+        val id = identity.id
+        val ownerFile = store.directoryOf(id).resolve(OwnerRecord.FILE_NAME)
+        // 世代の仕事 G が走っている間に、引き取りの owner.bin の仕事が書けずに印を付け、その失敗をメインスレッドが受け取る
+        // （ここでは G の build の中で、書き込みのスレッドの次の仕事とメインスレッドの受け取りを進めて、その順を作る）
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 0
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot {
+                Files.delete(ownerFile)
+                Files.createDirectories(ownerFile.resolve("x"))
+                assertTrue(manual.runNext(), "引き取りの owner.bin の仕事")
+                assertTrue(store.isUnusable(id))
+                assertTrue(store.pollCompleted().isEmpty(), "owner.bin だけの仕事の失敗は外に返さない")
+                assertTrue(store.isUnusable(id), "G が残っているので印は残す")
+                throw Unprintable()
+            }
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val g = store.submit(written.identity, p, bad, null)
+        index.removeIfOwner(id, p)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 1, 0, q).result)
+        assertEquals(2, manual.size)
+        assertNotNull(runCatching { manual.runNext() }.exceptionOrNull())
+        assertEquals(0, store.pendingCount)
+        assertTrue(store.isUnusable(id), "G の失敗（使えない印のあるIDの仕事）を受け取るまで印を外さない")
+        val completion = store.pollCompleted().single()
+        assertSame(g, completion.pending)
+        assertFalse(completion.succeeded)
+        assertFalse(store.isUnusable(id), "受け取って仕事がなければ印を外す")
+    }
+
+    @Test
     fun `finishedCountは掃除・owner_bin・削除を含めて、列に入れた仕事を1つにつき1回だけ数える`() {
         val identity = store.assignNewId(p)!!
         val start = store.finishedCount

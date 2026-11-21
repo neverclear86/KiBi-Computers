@@ -949,8 +949,12 @@ public class MachineSaveStore @JvmOverloads constructor(
             { Done(pending, registration, self, snapshot, null, IOException("the save writer is closed; generation $generation of $id is not written")) },
             writesOwner = ownerRecord != null,
             // writeGeneration は例外を失敗の完了にするが、その組み立て自体が投げても予約 1 つに完了 1 つを保つ（#852）。
-            // 原因の文字列（toString）は作らない（それが投げることがあるため）
-            crashed = { e -> Done(pending, registration, self, snapshot, null, IOException("failed to write generation $generation of $id", e)) },
+            // 原因の文字列（toString）は作らない（それが投げることがあるため）。「使えない」の印は writeGeneration の失敗と同じく付ける
+            // （付けないと、受け取る前に印が外れ、owner.bin のないディレクトリに後続の世代を書きうる。規則 7b・#566）
+            crashed = { e ->
+                val error = IOException("failed to write generation $generation of $id", e)
+                Done(pending, registration, self, snapshot, null, error, unusable = id in unusable)
+            },
         )
         return pending
     }
