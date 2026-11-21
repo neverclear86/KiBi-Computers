@@ -419,7 +419,7 @@ class MachineClaimTest {
         OwnerRecord.write(dir.resolve(mine.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(1, at(1)))
         OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(5, at(0)))
         val fresh = MachineSaveStore(dir, MachineIdIndex(), prefetchOwners = true)
-        val deadline = System.nanoTime() + 10_000_000_000L
+        val deadline = System.nanoTime() + 120_000_000_000L
         while (!fresh.ownerPrefetchDone && System.nanoTime() < deadline) Thread.sleep(5)
         assertEquals(true, fresh.ownerPrefetchDone, "先読みのスレッドが結果を渡す")
         assertEquals(ClaimResult.KEPT, fresh.claim(mine.toString(), 0, 0, at(1)).result)

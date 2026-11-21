@@ -326,6 +326,8 @@ public class MachineScheduler private constructor(
         dispatcher.signal()
         // 間引いたデバイスの失敗の要約（時が来ていなければ AtomicLong を1回読むだけ。#679）
         deviceFailureLog.tick(now)
+        // 許可を持ったままワーカーに渡せなかった step を渡し直し、続いていれば要約を出す（取り残しがなければ volatile などを読むだけ。#870）
+        permits.tick(now)
         val batch = ArrayList<Machine>()
         // マシンのロックの中で列のロックを取る（wakeAtTick）ので、列のロックを放してからマシンを呼ぶ
         wakeLock.withLockValue {
