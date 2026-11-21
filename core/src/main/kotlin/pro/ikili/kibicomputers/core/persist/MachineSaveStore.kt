@@ -45,7 +45,9 @@ internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirec
  * ディレクトリの削除は、`executor` の列に入れて順に走らせる。メインスレッドは予約（[submit]。世代を決め、持ち主を確かめる）と、
  * 完了の受け取り（[pollCompleted]）だけをする。[claim] もメインスレッドでは書かない（#585。ADR 0084 の規則 7a）: 引き取りの `owner.bin` は
  * その場で列に入れ、`owner.bin` がなかった ID と新しく振った ID の `owner.bin` は、最初の世代の書き込みの前に書く（[submit]）。
- * claim がディスクを読むのは、覚えておらず、先読み（`prefetchOwners`）でも分からない ID だけ。
+ * claim がディスクを読むのは、覚えておらず、先読み（`prefetchOwners`）でも分からない ID だけ。サーバーのメインスレッドは
+ * [claimOrDefer] を使い、その読みもしない（#869）: 読みを先読みのスレッドか書き込みのスレッドに回して claim を待ちにし、
+ * 読み終わった後の tick に [pollDeferredClaims] で確定する。
  *
  * スレッド: 列の仕事のほかは、メインスレッドだけで使う。[hasCapacity]・[pendingBytes]・[pendingCount] はどのスレッドから読んでもよい。
  *
@@ -168,13 +170,6 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 新しい ID の候補を作る口（テストが差し替える。既定は [UUID.randomUUID]。#579） */
     internal var uuidSource: () -> UUID = UUID::randomUUID
 
-    init {
-        scanDirectories()
-        if (prefetchOwners) {
-            startOwnerPrefetch { task -> Thread(task, "KiBi-OwnerPrefetch").apply { isDaemon = true }.start() }
-        }
-    }
-
     // ---- owner.bin の先読み（#585） ----
 
     /** 先読みした `owner.bin`（[startOwnerPrefetch]） */
@@ -187,11 +182,20 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
-     * 先読みの結果（全部読み終えてから、先読みのスレッドが1回だけ入れる。入れた後はメインスレッドだけが触る）。
-     * `null` なら、まだ終わっていない（または先読みしない）
+     * 先読みの結果（#585・#869）。先読みのスレッドが 1 件読むたびに入れ（読み終えた ID は、その時点で claim が使える）、
+     * メインスレッドが claim で使うときに抜く。ない ID は、まだ読んでいない（または先読みしない・読まない）
      */
+    private val prefetched = ConcurrentHashMap<UUID, Prefetched>()
+
+    /** 先読みのスレッドが終わった（[ownerPrefetchDone]） */
     @Volatile
-    private var prefetched: HashMap<UUID, Prefetched>? = null
+    private var prefetchFinished: Boolean = false
+
+    /** 先読みが読む ID（[startOwnerPrefetch] のときの [knownDirectories]。メインスレッドだけが触る。#869） */
+    private var prefetchIds: Set<UUID> = emptySet()
+
+    /** 先読みのスレッドに、順番より先に読んでほしい ID（待っている claim の ID。#869）。先読みのスレッドが毎回先に見る */
+    private val prefetchUrgent = ConcurrentLinkedQueue<UUID>()
 
     /**
      * 先読みのスレッドが読まない ID（このサーバーで触った ID。[touched] の写しで、どのスレッドからも読める。#585）。
@@ -218,35 +222,35 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 先読みのスレッドが `owner.bin` を読む口（テストが、読みの途中で止めるために差し替える。#585） */
     internal var prefetchOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
 
-    /** 先読みが終わったか（数え口・テスト用） */
-    public val ownerPrefetchDone: Boolean get() = prefetched != null
+    /** 先読みのスレッドが終わったか（数え口・テスト用） */
+    public val ownerPrefetchDone: Boolean get() = prefetchFinished
 
     /**
      * 開いたときに [root] にあった ID（[knownDirectories] の今の中身）の `owner.bin` を読む仕事を作り、[runner] で走らせる（#585）。
-     * 読むのは別のスレッドで、メインスレッドは結果が入った後にだけ見る。このサーバーで触った ID（claim・`delete`）には使わず、
-     * 読む前に触っていたら開かない（書き込みのスレッドの `owner.bin` の置き換えと重ねない。[awaitPrefetchRead]）
+     * 読むのは別のスレッドで、1 件読むたびに結果を [prefetched] に入れる（#869）。毎回、先に [prefetchUrgent]（待っている claim の ID）を見る。
+     * このサーバーで触った ID（claim・`delete`）には使わず、読む前に触っていたら開かない（書き込みのスレッドの `owner.bin` の置き換えと
+     * 重ねない。[awaitPrefetchRead]）
      */
     internal fun startOwnerPrefetch(runner: (Runnable) -> Unit) {
         val ids = knownDirectories.toList()
+        prefetchIds = ids.toHashSet()
         prefetchRunning = true
         runner(
             Runnable {
                 val start = System.nanoTime()
-                val out = HashMap<UUID, Prefetched>(ids.size * 2)
+                val order = ids.iterator()
+                val done = HashSet<UUID>(ids.size * 2)
                 try {
-                    for (id in ids) {
+                    while (true) {
+                        val id = prefetchUrgent.poll() ?: (if (order.hasNext()) order.next() else break)
+                        if (!done.add(id)) continue
                         val skip = prefetchLock.withLock {
                             (id in prefetchSkip).also { if (!it) prefetchReading = id }
                         }
                         if (skip) continue
                         try {
-                            out[id] = try {
-                                prefetchOwnerReader(directoryOf(id).resolve(OwnerRecord.FILE_NAME))?.let { Prefetched.Found(it) } ?: Prefetched.Missing
-                            } catch (e: IOException) {
-                                Prefetched.Unreadable("${e.message}")
-                            } catch (e: RuntimeException) {
-                                Prefetched.Unreadable("$e")
-                            }
+                            // 読みを止める（prefetchReading を外す）前に入れる。メインスレッドは、結果がなければ待つ側に回す
+                            prefetched[id] = readOwnerOffMain(prefetchOwnerReader, id)
                         } finally {
                             prefetchLock.withLock {
                                 prefetchReading = null
@@ -255,13 +259,23 @@ public class MachineSaveStore @JvmOverloads constructor(
                         }
                     }
                 } finally {
+                    // 結果を全部入れてから下ろす（メインスレッドは、下りたのを見てから「先読みでは来ない」とする。[ensureOwnerRead]）
                     prefetchRunning = false
+                    prefetchFinished = true
                 }
-                prefetched = out
                 val millis = (System.nanoTime() - start) / 1_000_000.0
                 LOG.log(System.Logger.Level.INFO, "Prefetched owner.bin of ${ids.size} machines in $root (${"%.1f".format(millis)} ms)")
             },
         )
+    }
+
+    /** メインスレッドの外で [id] の `owner.bin` を [reader] で読む（先読み・書き込みのスレッド。例外は [Prefetched.Unreadable] にする） */
+    private fun readOwnerOffMain(reader: (Path) -> OwnerRecord?, id: UUID): Prefetched = try {
+        reader(directoryOf(id).resolve(OwnerRecord.FILE_NAME))?.let { Prefetched.Found(it) } ?: Prefetched.Missing
+    } catch (e: IOException) {
+        Prefetched.Unreadable("${e.message}")
+    } catch (e: RuntimeException) {
+        Prefetched.Unreadable("$e")
     }
 
     /** [id] を触った（claim・`delete`・振った）。先読みの値を使わず、先読みのスレッドもその ID を開かない（#585） */
@@ -377,16 +391,222 @@ public class MachineSaveStore @JvmOverloads constructor(
      * なかったとき・新しい UUID は最初の世代の前に書く。書けなければ、メインスレッドが完了を受け取ったときにその ID を外し（規則 7b）、
      * 次の [submit] が振り直す。`owner.bin` を読むのは、覚えておらず、このサーバーで消した ID でも、開いたときに根になかった ID でもなく、
      * 先読みの値も使えないときだけ。そのときその UUID の仕事が列に残っていれば、終わるのを待ってから読む（上限 [claimWaitMillis]。
-     * 過ぎたら新しい UUID）
+     * 過ぎたら新しい UUID）。
+     *
+     * この口は、読みが要れば呼んだスレッドで読む（テスト・同期の置き場用）。サーバーのメインスレッドは [claimOrDefer] を使う（#869）
      */
     public fun claim(rawId: String?, rawGeneration: Long, rawEpoch: Long, self: MachineOwner): Claim {
         val start = System.nanoTime()
         try {
-            return claimInner(rawId, rawGeneration, rawEpoch, self)
+            return claimInner(rawId, rawGeneration, rawEpoch, self, defer = false)!!
         } finally {
             claimCount++
             claimNanos += System.nanoTime() - start
         }
+    }
+
+    // ---- 読みの要る claim の待ち（#869。ADR 0084 の規則 7a） ----
+
+    /** 待っている claim（[claimOrDefer]） */
+    private class DeferredEntry(
+        val key: Any,
+        val rawId: String,
+        val rawGeneration: Long,
+        val rawEpoch: Long,
+        val self: MachineOwner,
+        val since: Long,
+    )
+
+    /** ID → 待っている claim（来た順。メインスレッドだけが触る）。ID の並びも入れた順（確定の順を決まったものにする） */
+    private val deferredById = LinkedHashMap<UUID, ArrayDeque<DeferredEntry>>()
+
+    /** 待ちの鍵 → 待っている claim（[cancelDeferredClaim]。鍵は参照で比べる） */
+    private val deferredByKey = java.util.IdentityHashMap<Any, Pair<UUID, DeferredEntry>>()
+
+    /** 書き込みのスレッドに読みを頼んだ ID → 頼んだ番号（古い頼みの結果を捨てる。メインスレッドだけが触る） */
+    private val requestedReads = HashMap<UUID, Long>()
+
+    /** 先読みのスレッドに先に読んでほしいと頼んだ ID（同じ ID を何度も積まない。メインスレッドだけが触る） */
+    private val urgentRequested = HashSet<UUID>()
+
+    /** 書き込みのスレッドが読んで、まだ claim に使っていない `owner.bin`（メインスレッドだけが触る。その ID の待ちがなくなったら捨てる） */
+    private val ownerReads = HashMap<UUID, Prefetched>()
+
+    /** 書き込みのスレッドが読んだ `owner.bin`（メインスレッドが [pollDeferredClaims] で受け取る） */
+    private class OwnerRead(val id: UUID, val seq: Long, val value: Prefetched)
+
+    private val ownerReadResults = ConcurrentLinkedQueue<OwnerRead>()
+    private var readSeq = 0L
+
+    /** 書き込みのスレッドが claim のために `owner.bin` を読む口（テストが差し替える。#869） */
+    internal var writerOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
+
+    /** [claimOrDefer] が待ちにした回数（数え口。#869） */
+    public var deferredClaims: Long = 0
+        private set
+
+    /** 今待っている claim の数（数え口。#869） */
+    public val waitingClaims: Int get() = deferredByKey.size
+
+    /** 待ちにしてから確定するまでの時間の最大（ナノ秒。数え口。#869） */
+    public var maxDeferredClaimNanos: Long = 0
+        private set
+
+    /** 先読みのスレッドに、順番より先に読んでほしいと頼んだ回数（数え口。#869） */
+    public var prefetchRequests: Long = 0
+        private set
+
+    /** claim のために、書き込みのスレッドに `owner.bin` の読みを頼んだ回数（数え口。#869） */
+    public var writerOwnerReadRequests: Long = 0
+        private set
+
+    /**
+     * [claim] と同じ判定をするが、メインスレッドで `owner.bin` を読まない（#869。ADR 0084 の規則 7a）。メインスレッドだけが呼ぶ。
+     *
+     * メモリで決まる（値の検査・索引の重複・覚えている `owner.bin`・消した ID・根になかった ID・先読みの値がある）なら、その場で結果を返す。
+     * 読みが要るときは `null` を返して待ちにし、読みを先読みのスレッド（まだ読んでいなければ順番より先に）か、書き込みのスレッド
+     * （その ID の仕事の後ろ。先読みで決まらない ID）に回す。結果は後の tick の [pollDeferredClaims] が [key] と一緒に返す。
+     * 同じ ID に待ちがあれば、後ろに並ぶ（確定は ID ごとに来た順）。同じ [key] の待ちがあれば、取り消してから出し直す。
+     * 待っている間は索引に入れず、`owner.bin` も書かない。待ちを取り消すときは [cancelDeferredClaim]
+     *
+     * @param key 待ちの鍵（呼び手のブロックエンティティなど。参照で比べる）
+     * @return 決まった結果。待ちにしたら `null`
+     */
+    public fun claimOrDefer(rawId: String?, rawGeneration: Long, rawEpoch: Long, self: MachineOwner, key: Any): Claim? {
+        val start = System.nanoTime()
+        try {
+            cancelDeferredClaim(key)
+            val id = CanonicalUuid.parse(rawId)
+            val waiting = if (id != null) deferredById[id] else null
+            if (waiting == null) {
+                val claim = claimInner(rawId, rawGeneration, rawEpoch, self, defer = true)
+                if (claim != null) return claim
+            }
+            // ここに来るのは、ID が読めて、読みが要る（か、その ID に待ちがある）ときだけ
+            val entry = DeferredEntry(key, rawId!!, rawGeneration, rawEpoch, self, start)
+            deferredById.getOrPut(id!!) { ArrayDeque() }.addLast(entry)
+            deferredByKey[key] = id to entry
+            deferredClaims++
+            ensureOwnerRead(id)
+            // 起動の直後には台数だけ来うるので、文字列は DEBUG のときだけ作る
+            LOG.log(System.Logger.Level.DEBUG, java.util.function.Supplier { "Deferring the claim of $id at $self until its owner.bin is read" })
+            return null
+        } finally {
+            claimCount++
+            claimNanos += System.nanoTime() - start
+        }
+    }
+
+    /** [key] の待ちを取り消す（アンロード・`setRemoved`・NBT の値が変わったとき。#869）。待ちがなければ何もしない。メインスレッドだけが呼ぶ */
+    public fun cancelDeferredClaim(key: Any) {
+        val (id, entry) = deferredByKey.remove(key) ?: return
+        val queue = deferredById[id] ?: return
+        queue.remove(entry)
+        if (queue.isEmpty()) forgetWaiting(id)
+    }
+
+    /**
+     * テスト用（#869。GameTest が読みの要る claim を作る）: [id] の覚えている `owner.bin` を忘れ、開いたときに根にあった ID として扱う
+     * （再起動の後と同じく、次の claim は `owner.bin` の読みを要する）。索引・登録・列の仕事には触らない
+     */
+    public fun forgetOwnerForTest(id: UUID) {
+        owners.remove(id)
+        unwrittenOwners.remove(id)
+        deletedIds.remove(id)
+        knownDirectories += id
+    }
+
+    /** [key] の claim が待っているか（テスト用） */
+    public fun isClaimDeferred(key: Any): Boolean = deferredByKey.containsKey(key)
+
+    /**
+     * 待っている claim のうち、読みの結果がそろったものを確定して返す（#869。メインスレッドで毎 tick、[pollCompleted] の後に呼ぶ）。
+     * 確定は ID ごとに来た順で、そのたびに [claim] と同じ判定（索引の重複・覚えている `owner.bin` を含む）をやり直す。
+     * 返したものは待ちから外れている（索引にも入っている）ので、呼び手はその場で受け取る。待ちがなければ何もしない
+     */
+    public fun pollDeferredClaims(): List<DeferredClaim> {
+        while (true) {
+            val read = ownerReadResults.poll() ?: break
+            if (requestedReads[read.id] != read.seq) continue
+            requestedReads.remove(read.id)
+            ownerReads[read.id] = read.value
+        }
+        if (deferredById.isEmpty()) return emptyList()
+        val out = ArrayList<DeferredClaim>()
+        val start = System.nanoTime()
+        val ids = deferredById.entries.iterator()
+        val left = ArrayList<UUID>()
+        while (ids.hasNext()) {
+            val (id, queue) = ids.next()
+            // 判定の材料が何も変わっていなければ、判定をやり直さない（待ちの台数 × tick の、UUID の読み直しと索引の引きを避ける）
+            if (!mayDecide(id)) {
+                left += id
+                continue
+            }
+            while (queue.isNotEmpty()) {
+                val entry = queue.first()
+                val claim = claimInner(entry.rawId, entry.rawGeneration, entry.rawEpoch, entry.self, defer = true) ?: break
+                queue.removeFirst()
+                deferredByKey.remove(entry.key)
+                maxDeferredClaimNanos = maxOf(maxDeferredClaimNanos, System.nanoTime() - entry.since)
+                out += DeferredClaim(entry.key, claim)
+            }
+            if (queue.isEmpty()) {
+                ids.remove()
+                forgetReads(id)
+            } else {
+                left += id
+            }
+        }
+        for (id in left) ensureOwnerRead(id)
+        if (out.isNotEmpty()) claimNanos += System.nanoTime() - start
+        return out
+    }
+
+    /**
+     * 待っている [id] の claim が、今の判定で決まりうるか（読みの結果が来た・先読みの値がある・索引に入った・覚えた・消した）。
+     * 偽なら [claimInner] は必ず待ちを返すので、呼ばずに飛ばす
+     */
+    private fun mayDecide(id: UUID): Boolean =
+        id in ownerReads || index.ownerOf(id) != null || owners.containsKey(id) || id in deletedIds ||
+            (id !in touched && prefetched.containsKey(id))
+
+    /** [id] の待ちがなくなった: 待ちの表と、頼んだ読み・読んだ結果を捨てる */
+    private fun forgetWaiting(id: UUID) {
+        deferredById.remove(id)
+        forgetReads(id)
+    }
+
+    private fun forgetReads(id: UUID) {
+        requestedReads.remove(id)
+        ownerReads.remove(id)
+        urgentRequested.remove(id)
+    }
+
+    /**
+     * 待っている [id] の `owner.bin` の読みを手配する（#869）。先読みのスレッドがまだ読みうる（動いていて、開いたときの ID で、触っていない）
+     * なら、順番より先に読んでもらう。そうでなければ（先読みが終わった・触った ID・根の列挙が欠けて先読みにない ID）、書き込みのスレッドの
+     * その ID の列の後ろに読む仕事を入れる（前の仕事の後のディスクを読むので、仕事の終わりを待たなくてよい）。頼んであれば何もしない
+     */
+    private fun ensureOwnerRead(id: UUID) {
+        if (id in requestedReads || id in ownerReads) return
+        if (id !in touched && prefetchRunning && id in prefetchIds) {
+            if (urgentRequested.add(id)) {
+                prefetchUrgent.add(id)
+                prefetchRequests++
+            }
+            return
+        }
+        val seq = ++readSeq
+        requestedReads[id] = seq
+        writerOwnerReadRequests++
+        enqueue(id, 0, {
+            ownerReadResults.add(OwnerRead(id, seq, readOwnerOffMain(writerOwnerReader, id)))
+            null
+        }, {
+            ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("the save writer is closed")))
+            null
+        }, blocksRestore = false)
     }
 
     /**
@@ -421,7 +641,11 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
     }
 
-    private fun claimInner(rawId: String?, rawGeneration: Long, rawEpoch: Long, self: MachineOwner): Claim {
+    /**
+     * claim の判定。[defer] なら、読みが要るときにメインスレッドで読まず、書き込みのスレッドが読んだ結果（[ownerReads]）があれば使い、
+     * なければ何も変えずに `null` を返す（#869）。[defer] が偽なら、呼んだスレッドで読み、`null` を返さない
+     */
+    private fun claimInner(rawId: String?, rawGeneration: Long, rawEpoch: Long, self: MachineOwner, defer: Boolean): Claim? {
         val id = CanonicalUuid.parse(rawId)
         if (id == null || !MachineIdentityLimits.isValidCounter(rawGeneration) || !MachineIdentityLimits.isValidCounter(rawEpoch)) {
             return fresh(self, ClaimResult.NEW_ID_INVALID, "invalid values (id=$rawId, generation=$rawGeneration, epoch=$rawEpoch)")
@@ -435,14 +659,24 @@ public class MachineSaveStore @JvmOverloads constructor(
             id in deletedIds -> null
             // 開いたときに根になく、このサーバーも作っていない（動いている間に外から置かれたディレクトリは見ない。ADR 0084）
             scanComplete && id !in knownDirectories -> null
-            else -> when (val p = if (id in touched) null else prefetched?.remove(id)) {
+            else -> when (val p = if (id in touched) null else prefetched.remove(id)) {
                 is Prefetched.Found -> p.record.also { prefetchHits++ }
                 Prefetched.Missing -> null.also { prefetchHits++ }
                 is Prefetched.Unreadable -> {
                     touch(id)
                     return fresh(self, ClaimResult.NEW_ID_UNREADABLE, "owner.bin of $id is unreadable: ${p.reason}")
                 }
-                null -> {
+                null -> if (defer) {
+                    // 書き込みのスレッドが読んだ結果（その ID の前の仕事の後のディスク）。なければ待ち（何も変えない）
+                    when (val r = ownerReads.remove(id) ?: return null) {
+                        is Prefetched.Found -> r.record
+                        Prefetched.Missing -> null
+                        is Prefetched.Unreadable -> {
+                            touch(id)
+                            return fresh(self, ClaimResult.NEW_ID_UNREADABLE, "owner.bin of $id is unreadable: ${r.reason}")
+                        }
+                    }
+                } else {
                     if (!awaitIdle(id)) return fresh(self, ClaimResult.NEW_ID_UNREADABLE, busy(id))
                     touch(id)
                     try {
@@ -590,7 +824,10 @@ public class MachineSaveStore @JvmOverloads constructor(
         var id: UUID
         do {
             id = uuidSource()
-        } while (index.ownerOf(id) != null || owners.containsKey(id) || outstanding.containsKey(id) || id in knownDirectories)
+        } while (
+            index.ownerOf(id) != null || owners.containsKey(id) || outstanding.containsKey(id) || id in knownDirectories ||
+            deferredById.containsKey(id)
+        )
         knownDirectories += id
         return id
     }
@@ -1195,6 +1432,15 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /** 覚えている `owner.bin` の epoch（ディスクは読まない） */
     public fun epochOf(id: UUID): OptionalLong = owners[id]?.epoch.toOptional()
+
+    // 初期化子は書いた順に走るので、ほかのプロパティ（先読みの表・錠・待ちの表など）をすべて作った後に、根を読み、先読みを始める
+    // （先に始めると、先読みのスレッドが作る前の表に触り、後から走る初期化子が先読みの印を消す。#869）
+    init {
+        scanDirectories()
+        if (prefetchOwners) {
+            startOwnerPrefetch { task -> Thread(task, "KiBi-OwnerPrefetch").apply { isDaemon = true }.start() }
+        }
+    }
 
     override fun toString(): String = "MachineSaveStore($root)"
 

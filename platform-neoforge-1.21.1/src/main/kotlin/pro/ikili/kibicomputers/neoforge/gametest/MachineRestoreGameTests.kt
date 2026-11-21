@@ -227,6 +227,53 @@ object MachineRestoreGameTests {
     }
 
     /**
+     * claim が `owner.bin` の読みを待った台（#869。覚えていない ID。再起動の後と同じ）も、確定した後に復元の順番待ちに入り、
+     * 保存した世代から戻る（ID のないまま順番が来て冷えた起動にならない。#653 と同じ不具合）。待つ間は FULL に戻った経路
+     * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    fun restoresACaseWhoseClaimWaitedForARead(helper: GameTestHelper) {
+        val first = placeComputer(helper)
+        var copy: CaseBlockEntity? = null
+        var sawWaiting = false
+        var reads = 0L
+        helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
+            val tag = saveAndTag(helper, first)
+            val id = first.identity!!.id
+            val be = reload(helper, tag)
+            copy = be
+            val store = WorldMachineSaves.current!!
+            store.forgetOwnerForTest(id)
+            reads = store.mainOwnerReads
+        }.thenWaitUntil {
+            val be = copy!!
+            helper.assertTrue(be.isLoadedOnServer, "onLoad should run")
+            if (be.isClaimDeferred) {
+                // onLoad の tick（確定は次の tick の始め）
+                sawWaiting = true
+                helper.assertTrue(be.lastClaim == null && be.currentIdentity == null, "a waiting case has no id yet")
+                // FULL に戻った経路が来ても、ID のないまま順番待ちに入れない（入れると冷えた起動になり、下の確かめが落ちる）
+                ServerMachines.restorePromotedCase(be)
+                helper.fail("waiting for the claim")
+            }
+            assertRestored(helper, be)
+        }.thenExecute {
+            val be = copy!!
+            helper.assertTrue(sawWaiting, "the claim should have waited for owner.bin")
+            helper.assertTrue(be.lastClaim == ClaimResult.KEPT, "the case should keep its id but was ${be.lastClaim}")
+            helper.assertTrue(WorldMachineSaves.current!!.mainOwnerReads == reads, "claim should not read owner.bin on the main thread")
+            helper.assertTrue(
+                be.restoreStarts == 1 && be.lastRestoreSource != null && be.lastRestoreOutcome == RestoreOutcome.RESTORED,
+                "the restore should not cold-boot: starts=${be.restoreStarts}, source=${be.lastRestoreSource}, " +
+                    "outcome=${be.lastRestoreOutcome}, claim=${be.lastClaim}, ${be.computer}",
+            )
+            be.pressPowerButton()
+            helper.setBlock(CASE, Blocks.AIR)
+        }.thenSucceed()
+    }
+
+    /**
      * 戻すと、キーを打つ前にシェルがプロンプトと入力中の行を描き直す（`restored` イベント。#87、ADR 0087）。画面も置き直して
      * （ワールドを読み込み直したときと同じく、表示は空から始まる）、描き直しが前の画面の残りでないことを確かめる
      */

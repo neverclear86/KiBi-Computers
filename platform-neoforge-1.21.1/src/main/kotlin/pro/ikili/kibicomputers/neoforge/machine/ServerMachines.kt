@@ -611,6 +611,9 @@ object ServerMachines {
         applyConfigIfChanged()
         val t0 = System.nanoTime()
         processCompletions()
+        // 読みを待っていた claim を確定する（#869）。完了の後（規則 7b で外した ID を先に反映する）、復元の順番待ちと印の前
+        // （確定で offer した台・予約した印を、この tick のうちに流す）
+        processDeferredClaims()
         val t1 = System.nanoTime()
         manager?.tick()
         val t2 = System.nanoTime()
@@ -720,6 +723,18 @@ object ServerMachines {
                 // FULL でなくなったときのチャンク（#545。規則 5）。markChunkUnsaved が FULL でないチャンクにも付けるが、ここは前からの印として残す
                 be.demotedChunk?.let(::markDemotedChunkUnsaved)
             }
+        }
+    }
+
+    /**
+     * 読みを待っていた claim のうち、確定したものをケースに返す（#869。メインスレッドで、毎 tick の始めの [processCompletions] の後）。
+     * 待ちがなければ置き場が O(1) で返す
+     */
+    internal fun processDeferredClaims() {
+        val store = WorldMachineSaves.current ?: return
+        for (deferred in store.pollDeferredClaims()) {
+            val be = deferred.key as? CaseBlockEntity ?: continue
+            be.onDeferredClaim(deferred.claim)
         }
     }
 
@@ -1014,10 +1029,11 @@ object ServerMachines {
      * FULL に戻ったチャンクの [be] を、電源が入っていてマシンがなければ、復元の順番待ちに入れる（[restorePromoted]）。
      * まだ `onLoad` の済んでいないケース（[CaseBlockEntity.isLoadedOnServer] が偽）は何もしない（#653）。
      * ディスクから読み込んで FULL になったばかりのチャンクのケースは、`onLoad`（次の tick のブロックエンティティの処理）の前に
-     * ここに来ることがあり、ID の `claim` の前に順番が来ると、ID がないとして冷えた起動になる。そのケースは `onLoad` が順番待ちに入れる
+     * ここに来ることがあり、ID の `claim` の前に順番が来ると、ID がないとして冷えた起動になる。そのケースは `onLoad` が順番待ちに入れる。
+     * claim が `owner.bin` の読みを待っている台（[CaseBlockEntity.isClaimDeferred]）も同じ理由で何もしない（確定したときに入れる。#869）
      */
     internal fun restorePromotedCase(be: CaseBlockEntity) {
-        if (be.isRemoved || !be.isLoadedOnServer) return
+        if (be.isRemoved || !be.isLoadedOnServer || be.isClaimDeferred) return
         if (be.computer.beginRestore()) offerRestore(be)
     }
 
