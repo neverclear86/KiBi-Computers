@@ -16,6 +16,8 @@ description: KiBi Computers を開発環境の Minecraft（NeoForge 1.21.1 / For
 - 20秒ほどで終わる。全テストが通れば `All N required tests passed :)`、失敗すると `N required tests failed :(` が出てタスクが失敗する。
 - 失敗の詳細はログの `LogTestReporter` の行に出る。
 - テストの書き方は `AGENTS.md` の「つまずきやすい点」と `SmokeGameTests.kt` を参照。
+- GameTest のサーバーは、マシンの中で同時に 1 本だけ動く（#855）。ほかの worktree などで動いていると、Gradle が `Waiting for the GameTest lock ... Held by: ...` を 30 秒ごとに出して待つ（止まったのではない）。持ち主は `~/.gradle/kibicomputers/locks/gametest.owner`。待ちの上限は `-PgameTestLockTimeoutMinutes=<分>`（既定 90）、`-PgameTestLock=false` でロックを使わない。
+- 待ちを含めると 10 分を超えることがあるので、前景の Bash ではなく `run_in_background` で起動し、出力をファイルに書いて終わるまで待つ。`./gradlew --stop` は使わない（ほかの worktree のビルドも止まる）。
 
 ## 開発クライアント（自動操作の口）
 
