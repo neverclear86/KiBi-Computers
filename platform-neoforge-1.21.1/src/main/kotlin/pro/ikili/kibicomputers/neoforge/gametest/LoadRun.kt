@@ -2415,7 +2415,8 @@ internal class LoadRun(
 
         /**
          * 段階に予約した書き込みが終わるのを待つ tick の全体の上限（#854）。進んでいても、ここで打ち切る。
-         * 待つ段階は多くて 3 つ（AUTOSAVE・UNLOAD・本番の形の自動保存）。試験の上限（`CI_TIMEOUT_TICKS`）は、その分を足しても収まるようにしてある
+         * 待つ段階は多くて 2 つ（AUTOSAVE と UNLOAD）。本番の形の自動保存（[LoadSettings.productionAutosave]）は AUTOSAVE の段階の中で
+         * `autosave()` の代わりに呼ばれ、その形のときは UNLOAD が入らない。試験の上限（`CI_TIMEOUT_TICKS`）は、その 2 段階分を足しても収まるようにしてある
          */
         private const val SAVE_WAIT_TIMEOUT_TICKS = 6_000
 
