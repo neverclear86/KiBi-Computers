@@ -51,6 +51,30 @@ class FuelAccountTest {
     }
 
     @Test
+    fun `使った燃料の数え口は、渡した量から返した残りを引いたもので、tickをまたいで捨てた残りと前借りの負の残りも合う`() {
+        val state = KernelState(8)
+        val consumed = AtomicLong()
+        val a = FuelAccount(state, perTick, 0, consumed)
+        state.fuel = perTick
+        // 同じ tick の中で 30 渡して 10 返す: 使ったのは 20
+        assertEquals(30, a.take(0, 30))
+        a.giveBack(0, 10)
+        assertEquals(20, consumed.get())
+        // 50 渡して、tick が進んでから 15 残して返す: 残りは捨てるが、使ったのは 35
+        assertEquals(50, a.take(0, 50))
+        a.giveBack(1, 15)
+        assertEquals(55, consumed.get())
+        // 前借りで 7 足りなくなった（残り -7）: 使ったのは 渡した 40 + 7
+        assertEquals(40, a.take(1, 40))
+        a.giveBack(1, -7)
+        assertEquals(102, consumed.get())
+        // 燃料が正でなければ何も渡さず、数えない
+        state.fuel = 0
+        assertEquals(0, a.take(1, 40))
+        assertEquals(102, consumed.get())
+    }
+
+    @Test
     fun `遅延補充はtickごとに配るのと同じ値になる`() {
         for (start in listOf(perTick, 0L, -perTick / 2, -3 * perTick, -1L)) {
             for (k in listOf(0L, 1L, 2L, 3L, 5L, 1_000_000_000L)) {

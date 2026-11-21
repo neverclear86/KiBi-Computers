@@ -140,6 +140,31 @@ class AsyncFuelTest {
     }
 
     @Test
+    fun `巻き戻しの費用は、退避した値の数 x ASYNC_VALUE だけ巻き戻しの数え口に足され、使った燃料にも入る`() = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 20_000)
+            val s = Spin(h, m, listOf("main", "3", "100000"))
+            val unwinds0 = h.scheduler.fuelUnwinds.get()
+            val cost0 = h.scheduler.fuelUnwindCost.get()
+            val consumed0 = h.scheduler.fuelConsumedTotal
+            h.scheduler.tick()
+            eventually(30_000, "燃料切れで巻き戻さない") { s.waitingFuelThreadless() }
+            // 巻き戻した後は燃料が 0 以下で、次の tick まで巻き戻さない（1 tick に 1 回）
+            assertEquals(1L, h.scheduler.fuelUnwinds.get() - unwinds0)
+            m.lock.withLockValue {
+                val cost = h.scheduler.fuelUnwindCost.get() - cost0
+                assertEquals(s.process.asyncStack!!.size.toLong() * FuelCosts.ASYNC_VALUE, cost, "巻き戻しの費用が退避した値の数と合わない")
+                assertTrue(cost > 0, "費用が 0")
+                // 使った燃料 = 補充した 20,000 - 残り。残りは費用の分だけ借りになるので、費用も使ったに入る
+                assertEquals(20_000L - m.kernel.fuel, h.scheduler.fuelConsumedTotal - consumed0)
+                assertTrue(h.scheduler.fuelConsumedTotal - consumed0 >= cost, "使った燃料に費用が入っていない")
+            }
+            assertEquals(h.scheduler.fuelUnwindCost.get(), h.scheduler.fuelUnwindCostTotal)
+            assertEquals(expected(3, 100_000), s.finish())
+        }
+    }
+
+    @Test
     fun `スライスを使い切ると、計算し続ける2つのプロセスは巻き戻してスレッドを持たずに譲り合う`() = timeout(limit) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             // スライスは 1 tick の 1/10。2つが同じ tick の中で交代する（#47）
@@ -213,6 +238,7 @@ class AsyncFuelTest {
             val spins = List(processes) { Spin(h, m, listOf("main", "1000000", "100"), install = it == 0) }
             // 全員が、最初の燃料を待つところまで来てから始める（来る前に tick を進めると、起こす数がそろわない）
             eventually(30_000, "$processes 本とも燃料待ちにならない") { m.fuelWaiterCount == processes }
+            val grants0 = m.fuelGrantsByProcess()
             for (k in 1..ticks) {
                 val woken0 = h.scheduler.dispatcher.woken.get()
                 h.scheduler.tick()
@@ -228,6 +254,9 @@ class AsyncFuelTest {
             assertEquals(total, counts.sum(), "スライスの数: $counts")
             val fair = total / processes
             assertTrue(counts.all { it in fair - 1..fair + 1 }, "全員が同じ回数動いていない: $counts")
+            // プロセスごとのスライスの数え口（接続層の負荷試験が読む。#740）は、動いたスライスの数と同じ（全員が燃料待ちの間に読む）
+            val grants = m.fuelGrantsByProcess()
+            assertEquals(counts, spins.map { (grants[it.pid] ?: 0L) - (grants0[it.pid] ?: 0L) }.map { it.toInt() }, "プロセスごとのスライスの数え口")
             for (s in spins) m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
         }
     }

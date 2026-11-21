@@ -51,6 +51,12 @@ object LoadGameTests {
     private const val CI_BUSY = 10
 
     /**
+     * 1台に動かす計算するプロセスの数（[LoadPhase.COMPUTE_MULTI]。#740）。1 tick のスライスの数（既定で 4）と同じ本数は、燃料待ちの飢えの境の場合
+     * （ADR 0047。#737・#742）なので、CI と測定の既定はこの値にする
+     */
+    private const val COMPUTE_PROCESSES = 4
+
+    /**
      * CI で、待っている間・計算している間・出力している間の tick の平均の上限（ミリ秒）。20 TPS を保てる値。
      * CI の機械の速さに左右されないよう、目標（[TARGET_TICK_MILLIS]）そのものを上限にする
      */
@@ -85,8 +91,11 @@ object LoadGameTests {
     private fun ciMaxBootKernelThreads(): Int =
         2 * (ServerMachines.schedulerConfig ?: SchedulerConfig.DEFAULT).maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
-    /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
-    private const val CI_TIMEOUT_TICKS = 30_000
+    /**
+     * 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ。
+     * 書き込みの終わりの待ちを tick で数えるようにした分（1 つの段階で多くて 6,000 tick。待つ段階は多くて AUTOSAVE と UNLOAD の 2 つなので 12,000 tick。#854）を足してある
+     */
+    private const val CI_TIMEOUT_TICKS = 42_000
     private const val MEASURE_TIMEOUT_TICKS = 200_000
 
     /** 実際のサーバーの1 tick（20 TPS） */
@@ -140,6 +149,7 @@ object LoadGameTests {
         val massUnload = os == LoadOs.STANDARD
         val settings = LoadSettings(
             os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100, massUnload = massUnload,
+            computeProcesses = COMPUTE_PROCESSES,
         )
         LoadRun(helper, settings) { report ->
             LOGGER.info("Load test (CI, {})\n{}", os.id, report.toMarkdown())
@@ -189,6 +199,29 @@ object LoadGameTests {
                 compute.tick.avg < CI_MAX_AVG_TICK_MILLIS,
                 "ticks with $CI_BUSY computing machines should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${compute.tick}",
             )
+            // 計算し続ける台は燃料を使う（#740。数え口がつながっている）。回数や比の大きさは CI の機械に左右されるので見ない
+            helper.assertTrue(compute.fuel!!.consumed > 0 && compute.fuel.permits > 0, "the computing machines should use fuel: ${compute.fuel}")
+            // 1台に計算するプロセスが複数（#740）: 標準 OS のシェルだけで動かす。同じ台の中でスライスごとに譲り合う。
+            // 「譲った」（fuelYields）は、tick をそろえない CI ではプロセスが1本の台でも増える（手持ちを渡した tick が進んだので許可を回した分）ので、
+            // 譲り合いの検査にならない。測りはじめにあった計算するシェルが1本残らず、測った区間にスライスを受け取ったか（飢えていないか）で見る
+            val multi = report.phaseOrNull(LoadPhase.COMPUTE_MULTI)
+            if (os.backgroundCommand != null) {
+                helper.assertTrue(multi != null, "the multi-process phase should run with ${os.id}")
+                val f = multi!!.fuel!!
+                helper.assertTrue(f.consumed > 0, "$COMPUTE_PROCESSES computing processes on a machine should use fuel: $f")
+                helper.assertTrue(
+                    multi.minProcessGrants > 0,
+                    "every one of the $COMPUTE_PROCESSES computing shells on each machine should get fuel slices while measured: " +
+                        "min ${multi.minProcessGrants}, max ${multi.maxProcessGrants} ($f)",
+                )
+                helper.assertTrue(
+                    multi.tick.avg < CI_MAX_AVG_TICK_MILLIS,
+                    "ticks with $COMPUTE_PROCESSES computing processes on each of $CI_BUSY machines should stay under " +
+                        "$CI_MAX_AVG_TICK_MILLIS ms on average: ${multi.tick}",
+                )
+            } else {
+                helper.assertTrue(multi == null, "the multi-process phase should be skipped with ${os.id}")
+            }
             // 出力し続ける台の端末の処理は、プロセスのスレッドで行う（#355・#357）。メインスレッドは差分を送るだけ（#351）
             helper.assertTrue(
                 unwatched.tick.avg < CI_MAX_AVG_TICK_MILLIS,
@@ -231,8 +264,12 @@ object LoadGameTests {
     }
 
     private fun measure(helper: GameTestHelper, os: LoadOs, count: Int) {
+        val busy = LoadSettings.intProperty(LoadSettings.BUSY_PROPERTY).takeIf { it > 0 }?.coerceAtMost(count) ?: maxOf(1, count / 10)
         val settings = LoadSettings(
-            os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true,
+            os = os, count = count, busy = busy, paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true,
+            computeProcesses = System.getProperty(LoadSettings.COMPUTE_PROCESSES_PROPERTY)?.trim()?.toIntOrNull() ?: COMPUTE_PROCESSES,
+            fuelSlice = LoadSettings.fuelSliceProperty(),
+            massRestore = true,
             productionAutosave = System.getProperty(LoadSettings.PRODUCTION_AUTOSAVE_PROPERTY).toBoolean(),
             vanillaSaveOffset = LoadSettings.intProperty(LoadSettings.VANILLA_SAVE_OFFSET_PROPERTY),
             syntheticLogTicks = LoadSettings.intProperty(LoadSettings.SYNTHETIC_LOG_TICKS_PROPERTY),

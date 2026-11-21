@@ -6,11 +6,11 @@ export const meta = {
     { title: 'Select', detail: '対象の Issue と依存・area・プランの要否を調べる' },
     { title: 'Plan', detail: 'ABI・保存形式・公開 API に関わる Issue だけ、プランを書いてレビューする' },
     { title: 'Implement', detail: 'worktree で実装し、build と両バージョンの GameTest が通るまで直して PR を作る' },
-    { title: 'CI', detail: 'PR の CI を待つ。落ちたら直す' },
+    { title: 'CI', detail: 'PR の CI を待つ。main と衝突していたら取り込む。落ちたら直す' },
     { title: 'Review', detail: '正しさ・ルール違反のレビュー、公開 API の Java 相互運用レビュー、指摘の検証' },
     { title: 'Fix', detail: '確かな指摘を直して CI を待ち直す' },
-    { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする（merge: false なら飛ばす）' },
-    { title: 'Report', detail: 'PR に結果をまとめる。人の確認が要るものは Fable が前提と推奨を確かめてから質問して needs-human を付ける。worktree を片付ける' },
+    { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする。過負荷で GameTest だけが落ちたら 1 回だけ回し直す（merge: false なら飛ばす）' },
+    { title: 'Report', detail: 'PR に結果をまとめる。人の確認が要るものは Fable が前提と推奨を確かめてから質問して needs-human を付ける。マージ済みなら、Gradle が終わってから worktree を片付ける' },
   ],
 }
 
@@ -23,6 +23,35 @@ export const meta = {
 const REPO = 'neverclear86/KiBi-Computers'
 const MAX_CI_FIXES = 2
 const MAX_REVIEW_ROUNDS = 2
+// CI の段階で main との衝突を取り込む回数の上限（#855）
+const MAX_CONFLICT_MERGES = 2
+// マージの段階で GameTest だけが落ちたとき、過負荷とみなして 1 回だけ回し直すしきい値（#855）。
+// ふだんの起動でも、ワールドを読んだ直後に「Can't keep up!」が 1 回出ることがあるので、出たかどうかでなく大きさで決める。
+// 手元の worktree の latest.log の最大値（約 40 件）は、ふだんは NeoForge 1.21.1 が 70〜110 tick、Forge 1.20.1 が 55〜141 tick（最大 189）で、
+// 過負荷と分かる回は 350 tick 以上だった（11/20〜21 の過負荷では最大 32,800 tick 遅れ、ふだん 1.5〜2.5 分の NeoForge の GameTest が 1 時間を超えた）。
+// ふだんの最大（189）と過負荷の最小（350）の間に置く。ふだんの値に近すぎると、少し重いだけの回の本物の失敗まで回し直しに入る
+const OVERLOAD_TICKS_BEHIND = 300
+const OVERLOAD_GAMETEST_SECONDS = 600
+
+// Gradle を動かす段階に共通の決まり（#855）。ログは worktree の外（.worktrees/.logs/issue-<n>/）に残し、片付けで消えないようにする。
+// GameTest の同時実行は Gradle の側（build-logic の kibicomputers.gametest-lock）で止めるので、ここでは待ち方だけを書く
+function gradleRules(number, stage) {
+  const logs = `.worktrees/.logs/issue-${number}`
+  return `Gradle（\`./gradlew\`）の動かし方（#855。必ず守る）:
+- \`./gradlew\` は Bash の \`run_in_background\` で起動する。出力はリポジトリのルートの \`${logs}/\`（worktree の外）に \`${stage}-<内容>-<連番>.log\` として書き、終わったら終了コードを同じ名前の \`.exit\` に書く。
+- **ログの名前は、毎回まだ使っていないものにする（例の \`-1\` をそのまま使わない）。** 同じ Issue の中では段階の名前が重なる（CI の直しや衝突の取り込みは呼ばれるたびに同じ名前で、確かめのあとの再実装や resume でも同じ段階をもう一度通る）。前の回の \`.exit\` が残っている名前を使うと、「\`.exit\` ができるまで待つ」が動いている最中にすぐ満たされ、古い終了コードを読んでしまう。起動の前に前景で、\`.log\`・\`.exit\` のどちらもない連番を選ぶ: \`d=<ルート>/${logs}; mkdir -p $d; n=1; while [ -e $d/${stage}-build-$n.log ] || [ -e $d/${stage}-build-$n.exit ]; do n=$((n+1)); done; echo $d/${stage}-build-$n\`。出た名前で起動する: \`cd <worktree> && (./gradlew build --console=plain > <名前>.log 2>&1; echo $? > <名前>.exit)\`
+- \`.exit\` ができるまで、Monitor などで待つ（前景の \`sleep\` は使えない）。**Gradle が終わって終了コードを読むまで、この段階を終えて返さない。** バックグラウンドで動かしたまま返さない。
+- GameTest（\`runGameTestServer\`・\`runJarGameTestServer\`・\`runLoadTestServer\`）は、マシンの中で同時に 1 本だけ動く（Gradle がユーザーホームの \`kibicomputers/locks/gametest.lock\` を取る）。ほかが動いていれば「Waiting for the GameTest lock ... Held by: ...」を 30 秒ごとに出して待つので、止めずに待つ。待ちの時間は失敗ではない。
+- GameTest が落ちたら、\`<worktree>/platform-*/run/logs/latest.log\` を \`${logs}/${stage}-<内容>-<連番>-<バージョン>-latest.log\` に写す（worktree を片付けても調べられるように）。
+- \`./gradlew --stop\` は使わない（デーモンはほかの worktree と共有しているので、そちらのビルドまで止まる）。`
+}
+
+// worktree が本物か（git worktree list に載っているか）を確かめる手順（#855）。壊れた残りに対して git -C を実行すると、
+// 親のディレクトリをさかのぼって、ユーザーのチェックアウト（main）に対して走る
+function worktreeCheck(number) {
+  const dir = `.worktrees/issue-${number}`
+  return `\`${dir}\` があるときは、使う前に本物の worktree か確かめる: (a) \`git worktree list --porcelain\` の \`worktree\` 行に、そのディレクトリの絶対パスがある（大文字小文字と \`/\`・\`\\\` をそろえて比べる）、(b) \`git -C ${dir} rev-parse --show-toplevel\` がそのディレクトリ自身を指す。どちらかが違えば、片付けの途中で壊れた残りなので使わない。\`${dir}.stale\`（もうあれば \`.stale2\`、\`.stale3\`…）に名前を変え、\`git worktree prune\` してから、ないときと同じ手順で作り直す（ブランチがもうあれば \`-b\` を付けずにそのブランチで作る）。名前を変えられない（使用中）なら、そこで止めて理由を返す。`
+}
 
 const OPTS = Array.isArray(args) || typeof args === 'number' || args == null
   ? { issues: args == null ? [] : [].concat(args) }
@@ -173,8 +202,10 @@ const CI_SCHEMA = {
     passed: { type: 'boolean' },
     failingChecks: { type: 'array', items: { type: 'string' } },
     failureLog: { type: 'string', description: '失敗の原因が分かるログの抜粋（通ったら空）' },
+    mergeable: { type: 'string', enum: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'], description: '`gh pr view --json mergeable` の値' },
+    noChecks: { type: 'boolean', description: '待っても PR にチェックが 1 つも出なかったら true' },
   },
-  required: ['passed', 'failingChecks', 'failureLog'],
+  required: ['passed', 'failingChecks', 'failureLog', 'mergeable', 'noChecks'],
 }
 
 // must には直し方を書かせない（説明と修正案を同時に求めると誤判定が増える）
@@ -216,13 +247,38 @@ const FIX_SCHEMA = {
   required: ['pushed', 'summary'],
 }
 
+// main の取り込み（CI の段階の衝突）の結果。取り込むものがなかった・字面で解けない・build が直せない、を分ける（#855）
+const MERGE_MAIN_SCHEMA = {
+  type: 'object',
+  properties: {
+    outcome: { type: 'string', enum: ['merged', 'up_to_date', 'conflict', 'build_failed'] },
+    pushed: { type: 'boolean' },
+    summary: { type: 'string' },
+  },
+  required: ['outcome', 'pushed', 'summary'],
+}
+
 const MERGE_SCHEMA = {
   type: 'object',
   properties: {
     status: { type: 'string', enum: ['merged', 'needs_human'] },
     reason: { type: ['string', 'null'] },
+    failedStep: { type: ['string', 'null'], enum: ['conflict', 'build', 'gametest', 'ci', 'merge', null], description: '止まった手順（マージしたら null）' },
+    gameTestFailedOnly: { type: 'boolean', description: 'build は通り、GameTest のサーバーが起動してテストが落ちた（「N required tests failed」）ときだけ true。サーバーの起動前の失敗（コンパイル、依存の取得、ワールドを消せない、ロックの待ちの上限）は false' },
+    gameTestSeconds: { type: ['integer', 'null'], description: 'Gradle の出力の「GameTest lock released by ... after holding it for N s」のうち、最大の N（ロックの待ちは含まない）。なければ null' },
+    maxTicksBehind: { type: ['integer', 'null'], description: '両バージョンの latest.log の「Can\'t keep up! ... Running Nms or N ticks behind」の N（tick）の最大。出ていなければ 0、ログがなければ null' },
+    logPath: { type: ['string', 'null'], description: 'worktree の外に残したログの置き場所' },
   },
-  required: ['status', 'reason'],
+  required: ['status', 'reason', 'failedStep', 'gameTestFailedOnly', 'gameTestSeconds', 'maxTicksBehind', 'logPath'],
+}
+
+const CLEANUP_SCHEMA = {
+  type: 'object',
+  properties: {
+    removed: { type: 'boolean', description: 'worktree を消せたら true' },
+    note: { type: 'string', description: '片付けの結果（消せなかったときは理由と、残したディレクトリ）' },
+  },
+  required: ['removed', 'note'],
 }
 
 const CROSS_CHECK_SCHEMA = {
@@ -384,11 +440,13 @@ function implement(info, approvedPlan, guidance, advice) {
   return agent(
     `${REPO} の Issue #${info.number}「${info.title}」を実装して PR を作る。手順は \`.claude/skills/work-issue/SKILL.md\` の 1〜4 に従う。ただし作業場所は、ユーザーのチェックアウトとは別の worktree にする:
 
-1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する（\`.worktrees/issue-${info.number}\` がもうあれば、それを続けて使う）。
+1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する（\`.worktrees/issue-${info.number}\` がもうあれば、それを続けて使う）。${worktreeCheck(info.number)}
 2. 以降の編集・ビルド・テスト・コミット・push はすべてその worktree の中で行う（絶対パスで操作する）。\`git stash\` は使わない。
 3. 実装ループ: 実装 → \`./gradlew build\` → \`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer\` を、すべて通るまで繰り返す。
 4. PR を \`gh pr create\` で作る（1つの Issue を複数の PR に分けるときは、AGENTS.md の手順で Stacked PRs にする）。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
+
+${gradleRules(info.number, 'implement')}
 
 着手する前に \`gh issue view ${info.number} --json state,closedByPullRequestsReferences\` で Issue の状態を取り直す。もう閉じていたら（同じ実行の別の PR が一緒に閉じた、など）、worktree・ブランチ・PR を作らず、コメントもせずに status=already_done で終え、summary に閉じた PR を書く。
 
@@ -400,36 +458,93 @@ publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputer
 }
 
 // CI の結果を待つ。passed が偽なのに落ちたチェックの名前がない結果や、まだ終わっていないチェックを落ちたものに入れた結果は、
-// まだ走っている間に返したものとみなして待ち直す（ランナーの待ちが長いと、途中で返すことがある）
+// まだ走っている間に返したものとみなして待ち直す（ランナーの待ちが長いと、途中で返すことがある）。
+// ただし main と衝突している（mergeable が CONFLICTING）なら、GitHub は CI を動かさないので、待ち直さずに返す（#855）
 const UNFINISHED_CHECK = /in[_ ]?progress|pending|queued|waiting|not finished|still running|未完了|実行中/i
+// チェックが 1 つも出ないまま、これだけ待ったら衝突を疑って返す（分）
+const NO_CHECKS_MINUTES = 10
+// 片付けの前に、.exit のない Gradle のログを「終わった（殺された）」とみなす、最終更新からの時間（分）
+const STALE_LOG_MINUTES = 5
 async function waitCi(pr, label) {
   let ci = null
   for (let attempt = 0; attempt < 3; attempt++) {
     ci = await agent(
-      `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。\`gh pr checks ${pr} --watch --interval 30\` を使う（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。コードは変更しない。`,
+      `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。コードは変更しない。
+1. 先に \`gh pr view ${pr} --json mergeable,mergeStateStatus\` で main との衝突を確かめる。\`mergeable\` は計算が終わるまで UNKNOWN を返すので、UNKNOWN の間は 30 秒ほどおいて 5 回まで取り直す（前景の \`sleep\` は使えないので、\`gh pr checks ${pr} --watch --interval 30\` を 1 回はさむなどで間を空ける）。CONFLICTING なら、GitHub は衝突している PR の CI を動かさないので、待たずに passed=false・failingChecks=[]・mergeable=CONFLICTING・noChecks=true で返す。
+2. \`gh pr checks ${pr} --watch --interval 30\` で待つ（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。チェックが 1 つも出ないまま（「no checks reported」など）${NO_CHECKS_MINUTES} 分ほどたったら、待つのをやめ、もう一度 \`mergeable\` を取って、passed=false・failingChecks=[]・noChecks=true で返す。
+3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。
+mergeable には、最後に取った \`mergeable\` の値を入れる。`,
       { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
     )
+    if (ci && ci.mergeable === 'CONFLICTING') return ci
     const unfinished = !!ci && ci.failingChecks.some(c => UNFINISHED_CHECK.test(c))
     if (!ci || ci.passed || (ci.failingChecks.length && !unfinished)) return ci
-    log(`PR #${pr}: ${unfinished ? 'まだ終わっていないチェックを落ちたものとして返した' : 'CI の結果に落ちたチェックの名前がない'}。待ち直す（${attempt + 1}/3）`)
+    log(`PR #${pr}: ${unfinished ? 'まだ終わっていないチェックを落ちたものとして返した' : ci.noChecks ? 'チェックが出ない（衝突はしていない）' : 'CI の結果に落ちたチェックの名前がない'}。待ち直す（${attempt + 1}/3）`)
+  }
+  // 衝突していないのに、待ち直してもチェックが出ないなら、コードで直せる失敗ではない（ci-fix に回さず、報告の段階で人に聞く。#855）
+  if (ci && !ci.passed && ci.noChecks && !ci.failingChecks.length && ci.mergeable !== 'CONFLICTING') {
+    return { ...ci, noChecksOnly: true, failingChecks: ['チェックが出ない'], failureLog: ci.failureLog || `main との衝突はないが、3 回待ち直しても PR #${pr} にチェックが出なかった` }
+  }
+  return ci
+}
+
+// CI の段階で main と衝突していたら、worktree に main を取り込む（#855）。字面で解けないものは取り込まずに返す
+function mergeMain(info, impl, n) {
+  return agent(
+    `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）が main と衝突していて、CI が動かない。worktree で main を取り込む。
+返す outcome は次のどれか1つ（pushed は outcome=merged のときだけ true）。
+1. worktree で \`git fetch origin\` し、\`git merge origin/main\` する（rebase と force push はしない）。
+   - Already up to date（取り込むものがない。衝突の読み違いや、GitHub の \`mergeable\` が古い値だった、ほかの段階がもう取り込んでいた、など）なら、何もせず outcome=up_to_date・pushed=false で返す。ローカルにまだ push していないコミットがあれば push してから返す。
+2. 衝突が字面の解消で済む（両方の変更を残せば済む、など）なら解いてコミットする。ロジックの判断が要るなら \`git merge --abort\` で戻し、push せず outcome=conflict・pushed=false で、summary に衝突したファイルと、判断が要る理由を書く。
+3. 取り込んだ結果で \`./gradlew build\` を通す（GameTest はマージの段階でもう一度回るので、ここでは回さない）。build が落ちたら、取り込みで壊れた分を直す。直せなければ push せず outcome=build_failed・pushed=false で、summary に理由を書く。
+4. 通ったら push して outcome=merged・pushed=true で返す。
+${gradleRules(info.number, `conflict${n}`)}`,
+    { label: `conflict:${impl.pr}#${n}`, phase: 'CI', schema: MERGE_MAIN_SCHEMA, ...M.fixFirst },
+  )
+}
+
+// 衝突していたら取り込んでから待ち直す。取り込めなければ、衝突を落ちたチェックとして返す（報告の段階で、確かめてから人に聞く）
+async function waitCiResolvingConflicts(info, impl, label, conflictState) {
+  let ci = await waitCi(impl.pr, label)
+  while (ci && ci.mergeable === 'CONFLICTING') {
+    if (conflictState.count >= MAX_CONFLICT_MERGES) {
+      return { ...ci, passed: false, failingChecks: ['main との衝突'], failureLog: `main との衝突を ${MAX_CONFLICT_MERGES} 回取り込んだが、まだ衝突している` }
+    }
+    conflictState.count++
+    log(`PR #${impl.pr}: main と衝突していて CI が動かない。main を取り込む（${conflictState.count}/${MAX_CONFLICT_MERGES}）`)
+    const merged = await mergeMain(info, impl, conflictState.count)
+    // 取り込むものがなかった（CONFLICTING の読み違いや、GitHub の mergeable が古い値だった）なら、衝突として止めずに待ち直す。
+    // 待ち直してもまだ CONFLICTING なら、上限に達したところで「まだ衝突している」として返る
+    if (merged && merged.outcome === 'up_to_date') {
+      log(`PR #${impl.pr}: main に取り込むものがなかった（衝突の読み違いか、mergeable が古い値）。待ち直す`)
+    } else if (!merged || !merged.pushed) {
+      const reason = merged?.outcome === 'build_failed'
+        ? 'main を取り込んだ後の build（直せなかった）'
+        : merged?.outcome === 'conflict' ? 'main との衝突（字面で解けない）' : 'main の取り込みに失敗した'
+      return { ...ci, passed: false, failingChecks: [reason], failureLog: merged?.summary ?? 'main の取り込みのエージェントが結果を返さなかった' }
+    }
+    ci = await waitCi(impl.pr, `${label}+m${conflictState.count}`)
   }
   return ci
 }
 
 // CI が通るまで待つ。落ちたら最大 MAX_CI_FIXES 回直す（1回目は Sonnet、2回目は Opus）。
-async function untilGreen(impl, tag) {
-  let ci = await waitCi(impl.pr, `ci:${tag}`)
-  for (let i = 1; ci && !ci.passed && i <= MAX_CI_FIXES; i++) {
+// main との衝突は直しの回数に数えず、先に取り込む（衝突のまま ci-fix に回すと、名前のない失敗を直そうとする）
+async function untilGreen(info, impl, tag) {
+  const conflictState = { count: 0 }
+  let ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}`, conflictState)
+  for (let i = 1; ci && !ci.passed && ci.mergeable !== 'CONFLICTING' && !ci.noChecksOnly && i <= MAX_CI_FIXES; i++) {
     log(`PR #${impl.pr}: CI 失敗（${ci.failingChecks.join(', ')}）。修正 ${i}/${MAX_CI_FIXES}`)
     const fixed = await agent(
       `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
+${gradleRules(info.number, `ci-fix${i}`)}
 失敗したチェック: ${ci.failingChecks.join(', ')}
 ログ抜粋:
 ${ci.failureLog}`,
       { label: `ci-fix:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
     )
     if (!fixed || !fixed.pushed) break
-    ci = await waitCi(impl.pr, `ci:${tag}#${i}`)
+    ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}#${i}`, conflictState)
   }
   return ci
 }
@@ -500,18 +615,42 @@ ${listed}`
   return findings.filter((f, i) => byOpus.has(i) || byFable.has(i))
 }
 
+// マージの段階で GameTest だけが落ち、過負荷の兆候があったか（#855）。回し直すかどうかはスクリプトが決める（エージェントに任せない）
+function overloaded(m) {
+  return (m.maxTicksBehind ?? 0) >= OVERLOAD_TICKS_BEHIND || (m.gameTestSeconds ?? 0) >= OVERLOAD_GAMETEST_SECONDS
+}
+
+function mergePrompt(info, impl, retryNote) {
+  return `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。${retryNote ? `\n${retryNote}` : ''}
+1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、マージせず status=needs_human・failedStep=conflict で理由を返す。
+2. 取り込んだ結果で \`./gradlew build\` を通す。通らなければ status=needs_human・failedStep=build。通ったら、両バージョンの \`runGameTestServer\` を通す（\`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer --continue\`。片方が落ちても、もう片方も回す）。落ちたら status=needs_human・failedStep=gametest で返す。**GameTest は自分で回し直さない**（回し直すかどうかは、返した数字を見てこのスクリプトが決める）。
+3. 取り込みでコミットが増えたら push する。push したかどうかによらず、\`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。通らなければ status=needs_human・failedStep=ci。
+4. \`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human・failedStep=merge で理由を返す。マージできたら status=merged・failedStep=null。
+
+${gradleRules(info.number, retryNote ? 'merge-retry' : 'merge')}
+
+返す数字（GameTest まで進んだときは、成功・失敗によらず埋める）:
+- gameTestFailedOnly: build が通り、GameTest のサーバーが起動してテストが落ちた（「N required tests failed」）ときだけ true。サーバーの起動前に落ちたもの（コンパイル、依存の取得、ワールドを消せない、GameTest のロックの待ちの上限）は false。
+- gameTestSeconds: Gradle の出力にある「GameTest lock released by ... after holding it for N s」の N の最大（ロックを待った時間は入らない）。
+- maxTicksBehind: \`platform-neoforge-1.21.1/run/logs/latest.log\` と \`platform-forge-1.20.1/run/logs/latest.log\` の「Can't keep up! Is the server overloaded? Running Nms or N ticks behind」の tick の最大（\`grep -h "Can't keep up" ...\`）。出ていなければ 0。
+- logPath: ログを残した \`.worktrees/.logs/issue-${info.number}/\` の絶対パス。`
+}
+
 async function mergePr(info, impl) {
   await mergeLock.acquire()
+  // 回し直す間も mergeLock を持ったままにする（main を動かさないため。ほかのマージは待つ）
   try {
-    const m = await agent(
-      `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。
-1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、マージせず status=needs_human で理由を返す。
-2. 取り込んだ結果で \`./gradlew build\` と両バージョンの \`runGameTestServer\` を通す。通らなければ status=needs_human。
-3. 取り込みでコミットが増えたら push する。push したかどうかによらず、\`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。
-4. \`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human で理由を返す。`,
-      { label: `merge:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge },
-    )
-    return m ?? { status: 'needs_human', reason: 'マージの段階が失敗した' }
+    const first = await agent(mergePrompt(info, impl, null), { label: `merge:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge })
+    if (!first) return { status: 'needs_human', reason: 'マージの段階が失敗した' }
+    const retry = first.status === 'needs_human' && first.failedStep === 'gametest' && first.gameTestFailedOnly && overloaded(first)
+    if (!retry) return first
+    const numbers = `GameTest ${first.gameTestSeconds ?? '-'} 秒、最大 ${first.maxTicksBehind ?? '-'} tick 遅れ`
+    log(`PR #${impl.pr}: マージの段階で GameTest だけが落ち、過負荷の兆候がある（${numbers}）。1 回だけ回し直す`)
+    const note = `前回のマージの段階では、GameTest だけが過負荷の兆候とともに落ちた（${numbers}。理由: ${first.reason ?? '-'}）。過負荷による揺れの疑いがあるので、手順 1 からもう 1 回だけやり直す（GameTest はロックが空くのを待ってから回る）。**今回も落ちたら、回し直さずに status=needs_human で返す。**`
+    const second = await agent(mergePrompt(info, impl, note), { label: `merge-retry:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge })
+    const prefix = `過負荷の兆候（${numbers}）で GameTest が落ちたので、1 回だけ回し直した。1 回目の理由: ${first.reason ?? '-'}`
+    if (!second) return { ...first, reason: `${prefix}。回し直しの段階が失敗した` }
+    return { ...second, retried: true, reason: second.status === 'merged' ? prefix : `${prefix}。回し直しの理由: ${second.reason ?? '-'}` }
   } finally {
     mergeLock.release()
   }
@@ -527,14 +666,42 @@ function lastFindings(rounds) {
     : { all: last.confirmed, remaining: last.confirmed, fixedUnreviewed: [] }
 }
 
-// PR に結果をまとめる。自動でマージできなかったときは質問を返す
+// マージ済みの PR の worktree を片付ける（#855）。そこで動いている Gradle・GameTest のサーバーが終わってから消す。
+// 終わる前に git worktree remove --force を実行すると、.gradle のロックで途中で止まり、.git だけ消えた壊れたディレクトリが残る
+function cleanupWorktree(info, impl) {
+  const logs = `.worktrees/.logs/issue-${info.number}`
+  return agent(
+    `${REPO} の PR #${impl.pr} はマージ済み。worktree ${impl.worktree} を片付ける。リポジトリのルートで作業する。
+1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分、Monitor などで待つ（前景の \`sleep\` は使えない）:
+   - \`${logs}/\` の \`.log\` のうち、\`-latest.log\` で終わらないものすべてに、同じ名前の \`.exit\` がある（Gradle が終わった）。
+   - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]issue-${info.number}(?![0-9])' }\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
+   - ただし \`.exit\` のない \`.log\` でも、上の java のプロセスがなく、そのログの最終更新から ${STALE_LOG_MINUTES} 分以上たっていれば、終わった（ジョブが殺されて \`.exit\` を書けなかった）とみなす。最終更新との差は \`date +%s\` と \`stat -c %Y <ログ>\` で測る。そうみなしたログの名前は note に書く。
+   15 分たっても終わらなければ、消さずに removed=false で、残っているもの（ログの名前・プロセスの ID とコマンドラインの先頭）を note に書いて返す。プロセスは殺さない。\`./gradlew --stop\` は使わない（ほかの worktree のビルドまで止まる）。
+2. 終わっていたら \`git worktree remove --force ${impl.worktree}\` を実行する。
+3. 失敗したら、\`git worktree list --porcelain\` に載っているかを確かめる。登録が外れてディレクトリだけ残った（消えかけ）なら、\`${impl.worktree}.stale\`（もうあれば \`.stale2\`、\`.stale3\`…）に名前を変え、\`git worktree prune\` する。名前を変えられなければそのまま残す。どちらも removed=false で、残したディレクトリと理由を note に書く。
+\`${logs}/\` のログは消さない。`,
+    { label: `cleanup:${impl.pr}`, phase: 'Report', schema: CLEANUP_SCHEMA, ...M.report },
+  )
+}
+
+// PR に結果をまとめる。自動でマージできなかったときは質問を返す。
+// worktree はマージ済みのときだけ片付ける（needs_human や merge: false のときは、resume で続けるために残す。#855）
 async function report(info, r) {
   const { remaining, fixedUnreviewed } = lastFindings(r.rounds)
   const ciState = !r.ci ? 'CI の確認に失敗' : r.ci.passed ? 'CI 通過' : `CI 失敗（${r.ci.failingChecks.join(', ')}）`
   const ready = r.ready
+  const merged = r.merge?.status === 'merged'
   const mergeState = r.merge
-    ? (r.merge.status === 'merged' ? 'マージ済み' : `マージせず（${r.merge.reason}）`)
+    ? (merged ? `マージ済み${r.merge.retried ? `（${r.merge.reason}）` : ''}` : `マージせず（${r.merge.reason}）`)
     : MERGE ? 'マージせず（確認が必要）' : 'マージは人が行う（merge: false）'
+  let cleanup = null
+  if (merged) {
+    cleanup = await cleanupWorktree(info, r.impl)
+    log(`PR #${r.impl.pr}: worktree の片付け: ${cleanup ? (cleanup.removed ? '消した' : `残した（${cleanup.note}）`) : '片付けの段階が失敗した'}`)
+  }
+  const cleanupState = merged
+    ? (cleanup ? (cleanup.removed ? '片付けた' : `片付けなかった（${cleanup.note}）`) : '片付けの段階が失敗した（worktree が残っている）')
+    : `残した（${r.impl.worktree}。続きの作業に使う）`
   await agent(
     `${REPO} の PR #${r.impl.pr} に、自動レビューの結果を日本語のコメントで投稿する（\`gh pr comment ${r.impl.pr} --body-file <ファイル>\`）。内容:
 - CI: ${ciState}
@@ -543,10 +710,12 @@ async function report(info, r) {
 - 最後のレビューの指摘で、直して push したがレビューし直していないもの: ${fixedUnreviewed.length ? fixedUnreviewed.map(f => `[${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join(' / ') : 'なし'}
 - 結論: ${ready ? 'マージ可能' : '人の確認が必要'}
 - マージ: ${mergeState}
-投稿したら、リポジトリのルートで \`git worktree remove --force ${r.impl.worktree}\` を実行して worktree を片付ける。`,
+- worktree: ${cleanupState}
+- ログ: リポジトリのルートの \`.worktrees/.logs/issue-${info.number}/\`
+worktree は消さない（片付けはこのスクリプトが別に行う）。`,
     { label: `report:${r.impl.pr}`, phase: 'Report', ...M.report },
   )
-  if (r.merge?.status === 'merged' || (!MERGE && ready)) return null
+  if (merged || (!MERGE && ready)) return null
 
   const reasons = []
   if (!r.ci || !r.ci.passed) reasons.push(`CI が通らない: ${ciState}`)
@@ -615,6 +784,7 @@ async function runIssue(info) {
       const applied = await agent(
         `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）に、実装のエージェントが確認事項を残した。人に聞く前の確かめ（別のモデル）が、人を待たずに進められると判断し、次の進め方を示した。これに従う。
 コードを変える必要があれば worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してからコミットして push する。変える必要がなければ push しない。
+${gradleRules(info.number, 'resolve')}
 どちらの場合も、PR 本文の「確認してほしいこと」を、確かめた結果と結論（決めたこととその根拠）に書き換える（\`gh pr edit ${impl.pr} --body-file <ファイル>\`）。
 
 確認事項:
@@ -628,7 +798,7 @@ ${e.guidance}`,
     }
 
     const tag = `#${info.number}`
-    let ci = await untilGreen(impl, tag)
+    let ci = await untilGreen(info, impl, tag)
     const rounds = []
     for (let round = 1; ci && ci.passed && round <= MAX_REVIEW_ROUNDS; round++) {
       const confirmed = await review(info, impl, round)
@@ -643,12 +813,13 @@ ${e.guidance}`,
       const fixed = await agent(
         `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）へのレビュー指摘を直す。worktree の中で修正し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
 Issue にし忘れた別の問題は、コードを直す代わりに新しい Issue にして適切な Epic のサブ Issue にし（AGENTS.md の手順）、PR 本文に番号を書く。
+${gradleRules(info.number, `fix${round}`)}
 ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')}`,
         { label: `fix:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
       )
       if (!fixed || !fixed.pushed) break
       entry.fixed = true
-      ci = await untilGreen(impl, `${tag}-r${round}`)
+      ci = await untilGreen(info, impl, `${tag}-r${round}`)
     }
 
     // マージの条件は変えない: 最後のラウンドの must は、直して push していてもレビューし直していないので止める
@@ -699,7 +870,7 @@ async function prepareResume({ issue, pr }) {
   const r = await agent(
     `${REPO} の PR #${pr}（Issue #${issue}）を、途中で止まったところから自動の流れで続けるために用意する。
 1. \`gh pr view ${pr} --json state,headRefName,body,labels\` と \`gh issue view ${issue} --json title,labels\` を読む。PR が OPEN でないか、PR か Issue に \`needs-human\` ラベルが付いていれば ok=false にして、理由を summary に書く。
-2. リポジトリのルートで \`git fetch origin\` し、\`.worktrees/issue-${issue}\` がなければ \`git worktree add .worktrees/issue-${issue} <headRefName>\`（ローカルのブランチがなければ \`origin/<headRefName>\` から作る）。あれば \`git -C .worktrees/issue-${issue} pull --ff-only\` で先頭に合わせる。
+2. リポジトリのルートで \`git fetch origin\` し、\`.worktrees/issue-${issue}\` がなければ \`git worktree add .worktrees/issue-${issue} <headRefName>\`（ローカルのブランチがなければ \`origin/<headRefName>\` から作る）。あれば、${worktreeCheck(issue)} 本物の worktree なら \`git -C .worktrees/issue-${issue} pull --ff-only\` で先頭に合わせる。
 3. 差分（\`gh pr diff ${pr}\`）から、publicApiChanged（\`public\` な宣言、特に \`pro.ikili.kibicomputers.api\` 以下を足した・変えた）と touchesConcurrency（スレッド・ロック・非同期の完了待ちの振る舞いを変えた）を判断する。summary には PR 本文の要約を書く。
 コードは変更しない。`,
     { label: `resume:#${issue}`, phase: 'Select', schema: RESUME_SCHEMA, ...M.select },

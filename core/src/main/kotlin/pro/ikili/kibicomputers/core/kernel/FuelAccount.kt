@@ -1,5 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * マシンの燃料の遅延補充と受け渡し（ADR 0028 をカーネルに載せたもの。ADR 0043）。カーネルロックの中で使う。
  *
@@ -14,7 +16,13 @@ package pro.ikili.kibicomputers.core.kernel
  * 返すとき（[giveBack]）に tick が進んでいれば、残りは 0 以上なので `refilled` は `fuelPerTick` になり、そこへ手持ちの `min(r, 0)` を足す。
  * 結果は「tick ごとに `min(fuel, 0) + fuelPerTick`」と同じ（使わなかった分は、手持ちもマシンの残りも持ち越さない）
  */
-internal class FuelAccount(private val state: KernelState, val fuelPerTick: Long, initialTick: Long) {
+internal class FuelAccount(
+    private val state: KernelState,
+    val fuelPerTick: Long,
+    initialTick: Long,
+    /** 使った燃料の数え口（#740。`MachineScheduler.fuelConsumed`）。渡した量を足し、返した残りを引く。`null` なら数えない */
+    private val consumed: AtomicLong? = null,
+) {
     init {
         require(fuelPerTick > 0) { "fuelPerTick は正" }
     }
@@ -45,6 +53,7 @@ internal class FuelAccount(private val state: KernelState, val fuelPerTick: Long
         if (fuel <= 0) return 0
         val grant = minOf(fuel, limit)
         state.fuel = fuel - grant
+        consumed?.addAndGet(grant)
         return grant
     }
 
@@ -62,6 +71,8 @@ internal class FuelAccount(private val state: KernelState, val fuelPerTick: Long
         val k = now - lastRefillTick
         refill(now)
         state.fuel += if (k <= 0) remaining else minOf(remaining, 0)
+        // tick が進んで捨てる正の残りも、使っていないので引く（使ったのは「渡した量 - 残り」）
+        consumed?.addAndGet(-remaining)
     }
 
     /** 例外で抜けたとき: CPU を持っていたときだけ補充する（何も書き戻さない） */

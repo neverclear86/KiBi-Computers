@@ -22,6 +22,16 @@ java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 kotlin {
     jvmToolchain(21)
     compilerOptions.jvmTarget = JvmTarget.JVM_21
+    // 公開 API のダンプ（api/<プロジェクト名>.api）と食い違ったら check（build）で落とす（#845）。
+    // 公開 API を変えたら ./gradlew updateKotlinAbi で作り直してコミットする。
+    @OptIn(org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation::class)
+    abiValidation {
+        filters {
+            include {
+                byNames.add("pro.ikili.kibicomputers.neoforge.api.**")
+            }
+        }
+    }
 }
 
 // 開発環境でだけ読み込むコード（クライアントの自動操作の口など）。jar には入れない
@@ -125,6 +135,12 @@ neoForge {
             // -PloadTestDevices=<n> で、n 台に1台の割合でケースの隣に他 MOD 役のデバイス（#153）を置く（既定は 0 = 置かない）
             systemProperty("kibicomputers.dev.testDevices", "true")
             systemProperty("kibicomputers.loadTest.devices", providers.gradleProperty("loadTestDevices").getOrElse("0"))
+            // 許可の受け渡しを測る（#740）: -PloadTestComputeProcesses=<n> で、1台に計算するプロセスを n 本動かす段階の本数（標準 OS だけ。既定 4、1 以下で飛ばす）、
+            // -PloadTestBusy=<n> で計算・出力させる台数（既定は台数の 1/10。過負荷を作るときに上げる）、
+            // -PloadTestFuelSlice=tick|<燃料> でマシンのスライス（tick は fuelPerTick = 1 tick に1回。#47 の前と比べる回）を差し替える
+            systemProperty("kibicomputers.loadTest.computeProcesses", providers.gradleProperty("loadTestComputeProcesses").getOrElse("4"))
+            systemProperty("kibicomputers.loadTest.busy", providers.gradleProperty("loadTestBusy").getOrElse("0"))
+            systemProperty("kibicomputers.loadTest.fuelSlice", providers.gradleProperty("loadTestFuelSlice").getOrElse(""))
             // -PloadTestJfr=<ファイル> で、JFR のプロファイルを取る（メインスレッドで重いところを探すとき。#351）
             providers.gradleProperty("loadTestJfr").orNull?.let {
                 jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")

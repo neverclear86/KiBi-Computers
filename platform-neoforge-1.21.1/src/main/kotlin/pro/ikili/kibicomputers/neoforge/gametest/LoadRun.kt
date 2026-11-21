@@ -20,6 +20,7 @@ import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
@@ -62,6 +63,8 @@ private val LOAD_TYPIST: UUID = UUID(0, 0x10AD)
  *   計算させる台の全部にこのプロセスがあり、全部の台で段階に入ってからの台ごとの燃料切れの巻き戻し（`Machine.fuelUnwindCount`）が
  *   1 回以上になってから測りはじめる（読み込み・起動の途中を測らない。#821）
  * @property ci CI の試験（`runGameTestServer`）でも動かすか。`false` のものは測定用（`-PloadTestOs`）だけ
+ * @property backgroundCommand [computeCommand] をバックグラウンドで動かすコマンド（#740。[LoadPhase.COMPUTE_MULTI] で、1台に計算するプロセスを
+ *   複数作る）。シェルは `[k] pid` を出してからプロンプトに戻る。`null` なら、1台に計算するプロセスを複数作れない（Lua の REPL）ので、その段階を飛ばす
  */
 internal enum class LoadOs(
     val id: String,
@@ -75,6 +78,7 @@ internal enum class LoadOs(
     val bootDisk: String? = null,
     val computeProcess: String? = null,
     val ci: Boolean = true,
+    val backgroundCommand: String? = null,
 ) {
     /** テスト用の起動ディスク（#307）の Lua の REPL。`close` の戻り値 `true` を REPL が出す */
     LUA(
@@ -85,7 +89,7 @@ internal enum class LoadOs(
     /** 標準 OS（#98。ゲームの既定。#461）のシェル。`seq 3300` は 15,393 バイト */
     STANDARD(
         "standard", "標準 OS のシェル", '$', "while :; do :; done", "i=0; while :; do i=$((i+1)); echo \$i; done",
-        "seq 3300 >/tmp/l; echo ok", "ok", 15_393,
+        "seq 3300 >/tmp/l; echo ok", "ok", 15_393, backgroundCommand = "while :; do :; done &",
     ),
 
     /**
@@ -135,7 +139,13 @@ internal enum class LoadPhase(val label: String) {
     /** 一部の台が無限ループで計算し続ける（残りは入力待ち） */
     COMPUTE("一部が計算し続ける"),
 
-    /** 一部の台が画面に出力し続ける。誰も見ていない（計算していた台は電源を切る。残りは入力待ち） */
+    /**
+     * 一部の台で、計算し続けるプロセスが1台に複数（[LoadSettings.computeProcesses] 本。#740）。[COMPUTE] の台は電源を切り、別の台
+     * （[COMPUTE] と同じ台数）でバックグラウンドに N−1 本、前景に1本動かす。標準 OS のシェルだけ（[LoadOs.backgroundCommand]）
+     */
+    COMPUTE_MULTI("一部が計算し続ける（1台に複数）"),
+
+    /** 一部の台が画面に出力し続ける。誰も見ていない（計算していた台（[COMPUTE] か [COMPUTE_MULTI]）は電源を切る。残りは入力待ち） */
     OUTPUT("一部が出力し続ける"),
 
     /** [OUTPUT] の画面を、1人が全部見ている（画面の同期が送られる） */
@@ -146,6 +156,12 @@ internal enum class LoadPhase(val label: String) {
      * 測るだけで、目標値では落とさない（#84 の基準にする）
      */
     UNLOAD("まとめてアンロード"),
+
+    /**
+     * [UNLOAD] の後に、外した強制読み込みを戻し、アンロードの時点で動いていた台が全部戻るまで（#582。ADR 0085 の復元の順番待ち）。
+     * 同じ JVM なのでモジュールは共有済みで、コンパイル待ちの経路は通らない。測るだけで、目標値では落とさない
+     */
+    RESTORE("強制読み込みを戻して全台が戻る"),
 }
 
 /**
@@ -163,6 +179,7 @@ internal enum class LoadPhase(val label: String) {
  *   [LoadPhase.COMPUTE] で、計算させる台が全部、打ち込んだ命令を画面に出すまで待つ上限にも使う
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
+ * @property massRestore [massUnload] の後に [LoadPhase.RESTORE] を測るか（#582。測定用だけ。CI の試験では動かさない）
  * @property quietProgress 試験の間、GameTest のサーバーの進み具合のログを止めるか（#600）
  * @property devicesEvery この台数に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。#153）を置く（`-PloadTestDevices`。0 なら置かない）
  * @property productionAutosave 自動保存の段階を本番の形で測るか（`-PloadTestProductionAutosave`。#834）。周期を止めずに、数え口を合わせて
@@ -172,6 +189,9 @@ internal enum class LoadPhase(val label: String) {
  * @property vanillaSaveOffset [productionAutosave] のとき、バニラの自動保存を一巡の始めの tick から何 tick 後にするか（`-PloadTestVanillaSaveOffset`）。
  *   0 が本番の既定（周期 6000 tick・tick rate 20 のまま）の重なり方。正の値は、周期を変えた・tick rate を変えたときなどに一巡の途中に入る形
  * @property syntheticLogTicks [productionAutosave] の段階の間、メインスレッドに合成のログを何 tick ごとに書かせるか（`-PloadTestSyntheticLogTicks`。0 なら書かない）
+ * @property computeProcesses [LoadPhase.COMPUTE_MULTI] で1台に動かす計算するプロセスの数（`-PloadTestComputeProcesses`。#740）。2 未満なら、その段階を飛ばす
+ * @property fuelSlice マシンのスライスの差し替え（`-PloadTestFuelSlice`。#740）。`null` なら既定（`fuelPerTick` の 1/4）。
+ *   [Long.MAX_VALUE] は `fuelPerTick`（1 tick に1回渡す。#47 の前と同じ受け渡しの回数）に切り詰める
  */
 internal data class LoadSettings(
     val os: LoadOs,
@@ -183,11 +203,14 @@ internal data class LoadSettings(
     val bootTimeoutTicks: Int = if (paced) 150_000 else 15_000,
     val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
     val massUnload: Boolean = false,
+    val massRestore: Boolean = false,
     val devicesEvery: Int = System.getProperty(DEVICES_PROPERTY)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
     val quietProgress: Boolean = System.getProperty(QUIET_PROGRESS_PROPERTY).toBoolean(),
     val productionAutosave: Boolean = false,
     val vanillaSaveOffset: Int = 0,
     val syntheticLogTicks: Int = 0,
+    val computeProcesses: Int = 0,
+    val fuelSlice: Long? = null,
 ) {
     companion object {
         /**
@@ -207,6 +230,23 @@ internal data class LoadSettings(
 
         /** 合成のログの間隔（tick）のシステムプロパティ（`-PloadTestSyntheticLogTicks`） */
         const val SYNTHETIC_LOG_TICKS_PROPERTY: String = "kibicomputers.loadTest.syntheticLogTicks"
+
+        /** 1台に動かす計算するプロセスの数のシステムプロパティ（`-PloadTestComputeProcesses`。#740） */
+        const val COMPUTE_PROCESSES_PROPERTY: String = "kibicomputers.loadTest.computeProcesses"
+
+        /** 計算・出力させる台数のシステムプロパティ（`-PloadTestBusy`。#740。0 なら台数の 1/10） */
+        const val BUSY_PROPERTY: String = "kibicomputers.loadTest.busy"
+
+        /** スライスの差し替えのシステムプロパティ（`-PloadTestFuelSlice=tick|<燃料>`。#740。空なら既定） */
+        const val FUEL_SLICE_PROPERTY: String = "kibicomputers.loadTest.fuelSlice"
+
+        /** [FUEL_SLICE_PROPERTY] の値（`tick` は [Long.MAX_VALUE]。空なら `null`。読めなければ失敗にする） */
+        fun fuelSliceProperty(): Long? {
+            val v = System.getProperty(FUEL_SLICE_PROPERTY)?.trim().orEmpty()
+            if (v.isEmpty()) return null
+            if (v == "tick") return Long.MAX_VALUE
+            return v.toLongOrNull()?.takeIf { it >= 1 } ?: throw IllegalArgumentException("$FUEL_SLICE_PROPERTY should be tick or a positive number: $v")
+        }
 
         /** 0 以上の整数のシステムプロパティ（なければ・読めなければ 0） */
         fun intProperty(name: String): Int = System.getProperty(name)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
@@ -229,20 +269,43 @@ internal data class TickStats(val ticks: Int, val avg: Double, val p50: Double, 
 }
 
 /**
- * スケジューラの燃料切れの数え口（サーバー全体の累計。#821）: 巻き戻してスレッドを持たずに待った回数、スレッドを持ったまま待った回数、
- * 止まりうる関数でない関数の中で前借りした回数（`MachineScheduler` の `fuelUnwinds`・`fuelBlockingWaits`・`fuelOverdrafts`）
+ * スケジューラの燃料と許可の数え口（サーバー全体の累計。#821・#740）: 巻き戻してスレッドを持たずに待った回数、スレッドを持ったまま待った回数、
+ * 止まりうる関数でない関数の中で前借りした回数（`MachineScheduler` の `fuelUnwinds`・`fuelBlockingWaits`・`fuelOverdrafts`）と、
+ * 許可を取った回数・スライスをその場で足した回数・譲った回数（`permitAcquisitions`・`fuelSliceRenewals`・`fuelYields`）、
+ * 使った燃料の合計とそのうちの巻き戻しの費用（`fuelConsumed`・`fuelUnwindCost`）。
+ * 値は1つずつ読むので、動いている間に読むと互いに少しずれる（段階の区切りで差を取るぶんには問題にならない）
  */
-internal data class FuelCounts(val unwinds: Long, val blockingWaits: Long, val overdrafts: Long) {
-    operator fun minus(o: FuelCounts): FuelCounts = FuelCounts(unwinds - o.unwinds, blockingWaits - o.blockingWaits, overdrafts - o.overdrafts)
+internal data class FuelCounts(
+    val unwinds: Long,
+    val blockingWaits: Long,
+    val overdrafts: Long,
+    val permits: Long = 0,
+    val renewals: Long = 0,
+    val yields: Long = 0,
+    val consumed: Long = 0,
+    val unwindCost: Long = 0,
+) {
+    operator fun minus(o: FuelCounts): FuelCounts = FuelCounts(
+        unwinds - o.unwinds, blockingWaits - o.blockingWaits, overdrafts - o.overdrafts,
+        permits - o.permits, renewals - o.renewals, yields - o.yields, consumed - o.consumed, unwindCost - o.unwindCost,
+    )
 
-    override fun toString(): String = "巻き戻し $unwinds 回 / スレッドを持って待った $blockingWaits 回 / 前借り $overdrafts 回"
+    /** 計算の進みに使った燃料（使った燃料から巻き戻しの費用を引いたもの） */
+    val computed: Long get() = consumed - unwindCost
+
+    override fun toString(): String =
+        "巻き戻し $unwinds 回 / スレッドを持って待った $blockingWaits 回 / 前借り $overdrafts 回 / 許可 $permits 回 / その場で足した $renewals 回 / " +
+            "譲った $yields 回 / 使った燃料 $consumed（うち巻き戻しの費用 $unwindCost）"
 
     companion object {
         val ZERO = FuelCounts(0, 0, 0)
 
         /** 動いているサーバーのスケジューラの今の値（サーバーが動いていなければ 0） */
         fun current(): FuelCounts = ServerMachines.current?.scheduler?.let {
-            FuelCounts(it.fuelUnwindCount, it.fuelBlockingWaitCount, it.fuelOverdraftCount)
+            FuelCounts(
+                it.fuelUnwindCount, it.fuelBlockingWaitCount, it.fuelOverdraftCount,
+                it.permitAcquisitionCount, it.fuelSliceRenewalCount, it.fuelYieldCount, it.fuelConsumedTotal, it.fuelUnwindCostTotal,
+            )
         } ?: ZERO
     }
 }
@@ -292,6 +355,20 @@ internal data class PhaseResult(
      * （10 tick ごとに数えた中で。[LoadPhase.COMPUTE] だけ。ほかは -1）。巻き戻して待つプロセスは `RUNNABLE` なので数えない（#821）
      */
     val peakFuelThreadWaits: Int = -1,
+    /** 測った区間の、このプロセス（JVM）の CPU 時間（ナノ秒。全スレッドの合計。#740）。測る区間のない段階・取れない JVM は -1 */
+    val cpuNanos: Long = -1,
+    /** 計算・出力させた台の数（[LoadPhase.COMPUTE]・[LoadPhase.COMPUTE_MULTI]・[LoadPhase.OUTPUT]・[LoadPhase.WATCHED]。ほかは 0。#740） */
+    val busyMachines: Int = 0,
+    /** 計算させた台の、1台の計算するプロセスの数（[LoadPhase.COMPUTE] は 1、[LoadPhase.COMPUTE_MULTI] は N。ほかは 0。#740） */
+    val processesPerMachine: Int = 0,
+    /**
+     * [LoadPhase.COMPUTE_MULTI] の測った区間に、計算するシェル1本が燃料のスライスを受け取った回数の最小（測りはじめにあった全部のシェルの中で。
+     * `Machine.fuelGrantsByProcess` の増分。#740）。0 なら、そのシェルは測った区間に一度も動いていない（同じ台の中の譲り合いが壊れて、
+     * ほかが回り続けている）。[fuel] の「譲った」は、tick をそろえない回ではプロセスが1本でも増えるので、それだけでは見分けられない。ほかの段階は -1
+     */
+    val minProcessGrants: Long = -1,
+    /** [minProcessGrants] と同じものの最大 */
+    val maxProcessGrants: Long = -1,
 )
 
 /**
@@ -495,6 +572,64 @@ internal class ProductionAutosaveResult(
     val tickCount: Int,
 )
 
+/**
+ * [LoadPhase.RESTORE] の結果（#582）。tick は段階の中の番号（強制読み込みを戻した tick が 0。-1 は届かなかった）。
+ *
+ * @property expected 戻るはずの台（アンロードの段階に入るときにマシンがあった台）
+ * @property done そのうち、マシンがあって復元の順番待ちでも復元の途中でもなくなった台
+ * @property kept [done] のうち、アンロードされずに元のマシンのまま残った台（ケースのブロックエンティティが変わらず、復元も始めていない）
+ * @property fromSave 復元を始めた台のうち、保存した世代から戻そうとした数（[ServerMachines.Stats.restoresFromSave]）
+ * @property coldStart 復元を始めた台のうち、最初から冷えた起動にした数（[ServerMachines.Stats.restoresColdStart]）
+ * @property writeTimeouts 書き込みが期限までに終わらず、冷えた起動にした数
+ * @property restored 保存した世代から戻せた数
+ * @property fallbacks 戻せずに冷えた起動にした数
+ * @property versionMismatches [fallbacks] のうち、MOD のバージョンが違ったもの
+ * @property forceMillis 強制読み込みを戻すのにかかった時間（試験の呼び出しの中、1 tick。`setChunkForced` はその場でチャンクを読み込むので、
+ *   ディスクからの読み込みまでを含む。MSPT には入らない）。ケースの `onLoad`（復元の順番待ちに入る。ブロックエンティティの
+ *   `onLoad` は次の tick のブロックエンティティの処理で呼ばれる。#653）は含まず、測る区間の最初の tick（[firstTickMillis]）に入る
+ * @property firstTickMillis 測る区間の最初の tick の時間（強制読み込みを戻した次の tick。ブロックエンティティの `onLoad`・claim が入る）
+ * @property chunksTick ケース・画面・キーボードのあるチャンクが全部 FULL で読み込まれた tick
+ * @property startedTick 戻るはずの台が全部、復元を始めた（か、残っていた）tick
+ * @property doneTick 戻るはずの台が全部 [done] になった tick
+ * @property doneSeconds 強制読み込みを戻し終えてから [doneTick] までの壁時計の秒（届かなければ段階を打ち切るまで）
+ * @property timedOut [RESTORE_TIMEOUT_TICKS] で打ち切った
+ * @property maxQueue 復元の順番待ちの列の長さの最大（毎 tick 数えた中で）
+ * @property peakBootThreads `KiBi-boot-*` のスレッドの数の最大（毎 tick 数えた中で）。プールで次の仕事を待つスレッドも数えるので、
+ *   作りの上で [maxConcurrentMachines] を超えない（上限が守られているかの検査にはならない。参考の値）
+ * @property peakInFlight 復元を受け付けてから終わりの知らせが返るまで（`Machine.isRestoring`）の台数の最大（毎 tick 数えた中で）。
+ *   起動用の待ち行列・`KiBi-boot-*` のスレッド・コンパイル待ち・通知の列のどこにいる台も数える。「同時に前段にいる台数」
+ * @property maxConcurrentMachines 動いているサーバーの `maxConcurrentMachines`（`KiBi-boot-*` の本数の上限）
+ * @property tick 測った tick の時間（強制読み込みを戻した次の tick から、全台が戻るまで）
+ */
+internal data class RestoreResult(
+    val expected: Int,
+    val done: Int,
+    val kept: Int,
+    val fromSave: Long,
+    val coldStart: Long,
+    val writeTimeouts: Long,
+    val restored: Long,
+    val fallbacks: Long,
+    val versionMismatches: Long,
+    val forceMillis: Double,
+    val firstTickMillis: Double,
+    val chunksTick: Int,
+    val startedTick: Int,
+    val doneTick: Int,
+    val doneSeconds: Double,
+    val timedOut: Boolean,
+    val maxQueue: Int,
+    val peakBootThreads: Int,
+    val peakInFlight: Int,
+    val maxConcurrentMachines: Int,
+    val tick: TickStats,
+) {
+    companion object {
+        /** 全台が戻るまで待つ上限（過ぎたら、そこまでの結果を書く） */
+        const val RESTORE_TIMEOUT_TICKS: Int = 6_000
+    }
+}
+
 /** 負荷試験の結果。 */
 internal class LoadReport(
     val settings: LoadSettings,
@@ -502,7 +637,10 @@ internal class LoadReport(
     val placeMillis: Double,
     /** 全台の電源を入れるのにかかった時間（1 tick の中） */
     val powerOnMillis: Double,
-    /** 計算している台の電源を切るのにかかった時間（1 tick の中） */
+    /**
+     * 1台に計算するプロセスが1本の台（[LoadPhase.COMPUTE] で計算させた台）の電源を切るのにかかった時間（1 tick の中）。
+     * [LoadPhase.COMPUTE_MULTI] がある回はその始めに、ない回は [LoadPhase.OUTPUT] の始めに切る（どちらも同じ台・同じ状態）
+     */
     val powerOffMillis: Double,
     /** [LoadPhase.OUTPUT] で、出力させる台が全部、画面に出すまでの tick 数（この後から測る） */
     val outputWaitTicks: Int,
@@ -515,8 +653,54 @@ internal class LoadReport(
     val unload: UnloadResult? = null,
     /** 本番の形の自動保存の結果（#834。測らなければ `null`） */
     val production: ProductionAutosaveResult? = null,
+    /** [LoadPhase.RESTORE] の結果（#582。測らなければ `null`） */
+    val restore: RestoreResult? = null,
+    /** マシンの 1 tick の燃料（計算させた台の設定。#740。分からなければ 0） */
+    val fuelPerTick: Long = 0,
+    /** マシンのスライス（計算させた台の設定。#740。分からなければ 0） */
+    val fuelSlice: Long = 0,
+    /** 1台に計算するプロセスが N 本の台（[LoadPhase.COMPUTE_MULTI]）の電源を切るのにかかった時間（[LoadPhase.OUTPUT] の始め。1 tick の中。#740）。その段階がなければ -1 */
+    val powerOffMultiMillis: Double = -1.0,
 ) {
     fun phase(phase: LoadPhase): PhaseResult = phases.first { it.phase == phase }
+
+    /** [phase] の結果（その段階を飛ばしたなら `null`） */
+    fun phaseOrNull(phase: LoadPhase): PhaseResult? = phases.firstOrNull { it.phase == phase }
+
+    /**
+     * 許可と燃料の受け渡しの表（#740）。計算の進みの比は、計算の進み（使った燃料 − 巻き戻しの費用）÷（計算・出力させた台 × `fuelPerTick` × 測った tick）。
+     * 1 に近ければ、計算させた台は tick ごとの燃料を使い切っている。1 未満なら許可（CPU の枠）が足りずに使い残した（過負荷）。
+     * 入力待ちの台が使う燃料と、tick をそろえない回（GameTest の tick は短い）の数え方の違いで、1 を少し超えることがある
+     */
+    private fun appendHandoff(sb: StringBuilder, withFuel: List<PhaseResult>) {
+        sb.append(
+            String.format(
+                Locale.ROOT, "\n許可と燃料の受け渡し（#740。測った区間の増分。サーバー全体。スライス %d、fuelPerTick %d%s）:\n\n",
+                fuelSlice, fuelPerTick, if (settings.fuelSlice != null) "。スライスを差し替えた回" else "",
+            ),
+        )
+        sb.append("| 段階 | 計算・出力させた台 × 本数 | 測った tick | 許可を取った | その場で足した | 譲った | 使った燃料 | うち巻き戻しの費用 | 許可1回あたりの燃料 | 計算の進みの比 | CPU 時間 | 計算の進み / CPU 秒 |\n")
+        sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |\n")
+        for (p in withFuel) {
+            val f = p.fuel!!
+            val ticks = p.tick.ticks
+            val ratio = if (p.busyMachines > 0 && fuelPerTick > 0 && ticks > 0) {
+                String.format(Locale.ROOT, "%.3f", f.computed.toDouble() / (p.busyMachines.toDouble() * fuelPerTick * ticks))
+            } else {
+                "-"
+            }
+            val perPermit = if (f.permits > 0) String.format(Locale.ROOT, "%.0f", f.consumed.toDouble() / f.permits) else "-"
+            val cpu = if (p.cpuNanos >= 0) String.format(Locale.ROOT, "%.1f s", p.cpuNanos / 1e9) else "-"
+            val perCpu = if (p.cpuNanos > 0) String.format(Locale.ROOT, "%.3g", f.computed / (p.cpuNanos / 1e9)) else "-"
+            val machines = if (p.busyMachines > 0) "${p.busyMachines} × ${p.processesPerMachine.coerceAtLeast(1)}" else "-"
+            sb.append(
+                String.format(
+                    Locale.ROOT, "| %s | %s | %d | %d | %d | %d | %d | %d | %s | %s | %s | %s |\n",
+                    p.phase.label, machines, ticks, f.permits, f.renewals, f.yields, f.consumed, f.unwindCost, perPermit, ratio, cpu, perCpu,
+                ),
+            )
+        }
+    }
 
     fun toMarkdown(): String {
         val s = settings
@@ -564,7 +748,11 @@ internal class LoadReport(
         if (s.devicesEvery > 0) {
             sb.append(String.format(Locale.ROOT, "- 他 MOD 役のデバイス（樽）: %d 台に1台（%d 個）\n", s.devicesEvery, (s.count + s.devicesEvery - 1) / s.devicesEvery))
         }
-        sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台の電源を切る: %.1f ms（それぞれ 1 tick の中）\n", placeMillis, powerOnMillis, powerOffMillis))
+        sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台（1台に1本）の電源を切る: %.1f ms", placeMillis, powerOnMillis, powerOffMillis))
+        if (powerOffMultiMillis >= 0) {
+            sb.append(String.format(Locale.ROOT, "、1台に %d 本の台の電源を切る: %.1f ms", s.computeProcesses, powerOffMultiMillis))
+        }
+        sb.append("（それぞれ 1 tick の中）\n")
         sb.append(String.format(Locale.ROOT, "- 出力させる台が全部、画面に出すまで: %d tick（ここから「一部が出力し続ける」を測る）\n", outputWaitTicks))
         sb.append(
             String.format(
@@ -593,6 +781,23 @@ internal class LoadReport(
                         "アンロードされなかった %d / %d チャンク（ケースのあるもの）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms\n",
                     it.ticks, it.captures, it.writes, it.cost.submitted, it.maxTickCaptures, it.maxTickWrites, it.stillLoaded, it.chunks,
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
+                ),
+            )
+        }
+        restore?.let {
+            fun at(t: Int) = if (t >= 0) "$t tick" else "届かず"
+            sb.append(
+                String.format(
+                    Locale.ROOT,
+                    "- 強制読み込みを戻して全台が戻る（#582）: 戻るはずの台 %d、戻った台 %d（うち、アンロードされずに残った %d）%s。" +
+                        "強制読み込みを戻す %.1f ms（1 tick の中。チャンクの読み込みを含む。ケースの onLoad は次の tick）、最初の tick %.1f ms、チャンクが全部読み込まれるまで %s、全台が復元を始めるまで %s、全台が戻るまで %s（%.1f s）。" +
+                        "復元を始めた台: 保存した世代から %d・最初から冷えた起動 %d（うち書き込み待ちの期限切れ %d）。" +
+                        "知らせ: 戻せた %d・冷えた起動 %d（うち MOD のバージョン違い %d）。順番待ちの最大 %d 台、" +
+                        "前段にいる台の最大 %d 台、KiBi-boot-* の最大 %d 本（上限 maxConcurrentMachines %d）、MSPT 平均 %.2f / p50 %.2f / p95 %.2f / 最大 %.2f ms（%d tick）\n",
+                    it.expected, it.done, it.kept, if (it.timedOut) "、${RestoreResult.RESTORE_TIMEOUT_TICKS} tick で打ち切った" else "",
+                    it.forceMillis, it.firstTickMillis, at(it.chunksTick), at(it.startedTick), at(it.doneTick), it.doneSeconds,
+                    it.fromSave, it.coldStart, it.writeTimeouts, it.restored, it.fallbacks, it.versionMismatches, it.maxQueue,
+                    it.peakInFlight, it.peakBootThreads, it.maxConcurrentMachines, it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max, it.tick.ticks,
                 ),
             )
         }
@@ -673,9 +878,13 @@ internal class LoadReport(
                 if (p.peakFuelThreadWaits >= 0) {
                     sb.append("。計算させる台で、スレッドを持って燃料を待つプロセスの最大 ").append(p.peakFuelThreadWaits)
                 }
+                if (p.minProcessGrants >= 0) {
+                    sb.append("。計算するシェル1本がスライスを受け取った回数: 最小 ").append(p.minProcessGrants).append("・最大 ").append(p.maxProcessGrants)
+                }
                 sb.append('\n')
             }
         }
+        if (withFuel.isNotEmpty()) appendHandoff(sb, withFuel)
         sb.append("\nカーネルのスレッドの内訳（段階の終わり）:\n")
         for (p in phases) sb.append("- ").append(p.phase.label).append(": ").append(p.kernelThreadNames).append('\n')
         return sb.toString()
@@ -702,6 +911,15 @@ internal class LoadRun(
 
         /** 段階に入ってからの、この台の燃料切れの巻き戻しの回数（台のマシンがまだなければ 0） */
         fun unwindsSincePhase(): Long = (case.computer.machine?.fuelUnwindCount ?: 0L) - unwindsAtPhase
+
+        /** [LoadPhase.COMPUTE_MULTI] で、バックグラウンドに打ち込んだ計算するコマンドの数（#740） */
+        var jobsTyped = 0
+
+        /** [LoadPhase.COMPUTE_MULTI] で、前景の計算するコマンドを打ち込んだ（#740） */
+        var foregroundTyped = false
+
+        /** [LoadPhase.COMPUTE_MULTI] の測りはじめの、計算するシェルごとのスライスを受け取った回数（pid → 回数。#740） */
+        var grantsAtMeasure: Map<Int, Long> = emptyMap()
     }
 
     private val level = helper.level
@@ -714,6 +932,21 @@ internal class LoadRun(
 
     private val computeSet: List<Computer> get() = computers.subList(0, minOf(settings.busy, computers.size))
     private val outputSet: List<Computer> get() = computers.subList(minOf(settings.busy, computers.size), minOf(settings.busy * 2, computers.size))
+
+    /**
+     * 1台に計算するプロセスを複数動かす台（[LoadPhase.COMPUTE_MULTI]。#740）。[computeSet]・[outputSet]・[tmpSet] と重ねない。
+     * 台が足りなければ空（その段階を飛ばす）
+     */
+    private val multiSet: List<Computer> get() =
+        if (computers.size >= settings.busy * 4) computers.subList(settings.busy * 3, settings.busy * 4) else emptyList()
+
+    /** 今、計算させている台（[LoadPhase.COMPUTE] なら [computeSet]、[LoadPhase.COMPUTE_MULTI] なら [multiSet]）。次の段階で電源を切る */
+    private var computingSet: List<Computer> = emptyList()
+
+    /** [LoadPhase.COMPUTE_MULTI] を動かすか（#740）: 1台に複数のプロセスを作れる OS で、本数が 2 以上で、台が足りる */
+    private val multiProcess: Boolean
+        get() = settings.os.backgroundCommand != null && settings.computeProcesses >= 2 && settings.busy > 0 &&
+            settings.count >= settings.busy * 4
 
     /** `/tmp` にファイルを書かせる台（#553）。計算・出力させる台とは別にし、最後まで動かしておく（アンロードでも書く） */
     private val tmpSet: List<Computer> get() = computers.subList(minOf(settings.busy * 2, computers.size), minOf(settings.busy * 3, computers.size))
@@ -749,6 +982,22 @@ internal class LoadRun(
     /** [PhaseResult.peakFuelThreadWaits] */
     private var peakFuelThreadWaits = 0
 
+    /** 測りはじめたときの、このプロセスの CPU 時間（ナノ秒。#740。測っていない・取れなければ -1） */
+    private var cpuAtMeasure = -1L
+
+    /** 段階の終わりに読んだ燃料の数え口と JVM の CPU 時間（[next]。検証や GC の前）。[finish] が測りはじめ（[fuelAtMeasure]・[cpuAtMeasure]）との差を取る */
+    private var endFuel: FuelCounts = FuelCounts.ZERO
+    private var endCpu = -1L
+    private val osBean = ManagementFactory.getOperatingSystemMXBean() as? com.sun.management.OperatingSystemMXBean
+
+    /** [LoadPhase.COMPUTE_MULTI] の測った区間の、シェル1本あたりのスライスの回数の最小と最大（[next] で読む。#740。ほかの段階は -1） */
+    private var endMinProcessGrants = -1L
+    private var endMaxProcessGrants = -1L
+
+    /** 計算させた台の燃料の設定（#740。結果に書く） */
+    private var reportFuelPerTick = 0L
+    private var reportFuelSlice = 0L
+
     /** 段階に入ったときにあったカーネルのスレッドの ID。これらのうち、プールで待っているワーカーは [peakPhaseKernelThreads] に数えない */
     private var baselineKernelThreads: Set<Long> = emptySet()
     private var sentBytes = 0L
@@ -757,6 +1006,9 @@ internal class LoadRun(
     private var placeMillis = 0.0
     private var powerOnMillis = 0.0
     private var powerOffMillis = 0.0
+
+    /** [LoadReport.powerOffMultiMillis] */
+    private var powerOffMultiMillis = -1.0
     private var baselineHeap = 0L
     private var watcher: ServerPlayer? = null
     private var finished = false
@@ -771,8 +1023,21 @@ internal class LoadRun(
     /** 測る区間を終えたときの段階の中の tick（この後は書き込みの終わりを待つ） */
     private var measuredTicks = 0
 
-    /** 段階に予約した書き込みの終わりを待つ期限（`System.nanoTime` の値。[stopMeasuring] で決める） */
-    private var saveWaitDeadline = 0L
+    /** 段階に予約した書き込みの終わりを待ち始めたとき（`System.nanoTime` の値。失敗の文言に出すだけ。[stopMeasuring] で決める） */
+    private var saveWaitStartNanos = 0L
+
+    /** 段階に予約した書き込みの終わりを待った tick の数（[awaitPhaseSaves]） */
+    private var saveWaitTicks = 0
+
+    /** 終わった書き込みが増えないまま待った tick の数（[awaitPhaseSaves]） */
+    private var saveWaitIdleTicks = 0
+
+    /**
+     * 前の tick までに受け取った、段階に予約した書き込みの完了の数（[ServerMachines.Stats.windowCompletions]。増えたら [saveWaitIdleTicks] を数え直す）。
+     * 残りの数（予約 − 完了）では見ない。待っている間に予約が増えると（UNLOAD の段階が打ち切られ、残りのチャンクが待ちの間に
+     * アンロードされたとき）、完了が進んでいても残りが減らないことがあるため
+     */
+    private var saveWaitLastCompletions = 0L
     private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
@@ -781,6 +1046,34 @@ internal class LoadRun(
     private var unloadPrevWrites = 0L
     private var unloadMaxTickCaptures = 0L
     private var unloadMaxTickWrites = 0L
+
+    /**
+     * [LoadPhase.RESTORE]（#582）: 戻るはずの台の番号（アンロードの段階に入るときにマシンがあった台）と、そのときの台（古いブロックエンティティ）・
+     * 復元を始めた回数。アンロードで外れたブロックエンティティは、読み込み直すと別のものになるので、位置から引き直す（[refresh]）
+     */
+    private var restoreTargets: IntArray = IntArray(0)
+    private var restoreOld: List<Computer> = emptyList()
+    private var restoreBaseline: IntArray = IntArray(0)
+    private var restoreDone: BooleanArray = BooleanArray(0)
+    private var restoreStarted: BooleanArray = BooleanArray(0)
+    private var restoreKept: BooleanArray = BooleanArray(0)
+
+    /** 戻るはずの台のケース・画面・キーボードのあるチャンク */
+    private var restoreChunks: List<ChunkPos> = emptyList()
+    private var restoreChunksTick = -1
+    private var restoreStartedTick = -1
+    private var restoreDoneTick = -1
+    private var restoreDoneNanos = 0L
+    private var restoreMaxQueue = 0
+    private var restoreForceMillis = 0.0
+    private var restorePeakBootThreads = 0
+    private var restorePeakInFlight = 0
+
+    /** [LoadPhase.RESTORE] の前に、サーバーが遅れを取り戻して tick の予定に追いついたか待つ（[settlePace]）ために数える */
+    private var paceRun = 0
+    private var paceSettleTicks = 0
+    private var paceSettled = false
+    private var restoreResult: RestoreResult? = null
 
     private var prevCallback = 0L
     private var prevHarness = 0L
@@ -809,6 +1102,12 @@ internal class LoadRun(
 
     /** 本番の形の自動保存（#834）: バニラの `ticksUntilAutosave`（反射で読み書きする。試験のコードの中だけ） */
     private val vanillaAutosave = if (settings.productionAutosave) VanillaAutosave(level.server) else null
+
+    /** [LoadPhase.RESTORE] の強制読み込みの時間だけ、サーバーの tick の予定をずらす（[TickSchedule]。#582） */
+    private val tickSchedule = if (settings.paced && settings.massRestore) TickSchedule(level.server) else null
+
+    /** この呼び出しで tick の予定をずらした時間（[onTick] の待ちで、試験の呼び出しの時間から引く） */
+    private var scheduleShiftNanos = 0L
     private var prevVanillaTicks = -1
     private var vanillaSaveTick = -1
 
@@ -858,6 +1157,8 @@ internal class LoadRun(
             savedProgressLevel = Log4jManager.getLogger(PROGRESS_LOGGER).level
             Configurator.setLevel(PROGRESS_LOGGER, Log4jLevel.WARN)
         }
+        // スライスを差し替えて比べる回（#740）。電源を入れる前に立て、cleanUp で戻す
+        settings.fuelSlice?.let { slice -> CaseBlockEntity.configOverride = java.util.function.UnaryOperator { it.withFuelSlice(slice) } }
         probe.start()
         logCounter?.start()
         helper.onEachTick(::onTick)
@@ -898,9 +1199,20 @@ internal class LoadRun(
             // 実際のサーバーと同じく、サーバーの次の tick の予定（getNextTickTime）までしか待たない。遅れていれば待たずに追いつく。
             // 1 tick の長さだけで待つと、重い tick（アンロードの書き込みなど）で遅れた分が戻らず、tick の残り時間（haveTime）が
             // ずっとなくなる。するとチャンクのアンロードの列が 2,000 件を超えるまで流れず、アンロードが進まない（#540）
-            val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
+            // 予定をずらした分（RESTORE の強制読み込み）は、読み込みのスレッドで進んだものとして試験の呼び出しの時間から引く
+            val wait = minOf(TARGET_NANOS - work - (prevHarness - scheduleShiftNanos), level.server.nextTickTime - System.nanoTime())
+            scheduleShiftNanos = 0
+            // 予定より先にいる（待てた）tick が続けば、遅れを取り戻している（settlePace）
+            paceRun = if (wait > 0) paceRun + 1 else 0
             if (wait > 0) {
-                LockSupport.parkNanos(wait)
+                // parkNanos は、ほかのスレッドの unpark（サーバーのスレッドへ仕事を積むたびに起こす。復元の完了の知らせなど）で早く返る。
+                // 1 回だけだと、仕事が続く間は待ちが短くなり、tick が 50 ms より詰まる。予定の時刻まで待ち直す
+                val deadline = System.nanoTime() + wait
+                var left = wait
+                while (left > 0) {
+                    LockSupport.parkNanos(left)
+                    left = deadline - System.nanoTime()
+                }
             }
         }
         if (!finished) {
@@ -1087,15 +1399,44 @@ internal class LoadRun(
             baselineHeap = heapAfterGc()
             enter(sequence.first())
         } else {
+            if (p == LoadPhase.RESTORE && phaseTick == 0 && settings.paced && !paceSettled && !settlePace()) return
             if (phaseTick == 0) setUp(p)
             when (p) {
                 LoadPhase.BOOT -> boot()
                 LoadPhase.AUTOSAVE -> if (settings.productionAutosave) productionAutosave() else autosave()
                 LoadPhase.UNLOAD -> unload()
+                LoadPhase.RESTORE -> restore()
                 else -> steady(p)
             }
         }
         phaseTick++
+    }
+
+    /**
+     * [LoadPhase.RESTORE] を始める前に、サーバーが tick の予定（`nextTickTime`）に追いついているのを待つ。直前のアンロードの段階は、
+     * 長い tick と書き込みの終わりの待ち（[awaitPhaseSaves]）で予定より遅れて終わる。遅れたまま始めると、待ちが効かない（[onTick] の待ちは
+     * 予定までしか待たない）ので tick が詰めて回り、tick の数や秒数が 20 TPS のサーバーの値にならない。
+     * 試験の呼び出しで何もせず（測らない）、予定より先にいる tick が [PACE_SETTLE_TICKS] 続いたら始める。
+     * [PACE_SETTLE_TIMEOUT_TICKS] 待っても追いつかなければ WARN を出して始める
+     *
+     * @return 始めてよければ `true`（この呼び出しで段階の準備に進む）
+     */
+    private fun settlePace(): Boolean {
+        if (paceRun >= PACE_SETTLE_TICKS) {
+            LOGGER.info("The server caught up with its tick schedule after {} ticks; starting the {} phase", paceSettleTicks, phase)
+        } else if (++paceSettleTicks < PACE_SETTLE_TIMEOUT_TICKS) {
+            return false
+        } else {
+            LOGGER.warn(
+                "The server did not catch up with its tick schedule within {} ticks; the {} phase runs behind schedule (its tick counts and seconds are not 20 TPS values)",
+                PACE_SETTLE_TIMEOUT_TICKS,
+                phase,
+            )
+        }
+        paceSettled = true
+        // 待った時間は段階の秒に入れない（doneSeconds・finish の壁時計は、setUp が強制読み込みを戻し終えた時刻から数え直す）
+        phaseStartNanos = System.nanoTime()
+        return true
     }
 
     /** 段階の順番。計算・出力させる台がなければ、その段階は飛ばす */
@@ -1108,15 +1449,23 @@ internal class LoadRun(
         // 本番の形の自動保存（#834）は、その段階で終える（ほかの段階に、次の周期やバニラの自動保存が混ざらないように）
         if (!settings.productionAutosave) {
             if (settings.busy > 0) add(LoadPhase.COMPUTE)
+            if (multiProcess) add(LoadPhase.COMPUTE_MULTI)
             if (settings.busy > 0 && settings.count > settings.busy) {
                 add(LoadPhase.OUTPUT)
                 add(LoadPhase.WATCHED)
             }
-            if (settings.massUnload) add(LoadPhase.UNLOAD)
+            if (settings.massUnload) {
+                add(LoadPhase.UNLOAD)
+                if (settings.massRestore) add(LoadPhase.RESTORE)
+            }
         }
     }
 
     private fun next(p: LoadPhase) {
+        // CPU 時間と燃料は、検証（全台の describeProcesses）・スレッドの数え・強制 GC より前に読む（その分の CPU 時間を、測った区間に入れない）
+        endFuel = FuelCounts.current()
+        endCpu = osBean?.processCpuTime ?: -1
+        readProcessGrants(p)
         verify(p)
         finish()
         val i = sequence.indexOf(p) + 1
@@ -1241,7 +1590,10 @@ internal class LoadRun(
         val tick = tickStats()
         measuredTick = tick
         measuredTicks = phaseTick
-        saveWaitDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SAVE_WAIT_TIMEOUT_MILLIS)
+        saveWaitStartNanos = System.nanoTime()
+        saveWaitTicks = 0
+        saveWaitIdleTicks = 0
+        saveWaitLastCompletions = ServerMachines.Stats.windowCompletions
         recording = false
         return tick
     }
@@ -1250,7 +1602,9 @@ internal class LoadRun(
      * 段階に予約した書き込み（[ServerMachines.Stats.windowOutstanding]）がすべて終わったか（#614）。終わっていなければ、書き込みのスレッドが
      * 空になるのを 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待って、終わった書き込みを受け取る。tick をまたいで待つので、
      * 1回でメインスレッドを長く止めず、急いで回す試験（`paced` でない）でも tick の数が増えすぎない。待つ tick は測らない（[stopMeasuring]）。
-     * 壁時計の上限（[SAVE_WAIT_TIMEOUT_MILLIS]）を過ぎたら失敗する
+     * 上限は tick で数える（#854。重いマシンで書き込みのスレッドが I/O で遅れても、進んでいるうちは落とさない）:
+     * 終わった書き込みが1件も増えない tick が [SAVE_WAIT_IDLE_TICKS] 続くか、待つ tick が全部で [SAVE_WAIT_TIMEOUT_TICKS] に達したら失敗する。
+     * 1 tick に [SAVE_WAIT_STEP_MILLIS] まで待つので、どちらも壁時計では元の上限（120 秒）より短くならない
      */
     private fun awaitPhaseSaves(): Boolean {
         val s = ServerMachines.Stats
@@ -1263,14 +1617,25 @@ internal class LoadRun(
             }
         }
         ServerMachines.processCompletions()
-        if (s.windowOutstanding <= 0) return true
-        if (System.nanoTime() - saveWaitDeadline >= 0) {
-            fail(
-                "${s.windowOutstanding} of ${s.windowSubmits} saves queued in the $phase phase did not finish within $SAVE_WAIT_TIMEOUT_MILLIS ms " +
-                    "(pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
-            )
+        val outstanding = s.windowOutstanding
+        if (outstanding <= 0) return true
+        saveWaitTicks++
+        if (s.windowCompletions > saveWaitLastCompletions) {
+            saveWaitLastCompletions = s.windowCompletions
+            saveWaitIdleTicks = 0
+        } else {
+            saveWaitIdleTicks++
         }
-        return false
+        val reason = when {
+            saveWaitIdleTicks >= SAVE_WAIT_IDLE_TICKS -> "made no progress for $SAVE_WAIT_IDLE_TICKS ticks"
+            saveWaitTicks >= SAVE_WAIT_TIMEOUT_TICKS -> "did not finish within $SAVE_WAIT_TIMEOUT_TICKS ticks"
+            else -> return false
+        }
+        val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - saveWaitStartNanos)
+        fail(
+            "$outstanding of ${s.windowSubmits} saves queued in the $phase phase $reason " +
+                "(waited $saveWaitTicks ticks, $elapsed ms; pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
+        )
     }
 
     private fun unload() {
@@ -1295,10 +1660,100 @@ internal class LoadRun(
         next(LoadPhase.UNLOAD)
     }
 
+    /**
+     * [LoadPhase.RESTORE]（#582）: 毎 tick、`KiBi-boot-*` の本数と順番待ちの長さを数え、読み込まれたチャンクの台を引き直して、
+     * 戻るはずの台が全部戻ったか（マシンがあって、復元の順番待ちでも途中でもない）を見る。画面は見ない（画面の中身は保存しないので、
+     * 冷えた起動でもプロンプトが出る。ADR 0085）。全部戻るか、[RestoreResult.RESTORE_TIMEOUT_TICKS] で打ち切る
+     */
+    private fun restore() {
+        restoreMaxQueue = maxOf(restoreMaxQueue, ServerMachines.pendingRestores)
+        restorePeakBootThreads = maxOf(restorePeakBootThreads, bootThreads())
+        if (phaseTick % 10 == 0) sampleKernelThreads()
+        if (restoreChunksTick < 0 && restoreChunks.all { level.chunkSource.getChunkNow(it.x, it.z) != null }) restoreChunksTick = phaseTick
+        var started = 0
+        var done = 0
+        var inFlight = 0
+        for (k in restoreTargets.indices) {
+            if (!restoreDone[k]) {
+                val c = refresh(restoreTargets[k])
+                if (c != null) {
+                    val old = restoreOld[k]
+                    val starts = if (c.case === old.case) c.case.restoreStarts - restoreBaseline[k] else c.case.restoreStarts
+                    if (starts > 0) restoreStarted[k] = true
+                    val computer = c.case.computer
+                    if (computer.isRestoring) inFlight++
+                    if (computer.machine != null && !computer.isRestorePending && !computer.isRestoring) {
+                        restoreDone[k] = true
+                        restoreKept[k] = !restoreStarted[k] && c.case === old.case
+                    }
+                }
+            }
+            if (restoreDone[k]) done++
+            if (restoreDone[k] || restoreStarted[k]) started++
+        }
+        restorePeakInFlight = maxOf(restorePeakInFlight, inFlight)
+        if (restoreStartedTick < 0 && started == restoreTargets.size) restoreStartedTick = phaseTick
+        val all = done == restoreTargets.size
+        if (all) {
+            restoreDoneTick = phaseTick
+            restoreDoneNanos = System.nanoTime()
+        } else if (phaseTick < RestoreResult.RESTORE_TIMEOUT_TICKS) {
+            return
+        }
+        val tick = tickStats()
+        recording = false
+        val s = ServerMachines.Stats
+        restoreResult = RestoreResult(
+            expected = restoreTargets.size,
+            done = done,
+            kept = restoreKept.count { it },
+            fromSave = s.restoresFromSave,
+            coldStart = s.restoresColdStart,
+            writeTimeouts = s.restoreWriteTimeouts,
+            restored = s.restored,
+            fallbacks = s.restoreFallbacks,
+            versionMismatches = s.restoreVersionMismatches,
+            forceMillis = restoreForceMillis,
+            firstTickMillis = if (sampleCount > 0) samples[0] / 1e6 else 0.0,
+            chunksTick = restoreChunksTick,
+            startedTick = restoreStartedTick,
+            doneTick = restoreDoneTick,
+            doneSeconds = ((if (all) restoreDoneNanos else System.nanoTime()) - phaseStartNanos) / 1e9,
+            timedOut = !all,
+            maxQueue = restoreMaxQueue,
+            peakBootThreads = restorePeakBootThreads,
+            peakInFlight = restorePeakInFlight,
+            maxConcurrentMachines = (ServerMachines.schedulerConfig ?: SchedulerConfig.DEFAULT).maxConcurrentMachines,
+            tick = tick,
+        )
+        next(LoadPhase.RESTORE)
+    }
+
+    /**
+     * [i] 番目の台を位置から引き直す（#582）。ケース・画面・キーボードのチャンクが FULL で読み込まれていなければ `null`
+     * （`getBlockEntity` はその場でチャンクを読み込むので、読み込まれたチャンクにだけ問い合わせる）。変わっていれば [computers] を差し替える
+     */
+    private fun refresh(i: Int): Computer? {
+        val pos = helper.absolutePos(LoadGameTests.Layout.casePos(i, columns))
+        val case = loadedBlockEntity(pos) as? CaseBlockEntity ?: return null
+        val current = computers[i]
+        if (current.case === case) return current
+        val screen = loadedBlockEntity(pos.above()) as? ScreenBlockEntity ?: return null
+        val keyboard = loadedBlockEntity(pos.south()) as? KeyboardBlockEntity ?: return null
+        return Computer(case, screen, keyboard).also { computers[i] = it }
+    }
+
+    private fun loadedBlockEntity(pos: BlockPos) = level.chunkSource.getChunkNow(pos.x shr 4, pos.z shr 4)?.getBlockEntity(pos)
+
+    /** `KiBi-boot-*` のスレッドの数（スタックを取らない。毎 tick 数える） */
+    private fun bootThreads(): Int =
+        threads.getThreadInfo(threads.allThreadIds, 0).count { it != null && it.threadName.startsWith(BOOT_THREAD_PREFIX) }
+
     private fun steady(p: LoadPhase) {
         val from = measureFrom ?: return when (p) {
             LoadPhase.IDLE -> awaitTmp()
             LoadPhase.COMPUTE -> awaitCompute()
+            LoadPhase.COMPUTE_MULTI -> awaitComputeMulti()
             else -> awaitOutput()
         }
         val t = phaseTick - from
@@ -1310,10 +1765,19 @@ internal class LoadRun(
             peakPhaseKernelThreads = 0
             peakFuelThreadWaits = 0
             fuelAtMeasure = FuelCounts.current()
+            cpuAtMeasure = osBean?.processCpuTime ?: -1
+            if (p == LoadPhase.COMPUTE_MULTI) {
+                for (c in multiSet) {
+                    val shells = computingShellPids(c)
+                    c.grantsAtMeasure = (c.case.computer.machine?.fuelGrantsByProcess() ?: emptyMap()).filterKeys { it in shells }
+                }
+            }
         }
         if (recording && phaseTick % 10 == 0) {
             sampleKernelThreads()
-            if (p == LoadPhase.COMPUTE) peakFuelThreadWaits = maxOf(peakFuelThreadWaits, computeSet.sumOf { fuelThreadWaits(it) })
+            if (p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) {
+                peakFuelThreadWaits = maxOf(peakFuelThreadWaits, computingSet.sumOf { fuelThreadWaits(it) })
+            }
         }
         if (t == settings.warmupTicks + settings.measureTicks) next(p)
     }
@@ -1374,15 +1838,91 @@ internal class LoadRun(
         return computeSet.all { it.unwindsSincePhase() > 0 }
     }
 
-    /** 台の、終わっていないプロセスの名前と状態（`Machine.describeProcesses` の `<pid>:<名前>=<状態> waits=...` から） */
-    private fun processStates(c: Computer): List<Pair<String, String>> {
+    /**
+     * [LoadPhase.COMPUTE_MULTI] のはじめ（#740）: 台ごとに、バックグラウンドの計算するコマンドを N−1 回、前景のものを1回、1行ずつ打ち込む。
+     * 次の行は、シェルが前の行のジョブの知らせ（`[k] pid`）を出してプロンプトに戻ってから打つ（まとめて打つと、先打ちのエコーと知らせの順が入れ替わり、
+     * 画面の最後の行で判断できない）。全部の台が前景のループに入り、計算するシェルが N 本あったら測りはじめる。
+     * 画面だけでは、ジョブが起動に失敗して消えたのを見落とすので、プロセスの表（[computingShells]）でも確かめる
+     */
+    private fun awaitComputeMulti() {
+        if (phaseTick % 5 != 0) return
+        val n = settings.computeProcesses
+        val background = settings.os.backgroundCommand!!
+        var waiting = 0
+        for (c in multiSet) {
+            if (c.foregroundTyped) {
+                if (!runsLoop(c)) waiting++
+                continue
+            }
+            waiting++
+            val text = lines(c.screen.text)
+            text.firstOrNull { it.contains(SPAWN_FAILURE) }?.let { fail("a background job did not start: $text") }
+            val atPrompt = text.lastOrNull { it.isNotEmpty() } == settings.os.prompt.toString()
+            val noticed = c.jobsTyped == 0 || text.any { it.startsWith("[${c.jobsTyped}] ") }
+            if (!atPrompt || !noticed) continue
+            if (c.jobsTyped < n - 1) {
+                type(c, background)
+                c.jobsTyped++
+            } else {
+                type(c, settings.os.computeCommand)
+                c.foregroundTyped = true
+            }
+        }
+        if (waiting == 0) {
+            val short = multiSet.firstOrNull { computingShells(it) < n }
+            if (short == null) {
+                measureFrom = phaseTick
+            } else if (phaseTick >= settings.outputTimeoutTicks) {
+                fail("a machine should run $n computing shells: ${short.case.computer.machine?.describeProcesses()}")
+            }
+        } else if (phaseTick >= settings.outputTimeoutTicks) {
+            val c = multiSet.first { !it.foregroundTyped || !runsLoop(it) }
+            fail(
+                "$waiting of ${multiSet.size} machines did not start $n computing commands within ${settings.outputTimeoutTicks} ticks " +
+                    "(${c.jobsTyped} in the background): ${lines(c.screen.text)}",
+            )
+        }
+    }
+
+    /** 台の中で、計算している（終わっていない・イベントを待っていない）シェルの数（#740。`describeProcesses` はカーネルロックを取るので、段階の始めと終わりだけで呼ぶ） */
+    private fun computingShells(c: Computer): Int = computingShellPids(c).size
+
+    /** 台の中で、計算しているシェルの pid（[computingShells]） */
+    private fun computingShellPids(c: Computer): Set<Int> =
+        processEntries(c).filter { it.name.substringAfterLast('/') == SHELL && it.state in COMPUTING_STATES }.mapTo(HashSet()) { it.pid }
+
+    /**
+     * [LoadPhase.COMPUTE_MULTI] の終わり（#740）: 測りはじめにあった計算するシェルごとに、測った区間にスライスを受け取った回数を出し、
+     * 最小と最大を [endMinProcessGrants]・[endMaxProcessGrants] に入れる（終わったシェルは 0 回として数える）。ほかの段階は -1
+     */
+    private fun readProcessGrants(p: LoadPhase) {
+        endMinProcessGrants = -1
+        endMaxProcessGrants = -1
+        if (p != LoadPhase.COMPUTE_MULTI || fuelAtMeasure == null) return
+        val counts = multiSet.flatMap { c ->
+            val now = c.case.computer.machine?.fuelGrantsByProcess() ?: emptyMap()
+            c.grantsAtMeasure.map { (pid, at) -> (now[pid] ?: at) - at }
+        }
+        if (counts.isEmpty()) return
+        endMinProcessGrants = counts.min()
+        endMaxProcessGrants = counts.max()
+    }
+
+    /** 台の、終わっていないプロセスの名前と状態 */
+    private fun processStates(c: Computer): List<Pair<String, String>> = processEntries(c).map { it.name to it.state }
+
+    private class ProcessEntry(val pid: Int, val name: String, val state: String)
+
+    /** 台の、終わっていないプロセスの pid・名前・状態（`Machine.describeProcesses` の `<pid>:<名前>=<状態> waits=...` から） */
+    private fun processEntries(c: Computer): List<ProcessEntry> {
         val text = c.case.computer.machine?.describeProcesses() ?: return emptyList()
         if (text == "none") return emptyList()
         return text.split("; ").mapNotNull { entry ->
             val head = entry.substringBefore(" waits=")
             val colon = head.indexOf(':')
             val eq = head.lastIndexOf('=')
-            if (colon < 0 || eq < colon) null else head.substring(colon + 1, eq) to head.substring(eq + 1)
+            val pid = if (colon < 0) null else head.substring(0, colon).toIntOrNull()
+            if (pid == null || eq < colon) null else ProcessEntry(pid, head.substring(colon + 1, eq), head.substring(eq + 1))
         }
     }
 
@@ -1488,11 +2028,29 @@ internal class LoadRun(
                 if (settings.productionAutosave) startProductionAutosave() else ServerMachines.startAutosaveCycle(own)
                 recording = true
             }
-            LoadPhase.COMPUTE -> for (c in computeSet) type(c, settings.os.computeCommand)
+            LoadPhase.COMPUTE -> {
+                computingSet = computeSet
+                for (c in computeSet) type(c, settings.os.computeCommand)
+            }
+            LoadPhase.COMPUTE_MULTI -> {
+                // 1本の台は電源を切る（電源ボタンは押すたびに入・切が入れ替わるので、今計算している台だけを押す）。
+                // 1台に1本の台を切る時間は、段階を飛ばす回（OUTPUT の始めに切る）と同じものとしてここで測る
+                val t0 = System.nanoTime()
+                for (c in computingSet) c.case.pressPowerButton()
+                powerOffMillis = (System.nanoTime() - t0) / 1e6
+                computingSet = multiSet
+                for (c in multiSet) {
+                    c.jobsTyped = 0
+                    c.foregroundTyped = false
+                }
+            }
             LoadPhase.OUTPUT -> {
                 val t0 = System.nanoTime()
-                for (c in computeSet) c.case.pressPowerButton()
-                powerOffMillis = (System.nanoTime() - t0) / 1e6
+                val multi = computingSet.isNotEmpty() && computingSet == multiSet
+                for (c in computingSet) c.case.pressPowerButton()
+                computingSet = emptyList()
+                val millis = (System.nanoTime() - t0) / 1e6
+                if (multi) powerOffMultiMillis = millis else powerOffMillis = millis
                 for (c in outputSet) type(c, settings.os.outputCommand)
             }
             LoadPhase.WATCHED -> watch(outputSet)
@@ -1504,6 +2062,10 @@ internal class LoadRun(
                 }
                 ServerMachines.Stats.reset()
                 phaseWindow = ServerMachines.Stats.window
+                // 戻るはずの台（#582）: 今マシンがある台（計算させた台は電源を切ったので戻らない）
+                restoreTargets = computers.indices.filter { computers[it].case.computer.machine != null }.toIntArray()
+                restoreOld = restoreTargets.map { computers[it] }
+                restoreBaseline = IntArray(restoreTargets.size) { restoreOld[it].case.restoreStarts }
                 // スポーンチャンクに重なると読み込まれたままになるので、この段階だけスポーンチャンクをなくす
                 val rule = level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS)
                 savedSpawnChunkRadius = rule.get()
@@ -1518,6 +2080,34 @@ internal class LoadRun(
                     level.setChunkForced(chunk.x, chunk.z, false)
                     unforcedOthers += chunk
                 }
+                recording = true
+            }
+            LoadPhase.RESTORE -> {
+                // 保存の数え口は使わない（復元の数え口だけを 0 から数える。アンロードの結果は作り終えている）
+                ServerMachines.Stats.reset()
+                restoreDone = BooleanArray(restoreTargets.size)
+                restoreStarted = BooleanArray(restoreTargets.size)
+                restoreKept = BooleanArray(restoreTargets.size)
+                restoreChunks = restoreTargets.flatMap { i ->
+                    val pos = helper.absolutePos(LoadGameTests.Layout.casePos(i, columns))
+                    listOf(ChunkPos(pos), ChunkPos(pos.above()), ChunkPos(pos.south()))
+                }.distinct()
+                // テストの構造物のチャンクを先に戻してから、並べた範囲を強制読み込みする（はじめと同じ順。構造物のチャンクは forced に入らない）。
+                // スポーンチャンクの半径は cleanUp まで 0 のまま（戻すと、スポーンチャンクの読み込みが混ざる）
+                val t0 = System.nanoTime()
+                for (chunk in unforcedOthers) level.setChunkForced(chunk.x, chunk.z, true)
+                unforcedOthers.clear()
+                forceChunks()
+                val forceNanos = System.nanoTime() - t0
+                restoreForceMillis = forceNanos / 1e6
+                // 試験の呼び出しの中で同期に読み込んだ分、サーバーは tick の予定から遅れる。そのままだと、追いつくまで tick が詰めて回り
+                // （前の回は強制読み込みの後の 20 tick が 0.45 s）、測る区間が 20 TPS にならない。読み込みの時間だけ予定をずらす（TickSchedule）
+                tickSchedule?.let {
+                    it.delay(forceNanos)
+                    scheduleShiftNanos = forceNanos
+                }
+                // doneSeconds・finish の壁時計は強制読み込みを戻し終えてから数える（読み込みの時間は forceMillis に別に出す）
+                phaseStartNanos = System.nanoTime()
                 recording = true
             }
         }
@@ -1573,7 +2163,26 @@ internal class LoadRun(
                 // 計算している間はプロンプトに戻らない
                 if (!runsLoop(c)) fail("the loop should keep running: $text")
             }
+            LoadPhase.COMPUTE_MULTI -> for (c in multiSet) {
+                if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a computing machine stopped: ${lines(c.screen.text)}")
+                if (!runsLoop(c)) fail("the foreground loop should keep running: ${lines(c.screen.text)}")
+                val shells = computingShells(c)
+                if (shells < settings.computeProcesses) {
+                    fail("${settings.computeProcesses} computing shells should keep running, but $shells: ${c.case.computer.machine?.describeProcesses()}")
+                }
+                if (c.grantsAtMeasure.size < settings.computeProcesses) {
+                    fail("${settings.computeProcesses} computing shells should be counted when the measurement began, but ${c.grantsAtMeasure.size}")
+                }
+            }
             LoadPhase.UNLOAD -> unloadResult!!.let { verifyCounted(p, it.cost, handedToWriter = it.captures, exact = true) }
+            // 測るだけで落とさない。ただし、気づくべきことは WARN にする（#582）
+            LoadPhase.RESTORE -> restoreResult!!.let {
+                if (it.timedOut) {
+                    LOGGER.warn("Only {} of {} computers came back within {} ticks: {}", it.done, it.expected, RestoreResult.RESTORE_TIMEOUT_TICKS, it)
+                }
+                // アンロードの段階は予約した書き込みを全部待ってから終わるので、書き込み待ちで冷えた起動にする台はないはず
+                if (it.writeTimeouts > 0) LOGGER.warn("{} computers cold-booted because their writes did not finish: {}", it.writeTimeouts, it)
+            }
             LoadPhase.OUTPUT, LoadPhase.WATCHED -> for (c in outputSet) {
                 if (c.case.computer.machine?.state != MachineState.RUNNING) fail("an output machine stopped: ${lines(c.screen.text)}")
                 if (!showsOutput(c)) fail("output should be shown: ${lines(c.screen.text)}")
@@ -1609,7 +2218,7 @@ internal class LoadRun(
     private fun enter(p: LoadPhase) {
         phase = p
         phaseTick = -1 // step() が 0 にする
-        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE) null else 0
+        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) null else 0
         phaseStartNanos = System.nanoTime()
         recording = false
         measuredTick = null
@@ -1627,6 +2236,7 @@ internal class LoadRun(
         fuelAtPhase = FuelCounts.current()
         for (c in computers) c.unwindsAtPhase = c.case.computer.machine?.fuelUnwindCount ?: 0L
         fuelAtMeasure = null
+        cpuAtMeasure = -1
         peakFuelThreadWaits = 0
     }
 
@@ -1657,15 +2267,36 @@ internal class LoadRun(
             longTicks = longTicks.toList(),
             longTickCount = longTickCount,
             sectionMarks = sectionMarks.copyOf(),
-            fuel = fuelAtMeasure?.let { FuelCounts.current() - it },
-            peakFuelThreadWaits = if (p == LoadPhase.COMPUTE && fuelAtMeasure != null) peakFuelThreadWaits else -1,
+            fuel = fuelAtMeasure?.let { endFuel - it },
+            peakFuelThreadWaits = if ((p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) && fuelAtMeasure != null) peakFuelThreadWaits else -1,
+            cpuNanos = if (cpuAtMeasure >= 0 && fuelAtMeasure != null && endCpu >= 0) endCpu - cpuAtMeasure else -1,
+            busyMachines = when (p) {
+                LoadPhase.COMPUTE, LoadPhase.COMPUTE_MULTI -> computingSet.size
+                LoadPhase.OUTPUT, LoadPhase.WATCHED -> outputSet.size
+                else -> 0
+            },
+            processesPerMachine = when (p) {
+                LoadPhase.COMPUTE -> 1
+                LoadPhase.COMPUTE_MULTI -> settings.computeProcesses
+                else -> 0
+            },
+            minProcessGrants = endMinProcessGrants,
+            maxProcessGrants = endMaxProcessGrants,
         )
+        if (p == LoadPhase.COMPUTE) {
+            computeSet.firstNotNullOfOrNull { it.case.computer.machine?.config }?.let {
+                reportFuelPerTick = it.fuelPerTick
+                reportFuelSlice = it.fuelSliceValue
+            }
+        }
         results += result
     }
 
     private fun done() {
         val report = LoadReport(
             settings, placeMillis, powerOnMillis, powerOffMillis, outputWaitTicks, baselineHeap, results.toList(), autosaveResult, unloadResult, productionResult,
+            restoreResult,
+            fuelPerTick = reportFuelPerTick, fuelSlice = reportFuelSlice, powerOffMultiMillis = powerOffMultiMillis,
         )
         cleanUp()
         onDone(report)
@@ -1744,6 +2375,8 @@ internal class LoadRun(
         savedAutosaveEnabled = null
         ServerMachines.Stats.recordSaves = false
         ServerMachines.Stats.saves.clear()
+        // スライスの差し替え（#740）を残さない（同じ JVM で続けて動く GameTest のスライスが変わる）
+        if (settings.fuelSlice != null) CaseBlockEntity.configOverride = null
     }
 
     private fun sampleKernelThreads() {
@@ -1779,18 +2412,43 @@ internal class LoadRun(
         private const val UNLOAD_TIMEOUT_TICKS = 2_000
 
         /**
-         * 段階に予約した書き込みが終わるのを待つ上限（壁時計。#614）。遅いマシン（CI、ほかのビルドと並んだ手元）でも余裕のある長さにする。
-         * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] 待つので、待つ tick は多くて 2,400 で、試験の上限（`CI_TIMEOUT_TICKS`）に収まる
+         * 段階に予約した書き込みが終わるのを待つ間、終わった書き込みが1件も増えない tick の上限（#614・#854）。
+         * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待つので、壁時計では 120 秒以上になる（以前の壁時計の上限と同じ）
          */
-        private const val SAVE_WAIT_TIMEOUT_MILLIS = 120_000L
+        private const val SAVE_WAIT_IDLE_TICKS = 2_400
+
+        /**
+         * 段階に予約した書き込みが終わるのを待つ tick の全体の上限（#854）。進んでいても、ここで打ち切る。
+         * 待つ段階は多くて 2 つ（AUTOSAVE と UNLOAD）。本番の形の自動保存（[LoadSettings.productionAutosave]）は AUTOSAVE の段階の中で
+         * `autosave()` の代わりに呼ばれ、その形のときは UNLOAD が入らない。試験の上限（`CI_TIMEOUT_TICKS`）は、その 2 段階分を足しても収まるようにしてある
+         */
+        private const val SAVE_WAIT_TIMEOUT_TICKS = 6_000
 
         /** 段階に予約した書き込みの終わりを待つ間、1 tick で書き込みのスレッドを待つ上限 */
         private const val SAVE_WAIT_STEP_MILLIS = 50L
 
         private val DIGITS = Regex("[0-9]+")
 
+        /** 復元の前段のスレッドの名前（core の `MachineScheduler`） */
+        private const val BOOT_THREAD_PREFIX = "KiBi-boot-"
+
+        /** [LoadPhase.RESTORE] の前に、予定より先にいる tick がこれだけ続くのを待つ（[settlePace]。1 秒） */
+        private const val PACE_SETTLE_TICKS = 20
+
+        /** 追いつくのを待つ上限（tick。サーバーは 2 秒以上遅れると予定を飛ばして追いつくので、ふつうはもっと早い） */
+        private const val PACE_SETTLE_TIMEOUT_TICKS = 1_200
+
         /** `Machine.describeProcesses` に出る、燃料をスレッドを持ったまま待つプロセスの状態（core の `ProcessState.WAITING_FUEL`。内部の型なので名前で見る） */
         private const val WAITING_FUEL = "WAITING_FUEL"
+
+        /** 標準 OS のシェルのプロセスの名前（`argv[0]` の最後の部分。バックグラウンドのジョブもシェル自身を起動する） */
+        private const val SHELL = "sh"
+
+        /** 計算している（CPU・許可・燃料を待つか、動いている）プロセスの状態（core の `ProcessState`。内部の型なので名前で見る） */
+        private val COMPUTING_STATES = setOf("RUNNABLE", "RUNNING", WAITING_FUEL)
+
+        /** 標準 OS のシェルが、バックグラウンドのジョブを起動できなかったときに出す文 */
+        private const val SPAWN_FAILURE = "cannot start a subshell"
 
         /** プールで仕事を待っているワーカーを見分けるのに読むスタックの深さ */
         private const val STACK_DEPTH = 32

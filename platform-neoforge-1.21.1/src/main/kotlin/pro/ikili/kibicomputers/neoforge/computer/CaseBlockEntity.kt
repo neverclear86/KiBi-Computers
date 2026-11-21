@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.kernel.BootFailure
 import pro.ikili.kibicomputers.core.kernel.BootLanguage
 import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -308,6 +309,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     internal var restorePreparationHook: Runnable? = null
 
+    /** 挿さっている部品から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
+    private fun machineConfig(): MachineConfig {
+        val config = MachineSpecs.configOf(tier, parts.tiers)
+        return configOverride?.apply(config) ?: config
+    }
+
     /** 最後に [startRestore] で決めた戻す世代（テスト・#575 用。冷えた起動なら `null`。まだなら `null`） */
     internal var lastRestoreSource: RestoreSource? = null
         private set
@@ -344,7 +351,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // RestoreQueue に返し、場所ごとに間引いてログに出させる（#785）
         try {
             restorePreparationHook?.run()
-            val config = MachineSpecs.configOf(tier, parts.tiers)
+            val config = machineConfig()
             val disks = prepareDisks()
             val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
             // プレイヤーはいないので、前回の言語を使う。戻したマシンの再起動・冷えた起動もこの値を引き継ぐ（#661）
@@ -536,7 +543,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val level = level as? ServerLevel ?: return computer.status
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
-        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val config = machineConfig()
         var environment = MachineEnvironment.builder().access(accessPort).build()
         var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
@@ -723,6 +730,13 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         CaseMenu.server(containerId, playerInventory, this)
 
     companion object {
+        /**
+         * マシンの設定の差し替え（負荷試験用。#740）。電源を入れるときと復元を始めるときに、部品から決めた設定に当てる。
+         * 負荷試験が、スライスを変えて比べる回（`-PloadTestFuelSlice`）で立て、試験の終わり（失敗のときも）に `null` に戻す。普段は `null`
+         */
+        @Volatile
+        internal var configOverride: java.util.function.UnaryOperator<MachineConfig>? = null
+
         /** セーブデータの部品のキー */
         const val PARTS_TAG: String = "Parts"
 

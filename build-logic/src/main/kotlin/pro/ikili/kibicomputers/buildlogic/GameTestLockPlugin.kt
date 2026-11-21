@@ -1,0 +1,92 @@
+package pro.ikili.kibicomputers.buildlogic
+
+import org.gradle.api.Plugin
+import org.gradle.api.Project
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.logging.Logging
+import org.gradle.api.provider.Property
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFinishEvent
+import java.time.Duration
+import javax.inject.Inject
+
+/**
+ * GameTest のサーバー（`runGameTestServer`・`runJarGameTestServer`・`runLoadTestServer`）を、マシンの中で同時に 1 本だけにする
+ * プラグイン（`kibicomputers.gametest-lock`、#855）。ルートのプロジェクトに適用すると、全サブプロジェクトの該当タスクに掛かる。
+ *
+ * - 同じ Gradle の起動の中では、共有の [GameTestLockService]（`maxParallelUsages = 1`）で並びを止める
+ *   （`org.gradle.parallel` で両バージョンの GameTest が同時に走らない）。
+ * - 起動・worktree をまたぐ分は、Gradle のユーザーホームの `kibicomputers/locks/gametest.lock` の OS のロックで止める。
+ *   持ち主（worktree・タスク・PID・時刻）は `gametest.owner` に書き、待つ側が 30 秒ごとにログへ出す。
+ * - ロックはタスクの開始（`doFirst`）で取り、そのタスクが終わったとき（成功・失敗とも）と、ビルドの終わりに外す。
+ *
+ * 待ちの上限は既定で 90 分（`-PgameTestLockTimeoutMinutes=<分>`）。`-PgameTestLock=false` でロックを使わない。
+ */
+abstract class GameTestLockPlugin @Inject constructor(
+    private val events: BuildEventsListenerRegistry,
+) : Plugin<Project> {
+    override fun apply(project: Project) {
+        require(project == project.rootProject) { "kibicomputers.gametest-lock must be applied to the root project" }
+        val locks = project.gradle.gradleUserHomeDir.resolve("kibicomputers/locks")
+        val providers = project.providers
+        val service = project.gradle.sharedServices.registerIfAbsent(SERVICE_NAME, GameTestLockService::class.java) {
+            maxParallelUsages.set(1)
+            parameters.lockFile.set(locks.resolve("gametest.lock"))
+            parameters.ownerFile.set(locks.resolve("gametest.owner"))
+            parameters.timeoutMinutes.set(
+                providers.gradleProperty("gameTestLockTimeoutMinutes").map { it.toLong() }.orElse(DEFAULT_TIMEOUT_MINUTES),
+            )
+            parameters.enabled.set(providers.gradleProperty("gameTestLock").map { it.toBoolean() }.orElse(true))
+        }
+        events.onTaskCompletion(service)
+        val rootDir = project.rootDir.absolutePath
+        project.allprojects {
+            tasks.named { it in TASK_NAMES }.configureEach {
+                usesService(service)
+                val path = this.path
+                doFirst { service.get().acquire(path, rootDir) }
+            }
+        }
+    }
+
+    companion object {
+        const val SERVICE_NAME: String = "kibicomputersGameTestLock"
+        const val DEFAULT_TIMEOUT_MINUTES: Long = 90
+
+        /** ロックを掛けるタスクの名前（ModDevGradle の run タスク）。 */
+        @JvmField
+        val TASK_NAMES: Set<String> = setOf("runGameTestServer", "runJarGameTestServer", "runLoadTestServer")
+    }
+}
+
+/**
+ * [GameTestLockPlugin] の共有のサービス。ビルドの間 1 つだけ作られる。ロックの持ち主の管理は [GameTestLockCoordinator] に任せる。
+ */
+abstract class GameTestLockService : BuildService<GameTestLockService.Params>, OperationCompletionListener, AutoCloseable {
+    interface Params : BuildServiceParameters {
+        val lockFile: RegularFileProperty
+        val ownerFile: RegularFileProperty
+        val timeoutMinutes: Property<Long>
+        val enabled: Property<Boolean>
+    }
+
+    private val logger = Logging.getLogger(GameTestLockService::class.java)
+    private val coordinator = GameTestLockCoordinator(
+        GameTestFileLock(parameters.lockFile.get().asFile.toPath(), parameters.ownerFile.get().asFile.toPath()),
+        parameters.enabled.get(),
+        Duration.ofMinutes(parameters.timeoutMinutes.get()),
+        { logger.lifecycle(it) },
+    )
+
+    fun acquire(taskPath: String, rootDir: String) = coordinator.acquire(taskPath, rootDir)
+
+    override fun onFinish(event: FinishEvent) {
+        if (event is TaskFinishEvent) coordinator.onTaskFinished(event.descriptor.taskPath)
+    }
+
+    override fun close() = coordinator.close()
+}

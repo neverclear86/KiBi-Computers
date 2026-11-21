@@ -167,10 +167,14 @@ class DiskHotplugHostTest {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = boot(h, "root")
             val q = m.subscribeAll()
+            // 起動の終わりに積まれた自動マウントの仕事が、ghost を作った後に走ると先に外してしまう（CI で遅いと起きる）ので、
+            // その仕事が後始末とマウントまで終えるのを待つ（走り始めた回数 autoMountRuns ではなく、終えた回数。後始末は走り始めの後）
+            eventually(10_000, "起動の終わりの仕事が終わらない") { m.autoMountFinished.get() >= 1 }
             // 抜けたのに外れていないマウント（抜いた区間で外せなかったもの）を作る
             m.lock.withLockValue {
                 m.vfs.mountLocked(VfsPath.parse("/ghost"), TestMemoryFileSystem(), readOnly = false, source = "disk:ghost")
             }
+            // 起動の終わりの仕事は終わっているので、ここではまだ外れていない（外れるのは、下で挿したディスクの仕事の後始末）
             assertEquals("disk:ghost", m.mountAt("/ghost"))
             // 別のディスクを挿して仕事を動かす（フックがないので、後始末も走る）
             assertFalse(m.disksChanged(snapshot("root", "d1")))
