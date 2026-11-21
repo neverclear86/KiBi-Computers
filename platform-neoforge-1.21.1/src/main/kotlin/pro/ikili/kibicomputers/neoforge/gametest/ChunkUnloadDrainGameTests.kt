@@ -36,7 +36,9 @@ object ChunkUnloadDrainGameTests {
      * （30 秒）に間に合わなかった。ただし [far] 自身を FULL にしてから外すと、FULL の future が完了したまま残り、FULL のチケットを
      * 付け直すだけ（チケットの更新だけ）で読み込み直されてしまうので、メインスレッドの段を進めなくても通る。そこで、[far] は一度も
      * FULL にせず、まわりの 8 チャンクだけを FULL にして生成を済ませる（[far] は段階 34 で、LIGHT より前までしか進まない）。
-     * 各 tick で、まわりが FULL になるのを待つ（1 tick の中で待たない）。`drain` に残る仕事は、[far] のチケットの更新、LIGHT・SPAWN の段、
+     * まわりは、ほかの離れたチャンクのテスト（[FarChunks.allocate]）と同じく `getChunk` で、上限なしに同期で生成を待つ（tick の数で上限を
+     * 置くと、ワーカーのスレッドだけが遅いとき、壁時計の上限と変わらなくなる。まわりの `getChunk` の一時のチケットも段階 33 なので、
+     * [far] は段階 34 のまま）。`drain` に残る仕事は、[far] のチケットの更新、LIGHT・SPAWN の段、
      * FULL への昇格（メインスレッドの段を含む）になる。[far] のチケットは `drain` の中で付けるので、tick の間のサーバーの `pollTask` に
      * 先を越されることはない
      */
@@ -60,9 +62,9 @@ object ChunkUnloadDrainGameTests {
             },
         )
         ring.forEach { cache.addRegionTicket(TICKET, it, 0, it) }
-        helper.startSequence().thenWaitUntil {
+        ring.forEach { helper.level.getChunk(it.x, it.z) }
+        helper.startSequence().thenExecute {
             helper.assertTrue(ring.all { cache.getChunkNow(it.x, it.z) != null }, "the chunks around the far chunk should be FULL")
-        }.thenExecute {
             val result = drainWithRequeueing(cache, far, ticket = true, timeoutNanos = TimeUnit.SECONDS.toNanos(30))
             helper.assertFalse(result.loadedBefore, "the far chunk should not be FULL before the drain")
             helper.assertTrue(result.drained, "the unload queue should drain (ran the requeueing task ${result.runs} times)")

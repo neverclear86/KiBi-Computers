@@ -1032,8 +1032,12 @@ internal class LoadRun(
     /** 終わった書き込みが増えないまま待った tick の数（[awaitPhaseSaves]） */
     private var saveWaitIdleTicks = 0
 
-    /** これまでに見た、残っている書き込みの数の最小（減ったら [saveWaitIdleTicks] を数え直す） */
-    private var saveWaitLastOutstanding = Long.MAX_VALUE
+    /**
+     * 前の tick までに受け取った、段階に予約した書き込みの完了の数（[ServerMachines.Stats.windowCompletions]。増えたら [saveWaitIdleTicks] を数え直す）。
+     * 残りの数（予約 − 完了）では見ない。待っている間に予約が増えると（UNLOAD の段階が打ち切られ、残りのチャンクが待ちの間に
+     * アンロードされたとき）、完了が進んでいても残りが減らないことがあるため
+     */
+    private var saveWaitLastCompletions = 0L
     private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
@@ -1589,7 +1593,7 @@ internal class LoadRun(
         saveWaitStartNanos = System.nanoTime()
         saveWaitTicks = 0
         saveWaitIdleTicks = 0
-        saveWaitLastOutstanding = Long.MAX_VALUE
+        saveWaitLastCompletions = ServerMachines.Stats.windowCompletions
         recording = false
         return tick
     }
@@ -1616,8 +1620,8 @@ internal class LoadRun(
         val outstanding = s.windowOutstanding
         if (outstanding <= 0) return true
         saveWaitTicks++
-        if (outstanding < saveWaitLastOutstanding) {
-            saveWaitLastOutstanding = outstanding
+        if (s.windowCompletions > saveWaitLastCompletions) {
+            saveWaitLastCompletions = s.windowCompletions
             saveWaitIdleTicks = 0
         } else {
             saveWaitIdleTicks++
