@@ -1213,7 +1213,9 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 書き込みのスレッドで、[id] のディレクトリを調べる（[inspectForCleanup]・[deleteUnreferenced]） */
     private fun inspectDirectory(id: UUID): CleanupInspection {
         val dir = directoryOf(id)
-        if (!Files.isDirectory(dir)) return CleanupInspection(id, exists = false)
+        // 「確かにない」ときだけ ない。ディレクトリでない・判定できない（権限・I/O エラー）ときは、調べられなかったことにする（残す）
+        if (Files.notExists(dir)) return CleanupInspection(id, exists = false)
+        if (!Files.isDirectory(dir)) return CleanupInspection(id, exists = true, error = "not a readable directory: $dir")
         var newest: Long
         var bytes = 0L
         var generations = 0

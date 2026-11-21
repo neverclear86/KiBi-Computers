@@ -217,6 +217,33 @@ class SaveCleanupTest {
         assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
     }
 
+    @Test
+    fun `ディレクトリでないものは確かにないとは言えないので、調べられなかったことにして残す`() {
+        Files.createDirectories(machines)
+        val id = UUID.randomUUID()
+        Files.writeString(machines.resolve(id.toString()), "not a directory")
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+        val report = run(cleanup(store)).report
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertEquals(1, report.candidates)
+        assertEquals(1, report.undetermined)
+        assertEquals(0, report.deleted)
+    }
+
+    @Test
+    fun `削除の仕事は、ディレクトリを調べられなければ消したことにせず、消した扱いから外す`() {
+        Files.createDirectories(machines)
+        val id = UUID.randomUUID()
+        Files.writeString(machines.resolve(id.toString()), "not a directory")
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test")
+        val result = java.util.concurrent.CompletableFuture<Long>()
+        assertTrue(store.deleteUnreferenced(id, Long.MAX_VALUE) { result.complete(it) })
+        assertEquals(-1L, result.get(10, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        store.cleanupDeletionSkipped(id)
+        assertTrue(store.seenThisSession(id))
+    }
+
     // ---- モジュール ----
 
     private fun putModule(store: FileModuleStore, content: String): String {
