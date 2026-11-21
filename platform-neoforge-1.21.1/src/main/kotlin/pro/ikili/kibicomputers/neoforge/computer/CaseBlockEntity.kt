@@ -35,9 +35,11 @@ import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.Claim
 import pro.ikili.kibicomputers.core.persist.ClaimResult
 import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineOwner
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.core.persist.PendingSave
 import pro.ikili.kibicomputers.core.persist.RestoreListener
 import pro.ikili.kibicomputers.core.persist.RestoreOutcome
@@ -277,6 +279,14 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     var lastClaim: ClaimResult? = null
         private set
 
+    /**
+     * `claim` が `owner.bin` の読みを待っている（#869。`MachineSaveStore.claimOrDefer` が待ちにした）。待つ間は [identity] も [lastClaim] も
+     * `null` のままで、索引にも入らない。取り出し（[captureAndSubmit]）・電源ボタン・復元の順番待ちへの offer はしない。
+     * 確定は [ServerMachines] の tick の始めの [onDeferredClaim]。アンロード・`setRemoved` で取り消す
+     */
+    internal var isClaimDeferred: Boolean = false
+        private set
+
     /** サーバーで読み込まれた（[onLoad] の後。アンロード・`setRemoved` で下ろす） */
     private var loadedOnServer = false
 
@@ -299,8 +309,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         loadedOnServer = true
         ServerMachines.track(this)
         claimIdentity()
-        // 電源が入っていたら、復元の順番待ちに入る（#85。始めるのは ServerMachines の tick）
-        if (computer.beginRestore()) ServerMachines.offerRestore(this)
+        // 電源が入っていたら、復元の順番待ちに入る（#85。始めるのは ServerMachines の tick）。claim が待っていれば、順番待ちの印
+        // （RUNNING の表示）だけを立て、offer は確定してから（ID のないまま offer すると冷えた起動になる。#653・#869）
+        if (computer.beginRestore() && !isClaimDeferred) ServerMachines.offerRestore(this)
     }
 
     /**
@@ -435,18 +446,82 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         if (serial == restoreStarts) lastRestoreOutcome = outcome
     }
 
-    /** 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick の始め（か停止の始め）にチャンクに印を付ける（#762） */
+    /**
+     * 生の値で持ち主を確かめる（ID がなければ何もしない）。NBT と違う値になったら、次の tick の始め（か停止の始め）にチャンクに印を付ける（#762）。
+     * `owner.bin` の読みが要るときは、メインスレッドで読まずに待ちにする（[isClaimDeferred]。#869）。待っていれば取り消してから出し直す
+     * （`/data merge` で生の値が変わったとき）
+     */
     private fun claimIdentity() {
         // 先に取り出して ID が決まっていれば（書き込み中を含む）、それを使う（置いた直後の tick に取り出したときなど）
         if (currentIdentity != null) return
         val store = WorldMachineSaves.current ?: return
+        val wasDeferred = isClaimDeferred
+        cancelDeferredClaim()
+        resolveClaim(store)
+        // onLoad で待ちになって順番待ちへの offer を見送った台が、待つ間の loadAdditional で出し直されてその場で決まったとき
+        // （[onDeferredClaim] は来ない）。生の値がなくなって待たなくなったときも同じ
+        if (wasDeferred && !isClaimDeferred) offerRestoreAfterClaim()
+    }
+
+    private fun resolveClaim(store: MachineSaveStore) {
         val self = owner ?: return
         val raw = rawId ?: return
-        val claim = store.claim(raw, rawGeneration ?: 0, rawEpoch ?: 0, self)
+        // 動いている台（ID がまだない。置いた後に起動した台など）が `/data merge` で ID を得たときは、待たずに同期で確定する（これまでと同じ）。
+        // 待つと、待つ間の取り出し（アンロード・停止）が飛ばされて状態を失い、電源ボタンも効かなくなる。
+        // 復元の途中の台も同じ（マシンがある）。ADR 0084 の規則 7a の例外で、読みの要る ID ならメインスレッドで owner.bin を読み、
+        // その前に列の仕事を最大 claimWaitMillis 待つ（ID を持たずに動いている台にコマンドで ID を足したときだけ。数え口は mainOwnerReads）
+        if (computer.machine != null) {
+            applyClaim(store.claim(raw, rawGeneration ?: 0, rawEpoch ?: 0, self), raw)
+            return
+        }
+        val claim = store.claimOrDefer(raw, rawGeneration ?: 0, rawEpoch ?: 0, self, this)
+        if (claim == null) {
+            isClaimDeferred = true
+            // ID のないまま復元の順番待ちに入っていた台は、順番を外す（ID のないまま順番が来ると、冷えた起動になる）。
+            // 順番待ちの印（RUNNING の表示）は残し、確定したら [onDeferredClaim] が入れ直す
+            ServerMachines.cancelRestore(this)
+            return
+        }
+        applyClaim(claim, raw)
+    }
+
+    /** 待っていた claim が決まった後に、電源が入っていてチャンクが FULL なら、復元の順番待ちに入れる（FULL でなければ、FULL に戻ったときに入る） */
+    private fun offerRestoreAfterClaim() {
+        val level = level as? ServerLevel ?: return
+        if (isRemoved || !loadedOnServer) return
+        if (level.hasChunkAt(blockPos) && computer.beginRestore()) ServerMachines.offerRestore(this)
+    }
+
+    private fun applyClaim(claim: Claim, raw: String?) {
         lastClaim = claim.result
         identity = claim.identity
         val id = claim.identity
         if (id == null || id.id.toString() != raw || id.generation != rawGeneration || id.epoch != rawEpoch) ServerMachines.markChangedLater(this)
+    }
+
+    /**
+     * 待っていた claim が確定した（#869。[ServerMachines] の tick の始めに、`MachineSaveStore.pollDeferredClaims` から）。置き場はもう索引に
+     * 入れているので、待ちでなくなった・消えた・読み込まれていない台なら、索引から外して捨てる。受け取ったら、電源が入っていて
+     * チャンクが FULL なら、復元の順番待ちに入れる（[onLoad] で待たせた分。FULL でなければ、FULL に戻ったときに入る）
+     */
+    internal fun onDeferredClaim(claim: Claim) {
+        val self = owner
+        if (!isClaimDeferred || isRemoved || !loadedOnServer || currentIdentity != null) {
+            val id = claim.identity
+            if (id != null && self != null) WorldMachineSaves.current?.index?.removeIfOwner(id.id, self)
+            LOGGER.debug("Dropping a deferred claim of a case at {} that is no longer waiting ({})", blockPos, claim)
+            return
+        }
+        isClaimDeferred = false
+        applyClaim(claim, rawId)
+        offerRestoreAfterClaim()
+    }
+
+    /** 待っている claim を取り消す（#869。アンロード・`setRemoved`・出し直し） */
+    private fun cancelDeferredClaim() {
+        if (!isClaimDeferred) return
+        isClaimDeferred = false
+        WorldMachineSaves.current?.cancelDeferredClaim(this)
     }
 
     /** 索引から外す（自分を指しているときだけ。書き込み中なら予約の ID） */
@@ -467,6 +542,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      * @return 予約した書き込み（[PendingSave.writes] が書き込みの回数の見積もり）
      */
     internal fun captureAndSubmit(policy: CapturePolicy): PendingSave? {
+        // claim が待っている台は取り出さない（取り出すと置き場が新しい ID を振り、元の ID の状態を失う。#869）
+        if (isClaimDeferred) return null
         val store = WorldMachineSaves.current ?: return null
         val self = owner ?: return null
         val capturer = computer.capturer(policy, ServerMachines.saveConfig.fullSaveRule)
@@ -541,6 +618,8 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     fun pressPowerButton(player: ServerPlayer? = null): ComputerStatus {
         val level = level as? ServerLevel ?: return computer.status
+        // claim が待っている間（ふつうは読み込みの直後の数 tick。上限 claimWaitMillis）は効かない（動かすと、取り出せない台が ID のないまま動く。#869）
+        if (isClaimDeferred) return computer.status
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = machineConfig()
@@ -615,6 +694,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     override fun onChunkUnloaded() {
         super.onChunkUnloaded()
+        cancelDeferredClaim()
         leaveIndex()
         ServerMachines.untrack(this)
         ServerMachines.cancelRestore(this)
@@ -636,6 +716,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     override fun setRemoved() {
         super.setRemoved()
+        cancelDeferredClaim()
         leaveIndex()
         ServerMachines.untrack(this)
         ServerMachines.cancelRestore(this)
