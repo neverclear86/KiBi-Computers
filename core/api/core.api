@@ -1,0 +1,107 @@
+public abstract interface class pro/ikili/kibicomputers/api/device/Device {
+	public abstract fun getKind ()Ljava/lang/String;
+	public abstract fun getMethods ()Lpro/ikili/kibicomputers/api/device/DeviceMethods;
+	public fun onAttached (Lpro/ikili/kibicomputers/api/device/DeviceContext;)V
+	public fun onDetached (Lpro/ikili/kibicomputers/api/device/DeviceContext;)V
+}
+
+public final class pro/ikili/kibicomputers/api/device/Device$DefaultImpls {
+	public static fun onAttached (Lpro/ikili/kibicomputers/api/device/Device;Lpro/ikili/kibicomputers/api/device/DeviceContext;)V
+	public static fun onDetached (Lpro/ikili/kibicomputers/api/device/Device;Lpro/ikili/kibicomputers/api/device/DeviceContext;)V
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceArguments {
+	public final fun get (I)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun getBoolean (I)Z
+	public final fun getBytes (I)[B
+	public final fun getDouble (I)D
+	public final fun getLong (I)J
+	public final fun getText (I)Ljava/lang/String;
+	public final fun isNone (I)Z
+	public final fun size ()I
+	public fun toString ()Ljava/lang/String;
+}
+
+public abstract interface class pro/ikili/kibicomputers/api/device/DeviceCallContext {
+	public abstract fun consumeFuel (J)V
+	public abstract fun defer ()Lpro/ikili/kibicomputers/api/device/DeviceCompletion;
+	public abstract fun getAddress ()Ljava/lang/String;
+	public abstract fun getMethod ()Ljava/lang/String;
+	public abstract fun isMainThread ()Z
+}
+
+public abstract interface class pro/ikili/kibicomputers/api/device/DeviceCompletion {
+	public abstract fun complete ([Lpro/ikili/kibicomputers/api/device/DeviceValue;)V
+	public abstract fun fail (Ljava/lang/String;)V
+	public abstract fun isCancelled ()Z
+}
+
+public abstract interface class pro/ikili/kibicomputers/api/device/DeviceContext {
+	public abstract fun getAddress ()Ljava/lang/String;
+	public abstract fun postEvent (Ljava/lang/String;[Lpro/ikili/kibicomputers/api/device/DeviceValue;)Z
+}
+
+public class pro/ikili/kibicomputers/api/device/DeviceException : java/lang/Exception {
+	public fun <init> (Ljava/lang/String;)V
+}
+
+public abstract interface class pro/ikili/kibicomputers/api/device/DeviceMethodHandler {
+	public abstract fun call (Lpro/ikili/kibicomputers/api/device/DeviceCallContext;Lpro/ikili/kibicomputers/api/device/DeviceArguments;)[Lpro/ikili/kibicomputers/api/device/DeviceValue;
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceMethods {
+	public static final field Companion Lpro/ikili/kibicomputers/api/device/DeviceMethods$Companion;
+	public static final fun builder ()Lpro/ikili/kibicomputers/api/device/DeviceMethods$Builder;
+	public static final fun empty ()Lpro/ikili/kibicomputers/api/device/DeviceMethods;
+	public final fun getNames ()Ljava/util/List;
+	public fun toString ()Ljava/lang/String;
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceMethods$Builder {
+	public final fun build ()Lpro/ikili/kibicomputers/api/device/DeviceMethods;
+	public final fun direct (Ljava/lang/String;Lpro/ikili/kibicomputers/api/device/DeviceMethodHandler;)Lpro/ikili/kibicomputers/api/device/DeviceMethods$Builder;
+	public final fun mainThread (Ljava/lang/String;Lpro/ikili/kibicomputers/api/device/DeviceMethodHandler;)Lpro/ikili/kibicomputers/api/device/DeviceMethods$Builder;
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceMethods$Companion {
+	public final fun builder ()Lpro/ikili/kibicomputers/api/device/DeviceMethods$Builder;
+	public final fun empty ()Lpro/ikili/kibicomputers/api/device/DeviceMethods;
+}
+
+public abstract class pro/ikili/kibicomputers/api/device/DeviceValue {
+	public static final field Companion Lpro/ikili/kibicomputers/api/device/DeviceValue$Companion;
+	public final fun asBoolean ()Z
+	public final fun asBytes ()[B
+	public final fun asDouble ()D
+	public final fun asLong ()J
+	public final fun asText ()Ljava/lang/String;
+	public abstract fun getType ()Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final fun none ()Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public static final fun of (D)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public static final fun of (J)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public static final fun of (Ljava/lang/String;)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public static final fun of (Z)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public static final fun of ([B)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceValue$Companion {
+	public final fun none ()Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun of (D)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun of (J)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun of (Ljava/lang/String;)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun of (Z)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+	public final fun of ([B)Lpro/ikili/kibicomputers/api/device/DeviceValue;
+}
+
+public final class pro/ikili/kibicomputers/api/device/DeviceValue$Type : java/lang/Enum {
+	public static final field BOOLEAN Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final field BYTES Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final field FLOAT Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final field INTEGER Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final field NONE Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static final field TEXT Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static fun getEntries ()Lkotlin/enums/EnumEntries;
+	public static fun valueOf (Ljava/lang/String;)Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+	public static fun values ()[Lpro/ikili/kibicomputers/api/device/DeviceValue$Type;
+}
+

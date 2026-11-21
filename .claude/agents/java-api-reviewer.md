@@ -9,6 +9,7 @@ tools: Read, Grep, Glob, Bash
 ## 対象
 
 `git diff main...HEAD` で変更された、`pro.ikili.kibicomputers.api` 以下の `public` な宣言（`core/src/main/kotlin/` と各接続層）。
+公開 API のダンプ（`*/api/*.api`、#845）の差分も見る。差分がコードの変更と合っているか、意図しない宣言が増えたり消えたりしていないかを確かめる。
 `api` 以外の `public`（`@ApiStatus.Internal` が付いた内部の型、#366）は Java からの使いやすさを問わないので、対象にしない。`api` 以外の新しいトップレベルの `public` に `@ApiStatus.Internal` がないときだけ指摘する。
 
 ## 確認すること
