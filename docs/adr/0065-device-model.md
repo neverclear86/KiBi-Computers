@@ -74,6 +74,14 @@
 | `bad-arguments(msg)` | `DeviceArguments.get*` の型が違う（`argument #N: integer expected, got text` の形） |
 | `failed(msg)` | 作者が `DeviceException` を投げた・`DeviceCompletion.fail`。ほかの例外は `failed("internal error")` にしてログに出す（マシンは止めない）。中断は `failed("interrupted")` |
 
+追記（#679）: ログ。internal error にした失敗（例外・`null` の値）のログは、スケジューラに1つの `DeviceFailureLog` が間引く（マシンごとではない。ADR 0044・ADR 0088 の「ログと数え口」と同じく、1台ごとの WARNING を増やさない）。
+
+- キーは「デバイスの種類（つないだときに読んだ `kind`）・メソッド・失敗の種類（例外のクラス名か `null` の値）」。例外のメッセージ・スタック・マシンの id は入れない（呼ぶたびに変わる値で間引きが効かなくなる。繰り返しのたびにスタックを読まない）
+- キーごとに最初の1回だけ WARNING（マシンの id・address・種類・メソッド。例外ならスタックトレースつき）。2回目からは数えるだけで、台（マシンの id・address・例外の `toString`）は DEBUG に出す（DEBUG が有効なときだけ組み立てる）
+- 覚えるキーは 64 個まで（`HOST_FAILURE_TRACE_LIMIT` と同じ）。超えたら、そのことを書いた WARNING を1回だけ出し、後は「上限の後」としてまとめて数える
+- 数えた繰り返しは、最初の繰り返しから 1,200 tick（1分）過ぎたら、要約の WARNING 1本（件数とキーごとの内訳）に出して数え直す。確かめるのは失敗したときと `MachineScheduler.tick()` の頭（AtomicLong を1回読むだけ。台数に比例しない）。繰り返しがなければ出さない
+- 呼び出しの結果（`failed("internal error")`）と燃料は変えない。ログに出す処理は投げない（JVM の致命的なエラーだけ投げ直す）。間と上限は運用の値（ゲームバランスではない）
+
 ## イベント
 
 `DeviceContext.postEvent(kind, values...)` で、マシンのイベントキュー（ADR 0063）に `source` = address のイベントを入れる。値は同じ種類の `EventValue` に写し、`none` は載せない。上限を超えた・外れた後は `false` を返して捨てる。接続・切断のイベントは #67。
@@ -123,7 +131,7 @@
 
 ## テスト
 
-- `DeviceAddressTest`・`DeviceBusTest`・`DeviceDispatcherTest`・`PendingDeviceCallTest`・`SpeakerDeviceTest`・`KeyboardDeviceTest`・`ScreenDevice*Test`・`DeviceValueTest`（`core`）
+- `DeviceAddressTest`・`DeviceBusTest`・`DeviceDispatcherTest`・`DeviceFailureLogTest`（#679）・`PendingDeviceCallTest`・`SpeakerDeviceTest`・`KeyboardDeviceTest`・`ScreenDevice*Test`・`DeviceValueTest`（`core`）
 - `DeviceApiJavaTest`（Java から公開 API を使う）
 - `KibiWitTableTest`: `kibi:device` の `package`・`world imports`、`%` の識別子がないこと、`value` と `event-value` の case 名がそろうこと
 - GameTest `devicesAreAttachedWithSavedAddresses`: 電源を入れるとケース・画面・キーボードの address でつながり、address は読み直しても同じ
