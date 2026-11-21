@@ -42,11 +42,18 @@ object MainThreadBudgetGameTests {
     private const val BURN_MICROS = 3_000L
 
     /**
+     * 上限の tick 数。Lua の REPL を冷えた状態から起動するので、ほかの Lua の起動を待つ GameTest（`TestComputerGameTests` など）と同じにする。
+     * GameTest のサーバーは待たずに tick を進めるので、lua.wasm の読み込みと起動が終わる前に普通の上限を使い切ることがある
+     * （同じバッチで `loadgametests.ci` の 100 台も起動する。#871 と同じ種類の揺れ）
+     */
+    private const val BOOT_TIMEOUT_TICKS = 12_000
+
+    /**
      * Lua の REPL から、樽（`kibitest:reactor`）の重いメインスレッドのメソッド `burn` を 16 のコルーチンで同時に積む。
      * 予算（既定 5 ms）を超えた分は次の tick に回り（打ち切った tick が増える）、ゲストにはエラーを返さずに全部が終わる
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
     fun heavyMainThreadCallsAreSpreadOverTicksByTheBudget(helper: GameTestHelper) {
         val casePos = BlockPos(1, 1, 1)
         LoadGameTests.Layout.placeComputer(helper, casePos, LoadOs.LUA)
