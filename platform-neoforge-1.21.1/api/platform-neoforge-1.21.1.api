@@ -1,0 +1,5 @@
+public final class pro/ikili/kibicomputers/neoforge/api/KibiCapabilities {
+	public static final field DEVICE Lnet/neoforged/neoforge/capabilities/BlockCapability;
+	public static final field INSTANCE Lpro/ikili/kibicomputers/neoforge/api/KibiCapabilities;
+}
+

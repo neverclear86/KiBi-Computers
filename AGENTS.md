@@ -24,6 +24,7 @@ KiBi Computers（MOD ID `kibicomputers`）は、WebAssembly（[Endive](https://g
 | `dev-driver/` | 開発クライアントを外から操作する HTTP の口（MC 非依存の部分）。各接続層の `src/dev/` が MC 側の操作を実装する。開発環境でだけ読み込み、jar には入れない |
 | `build-logic/` | ビルド用の Gradle プラグイン（included build）。`kibicomputers.wasm` は C を `zig cc` で WASM にビルドし、ソースセットのリソースに入れる |
 | `gradle/libs.versions.toml` | 共通ライブラリのバージョン |
+| `*/api/*.api` | 公開 API のダンプ（#845）。`core/api/core.api`、`platform-*/api/platform-*.api`。`updateKotlinAbi` で作り、手で直さない |
 | `gradle/zig.properties` | WASM のビルドに使う Zig のバージョンと、配布アーカイブの SHA-256 |
 | `gradle/moonbit.properties` | MoonBit（標準 OS の言語の PoC #32 で使う）の版と、配布アーカイブの SHA-256。MoonBit は CI か `-Pkibi.moonbit=true` のときだけビルドする |
 | `gradle/wasi-sdk.properties` | テストでネイティブの `wasm32-wasip2`・`wasm32-wasip3` のコンポーネントをビルドする wasi-sdk の版と、全 OS 分のアーカイブの SHA-256（#775）。取得したものは `~/.gradle/kibicomputers/wasi-sdk/` に置く |
@@ -43,6 +44,8 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | core の単体テストだけ | `./gradlew :core:test` |
 | ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
 | 製品の jar（Jar-in-Jar で同梱したもの）を読んで GameTest（#775） | `./gradlew :platform-neoforge-1.21.1:runJarGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runJarGameTestServer` |
+| 公開 API のダンプを今のコードに合わせて作り直す（#845） | `./gradlew updateKotlinAbi` |
+| 公開 API とダンプの食い違いの検査（`build` の `check` にも入っている） | `./gradlew checkKotlinAbi` |
 | ゲーム内の多数台の負荷試験（手順と結果は `docs/load-test.md`） | `./gradlew :platform-neoforge-1.21.1:runLoadTestServer -PloadTestCounts=1000` |
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
@@ -79,6 +82,10 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - デフォルト引数を持つ公開関数・コンストラクターには `@JvmOverloads`。
 - 公開 API に `suspend` 関数、value class、Kotlin の関数型（`(A) -> B`）を出さない。コールバックは `fun interface` にする。
 - 例外を投げる公開関数には `@Throws` を付ける。
+- **公開 API の一覧（ダンプ）を `<モジュール>/api/<プロジェクト名>.api` に置いている**（#845。Kotlin Gradle Plugin の ABI 検証）。対象は `core` の `pro.ikili.kibicomputers.api.**` と、接続層の `pro.ikili.kibicomputers.<ローダー>.api.**`。コードとダンプが食い違うと `build`（`check` → `checkKotlinAbi`）が落ちる。
+  - 公開 API を足す・変える・消すときは `./gradlew updateKotlinAbi` でダンプを作り直し、その差分を同じ PR でコミットする。差分が API の変更の一覧になるので、PR のレビューで見る。
+  - ダンプは手で直さない（タブで字下げした書式。いつも `updateKotlinAbi` で作る）。
+  - Kotlin を上げて、API を変えていないのにダンプの書式だけが変わったときも、`updateKotlinAbi` で作り直す。ABI 検証の DSL は実験的なので、Kotlin を上げたら build スクリプトの `abiValidation {}` が通るかも確かめる。
 - `api` の宣言を足したら、`core/src/test/java/` に Java から呼ぶテストを足す（コンパイルできることが検査になる）。内部の型には Java のテストを足さない。今ある内部の型の Java テスト（`*JavaTest.java`）は振る舞いの確認も兼ねるので残すが、内部の型を変えて合わなくなったら、Kotlin のテストに移すか消してよい。
 
 ## コードスタイル

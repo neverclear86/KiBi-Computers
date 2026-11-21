@@ -28,6 +28,17 @@ kotlin {
         apiVersion = KotlinVersion.KOTLIN_2_2
         languageVersion = KotlinVersion.KOTLIN_2_2
     }
+    // 公開 API のダンプ（api/<プロジェクト名>.api）と食い違ったら check（build）で落とす（#845）。
+    // 公開 API を変えたら ./gradlew updateKotlinAbi で作り直してコミットする。
+    // まだ公開 API がないのでダンプは空。#224 で ...forge.api を足すと差分が出る。
+    @OptIn(org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation::class)
+    abiValidation {
+        filters {
+            include {
+                byNames.add("pro.ikili.kibicomputers.forge.api.**")
+            }
+        }
+    }
 }
 
 // 開発環境でだけ読み込むコード（クライアントの自動操作の口など）。jar には入れない
