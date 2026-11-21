@@ -401,6 +401,59 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
+    fun `書き込みの仕事が失敗の完了を組み立てられずに投げても、予約1つに完了1つが返り、仕事の数え口が戻る`() {
+        // toString が投げる Error: writeGeneration の catch が原因の文字列を作るところで投げ、仕事の外に漏れる（#852 で見つけた穴）
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 100
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot = throw Unprintable()
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val identity = store.assignNewId(p)!!
+        val pending = store.submit(identity, p, bad, null)
+        val finishedBefore = store.finishedCount
+        assertEquals(1, store.pendingCount)
+        assertEquals(100, store.pendingBytes)
+        // 例外は投げ直す（サーバーでは書き込みのスレッドが warn する）
+        val thrown = runCatching { manual.runNext() }.exceptionOrNull()
+        assertNotNull(thrown)
+        assertEquals(0, store.pendingCount)
+        assertEquals(0, store.pendingBytes)
+        assertEquals(finishedBefore + 1, store.finishedCount)
+        val completion = store.pollCompleted().single()
+        assertSame(pending, completion.pending)
+        assertFalse(completion.succeeded)
+        assertNotNull(completion.error)
+        assertEquals(OptionalLong.empty(), store.latestGeneration(identity.id))
+        // 次の予約は書ける
+        store.submit(identity, p, src(), null)
+        manual.runAll()
+        assertTrue(store.pollCompleted().single().succeeded)
+    }
+
+    @Test
+    fun `finishedCountは掃除や削除を含めて列から抜けた仕事を数える`() {
+        val identity = store.assignNewId(p)!!
+        val start = store.finishedCount
+        store.submit(identity, p, src(), null)
+        store.submit(identity, p, src(), null)
+        assertEquals(start, store.finishedCount, "走るまでは増えない")
+        manual.runNext()
+        assertEquals(start + 1, store.finishedCount)
+        manual.runAll()
+        store.pollCompleted()
+        store.delete(identity.id)
+        manual.runAll()
+        assertTrue(store.finishedCount >= start + 3)
+        assertEquals(0, store.pendingCount)
+    }
+
+    @Test
     fun `閉じた後の予約は失敗の完了で返る`() {
         val identity = store.assignNewId(p)!!
         assertTrue(store.close(1000))

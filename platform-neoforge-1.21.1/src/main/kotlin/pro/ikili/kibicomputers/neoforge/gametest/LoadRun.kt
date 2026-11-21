@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
+import pro.ikili.kibicomputers.core.persist.SaveWriter
 import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
@@ -1038,6 +1039,18 @@ internal class LoadRun(
      * アンロードされたとき）、完了が進んでいても残りが減らないことがあるため
      */
     private var saveWaitLastCompletions = 0L
+
+    /**
+     * 前の tick までに見た、書き込みの列から抜けた仕事の累計（[pro.ikili.kibicomputers.core.persist.MachineSaveStore.finishedCount]。#852）。
+     * 段階の保存の前に掃除などの仕事が並んでいても、列が進んでいれば [saveWaitIdleTicks] を数え直す
+     */
+    private var saveWaitLastFinished = 0L
+
+    /** 待ち始めてから、段階に予約した書き込みの完了を最後に受け取ったとき（`System.nanoTime`。まだなら待ち始め。#852） */
+    private var saveWaitLastCompletionNanos = 0L
+
+    /** 待ち始めてから、段階に予約した書き込みの完了を最後に受け取った待ちの tick（[saveWaitTicks] の値。#852） */
+    private var saveWaitLastCompletionTick = 0
     private val unforcedOthers = ArrayList<ChunkPos>()
     private var unloadPrevCaptures = 0L
     private var savedSpawnChunkRadius: Int? = null
@@ -1594,6 +1607,9 @@ internal class LoadRun(
         saveWaitTicks = 0
         saveWaitIdleTicks = 0
         saveWaitLastCompletions = ServerMachines.Stats.windowCompletions
+        saveWaitLastFinished = WorldMachineSaves.current?.finishedCount ?: 0L
+        saveWaitLastCompletionNanos = saveWaitStartNanos
+        saveWaitLastCompletionTick = 0
         recording = false
         return tick
     }
@@ -1603,8 +1619,10 @@ internal class LoadRun(
      * 空になるのを 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待って、終わった書き込みを受け取る。tick をまたいで待つので、
      * 1回でメインスレッドを長く止めず、急いで回す試験（`paced` でない）でも tick の数が増えすぎない。待つ tick は測らない（[stopMeasuring]）。
      * 上限は tick で数える（#854。重いマシンで書き込みのスレッドが I/O で遅れても、進んでいるうちは落とさない）:
-     * 終わった書き込みが1件も増えない tick が [SAVE_WAIT_IDLE_TICKS] 続くか、待つ tick が全部で [SAVE_WAIT_TIMEOUT_TICKS] に達したら失敗する。
-     * 1 tick に [SAVE_WAIT_STEP_MILLIS] まで待つので、どちらも壁時計では元の上限（120 秒）より短くならない
+     * 段階の書き込みの完了も、列の仕事（掃除なども。#852）の終わりも増えない tick が [SAVE_WAIT_IDLE_TICKS] 続くか、
+     * 待つ tick が全部で [SAVE_WAIT_TIMEOUT_TICKS] に達したら失敗する。
+     * 1 tick に [SAVE_WAIT_STEP_MILLIS] まで待つので、どちらも壁時計では元の上限（120 秒）より短くならない。
+     * 失敗の文言には、遅れの形（一様に遅い・1 件が止まった・取りこぼし）を見分ける材料を出す（[saveWaitDiagnostics]。#852）
      */
     private fun awaitPhaseSaves(): Boolean {
         val s = ServerMachines.Stats
@@ -1620,8 +1638,15 @@ internal class LoadRun(
         val outstanding = s.windowOutstanding
         if (outstanding <= 0) return true
         saveWaitTicks++
-        if (s.windowCompletions > saveWaitLastCompletions) {
+        val finished = store?.finishedCount ?: saveWaitLastFinished
+        val completed = s.windowCompletions > saveWaitLastCompletions
+        if (completed) {
+            saveWaitLastCompletionNanos = System.nanoTime()
+            saveWaitLastCompletionTick = saveWaitTicks
+        }
+        if (completed || finished > saveWaitLastFinished) {
             saveWaitLastCompletions = s.windowCompletions
+            saveWaitLastFinished = finished
             saveWaitIdleTicks = 0
         } else {
             saveWaitIdleTicks++
@@ -1634,8 +1659,44 @@ internal class LoadRun(
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - saveWaitStartNanos)
         fail(
             "$outstanding of ${s.windowSubmits} saves queued in the $phase phase $reason " +
-                "(waited $saveWaitTicks ticks, $elapsed ms; pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()})",
+                "(waited $saveWaitTicks ticks, $elapsed ms; pending ${store?.pendingCount} jobs, ${store?.pendingBytes} bytes; ${WriterStats.current()}; " +
+                "${saveWaitDiagnostics()})",
         )
+    }
+
+    /**
+     * 書き込みの待ちで失敗したときの材料（#852。失敗したときだけ作る）: 最後に段階の完了を受け取ってからの tick・ms、残っている予約
+     * （古い順に [SAVE_WAIT_REPORT_OUTSTANDING] 件。予約してからの tick・ms）、ここまでの完了の符号化・書き込みの時間（最大・合計）、
+     * 列から抜けた仕事の累計、書き込みのスレッドの状態とスタックの先頭。
+     * 見分け方: 書き込みの時間の最大が大きく、スレッドが `force`・`move` などの中なら 1 件が止まった。最大が合計 ÷ 件数に近く、
+     * 全体が長いなら一様に遅い。スレッドが列を待って（`WAITING`）いるのに残りがあるなら取りこぼし
+     */
+    private fun saveWaitDiagnostics(): String {
+        val now = System.nanoTime()
+        val tickNow = level.server.tickCount
+        val sinceCompletionMs = TimeUnit.NANOSECONDS.toMillis(now - saveWaitLastCompletionNanos)
+        val outstanding = ServerMachines.outstandingWindowSaves(SAVE_WAIT_REPORT_OUTSTANDING).joinToString(prefix = "[", postfix = "]") {
+            "${it.identity.id}@${it.identity.generation}${it.pos?.let { p -> " at ${p.toShortString()}" } ?: ""} " +
+                "submitted ${if (it.submittedAtTick >= 0) tickNow - it.submittedAtTick else "?"} ticks / " +
+                "${TimeUnit.NANOSECONDS.toMillis(now - it.submittedAtNanos)} ms ago"
+        }
+        val saves = ServerMachines.Stats.saves
+        val writeMax = saves.maxOfOrNull { it.fileWriteNanos } ?: 0L
+        val writeSum = saves.sumOf { it.fileWriteNanos }
+        val encodeMax = saves.maxOfOrNull { it.encodeNanos } ?: 0L
+        val encodeSum = saves.sumOf { it.encodeNanos }
+        val writer = Thread.getAllStackTraces().entries.firstOrNull { it.key.name == SaveWriter.DEFAULT_THREAD_NAME }
+        val writerText = if (writer == null) {
+            "writer thread not found"
+        } else {
+            "writer ${writer.key.state} at " + writer.value.take(SAVE_WAIT_REPORT_FRAMES).joinToString(" < ")
+        }
+        return "last phase completion ${saveWaitTicks - saveWaitLastCompletionTick} ticks / $sinceCompletionMs ms ago; " +
+            "outstanding $outstanding; " +
+            "completed ${saves.size} writes: file write max %.1f ms, total %.1f ms, encode max %.1f ms, total %.1f ms; ".format(
+                Locale.ROOT, writeMax / 1e6, writeSum / 1e6, encodeMax / 1e6, encodeSum / 1e6,
+            ) +
+            "finished jobs ${WorldMachineSaves.current?.finishedCount}; $writerText"
     }
 
     private fun unload() {
@@ -2426,6 +2487,12 @@ internal class LoadRun(
 
         /** 段階に予約した書き込みの終わりを待つ間、1 tick で書き込みのスレッドを待つ上限 */
         private const val SAVE_WAIT_STEP_MILLIS = 50L
+
+        /** 書き込みの待ちで失敗したとき、文言に出す残りの予約の数（[saveWaitDiagnostics]。#852） */
+        private const val SAVE_WAIT_REPORT_OUTSTANDING = 5
+
+        /** 書き込みの待ちで失敗したとき、文言に出す書き込みのスレッドのスタックの深さ（[saveWaitDiagnostics]。#852） */
+        private const val SAVE_WAIT_REPORT_FRAMES = 8
 
         private val DIGITS = Regex("[0-9]+")
 
