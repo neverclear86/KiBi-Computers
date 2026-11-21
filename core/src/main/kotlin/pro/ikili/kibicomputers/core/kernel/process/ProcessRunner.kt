@@ -598,7 +598,8 @@ internal class ProcessRunner(private val machine: Machine) {
      * ワーカーなら、許可の次の step を同じワーカーの続きにする（新しいスレッドを作らない。#350）
      */
     private fun releasePermitAndCpu(rt: ProcessRuntime, endOfStep: Boolean = false) {
-        // 印は返す前に下ろす（返した後にワーカーへ渡せずに投げたとき、もう一度返して許可を増やさないため）。
+        // 印は返す前に下ろす（返す途中で投げたとき、もう一度返して許可を増やさないため。次の仕事をワーカーへ渡せないときは、
+        // release は投げずに取り残しの列へ入れる。#870）。
         // 返す途中でスタックが尽きないことは、入口の余裕の確かめ（StackHeadroom。#828）で守る
         if (rt.holdsPermit) {
             rt.holdsPermit = false
