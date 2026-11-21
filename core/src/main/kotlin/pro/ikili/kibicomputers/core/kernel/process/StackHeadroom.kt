@@ -45,6 +45,13 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 32 段は、包みと燃料切れの処理の入口から、ロックの区間を抜けるまで（とホストの関数の本体の浅い処理）に当てる。
  * 足りなかったときに残ったものは、浅いところの安全網（`ProcessRunner.recoverLeaks`）が見つけて戻す。
  * まだ確かめていないのは、本体がカーネルロックの中で VFS の深いところ（`stat` より深い操作）まで入る道と、canon の lift・lower の中の道（#858）
+ *
+ * 3 つ目の入口（#856）: メモリの勘定（`ProcessMemory` の確保）。ロックではないが、プロセス → マシン → サーバー全体の別々の CAS を重ねるので、
+ * 段の途中で尽きると勘定がずれる（サーバー全体の勘定はサーバーを止めるまで戻らない）。ゲストの命令から包みを通らずに入るので、
+ * 確保の入口で [MEMORY_ACCOUNT_FRAMES] 段を払う。初めて書いた区画ごと（例外で入る遅い道。もともと例外の生成と 4 KiB の確保を払う）・
+ * `memory.grow`・`table.grow` ごとで、読み書きの速い道と、待っているだけの台には費用を足さない。
+ * `MemoryAccountStackExhaustionTest` で、確かめがないと尽きる位置をずらした 400 回のうち数回、プロセスとマシン（とサーバー全体）に
+ * 数えた分が残った（確かめた後は 0 回）
  */
 internal object StackHeadroom {
     /**
@@ -69,6 +76,13 @@ internal object StackHeadroom {
      * （1 回通るたびに新しいスライスを受け取る）ので、前借りの間に繰り返し通ることはない。`block`・`awaitHost` は呼ぶたびに払う
      */
     const val FUEL_YIELD_FRAMES: Int = 128
+
+    /**
+     * メモリの勘定の入口（`ProcessMemory.tryReserve`・`tryReserveBytes`）で確かめる段数（#856）。ここから先は、プロセス → マシン →
+     * サーバー全体の CAS（数段の呼び出し）と、呼び手の後処理（4 KiB の区画の確保・写し、Endive の `table.grow`、数えた分の記録）だけで、
+     * ロックを取る深い道はない。区画に初めて書くたびに通るので、ホストの関数の包みと同じ軽い段数にする
+     */
+    const val MEMORY_ACCOUNT_FRAMES: Int = 32
 
     /** [frames] 段分のスタックが残っているかを確かめる。足りなければ、何も触らずに `StackOverflowError` を投げる */
     fun ensure(frames: Int) {
