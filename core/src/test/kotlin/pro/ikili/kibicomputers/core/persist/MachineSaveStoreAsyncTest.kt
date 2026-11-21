@@ -437,20 +437,73 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
-    fun `finishedCountは掃除や削除を含めて列から抜けた仕事を数える`() {
+    fun `finishedCountは掃除・owner_bin・削除を含めて、列に入れた仕事を1つにつき1回だけ数える`() {
         val identity = store.assignNewId(p)!!
         val start = store.finishedCount
-        store.submit(identity, p, src(), null)
-        store.submit(identity, p, src(), null)
+        val first = store.submit(identity, p, src(), null)
+        store.submit(first.identity, p, src(), null)
+        // 引き取り（owner.bin を書く仕事）、印が進む（掃除）、削除
+        index.removeIfOwner(identity.id, p)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(identity.id.toString(), 0, 0, q).result)
+        assertEquals(ChunkMarkResult.ADVANCED, store.markChunkGeneration(identity.id, 1, q))
+        store.delete(identity.id)
+        val queued = manual.size
+        assertTrue(queued >= 5, "世代 2 つ・owner.bin・掃除・削除が列に入った: $queued")
         assertEquals(start, store.finishedCount, "走るまでは増えない")
+        assertEquals(queued, store.pendingCount)
         manual.runNext()
         assertEquals(start + 1, store.finishedCount)
         manual.runAll()
-        store.pollCompleted()
-        store.delete(identity.id)
-        manual.runAll()
-        assertTrue(store.finishedCount >= start + 3)
+        assertEquals(start + queued, store.finishedCount, "1 つの仕事で 1 つだけ増える")
         assertEquals(0, store.pendingCount)
+    }
+
+    @Test
+    fun `finishedCountは、閉じた後に断られた仕事も1つにつき1回だけ数える`() {
+        val identity = store.assignNewId(p)!!
+        val written = store.submit(identity, p, src(), null)
+        assertTrue(store.close(1000))
+        store.pollCompleted()
+        val start = store.finishedCount
+        store.submit(written.identity, p, src(), null)
+        assertEquals(start + 1, store.finishedCount, "断られた予約")
+        store.delete(identity.id)
+        assertEquals(start + 2, store.finishedCount, "断られた削除")
+        assertEquals(0, store.pendingCount)
+    }
+
+    @Test
+    fun `DIRECTでは書き込みの仕事が投げても、予約1つに完了1つで、数え口は1回だけ戻る`() {
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 100
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot = throw Unprintable()
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val direct = MachineSaveStore(dir, index, "test")
+        val identity = direct.assignNewId(p)!!
+        val start = direct.finishedCount
+        // 仕事がその場で走り、投げた例外（IllegalStateException）が execute から出る。それを「断られた」として 2 回目の完了にしない
+        val pending = direct.submit(identity, p, bad, null)
+        assertEquals(0, direct.pendingCount)
+        assertEquals(0, direct.pendingBytes)
+        assertEquals(start + 1, direct.finishedCount)
+        val completion = direct.pollCompleted().single()
+        assertSame(pending, completion.pending)
+        assertFalse(completion.succeeded)
+        assertNotNull(completion.error)
+        assertTrue(direct.pollCompleted().isEmpty(), "同じ予約の完了は 1 回だけ")
+        // 同期の write も、失敗を 1 回だけ返し、完了を残さない
+        org.junit.jupiter.api.assertThrows<java.io.IOException> { direct.write(pending.identity, p, bad) }
+        assertEquals(start + 2, direct.finishedCount)
+        assertTrue(direct.pollCompleted().isEmpty())
+        assertEquals(0, direct.pendingCount)
+        assertEquals(0, direct.pendingBytes)
     }
 
     @Test

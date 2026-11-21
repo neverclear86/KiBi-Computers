@@ -15,6 +15,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
@@ -1089,6 +1090,9 @@ public class MachineSaveStore @JvmOverloads constructor(
         outstanding.merge(id, 1, Int::plus)
         pendingTasks.incrementAndGet()
         pendingBytesCounter.addAndGet(bytes)
+        // 終わりの処理は 1 回だけ。[SaveExecutor.DIRECT] は仕事をその場で走らせるので、仕事が投げた例外が下の catch まで届き、
+        // 「断られた」として 2 回目の完了を積んでしまう（予約 1 つに完了 1 つを保つ。#852）
+        val settled = AtomicBoolean(false)
         val accepted = try {
             executor.execute(id) {
                 var done: Done? = null
@@ -1104,14 +1108,18 @@ public class MachineSaveStore @JvmOverloads constructor(
                     }
                     throw e
                 } finally {
-                    finishTask(id, bytes, done, blocksRestore, writesOwner)
+                    if (settled.compareAndSet(false, true)) finishTask(id, bytes, done, blocksRestore, writesOwner)
                 }
             }
         } catch (e: RuntimeException) {
+            if (settled.get()) {
+                LOG.log(System.Logger.Level.WARNING, "A save task of $id failed", e)
+                return
+            }
             LOG.log(System.Logger.Level.WARNING, "Failed to queue a save task of $id", e)
             false
         }
-        if (!accepted) finishTask(id, bytes, rejected(), blocksRestore, writesOwner)
+        if (!accepted && settled.compareAndSet(false, true)) finishTask(id, bytes, rejected(), blocksRestore, writesOwner)
     }
 
     private fun finishTask(id: UUID, bytes: Long, done: Done?, blocksRestore: Boolean, writesOwner: Boolean) {

@@ -1030,7 +1030,7 @@ internal class LoadRun(
     /** 段階に予約した書き込みの終わりを待った tick の数（[awaitPhaseSaves]） */
     private var saveWaitTicks = 0
 
-    /** 終わった書き込みが増えないまま待った tick の数（[awaitPhaseSaves]） */
+    /** 段階の書き込みの完了も、列から抜けた仕事も増えないまま待った tick の数（[awaitPhaseSaves]） */
     private var saveWaitIdleTicks = 0
 
     /**
@@ -2473,7 +2473,7 @@ internal class LoadRun(
         private const val UNLOAD_TIMEOUT_TICKS = 2_000
 
         /**
-         * 段階に予約した書き込みが終わるのを待つ間、終わった書き込みが1件も増えない tick の上限（#614・#854）。
+         * 段階に予約した書き込みが終わるのを待つ間、段階の書き込みの完了も、列から抜けた仕事（掃除なども。#852）も1件も増えない tick の上限（#614・#854）。
          * 1 tick あたり [SAVE_WAIT_STEP_MILLIS] まで待つので、壁時計では 120 秒以上になる（以前の壁時計の上限と同じ）
          */
         private const val SAVE_WAIT_IDLE_TICKS = 2_400
