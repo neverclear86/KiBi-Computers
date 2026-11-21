@@ -85,6 +85,20 @@ public class Claim(
 }
 
 /**
+ * 待ちにした claim の結果（[MachineSaveStore.pollDeferredClaims]。#869）。
+ *
+ * @property key [MachineSaveStore.claimOrDefer] に渡した鍵
+ * @property claim 確定した結果（索引にも入っている）
+ */
+@ApiStatus.Internal
+public class DeferredClaim(
+    public val key: Any,
+    public val claim: Claim,
+) {
+    override fun toString(): String = "DeferredClaim($key, $claim)"
+}
+
+/**
  * [MachineSaveStore.write] の結果。
  *
  * @property identity 書いた後の ID（世代は書いた世代）
