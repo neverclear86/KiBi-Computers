@@ -523,7 +523,7 @@ internal class ProductionAutosaveResult(
  * @property chunksTick ケース・画面・キーボードのあるチャンクが全部 FULL で読み込まれた tick
  * @property startedTick 戻るはずの台が全部、復元を始めた（か、残っていた）tick
  * @property doneTick 戻るはずの台が全部 [done] になった tick
- * @property doneSeconds [doneTick] までの壁時計の秒（届かなければ段階を打ち切るまで）
+ * @property doneSeconds 強制読み込みを戻し終えてから [doneTick] までの壁時計の秒（届かなければ段階を打ち切るまで）
  * @property timedOut [RESTORE_TIMEOUT_TICKS] で打ち切った
  * @property maxQueue 復元の順番待ちの列の長さの最大（毎 tick 数えた中で）
  * @property peakBootThreads `KiBi-boot-*` のスレッドの数の最大（毎 tick 数えた中で）。プールで次の仕事を待つスレッドも数えるので、
@@ -923,6 +923,12 @@ internal class LoadRun(
 
     /** 本番の形の自動保存（#834）: バニラの `ticksUntilAutosave`（反射で読み書きする。試験のコードの中だけ） */
     private val vanillaAutosave = if (settings.productionAutosave) VanillaAutosave(level.server) else null
+
+    /** [LoadPhase.RESTORE] の強制読み込みの時間だけ、サーバーの tick の予定をずらす（[TickSchedule]。#582） */
+    private val tickSchedule = if (settings.paced && settings.massRestore) TickSchedule(level.server) else null
+
+    /** この呼び出しで tick の予定をずらした時間（[onTick] の待ちで、試験の呼び出しの時間から引く） */
+    private var scheduleShiftNanos = 0L
     private var prevVanillaTicks = -1
     private var vanillaSaveTick = -1
 
@@ -1012,7 +1018,9 @@ internal class LoadRun(
             // 実際のサーバーと同じく、サーバーの次の tick の予定（getNextTickTime）までしか待たない。遅れていれば待たずに追いつく。
             // 1 tick の長さだけで待つと、重い tick（アンロードの書き込みなど）で遅れた分が戻らず、tick の残り時間（haveTime）が
             // ずっとなくなる。するとチャンクのアンロードの列が 2,000 件を超えるまで流れず、アンロードが進まない（#540）
-            val wait = minOf(TARGET_NANOS - work - prevHarness, level.server.nextTickTime - System.nanoTime())
+            // 予定をずらした分（RESTORE の強制読み込み）は、読み込みのスレッドで進んだものとして試験の呼び出しの時間から引く
+            val wait = minOf(TARGET_NANOS - work - (prevHarness - scheduleShiftNanos), level.server.nextTickTime - System.nanoTime())
+            scheduleShiftNanos = 0
             // 予定より先にいる（待てた）tick が続けば、遅れを取り戻している（settlePace）
             paceRun = if (wait > 0) paceRun + 1 else 0
             if (wait > 0) {
@@ -1245,7 +1253,7 @@ internal class LoadRun(
             )
         }
         paceSettled = true
-        // 待った時間は段階の秒に入れない（doneSeconds・finish の壁時計は、ここから数える）
+        // 待った時間は段階の秒に入れない（doneSeconds・finish の壁時計は、setUp が強制読み込みを戻し終えた時刻から数え直す）
         phaseStartNanos = System.nanoTime()
         return true
     }
@@ -1784,7 +1792,16 @@ internal class LoadRun(
                 for (chunk in unforcedOthers) level.setChunkForced(chunk.x, chunk.z, true)
                 unforcedOthers.clear()
                 forceChunks()
-                restoreForceMillis = (System.nanoTime() - t0) / 1e6
+                val forceNanos = System.nanoTime() - t0
+                restoreForceMillis = forceNanos / 1e6
+                // 試験の呼び出しの中で同期に読み込んだ分、サーバーは tick の予定から遅れる。そのままだと、追いつくまで tick が詰めて回り
+                // （前の回は強制読み込みの後の 20 tick が 0.45 s）、測る区間が 20 TPS にならない。読み込みの時間だけ予定をずらす（TickSchedule）
+                tickSchedule?.let {
+                    it.delay(forceNanos)
+                    scheduleShiftNanos = forceNanos
+                }
+                // doneSeconds・finish の壁時計は強制読み込みを戻し終えてから数える（読み込みの時間は forceMillis に別に出す）
+                phaseStartNanos = System.nanoTime()
                 recording = true
             }
         }
