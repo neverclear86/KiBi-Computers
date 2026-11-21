@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.persist
 
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.persist.snapshot.DeltaBaseCodec
+import pro.ikili.kibicomputers.core.persist.snapshot.InstanceStateCodec
 import java.io.ByteArrayOutputStream
 import java.io.DataInput
 import java.io.DataInputStream
@@ -261,6 +262,77 @@ public class MachineSnapshot @JvmOverloads constructor(
         @JvmStatic
         @Throws(IOException::class)
         public fun readModVersion(input: DataInput): String = readHeader(input).modVersion
+
+        /**
+         * `PROCESS_ABI` 節の p1 の層が参照するモジュールの元のハッシュ（32 バイト）を、節の順に [sink] に渡す（#564。モジュールの置き場の掃除）。
+         * ファイル全体を読まない: 外枠と節の頭を読み、`PROCESS_ABI` 以外の節は長さの分だけ読み飛ばし、`PROCESS_ABI` 節は先頭
+         * （pid・層・層の版・元のハッシュ）だけを読む。冷えた起動の写し・差分の世代も、ある節はそのまま数える（多めに残す側）。
+         * MOD のバージョンは見ない（戻したときのため。ADR 0088）。
+         *
+         * 今の読み手より甘くしない: `PROCESS_ABI` 節の版、p1 の層の版、層の ID（p1 とテスト用の 0 のほか）を知らなければ
+         * [SnapshotFormatException]（呼び出し側は、その回はモジュールを1つも消さない。#269 の層が増えたときもここで止まる）。
+         * magic・形式の版が違えば [IOException]、途中で切れていれば [SnapshotFormatException]
+         */
+        @JvmSynthetic
+        @Throws(IOException::class)
+        internal fun readModuleReferences(input: DataInput, sink: (ByteArray) -> Unit) {
+            readHeader(input)
+            while (true) {
+                val high = try {
+                    input.readUnsignedByte()
+                } catch (_: EOFException) {
+                    return
+                }
+                val (kind, sectionVersion, length) = truncatedAsFormat { readSectionHead(high, input) }
+                if (length > MAX_SECTION_BYTES) throw IOException("節 $kind の長さ $length が上限を超える")
+                if (kind != SnapshotSection.PROCESS_ABI) {
+                    truncatedAsFormat { skipFully(input, length) }
+                    continue
+                }
+                if (sectionVersion != SnapshotSection.PROCESS_ABI_VERSION) throw SnapshotFormatException("PROCESS_ABI 節の版 $sectionVersion")
+                if (length < ABI_HEAD_BYTES) throw SnapshotFormatException("PROCESS_ABI 節の長さ $length が短い")
+                truncatedAsFormat {
+                    input.readInt()
+                    val layer = input.readUnsignedShort()
+                    val layerVersion = input.readUnsignedShort()
+                    when (layer) {
+                        SnapshotSection.ABI_LAYER_P1 -> {
+                            if (layerVersion != InstanceStateCodec.VERSION_1 && layerVersion != InstanceStateCodec.VERSION_2) {
+                                throw SnapshotFormatException("p1 の層の版 $layerVersion を知らない")
+                            }
+                            if (length < ABI_HEAD_BYTES + MODULE_HASH_BYTES) throw SnapshotFormatException("p1 の層の長さ $length が短い")
+                            val hash = ByteArray(MODULE_HASH_BYTES)
+                            input.readFully(hash)
+                            sink(hash)
+                            skipFully(input, length - ABI_HEAD_BYTES - MODULE_HASH_BYTES)
+                        }
+                        SnapshotSection.ABI_LAYER_TEST -> skipFully(input, length - ABI_HEAD_BYTES)
+                        else -> throw SnapshotFormatException("ABI 層 $layer を知らない")
+                    }
+                }
+            }
+        }
+
+        /** `PROCESS_ABI` 節の頭（pid・層・層の版）のバイト数 */
+        private const val ABI_HEAD_BYTES = 8L
+
+        /** モジュールの元のハッシュ（SHA-256）のバイト数 */
+        private const val MODULE_HASH_BYTES = 32
+
+        /** [n] バイト読み飛ばす。途中で終われば [EOFException] */
+        private fun skipFully(input: DataInput, n: Long) {
+            var left = n
+            while (left > 0) {
+                val step = input.skipBytes(minOf(left, Int.MAX_VALUE.toLong()).toInt())
+                if (step > 0) {
+                    left -= step
+                } else {
+                    // skipBytes は終わりでなくても 0 を返しうるので、1 バイト読んで確かめる（終わりなら EOFException）
+                    input.readByte()
+                    left--
+                }
+            }
+        }
 
         private class Header(val modVersion: String, val id: UUID, val generation: Long)
 

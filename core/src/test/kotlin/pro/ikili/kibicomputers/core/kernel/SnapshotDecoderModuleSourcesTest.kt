@@ -91,6 +91,40 @@ class SnapshotDecoderModuleSourcesTest {
     }
 
     @Test
+    fun `掃除の参照の読み手は、本物の書き手が書いた写しから先読みと同じ元のハッシュを同じ順に読む`(): Unit = timeout(limit) {
+        // MachineSnapshot.readModuleReferences（#564。ファイル全体を読まない）は p1 の層の頭の形を自分で読む。
+        // P1SectionCodec.write が書く形（カーネルが取り出した写し）とずれたら、参照されているモジュールを消してしまうので、ここで確かめる
+        val c = capture()
+        val expected = SnapshotDecoder.moduleSources(c.snapshot, c.maxProcesses).map { it.originalHex }
+        assertEquals(2, expected.size)
+        assertEquals(expected, referencesRead(c.snapshot))
+        // 層の版 1 でも同じハッシュ（先頭 8 バイトの後ろの形は同じ）
+        val v1 = c.snapshot.withSections(
+            c.snapshot.sections.map { s ->
+                if (s.kind != SnapshotSection.PROCESS_ABI) {
+                    s
+                } else {
+                    val payload = s.payload
+                    payload[6] = 0
+                    payload[7] = 1
+                    SnapshotSection(s.kind, s.version, payload)
+                }
+            },
+        )
+        assertEquals(expected, referencesRead(v1))
+    }
+
+    private fun referencesRead(snapshot: MachineSnapshot): List<String> {
+        val bytes = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(bytes).use { snapshot.writeTo(it) }
+        val out = ArrayList<String>()
+        java.io.DataInputStream(bytes.toByteArray().inputStream()).use { input ->
+            MachineSnapshot.readModuleReferences(input) { out += it.joinToString("") { b -> "%02x".format(b.toInt() and 0xff) } }
+        }
+        return out
+    }
+
+    @Test
     fun `PROCESS_ABI節の版やp1の層の版が違えば、先読みも復号も断る`(): Unit = timeout(limit) {
         val c = capture()
         val others = c.snapshot.sections.filter { it.kind != SnapshotSection.PROCESS_ABI }
