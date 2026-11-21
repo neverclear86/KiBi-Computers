@@ -72,7 +72,7 @@ internal object FarChunks {
      * 見落とすので、`ServerMachines.findHolder` と同じく、見える表・更新中の表・アンロード待ちの表を引く（AT で読めるようにしたもの）。
      * まだ処理されていないチケットの変化は数えない
      */
-    private fun isTracked(level: ServerLevel, chunk: ChunkPos): Boolean {
+    fun isTracked(level: ServerLevel, chunk: ChunkPos): Boolean {
         val map = level.chunkSource.chunkMap
         val key = chunk.toLong()
         return map.getVisibleChunkIfPresent(key) != null ||
