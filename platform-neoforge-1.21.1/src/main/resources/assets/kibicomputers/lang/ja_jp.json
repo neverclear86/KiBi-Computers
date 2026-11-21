@@ -137,5 +137,9 @@
   "kibicomputers.configuration.access.requestTtlSeconds": "依頼の期限（秒）",
   "kibicomputers.configuration.access.requestTtlSeconds.tooltip": "コンピューターのプログラムが出した変更の依頼が、持ち主か OP の承認を待つ時間（秒）。過ぎたら取り消す。",
   "kibicomputers.configuration.access.maxRequestsPerComputer": "1台の依頼の上限",
-  "kibicomputers.configuration.access.maxRequestsPerComputer.tooltip": "1台のコンピューターの、承認を待っている変更の依頼の数の上限。"
+  "kibicomputers.configuration.access.maxRequestsPerComputer.tooltip": "1台のコンピューターの、承認を待っている変更の依頼の数の上限。",
+  "message.kibicomputers.saves.cleanup.started": "コンピューターの保存データの掃除を始めました（%s）",
+  "message.kibicomputers.saves.cleanup.busy": "コンピューターの保存データの掃除はもう動いているか、保存データの置き場がありません",
+  "message.kibicomputers.saves.cleanup.none": "このサーバーでは、まだコンピューターの保存データの掃除をしていません",
+  "message.kibicomputers.saves.cleanup.status": "コンピューターの保存データの掃除: %s（%s）"
 }
