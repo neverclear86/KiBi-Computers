@@ -233,6 +233,7 @@ object LoadGameTests {
     private fun measure(helper: GameTestHelper, os: LoadOs, count: Int) {
         val settings = LoadSettings(
             os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true,
+            massRestore = true,
             productionAutosave = System.getProperty(LoadSettings.PRODUCTION_AUTOSAVE_PROPERTY).toBoolean(),
             vanillaSaveOffset = LoadSettings.intProperty(LoadSettings.VANILLA_SAVE_OFFSET_PROPERTY),
             syntheticLogTicks = LoadSettings.intProperty(LoadSettings.SYNTHETIC_LOG_TICKS_PROPERTY),
