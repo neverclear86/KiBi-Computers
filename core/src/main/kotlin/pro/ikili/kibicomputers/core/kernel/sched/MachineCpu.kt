@@ -33,13 +33,19 @@ internal class MachineCpu(
     /** 予約したが、スレッドがまだ [acquire] で受け取っていない待ち手（渡した後のものも含む） */
     private val reserved = HashMap<ProcessRuntime, Node>()
 
+    /**
+     * [acquire] の中で待っているスレッドと、その待ち手（#828）。[acquire] を正しく抜けるときに外す。
+     * 待ちの途中（`await` の中など）でスタックが尽きて抜けると残るので、[abandonWaiter] で見つけて外す
+     */
+    private val threadWaiters = HashMap<Thread, Node>()
+
     /** 今のスレッドが中のロックを持っている数（#828。step の入口と出口を比べ、スタックが尽きてロックが残ったのを見つける） */
     val lockHoldCount: Int get() = lock.holdCount
 
     /** 残った中のロックを 1 つ放す（#828。[lockHoldCount] が入口より多いときに、浅いところで呼ぶ） */
     fun unlockLeaked() = lock.unlock()
 
-    /** 今の持ち主（テスト用） */
+    /** 今の持ち主（テストと、`ProcessRunner` の安全網が、終わったプロセスが CPU を持ったままかを見るのに使う。#828） */
     val currentOwner: ProcessRuntime? get() = lock.withLockValue { owner }
 
     /** 待っている数（スライスを使い切ったときに、譲るかを決めるのに使う。#47） */
@@ -53,20 +59,30 @@ internal class MachineCpu(
     fun acquire(rt: ProcessRuntime) {
         lock.lockInterruptibly()
         try {
-            val node = reserved.remove(rt) ?: run {
+            val thread = Thread.currentThread()
+            // 予約は、待ち手として控えてから外す（間で尽きても、[abandonWaiter] が予約ごと外せる）
+            val node = reserved[rt]?.also {
+                threadWaiters[thread] = it
+                reserved.remove(rt)
+            } ?: run {
                 if (owner == null && queue.isEmpty()) {
                     owner = rt
                     return
                 }
-                Node(rt, lock.newCondition()).also { queue.addLast(it) }
+                Node(rt, lock.newCondition()).also {
+                    threadWaiters[thread] = it
+                    queue.addLast(it)
+                }
             }
             try {
                 while (!node.granted) node.condition!!.await()
             } catch (e: InterruptedException) {
+                threadWaiters.remove(thread)
                 // 渡された直後に割り込まれたら、次へ渡し直す
                 if (node.granted) handOffLocked() else queue.remove(node)
                 throw e
             }
+            threadWaiters.remove(thread)
         } finally {
             lock.unlock()
         }
@@ -117,6 +133,48 @@ internal class MachineCpu(
             }
         } finally {
             lock.unlock()
+        }
+    }
+
+    /**
+     * [thread] が [acquire] の待ちの途中で抜けて（スタックが尽きたなど）残した待ち手を外す（#828。`ProcessRunner` の安全網が、
+     * そのスレッドが [acquire] の外にいる浅いところで呼ぶ）。
+     *
+     * まだ渡されていなければ、待ち行列（と予約）から外す（残すと、後で返された CPU が、起こす相手のいない待ち手に渡って台が止まる）。
+     * もう渡されていれば、外すのは控えだけで、CPU は持ち主のまま残す（受け取る者がいないので、呼んだ側が [release] で次へ渡す。
+     * 渡すのを呼んだ側に任せるのは、マシンを止めるときに、止めた後で渡すため）
+     */
+    fun abandonWaiter(thread: Thread): AbandonedWaiter {
+        lock.lock()
+        try {
+            val node = threadWaiters.remove(thread) ?: return AbandonedWaiter.NONE
+            if (reserved[node.rt] === node) reserved.remove(node.rt)
+            if (node.granted) return AbandonedWaiter.GRANTED
+            queue.remove(node)
+            return AbandonedWaiter.WAITING
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** [abandonWaiter] が見つけた待ち手 */
+    enum class AbandonedWaiter {
+        /** 残っていない */
+        NONE,
+
+        /** 渡される前の待ち手だった（外した） */
+        WAITING,
+
+        /** もう渡されていた（CPU は、その待ち手のプロセスが持ち主のまま） */
+        GRANTED,
+    }
+
+    /** [thread] が [acquire] で待っている途中だったまねをする（テスト用。#828。渡されていない待ち手を残す） */
+    fun leaveWaiterForTest(rt: ProcessRuntime, thread: Thread) {
+        lock.withLockValue {
+            val node = Node(rt, lock.newCondition())
+            threadWaiters[thread] = node
+            queue.addLast(node)
         }
     }
 

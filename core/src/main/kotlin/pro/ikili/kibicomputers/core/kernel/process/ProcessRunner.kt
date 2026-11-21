@@ -44,6 +44,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
+import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
@@ -171,53 +172,76 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /**
      * 安全網（#828）: step・専用スレッドの終わり（スタックが空いた浅いところ）で、入口より多くカーネルのロック（マシンのロック・CPU・許可の
-     * 中のロック）を持ったままでないか、終わったプロセスが CPU を持ったままでないかを確かめる。
+     * 中のロック）を持ったままでないか、終わったプロセスが CPU を持ったままでないか、CPU・許可の待ちの途中で抜けて待ち手を残していないかを確かめる。
      *
-     * どれも、ゲストの深い再帰でスタックがロックの途中で尽きたときにだけ起きうる（ふつうは入口の余裕の確かめ [StackHeadroom] で防ぐ）。
-     * 見つけたら、ロックを入口の保持数まで放し、CPU を返してから、マシンの不整合としてマシンを CRASHED にする
-     * （ロックの中の状態が途中までしか変わっていない恐れがあるため。サーバーの tick がそのマシンのロックで止まるよりよい）。
-     * 許可の中のロックはサーバー全体のものなので、放してログに出すだけにする
+     * どれも、ゲストの深い再帰でスタックがロックや待ちの途中で尽きたときにだけ起きうる（ふつうは入口の余裕の確かめ [StackHeadroom] で防ぐ）。
+     *
+     * - マシンのロック・CPU の中のロックが残った、終わったプロセスが CPU を持ったまま: マシンの不整合としてマシンを CRASHED にする
+     *   （ロックの中の状態が途中までしか変わっていない恐れがあるため。サーバーの tick がそのマシンのロックで止まるよりよい）。
+     *   マシンのロックは、このスレッドが持ったまま（再入して）CRASHED にしてから放し、CPU も CRASHED にした後で返す。
+     *   放してから CRASHED にするまでの間に、tick・保存の写し・同じ台のほかのプロセスが、途中までしか変わっていない状態に入らないように
+     * - 許可の中のロックだけが残った: サーバー全体のものなので、放してログに出すだけにする
+     * - CPU・許可の待ち手が残った（`MachineCpu.abandonWaiter`・`PermitPool.abandonWaiter`）: 外してログに出す。待ちの途中では、
+     *   カーネルの状態を変えていないので、マシンは止めない。待ち手が抜けた後に渡されていた CPU・許可は、受け取る者がいないので次へ渡す
+     *
+     * ロックの順番（CPU → 許可 → カーネルロック。CPU・許可の中のロックは末端）を守るため、末端のロックは先に放す。
+     * ログはロックの外で出す
      */
     private fun recoverLeaks(rt: ProcessRuntime, held: HeldLocks) {
+        val thread = Thread.currentThread()
         val machineLeak = lock.holdCount - held.machine
         val cpuLeak = machine.cpu.lockHoldCount - held.cpu
         val permitLeak = scheduler.permits.lockHoldCount - held.permits
         repeat(maxOf(0, permitLeak)) { scheduler.permits.unlockLeaked() }
         repeat(maxOf(0, cpuLeak)) { machine.cpu.unlockLeaked() }
-        repeat(maxOf(0, machineLeak)) { lock.unlock() }
-        val cpuOwned = held.machine == 0 && finishedHoldingCpu(rt)
-        if (machineLeak <= 0 && cpuLeak <= 0 && permitLeak <= 0 && !cpuOwned) return
-        val message = "プロセス ${rt.pid} のスレッドが、終わりにカーネルのロックを持ったままだった" +
-            "（マシン $machineLeak、CPU $cpuLeak、許可 $permitLeak、CPU の持ち主のまま $cpuOwned。原因: ${rt.lastError}）"
-        LOG.log(System.Logger.Level.ERROR, message, rt.lastError)
-        if (cpuOwned) {
-            try {
-                machine.cpu.release(rt)
-            } catch (e: IllegalStateException) {
-                LOG.log(System.Logger.Level.ERROR, "取り残された CPU を返せない（pid ${rt.pid}）", e)
+        // 終わっていないプロセスで何も残っていなければ、ロックを足さずに抜ける（ふつうの step の終わり）。
+        // 待ちの途中で尽きたプロセスは、例外で終わっている（exceptionExit）ので、待ち手を探すのは終わったプロセスだけでよい
+        val terminal = rt.process.state.isTerminal
+        if (machineLeak <= 0 && cpuLeak <= 0 && permitLeak <= 0 && !terminal) return
+        val cpuWaiter = if (terminal) machine.cpu.abandonWaiter(thread) else MachineCpu.AbandonedWaiter.NONE
+        val permitWaiter = terminal && scheduler.permits.abandonWaiter(thread)
+        val message: String
+        var releaseFailure: IllegalStateException? = null
+        lock.lock()
+        try {
+            // 残ったマシンのロックは、今取った 1 つを残して放す（CRASHED にするまで、ほかのスレッドを入れない）
+            repeat(maxOf(0, machineLeak)) { lock.unlock() }
+            // 待ちの途中で抜けた後に渡された CPU（受け取る者がいない）。カーネルの状態は変えていないので、渡し直すだけにする
+            val strandedCpu = cpuWaiter == MachineCpu.AbandonedWaiter.GRANTED && machine.cpu.currentOwner === rt
+            val cpuOwned = !strandedCpu && held.machine == 0 && finishedHoldingCpuLocked(rt, thread)
+            val crash = machineLeak > 0 || cpuLeak > 0 || cpuOwned
+            if (!crash && permitLeak <= 0 && cpuWaiter == MachineCpu.AbandonedWaiter.NONE && !permitWaiter) return
+            message = "プロセス ${rt.pid} のスレッドが、終わりにカーネルのロックか待ち手を残していた" +
+                "（マシン $machineLeak、CPU $cpuLeak、許可 $permitLeak、CPU の持ち主のまま $cpuOwned、" +
+                "CPU の待ち手 $cpuWaiter、許可の待ち手 $permitWaiter。原因: ${rt.lastError}）"
+            if (crash) machine.inconsistencyLocked(message)
+            // CRASHED にした後で返す（次の持ち主は、カーネルロックを取ったところで止められたのを見る）
+            if (cpuOwned || strandedCpu) {
+                try {
+                    machine.cpu.release(rt)
+                } catch (e: IllegalStateException) {
+                    releaseFailure = e
+                }
             }
+        } finally {
+            lock.unlock()
         }
-        if (machineLeak > 0 || cpuLeak > 0 || cpuOwned) {
-            lock.withLockValue { machine.inconsistencyLocked(message) }
-        }
+        LOG.log(System.Logger.Level.ERROR, message, rt.lastError)
+        releaseFailure?.let { LOG.log(System.Logger.Level.ERROR, "取り残された CPU を返せない（pid ${rt.pid}）", it) }
     }
 
     /**
-     * 終わったプロセスが、このスレッドの step のものとして CPU を持ったままか（[recoverLeaks]。終わったプロセスは CPU を持たない）。
+     * 終わったプロセスが、このスレッド [thread] の step のものとして CPU を持ったままか（[recoverLeaks]。終わったプロセスは CPU を持たない）。
+     * カーネルロックの中で呼ぶ（終わったかどうかと持ち主を、そろえて読む）。
      *
      * 待機点型は、このスレッドが登録を外した後（`rt.thread = null`）に、同じ `rt` の次の step が別のワーカーで始まり、
      * `exit`・`exceptionExit` で終えた（`finishLocked`）後、CPU を返す前までの間がある。そこでは「終わったプロセスが CPU の持ち主」は
      * 正しい状態なので、持ち主かどうかだけでは見分けられない。次の step のスレッドは `rt.thread` に登録されている
-     * （登録を外すのは CPU を返した後）ので、`rt.thread` が別のスレッドなら、このスレッドの漏れではない。
-     * 終わっていないプロセスは、ロックを取らずに先に外す（ふつうの step の終わりに、ロックを足さない）。
-     * 終わったかどうかと持ち主は、カーネルロックの中でそろえて読む
+     * （登録を外すのは CPU を返した後）ので、`rt.thread` が別のスレッドなら、このスレッドの漏れではない
      */
-    private fun finishedHoldingCpu(rt: ProcessRuntime): Boolean {
-        if (!rt.process.state.isTerminal) return false
-        return lock.withLockValue {
-            val thread = rt.thread
-            rt.process.state.isTerminal && (thread == null || thread === Thread.currentThread()) && machine.cpu.currentOwner === rt
-        }
+    private fun finishedHoldingCpuLocked(rt: ProcessRuntime, thread: Thread): Boolean {
+        val current = rt.thread
+        return rt.process.state.isTerminal && (current == null || current === thread) && machine.cpu.currentOwner === rt
     }
 
     private fun step(rt: ProcessRuntime) {

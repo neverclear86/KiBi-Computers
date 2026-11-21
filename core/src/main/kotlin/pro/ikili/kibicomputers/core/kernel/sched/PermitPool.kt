@@ -25,6 +25,12 @@ internal class PermitPool(permits: Int, private val workers: WorkerPool) {
     private val queue = ArrayDeque<Node>()
     private var available = permits
 
+    /**
+     * [acquire] の中で待っているスレッドと、その待ち手（#828）。[acquire] を正しく抜けるときに外す。
+     * 待ちの途中（`await` の中など）でスタックが尽きて抜けると残るので、[abandonWaiter] で見つけて外す
+     */
+    private val threadWaiters = HashMap<Thread, Node>()
+
     /** 今のスレッドが中のロックを持っている数（#828。step の入口と出口を比べ、スタックが尽きてロックが残ったのを見つける） */
     val lockHoldCount: Int get() = lock.holdCount
 
@@ -47,18 +53,57 @@ internal class PermitPool(permits: Int, private val workers: WorkerPool) {
                 available--
                 return
             }
+            val thread = Thread.currentThread()
             val node = Node(null, null, lock.newCondition())
+            threadWaiters[thread] = node
             queue.addLast(node)
             try {
                 while (!node.granted) node.condition!!.await()
             } catch (e: InterruptedException) {
+                threadWaiters.remove(thread)
                 // 渡された直後に割り込まれたら、次へ渡し直す
                 if (node.granted) dispatch = handOffLocked(inline = false) else queue.remove(node)
                 throw e
             }
+            threadWaiters.remove(thread)
         } finally {
             lock.unlock()
             dispatch?.let { workers.execute(it) }
+        }
+    }
+
+    /**
+     * [thread] が [acquire] の待ちの途中で抜けて（スタックが尽きたなど）残した待ち手を外す（#828。`ProcessRunner` の安全網が、
+     * そのスレッドが [acquire] の外にいる浅いところで呼ぶ）。残っていたら `true`。
+     *
+     * まだ渡されていなければ、待ち行列から外す（残すと、後で返された許可が、起こす相手のいない待ち手に渡って、サーバー全体の許可が
+     * 1 つ減ったままになる）。もう渡されていれば、受け取る者のいない許可なので、次の待ち手へ渡す
+     */
+    fun abandonWaiter(thread: Thread): Boolean {
+        var dispatch: Runnable? = null
+        lock.lock()
+        try {
+            val node = threadWaiters.remove(thread) ?: return false
+            if (node.granted) dispatch = handOffLocked(inline = false) else queue.remove(node)
+            return true
+        } finally {
+            lock.unlock()
+            dispatch?.let { workers.execute(it) }
+        }
+    }
+
+    /** [thread] が [acquire] で待っている途中だったまねをする（テスト用。#828）。[granted] なら、許可を 1 つ渡し終えた待ち手にする */
+    fun leaveWaiterForTest(thread: Thread, granted: Boolean) {
+        lock.withLockValue {
+            val node = Node(null, null, lock.newCondition())
+            threadWaiters[thread] = node
+            if (granted) {
+                check(available > 0) { "空いている許可がない" }
+                available--
+                node.granted = true
+            } else {
+                queue.addLast(node)
+            }
         }
     }
 

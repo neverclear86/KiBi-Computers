@@ -17,10 +17,14 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
 import pro.ikili.kibicomputers.core.runtime.FakeModule
+import pro.ikili.kibicomputers.core.runtime.FakeInstance
+import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
@@ -39,7 +43,23 @@ class StackExhaustionLockTest {
     private val limit = Duration.ofSeconds(120)
 
     /** 1 段ごとの呼び方 */
-    private enum class Pattern { HOST_EVERY_FRAME, FUEL_EVERY_FRAME, MIXED }
+    private enum class Pattern {
+        HOST_EVERY_FRAME,
+        FUEL_EVERY_FRAME,
+        MIXED,
+
+        /**
+         * 再帰を `callGuest` の中で動かし、1 段ごとに止まりうる関数の中の燃料切れ（`onFuelExhaustedUnwindable`）とホストの関数を交互に呼ぶ。
+         * ホストの関数の中から呼んだゲストの中は巻き戻せないので、`onFuelExhaustedUnwindable` → `onFuelExhausted`（スレッドを持ったまま待つ）の道を通る
+         */
+        UNWINDABLE_FUEL_IN_GUEST_CALL,
+
+        /**
+         * ホストの関数の再入: 1 段ごとにホストの関数 `g` を呼び、`g` の本体が `callGuest` の中でゲスト役の次の段を呼ぶ
+         * （ホスト → ゲスト → ホスト …と入れ子で深くなる）。3 段に 1 回、燃料切れの処理も呼ぶ
+         */
+        NESTED_HOST,
+    }
 
     /**
      * ホストの関数の本体がすること。包みの確かめ（[StackHeadroom.HOST_CALL_FRAMES]）が足りるかは、本体の奥でロックを取る道
@@ -52,14 +72,30 @@ class StackExhaustionLockTest {
         /** 完了済みの future を待つ（`awaitHost`。`releasePermitAndCpu` → `acquireCpu` → CPU・許可の取り直し。ブロッキング型だけ） */
         AWAIT_HOST,
 
+        /**
+         * まだ読めないストリームを `block` で待つ（`releasePermitAndCpu` → 条件変数の待ち → `acquireCpu` の `precheck`。ブロッキング型だけ）。
+         * テストのスレッドが、待ちに入ったのを見て 1 バイト書いて起こし、本体は読んでから戻る
+         */
+        BLOCK,
+
         /** カーネルロックの中で VFS を引く（`withKernelLock` → `Vfs.stat`） */
         KERNEL_VFS,
     }
 
-    private fun runBody(ctx: ProcessContext, body: Body) {
+    /** 1 回分の深い再帰で、ホストの関数の本体が使うもの */
+    private class Round(val stream: ByteStream?) {
+        val context = AtomicReference<ProcessContext>()
+    }
+
+    private fun runBody(ctx: ProcessContext, body: Body, round: Round) {
         when (body) {
             Body.EMPTY -> Unit
             Body.AWAIT_HOST -> ctx.awaitHost(CompletableFuture.completedFuture(Unit))
+            Body.BLOCK -> {
+                val stream = round.stream!!
+                ctx.block(listOf(WaitKey(stream.id, WaitCondition.READABLE)))
+                ctx.withKernelLock { stream.read(ByteArray(1), 0, 1, ctx.wakeSink) }
+            }
             Body.KERNEL_VFS -> ctx.withKernelLock { ctx.vfs.stat(VfsPath.parse("/")) }
         }
     }
@@ -79,23 +115,45 @@ class StackExhaustionLockTest {
             Pattern.HOST_EVERY_FRAME -> ctx.callImport("env", "h")
             Pattern.FUEL_EVERY_FRAME -> ctx.callFuelHandler(0)
             Pattern.MIXED -> if (n % 3 == 0) ctx.callFuelHandler(0) else ctx.callImport("env", "h")
+            Pattern.UNWINDABLE_FUEL_IN_GUEST_CALL -> if (n % 2 == 0) ctx.callUnwindableFuelHandler(0) else ctx.callImport("env", "h")
+            Pattern.NESTED_HOST -> {
+                if (n % 3 == 0) ctx.callFuelHandler(0)
+                // 戻らない（`g` の本体が、callGuest の中で次の段を呼び続ける）
+                ctx.callImport("env", "g", n.toLong())
+            }
         }
         return recurse(ctx, pattern, n + 1) + n
     }
 
-    private fun victim(pattern: Pattern, pad: Int): FakeModule = FakeModule.builder()
+    private val i64ToVoid = WasmFunctionType(listOf(WasmValueType.I64), emptyList())
+
+    private fun victim(pattern: Pattern, pad: Int, round: Round): FakeModule = FakeModule.builder()
         .fuelMetered()
         .import("env", "h", VOID)
+        .import("env", "g", i64ToVoid)
         .export("run", VOID) { ctx, _ ->
-            padThen(pad) { recurse(ctx, pattern, 0) }
+            if (pattern == Pattern.UNWINDABLE_FUEL_IN_GUEST_CALL) {
+                round.context.get().callGuest { padThen(pad) { recurse(ctx, pattern, 0) } }
+            } else {
+                padThen(pad) { recurse(ctx, pattern, 0) }
+            }
             LongArray(0)
         }
         .build()
 
-    private fun sweep(kind: ProcessKind, rounds: Int, body: Body = Body.EMPTY) = timeout(limit) {
+    private val basePatterns = listOf(Pattern.HOST_EVERY_FRAME, Pattern.FUEL_EVERY_FRAME, Pattern.MIXED)
+
+    private fun sweep(
+        kind: ProcessKind,
+        rounds: Int,
+        body: Body = Body.EMPTY,
+        patterns: List<Pattern> = basePatterns,
+    ) = timeout(limit) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         val h = Harness(config)
         val tally = Tally()
+        val stopWaker = AtomicBoolean(false)
+        var waker: Thread? = null
         try {
             val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 10_000)
             val other = h.machine(fuelPerTick = 50_000_000, fuelSlice = 10_000)
@@ -105,14 +163,54 @@ class StackExhaustionLockTest {
             other.spawnTest(h.program(spinForever(otherProgress)), runDriver(kind))
             h.tickUntilTrue("spin が動かない") { sameProgress.get() > 0 && otherProgress.get() > 0 }
             val permits = config.maxConcurrentMachines
-            val patterns = Pattern.values()
+            // Body.BLOCK: 犠牲のプロセスが block で待ちに入ったら、1 バイト書いて起こす
+            val current = AtomicReference<Pair<ProcessRuntime, ByteStream>?>()
+            if (body == Body.BLOCK) {
+                waker = Thread {
+                    while (!stopWaker.get()) {
+                        val target = current.get()
+                        if (target != null) {
+                            val (rt, stream) = target
+                            m.lock.withLockValue {
+                                if (rt.process.state == ProcessState.WAITING_EVENT && stream.available == 0) {
+                                    stream.write(ByteArray(1), 0, 1, m.wakeSink)
+                                }
+                            }
+                        }
+                        Thread.onSpinWait()
+                    }
+                }.apply {
+                    isDaemon = true
+                    start()
+                }
+            }
             for (i in 0 until rounds) {
                 val pattern = patterns[i % patterns.size]
                 // 尽きる位置を 1 段ずつずらす（詰め物の段数を変える）
                 val pad = (i / patterns.size * 7) % 97
-                val driver = runDriver(kind) { ctx, b -> b.host(ctx) { c, _, _ -> runBody(c, body).let { LongArray(0) } } }
-                val rt = m.spawnRt(h.program(victim(pattern, pad)), driver)
-                h.tickUntilTrue("深い再帰が終わらない（$i 回目、$pattern、pad $pad）") { rt.process.state.isTerminal || m.state == MachineState.CRASHED }
+                val stream = if (body == Body.BLOCK) m.lock.withLockValue { ByteStream(1).also { m.kernel.objects.add(it) } } else null
+                val round = Round(stream)
+                val driver = runDriver(kind) { ctx, b ->
+                    round.context.set(ctx)
+                    b.host(ctx) { c, _, _ -> runBody(c, body, round).let { LongArray(0) } }
+                    // NESTED_HOST: ゲスト役の次の段を、ホストの関数の中から callGuest で呼ぶ
+                    b.hostFunction(
+                        "env",
+                        "g",
+                        i64ToVoid,
+                        ctx.hostFunction { c, caller, args ->
+                            c.callGuest { recurse(FakeContext(caller as FakeInstance), pattern, args[0].toInt() + 1) }
+                            LongArray(0)
+                        },
+                    )
+                }
+                val rt = m.spawnRt(h.program(victim(pattern, pad, round)), driver)
+                if (stream != null) current.set(rt to stream)
+                eventuallyDescribe(10_000, { "深い再帰が終わらない（$i 回目、$pattern、pad $pad）: ${state(h, m, rt)}" }) {
+                    h.scheduler.tick()
+                    rt.process.state.isTerminal || m.state == MachineState.CRASHED
+                }
+                current.set(null)
                 assertEquals(MachineState.RUNNING, m.state, "マシンが壊れた（$i 回目）: ${rt.lastError}")
                 assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
                 assertEquals("call stack exhausted", crashReason(rt.lastError!!), "${rt.lastError}")
@@ -138,7 +236,9 @@ class StackExhaustionLockTest {
             assertEquals(0, h.scheduler.permits.waiting)
             assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
         } finally {
-            println("#828 $kind $body: CRASHED ${tally.crashed.get()} 回、尽きた位置がロックの中 ${tally.inLocks.get()} 回、入口の確かめ ${tally.inProbe.get()} 回")
+            stopWaker.set(true)
+            waker?.join(5_000)
+            println("#828 $kind $body $patterns: CRASHED ${tally.crashed.get()} 回、尽きた位置がロックの中 ${tally.inLocks.get()} 回、入口の確かめ ${tally.inProbe.get()} 回")
             h.close()
         }
         // 尽きた位置が JDK のロックの中だったことはない（入口の余裕の確かめが、ロックを取る前に止める）
@@ -171,6 +271,22 @@ class StackExhaustionLockTest {
     @Test
     fun `BLOCKINGでホストの関数の本体がawaitHostでCPUと許可を取り直しても、尽きる位置がロックの中にならない`() =
         sweep(ProcessKind.BLOCKING, rounds = 120, body = Body.AWAIT_HOST)
+
+    @Test
+    fun `BLOCKINGでホストの関数の本体がblockで待ってCPUと許可を取り直しても、尽きる位置がロックの中にならない`() =
+        sweep(ProcessKind.BLOCKING, rounds = 60, body = Body.BLOCK)
+
+    @Test
+    fun `BLOCKINGで止まりうる関数の燃料切れの口とホストの関数の再入で深くなっても、ロック・CPU・許可は壊れない`() =
+        sweep(ProcessKind.BLOCKING, rounds = 80, patterns = listOf(Pattern.UNWINDABLE_FUEL_IN_GUEST_CALL, Pattern.NESTED_HOST))
+
+    @Test
+    fun `WAIT_POINTで止まりうる関数の燃料切れの口とホストの関数の再入で深くなっても、ロック・CPU・許可は壊れない`() =
+        sweep(ProcessKind.WAIT_POINT, rounds = 80, patterns = listOf(Pattern.UNWINDABLE_FUEL_IN_GUEST_CALL, Pattern.NESTED_HOST))
+
+    @Test
+    fun `WAIT_POINTでホストの関数の再入の本体がカーネルロックの中でVFSを引いても、尽きる位置がロックの中にならない`() =
+        sweep(ProcessKind.WAIT_POINT, rounds = 60, body = Body.KERNEL_VFS, patterns = listOf(Pattern.NESTED_HOST))
 
     @Test
     fun `BLOCKINGでホストの関数の本体がカーネルロックの中でVFSを引いても、尽きる位置がロックの中にならない`() =
@@ -296,6 +412,95 @@ class StackExhaustionLockTest {
     @Test
     fun `WAIT_POINTで許可の中のロックだけを持ったまま終わると、放すだけでマシンはCRASHEDにしない`() =
         safetyNet(ProcessKind.WAIT_POINT, crashed = false) { m, _ -> innerLock(m.scheduler.permits).lock() }
+
+    /**
+     * CPU の待ちの途中で抜けた（`MachineCpu.acquire` の `await` の中でスタックが尽きたなど）まね: まだ渡されていない待ち手を、step の
+     * スレッドのものとして残す。step の中で残すと、プロセスが終わって CPU を返したときに、その待ち手に渡る（受け取る者のいない CPU）。
+     * 安全網は、その CPU を次へ渡す。待ちの途中ではカーネルの状態を変えていないので、マシンは CRASHED にしない
+     */
+    @Test
+    fun `BLOCKINGでCPUの待ち手を残して終わり、その待ち手にCPUが渡っても、次へ渡してマシンは動き続ける`() =
+        safetyNet(ProcessKind.BLOCKING, crashed = false) { m, rt -> m.cpu.leaveWaiterForTest(rt, Thread.currentThread()) }
+
+    @Test
+    fun `WAIT_POINTでCPUの待ち手を残して終わり、その待ち手にCPUが渡っても、次へ渡してマシンは動き続ける`() =
+        safetyNet(ProcessKind.WAIT_POINT, crashed = false) { m, rt -> m.cpu.leaveWaiterForTest(rt, Thread.currentThread()) }
+
+    /**
+     * 渡されないまま残った CPU の待ち手（CPU を返し終えた後、安全網の前に残すまね。`afterUnregister`）。安全網が外さなければ、
+     * 持ち主のいない CPU の待ち行列の先頭に残り、後から来たプロセスが CPU を受け取れない（続きのプロセスが終わらない）
+     */
+    private fun waitingCpuWaiter(kind: ProcessKind) =
+        safetyNet(kind, crashed = false) { m, rt ->
+            m.scheduler.hooks.afterUnregister = { mm, _ ->
+                if (mm === m) {
+                    m.scheduler.hooks.afterUnregister = null
+                    m.cpu.leaveWaiterForTest(rt, Thread.currentThread())
+                }
+            }
+        }
+
+    @Test
+    fun `BLOCKINGで渡されていないCPUの待ち手を残して終わると、外してマシンは動き続ける`() = waitingCpuWaiter(ProcessKind.BLOCKING)
+
+    @Test
+    fun `WAIT_POINTで渡されていないCPUの待ち手を残して終わると、外してマシンは動き続ける`() = waitingCpuWaiter(ProcessKind.WAIT_POINT)
+
+    /** 許可の待ちの途中で抜けたまね（渡されていない待ち手）。外すので、後で返された許可が待ち手に渡って減ったままにならない */
+    @Test
+    fun `BLOCKINGで許可の待ち手を残して終わると、外して許可が減らない`() =
+        safetyNet(ProcessKind.BLOCKING, crashed = false) { m, _ -> m.scheduler.permits.leaveWaiterForTest(Thread.currentThread(), granted = false) }
+
+    @Test
+    fun `WAIT_POINTで許可の待ち手を残して終わると、外して許可が減らない`() =
+        safetyNet(ProcessKind.WAIT_POINT, crashed = false) { m, _ -> m.scheduler.permits.leaveWaiterForTest(Thread.currentThread(), granted = false) }
+
+    /** 許可を渡された後、`acquire` から戻る前に抜けたまね。受け取る者のいない許可を返す */
+    @Test
+    fun `WAIT_POINTで渡された許可の待ち手を残して終わると、許可を返す`() =
+        safetyNet(ProcessKind.WAIT_POINT, crashed = false) { m, _ -> m.scheduler.permits.leaveWaiterForTest(Thread.currentThread(), granted = true) }
+
+    /**
+     * 安全網は、マシンのロックを持ったまま（再入して）マシンを CRASHED にしてから放す。放してから CRASHED にするまでの間に、
+     * ほかのスレッドがマシンのロックを取って、途中までしか変わっていないかもしれない状態に入らない（#828 のレビュー）。
+     * ロックを持ったまま step を終え、テストのスレッドはそのロックを待つ。取れたときには、もう CRASHED になっている
+     */
+    private fun crashedBeforeLockIsReleased(kind: ProcessKind) = timeout(Duration.ofSeconds(30)) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            val stepDone = CountDownLatch(1)
+            val leaker = TestDriver(kind) { _ ->
+                m.lock.lock()
+                stepDone.countDown()
+                // テストのスレッドがロックを待ち始めるまで、持ったまま
+                eventually(10_000, "テストのスレッドがロックを待たない") { m.lock.hasQueuedThreads() }
+                StepResult.Exit(0)
+            }
+            m.spawnTest(h.program(emptyModule()), leaker)
+            // step がロックを取ったら tick しない（テストのスレッドだけが、ロックを待つようにする）
+            eventually(10_000, "step が始まらない") {
+                stepDone.count == 0L || run {
+                    h.scheduler.tick()
+                    false
+                }
+            }
+            assertTrue(m.lock.tryLock(10, TimeUnit.SECONDS), "マシンのロックが放されていない: ${m.lock}")
+            val observed = try {
+                m.state
+            } finally {
+                m.lock.unlock()
+            }
+            assertEquals(MachineState.CRASHED, observed, "ロックが取れたときに、まだ CRASHED になっていない")
+        }
+    }
+
+    @Test
+    fun `BLOCKINGでマシンのロックを持ったまま終わると、ほかのスレッドがロックを取る前にCRASHEDにする`() =
+        crashedBeforeLockIsReleased(ProcessKind.BLOCKING)
+
+    @Test
+    fun `WAIT_POINTでマシンのロックを持ったまま終わると、ほかのスレッドがロックを取る前にCRASHEDにする`() =
+        crashedBeforeLockIsReleased(ProcessKind.WAIT_POINT)
 
     /**
      * 誤検知しない: 同じプロセスの次の step が別のワーカーで終わった（`finishLocked` の後・CPU を返す前）間に、前の step のワーカーが
