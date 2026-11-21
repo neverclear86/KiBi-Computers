@@ -181,6 +181,26 @@ public class MachineConfig private constructor(builder: Builder) {
      */
     public val maxDevices: Int = builder.maxDevices
 
+    /** [fuelSlice] の今の値（接続層の負荷試験が結果に書く。#740） */
+    public val fuelSliceValue: Long get() = fuelSlice
+
+    /**
+     * スライスだけを [value] に変えた設定（測定・テスト用。#740）。負荷試験が、スライスを `fuelPerTick` にして（1 tick に1回渡す）
+     * #47 の前と受け渡しの回数を比べるのに使う。[fuelPerTick] を超えた分は切り詰める。ゲームの設定の口ではない（スライスの値は #251）
+     */
+    public fun withFuelSlice(value: Long): MachineConfig {
+        val b = Builder()
+        b.fuelPerTick = fuelPerTick
+        b.fuelSlice(value)
+        b.maxProcesses = maxProcesses
+        b.maxBlockingProcesses = maxBlockingProcesses
+        b.maxHostCallsPerTick = maxHostCallsPerTick
+        b.memoryBytes = memoryBytes
+        b.maxProcessMemoryBytes = maxProcessMemoryBytes
+        b.maxDevices = maxDevices
+        return b.build()
+    }
+
     /** RAM のページ数 */
     internal val memoryPages: Int get() = pagesOf(memoryBytes)
 
@@ -301,7 +321,7 @@ public class Machine private constructor(
     internal val timers: MachineTimers = MachineTimers(scheduler.timerService) { timerId, generation -> onTimerDue(timerId, generation) }
 
     /** 燃料の遅延補充 */
-    internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
+    internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now, scheduler.fuelConsumed)
 
     /** このマシンのプロセスが、燃料切れで巻き戻した回数（譲るための巻き戻しも数える。数え口） */
     private val fuelUnwindsDone = AtomicLong()

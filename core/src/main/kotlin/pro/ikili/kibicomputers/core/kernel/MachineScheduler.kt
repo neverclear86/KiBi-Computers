@@ -225,6 +225,34 @@ public class MachineScheduler private constructor(
      */
     internal val fuelYields = AtomicLong()
 
+    /**
+     * マシンの燃料から渡した手持ちのうち、使った量の合計（数え口。#740）。手持ちを渡したとき（`FuelAccount.take`）に渡した量を足し、
+     * 返したとき（`FuelAccount.giveBack`）に残りを引く。前借りで残りが負なら、その分も使ったに入る。巻き戻しの費用（[fuelUnwindCost]）も含む。
+     * 例外で抜けたときは書き戻さないので、そのときの手持ちは全部使ったに入る（まれなので許容する）
+     */
+    internal val fuelConsumed = AtomicLong()
+
+    /** 燃料切れで巻き戻したときに、マシンの燃料から引いた巻き戻し・巻き直しの費用の合計（数え口。#740。[fuelConsumed] にも含む） */
+    internal val fuelUnwindCost = AtomicLong()
+
+    /**
+     * 負荷試験の段階の区切りで読む、燃料と許可の数え口の今の値（#740）。どれもサーバー全体の累計で、reset しない。
+     * 値は1つずつ読むので、動いている間に読むと、互いに少しずれる（段階の区切りで差を取るぶんには問題にならない）
+     */
+    public val permitAcquisitionCount: Long get() = permitAcquisitions.get()
+
+    /** [fuelSliceRenewals] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelSliceRenewalCount: Long get() = fuelSliceRenewals.get()
+
+    /** [fuelYields] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelYieldCount: Long get() = fuelYields.get()
+
+    /** [fuelConsumed] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelConsumedTotal: Long get() = fuelConsumed.get()
+
+    /** [fuelUnwindCost] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelUnwindCostTotal: Long get() = fuelUnwindCost.get()
+
     /** [fuelUnwinds] の今の値（接続層の負荷試験が読む。#821） */
     public val fuelUnwindCount: Long get() = fuelUnwinds.get()
 
