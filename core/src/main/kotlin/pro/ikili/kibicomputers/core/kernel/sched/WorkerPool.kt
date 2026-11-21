@@ -58,21 +58,34 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
     /** step を動かしているワーカーの数（数え口） */
     val activeSteps: AtomicInteger = AtomicInteger()
 
-    /** 渡した step の数（数え口） */
+    /** 渡した step の数（数え口）。渡せなかった（投げた）ものは数えない */
     val submitted: AtomicLong = AtomicLong()
+
+    /** [offerContinuation] で置いた続きを、例外で抜けたワーカーから渡し直せなかったときの受け口（#870） */
+    fun interface ContinuationFailure {
+        fun strand(task: Runnable, failure: Throwable)
+    }
+
+    /**
+     * 続き（許可を持っている）を渡し直せなかったときに渡す先（#870。[PermitPool] が登録する）。
+     * なければ、渡し直しの例外をそのまま投げる
+     */
+    @Volatile
+    var continuationFailure: ContinuationFailure? = null
 
     /** プールのスレッドの数（差し替えたときは -1） */
     val poolSize: Int get() = pool?.poolSize ?: -1
 
     /** step を渡す。ブロックしない。閉じた後なら、その場限りのスレッドで動かす（step は停止の印を見て終わる） */
     fun execute(task: Runnable) {
-        submitted.incrementAndGet()
         val wrapped = Runnable { runLoop(task) }
         try {
             executor.execute(wrapped)
         } catch (e: RejectedExecutionException) {
             KernelThread("KiBi-worker-late-${counter.incrementAndGet()}", stack, wrapped).start()
         }
+        // 渡せてから数える（渡せずに投げて、後で渡し直したときに二重に数えない。#870）
+        submitted.incrementAndGet()
     }
 
     /**
@@ -96,8 +109,15 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
             }
         } finally {
             inWorker.set(false)
-            // 例外で抜けたときも、置かれた続き（許可を持っている）を捨てない
-            takeContinuation()?.let { execute(it) }
+            // 例外で抜けたときも、置かれた続き（許可を持っている）を捨てない。渡せなければ受け口へ（#870）
+            takeContinuation()?.let { next ->
+                try {
+                    execute(next)
+                } catch (t: Throwable) {
+                    val sink = continuationFailure ?: throw t
+                    sink.strand(next, t)
+                }
+            }
         }
     }
 
