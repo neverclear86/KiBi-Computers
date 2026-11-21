@@ -146,7 +146,9 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 4. CI: 落ちたら最大2回直す。
 5. レビュー: 正しさ・ルール違反のレビューを1本（area が kernel・persistence・runtime・storage の Issue と、スレッド・並行処理に触れた PR は Fable、それ以外は Opus。公開 API の変更があれば Java 相互運用のレビューも）→ 別のエージェント（Opus）が指摘を検証 → 残った指摘を must・should を問わず直す。最大2ラウンド。
 6. マージ: 1件ずつ直列に、main を取り込んだ結果で `build` と GameTest を通してから squash マージする（`merge: false` で飛ばせる）。
-7. 報告: PR に結果をコメントし、worktree を片付ける。
+7. 報告: PR に結果をコメントする。マージ済みなら、その worktree の Gradle と GameTest のサーバーが終わってから worktree を片付ける（それ以外は resume のために残す）。
+
+Gradle を動かす段階は、`./gradlew` をバックグラウンドで動かし、ログと終了コード（`.exit`）を worktree の外の `.worktrees/.logs/issue-<番号>/` に残して、終わるまで待ってから返す（#855）。CI の段階では、PR が main と衝突している（GitHub が CI を動かさない）なら、先に main を取り込む。マージの段階で GameTest だけが落ち、過負荷の兆候（`Can't keep up!` が 200 tick 以上遅れた、または GameTest が 10 分以上かかった）があるときだけ、1 回だけ回し直す。それでも落ちたら、今までどおり止まる。
 
 人に質問して止まる前には、どの段階でも、別のモデル（Fable）が論点を確かめる。前提（何が問題で、なぜ止まったか）が正しいか、推奨が妥当か、そもそも人の判断が要るものかを、コード・ADR・仕様と突き合わせる。エージェントで直せるもの（プランの書き漏れなど）なら、その直し方でもう1回進める。人に聞くときは、確かめた結果を質問に添える。
 
@@ -171,4 +173,5 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 - 1.20.1（Forge）は 1.21.1 と細部が違う: GameTest の構造物は `data/kibicomputers/structures/`（複数形）に置く。データを読ませるには `pack.mcmeta` が必要。`mods.toml` は `META-INF/mods.toml` で、依存の指定は `mandatory = true`。jar は `reobfJar` で SRG 名に変換される。
 - core のログ（`System.getLogger`、名前は `kibicomputers.*`）は、`CoreLogRouting`（JUL の `kibicomputers` ロガーに付けたハンドラー）から接続層の `CoreLogBridge` を通って SLF4J（`latest.log`・`debug.log`）に出る（#673）。JUL 側のレベルは log4j の設定（`kibicomputers` とその下の `LoggerConfig`）を写したもので、設定の読み直しに追従する。`kibicomputers` の JUL ロガーのレベル・ハンドラーをいじらない（`Configurator.setLevel` で変えたら `CoreLogBridge.refresh()` を呼ぶ）。GameTest でログを確かめるときは、log4j の root の設定にアペンダーを付けて名前で絞る（`Logger.addAppender` だと、その名前の行がファイルに出なくなる）。
 - GameTest の run のワールドは `run/gametest-world`（負荷試験は `run/loadtest-world`、jar の GameTest は `run/jar-gametest/world`）で、Gradle が起動の前に消す（#792。残すときは `-PkeepGameTestWorld=true`）。消せないときは前の GameTest サーバーのプロセスが残っている。`run/world` は `runServer` のもので、GameTest は使わない。IDE の起動設定から動かすと消されない。
+- **GameTest のサーバー（`runGameTestServer`・`runJarGameTestServer`・`runLoadTestServer`）は、マシンの中で同時に 1 本だけ動く**（#855。ルートに適用した build-logic の `kibicomputers.gametest-lock`）。同じ起動の中では両バージョンが直列になり、worktree・起動をまたぐ分は Gradle のユーザーホームの `kibicomputers/locks/gametest.lock`（OS のロック。プロセスが死ねば外れる）で待つ。待つ間は 30 秒ごとに `Waiting for the GameTest lock ... Held by: <タスク> in <worktree> (Gradle pid ..., since ...)` を出す。持ち主は同じ場所の `gametest.owner` で分かる。終わると `GameTest lock released by <タスク> after holding it for N s` を出す。待ちの上限は既定 90 分（`-PgameTestLockTimeoutMinutes=<分>`）、`-PgameTestLock=false` でロックを使わない。デーモンは worktree をまたいで共有しているので、片付けに `./gradlew --stop` を使わない。
 - GameTest はクラスに `@GameTestHolder(KiBiComputers.MOD_ID)` と `@PrefixGameTestTemplate(false)`、メソッドに `@JvmStatic` と `@GameTest(template = "empty")` を付ける。`empty` は `data/kibicomputers/structure/empty.nbt`（空の 3x3x3）。例: `platform-neoforge-1.21.1/src/main/kotlin/pro/ikili/kibicomputers/neoforge/gametest/SmokeGameTests.kt`。
