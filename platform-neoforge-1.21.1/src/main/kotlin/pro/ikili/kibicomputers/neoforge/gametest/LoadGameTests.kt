@@ -91,8 +91,11 @@ object LoadGameTests {
     private fun ciMaxBootKernelThreads(): Int =
         2 * (ServerMachines.schedulerConfig ?: SchedulerConfig.DEFAULT).maxConcurrentMachines + CI_MAX_IDLE_KERNEL_THREADS
 
-    /** 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ */
-    private const val CI_TIMEOUT_TICKS = 30_000
+    /**
+     * 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ。
+     * 書き込みの終わりの待ちを tick で数えるようにした分（1 つの段階で多くて 6,000 tick。待つ段階は多くて AUTOSAVE と UNLOAD の 2 つなので 12,000 tick。#854）を足してある
+     */
+    private const val CI_TIMEOUT_TICKS = 42_000
     private const val MEASURE_TIMEOUT_TICKS = 200_000
 
     /** 実際のサーバーの1 tick（20 TPS） */
