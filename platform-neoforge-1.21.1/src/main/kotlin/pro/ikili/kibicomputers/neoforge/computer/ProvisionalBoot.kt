@@ -33,10 +33,11 @@ internal object ProvisionalBoot {
 
     /**
      * 仮の起動の設定: 起動部品あり、起動ディスクの候補は [disks]（ディスクのスロットの順）、最後に [fallback]。
-     * [fallback]（読み取り専用の同梱イメージ）から起動したときは、[disks] の最初のディスクを `/home` にマウントする（#461）
+     * [fallback]（読み取り専用の同梱イメージ）から起動したときは、[disks] の最初のディスクを `/home` にマウントする（#461）。
+     * [language] は OS の既定の言語（POSIX の形。[BootConfig.language]。#661）。`null` なら渡さない
      */
-    fun bootConfig(disks: List<String>, fallback: String = OS_BOOT_DISK): BootConfig =
-        BootConfig.builder().firmwarePresent(true).bootDisks(disks + fallback).homeDisk(disks.firstOrNull()).build()
+    fun bootConfig(disks: List<String>, fallback: String = OS_BOOT_DISK, language: String? = null): BootConfig =
+        BootConfig.builder().firmwarePresent(true).bootDisks(disks + fallback).homeDisk(disks.firstOrNull()).language(language).build()
 
     /** 起動部品（#125）のスロットは、挿さっているとみなす。ディスクの識別子は [parts] のまま */
     fun withBootPart(tier: CaseTier, parts: InstalledParts): InstalledParts = object : InstalledParts {

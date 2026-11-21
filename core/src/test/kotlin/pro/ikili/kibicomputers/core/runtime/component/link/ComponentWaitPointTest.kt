@@ -2,11 +2,18 @@ package pro.ikili.kibicomputers.core.runtime.component.link
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
+import pro.ikili.kibicomputers.core.kernel.process.Program
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmModuleShape
+import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonType
 import pro.ikili.kibicomputers.core.runtime.component.canon.CanonValue
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.fn
@@ -14,6 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.host
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.instantiate
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.load
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.u32
+import java.security.MessageDigest
 
 /**
  * コンポーネントの待機点への変換（#757。ADR 0757）。カーネルを通さず、`LinkedComponent` の巻き戻し・巻き直しを確かめる。
@@ -73,6 +81,44 @@ class ComponentWaitPointTest {
           (core instance ${'$'}sx (export "get" (func ${'$'}s "0")))
           (core instance ${'$'}m (instantiate ${'$'}main (with "shim" (instance ${'$'}sx))))
           (func (export "run") (result u32) (canon lift (core func ${'$'}m "run"))))
+    """
+
+    /** ゲストからゲストへの呼び出し（lift した関数を lower した import）の下に待ちがある形 */
+    private val guestToGuestShape = """
+        (component
+          (import "test:host/wait" (instance ${'$'}h (export "get" (func (result u32)))))
+          (alias export ${'$'}h "get" (func ${'$'}get))
+          (core func ${'$'}get_lower (canon lower (func ${'$'}get)))
+          (core module ${'$'}inner
+            (import "host" "get" (func ${'$'}g (result i32)))
+            (func (export "get") (result i32) (call ${'$'}g)))
+          (core instance ${'$'}hi (export "get" (func ${'$'}get_lower)))
+          (core instance ${'$'}i (instantiate ${'$'}inner (with "host" (instance ${'$'}hi))))
+          (func ${'$'}lifted (result u32) (canon lift (core func ${'$'}i "get")))
+          (core func ${'$'}lifted_lower (canon lower (func ${'$'}lifted)))
+          (core module ${'$'}outer
+            (import "inner" "get" (func ${'$'}g (result i32)))
+            (func (export "run") (result i32) (call ${'$'}g)))
+          (core instance ${'$'}oi (export "get" (func ${'$'}lifted_lower)))
+          (core instance ${'$'}o (instantiate ${'$'}outer (with "inner" (instance ${'$'}oi))))
+          (func (export "run") (result u32) (canon lift (core func ${'$'}o "run"))))
+    """
+
+    /** ゲストが実装した resource の dtor が待ちを呼ぶ形 */
+    private val dtorShape = """
+        (component
+          (import "test:host/wait" (instance ${'$'}h (export "get" (func (result u32)))))
+          (alias export ${'$'}h "get" (func ${'$'}get))
+          (core func ${'$'}get_lower (canon lower (func ${'$'}get)))
+          (core module ${'$'}m
+            (import "host" "get" (func ${'$'}g (result i32)))
+            (func (export "dtor") (param i32) (drop (call ${'$'}g)))
+            (func (export "run") (result i32) (i32.const 0)))
+          (core instance ${'$'}hi (export "get" (func ${'$'}get_lower)))
+          (core instance ${'$'}i (instantiate ${'$'}m (with "host" (instance ${'$'}hi))))
+          (type ${'$'}r (resource (rep i32) (dtor (func ${'$'}i "dtor"))))
+          (core func ${'$'}new (canon resource.new ${'$'}r))
+          (func (export "run") (result u32) (canon lift (core func ${'$'}i "run"))))
     """
 
     @ParameterizedTest
@@ -166,26 +212,7 @@ class ComponentWaitPointTest {
     @Test
     fun `待ちがゲストからゲストへの呼び出しの下にあれば変換しない`() {
         val g = GetHost(HostWait.UNWIND)
-        val text = """
-            (component
-              (import "test:host/wait" (instance ${'$'}h (export "get" (func (result u32)))))
-              (alias export ${'$'}h "get" (func ${'$'}get))
-              (core func ${'$'}get_lower (canon lower (func ${'$'}get)))
-              (core module ${'$'}inner
-                (import "host" "get" (func ${'$'}g (result i32)))
-                (func (export "get") (result i32) (call ${'$'}g)))
-              (core instance ${'$'}hi (export "get" (func ${'$'}get_lower)))
-              (core instance ${'$'}i (instantiate ${'$'}inner (with "host" (instance ${'$'}hi))))
-              (func ${'$'}lifted (result u32) (canon lift (core func ${'$'}i "get")))
-              (core func ${'$'}lifted_lower (canon lower (func ${'$'}lifted)))
-              (core module ${'$'}outer
-                (import "inner" "get" (func ${'$'}g (result i32)))
-                (func (export "run") (result i32) (call ${'$'}g)))
-              (core instance ${'$'}oi (export "get" (func ${'$'}lifted_lower)))
-              (core instance ${'$'}o (instantiate ${'$'}outer (with "inner" (instance ${'$'}oi))))
-              (func (export "run") (result u32) (canon lift (core func ${'$'}o "run"))))
-        """
-        val p = load(text, g.host)
+        val p = load(guestToGuestShape, g.host)
         assertFalse(p.waitPoints)
         assertTrue(p.waitPointRejection!!.contains("ゲストからゲスト"), p.waitPointRejection)
         instantiate(p).use { c ->
@@ -217,24 +244,90 @@ class ComponentWaitPointTest {
     /** ゲストが実装した resource の dtor が待ちを呼ぶなら、`resource.drop` の Kotlin の層から呼ぶので巻き戻せない */
     @Test
     fun `止まりうるdtorを持つresourceがあれば変換しない`() {
-        val text = """
-            (component
-              (import "test:host/wait" (instance ${'$'}h (export "get" (func (result u32)))))
-              (alias export ${'$'}h "get" (func ${'$'}get))
-              (core func ${'$'}get_lower (canon lower (func ${'$'}get)))
-              (core module ${'$'}m
-                (import "host" "get" (func ${'$'}g (result i32)))
-                (func (export "dtor") (param i32) (drop (call ${'$'}g)))
-                (func (export "run") (result i32) (i32.const 0)))
-              (core instance ${'$'}hi (export "get" (func ${'$'}get_lower)))
-              (core instance ${'$'}i (instantiate ${'$'}m (with "host" (instance ${'$'}hi))))
-              (type ${'$'}r (resource (rep i32) (dtor (func ${'$'}i "dtor"))))
-              (core func ${'$'}new (canon resource.new ${'$'}r))
-              (func (export "run") (result u32) (canon lift (core func ${'$'}i "run"))))
-        """
-        val p = load(text, GetHost(HostWait.UNWIND).host)
+        val p = load(dtorShape, GetHost(HostWait.UNWIND).host)
         assertFalse(p.waitPoints)
         assertTrue(p.waitPointRejection!!.contains("dtor"), p.waitPointRejection)
+    }
+
+    /** 読み込ませた（コンパイルさせた）回数を数えるランタイム。計画のための形の読み取り（describe）は数えない */
+    private class CountingRuntime(private val inner: WasmRuntime = LinkTesting.runtime) : WasmRuntime {
+        var loads = 0
+        override val name: String get() = "counting-" + inner.name
+
+        override fun load(bytes: ByteArray): WasmModule {
+            loads++
+            return inner.load(bytes)
+        }
+
+        override fun describe(bytes: ByteArray): WasmModuleShape = inner.describe(bytes)
+    }
+
+    /**
+     * `exec` の道（`requireWaitPoints`。#844）では、待機点に変換できないものを、理由（`AsyncifyUnsupported`）を原因にした
+     * [WasmLoadException] で断る。どの理由でも p1 と同じく [Program.unsuspendableReason] で取り出せ、断る前にコンパイルせず、
+     * 「スレッドを持つ」ログ（[WaitPointRejectionLog]）も出さない
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["guest", "dtor", "v128"])
+    fun `requireWaitPointsなら変換できない作りをコンパイルの前に断り、理由をp1と同じ形で残す`(kind: String) {
+        val (text, expected) = when (kind) {
+            "guest" -> guestToGuestShape to "ゲストからゲスト"
+            "dtor" -> dtorShape to "dtor"
+            else -> shimShape.replace("(local ${'$'}x i32)", "(local ${'$'}x i32) (local ${'$'}v v128)") to "v128"
+        }
+        // ログは JVM 全体で 1 回だけなので、同じ形を読むほかのテストと別のコンポーネントにする（使わない core モジュールを 1 つ足す）
+        val unique = text.trimEnd().removeSuffix(")") + "\n(core module (func (export \"nonce-${System.nanoTime()}\"))))"
+        val bytes = LinkTesting.wat(unique)
+        val runtime = CountingRuntime()
+        val e = assertThrows<WasmLoadException> {
+            ComponentProgram.load(runtime, bytes, GetHost(HostWait.UNWIND).host, metered = true, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        }
+        assertTrue(e.message!!.startsWith("待機点に変換できない: "), e.message)
+        val reason = Program.unsuspendableReason(e)
+        assertNotNull(reason, "原因が AsyncifyUnsupported でない: ${e.cause}")
+        assertTrue(reason!!.contains(expected), reason)
+        assertEquals(0, runtime.loads, "断るものをコンパイルした")
+        val sha = MessageDigest.getInstance("SHA-256").digest(bytes)
+        assertTrue(WaitPointRejectionLog.report(sha, "テストから"), "断ったのに「スレッドを持つ」ログを出した")
+    }
+
+    @Test
+    fun `requireWaitPointsでも変換できるもの・止まりうる関数がないものは断らない`() {
+        val p = ComponentProgram.load(
+            LinkTesting.runtime, LinkTesting.wat(shimShape), GetHost(HostWait.UNWIND).host, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true,
+        )
+        assertTrue(p.waitPoints)
+        // 止まりうる関数がない（待つホストの関数がない）なら、v128 があっても断らない（#384 と同じ）
+        val simd = shimShape.replace("(local ${'$'}x i32)", "(local ${'$'}x i32) (local ${'$'}v v128)")
+        val q = ComponentProgram.load(
+            LinkTesting.runtime, LinkTesting.wat(simd), GetHost(HostWait.NONE).host, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true,
+        )
+        assertTrue(q.waitPoints, "${q.waitPointRejection}")
+    }
+
+    /**
+     * 止まりうる関数がなくても、グローバルの初期値の式に `v128.const` があれば、読み込みは断られる（#851）。
+     * 計測あり（`exec`）では `FuelInjector` が断る（原因は `AsyncifyUnsupported` ではない）。計測なしでは `Asyncify` が断るので、
+     * `requireWaitPoints` なら理由が取り出せ、直接の読み込みなら `BLOCKING` に落ちる
+     */
+    @Test
+    fun `止まりうる関数がなくても定数式のv128グローバルがあれば断られる`() {
+        val constGlobal = shimShape.replace(
+            "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n", "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n            (global v128 (v128.const i32x4 0 0 0 0))\n",
+        )
+        check(constGlobal != shimShape)
+        val bytes = LinkTesting.wat(constGlobal)
+        val host = GetHost(HostWait.NONE).host
+        val metered = assertThrows<WasmLoadException> {
+            ComponentProgram.load(LinkTesting.runtime, bytes, host, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        }
+        assertNull(Program.unsuspendableReason(metered), "${metered.message} / ${metered.cause}")
+        val e = assertThrows<WasmLoadException> {
+            ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        }
+        assertTrue(Program.unsuspendableReason(e)?.contains("0xFD") == true, "${e.message} / ${e.cause}")
+        val direct = ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT)
+        assertFalse(direct.waitPoints)
     }
 
     @Test

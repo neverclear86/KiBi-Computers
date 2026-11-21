@@ -128,17 +128,31 @@ neoForge {
             taskBefore(cleanLoadTestWorld)
             systemProperty("neoforge.enabledGameTestNamespaces", "${modId}_load")
             systemProperty("kibicomputers.loadTest.counts", providers.gradleProperty("loadTestCounts").getOrElse("1000"))
-            // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る
+            // -PloadTestClaimPaste=100,1000 で、ほかの段階の代わりに、N 台を 1 tick で貼ったときと置き場を開き直した後の claim を測る（#585）
+            systemProperty("kibicomputers.loadTest.claimPaste", providers.gradleProperty("loadTestClaimPaste").getOrElse(""))
+            // -PloadTestOs=standard で、Lua の REPL ではなく標準 OS のシェルで測る。standard-p2 は、標準 OS のシェルから p2 のコマンドで計算させる（#821）
             systemProperty("kibicomputers.loadTest.os", providers.gradleProperty("loadTestOs").getOrElse("lua"))
             // -PloadTestDevices=<n> で、n 台に1台の割合でケースの隣に他 MOD 役のデバイス（#153）を置く（既定は 0 = 置かない）
             systemProperty("kibicomputers.dev.testDevices", "true")
             systemProperty("kibicomputers.loadTest.devices", providers.gradleProperty("loadTestDevices").getOrElse("0"))
+            // 許可の受け渡しを測る（#740）: -PloadTestComputeProcesses=<n> で、1台に計算するプロセスを n 本動かす段階の本数（標準 OS だけ。既定 4、1 以下で飛ばす）、
+            // -PloadTestBusy=<n> で計算・出力させる台数（既定は台数の 1/10。過負荷を作るときに上げる）、
+            // -PloadTestFuelSlice=tick|<燃料> でマシンのスライス（tick は fuelPerTick = 1 tick に1回。#47 の前と比べる回）を差し替える
+            systemProperty("kibicomputers.loadTest.computeProcesses", providers.gradleProperty("loadTestComputeProcesses").getOrElse("4"))
+            systemProperty("kibicomputers.loadTest.busy", providers.gradleProperty("loadTestBusy").getOrElse("0"))
+            systemProperty("kibicomputers.loadTest.fuelSlice", providers.gradleProperty("loadTestFuelSlice").getOrElse(""))
             // -PloadTestJfr=<ファイル> で、JFR のプロファイルを取る（メインスレッドで重いところを探すとき。#351）
             providers.gradleProperty("loadTestJfr").orNull?.let {
                 jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")
             }
             // -PloadTestQuietProgress=true で、GameTest のサーバーの進み具合のログ（20 tick ごと）を試験の間だけ止める（#600 の比べる回）
             systemProperty("kibicomputers.loadTest.quietProgress", providers.gradleProperty("loadTestQuietProgress").getOrElse("false"))
+            // -PloadTestProductionAutosave=true で、自動保存の段階を本番の形（周期を止めず、バニラの自動保存と同じ tick に始める）で測る（#834）。
+            // -PloadTestVanillaSaveOffset=<tick> でバニラの自動保存を一巡の始めから何 tick 後にするか、
+            // -PloadTestSyntheticLogTicks=<tick> でメインスレッドに合成のログを何 tick ごとに書かせるか（0 は書かない）を決める
+            systemProperty("kibicomputers.loadTest.productionAutosave", providers.gradleProperty("loadTestProductionAutosave").getOrElse("false"))
+            systemProperty("kibicomputers.loadTest.vanillaSaveOffset", providers.gradleProperty("loadTestVanillaSaveOffset").getOrElse("0"))
+            systemProperty("kibicomputers.loadTest.syntheticLogTicks", providers.gradleProperty("loadTestSyntheticLogTicks").getOrElse("0"))
             // -PloadTestJvmLog=<ファイル> で、GC と safepoint の JVM のログ（時刻と uptime つき）を取る（長い tick の突き合わせ。#600）。
             // -Xlog のファイル名にドライブの「:」を書くと区切りと混ざる（引用符は起動の引数ファイルで崩れる）ので、run/ からの相対パスで渡す
             providers.gradleProperty("loadTestJvmLog").orNull?.let {
@@ -187,6 +201,36 @@ neoForge {
 sourceSets.main {
     resources.srcDir("src/generated/resources")
 }
+
+// 負荷試験の p2 の計算（#821。-PloadTestOs=standard-p2）の起動ディスク `image:loadtest-p2`。標準 OS のイメージ（core の os.zip）に、
+// 計算し続ける p2 のコマンド（core のテストの fuel-spin-p2.wasm。wasi-sdk でビルドする）を `/bin/spin` として足す。
+// dev ソースセットのリソースに入れる（開発の run だけで読める。jar には入らない）
+val coreOsImage = core.tasks.named<Zip>("zipOsImage")
+val coreFuelSpinP2 = core.tasks.named("compileFuelSpinP2Wasm")
+val zipLoadTestP2Image = tasks.register<Zip>("zipLoadTestP2Image") {
+    group = "build"
+    description = "Builds the load test image (loadtest-p2.zip): the standard OS image plus a computing p2 command as /bin/spin."
+    from(coreOsImage.flatMap { it.archiveFile }.map { zipTree(it) })
+    // core のタスクの出力ディレクトリ（コンポーネントの .wasm はその1つだけ）を、タスクの出力から取る。出力先や名前が変わっても追従する
+    from(coreFuelSpinP2.map { it.outputs.files }) {
+        include("**/*.wasm")
+        eachFile { path = "bin/spin" }
+        includeEmptyDirs = false
+    }
+    // `/bin/spin` が入らない（include が何にも当たらない）イメージをエラーなしで作らない。それだと、`-PloadTestOs=standard-p2` の時間切れまで気づけない
+    doLast {
+        val image = archiveFile.get().asFile
+        val entries = zipTree(image).matching { include("bin/spin") }.files
+        if (entries.size != 1 || entries.single().length() == 0L) {
+            throw GradleException("${image.name} に /bin/spin（fuel-spin-p2.wasm）が入っていない。core の compileFuelSpinP2Wasm の出力を確かめる")
+        }
+    }
+    archiveFileName = "loadtest-p2.zip"
+    destinationDirectory = layout.buildDirectory.dir("generated/loadtest-images/kibicomputers/images")
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+}
+dev.resources.srcDir(files(layout.buildDirectory.dir("generated/loadtest-images")) { builtBy(zipLoadTestP2Image) })
 
 dependencies {
     // core は MOD の一部として jar に直接入れるので、ここではコンパイル時だけ参照する

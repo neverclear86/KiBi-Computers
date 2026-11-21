@@ -195,7 +195,8 @@ internal class BootSequence(private val machine: Machine, private val config: Bo
         val options = SpawnOptions(
             stdio = StdioSpec.CONSOLE,
             args = listOf(BootConfig.INIT_PATH),
-            env = emptyMap(),
+            // カーネルが init に渡す環境変数は、空か `LANG` の1つだけ（ADR 0049、#661）
+            env = config.language?.let { mapOf("LANG" to it) } ?: emptyMap(),
             cwd = "/",
             fds = SpawnOptions.ROOT_PREOPEN,
         )

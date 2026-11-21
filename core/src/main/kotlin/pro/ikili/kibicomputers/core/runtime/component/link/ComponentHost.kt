@@ -104,7 +104,10 @@ internal enum class HostWait {
      */
     UNWIND,
 
-    /** 待ちうるが、巻き戻せない（スレッドを持って待つ）。これを import するコンポーネントは `BLOCKING` で動かす */
+    /**
+     * 待ちうるが、巻き戻せない（スレッドを持って待つ）。これを import するコンポーネントは待機点に変換しない（`exec` では `NOEXEC`。#844。
+     * 直接読み込んだものは `BLOCKING` で動かす）。実物のホスト（`KernelDrivers.COMPONENT_HOST`）にはない（#800）
+     */
     BLOCK,
 }
 

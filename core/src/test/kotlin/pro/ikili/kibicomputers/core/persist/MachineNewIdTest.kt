@@ -136,18 +136,21 @@ class MachineNewIdTest {
     }
 
     @Test
-    fun `claimでowner_binが書けなかったNBTのUUIDも振らない`() {
+    fun `claimで受け入れたNBTのUUIDは、owner_binが書けずに外れても振らない`() {
         val root = dir.resolve("root")
         Files.write(root, byteArrayOf(1))
         val store = MachineSaveStore(root, index, "test", manual)
-        // claim の振り直し（fresh）が w を取る。y の owner.bin は書けない
-        store.useIds(w)
+        // owner.bin がないので KEPT。owner.bin は最初の世代の前に書く（#585）が、根がファイルなので書けない
         val claim = store.claim(y.toString(), 0, 0, p)
-        assertEquals(null, claim.identity)
+        assertEquals(ClaimResult.KEPT, claim.result)
+        store.submit(claim.identity!!, p, src(), null)
+        manual.runAll()
+        assertFalse(store.pollCompleted().single().succeeded)
+        assertEquals(null, store.ownerOf(y), "書けなかった ID は外す")
         Files.delete(root)
         Files.createDirectories(root)
-        store.useIds(y, w, z)
-        assertEquals(z, store.assignNewId(p)?.id)
+        store.useIds(y, w)
+        assertEquals(w, store.assignNewId(p)?.id)
     }
 
     @Test

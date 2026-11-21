@@ -53,6 +53,49 @@ class FuelSliceTest {
     }
 
     @Test
+    fun `withFuelSliceはスライスだけを変え、fuelPerTickを超えた分は切り詰める`() {
+        val base = MachineConfig.builder().fuelPerTick(1_000_000).maxProcesses(7).memoryBytes(4L * 1024 * 1024).maxDevices(3).build()
+        val c = base.withFuelSlice(1_000_000)
+        assertEquals(1_000_000, c.fuelSlice)
+        assertEquals(1_000_000, c.fuelSliceValue)
+        assertEquals(base.fuelPerTick, c.fuelPerTick)
+        assertEquals(base.maxProcesses, c.maxProcesses)
+        assertEquals(base.maxBlockingProcesses, c.maxBlockingProcesses)
+        assertEquals(base.maxHostCallsPerTick, c.maxHostCallsPerTick)
+        assertEquals(base.memoryBytes, c.memoryBytes)
+        assertEquals(base.maxProcessMemoryBytes, c.maxProcessMemoryBytes)
+        assertEquals(base.maxDevices, c.maxDevices)
+        assertEquals(1_000_000, base.withFuelSlice(5_000_000).fuelSlice)
+    }
+
+    @Test
+    fun `使った燃料の数え口は、計算し続けるプロセスでtickごとにfuelPerTickずつ増え、2本でも合計は変わらない`() = timeout(limit) {
+        for (processes in 1..2) {
+            Harness().use { h ->
+                val m = h.machine(fuelPerTick = 1000, fuelSlice = 100)
+                val progress = AtomicInteger()
+                repeat(processes) { m.spawnTest(h.program(spinForever(progress)), runDriver()) }
+                val consumed0 = h.scheduler.fuelConsumedTotal
+                val permits0 = h.scheduler.permitAcquisitionCount
+                for (k in 1..3) {
+                    h.scheduler.tick()
+                    eventually { progress.get() >= 1000 * k - 1 }
+                    // 燃料を使い切って待つまで（手持ちを返すまで）待つ
+                    eventually { h.scheduler.fuelConsumedTotal - consumed0 >= 1000L * k }
+                    Thread.sleep(30)
+                    val used = h.scheduler.fuelConsumedTotal - consumed0
+                    // 燃料切れを確かめる点の行き過ぎ（前借り）の分だけ、プロセスの数まで多くなりうる
+                    assertTrue(used in 1000L * k..1000L * k + processes, "processes=$processes tick $k: used $used, progress ${progress.get()}")
+                }
+                assertTrue(h.scheduler.permitAcquisitionCount > permits0, "許可を取った回数が増えていない")
+                assertEquals(h.scheduler.fuelSliceRenewals.get(), h.scheduler.fuelSliceRenewalCount)
+                assertEquals(h.scheduler.fuelYields.get(), h.scheduler.fuelYieldCount)
+                m.stop()
+            }
+        }
+    }
+
+    @Test
     fun `プロセスが1つだけなら、CPUを返さずにその場で足し、1tickにfuelPerTickまで使う`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 1000, fuelSlice = 100)

@@ -46,12 +46,24 @@ object WorldMachineSaves {
         close()
         val root = event.server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize()
         val version = ModList.get().getModContainerById(KiBiComputers.MOD_ID).map { it.modInfo.version.toString() }.orElse("unknown")
+        open(root.resolve(KiBiComputers.MOD_ID).resolve("machines"), version)
+    }
+
+    private fun open(machines: java.nio.file.Path, version: String) {
         val config = ServerMachines.saveConfig
         val w = SaveWriter()
         writer = w
-        store = MachineSaveStore(
-            root.resolve(KiBiComputers.MOD_ID).resolve("machines"), MachineIdIndex(), version, w, config.writerMaxPendingBytes, config.writerFlushMillis,
-        )
+        store = MachineSaveStore(machines, MachineIdIndex(), version, w, config.writerMaxPendingBytes, config.writerFlushMillis, prefetchOwners = true)
+    }
+
+    /**
+     * 置き場を閉じて、同じ根で開き直す（負荷試験が再起動の後の claim を測る用。#585）。読み込まれているケースが索引に残っていない
+     * ときだけ呼ぶ（索引も作り直すため）
+     */
+    internal fun reopenForTest() {
+        val s = store ?: return
+        close()
+        open(s.root, s.modVersion)
     }
 
     private fun onServerStopped(event: ServerStoppedEvent) {

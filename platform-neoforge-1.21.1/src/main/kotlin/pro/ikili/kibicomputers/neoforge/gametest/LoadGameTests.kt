@@ -17,7 +17,6 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.display.ScreenSyncSender
 import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
-import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -30,7 +29,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
  *   tick が重くなりすぎない、カーネルのスレッドが台数に比例して増えない、を確かめる。Lua の REPL と標準 OS のシェルの両方で1回ずつ動かす（#476）。
  *   標準 OS の試験では最後にまとめてアンロードし、ケースのあるチャンクが全部アンロードされることも確かめる（#540）
  * - 測定用: `runLoadTestServer -PloadTestCounts=100,500,1000` で動く。台数ごとに MSPT・スレッド数・ヒープ使用量をログに書く。
- *   OS は `-PloadTestOs=lua|standard`（[LoadOs]。既定は Lua の REPL）。
+ *   OS は `-PloadTestOs=lua|standard|standard-p2`（[LoadOs]。既定は Lua の REPL。`standard-p2` は測定用だけ。#821）。
  *   テンプレートを名前空間 [MEASURE_NAMESPACE] のもの（`src/dev/resources`。jar には入らない）にして、
  *   測定用の起動（その名前空間だけを有効にする）でほかの GameTest が混ざらないようにする
  */
@@ -50,6 +49,12 @@ object LoadGameTests {
 
     /** CI で、計算・出力させる台数 */
     private const val CI_BUSY = 10
+
+    /**
+     * 1台に動かす計算するプロセスの数（[LoadPhase.COMPUTE_MULTI]。#740）。1 tick のスライスの数（既定で 4）と同じ本数は、燃料待ちの飢えの境の場合
+     * （ADR 0047。#737・#742）なので、CI と測定の既定はこの値にする
+     */
+    private const val COMPUTE_PROCESSES = 4
 
     /**
      * CI で、待っている間・計算している間・出力している間の tick の平均の上限（ミリ秒）。20 TPS を保てる値。
@@ -99,12 +104,24 @@ object LoadGameTests {
         val tests = ArrayList<TestFunction>()
         // 別のバッチにして、ほかのテストと同時に動かない（並べる範囲がテンプレートの外にはみ出すため）
         // OS ごとにも別のバッチにする（同じ範囲に並べるため）
-        for (os in LoadOs.entries) {
+        // CI で動かさない OS（p2 の計算。#821）は、jar の GameTest にない開発用のイメージを使う
+        for (os in LoadOs.entries.filter { it.ci }) {
             val suffix = if (os == LoadOs.LUA) "" else "_${os.id}"
             tests += TestFunction(
                 "kibicomputers_load_ci$suffix", "loadgametests.ci$suffix", "${KiBiComputers.MOD_ID}:${SmokeGameTests.EMPTY}",
                 CI_TIMEOUT_TICKS, 0, true,
             ) { ci(it, os) }
+        }
+        val pasteCounts = countsOf(ClaimPasteRun.PROPERTY)
+        if (pasteCounts.isNotEmpty()) {
+            // claim の測定（#585）だけを動かす
+            for (count in pasteCounts) {
+                tests += TestFunction(
+                    "kibicomputers_claim_paste_$count", "loadgametests.claim_paste_$count", "$MEASURE_NAMESPACE:${SmokeGameTests.EMPTY}",
+                    MEASURE_TIMEOUT_TICKS, 0, true,
+                ) { ClaimPasteRun(it, count).start() }
+            }
+            return tests
         }
         val counts = measureCounts()
         if (counts.isNotEmpty()) {
@@ -119,14 +136,17 @@ object LoadGameTests {
         return tests
     }
 
-    private fun measureCounts(): List<Int> =
-        System.getProperty(COUNTS_PROPERTY).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
+    private fun measureCounts(): List<Int> = countsOf(COUNTS_PROPERTY)
+
+    private fun countsOf(property: String): List<Int> =
+        System.getProperty(property).orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
 
     private fun ci(helper: GameTestHelper, os: LoadOs) {
         // まとめてアンロードは標準 OS の試験でだけ動かす（アンロードの書き込みは台数 × fsync を 1 tick でするので、1回にとどめる）
         val massUnload = os == LoadOs.STANDARD
         val settings = LoadSettings(
             os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100, massUnload = massUnload,
+            computeProcesses = COMPUTE_PROCESSES,
         )
         LoadRun(helper, settings) { report ->
             LOGGER.info("Load test (CI, {})\n{}", os.id, report.toMarkdown())
@@ -176,6 +196,29 @@ object LoadGameTests {
                 compute.tick.avg < CI_MAX_AVG_TICK_MILLIS,
                 "ticks with $CI_BUSY computing machines should stay under $CI_MAX_AVG_TICK_MILLIS ms on average: ${compute.tick}",
             )
+            // 計算し続ける台は燃料を使う（#740。数え口がつながっている）。回数や比の大きさは CI の機械に左右されるので見ない
+            helper.assertTrue(compute.fuel!!.consumed > 0 && compute.fuel.permits > 0, "the computing machines should use fuel: ${compute.fuel}")
+            // 1台に計算するプロセスが複数（#740）: 標準 OS のシェルだけで動かす。同じ台の中でスライスごとに譲り合う。
+            // 「譲った」（fuelYields）は、tick をそろえない CI ではプロセスが1本の台でも増える（手持ちを渡した tick が進んだので許可を回した分）ので、
+            // 譲り合いの検査にならない。測りはじめにあった計算するシェルが1本残らず、測った区間にスライスを受け取ったか（飢えていないか）で見る
+            val multi = report.phaseOrNull(LoadPhase.COMPUTE_MULTI)
+            if (os.backgroundCommand != null) {
+                helper.assertTrue(multi != null, "the multi-process phase should run with ${os.id}")
+                val f = multi!!.fuel!!
+                helper.assertTrue(f.consumed > 0, "$COMPUTE_PROCESSES computing processes on a machine should use fuel: $f")
+                helper.assertTrue(
+                    multi.minProcessGrants > 0,
+                    "every one of the $COMPUTE_PROCESSES computing shells on each machine should get fuel slices while measured: " +
+                        "min ${multi.minProcessGrants}, max ${multi.maxProcessGrants} ($f)",
+                )
+                helper.assertTrue(
+                    multi.tick.avg < CI_MAX_AVG_TICK_MILLIS,
+                    "ticks with $COMPUTE_PROCESSES computing processes on each of $CI_BUSY machines should stay under " +
+                        "$CI_MAX_AVG_TICK_MILLIS ms on average: ${multi.tick}",
+                )
+            } else {
+                helper.assertTrue(multi == null, "the multi-process phase should be skipped with ${os.id}")
+            }
             // 出力し続ける台の端末の処理は、プロセスのスレッドで行う（#355・#357）。メインスレッドは差分を送るだけ（#351）
             helper.assertTrue(
                 unwatched.tick.avg < CI_MAX_AVG_TICK_MILLIS,
@@ -218,7 +261,16 @@ object LoadGameTests {
     }
 
     private fun measure(helper: GameTestHelper, os: LoadOs, count: Int) {
-        val settings = LoadSettings(os = os, count = count, busy = maxOf(1, count / 10), paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true)
+        val busy = LoadSettings.intProperty(LoadSettings.BUSY_PROPERTY).takeIf { it > 0 }?.coerceAtMost(count) ?: maxOf(1, count / 10)
+        val settings = LoadSettings(
+            os = os, count = count, busy = busy, paced = true, warmupTicks = 100, measureTicks = 600, massUnload = true,
+            computeProcesses = System.getProperty(LoadSettings.COMPUTE_PROCESSES_PROPERTY)?.trim()?.toIntOrNull() ?: COMPUTE_PROCESSES,
+            fuelSlice = LoadSettings.fuelSliceProperty(),
+            massRestore = true,
+            productionAutosave = System.getProperty(LoadSettings.PRODUCTION_AUTOSAVE_PROPERTY).toBoolean(),
+            vanillaSaveOffset = LoadSettings.intProperty(LoadSettings.VANILLA_SAVE_OFFSET_PROPERTY),
+            syntheticLogTicks = LoadSettings.intProperty(LoadSettings.SYNTHETIC_LOG_TICKS_PROPERTY),
+        )
         LoadRun(helper, settings) { report -> LOGGER.info("Load test ({} computers, {})\n{}", count, os.id, report.toMarkdown()) }.start()
     }
 
@@ -241,8 +293,8 @@ object LoadGameTests {
             )
             helper.setBlock(case.south(), KiBiBlocks.KEYBOARD.get())
             val be = helper.getBlockEntity<CaseBlockEntity>(case)
-            // Lua の REPL で測るときは、テスト用の起動ディスクから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
-            if (os == LoadOs.LUA) be.fallbackBootDisk = ProvisionalBoot.TEST_BOOT_DISK
+            // Lua の REPL はテスト用の起動ディスク、p2 の計算（#821）は開発用のイメージから起動する。標準 OS はゲームの既定（#461）なので、何も入れない
+            os.bootDisk?.let { be.fallbackBootDisk = it }
             // 起動部品のほかの必須の部品（#122〜#124）はまだないので、種類を確かめずに入れる（TestComputerGameTests と同じ）
             for (kind in PartKind.entries.filter { it.required && it != PartKind.BOOT }) {
                 be.parts.setStackInSlot(be.tier.firstSlot(kind), ItemStack(Items.IRON_INGOT))

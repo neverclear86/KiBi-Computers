@@ -17,6 +17,9 @@
 //! shell /bin/sh arg...      # コンソールのシェル（1 つだけ）。終わったら起こし直す
 //! ```
 //!
+//! 子の既定の環境変数は `PATH=/bin:/sbin`・`HOME=/` と、カーネルが init に渡した `LANG`（電源を入れたプレイヤーの言語。
+//! #661、ADR 0661）。init 自身の環境変数のうち、子に渡すのは `LANG` だけ（空なら渡さない）。inittab の `env` が後から勝つ。
+//!
 //! `env` はファイル全体を読んでから子を起こすので、書いた位置に関わらず全部の子に効く（同じ名前は後の行が勝つ）。
 //! inittab がない・読めないときは `shell /bin/sh` だけの既定で動く。inittab があって `shell` がなければ、シェルを起こさない。
 //! 動かす子も起こし直す予定もなくなったら、init は終わる（マシンが止まる）。
@@ -69,6 +72,10 @@ const default_shell_argv = [_][]const u8{DEFAULT_SHELL};
 pub fn main() u8 {
     _ = setEnv("PATH", "/bin:/sbin");
     _ = setEnv("HOME", "/");
+    // カーネルが渡した OS の既定の言語（#661）。inittab の `env LANG=` が後から置き換える
+    if (process.getenv("LANG")) |lang| {
+        if (lang.len > 0) _ = setEnv("LANG", lang);
+    }
     // コンソールの TTY は再起動をまたいで残るので、前の起動のモードを戻す
     resetTty();
     loadConfig();

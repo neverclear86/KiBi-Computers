@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.wasi.p1
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -225,6 +226,22 @@ class WasiP1PollTest {
                         Ev(4, Errno.BADF.code, P1.EVENTTYPE_FD_WRITE),
                     ),
                     poll(s),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `デバイスのfdはFD_READもFD_WRITEもINVALのイベントになり、待たない（ADR 0054の保つ形。#695）`() = timeout(limit) {
+        env { e ->
+            val device = e.m.lock.withLockValue { DeviceHandle("123e4567-e89b-12d3-a456-426614174000", "kibi:screen").also { e.m.kernel.objects.add(it) } }
+            val opts = SpawnOptions(
+                stdio = StdioSpec(StdioSource.Object(device.id, HandleRights.READ), StdioSource.Object(device.id, HandleRights.WRITE), StdioSource.Closed),
+            )
+            e.run(opts) {
+                assertEquals(
+                    listOf(Ev(1, Errno.INVAL.code, P1.EVENTTYPE_FD_READ), Ev(2, Errno.INVAL.code, P1.EVENTTYPE_FD_WRITE)),
+                    poll(subs().read(1, 0).write(2, 1)),
                 )
             }
         }

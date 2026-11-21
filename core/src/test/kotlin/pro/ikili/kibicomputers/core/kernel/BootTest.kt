@@ -470,6 +470,28 @@ class BootTest {
     }
 
     @Test
+    fun `言語があればinitにLANGだけを渡し、再起動の後も前回の値を引き継ぐ`() = env {
+        disks.withInit("d", exe(foreverInit()))
+        assertTrue(m.boot(BootConfig.builder().bootDisks(listOf("d")).language("ja_JP.UTF-8").build()))
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && process(1) != null }
+        assertEquals(mapOf("LANG" to "ja_JP.UTF-8"), process(1)!!.env)
+        val firstInit = process(1)!!
+
+        // 再起動は前回の設定（lastBootConfig）で起動するので、同じ言語のまま（#661）
+        assertTrue(m.reboot())
+        tickUntil { host.reboots.get() == 1 && m.state == MachineState.RUNNING && !m.isBooting && process(1).let { it != null && it !== firstInit } }
+        assertEquals(mapOf("LANG" to "ja_JP.UTF-8"), process(1)!!.env)
+        assertEquals("ja_JP.UTF-8", m.lastBootConfig!!.language)
+    }
+
+    @Test
+    fun `プログラムだけの起動でも、言語があればinitにLANGを渡す`() = env {
+        assertTrue(m.boot(BootConfig.builder().firmwareProgram(exe(foreverInit())).language("en_US.UTF-8").build()))
+        tickUntil { m.state == MachineState.RUNNING && !m.isBooting && process(1) != null }
+        assertEquals(mapOf("LANG" to "en_US.UTF-8"), process(1)!!.env)
+    }
+
+    @Test
     fun `initにはシグナルを送れず、Ctrl+Cでも止まらない`() = env {
         disks.withInit("d", exe(foreverInit()))
         assertTrue(m.boot(bootDisks("d")))

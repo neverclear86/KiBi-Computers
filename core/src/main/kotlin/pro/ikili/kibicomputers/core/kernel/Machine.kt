@@ -151,7 +151,7 @@ public class MachineConfig private constructor(builder: Builder) {
     public val maxProcesses: Int = builder.maxProcesses
 
     /**
-     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。p2 のコマンドのコンポーネントなど）の数の上限（仮: 8。確定は #251）。
+     * 1 台のブロッキング型プロセス（専用スレッドを 1 本使う。待機点に変換しない道で動かすもの。`exec` したコンポーネントは変換できなければ断るので、これには入らない（#844））の数の上限（仮: 8。確定は #251）。
      * サーバー全体の枠（[SchedulerConfig.maxBlockingProcesses]）を少数の台で使い切らないためのもの。スレッドを持たない待ちは #757
      */
     public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
@@ -180,6 +180,26 @@ public class MachineConfig private constructor(builder: Builder) {
      * 上限に達したら `DeviceBus.attach` は断る（`false`）。保存しない（CPU から毎回決める）。仮: 16（確定は #122・#251）
      */
     public val maxDevices: Int = builder.maxDevices
+
+    /** [fuelSlice] の今の値（接続層の負荷試験が結果に書く。#740） */
+    public val fuelSliceValue: Long get() = fuelSlice
+
+    /**
+     * スライスだけを [value] に変えた設定（測定・テスト用。#740）。負荷試験が、スライスを `fuelPerTick` にして（1 tick に1回渡す）
+     * #47 の前と受け渡しの回数を比べるのに使う。[fuelPerTick] を超えた分は切り詰める。ゲームの設定の口ではない（スライスの値は #251）
+     */
+    public fun withFuelSlice(value: Long): MachineConfig {
+        val b = Builder()
+        b.fuelPerTick = fuelPerTick
+        b.fuelSlice(value)
+        b.maxProcesses = maxProcesses
+        b.maxBlockingProcesses = maxBlockingProcesses
+        b.maxHostCallsPerTick = maxHostCallsPerTick
+        b.memoryBytes = memoryBytes
+        b.maxProcessMemoryBytes = maxProcessMemoryBytes
+        b.maxDevices = maxDevices
+        return b.build()
+    }
 
     /** RAM のページ数 */
     internal val memoryPages: Int get() = pagesOf(memoryBytes)
@@ -301,7 +321,20 @@ public class Machine private constructor(
     internal val timers: MachineTimers = MachineTimers(scheduler.timerService) { timerId, generation -> onTimerDue(timerId, generation) }
 
     /** 燃料の遅延補充 */
-    internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now)
+    internal val fuelAccount = FuelAccount(kernel, config.fuelPerTick, scheduler.now, scheduler.fuelConsumed)
+
+    /** このマシンのプロセスが、燃料切れで巻き戻した回数（譲るための巻き戻しも数える。数え口） */
+    private val fuelUnwindsDone = AtomicLong()
+
+    /**
+     * このマシンのプロセスが、燃料切れ・譲るために巻き戻した回数（#821）。接続層の負荷試験が、台ごとに計算するコマンドの起動が済んだか
+     * （起動の途中は巻き戻せず、スレッドを持って待つことがある。ADR 0757）を見るために読む
+     */
+    public val fuelUnwindCount: Long get() = fuelUnwindsDone.get()
+
+    internal fun countFuelUnwind() {
+        fuelUnwindsDone.incrementAndGet()
+    }
 
     /** 線形メモリの使用量（RAM。#39）。親はサーバー全体の勘定（#362） */
     internal val memoryAccount = MemoryAccount(config.memoryPages, scheduler.memoryAccount)
@@ -678,6 +711,15 @@ public class Machine private constructor(
                 "${p.pid}:$name=${p.state} waits=$waits"
             }
             .ifEmpty { "none" }
+    }
+
+    /**
+     * 終わっていないプロセスごとの、燃料のスライスを受け取った回数（pid → 回数。実行時だけの数え口で、保存しない。戻した後は 0 から数える。#740）。
+     * 接続層の負荷試験が、同じ台の中で計算し続けるプロセスが全部進んでいるか（譲り合いが壊れて1本だけが回り続けていないか）を見るために、
+     * 測る区間の始めと終わりに読む。カーネルロックを取るので、毎 tick は呼ばない
+     */
+    public fun fuelGrantsByProcess(): Map<Int, Long> = lock.withLockValue {
+        runtimes.values.filter { !it.process.state.isTerminal }.associate { it.pid to it.fuelGrants }
     }
 
     /** 再起動を求められて、まだ [MachineHost.onRebootRequested] を呼んでいない（#85。`STOPPED` が再起動の途中かを見分ける） */
@@ -1683,8 +1725,8 @@ public class Machine private constructor(
      * - Component Model のコンポーネント（layer 1）は、ヘッダーで見分けて `ComponentProgram.load` で読み込み、リンクの計画まで作る
      *   （#687。[Program.loadExecutable]。ホストは固定の [KernelDrivers.COMPONENT_HOST]）。計画は p1 と同じく `ProgramCache` で全マシンが
      *   共有する。p1 の待機点への変換（`asyncifyExecutables`）はかけず、コンポーネント全体の変換を常にかける（#757。ADR 0757）。
-     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして、
-     *   変換できれば `WAIT_POINT`、できなければ `BLOCKING` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
+     *   待機点に変換できない作りは、p1 と同じく読み込みで断り `NOEXEC`（#844。理由はメッセージに書く。失敗は覚える）。
+     *   ドライバー（[drivers]）がコンポーネントを動かせなければ `NOEXEC`（[KernelDrivers.DEFAULT] は p2 のコマンドとして `WAIT_POINT` で動かす）。コンポーネントの検証の途中でコンパイル用のスレッドが割り込まれたら `AGAIN`
      *   （内容の失敗ではないので覚えない）。コンポーネントのプロセスは保存できない（#269）
      *
      * カーネルロックを持たずに呼ぶ。ほかの失敗は [spawn] と同じ。[asInit] は起動の手順だけが使う（[spawn]）。
@@ -2708,6 +2750,9 @@ public class Machine private constructor(
     /** 自動マウントの仕事を走らせた回数（テスト用） */
     internal val autoMountRuns = AtomicInteger()
 
+    /** 自動マウントの仕事を最後まで走らせ終えた回数（後始末 [unmountStaleDisksLocked] とマウントの後。テスト用） */
+    internal val autoMountFinished = AtomicInteger()
+
     /** 開いている途中の予約の数（テスト用） */
     internal val diskClaimCount: Int get() = lock.withLockValue { diskClaims.size }
 
@@ -3003,7 +3048,11 @@ public class Machine private constructor(
             // 印を下ろしてから状態を読む（下ろした後の挿し込みは、もう1回積まれる）
             autoMountScheduled.set(false)
             autoMountRuns.incrementAndGet()
-            reconcileMounts()
+            try {
+                reconcileMounts()
+            } finally {
+                autoMountFinished.incrementAndGet()
+            }
         }
         try {
             scheduler.bootExecutor.execute(job)

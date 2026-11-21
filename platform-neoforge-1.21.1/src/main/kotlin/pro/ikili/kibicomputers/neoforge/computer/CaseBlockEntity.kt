@@ -16,6 +16,7 @@ import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.chunk.LevelChunk
+import net.neoforged.neoforge.common.util.FakePlayer
 import pro.ikili.kibicomputers.core.access.PlayerAccess
 import pro.ikili.kibicomputers.core.access.PlayerAccessRecord
 import pro.ikili.kibicomputers.core.computer.CaseTier
@@ -26,8 +27,10 @@ import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.computer.RestoreReady
 import pro.ikili.kibicomputers.core.kernel.BootFailure
+import pro.ikili.kibicomputers.core.kernel.BootLanguage
 import pro.ikili.kibicomputers.core.kernel.DiskSnapshot
 import pro.ikili.kibicomputers.core.kernel.Machine
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.MachineEnvironment
@@ -166,6 +169,14 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
     private val speakerSlot = DeviceAddressSlot(SPEAKER_ADDRESS_TAG) { setChanged() }
 
+    /**
+     * OS の既定の言語（#661、ADR 0661）。POSIX の形（[BootLanguage.isValid] に合うもの）か `null`（英語）。
+     * 電源ボタンで起動したプレイヤーの言語で更新し、プレイヤーのいない起動（復元・復元の後の再起動・冷えた起動）は前回の値を使う。
+     * セーブデータの [BOOT_LANGUAGE_TAG] に書く。サーバーのメインスレッドでだけ読み書きする
+     */
+    internal var bootLanguage: String? = null
+        private set
+
     // 起動部品（#125）はまだないので、挿さっているとみなす（仮。#307）
     private val installedForBoot = ProvisionalBoot.withBootPart(tier, parts.installed)
 
@@ -295,6 +306,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     internal var restorePreparationHook: Runnable? = null
 
+    /** 挿さっている部品から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
+    private fun machineConfig(): MachineConfig {
+        val config = MachineSpecs.configOf(tier, parts.tiers)
+        return configOverride?.apply(config) ?: config
+    }
+
     /** 最後に [startRestore] で決めた戻す世代（テスト・#575 用。冷えた起動なら `null`。まだなら `null`） */
     internal var lastRestoreSource: RestoreSource? = null
         private set
@@ -331,10 +348,11 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         // RestoreQueue に返し、場所ごとに間引いてログに出させる（#785）
         try {
             restorePreparationHook?.run()
-            val config = MachineSpecs.configOf(tier, parts.tiers)
+            val config = machineConfig()
             val disks = prepareDisks()
             val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
-            val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
+            // プレイヤーはいないので、前回の言語を使う。戻したマシンの再起動・冷えた起動もこの値を引き継ぐ（#661）
+            val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
             val store = WorldMachineSaves.current
             // 予約の世代を使う: FULL でなくなったときの取り出しは identity を進めず（規則 5）、完了を受け取る前に順番が来ることがある（#575）
             val id = currentIdentity
@@ -491,8 +509,15 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         return true
     }
 
-    /** 自動保存の書き込みの回数の見積もり（今の ID があれば 1、ID を振る台は 2） */
-    internal val plannedWrites: Int get() = if (currentIdentity == null) 2 else 1
+    /**
+     * 自動保存の書き込みの回数の見積もり（今の ID があって `owner.bin` も書いてあれば 1。ID を振る台と、claim が受け入れた・振った ID で
+     * `owner.bin` をまだ書いていない台は、最初の [submit][pro.ikili.kibicomputers.core.persist.MachineSaveStore.submit] が `owner.bin` も書くので 2。#585）
+     */
+    internal val plannedWrites: Int
+        get() {
+            val id = currentIdentity ?: return 2
+            return if (WorldMachineSaves.current?.hasUnwrittenOwner(id.id) == true) 2 else 1
+        }
 
     /**
      * プレイヤーの破壊・爆発: このマシンの保存データのディレクトリを消す（ほかの経路で消えたブロックのディレクトリは残る）。
@@ -506,19 +531,23 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     /**
      * 電源ボタン。サーバーでだけ働く。電力の有無（#128）は、今は常にあるとして扱う。
      *
+     * 起動するときは、[player] の言語（クライアントの設定）を OS の既定の言語にして覚える（#661）。[player] が `null`・
+     * [FakePlayer]（他の MOD の自動化）・言語の形が合わないときは、前回の値を使う。止める操作では言語を変えない
+     *
      * @return 押した後の状態
      */
-    fun pressPowerButton(): ComputerStatus {
+    fun pressPowerButton(player: ServerPlayer? = null): ComputerStatus {
         val level = level as? ServerLevel ?: return computer.status
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
-        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val config = machineConfig()
         var environment = MachineEnvironment.builder().access(accessPort).build()
         var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
+            updateBootLanguage(player)
             val disks = prepareDisks()
             environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
-            boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk)
+            boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
         }
         val status = computer.pressPowerButton(
             ServerMachines.current,
@@ -535,6 +564,15 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             wiring.connect(level, blockPos, machine, speakerAddress, boot)
         }
         return status
+    }
+
+    /** 起動するプレイヤーの言語で [bootLanguage] を更新する。取れなければ前回の値のまま。変わったときだけ setChanged する */
+    private fun updateBootLanguage(player: ServerPlayer?) {
+        if (player == null || player is FakePlayer) return
+        val language = BootLanguage.fromMinecraft(player.clientInformation().language()) ?: return
+        if (language == bootLanguage) return
+        bootLanguage = language
+        setChanged()
     }
 
     /** 電源を入れる前のディスクの用意: 挿さっているディスクの写しと、起動の候補（ディスクのスロットの順） */
@@ -607,6 +645,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         tag.put(PARTS_TAG, parts.serializeNBT(registries))
         speakerSlot.save(tag)
         tag.putBoolean(POWERED_ON_TAG, computer.poweredOn)
+        bootLanguage?.let { tag.putString(BOOT_LANGUAGE_TAG, it) }
         savePlayerAccess(tag)
         // 参照を書くだけ（チャンクの保存のほかに /data get block・/clone・ピックブロックからも呼ばれる。印は ChunkDataEvent.Save で付ける）
         val id = identity
@@ -627,6 +666,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         speakerSlot.load(tag)
         // 古いセーブデータ（タグがない）は電源が切れている（#85）
         computer.loadPoweredOn(tag.getBoolean(POWERED_ON_TAG))
+        // タグがない（古いセーブデータ）・形が合わない（/data merge など）なら言語なし（英語。#661）
+        bootLanguage = if (tag.contains(BOOT_LANGUAGE_TAG, Tag.TAG_STRING.toInt())) {
+            tag.getString(BOOT_LANGUAGE_TAG).takeIf { BootLanguage.isValid(it) }
+        } else {
+            null
+        }
         loadPlayerAccess(tag)
         val id = if (tag.contains(MACHINE_ID_TAG, Tag.TAG_STRING.toInt())) tag.getString(MACHINE_ID_TAG) else null
         val generation = if (tag.contains(SAVE_GENERATION_TAG, Tag.TAG_LONG.toInt())) tag.getLong(SAVE_GENERATION_TAG) else null
@@ -682,6 +727,13 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         CaseMenu.server(containerId, playerInventory, this)
 
     companion object {
+        /**
+         * マシンの設定の差し替え（負荷試験用。#740）。電源を入れるときと復元を始めるときに、部品から決めた設定に当てる。
+         * 負荷試験が、スライスを変えて比べる回（`-PloadTestFuelSlice`）で立て、試験の終わり（失敗のときも）に `null` に戻す。普段は `null`
+         */
+        @Volatile
+        internal var configOverride: java.util.function.UnaryOperator<MachineConfig>? = null
+
         /** セーブデータの部品のキー */
         const val PARTS_TAG: String = "Parts"
 
@@ -702,6 +754,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
 
         /** セーブデータの、電源が入っているかのキー（#85、ADR 0085） */
         const val POWERED_ON_TAG: String = "PoweredOn"
+
+        /** セーブデータの、OS の既定の言語のキー（#661、ADR 0661。中身は POSIX の形。言語がなければ書かない） */
+        const val BOOT_LANGUAGE_TAG: String = "BootLanguage"
 
         private val LOGGER = LogUtils.getLogger()
     }

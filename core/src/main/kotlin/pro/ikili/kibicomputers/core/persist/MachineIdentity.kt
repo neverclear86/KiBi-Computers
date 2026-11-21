@@ -47,7 +47,7 @@ public object MachineIdentityLimits {
 /** [MachineSaveStore.claim] の判定（#81、ADR 0081） */
 @ApiStatus.Internal
 public enum class ClaimResult {
-    /** 自分が持ち主（`owner.bin` がなければ自分を持ち主として書いた） */
+    /** 自分が持ち主（`owner.bin` がなければ自分を持ち主として覚え、次の [MachineSaveStore.submit] が最初の世代の前に書く。#585） */
     KEPT,
 
     /** 持ち主の位置が違い、NBT の epoch が記録以上だったので引き取った（epoch + 1） */
@@ -62,7 +62,7 @@ public enum class ClaimResult {
     /** NBT の値が検査に外れた・引き取る epoch が上限 → 新しい UUID */
     NEW_ID_INVALID,
 
-    /** `owner.bin` が壊れている・読み書きに失敗した → 新しい UUID */
+    /** `owner.bin` が壊れている・読めなかった（書き込みの仕事を待ちきれなかったときも）→ 新しい UUID（claim は `owner.bin` を書かない） */
     NEW_ID_UNREADABLE,
     ;
 
@@ -73,7 +73,7 @@ public enum class ClaimResult {
 /**
  * [MachineSaveStore.claim] の結果。
  *
- * @property identity 確定した ID。新しい UUID の `owner.bin` も書けなかったときは `null`（ID なしとして続け、最初の取り出しで振り直す）
+ * @property identity 確定した ID。claim は `owner.bin` を書かない（#585。次の [MachineSaveStore.submit] が書く）ので、今は常に非 `null`（型は互換のために `null` を許す）
  * @property result 判定
  */
 @ApiStatus.Internal
@@ -337,7 +337,7 @@ public data class FullSaveRule @JvmOverloads constructor(
  *
  * @property autosavePeriodTicks 自動保存の周期（tick）
  * @property autosaveQuiesceTicks 自動保存で、止めてから [SaveReadiness.READY] になるまで待つ上限（tick）
- * @property autosaveWritesPerTick 自動保存で tick ごとに書き込みに回す回数の予算。`owner.bin` を書く台は 2 と数える。
+ * @property autosaveWritesPerTick 自動保存で tick ごとに書き込みに回す回数の予算。`owner.bin` を書く台（ID を振る台・claim が受け入れてまだ書いていない台）は 2 と数える。
  *   書き込み（符号化・圧縮・fsync）は書き込みのスレッドで行う（#84）ので、メインスレッドのコストは取り出しだけ。
  *   仮の値 4（#84。確定は #251）。1,000 台の一巡は、ID を振る初回で約 500 tick、2回目から約 250 tick（周期 6000 tick より短い）
  * @property unloadWaitBudgetMillis チャンクのアンロードで、tick ごとに待機点を待つ時間の合計の上限

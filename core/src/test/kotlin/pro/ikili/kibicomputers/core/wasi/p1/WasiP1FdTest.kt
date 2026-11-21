@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.TestDriver
@@ -112,6 +113,26 @@ class WasiP1FdTest {
                 assertEquals(Errno.INVAL.code, call("fd_fdstat_set_flags", 0, 0x100))
                 assertEquals(Errno.NOTSUP.code, call("fd_fdstat_set_flags", 0, P1.FDFLAGS_SYNC.toLong()))
                 assertEquals(Errno.BADF.code, call("fd_fdstat_get", 7, 400))
+            }
+        }
+    }
+
+    @Test
+    fun `デバイスのfdのfd_readとfd_writeはNOSYSで、権利のない向きはBADF（ADR 0054の保つ形。#695）`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 1_000_000)
+            val device = m.lock.withLockValue { DeviceHandle("123e4567-e89b-12d3-a456-426614174000", "kibi:screen").also { m.kernel.objects.add(it) } }
+            val module = forwarding("fd_read", "fd_write")
+            val opts = SpawnOptions(
+                stdio = StdioSpec(StdioSource.Object(device.id, HandleRights.READ), StdioSource.Object(device.id, HandleRights.WRITE), StdioSource.Closed),
+            )
+            runToEnd(h, m, module, opts) { _, mem, call ->
+                mem.write(200, "hi".toByteArray())
+                iov(mem, 100, 200 to 2)
+                assertEquals(Errno.NOSYS.code, call("fd_read", 0, 100, 1, 300))
+                assertEquals(Errno.NOSYS.code, call("fd_write", 1, 100, 1, 300))
+                assertEquals(Errno.BADF.code, call("fd_write", 0, 100, 1, 300))
+                assertEquals(Errno.BADF.code, call("fd_read", 1, 100, 1, 300))
             }
         }
     }

@@ -26,7 +26,7 @@ internal object KernelDrivers {
      * p1 に許していない import（[WasiP1.checkImports]。#40）があっても `NOEXEC`。
      * p1 の止まりうる import（[WasiP1.WAIT_IMPORTS]）で待機点への変換をかけさせ（#329）、変換できたものは `WAIT_POINT` で動かす。
      * コンポーネント（[Program.component]）は p2 のコマンドとして [WasiP2Driver] で動かす（#687。待機点への変換をかけたものは
-     * `WAIT_POINT`、かけられなかったものは `BLOCKING`。#757。
+     * `WAIT_POINT`。#757。`exec` では変換できないものは読み込みで断るので来ない（#844）。直接読み込んだものだけ `BLOCKING`。
      * `wasi:cli/run@0.2.<n>` の `run` がなければ `NOEXEC`。ADR 0267）
      */
     val DEFAULT: ProcessDriverFactory = object : ProcessDriverFactory {

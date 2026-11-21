@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.device.DeviceFailureLog
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
@@ -110,6 +111,9 @@ public class MachineScheduler private constructor(
         if (hostFailureTraced.size >= HOST_FAILURE_TRACE_LIMIT) return HostFailureTrace.LIMIT_REACHED
         return if (hostFailureTraced.add(site)) HostFailureTrace.NEW else HostFailureTrace.KNOWN
     }
+
+    /** デバイスのメソッドの失敗（internal error）のログ。スケジューラ全体で間引く（#679） */
+    internal val deviceFailureLog = DeviceFailureLog()
 
     /** 期限の tick に起こすマシン（[wakeAtTick]。今はゲストの再起動の待ちだけ。#635）。期限の早い順。[wakeLock] の中で触る */
     private val wakeQueue = PriorityQueue<TickWake>(compareBy<TickWake> { it.tick }.thenBy { it.seq })
@@ -221,6 +225,43 @@ public class MachineScheduler private constructor(
      */
     internal val fuelYields = AtomicLong()
 
+    /**
+     * マシンの燃料から渡した手持ちのうち、使った量の合計（数え口。#740）。手持ちを渡したとき（`FuelAccount.take`）に渡した量を足し、
+     * 返したとき（`FuelAccount.giveBack`）に残りを引く。前借りで残りが負なら、その分も使ったに入る。巻き戻しの費用（[fuelUnwindCost]）も含む。
+     * 例外で抜けたときは書き戻さないので、そのときの手持ちは全部使ったに入る（まれなので許容する）
+     */
+    internal val fuelConsumed = AtomicLong()
+
+    /** 燃料切れで巻き戻したときに、マシンの燃料から引いた巻き戻し・巻き直しの費用の合計（数え口。#740。[fuelConsumed] にも含む） */
+    internal val fuelUnwindCost = AtomicLong()
+
+    /**
+     * 負荷試験の段階の区切りで読む、燃料と許可の数え口の今の値（#740）。どれもサーバー全体の累計で、reset しない。
+     * 値は1つずつ読むので、動いている間に読むと、互いに少しずれる（段階の区切りで差を取るぶんには問題にならない）
+     */
+    public val permitAcquisitionCount: Long get() = permitAcquisitions.get()
+
+    /** [fuelSliceRenewals] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelSliceRenewalCount: Long get() = fuelSliceRenewals.get()
+
+    /** [fuelYields] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelYieldCount: Long get() = fuelYields.get()
+
+    /** [fuelConsumed] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelConsumedTotal: Long get() = fuelConsumed.get()
+
+    /** [fuelUnwindCost] の今の値（接続層の負荷試験が読む。#740） */
+    public val fuelUnwindCostTotal: Long get() = fuelUnwindCost.get()
+
+    /** [fuelUnwinds] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelUnwindCount: Long get() = fuelUnwinds.get()
+
+    /** [fuelBlockingWaits] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelBlockingWaitCount: Long get() = fuelBlockingWaits.get()
+
+    /** [fuelOverdrafts] の今の値（接続層の負荷試験が読む。#821） */
+    public val fuelOverdraftCount: Long get() = fuelOverdrafts.get()
+
     init {
         dispatcher.start()
     }
@@ -283,6 +324,8 @@ public class MachineScheduler private constructor(
     public fun tick() {
         val now = tickCounter.incrementAndGet()
         dispatcher.signal()
+        // 間引いたデバイスの失敗の要約（時が来ていなければ AtomicLong を1回読むだけ。#679）
+        deviceFailureLog.tick(now)
         val batch = ArrayList<Machine>()
         // マシンのロックの中で列のロックを取る（wakeAtTick）ので、列のロックを放してからマシンを呼ぶ
         wakeLock.withLockValue {
@@ -440,6 +483,8 @@ public class MachineScheduler private constructor(
         machines.values.forEach { it.stop() }
         wakeLock.withLockValue { wakeQueue.clear() }
         dispatcher.close()
+        // 最後の要約の後に数えた、デバイスのメソッドの失敗の繰り返しを出す（#679）
+        deviceFailureLog.flushPending()
         timerService.close()
         workers.shutdown()
         bootExecutor.shutdown()

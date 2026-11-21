@@ -269,6 +269,12 @@ object ServerMachines {
         var autosaveWritten: Long = 0
         var autosaveSkipped: Long = 0
 
+        /**
+         * 周期の数え口（[autosaveTick] の `% autosavePeriodTicks`）で自動保存の一巡を始めた回数。[reset] では戻さない
+         * （負荷試験が、一巡が始まった tick を前の呼び出しとの差で知るため。#834）
+         */
+        var autosaveCycleStarts: Long = 0
+
         /** 終わった自動保存の周期の、一巡にかかった tick 数（古い順） */
         val autosaveCycleTicks: MutableList<Int> = ArrayList()
 
@@ -586,6 +592,17 @@ object ServerMachines {
         rotation.startCycle(tracked.filter { it in onlySet && it.computer.machine != null && !it.computer.isRestoring })
     }
 
+    /**
+     * 自動保存の周期の数え口を、[ticksUntilCycle] tick 後の tick の始め（`ServerTickEvent.Pre`）に周期が来るように合わせる
+     * （負荷試験の本番の形の段階用。#834。本番では呼ばない）。周期は本物の経路（[autosaveTick] の `% autosavePeriodTicks`）で始まる。
+     * 1 は次の tick。[MachineSaveConfig.autosavePeriodTicks] より小さくする
+     */
+    internal fun alignAutosaveCounter(ticksUntilCycle: Long) {
+        val period = saveConfig.autosavePeriodTicks
+        require(ticksUntilCycle in 1 until period) { "ticksUntilCycle must be in 1 until $period: $ticksUntilCycle" }
+        autosaveTicks = period - ticksUntilCycle
+    }
+
     /** 自動保存の周期が終わっている（負荷試験用） */
     internal val isAutosaveCycleDone: Boolean
         get() = rotation.isCycleDone
@@ -617,6 +634,7 @@ object ServerMachines {
         if (autosaveTicks % saveConfig.autosavePeriodTicks == 0L) {
             if (!rotation.isCycleDone) LOGGER.warn("Autosave of computers did not finish within {} ticks", saveConfig.autosavePeriodTicks)
             rotation.startCycle(tracked.filter { it.computer.machine != null && !it.computer.isRestoring })
+            Stats.autosaveCycleStarts++
         }
         if (rotation.isCycleDone) return
         rotation.tick(AUTOSAVE_TARGET)

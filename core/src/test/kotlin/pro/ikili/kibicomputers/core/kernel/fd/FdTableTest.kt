@@ -309,6 +309,19 @@ class FdTableTest {
     }
 
     @Test
+    fun `dev_deviceのfdのpollは、読みも書きもINVALで待てない（ADR 0054の保つ形。#695）`() {
+        val devices = Devices().also { it.table[address] = "kibi:screen" }
+        val vfs = deviceVfs(devices)
+        val file = vfs.open(VfsPath.parse("/dev/device/$address"), OpenOptions(read = true, write = true))
+        val fd = fds.openFile(file, vfs, 0, HandleRights.READ or HandleRights.WRITE)
+        assertEquals(FdReadiness.Error(Errno.INVAL), FdIo.pollEntryLocked(kernel, vfs, fds.entry(fd), WaitCondition.READABLE))
+        assertEquals(FdReadiness.Error(Errno.INVAL), FdIo.pollEntryLocked(kernel, vfs, fds.entry(fd), WaitCondition.WRITABLE))
+        // 権利のない向きは、種類の前に BADF
+        val readOnly = fds.openFile(vfs.open(VfsPath.parse("/dev/device/$address"), OpenOptions(read = true)), vfs, 0, HandleRights.READ)
+        assertEquals(FdReadiness.Error(Errno.BADF), FdIo.pollEntryLocked(kernel, vfs, fds.entry(readOnly), WaitCondition.WRITABLE))
+    }
+
+    @Test
     fun `openFileのdev_deviceはnodeが同じ別のデバイスがあっても、開いたパスのデバイスを指す`() {
         // address と上位・下位の 64 ビットを入れ替えたもの（node が同じ。#693）
         val other = "a4564266-1417-4000-123e-4567e89b12d3"
