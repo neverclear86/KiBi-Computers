@@ -195,6 +195,9 @@ public class MachineScheduler private constructor(
     /** [tick] でホスト呼び出しを実行するのにかかった時間の合計（ナノ秒。数え口。#356） */
     internal val hostCallNanos = AtomicLong()
 
+    /** [tick] で実行したホスト呼び出しの件数の合計（数え口。#356） */
+    internal val hostCallsRun = AtomicLong()
+
     /** `stop()` が送った割り込みの数（数え口） */
     internal val interruptsSent = AtomicLong()
 
@@ -261,6 +264,42 @@ public class MachineScheduler private constructor(
 
     /** [fuelOverdrafts] の今の値（接続層の負荷試験が読む。#821） */
     public val fuelOverdraftCount: Long get() = fuelOverdrafts.get()
+
+    /** [budgetCutTicks] の今の値（接続層の負荷試験が読む。#356） */
+    public val budgetCutTickCount: Long get() = budgetCutTicks.get()
+
+    /** [carriedMachines] の今の値（接続層の負荷試験が読む。#356） */
+    public val carriedMachineCount: Long get() = carriedMachines.get()
+
+    /** [notifyNanos] の今の値（接続層の負荷試験が読む。#356） */
+    public val notifyNanosTotal: Long get() = notifyNanos.get()
+
+    /** [hostCallNanos] の今の値（接続層の負荷試験が読む。#356） */
+    public val hostCallNanosTotal: Long get() = hostCallNanos.get()
+
+    /** [hostCallsRun] の今の値（接続層の負荷試験が読む。#356） */
+    public val hostCallsRunTotal: Long get() = hostCallsRun.get()
+
+    /** [mainThreadBudgetOverrideNanos] の値。負なら差し替えていない */
+    @Volatile
+    private var budgetOverrideNanos = -1L
+
+    /**
+     * メインスレッドの予算（[SchedulerConfig.mainThreadBudgetNanos]）の、実行中の差し替え（試験用。#356）。`null` なら設定の値を使う。
+     * 接続層の負荷試験が、予算あり・予算なし（[Long.MAX_VALUE]）を同じサーバーで続けて測るために使う。本番のコードからは使わない。
+     * 次の [tick] から効く（[tick] の頭で1回読む）。差し替えたら、試験の終わりに（失敗したときも）`null` に戻す
+     *
+     * @throws IllegalArgumentException 1 未満
+     */
+    public var mainThreadBudgetOverrideNanos: Long?
+        get() = budgetOverrideNanos.takeIf { it >= 0 }
+        set(value) {
+            require(value == null || value >= 1) { "予算は 1 ナノ秒以上: $value" }
+            budgetOverrideNanos = value ?: -1L
+        }
+
+    /** 今の tick に使うメインスレッドの予算（差し替えがあればそれ、なければ設定の値） */
+    private fun currentBudgetNanos(): Long = budgetOverrideNanos.let { if (it >= 0) it else config.mainThreadBudgetNanos }
 
     init {
         dispatcher.start()
@@ -351,7 +390,7 @@ public class MachineScheduler private constructor(
         try {
             // 列から取り出すのは tick の頭の1回だけ（配る中で積み直したマシンは、次の tick に回る）
             while (true) notifyCarry.addLast(notifyQueue.poll() ?: break)
-            val budget = TickBudget(options.nanoTime, config.mainThreadBudgetNanos)
+            val budget = TickBudget(options.nanoTime, currentBudgetNanos())
             var cut = false
             if (notifyCarry.isNotEmpty()) cut = deliverNotifications(budget)
             // 通知の中で出したホスト呼び出しも、この tick で実行する（取り出すのはこの1回だけ）

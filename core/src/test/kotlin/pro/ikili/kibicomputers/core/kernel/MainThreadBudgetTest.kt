@@ -554,4 +554,59 @@ class MainThreadBudgetTest {
             assertEquals(listOf("again"), b.tick())
         }
     }
+
+    @Test
+    fun `予算の差し替えは次のtickから効き、外すと設定の値に戻る`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val s = b.h.scheduler
+            val m = b.machine()
+            assertNull(s.mainThreadBudgetOverrideNanos)
+            for (i in 1..9) b.call(m, "c$i", 40)
+            // 設定の予算（100）: 3件で止める
+            assertEquals(listOf("c1", "c2", "c3"), b.tick())
+            // 差し替え（40）: 1件で止める
+            s.mainThreadBudgetOverrideNanos = 40
+            assertEquals(40L, s.mainThreadBudgetOverrideNanos)
+            assertEquals(listOf("c4"), b.tick())
+            // 予算なし（比べる基準）: 残りを全部
+            s.mainThreadBudgetOverrideNanos = Long.MAX_VALUE
+            for (i in 10..12) b.call(m, "c$i", 40)
+            assertEquals((5..12).map { "c$it" }, b.tick())
+            // 外すと設定の値に戻る
+            s.mainThreadBudgetOverrideNanos = null
+            assertNull(s.mainThreadBudgetOverrideNanos)
+            for (i in 13..17) b.call(m, "c$i", 40)
+            assertEquals(listOf("c13", "c14", "c15"), b.tick())
+            assertThrows(IllegalArgumentException::class.java) { s.mainThreadBudgetOverrideNanos = 0 }
+            assertNull(s.mainThreadBudgetOverrideNanos)
+        }
+    }
+
+    @Test
+    fun `負荷試験の数え口は、打ち切ったtick・持ち越した台・実行した件数と時間を数える`() = timeout(limit) {
+        Budgeted(100).use { b ->
+            val s = b.h.scheduler
+            val a = b.machine()
+            val c = b.machine()
+            for (i in 1..3) b.call(a, "a$i", 60)
+            b.call(c, "c1", 10)
+            b.notify(a, "n1", 20)
+            // 通知 20、a1・a2（60・60）で予算を超えて止める。c は手を付けずに持ち越す
+            assertEquals(listOf("n1", "a1", "a2"), b.tick())
+            assertEquals(1L, s.budgetCutTickCount)
+            assertEquals(1L, s.carriedMachineCount)
+            assertEquals(2L, s.hostCallsRunTotal)
+            assertEquals(20L, s.notifyNanosTotal)
+            assertEquals(120L, s.hostCallNanosTotal)
+            assertEquals(2L, a.hostCallRunCount)
+            assertEquals(0L, c.hostCallRunCount)
+            // c1・a3 で残りがなくなる（打ち切りは増えない）
+            assertEquals(listOf("c1", "a3"), b.tick())
+            assertEquals(1L, s.budgetCutTickCount)
+            assertEquals(4L, s.hostCallsRunTotal)
+            assertEquals(190L, s.hostCallNanosTotal)
+            assertEquals(3L, a.hostCallRunCount)
+            assertEquals(1L, c.hostCallRunCount)
+        }
+    }
 }

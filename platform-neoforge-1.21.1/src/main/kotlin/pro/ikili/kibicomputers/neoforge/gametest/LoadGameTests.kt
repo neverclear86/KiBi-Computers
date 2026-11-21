@@ -273,6 +273,10 @@ object LoadGameTests {
             productionAutosave = System.getProperty(LoadSettings.PRODUCTION_AUTOSAVE_PROPERTY).toBoolean(),
             vanillaSaveOffset = LoadSettings.intProperty(LoadSettings.VANILLA_SAVE_OFFSET_PROPERTY),
             syntheticLogTicks = LoadSettings.intProperty(LoadSettings.SYNTHETIC_LOG_TICKS_PROPERTY),
+            hostCallers = LoadSettings.intProperty(LoadSettings.HOST_CALLERS_PROPERTY),
+            hostCallMicros = LoadSettings.intProperty(LoadSettings.HOST_CALL_MICROS_PROPERTY).toLong().takeIf { it > 0 }
+                ?: LoadSettings.DEFAULT_HOST_CALL_MICROS,
+            hostCallParallel = LoadSettings.intProperty(LoadSettings.HOST_CALL_PARALLEL_PROPERTY).coerceAtLeast(1),
         )
         LoadRun(helper, settings) { report -> LOGGER.info("Load test ({} computers, {})\n{}", count, os.id, report.toMarkdown()) }.start()
     }
