@@ -54,6 +54,7 @@ import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProgramLoadBusyException
 import pro.ikili.kibicomputers.core.kernel.process.Shebang
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.MachineCpu
 import pro.ikili.kibicomputers.core.kernel.time.ClockSnapshot
@@ -105,6 +106,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.io.ByteArrayOutputStream
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -312,6 +314,20 @@ public class Machine private constructor(
     /** カーネルロック。持ったまま待たない・WASM を呼ばない・[MachineHost] を呼ばない */
     internal val lock = ReentrantLock()
 
+    /**
+     * 今の公平の組（#738、ADR 0738）。許可・ブロッキング型の枠・読み込みの待ち行列・画面の送信の予算で、まずこの組の間で公平にし、
+     * 組ごとの上限をかける。初めは [MachineEnvironment.fairnessKey] から決め、持ち主が変わったら [updateFairnessKey] で差し替える。
+     * 差し替えは次に並ぶときから効き、並んでいる・借りているものは、並んだ・借りたときの組に返す。どのスレッドから読んでもよい
+     */
+    @Volatile
+    public var fairShareGroup: FairShareGroup = FairShareGroup.of(environment.fairnessKey)
+        private set
+
+    /** 公平の組の鍵（持ち主のプレイヤーの UUID。`null` は持ち主なし）を差し替える（#738）。どのスレッドから呼んでもよい */
+    public fun updateFairnessKey(playerId: UUID?) {
+        if (fairShareGroup.playerId != playerId) fairShareGroup = FairShareGroup.of(playerId)
+    }
+
     /** カーネルの状態（保存の対象） */
     internal val kernel = KernelState(config.maxProcesses).also {
         it.clocks.start(environment.clock, scheduler.now)
@@ -417,7 +433,14 @@ public class Machine private constructor(
     /** マシンの CPU */
     internal val cpu = MachineCpu(
         // CPU を渡したら、許可の待ち行列に並べる。許可を受け取ってからワーカーに渡す（#350）
-        onThreadlessGranted = { rt -> scheduler.permits.submit(rt) { runner.runStep(rt) } },
+        // 並べたときの組を控え、step の終わりにその組へ返す（#738。並んでいる間に持ち主が変わっても数を合わせる）
+        onThreadlessGranted = { rt ->
+            val group = fairShareGroup
+            scheduler.permits.submit(rt, group) {
+                rt.permitGroup = group
+                runner.runStep(rt)
+            }
+        },
         onThreadlessRevoked = { rt -> scheduler.permits.remove(rt) },
     )
 
@@ -1565,12 +1588,12 @@ public class Machine private constructor(
             ) {
                 throw ResourceLimitException("このコンピューターのブロッキング型のプロセスの数が上限（${config.maxBlockingProcesses}）")
             }
-            if (kind == ProcessKind.BLOCKING && !scheduler.tryReserveBlocking()) {
-                throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${scheduler.config.maxBlockingProcesses}）")
-            }
+            // 次に持ち主ごと（公平の組。#738）、最後にサーバー全体。予約した組を控え、終わり・巻き戻しでその組へ返す
+            val blockingGroup = fairShareGroup
+            if (kind == ProcessKind.BLOCKING) scheduler.reserveBlocking(blockingGroup)
             // ここから引き返せない点（スレッドを動かす・待ち行列に積む）までに例外が出たら、足した分を巻き戻して投げ直す（#629）。
             // どこまで進んだかを覚えておき、進んだ分だけ戻す（rollbackSpawnLocked）。成功の道筋では何も作らない
-            val reserved = kind == ProcessKind.BLOCKING
+            val reserved = if (kind == ProcessKind.BLOCKING) blockingGroup else null
             val prevInitPid = kernel.initPid
             var process: Process? = null
             var handleRetained = false
@@ -1598,6 +1621,7 @@ public class Machine private constructor(
                     spawnStage(SpawnStage.HANDLE)
                 }
                 val r = ProcessRuntime(this, p, program, driver)
+                r.blockingGroup = blockingGroup
                 runner.initRuntime(r)
                 spawnStage(SpawnStage.RUNTIME_INIT)
                 runtimes[pid] = r
@@ -1654,7 +1678,7 @@ public class Machine private constructor(
      */
     private fun rollbackSpawnLocked(
         cause: Throwable,
-        reserved: Boolean,
+        reserved: FairShareGroup?,
         prevInitPid: Int,
         process: Process?,
         handleRetained: Boolean,
@@ -1679,7 +1703,7 @@ public class Machine private constructor(
             if (process.objectId != 0) rollbackStep(cause) { kernel.objects.release(process.objectId, wakeSink) }
         }
         kernel.initPid = prevInitPid
-        if (reserved) scheduler.releaseBlocking()
+        if (reserved != null) scheduler.releaseBlocking(reserved)
         // awaitTermination で待っている側を起こす（状態は変えないので、checkAllDoneLocked は呼ばない）
         if (kernel.processes.liveCount() == 0 && registeredThreads == 0) terminated.signalAll()
     }
@@ -1810,7 +1834,8 @@ public class Machine private constructor(
         // コンポーネントは待機点への変換を使わないので、キーの止まりうる import を空にそろえる（#687。二重に読み込まない）
         val waitImports = Program.cacheWaitImports(executable.bytes, if (scheduler.options.asyncifyExecutables) drivers.waitImports else emptySet())
         val host = KernelDrivers.COMPONENT_HOST
-        val future = scheduler.programs.load(id, executable.bytes, metered, waitImports) { bytes ->
+        // 公平の組の読み込みの上限で断るのはゲストの exec だけ（init は parentPid = 0。起動の失敗にしない。#738）
+        val future = scheduler.programs.load(id, fairShareGroup, parentPid != 0, executable.bytes, metered, waitImports) { bytes ->
             Program.loadExecutable(runtime, bytes, limits, metered, waitImports, host)
         }
         // 読み込みが終わったら、元のバイト列をモジュールの置き場に書く（#82。読み込みのスレッドで。メインスレッドでは書かない）

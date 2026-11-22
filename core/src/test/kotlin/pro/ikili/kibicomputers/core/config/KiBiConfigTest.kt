@@ -38,6 +38,31 @@ class KiBiConfigTest {
     }
 
     @Test
+    fun ownerLimitsReachTheSchedulerAndTheScreenTraffic() {
+        // 既定（#738）: 組ごとの値は SchedulerConfig・ScreenSyncTraffic の既定と同じ
+        val defaults = KiBiConfig.schedulerConfig(ConfigValues.DEFAULTS, ModuleStore.NONE)
+        assertEquals(SchedulerConfig.DEFAULT.maxConcurrentMachinesPerGroup, defaults.maxConcurrentMachinesPerGroup)
+        assertEquals(SchedulerConfig.DEFAULT.maxBlockingProcessesPerGroup, defaults.maxBlockingProcessesPerGroup)
+        assertEquals(SchedulerConfig.DEFAULT.maxPendingLoadsPerGroup, defaults.maxPendingLoadsPerGroup)
+        assertEquals(ScreenSyncTraffic.DEFAULT_GROUP_BYTES_PER_SECOND, KiBiConfig.screenSyncTraffic<Any>(ConfigValues.DEFAULTS).groupBytesPerSecond)
+
+        val values = ConfigValues.resolve(
+            mapSource(
+                KiBiConfig.MAX_CONCURRENT_MACHINES_PER_OWNER to 3,
+                KiBiConfig.MAX_BLOCKING_PROCESSES_PER_OWNER to 5,
+                KiBiConfig.MAX_PENDING_LOADS_PER_OWNER to 7,
+                KiBiConfig.SCREEN_OWNER_BYTES_PER_SECOND to 11_000,
+            ),
+        )
+        assertEquals(emptyList<ConfigEntry<*>>(), values.rejected)
+        val scheduler = KiBiConfig.schedulerConfig(values, ModuleStore.NONE)
+        assertEquals(3, scheduler.maxConcurrentMachinesPerGroup)
+        assertEquals(5, scheduler.maxBlockingProcessesPerGroup)
+        assertEquals(7, scheduler.maxPendingLoadsPerGroup)
+        assertEquals(11_000, KiBiConfig.screenSyncTraffic<Any>(values).groupBytesPerSecond)
+    }
+
+    @Test
     fun autoSentinelLeavesMachineDependentDefaults() {
         val explicit = ConfigValues.resolve(
             mapSource(KiBiConfig.MAX_CONCURRENT_MACHINES to 3, KiBiConfig.TOTAL_MEMORY_MIB to 5),

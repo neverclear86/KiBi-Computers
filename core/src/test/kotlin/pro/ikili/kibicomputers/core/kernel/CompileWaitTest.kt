@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
@@ -22,6 +23,7 @@ import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.time.Duration
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
@@ -66,8 +68,10 @@ class CompileWaitTest {
         }
     }
 
-    private fun env(maxConcurrentMachines: Int = 4, block: Env.() -> Unit) = timeout(limit) {
-        val config = SchedulerConfig.builder().maxConcurrentMachines(maxConcurrentMachines).maxBlockingProcesses(64).compilerThreads(1).build()
+    private fun env(maxConcurrentMachines: Int = 4, maxPendingLoadsPerGroup: Int? = null, block: Env.() -> Unit) = timeout(limit) {
+        val config = SchedulerConfig.builder().maxConcurrentMachines(maxConcurrentMachines).maxBlockingProcesses(64).compilerThreads(1)
+            .apply { maxPendingLoadsPerGroup?.let { maxPendingLoadsPerGroup(it) } }
+            .build()
         Harness(config).use { h ->
             val env = Env(h)
             try {
@@ -316,6 +320,53 @@ class CompileWaitTest {
         other.stop()
         assertTrue(m.awaitTermination(5_000))
         assertTrue(other.awaitTermination(5_000))
+    }
+
+    @Test
+    fun `組の読み込みの上限で断るのはゲストのexecだけで、同じ組のinitは断らず、別の持ち主は受け付ける`() = env(maxPendingLoadsPerGroup = 2) {
+        val a = FairShareGroup.of(UUID(0, 1))
+        val b = FairShareGroup.of(UUID(0, 2))
+        val envA = MachineEnvironment.builder().fairnessKey(UUID(0, 1)).build()
+        val envB = MachineEnvironment.builder().fairnessKey(UUID(0, 2)).build()
+        val programs = h.scheduler.programs
+        val host = FailureHost()
+        val disk = initDisk(exe(exitingInit()))
+        h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(disk, readOnly = false) else null }
+        val m = h.machine(fuelPerTick = 1_000_000, environment = envA)
+        val files = (0..2).map { "/bin/p$it" to exe() }
+        m.mountRoot(*files.toTypedArray())
+        val outs = files.map { AtomicReference<Any>() }
+        // 組 A の読み込みが上限（2）まで積まれる（読み込みはゲートで止まる）
+        val pids = (0 until 2).map { i -> m.spawnTest(h.program(emptyModule()), execer(files[i].first, outs[i])) }
+        tickUntil { programs.pendingOfGroup(a) == 2 && pids.all { m.stateOf(it) == ProcessState.WAITING_HOST } }
+        // ゲストの exec（親のあるもの）は、組の上限で待たずに AGAIN
+        val over = m.spawnTest(h.program(emptyModule()), execer(files[2].first, outs[2]))
+        tickUntil { m.stateOf(over).isTerminal }
+        assertEquals(Errno.AGAIN, (outs[2].get() as FsException).errno)
+        assertEquals(2, programs.pendingOfGroup(a))
+        // 同じ持ち主の別の台の init（parentPid = 0）は断らず、組の数に入れる
+        val booting = h.machine(fuelPerTick = 1_000_000, host = host, environment = envA)
+        assertTrue(booting.boot(BootConfig.builder().bootDisks(listOf("d")).build()))
+        tickUntil("init の読み込みが組の数に入らない") { programs.pendingOfGroup(a) == 3 }
+        // 別の持ち主の台は受け付ける
+        val other = h.machine(fuelPerTick = 1_000_000, environment = envB)
+        other.mountRoot("/bin/q" to exe())
+        val otherOut = AtomicReference<Any>()
+        val otherPid = other.spawnTest(h.program(emptyModule()), execer("/bin/q", otherOut))
+        tickUntil { other.stateOf(otherPid) == ProcessState.WAITING_HOST }
+        assertEquals(1, programs.pendingOfGroup(b))
+        gate.countDown()
+        tickUntil { !booting.isBooting && pids.all { m.stateOf(it).isTerminal } && other.stateOf(otherPid).isTerminal }
+        // 起動の失敗の通知は tick() で配られる
+        repeat(5) { h.scheduler.tick() }
+        assertEquals(emptyList<Pair<BootFailure, String>>(), host.failures.toList(), "init を断って起動が失敗した")
+        assertTrue(outs.take(2).all { it.get() is Int }, outs.toString())
+        assertTrue(otherOut.get() is Int)
+        eventually { programs.pendingGroupCount == 0 }
+        for (machine in listOf(m, booting, other)) {
+            machine.stop()
+            assertTrue(machine.awaitTermination(5_000))
+        }
     }
 
     @Test

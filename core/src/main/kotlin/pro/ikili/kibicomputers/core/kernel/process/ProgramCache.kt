@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.process
 
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.WeakReference
@@ -24,14 +25,18 @@ import java.util.concurrent.atomic.AtomicLong
  * - キー: 読み込む前のバイト列の SHA-256、燃料の計測コードを挿入するか、待機点への変換をかける import の集合
  *   （構造の上限とランタイムはスケジューラごとに決まっているので、キーに入れない）
  * - 読み込みは [executor]（コンパイル用のスレッド）で行う。同じキーを同時に頼まれたら、1回だけ読み込んで待ち合わせる
- * - 待ち行列は持ち主（マシン）ごとに分け、持ち主を巡回して1つずつ取り出す（#363）。1台が大量に積んでも、別の台の読み込みは
+ * - 待ち行列は公平の組（[FairShareGroup]。ケースのプレイヤーの持ち主。#738）→ 持ち主（マシン）の二段に分け、まず組を巡回し、
+ *   組の中で持ち主（マシン）を巡回して1つずつ取り出す（#363・#738）。1台・1人が大量に積んでも、別の台・別の人の読み込みは
  *   その後ろに並ばない。[executor] には読み込み1つにつき「次の1つを取り出して読み込む」仕事を1つ渡すので、[executor] 自体の
  *   待ち行列が FIFO でも、何を読み込むかは取り出すときに巡回で決まる
- * - 持ち主ごとに、読み込み中・待ち行列にある読み込みの数を [maxPendingPerOwner] までにする。超えたら [ProgramLoadBusyException]
- *   の失敗をすぐに返す（`Machine.exec` は `AGAIN` にする）。数えるのは自分が始めた読み込みだけで、ほかの台の読み込みに相乗りしたものは数えない
+ * - 持ち主（マシン）ごとに、読み込み中・待ち行列にある読み込みの数を [maxPendingPerOwner] までにする。組ごとには [maxPendingPerGroup]
+ *   までにする（組の上限は、[load] で `limitGroup` を立てたものだけを断る。init・復元の読み込みは断らない。#738）。
+ *   超えたら [ProgramLoadBusyException] の失敗をすぐに返す（`Machine.exec` は `AGAIN` にする）。
+ *   数えるのは自分が始めた読み込みだけで、ほかの台の読み込みに相乗りしたものは数えない（組の数も同じ）
  * - 読み込みの持ち主が待つのをやめたら（その持ち主の future がすべて取り消されたら）、持ち主の数から外す（#383）。
  *   始まる前で、相乗りした台が残っていれば、残った台のうち最も早く頼んだ台を新しい持ち主にし、その台の列の末尾に移して
- *   その台の数に入れる（その台の数が一時的に上限を超えることもある）。始まっていれば持ち主のない読み込みとして最後まで読み込む
+ *   その台の数に入れる（その台の数が一時的に上限を超えることもある）。組も、その台が頼んだときの組に移す。
+ *   始まっていれば持ち主のない読み込みとして最後まで読み込む
  * - [load] が返す future は呼び出しごとに別のもの。待つのをやめたら `cancel` する。待つ側がすべていなくなった読み込みは、
  *   始まる前なら待ち行列から外して読み込まない（始まっていれば最後まで読み込み、結果は共有する）
  * - 読み込みが [WasmLoadException] で失敗したら、そのキーを [failureTtlNanos] の間（最大 [maxFailures] 個）覚え、
@@ -62,6 +67,8 @@ internal class ProgramCache(
     private val maxFailures: Int = DEFAULT_MAX_FAILURES,
     /** 時計（ナノ秒。テストで差し替える） */
     private val nanoTime: () -> Long = System::nanoTime,
+    /** 公平の組ごとの、読み込み中・待ち行列にある読み込みの数の上限（1 以上。`Int.MAX_VALUE` で上限なし。#738） */
+    private val maxPendingPerGroup: Int = Int.MAX_VALUE,
 ) {
     init {
         require(maxEntries >= 1) { "maxEntries は 1 以上: $maxEntries" }
@@ -69,6 +76,7 @@ internal class ProgramCache(
         require(maxPendingPerOwner >= 1) { "maxPendingPerOwner は 1 以上: $maxPendingPerOwner" }
         require(failureTtlNanos >= 0) { "failureTtlNanos は 0 以上: $failureTtlNanos" }
         require(maxFailures >= 1) { "maxFailures は 1 以上: $maxFailures" }
+        require(maxPendingPerGroup >= 1) { "maxPendingPerGroup は 1 以上: $maxPendingPerGroup" }
     }
 
     /** 共有のキー */
@@ -79,12 +87,15 @@ internal class ProgramCache(
     private class Ref(val key: Key, program: Program, queue: ReferenceQueue<Program>) : WeakReference<Program>(program, queue)
 
     /** 読み込み1つ（待ち行列にあるか、読み込み中） */
-    private class Job(val key: Key, owner: Long, val bytes: ByteArray, val loader: (ByteArray) -> Program) {
+    private class Job(val key: Key, owner: Long, group: FairShareGroup, val bytes: ByteArray, val loader: (ByteArray) -> Program) {
         /**
          * 数に入れている持ち主（始まっていなければ、この持ち主の列にある）。持ち主が待つのをやめて、始まった後なら `null`
          * （どの持ち主の数にも入れない。#383）
          */
         var owner: Long? = owner
+
+        /** 数に入れている公平の組（[owner] が `null` でないときだけ意味がある。持ち主が頼んだときの組。#738） */
+        var group: FairShareGroup = group
 
         /** 待つ側に返した future（呼び出しごと。頼んだ順）と、頼んだ持ち主 */
         val waiters = ArrayList<Waiter>(1)
@@ -93,8 +104,11 @@ internal class ProgramCache(
         var started = false
     }
 
-    /** 待つ側1つ */
-    private class Waiter(val ticket: CompletableFuture<Program>, val owner: Long)
+    /** 待つ側1つ（頼んだ持ち主と、頼んだときの公平の組） */
+    private class Waiter(val ticket: CompletableFuture<Program>, val owner: Long, val group: FairShareGroup)
+
+    /** 組と持ち主（マシン）の組み合わせ1つの列の鍵（持ち主の組が変わっても、前の組の列と混ぜない） */
+    private data class Slot(val group: FairShareGroup, val owner: Long)
 
     /** 覚えている失敗 */
     private class Failure(val cause: Throwable, val expiresAt: Long)
@@ -104,14 +118,20 @@ internal class ProgramCache(
     /** 読み込み中・待ち行列にあるもの */
     private val loading = HashMap<Key, Job>()
 
-    /** 持ち主ごとの、始まっていない読み込み（先頭から読み込む） */
-    private val queues = HashMap<Long, ArrayDeque<Job>>()
+    /** 組と持ち主ごとの、始まっていない読み込み（先頭から読み込む） */
+    private val queues = HashMap<Slot, ArrayDeque<Job>>()
 
-    /** 始まっていない読み込みがある持ち主の、巡回の順（先頭が次） */
-    private val ring = ArrayDeque<Long>()
+    /** 組ごとの、始まっていない読み込みがある持ち主の巡回の順（先頭が次） */
+    private val ownerRings = HashMap<FairShareGroup, ArrayDeque<Long>>()
+
+    /** 始まっていない読み込みがある組の、巡回の順（先頭が次） */
+    private val ring = ArrayDeque<FairShareGroup>()
 
     /** 持ち主ごとの、読み込み中・待ち行列にある読み込みの数 */
     private val pendingByOwner = HashMap<Long, Int>()
+
+    /** 組ごとの、読み込み中・待ち行列にある読み込みの数（0 になった組は消す。#738） */
+    private val pendingByGroup = HashMap<FairShareGroup, Int>()
 
     /** 覚えている失敗（古い順） */
     private val failures = LinkedHashMap<Key, Failure>()
@@ -143,7 +163,23 @@ internal class ProgramCache(
      * [owner] の読み込みが [maxPendingPerOwner] 個あるときは [ProgramLoadBusyException] の失敗。最近 [WasmLoadException] で
      * 失敗したものは、読み込まずに同じ例外の失敗
      */
-    fun load(owner: Long, bytes: ByteArray, metered: Boolean, waitImports: Set<String>, loader: (ByteArray) -> Program): CompletableFuture<Program> {
+    fun load(owner: Long, bytes: ByteArray, metered: Boolean, waitImports: Set<String>, loader: (ByteArray) -> Program): CompletableFuture<Program> =
+        load(owner, FairShareGroup.NONE, true, bytes, metered, waitImports, loader)
+
+    /**
+     * 公平の組 [group] の持ち主 [owner] のために読み込む（#738）。ほかは 5 引数の [load] と同じ。
+     * [limitGroup] なら、[group] の読み込みが [maxPendingPerGroup] 個あるときに [ProgramLoadBusyException] の失敗にする。
+     * 立てないもの（init・復元の読み込み）は、組の数には入れるが、組の上限では断らない
+     */
+    fun load(
+        owner: Long,
+        group: FairShareGroup,
+        limitGroup: Boolean,
+        bytes: ByteArray,
+        metered: Boolean,
+        waitImports: Set<String>,
+        loader: (ByteArray) -> Program,
+    ): CompletableFuture<Program> {
         val key = Key(sha256(bytes), metered, waitImports.toSet())
         val ticket = CompletableFuture<Program>()
         val job: Job
@@ -160,7 +196,7 @@ internal class ProgramCache(
             val existing = loading[key]
             if (existing != null) {
                 // 相乗りする（持ち主の数には数えない）
-                existing.waiters += Waiter(ticket, owner)
+                existing.waiters += Waiter(ticket, owner, group)
                 job = existing
             } else {
                 if (closed) return CompletableFuture.failedFuture(closedException(null))
@@ -168,11 +204,18 @@ internal class ProgramCache(
                 if (pending >= maxPendingPerOwner) {
                     return CompletableFuture.failedFuture(ProgramLoadBusyException("読み込みを待つ実行ファイルが多すぎる（上限 $maxPendingPerOwner）"))
                 }
-                job = Job(key, owner, bytes, loader)
-                job.waiters += Waiter(ticket, owner)
+                val groupPending = pendingByGroup[group] ?: 0
+                if (limitGroup && groupPending >= maxPendingPerGroup) {
+                    return CompletableFuture.failedFuture(
+                        ProgramLoadBusyException("この持ち主の読み込みを待つ実行ファイルが多すぎる（上限 $maxPendingPerGroup）"),
+                    )
+                }
+                job = Job(key, owner, group, bytes, loader)
+                job.waiters += Waiter(ticket, owner, group)
                 loading[key] = job
                 pendingByOwner[owner] = pending + 1
-                enqueueLocked(owner, job)
+                pendingByGroup[group] = groupPending + 1
+                enqueueLocked(job)
                 created = true
             }
         }
@@ -207,16 +250,18 @@ internal class ProgramCache(
             }
             val owner = job.owner ?: return
             if (job.waiters.any { it.owner == owner }) return
-            releaseOwnerLocked(owner)
+            releaseOwnerLocked(owner, job.group)
             if (job.started) {
                 job.owner = null
             } else {
-                dequeueLocked(owner, job)
-                // 残った台のうち、最も早く頼んだ台に移す
-                val next = job.waiters.first().owner
-                job.owner = next
-                pendingByOwner[next] = (pendingByOwner[next] ?: 0) + 1
-                enqueueLocked(next, job)
+                dequeueLocked(job)
+                // 残った台のうち、最も早く頼んだ台に移す（組も、その台が頼んだときの組に移す。#738）
+                val next = job.waiters.first()
+                job.owner = next.owner
+                job.group = next.group
+                pendingByOwner[next.owner] = (pendingByOwner[next.owner] ?: 0) + 1
+                pendingByGroup[next.group] = (pendingByGroup[next.group] ?: 0) + 1
+                enqueueLocked(job)
             }
         }
     }
@@ -225,39 +270,57 @@ internal class ProgramCache(
     private fun dropLocked(job: Job) {
         loading.remove(job.key)
         val owner = job.owner ?: return
+        releaseOwnerLocked(owner, job.group)
+        dequeueLocked(job)
         job.owner = null
-        releaseOwnerLocked(owner)
-        dequeueLocked(owner, job)
     }
 
-    /** [owner] の列の末尾に [job] を入れる（列が空なら巡回にも入れる） */
-    private fun enqueueLocked(owner: Long, job: Job) {
-        val ownerQueue = queues.getOrPut(owner) { ArrayDeque() }
-        if (ownerQueue.isEmpty()) ring.addLast(owner)
+    /** 始まっていない [job] を、持ち主（[Job.owner]）と組（[Job.group]）の列の末尾に入れる（列が空なら巡回にも入れる） */
+    private fun enqueueLocked(job: Job) {
+        val owner = checkNotNull(job.owner)
+        val slot = Slot(job.group, owner)
+        val ownerQueue = queues.getOrPut(slot) { ArrayDeque() }
+        if (ownerQueue.isEmpty()) {
+            val owners = ownerRings.getOrPut(job.group) { ArrayDeque() }
+            if (owners.isEmpty()) ring.addLast(job.group)
+            owners.addLast(owner)
+        }
         ownerQueue.addLast(job)
     }
 
-    /** [owner] の列から [job] を外す（列が空になれば巡回からも外す） */
-    private fun dequeueLocked(owner: Long, job: Job) {
-        val ownerQueue = queues[owner] ?: return
+    /** 始まっていない [job] を、持ち主と組の列から外す（列が空になれば巡回からも外す） */
+    private fun dequeueLocked(job: Job) {
+        val owner = job.owner ?: return
+        val slot = Slot(job.group, owner)
+        val ownerQueue = queues[slot] ?: return
         ownerQueue.remove(job)
-        if (ownerQueue.isEmpty()) {
-            queues.remove(owner)
-            ring.remove(owner)
+        if (ownerQueue.isNotEmpty()) return
+        queues.remove(slot)
+        val owners = ownerRings[job.group] ?: return
+        owners.remove(owner)
+        if (owners.isEmpty()) {
+            ownerRings.remove(job.group)
+            ring.remove(job.group)
         }
     }
 
-    private fun releaseOwnerLocked(owner: Long) {
+    private fun releaseOwnerLocked(owner: Long, group: FairShareGroup) {
         val n = (pendingByOwner[owner] ?: 0) - 1
         if (n <= 0) pendingByOwner.remove(owner) else pendingByOwner[owner] = n
+        val g = (pendingByGroup[group] ?: 0) - 1
+        if (g <= 0) pendingByGroup.remove(group) else pendingByGroup[group] = g
     }
 
-    /** 巡回の順で、次の持ち主の先頭を取り出す。なければ `null` */
+    /** 巡回の順で、次の組の、次の持ち主の先頭を取り出す。なければ `null` */
     private fun takeNextLocked(): Job? {
-        val owner = ring.removeFirstOrNull() ?: return null
-        val ownerQueue = queues.getValue(owner)
+        val group = ring.removeFirstOrNull() ?: return null
+        val owners = ownerRings.getValue(group)
+        val owner = owners.removeFirst()
+        val slot = Slot(group, owner)
+        val ownerQueue = queues.getValue(slot)
         val job = ownerQueue.removeFirst()
-        if (ownerQueue.isEmpty()) queues.remove(owner) else ring.addLast(owner)
+        if (ownerQueue.isEmpty()) queues.remove(slot) else owners.addLast(owner)
+        if (owners.isEmpty()) ownerRings.remove(group) else ring.addLast(group)
         job.started = true
         return job
     }
@@ -275,7 +338,7 @@ internal class ProgramCache(
             // close() が先に外して失敗させていれば、結果は覚えない
             if (loading[job.key] === job) {
                 loading.remove(job.key)
-                job.owner?.let { releaseOwnerLocked(it) }
+                job.owner?.let { releaseOwnerLocked(it, job.group) }
                 job.owner = null
             }
             if (!closed) {
@@ -325,8 +388,10 @@ internal class ProgramCache(
             pending = loading.values.flatMap { job -> job.waiters.map { it.ticket } }
             loading.clear()
             queues.clear()
+            ownerRings.clear()
             ring.clear()
             pendingByOwner.clear()
+            pendingByGroup.clear()
         }
         // 後続の処理（anyOf など）はロックの外で動かす
         val failure = closedException(null)
@@ -338,6 +403,12 @@ internal class ProgramCache(
 
     /** [owner] の数に入っている、読み込み中・待ち行列にある読み込みの数（テスト用） */
     fun pendingOf(owner: Long): Int = synchronized(lock) { pendingByOwner[owner] ?: 0 }
+
+    /** 組 [group] の数に入っている、読み込み中・待ち行列にある読み込みの数（テスト用。#738） */
+    fun pendingOfGroup(group: FairShareGroup): Int = synchronized(lock) { pendingByGroup[group] ?: 0 }
+
+    /** 数を記録している組の数（テスト用。#738。0 になった組は消える） */
+    val pendingGroupCount: Int get() = synchronized(lock) { pendingByGroup.size }
 
     private fun closedException(cause: Throwable?) = IllegalStateException("WASM を読み込むスレッドが止まっている", cause)
 
