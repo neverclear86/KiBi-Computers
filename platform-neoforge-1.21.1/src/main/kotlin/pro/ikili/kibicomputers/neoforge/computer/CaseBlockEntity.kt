@@ -636,7 +636,6 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             updateBootLanguage(player)
             val disks = prepareDisks()
             environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).fairnessKey(ownerPlayerId).build()
-
             boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
         }
         val status = computer.pressPowerButton(

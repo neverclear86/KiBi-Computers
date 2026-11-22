@@ -252,8 +252,6 @@ public constructor(
          */
         public const val DEFAULT_GROUP_BYTES_PER_SECOND: Int = 0
 
-
-
         private val BY_PRIORITY: Comparator<Delivery<*>> = Comparator { a, b -> a.priority.compareTo(b.priority) }
     }
 }

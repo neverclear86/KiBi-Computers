@@ -215,7 +215,6 @@ public constructor(
                 val p = it.next()
                 val last = lastKeyframe[p]
                 if ((last == null || now - last >= throttleRetryTicks) && (traffic == null || traffic.hasBudget(p, keyframeBytes, group))) {
-
                     it.remove()
                     fresh.add(p)
                 }

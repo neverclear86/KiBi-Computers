@@ -16,9 +16,8 @@ import pro.ikili.kibicomputers.core.config.ConfigValues
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.display.ScreenSyncHost
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
-import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
-
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import java.util.Collections
 import java.util.IdentityHashMap

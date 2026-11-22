@@ -1186,7 +1186,6 @@ internal class ProcessRunner(private val machine: Machine) {
         process.asyncWait = null
         process.asyncStack?.clear()
         if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking(rt.blockingGroup)
-
         // まだ実行していないホスト呼び出しを取り消す（ふつうは 0 件。#46）
         machine.cancelHostCallsLocked(process.pid)
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）

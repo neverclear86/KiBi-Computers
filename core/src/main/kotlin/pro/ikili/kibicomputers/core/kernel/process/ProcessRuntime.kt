@@ -52,7 +52,6 @@ internal class ProcessRuntime(
     /** ブロッキング型の枠を予約した公平の組（終わりにこの組へ返す。#738。作るときにカーネルロックの中で書く） */
     var blockingGroup: FairShareGroup = FairShareGroup.NONE
 
-
     /** 一時停止の数え（スケジューラの「実行中」）に入っている */
     var active: Boolean = false
 

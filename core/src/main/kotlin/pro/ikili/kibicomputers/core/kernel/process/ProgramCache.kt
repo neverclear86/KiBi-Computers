@@ -410,7 +410,6 @@ internal class ProgramCache(
     /** 数を記録している組の数（テスト用。#738。0 になった組は消える） */
     val pendingGroupCount: Int get() = synchronized(lock) { pendingByGroup.size }
 
-
     private fun closedException(cause: Throwable?) = IllegalStateException("WASM を読み込むスレッドが止まっている", cause)
 
     /** 強い参照で持つ。重さは [Program.cacheWeight]（#687）。あふれたら古いものから外す（最新の 1 つは残す） */

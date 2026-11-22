@@ -209,7 +209,6 @@ public class MachineEnvironment private constructor(builder: Builder) {
         /** 公平の組の鍵（既定は `null` = 持ち主なしの組。#738） */
         public fun fairnessKey(value: UUID?): Builder = apply { fairnessKey = value }
 
-
         /** 環境を作る。 */
         public fun build(): MachineEnvironment = MachineEnvironment(this)
     }

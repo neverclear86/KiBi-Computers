@@ -400,7 +400,6 @@ public object KiBiConfig {
             values[SCREEN_OWNER_BYTES_PER_SECOND],
         )
 
-
     /** [values] から、キーボード1つの入力の予算を作る */
     @JvmStatic
     public fun keyboardInputBudget(values: ConfigValues): KeyboardInputBudget =

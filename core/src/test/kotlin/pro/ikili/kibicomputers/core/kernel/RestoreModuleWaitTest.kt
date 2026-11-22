@@ -16,6 +16,7 @@ import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -38,6 +39,7 @@ import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -67,8 +69,14 @@ class RestoreModuleWaitTest {
     }
 
     /** 起動用のスレッドも読み込み用のスレッドも1本のスケジューラ */
-    private fun restoringHarness(modules: MemoryModuleStore, moduleLimits: ModuleLimits = ModuleLimits.DEFAULT): Harness = Harness(
-        SchedulerConfig.builder().maxConcurrentMachines(1).maxBlockingProcesses(64).compilerThreads(1).build(),
+    private fun restoringHarness(
+        modules: MemoryModuleStore,
+        moduleLimits: ModuleLimits = ModuleLimits.DEFAULT,
+        maxPendingLoadsPerGroup: Int? = null,
+    ): Harness = Harness(
+        SchedulerConfig.builder().maxConcurrentMachines(1).maxBlockingProcesses(64).compilerThreads(1)
+            .apply { maxPendingLoadsPerGroup?.let { maxPendingLoadsPerGroup(it) } }
+            .build(),
         execRuntime = EndiveRuntime(),
         moduleLimits = moduleLimits,
         moduleStore = modules,
@@ -267,6 +275,53 @@ class RestoreModuleWaitTest {
                 val (_, outcome, cause) = finished.outcomes.single()
                 assertEquals(RestoreOutcome.RESTORED, outcome, cause.toString())
                 assertEquals(MachineState.RUNNING, m.state)
+                assertNoCancelRegistration(m)
+            } finally {
+                gate.countDown()
+            }
+        }
+    }
+
+    @Test
+    fun `組の読み込みの上限に達していても、復元の読み込みは断らず、組の数に入れて待つ`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val modules = MemoryModuleStore()
+        val saved = save(store, modules).single()
+        val ownerId = UUID(0, 1)
+        val group = FairShareGroup.of(ownerId)
+        restoringHarness(modules, maxPendingLoadsPerGroup = 1).use { h ->
+            val gate = CountDownLatch(1)
+            try {
+                volumes(h)
+                val programs = h.scheduler.programs
+                // 組の読み込みが上限（1）まで残っている（読み込み用のスレッドも塞ぐ）
+                val started = CountDownLatch(1)
+                programs.load(holder, group, false, "held".toByteArray(), true, emptySet()) {
+                    started.countDown()
+                    gate.await()
+                    throw WasmLoadException("held")
+                }
+                assertTrue(started.await(10, TimeUnit.SECONDS), "読み込み用のスレッドを塞げない")
+                assertEquals(1, programs.pendingOfGroup(group))
+
+                val m = h.machine(fuelPerTick = 10_000_000, environment = MachineEnvironment.builder().fairnessKey(ownerId).build())
+                val finished = Finished()
+                assertTrue(m.restore(request(saved, store, finished)))
+                // 断らずに積む（断ると、やり直しの合間は数に入らず、いずれ冷えた起動に落ちる）
+                eventually(10_000, "復元の読み込みが組の数に入らない") { programs.pendingOfGroup(group) == 2 }
+                h.scheduler.tick()
+                assertTrue(m.isRestoring, "冷えた起動に落とさない")
+                assertTrue(finished.outcomes.isEmpty())
+
+                gate.countDown()
+                eventually(60_000, "復元が終わらない") {
+                    h.scheduler.tick()
+                    finished.outcomes.isNotEmpty()
+                }
+                val (_, outcome, cause) = finished.outcomes.single()
+                assertEquals(RestoreOutcome.RESTORED, outcome, cause.toString())
+                assertEquals(MachineState.RUNNING, m.state)
+                eventually(10_000, "組の数が戻らない") { programs.pendingGroupCount == 0 }
                 assertNoCancelRegistration(m)
             } finally {
                 gate.countDown()

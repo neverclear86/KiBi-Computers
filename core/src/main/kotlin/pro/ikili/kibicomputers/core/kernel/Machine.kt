@@ -441,7 +441,6 @@ public class Machine private constructor(
                 runner.runStep(rt)
             }
         },
-
         onThreadlessRevoked = { rt -> scheduler.permits.remove(rt) },
     )
 
@@ -1705,7 +1704,6 @@ public class Machine private constructor(
         }
         kernel.initPid = prevInitPid
         if (reserved != null) scheduler.releaseBlocking(reserved)
-
         // awaitTermination で待っている側を起こす（状態は変えないので、checkAllDoneLocked は呼ばない）
         if (kernel.processes.liveCount() == 0 && registeredThreads == 0) terminated.signalAll()
     }

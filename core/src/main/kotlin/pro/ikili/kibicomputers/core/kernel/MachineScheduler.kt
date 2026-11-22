@@ -828,7 +828,6 @@ public class SchedulerConfig private constructor(builder: Builder) {
         }
 
         /** 実行ファイルを読み込むスレッドの数（1 以上） */
-
         public fun compilerThreads(value: Int): Builder = apply {
             require(value >= 1) { "compilerThreads は 1 以上" }
             compilerThreads = value

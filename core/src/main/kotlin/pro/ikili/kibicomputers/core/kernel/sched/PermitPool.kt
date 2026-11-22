@@ -486,7 +486,6 @@ internal class PermitPool(
         g.held++
         if (g.queue.isNotEmpty() && g.held < perGroupLimit) rotation.addLast(g) else g.inRotation = false
         next.granted = true
-
         if (next.condition != null) {
             next.condition.signal()
             return null
