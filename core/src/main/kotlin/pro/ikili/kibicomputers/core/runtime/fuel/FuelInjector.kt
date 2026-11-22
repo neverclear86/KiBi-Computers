@@ -843,7 +843,26 @@ internal object FuelInjector {
                         out.leb(remap(leb()))
                     }
                     0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op) // 拡張定数式
-                    else -> throw WasmLoadException("定数式の命令 0x%02X には対応していない".format(op))
+                    0xFD -> { // v128.const（#851）
+                        val sub = leb()
+                        if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))
+                        if (end - pos < 16) throw WasmLoadException("セクションの終わりを超えて読んだ")
+                        pos += 16
+                        out.bytes(buf, start, pos - start)
+                    }
+                    0xFB -> { // GC の提案の定数式の命令（#851）
+                        when (val sub = leb()) {
+                            0L, 1L, 6L, 7L -> skipLeb() // struct.new・struct.new_default・array.new・array.new_default（型の番号）
+                            8L -> { // array.new_fixed（型の番号と数）
+                                skipLeb()
+                                skipLeb()
+                            }
+                            0x1AL, 0x1BL, 0x1CL -> Unit // any.convert_extern・extern.convert_any・ref.i31
+                            else -> throw WasmLoadException("定数式の命令 0xFB %d は定数式に使えない".format(sub))
+                        }
+                        out.bytes(buf, start, pos - start)
+                    }
+                    else -> throw WasmLoadException("定数式の命令 0x%02X は定数式に使えない".format(op))
                 }
             }
         }

@@ -948,6 +948,16 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         val mod = module.module
         if (mod.startSection().isPresent) throw WasmStateException("start 関数を持つモジュールは、状態から作り直せない")
         if (mode != StateCaptureMode.FULL && !tracksChanges) throw WasmStateException("このメモリは変わった区画を追えない（$mode）")
+        // 可変のグローバル（モジュールが定義したもの。グローバルの import はランタイムが断る）。取り出せない型（可変の v128 など。#851）なら、
+        // メモリの区画を写す前に断る（保存のたびに、捨てる区画を写さない）
+        if (mod.importSection().count(ExternalType.GLOBAL) > 0) throw WasmStateException("グローバルの import を持つモジュール")
+        val globals = ArrayList<WasmInstanceState.GlobalValue>()
+        mod.globalSection().globals().forEachIndexed { i, g ->
+            if (g.mutabilityType() != MutabilityType.Var) return@forEachIndexed
+            val type = valueType(g.valueType())
+            if (type == WasmValueType.UNSUPPORTED) throw WasmStateException("取り出せない型の可変のグローバル $i（${g.valueType()}）")
+            globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
+        }
         // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1
         var indices = IntArray(0)
@@ -978,15 +988,6 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
                 indices = list.toIntArray()
                 data = bytes
             }
-        }
-        // 可変のグローバル（モジュールが定義したもの。グローバルの import はランタイムが断る）
-        if (mod.importSection().count(ExternalType.GLOBAL) > 0) throw WasmStateException("グローバルの import を持つモジュール")
-        val globals = ArrayList<WasmInstanceState.GlobalValue>()
-        mod.globalSection().globals().forEachIndexed { i, g ->
-            if (g.mutabilityType() != MutabilityType.Var) return@forEachIndexed
-            val type = valueType(g.valueType())
-            if (type == WasmValueType.UNSUPPORTED) throw WasmStateException("取り出せない型の可変のグローバル $i（${g.valueType()}）")
-            globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
         }
         // テーブル（funcref だけ。ほかのインスタンスの関数は指せない）
         if (mod.importSection().count(ExternalType.TABLE) > 0) throw WasmStateException("テーブルの import を持つモジュール")
