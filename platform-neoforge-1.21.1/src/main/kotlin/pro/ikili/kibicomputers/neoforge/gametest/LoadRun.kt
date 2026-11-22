@@ -2126,11 +2126,24 @@ internal class LoadRun(
 
     /**
      * 予算なしの段階の後（#356）: 予算を設定の値に戻し、呼ぶ台の電源を切る。残った呼び出しは kill で取り消される（#358）。
-     * 呼び続けたまま後の段階（アンロード・復元）に流すと、実行を待つ呼び出しを保存して積み直す道に入り、前の結果と比べられなくなる
+     * 呼び続けたまま後の段階（アンロード・復元）に流すと、実行を待つ呼び出しを保存して積み直す道に入り、呼ばない回と同じ形の
+     * アンロード・復元にならない（実行を待つ呼び出しを積み直す手間が、数字に混ざる）。そのため切る。
+     *
+     * 切ると、後の段階（計算・出力・アンロード・復元）は、呼ぶ台の数だけ動いている台が少ない状態で走る
+     * （アンロードの取り出し・書き込みの数、[restoreTargets]、報告の「動いている台」が、`-PloadTestHostCallers` を付けない回より減る）。
+     * この回の後の段階の数字は、付けない回の結果と直接比べない。比べるなら、報告の「動いている台」で台数をそろえて見る
      */
     private fun stopHostCalls() {
         scheduler().mainThreadBudgetOverrideNanos = null
-        for (c in callerSet) if (c.case.computer.machine != null) c.case.pressPowerButton()
+        var stopped = 0
+        for (c in callerSet) if (c.case.computer.machine != null) {
+            c.case.pressPowerButton()
+            stopped++
+        }
+        LOGGER.info(
+            "Host callers powered off after the unbudgeted phase: {} of {} computers; the later phases run with fewer running computers",
+            stopped, settings.count,
+        )
     }
 
     /**
