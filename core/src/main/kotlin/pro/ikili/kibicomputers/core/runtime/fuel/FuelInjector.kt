@@ -722,7 +722,7 @@ internal object FuelInjector {
 
     // --- バイト列の読み書き ---
 
-    private class Sink : ByteArrayOutputStream() {
+    internal class Sink : ByteArrayOutputStream() {
         fun u8(b: Int) = write(b and 0xFF)
 
         fun bytes(src: ByteArray, off: Int, len: Int) = write(src, off, len)
@@ -763,7 +763,8 @@ internal object FuelInjector {
         }
     }
 
-    private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
+    /** テストが定数式の写しを直接呼ぶので internal（#851） */
+    internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
         fun u8(): Int {
             if (pos >= end) throw WasmLoadException("セクションの終わりを超えて読んだ")
             return buf[pos++].toInt() and 0xFF
@@ -809,7 +810,14 @@ internal object FuelInjector {
             if (flags and 1 != 0) skipLeb()
         }
 
-        /** 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える */
+        /**
+         * 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える。
+         *
+         * 「定数式に使えない」で断る分岐は、正しくない WASM として断る（原因なしの [WasmLoadException]。#851）。[inject] は最初に
+         * Endive の `Parser.parse`（検証あり）を通すが、Endive 1.2.0 の検証は、グローバルの初期値と能動な要素セグメント（flag 0・2・4・6）の
+         * 定数式しか確かめない。パッシブ・宣言の要素セグメント（flag 5・7）の初期値は検証されずにここへ届くので、この分岐は届く経路がある
+         * （`drop` などの命令で断る。型が合わないだけの `v128.const` は、命令としては定数式なので写す）
+         */
         fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {
                 val start = pos
@@ -843,7 +851,26 @@ internal object FuelInjector {
                         out.leb(remap(leb()))
                     }
                     0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op) // 拡張定数式
-                    else -> throw WasmLoadException("定数式の命令 0x%02X には対応していない".format(op))
+                    0xFD -> { // v128.const（#851）
+                        val sub = leb()
+                        if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))
+                        if (end - pos < 16) throw WasmLoadException("セクションの終わりを超えて読んだ")
+                        pos += 16
+                        out.bytes(buf, start, pos - start)
+                    }
+                    0xFB -> { // GC の提案の定数式の命令（#851）
+                        when (val sub = leb()) {
+                            0L, 1L, 6L, 7L -> skipLeb() // struct.new・struct.new_default・array.new・array.new_default（型の番号）
+                            8L -> { // array.new_fixed（型の番号と数）
+                                skipLeb()
+                                skipLeb()
+                            }
+                            0x1AL, 0x1BL, 0x1CL -> Unit // any.convert_extern・extern.convert_any・ref.i31
+                            else -> throw WasmLoadException("定数式の命令 0xFB %d は定数式に使えない".format(sub))
+                        }
+                        out.bytes(buf, start, pos - start)
+                    }
+                    else -> throw WasmLoadException("定数式の命令 0x%02X は定数式に使えない".format(op))
                 }
             }
         }

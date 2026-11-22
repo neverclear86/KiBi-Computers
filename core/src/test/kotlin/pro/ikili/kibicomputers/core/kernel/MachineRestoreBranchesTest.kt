@@ -133,10 +133,11 @@ class MachineRestoreBranchesTest {
         stdout: ((Machine) -> Int)? = null,
         withInput: Boolean = true,
         beforeExec: (Machine) -> Unit = {},
+        module: ByteArray? = null,
     ): Started {
         m.vfs.mount(VfsPath.ROOT, root, readOnly = false, source = "disk:root")
         m.vfs.createDirectory(VfsPath.parse("/bin"))
-        val bytes = resource(name)
+        val bytes = module ?: resource(name)
         val f = m.vfs.open(VfsPath.parse(path), OpenOptions(read = true, write = true, create = true, truncate = true))
         m.vfs.write(f, bytes, 0, bytes.size)
         beforeExec(m)
@@ -312,6 +313,61 @@ class MachineRestoreBranchesTest {
             val m3 = restore(h, store, delta.identity, finished)
             assertColdBoot(m3, finished, ColdBootCause.UNREADABLE)
             m3.close()
+        }
+    }
+
+    // ---- v128 のグローバル（#851） ----
+
+    /** 標準入力から 1 バイト読み、不変の v128 のグローバルの lane 0（7）を数字にして標準出力に書いて終わる p1 のコマンド */
+    private val v128Command by lazy {
+        pro.ikili.kibicomputers.core.wasi.kibi.WitTool.wat(
+            """
+            (module
+              (import "wasi_snapshot_preview1" "fd_read" (func ${'$'}fd_read (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "fd_write" (func ${'$'}fd_write (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (global ${'$'}v v128 (v128.const i32x4 7 0 0 0))
+              (func ${'$'}lane (result i32) (i32x4.extract_lane 0 (global.get ${'$'}v)))
+              (func (export "_start")
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 1))
+                (drop (call ${'$'}fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+                (i32.store8 (i32.const 32) (i32.add (i32.const 48) (call ${'$'}lane)))
+                (i32.store (i32.const 0) (i32.const 32))
+                (i32.store (i32.const 4) (i32.const 1))
+                (drop (call ${'$'}fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun `不変のv128のグローバルだけを持つプロセスは、保存の世代に残り、戻した後もグローバルの初期値を読める`() = timeout(limit) {
+        val store = newStore()
+        Harness(execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore()).use { h ->
+            openFreshRoot(h)
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = start(m, TestMemoryFileSystem(), "", "/bin/v128", listOf("v128"), module = v128Command)
+            awaitWaiting(h, s, "入力を待たない")
+            // 写しの中で殺さない（可変の v128 のグローバルと違い、不変のグローバルは写さなくても、戻すときのインスタンスの作り直しで揃う）
+            val copy = captureCopy(m)
+            assertFalse(s.pid in copy.killedPids, "写しの中で殺した")
+            assertNotNull(copy.abiCaptures[s.pid], "ABI 層を写していない")
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            val written = stored(store, identity)
+            assertEquals(ProcessState.WAITING_EVENT, kernelOf(written).processes[s.pid]!!.state)
+            assertNotNull(p1Of(written, s.pid).instance, "p1 の層にインスタンスの状態がない")
+            m.close()
+
+            val finished = Finished()
+            val m2 = restore(h, store, identity, finished)
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            assertEquals(ProcessState.WAITING_EVENT, m2.stateOf(s.pid))
+            send(m2, s.input, "x")
+            eventually(60_000, "戻したプロセスがグローバルの値を書かない: ${output(m2, s.output)}") {
+                h.scheduler.tick()
+                output(m2, s.output) == "7"
+            }
+            m2.close()
         }
     }
 

@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel.process
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MemoryRefusal
 import pro.ikili.kibicomputers.core.kernel.ProcessMemory
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.wait.WaitSet
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
@@ -44,6 +45,12 @@ internal class ProcessRuntime(
 
     /** サーバー全体のセマフォの許可を持っている（プロセスのスレッドだけが読み書きする） */
     var holdsPermit: Boolean = false
+
+    /** 持っている許可を借りた公平の組（[holdsPermit] のときだけ意味がある。返すときはこの組へ。#738。プロセスのスレッドだけが読み書きする） */
+    var permitGroup: FairShareGroup = FairShareGroup.NONE
+
+    /** ブロッキング型の枠を予約した公平の組（終わりにこの組へ返す。#738。作るときにカーネルロックの中で書く） */
+    var blockingGroup: FairShareGroup = FairShareGroup.NONE
 
     /** 一時停止の数え（スケジューラの「実行中」）に入っている */
     var active: Boolean = false
