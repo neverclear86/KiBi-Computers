@@ -593,8 +593,7 @@ class StackExhaustionLockTest {
                 .append("、スレッド: ${victim.thread?.let { "${it.name} ${it.state} ${it.stackTrace.take(16).joinToString(" <- ")}" }}")
         }
         sb.append("\n  tick: ${ticker.describe()}")
-        sb.append("
-  ここまで: ${tally.describe()}")
+        sb.append("\n  ここまで: ${tally.describe()}")
         for ((t, frames) in Thread.getAllStackTraces().entries.sortedBy { it.key.name }) {
             if (!t.name.startsWith("KiBi-")) continue
             sb.append("\n  ${t.name} ${t.state}: ${frames.take(8).joinToString(" <- ")}")
