@@ -45,18 +45,31 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 32 段は、包みと燃料切れの処理の入口から、ロックの区間を抜けるまで（とホストの関数の本体の浅い処理）に当てる。
  * 足りなかったときに残ったものは、浅いところの安全網（`ProcessRunner.recoverLeaks`）が見つけて戻す。
  *
- * 道ごとの確かめ（#858）: 次の道も、本体を置いたテストで、尽きる位置を 1 段ずつずらして確かめた（尽きた位置はどれも確かめの中）。
- * - ディスクの VFS（`DiskFileSystem`。道の解決はカーネルロックの中、I/O はロックの外でリースのロックを取る）の深いディレクトリの `stat`、
- *   `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`（`StackExhaustionLockTest` の `DISK_IO`）
- * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）
+ * 道ごとの確かめ（#858）: 次の道も、本体を置いたテストで、尽きる位置を 1 段ずつずらして確かめた。毎回、尽きた位置（SOE のスタックトレース。
+ * テストの `SoePositions`）を区画に分けて数え、(1) ロックを取る・放す途中（AQS・`Unsafe` の CAS を含む。一番上でなく、ロックの機構を飛ばした呼び手で見る）で
+ * 尽きていないこと、(2) 毎回の後の状態（マシンのロック・リースのロック・表示デバイスのロック・CPU・許可・コンソールの出力の予約）が戻ること、を確かめる。
+ * 本体（VFS・端末・NIO）の中で尽きた位置は、確かめを通った後に起きるふつうの位置なので数えるだけで、安全かは (2) で見る
+ * - ディスクの VFS（`DiskFileSystem`。道の解決はカーネルロックの中、I/O はロックの外でリースのロックを取る）: 回ごとに 1 種類の操作
+ *   （深いディレクトリの `stat`・別のディスクの `stat`・`open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`）を、
+ *   ホストの関数を呼ぶたびに繰り返す（`StackExhaustionLockTest` の `DISK_IO`）。尽きる位置は一番深い呼び出しの中に落ちるので、操作を回ごとに分け、
+ *   1 本で操作ごとに 8 回（今の段数。冷えた道は 2 回）
+ * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）。1 本で 60 回
+ *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が 0 に戻ることも見る
  * - canon の lift・lower（文字列の realloc、post-return、別のインスタンスが lower した関数を lift し直す `CoreRef.Lowered` の道。
- *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）
+ *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）。入口の `top` に止まりうるホストの関数を置くので、待機点型の回は
+ *   待機点型に固有の燃料切れの道を通る: 深い `f`（ゲストからゲストへの呼び出しの下）の中の前借りと、`top` の loop の先頭の燃料切れの巻き戻し・巻き直し
+ *   （`onComponentFuelExhaustedUnwindable` → `requestUnwind`）。巻き戻しは `top` でしか起きないので、`top` の詰め物を尽きる境目の近くまで積んで
+ *   1 段ずつずらす回（`edgeSweep`）で、巻き戻し・巻き直しの途中で尽きる位置も確かめる
  * - 本物の p1 のモジュールの燃料切れ（前借り、待ち点への変換と巻き戻し。`P1StackExhaustionLockTest`）
- * 段数を縮めて同じテストを回した（JDK 17、JIT。手元だけの変更で、コミットしていない）ところ、Windows・Linux とも、
- * 包み・入口・深い道の順に 8・8・32 段では落ち（Windows では p1 の待ち点の道で、`clock_time_get` の本体が `Machine.monotonicNanos` の
- * マシンのロックを取る途中、Linux ではディスクのリースのロックの途中で尽きた）、16・16・64 段では通った。JIT をかけない冷えた道
- * （[probe] だけをコンパイルし、ほかはインタプリタ）でも、32・32・128 段と 16・16・64 段は両方の OS で通った。JDK 21 でも今の段数で通った。
- * 冷えた道（Windows）と JDK 21（Linux）では 8・8・32 段でも通り、足りなくなる段数は JVM と回し方で変わる。
+ * 今の段数（32・32・128）では、JIT の Windows（JDK 17）・JIT をかけない冷えた道（Windows）とも、ロックの途中で尽きた回はなく、
+ * 尽きた位置は、本体の中の数回（ディスクの `rename` の NIO）を除いて、すべて確かめの中（`StackHeadroom`）だった。
+ * 段数を縮めた同じテストでは（JDK 17、JIT、Windows。手元だけの変更で、コミットしていない）、16・16・64 段は、ロックの途中で尽きた回がなく、状態も戻った
+ * （ただし、尽きた位置が本体の中（NIO・VFS・端末・ランタイム）になった回が増え、確かめの余裕が薄くなった）。8・8・32 段は、p1 の待ち点の回で、
+ * `clock_time_get` の本体が `Machine.monotonicNanos` のマシンのロックを取る途中（`ReentrantLock.lock`）で尽きた回があり落ちた（Linux では、
+ * ディスクのリースのロックの途中だった）。JDK 21 は今の段数で通った（Windows・Linux）。
+ * 冷えた道・JDK 21 で 8・8・32 段が通ったという前の測定は、残ったロックが見つからなかったというだけの結果で、尽きた位置は数えていなかった
+ * （インタプリタでは AQS の CAS が本物のフレームになり、一番上は `Unsafe` になる）。上の位置の数え方で測り直したのは、今の段数の冷えた道と、
+ * 16・16・64・8・8・32 段の JIT だけで、足りなくなる段数は JVM と回し方で変わる。
  * 今の段数は、測った最小（16・16・64）の 2 倍で、上の理由（環境で変わる）から下げない。費用は `docs/load-test.md` の「#858 の結果」。
  * これらのテストは段数を縮めて回す口を持たない。冷えた道・`-Xint`・JDK 21 で回す口は `-Pkibi.stackHeadroom=true` の
  * `stackHeadroomColdTest`・`stackHeadroomXintTest`・`stackHeadroomJdk21Test`（通常の `build` には入れない）

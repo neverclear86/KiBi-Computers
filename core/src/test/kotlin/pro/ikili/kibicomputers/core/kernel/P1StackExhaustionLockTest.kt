@@ -10,7 +10,6 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
-import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.kernel.process.crashReason
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -18,7 +17,6 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -49,17 +47,11 @@ class P1StackExhaustionLockTest {
         vfs.close(f)
     }
 
-    private fun soe(rt: ProcessRuntime): StackOverflowError? {
-        var t: Throwable? = rt.lastError
-        while (t != null && t !is StackOverflowError) t = t.cause
-        return t as StackOverflowError?
-    }
+    private fun soe(rt: ProcessRuntime): StackOverflowError? = SoePositions().soe(rt)
 
     private fun sweep(kind: ProcessKind, rounds: Int) = timeout(stackHeadroomTestLimit()) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
-        val tops = ConcurrentHashMap<String, AtomicInteger>()
-        var inLocks = 0
-        var inProbe = 0
+        val tally = SoePositions()
         Harness(config, execRuntime = EndiveRuntime(), asyncify = kind == ProcessKind.WAIT_POINT).use { h ->
             val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 3_000)
             val other = h.machine(fuelPerTick = 50_000_000, fuelSlice = 3_000)
@@ -92,14 +84,7 @@ class P1StackExhaustionLockTest {
                 assertTrue(e is StackOverflowError || (e is WasmTrapException && e.kind == WasmTrapKind.STACK_OVERFLOW), "$e")
                 assertEquals("call stack exhausted", crashReason(e!!), "${rt.lastError}")
                 modes.merge(mode, 1, Int::plus)
-                soe(rt)?.stackTrace?.firstOrNull()?.let { top ->
-                    tops.computeIfAbsent(top.className.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
-                    if (top.className.startsWith("java.util.concurrent.locks.")) {
-                        inLocks++
-                        println("#858 ロックの中で尽きた（$i 回目）: ${soe(rt)!!.stackTrace.take(16).joinToString(" <- ")}")
-                    }
-                    if (top.className == StackHeadroom::class.java.name) inProbe++
-                }
+                tally.record(rt, mode)
                 assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、$mode、pad $pad）: ${m.lock}")
                 m.lock.unlock()
                 val same = sameProgress.get()
@@ -116,8 +101,7 @@ class P1StackExhaustionLockTest {
             val blocking = h.scheduler.fuelBlockingWaits.get() - blocking0
             val unwindCost = h.scheduler.fuelUnwindCost.get() - unwindCost0
             println(
-                "#858 p1 $kind: CRASHED ${stackHeadroomRounds(rounds)} 回（$modes）、尽きた位置がロックの中 $inLocks 回、入口の確かめ $inProbe 回、" +
-                    "一番上: ${tops.entries.sortedByDescending { it.value.get() }.take(8).joinToString { "${it.key}=${it.value.get()}" }}、" +
+                "#858 p1 $kind: $modes、${tally.describe()}、" +
                     "前借り $overdrafts 回、巻き戻して燃料を待った $unwinds 回、譲った（巻き戻して譲ったのを含む） $yields 回、巻き戻しの費用 $unwindCost、スレッドを持って燃料を待った $blocking 回",
             )
             // 本番の燃料切れの道を通った（WAIT_POINT は前借り、BLOCKING は譲る道）
@@ -136,7 +120,7 @@ class P1StackExhaustionLockTest {
             assertEquals(0, h.scheduler.permits.waiting)
             assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
         }
-        assertEquals(0, inLocks, "スタックが JDK のロックの中で尽きた")
+        assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
     @Test

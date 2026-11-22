@@ -44,7 +44,15 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * スタックを 256 KiB に縮めたカーネルのスレッドで、1 段ごとにホストの関数（`ctx.hostFunction` の包み）か燃料切れの処理を呼ぶ再帰を、
  * 尽きる位置をずらしながら多数回動かす。毎回の後に、ほかのスレッド（テストのスレッド）からマシンのロックが取れること、
  * 同じ台と別の台のプロセスが進み続けることを確かめ、最後に止めて CPU と許可が元に戻ったことを確かめる。
- * 同じワーカー・同じ種類の専用スレッドで何度もスタックを使い切らせる（2 回目以降に JVM ごと落ちないことも見る）
+ * 同じワーカー・同じ種類の専用スレッドで何度もスタックを使い切らせる（2 回目以降に JVM ごと落ちないことも見る）。
+ *
+ * 尽きた位置（SOE のスタックトレース）は [SoePositions] で区画に分けて数える（回数は標準出力に出る）。確かめるのは次の 2 つ:
+ * - 位置が、ロックを取る・放す途中（AQS・`Unsafe` の CAS を含む）でないこと。入口の確かめが足りなければ、ここに落ちる
+ * - 毎回の後の状態: マシンのロック・ほかのロック（リースの I/O・表示デバイス）が取れる、CPU・許可が戻る、同じ台・別の台が進み続ける、
+ *   コンソールの出力の予約が 0 に戻る（[Body.CONSOLE]）
+ *
+ * 本体（VFS・端末・NIO）の中で尽きた位置は、確かめを通った後に起きるふつうの位置なので、数えるだけで落とさない（一番上が `String`・`Character` などの
+ * JDK の葉になることもある）。本体の中でロックを持ったまま尽きても、`finally` で放して巻き戻るので、上の状態で確かめる
  */
 class StackExhaustionLockTest {
     private val limit = stackHeadroomTestLimit()
@@ -93,9 +101,10 @@ class StackExhaustionLockTest {
 
         /**
          * ディスク（[DiskFileSystem]）の深いところまで入る（#858）。カーネルロックの中で fd・パスの解決に当たる区間を通った後、
-         * ロックの外で、深いディレクトリの下のファイルを `open(create)` → write → close → `rename`、マウントをまたぐ `rename`（`XDEV`）、
-         * 別のディスクの `stat` をする。ディスクの操作は、リースの I/O のロック（`HostDiskLeases.Lease.lock`）を持ったままホストの NIO を呼ぶ。
-         * テストのスレッドがそのロックを取り合い、待ち行列ができた状態の取得・解放（AQS の遅い道）も通す
+         * ロックの外で、回ごとに決めた 1 種類の操作（[DiskOp]）を、ホストの関数を呼ぶたびに繰り返す。ディスクの操作は、
+         * リースの I/O のロック（`HostDiskLeases.Lease.lock`）を持ったままホストの NIO を呼ぶ。
+         * テストのスレッドがそのロックを取り合い、待ち行列ができた状態の取得・解放（AQS の遅い道）も通す。
+         * 尽きる位置は、再帰の一番深いところで呼ばれた操作の中に落ちるので、操作を回ごとに分けて、どの操作の中でも確かめる
          */
         DISK_IO,
 
@@ -104,6 +113,24 @@ class StackExhaustionLockTest {
          * カーネルロック → `AnsiTerminal.write`）。テストのスレッドが表示デバイスのロックを取り合う（メインスレッドの描画のまね）
          */
         CONSOLE,
+    }
+
+    /** [Body.DISK_IO] の回ごとの操作（回の中は、ホストの関数を呼ぶたびに同じ操作） */
+    private enum class DiskOp {
+        /** 深いディレクトリの `stat`（パスの解決を 1 段ずつホストで確かめる） */
+        STAT_DEEP,
+
+        /** 別のディスクの `stat` */
+        STAT_OTHER,
+
+        /** `open`（作る・切り詰める）→ write → close */
+        CREATE_WRITE_CLOSE,
+
+        /** 同じマウントの中の `rename`（呼ぶたびに 2 つの名前を行き来する） */
+        RENAME,
+
+        /** マウントをまたぐ `rename`（`XDEV` で断られる） */
+        RENAME_ACROSS,
     }
 
     /** ホストの関数の本体が使うもの（1 回の sweep で共有する） */
@@ -129,7 +156,7 @@ class StackExhaustionLockTest {
     }
 
     /** 1 回分の深い再帰で、ホストの関数の本体が使うもの */
-    private class Round(val rig: Rig, val index: Int) {
+    private class Round(val rig: Rig, val index: Int, val diskOp: DiskOp? = null) {
         val context = AtomicReference<ProcessContext>()
 
         /** ホストの関数の本体を呼んだ回数 */
@@ -150,28 +177,30 @@ class StackExhaustionLockTest {
             Body.KERNEL_VFS -> ctx.withKernelLock { ctx.vfs.stat(VfsPath.parse("/")) }
             Body.DISK_IO -> {
                 val disk = round.rig.disk!!
-                // 1 回ごとの深いパスの stat（パスの解決）と、16 回に 1 回の open・write・rename（ホストの I/O は遅いので間引く）
-                if (round.calls.getAndIncrement() % 16 != 0) {
-                    ctx.vfs.stat(disk.deep)
-                    return
-                }
+                val n = round.index
+                val call = round.calls.getAndIncrement()
                 // 本番の path_open・path_rename と同じく、ロックの中は fd・パスの解決だけ（WasiP1Path）
                 ctx.withKernelLock { ctx.kernel.processes[ctx.pid] }
                 val vfs = ctx.vfs
-                val n = round.index
-                val f = vfs.open(disk.file(n), OpenOptions(read = true, write = true, create = true, truncate = true))
-                vfs.write(f, payload, 0, payload.size)
-                vfs.close(f)
-                vfs.rename(disk.file(n), disk.renamed(n))
-                try {
-                    vfs.rename(disk.renamed(n), disk.across(n))
-                } catch (e: FsException) {
-                    check(e.errno == Errno.XDEV) { "マウントをまたぐ名前の変更が XDEV でない: ${e.errno}" }
+                when (round.diskOp!!) {
+                    DiskOp.STAT_DEEP -> vfs.stat(disk.deep)
+                    DiskOp.STAT_OTHER -> vfs.stat(disk.other)
+                    DiskOp.CREATE_WRITE_CLOSE -> {
+                        val f = vfs.open(disk.file(n), OpenOptions(read = true, write = true, create = true, truncate = true))
+                        vfs.write(f, payload, 0, payload.size)
+                        vfs.close(f)
+                    }
+                    DiskOp.RENAME -> if (call % 2 == 0) vfs.rename(disk.file(n), disk.renamed(n)) else vfs.rename(disk.renamed(n), disk.file(n))
+                    DiskOp.RENAME_ACROSS -> try {
+                        vfs.rename(disk.file(n), disk.across(n))
+                    } catch (e: FsException) {
+                        check(e.errno == Errno.XDEV) { "マウントをまたぐ名前の変更が XDEV でない: ${e.errno}" }
+                    }
                 }
-                vfs.stat(disk.other)
             }
             Body.CONSOLE -> {
                 val tty = round.rig.tty!!
+                round.calls.incrementAndGet()
                 ctx.withKernelLock {
                     tty.write(payload, 0, payload.size, ctx.wakeSink)
                     ctx.reserveConsoleFlushLocked()
@@ -179,30 +208,6 @@ class StackExhaustionLockTest {
                 ctx.flushConsole()
             }
         }
-    }
-
-    /** 再帰で尽きた位置（SOE の一番上のフレーム）の内訳 */
-    private class Tally {
-        val crashed = AtomicInteger()
-        val inLocks = AtomicInteger()
-        val inProbe = AtomicInteger()
-
-        /** ホストの I/O（`java.nio`・`sun.nio`・`java.io`）の中 */
-        val inHostIo = AtomicInteger()
-
-        /** 端末（`AnsiTerminal`・`TextBuffer`）・TTY の中 */
-        val inTerminal = AtomicInteger()
-
-        /** VFS・ディスクの中 */
-        val inVfs = AtomicInteger()
-
-        /** 一番上のフレームのクラスごとの回数（表に書くため） */
-        val tops = java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>()
-
-        fun describe(): String =
-            "CRASHED ${crashed.get()} 回、尽きた位置がロックの中 ${inLocks.get()} 回、入口の確かめ ${inProbe.get()} 回、" +
-                "ホストの I/O ${inHostIo.get()} 回、端末 ${inTerminal.get()} 回、VFS ${inVfs.get()} 回、" +
-                "一番上: ${tops.entries.sortedByDescending { it.value.get() }.take(8).joinToString { "${it.key}=${it.value.get()}" }}"
     }
 
     /** テストのスレッドで、[locks] を取っては放し続ける（待ち行列を作り、プロセスの側の取得・解放を AQS の遅い道に入れる） */
@@ -260,15 +265,20 @@ class StackExhaustionLockTest {
 
     private val basePatterns = listOf(Pattern.HOST_EVERY_FRAME, Pattern.FUEL_EVERY_FRAME, Pattern.MIXED)
 
+    /** 本体を呼ぶ道だけ（`FUEL_EVERY_FRAME` はホストの関数を呼ばないので、本体が 1 度も動かない） */
+    private val hostPatterns = listOf(Pattern.HOST_EVERY_FRAME, Pattern.MIXED)
+
     private fun sweep(
         kind: ProcessKind,
         rounds: Int,
         body: Body = Body.EMPTY,
         patterns: List<Pattern> = basePatterns,
-    ) = timeout(limit) {
+        timeoutScale: Long = 1,
+    ) = timeout(limit.multipliedBy(timeoutScale)) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         val h = Harness(config)
-        val tally = Tally()
+        val tally = SoePositions()
+        val bodyCalls = AtomicInteger()
         val stopWaker = AtomicBoolean(false)
         var waker: Thread? = null
         var contenderThread: Thread? = null
@@ -340,7 +350,15 @@ class StackExhaustionLockTest {
                 // 尽きる位置を 1 段ずつずらす（詰め物の段数を変える）
                 val pad = (i / patterns.size * 7) % 97
                 val stream = if (body == Body.BLOCK) m.lock.withLockValue { ByteStream(1).also { m.kernel.objects.add(it) } } else null
-                val round = Round(Rig(stream, disk, tty), i)
+                val diskOp = if (body == Body.DISK_IO) DiskOp.entries[i / patterns.size % DiskOp.entries.size] else null
+                val tag = diskOp?.name ?: ""
+                val round = Round(Rig(stream, disk, tty), i, diskOp)
+                // RENAME・RENAME_ACROSS は、回ごとのファイルを先に作っておく
+                if (diskOp == DiskOp.RENAME || diskOp == DiskOp.RENAME_ACROSS) {
+                    val f = m.vfs.open(disk!!.file(i), OpenOptions(read = true, write = true, create = true, truncate = true))
+                    m.vfs.write(f, payload, 0, payload.size)
+                    m.vfs.close(f)
+                }
                 val driver = runDriver(kind) { ctx, b ->
                     round.context.set(ctx)
                     b.host(ctx) { c, _, _ -> runBody(c, body, round).let { LongArray(0) } }
@@ -365,7 +383,12 @@ class StackExhaustionLockTest {
                 assertEquals(MachineState.RUNNING, m.state, "マシンが壊れた（$i 回目）: ${rt.lastError}")
                 assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
                 assertEquals("call stack exhausted", crashReason(rt.lastError!!), "${rt.lastError}")
-                record(tally, rt)
+                tally.record(rt, tag)
+                bodyCalls.addAndGet(round.calls.get())
+                if (body == Body.DISK_IO || body == Body.CONSOLE) {
+                    // 本体は、尽きる深さまでホストの関数を呼ぶたびに動いた（尽きる位置が本体の中に落ちる）
+                    assertTrue(round.calls.get() > 0, "本体が 1 度も動かなかった（$i 回目、$pattern、$tag）")
+                }
                 // ほかのスレッドから、マシンのロックが取れる（持ったまま死んだスレッドがいない）
                 assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、$pattern、pad $pad）: ${m.lock}")
                 m.lock.unlock()
@@ -373,6 +396,11 @@ class StackExhaustionLockTest {
                 for (l in extraLocks) {
                     assertTrue(l.tryLock(5, TimeUnit.SECONDS), "ほかのロックが取れない（$i 回目、$pattern、pad $pad）: $l")
                     l.unlock()
+                }
+                if (body == Body.CONSOLE) {
+                    // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている。残ると、
+                    // メインスレッドがその台の TTY の残り（キー入力のエコーなど）をずっと取り出さなくなる
+                    assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った（$i 回目、$pattern、pad $pad）")
                 }
                 // 同じ台と別の台のプロセスが進み続ける（CPU・許可が渡り続ける）
                 val same = sameProgress.get()
@@ -395,7 +423,7 @@ class StackExhaustionLockTest {
             stopWaker.set(true)
             waker?.join(5_000)
             contenderThread?.join(5_000)
-            println("#858 $kind $body $patterns: ${tally.describe()}")
+            println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}")
             h.close()
             disk?.let {
                 it.a.retire()
@@ -403,8 +431,9 @@ class StackExhaustionLockTest {
             }
             tmp?.let { dir -> dir.toFile().deleteRecursively() }
         }
-        // 尽きた位置が JDK のロックの中だったことはない（入口の余裕の確かめが、ロックを取る前に止める）
-        assertEquals(0, tally.inLocks.get(), "スタックが JDK のロックの中で尽きた")
+        // 尽きた位置が、このMOD のロックを取る・放す途中（AQS・`Unsafe` の CAS を含む）だったことはない（入口の余裕の確かめが、ロックを取る前に止める）。
+        // 本体（VFS・端末・NIO）の中で尽きた位置は、ふつうに起きるので数えるだけで、毎回の後の状態（ロック・予約・CPU・許可）で確かめる
+        assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
     private fun state(h: Harness, m: Machine, rt: ProcessRuntime): String {
@@ -413,26 +442,6 @@ class StackExhaustionLockTest {
         val frames = t?.stackTrace?.take(8)?.joinToString(" <- ")
         return "CPU ${m.cpu.currentOwner?.pid} 待ち ${m.cpu.waiting}、許可 ${h.scheduler.permits.availablePermits()} 待ち ${h.scheduler.permits.waiting}、" +
             "lock ${m.lock}、SOE: $frames"
-    }
-
-    private fun record(tally: Tally, rt: ProcessRuntime) {
-        tally.crashed.incrementAndGet()
-        var t: Throwable? = rt.lastError
-        while (t != null && t !is StackOverflowError) t = t.cause
-        val top = t?.stackTrace?.firstOrNull() ?: return
-        val c = top.className
-        tally.tops.computeIfAbsent(c.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
-        when {
-            c.startsWith("java.util.concurrent.locks.") -> {
-                tally.inLocks.incrementAndGet()
-                println("#858 ロックの中で尽きた: ${t.stackTrace.take(16).joinToString(" <- ")}")
-            }
-            c == StackHeadroom::class.java.name -> tally.inProbe.incrementAndGet()
-            c.startsWith("java.nio.") || c.startsWith("sun.nio.") || c.startsWith("java.io.") -> tally.inHostIo.incrementAndGet()
-            c.startsWith("pro.ikili.kibicomputers.core.display.") || c.startsWith("pro.ikili.kibicomputers.core.kernel.tty.") ->
-                tally.inTerminal.incrementAndGet()
-            c.startsWith("pro.ikili.kibicomputers.core.kernel.vfs.") -> tally.inVfs.incrementAndGet()
-        }
     }
 
     @Test
@@ -471,19 +480,19 @@ class StackExhaustionLockTest {
 
     @Test
     fun `BLOCKINGでホストの関数の本体がディスクの深いところまで入っても、尽きる位置がロックの中にならず、リースのロックも残らない`() =
-        sweep(ProcessKind.BLOCKING, rounds = 24, body = Body.DISK_IO)
+        sweep(ProcessKind.BLOCKING, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns, timeoutScale = 2)
 
     @Test
     fun `WAIT_POINTでホストの関数の本体がディスクの深いところまで入っても、尽きる位置がロックの中にならず、リースのロックも残らない`() =
-        sweep(ProcessKind.WAIT_POINT, rounds = 24, body = Body.DISK_IO)
+        sweep(ProcessKind.WAIT_POINT, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns, timeoutScale = 2)
 
     @Test
     fun `BLOCKINGでホストの関数の本体がコンソールに書いて表示デバイスに流しても、表示デバイスのロックが残らない`() =
-        sweep(ProcessKind.BLOCKING, rounds = 60, body = Body.CONSOLE)
+        sweep(ProcessKind.BLOCKING, rounds = 60, body = Body.CONSOLE, patterns = hostPatterns)
 
     @Test
     fun `WAIT_POINTでホストの関数の本体がコンソールに書いて表示デバイスに流しても、表示デバイスのロックが残らない`() =
-        sweep(ProcessKind.WAIT_POINT, rounds = 60, body = Body.CONSOLE)
+        sweep(ProcessKind.WAIT_POINT, rounds = 60, body = Body.CONSOLE, patterns = hostPatterns)
 
     /**
      * 安全網: 入口の確かめが漏れてロックが残ったときのまね。ドライバーがマシンのロックを取ったまま返ると、step・専用スレッドの終わりで
