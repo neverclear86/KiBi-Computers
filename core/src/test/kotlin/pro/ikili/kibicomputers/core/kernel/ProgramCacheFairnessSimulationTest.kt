@@ -26,6 +26,18 @@ class ProgramCacheFairnessSimulationTest {
 
     private class Event(val at: Long, val seq: Long, val action: () -> Unit)
 
+    /** 重い台の読み込みの出し方 */
+    private enum class Pattern {
+        /** 8 秒の読み込みを、失敗を受け取るたびにすぐ出し直す */
+        STEADY,
+
+        /** 8 秒の読み込みの間に、すぐ終わる読み込み（1 ms）を 1 件はさむ（前後に 50 ms の間） */
+        QUICK_BETWEEN,
+
+        /** 8 秒・4 秒・2 秒・1 秒の読み込みを、この順に繰り返す（中くらいの読み込みで見込みを減らそうとする形） */
+        HALVING,
+    }
+
     /**
      * [machines] 台のうち [heavy] 台が重い台。軽い台は合わせて毎秒 [lightRate] 件、0.3〜0.9 秒の読み込みを出す（ポアソン到着）。
      * [playerGroups] なら、重い台は 1 台ずつ別のプレイヤーの組、軽い台は 50 人の組に分ける。そうでなければ全部が持ち主なしの組
@@ -34,7 +46,7 @@ class ProgramCacheFairnessSimulationTest {
         threshold: Long,
         heavy: Int,
         playerGroups: Boolean,
-        quickBetween: Boolean = false,
+        pattern: Pattern = Pattern.STEADY,
         machines: Int = 1000,
         lightRate: Double = 0.5,
         seconds: Int = 1800,
@@ -73,20 +85,21 @@ class ProgramCacheFairnessSimulationTest {
             program
         }
 
-        fun requestHeavy(id: Long) {
+        fun requestHeavy(id: Long, step: Int = 0) {
             if (now >= end) return
-            val f = cache.load(id, group(id), true, "heavy-${serial++}".toByteArray(), true, emptySet(), loader(8 * NANOS, true, null))
+            val seconds = if (pattern == Pattern.HALVING) 8L shr step else 8L
+            val f = cache.load(id, group(id), true, "heavy-${serial++}".toByteArray(), true, emptySet(), loader(seconds * NANOS, true, null))
             f.whenComplete { _, _ ->
                 heavyLoads++
-                if (!quickBetween) {
+                when (pattern) {
                     // 失敗を受け取ったらすぐ次を出す（exec を1つずつ順に繰り返す）
-                    requestHeavy(id)
-                    return@whenComplete
-                }
-                // 失敗を受け取って 50 ms 後に、すぐ終わる読み込み（1 ms）を 1 件はさみ、その 50 ms 後に次の重い読み込みを出す
-                events += Event(now + GAP, seq++) {
-                    val q = cache.load(id, group(id), true, "quick-${serial++}".toByteArray(), true, emptySet(), loader(QUICK, false, null))
-                    q.whenComplete { _, _ -> events += Event(now + GAP, seq++) { requestHeavy(id) } }
+                    Pattern.STEADY -> requestHeavy(id)
+                    Pattern.HALVING -> requestHeavy(id, (step + 1) % 4)
+                    // 失敗を受け取って 50 ms 後に、すぐ終わる読み込み（1 ms）を 1 件はさみ、その 50 ms 後に次の重い読み込みを出す
+                    Pattern.QUICK_BETWEEN -> events += Event(now + GAP, seq++) {
+                        val q = cache.load(id, group(id), true, "quick-${serial++}".toByteArray(), true, emptySet(), loader(QUICK, false, null))
+                        q.whenComplete { _, _ -> events += Event(now + GAP, seq++) { requestHeavy(id) } }
+                    }
                 }
             }
         }
@@ -148,16 +161,16 @@ class ProgramCacheFairnessSimulationTest {
         assertTrue(failures.isEmpty(), (failures + rows.toString()).joinToString(System.lineSeparator()))
     }
 
-    @Test
-    fun `重い読み込みの間にすぐ終わる読み込みをはさんでも、軽い台の待ちは読み込み中の1件の残りほどに収まる`() {
+    /** [pattern] の重い台が 5 台・20 台いるときの表を出し、件数の巡回と比べて確かめる */
+    private fun checkPattern(pattern: Pattern) {
         val rows = StringBuilder()
         rows.appendLine("| 組 | 重い台 | 方式 | 軽い台の待ち p50 | p99 | 最大 | 最大（最初から） | 重い台の読み込み数 |")
         rows.appendLine("| --- | --- | --- | --- | --- | --- | --- | --- |")
         val failures = ArrayList<String>()
         for (playerGroups in listOf(false, true)) {
             for (k in listOf(5, 20)) {
-                val old = simulate(Long.MAX_VALUE, k, playerGroups, quickBetween = true)
-                val fair = simulate(ProgramCache.DEFAULT_DEBT_THRESHOLD_NANOS, k, playerGroups, quickBetween = true)
+                val old = simulate(Long.MAX_VALUE, k, playerGroups, pattern)
+                val fair = simulate(ProgramCache.DEFAULT_DEBT_THRESHOLD_NANOS, k, playerGroups, pattern)
                 val label = if (playerGroups) "重い台ごとに別の人" else "全部持ち主なし"
                 for ((name, s) in listOf("件数の巡回" to old, "時間の公平さ" to fair)) {
                     rows.appendLine("| $label | $k | $name | %.2f s | %.2f s | %.2f s | %.2f s | %d |".format(s.p50, s.p99, s.max, s.firstMax, s.heavyLoads))
@@ -171,6 +184,16 @@ class ProgramCacheFairnessSimulationTest {
         }
         println(rows)
         assertTrue(failures.isEmpty(), (failures + rows.toString()).joinToString(System.lineSeparator()))
+    }
+
+    @Test
+    fun `重い読み込みの間にすぐ終わる読み込みをはさんでも、軽い台の待ちは読み込み中の1件の残りほどに収まる`() {
+        checkPattern(Pattern.QUICK_BETWEEN)
+    }
+
+    @Test
+    fun `中くらいの読み込みで見込みを減らそうとしても、軽い台の待ちは読み込み中の1件の残りほどに収まる`() {
+        checkPattern(Pattern.HALVING)
     }
 
     private companion object {

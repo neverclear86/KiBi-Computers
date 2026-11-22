@@ -295,6 +295,75 @@ class ProgramCacheTimeFairnessTest {
     }
 
     @Test
+    fun `中くらいの読み込みを続けて見込みを減らそうとしても、重い台は後に回る`() {
+        val cache = newCache()
+        // 8 秒の後に 4・2・1 秒を、ほかに待っている台がいない間に読み込む（借りは毎回帳消しになり、最後の 1 秒だけ残る）
+        for ((name, seconds) in listOf("h8" to 8.0, "h4" to 4.0, "h2" to 2.0, "h1" to 1.0)) {
+            cache.request(1, name, job(name, seconds, fail = true))
+            runAll()
+        }
+        assertEquals(sec(1.0), cache.debtOf(1))
+        cache.request(1, "h8b", job("h8b", 8.0, fail = true))
+        cache.request(2, "light", job("light", 0.5))
+        runAll()
+        // 見込みを直前の読み込みから減らすと、借り 1 秒 + 見込み 1 秒が 2 秒以下になり、台 1 が先に並ぶ。
+        // 見込みは読み込みでは減らないので、8 秒のまま後に回る
+        assertEquals(listOf("h8", "h4", "h2", "h1", "light", "h8b"), order)
+    }
+
+    @Test
+    fun `組の借りも、組のどの台も頼まずにいた間だけ減る`() {
+        val a = FairShareGroup.of(UUID(0, 1))
+        val b = FairShareGroup.of(UUID(0, 2))
+        val cache = newCache()
+        cache.request(1, "heavy", job("heavy", 8.0, fail = true), a)
+        runAll()
+        assertEquals(sec(8.0), cache.debtOfGroup(a))
+        // 10 秒、組 a のどの台も頼まずにいた: 組 a の別の台 2 が頼むと、組の借りが 1.25 秒減る（台 2 自身には記録がない）
+        now += sec(10.0)
+        cache.request(2, "a2", job("a2", 0.1), a)
+        assertEquals(sec(6.75), cache.debtOfGroup(a))
+        // 組 a がもう並んでいる間に、組 a の台 3 が頼んでも、組の借りは減らない（台 3 は待ち行列になかったので、台 3 の勘定だけが見られる）
+        now += sec(10.0)
+        cache.request(3, "a3", job("a3", 0.1), a)
+        assertEquals(sec(6.75), cache.debtOfGroup(a))
+        // 組 b は後から来たが、組 a は借りが残っているので後に回る
+        cache.request(4, "b4", job("b4", 0.1), b)
+        runAll()
+        assertEquals(listOf("heavy", "b4", "a2", "a3"), order)
+        // 組 a がもう一度 8 秒使ってから 112 秒頼まずにいれば、借りも見込み（8 秒から 2 秒）も減り、巡回の順に戻る
+        cache.request(1, "heavy2", job("heavy2", 8.0, fail = true), a)
+        runAll()
+        order.clear()
+        now += sec(112.0)
+        cache.request(5, "a5", job("a5", 0.1), a)
+        assertEquals(0, cache.debtOfGroup(a))
+        cache.request(6, "b6", job("b6", 0.1), b)
+        runAll()
+        assertEquals(listOf("a5", "b6"), order)
+    }
+
+    @Test
+    fun `減りきった組と、空になった組の持ち主の勘定は後始末で消える`() {
+        val a = FairShareGroup.of(UUID(0, 1))
+        val cache = newCache()
+        // 組 a の台 1 と、持ち主なしの組の 62 台
+        cache.request(1, "a1", job("a1", 0.01), a)
+        (2L..63L).forEach { cache.request(it, "p$it", job("p$it", 0.01)) }
+        runAll()
+        // 63 台と、組 a・組 NONE
+        assertEquals(65, cache.usageCount)
+        assertEquals(2, cache.ownerLedgerCount)
+        now += sec(3600.0)
+        // 64 回目の読み込みで、減りきったものを消す。組 a の記録と、空になった組 a の持ち主の勘定も消える
+        cache.request(64, "p64", job("p64", 0.01))
+        runAll()
+        assertEquals(2, cache.usageCount)
+        assertEquals(0, cache.debtOfGroup(a))
+        assertEquals(1, cache.ownerLedgerCount)
+    }
+
+    @Test
     fun `借りも見込みも残っている台は、後始末では消えず、順番が後始末の回数で変わらない`() {
         val cache = newCache()
         cache.request(1, "heavy", job("heavy", 8.0, fail = true))

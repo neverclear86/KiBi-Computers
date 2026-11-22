@@ -140,9 +140,9 @@ internal class ProgramCache(
      */
     private class Usage(var vtime: Long, var at: Long) {
         /**
-         * 次の読み込みにかかる時間の見込み。読み込みが終わるたびに、その経過時間と、前の見込みから経過時間を引いたものの大きい方にする
-         * （重い読み込みの間にすぐ終わる読み込みをはさんでも、見込みは 1 件ぶんの経過時間しか減らない）。
-         * 頼まずにいた間にも減る（[forgiveIdleLocked]）
+         * 次の読み込みにかかる時間の見込み。読み込みが終わるたびに、その経過時間と前の見込みの大きい方にする。
+         * 読み込みでは減らず、頼まずにいた間にだけ減る（[forgiveIdleLocked]）。読み込みで減らせると、重い読み込みの間に
+         * すぐ終わる読み込みや中くらいの読み込み（8 秒の後に 4・2・1 秒）をはさんで、軽い台が待っていない空き時間に見込みを崩せる
          */
         var lastCost = 0L
 
@@ -496,7 +496,7 @@ internal class ProgramCache(
         val u = ledger.usage[key] ?: return
         val elapsed = (now - startedAt).coerceAtLeast(0)
         u.vtime = ledger.floor + lagOf(ledger, u) + elapsed
-        u.lastCost = maxOf(elapsed, u.lastCost - elapsed)
+        u.lastCost = maxOf(elapsed, u.lastCost)
         u.at = now
         u.running--
         u.startSum -= startedAt
@@ -618,6 +618,9 @@ internal class ProgramCache(
 
     /** 組 [group] の借り（ナノ秒。テスト用。#750） */
     fun debtOfGroup(group: FairShareGroup): Long = synchronized(lock) { groupLedger.usage[group]?.let { lagOf(groupLedger, it) } ?: 0 }
+
+    /** 持ち主の間の勘定の数（組ごとに 1 つ。空になった勘定は後始末で消える。テスト用。#750） */
+    val ownerLedgerCount: Int get() = synchronized(lock) { ownerLedgers.size }
 
     /** 使った時間を覚えている持ち主と組の数（テスト用。#750） */
     val usageCount: Int get() = synchronized(lock) { groupLedger.usage.size + ownerLedgers.values.sumOf { it.usage.size } }
