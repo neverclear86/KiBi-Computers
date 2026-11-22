@@ -141,6 +141,11 @@ kibiWasm {
         sources.from("src/test/wasm/poll_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // /dev/device/<address> の fd の種類と isatty を確かめるプログラム（#865）
+    module("dev-device-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/dev_device_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // WASI p1 の cwd を PWD から合わせる起動処理（#332）を確かめるプログラム
     module("cwd-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/cwd_wasi.c", "src/main/wasm/common/kibi_cwd.c")
@@ -257,6 +262,11 @@ kibiWasm {
     // wasi-libc が p2 の wasi:filesystem（preopen・descriptor）を直接呼ぶ形で、パスの操作を確かめる（path_wasi.c はアダプター経由の p1 と同じソース）
     wasiSdkModule("path-wasi-p2") {
         sources.from("src/test/wasm/path_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // /dev/device/<address> の fd の isatty を、wasi-libc が p2 の wasi:filesystem を直接呼ぶ形で確かめる（#865。dev_device_wasi.c は p1 と同じソース）
+    wasiSdkModule("dev-device-wasi-p2") {
+        sources.from("src/test/wasm/dev_device_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
     // args・environ・時計・乱数・sched_yield を、wasi-libc が wasi:cli・wasi:clocks・wasi:random を直接呼ぶ形で確かめる
