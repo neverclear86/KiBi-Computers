@@ -105,9 +105,14 @@ internal class MemoryAccount(
  * プロセスの上限 [limitPages] × 64 KiB と、マシン全体の RAM（[MemoryAccount]）の両方に収まるときだけ確保する。
  *
  * 確保（[tryReserve]・[tryReserveBytes]）は、ゲストの命令（初めて書いた区画・`memory.grow`・`table.grow`）から、ホストの関数の包みを
- * 通らずにどの深さからでも呼ばれる。そこで先頭で [StackHeadroom.MEMORY_ACCOUNT_FRAMES] 段の余裕を確かめ、足りなければ何も数えずに
+ * 通らずにどの深さからでも呼ばれる（ホストの関数の本体から入る道もある。下）。そこで先頭で [StackHeadroom.MEMORY_ACCOUNT_FRAMES] 段の余裕を確かめ、足りなければ何も数えずに
  * `StackOverflowError` を投げる（プロセスだけが `call stack exhausted` で終わる。#856）。通れば、3 段の CAS と断られたときの戻し、
- * 呼び手の後処理（区画の確保・写し、Endive の `grow`、数えた分の記録）は、確かめた余裕の中で動く。返す側では確かめない
+ * 呼び手の後処理（区画の確保・写し、Endive の `grow`、数えた分の記録）は、確かめた余裕の中で動く。返す側では確かめない。
+ *
+ * ホストの関数の本体から入る道（本体が新しい区画へ書く `memory.write*`、`ctx.instantiate` の `ProcessRunner.reserveCoreInstanceOverhead`。
+ * 後者はカーネルロックの中）では、包みの確かめを通った後の本体の深さから、ここでもう 1 回確かめる。本体の途中（カーネルの状態を変えた後）で
+ * `StackOverflowError` になる深さがあるが、何も数える前に投げるので勘定はずれず、プロセスだけが終わる（ADR 0043）。
+ * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶ（まだ確かめていない。#883）
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {
     /** プロセスの上限（バイト） */
