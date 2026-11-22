@@ -38,6 +38,7 @@ import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.ColdBootLog
 import pro.ikili.kibicomputers.core.persist.ChunkMarkResult
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
+import pro.ikili.kibicomputers.core.persist.MachineIdentity
 import pro.ikili.kibicomputers.core.persist.MachineIdentityLimits
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -686,15 +687,37 @@ object ServerMachines {
     /** 予約ごとの取り出しの時間と区間（[Stats.recordSaves] のときだけ。完了で [Stats.saves] に入れる） */
     private val submitOf = IdentityHashMap<PendingSave, SubmitInfo>()
 
-    /** 予約の記録（負荷試験用。[captureNanos] は取り出しの時間、[window] は予約した区間の番号。#614） */
-    private class SubmitInfo(val captureNanos: Long, val window: Long)
+    /**
+     * 予約の記録（負荷試験用。[captureNanos] は取り出しの時間、[window] は予約した区間の番号。#614。
+     * [submittedAtNanos] は予約したときの `System.nanoTime`、[submittedAtTick] はそのときのサーバーの tick。#852 の失敗の文言に出す）
+     */
+    private class SubmitInfo(val captureNanos: Long, val window: Long, val submittedAtNanos: Long, val submittedAtTick: Int)
+
+    /** 今の区間に予約して、まだ完了を受け取っていない書き込み（負荷試験の失敗の文言用。#852） */
+    internal class OutstandingSave(val identity: MachineIdentity, val pos: BlockPos?, val submittedAtNanos: Long, val submittedAtTick: Int)
+
+    /**
+     * 今の区間に予約して、まだ完了を受け取っていない書き込みのうち、古い順に [limit] 件（負荷試験が失敗したときだけ呼ぶ。#852）。
+     * [Stats.recordSaves] の間だけ表に載るので、ふだんは空
+     */
+    internal fun outstandingWindowSaves(limit: Int): List<OutstandingSave> =
+        submitOf.entries.asSequence()
+            .filter { it.value.window == Stats.window }
+            .sortedBy { it.value.submittedAtNanos }
+            .take(limit)
+            .map { (pending, info) ->
+                OutstandingSave(pending.identity, (pending.tag as? CaseBlockEntity)?.blockPos, info.submittedAtNanos, info.submittedAtTick)
+            }
+            .toList()
 
     /** ケースが書き込みを予約した（[CaseBlockEntity.captureAndSubmit] から）。数え口に入れる */
     internal fun recordSubmit(submitted: CaptureSubmitResult) {
         Stats.captureNanos += submitted.captureNanos
         if (submitted.retried) Stats.deltaRetries++
         if (Stats.recordSaves) {
-            submitOf[submitted.pending] = SubmitInfo(submitted.captureNanos, Stats.window)
+            submitOf[submitted.pending] = SubmitInfo(
+                submitted.captureNanos, Stats.window, System.nanoTime(), (submitted.pending.tag as? CaseBlockEntity)?.level?.server?.tickCount ?: -1,
+            )
             Stats.windowSubmits++
         }
         val store = WorldMachineSaves.current ?: return

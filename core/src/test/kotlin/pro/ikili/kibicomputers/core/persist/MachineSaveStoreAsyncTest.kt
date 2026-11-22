@@ -401,6 +401,154 @@ class MachineSaveStoreAsyncTest {
     }
 
     @Test
+    fun `書き込みの仕事が失敗の完了を組み立てられずに投げても、予約1つに完了1つが返り、仕事の数え口が戻る`() {
+        // toString が投げる Error: writeGeneration の catch が原因の文字列を作るところで投げ、仕事の外に漏れる（#852 で見つけた穴）
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 100
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot = throw Unprintable()
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val identity = store.assignNewId(p)!!
+        val pending = store.submit(identity, p, bad, null)
+        val finishedBefore = store.finishedCount
+        assertEquals(1, store.pendingCount)
+        assertEquals(100, store.pendingBytes)
+        // 例外は投げ直す（サーバーでは書き込みのスレッドが warn する）
+        val thrown = runCatching { manual.runNext() }.exceptionOrNull()
+        assertNotNull(thrown)
+        assertEquals(0, store.pendingCount)
+        assertEquals(0, store.pendingBytes)
+        assertEquals(finishedBefore + 1, store.finishedCount)
+        val completion = store.pollCompleted().single()
+        assertSame(pending, completion.pending)
+        assertFalse(completion.succeeded)
+        assertNotNull(completion.error)
+        assertEquals(OptionalLong.empty(), store.latestGeneration(identity.id))
+        // 次の予約は書ける
+        store.submit(identity, p, src(), null)
+        manual.runAll()
+        assertTrue(store.pollCompleted().single().succeeded)
+    }
+
+    @Test
+    fun `使えない印の付いたIDの仕事が失敗の完了を組み立てられずに投げても、その失敗を受け取るまで印を外さない`() {
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val identity = store.assignNewId(p)!!
+        val written = store.submit(identity, p, src(), null)
+        manual.runAll()
+        store.pollCompleted()
+        val id = identity.id
+        val ownerFile = store.directoryOf(id).resolve(OwnerRecord.FILE_NAME)
+        // 世代の仕事 G が走っている間に、引き取りの owner.bin の仕事が書けずに印を付け、その失敗をメインスレッドが受け取る
+        // （ここでは G の build の中で、書き込みのスレッドの次の仕事とメインスレッドの受け取りを進めて、その順を作る）
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 0
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot {
+                Files.delete(ownerFile)
+                Files.createDirectories(ownerFile.resolve("x"))
+                assertTrue(manual.runNext(), "引き取りの owner.bin の仕事")
+                assertTrue(store.isUnusable(id))
+                assertTrue(store.pollCompleted().isEmpty(), "owner.bin だけの仕事の失敗は外に返さない")
+                assertTrue(store.isUnusable(id), "G が残っているので印は残す")
+                throw Unprintable()
+            }
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val g = store.submit(written.identity, p, bad, null)
+        index.removeIfOwner(id, p)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 1, 0, q).result)
+        assertEquals(2, manual.size)
+        assertNotNull(runCatching { manual.runNext() }.exceptionOrNull())
+        assertEquals(0, store.pendingCount)
+        assertTrue(store.isUnusable(id), "G の失敗（使えない印のあるIDの仕事）を受け取るまで印を外さない")
+        val completion = store.pollCompleted().single()
+        assertSame(g, completion.pending)
+        assertFalse(completion.succeeded)
+        assertFalse(store.isUnusable(id), "受け取って仕事がなければ印を外す")
+    }
+
+    @Test
+    fun `finishedCountは掃除・owner_bin・削除を含めて、列に入れた仕事を1つにつき1回だけ数える`() {
+        val identity = store.assignNewId(p)!!
+        val start = store.finishedCount
+        val first = store.submit(identity, p, src(), null)
+        store.submit(first.identity, p, src(), null)
+        // 引き取り（owner.bin を書く仕事）、印が進む（掃除）、削除
+        index.removeIfOwner(identity.id, p)
+        assertEquals(ClaimResult.TAKEN_OVER, store.claim(identity.id.toString(), 0, 0, q).result)
+        assertEquals(ChunkMarkResult.ADVANCED, store.markChunkGeneration(identity.id, 1, q))
+        store.delete(identity.id)
+        val queued = manual.size
+        assertTrue(queued >= 5, "世代 2 つ・owner.bin・掃除・削除が列に入った: $queued")
+        assertEquals(start, store.finishedCount, "走るまでは増えない")
+        assertEquals(queued, store.pendingCount)
+        manual.runNext()
+        assertEquals(start + 1, store.finishedCount)
+        manual.runAll()
+        assertEquals(start + queued, store.finishedCount, "1 つの仕事で 1 つだけ増える")
+        assertEquals(0, store.pendingCount)
+    }
+
+    @Test
+    fun `finishedCountは、閉じた後に断られた仕事も1つにつき1回だけ数える`() {
+        val identity = store.assignNewId(p)!!
+        val written = store.submit(identity, p, src(), null)
+        assertTrue(store.close(1000))
+        store.pollCompleted()
+        val start = store.finishedCount
+        store.submit(written.identity, p, src(), null)
+        assertEquals(start + 1, store.finishedCount, "断られた予約")
+        store.delete(identity.id)
+        assertEquals(start + 2, store.finishedCount, "断られた削除")
+        assertEquals(0, store.pendingCount)
+    }
+
+    @Test
+    fun `DIRECTでは書き込みの仕事が投げても、予約1つに完了1つで、数え口は1回だけ戻る`() {
+        class Unprintable : Error() {
+            override fun toString(): String = throw IllegalStateException("cannot print")
+        }
+        val bad = object : MachineSnapshotSource {
+            override val deltaBase: DeltaBase? get() = null
+            override val estimatedBytes: Long get() = 100
+
+            override fun build(id: UUID, generation: Long, modVersion: String): MachineSnapshot = throw Unprintable()
+
+            override fun committed(id: UUID, generation: Long) = Unit
+        }
+        val direct = MachineSaveStore(dir, index, "test")
+        val identity = direct.assignNewId(p)!!
+        val start = direct.finishedCount
+        // 仕事がその場で走り、投げた例外（IllegalStateException）が execute から出る。それを「断られた」として 2 回目の完了にしない
+        val pending = direct.submit(identity, p, bad, null)
+        assertEquals(0, direct.pendingCount)
+        assertEquals(0, direct.pendingBytes)
+        assertEquals(start + 1, direct.finishedCount)
+        val completion = direct.pollCompleted().single()
+        assertSame(pending, completion.pending)
+        assertFalse(completion.succeeded)
+        assertNotNull(completion.error)
+        assertTrue(direct.pollCompleted().isEmpty(), "同じ予約の完了は 1 回だけ")
+        // 同期の write も、失敗を 1 回だけ返し、完了を残さない
+        org.junit.jupiter.api.assertThrows<java.io.IOException> { direct.write(pending.identity, p, bad) }
+        assertEquals(start + 2, direct.finishedCount)
+        assertTrue(direct.pollCompleted().isEmpty())
+        assertEquals(0, direct.pendingCount)
+        assertEquals(0, direct.pendingBytes)
+    }
+
+    @Test
     fun `閉じた後の予約は失敗の完了で返る`() {
         val identity = store.assignNewId(p)!!
         assertTrue(store.close(1000))

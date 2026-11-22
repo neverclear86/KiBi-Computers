@@ -323,4 +323,84 @@ object AsyncSaveGameTests {
             finish(helper)
         }
     }
+
+    /**
+     * 負荷試験の書き込みの待ちが失敗したときの材料（#852）: 残っている予約が古い順に出て、書き込みのスレッドが名前で見つかり、
+     * そのスタックが出る。待ちが失敗したときにしか作らない文言なので、ここで一度組み立てて確かめる。
+     * [ServerMachines.Stats] を空にするので、ほかのテストと同時に動かないよう別のバッチにする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200, batch = "kibicomputers_save_window")
+    fun saveWaitDiagnosticsListOutstandingSavesOldestFirst(helper: GameTestHelper) {
+        val store = store(helper)
+        withRunningCase(helper) { be ->
+            val stats = ServerMachines.Stats
+            try {
+                stats.recordSaves = true
+                stats.reset()
+                WriterGate().use {
+                    val first = submit(helper, be)
+                    val second = submit(helper, be)
+                    ServerMachines.processCompletions()
+                    val outstanding = ServerMachines.outstandingWindowSaves(5)
+                    helper.assertTrue(
+                        outstanding.map { it.identity } == listOf(first.identity, second.identity),
+                        "both saves should be outstanding, oldest first: ${outstanding.map { it.identity }}",
+                    )
+                    helper.assertTrue(
+                        outstanding.all { it.pos == be.blockPos && it.submittedAtTick >= 0 },
+                        "each save should carry its case and tick: ${outstanding.map { "${it.pos} ${it.submittedAtTick}" }}",
+                    )
+                    helper.assertTrue(
+                        ServerMachines.outstandingWindowSaves(1).map { it.identity } == listOf(first.identity),
+                        "the limit should keep the oldest save",
+                    )
+                    val wait = SaveWaitProgress(stats.windowCompletions, store.finishedCount, System.nanoTime())
+                    wait.observe(stats.windowCompletions, store.finishedCount, System.nanoTime())
+                    val text = LoadRun.saveWaitDiagnostics(wait, helper.level.server.tickCount)
+                    val firstAt = text.indexOf("${first.identity.id}@${first.identity.generation}")
+                    val secondAt = text.indexOf("${second.identity.id}@${second.identity.generation}")
+                    helper.assertTrue(firstAt >= 0 && secondAt > firstAt, "the outstanding saves should be listed oldest first: $text")
+                    helper.assertTrue(text.contains("at ${be.blockPos.toShortString()}"), "the case position should be shown: $text")
+                    helper.assertTrue(text.contains("last phase completion 1 ticks"), "the ticks since the last completion should be shown: $text")
+                    // ゲートの仕事が書き込みのスレッドを CountDownLatch.await(上限) で止めている
+                    helper.assertTrue(
+                        text.contains("writer TIMED_WAITING at ") && text.contains("CountDownLatch"),
+                        "the writer thread should be found by name with its stack: $text",
+                    )
+                }
+                ServerMachines.drainSaves()
+                helper.assertTrue(ServerMachines.outstandingWindowSaves(5).isEmpty(), "received saves should leave the outstanding list")
+            } finally {
+                stats.recordSaves = false
+                stats.reset()
+            }
+            finish(helper)
+        }
+    }
+
+    /**
+     * 負荷試験の書き込みの待ちの進み（#852・#854）: 段階の完了が増えても、列から抜けた仕事（掃除など）が増えても、進みなしの tick を
+     * 数え直す。置き場がない tick（`null`）は列の累計を変えない。最後の完了の tick と時刻は、段階の完了が増えたときだけ進む
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun saveWaitProgressCountsQueueProgress(helper: GameTestHelper) {
+        val wait = SaveWaitProgress(10, 100, 5)
+        wait.observe(10, 100, 6)
+        helper.assertTrue(wait.ticks == 1 && wait.idleTicks == 1, "nothing moved: ${wait.ticks} ${wait.idleTicks}")
+        wait.observe(10, 101, 7)
+        helper.assertTrue(wait.idleTicks == 0, "a finished queue job (cleanup) should count as progress: ${wait.idleTicks}")
+        helper.assertTrue(wait.lastCompletionTick == 0 && wait.lastCompletionNanos == 5L, "no phase completion yet")
+        wait.observe(10, null, 8)
+        helper.assertTrue(wait.idleTicks == 1, "no store should not count as progress: ${wait.idleTicks}")
+        wait.observe(10, 101, 9)
+        helper.assertTrue(wait.idleTicks == 2, "the same finished count should not count again: ${wait.idleTicks}")
+        wait.observe(11, 101, 10)
+        helper.assertTrue(wait.idleTicks == 0, "a phase completion should count as progress: ${wait.idleTicks}")
+        helper.assertTrue(wait.lastCompletionTick == 5 && wait.lastCompletionNanos == 10L, "the last completion: ${wait.lastCompletionTick}")
+        wait.observe(11, 101, 11)
+        helper.assertTrue(wait.ticks == 6 && wait.idleTicks == 1, "after the completion: ${wait.ticks} ${wait.idleTicks}")
+        helper.succeed()
+    }
 }

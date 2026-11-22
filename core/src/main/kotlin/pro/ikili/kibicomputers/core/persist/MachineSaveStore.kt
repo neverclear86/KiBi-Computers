@@ -17,6 +17,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
@@ -166,6 +167,9 @@ public class MachineSaveStore @JvmOverloads constructor(
     private val outstanding = ConcurrentHashMap<UUID, Int>()
     private val pendingBytesCounter = AtomicLong()
     private val pendingTasks = AtomicInteger()
+
+    /** 列から抜けた（走り終えた・断られた）仕事の累計（[finishedCount]。#852） */
+    private val finishedTasks = AtomicLong()
     private val completed = ConcurrentLinkedQueue<Done>()
     private val waitLock = ReentrantLock()
     private val progress = waitLock.newCondition()
@@ -950,6 +954,13 @@ public class MachineSaveStore @JvmOverloads constructor(
             { writeGeneration(pending, registration, self, snapshot, ownerRecord, if (reassigned) current?.id else null) },
             { Done(pending, registration, self, snapshot, null, IOException("the save writer is closed; generation $generation of $id is not written")) },
             writesOwner = ownerRecord != null,
+            // writeGeneration は例外を失敗の完了にするが、その組み立て自体が投げても予約 1 つに完了 1 つを保つ（#852）。
+            // 原因の文字列（toString）は作らない（それが投げることがあるため）。「使えない」の印は writeGeneration の失敗と同じく付ける
+            // （付けないと、受け取る前に印が外れ、owner.bin のないディレクトリに後続の世代を書きうる。規則 7b・#566）
+            crashed = { e ->
+                val error = IOException("failed to write generation $generation of $id", e)
+                Done(pending, registration, self, snapshot, null, error, unusable = id in unusable)
+            },
         )
         return pending
     }
@@ -1071,27 +1082,54 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
     }
 
-    /** [task] を列に入れる。閉じていれば [rejected] の完了で返す。終わったら（どちらでも）見積もりと数を戻し、待ち手を起こす */
-    private fun enqueue(id: UUID, bytes: Long, task: () -> Done?, rejected: () -> Done?, blocksRestore: Boolean = true, writesOwner: Boolean = false) {
+    /**
+     * [task] を列に入れる。閉じていれば [rejected] の完了で返す。終わったら（どちらでも）見積もりと数を戻し、待ち手を起こす。
+     * [task] が投げたら、[crashed] があればその完了を積み（予約 1 つに完了 1 つを保つ。#852）、例外は投げ直す（書き込みのスレッドが warn する）
+     */
+    private fun enqueue(
+        id: UUID,
+        bytes: Long,
+        task: () -> Done?,
+        rejected: () -> Done?,
+        blocksRestore: Boolean = true,
+        writesOwner: Boolean = false,
+        crashed: ((Throwable) -> Done?)? = null,
+    ) {
         if (writesOwner) ownerWriteJobs.merge(id, 1, Int::plus)
         if (blocksRestore) restoreBlocking.merge(id, 1, Int::plus)
         outstanding.merge(id, 1, Int::plus)
         pendingTasks.incrementAndGet()
         pendingBytesCounter.addAndGet(bytes)
+        // 終わりの処理は 1 回だけ。[SaveExecutor.DIRECT] は仕事をその場で走らせるので、仕事が投げた例外が下の catch まで届き、
+        // 「断られた」として 2 回目の完了を積んでしまう（予約 1 つに完了 1 つを保つ。#852）
+        val settled = AtomicBoolean(false)
         val accepted = try {
             executor.execute(id) {
                 var done: Done? = null
                 try {
                     done = task()
+                } catch (e: Throwable) {
+                    if (crashed != null) {
+                        done = try {
+                            crashed(e)
+                        } catch (_: Throwable) {
+                            null
+                        }
+                    }
+                    throw e
                 } finally {
-                    finishTask(id, bytes, done, blocksRestore, writesOwner)
+                    if (settled.compareAndSet(false, true)) finishTask(id, bytes, done, blocksRestore, writesOwner)
                 }
             }
         } catch (e: RuntimeException) {
+            if (settled.get()) {
+                LOG.log(System.Logger.Level.WARNING, "A save task of $id failed", e)
+                return
+            }
             LOG.log(System.Logger.Level.WARNING, "Failed to queue a save task of $id", e)
             false
         }
-        if (!accepted) finishTask(id, bytes, rejected(), blocksRestore, writesOwner)
+        if (!accepted && settled.compareAndSet(false, true)) finishTask(id, bytes, rejected(), blocksRestore, writesOwner)
     }
 
     private fun finishTask(id: UUID, bytes: Long, done: Done?, blocksRestore: Boolean, writesOwner: Boolean) {
@@ -1104,6 +1142,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         if (blocksRestore) restoreBlocking.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
         pendingBytesCounter.addAndGet(-bytes)
         pendingTasks.decrementAndGet()
+        finishedTasks.incrementAndGet()
         val left = outstanding.compute(id) { _, n -> if (n == null || n <= 1) null else n - 1 }
         if (left == null && id in unusable && !unreceivedUnusable.containsKey(id)) forgetUnusable(id)
         waitLock.withLock { progress.signalAll() }
@@ -1219,6 +1258,12 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /** 列に入れて終わっていない仕事の数（数え口） */
     public val pendingCount: Int get() = pendingTasks.get()
+
+    /**
+     * 列から抜けた仕事（世代の書き込みのほか、掃除・`owner.bin`・削除・読みも。断られたものも含む）の累計（数え口。どのスレッドから読んでもよい）。
+     * 負荷試験が、書き込みのスレッドが進んでいるかを見る（#852。段階の保存の前に別の仕事が並んでいても、進んでいれば止まったと見ない）
+     */
+    public val finishedCount: Long get() = finishedTasks.get()
 
     /** [hasCapacity] が真になるまで、最大 [timeoutMillis] ミリ秒待つ（アンロード・停止の取り出しの前。#84）。待ちきれなければ `false` */
     @Throws(InterruptedException::class)
