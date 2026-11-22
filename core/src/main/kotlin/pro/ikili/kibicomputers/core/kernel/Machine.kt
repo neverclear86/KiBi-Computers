@@ -2588,7 +2588,29 @@ public class Machine private constructor(
     internal fun scheduleThreadlessLocked(rt: ProcessRuntime) {
         if (rt.process.state.isTerminal) return
         if (rt.process.state == ProcessState.WAITING_EVENT) rt.process.state = ProcessState.RUNNABLE
-        if (rt.thread != null) rt.pendingSchedule = true else cpu.enqueueThreadless(rt)
+        if (rt.thread == null) {
+            cpu.enqueueThreadless(rt)
+        } else if (!rt.pendingSchedule) {
+            rt.pendingSchedule = true
+            pendingSchedules++
+        }
+    }
+
+    /**
+     * step の途中に起こされ、スレッドが外れるのを待っているプロセスの数（[ProcessRuntime.pendingSchedule]。カーネルロック）。
+     * スレッドが外れるまでは CPU の待ち行列にも燃料待ちにもいないが、CPU を待つ者として数える（スライスをその場で足すかを決めるとき。#47）
+     */
+    private var pendingSchedules = 0
+
+    /** スレッドが外れるのを待って CPU の待ち行列に入るプロセスがいるか。カーネルロックの中で呼ぶ */
+    internal fun hasPendingSchedulesLocked(): Boolean = pendingSchedules > 0
+
+    /** [ProcessRuntime.pendingSchedule] を下ろす。立っていたら `true`。カーネルロックの中で呼ぶ */
+    internal fun clearPendingScheduleLocked(rt: ProcessRuntime): Boolean {
+        if (!rt.pendingSchedule) return false
+        rt.pendingSchedule = false
+        pendingSchedules--
+        return true
     }
 
     /** 燃料待ち（・一時停止の解除待ち）のプロセス（カーネルロック） */
