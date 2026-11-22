@@ -54,14 +54,18 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 確かめがないと、確かめが通らない深さでも確保が数えられ、`memory.grow`・初めて書いた区画では数えた分がプロセス・マシン・サーバー全体に
  * 残った（確かめた後は、確かめが通らない深さで必ず断られ、通った深さでは勘定がずれない）。
  *
- * ホストの関数の本体から入る道がある。本体が新しい区画へ書く（`memory.write*` → `WrittenPagesMemory.commit`）、`ctx.instantiate`
- * （`ProcessRunner.reserveCoreInstanceOverhead`。カーネルロックの中）は、包みの `ensure(HOST_CALL_FRAMES)` を通った後の本体の深さから、
- * 確保の入口でもう 1 回 [MEMORY_ACCOUNT_FRAMES] 段を確かめる。包みは通ったのに、本体の途中（カーネルの状態を変えた後。fd を開いた後・
+ * ホストの関数の本体から入る道がある。本体が新しい区画へ書く（`memory.write*` → `WrittenPagesMemory.commit`、`commit` →
+ * `commitRange`）、`ctx.instantiate` が作るメモリ・テーブルの最初の分（`createMemory`・`createTable`。カーネルロックの外）は、
+ * 包みの `ensure(HOST_CALL_FRAMES)` を通った後の本体の深さから、確保の入口でもう 1 回 [MEMORY_ACCOUNT_FRAMES] 段を確かめる
+ * （コンポーネントの固定費 `ProcessRunner.reserveCoreInstanceOverhead` は、プロセスの始まり（`load`）の浅いところからだけ来る）。包みは通ったのに、本体の途中（カーネルの状態を変えた後。fd を開いた後・
  * パイプから読んだ後・デバイスを呼んだ後など）で、ここが `StackOverflowError` を投げる深さがある。確かめは何も数える前なので勘定は
  * ずれず、プロセスは `call stack exhausted` で終わる（本体が変えたカーネルの状態は、プロセスの終わりで片付く）。確かめがなければ、
  * 同じ深さで段の途中で尽きて勘定がずれたので、窓が新しくできたのではなく、ずれる窓が「何も数えずに終わる」窓に変わった。
  * 「包みの確かめで、次にゲストを呼ぶまでのホストの区間がまかなえる」（ADR 0043）が成り立つのは、本体の中で確保に入らない区間だけ
  * （`MemoryAccountStackExhaustionTest` の `hostBody`）。
+ * カーネルのプロセスを通した確かめは `MemoryAccountStackExhaustionKernelTest`（本物のマシン・Endive で、ゲストの命令とホストの関数の本体
+ * （`memory.write*`・`commit`）から入り、プロセスだけが終わり、終わりの後にマシン・サーバー全体の勘定が戻り、ほかの台が動き続ける）。
+ * `ctx.instantiate` の道（作るのに失敗したときに同じ深さで返す `catch` を含む）は、まだ確かめていない（#884）。
  *
  * `/tmp`（`TmpFileSystem`）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、この入口で
  * 覆えない。まだ確かめていない（#883）

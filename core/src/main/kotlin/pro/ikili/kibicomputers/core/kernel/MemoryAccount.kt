@@ -109,9 +109,12 @@ internal class MemoryAccount(
  * `StackOverflowError` を投げる（プロセスだけが `call stack exhausted` で終わる。#856）。通れば、3 段の CAS と断られたときの戻し、
  * 呼び手の後処理（区画の確保・写し、Endive の `grow`、数えた分の記録）は、確かめた余裕の中で動く。返す側では確かめない。
  *
- * ホストの関数の本体から入る道（本体が新しい区画へ書く `memory.write*`、`ctx.instantiate` の `ProcessRunner.reserveCoreInstanceOverhead`。
- * 後者はカーネルロックの中）では、包みの確かめを通った後の本体の深さから、ここでもう 1 回確かめる。本体の途中（カーネルの状態を変えた後）で
+ * ホストの関数の本体から入る道（本体が新しい区画へ書く `memory.write*`・`commit`（`WrittenPagesMemory.commitRange`）、
+ * `ctx.instantiate` が作るメモリ・テーブルの最初の分（`createMemory`・`createTable`）。どれもカーネルロックの外）では、
+ * 包みの確かめを通った後の本体の深さから、ここでもう 1 回確かめる。本体の途中（カーネルの状態を変えた後）で
  * `StackOverflowError` になる深さがあるが、何も数える前に投げるので勘定はずれず、プロセスだけが終わる（ADR 0043）。
+ * コンポーネントの core インスタンスの固定費（`ProcessRunner.reserveCoreInstanceOverhead`。カーネルロックの中）は、
+ * プロセスの始まり（`load` → `loadComponent` の `configure`。step・専用スレッドの浅いところ）からだけ来て、ホストの関数の本体からは入らない。
  * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶ（まだ確かめていない。#883）
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {

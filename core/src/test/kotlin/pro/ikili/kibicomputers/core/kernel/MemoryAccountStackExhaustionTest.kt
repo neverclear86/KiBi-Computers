@@ -25,7 +25,11 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * - 確かめた余裕で足りること: 確かめが通った深さでは、確保が最後まで終わるか、何も数えずに断られる。途中で尽きて数えた分が残れば、ずれとして見つかる
  *
  * ホストの関数の本体から入る道（[hostBody]）は、包みの確かめ（[StackHeadroom.HOST_CALL_FRAMES]）が通った後、本体が深くなってから確保に入る。
- * 包みの確かめを通ったのに本体の途中で断られる深さがあること（ADR 0043）と、その深さでも勘定がずれないことを確かめる
+ * 包みの確かめを通ったのに本体の途中で断られる深さがあること（ADR 0043）と、その深さでも勘定がずれないことを確かめる。
+ *
+ * ここは勘定の組だけを直接組み、Kotlin の再帰から呼ぶ（深さごとに、確かめが通らない深さで必ず断られることまで見るため）。
+ * カーネルのプロセス（`ProcessRunner`・`ctx.hostFunction` の包み・`finishLocked`）と本物の Endive（ROM の区画の写し、`commitRange`、
+ * `BudgetedTable` の `table.grow`）を通し、プロセスだけが終わること・ほかの台が動き続けることは [MemoryAccountStackExhaustionKernelTest] で確かめる
  */
 class MemoryAccountStackExhaustionTest {
     private val stackBytes = 256L * 1024
@@ -191,7 +195,8 @@ class MemoryAccountStackExhaustionTest {
     fun `底に近い深さのすべてで、ページを数えても、プロセス・マシン・サーバー全体の勘定はずれない`() = check(Op.RESERVE_PAGES)
 
     /**
-     * ホストの関数の本体（包みの確かめを通った後）から入る道（`memory.write*` が新しい区画に書く、`ProcessRunner.reserveCoreInstanceOverhead`）。
+     * ホストの関数の本体（包みの確かめを通った後）から入る道（`memory.write*` が新しい区画に書く、`ctx.instantiate` が作るメモリ・テーブルの最初の分）のまね。
+     * 包みは [lacks] で真似るだけで、カーネルのプロセスを通した確かめは [MemoryAccountStackExhaustionKernelTest]。
      * 本体が深くなってから確保に入るので、包みの確かめは通ったのに、本体の途中で確保が断られる深さがある（ADR 0043）。
      * そこでは何も数えずに `StackOverflowError` になり、勘定はずれない（本体がその前に変えたカーネルの状態は、プロセスの終わりで片付く）
      */
