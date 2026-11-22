@@ -232,22 +232,19 @@ class StackExhaustionLockTest {
                 assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
                 assertEquals("call stack exhausted", crashReason(rt.lastError!!), "${rt.lastError}")
                 record(tally, rt)
-                // 尽きた位置が JDK のロックの中なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）
-                assertTrue(
-                    soeTop(rt)?.className?.startsWith("java.util.concurrent.locks.") != true,
-                    "スタックが JDK のロックの中で尽きた（$i 回目、$pattern、pad $pad）: ${state(h, m, rt)}",
-                )
+                // 尽きた位置が JDK のロックの中なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
+                // 失敗の説明は、落とすときだけ作る（成功する回で `state` を評価しない。中のロックは待ちの上限付きで取る）
+                if (soeTop(rt)?.className?.startsWith("java.util.concurrent.locks.") == true) {
+                    fail("スタックが JDK のロックの中で尽きた（$where）: ${state(h, m, rt)}")
+                }
                 // ほかのスレッドから、マシンのロックが取れる（持ったまま死んだスレッドがいない）
-                assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、$pattern、pad $pad）: ${m.lock}")
+                assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$where）: ${m.lock}")
                 m.lock.unlock()
                 // 同じ台と別の台のプロセスが進み続ける（CPU・許可が渡り続ける）
                 awaitProgress(h, "同じ台のプロセス（$where）", sameProgress, describe)
                 awaitProgress(h, "別の台のプロセス（$where）", otherProgress, describe)
-                // 許可が失われていない。この構成（台 2 つ、許可 2 つ）では、1 台が持つ許可は高々 1 つ（CPU → 許可の順に取り、
-                // 許可 → CPU の順に返す）なので、許可の待ち手はいつもいない。待ち手が残るなら、どこかで許可が減っている
-                eventuallyDescribe(5_000, { "許可の待ち手が残っている（$where）: ${describe()}" }) {
-                    peek(innerLock(h.scheduler.permits)) { h.scheduler.permits.waiting } == 0
-                }
+                // 許可が失われていないことは、毎回は見ない（待ち手の数の確かめは、tick を回さない間に燃料待ちへ移って 0 になるだけで、
+                // 許可が 1 つ減っても見つけられない）。許可の数は、止めた後の最後の確かめ（availablePermits が元の数に戻る）で見る
             }
             m.stop()
             other.stop()
@@ -281,7 +278,7 @@ class StackExhaustionLockTest {
      *
      * - 遅れ（後でそろった）: 様子を標準出力に出して続ける。全体のテストを回した負荷の高い状態（CPU の取り合い、GC、プロセスごと
      *   止まった後の再開）では、正しく動いていても 10 秒を超えることがある。確かめたいのは「CPU・許可が渡り続ける」ことなので、
-     *   遅れでは落とさない。許可が失われたことは、毎回の許可の待ち手の確かめと、最後の許可の数の確かめで見る
+     *   遅れでは落とさない。許可が失われたことは、最後の許可の数の確かめで見る
      * - 停止（そろわないまま）: 最初と終わりの時点の様子を付けて落とす
      */
     private fun awaitOrClassify(h: Harness, what: String, describe: () -> String, condition: () -> Boolean) {
@@ -330,7 +327,7 @@ class StackExhaustionLockTest {
 
     /**
      * 止まったときの説明（#868）。台ごとの CPU と spin の様子、許可、tick の数、カーネルのスレッドのスタック、ここまでの集計。
-     * ロックはすべて待ちの上限付きで取る（[peek]）
+     * CPU・許可・ディスパッチャーの中のロックと、マシンのロックは、すべて待ちの上限付きで取る（[peek]）
      */
     private fun diagnose(h: Harness, spins: List<Pair<Machine, ProcessRuntime>>, victim: ProcessRuntime?, tally: Tally): String {
         val permits = h.scheduler.permits
@@ -372,10 +369,14 @@ class StackExhaustionLockTest {
         return t as StackOverflowError?
     }
 
+    /** 失敗の説明（落とすときだけ呼ぶ）。CPU・許可の中のロックは、待ちの上限付きで取る（[peek]） */
     private fun state(h: Harness, m: Machine, rt: ProcessRuntime): String {
-        val frames = soeTop(rt, 8)
-        return "CPU ${m.cpu.currentOwner?.pid} 待ち ${m.cpu.waiting}、許可 ${h.scheduler.permits.availablePermits()} 待ち ${h.scheduler.permits.waiting}、" +
-            "lock ${m.lock}、SOE: $frames"
+        val permits = h.scheduler.permits
+        val cpu = innerLock(m.cpu)
+        val inner = innerLock(permits)
+        return "CPU ${peek(cpu) { m.cpu.currentOwner?.pid }} 待ち ${peek(cpu) { m.cpu.waiting }}、" +
+            "許可 ${peek(inner) { permits.availablePermits() }} 待ち ${peek(inner) { permits.waiting }}、" +
+            "lock ${m.lock}、SOE: ${soeTop(rt, 8)}"
     }
 
     private fun record(tally: Tally, rt: ProcessRuntime) {
