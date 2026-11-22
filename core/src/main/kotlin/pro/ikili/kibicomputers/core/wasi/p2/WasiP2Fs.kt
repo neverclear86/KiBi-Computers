@@ -1,12 +1,10 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
-import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
+import pro.ikili.kibicomputers.core.kernel.fd.descriptorFileType
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
-import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
 import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
-import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FileStat
 import pro.ikili.kibicomputers.core.kernel.vfs.FileType
@@ -134,7 +132,7 @@ internal object WasiP2Fs {
             "[method]descriptor.get-flags" to fs { ctx, a -> CanonValue.Flags(P2.entry<DescriptorEntry>(ctx, a[0]).flags) },
             "[method]descriptor.get-type" to fs { ctx, a ->
                 val e = P2.entry<DescriptorEntry>(ctx, a[0])
-                typeOf(ctx.withKernelLock { kindOf(ctx.kernel.objects[e.objectId]) })
+                typeOf(ctx.withKernelLock { descriptorFileType(ctx.kernel.objects[e.objectId]) })
             },
             "[method]descriptor.set-size" to fs { ctx, a ->
                 ctx.vfs.setSize(file(ctx, a[0]), P2.u64(a[1]))
@@ -182,7 +180,7 @@ internal object WasiP2Fs {
             "[method]descriptor.stat" to fs { ctx, a ->
                 val e = P2.entry<DescriptorEntry>(ctx, a[0])
                 val obj = ctx.withKernelLock { ctx.kernel.objects[e.objectId] }
-                statValue(if (obj is OpenFile) ctx.vfs.stat(obj) else FileStat(0, kindOf(obj)))
+                statValue(if (obj is OpenFile) ctx.vfs.stat(obj) else FileStat(0, descriptorFileType(obj)))
             },
             "[method]descriptor.stat-at" to fs { ctx, a ->
                 val target = resolve(ctx, a[0], a[2])
@@ -281,12 +279,6 @@ internal object WasiP2Fs {
         )
         val preopens = mapOf("get-directories" to body { ctx, _ -> CanonValue.Items(preopens(ctx)) })
         return mapOf(TYPES to types, PREOPENS to preopens)
-    }
-
-    private fun kindOf(obj: KernelObject?): FileType = when (obj) {
-        is OpenFile -> obj.type
-        is Tty, is DeviceHandle -> FileType.CHARACTER_DEVICE
-        else -> FileType.UNKNOWN
     }
 
     /** descriptor [self] が指す [OpenFile]（差し替えた `/dev` のものは `bad-descriptor`） */
