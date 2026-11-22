@@ -491,4 +491,58 @@ class AsyncP1Test {
             assertEquals(ProcessState.EXITED, m.stateOf(pid))
         }
     }
+    /**
+     * 可変の v128 のグローバル（初期値は `v128.const`）を持ち、標準入力から 1 バイト読んでから、そのグローバルの lane 0（7）で
+     * 終わる p1 のコマンド（#851）。止まりうる `_start` は v128 を扱わず、lane は止まらない関数 `${'$'}code` で読む
+     */
+    private val v128GlobalCommand by lazy {
+        pro.ikili.kibicomputers.core.wasi.kibi.WitTool.wat(
+            """
+            (module
+              (import "wasi_snapshot_preview1" "fd_read" (func ${'$'}fd_read (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "proc_exit" (func ${'$'}exit (param i32)))
+              (memory (export "memory") 1)
+              (global ${'$'}v (mut v128) (v128.const i32x4 7 0 0 0))
+              (func ${'$'}code (result i32) (i32x4.extract_lane 0 (global.get ${'$'}v)))
+              (func (export "_start")
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 1))
+                (drop (call ${'$'}fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+                (call ${'$'}exit (call ${'$'}code))))
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun `定数式のv128グローバルを持つモジュールは待機点型で動き、保存の写しの中でだけ止める`() = timeout(limit) {
+        val program = Program.loadMetered(EndiveRuntime(), v128GlobalCommand, null, WasiP1.WAIT_IMPORTS)
+        assertTrue(program.module.isAsyncified)
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            val f = m.vfs.open(VfsPath.parse("/v128"), OpenOptions(read = true, write = true, create = true, truncate = true))
+            m.vfs.write(f, v128GlobalCommand, 0, v128GlobalCommand.size)
+            val input = m.lock.withLockValue { ByteStream(16).also { m.kernel.objects.add(it) }.id }
+            val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Closed, StdioSource.Closed)
+            val pid = m.exec("/v128", KernelDrivers.DEFAULT, SpawnOptions(stdio = stdio))
+            assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
+            eventually(30_000, "入力を待たない") {
+                h.scheduler.tick()
+                m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
+            }
+            assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
+            // 可変の v128 のグローバルは取り出せない（ADR 0082）。写しは取れ、その中でだけプロセスを殺す
+            val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
+            assertTrue(pid in copy.killedPids, "写しの中で殺していない")
+            assertTrue(copy.abiCaptures[pid] == null, "殺したプロセスの ABI 層を写した")
+            // 元のプロセスは動き続け、グローバルの初期値どおりに終わる
+            m.lock.withLockValue { (m.kernel.objects[input] as ByteStream).closeWrite(m.wakeSink) }
+            eventually(30_000, "終わらない") {
+                h.scheduler.tick()
+                m.stateOf(pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(pid))
+            assertEquals(7, m.lock.withLockValue { m.kernel.processes[pid]?.exitCode })
+        }
+    }
 }

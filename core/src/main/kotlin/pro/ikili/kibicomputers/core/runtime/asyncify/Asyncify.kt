@@ -19,8 +19,9 @@ import java.io.ByteArrayOutputStream
  * （`exec` は `NOEXEC`。#367）。
  *
  * [message] は断った理由（どの関数の、どの命令・どの機能か。`exec` のエラーメッセージに入る）。
- * 止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。ただし、グローバル・要素セグメントの定数式に
- * `v128.const` などの命令があれば、止まりうる関数がなくても断る（#851）。
+ * 止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。グローバル・要素セグメントの定数式の
+ * `v128.const` と GC の提案の命令は、定数式としてそのまま写し、これでは断らない（#851）。ただし、止まりうる関数があるモジュールは、
+ * 型付きの参照型（`(ref i31)` など）のグローバルや型を持てば、定数式の命令とは別に断る（型を追えない。#384）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -119,8 +120,9 @@ internal object Asyncify {
      *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
-     *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は、止まりうる関数がなくても断る（#851）
-     * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
+     *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
+     * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。グローバル・能動な要素セグメントのものは Endive の検証が、
+     *   パッシブ・宣言の要素セグメントのものは定数式の写しが断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)
     fun transform(
@@ -952,6 +954,8 @@ private class Transformer(
                 I64 -> { out.u8(0x42); out.u8(0) }
                 F32 -> { out.u8(0x43); repeat(4) { out.u8(0) } }
                 F64 -> { out.u8(0x44); repeat(8) { out.u8(0) } }
+                // ref.null 0x7B は正しくない。v128 を結果に持つものは、ローカル変数と同じく断る（ADR 0316。#851）
+                V128 -> throw AsyncifyUnsupported("SIMD（v128）の値を結果に持つ関数・ブロックには対応していない")
                 else -> { out.u8(0xD0); out.u8(t) }
             }
         }
@@ -1288,8 +1292,8 @@ private class Transformer(
     }
 }
 
-/** バイト列の書き出し（core の `FuelInjector` と同じもの。core のものは internal なので写した） */
-private class Sink : ByteArrayOutputStream() {
+/** バイト列の書き出し（core の `FuelInjector` と同じもの。core のものは internal なので写した。テストが [Reader] に渡すので internal） */
+internal class Sink : ByteArrayOutputStream() {
     fun u8(b: Int) = write(b and 0xFF)
 
     fun bytes(src: ByteArray, off: Int, len: Int) = write(src, off, len)
@@ -1332,8 +1336,8 @@ private class Sink : ByteArrayOutputStream() {
     }
 }
 
-/** バイト列の読み込み */
-private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
+/** バイト列の読み込み（定数式の写しをテストが直接呼ぶので internal。#851） */
+internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
     fun u8(): Int {
         if (pos >= end) throw AsyncifyUnsupported("セクションの終わりを超えて読んだ")
         return buf[pos++].toInt() and 0xFF
@@ -1412,7 +1416,29 @@ private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
                     out.leb(remap(leb()))
                 }
                 0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op)
-                else -> throw AsyncifyUnsupported("定数式の命令 0x%02X（拡張された定数式の提案）には対応していない".format(op))
+                // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。以下の「定数式に使えない」で断る分岐は、変換できない作りではなく、
+                // WASM として正しくないものとして断る（原因なしの WasmLoadException）。`prepare` は最初に Endive の `Parser.parse`（検証あり）を通すが、
+                // Endive 1.2.0 の検証はパッシブ・宣言の要素セグメント（flag 5・7）の初期値を確かめないので、その形ではここに届く
+                0xFD -> { // v128.const
+                    val sub = leb()
+                    if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))
+                    if (end - pos < 16) throw WasmLoadException("セクションの終わりを超えて読んだ")
+                    pos += 16
+                    out.bytes(buf, start, pos - start)
+                }
+                0xFB -> { // GC の提案の定数式の命令
+                    when (val sub = leb()) {
+                        0L, 1L, 6L, 7L -> skipLeb() // struct.new・struct.new_default・array.new・array.new_default（型の番号）
+                        8L -> { // array.new_fixed（型の番号と数）
+                            skipLeb()
+                            skipLeb()
+                        }
+                        0x1AL, 0x1BL, 0x1CL -> Unit // any.convert_extern・extern.convert_any・ref.i31
+                        else -> throw WasmLoadException("定数式の命令 0xFB %d は定数式に使えない".format(sub))
+                    }
+                    out.bytes(buf, start, pos - start)
+                }
+                else -> throw WasmLoadException("定数式の命令 0x%02X は定数式に使えない".format(op))
             }
         }
     }

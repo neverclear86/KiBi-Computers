@@ -120,7 +120,8 @@ public class WasmInstanceState @JvmOverloads constructor(
 
 /**
  * インスタンスの状態を取り出せない作り（#82）。v128 のグローバル、参照型の可変のグローバル、externref のテーブル、
- * ほかのインスタンスの関数を指す要素、start 関数を持つモジュール（[WasmModule.instantiateForRestore] で start を飛ばせない）など。
+ * ほかのインスタンスの関数を指す要素、GC のオブジェクト（struct・array）を初期値の式で作るグローバル・要素セグメント（不変でも。
+ * オブジェクトの中身を写さないため。#851）、start 関数を持つモジュール（[WasmModule.instantiateForRestore] で start を飛ばせない）など。
  * 取り出す側（カーネル）は、そのプロセスを保存できないものとして扱う
  */
 @ApiStatus.Internal

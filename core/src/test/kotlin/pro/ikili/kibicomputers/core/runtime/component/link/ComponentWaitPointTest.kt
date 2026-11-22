@@ -252,10 +252,14 @@ class ComponentWaitPointTest {
     /** 読み込ませた（コンパイルさせた）回数を数えるランタイム。計画のための形の読み取り（describe）は数えない */
     private class CountingRuntime(private val inner: WasmRuntime = LinkTesting.runtime) : WasmRuntime {
         var loads = 0
+
+        /** 読み込んだバイト列（挿入・変換の後の core モジュール）の SHA-256 */
+        val loaded = ArrayList<String>()
         override val name: String get() = "counting-" + inner.name
 
         override fun load(bytes: ByteArray): WasmModule {
             loads++
+            loaded += MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
             return inner.load(bytes)
         }
 
@@ -306,28 +310,28 @@ class ComponentWaitPointTest {
     }
 
     /**
-     * 止まりうる関数がなくても、グローバルの初期値の式に `v128.const` があれば、読み込みは断られる（#851）。
-     * 計測あり（`exec`）では `FuelInjector` が断る（原因は `AsyncifyUnsupported` ではない）。計測なしでは `Asyncify` が断るので、
-     * `requireWaitPoints` なら理由が取り出せ、直接の読み込みなら `BLOCKING` に落ちる
+     * グローバルの初期値の式に `v128.const` があっても、計測あり（`exec`）・計測なしのどちらでも待機点に変換でき、
+     * `requireWaitPoints` でも断らない（#851）。止まりうる関数がある形（`UNWIND`）とない形（`NONE`）の両方。変換は決定的
      */
     @Test
-    fun `止まりうる関数がなくても定数式のv128グローバルがあれば断られる`() {
+    fun `定数式のv128グローバルがあっても待機点に変換できる`() {
         val constGlobal = shimShape.replace(
             "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n", "(import \"shim\" \"get\" (func ${'$'}g (result i32)))\n            (global v128 (v128.const i32x4 0 0 0 0))\n",
         )
         check(constGlobal != shimShape)
         val bytes = LinkTesting.wat(constGlobal)
-        val host = GetHost(HostWait.NONE).host
-        val metered = assertThrows<WasmLoadException> {
-            ComponentProgram.load(LinkTesting.runtime, bytes, host, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+        for (wait in listOf(HostWait.NONE, HostWait.UNWIND)) {
+            for (metered in listOf(true, false)) {
+                val runs = List(2) {
+                    val runtime = CountingRuntime()
+                    val p = ComponentProgram.load(runtime, bytes, GetHost(wait).host, metered = metered, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
+                    assertTrue(p.waitPoints, "$wait metered=$metered: ${p.waitPointRejection}")
+                    runtime.loaded.toList()
+                }
+                assertTrue(runs[0].isNotEmpty())
+                assertEquals(runs[0], runs[1], "$wait metered=$metered: 変換が決定的でない")
+            }
         }
-        assertNull(Program.unsuspendableReason(metered), "${metered.message} / ${metered.cause}")
-        val e = assertThrows<WasmLoadException> {
-            ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT, requireWaitPoints = true)
-        }
-        assertTrue(Program.unsuspendableReason(e)?.contains("0xFD") == true, "${e.message} / ${e.cause}")
-        val direct = ComponentProgram.load(LinkTesting.runtime, bytes, host, metered = false, policy = LinkTesting.ANY_IMPORT)
-        assertFalse(direct.waitPoints)
     }
 
     @Test
