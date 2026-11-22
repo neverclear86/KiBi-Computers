@@ -2,8 +2,8 @@ package pro.ikili.kibicomputers.core.wasi.p1
 
 import pro.ikili.kibicomputers.core.kernel.fd.FdIo
 import pro.ikili.kibicomputers.core.kernel.fd.FdTable
-import pro.ikili.kibicomputers.core.kernel.fd.descriptorFileType
 import pro.ikili.kibicomputers.core.kernel.fd.IoResult
+import pro.ikili.kibicomputers.core.kernel.fd.descriptorFileType
 import pro.ikili.kibicomputers.core.kernel.obj.HandleEntry
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.obj.KernelObject
