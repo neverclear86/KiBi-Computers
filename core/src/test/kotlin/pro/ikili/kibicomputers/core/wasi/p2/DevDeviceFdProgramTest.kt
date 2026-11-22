@@ -28,7 +28,12 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *
  * 同じ `dev_device_wasi.c` を、p1 のまま・アダプターで包んだ p2・`wasm32-wasip2` でビルドした p2 の3通りで動かす。
  * p1 と包んだ p2 は `fd_fdstat_get` の filetype が `UNKNOWN` であることも確かめる（包んだ p2 の filetype は `descriptor.get-type` を写したもの）。
- * wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 は後退の見張りだけ
+ *
+ * この PR の変更（p2 の fd の種類を `UNKNOWN` にする）を見張っているのは、p1 のままの2つの検査と、包んだ p2 の filetype の検査だけ。
+ * - 包んだ p2 の `isatty` は、直す前（`character-device`）でも偽になるので、後退の見張りだけ。
+ *   wasmtime のアダプターの `fd_fdstat_get` は、ディレクトリ以外の descriptor の `fs_rights_base` を全ビット（SEEK・TELL を含む）から始めて READ・WRITE しか落とさず、
+ *   wasi-libc の p1 の `isatty` は SEEK か TELL があれば偽を返すため
+ * - wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 も後退の見張りだけ
  */
 class DevDeviceFdProgramTest {
     private val limit = Duration.ofSeconds(120)

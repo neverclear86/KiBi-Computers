@@ -28,7 +28,9 @@ int main(int argc, char **argv) {
 
     int fd = open(path, O_RDONLY);
     CHECK(fd >= 0);
-    // device の fd は端末ではない
+    // device の fd は端末ではない。
+    // p1 のままでは種類（UNKNOWN）で偽になる。包んだ p2 はアダプターが SEEK・TELL の権利を残すので種類に関係なく偽、
+    // ネイティブの p2 は wasi-libc が種類を見ないので偽（どちらも後退の見張りだけ）
     CHECK(isatty(fd) == 0);
 #if !defined(__wasip2__) && !defined(__wasip3__)
     // p1 の fd_fdstat_get（アダプターで包んだときは descriptor.get-type を写したもの）は UNKNOWN
