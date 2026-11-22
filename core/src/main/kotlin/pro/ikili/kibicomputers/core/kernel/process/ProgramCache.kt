@@ -38,6 +38,8 @@ import java.util.concurrent.atomic.AtomicLong
  *   [runNext] 1つにつき1件を取り出すことも変えない）。軽い読み込みしかないときは、件数の巡回と同じ順になる。
  *   借りは取り出した時点の持ち主と組に付け、読み込みが成功しても失敗しても付ける。相乗りした台には付けない。
  *   借りは、待っているものが全員借りているときと、待ち行列に何もない間（経過時間の [idleDecayDivisor] 分の 1 ずつ）だけ減る。
+ *   前の読み込みの時間（見込み）は、読み込むたびに「その経過時間」と「前の見込み − その経過時間」の大きい方にするので、
+ *   重い読み込みの間にすぐ終わる読み込みをはさんでも、見込みはほとんど減らない。待ち行列に何もない間は、借りに続けて同じ割合で減る。
  *   保存しない
  * - 持ち主（マシン）ごとに、読み込み中・待ち行列にある読み込みの数を [maxPendingPerOwner] までにする。組ごとには [maxPendingPerGroup]
  *   までにする（組の上限は、[load] で `limitGroup` を立てたものだけを断る。init・復元の読み込みは断らない。#738）。
@@ -137,7 +139,11 @@ internal class ProgramCache(
      * 読み込み中のものの時間は、終わってから [vtime] に足す
      */
     private class Usage(var vtime: Long, var at: Long) {
-        /** 前の読み込みにかかった時間（次の読み込みの見込み） */
+        /**
+         * 次の読み込みにかかる時間の見込み。読み込みが終わるたびに、その経過時間と、前の見込みから経過時間を引いたものの大きい方にする
+         * （重い読み込みの間にすぐ終わる読み込みをはさんでも、見込みは 1 件ぶんの経過時間しか減らない）。
+         * 頼まずにいた間にも減る（[forgiveIdleLocked]）
+         */
         var lastCost = 0L
 
         /** 読み込み中の数 */
@@ -490,20 +496,20 @@ internal class ProgramCache(
         val u = ledger.usage[key] ?: return
         val elapsed = (now - startedAt).coerceAtLeast(0)
         u.vtime = ledger.floor + lagOf(ledger, u) + elapsed
-        u.lastCost = elapsed
+        u.lastCost = maxOf(elapsed, u.lastCost - elapsed)
         u.at = now
         u.running--
         u.startSum -= startedAt
     }
 
     /**
-     * 待ち行列にも読み込み中にもなく、待たずにいた分を引けば借りがなくなるものを消す。空になった持ち主の勘定も消す
-     * （台が消えても表に残らない。#750）
+     * 待ち行列にも読み込み中にもなく、待たずにいた分を引けば借りも前の読み込みの時間の見込みもなくなる（[forgiveIdleLocked] で
+     * 記録がないのと同じになる）ものを消す。空になった持ち主の勘定も消す（台が消えても表に残らない。#750）
      */
     private fun sweepUsageLocked(now: Long) {
         fun <K> Ledger<K>.sweep(queued: (K) -> Boolean) {
             usage.entries.removeAll { (key, u) ->
-                u.running == 0 && !queued(key) && lagOf(this, u) - (now - u.at) / idleDecayDivisor <= 0
+                u.running == 0 && !queued(key) && finishOf(this, u) - (now - u.at) / idleDecayDivisor <= 0
             }
         }
         groupLedger.sweep { ownerRings.containsKey(it) }
@@ -615,6 +621,9 @@ internal class ProgramCache(
 
     /** 使った時間を覚えている持ち主と組の数（テスト用。#750） */
     val usageCount: Int get() = synchronized(lock) { groupLedger.usage.size + ownerLedgers.values.sumOf { it.usage.size } }
+
+    /** 読み込み中の持ち主の読み込みの数（組の勘定の読み込み中の数の合計。テスト用。#750） */
+    val runningCount: Int get() = synchronized(lock) { groupLedger.usage.values.sumOf { it.running } }
 
     /** 数を記録している組の数（テスト用。#738。0 になった組は消える） */
     val pendingGroupCount: Int get() = synchronized(lock) { pendingByGroup.size }

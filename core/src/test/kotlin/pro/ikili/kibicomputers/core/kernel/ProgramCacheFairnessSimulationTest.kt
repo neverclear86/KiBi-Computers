@@ -30,7 +30,15 @@ class ProgramCacheFairnessSimulationTest {
      * [machines] 台のうち [heavy] 台が重い台。軽い台は合わせて毎秒 [lightRate] 件、0.3〜0.9 秒の読み込みを出す（ポアソン到着）。
      * [playerGroups] なら、重い台は 1 台ずつ別のプレイヤーの組、軽い台は 50 人の組に分ける。そうでなければ全部が持ち主なしの組
      */
-    private fun simulate(threshold: Long, heavy: Int, playerGroups: Boolean, machines: Int = 1000, lightRate: Double = 0.5, seconds: Int = 1800): Stats {
+    private fun simulate(
+        threshold: Long,
+        heavy: Int,
+        playerGroups: Boolean,
+        quickBetween: Boolean = false,
+        machines: Int = 1000,
+        lightRate: Double = 0.5,
+        seconds: Int = 1800,
+    ): Stats {
         var now = 0L
         val tasks = ArrayDeque<Runnable>()
         val cache = ProgramCache(16, Long.MAX_VALUE, Executor { tasks.addLast(it) }, nanoTime = { now }, debtThresholdNanos = threshold)
@@ -68,10 +76,18 @@ class ProgramCacheFairnessSimulationTest {
         fun requestHeavy(id: Long) {
             if (now >= end) return
             val f = cache.load(id, group(id), true, "heavy-${serial++}".toByteArray(), true, emptySet(), loader(8 * NANOS, true, null))
-            // 失敗を受け取ったらすぐ次を出す（exec を1つずつ順に繰り返す）
             f.whenComplete { _, _ ->
                 heavyLoads++
-                requestHeavy(id)
+                if (!quickBetween) {
+                    // 失敗を受け取ったらすぐ次を出す（exec を1つずつ順に繰り返す）
+                    requestHeavy(id)
+                    return@whenComplete
+                }
+                // 失敗を受け取って 50 ms 後に、すぐ終わる読み込み（1 ms）を 1 件はさみ、その 50 ms 後に次の重い読み込みを出す
+                events += Event(now + GAP, seq++) {
+                    val q = cache.load(id, group(id), true, "quick-${serial++}".toByteArray(), true, emptySet(), loader(QUICK, false, null))
+                    q.whenComplete { _, _ -> events += Event(now + GAP, seq++) { requestHeavy(id) } }
+                }
             }
         }
         val random = Random(750)
@@ -132,8 +148,39 @@ class ProgramCacheFairnessSimulationTest {
         assertTrue(failures.isEmpty(), (failures + rows.toString()).joinToString(System.lineSeparator()))
     }
 
+    @Test
+    fun `重い読み込みの間にすぐ終わる読み込みをはさんでも、軽い台の待ちは読み込み中の1件の残りほどに収まる`() {
+        val rows = StringBuilder()
+        rows.appendLine("| 組 | 重い台 | 方式 | 軽い台の待ち p50 | p99 | 最大 | 最大（最初から） | 重い台の読み込み数 |")
+        rows.appendLine("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        val failures = ArrayList<String>()
+        for (playerGroups in listOf(false, true)) {
+            for (k in listOf(5, 20)) {
+                val old = simulate(Long.MAX_VALUE, k, playerGroups, quickBetween = true)
+                val fair = simulate(ProgramCache.DEFAULT_DEBT_THRESHOLD_NANOS, k, playerGroups, quickBetween = true)
+                val label = if (playerGroups) "重い台ごとに別の人" else "全部持ち主なし"
+                for ((name, s) in listOf("件数の巡回" to old, "時間の公平さ" to fair)) {
+                    rows.appendLine("| $label | $k | $name | %.2f s | %.2f s | %.2f s | %.2f s | %d |".format(s.p50, s.p99, s.max, s.firstMax, s.heavyLoads))
+                }
+                val tag = "$label k=$k"
+                // 件数の巡回と違い、重い台の数に比例して伸びない（読み込み中の 1 件と、先に並んだ軽い読み込みの分まで）
+                if (fair.max > 16.0) failures += "$tag: 最大 ${fair.max} 秒"
+                if (fair.p99 > old.p99) failures += "$tag: p99 が悪くなった（${fair.p99} > ${old.p99}）"
+                if (fair.heavyLoads < old.heavyLoads * 0.8) failures += "$tag: 重い台の読み込み数 ${fair.heavyLoads} / ${old.heavyLoads}"
+            }
+        }
+        println(rows)
+        assertTrue(failures.isEmpty(), (failures + rows.toString()).joinToString(System.lineSeparator()))
+    }
+
     private companion object {
         const val NANOS: Long = 1_000_000_000L
+
+        /** 失敗を受け取ってから次を頼むまでの間（50 ms） */
+        const val GAP: Long = 50_000_000L
+
+        /** すぐ終わる読み込みの時間（1 ms） */
+        const val QUICK: Long = 1_000_000L
 
         /** 定常とみなす時刻（秒）。重い台の最初の 1 件は、使った時間がまだないので軽い台と同じ扱いになる */
         const val STEADY_FROM: Long = 300

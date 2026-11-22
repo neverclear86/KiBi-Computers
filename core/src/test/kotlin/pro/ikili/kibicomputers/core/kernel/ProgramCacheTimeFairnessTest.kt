@@ -227,6 +227,93 @@ class ProgramCacheTimeFairnessTest {
         assertEquals(listOf("a1", "b3", "a2"), scenario(Long.MAX_VALUE))
     }
 
+    /** 3 本目の経路（待っているもの全員が読み込み中）を、2 本以上のスレッドを入れ子の [runOne] で動かして通す */
+    private fun allRunningScenario(groupOf1: FairShareGroup, groupOf2: FairShareGroup) {
+        val cache = newCache()
+        // 台 1 と台 2 が 3 件ずつ並ぶ。入れ子の runOne は、その時点で動いている読み込みの数だけ別のスレッドが取り出すのと同じ
+        fun step(name: String, at: Double, next: Boolean): (ByteArray) -> Program = {
+            order += name
+            now = sec(at)
+            if (next) runOne()
+            program
+        }
+        val steps = listOf(
+            Triple("x1", 1.0, true),
+            Triple("y1", 2.0, true),
+            Triple("y2", 3.5, true),
+            Triple("x2", 4.0, true),
+            Triple("x3", 5.0, true),
+            Triple("y3", 5.5, false),
+        )
+        val loaders = steps.associate { (name, at, next) -> name to step(name, at, next) }
+        for (name in listOf("x1", "x2", "x3")) cache.request(1, name, loaders.getValue(name), groupOf1)
+        for (name in listOf("y1", "y2", "y3")) cache.request(2, name, loaders.getValue(name), groupOf2)
+        runOne()
+        assertEquals(0, tasks.size)
+        // 1) x1（台 1）が始まりに、2) 記録のない台 2 の y1。
+        // 3) 台 1 は 2 秒、台 2 は 1 秒読み込み中: 少ない台 2 の y2（巡回の先頭の台 1 ではない）。
+        // 4) 台 1 は 1 件で 3.5 秒、台 2 は 2 件（1 秒と 2 秒に始めた）で 2.5 + 1.5 = 4 秒: 台 1 の x2
+        // 5) 台 1 は 2 件（0 秒と 3.5 秒）で 4 + 0.5 = 4.5 秒、台 2 は 2 件で 3 + 2 = 5 秒: 台 1 の x3（巡回の先頭は台 2）
+        assertEquals(listOf("x1", "y1", "y2", "x2", "x3", "y3"), order)
+        // 終わったら、6 件を 2 台と組に付ける（台 1: 5.5 + 2 + 1.5 秒、台 2: 4.5 + 3.5 + 0.5 秒）。読み込み中の数は 0 に戻る
+        assertEquals(sec(9.0), cache.debtOf(1, groupOf1))
+        assertEquals(sec(8.5), cache.debtOf(2, groupOf2))
+        if (groupOf1 == groupOf2) {
+            assertEquals(sec(17.5), cache.debtOfGroup(groupOf1))
+        } else {
+            assertEquals(sec(9.0), cache.debtOfGroup(groupOf1))
+            assertEquals(sec(8.5), cache.debtOfGroup(groupOf2))
+        }
+        assertEquals(0, cache.runningCount)
+    }
+
+    @Test
+    fun `全員が読み込み中なら、読み込み中の経過時間を足して最も少ない台が選ばれる（同じ組）`() {
+        allRunningScenario(FairShareGroup.NONE, FairShareGroup.NONE)
+    }
+
+    @Test
+    fun `全員が読み込み中なら、読み込み中の経過時間を足して最も少ない組が選ばれる（別の組）`() {
+        allRunningScenario(FairShareGroup.of(UUID(0, 1)), FairShareGroup.of(UUID(0, 2)))
+    }
+
+    @Test
+    fun `重い読み込みの間にすぐ終わる読み込みをはさんでも、重い台は後に回る`() {
+        val cache = newCache()
+        cache.request(1, "h0", job("h0", 8.0, fail = true))
+        runAll()
+        // exec を受け取って次を頼むまでの間（50 ms）に、すぐ終わる読み込みを 1 件はさむ
+        now += sec(0.05)
+        cache.request(1, "q", job("q", 0.001))
+        runAll()
+        now += sec(0.05)
+        cache.request(1, "h1", job("h1", 8.0, fail = true))
+        cache.request(2, "light", job("light", 0.5))
+        runAll()
+        // 前の 1 件（0.001 秒）だけを見込みにすると、台 1 は軽い台と同じ扱いに戻って先に並ぶ
+        assertEquals(listOf("h0", "q", "light", "h1"), order)
+    }
+
+    @Test
+    fun `借りも見込みも残っている台は、後始末では消えず、順番が後始末の回数で変わらない`() {
+        val cache = newCache()
+        cache.request(1, "heavy", job("heavy", 8.0, fail = true))
+        runAll()
+        // 100 秒頼まずにいた（借り 8 秒 + 見込み 8 秒 = 16 秒に対して、減るのは 12.5 秒。見込みが 3.5 秒残る）
+        now += sec(100.0)
+        // 63 台の読み込みで、借りを付けた回数が 64 になる（後始末が走る）
+        (2L..64L).forEach { cache.request(it, "p$it", job("p$it", 0.01)) }
+        runAll()
+        // 後始末が走った（記録のあった台のほとんどは消えたが、台 1 は残っている）
+        assertTrue(cache.usageCount < 64)
+        order.clear()
+        cache.request(1, "c", job("c", 0.1))
+        cache.request(100, "d", job("d", 0.1))
+        runAll()
+        // 台 1 は、見込み 3.5 秒が残っていて、しきい値（2 秒）より多いので、後から来た台 100 が先
+        assertEquals(listOf("d", "c"), order)
+    }
+
     @Test
     fun `減りきった借りは消え、閉じたら全部消える`() {
         val cache = newCache()
