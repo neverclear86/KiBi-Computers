@@ -219,6 +219,21 @@ class AsyncFuelTest {
     }
 
     @Test
+    fun `巻き戻した側のスレッドが外れるのが遅くても、ほかの側はスライスをその場で足さずに譲る`() = timeout(limit) {
+        // 巻き戻してから step のスレッドが外れるまでの間、起こされた側は CPU の待ち行列にも燃料待ちにもいない（pendingSchedule）。
+        // その間にスライスを使い切った側が、待つ者がいないと見てその場で足すと、巻き戻しが 1 回減ってスライスの数がずれた
+        // （負荷の高い CI でまれに落ちていた）。スレッドが外れるのを遅らせて、その間を広げる。
+        // 外れた順に CPU の待ち行列へ入るので、順番はスレッドの外れ方でぶれる。ここではスライスの数と数え口だけを確かめる
+        assertRoundRobin(processes = 3, slicesPerTick = 4, ticks = 6, fair = false) { h ->
+            // 止めるときの割り込みで投げないよう、sleep でなく時間まで回して待つ（投げると登録が外れずに残る）
+            h.scheduler.hooks.beforeUnregister = { _, _ ->
+                val until = System.nanoTime() + 20_000_000L
+                while (System.nanoTime() < until) Thread.onSpinWait()
+            }
+        }
+    }
+
+    @Test
     fun `スライスがfuelPerTickと同じでも、計算し続ける2本が交互に動く`() = timeout(limit) {
         // 1 tick に 1 スライス。使い切った側が毎 tick 先頭で起こされると、もう 1 本が動けない
         assertRoundRobin(processes = 2, slicesPerTick = 1, ticks = 10)
@@ -229,8 +244,9 @@ class AsyncFuelTest {
      * 燃料待ちは入った順に起こすが、スライスを使い切って巻き戻した側は CPU の待ち行列にいたプロセスの後ろに回るので、tick をまたいで順番が回る。
      * スライスを使い切って巻き戻す回数が、そのプロセスが動いたスライスの数
      */
-    private fun assertRoundRobin(processes: Int, slicesPerTick: Int, ticks: Int) {
+    private fun assertRoundRobin(processes: Int, slicesPerTick: Int, ticks: Int, fair: Boolean = true, setUp: (Harness) -> Unit = {}) {
         Harness(execRuntime = EndiveRuntime()).use { h ->
+            setUp(h)
             val slice = 20_000L
             val m = h.machine(fuelPerTick = slice * slicesPerTick, fuelSlice = slice)
             val runs = ConcurrentHashMap<Int, AtomicInteger>()
@@ -252,11 +268,15 @@ class AsyncFuelTest {
             val total = ticks * slicesPerTick
             // 全部のスライスを、全員で同じ回数ずつ。tick の頭の入り方で 1 回ぶれうる
             assertEquals(total, counts.sum(), "スライスの数: $counts")
-            val fair = total / processes
-            assertTrue(counts.all { it in fair - 1..fair + 1 }, "全員が同じ回数動いていない: $counts")
+            if (fair) {
+                val each = total / processes
+                assertTrue(counts.all { it in each - 1..each + 1 }, "全員が同じ回数動いていない: $counts")
+            }
             // プロセスごとのスライスの数え口（接続層の負荷試験が読む。#740）は、動いたスライスの数と同じ（全員が燃料待ちの間に読む）
             val grants = m.fuelGrantsByProcess()
             assertEquals(counts, spins.map { (grants[it.pid] ?: 0L) - (grants0[it.pid] ?: 0L) }.map { it.toInt() }, "プロセスごとのスライスの数え口")
+            // setUp で足した遅らせる口は、止める前に外す（止める間まで遅らせない）
+            h.scheduler.hooks.beforeUnregister = null
             for (s in spins) m.lock.withLockValue { m.killLocked(s.pid, KillSignal.KILL) }
         }
     }

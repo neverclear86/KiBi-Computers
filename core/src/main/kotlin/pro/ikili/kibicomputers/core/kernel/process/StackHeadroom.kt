@@ -45,6 +45,30 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 32 段は、包みと燃料切れの処理の入口から、ロックの区間を抜けるまで（とホストの関数の本体の浅い処理）に当てる。
  * 足りなかったときに残ったものは、浅いところの安全網（`ProcessRunner.recoverLeaks`）が見つけて戻す。
  * まだ確かめていないのは、本体がカーネルロックの中で VFS の深いところ（`stat` より深い操作）まで入る道と、canon の lift・lower の中の道（#858）
+ *
+ * 3 つ目の入口（#856）: メモリの勘定（`ProcessMemory` の確保）。ロックではないが、プロセス → マシン → サーバー全体の別々の CAS を重ねるので、
+ * 段の途中で尽きると勘定がずれる（サーバー全体の勘定はサーバーを止めるまで戻らない）。ゲストの命令から包みを通らずに入るので、
+ * 確保の入口で [MEMORY_ACCOUNT_FRAMES] 段を払う。初めて書いた区画ごと（例外で入る遅い道。もともと例外の生成と 4 KiB の確保を払う）・
+ * `memory.grow`・`table.grow` ごとで、読み書きの速い道と、待っているだけの台には費用を足さない。
+ * `MemoryAccountStackExhaustionTest` は、スタックの底に近い深さを 1 段ずつ全部試し（尽きる位置を JIT の温まり方に頼らない）、
+ * 確かめがないと、確かめが通らない深さでも確保が数えられ、`memory.grow`・初めて書いた区画では数えた分がプロセス・マシン・サーバー全体に
+ * 残った（確かめた後は、確かめが通らない深さで必ず断られ、通った深さでは勘定がずれない）。
+ *
+ * ホストの関数の本体から入る道がある。本体が新しい区画へ書く（`memory.write*` → `WrittenPagesMemory.commit`、`commit` →
+ * `commitRange`）、`ctx.instantiate` が作るメモリ・テーブルの最初の分（`createMemory`・`createTable`。カーネルロックの外）は、
+ * 包みの `ensure(HOST_CALL_FRAMES)` を通った後の本体の深さから、確保の入口でもう 1 回 [MEMORY_ACCOUNT_FRAMES] 段を確かめる
+ * （コンポーネントの固定費 `ProcessRunner.reserveCoreInstanceOverhead` は、プロセスの始まり（`load`）の浅いところからだけ来る）。包みは通ったのに、本体の途中（カーネルの状態を変えた後。fd を開いた後・
+ * パイプから読んだ後・デバイスを呼んだ後など）で、ここが `StackOverflowError` を投げる深さがある。確かめは何も数える前なので勘定は
+ * ずれず、プロセスは `call stack exhausted` で終わる（本体が変えたカーネルの状態は、プロセスの終わりで片付く）。確かめがなければ、
+ * 同じ深さで段の途中で尽きて勘定がずれたので、窓が新しくできたのではなく、ずれる窓が「何も数えずに終わる」窓に変わった。
+ * 「包みの確かめで、次にゲストを呼ぶまでのホストの区間がまかなえる」（ADR 0043）が成り立つのは、本体の中で確保に入らない区間だけ
+ * （`MemoryAccountStackExhaustionTest` の `hostBody`）。
+ * カーネルのプロセスを通した確かめは `MemoryAccountStackExhaustionKernelTest`（本物のマシン・Endive で、ゲストの命令とホストの関数の本体
+ * （`memory.write*`・`commit`）から入り、プロセスだけが終わり、終わりの後にマシン・サーバー全体の勘定が戻り、ほかの台が動き続ける）。
+ * `ctx.instantiate` の道（作るのに失敗したときに同じ深さで返す `catch` を含む）は、まだ確かめていない（#884）。
+ *
+ * `/tmp`（`TmpFileSystem`）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、この入口で
+ * 覆えない。まだ確かめていない（#883）
  */
 internal object StackHeadroom {
     /**
@@ -69,6 +93,13 @@ internal object StackHeadroom {
      * （1 回通るたびに新しいスライスを受け取る）ので、前借りの間に繰り返し通ることはない。`block`・`awaitHost` は呼ぶたびに払う
      */
     const val FUEL_YIELD_FRAMES: Int = 128
+
+    /**
+     * メモリの勘定の入口（`ProcessMemory.tryReserve`・`tryReserveBytes`）で確かめる段数（#856）。ここから先は、プロセス → マシン →
+     * サーバー全体の CAS（数段の呼び出し）と、呼び手の後処理（4 KiB の区画の確保・写し、Endive の `table.grow`、数えた分の記録）だけで、
+     * ロックを取る深い道はない。区画に初めて書くたびに通るので、ホストの関数の包みと同じ軽い段数にする
+     */
+    const val MEMORY_ACCOUNT_FRAMES: Int = 32
 
     /** [frames] 段分のスタックが残っているかを確かめる。足りなければ、何も触らずに `StackOverflowError` を投げる */
     fun ensure(frames: Int) {

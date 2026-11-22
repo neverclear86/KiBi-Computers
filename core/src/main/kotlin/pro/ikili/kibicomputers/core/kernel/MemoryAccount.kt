@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import pro.ikili.kibicomputers.core.runtime.WasmMemoryBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
@@ -16,6 +17,10 @@ import java.util.concurrent.atomic.AtomicLong
  * 確保は自分と親の両方に収まるときだけ数え、親で断られたら自分の分を戻す。返すときは両方から引く。
  *
  * `memory.grow` はプロセスのスレッドから、カーネルロックを持たずに呼ばれるので、ロックではなく CAS で数える。
+ *
+ * 段（プロセス → マシン → サーバー全体）ごとに別の CAS なので、段の途中でスタックが尽きると、片方だけ数えたまま抜けてずれる（#856）。
+ * ゲストのどの深さからでも入る確保（初めて書いた区画、`memory.grow`、`table.grow`）は [ProcessMemory] の入口でスタックの余裕を確かめ、
+ * ここ（と呼び手の後処理）はその余裕の中で動く。返す側では確かめない（確かめで投げると、返すこと自体が飛ばされる）
  */
 internal class MemoryAccount(
     /** 上限（バイト。0 以上） */
@@ -98,6 +103,19 @@ internal class MemoryAccount(
  *
  * 線形メモリ（ページ）とテーブル（バイト。要素数 × 要素1つの大きさ）を合わせたバイト数を、
  * プロセスの上限 [limitPages] × 64 KiB と、マシン全体の RAM（[MemoryAccount]）の両方に収まるときだけ確保する。
+ *
+ * 確保（[tryReserve]・[tryReserveBytes]）は、ゲストの命令（初めて書いた区画・`memory.grow`・`table.grow`）から、ホストの関数の包みを
+ * 通らずにどの深さからでも呼ばれる（ホストの関数の本体から入る道もある。下）。そこで先頭で [StackHeadroom.MEMORY_ACCOUNT_FRAMES] 段の余裕を確かめ、足りなければ何も数えずに
+ * `StackOverflowError` を投げる（プロセスだけが `call stack exhausted` で終わる。#856）。通れば、3 段の CAS と断られたときの戻し、
+ * 呼び手の後処理（区画の確保・写し、Endive の `grow`、数えた分の記録）は、確かめた余裕の中で動く。返す側では確かめない。
+ *
+ * ホストの関数の本体から入る道（本体が新しい区画へ書く `memory.write*`・`commit`（`WrittenPagesMemory.commitRange`）、
+ * `ctx.instantiate` が作るメモリ・テーブルの最初の分（`createMemory`・`createTable`）。どれもカーネルロックの外）では、
+ * 包みの確かめを通った後の本体の深さから、ここでもう 1 回確かめる。本体の途中（カーネルの状態を変えた後）で
+ * `StackOverflowError` になる深さがあるが、何も数える前に投げるので勘定はずれず、プロセスだけが終わる（ADR 0043）。
+ * コンポーネントの core インスタンスの固定費（`ProcessRunner.reserveCoreInstanceOverhead`。カーネルロックの中）は、
+ * プロセスの始まり（`load` → `loadComponent` の `configure`。step・専用スレッドの浅いところ）からだけ来て、ホストの関数の本体からは入らない。
+ * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶ（まだ確かめていない。#883）
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {
     /** プロセスの上限（バイト） */
@@ -135,6 +153,8 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
 
     override fun tryReserve(pages: Int): Boolean {
         require(pages > 0) { "ページ数は正: $pages" }
+        // 段の途中で尽きないよう、何も数えないうちに確かめる（#856。足りなければ何も触らずに StackOverflowError）
+        StackHeadroom.ensure(StackHeadroom.MEMORY_ACCOUNT_FRAMES)
         val bytes = pages.toLong() * WasmMemory.PAGE_SIZE
         if (!tryAdd(usedBytesCounter, bytes, limitBytes)) return refused(MemoryRefusal.PROCESS)
         val refusal = machine.reserve(pages)
@@ -159,6 +179,8 @@ internal class ProcessMemory(private val machine: MemoryAccount, val limitPages:
     /** プロセスとマシンのそれぞれで、数えた後の残りが [keepBytes] 以上になるときだけ数える（#408。サーバー全体には [keepBytes] をかけない） */
     override fun tryReserveBytes(bytes: Long, keepBytes: Long): Boolean {
         require(bytes > 0) { "バイト数は正: $bytes" }
+        // 段の途中で尽きないよう、何も数えないうちに確かめる（#856。足りなければ何も触らずに StackOverflowError）
+        StackHeadroom.ensure(StackHeadroom.MEMORY_ACCOUNT_FRAMES)
         if (!tryAdd(usedBytesCounter, bytes, limitBytes, keepBytes)) return refused(MemoryRefusal.PROCESS)
         val refusal = machine.reserveBytes(bytes, keepBytes)
         if (refusal != null) {
