@@ -24,7 +24,11 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -43,7 +47,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  */
 class StackExhaustionLockTest {
     /**
-     * 1 つの掃引の上限（止まったときの最後の砦）。止まったことは、待ちごとの見分け（[awaitOrClassify]）が様子を付けて先に落とす。
+     * 1 つの掃引の上限（止まったときの最後の砦）。止まったことは、待ちごとの見分け（[awaitOrClassify]）が様子を付けて先に落とす
+     * （tick は [Ticker] の別のスレッドで回すので、tick の中でロックが残って止まる形でも、テストのスレッドは止まらずに見分けに届く）。
      * 単独では 10〜20 秒で終わるが、CPU を取り合う負荷の下では 1 回あたり数秒になることがある（#868 で 60 回に約 210 秒を測った）
      */
     private val limit = Duration.ofSeconds(300)
@@ -157,6 +162,7 @@ class StackExhaustionLockTest {
     ) = timeout(limit) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         val h = Harness(config)
+        val ticker = Ticker(h)
         val tally = Tally()
         val stopWaker = AtomicBoolean(false)
         var waker: Thread? = null
@@ -223,8 +229,8 @@ class StackExhaustionLockTest {
                     LockSupport.unpark(waker)
                 }
                 val where = "$i 回目、$pattern、pad $pad"
-                val describe = { diagnose(h, listOf(m to sameSpin, other to otherSpin), rt, tally) }
-                awaitOrClassify(h, "深い再帰が終わる（$where）", describe) {
+                val describe = { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), rt, tally) }
+                awaitOrClassify(ticker, "深い再帰が終わる（$where）", describe) {
                     rt.process.state.isTerminal || m.state == MachineState.CRASHED
                 }
                 current.set(null)
@@ -241,14 +247,14 @@ class StackExhaustionLockTest {
                 assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$where）: ${m.lock}")
                 m.lock.unlock()
                 // 同じ台と別の台のプロセスが進み続ける（CPU・許可が渡り続ける）
-                awaitProgress(h, "同じ台のプロセス（$where）", sameProgress, describe)
-                awaitProgress(h, "別の台のプロセス（$where）", otherProgress, describe)
+                awaitProgress(ticker, "同じ台のプロセス（$where）", sameProgress, describe)
+                awaitProgress(ticker, "別の台のプロセス（$where）", otherProgress, describe)
                 // 許可が失われていないことは、毎回は見ない（待ち手の数の確かめは、tick を回さない間に燃料待ちへ移って 0 になるだけで、
                 // 許可が 1 つ減っても見つけられない）。許可の数は、止めた後の最後の確かめ（availablePermits が元の数に戻る）で見る
             }
             m.stop()
             other.stop()
-            awaitOrClassify(h, "マシンが止まる", { diagnose(h, listOf(m to sameSpin, other to otherSpin), null, tally) }) {
+            awaitOrClassify(ticker, "マシンが止まる", { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), null, tally) }) {
                 m.state == MachineState.STOPPED && other.state == MachineState.STOPPED
             }
             // CPU は誰も持っておらず、待ち手もいない。許可はすべて戻った
@@ -259,6 +265,7 @@ class StackExhaustionLockTest {
         } finally {
             stopWaker.set(true)
             waker?.join(5_000)
+            ticker.close()
             println("#828 $kind $body $patterns: CRASHED ${tally.crashed.get()} 回、尽きた位置がロックの中 ${tally.inLocks.get()} 回、入口の確かめ ${tally.inProbe.get()} 回")
             h.close()
         }
@@ -267,24 +274,28 @@ class StackExhaustionLockTest {
     }
 
     /** 進み具合を待つ（#868）。[progress] が今より 3 以上進むまで、tick を回して待つ（[awaitOrClassify]） */
-    private fun awaitProgress(h: Harness, what: String, progress: AtomicInteger, describe: () -> String) {
+    private fun awaitProgress(ticker: Ticker, what: String, progress: AtomicInteger, describe: () -> String) {
         val before = progress.get()
-        awaitOrClassify(h, "$what が進む", describe) { progress.get() > before + 2 }
+        awaitOrClassify(ticker, "$what が進む", describe) { progress.get() > before + 2 }
     }
 
     /**
      * [condition] がそろうまで tick を回して待つ（#868）。[FIRST_WAIT_MILLIS] でそろわなければ、その時点の様子（[describe]）を取り、
      * さらに [GRACE_MILLIS] 観察を続けて、遅れか停止かを見分ける。
      *
-     * - 遅れ（後でそろった）: 様子を標準出力に出して続ける。全体のテストを回した負荷の高い状態（CPU の取り合い、GC、プロセスごと
-     *   止まった後の再開）では、正しく動いていても 10 秒を超えることがある。確かめたいのは「CPU・許可が渡り続ける」ことなので、
-     *   遅れでは落とさない。許可が失われたことは、最後の許可の数の確かめで見る
-     * - 停止（そろわないまま）: 最初と終わりの時点の様子を付けて落とす
+     * - 遅れ（後でそろった）: 様子を標準出力に [SLOWDOWN_MARKER] で始まる行として出して続ける。core の `test` タスクがこの行を
+     *   Gradle のコンソール（CI のログ）に写すので、通った回でも見える（`core/build.gradle.kts`）。全体のテストを回した負荷の高い状態
+     *   （CPU の取り合い、GC、プロセスごと止まった後の再開）では、正しく動いていても 10 秒を超えることがある。確かめたいのは
+     *   「CPU・許可が渡り続ける」ことなので、遅れでは落とさない。許可が失われたことは、最後の許可の数の確かめで見る
+     * - 停止（そろわないまま）: 最初と終わりの時点の様子を付けて落とす（失敗の本文は、`test` タスクの `exceptionFormat = FULL` で
+     *   CI のログに出る）
+     *
+     * tick は [ticker] の別のスレッドで回す。tick の中で止まっても（ディスパッチャーの中のロックが残ったなど）、ここは止まらない
      */
-    private fun awaitOrClassify(h: Harness, what: String, describe: () -> String, condition: () -> Boolean) {
+    private fun awaitOrClassify(ticker: Ticker, what: String, describe: () -> String, condition: () -> Boolean) {
         val start = System.nanoTime()
         val reached = {
-            h.scheduler.tick()
+            ticker.tick()
             condition()
         }
         if (pollUntil(FIRST_WAIT_MILLIS, reached)) {
@@ -296,7 +307,9 @@ class StackExhaustionLockTest {
         val resumed = pollUntil(GRACE_MILLIS, reached)
         val elapsed = (System.nanoTime() - start) / 1_000_000
         if (resumed) {
-            println("#868 遅れ: $what まで $elapsed ms かかった（$FIRST_WAIT_MILLIS ms の時点: $atFirst）")
+            // Gradle は標準出力を行ごとに受け取るので、様子の行にもすべて頭を付ける（写すのは頭の付いた行だけ）
+            val text = "$what まで $elapsed ms かかった（$FIRST_WAIT_MILLIS ms の時点: $atFirst）"
+            println(text.lines().joinToString("\n") { "$SLOWDOWN_MARKER: $it" })
         } else {
             fail("停止: $what が $elapsed ms そろわない（$FIRST_WAIT_MILLIS ms の時点: $atFirst）\n終わりの時点: ${describe()}")
         }
@@ -310,6 +323,43 @@ class StackExhaustionLockTest {
             Thread.sleep(1)
         }
         return true
+    }
+
+    /**
+     * tick（`MachineScheduler.tick`）を、テストのスレッドとは別のスレッドで回す（#868）。tick の中でロックが残って止まっても
+     * （tick の先頭の `dispatcher.signal()` は、ディスパッチャーの中のロックを上限なしで取る）、テストのスレッドは止まらず、
+     * 待ちごとの見分け（[awaitOrClassify]）が様子（このスレッドのスタックを含む）を付けて落とせる。tick は重ねない
+     */
+    private class Ticker(private val h: Harness) : AutoCloseable {
+        private val threadRef = AtomicReference<Thread>()
+        private val executor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "StackExhaustionLockTest-tick").apply { isDaemon = true }.also { threadRef.set(it) }
+        }
+        private var pending: Future<*>? = null
+
+        /** tick を 1 回回し、[TICK_WAIT_MILLIS] まで終わりを待つ。前の tick が終わっていなければ、新しく回さずにそれを待つ */
+        fun tick() {
+            val running = pending?.takeUnless { it.isDone } ?: executor.submit { h.scheduler.tick() }.also { pending = it }
+            try {
+                running.get(TICK_WAIT_MILLIS, TimeUnit.MILLISECONDS)
+            } catch (_: TimeoutException) {
+                // 終わらない tick は、見分けが様子（describe）に出す
+            } catch (e: ExecutionException) {
+                throw e.cause ?: e
+            }
+        }
+
+        /** tick のスレッドの様子 */
+        fun describe(): String {
+            val t = threadRef.get() ?: return "（まだ回していない）"
+            val busy = if (pending?.isDone == false) " tick の途中" else ""
+            return "${t.name} ${t.state}$busy: ${t.stackTrace.take(12).joinToString(" <- ")}"
+        }
+
+        /** 止まった tick のスレッドはデーモンなので、待たずに放す */
+        override fun close() {
+            executor.shutdown()
+        }
     }
 
     /**
@@ -327,9 +377,10 @@ class StackExhaustionLockTest {
 
     /**
      * 止まったときの説明（#868）。台ごとの CPU と spin の様子、許可、tick の数、カーネルのスレッドのスタック、ここまでの集計。
-     * CPU・許可・ディスパッチャーの中のロックと、マシンのロックは、すべて待ちの上限付きで取る（[peek]）
+     * CPU・許可・ディスパッチャーの中のロックと、マシンのロックは、すべて待ちの上限付きで取る（[peek]。ディスパッチャーの列の長さ
+     * `Dispatcher.size` は中のロックを上限なしで取るので、先に同じロックを上限付きで取ってから読む。再入できるロックなので止まらない）
      */
-    private fun diagnose(h: Harness, spins: List<Pair<Machine, ProcessRuntime>>, victim: ProcessRuntime?, tally: Tally): String {
+    private fun diagnose(h: Harness, ticker: Ticker, spins: List<Pair<Machine, ProcessRuntime>>, victim: ProcessRuntime?, tally: Tally): String {
         val permits = h.scheduler.permits
         val sb = StringBuilder()
         for ((machine, spin) in spins) {
@@ -339,7 +390,8 @@ class StackExhaustionLockTest {
                 .append("、spin pid ${spin.process.pid} ${spin.process.state} holdsCpu ${spin.holdsCpu} holdsPermit ${spin.holdsPermit}")
                 .append("、燃料待ち ${peek(machine.lock) { machine.fuelWaiterCount }} 燃料 ${peek(machine.lock) { machine.kernel.fuel }}")
         }
-        sb.append("\n  ディスパッチャー: 列 ${h.scheduler.dispatcher.size} 起こした数 ${h.scheduler.dispatcher.woken.get()}")
+        val dispatcher = h.scheduler.dispatcher
+        sb.append("\n  ディスパッチャー: 列 ${peek(innerLock(dispatcher)) { dispatcher.size }} 起こした数 ${h.scheduler.dispatcher.woken.get()}")
         val inner = innerLock(permits)
         sb.append("\n  許可: 空き ${peek(inner) { permits.availablePermits() }} 待ち ${peek(inner) { permits.waiting }}")
             .append(" 取り残し ${peek(inner) { permits.strandedTasks }} 引き渡しの失敗 ${permits.handOffFailures.get()}")
@@ -349,6 +401,7 @@ class StackExhaustionLockTest {
                 .append("、SOE: ${soeTop(victim, 8)}")
                 .append("、スレッド: ${victim.thread?.let { "${it.name} ${it.state} ${it.stackTrace.take(16).joinToString(" <- ")}" }}")
         }
+        sb.append("\n  tick: ${ticker.describe()}")
         sb.append("\n  ここまで: CRASHED ${tally.crashed.get()}、ロックの中 ${tally.inLocks.get()}、入口の確かめ ${tally.inProbe.get()}")
         for ((t, frames) in Thread.getAllStackTraces().entries.sortedBy { it.key.name }) {
             if (!t.name.startsWith("KiBi-")) continue
@@ -686,5 +739,11 @@ class StackExhaustionLockTest {
 
         /** 最初の待ちで進まなかったときに、遅れか停止かを見分けるために観察を続ける長さ */
         const val GRACE_MILLIS = 30_000L
+
+        /** 1 回の tick の終わりを待つ長さ。これを過ぎた tick は、終わるまで新しく回さない */
+        const val TICK_WAIT_MILLIS = 100L
+
+        /** 遅れの行の頭（`core/build.gradle.kts` の `test` タスクが、この行を Gradle のコンソールに写す） */
+        const val SLOWDOWN_MARKER = "#868 遅れ"
     }
 }

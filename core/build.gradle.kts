@@ -61,6 +61,18 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // 失敗の本文（assert の説明。StackExhaustionLockTest の「停止: ...」の様子など）を、コンソールと CI のログに出す（#868。
+    // 既定は例外の型と行番号だけで、本文はテストレポートを開かないと見えない）
+    testLogging {
+        events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+    // 負荷の下で 10 秒を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で始まる行を標準出力に出す）は、
+    // 通った回もコンソールと CI のログに写す（#868。標準出力のすべては写さない）
+    val testLogger = logger
+    addTestOutputListener { descriptor, event ->
+        if (event.message.startsWith("#868 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+    }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
