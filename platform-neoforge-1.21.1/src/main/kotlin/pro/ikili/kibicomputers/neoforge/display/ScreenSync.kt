@@ -16,6 +16,8 @@ import pro.ikili.kibicomputers.core.config.ConfigValues
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.display.ScreenSyncHost
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
+
 import pro.ikili.kibicomputers.core.display.ScreenWatchers
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import java.util.Collections
@@ -67,7 +69,8 @@ object ScreenSync {
         trafficConfig = values
         val current = traffic
         if (current.playerBytesPerSecond != values[KiBiConfig.SCREEN_PLAYER_BYTES_PER_SECOND] ||
-            current.serverBytesPerSecond != values[KiBiConfig.SCREEN_SERVER_BYTES_PER_SECOND]
+            current.serverBytesPerSecond != values[KiBiConfig.SCREEN_SERVER_BYTES_PER_SECOND] ||
+            current.groupBytesPerSecond != values[KiBiConfig.SCREEN_OWNER_BYTES_PER_SECOND]
         ) {
             traffic = KiBiConfig.screenSyncTraffic(values)
         }
@@ -203,6 +206,9 @@ object ScreenSync {
             val dimension = screen.level?.dimension() ?: return
             transport.send(player, ScreenUpdatePayload(dimension, screen.blockPos, fragment))
         }
+
+        // 映している側（つながったケースのマシン）の公平の組（#738）。つながっていなければ持ち主なし
+        override fun fairShareGroup(): FairShareGroup = screen.wiredTo?.connectedMachine?.fairShareGroup ?: FairShareGroup.NONE
     }
 
     /**

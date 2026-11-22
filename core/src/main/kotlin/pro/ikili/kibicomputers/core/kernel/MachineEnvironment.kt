@@ -2,8 +2,10 @@ package pro.ikili.kibicomputers.core.kernel
 
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.access.AccessPort
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import java.nio.file.Path
 import java.security.SecureRandom
+import java.util.UUID
 
 /**
  * 時計（接続層 → カーネル。#44）。中身の使い方（WASI の clock、タイマー）は #64・#69。
@@ -174,6 +176,12 @@ public class MachineEnvironment private constructor(builder: Builder) {
      */
     public val access: AccessPort? = builder.access
 
+    /**
+     * 公平の組の鍵（ケースの持ち主のプレイヤーの UUID。#738、ADR 0738）。`null` なら持ち主なしの組（[FairShareGroup.NONE]）。
+     * マシンを作るときの初めの値で、持ち主が変わったら接続層が [Machine.updateFairnessKey] で差し替える。保存しない
+     */
+    public val fairnessKey: UUID? = builder.fairnessKey
+
     /** [MachineEnvironment] を組み立てる。 */
     public class Builder internal constructor() {
         internal var clock: MachineClock = MachineClock.SYSTEM
@@ -181,6 +189,7 @@ public class MachineEnvironment private constructor(builder: Builder) {
         internal var disks: DiskSnapshot = DiskSnapshot.EMPTY
         internal var storageDirectory: Path? = null
         internal var access: AccessPort? = null
+        internal var fairnessKey: UUID? = null
 
         /** 時計（既定は [MachineClock.SYSTEM]） */
         public fun clock(value: MachineClock): Builder = apply { clock = value }
@@ -196,6 +205,10 @@ public class MachineEnvironment private constructor(builder: Builder) {
 
         /** 持ち主と権限の口（既定は `null` = `kibi:computer/access` は `not-supported`。#110） */
         public fun access(value: AccessPort?): Builder = apply { access = value }
+
+        /** 公平の組の鍵（既定は `null` = 持ち主なしの組。#738） */
+        public fun fairnessKey(value: UUID?): Builder = apply { fairnessKey = value }
+
 
         /** 環境を作る。 */
         public fun build(): MachineEnvironment = MachineEnvironment(this)

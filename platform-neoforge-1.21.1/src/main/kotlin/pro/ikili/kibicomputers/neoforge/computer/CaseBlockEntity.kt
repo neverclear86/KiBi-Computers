@@ -190,7 +190,14 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     @Volatile
     internal var playerAccess: PlayerAccess = PlayerAccess.NONE
-        private set
+        private set(value) {
+            val before = field.owner?.id
+            field = value
+            // 持ち主が変わったら、動いているマシンの公平の組を差し替える（#738、ADR 0738。次に並ぶときから効く）。
+            // マシンを作るときは、その時の持ち主を環境（fairnessKey）で渡す。毎 tick 見回らない
+            val after = value.owner?.id
+            if (after != before) computer.machine?.updateFairnessKey(after)
+        }
 
     /**
      * `kibi:computer/access` の口（#110、ADR 0110）。BE が生きている間、同じインスタンスをマシンの環境に渡す（作り直したマシンにも。
@@ -364,7 +371,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             restorePreparationHook?.run()
             val config = machineConfig()
             val disks = prepareDisks()
-            val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
+            val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).fairnessKey(ownerPlayerId).build()
             // プレイヤーはいないので、前回の言語を使う。戻したマシンの再起動・冷えた起動もこの値を引き継ぐ（#661）
             val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
             val store = WorldMachineSaves.current
@@ -623,12 +630,13 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = machineConfig()
-        var environment = MachineEnvironment.builder().access(accessPort).build()
+        var environment = MachineEnvironment.builder().access(accessPort).fairnessKey(ownerPlayerId).build()
         var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             updateBootLanguage(player)
             val disks = prepareDisks()
-            environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).build()
+            environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).fairnessKey(ownerPlayerId).build()
+
             boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
         }
         val status = computer.pressPowerButton(

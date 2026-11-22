@@ -76,6 +76,30 @@ public object KiBiConfig {
         "サーバー全体のブロッキング型プロセス（1つが専用スレッドを1本使う）の数の上限。",
     )
 
+    /** 1人の持ち主（公平の組。#738）が同時に WASM を実行できるコンピューターの数の上限。0 は上限なし */
+    @JvmField
+    public val MAX_CONCURRENT_MACHINES_PER_OWNER: IntEntry = serverInt(
+        "scheduler", "maxConcurrentMachinesPerOwner", 0, 0, 4096, ConfigApply.WORLD_RESTART,
+        "Maximum number of one owner's computers running WebAssembly at the same time. 0 = no limit (owners still take turns).",
+        "1人の持ち主のコンピューターが同時に WebAssembly を実行できる数の上限。0 は上限なし（持ち主の間の順番は回す）。",
+    )
+
+    /** 1人の持ち主（公平の組。#738）のブロッキング型プロセスの数の上限。0 は上限なし */
+    @JvmField
+    public val MAX_BLOCKING_PROCESSES_PER_OWNER: IntEntry = serverInt(
+        "scheduler", "maxBlockingProcessesPerOwner", 256, 0, 65536, ConfigApply.WORLD_RESTART,
+        "Maximum number of blocking processes of one owner's computers. 0 = no limit.",
+        "1人の持ち主のコンピューターのブロッキング型プロセスの数の上限。0 は上限なし。",
+    )
+
+    /** 1人の持ち主（公平の組。#738）の、読み込みを待つ実行ファイルの数の上限。0 は上限なし */
+    @JvmField
+    public val MAX_PENDING_LOADS_PER_OWNER: IntEntry = serverInt(
+        "scheduler", "maxPendingLoadsPerOwner", 64, 0, 65536, ConfigApply.WORLD_RESTART,
+        "Maximum number of programs one owner's computers may have waiting to load. Startup and restore are not refused. 0 = no limit.",
+        "1人の持ち主のコンピューターが読み込みを待たせられる実行ファイルの数の上限。起動と復元の読み込みは断らない。0 は上限なし。",
+    )
+
     /** 実行ファイルを読み込む（計測コードの挿入・コンパイル）スレッドの数 */
     @JvmField
     public val COMPILER_THREADS: IntEntry = serverInt(
@@ -224,6 +248,15 @@ public object KiBiConfig {
         "全プレイヤーの合計の、画面の同期の送信量の上限（バイト/秒）。",
     )
 
+    /** 1人の持ち主（公平の組。#738）のコンピューターの画面の同期の送信量の上限（バイト/秒）。0 は上限なし */
+    @JvmField
+    public val SCREEN_OWNER_BYTES_PER_SECOND: IntEntry = serverInt(
+        "screenSync", "ownerBytesPerSecond", ScreenSyncTraffic.DEFAULT_GROUP_BYTES_PER_SECOND, 0, Int.MAX_VALUE,
+        ConfigApply.RELOAD,
+        "Maximum screen update traffic from the screens of one owner's computers, in bytes per second. 0 = no limit.",
+        "1人の持ち主のコンピューターの画面から送る、画面の同期の送信量の上限（バイト/秒）。0 は上限なし。",
+    )
+
     // ---- keyboard: キーボードの入力の量（#142）。読み直した後に開いたキーボードから効く ----
 
     /** キーボードの入力の、ためておける量（バイト） */
@@ -327,6 +360,9 @@ public object KiBiConfig {
         val builder = SchedulerConfig.builder()
             .threadStackBytes(values[THREAD_STACK_KIB] * KIB)
             .maxBlockingProcesses(values[MAX_BLOCKING_PROCESSES])
+            .maxConcurrentMachinesPerGroup(values[MAX_CONCURRENT_MACHINES_PER_OWNER])
+            .maxBlockingProcessesPerGroup(values[MAX_BLOCKING_PROCESSES_PER_OWNER])
+            .maxPendingLoadsPerGroup(values[MAX_PENDING_LOADS_PER_OWNER])
             .compilerThreads(values[COMPILER_THREADS])
             .programCacheEntries(values[PROGRAM_CACHE_ENTRIES])
             .programCacheBytes(values[PROGRAM_CACHE_MIB] * MIB)
@@ -358,7 +394,12 @@ public object KiBiConfig {
     /** [values] から画面の同期の送信量の勘定を作る（作り直すと、プレイヤーごとの勘定は空に戻る） */
     @JvmStatic
     public fun <P : Any> screenSyncTraffic(values: ConfigValues): ScreenSyncTraffic<P> =
-        ScreenSyncTraffic(values[SCREEN_PLAYER_BYTES_PER_SECOND], values[SCREEN_SERVER_BYTES_PER_SECOND])
+        ScreenSyncTraffic(
+            values[SCREEN_PLAYER_BYTES_PER_SECOND],
+            values[SCREEN_SERVER_BYTES_PER_SECOND],
+            values[SCREEN_OWNER_BYTES_PER_SECOND],
+        )
+
 
     /** [values] から、キーボード1つの入力の予算を作る */
     @JvmStatic

@@ -320,7 +320,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
         // 同じキーの結果・失敗を作らない。コンポーネントの Program は、下の prepare で戻せないもの（冷えた起動）になる
         val waitImports = Program.cacheWaitImports(bytes, source.waitImports.toSet())
         val host = KernelDrivers.COMPONENT_HOST
-        return machine.scheduler.programs.load(machine.id, bytes, source.metered, waitImports) { b ->
+        // 復元は公平の組の読み込みの上限では断らない（断ると冷えた起動になり、動いていた状態を失う。#738）
+        return machine.scheduler.programs.load(machine.id, machine.fairShareGroup, false, bytes, source.metered, waitImports) { b ->
             Program.loadExecutable(runtime, b, limits, source.metered, waitImports, host)
         }
     }

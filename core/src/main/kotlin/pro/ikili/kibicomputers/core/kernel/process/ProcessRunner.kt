@@ -581,11 +581,14 @@ internal class ProcessRunner(private val machine: Machine) {
 
     private fun acquirePermit(rt: ProcessRuntime) {
         if (rt.holdsPermit) return
+        // 並んだときの組を控え、返すときはその組へ返す（#738。待っている間に持ち主が変わっても数を合わせる）
+        val group = machine.fairShareGroup
         try {
-            scheduler.permits.acquire()
+            scheduler.permits.acquire(group)
         } catch (e: InterruptedException) {
             throw ProcessKilledException(e)
         }
+        rt.permitGroup = group
         rt.holdsPermit = true
         scheduler.permitAcquisitions.incrementAndGet()
     }
@@ -602,7 +605,7 @@ internal class ProcessRunner(private val machine: Machine) {
         // 返す途中でスタックが尽きないことは、入口の余裕の確かめ（StackHeadroom。#828）で守る
         if (rt.holdsPermit) {
             rt.holdsPermit = false
-            scheduler.permits.release(inline = endOfStep)
+            scheduler.permits.release(rt.permitGroup, inline = endOfStep)
         }
         if (rt.holdsCpu) {
             rt.holdsCpu = false
@@ -1182,7 +1185,8 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         process.asyncWait = null
         process.asyncStack?.clear()
-        if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
+        if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking(rt.blockingGroup)
+
         // まだ実行していないホスト呼び出しを取り消す（ふつうは 0 件。#46）
         machine.cancelHostCallsLocked(process.pid)
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）
