@@ -20,7 +20,8 @@ import java.io.ByteArrayOutputStream
  *
  * [message] は断った理由（どの関数の、どの命令・どの機能か。`exec` のエラーメッセージに入る）。
  * 止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。グローバル・要素セグメントの定数式の
- * `v128.const` と GC の提案の命令は、止まりうる関数があってもなくても、そのまま写す（#851）。
+ * `v128.const` と GC の提案の命令は、定数式としてそのまま写し、これでは断らない（#851）。ただし、止まりうる関数があるモジュールは、
+ * 型付きの参照型（`(ref i31)` など）のグローバルや型を持てば、定数式の命令とは別に断る（型を追えない。#384）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -120,7 +121,7 @@ internal object Asyncify {
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
-     * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
+     * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。Endive の検証が断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)
     fun transform(
@@ -1290,8 +1291,8 @@ private class Transformer(
     }
 }
 
-/** バイト列の書き出し（core の `FuelInjector` と同じもの。core のものは internal なので写した） */
-private class Sink : ByteArrayOutputStream() {
+/** バイト列の書き出し（core の `FuelInjector` と同じもの。core のものは internal なので写した。テストが [Reader] に渡すので internal） */
+internal class Sink : ByteArrayOutputStream() {
     fun u8(b: Int) = write(b and 0xFF)
 
     fun bytes(src: ByteArray, off: Int, len: Int) = write(src, off, len)
@@ -1334,8 +1335,8 @@ private class Sink : ByteArrayOutputStream() {
     }
 }
 
-/** バイト列の読み込み */
-private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
+/** バイト列の読み込み（定数式の写しをテストが直接呼ぶので internal。#851） */
+internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
     fun u8(): Int {
         if (pos >= end) throw AsyncifyUnsupported("セクションの終わりを超えて読んだ")
         return buf[pos++].toInt() and 0xFF
@@ -1414,7 +1415,9 @@ private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
                     out.leb(remap(leb()))
                 }
                 0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op)
-                // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。定数式に使えない命令は、変換できない作りではなく、WASM として正しくない
+                // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。以下の「定数式に使えない」で断る分岐は、今は届かない守り
+                // （`prepare` が最初に Endive の `Parser.parse`（検証あり）を通し、定数式に使えない命令はそこで断られる）。
+                // 届いたときは、変換できない作りではなく、WASM として正しくないものとして断る
                 0xFD -> { // v128.const
                     val sub = leb()
                     if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))

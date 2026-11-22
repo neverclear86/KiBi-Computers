@@ -57,6 +57,7 @@ import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
 import run.endive.wasm.types.GlobalImport
+import run.endive.wasm.types.Instruction
 import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
@@ -255,6 +256,26 @@ public class EndiveRuntime internal constructor(
         }
 
         private fun isV128(type: ValType): Boolean = type == ValType.V128
+
+        /**
+         * 定数式で GC のオブジェクト（struct・array）を作る命令（`struct.new` など）を初期値に持つグローバル・要素セグメントがあれば、
+         * その名前（「グローバル 3」「要素セグメント 0」）。なければ `null`（#851）。`ref.i31` などは、オブジェクトを作らないので数えない
+         */
+        internal fun gcObjectInitializer(module: EndiveModule): String? {
+            module.globalSection().globals().forEachIndexed { i, g ->
+                if (g.initInstructions().any(::isGcAllocation)) return "グローバル $i"
+            }
+            val elements = module.elementSection()
+            for (i in 0 until elements.elementCount()) {
+                if (elements.getElement(i).initializers().any { init -> init.any(::isGcAllocation) }) return "要素セグメント $i"
+            }
+            return null
+        }
+
+        private fun isGcAllocation(ins: Instruction): Boolean = when (ins.opcode()) {
+            OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT, OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_FIXED -> true
+            else -> false
+        }
 
         /** SIMD の命令の接頭辞 */
         private const val SIMD_PREFIX: Int = 0xFD
@@ -958,6 +979,10 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
             if (type == WasmValueType.UNSUPPORTED) throw WasmStateException("取り出せない型の可変のグローバル $i（${g.valueType()}）")
             globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
         }
+        // GC のオブジェクト（struct・array）を初期値に持つグローバル・要素セグメントは、不変でも写せない。オブジェクトの中身（可変のフィールド）は
+        // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。今は、GC の型を持つモジュールは
+        // 読み込みで落ちるので、ここに届かない。#891）
+        EndiveRuntime.gcObjectInitializer(mod)?.let { throw WasmStateException("GC のオブジェクトを初期値に持つ$it") }
         // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1
         var indices = IntArray(0)

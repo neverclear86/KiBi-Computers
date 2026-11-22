@@ -19,6 +19,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
+import run.endive.wasm.InvalidException
+import run.endive.wasm.MalformedException
+import run.endive.wasm.Parser
 import java.io.ByteArrayOutputStream
 
 /**
@@ -226,15 +229,21 @@ class ConstExprInstrumentationTest {
     }
 
     @Test
-    fun `定数式に使えない0xFDの命令は、WASMとして読めないものとして断る`() {
-        // v128.const（12）を i8x16.shuffle（13。即値の長さは同じ 16 バイト）に書き換える
+    fun `定数式に使えない0xFDの命令は、変換できない作りではなく、Endiveの検証が断る`() {
+        // v128.const（12）を i8x16.shuffle（13。即値の長さは同じ 16 バイト）に書き換える。定数式の写しに届く前に、最初の Parser.parse が断る
         val bad = v128Bytes.copyOf().also { it[v128ConstAt(it)] = 0x0D }
         val fuel = assertThrows<WasmLoadException> { FuelInjector.inject(bad) }
-        assertTrue(fuel.cause !is AsyncifyUnsupported, "${fuel.cause}")
+        assertTrue(fuel.message!!.startsWith("燃料の計測コードを挿入できない: "), fuel.message)
+        assertTrue(fuel.message!!.contains("constant expression required"), fuel.message)
+        assertTrue(fuel.cause is InvalidException, "${fuel.cause}")
         val async = assertThrows<WasmLoadException> { Asyncify.transform(bad, setOf("w.wait")) }
-        assertTrue(async.cause !is AsyncifyUnsupported, "${async.cause}")
+        assertTrue(async.message!!.startsWith("WASM として読めない: "), async.message)
+        assertTrue(async.message!!.contains("constant expression required"), async.message)
+        assertTrue(async.cause is InvalidException, "${async.cause}")
+        // 計測ありの読み込みは、最初の段（挿入）で断る。変換できない作り（AsyncifyUnsupported）としては報告しない
         val loaded = assertThrows<WasmLoadException> { Program.loadMetered(runtime, bad, null, setOf("w.wait")) }
         assertNull(Program.unsuspendableReason(loaded), loaded.message)
+        assertTrue(loaded.message!!.contains("constant expression required"), loaded.message)
         // 即値の途中で切れたもの
         val cut = WitTool.wat("(module (global v128 (v128.const i64x2 0 0)))")
         val at = v128ConstAt(cut)
@@ -243,7 +252,76 @@ class ConstExprInstrumentationTest {
         val truncated = cut.copyOf(at + 5)
         // セクションの大きさを、切った後に合わせる（1 バイトの LEB）
         truncated[start - 1] = (truncated.size - start).toByte()
-        assertThrows<WasmLoadException> { FuelInjector.inject(truncated) }
+        val truncatedFuel = assertThrows<WasmLoadException> { FuelInjector.inject(truncated) }
+        assertTrue(truncatedFuel.cause is MalformedException, "${truncatedFuel.cause}")
+        val truncatedAsync = assertThrows<WasmLoadException> { Asyncify.transform(truncated, emptySet()) }
+        assertTrue(truncatedAsync.message!!.startsWith("WASM として読めない: "), truncatedAsync.message)
+        assertTrue(truncatedAsync.cause is MalformedException, "${truncatedAsync.cause}")
+    }
+
+    // ---- 定数式の写しの各分岐（上の入力は Endive の検証が先に断るので、写しを直接呼んで確かめる） ----
+
+    private fun b(vararg v: Int) = ByteArray(v.size) { v[it].toByte() }
+
+    private fun asyncifyCopy(bytes: ByteArray): ByteArray {
+        val sink = Sink()
+        Reader(bytes, 0, bytes.size).copyConstExpr(sink) { it }
+        return sink.toByteArray()
+    }
+
+    private fun fuelCopy(bytes: ByteArray): ByteArray {
+        val sink = FuelInjector.Sink()
+        FuelInjector.Reader(bytes, 0, bytes.size).copyConstExpr(sink, { it }, { it })
+        return sink.toByteArray()
+    }
+
+    /** 即値の 16 バイト（1, 2, …, 16） */
+    private val lanes16 = ByteArray(16) { (it + 1).toByte() }
+
+    @Test
+    fun `定数式の写しは、v128_constとGCの提案の命令を、バイト列のまま写す`() {
+        val cases = mapOf(
+            "v128.const" to b(0xFD, 0x0C) + lanes16 + b(0x0B),
+            "v128.const（正規でない LEB のサブの opcode）" to b(0xFD, 0x8C, 0x00) + lanes16 + b(0x0B),
+            "struct.new" to b(0xFB, 0x00, 0x03, 0x41, 0x01, 0x0B),
+            "struct.new_default" to b(0xFB, 0x01, 0x03, 0x0B),
+            "array.new" to b(0xFB, 0x06, 0x02, 0x41, 0x01, 0x41, 0x03, 0x0B),
+            "array.new_default" to b(0xFB, 0x07, 0x02, 0x41, 0x02, 0x0B),
+            "array.new_fixed" to b(0xFB, 0x08, 0x02, 0x03, 0x41, 0x01, 0x41, 0x02, 0x41, 0x03, 0x0B),
+            "any.convert_extern" to b(0xFB, 0x1A, 0x0B),
+            "extern.convert_any" to b(0xFB, 0x1B, 0x0B),
+            "ref.i31" to b(0xFB, 0x1C, 0x0B),
+            "型の番号が 2 バイトの LEB" to b(0xFB, 0x00, 0x80, 0x01, 0x0B),
+            "続けて書いた命令" to b(0xFD, 0x0C) + lanes16 + b(0xFB, 0x1C, 0x41, 0x05, 0xFB, 0x1C, 0x0B),
+        )
+        for ((name, bytes) in cases) {
+            assertArrayEquals(bytes, asyncifyCopy(bytes), "Asyncify: $name")
+            assertArrayEquals(bytes, fuelCopy(bytes), "FuelInjector: $name")
+        }
+    }
+
+    private fun assertRejected(name: String, bytes: ByteArray, text: String) {
+        val a = assertThrows<WasmLoadException>("Asyncify: $name") { asyncifyCopy(bytes) }
+        assertTrue(a.message!!.contains(text), "Asyncify: $name: ${a.message}")
+        assertNull(a.cause, "Asyncify: $name")
+        val f = assertThrows<WasmLoadException>("FuelInjector: $name") { fuelCopy(bytes) }
+        assertTrue(f.message!!.contains(text), "FuelInjector: $name: ${f.message}")
+        assertNull(f.cause, "FuelInjector: $name")
+    }
+
+    @Test
+    fun `定数式の写しは、定数式に使えない命令を、WASMとして正しくないものとして断る`() {
+        // 0xFD のサブの opcode が 12 でない（i8x16.shuffle。即値の長さは同じ 16 バイト）
+        assertRejected("0xFD 13", b(0xFD, 0x0D) + lanes16 + b(0x0B), "定数式の命令 0xFD 13 は定数式に使えない")
+        // v128.const の即値が 16 バイトに足りない（終わりがちょうど 15 バイト後）
+        assertRejected("即値が足りない", b(0xFD, 0x0C) + lanes16.copyOf(15), "セクションの終わりを超えて読んだ")
+        // 0xFB のサブの opcode が定数式のもの以外（struct.get）
+        assertRejected("0xFB 2", b(0xFB, 0x02, 0x00, 0x00, 0x0B), "定数式の命令 0xFB 2 は定数式に使えない")
+        // 0xFB 9（array.new_data）も、この写しは受け付けない（定数式の命令ではない）
+        assertRejected("0xFB 9", b(0xFB, 0x09, 0x00, 0x00, 0x0B), "定数式の命令 0xFB 9 は定数式に使えない")
+        // 最後の else（nop・unreachable・i32.add でない算術など）
+        assertRejected("0x01", b(0x01, 0x0B), "定数式の命令 0x01 は定数式に使えない")
+        assertRejected("0x00", b(0x00, 0x0B), "定数式の命令 0x00 は定数式に使えない")
     }
 
     private fun assertUnsupportedV128(wat: String) {
@@ -343,8 +421,24 @@ class ConstExprInstrumentationTest {
         }
     }
 
+    /**
+     * 止まりうる関数（`run`）と、型を持たない参照（anyref・externref・i31ref）のグローバル・要素セグメントを、GC の提案の定数式で初期化するモジュール。
+     * `(ref i31)` のような型付きの参照型のグローバルは持たない（持つと、止まりうる関数があるときは変換が断る。下のテスト）
+     */
+    private val gcSuspendWat = """
+        (module
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (global ${'$'}i i31ref (ref.i31 (i32.const 5)))
+          (global ${'$'}ex externref (extern.convert_any (ref.null any)))
+          (global ${'$'}an anyref (any.convert_extern (ref.null extern)))
+          (elem ${'$'}e i31ref (item (ref.i31 (i32.const 9))))
+          (func (export "lanes") (result i32) (i31.get_s (global.get ${'$'}i)))
+          (func (export "run") (result i32)
+            (i32.add (i32.add (call ${'$'}wait) (call ${'$'}wait)) (i32.const 7))))
+    """.trimIndent()
+
     @Test
-    fun `待機点への変換は、GCの提案の定数式の命令もそのまま写す`() {
+    fun `待機点への変換は、止まりうる関数がなくても、GCの提案の定数式の命令もそのまま写す`() {
         val bytes = WitTool.wat(gcLiteWat)
         val transformed = Asyncify.transform(bytes, emptySet()).bytes
         assertNull(WitTool.validate(transformed))
@@ -352,5 +446,87 @@ class ConstExprInstrumentationTest {
         val metered = Instrumentation.apply(bytes, setOf("w.wait"))
         assertNull(WitTool.validate(metered))
         assertTrue(contains(metered, globals(bytes)))
+    }
+
+    @Test
+    fun `止まりうる関数があっても、型を持たない参照のグローバルのGCの定数式はそのまま写し、巻き戻しと巻き直しで正しく動く`() {
+        val bytes = WitTool.wat(gcSuspendWat)
+        val r = Asyncify.transform(bytes, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertNull(WitTool.validate(r.bytes))
+        assertTrue(contains(r.bytes, globals(bytes)))
+        assertEquals(10L to 5L, drive(runtime.load(r.bytes)))
+        // 計測あり（挿入 → 変換）
+        val applied = Instrumentation.apply(bytes, setOf("w.wait"))
+        assertNull(WitTool.validate(applied))
+        assertEquals(10L to 5L, drive(runtime.load(applied)))
+    }
+
+    @Test
+    fun `止まりうる関数があって型付きの参照型（ref i31）のグローバルを持つと、定数式ではなく型を追えないために断る`() {
+        val bytes = WitTool.wat(gcSuspendWat.replace("(global \$i i31ref", "(global \$i (ref i31)"))
+        val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(bytes, setOf("w.wait")) }
+        assertTrue(e.message!!.contains("型付きの参照型"), e.message)
+        // 止まりうる関数がなければ、そのまま写す（#384）
+        assertNull(WitTool.validate(Asyncify.transform(bytes, emptySet()).bytes))
+    }
+
+    // ---- 保存（captureState） ----
+
+    @Test
+    fun `GCのオブジェクトを初期値に持つグローバル・要素セグメントは、不変でも保存の写しの対象として見つける`() {
+        // 今は、struct・array の型を持つモジュールは EndiveRuntime.load が落とす（#891）ので、読んだモジュールで確かめる
+        fun found(wat: String) = EndiveRuntime.gcObjectInitializer(Parser.parse(WitTool.wat(wat)))
+        assertEquals("グローバル 1", found(gcWat))
+        assertEquals(
+            "グローバル 0",
+            found(
+                """
+                (module
+                  (type ${'$'}s (struct (field (mut i32))))
+                  (global ${'$'}g (ref ${'$'}s) (struct.new ${'$'}s (i32.const 1)))
+                  (func (export "f")))
+                """.trimIndent(),
+            ),
+        )
+        assertEquals(
+            "グローバル 0",
+            found(
+                """
+                (module
+                  (type ${'$'}a (array (mut i32)))
+                  (global ${'$'}g (ref ${'$'}a) (array.new_default ${'$'}a (i32.const 2)))
+                  (func (export "f")))
+                """.trimIndent(),
+            ),
+        )
+        assertEquals(
+            "要素セグメント 0",
+            found(
+                """
+                (module
+                  (type ${'$'}s (struct (field (mut i32))))
+                  (elem ${'$'}e (ref null ${'$'}s) (item (struct.new ${'$'}s (i32.const 1))))
+                  (func (export "f")))
+                """.trimIndent(),
+            ),
+        )
+        // オブジェクトを作らない GC の定数式（ref.i31 など）と、v128 のグローバルは数えない
+        assertNull(found(gcLiteWat))
+        assertNull(found(v128Wat))
+    }
+
+    @Test
+    fun `不変のv128のグローバルだけなら、保存の写しを取れ、グローバルは写さない（戻すのは MachineRestoreBranchesTest）`() {
+        val wat = """
+            (module
+              (memory (export "memory") 1)
+              (global ${'$'}v v128 (v128.const i32x4 11 22 33 44))
+              (func (export "lane") (result i32) (i32x4.extract_lane 2 (global.get ${'$'}v))))
+        """.trimIndent()
+        runtime.load(WitTool.wat(wat)).instantiate(WasmInstanceConfig.builder().build()).use {
+            assertEquals(33L, it.call("lane").single())
+            assertTrue(it.captureState().globals.isEmpty(), "不変のグローバルは写さない")
+        }
     }
 }

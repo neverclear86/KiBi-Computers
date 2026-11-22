@@ -722,7 +722,7 @@ internal object FuelInjector {
 
     // --- バイト列の読み書き ---
 
-    private class Sink : ByteArrayOutputStream() {
+    internal class Sink : ByteArrayOutputStream() {
         fun u8(b: Int) = write(b and 0xFF)
 
         fun bytes(src: ByteArray, off: Int, len: Int) = write(src, off, len)
@@ -763,7 +763,8 @@ internal object FuelInjector {
         }
     }
 
-    private class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
+    /** テストが定数式の写しを直接呼ぶので internal（#851） */
+    internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
         fun u8(): Int {
             if (pos >= end) throw WasmLoadException("セクションの終わりを超えて読んだ")
             return buf[pos++].toInt() and 0xFF
@@ -809,7 +810,12 @@ internal object FuelInjector {
             if (flags and 1 != 0) skipLeb()
         }
 
-        /** 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える */
+        /**
+         * 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える。
+         *
+         * 「定数式に使えない」で断る分岐は、今は届かない守り（[inject] は最初に Endive の `Parser.parse`（検証あり）を通し、
+         * 定数式に使えない命令はそこで断られる。#851）。届いたときは WASM として正しくないものとして断る
+         */
         fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {
                 val start = pos
