@@ -413,6 +413,9 @@ internal class DiskFileSystem private constructor(
     /** パスを辿った先 */
     private class Resolved(val node: Long, val type: FileType, val segments: List<String>, val attrs: BasicFileAttributes)
 
+    /** リースの I/O のロック（テスト用。スタック切れでロックが残らないことを、ほかのスレッドから確かめる。#858） */
+    internal val ioLockForTest: java.util.concurrent.locks.ReentrantLock get() = lease.lock
+
     /** このディスクの操作を、リースの I/O のロックの中で行う。古い世代・止められた後は `IO` */
     private inline fun <T> io(block: () -> T): T {
         lease.lock.lock()
