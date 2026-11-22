@@ -44,7 +44,22 @@ package pro.ikili.kibicomputers.core.kernel.process
  * そこで、CPU・許可を返して取り直す道の手前は、どれも 128 段で確かめる形にした（`block`・`awaitHost` の先頭にも足した）。
  * 32 段は、包みと燃料切れの処理の入口から、ロックの区間を抜けるまで（とホストの関数の本体の浅い処理）に当てる。
  * 足りなかったときに残ったものは、浅いところの安全網（`ProcessRunner.recoverLeaks`）が見つけて戻す。
- * まだ確かめていないのは、本体がカーネルロックの中で VFS の深いところ（`stat` より深い操作）まで入る道と、canon の lift・lower の中の道（#858）
+ *
+ * 道ごとの確かめ（#858）: 次の道も、本体を置いたテストで、尽きる位置を 1 段ずつずらして確かめた（尽きた位置はどれも確かめの中）。
+ * - ディスクの VFS（`DiskFileSystem`。道の解決はカーネルロックの中、I/O はロックの外でリースのロックを取る）の深いディレクトリの `stat`、
+ *   `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`（`StackExhaustionLockTest` の `DISK_IO`）
+ * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）
+ * - canon の lift・lower（文字列の realloc、post-return、別のインスタンスが lower した関数を lift し直す `CoreRef.Lowered` の道。
+ *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）
+ * - 本物の p1 のモジュールの燃料切れ（前借り、待ち点への変換と巻き戻し。`P1StackExhaustionLockTest`）
+ * 段数を縮めて同じテストを回した（JDK 17、JIT。手元だけの変更で、コミットしていない）ところ、Windows・Linux とも、
+ * 包み・入口・深い道の順に 8・8・32 段では落ち（Windows では p1 の待ち点の道で、`clock_time_get` の本体が `Machine.monotonicNanos` の
+ * マシンのロックを取る途中、Linux ではディスクのリースのロックの途中で尽きた）、16・16・64 段では通った。JIT をかけない冷えた道
+ * （[probe] だけをコンパイルし、ほかはインタプリタ）でも、32・32・128 段と 16・16・64 段は両方の OS で通った。JDK 21 でも今の段数で通った。
+ * 冷えた道（Windows）と JDK 21（Linux）では 8・8・32 段でも通り、足りなくなる段数は JVM と回し方で変わる。
+ * 今の段数は、測った最小（16・16・64）の 2 倍で、上の理由（環境で変わる）から下げない。費用は `docs/load-test.md` の「#858 の結果」。
+ * これらのテストは段数を縮めて回す口を持たない。冷えた道・`-Xint`・JDK 21 で回す口は `-Pkibi.stackHeadroom=true` の
+ * `stackHeadroomColdTest`・`stackHeadroomXintTest`・`stackHeadroomJdk21Test`（通常の `build` には入れない）
  *
  * 3 つ目の入口（#856）: メモリの勘定（`ProcessMemory` の確保）。ロックではないが、プロセス → マシン → サーバー全体の別々の CAS を重ねるので、
  * 段の途中で尽きると勘定がずれる（サーバー全体の勘定はサーバーを止めるまで戻らない）。ゲストの命令から包みを通らずに入るので、
