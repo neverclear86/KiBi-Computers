@@ -177,7 +177,7 @@ class ComponentStackExhaustionLockTest {
             assertTrue(echoCalls.get() > 0 && pidCalls.get() > 0)
             if (kind == ProcessKind.WAIT_POINT) assertTrue(program.component!!.waitPoints, "${program.component!!.waitPointRejection}")
 
-            for (i in 0 until rounds) {
+            for (i in 0 until stackHeadroomRounds(rounds)) {
                 val pad = (i * 7) % 97
                 val rt = m.spawnRt(program, driver(kind, Int.MAX_VALUE, pad, AtomicInteger()))
                 assertEquals(kind, rt.process.kind)
@@ -192,7 +192,10 @@ class ComponentStackExhaustionLockTest {
                 assertEquals("call stack exhausted", crashReason(e!!), "${rt.lastError}")
                 soe(rt)?.stackTrace?.firstOrNull()?.let { top ->
                     tops.computeIfAbsent(top.className.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
-                    if (top.className.startsWith("java.util.concurrent.locks.")) inLocks++
+                    if (top.className.startsWith("java.util.concurrent.locks.")) {
+                        inLocks++
+                        println("#858 ロックの中で尽きた（$i 回目）: ${soe(rt)!!.stackTrace.take(16).joinToString(" <- ")}")
+                    }
                     if (top.className == StackHeadroom::class.java.name) inProbe++
                 }
                 assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、pad $pad）: ${m.lock}")
@@ -215,7 +218,7 @@ class ComponentStackExhaustionLockTest {
             assertEquals(0, h.scheduler.permits.waiting)
             assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
             println(
-                "#858 component $kind: CRASHED $rounds 回、尽きた位置がロックの中 $inLocks 回、入口の確かめ $inProbe 回、" +
+                "#858 component $kind: CRASHED ${stackHeadroomRounds(rounds)} 回、尽きた位置がロックの中 $inLocks 回、入口の確かめ $inProbe 回、" +
                     "一番上: ${tops.entries.sortedByDescending { it.value.get() }.take(8).joinToString { "${it.key}=${it.value.get()}" }}、" +
                     "echo ${echoCalls.get()} 回、pid ${pidCalls.get()} 回、譲った ${h.scheduler.fuelYields.get()} 回、" +
                     "スレッドを持って燃料を待った ${h.scheduler.fuelBlockingWaits.get()} 回、前借り ${h.scheduler.fuelOverdrafts.get()} 回",

@@ -65,6 +65,13 @@ tasks.test {
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // 前借りの間の燃料切れの処理の費用を測る（#858。`-Pkibi.overdraftBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.overdraftBenchmark").orNull == "true") {
+        systemProperty("kibi.overdraftBenchmark", "true")
+        for (name in listOf("machines", "inner", "rounds")) {
+            providers.gradleProperty("kibi.overdraftBenchmark.$name").orNull?.let { systemProperty("kibi.overdraftBenchmark.$name", it) }
+        }
+    }
     // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
     providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
         systemProperty("kibi.luaReplMachines", it)
@@ -91,6 +98,8 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         jvmArgs(args)
         // インタプリタでは遅いので、1 本の時間の上限を延ばす
         systemProperty("kibi.stackHeadroom.timeoutSeconds", "1800")
+        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）
+        if (args.isNotEmpty()) systemProperty("kibi.stackHeadroom.roundsScale", "0.25")
         testLogging.showStandardStreams = true
         outputs.upToDateWhen { false }
     }

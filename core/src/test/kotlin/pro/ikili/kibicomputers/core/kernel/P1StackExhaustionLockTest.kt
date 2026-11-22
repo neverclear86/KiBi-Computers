@@ -75,7 +75,7 @@ class P1StackExhaustionLockTest {
             val blocking0 = h.scheduler.fuelBlockingWaits.get()
             val unwindCost0 = h.scheduler.fuelUnwindCost.get()
             val modes = HashMap<String, Int>()
-            for (i in 0 until rounds) {
+            for (i in 0 until stackHeadroomRounds(rounds)) {
                 val mode = if (i % 2 == 0) "a" else "l"
                 val pad = (i / 2 * 3) % 61
                 val stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed)
@@ -94,7 +94,10 @@ class P1StackExhaustionLockTest {
                 modes.merge(mode, 1, Int::plus)
                 soe(rt)?.stackTrace?.firstOrNull()?.let { top ->
                     tops.computeIfAbsent(top.className.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
-                    if (top.className.startsWith("java.util.concurrent.locks.")) inLocks++
+                    if (top.className.startsWith("java.util.concurrent.locks.")) {
+                        inLocks++
+                        println("#858 ロックの中で尽きた（$i 回目）: ${soe(rt)!!.stackTrace.take(16).joinToString(" <- ")}")
+                    }
                     if (top.className == StackHeadroom::class.java.name) inProbe++
                 }
                 assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、$mode、pad $pad）: ${m.lock}")
@@ -113,7 +116,7 @@ class P1StackExhaustionLockTest {
             val blocking = h.scheduler.fuelBlockingWaits.get() - blocking0
             val unwindCost = h.scheduler.fuelUnwindCost.get() - unwindCost0
             println(
-                "#858 p1 $kind: CRASHED $rounds 回（$modes）、尽きた位置がロックの中 $inLocks 回、入口の確かめ $inProbe 回、" +
+                "#858 p1 $kind: CRASHED ${stackHeadroomRounds(rounds)} 回（$modes）、尽きた位置がロックの中 $inLocks 回、入口の確かめ $inProbe 回、" +
                     "一番上: ${tops.entries.sortedByDescending { it.value.get() }.take(8).joinToString { "${it.key}=${it.value.get()}" }}、" +
                     "前借り $overdrafts 回、巻き戻して燃料を待った $unwinds 回、譲った（巻き戻して譲ったのを含む） $yields 回、巻き戻しの費用 $unwindCost、スレッドを持って燃料を待った $blocking 回",
             )

@@ -114,15 +114,22 @@ class StackExhaustionLockTest {
     )
 
     /** [Body.DISK_IO] の置き場。`/a` と `/b` に別々のディスクをマウントし、`/a` の下に深いディレクトリを作る */
-    private class DiskRig(val a: DiskFileSystem, val b: DiskFileSystem, deep: VfsPath) {
-        val file: VfsPath = deep.child("t.txt")
-        val renamed: VfsPath = deep.child("u.txt")
-        val across: VfsPath = VfsPath.parse("/b/u.txt")
+    private class DiskRig(val a: DiskFileSystem, val b: DiskFileSystem, val deep: VfsPath) {
+        /**
+         * 回ごとに別の名前にする。スタックが open と close の間で尽きると、開いたホストのファイルが（ファイルシステムを外すまで）残り、
+         * Windows では開いたままのファイルの名前を変えられない（本番では fd に付くので、プロセスの終わりに閉じる）
+         */
+        fun file(round: Int): VfsPath = deep.child("t$round.txt")
+
+        fun renamed(round: Int): VfsPath = deep.child("u$round.txt")
+
+        fun across(round: Int): VfsPath = VfsPath.parse("/b/u$round.txt")
+
         val other: VfsPath = VfsPath.parse("/b")
     }
 
     /** 1 回分の深い再帰で、ホストの関数の本体が使うもの */
-    private class Round(val rig: Rig) {
+    private class Round(val rig: Rig, val index: Int) {
         val context = AtomicReference<ProcessContext>()
 
         /** ホストの関数の本体を呼んだ回数 */
@@ -145,18 +152,19 @@ class StackExhaustionLockTest {
                 val disk = round.rig.disk!!
                 // 1 回ごとの深いパスの stat（パスの解決）と、16 回に 1 回の open・write・rename（ホストの I/O は遅いので間引く）
                 if (round.calls.getAndIncrement() % 16 != 0) {
-                    ctx.vfs.stat(disk.file.parent!!)
+                    ctx.vfs.stat(disk.deep)
                     return
                 }
                 // 本番の path_open・path_rename と同じく、ロックの中は fd・パスの解決だけ（WasiP1Path）
                 ctx.withKernelLock { ctx.kernel.processes[ctx.pid] }
                 val vfs = ctx.vfs
-                val f = vfs.open(disk.file, OpenOptions(read = true, write = true, create = true, truncate = true))
+                val n = round.index
+                val f = vfs.open(disk.file(n), OpenOptions(read = true, write = true, create = true, truncate = true))
                 vfs.write(f, payload, 0, payload.size)
                 vfs.close(f)
-                vfs.rename(disk.file, disk.renamed)
+                vfs.rename(disk.file(n), disk.renamed(n))
                 try {
-                    vfs.rename(disk.renamed, disk.across)
+                    vfs.rename(disk.renamed(n), disk.across(n))
                 } catch (e: FsException) {
                     check(e.errno == Errno.XDEV) { "マウントをまたぐ名前の変更が XDEV でない: ${e.errno}" }
                 }
@@ -327,12 +335,12 @@ class StackExhaustionLockTest {
                 extraLocks += display.lock
             }
             if (extraLocks.isNotEmpty()) contenderThread = contender(extraLocks, stopWaker)
-            for (i in 0 until rounds) {
+            for (i in 0 until stackHeadroomRounds(rounds)) {
                 val pattern = patterns[i % patterns.size]
                 // 尽きる位置を 1 段ずつずらす（詰め物の段数を変える）
                 val pad = (i / patterns.size * 7) % 97
                 val stream = if (body == Body.BLOCK) m.lock.withLockValue { ByteStream(1).also { m.kernel.objects.add(it) } } else null
-                val round = Round(Rig(stream, disk, tty))
+                val round = Round(Rig(stream, disk, tty), i)
                 val driver = runDriver(kind) { ctx, b ->
                     round.context.set(ctx)
                     b.host(ctx) { c, _, _ -> runBody(c, body, round).let { LongArray(0) } }
@@ -415,7 +423,10 @@ class StackExhaustionLockTest {
         val c = top.className
         tally.tops.computeIfAbsent(c.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
         when {
-            c.startsWith("java.util.concurrent.locks.") -> tally.inLocks.incrementAndGet()
+            c.startsWith("java.util.concurrent.locks.") -> {
+                tally.inLocks.incrementAndGet()
+                println("#858 ロックの中で尽きた: ${t.stackTrace.take(16).joinToString(" <- ")}")
+            }
             c == StackHeadroom::class.java.name -> tally.inProbe.incrementAndGet()
             c.startsWith("java.nio.") || c.startsWith("sun.nio.") || c.startsWith("java.io.") -> tally.inHostIo.incrementAndGet()
             c.startsWith("pro.ikili.kibicomputers.core.display.") || c.startsWith("pro.ikili.kibicomputers.core.kernel.tty.") ->
@@ -743,3 +754,9 @@ internal fun stackHeadroomTestLimit(): Duration = Duration.ofSeconds(Integer.get
 
 /** 1 回分の待ちの上限 [millis] を、[stackHeadroomTestLimit] が 120 秒より長いときは同じ割合で延ばす */
 internal fun stackHeadroomWait(millis: Long): Long = millis * maxOf(1L, stackHeadroomTestLimit().seconds / 120)
+
+/**
+ * 1 本の回数 [rounds] を、`kibi.stackHeadroom.roundsScale`（既定 1）の割合で減らす（インタプリタで回す opt-in のタスク用。少なくとも 4 回）
+ */
+internal fun stackHeadroomRounds(rounds: Int): Int =
+    maxOf(4, (rounds * (System.getProperty("kibi.stackHeadroom.roundsScale")?.toDouble() ?: 1.0)).toInt())
