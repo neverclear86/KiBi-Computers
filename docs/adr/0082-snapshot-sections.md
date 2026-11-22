@@ -44,7 +44,7 @@
 - 可変のグローバル（export しないものも）・テーブル（funcref の関数の番号、`null` は -1）・drop 済みのパッシブなデータ・要素のセグメント
 - 戻す口は `WasmModule.instantiateForRestore`。能動なセグメントの初期化はし、その後でメモリの大きさ・区画・グローバル・テーブル・drop 済みを上書きする。区画は1つずつ予算で数え、断られたら `WasmLinkException`
 - **start 関数を持つモジュールは保存できない**: Endive 1.2.0 はインスタンスを作るときに start 関数を必ず動かし、飛ばす口がない（実装で確かめた）。`captureState` は `WasmStateException`、`instantiateForRestore` は `WasmLinkException` を投げ、そのプロセスは写しの中で殺す。wasi-libc のコマンドは start セクションを使わないので、標準 OS のコマンドには当たらない
-- 取り出せないもの（`WasmStateException`）: グローバル・テーブルの import、v128・参照型の可変のグローバル、externref のテーブル、ほかのインスタンスの関数を指す要素
+- 取り出せないもの（`WasmStateException`）: グローバル・テーブルの import、v128・参照型の可変のグローバル、externref のテーブル、ほかのインスタンスの関数を指す要素、GC のオブジェクト（struct・array）を初期値の式で作るグローバル・要素セグメント（不変でも。オブジェクトの中身を写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻るため。`EndiveRuntime.gcObjectInitializer`。#851、ADR 0329 の追記）
 
 ## TMPFS 節
 

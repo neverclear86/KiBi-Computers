@@ -981,7 +981,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         }
         // GC のオブジェクト（struct・array）を初期値に持つグローバル・要素セグメントは、不変でも写せない。オブジェクトの中身（可変のフィールド）は
         // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。今は、GC の型を持つモジュールは
-        // 読み込みで落ちるので、ここに届かない。#891）
+        // 製品の経路ではコンパイル（`simdFunctions`）で落ちるので、ここに届かない（#891）。コンパイルしないランタイムでは届く）
         EndiveRuntime.gcObjectInitializer(mod)?.let { throw WasmStateException("GC のオブジェクトを初期値に持つ$it") }
         // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1

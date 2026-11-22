@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
+import pro.ikili.kibicomputers.core.runtime.WasmStateException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
@@ -209,6 +210,51 @@ class ConstExprInstrumentationTest {
         assertEquals(10L to lanes, drive(runtime.load(shared), sharedFuel = true))
     }
 
+    /**
+     * 止まりうる関数 `run` そのものが、待ち点をまたがずに v128 のグローバルを読み書きする（`global.get`・`global.set` だけ）モジュール。
+     * 1つ目の待ちの前に `$m = $v`、2つの待ちの間に `$w = $m` と `$m = $z`。巻き直しで前の `global.set` をやり直したり飛ばし損ねたりすると、
+     * `lanes`（`$w` の lane 1 と `$m` の lane 3）が変わる
+     */
+    private val v128SuspendWat = """
+        (module
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (global ${'$'}v v128 (v128.const i32x4 11 22 33 44))
+          (global ${'$'}z v128 (v128.const i32x4 1000 2000 3000 4000))
+          (global ${'$'}m (mut v128) (v128.const i32x4 0 0 0 0))
+          (global ${'$'}w (mut v128) (v128.const i32x4 0 0 0 0))
+          (func (export "lanes") (result i32)
+            (i32.add (i32x4.extract_lane 1 (global.get ${'$'}w)) (i32x4.extract_lane 3 (global.get ${'$'}m))))
+          (func (export "run") (result i32)
+            (local ${'$'}s i32)
+            (global.set ${'$'}m (global.get ${'$'}v))
+            (local.set ${'$'}s (call ${'$'}wait))
+            (global.set ${'$'}w (global.get ${'$'}m))
+            (global.set ${'$'}m (global.get ${'$'}z))
+            (i32.add (local.get ${'$'}s) (i32.add (call ${'$'}wait) (i32.const 7)))))
+    """.trimIndent()
+
+    @Test
+    fun `止まりうる関数が待ち点をまたがずにv128のグローバルを読み書きしても、巻き戻しと巻き直しで正しく動く`() {
+        val bytes = WitTool.wat(v128SuspendWat)
+        // `$w` は 22（1つ目の待ちの前の `$m = $v`）、`$m` は 4000（2つの待ちの間の `$m = $z`）
+        val expected = 10L to 4022L
+        val interpreter = EndiveRuntime(compile = false)
+        val r = Asyncify.transform(bytes, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertNull(WitTool.validate(r.bytes))
+        // コンパイルあり（v128 を使う関数はインタプリタに回る）と、インタプリタだけ
+        assertEquals(expected, drive(runtime.load(r.bytes)), "コンパイルあり")
+        assertEquals(expected, drive(interpreter.load(r.bytes)), "インタプリタだけ")
+        // 計測あり（挿入 → 変換）
+        val applied = Instrumentation.applyDetailed(bytes, setOf("w.wait"))
+        assertTrue(applied.fuelYield, "${applied.fuelYieldRejection}")
+        assertNull(WitTool.validate(applied.bytes))
+        assertEquals(expected, drive(runtime.load(applied.bytes)), "計測あり・コンパイルあり")
+        assertEquals(expected, drive(interpreter.load(applied.bytes)), "計測あり・インタプリタだけ")
+        // 変換しないものと同じ答え
+        assertEquals(expected, plain(runtime.load(bytes)))
+    }
+
     @Test
     fun `止まりうる関数がなければ、v128のグローバルがあっても断らない`() {
         val r = Asyncify.transform(v128Bytes, emptySet())
@@ -259,7 +305,50 @@ class ConstExprInstrumentationTest {
         assertTrue(truncatedAsync.cause is MalformedException, "${truncatedAsync.cause}")
     }
 
-    // ---- 定数式の写しの各分岐（上の入力は Endive の検証が先に断るので、写しを直接呼んで確かめる） ----
+    /**
+     * テーブルなどを持たず、要素セグメントを 1 つだけ持つモジュール。[flag] は要素セグメントの形式（5 = パッシブ、7 = 宣言）、
+     * 要素の型は funcref、項目は [item]（終わりの 0x0B を含む定数式）が 1 つ。WAT では書けない（正しくない）ので、バイト列で作る
+     */
+    private fun elemModule(flag: Int, item: ByteArray): ByteArray {
+        val content = b(1, flag, 0x70, 1) + item
+        check(content.size < 0x80)
+        return b(0x00, 0x61, 0x73, 0x6D, 1, 0, 0, 0, 9, content.size) + content
+    }
+
+    @Test
+    fun `パッシブ・宣言の要素セグメントの定数式に使えない命令は、検証を通って写しに届き、写しが正しくないWASMとして断る`() {
+        // Endive 1.2.0 の検証は、パッシブ・宣言の要素セグメント（flag 5・7）の初期値を確かめない。写しが断る
+        val items = mapOf(
+            // (elem funcref (item (i32.const 0) (drop) (ref.null func)))
+            "定数式の命令 0x1A は定数式に使えない" to b(0x41, 0x00, 0x1A, 0xD0, 0x70, 0x0B),
+            // i8x16.swizzle
+            "定数式の命令 0xFD 14 は定数式に使えない" to b(0xFD, 14, 0x0B),
+        )
+        for (flag in listOf(5, 7)) {
+            for ((text, item) in items) {
+                val bytes = elemModule(flag, item)
+                assertTrue(WitTool.validate(bytes) != null, "テストの入力が正しい WASM になっている（flag $flag: $text）")
+                // 検証は通る（Endive の穴。#893）
+                Parser.parse(bytes)
+                val name = "flag $flag: $text"
+                val fuel = assertThrows<WasmLoadException>(name) { FuelInjector.inject(bytes) }
+                assertEquals(text, fuel.message, name)
+                assertNull(fuel.cause, name)
+                // 計測なしの変換も、変換できない作り（AsyncifyUnsupported）ではなく、正しくない WASM として断る（止まりうる関数の有無によらない）
+                for (waits in listOf(emptySet(), setOf("w.wait"))) {
+                    val async = assertThrows<WasmLoadException>("$name, $waits") { Asyncify.transform(bytes, waits) }
+                    assertEquals(text, async.message, "$name, $waits")
+                    assertNull(async.cause, "$name, $waits")
+                }
+                // 計測ありの読み込み（exec の経路）
+                val loaded = assertThrows<WasmLoadException>(name) { Program.loadMetered(runtime, bytes, null, setOf("w.wait")) }
+                assertTrue(loaded.message!!.contains(text), "$name: ${loaded.message}")
+                assertNull(Program.unsuspendableReason(loaded), "$name: ${loaded.message}")
+            }
+        }
+    }
+
+    // ---- 定数式の写しの各分岐（検証が先に断る形もあるので、写しを直接呼んでも確かめる） ----
 
     private fun b(vararg v: Int) = ByteArray(v.size) { v[it].toByte() }
 
@@ -475,7 +564,7 @@ class ConstExprInstrumentationTest {
 
     @Test
     fun `GCのオブジェクトを初期値に持つグローバル・要素セグメントは、不変でも保存の写しの対象として見つける`() {
-        // 今は、struct・array の型を持つモジュールは EndiveRuntime.load が落とす（#891）ので、読んだモジュールで確かめる
+        // 製品の経路（コンパイルあり）の EndiveRuntime.load は struct・array の型を持つモジュールを落とす（#891）ので、読んだモジュールでも確かめる
         fun found(wat: String) = EndiveRuntime.gcObjectInitializer(Parser.parse(WitTool.wat(wat)))
         assertEquals("グローバル 1", found(gcWat))
         assertEquals(
@@ -514,6 +603,41 @@ class ConstExprInstrumentationTest {
         // オブジェクトを作らない GC の定数式（ref.i31 など）と、v128 のグローバルは数えない
         assertNull(found(gcLiteWat))
         assertNull(found(v128Wat))
+    }
+
+    @Test
+    fun `GCのオブジェクトを初期値に持つグローバル・要素セグメントがあると、実際のインスタンスのcaptureStateが断る`() {
+        // 製品の経路（コンパイルあり）は struct・array の型を持つモジュールを読めない（#891）が、インタプリタだけのランタイムは読める
+        val interpreter = EndiveRuntime(compile = false)
+        val global = """
+            (module
+              (memory (export "memory") 1)
+              (type ${'$'}s (struct (field (mut i32))))
+              (global ${'$'}g (ref ${'$'}s) (struct.new ${'$'}s (i32.const 1)))
+              (func (export "bump") (result i32)
+                (struct.set ${'$'}s 0 (global.get ${'$'}g) (i32.add (struct.get ${'$'}s 0 (global.get ${'$'}g)) (i32.const 1)))
+                (struct.get ${'$'}s 0 (global.get ${'$'}g))))
+        """.trimIndent()
+        interpreter.load(WitTool.wat(global)).instantiate(WasmInstanceConfig.builder().build()).use {
+            assertEquals(2L, it.call("bump").single())
+            val e = assertThrows<WasmStateException> { it.captureState() }
+            assertEquals("GC のオブジェクトを初期値に持つグローバル 0", e.message)
+        }
+        val element = """
+            (module
+              (type ${'$'}a (array (mut i32)))
+              (elem ${'$'}e (ref null ${'$'}a) (item (array.new_default ${'$'}a (i32.const 2))))
+              (func (export "f")))
+        """.trimIndent()
+        interpreter.load(WitTool.wat(element)).instantiate(WasmInstanceConfig.builder().build()).use {
+            val e = assertThrows<WasmStateException> { it.captureState() }
+            assertEquals("GC のオブジェクトを初期値に持つ要素セグメント 0", e.message)
+        }
+        // オブジェクトを作らない GC の定数式（ref.i31 など）だけなら断らない
+        interpreter.load(WitTool.wat(gcLiteWat)).instantiate(WasmInstanceConfig.builder().build()).use {
+            assertEquals(5L, it.call("f").single())
+            it.captureState()
+        }
     }
 
     @Test

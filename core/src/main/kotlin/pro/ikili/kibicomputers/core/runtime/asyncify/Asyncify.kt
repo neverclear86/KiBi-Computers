@@ -121,7 +121,8 @@ internal object Asyncify {
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
-     * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。Endive の検証が断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
+     * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。グローバル・能動な要素セグメントのものは Endive の検証が、
+     *   パッシブ・宣言の要素セグメントのものは定数式の写しが断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
      */
     @Throws(WasmLoadException::class)
     fun transform(
@@ -1415,9 +1416,9 @@ internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
                     out.leb(remap(leb()))
                 }
                 0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E -> out.u8(op)
-                // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。以下の「定数式に使えない」で断る分岐は、今は届かない守り
-                // （`prepare` が最初に Endive の `Parser.parse`（検証あり）を通し、定数式に使えない命令はそこで断られる）。
-                // 届いたときは、変換できない作りではなく、WASM として正しくないものとして断る
+                // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。以下の「定数式に使えない」で断る分岐は、変換できない作りではなく、
+                // WASM として正しくないものとして断る（原因なしの WasmLoadException）。`prepare` は最初に Endive の `Parser.parse`（検証あり）を通すが、
+                // Endive 1.2.0 の検証はパッシブ・宣言の要素セグメント（flag 5・7）の初期値を確かめないので、その形ではここに届く
                 0xFD -> { // v128.const
                     val sub = leb()
                     if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))

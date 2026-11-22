@@ -813,8 +813,10 @@ internal object FuelInjector {
         /**
          * 定数式を写す。`ref.func`（[remap]）と `global.get`（[globalRemap]）の番号を付け替える。
          *
-         * 「定数式に使えない」で断る分岐は、今は届かない守り（[inject] は最初に Endive の `Parser.parse`（検証あり）を通し、
-         * 定数式に使えない命令はそこで断られる。#851）。届いたときは WASM として正しくないものとして断る
+         * 「定数式に使えない」で断る分岐は、正しくない WASM として断る（原因なしの [WasmLoadException]。#851）。[inject] は最初に
+         * Endive の `Parser.parse`（検証あり）を通すが、Endive 1.2.0 の検証は、グローバルの初期値と能動な要素セグメント（flag 0・2・4・6）の
+         * 定数式しか確かめない。パッシブ・宣言の要素セグメント（flag 5・7）の初期値は検証されずにここへ届くので、この分岐は届く経路がある
+         * （`drop` などの命令で断る。型が合わないだけの `v128.const` は、命令としては定数式なので写す）
          */
         fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {
