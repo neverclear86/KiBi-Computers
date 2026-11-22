@@ -29,6 +29,16 @@ import java.util.concurrent.atomic.AtomicLong
  *   組の中で持ち主（マシン）を巡回して1つずつ取り出す（#363・#738）。1台・1人が大量に積んでも、別の台・別の人の読み込みは
  *   その後ろに並ばない。[executor] には読み込み1つにつき「次の1つを取り出して読み込む」仕事を1つ渡すので、[executor] 自体の
  *   待ち行列が FIFO でも、何を読み込むかは取り出すときに巡回で決まる
+ * - 巡回は件数だけでなく時間でも公平にする（#750、ADR 0750）。組の間と、組ごとの持ち主（マシン）の間で、それぞれ
+ *   コンパイル用のスレッドを使った経過時間を仮想時間（[Ledger]）で数え、ほかより多く使った分を「借り」とする。
+ *   取り出すときは、待っているものの借りの最小を基準から引き（待っているものが全員借りていれば、その分を帳消しにする）、
+ *   読み込み中でないもののうち、巡回の順で最初の「借り + 前の読み込みにかかった時間（終わる見込み）が、その最小 +
+ *   [debtThresholdNanos] 以下」の組・持ち主を選ぶ（飛ばしたものの順番は変えない。まだ使っていないものは 0）。
+ *   全員が読み込み中なら、読み込み中の経過時間も足して最も少ないものを選ぶ（スレッドを遊ばせない。
+ *   [runNext] 1つにつき1件を取り出すことも変えない）。軽い読み込みしかないときは、件数の巡回と同じ順になる。
+ *   借りは取り出した時点の持ち主と組に付け、読み込みが成功しても失敗しても付ける。相乗りした台には付けない。
+ *   借りは、待っているものが全員借りているときと、待ち行列に何もない間（経過時間の [idleDecayDivisor] 分の 1 ずつ）だけ減る。
+ *   保存しない
  * - 持ち主（マシン）ごとに、読み込み中・待ち行列にある読み込みの数を [maxPendingPerOwner] までにする。組ごとには [maxPendingPerGroup]
  *   までにする（組の上限は、[load] で `limitGroup` を立てたものだけを断る。init・復元の読み込みは断らない。#738）。
  *   超えたら [ProgramLoadBusyException] の失敗をすぐに返す（`Machine.exec` は `AGAIN` にする）。
@@ -69,6 +79,13 @@ internal class ProgramCache(
     private val nanoTime: () -> Long = System::nanoTime,
     /** 公平の組ごとの、読み込み中・待ち行列にある読み込みの数の上限（1 以上。`Int.MAX_VALUE` で上限なし。#738） */
     private val maxPendingPerGroup: Int = Int.MAX_VALUE,
+    /**
+     * 借り（ほかより多く使った経過時間。ナノ秒）が、待っているものの最小よりこれだけ多い組・持ち主は、ほかに当てはまるものがあれば
+     * 後に回す（0 以上。`Long.MAX_VALUE` なら件数の巡回だけ。#750）
+     */
+    private val debtThresholdNanos: Long = DEFAULT_DEBT_THRESHOLD_NANOS,
+    /** 待ち行列に何もない組・持ち主の借りが減る速さ（経過時間の何分の 1 ずつ減るか。1 以上。#750） */
+    private val idleDecayDivisor: Long = DEFAULT_IDLE_DECAY_DIVISOR,
 ) {
     init {
         require(maxEntries >= 1) { "maxEntries は 1 以上: $maxEntries" }
@@ -77,6 +94,8 @@ internal class ProgramCache(
         require(failureTtlNanos >= 0) { "failureTtlNanos は 0 以上: $failureTtlNanos" }
         require(maxFailures >= 1) { "maxFailures は 1 以上: $maxFailures" }
         require(maxPendingPerGroup >= 1) { "maxPendingPerGroup は 1 以上: $maxPendingPerGroup" }
+        require(debtThresholdNanos >= 0) { "debtThresholdNanos は 0 以上: $debtThresholdNanos" }
+        require(idleDecayDivisor >= 1) { "idleDecayDivisor は 1 以上: $idleDecayDivisor" }
     }
 
     /** 共有のキー */
@@ -102,6 +121,39 @@ internal class ProgramCache(
 
         /** 読み込みを始めた */
         var started = false
+
+        /** 借りを付ける持ち主（取り出した時点の [owner]。#750） */
+        var chargedOwner = 0L
+
+        /** 借りを付ける組（取り出した時点の [group]。#750） */
+        var chargedGroup: FairShareGroup = group
+
+        /** 読み込みを始めた時刻（[nanoTime]。#750） */
+        var startedAt = 0L
+    }
+
+    /**
+     * 組か持ち主1つの、コンパイル用のスレッドを使った時間（#750）。借りは [vtime] − [Ledger.floor]（0 未満は 0）。
+     * 読み込み中のものの時間は、終わってから [vtime] に足す
+     */
+    private class Usage(var vtime: Long, var at: Long) {
+        /** 前の読み込みにかかった時間（次の読み込みの見込み） */
+        var lastCost = 0L
+
+        /** 読み込み中の数 */
+        var running = 0
+
+        /** 読み込み中のものの、始めた時刻の合計（あふれても、時刻の差は正しく出る） */
+        var startSum = 0L
+    }
+
+    /**
+     * 使った時間の勘定1つ（組の間で1つ、組ごとに持ち主の間で1つ。#750）。[floor] は仮想時間の基準で、進むだけ。
+     * 記録のないものは借りが 0
+     */
+    private class Ledger<K> {
+        var floor = 0L
+        val usage = HashMap<K, Usage>()
     }
 
     /** 待つ側1つ（頼んだ持ち主と、頼んだときの公平の組） */
@@ -132,6 +184,15 @@ internal class ProgramCache(
 
     /** 組ごとの、読み込み中・待ち行列にある読み込みの数（0 になった組は消す。#738） */
     private val pendingByGroup = HashMap<FairShareGroup, Int>()
+
+    /** 組の間の、使った時間の勘定（#750。借りがなく、待ち行列にも読み込み中にもないものは消す） */
+    private val groupLedger = Ledger<FairShareGroup>()
+
+    /** 組ごとの、持ち主（マシン）の間の使った時間の勘定（#750。同じく消し、空になった勘定も消す） */
+    private val ownerLedgers = HashMap<FairShareGroup, Ledger<Long>>()
+
+    /** 借りを付けた回数（[USAGE_SWEEP_INTERVAL] 回ごとに、減りきったものを消す） */
+    private var charges = 0
 
     /** 覚えている失敗（古い順） */
     private val failures = LinkedHashMap<Key, Failure>()
@@ -282,10 +343,29 @@ internal class ProgramCache(
         val ownerQueue = queues.getOrPut(slot) { ArrayDeque() }
         if (ownerQueue.isEmpty()) {
             val owners = ownerRings.getOrPut(job.group) { ArrayDeque() }
-            if (owners.isEmpty()) ring.addLast(job.group)
+            if (owners.isEmpty()) {
+                ring.addLast(job.group)
+                forgiveIdleLocked(groupLedger, job.group)
+            }
             owners.addLast(owner)
+            ownerLedgers[job.group]?.let { forgiveIdleLocked(it, owner) }
         }
         ownerQueue.addLast(job)
+    }
+
+    /**
+     * 待ち行列に入っていなかった [key] が入る。読み込み中のものもなければ、前に借りを付けてから（前に減らしてから）の経過時間の
+     * [idleDecayDivisor] 分の 1 だけ、借りを減らし、余った分で前の読み込みの時間（見込み）も減らす（#750。続けて頼み直す台は減らない）
+     */
+    private fun <K> forgiveIdleLocked(ledger: Ledger<K>, key: K) {
+        val u = ledger.usage[key] ?: return
+        if (u.running != 0) return
+        val now = nanoTime()
+        val decay = (now - u.at).coerceAtLeast(0) / idleDecayDivisor
+        val lag = lagOf(ledger, u)
+        u.vtime = ledger.floor + (lag - decay).coerceAtLeast(0)
+        if (decay > lag) u.lastCost = (u.lastCost - (decay - lag)).coerceAtLeast(0)
+        u.at = now
     }
 
     /** 始まっていない [job] を、持ち主と組の列から外す（列が空になれば巡回からも外す） */
@@ -311,18 +391,128 @@ internal class ProgramCache(
         if (g <= 0) pendingByGroup.remove(group) else pendingByGroup[group] = g
     }
 
-    /** 巡回の順で、次の組の、次の持ち主の先頭を取り出す。なければ `null` */
+    /**
+     * 巡回の順で、次の組の、次の持ち主の先頭を取り出す（借りの多いものは後に回す。#750）。どこかの列にあれば必ず1つ返す。
+     * なければ `null`
+     */
     private fun takeNextLocked(): Job? {
-        val group = ring.removeFirstOrNull() ?: return null
+        if (ring.isEmpty()) return null
+        val now = nanoTime()
+        val group = ring.removeAt(pickLocked(ring, groupLedger, now))
         val owners = ownerRings.getValue(group)
-        val owner = owners.removeFirst()
+        val ownerLedger = ownerLedgers.getOrPut(group) { Ledger() }
+        val owner = owners.removeAt(pickLocked(owners, ownerLedger, now))
         val slot = Slot(group, owner)
         val ownerQueue = queues.getValue(slot)
         val job = ownerQueue.removeFirst()
         if (ownerQueue.isEmpty()) queues.remove(slot) else owners.addLast(owner)
         if (owners.isEmpty()) ownerRings.remove(group) else ring.addLast(group)
         job.started = true
+        job.chargedOwner = owner
+        job.chargedGroup = group
+        job.startedAt = now
+        beginUsageLocked(ownerLedger, owner, now)
+        beginUsageLocked(groupLedger, group, now)
         return job
+    }
+
+    /**
+     * 巡回の順 [order]（空でない）から選ぶものの位置（#750）。
+     *
+     * 1. 待っているもの全員に借りがあれば、その最小だけ [Ledger.floor] を進める（全員から同じだけ帳消しにする）
+     * 2. 読み込み中でないもののうち、先頭から見て、終わる見込み（借り + 前の読み込みの時間。記録がなければ 0）が
+     *    「その最小 + [debtThresholdNanos]」以下の最初のもの
+     * 3. 全員が読み込み中なら、終わる見込みに読み込み中の経過時間を足したものが最も少ないもの（同じなら前のもの。スレッドを遊ばせない）
+     *
+     * 先頭に記録がなければ（借り 0 で読み込み中でもない）すぐ選ぶので、軽い読み込みだけのときは先頭を見るだけで済む
+     */
+    private fun <K> pickLocked(order: ArrayDeque<K>, ledger: Ledger<K>, now: Long): Int {
+        val usage = ledger.usage
+        if (usage[order[0]] == null) return 0
+        var minLag = Long.MAX_VALUE
+        for (key in order) {
+            val lag = usage[key]?.let { lagOf(ledger, it) } ?: 0
+            if (lag < minLag) minLag = lag
+        }
+        if (minLag > 0) ledger.floor += minLag
+        // 読み込み中でないものの、借りと前の読み込みの時間の和（終わる見込みの仮想時刻）の最小
+        var minFinish = Long.MAX_VALUE
+        for (key in order) {
+            val u = usage[key]
+            if (u == null) {
+                minFinish = 0
+                break
+            }
+            if (u.running == 0) minFinish = minOf(minFinish, finishOf(ledger, u))
+        }
+        if (minFinish == Long.MAX_VALUE) {
+            // 全員が読み込み中（スレッドが 2 本以上）。読み込み中の経過時間を足して最も少ないもの
+            var best = 0
+            var bestTotal = Long.MAX_VALUE
+            for (i in order.indices) {
+                val u = usage.getValue(order[i])
+                val total = finishOf(ledger, u) + (u.running * now - u.startSum)
+                if (total < bestTotal) {
+                    best = i
+                    bestTotal = total
+                }
+            }
+            return best
+        }
+        val limit = if (debtThresholdNanos > Long.MAX_VALUE - minFinish) Long.MAX_VALUE else minFinish + debtThresholdNanos
+        for (i in order.indices) {
+            val u = usage[order[i]] ?: return i
+            if (u.running == 0 && finishOf(ledger, u) <= limit) return i
+        }
+        error("選べるものがない")
+    }
+
+    /** [u] の借り（0 以上。読み込み中のものの経過時間は入れない） */
+    private fun lagOf(ledger: Ledger<*>, u: Usage): Long = (u.vtime - ledger.floor).coerceAtLeast(0)
+
+    /** [u] の次の読み込みが終わる見込みの仮想時刻（基準から。借り + 前の読み込みにかかった時間） */
+    private fun finishOf(ledger: Ledger<*>, u: Usage): Long = lagOf(ledger, u) + u.lastCost
+
+    private fun <K> beginUsageLocked(ledger: Ledger<K>, key: K, now: Long) {
+        val u = ledger.usage.getOrPut(key) { Usage(ledger.floor, now) }
+        u.running++
+        u.startSum += now
+    }
+
+    /** 読み込みが終わった [job] の経過時間を、取り出した時点の持ち主と組の借りに足す（成功でも失敗でも。#750） */
+    private fun chargeLocked(job: Job, now: Long) {
+        ownerLedgers[job.chargedGroup]?.let { endUsageLocked(it, job.chargedOwner, job.startedAt, now) }
+        endUsageLocked(groupLedger, job.chargedGroup, job.startedAt, now)
+        if (++charges % USAGE_SWEEP_INTERVAL == 0) sweepUsageLocked(now)
+    }
+
+    private fun <K> endUsageLocked(ledger: Ledger<K>, key: K, startedAt: Long, now: Long) {
+        val u = ledger.usage[key] ?: return
+        val elapsed = (now - startedAt).coerceAtLeast(0)
+        u.vtime = ledger.floor + lagOf(ledger, u) + elapsed
+        u.lastCost = elapsed
+        u.at = now
+        u.running--
+        u.startSum -= startedAt
+    }
+
+    /**
+     * 待ち行列にも読み込み中にもなく、待たずにいた分を引けば借りがなくなるものを消す。空になった持ち主の勘定も消す
+     * （台が消えても表に残らない。#750）
+     */
+    private fun sweepUsageLocked(now: Long) {
+        fun <K> Ledger<K>.sweep(queued: (K) -> Boolean) {
+            usage.entries.removeAll { (key, u) ->
+                u.running == 0 && !queued(key) && lagOf(this, u) - (now - u.at) / idleDecayDivisor <= 0
+            }
+        }
+        groupLedger.sweep { ownerRings.containsKey(it) }
+        val iter = ownerLedgers.entries.iterator()
+        while (iter.hasNext()) {
+            val (group, ledger) = iter.next()
+            ledger.sweep { queues.containsKey(Slot(group, it)) }
+            if (ledger.usage.isEmpty()) iter.remove()
+        }
     }
 
     /** コンパイル用のスレッドで、次の1つを読み込む（取り消されて無くなっていれば何もしない） */
@@ -335,6 +525,8 @@ internal class ProgramCache(
             Result.failure(t)
         }
         val waiters = synchronized(lock) {
+            // 借りは成功でも失敗でも（VM のエラーでも）付ける。close() の後は表を消したので付けない（#750）
+            if (!closed) chargeLocked(job, nanoTime())
             // close() が先に外して失敗させていれば、結果は覚えない
             if (loading[job.key] === job) {
                 loading.remove(job.key)
@@ -392,6 +584,8 @@ internal class ProgramCache(
             ring.clear()
             pendingByOwner.clear()
             pendingByGroup.clear()
+            groupLedger.usage.clear()
+            ownerLedgers.clear()
         }
         // 後続の処理（anyOf など）はロックの外で動かす
         val failure = closedException(null)
@@ -406,6 +600,21 @@ internal class ProgramCache(
 
     /** 組 [group] の数に入っている、読み込み中・待ち行列にある読み込みの数（テスト用。#738） */
     fun pendingOfGroup(group: FairShareGroup): Int = synchronized(lock) { pendingByGroup[group] ?: 0 }
+
+    /**
+     * 組 [group] の持ち主 [owner] の借り（ナノ秒。読み込み中のものの経過時間と、待ち行列に入るときに減らす分は入れない。
+     * テスト用。#750）
+     */
+    fun debtOf(owner: Long, group: FairShareGroup = FairShareGroup.NONE): Long = synchronized(lock) {
+        val ledger = ownerLedgers[group] ?: return 0
+        ledger.usage[owner]?.let { lagOf(ledger, it) } ?: 0
+    }
+
+    /** 組 [group] の借り（ナノ秒。テスト用。#750） */
+    fun debtOfGroup(group: FairShareGroup): Long = synchronized(lock) { groupLedger.usage[group]?.let { lagOf(groupLedger, it) } ?: 0 }
+
+    /** 使った時間を覚えている持ち主と組の数（テスト用。#750） */
+    val usageCount: Int get() = synchronized(lock) { groupLedger.usage.size + ownerLedgers.values.sumOf { it.usage.size } }
 
     /** 数を記録している組の数（テスト用。#738。0 になった組は消える） */
     val pendingGroupCount: Int get() = synchronized(lock) { pendingByGroup.size }
@@ -451,6 +660,21 @@ internal class ProgramCache(
 
         /** 覚えておく失敗の数の上限（仮: 256。#363） */
         const val DEFAULT_MAX_FAILURES: Int = 256
+
+        /**
+         * 借りが待っているものの最小よりこれだけ多い組・持ち主を後に回す（仮: 2 秒。挿入後の lua.wasm の最初の読み込み 0.3〜0.9 秒より
+         * 十分大きくし、普通の読み込みでは件数の巡回と同じ順にする。確定は #251。#750）
+         */
+        const val DEFAULT_DEBT_THRESHOLD_NANOS: Long = 2_000_000_000L
+
+        /**
+         * 待ち行列に何もない組・持ち主の借りが減る速さ（仮: 経過時間の 1/8。8 秒の読み込みの後、64 秒頼まずにいれば借りが、
+         * 128 秒で前の読み込みの時間の見込みも消える。確定は #251。#750）
+         */
+        const val DEFAULT_IDLE_DECAY_DIVISOR: Long = 8
+
+        /** 減りきった借りを消す間隔（借りを付けた回数） */
+        private const val USAGE_SWEEP_INTERVAL: Int = 64
 
         /** 仕事のないコンパイル用のスレッドが終わるまでの時間 */
         private const val COMPILER_IDLE_SECONDS: Long = 30
