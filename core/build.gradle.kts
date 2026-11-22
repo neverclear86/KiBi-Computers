@@ -61,6 +61,18 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // 失敗の本文（assert の説明。StackExhaustionLockTest の「停止: ...」の様子など）を、コンソールと CI のログに出す（#868。
+    // 既定は例外の型と行番号だけで、本文はテストレポートを開かないと見えない）
+    testLogging {
+        events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+    // 負荷の下で 10 秒を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で始まる行を標準出力に出す）は、
+    // 通った回もコンソールと CI のログに写す（#868。標準出力のすべては写さない）
+    val testLogger = logger
+    addTestOutputListener { descriptor, event ->
+        if (event.message.startsWith("#868 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+    }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
@@ -185,6 +197,11 @@ kibiWasm {
         sources.from("src/test/wasm/poll_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
+    // /dev/device/<address> の fd の種類と isatty を確かめるプログラム（#865）
+    module("dev-device-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/dev_device_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
     // WASI p1 の cwd を PWD から合わせる起動処理（#332）を確かめるプログラム
     module("cwd-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/cwd_wasi.c", "src/main/wasm/common/kibi_cwd.c")
@@ -307,6 +324,11 @@ kibiWasm {
     // wasi-libc が p2 の wasi:filesystem（preopen・descriptor）を直接呼ぶ形で、パスの操作を確かめる（path_wasi.c はアダプター経由の p1 と同じソース）
     wasiSdkModule("path-wasi-p2") {
         sources.from("src/test/wasm/path_wasi.c")
+        compilerArgs.addAll("-O2", "-s")
+    }
+    // /dev/device/<address> の fd の isatty を、wasi-libc が p2 の wasi:filesystem を直接呼ぶ形で確かめる（#865。dev_device_wasi.c は p1 と同じソース）
+    wasiSdkModule("dev-device-wasi-p2") {
+        sources.from("src/test/wasm/dev_device_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
     // args・environ・時計・乱数・sched_yield を、wasi-libc が wasi:cli・wasi:clocks・wasi:random を直接呼ぶ形で確かめる

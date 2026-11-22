@@ -14,6 +14,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
 import pro.ikili.kibicomputers.core.kernel.process.ProcessObject
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
+import pro.ikili.kibicomputers.core.kernel.vfs.FileType
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.Vfs
@@ -333,4 +334,21 @@ internal object FdIo {
         if (obj.reading != reading) return null
         return checkNotNull(kernel.objects[obj.streamId] as? ByteStream) { "パイプの端 ${obj.id} の中身 ${obj.streamId} がない" }
     }
+}
+
+/**
+ * fd が指すカーネルオブジェクトの種類（p1 の `fd_fdstat_get`・`fd_filestat_get`、p2 の `descriptor.get-type`・`descriptor.stat` で共通。
+ * p3 もこれを使う）。
+ *
+ * - [OpenFile] は VFS の種類（`/dev/null` などは `CHARACTER_DEVICE`）
+ * - [Tty] は端末なので `CHARACTER_DEVICE`
+ * - それ以外（`/dev/device/<address>` の [DeviceHandle]、パイプなど）は `UNKNOWN`
+ *
+ * パスの stat（`/dev/device/<address>` は `CHARACTER_DEVICE`）とは違う。`CHARACTER_DEVICE` を返す fd は
+ * [Tty] とファイルだけにする（ADR 0054「fd とパスで種類が違う」、#865）。型を見るだけなので、ロックは要らない。
+ */
+internal fun descriptorFileType(obj: KernelObject?): FileType = when (obj) {
+    is OpenFile -> obj.type
+    is Tty -> FileType.CHARACTER_DEVICE
+    else -> FileType.UNKNOWN
 }

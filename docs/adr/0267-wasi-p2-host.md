@@ -73,6 +73,13 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 - `get-arguments` は argv[0] を含む引数そのまま（p1 と同じ）。`get-environment` は環境変数から `PWD` を除いたもの、`initial-cwd` は開始時の cwd（ADR 0332 で p1 は `PWD` で渡すが、p2 には専用の関数がある）。親が `PWD` を環境変数に入れて起動しても、ゲストには見せない（古い値が `initial-cwd` とずれないように）。アダプターで包んだ p1 のプログラムは `PWD` を受け取らないので、`kibi_cwd.c` による cwd の同期は働かない（p2 のコマンドは `initial-cwd` で cwd を知る）。
   - 追記（#760）: `PWD` を除く規則をやめ、`get-environment` に `PWD=<initial-cwd>` を入れる。規則は p1 の `WasiP1Basic.p1Environment` と同じ（親が渡した `PWD` は同じ位置で値を置き換え、なければ最後に足す。`Process.env` は変えず、`PWD` の分は環境変数の大きさの上限に数えない）。値は起動時に固定した `initial-cwd`（`HostResourceTable.initialCwd`）で、`kibi:process` の `set-cwd` の後も変わらない。理由: wasmtime のアダプターは `initial-cwd` を import せず、wasi-libc と Rust の std も `initial-cwd` を読まないので、`PWD` で渡さないとアダプターで包んだ p1 のプログラムが cwd を知る方法がない。値を固定するので `initial-cwd` とずれず、アダプターが `environ_sizes_get` と `environ_get` で `get-environment` を 2 回呼んでも大きさと中身が合う。これで、包んだ p1 のプログラムでも `kibi_cwd.c` の同期が働く。
 
+#### descriptor の種類（#865）
+
+- `descriptor.get-type` と `descriptor.stat` の `type` は、fd の規則（`kernel/fd` の `descriptorFileType`。p1 の `fd_fdstat_get`・`fd_filestat_get` と同じ関数）で決める: ファイル（`OpenFile`。`/dev/null` などを含む）は VFS の種類、`Tty`（`/dev/tty`）は `character-device`、`/dev/device/<address>` の `DeviceHandle` とそれ以外は `unknown`（ADR 0054「fd とパスで種類が違う」）
+- パスで見る `stat-at` と `read-directory` の項目は VFS の種類のまま（`/dev/device/<address>` は `character-device`。`ls -l` 向け）
+- 理由: p1 とそろえる。wasmtime のアダプターの `fd_fdstat_get` は filetype を `get-type` から写すので、`character-device` を返していたときは、同じ p1 のプログラムが p1 のままなら `UNKNOWN`、アダプターで包むと `CHARACTER_DEVICE` に見えていた。なお、wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 の `isatty` はこの変更の前から偽だった
+- p3（#268）も同じ関数を使う
+
 #### エラーの写し方
 
 カーネルの `Errno` を `wasi:filesystem/types` の `error-code` に写す（`WasiP2Errors.TABLE`）。主な対応: `NOTCAPABLE`・`PERM` → `not-permitted`、`NOSYS`・`NOTSUP`・`NOEXEC` → `unsupported`、`MFILE`・`NFILE`・`NOMEM` → `insufficient-memory`、表にないもの → `io`。stream の `last-operation-failed` の `error` は errno を持ち、`to-debug-string` と `filesystem-error-code` で読める。パイプの相手が閉じた（`PIPE`）・EOF は `closed`。
