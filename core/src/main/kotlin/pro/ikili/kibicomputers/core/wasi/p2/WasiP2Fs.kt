@@ -177,11 +177,7 @@ internal object WasiP2Fs {
                 ctx.vfs.createDirectory(target.path)
                 null
             },
-            "[method]descriptor.stat" to fs { ctx, a ->
-                val e = P2.entry<DescriptorEntry>(ctx, a[0])
-                val obj = ctx.withKernelLock { ctx.kernel.objects[e.objectId] }
-                statValue(if (obj is OpenFile) ctx.vfs.stat(obj) else FileStat(0, descriptorFileType(obj)))
-            },
+            "[method]descriptor.stat" to fs { ctx, a -> statValue(descriptorStat(ctx, a[0])) },
             "[method]descriptor.stat-at" to fs { ctx, a ->
                 val target = resolve(ctx, a[0], a[2])
                 val st = ctx.vfs.stat(target.path)
@@ -234,6 +230,7 @@ internal object WasiP2Fs {
                 ctx.vfs.removeFile(target.path)
                 null
             },
+            // 真なら metadata-hash も等しい（同じオブジェクトか、同じ (node, device) の OpenFile。ファイル以外はいつも (0, 0)）
             "[method]descriptor.is-same-object" to body { ctx, a ->
                 val x = P2.entry<DescriptorEntry>(ctx, a[0])
                 val y = P2.entry<DescriptorEntry>(ctx, a[1])
@@ -251,7 +248,8 @@ internal object WasiP2Fs {
                 }
                 CanonValue.Bool(same)
             },
-            "[method]descriptor.metadata-hash" to fs { ctx, a -> hash(ctx.vfs.stat(openFile(ctx, a[0]))) },
+            // ファイル以外の fd は stat と同じく node・device が 0 なので (0, 0)（p1 の fd_filestat_get の ino・dev と同じ。#885）
+            "[method]descriptor.metadata-hash" to fs { ctx, a -> hash(descriptorStat(ctx, a[0])) },
             "[method]descriptor.metadata-hash-at" to fs { ctx, a ->
                 val target = resolve(ctx, a[0], a[2])
                 hash(ctx.vfs.stat(target.path))
@@ -279,6 +277,19 @@ internal object WasiP2Fs {
         )
         val preopens = mapOf("get-directories" to body { ctx, _ -> CanonValue.Items(preopens(ctx)) })
         return mapOf(TYPES to types, PREOPENS to preopens)
+    }
+
+    /**
+     * descriptor [self] の stat（`descriptor.stat` と `descriptor.metadata-hash` が使う）。
+     *
+     * [OpenFile] は VFS の値、ファイル以外（`/dev/tty` の `Tty`、`/dev/device/<address>` の `DeviceHandle` など）は
+     * p1 の `fd_filestat_get` と同じく、種類だけを持つ全部 0 の値（#865・#885）。オブジェクトはカーネルロックの中で引き、
+     * VFS の I/O はロックの外で呼ぶ。
+     */
+    private fun descriptorStat(ctx: ProcessContext, self: CanonValue): FileStat {
+        val e = P2.entry<DescriptorEntry>(ctx, self)
+        val obj = ctx.withKernelLock { ctx.kernel.objects[e.objectId] }
+        return if (obj is OpenFile) ctx.vfs.stat(obj) else FileStat(0, descriptorFileType(obj))
     }
 
     /** descriptor [self] が指す [OpenFile]（差し替えた `/dev` のものは `bad-descriptor`） */

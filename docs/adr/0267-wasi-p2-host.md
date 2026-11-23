@@ -80,6 +80,16 @@ WIT の `@unstable` のうち、出すのは `wasi:cli/exit` の `exit-with-code
 - 理由: p1 とそろえる。wasmtime のアダプターの `fd_fdstat_get` は filetype を `get-type` から写すので、`character-device` を返していたときは、同じ p1 のプログラムが p1 のままなら `UNKNOWN`、アダプターで包むと `CHARACTER_DEVICE` に見えていた。なお、wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 の `isatty` はこの変更の前から偽だった
 - p3（#268）も同じ関数を使う
 
+#### ファイル以外の descriptor の metadata-hash（#885）
+
+- `descriptor.metadata-hash` は `descriptor.stat` と同じ値（`WasiP2Fs.descriptorStat`）から作る（`lower` = node、`upper` = device。ファイルは今までどおり）。ファイル以外の fd（`Tty`・`DeviceHandle` など）は stat の node・device が 0 なので、hash は `(0, 0)` になる。`openFile` を通さないので `bad-descriptor` にはならない
+- 理由: p1 にそろえる。p1 の `fd_filestat_get` は、ファイル以外の fd で `ino=0`・`dev=0` の filestat を返す。wasi-libc の p2 の `fstat` と wasmtime のアダプターの `fd_filestat_get` は先に `metadata-hash` を呼ぶので、`bad-descriptor` を返していたときは、ネイティブの p2 もアダプターで包んだ p1 も、device・`/dev/tty` の fd の `fstat` が EBADF で失敗していた。`(0, 0)` なら、ネイティブの p2 の `st_ino`・`st_dev`（`lower`・`upper` から取る）と、アダプターの `ino`（`lower` から取る。`dev` はアダプターがいつも 1 にする）が p1 と同じになる
+- `is-same-object` との関係: 真なら hash が等しい（同じカーネルのオブジェクトか、同じ `(node, device)` の `OpenFile`。`/dev/tty` を何度開いても同じ `Tty` なので真で、hash も等しい）。逆（hash が等しいなら同じもの）は WIT も求めていない
+- 既知の衝突: `(0, 0)` は、device の fd どうし、device の fd と `/dev/tty`、マウントの祖先のディレクトリ（ADR 0051。node 0・device 0）の間で重なる。p1 の `ino`・`dev` でも同じものが重なるので、新しい食い違いではない
+- 作らない hash: カーネルのオブジェクトの ID から作ると、閉じると使い回され、保存と復元をまたぐと変わり、p1 ともずれる。`/dev` の node を p2 の層で計算すると「ABI 層は `/dev` を知らない」（ADR 0054）に反する
+- パスで引く `metadata-hash-at` は VFS の値のまま（`/dev/device/<address>` は `/dev` の node とマウントの ID）。fd とパスで違うのは、種類と同じく ADR 0054「fd とパスで種類が違う」の扱い
+- 状態は足さない（定数を返すだけ）ので、1,000 台規模の負荷と保存形式には響かない
+
 #### エラーの写し方
 
 カーネルの `Errno` を `wasi:filesystem/types` の `error-code` に写す（`WasiP2Errors.TABLE`）。主な対応: `NOTCAPABLE`・`PERM` → `not-permitted`、`NOSYS`・`NOTSUP`・`NOEXEC` → `unsupported`、`MFILE`・`NFILE`・`NOMEM` → `insufficient-memory`、表にないもの → `io`。stream の `last-operation-failed` の `error` は errno を持ち、`to-debug-string` と `filesystem-error-code` で読める。パイプの相手が閉じた（`PIPE`）・EOF は `closed`。
