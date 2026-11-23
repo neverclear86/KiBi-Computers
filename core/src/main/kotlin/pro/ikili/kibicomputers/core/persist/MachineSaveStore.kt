@@ -343,8 +343,9 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     private var sideReaderThread: Thread? = null
 
-    /** 列の外の読み手が `owner.bin` を読む口（テストが、読みの途中で止めるために差し替える。#877） */
-    internal var sideOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
+    /** 列の外の読み手が `owner.bin` を読む口（テストが、読みの途中で止めるために差し替える。GameTest も使う。#877） */
+    @Volatile
+    public var sideOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
 
     /** claim のために、列の外の読み手に `owner.bin` の読みを頼んだ回数（数え口。#877） */
     public var sideOwnerReadRequests: Long = 0
