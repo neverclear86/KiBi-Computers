@@ -2515,6 +2515,19 @@ internal class LoadRun(
                 // 予算が効いても、巡回するので呼ぶ台はみな前に進む（0 の台があれば、先頭に居座る台がいる）
                 val stats = endHostCalls ?: fail("the host call counters were not read in the $p phase")
                 if (stats.minCallerCalls <= 0) fail("every host caller should run host calls while measured: $stats")
+                // 予算が効いたか・切れていたかを数え口で確かめる。2つの段階が同じ数字のまま「予算あり／なしの比べ」として出ないように。
+                // 需要（台数 × 同時に積む数 × 1件の重さ）が予算に届かない指定や、差し替え（mainThreadBudgetOverrideNanos）が効かない退行で落ちる
+                val demandMicros = settings.hostCallers.toLong() * settings.hostCallParallel * settings.hostCallMicros
+                if (p == LoadPhase.HOST_CALLS && stats.cutTicks <= 0) {
+                    fail(
+                        "the main thread budget (${stats.budgetNanos / 1000} us) should cut some ticks in the $p phase, but none was cut: " +
+                            "raise the demand (${settings.hostCallers} callers x ${settings.hostCallParallel} x ${settings.hostCallMicros} us = " +
+                            "$demandMicros us per tick) above the budget: $stats",
+                    )
+                }
+                if (p == LoadPhase.HOST_CALLS_UNBUDGETED && stats.cutTicks != 0L) {
+                    fail("no tick should be cut while the budget is lifted in the $p phase, but ${stats.cutTicks} were: $stats")
+                }
             }
             LoadPhase.UNLOAD -> unloadResult!!.let { verifyCounted(p, it.cost, handedToWriter = it.captures, exact = true) }
             // 測るだけで落とさない。ただし、気づくべきことは WARN にする（#582）
