@@ -62,22 +62,40 @@ function withGradlePending(schema) {
 }
 
 // gradleStillRunning=false と申告しながら、理由の文が「Gradle がまだ終わっていない」を示す回を拾う（#904。PR #889 の実例:
-// 「やり直しは返す時点で :core:test を実行中で、終了コードを読めていない」「スキーマに『未完了』がないため needs_human で返す」）。
-// 本物の失敗まで拾わないよう、失敗の理由として読む文（マージの build の失敗、取り込みの build_failed、push しなかった修正）にだけ当て、
-// さらに Gradle が終わったあとの失敗の証拠（GameTest のロックの待ちの上限、タイムアウト、サーバーが落ちた、など）を含む文は外す
-const GRADLE_UNFINISHED_TEXT = /終了コードを(まだ)?(読めて|読んで|確かめられて|確かめて|確認できて|確認して)いない|\.exit\s*(が|は)?(まだ)?(ない|できていない|書かれていない)|(gradle|ビルド|build|GameTest|テスト|test|:[\w.-]+:\w+)[^。\n]{0,30}?(を|が|は)?(まだ)?(実行中|動いている|走っている|終わっていない|終わる前)|スキーマに「?未完了|still running|not (yet )?finished/i
+// 「最初の ./gradlew build は、maven.neoforged.net の名前解決の失敗…で落ちたので、同じ内容でやり直した（merge-build-2）。
+// やり直しは返す時点で :core:test を実行中で、終了コードを読めていない。…build が落ちたわけではないが、スキーマに「未完了」がないため needs_human で返す」）。
+// 本物の失敗まで拾わないよう、失敗の理由として読む文（マージの build の失敗、取り込みの build_failed、push しなかった修正）にだけ当てる。
+// 依存の取得の失敗を 1 回回し直す決まりがあるので、未完了の回の理由の文には、ふつう 1 回目の失敗（落ちた、Could not HEAD など）も書かれる。
+// そのため、失敗の証拠が文のどこかにあるだけでは外さず、手がかりの強さで 2 つに分ける:
+// - 強い手がかり（GRADLE_UNFINISHED_STRONG）: 終了コードを読めていない、.exit がない、スキーマに「未完了」がない。Gradle が終わって失敗したなら
+//   終了コードは読めているので、失敗の証拠があっても未完了と見る
+// - 弱い手がかり（GRADLE_UNFINISHED_WEAK）: 「<タスク> が実行中」「終わる前」など。本物の失敗の説明にも出るので、同じ一文（。・改行で区切る）に
+//   失敗の証拠（GRADLE_FAILURE_EVIDENCE）がなく、文の全体に GameTest のロックの待ちの上限の証拠（GRADLE_LOCK_LIMIT_EVIDENCE）もないときだけ拾う
+const GRADLE_UNFINISHED_STRONG = /終了コードを(まだ)?(読めて|読んで|確かめられて|確かめて|確認できて|確認して)いない|\.exit\s*(が|は)?(まだ)?(ない|できていない|書かれていない)|スキーマに「?未完了/i
+const GRADLE_UNFINISHED_WEAK = /(gradle|ビルド|build|GameTest|テスト|test|:[\w.-]+:\w+)[^。\n]{0,30}?(を|が|は)?(まだ)?(実行中|動いている|走っている|終わっていない|終わる前)|still running|not (yet )?finished/i
 
-// Gradle が終わったあとの本物の失敗の証拠。理由の文にこれがあれば、「実行中」「終わる前」などを含んでいても未完了とは見ない
-// （例: GameTest のロックの待ちの上限に達した理由に「Held by: ...runGameTestServer in .worktrees/issue-900 が実行中のまま」と添えた回、
-// 「GameTest が時間内に終わっていない（タイムアウト）」、「testFoo が終わる前にサーバーが落ちた」）
+// Gradle が終わったあとの本物の失敗の証拠。同じ一文にこれがあれば、弱い手がかりは未完了とは見ない
+// （例: 「GameTest が時間内に終わっていない（タイムアウト）」、「testFoo が終わる前にサーバーが落ちた」、
+// 「Held by: ...runGameTestServer in .worktrees/issue-900 が実行中のまま」）
 const GRADLE_FAILURE_EVIDENCE = /Held by|Waiting for the GameTest lock|ロック|上限|タイムアウト|time[ds]? ?out|落ち(た|て)|クラッシュ|crash|required tests failed|BUILD FAILED|FAILED\b|Could not (GET|HEAD|resolve|find)|UnknownHost/i
+// GameTest のロックの待ちの上限に達した証拠。これが文のどこかにあれば、弱い手がかりは見ない（「上限に達した。runGameTestServer が実行中のままだった」のように、
+// ほかの worktree のタスクが実行中だと別の一文で添えた回）。依存の取得の失敗（1 回目の失敗の記述）は当たらないよう、ロックに限る
+const GRADLE_LOCK_LIMIT_EVIDENCE = /Held by|Waiting for the GameTest lock|ロックの待ち|ロックを待/i
+
+// 理由の文が、Gradle がまだ終わっていないことを示すか（#904）
+function textSaysGradleUnfinished(text) {
+  if (!text) return false
+  if (GRADLE_UNFINISHED_STRONG.test(text)) return true
+  if (GRADLE_LOCK_LIMIT_EVIDENCE.test(text)) return false
+  return text.split(/[。\n]/).some(s => GRADLE_UNFINISHED_WEAK.test(s) && !GRADLE_FAILURE_EVIDENCE.test(s))
+}
 
 // 返り値が「Gradle を待たずに返した」か。textEligible のときだけ text も見る。当たらなければ null
 function gradlePending(r, text, textEligible) {
   if (!r) return null
   const logs = Array.isArray(r.runningLogs) ? r.runningLogs : []
   if (r.gradleStillRunning === true) return { by: 'flag', logs, text: text ?? '' }
-  if (textEligible && text && !GRADLE_FAILURE_EVIDENCE.test(text) && GRADLE_UNFINISHED_TEXT.test(text)) return { by: 'text', logs, text }
+  if (textEligible && textSaysGradleUnfinished(text)) return { by: 'text', logs, text }
   return null
 }
 

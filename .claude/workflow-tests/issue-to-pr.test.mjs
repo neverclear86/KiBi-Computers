@@ -60,16 +60,29 @@ test('既定の流れはマージまで進み、やり直しは呼ばれない',
   assert.equal(r.count('merge-wait'), 0)
 })
 
-test('#889 の文（申告は false、failedStep=build）で返ったマージは、待つやり直しで進む', async () => {
-  const r = await run({
-    merge: [fail('build', 'やり直しは返す時点で :core:test を実行中で、終了コードを読めていない。スキーマに未完了がないため needs_human で返す')],
-    'merge-wait': [MERGED],
-  })
+// PR #889 のマージの段階が実際に返した理由の文（切らずにそのまま）。1 回目の失敗の記述（「落ちたので」「落ちたわけではないが」）を含む
+const PR889_REASON = 'マージは行っていない。main の取り込みは衝突なしで済んだ（コミット 65c5fb52。まだ push していない）。最初の `./gradlew build` は、maven.neoforged.net の名前解決の失敗（一時的なネットワークの不調）で落ちたので、同じ内容でやり直した（merge-build-2）。やり直しは返す時点で :core:test を実行中で、終了コードを読めていない。GameTest・CI・マージの段階には進んでいない。build が落ちたわけではないが、スキーマに「未完了」がないため needs_human で返す。この段階を最初からやり直してほしい。'
+
+test('#889 の実際の文（申告は false、failedStep=build）で返ったマージは、待つやり直しで進む', async () => {
+  const r = await run({ merge: [fail('build', PR889_REASON)], 'merge-wait': [MERGED] })
   assert.equal(r.issue.status, 'merged')
   assert.equal(r.count('merge'), 1)
   assert.equal(r.count('merge-wait'), 1)
   assert.ok(r.logs.some(l => l.includes('決まりに反した申告')))
 })
+
+// ネットワークの失敗を回し直し、その回し直しを待たずに返した回は、理由の文に 1 回目の失敗の記述が入る。それでも未完了と見る
+for (const [name, text] of [
+  ['強い手がかり（終了コード）と、1 回目の Could not HEAD', '1 回目は Could not HEAD https://maven.neoforged.net/... で落ちた。回し直しの build-2 は終了コードを確かめていない'],
+  ['強い手がかり（.exit がない）と、1 回目の UnknownHost', '1 回目は UnknownHostException で落ちたので回し直した。build-2 の .exit がまだない'],
+  ['弱い手がかりだけで、1 回目の失敗は別の一文', '1 回目は Read timed out で落ちた。回し直しの :core:test がまだ実行中'],
+]) {
+  test(`回し直しを待たずに返した文は、1 回目の失敗の記述があっても待つやり直しをする: ${name}`, async () => {
+    const r = await run({ merge: [fail('build', text)], 'merge-wait': [MERGED] })
+    assert.equal(r.issue.status, 'merged')
+    assert.equal(r.count('merge-wait'), 1)
+  })
+}
 
 test('申告 true で返ったマージは、待つやり直しで進む', async () => {
   const r = await run({ merge: [fail('build', 'build 実行中', PENDING)], 'merge-wait': [MERGED] })
@@ -101,6 +114,8 @@ for (const [name, step, text, extra] of [
   ['GameTest のテストの失敗（文は「実行中」を含む）', 'gametest', 'GameTest が実行中に 2 件失敗した（required tests failed）', { gameTestFailedOnly: true }],
   ['failedStep=ci の「実行中」', 'ci', 'CI が実行中のまま 30 分たった', {}],
   ['コンパイルの失敗', 'build', ':core:compileKotlin が失敗した（型の不一致）', {}],
+  ['ロックの待ちの上限と、別の一文の「実行中」', 'build', 'GameTest のロックの待ちの上限に達した。Held by: runGameTestServer in .worktrees/issue-900。そのタスクはまだ実行中だった', {}],
+  ['ネットワークの失敗が 2 回続いた', 'build', '依存の取得の失敗（ネットワーク）が 2 回続いた。2 回目も Could not HEAD で落ちた', {}],
 ]) {
   test(`本物の失敗は待つやり直しをしない: ${name}`, async () => {
     const r = await run({ merge: [fail(step, text, extra)] })
