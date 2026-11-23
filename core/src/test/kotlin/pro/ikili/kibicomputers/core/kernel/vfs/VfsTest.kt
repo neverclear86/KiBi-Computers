@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 
 class VfsTest {
     private fun p(text: String) = VfsPath.parse(text)
@@ -269,5 +270,27 @@ class VfsTest {
         val buf = ByteArray(4)
         assertEquals(4, restored.read(f, buf, 0, 4))
         assertEquals("kept", String(buf))
+    }
+
+    /** 根の `stat` で決まったものを投げるマウント（[failure] を投げるまでは、ふつうのメモリの FS） */
+    private class FailingRootStat(var failure: Throwable? = null, private val inner: TestMemoryFileSystem = TestMemoryFileSystem()) :
+        FileSystem by inner {
+        override fun stat(path: VfsPath): FileStat {
+            failure?.let { if (path == VfsPath.ROOT) throw it }
+            return inner.stat(path)
+        }
+    }
+
+    @Test
+    fun `一覧でマウントの根が読めなければnodeは0、Errorは伝える`() {
+        val (vfs, _) = vfsWithRoot()
+        val disk = FailingRootStat()
+        vfs.mount(p("/disk"), disk, readOnly = false, source = "disk:1")
+        val root = vfs.open(VfsPath.ROOT, OpenOptions())
+        disk.failure = FsException(Errno.IO)
+        assertEquals(listOf(DirEntry("disk", FileType.DIRECTORY, 0)), vfs.readDirectory(root))
+        // ディスクの入口の確かめ（StackHeadroom.ensure）の StackOverflowError は飲まない（プロセスだけが終わる。#858）
+        disk.failure = StackOverflowError("headroom")
+        assertThrows<StackOverflowError> { vfs.readDirectory(root) }
     }
 }

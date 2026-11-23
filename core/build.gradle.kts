@@ -98,7 +98,12 @@ tasks.test {
 // - stackHeadroomXintTest: 全部インタプリタ（比べるため）
 // - stackHeadroomJdk21Test: JDK 21（1.21.1 の本番の JDK。JDK 19 で ReentrantLock の中身（AQS）が書き直された）
 if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
-    val headroomTests = listOf("StackExhaustionLockTest", "ComponentStackExhaustionLockTest", "P1StackExhaustionLockTest")
+    val headroomTests = listOf(
+        "StackExhaustionLockTest",
+        "ComponentStackExhaustionLockTest",
+        "P1StackExhaustionLockTest",
+        "P1DiskCloseStackExhaustionTest",
+    )
     fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
         group = "verification"
         description = "StackHeadroom の確かめを、JDK $java・$args で回す（#858）"

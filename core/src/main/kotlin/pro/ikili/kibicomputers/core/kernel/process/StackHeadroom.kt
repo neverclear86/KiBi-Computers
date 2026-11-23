@@ -46,7 +46,7 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 足りなかったときに残ったものは、浅いところの安全網（`ProcessRunner.recoverLeaks`）が見つけて戻す。
  *
  * 道ごとの確かめ（#858）: 次の道も、本体を置いたテストで、尽きる位置をずらして確かめた。毎回、尽きた位置（SOE のスタックトレース。
- * テストの `SoePositions`）を区画に分けて数え、(1) ロックを取る・放す途中（AQS・`Unsafe` の CAS を含む。一番上でなく、ロックの機構を飛ばした呼び手で見る）で
+ * テストの `SoePositions`。区画の分け方は `SoePositionsTest` が確かめる）を区画に分けて数え、(1) ロックを取る・放す途中（AQS・`Unsafe` の CAS を含む。一番上でなく、ロックの機構を飛ばした呼び手で見る）で
  * 尽きていないこと、(2) 毎回の後の状態（マシンのロック・リースのロック・表示デバイスのロック・CPU・許可・コンソールの出力の予約）が戻ること、を確かめる。
  * 本体（VFS・端末・NIO）の中で尽きた位置は、確かめを通った後に起きるふつうの位置なので数えるだけで、安全かは (2) で見る
  * - ディスクの VFS（`DiskFileSystem`。道の解決はカーネルロックの中、I/O はロックの外でリースのロックを取る）: ロックの面だけでは足りない。
@@ -64,6 +64,11 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     `release` の確かめで投げると知らせが捨てられるので、取り出す前に [DEFERRED_RELEASE_FRAMES] 段を投げずに確かめ（[hasHeadroom]）、
  *     足りなければ取り出さずに返す（`drainDeferred` は、ファイルシステムに届く操作からゲストのスレッドの深さでも走る）。
  *     同じテストの、fd の表から閉じる知らせの回が、知らせが行われたか列に残ったかのどちらかになることを見る。
+ *     「深いスレッドが積んだ知らせを、起動用のスレッドが行う」道（`Machine.scheduleVfsDrain`）は、`P1DiskCloseStackExhaustionTest` が、
+ *     本物の WASI p1 の `path_open`・`fd_close` をスタックの底に近いところで繰り返して、Machine ごと通す（毎回の後に、知らせが残らず、
+ *     開いたままの枠が 0 に戻り、ディスクの状態がホストと合うこと）。
+ *     入口の確かめの `StackOverflowError` は、呼び手が飲まずに伝える（`Vfs.readDirectory` がマウントの根の `stat` の失敗を node 0 に
+ *     するのは `Exception` だけで、`Error` は伝える）。
  *     `/tmp`（`TmpFileSystem`）の木の「外す → 付け替える」は、まだ確かめていない（#902）
  *   - `StackExhaustionLockTest` の `DISK_IO`: プロセスの中から、回ごとに 1 種類の操作（深いディレクトリの `stat`・別のディスクの `stat`・
  *     `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`）を、スタックの底に近いところのホストの関数で動かす

@@ -414,7 +414,13 @@ internal class Vfs(
             val node = v.table.at(child)?.let { m ->
                 v.fileSystems[m.id]?.let { fs ->
                     checkUnlocked()
-                    runCatching { fs.stat(VfsPath.ROOT).node }.getOrNull()
+                    // 読めないマウント（外れかけのディスクなど）は node を 0 にする。ただし Error（入口の StackHeadroom.ensure の
+                    // StackOverflowError など）は飲まずに伝える（プロセスだけが call stack exhausted で終わる。#858）
+                    try {
+                        fs.stat(VfsPath.ROOT).node
+                    } catch (e: Exception) {
+                        null
+                    }
                 }
             }
             byName[name] = DirEntry(name, FileType.DIRECTORY, node ?: 0)

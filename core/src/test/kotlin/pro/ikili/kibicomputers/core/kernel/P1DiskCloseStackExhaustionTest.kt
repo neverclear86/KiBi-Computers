@@ -141,9 +141,12 @@ class P1DiskCloseStackExhaustionTest {
                         opens += round.opens.get()
                         closes += round.closes.get()
                         // 起動用のスレッドが、積んだ知らせを行う（深いスレッドが残した分、プロセスの終わりが残った fd を閉じた分を含む）。
-                        // 知らせが列に残り続ける、または枠が返らないなら、深いところで取り出して捨てたか、頼みが落ちている
-                        eventuallyDescribe(
-                            describe = { "閉じる知らせが残った、または枠が返らない（$where）: 知らせ ${m.vfs.hasDeferred}、開いたままの枠 ${fs.openHandles}" },
+                        // 知らせが列に残り続ける、または枠が返らないなら、深いところで取り出して捨てたか、頼みが落ちている。
+                        // どちらもテストのスレッドの外で進むので、固定の待ちでなく、遅れと停止を見分ける待ちを通す
+                        awaitOrClassify(
+                            ticker,
+                            "閉じる知らせが行われ、枠が返る（$where）",
+                            { "知らせ ${m.vfs.hasDeferred}、開いたままの枠 ${fs.openHandles}、${describe()}" },
                         ) { !m.vfs.hasDeferred && fs.openHandles == 0 }
                         assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$where）: ${m.lock}")
                         m.lock.unlock()
@@ -162,7 +165,7 @@ class P1DiskCloseStackExhaustionTest {
                     awaitOrClassify(ticker, "マシンが止まる", stopping) { m.state == MachineState.STOPPED }
                     awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
                     awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
-                    eventuallyDescribe(describe = { "マシンのロックが放されない: ${m.lock}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
+                    awaitOrClassify(ticker, "マシンのロックが放される", { "${m.lock}、${stopping()}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
                 }
             }
         } finally {

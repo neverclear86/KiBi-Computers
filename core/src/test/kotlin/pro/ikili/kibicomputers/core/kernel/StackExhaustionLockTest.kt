@@ -169,7 +169,7 @@ class StackExhaustionLockTest {
     private class Round(val rig: Rig, val index: Int, val diskOp: DiskOp? = null) {
         val context = AtomicReference<ProcessContext>()
 
-        /** ホストの関数の本体を呼んだ回数 */
+        /** ホストの関数の本体を呼んだ回数（どの [Body] も数える） */
         val calls = AtomicInteger()
 
         /** [Body.DISK_IO] で、ディスクの本物の操作まで動かした回数（スタックの底に近いときだけ動かす。[nearStackEnd]） */
@@ -198,6 +198,8 @@ class StackExhaustionLockTest {
     private val payload = "\u001b[31mstack\u001b[0m headroom #858 \u001b[2K\r\n".toByteArray()
 
     private fun runBody(ctx: ProcessContext, body: Body, round: Round) {
+        // どの本体も数える（終わりの集計の「本体を呼んだ回数」が、本体が動いた回で 0 にならないように）
+        round.calls.incrementAndGet()
         when (body) {
             Body.EMPTY -> Unit
             Body.AWAIT_HOST -> ctx.awaitHost(CompletableFuture.completedFuture(Unit))
@@ -210,7 +212,6 @@ class StackExhaustionLockTest {
             Body.DISK_IO -> {
                 val disk = round.rig.disk!!
                 val n = round.index
-                round.calls.incrementAndGet()
                 // 本番の path_open・path_rename と同じく、ロックの中は fd・パスの解決だけ（WasiP1Path）
                 ctx.withKernelLock { ctx.kernel.processes[ctx.pid] }
                 // 浅いところは、ホストの関数の呼び出しだけ（本物の操作は、スタックの底に近いところだけ）
@@ -237,7 +238,6 @@ class StackExhaustionLockTest {
             }
             Body.CONSOLE -> {
                 val tty = round.rig.tty!!
-                round.calls.incrementAndGet()
                 ctx.withKernelLock {
                     tty.write(payload, 0, payload.size, ctx.wakeSink)
                     ctx.reserveConsoleFlushLocked()
@@ -543,9 +543,6 @@ class StackExhaustionLockTest {
         }
         return sb.toString()
     }
-
-    /** [rt] が尽きた位置（SOE の一番上のフレーム） */
-    private fun soeTop(rt: ProcessRuntime): StackTraceElement? = soe(rt)?.stackTrace?.firstOrNull()
 
     /** [rt] が尽きた位置から [n] フレーム */
     private fun soeTop(rt: ProcessRuntime, n: Int): String? = soe(rt)?.stackTrace?.take(n)?.joinToString(" <- ")
