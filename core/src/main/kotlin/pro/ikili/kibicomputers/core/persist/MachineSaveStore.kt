@@ -16,6 +16,7 @@ import java.util.OptionalLong
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -217,6 +218,12 @@ public class MachineSaveStore @JvmOverloads constructor(
     @Volatile
     private var prefetchFinished: Boolean = false
 
+    /**
+     * 先読みのスレッドが終わったら開く門（[awaitOwnerPrefetch]。テストが壁時計の期限なしで終わりを待つため。#878）。
+     * `init` より上に置く（先読みのスレッドは `init` で始まるので、ここより下だと作る前の門に触る。#869）
+     */
+    private val prefetchDoneSignal = CountDownLatch(1)
+
     /** 先読みが読む ID（[startOwnerPrefetch] のときの [knownDirectories]。メインスレッドだけが触る。#869） */
     private var prefetchIds: Set<UUID> = emptySet()
 
@@ -250,6 +257,17 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /** 先読みのスレッドが終わったか（数え口・テスト用） */
     public val ownerPrefetchDone: Boolean get() = prefetchFinished
+
+    /**
+     * 先読みのスレッドが終わるまで待つ（テスト用。#878）。[startOwnerPrefetch]（`prefetchOwners` を含む）で先読みを始め、
+     * その仕事が走った後だけ返る。始めていない置き場や、仕事を走らせない runner では返らない。
+     * メインスレッドや tick からは呼ばない（メインスレッドは先読みを待たない。ADR 0084）。待ち終えた後は、先読みの結果
+     * （[prefetchHits] の元になる表など）がすべて見える
+     */
+    @Throws(InterruptedException::class)
+    internal fun awaitOwnerPrefetch() {
+        prefetchDoneSignal.await()
+    }
 
     /**
      * 開いたときに [root] にあった ID（[knownDirectories] の今の中身）の `owner.bin` を読む仕事を作り、[runner] で走らせる（#585）。
@@ -288,6 +306,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                     // 結果を全部入れてから下ろす（メインスレッドは、下りたのを見てから「先読みでは来ない」とする。[ensureOwnerRead]）
                     prefetchRunning = false
                     prefetchFinished = true
+                    prefetchDoneSignal.countDown()
                 }
                 val millis = (System.nanoTime() - start) / 1_000_000.0
                 LOG.log(System.Logger.Level.INFO, "Prefetched owner.bin of ${ids.size} machines in $root (${"%.1f".format(millis)} ms)")
