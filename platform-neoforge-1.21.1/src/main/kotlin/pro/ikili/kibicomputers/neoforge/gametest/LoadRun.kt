@@ -195,6 +195,10 @@ internal enum class LoadPhase(val label: String) {
  *   [LoadPhase.IDLE] で、`/tmp` に書かせる台が全部、書き終わるまで待つ上限にも使う
  * @property massUnload 最後に [LoadPhase.UNLOAD] を測るか
  * @property massRestore [massUnload] の後に [LoadPhase.RESTORE] を測るか（#582。測定用だけ。CI の試験では動かさない）
+ * @property drainUnloadsAfterWindow [LoadPhase.UNLOAD] の測る区間の終わりに、ケースのあるチャンクがまだ残っていたら、
+ *   測らない tick でアンロードの列（`ChunkMap.unloadQueue`）を流してから、書き込みの終わりを待つか（#872。CI の試験だけ）。
+ *   バニラは tick に時間が残らないと列を流さないので、重いマシンでは測る区間の中で終わらないことがある。測る区間の数字は変わらない。
+ *   測定では流さない（[massRestore] の前提の、アンロードされずに残った台を変えないため）
  * @property quietProgress 試験の間、GameTest のサーバーの進み具合のログを止めるか（#600）
  * @property devicesEvery この台数に1台の割合で、ケースの北隣に他 MOD 役のデバイス（樽。#153）を置く（`-PloadTestDevices`。0 なら置かない）
  * @property productionAutosave 自動保存の段階を本番の形で測るか（`-PloadTestProductionAutosave`。#834）。周期を止めずに、数え口を合わせて
@@ -224,6 +228,7 @@ internal data class LoadSettings(
     val outputTimeoutTicks: Int = if (paced) 6_000 else 10_000,
     val massUnload: Boolean = false,
     val massRestore: Boolean = false,
+    val drainUnloadsAfterWindow: Boolean = false,
     val devicesEvery: Int = System.getProperty(DEVICES_PROPERTY)?.trim()?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
     val quietProgress: Boolean = System.getProperty(QUIET_PROGRESS_PROPERTY).toBoolean(),
     val productionAutosave: Boolean = false,
@@ -643,7 +648,16 @@ internal data class AutosaveResult(
 
 /**
  * [LoadPhase.UNLOAD] の結果: 取り出して書き込みに回した台と書き込みの回数（合計と 1 tick の最大）、ケースのあるチャンクのうちアンロードされなかった数とその全体、
- * tick の時間（[tick]。壁時計。書き込みは書き込みのスレッドで行う。#84）、保存の手間と大きさ（[cost]）
+ * tick の時間（[tick]。壁時計。書き込みは書き込みのスレッドで行う。#84）、保存の手間と大きさ（[cost]）。
+ * [captures]・[writes]・[cost] は、測る区間の後に流した分も含む（取り出しと予約の数を正確に突き合わせるため）。
+ * [maxTickCaptures]・[maxTickWrites]・[tick] は、測る区間の中だけのもの
+ *
+ * @property stillLoaded 測る区間の終わりに、アンロードされていなかったチャンクの数
+ * @property queuedAtWindowEnd 測る区間の終わりの、アンロードの列（`ChunkMap.unloadQueue`）の長さ
+ * @property drainTicks 測る区間の後に列を流した tick の数（#872。流さなければ 0）
+ * @property drainedChunks 流した間にアンロードされた、ケースのあるチャンクの数
+ * @property stillLoadedAfterDrain 流した後も残ったチャンクの数（流さなければ [stillLoaded] と同じ）
+ * @property drainNote 流しても残ったときの、残ったチャンクの様子（holder の表とチケットの段階。残らなければ `null`）
  */
 internal data class UnloadResult(
     val captures: Long,
@@ -655,6 +669,11 @@ internal data class UnloadResult(
     val ticks: Int,
     val tick: TickStats,
     val cost: SaveCost,
+    val queuedAtWindowEnd: Int,
+    val drainTicks: Int,
+    val drainedChunks: Int,
+    val stillLoadedAfterDrain: Int,
+    val drainNote: String?,
 )
 
 /**
@@ -907,6 +926,15 @@ internal class LoadReport(
                     it.tick.avg, it.tick.p50, it.tick.p95, it.tick.max,
                 ),
             )
+            if (it.drainTicks > 0) {
+                sb.append(
+                    String.format(
+                        Locale.ROOT,
+                        "  - 測る区間の後に列を流した（#872。測らない）: %d tick、アンロードされた %d チャンク、残った %d チャンク（区間の終わりの列の長さ %d）\n",
+                        it.drainTicks, it.drainedChunks, it.stillLoadedAfterDrain, it.queuedAtWindowEnd,
+                    ),
+                )
+            }
         }
         restore?.let {
             fun at(t: Int) = if (t >= 0) "$t tick" else "届かず"
@@ -1226,6 +1254,20 @@ internal class LoadRun(
     private var unloadResult: UnloadResult? = null
     private var unloadCaseChunks = 0
     private var unloadRemaining = 0
+
+    /** [LoadPhase.UNLOAD] の、ケースのあるチャンク（流しても残ったときの様子を出すのに使う。#872） */
+    private var unloadCaseChunkList: List<ChunkPos> = emptyList()
+
+    /** 測る区間の終わりのアンロードの列の長さ（#872） */
+    private var unloadQueuedAtWindowEnd = 0
+
+    /** 測る区間の後に列を流している間か（#872。[LoadSettings.drainUnloadsAfterWindow]） */
+    private var unloadDraining = false
+    private var unloadDrainTicks = 0
+    private var unloadDrainIdleTicks = 0
+    private var unloadDrainLastEvents = 0L
+    private var unloadAfterDrain = 0
+    private var unloadDrainNote: String? = null
 
     /** [LoadPhase.AUTOSAVE]・[LoadPhase.UNLOAD] の測る区間の tick の時間（終えたら。`null` ならまだ測っている。#614） */
     private var measuredTick: TickStats? = null
@@ -1894,24 +1936,96 @@ internal class LoadRun(
 
     private fun unload() {
         val s = ServerMachines.Stats
-        unloadMaxTickCaptures = maxOf(unloadMaxTickCaptures, s.unloadCaptures - unloadPrevCaptures)
-        unloadMaxTickWrites = maxOf(unloadMaxTickWrites, s.unloadWrites - unloadPrevWrites)
-        unloadPrevCaptures = s.unloadCaptures
-        unloadPrevWrites = s.unloadWrites
         if (measuredTick == null) {
+            // 1 tick の最大は測る区間の中だけで取る（区間の後に流した分は、1回でまとめて取り出すので数えない。#872）
+            unloadMaxTickCaptures = maxOf(unloadMaxTickCaptures, s.unloadCaptures - unloadPrevCaptures)
+            unloadMaxTickWrites = maxOf(unloadMaxTickWrites, s.unloadWrites - unloadPrevWrites)
+            unloadPrevCaptures = s.unloadCaptures
+            unloadPrevWrites = s.unloadWrites
             if (phaseTick % 10 != 0) return
             // ケースのあるチャンクが全部アンロードされたら終わり（hasChunk は FULL でなくなっただけでも偽になるので、Unload を数える）
             val remaining = unloadCaseChunks - s.unloadEventsWithCases.toInt()
             if (remaining > 0 && phaseTick < UNLOAD_TIMEOUT_TICKS) return
             unloadRemaining = remaining.coerceAtLeast(0)
+            unloadAfterDrain = unloadRemaining
+            unloadQueuedAtWindowEnd = level.chunkSource.chunkMap.unloadQueue.size
             stopMeasuring()
+            unloadDraining = settings.drainUnloadsAfterWindow && unloadRemaining > 0
+            unloadDrainLastEvents = s.unloadEventsWithCases
         }
+        // 流した分の取り出しも段階の書き込みの予約になるので、流し終えてから書き込みの終わりを待つ
+        if (unloadDraining && !drainUnloads()) return
         if (!awaitPhaseSaves()) return
         unloadResult = UnloadResult(
             s.unloadCaptures, s.unloadWrites, unloadMaxTickCaptures, unloadMaxTickWrites, unloadRemaining, unloadCaseChunks, measuredTicks,
             measuredTick!!, saveCost(),
+            queuedAtWindowEnd = unloadQueuedAtWindowEnd,
+            drainTicks = unloadDrainTicks,
+            drainedChunks = unloadRemaining - unloadAfterDrain,
+            stillLoadedAfterDrain = unloadAfterDrain,
+            drainNote = unloadDrainNote,
         )
         next(LoadPhase.UNLOAD)
+    }
+
+    /**
+     * 測る区間の後に、アンロードの列に今ある仕事を 1 tick に1回ずつ流す（#872。[LoadSettings.drainUnloadsAfterWindow]）。
+     * バニラの `processUnloads` は tick に時間が残らないと列を流さないので、重いマシン（急いで回す試験で tick が 50 ms を超える）では、
+     * 強制読み込みを外したチャンクが測る区間の中でアンロードされきらない。流すのは測らない tick だけなので、段階の数字は変わらない。
+     * 積み直された仕事（#540）は次の tick に回す（[runQueuedUnloads]）。`processUnloads { true }` は積み直しを同じ呼び出しで回し続けるので使わない。
+     * ケースのあるチャンクのアンロードが [UNLOAD_DRAIN_IDLE_TICKS] 続けて増えないか、流した tick が [UNLOAD_DRAIN_TIMEOUT_TICKS] に達したら、
+     * 残ったまま流すのをやめる（落とすのは呼び手。残りと様子は結果に書く）。積み直しが終わらない・チケットが残るなどの本当の詰まりは、流しても残る
+     *
+     * @return 流し終えたら真
+     */
+    private fun drainUnloads(): Boolean {
+        val s = ServerMachines.Stats
+        runQueuedUnloads(level)
+        unloadDrainTicks++
+        val events = s.unloadEventsWithCases
+        if (events != unloadDrainLastEvents) {
+            unloadDrainLastEvents = events
+            unloadDrainIdleTicks = 0
+        } else {
+            unloadDrainIdleTicks++
+        }
+        val remaining = (unloadCaseChunks - events.toInt()).coerceAtLeast(0)
+        unloadAfterDrain = remaining
+        if (remaining > 0 && unloadDrainIdleTicks < UNLOAD_DRAIN_IDLE_TICKS && unloadDrainTicks < UNLOAD_DRAIN_TIMEOUT_TICKS) return false
+        if (remaining > 0) {
+            val note = drainDiagnostics()
+            unloadDrainNote = note
+            LOGGER.warn(
+                "{} of {} chunks with cases did not unload after draining the unload queue for {} ticks: {}",
+                remaining, unloadCaseChunks, unloadDrainTicks, note,
+            )
+        }
+        unloadDraining = false
+        // 書き込みの終わりの待ちは、流し終えたところから数え直す（経過の ms や進まない tick に、流した tick を混ぜない）
+        saveWaitStartNanos = System.nanoTime()
+        saveWait = SaveWaitProgress(s.windowCompletions, WorldMachineSaves.current?.finishedCount ?: 0L, saveWaitStartNanos)
+        return true
+    }
+
+    /** 流しても残ったチャンクの様子: holder がどの表にいるか、チケットの段階、列の長さ（#872）。多ければ先頭だけ */
+    private fun drainDiagnostics(): String {
+        val map = level.chunkSource.chunkMap
+        val left = unloadCaseChunkList.filter { FarChunks.isTracked(level, it) }
+        val shown = left.take(UNLOAD_DRAIN_REPORT_CHUNKS).joinToString("; ") { chunk ->
+            val key = chunk.toLong()
+            val visible = map.getVisibleChunkIfPresent(key)
+            val updating = map.getUpdatingChunkIfPresent(key)
+            val pending = map.pendingUnloads.get(key)
+            val table = when {
+                pending != null -> "pendingUnloads"
+                updating != null && updating !== visible -> "updating"
+                else -> "visible"
+            }
+            val holder = pending ?: updating ?: visible
+            "$chunk $table ticket level ${holder?.ticketLevel}"
+        }
+        return "tracked ${left.size} of ${unloadCaseChunkList.size} case chunks (unload events say $unloadAfterDrain left), " +
+            "unload queue ${map.unloadQueue.size}, idle $unloadDrainIdleTicks ticks: $shown"
     }
 
     /**
@@ -2401,7 +2515,8 @@ internal class LoadRun(
                 val rule = level.gameRules.getRule(GameRules.RULE_SPAWN_CHUNK_RADIUS)
                 savedSpawnChunkRadius = rule.get()
                 rule.set(0, level.server)
-                unloadCaseChunks = computers.mapTo(HashSet()) { ChunkPos(it.case.blockPos) }.size
+                unloadCaseChunkList = computers.mapTo(LinkedHashSet()) { ChunkPos(it.case.blockPos) }.toList()
+                unloadCaseChunks = unloadCaseChunkList.size
                 for (chunk in forced) level.setChunkForced(chunk.x, chunk.z, false)
                 forced.clear()
                 // テストの構造物のチャンク（GameTest が強制読み込みする）も外す。強制読み込みのチャンクは、まわり 13 チャンクを
@@ -2805,8 +2920,17 @@ internal class LoadRun(
         /** 自動保存の一巡を待つ上限 */
         private const val AUTOSAVE_TIMEOUT_TICKS = 2_000
 
-        /** まとめてアンロードを待つ上限（過ぎたら、そこまでの結果を書く） */
+        /** まとめてアンロードを待つ上限（過ぎたら、そこまでの結果を書く）。この tick までが測る区間 */
         private const val UNLOAD_TIMEOUT_TICKS = 2_000
+
+        /** 測る区間の後に列を流す間（#872）、ケースのあるチャンクのアンロードが1つも増えない tick の上限 */
+        private const val UNLOAD_DRAIN_IDLE_TICKS = 600
+
+        /** 測る区間の後に列を流す tick の上限（#872。CI の試験の上限に足してある） */
+        internal const val UNLOAD_DRAIN_TIMEOUT_TICKS = 2_000
+
+        /** 流しても残ったときに、様子を書くチャンクの数の上限 */
+        private const val UNLOAD_DRAIN_REPORT_CHUNKS = 8
 
         /**
          * 段階に予約した書き込みが終わるのを待つ間、段階の書き込みの完了も、列から抜けた仕事（掃除なども。#852）も1件も増えない tick の上限（#614・#854）。
