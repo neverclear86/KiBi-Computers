@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.block.Blocks
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
@@ -79,6 +80,46 @@ internal class WriterGate(helper: GameTestHelper? = null) : AutoCloseable {
         const val SHORT_LIMIT_SECONDS = 30L
 
         /** テストの終わりに必ず放すゲートの、念のための上限 */
+        const val HELD_LIMIT_SECONDS = 1_800L
+    }
+}
+
+/**
+ * GameTest 用: 列の外の `owner.bin` の読み手（#877）を止めておく。[WriterGate] は書き込みのスレッドだけを止めるので、列の外の読み手に回る claim
+ * （その ID の仕事が列にない ID）の読みは止まらない。claim の確定を tick をまたいで待たせたいテストが、[WriterGate] と並べて使う。
+ * 読み手は、差し込んだ読みの口で [close] まで待つ（読みはそのあとで走る）。[close] で放して、口を元に戻す。放し忘れても、
+ * テストが終わったとき（成功・失敗・タイムアウト）に放す
+ */
+internal class SideReaderGate(helper: GameTestHelper, private val store: MachineSaveStore) : AutoCloseable {
+    private val latch = CountDownLatch(1)
+    private val original = store.sideOwnerReader
+
+    init {
+        store.sideOwnerReader = { path ->
+            latch.await(HELD_LIMIT_SECONDS, TimeUnit.SECONDS)
+            original(path)
+        }
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
+    }
+
+    override fun close() {
+        latch.countDown()
+        // 差し込んだままにしない（ほかのテストの読みが、放した後の口を通るだけで済むように、元に戻す）
+        store.sideOwnerReader = original
+    }
+
+    private companion object {
+        /** テストの終わりに必ず放すゲートの、念のための上限（[WriterGate] と同じ） */
         const val HELD_LIMIT_SECONDS = 1_800L
     }
 }
