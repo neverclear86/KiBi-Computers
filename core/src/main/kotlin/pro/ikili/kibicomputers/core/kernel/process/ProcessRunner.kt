@@ -132,7 +132,10 @@ internal class ProcessRunner(private val machine: Machine) {
     }
 
     /**
-     * 待機点型の1回の step。CPU と許可を受け取ったワーカーで動く（許可は `PermitPool.submit` が渡す。#350）。
+     * 待機点型の1回の step。CPU と許可を受け取ったワーカーで動く（許可は `PermitPool` が渡す。#350）。
+     * 渡す道は、spawn の直接の道（CPU が空いていて、spawn がその場で CPU を受け取るとき。`PermitPool.submit`）だけがワーカーに渡せなければ
+     * 投げて巻き戻す（#629）。ほかの道（CPU の受け渡し・起こし・復元の取り込み・[unregister] の保留した起こし）は `PermitPool.submitOrStrand` を通り、
+     * ワーカーに渡せなくても投げずに取り残しの列に入れて、毎 tick と次の受け渡しで渡し直す（#875）
      * 終わりで返した許可の次の step は、同じワーカーの続きにする（[releasePermitAndCpu] の `endOfStep`）
      */
     fun runStep(rt: ProcessRuntime) {

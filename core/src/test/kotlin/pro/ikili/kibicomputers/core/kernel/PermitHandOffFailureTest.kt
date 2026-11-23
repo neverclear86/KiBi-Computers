@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
+import org.junit.jupiter.api.fail
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
@@ -14,30 +15,14 @@ import java.time.Duration
 import java.util.Collections
 import java.util.ResourceBundle
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /** 許可を次へ渡した後に、ワーカーへ渡せなかったとき（#870）。許可は取り残しの列で持ったまま、後で渡し直す */
 internal class PermitHandOffFailureTest {
-    /** 指定した回数だけ `execute` を失敗させるワーカーの置き場（`unable to create native thread` を再現する） */
-    private class FailingExecutor(private val delegate: ExecutorService) : ExecutorService by delegate {
-        val failuresLeft = AtomicInteger()
-
-        @Volatile
-        var alwaysFail = false
-
-        override fun execute(command: Runnable) {
-            if (alwaysFail || failuresLeft.getAndUpdate { if (it > 0) it - 1 else 0 } > 0) {
-                throw OutOfMemoryError("unable to create native thread")
-            }
-            delegate.execute(command)
-        }
-    }
-
     /** 出したものを拾う [System.Logger] */
     private class RecordingLogger : System.Logger {
         data class Line(val level: System.Logger.Level, val message: String, val thrown: Throwable?)
@@ -597,6 +582,54 @@ internal class PermitHandOffFailureTest {
             h.tickUntilTrue("CPU と許可が戻らない") { m.cpu.currentOwner == null && permits.availablePermits() == total }
             assertEquals(0, permits.strandedTasks)
             m.stop()
+        }
+    }
+
+
+    @Test
+    fun `stepの途中で起こされ、登録を外すときにワーカーへ渡せなくても、登録の後始末まで進み、tickだけで進んで戻る`() = timeout(Duration.ofSeconds(30)) {
+        val executor = FailingExecutor(Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+        Harness(executor = executor).use { h ->
+            val permits = h.scheduler.permits
+            val total = permits.availablePermits()
+            val m = h.machine()
+            val gate = Gate(m)
+            val fired = AtomicBoolean()
+            // 待ちを登録して CPU・許可を返した step の、登録を外す前（rt.thread が残っている間）に起こす。
+            // 登録を外すときに、保留した起こし（pendingSchedule）が cpu.enqueueThreadless で次の step を渡すが、そこで失敗させる。
+            // 失敗は tick の渡し直しでも続ける（tick を回しても、取り残しの列に残ったまま確かめられるように）。
+            // 最初の step（読み込みを待って返す。state は CREATED のまま）では起こさない
+            h.scheduler.hooks.beforeUnregister = { machine, pid ->
+                if (machine === m && machine.processState(pid) == ProcessState.WAITING_EVENT && fired.compareAndSet(false, true)) {
+                    executor.alwaysFail = true
+                    gate.open()
+                }
+            }
+            val pid = m.spawnTest(h.program(emptyModule()), gated(gate, kind = ProcessKind.WAIT_POINT))
+            h.tickUntilTrue("取り残しの列に入らない") { fired.get() && permits.strandedTasks == 1 }
+            // unregister が投げずに最後まで進んだ
+            val rt = m.runtime(pid) ?: fail("実行時の部分がない")
+            assertTrue(
+                m.lock.withLockValue { rt.thread == null && !m.hasPendingSchedulesLocked() },
+                "登録の後始末が飛ばされた（スレッドが残っている・保留が残っている）",
+            )
+            assertTrue(permits.handOffFailures.get() >= 1L, "登録を外すときの受け渡しで失敗する")
+            assertEquals(pid, m.cpu.currentOwner?.pid, "CPU は取り残した step の持ち主のまま")
+            assertEquals(ProcessState.RUNNABLE, m.processState(pid))
+            assertTrue(m.state != MachineState.CRASHED, "マシンが落ちた")
+            // 渡せない間は tick を回しても進まず、取り残しのまま
+            repeat(5) { h.scheduler.tick() }
+            assertEquals(1, permits.strandedTasks)
+            assertEquals(ProcessState.RUNNABLE, m.processState(pid))
+            // 渡せるようになれば、tick だけで進む
+            executor.alwaysFail = false
+            h.tickUntilTrue("終わらない") { m.processState(pid)?.isTerminal == true }
+            assertEquals(ProcessState.EXITED, m.processState(pid))
+            h.tickUntilTrue("CPU と許可が戻らない") { m.cpu.currentOwner == null && permits.availablePermits() == total }
+            assertEquals(0, permits.strandedTasks)
+            // 登録（registeredThreads）の数が合っている。外し損ねていれば、プロセスが終わっても待ち終わらない
+            assertTrue(m.awaitTermination(5_000), "登録したスレッドが残っている")
+            h.scheduler.hooks.beforeUnregister = null
         }
     }
 }
