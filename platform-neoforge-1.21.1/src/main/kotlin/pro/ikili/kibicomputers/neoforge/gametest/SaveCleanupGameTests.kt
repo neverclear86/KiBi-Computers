@@ -524,26 +524,37 @@ object SaveCleanupGameTests {
 
     /**
      * 実際のチャンクの読み書きの経路（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）は、GameTest のサーバー（と製品の jar のサーバー）では
-     * Mixin が当たっておらず（[ChunkReferenceProbe.modifiedRegionStorage] が空）、既定の問いはファイル名で判定する。
-     * 合わせたメンバーの印（[ChunkReferenceProbe.hasMergedMembers]）は、印の付いたメソッドのあるクラスで見つかる（`@MixinMerged` はソースに書けないので、テスト用の実行時の注釈 [TestMark] で確かめる）
+     * Mixin が当たっておらず（[ChunkReferenceProbe.modifiedRegionStorage] が空）、全ディメンションのインスタンスもバニラのクラスそのもので
+     * （[ChunkReferenceProbe.substitutedRegionStorage] が空）、既定の問いはファイル名で判定する。
+     * 合わせたメンバーの印（[ChunkReferenceProbe.hasMergedMembers]）は、印の付いたメソッドのあるクラスで見つかる（`@MixinMerged` はソースに書けないので、テスト用の実行時の注釈 [TestMark] で確かめる）。
+     * インスタンスの差し替え（サブクラス・ない）は [ChunkReferenceProbe.substitutedInstances] が見つける
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
     fun vanillaRegionStorageIsTrusted(helper: GameTestHelper) {
+        val server = helper.level.server
         val modified = ChunkReferenceProbe.modifiedRegionStorage()
         helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
-        helper.assertTrue(ChunkReferenceProbe(helper.level.server).regionNamesTrusted, "the default probe should trust the region names")
+        val substituted = ChunkReferenceProbe.substitutedRegionStorage(server)
+        helper.assertTrue(substituted.isEmpty(), "the chunk storage instances should be vanilla: $substituted")
+        helper.assertTrue(ChunkReferenceProbe.untrustedRegionStorage(server).isEmpty(), "the chunk storage should be trusted")
+        helper.assertTrue(ChunkReferenceProbe(server).regionNamesTrusted, "the default probe should trust the region names")
         helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(MarkedMember::class.java, TestMark::class.java.name), "a marked method should be found")
         helper.assertTrue(!ChunkReferenceProbe.hasMergedMembers(UnmarkedMember::class.java, TestMark::class.java.name), "an unmarked class should have no mark")
         helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java), "a plain class should not be a mixin target")
+        // インスタンスがクラスそのものなら差し替えでない。サブクラス・ないものは差し替え（ないものは確かめられない）
+        val same = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to BaseStorage()))
+        helper.assertTrue(same.isEmpty(), "an exact instance should not be substituted: $same")
+        val sub = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to SubStorage(), BaseStorage::class.java to null))
+        helper.assertTrue(sub == listOf(SubStorage::class.java.name, "null"), "a subclass and a missing instance should be substituted: $sub")
         helper.succeed()
     }
 
     /**
      * 本物の Mixin が当たったクラスでの検出。NeoForge 自身が `neoforge.mixins.json` で `BlockEntityType`・`MappedRegistry` にアクセサーの Mixin を当てているので、
      * 本物の `@MixinMerged` が見つかること、その Mixin がインターフェース（アクセサーだけ）と判定されて数えられないこと（本物のクラスローダーでクラスファイルが読めること）を確かめる。
-     * 処理を書き換える Mixin（インターフェースでないもの）なら数えること、記録が引けないときは数えることは、Mixin の記録を差し替えて確かめる。
-     * Mixin の記録（`Mixins.getMixinsForClass`）は 0.8.7 では本物の対象でも空なので、記録ではなく印の検出が壊れたらここで落ちる（#899）
+     * 数える側（処理を書き換える Mixin の印、`mixin` が読めない印、クラスファイルが読めない Mixin の印）は、`@MixinMerged` と同じ形（`mixin` を持つ）のテスト用の印
+     * [TestMerged] を付けたクラスで、本番と同じ [ChunkReferenceProbe.isMixinTarget] の経路を通して確かめる（#899）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
@@ -557,12 +568,15 @@ object SaveCleanupGameTests {
             helper.assertTrue(names.all { ChunkReferenceProbe.isAccessorMixin(loader, it) }, "the accessor mixins of ${type.name} should be interfaces: $names")
             helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(type), "accessor-only mixins on ${type.name} should not count: $names")
         }
-        // 処理を書き換える Mixin（インターフェースでないもの）の記録なら数える。アクセサー（インターフェース）の記録なら数えない
-        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf(UnmarkedMember::class.java.name) }, "a non-accessor mixin should count")
-        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf(AccessorLike::class.java.name) }, "an accessor mixin should not count")
-        // 記録が引けないとき・Mixin のクラスファイルが読めないときは数える（残す側）
-        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { error("no registry") }, "a failing lookup should count")
-        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf("no.such.Mixin") }, "an unreadable mixin should count")
+        val merged = TestMerged::class.java.name
+        // 処理を書き換える Mixin（インターフェースでないもの）の印なら数える。アクセサー（インターフェース）の印なら数えない
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByClassMixin::class.java, merged), "a mark of a non-accessor mixin should count")
+        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(MergedByAccessor::class.java, merged), "a mark of an accessor mixin should not count")
+        // アクセサーの印と、処理を書き換える Mixin の印が両方あれば数える
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByBoth::class.java, merged), "a non-accessor mark beside an accessor mark should count")
+        // Mixin のクラスファイルが読めない印、`mixin` が読めない印は数える（残す側）
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByUnreadable::class.java, merged), "a mark of an unreadable mixin should count")
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MarkedMember::class.java, TestMark::class.java.name), "a mark without the mixin name should count")
         helper.succeed()
     }
 
@@ -572,12 +586,56 @@ object SaveCleanupGameTests {
     private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
 
     /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの Mixin の代わりのインターフェース */
-    private interface AccessorLike
+    internal interface AccessorLike
 
-    /** [vanillaRegionStorageIsTrusted] の、`@MixinMerged` の代わりの印（実行時に見える注釈） */
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin の代わりのクラス */
+    internal class ClassMixinLike
+
+    /**
+     * [mixinTargetIsDetectedOnRealMixins] の、`@MixinMerged` と同じ形の印（`mixin` に合わせた Mixin のクラス名）。
+     * 本番のコードがリフレクションで `mixin` を読むので、JVM の上で public にする（`internal`）
+     */
     @Retention(AnnotationRetention.RUNTIME)
     @Target(AnnotationTarget.FUNCTION)
-    private annotation class TestMark
+    internal annotation class TestMerged(val mixin: String)
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin の印の付いたクラス */
+    internal class MergedByClassMixin {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの Mixin の印だけが付いたクラス */
+    internal class MergedByAccessor {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの印と処理を書き換える Mixin の印の両方が付いたクラス */
+    internal class MergedByBoth {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        fun accessor(): Int = 1
+
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、クラスファイルが読めない Mixin の印の付いたクラス */
+    internal class MergedByUnreadable {
+        @TestMerged("no.such.Mixin")
+        fun merged(): Int = 1
+    }
+
+    /** [vanillaRegionStorageIsTrusted] の、`@MixinMerged` の代わりの印（`mixin` を持たない。実行時に見える注釈） */
+    @Retention(AnnotationRetention.RUNTIME)
+    @Target(AnnotationTarget.FUNCTION)
+    internal annotation class TestMark
+
+    /** [vanillaRegionStorageIsTrusted] の、差し替えの判定の期待するクラス */
+    internal open class BaseStorage
+
+    /** [vanillaRegionStorageIsTrusted] の、差し替えたサブクラス */
+    internal class SubStorage : BaseStorage()
 
     /** [vanillaRegionStorageIsTrusted] の、印の付いたメソッドのあるクラス */
     private class MarkedMember {

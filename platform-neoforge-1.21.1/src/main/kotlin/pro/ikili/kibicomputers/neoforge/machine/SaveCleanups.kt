@@ -13,6 +13,7 @@ import net.minecraft.server.MinecraftServer
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.server.level.ChunkHolder
+import net.minecraft.server.level.ChunkMap
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.chunk.LevelChunk
@@ -27,7 +28,6 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.Opcodes
-import org.spongepowered.asm.mixin.Mixins
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineReference
@@ -138,8 +138,8 @@ internal object SaveCleanups {
         if (!probe.regionNamesTrusted) {
             // 掃除1回につき1行（問いごとには出さない）
             LOGGER.info(
-                "The chunk storage classes are modified ({}); the computer save cleanup keeps directories at positions without a region file",
-                ChunkReferenceProbe.modifiedRegionStorage().joinToString(),
+                "The chunk storage is modified or substituted ({}); the computer save cleanup keeps directories at positions without a region file",
+                ChunkReferenceProbe.untrustedRegionStorage(s).joinToString(),
             )
         }
         val cleanup = SaveCleanup(store, modules, probe, settings, dryRun, force)
@@ -207,12 +207,13 @@ internal object SaveCleanups {
  *
  * チャンクの NBT は覚えない（1,000 件分を持つと大きいため。同じチャンクを何度か読むことはある。問いの数は [SaveCleanupSettings.maxProbesInFlight] まで）
  *
- * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）に Mixin が当たっていないか（[modifiedRegionStorage]）。
+ * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）に処理を書き換える Mixin が当たっておらず、
+ * 実際に使われているインスタンスがバニラのクラスそのものか（[untrustedRegionStorage]）。
  * 作るときに1回だけ決める（メインスレッドで作る。問いごと・IO のスレッドでは調べない）。テストは差し替える
  */
 internal class ChunkReferenceProbe(
     private val server: MinecraftServer,
-    val regionNamesTrusted: Boolean = modifiedRegionStorage().isEmpty(),
+    val regionNamesTrusted: Boolean = untrustedRegionStorage(server).isEmpty(),
 ) : MachineReferenceProbe {
     override fun probe(id: UUID, owner: MachineOwner, answer: Consumer<MachineReference>) {
         val location = ResourceLocation.tryParse(owner.dimension)
@@ -313,40 +314,70 @@ internal class ChunkReferenceProbe(
         private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
 
         /**
-         * チャンクを読み書きする経路のクラス（[REGION_STORAGE_CLASSES]）のうち、Mixin が当たったもの（の名前）。空なら既定の作りで、
-         * 「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
+         * サーバー [server] のチャンクを読み書きする側が、既定の作りと確かめられない理由（空なら既定の作り）。
+         * 既定の作りなら「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
          *
-         * 形式を差し替える口はバニラにない（`RegionFileStorage` は `final` でコンストラクターはパッケージの中だけ、`ChunkStorage.worker`・`IOWorker.storage` は `final`）ので、
-         * 差し替えられるのはバイトコードを書き換えるもの（Mixin・coremod）だけ。Mixin は、合わせたメンバーの印（`@MixinMerged`）と、
-         * 当てたクラスの記録（`Mixins.getMixinsForClass`。Mixin 0.8.7 では空を返すので、実際に効くのは印）の両方で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
-         * アクセサー・インボーカーだけの Mixin（NeoForge 自身が `BlockEntityType` などに当てているもの。[isAccessorMixin]）は、処理を書き換えないので数えない。
-         * 処理を書き換える Mixin は、形式を変えないもの（性能のためのもの）も区別できず数える。その環境では、リージョンファイルのない位置の残骸は回収されない（毎回「判定できない」）。
-         * coremod・JVM エージェントの書き換えは見えない。`ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので数えない（数えると、ほとんどの環境で
-         * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。
+         * 2つを見る。
+         * - クラスの書き換え（[modifiedRegionStorage]）: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないか
+         * - 差し替え（[substitutedRegionStorage]）: 全ディメンションで、実際に使われている `ChunkMap`・`IOWorker`・`RegionFileStorage` のインスタンスがバニラのクラスそのものか。
+         *   `IOWorker` は `final` でなく、コンストラクターは `protected`、`loadAsync`・`store` は上書きできるので、バイトコードを書き換えなくてもサブクラスが作れる。
+         *   それを `ChunkStorage.worker`（`final`）に入れるのは、アクセサーの Mixin・リフレクション・AT で足りる（アクセサーの Mixin はクラスの書き換えとしては数えないので、こちらで見る）
          *
-         * 掃除1回につき1回、メインスレッドで呼ぶ（問いごと・IO のスレッドでは調べない）
+         * 調べるのに失敗したら、確かめられないとして理由に数える（残す側）。掃除1回につき1回、メインスレッドで呼ぶ（問いごと・IO のスレッドでは調べない）
          */
-        fun modifiedRegionStorage(): List<String> = REGION_STORAGE_CLASSES.filter(::isMixinTarget).map { it.name }
+        fun untrustedRegionStorage(server: MinecraftServer): List<String> = modifiedRegionStorage() + substitutedRegionStorage(server)
 
         /**
-         * クラス [type] に、形式を変えうる Mixin が当たっているか（調べるのに失敗したら `true`）。
-         * 合わせたメンバーの印（[hasMergedMembers]）と、当てたクラスの記録（[recorded]）の両方で見る。
-         * アクセサー・インボーカーだけの Mixin（インターフェースの Mixin。フィールド・メソッドを開くだけで、処理を書き換えない）は数えない（[isAccessorMixin]）。
+         * チャンクを読み書きする経路のクラス（[REGION_STORAGE_CLASSES]）のうち、処理を書き換える Mixin が当たったもの（の名前）。
          *
-         * 記録（`Mixins.getMixinsForClass`）は、Mixin 0.8.7 では当てられたクラスでも空を返す（GameTest で確かめた。`BlockEntityType` は
-         * 記録が空で、印はある）。実際に効くのは印のほうで、記録は、引ける版・形が来たときの保険
+         * Mixin は、合わせたメンバーの印（`@MixinMerged`。[isMixinTarget]）で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
+         * アクセサー・インボーカーだけの Mixin（NeoForge 自身が `BlockEntityType` などに当てているもの。[isAccessorMixin]）は、処理を書き換えないので数えない
+         * （それで入れ替えたインスタンスは [substitutedRegionStorage] が見る）。
+         * 処理を書き換える Mixin は、形式を変えないもの（性能のためのもの）も区別できず数える。その環境では、リージョンファイルのない位置の残骸は回収されない（毎回「判定できない」）。
+         *
+         * 見えないもの: 合わせたメソッド・フィールドを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
+         * `<clinit>` だけの Mixin。どちらも印が付かない）と、coremod・JVM エージェントの書き換え。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
+         * 適用の記録が Mixin 自身のクラスの側にしか付かず、対象のクラスでは作りの上で常に空なので使わない。
+         * `ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので数えない（数えると、ほとんどの環境で
+         * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）
          */
-        fun isMixinTarget(type: Class<*>, recorded: (String) -> Collection<String> = ::recordedMixins): Boolean = try {
+        fun modifiedRegionStorage(): List<String> = REGION_STORAGE_CLASSES.filter { isMixinTarget(it) }.map { it.name }
+
+        /**
+         * 全ディメンションのうち、チャンクを読み書きするインスタンス（`ChunkMap`・その `IOWorker`・その `RegionFileStorage`）が、バニラのクラスそのものでないもの
+         * （「ディメンション: クラス名」。引けなければ「ディメンション: unreadable」）。サブクラスで読み書きを差し替える環境を見る（[untrustedRegionStorage]）
+         */
+        fun substitutedRegionStorage(server: MinecraftServer): List<String> = server.allLevels.flatMap { level ->
+            val name = level.dimension().location().toString()
+            try {
+                val chunkMap = level.chunkSource.chunkMap
+                val worker = chunkMap.worker
+                substitutedInstances(
+                    listOf(ChunkMap::class.java to chunkMap, IOWorker::class.java to worker, RegionFileStorage::class.java to worker.storage),
+                ).map { "$name: $it" }
+            } catch (e: RuntimeException) {
+                listOf("$name: unreadable")
+            }
+        }
+
+        /** 組（期待するクラス, インスタンス）のうち、インスタンスがそのクラスそのものでないもの（の実際のクラス名。インスタンスがなければ `null`） */
+        fun substitutedInstances(instances: List<Pair<Class<*>, Any?>>): List<String> =
+            instances.filter { (expected, instance) -> instance == null || instance.javaClass != expected }
+                .map { (_, instance) -> instance?.javaClass?.name ?: "null" }
+
+        /**
+         * クラス [type] に、処理を書き換える Mixin が当たっているか（調べるのに失敗したら `true`）。合わせたメンバーの印（[marker]。既定は `@MixinMerged`。[hasMergedMembers]）で見る。
+         * 印の `mixin` がアクセサー・インボーカーだけの Mixin（インターフェースの Mixin。フィールド・メソッドを開くだけで、処理を書き換えない）なら数えない（[isAccessorMixin]）。
+         * `mixin` が読めない印、クラスファイルが読めない Mixin は数える。印の付かない Mixin は見えない（[modifiedRegionStorage]）
+         */
+        fun isMixinTarget(type: Class<*>, marker: String = MIXIN_MERGED): Boolean = try {
             val loader = type.classLoader
-            hasMergedMembers(type, ignoredMixin = { isAccessorMixin(loader, it) }) || recorded(type.name).any { !isAccessorMixin(loader, it) }
+            hasMergedMembers(type, marker, ignoredMixin = { isAccessorMixin(loader, it) })
         } catch (e: RuntimeException) {
             true
         } catch (e: LinkageError) {
             true
         }
-
-        /** クラス名 [className] に当たった Mixin の記録（Mixin のクラス名） */
-        private fun recordedMixins(className: String): Collection<String> = Mixins.getMixinsForClass(className).map { it.className }
 
         /**
          * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースにはアクセサーとインボーカーしか書けない。
