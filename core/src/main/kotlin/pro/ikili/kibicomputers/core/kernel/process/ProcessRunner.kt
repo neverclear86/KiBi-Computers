@@ -488,11 +488,10 @@ internal class ProcessRunner(private val machine: Machine) {
                 // WASM が終わった後・登録を外す前に止められた
                 machine.cpu.removeThreadless(rt)
                 finishLocked(rt, ProcessState.KILLED, null)
-            } else if (rt.pendingSchedule) {
-                rt.pendingSchedule = false
+            } else if (machine.clearPendingScheduleLocked(rt)) {
                 if (!rt.process.state.isTerminal) machine.cpu.enqueueThreadless(rt)
             }
-            rt.pendingSchedule = false
+            machine.clearPendingScheduleLocked(rt)
             if (rt.process.kind == ProcessKind.BLOCKING) {
                 scheduler.dedicatedThreads.remove(Thread.currentThread())
             }
@@ -582,11 +581,14 @@ internal class ProcessRunner(private val machine: Machine) {
 
     private fun acquirePermit(rt: ProcessRuntime) {
         if (rt.holdsPermit) return
+        // 並んだときの組を控え、返すときはその組へ返す（#738。待っている間に持ち主が変わっても数を合わせる）
+        val group = machine.fairShareGroup
         try {
-            scheduler.permits.acquire()
+            scheduler.permits.acquire(group)
         } catch (e: InterruptedException) {
             throw ProcessKilledException(e)
         }
+        rt.permitGroup = group
         rt.holdsPermit = true
         scheduler.permitAcquisitions.incrementAndGet()
     }
@@ -603,7 +605,7 @@ internal class ProcessRunner(private val machine: Machine) {
         // 返す途中でスタックが尽きないことは、入口の余裕の確かめ（StackHeadroom。#828）で守る
         if (rt.holdsPermit) {
             rt.holdsPermit = false
-            scheduler.permits.release(inline = endOfStep)
+            scheduler.permits.release(rt.permitGroup, inline = endOfStep)
         }
         if (rt.holdsCpu) {
             rt.holdsCpu = false
@@ -634,7 +636,7 @@ internal class ProcessRunner(private val machine: Machine) {
      * 次のスライスを取り、新しい手持ちを返す。足せなければ何も書き換えずに `null`。カーネルロックの中で呼ぶ。
      *
      * 足すのは、一時停止（マシンだけの quiesce も）でなく、手持ちを渡した tick の中（[FuelAccount.lastRefillTick] が今の tick）で、
-     * 書き戻した後のマシンの燃料が正で、CPU を待つプロセスも燃料待ちもいないときだけ。
+     * 書き戻した後のマシンの燃料が正で、CPU を待つプロセス（スレッドが外れるのを待って CPU の待ち行列に入る者を含む）も燃料待ちもいないときだけ。
      * 待つ者がいれば譲る（呼んだ側が CPU を返す）。tick が進んでいれば、待つ者がいなくても CPU と許可を返す（呼んだ側が返して取り直す）。
      * 許可はサーバー全体で数が限られ、公平な順で回るので、tick をまたいで持ち続けると、ほかの台が取れなくなる（ADR 0027。#47 より前は燃料切れのたびに返していた）。
      * プロセスが1つだけの台は、同じ tick の中なら CPU と許可の出し入れも巻き戻しもせずに、1 tick に `fuelPerTick` まで使える。
@@ -647,7 +649,9 @@ internal class ProcessRunner(private val machine: Machine) {
         // 手持ちを渡した後に tick が進んでいたら、その場で足さない（許可を回す）
         if (account.lastRefillTick != observed) return null
         if (account.afterGiveBack(observed, remaining) <= 0) return null
-        if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked()) return null
+        // 起こされてスレッドが外れるのを待っている者（巻き戻した直後に自分で起こした待機点型など）も、CPU を待つ者に数える。
+        // 数えないと、そのスレッドが外れる前にスライスを使い切った側が譲らずに足し、巻き戻しが 1 回減って配分がぶれる（#47）
+        if (machine.cpu.waiting > 0 || machine.hasFuelWaitersLocked() || machine.hasPendingSchedulesLocked()) return null
         account.giveBack(observed, remaining)
         val grant = account.take(observed, machine.config.fuelSlice)
         check(grant > 0) { "書き戻した後の燃料が正なのに、スライスを渡せない" }
@@ -1181,7 +1185,7 @@ internal class ProcessRunner(private val machine: Machine) {
         }
         process.asyncWait = null
         process.asyncStack?.clear()
-        if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking()
+        if (process.kind == ProcessKind.BLOCKING) scheduler.releaseBlocking(rt.blockingGroup)
         // まだ実行していないホスト呼び出しを取り消す（ふつうは 0 件。#46）
         machine.cancelHostCallsLocked(process.pid)
         // 終わりを記録し、親へ知らせ、子を付け替える（#46）

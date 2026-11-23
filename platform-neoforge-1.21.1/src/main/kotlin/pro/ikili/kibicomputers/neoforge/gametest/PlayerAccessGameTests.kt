@@ -45,14 +45,19 @@ import pro.ikili.kibicomputers.core.access.PlayerRef
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.display.ScreenTier
 import pro.ikili.kibicomputers.core.input.KeyboardEvent
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
 import pro.ikili.kibicomputers.neoforge.computer.CaseAccess
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlock
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseMenu
 import pro.ikili.kibicomputers.neoforge.computer.PlayerAccessNbt
+import pro.ikili.kibicomputers.neoforge.display.ScreenBlock
+import pro.ikili.kibicomputers.neoforge.display.ScreenBlockEntity
+import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardInputPayload
 import pro.ikili.kibicomputers.neoforge.input.KeyboardSessions
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -454,6 +459,79 @@ object PlayerAccessGameTests {
         val refused = runCatching { ownerless.replacePlayerAccess(PlayerAccess.LOCKED) }.exceptionOrNull()
         helper.assertTrue(refused is IllegalArgumentException, "making a readable case locked should be refused but was $refused")
         helper.assertTrue(!ownerless.playerAccess.hasOwner, "the refused replacement should not change the access")
+        helper.succeed()
+    }
+
+    /**
+     * 公平の組（#738、ADR 0738）: マシンは電源を入れたときの持ち主の組で作られ、持ち主が変わったら組が差し替わる。
+     * 持ち主なし（`setBlock`）と読めなかった記録（locked）は、同じ1つの組（持ち主なし）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200)
+    fun machinesFollowTheOwnersFairShareGroup(helper: GameTestHelper) {
+        val alex = player(helper, "Alex738a")
+        val steve = player(helper, "Steve738a")
+        val owned = placeBy(helper, alex)
+        installRequired(owned)
+        helper.assertTrue(owned.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${owned.computer}")
+        val machine = owned.computer.machine!!
+        helper.assertTrue(machine.fairShareGroup == FairShareGroup.of(alex.uuid), "the machine should be in the owner's group: ${machine.fairShareGroup}")
+        owned.replacePlayerAccess(owned.playerAccess.transferOwner(ref(steve)))
+        helper.assertTrue(machine.fairShareGroup == FairShareGroup.of(steve.uuid), "the group should follow the new owner: ${machine.fairShareGroup}")
+        // 持ち主が変わらない変更（保留の招待）では差し替えない
+        val before = machine.fairShareGroup
+        owned.replacePlayerAccess(owned.playerAccess.addPending("bob", System.currentTimeMillis(), CaseAccess.rules()).access)
+        helper.assertTrue(machine.fairShareGroup === before, "a change that keeps the owner should keep the group")
+
+        val ownerless = placeCase(helper, CASE.above())
+        installRequired(ownerless)
+        helper.assertTrue(ownerless.pressPowerButton() == ComputerStatus.RUNNING, "ownerless case should run but was ${ownerless.computer}")
+        helper.assertTrue(ownerless.computer.machine!!.fairShareGroup === FairShareGroup.NONE, "an ownerless case should be in the shared group")
+
+        val locked = placeCase(helper, CASE.west())
+        val tag = locked.saveWithoutMetadata(helper.level.registryAccess())
+        tag.put(CaseBlockEntity.PLAYER_ACCESS_TAG, CompoundTag().apply { putInt("Version", 99) })
+        locked.loadWithComponents(tag, helper.level.registryAccess())
+        helper.assertTrue(locked.playerAccess.locked, "the case should be locked")
+        installRequired(locked)
+        helper.assertTrue(locked.pressPowerButton() == ComputerStatus.RUNNING, "locked case should run but was ${locked.computer}")
+        helper.assertTrue(
+            locked.computer.machine!!.fairShareGroup === FairShareGroup.NONE,
+            "a locked case should share the ownerless group",
+        )
+        for (be in listOf(owned, ownerless, locked)) be.pressPowerButton()
+        helper.succeed()
+    }
+
+    /**
+     * 画面の同期の公平の組（#738）: 画面の組は、つながったケースのマシンの組（`ScreenSync.Host.fairShareGroup`）。
+     * つながっていない画面は持ち主なしの組で、持ち主が変わったら、つながったままでも新しい持ち主の組になる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200)
+    fun screenSyncUsesTheWiredMachinesFairShareGroup(helper: GameTestHelper) {
+        val alex = player(helper, "Alex738b")
+        val steve = player(helper, "Steve738b")
+        val case = placeBy(helper, alex)
+        installRequired(case)
+        val screenPos = CASE.above()
+        helper.setBlock(
+            screenPos,
+            KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get().defaultBlockState().setValue(ScreenBlock.FACING, Direction.SOUTH),
+        )
+        val screen = helper.getBlockEntity<ScreenBlockEntity>(screenPos)
+        val host = ScreenSync.Host(screen)
+        helper.assertTrue(screen.wiredTo == null, "the screen should not be wired before power on")
+        helper.assertTrue(host.fairShareGroup() === FairShareGroup.NONE, "an unwired screen should be in the shared group: ${host.fairShareGroup()}")
+        helper.assertTrue(case.pressPowerButton() == ComputerStatus.RUNNING, "case should run but was ${case.computer}")
+        helper.assertTrue(screen.wiredTo === case.wiring, "the screen should be wired to the case")
+        helper.assertTrue(host.fairShareGroup() == FairShareGroup.of(alex.uuid), "the screen should be in the wired owner's group: ${host.fairShareGroup()}")
+        case.replacePlayerAccess(case.playerAccess.transferOwner(ref(steve)))
+        helper.assertTrue(screen.wiredTo === case.wiring, "the screen should stay wired after the owner changes")
+        helper.assertTrue(host.fairShareGroup() == FairShareGroup.of(steve.uuid), "the screen should follow the new owner: ${host.fairShareGroup()}")
+        case.pressPowerButton()
+        helper.assertTrue(screen.wiredTo == null, "turning the case off should free the screen")
+        helper.assertTrue(host.fairShareGroup() === FairShareGroup.NONE, "a freed screen should be in the shared group: ${host.fairShareGroup()}")
         helper.succeed()
     }
 

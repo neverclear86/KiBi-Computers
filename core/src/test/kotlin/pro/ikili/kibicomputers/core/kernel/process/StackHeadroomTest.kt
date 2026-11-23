@@ -3,16 +3,36 @@ package pro.ikili.kibicomputers.core.kernel.process
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
-import java.util.concurrent.atomic.AtomicInteger
 
 /** [StackHeadroom]（#828） */
 class StackHeadroomTest {
-    /** 256 KiB のスタックのスレッドで、[frames] があれば 1 段ごとにその段数の確かめをしながら、尽きるまで再帰した深さ */
-    private fun depth(frames: Int?): Int {
-        val depth = AtomicInteger()
+    /**
+     * 256 KiB のスタックのスレッドで、1 回の再帰の中で、各段で「[StackHeadroom.HOST_CALL_FRAMES] 段」「[StackHeadroom.FUEL_YIELD_FRAMES] 段」の
+     * 確かめを試し、初めて断られた深さと、実際にスタックが尽きた深さを返す（順に fuel・host・尽きた深さ）。
+     *
+     * 別々の再帰の深さを比べると、JIT のコンパイルが途中で終わった回（インタプリタのフレームは大きい）が混ざって順序が入れ替わる。
+     * 1 回の再帰の中なら、残りのスタックは深くなるほど単調に減るので、必要量が大きい確かめほど先に断られる（JIT の状態に頼らない）
+     */
+    private fun firstRefusals(): Triple<Int, Int, Int> {
+        var fuel = -1
+        var host = -1
+        var last = 0
         fun recurse(n: Int): Int {
-            depth.set(n)
-            if (frames != null) StackHeadroom.ensure(frames)
+            last = n
+            if (fuel < 0) {
+                try {
+                    StackHeadroom.ensure(StackHeadroom.FUEL_YIELD_FRAMES)
+                } catch (_: StackOverflowError) {
+                    fuel = n
+                }
+            }
+            if (host < 0) {
+                try {
+                    StackHeadroom.ensure(StackHeadroom.HOST_CALL_FRAMES)
+                } catch (_: StackOverflowError) {
+                    host = n
+                }
+            }
             return recurse(n + 1) + 1
         }
         val t = KernelThread("KiBi-test-headroom", 256L * 1024) {
@@ -23,25 +43,16 @@ class StackHeadroomTest {
         }
         t.start()
         t.join()
-        return depth.get()
+        return Triple(fuel, host, last)
     }
 
     @Test
-    fun `確かめの分だけ、尽きる深さが浅くなる（JIT が再帰をたたんでいない）`() {
-        // 温めてから、3 通りを交互に何回か測り、それぞれの最大を比べる。
-        // 全体のテストで CPU が混むと、JIT のコンパイルが測定の途中で終わり、インタプリタのフレーム（大きい）で測った回が混ざって浅くなる。
-        // 最大を取れば、コンパイル後の（フレームが小さい）回どうしの比べになる
-        repeat(3) { depth(null); depth(StackHeadroom.HOST_CALL_FRAMES); depth(StackHeadroom.FUEL_YIELD_FRAMES) }
-        var plain = 0
-        var host = 0
-        var fuel = 0
-        repeat(15) {
-            plain = maxOf(plain, depth(null))
-            host = maxOf(host, depth(StackHeadroom.HOST_CALL_FRAMES))
-            fuel = maxOf(fuel, depth(StackHeadroom.FUEL_YIELD_FRAMES))
+    fun `確かめの分だけ、尽きる深さが浅くなる（大きい確かめほど先に断られる）`() {
+        repeat(5) {
+            val (fuel, host, last) = firstRefusals()
+            assertTrue(fuel in 0 until host, "fuel $fuel, host $host")
+            assertTrue(host in 0 until last, "host $host, last $last")
         }
-        assertTrue(host < plain, "host $host, plain $plain")
-        assertTrue(fuel < host, "fuel $fuel, host $host")
     }
 
     @Test

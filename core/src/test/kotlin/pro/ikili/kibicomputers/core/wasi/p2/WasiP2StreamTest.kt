@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.api.device.Device
+import pro.ikili.kibicomputers.api.device.DeviceMethods
 import pro.ikili.kibicomputers.core.device.DeviceHandle
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
@@ -672,6 +674,54 @@ class WasiP2StreamTest {
                 val out2 = ctx.p2("wasi:cli/stdout", "get-stdout")!!
                 val written = ctx.p2(streams, "[method]output-stream.blocking-write-and-flush", out2, CanonValue.Bytes("hi".toByteArray()))
                 assertTrue(failure(written).startsWith("nosys"))
+            }
+            m.stop()
+        }
+    }
+
+    private object TestDevice : Device {
+        override val kind = "test:device"
+        override val methods: DeviceMethods = DeviceMethods.builder().build()
+    }
+
+    @Test
+    fun `パスで開いたdeviceのfdはget-typeとstatがunknownで、パスのstat-atとread-directoryはcharacter-device（ADR 0054。#865）`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/dev"))
+            assertNull(m.mountDev())
+            val address = "00000000-0000-4000-8000-000000000865"
+            assertTrue(m.devices.attach(address, TestDevice))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val kind = fsTypes.type<CanonType.Enum>("descriptor-type")
+                val stat = fsTypes.type<CanonType.Record>("descriptor-stat")
+                val typeOf = { d: CanonValue -> kind.caseName(ok(ctx.p2(ty, "[method]descriptor.get-type", d))!!) }
+                val root = root(ctx)
+                // device の fd は UNKNOWN（CHARACTER_DEVICE を返す fd は Tty だけ。p1 の fd_fdstat_get と同じ）
+                val device = ok(openAt(ctx, root, "dev/device/$address", flags = arrayOf("read", "write")))!!
+                assertEquals("unknown", typeOf(device))
+                val st = ok(ctx.p2(ty, "[method]descriptor.stat", device))!!
+                assertEquals("unknown", kind.caseName(stat.field(st, "type")))
+                assertEquals(CanonValue.I64(1), stat.field(st, "link-count"))
+                assertEquals(CanonValue.I64(0), stat.field(st, "size"))
+                // パスの種類は CHARACTER_DEVICE のまま（ls -l 向け）
+                val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
+                val pathStat = ok(ctx.p2(ty, "[method]descriptor.stat-at", root, pf, CanonValue.str("dev/device/$address")))!!
+                assertEquals("character-device", kind.caseName(stat.field(pathStat, "type")))
+                val dir = ok(openAt(ctx, root, "dev/device", flags = arrayOf("read")))!!
+                val ds = ok(ctx.p2(ty, "[method]descriptor.read-directory", dir))!!
+                val entry = ok(ctx.p2(ty, "[method]directory-entry-stream.read-directory-entry", ds)) as CanonValue.Case
+                assertEquals(1, entry.index, "device の項目があるはず")
+                val dirEntry = fsTypes.type<CanonType.Record>("directory-entry")
+                assertEquals(CanonValue.str(address), dirEntry.field(entry.payload!!, "name"))
+                assertEquals("character-device", kind.caseName(dirEntry.field(entry.payload!!, "type")))
+                // ファイル（/dev/null は OpenFile）の fd は VFS の種類（CHARACTER_DEVICE）のまま
+                val devNull = ok(openAt(ctx, root, "dev/null", flags = arrayOf("read", "write")))!!
+                assertEquals("character-device", typeOf(devNull))
+                assertEquals("character-device", kind.caseName(stat.field(ok(ctx.p2(ty, "[method]descriptor.stat", devNull))!!, "type")))
             }
             m.stop()
         }

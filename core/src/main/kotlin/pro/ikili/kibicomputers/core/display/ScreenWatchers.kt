@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.display
 
 import org.jetbrains.annotations.ApiStatus
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 
 /**
  * [ScreenWatchers] が、プレイヤーの位置を調べたり、フラグメントを送ったりするときの口（#359）。接続層が実装する。
@@ -23,6 +24,12 @@ public interface ScreenSyncHost<P : Any> {
 
     /** [player] に、フラグメント [fragment] を送る。 */
     public fun send(player: P, fragment: ByteArray)
+
+    /**
+     * 映している側の公平の組（画面がつながったケースの持ち主。#738）。送信の予算を組の間で回し、組ごとの予算をかけるのに使う。
+     * つながっていない画面は [FairShareGroup.NONE]。tick ごとに呼ぶので、軽く返す
+     */
+    public fun fairShareGroup(): FairShareGroup = FairShareGroup.NONE
 }
 
 /**
@@ -202,11 +209,12 @@ public constructor(
         // 送信量の予算で止められた人のうち、予算の残りに画面全体が収まり、間隔が空いた人に、画面全体を送ってみる
         if (throttled.isNotEmpty()) {
             val keyframeBytes = sender.keyframeBytes
+            val group = host.fairShareGroup()
             val it = throttled.iterator()
             while (it.hasNext()) {
                 val p = it.next()
                 val last = lastKeyframe[p]
-                if ((last == null || now - last >= throttleRetryTicks) && (traffic == null || traffic.hasBudget(p, keyframeBytes))) {
+                if ((last == null || now - last >= throttleRetryTicks) && (traffic == null || traffic.hasBudget(p, keyframeBytes, group))) {
                     it.remove()
                     fresh.add(p)
                 }

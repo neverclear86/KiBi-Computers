@@ -6,6 +6,7 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.sched.KernelThread
 import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
@@ -84,6 +85,9 @@ public class MachineScheduler private constructor(
     private val carryOwner = AtomicBoolean()
     private val blockingCount = AtomicInteger()
 
+    /** 公平の組ごとの、ブロッキング型の枠の数（#738。0 になった組は消す。組ごとの上限がなければ使わない） */
+    private val blockingByGroup = ConcurrentHashMap<FairShareGroup, Int>()
+
     /** 接続層の例外のスタックトレースを、もうログに出した場所（種類・例外のクラス・呼んだ側のスタック。#674） */
     private val hostFailureTraced: MutableSet<List<Any>> = ConcurrentHashMap.newKeySet()
 
@@ -126,10 +130,14 @@ public class MachineScheduler private constructor(
     internal val workers = WorkerPool(config.threadStackBytes, options.workerIdleMillis, options.executor)
 
     /**
-     * 同時に WASM を実行するマシンの数の許可（公平な FIFO。#350）。待機点型の step は、許可を受け取ってからワーカーに渡すので、
-     * 許可を待つ間はスレッドを持たない
+     * 同時に WASM を実行するマシンの数の許可（公平の組の巡回、組の中は FIFO。#350・#738）。待機点型の step は、許可を受け取ってから
+     * ワーカーに渡すので、許可を待つ間はスレッドを持たない
      */
-    internal val permits = PermitPool(config.maxConcurrentMachines, workers)
+    internal val permits = PermitPool(
+        config.maxConcurrentMachines,
+        workers,
+        perGroupLimit = config.maxConcurrentMachinesPerGroup.let { if (it == 0) Int.MAX_VALUE else it },
+    )
 
     /**
      * 起動の手順（`BootSequence`）と復元の前段（`MachineRestore`）を動かすスレッド `KiBi-boot-*`（#350。[SchedulerConfig.maxConcurrentMachines] 本まで、
@@ -152,7 +160,12 @@ public class MachineScheduler private constructor(
     private val compilerExecutor = ProgramCache.compilerExecutor(config.compilerThreads, config.threadStackBytes)
 
     /** 読み込んだ実行ファイルの共有（#37。`Machine.exec` が使う） */
-    internal val programs: ProgramCache = ProgramCache(config.programCacheEntries, config.programCacheBytes, compilerExecutor)
+    internal val programs: ProgramCache = ProgramCache(
+        config.programCacheEntries,
+        config.programCacheBytes,
+        compilerExecutor,
+        maxPendingPerGroup = config.maxPendingLoadsPerGroup.let { if (it == 0) Int.MAX_VALUE else it },
+    )
 
     /**
      * サーバー全体の RAM の勘定（#362。上限は [SchedulerConfig.totalMemoryBytes]）。各マシンの勘定（[Machine.memoryAccount]）の親。
@@ -589,8 +602,47 @@ public class MachineScheduler private constructor(
 
     private class TickWake(val tick: Long, val seq: Long, val machine: Machine)
 
-    /** ブロッキング型のプロセスの枠を1つ取る。上限なら `false` */
-    internal fun tryReserveBlocking(): Boolean {
+    /**
+     * 公平の組 [group] のために、ブロッキング型のプロセスの枠を1つ取る（#738）。組ごとの上限（[SchedulerConfig.maxBlockingProcessesPerGroup]）、
+     * サーバー全体の上限の順に見る。どちらかが上限なら、取らずに [ResourceLimitException]（1 台の上限と同じ断り方）。
+     * 返すときは、同じ [group] を [releaseBlocking] に渡す
+     */
+    @Throws(ResourceLimitException::class)
+    internal fun reserveBlocking(group: FairShareGroup) {
+        val limit = config.maxBlockingProcessesPerGroup
+        if (limit > 0) {
+            var reserved = false
+            // 確かめて足すのを1回の原子操作にする（get してから put すると、ほかのマシンと競合する）
+            blockingByGroup.compute(group) { _, n ->
+                val count = n ?: 0
+                if (count >= limit) {
+                    n
+                } else {
+                    reserved = true
+                    count + 1
+                }
+            }
+            if (!reserved) throw ResourceLimitException("この持ち主のブロッキング型のプロセスの数が上限（$limit）")
+        }
+        if (!tryReserveBlocking()) {
+            if (limit > 0) releaseGroupBlocking(group)
+            throw ResourceLimitException("ブロッキング型のプロセスの数が上限（${config.maxBlockingProcesses}）")
+        }
+    }
+
+    /** ブロッキング型のプロセスの枠を、予約した組 [group] に1つ返す */
+    internal fun releaseBlocking(group: FairShareGroup) {
+        blockingCount.decrementAndGet()
+        if (config.maxBlockingProcessesPerGroup > 0) releaseGroupBlocking(group)
+    }
+
+    /** 組 [group] のブロッキング型の枠の数（テスト用。#738） */
+    internal fun blockingOf(group: FairShareGroup): Int = blockingByGroup[group] ?: 0
+
+    /** 組の数を記録している組の数（テスト用。#738。0 になった組は消える） */
+    internal val blockingGroupCount: Int get() = blockingByGroup.size
+
+    private fun tryReserveBlocking(): Boolean {
         while (true) {
             val n = blockingCount.get()
             if (n >= config.maxBlockingProcesses) return false
@@ -598,8 +650,9 @@ public class MachineScheduler private constructor(
         }
     }
 
-    internal fun releaseBlocking() {
-        blockingCount.decrementAndGet()
+    // 0 になった組は消す（今までに見たすべての持ち主を溜めない）
+    private fun releaseGroupBlocking(group: FairShareGroup) {
+        blockingByGroup.computeIfPresent(group) { _, n -> if (n <= 1) null else n - 1 }
     }
 
     /** 一時停止でなければ、[rt] を実行中に数えて `true`。カーネルロックの中から呼ぶ（このロックは末端） */
@@ -704,6 +757,25 @@ public class SchedulerConfig private constructor(builder: Builder) {
     public val maxBlockingProcesses: Int = builder.maxBlockingProcesses
 
     /**
+     * 1つの公平の組（持ち主。#738、ADR 0738）が同時に持てる、[maxConcurrentMachines] の許可の数（0 は上限なし。仮: 0）。
+     * 組の間の公平は巡回で取るので、既定では上限を置かない（持ち主が1人のシングルプレイ・持ち主なしだけのワールドで、許可が空いたまま
+     * 遅くならないように）
+     */
+    public val maxConcurrentMachinesPerGroup: Int = builder.maxConcurrentMachinesPerGroup
+
+    /**
+     * 1つの公平の組（持ち主）のブロッキング型プロセスの数の上限（0 は上限なし。仮: 256。#738）。
+     * ブロッキング型はスレッドを長く持ち続け、巡回では公平にならないので、上限で分ける
+     */
+    public val maxBlockingProcessesPerGroup: Int = builder.maxBlockingProcessesPerGroup
+
+    /**
+     * 1つの公平の組（持ち主）の、読み込み中・待ち行列にある実行ファイルの読み込みの数の上限（0 は上限なし。仮: 64。#738）。
+     * 超えたゲストの `exec` は `AGAIN`。init と復元の読み込みは、この上限では断らない（起動の失敗・冷えた起動にしない）
+     */
+    public val maxPendingLoadsPerGroup: Int = builder.maxPendingLoadsPerGroup
+
+    /**
      * 実行ファイルの読み込み（燃料の計測コードの挿入・パース・コンパイル）を行うスレッドの数（仮: 1。#37）。
      * 優先度を下げたスレッドで、仕事がなければ終わる
      */
@@ -748,6 +820,9 @@ public class SchedulerConfig private constructor(builder: Builder) {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
         internal var threadStackBytes: Long = 16L * 1024 * 1024
         internal var maxBlockingProcesses: Int = 2048
+        internal var maxConcurrentMachinesPerGroup: Int = 0
+        internal var maxBlockingProcessesPerGroup: Int = 256
+        internal var maxPendingLoadsPerGroup: Int = 64
         internal var compilerThreads: Int = 1
         internal var programCacheEntries: Int = 32
         internal var programCacheBytes: Long = 32L * 1024 * 1024
@@ -771,6 +846,24 @@ public class SchedulerConfig private constructor(builder: Builder) {
         public fun maxBlockingProcesses(value: Int): Builder = apply {
             require(value >= 0) { "maxBlockingProcesses は 0 以上" }
             maxBlockingProcesses = value
+        }
+
+        /** 1つの公平の組が同時に持てる許可の数（0 以上。0 は上限なし。#738） */
+        public fun maxConcurrentMachinesPerGroup(value: Int): Builder = apply {
+            require(value >= 0) { "maxConcurrentMachinesPerGroup は 0 以上" }
+            maxConcurrentMachinesPerGroup = value
+        }
+
+        /** 1つの公平の組のブロッキング型プロセスの数の上限（0 以上。0 は上限なし。#738） */
+        public fun maxBlockingProcessesPerGroup(value: Int): Builder = apply {
+            require(value >= 0) { "maxBlockingProcessesPerGroup は 0 以上" }
+            maxBlockingProcessesPerGroup = value
+        }
+
+        /** 1つの公平の組の、読み込み中・待ち行列にある読み込みの数の上限（0 以上。0 は上限なし。#738） */
+        public fun maxPendingLoadsPerGroup(value: Int): Builder = apply {
+            require(value >= 0) { "maxPendingLoadsPerGroup は 0 以上" }
+            maxPendingLoadsPerGroup = value
         }
 
         /** 実行ファイルを読み込むスレッドの数（1 以上） */

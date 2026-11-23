@@ -6,7 +6,12 @@ import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
 
 /**
- * サーバー全体の許可（同時に WASM を実行するマシンの数の上限。#350）。公平な FIFO で手渡す。
+ * サーバー全体の許可（同時に WASM を実行するマシンの数の上限。#350）。公平の組（[FairShareGroup]。持ち主ごと。#738、ADR 0738）の
+ * 二段で手渡す: 待ち手のある組を巡回して1つずつ渡し、組の中は FIFO にする。1台が許可の列に並ぶのは同時に高々1つなので、
+ * 組の中の FIFO がそのまま「マシンの間で回す」になる。組が1つだけなら、#738 より前と同じ FIFO。
+ * 組ごとに、同時に持てる許可の数を [perGroupLimit] までにする。上限の組は巡回から外して待たせ、その組の許可が返って上限を
+ * 下回ったら、同じ [release] の中で巡回に戻す（空いた許可を取りこぼさない）。返すときは、借りたときの組に返す（持ち主が
+ * 変わっても、並んだ・借りた組の数を合わせるため）。待ち手も貸し出しもない組は表から消す。
  *
  * 待ち手は「止まっているスレッド」（[acquire]。ブロッキング型の専用スレッドと、step の途中で CPU を取り直すワーカー）と、
  * 「スレッドを持たない仕事」（[submit]。CPU を受け取った待機点型のプロセスの step）の2種類。
@@ -33,13 +38,39 @@ internal class PermitPool(
     private val workers: WorkerPool,
     private val summaryIntervalTicks: Long = SUMMARY_INTERVAL_TICKS,
     private val log: System.Logger = LOG,
+    /** 1つの組が同時に持てる許可の数（1 以上。`Int.MAX_VALUE` で上限なし。#738） */
+    private val perGroupLimit: Int = Int.MAX_VALUE,
 ) {
-    private class Node(val task: Runnable?, val key: Any?, val condition: Condition?) {
+    init {
+        require(perGroupLimit >= 1) { "perGroupLimit は 1 以上: $perGroupLimit" }
+    }
+
+    private class Node(val task: Runnable?, val key: Any?, val condition: Condition?, val group: Group) {
         var granted = false
     }
 
+    /** 組1つの待ち手と貸し出しの数（中のロックの中で読み書きする） */
+    private class Group(val id: FairShareGroup) {
+        /** 許可を待っている待ち手（組の中は FIFO） */
+        val queue = ArrayDeque<Node>()
+
+        /** この組に貸し出している許可の数（取り残しの列の仕事の分も含む） */
+        var held = 0
+
+        /** [rotation] に入っている */
+        var inRotation = false
+    }
+
     private val lock = ReentrantLock()
-    private val queue = ArrayDeque<Node>()
+
+    /** 待ち手か貸し出しのある組 */
+    private val groups = HashMap<FairShareGroup, Group>()
+
+    /** 待ち手があり、上限に達していない組の巡回の順（先頭が次） */
+    private val rotation = ArrayDeque<Group>()
+
+    /** 待ち手の数の合計 */
+    private var queued = 0
     private var available = permits
 
     /**
@@ -100,7 +131,13 @@ internal class PermitPool(
     fun availablePermits(): Int = lock.withLockValue { available }
 
     /** 許可を待っている数（テスト用） */
-    val waiting: Int get() = lock.withLockValue { queue.size }
+    val waiting: Int get() = lock.withLockValue { queued }
+
+    /** [group] に貸し出している許可の数（テスト用。#738） */
+    fun heldBy(group: FairShareGroup): Int = lock.withLockValue { groups[group]?.held ?: 0 }
+
+    /** 表に残っている組の数（テスト用。#738。待ち手も貸し出しもない組は消える） */
+    val groupCount: Int get() = lock.withLockValue { groups.size }
 
     /** 許可を持ったまま、ワーカーに渡すのを待っている仕事の数（テスト用。#870） */
     val strandedTasks: Int get() = lock.withLockValue { stranded.size }
@@ -111,26 +148,27 @@ internal class PermitPool(
     /** [thread] が中のロックを待っているか（テスト用。#870） */
     fun hasQueuedThreadForTest(thread: Thread): Boolean = lock.hasQueuedThread(thread)
 
-    /** スレッドで許可を取る。取れるまで止まる。割り込まれたら [InterruptedException] */
+    /**
+     * スレッドで、組 [group] の許可を取る。取れるまで止まる。割り込まれたら [InterruptedException]。
+     * 返すときは、同じ [group] を [release] に渡す
+     */
     @Throws(InterruptedException::class)
-    fun acquire() {
+    fun acquire(group: FairShareGroup = FairShareGroup.NONE) {
         var dispatch: Runnable? = null
         lock.lockInterruptibly()
         try {
-            if (available > 0 && queue.isEmpty()) {
-                available--
-                return
-            }
+            val g = groupLocked(group)
+            if (tryTakeLocked(g)) return
             val thread = Thread.currentThread()
-            val node = Node(null, null, lock.newCondition())
+            val node = Node(null, null, lock.newCondition(), g)
             threadWaiters[thread] = node
-            queue.addLast(node)
+            enqueueLocked(node)
             try {
                 while (!node.granted) node.condition!!.await()
             } catch (e: InterruptedException) {
                 threadWaiters.remove(thread)
-                // 渡された直後に割り込まれたら、次へ渡し直す
-                if (node.granted) dispatch = handOffLocked(inline = false) else queue.remove(node)
+                // 渡された直後に割り込まれたら、借りた組から外して次へ渡し直す
+                dispatch = leaveLocked(node)
                 throw e
             }
             threadWaiters.remove(thread)
@@ -153,7 +191,7 @@ internal class PermitPool(
         lock.lock()
         try {
             val node = threadWaiters.remove(thread) ?: return false
-            if (node.granted) dispatch = handOffLocked(inline = false) else queue.remove(node)
+            dispatch = leaveLocked(node)
             return true
         } finally {
             lock.unlock()
@@ -162,16 +200,18 @@ internal class PermitPool(
     }
 
     /** [thread] が [acquire] で待っている途中だったまねをする（テスト用。#828）。[granted] なら、許可を 1 つ渡し終えた待ち手にする */
-    fun leaveWaiterForTest(thread: Thread, granted: Boolean) {
+    fun leaveWaiterForTest(thread: Thread, granted: Boolean, group: FairShareGroup = FairShareGroup.NONE) {
         lock.withLockValue {
-            val node = Node(null, null, lock.newCondition())
+            val g = groupLocked(group)
+            val node = Node(null, null, lock.newCondition(), g)
             threadWaiters[thread] = node
             if (granted) {
                 check(available > 0) { "空いている許可がない" }
                 available--
+                g.held++
                 node.granted = true
             } else {
-                queue.addLast(node)
+                enqueueLocked(node)
             }
         }
     }
@@ -180,14 +220,14 @@ internal class PermitPool(
      * スレッドを持たない仕事 [task] を並べる。許可が空いていれば、すぐワーカーに渡す。
      * [task] は許可を持って動き、自分で [release] する。[key] は [remove] で外すときの目印。
      * すぐ渡すときにワーカーに渡せずに投げたら（スレッドを作れないとき）、取った許可は返してから、同じ例外を投げ直す（#629）。
-     * 並べた仕事を後で渡すときに渡せなかったら、投げずに取り残しの列に入れる（#870）
+     * 並べた仕事を後で渡すときに渡せなかったら、投げずに取り残しの列に入れる（#870）。
+     * [task] は組 [group] の許可を持って動くので、返すときは同じ [group] を [release] に渡す
      */
-    fun submit(key: Any, task: Runnable) {
+    fun submit(key: Any, group: FairShareGroup, task: Runnable) {
         lock.withLockValue {
-            if (available > 0 && queue.isEmpty()) {
-                available--
-            } else {
-                queue.addLast(Node(task, key, null))
+            val g = groupLocked(group)
+            if (!tryTakeLocked(g)) {
+                enqueueLocked(Node(task, key, null, g))
                 return
             }
         }
@@ -197,7 +237,7 @@ internal class PermitPool(
             // ワーカーのスレッドを作れないときなど。仕事は動かず、取った許可を返す者がいないので、ここで返して投げ直す（#629）。
             // 返した許可の次の仕事を渡せなくても、release は投げずに取り残しの列へ入れる（#870）
             try {
-                release()
+                release(group)
             } catch (e: Throwable) {
                 if (e !== t) t.addSuppressed(e)
             }
@@ -207,19 +247,41 @@ internal class PermitPool(
         retryStranded()
     }
 
+    /** 組 [FairShareGroup.NONE] で [submit] する（テスト用の短い形） */
+    fun submit(key: Any, task: Runnable): Unit = submit(key, FairShareGroup.NONE, task)
+
     /**
      * まだ許可を受け取っていない、[key] の仕事を外す（止めたとき）。外したら `true`。
      * 取り残しの列（許可を受け取り済み）には触らない。そこにある step は、後で動いたときに止められていると知り、許可を返して終わる
      */
-    fun remove(key: Any): Boolean = lock.withLockValue { queue.removeAll { it.key === key } }
+    fun remove(key: Any): Boolean = lock.withLockValue {
+        // 止めたときだけ呼ぶ（step の道ではない）。待ち手のある組だけを見る
+        var removed = false
+        for (g in groups.values.toList()) {
+            if (g.queue.isEmpty()) continue
+            val before = g.queue.size
+            if (!g.queue.removeAll { it.key === key }) continue
+            removed = true
+            queued -= before - g.queue.size
+            if (g.queue.isEmpty() && g.inRotation) {
+                rotation.remove(g)
+                g.inRotation = false
+            }
+            dropIfIdleLocked(g)
+        }
+        removed
+    }
 
     /**
-     * 許可を1つ返して、次の待ち手へ渡す。投げない（次の仕事をワーカーに渡せなければ、取り残しの列に入れる。#870）。
+     * 組 [group]（借りたときの組）の許可を1つ返して、次の待ち手へ渡す。投げない（次の仕事をワーカーに渡せなければ、取り残しの列に入れる。#870）。
      *
      * @param inline 次がスレッドを持たない仕事なら、今のワーカーの続きにする（ワーカーの中で、step の終わりにだけ使う）
      */
-    fun release(inline: Boolean = false) {
-        val dispatch = lock.withLockValue { handOffLocked(inline) } ?: return
+    fun release(group: FairShareGroup = FairShareGroup.NONE, inline: Boolean = false) {
+        val dispatch = lock.withLockValue {
+            groups[group]?.let { returnLocked(it) }
+            handOffLocked(inline)
+        } ?: return
         // ワーカーに渡せたときだけ、取り残しを渡し直す（空きに戻しただけ・続きにしただけのときは、tick を待つ）
         if (dispatchGranted(dispatch)) retryStranded()
     }
@@ -346,13 +408,83 @@ internal class PermitPool(
         }
     }
 
-    /** 先頭に許可を渡す。ワーカーに渡す仕事があれば返す（ロックの外で渡す） */
+    /** [id] の組（なければ作る） */
+    private fun groupLocked(id: FairShareGroup): Group = groups.getOrPut(id) { Group(id) }
+
+    /**
+     * 並ばずに取れるなら取って `true`。巡回が空（上限の内で待っている組がない）で、許可が空いていて、[g] が上限の内のとき。
+     * 取れなければ `false`（呼び手が並べる）
+     */
+    private fun tryTakeLocked(g: Group): Boolean {
+        if (available > 0 && rotation.isEmpty() && g.held < perGroupLimit) {
+            available--
+            g.held++
+            return true
+        }
+        return false
+    }
+
+    /** [node] を組の列の後ろに並べる（組が上限の内で、まだ巡回になければ巡回の後ろに入れる） */
+    private fun enqueueLocked(node: Node) {
+        val g = node.group
+        g.queue.addLast(node)
+        queued++
+        if (!g.inRotation && g.held < perGroupLimit) {
+            rotation.addLast(g)
+            g.inRotation = true
+        }
+    }
+
+    /**
+     * 待ちの途中で抜けた [node]（割り込み・スタックが尽きた）を片付ける。まだ渡されていなければ列から外す。
+     * もう渡されていれば、受け取る者のいない許可なので、借りた組から外して次へ渡す（ワーカーに渡す仕事を返す）
+     */
+    private fun leaveLocked(node: Node): Runnable? {
+        val g = node.group
+        if (node.granted) {
+            returnLocked(g)
+            return handOffLocked(inline = false)
+        }
+        if (g.queue.remove(node)) {
+            queued--
+            if (g.queue.isEmpty() && g.inRotation) {
+                rotation.remove(g)
+                g.inRotation = false
+            }
+        }
+        dropIfIdleLocked(g)
+        return null
+    }
+
+    /** [g] の貸し出しを1つ減らす。上限を下回って待ち手があれば、巡回の後ろに戻す。空になれば表から消す */
+    private fun returnLocked(g: Group) {
+        if (g.held > 0) g.held--
+        if (!g.inRotation && g.queue.isNotEmpty() && g.held < perGroupLimit) {
+            rotation.addLast(g)
+            g.inRotation = true
+        }
+        dropIfIdleLocked(g)
+    }
+
+    /** 待ち手も貸し出しもない [g] を表から消す（今までに見たすべての組を溜めない） */
+    private fun dropIfIdleLocked(g: Group) {
+        if (g.held == 0 && g.queue.isEmpty() && groups[g.id] === g) groups.remove(g.id)
+    }
+
+    /**
+     * 巡回の先頭の組の、先頭の待ち手に許可を渡す。渡した組は、待ち手が残っていて上限の内なら巡回の後ろへ回す。
+     * 渡す相手がいなければ、空きに戻す。ワーカーに渡す仕事があれば返す（ロックの外で渡す）
+     */
     private fun handOffLocked(inline: Boolean): Runnable? {
-        val next = queue.removeFirstOrNull()
-        if (next == null) {
+        val g = rotation.removeFirstOrNull()
+        if (g == null) {
             available++
             return null
         }
+        val next = g.queue.removeFirst()
+        queued--
+        g.held++
+        if (g.queue.isNotEmpty() && g.held < perGroupLimit) rotation.addLast(g) else g.inRotation = false
         next.granted = true
         if (next.condition != null) {
             next.condition.signal()
