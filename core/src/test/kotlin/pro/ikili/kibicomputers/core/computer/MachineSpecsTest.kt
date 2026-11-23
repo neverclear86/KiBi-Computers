@@ -19,7 +19,7 @@ class MachineSpecsTest {
 
     @Test
     fun `何も挿さっていなければ既定の設定`() {
-        val config = MachineSpecs.configOf(CaseTier.SUPERIOR) { null }
+        val config = MachineSpecs.configOf(CaseTier.SUPERIOR, { null })
         assertEquals(MachineConfig.DEFAULT.fuelPerTick, config.fuelPerTick)
         assertEquals(MachineConfig.DEFAULT.memoryBytes, config.memoryBytes)
         assertEquals(MachineConfig.DEFAULT.maxDevices, config.maxDevices)

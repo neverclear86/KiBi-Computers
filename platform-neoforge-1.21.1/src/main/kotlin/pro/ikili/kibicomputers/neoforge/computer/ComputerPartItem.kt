@@ -8,6 +8,8 @@ import net.minecraft.world.item.TooltipFlag
 import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 
 /**
  * ケースに挿す部品のアイテム（#347）。種類（[kind]）とティア（[tier]）で性能が決まる（[PartTier]）。
@@ -18,10 +20,12 @@ import pro.ikili.kibicomputers.core.computer.PartTier
 open class ComputerPartItem(val kind: PartKind, val tier: PartTier, properties: Properties) : Item(properties) {
     override fun appendHoverText(stack: ItemStack, context: TooltipContext, tooltip: MutableList<Component>, flag: TooltipFlag) {
         super.appendHoverText(stack, context, tooltip, flag)
+        // 性能値はコンフィグ（#719）から。クライアントでは、サーバーから同期された写し（同期の前は既定の値）
+        val spec = KiBiConfig.machineProfile(KiBiConfigs.server).spec(tier)
         val line = when (kind) {
-            PartKind.CPU -> Component.translatable("$TOOLTIP.cpu", tier.cpuFuelPerTick)
-            PartKind.MEMORY -> Component.translatable("$TOOLTIP.memory", tier.memoryBytes / (1024 * 1024))
-            PartKind.STORAGE -> Component.translatable("$TOOLTIP.storage", tier.diskBytes / (1024 * 1024), tier.diskEntries)
+            PartKind.CPU -> Component.translatable("$TOOLTIP.cpu", spec.cpuFuelPerTick)
+            PartKind.MEMORY -> Component.translatable("$TOOLTIP.memory", spec.memoryBytes / (1024 * 1024))
+            PartKind.STORAGE -> Component.translatable("$TOOLTIP.storage", spec.diskBytes / (1024 * 1024), spec.diskEntries)
             else -> null
         }
         line?.let { tooltip.add(it.withStyle(ChatFormatting.GRAY)) }

@@ -13,10 +13,16 @@ internal object EventLimits {
     /** キューの件数の最大値。`openEventQueue` の capacity は `1..MAX_CAPACITY` */
     const val MAX_CAPACITY: Int = 256
 
-    /** マシンあたりのキューの数 */
+    /** マシンあたりのキューの数の既定（`MachineConfig.maxEventQueues` の既定。#719） */
     const val MAX_QUEUES: Int = 64
 
-    /** マシン全体で溜めるイベントの見積もり（[KernelEvent.footprint]）の合計（バイト） */
+    /**
+     * マシンあたりのキューの数の、設定できる最大（#719）。保存データの復号は、この数で項目の数を確かめる
+     * （設定を上げたまま保存した台を、同じ設定で戻せるように。設定の上限はこれを超えない）
+     */
+    const val MAX_QUEUES_CEILING: Int = 1024
+
+    /** マシン全体で溜めるイベントの見積もり（[KernelEvent.footprint]）の合計の既定（バイト。`MachineConfig.maxPendingEventBytes` の既定。#719） */
     const val MAX_PENDING_BYTES: Int = 256 * 1024
 
     /** 1イベントの固定の見積もり（`KernelEvent` 自体、値の並び、キューの中の場所。バイト） */

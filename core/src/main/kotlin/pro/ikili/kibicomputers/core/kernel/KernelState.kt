@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import pro.ikili.kibicomputers.core.kernel.event.EventHub
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
 import pro.ikili.kibicomputers.core.kernel.obj.ObjectTable
 import pro.ikili.kibicomputers.core.kernel.process.KernelStateView
 import pro.ikili.kibicomputers.core.kernel.process.ProcessTable
@@ -14,7 +15,13 @@ import pro.ikili.kibicomputers.core.kernel.vfs.MountTable
  * オブジェクト同士・プロセスとオブジェクトの間は、番号（pid、オブジェクトID、ハンドル番号）で指す。
  * マシンのカーネルロックの中でだけ読み書きする。
  */
-internal class KernelState(maxProcesses: Int) : KernelStateView {
+internal class KernelState(
+    maxProcesses: Int,
+    /** イベントキューの数の上限（`MachineConfig.maxEventQueues`。#719） */
+    maxEventQueues: Int = EventLimits.MAX_QUEUES,
+    /** 溜めるイベントの見積もりの合計の上限（`MachineConfig.maxPendingEventBytes`。#719） */
+    maxPendingEventBytes: Int = EventLimits.MAX_PENDING_BYTES,
+) : KernelStateView {
     /** pid → プロセス（と次に割り当てる pid） */
     override val processes: ProcessTable = ProcessTable(maxProcesses)
 
@@ -22,7 +29,7 @@ internal class KernelState(maxProcesses: Int) : KernelStateView {
     override val objects: ObjectTable = ObjectTable()
 
     /** イベントの種類 → イベントキューのオブジェクトID の索引（#63、ADR 0063） */
-    val events: EventHub = EventHub()
+    val events: EventHub = EventHub(maxEventQueues, maxPendingEventBytes)
 
     /** VFS のマウントの表（ファイルシステムそのものは実行時だけ。`Machine.vfs` が持つ。ADR 0051） */
     val mounts: MountTable = MountTable()

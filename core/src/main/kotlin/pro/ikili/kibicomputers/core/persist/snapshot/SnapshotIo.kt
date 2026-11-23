@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.persist.snapshot
 
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.SnapshotLimitException
 
 /**
  * 節の中身を書く（#82、ADR 0082）。数値はビッグエンディアン、可変長の整数は使わない。文字列は u32 のバイト数 + UTF-8
@@ -126,6 +127,18 @@ internal class SnapshotReader(private val buf: ByteArray, private var pos: Int =
     fun count(max: Int, minBytesEach: Int = 0): Int {
         val n = i32().toLong() and 0xFFFF_FFFFL
         if (n > max) throw SnapshotFormatException("数 $n が上限 $max を超える")
+        if (n * minBytesEach > remaining) throw SnapshotFormatException("数 $n が残りの長さ $remaining に収まらない")
+        return n.toInt()
+    }
+
+    /**
+     * [count] と同じだが、[max] を超え [ceiling] 以下の数は、壊れているのではなく今の上限に収まらないもの
+     * （上限を下げる前に保存した）として [SnapshotLimitException] にする（#719）
+     */
+    fun countWithin(max: Int, ceiling: Int, minBytesEach: Int = 0): Int {
+        val n = i32().toLong() and 0xFFFF_FFFFL
+        if (n > maxOf(max, ceiling)) throw SnapshotFormatException("数 $n が上限 ${maxOf(max, ceiling)} を超える")
+        if (n > max) throw SnapshotLimitException("数 $n が今の上限 $max を超える")
         if (n * minBytesEach > remaining) throw SnapshotFormatException("数 $n が残りの長さ $remaining に収まらない")
         return n.toInt()
     }

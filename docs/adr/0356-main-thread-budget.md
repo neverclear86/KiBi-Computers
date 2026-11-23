@@ -64,4 +64,4 @@
 ## 今の制限
 
 - 負荷試験は `docs/load-test.md` の「メインスレッドのメソッドを呼び続ける」の段階（`-PloadTestHostCallers`。既定では動かさない）と、「#356 の結果」。1,000 台のうち 200 台が 1件 100 µs のメソッドを呼び続けても、MSPT の入力待ちとの差は予算の付近（+5.0 ms）で頭打ちになる（予算なしでは +21 ms）。予算は試験用の差し替え（`MachineScheduler.mainThreadBudgetOverrideNanos`）で切って比べる。コンフィグの項目ではない。
-- 予算はまだコンフィグの項目にしていない（#202・#719 で扱う）。
+- 予算はまだコンフィグの項目にしていない（#202・#719 で扱う）。→ #719 で `scheduler.mainThreadBudgetMicros`（マイクロ秒。次にワールドを開いたときに効く）にした。負荷試験の上書き（`mainThreadBudgetOverrideNanos`）が優先なのは変わらない（ADR 0719）。

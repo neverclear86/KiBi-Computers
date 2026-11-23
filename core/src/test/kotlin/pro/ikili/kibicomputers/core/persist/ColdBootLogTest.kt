@@ -17,7 +17,7 @@ class ColdBootLogTest {
     @Test
     fun `ほかの理由とnullは、MOD_VERSIONの前後どちらでも毎回EACH`() {
         val log = ColdBootLog()
-        val others = ColdBootCause.entries.filter { it != ColdBootCause.MOD_VERSION } + listOf<ColdBootCause?>(null)
+        val others = ColdBootCause.entries.filter { it != ColdBootCause.MOD_VERSION && it != ColdBootCause.OVER_LIMIT } + listOf<ColdBootCause?>(null)
         for (cause in others) assertEquals(ColdBootLog.Kind.EACH, log.classify(cause), "前: $cause")
         assertEquals(ColdBootLog.Kind.SUMMARY, log.classify(ColdBootCause.MOD_VERSION), "ほかの理由は要約の1回を使わない")
         for (cause in others) assertEquals(ColdBootLog.Kind.EACH, log.classify(cause), "後: $cause")
@@ -31,5 +31,14 @@ class ColdBootLogTest {
         assertEquals(ColdBootLog.Kind.QUIET, first.classify(ColdBootCause.MOD_VERSION))
         val second = ColdBootLog()
         assertEquals(ColdBootLog.Kind.SUMMARY, second.classify(ColdBootCause.MOD_VERSION))
+    }
+
+    @Test
+    fun `上限を下げた後のOVER_LIMITも、MOD_VERSIONとは別に1回だけSUMMARY`() {
+        val log = ColdBootLog()
+        assertEquals(ColdBootLog.Kind.SUMMARY, log.classify(ColdBootCause.MOD_VERSION))
+        assertEquals(ColdBootLog.Kind.SUMMARY, log.classify(ColdBootCause.OVER_LIMIT), "理由ごとに要約を1回")
+        assertEquals(ColdBootLog.Kind.QUIET, log.classify(ColdBootCause.OVER_LIMIT))
+        assertEquals(ColdBootLog.Kind.QUIET, log.classify(ColdBootCause.MOD_VERSION))
     }
 }
