@@ -9,11 +9,13 @@ import org.junit.jupiter.api.fail
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
+import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import java.time.Duration
 import java.util.Collections
 import java.util.ResourceBundle
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -302,6 +304,66 @@ internal class PermitHandOffFailureTest {
             // b は許可を持ったまま止める（b が許可を返す release が渡し直すのではなく、submit が渡し直すことを確かめる）
             val gate = CountDownLatch(1)
             f.pool.submit("b") {
+                f.order += "b"
+                gate.await(10, TimeUnit.SECONDS)
+                f.pool.release()
+            }
+            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            assertEquals(0, f.pool.strandedTasks)
+            assertEquals(1, f.order.count { it == "a" })
+            gate.countDown()
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 2 }
+        }
+    }
+
+    @Test
+    fun `submitOrStrandは直接渡せなくても投げず、許可を持たせたまま取り残し、その場では渡し直さない`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(1).use { f ->
+            val group = FairShareGroup.of(UUID(0, 1))
+            val done = CountDownLatch(1)
+            val task = Runnable {
+                f.order += "a"
+                f.pool.release(group)
+                done.countDown()
+            }
+            // 1回だけ失敗させる。失敗の直後に渡し直していれば、2回目の execute が通って取り残しが消える
+            f.executor.failuresLeft.set(1)
+            assertDoesNotThrow { f.pool.submitOrStrand("a", group, task) }
+            assertEquals(1, f.pool.strandedTasks, "許可を持ったまま取り残しの列に入る")
+            assertEquals(0, f.pool.availablePermits(), "取った許可は返さない（取り残した仕事が持つ）")
+            assertEquals(1, f.pool.heldBy(group), "借りた組の貸し出しに残る")
+            assertEquals(0, f.pool.waiting)
+            assertEquals(1L, f.pool.handOffFailures.get())
+            assertTrue(f.order.isEmpty(), "失敗の直後には渡し直さない")
+            // tick で渡し直すと動き、借りた組に許可が戻る
+            f.pool.tick(1)
+            assertTrue(done.await(5, TimeUnit.SECONDS), "tick で渡し直されない")
+            waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
+            assertEquals(0, f.pool.heldBy(group))
+            assertEquals(0, f.pool.strandedTasks)
+            assertEquals(listOf("a"), f.order.toList(), "1回だけ動く")
+        }
+    }
+
+    @Test
+    fun `submitOrStrandでワーカーに渡せたら、取り残していた仕事も渡し直す（tickを待たない）`() = timeout(Duration.ofSeconds(30)) {
+        Fixture(2).use { f ->
+            val done = CountDownLatch(1)
+            f.pool.acquire()
+            f.pool.acquire()
+            f.pool.submit("a", f.task("a", done))
+            // release の渡しを失敗させ、a を取り残しの列に入れる
+            f.executor.failuresLeft.set(1)
+            f.pool.release()
+            assertEquals(1, f.pool.strandedTasks)
+            // 許可を空きに戻すだけの release（渡し直しは試みない）
+            f.pool.release()
+            assertEquals(1, f.pool.strandedTasks, "a は取り残されたまま")
+            assertEquals(1, f.pool.availablePermits())
+            // 空いた許可で直接渡す。渡せたら a も渡し直される（retryStranded も tick も呼ばない）
+            // b は許可を持ったまま止める（b が許可を返す release ではなく、submitOrStrand が渡し直すことを確かめる）
+            val gate = CountDownLatch(1)
+            f.pool.submitOrStrand("b", FairShareGroup.NONE) {
                 f.order += "b"
                 gate.await(10, TimeUnit.SECONDS)
                 f.pool.release()
