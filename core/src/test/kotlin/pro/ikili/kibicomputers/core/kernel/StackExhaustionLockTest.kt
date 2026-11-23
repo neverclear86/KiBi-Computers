@@ -329,7 +329,8 @@ class StackExhaustionLockTest {
             val otherProgress = AtomicInteger()
             val sameSpin = m.spawnRt(h.program(spinForever(sameProgress)), runDriver(kind))
             val otherSpin = other.spawnRt(h.program(spinForever(otherProgress)), runDriver(kind))
-            h.tickUntilTrue("spin が動かない") { sameProgress.get() > 0 && otherProgress.get() > 0 }
+            val starting = { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), null, tally) }
+            awaitOrClassify(ticker, "spin が動く", starting) { sameProgress.get() > 0 && otherProgress.get() > 0 }
             val permits = config.maxConcurrentMachines
             // Body.BLOCK: 犠牲のプロセスが block で待ちに入ったら、1 バイト書いて起こす（待ちに入ったのを見てから書く。先に書くと、
             // block がすぐそろう道しか通らない）。
