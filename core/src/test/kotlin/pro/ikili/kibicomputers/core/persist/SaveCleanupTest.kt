@@ -906,8 +906,8 @@ class SaveCleanupTest {
         val writer = SaveWriter("kibicomputers-cleanup-test")
         val gate = java.util.concurrent.CountDownLatch(1)
         try {
-            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める
-            assertTrue(writer.execute(UUID.randomUUID()) { gate.await(10, java.util.concurrent.TimeUnit.SECONDS) })
+            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める（門は期限で勝手に開かない。finally で必ず開ける）
+            assertTrue(writer.execute(UUID.randomUUID()) { gate.await() })
             val store = MachineSaveStore(machines, MachineIdIndex(), "test", writer)
             val cleanup = cleanup(store, FileModuleStore(modulesRoot))
             cleanup.tick()
@@ -915,7 +915,8 @@ class SaveCleanupTest {
             assertTrue(cleanup.settling)
             gate.countDown()
             runThreaded(cleanup) { !cleanup.settling }
-            assertTrue(writer.flush(10_000))
+            // 列が空くのを、壁時計の期限で合否を決めずに待つ（#878。止まったときはメソッドの Timeout が落とす）
+            assertTrue(writer.flush(Long.MAX_VALUE))
             repeat(5) { cleanup.tick() }
             assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
             assertTrue(asked.isEmpty())

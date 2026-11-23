@@ -16,13 +16,20 @@ import java.util.concurrent.TimeUnit
  * 待ちにした claim の `owner.bin` を、書き込みの列の外の読み手で読む（#877、ADR 0084 の規則 7a）のテスト。
  * その ID の仕事が列に残っていなければ、ほかの ID の仕事で列が詰まっていても読み手が読んで決まり、残っていれば今までどおり列の後ろで読む。
  * 読み手が開いている間は、書き込みのスレッドがその ID の `owner.bin` を置き換えない。
- * 読み手（実スレッド）の結果は壁時計の期限で合否を決めずに待つ（#878。待ちの上限 `claimWaitMillis` も 1 日にして、上限で決まらないようにしている）。
+ * 読み手（実スレッド）の結果と止まるのは、壁時計の期限で合否を決めずに待つ（#878。待ちの上限 `claimWaitMillis` も 1 日にして、上限で決まらないようにし、
+ * 上限に届かなかったことは `KEPT` と `deferredClaimTimeouts == 0` で見る。`close` にも上限を付けない）。
  * クラスの [Timeout] は、止まったときの保険で、合否の基準ではない
  */
 @Timeout(10, unit = TimeUnit.MINUTES)
 class MachineSideOwnerReadTest {
     private companion object {
         val CLAIM_WAIT_MILLIS: Long = TimeUnit.DAYS.toMillis(1)
+
+        /**
+         * `close` に渡す上限。列の外の読み手（実スレッド）が止まるのを、壁時計の期限で合否を決めずに待つ（#878）。
+         * 止まらないときは、クラスの [Timeout] が落とす
+         */
+        const val NO_DEADLINE: Long = Long.MAX_VALUE
     }
 
     @TempDir
@@ -83,7 +90,7 @@ class MachineSideOwnerReadTest {
         assertEquals(0, store.deferredClaimTimeouts, "上限で決まったのではなく、読み手が読んで決まった")
         assertEquals(0, store.mainOwnerReads, "メインスレッドで読まない")
         assertEquals(queued, manual.size, "列の仕事は 1 つも走っていない")
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
     }
 
     @Test
@@ -105,7 +112,7 @@ class MachineSideOwnerReadTest {
         // 引き取りの後の owner.bin (1, at(1)) を読んで、さらに引き取る
         assertEquals(ClaimResult.TAKEN_OVER, done.single().claim.result)
         assertEquals(MachineIdentity(id, 0, 2), done.single().claim.identity)
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
     }
 
     @Test
@@ -142,7 +149,7 @@ class MachineSideOwnerReadTest {
         // 待っていた写しは、引き取った台が索引にいるので重複になる（覚えている owner.bin で判定し直す）
         val done = pollUntil(store, 1)
         assertEquals(ClaimResult.NEW_ID_DUPLICATE_LOADED, done.single().claim.result)
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
     }
 
     @Test
@@ -186,7 +193,7 @@ class MachineSideOwnerReadTest {
         assertEquals(ClaimResult.KEPT, done.single().claim.result)
         assertEquals(second, done.single().claim.identity!!.id)
         assertEquals(0, store.mainOwnerReads)
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
     }
 
     @Test
@@ -221,7 +228,7 @@ class MachineSideOwnerReadTest {
         }
         val done = pollUntil(store, 1)
         assertEquals(listOf(first), done.map { it.key })
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
         assertEquals(listOf(blocker), reads, "取り消した読みは開かない")
         assertTrue(store.pollDeferredClaims().isEmpty())
         assertEquals(null, store.index.ownerOf(gone))
@@ -238,7 +245,7 @@ class MachineSideOwnerReadTest {
         assertEquals(null, store.claimOrDefer(id.toString(), 0, 0, at(0), Key("a")))
         assertEquals(ClaimResult.KEPT, pollUntil(store, 1).single().claim.result)
         assertTrue(store.sideReaderAlive)
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
         assertFalse(store.sideReaderAlive, "close で止まる")
         // 閉じた後は書き込みの列に回り、閉じた口に断られて読めなかったとする（書き込みの口が閉じたときと同じ）
         assertEquals(null, store.claimOrDefer(later.toString(), 0, 0, at(1), Key("b")))
@@ -266,6 +273,6 @@ class MachineSideOwnerReadTest {
         assertEquals(ClaimResult.NEW_ID_UNREADABLE, done["bad"])
         assertEquals(ClaimResult.KEPT, done["good"])
         assertEquals(0, store.deferredClaimTimeouts)
-        assertTrue(store.close(10_000))
+        assertTrue(store.close(NO_DEADLINE))
     }
 }
