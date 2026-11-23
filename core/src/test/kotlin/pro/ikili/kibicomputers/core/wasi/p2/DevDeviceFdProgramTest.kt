@@ -36,7 +36,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * - wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 も後退の見張りだけ
  *
  * device と `/dev/tty` の fd の `fstat` も確かめる（#885。ADR 0267「ファイル以外の descriptor の metadata-hash」）。
- * 包んだ p2 とネイティブの p2 の `fstat` は先に `descriptor.metadata-hash` を呼ぶので、直す前（`bad-descriptor`）は EBADF で落ちる。
+ * 包んだ p2 とネイティブの p2 の `fstat` は `descriptor.metadata-hash` も呼ぶので（アダプターは `stat` の後。wasi-libc の順序は確かめていない）、直す前（`bad-descriptor`）は EBADF で落ちる。
  * p1 のままは前から通るので、後退の見張り。`/dev/tty` を開けるように、console の `Tty` を用意しておく。
  */
 class DevDeviceFdProgramTest {

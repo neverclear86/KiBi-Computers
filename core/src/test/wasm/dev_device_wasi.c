@@ -3,7 +3,7 @@
 //   引数: "dev-device-wasi" <address>
 //   標準出力: 出力のストリーム
 // 失敗したら "FAIL ..." を出して 1 で終わる。最後まで進めば "OK" を出して 0 で終わる。
-// p2 の fstat() は先に metadata-hash を呼ぶので、ファイル以外の fd の metadata-hash が ok であることもここで見る（#885）。
+// p2 の fstat() は metadata-hash も呼ぶので（アダプターは stat の後。wasi-libc の順序は確かめていない）、ファイル以外の fd の metadata-hash が ok であることもここで見る（#885）。
 // st_dev は見ない（アダプターで包んだ p2 はいつも 1、ほかは 0 で、アダプターの都合を固定することになるため）。
 #include <fcntl.h>
 #include <stdio.h>
