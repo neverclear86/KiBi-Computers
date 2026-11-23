@@ -348,6 +348,15 @@ public class Machine private constructor(
      */
     public val fuelUnwindCount: Long get() = fuelUnwindsDone.get()
 
+    /** このマシンのホスト呼び出しを、メインスレッドで実行した件数（数え口。#356）。書くのは [runHostCalls]（メインスレッド）だけ */
+    private val hostCallsRun = AtomicLong()
+
+    /**
+     * このマシンのホスト呼び出しを、スケジューラの [MachineScheduler.tick] で実行した件数の累計（#356）。接続層の負荷試験が、
+     * 予算が効いている間も呼び出す台がみな前に進んでいる（巡回が壊れていない）かを見るために読む
+     */
+    public val hostCallRunCount: Long get() = hostCallsRun.get()
+
     internal fun countFuelUnwind() {
         fuelUnwindsDone.incrementAndGet()
     }
@@ -4015,6 +4024,10 @@ public class Machine private constructor(
             ran++
             pending.run()
             if (budget.check()) break
+        }
+        if (ran > 0) {
+            hostCallsRun.addAndGet(ran.toLong())
+            scheduler.hostCallsRun.addAndGet(ran.toLong())
         }
         return lock.withLockValue {
             val remains = hostCalls.isNotEmpty()
