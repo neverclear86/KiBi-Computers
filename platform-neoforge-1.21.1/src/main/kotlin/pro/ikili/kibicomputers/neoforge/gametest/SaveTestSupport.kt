@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.block.Blocks
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
@@ -84,6 +85,46 @@ internal class WriterGate(helper: GameTestHelper? = null) : AutoCloseable {
 }
 
 /**
+ * GameTest 用: 列の外の `owner.bin` の読み手（#877）を止めておく。[WriterGate] は書き込みのスレッドだけを止めるので、列の外の読み手に回る claim
+ * （その ID の仕事が列にない ID）の読みは止まらない。claim の確定を tick をまたいで待たせたいテストが、[WriterGate] と並べて使う。
+ * 読み手は、差し込んだ読みの口で [close] まで待つ（読みはそのあとで走る）。[close] で放して、口を元に戻す。放し忘れても、
+ * テストが終わったとき（成功・失敗・タイムアウト）に放す
+ */
+internal class SideReaderGate(helper: GameTestHelper, private val store: MachineSaveStore) : AutoCloseable {
+    private val latch = CountDownLatch(1)
+    private val original = store.sideOwnerReader
+
+    init {
+        store.sideOwnerReader = { path ->
+            latch.await(HELD_LIMIT_SECONDS, TimeUnit.SECONDS)
+            original(path)
+        }
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = close()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
+    }
+
+    override fun close() {
+        latch.countDown()
+        // 差し込んだままにしない（ほかのテストの読みが、放した後の口を通るだけで済むように、元に戻す）
+        store.sideOwnerReader = original
+    }
+
+    private companion object {
+        /** テストの終わりに必ず放すゲートの、念のための上限（[WriterGate] と同じ） */
+        const val HELD_LIMIT_SECONDS = 1_800L
+    }
+}
+
+/**
  * GameTest 用: [level] のチャンクのアンロードの列（`ChunkMap.unloadQueue`）に今ある仕事を1回ずつ流す（#854）。
  * バニラの `processUnloads` は、tick に時間が残らないと列を流さない（2,000 件を超えるまで溜める）ので、重いマシンではアンロードを待つテストが
  * 何 tick 待っても進まない。tick に時間が残っていたのと同じことを、テストの中で起こす。
@@ -93,4 +134,36 @@ internal class WriterGate(helper: GameTestHelper? = null) : AutoCloseable {
 internal fun runQueuedUnloads(level: ServerLevel) {
     val queue = level.chunkSource.chunkMap.unloadQueue
     repeat(queue.size) { (queue.poll() ?: return).run() }
+}
+
+/**
+ * GameTest 用: tick をまたぐ待ちを壁時計で打ち切る（#881）。GameTest のサーバーは tick の間で待たない
+ * （`GameTestServer.waitUntilNextTick` は積まれた仕事を回すだけ）ので、tick はいつも全速で進み、`timeoutTicks` は壁時計では
+ * 1 秒もかからずに尽きうる。そこで、条件が偽の tick ごとに [pace] で最大 [stepMillis] だけ眠り、壁時計の [limitMillis] で打ち切る。
+ * 待つ tick は 1 回あたり [stepMillis] 以上かかるので、`timeoutTicks` を `limitMillis / stepMillis` より十分大きくしておけば、
+ * 壁時計の上限が必ず先に来る（失敗の文言が「間に合わなかった」理由を出せる）。
+ *
+ * 眠るのはメインスレッドなので、待つ相手（書き込みのスレッド・列の外の読み手など）がメインスレッドを要しないときだけ使う。
+ * 作った時点から測る（待ちに入ったところで作る）
+ */
+internal class WallClockWait(private val limitMillis: Long, private val stepMillis: Long) {
+    private val startNanos = System.nanoTime()
+
+    /** [pace] を呼んだ（待った）tick の数 */
+    var ticks: Int = 0
+        private set
+
+    /** 作ってからの経過（ミリ秒） */
+    val elapsedMillis: Long get() = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos)
+
+    /** 上限を過ぎていれば `false`。過ぎていなければ、残りと [stepMillis] の小さい方だけ眠って `true` */
+    fun pace(): Boolean {
+        val left = limitMillis - elapsedMillis
+        if (left <= 0) return false
+        ticks++
+        Thread.sleep(minOf(stepMillis, left))
+        return true
+    }
+
+    override fun toString(): String = "${elapsedMillis}ms over $ticks ticks (limit ${limitMillis}ms)"
 }

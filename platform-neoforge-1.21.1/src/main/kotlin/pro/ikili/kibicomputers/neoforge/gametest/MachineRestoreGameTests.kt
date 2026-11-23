@@ -350,6 +350,7 @@ object MachineRestoreGameTests {
         var saved: MachineIdentity? = null
         var copy: CaseBlockEntity? = null
         var gate: WriterGate? = null
+        var sideGate: SideReaderGate? = null
         var reads = 0L
 
         fun assertRawTag(be: CaseBlockEntity, what: String) {
@@ -376,6 +377,8 @@ object MachineRestoreGameTests {
             be.loadWithComponents(tag, level.registryAccess())
             store.forgetOwnerForTest(saved!!.id)
             gate = WriterGate()
+            // 仕事のない ID の読みは列の外の読み手に回る（#877）ので、そちらも止める
+            sideGate = SideReaderGate(helper, store)
             reads = store.mainOwnerReads
             copy = be
         }.thenWaitUntil {
@@ -405,6 +408,8 @@ object MachineRestoreGameTests {
             assertRawTag(be, "after the demotion")
             gate!!.close()
             gate = null
+            sideGate!!.close()
+            sideGate = null
         }.thenWaitUntil {
             helper.assertTrue(!copy!!.isClaimDeferred, "the waiting claim should be decided")
         }.thenExecute {
