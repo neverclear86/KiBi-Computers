@@ -443,12 +443,15 @@ public class Machine private constructor(
     internal val cpu = MachineCpu(
         // CPU を渡したら、許可の待ち行列に並べる。許可を受け取ってからワーカーに渡す（#350）
         // 並べたときの組を控え、step の終わりにその組へ返す（#738。並んでいる間に持ち主が変わっても数を合わせる）
-        onThreadlessGranted = { rt ->
+        // spawn の直接の道（strict）だけ、ワーカーに渡せなければ投げる（巻き戻す。#629）。ほかの道は投げずに取り残しの列へ（#875。
+        // 呼び手は CPU のロック・カーネルロックを持っていて、巻き戻せない。CPU は持ち主のまま、取り残した step が動いたときに返る）
+        onThreadlessGranted = { rt, strict ->
             val group = fairShareGroup
-            scheduler.permits.submit(rt, group) {
+            val task = Runnable {
                 rt.permitGroup = group
                 runner.runStep(rt)
             }
+            if (strict) scheduler.permits.submit(rt, group, task) else scheduler.permits.submitOrStrand(rt, group, task)
         },
         onThreadlessRevoked = { rt -> scheduler.permits.remove(rt) },
     )
@@ -1651,7 +1654,9 @@ public class Machine private constructor(
                     thread.start()
                 } else {
                     enqueued = true
-                    cpu.enqueueThreadless(r)
+                    // strict: その場でワーカーに渡せなければ投げ、下の巻き戻しで CPU と許可を戻す（#629）。
+                    // CPU が埋まっていて並んだだけなら、後で渡すときは投げない（#875）
+                    cpu.enqueueThreadless(r, strict = true)
                 }
             } catch (t: Throwable) {
                 rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, handlePlace, rt, thread, enqueued)

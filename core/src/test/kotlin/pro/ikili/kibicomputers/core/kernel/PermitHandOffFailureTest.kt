@@ -1,10 +1,13 @@
 package pro.ikili.kibicomputers.core.kernel
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertDoesNotThrow
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import java.time.Duration
@@ -474,6 +477,126 @@ internal class PermitHandOffFailureTest {
             repeat(20) { h.scheduler.tick() }
             Thread.sleep(50)
             assertEquals(1, permits.availablePermits(), "許可は1回だけ返る")
+        }
+    }
+
+    // ---- CPU の中からの受け渡し（#875） ----
+
+    /** tick を進めずに待つ（取り残しが tick で渡し直される前に確かめる） */
+    private fun waitWithoutTick(message: String, condition: () -> Boolean) = eventually(10_000, message) {
+        Thread.sleep(1)
+        condition()
+    }
+
+    /** 同じ台で、[release] を待ってから終わる待機点型の A と、CPU の列に並んだ B を作る */
+    private class CpuHandOff(h: Harness) {
+        val m = h.machine()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val program = h.program(emptyModule())
+        val a = m.spawnTest(
+            program,
+            TestDriver(ProcessKind.WAIT_POINT) {
+                entered.countDown()
+                check(release.await(10, TimeUnit.SECONDS))
+                StepResult.Exit(0)
+            },
+        )
+        var b = 0
+
+        fun spawnWaiter(h: Harness) {
+            h.tickUntilTrue("A が step に入らない") { entered.count == 0L }
+            b = m.spawnTest(program, exiting(0, ProcessKind.WAIT_POINT))
+            waitWithoutTick("B が CPU の列に並ばない") { m.cpu.waiting == 1 }
+        }
+
+        private fun waitWithoutTick(message: String, condition: () -> Boolean) = eventually(10_000, message) {
+            Thread.sleep(1)
+            condition()
+        }
+    }
+
+    @Test
+    fun `CPUを次のプロセスへ渡すときにワーカーへ渡せなくても投げず、tickだけで進んでCPUと許可が戻る`() = timeout(Duration.ofSeconds(30)) {
+        val executor = FailingExecutor(Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+        Harness(executor = executor).use { h ->
+            val permits = h.scheduler.permits
+            val total = permits.availablePermits()
+            assertTrue(total >= 2, "許可が空いている状態にする")
+            val f = CpuHandOff(h)
+            val group = f.m.fairShareGroup
+            f.spawnWaiter(h)
+            executor.failuresLeft.set(1)
+            f.release.countDown()
+            // tick を回す前: CPU の受け渡しで取り残された（A のワーカーに例外が漏れず、A は終わる）
+            waitWithoutTick("取り残しの列に入らない") { permits.strandedTasks == 1 }
+            waitWithoutTick("A が終わらない") { f.m.processState(f.a)?.isTerminal == true }
+            assertEquals(ProcessState.EXITED, f.m.processState(f.a))
+            assertEquals(1L, permits.handOffFailures.get(), "CPU の受け渡しで1回だけ失敗する")
+            assertEquals(f.b, f.m.cpu.currentOwner?.pid, "CPU は取り残した B が持ち主のまま")
+            assertTrue(f.m.state != MachineState.CRASHED, "マシンが落ちた")
+            assertEquals(1, permits.heldBy(group), "取り残した B は許可を持ったまま（#738）")
+            // tick だけで進む
+            h.tickUntilTrue("B が終わらない") { f.m.processState(f.b)?.isTerminal == true }
+            assertEquals(ProcessState.EXITED, f.m.processState(f.b))
+            h.tickUntilTrue("CPU と許可が戻らない") {
+                f.m.cpu.currentOwner == null && permits.availablePermits() == total && permits.heldBy(group) == 0
+            }
+            assertEquals(0, permits.strandedTasks)
+            assertEquals(1L, permits.handOffFailures.get())
+            assertEquals(0, executor.failuresLeft.get())
+            f.m.stop()
+        }
+    }
+
+    @Test
+    fun `CPUの受け渡しで取り残されている間に止めると、KILLEDになり、CPUと許可は1回だけ返る`() = timeout(Duration.ofSeconds(30)) {
+        val executor = FailingExecutor(Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+        Harness(executor = executor).use { h ->
+            val permits = h.scheduler.permits
+            val total = permits.availablePermits()
+            val f = CpuHandOff(h)
+            f.spawnWaiter(h)
+            executor.alwaysFail = true
+            f.release.countDown()
+            waitWithoutTick("取り残しの列に入らない") { permits.strandedTasks == 1 && f.m.processState(f.a)?.isTerminal == true }
+            assertEquals(f.b, f.m.cpu.currentOwner?.pid)
+            f.m.stop()
+            h.tickUntilTrue("KILLED にならない") { f.m.processState(f.b) == ProcessState.KILLED }
+            assertTrue(f.m.awaitTermination(5_000), "止まり切らない")
+            assertNull(f.m.cpu.currentOwner, "止めたら CPU は次へ渡る")
+            executor.alwaysFail = false
+            h.tickUntilTrue("許可が戻らない") { permits.strandedTasks == 0 && permits.availablePermits() == total }
+            // 動き出した step は止められていると知って許可を返すだけ。二重に返らない
+            repeat(20) { h.scheduler.tick() }
+            Thread.sleep(50)
+            assertEquals(total, permits.availablePermits(), "許可は1回だけ返る")
+            assertNull(f.m.cpu.currentOwner)
+        }
+    }
+
+    @Test
+    fun `起こすときにワーカーへ渡せなくても投げず、tickだけで進んでCPUと許可が戻る`() = timeout(Duration.ofSeconds(30)) {
+        val executor = FailingExecutor(Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+        Harness(executor = executor).use { h ->
+            val permits = h.scheduler.permits
+            val total = permits.availablePermits()
+            val m = h.machine()
+            val gate = Gate(m)
+            val pid = m.spawnTest(h.program(emptyModule()), gated(gate, kind = ProcessKind.WAIT_POINT))
+            h.tickUntilTrue("イベント待ちにならない") {
+                m.processState(pid) == ProcessState.WAITING_EVENT && m.cpu.currentOwner == null && permits.availablePermits() == total
+            }
+            executor.failuresLeft.set(1)
+            assertDoesNotThrow { gate.open() }
+            assertDoesNotThrow {
+                h.tickUntilTrue("終わらない") { m.processState(pid)?.isTerminal == true }
+            }
+            assertEquals(ProcessState.EXITED, m.processState(pid))
+            assertEquals(1L, permits.handOffFailures.get())
+            h.tickUntilTrue("CPU と許可が戻らない") { m.cpu.currentOwner == null && permits.availablePermits() == total }
+            assertEquals(0, permits.strandedTasks)
+            m.stop()
         }
     }
 }
