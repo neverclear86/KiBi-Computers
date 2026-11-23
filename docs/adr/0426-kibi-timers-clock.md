@@ -167,6 +167,7 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 - C: `core/src/main/wasm/common/kibi_timers.h`・`kibi_clock.h`（手書き。wit-bindgen で作る束縛は SDK #116）
 - `WasiP1.kt`・`ProcessContext.kt`・カーネルの `time` パッケージ・`platform-*` は変えていない
 - 接続層はまだゲーム内時間を渡していない（`MachineClock.SYSTEM` のまま）ので、ゲームの中の `world-ticks` は今は 0。渡すのは #439
+  - 追記（#439）: 1.21.1 の接続層が渡すようにした。core の `PublishedWorldClock`（`@ApiStatus.Internal`）を `ServerLevel` ごとに1つ作り（`neoforge.machine.WorldClocks`）、サーバーの tick の始め（`ServerMachines.onServerTick` の先頭）で `level.gameTime` を写す。作るときに今の gameTime を入れる。1.20.1 は #224 の配下
 
 ## テスト
 
@@ -182,6 +183,6 @@ world imports-p3 { include imports; import timers-async; import events-async; }
 
 - p2/p3 の層の実装（`pollable`・async、resource のハンドル）: #685（p2。済んだ）・#265（resource）・#266（p3）。上の p3 の WIT は仮置き
 - 対象の `wasi:*` の版: #267
-- 接続層からゲーム内時間を渡すこと: #439
+- 接続層からゲーム内時間を渡すこと: #439（1.21.1 は済み。1.20.1 は #224）
 - Lua の `os.sleep`・`event` との対応: #94・#95
 - 最小の間隔・動いているタイマーの上限・燃料の確定: #251

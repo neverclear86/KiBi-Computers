@@ -385,5 +385,9 @@ class ScreenWatchersTest {
         assertThrows<IllegalArgumentException> { ScreenWatchers<Player>(resyncIntervalTicks = -1) }
         assertThrows<IllegalArgumentException> { ScreenWatchers<Player>(scanIntervalTicks = 0) }
         assertThrows<IllegalArgumentException> { ScreenWatchers<Player>(throttleRetryTicks = -1) }
+        assertThrows<IllegalArgumentException> {
+            ScreenWatchers<Player>(throttleRetryTicks = ScreenSyncTraffic.MAX_THROTTLE_RETRY_TICKS + 1)
+        }
+        ScreenWatchers<Player>(throttleRetryTicks = ScreenSyncTraffic.MAX_THROTTLE_RETRY_TICKS)
     }
 }
