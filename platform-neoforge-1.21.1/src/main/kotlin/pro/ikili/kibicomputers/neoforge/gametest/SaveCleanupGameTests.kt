@@ -459,8 +459,105 @@ object SaveCleanupGameTests {
     }
 
     /**
-     * リージョンファイルがないときの答え（[ChunkReferenceProbe.regionAbsence]）は、ないと確かめられ、同じ保存先にバニラの名前のリージョンファイルが
-     * あるときだけ「ない」。保存先がない・バニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら「判定できない」。ファイルがあれば読む（`null`）
+     * 保存先に別の座標のリージョンファイルだけがあり、台の位置のリージョンファイルがないとき、チャンクを読み書きする側が既定の作りと確かめられなければ
+     * （[ChunkReferenceProbe.regionNamesTrusted] が偽。リージョン形式を変える MOD への移行の後の混ざった状態など）、台のディレクトリは残り、
+     * 「判定できない」に数えられる（#899）。リージョンファイルも作らない。同じ位置は、既定の作りなら「ない」になる（別の座標のファイルが前提の対照）。
+     * 書き込み待ちのチャンク（リージョンにまだ出ていないかもしれない）のケースも「ない」にならない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun regionlessPositionIsKeptWhenRegionStorageIsModified(helper: GameTestHelper) {
+        val level = helper.level
+        val server = level.server
+        val dimension = level.dimension().location().toString()
+        ensureVanillaRegion(helper)
+        val target = FarChunks.reserve(helper)
+        val targetRegion = ChunkReferenceProbe.regionFile(level, target)
+        helper.assertTrue(!Files.exists(targetRegion), "the region of the target chunk should not exist yet: $targetRegion")
+        val others = Files.newDirectoryStream(targetRegion.parent, "r.*.mca").use { dir -> dir.map { it.fileName.toString() } }
+        helper.assertTrue(others.isNotEmpty(), "the storage should have a region file of another position")
+        val pos = BlockPos(target.minBlockX + 2, 64, target.minBlockZ + 3)
+        val id = UUID.randomUUID()
+        val modified = ChunkReferenceProbe(server, regionNamesTrusted = false)
+        val untrusted = ask(modified, id, dimension, pos)
+        val trusted = ask(ChunkReferenceProbe(server, regionNamesTrusted = true), id, dimension, pos)
+        // 書き込み待ちのケース（ほかのテストが読まない別の離れたチャンク。リージョンファイルはまだない）
+        val pendingChunk = FarChunks.reserve(helper)
+        val pendingRegion = ChunkReferenceProbe.regionFile(level, pendingChunk)
+        val pendingPos = BlockPos(pendingChunk.minBlockX + 1, 70, pendingChunk.minBlockZ + 1)
+        val pendingId = UUID.randomUUID()
+        helper.assertTrue(!Files.exists(pendingRegion), "the region of the pending chunk should not exist yet: $pendingRegion")
+        val caseTag = CompoundTag().apply {
+            putString("id", BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString())
+            putInt("x", pendingPos.x)
+            putInt("y", pendingPos.y)
+            putInt("z", pendingPos.z)
+            putString(CaseBlockEntity.MACHINE_ID_TAG, pendingId.toString())
+        }
+        level.chunkSource.chunkMap.write(pendingChunk, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+        val pending = ask(modified, pendingId, dimension, pendingPos)
+        val root = tempRoot(helper)
+        previousDirectory(root, id, MachineOwner(dimension, pos.x, pos.y, pos.z))
+        val store = MachineSaveStore(root, MachineIdIndex(), "test")
+        val cleanup = SaveCleanup(store, null, modified, SaveCleanupSettings.DEFAULT)
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(untrusted.get() != null && trusted.get() != null && pending.get() != null, "the probes should answer")
+            cleanup.tick()
+            helper.assertTrue(cleanup.finished, "the cleanup should finish (${cleanup.phase})")
+        }.thenExecute {
+            try {
+                helper.assertTrue(untrusted.get() == MachineReference.UNKNOWN, "a regionless position with modified storage should be undetermined: ${untrusted.get()}")
+                helper.assertTrue(trusted.get() == MachineReference.ABSENT, "a regionless position with vanilla storage should be absent: ${trusted.get()}")
+                // IOWorker が先に書き出していれば読んで「ある」、まだなら「判定できない」。どちらでも消す側にはならない
+                val p = pending.get()
+                helper.assertTrue(p == MachineReference.PRESENT || p == MachineReference.UNKNOWN, "a pending case with modified storage should not be absent: $p")
+                val report = cleanup.report
+                helper.assertTrue(Files.isDirectory(root.resolve(id.toString())), "the directory should stay: $report")
+                helper.assertTrue(report.candidates == 1 && report.undetermined == 1 && report.deleted == 0 && report.unreferenced == 0, "counts: $report")
+                helper.assertTrue(!Files.exists(targetRegion), "the probes should not create the region file $targetRegion")
+            } finally {
+                deleteTree(root)
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * 実際のチャンクの読み書きの経路（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）は、GameTest のサーバー（と製品の jar のサーバー）では
+     * Mixin が当たっておらず（[ChunkReferenceProbe.modifiedRegionStorage] が空）、既定の問いはファイル名で判定する。
+     * 合わせたメンバーの印（[ChunkReferenceProbe.hasMergedMembers]）は、印の付いたメソッドのあるクラスで見つかる（`@MixinMerged` はソースに書けないので、テスト用の実行時の注釈 [TestMark] で確かめる）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun vanillaRegionStorageIsTrusted(helper: GameTestHelper) {
+        val modified = ChunkReferenceProbe.modifiedRegionStorage()
+        helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
+        helper.assertTrue(ChunkReferenceProbe(helper.level.server).regionNamesTrusted, "the default probe should trust the region names")
+        helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(MarkedMember::class.java, TestMark::class.java.name), "a marked method should be found")
+        helper.assertTrue(!ChunkReferenceProbe.hasMergedMembers(UnmarkedMember::class.java, TestMark::class.java.name), "an unmarked class should have no mark")
+        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java), "a plain class should not be a mixin target")
+        helper.succeed()
+    }
+
+    /** [vanillaRegionStorageIsTrusted] の、`@MixinMerged` の代わりの印（実行時に見える注釈） */
+    @Retention(AnnotationRetention.RUNTIME)
+    @Target(AnnotationTarget.FUNCTION)
+    private annotation class TestMark
+
+    /** [vanillaRegionStorageIsTrusted] の、印の付いたメソッドのあるクラス */
+    private class MarkedMember {
+        @TestMark
+        fun marked(): Int = 1
+    }
+
+    /** [vanillaRegionStorageIsTrusted] の、印のないクラス */
+    private class UnmarkedMember {
+        fun plain(): Int = 1
+    }
+
+    /**
+     * リージョンファイルがないときの答え（[ChunkReferenceProbe.regionAbsence]）は、ないと確かめられ、チャンクを読み書きする側が既定の作りで、
+     * 同じ保存先にバニラの名前のリージョンファイルがあるときだけ「ない」。保存先がない・バニラの名前のファイルがない（名前・形式を変える環境かもしれない）・
+     * 既定の作りと確かめられない（別の座標のファイルは証拠にならない。#899）なら「判定できない」。ファイルがあれば読む（`null`）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
@@ -468,8 +565,8 @@ object SaveCleanupGameTests {
         val folder = tempRoot(helper).resolve("region")
         try {
             val target = folder.resolve("r.3.-4.mca")
-            fun check(expected: MachineReference?, what: String) {
-                val actual = ChunkReferenceProbe.regionAbsence(target, HashSet())
+            fun check(expected: MachineReference?, what: String, trusted: Boolean = true) {
+                val actual = ChunkReferenceProbe.regionAbsence(target, HashSet(), trusted)
                 helper.assertTrue(actual == expected, "$what should be $expected but was $actual")
             }
             check(MachineReference.UNKNOWN, "a missing folder")
@@ -481,8 +578,10 @@ object SaveCleanupGameTests {
             check(MachineReference.UNKNOWN, "a folder with only other region names")
             Files.write(folder.resolve("r.-1.2.mca"), ByteArray(0))
             check(MachineReference.ABSENT, "a folder with a vanilla region file")
+            check(MachineReference.UNKNOWN, "a folder with a vanilla region file of another position and modified storage", trusted = false)
             Files.write(target, ByteArray(0))
             check(null, "an existing region file")
+            check(null, "an existing region file with modified storage", trusted = false)
         } finally {
             deleteTree(folder)
         }

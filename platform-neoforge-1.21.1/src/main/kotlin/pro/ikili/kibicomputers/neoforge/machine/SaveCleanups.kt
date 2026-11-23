@@ -16,11 +16,16 @@ import net.minecraft.server.level.ChunkHolder
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.chunk.storage.ChunkStorage
+import net.minecraft.world.level.chunk.storage.IOWorker
+import net.minecraft.world.level.chunk.storage.RegionFile
+import net.minecraft.world.level.chunk.storage.RegionFileStorage
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.server.ServerStartedEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
+import org.spongepowered.asm.mixin.Mixins
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineOwner
 import pro.ikili.kibicomputers.core.persist.MachineReference
@@ -127,7 +132,15 @@ internal object SaveCleanups {
         val s = server ?: return null
         // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
         if (running?.let { !it.finished || it.settling } == true || store == null) return null
-        val cleanup = SaveCleanup(store, modules, ChunkReferenceProbe(s), settings, dryRun, force)
+        val probe = ChunkReferenceProbe(s)
+        if (!probe.regionNamesTrusted) {
+            // 掃除1回につき1行（問いごとには出さない）
+            LOGGER.info(
+                "The chunk storage classes are modified ({}); the computer save cleanup keeps directories at positions without a region file",
+                ChunkReferenceProbe.modifiedRegionStorage().joinToString(),
+            )
+        }
+        val cleanup = SaveCleanup(store, modules, probe, settings, dryRun, force)
         running = cleanup
         last = cleanup
         // 何も消さない試しの実行では、自動の掃除（本番）を取り消さない（自動は、走っている掃除が終わるのを待って始める）
@@ -182,14 +195,23 @@ internal object SaveCleanups {
  *   その ID を持つなら [MachineReference.PRESENT]、なければ（チャンクがディスクにないときも）[MachineReference.ABSENT]。読みが失敗したら [MachineReference.UNKNOWN]。
  *   ディスクの確認と読みは IO のスレッド（`Util.ioPool`）の仕事で、メインスレッドは stat も読みもしない（答えは次の tick 以降に返る）。
  *   `RegionFileStorage` は、読むだけでもリージョンファイルがなければ空のものを作る。そこで、リージョンファイル（`ChunkMap` が実際に開く保存先の `r.X.Z.mca`。[regionFile]）がないと確かめられ、
- *   同じ保存先にバニラの名前のリージョンファイルがあれば、読まずに [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。
- *   確かめられない・保存先にバニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら [MachineReference.UNKNOWN]（[regionAbsence]）。リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
+ *   チャンクを読み書きする側が既定の作りで（[regionNamesTrusted]。リージョンファイルの名前で、チャンクがないと言える）、同じ保存先にバニラの名前のリージョンファイルがあれば、
+ *   読まずに [MachineReference.ABSENT] とする（試しの実行でも、ワールドにファイルを増やさない）。
+ *   確かめられない・既定の作りと確かめられない・保存先にバニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら [MachineReference.UNKNOWN]（[regionAbsence]）。
+ *   別の座標のリージョンファイルがあることは、対象のチャンクがないことの証拠にならない（形式を変える MOD への移行の後の混ざった状態では、対象のチャンクが別の形で生きている。#899）。
+ *   リージョンファイルのない所のチャンクで書き込み待ちになりうるのは、
  *   このセッションで生成したチャンクだけで、そこにあるケースはこのセッションで置いた（ID を振った・claim した）もの、つまり「見た ID」なので、ここには問われない
  *   （消す直前にも見直す）。リージョンファイルがあれば、書き込み待ちは `ChunkMap.read` が返す
  *
  * チャンクの NBT は覚えない（1,000 件分を持つと大きいため。同じチャンクを何度か読むことはある。問いの数は [SaveCleanupSettings.maxProbesInFlight] まで）
+ *
+ * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）に Mixin が当たっていないか（[modifiedRegionStorage]）。
+ * 作るときに1回だけ決める（メインスレッドで作る。問いごと・IO のスレッドでは調べない）。テストは差し替える
  */
-internal class ChunkReferenceProbe(private val server: MinecraftServer) : MachineReferenceProbe {
+internal class ChunkReferenceProbe(
+    private val server: MinecraftServer,
+    val regionNamesTrusted: Boolean = modifiedRegionStorage().isEmpty(),
+) : MachineReferenceProbe {
     override fun probe(id: UUID, owner: MachineOwner, answer: Consumer<MachineReference>) {
         val location = ResourceLocation.tryParse(owner.dimension)
         val level = location?.let { server.getLevel(ResourceKey.create(Registries.DIMENSION, it)) }
@@ -228,7 +250,7 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
     /** IO のスレッドで、チャンクの保存先の確認と読みをする（[probe]） */
     private fun readFromStorage(level: ServerLevel, chunk: ChunkPos, region: Path, id: UUID, pos: BlockPos, answer: Consumer<MachineReference>) {
         // リージョンファイルがなければ読まない（読みが空のリージョンファイルを作るため）。ないと確かめられたときだけ「ない」にする
-        regionAbsence(region, vanillaFolders)?.let {
+        regionAbsence(region, vanillaFolders, regionNamesTrusted)?.let {
             answer.accept(it)
             return
         }
@@ -254,16 +276,18 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
          * リージョンファイル [region] がないときの答え（IO のスレッドで呼ぶ）。読んでよい（ファイルがある）なら `null`。
          *
          * - ファイルがあると確かめられた: `null`（`ChunkMap.read` で読む）
-         * - ないと確かめられ（`Files.notExists`）、同じ保存先にバニラの名前のリージョンファイルが1つでもある: [MachineReference.ABSENT]
-         * - それ以外（stat の I/O エラー・アクセス拒否で確かめられない、保存先にバニラの名前のファイルが1つもない）: [MachineReference.UNKNOWN]。
-         *   保存先にバニラの名前のファイルがないのは、このディメンションでまだチャンクを保存していないか、リージョンの名前・形式を変える環境で、
-         *   どちらもファイル名からは判定できないので、消す側に倒さない（ADR 0564 の「判定できないものは残す」）
+         * - ないと確かめられ（`Files.notExists`）、チャンクを読み書きする側が既定の作り（[trusted]）で、同じ保存先にバニラの名前のリージョンファイルが1つでもある: [MachineReference.ABSENT]
+         * - それ以外（stat の I/O エラー・アクセス拒否で確かめられない、既定の作りと確かめられない、保存先にバニラの名前のファイルが1つもない）: [MachineReference.UNKNOWN]。
+         *   既定の作りでないと、対象のチャンクがリージョンファイルの外（別の名前・形式）にあるかもしれない。別の座標のバニラの名前のファイルがあっても、
+         *   対象のチャンクがないことの証拠にはならない（#899）。保存先にバニラの名前のファイルがないのは、このディメンションでまだチャンクを保存していないか、
+         *   リージョンの名前・形式を変える環境で、どちらもファイル名からは判定できない。どれも消す側に倒さない（ADR 0564 の「判定できないものは残す」）
          *
          * [known] は、バニラの名前のファイルがあると分かった保存先の覚え（同じ保存先を何度も一覧しない）
          */
-        fun regionAbsence(region: Path, known: MutableSet<Path>): MachineReference? {
+        fun regionAbsence(region: Path, known: MutableSet<Path>, trusted: Boolean): MachineReference? {
             if (Files.exists(region)) return null
             if (!Files.notExists(region)) return MachineReference.UNKNOWN
+            if (!trusted) return MachineReference.UNKNOWN
             val folder = region.parent ?: return MachineReference.UNKNOWN
             if (folder !in known) {
                 val vanilla = try {
@@ -277,6 +301,42 @@ internal class ChunkReferenceProbe(private val server: MinecraftServer) : Machin
                 known.add(folder)
             }
             return MachineReference.ABSENT
+        }
+
+        /** チャンクを読み書きする経路のうち、リージョンファイルの名前と中身を決めるクラス（[modifiedRegionStorage]） */
+        private val REGION_STORAGE_CLASSES: List<Class<*>> =
+            listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java)
+
+        /** Mixin が合わせたメソッドに付ける印（実行時に見える注釈） */
+        private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
+
+        /**
+         * チャンクを読み書きする経路のクラス（[REGION_STORAGE_CLASSES]）のうち、Mixin が当たったもの（の名前）。空なら既定の作りで、
+         * 「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
+         *
+         * 形式を差し替える口はバニラにない（`RegionFileStorage` は `final` でコンストラクターはパッケージの中だけ、`ChunkStorage.worker`・`IOWorker.storage` は `final`）ので、
+         * 差し替えられるのはバイトコードを書き換えるもの（Mixin・coremod）だけ。Mixin は、当てたクラスの記録（`Mixins.getMixinsForClass`）と、
+         * 合わせたメンバーの印（`@MixinMerged`。記録が引けない形でも見える）の両方で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
+         * coremod・JVM エージェントの書き換えは見えない。`ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので数えない（数えると、ほとんどの環境で
+         * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。
+         *
+         * 掃除1回につき1回、メインスレッドで呼ぶ（問いごと・IO のスレッドでは調べない）
+         */
+        fun modifiedRegionStorage(): List<String> = REGION_STORAGE_CLASSES.filter(::isMixinTarget).map { it.name }
+
+        /** クラス [type] に Mixin が当たっているか（調べるのに失敗したら `true`） */
+        fun isMixinTarget(type: Class<*>): Boolean = try {
+            hasMergedMembers(type) || Mixins.getMixinsForClass(type.name).isNotEmpty()
+        } catch (e: RuntimeException) {
+            true
+        } catch (e: LinkageError) {
+            true
+        }
+
+        /** クラス [type] に、Mixin が合わせたメソッド・コンストラクター・フィールド（印 [marker]。既定は `@MixinMerged`）があるか */
+        fun hasMergedMembers(type: Class<*>, marker: String = MIXIN_MERGED): Boolean {
+            val members = type.declaredMethods.asSequence() + type.declaredConstructors.asSequence() + type.declaredFields.asSequence()
+            return members.any { member -> member.declaredAnnotations.any { it.annotationClass.java.name == marker } }
         }
 
         /**
