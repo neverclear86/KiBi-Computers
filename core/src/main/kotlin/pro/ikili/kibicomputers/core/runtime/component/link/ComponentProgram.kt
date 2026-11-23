@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.runtime.component.ComponentImportPolicy
 import pro.ikili.kibicomputers.core.runtime.component.ComponentLimits
 import pro.ikili.kibicomputers.core.runtime.component.ComponentLoader
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelSites
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import java.nio.ByteBuffer
 
@@ -118,6 +119,8 @@ internal class ComponentProgram private constructor(
             val injected = ArrayList<ByteArray>()
             // 元のモジュールの関数の番号への戻し方（燃料の挿入が足した import の分。断る理由に書く番号を p1 と同じ元の番号にする。#398）
             val numbering = ArrayList<(Int) -> Int>()
+            // 挿入した燃料の計測コードの位置（#389。変換が足すコードの見込みに使う。計測しないなら null）
+            val fuelSites = ArrayList<FuelSites?>()
             val byContent = HashMap<ByteBuffer, Int>()
             val moduleIndex = HashMap<ByteRange, Int>()
             for (range in loaded.coreModules) {
@@ -127,9 +130,11 @@ internal class ComponentProgram private constructor(
                         val r = FuelInjector.inject(original, sharedGlobal = true) { deadline.check("燃料の計測コードの挿入") }
                         injected += r.bytes
                         numbering += r::originalFunc
+                        fuelSites += r.sites
                     } else {
                         injected += original
                         numbering += { it }
+                        fuelSites += null
                     }
                     injected.size - 1
                 }
@@ -144,7 +149,7 @@ internal class ComponentProgram private constructor(
             var yieldRejection: String? = null
             val finalBytes = if (asyncify) {
                 // 燃料切れの import（`kibi.fuel`）は、計測コードを挿入したときだけある
-                val r = transform(injected, numbering, planned, deadline, fuelYield && metered)
+                val r = transform(injected, numbering, fuelSites, planned, deadline, fuelYield && metered)
                 rejection = r.rejection
                 rejection?.let {
                     // exec の道（#844）: 全モジュールをコンパイルする前に断る（捨てるもののコンパイルと、うその「スレッドを持つ」ログを避ける）
@@ -201,12 +206,13 @@ internal class ComponentProgram private constructor(
         private fun transform(
             injected: List<ByteArray>,
             numbering: List<(Int) -> Int>,
+            fuelSites: List<FuelSites?>,
             planned: ComponentPlanner.Planned,
             deadline: LoadDeadline,
             fuelYield: Boolean,
         ): Transformed {
             val checkpoint = { deadline.check(STAGE_ASYNCIFY) }
-            val prepared = injected.mapIndexed { i, b -> Asyncify.prepare(b, checkpoint, numbering[i]) }
+            val prepared = injected.mapIndexed { i, b -> Asyncify.prepare(b, checkpoint, numbering[i], fuelSites[i]) }
             val analysis = ComponentAsyncify.analyze(planned, prepared, checkpoint)
             analysis.rejection?.let { return Transformed(null, it, false, null) }
             val out = ArrayList<ByteArray>(injected.size)

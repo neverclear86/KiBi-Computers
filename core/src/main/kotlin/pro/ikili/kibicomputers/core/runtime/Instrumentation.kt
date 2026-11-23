@@ -11,7 +11,9 @@ import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
  * lua.wasm の `luaV_execute` が JVM のメソッドの上限（64 KB）を超えて、ランタイムコンパイラでコンパイルできなかった
  * （WASM の命令の数が約 29,100 → この順で約 21,400。生成したメソッドは約 50 KB）。この順には、次の性質もある:
  * - 燃料を引くコードは、変換で包んだ `if (state == NORMAL)` の中に入るので、巻き直しの間は引かない（同じ命令を二度数えない）。
- *   変換が足したコード（退避・復元・状態の確かめ）は燃料を数えない。数えるのは元のプログラムの命令だけ
+ *   変換が足したコード（状態の確かめ、ランと呼び出しの包み、一時ローカルへの出し入れ）は、実行時には数えない。その分は、
+ *   止まりうる関数のセグメントの課金の定数を倍にして見込む（#389。`FuelCosts.ASYNCIFY_NUMERATOR`。挿入の結果の課金の位置
+ *   `FuelInjector.Result.sites` を変換に渡す）。葉の関数（止まりうる関数でない関数）の課金は変えない
  * - 燃料の残りを写したローカル変数は、待ち点の後では生きていない（呼び出しの前にグローバルへ書き戻し、戻った直後に読み直す）ので、
  *   退避も復元もされない（#338。巻き直しの後は、呼ばれたときの値か 0 のまま）。使う前にグローバルから読み直すので、古い値で数えることはない
  * - 燃料切れの import（`kibi.fuel`）は、変換のときには普通の import として見える。止まりうる関数の中のものは待ち点にする（#339。下記）
@@ -28,7 +30,7 @@ internal object Instrumentation {
      * 後のハッシュを照合する。そのため挿入・変換は決定的であること（同じ入力から同じバイト列。`InstrumentationDeterminismTest`）。
      * 出力を変える変更（燃料のセグメントの切り方、変換の形など）をしたら、この版を上げる
      */
-    const val VERSION: Int = 2
+    const val VERSION: Int = 3
 
     /**
      * [applyDetailed] の結果。
@@ -52,10 +54,10 @@ internal object Instrumentation {
         val metered = FuelInjector.inject(wasm) { checkpoint(STAGE_FUEL) }
         if (waitImports.isEmpty()) return Applied(metered.bytes, false, null)
         return try {
-            val r = Asyncify.transform(metered.bytes, waitImports, YIELD_IMPORT, metered::originalFunc) { checkpoint(STAGE_ASYNCIFY) }
+            val r = Asyncify.transform(metered.bytes, waitImports, YIELD_IMPORT, metered::originalFunc, fuelSites = metered.sites) { checkpoint(STAGE_ASYNCIFY) }
             Applied(r.bytes, true, null)
         } catch (e: AsyncifyUnsupported) {
-            val r = Asyncify.transform(metered.bytes, waitImports, null, metered::originalFunc) { checkpoint(STAGE_ASYNCIFY) }
+            val r = Asyncify.transform(metered.bytes, waitImports, null, metered::originalFunc, fuelSites = metered.sites) { checkpoint(STAGE_ASYNCIFY) }
             Applied(r.bytes, false, e.message ?: "理由不明")
         }
     }

@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.runtime.asyncify
 
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelSites
 import run.endive.wasm.Parser
 import run.endive.wasm.WasmModule
 import run.endive.wasm.types.AnnotatedInstruction
@@ -79,8 +80,11 @@ internal enum class AsyncifyDebug {
  * （燃料の確かめはすべての関数にあるので、使うと全関数が変換されてしまう）。止まりうる関数でない関数の呼び出しはそのまま残す。
  * [WasmAsync.FUEL] の import は `async_pop` の後に足すので、そのとき定義済みの関数の番号は3つずれる。
  *
- * 変換が足すコード（退避・復元・状態の確かめ）は燃料を数えない（#341 と同じ。#339 で数える形を試したが、
- * かえって燃料 1 あたりの CPU 時間が増えたのでやめた。ADR 0329 の「燃料切れの待ち点化」）。
+ * 変換が足すコード（退避・復元・状態の確かめ）は、実行時には燃料を数えない（#341 と同じ。#339 で数える形を試したが、
+ * かえって燃料 1 あたりの CPU 時間が増えたのでやめた。ADR 0329 の「燃料切れの待ち点化」）。代わりに、[transform] の `fuelSites`
+ * （挿入した課金の位置）があれば、止まりうる関数のセグメントの課金の定数を `FuelSites.weight` 倍にして見込む（#389。
+ * ADR 0329 の「#389: 変換が足すコードの見込み」）。課金は `if (state == NORMAL)` のランの中のままなので、巻き直しの間は引かない。
+ * 止まりうる関数でない関数（番号の付け替えだけで写す）の課金は変えない。
  *
  * 名前のカスタムセクションは捨てる（燃料の計測コードの挿入と同じ）。
  *
@@ -138,6 +142,9 @@ internal object Asyncify {
      * [originalFunc] は、断る理由に書く関数の番号を、利用者の元のモジュールの番号に戻す（#398）。[wasm] が前の書き換え
      * （燃料の計測コードの挿入）で import を足した後のものなら、その番号の対応を渡す（`FuelInjector.Result.originalFunc`）。
      *
+     * [fuelSites] は、[wasm] に挿入した燃料の課金の位置（#389。`FuelInjector.Result.sites`）。あれば、止まりうる関数の
+     * セグメントの課金を `FuelSites.weight` 倍にして、変換が足したコードの分を見込む。`null` なら課金は変えない（#389 の前と同じ出力）。
+     *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
      *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
@@ -151,8 +158,9 @@ internal object Asyncify {
         yieldImport: String? = null,
         originalFunc: (Int) -> Int = { it },
         debug: AsyncifyDebug = AsyncifyDebug.NONE,
+        fuelSites: FuelSites? = null,
         checkpoint: () -> Unit = {},
-    ): Result = prepare(wasm, checkpoint).transform(waitImports, emptySet(), yieldImport, originalFunc, debug, checkpoint)
+    ): Result = prepare(wasm, checkpoint, fuelSites = fuelSites).transform(waitImports, emptySet(), yieldImport, originalFunc, debug, checkpoint)
 
     /**
      * 関数の型（引数と結果の値の型の並び。値の型は WASM のバイナリの型の番号）。コンポーネントの core モジュールをまたいで、
@@ -177,6 +185,8 @@ internal object Asyncify {
         private val wasm: ByteArray,
         private val module: WasmModule,
         private val numbering: (Int) -> Int = { it },
+        /** 挿入した燃料の計測コードの位置（#389。[Asyncify.transform] の `fuelSites`） */
+        private val fuelSites: FuelSites? = null,
     ) {
         /**
          * 止まりうる関数を求めるだけで、書き換えない。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（[transform]）
@@ -202,7 +212,7 @@ internal object Asyncify {
             originalFunc: (Int) -> Int = numbering,
             debug: AsyncifyDebug = AsyncifyDebug.NONE,
             checkpoint: () -> Unit = {},
-        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug).run() }
+        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug, fuelSites).run() }
 
         private inline fun <T> guard(block: () -> T): T = try {
             block()
@@ -220,16 +230,20 @@ internal object Asyncify {
     /**
      * [wasm] を読み、予約した名前を使っていないか確かめる（#757。解析と変換は [Prepared] で）。[checkpoint] は読んだ後に 1 回呼ぶ
      *
-     * [originalFunc] は、断る理由に書く関数の番号を元のモジュールの番号に戻す（[transform] と同じ。#398）。[Prepared] の解析と変換の既定になる
+     * [originalFunc] は、断る理由に書く関数の番号を元のモジュールの番号に戻す（[transform] と同じ。#398）。[Prepared] の解析と変換の既定になる。
+     * [fuelSites] は、挿入した燃料の計測コードの位置（[transform] と同じ。#389）
      *
      * @throws WasmLoadException WASM として読めない、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた
      */
     @Throws(WasmLoadException::class)
-    fun prepare(wasm: ByteArray, checkpoint: () -> Unit = {}, originalFunc: (Int) -> Int = { it }): Prepared {
+    fun prepare(wasm: ByteArray, checkpoint: () -> Unit = {}, originalFunc: (Int) -> Int = { it }, fuelSites: FuelSites? = null): Prepared {
         val module = parse(wasm)
         checkpoint()
         checkReserved(module)
-        return Prepared(wasm, module, originalFunc)
+        if (fuelSites != null) {
+            check(fuelSites.charges.size == module.codeSection().functionBodyCount()) { "燃料の計測コードの位置が、関数の数と合わない" }
+        }
+        return Prepared(wasm, module, originalFunc, fuelSites)
     }
 
     /** 予約した名前をすでに使っていたら断る（プレイヤーが退避した値や状態を自分で書き換えられてしまう） */
@@ -330,6 +344,8 @@ private class Transformer(
     /** モジュールの外から止まりうるとみなす関数の型（#757。[Asyncify.Prepared.transform]） */
     private val externalSuspendTypes: Set<Asyncify.Signature> = emptySet(),
     private val debug: AsyncifyDebug = AsyncifyDebug.NONE,
+    /** 挿入した燃料の計測コードの位置（#389）。`null` なら課金を変えない */
+    private val fuelSites: FuelSites? = null,
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
@@ -810,6 +826,12 @@ private class Transformer(
         var yieldSites = 0
             private set
 
+        /** 燃料の課金の `i64.const` の位置（#389。[fuelSites] がなければ空。差し替えない） */
+        private val chargeAt = HashSet<Int>()
+
+        /** 課金の `i64.const` を出した、$body の中の位置と元の命令の長さ・元の課金（[rewrite] が定数を差し替える） */
+        private val holes = ArrayList<LongArray>()
+
         init {
             localTypes += sig.params
             module.codeSection().getFunctionBody(func - importedFuncs).localTypes().forEach { localTypes += code(it) }
@@ -817,6 +839,36 @@ private class Transformer(
             for (i in list.indices) endOf[list[i]] = insEnd(list, i, bodyEnd)
             if (localTypes.any { it == V128 }) throw AsyncifyUnsupported("SIMD（v128）のローカル変数には対応していない")
             kLocal = newLocal(I32)
+            fuelSites?.let { sites ->
+                val starts = HashSet<Int>(list.size * 2)
+                for (ins in list) starts += ins.address()
+                for (c in sites.charges[func - importedFuncs]) {
+                    val at = bodyStart + c
+                    // 位置は挿入の結果から渡されたもの。ずれていたら内部の誤り（燃料の数を壊さないように、黙って続けない）
+                    check(at in starts && wasm[at].toInt() == 0x42) { "燃料の課金の位置 $at が i64.const でない" }
+                    chargeAt += at
+                }
+            }
+        }
+
+        /** [body] を [out] に写し、課金の定数を、見込んだ値（[FuelSites.weight]）に差し替える（#389） */
+        private fun appendPatched(out: Sink, body: Sink) {
+            val weight = fuelSites?.weight
+            check(holes.size == chargeAt.size) { "燃料の課金を ${chargeAt.size} 個のうち ${holes.size} 個しか写していない" }
+            if (holes.isEmpty() || weight == null) {
+                out.append(body)
+                return
+            }
+            val bytes = body.toByteArray()
+            var at = 0
+            for (h in holes) {
+                val pos = h[0].toInt()
+                out.bytes(bytes, at, pos - at)
+                out.u8(0x42)
+                out.sleb(weight.apply(h[2]))
+                at = pos + h[1].toInt()
+            }
+            out.bytes(bytes, at, bytes.size - at)
         }
 
         private fun newLocal(t: Int): Int {
@@ -912,7 +964,7 @@ private class Transformer(
 
             out.u8(0x02); out.u8(0x40) // $unwind
             out.u8(0x02); blockType(out, sig.results) // $body
-            out.append(body)
+            appendPatched(out, body)
             out.u8(0x0B)
             out.u8(0x0F) // return
             out.u8(0x0B)
@@ -1549,6 +1601,8 @@ private class Transformer(
                 is Leaf -> {
                     val ins = node.ins
                     val end = endOf[ins]!!
+                    // 燃料の課金: 後で定数を差し替える（#389。課金はいつもランの中にあり、ここから出る）
+                    if (ins.address() in chargeAt) holes += longArrayOf(out.size().toLong(), (end - ins.address()).toLong(), ins.operand(0))
                     when (ins.opcode()) {
                         OpCode.BR, OpCode.BR_IF -> {
                             out.u8(ins.opcode().opcode())
