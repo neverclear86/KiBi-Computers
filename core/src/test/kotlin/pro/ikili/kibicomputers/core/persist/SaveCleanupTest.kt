@@ -597,9 +597,9 @@ class SaveCleanupTest {
         time += 1001
         cleanup.tick()
         assertFalse(cleanup.settling)
-        // その後で削除の仕事が走り、見送る
+        // その後で削除の仕事が走り、見送る。接続層は諦めた掃除をもう tick しない（SaveCleanups.tickRunning が外す）ので、
+        // ここでも cleanup.tick() を呼ばない。取り消しは置き場の pollCompleted だけで届かなければならない
         manual.runAll()
-        repeat(3) { cleanup.tick() }
         store.pollCompleted()
         assertEquals(0, cleanup.report.deleted)
         assertTrue(Files.exists(machines.resolve(id.toString())))
