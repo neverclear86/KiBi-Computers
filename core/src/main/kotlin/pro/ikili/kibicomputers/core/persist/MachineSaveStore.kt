@@ -101,6 +101,17 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** このサーバーで `delete` した ID（`owner.bin` は消える。claim はディスクを読まずに「ない」とする。#585）。claim し直したら外す */
     private val deletedIds = HashSet<UUID>()
 
+    /**
+     * [deleteUnreferenced] で「消した」にし、まだ削除の仕事の結果を受け取っていない ID（#900。メインスレッドだけが触る）。
+     * その間に claim・[delete] が来たら外す（その ID の「消した」は、もう掃除のものではないので、消さなかった結果でも外さない）
+     */
+    private val cleanupDeletesPending = HashSet<UUID>()
+
+    /** [deleteUnreferenced] の仕事の結果（消したバイト数。消さなかったら -1）。書き込みのスレッドが積み、[drainCompleted] が受け取る（#900） */
+    private class CleanupDeleteResult(val id: UUID, val bytes: Long)
+
+    private val cleanupDeleteResults = ConcurrentLinkedQueue<CleanupDeleteResult>()
+
     /** このサーバーで claim・`delete`・ID を振った ID（先読みの値を使わない。先読みは開いたときのディスクの写しのため。#585） */
     private val touched = HashSet<UUID>()
 
@@ -671,6 +682,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         owners.remove(id)
         unwrittenOwners.remove(id)
         deletedIds.remove(id)
+        cleanupDeletesPending.remove(id)
         knownDirectories += id
     }
 
@@ -905,6 +917,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                 unwrittenOwners[id] = next
                 knownDirectories += id
                 deletedIds -= id
+                cleanupDeletesPending -= id
                 epoch = rawEpoch
                 result = ClaimResult.KEPT
             }
@@ -1348,7 +1361,8 @@ public class MachineSaveStore @JvmOverloads constructor(
     /**
      * 終わった書き込みを受け取る（メインスレッドで、毎 tick。#84）。失敗したもの・走らせなかったものも入る。
      * その予約を作った登録が今も同じときだけ、書けた最新の世代・今の基準を進め、[MachineSnapshotSource.committed] を呼ぶ。
-     * 新しく振った `owner.bin` が書けなかった UUID は、覚えていること・索引から外す（規則 7b）
+     * 新しく振った `owner.bin` が書けなかった UUID は、覚えていること・索引から外す（規則 7b）。
+     * [deleteUnreferenced] の削除の仕事の結果もここで受け取り、消さなかった ID を「このサーバーで消した」から外す（#900。返す一覧には入れない）
      */
     public fun pollCompleted(): List<SaveCompletion> {
         drainCompleted()
@@ -1359,6 +1373,10 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     private fun drainCompleted() {
+        while (true) {
+            val result = cleanupDeleteResults.poll() ?: break
+            cleanupDeleteFinished(result.id, result.bytes)
+        }
         while (true) {
             val done = completed.poll() ?: return
             accept(done)?.let { ready += it }
@@ -1514,6 +1532,7 @@ public class MachineSaveStore @JvmOverloads constructor(
         owners.remove(id)
         unwrittenOwners.remove(id)
         deletedIds += id
+        cleanupDeletesPending.remove(id)
         touch(id)
         marks.remove(id)
         latest.remove(id)
@@ -1601,12 +1620,15 @@ public class MachineSaveStore @JvmOverloads constructor(
      * `owner.bin` がないとする。[delete] と同じ）、見た ID になる。
      *
      * 仕事の中で調べ直し、判定に使った最新の更新時刻 [judgedNewestMillis] より新しいものがある・調べられないときは消さない。
-     * [sink] には消したバイト数（もうなかったら 0、消さなかったら -1）を書き込みのスレッドで1回渡す。消さなかったときは、
-     * メインスレッドで [cleanupDeletionSkipped] を呼ぶ
+     * [sink] には消したバイト数（もうなかったら 0、消さなかったら -1）を書き込みのスレッドで1回渡す（列が閉じていれば、呼んだスレッドで）。
+     * [sink] は数えるためのもので、「消した」の取り消しには使わない。結果は置き場自身も受け取り、消さなかったときは、次の [pollCompleted]
+     * （メインスレッドで毎 tick）で「このサーバーで消した」から外す（claim がディスクの `owner.bin` を読むように。#900）。
+     * 結果を受け取る前にその ID を claim・[delete] したときは外さない
      */
     public fun deleteUnreferenced(id: UUID, judgedNewestMillis: Long, sink: (Long) -> Unit): Boolean {
         if (seenThisSession(id)) return false
         deletedIds += id
+        cleanupDeletesPending += id
         touch(id)
         enqueue(id, 0, {
             val bytes = try {
@@ -1615,10 +1637,17 @@ public class MachineSaveStore @JvmOverloads constructor(
                 LOG.log(System.Logger.Level.WARNING, "Failed to delete the unreferenced directory of $id", e)
                 -1L
             }
+            // 置き場の列に積んでから渡す（掃除が数えた時点で、置き場はもう受け取れる）
+            cleanupDeleteResults.add(CleanupDeleteResult(id, bytes))
             sink(bytes)
             null
         }, {
+            cleanupDeleteResults.add(CleanupDeleteResult(id, -1))
             sink(-1)
+            null
+        }, crashed = {
+            // 仕事が RuntimeException の外で落ちた（sink は呼ばれない）。「消した」のままにしない
+            cleanupDeleteResults.add(CleanupDeleteResult(id, -1))
             null
         })
         return true
@@ -1641,11 +1670,12 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
-     * [deleteUnreferenced] の仕事が消さなかった [id] を、「このサーバーで消した」から外す（claim がディスクの `owner.bin` を読むように）。
-     * その間に claim していれば（覚えている `owner.bin` がある）何もしない。メインスレッドだけが呼ぶ
+     * [deleteUnreferenced] の仕事の結果を受け取る（メインスレッド。#900）。消さなかった（[bytes] が負）なら、[id] を「このサーバーで消した」
+     * から外す（claim がディスクの `owner.bin` を読むように）。結果の前にその ID を claim・[delete] していれば、何もしない
      */
-    public fun cleanupDeletionSkipped(id: UUID) {
-        if (!owners.containsKey(id)) deletedIds -= id
+    private fun cleanupDeleteFinished(id: UUID, bytes: Long) {
+        if (!cleanupDeletesPending.remove(id)) return
+        if (bytes < 0) deletedIds -= id
     }
 
     /**

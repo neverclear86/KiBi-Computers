@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.neoforge.display
 
 import com.mojang.logging.LogUtils
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.level.ChunkPos
@@ -8,6 +9,7 @@ import net.minecraft.world.phys.Vec3
 import net.neoforged.bus.api.IEventBus
 import net.neoforged.neoforge.common.NeoForge
 import net.neoforged.neoforge.event.entity.player.PlayerEvent
+import net.neoforged.neoforge.event.level.ChunkWatchEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
 import net.neoforged.neoforge.network.PacketDistributor
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent
@@ -40,6 +42,7 @@ import java.util.IdentityHashMap
  *
  * 見ている人と送信量の勘定は `ServerPlayer` のオブジェクトで数える。ログアウトしたとき、リスポーンで
  * オブジェクトが替わったとき（[PlayerEvent.Clone]）、ディメンションを移ったときに外す（#382）。
+ * プレイヤーごとの「送ったチャンク」の記録（[isChunkSent]、#655）も、同じところで外す。
  */
 object ScreenSync {
     private val LOGGER = LogUtils.getLogger()
@@ -95,6 +98,10 @@ object ScreenSync {
         NeoForge.EVENT_BUS.addListener(::onLogout)
         NeoForge.EVENT_BUS.addListener(::onClone)
         NeoForge.EVENT_BUS.addListener(::onChangedDimension)
+        // ChunkWatchEvent は abstract なので、具体クラスごとに登録する
+        NeoForge.EVENT_BUS.addListener(::onChunkWatch)
+        NeoForge.EVENT_BUS.addListener(::onChunkSent)
+        NeoForge.EVENT_BUS.addListener(::onChunkUnWatch)
     }
 
     private fun registerPayloads(event: RegisterPayloadHandlersEvent) {
@@ -131,12 +138,15 @@ object ScreenSync {
         for (screen in serverScreens) {
             if (screen.level?.dimension() == event.from) screen.forget(player)
         }
+        // 元のディメンションで送ったチャンクの記録も捨てる。新しいディメンションの Sent は、この後の "send chunks" で出る
+        sentChunks.remove(player)
     }
 
     /** [player] を、すべての画面の見ている人と、送信量の勘定から外す（ログアウトしたとき、リスポーンで替わった古いオブジェクト）。 */
     internal fun forget(player: ServerPlayer) {
         for (screen in serverScreens) screen.forget(player)
         traffic.forget(player)
+        sentChunks.remove(player)
     }
 
     // サーバー: クライアントが送り直しをお願いした（メインスレッドで呼ばれる）
@@ -182,8 +192,8 @@ object ScreenSync {
 
     /**
      * 1つの画面の [ScreenWatchers] に、プレイヤーの位置を教え、フラグメントを送る口。
-     * 画面のチャンクがプレイヤーに届いていない（追跡していない、まだ送れる状態になっていない、送る順番を待っている）間は、
-     * 見られないものとする（[isChunkProbablySent]）。
+     * 画面のチャンクがプレイヤーに届いていない（まだ送っていない、送り直しの順番を待っている、追跡から外れた）間は、
+     * 見られないものとする（[isChunkSent]）。
      */
     internal class Host(private val screen: ScreenBlockEntity) : ScreenSyncHost<ServerPlayer> {
         private val center = Vec3.atCenterOf(screen.blockPos)
@@ -197,7 +207,7 @@ object ScreenSync {
                 return Double.POSITIVE_INFINITY
             }
             val level = screen.level as? ServerLevel ?: return Double.POSITIVE_INFINITY
-            if (!isChunkProbablySent(level, player, chunk)) return Double.POSITIVE_INFINITY
+            if (!isChunkSent(level, player, chunk)) return Double.POSITIVE_INFINITY
             return center.distanceToSqr(player.eyePosition)
         }
 
@@ -210,34 +220,74 @@ object ScreenSync {
         override fun fairShareGroup(): FairShareGroup = screen.wiredTo?.connectedMachine?.fairShareGroup ?: FairShareGroup.NONE
     }
 
-    /**
-     * [chunk] がもう [player] に送られたとみなしてよいか。メインスレッドから呼ぶ。
-     *
-     * 送った事実を記録しているのではなく、「追跡の範囲に入っている・送る順番待ちでない・いま送れる状態
-     * （[net.minecraft.server.level.ChunkMap.getChunkToSend] が null でない）」から推し量っている。
-     *
-     * サーバーはチャンクを、追跡の範囲に入っただけでは送らず、送れる状態（ブロックが tick する段まで読み込み終え、
-     * `ChunkHolder` の送る前の待ち（`sendSync`）も終わったもの）になってから送る順番待ちに入れる。画面のブロックエンティティは、
-     * その前の段（FULL）で読み込まれるので、追跡の範囲に入っていて順番待ちでもないのに、まだ送っていないことがある。その間に送った
-     * 画面の中身は、クライアントがチャンクを持っていないので捨てられ、サーバーは送れたものとして差分しか送らない（#636。ワールドに
-     * 入り直した直後、画面が空のままになった）。
-     *
-     * ふつうの経路（tick する段になるのと同じ呼び出しの中で順番待ちに入る）では、送れる状態と送ったことは一致する。ずれるのは、
-     * `ChunkMap.waitForLightBeforeSending` で送る前にライトの処理を待たせたチャンク（バニラでは End の出口ポータルの周り。
-     * 他 MOD も呼べる）だけ:
-     * - 既に届いているチャンクでも、ライトの処理が終わるまで偽になる。見ている人から外れ、次に見はじめる（キーフレームを送り直す）
-     *   まで、その画面は更新されない
-     * - 待ちが終わってから順番待ちに入れるタスク（メインスレッドに積まれる）が走るまでの間は、まだ送っていないのに真になる。
-     *   その間にキーフレームを送ると、#636 と同じように捨てられる
-     *
-     * 送った事実をプレイヤーごとに記録すれば、どちらも起きない（#655）。
-     */
-    internal fun isChunkProbablySent(level: ServerLevel, player: ServerPlayer, chunk: ChunkPos): Boolean {
-        if (!player.chunkTrackingView.contains(chunk)) return false
-        val key = chunk.toLong()
-        if (player.connection.chunkSender.isPending(key)) return false
-        return level.chunkSource.chunkMap.getChunkToSend(key) != null
+    /** 1人のプレイヤーに送ったチャンク（[level] のもの）の座標（[ChunkPos.toLong]）。 */
+    private class SentChunks(val level: ServerLevel) {
+        val chunks = LongOpenHashSet()
     }
+
+    /**
+     * プレイヤーごとの、送ったチャンクの記録（#655）。メインスレッドから読み書きする（チャンクのイベントも、画面の tick も
+     * メインスレッドで動く）。
+     *
+     * 画面のあるチャンクに絞らず、送ったチャンクをすべて記録する。送った後のチャンクに画面を置いたとき（いちばんよくある置き方）、
+     * Sent はもう出た後なので、絞ると次にチャンクを送り直すまで誰もその画面を見なくなる。コストは台数によらず、
+     * プレイヤー数 × 見える範囲に比例する（描画距離 12 で 625 件 ≒ 8 KB/人、32 で 4225 件 ≒ 64 KB/人）。
+     */
+    private val sentChunks = IdentityHashMap<ServerPlayer, SentChunks>()
+
+    // チャンクを送る順番待ちに入れた（送り直しも含む）。届くまでは見られないものとする。
+    // 入れ物は作らない（ログアウトの後にも出るので、作ると消したプレイヤーの分が残る）
+    private fun onChunkWatch(event: ChunkWatchEvent.Watch) {
+        sentChunks[event.player]?.chunks?.remove(event.pos.toLong())
+    }
+
+    // 追跡から外した（順番待ちから外したか、クライアントに忘れさせた）。送る前に外れたチャンクにも出る
+    private fun onChunkUnWatch(event: ChunkWatchEvent.UnWatch) {
+        sentChunks[event.player]?.chunks?.remove(event.pos.toLong())
+    }
+
+    // チャンクのパケットを接続に積んだ。この後に積む画面のパケットは、チャンクより先には届かない
+    private fun onChunkSent(event: ChunkWatchEvent.Sent) {
+        val player = event.player
+        // リスポーンで替わった古いオブジェクト（接続の player が替わる前の Sent）など。記録を作ると残るので無視する
+        if (player.isRemoved || player.hasDisconnected()) return
+        val level = event.level
+        var record = sentChunks[player]
+        if (record == null || record.level !== level) {
+            record = SentChunks(level)
+            sentChunks[player] = record
+        }
+        record.chunks.add(event.pos.toLong())
+        // 送り直したチャンクでは、クライアントが画面のブロックエンティティを作り直し、画面が空になる。順番待ちから送るまでが
+        // 同じ tick に収まると、tick の終わりの距離の確かめでは見ている人から外れないので、ここで外す。次に見はじめる人を
+        // 探す tick に、間隔を待たずにキーフレームを送る。画面を全部なめず、そのチャンクのブロックエンティティだけを見る
+        if (serverScreens.isEmpty()) return
+        for (be in event.chunk.blockEntities.values) {
+            if (be is ScreenBlockEntity) be.forget(player)
+        }
+    }
+
+    /**
+     * [level] の [chunk] を、もう [player] に送ったか。メインスレッドから呼ぶ。
+     *
+     * NeoForge のチャンクのイベントで、プレイヤーごとに送った事実を記録している（#655）:
+     * - [ChunkWatchEvent.Sent]: チャンクのパケットを接続に積んだ（`PlayerChunkSender.sendNextChunks`。tick の "send chunks" の段で、
+     *   [ServerTickEvent.Post] より前）。記録に足す
+     * - [ChunkWatchEvent.Watch]: 送る順番待ちに入れた（送り直しも含む）。記録から外す
+     * - [ChunkWatchEvent.UnWatch]: 追跡から外した。記録から外す
+     *
+     * サーバーはチャンクを、追跡の範囲に入っただけでは送らず、送れる状態になってから送る順番待ちに入れる。画面のブロックエンティティは
+     * その前の段（FULL）で読み込まれるので、まだ送っていない間に画面を送ると、クライアントはチャンクを持っていないので捨て、
+     * サーバーは送れたものとして差分しか送らなくなる（#636）。以前（#654）は「追跡の範囲・順番待ちでない・送れる状態」から推し量って
+     * いたが、`ChunkMap.waitForLightBeforeSending` で送る前の待ちを足したチャンク（End の出口ポータルの周りなど）でずれた。
+     */
+    internal fun isChunkSent(level: ServerLevel, player: ServerPlayer, chunk: ChunkPos): Boolean {
+        val record = sentChunks[player] ?: return false
+        return record.level === level && record.chunks.contains(chunk.toLong())
+    }
+
+    /** [player] の送ったチャンクの記録の件数。記録がなければ -1。GameTest で、記録が残らないことを確かめるためのもの。 */
+    internal fun sentChunkCount(player: ServerPlayer): Int = sentChunks[player]?.chunks?.size ?: -1
 
     // クライアント: 画面の中身のフラグメントを受け取った（メインスレッドで呼ばれる）
     private fun onUpdate(payload: ScreenUpdatePayload, context: IPayloadContext) {
