@@ -135,3 +135,35 @@ internal fun runQueuedUnloads(level: ServerLevel) {
     val queue = level.chunkSource.chunkMap.unloadQueue
     repeat(queue.size) { (queue.poll() ?: return).run() }
 }
+
+/**
+ * GameTest 用: tick をまたぐ待ちを壁時計で打ち切る（#881）。GameTest のサーバーは tick の間で待たない
+ * （`GameTestServer.waitUntilNextTick` は積まれた仕事を回すだけ）ので、tick はいつも全速で進み、`timeoutTicks` は壁時計では
+ * 1 秒もかからずに尽きうる。そこで、条件が偽の tick ごとに [pace] で最大 [stepMillis] だけ眠り、壁時計の [limitMillis] で打ち切る。
+ * 待つ tick は 1 回あたり [stepMillis] 以上かかるので、`timeoutTicks` を `limitMillis / stepMillis` より十分大きくしておけば、
+ * 壁時計の上限が必ず先に来る（失敗の文言が「間に合わなかった」理由を出せる）。
+ *
+ * 眠るのはメインスレッドなので、待つ相手（書き込みのスレッド・列の外の読み手など）がメインスレッドを要しないときだけ使う。
+ * 作った時点から測る（待ちに入ったところで作る）
+ */
+internal class WallClockWait(private val limitMillis: Long, private val stepMillis: Long) {
+    private val startNanos = System.nanoTime()
+
+    /** [pace] を呼んだ（待った）tick の数 */
+    var ticks: Int = 0
+        private set
+
+    /** 作ってからの経過（ミリ秒） */
+    val elapsedMillis: Long get() = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos)
+
+    /** 上限を過ぎていれば `false`。過ぎていなければ、残りと [stepMillis] の小さい方だけ眠って `true` */
+    fun pace(): Boolean {
+        val left = limitMillis - elapsedMillis
+        if (left <= 0) return false
+        ticks++
+        Thread.sleep(minOf(stepMillis, left))
+        return true
+    }
+
+    override fun toString(): String = "${elapsedMillis}ms over $ticks ticks (limit ${limitMillis}ms)"
+}
