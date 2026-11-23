@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.neoforge.gametest
 
 import com.mojang.brigadier.exceptions.CommandSyntaxException
 import net.minecraft.core.BlockPos
+import net.minecraft.core.MappedRegistry
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.gametest.framework.GameTestInfo
@@ -537,6 +538,41 @@ object SaveCleanupGameTests {
         helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java), "a plain class should not be a mixin target")
         helper.succeed()
     }
+
+    /**
+     * 本物の Mixin が当たったクラスでの検出。NeoForge 自身が `neoforge.mixins.json` で `BlockEntityType`・`MappedRegistry` にアクセサーの Mixin を当てているので、
+     * 本物の `@MixinMerged` が見つかること、その Mixin がインターフェース（アクセサーだけ）と判定されて数えられないこと（本物のクラスローダーでクラスファイルが読めること）を確かめる。
+     * 処理を書き換える Mixin（インターフェースでないもの）なら数えること、記録が引けないときは数えることは、Mixin の記録を差し替えて確かめる。
+     * Mixin の記録（`Mixins.getMixinsForClass`）は 0.8.7 では本物の対象でも空なので、記録ではなく印の検出が壊れたらここで落ちる（#899）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun mixinTargetIsDetectedOnRealMixins(helper: GameTestHelper) {
+        for (type in listOf(BlockEntityType::class.java, MappedRegistry::class.java)) {
+            val mixins = type.declaredMethods.flatMap { it.declaredAnnotations.toList() }.filter { it.annotationClass.java.name == MIXIN_MERGED }
+            helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(type), "the real mixin on ${type.name} should leave a merged mark")
+            helper.assertTrue(mixins.isNotEmpty(), "the merged mark should be readable on ${type.name}")
+            val loader = type.classLoader
+            val names = mixins.map { mergedName(it) }
+            helper.assertTrue(names.all { ChunkReferenceProbe.isAccessorMixin(loader, it) }, "the accessor mixins of ${type.name} should be interfaces: $names")
+            helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(type), "accessor-only mixins on ${type.name} should not count: $names")
+        }
+        // 処理を書き換える Mixin（インターフェースでないもの）の記録なら数える。アクセサー（インターフェース）の記録なら数えない
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf(UnmarkedMember::class.java.name) }, "a non-accessor mixin should count")
+        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf(AccessorLike::class.java.name) }, "an accessor mixin should not count")
+        // 記録が引けないとき・Mixin のクラスファイルが読めないときは数える（残す側）
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { error("no registry") }, "a failing lookup should count")
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java) { listOf("no.such.Mixin") }, "an unreadable mixin should count")
+        helper.succeed()
+    }
+
+    /** `@MixinMerged` の `mixin`（合わせた Mixin のクラス名） */
+    private fun mergedName(mark: Annotation): String = mark.annotationClass.java.getMethod("mixin").invoke(mark) as String
+
+    private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの Mixin の代わりのインターフェース */
+    private interface AccessorLike
 
     /** [vanillaRegionStorageIsTrusted] の、`@MixinMerged` の代わりの印（実行時に見える注釈） */
     @Retention(AnnotationRetention.RUNTIME)

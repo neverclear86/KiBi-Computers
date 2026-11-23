@@ -25,6 +25,8 @@ import net.neoforged.neoforge.event.server.ServerStartedEvent
 import net.neoforged.neoforge.event.server.ServerStoppedEvent
 import net.neoforged.neoforge.event.server.ServerStoppingEvent
 import net.neoforged.neoforge.event.tick.ServerTickEvent
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.Opcodes
 import org.spongepowered.asm.mixin.Mixins
 import pro.ikili.kibicomputers.core.persist.FileModuleStore
 import pro.ikili.kibicomputers.core.persist.MachineOwner
@@ -315,8 +317,10 @@ internal class ChunkReferenceProbe(
          * 「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
          *
          * 形式を差し替える口はバニラにない（`RegionFileStorage` は `final` でコンストラクターはパッケージの中だけ、`ChunkStorage.worker`・`IOWorker.storage` は `final`）ので、
-         * 差し替えられるのはバイトコードを書き換えるもの（Mixin・coremod）だけ。Mixin は、当てたクラスの記録（`Mixins.getMixinsForClass`）と、
-         * 合わせたメンバーの印（`@MixinMerged`。記録が引けない形でも見える）の両方で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
+         * 差し替えられるのはバイトコードを書き換えるもの（Mixin・coremod）だけ。Mixin は、合わせたメンバーの印（`@MixinMerged`）と、
+         * 当てたクラスの記録（`Mixins.getMixinsForClass`。Mixin 0.8.7 では空を返すので、実際に効くのは印）の両方で見る。調べるのに失敗したら、当たったものとして数える（残す側）。
+         * アクセサー・インボーカーだけの Mixin（NeoForge 自身が `BlockEntityType` などに当てているもの。[isAccessorMixin]）は、処理を書き換えないので数えない。
+         * 処理を書き換える Mixin は、形式を変えないもの（性能のためのもの）も区別できず数える。その環境では、リージョンファイルのない位置の残骸は回収されない（毎回「判定できない」）。
          * coremod・JVM エージェントの書き換えは見えない。`ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので数えない（数えると、ほとんどの環境で
          * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。
          *
@@ -324,19 +328,58 @@ internal class ChunkReferenceProbe(
          */
         fun modifiedRegionStorage(): List<String> = REGION_STORAGE_CLASSES.filter(::isMixinTarget).map { it.name }
 
-        /** クラス [type] に Mixin が当たっているか（調べるのに失敗したら `true`） */
-        fun isMixinTarget(type: Class<*>): Boolean = try {
-            hasMergedMembers(type) || Mixins.getMixinsForClass(type.name).isNotEmpty()
+        /**
+         * クラス [type] に、形式を変えうる Mixin が当たっているか（調べるのに失敗したら `true`）。
+         * 合わせたメンバーの印（[hasMergedMembers]）と、当てたクラスの記録（[recorded]）の両方で見る。
+         * アクセサー・インボーカーだけの Mixin（インターフェースの Mixin。フィールド・メソッドを開くだけで、処理を書き換えない）は数えない（[isAccessorMixin]）。
+         *
+         * 記録（`Mixins.getMixinsForClass`）は、Mixin 0.8.7 では当てられたクラスでも空を返す（GameTest で確かめた。`BlockEntityType` は
+         * 記録が空で、印はある）。実際に効くのは印のほうで、記録は、引ける版・形が来たときの保険
+         */
+        fun isMixinTarget(type: Class<*>, recorded: (String) -> Collection<String> = ::recordedMixins): Boolean = try {
+            val loader = type.classLoader
+            hasMergedMembers(type, ignoredMixin = { isAccessorMixin(loader, it) }) || recorded(type.name).any { !isAccessorMixin(loader, it) }
         } catch (e: RuntimeException) {
             true
         } catch (e: LinkageError) {
             true
         }
 
-        /** クラス [type] に、Mixin が合わせたメソッド・コンストラクター・フィールド（印 [marker]。既定は `@MixinMerged`）があるか */
-        fun hasMergedMembers(type: Class<*>, marker: String = MIXIN_MERGED): Boolean {
+        /** クラス名 [className] に当たった Mixin の記録（Mixin のクラス名） */
+        private fun recordedMixins(className: String): Collection<String> = Mixins.getMixinsForClass(className).map { it.className }
+
+        /**
+         * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースにはアクセサーとインボーカーしか書けない。
+         * Mixin のクラスは読み込めない（Mixin が弾く）ので、クラスファイルのアクセスフラグを読む。名前がない・読めないなら `false`（数える）
+         */
+        fun isAccessorMixin(loader: ClassLoader?, mixin: String?): Boolean {
+            if (mixin == null) return false
+            return try {
+                val bytes = (loader ?: ClassLoader.getSystemClassLoader()).getResourceAsStream(mixin.replace('.', '/') + ".class")?.use { it.readAllBytes() } ?: return false
+                ClassReader(bytes).access and Opcodes.ACC_INTERFACE != 0
+            } catch (e: IOException) {
+                false
+            } catch (e: RuntimeException) {
+                false
+            }
+        }
+
+        /**
+         * クラス [type] に、Mixin が合わせたメソッド・コンストラクター・フィールド（印 [marker]。既定は `@MixinMerged`）があるか。
+         * 印の `mixin`（合わせた Mixin のクラス名）が [ignoredMixin] に当たるものは数えない。`mixin` が読めない印は数える（残す側）
+         */
+        fun hasMergedMembers(type: Class<*>, marker: String = MIXIN_MERGED, ignoredMixin: (String?) -> Boolean = { false }): Boolean {
             val members = type.declaredMethods.asSequence() + type.declaredConstructors.asSequence() + type.declaredFields.asSequence()
-            return members.any { member -> member.declaredAnnotations.any { it.annotationClass.java.name == marker } }
+            return members.any { member ->
+                member.declaredAnnotations.any { it.annotationClass.java.name == marker && !ignoredMixin(mergedMixin(it)) }
+            }
+        }
+
+        /** 印 [mark]（`@MixinMerged`）の `mixin`。読めなければ `null`（[hasMergedMembers] は数える） */
+        private fun mergedMixin(mark: Annotation): String? = try {
+            mark.annotationClass.java.getMethod("mixin").invoke(mark) as? String
+        } catch (e: ReflectiveOperationException) {
+            null
         }
 
         /**
