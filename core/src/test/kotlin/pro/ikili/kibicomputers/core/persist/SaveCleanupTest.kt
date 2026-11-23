@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -857,17 +858,19 @@ class SaveCleanupTest {
         assertTrue(Files.exists(stale))
     }
 
-    /** 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する */
+    /**
+     * 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する。壁時計の期限で合否を決めない（#878）。
+     * 止まったときは、呼ぶテストの [Timeout]（保険）が止める
+     */
     private fun runThreaded(cleanup: SaveCleanup, done: () -> Boolean = { cleanup.finished }) {
-        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
         while (!done()) {
             cleanup.tick()
-            check(System.nanoTime() < deadline) { "the cleanup did not finish (${cleanup.phase})" }
             Thread.sleep(1)
         }
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で、ディレクトリとモジュールを掃除する`() {
         val (referenced, unused) = oldModules("referenced", "unused")
         val stale = staleTemp()
@@ -896,6 +899,7 @@ class SaveCleanupTest {
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で止めると、列に残った調べは問いも削除も入れず、結果を受け取りきる`() {
         val (unused) = oldModules("unused")
         val ids = List(20) { previousMachine(MachineOwner("minecraft:overworld", it * 16, 64, 0)) }

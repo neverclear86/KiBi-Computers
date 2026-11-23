@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
 import java.util.UUID
@@ -14,8 +15,10 @@ import java.util.concurrent.TimeUnit
 /**
  * 待ちにした claim の `owner.bin` を、書き込みの列の外の読み手で読む（#877、ADR 0084 の規則 7a）のテスト。
  * その ID の仕事が列に残っていなければ、ほかの ID の仕事で列が詰まっていても読み手が読んで決まり、残っていれば今までどおり列の後ろで読む。
- * 読み手が開いている間は、書き込みのスレッドがその ID の `owner.bin` を置き換えない
+ * 読み手が開いている間は、書き込みのスレッドがその ID の `owner.bin` を置き換えない。
+ * 読み手（実スレッド）の結果は壁時計の期限で合否を決めずに待つ（#878）。クラスの [Timeout] は、止まったときの保険で、合否の基準ではない
  */
+@Timeout(10, unit = TimeUnit.MINUTES)
 class MachineSideOwnerReadTest {
     @TempDir
     lateinit var dir: Path
@@ -33,23 +36,19 @@ class MachineSideOwnerReadTest {
     private fun store(manual: ManualSaveExecutor, claimWaitMillis: Long = MachineSaveConfig.DEFAULT_WRITER_FLUSH_MILLIS) =
         MachineSaveStore(dir, MachineIdIndex(), "test", manual, claimWaitMillis = claimWaitMillis, sideOwnerReads = true)
 
-    private fun pollUntil(store: MachineSaveStore, expected: Int, timeoutMillis: Long = 10_000): List<DeferredClaim> {
+    /** [store] の待ちを、[expected] 件そろうまで [MachineSaveStore.pollDeferredClaims] で受け取る（期限なし。#878） */
+    private fun pollUntil(store: MachineSaveStore, expected: Int): List<DeferredClaim> {
         val out = ArrayList<DeferredClaim>()
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
-        while (out.size < expected && System.nanoTime() < deadline) {
+        while (true) {
             out += store.pollDeferredClaims()
-            if (out.size < expected) Thread.sleep(2)
-        }
-        return out
-    }
-
-    private fun waitFor(timeoutMillis: Long = 10_000, condition: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
-        while (!condition()) {
-            if (System.nanoTime() > deadline) return false
+            if (out.size >= expected) return out
             Thread.sleep(2)
         }
-        return true
+    }
+
+    /** [condition] が真になるまで待つ（期限なし。#878） */
+    private fun waitFor(condition: () -> Boolean) {
+        while (!condition()) Thread.sleep(2)
     }
 
     @Test
@@ -113,20 +112,25 @@ class MachineSideOwnerReadTest {
         val release = CountDownLatch(1)
         store.sideOwnerReader = { path ->
             opened.countDown()
-            release.await(10, TimeUnit.SECONDS)
+            release.await()
             OwnerRecord.read(path)
         }
         assertEquals(null, store.claimOrDefer(id.toString(), 0, 0, at(2), Key("waiting")))
-        assertTrue(opened.await(10, TimeUnit.SECONDS))
-        // 読み手が開いている間に、マシンのある台の同期の claim が引き取る（owner.bin を書く仕事が列に入る）
-        assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 0, 0, at(1)).result)
-        val writer = Thread { manual.runAll() }.apply { start() }
-        writer.join(300)
-        assertTrue(writer.isAlive, "書き込みのスレッドは、読み手が読み終えるのを待つ")
-        assertEquals(OwnerRecord(0, at(0)), OwnerRecord.read(ownerFile(id)), "まだ置き換えていない")
-        release.countDown()
-        writer.join(10_000)
-        assertFalse(writer.isAlive)
+        val writer: Thread
+        try {
+            opened.await()
+            // 読み手が開いている間に、マシンのある台の同期の claim が引き取る（owner.bin を書く仕事が列に入る）
+            assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 0, 0, at(1)).result)
+            writer = Thread { manual.runAll() }.apply { start() }
+            // 待たされていることを確かめる（負荷が高いほど通りやすい向きなので、短い時間のままでよい）
+            writer.join(300)
+            assertTrue(writer.isAlive, "書き込みのスレッドは、読み手が読み終えるのを待つ")
+            assertEquals(OwnerRecord(0, at(0)), OwnerRecord.read(ownerFile(id)), "まだ置き換えていない")
+        } finally {
+            // 途中で落ちても、止めた読み手を放す
+            release.countDown()
+        }
+        writer.join()
         assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(ownerFile(id)))
         // 待っていた写しは、引き取った台が索引にいるので重複になる（覚えている owner.bin で判定し直す）
         val done = pollUntil(store, 1)
@@ -150,20 +154,23 @@ class MachineSideOwnerReadTest {
             reads += id
             if (id == first) {
                 opened.countDown()
-                release.await(10, TimeUnit.SECONDS)
+                release.await()
             }
             OwnerRecord.read(path)
         }
         assertEquals(null, store.claimOrDefer(first.toString(), 0, 0, at(0), Key("first")))
-        assertTrue(opened.await(10, TimeUnit.SECONDS))
         val key = Key("second")
-        assertEquals(null, store.claimOrDefer(second.toString(), 0, 0, at(3), key))
-        assertEquals(2, store.sideOwnerReadRequests)
-        // 読み手が second を開く前に、その ID の仕事が列に入る（判定の材料は変えない仕事）
-        store.readModuleReferences(second.toString(), { false }) { }
-        release.countDown()
+        try {
+            opened.await()
+            assertEquals(null, store.claimOrDefer(second.toString(), 0, 0, at(3), key))
+            assertEquals(2, store.sideOwnerReadRequests)
+            // 読み手が second を開く前に、その ID の仕事が列に入る（判定の材料は変えない仕事）
+            store.readModuleReferences(second.toString(), { false }) { }
+        } finally {
+            release.countDown()
+        }
         // first の確定はここでは見ない（受け取って捨てる）
-        assertTrue(waitFor { store.pollDeferredClaims(); store.sideOwnerReadRetries == 1L })
+        waitFor { store.pollDeferredClaims(); store.sideOwnerReadRetries == 1L }
         assertEquals(listOf(first), reads, "second は開かない")
         assertEquals(1, store.writerOwnerReadRequests, "書き込みの列に回し直す")
         manual.runAll()
@@ -191,17 +198,20 @@ class MachineSideOwnerReadTest {
             reads += id
             if (id == blocker) {
                 opened.countDown()
-                release.await(10, TimeUnit.SECONDS)
+                release.await()
             }
             OwnerRecord.read(path)
         }
         val first = Key("blocker")
         assertEquals(null, store.claimOrDefer(blocker.toString(), 0, 0, at(0), first))
-        assertTrue(opened.await(10, TimeUnit.SECONDS))
-        val key = Key("gone")
-        assertEquals(null, store.claimOrDefer(gone.toString(), 0, 0, at(1), key))
-        store.cancelDeferredClaim(key)
-        release.countDown()
+        try {
+            opened.await()
+            val key = Key("gone")
+            assertEquals(null, store.claimOrDefer(gone.toString(), 0, 0, at(1), key))
+            store.cancelDeferredClaim(key)
+        } finally {
+            release.countDown()
+        }
         val done = pollUntil(store, 1)
         assertEquals(listOf(first), done.map { it.key })
         assertTrue(store.close(10_000))
