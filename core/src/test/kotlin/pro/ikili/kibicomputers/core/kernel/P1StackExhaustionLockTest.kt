@@ -17,7 +17,6 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -91,9 +90,8 @@ class P1StackExhaustionLockTest {
                     assertEquals("call stack exhausted", crashReason(e!!), "${rt.lastError}")
                     modes.merge(mode, 1, Int::plus)
                     tally.record(rt, mode)
-                    assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$i 回目、$mode、pad $pad）: ${m.lock}")
-                    m.lock.unlock()
                     val alive = { describe(h, m, ticker, "$i 回目", rt) }
+                    awaitLockAcquirable(ticker, "マシンのロックが取れる（$i 回目、$mode、pad $pad）", m.lock, alive)
                     awaitProgress(ticker, "同じ台のプロセス（$i 回目、$mode、pad $pad）", sameProgress, alive)
                     awaitProgress(ticker, "別の台のプロセス（$i 回目、$mode、pad $pad）", otherProgress, alive)
                 }
@@ -119,8 +117,9 @@ class P1StackExhaustionLockTest {
                 awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
                 awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
                 // STOPPED・許可が戻った直後は、最後のプロセススレッドが終わりの後始末（`ProcessRunner.recoverLeaks`）でマシンのロックを
-                // 一瞬持っていることがある。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
-                eventuallyDescribe(describe = { "マシンのロックが放されない: ${m.lock}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
+                // 持っていることがある。負荷の下ではそのスレッドがすぐ動けず、一瞬で済まないことがあるので、固定の待ちでなく遅れと停止を
+                // 見分ける（#905）。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
+                awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
             }
         }
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")

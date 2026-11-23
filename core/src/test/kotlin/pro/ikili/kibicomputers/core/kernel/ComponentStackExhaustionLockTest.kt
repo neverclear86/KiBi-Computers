@@ -23,7 +23,6 @@ import pro.ikili.kibicomputers.core.runtime.component.link.HostFunction
 import pro.ikili.kibicomputers.core.runtime.component.link.HostWait
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -295,8 +294,7 @@ class ComponentStackExhaustionLockTest {
 
     /** 毎回の後の確かめ: マシンのロックが取れる。同じ台と別の台のプロセスが進み続ける（遅れか停止かを見分ける） */
     private fun checkAlive(r: Rig, label: String, rt: ProcessRuntime) {
-        assertTrue(r.m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$label）: ${r.m.lock}")
-        r.m.lock.unlock()
+        awaitLockAcquirable(r.ticker, "マシンのロックが取れる（$label）", r.m.lock) { describe(r, rt) }
         awaitProgress(r.ticker, "同じ台のプロセス（$label）", r.sameProgress) { describe(r, rt) }
         awaitProgress(r.ticker, "別の台のプロセス（$label）", r.otherProgress) { describe(r, rt) }
     }
@@ -365,8 +363,9 @@ class ComponentStackExhaustionLockTest {
                 awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
                 awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
                 // STOPPED・許可が戻った直後は、最後のプロセススレッドが終わりの後始末（`ProcessRunner.recoverLeaks`）でマシンのロックを
-                // 一瞬持っていることがある。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
-                eventuallyDescribe(describe = { "マシンのロックが放されない: ${m.lock}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
+                // 持っていることがある。負荷の下ではそのスレッドがすぐ動けず、一瞬で済まないことがあるので、固定の待ちでなく遅れと停止を
+                // 見分ける（#905）。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
+                awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
             }
         }
     }

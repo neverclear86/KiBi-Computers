@@ -11,8 +11,8 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
 /*
- * スタックの余裕の確かめ（#828・#858）の 3 つのテスト（`StackExhaustionLockTest`・`ComponentStackExhaustionLockTest`・
- * `P1StackExhaustionLockTest`）が共有する、待ちの見分けと失敗の説明（#868・#888 で `StackExhaustionLockTest` に入れたもの）。
+ * スタックの余裕の確かめ（#828・#858）のテスト（`StackExhaustionLockTest`・`ComponentStackExhaustionLockTest`・
+ * `P1StackExhaustionLockTest`・`P1DiskCloseStackExhaustionTest`）が共有する、待ちの見分けと失敗の説明（#868・#888 で `StackExhaustionLockTest` に入れたもの）。
  *
  * 固定の待ち（`eventually`・`Harness.tickUntilTrue` の 10 秒）で落とすと、負荷の下の遅れを停止と見誤る。また、失敗の説明で
  * CPU・許可・マシンのロックを上限なしで読むと、本当にロックが残ったときに説明を作るところで止まり、テスト全体の上限でしか落ちない。
@@ -27,6 +27,9 @@ internal const val HEADROOM_GRACE_MILLIS = 30_000L
 
 /** 1 回の tick の終わりを待つ長さ。これを過ぎた tick は、終わるまで新しく回さない */
 internal const val HEADROOM_TICK_WAIT_MILLIS = 100L
+
+/** ロックが取れるかの確かめ（[awaitLockAcquirable]）で、1 回の `tryLock` が待つ長さ。見分けの区切りより十分短くする */
+internal const val HEADROOM_LOCK_PROBE_MILLIS = 20L
 
 /** 遅れの行の頭（`core/build.gradle.kts` の `test` タスクが、この行を Gradle のコンソールに写す） */
 internal const val HEADROOM_SLOWDOWN_MARKER = "#868 遅れ"
@@ -144,6 +147,25 @@ internal fun awaitOrClassify(ticker: HeadroomTicker, what: String, describe: () 
     } else {
         fail("停止: $what が $elapsed ms そろわない（$HEADROOM_FIRST_WAIT_MILLIS ms の時点: $atFirst）\n終わりの時点: ${describe()}")
     }
+}
+
+/**
+ * テストのスレッドが [lock] を取れるまで、遅れか停止かを見分けて待つ（#905。[awaitOrClassify]）。毎回 [HEADROOM_LOCK_PROBE_MILLIS] だけ
+ * 待って取り、取れたらすぐ放す（ロックを持ったまま tick を回したり、条件を返したりしない）。spin のプロセスが同じロックを頻繁に取るので、
+ * `isLocked` を見るのでなく、実際に取れることを確かめる
+ */
+internal fun awaitLockAcquirable(ticker: HeadroomTicker, what: String, lock: ReentrantLock, describe: () -> String) {
+    awaitOrClassify(ticker, what, describe) {
+        lock.tryLock(HEADROOM_LOCK_PROBE_MILLIS, TimeUnit.MILLISECONDS).also { if (it) lock.unlock() }
+    }
+}
+
+/**
+ * [lock] を誰も持たず、待つスレッドもいなくなるまで、遅れか停止かを見分けて待つ（#905。止めた後。[awaitOrClassify]）。
+ * 持ったまま死んだスレッドがいれば停止で落ちる。テストのスレッド自身が待ち行列に入らないよう、取らずに見るだけにする
+ */
+internal fun awaitLockReleased(ticker: HeadroomTicker, what: String, lock: ReentrantLock, describe: () -> String) {
+    awaitOrClassify(ticker, what, describe) { !lock.isLocked && !lock.hasQueuedThreads() }
 }
 
 /** [timeoutMillis] まで [condition] を 1 ms ごとに確かめる。そろえば `true` */
