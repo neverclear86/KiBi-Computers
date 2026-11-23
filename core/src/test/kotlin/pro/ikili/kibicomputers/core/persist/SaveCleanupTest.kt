@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -933,17 +934,19 @@ class SaveCleanupTest {
         assertTrue(Files.exists(stale))
     }
 
-    /** 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する */
+    /**
+     * 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する。壁時計の期限で合否を決めない（#878）。
+     * 止まったときは、呼ぶテストの [Timeout]（保険）が止める
+     */
     private fun runThreaded(cleanup: SaveCleanup, done: () -> Boolean = { cleanup.finished }) {
-        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
         while (!done()) {
             cleanup.tick()
-            check(System.nanoTime() < deadline) { "the cleanup did not finish (${cleanup.phase})" }
             Thread.sleep(1)
         }
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で、ディレクトリとモジュールを掃除する`() {
         val (referenced, unused) = oldModules("referenced", "unused")
         val stale = staleTemp()
@@ -972,14 +975,15 @@ class SaveCleanupTest {
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で止めると、列に残った調べは問いも削除も入れず、結果を受け取りきる`() {
         val (unused) = oldModules("unused")
         val ids = List(20) { previousMachine(MachineOwner("minecraft:overworld", it * 16, 64, 0)) }
         val writer = SaveWriter("kibicomputers-cleanup-test")
         val gate = java.util.concurrent.CountDownLatch(1)
         try {
-            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める
-            assertTrue(writer.execute(UUID.randomUUID()) { gate.await(10, java.util.concurrent.TimeUnit.SECONDS) })
+            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める（門は期限で勝手に開かない。finally で必ず開ける）
+            assertTrue(writer.execute(UUID.randomUUID()) { gate.await() })
             val store = MachineSaveStore(machines, MachineIdIndex(), "test", writer)
             val cleanup = cleanup(store, FileModuleStore(modulesRoot))
             cleanup.tick()
@@ -987,7 +991,8 @@ class SaveCleanupTest {
             assertTrue(cleanup.settling)
             gate.countDown()
             runThreaded(cleanup) { !cleanup.settling }
-            assertTrue(writer.flush(10_000))
+            // 列が空くのを、壁時計の期限で合否を決めずに待つ（#878。止まったときはメソッドの Timeout が落とす）
+            assertTrue(writer.flush(Long.MAX_VALUE))
             repeat(5) { cleanup.tick() }
             assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
             assertTrue(asked.isEmpty())
