@@ -63,15 +63,21 @@ function withGradlePending(schema) {
 
 // gradleStillRunning=false と申告しながら、理由の文が「Gradle がまだ終わっていない」を示す回を拾う（#904。PR #889 の実例:
 // 「やり直しは返す時点で :core:test を実行中で、終了コードを読めていない」「スキーマに『未完了』がないため needs_human で返す」）。
-// 本物の失敗まで拾わないよう、失敗の理由として読む文（マージの build・gametest の失敗、取り込みの build_failed、push しなかった修正）にだけ当てる
+// 本物の失敗まで拾わないよう、失敗の理由として読む文（マージの build の失敗、取り込みの build_failed、push しなかった修正）にだけ当て、
+// さらに Gradle が終わったあとの失敗の証拠（GameTest のロックの待ちの上限、タイムアウト、サーバーが落ちた、など）を含む文は外す
 const GRADLE_UNFINISHED_TEXT = /終了コードを(まだ)?(読めて|読んで|確かめられて|確かめて|確認できて|確認して)いない|\.exit\s*(が|は)?(まだ)?(ない|できていない|書かれていない)|(gradle|ビルド|build|GameTest|テスト|test|:[\w.-]+:\w+)[^。\n]{0,30}?(を|が|は)?(まだ)?(実行中|動いている|走っている|終わっていない|終わる前)|スキーマに「?未完了|still running|not (yet )?finished/i
+
+// Gradle が終わったあとの本物の失敗の証拠。理由の文にこれがあれば、「実行中」「終わる前」などを含んでいても未完了とは見ない
+// （例: GameTest のロックの待ちの上限に達した理由に「Held by: ...runGameTestServer in .worktrees/issue-900 が実行中のまま」と添えた回、
+// 「GameTest が時間内に終わっていない（タイムアウト）」、「testFoo が終わる前にサーバーが落ちた」）
+const GRADLE_FAILURE_EVIDENCE = /Held by|Waiting for the GameTest lock|ロック|上限|タイムアウト|time[ds]? ?out|落ち(た|て)|クラッシュ|crash|required tests failed|BUILD FAILED|FAILED\b|Could not (GET|HEAD|resolve|find)|UnknownHost/i
 
 // 返り値が「Gradle を待たずに返した」か。textEligible のときだけ text も見る。当たらなければ null
 function gradlePending(r, text, textEligible) {
   if (!r) return null
   const logs = Array.isArray(r.runningLogs) ? r.runningLogs : []
   if (r.gradleStillRunning === true) return { by: 'flag', logs, text: text ?? '' }
-  if (textEligible && text && GRADLE_UNFINISHED_TEXT.test(text)) return { by: 'text', logs, text }
+  if (textEligible && text && !GRADLE_FAILURE_EVIDENCE.test(text) && GRADLE_UNFINISHED_TEXT.test(text)) return { by: 'text', logs, text }
   return null
 }
 
@@ -95,13 +101,15 @@ function gradleWaitNote(number, worktree, pending) {
    プロセスは殺さない。\`./gradlew --stop\` も使わない。同じ worktree で Gradle を 2 本動かすと、\`.gradle\` のロックや \`build/\`・\`run/\` の出力、GameTest のロックを取り合う。${ORPHAN_WAIT_MINUTES} 分たっても終わらなければ、自分の Gradle は起動せず、\`gradleStillRunning=true\` で返す。
 3. 前の回のログに結果（BUILD SUCCESSFUL など）が出ていても、それは参考にとどめる。新しい連番（\`.log\`・\`.exit\` のどちらもない名前）で、この段階の手順どおりに起動し直し、その \`.exit\` を読むまで返さない。
 4. 前の回の作業の続き（コミット済みで push していない取り込みや修正）は、そのまま使う（reset・force push はしない）。\`git merge origin/main\` をもう一度実行して「Already up to date」になっても問題ない。
-5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さず、人に上げる）。`
+5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さない。この段階は「確かめられなかった」失敗として扱われ、先へ進まずに止まって人に上がる）。`
 }
 
 // Gradle を動かす段階を呼び、Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。
 // 呼び直すかどうかはスクリプトが決める（エージェントに任せない）。回数の上限は呼び出し 1 か所ごとに 1 回。
 // run(note) は note（null か、やり直しの指示）を受けてエージェントを呼ぶ。pendingOf(r) は gradlePending の結果を返す。
-// 返り値の stillPending は、やり直しでも待たずに返したとき true（呼ぶ側が今までどおり止める）
+// 返り値の stillPending は、やり直しでも待たずに返したとき true。呼ぶ側はこの結果を成功として先へ進めず、失敗として止める（pendingReason を理由に使う）。
+// やり直しの段階が結果を返さなかった（失敗した）ときは result=null・retryFailed=true で、stillPending=false（2 回待たずに返したのではない）。
+// 呼ぶ側は、段階が失敗したときと同じに扱う
 async function withGradleWait(what, number, worktree, run, pendingOf) {
   const first = await run(null)
   const p1 = pendingOf(first)
@@ -110,12 +118,18 @@ async function withGradleWait(what, number, worktree, run, pendingOf) {
   log(`${what}: Gradle の終わりを待たずに返した（${how}。ログ: ${p1.logs.join(', ') || '-'}）。Gradle を待つ指示を付けて 1 回だけやり直す`)
   const second = await run(gradleWaitNote(number, worktree, p1))
   if (!second) {
-    log(`${what}: Gradle を待つやり直しの段階が結果を返さなかった。1 回目の結果で続ける`)
-    return { result: first, waited: true, stillPending: true, first: p1 }
+    log(`${what}: Gradle を待つやり直しの段階が結果を返さなかった（段階の失敗として扱う）`)
+    return { result: null, waited: true, stillPending: false, retryFailed: true, first: p1 }
   }
   const p2 = pendingOf(second)
   if (p2) log(`${what}: やり直しでも Gradle の終わりを待たずに返した（ログ: ${p2.logs.join(', ') || '-'}）。もうやり直さない`)
   return { result: second, waited: true, stillPending: !!p2, first: p1 }
+}
+
+// やり直しでも Gradle を待たずに返した（stillPending）ときの、理由に付ける文（#904）
+function pendingReason(what, r) {
+  const logs = Array.isArray(r?.runningLogs) && r.runningLogs.length ? `（動いていたログ: ${r.runningLogs.join(', ')}）` : ''
+  return `${what}が、Gradle の終わりを待たずに 2 回返した${logs}（やり直しは 1 回まで）。ビルドとテストは確かめられていない`
 }
 
 // worktree が本物か（git worktree list に載っているか）を確かめる手順（#855）。壊れた残りに対して git -C を実行すると、
@@ -510,11 +524,15 @@ function askHuman(kind, number, question) {
 
 // 実装の段階。Gradle を待たずに返したら（gradleStillRunning）、待つ指示を付けて 1 回だけ呼び直す（#904。worktree はそのまま続けて使う）
 async function implement(info, approvedPlan, guidance, advice) {
-  const { result } = await withGradleWait(
+  const { result, stillPending } = await withGradleWait(
     `Issue #${info.number} の実装`, info.number, null,
     note => implementOnce(info, approvedPlan, guidance, advice, note),
     r => r && r.status !== 'already_done' ? gradlePending(r, r.summary, false) : null,
   )
+  // やり直しでも待たずに返したら、ビルドを確かめていない PR を CI に進めず、失敗として止める
+  if (result && stillPending) {
+    return { ...result, status: 'failed', summary: `${pendingReason('実装の段階', result)}。最後の報告: ${result.summary}${result.pr ? `（PR #${result.pr} は作られている）` : ''}` }
+  }
   return result
 }
 
@@ -573,15 +591,15 @@ mergeable には、最後に取った \`mergeable\` の値を入れる。`,
 }
 
 // CI の段階で main と衝突していたら、worktree に main を取り込む（#855）。字面で解けないものは取り込まずに返す
-// Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。やり直しでも待たずに返したら、今までどおり（build_failed なら衝突として人に上げる）
+// Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。やり直しでも待たずに返したら、取り込みの失敗（build_failed・push していない）として返す
 async function mergeMain(info, impl, n) {
   const { result, stillPending } = await withGradleWait(
     `PR #${impl.pr} の main の取り込み（${n}）`, info.number, impl.worktree,
     note => mergeMainOnce(info, impl, n, note),
     r => gradlePending(r, r?.summary, r?.outcome === 'build_failed'),
   )
-  if (result && stillPending && result.outcome === 'build_failed') {
-    return { ...result, summary: `Gradle の終わりを待たずに 2 回返した（やり直しは 1 回まで）。${result.summary}` }
+  if (result && stillPending) {
+    return { ...result, outcome: 'build_failed', pushed: false, summary: `${pendingReason('main の取り込みの段階', result)}。最後の報告: ${result.summary}` }
   }
   return result
 }
@@ -635,7 +653,7 @@ async function untilGreen(info, impl, tag) {
     log(`PR #${impl.pr}: CI 失敗（${ci.failingChecks.join(', ')}）。修正 ${i}/${MAX_CI_FIXES}`)
     const failing = ci.failingChecks.join(', ')
     const failureLog = ci.failureLog
-    const { result: fixed } = await withGradleWait(
+    const { result: fixed, stillPending } = await withGradleWait(
       `PR #${impl.pr} の CI の修正（${i}）`, info.number, impl.worktree,
       note => agent(
         `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。${note ? `\n${note}` : ''}
@@ -647,6 +665,11 @@ ${failureLog}`,
       ),
       r => gradlePending(r, r?.summary, r?.pushed === false),
     )
+    if (fixed && stillPending) {
+      // 直しのビルドを確かめていないので、直ったことにして先へ進めない。落ちたまま、理由を添えて返す
+      ci = { ...ci, failingChecks: [...ci.failingChecks, pendingReason(`CI の修正（${i}）の段階`, fixed)] }
+      break
+    }
     if (!fixed || !fixed.pushed) break
     ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}#${i}`, conflictState)
   }
@@ -750,7 +773,7 @@ async function mergePr(info, impl) {
     // Gradle を待たずに返した回（#904）は、過負荷の判定より先に見る（終わっていない GameTest の数字には意味がない）
     const firstRun = await mergeOnce(info, impl, null, 'merge')
     const first = firstRun.result
-    if (!first) return { status: 'needs_human', reason: 'マージの段階が失敗した' }
+    if (!first) return { status: 'needs_human', reason: firstRun.retryFailed ? 'マージの段階が Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した' : 'マージの段階が失敗した' }
     if (firstRun.stillPending) return pendingMergeResult(first)
     const waitPrefix = firstRun.waited ? 'マージの段階が Gradle の終わりを待たずに返したので、1 回だけやり直した。' : ''
     const retry = first.status === 'needs_human' && first.failedStep === 'gametest' && first.gameTestFailedOnly && overloaded(first)
@@ -761,7 +784,7 @@ async function mergePr(info, impl) {
     const secondRun = await mergeOnce(info, impl, note, 'merge-retry')
     const second = secondRun.result
     const prefix = `${waitPrefix}過負荷の兆候（${numbers}）で GameTest が落ちたので、1 回だけ回し直した。1 回目の理由: ${first.reason ?? '-'}`
-    if (!second) return { ...first, reason: `${prefix}。回し直しの段階が失敗した` }
+    if (!second) return { ...first, reason: `${prefix}。回し直しの段階が失敗した${secondRun.retryFailed ? '（Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した）' : ''}` }
     if (secondRun.stillPending) return pendingMergeResult(second, prefix)
     return { ...second, retried: true, reason: second.status === 'merged' ? prefix : `${prefix}。回し直しの理由: ${second.reason ?? '-'}` }
   } finally {
@@ -770,23 +793,24 @@ async function mergePr(info, impl) {
 }
 
 // マージの段階を 1 回呼ぶ。Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。
-// 理由の文も見るのは、マージせずに build・GameTest で止まったと返した回だけ（conflict・ci・merge は Gradle の終わりと関係しない）
+// 理由の文も見るのは、マージせずに build で止まったと返した回（failedStep が build か null）だけ。
+// conflict・ci・merge は Gradle の終わりと関係せず、gametest は「ロックの待ちの上限」「タイムアウト」「サーバーが落ちた」など、
+// Gradle が終わったあとの本物の失敗が「実行中」「終わる前」といった文を含みうるので見ない（gametest の未完了は申告で見分ける）
 function mergeOnce(info, impl, retryNote, stage) {
   return withGradleWait(
     `PR #${impl.pr} の${stage === 'merge' ? 'マージ' : 'マージの回し直し'}`, info.number, impl.worktree,
     note => agent(mergePrompt(info, impl, retryNote, note), { label: `${stage}${note ? '-wait' : ''}:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge }),
-    r => r && r.status !== 'merged' ? gradlePending(r, r.reason, r.failedStep == null || r.failedStep === 'build' || r.failedStep === 'gametest') : null,
+    r => r && r.status !== 'merged' ? gradlePending(r, r.reason, r.failedStep == null || r.failedStep === 'build') : null,
   )
 }
 
 // やり直しでも Gradle を待たずに返した（#904）。今までどおり人に上げる（マージはしていない）
 function pendingMergeResult(r, prefix) {
-  const logs = Array.isArray(r.runningLogs) && r.runningLogs.length ? `（ログ: ${r.runningLogs.join(', ')}）` : ''
   return {
     ...r,
     status: 'needs_human',
     failedStep: r.failedStep ?? 'build',
-    reason: `${prefix ? `${prefix}。` : ''}マージの段階が、Gradle の終わりを待たずに 2 回返した${logs}（やり直しは 1 回まで）。最後の理由: ${r.reason ?? '-'}`,
+    reason: `${prefix ? `${prefix}。` : ''}${pendingReason('マージの段階', r)}。最後の理由: ${r.reason ?? '-'}`,
   }
 }
 
@@ -859,6 +883,7 @@ worktree は消さない（片付けはこのスクリプトが別に行う）�
   for (const f of fixedUnreviewed.filter(f => f.severity === 'must')) {
     reasons.push(`最後のラウンドで直して push したが、レビューし直していない must の指摘: ${f.file}:${f.line ?? '-'} ${f.problem}`)
   }
+  if (r.unverified) reasons.push(`直しを確かめられなかった: ${r.unverified}`)
   if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
   const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
   // この段階ではもう直す機会がないので、確かめた結果を添えて聞く
@@ -916,7 +941,7 @@ async function runIssue(info) {
       const e = await escalate('pr', impl.pr, q, `実装の段階で PR を作ったあと（ブランチ ${impl.branch}）`, true)
       if (!e.guidance) return { issue: info.number, status: 'needs_human', pr: impl.pr, reason: e.question, question: e.question }
       // push しないのが正しい回もある（コードを変える必要がない）ので、理由の文は見ずに申告だけで見分ける（#904）
-      const { result: applied } = await withGradleWait(
+      const { result: applied, stillPending: appliedPending } = await withGradleWait(
         `PR #${impl.pr} の確認事項の反映`, info.number, impl.worktree,
         note => agent(
           `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）に、実装のエージェントが確認事項を残した。人に聞く前の確かめ（別のモデル）が、人を待たずに進められると判断し、次の進め方を示した。これに従う。${note ? `\n${note}` : ''}
@@ -934,11 +959,13 @@ ${e.guidance}`,
         r => gradlePending(r, r?.summary, false),
       )
       if (!applied) return { issue: info.number, status: 'failed', pr: impl.pr, reason: '確認事項の反映に失敗した', question: null }
+      if (appliedPending) return { issue: info.number, status: 'failed', pr: impl.pr, reason: `${pendingReason('確認事項の反映の段階', applied)}。最後の報告: ${applied.summary}`, question: null }
     }
 
     const tag = `#${info.number}`
     let ci = await untilGreen(info, impl, tag)
     const rounds = []
+    let unverified = null
     for (let round = 1; ci && ci.passed && round <= MAX_REVIEW_ROUNDS; round++) {
       const confirmed = await review(info, impl, round)
       // 検証で残った指摘は must・should を問わず直す（should をマージ前に止めるため）
@@ -949,7 +976,7 @@ ${e.guidance}`,
       if (confirmed.some(f => f.reviewFailed)) break
       if (!toFix.length) break
       log(`PR #${impl.pr}: 指摘 ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
-      const { result: fixed } = await withGradleWait(
+      const { result: fixed, stillPending: fixPending } = await withGradleWait(
         `PR #${impl.pr} のレビュー指摘の修正（${round}）`, info.number, impl.worktree,
         note => agent(
           `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）へのレビュー指摘を直す。worktree の中で修正し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。${note ? `\n${note}` : ''}
@@ -960,6 +987,11 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
         ),
         r => gradlePending(r, r?.summary, r?.pushed === false),
       )
+      if (fixed && fixPending) {
+        // 直しのビルドを確かめていないので、直ったことにせず、マージを止める
+        unverified = pendingReason(`レビュー指摘の修正（${round}）の段階`, fixed)
+        break
+      }
       if (!fixed || !fixed.pushed) break
       entry.fixed = true
       ci = await untilGreen(info, impl, `${tag}-r${round}`)
@@ -967,11 +999,11 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
 
     // マージの条件は変えない: 最後のラウンドの must は、直して push していてもレビューし直していないので止める
     const { all: lastConfirmed, remaining, fixedUnreviewed } = lastFindings(rounds)
-    const ready = ci && ci.passed && !lastConfirmed.some(f => f.severity === 'must')
+    const ready = ci && ci.passed && !unverified && !lastConfirmed.some(f => f.severity === 'must')
     const merge = MERGE && ready ? await mergePr(info, impl) : null
 
     const result = { impl, ci, rounds, merge }
-    const question = await report(info, { ...result, ready })
+    const question = await report(info, { ...result, ready, unverified })
     return {
       issue: info.number,
       status: merge?.status === 'merged' ? 'merged' : ready ? 'ready' : 'needs_human',
