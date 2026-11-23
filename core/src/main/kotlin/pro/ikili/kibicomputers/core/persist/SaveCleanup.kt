@@ -280,7 +280,8 @@ public class SaveCleanup @JvmOverloads constructor(
 
     /**
      * 止める（列に入れた調べ・読みの仕事は何もせずに戻る。入れた削除の仕事は走る）。メインスレッドだけが呼ぶ。
-     * 止めた後も、入れた削除の仕事の結果を受け取るために、[settling] の間は [tick] を呼ぶ
+     * 止めた後も、入れた仕事の結果を数えきるために、[settling] の間は [tick] を呼ぶ（削除の仕事の結果は置き場自身が受け取るので、
+     * 待つのを諦めても「消した」の取り消しは漏れない。#900）
      */
     public fun cancel() {
         if (finished) return
@@ -290,7 +291,7 @@ public class SaveCleanup @JvmOverloads constructor(
         finish()
     }
 
-    /** 止めた後で、列に入れた仕事・問いの結果がまだ返っていない（結果を受け取るために [tick] を呼び続ける） */
+    /** 止めた後で、列に入れた仕事・問いの結果がまだ返っていない（数えきるために [tick] を呼び続ける） */
     public val settling: Boolean get() = phase == Phase.CANCELLED && inFlight > 0
 
     /** 1 tick 分すすめる（メインスレッド）。結果を受け取り、列・問いの余地の分だけ次を入れる */
@@ -322,15 +323,14 @@ public class SaveCleanup @JvmOverloads constructor(
     }
 
     /**
-     * 止めた後に返った結果を受け取る。消さなかった削除（-1）は「このサーバーで消した」から外す（外さないと、ディレクトリが残ったまま、
-     * claim が読まずに `owner.bin` なしとして扱う）。ほかの結果は捨てる。上限の間に返らなかった仕事は諦める
+     * 止めた後に返った結果を数えて捨てる。上限の間に返らなかった仕事は諦める（削除の仕事の結果は置き場が [MachineSaveStore.pollCompleted]
+     * で受け取り、消さなかった ID を「このサーバーで消した」から外すので、ここで諦めても取り消しは漏れない。#900）
      */
     private fun settle() {
         while (true) {
             val event = events.poll() ?: break
             inFlight--
             lastProgress = clock()
-            if (event is Event.Deleted && event.bytes < 0) store.cleanupDeletionSkipped(event.id)
         }
         if (inFlight > 0 && clock() - maxOf(lastProgress, cancelledAt) > settings.stallMillis) {
             LOG.log(System.Logger.Level.WARNING, "Giving up waiting for $inFlight results of the cancelled computer save cleanup")
@@ -361,7 +361,8 @@ public class SaveCleanup @JvmOverloads constructor(
                 report.deletedBytes += event.bytes
                 LOG.log(System.Logger.Level.DEBUG) { "Deleted the unreferenced directory of ${event.id} (${event.bytes} bytes)" }
             } else {
-                store.cleanupDeletionSkipped(event.id)
+                // 「消した」の取り消しは置き場が受け取って行う（#900）
+                LOG.log(System.Logger.Level.DEBUG) { "Kept the unreferenced directory of ${event.id}: the delete task did not delete it" }
             }
             is Event.References -> if (event.hashes == null) report.modulesAborted = true else referenced += event.hashes
             is Event.ModuleDeleted -> if (event.bytes >= 0) {
