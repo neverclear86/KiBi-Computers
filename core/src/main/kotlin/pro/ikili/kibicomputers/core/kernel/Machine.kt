@@ -2278,6 +2278,9 @@ public class Machine private constructor(
      */
     private var consolePumpsReserved = 0
 
+    /** [consolePumpsReserved] の今の値（テスト用。#858。スタックが尽きて予約が戻らなかったかを確かめる） */
+    internal val consolePumpsReservedForTest: Int get() = lock.withLockValue { consolePumpsReserved }
+
     /**
      * コンソールの TTY に書いたプロセスが、この後に [pumpConsole]（`reserved = true`）で書くと予約する（#419）。
      * TTY に書いたのと同じカーネルロックの中で呼ぶ

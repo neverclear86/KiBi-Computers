@@ -77,11 +77,63 @@ tasks.test {
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // 前借りの間の燃料切れの処理の費用を測る（#858。`-Pkibi.overdraftBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.overdraftBenchmark").orNull == "true") {
+        systemProperty("kibi.overdraftBenchmark", "true")
+        for (name in listOf("machines", "inner", "rounds")) {
+            providers.gradleProperty("kibi.overdraftBenchmark.$name").orNull?.let { systemProperty("kibi.overdraftBenchmark.$name", it) }
+        }
+    }
     // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
     providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
         systemProperty("kibi.luaReplMachines", it)
         maxHeapSize = "4g"
     }
+}
+
+// スタックの余裕の確かめ（StackHeadroom。#828・#858）のテストを、ふつうの :core:test と違う JVM で回す（-Pkibi.stackHeadroom=true のときだけ
+// 作る。build・CI には入れない）。結果は ADR 0043 と StackHeadroom の KDoc に書く。
+// - stackHeadroomColdTest: StackHeadroom.probe だけを JIT し、ほかはすべてインタプリタで動かす（確かめは小さいフレームで測り、守る道は
+//   大きいフレームで動く、いちばん悪い組み合わせ）
+// - stackHeadroomXintTest: 全部インタプリタ（比べるため）
+// - stackHeadroomJdk21Test: JDK 21（1.21.1 の本番の JDK。JDK 19 で ReentrantLock の中身（AQS）が書き直された）
+if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
+    val headroomTests = listOf(
+        "StackExhaustionLockTest",
+        "ComponentStackExhaustionLockTest",
+        "P1StackExhaustionLockTest",
+        "P1DiskCloseStackExhaustionTest",
+    )
+    fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
+        group = "verification"
+        description = "StackHeadroom の確かめを、JDK $java・$args で回す（#858）"
+        testClassesDirs = sourceSets.test.get().output.classesDirs
+        classpath = sourceSets.test.get().runtimeClasspath
+        useJUnitPlatform()
+        filter {
+            headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
+            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
+        }
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
+        jvmArgs(args)
+        // インタプリタでは遅いので、1 本の時間の上限を延ばす
+        systemProperty("kibi.stackHeadroom.timeoutSeconds", "1800")
+        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）
+        if (args.isNotEmpty()) systemProperty("kibi.stackHeadroom.roundsScale", "0.25")
+        testLogging.showStandardStreams = true
+        outputs.upToDateWhen { false }
+    }
+    registerHeadroomTest(
+        "stackHeadroomColdTest",
+        17,
+        listOf(
+            "-XX:CompileCommand=quiet",
+            "-XX:CompileCommand=compileonly,pro.ikili.kibicomputers.core.kernel.process.StackHeadroom::probe",
+            "-Xbatch",
+        ),
+    )
+    registerHeadroomTest("stackHeadroomXintTest", 17, listOf("-Xint"))
+    registerHeadroomTest("stackHeadroomJdk21Test", 21, emptyList())
 }
 
 // テスト用の WASM（#9）。zig cc でビルドし、テストのリソースに入れる
@@ -173,6 +225,12 @@ kibiWasm {
     module("fuel-spin-wasi", sourceSet = "test") {
         sources.from("src/test/wasm/fuel_spin_wasi.c")
         compilerArgs.addAll("-O2", "-s")
+    }
+    // スタックを使い切るまで再帰する CLI（#858。待機点型の燃料切れの道を、尽きる位置をずらして通す）
+    module("stack-deep-wasi", sourceSet = "test") {
+        sources.from("src/test/wasm/stack_deep_wasi.c")
+        // 線形メモリのスタック（volatile の局所変数）が、Java のスタックより先に尽きないように大きくする
+        compilerArgs.addAll("-O2", "-s", "-Wl,-z,stack-size=4194304")
     }
     // RAM を書き換えた 4 KiB の区画で数える（#407）ことと、メモリ不足の表示を確かめる CLI
     module("oom-wasi", sourceSet = "test") {

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.vfs
 
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
@@ -413,7 +414,13 @@ internal class Vfs(
             val node = v.table.at(child)?.let { m ->
                 v.fileSystems[m.id]?.let { fs ->
                     checkUnlocked()
-                    runCatching { fs.stat(VfsPath.ROOT).node }.getOrNull()
+                    // 読めないマウント（外れかけのディスクなど）は node を 0 にする。ただし Error（入口の StackHeadroom.ensure の
+                    // StackOverflowError など）は飲まずに伝える（プロセスだけが call stack exhausted で終わる。#858）
+                    try {
+                        fs.stat(VfsPath.ROOT).node
+                    } catch (e: Exception) {
+                        null
+                    }
                 }
             }
             byName[name] = DirEntry(name, FileType.DIRECTORY, node ?: 0)
@@ -474,9 +481,17 @@ internal class Vfs(
         defer(Deferred.Release(fs, file.node))
     }
 
-    /** 積んだ知らせを行う（カーネルロックの外。持っていれば何もしない）。ファイルシステムの例外は捨てる */
+    /**
+     * 積んだ知らせを行う（カーネルロックの外。持っていれば何もしない）。ファイルシステムの例外は捨てる。
+     *
+     * 起動用のスレッドだけでなく、ファイルシステムに届く操作（[checkUnlocked]）から、ゲストのスレッドのその深さでも呼ばれる。
+     * 知らせを取り出した後で `release` の入口の確かめ（[StackHeadroom.HOST_IO_FRAMES]）が投げると、取り出した知らせが捨てられ、
+     * ホストのファイルと開いたままの枠が返らない（#858）。そこで、取り出す前にスタックの余裕を確かめ、足りなければ何も取り出さずに返す
+     * （残した知らせは、積んだときに頼んだ起動用のスレッドの仕事か、次の操作が行う）
+     */
     fun drainDeferred() {
         if (lockHeld()) return
+        if (deferred.isEmpty() || !StackHeadroom.hasHeadroom(StackHeadroom.DEFERRED_RELEASE_FRAMES)) return
         while (true) {
             val d = deferred.poll() ?: return
             try {

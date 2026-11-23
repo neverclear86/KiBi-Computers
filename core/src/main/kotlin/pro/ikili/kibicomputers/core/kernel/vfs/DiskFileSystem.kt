@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel.vfs
 
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.ClosedChannelException
@@ -377,6 +378,8 @@ internal class DiskFileSystem private constructor(
     }
 
     override fun release(node: Long) {
+        // 表から外してホストのファイルを閉じ、枠を返す間で尽きると、枠が返らない（[io] と同じく、何も変えない前に確かめる）
+        StackHeadroom.ensure(StackHeadroom.HOST_IO_FRAMES)
         lease.lock.withLock {
             val h = handles[node] ?: return
             if (--h.refs > 0) return
@@ -413,8 +416,43 @@ internal class DiskFileSystem private constructor(
     /** パスを辿った先 */
     private class Resolved(val node: Long, val type: FileType, val segments: List<String>, val attrs: BasicFileAttributes)
 
+    /**
+     * node の表・使用量・開いたままのファイルの数が、ホストと食い違っていないかを確かめる（テスト用。スタックが尽きた後の状態を見る。#858）。
+     * 食い違いの説明の一覧（なければ空）。表の内側（[nodes]・[byKey]・[paths]・[handles]）の食い違い、表の node のホストでの有無と種類、
+     * 木をたどって数え直した使用量、[budget] の数と開いたままのファイルの数。外から変更していないディスクにだけ使う
+     */
+    internal fun consistencyProblemsForTest(): List<String> = lease.lock.withLock {
+        val problems = ArrayList<String>()
+        for ((node, info) in nodes) {
+            if (byKey[key(info.segments)] != node) problems += "node $node ${info.segments} の鍵が byKey にない（${byKey[key(info.segments)]}）"
+            if (paths[node] != info.segments) problems += "node $node の paths（${paths[node]}）が表（${info.segments}）と違う"
+            if (node != ROOT_NODE) {
+                val attrs = attrsOf(hostPath(info.segments))
+                if (attrs == null || typeOf(attrs) != info.type) problems += "node $node ${info.segments} がホストにない・種類が違う"
+            }
+        }
+        for ((k, node) in byKey) {
+            val info = nodes[node]
+            if (info == null || key(info.segments) != k) problems += "byKey の $k → $node が表と合わない（${info?.segments}）"
+        }
+        for (node in paths.keys) if (node !in nodes) problems += "paths にだけ node $node がある"
+        for (node in handles.keys) if (node !in nodes) problems += "表にない node $node のファイルが開いたまま"
+        val (bytes, entries) = countHost()
+        if (bytes != usedBytes || entries != usedEntries) {
+            problems += "使用量がホストと合わない: 数え直し $bytes バイト $entries 項目、メモリ上 $usedBytes バイト $usedEntries 項目"
+        }
+        if (budget.inUse != handles.size) problems += "開いたままのファイルの枠 ${budget.inUse} が、開いている ${handles.size} と違う"
+        problems
+    }
+
+    /** リースの I/O のロック（テスト用。スタック切れでロックが残らないことを、ほかのスレッドから確かめる。#858） */
+    internal val ioLockForTest: java.util.concurrent.locks.ReentrantLock get() = lease.lock
+
     /** このディスクの操作を、リースの I/O のロックの中で行う。古い世代・止められた後は `IO` */
     private inline fun <T> io(block: () -> T): T {
+        // ホストの I/O と表の付け替えが続く操作なので、ロックを取る前（何も変えていないうちに）スタックを確かめる（#858）。
+        // 途中で尽きると、ホストと node の表・使用量・開いたままの枠が食い違う（`DiskFileSystemStackExhaustionTest`）
+        StackHeadroom.ensure(StackHeadroom.HOST_IO_FRAMES)
         lease.lock.lock()
         try {
             if (revoked || lease.generation != generation) fsError(Errno.IO, "ディスクはもう使えない（止められたか、別のカーネルが開いた）")
@@ -931,6 +969,13 @@ internal class DiskFileSystem private constructor(
      * 1項目の属性を読めないときは、その項目を見せないものとして続ける
      */
     private fun recount() {
+        val (bytes, entries) = countHost()
+        usedBytes = bytes
+        usedEntries = entries
+    }
+
+    /** 木をたどって、使用量（バイト、項目の数）を数える（[recount] の数え方。メモリ上の数は変えない） */
+    private fun countHost(): Pair<Long, Int> {
         var bytes = 0L
         var entries = 0
         val stack = ArrayDeque<Path>()
@@ -952,8 +997,7 @@ internal class DiskFileSystem private constructor(
                 }
             }
         }
-        usedBytes = bytes
-        usedEntries = entries
+        return bytes to entries
     }
 
     /**
