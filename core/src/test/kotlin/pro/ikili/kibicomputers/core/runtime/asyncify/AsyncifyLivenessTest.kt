@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.runtime.asyncify
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -12,12 +13,15 @@ import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.WasmHostFunction
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmModule
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 
 /**
@@ -262,6 +266,243 @@ class AsyncifyLivenessTest {
         assertEquals(1, Asyncify.transform(reads, setOf("w.wait")).maxLocals)
         // 外側の catch 先で読まなければ、退避しない
         assertEquals(0, Asyncify.transform(nested(bytes(0x41, 0x09)), setOf("w.wait")).maxLocals)
+    }
+
+    /** `w.wait` を import し、funcref のローカル `$r` に [init] を入れてから待ち、[after] を足して返す `run`（`$r` 自体も ref.func できる） */
+    private fun refModule(init: String, after: String): ByteArray = WitTool.wat(
+        """
+        (module
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (elem declare func ${'$'}run)
+          (func ${'$'}run (export "run") (result i32)
+            (local ${'$'}r funcref)
+            (local.set ${'$'}r $init)
+            (call ${'$'}wait)
+            $after
+            i32.add))
+        """.trimIndent(),
+    )
+
+    @Test
+    fun `待ち点の後で読まない参照型のローカルは、nullでなくても積まないので巻き戻せる`() {
+        // 参照は退避できない（巻き戻しで null でなければ trap。ADR 0329）。生きていなければ確かめもしない
+        val dead = refModule("(ref.func ${'$'}run)", "(i32.const 1)")
+        assertEquals(0, Asyncify.transform(dead, setOf("w.wait")).maxLocals)
+        for (debug in listOf(AsyncifyDebug.NONE, AsyncifyDebug.POISON_UNSAVED)) assertEquals(42L, runWithWait(dead, debug), "$debug")
+        // すべて退避する今までの形では、生きていなくても null でない参照で trap する
+        assertThrows<WasmTrapException> { runWithWait(dead, AsyncifyDebug.SAVE_ALL) }
+    }
+
+    @Test
+    fun `待ち点の後で読む参照型のローカルは、nullなら戻し、nullでなければ巻き戻しでtrapする`() {
+        val liveNull = refModule("(ref.null func)", "(ref.is_null (local.get ${'$'}r))")
+        assertEquals(1, Asyncify.transform(liveNull, setOf("w.wait")).maxLocals)
+        for (debug in AsyncifyDebug.entries) assertEquals(42L, runWithWait(liveNull, debug), "$debug")
+
+        val liveFunc = refModule("(ref.func ${'$'}run)", "(ref.is_null (local.get ${'$'}r))")
+        for (debug in AsyncifyDebug.entries) assertThrows<WasmTrapException>("$debug") { runWithWait(liveFunc, debug) }
+    }
+
+    /**
+     * lua.wasm にない形の待ち点を並べた `run() -> i32`（一時ローカルの選別 [Asyncify] の `savedTemps` を、[AsyncifyDebug.POISON_UNSAVED] で確かめる）:
+     * - 待ち点の前にスタックに残る値（keep）
+     * - 引数を持つ block・loop（先頭への分岐で引数を渡す）・if・try_table（#425 の専用の一時ローカル）
+     * - 引数のある止まりうる import（`w.waitv`。巻き直しで引数を渡してやり直す）
+     * - 引数のある定義済みの関数への直接の call（引数は呼ばれた側が戻す）・call_indirect
+     * - 外から止まりうるとみなす型（`externalSuspendTypes`。#757）の、export したテーブルへの call_indirect（`w.ext`。この型の止まりうる関数はモジュールの中にない）
+     *
+     * `call_ref` は、参照を一時ローカルに移すと型が funcref になり、変換の出力が検証に通らないので、ここでは扱わない（#923）
+     */
+    private val shapes by lazy {
+        WitTool.wat(
+            """
+            (module
+              (type ${'$'}v_i (func (result i32)))
+              (type ${'$'}iii_i (func (param i32 i32 i32) (result i32)))
+              (type ${'$'}l_l (func (param i64) (result i64)))
+              (import "w" "wait" (func ${'$'}wait (type ${'$'}v_i)))
+              (import "w" "waitv" (func ${'$'}waitv (param i32 i32) (result i32)))
+              (import "w" "ext" (func ${'$'}ext (type ${'$'}l_l)))
+              (table (export "t") 3 funcref)
+              (elem (i32.const 0) ${'$'}mix ${'$'}wait ${'$'}ext)
+              (func ${'$'}mix (type ${'$'}iii_i)
+                (call ${'$'}wait)
+                (i32.mul (local.get 0) (i32.const 100))
+                i32.add
+                (i32.mul (local.get 1) (i32.const 10))
+                i32.add
+                (local.get 2)
+                i32.add)
+              (func (export "run") (result i32)
+                (local ${'$'}c i32)
+                i32.const 1000
+                ;; 引数 2 つの block
+                i32.const 3
+                i32.const 4
+                (block (param i32 i32) (result i32)
+                  call ${'$'}wait
+                  i32.add
+                  i32.mul)
+                i32.add
+                ;; 引数 2 つの loop
+                i32.const 3
+                (loop ${'$'}l (param i32 i32) (result i32)
+                  local.set ${'$'}c
+                  call ${'$'}wait
+                  i32.add
+                  local.get ${'$'}c
+                  i32.const 1
+                  i32.sub
+                  local.tee ${'$'}c
+                  local.get ${'$'}c
+                  br_if ${'$'}l
+                  drop)
+                ;; 引数 1 つの if
+                i32.const 5
+                i32.const 1
+                (if (param i32) (result i32)
+                  (then call ${'$'}wait i32.mul)
+                  (else))
+                i32.add
+                ;; 引数 1 つの try_table
+                i32.const 9
+                (try_table (param i32) (result i32)
+                  call ${'$'}wait
+                  i32.sub)
+                i32.add
+                ;; 引数のある止まりうる import
+                i32.const 7
+                i32.const 8
+                call ${'$'}waitv
+                i32.add
+                ;; 定義済みの関数への直接の call
+                i32.const 1
+                i32.const 2
+                i32.const 3
+                call ${'$'}mix
+                i32.add
+                ;; call_indirect（表の 0 は mix、1 は wait、2 は ext）
+                i32.const 4
+                i32.const 5
+                i32.const 6
+                i32.const 0
+                call_indirect (type ${'$'}iii_i)
+                i32.add
+                i32.const 1
+                call_indirect (type ${'$'}v_i)
+                i32.add
+                ;; 外の型の call_indirect
+                i64.const 21
+                i32.const 2
+                call_indirect (type ${'$'}l_l)
+                i32.wrap_i64
+                i32.add))
+            """.trimIndent(),
+        )
+    }
+
+    private val extTypes = setOf(Asyncify.Signature(listOf(0x7E), listOf(0x7E)))
+
+    /** 止まった数（import ごと）と燃料切れで巻き戻した数 */
+    private class ShapeCounts {
+        val unwinds = HashMap<String, Int>()
+        var fuelUnwinds = 0
+        var fuelBlocking = 0
+    }
+
+    /**
+     * [shapes] の `run` を動かす。import は呼ばれるたびに 1, 2, 3, … を使って値を返す（`waitv(a, b)` は `a * 10 + b + n`、`ext(x)` は `x * 2 + n`）。
+     * [suspend] なら、毎回いったん巻き戻してから、巻き直しで着いたときに返す（巻き直しで渡された引数で値を作る）。[fuel] があれば、燃料切れでも巻き戻す
+     */
+    private fun driveShapes(module: WasmModule, suspend: Boolean, fuel: Long? = null): Pair<Long, ShapeCounts> {
+        val counts = ShapeCounts()
+        val stack = Stack()
+        var next = 0L
+        fun host(name: String, value: (LongArray, Long) -> Long) = WasmHostFunction { instance, args ->
+            // 止めないとき（変換していないモジュールも）は、巻き直しで import に着くことはない（燃料切れの呼び出しだけで止まる）
+            if (!suspend) {
+                longArrayOf(value(args, ++next))
+            } else if (instance.asyncState == WasmAsyncState.REWINDING) {
+                assertTrue(stack.values.isEmpty(), "巻き直しで着いたのに、退避した値が残っている")
+                instance.asyncState = WasmAsyncState.NORMAL
+                longArrayOf(value(args, ++next))
+            } else {
+                counts.unwinds.merge(name, 1, Int::plus)
+                instance.asyncState = WasmAsyncState.UNWINDING
+                longArrayOf(0)
+            }
+        }
+        val i32 = WasmValueType.I32
+        val i64 = WasmValueType.I64
+        val builder = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(i32)), host("wait") { _, n -> n })
+            .hostFunction("w", "waitv", WasmFunctionType.of(listOf(i32, i32), listOf(i32)), host("waitv") { a, n -> a[0] * 10 + a[1] + n })
+            .hostFunction("w", "ext", WasmFunctionType.of(listOf(i64), listOf(i64)), host("ext") { a, n -> a[0] * 2 + n })
+        if (module.isAsyncified) builder.asyncStack(stack)
+        if (fuel != null) {
+            builder.fuel(
+                fuel,
+                object : WasmFuelHandler {
+                    override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
+                        counts.fuelBlocking++
+                        return fuel
+                    }
+
+                    override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long {
+                        if (instance.asyncState == WasmAsyncState.REWINDING) {
+                            instance.asyncState = WasmAsyncState.NORMAL
+                            return instance.fuel
+                        }
+                        counts.fuelUnwinds++
+                        instance.asyncState = WasmAsyncState.UNWINDING
+                        return remaining
+                    }
+                },
+            )
+        }
+        return module.instantiate(builder.build()).use { instance ->
+            var result = instance.call("run")
+            var rounds = 0
+            while (module.isAsyncified && instance.asyncState == WasmAsyncState.UNWINDING) {
+                assertTrue(++rounds < 100_000, "終わらない")
+                instance.asyncState = WasmAsyncState.REWINDING
+                if (fuel != null) instance.fuel = fuel
+                result = instance.call("run")
+            }
+            assertTrue(stack.values.isEmpty())
+            result[0] to counts
+        }
+    }
+
+    @Test
+    fun `引数を持つ構造と呼び出しの待ち点でも、戻さない一時ローカルにごみを入れて結果が同じ`() {
+        val expected = driveShapes(EndiveRuntime(compile = false).load(shapes), suspend = false).first
+        for (debug in AsyncifyDebug.entries) {
+            val r = Asyncify.prepare(shapes).transform(setOf("w.wait", "w.waitv"), extTypes, debug = debug)
+            assertNull(WitTool.validate(r.bytes), "$debug")
+            if (debug != AsyncifyDebug.SAVE_ALL) assertTrue(r.savedLocals < r.allLocals, "$debug: ${r.savedLocals} / ${r.allLocals}")
+            val (got, counts) = driveShapes(EndiveRuntime(compile = false).load(r.bytes), suspend = true)
+            assertEquals(expected, got, "$debug")
+            assertEquals(setOf("wait", "waitv", "ext"), counts.unwinds.keys, "$debug")
+        }
+    }
+
+    @Test
+    fun `引数を持つ構造と呼び出しの待ち点で燃料切れでも巻き戻し、戻さない一時ローカルにごみを入れて結果が同じ`() {
+        val expected = driveShapes(EndiveRuntime(compile = false).load(shapes), suspend = false).first
+        val metered = FuelInjector.inject(shapes)
+        for (debug in AsyncifyDebug.entries) {
+            val r = Asyncify.prepare(metered.bytes, originalFunc = metered::originalFunc)
+                .transform(setOf("w.wait", "w.waitv"), extTypes, Instrumentation.YIELD_IMPORT, metered::originalFunc, debug)
+            assertTrue(r.yieldSites > 0, "$debug")
+            val module = EndiveRuntime(compile = false).load(r.bytes)
+            for (suspend in listOf(false, true)) {
+                val (got, counts) = driveShapes(module, suspend, fuel = 3)
+                assertEquals(expected, got, "$debug, suspend = $suspend")
+                assertTrue(counts.fuelUnwinds > 0, "$debug: 燃料切れで巻き戻していない")
+                assertEquals(0, counts.fuelBlocking, "$debug: 燃料切れでスレッドを持って待った")
+            }
+        }
     }
 
     @Test
