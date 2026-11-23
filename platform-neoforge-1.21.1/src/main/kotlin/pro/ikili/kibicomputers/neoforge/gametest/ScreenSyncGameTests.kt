@@ -431,15 +431,26 @@ object ScreenSyncGameTests {
             .thenSucceed()
     }
 
-    /** ディメンションを移ると、元のディメンションの画面の見ている人から外れる。勘定は残る（#382）。 */
+    /**
+     * ディメンションを移ると、元のディメンションの画面の見ている人から外れる。勘定は残る（#382）。
+     * 送ったチャンクの記録は捨てられ、移った先の Sent で新しいレベルの記録になる（元のディメンションの同じ座標の
+     * チャンクは送ったものと数えない。#655）。
+     */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
     fun changingDimensionStopsWatching(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
         val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
         val (player, _) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        val overworld = helper.level
+        val screenChunk = ChunkPos(helper.absolutePos(POS))
+        // ネザーの (0, 0) のチャンク。元のディメンションの同じ座標は、別のチャンクとして扱われる
+        val netherChunk = ChunkPos(0, 0)
         helper.startSequence()
-            .thenWaitUntil { helper.assertTrue(be.isWatchedBy(player), "the player should be watching") }
+            .thenWaitUntil {
+                helper.assertTrue(be.isWatchedBy(player), "the player should be watching")
+                helper.assertTrue(ScreenSync.isChunkSent(overworld, player, screenChunk), "the screen's chunk should be recorded as sent")
+            }
             .thenExecute {
                 val nether = helper.level.server.getLevel(Level.NETHER)
                 helper.assertTrue(nether != null, "the nether should exist on the test server")
@@ -451,10 +462,38 @@ object ScreenSyncGameTests {
                 helper.assertTrue(player.level() === nether, "the player should be in the nether")
                 helper.assertTrue(!be.isWatchedBy(player), "changing dimension should stop watching at once")
                 helper.assertTrue(ScreenSync.traffic.bytesSent(player) == sent, "the traffic of the same player should stay")
+                // 元のディメンションで送ったチャンクの記録は、移った直後に消える
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "changing dimension should drop the sent chunks")
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, screenChunk),
+                    "the old dimension's chunk should not count as sent after the move",
+                )
             }
             .thenIdle(1)
             .thenExecute {
                 helper.assertTrue(!be.isWatchedBy(player), "a player in another dimension should not start watching")
+            }
+            // 偽物の接続は tick されないので、ネザーのチャンクが届くまで、クライアントが受け取ったことにして送る
+            .thenWaitUntil {
+                val nether = helper.level.server.getLevel(Level.NETHER)!!
+                val sender = player.connection.chunkSender
+                sender.onChunkBatchReceivedByClient(64f)
+                sender.sendNextChunks(player)
+                helper.assertTrue(ScreenSync.isChunkSent(nether, player, netherChunk), "the nether chunk should be recorded as sent")
+            }
+            .thenExecute {
+                val nether = helper.level.server.getLevel(Level.NETHER)!!
+                helper.assertTrue(ScreenSync.sentChunkCount(player) > 0, "the new level's record should hold the sent chunks")
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, netherChunk),
+                    "the same coordinates in the old dimension should not count as sent",
+                )
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, screenChunk),
+                    "the old dimension's screen chunk should still not count as sent",
+                )
+                helper.assertTrue(ScreenSync.isChunkSent(nether, player, netherChunk), "the nether chunk should still be recorded")
+                helper.assertTrue(!be.isWatchedBy(player), "the screen in the old dimension should not be watched")
                 cleanUp(helper, player)
             }
             .thenSucceed()
