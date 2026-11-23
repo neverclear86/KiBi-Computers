@@ -18,6 +18,8 @@ import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.chunk.status.ChunkStatus
 import net.minecraft.world.level.portal.DimensionTransition
 import net.minecraft.world.phys.Vec3
+import net.neoforged.neoforge.common.NeoForge
+import net.neoforged.neoforge.event.level.ChunkWatchEvent
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -422,8 +424,23 @@ object ScreenSyncGameTests {
                 helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "the old player's sent chunks should be dropped")
                 respawnedPlayer = respawned
             }
-            // 偽物の接続の player は古いオブジェクトのまま（本物ではリスポーンのパケットの処理で替わる）なので、
-            // この後の送信の Sent は古いオブジェクトに出る。それで記録が作り直されない（#655）
+            // 本物の接続では、リスポーンのパケットの処理で接続の player が替わるまでの Sent が古いオブジェクトに出る。
+            // 偽物の接続では、送信枠や順番待ちの中身しだいで Sent が出ないこともあるので、イベントを直に出して確かめる。
+            // 古いオブジェクトへの Sent で記録が作り直されない（#655）
+            .thenExecute {
+                val level = helper.level
+                val chunk = level.getChunkAt(helper.absolutePos(POS))
+                NeoForge.EVENT_BUS.post(ChunkWatchEvent.Sent(player, chunk, level))
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "a Sent for the old player object should be ignored")
+                // 対照: 同じイベントを新しいオブジェクトに出すと記録される（イベントが処理に届いていることの確かめ）
+                val respawned = respawnedPlayer!!
+                NeoForge.EVENT_BUS.post(ChunkWatchEvent.Sent(respawned, chunk, level))
+                helper.assertTrue(
+                    ScreenSync.isChunkSent(level, respawned, chunk.pos),
+                    "a Sent for the new player object should be recorded",
+                )
+            }
+            // 偽物の接続のままの送信でも、古いオブジェクトの記録は作り直されない
             .thenIdle(2)
             .thenExecute {
                 helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "a Sent for the old player object should be ignored")
