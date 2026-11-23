@@ -47,6 +47,9 @@ object MachineRestoreGameTests {
     /** 起動を待つ tick 数の上限（[StandardOsGameTests] と同じ理由で長くとる） */
     private const val BOOT_TIMEOUT_TICKS = 12_000
 
+    /** tick をまたいで待たせる claim の、読みの待ちの上限（[WriterGate] の helper ありの上限と同じ 1,800 秒。#872） */
+    private const val HELD_CLAIM_WAIT_MILLIS = 1_800_000L
+
     private val CASE = BlockPos(1, 1, 1)
     private val SCREEN = BlockPos(1, 2, 1)
     private val KEYBOARD = BlockPos(1, 1, 2)
@@ -376,6 +379,10 @@ object MachineRestoreGameTests {
             val be = level.getBlockEntity(far.pos) as CaseBlockEntity
             be.loadWithComponents(tag, level.registryAccess())
             store.forgetOwnerForTest(saved!!.id)
+            // claim の読みの待ちの上限（壁時計。writerFlushMillis が claimWaitMillis になる）を、ゲートと同じ長さにする（テストの間だけ。#872）。
+            // 重いマシンで降格を待つ数 tick が 30 秒を超えると、読みを待たずに新しい UUID（NEW_ID_UNREADABLE）になって落ちる
+            restoreSaveConfigWhenDone(helper, ServerMachines.saveConfig)
+            ServerMachines.saveConfig = ServerMachines.saveConfig.copy(writerFlushMillis = HELD_CLAIM_WAIT_MILLIS)
             gate = WriterGate(helper)
             // 仕事のない ID の読みは列の外の読み手に回る（#877）ので、そちらも止める
             sideGate = SideReaderGate(helper, store)
