@@ -696,8 +696,11 @@ internal class SchedulerInternals(
     val timers: TimerService? = null,
     /** モジュールの置き場（#82。テストのメモリ上のもの）。`null` なら [SchedulerConfig.moduleStore] */
     val moduleStore: ModuleStore? = null,
-    /** ゲストの再起動で起動し直すまでの待ち（#635。テストで短い値や [RebootBackoff.NONE] にする） */
-    val rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT,
+    /**
+     * ゲストの再起動で起動し直すまでの待ちの、テストの差し替え（#635。短い値や [RebootBackoff.NONE] にする）。
+     * `null` なら [SchedulerConfig.rebootBackoff]（コンフィグの値。#719）
+     */
+    val rebootBackoff: RebootBackoff? = null,
     /** tick ごとの予算（#356）を測る時計（ナノ秒。テストで手で進めるものにする） */
     val nanoTime: () -> Long = System::nanoTime,
 )
@@ -815,6 +818,15 @@ public class SchedulerConfig private constructor(builder: Builder) {
      */
     public val mainThreadBudgetNanos: Long = builder.mainThreadBudgetNanos
 
+    /**
+     * サーバー全体（この JVM の中）で開いたままにできるホストのファイルの数（#52、#719。仮: 2,048）。
+     * 1 台の数は [MachineConfig.hostFilesPerMachine]
+     */
+    public val hostFilesTotal: Int = builder.hostFilesTotal
+
+    /** ゲストの再起動で起動し直すまでの待ち（#635、ADR 0635。#719 でコンフィグにした。仮: [RebootBackoff.DEFAULT]） */
+    internal val rebootBackoff: RebootBackoff = builder.rebootBackoff
+
     /** [SchedulerConfig] を組み立てる。 */
     public class Builder internal constructor() {
         internal var maxConcurrentMachines: Int = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
@@ -828,7 +840,9 @@ public class SchedulerConfig private constructor(builder: Builder) {
         internal var programCacheBytes: Long = 32L * 1024 * 1024
         internal var totalMemoryBytes: Long? = null
         internal var moduleStore: ModuleStore = ModuleStore.NONE
-        internal var mainThreadBudgetNanos: Long = 5_000_000
+        internal var mainThreadBudgetNanos: Long = DEFAULT_MAIN_THREAD_BUDGET_NANOS
+        internal var hostFilesTotal: Int = DEFAULT_HOST_FILES_TOTAL
+        internal var rebootBackoff: RebootBackoff = RebootBackoff.DEFAULT
 
         /** 同時に WASM を実行するマシンの数の上限（1 以上） */
         public fun maxConcurrentMachines(value: Int): Builder = apply {
@@ -902,11 +916,26 @@ public class SchedulerConfig private constructor(builder: Builder) {
             mainThreadBudgetNanos = value
         }
 
+        /** サーバー全体で開いたままにできるホストのファイルの数（1 以上。#719） */
+        public fun hostFilesTotal(value: Int): Builder = apply {
+            require(value >= 1) { "hostFilesTotal は 1 以上" }
+            hostFilesTotal = value
+        }
+
+        /** ゲストの再起動で起動し直すまでの待ち（#635、#719） */
+        internal fun rebootBackoff(value: RebootBackoff): Builder = apply { rebootBackoff = value }
+
         /** 設定を作る。 */
         public fun build(): SchedulerConfig = SchedulerConfig(this)
     }
 
     public companion object {
+        /** [hostFilesTotal] の既定（仮: 2,048。#52） */
+        public const val DEFAULT_HOST_FILES_TOTAL: Int = MachineLimits.HOST_FILES_TOTAL
+
+        /** [mainThreadBudgetNanos] の既定（仮: 5 ms。#356） */
+        public const val DEFAULT_MAIN_THREAD_BUDGET_NANOS: Long = 5_000_000
+
         /** [totalMemoryBytes] の既定: JVM のヒープの最大値の半分（仮。#251） */
         private fun defaultTotalMemoryBytes(): Long = Runtime.getRuntime().maxMemory() / 2
 

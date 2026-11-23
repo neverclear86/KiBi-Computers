@@ -23,6 +23,8 @@ import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.MachineSpecs
+import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.computer.RestoreReady
@@ -327,9 +329,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     internal var restorePreparationHook: Runnable? = null
 
-    /** 挿さっている部品から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
+    /** 挿さっている部品と今のコンフィグ（#719）から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
     private fun machineConfig(): MachineConfig {
-        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val config = MachineSpecs.configOf(tier, parts.tiers, KiBiConfig.machineProfile(KiBiConfigs.server))
         return configOverride?.apply(config) ?: config
     }
 
@@ -687,7 +689,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             DiskItem.diskIdOf(stack)?.let { disks.putIfAbsent(it, item.tier) }
         }
         if (assigned) setChanged()
-        return PreparedDisks(store.snapshot(disks), disks.keys.toList())
+        return PreparedDisks(store.snapshot(disks, KiBiConfig.machineProfile(KiBiConfigs.server)), disks.keys.toList())
     }
 
     private fun onPartsChanged() {

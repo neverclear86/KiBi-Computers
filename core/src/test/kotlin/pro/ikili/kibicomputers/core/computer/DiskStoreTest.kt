@@ -87,6 +87,17 @@ class DiskStoreTest {
     }
 
     @Test
+    fun `容量はコンフィグの性能値から取る`() {
+        // #719: ティアの値は MachineProfile（コンフィグ）から
+        val a = store.newId()
+        val specs = PartTier.entries.associateWith { if (it == PartTier.TIER_1) PartSpec(1, 1L shl 20, 12345, 67, 8) else it.defaultSpec }
+        val profile = MachineProfile(pro.ikili.kibicomputers.core.kernel.MachineConfig.DEFAULT, specs)
+        val disk = store.snapshot(mapOf(a to PartTier.TIER_1), profile).resolve(a)!!
+        assertEquals(12345L, disk.capacityBytes)
+        assertEquals(67, disk.maxEntries)
+    }
+
+    @Test
     fun `ディスクがなければNONE`() {
         assertSame(DiskSnapshot.EMPTY, store.snapshot(emptyMap()))
         assertSame(DiskSnapshot.EMPTY, store.snapshot(mapOf("x" to PartTier.TIER_1)))

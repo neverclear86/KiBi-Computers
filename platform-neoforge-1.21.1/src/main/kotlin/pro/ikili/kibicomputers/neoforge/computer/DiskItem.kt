@@ -11,7 +11,7 @@ import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 
 /**
- * 内蔵ディスク（HDD）のアイテム（#124）。容量はティアで決まる（[PartTier.diskBytes]）。
+ * 内蔵ディスク（HDD）のアイテム（#124）。容量はティアで決まる（コンフィグの性能値（`KiBiConfig.machineProfile`。#719））。
  *
  * 識別子はデータコンポーネント `kibicomputers:disk_id`（[KiBiDataComponents.DISK_ID]）に持つ。クラフトしたときには付けず、
  * ケースに挿して電源を入れたときに付ける（[CaseBlockEntity]）。中身はワールドの `kibicomputers/disks/<識別子>/`（[WorldDisks]）。

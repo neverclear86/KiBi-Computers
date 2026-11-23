@@ -77,3 +77,7 @@ WIT（`kibi-device`）、公開 API（`pro.ikili.kibicomputers.api.device`）、
 
 tick の処理は増やさない。メインスレッドの呼び出しの件数は `maxHostCallsPerTick` のまま。これに重ねて、サーバー全体の tick ごとの時間の予算がかかる（#356、ADR 0356）。
 上限の判定は、つなぐときの `writeLock` の中で表の大きさを見るだけ。
+
+## 追記（#719）
+
+CPU のティアごとの接続数（`PartTier.cpuMaxDevices`）は、コンフィグの `cpu.<ティア>MaxDevices`（3〜256）にした。値は `PartTier.defaultSpec` が既定で、`MachineSpecs.configOf` はコンフィグから組み立てた `MachineProfile` を受け取る。保存しないので、下げた後に戻した台は今の値で決まり、つなげなかったデバイスは今までどおり `detached` になる（ADR 0719）。
