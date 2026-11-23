@@ -261,7 +261,9 @@ class StackExhaustionLockTest {
             eventually { m.cpu.currentOwner == null && m.cpu.waiting == 0 }
             eventually(message = "許可が戻らない: ${h.scheduler.permits.availablePermits()}") { h.scheduler.permits.availablePermits() == permits }
             assertEquals(0, h.scheduler.permits.waiting)
-            assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
+            // STOPPED になった直後は、最後のプロセススレッドが終わりの後始末でロックを持っていることがある（取り合いの下で見える）。
+            // ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
+            eventually(message = "マシンのロックが放されない: ${m.lock}") { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
         } finally {
             stopWaker.set(true)
             waker?.join(5_000)

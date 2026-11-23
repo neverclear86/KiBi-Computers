@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.SaveWriter
 import pro.ikili.kibicomputers.core.device.wiring.ExternalDeviceHolder
 import pro.ikili.kibicomputers.core.kernel.BootConfig
+import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.ProvisionalBoot
@@ -137,6 +138,19 @@ internal enum class LoadPhase(val label: String) {
     /** 全台が入力を待っている間に、自動保存を1周期回す（#81）。一巡したら終わる */
     AUTOSAVE("自動保存の一巡（全台が入力待ち）"),
 
+    /**
+     * 一部の台（[LoadSettings.hostCallers] 台）が、他 MOD 役のデバイス（樽）のメインスレッドのメソッド（`burn`。決まった時間だけ回す）を
+     * 呼び続ける（#356）。メインスレッドの予算（`SchedulerConfig.mainThreadBudgetNanos`）は設定の値のまま。
+     * 呼び出しの需要が予算を超えると、ホスト呼び出しの時間が予算の付近で頭打ちになる。Lua の REPL だけ。測定用（既定では動かさない）
+     */
+    HOST_CALLS("一部がメインスレッドのメソッドを呼び続ける（予算あり）"),
+
+    /**
+     * [HOST_CALLS] の台が呼び続けたまま、予算を切る（`MachineScheduler.mainThreadBudgetOverrideNanos` を [Long.MAX_VALUE]。#356）。
+     * 比べる基準。段階の終わりに予算を戻し、呼ぶ台の電源を切る（残った呼び出しは取り消される）
+     */
+    HOST_CALLS_UNBUDGETED("一部がメインスレッドのメソッドを呼び続ける（予算なし）"),
+
     /** 一部の台が無限ループで計算し続ける（残りは入力待ち） */
     COMPUTE("一部が計算し続ける"),
 
@@ -191,6 +205,11 @@ internal enum class LoadPhase(val label: String) {
  *   0 が本番の既定（周期 6000 tick・tick rate 20 のまま）の重なり方。正の値は、周期を変えた・tick rate を変えたときなどに一巡の途中に入る形
  * @property syntheticLogTicks [productionAutosave] の段階の間、メインスレッドに合成のログを何 tick ごとに書かせるか（`-PloadTestSyntheticLogTicks`。0 なら書かない）
  * @property computeProcesses [LoadPhase.COMPUTE_MULTI] で1台に動かす計算するプロセスの数（`-PloadTestComputeProcesses`。#740）。2 未満なら、その段階を飛ばす
+ * @property hostCallers [LoadPhase.HOST_CALLS] で、メインスレッドのメソッドを呼び続ける台の数（`-PloadTestHostCallers`。#356）。0 なら、その段階を飛ばす。
+ *   呼ぶ台は並べた台の後ろから取り、ほかの段階の台（先頭から 4 × [busy] 台）と重ねない
+ * @property hostCallMicros 呼ぶ台が1回に呼ぶメソッドの重さ（マイクロ秒。`-PloadTestHostCallMicros`。上限は試験用のデバイスの 10 ms）
+ * @property hostCallParallel 呼ぶ台1台が同時に積む呼び出しの数（`-PloadTestHostCallParallel`。1 から 16）。1 は REPL からそのまま呼ぶ
+ *   （待機点で結果を待つので、1台が積めるのは1件）。2 以上は `parallel.waitForAll` のコルーチンの中で呼ぶ（ADR 0744）
  * @property fuelSlice マシンのスライスの差し替え（`-PloadTestFuelSlice`。#740）。`null` なら既定（`fuelPerTick` の 1/4）。
  *   [Long.MAX_VALUE] は `fuelPerTick`（1 tick に1回渡す。#47 の前と同じ受け渡しの回数）に切り詰める
  */
@@ -212,6 +231,9 @@ internal data class LoadSettings(
     val syntheticLogTicks: Int = 0,
     val computeProcesses: Int = 0,
     val fuelSlice: Long? = null,
+    val hostCallers: Int = 0,
+    val hostCallMicros: Long = DEFAULT_HOST_CALL_MICROS,
+    val hostCallParallel: Int = 1,
 ) {
     companion object {
         /**
@@ -240,6 +262,21 @@ internal data class LoadSettings(
 
         /** スライスの差し替えのシステムプロパティ（`-PloadTestFuelSlice=tick|<燃料>`。#740。空なら既定） */
         const val FUEL_SLICE_PROPERTY: String = "kibicomputers.loadTest.fuelSlice"
+
+        /** メインスレッドのメソッドを呼び続ける台の数のシステムプロパティ（`-PloadTestHostCallers`。#356。0 なら飛ばす） */
+        const val HOST_CALLERS_PROPERTY: String = "kibicomputers.loadTest.hostCallers"
+
+        /** 呼び出し1件の重さ（マイクロ秒）のシステムプロパティ（`-PloadTestHostCallMicros`。#356） */
+        const val HOST_CALL_MICROS_PROPERTY: String = "kibicomputers.loadTest.hostCallMicros"
+
+        /** 1台が同時に積む呼び出しの数のシステムプロパティ（`-PloadTestHostCallParallel`。#356） */
+        const val HOST_CALL_PARALLEL_PROPERTY: String = "kibicomputers.loadTest.hostCallParallel"
+
+        /** [hostCallMicros] の既定（マイクロ秒） */
+        const val DEFAULT_HOST_CALL_MICROS: Long = 100
+
+        /** [hostCallParallel] の上限（1プロセスが積める呼び出しの数。`DeviceLimits.MAX_PENDING_CALLS`） */
+        const val MAX_HOST_CALL_PARALLEL: Int = 16
 
         /** [FUEL_SLICE_PROPERTY] の値（`tick` は [Long.MAX_VALUE]。空なら `null`。読めなければ失敗にする） */
         fun fuelSliceProperty(): Long? {
@@ -311,6 +348,82 @@ internal data class FuelCounts(
     }
 }
 
+/**
+ * [LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] の、測った区間のメインスレッドの予算の数え口（#356）。
+ * 時間はナノ秒。tick あたりの値は、測った tick ごとに `MachineScheduler` の数え口の増分を取ったもの
+ *
+ * @property budgetNanos その段階の予算（予算を切った回は [Long.MAX_VALUE]）
+ * @property callers 呼ぶ台の数
+ * @property parallel 1台が同時に積む呼び出しの数
+ * @property callMicros 呼び出し1件の重さ（指定。回す時間）
+ * @property ticks 測った tick の数
+ * @property hostCallNanos ホスト呼び出しを実行した時間の合計
+ * @property maxTickHostCallNanos 1 tick のホスト呼び出しの時間の最大
+ * @property notifyNanos 通知を配った時間の合計
+ * @property calls 実行したホスト呼び出しの件数の合計
+ * @property maxTickCalls 1 tick に実行した件数の最大
+ * @property cutTicks 予算で打ち切った tick の数
+ * @property carried 予算で打ち切ったとき、手を付けずに次の tick へ持ち越した台の数の合計
+ * @property minCallerCalls 呼ぶ台ごとの、測った区間に実行した件数の最小（0 なら、その台は一度も回ってきていない）
+ * @property maxCallerCalls [minCallerCalls] と同じものの最大
+ * @property preNanos `ServerTickEvent.Pre` の区間（[LoadTickProbe.Section.PRE]。スケジューラの tick を含む）の時間の合計
+ * @property maxPreNanos `Pre` の区間の 1 tick の最大
+ */
+internal data class HostCallStats(
+    val budgetNanos: Long,
+    val callers: Int,
+    val parallel: Int,
+    val callMicros: Long,
+    val ticks: Int,
+    val hostCallNanos: Long,
+    val maxTickHostCallNanos: Long,
+    val notifyNanos: Long,
+    val calls: Long,
+    val maxTickCalls: Long,
+    val cutTicks: Long,
+    val carried: Long,
+    val minCallerCalls: Long,
+    val maxCallerCalls: Long,
+    val preNanos: Long,
+    val maxPreNanos: Long,
+) {
+    /** 1件の実効の重さ（マイクロ秒。回した時間とカーネルの費用。件数がなければ 0） */
+    val microsPerCall: Double get() = if (calls > 0) hostCallNanos / 1e3 / calls else 0.0
+
+    private fun perTick(v: Long): Double = if (ticks > 0) v.toDouble() / ticks else 0.0
+
+    private fun budgetLabel(none: String): String =
+        if (budgetNanos == Long.MAX_VALUE) none else String.format(Locale.ROOT, "%.1f ms", budgetNanos / 1e6)
+
+    override fun toString(): String = String.format(
+        Locale.ROOT,
+        "budget %s, %d callers x %d, %d us/call: %d ticks, host calls %.2f / %.2f ms per tick (avg / max), notify %.3f ms per tick, " +
+            "%.1f / %d calls per tick (%.1f us each), cut %d ticks, carried %d, per caller %d..%d calls, Pre %.2f / %.2f ms",
+        budgetLabel("none"), callers, parallel, callMicros, ticks,
+        perTick(hostCallNanos) / 1e6, maxTickHostCallNanos / 1e6, perTick(notifyNanos) / 1e6, perTick(calls), maxTickCalls, microsPerCall,
+        cutTicks, carried, minCallerCalls, maxCallerCalls, perTick(preNanos) / 1e6, maxPreNanos / 1e6,
+    )
+
+    /** 結果の表の1行（[LoadReport.toMarkdown]）。[idleAvgMillis] は入力待ちの MSPT の平均 */
+    fun row(label: String, tick: TickStats, idleAvgMillis: Double?): String = String.format(
+        Locale.ROOT,
+        "| %s | %s | %d × %d | %d µs | %d | %.2f / %.2f%s | %.2f / %.2f | %.3f | %.2f / %.2f | %.0f%% | %.1f | %.1f / %d | %.1f µs | %d / %d |\n",
+        label, budgetLabel("なし"), callers, parallel, callMicros,
+        ticks, tick.avg, tick.p95, idleAvgMillis?.let { String.format(Locale.ROOT, "（%+.2f）", tick.avg - it) } ?: "",
+        perTick(hostCallNanos) / 1e6, maxTickHostCallNanos / 1e6, perTick(notifyNanos) / 1e6, perTick(preNanos) / 1e6, maxPreNanos / 1e6,
+        if (ticks > 0) 100.0 * cutTicks / ticks else 0.0, perTick(carried), perTick(calls), maxTickCalls, microsPerCall, minCallerCalls, maxCallerCalls,
+    )
+
+    companion object {
+        /** [row] の見出し */
+        const val HEADER: String =
+            "| 段階 | 予算 | 呼ぶ台 × 同時に積む数 | 1件の重さ（指定） | 測った tick | MSPT 平均 / p95（入力待ちとの差） | ホスト呼び出し / tick（平均 / 最大 ms） | " +
+                "通知 / tick（ms） | Pre の区間 / tick（平均 / 最大 ms） | 打ち切った tick | 持ち越した台 / tick | 実行した件数 / tick（平均 / 最大） | " +
+                "1件の実効の重さ | 台ごとの件数（最小 / 最大） |\n" +
+                "| --- | --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |\n"
+    }
+}
+
 /** 1つの段階の結果。 */
 internal data class PhaseResult(
     val phase: LoadPhase,
@@ -370,6 +483,8 @@ internal data class PhaseResult(
     val minProcessGrants: Long = -1,
     /** [minProcessGrants] と同じものの最大 */
     val maxProcessGrants: Long = -1,
+    /** メインスレッドの予算の数え口（[LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] だけ。#356。ほかは `null`） */
+    val hostCalls: HostCallStats? = null,
 )
 
 /**
@@ -749,6 +864,14 @@ internal class LoadReport(
         if (s.devicesEvery > 0) {
             sb.append(String.format(Locale.ROOT, "- 他 MOD 役のデバイス（樽）: %d 台に1台（%d 個）\n", s.devicesEvery, (s.count + s.devicesEvery - 1) / s.devicesEvery))
         }
+        if (s.hostCallers > 0 && phaseOrNull(LoadPhase.HOST_CALLS) != null) {
+            sb.append(
+                String.format(
+                    Locale.ROOT, "- メインスレッドのメソッドを呼び続ける台（#356）: %d 台（後ろから）、1件 %d µs、1台が同時に積む数 %d\n",
+                    s.hostCallers, s.hostCallMicros, s.hostCallParallel,
+                ),
+            )
+        }
         sb.append(String.format(Locale.ROOT, "- 並べる: %.1f ms、電源を入れる: %.1f ms、計算中の台（1台に1本）の電源を切る: %.1f ms", placeMillis, powerOnMillis, powerOffMillis))
         if (powerOffMultiMillis >= 0) {
             sb.append(String.format(Locale.ROOT, "、1台に %d 本の台の電源を切る: %.1f ms", s.computeProcesses, powerOffMultiMillis))
@@ -851,6 +974,13 @@ internal class LoadReport(
                 ),
             )
         }
+        val withHostCalls = phases.filter { it.hostCalls != null }
+        if (withHostCalls.isNotEmpty()) {
+            val idleAvg = phaseOrNull(LoadPhase.IDLE)?.tick?.avg
+            sb.append("\nメインスレッドの予算（#356。測った区間。ホスト呼び出し・通知はスケジューラの数え口、Pre は ServerTickEvent.Pre の区間）:\n\n")
+            sb.append(HostCallStats.HEADER)
+            for (p in withHostCalls) sb.append(p.hostCalls!!.row(p.phase.label, p.tick, idleAvg))
+        }
         val withLong = phases.filter { it.longTickCount > 0 }
         if (withLong.isNotEmpty()) {
             sb.append(String.format(Locale.ROOT, "\n長い tick（%d ms 以上。#600。時刻は tick の終わり。区間の内訳はミリ秒）:\n\n", LoadTickProbe.LONG_TICK_MILLIS))
@@ -921,6 +1051,66 @@ internal class LoadRun(
 
         /** [LoadPhase.COMPUTE_MULTI] の測りはじめの、計算するシェルごとのスライスを受け取った回数（pid → 回数。#740） */
         var grantsAtMeasure: Map<Int, Long> = emptyMap()
+
+        /** [LoadPhase.HOST_CALLS] に入ったときの、この台のホスト呼び出しを実行した件数（呼び始めたかを見る。#356） */
+        var hostCallsAtPhase = 0L
+
+        /** [LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] の測りはじめの、この台のホスト呼び出しを実行した件数（#356） */
+        var hostCallsAtMeasure = 0L
+
+        /** この台のホスト呼び出しを実行した件数（マシンがなければ 0） */
+        fun hostCallsRun(): Long = case.computer.machine?.hostCallRunCount ?: 0L
+    }
+
+    /**
+     * [LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] の測った区間の、スケジューラの数え口（#356）。
+     * 測りはじめに作り、測った tick ごとに [sample] で増分を取る（台を走査しない。数え口を数個読むだけ）
+     */
+    private class HostCallWindow(private val scheduler: MachineScheduler, val budgetNanos: Long) {
+        private val startHost = scheduler.hostCallNanosTotal
+        private val startNotify = scheduler.notifyNanosTotal
+        private val startCalls = scheduler.hostCallsRunTotal
+        private val startCut = scheduler.budgetCutTickCount
+        private val startCarried = scheduler.carriedMachineCount
+        private var lastHost = startHost
+        private var lastCalls = startCalls
+        var ticks = 0
+        private var maxHost = 0L
+        private var maxCalls = 0L
+        private var pre = 0L
+        private var maxPre = 0L
+
+        /** 測った tick を1つ足す。[preNanos] はその tick の `ServerTickEvent.Pre` の区間の時間 */
+        fun sample(preNanos: Long) {
+            ticks++
+            val host = scheduler.hostCallNanosTotal
+            val calls = scheduler.hostCallsRunTotal
+            maxHost = maxOf(maxHost, host - lastHost)
+            maxCalls = maxOf(maxCalls, calls - lastCalls)
+            lastHost = host
+            lastCalls = calls
+            pre += preNanos
+            maxPre = maxOf(maxPre, preNanos)
+        }
+
+        fun stats(settings: LoadSettings, minCaller: Long, maxCaller: Long): HostCallStats = HostCallStats(
+            budgetNanos = budgetNanos,
+            callers = settings.hostCallers,
+            parallel = settings.hostCallParallel,
+            callMicros = settings.hostCallMicros,
+            ticks = ticks,
+            hostCallNanos = lastHost - startHost,
+            maxTickHostCallNanos = maxHost,
+            notifyNanos = scheduler.notifyNanosTotal - startNotify,
+            calls = lastCalls - startCalls,
+            maxTickCalls = maxCalls,
+            cutTicks = scheduler.budgetCutTickCount - startCut,
+            carried = scheduler.carriedMachineCount - startCarried,
+            minCallerCalls = minCaller,
+            maxCallerCalls = maxCaller,
+            preNanos = pre,
+            maxPreNanos = maxPre,
+        )
     }
 
     private val level = helper.level
@@ -948,6 +1138,25 @@ internal class LoadRun(
     private val multiProcess: Boolean
         get() = settings.os.backgroundCommand != null && settings.computeProcesses >= 2 && settings.busy > 0 &&
             settings.count >= settings.busy * 4
+
+    /**
+     * メインスレッドのメソッドを呼び続ける台（[LoadPhase.HOST_CALLS]。#356）。並べた台の後ろから [LoadSettings.hostCallers] 台。
+     * 先頭から取るほかの段階の台（計算・出力・`/tmp`・1台に複数。4 × busy 台）とは重ねない（[start] で確かめる）
+     */
+    private val callerSet: List<Computer> get() =
+        if (hostCalls) computers.subList(minOf(settings.count - settings.hostCallers, computers.size), computers.size) else emptyList()
+
+    /** [LoadPhase.HOST_CALLS] を動かすか（#356）: 呼ぶ台があり、本番の形の自動保存の回でない（その回は自動保存の段階で終える） */
+    private val hostCalls: Boolean get() = settings.hostCallers > 0 && !settings.productionAutosave
+
+    /** [i] 番目の台が、メインスレッドのメソッドを呼び続ける台か（樽を置く・消すため。台を作る前にも使う） */
+    private fun isCaller(i: Int): Boolean = hostCalls && i >= settings.count - settings.hostCallers
+
+    /** [LoadPhase.HOST_CALLS] の測った区間の数え口（測っていなければ `null`） */
+    private var hostCallWindow: HostCallWindow? = null
+
+    /** 段階の終わりに読んだ、メインスレッドの予算の数え口（[next]。[finish] が結果に入れる） */
+    private var endHostCalls: HostCallStats? = null
 
     /** `/tmp` にファイルを書かせる台（#553）。計算・出力させる台とは別にし、最後まで動かしておく（アンロードでも書く） */
     private val tmpSet: List<Computer> get() = computers.subList(minOf(settings.busy * 2, computers.size), minOf(settings.busy * 3, computers.size))
@@ -1127,6 +1336,7 @@ internal class LoadRun(
     private val tickMarks = IntArray(LoadTickProbe.Section.entries.size)
 
     fun start() {
+        if (settings.hostCallers > 0) checkHostCallSettings()
         // 結果はコンフィグの値に左右される（runClient などと同じ run/config を使う）。既定と違う値があれば、結果と一緒に残す
         val nonDefault = KiBiConfig.entries(ConfigSide.SERVER).filter { KiBiConfigs.server[it] != it.default }
         if (nonDefault.isNotEmpty()) {
@@ -1154,6 +1364,45 @@ internal class LoadRun(
         logCounter?.start()
         helper.onEachTick(::onTick)
     }
+
+    /**
+     * メインスレッドのメソッドを呼び続ける段階（#356）の設定を確かめる。呼ぶ台は Lua の REPL から呼ぶので、OS は Lua の REPL だけ。
+     * 台はほかの段階の台と重ねない
+     */
+    private fun checkHostCallSettings() {
+        if (settings.os != LoadOs.LUA) fail("the host call phases (${LoadSettings.HOST_CALLERS_PROPERTY}) need the Lua REPL (-PloadTestOs=lua), not ${settings.os.id}")
+        val reserved = settings.busy * 4
+        if (settings.hostCallers > settings.count - reserved) {
+            fail("${settings.hostCallers} host callers do not fit: $reserved of ${settings.count} computers are used by the other phases")
+        }
+        if (settings.hostCallParallel !in 1..LoadSettings.MAX_HOST_CALL_PARALLEL) {
+            fail("${LoadSettings.HOST_CALL_PARALLEL_PROPERTY} should be 1 to ${LoadSettings.MAX_HOST_CALL_PARALLEL}: ${settings.hostCallParallel}")
+        }
+        if (settings.hostCallMicros !in 1..MAX_HOST_CALL_MICROS) {
+            fail("${LoadSettings.HOST_CALL_MICROS_PROPERTY} should be 1 to $MAX_HOST_CALL_MICROS: ${settings.hostCallMicros}")
+        }
+    }
+
+    /**
+     * 呼ぶ台が REPL に打ち込む行（#356）。他 MOD 役のデバイス（樽。種類 `kibitest:reactor`）のメインスレッドのメソッド `burn` を呼び続ける。
+     * 同時に積む数が 2 以上なら、その数のコルーチンを `parallel.waitForAll` で動かす（コルーチンの中は start → take で待つ。ADR 0744）
+     */
+    private fun hostCallCommand(): String {
+        val call = "r.$BURN_METHOD(${settings.hostCallMicros})"
+        val find = "local r=peripheral.find(\"reactor\")"
+        if (settings.hostCallParallel <= 1) return "$find while true do $call end"
+        return "$find local f=function() while true do $call end end local t={} for i=1,${settings.hostCallParallel} do t[i]=f end " +
+            "parallel.waitForAll(table.unpack(t))"
+    }
+
+    /** 呼ぶ台が、打ち込んだ行を読んで（エコーが出て）からプロンプトに戻った（行が誤っていた・止まった） */
+    private fun hostCallerReturned(c: Computer): Boolean {
+        val text = lines(c.screen.text)
+        return text.any { it.startsWith("${settings.os.prompt} local r=") } &&
+            text.lastOrNull { it.isNotEmpty() } == settings.os.prompt.toString()
+    }
+
+    private fun scheduler(): MachineScheduler = ServerMachines.current?.scheduler ?: fail("no running scheduler")
 
     private fun onTick() {
         if (finished) return
@@ -1437,6 +1686,11 @@ internal class LoadRun(
         add(LoadPhase.BOOT)
         add(LoadPhase.IDLE)
         add(LoadPhase.AUTOSAVE)
+        // メインスレッドの予算（#356）。入力待ちの台ばかりのところで測り、全台が入力待ちの段階の MSPT との差を見る
+        if (hostCalls) {
+            add(LoadPhase.HOST_CALLS)
+            add(LoadPhase.HOST_CALLS_UNBUDGETED)
+        }
         // 本番の形の自動保存（#834）は、その段階で終える（ほかの段階に、次の周期やバニラの自動保存が混ざらないように）
         if (!settings.productionAutosave) {
             if (settings.busy > 0) add(LoadPhase.COMPUTE)
@@ -1457,8 +1711,10 @@ internal class LoadRun(
         endFuel = FuelCounts.current()
         endCpu = osBean?.processCpuTime ?: -1
         readProcessGrants(p)
+        readHostCalls(p)
         verify(p)
         finish()
+        if (p == LoadPhase.HOST_CALLS_UNBUDGETED) stopHostCalls()
         val i = sequence.indexOf(p) + 1
         if (i < sequence.size) enter(sequence[i]) else done()
     }
@@ -1752,6 +2008,7 @@ internal class LoadRun(
             LoadPhase.IDLE -> awaitTmp()
             LoadPhase.COMPUTE -> awaitCompute()
             LoadPhase.COMPUTE_MULTI -> awaitComputeMulti()
+            LoadPhase.HOST_CALLS -> awaitHostCalls()
             else -> awaitOutput()
         }
         val t = phaseTick - from
@@ -1770,6 +2027,14 @@ internal class LoadRun(
                     c.grantsAtMeasure = (c.case.computer.machine?.fuelGrantsByProcess() ?: emptyMap()).filterKeys { it in shells }
                 }
             }
+            if (p == LoadPhase.HOST_CALLS || p == LoadPhase.HOST_CALLS_UNBUDGETED) {
+                val scheduler = scheduler()
+                for (c in callerSet) c.hostCallsAtMeasure = c.hostCallsRun()
+                hostCallWindow = HostCallWindow(scheduler, scheduler.mainThreadBudgetOverrideNanos ?: scheduler.config.mainThreadBudgetNanos)
+            }
+        } else if (t > settings.warmupTicks) {
+            // 直前の tick（この呼び出しの前のサーバーの tick）の分。sectionNanos は onTick がその tick の区間を取ったもの
+            hostCallWindow?.sample(sectionNanos[LoadTickProbe.Section.PRE.ordinal])
         }
         if (recording && phaseTick % 10 == 0) {
             sampleKernelThreads()
@@ -1822,6 +2087,61 @@ internal class LoadRun(
             val c = computeSet.first { !runsLoop(it) }
             fail("$waiting of ${computeSet.size} computing machines did not show the command within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)}")
         }
+    }
+
+    /**
+     * [LoadPhase.HOST_CALLS] のはじめ（#356）: 呼ぶ台が全部、ホスト呼び出しを1件以上実行されるまで待ってから測りはじめる
+     * （行が誤っていると、エラーの文の後にプロンプトが戻るだけで、黙って負荷が出ない）。予算が効くと1台に回るのは数 tick に1回なので、
+     * 10 tick ごとに見る
+     */
+    private fun awaitHostCalls() {
+        if (phaseTick % 10 != 0) return
+        callerSet.firstOrNull(::hostCallerReturned)?.let { fail("a host caller returned to the prompt: ${lines(it.screen.text)}") }
+        val waiting = callerSet.count { it.hostCallsRun() <= it.hostCallsAtPhase }
+        if (waiting == 0) {
+            measureFrom = phaseTick
+        } else if (phaseTick >= settings.outputTimeoutTicks) {
+            val c = callerSet.first { it.hostCallsRun() <= it.hostCallsAtPhase }
+            fail(
+                "$waiting of ${callerSet.size} host callers ran no host call within ${settings.outputTimeoutTicks} ticks: ${lines(c.screen.text)} " +
+                    "(processes: ${c.case.computer.machine?.describeProcesses()})",
+            )
+        }
+    }
+
+    /**
+     * [LoadPhase.HOST_CALLS]・[LoadPhase.HOST_CALLS_UNBUDGETED] の終わり（#356）: 測った区間の数え口と、呼ぶ台ごとの件数の最小・最大を
+     * [endHostCalls] に入れる（呼ぶ台の走査は、段階の終わりのここだけ）。ほかの段階は `null`
+     */
+    private fun readHostCalls(p: LoadPhase) {
+        endHostCalls = null
+        val window = hostCallWindow ?: return
+        if (p != LoadPhase.HOST_CALLS && p != LoadPhase.HOST_CALLS_UNBUDGETED) return
+        val counts = callerSet.map { it.hostCallsRun() - it.hostCallsAtMeasure }
+        endHostCalls = window.stats(settings, counts.minOrNull() ?: 0, counts.maxOrNull() ?: 0)
+        LOGGER.info("Main thread budget ({}): {}", p, endHostCalls)
+    }
+
+    /**
+     * 予算なしの段階の後（#356）: 予算を設定の値に戻し、呼ぶ台の電源を切る。残った呼び出しは kill で取り消される（#358）。
+     * 呼び続けたまま後の段階（アンロード・復元）に流すと、実行を待つ呼び出しを保存して積み直す道に入り、呼ばない回と同じ形の
+     * アンロード・復元にならない（実行を待つ呼び出しを積み直す手間が、数字に混ざる）。そのため切る。
+     *
+     * 切ると、後の段階（計算・出力・アンロード・復元）は、呼ぶ台の数だけ動いている台が少ない状態で走る
+     * （アンロードの取り出し・書き込みの数、[restoreTargets]、報告の「動いている台」が、`-PloadTestHostCallers` を付けない回より減る）。
+     * この回の後の段階の数字は、付けない回の結果と直接比べない。比べるなら、報告の「動いている台」で台数をそろえて見る
+     */
+    private fun stopHostCalls() {
+        scheduler().mainThreadBudgetOverrideNanos = null
+        var stopped = 0
+        for (c in callerSet) if (c.case.computer.machine != null) {
+            c.case.pressPowerButton()
+            stopped++
+        }
+        LOGGER.info(
+            "Host callers powered off after the unbudgeted phase: {} of {} computers; the later phases run with fewer running computers",
+            stopped, settings.count,
+        )
     }
 
     /**
@@ -1973,6 +2293,8 @@ internal class LoadRun(
                         helper.setBlock(LoadGameTests.Layout.casePos(i, columns).north(), Blocks.BARREL)
                     }
                 }
+                // メインスレッドのメソッドを呼び続ける台（#356）の隣にも置く（-PloadTestDevices の樽と重なってもよい。同じ樽になる）
+                for (i in 0 until settings.count) if (isCaller(i)) helper.setBlock(LoadGameTests.Layout.casePos(i, columns).north(), Blocks.BARREL)
                 placeMillis = (System.nanoTime() - t0) / 1e6
             }
             LoadPhase.BOOT -> {
@@ -1989,11 +2311,11 @@ internal class LoadRun(
                         fail("computer at ${c.case.blockPos} is not wired to its own screen and keyboard")
                     }
                 }
-                if (settings.devicesEvery > 0) {
-                    for (i in computers.indices step settings.devicesEvery) {
-                        if (computers[i].case.wiring.connected.none { it is ExternalDeviceHolder<*> }) {
-                            fail("computer #$i is not wired to the test device next to it (is kibicomputers.dev.testDevices set?)")
-                        }
+                val wired = (if (settings.devicesEvery > 0) computers.indices.step(settings.devicesEvery).toSet() else emptySet()) +
+                    computers.indices.filter(::isCaller)
+                for (i in wired.sorted()) {
+                    if (computers[i].case.wiring.connected.none { it is ExternalDeviceHolder<*> }) {
+                        fail("computer #$i is not wired to the test device next to it (is kibicomputers.dev.testDevices set?)")
                     }
                 }
                 // 起動は、電源を入れた次の tick から終わるまでを全部測る
@@ -2026,6 +2348,17 @@ internal class LoadRun(
                 if (settings.productionAutosave) startProductionAutosave() else ServerMachines.startAutosaveCycle(own)
                 recording = true
             }
+            LoadPhase.HOST_CALLS -> {
+                // 予算は設定の値のまま（前の回の差し替えが残っていても外す）
+                scheduler().mainThreadBudgetOverrideNanos = null
+                val line = hostCallCommand()
+                for (c in callerSet) {
+                    c.hostCallsAtPhase = c.hostCallsRun()
+                    type(c, line)
+                }
+            }
+            // 呼ぶ台は呼び続けたまま、次の tick から予算を切る（比べる基準）。戻すのは段階の終わり（stopHostCalls）か cleanUp
+            LoadPhase.HOST_CALLS_UNBUDGETED -> scheduler().mainThreadBudgetOverrideNanos = Long.MAX_VALUE
             LoadPhase.COMPUTE -> {
                 computingSet = computeSet
                 for (c in computeSet) type(c, settings.os.computeCommand)
@@ -2172,6 +2505,28 @@ internal class LoadRun(
                     fail("${settings.computeProcesses} computing shells should be counted when the measurement began, but ${c.grantsAtMeasure.size}")
                 }
             }
+            LoadPhase.HOST_CALLS, LoadPhase.HOST_CALLS_UNBUDGETED -> {
+                for (c in callerSet) {
+                    if (c.case.computer.machine?.state != MachineState.RUNNING) fail("a host caller stopped: ${lines(c.screen.text)}")
+                    if (hostCallerReturned(c)) fail("a host caller returned to the prompt: ${lines(c.screen.text)}")
+                }
+                // 予算が効いても、巡回するので呼ぶ台はみな前に進む（0 の台があれば、先頭に居座る台がいる）
+                val stats = endHostCalls ?: fail("the host call counters were not read in the $p phase")
+                if (stats.minCallerCalls <= 0) fail("every host caller should run host calls while measured: $stats")
+                // 予算が効いたか・切れていたかを数え口で確かめる。2つの段階が同じ数字のまま「予算あり／なしの比べ」として出ないように。
+                // 需要（台数 × 同時に積む数 × 1件の重さ）が予算に届かない指定や、差し替え（mainThreadBudgetOverrideNanos）が効かない退行で落ちる
+                val demandMicros = settings.hostCallers.toLong() * settings.hostCallParallel * settings.hostCallMicros
+                if (p == LoadPhase.HOST_CALLS && stats.cutTicks <= 0) {
+                    fail(
+                        "the main thread budget (${stats.budgetNanos / 1000} us) should cut some ticks in the $p phase, but none was cut: " +
+                            "raise the demand (${settings.hostCallers} callers x ${settings.hostCallParallel} x ${settings.hostCallMicros} us = " +
+                            "$demandMicros us per tick) above the budget: $stats",
+                    )
+                }
+                if (p == LoadPhase.HOST_CALLS_UNBUDGETED && stats.cutTicks != 0L) {
+                    fail("no tick should be cut while the budget is lifted in the $p phase, but ${stats.cutTicks} were: $stats")
+                }
+            }
             LoadPhase.UNLOAD -> unloadResult!!.let { verifyCounted(p, it.cost, handedToWriter = it.captures, exact = true) }
             // 測るだけで落とさない。ただし、気づくべきことは WARN にする（#582）
             LoadPhase.RESTORE -> restoreResult!!.let {
@@ -2216,7 +2571,10 @@ internal class LoadRun(
     private fun enter(p: LoadPhase) {
         phase = p
         phaseTick = -1 // step() が 0 にする
-        measureFrom = if (p == LoadPhase.OUTPUT || p == LoadPhase.IDLE || p == LoadPhase.COMPUTE || p == LoadPhase.COMPUTE_MULTI) null else 0
+        measureFrom = when (p) {
+            LoadPhase.OUTPUT, LoadPhase.IDLE, LoadPhase.COMPUTE, LoadPhase.COMPUTE_MULTI, LoadPhase.HOST_CALLS -> null
+            else -> 0
+        }
         phaseStartNanos = System.nanoTime()
         recording = false
         measuredTick = null
@@ -2236,6 +2594,7 @@ internal class LoadRun(
         fuelAtMeasure = null
         cpuAtMeasure = -1
         peakFuelThreadWaits = 0
+        hostCallWindow = null
     }
 
     private fun finish() {
@@ -2280,7 +2639,9 @@ internal class LoadRun(
             },
             minProcessGrants = endMinProcessGrants,
             maxProcessGrants = endMaxProcessGrants,
+            hostCalls = endHostCalls,
         )
+        endHostCalls = null
         if (p == LoadPhase.COMPUTE) {
             computeSet.firstNotNullOfOrNull { it.case.computer.machine?.config }?.let {
                 reportFuelPerTick = it.fuelPerTick
@@ -2356,7 +2717,7 @@ internal class LoadRun(
             helper.setBlock(pos, Blocks.AIR)
             helper.setBlock(pos.above(), Blocks.AIR)
             helper.setBlock(pos.south(), Blocks.AIR)
-            if (settings.devicesEvery > 0) helper.setBlock(pos.north(), Blocks.AIR)
+            if (settings.devicesEvery > 0 || isCaller(i)) helper.setBlock(pos.north(), Blocks.AIR)
         }
         watcher?.let { level.server.playerList.remove(it) }
         watcher = null
@@ -2375,6 +2736,8 @@ internal class LoadRun(
         ServerMachines.Stats.saves.clear()
         // スライスの差し替え（#740）を残さない（同じ JVM で続けて動く GameTest のスライスが変わる）
         if (settings.fuelSlice != null) CaseBlockEntity.configOverride = null
+        // 予算の差し替え（#356）を残さない（同じ JVM の次の台数の回や、ほかの GameTest に効く）
+        if (hostCalls) ServerMachines.current?.scheduler?.mainThreadBudgetOverrideNanos = null
     }
 
     private fun sampleKernelThreads() {
@@ -2509,6 +2872,15 @@ internal class LoadRun(
          * この値（段階の始めから数える）が上限になる。一巡が始まる前だけは、上限が「周期 + [PRODUCTION_LEAD_TICKS] - 1」を超えない
          */
         private const val PRODUCTION_TIMEOUT_TICKS = 12_000
+
+        /**
+         * 呼ぶ台が呼ぶ、他 MOD 役のデバイスのメインスレッドのメソッド（#356）。dev ソースセットの `TestReactor.BURN`
+         * （main からは参照できないので名前で持つ）。引数のマイクロ秒だけメインスレッドで回す
+         */
+        private const val BURN_METHOD = "burn"
+
+        /** [BURN_METHOD] の重さの上限（マイクロ秒。`TestReactor.MAX_BURN_MICROS`。超えると切り詰められる） */
+        private const val MAX_HOST_CALL_MICROS = 10_000L
 
         /** 段階ごとに覚える長い tick の上限 */
         private const val MAX_LONG_TICKS = 32

@@ -141,6 +141,12 @@ neoForge {
             systemProperty("kibicomputers.loadTest.computeProcesses", providers.gradleProperty("loadTestComputeProcesses").getOrElse("4"))
             systemProperty("kibicomputers.loadTest.busy", providers.gradleProperty("loadTestBusy").getOrElse("0"))
             systemProperty("kibicomputers.loadTest.fuelSlice", providers.gradleProperty("loadTestFuelSlice").getOrElse(""))
+            // メインスレッドの予算を測る（#356）: -PloadTestHostCallers=<n> で、n 台（後ろから）に他 MOD 役のデバイスのメインスレッドのメソッドを
+            // 呼び続けさせる段階（予算あり・予算なし）を足す（既定は 0 = 飛ばす。Lua の REPL だけ）。-PloadTestHostCallMicros=<µs> で1件の重さ
+            // （既定 100、上限 10000）、-PloadTestHostCallParallel=<n> で1台が同時に積む数（既定 1、上限 16）
+            systemProperty("kibicomputers.loadTest.hostCallers", providers.gradleProperty("loadTestHostCallers").getOrElse("0"))
+            systemProperty("kibicomputers.loadTest.hostCallMicros", providers.gradleProperty("loadTestHostCallMicros").getOrElse("100"))
+            systemProperty("kibicomputers.loadTest.hostCallParallel", providers.gradleProperty("loadTestHostCallParallel").getOrElse("1"))
             // -PloadTestJfr=<ファイル> で、JFR のプロファイルを取る（メインスレッドで重いところを探すとき。#351）
             providers.gradleProperty("loadTestJfr").orNull?.let {
                 jvmArgument("-XX:StartFlightRecording=filename=${file(it).absolutePath},settings=profile,dumponexit=true")
