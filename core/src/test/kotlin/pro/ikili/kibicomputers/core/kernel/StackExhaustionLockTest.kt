@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.Errno
 import pro.ikili.kibicomputers.core.kernel.vfs.FsException
+import pro.ikili.kibicomputers.core.kernel.vfs.OpenFile
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.tty.Tty
 import pro.ikili.kibicomputers.core.display.DisplayDevice
@@ -31,11 +32,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.Executors
-import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -63,7 +60,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 class StackExhaustionLockTest {
     /**
      * 1 つの掃引の上限（止まったときの最後の砦）。止まったことは、待ちごとの見分け（[awaitOrClassify]）が様子を付けて先に落とす
-     * （tick は [Ticker] の別のスレッドで回すので、tick の中でロックが残って止まる形でも、テストのスレッドは止まらずに見分けに届く）。
+     * （tick は [HeadroomTicker] の別のスレッドで回すので、tick の中でロックが残って止まる形でも、テストのスレッドは止まらずに見分けに届く）。
      * 単独では 10〜20 秒で終わるが、CPU を取り合う負荷の下では 1 回あたり数秒になることがある（#868 で 60 回に約 210 秒を測った）
      */
     private val limit = maxOf(Duration.ofSeconds(300), stackHeadroomTestLimit())
@@ -115,7 +112,9 @@ class StackExhaustionLockTest {
          * ロックの外で、回ごとに決めた 1 種類の操作（[DiskOp]）を、ホストの関数を呼ぶたびに繰り返す。ディスクの操作は、
          * リースの I/O のロック（`HostDiskLeases.Lease.lock`）を持ったままホストの NIO を呼ぶ。
          * テストのスレッドがそのロックを取り合い、待ち行列ができた状態の取得・解放（AQS の遅い道）も通す。
-         * 尽きる位置は、再帰の一番深いところで呼ばれた操作の中に落ちるので、操作を回ごとに分けて、どの操作の中でも確かめる
+         * 尽きる位置は、再帰の一番深いところで呼ばれた操作の中に落ちるので、操作を回ごとに分けて、どの操作の中でも確かめる。
+         * 本物の操作は、スタックの底に近いところだけ動かす（[nearStackEnd]。1 回に何千回もすると、1 回が数秒かかる）。
+         * 毎回の後に、ディスクの node の表・使用量・開いたままの枠がホストと合うこと（[DiskFileSystem.consistencyProblemsForTest]）も見る
          */
         DISK_IO,
 
@@ -172,7 +171,29 @@ class StackExhaustionLockTest {
 
         /** ホストの関数の本体を呼んだ回数 */
         val calls = AtomicInteger()
+
+        /** [Body.DISK_IO] で、ディスクの本物の操作まで動かした回数（スタックの底に近いときだけ動かす。[nearStackEnd]） */
+        val ops = AtomicInteger()
+
+        /** [DiskOp.CREATE_WRITE_CLOSE] で開いて、まだ閉じていないファイル（尽きて閉じ損ねたものを、回の後に閉じる） */
+        val openFile = AtomicReference<OpenFile?>()
     }
+
+    /**
+     * スタックの底に近いか（あと [diskNearEndFrames] 段分のスタックが残っていないか）。[Body.DISK_IO] は、ホストの関数を呼ぶたびに
+     * 本物のディスクの操作をすると、1 回に 1,300〜1,700 回の `rename` などで 1 回が 5 秒を超えた（負荷の下の遅れが、遅れか停止かの
+     * 見分けの 10 秒・40 秒に迫る）。尽きる位置は、再帰の一番深いところで呼ばれた本体の中に落ちるので、深いところだけ本物の操作をする。
+     * 尽きて投げるのは確かめだけ（[StackHeadroom.ensure]。何も触らない）で、ここで受ける
+     */
+    private fun nearStackEnd(): Boolean = try {
+        StackHeadroom.ensure(diskNearEndFrames)
+        false
+    } catch (_: StackOverflowError) {
+        true
+    }
+
+    /** [nearStackEnd] の段数。ディスクの操作の入口の確かめ（[StackHeadroom.HOST_IO_FRAMES]）の 2 倍（確かめが通る深さのうち、浅い側から底へ） */
+    private val diskNearEndFrames = StackHeadroom.HOST_IO_FRAMES * 2
 
     private val payload = "\u001b[31mstack\u001b[0m headroom #858 \u001b[2K\r\n".toByteArray()
 
@@ -189,17 +210,22 @@ class StackExhaustionLockTest {
             Body.DISK_IO -> {
                 val disk = round.rig.disk!!
                 val n = round.index
-                val call = round.calls.getAndIncrement()
+                round.calls.incrementAndGet()
                 // 本番の path_open・path_rename と同じく、ロックの中は fd・パスの解決だけ（WasiP1Path）
                 ctx.withKernelLock { ctx.kernel.processes[ctx.pid] }
+                // 浅いところは、ホストの関数の呼び出しだけ（本物の操作は、スタックの底に近いところだけ）
+                if (!nearStackEnd()) return
+                val call = round.ops.getAndIncrement()
                 val vfs = ctx.vfs
                 when (round.diskOp!!) {
                     DiskOp.STAT_DEEP -> vfs.stat(disk.deep)
                     DiskOp.STAT_OTHER -> vfs.stat(disk.other)
                     DiskOp.CREATE_WRITE_CLOSE -> {
                         val f = vfs.open(disk.file(n), OpenOptions(read = true, write = true, create = true, truncate = true))
+                        round.openFile.set(f)
                         vfs.write(f, payload, 0, payload.size)
                         vfs.close(f)
+                        round.openFile.set(null)
                     }
                     DiskOp.RENAME -> if (call % 2 == 0) vfs.rename(disk.file(n), disk.renamed(n)) else vfs.rename(disk.renamed(n), disk.file(n))
                     DiskOp.RENAME_ACROSS -> try {
@@ -284,13 +310,13 @@ class StackExhaustionLockTest {
         rounds: Int,
         body: Body = Body.EMPTY,
         patterns: List<Pattern> = basePatterns,
-        timeoutScale: Long = 1,
-    ) = timeout(limit.multipliedBy(timeoutScale)) {
+    ) = timeout(limit) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         val h = Harness(config)
-        val ticker = Ticker(h)
+        val ticker = HeadroomTicker(h)
         val tally = SoePositions()
         val bodyCalls = AtomicInteger()
+        val diskOps = AtomicInteger()
         val stopWaker = AtomicBoolean(false)
         var waker: Thread? = null
         var contenderThread: Thread? = null
@@ -412,6 +438,11 @@ class StackExhaustionLockTest {
                     // 本体は、尽きる深さまでホストの関数を呼ぶたびに動いた（尽きる位置が本体の中に落ちる）
                     assertTrue(round.calls.get() > 0, "本体が 1 度も動かなかった（$where、$tag）")
                 }
+                if (body == Body.DISK_IO) {
+                    // ディスクの本物の操作が、底に近いところで動いた（尽きる位置がディスクの操作の中に落ちうる）
+                    assertTrue(round.ops.get() > 0, "ディスクの操作が 1 度も動かなかった（$where、$tag。本体 ${round.calls.get()} 回）")
+                    diskOps.addAndGet(round.ops.get())
+                }
                 // 尽きた位置が、このMOD のロックを取る・放す途中（AQS・`Unsafe` の CAS を含む）なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
                 // 失敗の説明は、落とすときだけ作る（成功する回で `state` を評価しない。中のロックは待ちの上限付きで取る）
                 if (position == SoePositions.Position.LOCK) {
@@ -424,6 +455,18 @@ class StackExhaustionLockTest {
                 for (l in extraLocks) {
                     assertTrue(l.tryLock(5, TimeUnit.SECONDS), "ほかのロックが取れない（$where）: $l")
                     l.unlock()
+                }
+                if (body == Body.DISK_IO) {
+                    // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイルは、本番では fd の表がプロセスの終わりに閉じる。ここでは
+                    // 閉じてから、node の表・使用量・開いたままの枠がホストと合い、開いたままのホストのファイルが残っていないことを見る
+                    // （マシンのロック・リースのロックが取れるだけでは、「ホストの移動の後の付け替え」「ファイルを閉じた後の枠の返却」の
+                    // 途中で尽きた食い違いを見つけられない。`DiskFileSystemStackExhaustionTest` が全位置を見る）
+                    round.openFile.getAndSet(null)?.let { m.vfs.close(it) }
+                    for ((name, fs) in listOf("a" to disk!!.a, "b" to disk.b)) {
+                        val problems = fs.consistencyProblemsForTest()
+                        assertTrue(problems.isEmpty(), "尽きた後にディスク $name の状態がホストと食い違った（$where、$tag）: $problems")
+                        assertEquals(0, fs.openHandles, "開いたままのホストのファイルが残った（ディスク $name。$where、$tag）")
+                    }
                 }
                 if (body == Body.CONSOLE) {
                     // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている。残ると、
@@ -451,7 +494,7 @@ class StackExhaustionLockTest {
             waker?.join(5_000)
             contenderThread?.join(5_000)
             ticker.close()
-            println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}")
+            println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}、ディスクの操作 ${diskOps.get()} 回")
             h.close()
             disk?.let {
                 it.a.retire()
@@ -464,114 +507,12 @@ class StackExhaustionLockTest {
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
-    /** 進み具合を待つ（#868）。[progress] が今より 3 以上進むまで、tick を回して待つ（[awaitOrClassify]） */
-    private fun awaitProgress(ticker: Ticker, what: String, progress: AtomicInteger, describe: () -> String) {
-        val before = progress.get()
-        awaitOrClassify(ticker, "$what が進む", describe) { progress.get() > before + 2 }
-    }
-
-    /**
-     * [condition] がそろうまで tick を回して待つ（#868）。[FIRST_WAIT_MILLIS] でそろわなければ、その時点の様子（[describe]）を取り、
-     * さらに [GRACE_MILLIS] 観察を続けて、遅れか停止かを見分ける。
-     *
-     * - 遅れ（後でそろった）: 様子を標準出力に [SLOWDOWN_MARKER] で始まる行として出して続ける。core の `test` タスクがこの行を
-     *   Gradle のコンソール（CI のログ）に写すので、通った回でも見える（`core/build.gradle.kts`）。全体のテストを回した負荷の高い状態
-     *   （CPU の取り合い、GC、プロセスごと止まった後の再開）では、正しく動いていても 10 秒を超えることがある。確かめたいのは
-     *   「CPU・許可が渡り続ける」ことなので、遅れでは落とさない。許可が失われたことは、最後の許可の数の確かめで見る
-     * - 停止（そろわないまま）: 最初と終わりの時点の様子を付けて落とす（失敗の本文は、`test` タスクの `exceptionFormat = FULL` で
-     *   CI のログに出る）
-     *
-     * tick は [ticker] の別のスレッドで回す。tick の中で止まっても（ディスパッチャーの中のロックが残ったなど）、ここは止まらない
-     */
-    private fun awaitOrClassify(ticker: Ticker, what: String, describe: () -> String, condition: () -> Boolean) {
-        val start = System.nanoTime()
-        val reached = {
-            ticker.tick()
-            condition()
-        }
-        if (pollUntil(stackHeadroomWait(FIRST_WAIT_MILLIS), reached)) {
-            val elapsed = (System.nanoTime() - start) / 1_000_000
-            if (elapsed > 1_000) println("#868 遅い: $what まで $elapsed ms")
-            return
-        }
-        val atFirst = describe()
-        val resumed = pollUntil(stackHeadroomWait(GRACE_MILLIS), reached)
-        val elapsed = (System.nanoTime() - start) / 1_000_000
-        if (resumed) {
-            // Gradle は標準出力を行ごとに受け取るので、様子の行にもすべて頭を付ける（写すのは頭の付いた行だけ）
-            val text = "$what まで $elapsed ms かかった（$FIRST_WAIT_MILLIS ms の時点: $atFirst）"
-            println(text.lines().joinToString("\n") { "$SLOWDOWN_MARKER: $it" })
-        } else {
-            fail("停止: $what が $elapsed ms そろわない（$FIRST_WAIT_MILLIS ms の時点: $atFirst）\n終わりの時点: ${describe()}")
-        }
-    }
-
-    /** [timeoutMillis] まで [condition] を 1 ms ごとに確かめる。そろえば `true` */
-    private fun pollUntil(timeoutMillis: Long, condition: () -> Boolean): Boolean {
-        val deadline = System.nanoTime() + timeoutMillis * 1_000_000
-        while (!condition()) {
-            if (System.nanoTime() > deadline) return false
-            Thread.sleep(1)
-        }
-        return true
-    }
-
-    /**
-     * tick（`MachineScheduler.tick`）を、テストのスレッドとは別のスレッドで回す（#868）。tick の中でロックが残って止まっても
-     * （tick の先頭の `dispatcher.signal()` は、ディスパッチャーの中のロックを上限なしで取る）、テストのスレッドは止まらず、
-     * 待ちごとの見分け（[awaitOrClassify]）が様子（このスレッドのスタックを含む）を付けて落とせる。tick は重ねない
-     */
-    private class Ticker(private val h: Harness) : AutoCloseable {
-        private val threadRef = AtomicReference<Thread>()
-        private val executor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "StackExhaustionLockTest-tick").apply { isDaemon = true }.also { threadRef.set(it) }
-        }
-        private var pending: Future<*>? = null
-
-        /** tick を 1 回回し、[TICK_WAIT_MILLIS] まで終わりを待つ。前の tick が終わっていなければ、新しく回さずにそれを待つ */
-        fun tick() {
-            val running = pending?.takeUnless { it.isDone } ?: executor.submit { h.scheduler.tick() }.also { pending = it }
-            try {
-                running.get(TICK_WAIT_MILLIS, TimeUnit.MILLISECONDS)
-            } catch (_: TimeoutException) {
-                // 終わらない tick は、見分けが様子（describe）に出す
-            } catch (e: ExecutionException) {
-                throw e.cause ?: e
-            }
-        }
-
-        /** tick のスレッドの様子 */
-        fun describe(): String {
-            val t = threadRef.get() ?: return "（まだ回していない）"
-            val busy = if (pending?.isDone == false) " tick の途中" else ""
-            return "${t.name} ${t.state}$busy: ${t.stackTrace.take(12).joinToString(" <- ")}"
-        }
-
-        /** 止まった tick のスレッドはデーモンなので、待たずに放す */
-        override fun close() {
-            executor.shutdown()
-        }
-    }
-
-    /**
-     * [lock] を待ちの上限付きで取ってから [read] する（#868。失敗の説明を作る処理が、残ったロックで止まらないように）。
-     * 取れなければ、ロックの様子を返す
-     */
-    private fun peek(lock: ReentrantLock, read: () -> Any?): Any? {
-        if (!lock.tryLock(200, TimeUnit.MILLISECONDS)) return "（ロックが取れない: $lock）"
-        try {
-            return read()
-        } finally {
-            lock.unlock()
-        }
-    }
-
     /**
      * 止まったときの説明（#868）。台ごとの CPU と spin の様子、許可、tick の数、カーネルのスレッドのスタック、ここまでの集計。
      * CPU・許可・ディスパッチャーの中のロックと、マシンのロックは、すべて待ちの上限付きで取る（[peek]。ディスパッチャーの列の長さ
      * `Dispatcher.size` は中のロックを上限なしで取るので、先に同じロックを上限付きで取ってから読む。再入できるロックなので止まらない）
      */
-    private fun diagnose(h: Harness, ticker: Ticker, spins: List<Pair<Machine, ProcessRuntime>>, victim: ProcessRuntime?, tally: SoePositions): String {
+    private fun diagnose(h: Harness, ticker: HeadroomTicker, spins: List<Pair<Machine, ProcessRuntime>>, victim: ProcessRuntime?, tally: SoePositions): String {
         val permits = h.scheduler.permits
         val sb = StringBuilder()
         for ((machine, spin) in spins) {
@@ -659,11 +600,11 @@ class StackExhaustionLockTest {
 
     @Test
     fun `BLOCKINGでホストの関数の本体がディスクの深いところまで入っても、尽きる位置がロックの中にならず、リースのロックも残らない`() =
-        sweep(ProcessKind.BLOCKING, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns, timeoutScale = 2)
+        sweep(ProcessKind.BLOCKING, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns)
 
     @Test
     fun `WAIT_POINTでホストの関数の本体がディスクの深いところまで入っても、尽きる位置がロックの中にならず、リースのロックも残らない`() =
-        sweep(ProcessKind.WAIT_POINT, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns, timeoutScale = 2)
+        sweep(ProcessKind.WAIT_POINT, rounds = 40, body = Body.DISK_IO, patterns = hostPatterns)
 
     @Test
     fun `BLOCKINGでホストの関数の本体がコンソールに書いて表示デバイスに流しても、表示デバイスのロックが残らない`() =
@@ -705,10 +646,6 @@ class StackExhaustionLockTest {
     fun `WAIT_POINTのstepがマシンのロックを持ったまま終わると、放してマシンをCRASHEDにする`() = leakedLockIsRecovered(ProcessKind.WAIT_POINT)
 
     // ---- 安全網の枝（recoverLeaks）----
-
-    /** [owner]（`MachineCpu`・`PermitPool`）の中のロック。テストで、ロックを持ったまま step を終えるまねをするのに使う */
-    private fun innerLock(owner: Any): ReentrantLock =
-        owner.javaClass.getDeclaredField("lock").apply { isAccessible = true }.get(owner) as ReentrantLock
 
     /** [t]（step・専用スレッドを動かしていたスレッド）が、`runStep`・`runBlocking`（安全網を含む）を抜けるまで待つ */
     private fun awaitOutOfRunner(t: Thread) =
@@ -931,20 +868,6 @@ class StackExhaustionLockTest {
             assertEquals(ProcessState.EXITED, rt.process.state)
             m.stop()
         }
-    }
-
-    private companion object {
-        /** 進み具合の最初の待ち */
-        const val FIRST_WAIT_MILLIS = 10_000L
-
-        /** 最初の待ちで進まなかったときに、遅れか停止かを見分けるために観察を続ける長さ */
-        const val GRACE_MILLIS = 30_000L
-
-        /** 1 回の tick の終わりを待つ長さ。これを過ぎた tick は、終わるまで新しく回さない */
-        const val TICK_WAIT_MILLIS = 100L
-
-        /** 遅れの行の頭（`core/build.gradle.kts` の `test` タスクが、この行を Gradle のコンソールに写す） */
-        const val SLOWDOWN_MARKER = "#868 遅れ"
     }
 }
 

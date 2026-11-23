@@ -105,7 +105,10 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         testClassesDirs = sourceSets.test.get().output.classesDirs
         classpath = sourceSets.test.get().runtimeClasspath
         useJUnitPlatform()
-        filter { headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") } }
+        filter {
+            headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
+            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
+        }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)
         // インタプリタでは遅いので、1 本の時間の上限を延ばす

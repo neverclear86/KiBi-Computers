@@ -72,9 +72,11 @@ internal class SoePositions {
     }
 
     /** [rt] が尽きた位置を数える。[tag] は、本体の種類など、位置を分けて数える名前 */
-    fun record(rt: ProcessRuntime, tag: String = ""): Position {
+    fun record(rt: ProcessRuntime, tag: String = ""): Position = record(soe(rt), tag)
+
+    /** [t]（尽きたときの `StackOverflowError`。なければ `STACK_OVERFLOW` のトラップ）の位置を数える */
+    fun record(t: StackOverflowError?, tag: String = ""): Position {
         crashed.incrementAndGet()
-        val t = soe(rt)
         val position = if (t == null) Position.TRAP else classify(t.stackTrace)
         positions.computeIfAbsent(if (tag.isEmpty()) position.name else "$tag:${position.name}") { AtomicInteger() }.incrementAndGet()
         t?.stackTrace?.firstOrNull()?.let { top ->

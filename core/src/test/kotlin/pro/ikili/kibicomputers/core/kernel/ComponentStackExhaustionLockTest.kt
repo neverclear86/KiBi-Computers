@@ -49,8 +49,12 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *   巻き直して続ける（ドライバーは `WasiP2Driver` と同じく `StepResult.WaitFuel` を返す）
  *
  * 巻き戻しは `top`（外からの call の 1 段目）でしか起きず、深い `f` の下では起きない（待ちがゲストからゲストへの呼び出しの下にあると、
- * 変換を断る）。そこで、巻き戻しの道の途中で尽きる位置を確かめるために、`top` を呼ぶドライバーの詰め物を、尽きる境目の近くまで
- * 積んで 1 段ずつずらす回（[edgeSweep]）も回す
+ * 変換を断る）。そこで、巻き戻しの道の途中で尽きる位置を確かめるために、`f` を呼ばず `wait` と燃料を使う計算の loop だけの入口 `wind` を、
+ * ドライバーの詰め物を尽きる境目の近くまで積んで 1 段ずつずらして呼ぶ回（[edgeSweep]）も回す。`f` の連鎖（echo の包みの確かめ 32 段、
+ * realloc・post-return の中の `ensure(128)`）を呼ばないので、境目を決めるのは巻き戻し・巻き直しの道そのものになり、入口の確かめが
+ * 「ぎりぎり通る」深さで、その先の巻き戻し・巻き直しが収まるかを見る。巻き直した後の結果は、尽きなかった回でも期待値と合うことを確かめる
+ *
+ * 毎回の待ちは、`StackExhaustionLockTest` と同じ見分け（[awaitOrClassify]。遅れか停止か）と上限付きの読み（[peek]）を使う
  */
 class ComponentStackExhaustionLockTest {
     private val d = "$"
@@ -154,15 +158,31 @@ class ComponentStackExhaustionLockTest {
                 (local.set ${d}i (i32.sub (local.get ${d}i) (i32.const 1)))
                 (br_if ${d}l (local.get ${d}i)))
               (i64.add (local.get ${d}acc) (i64.extend_i32_u (call ${d}fn (local.get 0)))))
+            ;; f を呼ばず、wait と燃料を使う計算の loop だけの入口（巻き戻し・巻き直しの道だけが、境目を決める）
+            (func ${d}spinBody (result i64)
+              (local ${d}i i32) (local ${d}c i32) (local ${d}acc i64)
+              (call ${d}wait)
+              (local.set ${d}i (i32.const 150))
+              (loop ${d}l
+                (local.set ${d}c (i32.const 200))
+                (loop ${d}cl
+                  (local.set ${d}acc (i64.add (local.get ${d}acc) (i64.extend_i32_u (local.get ${d}c))))
+                  (local.set ${d}c (i32.sub (local.get ${d}c) (i32.const 1)))
+                  (br_if ${d}cl (local.get ${d}c)))
+                (local.set ${d}i (i32.sub (local.get ${d}i) (i32.const 1)))
+                (br_if ${d}l (local.get ${d}i)))
+              (local.get ${d}acc))
             ;; 巻き直しで呼べるのは引数のない関数だけ（LinkedComponent.beginRewind）。深さで 2 つに分ける
             (func (export "top") (result i64) (call ${d}body (i32.const 2147483647)))
-            (func (export "edge") (result i64) (call ${d}body (i32.const 0))))
+            (func (export "edge") (result i64) (call ${d}body (i32.const 0)))
+            (func (export "wind") (result i64) (call ${d}spinBody)))
           (core instance ${d}env_exports (export "mem" (memory ${d}memory)))
           (core instance ${d}host_exports (export "echo" (func ${d}echo_l)) (export "wait" (func ${d}wait_l)))
           (core instance ${d}m1 (instantiate ${d}M1 (with "host" (instance ${d}host_exports)) (with "env" (instance ${d}env_exports))))
           (func ${d}f (export "run") (param "n" u32) (result u32) (canon lift (core func ${d}m1 "f")))
           (func (export "top") (result u64) (canon lift (core func ${d}m1 "top")))
           (func (export "edge") (result u64) (canon lift (core func ${d}m1 "edge")))
+          (func (export "wind") (result u64) (canon lift (core func ${d}m1 "wind")))
           (component ${d}B
             (import "pid" (func ${d}pid (result u32)))
             (import "f" (func ${d}f (param "n" u32) (result u32)))
@@ -206,15 +226,18 @@ class ComponentStackExhaustionLockTest {
     private var sink: Any? = null
 
     /**
-     * `top` を [depth] で呼ぶドライバー。`WasiP2Driver` と同じく、燃料切れで巻き戻したら `StepResult.WaitFuel` を返し、
-     * 再開では巻き直して同じ `top` を呼び直す（`TestDriver` は、`WaitFuel` の後の空の `ready` を断るので使わない）
+     * 入口の関数（[function]）を呼ぶドライバー。`WasiP2Driver` と同じく、燃料切れで巻き戻したら `StepResult.WaitFuel` を返し、
+     * 再開では巻き直して同じ関数を呼び直す（`TestDriver` は、`WaitFuel` の後の空の `ready` を断るので使わない）
      */
     private class TopDriver(
         override val kind: ProcessKind,
         private val function: String,
-        private val result: AtomicLong,
+        val result: AtomicLong,
         private val pads: (() -> CanonValue?) -> CanonValue?,
     ) : ProcessDriver {
+        /** 燃料切れで巻き戻した回数（巻き直しも同じ回数。再開のたびに巻き直す） */
+        val unwinds = AtomicInteger()
+
         override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) = Unit
 
         override fun start(ctx: ProcessContext): StepResult = run(ctx)
@@ -232,6 +255,7 @@ class ComponentStackExhaustionLockTest {
                 val suspend = (component.env as KernelLinkEnv).suspend
                 check(ctx.takeFuelUnwind()) { "燃料切れでないのに巻き戻した" }
                 check(!suspend.hasPendingKeys) { "燃料切れとホストの待ちの巻き戻しが重なった" }
+                unwinds.incrementAndGet()
                 return StepResult.WaitFuel
             }
             result.set((r as CanonValue.I64).value)
@@ -239,37 +263,40 @@ class ComponentStackExhaustionLockTest {
         }
     }
 
-    private fun driver(kind: ProcessKind, function: String, pad: Int, result: AtomicLong): ProcessDriver =
+    private fun driver(kind: ProcessKind, function: String, pad: Int, result: AtomicLong = AtomicLong()): TopDriver =
         TopDriver(kind, function, result) { body -> padThen(pad, body) }
 
     /** `edge` の期待値: 150 回の（200 の和 20100 と、浅い `f(3)`）と、`f(0)`。`f(n)` は 100 + 21n（echo は 21 文字を返す） */
     private val expectedShallow = 150L * (20100 + 100 + 3 * 21) + 100
 
+    /** `wind` の期待値: 200 の和 20100 を 150 回 */
+    private val expectedWind = 150L * 20100
+
     /** 毎回の後の確かめに使うもの */
     private class Rig(
         val h: Harness,
         val m: Machine,
+        val ticker: HeadroomTicker,
         val sameProgress: AtomicInteger,
         val otherProgress: AtomicInteger,
     )
 
-    /** 毎回の後の確かめ: マシンのロックが取れる。同じ台と別の台のプロセスが進み続ける */
+    /** 止まったときの説明（上限付きで読む。[describeMachineState]）。[rt] があれば、その状態と尽きた位置も付ける */
+    private fun describe(r: Rig, rt: ProcessRuntime?): String =
+        describeMachineState(r.h, r.m) + "、tick: ${r.ticker.describe()}" +
+            (rt?.let { "、犠牲 ${it.process.state}、SOE: ${soe(it)?.stackTrace?.take(8)?.joinToString(" <- ")}" } ?: "")
+
+    /** 毎回の後の確かめ: マシンのロックが取れる。同じ台と別の台のプロセスが進み続ける（遅れか停止かを見分ける） */
     private fun checkAlive(r: Rig, label: String, rt: ProcessRuntime) {
         assertTrue(r.m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$label）: ${r.m.lock}")
         r.m.lock.unlock()
-        val same = r.sameProgress.get()
-        val otherBefore = r.otherProgress.get()
-        eventuallyDescribe(stackHeadroomWait(10_000), { "同じ台のプロセスが止まった（$label）: ${state(r.h, r.m, rt)}" }) {
-            r.h.scheduler.tick()
-            r.sameProgress.get() > same + 2
-        }
-        r.h.tickUntilTrue("別の台のプロセスが止まった（$label）") { r.otherProgress.get() > otherBefore + 2 }
+        awaitProgress(r.ticker, "同じ台のプロセス（$label）", r.sameProgress) { describe(r, rt) }
+        awaitProgress(r.ticker, "別の台のプロセス（$label）", r.otherProgress) { describe(r, rt) }
     }
 
-    /** [rt] が終わるまで tick する */
+    /** [rt] が終わるまで tick する（遅れか停止かを見分ける） */
     private fun awaitEnd(r: Rig, rt: ProcessRuntime, label: String) =
-        eventuallyDescribe(stackHeadroomWait(20_000), { "深い再帰が終わらない（$label）: ${state(r.h, r.m, rt)}" }) {
-            r.h.scheduler.tick()
+        awaitOrClassify(r.ticker, "深い再帰が終わる（$label）", { describe(r, rt) }) {
             rt.process.state.isTerminal || r.m.state == MachineState.CRASHED
         }
 
@@ -285,53 +312,53 @@ class ComponentStackExhaustionLockTest {
     private fun onMachines(kind: ProcessKind, tally: SoePositions, body: (Rig) -> Unit) = timeout(stackHeadroomTestLimit()) {
         val config = SchedulerConfig.builder().maxConcurrentMachines(2).maxBlockingProcesses(64).threadStackBytes(256L * 1024).build()
         Harness(config).use { h ->
-            // スライスを小さくし、同じ台で燃料を取り合わせる（realloc・post-return・再帰の中の燃料切れを、譲る道に入れる）
-            val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 2_000)
-            val other = h.machine(fuelPerTick = 50_000_000, fuelSlice = 2_000)
-            val sameProgress = AtomicInteger()
-            val otherProgress = AtomicInteger()
-            m.spawnTest(h.program(spinForever(sameProgress)), runDriver(kind))
-            other.spawnTest(h.program(spinForever(otherProgress)), runDriver(kind))
-            h.tickUntilTrue("spin が動かない") { sameProgress.get() > 0 && otherProgress.get() > 0 }
-            val rig = Rig(h, m, sameProgress, otherProgress)
+            HeadroomTicker(h).use { ticker ->
+                // スライスを小さくし、同じ台で燃料を取り合わせる（realloc・post-return・再帰の中の燃料切れを、譲る道に入れる）
+                val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 2_000)
+                val other = h.machine(fuelPerTick = 50_000_000, fuelSlice = 2_000)
+                val sameProgress = AtomicInteger()
+                val otherProgress = AtomicInteger()
+                m.spawnTest(h.program(spinForever(sameProgress)), runDriver(kind))
+                other.spawnTest(h.program(spinForever(otherProgress)), runDriver(kind))
+                val rig = Rig(h, m, ticker, sameProgress, otherProgress)
+                awaitOrClassify(ticker, "spin が動く", { describe(rig, null) }) { sameProgress.get() > 0 && otherProgress.get() > 0 }
 
-            // 浅い再帰は最後まで進む（WAT とホストの関数の確かめ）。echo は "stack-headroom-858/18"（21 文字）を返す
-            val shallow = AtomicLong(-1)
-            val ok = m.spawnRt(program, driver(kind, "edge", 0, shallow))
-            h.tickUntilTrue("浅い再帰が終わらない") { ok.process.state.isTerminal || m.state == MachineState.CRASHED }
-            assertEquals(ProcessState.EXITED, ok.process.state, "${ok.lastError}")
-            assertEquals(expectedShallow, shallow.get(), "巻き戻して巻き直しても、結果は同じ")
-            assertTrue(echoCalls.get() > 0 && pidCalls.get() > 0 && waitCalls.get() > 0)
-            if (kind == ProcessKind.WAIT_POINT) {
-                // 待機点への変換がかかり、`top` に燃料切れの待ち点ができた（待機点型に固有の燃料切れの道がある）
-                val c = program.component!!
-                assertTrue(c.waitPoints, "${c.waitPointRejection}")
-                assertTrue(c.fuelYield, "燃料切れの待ち点がない: ${c.fuelYieldRejection}")
-            }
-            val overdrafts0 = h.scheduler.fuelOverdrafts.get()
-            val unwindCost0 = h.scheduler.fuelUnwindCost.get()
+                // 浅い再帰は最後まで進む（WAT とホストの関数の確かめ）。echo は "stack-headroom-858/18"（21 文字）を返す
+                val shallow = AtomicLong(-1)
+                val ok = m.spawnRt(program, driver(kind, "edge", 0, shallow))
+                awaitOrClassify(ticker, "浅い再帰が終わる", { describe(rig, ok) }) { ok.process.state.isTerminal || m.state == MachineState.CRASHED }
+                assertEquals(ProcessState.EXITED, ok.process.state, "${ok.lastError}")
+                assertEquals(expectedShallow, shallow.get(), "巻き戻して巻き直しても、結果は同じ")
+                assertTrue(echoCalls.get() > 0 && pidCalls.get() > 0 && waitCalls.get() > 0)
+                if (kind == ProcessKind.WAIT_POINT) {
+                    // 待機点への変換がかかり、`top` に燃料切れの待ち点ができた（待機点型に固有の燃料切れの道がある）
+                    val c = program.component!!
+                    assertTrue(c.waitPoints, "${c.waitPointRejection}")
+                    assertTrue(c.fuelYield, "燃料切れの待ち点がない: ${c.fuelYieldRejection}")
+                }
+                val overdrafts0 = h.scheduler.fuelOverdrafts.get()
+                val unwindCost0 = h.scheduler.fuelUnwindCost.get()
 
-            body(rig)
+                body(rig)
 
-            if (kind == ProcessKind.WAIT_POINT) {
-                // 本番の燃料切れの道を通った: 深い `f` の中の前借り、`top` の巻き戻し
-                assertTrue(h.scheduler.fuelUnwindCost.get() > unwindCost0, "top の燃料切れで巻き戻していない")
-                if (overdraftsExpected) assertTrue(h.scheduler.fuelOverdrafts.get() > overdrafts0, "前借りしていない")
+                if (kind == ProcessKind.WAIT_POINT) {
+                    // 本番の燃料切れの道を通った: 深い `f` の中の前借り、`top` の巻き戻し
+                    assertTrue(h.scheduler.fuelUnwindCost.get() > unwindCost0, "top の燃料切れで巻き戻していない")
+                    if (overdraftsExpected) assertTrue(h.scheduler.fuelOverdrafts.get() > overdrafts0, "前借りしていない")
+                }
+                println(
+                    "#858 component $kind: ${tally.describe()}、echo ${echoCalls.get()} 回、pid ${pidCalls.get()} 回、wait ${waitCalls.get()} 回、" +
+                        "譲った ${h.scheduler.fuelYields.get()} 回、スレッドを持って燃料を待った ${h.scheduler.fuelBlockingWaits.get()} 回、" +
+                        "前借り ${h.scheduler.fuelOverdrafts.get()} 回、巻き戻しの費用 ${h.scheduler.fuelUnwindCost.get()}",
+                )
+                m.stop()
+                other.stop()
+                val stopping = { describe(rig, null) }
+                awaitOrClassify(ticker, "マシンが止まる", stopping) { m.state == MachineState.STOPPED && other.state == MachineState.STOPPED }
+                awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
+                awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
+                assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
             }
-            println(
-                "#858 component $kind: ${tally.describe()}、echo ${echoCalls.get()} 回、pid ${pidCalls.get()} 回、wait ${waitCalls.get()} 回、" +
-                    "譲った ${h.scheduler.fuelYields.get()} 回、スレッドを持って燃料を待った ${h.scheduler.fuelBlockingWaits.get()} 回、" +
-                    "前借り ${h.scheduler.fuelOverdrafts.get()} 回、巻き戻しの費用 ${h.scheduler.fuelUnwindCost.get()}",
-            )
-            m.stop()
-            other.stop()
-            h.tickUntilTrue("止まらない") { m.state == MachineState.STOPPED && other.state == MachineState.STOPPED }
-            eventually { m.cpu.currentOwner == null && m.cpu.waiting == 0 }
-            eventually(message = "許可が戻らない: ${h.scheduler.permits.availablePermits()}") {
-                h.scheduler.permits.availablePermits() == config.maxConcurrentMachines
-            }
-            assertEquals(0, h.scheduler.permits.waiting)
-            assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
         }
     }
 
@@ -344,7 +371,7 @@ class ComponentStackExhaustionLockTest {
         onMachines(kind, tally) { r ->
             for (i in 0 until stackHeadroomRounds(rounds)) {
                 val pad = (i * 7) % 97
-                val rt = r.m.spawnRt(program, driver(kind, "top", pad, AtomicLong()))
+                val rt = r.m.spawnRt(program, driver(kind, "top", pad))
                 assertEquals(kind, rt.process.kind)
                 awaitEnd(r, rt, "$i 回目、pad $pad")
                 assertCrashedBySoe(rt, r.m, "$i 回目")
@@ -356,73 +383,90 @@ class ComponentStackExhaustionLockTest {
     }
 
     /**
-     * 尽きる境目を `top(0)`（深い再帰なし。巻き戻しの道を通る）で探し、その手前から先へ、詰め物を 1 段ずつ増やして動かす。
-     * 境目の手前では終わり（EXITED）、境目では `top` の中のどこか（巻き戻しの途中、巻き直しで `f` の呼び出しを組み直す途中、
-     * ホストの関数・canon の中）で尽きる。どちらでもプロセスだけが終わり、ロック・CPU・許可は壊れない
+     * 尽きる境目を `wind`（`f` を呼ばず、`wait` と燃料を使う loop だけ。巻き戻し・巻き直しの道を通る）で探し、その近くを、詰め物を
+     * 1 段ずつ増やして動かす。境目の手前では終わり（EXITED。結果は期待値と合う）、境目では `wind` の中のどこか
+     * （巻き戻しの途中、巻き直しの途中、ホストの関数・canon の中）で尽きる。どちらでもプロセスだけが終わり、ロック・CPU・許可は壊れない。
+     *
+     * `top`・`edge` を使わないのは、1 回の実行で一番深い道が `f` の連鎖の先（echo の包みの確かめ 32 段、realloc・post-return の中の
+     * `ensure(128)`）になり、巻き戻しの道は、その分浅いところで動くので、境目の近くでも入口の確かめと同じ余裕が残るため
      */
     private fun edgeSweep(kind: ProcessKind, rounds: Int) {
         val tally = SoePositions()
         var exited = 0
+        var exitedUnwound = 0
+        var crashedUnwound = 0
         overdraftsExpected = false
         onMachines(kind, tally) { r ->
-            fun run(pad: Int): ProcessRuntime {
-                val rt = r.m.spawnRt(program, driver(kind, "edge", pad, AtomicLong()))
+            fun run(pad: Int): Pair<ProcessRuntime, TopDriver> {
+                val d = driver(kind, "wind", pad)
+                val rt = r.m.spawnRt(program, d)
                 awaitEnd(r, rt, "pad $pad")
-                return rt
+                return rt to d
             }
             // 詰め物の再帰を JIT のコンパイルに乗せてから探す（インタプリタと JIT のコードでは、1 段のフレームの大きさが違い、境目が数倍動く）
             val warmEnd = System.nanoTime() + 500_000_000L
             while (System.nanoTime() < warmEnd) padThen(2000) { 0 }
-            // 境目の探索: 倍々で尽きる詰め物を見つけ、二分で縮める
-            var lo = 0
-            var hi = 256
-            while (run(hi).process.state != ProcessState.CRASHED) {
-                lo = hi
-                hi *= 2
-                check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
+
+            /** 尽きる最小の詰め物の段数（境目）。倍々で尽きるところを見つけ、二分で縮める */
+            fun findEdge(): Int {
+                var lo = 0
+                var hi = 256
+                while (run(hi).first.process.state != ProcessState.CRASHED) {
+                    lo = hi
+                    hi *= 2
+                    check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
+                }
+                while (hi - lo > 1) {
+                    val mid = (lo + hi) / 2
+                    if (run(mid).first.process.state == ProcessState.CRASHED) hi = mid else lo = mid
+                }
+                return hi
             }
-            while (hi - lo > 1) {
-                val mid = (lo + hi) / 2
-                if (run(mid).process.state == ProcessState.CRASHED) hi = mid else lo = mid
-            }
-            // 境目の近くを、詰め物の段数をずらして回す。回すうちに JIT でフレームが小さくなると境目が動くので、
-            // 境目より後ろで終わった（または手前で尽きた）ら、境目の見積もりを、倍々の歩幅で動かして追う
-            var edge = hi
-            var step = 8
+
+            // 境目の手前（終わる側）と、境目から先（詰め物が多く、残りのスタックが少ない側）を、詰め物の段数をずらして回す。
+            // 境目は、1 回の実行でいちばん深い所が尽きる最小の詰め物で、それより浅い所（入口の確かめを通った後の、巻き戻し・巻き直しの
+            // 中など）は、詰め物がもっと多いところで尽きる。回すうちに JIT でフレームが小さくなると境目が動くので、BATCH 回ごとに探し直す
             val count = stackHeadroomRounds(rounds)
+            var edge = findEdge()
             for (i in 0 until count) {
-                val offset = (i % 12) * 3 - 24 + i / 12
+                if (i > 0 && i % BATCH == 0) edge = findEdge()
+                val offset = -16 + i * SPAN / count
                 val pad = maxOf(0, edge + offset)
-                val rt = run(pad)
+                val (rt, d) = run(pad)
                 val exitedHere = rt.process.state == ProcessState.EXITED
                 if (exitedHere) {
                     exited++
+                    // 巻き直した後の結果も期待値と合う（スタックが残り少ない状態で巻き戻し・巻き直しをした結果）
+                    assertEquals(expectedWind, d.result.get(), "境目の近くで終わった回の結果が違う（pad $pad、巻き戻し ${d.unwinds.get()} 回）")
+                    if (d.unwinds.get() > 0) exitedUnwound++
                 } else {
                     assertCrashedBySoe(rt, r.m, "pad $pad")
-                    tally.record(rt)
+                    val unwound = d.unwinds.get() > 0
+                    tally.record(rt, if (unwound) "巻き戻した後" else "最初の通り")
+                    if (unwound) crashedUnwound++
                 }
                 checkAlive(r, "pad $pad", rt)
-                if (exitedHere) {
-                    if (offset >= 0) {
-                        step = minOf(step * 2, 8192)
-                        edge += step
-                    }
-                } else {
-                    step = 8
-                    if (offset <= -12) edge -= 8
-                }
             }
         }
+        println("#858 component edge $kind: 境目の近くで終わった $exited 回（巻き戻した $exitedUnwound 回）、尽きた回のうち巻き戻した後のもの $crashedUnwound 回")
         assertTrue(tally.crashed.get() > 0, "境目で 1 度も尽きなかった")
         assertTrue(exited > 0, "境目の手前で 1 度も終わらなかった")
+        if (kind == ProcessKind.WAIT_POINT) {
+            // 境目の近くまで積んだ状態で、実際に巻き戻して巻き直し、最後まで終わった回がある（巻き戻しの道が「ぎりぎり通る」深さで動いた）
+            assertTrue(exitedUnwound > 0, "境目の近くで巻き戻して終わった回がない")
+        }
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
     private fun soe(rt: ProcessRuntime): StackOverflowError? = SoePositions().soe(rt)
 
-    private fun state(h: Harness, m: Machine, rt: ProcessRuntime): String =
-        "CPU ${m.cpu.currentOwner?.pid} 待ち ${m.cpu.waiting}、許可 ${h.scheduler.permits.availablePermits()} 待ち ${h.scheduler.permits.waiting}、" +
-            "lock ${m.lock}、SOE: ${soe(rt)?.stackTrace?.take(8)?.joinToString(" <- ")}"
+    private companion object {
+        /** `edgeSweep` が境目を探し直す間隔（回） */
+        const val BATCH = 16
+
+        /** `edgeSweep` が、境目から先へ進む詰め物の段数（回数で等分する。入口の確かめの 32 段分より広く取る） */
+        const val SPAN = 320
+    }
 
     @Test
     fun `BLOCKINGのコンポーネントでcanonのliftとlowerの中からロックを取る深い再帰を繰り返しても、ロック・CPU・許可は壊れない`() =
@@ -433,10 +477,10 @@ class ComponentStackExhaustionLockTest {
         sweep(ProcessKind.WAIT_POINT, rounds = 60)
 
     @Test
-    fun `BLOCKINGのコンポーネントで尽きる境目をtopの詰め物でずらしても、ロック・CPU・許可は壊れない`() =
-        edgeSweep(ProcessKind.BLOCKING, rounds = 60)
+    fun `BLOCKINGのコンポーネントで尽きる境目をwindの詰め物でずらしても、ロック・CPU・許可は壊れない`() =
+        edgeSweep(ProcessKind.BLOCKING, rounds = 96)
 
     @Test
-    fun `WAIT_POINTのコンポーネントで燃料切れの巻き戻し・巻き直しの途中で尽きる位置をずらしても、ロック・CPU・許可は壊れない`() =
-        edgeSweep(ProcessKind.WAIT_POINT, rounds = 60)
+    fun `WAIT_POINTのコンポーネントで燃料切れの巻き戻し・巻き直しの途中で尽きる位置をずらしても、ロック・CPU・許可は壊れず、結果は変わらない`() =
+        edgeSweep(ProcessKind.WAIT_POINT, rounds = 96)
 }
