@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.persist.snapshot
 
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.SnapshotLimitException
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceState
 import java.util.zip.DataFormatException
 import java.util.zip.Deflater
@@ -139,9 +140,11 @@ internal class ChunkReadBudget(val limitChunks: Long) {
     /** ページ数 [pages] のメモリの [count] 個の区画を数える。上限を超えるなら [SnapshotFormatException] */
     @Throws(SnapshotFormatException::class)
     fun take(count: Int, pages: Int) {
-        val perProcess = minOf(pages.toLong() * WasmInstanceState.CHUNKS_PER_PAGE, limitChunks)
-        if (count < 0 || count > perProcess) throw SnapshotFormatException("区画の数 $count が上限 $perProcess を超える")
-        if (used + count > limitChunks) throw SnapshotFormatException("区画の数の合計 ${used + count} が上限 $limitChunks を超える")
+        val pageChunks = pages.toLong() * WasmInstanceState.CHUNKS_PER_PAGE
+        if (count < 0 || count > pageChunks) throw SnapshotFormatException("区画の数 $count がページ数の上限 $pageChunks を超える")
+        // ページ数には収まるが、今のマシンの RAM に収まらない: RAM を下げる前に保存したもの（#719）
+        if (count > limitChunks) throw SnapshotLimitException("区画の数 $count が今の RAM の上限 $limitChunks を超える")
+        if (used + count > limitChunks) throw SnapshotLimitException("区画の数の合計 ${used + count} が今の RAM の上限 $limitChunks を超える")
         used += count
     }
 

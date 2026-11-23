@@ -30,14 +30,16 @@ public class DiskStore(public val root: Path) {
     /**
      * 挿さっているディスク（識別子 → ティア）から、変わらない [DiskSnapshot] を作る（電源を入れたとき・動いている間に挿し抜きしたときに、
      * メインスレッドで呼ぶ。#56）。[disks] の並び（接続層が渡す順＝スロットの順）を保つ。
-     * 形の正しくない識別子は入れない。容量は [PartTier.diskBytes]・[PartTier.diskEntries]。
+     * 形の正しくない識別子は入れない。容量は [profile]（コンフィグ。#719）の [PartSpec.diskBytes]・[PartSpec.diskEntries]。
      * 作った後に [disks] を変えても、結果は変わらない（プロセスのスレッドから呼ばれるため、ワールドにもアイテムにも触らない）
      */
-    public fun snapshot(disks: Map<String, PartTier>): DiskSnapshot {
+    @JvmOverloads
+    public fun snapshot(disks: Map<String, PartTier>, profile: MachineProfile = MachineProfile.DEFAULT): DiskSnapshot {
         val resolved = LinkedHashMap<String, ResolvedDisk>()
         for ((id, tier) in disks) {
             val dir = directoryOf(id) ?: continue
-            resolved[id] = ResolvedDisk(dir, tier.diskBytes, tier.diskEntries)
+            val spec = profile.spec(tier)
+            resolved[id] = ResolvedDisk(dir, spec.diskBytes, spec.diskEntries)
         }
         return DiskSnapshot.of(resolved)
     }
