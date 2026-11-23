@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
@@ -18,8 +19,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 読みの要る claim の待ち（`MachineSaveStore.claimOrDefer`・`pollDeferredClaims`。#869、ADR 0084 の規則 7a）のテスト。
- * メインスレッドで `owner.bin` を読まず、先読みの途中でも読み終えた ID はその場で決まり、未読の ID は待ちにして後で確定する
+ * メインスレッドで `owner.bin` を読まず、先読みの途中でも読み終えた ID はその場で決まり、未読の ID は待ちにして後で確定する。
+ * 実スレッドの終わりは壁時計の期限で合否を決めずに待つ（#878）。クラスの [Timeout] は、止まったときの保険で、合否の基準ではない
  */
+@Timeout(10, unit = TimeUnit.MINUTES)
 class MachineDeferredClaimTest {
     @TempDir
     lateinit var dir: Path
@@ -36,17 +39,6 @@ class MachineDeferredClaimTest {
         override fun toString() = name
     }
 
-    /** [store] の待ちを、[timeoutMillis] の間 [MachineSaveStore.pollDeferredClaims] で受け取る（[expected] 件そろうまで） */
-    private fun pollUntil(store: MachineSaveStore, expected: Int, timeoutMillis: Long = 10_000): List<DeferredClaim> {
-        val out = ArrayList<DeferredClaim>()
-        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
-        while (out.size < expected && System.nanoTime() < deadline) {
-            out += store.pollDeferredClaims()
-            if (out.size < expected) Thread.sleep(5)
-        }
-        return out
-    }
-
     @Test
     fun `先読みの途中でも、読み終えたIDはその場で決まり、未読のIDは待ちにして先に読んでもらう`() {
         val ids = List(6) { UUID.randomUUID() }
@@ -61,39 +53,46 @@ class MachineDeferredClaimTest {
             opened += UUID.fromString(path.parent.fileName.toString())
             if (opened.size == 2) {
                 stuck.countDown()
-                release.await(10, TimeUnit.SECONDS)
+                release.await()
             }
             OwnerRecord.read(path)
         }
         var thread: Thread? = null
         store.startOwnerPrefetch { thread = Thread(it).apply { start() } }
-        assertTrue(stuck.await(10, TimeUnit.SECONDS))
-        val read = opened[0]
-        val reading = opened[1]
-        // 読み終えた ID は待たずに決まる
-        val readOwner = if (ids.indexOf(read) >= 4) at(1) else at(0)
-        val now = store.claimOrDefer(read.toString(), 0, 0, readOwner, Key("read"))
-        assertEquals(ClaimResult.KEPT, now?.result)
-        assertEquals(1, store.prefetchHits)
-        // まだ開いていない ID のうち、先読みの順で最後のもの（順番より先に読まれるはず）
-        val notOpened = ids.filter { it != read && it != reading }
-        val urgent = HashSet(ids).toList().last { it in notOpened }
+        val reading: UUID
+        val urgent: UUID
         val keys = HashMap<UUID, Key>()
-        for (id in listOf(reading, urgent)) {
-            val key = Key(id.toString())
-            keys[id] = key
-            assertNull(store.claimOrDefer(id.toString(), 0, 0, at(1), key), "未読の ID は待ち")
-            assertTrue(store.isClaimDeferred(key))
+        try {
+            stuck.await()
+            val read = opened[0]
+            reading = opened[1]
+            // 読み終えた ID は待たずに決まる
+            val readOwner = if (ids.indexOf(read) >= 4) at(1) else at(0)
+            val now = store.claimOrDefer(read.toString(), 0, 0, readOwner, Key("read"))
+            assertEquals(ClaimResult.KEPT, now?.result)
+            assertEquals(1, store.prefetchHits)
+            // まだ開いていない ID のうち、先読みの順で最後のもの（順番より先に読まれるはず）
+            val notOpened = ids.filter { it != read && it != reading }
+            urgent = HashSet(ids).toList().last { it in notOpened }
+            for (id in listOf(reading, urgent)) {
+                val key = Key(id.toString())
+                keys[id] = key
+                assertNull(store.claimOrDefer(id.toString(), 0, 0, at(1), key), "未読の ID は待ち")
+                assertTrue(store.isClaimDeferred(key))
+            }
+            assertEquals(2, store.waitingClaims)
+            assertEquals(0, store.mainOwnerReads, "メインスレッドで読まない")
+            assertEquals(0, store.writerOwnerReadRequests, "先読みが読むので、書き込みのスレッドには頼まない")
+            assertTrue(store.pollDeferredClaims().isEmpty(), "読み終わるまでは決まらない")
+            assertNull(store.index.ownerOf(urgent), "待つ間は索引に入れない")
+        } finally {
+            // 途中で落ちても、止めた先読みのスレッドを放し、終わるのを待つ（@TempDir の掃除と重ならないように）
+            release.countDown()
+            thread?.join()
         }
-        assertEquals(2, store.waitingClaims)
-        assertEquals(0, store.mainOwnerReads, "メインスレッドで読まない")
-        assertEquals(0, store.writerOwnerReadRequests, "先読みが読むので、書き込みのスレッドには頼まない")
-        assertTrue(store.pollDeferredClaims().isEmpty(), "読み終わるまでは決まらない")
-        assertNull(store.index.ownerOf(urgent), "待つ間は索引に入れない")
-        release.countDown()
-        thread!!.join(10_000)
         assertEquals(urgent, opened[2], "待っている ID を順番より先に読む")
-        val done = pollUntil(store, 2)
+        // 先読みのスレッドが終わったので、待ちの ID の結果はすべて入っている（1 回の poll で決まる）
+        val done = store.pollDeferredClaims()
         assertEquals(setOf(keys[reading], keys[urgent]), done.map { it.key }.toSet())
         for (d in done) {
             val id = UUID.fromString((d.key as Key).name)
@@ -244,8 +243,8 @@ class MachineDeferredClaimTest {
         for (id in ids) writeOwner(id, OwnerRecord(0, at(1)))
         // 置き場のコンストラクターが先読みのスレッドを始める（ほかのプロパティを作った後に始めないと、表が作り直されて結果を失う）
         val store = MachineSaveStore(dir, MachineIdIndex(), prefetchOwners = true)
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-        while (!store.ownerPrefetchDone && System.nanoTime() < deadline) Thread.sleep(5)
+        // 壁時計の期限ではなく、先読みのスレッドの終わりそのものを待つ（#878）
+        store.awaitOwnerPrefetch()
         assertTrue(store.ownerPrefetchDone)
         for ((i, id) in ids.withIndex()) {
             assertEquals(ClaimResult.KEPT, store.claimOrDefer(id.toString(), 0, 0, at(1), Key("$i"))?.result, "$id")

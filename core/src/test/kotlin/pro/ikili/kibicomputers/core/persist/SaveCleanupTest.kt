@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -214,8 +215,23 @@ class SaveCleanupTest {
         assertTrue(store.deleteUnreferenced(id, judged) { result = it })
         assertEquals(-1, result)
         assertTrue(Files.exists(machines.resolve(id.toString())))
-        store.cleanupDeletionSkipped(id)
-        assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+        // 消さなかった結果は、掃除を通さずに置き場が受け取る（#900）
+        store.pollCompleted()
+        assertTakenOverFromDisk(store, id)
+    }
+
+    /**
+     * 「消した」から外れていて、claim がディスクの `owner.bin`（持ち主 [p]・epoch 0）を読むこと。違う位置 [q] から epoch 0 で claim し、
+     * ディスクを読めば `TAKEN_OVER`（epoch 1）、「消した」のままなら読まずに `KEPT`（epoch 0）になる
+     */
+    private fun assertTakenOverFromDisk(store: MachineSaveStore, id: UUID) {
+        assertTrue(Files.exists(machines.resolve(id.toString()).resolve(OwnerRecord.FILE_NAME)))
+        val reads = store.mainOwnerReads
+        val claim = store.claim(id.toString(), 1, 0, q)
+        assertEquals(ClaimResult.TAKEN_OVER, claim.result)
+        assertEquals(1, claim.identity!!.epoch)
+        assertEquals(reads + 1, store.mainOwnerReads)
+        assertFalse(store.hasUnwrittenOwner(id))
     }
 
     @Test
@@ -241,7 +257,7 @@ class SaveCleanupTest {
         assertTrue(store.deleteUnreferenced(id, Long.MAX_VALUE) { result.complete(it) })
         assertEquals(-1L, result.get(10, java.util.concurrent.TimeUnit.SECONDS))
         assertTrue(Files.exists(machines.resolve(id.toString())))
-        store.cleanupDeletionSkipped(id)
+        store.pollCompleted()
         assertTrue(store.seenThisSession(id))
     }
 
@@ -556,8 +572,66 @@ class SaveCleanupTest {
         }
         assertFalse(cleanup.settling)
         assertTrue(Files.exists(machines.resolve(id.toString())))
-        // 「消した」から外れているので、claim はディスクの owner.bin を読む
+        // 置き場が結果を受け取ると「消した」から外れ、claim はディスクの owner.bin を読む
+        store.pollCompleted()
+        assertTakenOverFromDisk(store, id)
+    }
+
+    @Test
+    fun `削除の仕事を止めたまま打ち切りと諦めを過ぎても、後で見送られた削除は置き場が受け取り、claimが残ったowner_binを読む`() {
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val store = MachineSaveStore(machines, MachineIdIndex(), "test", manual)
+        val judged = Files.getLastModifiedTime(machines.resolve(id.toString())).toMillis()
+        var time = now
+        val cleanup = SaveCleanup(store, null, probe, SaveCleanupSettings(stallMillis = 1000), false, false) { time }
+        // 削除の仕事が列に入ったところまで進める（まだ走らせない）
+        advanceManual(cleanup, manual) { cleanup.phase == SaveCleanup.Phase.DELETE && manual.size > 0 }
+        // 判定の後に更新されたので、削除の仕事は消さずに -1 を返す
+        Files.setLastModifiedTime(store0Generation(id), FileTime.fromMillis(judged + 10_000))
+        // 列が詰まったまま打ち切り
+        time += 1001
+        cleanup.tick()
+        assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
+        assertTrue(cleanup.settling)
+        // 止めた後の待ちも諦める
+        time += 1001
+        cleanup.tick()
+        assertFalse(cleanup.settling)
+        // その後で削除の仕事が走り、見送る。接続層は諦めた掃除をもう tick しない（SaveCleanups.tickRunning が外す）ので、
+        // ここでも cleanup.tick() を呼ばない。取り消しは置き場の pollCompleted だけで届かなければならない
+        manual.runAll()
+        store.pollCompleted()
+        assertEquals(0, cleanup.report.deleted)
+        assertTrue(Files.exists(machines.resolve(id.toString())))
+        assertTakenOverFromDisk(store, id)
+    }
+
+    @Test
+    fun `削除の結果の前にclaimとdeleteが来たIDは、消さなかった結果を受け取っても消したことから外さない`() {
+        val id = previousMachine(p)
+        val manual = ManualSaveExecutor()
+        val index = MachineIdIndex()
+        val store = MachineSaveStore(machines, index, "test", manual)
+        val judged = Files.getLastModifiedTime(machines.resolve(id.toString())).toMillis()
+        Files.setLastModifiedTime(store0Generation(id), FileTime.fromMillis(judged + 10_000))
+        assertTrue(store.deleteUnreferenced(id, judged) {})
+        // 削除の仕事が列で待つ間に claim（「消した」なので KEPT）が来て、続けてプレイヤーが壊す
         assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+        store.delete(id)
+        // ブロックを壊した接続層と同じく、索引から外す
+        index.removeIfOwner(id, p)
+        assertEquals(2, manual.size)
+        // 掃除の削除の仕事だけ走らせる（見送る）。delete の仕事は列に残る
+        assertTrue(manual.runNext())
+        store.pollCompleted()
+        // delete の「消した」は残る: claim は delete の仕事を待たずに、読まずに KEPT
+        val reads = store.mainOwnerReads
+        val claim = store.claim(id.toString(), 1, 0, q)
+        assertEquals(ClaimResult.KEPT, claim.result)
+        assertEquals(0, claim.identity!!.epoch)
+        assertEquals(reads, store.mainOwnerReads)
+        manual.runAll()
     }
 
     @Test
@@ -759,7 +833,8 @@ class SaveCleanupTest {
         assertEquals(0, cleanup.report.deleted)
         assertTrue(Files.exists(machines.resolve(id.toString())))
         // 「消した」にしていないので、claim はディスクの owner.bin を読む
-        assertEquals(ClaimResult.KEPT, store.claim(id.toString(), 1, 0, p).result)
+        store.pollCompleted()
+        assertTakenOverFromDisk(store, id)
     }
 
     @Test
@@ -827,8 +902,10 @@ class SaveCleanupTest {
         val bytes = ArrayList<Long>()
         assertTrue(store.deleteUnreferenced(id, Long.MAX_VALUE) { bytes += it })
         assertEquals(listOf(-1L), bytes)
-        store.cleanupDeletionSkipped(id)
         assertTrue(Files.exists(machines.resolve(id.toString())))
+        // 列が閉じて断られた削除も、置き場が受け取って「消した」から外す
+        store.pollCompleted()
+        assertTakenOverFromDisk(store, id)
         var ran = false
         assertFalse(store.runOnWriter { ran = true })
         assertFalse(ran)
@@ -857,17 +934,19 @@ class SaveCleanupTest {
         assertTrue(Files.exists(stale))
     }
 
-    /** 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する */
+    /**
+     * 書き込みのスレッドの結果を待ちながら、[cleanup] を [done] が真になるまで tick する。壁時計の期限で合否を決めない（#878）。
+     * 止まったときは、呼ぶテストの [Timeout]（保険）が止める
+     */
     private fun runThreaded(cleanup: SaveCleanup, done: () -> Boolean = { cleanup.finished }) {
-        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
         while (!done()) {
             cleanup.tick()
-            check(System.nanoTime() < deadline) { "the cleanup did not finish (${cleanup.phase})" }
             Thread.sleep(1)
         }
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で、ディレクトリとモジュールを掃除する`() {
         val (referenced, unused) = oldModules("referenced", "unused")
         val stale = staleTemp()
@@ -896,14 +975,15 @@ class SaveCleanupTest {
     }
 
     @Test
+    @Timeout(10, unit = java.util.concurrent.TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#878）
     fun `書き込みのスレッドの置き場で止めると、列に残った調べは問いも削除も入れず、結果を受け取りきる`() {
         val (unused) = oldModules("unused")
         val ids = List(20) { previousMachine(MachineOwner("minecraft:overworld", it * 16, 64, 0)) }
         val writer = SaveWriter("kibicomputers-cleanup-test")
         val gate = java.util.concurrent.CountDownLatch(1)
         try {
-            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める
-            assertTrue(writer.execute(UUID.randomUUID()) { gate.await(10, java.util.concurrent.TimeUnit.SECONDS) })
+            // 列の先頭を止めておき、掃除の調べが列に残ったまま止める（門は期限で勝手に開かない。finally で必ず開ける）
+            assertTrue(writer.execute(UUID.randomUUID()) { gate.await() })
             val store = MachineSaveStore(machines, MachineIdIndex(), "test", writer)
             val cleanup = cleanup(store, FileModuleStore(modulesRoot))
             cleanup.tick()
@@ -911,7 +991,8 @@ class SaveCleanupTest {
             assertTrue(cleanup.settling)
             gate.countDown()
             runThreaded(cleanup) { !cleanup.settling }
-            assertTrue(writer.flush(10_000))
+            // 列が空くのを、壁時計の期限で合否を決めずに待つ（#878。止まったときはメソッドの Timeout が落とす）
+            assertTrue(writer.flush(Long.MAX_VALUE))
             repeat(5) { cleanup.tick() }
             assertEquals(SaveCleanup.Phase.CANCELLED, cleanup.phase)
             assertTrue(asked.isEmpty())

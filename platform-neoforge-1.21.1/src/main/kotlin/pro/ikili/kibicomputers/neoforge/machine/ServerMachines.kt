@@ -464,6 +464,8 @@ object ServerMachines {
     private fun onServerAboutToStart(event: ServerAboutToStartEvent) {
         // 前のサーバーのものが残っていれば止める（統合サーバーを開き直したときなど）
         manager?.let { stop(it) }
+        // ワールドごとの時計（#439）も作り直す（統合サーバーを開き直したとき、前のワールドの時計を使い回さない）
+        WorldClocks.clear()
         tracked.clear()
         changedLater.clear()
         rotation.clear()
@@ -618,6 +620,8 @@ object ServerMachines {
         get() = rotation.isCycleDone
 
     private fun onServerTick(event: ServerTickEvent.Pre) {
+        // ゲーム内時間をマシンの時計に写す（#439）。復元・マシンの tick より前に（この tick で戻すマシンが今の値を見る）
+        WorldClocks.publishAll()
         applyConfigIfChanged()
         val t0 = System.nanoTime()
         processCompletions()
@@ -1180,6 +1184,8 @@ object ServerMachines {
     }
 
     private fun onServerStopped(event: ServerStoppedEvent) {
+        // 時計の表だけを空にする（マシンの環境が持つ時計は、最後に写した値のまま残る。#439）
+        WorldClocks.clear()
         val m = manager ?: return
         manager = null
         schedulerConfig = null
