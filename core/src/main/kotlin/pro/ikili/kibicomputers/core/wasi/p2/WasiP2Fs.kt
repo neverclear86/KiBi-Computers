@@ -283,8 +283,8 @@ internal object WasiP2Fs {
      * descriptor [self] の stat（`descriptor.stat` と `descriptor.metadata-hash` が使う）。
      *
      * [OpenFile] は VFS の値、ファイル以外（`/dev/tty` の `Tty`、`/dev/device/<address>` の `DeviceHandle` など）は
-     * p1 の `fd_filestat_get` と同じく、種類だけを持つ全部 0 の値（#865・#885）。オブジェクトはカーネルロックの中で引き、
-     * VFS の I/O はロックの外で呼ぶ。
+     * p1 の `fd_filestat_get` と同じく、種類のほかは node・device・size・時刻が 0 で、`link-count` だけが 1 の値（#865・#885）。
+     * オブジェクトはカーネルロックの中で引き、VFS の I/O はロックの外で呼ぶ。
      */
     private fun descriptorStat(ctx: ProcessContext, self: CanonValue): FileStat {
         val e = P2.entry<DescriptorEntry>(ctx, self)
