@@ -28,7 +28,7 @@ internal object Instrumentation {
      * 後のハッシュを照合する。そのため挿入・変換は決定的であること（同じ入力から同じバイト列。`InstrumentationDeterminismTest`）。
      * 出力を変える変更（燃料のセグメントの切り方、変換の形など）をしたら、この版を上げる
      */
-    const val VERSION: Int = 1
+    const val VERSION: Int = 2
 
     /**
      * [applyDetailed] の結果。
