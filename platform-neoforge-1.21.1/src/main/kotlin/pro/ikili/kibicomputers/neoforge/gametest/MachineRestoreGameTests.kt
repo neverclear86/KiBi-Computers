@@ -376,7 +376,7 @@ object MachineRestoreGameTests {
             val be = level.getBlockEntity(far.pos) as CaseBlockEntity
             be.loadWithComponents(tag, level.registryAccess())
             store.forgetOwnerForTest(saved!!.id)
-            gate = WriterGate()
+            gate = WriterGate(helper)
             // 仕事のない ID の読みは列の外の読み手に回る（#877）ので、そちらも止める
             sideGate = SideReaderGate(helper, store)
             reads = store.mainOwnerReads
@@ -663,12 +663,14 @@ object MachineRestoreGameTests {
         val config = ServerMachines.saveConfig
         // 順番待ちが、書き込みの終わりを十分待つようにする（テストの間だけ）
         ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 60_000)
+        // 途中で落ちても、後のバッチに 60 秒の設定を残さない（#872）
+        restoreSaveConfigWhenDone(helper, config)
         var starts = 0
         var gate: WriterGate? = null
         // onLoad（追跡と索引）を待ってから、書き込みを積む
         helper.runAfterDelay(1) {
             be.computer.prepareUnload()
-            gate = WriterGate()
+            gate = WriterGate(helper)
             helper.assertTrue(be.captureAndSubmit(CapturePolicy.KILL_TRANSIENT) != null, "the case should submit a write")
             // マシンだけを外し（電源の状態は残る）、書き込みの終わりを待つ復元の順番待ちに入れてから、FULL でなくす
             be.computer.chunkUnloaded()
@@ -835,6 +837,8 @@ object MachineRestoreGameTests {
         val config = ServerMachines.saveConfig
         var before: MachineIdentity? = null
         var gate: WriterGate? = null
+        // 途中で落ちても、後のバッチに変えた設定を残さない（#872）
+        restoreSaveConfigWhenDone(helper, config)
         helper.startSequence().thenWaitUntil { assertPrompt(helper, be) }.thenExecute {
             // 前の世代（印なし）を書いておく
             be.computer.prepareUnload()
@@ -849,7 +853,7 @@ object MachineRestoreGameTests {
         }.thenWaitUntil { assertScreenShows(helper, be, MARKED) }.thenExecute {
             // 順番待ちが書き込みの終わりを十分待つようにする（テストの間だけ）
             ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 60_000)
-            gate = WriterGate()
+            gate = WriterGate(helper)
             far.setFull(false)
         }.thenWaitUntil {
             far.assertDemoted(helper)
@@ -899,13 +903,15 @@ object MachineRestoreGameTests {
         val config = ServerMachines.saveConfig
         var gate: WriterGate? = null
         var starts = 0
+        // 途中で落ちても、後のバッチに期限 0 ms の設定を残さない（#872）
+        restoreSaveConfigWhenDone(helper, config)
         var before = RestoreStats.now()
         helper.startSequence().thenWaitUntil { assertPrompt(helper, be) }.thenExecute {
             // 順番が来たら、書き込みを待たずに期限切れにする（テストの間だけ）
             ServerMachines.saveConfig = config.copy(restoreWriteWaitMillis = 0)
             starts = be.restoreStarts
             before = RestoreStats.now()
-            gate = WriterGate()
+            gate = WriterGate(helper)
             far.setFull(false)
         }.thenWaitUntil {
             far.assertDemoted(helper)
