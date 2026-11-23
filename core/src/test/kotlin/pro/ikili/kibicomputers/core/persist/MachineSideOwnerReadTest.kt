@@ -16,10 +16,15 @@ import java.util.concurrent.TimeUnit
  * 待ちにした claim の `owner.bin` を、書き込みの列の外の読み手で読む（#877、ADR 0084 の規則 7a）のテスト。
  * その ID の仕事が列に残っていなければ、ほかの ID の仕事で列が詰まっていても読み手が読んで決まり、残っていれば今までどおり列の後ろで読む。
  * 読み手が開いている間は、書き込みのスレッドがその ID の `owner.bin` を置き換えない。
- * 読み手（実スレッド）の結果は壁時計の期限で合否を決めずに待つ（#878）。クラスの [Timeout] は、止まったときの保険で、合否の基準ではない
+ * 読み手（実スレッド）の結果は壁時計の期限で合否を決めずに待つ（#878。待ちの上限 `claimWaitMillis` も 1 日にして、上限で決まらないようにしている）。
+ * クラスの [Timeout] は、止まったときの保険で、合否の基準ではない
  */
 @Timeout(10, unit = TimeUnit.MINUTES)
 class MachineSideOwnerReadTest {
+    private companion object {
+        val CLAIM_WAIT_MILLIS: Long = TimeUnit.DAYS.toMillis(1)
+    }
+
     @TempDir
     lateinit var dir: Path
 
@@ -33,8 +38,13 @@ class MachineSideOwnerReadTest {
         override fun toString() = name
     }
 
-    private fun store(manual: ManualSaveExecutor, claimWaitMillis: Long = MachineSaveConfig.DEFAULT_WRITER_FLUSH_MILLIS) =
-        MachineSaveStore(dir, MachineIdIndex(), "test", manual, claimWaitMillis = claimWaitMillis, sideOwnerReads = true)
+    /**
+     * 待ちの上限（`claimWaitMillis`）は、壁時計で合否が決まらないように 1 日にしてある（#878）。
+     * 上限を過ぎた claim は読み手の結果を待たずに `NEW_ID_UNREADABLE` で決まるので、既定の 30 秒だと、読み手（実スレッド）が遅れた負荷の高い CI で落ちる。
+     * 上限に届かず読み手が決めたことは、結果が `KEPT` で `deferredClaimTimeouts` が 0 であることで確かめる
+     */
+    private fun store(manual: ManualSaveExecutor) =
+        MachineSaveStore(dir, MachineIdIndex(), "test", manual, claimWaitMillis = CLAIM_WAIT_MILLIS, sideOwnerReads = true)
 
     /** [store] の待ちを、[expected] 件そろうまで [MachineSaveStore.pollDeferredClaims] で受け取る（期限なし。#878） */
     private fun pollUntil(store: MachineSaveStore, expected: Int): List<DeferredClaim> {
@@ -56,8 +66,7 @@ class MachineSideOwnerReadTest {
         val ids = List(20) { UUID.randomUUID() }
         for (id in ids) writeOwner(id, OwnerRecord(0, at(1)))
         val manual = ManualSaveExecutor()
-        // 上限を短くしても、読み手が読むので上限には届かない
-        val store = store(manual, claimWaitMillis = 5_000)
+        val store = store(manual)
         // ほかの台の仕事で列を詰める（走らせない）
         repeat(50) { store.delete(UUID.randomUUID()) }
         val queued = manual.size
@@ -68,13 +77,10 @@ class MachineSideOwnerReadTest {
         assertEquals(20, store.sideOwnerReadRequests)
         assertEquals(0, store.writerOwnerReadRequests, "書き込みの列には入れない")
         assertEquals(queued, manual.size)
-        val start = System.nanoTime()
         val done = pollUntil(store, ids.size)
-        val millis = (System.nanoTime() - start) / 1_000_000
         assertEquals(keys.toSet(), done.map { it.key }.toSet())
         for (d in done) assertEquals(ClaimResult.KEPT, d.claim.result)
-        assertTrue(millis < 5_000, "上限より前に決まる（$millis ms）")
-        assertEquals(0, store.deferredClaimTimeouts)
+        assertEquals(0, store.deferredClaimTimeouts, "上限で決まったのではなく、読み手が読んで決まった")
         assertEquals(0, store.mainOwnerReads, "メインスレッドで読まない")
         assertEquals(queued, manual.size, "列の仕事は 1 つも走っていない")
         assertTrue(store.close(10_000))
@@ -116,21 +122,22 @@ class MachineSideOwnerReadTest {
             OwnerRecord.read(path)
         }
         assertEquals(null, store.claimOrDefer(id.toString(), 0, 0, at(2), Key("waiting")))
-        val writer: Thread
+        var writer: Thread? = null
         try {
             opened.await()
             // 読み手が開いている間に、マシンのある台の同期の claim が引き取る（owner.bin を書く仕事が列に入る）
             assertEquals(ClaimResult.TAKEN_OVER, store.claim(id.toString(), 0, 0, at(1)).result)
-            writer = Thread { manual.runAll() }.apply { start() }
+            val started = Thread { manual.runAll() }.apply { start() }
+            writer = started
             // 待たされていることを確かめる（負荷が高いほど通りやすい向きなので、短い時間のままでよい）
-            writer.join(300)
-            assertTrue(writer.isAlive, "書き込みのスレッドは、読み手が読み終えるのを待つ")
+            started.join(300)
+            assertTrue(started.isAlive, "書き込みのスレッドは、読み手が読み終えるのを待つ")
             assertEquals(OwnerRecord(0, at(0)), OwnerRecord.read(ownerFile(id)), "まだ置き換えていない")
         } finally {
-            // 途中で落ちても、止めた読み手を放す
+            // 途中で落ちても、止めた読み手を放し、書き込みのスレッドが終わるのを待つ（@TempDir の掃除と重ならないように）
             release.countDown()
+            writer?.join()
         }
-        writer.join()
         assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(ownerFile(id)))
         // 待っていた写しは、引き取った台が索引にいるので重複になる（覚えている owner.bin で判定し直す）
         val done = pollUntil(store, 1)

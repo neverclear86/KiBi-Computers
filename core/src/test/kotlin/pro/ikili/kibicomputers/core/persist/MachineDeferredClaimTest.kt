@@ -86,10 +86,10 @@ class MachineDeferredClaimTest {
             assertTrue(store.pollDeferredClaims().isEmpty(), "読み終わるまでは決まらない")
             assertNull(store.index.ownerOf(urgent), "待つ間は索引に入れない")
         } finally {
-            // 途中で落ちても、止めた先読みのスレッドを放す
+            // 途中で落ちても、止めた先読みのスレッドを放し、終わるのを待つ（@TempDir の掃除と重ならないように）
             release.countDown()
+            thread?.join()
         }
-        thread!!.join()
         assertEquals(urgent, opened[2], "待っている ID を順番より先に読む")
         // 先読みのスレッドが終わったので、待ちの ID の結果はすべて入っている（1 回の poll で決まる）
         val done = store.pollDeferredClaims()
