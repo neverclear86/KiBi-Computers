@@ -15,6 +15,7 @@ import net.minecraft.world.entity.player.ChatVisiblity
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.chunk.status.ChunkStatus
 import net.minecraft.world.level.portal.DimensionTransition
 import net.minecraft.world.phys.Vec3
 import net.neoforged.neoforge.gametest.GameTestHolder
@@ -437,7 +438,7 @@ object ScreenSyncGameTests {
      * チャンクは送ったものと数えない。#655）。
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600)
     fun changingDimensionStopsWatching(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
         val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
@@ -454,9 +455,11 @@ object ScreenSyncGameTests {
             .thenExecute {
                 val nether = helper.level.server.getLevel(Level.NETHER)
                 helper.assertTrue(nether != null, "the nether should exist on the test server")
+                // ネザーの (0, 0) を先に作っておく。遅いマシンでは、移ってから生成するとタイムアウトまでに届かないことがある
+                nether!!.getChunk(netherChunk.x, netherChunk.z, ChunkStatus.FULL, true)
                 val sent = ScreenSync.traffic.bytesSent(player)
                 val moved = player.changeDimension(
-                    DimensionTransition(nether!!, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
+                    DimensionTransition(nether, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
                 )
                 helper.assertTrue(moved === player, "a player keeps its object when changing dimension")
                 helper.assertTrue(player.level() === nether, "the player should be in the nether")
