@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.runtime.Instrumentation
 import pro.ikili.kibicomputers.core.runtime.TestWasiP1
 import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
@@ -152,10 +153,10 @@ class AsyncifyLivenessTest {
         return out
     }
 
-    /** `w.wait() -> i32` を import し、i32 のローカルを1つ持つ `run() -> i32`（本体は [code]。`end` を含めない）を export するモジュール */
-    private fun runModule(code: ByteArray, tag: Boolean = false): ByteArray {
+    /** `w.wait() -> i32` を import し、i32 のローカルを [locals] 個持つ `run() -> i32`（本体は [code]。`end` を含めない）を export するモジュール */
+    private fun runModule(code: ByteArray, tag: Boolean = false, locals: Int = 1): ByteArray {
         val types = vec(listOf(bytes(0x60, 0x00, 0x01, 0x7F), bytes(0x60, 0x00, 0x00)))
-        val body = bytes(0x01, 0x01, 0x7F) + code + bytes(0x0B)
+        val body = bytes(0x01) + WasmBinary.uleb(locals.toLong()) + bytes(0x7F) + code + bytes(0x0B)
         val sections = mutableListOf(
             1 to types,
             2 to vec(listOf(name("w") + name("wait") + bytes(0x00, 0x00))),
@@ -236,5 +237,102 @@ class AsyncifyLivenessTest {
         for (debug in AsyncifyDebug.entries) assertEquals(42L, runWithWait(dead, debug), "$debug")
         assertEquals(0, Asyncify.transform(dead, setOf("w.wait")).maxLocals)
         assertEquals(2, Asyncify.transform(dead, setOf("w.wait"), debug = AsyncifyDebug.SAVE_ALL).maxLocals)
+    }
+
+    @Test
+    fun `入れ子のtry_tableでは、外側のcatch先だけで読むローカルも退避する`() {
+        // local 0 = 42; block $A (block $B (try_table (catch_all $A) (try_table (catch_all $B) call wait; drop)) i32.const 7; return) <最後に読む>
+        fun nested(last: ByteArray) = runModule(
+            bytes(
+                0x41, 0x2A, 0x21, 0x00,
+                0x02, 0x40,
+                0x02, 0x40,
+                0x1F, 0x40, 0x01, 0x02, 0x01,
+                0x1F, 0x40, 0x01, 0x02, 0x01,
+                0x10, 0x00, 0x1A,
+                0x0B,
+                0x0B,
+                0x0B,
+                0x41, 0x07, 0x0F,
+                0x0B,
+            ) + last,
+        )
+        val reads = nested(bytes(0x20, 0x00))
+        for (debug in AsyncifyDebug.entries) assertEquals(7L, runWithWait(reads, debug), "$debug")
+        assertEquals(1, Asyncify.transform(reads, setOf("w.wait")).maxLocals)
+        // 外側の catch 先で読まなければ、退避しない
+        assertEquals(0, Asyncify.transform(nested(bytes(0x41, 0x09)), setOf("w.wait")).maxLocals)
+    }
+
+    @Test
+    fun `追えない分岐のbr_on_nullは、解析に届く前に変換を断る`() {
+        // call wait; ref.null func; br_on_null 0; drop（ADR 0329。GC の br_on_* を持つ止まりうる関数は読み込めない）
+        val wasm = runModule(bytes(0x10, 0x00, 0xD0, 0x70, 0xD5, 0x00, 0x1A))
+        for (debug in AsyncifyDebug.entries) {
+            assertThrows<AsyncifyUnsupported>("$debug") { Asyncify.transform(wasm, setOf("w.wait"), debug = debug) }
+        }
+    }
+
+    /** ローカルが [locals] 個、空のブロックが [blocks] 組ある関数（解析の大きさは、ほぼ blocks × 2 × (locals / 64)） */
+    private fun bigFunction(locals: Int, blocks: Int): ByteArray {
+        val empty = bytes(0x02, 0x40, 0x0B)
+        var code = bytes(0x41, 0x2A, 0x21, 0x00, 0x10, 0x00, 0x1A)
+        repeat(blocks) { code += empty }
+        return runModule(code + bytes(0x20, 0x00), locals = locals)
+    }
+
+    @Test
+    fun `解析の上限を超えた関数は、すべて退避する今までの形で変換され、巻き戻して正しく動く`() {
+        // ローカル 20,000 個 = 313 語。上限（2^20 語）は約 3,350 ブロック
+        val small = bigFunction(locals = 20_000, blocks = 100)
+        val over = bigFunction(locals = 20_000, blocks = 3_000)
+        val live = Asyncify.transform(small, setOf("w.wait"))
+        val all = Asyncify.transform(small, setOf("w.wait"), debug = AsyncifyDebug.SAVE_ALL)
+        assertEquals(1, live.maxLocals)
+        assertTrue(all.maxLocals >= 20_000, "${all.maxLocals}")
+
+        val overLive = Asyncify.transform(over, setOf("w.wait"))
+        val overAll = Asyncify.transform(over, setOf("w.wait"), debug = AsyncifyDebug.SAVE_ALL)
+        assertEquals(overAll.maxLocals, overLive.maxLocals)
+        assertEquals(overAll.savedLocals, overLive.savedLocals)
+        // 切り替えは入力だけで決まり、出力は決定的で、すべて退避する形と同じバイト列になる
+        assertArrayEquals(overAll.bytes, overLive.bytes)
+        assertArrayEquals(overLive.bytes, Asyncify.transform(over, setOf("w.wait")).bytes)
+        for (debug in AsyncifyDebug.entries) assertEquals(42L, runWithWait(over, debug), "$debug")
+        for (debug in AsyncifyDebug.entries) assertEquals(42L, runWithWait(small, debug), "$debug")
+    }
+
+    @Test
+    fun `深く入れ子にしたtry_tableの中に呼び出しが多くても、解析の確保は命令の数に比例する`() {
+        // try_table (catch_all) を depth 段入れ子にして、その中に空の関数への call を calls 個並べる
+        // （命令ごとに囲むすべての catch 先の配列を作る形だと、確保が depth × calls になる）
+        val depth = 1_000
+        val calls = 100_000
+        val types = vec(listOf(bytes(0x60, 0x00, 0x01, 0x7F), bytes(0x60, 0x00, 0x00)))
+        var code = bytes(0x41, 0x2A, 0x21, 0x00, 0x10, 0x00, 0x1A, 0x02, 0x40)
+        repeat(depth) { code += bytes(0x1F, 0x40, 0x01, 0x02, 0x00) }
+        repeat(calls) { code += bytes(0x10, 0x02) }
+        repeat(depth) { code += bytes(0x0B) }
+        code += bytes(0x0B, 0x20, 0x00)
+        val run = bytes(0x01, 0x01, 0x7F) + code + bytes(0x0B)
+        val nop = bytes(0x00, 0x0B)
+        val wasm = module(
+            1 to types,
+            2 to vec(listOf(name("w") + name("wait") + bytes(0x00, 0x00))),
+            3 to vec(listOf(bytes(0x00), bytes(0x01))),
+            7 to vec(listOf(name("run") + bytes(0x00, 0x01))),
+            10 to vec(listOf(WasmBinary.uleb(run.size.toLong()) + run, WasmBinary.uleb(nop.size.toLong()) + nop)),
+        )
+        val threads = java.lang.management.ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        fun allocated(debug: AsyncifyDebug): Long {
+            val before = threads.getThreadAllocatedBytes(Thread.currentThread().id)
+            Asyncify.transform(wasm, setOf("w.wait"), debug = debug)
+            return threads.getThreadAllocatedBytes(Thread.currentThread().id) - before
+        }
+        val all = allocated(AsyncifyDebug.SAVE_ALL)
+        val live = allocated(AsyncifyDebug.NONE)
+        // 解析の分の確保は、すべて退避する形よりわずかしか増えない（命令ごとに全部の catch 先の配列を作ると、約 400 MB 増える）
+        assertTrue(live < all + 96L * 1024 * 1024, "SAVE_ALL $all, 生存解析 $live")
+        assertEquals(42L, runWithWait(wasm, AsyncifyDebug.NONE))
     }
 }

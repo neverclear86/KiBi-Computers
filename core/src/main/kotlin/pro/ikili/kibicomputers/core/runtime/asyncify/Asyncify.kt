@@ -252,8 +252,12 @@ private const val UNWINDING = 1
 private const val REWINDING = 2
 
 /**
- * 生存解析（#338）の大きさの上限: 基本ブロックの数 × ローカル変数の 64 個の組の数。超えた関数は、すべてのローカルを退避する（今までの形）。
- * 1 つのビット集合の配列が 8 MiB（3 本で 24 MiB）になる大きさ。lua.wasm のいちばん大きい関数でも、この 1% 未満
+ * 生存解析（#338）の大きさの上限: 解析の頂点の数（基本ブロックと、`try_table` の catch 先の節）× ローカル変数の 64 個の組の数。
+ * 超えた関数は、すべてのローカルを退避する（今までの形）。1 つのビット集合の配列が 8 MiB（3 本で 24 MiB）になる大きさ。
+ * lua.wasm のいちばん大きい関数でも、この 1% 未満。
+ *
+ * ビット集合のほかに作る配列（頂点ごとの後続など）は、関数の命令の数とバイト数に比例する大きさ（命令ごとに、囲む catch 先の数に比例する配列は作らない）。
+ * 基本ブロックの数が上限を超えると決まった時点で、後続の配列を作る前にやめる。組み立てのループでも [Transformer.checkpoint] を呼ぶ（時間の上限。#40）
  */
 private const val LIVENESS_LIMIT_WORDS = 1L shl 20
 
@@ -941,10 +945,12 @@ private class Transformer(
          *
          * 関数の本体の制御フロー（分岐・loop の後ろ向きの辺・`br_table`・`try_table` の catch 先への辺）で後ろ向きの生存解析をする。
          * catch 先への辺は、`try_table` の中の投げうる命令（呼び出しと `throw`・`throw_ref`）から、囲むすべての `try_table` の catch 先へ張る
-         * （止まった呼び出しが、再開した後で投げうる）。
+         * （止まった呼び出しが、再開した後で投げうる）。囲むものすべてへ命令ごとに辺を張ると、確保が「命令の数 × 入れ子の深さ」になるので、
+         * `try_table` ごとに「自分の catch 先と外側の節」を持つ節の頂点を 1 つ作り、命令からは内側の節 1 つへだけ辺を張る（頂点は命令の数に比例）。
          *
-         * 解析が大きすぎる（基本ブロックの数 × ローカルの数が [LIVENESS_LIMIT_WORDS] の 64 倍を超える）か、追えない分岐の命令があれば `null`
-         * （すべてを退避する）。どちらに切り替えるかは入力だけで決まる（決定的。`Instrumentation.VERSION`）
+         * 解析が大きすぎる（頂点の数 × ローカルの数が [LIVENESS_LIMIT_WORDS] の 64 倍を超える）と `null`（すべてを退避する）。
+         * 追えない分岐（GC の `br_on_*`）の命令があっても `null` にするが、それらは [emitSuspendBody] が先に断る（変換できない作りとして読み込みを断る）ので、
+         * 実際にはここまで来ない。どちらに切り替えるかは入力だけで決まる（決定的。`Instrumentation.VERSION`）
          */
         private fun liveAcrossWaitPoints(): BooleanArray? {
             val n = list.size
@@ -973,12 +979,19 @@ private class Transformer(
             fun mayThrow(op: OpCode) = op == OpCode.CALL || op == OpCode.CALL_INDIRECT || op == OpCode.CALL_REF ||
                 op == OpCode.THROW || op == OpCode.THROW_REF
 
-            // 基本ブロックに分け、それぞれの後続（命令の番号）を求める
+            val words = (nl + 63) ushr 6
+            if (words == 0) return BooleanArray(0)
+
+            // 基本ブロックに分け、それぞれの後続を求める。後続は、0 以上なら命令の番号（その命令のあるブロック）、負なら catch 先の節 `-(k + 1)`。
+            // 投げうる命令から囲むすべての catch 先への辺は、命令ごとに配列を作らず、`try_table` ごとの節（自分の catch 先と、外側の節）を
+            // 1 つ作って、そこを通して張る（確保する量を、命令の数に比例する大きさに抑える）
             val blockOf = IntArray(n)
             val starts = ArrayList<Int>()
             val succIns = ArrayList<IntArray>()
             val labels = ArrayList<Int>() // 開いている構造（内側が最後）
-            val catches = ArrayList<IntArray>() // 開いている構造ごとの、囲む try_table の catch 先（累積）
+            val handlerStack = ArrayList<Int>() // 開いている構造ごとの、いちばん内側の囲む節（なければ -1）
+            val handlerTargets = ArrayList<IntArray>() // 節ごとの、自分の catch 先（命令の番号）
+            val handlerOuter = ArrayList<Int>() // 節ごとの、外側の節（なければ -1）
             var prevEnder = true
             val empty = IntArray(0)
 
@@ -988,28 +1001,35 @@ private class Transformer(
                 return if (ops[s] == OpCode.LOOP) s else match[s]
             }
             for (i in 0 until n) {
+                // 大きな関数でも、時間の上限（#40）が効くようにする
+                if ((i and 0x3FF) == 0x3FF) checkpoint()
                 val op = ops[i]
                 if (prevEnder || structural(op)) {
                     if (starts.isNotEmpty() && succIns.size < starts.size) succIns += intArrayOf(i)
                     starts += i
+                    // 上限を超えると決まったら、後続の配列などを作る前にやめる
+                    if (starts.size.toLong() * words > LIVENESS_LIMIT_WORDS) return null
                 }
                 blockOf[i] = starts.size - 1
-                val inTry = catches.isNotEmpty() && catches.last().isNotEmpty()
+                val handler = if (handlerStack.isEmpty()) -1 else handlerStack.last()
                 val end = endOf[list[i]]!!
                 var succ: IntArray? = null
                 when (op) {
                     OpCode.BLOCK, OpCode.LOOP, OpCode.TRY_TABLE, OpCode.IF -> {
-                        val outer = if (catches.isEmpty()) empty else catches.last()
-                        var own = outer
+                        var own = handler
                         if (op == OpCode.TRY_TABLE) {
                             val r = Reader(wasm, blockSig(list[i]).third, end)
                             val c = r.leb().toInt()
-                            val t = IntArray(c) {
-                                val kind = r.u8()
-                                if (kind == 0 || kind == 1) r.leb()
-                                target(r.leb())
+                            if (c > 0) {
+                                val t = IntArray(c) {
+                                    val kind = r.u8()
+                                    if (kind == 0 || kind == 1) r.leb()
+                                    target(r.leb())
+                                }
+                                handlerTargets += t
+                                handlerOuter += handler
+                                own = handlerTargets.size - 1
                             }
-                            own = outer + t
                         }
                         succ = if (op == OpCode.IF) {
                             intArrayOf(i + 1, if (elseOfIf[i] >= 0) elseOfIf[i] + 1 else match[i])
@@ -1017,13 +1037,13 @@ private class Transformer(
                             intArrayOf(i + 1)
                         }
                         labels += i
-                        catches += own
+                        handlerStack += own
                     }
                     OpCode.ELSE -> succ = intArrayOf(match[ifOfElse[i]])
                     OpCode.END -> {
                         if (labels.isNotEmpty()) {
                             labels.removeAt(labels.size - 1)
-                            catches.removeAt(catches.size - 1)
+                            handlerStack.removeAt(handlerStack.size - 1)
                         }
                         succ = if (i + 1 < n) intArrayOf(i + 1) else empty
                     }
@@ -1035,24 +1055,37 @@ private class Transformer(
                         succ = IntArray(c + 1) { target(r.leb()) }
                     }
                     OpCode.RETURN, OpCode.UNREACHABLE, OpCode.RETURN_CALL, OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF -> succ = empty
-                    OpCode.THROW, OpCode.THROW_REF -> succ = if (inTry) catches.last() else empty
+                    OpCode.THROW, OpCode.THROW_REF -> succ = if (handler >= 0) intArrayOf(-(handler + 1)) else empty
+                    // 追えない分岐。ただし、これらは emitSuspendBody が先に断るので、ここには来ない（保険）
                     OpCode.BR_ON_NULL, OpCode.BR_ON_NON_NULL, OpCode.BR_ON_CAST, OpCode.BR_ON_CAST_FAIL -> return null
-                    else -> if (inTry && mayThrow(op)) succ = intArrayOf(i + 1) + catches.last()
+                    else -> if (handler >= 0 && mayThrow(op)) succ = intArrayOf(i + 1, -(handler + 1))
                 }
                 prevEnder = succ != null
                 if (succ != null) succIns += succ
             }
             if (succIns.size < starts.size) succIns += empty
             val blocks = starts.size
-            val words = (nl + 63) ushr 6
-            if (words == 0) return BooleanArray(0)
-            if (blocks.toLong() * words > LIVENESS_LIMIT_WORDS) return null
-            val succ = Array(blocks) { b -> succIns[b].map { blockOf[it] }.distinct().toIntArray() }
+            val nodes = blocks + handlerTargets.size
+            if (nodes.toLong() * words > LIVENESS_LIMIT_WORDS) return null
+            fun nodeOf(x: Int) = if (x >= 0) blockOf[x] else blocks - x - 1
+
+            // 節の後続は、自分の catch 先と外側の節
+            val succ = Array(nodes) { v ->
+                val raw = if (v < blocks) {
+                    succIns[v]
+                } else {
+                    val k = v - blocks
+                    val outer = handlerOuter[k]
+                    val t = handlerTargets[k]
+                    if (outer >= 0) t + (-(outer + 1)) else t
+                }
+                distinctNodes(IntArray(raw.size) { nodeOf(raw[it]) })
+            }
             fun blockEnd(b: Int) = if (b + 1 < blocks) starts[b + 1] else n
 
             // ブロックごとの gen（先に読む）と kill（先に書く）
-            val gen = LongArray(blocks * words)
-            val kill = LongArray(blocks * words)
+            val gen = LongArray(nodes * words)
+            val kill = LongArray(nodes * words)
             for (b in 0 until blocks) {
                 val base = b * words
                 for (i in blockEnd(b) - 1 downTo starts[b]) {
@@ -1068,13 +1101,13 @@ private class Transformer(
                 }
             }
             // 不動点まで（後ろのブロックから）
-            val liveIn = LongArray(blocks * words)
+            val liveIn = LongArray(nodes * words)
             val tmp = LongArray(words)
             var changed = true
             while (changed) {
                 checkpoint()
                 changed = false
-                for (b in blocks - 1 downTo 0) {
+                for (b in nodes - 1 downTo 0) {
                     tmp.fill(0)
                     for (s in succ[b]) for (w in 0 until words) tmp[w] = tmp[w] or liveIn[s * words + w]
                     val base = b * words
@@ -1102,6 +1135,15 @@ private class Transformer(
                 }
             }
             return BooleanArray(nl) { result[it ushr 6] and (1L shl (it and 63)) != 0L }
+        }
+
+        /** [a] の重複を除く（順番は問わない。箱に入れずに、小さな配列のまま） */
+        private fun distinctNodes(a: IntArray): IntArray {
+            if (a.size < 2) return a
+            a.sort()
+            var m = 1
+            for (j in 1 until a.size) if (a[j] != a[j - 1]) a[m++] = a[j]
+            return if (m == a.size) a else a.copyOf(m)
         }
 
         /** `local.get`・`local.set`・`local.tee` の元のローカルの番号。それ以外は `null` */
