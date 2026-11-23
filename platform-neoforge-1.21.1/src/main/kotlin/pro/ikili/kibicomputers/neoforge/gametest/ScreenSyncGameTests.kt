@@ -455,8 +455,16 @@ object ScreenSyncGameTests {
             .thenExecute {
                 val nether = helper.level.server.getLevel(Level.NETHER)
                 helper.assertTrue(nether != null, "the nether should exist on the test server")
-                // ネザーの (0, 0) を先に作っておく。遅いマシンでは、移ってから生成するとタイムアウトまでに届かないことがある
-                nether!!.getChunk(netherChunk.x, netherChunk.z, ChunkStatus.FULL, true)
+                checkNotNull(nether)
+                // ネザーの (0, 0) とその周り 1 チャンクを、この tick の中で作り切っておく。(0, 0) を送れる状態（ブロックが
+                // tick する段）にするには周りも FULL になっている必要がある。移ってから生成させると、生成はワーカーの
+                // スレッドで実時間をかけて進む一方、遅れを取り戻すサーバーは tick を続けて回すので、tick で数える
+                // タイムアウトが先に来ることがある（CI で、生成の途中に 600 tick を 1 秒ほどで使い切った）
+                for (dx in -1..1) {
+                    for (dz in -1..1) {
+                        nether.getChunk(netherChunk.x + dx, netherChunk.z + dz, ChunkStatus.FULL, true)
+                    }
+                }
                 val sent = ScreenSync.traffic.bytesSent(player)
                 val moved = player.changeDimension(
                     DimensionTransition(nether, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
