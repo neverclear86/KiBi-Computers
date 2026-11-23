@@ -329,7 +329,8 @@ class StackExhaustionLockTest {
             val otherProgress = AtomicInteger()
             val sameSpin = m.spawnRt(h.program(spinForever(sameProgress)), runDriver(kind))
             val otherSpin = other.spawnRt(h.program(spinForever(otherProgress)), runDriver(kind))
-            h.tickUntilTrue("spin が動かない") { sameProgress.get() > 0 && otherProgress.get() > 0 }
+            val starting = { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), null, tally) }
+            awaitOrClassify(ticker, "spin が動く", starting) { sameProgress.get() > 0 && otherProgress.get() > 0 }
             val permits = config.maxConcurrentMachines
             // Body.BLOCK: 犠牲のプロセスが block で待ちに入ったら、1 バイト書いて起こす（待ちに入ったのを見てから書く。先に書くと、
             // block がすぐそろう道しか通らない）。
@@ -448,13 +449,12 @@ class StackExhaustionLockTest {
                 if (position.isLock) {
                     fail("スタックがロックを取る・放す途中で尽きた（$where）: ${state(h, m, rt)}")
                 }
-                // ほかのスレッドから、マシンのロックが取れる（持ったまま死んだスレッドがいない）
-                assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$where）: ${m.lock}")
-                m.lock.unlock()
+                // ほかのスレッドから、マシンのロックが取れる（持ったまま死んだスレッドがいない）。負荷の下の遅れと、持ったまま残った
+                // 停止を見分ける（#905）
+                awaitLockAcquirable(ticker, "マシンのロックが取れる（$where）", m.lock) { "${m.lock}、${describe()}" }
                 // 表示デバイス・ディスクのリースのロックも残っていない（残るとメインスレッドの描画・同じディスクが止まる）
                 for (l in extraLocks) {
-                    assertTrue(l.tryLock(5, TimeUnit.SECONDS), "ほかのロックが取れない（$where）: $l")
-                    l.unlock()
+                    awaitLockAcquirable(ticker, "ほかのロックが取れる（$where）", l) { "$l、${describe()}" }
                 }
                 if (body == Body.DISK_IO) {
                     // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイルは、本番では fd の表がプロセスの終わりに閉じる。ここでは
@@ -481,16 +481,16 @@ class StackExhaustionLockTest {
             }
             m.stop()
             other.stop()
-            awaitOrClassify(ticker, "マシンが止まる", { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), null, tally) }) {
+            val stopping = { diagnose(h, ticker, listOf(m to sameSpin, other to otherSpin), null, tally) }
+            awaitOrClassify(ticker, "マシンが止まる", stopping) {
                 m.state == MachineState.STOPPED && other.state == MachineState.STOPPED
             }
-            // CPU は誰も持っておらず、待ち手もいない。許可はすべて戻った
-            eventually { m.cpu.currentOwner == null && m.cpu.waiting == 0 }
-            eventually(message = "許可が戻らない: ${h.scheduler.permits.availablePermits()}") { h.scheduler.permits.availablePermits() == permits }
-            assertEquals(0, h.scheduler.permits.waiting)
-            // STOPPED になった直後は、最後のプロセススレッドが終わりの後始末でロックを持っていることがある（取り合いの下で見える）。
-            // ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
-            eventually(message = "マシンのロックが放されない: ${m.lock}") { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
+            // CPU は誰も持っておらず、待ち手もいない。許可はすべて戻り、待ち手もいない（固定の待ちでなく、遅れと停止を見分ける。#905）
+            awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
+            awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, permits) }
+            // STOPPED になった直後は、最後のプロセススレッドが終わりの後始末でロックを持っていることがある（取り合いの下で見える。
+            // 負荷の下では一瞬で済まないことがある）。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
+            awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
         } finally {
             stopWaker.set(true)
             waker?.join(5_000)
