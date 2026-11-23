@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.block.Blocks
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.MachineSaveStore
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
@@ -82,6 +83,29 @@ internal class WriterGate(helper: GameTestHelper? = null) : AutoCloseable {
         /** テストの終わりに必ず放すゲートの、念のための上限 */
         const val HELD_LIMIT_SECONDS = 1_800L
     }
+}
+
+/**
+ * GameTest 用: [ServerMachines.saveConfig] を、テストが終わったとき（成功・失敗・タイムアウト）に [original] へ戻す（#872）。
+ * 設定を変えたテストが途中で落ちると、成功の経路の戻しを通らず、後のバッチの復元のテストが変えた値（期限 0 ms など）のまま走って連鎖して落ちる。
+ * 成功の経路で途中に戻すテストは、その戻しも残してよい（同じ値をもう一度入れるだけ）
+ */
+internal fun restoreSaveConfigWhenDone(helper: GameTestHelper, original: MachineSaveConfig) {
+    helper.testInfo.addListener(
+        object : GameTestListener {
+            override fun testStructureLoaded(info: GameTestInfo) {}
+
+            override fun testPassed(info: GameTestInfo, runner: GameTestRunner) {
+                ServerMachines.saveConfig = original
+            }
+
+            override fun testFailed(info: GameTestInfo, runner: GameTestRunner) {
+                ServerMachines.saveConfig = original
+            }
+
+            override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+        },
+    )
 }
 
 /**

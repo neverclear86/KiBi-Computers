@@ -93,9 +93,10 @@ object LoadGameTests {
 
     /**
      * 起動（上限 15,000 tick）と出力を待つ間（上限 10,000 tick）、ほかの段階を足しても収まる長さ。
-     * 書き込みの終わりの待ちを tick で数えるようにした分（1 つの段階で多くて 6,000 tick。待つ段階は多くて AUTOSAVE と UNLOAD の 2 つなので 12,000 tick。#854）を足してある
+     * 書き込みの終わりの待ちを tick で数えるようにした分（1 つの段階で多くて 6,000 tick。待つ段階は多くて AUTOSAVE と UNLOAD の 2 つなので 12,000 tick。#854）と、
+     * UNLOAD の測る区間の後にアンロードの列を流す上限（[LoadRun.UNLOAD_DRAIN_TIMEOUT_TICKS] の 2,000 tick。#872）を足してある
      */
-    private const val CI_TIMEOUT_TICKS = 42_000
+    private const val CI_TIMEOUT_TICKS = 44_000
     private const val MEASURE_TIMEOUT_TICKS = 200_000
 
     /** 実際のサーバーの1 tick（20 TPS） */
@@ -149,14 +150,21 @@ object LoadGameTests {
         val massUnload = os == LoadOs.STANDARD
         val settings = LoadSettings(
             os = os, count = CI_COUNT, busy = CI_BUSY, paced = false, warmupTicks = 20, measureTicks = 100, massUnload = massUnload,
+            // 急いで回す試験は、重いマシンで tick に時間が残らず、バニラがアンロードの列を流さない。測る区間の後に流す（#872）
+            drainUnloadsAfterWindow = massUnload,
             computeProcesses = COMPUTE_PROCESSES,
         )
         LoadRun(helper, settings) { report ->
             LOGGER.info("Load test (CI, {})\n{}", os.id, report.toMarkdown())
             if (massUnload) {
-                // 強制読み込みを外したら、ケースのあるチャンクが全部アンロードされる（#540）
+                // 強制読み込みを外したら、ケースのあるチャンクが全部アンロードされる（#540）。測る区間の中で終わらなかった分は、
+                // 区間の後に列を流してから見る（#872。tick に時間が残らないとバニラが列を流さないため）。KiBi の積み直しが終わらない・
+                // チケットが残るなど、アンロードを止め続けるものは、流しても残るので落ちる
                 val unload = report.unload!!
-                helper.assertTrue(unload.stillLoaded == 0, "all chunks with cases should unload after the force loading is removed: $unload")
+                helper.assertTrue(
+                    unload.stillLoadedAfterDrain == 0,
+                    "all chunks with cases should unload after the force loading is removed: $unload",
+                )
                 // アンロードの tick は、書き込みを除いても、チャンクのアンロードそのものと待機点を待つ時間（unloadWaitBudgetMillis）を含み、
                 // CI の 100 台は 1 tick に全部が来る（#84 の基準）。取り出し・符号化の時間（unload.cost）は表に出すだけで検査しない（#553）
                 // 数えるのは、この段階に予約した書き込みだけ（前の段階の書き込みの完了は writer の「前の段階の完了」に出る。#614）
