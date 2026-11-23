@@ -328,7 +328,7 @@ public class SaveCleanup @JvmOverloads constructor(
      */
     private fun settle() {
         while (true) {
-            val event = events.poll() ?: break
+            events.poll() ?: break
             inFlight--
             lastProgress = clock()
         }
