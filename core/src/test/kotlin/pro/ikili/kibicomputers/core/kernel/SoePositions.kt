@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * 一番上のフレームだけを見ると、次の 2 つを見逃す（#889 のレビュー）:
  * - ロックの取得・解放の途中で尽きても、インタプリタ（冷えた道）では AQS の CAS（JDK 17 は `jdk.internal.misc.Unsafe.compareAndSetInt`）が
  *   本物のフレームになり、一番上は `Unsafe` になる。ロックの中に数えるには、`Unsafe`・`java.lang.invoke`・`java.util.concurrent.atomic` を飛ばして、
- *   ロックのフレームの下を見る
+ *   ロックのフレームの下を見る（`ReentrantLock` が最初に呼ぶ `Thread.currentThread()` が一番上になる冷えた道も同じ）
  * - 本体（VFS・端末・NIO）の中で尽きたとき、一番上は `String`・`Character`・`Arrays` などの JDK の葉になる。
  *   どの区画の中かは、一番上から下へ、最初のこの MOD のフレーム（と、その前に NIO のフレームがあったか）で決める
  *
@@ -115,9 +115,14 @@ internal class SoePositions {
             return simple.endsWith("Test") || simple.startsWith("StackHeadroomTest") || simple == "SoePositions"
         }
 
+        /**
+         * ロックの機構のフレーム。`java.lang.Thread` は、`ReentrantLock` の `initialTryLock`・`tryRelease` が最初に呼ぶ
+         * `Thread.currentThread()`（JDK 17・21 とも native）で、インタプリタ（冷えた道）では一番上に出うる。
+         * 飛ばさないと、`lock()`・`unlock()` の入口で尽きた回が [Position.LOCK] にならず、`KERNEL`・`VFS` などに数えられる
+         */
         private fun isLockMachinery(c: String): Boolean =
-            c.startsWith("java.util.concurrent.locks.") || c == "jdk.internal.misc.Unsafe" || c.startsWith("java.lang.invoke.") ||
-                c.startsWith("java.util.concurrent.atomic.")
+            c.startsWith("java.util.concurrent.locks.") || c == "jdk.internal.misc.Unsafe" || c == "java.lang.Thread" ||
+                c.startsWith("java.lang.invoke.") || c.startsWith("java.util.concurrent.atomic.")
 
         /** スタックトレース [trace]（一番上が先頭）の、尽きた位置の区画 */
         fun classify(trace: Array<StackTraceElement>): Position {

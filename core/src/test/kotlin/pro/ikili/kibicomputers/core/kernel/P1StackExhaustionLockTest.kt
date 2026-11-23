@@ -118,7 +118,9 @@ class P1StackExhaustionLockTest {
                 awaitOrClassify(ticker, "マシンが止まる", stopping) { m.state == MachineState.STOPPED && other.state == MachineState.STOPPED }
                 awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
                 awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
-                assertTrue(!m.lock.isLocked && !m.lock.hasQueuedThreads(), "${m.lock}")
+                // STOPPED・許可が戻った直後は、最後のプロセススレッドが終わりの後始末（`ProcessRunner.recoverLeaks`）でマシンのロックを
+                // 一瞬持っていることがある。ロックが残り続けること（持ったまま死んだスレッドがいる）だけを落とす
+                eventuallyDescribe(describe = { "マシンのロックが放されない: ${m.lock}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
             }
         }
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")

@@ -218,6 +218,8 @@ class DiskFileSystemStackExhaustionTest {
             val edge = walkEdge(::attempt)
             println("#858 disk $op: 境目 $edge、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
             assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
+            // 入口の確かめ（`ensure(HOST_IO_FRAMES)`）は、リースのロックを取る前に止める。ロック・NIO のチャンネルの中のロックの途中では尽きない
+            assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
             assertTrue(completed > 0, "1 度も終わりまで動かなかった")
             assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
         } finally {
@@ -303,6 +305,7 @@ class DiskFileSystemStackExhaustionTest {
 
             val edge = walkEdge(::attempt)
             println("#858 disk deferred release: 境目 $edge、$counter 回動かし、深いところで行えた $drained 回、列に残した $left 回、尽きた位置: ${tally.describe()}")
+            assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
             assertTrue(drained > 0, "1 度も深いところで行えなかった")
             assertTrue(left > 0, "1 度も列に残さなかった（境目を通っていない）")
             assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
