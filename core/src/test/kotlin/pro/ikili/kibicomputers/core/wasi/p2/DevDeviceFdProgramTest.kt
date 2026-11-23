@@ -24,7 +24,7 @@ import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
 /**
- * `/dev/device/<address>` を開いた fd の種類と `isatty`（#865。ADR 0054「fd とパスで種類が違う」、ADR 0267「descriptor の種類」）。
+ * `/dev/device/<address>` を開いた fd の種類・`isatty`・`fstat`（#865・#885。ADR 0054「fd とパスで種類が違う」、ADR 0267「descriptor の種類」）。
  *
  * 同じ `dev_device_wasi.c` を、p1 のまま・アダプターで包んだ p2・`wasm32-wasip2` でビルドした p2 の3通りで動かす。
  * p1 と包んだ p2 は `fd_fdstat_get` の filetype が `UNKNOWN` であることも確かめる（包んだ p2 の filetype は `descriptor.get-type` を写したもの）。
@@ -34,6 +34,10 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *   wasmtime のアダプターの `fd_fdstat_get` は、ディレクトリ以外の descriptor の `fs_rights_base` を全ビット（SEEK・TELL を含む）から始めて READ・WRITE しか落とさず、
  *   wasi-libc の p1 の `isatty` は SEEK か TELL があれば偽を返すため
  * - wasi-libc の p2 の `isatty` は種類を見ない（ファイルの fd はいつも偽）ので、ネイティブの p2 も後退の見張りだけ
+ *
+ * device と `/dev/tty` の fd の `fstat` も確かめる（#885。ADR 0267「ファイル以外の descriptor の metadata-hash」）。
+ * 包んだ p2 とネイティブの p2 の `fstat` は `descriptor.metadata-hash` も呼ぶので（アダプターは `stat` の後。wasi-libc の順序は確かめていない）、直す前（`bad-descriptor`）は EBADF で落ちる。
+ * p1 のままは前から通るので、後退の見張り。`/dev/tty` を開けるように、console の `Tty` を用意しておく。
  */
 class DevDeviceFdProgramTest {
     private val limit = Duration.ofSeconds(120)
@@ -54,6 +58,8 @@ class DevDeviceFdProgramTest {
         m.vfs.createDirectory(VfsPath.parse("/dev"))
         assertNull(m.mountDev())
         assertTrue(m.devices.attach(address, TestDevice))
+        // stdin が Closed なので console の Tty は作られない。/dev/tty を開けるように作っておく
+        m.lock.withLockValue { m.ensureConsoleLocked() }
         return m
     }
 
@@ -76,17 +82,17 @@ class DevDeviceFdProgramTest {
     }
 
     @Test
-    fun `p1のままではdeviceのfdはUNKNOWNでisattyが偽`() = timeout(limit) {
+    fun `p1のままではdeviceのfdはUNKNOWNでisattyが偽、deviceとttyのfstatが成功する`() = timeout(limit) {
         assertEquals("OK\n" to 0, runProgram(resource("/kibicomputers/wasm/dev-device-wasi.wasm")))
     }
 
     @Test
-    fun `アダプターで包んだp2でもdeviceのfdはUNKNOWNでisattyが偽`() = timeout(limit) {
+    fun `アダプターで包んだp2でもdeviceのfdはUNKNOWNでisattyが偽、deviceとttyのfstatが成功する`() = timeout(limit) {
         assertEquals("OK\n" to 0, runProgram(P2Testing.wrap("dev-device-wasi")))
     }
 
     @Test
-    fun `wasm32-wasip2でビルドしたp2でもdeviceのfdのisattyが偽`() = timeout(limit) {
+    fun `wasm32-wasip2でビルドしたp2でもdeviceのfdのisattyが偽、deviceとttyのfstatが成功する`() = timeout(limit) {
         assertEquals("OK\n" to 0, runProgram(resource("/kibicomputers/wasm-native/dev-device-wasi-p2.wasm")))
     }
 }
