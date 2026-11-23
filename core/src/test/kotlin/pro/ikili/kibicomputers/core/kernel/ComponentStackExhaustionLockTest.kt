@@ -49,10 +49,17 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *   巻き直して続ける（ドライバーは `WasiP2Driver` と同じく `StepResult.WaitFuel` を返す）
  *
  * 巻き戻しは `top`（外からの call の 1 段目）でしか起きず、深い `f` の下では起きない（待ちがゲストからゲストへの呼び出しの下にあると、
- * 変換を断る）。そこで、巻き戻しの道の途中で尽きる位置を確かめるために、`f` を呼ばず `wait` と燃料を使う計算の loop だけの入口 `wind` を、
- * ドライバーの詰め物を尽きる境目の近くまで積んで 1 段ずつずらして呼ぶ回（[edgeSweep]）も回す。`f` の連鎖（echo の包みの確かめ 32 段、
- * realloc・post-return の中の `ensure(128)`）を呼ばないので、境目を決めるのは巻き戻し・巻き直しの道そのものになり、入口の確かめが
- * 「ぎりぎり通る」深さで、その先の巻き戻し・巻き直しが収まるかを見る。巻き直した後の結果は、尽きなかった回でも期待値と合うことを確かめる
+ * 変換を断る）。そこで、巻き戻しの道を境目の近くで動かすために、`f` を呼ばず `wait` と燃料を使う計算の loop だけの入口 `wind` を、
+ * ドライバーの詰め物を尽きる境目の近くまで積んで呼ぶ回（[edgeSweep]）も回す。境目は二分探索で 1 段の精度で探し（その回も毎回確かめる）、
+ * その後は境目の 16 段手前から [SPAN] 段先までを回数で等分した刻み（96 回で約 3.3 段、冷えた道の 24 回で約 13 段）でずらす。
+ * `f` の連鎖（echo の包みの確かめ 32 段、realloc・post-return の中の `ensure(128)`）を呼ばないので、境目を決めるのは巻き戻し・巻き直しの道
+ * そのものになり、入口の確かめが「ぎりぎり通る」深さで、その先の巻き戻し・巻き直しが収まるかを見る。巻き直した後の結果は、尽きなかった回でも
+ * 期待値と合うことを確かめる。
+ *
+ * 確かめられたのは、「境目の近くで入口の確かめを通った回は、巻き戻して巻き直し、最後まで終わる（結果も合う）」まで。手元の結果
+ * （JIT、Windows）では、尽きた回は確かめの中か詰め物の再帰そのもの（`wind` に入る前）・ランタイムの中で、巻き戻した後に尽きた回は、
+ * 巻き直した後の入口の確かめの中（`PROBE`）だけだった。
+ * 巻き戻し・巻き直しの最中に尽きた回は観測されていない（その位置に当てることは #903）
  *
  * 毎回の待ちは、`StackExhaustionLockTest` と同じ見分け（[awaitOrClassify]。遅れか停止か）と上限付きの読み（[peek]）を使う
  */
@@ -383,9 +390,12 @@ class ComponentStackExhaustionLockTest {
     }
 
     /**
-     * 尽きる境目を `wind`（`f` を呼ばず、`wait` と燃料を使う loop だけ。巻き戻し・巻き直しの道を通る）で探し、その近くを、詰め物を
-     * 1 段ずつ増やして動かす。境目の手前では終わり（EXITED。結果は期待値と合う）、境目では `wind` の中のどこか
-     * （巻き戻しの途中、巻き直しの途中、ホストの関数・canon の中）で尽きる。どちらでもプロセスだけが終わり、ロック・CPU・許可は壊れない。
+     * 尽きる境目を `wind`（`f` を呼ばず、`wait` と燃料を使う loop だけ。巻き戻し・巻き直しの道を通る）で探し（倍々と二分探索）、その近くを、
+     * 境目の 16 段手前から [SPAN] 段先までを回数で等分した刻みで動かす（1 段ずつではない。96 回で約 3.3 段、冷えた道の 24 回で約 13 段）。
+     * 境目を探す回も含めて毎回、終わった回（EXITED）は結果が期待値と合うこと、尽きた回はプロセスだけが `call stack exhausted` で終わり、
+     * 尽きた位置がロックの途中でないこと、ロック・同じ台・別の台が動き続けることを確かめる。尽きる位置は、入口の確かめ・詰め物の再帰・
+     * `wind` の中（巻き戻し・巻き直し、ホストの関数・canon）のどこにもなりうるが、巻き戻し・巻き直しの最中に尽きた回は観測されていない
+     * （クラスの KDoc）。
      *
      * `top`・`edge` を使わないのは、1 回の実行で一番深い道が `f` の連鎖の先（echo の包みの確かめ 32 段、realloc・post-return の中の
      * `ensure(128)`）になり、巻き戻しの道は、その分浅いところで動くので、境目の近くでも入口の確かめと同じ余裕が残るため
@@ -397,11 +407,30 @@ class ComponentStackExhaustionLockTest {
         var crashedUnwound = 0
         overdraftsExpected = false
         onMachines(kind, tally) { r ->
-            fun run(pad: Int): Pair<ProcessRuntime, TopDriver> {
+            /**
+             * [pad] 段の詰め物で `wind` を 1 回動かし、尽きたかを返す。境目を探す回も含めて毎回、終わった回は結果が期待値と合うこと、
+             * 尽きた回は `call stack exhausted` で終わり、尽きた位置がロックの途中でないこと、その後にマシンのロックが取れて同じ台・別の台が
+             * 進み続けることを確かめる（境目を探す回が、いちばん境目に近い「ぎりぎり」の回になる）
+             */
+            fun run(pad: Int): Boolean {
                 val d = driver(kind, "wind", pad)
                 val rt = r.m.spawnRt(program, d)
                 awaitEnd(r, rt, "pad $pad")
-                return rt to d
+                val crashed = rt.process.state != ProcessState.EXITED
+                if (!crashed) {
+                    exited++
+                    // 巻き直した後の結果も期待値と合う（スタックが残り少ない状態で巻き戻し・巻き直しをした結果）
+                    assertEquals(expectedWind, d.result.get(), "境目の近くで終わった回の結果が違う（pad $pad、巻き戻し ${d.unwinds.get()} 回）")
+                    if (d.unwinds.get() > 0) exitedUnwound++
+                } else {
+                    assertCrashedBySoe(rt, r.m, "pad $pad")
+                    val unwound = d.unwinds.get() > 0
+                    val position = tally.record(rt, if (unwound) "巻き戻した後" else "最初の通り")
+                    if (unwound) crashedUnwound++
+                    if (position.isLock) throw AssertionError("スタックがロックを取る・放す途中で尽きた（pad $pad）: ${describe(r, rt)}")
+                }
+                checkAlive(r, "pad $pad", rt)
+                return crashed
             }
             // 詰め物の再帰を JIT のコンパイルに乗せてから探す（インタプリタと JIT のコードでは、1 段のフレームの大きさが違い、境目が数倍動く）
             val warmEnd = System.nanoTime() + 500_000_000L
@@ -411,14 +440,14 @@ class ComponentStackExhaustionLockTest {
             fun findEdge(): Int {
                 var lo = 0
                 var hi = 256
-                while (run(hi).first.process.state != ProcessState.CRASHED) {
+                while (!run(hi)) {
                     lo = hi
                     hi *= 2
                     check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
                 }
                 while (hi - lo > 1) {
                     val mid = (lo + hi) / 2
-                    if (run(mid).first.process.state == ProcessState.CRASHED) hi = mid else lo = mid
+                    if (run(mid)) hi = mid else lo = mid
                 }
                 return hi
             }
@@ -432,23 +461,10 @@ class ComponentStackExhaustionLockTest {
                 if (i > 0 && i % BATCH == 0) edge = findEdge()
                 val offset = -16 + i * SPAN / count
                 val pad = maxOf(0, edge + offset)
-                val (rt, d) = run(pad)
-                val exitedHere = rt.process.state == ProcessState.EXITED
-                if (exitedHere) {
-                    exited++
-                    // 巻き直した後の結果も期待値と合う（スタックが残り少ない状態で巻き戻し・巻き直しをした結果）
-                    assertEquals(expectedWind, d.result.get(), "境目の近くで終わった回の結果が違う（pad $pad、巻き戻し ${d.unwinds.get()} 回）")
-                    if (d.unwinds.get() > 0) exitedUnwound++
-                } else {
-                    assertCrashedBySoe(rt, r.m, "pad $pad")
-                    val unwound = d.unwinds.get() > 0
-                    tally.record(rt, if (unwound) "巻き戻した後" else "最初の通り")
-                    if (unwound) crashedUnwound++
-                }
-                checkAlive(r, "pad $pad", rt)
+                run(pad)
             }
         }
-        println("#858 component edge $kind: 境目の近くで終わった $exited 回（巻き戻した $exitedUnwound 回）、尽きた回のうち巻き戻した後のもの $crashedUnwound 回")
+        println("#858 component edge $kind: 境目を探す回を含めて、終わった $exited 回（巻き戻した $exitedUnwound 回）、尽きた回のうち巻き戻した後のもの $crashedUnwound 回")
         assertTrue(tally.crashed.get() > 0, "境目で 1 度も尽きなかった")
         assertTrue(exited > 0, "境目の手前で 1 度も終わらなかった")
         if (kind == ProcessKind.WAIT_POINT) {
@@ -464,7 +480,7 @@ class ComponentStackExhaustionLockTest {
         /** `edgeSweep` が境目を探し直す間隔（回） */
         const val BATCH = 16
 
-        /** `edgeSweep` が、境目から先へ進む詰め物の段数（回数で等分する。入口の確かめの 32 段分より広く取る） */
+        /** `edgeSweep` が、境目から先へ進む詰め物の段数（回数で等分する。1 段ずつではない。入口の確かめの 32 段分より広く取る） */
         const val SPAN = 320
     }
 
@@ -481,6 +497,6 @@ class ComponentStackExhaustionLockTest {
         edgeSweep(ProcessKind.BLOCKING, rounds = 96)
 
     @Test
-    fun `WAIT_POINTのコンポーネントで燃料切れの巻き戻し・巻き直しの途中で尽きる位置をずらしても、ロック・CPU・許可は壊れず、結果は変わらない`() =
+    fun `WAIT_POINTのコンポーネントで尽きる境目の近くで燃料切れの巻き戻し・巻き直しをしても、ロック・CPU・許可は壊れず、結果は変わらない`() =
         edgeSweep(ProcessKind.WAIT_POINT, rounds = 96)
 }

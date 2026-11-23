@@ -15,20 +15,29 @@ import java.util.concurrent.atomic.AtomicInteger
  * - 本体（VFS・端末・NIO）の中で尽きたとき、一番上は `String`・`Character`・`Arrays` などの JDK の葉になる。
  *   どの区画の中かは、一番上から下へ、最初のこの MOD のフレーム（と、その前に NIO のフレームがあったか）で決める
  *
- * 数えた位置のうち、[Position.LOCK] だけは、入口の確かめ（`StackHeadroom`）が足りなかったことを示す（ロックを取る・放す途中で尽きた）ので、
- * テストは 0 回であることを確かめる。ほかは、確かめを通った後の本体の中で尽きた位置で、ふつうに起きる（本体の奥の深さは、入口の確かめの
+ * 数えた位置のうち、[Position.LOCK] と [Position.JDK_LOCK]（[Position.isLock]）は、入口の確かめ（`StackHeadroom`）が足りなかったことを示す
+ * （ロックを取る・放す途中で尽きた）ので、テストは 0 回であることを確かめる（[inLocks]。回ごとに落とすテストは [Position.isLock] を見る）。
+ * JDK のクラス経由で取るロック（カーネルロックの中の `scheduleVfsDrain` → `bootExecutor.execute`、ワーカーへの引き渡しの列、NIO のチャンネル）も、
+ * 途中で尽きると共有の executor・列の中のロックが放されずに残り、安全網では戻せない（ADR 0043）ので、この MOD のロックと同じく落とす
+ * （#828 の `StackExhaustionLockTest` が、一番上が `java.util.concurrent.locks.` なら呼び手を問わず落としていたのと同じ強さ）。ほかは、確かめを通った後の本体の中で尽きた位置で、ふつうに起きる（本体の奥の深さは、入口の確かめの
  * 段数に収まらない）。本体の中で尽きても安全かは、位置でなく、毎回の後の状態（ロックが取れる・CPU・許可・予約が戻る）で確かめる
  */
 internal class SoePositions {
-    enum class Position {
+    enum class Position(
+        /** ロックを取る・放す途中（テストは 0 回であることを確かめる） */
+        val isLock: Boolean = false,
+    ) {
         /** 入口の確かめ（`StackHeadroom.probe`）の中。何も触る前なので安全 */
         PROBE,
 
         /** この MOD のロック（`ReentrantLock`）を取る・放す途中（AQS・`Unsafe` の CAS を含む）。確かめが足りなかった */
-        LOCK,
+        LOCK(isLock = true),
 
-        /** JDK の中のロック（NIO のチャンネルなど）の途中。この MOD のロックではない */
-        JDK_LOCK,
+        /**
+         * JDK のクラス経由で取るロック（`ThreadPoolExecutor`・`LinkedBlockingQueue` などの共有の executor・列、NIO のチャンネル）の途中。
+         * この MOD のロックではないが、放されずに残ると安全網で戻せないので、[LOCK] と同じく確かめが足りなかったものとして数える
+         */
+        JDK_LOCK(isLock = true),
 
         /** ホストの I/O（`java.nio`・`sun.nio`・`java.io`）の中 */
         HOST_IO,
@@ -45,7 +54,7 @@ internal class SoePositions {
         /** WASM のランタイム・WASI・ホストの関数の中 */
         RUNTIME,
 
-        /** ゲスト役のテストのコード・JDK だけ */
+        /** ゲスト役のテストのコード（詰め物の再帰・テストのラムダ。パッケージを問わない）・JDK だけ */
         OTHER,
 
         /** `StackOverflowError` でなく、Endive の `STACK_OVERFLOW` のトラップで終わった（尽きた位置は Java のスタックでない） */
@@ -61,7 +70,7 @@ internal class SoePositions {
 
     private val lockCount = AtomicInteger()
 
-    /** [Position.LOCK] の回数 */
+    /** [Position.isLock] の位置（[Position.LOCK]・[Position.JDK_LOCK]）の回数 */
     val inLocks: Int get() = lockCount.get()
 
     /** [rt] の終わり方の `StackOverflowError`（原因をたどる）。なければ `null` */
@@ -82,7 +91,7 @@ internal class SoePositions {
         t?.stackTrace?.firstOrNull()?.let { top ->
             tops.computeIfAbsent(top.className.substringAfterLast('.')) { AtomicInteger() }.incrementAndGet()
         }
-        if (position == Position.LOCK) {
+        if (position.isLock) {
             lockCount.incrementAndGet()
             println("#858 ロックの中で尽きた${if (tag.isEmpty()) "" else "（$tag）"}: ${t!!.stackTrace.take(16).joinToString(" <- ")}")
         }
@@ -96,6 +105,16 @@ internal class SoePositions {
     companion object {
         private const val MOD = "pro.ikili.kibicomputers."
 
+        /**
+         * テストのコード（詰め物の再帰・テストのラムダ・テストの支え）。パッケージを問わず、本体の区画（VFS・カーネルなど）に数えない
+         * （`DiskFileSystemStackExhaustionTest` は `core.kernel.vfs` にあるので、名前で見分ける）
+         */
+        private fun isTestCode(c: String): Boolean {
+            val simple = c.substringAfterLast('.').substringBefore('$')
+            // `StackHeadroomTestSupportKt` は `StackHeadroomTestSupport.kt` のトップレベルの関数
+            return simple.endsWith("Test") || simple.startsWith("StackHeadroomTest") || simple == "SoePositions"
+        }
+
         private fun isLockMachinery(c: String): Boolean =
             c.startsWith("java.util.concurrent.locks.") || c == "jdk.internal.misc.Unsafe" || c.startsWith("java.lang.invoke.") ||
                 c.startsWith("java.util.concurrent.atomic.")
@@ -105,7 +124,8 @@ internal class SoePositions {
             val top = trace.firstOrNull() ?: return Position.OTHER
             if (top.className == StackHeadroom::class.java.name) return Position.PROBE
             // ロックの機構（AQS・Unsafe・VarHandle・atomic）を一番上から飛ばし、その下の呼び手を見る。
-            // 呼び手がこの MOD なら、この MOD のロックの途中（`Machine.withLockValue` など）。JDK の中なら、JDK の中のロック
+            // 呼び手がこの MOD なら、この MOD のロックの途中（`Machine.withLockValue` など）。JDK の中（executor・列・NIO）なら、JDK の中のロック。
+            // どちらも落とす（[Position.isLock]）
             var i = 0
             var sawLock = false
             while (i < trace.size && isLockMachinery(trace[i].className)) {
@@ -131,8 +151,9 @@ internal class SoePositions {
                 return when {
                     hostIo -> Position.HOST_IO
                     c.startsWith("${MOD}core.display.") || c.startsWith("${MOD}core.kernel.tty.") -> Position.TERMINAL
+                    isTestCode(c) -> Position.OTHER
                     c.startsWith("${MOD}core.kernel.vfs.") -> Position.VFS
-                    c.startsWith("${MOD}core.kernel.") && !c.contains(".kernel.Stack") && !c.endsWith("Test") && !c.contains("Test$") -> Position.KERNEL
+                    c.startsWith("${MOD}core.kernel.") -> Position.KERNEL
                     c.startsWith("${MOD}core.runtime.") || c.startsWith("${MOD}core.wasi.") -> Position.RUNTIME
                     else -> Position.OTHER
                 }

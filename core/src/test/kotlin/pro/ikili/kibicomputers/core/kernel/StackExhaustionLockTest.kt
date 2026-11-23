@@ -443,9 +443,9 @@ class StackExhaustionLockTest {
                     assertTrue(round.ops.get() > 0, "ディスクの操作が 1 度も動かなかった（$where、$tag。本体 ${round.calls.get()} 回）")
                     diskOps.addAndGet(round.ops.get())
                 }
-                // 尽きた位置が、このMOD のロックを取る・放す途中（AQS・`Unsafe` の CAS を含む）なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
+                // 尽きた位置が、ロック（この MOD のもの、JDK のクラス経由の executor・列・NIO のもの）を取る・放す途中（AQS・`Unsafe` の CAS を含む）なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
                 // 失敗の説明は、落とすときだけ作る（成功する回で `state` を評価しない。中のロックは待ちの上限付きで取る）
-                if (position == SoePositions.Position.LOCK) {
+                if (position.isLock) {
                     fail("スタックがロックを取る・放す途中で尽きた（$where）: ${state(h, m, rt)}")
                 }
                 // ほかのスレッドから、マシンのロックが取れる（持ったまま死んだスレッドがいない）

@@ -147,6 +147,45 @@ class DiskFileSystemStackExhaustionTest {
         }
     }
 
+    /**
+     * 詰め物の段数を変えて [attempt]（尽きた・深いところで行えなかったら `true`）を動かす。JIT をかけてから、尽きる境目を探し、
+     * 境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅だけ 1 段ずつ動かす。最後の境目を返す
+     */
+    private fun walkEdge(attempt: (Int) -> Boolean): Int {
+        // 操作を何度か動かして、JIT をかける（インタプリタと JIT のコードでは、フレームの大きさが違い、境目が動く）
+        repeat(stackHeadroomRounds(WARMUP)) { attempt(0) }
+
+        /** 尽きる最小の詰め物の段数を探す（倍々で尽きるところを見つけ、二分で縮める） */
+        fun findEdge(): Int {
+            var lo = 0
+            var hi = 256
+            while (!attempt(hi)) {
+                lo = hi
+                hi *= 2
+                check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
+            }
+            while (hi - lo > 1) {
+                val mid = (lo + hi) / 2
+                if (attempt(mid)) hi = mid else lo = mid
+            }
+            return hi
+        }
+
+        val width = stackHeadroomRounds(WIDTH)
+        var edge = findEdge()
+        var done = 0
+        // 境目から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅だけ 1 段ずつ。境目は、操作のいちばん深い所が尽きる
+        // 最小の詰め物で、それより浅い所（ホストの移動の後の付け替えなど）は、詰め物がもっと多いところで尽きる。境目は動くので
+        // （JIT が進む）、途中で探し直す
+        while (done < width) {
+            val batch = minOf(width - done, REFIND_EVERY)
+            for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k))
+            done += batch
+            edge = findEdge()
+        }
+        return edge
+    }
+
     private fun sweep(op: Op) {
         val root = Files.createDirectories(dir.resolve("disk"))
         val fs = DiskFileSystem.open(root, budget = HostFileBudget(64, 128, AtomicInteger()))
@@ -176,37 +215,7 @@ class DiskFileSystemStackExhaustionTest {
                 return soe != null
             }
 
-            // 操作を何度か動かして、JIT をかける（インタプリタと JIT のコードでは、フレームの大きさが違い、境目が動く）
-            repeat(stackHeadroomRounds(WARMUP)) { attempt(0) }
-
-            /** 尽きる最小の詰め物の段数を探す（倍々で尽きるところを見つけ、二分で縮める） */
-            fun findEdge(): Int {
-                var lo = 0
-                var hi = 256
-                while (!attempt(hi)) {
-                    lo = hi
-                    hi *= 2
-                    check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
-                }
-                while (hi - lo > 1) {
-                    val mid = (lo + hi) / 2
-                    if (attempt(mid)) hi = mid else lo = mid
-                }
-                return hi
-            }
-
-            val width = stackHeadroomRounds(WIDTH)
-            var edge = findEdge()
-            var done = 0
-            // 境目から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅だけ 1 段ずつ。境目は、操作のいちばん深い所が尽きる
-            // 最小の詰め物で、それより浅い所（ホストの移動の後の付け替えなど）は、詰め物がもっと多いところで尽きる。境目は動くので
-            // （JIT が進む）、途中で探し直す
-            while (done < width) {
-                val batch = minOf(width - done, REFIND_EVERY)
-                for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k))
-                done += batch
-                edge = findEdge()
-            }
+            val edge = walkEdge(::attempt)
             println("#858 disk $op: 境目 $edge、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
             assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
             assertTrue(completed > 0, "1 度も終わりまで動かなかった")
@@ -248,6 +257,59 @@ class DiskFileSystemStackExhaustionTest {
 
     @Test
     fun `ディレクトリの名前を変える途中で尽きても、ディスクの状態は食い違わない`() = sweep(Op.RENAME_DIRECTORY)
+
+    /**
+     * fd の表から閉じる道（`Vfs.releaseLater` → `Vfs.drainDeferred` → [DiskFileSystem.release]）を、深いところで行う回（#858）。
+     * `drainDeferred` は起動用のスレッドだけでなく、ファイルシステムに届く操作（`checkUnlocked`）から、ゲストのスレッドのその深さでも呼ばれる。
+     * 知らせを列から取り出した後に `release` の入口の確かめで尽きると、取り出した知らせが捨てられ、開いたままの枠とホストのファイルが返らない。
+     * 毎回、深いところで `drainDeferred` を呼んだ後に、知らせが行われたか、列に残っているかのどちらかであることと、浅いところで行えば
+     * 枠が返ることを確かめる
+     */
+    @Test
+    fun `fdの表から閉じる知らせを深いところで行っても、開いたままの枠は返る`() {
+        val root = Files.createDirectories(dir.resolve("disk"))
+        val fs = DiskFileSystem.open(root, budget = HostFileBudget(64, 128, AtomicInteger()))
+        try {
+            val vfs = Vfs()
+            vfs.mount(VfsPath.ROOT, fs, readOnly = false, source = "disk")
+            fs.createDirectory(p("/w"))
+            val tally = SoePositions()
+            var counter = 0
+            var drained = 0
+            var left = 0
+
+            /** 深いところで行えなかった（知らせが列に残った、または尽きた）なら `true` */
+            fun attempt(pad: Int): Boolean {
+                val n = ++counter
+                val f = vfs.open(p("/w/f$n"), OpenOptions(read = true, write = true, create = true))
+                assertEquals(1, fs.openHandles, "開いたファイルの枠を数えていない")
+                vfs.releaseLater(f)
+                val error = runOnSmallStack(pad) { vfs.drainDeferred() }
+                val soe = error as? StackOverflowError
+                if (error != null && soe == null) throw AssertionError("尽きる以外の失敗（pad $pad）", error)
+                val queued = vfs.hasDeferred
+                if (!queued && fs.openHandles != 0) {
+                    fail("閉じる知らせを取り出したのに、開いたままの枠が返らない（pad $pad）\nSOE:${soe?.stackTrace?.take(14)?.joinToString(" <- ")}")
+                }
+                if (soe != null) tally.record(soe)
+                if (queued) left++ else if (soe == null) drained++
+                vfs.drainDeferred()
+                assertTrue(!vfs.hasDeferred, "浅いところで行っても知らせが残った（pad $pad）")
+                assertEquals(0, fs.openHandles, "浅いところで行っても枠が返らない（pad $pad）")
+                verify(fs, "閉じる知らせ、pad $pad", soe)
+                fs.removeFile(p("/w/f$n"))
+                return queued || soe != null
+            }
+
+            val edge = walkEdge(::attempt)
+            println("#858 disk deferred release: 境目 $edge、$counter 回動かし、深いところで行えた $drained 回、列に残した $left 回、尽きた位置: ${tally.describe()}")
+            assertTrue(drained > 0, "1 度も深いところで行えなかった")
+            assertTrue(left > 0, "1 度も列に残さなかった（境目を通っていない）")
+            assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
+        } finally {
+            fs.retire()
+        }
+    }
 
     private companion object {
         const val DEEP = "/w/deep0/deep1/deep2/deep3/deep4/deep5/deep6/deep7"
