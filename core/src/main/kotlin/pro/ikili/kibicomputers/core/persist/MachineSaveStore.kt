@@ -16,6 +16,7 @@ import java.util.OptionalLong
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -49,8 +50,8 @@ internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirec
  * 完了の受け取り（[pollCompleted]）だけをする。[claim] もメインスレッドでは書かない（#585。ADR 0084 の規則 7a）: 引き取りの `owner.bin` は
  * その場で列に入れ、`owner.bin` がなかった ID と新しく振った ID の `owner.bin` は、最初の世代の書き込みの前に書く（[submit]）。
  * claim がディスクを読むのは、覚えておらず、先読み（`prefetchOwners`）でも分からない ID だけ。サーバーのメインスレッドは
- * [claimOrDefer] を使い、その読みもしない（#869）: 読みを先読みのスレッドか書き込みのスレッドに回して claim を待ちにし、
- * 読み終わった後の tick に [pollDeferredClaims] で確定する。例外は、マシンのある台（動いている・復元の途中）が `/data merge` で
+ * [claimOrDefer] を使い、その読みもしない（#869）: 読みを先読みのスレッド、列の外の読み手（その ID の仕事が列に残っていないとき。#877）、
+ * 書き込みのスレッド（残っているとき）のどれかに回して claim を待ちにし、読み終わった後の tick に [pollDeferredClaims] で確定する。例外は、マシンのある台（動いている・復元の途中）が `/data merge` で
  * ID を得たときで、接続層は同期の [claim] を呼ぶ（待つと取り出しが飛ばされ状態を失うため。ADR 0084 の規則 7a）。
  *
  * スレッド: 列の仕事のほかは、メインスレッドだけで使う。[hasCapacity]・[pendingBytes]・[pendingCount] はどのスレッドから読んでもよい。
@@ -64,6 +65,8 @@ internal var openRootEntries: (Path) -> DirectoryStream<Path> = { Files.newDirec
  *   [claimOrDefer] が待ちにした claim の待ちの上限も兼ねる（#869。過ぎたら新しい UUID にする）
  * @param prefetchOwners 開いたときに、根にあった ID の `owner.bin` を別のスレッドで先読みするか（#585。サーバーの置き場は真。
  *   既定は偽で、テストは [startOwnerPrefetch] で走らせ方を決める）
+ * @param sideOwnerReads 待ちにした claim の `owner.bin` を、その ID の仕事が列に残っていなければ、書き込みの列の外の読み手
+ *   （置き場に 1 本のスレッド）で読むか（#877。サーバーの置き場は真。偽なら今までどおり書き込みの列の後ろで読む）
  */
 @ApiStatus.Internal
 public class MachineSaveStore @JvmOverloads constructor(
@@ -74,6 +77,7 @@ public class MachineSaveStore @JvmOverloads constructor(
     maxPendingBytes: Long = Long.MAX_VALUE,
     claimWaitMillis: Long = MachineSaveConfig.DEFAULT_WRITER_FLUSH_MILLIS,
     prefetchOwners: Boolean = false,
+    private val sideOwnerReads: Boolean = false,
 ) {
     /** 書き込み待ちの写しの見積もりの合計の上限（バイト。GameTest が差し替える） */
     @Volatile
@@ -296,16 +300,125 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
-     * 書き込みのスレッドで、[id] の `owner.bin` を置き換える・消す前に、先読みのスレッドがそのファイルを読み終えるのを待つ（#585）。
-     * Windows では、開いているファイルへの `ATOMIC_MOVE`（`REPLACE_EXISTING`）が `AccessDeniedException` になるため。
-     * メインスレッドは、その仕事を入れる前に [touch] で [prefetchSkip] に入れているので、ここを抜けた後に先読みが [id] を開くことはない。
-     * 待つのは読みの 1 回分まで（1 件数 ms）で、先読みが終わった後は錠を取らない
+     * 書き込みのスレッドで、[id] の `owner.bin` を置き換える・消す前に、先読みのスレッドと列の外の読み手（#877）がそのファイルを
+     * 読み終えるのを待つ（#585）。Windows では、開いているファイルへの `ATOMIC_MOVE`（`REPLACE_EXISTING`）が `AccessDeniedException` になるため。
+     * メインスレッドは、その仕事を入れる前に [touch] で [prefetchSkip] に入れ、[outstanding] を増やしているので、ここを抜けた後に
+     * 先読みも読み手も [id] を開くことはない（読み手は、開く前に錠の中で [outstanding] を見る）。待つのは読みの 1 回分まで（1 件数 ms）で、
+     * 読み手に頼んだがまだ開いていない読みは待たない。先読みが終わり、読み手も始めていなければ錠を取らない
      */
     private fun awaitPrefetchRead(id: UUID) {
-        if (!prefetchRunning) return
+        if (!prefetchRunning && !sideReaderStarted) return
         prefetchLock.withLock {
-            while (prefetchReading == id) prefetchIdle.awaitUninterruptibly()
+            while (prefetchReading == id || sideReading == id) prefetchIdle.awaitUninterruptibly()
         }
+    }
+
+    // ---- 列の外の owner.bin の読み手（#877） ----
+
+    /** 読み手に頼んだ読み（[seq] は [requestedReads] の番号） */
+    private class SideRead(val id: UUID, val seq: Long)
+
+    /** 読み手の列（メインスレッドが入れ、読み手のスレッドが取る）。[sideReadStop] で止める */
+    private val sideReads = LinkedBlockingQueue<SideRead>()
+
+    /** 読み手を止める印（[close]） */
+    private val sideReadStop = SideRead(UUID(0, 0), -1)
+
+    /**
+     * 読み手に頼んで、まだ要る読み（ID → 番号）。メインスレッドが頼むときに入れ、結果を受け取ったときとその ID の待ちがなくなったときに外す。
+     * 読み手は開く前に見て、取り消した読みは開かない（チャンクのアンロードで多数の待ちが消えても、ディスクの読みを無駄にしない）
+     */
+    private val sideWanted = ConcurrentHashMap<UUID, Long>()
+
+    /** 読み手が今開いている `owner.bin` の ID（[prefetchLock] の中で読み書きする） */
+    private var sideReading: UUID? = null
+
+    /** 読み手のスレッドを始めた（[awaitPrefetchRead] が錠を取る。一度真にしたら戻さない） */
+    @Volatile
+    private var sideReaderStarted: Boolean = false
+
+    /** 読み手を止めた（[close]）。止めた後の読みは、書き込みの列に回す */
+    @Volatile
+    private var sideReaderClosed: Boolean = false
+
+    private var sideReaderThread: Thread? = null
+
+    /** 列の外の読み手が `owner.bin` を読む口（テストが、読みの途中で止めるために差し替える。#877） */
+    internal var sideOwnerReader: (Path) -> OwnerRecord? = { OwnerRecord.read(it) }
+
+    /** claim のために、列の外の読み手に `owner.bin` の読みを頼んだ回数（数え口。#877） */
+    public var sideOwnerReadRequests: Long = 0
+        private set
+
+    /** 列の外の読み手が、開く前にその ID の仕事が列に入ったのを見て読まず、書き込みの列に回し直した回数（数え口。#877） */
+    public var sideOwnerReadRetries: Long = 0
+        private set
+
+    /** 列の外の読み手のスレッドが動いているか（テスト用。[close] で止まる） */
+    internal val sideReaderAlive: Boolean get() = sideReaderThread?.isAlive == true
+
+    /** 読み手のスレッドを始める（最初の頼みのとき。置き場に 1 本で、台数によらない） */
+    private fun startSideReader() {
+        if (sideReaderStarted) return
+        sideReaderStarted = true
+        sideReaderThread = Thread(::runSideReader, "KiBi-OwnerReader").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * 読み手のスレッドの本体。頼まれた順に読み、結果を [ownerReadResults] に番号つきで入れる。開く前に錠の中で、その ID の仕事が列に
+     * 残っていないかを見る: 残っていれば読まず、「やり直し」（値が `null`）を返す（メインスレッドが書き込みの列に回し直す。前の仕事の前の
+     * ディスクを読まず、書き込みのスレッドの置き換えとも重ねない）。読みが落ちても（Error も）「読めなかった」で返す
+     */
+    private fun runSideReader() {
+        while (true) {
+            val req = try {
+                sideReads.take()
+            } catch (_: InterruptedException) {
+                break
+            }
+            if (req === sideReadStop) break
+            if (sideWanted[req.id] != req.seq) continue
+            val open = prefetchLock.withLock {
+                (!outstanding.containsKey(req.id)).also { if (it) sideReading = req.id }
+            }
+            if (!open) {
+                ownerReadResults.add(OwnerRead(req.id, req.seq, null))
+                continue
+            }
+            val value = try {
+                readOwnerOffMain(sideOwnerReader, req.id)
+            } catch (e: Throwable) {
+                LOG.log(System.Logger.Level.WARNING, "Failed to read owner.bin of ${req.id}", e)
+                Prefetched.Unreadable("$e")
+            } finally {
+                prefetchLock.withLock {
+                    sideReading = null
+                    prefetchIdle.signalAll()
+                }
+            }
+            ownerReadResults.add(OwnerRead(req.id, req.seq, value))
+        }
+        // 止めた後に残った頼みは、読めなかったとして返す（書き込みの口が閉じたときと同じ）
+        while (true) {
+            val req = sideReads.poll() ?: break
+            if (req !== sideReadStop) ownerReadResults.add(OwnerRead(req.id, req.seq, Prefetched.Unreadable("the owner reader is closed")))
+        }
+    }
+
+    /** 読み手を止めて join する（[close]）。止まれば（始めていなければ）`true` */
+    private fun stopSideReader(timeoutMillis: Long): Boolean {
+        sideReaderClosed = true
+        val thread = sideReaderThread ?: return true
+        sideReads.add(sideReadStop)
+        try {
+            thread.join(timeoutMillis.coerceAtLeast(1))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        return !thread.isAlive
     }
 
     /**
@@ -438,17 +551,20 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 待ちの鍵 → 待っている claim（[cancelDeferredClaim]。鍵は参照で比べる） */
     private val deferredByKey = java.util.IdentityHashMap<Any, Pair<UUID, DeferredEntry>>()
 
-    /** 書き込みのスレッドに読みを頼んだ ID → 頼んだ番号（古い頼みの結果を捨てる。メインスレッドだけが触る） */
+    /** 書き込みのスレッド・列の外の読み手に読みを頼んだ ID → 頼んだ番号（古い頼みの結果を捨てる。メインスレッドだけが触る） */
     private val requestedReads = HashMap<UUID, Long>()
 
     /** 先読みのスレッドに先に読んでほしいと頼んだ ID（同じ ID を何度も積まない。メインスレッドだけが触る） */
     private val urgentRequested = HashSet<UUID>()
 
-    /** 書き込みのスレッドが読んで、まだ claim に使っていない `owner.bin`（メインスレッドだけが触る。その ID の待ちがなくなったら捨てる） */
+    /** 書き込みのスレッド・列の外の読み手が読んで、まだ claim に使っていない `owner.bin`（メインスレッドだけが触る。その ID の待ちがなくなったら捨てる） */
     private val ownerReads = HashMap<UUID, Prefetched>()
 
-    /** 書き込みのスレッドが読んだ `owner.bin`（メインスレッドが [pollDeferredClaims] で受け取る） */
-    private class OwnerRead(val id: UUID, val seq: Long, val value: Prefetched)
+    /**
+     * 書き込みのスレッド・列の外の読み手が読んだ `owner.bin`（メインスレッドが [pollDeferredClaims] で受け取る）。[value] が `null` なのは、
+     * 読み手が開く前にその ID の仕事が列に入ったのを見て、読まなかったとき（やり直し。#877）
+     */
+    private class OwnerRead(val id: UUID, val seq: Long, val value: Prefetched?)
 
     private val ownerReadResults = ConcurrentLinkedQueue<OwnerRead>()
     private var readSeq = 0L
@@ -483,8 +599,9 @@ public class MachineSaveStore @JvmOverloads constructor(
      * [claim] と同じ判定をするが、メインスレッドで `owner.bin` を読まない（#869。ADR 0084 の規則 7a）。メインスレッドだけが呼ぶ。
      *
      * メモリで決まる（値の検査・索引の重複・覚えている `owner.bin`・消した ID・根になかった ID・先読みの値がある）なら、その場で結果を返す。
-     * 読みが要るときは `null` を返して待ちにし、読みを先読みのスレッド（まだ読んでいなければ順番より先に）か、書き込みのスレッド
-     * （列は全 ID で 1 本なので、そのとき列にあるすべての仕事の後ろ。先読みで決まらない ID）に回す。結果は後の tick の
+     * 読みが要るときは `null` を返して待ちにし、読みを先読みのスレッド（まだ読んでいなければ順番より先に）、列の外の読み手（先読みで決まらず、
+     * その ID の仕事が列に残っていない ID。#877）か、書き込みのスレッド（残っている ID。列は全 ID で 1 本なので、そのとき列にあるすべての
+     * 仕事の後ろ）に回す（[ensureOwnerRead]）。結果は後の tick の
      * [pollDeferredClaims] が [key] と一緒に返す。待ちが [claimWaitMillis] を過ぎたら、読みを待たずに新しい UUID にする
      * （`NEW_ID_UNREADABLE`、warn。同期の [claim] の待ちの上限と同じ）。
      * 同じ ID に待ちがあれば、後ろに並ぶ（確定は ID ごとに来た順）。同じ [key] の待ちがあれば、取り消してから出し直す。
@@ -551,7 +668,14 @@ public class MachineSaveStore @JvmOverloads constructor(
             val read = ownerReadResults.poll() ?: break
             if (requestedReads[read.id] != read.seq) continue
             requestedReads.remove(read.id)
-            ownerReads[read.id] = read.value
+            sideWanted.remove(read.id)
+            val value = read.value
+            if (value == null) {
+                // やり直し: 下の ensureOwnerRead が、その ID の仕事の後ろ（書き込みの列）に回し直す（#877）
+                sideOwnerReadRetries++
+                continue
+            }
+            ownerReads[read.id] = value
         }
         if (deferredById.isEmpty()) return emptyList()
         val out = ArrayList<DeferredClaim>()
@@ -616,16 +740,23 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     private fun forgetReads(id: UUID) {
         requestedReads.remove(id)
+        sideWanted.remove(id)
         ownerReads.remove(id)
         urgentRequested.remove(id)
     }
 
     /**
-     * 待っている [id] の `owner.bin` の読みを手配する（#869）。先読みのスレッドがまだ読みうる（動いていて、開いたときの ID で、触っていない）
-     * なら、順番より先に読んでもらう。そうでなければ（先読みが終わった・触った ID・根の列挙が欠けて先読みにない ID）、書き込みのスレッドの
-     * 列に読む仕事を入れる（前の仕事の後のディスクを読むので、仕事の終わりを待たなくてよい）。列は全 ID で 1 本なので、読みはそのとき列にある
-     * すべての仕事（ほかの台の世代・`owner.bin` の書き込みも）の後に走る。待ちの長さは [claimWaitMillis] で抑える（[pollDeferredClaims]）。
-     * 頼んであれば何もしない
+     * 待っている [id] の `owner.bin` の読みを手配する（#869・#877）。頼んであれば何もしない（毎 tick 呼ばれるので O(1)）。
+     *
+     * 1. 先読みのスレッドがまだ読みうる（動いていて、開いたときの ID で、触っていない）なら、順番より先に読んでもらう
+     * 2. そうでなく（先読みが終わった・触った ID・根の列挙が欠けて先読みにない ID）、その ID の仕事が列に残っていなければ、列の外の読み手
+     *    （[sideOwnerReads]）に頼む。メインスレッドは列に仕事を入れる唯一のスレッドなので、残っていなければ前の仕事は全部終わっていて、
+     *    ディスクは最終の形。ほかの ID の仕事の後ろに並ばないので、書き込みの列が詰まっていても数 tick で決まる。読み手は開く前に錠の中で
+     *    もう一度見て、その間に仕事が入っていれば読まずに「やり直し」を返し、次の呼び出しが 3 に回す
+     * 3. 残っていれば（または読み手を使わない置き場・読み手を止めた後）、書き込みのスレッドの列に読む仕事を入れる（前の仕事の後のディスクを
+     *    読むので、仕事の終わりを待たなくてよい）。列は全 ID で 1 本なので、読みはそのとき列にあるすべての仕事の後に走る
+     *
+     * 待ちの長さは [claimWaitMillis] で抑える（[pollDeferredClaims]）
      */
     private fun ensureOwnerRead(id: UUID) {
         if (id in requestedReads || id in ownerReads) return
@@ -638,6 +769,13 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
         val seq = ++readSeq
         requestedReads[id] = seq
+        if (sideOwnerReads && !sideReaderClosed && !outstanding.containsKey(id)) {
+            sideOwnerReadRequests++
+            sideWanted[id] = seq
+            startSideReader()
+            sideReads.add(SideRead(id, seq))
+            return
+        }
         writerOwnerReadRequests++
         enqueue(id, 0, {
             // 読みが IOException・RuntimeException 以外で落ちても結果を返す（返さないと、頼み済みのままその ID の待ちが上限まで残る）
@@ -1296,8 +1434,18 @@ public class MachineSaveStore @JvmOverloads constructor(
     @Throws(InterruptedException::class)
     public fun flush(timeoutMillis: Long): Boolean = executor.flush(timeoutMillis)
 
-    /** 書き込みの口を閉じる（入っている仕事は終える）。止まれば `true`。後から入れた予約は失敗の完了で返る */
-    public fun close(timeoutMillis: Long): Boolean = executor.close(timeoutMillis)
+    /**
+     * 書き込みの口を閉じる（入っている仕事は終える）。列の外の `owner.bin` の読み手（#877）も止めて join する（閉じた後の置き場の読み手が、
+     * 同じ根で開き直した置き場の書き込みのスレッドの置き換えと重ならないように。錠は置き場ごと）。止まれば `true`。
+     * 後から入れた予約は失敗の完了で返る
+     */
+    public fun close(timeoutMillis: Long): Boolean {
+        val start = System.nanoTime()
+        val reader = stopSideReader(timeoutMillis)
+        if (!reader) LOG.log(System.Logger.Level.WARNING, "The owner reader of $root did not stop within $timeoutMillis ms")
+        val left = timeoutMillis - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+        return executor.close(left.coerceAtLeast(0)) && reader
+    }
 
     /** 予約した最大の世代（なければ空。#84） */
     public fun reservedGeneration(id: UUID): OptionalLong = reserved[id].toOptional()

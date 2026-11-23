@@ -26,6 +26,9 @@ import java.util.UUID
  * - 開き直した直後（#869）: 同じく開き直し、先読みを待たずに同じ tick に貼る。先読みが読み終えた ID はその場で決まり、未読の ID は
  *   claim を待ちにして（メインスレッドで読まない）、先読みに先に読んでもらってから後の tick に確定する。直前に書いた `owner.bin` は
  *   OS のキャッシュに載っていて先読みがすぐ終わりうるので、貼った時点で先読みが終わっていたかも表に出す
+ * - 書き込みの列が詰まっているとき（#877）: 先読みが終わった後に、貼る位置を持ち主にした `owner.bin` を置き（先読みの値がなく、読みの要る ID）、
+ *   書き込みのスレッドに [BUSY_WRITER_MILLIS] 眠る仕事を入れて列を詰めてから貼る。その ID の仕事は列にないので、列の外の読み手が読み、
+ *   列が空くのを待たずに確定する（確定までの最大が眠る時間より十分短く、上限を過ぎた数が 0）
  *
  * 部品を入れないので電源は入らず、復元は走らない。結果は Markdown の表でログに出す。
  */
@@ -35,6 +38,7 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         UNKNOWN("知らない ID（owner.bin なし）"),
         REOPENED("開き直した後（owner.bin あり、持ち主が自分）"),
         REOPENED_NO_WAIT("開き直した直後（先読みを待たない）"),
+        WRITER_BUSY("書き込みの列が詰まっているとき（先読みの値なし）"),
     }
 
     private class Row(
@@ -53,6 +57,8 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         val prefetchRequests: Long,
         val writerReads: Long,
         val prefetchDoneAtPaste: Boolean,
+        val sideReads: Long,
+        val timeouts: Long,
     )
 
     private val level = helper.level
@@ -88,13 +94,15 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         val deferred: Long,
         val prefetchRequests: Long,
         val writerReads: Long,
+        val sideReads: Long,
+        val timeouts: Long,
     ) {
         companion object {
-            val ZERO = Counters(0, 0, 0, 0, 0, 0, 0, 0)
+            val ZERO = Counters(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
             fun of(s: MachineSaveStore) = Counters(
                 s.claimCount, s.claimNanos, s.mainOwnerReads, s.mainOwnerReadNanos, s.prefetchHits, s.deferredClaims, s.prefetchRequests,
-                s.writerOwnerReadRequests,
+                s.writerOwnerReadRequests, s.sideOwnerReadRequests, s.deferredClaimTimeouts,
             )
         }
     }
@@ -121,6 +129,9 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
                     prefetchWaitStart = System.nanoTime()
                     step = Step.WAIT_PREFETCH
                     waitTicks = 0
+                } else if (Scene.entries[scene] == Scene.WRITER_BUSY) {
+                    prepareBusyWriter()
+                    paste()
                 } else if (Scene.entries[scene] == Scene.REOPENED_NO_WAIT) {
                     // 開き直したのと同じ tick に貼る（先読みを待たない。#869）
                     prepareReopen()
@@ -189,12 +200,29 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         original = null
     }
 
+    /**
+     * 書き込みの列が詰まっている場面の用意（#877）: 先読みの後に置いた `owner.bin`（覚えておらず、先読みの値もない ID）を作り、
+     * 書き込みのスレッドに眠る仕事を入れる（ほかの ID の重い仕事の代わり。`outstanding` には入らない）
+     */
+    private fun prepareBusyWriter() {
+        helper.setBlock(originalPos, Blocks.AIR)
+        original = null
+        val st = store()
+        reopenedIds = List(count) { UUID.randomUUID() }
+        for (i in 0 until count) {
+            OwnerRecord.write(st.root.resolve(reopenedIds[i].toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(0, ownerAt(positions[i])))
+            st.forgetOwnerForTest(reopenedIds[i])
+        }
+        val writer = checkNotNull(WorldMachineSaves.writer) { "no save writer" }
+        writer.execute(UUID.randomUUID()) { Thread.sleep(BUSY_WRITER_MILLIS) }
+    }
+
     private fun paste() {
         val s = Scene.entries[scene]
         val ids = when (s) {
             Scene.DUPLICATE -> List(count) { original!!.identity!!.id }
             Scene.UNKNOWN -> List(count) { UUID.randomUUID() }
-            Scene.REOPENED, Scene.REOPENED_NO_WAIT -> reopenedIds
+            Scene.REOPENED, Scene.REOPENED_NO_WAIT, Scene.WRITER_BUSY -> reopenedIds
         }
         before = Counters.of(store())
         prefetchDoneAtPaste = store().ownerPrefetchDone
@@ -232,6 +260,8 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
             after.prefetchRequests - before.prefetchRequests,
             after.writerReads - before.writerReads,
             prefetchDoneAtPaste,
+            after.sideReads - before.sideReads,
+            after.timeouts - before.timeouts,
         )
         LOGGER.info("Claim paste ({} cases): {} done", count, Scene.entries[scene])
     }
@@ -257,16 +287,16 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
         val sb = StringBuilder()
         sb.append(
             "| 場面 | claim | claim の合計 (ms) | メインスレッドの読み（回 / ms） | 先読みの値を使った | 待ちにした | 確定までの最大 (ms) | " +
-                "先読みに頼んだ / 書き込みのスレッドに頼んだ | 貼った時点で先読みが終わっていた | tick の間隔の最大 (ms) | 直後の書き込み待ち | " +
-                "流しきるまで (ms) | 判定 |\n",
+                "先読みに頼んだ / 書き込みのスレッドに頼んだ / 列の外の読み手に頼んだ | 上限を過ぎた | 貼った時点で先読みが終わっていた | " +
+                "tick の間隔の最大 (ms) | 直後の書き込み待ち | 流しきるまで (ms) | 判定 |\n",
         )
-        sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --- | --: | --: | --: | --- |\n")
+        sb.append("| --- | --: | --: | --: | --: | --: | --: | --: | --: | --- | --: | --: | --: | --- |\n")
         for (r in rows) {
             sb.append(
                 String.format(
-                    Locale.ROOT, "| %s | %d | %.1f | %d / %.1f | %d | %d | %.1f | %d / %d | %s | %.1f | %d | %.0f | %s |\n",
+                    Locale.ROOT, "| %s | %d | %.1f | %d / %.1f | %d | %d | %.1f | %d / %d / %d | %d | %s | %.1f | %d | %.0f | %s |\n",
                     r.scene.label, r.claims, r.claimMillis, r.reads, r.readMillis, r.prefetchHits, r.deferred, r.maxDeferredMillis,
-                    r.prefetchRequests, r.writerReads, if (r.prefetchDoneAtPaste) "はい" else "いいえ", r.maxTickMillis, r.pendingAfter,
+                    r.prefetchRequests, r.writerReads, r.sideReads, r.timeouts, if (r.prefetchDoneAtPaste) "はい" else "いいえ", r.maxTickMillis, r.pendingAfter,
                     r.drainMillis, r.results,
                 ),
             )
@@ -280,5 +310,8 @@ internal class ClaimPasteRun(private val helper: GameTestHelper, private val cou
 
         /** 測る台数（カンマ区切り）を渡すシステムプロパティ（`-PloadTestClaimPaste`） */
         const val PROPERTY: String = "kibicomputers.loadTest.claimPaste"
+
+        /** 書き込みの列が詰まっている場面で、書き込みのスレッドを眠らせる時間（ミリ秒。#877） */
+        private const val BUSY_WRITER_MILLIS = 5_000L
     }
 }
