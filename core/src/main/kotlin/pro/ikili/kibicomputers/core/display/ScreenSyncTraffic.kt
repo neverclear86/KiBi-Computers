@@ -83,8 +83,9 @@ public constructor(
 
     /**
      * 組の巡回の位置（#896）。[ROTATION_RETAIN_TICKS] 以内に積んだ組だけを持つ（今までに映したすべての持ち主は溜めない）。
-     * 番号の小さい組ほど長く送れていないので、先に回す。初めて積んだ組（または消えた後で戻った組）は、その時点の
-     * [serveCount] を番号にする（それより前に送れた組の後ろ、後に送れた組の前に並ぶ）
+     * 番号の小さい組ほど長く送れていないので、先に回す。初めて積んだ組（または消えた後で戻った組）は、[serveCount] を
+     * 1つ進めた番号にする（番号は組ごとに別になるので、直前に送れた組とは同点にならず、それより前に送れた組の後ろ、
+     * 後に送れた組の前に並ぶ）
      */
     private val rotation = HashMap<FairShareGroup, Rotation>()
 
@@ -220,7 +221,7 @@ public constructor(
 
     // 今の tick に [group] を積んだことを記録し、その巡回の位置を返す
     private fun seen(group: FairShareGroup): Rotation {
-        val r = rotation.getOrPut(group) { Rotation(serveCount, tickCount) }
+        val r = rotation.getOrPut(group) { Rotation(++serveCount, tickCount) }
         r.lastSeen = tickCount
         return r
     }
@@ -294,12 +295,18 @@ public constructor(
          */
         public const val DEFAULT_GROUP_BYTES_PER_SECOND: Int = 0
 
+        private const val ROTATION_RETAIN_FACTOR: Int = 8
+
         /**
          * 積まなくなった組の巡回の位置を残す tick 数（#896）。送れなかった画面がキーフレームを試し直す間隔
-         * （[ScreenWatchers.DEFAULT_THROTTLE_RETRY_TICKS]）より十分長くする。短いと、試し直しまで積まなかった組が戻ったときに
-         * 位置を失い、間を置いて積むほかの組と同じ扱いになって、優先度で負け続ける。仮の値
+         * （[ScreenWatchers.DEFAULT_THROTTLE_RETRY_TICKS]）の [ROTATION_RETAIN_FACTOR] 倍。短いと、試し直しまで積まなかった組が
+         * 戻ったときに位置を失い、間を置いて積むほかの組と同じ扱いになって、優先度で負け続ける。
+         * [ScreenWatchers] の `throttleRetryTicks` は [MAX_THROTTLE_RETRY_TICKS] までに限る。仮の値
          */
-        internal const val ROTATION_RETAIN_TICKS: Int = ScreenWatchers.DEFAULT_RESYNC_INTERVAL_TICKS * 2
+        internal const val ROTATION_RETAIN_TICKS: Int = ScreenWatchers.DEFAULT_THROTTLE_RETRY_TICKS * ROTATION_RETAIN_FACTOR
+
+        /** [ScreenWatchers] に渡せる `throttleRetryTicks` の上限（[ROTATION_RETAIN_TICKS] の半分。それより長いと巡回の位置が先に消える） */
+        internal const val MAX_THROTTLE_RETRY_TICKS: Int = ROTATION_RETAIN_TICKS / 2
 
         private val BY_PRIORITY: Comparator<Delivery<*>> = Comparator { a, b -> a.priority.compareTo(b.priority) }
     }

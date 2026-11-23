@@ -53,7 +53,7 @@ public interface ScreenSyncHost<P : Any> {
  * @param stopDistance 見るのをやめる距離（ブロックの数）。[startDistance] 以上
  * @param resyncIntervalTicks 画面全体を送り直す最短の間隔（tick）。仮の値（確定は #251）
  * @param scanIntervalTicks 見はじめる人を探す間隔（tick）
- * @param throttleRetryTicks 送信量の予算で止められた人に、画面全体を送ってみる最短の間隔（tick）。仮の値（確定は #251）
+ * @param throttleRetryTicks 送信量の予算で止められた人に、画面全体を送ってみる最短の間隔（tick）。[ScreenSyncTraffic] の巡回の位置を残す間隔より短くする（上限あり）。仮の値（確定は #251）
  */
 @ApiStatus.Internal
 public class ScreenWatchers<P : Any>
@@ -72,6 +72,10 @@ public constructor(
         require(resyncIntervalTicks >= 0) { "resyncIntervalTicks must not be negative: $resyncIntervalTicks" }
         require(scanIntervalTicks > 0) { "scanIntervalTicks must be positive: $scanIntervalTicks" }
         require(throttleRetryTicks >= 0) { "throttleRetryTicks must not be negative: $throttleRetryTicks" }
+        // これより長いと、止められた組が戻る前に ScreenSyncTraffic の巡回の位置が消える（#896）
+        require(throttleRetryTicks <= ScreenSyncTraffic.MAX_THROTTLE_RETRY_TICKS) {
+            "throttleRetryTicks must not exceed ${ScreenSyncTraffic.MAX_THROTTLE_RETRY_TICKS}: $throttleRetryTicks"
+        }
     }
 
     private val startSquared = startDistance * startDistance

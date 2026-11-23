@@ -174,6 +174,23 @@ class ScreenSyncTrafficFairnessTest {
     }
 
     @Test
+    fun `初めて積んだ組は、直前に送れた組と同点にならず、その後ろに並ぶ`() {
+        // 1 tick に 1 つしか通らない。先に a だけが送れ、次の tick に、遠い a と近い新しい組 c が並ぶ
+        val tr = starvedTraffic(perTick = 60)
+        val hostA = Host(a, 10.0)
+        val hostC = Host(FairShareGroup.of(UUID(0, 3)), 0.0)
+        tr.queue(hostA, 60)
+        tr.endTick()
+        assertEquals(1, hostA.sent)
+        tr.queue(hostA, 60)
+        tr.queue(hostC, 60)
+        tr.endTick()
+        // c の方が近くても、c は a の後ろ（直前に送れたのは a だが、c は初めて積んだ組なので a と同点にしない）
+        assertEquals(2, hostA.sent)
+        assertEquals(0, hostC.sent)
+    }
+
+    @Test
     fun `しばらく積まなかった組の巡回の位置は消し、組が1つの tick は優先度の順のまま`() {
         val tr = starvedTraffic(perTick = 60)
         val hosts = (1..4).map { Host(FairShareGroup.of(UUID(3, it.toLong())), it.toDouble()) }
