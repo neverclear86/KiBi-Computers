@@ -25,6 +25,18 @@ import java.io.ByteArrayOutputStream
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
+/** 変換のテスト用の切り替え（#338）。本番の読み込み（`Instrumentation`）は、いつも [NONE] */
+internal enum class AsyncifyDebug {
+    /** 生きているローカルだけを退避する（本番の形） */
+    NONE,
+
+    /** 今までの形: すべてのローカルを退避する（生存解析と出力を比べるため） */
+    SAVE_ALL,
+
+    /** 生きているローカルだけを退避し、巻き直しの入口で、戻さないローカル（参照型を除く）にごみを入れる（解析の漏れを見つけるため） */
+    POISON_UNSAVED,
+}
+
 /**
  * 読み込み時にかける、待機点への変換（asyncify 相当。#329、方式は ADR 0316、PoC は `poc/threadless-wait/`）。
  *
@@ -66,8 +78,12 @@ internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
  *   線形メモリには書かない（モジュールのメモリの配置を変えない）。import の関数の最後に足すので、定義済みの関数の番号が2つずれる
  * - 可変の i32 のグローバル（状態。0 = NORMAL、1 = UNWINDING、2 = REWINDING）。`kibi_async_state` という名前で export する
  *
- * 1つの関数が巻き戻しで積む値の並び: 退避するローカル（i32・f32・f64 は 64 ビットに広げる。参照型は null だけで、
+ * 1つの関数が巻き戻しで積む値の並び: 退避するローカル（番号の小さい順。i32・f32・f64 は 64 ビットに広げる。参照型は null だけで、
  * null でなければ trap）、最後に「どの呼び出しで止まったか」の番号。内側の関数から順に積み、巻き直しは外側から順に取り出す。
+ * 退避するローカルは関数ごとに決まった集合（#338）: 元のローカルのうち、どれかの待ち点の後で読まれうるもの（生存解析）と、
+ * 巻き直しで読む一時ローカル（待ち点の前に移したオペランドスタック、待ち点の構造の引数、やり直す呼び出しに要る引数）。
+ * 退避しないローカルは、巻き直しの後は呼ばれたときの値（引数）か 0 のまま。巻き直しの道（止まった呼び出しより前の待ち点の構造を通る）で
+ * それを読んでも、ランと呼び出しを飛ばすので害はない（`if` の条件は退避した一時ローカルから読む）。
  *
  * 燃料切れの待ち点化（#339。[transform] の `yieldImport`）: 止まりうる関数の中の `yieldImport`（燃料切れの `kibi.fuel`）の呼び出しも
  * 待ち点にし、呼び先を [WasmAsync.FUEL]（`kibi.async_fuel`）に書き換える。`yieldImport` は止まりうる関数の判定には使わない
@@ -98,6 +114,8 @@ internal object Asyncify {
      * @property codeAfter 同じく変換後
      * @property maxLocals 変換した関数の、退避するローカル変数の数の最大
      * @property yieldSites 待ち点にした燃料切れの呼び出しの数（`yieldImport` がないときは 0。[sites] に含む）
+     * @property savedLocals 変換した関数の、退避するローカル変数の数の和（#338。生きているものだけ）
+     * @property allLocals 同じく、変換した関数のローカル変数（足した一時ローカルを含み、呼び出しの番号を除く）の数の和（すべてを退避したときの [savedLocals]）
      */
     class Result(
         val bytes: ByteArray,
@@ -108,6 +126,8 @@ internal object Asyncify {
         val codeAfter: Int,
         val maxLocals: Int,
         val yieldSites: Int,
+        val savedLocals: Int,
+        val allLocals: Int,
     )
 
     private fun parse(wasm: ByteArray): WasmModule = try {
@@ -141,8 +161,9 @@ internal object Asyncify {
         waitImports: Set<String>,
         yieldImport: String? = null,
         originalFunc: (Int) -> Int = { it },
+        debug: AsyncifyDebug = AsyncifyDebug.NONE,
         checkpoint: () -> Unit = {},
-    ): Result = prepare(wasm, checkpoint).transform(waitImports, emptySet(), yieldImport, originalFunc, checkpoint)
+    ): Result = prepare(wasm, checkpoint).transform(waitImports, emptySet(), yieldImport, originalFunc, debug, checkpoint)
 
     /**
      * 関数の型（引数と結果の値の型の並び。値の型は WASM のバイナリの型の番号）。コンポーネントの core モジュールをまたいで、
@@ -190,8 +211,9 @@ internal object Asyncify {
             externalSuspendTypes: Set<Signature> = emptySet(),
             yieldImport: String? = null,
             originalFunc: (Int) -> Int = numbering,
+            debug: AsyncifyDebug = AsyncifyDebug.NONE,
             checkpoint: () -> Unit = {},
-        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes).run() }
+        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug).run() }
 
         private inline fun <T> guard(block: () -> T): T = try {
             block()
@@ -239,6 +261,19 @@ internal object Asyncify {
 
 private const val UNWINDING = 1
 private const val REWINDING = 2
+
+/**
+ * 生存解析（#338）の大きさの上限: 解析の頂点の数（基本ブロックと、`try_table` の catch 先の節）× ローカル変数の 64 個の組の数。
+ * 超えた関数は、すべてのローカルを退避する（今までの形）。1 つのビット集合の配列が 8 MiB（3 本で 24 MiB）になる大きさ。
+ * lua.wasm のいちばん大きい関数でも、この 1% 未満。
+ *
+ * ビット集合のほかに作る配列（頂点ごとの後続など）は、関数の命令の数とバイト数に比例する大きさ（命令ごとに、囲む catch 先の数に比例する配列は作らない）。
+ * 基本ブロックの数が上限を超えると決まった時点で、後続の配列を作る前にやめる。組み立てのループでも [Transformer.checkpoint] を呼ぶ（時間の上限。#40）
+ */
+private const val LIVENESS_LIMIT_WORDS = 1L shl 20
+
+/** [AsyncifyDebug.POISON_UNSAVED] で、戻さないローカルに入れる値 */
+private const val POISON = 0x5EADBEEF5EADBEEFL
 
 private const val I32 = 0x7F
 private const val I64 = 0x7E
@@ -305,6 +340,7 @@ private class Transformer(
     private val checkpoint: () -> Unit,
     /** モジュールの外から止まりうるとみなす関数の型（#757。[Asyncify.Prepared.transform]） */
     private val externalSuspendTypes: Set<Asyncify.Signature> = emptySet(),
+    private val debug: AsyncifyDebug = AsyncifyDebug.NONE,
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
@@ -586,11 +622,13 @@ private class Transformer(
             }
         }
         return Asyncify.Result(
-            out.toByteArray(), bodies.size, instrumented, sites, codeBefore, codeAfter, maxLocals, yieldSites,
+            out.toByteArray(), bodies.size, instrumented, sites, codeBefore, codeAfter, maxLocals, yieldSites, savedTotal, localsTotal,
         )
     }
 
     // 変換の集計（[rewriteCode] が数える）
+    private var savedTotal = 0
+    private var localsTotal = 0
     private var codeBefore = 0
     private var codeAfter = 0
     private var instrumented = 0
@@ -809,11 +847,33 @@ private class Transformer(
             free.getOrPut(localTypes[idx]) { ArrayDeque() }.addLast(idx)
         }
 
+        /**
+         * 巻き戻しで退避する一時ローカル（#338）。待ち点の直前でオペランドスタックを移した一時ローカル（`keep`）、
+         * 待ち点の構造の引数（`if` の条件を含む。巻き直しで構造に入る直前に積み直す）、巻き直しで同じ呼び出しをやり直すのに要る
+         * 呼び出しの引数（止まりうる import は最初からやり直す。`call_indirect` の表の番号・`call_ref` の参照は同じ関数を呼ぶのに要る）。
+         * 定義済みの関数への直接の `call` の引数（呼ばれた側が自分の生きているローカルを戻す）と、燃料切れの呼び出しの引数（巻き直しでは使わない）は退避しない。
+         * 一時ローカルは使い回すので、どこかの待ち点でこれに当たったものの和を取る
+         */
+        private val savedTemps = HashSet<Int>()
+
         /** (呼び出しの数, 退避するローカルの数) */
         fun rewrite(out: Sink): Pair<Int, Int> {
             val (nodes, _) = buildTree(0)
             val body = Sink()
             emitSuspendBody(body, nodes, sig.results, 0)
+            val live = if (debug == AsyncifyDebug.SAVE_ALL) null else liveAcrossWaitPoints()
+            // 退避するローカル（番号の小さい順に積み、逆の順に取り出す。積むものと取り出すものは、いつもこの1つの並びから作る）
+            val saved = localTypes.indices.filter { i ->
+                when {
+                    i == kLocal -> false
+                    live == null -> true
+                    i < origLocals -> live[i]
+                    else -> i in savedTemps
+                }
+            }
+            val isSaved = BooleanArray(localTypes.size).also { a -> saved.forEach { a[it] = true } }
+            savedTotal += saved.size
+            localsTotal += localTypes.size - 1
 
             // ローカル変数の宣言
             val r = Reader(wasm, bodyStart, list.first().address())
@@ -831,8 +891,7 @@ private class Transformer(
             out.u8(0x23); out.leb(stateGlobal); out.u8(0x41); out.sleb(REWINDING.toLong()); out.u8(0x46)
             out.u8(0x04); out.u8(0x40)
             out.u8(0x10); out.leb(popFunc); out.u8(0xA7); out.u8(0x21); out.leb(kLocal)
-            for (i in localTypes.indices.reversed()) {
-                if (i == kLocal) continue
+            for (i in saved.reversed()) {
                 val t = localTypes[i]
                 if (isRef(t)) {
                     out.u8(0xD0); out.u8(t)
@@ -846,6 +905,20 @@ private class Transformer(
                 }
                 out.u8(0x21); out.leb(i)
             }
+            if (debug == AsyncifyDebug.POISON_UNSAVED) {
+                // テスト用: 戻さないローカルにごみを入れる（生存の解析の漏れを、0 で初期化された値がたまたま合うことで見逃さないため）
+                for (i in localTypes.indices) {
+                    if (i == kLocal || isSaved[i]) continue
+                    when (localTypes[i]) {
+                        I32 -> { out.u8(0x41); out.sleb(POISON.toInt().toLong()) }
+                        I64 -> { out.u8(0x42); out.sleb(POISON) }
+                        F32 -> { out.u8(0x41); out.sleb(POISON.toInt().toLong()); out.u8(0xBE) }
+                        F64 -> { out.u8(0x42); out.sleb(POISON); out.u8(0xBF) }
+                        else -> continue
+                    }
+                    out.u8(0x21); out.leb(i)
+                }
+            }
             out.u8(0x0B)
 
             out.u8(0x02); out.u8(0x40) // $unwind
@@ -856,8 +929,7 @@ private class Transformer(
             out.u8(0x0B)
 
             // 巻き戻し: ローカルと k を積んで、ダミーの値で戻る
-            for (i in localTypes.indices) {
-                if (i == kLocal) continue
+            for (i in saved) {
                 val t = localTypes[i]
                 out.u8(0x20); out.leb(i)
                 if (isRef(t)) {
@@ -874,8 +946,226 @@ private class Transformer(
             out.u8(0x20); out.leb(kLocal); out.u8(0xAD); out.u8(0x10); out.leb(pushFunc)
             dummies(out, sig.results)
             out.u8(0x0B)
-            return siteCount to localTypes.size
+            return siteCount to saved.size
         }
+
+        /**
+         * 元のローカル（引数と宣言したもの）のうち、どれかの待ち点（止まりうる呼び出し）の後で読まれうるもの（#338）。
+         * 巻き直しの道（ランと呼び出しを飛ばして止まった呼び出しまで進む）は元のローカルを読まない（一時ローカルだけを読む）ので、
+         * 戻す必要があるのは、止まった呼び出しから戻った後に元のプログラムが読むものだけ。
+         *
+         * 関数の本体の制御フロー（分岐・loop の後ろ向きの辺・`br_table`・`try_table` の catch 先への辺）で後ろ向きの生存解析をする。
+         * catch 先への辺は、`try_table` の中の投げうる命令（呼び出しと `throw`・`throw_ref`）から、囲むすべての `try_table` の catch 先へ張る
+         * （止まった呼び出しが、再開した後で投げうる）。囲むものすべてへ命令ごとに辺を張ると、確保が「命令の数 × 入れ子の深さ」になるので、
+         * `try_table` ごとに「自分の catch 先と外側の節」を持つ節の頂点を 1 つ作り、命令からは内側の節 1 つへだけ辺を張る（頂点は命令の数に比例）。
+         *
+         * 解析が大きすぎる（頂点の数 × ローカルの数が [LIVENESS_LIMIT_WORDS] の 64 倍を超える）と `null`（すべてを退避する）。
+         * 追えない分岐（GC の `br_on_*`）の命令があっても `null` にするが、それらは [emitSuspendBody] が先に断る（変換できない作りとして読み込みを断る）ので、
+         * 実際にはここまで来ない。どちらに切り替えるかは入力だけで決まる（決定的。`Instrumentation.VERSION`）
+         */
+        private fun liveAcrossWaitPoints(): BooleanArray? {
+            val n = list.size
+            val nl = origLocals
+            if (n == 0 || list[n - 1].opcode() != OpCode.END) return null
+            val ops = Array(n) { list[it].opcode() }
+            // 構造の開き → 対応する end。else → その if
+            val match = IntArray(n) { -1 }
+            val ifOfElse = IntArray(n) { -1 }
+            val elseOfIf = IntArray(n) { -1 }
+            run {
+                val st = ArrayList<Int>()
+                for (i in 0 until n) when (ops[i]) {
+                    OpCode.BLOCK, OpCode.LOOP, OpCode.IF, OpCode.TRY_TABLE -> st += i
+                    OpCode.ELSE -> {
+                        ifOfElse[i] = st.last()
+                        elseOfIf[st.last()] = i
+                    }
+                    OpCode.END -> if (st.isNotEmpty()) match[st.removeAt(st.size - 1)] = i
+                    else -> Unit
+                }
+            }
+            fun structural(op: OpCode) = op == OpCode.BLOCK || op == OpCode.LOOP || op == OpCode.IF || op == OpCode.TRY_TABLE ||
+                op == OpCode.ELSE || op == OpCode.END
+
+            fun mayThrow(op: OpCode) = op == OpCode.CALL || op == OpCode.CALL_INDIRECT || op == OpCode.CALL_REF ||
+                op == OpCode.THROW || op == OpCode.THROW_REF
+
+            val words = (nl + 63) ushr 6
+            if (words == 0) return BooleanArray(0)
+
+            // 基本ブロックに分け、それぞれの後続を求める。後続は、0 以上なら命令の番号（その命令のあるブロック）、負なら catch 先の節 `-(k + 1)`。
+            // 投げうる命令から囲むすべての catch 先への辺は、命令ごとに配列を作らず、`try_table` ごとの節（自分の catch 先と、外側の節）を
+            // 1 つ作って、そこを通して張る（確保する量を、命令の数に比例する大きさに抑える）
+            val blockOf = IntArray(n)
+            val starts = ArrayList<Int>()
+            val succIns = ArrayList<IntArray>()
+            val labels = ArrayList<Int>() // 開いている構造（内側が最後）
+            val handlerStack = ArrayList<Int>() // 開いている構造ごとの、いちばん内側の囲む節（なければ -1）
+            val handlerTargets = ArrayList<IntArray>() // 節ごとの、自分の catch 先（命令の番号）
+            val handlerOuter = ArrayList<Int>() // 節ごとの、外側の節（なければ -1）
+            var prevEnder = true
+            val empty = IntArray(0)
+
+            fun target(l: Long): Int {
+                if (l >= labels.size) return n - 1
+                val s = labels[labels.size - 1 - l.toInt()]
+                return if (ops[s] == OpCode.LOOP) s else match[s]
+            }
+            for (i in 0 until n) {
+                // 大きな関数でも、時間の上限（#40）が効くようにする
+                if ((i and 0x3FF) == 0x3FF) checkpoint()
+                val op = ops[i]
+                if (prevEnder || structural(op)) {
+                    if (starts.isNotEmpty() && succIns.size < starts.size) succIns += intArrayOf(i)
+                    starts += i
+                    // 上限を超えると決まったら、後続の配列などを作る前にやめる
+                    if (starts.size.toLong() * words > LIVENESS_LIMIT_WORDS) return null
+                }
+                blockOf[i] = starts.size - 1
+                val handler = if (handlerStack.isEmpty()) -1 else handlerStack.last()
+                val end = endOf[list[i]]!!
+                var succ: IntArray? = null
+                when (op) {
+                    OpCode.BLOCK, OpCode.LOOP, OpCode.TRY_TABLE, OpCode.IF -> {
+                        var own = handler
+                        if (op == OpCode.TRY_TABLE) {
+                            val r = Reader(wasm, blockSig(list[i]).third, end)
+                            val c = r.leb().toInt()
+                            if (c > 0) {
+                                val t = IntArray(c) {
+                                    val kind = r.u8()
+                                    if (kind == 0 || kind == 1) r.leb()
+                                    target(r.leb())
+                                }
+                                handlerTargets += t
+                                handlerOuter += handler
+                                own = handlerTargets.size - 1
+                            }
+                        }
+                        succ = if (op == OpCode.IF) {
+                            intArrayOf(i + 1, if (elseOfIf[i] >= 0) elseOfIf[i] + 1 else match[i])
+                        } else {
+                            intArrayOf(i + 1)
+                        }
+                        labels += i
+                        handlerStack += own
+                    }
+                    OpCode.ELSE -> succ = intArrayOf(match[ifOfElse[i]])
+                    OpCode.END -> {
+                        if (labels.isNotEmpty()) {
+                            labels.removeAt(labels.size - 1)
+                            handlerStack.removeAt(handlerStack.size - 1)
+                        }
+                        succ = if (i + 1 < n) intArrayOf(i + 1) else empty
+                    }
+                    OpCode.BR -> succ = intArrayOf(target(Reader(wasm, list[i].address() + 1, end).leb()))
+                    OpCode.BR_IF -> succ = intArrayOf(i + 1, target(Reader(wasm, list[i].address() + 1, end).leb()))
+                    OpCode.BR_TABLE -> {
+                        val r = Reader(wasm, list[i].address() + 1, end)
+                        val c = r.leb().toInt()
+                        succ = IntArray(c + 1) { target(r.leb()) }
+                    }
+                    OpCode.RETURN, OpCode.UNREACHABLE, OpCode.RETURN_CALL, OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF -> succ = empty
+                    OpCode.THROW, OpCode.THROW_REF -> succ = if (handler >= 0) intArrayOf(-(handler + 1)) else empty
+                    // 追えない分岐。ただし、これらは emitSuspendBody が先に断るので、ここには来ない（保険）
+                    OpCode.BR_ON_NULL, OpCode.BR_ON_NON_NULL, OpCode.BR_ON_CAST, OpCode.BR_ON_CAST_FAIL -> return null
+                    else -> if (handler >= 0 && mayThrow(op)) succ = intArrayOf(i + 1, -(handler + 1))
+                }
+                prevEnder = succ != null
+                if (succ != null) succIns += succ
+            }
+            if (succIns.size < starts.size) succIns += empty
+            val blocks = starts.size
+            val nodes = blocks + handlerTargets.size
+            if (nodes.toLong() * words > LIVENESS_LIMIT_WORDS) return null
+            fun nodeOf(x: Int) = if (x >= 0) blockOf[x] else blocks - x - 1
+
+            // 節の後続は、自分の catch 先と外側の節
+            val succ = Array(nodes) { v ->
+                val raw = if (v < blocks) {
+                    succIns[v]
+                } else {
+                    val k = v - blocks
+                    val outer = handlerOuter[k]
+                    val t = handlerTargets[k]
+                    if (outer >= 0) t + (-(outer + 1)) else t
+                }
+                distinctNodes(IntArray(raw.size) { nodeOf(raw[it]) })
+            }
+            fun blockEnd(b: Int) = if (b + 1 < blocks) starts[b + 1] else n
+
+            // ブロックごとの gen（先に読む）と kill（先に書く）
+            val gen = LongArray(nodes * words)
+            val kill = LongArray(nodes * words)
+            for (b in 0 until blocks) {
+                val base = b * words
+                for (i in blockEnd(b) - 1 downTo starts[b]) {
+                    val x = localOperand(i, ops[i]) ?: continue
+                    val w = base + (x ushr 6)
+                    val bit = 1L shl (x and 63)
+                    if (ops[i] == OpCode.LOCAL_GET) {
+                        gen[w] = gen[w] or bit
+                    } else {
+                        gen[w] = gen[w] and bit.inv()
+                        kill[w] = kill[w] or bit
+                    }
+                }
+            }
+            // 不動点まで（後ろのブロックから）
+            val liveIn = LongArray(nodes * words)
+            val tmp = LongArray(words)
+            var changed = true
+            while (changed) {
+                checkpoint()
+                changed = false
+                for (b in nodes - 1 downTo 0) {
+                    tmp.fill(0)
+                    for (s in succ[b]) for (w in 0 until words) tmp[w] = tmp[w] or liveIn[s * words + w]
+                    val base = b * words
+                    for (w in 0 until words) {
+                        val v = gen[base + w] or (tmp[w] and kill[base + w].inv())
+                        if (v != liveIn[base + w]) {
+                            liveIn[base + w] = v
+                            changed = true
+                        }
+                    }
+                }
+            }
+            // 待ち点の直後で生きているものの和
+            val result = LongArray(words)
+            for (b in 0 until blocks) {
+                if ((starts[b] until blockEnd(b)).none { isWaitInstruction(ops[it], it) }) continue
+                tmp.fill(0)
+                for (s in succ[b]) for (w in 0 until words) tmp[w] = tmp[w] or liveIn[s * words + w]
+                for (i in blockEnd(b) - 1 downTo starts[b]) {
+                    if (isWaitInstruction(ops[i], i)) for (w in 0 until words) result[w] = result[w] or tmp[w]
+                    val x = localOperand(i, ops[i]) ?: continue
+                    val bit = 1L shl (x and 63)
+                    val w = x ushr 6
+                    tmp[w] = if (ops[i] == OpCode.LOCAL_GET) tmp[w] or bit else tmp[w] and bit.inv()
+                }
+            }
+            return BooleanArray(nl) { result[it ushr 6] and (1L shl (it and 63)) != 0L }
+        }
+
+        /** [a] の重複を除く（順番は問わない。箱に入れずに、小さな配列のまま） */
+        private fun distinctNodes(a: IntArray): IntArray {
+            if (a.size < 2) return a
+            a.sort()
+            var m = 1
+            for (j in 1 until a.size) if (a[j] != a[j - 1]) a[m++] = a[j]
+            return if (m == a.size) a else a.copyOf(m)
+        }
+
+        /** `local.get`・`local.set`・`local.tee` の元のローカルの番号。それ以外は `null` */
+        private fun localOperand(i: Int, op: OpCode): Int? = when (op) {
+            OpCode.LOCAL_GET, OpCode.LOCAL_SET, OpCode.LOCAL_TEE -> list[i].operand(0).toInt().takeIf { it < origLocals }
+            else -> null
+        }
+
+        /** 待ち点になりうる呼び出し（[isSuspendCall]。末尾呼び出しは除く。到達できないところのものも含む） */
+        private fun isWaitInstruction(op: OpCode, i: Int): Boolean =
+            (op == OpCode.CALL || op == OpCode.CALL_INDIRECT || op == OpCode.CALL_REF) && isSuspendCall(list[i])
 
         private fun buildTree(from: Int): Pair<List<Node>, Int> {
             val nodes = ArrayList<Node>()
@@ -915,6 +1205,17 @@ private class Transformer(
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
                 if (indirectMaySuspend(ins)) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             else -> false
+        }
+
+        /**
+         * 巻き直しで、止まった呼び出しをやり直すときに引数が要るか。定義済みの関数への直接の `call` は、呼ばれた側が入口で
+         * 自分の生きているローカルを戻す（引数のローカルも、要るものは退避している）ので要らない。燃料切れの呼び出し（[WasmAsync.FUEL]）は、
+         * 巻き直しで着いたときに引数を見ない（`onFuelExhaustedUnwindable`）
+         */
+        private fun needsArgsOnRewind(ins: AnnotatedInstruction): Boolean = when {
+            isYieldCall(ins) -> false
+            ins.opcode() == OpCode.CALL -> ins.operand(0).toInt() < importedFuncs
+            else -> true
         }
 
         private val suspendMemo = HashMap<Node, Boolean>()
@@ -1158,6 +1459,9 @@ private class Transformer(
                 run.clear()
                 val keep = spill.subList(0, spill.size - consumed)
                 val args = spill.subList(spill.size - consumed, spill.size)
+                // 巻き直しで読む一時ローカル（[savedTemps]）
+                savedTemps += keep
+                if (node is Struct || needsArgsOnRewind((node as Leaf).ins)) savedTemps += args
                 val resultTemps: List<Int>
                 when (node) {
                     is Leaf -> {

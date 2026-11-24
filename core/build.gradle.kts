@@ -84,6 +84,11 @@ tasks.test {
             providers.gradleProperty("kibi.overdraftBenchmark.$name").orNull?.let { systemProperty("kibi.overdraftBenchmark.$name", it) }
         }
     }
+    // 待機点への変換の速さを測る（#338。`-Pkibi.asyncifyBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.asyncifyBenchmark").orNull == "true") {
+        systemProperty("kibi.asyncifyBenchmark", "true")
+        providers.gradleProperty("kibi.asyncifyBenchmark.rounds").orNull?.let { systemProperty("kibi.asyncifyBenchmark.rounds", it) }
+    }
     // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
     providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
         systemProperty("kibi.luaReplMachines", it)
