@@ -346,6 +346,8 @@ const FIX_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     pushed: { type: 'boolean' },
+    // CI の直し（ci-fix）だけが使う。PR と関係のない不安定なテストと判断し、push せずに落ちたジョブを回し直した
+    rerun: { type: 'boolean' },
     summary: { type: 'string' },
   },
   required: ['pushed', 'summary'],
@@ -592,7 +594,7 @@ async function waitCi(pr, label) {
       `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。コードは変更しない。
 1. 先に \`gh pr view ${pr} --json mergeable,mergeStateStatus\` で main との衝突を確かめる。\`mergeable\` は計算が終わるまで UNKNOWN を返すので、UNKNOWN の間は 30 秒ほどおいて 5 回まで取り直す（前景の \`sleep\` は使えないので、\`gh pr checks ${pr} --watch --interval 30\` を 1 回はさむなどで間を空ける）。CONFLICTING なら、GitHub は衝突している PR の CI を動かさないので、待たずに passed=false・failingChecks=[]・mergeable=CONFLICTING・noChecks=true で返す。
 2. \`gh pr checks ${pr} --watch --interval 30\` で待つ（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。チェックが 1 つも出ないまま（「no checks reported」など）${NO_CHECKS_MINUTES} 分ほどたったら、待つのをやめ、もう一度 \`mergeable\` を取って、passed=false・failingChecks=[]・noChecks=true で返す。
-3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。
+3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。failureLog の先頭には、落ちた run の ID と試行の番号（\`gh run view <run-id> --json attempt\`）を書く（CI は、落ちた run に artifact \`test-reports-attempt-<試行の番号>\` としてテスト結果の XML と GameTest のログを残す）。
 mergeable には、最後に取った \`mergeable\` の値を入れる。`,
       { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
     )
@@ -674,21 +676,27 @@ async function untilGreen(info, impl, tag) {
     const { result: fixed, stillPending } = await withGradleWait(
       `PR #${impl.pr} の CI の修正（${i}）`, info.number, impl.worktree,
       note => agent(
-        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。${note ? `\n${note}` : ''}
+        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。原因を調べ、PR の変更が原因なら worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する（不安定なテストのときの扱いは下に書く）。${note ? `
+${note}` : ''}
 ${gradleRules(info.number, `ci-fix${i}${note ? '-wait' : ''}`)}
 失敗したチェック: ${failing}
+まず、落ちた run の artifact \`test-reports-attempt-<試行の番号>\`（テスト結果の XML と GameTest のログ。run の ID と試行の番号はログ抜粋の先頭にある）を、worktree の外に取る: \`gh run download <run-id> -n test-reports-attempt-<n> -D <ルート>/.worktrees/.logs/issue-${info.number}/ci-reports-<run-id>-<n>\`（中のパスは手元のビルド出力と同じなので、worktree の中に展開しない）。artifact が無いとき（コンパイルで落ちた、upload の段まで進まなかったなど）は、ログ抜粋と \`gh run view <run-id> --log-failed\` から原因を探す。そのうえで、次のどれかで返す。
+- PR の変更が原因なら、直して push し、pushed=true で返す。
+- PR の変更と関係のない不安定なテストと判断したとき（PR が触っていない所のテストで、手元で繰り返しても再現しない、main でも同じテストが落ちたことがある、など）は、コードを直さない。落ちたテストの \`<testcase>\` の抜粋（\`<failure>\` と関係する system-out。XML の全文は GitHub のコメントの上限 65,536 文字を超えることがあるので貼らない）と run の URL を添えて新しい Issue を作り（同じテストの Issue がもうあれば、そこにコメントする）、AGENTS.md の手順で適切な Epic のサブ Issue にする。PR にその Issue の番号をコメントしてから、\`gh run rerun <run-id> --failed\` で落ちたジョブを回し直し、\`gh run view <run-id> --json status\` で queued か in_progress になったのを確かめて、pushed=false・rerun=true で返す（summary に Issue の番号を書く）。
+- 直せず、回し直す理由もないときは、pushed=false・rerun=false で返し、summary に理由を書く。
 ログ抜粋:
 ${failureLog}`,
         { label: `ci-fix${note ? '-wait' : ''}:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
       ),
-      r => gradlePending(r, r?.summary, r?.pushed === false),
+      r => gradlePending(r, r?.summary, r?.pushed === false && r?.rerun !== true),
     )
     if (fixed && stillPending) {
       // 直しのビルドを確かめていないので、直ったことにして先へ進めない。落ちたまま、理由を添えて返す
       ci = { ...ci, failingChecks: [...ci.failingChecks, pendingReason(`CI の修正（${i}）の段階`, fixed)] }
       break
     }
-    if (!fixed || !fixed.pushed) break
+    // 不安定なテストで回し直したとき（rerun）も、push したときと同じく CI を待ち直す
+    if (!fixed || !(fixed.pushed || fixed.rerun)) break
     ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}#${i}`, conflictState)
   }
   return ci

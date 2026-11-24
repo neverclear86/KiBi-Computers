@@ -62,6 +62,6 @@
 
 ## 今の範囲に入れなかったもの
 
-- `const val` のマシンごとの上限（`Machine`・`DeviceLimits`・`Pipe`・`Tty`・`EventLimits`・`HostFiles` など）と `PartTier` の値、`RebootBackoff.DEFAULT`。`MachineConfig` を通す作り直しが要り、#205 と重なるので別の Issue にする。
+- `const val` のマシンごとの上限（`Machine`・`DeviceLimits`・`Pipe`・`Tty`・`EventLimits`・`HostFiles` など）と `PartTier` の値、`RebootBackoff.DEFAULT`。`MachineConfig` を通す作り直しが要り、#205 と重なるので別の Issue にする。→ #719 で `machine`・`reboot`・`cpu`・`memory`・`storage` 区画と `scheduler` の2項目にした（ゲストに見える形の上限と見積もりの定数は入れていない。ADR 0719）。
 - CLIENT の項目（描画の細かさなど）。仕組みは分類を問わないので、項目を足せば登録される。
 - 1.20.1 の使う側（スケジューラなど）。1.20.1 の接続層はまだ雛形なので、spec の登録と写しを作るところまで（#224）。

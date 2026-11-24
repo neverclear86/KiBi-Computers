@@ -8,14 +8,18 @@ import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ChunkTrackingView
 import net.minecraft.server.level.ClientInformation
 import net.minecraft.server.level.ServerPlayer
+import net.minecraft.server.level.TicketType
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.HumanoidArm
 import net.minecraft.world.entity.player.ChatVisiblity
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.chunk.status.ChunkStatus
 import net.minecraft.world.level.portal.DimensionTransition
 import net.minecraft.world.phys.Vec3
+import net.neoforged.neoforge.common.NeoForge
+import net.neoforged.neoforge.event.level.ChunkWatchEvent
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
@@ -33,6 +37,7 @@ import pro.ikili.kibicomputers.neoforge.display.ScreenUpdatePayload
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.concurrent.CompletableFuture
 
 /** サーバーからクライアントへの画面の同期（#140、#359）の GameTest。 */
 @GameTestHolder(KiBiComputers.MOD_ID)
@@ -388,6 +393,8 @@ object ScreenSyncGameTests {
                 helper.assertTrue(!a.isWatchedBy(player) && !b.isWatchedBy(player), "logout should drop the player from all screens")
                 helper.assertTrue(ScreenSync.traffic.bytesSent(player) == 0L, "logout should drop the player's traffic")
                 helper.assertTrue(ScreenSync.traffic.keyframesSent(player) == 0L, "logout should drop the player's keyframes")
+                // ログアウトのイベントの後に出る UnWatch で、記録が作り直されない（#655）
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "logout should drop the player's sent chunks")
             }
             .thenSucceed()
     }
@@ -399,10 +406,12 @@ object ScreenSyncGameTests {
         helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
         val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
         val (player, client) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        var respawnedPlayer: ServerPlayer? = null
         helper.startSequence()
             .thenWaitUntil {
                 helper.assertTrue(be.isWatchedBy(player), "the player should be watching")
                 helper.assertTrue(ScreenSync.traffic.bytesSent(player) > 0, "sent bytes should be counted")
+                helper.assertTrue(ScreenSync.sentChunkCount(player) > 0, "sent chunks should be recorded")
             }
             .thenExecute {
                 val respawned = helper.level.server.playerList.respawn(player, false, Entity.RemovalReason.KILLED)
@@ -412,35 +421,107 @@ object ScreenSyncGameTests {
                 helper.assertTrue(!be.isWatchedBy(player), "the old player object should not be watching")
                 helper.assertTrue(ScreenSync.traffic.bytesSent(player) == 0L, "the old player object should not be counted")
                 helper.assertTrue(ScreenSync.traffic.keyframesSent(player) == 0L, "the old player's keyframes should be dropped")
-                cleanUp(helper, respawned)
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "the old player's sent chunks should be dropped")
+                respawnedPlayer = respawned
+            }
+            // 本物の接続では、リスポーンのパケットの処理で接続の player が替わるまでの Sent が古いオブジェクトに出る。
+            // 偽物の接続では、送信枠や順番待ちの中身しだいで Sent が出ないこともあるので、イベントを直に出して確かめる。
+            // 古いオブジェクトへの Sent で記録が作り直されない（#655）
+            .thenExecute {
+                val level = helper.level
+                val chunk = level.getChunkAt(helper.absolutePos(POS))
+                NeoForge.EVENT_BUS.post(ChunkWatchEvent.Sent(player, chunk, level))
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "a Sent for the old player object should be ignored")
+                // 対照: 同じイベントを新しいオブジェクトに出すと記録される（イベントが処理に届いていることの確かめ）
+                val respawned = respawnedPlayer!!
+                NeoForge.EVENT_BUS.post(ChunkWatchEvent.Sent(respawned, chunk, level))
+                helper.assertTrue(
+                    ScreenSync.isChunkSent(level, respawned, chunk.pos),
+                    "a Sent for the new player object should be recorded",
+                )
+            }
+            // 偽物の接続のままの送信でも、古いオブジェクトの記録は作り直されない
+            .thenIdle(2)
+            .thenExecute {
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "a Sent for the old player object should be ignored")
+                cleanUp(helper, respawnedPlayer!!)
             }
             .thenSucceed()
     }
 
-    /** ディメンションを移ると、元のディメンションの画面の見ている人から外れる。勘定は残る（#382）。 */
+    /**
+     * ディメンションを移ると、元のディメンションの画面の見ている人から外れる。勘定は残る（#382）。
+     * 送ったチャンクの記録は捨てられ、移った先の Sent で新しいレベルの記録になる（元のディメンションの同じ座標の
+     * チャンクは送ったものと数えない。#655）。
+     */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 600)
     fun changingDimensionStopsWatching(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.MONOCHROME).get())
         val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
         val (player, _) = watcherAt(helper, ScreenTier.MONOCHROME, 2.0)
+        val overworld = helper.level
+        val screenChunk = ChunkPos(helper.absolutePos(POS))
+        // ネザーの (0, 0) のチャンク。元のディメンションの同じ座標は、別のチャンクとして扱われる
+        val netherChunk = ChunkPos(0, 0)
         helper.startSequence()
-            .thenWaitUntil { helper.assertTrue(be.isWatchedBy(player), "the player should be watching") }
+            .thenWaitUntil {
+                helper.assertTrue(be.isWatchedBy(player), "the player should be watching")
+                helper.assertTrue(ScreenSync.isChunkSent(overworld, player, screenChunk), "the screen's chunk should be recorded as sent")
+            }
             .thenExecute {
                 val nether = helper.level.server.getLevel(Level.NETHER)
                 helper.assertTrue(nether != null, "the nether should exist on the test server")
+                checkNotNull(nether)
+                // ネザーの (0, 0) とその周り 1 チャンクを、この tick の中で作り切っておく。(0, 0) を送れる状態（ブロックが
+                // tick する段）にするには周りも FULL になっている必要がある。移ってから生成させると、生成はワーカーの
+                // スレッドで実時間をかけて進む一方、遅れを取り戻すサーバーは tick を続けて回すので、tick で数える
+                // タイムアウトが先に来ることがある（CI で、生成の途中に 600 tick を 1 秒ほどで使い切った）
+                for (dx in -1..1) {
+                    for (dz in -1..1) {
+                        nether.getChunk(netherChunk.x + dx, netherChunk.z + dz, ChunkStatus.FULL, true)
+                    }
+                }
                 val sent = ScreenSync.traffic.bytesSent(player)
                 val moved = player.changeDimension(
-                    DimensionTransition(nether!!, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
+                    DimensionTransition(nether, Vec3(0.5, 64.0, 0.5), Vec3.ZERO, 0f, 0f, DimensionTransition.DO_NOTHING),
                 )
                 helper.assertTrue(moved === player, "a player keeps its object when changing dimension")
                 helper.assertTrue(player.level() === nether, "the player should be in the nether")
                 helper.assertTrue(!be.isWatchedBy(player), "changing dimension should stop watching at once")
                 helper.assertTrue(ScreenSync.traffic.bytesSent(player) == sent, "the traffic of the same player should stay")
+                // 元のディメンションで送ったチャンクの記録は、移った直後に消える
+                helper.assertTrue(ScreenSync.sentChunkCount(player) == -1, "changing dimension should drop the sent chunks")
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, screenChunk),
+                    "the old dimension's chunk should not count as sent after the move",
+                )
             }
             .thenIdle(1)
             .thenExecute {
                 helper.assertTrue(!be.isWatchedBy(player), "a player in another dimension should not start watching")
+            }
+            // 偽物の接続は tick されないので、ネザーのチャンクが届くまで、クライアントが受け取ったことにして送る
+            .thenWaitUntil {
+                val nether = helper.level.server.getLevel(Level.NETHER)!!
+                val sender = player.connection.chunkSender
+                sender.onChunkBatchReceivedByClient(64f)
+                sender.sendNextChunks(player)
+                helper.assertTrue(ScreenSync.isChunkSent(nether, player, netherChunk), "the nether chunk should be recorded as sent")
+            }
+            .thenExecute {
+                val nether = helper.level.server.getLevel(Level.NETHER)!!
+                helper.assertTrue(ScreenSync.sentChunkCount(player) > 0, "the new level's record should hold the sent chunks")
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, netherChunk),
+                    "the same coordinates in the old dimension should not count as sent",
+                )
+                helper.assertTrue(
+                    !ScreenSync.isChunkSent(overworld, player, screenChunk),
+                    "the old dimension's screen chunk should still not count as sent",
+                )
+                helper.assertTrue(ScreenSync.isChunkSent(nether, player, netherChunk), "the nether chunk should still be recorded")
+                helper.assertTrue(!be.isWatchedBy(player), "the screen in the old dimension should not be watched")
                 cleanUp(helper, player)
             }
             .thenSucceed()
@@ -480,7 +561,7 @@ object ScreenSyncGameTests {
         val level = helper.level
         val here = ChunkPos(helper.absolutePos(POS))
         // 届いたチャンクの画面は、見られる
-        helper.assertTrue(ScreenSync.isChunkProbablySent(level, player, here), "the test chunk should have been sent")
+        helper.assertTrue(ScreenSync.isChunkSent(level, player, here), "the test chunk should have been sent")
         val near = ScreenSync.Host(helper.getBlockEntity<ScreenBlockEntity>(POS)).distanceSquared(player)
         helper.assertTrue(near.isFinite(), "a screen in a sent chunk should be visible but was $near")
         // テストの場所から離れたチャンクを、同期の読み込み（一時的なチケット）で FULL まで読み込む。ブロックが tick する段には
@@ -497,7 +578,7 @@ object ScreenSyncGameTests {
             player.setChunkTrackingView(ChunkTrackingView.of(here, 64))
             helper.assertTrue(player.chunkTrackingView.contains(far), "the far chunk should be in the tracking view")
             helper.assertTrue(!player.connection.chunkSender.isPending(far.toLong()), "the far chunk should not be pending")
-            helper.assertTrue(!ScreenSync.isChunkProbablySent(level, player, far), "the far chunk should not count as sent")
+            helper.assertTrue(!ScreenSync.isChunkSent(level, player, far), "the far chunk should not count as sent")
             val d = ScreenSync.Host(farScreen!!).distanceSquared(player)
             helper.assertTrue(d == Double.POSITIVE_INFINITY, "a screen in a chunk not yet sent should not be visible but was $d")
         } finally {
@@ -505,6 +586,189 @@ object ScreenSyncGameTests {
             cleanUp(helper, player)
         }
         helper.succeed()
+    }
+
+    private val SEND_TEST_TICKET: TicketType<ChunkPos> =
+        TicketType.create("kibicomputers_screen_send_test", Comparator.comparingLong(ChunkPos::toLong))
+
+    /**
+     * 届いた後のチャンクに、送る前の待ち（`ChunkMap.waitForLightBeforeSending` と同じ `addSendDependency`）が付いて
+     * いま送れない状態（`getChunkToSend` が null）になっても、送った事実は変わらないので、見ている人から外れず、描画も届く（#655 のずれ1）。
+     *
+     * 待ちを、ほかのテストのプレイヤーが追跡しはじめるチャンクに付けると、その人には待ちが終わっても送られなくなる。
+     * だれも使わない離れたチャンク（[FarChunks]）に付け、失敗しても必ず外す。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun sentChunkStaysWatchedWhileSendIsDelayed(helper: GameTestHelper) {
+        val level = helper.level
+        // だれも読み込んでいない離れたチャンク（#747）。プレイヤーのチケットで読み込む
+        val far = FarChunks.reserve(helper)
+        val farPos = far.getMiddleBlockPosition(helper.absolutePos(POS).y)
+        ScreenSync.transport = CAPTURE
+        val player = helper.makeMockServerPlayerInLevel()
+        val client = FakeClient(ScreenTier.COLOR, farPos)
+        clients[player] = client
+        // 画面の東 2 ブロックに立つ（目の高さを画面の中心にそろえる）
+        player.teleportTo(farPos.x + 2.5, farPos.y + 0.5 - player.eyeHeight, farPos.z + 0.5)
+        level.chunkSource.move(player)
+        val delay = CompletableFuture<Any?>()
+        var screen: ScreenBlockEntity? = null
+        var sent = 0
+        var cleaned = false
+        fun cleanUpAll() {
+            if (cleaned) return
+            cleaned = true
+            delay.complete(null)
+            if (screen != null) level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
+            cleanUp(helper, player)
+        }
+
+        // 待ちを付けた後の段で失敗したら、その場で外してから失敗させる
+        fun guarded(block: () -> Unit) {
+            try {
+                block()
+            } catch (e: Throwable) {
+                cleanUpAll()
+                throw e
+            }
+        }
+        helper.startSequence()
+            // プレイヤーのチケットで読み込まれ、送れる状態になったら届ける
+            .thenWaitUntil {
+                deliverChunks(player, farPos)
+                helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "the far chunk should be sent to the player")
+            }
+            .thenExecute {
+                // 送った後のチャンクに画面を置く（いちばんよくある置き方）
+                level.setBlock(farPos, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState(), 3)
+                screen = level.getBlockEntity(farPos) as? ScreenBlockEntity
+                helper.assertTrue(screen != null, "the far screen should have a block entity")
+                screen!!.text.write(0, 0, "delayed send", 0xFFFFFF, 0)
+            }
+            .thenWaitUntil {
+                helper.assertTrue(screen!!.isWatchedBy(player), "the player should watch the screen")
+                helper.assertTrue(client.keyframes == 1, "the first keyframe should arrive")
+            }
+            .thenExecute {
+                guarded {
+                    val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(far.toLong())
+                    helper.assertTrue(holder != null, "the far chunk should have a holder")
+                    holder!!.addSendDependency(delay)
+                    // 以前の推し量り（#654）なら、ここで「送っていない」とみなして見ている人から外していた
+                    helper.assertTrue(
+                        level.chunkSource.chunkMap.getChunkToSend(far.toLong()) == null,
+                        "the far chunk should not be sendable now",
+                    )
+                    helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "a sent chunk should stay sent")
+                    sent = client.fragments
+                    screen!!.text.write(0, 1, "still watched", 0x00FF00, 0)
+                }
+            }
+            .thenExecuteFor(5) {
+                guarded {
+                    helper.assertTrue(screen!!.isWatchedBy(player), "the player should keep watching while sending is delayed")
+                }
+            }
+            .thenExecute {
+                guarded {
+                    helper.assertTrue(client.fragments > sent, "the drawing should be sent while sending is delayed")
+                    helper.assertTrue(client.keyframes == 1, "no keyframe should be resent: ${client.keyframes}")
+                    helper.assertTrue(client.matches(screen!!), "the client should match the server")
+                }
+                cleanUpAll()
+            }
+            .thenSucceed()
+    }
+
+    /**
+     * 送れる状態（`getChunkToSend` が null でない）で、追跡の範囲に入っていて順番待ちでもないが、まだ送っていないチャンクの画面は、
+     * 見られないものとする（#655 のずれ2。以前の推し量りでは、送ったとみなしていた）。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun sendableButUnsentChunkIsNotWatched(helper: GameTestHelper) {
+        val level = helper.level
+        val cache = level.chunkSource
+        // だれも読み込んでいない離れたチャンク（#747）。テスト用のチケットで読み込む
+        val far = FarChunks.reserve(helper)
+        val farPos = far.getMiddleBlockPosition(helper.absolutePos(POS).y)
+        ScreenSync.transport = CAPTURE
+        val player = helper.makeMockServerPlayerInLevel()
+        var placed = false
+        fun cleanUpAll() {
+            if (placed) level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
+            cache.removeRegionTicket(SEND_TEST_TICKET, far, 2, far)
+            cleanUp(helper, player)
+        }
+        // 中心のチャンクがブロックの tick する段（送れる状態）になるチケット
+        cache.addRegionTicket(SEND_TEST_TICKET, far, 2, far)
+        helper.startSequence()
+            .thenWaitUntil {
+                cache.runDistanceManagerUpdates()
+                helper.assertTrue(cache.chunkMap.getChunkToSend(far.toLong()) != null, "the far chunk should become sendable")
+            }
+            .thenExecute {
+                try {
+                    level.setBlock(farPos, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get().defaultBlockState(), 3)
+                    placed = true
+                    val screen = level.getBlockEntity(farPos) as? ScreenBlockEntity
+                    helper.assertTrue(screen != null, "the far screen should have a block entity")
+                    // 画面のそばに立たせ、追跡の範囲に入れる（送る順番待ちには入れない）
+                    player.teleportTo(farPos.x + 2.5, farPos.y + 0.5 - player.eyeHeight, farPos.z + 0.5)
+                    player.setChunkTrackingView(ChunkTrackingView.of(far, 2))
+                    helper.assertTrue(player.chunkTrackingView.contains(far), "the far chunk should be in the tracking view")
+                    helper.assertTrue(!player.connection.chunkSender.isPending(far.toLong()), "the far chunk should not be pending")
+                    helper.assertTrue(cache.chunkMap.getChunkToSend(far.toLong()) != null, "the far chunk should be sendable")
+                    helper.assertTrue(!ScreenSync.isChunkSent(level, player, far), "a chunk never sent should not count as sent")
+                    val d = ScreenSync.Host(screen!!).distanceSquared(player)
+                    helper.assertTrue(d == Double.POSITIVE_INFINITY, "a screen in a chunk not yet sent should not be visible but was $d")
+                } finally {
+                    cleanUpAll()
+                }
+            }
+            .thenSucceed()
+    }
+
+    /**
+     * 見ている画面のチャンクを、同じ tick の中で送り直すと（追跡から外れて戻る）、クライアントは画面のブロックエンティティを
+     * 作り直して画面が空になる。tick の終わりの距離の確かめでは外れないので、送ったときに見ている人から外し、
+     * 次に見はじめる人を探す tick にキーフレームを送り直す（#655）。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200)
+    fun resentChunkResendsKeyframe(helper: GameTestHelper) {
+        helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get())
+        val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
+        be.text.write(0, 0, "resent chunk", 0xFFFFFF, 0)
+        val (player, client) = watcherAt(helper, ScreenTier.COLOR, 2.0)
+        val level = helper.level
+        val here = ChunkPos(helper.absolutePos(POS))
+        helper.startSequence()
+            .thenWaitUntil {
+                helper.assertTrue(be.isWatchedBy(player), "the player should be watching")
+                helper.assertTrue(client.keyframes == 1, "the first keyframe should arrive")
+            }
+            .thenExecute {
+                val back = player.position()
+                // 追跡の範囲（2 チャンク）の外へ行って戻る。画面のチャンクは UnWatch → Watch → Sent になる
+                player.teleportTo(back.x + 16 * 8, back.y, back.z)
+                level.chunkSource.move(player)
+                helper.assertTrue(!ScreenSync.isChunkSent(level, player, here), "an unwatched chunk should not count as sent")
+                player.teleportTo(back.x, back.y, back.z)
+                level.chunkSource.move(player)
+                helper.assertTrue(!ScreenSync.isChunkSent(level, player, here), "a chunk waiting to be resent should not count as sent")
+                deliverChunks(player, helper.absolutePos(POS))
+                helper.assertTrue(ScreenSync.isChunkSent(level, player, here), "the chunk should be sent again")
+                helper.assertTrue(!be.isWatchedBy(player), "resending the chunk should drop the watcher until the next scan")
+            }
+            .thenWaitUntil { helper.assertTrue(client.keyframes == 2, "a keyframe should be resent after the chunk is resent") }
+            .thenExecute {
+                helper.assertTrue(be.isWatchedBy(player), "the player should watch again")
+                helper.assertTrue(client.matches(be), "the client should match the server")
+                cleanUp(helper, player)
+            }
+            .thenSucceed()
     }
 
     /** 同期のパケットは、ディメンション・位置・バイト列をそのまま運ぶ。 */

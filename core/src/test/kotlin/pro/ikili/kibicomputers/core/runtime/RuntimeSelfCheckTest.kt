@@ -16,6 +16,11 @@ class RuntimeSelfCheckTest {
     }
 
     @Test
+    fun `失敗の例外から大きすぎる関数の番号を読める`() {
+        assertTrue(RuntimeSelfCheck.readsTooLargeFunction())
+    }
+
+    @Test
     fun `コンポーネントの検証器を動かせる`() {
         assertTrue(RuntimeSelfCheck.validatesComponent())
     }

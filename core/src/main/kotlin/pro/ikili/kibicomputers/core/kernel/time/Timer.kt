@@ -7,7 +7,7 @@ import pro.ikili.kibicomputers.core.kernel.wait.WakeSink
 
 /** タイマーの上限など（仮の値。確定は #251） */
 internal object TimerLimits {
-    /** マシンで同時に動かせる（期限を待っている）タイマーの数 */
+    /** マシンで同時に動かせる（期限を待っている）タイマーの数の既定（`MachineConfig.maxArmedTimers` の既定。#719） */
     const val MAX_ARMED_TIMERS: Int = 128
 
     /** 繰り返しのタイマーの最小の間隔（ナノ秒。1 tick = 50 ms。画面への反映も tick ごとなので、これより細かくしても見えない） */

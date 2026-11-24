@@ -242,6 +242,40 @@ class DiskFileSystemTest {
     }
 
     @Test
+    fun `容量を下げた後に開いたディスクは、読む・消す・縮める・上書きができ、増やす書き込みと作成だけを断る`() {
+        // コンフィグでディスクの容量を下げた（#719）: 大きな容量で書いたディスクを、小さな容量で開き直す
+        val before = disk(quota = DiskQuota(maxBytes = 1L shl 20, maxEntries = 100))
+        val a = before.writeAll("/a", "x".repeat(3000))
+        before.writeAll("/b", "y".repeat(3000))
+        before.createDirectory(p("/d"))
+        before.writeAll("/d/c", "z".repeat(100))
+        assertTrue(a > 0)
+        before.retire()
+        opened.remove(before)
+
+        val fs = disk(quota = DiskQuota(maxBytes = 2000, maxEntries = 2))
+        assertTrue(fs.usedBytes > 2000 && fs.usedEntries == 4, "上限を超えたまま開ける")
+        assertEquals(0L, fs.usage().availableBytes, "空きは 0 で止まる")
+        // 読める・伸ばさない上書きはできる
+        val nodeA = fs.stat(p("/a")).node
+        assertEquals("x".repeat(3000), fs.readAll(nodeA))
+        assertEquals(1, fs.write(nodeA, 0, "w".toByteArray(), 0, 1))
+        // 増やす書き込み・作成・伸ばすのは断る
+        errno(Errno.NOSPC) { fs.write(nodeA, 3000, ByteArray(1), 0, 1) }
+        errno(Errno.NOSPC) { fs.createFile(p("/new")) }
+        errno(Errno.NOSPC) { fs.createDirectory(p("/newdir")) }
+        errno(Errno.NOSPC) { fs.setSize(nodeA, 5000) }
+        // 消す・縮めると空く
+        fs.removeFile(p("/d/c"))
+        fs.removeDirectory(p("/d"))
+        fs.setSize(nodeA, 0)
+        fs.removeFile(p("/b"))
+        assertEquals(1, fs.usedEntries)
+        fs.createFile(p("/new"))
+        assertEquals(2, fs.usedEntries)
+    }
+
+    @Test
     fun `追記とallocateは不可分で、allocateは縮めない`() {
         val fs = disk()
         val node = fs.writeAll("/f", "abc")

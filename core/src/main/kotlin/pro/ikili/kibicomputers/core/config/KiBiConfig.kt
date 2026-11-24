@@ -6,7 +6,15 @@ import pro.ikili.kibicomputers.core.access.AccessRules
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.input.KeyboardEventCodec
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
+import pro.ikili.kibicomputers.core.computer.MachineProfile
+import pro.ikili.kibicomputers.core.computer.PartSpec
+import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.kernel.event.EventLimits
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.persist.snapshot.KernelLimits
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
 import pro.ikili.kibicomputers.core.persist.ModuleStore
 
@@ -132,6 +140,212 @@ public object KiBiConfig {
         "サーバーの全コンピューターの RAM の合計の上限（MiB）。0 は自動（JVM のヒープの最大値の半分）。",
         auto = 0,
     )
+
+    /** メインスレッドで通知とホスト呼び出しに使う、tick ごとの時間の予算（マイクロ秒。#356、#719） */
+    @JvmField
+    public val MAIN_THREAD_BUDGET_MICROS: IntEntry = serverInt(
+        "scheduler", "mainThreadBudgetMicros", (SchedulerConfig.DEFAULT_MAIN_THREAD_BUDGET_NANOS / 1000).toInt(), 100, 1_000_000,
+        ConfigApply.WORLD_RESTART,
+        "Time per tick the server thread spends on computer notifications and world calls, in microseconds. The rest waits for later ticks.",
+        "1 tick にサーバーのスレッドが、コンピューターの通知とワールドの操作に使う時間（マイクロ秒）。残りは後の tick に回す。",
+    )
+
+    /** サーバー全体で開いたままにできるホストのファイルの数（#52、#719） */
+    @JvmField
+    public val HOST_FILES_TOTAL: IntEntry = serverInt(
+        "scheduler", "hostFilesTotal", SchedulerConfig.DEFAULT_HOST_FILES_TOTAL, 1, 1_000_000, ConfigApply.WORLD_RESTART,
+        "Maximum number of disk files kept open by all computers on the server together.",
+        "サーバーの全コンピューターが開いたままにできる、ディスクのファイルの数の合計の上限。",
+    )
+
+    // ---- reboot: ゲストの再起動の待ち（#635、ADR 0635）。スケジューラを作るときに決まるので、次の起動で効く ----
+
+    /** 待たずに起動し直す段の数 */
+    @JvmField
+    public val REBOOT_FREE: IntEntry = serverInt(
+        "reboot", "freeReboots", RebootBackoff.DEFAULT.freeReboots, 0, 1000, ConfigApply.WORLD_RESTART,
+        "Number of quick reboots a computer may make without waiting.",
+        "コンピューターが待たずに再起動できる回数。",
+    )
+
+    /** 最初に待つ段の待ち（tick） */
+    @JvmField
+    public val REBOOT_BASE_DELAY_TICKS: IntEntry = serverInt(
+        "reboot", "baseDelayTicks", RebootBackoff.DEFAULT.baseDelayTicks.toInt(), 1, 72_000, ConfigApply.WORLD_RESTART,
+        "First wait before a reboot after the free ones, in ticks. Doubles with each further quick reboot.",
+        "待たない回を使い切った後の、最初の再起動の待ち（tick）。続けて再起動するたびに倍になる。",
+    )
+
+    /** 待ちの上限（tick） */
+    @JvmField
+    public val REBOOT_MAX_DELAY_TICKS: IntEntry = serverInt(
+        "reboot", "maxDelayTicks", RebootBackoff.DEFAULT.maxDelayTicks.toInt(), 1, 1_728_000, ConfigApply.WORLD_RESTART,
+        "Longest wait before a reboot, in ticks. Raised to at least decayTicks.",
+        "再起動の待ちの上限（tick）。decayTicks より短いときは、それに引き上げる。",
+    )
+
+    /** この長さ動くと1段戻る（tick） */
+    @JvmField
+    public val REBOOT_DECAY_TICKS: IntEntry = serverInt(
+        "reboot", "decayTicks", RebootBackoff.DEFAULT.decayTicks.toInt(), 1, 1_728_000, ConfigApply.WORLD_RESTART,
+        "Ticks a computer must run to earn back one quick reboot. In the long run, each computer reboots at most once per this many ticks.",
+        "コンピューターがこの長さ動くと、再起動の段が1つ戻る（tick）。長い目で見ると、1台の再起動はこの長さに1回以下になる。",
+    )
+
+    /** 借りの上限（段） */
+    @JvmField
+    public val REBOOT_CAP_LEVELS: IntEntry = serverInt(
+        "reboot", "capLevels", RebootBackoff.DEFAULT.capLevels, 1, 64, ConfigApply.WORLD_RESTART,
+        "Most levels of reboot debt kept. Raised so the wait can reach maxDelayTicks.",
+        "再起動の段の上限。待ちが maxDelayTicks に届く段の数より少ないときは、それに引き上げる。",
+    )
+
+    // ---- machine: マシンごとの上限（#719、ADR 0719）。次に電源を入れた・読み込み直したコンピューターから効く ----
+
+    /** プロセスの数の上限 */
+    @JvmField
+    public val MACHINE_MAX_PROCESSES: IntEntry = serverInt(
+        "machine", "maxProcesses", MachineConfig.DEFAULT.maxProcesses, 1, KernelLimits.MAX_PROCESSES_CEILING, ConfigApply.RELOAD,
+        "Maximum number of processes on one computer.",
+        "1台のコンピューターのプロセスの数の上限。",
+    )
+
+    /** 1台のブロッキング型プロセスの数の上限 */
+    @JvmField
+    public val MACHINE_MAX_BLOCKING_PROCESSES: IntEntry = serverInt(
+        "machine", "maxBlockingProcesses", MachineConfig.DEFAULT.maxBlockingProcesses, 0, 1024, ConfigApply.RELOAD,
+        "Maximum number of blocking processes (each uses a dedicated thread) on one computer.",
+        "1台のコンピューターのブロッキング型プロセス（1つが専用スレッドを1本使う）の数の上限。",
+    )
+
+    /** 1 tick に実行するホスト呼び出しの数の上限 */
+    @JvmField
+    public val MACHINE_MAX_HOST_CALLS_PER_TICK: IntEntry = serverInt(
+        "machine", "maxHostCallsPerTick", MachineConfig.DEFAULT.maxHostCallsPerTick, 1, 4096, ConfigApply.RELOAD,
+        "Maximum number of world calls (device calls and the like) one computer runs on the server thread per tick.",
+        "1台のコンピューターが 1 tick にサーバーのスレッドで実行するワールドの操作（デバイスの呼び出しなど）の数の上限。",
+    )
+
+    /** イベントキューの数の上限 */
+    @JvmField
+    public val MACHINE_MAX_EVENT_QUEUES: IntEntry = serverInt(
+        "machine", "maxEventQueues", MachineConfig.DEFAULT.maxEventQueues, 1, EventLimits.MAX_QUEUES_CEILING, ConfigApply.RELOAD,
+        "Maximum number of event queues on one computer.",
+        "1台のコンピューターのイベントキューの数の上限。",
+    )
+
+    /** 溜めるイベントの合計の上限（KiB） */
+    @JvmField
+    public val MACHINE_MAX_PENDING_EVENT_KIB: IntEntry = serverInt(
+        "machine", "maxPendingEventKiB", (MachineConfig.DEFAULT.maxPendingEventBytes / KIB).toInt(), 16, 65536, ConfigApply.RELOAD,
+        "Maximum total size of undelivered events held by one computer, in KiB.",
+        "1台のコンピューターが溜めておける、受け取られていないイベントの大きさの合計の上限（KiB）。",
+    )
+
+    /** 同時に動かせるタイマーの数の上限 */
+    @JvmField
+    public val MACHINE_MAX_ARMED_TIMERS: IntEntry = serverInt(
+        "machine", "maxArmedTimers", MachineConfig.DEFAULT.maxArmedTimers, 1, 4096, ConfigApply.RELOAD,
+        "Maximum number of running timers on one computer.",
+        "1台のコンピューターで同時に動かせるタイマーの数の上限。",
+    )
+
+    /** 開いたままにできるホストのファイルの数 */
+    @JvmField
+    public val MACHINE_HOST_FILES: IntEntry = serverInt(
+        "machine", "hostFilesPerMachine", MachineConfig.DEFAULT.hostFilesPerMachine, 1, 4096, ConfigApply.RELOAD,
+        "Maximum number of disk files one computer keeps open.",
+        "1台のコンピューターが開いたままにできる、ディスクのファイルの数の上限。",
+    )
+
+    /** コンソールの入力の上限（KiB） */
+    @JvmField
+    public val MACHINE_CONSOLE_INPUT_KIB: IntEntry = serverInt(
+        "machine", "consoleInputKiB", (MachineConfig.DEFAULT.consoleInputBytes / KIB).toInt(), 1, (Tty.MAX_SNAPSHOT_CAPACITY / KIB).toInt(),
+        ConfigApply.RELOAD,
+        "Console input buffer of one computer (typed and unread input), in KiB. Applies when a computer cold-boots.",
+        "1台のコンピューターのコンソールの入力のバッファ（入力して読まれていない分）の大きさ（KiB）。冷えた起動のときに効く。",
+    )
+
+    /** コンソールの出力のバッファ（KiB） */
+    @JvmField
+    public val MACHINE_CONSOLE_OUTPUT_KIB: IntEntry = serverInt(
+        "machine", "consoleOutputKiB", (MachineConfig.DEFAULT.consoleOutputBytes / KIB).toInt(), 1, (Tty.MAX_SNAPSHOT_CAPACITY / KIB).toInt(),
+        ConfigApply.RELOAD,
+        "Console output buffer of one computer, in KiB. Programs wait when it is full. Applies when a computer cold-boots.",
+        "1台のコンピューターのコンソールの出力のバッファの大きさ（KiB）。いっぱいならプログラムが待つ。冷えた起動のときに効く。",
+    )
+
+    /** 配っていないコンソール出力の上限（KiB） */
+    @JvmField
+    public val MACHINE_MAX_PENDING_CONSOLE_KIB: IntEntry = serverInt(
+        "machine", "maxPendingConsoleKiB", (MachineConfig.DEFAULT.maxPendingConsoleBytes / KIB).toInt(), 1, 65536, ConfigApply.RELOAD,
+        "Maximum console output of one computer waiting to be shown, in KiB. Output beyond this is dropped.",
+        "1台のコンピューターの、表示を待っているコンソールの出力の上限（KiB）。超えた分は捨てる。",
+    )
+
+    // ---- cpu・memory・storage: 部品のティアごとの性能値（#347、ADR 0066、#719）。次に電源を入れた・読み込み直したコンピューター、挿したディスクから効く ----
+
+    /** ティアの項目の名前の頭（`tier1`〜`tier4`、`creative`） */
+    private fun tierKey(tier: PartTier): String = if (tier == PartTier.CREATIVE) "creative" else "tier${tier.level}"
+
+    /** ティアの説明（英語・日本語） */
+    private fun tierLabel(tier: PartTier): Pair<String, String> =
+        if (tier == PartTier.CREATIVE) "creative" to "クリエイティブ" else "tier ${tier.level}" to "ティア ${tier.level}"
+
+    private fun perTier(build: (PartTier, String, Pair<String, String>) -> IntEntry): Map<PartTier, IntEntry> =
+        PartTier.entries.associateWith { build(it, tierKey(it), tierLabel(it)) }
+
+    /** CPU の 1 tick の燃料 */
+    @JvmField
+    public val CPU_FUEL_PER_TICK: Map<PartTier, IntEntry> = perTier { tier, key, (en, ja) ->
+        serverInt(
+            "cpu", "${key}FuelPerTick", tier.defaultSpec.cpuFuelPerTick.toInt(), 100_000, 1_000_000_000, ConfigApply.RELOAD,
+            "Fuel (WebAssembly instructions, roughly) per tick of a $en CPU.",
+            "$ja の CPU の 1 tick の燃料（おおよそ WebAssembly の命令の数）。",
+        )
+    }
+
+    /** CPU でつなげるデバイスの数 */
+    @JvmField
+    public val CPU_MAX_DEVICES: Map<PartTier, IntEntry> = perTier { tier, key, (en, ja) ->
+        serverInt(
+            // 最小 3: 画面・キーボード・ケースのスピーカーは入る（ADR 0066）。最大 256: Lua の list-devices の結果の見積もり
+            "cpu", "${key}MaxDevices", tier.defaultSpec.cpuMaxDevices, 3, 256, ConfigApply.RELOAD,
+            "Number of devices a computer with a $en CPU can connect (the case speaker counts as one).",
+            "$ja の CPU のコンピューターがつなげるデバイスの数（ケースのスピーカーも1つと数える）。",
+        )
+    }
+
+    /** RAM 1 つの容量（MiB） */
+    @JvmField
+    public val MEMORY_MIB: Map<PartTier, IntEntry> = perTier { tier, key, (en, ja) ->
+        serverInt(
+            "memory", "${key}MiB", (tier.defaultSpec.memoryBytes / MIB).toInt(), 1, 4096, ConfigApply.RELOAD,
+            "Capacity of one $en RAM module, in MiB. A computer's total RAM is capped at 4096 MiB.",
+            "$ja の RAM 1 つの容量（MiB）。コンピューターの RAM の合計は 4096 MiB で頭打ち。",
+        )
+    }
+
+    /** ディスク 1 つの容量（MiB） */
+    @JvmField
+    public val STORAGE_MIB: Map<PartTier, IntEntry> = perTier { tier, key, (en, ja) ->
+        serverInt(
+            "storage", "${key}MiB", (tier.defaultSpec.diskBytes / MIB).toInt(), 1, 65536, ConfigApply.RELOAD,
+            "Capacity of one $en disk, in MiB. Lowering it does not delete files; writes that would grow a fuller disk are refused.",
+            "$ja のディスク 1 つの容量（MiB）。下げてもファイルは消えず、容量を超えたディスクは増える書き込みを断る。",
+        )
+    }
+
+    /** ディスク 1 つのファイル・ディレクトリの数の上限 */
+    @JvmField
+    public val STORAGE_MAX_ENTRIES: Map<PartTier, IntEntry> = perTier { tier, key, (en, ja) ->
+        serverInt(
+            "storage", "${key}MaxEntries", tier.defaultSpec.diskEntries, 16, 65536, ConfigApply.RELOAD,
+            "Maximum number of files and directories on one $en disk.",
+            "$ja のディスク 1 つのファイル・ディレクトリの数の上限。",
+        )
+    }
 
     // ---- save: 待機点保存（ADR 0081・0083・0084・0085）。読み直しで効く ----
 
@@ -342,6 +556,26 @@ public object KiBiConfig {
             "Threads and server-wide limits. Changes take effect when the world is next opened.",
             "スレッドとサーバー全体の上限。変えた値は、次にワールドを開いたときに効く。",
         ),
+        "reboot" to listOf(
+            "Waits before a computer that keeps rebooting starts again. Changes take effect when the world is next opened.",
+            "再起動を繰り返すコンピューターが、起動し直すまでの待ち。変えた値は、次にワールドを開いたときに効く。",
+        ),
+        "machine" to listOf(
+            "Limits of each computer. Changes apply to computers powered on or loaded afterwards; lowering them can make saved computers cold-boot.",
+            "コンピューター1台ごとの上限。変えた値は、その後に電源を入れた・読み込んだコンピューターから効く。下げると、保存済みのコンピューターが冷えた起動になることがある。",
+        ),
+        "cpu" to listOf(
+            "Performance of each CPU tier. Changes apply to computers powered on or loaded afterwards.",
+            "CPU のティアごとの性能。変えた値は、その後に電源を入れた・読み込んだコンピューターから効く。",
+        ),
+        "memory" to listOf(
+            "Capacity of each RAM tier. Changes apply to computers powered on or loaded afterwards; lowering them can make saved computers cold-boot.",
+            "RAM のティアごとの容量。変えた値は、その後に電源を入れた・読み込んだコンピューターから効く。下げると、保存済みのコンピューターが冷えた起動になることがある。",
+        ),
+        "storage" to listOf(
+            "Capacity of each disk tier. Changes apply to disks inserted or computers powered on afterwards; files are kept when lowered.",
+            "ディスクのティアごとの容量。変えた値は、その後に挿した・電源を入れたコンピューターのディスクから効く。下げてもファイルは消えない。",
+        ),
         "save" to listOf("Saving and restoring running computers.", "動いているコンピューターの保存と復元。"),
         "screenSync" to listOf("Network budget for screen updates.", "画面の更新を送る量の予算。"),
         "keyboard" to listOf("Limits on keyboard input.", "キーボードの入力の上限。"),
@@ -367,9 +601,67 @@ public object KiBiConfig {
             .programCacheEntries(values[PROGRAM_CACHE_ENTRIES])
             .programCacheBytes(values[PROGRAM_CACHE_MIB] * MIB)
             .moduleStore(moduleStore)
+            .mainThreadBudgetNanos(values[MAIN_THREAD_BUDGET_MICROS] * 1000L)
+            .hostFilesTotal(values[HOST_FILES_TOTAL])
+            .rebootBackoff(rebootBackoff(values))
         values[MAX_CONCURRENT_MACHINES].let { if (it != MAX_CONCURRENT_MACHINES.auto) builder.maxConcurrentMachines(it) }
         values[TOTAL_MEMORY_MIB].let { if (it != TOTAL_MEMORY_MIB.auto) builder.totalMemoryBytes(it * MIB) }
         return builder.build()
+    }
+
+    /**
+     * [values] から再起動の待ちを作る（#635、#719）。上限の見積もり（ADR 0635: 1台の再起動は長い目で見て `decayTicks` に1回以下）が
+     * 成り立つよう、`maxDelayTicks` を `decayTicks` 以上に、`capLevels` を待ちが `maxDelayTicks` に届く段の数以上に引き上げる
+     */
+    internal fun rebootBackoff(values: ConfigValues): RebootBackoff {
+        val free = values[REBOOT_FREE]
+        val base = values[REBOOT_BASE_DELAY_TICKS].toLong()
+        val decay = values[REBOOT_DECAY_TICKS].toLong()
+        val maxDelay = maxOf(values[REBOOT_MAX_DELAY_TICKS].toLong(), decay)
+        // base から倍々にして maxDelay に届くまでの回数
+        var shifts = 0
+        var d = base
+        while (d < maxDelay) {
+            d = d shl 1
+            shifts++
+        }
+        val cap = maxOf(values[REBOOT_CAP_LEVELS], free + 1 + shifts)
+        return RebootBackoff(free, base, maxDelay, decay, cap)
+    }
+
+    /** 最後に組み立てた [machineProfile]（コンフィグの写しの参照と組。読み直しは別スレッドから来るので、組ごと差し替える） */
+    @Volatile
+    private var lastProfile: Pair<ConfigValues, MachineProfile>? = null
+
+    /**
+     * [values] からマシンの設定の元（上限とティアごとの性能値）を作る（#719）。同じ写し（参照）には同じものを返すので、
+     * 電源を入れる・戻す・ディスクを挿すたびに呼んでよい（台ごとに作り直さない）。どのスレッドから呼んでもよい
+     */
+    @JvmStatic
+    public fun machineProfile(values: ConfigValues): MachineProfile {
+        lastProfile?.let { (v, p) -> if (v === values) return p }
+        val base = MachineConfig.builder()
+            .maxProcesses(values[MACHINE_MAX_PROCESSES])
+            .maxBlockingProcesses(values[MACHINE_MAX_BLOCKING_PROCESSES])
+            .maxHostCallsPerTick(values[MACHINE_MAX_HOST_CALLS_PER_TICK])
+            .maxEventQueues(values[MACHINE_MAX_EVENT_QUEUES])
+            .maxPendingEventBytes((values[MACHINE_MAX_PENDING_EVENT_KIB] * KIB).toInt())
+            .maxArmedTimers(values[MACHINE_MAX_ARMED_TIMERS])
+            .hostFilesPerMachine(values[MACHINE_HOST_FILES])
+            .consoleInputBytes((values[MACHINE_CONSOLE_INPUT_KIB] * KIB).toInt())
+            .consoleOutputBytes((values[MACHINE_CONSOLE_OUTPUT_KIB] * KIB).toInt())
+            .maxPendingConsoleBytes(values[MACHINE_MAX_PENDING_CONSOLE_KIB] * KIB)
+            .build()
+        val specs = PartTier.entries.associateWith { tier ->
+            PartSpec(
+                cpuFuelPerTick = values[CPU_FUEL_PER_TICK.getValue(tier)].toLong(),
+                memoryBytes = values[MEMORY_MIB.getValue(tier)] * MIB,
+                diskBytes = values[STORAGE_MIB.getValue(tier)] * MIB,
+                diskEntries = values[STORAGE_MAX_ENTRIES.getValue(tier)],
+                cpuMaxDevices = values[CPU_MAX_DEVICES.getValue(tier)],
+            )
+        }
+        return MachineProfile(base, specs).also { lastProfile = values to it }
     }
 
     /** [values] から待機点保存の設定を作る */

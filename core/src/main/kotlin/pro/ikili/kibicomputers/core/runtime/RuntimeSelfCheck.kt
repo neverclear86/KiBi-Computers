@@ -12,6 +12,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkEnv
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkedComponent
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.interpretedFunctions
 import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
@@ -64,6 +65,73 @@ public object RuntimeSelfCheck {
         val lua = checkNotNull(RuntimeSelfCheck::class.java.getResourceAsStream(LUA_RESOURCE)) { "$LUA_RESOURCE が同梱されていない" }
             .use { it.readBytes() }
         return isCompiled(EndiveRuntime().load(Instrumentation.apply(lua, WasiP1.WAIT_IMPORTS)))
+    }
+
+    /**
+     * コンパイルの失敗の例外から、JVM のメソッドの上限を超えた関数の番号を読む処理（#446）が、実行環境で動くなら `true`。
+     * この処理は ASM の `MethodTooLargeException` を直接参照するが、参照は SIMD を使う関数と大きすぎる関数があるモジュールの
+     * コンパイルが失敗したときにしか解決されず、ふつうの GameTest は通らない。ローダーの ASM から解決できることを、ここで確かめる
+     * （解決できないと `NoClassDefFoundError`。本番では特定できない失敗として扱われ、黙って別の経路になる）。
+     */
+    @JvmStatic
+    public fun readsTooLargeFunction(): Boolean {
+        val failure = RuntimeException(org.objectweb.asm.MethodTooLargeException("Machine", "func_7", "()I", 70_000))
+        return EndiveRuntime.readTooLargeFunction(failure, 0..9) == 7
+    }
+
+    /**
+     * JVM のメソッドの上限を超える関数を1つだけ持つモジュール（[TOO_LARGE_GROUPS] 回 1 を足して返す `big`）を読み込み、
+     * その関数だけがインタプリタに回り（モジュールはコンパイルしたまま）、正しく動いたなら `true`（#680）。
+     * Endive の自動の切り替え（`InterpreterFallback.SILENT`）の経路で、GameTest はこの間に標準エラーに
+     * 何も出ないことを見る。重い（0.5 秒ほど）ので、起動時には呼ばない。
+     *
+     * @throws WasmLoadException 読み込めない
+     */
+    @JvmStatic
+    @Throws(WasmLoadException::class)
+    public fun compilesTooLargeFunction(): Boolean {
+        val module = EndiveRuntime().load(tooLargeModule())
+        if (!isCompiled(module) || interpretedFunctions(module) != setOf(0)) return false
+        return module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("big")[0] } == TOO_LARGE_GROUPS.toLong()
+    }
+
+    /** JVM のメソッドの上限を超えるよう、`local.get 0; i32.const 1; i32.add; local.set 0` を並べる組の数 */
+    private const val TOO_LARGE_GROUPS: Int = 30_000
+
+    /** `(func (export "big") (result i32) (local i32) [local += 1 を TOO_LARGE_GROUPS 回] local.get 0)` */
+    private fun tooLargeModule(): ByteArray {
+        fun bytes(vararg b: Int) = ByteArray(b.size) { b[it].toByte() }
+        fun java.io.ByteArrayOutputStream.uleb(v: Int) {
+            var x = v
+            do {
+                var b = x and 0x7F
+                x = x ushr 7
+                if (x != 0) b = b or 0x80
+                write(b)
+            } while (x != 0)
+        }
+        val out = java.io.ByteArrayOutputStream()
+        fun section(id: Int, content: ByteArray) {
+            out.write(id)
+            out.uleb(content.size)
+            out.write(content)
+        }
+        out.write(bytes(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00))
+        // 型 () -> i32、関数 1 つ、export "big"
+        section(1, bytes(0x01, 0x60, 0x00, 0x01, 0x7f))
+        section(3, bytes(0x01, 0x00))
+        section(7, bytes(0x01, 0x03, 'b'.code, 'i'.code, 'g'.code, 0x00, 0x00))
+        val body = java.io.ByteArrayOutputStream()
+        body.write(bytes(0x01, 0x01, 0x7f))
+        val group = bytes(0x20, 0x00, 0x41, 0x01, 0x6a, 0x21, 0x00)
+        repeat(TOO_LARGE_GROUPS) { body.write(group) }
+        body.write(bytes(0x20, 0x00, 0x0b))
+        val code = java.io.ByteArrayOutputStream()
+        code.write(0x01)
+        code.uleb(body.size())
+        code.write(body.toByteArray())
+        section(10, code.toByteArray())
+        return out.toByteArray()
     }
 
     /**

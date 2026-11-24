@@ -53,7 +53,7 @@ object WorldMachineSaves {
         val config = ServerMachines.saveConfig
         val w = SaveWriter()
         writer = w
-        store = MachineSaveStore(machines, MachineIdIndex(), version, w, config.writerMaxPendingBytes, config.writerFlushMillis, prefetchOwners = true)
+        store = MachineSaveStore(machines, MachineIdIndex(), version, w, config.writerMaxPendingBytes, config.writerFlushMillis, prefetchOwners = true, sideOwnerReads = true)
     }
 
     /**

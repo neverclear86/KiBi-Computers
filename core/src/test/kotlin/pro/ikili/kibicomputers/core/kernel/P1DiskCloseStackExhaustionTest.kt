@@ -20,7 +20,6 @@ import pro.ikili.kibicomputers.core.wasi.p1.P1
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -142,16 +141,17 @@ class P1DiskCloseStackExhaustionTest {
                         closes += round.closes.get()
                         // 起動用のスレッドが、積んだ知らせを行う（深いスレッドが残した分、プロセスの終わりが残った fd を閉じた分を含む）。
                         // 知らせが列に残り続ける、または枠が返らないなら、深いところで取り出して捨てたか、頼みが落ちている。
-                        // どちらもテストのスレッドの外で進むので、固定の待ちでなく、遅れと停止を見分ける待ちを通す
+                        // どちらもテストのスレッドの外で進むので、固定の待ちでなく、遅れと停止を見分ける待ちを通す。
+                        // 枠の数（`openHandles`）はリースのロックを上限なしで取るので、上限付きで読む（[peek]。ロックが残っても止まらない）
+                        val handles = { peek(fs.ioLockForTest) { fs.openHandles } }
                         awaitOrClassify(
                             ticker,
                             "閉じる知らせが行われ、枠が返る（$where）",
-                            { "知らせ ${m.vfs.hasDeferred}、開いたままの枠 ${fs.openHandles}、${describe()}" },
-                        ) { !m.vfs.hasDeferred && fs.openHandles == 0 }
-                        assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない（$where）: ${m.lock}")
-                        m.lock.unlock()
-                        assertTrue(fs.ioLockForTest.tryLock(5, TimeUnit.SECONDS), "リースのロックが取れない（$where）: ${fs.ioLockForTest}")
-                        fs.ioLockForTest.unlock()
+                            { "知らせ ${m.vfs.hasDeferred}、開いたままの枠 ${handles()}、${describe()}" },
+                        ) { !m.vfs.hasDeferred && handles() == 0 }
+                        // ロックの待ちも、負荷の下の遅れと、持ったまま残った停止を見分ける（#905）
+                        awaitLockAcquirable(ticker, "マシンのロックが取れる（$where）", m.lock, describe)
+                        awaitLockAcquirable(ticker, "リースのロックが取れる（$where）", fs.ioLockForTest) { "${fs.ioLockForTest}、${describe()}" }
                         assertEquals(emptyList<String>(), fs.consistencyProblemsForTest(), "ディスクの状態がホストと食い違った（$where）")
                     }
                     println(
@@ -165,7 +165,7 @@ class P1DiskCloseStackExhaustionTest {
                     awaitOrClassify(ticker, "マシンが止まる", stopping) { m.state == MachineState.STOPPED }
                     awaitOrClassify(ticker, "CPU が返る", stopping) { cpuIsIdle(m) }
                     awaitOrClassify(ticker, "許可が戻る", stopping) { permitsAreBack(h, config.maxConcurrentMachines) }
-                    awaitOrClassify(ticker, "マシンのロックが放される", { "${m.lock}、${stopping()}" }) { !m.lock.isLocked && !m.lock.hasQueuedThreads() }
+                    awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
                 }
             }
         } finally {

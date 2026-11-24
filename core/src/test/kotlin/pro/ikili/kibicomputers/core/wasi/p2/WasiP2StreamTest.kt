@@ -728,6 +728,57 @@ class WasiP2StreamTest {
     }
 
     @Test
+    fun `deviceとttyのfdのmetadata-hashは(0,0)でokになり、is-same-objectが真なら等しい（ADR 0267。#885）`() = timeout(limit) {
+        Harness().use { h ->
+            val m = h.machine(fuelPerTick = 10_000_000)
+            m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
+            m.vfs.createDirectory(VfsPath.parse("/dev"))
+            assertNull(m.mountDev())
+            val address = "00000000-0000-4000-8000-000000000885"
+            assertTrue(m.devices.attach(address, TestDevice))
+            // /dev/tty を開くには console の Tty が要る
+            m.lock.withLockValue { m.ensureConsoleLocked() }
+            m.vfs.open(VfsPath.parse("/f.txt"), OpenOptions(read = true, write = true, create = true))
+            val input = pipe(m)
+            val output = pipe(m)
+            scenario(h, m, input.readEnd, output.writeEnd) { ctx ->
+                val hashType = fsTypes.type<CanonType.Record>("metadata-hash-value")
+                val zero = hashType.value("lower" to CanonValue.I64(0), "upper" to CanonValue.I64(0))
+                val hashOf = { d: CanonValue -> ok(ctx.p2(ty, "[method]descriptor.metadata-hash", d))!! }
+                val same = { x: CanonValue, y: CanonValue -> ctx.p2(ty, "[method]descriptor.is-same-object", x, y) }
+                val root = root(ctx)
+                val device = ok(openAt(ctx, root, "dev/device/$address", flags = arrayOf("read", "write")))!!
+                val tty = ok(openAt(ctx, root, "dev/tty", flags = arrayOf("read", "write")))!!
+                val tty2 = ok(openAt(ctx, root, "dev/tty", flags = arrayOf("read", "write")))!!
+                val file = ok(openAt(ctx, root, "f.txt"))!!
+                // ファイル以外の fd は (0, 0)（p1 の fd_filestat_get の ino=0・dev=0 と同じ）
+                assertEquals(zero, hashOf(device))
+                assertEquals(zero, hashOf(tty))
+                // /dev/tty を2回開くと同じ Tty を指すので、is-same-object が真で hash も等しい
+                assertEquals(CanonValue.TRUE, same(tty, tty2))
+                assertEquals(hashOf(tty), hashOf(tty2))
+                assertEquals(CanonValue.TRUE, same(device, device))
+                // 種類の違うもの同士は偽（hash が等しくても同じものとは限らない）
+                assertEquals(CanonValue.FALSE, same(device, tty))
+                assertEquals(CanonValue.FALSE, same(device, file))
+                assertEquals(CanonValue.FALSE, same(tty, file))
+                // パスで引く hash は VFS の値のまま（/dev の node は 0 ではない。fd とパスで違う。ADR 0054）
+                val pf = fsTypes.type<CanonType.Flags>("path-flags").value()
+                val pathHash = ok(ctx.p2(ty, "[method]descriptor.metadata-hash-at", root, pf, CanonValue.str("dev/device/$address")))!!
+                assertTrue((hashType.field(pathHash, "lower") as CanonValue.I64).value != 0L)
+                // /dev/null（OpenFile）の fd は VFS の値で、パスの hash と同じ
+                val devNull = ok(openAt(ctx, root, "dev/null", flags = arrayOf("read", "write")))!!
+                val nullHash = hashOf(devNull)
+                assertTrue(nullHash != zero)
+                assertEquals(nullHash, ok(ctx.p2(ty, "[method]descriptor.metadata-hash-at", root, pf, CanonValue.str("dev/null"))))
+                // ファイルの fd の hash も今のまま（0 ではない）
+                assertTrue(hashOf(file) != zero)
+            }
+            m.stop()
+        }
+    }
+
+    @Test
     fun `ストリームの失敗はlast-operation-failedで、errorからerror-codeと説明を読める`() = timeout(limit) {
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)

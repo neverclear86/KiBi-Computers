@@ -334,7 +334,7 @@ kibiWasm {
         sources.from("src/test/wasm/path_wasi.c")
         compilerArgs.addAll("-O2", "-s")
     }
-    // /dev/device/<address> の fd の isatty を、wasi-libc が p2 の wasi:filesystem を直接呼ぶ形で確かめる（#865。dev_device_wasi.c は p1 と同じソース）
+    // /dev/device/<address> と /dev/tty の fd の isatty・fstat を、wasi-libc が p2 の wasi:filesystem を直接呼ぶ形で確かめる（#865・#885。dev_device_wasi.c は p1 と同じソース）
     wasiSdkModule("dev-device-wasi-p2") {
         sources.from("src/test/wasm/dev_device_wasi.c")
         compilerArgs.addAll("-O2", "-s")
