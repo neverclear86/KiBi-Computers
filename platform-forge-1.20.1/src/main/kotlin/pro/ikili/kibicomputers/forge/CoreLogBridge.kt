@@ -33,7 +33,7 @@ internal object CoreLogBridge {
         }
     }
 
-    /** 流す名前の根。`endive` のレベルも log4j の設定を写す（既定の INFO なら、Endive の TRACE の行は書式を作る前に落ちる） */
+    /** 流す名前の根。`endive` のレベルも log4j の設定を写す（ローダー同梱の log4j2.xml は `<Root level="all">` で `endive` 用の設定がないので、既定では ALL になり、Endive の TRACE の行も SLF4J まで渡る） */
     private val ROOTS = listOf(CoreLogRouting.ROOT, CoreLogRouting.ENDIVE_ROOT)
 
     /** 取り付けた経路（根の名前ごと） */

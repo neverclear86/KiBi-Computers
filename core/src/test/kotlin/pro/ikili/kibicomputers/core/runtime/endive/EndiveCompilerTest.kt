@@ -557,6 +557,9 @@ class EndiveCompilerTest {
         }
         val injected = FuelInjector.inject(original)
         val before = EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.SOME_FUNCTIONS)
+        // JUL の root の ConsoleHandler は、初めて使うときの System.err をつかむ。差し替えの前に作らせておかないと、このテストが JVM で最初の
+        // 報告（WARNING）を出したとき、MOD 自身のログが差し替え先に書かれ、ConsoleHandler が捨てる先をつかんだままになる（単独実行で起きる）
+        java.util.logging.Logger.getLogger("").handlers
         // 標準エラーは JVM 全体の状態なので、読み込みの間だけ差し替えて、必ず戻す（core のテストは並列に動かさない）
         val err = java.io.ByteArrayOutputStream()
         val saved = System.err
@@ -594,6 +597,47 @@ class EndiveCompilerTest {
         assertEquals(setOf(0, 1), EndiveRuntime.retainedFunctions(parsed))
         assertEquals(setOf(1), EndiveRuntime.retainedFunctions(parsed.stripped(setOf(1))))
         assertEquals(emptySet<Int>(), EndiveRuntime.retainedFunctions(parsed.stripped(emptySet())))
+    }
+
+    @Test
+    fun `ログに並べる関数の番号は、上限を超えた分を個数にする`() {
+        assertEquals("[0, 1, 2]", EndiveRuntime.describeFunctions(setOf(0, 1, 2)))
+        val n = EndiveRuntime.MAX_LOGGED_FUNCTIONS
+        assertEquals((0 until n).toSet().toString(), EndiveRuntime.describeFunctions((0 until n).toSet()))
+        val big = EndiveRuntime.describeFunctions((0 until 100_000).toSet())
+        assertEquals((0 until n).joinToString(", ", "[", "") + ", … ほか ${100_000 - n} 個]", big)
+        assertTrue(big.length < 200)
+    }
+
+    @Test
+    fun `大きすぎる関数が間接の末尾呼び出しを持つと、本体が残る関数が広がるが、ログの1行は短いまま`() {
+        // #680: Endive は、インタプリタに回した関数に return_call_indirect があると、定義した関数の全部の本体を残す
+        val type = WasmBinary().typeIndex(emptyList(), listOf(WasmBinary.I32))
+        val smalls = ArrayList<Int>()
+        var big = -1
+        val bytes = WasmBinary().run {
+            table(1)
+            repeat(40) { i -> smalls += func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, i)).also { exportFunc("small$i", it) } }
+            elem(0, listOf(smalls[0]))
+            // 大きすぎる関数。最後は 0 番のテーブルの要素への return_call_indirect
+            big = func(
+                emptyList(),
+                listOf(WasmBinary.I32),
+                WasmBinary.code(sumBody(TOO_LARGE_GROUPS, 400_003), 0x1A, 0x41, 0, 0x13, type, 0),
+                locals = listOf(WasmBinary.I32),
+            ).also { exportFunc("big", it) }
+            build()
+        }
+        val module = EndiveRuntime().load(bytes)
+        assertTrue(isCompiled(module))
+        val retained = interpretedFunctions(module)
+        assertTrue(big in retained)
+        assertTrue(retained.size > 1, "末尾呼び出しで本体が残る関数が広がる: $retained")
+        assertTrue(EndiveRuntime.describeFunctions(retained).length < 300)
+        module.instantiate(WasmInstanceConfig.EMPTY).use {
+            assertEquals(0L, it.call("big")[0])
+            assertEquals(7L, it.call("small7")[0])
+        }
     }
 
     private companion object {

@@ -215,7 +215,7 @@ public class EndiveRuntime internal constructor(
             val auto = retainedFunctions(result.value.wasmModule())
             if (auto.isNotEmpty()) {
                 FALLBACK_LOG.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) {
-                    "WASM の関数 $auto をインタプリタで動かす（JVM のメソッドの上限を超える）"
+                    "WASM の関数 ${describeFunctions(auto)} をインタプリタで動かす（JVM のメソッドの上限を超える関数と、そこから末尾呼び出しで届く関数）"
                 }
             }
             return Compilation(result.value, auto)
@@ -244,6 +244,17 @@ public class EndiveRuntime internal constructor(
             for (i in bodies.indices) if (bodies[i] != null) out += i + imported
             return out
         }
+
+        /** ログの1行に並べる関数の番号の数の上限。プレイヤーが作るモジュールは関数を 100,000 まで持てるので、行の大きさを抑える（#680） */
+        internal const val MAX_LOGGED_FUNCTIONS: Int = 16
+
+        /** ログに出す関数の番号の並び。[MAX_LOGGED_FUNCTIONS] を超えた分は個数だけにする */
+        internal fun describeFunctions(functions: Set<Int>): String =
+            if (functions.size <= MAX_LOGGED_FUNCTIONS) {
+                functions.toString()
+            } else {
+                functions.take(MAX_LOGGED_FUNCTIONS).joinToString(", ", "[", "") + ", … ほか ${functions.size - MAX_LOGGED_FUNCTIONS} 個]"
+            }
 
         /**
          * コンパイルに失敗し、失敗の例外から大きすぎる関数を特定できないとき、命令の数が多い関数をインタプリタに回してやり直す回数
