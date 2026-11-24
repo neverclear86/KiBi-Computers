@@ -89,6 +89,11 @@ tasks.test {
         systemProperty("kibi.asyncifyBenchmark", "true")
         providers.gradleProperty("kibi.asyncifyBenchmark.rounds").orNull?.let { systemProperty("kibi.asyncifyBenchmark.rounds", it) }
     }
+    // 変換したモジュールの燃料 1 あたりの CPU 時間を測る（#389。`-Pkibi.asyncifyFuelBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.asyncifyFuelBenchmark").orNull == "true") {
+        systemProperty("kibi.asyncifyFuelBenchmark", "true")
+        providers.gradleProperty("kibi.asyncifyFuelBenchmark.rounds").orNull?.let { systemProperty("kibi.asyncifyFuelBenchmark.rounds", it) }
+    }
     // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
     providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
         systemProperty("kibi.luaReplMachines", it)

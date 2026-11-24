@@ -136,8 +136,10 @@ class AsyncifyLivenessTest {
     @Test
     fun `本番の読み込みは生きているローカルだけを退避する`() {
         val metered = FuelInjector.inject(resource("lua.wasm"))
-        val r = Asyncify.transform(metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc)
-        val all = Asyncify.transform(metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc, debug = AsyncifyDebug.SAVE_ALL)
+        val r = Asyncify.transform(metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc, fuelSites = metered.sites)
+        val all = Asyncify.transform(
+            metered.bytes, WasiP1.WAIT_IMPORTS, Instrumentation.YIELD_IMPORT, metered::originalFunc, debug = AsyncifyDebug.SAVE_ALL, fuelSites = metered.sites,
+        )
         assertArrayEquals(Instrumentation.apply(resource("lua.wasm"), WasiP1.WAIT_IMPORTS), r.bytes)
         assertTrue(r.codeAfter < all.codeAfter, "${r.codeAfter} / ${all.codeAfter}")
         println("lua.wasm: 退避するローカル ${r.savedLocals} / ${r.allLocals}、関数あたりの最大 ${r.maxLocals} / ${all.maxLocals}、コード ${r.codeAfter} / ${all.codeAfter}（変換前 ${r.codeBefore}）")

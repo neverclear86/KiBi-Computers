@@ -1,0 +1,293 @@
+package pro.ikili.kibicomputers.core.runtime.asyncify
+
+import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.runtime.Instrumentation
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncStack
+import pro.ikili.kibicomputers.core.runtime.WasmAsyncState
+import pro.ikili.kibicomputers.core.runtime.WasmBinary
+import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
+import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.WasmInstance
+import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
+import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.fuel.AsyncifyFuelWeight
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelSites
+import run.endive.wasm.Parser
+import run.endive.wasm.types.OpCode
+
+/** 変換が足すコードの分を、止まりうる関数の課金に見込む（#389。ADR 0329 の「#389: 変換が足すコードの見込み」） */
+class AsyncifyFuelEstimateTest {
+    private val i32 = 0x7F
+
+    /**
+     * `w.wait() -> i32` を呼んで、その値の回数だけ回る loop（止まりうる関数 `run` の中）と、
+     * 50 回まわる葉の関数 `leaf`（止まりうる関数を呼ばない）を通る `run() -> i32`。戻り値は 7（`AsyncifyTest` と同じ形）。
+     *
+     * [pad] は、loop の中の分岐の後のセグメントに足す `i32.const 0; drop` の組の数（セグメントの課金を大きくする）。
+     * [tryTable] なら `run` の本体を catch のない `try_table` で包む（燃料をローカルに写さず、グローバルで数える形になる。ADR 0028）
+     */
+    private fun loopModule(simd: Boolean = false, pad: Int = 0, tryTable: Boolean = false): ByteArray {
+        val b = WasmBinary()
+        val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
+        b.mutableI64Global(0)
+        // [simd] なら loop の中に SIMD の命令を入れる（段1で loop の先頭が待ち点になり、型を追えずに断られる。段2では変換できる）
+        val simdOp = if (simd) WasmBinary.code(0xFD, 0x0C, ByteArray(16), 0xFD, 0x1B, 0, 0x1A) else ByteArray(0)
+        val padding = ByteArray(pad * 3) { intArrayOf(0x41, 0, 0x1A)[it % 3].toByte() }
+        val countDown = WasmBinary.code(
+            0x02, 0x40, 0x03, 0x40, simdOp, 0x20, 0, 0x45, 0x0D, 1, padding, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B,
+        )
+        val leaf = b.func(listOf(i32), listOf(i32), countDown + WasmBinary.code(0x41, 7))
+        val inner = WasmBinary.code(0x10, wait, 0x21, 0) + countDown + WasmBinary.code(0x41, 50, 0x10, leaf)
+        val run = b.func(
+            emptyList(),
+            listOf(i32),
+            if (tryTable) WasmBinary.code(0x1F, i32, 0, inner, 0x0B) else inner,
+            locals = listOf(i32),
+        )
+        b.exportFunc("run", run)
+        return b.build()
+    }
+
+    private class Stack : WasmAsyncStack {
+        val values = ArrayList<Long>()
+
+        override fun push(value: Long) {
+            values += value
+        }
+
+        override fun pop(): Long = values.removeAt(values.size - 1)
+    }
+
+    private val metered = FuelInjector.inject(loopModule())
+
+    /** 挿入した [m]（既定は [metered]）を、[weight] で見込んで変換する（[yield] なら燃料切れも待ち点にする段1） */
+    private fun transform(weight: AsyncifyFuelWeight?, yield: Boolean = true, m: FuelInjector.Result = metered): ByteArray = Asyncify.transform(
+        m.bytes,
+        setOf("w.wait"),
+        if (yield) Instrumentation.YIELD_IMPORT else null,
+        m::originalFunc,
+        fuelSites = weight?.let { m.sites.withWeight(it) },
+    ).bytes
+
+    private val noExhaustion = object : WasmFuelHandler {
+        override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = throw AssertionError("燃料は切れない")
+    }
+
+    /** `w.wait` が [n] を返すとき、`run` が使った燃料（切れないだけの燃料で） */
+    private fun used(bytes: ByteArray, n: Int): Long {
+        val module = EndiveRuntime().load(bytes)
+        val initial = 1_000_000_000L
+        val config = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(n.toLong()) }
+            .asyncStack(Stack())
+            .fuel(initial, noExhaustion)
+            .build()
+        return module.instantiate(config).use { instance ->
+            assertArrayEquals(longArrayOf(7), instance.call("run"))
+            initial - instance.fuel
+        }
+    }
+
+    private fun instructions(bytes: ByteArray, defined: Int) =
+        Parser.parse(bytes).codeSection().getFunctionBody(defined).instructions().map { it.opcode() to it.operands().toList() }
+
+    @Test
+    fun `見込まない重みは、位置を渡さないときと同じバイト列になる`() {
+        assertArrayEquals(transform(null), transform(AsyncifyFuelWeight.NONE))
+        assertArrayEquals(transform(null, yield = false), transform(AsyncifyFuelWeight.NONE, yield = false))
+        // 本番の重みでは変わる
+        assertFalse(transform(null).contentEquals(transform(AsyncifyFuelWeight.DEFAULT)))
+    }
+
+    @Test
+    fun `同じ入力からは同じバイト列が出る`() {
+        assertArrayEquals(transform(AsyncifyFuelWeight.DEFAULT), transform(AsyncifyFuelWeight.DEFAULT))
+        assertArrayEquals(Instrumentation.apply(loopModule(), setOf("w.wait")), Instrumentation.apply(loopModule(), setOf("w.wait")))
+    }
+
+    /** 挿入した [m] を段1・段2で変換し、止まりうる関数 `run` の loop の 1 回ごとの燃料がちょうど 2 倍になり、葉の関数は変わらないことを確かめる */
+    private fun assertDoublesOnlySuspending(m: FuelInjector.Result) {
+        assertEquals(2, FuelCosts.ASYNCIFY_NUMERATOR / FuelCosts.ASYNCIFY_DENOMINATOR)
+        for (yield in listOf(true, false)) {
+            val stage = "段${if (yield) 1 else 2}"
+            val none = transform(AsyncifyFuelWeight.NONE, yield, m)
+            val def = transform(AsyncifyFuelWeight.DEFAULT, yield, m)
+            val base = listOf(0, 100, 200).map { used(none, it) }
+            val extra = listOf(0, 100, 200).map { used(def, it) - used(none, it) }
+            // 止まりうる関数 run の loop の 1 回ごとの燃料は、ちょうど 2 倍になる（増えた分 = 見込まないときの分）
+            val perIteration = base[1] - base[0]
+            assertTrue(perIteration > 0, "$stage: $base")
+            assertEquals(perIteration, base[2] - base[1], "$stage: $base")
+            assertEquals(perIteration, extra[1] - extra[0], "$stage: $extra")
+            assertEquals(perIteration, extra[2] - extra[1], "$stage: $extra")
+            // 葉の関数の分（50 回まわる loop）は増えないので、増えた分は全体より少ない
+            assertTrue(extra[0] in 1 until base[0], "$stage: $base $extra")
+            // 葉の関数（定義済みの関数の 0 番）は変換しないので、命令も課金もそのまま
+            assertEquals(instructions(none, 0), instructions(def, 0))
+            assertEquals(instructions(m.bytes, 0).size, instructions(def, 0).size)
+        }
+    }
+
+    /** [bytes] の、止まりうる関数 `run`（定義済みの関数の 1 番）の中の `i64.const` の値（課金の定数） */
+    private fun i64Consts(bytes: ByteArray): List<Long> =
+        instructions(bytes, 1).filter { it.first == OpCode.I64_CONST }.map { it.second[0] }
+
+    @Test
+    fun `止まりうる関数の課金だけを倍率どおりに増やし、葉の関数は変えない`() = assertDoublesOnlySuspending(metered)
+
+    @Test
+    fun `倍にして課金の定数が長くなっても（1 バイトから 2 バイト）、使う燃料はちょうど 2 倍になる`() {
+        // loop の分岐の後のセグメントの課金を 32〜63（sleb で 1 バイト）にして、倍の 64〜126 で 2 バイトになるようにする
+        val m = FuelInjector.inject(loopModule(pad = 20))
+        val before = i64Consts(m.bytes)
+        assertTrue(before.any { it in 32..63 }, "$before")
+        assertDoublesOnlySuspending(m)
+        // 変換の後の run には、2 バイトになった課金の定数がある（後ろの命令も正しく写せている）
+        for (yield in listOf(true, false)) {
+            val after = i64Consts(transform(AsyncifyFuelWeight.DEFAULT, yield, m))
+            assertTrue(after.any { it in 64..126 }, "$after")
+            assertEquals(before.filter { it > 0 }.map { it * 2 }.sorted(), after.filter { it > 0 }.sorted())
+        }
+    }
+
+    @Test
+    fun `try_table を含む止まりうる関数（燃料をグローバルで数える形）でも、課金を差し替えて倍にする`() {
+        for (pad in listOf(0, 20)) {
+            val m = FuelInjector.inject(loopModule(pad = pad, tryTable = true))
+            // 燃料をローカルに写さないので、run のローカルは元の 1 つのまま（写す形なら i64 のローカルが 1 つ増える）
+            assertEquals(1, Parser.parse(m.bytes).codeSection().getFunctionBody(1).localTypes().size)
+            assertTrue(m.sites.charges[1].isNotEmpty())
+            assertDoublesOnlySuspending(m)
+        }
+    }
+
+    @Test
+    fun `倍率は整数で計算して切り上げる`() {
+        val w = AsyncifyFuelWeight(3, 2)
+        assertEquals(2, w.apply(1)) // 1.5 を切り上げ
+        assertEquals(3, w.apply(2))
+        assertEquals(15, w.apply(10))
+        assertEquals(10, AsyncifyFuelWeight.NONE.apply(10))
+        assertEquals(20, AsyncifyFuelWeight.DEFAULT.apply(10))
+        assertEquals(FuelCosts.ASYNCIFY_NUMERATOR, AsyncifyFuelWeight.DEFAULT.numerator)
+        assertEquals(FuelCosts.ASYNCIFY_DENOMINATOR, AsyncifyFuelWeight.DEFAULT.denominator)
+        assertThrows<IllegalArgumentException> { AsyncifyFuelWeight(1, 2) }
+    }
+
+    @Test
+    fun `燃料切れで巻き戻して巻き直しても、使った燃料は燃料が切れないときと同じ`() {
+        // 見込みは課金の定数を大きくするだけで、課金は if (state == NORMAL) の中にあるので、巻き直しの間は引かない
+        val bytes = Instrumentation.apply(loopModule(), setOf("w.wait"))
+        val n = 300
+        val expected = used(bytes, n)
+        val module = EndiveRuntime().load(bytes)
+        val grant = 40L
+        var granted = grant
+        var unwinds = 0
+        var blocking = 0
+        // 巻き戻したときの残り（燃料のグローバルは、巻き戻しでは書き戻されないので、カーネルと同じくこれを使う）
+        var unwoundRemaining = 0L
+        val handler = object : WasmFuelHandler {
+            // 葉の関数の中の切れ（巻き戻せない）は、その場で足す
+            override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
+                blocking++
+                granted += grant
+                return remaining + grant
+            }
+
+            override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long {
+                if (instance.asyncState == WasmAsyncState.REWINDING) {
+                    instance.asyncState = WasmAsyncState.NORMAL
+                    return instance.fuel
+                }
+                unwinds++
+                unwoundRemaining = remaining
+                instance.asyncState = WasmAsyncState.UNWINDING
+                return remaining
+            }
+        }
+        val stack = Stack()
+        val config = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(n.toLong()) }
+            .asyncStack(stack)
+            .fuel(grant, handler)
+            .build()
+        module.instantiate(config).use { instance ->
+            var result = instance.call("run")
+            while (instance.asyncState == WasmAsyncState.UNWINDING) {
+                instance.fuel = unwoundRemaining + grant
+                granted += grant
+                instance.asyncState = WasmAsyncState.REWINDING
+                result = instance.call("run")
+            }
+            assertArrayEquals(longArrayOf(7), result)
+            assertTrue(stack.values.isEmpty())
+            assertTrue(unwinds > 10, "巻き戻し $unwinds 回")
+            assertTrue(blocking > 0, "葉の関数の中の切れ $blocking 回")
+            assertEquals(expected, granted - instance.fuel)
+        }
+    }
+
+    @Test
+    fun `燃料を共有するcoreモジュール（コンポーネント）にも見込む`() {
+        val shared = FuelInjector.inject(loopModule(), sharedGlobal = true)
+        fun transform(weight: AsyncifyFuelWeight?) = Asyncify.prepare(shared.bytes, {}, shared::originalFunc, weight?.let { shared.sites.withWeight(it) })
+            .transform(setOf("w.wait"), yieldImport = Instrumentation.YIELD_IMPORT).bytes
+        assertArrayEquals(transform(null), transform(AsyncifyFuelWeight.NONE))
+        val def = transform(AsyncifyFuelWeight.DEFAULT)
+        assertFalse(transform(null).contentEquals(def))
+        // 正しい WASM として読める
+        Parser.parse(def)
+    }
+
+    /** [Instrumentation.applyDetailed] が、段 [yield] の変換に、挿入の結果の課金の位置を渡す（渡し忘れると、見込まない出力になる） */
+    private fun assertInstrumentationPassesSites(simd: Boolean, stage1: Boolean) {
+        val original = loopModule(simd)
+        val m = FuelInjector.inject(original)
+        val waits = setOf("w.wait")
+        fun expected(weight: AsyncifyFuelWeight) = Asyncify.transform(
+            m.bytes,
+            waits,
+            if (stage1) Instrumentation.YIELD_IMPORT else null,
+            m::originalFunc,
+            fuelSites = m.sites.withWeight(weight),
+        ).bytes
+        val applied = Instrumentation.applyDetailed(original, waits)
+        assertEquals(stage1, applied.fuelYield, "${applied.fuelYieldRejection}")
+        if (!stage1) assertTrue(applied.fuelYieldRejection!!.contains("SIMD"), "${applied.fuelYieldRejection}")
+        assertArrayEquals(expected(AsyncifyFuelWeight.DEFAULT), applied.bytes)
+        assertFalse(expected(AsyncifyFuelWeight.NONE).contentEquals(applied.bytes))
+    }
+
+    @Test
+    fun `Instrumentation は段1の変換に課金の位置を渡す`() = assertInstrumentationPassesSites(simd = false, stage1 = true)
+
+    @Test
+    fun `Instrumentation は段1を断られて落ちた段2の変換にも課金の位置を渡す`() = assertInstrumentationPassesSites(simd = true, stage1 = false)
+
+    @Test
+    fun `課金の位置が合わなければ、変換できないとして断る（燃料の数を黙って壊さない）`() {
+        fun transform(sites: FuelSites) = Asyncify.transform(metered.bytes, setOf("w.wait"), Instrumentation.YIELD_IMPORT, metered::originalFunc, fuelSites = sites)
+        // 位置が命令の先頭でない（止まりうる関数 run は、定義済みの関数の 1 番）
+        val shifted = FuelSites(Array(metered.sites.charges.size) { f -> IntArray(metered.sites.charges[f].size) { metered.sites.charges[f][it] + 1 } })
+        assertTrue(shifted.charges[1].isNotEmpty())
+        val moved = assertThrows<AsyncifyUnsupported> { transform(shifted) }
+        assertTrue(moved.message!!.contains("変換できない"), moved.message)
+        assertTrue(moved.message!!.contains("燃料の課金の位置"), moved.message)
+        // 関数の数と合わない（prepare は読むだけで、変換のときに断る）
+        val fewer = FuelSites(metered.sites.charges.copyOfRange(0, metered.sites.charges.size - 1))
+        val prepared = Asyncify.prepare(metered.bytes, {}, metered::originalFunc, fewer)
+        val count = assertThrows<AsyncifyUnsupported> { prepared.transform(setOf("w.wait"), yieldImport = Instrumentation.YIELD_IMPORT) }
+        assertTrue(count.message!!.contains("関数の数と合わない"), count.message)
+        // 正しい位置なら変換できる
+        transform(metered.sites)
+    }
+}

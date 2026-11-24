@@ -387,8 +387,10 @@ public class MachineConfig private constructor(builder: Builder) {
         private fun pagesOf(bytes: Long): Int = minOf(bytes / WasmMemory.PAGE_SIZE, WasmMemory.MAX_PAGES.toLong()).toInt()
 
         /**
-         * スライスの下限（仮。#47、確定は #251）。確かめる点の間の行き過ぎ（lua.wasm で最大約 7,000 命令。ADR 0028）と
-         * 前借りの上限（[pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_LIMIT] = 50,000）より十分大きくして、区切りが崩れないようにする
+         * スライスの下限（仮。#47、確定は #251）。確かめる点の間の行き過ぎ（lua.wasm で最大約 7,000 命令。ADR 0028。
+         * 待機点に変換した止まりうる関数の中では課金が 2 倍になる（`FuelCosts.ASYNCIFY_NUMERATOR`。#389）ので、燃料では最大約 14,000）と
+         * 前借りの上限（[pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_LIMIT] = 50,000）より十分大きくして、区切りが崩れないようにする。
+         * 重みや倍率を確定するとき（#251）は、行き過ぎ × 倍率がこれより十分小さいままかを見る
          */
         internal const val MIN_FUEL_SLICE: Long = 250_000
 
