@@ -62,6 +62,7 @@ import run.endive.wasm.types.FunctionType
 import run.endive.wasm.types.GlobalImport
 import run.endive.wasm.types.Instruction
 import run.endive.wasm.types.OpCode
+import run.endive.wasm.types.PassiveElement
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
 import run.endive.wasm.types.Table
@@ -151,6 +152,10 @@ public class EndiveRuntime internal constructor(
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
         return try {
+            // Endive が違う関数を置いてしまう形は、動かす前に断る（#706。正しくない結果になるので、対応しない作りとして扱う）
+            foreignFuncRefInitializer(module)?.let {
+                throw WasmLoadException("対応していない作り: $it（Endive が別の関数を置いてしまう。#706）")
+            }
             EndiveWasmModule(module, null)
         } catch (e: WasmLoadException) {
             throw e
@@ -508,6 +513,79 @@ public class EndiveRuntime internal constructor(
                 if (elements.getElement(i).initializers().any { init -> init.any(::isGcAllocation) }) return "要素セグメント $i"
             }
             return null
+        }
+
+        /**
+         * Endive が、ほかのインスタンスの関数の参照を、自分の関数の番号として置いてしまう定数式があれば、その場所と理由。なければ `null`（#706）。
+         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号（グローバルは import を数えない）
+         *
+         * import したグローバルの funcref の値は、渡した側のインスタンスでの関数の番号になっている。Endive 1.2.0 は、アクティブの要素では
+         * その持ち主のインスタンスを引く（`ConstantEvaluators.computeConstantInstance`）が、次の形では引かずに自分の番号として置く
+         * （別の関数が呼ばれるか、型が合わずにトラップする）。読み込みで断る:
+         * - パッシブの要素（`table.init` で置く。`OpcodeImpl.TABLE_INIT`）の式が、import したグローバルを `global.get` する
+         * - 関数の参照の型の、定義したグローバルの初期値が、import したグローバルを `global.get` する（`Instance.initialize` が持ち主を
+         *   自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
+         * - 定数式の `struct.new`・`array.new`・`array.new_fixed` が、番号で持つ参照の型の import したグローバルを `global.get` して、
+         *   フィールド・要素に入れる（Endive 1.2.0 の `ConstantEvaluators.computeConstant` は、funcref のフィールドを渡した側での番号のまま
+         *   int で入れる。`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる）。グローバルの初期値、どの要素セグメントの式、
+         *   表の初期値の式（例: `(table 1 (ref null $S) (struct.new $S (global.get $fr)))`。`Instance` のコンストラクターが同じ
+         *   `computeConstant` で作って `setObjRef` で置く）を見る
+         *
+         * 表の初期値の式が import したグローバルを直に `global.get` する形（`(table 8 funcref (global.get $fr))`）は、アクティブの要素と同じく
+         * `computeConstantInstance` で持ち主を引いて置くので正しく、断らない。
+         * 最初の 2 つは、JVM で番号（int）として持つ参照の型（funcref・関数の型の参照。`isObjectRef` でないもの）だけ。externref・
+         * GC の参照そのもの（struct・array の参照）は参照ごと置くので正しい。宣言の要素は `table.init` で使えないので見ない。
+         * 関数の本体で値として運ぶ形（`global.get` → `table.set`・`call_ref`、import した表からの `table.get`）も同じく間違うが、
+         * 定数式ではないので、ここでは見ない（#932）。Endive が直ったら、この判定を外す（#932）
+         */
+        internal fun foreignFuncRefInitializer(module: EndiveModule): String? {
+            val imports = module.importSection()
+            val importedGlobalTypes = ArrayList<ValType>()
+            for (i in 0 until imports.importCount()) {
+                val imp = imports.getImport(i)
+                if (imp is GlobalImport) importedGlobalTypes += imp.type()
+            }
+            if (importedGlobalTypes.isEmpty()) return null
+            val types = module.typeSection()
+            fun heldAsIndex(type: ValType) = type.isReference && !ValType.isObjectRef(type.id(), types)
+            fun readsImportedGlobal(init: List<Instruction>) =
+                init.any { it.opcode() == OpCode.GLOBAL_GET && it.operand(0) < importedGlobalTypes.size }
+            // GC のオブジェクトを作る式が、番号で持つ参照の型の import したグローバルを指す形（中のフィールド・要素に、番号のまま入る）
+            fun putsImportedFuncRefInObject(init: List<Instruction>) =
+                init.any(::takesOperandsIntoObject) &&
+                    init.any { it.opcode() == OpCode.GLOBAL_GET && it.operand(0) < importedGlobalTypes.size && heldAsIndex(importedGlobalTypes[it.operand(0).toInt()]) }
+            module.globalSection().globals().forEachIndexed { i, g ->
+                if (heldAsIndex(g.valueType()) && readsImportedGlobal(g.initInstructions())) {
+                    return "グローバル $i の初期値が、import したグローバルの関数の参照を指す"
+                }
+                if (putsImportedFuncRefInObject(g.initInstructions())) {
+                    return "グローバル $i の初期値が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
+                }
+            }
+            val elements = module.elementSection()
+            for (i in 0 until elements.elementCount()) {
+                val el = elements.getElement(i)
+                if (el is PassiveElement && heldAsIndex(el.type()) && el.initializers().any(::readsImportedGlobal)) {
+                    return "要素セグメント $i（パッシブ）の式が、import したグローバルの関数の参照を指す"
+                }
+                if (el.initializers().any(::putsImportedFuncRefInObject)) {
+                    return "要素セグメント $i の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
+                }
+            }
+            val tables = module.tableSection()
+            for (i in 0 until tables.tableCount()) {
+                val init: List<Instruction>? = tables.getTable(i).initialize()
+                if (init != null && putsImportedFuncRefInObject(init)) {
+                    return "表 $i の初期値の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
+                }
+            }
+            return null
+        }
+
+        /** 値をスタックから取って、GC のオブジェクト（struct・array）の中に入れる命令（`*.new_default`・`array.new_elem`・`array.new_data` は値を取らない） */
+        private fun takesOperandsIntoObject(ins: Instruction): Boolean = when (ins.opcode()) {
+            OpCode.STRUCT_NEW, OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_FIXED -> true
+            else -> false
         }
 
         private fun isGcAllocation(ins: Instruction): Boolean = when (ins.opcode()) {
