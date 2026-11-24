@@ -62,6 +62,7 @@ import run.endive.wasm.types.FunctionType
 import run.endive.wasm.types.GlobalImport
 import run.endive.wasm.types.Instruction
 import run.endive.wasm.types.OpCode
+import run.endive.wasm.types.PassiveElement
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
 import run.endive.wasm.types.Table
@@ -151,6 +152,10 @@ public class EndiveRuntime internal constructor(
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
         return try {
+            // Endive が違う関数を置いてしまう形は、動かす前に断る（#706。正しくない結果になるので、対応しない作りとして扱う）
+            foreignFuncRefInitializer(module)?.let {
+                throw WasmLoadException("対応していない作り: $it（Endive が別の関数を置いてしまう。#706）")
+            }
             EndiveWasmModule(module, null)
         } catch (e: WasmLoadException) {
             throw e
@@ -506,6 +511,45 @@ public class EndiveRuntime internal constructor(
             val elements = module.elementSection()
             for (i in 0 until elements.elementCount()) {
                 if (elements.getElement(i).initializers().any { init -> init.any(::isGcAllocation) }) return "要素セグメント $i"
+            }
+            return null
+        }
+
+        /**
+         * Endive が、ほかのインスタンスの関数の参照を、自分の関数の番号として置いてしまう定数式があれば、その場所と理由。なければ `null`（#706）。
+         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号（グローバルは import を数えない）
+         *
+         * import したグローバルの funcref の値は、渡した側のインスタンスでの関数の番号になっている。Endive 1.2.0 は、アクティブの要素では
+         * その持ち主のインスタンスを引く（`ConstantEvaluators.computeConstantInstance`）が、次の 2 つでは引かずに自分の番号として置く
+         * （別の関数が呼ばれるか、型が合わずにトラップする）。読み込みで断る:
+         * - パッシブの要素（`table.init` で置く。`OpcodeImpl.TABLE_INIT`）の式が、import したグローバルを `global.get` する
+         * - 関数の参照の型の、定義したグローバルの初期値が、import したグローバルを `global.get` する（`Instance.initialize` が持ち主を
+         *   自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
+         *
+         * 対象は、JVM で番号（int）として持つ参照の型（funcref・関数の型の参照。`isObjectRef` でないもの）だけ。externref・GC の参照は
+         * 参照ごと置くので正しい。宣言の要素は `table.init` で使えないので見ない。
+         * 関数の本体で値として運ぶ形（`global.get` → `table.set`・`call_ref`、import した表からの `table.get`）も同じく間違うが、
+         * 定数式ではないので、ここでは見ない（#932）。Endive が直ったら、この判定を外す（#932）
+         */
+        internal fun foreignFuncRefInitializer(module: EndiveModule): String? {
+            val imports = module.importSection()
+            var importedGlobals = 0
+            for (i in 0 until imports.importCount()) if (imports.getImport(i) is GlobalImport) importedGlobals++
+            if (importedGlobals == 0) return null
+            val types = module.typeSection()
+            fun heldAsIndex(type: ValType) = type.isReference && !ValType.isObjectRef(type.id(), types)
+            fun readsImportedGlobal(init: List<Instruction>) = init.any { it.opcode() == OpCode.GLOBAL_GET && it.operand(0) < importedGlobals }
+            module.globalSection().globals().forEachIndexed { i, g ->
+                if (heldAsIndex(g.valueType()) && readsImportedGlobal(g.initInstructions())) {
+                    return "グローバル $i の初期値が、import したグローバルの関数の参照を指す"
+                }
+            }
+            val elements = module.elementSection()
+            for (i in 0 until elements.elementCount()) {
+                val el = elements.getElement(i)
+                if (el is PassiveElement && heldAsIndex(el.type()) && el.initializers().any(::readsImportedGlobal)) {
+                    return "要素セグメント $i（パッシブ）の式が、import したグローバルの関数の参照を指す"
+                }
             }
             return null
         }

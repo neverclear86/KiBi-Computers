@@ -107,5 +107,19 @@
 - `ComponentSpecTest`: 仕様の `test/values`・`test/linking` の wast（同じコミット）を `wasm-tools json-from-wast` で動かす。計測なしとあり（燃料を共有する形）の両方で動かし、計測ありで燃料が切れたトラップは `assert_trap` の成功に数えない（#692。`json-from-wast` はファイルごとに 1 回）。通らないもの（map、async、複数のメモリ）は理由と一緒に挙げる（resource は #265 で通るようにした。`test/resources` の wast も足した）。
 - `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` からホストの関数まで届き、標準入出力の own を受けた先まで進むことを確かめる（#265）。
 - `ComponentProcessTest`: カーネルの中で、インスタンスをまたぐ呼び出しと燃料切れでマシンを壊さない。読み込みの途中の失敗（#692）: 2 つ目の start 関数のトラップ（プロセスだけが `CRASHED`）、作る途中の燃料待ちでの kill と、インスタンスを作る間の kill（`KILLED`）。どれもマシンを壊さず、作った core インスタンスを閉じ、プロセスとマシンの RAM を返す。
-- `FuelInjectorSharedTest`: 燃料を共有する形の挿入（#692）。グローバルの import があるとき・ないときの、関数の本体・export・グローバルの初期値（import を指す形と、前に定義したグローバルを指す extended-const の形）・データと要素のオフセット・要素の式の番号の付け替えを、wasm-tools の検証、Endive の読み込み、実行の結果で確かめる。パッシブの要素の式は、Endive が `table.init` で `global.get` を正しく置かない（#706）ので、wasm-tools で読み戻して確かめる。共有しない形では、今までどおりグローバルの import を断る。
+- `FuelInjectorSharedTest`: 燃料を共有する形の挿入（#692）。グローバルの import があるとき・ないときの、関数の本体・export・グローバルの初期値（import を指す形と、前に定義したグローバルを指す extended-const の形）・データと要素のオフセット・要素の式の番号の付け替えを、wasm-tools の検証、Endive の読み込み、実行の結果で確かめる。パッシブの要素の式は、Endive が `table.init` でほかのインスタンスの関数の参照を正しく置かず、ランタイムが読み込みで断る（#706）ので、wasm-tools で読み戻して確かめ、Endive の読み込みでは断ることを確かめる。共有しない形では、今までどおりグローバルの import を断る。
+- `ForeignFuncRefTest`: ほかのインスタンスの関数の参照を Endive が自分の番号として置いてしまう定数式を、計測なしと共有の燃料の形の両方で、読み込みで断る（#706。下の「追記（#706）」）。正しく動く形（アクティブの要素の import、パッシブの要素の `ref.func`、externref の要素）は断らず、動かして値を確かめる。
 - GameTest `componentLinksOnServer`（両バージョン）。
+
+## 追記（#706）: ほかのインスタンスの関数の参照を置く定数式を断る
+
+Endive 1.2.0 は、import した funcref のグローバルの値（渡した側のインスタンスでの関数の番号）を、次の 2 つの定数式で、受け取った側の関数の番号として置いてしまう（インタプリタ・コンパイルとも。上流の main でも同じ）。別の関数が呼ばれるか、型が合わずにトラップする。
+
+- パッシブの要素の式（`table.init` で置く。`OpcodeImpl.TABLE_INIT` が、アクティブの要素と違って `ConstantEvaluators.computeConstantInstance` で持ち主を引かない）
+- 関数の参照の型の、定義したグローバルの初期値（`Instance.initialize` が持ち主を自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
+
+直るまでは、`EndiveRuntime.parseModule` が `foreignFuncRefInitializer` で見つけて `WasmLoadException` で断る（対応しない作りとして扱う。`AsyncifyUnsupported` ではない）。対象は、番号（int）で持つ参照の型（funcref・関数の型の参照）が、import したグローバルを `global.get` する形だけ。externref・GC の参照は参照ごと置くので断らない。判定は読み込みのときに 1 回だけで、結果は `ProgramCache` が共有するので、実行中のコストはない。グローバルの import を持てるのは、計測しないモジュールと燃料を共有する形（コンポーネントの core モジュール）だけなので、p1 のプログラムには当たらない。
+
+比べた方式: 読み込みで動く形に書き換える（隠した表に入れて `table.init` を `table.copy` にするなど）は、`elem.drop` の後のトラップの条件・表の番号・RAM の数え方・状態保存の表の一覧・Asyncify の `sharedTables` に波及し、めったに当たらない形に対して重すぎる。Endive を差し替える（fork・shade）は、Jar-in-Jar とコンパイルしたコードの呼び出しを壊しやすい。funcref のグローバルの import を丸ごと断ると、正しく動くアクティブの要素まで断る。
+
+関数の本体で参照を値として運ぶ形（import した funcref のグローバルを `global.get` して `table.set`・`call_ref` する、import した表から `table.get` して自分の表に置く）も、同じく違う関数になることを確かめた（`table.copy` は正しい）。定数式でなく、命令の流れを追わないと分からないので、#706 では扱わず、#932 に分けた。Endive が直ったら、この判定を外し、`FuelInjectorSharedTest` のパッシブの要素を動かして確かめる形に戻す。
