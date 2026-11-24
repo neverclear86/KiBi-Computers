@@ -212,7 +212,12 @@ internal object Asyncify {
             originalFunc: (Int) -> Int = numbering,
             debug: AsyncifyDebug = AsyncifyDebug.NONE,
             checkpoint: () -> Unit = {},
-        ): Result = guard { Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug, fuelSites).run() }
+        ): Result = guard {
+            // 位置は挿入の結果から渡されたもの。合わなければ内部の誤り。ほかの変換の誤りと同じく、変換できない（[AsyncifyUnsupported]）として断る
+            // （燃料の数を壊さないように、黙って続けない。p1 は段1 → 段2 と試して読み込みを断り、コンポーネントは待機点に変換せずに動く）
+            fuelSites?.let { check(it.charges.size == module.codeSection().functionBodyCount()) { "燃料の計測コードの位置が、関数の数と合わない" } }
+            Transformer(wasm, module, waitImports, yieldImport, originalFunc, checkpoint, externalSuspendTypes, debug, fuelSites).run()
+        }
 
         private inline fun <T> guard(block: () -> T): T = try {
             block()
@@ -240,9 +245,6 @@ internal object Asyncify {
         val module = parse(wasm)
         checkpoint()
         checkReserved(module)
-        if (fuelSites != null) {
-            check(fuelSites.charges.size == module.codeSection().functionBodyCount()) { "燃料の計測コードの位置が、関数の数と合わない" }
-        }
         return Prepared(wasm, module, originalFunc, fuelSites)
     }
 

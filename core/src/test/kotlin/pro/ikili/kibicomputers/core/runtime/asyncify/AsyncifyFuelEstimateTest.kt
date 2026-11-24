@@ -19,6 +19,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.AsyncifyFuelWeight
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.runtime.fuel.FuelSites
 import run.endive.wasm.Parser
 
 /** 変換が足すコードの分を、止まりうる関数の課金に見込む（#389。ADR 0329 の「#389: 変換が足すコードの見込み」） */
@@ -29,11 +30,13 @@ class AsyncifyFuelEstimateTest {
      * `w.wait() -> i32` を呼んで、その値の回数だけ回る loop（止まりうる関数 `run` の中）と、
      * 50 回まわる葉の関数 `leaf`（止まりうる関数を呼ばない）を通る `run() -> i32`。戻り値は 7（`AsyncifyTest` と同じ形）
      */
-    private fun loopModule(): ByteArray {
+    private fun loopModule(simd: Boolean = false): ByteArray {
         val b = WasmBinary()
         val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
         b.mutableI64Global(0)
-        val countDown = WasmBinary.code(0x02, 0x40, 0x03, 0x40, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B)
+        // [simd] なら loop の中に SIMD の命令を入れる（段1で loop の先頭が待ち点になり、型を追えずに断られる。段2では変換できる）
+        val simdOp = if (simd) WasmBinary.code(0xFD, 0x0C, ByteArray(16), 0xFD, 0x1B, 0, 0x1A) else ByteArray(0)
+        val countDown = WasmBinary.code(0x02, 0x40, 0x03, 0x40, simdOp, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B)
         val leaf = b.func(listOf(i32), listOf(i32), countDown + WasmBinary.code(0x41, 7))
         val run = b.func(
             emptyList(),
@@ -202,5 +205,48 @@ class AsyncifyFuelEstimateTest {
         assertFalse(transform(null).contentEquals(def))
         // 正しい WASM として読める
         Parser.parse(def)
+    }
+
+    /** [Instrumentation.applyDetailed] が、段 [yield] の変換に、挿入の結果の課金の位置を渡す（渡し忘れると、見込まない出力になる） */
+    private fun assertInstrumentationPassesSites(simd: Boolean, stage1: Boolean) {
+        val original = loopModule(simd)
+        val m = FuelInjector.inject(original)
+        val waits = setOf("w.wait")
+        fun expected(weight: AsyncifyFuelWeight) = Asyncify.transform(
+            m.bytes,
+            waits,
+            if (stage1) Instrumentation.YIELD_IMPORT else null,
+            m::originalFunc,
+            fuelSites = m.sites.withWeight(weight),
+        ).bytes
+        val applied = Instrumentation.applyDetailed(original, waits)
+        assertEquals(stage1, applied.fuelYield, "${applied.fuelYieldRejection}")
+        if (!stage1) assertTrue(applied.fuelYieldRejection!!.contains("SIMD"), "${applied.fuelYieldRejection}")
+        assertArrayEquals(expected(AsyncifyFuelWeight.DEFAULT), applied.bytes)
+        assertFalse(expected(AsyncifyFuelWeight.NONE).contentEquals(applied.bytes))
+    }
+
+    @Test
+    fun `Instrumentation は段1の変換に課金の位置を渡す`() = assertInstrumentationPassesSites(simd = false, stage1 = true)
+
+    @Test
+    fun `Instrumentation は段1を断られて落ちた段2の変換にも課金の位置を渡す`() = assertInstrumentationPassesSites(simd = true, stage1 = false)
+
+    @Test
+    fun `課金の位置が合わなければ、変換できないとして断る（燃料の数を黙って壊さない）`() {
+        fun transform(sites: FuelSites) = Asyncify.transform(metered.bytes, setOf("w.wait"), Instrumentation.YIELD_IMPORT, metered::originalFunc, fuelSites = sites)
+        // 位置が命令の先頭でない（止まりうる関数 run は、定義済みの関数の 1 番）
+        val shifted = FuelSites(Array(metered.sites.charges.size) { f -> IntArray(metered.sites.charges[f].size) { metered.sites.charges[f][it] + 1 } })
+        assertTrue(shifted.charges[1].isNotEmpty())
+        val moved = assertThrows<AsyncifyUnsupported> { transform(shifted) }
+        assertTrue(moved.message!!.contains("変換できない"), moved.message)
+        assertTrue(moved.message!!.contains("燃料の課金の位置"), moved.message)
+        // 関数の数と合わない（prepare は読むだけで、変換のときに断る）
+        val fewer = FuelSites(metered.sites.charges.copyOfRange(0, metered.sites.charges.size - 1))
+        val prepared = Asyncify.prepare(metered.bytes, {}, metered::originalFunc, fewer)
+        val count = assertThrows<AsyncifyUnsupported> { prepared.transform(setOf("w.wait"), yieldImport = Instrumentation.YIELD_IMPORT) }
+        assertTrue(count.message!!.contains("関数の数と合わない"), count.message)
+        // 正しい位置なら変換できる
+        transform(metered.sites)
     }
 }
