@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
 import org.jetbrains.annotations.ApiStatus
+import org.objectweb.asm.MethodTooLargeException
 import pro.ikili.kibicomputers.core.runtime.MemoryChunkCounts
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmAsync
@@ -31,6 +32,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import run.endive.compiler.InterpreterFallback
 import run.endive.compiler.MachineFactoryCompiler
+import run.endive.compiler.MethodPrefixer
 import run.endive.runtime.ByteBufferMemory
 import run.endive.runtime.CompiledModule
 import run.endive.runtime.ExportFunction
@@ -74,7 +76,7 @@ import run.endive.wasm.WasmModule as EndiveModule
  * [load] でパース・検証の後に、ランタイムコンパイラで JVM のバイトコードにコンパイルする（#29 の決定 B、#37）。
  * JVM のメソッドの上限を超える関数だけは、Endive がその関数をインタプリタで動かす（[InterpreterFallback.WARN]。ログに出る）。
  * Endive のコンパイラは SIMD（v128）に対応していないので、SIMD を使う関数（[simdFunctions]）もその関数だけインタプリタで動かし、
- * ほかの関数はコンパイルする（#424）。
+ * ほかの関数はコンパイルする（#424）。そのときも、上限を超える関数は失敗の例外から読み取って、その関数だけインタプリタに回す（#446）。
  * コンパイルの後は、関数の本体を除いたモジュール（[CompiledModule.wasmModule]）だけを持ち、パースした命令の列は捨てる
  * （挿入後の lua.wasm で、ヒープが約 18 MB → 約 0.08 MB）。同じ WASM の読み込みの共有は、呼び出し側（カーネルの `ProgramCache`）が受け持つ。
  *
@@ -145,23 +147,25 @@ public class EndiveRuntime internal constructor(
         }
     }
 
-    /** コンパイルの結果。[interpreted] は、インタプリタで動かす関数の番号（import を含めた番号） */
+    /** コンパイルの結果。[interpreted] は、インタプリタで動かすと決めて渡した関数の番号（import を含めた番号） */
     private class Compilation(val module: CompiledModule, val interpreted: Set<Int>)
 
     /**
      * [module] をコンパイルする。できなければ `null`（ログに出す）。
      *
-     * Endive のコンパイラは、JVM のメソッドの上限を超える関数をインタプリタに回す（[InterpreterFallback.WARN]）が、
-     * 上限の近くで ASM が上限超えを見分けられずに別の例外で落ちることがある（待機点への変換の後に燃料の計測コードを
-     * 挿入した lua.wasm の `luaV_execute`。#37 で見つけた。`exec` は逆の順にして上限に収めている。#341）。そのときは、命令の数が多い関数から順にインタプリタに回して
-     * [MAX_COMPILE_RETRIES] 回までやり直す。それでもだめ（コンパイラが対応しない作り）なら `null`。
-     *
      * SIMD を使う関数は、初めからインタプリタに回す（[simdFunctions]。#424）。関数の型（引数・戻り値）に v128 があると、
      * 関数の呼び出しの橋渡しをコンパイルできないので、モジュール全体をインタプリタで動かす。
+     *
+     * インタプリタに回す関数がなければ、JVM のメソッドの上限を超える関数は、Endive がその関数だけインタプリタに回す
+     * （[InterpreterFallback.WARN]）。回す関数を決めて渡すと、Endive の制約でこの自動の切り替えを使えない（[InterpreterFallback.FAIL]）ので、
+     * 失敗の例外から大きすぎる関数を読み取って足し、やり直す（[compileWithFallback]。#446）。
      *
      * ただし、例外処理（タグ）を使うモジュールでは、関数ごとにインタプリタとコンパイルしたコードを混ぜない
      * （混ぜると、Lua のコルーチンの戻り値が欠けるなど、結果が変わった。#341）。1つでもコンパイルできない関数があれば、
      * モジュール全体をインタプリタで動かす。SIMD を使う関数があるときも同じ。
+     *
+     * 1回目に [InterpreterFallback.WARN] で Endive が自動で回した関数は、[Compilation.interpreted] に入らない
+     * （Endive がコンパイルの結果に出さない）。
      */
     private fun compileOrNull(module: EndiveModule): Compilation? {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
@@ -174,36 +178,20 @@ public class EndiveRuntime internal constructor(
             LOG.log(System.Logger.Level.WARNING, "例外処理を使う WASM の関数 $simd が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす")
             return null
         }
-        val interpreted = LinkedHashSet(simd)
-        var candidates: List<Int>? = null
-        var attempt = 0
-        while (true) {
-            val failure = try {
-                val builder = MachineFactoryCompiler.builder(module)
-                when {
-                    !mixable -> builder.withInterpreterFallback(InterpreterFallback.FAIL)
-                    interpreted.isEmpty() -> builder.withInterpreterFallback(InterpreterFallback.WARN)
-                    // 決めた関数をインタプリタに回すときは、ほかの関数の自動の切り替えは使えない（Endive の制約）
-                    else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
-                }
-                val compiled = builder.compileModule()
-                if (interpreted.isNotEmpty()) LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない）")
-                return Compilation(compiled, interpreted.toSet())
-            } catch (e: RuntimeException) {
-                e
-            } catch (e: StackOverflowError) {
-                e
-            } catch (e: LinkageError) {
-                // 生成したクラスを JVM が受け付けない（VerifyError など）
-                e
+        val imported = module.importSection().count(ExternalType.FUNCTION)
+        val defined = imported until imported + module.codeSection().functionBodies().size
+        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }) { interpreted ->
+            // メソッドの名前から関数の番号を読むので、名前の付け方を固定する（既定。func_<番号>）
+            val builder = MachineFactoryCompiler.builder(module).withMethodPrefixer(MethodPrefixer.defaultPrefixer())
+            when {
+                !mixable -> builder.withInterpreterFallback(InterpreterFallback.FAIL)
+                interpreted.isEmpty() -> builder.withInterpreterFallback(InterpreterFallback.WARN)
+                // 決めた関数をインタプリタに回すときは、ほかの関数の自動の切り替えは使えない（Endive の制約）
+                else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
             }
-            val next = if (mixable) (candidates ?: largeFunctions(module).also { candidates = it }).firstOrNull { it !in interpreted } else null
-            if (attempt++ >= MAX_COMPILE_RETRIES || next == null) {
-                LOG.log(System.Logger.Level.WARNING, "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす: $failure")
-                return null
-            }
-            interpreted += next
-        }
+            builder.compileModule()
+        } ?: return null
+        return Compilation(result.value, result.interpreted)
     }
 
     public companion object {
@@ -212,8 +200,117 @@ public class EndiveRuntime internal constructor(
 
         private val LOG: System.Logger = System.getLogger("kibicomputers.wasm")
 
-        /** コンパイルに失敗したとき、関数をインタプリタに回してやり直す回数 */
-        private const val MAX_COMPILE_RETRIES: Int = 3
+        /**
+         * コンパイルに失敗し、失敗の例外から大きすぎる関数を特定できないとき、命令の数が多い関数をインタプリタに回してやり直す回数
+         */
+        internal const val MAX_COMPILE_RETRIES: Int = 3
+
+        /**
+         * 失敗の例外から特定した大きすぎる関数をインタプリタに回して、やり直す回数の上限（#446）。
+         * 1回の失敗で1つしか分からないので、大きすぎる関数が k 個なら、モジュール全体を k+1 回コンパイルする。
+         * コンパイルは割り込めず、全台で共有するコンパイル用のスレッドを使う（ADR 0750）ので、悪い入力でも回数を抑える。仮の値（#251）
+         */
+        internal const val MAX_IDENTIFIED_RETRIES: Int = 32
+
+        /**
+         * 特定した関数でやり直すときの、コンパイルに使う時間（ナノ秒）の上限（#446）。それまでの合計に、1回にかかった最大の時間を
+         * 足して超えるなら、やり直さずにモジュール全体をインタプリタで動かす。読み込みの上限（CPU 時間で 8 秒。`LoadDeadline`）で
+         * 断られないよう、その半分にする。仮の値（#251）
+         */
+        internal const val COMPILE_RETRY_BUDGET_NANOS: Long = 4_000_000_000L
+
+        /**
+         * [compile] でコンパイルし、失敗したら関数をインタプリタに回してやり直す。結果か、諦めたら `null`（ログに出す）。
+         *
+         * [compile] には、インタプリタで動かす関数の番号を渡す（初めは [simd]）。失敗したら:
+         * - [mixable] でなければ、やり直さない（例外処理を使うモジュール。#341）。
+         * - 失敗の例外から大きすぎる関数（[tooLargeFunction]）を特定でき、まだ回していなければ、それを足す。
+         *   [MAX_IDENTIFIED_RETRIES] 回と [COMPILE_RETRY_BUDGET_NANOS] が上限。
+         * - 特定できなければ（上限の近くで ASM が上限超えを見分けられずに別の例外で落ちることがある。待機点への変換の後に
+         *   燃料の計測コードを挿入した lua.wasm の `luaV_execute`。#37）、[largeFunctions] の大きい順に、まだ回していないものを足す。
+         *   [MAX_COMPILE_RETRIES] 回が上限（#446 の前と同じ）。
+         *
+         * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（テストで差し替える）。
+         */
+        internal fun <T : Any> compileWithFallback(
+            simd: Set<Int>,
+            mixable: Boolean,
+            defined: IntRange,
+            largeFunctions: () -> List<Int>,
+            clock: () -> Long = System::nanoTime,
+            compile: (Set<Int>) -> T,
+        ): Fallback<T>? {
+            val interpreted = LinkedHashSet(simd)
+            var candidates: List<Int>? = null
+            var identified = 0
+            var unidentified = 0
+            var spent = 0L
+            var longest = 0L
+            while (true) {
+                val start = clock()
+                val failure = try {
+                    val value = compile(interpreted.toSet())
+                    if (interpreted.isNotEmpty()) {
+                        val retries = if (identified + unidentified > 0) "。やり直し: 特定した関数で $identified 回、特定できずに $unidentified 回" else ""
+                        LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない$retries）")
+                    }
+                    return Fallback(value, interpreted.toSet())
+                } catch (e: RuntimeException) {
+                    e
+                } catch (e: StackOverflowError) {
+                    e
+                } catch (e: LinkageError) {
+                    // 生成したクラスを JVM が受け付けない（VerifyError など）
+                    e
+                }
+                val took = clock() - start
+                spent += took
+                longest = maxOf(longest, took)
+                if (!mixable) return giveUp(failure, "")
+                val id = tooLargeFunction(failure, defined)?.takeIf { it !in interpreted }
+                if (id != null) {
+                    if (identified >= MAX_IDENTIFIED_RETRIES) return giveUp(failure, "（大きすぎる関数が多すぎる）")
+                    if (spent + longest > COMPILE_RETRY_BUDGET_NANOS) return giveUp(failure, "（やり直すと時間がかかりすぎる）")
+                    identified++
+                    interpreted += id
+                } else {
+                    val next = (candidates ?: largeFunctions().also { candidates = it }).firstOrNull { it !in interpreted }
+                    if (unidentified >= MAX_COMPILE_RETRIES || next == null) return giveUp(failure, "")
+                    unidentified++
+                    interpreted += next
+                }
+            }
+        }
+
+        private fun giveUp(failure: Throwable, reason: String): Nothing? {
+            LOG.log(System.Logger.Level.WARNING, "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす$reason: $failure")
+            return null
+        }
+
+        /** [compileWithFallback] の結果。[interpreted] は、インタプリタで動かすと決めて渡した関数の番号 */
+        internal class Fallback<T : Any>(val value: T, val interpreted: Set<Int>)
+
+        /** Endive が関数の本体をコンパイルしたメソッドの名前（既定の [MethodPrefixer]。`func_<番号>`） */
+        private val FUNCTION_METHOD = Regex("^" + Regex.escape(MethodPrefixer.DEFAULT_PREFIX) + "_(\\d+)$")
+
+        /**
+         * [failure] が、JVM のメソッドの上限を超えた関数によるものなら、その関数の番号（import を含めた番号。[defined] の中のもの）。
+         * 原因の連鎖に ASM の [MethodTooLargeException] があり、そのメソッドが関数の本体（`func_<番号>`）のときだけ読む
+         * （`call_<番号>` などの橋渡しや `call_indirect_<型の番号>` は関数の本体ではない）。例外のメッセージは読まない。
+         */
+        internal fun tooLargeFunction(failure: Throwable, defined: IntRange): Int? {
+            var e: Throwable? = failure
+            var depth = 0
+            while (e != null && depth++ < 16) {
+                if (e is MethodTooLargeException) {
+                    val name = e.methodName ?: return null
+                    val id = FUNCTION_METHOD.matchEntire(name)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+                    return id.takeIf { it in defined }
+                }
+                e = e.cause?.takeIf { it !== e }
+            }
+            return null
+        }
 
         /** やり直しでインタプリタに回す候補にする、関数の命令の数の下限（これより小さい関数は JVM のメソッドの上限に届かない） */
         private const val LARGE_FUNCTION_INSTRUCTIONS: Int = 4096
