@@ -17,6 +17,8 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineScheduler
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.log.CoreLogRouting
+import pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck
 import pro.ikili.kibicomputers.forge.CoreLogBridge
 import java.util.Collections
 import java.util.UUID
@@ -66,6 +68,96 @@ object CoreLogGameTests {
                 "the core DEBUG should reach log4j as DEBUG (debug.log): $events",
             )
         }
+        helper.succeed()
+    }
+
+    /**
+     * Endive の `System.Logger`（名前 `endive`）の WARNING も、log4j の root まで1回だけ WARN で届く（#680）。
+     * JUL 側の `endive` のレベルは log4j の設定を写すので、TRACE の判定も log4j と一致する（Endive の `WasiPreview1` の
+     * TRACE の行の書式を、出さないのに作らない）。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun endiveSystemLoggerReachesLog4j(helper: GameTestHelper) {
+        val name = CoreLogRouting.ENDIVE_ROOT
+        val mark = UUID.randomUUID().toString()
+        val events = Collections.synchronizedList(ArrayList<Pair<Log4jLevel, String>>())
+        @Suppress("DEPRECATION")
+        val appender = object : AbstractAppender("kibicomputers-logtest-${UUID.randomUUID()}", null, null, true) {
+            override fun append(event: LogEvent) {
+                val message = event.message.formattedMessage
+                if (event.loggerName == name && message.endsWith(mark)) events += event.level to message
+            }
+        }
+        appender.start()
+        val rootConfig = LoggerContext.getContext(false).configuration.rootLogger
+        rootConfig.addAppender(appender, null, null)
+        val log = System.getLogger(name)
+        try {
+            log.log(System.Logger.Level.WARNING, "CoreLogGameTests endive test line (not a bug) $mark")
+        } finally {
+            rootConfig.removeAppender(appender.name)
+            appender.stop()
+        }
+        helper.assertTrue(events.count { it.first == Log4jLevel.WARN } == 1, "the endive WARNING should reach log4j once as WARN: $events")
+        helper.assertTrue(
+            log.isLoggable(System.Logger.Level.TRACE) == LogManager.getLogger(name).isTraceEnabled,
+            "the endive TRACE level in JUL should follow log4j",
+        )
+        helper.succeed()
+    }
+
+    /**
+     * JVM のメソッドの上限を超える関数をインタプリタに回しても、Endive が標準エラーに直に書かない（#680）。
+     * GameTest のサーバーでは `System.err` はプロセスの標準エラーのまま（`latest.log` に出ず、`InterpreterFallback.WARN` の行は
+     * Gradle の出力にだけ出た）。MC が `System.err` を log4j に流す環境（`[STDERR]` の INFO の行）もあるので、両方を見る:
+     * 読み込みの間だけ `System.err` を、元にも書く写し（tee）に差し替え、root に付けたアペンダーでも Endive の文言を探す。
+     * `System.err` はプロセス全体の状態なので、元にも書き（ほかのスレッドの行を落とさない）、必ず戻す。
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun tooLargeFunctionDoesNotWriteToStderr(helper: GameTestHelper) {
+        val lines = Collections.synchronizedList(ArrayList<String>())
+        @Suppress("DEPRECATION")
+        val appender = object : AbstractAppender("kibicomputers-logtest-${UUID.randomUUID()}", null, null, true) {
+            override fun append(event: LogEvent) {
+                val message = event.message.formattedMessage
+                if (message.contains("using interpreted mode")) lines += "${event.loggerName}: $message"
+            }
+        }
+        appender.start()
+        val rootConfig = LoggerContext.getContext(false).configuration.rootLogger
+        rootConfig.addAppender(appender, null, null)
+        val captured = java.io.ByteArrayOutputStream()
+        val original = System.err
+        val tee = java.io.PrintStream(
+            object : java.io.OutputStream() {
+                override fun write(b: Int) {
+                    synchronized(captured) { captured.write(b) }
+                    original.write(b)
+                }
+
+                override fun write(b: ByteArray, off: Int, len: Int) {
+                    synchronized(captured) { captured.write(b, off, len) }
+                    original.write(b, off, len)
+                }
+
+                override fun flush() = original.flush()
+            },
+            true,
+        )
+        val compiled = try {
+            System.setErr(tee)
+            RuntimeSelfCheck.compilesTooLargeFunction()
+        } finally {
+            System.setErr(original)
+            rootConfig.removeAppender(appender.name)
+            appender.stop()
+        }
+        val stderr = synchronized(captured) { captured.toString(Charsets.UTF_8) }
+        helper.assertTrue(compiled, "only the too-large function should run in the interpreter")
+        helper.assertTrue(!stderr.contains("using interpreted mode"), "Endive should not print the interpreter fallback to stderr: $stderr")
+        helper.assertTrue(lines.isEmpty(), "Endive should not print the interpreter fallback to stderr (log4j): $lines")
         helper.succeed()
     }
 

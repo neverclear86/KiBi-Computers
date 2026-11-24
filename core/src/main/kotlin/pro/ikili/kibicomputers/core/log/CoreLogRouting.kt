@@ -97,6 +97,13 @@ public object CoreLogRouting {
     /** core のロガー名の根 */
     public const val ROOT: String = "kibicomputers"
 
+    /**
+     * Endive の `System.Logger` の名前の根（`run.endive.log.SystemLogger`。#680）。Endive 1.2.0 では `wasi` の
+     * `WasiPreview1` だけが使い（ほぼ TRACE）、MOD はそれに黙らせるロガーを渡しているので、今は出す元がない。
+     * Endive を上げて使う箇所が増えたときの保険に、接続層が [ROOT] と同じように取り付ける
+     */
+    public const val ENDIVE_ROOT: String = "endive"
+
     private val installed = ConcurrentHashMap<String, Installation>()
 
     /**

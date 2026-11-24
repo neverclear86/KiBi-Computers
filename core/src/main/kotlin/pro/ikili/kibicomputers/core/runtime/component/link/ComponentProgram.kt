@@ -168,7 +168,9 @@ internal class ComponentProgram private constructor(
             val modules = ArrayList<WasmModule>(finalBytes.size)
             var moduleBytes = 0L
             for ((i, b) in finalBytes.withIndex()) {
-                val module = runtime.load(b)
+                // 時間の上限の残りを、まだ読み込んでいないモジュールで等分して渡す（前のモジュールのコンパイルのやり直しが、
+                // 後のモジュールの分まで使わないように。#446）
+                val module = runtime.load(b, deadline.remainingNanos / (finalBytes.size - i))
                 deadline.check("core モジュールのパース・検証・コンパイル")
                 // 計画は変換の前の形で作った。ランタイムは変換・挿入が足したものを見せないので、同じ形になる
                 check(module.imports == shapes[i].imports && module.exports == shapes[i].exports) { "読み込んだ core モジュール $i の形が計画と違う" }

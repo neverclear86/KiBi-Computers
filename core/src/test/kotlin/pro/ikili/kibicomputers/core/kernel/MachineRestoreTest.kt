@@ -208,6 +208,9 @@ class MachineRestoreTest {
 
     /** 作り直し（instantiateForRestore）だけ [WasmLinkException] で断るランタイム（RAM の不足でない失敗） */
     private class LinkFailingRestoreRuntime(private val inner: WasmRuntime) : WasmRuntime by inner {
+        // 残りを渡す読み込みも、下の load を通す（`by inner` のままだと inner に直接行く）
+        override fun load(bytes: ByteArray, timeLeftNanos: Long): WasmModule = load(bytes)
+
         override fun load(bytes: ByteArray): WasmModule {
             val module = inner.load(bytes)
             return object : WasmModule by module {
@@ -223,6 +226,9 @@ class MachineRestoreTest {
      * （[ProcessMemory.refusedReservation] が立つので、冷えた起動の原因が NO_MEMORY になる）
      */
     private class TableRefusingRestoreRuntime(private val inner: WasmRuntime) : WasmRuntime by inner {
+        // 残りを渡す読み込みも、下の load を通す（`by inner` のままだと inner に直接行く）
+        override fun load(bytes: ByteArray, timeLeftNanos: Long): WasmModule = load(bytes)
+
         @Volatile
         var refused = false
 

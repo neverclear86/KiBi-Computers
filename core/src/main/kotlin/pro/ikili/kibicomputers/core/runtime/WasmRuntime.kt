@@ -25,6 +25,15 @@ public interface WasmRuntime {
     public fun load(bytes: ByteArray): WasmModule
 
     /**
+     * [load] と同じだが、呼んだ側の読み込みの時間の上限の残り [timeLeftNanos]（ナノ秒。このスレッドの CPU 時間。
+     * 測れない JVM では経過時間）を渡す（#446）。実装は、省いてもよい時間のかかる処理（コンパイルのやり直しなど）を、
+     * この残りに収まるように抑える。残りを超えたかどうかは呼んだ側が確かめる。既定は残りを見ずに [load] する
+     * （別のランタイムに `by` で任せて [load] だけを差し替えるときは、こちらも差し替える。でないと任せた先に直接行く）
+     */
+    @Throws(WasmLoadException::class)
+    public fun load(bytes: ByteArray, timeLeftNanos: Long): WasmModule = load(bytes)
+
+    /**
      * WASM のバイト列の import と export だけを読む（#757。コンパイルしない）。[load] したときの [WasmModule.imports]・
      * [WasmModule.exports] と同じものを返す（燃料・待機点のためにランタイムがつなぐものは除く）。
      * コンポーネントのリンクの計画を、待機点への変換の前に作るのに使う。既定は [load] する
