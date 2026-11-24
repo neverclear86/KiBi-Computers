@@ -1384,4 +1384,52 @@ class MachineRestoreBranchesTest {
             m.close()
         }
     }
+
+    // ---- 取り込みでワーカーへ渡せないとき（#875） ----
+
+    @Test
+    fun `作ったばかりのプロセスを取り込むときにワーカーへ渡せなくても、戻せて、tickだけで進む`() = timeout(limit) {
+        val store = newStore()
+        val executor = FailingExecutor(java.util.concurrent.Executors.newCachedThreadPool { r -> KernelThreadsProbe.thread(r) })
+        val oneMachine = SchedulerConfig.builder().maxConcurrentMachines(1).maxBlockingProcesses(64).build()
+        Harness(schedulerConfig = oneMachine, execRuntime = EndiveRuntime(), moduleStore = MemoryModuleStore(), executor = executor).use { h ->
+            openFreshRoot(h)
+            val permits = h.scheduler.permits
+            val total = permits.availablePermits()
+            // 許可をふさいで、init の最初の step を CREATED のまま許可待ちにして写しを取る
+            permits.acquire()
+            val m = h.machine(fuelPerTick = 10_000_000)
+            val s = start(m, TestMemoryFileSystem(), "prompt-wasi.wasm", "/bin/prompt", listOf("prompt"))
+            eventually(10_000, "CREATED のまま許可を待たない") { m.stateOf(s.pid) == ProcessState.CREATED && permits.waiting == 1 }
+            val identity = store.write(store.assignNewId(owner)!!, owner, capture(m)).identity
+            assertEquals(ProcessState.CREATED, kernelOf(stored(store, identity)).processes.all().single { it.pid == s.pid }.state)
+            m.close()
+            permits.release()
+            eventually(10_000, "許可が戻らない") { permits.availablePermits() == total && permits.waiting == 0 }
+
+            // 取り込みで、CREATED のプロセスの最初の step を渡す（installRestoredLocked の CREATED -> cpu.enqueueThreadless）。そこで失敗させる
+            val failures0 = permits.handOffFailures.get()
+            executor.failuresLeft.set(1)
+            val finished = Finished()
+            val m2 = h.machine(fuelPerTick = 10_000_000)
+            assertTrue(m2.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
+            eventually(60_000, "知らせが来ない") {
+                h.scheduler.tick()
+                finished.outcomes.isNotEmpty()
+            }
+            finished.assertNoErrors()
+            // 投げずに取り込みが終わり、CRASHED にならない
+            assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
+            assertEquals(MachineState.RUNNING, m2.state)
+            assertEquals(failures0 + 1, permits.handOffFailures.get(), "取り込みの受け渡しで1回だけ失敗する")
+            assertEquals(0, executor.failuresLeft.get())
+            // tick だけで進む: 最初の step が動き、入力を待つ
+            eventually(60_000, "取り残した step が動かない") {
+                h.scheduler.tick()
+                m2.stateOf(s.pid) == ProcessState.WAITING_EVENT && m2.isAtWaitPoint
+            }
+            eventually(10_000, "取り残しが残る") { h.scheduler.tick(); permits.strandedTasks == 0 && permits.availablePermits() == total }
+            m2.close()
+        }
+    }
 }

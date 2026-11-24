@@ -24,7 +24,13 @@ class MachineCpuTest {
     private class Fixture(h: Harness) {
         val granted = ArrayList<ProcessRuntime>()
         val revoked = ArrayList<ProcessRuntime>()
-        val cpu = MachineCpu({ granted += it }, { revoked += it })
+
+        /** [granted] と同じ順の、strict の印（#875） */
+        val strict = ArrayList<Boolean>()
+        val cpu = MachineCpu({ rt, s ->
+            granted += rt
+            strict += s
+        }, { revoked += it })
         val machine = h.machine(fuelPerTick = 1000)
         val a = machine.spawnRt(h.program(spinForever()), runDriver())
         val b = machine.spawnRt(h.program(spinForever()), runDriver())
@@ -222,6 +228,36 @@ class MachineCpuTest {
             f.cpu.acquire(f.c)
             f.cpu.release(f.c)
             assertNull(f.cpu.currentOwner)
+            f.machine.stop()
+        }
+    }
+
+    @Test
+    fun `strictはspawnのenqueueThreadlessで空いていたときだけで、並んだ後の受け渡しはいつも投げない版になる`() = timeout(limit) {
+        Harness().use { h ->
+            val f = Fixture(h)
+            // 空いていて strict で並ぶ（spawn の直接の道）
+            f.cpu.enqueueThreadless(f.a, strict = true)
+            // strict で並んでも、埋まっていれば後で渡すとき（release）は strict でない
+            f.cpu.enqueueThreadless(f.b, strict = true)
+            f.cpu.release(f.a)
+            assertSame(f.b, f.cpu.currentOwner)
+            // 止めたとき（removeThreadless）の受け渡しも strict でない
+            f.cpu.enqueueThreadless(f.c)
+            f.cpu.removeThreadless(f.b)
+            assertSame(f.c, f.cpu.currentOwner)
+            f.cpu.release(f.c)
+            // 既定（起こすとき・復元の取り込み）は strict でない
+            f.cpu.enqueueThreadless(f.a)
+            f.cpu.release(f.a)
+            // 予約を取り消したときの受け渡しも strict でない
+            f.cpu.reserve(f.a)
+            f.cpu.enqueueThreadless(f.b, strict = true)
+            f.cpu.cancelReservation(f.a)
+            f.cpu.release(f.b)
+            assertNull(f.cpu.currentOwner)
+            assertEquals(listOf(f.a, f.b, f.c, f.a, f.b), f.granted)
+            assertEquals(listOf(true, false, false, false, false), f.strict)
             f.machine.stop()
         }
     }
