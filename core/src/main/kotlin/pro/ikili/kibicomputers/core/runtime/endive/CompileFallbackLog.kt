@@ -24,8 +24,14 @@ internal class CompileFallbackLog(private val log: System.Logger) {
         /** 例外処理を使うモジュールの関数が SIMD を使っていて、モジュール全体をインタプリタで動かす */
         SIMD_WITH_EXCEPTIONS,
 
-        /** 一部の関数（SIMD を使う関数・JVM のメソッドの上限を超える関数）だけをインタプリタで動かす */
-        SOME_FUNCTIONS,
+        /** SIMD を使う関数だけをインタプリタで動かす（#424。SIMD を使うモジュールなら毎回起きる普通の経路） */
+        SIMD_FUNCTIONS,
+
+        /**
+         * JVM のメソッドの上限を超える関数（とそこから末尾呼び出しで届く関数、SIMD を使う関数）をインタプリタで動かす（#446・#680）。
+         * 性能の苦情を調べる手がかりなので、[SIMD_FUNCTIONS] とは分けて数える（SIMD のモジュールが先に読まれても、この最初の1回は WARNING になる）
+         */
+        TOO_LARGE_FUNCTIONS,
 
         /** コンパイルに失敗して、モジュール全体をインタプリタで動かす */
         WHOLE_MODULE,

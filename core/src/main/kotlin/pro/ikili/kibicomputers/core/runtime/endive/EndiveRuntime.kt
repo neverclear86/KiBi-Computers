@@ -117,7 +117,7 @@ public class EndiveRuntime internal constructor(
         if (!compile) return interpreted
         val budget = retryBudget(timeLeftNanos, clock() - start)
         // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
-        val compiled = compileOrNull(interpreted.module, budget) ?: return interpreted
+        val compiled = compileOrNull(interpreted.module, budget, moduleLabel(bytes)) ?: return interpreted
         // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
         // コンパイル結果だけ
         return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
@@ -160,7 +160,11 @@ public class EndiveRuntime internal constructor(
         }
     }
 
-    /** コンパイルの結果。[interpreted] は、インタプリタで動かすと決めて渡した関数の番号（import を含めた番号） */
+    /**
+     * コンパイルの結果。[interpreted] は、インタプリタで動かす関数の番号（import を含めた番号）。自分で決めて渡した関数か、
+     * Endive が自動で回したとき（[InterpreterFallback.SILENT]）はコンパイル後のモジュールに本体が残った関数（[retainedFunctions]。
+     * 自動で回した関数と、そこから末尾呼び出しで届く関数なので、本当の集合より広いことがある）
+     */
     private class Compilation(val module: CompiledModule, val interpreted: Set<Int>)
 
     /**
@@ -180,25 +184,28 @@ public class EndiveRuntime internal constructor(
      *
      * 1回目に [InterpreterFallback.SILENT] で Endive が自動で回した関数は、Endive がコンパイルの結果の公開の口に出さないので、
      * コンパイル後のモジュールに本体が残った関数（[retainedFunctions]）から読む（#680）。
+     *
+     * [label] は、ログでモジュールを見分ける名前（[moduleLabel]。出すときだけ作る）。
      */
-    private fun compileOrNull(module: EndiveModule, budgetNanos: Long): Compilation? {
+    private fun compileOrNull(module: EndiveModule, budgetNanos: Long, label: () -> String): Compilation? {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
         val simd = simdFunctions(module)
+        val describe = { functions: Set<Int> -> describeFunctions(functions, functionNames(module)) }
         if (simd == null) {
             FALLBACK_LOG.report(CompileFallbackLog.Reason.V128_SIGNATURE) {
-                "WASM の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
+                "${label()} の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
             return null
         }
         if (simd.isNotEmpty() && !mixable) {
             FALLBACK_LOG.report(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS) {
-                "例外処理を使う WASM の関数 $simd が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす"
+                "例外処理を使う ${label()} の関数 ${describe(simd)} が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
             return null
         }
         val imported = module.importSection().count(ExternalType.FUNCTION)
         val defined = imported until imported + module.codeSection().functionBodies().size
-        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }, clock, budgetNanos) { interpreted ->
+        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }, clock, budgetNanos, label, describe) { interpreted ->
             // メソッドの名前から関数の番号を読むので、名前の付け方を固定する（既定。func_<番号>）
             val builder = MachineFactoryCompiler.builder(module).withMethodPrefixer(MethodPrefixer.defaultPrefixer())
             when {
@@ -214,8 +221,8 @@ public class EndiveRuntime internal constructor(
             // Endive が自動で回した関数（SILENT）。ここで自分の言葉で出す
             val auto = retainedFunctions(result.value.wasmModule())
             if (auto.isNotEmpty()) {
-                FALLBACK_LOG.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) {
-                    "WASM の関数 ${describeFunctions(auto)} をインタプリタで動かす（JVM のメソッドの上限を超える関数と、そこから末尾呼び出しで届く関数）"
+                FALLBACK_LOG.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) {
+                    "${label()} の関数 ${describe(auto)} をインタプリタで動かす（JVM のメソッドの上限を超える関数と、そこから末尾呼び出しで届く関数）"
                 }
             }
             return Compilation(result.value, auto)
@@ -245,16 +252,43 @@ public class EndiveRuntime internal constructor(
             return out
         }
 
-        /** ログの1行に並べる関数の番号の数の上限。プレイヤーが作るモジュールは関数を 100,000 まで持てるので、行の大きさを抑える（#680） */
+        /**
+         * ログの1行に並べる関数の番号の数の上限。プレイヤーが作るモジュールは関数を 100,000 まで持てるので、行の大きさを抑える（#680）。
+         * インタプリタに回したことのログ（[FALLBACK_LOG]）で関数を並べる箇所は、すべて [describeFunctions] を通す
+         */
         internal const val MAX_LOGGED_FUNCTIONS: Int = 16
 
-        /** ログに出す関数の番号の並び。[MAX_LOGGED_FUNCTIONS] を超えた分は個数だけにする */
-        internal fun describeFunctions(functions: Set<Int>): String =
-            if (functions.size <= MAX_LOGGED_FUNCTIONS) {
-                functions.toString()
-            } else {
-                functions.take(MAX_LOGGED_FUNCTIONS).joinToString(", ", "[", "") + ", … ほか ${functions.size - MAX_LOGGED_FUNCTIONS} 個]"
+        /** ログに添える関数の名前（name セクションのもの）の長さの上限。名前はプレイヤーが決めるので、1つの長さも抑える（#680） */
+        internal const val MAX_LOGGED_NAME_CHARS: Int = 48
+
+        /**
+         * ログに出す関数の番号の並び。[MAX_LOGGED_FUNCTIONS] を超えた分は個数だけにする。[nameOf] が名前を返す関数には、
+         * `番号(名前)` の形で名前を添える（[MAX_LOGGED_NAME_CHARS] で切り、制御文字は `?` にする）
+         */
+        internal fun describeFunctions(functions: Set<Int>, nameOf: (Int) -> String? = { null }): String {
+            fun one(id: Int): String {
+                val name = nameOf(id)?.takeIf { it.isNotEmpty() } ?: return id.toString()
+                val shown = name.take(MAX_LOGGED_NAME_CHARS).map { if (it.isISOControl()) '?' else it }.joinToString("")
+                return "$id($shown${if (name.length > MAX_LOGGED_NAME_CHARS) "…" else ""})"
             }
+            val head = functions.asSequence().take(MAX_LOGGED_FUNCTIONS).joinToString(", ", transform = ::one)
+            return if (functions.size <= MAX_LOGGED_FUNCTIONS) "[$head]" else "[$head, … ほか ${functions.size - MAX_LOGGED_FUNCTIONS} 個]"
+        }
+
+        /** [module] の name セクションから関数の名前を引く（import を含めた番号）。name セクションがなければ、いつも `null` */
+        internal fun functionNames(module: EndiveModule): (Int) -> String? {
+            val names = module.nameSection() ?: return { null }
+            return { id -> runCatching { names.nameOfFunction(id) }.getOrNull() }
+        }
+
+        /**
+         * ログに出すモジュールの名前。ランタイムに渡したバイト列（燃料の計測コードの挿入や待機点への変換の後）の SHA-256 の先頭 16 桁（#680）。
+         * `ProgramCache` のキー（変換の前のバイト列）とは別の値だが、同じプログラムなら同じになる。呼んだときに計算する
+         */
+        internal fun moduleLabel(bytes: ByteArray): () -> String = {
+            val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            "WASM（SHA-256 ${java.util.HexFormat.of().formatHex(digest, 0, 8)}…）"
+        }
 
         /**
          * コンパイルに失敗し、失敗の例外から大きすぎる関数を特定できないとき、命令の数が多い関数をインタプリタに回してやり直す回数
@@ -310,7 +344,10 @@ public class EndiveRuntime internal constructor(
          * （特定できない分の枠は、特定できた分で減らない）。
          *
          * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（このスレッドで呼ぶ。既定は [defaultCompileClock]。
-         * テストで差し替える）。
+         * テストで差し替える）。[label] と [describe] は、ログのモジュールの名前と関数の並び（[compileOrNull] が渡す）。
+         *
+         * ログの理由は、SIMD を使う関数だけを回したなら [CompileFallbackLog.Reason.SIMD_FUNCTIONS]、やり直しで関数を足したなら
+         * [CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS]（SIMD のモジュールが先に読まれても、大きすぎる関数の最初の1回は WARNING になる）。
          */
         internal fun <T : Any> compileWithFallback(
             simd: Set<Int>,
@@ -319,6 +356,8 @@ public class EndiveRuntime internal constructor(
             largeFunctions: () -> List<Int>,
             clock: () -> Long = defaultCompileClock(),
             budgetNanos: Long = COMPILE_RETRY_BUDGET_NANOS,
+            label: () -> String = { "WASM" },
+            describe: (Set<Int>) -> String = { describeFunctions(it) },
             compile: (Set<Int>) -> T,
         ): Fallback<T>? {
             val interpreted = LinkedHashSet(simd)
@@ -332,8 +371,16 @@ public class EndiveRuntime internal constructor(
                 val failure = try {
                     val value = compile(interpreted.toSet())
                     if (interpreted.isNotEmpty()) {
-                        val retries = if (identified + unidentified > 0) "。やり直し: 特定した関数で $identified 回、特定できずに $unidentified 回" else ""
-                        FALLBACK_LOG.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) { "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない$retries）" }
+                        if (identified + unidentified > 0) {
+                            FALLBACK_LOG.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) {
+                                "${label()} の関数 ${describe(interpreted)} をインタプリタで動かす（SIMD を使う関数と、コンパイルできない関数。" +
+                                    "やり直し: 特定した関数で $identified 回、特定できずに $unidentified 回）"
+                            }
+                        } else {
+                            FALLBACK_LOG.report(CompileFallbackLog.Reason.SIMD_FUNCTIONS) {
+                                "${label()} の関数 ${describe(interpreted)} をインタプリタで動かす（SIMD を使う関数）"
+                            }
+                        }
                     }
                     return Fallback(value, interpreted.toSet())
                 } catch (e: RuntimeException) {

@@ -47,16 +47,16 @@ class CompileFallbackLogTest {
     fun `理由ごとに最初の1回だけWARNINGで、2回目からはDEBUGに何回目かを添えて出す`() {
         val rec = Recorder(debug = true)
         val log = CompileFallbackLog(rec.logger)
-        log.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) { "関数 [3]" }
-        log.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) { "関数 [4]" }
+        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [3]" }
+        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [4]" }
         log.report(CompileFallbackLog.Reason.WHOLE_MODULE) { "全体" }
-        log.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) { "関数 [5]" }
+        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [5]" }
         val warn = rec.of(Level.WARNING)
         assertEquals(2, warn.size, "$warn")
         assertTrue(warn[0].startsWith("関数 [3]"), warn[0])
         assertTrue(warn[1].startsWith("全体"), warn[1])
         assertEquals(listOf("関数 [4]（同じ理由で 2 回目）", "関数 [5]（同じ理由で 3 回目）"), rec.of(Level.FINE))
-        assertEquals(3L, log.count(CompileFallbackLog.Reason.SOME_FUNCTIONS))
+        assertEquals(3L, log.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS))
         assertEquals(1L, log.count(CompileFallbackLog.Reason.WHOLE_MODULE))
         assertEquals(0L, log.count(CompileFallbackLog.Reason.V128_SIGNATURE))
     }

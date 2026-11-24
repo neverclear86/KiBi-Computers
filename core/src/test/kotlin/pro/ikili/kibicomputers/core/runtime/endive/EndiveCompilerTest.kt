@@ -356,6 +356,21 @@ class EndiveCompilerTest {
     }
 
     @Test
+    fun `SIMDの関数だけを回したときと、大きすぎる関数を足したときは、別の理由で数える`() {
+        // #680: 先に SIMD のモジュールが読まれても、大きすぎる関数の最初の1回が WARNING になるよう、理由を分ける
+        fun counts() = CompileFallbackLog.Reason.SIMD_FUNCTIONS.let(EndiveRuntime.FALLBACK_LOG::count) to
+            EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS)
+        val (simd0, large0) = counts()
+        assertEquals("ok", EndiveRuntime.compileWithFallback(setOf(1), true, 1..20, { emptyList() }) { "ok" }!!.value)
+        assertEquals(simd0 + 1 to large0, counts())
+        EndiveRuntime.compileWithFallback(setOf(1), true, 1..20, { emptyList() }) { set ->
+            if (11 !in set) throw tooLarge("func_11")
+            "ok"
+        }!!
+        assertEquals(simd0 + 1 to large0 + 1, counts())
+    }
+
+    @Test
     fun `関数の本体でないメソッドや範囲の外の番号は、特定できない失敗として扱う`() {
         val defined = 2..5
         assertEquals(3, EndiveRuntime.tooLargeFunction(tooLarge("func_3"), defined))
@@ -556,7 +571,7 @@ class EndiveCompilerTest {
             build()
         }
         val injected = FuelInjector.inject(original)
-        val before = EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.SOME_FUNCTIONS)
+        val before = EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS)
         // JUL の root の ConsoleHandler は、初めて使うときの System.err をつかむ。差し替えの前に作らせておかないと、このテストが JVM で最初の
         // 報告（WARNING）を出したとき、MOD 自身のログが差し替え先に書かれ、ConsoleHandler が捨てる先をつかんだままになる（単独実行で起きる）
         java.util.logging.Logger.getLogger("").handlers
@@ -573,7 +588,7 @@ class EndiveCompilerTest {
         assertTrue(isCompiled(module))
         assertEquals(tooLarge.toSet(), interpretedFunctions(module).map(injected::originalFunc).toSet())
         // 自分の言葉で1回報告した（WARNING か DEBUG かは、同じ JVM の前のテストしだい）
-        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.SOME_FUNCTIONS))
+        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS))
         val names = listOf("small", "big0", "big1")
         fun run(m: pro.ikili.kibicomputers.core.runtime.WasmModule): Pair<List<Long>, Long> {
             val config = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
@@ -607,6 +622,24 @@ class EndiveCompilerTest {
         val big = EndiveRuntime.describeFunctions((0 until 100_000).toSet())
         assertEquals((0 until n).joinToString(", ", "[", "") + ", … ほか ${100_000 - n} 個]", big)
         assertTrue(big.length < 200)
+    }
+
+    @Test
+    fun `ログに並べる関数には名前を添え、長い名前は切り、制御文字は置き換える`() {
+        val long = "x".repeat(1000)
+        val names = mapOf(0 to "main", 1 to "a\nb", 2 to long, 3 to "")
+        assertEquals("[0(main), 1(a?b), 4]", EndiveRuntime.describeFunctions(linkedSetOf(0, 1, 4), names::get))
+        assertEquals("[2(${"x".repeat(EndiveRuntime.MAX_LOGGED_NAME_CHARS)}…), 3]", EndiveRuntime.describeFunctions(linkedSetOf(2, 3), names::get))
+        // 関数が多く名前が長くても、1行は上限の数 × 名前の上限ほどに収まる
+        val many = EndiveRuntime.describeFunctions((0 until 100_000).toSet()) { long }
+        assertTrue(many.length < EndiveRuntime.MAX_LOGGED_FUNCTIONS * (EndiveRuntime.MAX_LOGGED_NAME_CHARS + 12) + 50, "${many.length}")
+    }
+
+    @Test
+    fun `ログのモジュールの名前は、中身のSHA-256の先頭16桁`() {
+        val label = EndiveRuntime.moduleLabel(byteArrayOf())()
+        // 空のバイト列の SHA-256 は e3b0c44298fc1c14...
+        assertEquals("WASM（SHA-256 e3b0c44298fc1c14…）", label)
     }
 
     @Test
