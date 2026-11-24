@@ -472,7 +472,7 @@ async function waitCi(pr, label) {
       `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。コードは変更しない。
 1. 先に \`gh pr view ${pr} --json mergeable,mergeStateStatus\` で main との衝突を確かめる。\`mergeable\` は計算が終わるまで UNKNOWN を返すので、UNKNOWN の間は 30 秒ほどおいて 5 回まで取り直す（前景の \`sleep\` は使えないので、\`gh pr checks ${pr} --watch --interval 30\` を 1 回はさむなどで間を空ける）。CONFLICTING なら、GitHub は衝突している PR の CI を動かさないので、待たずに passed=false・failingChecks=[]・mergeable=CONFLICTING・noChecks=true で返す。
 2. \`gh pr checks ${pr} --watch --interval 30\` で待つ（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。チェックが 1 つも出ないまま（「no checks reported」など）${NO_CHECKS_MINUTES} 分ほどたったら、待つのをやめ、もう一度 \`mergeable\` を取って、passed=false・failingChecks=[]・noChecks=true で返す。
-3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。
+3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。failureLog の先頭には、落ちた run の ID と試行の番号（\`gh run view <run-id> --json attempt\`）を書く（CI は、落ちた run に artifact \`test-reports-attempt-<試行の番号>\` としてテスト結果の XML と GameTest のログを残す）。
 mergeable には、最後に取った \`mergeable\` の値を入れる。`,
       { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
     )
@@ -539,6 +539,7 @@ async function untilGreen(info, impl, tag) {
       `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
 ${gradleRules(info.number, `ci-fix${i}`)}
 失敗したチェック: ${ci.failingChecks.join(', ')}
+再実行や修正に進む前に、落ちた run の artifact \`test-reports-attempt-<試行の番号>\`（テスト結果の XML と GameTest のログ。\`gh run download <run-id> -n <名前>\` で取る）を確かめる。不安定なテストが原因に見えるなら、落ちたテストの XML を PR に貼ってから直す（再実行で通るだけなら、この artifact を添えて新しい Issue で追う）。
 ログ抜粋:
 ${ci.failureLog}`,
       { label: `ci-fix:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
