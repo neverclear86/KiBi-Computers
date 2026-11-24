@@ -69,10 +69,6 @@ jobs:
         timeout-minutes: 30
         run: ./gradlew :platform-forge-1.20.1:runJarGameTestServer --console=plain
 
-      # 一時的: 失敗時の upload の段が artifact を作るかを確かめる（PR #926。次のコミットで戻す）
-      - name: TEMP force failure
-        run: exit 1
-
       # どこかの段が落ちたら、テスト結果の XML（テスト名・スタックトレース・system-out）と GameTest のサーバーのログを残す（#394）。
       # 不安定なテストは再実行で通ると記録が消えるので、再実行の前に調べられるようにする。
       # 名前に attempt を入れて、同じ run の再実行で名前がぶつからないようにする。
