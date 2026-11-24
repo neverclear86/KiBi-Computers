@@ -127,6 +127,20 @@ class AsyncifyMultiValueTest {
                     longArrayOf(++next)
                 }
             }
+            // 引数を取る止まりうる import。巻き直しで着いたとき（呼び出しのやり直し）に積まれた引数で結果を作る
+            .hostFunction("w", "take", WasmFunctionType.of(listOf(WasmValueType.I32), listOf(WasmValueType.I32))) { instance, args ->
+                if (instance.asyncState == WasmAsyncState.REWINDING) {
+                    assertTrue(stack.values.isEmpty(), "巻き直しで着いたのに、退避した値が残っている")
+                    instance.asyncState = WasmAsyncState.NORMAL
+                    longArrayOf(take(args[0], ++next))
+                } else if (suspendWait) {
+                    counts.waitUnwinds++
+                    instance.asyncState = WasmAsyncState.UNWINDING
+                    longArrayOf(0)
+                } else {
+                    longArrayOf(take(args[0], ++next))
+                }
+            }
             .asyncStack(stack)
         if (fuel != null) {
             builder.fuel(
@@ -164,6 +178,9 @@ class AsyncifyMultiValueTest {
         }
     }
 
+    /** `w.take` の結果（引数の取り違えが結果に出るように、引数と呼ばれた順の番号の両方から作る。i32 で切り詰める） */
+    private fun take(arg: Long, n: Long): Long = (arg.toInt() * 5 + n.toInt()).toLong()
+
     private class Counts {
         var waitUnwinds = 0
         var fuelUnwinds = 0
@@ -178,6 +195,9 @@ class AsyncifyMultiValueTest {
         var next = 0L
         val config = WasmInstanceConfig.builder()
             .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(++next) }
+            .hostFunction("w", "take", WasmFunctionType.of(listOf(WasmValueType.I32), listOf(WasmValueType.I32))) { _, args ->
+                longArrayOf(take(args[0], ++next))
+            }
             .build()
         return EndiveRuntime().load(module).instantiate(config).use { it.call(export) }
     }
@@ -236,12 +256,13 @@ class AsyncifyMultiValueTest {
      * 入力待ちだけ・燃料切れだけ・両方で巻き戻して巻き直しても、止めずに動かしたときと結果が同じ
      */
     private fun checkAllWays(module: ByteArray, exports: List<String>) {
-        val transformed = Asyncify.transform(module, setOf("w.wait")).bytes
+        val waits = setOf("w.wait", "w.take")
+        val transformed = Asyncify.transform(module, waits).bytes
         assertNull(WitTool.validate(transformed))
         val waitOnly = EndiveRuntime().load(transformed)
-        val metered = Asyncify.transform(FuelInjector.inject(module).bytes, setOf("w.wait"), "kibi.fuel")
+        val metered = Asyncify.transform(FuelInjector.inject(module).bytes, waits, "kibi.fuel")
         assertNull(WitTool.validate(metered.bytes))
-        val applied = Instrumentation.applyDetailed(module, setOf("w.wait"))
+        val applied = Instrumentation.applyDetailed(module, waits)
         assertTrue(applied.fuelYield, "燃料切れを待ち点にできなかった: ${applied.fuelYieldRejection}")
         val loaded = EndiveRuntime().load(applied.bytes)
         for (export in exports) {
@@ -401,8 +422,9 @@ class AsyncifyMultiValueTest {
      *   中の引数付きの loop（先頭への分岐あり）と、外の loop の引数から条件を作る引数付きの `if` を通って、block の中から外の loop の先頭へ分岐する
      * - `no_else`: else のない引数付きの `if`（引数と結果が同じ）。条件が偽の繰り返しでは、止まった呼び出しより前の `if` を通り抜けて巻き直す。
      *   同じ繰り返しの後ろにも待ち点がある
-     * - `loop_args`: 引数付きの loop の本体の最初が、その引数を受け取る止まりうる呼び出し。引数は繰り返しごとに変わる
-     *   （巻き直しで loop の直前に積み直す値は、外から最後に入ったときのもの。今の繰り返しの値は、退避した一時ローカルから戻る）
+     * - `loop_args`: 引数付きの loop の本体の最初が、その引数を受け取る止まりうる関数 `pair` の呼び出し。引数は繰り返しごとに変わる。
+     *   2回目以降の繰り返しで止まっても巻き直せることを見る。止まった呼び出しに渡す引数が古い値になる退行は、これでは見分けられない
+     *   （`pair` は巻き直しの入口で自分の引数ローカルも退避から戻すので、呼び出し側が積む値は結果に出ない）。それは [takeWat] で見る
      */
     private val nestedWat = """
         (module
@@ -488,6 +510,74 @@ class AsyncifyMultiValueTest {
               i32.lt_u
               br_if ${'$'}l)))
     """.trimIndent()
+
+    /**
+     * 引数付きの構造の引数を、引数を取る止まりうる import（`w.take`）が直接受け取るもの（#447）。
+     * 止まりうる import は、巻き直しで着いたとき、そのとき積まれた引数で呼び出しをやり直すので、止まった呼び出しに渡す引数が
+     * 古い値（構造の直前に積み直した、外から最後に入ったときの引数）になる退行（退避を省いて専用の引数ローカルを直接使う、など）が結果に出る。
+     * どれも 2回目以降の繰り返しで止まる:
+     * - `loop_take`: 引数付きの loop の本体の最初が `w.take` で、その引数は loop の引数
+     * - `block_take`: 引数 2 つの loop の本体の最初が引数 2 つの block で、その本体の最初が `w.take`（引数は block の引数の上の方）
+     * - `if_take`: loop の中の引数付きの `if` の両方の枝の最初が `w.take`（引数は `if` の引数。枝ごとに後の計算を変える）
+     *
+     * 燃料の計測コードを入れたものは、loop の先頭の燃料の確かめが最初の待ち点になり、引数はそこで一時ローカルへ移るので、
+     * 見分けられるのは入力待ちだけで止めるもの。
+     */
+    private val takeWat = """
+        (module
+          (import "w" "take" (func ${'$'}take (param i32) (result i32)))
+          (func (export "loop_take") (result i32)
+            (local ${'$'}i i32)
+            i32.const 1
+            (loop ${'$'}l (param i32) (result i32)
+              call ${'$'}take
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l))
+          (func (export "block_take") (result i32)
+            (local ${'$'}c i32) (local ${'$'}t i32)
+            i32.const 4
+            i32.const 2
+            (loop ${'$'}l (param i32 i32) (result i32)
+              (block (param i32 i32) (result i32 i32)
+                ;; [回数, acc] → [回数, take(acc)]
+                call ${'$'}take)
+              ;; [回数 - 1, v]。0 でなければ先頭へ
+              local.set ${'$'}t
+              i32.const 1
+              i32.sub
+              local.tee ${'$'}c
+              local.get ${'$'}t
+              local.get ${'$'}c
+              br_if ${'$'}l
+              i32.add))
+          (func (export "if_take") (result i32)
+            (local ${'$'}i i32)
+            i32.const 3
+            (loop ${'$'}l (param i32) (result i32)
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32)
+                (then call ${'$'}take i32.const 1 i32.add)
+                (else call ${'$'}take i32.const 2 i32.mul))
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)))
+    """.trimIndent()
+
+    @Test
+    fun `引数付きの構造の引数を止まりうるimportが直接受け取っても、巻き直しで今の繰り返しの値を渡す`() {
+        checkAllWays(WitTool.wat(takeWat), listOf("loop_take", "block_take", "if_take"))
+    }
 
     @Test
     fun `引数付きのifでelseの側が止まっても、巻き直して結果が同じ`() {
