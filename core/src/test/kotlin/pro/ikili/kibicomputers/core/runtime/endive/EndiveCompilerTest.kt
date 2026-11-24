@@ -246,7 +246,8 @@ class EndiveCompilerTest {
         }
         val parsed = Parser.parse(bytes)
         assertTrue(nops.all { parsed.codeSection().getFunctionBody(it).instructions().size > TOO_LARGE_GROUPS * 4 + 1 })
-        val module = EndiveRuntime().load(bytes)
+        // 時計は止めておく（負荷しだいで時間の上限に掛かって不安定にならないように。上限の動きは compileWithFallback のテストで確かめる）
+        val module = EndiveRuntime(true) { 0L }.load(bytes)
         assertTrue(isCompiled(module))
         assertEquals(setOf(0) + tooLarge, interpretedFunctions(module))
         val reference = EndiveRuntime(compile = false).load(bytes)
@@ -310,25 +311,138 @@ class EndiveCompilerTest {
     }
 
     @Test
-    fun `特定できた関数でのやり直しは、回数と時間に上限がある`() {
+    fun `特定できた関数でのやり直しは、回数に上限がある`() {
         var calls = 0
-        val many = EndiveRuntime.compileWithFallback(setOf(0), true, 0..10_000, { emptyList() }) { set ->
+        val many = EndiveRuntime.compileWithFallback(setOf(0), true, 0..10_000, { emptyList() }, clock = { 0L }) { set ->
             calls++
             throw tooLarge("func_${set.size}")
         }
         assertEquals(null, many)
         assertEquals(EndiveRuntime.MAX_IDENTIFIED_RETRIES + 1, calls)
+    }
 
-        // 1回に 1.5 秒かかるなら、2回目の後（3 秒 + 1.5 秒が上限の 4 秒を超える）でやめる
+    @Test
+    fun `やり直しが3回までなら、1回が遅くても時間で諦めない`() {
+        // #446 の前は、時間を見ずに 3 回までやり直していた。1回に 2 秒かかっても、4 回目のコンパイルで通る
         var now = 0L
-        calls = 0
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
+            calls += set
+            now += 2_000_000_000L
+            if (set.size < 4) throw tooLarge("func_${10 + set.size}")
+            "ok"
+        }!!
+        assertEquals(setOf(0, 11, 12, 13), result.interpreted)
+        assertEquals(4, calls.size)
+    }
+
+    @Test
+    fun `やり直しが3回を超えるときは、時間の上限を超えるならやめる`() {
+        // 1回に 1.5 秒: 3 回やり直した（4 回コンパイルした）後は、6 秒 + 1.5 秒が上限の 4 秒を超えるのでやめる
+        var now = 0L
+        var calls = 0
         val slow = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
             calls++
             now += 1_500_000_000L
             throw tooLarge("func_${set.size}")
         }
         assertEquals(null, slow)
-        assertEquals(2, calls)
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+
+        // 1回 0.5 秒なら、7 回目（3.5 秒 + 0.5 秒が 4 秒に収まる）までやり直せる。8 回目の後は 4 秒 + 0.5 秒で超える
+        now = 0L
+        calls = 0
+        val fast = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
+            calls++
+            now += 500_000_000L
+            throw tooLarge("func_${set.size}")
+        }
+        assertEquals(null, fast)
+        assertEquals(8, calls)
+    }
+
+    @Test
+    fun `特定できない失敗の時間も、時間の上限に数える`() {
+        // 特定できない失敗 3 回（4.5 秒）の後に特定できた失敗が出ても、時間の上限（4 秒）を超えているのでやり直さない
+        var now = 0L
+        var calls = 0
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7) }, clock = { now }) {
+            calls++
+            now += 1_500_000_000L
+            throw if (calls <= 3) IllegalStateException("特定できない") else tooLarge("func_50")
+        }
+        assertEquals(null, result)
+        assertEquals(4, calls)
+    }
+
+    @Test
+    fun `特定できた失敗と特定できない失敗は別々に数え、特定できない分の枠は特定できた分で減らない`() {
+        // 特定できた 2 回の後に、特定できない 3 回が使える（時計は進めない）
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7, 8) }, clock = { 0L }) { set ->
+            calls += set
+            when (calls.size) {
+                1 -> throw tooLarge("func_11")
+                2 -> throw tooLarge("func_12")
+                3, 4, 5 -> throw IllegalStateException("特定できない")
+                else -> "ok"
+            }
+        }!!
+        assertEquals(setOf(11, 12, 5, 6, 7), result.interpreted)
+        assertEquals(6, calls.size)
+
+        // 特定できない失敗が 4 回続けば、特定できた分があっても諦める
+        calls.clear()
+        val giveUp = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7, 8, 9) }, clock = { 0L }) { set ->
+            calls += set
+            if (calls.size == 1) throw tooLarge("func_11")
+            throw IllegalStateException("特定できない")
+        }
+        assertEquals(null, giveUp)
+        // 特定できた 1 回 + 特定できない 3 回のやり直し = 5 回のコンパイル
+        assertEquals(5, calls.size)
+    }
+
+    @Test
+    fun `特定できない失敗の後に特定できた失敗が出るモジュールは、両方の関数を足す`() {
+        // #37 の型の失敗で、命令の数の順に 1 つ足し、次に MethodTooLargeException で別の関数が特定できる（SIMD がなくても起きる経路）
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6) }) { set ->
+            calls += set
+            when {
+                calls.size == 1 -> throw IllegalStateException("特定できない")
+                11 !in set -> throw tooLarge("func_11")
+                else -> "ok"
+            }
+        }!!
+        assertEquals(setOf(5, 11), result.interpreted)
+        assertEquals(listOf(emptySet(), setOf(5), setOf(5, 11)), calls)
+    }
+
+    @Test
+    fun `命令の数の順の候補と特定した関数が重なったら、特定できない失敗として扱って次の候補を足す`() {
+        // 候補の 5 を足した後に、5 で落ちた（すでに回している）なら、特定できない失敗として次の 6 を足し、候補が尽きたら諦める
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6) }) { set ->
+            calls += set
+            if (calls.size == 1) throw IllegalStateException("特定できない")
+            throw tooLarge("func_5")
+        }
+        assertEquals(null, result)
+        assertEquals(listOf(emptySet(), setOf(5), setOf(5, 6)), calls)
+    }
+
+    @Test
+    fun `時計を測れる JVM では、既定の時計はこのスレッドのCPU時間で測る`() {
+        val clock = EndiveRuntime.defaultCompileClock()
+        val a = clock()
+        // 待っても CPU 時間は進まない（経過時間なら 200 ms 以上進む）
+        Thread.sleep(200)
+        val waited = clock() - a
+        val bean = java.lang.management.ManagementFactory.getThreadMXBean()
+        if (bean.isCurrentThreadCpuTimeSupported && bean.isThreadCpuTimeEnabled) {
+            assertTrue(waited < 100_000_000L, "待っただけで ${waited / 1_000_000} ms 進んだ")
+        }
     }
 
     @Test

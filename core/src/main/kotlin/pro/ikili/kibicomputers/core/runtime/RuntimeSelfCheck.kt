@@ -67,6 +67,18 @@ public object RuntimeSelfCheck {
     }
 
     /**
+     * コンパイルの失敗の例外から、JVM のメソッドの上限を超えた関数の番号を読む処理（#446）が、実行環境で動くなら `true`。
+     * この処理は ASM の `MethodTooLargeException` を直接参照するが、参照は SIMD を使う関数と大きすぎる関数があるモジュールの
+     * コンパイルが失敗したときにしか解決されず、ふつうの GameTest は通らない。ローダーの ASM から解決できることを、ここで確かめる
+     * （解決できないと `NoClassDefFoundError`。本番では特定できない失敗として扱われ、黙って別の経路になる）。
+     */
+    @JvmStatic
+    public fun readsTooLargeFunction(): Boolean {
+        val failure = RuntimeException(org.objectweb.asm.MethodTooLargeException("Machine", "func_7", "()I", 70_000))
+        return EndiveRuntime.readTooLargeFunction(failure, 0..9) == 7
+    }
+
+    /**
      * コンポーネントの検証器（wasm-tools を WASM にしたもの。#262）を、最小のコンポーネント（ヘッダーだけ）に当てて、
      * 読み込んで動かせたなら `true`。検証器の jar（`run.endive:wasi`・`wasm-tools`）が実行環境から見えるかを GameTest で確かめるために使う。
      * 重い（初回は 1 秒ほど）ので、起動時には呼ばない。

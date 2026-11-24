@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import run.endive.compiler.InterpreterFallback
 import run.endive.compiler.MachineFactoryCompiler
 import run.endive.compiler.MethodPrefixer
@@ -93,6 +94,8 @@ import run.endive.wasm.WasmModule as EndiveModule
 public class EndiveRuntime internal constructor(
     /** `false` ならコンパイルせずインタプリタで動かす（テストで、インタプリタとの結果を比べるため） */
     private val compile: Boolean,
+    /** コンパイルのやり直しの時間を測る時計（ナノ秒）。テストで差し替える。既定は、呼んだスレッドの CPU 時間（[defaultCompileClock]） */
+    private val clock: () -> Long = defaultCompileClock(),
 ) : WasmRuntime {
     /** ランタイムコンパイラで動かすランタイムを作る */
     public constructor() : this(true)
@@ -180,7 +183,7 @@ public class EndiveRuntime internal constructor(
         }
         val imported = module.importSection().count(ExternalType.FUNCTION)
         val defined = imported until imported + module.codeSection().functionBodies().size
-        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }) { interpreted ->
+        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }, clock) { interpreted ->
             // メソッドの名前から関数の番号を読むので、名前の付け方を固定する（既定。func_<番号>）
             val builder = MachineFactoryCompiler.builder(module).withMethodPrefixer(MethodPrefixer.defaultPrefixer())
             when {
@@ -202,6 +205,7 @@ public class EndiveRuntime internal constructor(
 
         /**
          * コンパイルに失敗し、失敗の例外から大きすぎる関数を特定できないとき、命令の数が多い関数をインタプリタに回してやり直す回数
+         * （#446 の前からの値）。特定できた分も含めたやり直しの合計のうち、この回数までは時間を見ずに許す（[compileWithFallback]）
          */
         internal const val MAX_COMPILE_RETRIES: Int = 3
 
@@ -213,31 +217,45 @@ public class EndiveRuntime internal constructor(
         internal const val MAX_IDENTIFIED_RETRIES: Int = 32
 
         /**
-         * 特定した関数でやり直すときの、コンパイルに使う時間（ナノ秒）の上限（#446）。それまでの合計に、1回にかかった最大の時間を
+         * [MAX_COMPILE_RETRIES] 回を超えるやり直しの前に見る、コンパイルに使う時間（ナノ秒）の上限（#446）。それまでの合計に、1回にかかった最大の時間を
          * 足して超えるなら、やり直さずにモジュール全体をインタプリタで動かす。読み込みの上限（CPU 時間で 8 秒。`LoadDeadline`）で
-         * 断られないよう、その半分にする。仮の値（#251）
+         * 断られないよう、その半分にする。[MAX_COMPILE_RETRIES] 回までのやり直しには掛けない（#446 の前にコンパイルできたモジュールを、
+         * 時間のせいで全体インタプリタに落とさないため。そこまでは、#446 の前と同じ最大 4 回のコンパイル）。仮の値（#251）
          */
         internal const val COMPILE_RETRY_BUDGET_NANOS: Long = 4_000_000_000L
+
+        /**
+         * やり直しの時間を測る既定の時計。呼んだスレッドの CPU 時間（測れない JVM では経過時間）。
+         * 混んだサーバーや GC の停止で待たされただけで、同じモジュールが全体インタプリタに落ちたり落ちなかったりしないよう
+         * （結果は `ProgramCache` で共有されて残る）、検証の時間の上限（`LoadDeadline`）と同じく CPU 時間で測る。
+         */
+        internal fun defaultCompileClock(): () -> Long = LoadDeadline.cpuClock() ?: System::nanoTime
 
         /**
          * [compile] でコンパイルし、失敗したら関数をインタプリタに回してやり直す。結果か、諦めたら `null`（ログに出す）。
          *
          * [compile] には、インタプリタで動かす関数の番号を渡す（初めは [simd]）。失敗したら:
          * - [mixable] でなければ、やり直さない（例外処理を使うモジュール。#341）。
-         * - 失敗の例外から大きすぎる関数（[tooLargeFunction]）を特定でき、まだ回していなければ、それを足す。
-         *   [MAX_IDENTIFIED_RETRIES] 回と [COMPILE_RETRY_BUDGET_NANOS] が上限。
+         * - 失敗の例外から大きすぎる関数（[tooLargeFunction]）を特定でき、まだ回していなければ、それを足す
+         *   （特定できた分。[MAX_IDENTIFIED_RETRIES] 回まで）。
          * - 特定できなければ（上限の近くで ASM が上限超えを見分けられずに別の例外で落ちることがある。待機点への変換の後に
-         *   燃料の計測コードを挿入した lua.wasm の `luaV_execute`。#37）、[largeFunctions] の大きい順に、まだ回していないものを足す。
-         *   [MAX_COMPILE_RETRIES] 回が上限（#446 の前と同じ）。
+         *   燃料の計測コードを挿入した lua.wasm の `luaV_execute`。#37）、[largeFunctions] の大きい順に、まだ回していないものを足す
+         *   （特定できない分。[MAX_COMPILE_RETRIES] 回まで。#446 の前と同じ）。
          *
-         * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（テストで差し替える）。
+         * 特定できた分と特定できない分を合わせたやり直しが [MAX_COMPILE_RETRIES] 回に達するまでは、時間を見ずにやり直す
+         * （#446 の前と同じ。コンパイルは最大 4 回）。それを超えるやり直しは、それまでのコンパイルの時間の合計（特定できない失敗の分も含む）に
+         * 1回の最大を足して [COMPILE_RETRY_BUDGET_NANOS] を超えないときだけ行う。特定できた分と特定できない分は別々に数える
+         * （特定できない分の枠は、特定できた分で減らない）。
+         *
+         * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（このスレッドで呼ぶ。既定は [defaultCompileClock]。
+         * テストで差し替える）。
          */
         internal fun <T : Any> compileWithFallback(
             simd: Set<Int>,
             mixable: Boolean,
             defined: IntRange,
             largeFunctions: () -> List<Int>,
-            clock: () -> Long = System::nanoTime,
+            clock: () -> Long = defaultCompileClock(),
             compile: (Set<Int>) -> T,
         ): Fallback<T>? {
             val interpreted = LinkedHashSet(simd)
@@ -267,15 +285,18 @@ public class EndiveRuntime internal constructor(
                 spent += took
                 longest = maxOf(longest, took)
                 if (!mixable) return giveUp(failure, "")
+                // #446 の前から許していた回数までは、時間を見ない
+                val tooSlow = identified + unidentified >= MAX_COMPILE_RETRIES && spent + longest > COMPILE_RETRY_BUDGET_NANOS
                 val id = tooLargeFunction(failure, defined)?.takeIf { it !in interpreted }
                 if (id != null) {
                     if (identified >= MAX_IDENTIFIED_RETRIES) return giveUp(failure, "（大きすぎる関数が多すぎる）")
-                    if (spent + longest > COMPILE_RETRY_BUDGET_NANOS) return giveUp(failure, "（やり直すと時間がかかりすぎる）")
+                    if (tooSlow) return giveUp(failure, "（やり直すと時間がかかりすぎる）")
                     identified++
                     interpreted += id
                 } else {
                     val next = (candidates ?: largeFunctions().also { candidates = it }).firstOrNull { it !in interpreted }
                     if (unidentified >= MAX_COMPILE_RETRIES || next == null) return giveUp(failure, "")
+                    if (tooSlow) return giveUp(failure, "（やり直すと時間がかかりすぎる）")
                     unidentified++
                     interpreted += next
                 }
@@ -297,8 +318,18 @@ public class EndiveRuntime internal constructor(
          * [failure] が、JVM のメソッドの上限を超えた関数によるものなら、その関数の番号（import を含めた番号。[defined] の中のもの）。
          * 原因の連鎖に ASM の [MethodTooLargeException] があり、そのメソッドが関数の本体（`func_<番号>`）のときだけ読む
          * （`call_<番号>` などの橋渡しや `call_indirect_<型の番号>` は関数の本体ではない）。例外のメッセージは読まない。
+         *
+         * core が ASM のクラスを直接参照するのはここだけで、参照は失敗の例外を調べるときに初めて解決される（実行時の ASM は、MC ではローダーのもの）。
+         * 解決できなければ特定できなかったものとして扱う。実行環境で解決できることは [pro.ikili.kibicomputers.core.runtime.RuntimeSelfCheck.readsTooLargeFunction]
+         * （GameTest）で確かめる。
          */
-        internal fun tooLargeFunction(failure: Throwable, defined: IntRange): Int? {
+        internal fun tooLargeFunction(failure: Throwable, defined: IntRange): Int? = try {
+            readTooLargeFunction(failure, defined)
+        } catch (e: LinkageError) {
+            null
+        }
+
+        internal fun readTooLargeFunction(failure: Throwable, defined: IntRange): Int? {
             var e: Throwable? = failure
             var depth = 0
             while (e != null && depth++ < 16) {
