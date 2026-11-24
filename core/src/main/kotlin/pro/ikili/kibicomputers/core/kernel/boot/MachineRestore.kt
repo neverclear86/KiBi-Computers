@@ -24,6 +24,7 @@ import pro.ikili.kibicomputers.core.persist.ColdBootCause
 import pro.ikili.kibicomputers.core.persist.ColdBootReason
 import pro.ikili.kibicomputers.core.persist.RestoreRequest
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.SnapshotLimitException
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.persist.StoredSnapshot
 import pro.ikili.kibicomputers.core.persist.snapshot.DecodedSnapshot
@@ -182,7 +183,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
             return
         } catch (e: RestoreFallbackException) {
             // MOD のバージョン違いは更新直後に全台が当たるので、1台ごとは DEBUG（要約は接続層が1回出す。ADR 0088）
-            val level = if (e.cause0 == ColdBootCause.MOD_VERSION) System.Logger.Level.DEBUG else System.Logger.Level.WARNING
+            // 上限を下げた後（#719）も同じく、要約は接続層が出す
+            val level = if (e.cause0 == ColdBootCause.MOD_VERSION || e.cause0 == ColdBootCause.OVER_LIMIT) System.Logger.Level.DEBUG else System.Logger.Level.WARNING
             LOG.log(level, "マシン ${request.source.id} を戻せないので冷えた起動にする（${e.cause0}）: ${e.message}")
             machine.restoreFellBack(e.cause0, e.reason)
             return
@@ -255,6 +257,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
         this.stored = stored
         val referenced = try {
             SnapshotDecoder.moduleSources(snapshot, machine.config.maxProcesses)
+        } catch (e: SnapshotLimitException) {
+            fallback(ColdBootCause.OVER_LIMIT, "世代 $gen が今の上限に収まらない: ${e.message}", e)
         } catch (e: SnapshotFormatException) {
             fallback(ColdBootCause.UNREADABLE, "世代 $gen を読めない: ${e.message}", e)
         }
@@ -376,6 +380,8 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val config = machine.config
         val decoded = try {
             SnapshotDecoder.decode(stored.snapshot, config.maxProcesses, config.memoryPages, base)
+        } catch (e: SnapshotLimitException) {
+            fallback(ColdBootCause.OVER_LIMIT, "世代 $gen が今の上限に収まらない: ${e.message}", e)
         } catch (e: SnapshotFormatException) {
             fallback(ColdBootCause.UNREADABLE, "世代 $gen を読めない: ${e.message}", e)
         }

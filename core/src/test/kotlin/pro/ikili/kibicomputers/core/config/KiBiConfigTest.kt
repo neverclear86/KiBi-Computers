@@ -7,6 +7,13 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
 import pro.ikili.kibicomputers.core.input.KeyboardInputBudget
+import pro.ikili.kibicomputers.core.computer.CaseTier
+import pro.ikili.kibicomputers.core.computer.MachineSpecs
+import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.computer.PartSpec
+import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.kernel.RebootBackoff
 import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.persist.FullSaveRule
 import pro.ikili.kibicomputers.core.persist.MachineSaveConfig
@@ -102,6 +109,8 @@ class KiBiConfigTest {
             KiBiConfig.machineSaveConfig(values)
             KiBiConfig.screenSyncTraffic<Any>(values)
             KiBiConfig.keyboardInputBudget(values)
+            KiBiConfig.machineProfile(values)
+            KiBiConfig.rebootBackoff(values)
             // 自動保存の周期は、止めた台が書かれる前に替わらない長さになる
             val save = KiBiConfig.machineSaveConfig(values)
             assertTrue(
@@ -246,6 +255,133 @@ class KiBiConfigTest {
         assertEquals("kibicomputers-server.toml", ConfigSide.SERVER.fileName)
         assertEquals("kibicomputers-client.toml", ConfigSide.CLIENT.fileName)
         assertEquals("kibicomputers-common.toml", ConfigSide.COMMON.fileName)
+    }
+
+    @Test
+    fun machineAndPartDefaultsMatchTheBuiltInValues() {
+        val profile = KiBiConfig.machineProfile(ConfigValues.DEFAULTS)
+        assertTrue(profile.base.sameValues(MachineConfig.DEFAULT), "既定のコンフィグの上限は MachineConfig.DEFAULT と同じ")
+        for (tier in PartTier.entries) assertEquals(tier.defaultSpec, profile.spec(tier), "$tier")
+        val scheduler = KiBiConfig.schedulerConfig(ConfigValues.DEFAULTS, ModuleStore.NONE)
+        assertEquals(SchedulerConfig.DEFAULT.mainThreadBudgetNanos, scheduler.mainThreadBudgetNanos)
+        assertEquals(SchedulerConfig.DEFAULT.hostFilesTotal, scheduler.hostFilesTotal)
+        val backoff = scheduler.rebootBackoff
+        val d = RebootBackoff.DEFAULT
+        assertEquals(
+            listOf(d.freeReboots.toLong(), d.baseDelayTicks, d.maxDelayTicks, d.decayTicks, d.capLevels.toLong()),
+            listOf(backoff.freeReboots.toLong(), backoff.baseDelayTicks, backoff.maxDelayTicks, backoff.decayTicks, backoff.capLevels.toLong()),
+        )
+    }
+
+    @Test
+    fun machineAndPartValuesReachTheMachineConfig() {
+        val values = ConfigValues.resolve(
+            mapSource(
+                KiBiConfig.MACHINE_MAX_PROCESSES to 9,
+                KiBiConfig.MACHINE_MAX_BLOCKING_PROCESSES to 2,
+                KiBiConfig.MACHINE_MAX_HOST_CALLS_PER_TICK to 7,
+                KiBiConfig.MACHINE_MAX_EVENT_QUEUES to 5,
+                KiBiConfig.MACHINE_MAX_PENDING_EVENT_KIB to 32,
+                KiBiConfig.MACHINE_MAX_ARMED_TIMERS to 3,
+                KiBiConfig.MACHINE_HOST_FILES to 4,
+                KiBiConfig.MACHINE_CONSOLE_INPUT_KIB to 2,
+                KiBiConfig.MACHINE_CONSOLE_OUTPUT_KIB to 8,
+                KiBiConfig.MACHINE_MAX_PENDING_CONSOLE_KIB to 16,
+                KiBiConfig.CPU_FUEL_PER_TICK.getValue(PartTier.CREATIVE) to 2_000_000,
+                KiBiConfig.CPU_MAX_DEVICES.getValue(PartTier.CREATIVE) to 40,
+                KiBiConfig.MEMORY_MIB.getValue(PartTier.CREATIVE) to 48,
+                KiBiConfig.STORAGE_MIB.getValue(PartTier.TIER_2) to 3,
+                KiBiConfig.STORAGE_MAX_ENTRIES.getValue(PartTier.TIER_2) to 100,
+                KiBiConfig.MAIN_THREAD_BUDGET_MICROS to 2500,
+                KiBiConfig.HOST_FILES_TOTAL to 99,
+            ),
+        )
+        assertEquals(emptyList<ConfigEntry<*>>(), values.rejected)
+        val profile = KiBiConfig.machineProfile(values)
+        assertSame(profile, KiBiConfig.machineProfile(values), "同じ写しには同じものを返す（台ごとに作り直さない）")
+        // CREATIVE の CPU と RAM を挿したケース
+        val case = CaseTier.entries.last()
+        val config = MachineSpecs.configOf(
+            case,
+            { slot ->
+                when (case.kindOf(slot)) {
+                    PartKind.CPU, PartKind.MEMORY -> PartTier.CREATIVE
+                    else -> null
+                }
+            },
+            profile,
+        )
+        val memorySlots = (0 until case.slotCount).count { case.kindOf(it) == PartKind.MEMORY }
+        assertEquals(2_000_000L, config.fuelPerTick)
+        assertEquals(40, config.maxDevices)
+        assertEquals(minOf(memorySlots * 48L * 1024 * 1024, MachineSpecs.MAX_MEMORY_BYTES), config.memoryBytes)
+        assertEquals(9, config.maxProcesses)
+        assertEquals(2, config.maxBlockingProcesses)
+        assertEquals(7, config.maxHostCallsPerTick)
+        assertEquals(5, config.maxEventQueues)
+        assertEquals(32 * 1024, config.maxPendingEventBytes)
+        assertEquals(3, config.maxArmedTimers)
+        assertEquals(4, config.hostFilesPerMachine)
+        assertEquals(2 * 1024, config.consoleInputBytes)
+        assertEquals(8 * 1024, config.consoleOutputBytes)
+        assertEquals(16L * 1024, config.maxPendingConsoleBytes)
+        assertEquals(PartSpec(1_000_000, 32L shl 20, 3L shl 20, 100, 12), profile.spec(PartTier.TIER_2))
+        val scheduler = KiBiConfig.schedulerConfig(values, ModuleStore.NONE)
+        assertEquals(2_500_000L, scheduler.mainThreadBudgetNanos)
+        assertEquals(99, scheduler.hostFilesTotal)
+    }
+
+    @Test
+    fun rebootBackoffIsRaisedSoTheRateBoundHolds() {
+        // maxDelay < decay で、capLevels が小さすぎる組み合わせ
+        val values = ConfigValues.resolve(
+            mapSource(
+                KiBiConfig.REBOOT_FREE to 5,
+                KiBiConfig.REBOOT_BASE_DELAY_TICKS to 1,
+                KiBiConfig.REBOOT_MAX_DELAY_TICKS to 10,
+                KiBiConfig.REBOOT_DECAY_TICKS to 1000,
+                KiBiConfig.REBOOT_CAP_LEVELS to 1,
+            ),
+        )
+        val b = KiBiConfig.rebootBackoff(values)
+        assertEquals(1000L, b.maxDelayTicks)
+        assertEquals(5 + 1 + 10, b.capLevels, "1 から倍々で 1000 に届くのは 10 回目（1024）")
+        assertRateBound(b)
+        // 全項目の最小・最大でも、見積もりが成り立つ
+        for (bound in listOf(true, false)) {
+            val extreme = ConfigValues.resolve(ConfigSource { entry -> (entry as? IntEntry)?.let { if (bound) it.min else it.max } })
+            assertRateBound(KiBiConfig.rebootBackoff(extreme))
+        }
+    }
+
+    /** N 回の再起動にかかる tick は「(N - capLevels) * decayTicks」以上（ADR 0635） */
+    private fun assertRateBound(b: RebootBackoff) {
+        for (ran in listOf(0L, 1L, b.decayTicks - 1, b.decayTicks, b.decayTicks + 1)) {
+            val n = b.capLevels + 200
+            var debt = 0L
+            var total = 0L
+            repeat(n) {
+                val step = b.next(debt, ran)
+                debt = step.debtTicks
+                total += step.delayTicks + ran
+            }
+            val bound = (n - b.capLevels).toLong() * b.decayTicks
+            assertTrue(total >= bound, "ran=$ran: $total < $bound")
+        }
+    }
+
+    @Test
+    fun machineConfigToBuilderCopiesEveryValue() {
+        val c = MachineConfig.builder()
+            .fuelPerTick(3_000_000).fuelSlice(400_000).maxProcesses(11).maxBlockingProcesses(3).maxHostCallsPerTick(5)
+            .memoryBytes(8L shl 20).maxProcessMemoryBytes(4L shl 20).maxDevices(6).maxEventQueues(7).maxPendingEventBytes(9000)
+            .maxArmedTimers(13).hostFilesPerMachine(17).consoleInputBytes(1000).consoleOutputBytes(3000).maxPendingConsoleBytes(5000)
+            .build()
+        assertTrue(c.toBuilder().build().sameValues(c))
+        assertTrue(c.withFuelSlice(400_000).sameValues(c))
+        // 明示していないスライスは、燃料を変えると決まり直す
+        val d = MachineConfig.DEFAULT.toBuilder().fuelPerTick(4_000_000).build()
+        assertEquals(1_000_000L, d.fuelSliceValue)
     }
 
     private fun mapSource(vararg pairs: Pair<ConfigEntry<*>, Any>): ConfigSource {

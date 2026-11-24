@@ -7,7 +7,8 @@ import org.jetbrains.annotations.ApiStatus
  *
  * MOD を更新した直後は、電源の入っていた全台が [ColdBootCause.MOD_VERSION] で冷えた起動になる（1,000 台規模なら 1,000 回）。
  * そのため [ColdBootCause.MOD_VERSION] は、最初の1回だけ要約（[Kind.SUMMARY]）にし、2回目からは台の位置を DEBUG だけにする
- * （[Kind.QUIET]）。それ以外の理由は、今までどおり1台ごとに出す（[Kind.EACH]）。
+ * （[Kind.QUIET]）。コンフィグで上限を下げた後の [ColdBootCause.OVER_LIMIT]（#719）も、同じく全台が当たりうるので理由ごとに同じ扱いにする。
+ * それ以外の理由は、今までどおり1台ごとに出す（[Kind.EACH]）。
  *
  * 状態は「要約をもう出したか」だけで、数え口もロガーも持たない。接続層がサーバーの起動ごとに作り直す（要約はサーバーの起動ごとに1回）。
  * メインスレッドだけで使う前提なので、同期しない
@@ -26,13 +27,17 @@ public class ColdBootLog {
         QUIET,
     }
 
-    private var summarized = false
+    /** 要約をもう出した理由 */
+    private val summarized = HashSet<ColdBootCause>()
 
     /** 冷えた起動の理由 [cause]（分からなければ `null`）のログの出し方を決める */
     public fun classify(cause: ColdBootCause?): Kind {
-        if (cause != ColdBootCause.MOD_VERSION) return Kind.EACH
-        if (summarized) return Kind.QUIET
-        summarized = true
-        return Kind.SUMMARY
+        if (cause == null || cause !in SUMMARIZED) return Kind.EACH
+        return if (summarized.add(cause)) Kind.SUMMARY else Kind.QUIET
+    }
+
+    private companion object {
+        /** 要約にする理由（全台が一度に当たりうるもの） */
+        val SUMMARIZED = setOf(ColdBootCause.MOD_VERSION, ColdBootCause.OVER_LIMIT)
     }
 }

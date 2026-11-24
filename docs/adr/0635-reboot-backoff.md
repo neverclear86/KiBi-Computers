@@ -86,3 +86,7 @@
 - 外から呼ぶ `boot()`（電源ボタン、レッドストーンで電源を入れ直すなど、プレイヤーが作った仕掛け）は抑えない。ゲストの `shutdown` はケースを OFF にしてマシンを外す（#640）ので、ゲストだけでは回せない。
 - 借りは実行時だけなので、ワールドを読み込み直すと 0 から始まる。ワールドの読み込み直しはゲストが起こせないので、上限の見積もりは崩れない。
 - 接続層が `onRebootRequested` を上書きしても、遅らせるのはその前（`Machine` の中）なので、どの host でも効く。
+
+## 追記（#719）
+
+`RebootBackoff` の5つの値はコンフィグの `reboot` 区画にした（`SchedulerConfig.rebootBackoff`。次にワールドを開いたときに効く）。上限の見積もりの前提（`maxDelayTicks >= decayTicks`、`capLevels` 段で `maxDelayTicks` に届く）は、組み立て（`KiBiConfig.rebootBackoff`）で引き上げて守る。テストの差し替え（`SchedulerInternals.rebootBackoff`）は残し、`null` ならコンフィグの値を使う（ADR 0719）。

@@ -529,10 +529,17 @@ object ServerMachines {
                 when (coldBootLog.classify(cause)) {
                     ColdBootLog.Kind.EACH -> LOGGER.info("Could not restore the computer at {} ({}); cold-booting", pos, cause)
                     ColdBootLog.Kind.SUMMARY -> {
-                        LOGGER.info(
-                            "Computer saves were written by a different version of {}; running computers will cold-boot instead of being restored",
-                            KiBiComputers.MOD_ID,
-                        )
+                        if (cause == ColdBootCause.OVER_LIMIT) {
+                            // コンフィグ・部品で上限（プロセスの数・RAM）を下げた後（#719）
+                            LOGGER.info(
+                                "Some computer saves do not fit the current limits (processes or RAM were lowered); those computers will cold-boot instead of being restored",
+                            )
+                        } else {
+                            LOGGER.info(
+                                "Computer saves were written by a different version of {}; running computers will cold-boot instead of being restored",
+                                KiBiComputers.MOD_ID,
+                            )
+                        }
                         LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)
                     }
                     ColdBootLog.Kind.QUIET -> LOGGER.debug("Cold-booting the computer at {} ({})", pos, cause)

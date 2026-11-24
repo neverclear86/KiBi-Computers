@@ -3,9 +3,12 @@ package pro.ikili.kibicomputers.neoforge.gametest
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestAssertException
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.world.InteractionHand
+import net.minecraft.world.level.GameType
 import net.minecraft.world.phys.Vec3
 import net.neoforged.fml.ModList
 import net.neoforged.fml.config.ModConfig
@@ -14,11 +17,14 @@ import net.neoforged.fml.event.config.ModConfigEvent
 import net.neoforged.neoforge.gametest.GameTestHolder
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate
 import pro.ikili.kibicomputers.core.KiBiComputers
+import pro.ikili.kibicomputers.core.computer.ComputerStatus
+import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.config.ConfigEntry
 import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.IntEntry
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.display.ScreenSync
 import pro.ikili.kibicomputers.neoforge.input.KeyboardBlockEntity
@@ -42,6 +48,7 @@ import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 @PrefixGameTestTemplate(false)
 object ConfigGameTests {
     private val KEYBOARD_POS = BlockPos(1, 1, 1)
+    private val CASE_POS = BlockPos(1, 1, 1)
 
     /** SERVER の spec が登録され、サーバーを開くときに（`ServerAboutToStartEvent` の前に）読まれている */
     @JvmStatic
@@ -268,6 +275,45 @@ object ConfigGameTests {
             helper.assertTrue(report.changed == listOf<ConfigEntry<*>>(entry), "the synced value should be taken: ${report.changed}")
             helper.assertTrue(report.needsRestart.isEmpty(), "a synced config should not be reported as needing a restart: ${report.needsRestart}")
             helper.assertTrue(KiBiConfigs.server[entry] == synced, "the client copy should hold the synced value")
+        } finally {
+            restore(originals)
+        }
+        helper.succeed()
+    }
+
+    /**
+     * 読み直した `machine`・`cpu`・`storage` の値（#719）が、その後に電源を入れたコンピューターの設定と、ディスクの容量に当たる。
+     * 動いている台は変わらない（電源を入れたときの設定のまま）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, batch = "kibicomputers_config_machine", timeoutTicks = 100)
+    fun reloadedMachineValuesApplyToTheNextPowerOn(helper: GameTestHelper) {
+        val processes = KiBiConfig.MACHINE_MAX_PROCESSES
+        val devices = KiBiConfig.CPU_MAX_DEVICES.getValue(PartTier.CREATIVE)
+        val storage = KiBiConfig.STORAGE_MIB.getValue(PartTier.CREATIVE)
+        val originals = originalsOf(processes, devices, storage)
+        val (p1, p2) = otherValues(processes, 2)
+        val d1 = otherValues(devices, 1).single()
+        val s1 = otherValues(storage, 1).single()
+        try {
+            reload(processes to p1, devices to d1, storage to s1)
+            helper.assertTrue(KiBiConfigs.lastReport?.needsRestart?.isEmpty() == true, "machine values should not need a restart")
+            val spec = KiBiConfig.machineProfile(KiBiConfigs.server).spec(PartTier.CREATIVE)
+            helper.assertTrue(spec.diskBytes == s1 * 1024L * 1024, "disk capacity should follow the config but was ${spec.diskBytes}")
+
+            val stack = KiBiBlocks.creativeCase(helper.level.registryAccess())
+            val player = helper.makeMockPlayer(GameType.CREATIVE)
+            player.setItemInHand(InteractionHand.MAIN_HAND, stack.copy())
+            helper.placeAt(player, stack, CASE_POS.below(), Direction.UP)
+            val be = helper.getBlockEntity<CaseBlockEntity>(CASE_POS)
+            helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "creative case should run but was ${be.computer}")
+            val config = be.computer.machine!!.config
+            helper.assertTrue(config.maxProcesses == p1, "maxProcesses should come from the config but was ${config.maxProcesses}")
+            helper.assertTrue(config.maxDevices == d1, "maxDevices should come from the CPU tier in the config but was ${config.maxDevices}")
+            // 動いている台は変わらない
+            reload(processes to p2)
+            helper.assertTrue(be.computer.machine!!.config.maxProcesses == p1, "a running computer should keep its limits")
+            be.pressPowerButton()
         } finally {
             restore(originals)
         }

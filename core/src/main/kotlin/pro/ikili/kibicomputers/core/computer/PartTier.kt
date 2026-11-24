@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.computer
 
 import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
 
 /**
  * 部品（CPU・RAM・ディスク・起動部品）のティア（#347）。部品の種類（[PartKind]）とティアで、性能が決まる。
@@ -11,6 +12,9 @@ import pro.ikili.kibicomputers.core.kernel.MachineConfig
  * 正式なティアの CPU の燃料と RAM の容量には今は [MachineConfig.DEFAULT] と同じ値を入れている（CPU の接続数 [cpuMaxDevices] は
  * ティアごとに違い、[TIER_3] だけが [MachineConfig.DEFAULT] の `maxDevices` と同じ。#66）。
  * 性能値はどれも仮の値で、正式な値は #20・#251 で確定する。
+ *
+ * ここの値は既定（[defaultSpec]）で、ゲームで使う値はコンフィグ（#719）から組み立てた [MachineProfile.spec] から読む。
+ * 性能値をここから直接読まない（読むとコンフィグが効かない）。
  *
  * @property level ティアの番号（正式なティアは 1〜4、[CREATIVE] は 0）
  * @property cpuFuelPerTick この CPU の 1 tick の燃料（[MachineConfig.fuelPerTick]）
@@ -53,6 +57,70 @@ public enum class PartTier(
         diskEntries = 65536,
         cpuMaxDevices = 256,
     ),
+    ;
+
+    /** このティアの既定の性能値（コンフィグの既定。#719） */
+    public val defaultSpec: PartSpec get() = PartSpec(cpuFuelPerTick, memoryBytes, diskBytes, diskEntries, cpuMaxDevices)
+}
+
+/**
+ * 部品1つのティアの性能値（#719）。既定は [PartTier.defaultSpec] で、コンフィグで変えられる（[MachineProfile]）。変わらない値。
+ *
+ * @property cpuFuelPerTick この CPU の 1 tick の燃料（[MachineConfig.fuelPerTick]。1 以上）
+ * @property memoryBytes この RAM 1 つの容量（バイト。64 KiB 以上）
+ * @property diskBytes このディスク 1 つの容量（バイト。1 以上）
+ * @property diskEntries このディスク 1 つのファイル・ディレクトリの数の上限（根を除く。1 以上）
+ * @property cpuMaxDevices この CPU でつなげるデバイスの数（1 以上）
+ */
+@ApiStatus.Internal
+public class PartSpec(
+    @JvmField public val cpuFuelPerTick: Long,
+    @JvmField public val memoryBytes: Long,
+    @JvmField public val diskBytes: Long,
+    @JvmField public val diskEntries: Int,
+    @JvmField public val cpuMaxDevices: Int,
+) {
+    init {
+        require(cpuFuelPerTick >= 1) { "cpuFuelPerTick は 1 以上" }
+        require(memoryBytes >= WasmMemory.PAGE_SIZE) { "memoryBytes は ${WasmMemory.PAGE_SIZE} 以上" }
+        require(diskBytes >= 1) { "diskBytes は 1 以上" }
+        require(diskEntries >= 1) { "diskEntries は 1 以上" }
+        require(cpuMaxDevices >= 1) { "cpuMaxDevices は 1 以上" }
+    }
+
+    override fun equals(other: Any?): Boolean =
+        other is PartSpec && cpuFuelPerTick == other.cpuFuelPerTick && memoryBytes == other.memoryBytes &&
+            diskBytes == other.diskBytes && diskEntries == other.diskEntries && cpuMaxDevices == other.cpuMaxDevices
+
+    override fun hashCode(): Int = listOf(cpuFuelPerTick, memoryBytes, diskBytes, diskEntries, cpuMaxDevices).hashCode()
+
+    override fun toString(): String =
+        "PartSpec(fuel=$cpuFuelPerTick, memory=$memoryBytes, disk=$diskBytes/$diskEntries, devices=$cpuMaxDevices)"
+}
+
+/**
+ * マシンの設定の元（#719）。部品で決まらない値（プロセス・イベント・タイマーなどの上限）を持つ [base] と、ティアごとの性能値。
+ * コンフィグの写し（`ConfigValues`）ごとに1つ作り、全台で共有する（`KiBiConfig.machineProfile`）。変わらない値。
+ *
+ * 電源を入れたとき・戻したとき・ディスクを挿したときに読む（[MachineSpecs.configOf]、[DiskStore.snapshot]）。
+ * 動いている台の設定は変わらない。
+ */
+@ApiStatus.Internal
+public class MachineProfile(
+    /** 部品で決まらない値。燃料・RAM・接続数は、挿さっている部品で上書きする（部品がなければこの値のまま） */
+    @JvmField public val base: MachineConfig,
+    specs: Map<PartTier, PartSpec>,
+) {
+    private val specs: Array<PartSpec> = PartTier.entries.map { requireNotNull(specs[it]) { "$it の性能値がない" } }.toTypedArray()
+
+    /** [tier] の性能値 */
+    public fun spec(tier: PartTier): PartSpec = specs[tier.ordinal]
+
+    public companion object {
+        /** すべて既定の値（[MachineConfig.DEFAULT] と [PartTier.defaultSpec]） */
+        @JvmField
+        public val DEFAULT: MachineProfile = MachineProfile(MachineConfig.DEFAULT, PartTier.entries.associateWith { it.defaultSpec })
+    }
 }
 
 private const val MIB: Long = 1024L * 1024
@@ -84,25 +152,27 @@ public object MachineSpecs {
      * - RAM（[MachineConfig.memoryBytes]）: RAM のスロットの [PartTier.memoryBytes] の合計（WASM の 32 ビットの上限で頭打ち）
      * - 接続数（[MachineConfig.maxDevices]）: CPU のスロットのうち、いちばん大きい [PartTier.cpuMaxDevices]（#66）
      *
-     * CPU・RAM が挿さっていなければ、その値は [MachineConfig.DEFAULT] のまま（起動できるかは [CaseTier.missingRequired] で見る）。
+     * 性能値は [profile]（コンフィグ。#719）の [MachineProfile.spec]、部品で決まらない値は [MachineProfile.base] から取る。
+     * CPU・RAM が挿さっていなければ、その値は [MachineProfile.base] のまま（起動できるかは [CaseTier.missingRequired] で見る）。
      */
     @JvmStatic
-    public fun configOf(caseTier: CaseTier, parts: InstalledPartTiers): MachineConfig {
+    @JvmOverloads
+    public fun configOf(caseTier: CaseTier, parts: InstalledPartTiers, profile: MachineProfile = MachineProfile.DEFAULT): MachineConfig {
         var fuel = 0L
         var memory = 0L
         var maxDevices = 0
         for (slot in 0 until caseTier.slotCount) {
-            val tier = parts.tierAt(slot) ?: continue
+            val spec = profile.spec(parts.tierAt(slot) ?: continue)
             when (caseTier.kindOf(slot)) {
                 PartKind.CPU -> {
-                    fuel = maxOf(fuel, tier.cpuFuelPerTick)
-                    maxDevices = maxOf(maxDevices, tier.cpuMaxDevices)
+                    fuel = maxOf(fuel, spec.cpuFuelPerTick)
+                    maxDevices = maxOf(maxDevices, spec.cpuMaxDevices)
                 }
-                PartKind.MEMORY -> memory = minOf(memory + tier.memoryBytes, MAX_MEMORY_BYTES)
+                PartKind.MEMORY -> memory = minOf(memory + spec.memoryBytes, MAX_MEMORY_BYTES)
                 else -> Unit
             }
         }
-        val builder = MachineConfig.builder()
+        val builder = profile.base.toBuilder()
         if (fuel > 0) builder.fuelPerTick(fuel)
         if (memory > 0) builder.memoryBytes(memory)
         if (maxDevices > 0) builder.maxDevices(maxDevices)
