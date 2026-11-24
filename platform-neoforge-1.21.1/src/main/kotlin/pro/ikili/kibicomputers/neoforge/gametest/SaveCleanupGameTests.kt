@@ -196,10 +196,11 @@ object SaveCleanupGameTests {
     /**
      * 本番の経路 [SaveCleanups.start] が、検出した理由（[ChunkReferenceProbe.untrustedRegionStorage]）を問い（[ChunkReferenceProbe.regionNamesTrusted]）に渡す（#899）。
      * 保存先に別の座標のリージョンファイルだけがあり、台の位置のリージョンファイルがないとき、理由が空でなければ台のディレクトリは「判定できない」に数えられて残り、
-     * 空なら「ない」に数えられる。検出（[vanillaRegionStorageIsTrusted]）と問い（[regionlessPositionIsKeptWhenRegionStorageIsModified]）の間をつなぐ部分を確かめる
+     * 空なら「ない」に数えられる。検出（[vanillaRegionStorageIsTrusted]）と問い（[regionlessPositionIsKeptWhenRegionStorageIsModified]）の間をつなぐ部分を確かめる。
+     * 共有の [SaveCleanups] を使うので、ほかの掃除のテスト（[dryRunCountsWithoutDeleting] など）と重ならないよう別の batch にする
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 800)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 800, batch = "kibicomputers_save_cleanup_untrusted")
     fun startPassesUntrustedReasonsToTheProbe(helper: GameTestHelper) {
         val level = helper.level
         val dimension = level.dimension().location().toString()
