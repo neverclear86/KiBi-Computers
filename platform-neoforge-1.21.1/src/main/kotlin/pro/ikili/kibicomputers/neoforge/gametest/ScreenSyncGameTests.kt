@@ -588,12 +588,6 @@ object ScreenSyncGameTests {
         helper.succeed()
     }
 
-    /**
-     * 離れたチャンクの生成（別スレッド）を待つ間に、tick のたびに眠る時間（ミリ秒）。GameTest のサーバーは tick を待たずに回すので、
-     * 眠らないと、生成が遅い CI のマシンで 1200 tick を実時間の数秒で使い切って落ちる（#934）
-     */
-    private const val WORLDGEN_WAIT_MS = 5L
-
     private val SEND_TEST_TICKET: TicketType<ChunkPos> =
         TicketType.create("kibicomputers_screen_send_test", Comparator.comparingLong(ChunkPos::toLong))
 
@@ -643,7 +637,6 @@ object ScreenSyncGameTests {
             // プレイヤーのチケットで読み込まれ、送れる状態になったら届ける
             .thenWaitUntil {
                 deliverChunks(player, farPos)
-                if (!ScreenSync.isChunkSent(level, player, far)) Thread.sleep(WORLDGEN_WAIT_MS)
                 helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "the far chunk should be sent to the player")
             }
             .thenExecute {
@@ -713,7 +706,6 @@ object ScreenSyncGameTests {
         helper.startSequence()
             .thenWaitUntil {
                 cache.runDistanceManagerUpdates()
-                if (cache.chunkMap.getChunkToSend(far.toLong()) == null) Thread.sleep(WORLDGEN_WAIT_MS)
                 helper.assertTrue(cache.chunkMap.getChunkToSend(far.toLong()) != null, "the far chunk should become sendable")
             }
             .thenExecute {
