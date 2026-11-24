@@ -142,11 +142,30 @@ test('実装: 1 回目が未完了なら implement-wait で進む', async () => 
   assert.equal(r.count('implement-wait'), 1)
 })
 
-test('実装: 2 回とも未完了なら、CI に進まず failed になる', async () => {
+test('実装: 2 回とも未完了なら、CI に進まず、PR を残して人に上がる', async () => {
   const r = await run({ implement: [{ ...IMPL, ...PENDING }], 'implement-wait': [{ ...IMPL, ...PENDING }] })
-  assert.equal(r.issue.status, 'failed')
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, PR)
   assert.equal(r.count('ci'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+  assert.ok(r.issue.question)
   assert.match(r.issue.reason, /2 回返した/)
+})
+
+test('実装: PR を作る前に 2 回とも未完了なら、Issue で人に上がる', async () => {
+  const noPr = { ...IMPL, status: 'failed', pr: null, ...PENDING }
+  const r = await run({ implement: [noPr], 'implement-wait': [noPr] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, null)
+  assert.equal(r.count('ask'), 1)
+})
+
+test('実装: blocked なら、gradleStillRunning=true でも待つやり直しをせずに人の判断へ回る', async () => {
+  const r = await run({ implement: [{ ...IMPL, status: 'blocked', pr: null, summary: 'decision が未決', ...PENDING }] })
+  assert.equal(r.count('implement-wait'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.issue.status, 'needs_human')
 })
 
 test('実装: やり直しが結果を返さなかったら failed で、「2 回返した」とは書かない', async () => {
@@ -259,15 +278,17 @@ test('レビューの直し: 2 回とも未完了なら、マージせずに止�
   assert.match(r.issue.question, /確かめられなかった/)
 })
 
-test('確認事項の反映: 2 回とも未完了なら、先へ進まず failed になる', async () => {
+test('確認事項の反映: 2 回とも未完了なら、先へ進まず人に上がる', async () => {
   const r = await run({
     implement: [{ ...IMPL, openQuestions: ['q'] }],
     'cross-check': [{ premiseSound: true, needsHuman: false, findings: 'f', question: null, guidance: 'g' }],
     resolve: [{ pushed: true, summary: 'x', ...PENDING }],
     'resolve-wait': [{ pushed: true, summary: 'y', ...PENDING }],
   })
-  assert.equal(r.issue.status, 'failed')
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, PR)
   assert.equal(r.count('ci'), 0)
+  assert.equal(r.count('ask'), 1)
   assert.match(r.issue.reason, /2 回返した/)
 })
 

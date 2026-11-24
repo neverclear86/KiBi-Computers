@@ -119,13 +119,14 @@ function gradleWaitNote(number, worktree, pending) {
    プロセスは殺さない。\`./gradlew --stop\` も使わない。同じ worktree で Gradle を 2 本動かすと、\`.gradle\` のロックや \`build/\`・\`run/\` の出力、GameTest のロックを取り合う。${ORPHAN_WAIT_MINUTES} 分たっても終わらなければ、自分の Gradle は起動せず、\`gradleStillRunning=true\` で返す。
 3. 前の回のログに結果（BUILD SUCCESSFUL など）が出ていても、それは参考にとどめる。新しい連番（\`.log\`・\`.exit\` のどちらもない名前）で、この段階の手順どおりに起動し直し、その \`.exit\` を読むまで返さない。
 4. 前の回の作業の続き（コミット済みで push していない取り込みや修正）は、そのまま使う（reset・force push はしない）。\`git merge origin/main\` をもう一度実行して「Already up to date」になっても問題ない。
-5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さない。この段階は「確かめられなかった」失敗として扱われ、先へ進まずに止まって人に上がる）。`
+5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さない。この段階は「確かめられなかった」失敗として扱われ、先へ進まずに止まって人に上がる。PR（まだなければ Issue）に確認のコメントと \`needs-human\` が付く）。`
 }
 
 // Gradle を動かす段階を呼び、Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。
 // 呼び直すかどうかはスクリプトが決める（エージェントに任せない）。回数の上限は呼び出し 1 か所ごとに 1 回。
 // run(note) は note（null か、やり直しの指示）を受けてエージェントを呼ぶ。pendingOf(r) は gradlePending の結果を返す。
-// 返り値の stillPending は、やり直しでも待たずに返したとき true。呼ぶ側はこの結果を成功として先へ進めず、失敗として止める（pendingReason を理由に使う）。
+// 返り値の stillPending は、やり直しでも待たずに返したとき true。呼ぶ側はこの結果を成功として先へ進めず、失敗として止め、
+// escalate を通して人に上げる（pendingReason を理由に使う。gradleWaitNote の手順 5 がエージェントにそう伝えている）。
 // やり直しの段階が結果を返さなかった（失敗した）ときは result=null・retryFailed=true で、stillPending=false（2 回待たずに返したのではない）。
 // 呼ぶ側は、段階が失敗したときと同じに扱う
 async function withGradleWait(what, number, worktree, run, pendingOf) {
@@ -542,18 +543,28 @@ function askHuman(kind, number, question) {
   )
 }
 
-// 実装の段階。Gradle を待たずに返したら（gradleStillRunning）、待つ指示を付けて 1 回だけ呼び直す（#904。worktree はそのまま続けて使う）
+// 実装の段階。Gradle を待たずに返したら（gradleStillRunning）、待つ指示を付けて 1 回だけ呼び直す（#904。worktree はそのまま続けて使う）。
+// already_done（着手の前に閉じていた）と blocked（人の判断が要る）は、ビルドの結果に関係なく止まるので、待つやり直しをしない
 async function implement(info, approvedPlan, guidance, advice) {
   const { result, stillPending } = await withGradleWait(
     `Issue #${info.number} の実装`, info.number, null,
     note => implementOnce(info, approvedPlan, guidance, advice, note),
-    r => r && r.status !== 'already_done' ? gradlePending(r, r.summary, false) : null,
+    r => r && r.status !== 'already_done' && r.status !== 'blocked' ? gradlePending(r, r.summary, false) : null,
   )
-  // やり直しでも待たずに返したら、ビルドを確かめていない PR を CI に進めず、失敗として止める
+  // やり直しでも待たずに返したら、ビルドを確かめていない PR を CI に進めない。
+  // status=gradle_pending（このスクリプトの中だけのもの）で返し、呼ぶ側が人に上げる（pr はそのまま残す）
   if (result && stillPending) {
-    return { ...result, status: 'failed', summary: `${pendingReason('実装の段階', result)}。最後の報告: ${result.summary}${result.pr ? `（PR #${result.pr} は作られている）` : ''}` }
+    return { ...result, status: 'gradle_pending', summary: `${pendingReason('実装の段階', result)}。最後の報告: ${result.summary}${result.pr ? `（PR #${result.pr} は作られている）` : ''}` }
   }
   return result
+}
+
+// Gradle の終わりを待つやり直しでも待たずに返した段階を、人に上げる（#904）。PR があれば PR に、なければ Issue に聞く。
+// もう直す機会がないので、確かめた結果を添えて聞く
+async function escalateUnverified(info, pr, reason, context) {
+  const question = `自動では、ビルドとテストの結果を確かめられなかった（Gradle の終わりを待たずに返した）。どう進めるか判断してほしい（このまま続ける、やり直す、PR を閉じる など）:\n- ${reason}\n- ログ: リポジトリのルートの \`.worktrees/.logs/issue-${info.number}/\``
+  const e = await escalate(pr ? 'pr' : 'issue', pr ?? info.number, question, context, false)
+  return { issue: info.number, status: 'needs_human', pr: pr ?? null, reason, question: e.question }
 }
 
 function implementOnce(info, approvedPlan, guidance, advice, waitNote) {
@@ -959,6 +970,9 @@ async function runIssue(info) {
         return { issue: info.number, status: 'needs_human', reason: again.question, question: again.question }
       }
     }
+    if (impl && impl.status === 'gradle_pending') {
+      return escalateUnverified(info, impl.pr ?? null, impl.summary, '実装の段階（Gradle の終わりを待つやり直しのあと）')
+    }
     if (!impl || impl.status !== 'pr_opened' || !impl.pr) {
       return { issue: info.number, status: 'failed', reason: impl?.summary ?? '実装の段階が失敗した', question: null }
     }
@@ -988,7 +1002,9 @@ ${e.guidance}`,
         r => gradlePending(r, r?.summary, false),
       )
       if (!applied) return { issue: info.number, status: 'failed', pr: impl.pr, reason: '確認事項の反映に失敗した', question: null }
-      if (appliedPending) return { issue: info.number, status: 'failed', pr: impl.pr, reason: `${pendingReason('確認事項の反映の段階', applied)}。最後の報告: ${applied.summary}`, question: null }
+      if (appliedPending) {
+        return escalateUnverified(info, impl.pr, `${pendingReason('確認事項の反映の段階', applied)}。最後の報告: ${applied.summary}`, `確認事項の反映の段階（ブランチ ${impl.branch}。Gradle の終わりを待つやり直しのあと）`)
+      }
     }
 
     const tag = `#${info.number}`
