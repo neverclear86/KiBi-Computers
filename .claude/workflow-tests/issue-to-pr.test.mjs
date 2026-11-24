@@ -1,0 +1,303 @@
+// issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）の検査。
+// 偽の agent でスクリプト全体を流し、どの段階が何回呼ばれたか、最後の結果がどうなるかを見る。
+// 実行: node --test .claude/workflow-tests/
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const SOURCE = readFileSync(join(here, '..', 'workflows', 'issue-to-pr.js'), 'utf8').replace('export const meta =', 'const meta =')
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+
+const PR = 906
+const IMPL = {
+  status: 'pr_opened', pr: PR, branch: 'issue-904-x', worktree: 'D:/w/issue-904', publicApiChanged: false,
+  touchesConcurrency: false, summary: 'done', openQuestions: [], gradleStillRunning: false, runningLogs: [],
+}
+const OK_CI = { passed: true, failingChecks: [], failureLog: '', mergeable: 'MERGEABLE', noChecks: false }
+const MERGED = {
+  status: 'merged', reason: null, failedStep: null, gameTestFailedOnly: false, gameTestSeconds: 100, maxTicksBehind: 0,
+  logPath: null, gradleStillRunning: false, runningLogs: [],
+}
+const fail = (failedStep, reason, extra = {}) => ({ ...MERGED, status: 'needs_human', failedStep, reason, ...extra })
+const PENDING = { gradleStillRunning: true, runningLogs: ['merge-build-2.log'] }
+
+// overrides: ラベルの種類（'merge' など。`:` より前）→ 呼ばれる順の応答（なければ既定）。関数なら呼んで使う
+async function run(overrides = {}, args = { issues: [904] }) {
+  const queues = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [k, [...v]]))
+  const calls = []
+  const logs = []
+  const defaults = {
+    select: () => ({ issues: [{ number: 904, title: 't', areas: ['tooling'], openDeps: [], blockedReason: null, needsPlan: false }] }),
+    advise: () => 'advice',
+    implement: () => IMPL,
+    ci: () => OK_CI,
+    review: () => ({ findings: [] }),
+    verify: () => ({ confirmed: [], notes: '' }),
+    merge: () => MERGED,
+    cleanup: () => ({ removed: true, note: '' }),
+    'cross-check': prompt => ({ premiseSound: true, needsHuman: true, findings: prompt, question: 'q', guidance: null }),
+  }
+  const agent = async (prompt, opts) => {
+    const kind = opts.label.split(':')[0].replace(/~\d+$/, '')
+    calls.push(kind)
+    const q = queues[kind]
+    const next = q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
+    return typeof next === 'function' ? next() : next
+  }
+  const parallel = fns => Promise.all(fns.map(f => f()))
+  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', SOURCE)
+  const result = await fn(args, agent, parallel, m => logs.push(m), () => {})
+  const count = k => calls.filter(c => c === k).length
+  return { result, calls, logs, count, issue: result.results[0] }
+}
+
+test('既定の流れはマージまで進み、やり直しは呼ばれない', async () => {
+  const r = await run()
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-wait'), 0)
+})
+
+// PR #889 のマージの段階が実際に返した理由の文（切らずにそのまま）。1 回目の失敗の記述（「落ちたので」「落ちたわけではないが」）を含む
+const PR889_REASON = 'マージは行っていない。main の取り込みは衝突なしで済んだ（コミット 65c5fb52。まだ push していない）。最初の `./gradlew build` は、maven.neoforged.net の名前解決の失敗（一時的なネットワークの不調）で落ちたので、同じ内容でやり直した（merge-build-2）。やり直しは返す時点で :core:test を実行中で、終了コードを読めていない。GameTest・CI・マージの段階には進んでいない。build が落ちたわけではないが、スキーマに「未完了」がないため needs_human で返す。この段階を最初からやり直してほしい。'
+
+test('#889 の実際の文（申告は false、failedStep=build）で返ったマージは、待つやり直しで進む', async () => {
+  const r = await run({ merge: [fail('build', PR889_REASON)], 'merge-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 1)
+  assert.equal(r.count('merge-wait'), 1)
+  assert.ok(r.logs.some(l => l.includes('決まりに反した申告')))
+})
+
+// ネットワークの失敗を回し直し、その回し直しを待たずに返した回は、理由の文に 1 回目の失敗の記述が入る。それでも未完了と見る
+for (const [name, text] of [
+  ['強い手がかり（終了コード）と、1 回目の Could not HEAD', '1 回目は Could not HEAD https://maven.neoforged.net/... で落ちた。回し直しの build-2 は終了コードを確かめていない'],
+  ['強い手がかり（.exit がない）と、1 回目の UnknownHost', '1 回目は UnknownHostException で落ちたので回し直した。build-2 の .exit がまだない'],
+  ['弱い手がかりだけで、1 回目の失敗は別の一文', '1 回目は Read timed out で落ちた。回し直しの :core:test がまだ実行中'],
+]) {
+  test(`回し直しを待たずに返した文は、1 回目の失敗の記述があっても待つやり直しをする: ${name}`, async () => {
+    const r = await run({ merge: [fail('build', text)], 'merge-wait': [MERGED] })
+    assert.equal(r.issue.status, 'merged')
+    assert.equal(r.count('merge-wait'), 1)
+  })
+}
+
+test('申告 true で返ったマージは、待つやり直しで進む', async () => {
+  const r = await run({ merge: [fail('build', 'build 実行中', PENDING)], 'merge-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-wait'), 1)
+})
+
+test('2 回とも申告 true なら、やり直しは 1 回で止まり、理由に「2 回返した」が入る', async () => {
+  const r = await run({ merge: [fail('build', 'a', PENDING)], 'merge-wait': [fail('build', 'b', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-wait'), 1)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('やり直しの段階が結果を返さなかったら、「2 回返した」とは書かず、段階の失敗として止まる', async () => {
+  const r = await run({ merge: [fail('build', 'a', PENDING)], 'merge-wait': [null] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.doesNotMatch(r.issue.mergeReason, /2 回返した/)
+  assert.match(r.issue.mergeReason, /やり直しの段階も失敗した/)
+})
+
+// マージの理由の文が、Gradle が終わったあとの本物の失敗を述べている回は、やり直さない
+for (const [name, step, text, extra] of [
+  ['ロックの待ちの上限（Held by に別の worktree のタスク名）', 'gametest', 'GameTest のロックの待ちの上限（90 分）に達した。Held by: :platform-neoforge-1.21.1:runGameTestServer in .worktrees/issue-900 が実行中のまま', {}],
+  ['ロックの待ちの上限（failedStep=build）', 'build', 'GameTest のロックの待ちの上限に達した。Held by: runGameTestServer in .worktrees/issue-900 が実行中のまま', {}],
+  ['GameTest のタイムアウト', 'gametest', 'GameTest が時間内に終わっていない（タイムアウト）', {}],
+  ['サーバーが落ちた', 'gametest', 'testFoo が終わる前にサーバーが落ちた', {}],
+  ['サーバーが落ちた（failedStep=build）', 'build', 'テストが終わる前にサーバーが落ちた', {}],
+  ['GameTest のテストの失敗（文は「実行中」を含む）', 'gametest', 'GameTest が実行中に 2 件失敗した（required tests failed）', { gameTestFailedOnly: true }],
+  ['failedStep=ci の「実行中」', 'ci', 'CI が実行中のまま 30 分たった', {}],
+  ['コンパイルの失敗', 'build', ':core:compileKotlin が失敗した（型の不一致）', {}],
+  ['ロックの待ちの上限と、別の一文の「実行中」', 'build', 'GameTest のロックの待ちの上限に達した。Held by: runGameTestServer in .worktrees/issue-900。そのタスクはまだ実行中だった', {}],
+  ['ネットワークの失敗が 2 回続いた', 'build', '依存の取得の失敗（ネットワーク）が 2 回続いた。2 回目も Could not HEAD で落ちた', {}],
+]) {
+  test(`本物の失敗は待つやり直しをしない: ${name}`, async () => {
+    const r = await run({ merge: [fail(step, text, extra)] })
+    assert.equal(r.count('merge-wait'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+    assert.doesNotMatch(r.issue.mergeReason ?? '', /2 回返した/)
+  })
+}
+
+test('待つやり直しのあとで過負荷の GameTest が落ちたら、merge-retry で進む', async () => {
+  const r = await run({
+    merge: [fail('build', '終了コードを読めていない', {})],
+    'merge-wait': [fail('gametest', 'GameTest が落ちた', { gameTestFailedOnly: true, maxTicksBehind: 5000 })],
+    'merge-retry': [MERGED],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-wait'), 1)
+  assert.equal(r.count('merge-retry'), 1)
+})
+
+test('実装: 1 回目が未完了なら implement-wait で進む', async () => {
+  const r = await run({ implement: [{ ...IMPL, ...PENDING }], 'implement-wait': [IMPL] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('implement-wait'), 1)
+})
+
+test('実装: 2 回とも未完了なら、CI に進まず、PR を残して人に上がる', async () => {
+  const r = await run({ implement: [{ ...IMPL, ...PENDING }], 'implement-wait': [{ ...IMPL, ...PENDING }] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, PR)
+  assert.equal(r.count('ci'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+  assert.ok(r.issue.question)
+  assert.match(r.issue.reason, /2 回返した/)
+})
+
+test('実装: PR を作る前に 2 回とも未完了なら、Issue で人に上がる', async () => {
+  const noPr = { ...IMPL, status: 'failed', pr: null, ...PENDING }
+  const r = await run({ implement: [noPr], 'implement-wait': [noPr] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, null)
+  assert.equal(r.count('ask'), 1)
+})
+
+test('実装: blocked なら、gradleStillRunning=true でも待つやり直しをせずに人の判断へ回る', async () => {
+  const r = await run({ implement: [{ ...IMPL, status: 'blocked', pr: null, summary: 'decision が未決', ...PENDING }] })
+  assert.equal(r.count('implement-wait'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.issue.status, 'needs_human')
+})
+
+test('実装: やり直しが結果を返さなかったら failed で、「2 回返した」とは書かない', async () => {
+  const r = await run({ implement: [{ ...IMPL, ...PENDING }], 'implement-wait': [null] })
+  assert.equal(r.issue.status, 'failed')
+  assert.doesNotMatch(r.issue.reason, /2 回返した/)
+})
+
+const CONFLICT = { ...OK_CI, passed: false, mergeable: 'CONFLICTING', noChecks: true }
+
+test('取り込み: 未完了ならやり直しで進む', async () => {
+  const r = await run({
+    ci: [CONFLICT, OK_CI],
+    conflict: [{ outcome: 'build_failed', pushed: false, summary: 'build が実行中', ...PENDING }],
+    'conflict-wait': [{ outcome: 'merged', pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('conflict-wait'), 1)
+})
+
+test('取り込み: 2 回とも未完了なら、push せず build_failed 扱いで止まる（成功扱いにしない）', async () => {
+  const r = await run({
+    ci: [CONFLICT],
+    conflict: [{ outcome: 'merged', pushed: true, summary: 'x', ...PENDING }],
+    'conflict-wait': [{ outcome: 'merged', pushed: true, summary: 'y', ...PENDING }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('conflict-wait'), 1)
+  assert.equal(r.count('merge'), 0)
+})
+
+test('取り込み: やり直しが結果を返さなかったら、「2 回返した」とは書かない', async () => {
+  const r = await run({
+    ci: [CONFLICT],
+    conflict: [{ outcome: 'build_failed', pushed: false, summary: 'build が実行中', ...PENDING }],
+    'conflict-wait': [null],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('merge'), 0)
+  assert.doesNotMatch(JSON.stringify(r.result), /2 回返した/)
+})
+
+const FAILED_CI = { passed: false, failingChecks: ['build'], failureLog: 'e', mergeable: 'MERGEABLE', noChecks: false }
+
+test('CI の直し: 未完了ならやり直しで進む', async () => {
+  const r = await run({
+    ci: [FAILED_CI, OK_CI],
+    'ci-fix': [{ pushed: true, summary: 'x', ...PENDING }],
+    'ci-fix-wait': [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('ci-fix-wait'), 1)
+})
+
+test('CI の直し: 2 回とも未完了なら、直ったことにせず止まる（再待ちもマージもしない）', async () => {
+  const r = await run({
+    ci: [FAILED_CI],
+    'ci-fix': [{ pushed: true, summary: 'x', ...PENDING }],
+    'ci-fix-wait': [{ pushed: true, summary: 'y', ...PENDING }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('ci'), 1)
+  assert.equal(r.count('merge'), 0)
+  assert.match(r.issue.question, /2 回返した/)
+})
+
+test('CI の直し: 不安定なテストで回し直した（rerun=true）なら、gradleStillRunning=true が付いても待つやり直しはしない', async () => {
+  const r = await run({
+    ci: [FAILED_CI, OK_CI],
+    'ci-fix': [{ pushed: false, rerun: true, summary: 'flaky #1', ...PENDING }],
+    'ci-fix-wait': [{ pushed: false, rerun: true, summary: 'flaky #2', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.count('ci-fix'), 1)
+  assert.equal(r.count('ci-fix-wait'), 0)
+  assert.equal(r.count('ci'), 2)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('CI の直し: push した直しの gradleStillRunning=true は、rerun が偽なら待つやり直しになる', async () => {
+  const r = await run({
+    ci: [FAILED_CI, OK_CI],
+    'ci-fix': [{ pushed: true, rerun: false, summary: 'x', ...PENDING }],
+    'ci-fix-wait': [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.count('ci-fix-wait'), 1)
+})
+
+const FINDING = { file: 'a.kt', line: 1, severity: 'should', problem: 'p' }
+
+test('レビューの直し: 未完了ならやり直しで進む', async () => {
+  const r = await run({
+    review: [{ findings: [FINDING] }],
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: true, summary: 'x', ...PENDING }],
+    'fix-wait': [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('fix-wait'), 1)
+})
+
+test('レビューの直し: 2 回とも未完了なら、マージせずに止まる', async () => {
+  const r = await run({
+    review: [{ findings: [FINDING] }],
+    verify: [{ confirmed: [0], notes: '' }],
+    fix: [{ pushed: true, summary: 'x', ...PENDING }],
+    'fix-wait': [{ pushed: true, summary: 'y', ...PENDING }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('merge'), 0)
+  assert.match(r.issue.question, /確かめられなかった/)
+})
+
+test('確認事項の反映: 2 回とも未完了なら、先へ進まず人に上がる', async () => {
+  const r = await run({
+    implement: [{ ...IMPL, openQuestions: ['q'] }],
+    'cross-check': [{ premiseSound: true, needsHuman: false, findings: 'f', question: null, guidance: 'g' }],
+    resolve: [{ pushed: true, summary: 'x', ...PENDING }],
+    'resolve-wait': [{ pushed: true, summary: 'y', ...PENDING }],
+  })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.issue.pr, PR)
+  assert.equal(r.count('ci'), 0)
+  assert.equal(r.count('ask'), 1)
+  assert.match(r.issue.reason, /2 回返した/)
+})
+
+test('確認事項の反映: push しなくても、申告が false なら未完了とは見ない', async () => {
+  const r = await run({
+    implement: [{ ...IMPL, openQuestions: ['q'] }],
+    'cross-check': [{ premiseSound: true, needsHuman: false, findings: 'f', question: null, guidance: 'g' }],
+    resolve: [{ pushed: false, summary: '変更なし。build は実行中のものはない', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.count('resolve-wait'), 0)
+  assert.equal(r.issue.status, 'merged')
+})
