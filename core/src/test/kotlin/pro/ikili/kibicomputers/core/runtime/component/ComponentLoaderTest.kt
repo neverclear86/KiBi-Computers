@@ -839,13 +839,66 @@ class ComponentLoaderTest {
 
     @Test
     fun `wacで合成した形の見積もりの余裕`() {
-        // 実物の確かめ（#666。ADR 0262 の「検証の時間の見積もり」）。見積もりは引数ごとに部品の型の大きさ（最大 3,620）を数えるので、
-        // 引数の総数に比例して大きくなる。インターフェース 4 個 × 4 段は上限の 1/6、10 個 × 10 段は上限の手前（約 1.9M）で、
-        // 実際の検証は 0.3 秒ほど。余裕は 10 倍を切る（ADR に書いた）
+        // 実物の確かめ（#666・#751。ADR 0262 の「検証の時間の見積もり」）。見積もりは引数ごとに部品のインターフェースの型の大きさ
+        // （最大 3,620）を数えるので、引数の総数に比例して大きくなる。インスタンス化で作ったインスタンスの型は export だけで、
+        // 写し直しは違う宣言ごとに数える（#751）。インターフェース 4 個 × 4 段は上限の 1/20 ほど
         val small = composedComponent(k = 4, n = 4)
         val e = estimateOf(small)
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 168 万。実際の検証は CPU 0.5 秒ほど）
+        val large = composedComponent(k = 20, n = 20)
+        val l = estimateOf(large)
+        assertTrue(l.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${l.checkCount} × ${l.maxTypeWeight} = ${l.cost}（写し直し ${l.remapCost}）" }
+        // 写し直しは、展開した大きさ（段ごとに export のインターフェース 20 個 × 3,620）ではなく、違う宣言の大きさで数える
+        assertTrue(l.remapCost * 10 < 20L * 20 * 3620) { "${l.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(large, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `写し直しは同じ宣言を1回のインスタンス化の中で1回だけ数える`() {
+        // フィールド 100 個の record を 100 個のフィールドに持つ record（展開すると約 1 万、宣言は 2 つで約 200）を export する
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val outer = (0 until 100).joinToString(" ") { """(field "g$it" ${'$'}r0)""" }
+        val c = """(component ${'$'}c (type ${'$'}r0x (record $inner)) (export ${'$'}r0 "r0" (type ${'$'}r0x)) (type ${'$'}r1 (record $outer)) (export "r" (type ${'$'}r1)))"""
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        val e = estimateOf(wat("(component $c $instances)"))
+        assertEquals(0L, e.checkCount)
+        // 1 回あたり約 300（export した r0 の 101 と、r1 の宣言 101 とその中の r0 の 101、コンポーネントの宣言）。展開した大きさ（約 1 万）ではない
+        assertTrue(e.remapCost in 10L * 202..10L * 400) { "${e.remapCost}" }
+        assertEquals(e.cost, e.remapCost)
+
+        // 別のインスタンス化で作ったインスタンスは、同じ宣言から来ても別の型（wasmparser が resource を置き換えて写し直す）なので、
+        // 重なりを除かない。c を 2 回インスタンス化して両方を export する d を、10 回インスタンス化する
+        val d = """(component ${'$'}d $c (instance ${'$'}x1 (instantiate ${'$'}c)) (instance ${'$'}x2 (instantiate ${'$'}c)) (export "a" (instance ${'$'}x1)) (export "b" (instance ${'$'}x2)))"""
+        val outerInstances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        val twice = estimateOf(wat("(component $d $outerInstances)"))
+        val perC = e.remapCost / 10
+        assertTrue(twice.remapCost >= 2 * perC + 10 * 2 * perC) { "${twice.remapCost} / $perC" }
+    }
+
+    @Test
+    fun `インスタンス化で作ったインスタンスの型はexportだけの大きさ`() {
+        // c は大きなインスタンス型を import し、何も export しない。そのインスタンスを引数に渡す確認は、import の大きさを数えない
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}y (with \"j\" (instance ${'$'}x))))" }
+        val bytes = wat(
+            """
+            (component
+              (type ${'$'}t (instance (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr)))))
+              (import "wasi:a/b@0.2.0" (instance ${'$'}a (type ${'$'}t)))
+              (component ${'$'}c (alias outer 1 ${'$'}t (type ${'$'}t)) (import "i" (instance (type ${'$'}t))))
+              (component ${'$'}y (import "j" (instance)))
+              (instance ${'$'}x (instantiate ${'$'}c (with "i" (instance ${'$'}a))))
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(11L, e.checkCount)
+        // a を渡す 1 回（約 100）と、x を渡す 10 回（それぞれ 1）。x の型に c の import（約 100）を入れると 1,000 を超える
+        assertTrue(e.cost - e.remapCost in 101L..200L) { "${e.cost} - ${e.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(bytes, policy = ComponentImportPolicy { null }) }
     }
 
     @Test

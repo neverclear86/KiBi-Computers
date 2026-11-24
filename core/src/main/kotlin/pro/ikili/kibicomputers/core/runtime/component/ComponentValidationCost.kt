@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.runtime.component
 
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
+import java.util.IdentityHashMap
 
 /**
  * wasm-tools の検証にかかる時間の見積もり（#262）。検証は、見張り（`ValidationWatchdog`）が時間の上限（`LoadDeadline`）で
@@ -14,14 +15,22 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
  * 抑えられない（例: export が 2,000 個のインスタンス型を受ける引数 100 個 × インスタンス化 100 回の 98 KB で CPU 約 22 秒、
  * フィールド 4,000 個の record を `(type (eq ..))` で受ける引数 100 個 × 100 回で約 13 秒）。そこで、ここで別に抑える。
  *
- * 見積もりは、型の確認ごとの、確かめる型の大きさの合計。
+ * 見積もりは、型の確認ごとの、確かめる型の大きさの合計と、インスタンス化ごとの型の写し直しの大きさの合計。
  *
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
- *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）
+ *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
+ *   wasmparser は型の確認を覚えない（同じ型の対でも、引数ごと・インスタンス化ごとに確かめ直す）ので、回数で掛ける
  * - 型の大きさ: wasmparser の `TypeInfo`（展開した大きさ。`MAX_WASM_TYPE_SIZE` = 100 万を超える型は、wasmparser が
  *   型を定義したときに断る）にならって、参照している型の大きさを足して数える。添字空間をなぞって参照を引き、
  *   引けないもの（入れ子のコンポーネントのインスタンスの export など）は、それまでに見た型の大きさの最大とする
- *   （参照できる型は、バイナリの中でそれより前に定義されているので、実際より小さくならない）
+ *   （参照できる型は、バイナリの中でそれより前に定義されているので、実際より小さくならない）。
+ *   インスタンス化で作ったインスタンスの型は、そのコンポーネントの export だけ（import は引数で置き換わる。#751）
+ * - 写し直し: wasmparser はインスタンス化のたびに、そのコンポーネントの export の型を写し直す（resource の置き換え）。
+ *   写し直しは1回のインスタンス化の中で型ごとに覚える（`Remapping` の `types`）ので、展開した大きさではなく、
+ *   export からたどれる、違う型の宣言の大きさ（[Info.local]）の合計で数える（#751）。wasmparser が型を新しく作り直す
+ *   ところ（import・export したインスタンス・コンポーネント・型、インスタンス化、インスタンスの export の alias）は、
+ *   同じ宣言から来ても別の型として数える（[Info.content]。重なりを除かないので、実際より小さくならない）。
+ *   展開した大きさは超えない
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * ほかの形の膨らみは、#666 で探して見つからなかった（core のインスタンス化の引数、resource と canon。入力の大きさに比例するだけ。
@@ -31,33 +40,59 @@ internal object ComponentValidationCost {
     /** 型の大きさの上限。wasmparser は、これ（`MAX_WASM_TYPE_SIZE`）を超える型を、型を定義したときに断る */
     private const val MAX_TYPE_SIZE = 1_000_000L
 
-    /** 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は確かめる型の大きさの合計（見積もりの値） */
-    class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long)
+    /** 写し直しの大きさをたどる入れ子の深さの上限。超えたら展開した大きさで数える（大きい側） */
+    private const val MAX_FLAT_DEPTH = 64
+
+    private const val SATURATED = Long.MAX_VALUE / 2
+
+    /**
+     * 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は見積もりの値（確かめる型の大きさと、
+     * 写し直しの大きさの合計）、[remapCost] はそのうちの写し直しの分
+     */
+    class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long, val remapCost: Long)
 
     /** [root]（入れ子を含む）の見積もり */
-    fun estimate(root: ParsedComponent): Estimate {
-        val walker = Walker()
+    fun estimate(root: ParsedComponent): Estimate = estimate(root, SATURATED)
+
+    /** [budget] を超えたら、写し直しの大きさをたどるのをやめる（見積もりは [budget] を超えたままになる） */
+    private fun estimate(root: ParsedComponent, budget: Long): Estimate {
+        val walker = Walker(budget)
         walker.component(root, null)
-        return Estimate(walker.checks, walker.maxSize, walker.cost)
+        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost)
     }
 
     /** 見積もりが [limits] の上限を超えていたら [WasmLoadException] */
     @Throws(WasmLoadException::class)
     fun check(root: ParsedComponent, limits: ComponentLimits) {
-        val e = estimate(root)
+        val e = estimate(root, limits.maxValidationCost)
         if (e.cost > limits.maxValidationCost) {
             throw WasmLoadException(
-                "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさの合計 ${e.cost}" +
-                    "（最大 ${e.maxTypeWeight}）。上限 ${limits.maxValidationCost}）",
+                "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさと写し直しの合計 ${e.cost}" +
+                    "（型の大きさの最大 ${e.maxTypeWeight}、写し直し ${e.remapCost}）。上限 ${limits.maxValidationCost}）",
             )
         }
     }
 
     /**
-     * 型（またはインスタンス・コンポーネント）の大きさ [size]。インスタンス型・コンポーネント型と、インスタンス・
-     * コンポーネントは、export の名前ごとの情報 [exports] も持つ（alias で引くため）
+     * 型（またはインスタンス・コンポーネント）の情報。[size] は展開した大きさ（コンポーネントは import も含む）。
+     * インスタンス型・コンポーネント型と、インスタンス・コンポーネントは、export の名前ごとの情報 [exports] も持つ（alias で引くため）。
+     *
+     * 写し直しの大きさのために、宣言そのものの大きさ [local]（参照を 1 と数えたもの）と、参照している型 [refs] を持つ。
+     * [content] があるものは、wasmparser が [content] を写して新しく作る型（import・インスタンス化など）。
+     * 同じ [content] から作ったものどうしでも、重なりを除かない
      */
-    private class Info(val size: Long, val exports: Map<String, Info>? = null)
+    private class Info(
+        val size: Long,
+        val exports: Map<String, Info>? = null,
+        val local: Long = size,
+        val refs: List<Info> = emptyList(),
+        val content: Info? = null,
+        /** 写し直しの大きさの上限（展開した大きさ）。コンポーネントは export だけ */
+        val remapBound: Long = size,
+    ) {
+        /** 写し直しの大きさ（まだなら -1） */
+        var flat = -1L
+    }
 
     /** 添字空間（型・関数・インスタンス・コンポーネント・core の型だけ。関数は、その型の情報）。引けないものは `null` */
     private class Scope(val parent: Scope?) {
@@ -90,21 +125,28 @@ internal object ComponentValidationCost {
         }
     }
 
-    private class Walker {
+    private class Walker(private val budget: Long) {
         var checks = 0L
 
-        /** 確かめる型の大きさの合計 */
+        /** 見積もりの値（確かめる型の大きさと、写し直しの大きさの合計） */
         var cost = 0L
 
-        /** インスタンス化での export の型の写し直しを数える（型の確認の回数には入れない） */
-        private fun remap(info: Info?) {
-            cost = minOf(cost + sizeOf(info), Long.MAX_VALUE / 2)
+        /** そのうちの写し直しの分 */
+        var remapCost = 0L
+
+        private fun add(a: Long, b: Long): Long = minOf(a + b, SATURATED)
+
+        /** インスタンス化での export の型の写し直しを数える（型の確認の回数には入れない）。[target] はコンポーネント */
+        private fun remap(target: Info?) {
+            val n = if (target == null) maxSize else flatOf(target, 0)
+            cost = add(cost, n)
+            remapCost = add(remapCost, n)
         }
 
         /** 型の確認を 1 回数える。確かめるのは [info] の型（引けなければ、それまでの最大） */
         private fun check(info: Info?) {
             checks++
-            cost = minOf(cost + sizeOf(info), Long.MAX_VALUE / 2)
+            cost = add(cost, sizeOf(info))
         }
 
         /** それまでに見た型の大きさの最大 */
@@ -121,11 +163,48 @@ internal object ComponentValidationCost {
 
         private fun sum(a: Long, b: Long): Long = minOf(a + b, MAX_TYPE_SIZE)
 
-        /** コンポーネント [c] をなぞり、その export の情報を返す */
+        /** 引けない参照の代わり（それまでの最大の大きさの、中を持たない型） */
+        private fun unknown(): Info = Info(maxSize)
+
+        /** wasmparser が [info] を写して新しく作る型 */
+        private fun copied(info: Info?): Info? = info?.let {
+            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound)
+        }
+
+        /**
+         * [info] を、新しい写し直しの中で写すときの大きさ。export からたどれる、違う宣言の [Info.local] の合計
+         * （写して作った型は、その中を別に数えて足す）。展開した大きさ [Info.remapBound] は超えない。
+         * 見積もりが上限を超えた後や、入れ子が深すぎるときは、たどらずに展開した大きさにする
+         */
+        private fun flatOf(info: Info, depth: Int): Long {
+            val target = info.content ?: info
+            if (target.flat >= 0) return target.flat
+            if (cost > budget || depth > MAX_FLAT_DEPTH) return target.remapBound
+            var total = target.local
+            val seen = IdentityHashMap<Info, Unit>()
+            val stack = ArrayList<Info>(target.refs)
+            while (stack.isNotEmpty() && total < target.remapBound) {
+                val n = stack.removeAt(stack.size - 1)
+                if (seen.put(n, Unit) != null) continue
+                if (n.content != null) {
+                    total = add(total, flatOf(n, depth + 1))
+                } else {
+                    total = add(total, n.local)
+                    stack.addAll(n.refs)
+                }
+            }
+            val result = minOf(total, target.remapBound)
+            target.flat = result
+            return result
+        }
+
+        /** コンポーネント [c] をなぞり、その情報を返す（大きさは import も含む。export だけの大きさは [Info.remapBound]） */
         fun component(c: ParsedComponent, parent: Scope?): Info {
             val s = Scope(parent)
             val exports = HashMap<String, Info>()
+            val refs = ArrayList<Info>()
             var size = 1L
+            var exportSize = 1L
             for (section in c.sections) {
                 when (section) {
                     is ComponentSection.Nested -> s.components += component(section.component, s)
@@ -143,17 +222,28 @@ internal object ComponentValidationCost {
                                 val target = s.components.getOrNull(item.component)
                                 // 引数がなくても、インスタンス化のたびに export の型を写し直す（resource の置き換え）
                                 remap(target)
-                                target
+                                // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）
+                                target?.let {
+                                    Info(it.remapBound, it.exports, content = it.content ?: it, remapBound = it.remapBound)
+                                }
                             }
                             is InstanceExpr.FromExports -> fromExports(s, item.exports)
                         }
                     }
                     is ComponentSection.Exports -> for (item in section.items) {
-                        val info = s.lookup(item.target)
+                        val found = s.lookup(item.target)
                         // 型を付けた export は、付けた型の部分型かを確かめる
-                        if (item.desc != null) check(info)
-                        if (info != null) exports[item.name] = info
+                        if (item.desc != null) check(found)
+                        // 関数のほかは、export するときに型を写して新しく作る
+                        val info = if (item.target.sort == Sort.FUNC) found else copied(found)
+                        if (info != null) {
+                            exports[item.name] = info
+                            refs += info
+                        } else {
+                            refs += unknown()
+                        }
                         size = sum(size, 1 + sizeOf(info))
+                        exportSize = sum(exportSize, 1 + sizeOf(info))
                         // export も、その種類の添字空間に新しい番号を足す
                         s.push(item.target.sort, info)
                     }
@@ -167,28 +257,31 @@ internal object ComponentValidationCost {
                     -> Unit
                 }
             }
-            return Info(size, exports)
+            return Info(size, exports, local = 1L + refs.size, refs = refs, remapBound = exportSize)
         }
 
         private fun fromExports(s: Scope, items: List<Pair<String, SortIdx>>): Info {
             val exports = HashMap<String, Info>()
+            val refs = ArrayList<Info>()
             var size = 1L
             for ((name, idx) in items) {
                 val info = s.lookup(idx)
                 if (info != null) exports[name] = info
+                refs += info ?: unknown()
                 size = sum(size, 1 + sizeOf(info))
             }
-            return Info(size, exports)
+            return Info(size, exports, local = 1L + refs.size, refs = refs)
         }
 
         private fun alias(s: Scope, a: Alias) {
             val info = when (a) {
-                is Alias.InstanceExport -> s.instances.getOrNull(a.instance)?.exports?.get(a.name)
+                // インスタンスの export は、インスタンスごとに写した型なので、別の型として数える
+                is Alias.InstanceExport -> copied(s.instances.getOrNull(a.instance)?.exports?.get(a.name))
                 is Alias.Outer -> s.outer(a.count)?.lookup(SortIdx(a.sort, a.index))
                 is Alias.CoreInstanceExport -> null
             }
             // 引けない型は、それまでの最大とする
-            s.push(a.sort, info ?: if (a.sort == Sort.TYPE || a.sort == Sort.CORE_TYPE) Info(maxSize) else null)
+            s.push(a.sort, info ?: if (a.sort == Sort.TYPE || a.sort == Sort.CORE_TYPE) unknown() else null)
         }
 
         /** import・export の記述 [desc] の型の情報。[s] の添字空間に番号を足す */
@@ -197,10 +290,11 @@ internal object ComponentValidationCost {
                 // `(sub resource)` は新しい resource（大きさ 1）
                 is ExternDesc.Type -> if (desc.eqTypeIndex == null) Info(1) else s.types.getOrNull(desc.eqTypeIndex)
                 is ExternDesc.Func -> s.types.getOrNull(desc.typeIndex)
-                is ExternDesc.Instance -> s.types.getOrNull(desc.typeIndex)
-                is ExternDesc.Component -> s.types.getOrNull(desc.typeIndex)
+                // インスタンス・コンポーネントは、import・export するときに型を写して新しく作る
+                is ExternDesc.Instance -> copied(s.types.getOrNull(desc.typeIndex))
+                is ExternDesc.Component -> copied(s.types.getOrNull(desc.typeIndex))
                 is ExternDesc.Module -> s.coreTypes.getOrNull(desc.coreTypeIndex)
-            } ?: Info(maxSize)
+            } ?: unknown()
             s.push(desc.sort, info)
             return info
         }
@@ -209,36 +303,49 @@ internal object ComponentValidationCost {
         private fun declType(decls: List<TypeDecl>, parent: Scope): Info {
             val s = Scope(parent)
             val exports = HashMap<String, Info>()
+            val refs = ArrayList<Info>()
             var size = 1L
             for (d in decls) {
                 when (d) {
                     is TypeDecl.CoreType -> s.coreTypes += Info(coreType(d.type))
                     is TypeDecl.Type -> s.types += defType(d.type, s)
                     is TypeDecl.AliasDecl -> alias(s, d.alias)
-                    is TypeDecl.Import -> size = sum(size, 1 + extern(s, d.desc).size)
+                    is TypeDecl.Import -> {
+                        val info = extern(s, d.desc)
+                        refs += info
+                        size = sum(size, 1 + info.size)
+                    }
                     is TypeDecl.Export -> {
                         val info = extern(s, d.desc)
                         exports[d.name] = info
+                        refs += info
                         size = sum(size, 1 + info.size)
                     }
                 }
             }
-            return Info(note(size), exports)
+            return Info(note(size), exports, local = 1L + refs.size, refs = refs)
         }
 
         private fun defType(def: DefType, s: Scope): Info = when (def) {
             is InstanceTypeDef -> declType(def.decls, s)
             is ComponentTypeDef -> declType(def.decls, s)
-            else -> Info(note(valueSize(def, s)))
+            else -> valueType(def, s)
         }
 
-        private fun valueSize(def: DefType, s: Scope): Long {
+        /** 値の型・関数型・resource。大きさは参照している型の中まで数え、宣言そのものの大きさは参照を 1 と数える */
+        private fun valueType(def: DefType, s: Scope): Info {
+            val refs = ArrayList<Info>()
             fun v(t: ValType?): Long = when (t) {
                 null -> 0L
                 is ValType.Primitive -> 1L
-                is ValType.Ref -> sizeOf(s.types.getOrNull(t.typeIndex))
+                is ValType.Ref -> {
+                    val info = s.types.getOrNull(t.typeIndex) ?: unknown()
+                    refs += info
+                    info.size
+                }
             }
             var n = 1L
+            var local = 1L
             when (def) {
                 is DefValType.Record -> for (f in def.fields) n = sum(n, v(f.type))
                 is DefValType.Variant -> for (c in def.cases) n = sum(n, 1 + v(c.type))
@@ -259,7 +366,18 @@ internal object ComponentValidationCost {
                 is DefValType.Primitive, is DefValType.Own, is DefValType.Borrow, is ResourceType -> Unit
                 is InstanceTypeDef, is ComponentTypeDef -> Unit
             }
-            return n
+            // 宣言そのものの大きさは、参照を 1 と数えたもの（参照の先は refs でたどる）
+            when (def) {
+                is DefValType.Record -> local += def.fields.size
+                is DefValType.Variant -> local += def.cases.size
+                is DefValType.Tuple -> local += def.types.size
+                is DefValType.Flags -> local += def.names.size
+                is DefValType.Enum -> local += def.names.size
+                is FuncType -> local += def.params.size + 1
+                else -> local += refs.size
+            }
+            val size = note(n)
+            return Info(size, local = minOf(local, size).coerceAtLeast(1), refs = refs)
         }
 
         /** core の型の大きさ（関数は引数と結果の数、モジュール型は宣言の数） */
