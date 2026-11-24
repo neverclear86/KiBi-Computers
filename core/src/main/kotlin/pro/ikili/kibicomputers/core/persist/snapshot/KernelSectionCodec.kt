@@ -42,8 +42,17 @@ internal class KernelLimits(
     val maxTableProcesses: Int get() = tableProcessLimit(maxProcesses)
 
     companion object {
+        /**
+         * コンフィグで設定できるプロセスの数の最大（#719）。これ以下の上限で保存した写しの、今の上限を超える数は、
+         * 壊れているのではなく上限を下げたものとして [pro.ikili.kibicomputers.core.persist.SnapshotLimitException] にする
+         */
+        const val MAX_PROCESSES_CEILING: Int = 1024
+
         /** [maxTableProcesses] の式（[maxProcesses] から） */
         fun tableProcessLimit(maxProcesses: Int): Int = maxProcesses * 2 + 64
+
+        /** [MAX_PROCESSES_CEILING] の表の上限 */
+        val TABLE_PROCESS_CEILING: Int = tableProcessLimit(MAX_PROCESSES_CEILING)
     }
 }
 
@@ -203,9 +212,9 @@ internal object KernelSectionCodec {
         val maxProcesses = limits.maxTableProcesses
         val nextPid = input.i32()
         if (nextPid < 1) throw SnapshotFormatException("次の pid が不正（$nextPid）")
-        val orphanCount = input.count(maxProcesses, 4)
+        val orphanCount = input.countWithin(maxProcesses, KernelLimits.TABLE_PROCESS_CEILING, 4)
         val orphans = List(orphanCount) { input.i32() }
-        val processCount = input.count(maxProcesses, 16)
+        val processCount = input.countWithin(maxProcesses, KernelLimits.TABLE_PROCESS_CEILING, 16)
         val processes = LinkedHashMap<Int, Process>()
         val wake = HashSet<Int>()
         repeat(processCount) {
@@ -232,7 +241,7 @@ internal object KernelSectionCodec {
         // イベントの索引
         val queues = readIds(input)
         val all = readIds(input)
-        val typeCount = input.count(EventLimits.MAX_QUEUES * EventLimits.MAX_FILTER_TYPES, 8)
+        val typeCount = input.count(EventLimits.MAX_QUEUES_CEILING * EventLimits.MAX_FILTER_TYPES, 8)
         val byType = List(typeCount) { input.string(EventLimits.MAX_TYPE_BYTES) to readIds(input) }
         // マウントの表
         val nextMountId = input.i32()
@@ -291,7 +300,7 @@ internal object KernelSectionCodec {
     }
 
     private fun readIds(input: SnapshotReader): List<Int> {
-        val n = input.count(EventLimits.MAX_QUEUES * 4, 4)
+        val n = input.count(EventLimits.MAX_QUEUES_CEILING * 4, 4)
         return List(n) { input.i32() }
     }
 

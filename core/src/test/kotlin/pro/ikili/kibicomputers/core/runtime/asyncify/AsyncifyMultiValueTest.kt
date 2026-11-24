@@ -127,6 +127,20 @@ class AsyncifyMultiValueTest {
                     longArrayOf(++next)
                 }
             }
+            // 引数を取る止まりうる import。巻き直しで着いたとき（呼び出しのやり直し）に積まれた引数で結果を作る
+            .hostFunction("w", "take", WasmFunctionType.of(listOf(WasmValueType.I32), listOf(WasmValueType.I32))) { instance, args ->
+                if (instance.asyncState == WasmAsyncState.REWINDING) {
+                    assertTrue(stack.values.isEmpty(), "巻き直しで着いたのに、退避した値が残っている")
+                    instance.asyncState = WasmAsyncState.NORMAL
+                    longArrayOf(take(args[0], ++next))
+                } else if (suspendWait) {
+                    counts.waitUnwinds++
+                    instance.asyncState = WasmAsyncState.UNWINDING
+                    longArrayOf(0)
+                } else {
+                    longArrayOf(take(args[0], ++next))
+                }
+            }
             .asyncStack(stack)
         if (fuel != null) {
             builder.fuel(
@@ -164,6 +178,9 @@ class AsyncifyMultiValueTest {
         }
     }
 
+    /** `w.take` の結果（引数の取り違えが結果に出るように、引数と呼ばれた順の番号の両方から作る。i32 で切り詰める） */
+    private fun take(arg: Long, n: Long): Long = (arg.toInt() * 5 + n.toInt()).toLong()
+
     private class Counts {
         var waitUnwinds = 0
         var fuelUnwinds = 0
@@ -171,12 +188,18 @@ class AsyncifyMultiValueTest {
     }
 
     /** 止めずに動かしたときの結果（変換していないモジュール） */
-    private fun expected(export: String): LongArray {
+    private fun expected(export: String): LongArray = expected(bytes, export)
+
+    /** 止めずに動かしたときの結果（変換していない [module]） */
+    private fun expected(module: ByteArray, export: String): LongArray {
         var next = 0L
         val config = WasmInstanceConfig.builder()
             .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(++next) }
+            .hostFunction("w", "take", WasmFunctionType.of(listOf(WasmValueType.I32), listOf(WasmValueType.I32))) { _, args ->
+                longArrayOf(take(args[0], ++next))
+            }
             .build()
-        return EndiveRuntime().load(bytes).instantiate(config).use { it.call(export) }
+        return EndiveRuntime().load(module).instantiate(config).use { it.call(export) }
     }
 
     @Test
@@ -226,5 +249,343 @@ class AsyncifyMultiValueTest {
         val r = Asyncify.transform(metered, setOf("w.wait"), "kibi.fuel")
         assertTrue(r.yieldSites > 0)
         assertNull(WitTool.validate(r.bytes))
+    }
+
+    /**
+     * [module] の各 [exports] を確かめる: 変換したもの（燃料の計測コードを入れたものも）が正しい WASM で、燃料切れが待ち点になり、
+     * 入力待ちだけ・燃料切れだけ・両方で巻き戻して巻き直しても、止めずに動かしたときと結果が同じ
+     */
+    private fun checkAllWays(module: ByteArray, exports: List<String>) {
+        val waits = setOf("w.wait", "w.take")
+        val transformed = Asyncify.transform(module, waits).bytes
+        assertNull(WitTool.validate(transformed))
+        val waitOnly = EndiveRuntime().load(transformed)
+        val metered = Asyncify.transform(FuelInjector.inject(module).bytes, waits, "kibi.fuel")
+        assertNull(WitTool.validate(metered.bytes))
+        val applied = Instrumentation.applyDetailed(module, waits)
+        assertTrue(applied.fuelYield, "燃料切れを待ち点にできなかった: ${applied.fuelYieldRejection}")
+        val loaded = EndiveRuntime().load(applied.bytes)
+        for (export in exports) {
+            val want = expected(module, export)
+            // 入力待ちだけで止める（燃料の計測コードを入れていないもの）
+            val (waited, c1) = drive(waitOnly, export, suspendWait = true)
+            assertArrayEquals(want, waited, "$export: 入力待ち")
+            assertTrue(c1.waitUnwinds > 0, export)
+            // 燃料切れだけで止める
+            val (fueled, c2) = drive(loaded, export, suspendWait = false, fuel = 3)
+            assertArrayEquals(want, fueled, "$export: 燃料切れ")
+            assertTrue(c2.fuelUnwinds > 0, "$export: 燃料切れで巻き戻していない")
+            assertEquals(0, c2.fuelBlocking, "$export: 燃料切れでスレッドを持って待った")
+            // 両方で止める
+            val (both, c3) = drive(loaded, export, suspendWait = true, fuel = 3)
+            assertArrayEquals(want, both, "$export: 両方")
+            assertTrue(c3.waitUnwinds > 0 && c3.fuelUnwinds > 0, export)
+            assertEquals(0, c3.fuelBlocking, export)
+        }
+    }
+
+    /**
+     * 引数を持つ `if` で、`else` の側が止まるもの（#447）。どれも 5〜6 回まわる loop の中に置き、条件を繰り返しごとに交互に変える
+     * （巻き直しで then に入る道と else に入る道の両方を通す）。then と else で違う計算にして、枝ごとの専用ローカルの取り違えを見分ける:
+     * - `else_both`: then と else の両方が止まる
+     * - `else_only`: then は止まらず、else だけが止まる
+     * - `empty_then`: then が空で、else だけが止まる（then の中身がないので、引数を積み直すだけになる）
+     * - `else_only_later`・`empty_then_later`: `else_only`・`empty_then` の `if` の後ろ（同じ繰り返しの中）にも待ち点を足したもの。
+     *   後ろの待ち点で止まった巻き直しは、条件が真の繰り返しでは、止まらない then の枝を REWINDING のまま通る
+     *   （`empty_then_later` は、中身が空の枝を包みのない `local.get` で積み直す道。`else_only_later` は、待ち点のない枝の最後のランを
+     *   `if (state == NORMAL)` で包む道）。`else_only`・`empty_then` の巻き直しは、止まった else の中へ入る道と燃料の確かめで NORMAL に戻る道だけ
+     */
+    private val elseWat = """
+        (module
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (func (export "else_both") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32 i32)
+                (then call ${'$'}wait)
+                (else i32.const 100 i32.add call ${'$'}wait i32.const 7 i32.mul))
+              i32.add
+              i32.const 3
+              i32.mul
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "else_only") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32 i32)
+                (then i32.const 7)
+                (else i32.const 100 i32.add call ${'$'}wait))
+              i32.const 11
+              i32.mul
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "empty_then") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32 i32) (result i32 i32)
+                (then)
+                (else i32.add call ${'$'}wait i32.const 13 i32.mul))
+              i32.const 5
+              i32.mul
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "else_only_later") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32 i32)
+                (then i32.const 7)
+                (else i32.const 100 i32.add call ${'$'}wait))
+              i32.const 11
+              i32.mul
+              i32.add
+              call ${'$'}wait
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "empty_then_later") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32 i32) (result i32 i32)
+                (then)
+                (else i32.add call ${'$'}wait i32.const 13 i32.mul))
+              i32.const 5
+              i32.mul
+              i32.add
+              call ${'$'}wait
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc))
+    """.trimIndent()
+
+    /**
+     * 入れ子と、else のない `if` と、2回目以降の繰り返しで止まる loop（#447）:
+     * - `nested`: 引数 2 つの loop の本体の最初が、引数 2 つの block。block はその引数を止まりうる関数 `pair` に渡し、
+     *   中の引数付きの loop（先頭への分岐あり）と、外の loop の引数から条件を作る引数付きの `if` を通って、block の中から外の loop の先頭へ分岐する
+     * - `no_else`: else のない引数付きの `if`（引数と結果が同じ）。条件が偽の繰り返しでは、止まった呼び出しより前の `if` を通り抜けて巻き直す。
+     *   同じ繰り返しの後ろにも待ち点がある
+     * - `loop_args`: 引数付きの loop の本体の最初が、その引数を受け取る止まりうる関数 `pair` の呼び出し。引数は繰り返しごとに変わる。
+     *   2回目以降の繰り返しで止まっても巻き直せることを見る。止まった呼び出しに渡す引数が古い値になる退行は、これでは見分けられない
+     *   （`pair` は巻き直しの入口で自分の引数ローカルも退避から戻すので、呼び出し側が積む値は結果に出ない）。それは [takeWat] で見る
+     */
+    private val nestedWat = """
+        (module
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (func ${'$'}pair (param i32) (result i32 i32)
+            (call ${'$'}wait)
+            (i32.mul (local.get 0) (i32.const 3)))
+          (func (export "nested") (result i32)
+            (local ${'$'}n i32) (local ${'$'}c i32) (local ${'$'}t i32)
+            i32.const 3
+            i32.const 1
+            (loop ${'$'}outer (param i32 i32) (result i32)
+              (block (param i32 i32) (result i32 i32)
+                ;; [回数, acc] → [回数, w + acc * 3]
+                call ${'$'}pair
+                i32.add
+                i32.const 2
+                local.set ${'$'}n
+                (loop ${'$'}il (param i32 i32) (result i32 i32)
+                  call ${'$'}wait
+                  i32.add
+                  ;; 外の loop の引数（回数）から条件を作る
+                  local.set ${'$'}t
+                  local.tee ${'$'}c
+                  local.get ${'$'}t
+                  local.get ${'$'}c
+                  local.get ${'$'}n
+                  i32.add
+                  i32.const 1
+                  i32.and
+                  (if (param i32) (result i32)
+                    (then call ${'$'}wait i32.add)
+                    (else call ${'$'}wait i32.const 7 i32.mul i32.add))
+                  local.get ${'$'}n
+                  i32.const 1
+                  i32.sub
+                  local.tee ${'$'}n
+                  br_if ${'$'}il)
+                ;; [回数 - 1, v]。0 でなければ外の loop の先頭へ
+                local.set ${'$'}t
+                i32.const 1
+                i32.sub
+                local.tee ${'$'}c
+                local.get ${'$'}t
+                local.get ${'$'}c
+                br_if ${'$'}outer)
+              i32.add))
+          (func (export "no_else") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32 i32) (result i32 i32)
+                (then call ${'$'}wait i32.add i32.const 17 i32.mul))
+              i32.const 5
+              i32.mul
+              i32.add
+              call ${'$'}wait
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "loop_args") (result i32)
+            (local ${'$'}i i32)
+            i32.const 1
+            (loop ${'$'}l (param i32) (result i32)
+              call ${'$'}pair
+              i32.add
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l)))
+    """.trimIndent()
+
+    /**
+     * 引数付きの構造の引数を、引数を取る止まりうる import（`w.take`）が直接受け取るもの（#447）。
+     * 止まりうる import は、巻き直しで着いたとき、そのとき積まれた引数で呼び出しをやり直すので、止まった呼び出しに渡す引数が
+     * 古い値（構造の直前に積み直した、外から最後に入ったときの引数）になる退行（退避を省いて専用の引数ローカルを直接使う、など）が結果に出る。
+     * どれも 2回目以降の繰り返しで止まる:
+     * - `loop_take`: 引数付きの loop の本体の最初が `w.take` で、その引数は loop の引数
+     * - `block_take`: 引数 2 つの loop の本体の最初が引数 2 つの block で、その本体の最初が `w.take`（引数は block の引数の上の方）
+     * - `if_take`: loop の中の引数付きの `if` の両方の枝の最初が `w.take`（引数は `if` の引数。枝ごとに後の計算を変える）
+     *
+     * 燃料の計測コードを入れたものは、loop の先頭の燃料の確かめが最初の待ち点になり、引数はそこで一時ローカルへ移るので、
+     * 見分けられるのは入力待ちだけで止めるもの。
+     */
+    private val takeWat = """
+        (module
+          (import "w" "take" (func ${'$'}take (param i32) (result i32)))
+          (func (export "loop_take") (result i32)
+            (local ${'$'}i i32)
+            i32.const 1
+            (loop ${'$'}l (param i32) (result i32)
+              call ${'$'}take
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l))
+          (func (export "block_take") (result i32)
+            (local ${'$'}c i32) (local ${'$'}t i32)
+            i32.const 4
+            i32.const 2
+            (loop ${'$'}l (param i32 i32) (result i32)
+              (block (param i32 i32) (result i32 i32)
+                ;; [回数, acc] → [回数, take(acc)]
+                call ${'$'}take)
+              ;; [回数 - 1, v]。0 でなければ先頭へ
+              local.set ${'$'}t
+              i32.const 1
+              i32.sub
+              local.tee ${'$'}c
+              local.get ${'$'}t
+              local.get ${'$'}c
+              br_if ${'$'}l
+              i32.add))
+          (func (export "if_take") (result i32)
+            (local ${'$'}i i32)
+            i32.const 3
+            (loop ${'$'}l (param i32) (result i32)
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32)
+                (then call ${'$'}take i32.const 1 i32.add)
+                (else call ${'$'}take i32.const 2 i32.mul))
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)))
+    """.trimIndent()
+
+    @Test
+    fun `引数付きの構造の引数を止まりうるimportが直接受け取っても、巻き直しで今の繰り返しの値を渡す`() {
+        checkAllWays(WitTool.wat(takeWat), listOf("loop_take", "block_take", "if_take"))
+    }
+
+    @Test
+    fun `引数付きのifでelseの側が止まっても、巻き直して結果が同じ`() {
+        checkAllWays(WitTool.wat(elseWat), listOf("else_both", "else_only", "empty_then", "else_only_later", "empty_then_later"))
+    }
+
+    @Test
+    fun `引数付きの構造の入れ子、elseのないif、2回目以降の繰り返しで止まるloopでも、巻き直して結果が同じ`() {
+        checkAllWays(WitTool.wat(nestedWat), listOf("nested", "no_else", "loop_args"))
     }
 }

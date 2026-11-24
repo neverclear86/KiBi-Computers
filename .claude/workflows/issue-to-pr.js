@@ -9,7 +9,7 @@ export const meta = {
     { title: 'CI', detail: 'PR の CI を待つ。main と衝突していたら取り込む。落ちたら直す' },
     { title: 'Review', detail: '正しさ・ルール違反のレビュー、公開 API の Java 相互運用レビュー、指摘の検証' },
     { title: 'Fix', detail: '確かな指摘を直して CI を待ち直す' },
-    { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする。過負荷で GameTest だけが落ちたら 1 回だけ回し直す（merge: false なら飛ばす）' },
+    { title: 'Merge', detail: '1件ずつ main を取り込み、確認してからマージする。過負荷で GameTest だけが落ちたら 1 回だけ回し直す。Gradle を待たずに返した段階は、待つ指示を付けて 1 回だけやり直す（merge: false なら飛ばす）' },
     { title: 'Report', detail: 'PR に結果をまとめる。人の確認が要るものは Fable が前提と推奨を確かめてから質問して needs-human を付ける。マージ済みなら、Gradle が終わってから worktree を片付ける' },
   ],
 }
@@ -43,7 +43,112 @@ function gradleRules(number, stage) {
 - \`.exit\` ができるまで、Monitor などで待つ（前景の \`sleep\` は使えない）。**Gradle が終わって終了コードを読むまで、この段階を終えて返さない。** バックグラウンドで動かしたまま返さない。
 - GameTest（\`runGameTestServer\`・\`runJarGameTestServer\`・\`runLoadTestServer\`）は、マシンの中で同時に 1 本だけ動く（Gradle がユーザーホームの \`kibicomputers/locks/gametest.lock\` を取る）。ほかが動いていれば「Waiting for the GameTest lock ... Held by: ...」を 30 秒ごとに出して待つので、止めずに待つ。待ちの時間は失敗ではない。
 - GameTest が落ちたら、\`<worktree>/platform-*/run/logs/latest.log\` を \`${logs}/${stage}-<内容>-<連番>-<バージョン>-latest.log\` に写す（worktree を片付けても調べられるように）。
-- \`./gradlew --stop\` は使わない（デーモンはほかの worktree と共有しているので、そちらのビルドまで止まる）。`
+- \`./gradlew --stop\` は使わない（デーモンはほかの worktree と共有しているので、そちらのビルドまで止まる）。
+- **依存の取得の失敗（コードと関係のない、ネットワークの層の失敗）は、同じ内容で 1 回だけ回し直す**（#904）。当たるのは、\`UnknownHostException\`、名前解決の失敗（Windows では「そのようなホストは不明です。 (maven.neoforged.net)」のように日本語で出る）、\`Connection refused\`・\`Connection reset\`、\`Read timed out\`・\`connect timed out\`、HTTP の 5xx、原因がこれらの \`Could not GET\`・\`Could not HEAD\`・\`Could not resolve\`。回し直しは新しい連番で起動し、その \`.exit\` を待つ。2 回目も同じように落ちたら、それ以上は回さず、「依存の取得の失敗（ネットワーク）が 2 回続いた」と理由に書いて、ビルドの失敗として返す。\`Could not find <座標>\`（404。版の誤り）、Zig・Lua・wasi-sdk などの SHA-256 の不一致、コンパイルやテストの失敗は、回し直さない（本物の失敗）。
+- **返す値の \`gradleStillRunning\` と \`runningLogs\`**（#904）: Gradle が終わって終了コードを読めたら、\`gradleStillRunning=false\`・\`runningLogs=[]\`。どうしても終わりを待てずに返すことになったら（決まりに反するので、本当に最後の手段）、失敗（needs_human・blocked・build_failed など）に見せかけず、\`gradleStillRunning=true\` にし、\`runningLogs\` に \`.exit\` のないログの名前を入れて返す。このスクリプトが、Gradle の終わりを待つ指示を付けてこの段階を 1 回だけやり直す。`
+}
+
+// Gradle を動かす段階のスキーマに足す項目（#904）。エージェントが Gradle の終わりを待たずに返した回を、スクリプトの側で見分ける
+const GRADLE_PENDING_PROPS = {
+  gradleStillRunning: { type: 'boolean', description: 'この段階で起動した Gradle のどれかが、終了コード（.exit）を読む前に返したなら true。すべて終わって終了コードを読めたら false' },
+  runningLogs: { type: 'array', items: { type: 'string' }, description: 'gradleStillRunning のとき、.exit のないログの名前（.worktrees/.logs/issue-<n>/ の中のもの）。それ以外は空' },
+}
+function withGradlePending(schema) {
+  return {
+    ...schema,
+    properties: { ...schema.properties, ...GRADLE_PENDING_PROPS },
+    required: [...schema.required, 'gradleStillRunning', 'runningLogs'],
+  }
+}
+
+// gradleStillRunning=false と申告しながら、理由の文が「Gradle がまだ終わっていない」を示す回を拾う（#904。PR #889 の実例:
+// 「最初の ./gradlew build は、maven.neoforged.net の名前解決の失敗…で落ちたので、同じ内容でやり直した（merge-build-2）。
+// やり直しは返す時点で :core:test を実行中で、終了コードを読めていない。…build が落ちたわけではないが、スキーマに「未完了」がないため needs_human で返す」）。
+// 本物の失敗まで拾わないよう、失敗の理由として読む文（マージの build の失敗、取り込みの build_failed、push しなかった修正）にだけ当てる。
+// 依存の取得の失敗を 1 回回し直す決まりがあるので、未完了の回の理由の文には、ふつう 1 回目の失敗（落ちた、Could not HEAD など）も書かれる。
+// そのため、失敗の証拠が文のどこかにあるだけでは外さず、手がかりの強さで 2 つに分ける:
+// - 強い手がかり（GRADLE_UNFINISHED_STRONG）: 終了コードを読めていない、.exit がない、スキーマに「未完了」がない。Gradle が終わって失敗したなら
+//   終了コードは読めているので、失敗の証拠があっても未完了と見る
+// - 弱い手がかり（GRADLE_UNFINISHED_WEAK）: 「<タスク> が実行中」「終わる前」など。本物の失敗の説明にも出るので、同じ一文（。・改行で区切る）に
+//   失敗の証拠（GRADLE_FAILURE_EVIDENCE）がなく、文の全体に GameTest のロックの待ちの上限の証拠（GRADLE_LOCK_LIMIT_EVIDENCE）もないときだけ拾う
+const GRADLE_UNFINISHED_STRONG = /終了コードを(まだ)?(読めて|読んで|確かめられて|確かめて|確認できて|確認して)いない|\.exit\s*(が|は)?(まだ)?(ない|できていない|書かれていない)|スキーマに「?未完了/i
+const GRADLE_UNFINISHED_WEAK = /(gradle|ビルド|build|GameTest|テスト|test|:[\w.-]+:\w+)[^。\n]{0,30}?(を|が|は)?(まだ)?(実行中|動いている|走っている|終わっていない|終わる前)|still running|not (yet )?finished/i
+
+// Gradle が終わったあとの本物の失敗の証拠。同じ一文にこれがあれば、弱い手がかりは未完了とは見ない
+// （例: 「GameTest が時間内に終わっていない（タイムアウト）」、「testFoo が終わる前にサーバーが落ちた」、
+// 「Held by: ...runGameTestServer in .worktrees/issue-900 が実行中のまま」）
+const GRADLE_FAILURE_EVIDENCE = /Held by|Waiting for the GameTest lock|ロック|上限|タイムアウト|time[ds]? ?out|落ち(た|て)|クラッシュ|crash|required tests failed|BUILD FAILED|FAILED\b|Could not (GET|HEAD|resolve|find)|UnknownHost/i
+// GameTest のロックの待ちの上限に達した証拠。これが文のどこかにあれば、弱い手がかりは見ない（「上限に達した。runGameTestServer が実行中のままだった」のように、
+// ほかの worktree のタスクが実行中だと別の一文で添えた回）。依存の取得の失敗（1 回目の失敗の記述）は当たらないよう、ロックに限る
+const GRADLE_LOCK_LIMIT_EVIDENCE = /Held by|Waiting for the GameTest lock|ロックの待ち|ロックを待/i
+
+// 理由の文が、Gradle がまだ終わっていないことを示すか（#904）
+function textSaysGradleUnfinished(text) {
+  if (!text) return false
+  if (GRADLE_UNFINISHED_STRONG.test(text)) return true
+  if (GRADLE_LOCK_LIMIT_EVIDENCE.test(text)) return false
+  return text.split(/[。\n]/).some(s => GRADLE_UNFINISHED_WEAK.test(s) && !GRADLE_FAILURE_EVIDENCE.test(s))
+}
+
+// 返り値が「Gradle を待たずに返した」か。textEligible のときだけ text も見る。当たらなければ null
+function gradlePending(r, text, textEligible) {
+  if (!r) return null
+  const logs = Array.isArray(r.runningLogs) ? r.runningLogs : []
+  if (r.gradleStillRunning === true) return { by: 'flag', logs, text: text ?? '' }
+  if (textEligible && textSaysGradleUnfinished(text)) return { by: 'text', logs, text }
+  return null
+}
+
+// コマンドラインに worktree のパスを含む java のプロセスを探す PowerShell のコマンド（#855）。
+// 番号が前方一致する別の worktree（issue-<n>0 など）のものを数えないよう、番号の後ろに数字が続かないものだけを数える
+function worktreeJavaQuery(number) {
+  return `Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]issue-${number}(?![0-9])' }`
+}
+
+// Gradle を待たずに返した段階を、もう 1 回だけ呼ぶときに付ける指示（#904）。
+// 返したときにバックグラウンドのシェルが止まり、前の回の .exit は二度とできないことがある（Gradle の java だけが孤児として最後まで走る）。
+// なので前の回の .exit は待たせず、孤児の Gradle が終わるのを待ってから、新しい連番で起動させる
+const ORPHAN_WAIT_MINUTES = 30
+function gradleWaitNote(number, worktree, pending) {
+  const logs = `.worktrees/.logs/issue-${number}`
+  return `**やり直し（#904）**: 前回のこの段階は、Gradle の終わり（\`.exit\`）を待たずに返した（動いていたログ: ${pending.logs.length ? pending.logs.join(', ') : '申告なし'}。前回の理由: ${pending.text || '-'}）。この段階を手順の最初からもう 1 回だけやり直す。次を守る:
+1. 前の回のログの \`.exit\` は待たない。返したときにバックグラウンドのシェルが止まるので、\`.exit\` は二度とできないことがある。
+2. 自分の \`./gradlew\` を起動する前に、前の回の Gradle が終わるのを最大 ${ORPHAN_WAIT_MINUTES} 分、Monitor などで待つ（前景の \`sleep\` は使えない）。終わったとみなすのは、次のどちらも満たすとき:
+   - コマンドラインに worktree のパス（${worktree ?? `.worktrees/issue-${number}`}）を含む java のプロセスがない（PowerShell の \`${worktreeJavaQuery(number)}\`）。
+   - \`${logs}/\` の \`.exit\` のないログ（\`-latest.log\` で終わるものは除く）が、どれも最終更新から ${STALE_LOG_MINUTES} 分以上たっている（\`date +%s\` と \`stat -c %Y <ログ>\` で測る）。
+   プロセスは殺さない。\`./gradlew --stop\` も使わない。同じ worktree で Gradle を 2 本動かすと、\`.gradle\` のロックや \`build/\`・\`run/\` の出力、GameTest のロックを取り合う。${ORPHAN_WAIT_MINUTES} 分たっても終わらなければ、自分の Gradle は起動せず、\`gradleStillRunning=true\` で返す。
+3. 前の回のログに結果（BUILD SUCCESSFUL など）が出ていても、それは参考にとどめる。新しい連番（\`.log\`・\`.exit\` のどちらもない名前）で、この段階の手順どおりに起動し直し、その \`.exit\` を読むまで返さない。
+4. 前の回の作業の続き（コミット済みで push していない取り込みや修正）は、そのまま使う（reset・force push はしない）。\`git merge origin/main\` をもう一度実行して「Already up to date」になっても問題ない。
+5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さない。この段階は「確かめられなかった」失敗として扱われ、先へ進まずに止まって人に上がる。PR（まだなければ Issue）に確認のコメントと \`needs-human\` が付く）。`
+}
+
+// Gradle を動かす段階を呼び、Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。
+// 呼び直すかどうかはスクリプトが決める（エージェントに任せない）。回数の上限は呼び出し 1 か所ごとに 1 回。
+// run(note) は note（null か、やり直しの指示）を受けてエージェントを呼ぶ。pendingOf(r) は gradlePending の結果を返す。
+// 返り値の stillPending は、やり直しでも待たずに返したとき true。呼ぶ側はこの結果を成功として先へ進めず、失敗として止め、
+// escalate を通して人に上げる（pendingReason を理由に使う。gradleWaitNote の手順 5 がエージェントにそう伝えている）。
+// やり直しの段階が結果を返さなかった（失敗した）ときは result=null・retryFailed=true で、stillPending=false（2 回待たずに返したのではない）。
+// 呼ぶ側は、段階が失敗したときと同じに扱う
+async function withGradleWait(what, number, worktree, run, pendingOf) {
+  const first = await run(null)
+  const p1 = pendingOf(first)
+  if (!p1) return { result: first, waited: false, stillPending: false }
+  const how = p1.by === 'text' ? 'gradleStillRunning=false と申告したが、理由の文が未完了を示す（決まりに反した申告）' : 'gradleStillRunning=true'
+  log(`${what}: Gradle の終わりを待たずに返した（${how}。ログ: ${p1.logs.join(', ') || '-'}）。Gradle を待つ指示を付けて 1 回だけやり直す`)
+  const second = await run(gradleWaitNote(number, worktree, p1))
+  if (!second) {
+    log(`${what}: Gradle を待つやり直しの段階が結果を返さなかった（段階の失敗として扱う）`)
+    return { result: null, waited: true, stillPending: false, retryFailed: true, first: p1 }
+  }
+  const p2 = pendingOf(second)
+  if (p2) log(`${what}: やり直しでも Gradle の終わりを待たずに返した（ログ: ${p2.logs.join(', ') || '-'}）。もうやり直さない`)
+  return { result: second, waited: true, stillPending: !!p2, first: p1 }
+}
+
+// やり直しでも Gradle を待たずに返した（stillPending）ときの、理由に付ける文（#904）
+function pendingReason(what, r) {
+  const logs = Array.isArray(r?.runningLogs) && r.runningLogs.length ? `（動いていたログ: ${r.runningLogs.join(', ')}）` : ''
+  return `${what}が、Gradle の終わりを待たずに 2 回返した${logs}（やり直しは 1 回まで）。ビルドとテストは確かめられていない`
 }
 
 // worktree が本物か（git worktree list に載っているか）を確かめる手順（#855）。壊れた残りに対して git -C を実行すると、
@@ -181,7 +286,7 @@ const PLAN_REVIEW_SCHEMA = {
   required: ['verdict', 'must', 'undecided'],
 }
 
-const IMPLEMENT_SCHEMA = {
+const IMPLEMENT_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     status: { type: 'string', enum: ['pr_opened', 'blocked', 'already_done'] },
@@ -194,7 +299,7 @@ const IMPLEMENT_SCHEMA = {
     openQuestions: { type: 'array', items: { type: 'string' }, description: 'PR を作ったが、人の確認が要るかもしれない点（PR 本文の「確認してほしいこと」と同じもの）。なければ空' },
   },
   required: ['status', 'pr', 'branch', 'worktree', 'publicApiChanged', 'touchesConcurrency', 'summary', 'openQuestions'],
-}
+})
 
 const CI_SCHEMA = {
   type: 'object',
@@ -238,17 +343,19 @@ const VERDICT_SCHEMA = {
   required: ['confirmed', 'notes'],
 }
 
-const FIX_SCHEMA = {
+const FIX_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     pushed: { type: 'boolean' },
+    // CI の直し（ci-fix）だけが使う。PR と関係のない不安定なテストと判断し、push せずに落ちたジョブを回し直した
+    rerun: { type: 'boolean' },
     summary: { type: 'string' },
   },
   required: ['pushed', 'summary'],
-}
+})
 
 // main の取り込み（CI の段階の衝突）の結果。取り込むものがなかった・字面で解けない・build が直せない、を分ける（#855）
-const MERGE_MAIN_SCHEMA = {
+const MERGE_MAIN_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     outcome: { type: 'string', enum: ['merged', 'up_to_date', 'conflict', 'build_failed'] },
@@ -256,9 +363,9 @@ const MERGE_MAIN_SCHEMA = {
     summary: { type: 'string' },
   },
   required: ['outcome', 'pushed', 'summary'],
-}
+})
 
-const MERGE_SCHEMA = {
+const MERGE_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     status: { type: 'string', enum: ['merged', 'needs_human'] },
@@ -270,7 +377,7 @@ const MERGE_SCHEMA = {
     logPath: { type: ['string', 'null'], description: 'worktree の外に残したログの置き場所' },
   },
   required: ['status', 'reason', 'failedStep', 'gameTestFailedOnly', 'gameTestSeconds', 'maxTicksBehind', 'logPath'],
-}
+})
 
 const CLEANUP_SCHEMA = {
   type: 'object',
@@ -436,9 +543,35 @@ function askHuman(kind, number, question) {
   )
 }
 
-function implement(info, approvedPlan, guidance, advice) {
+// 実装の段階。Gradle を待たずに返したら（gradleStillRunning）、待つ指示を付けて 1 回だけ呼び直す（#904。worktree はそのまま続けて使う）。
+// already_done（着手の前に閉じていた）と blocked（人の判断が要る）は、ビルドの結果に関係なく止まるので、待つやり直しをしない
+async function implement(info, approvedPlan, guidance, advice) {
+  const { result, stillPending } = await withGradleWait(
+    `Issue #${info.number} の実装`, info.number, null,
+    note => implementOnce(info, approvedPlan, guidance, advice, note),
+    r => r && r.status !== 'already_done' && r.status !== 'blocked' ? gradlePending(r, r.summary, false) : null,
+  )
+  // やり直しでも待たずに返したら、ビルドを確かめていない PR を CI に進めない。
+  // status=gradle_pending（このスクリプトの中だけのもの）で返し、呼ぶ側が人に上げる（pr はそのまま残す）
+  if (result && stillPending) {
+    return { ...result, status: 'gradle_pending', summary: `${pendingReason('実装の段階', result)}。最後の報告: ${result.summary}${result.pr ? `（PR #${result.pr} は作られている）` : ''}` }
+  }
+  return result
+}
+
+// Gradle の終わりを待つやり直しでも待たずに返した段階を、人に上げる（#904）。PR があれば PR に、なければ Issue に聞く。
+// もう直す機会がないので、確かめた結果を添えて聞く
+async function escalateUnverified(info, pr, reason, context) {
+  const question = `自動では、ビルドとテストの結果を確かめられなかった（Gradle の終わりを待たずに返した）。どう進めるか判断してほしい（このまま続ける、やり直す、PR を閉じる など）:\n- ${reason}\n- ログ: リポジトリのルートの \`.worktrees/.logs/issue-${info.number}/\``
+  const e = await escalate(pr ? 'pr' : 'issue', pr ?? info.number, question, context, false)
+  return { issue: info.number, status: 'needs_human', pr: pr ?? null, reason, question: e.question }
+}
+
+function implementOnce(info, approvedPlan, guidance, advice, waitNote) {
   return agent(
-    `${REPO} の Issue #${info.number}「${info.title}」を実装して PR を作る。手順は \`.claude/skills/work-issue/SKILL.md\` の 1〜4 に従う。ただし作業場所は、ユーザーのチェックアウトとは別の worktree にする:
+    `${REPO} の Issue #${info.number}「${info.title}」を実装して PR を作る。${waitNote ? `
+${waitNote}
+` : ''}手順は \`.claude/skills/work-issue/SKILL.md\` の 1〜4 に従う。ただし作業場所は、ユーザーのチェックアウトとは別の worktree にする:
 
 1. リポジトリのルートで \`git fetch origin\` し、\`git worktree add .worktrees/issue-${info.number} -b issue-${info.number}-<短い英語名> origin/main\` を実行する（\`.worktrees/issue-${info.number}\` がもうあれば、それを続けて使う）。${worktreeCheck(info.number)}
 2. 以降の編集・ビルド・テスト・コミット・push はすべてその worktree の中で行う（絶対パスで操作する）。\`git stash\` は使わない。
@@ -446,14 +579,14 @@ function implement(info, approvedPlan, guidance, advice) {
 4. PR を \`gh pr create\` で作る（1つの Issue を複数の PR に分けるときは、AGENTS.md の手順で Stacked PRs にする）。本文の「概要」に、実装中に決めた細かい設計（設計メモ）を書く。マージはしない。
 5. 仮素材（テクスチャ・モデル・GUI 画像）を追加したら、#250 の「仮素材の一覧」に追記する。
 
-${gradleRules(info.number, 'implement')}
+${gradleRules(info.number, waitNote ? 'implement-wait' : 'implement')}
 
 着手する前に \`gh issue view ${info.number} --json state,closedByPullRequestsReferences\` で Issue の状態を取り直す。もう閉じていたら（同じ実行の別の PR が一緒に閉じた、など）、worktree・ブランチ・PR を作らず、コメントもせずに status=already_done で終え、summary に閉じた PR を書く。
 
 未決の \`decision\` に左右される論点や、AGENTS.md で人に聞くと決めた4つ（ABI・保存形式・公開 API・ゲームバランスの最終値）に当たったら、実装を止めて status=blocked で終える。summary に論点・選択肢・推奨を書く（Issue には質問をコメントしない。このスクリプトが確かめてから聞く）。
 PR を作ったうえで、人に確かめてほしい点が残る（PR 本文に「確認してほしいこと」を書いた）なら、論点・選択肢・推奨を1件ずつ openQuestions に入れる。なければ空にする（マージの前に、このスクリプトが確かめる）。
 publicApiChanged には、\`public\` な宣言（特に \`pro.ikili.kibicomputers.api\` 以下）を追加・変更したかを入れる。touchesConcurrency には、スレッド・ロック・非同期の完了待ちなど、並行して動く処理の振る舞いを変えたかを入れる。${approvedPlan ? `\n\n承認済みのプラン（これに従う。従えない点があれば PR に理由を書く）:\n${approvedPlan}` : ''}${guidance ? `\n\n前に止まった論点について、人に聞く前の確かめで示された進め方（これに従う）:\n${guidance}` : ''}${advice ? `\n\n着手前の設計の助言（別のモデル。鵜呑みにせず、コードと突き合わせて使う）:\n${advice}` : ''}`,
-    { label: `implement:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
+    { label: `${waitNote ? 'implement-wait' : 'implement'}:#${info.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, ...M.implement },
   )
 }
 
@@ -472,7 +605,7 @@ async function waitCi(pr, label) {
       `${REPO} の PR #${pr} の CI が終わるまで待ち、結果を返す。コードは変更しない。
 1. 先に \`gh pr view ${pr} --json mergeable,mergeStateStatus\` で main との衝突を確かめる。\`mergeable\` は計算が終わるまで UNKNOWN を返すので、UNKNOWN の間は 30 秒ほどおいて 5 回まで取り直す（前景の \`sleep\` は使えないので、\`gh pr checks ${pr} --watch --interval 30\` を 1 回はさむなどで間を空ける）。CONFLICTING なら、GitHub は衝突している PR の CI を動かさないので、待たずに passed=false・failingChecks=[]・mergeable=CONFLICTING・noChecks=true で返す。
 2. \`gh pr checks ${pr} --watch --interval 30\` で待つ（10分を超えそうならもう一度実行する）。pending・queued・in_progress のチェックが残っている間は返さない。チェックが 1 つも出ないまま（「no checks reported」など）${NO_CHECKS_MINUTES} 分ほどたったら、待つのをやめ、もう一度 \`mergeable\` を取って、passed=false・failingChecks=[]・noChecks=true で返す。
-3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。
+3. 終わったら \`gh pr checks ${pr} --json name,state,bucket\` で全部のチェックの結果を確かめ、passed は「すべて pass か skipping」のときだけ true にする。failingChecks に入れるのは、終わって bucket が fail・cancel になったチェックだけ（終わっていないものは入れず、終わるまで待つ）。失敗したら failingChecks に落ちたチェックの名前を入れ、\`gh run view <run-id> --log-failed\` の末尾から原因が分かる部分を抜き出す。failureLog の先頭には、落ちた run の ID と試行の番号（\`gh run view <run-id> --json attempt\`）を書く（CI は、落ちた run に artifact \`test-reports-attempt-<試行の番号>\` としてテスト結果の XML と GameTest のログを残す）。
 mergeable には、最後に取った \`mergeable\` の値を入れる。`,
       { label: attempt ? `${label}~${attempt}` : label, phase: 'CI', schema: CI_SCHEMA, ...M.ciWait },
     )
@@ -489,17 +622,31 @@ mergeable には、最後に取った \`mergeable\` の値を入れる。`,
 }
 
 // CI の段階で main と衝突していたら、worktree に main を取り込む（#855）。字面で解けないものは取り込まずに返す
-function mergeMain(info, impl, n) {
+// Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。やり直しでも待たずに返したら、取り込みの失敗（build_failed・push していない）として返す
+async function mergeMain(info, impl, n) {
+  const { result, stillPending } = await withGradleWait(
+    `PR #${impl.pr} の main の取り込み（${n}）`, info.number, impl.worktree,
+    note => mergeMainOnce(info, impl, n, note),
+    r => gradlePending(r, r?.summary, r?.outcome === 'build_failed'),
+  )
+  if (result && stillPending) {
+    return { ...result, outcome: 'build_failed', pushed: false, summary: `${pendingReason('main の取り込みの段階', result)}。最後の報告: ${result.summary}` }
+  }
+  return result
+}
+
+function mergeMainOnce(info, impl, n, waitNote) {
   return agent(
-    `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）が main と衝突していて、CI が動かない。worktree で main を取り込む。
+    `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）が main と衝突していて、CI が動かない。worktree で main を取り込む。${waitNote ? `
+${waitNote}` : ''}
 返す outcome は次のどれか1つ（pushed は outcome=merged のときだけ true）。
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` する（rebase と force push はしない）。
    - Already up to date（取り込むものがない。衝突の読み違いや、GitHub の \`mergeable\` が古い値だった、ほかの段階がもう取り込んでいた、など）なら、何もせず outcome=up_to_date・pushed=false で返す。ローカルにまだ push していないコミットがあれば push してから返す。
 2. 衝突が字面の解消で済む（両方の変更を残せば済む、など）なら解いてコミットする。ロジックの判断が要るなら \`git merge --abort\` で戻し、push せず outcome=conflict・pushed=false で、summary に衝突したファイルと、判断が要る理由を書く。
 3. 取り込んだ結果で \`./gradlew build\` を通す（GameTest はマージの段階でもう一度回るので、ここでは回さない）。build が落ちたら、取り込みで壊れた分を直す。直せなければ push せず outcome=build_failed・pushed=false で、summary に理由を書く。
 4. 通ったら push して outcome=merged・pushed=true で返す。
-${gradleRules(info.number, `conflict${n}`)}`,
-    { label: `conflict:${impl.pr}#${n}`, phase: 'CI', schema: MERGE_MAIN_SCHEMA, ...M.fixFirst },
+${gradleRules(info.number, `conflict${n}${waitNote ? '-wait' : ''}`)}`,
+    { label: `conflict${waitNote ? '-wait' : ''}:${impl.pr}#${n}`, phase: 'CI', schema: MERGE_MAIN_SCHEMA, ...M.fixFirst },
   )
 }
 
@@ -535,15 +682,35 @@ async function untilGreen(info, impl, tag) {
   let ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}`, conflictState)
   for (let i = 1; ci && !ci.passed && ci.mergeable !== 'CONFLICTING' && !ci.noChecksOnly && i <= MAX_CI_FIXES; i++) {
     log(`PR #${impl.pr}: CI 失敗（${ci.failingChecks.join(', ')}）。修正 ${i}/${MAX_CI_FIXES}`)
-    const fixed = await agent(
-      `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
-${gradleRules(info.number, `ci-fix${i}`)}
-失敗したチェック: ${ci.failingChecks.join(', ')}
+    const failing = ci.failingChecks.join(', ')
+    const failureLog = ci.failureLog
+    const { result: fixed, stillPending } = await withGradleWait(
+      `PR #${impl.pr} の CI の修正（${i}）`, info.number, impl.worktree,
+      note => agent(
+        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。原因を調べ、PR の変更が原因なら worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する（不安定なテストのときの扱いは下に書く）。${note ? `
+${note}` : ''}
+${gradleRules(info.number, `ci-fix${i}${note ? '-wait' : ''}`)}
+失敗したチェック: ${failing}
+まず、落ちた run の artifact \`test-reports-attempt-<試行の番号>\`（テスト結果の XML と GameTest のログ。run の ID と試行の番号はログ抜粋の先頭にある）を、worktree の外に取る: \`gh run download <run-id> -n test-reports-attempt-<n> -D <ルート>/.worktrees/.logs/issue-${info.number}/ci-reports-<run-id>-<n>\`（中のパスは手元のビルド出力と同じなので、worktree の中に展開しない）。artifact が無いとき（コンパイルで落ちた、upload の段まで進まなかったなど）は、ログ抜粋と \`gh run view <run-id> --log-failed\` から原因を探す。そのうえで、次のどれかで返す。
+- PR の変更が原因なら、直して push し、pushed=true で返す。
+- PR の変更と関係のない不安定なテストと判断したとき（PR が触っていない所のテストで、手元で繰り返しても再現しない、main でも同じテストが落ちたことがある、など）は、コードを直さない。落ちたテストの \`<testcase>\` の抜粋（\`<failure>\` と関係する system-out。XML の全文は GitHub のコメントの上限 65,536 文字を超えることがあるので貼らない）と run の URL を添えて新しい Issue を作り（同じテストの Issue がもうあれば、そこにコメントする）、AGENTS.md の手順で適切な Epic のサブ Issue にする。PR にその Issue の番号をコメントしてから、\`gh run rerun <run-id> --failed\` で落ちたジョブを回し直し、\`gh run view <run-id> --json status\` で queued か in_progress になったのを確かめて、pushed=false・rerun=true で返す（summary に Issue の番号を書く）。
+- 直せず、回し直す理由もないときは、pushed=false・rerun=false で返し、summary に理由を書く。
 ログ抜粋:
-${ci.failureLog}`,
-      { label: `ci-fix:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
+${failureLog}`,
+        { label: `ci-fix${note ? '-wait' : ''}:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
+      ),
+      // 不安定なテストとして回し直した（pushed=false・rerun=true）ときは、コードを変えておらず、ビルドも確かめなくてよい。
+      // gradleStillRunning=true が一緒に返っても待つやり直しはしない（やり直しは手順の最初からなので、不安定なテストの Issue と run の回し直しがもう1回起きる）。
+      // 待つやり直しをするのは、push した（確かめていない変更がある）か、直せず回し直しもしない（理由の文が未完了を示す）ときだけ
+      r => (r?.rerun === true && r?.pushed !== true) ? null : gradlePending(r, r?.summary, r?.pushed === false && r?.rerun !== true),
     )
-    if (!fixed || !fixed.pushed) break
+    if (fixed && stillPending) {
+      // 直しのビルドを確かめていないので、直ったことにして先へ進めない。落ちたまま、理由を添えて返す
+      ci = { ...ci, failingChecks: [...ci.failingChecks, pendingReason(`CI の修正（${i}）の段階`, fixed)] }
+      break
+    }
+    // 不安定なテストで回し直したとき（rerun）も、push したときと同じく CI を待ち直す
+    if (!fixed || !(fixed.pushed || fixed.rerun)) break
     ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}#${i}`, conflictState)
   }
   return ci
@@ -620,14 +787,17 @@ function overloaded(m) {
   return (m.maxTicksBehind ?? 0) >= OVERLOAD_TICKS_BEHIND || (m.gameTestSeconds ?? 0) >= OVERLOAD_GAMETEST_SECONDS
 }
 
-function mergePrompt(info, impl, retryNote) {
-  return `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。${retryNote ? `\n${retryNote}` : ''}
+// retryNote は過負荷の回し直し（#855）、waitNote は Gradle を待たずに返した回のやり直し（#904）の指示。
+// ログの名前（段階の名前）は merge・merge-retry に、やり直しなら -wait を付けて見分ける
+function mergePrompt(info, impl, retryNote, waitNote) {
+  const stage = `${retryNote ? 'merge-retry' : 'merge'}${waitNote ? '-wait' : ''}`
+  return `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）をマージする。他の PR のマージとは直列に行っている。${retryNote ? `\n${retryNote}` : ''}${waitNote ? `\n${waitNote}` : ''}
 1. worktree で \`git fetch origin\` し、\`git merge origin/main\` で main を取り込む（rebase と force push はしない）。衝突が字面の解消で済まない（ロジックの判断が要る）なら、マージせず status=needs_human・failedStep=conflict で理由を返す。
 2. 取り込んだ結果で \`./gradlew build\` を通す。通らなければ status=needs_human・failedStep=build。通ったら、両バージョンの \`runGameTestServer\` を通す（\`./gradlew :platform-neoforge-1.21.1:runGameTestServer :platform-forge-1.20.1:runGameTestServer --continue\`。片方が落ちても、もう片方も回す）。落ちたら status=needs_human・failedStep=gametest で返す。**GameTest は自分で回し直さない**（回し直すかどうかは、返した数字を見てこのスクリプトが決める）。
 3. 取り込みでコミットが増えたら push する。push したかどうかによらず、\`gh pr checks ${impl.pr} --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（pending が残っている間はマージしない）。通らなければ status=needs_human・failedStep=ci。
 4. \`gh pr merge ${impl.pr} --squash --delete-branch\` でマージする。「base branch policy prohibits the merge」で断られたら、\`gh pr view ${impl.pr} --json mergeStateStatus,statusCheckRollup\` で理由を確かめ、CI の待ちが理由なら 3 からもう1回やり直す。2回目も断られたら status=needs_human・failedStep=merge で理由を返す。マージできたら status=merged・failedStep=null。
 
-${gradleRules(info.number, retryNote ? 'merge-retry' : 'merge')}
+${gradleRules(info.number, stage)}
 
 返す数字（GameTest まで進んだときは、成功・失敗によらず埋める）:
 - gameTestFailedOnly: build が通り、GameTest のサーバーが起動してテストが落ちた（「N required tests failed」）ときだけ true。サーバーの起動前に落ちたもの（コンパイル、依存の取得、ワールドを消せない、GameTest のロックの待ちの上限）は false。
@@ -640,19 +810,47 @@ async function mergePr(info, impl) {
   await mergeLock.acquire()
   // 回し直す間も mergeLock を持ったままにする（main を動かさないため。ほかのマージは待つ）
   try {
-    const first = await agent(mergePrompt(info, impl, null), { label: `merge:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge })
-    if (!first) return { status: 'needs_human', reason: 'マージの段階が失敗した' }
+    // Gradle を待たずに返した回（#904）は、過負荷の判定より先に見る（終わっていない GameTest の数字には意味がない）
+    const firstRun = await mergeOnce(info, impl, null, 'merge')
+    const first = firstRun.result
+    if (!first) return { status: 'needs_human', reason: firstRun.retryFailed ? 'マージの段階が Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した' : 'マージの段階が失敗した' }
+    if (firstRun.stillPending) return pendingMergeResult(first)
+    const waitPrefix = firstRun.waited ? 'マージの段階が Gradle の終わりを待たずに返したので、1 回だけやり直した。' : ''
     const retry = first.status === 'needs_human' && first.failedStep === 'gametest' && first.gameTestFailedOnly && overloaded(first)
-    if (!retry) return first
+    if (!retry) return waitPrefix ? { ...first, retried: true, reason: `${waitPrefix}${first.status === 'merged' ? '' : `やり直しの理由: ${first.reason ?? '-'}`}` } : first
     const numbers = `GameTest ${first.gameTestSeconds ?? '-'} 秒、最大 ${first.maxTicksBehind ?? '-'} tick 遅れ`
     log(`PR #${impl.pr}: マージの段階で GameTest だけが落ち、過負荷の兆候がある（${numbers}）。1 回だけ回し直す`)
     const note = `前回のマージの段階では、GameTest だけが過負荷の兆候とともに落ちた（${numbers}。理由: ${first.reason ?? '-'}）。過負荷による揺れの疑いがあるので、手順 1 からもう 1 回だけやり直す（GameTest はロックが空くのを待ってから回る）。**今回も落ちたら、回し直さずに status=needs_human で返す。**`
-    const second = await agent(mergePrompt(info, impl, note), { label: `merge-retry:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge })
-    const prefix = `過負荷の兆候（${numbers}）で GameTest が落ちたので、1 回だけ回し直した。1 回目の理由: ${first.reason ?? '-'}`
-    if (!second) return { ...first, reason: `${prefix}。回し直しの段階が失敗した` }
+    const secondRun = await mergeOnce(info, impl, note, 'merge-retry')
+    const second = secondRun.result
+    const prefix = `${waitPrefix}過負荷の兆候（${numbers}）で GameTest が落ちたので、1 回だけ回し直した。1 回目の理由: ${first.reason ?? '-'}`
+    if (!second) return { ...first, reason: `${prefix}。回し直しの段階が失敗した${secondRun.retryFailed ? '（Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した）' : ''}` }
+    if (secondRun.stillPending) return pendingMergeResult(second, prefix)
     return { ...second, retried: true, reason: second.status === 'merged' ? prefix : `${prefix}。回し直しの理由: ${second.reason ?? '-'}` }
   } finally {
     mergeLock.release()
+  }
+}
+
+// マージの段階を 1 回呼ぶ。Gradle を待たずに返したら、待つ指示を付けて 1 回だけ呼び直す（#904）。
+// 理由の文も見るのは、マージせずに build で止まったと返した回（failedStep が build か null）だけ。
+// conflict・ci・merge は Gradle の終わりと関係せず、gametest は「ロックの待ちの上限」「タイムアウト」「サーバーが落ちた」など、
+// Gradle が終わったあとの本物の失敗が「実行中」「終わる前」といった文を含みうるので見ない（gametest の未完了は申告で見分ける）
+function mergeOnce(info, impl, retryNote, stage) {
+  return withGradleWait(
+    `PR #${impl.pr} の${stage === 'merge' ? 'マージ' : 'マージの回し直し'}`, info.number, impl.worktree,
+    note => agent(mergePrompt(info, impl, retryNote, note), { label: `${stage}${note ? '-wait' : ''}:${impl.pr}`, phase: 'Merge', schema: MERGE_SCHEMA, ...M.merge }),
+    r => r && r.status !== 'merged' ? gradlePending(r, r.reason, r.failedStep == null || r.failedStep === 'build') : null,
+  )
+}
+
+// やり直しでも Gradle を待たずに返した（#904）。今までどおり人に上げる（マージはしていない）
+function pendingMergeResult(r, prefix) {
+  return {
+    ...r,
+    status: 'needs_human',
+    failedStep: r.failedStep ?? 'build',
+    reason: `${prefix ? `${prefix}。` : ''}${pendingReason('マージの段階', r)}。最後の理由: ${r.reason ?? '-'}`,
   }
 }
 
@@ -674,7 +872,7 @@ function cleanupWorktree(info, impl) {
     `${REPO} の PR #${impl.pr} はマージ済み。worktree ${impl.worktree} を片付ける。リポジトリのルートで作業する。
 1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分、Monitor などで待つ（前景の \`sleep\` は使えない）:
    - \`${logs}/\` の \`.log\` のうち、\`-latest.log\` で終わらないものすべてに、同じ名前の \`.exit\` がある（Gradle が終わった）。
-   - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match '[\\\\/]\\.worktrees[\\\\/]issue-${info.number}(?![0-9])' }\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
+   - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`${worktreeJavaQuery(info.number)}\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
    - ただし \`.exit\` のない \`.log\` でも、上の java のプロセスがなく、そのログの最終更新から ${STALE_LOG_MINUTES} 分以上たっていれば、終わった（ジョブが殺されて \`.exit\` を書けなかった）とみなす。最終更新との差は \`date +%s\` と \`stat -c %Y <ログ>\` で測る。そうみなしたログの名前は note に書く。
    15 分たっても終わらなければ、消さずに removed=false で、残っているもの（ログの名前・プロセスの ID とコマンドラインの先頭）を note に書いて返す。プロセスは殺さない。\`./gradlew --stop\` は使わない（ほかの worktree のビルドまで止まる）。
 2. 終わっていたら \`git worktree remove --force ${impl.worktree}\` を実行する。
@@ -725,6 +923,7 @@ worktree は消さない（片付けはこのスクリプトが別に行う）�
   for (const f of fixedUnreviewed.filter(f => f.severity === 'must')) {
     reasons.push(`最後のラウンドで直して push したが、レビューし直していない must の指摘: ${f.file}:${f.line ?? '-'} ${f.problem}`)
   }
+  if (r.unverified) reasons.push(`直しを確かめられなかった: ${r.unverified}`)
   if (r.merge && r.merge.status !== 'merged') reasons.push(`マージできなかった: ${r.merge.reason}`)
   const question = `自動ではマージできなかった。どう進めるか判断してほしい（直し方の指示、このままマージ、PR を閉じる など）:\n${reasons.map(x => `- ${x}`).join('\n')}`
   // この段階ではもう直す機会がないので、確かめた結果を添えて聞く
@@ -771,6 +970,9 @@ async function runIssue(info) {
         return { issue: info.number, status: 'needs_human', reason: again.question, question: again.question }
       }
     }
+    if (impl && impl.status === 'gradle_pending') {
+      return escalateUnverified(info, impl.pr ?? null, impl.summary, '実装の段階（Gradle の終わりを待つやり直しのあと）')
+    }
     if (!impl || impl.status !== 'pr_opened' || !impl.pr) {
       return { issue: info.number, status: 'failed', reason: impl?.summary ?? '実装の段階が失敗した', question: null }
     }
@@ -781,10 +983,13 @@ async function runIssue(info) {
       const q = `実装のエージェントが PR に確認事項を残した:\n${listed}`
       const e = await escalate('pr', impl.pr, q, `実装の段階で PR を作ったあと（ブランチ ${impl.branch}）`, true)
       if (!e.guidance) return { issue: info.number, status: 'needs_human', pr: impl.pr, reason: e.question, question: e.question }
-      const applied = await agent(
-        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）に、実装のエージェントが確認事項を残した。人に聞く前の確かめ（別のモデル）が、人を待たずに進められると判断し、次の進め方を示した。これに従う。
+      // push しないのが正しい回もある（コードを変える必要がない）ので、理由の文は見ずに申告だけで見分ける（#904）
+      const { result: applied, stillPending: appliedPending } = await withGradleWait(
+        `PR #${impl.pr} の確認事項の反映`, info.number, impl.worktree,
+        note => agent(
+          `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）に、実装のエージェントが確認事項を残した。人に聞く前の確かめ（別のモデル）が、人を待たずに進められると判断し、次の進め方を示した。これに従う。${note ? `\n${note}` : ''}
 コードを変える必要があれば worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してからコミットして push する。変える必要がなければ push しない。
-${gradleRules(info.number, 'resolve')}
+${gradleRules(info.number, note ? 'resolve-wait' : 'resolve')}
 どちらの場合も、PR 本文の「確認してほしいこと」を、確かめた結果と結論（決めたこととその根拠）に書き換える（\`gh pr edit ${impl.pr} --body-file <ファイル>\`）。
 
 確認事項:
@@ -792,14 +997,20 @@ ${listed}
 
 進め方:
 ${e.guidance}`,
-        { label: `resolve:${impl.pr}`, phase: 'Fix', schema: FIX_SCHEMA, ...M.fixFirst },
+          { label: `${note ? 'resolve-wait' : 'resolve'}:${impl.pr}`, phase: 'Fix', schema: FIX_SCHEMA, ...M.fixFirst },
+        ),
+        r => gradlePending(r, r?.summary, false),
       )
       if (!applied) return { issue: info.number, status: 'failed', pr: impl.pr, reason: '確認事項の反映に失敗した', question: null }
+      if (appliedPending) {
+        return escalateUnverified(info, impl.pr, `${pendingReason('確認事項の反映の段階', applied)}。最後の報告: ${applied.summary}`, `確認事項の反映の段階（ブランチ ${impl.branch}。Gradle の終わりを待つやり直しのあと）`)
+      }
     }
 
     const tag = `#${info.number}`
     let ci = await untilGreen(info, impl, tag)
     const rounds = []
+    let unverified = null
     for (let round = 1; ci && ci.passed && round <= MAX_REVIEW_ROUNDS; round++) {
       const confirmed = await review(info, impl, round)
       // 検証で残った指摘は must・should を問わず直す（should をマージ前に止めるため）
@@ -810,13 +1021,22 @@ ${e.guidance}`,
       if (confirmed.some(f => f.reviewFailed)) break
       if (!toFix.length) break
       log(`PR #${impl.pr}: 指摘 ${toFix.length} 件を修正（${round}/${MAX_REVIEW_ROUNDS}）`)
-      const fixed = await agent(
-        `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）へのレビュー指摘を直す。worktree の中で修正し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
+      const { result: fixed, stillPending: fixPending } = await withGradleWait(
+        `PR #${impl.pr} のレビュー指摘の修正（${round}）`, info.number, impl.worktree,
+        note => agent(
+          `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）へのレビュー指摘を直す。worktree の中で修正し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。${note ? `\n${note}` : ''}
 Issue にし忘れた別の問題は、コードを直す代わりに新しい Issue にして適切な Epic のサブ Issue にし（AGENTS.md の手順）、PR 本文に番号を書く。
-${gradleRules(info.number, `fix${round}`)}
+${gradleRules(info.number, `fix${round}${note ? '-wait' : ''}`)}
 ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.problem}`).join('\n')}`,
-        { label: `fix:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
+          { label: `fix${note ? '-wait' : ''}:${impl.pr}#${round}`, phase: 'Fix', schema: FIX_SCHEMA, ...(round === 1 ? M.fixFirst : M.fixAgain) },
+        ),
+        r => gradlePending(r, r?.summary, r?.pushed === false),
       )
+      if (fixed && fixPending) {
+        // 直しのビルドを確かめていないので、直ったことにせず、マージを止める
+        unverified = pendingReason(`レビュー指摘の修正（${round}）の段階`, fixed)
+        break
+      }
       if (!fixed || !fixed.pushed) break
       entry.fixed = true
       ci = await untilGreen(info, impl, `${tag}-r${round}`)
@@ -824,11 +1044,11 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
 
     // マージの条件は変えない: 最後のラウンドの must は、直して push していてもレビューし直していないので止める
     const { all: lastConfirmed, remaining, fixedUnreviewed } = lastFindings(rounds)
-    const ready = ci && ci.passed && !lastConfirmed.some(f => f.severity === 'must')
+    const ready = ci && ci.passed && !unverified && !lastConfirmed.some(f => f.severity === 'must')
     const merge = MERGE && ready ? await mergePr(info, impl) : null
 
     const result = { impl, ci, rounds, merge }
-    const question = await report(info, { ...result, ready })
+    const question = await report(info, { ...result, ready, unverified })
     return {
       issue: info.number,
       status: merge?.status === 'merged' ? 'merged' : ready ? 'ready' : 'needs_human',

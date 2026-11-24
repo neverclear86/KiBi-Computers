@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
@@ -15,7 +16,11 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
-/** 持ち主の規則（`MachineSaveStore.claim`。回答 A の epoch 方式）のテスト（#81、ADR 0081） */
+/**
+ * 持ち主の規則（`MachineSaveStore.claim`。回答 A の epoch 方式）のテスト（#81、ADR 0081）。
+ * 実スレッドの終わりは壁時計の期限で合否を決めずに待つ（#878）。クラスの [Timeout] は、止まったときの保険（CI のジョブを止めない）で、合否の基準ではない
+ */
+@Timeout(10, unit = TimeUnit.MINUTES)
 class MachineClaimTest {
     @TempDir
     lateinit var dir: Path
@@ -284,25 +289,33 @@ class MachineClaimTest {
             opened += id
             if (opened.size == 1) {
                 entered.countDown()
-                release.await(10, TimeUnit.SECONDS)
+                release.await()
             }
             OwnerRecord.read(path)
         }
         var prefetch: Thread? = null
         fresh.startOwnerPrefetch { prefetch = Thread(it).apply { start() } }
-        assertTrue(entered.await(10, TimeUnit.SECONDS))
-        val first = opened.single()
-        val second = if (first == reading) other else reading
-        // 読んでいる ID と、まだ開いていない ID を引き取る（どちらも owner.bin を書く仕事が列に入る。後者は先読みの前にメインスレッドで読む）
-        assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(first.toString(), 0, 0, at(1)).result)
-        assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(second.toString(), 0, 0, at(1)).result)
-        val writer = Thread { manual.runAll() }.apply { start() }
-        writer.join(300)
-        assertTrue(writer.isAlive, "先読みが読み終えるまで、その owner.bin を置き換えない")
-        release.countDown()
-        writer.join(10_000)
-        prefetch!!.join(10_000)
-        assertFalse(writer.isAlive)
+        val first: UUID
+        val second: UUID
+        var writer: Thread? = null
+        try {
+            entered.await()
+            first = opened.single()
+            second = if (first == reading) other else reading
+            // 読んでいる ID と、まだ開いていない ID を引き取る（どちらも owner.bin を書く仕事が列に入る。後者は先読みの前にメインスレッドで読む）
+            assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(first.toString(), 0, 0, at(1)).result)
+            assertEquals(ClaimResult.TAKEN_OVER, fresh.claim(second.toString(), 0, 0, at(1)).result)
+            val started = Thread { manual.runAll() }.apply { start() }
+            writer = started
+            // 待たされていることを確かめる（負荷が高いほど通りやすい向きなので、短い時間のままでよい）
+            started.join(300)
+            assertTrue(started.isAlive, "先読みが読み終えるまで、その owner.bin を置き換えない")
+        } finally {
+            // 途中で落ちても、止めた先読みのスレッドを放し、書き込み・先読みのスレッドが終わるのを待つ（@TempDir の掃除と重ならないように）
+            release.countDown()
+            writer?.join()
+            prefetch?.join()
+        }
         assertEquals(listOf(first), opened.toList(), "触った ID は先読みが開かない")
         assertFalse(fresh.isUnusable(first))
         assertFalse(fresh.isUnusable(second))
@@ -419,8 +432,8 @@ class MachineClaimTest {
         OwnerRecord.write(dir.resolve(mine.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(1, at(1)))
         OwnerRecord.write(dir.resolve(other.toString()).resolve(OwnerRecord.FILE_NAME), OwnerRecord(5, at(0)))
         val fresh = MachineSaveStore(dir, MachineIdIndex(), prefetchOwners = true)
-        val deadline = System.nanoTime() + 120_000_000_000L
-        while (!fresh.ownerPrefetchDone && System.nanoTime() < deadline) Thread.sleep(5)
+        // 壁時計の期限ではなく、先読みのスレッドの終わりそのものを待つ（#878）
+        fresh.awaitOwnerPrefetch()
         assertEquals(true, fresh.ownerPrefetchDone, "先読みのスレッドが結果を渡す")
         assertEquals(ClaimResult.KEPT, fresh.claim(mine.toString(), 0, 0, at(1)).result)
         assertEquals(ClaimResult.NEW_ID_STALE, fresh.claim(other.toString(), 0, 0, at(1)).result)

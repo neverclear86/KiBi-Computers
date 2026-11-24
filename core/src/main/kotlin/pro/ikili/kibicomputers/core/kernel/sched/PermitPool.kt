@@ -32,6 +32,8 @@ import java.util.concurrent.locks.ReentrantLock
  * 運用の側へは、取り残しの始まり（スタックトレース付きの WARNING 1本）、続いている間の要約（[summaryIntervalTicks] tick ごとの WARNING）、
  * 復旧（全部渡し直せたときの INFO 1本）を出す。復旧した後にまた起きれば、もう一度スタックトレース付きで出す。
  * 呼び手に投げるのは [submit] の直接の道（許可を取ったその場で渡すとき）だけで、そのときは取った許可を返してから投げる（#629）。
+ * [submit] は spawn の巻き戻しの道（CPU が空いていて、spawn がその場で CPU を受け取ったとき）だけが使う。
+ * それ以外（CPU を次へ渡すとき、起こすとき、復元の取り込みなど）は [submitOrStrand] を使い、直接の道でも投げずに取り残しの列へ入れる（#875）。
  */
 internal class PermitPool(
     permits: Int,
@@ -221,16 +223,12 @@ internal class PermitPool(
      * [task] は許可を持って動き、自分で [release] する。[key] は [remove] で外すときの目印。
      * すぐ渡すときにワーカーに渡せずに投げたら（スレッドを作れないとき）、取った許可は返してから、同じ例外を投げ直す（#629）。
      * 並べた仕事を後で渡すときに渡せなかったら、投げずに取り残しの列に入れる（#870）。
-     * [task] は組 [group] の許可を持って動くので、返すときは同じ [group] を [release] に渡す
+     * [task] は組 [group] の許可を持って動くので、返すときは同じ [group] を [release] に渡す。
+     *
+     * 投げるのは、呼び手が巻き戻せるとき（spawn の直接の道。#629）だけのため。ほかの道は [submitOrStrand] を使う（#875）
      */
     fun submit(key: Any, group: FairShareGroup, task: Runnable) {
-        lock.withLockValue {
-            val g = groupLocked(group)
-            if (!tryTakeLocked(g)) {
-                enqueueLocked(Node(task, key, null, g))
-                return
-            }
-        }
+        if (!takeOrEnqueue(key, group, task)) return
         try {
             workers.execute(task)
         } catch (t: Throwable) {
@@ -245,6 +243,28 @@ internal class PermitPool(
         }
         // ワーカーに渡せたので、取り残しがあれば渡し直す
         retryStranded()
+    }
+
+    /**
+     * [submit] と同じだが、すぐ渡すときにワーカーに渡せなくても投げない（#875）。
+     * そのときは、取った許可を持たせたまま [task] を取り残しの列に入れ、[retryStranded]（毎 tick と、次にワーカーへ渡せたとき）で渡し直す。
+     * 呼び手が巻き戻せない道（CPU を次へ渡したとき、起こすときなど。呼び手は CPU のロックやカーネルロックを持っている）で使う。
+     * 失敗した直後には渡し直さない（その場でスレッドの作成を繰り返さない。#870）
+     */
+    fun submitOrStrand(key: Any, group: FairShareGroup, task: Runnable) {
+        if (!takeOrEnqueue(key, group, task)) return
+        if (dispatchGranted(task)) retryStranded()
+    }
+
+    /** 組 [group] の許可が取れたら取って `true`。取れなければ [task] を待ち行列に並べて `false` */
+    private fun takeOrEnqueue(key: Any, group: FairShareGroup, task: Runnable): Boolean = lock.withLockValue {
+        val g = groupLocked(group)
+        if (tryTakeLocked(g)) {
+            true
+        } else {
+            enqueueLocked(Node(task, key, null, g))
+            false
+        }
     }
 
     /** 組 [FairShareGroup.NONE] で [submit] する（テスト用の短い形） */

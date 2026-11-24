@@ -183,25 +183,86 @@ public class MachineConfig private constructor(builder: Builder) {
      */
     public val maxDevices: Int = builder.maxDevices
 
+    /**
+     * 1 台のイベントキューの数の上限（#63、#719。仮: [EventLimits.MAX_QUEUES]）。
+     * 復号の上限（[EventLimits.MAX_QUEUES_CEILING]）を超えない。保存しない（電源を入れたとき・戻したときの設定で決まる）
+     */
+    public val maxEventQueues: Int = builder.maxEventQueues
+
+    /** 1 台で溜めるイベントの見積もりの合計の上限（バイト。#63、#719。仮: [EventLimits.MAX_PENDING_BYTES]） */
+    public val maxPendingEventBytes: Int = builder.maxPendingEventBytes
+
+    /** 1 台で同時に動かせる（期限を待っている）タイマーの数の上限（#64、#719。仮: [TimerLimits.MAX_ARMED_TIMERS]） */
+    public val maxArmedTimers: Int = builder.maxArmedTimers
+
+    /**
+     * 1 台が開いたままにできるホストのファイルの数（#52、#719。仮: [MachineLimits.HOST_FILES_PER_MACHINE]）。
+     * サーバー全体の数は [SchedulerConfig.hostFilesTotal]
+     */
+    public val hostFilesPerMachine: Int = builder.hostFilesPerMachine
+
+    /**
+     * コンソールの TTY の入力の上限（バイト。読める入力＋編集中の行。#58、#719。仮: [MachineLimits.CONSOLE_INPUT_BYTES]）。
+     * TTY を作るとき（冷えた起動）に決まり、戻した TTY は保存したときの大きさのまま
+     */
+    public val consoleInputBytes: Int = builder.consoleInputBytes
+
+    /** コンソールの TTY の出力のバッファ（バイト。#58、#719。仮: [MachineLimits.CONSOLE_OUTPUT_BYTES]）。決まるときは [consoleInputBytes] と同じ */
+    public val consoleOutputBytes: Int = builder.consoleOutputBytes
+
+    /** 配っていないコンソール出力の上限（バイト。#719。仮: [MachineLimits.MAX_PENDING_CONSOLE_BYTES]） */
+    public val maxPendingConsoleBytes: Long = builder.maxPendingConsoleBytes
+
+    /** 明示したスライス（[Builder.fuelSlice]）。[toBuilder] で写すため */
+    private val explicitFuelSlice: Long? = builder.fuelSlice
+
+    /** 明示した 1 プロセスの上限（[Builder.maxProcessMemoryBytes]）。[toBuilder] で写すため */
+    private val explicitMaxProcessMemoryBytes: Long? = builder.maxProcessMemoryBytes
+
     /** [fuelSlice] の今の値（接続層の負荷試験が結果に書く。#740） */
     public val fuelSliceValue: Long get() = fuelSlice
+
+    /**
+     * この設定の値をすべて写した [Builder]（#719）。写しの口はここ1つにする（フィールドを足したら、ここに1行足す）。
+     * 明示していない値（スライス、1 プロセスの RAM）は明示していないまま写すので、燃料や RAM を変えると、それに合わせて決まり直す
+     */
+    public fun toBuilder(): Builder {
+        val b = Builder()
+        b.fuelPerTick = fuelPerTick
+        b.fuelSlice = explicitFuelSlice
+        b.maxProcesses = maxProcesses
+        b.maxBlockingProcesses = maxBlockingProcesses
+        b.maxHostCallsPerTick = maxHostCallsPerTick
+        b.memoryBytes = memoryBytes
+        b.maxProcessMemoryBytes = explicitMaxProcessMemoryBytes
+        b.maxDevices = maxDevices
+        b.maxEventQueues = maxEventQueues
+        b.maxPendingEventBytes = maxPendingEventBytes
+        b.maxArmedTimers = maxArmedTimers
+        b.hostFilesPerMachine = hostFilesPerMachine
+        b.consoleInputBytes = consoleInputBytes
+        b.consoleOutputBytes = consoleOutputBytes
+        b.maxPendingConsoleBytes = maxPendingConsoleBytes
+        return b
+    }
 
     /**
      * スライスだけを [value] に変えた設定（測定・テスト用。#740）。負荷試験が、スライスを `fuelPerTick` にして（1 tick に1回渡す）
      * #47 の前と受け渡しの回数を比べるのに使う。[fuelPerTick] を超えた分は切り詰める。ゲームの設定の口ではない（スライスの値は #251）
      */
-    public fun withFuelSlice(value: Long): MachineConfig {
-        val b = Builder()
-        b.fuelPerTick = fuelPerTick
-        b.fuelSlice(value)
-        b.maxProcesses = maxProcesses
-        b.maxBlockingProcesses = maxBlockingProcesses
-        b.maxHostCallsPerTick = maxHostCallsPerTick
-        b.memoryBytes = memoryBytes
-        b.maxProcessMemoryBytes = maxProcessMemoryBytes
-        b.maxDevices = maxDevices
-        return b.build()
-    }
+    public fun withFuelSlice(value: Long): MachineConfig = toBuilder().fuelSlice(value).build()
+
+    /** 値がすべて同じか（テスト用。[toBuilder] が全部を写すことを確かめる） */
+    internal fun sameValues(other: MachineConfig): Boolean =
+        fuelPerTick == other.fuelPerTick && fuelSlice == other.fuelSlice && explicitFuelSlice == other.explicitFuelSlice &&
+            maxProcesses == other.maxProcesses && maxBlockingProcesses == other.maxBlockingProcesses &&
+            maxHostCallsPerTick == other.maxHostCallsPerTick && memoryBytes == other.memoryBytes &&
+            maxProcessMemoryBytes == other.maxProcessMemoryBytes &&
+            explicitMaxProcessMemoryBytes == other.explicitMaxProcessMemoryBytes &&
+            maxDevices == other.maxDevices && maxEventQueues == other.maxEventQueues &&
+            maxPendingEventBytes == other.maxPendingEventBytes && maxArmedTimers == other.maxArmedTimers &&
+            hostFilesPerMachine == other.hostFilesPerMachine && consoleInputBytes == other.consoleInputBytes &&
+            consoleOutputBytes == other.consoleOutputBytes && maxPendingConsoleBytes == other.maxPendingConsoleBytes
 
     /** RAM のページ数 */
     internal val memoryPages: Int get() = pagesOf(memoryBytes)
@@ -219,6 +280,13 @@ public class MachineConfig private constructor(builder: Builder) {
         internal var memoryBytes: Long = 32L * 1024 * 1024
         internal var maxProcessMemoryBytes: Long? = null
         internal var maxDevices: Int = 16
+        internal var maxEventQueues: Int = EventLimits.MAX_QUEUES
+        internal var maxPendingEventBytes: Int = EventLimits.MAX_PENDING_BYTES
+        internal var maxArmedTimers: Int = TimerLimits.MAX_ARMED_TIMERS
+        internal var hostFilesPerMachine: Int = MachineLimits.HOST_FILES_PER_MACHINE
+        internal var consoleInputBytes: Int = MachineLimits.CONSOLE_INPUT_BYTES
+        internal var consoleOutputBytes: Int = MachineLimits.CONSOLE_OUTPUT_BYTES
+        internal var maxPendingConsoleBytes: Long = MachineLimits.MAX_PENDING_CONSOLE_BYTES
 
         /** 1 tick に配る燃料（1 以上） */
         public fun fuelPerTick(value: Long): Builder = apply {
@@ -266,6 +334,48 @@ public class MachineConfig private constructor(builder: Builder) {
         public fun maxDevices(value: Int): Builder = apply {
             require(value >= 1) { "maxDevices は 1 以上" }
             maxDevices = value
+        }
+
+        /** イベントキューの数の上限（1 以上 [EventLimits.MAX_QUEUES_CEILING] 以下） */
+        public fun maxEventQueues(value: Int): Builder = apply {
+            require(value in 1..EventLimits.MAX_QUEUES_CEILING) { "maxEventQueues は 1 以上 ${EventLimits.MAX_QUEUES_CEILING} 以下" }
+            maxEventQueues = value
+        }
+
+        /** 溜めるイベントの見積もりの合計の上限（バイト。1 以上） */
+        public fun maxPendingEventBytes(value: Int): Builder = apply {
+            require(value >= 1) { "maxPendingEventBytes は 1 以上" }
+            maxPendingEventBytes = value
+        }
+
+        /** 同時に動かせるタイマーの数の上限（1 以上） */
+        public fun maxArmedTimers(value: Int): Builder = apply {
+            require(value >= 1) { "maxArmedTimers は 1 以上" }
+            maxArmedTimers = value
+        }
+
+        /** 開いたままにできるホストのファイルの数（1 以上） */
+        public fun hostFilesPerMachine(value: Int): Builder = apply {
+            require(value >= 1) { "hostFilesPerMachine は 1 以上" }
+            hostFilesPerMachine = value
+        }
+
+        /** コンソールの TTY の入力の上限（バイト。2 以上 `Tty.MAX_SNAPSHOT_CAPACITY` 以下） */
+        public fun consoleInputBytes(value: Int): Builder = apply {
+            require(value in 2..Tty.MAX_SNAPSHOT_CAPACITY) { "consoleInputBytes は 2 以上 ${Tty.MAX_SNAPSHOT_CAPACITY} 以下" }
+            consoleInputBytes = value
+        }
+
+        /** コンソールの TTY の出力のバッファ（バイト。2 以上 `Tty.MAX_SNAPSHOT_CAPACITY` 以下） */
+        public fun consoleOutputBytes(value: Int): Builder = apply {
+            require(value in 2..Tty.MAX_SNAPSHOT_CAPACITY) { "consoleOutputBytes は 2 以上 ${Tty.MAX_SNAPSHOT_CAPACITY} 以下" }
+            consoleOutputBytes = value
+        }
+
+        /** 配っていないコンソール出力の上限（バイト。1 以上） */
+        public fun maxPendingConsoleBytes(value: Long): Builder = apply {
+            require(value >= 1) { "maxPendingConsoleBytes は 1 以上" }
+            maxPendingConsoleBytes = value
         }
 
         /** 設定を作る。 */
@@ -329,7 +439,7 @@ public class Machine private constructor(
     }
 
     /** カーネルの状態（保存の対象） */
-    internal val kernel = KernelState(config.maxProcesses).also {
+    internal val kernel = KernelState(config.maxProcesses, config.maxEventQueues, config.maxPendingEventBytes).also {
         it.clocks.start(environment.clock, scheduler.now)
     }
 
@@ -373,7 +483,7 @@ public class Machine private constructor(
     }
 
     /** このマシンが開いたままにできるホストのファイルの枠（ディスク。#52） */
-    internal val hostFiles = HostFileBudget()
+    internal val hostFiles = HostFileBudget(config.hostFilesPerMachine, scheduler.config.hostFilesTotal)
 
     /** [vfs] の後で行う知らせを、起動用のスレッドに積んだか（積むのは1つだけ） */
     private val vfsDrainScheduled = AtomicBoolean()
@@ -443,12 +553,15 @@ public class Machine private constructor(
     internal val cpu = MachineCpu(
         // CPU を渡したら、許可の待ち行列に並べる。許可を受け取ってからワーカーに渡す（#350）
         // 並べたときの組を控え、step の終わりにその組へ返す（#738。並んでいる間に持ち主が変わっても数を合わせる）
-        onThreadlessGranted = { rt ->
+        // spawn の直接の道（strict）だけ、ワーカーに渡せなければ投げる（巻き戻す。#629）。ほかの道は投げずに取り残しの列へ（#875。
+        // 呼び手は CPU のロック・カーネルロックを持っていて、巻き戻せない。CPU は持ち主のまま、取り残した step が動いたときに返る）
+        onThreadlessGranted = { rt, strict ->
             val group = fairShareGroup
-            scheduler.permits.submit(rt, group) {
+            val task = Runnable {
                 rt.permitGroup = group
                 runner.runStep(rt)
             }
+            if (strict) scheduler.permits.submit(rt, group, task) else scheduler.permits.submitOrStrand(rt, group, task)
         },
         onThreadlessRevoked = { rt -> scheduler.permits.remove(rt) },
     )
@@ -1651,7 +1764,9 @@ public class Machine private constructor(
                     thread.start()
                 } else {
                     enqueued = true
-                    cpu.enqueueThreadless(r)
+                    // strict: その場でワーカーに渡せなければ投げ、下の巻き戻しで CPU と許可を戻す（#629）。
+                    // CPU が埋まっていて並んだだけなら、後で渡すときは投げない（#875）
+                    cpu.enqueueThreadless(r, strict = true)
                 }
             } catch (t: Throwable) {
                 rollbackSpawnLocked(t, reserved, prevInitPid, process, handleRetained, handleFd, handlePlace, rt, thread, enqueued)
@@ -2167,7 +2282,7 @@ public class Machine private constructor(
 
     /** コンソールの `Tty` を、なければ作る（カーネルが参照を1つ持ち、閉じない） */
     internal fun ensureConsoleLocked() {
-        if (kernel.consoleTtyId == 0) kernel.consoleTtyId = kernel.objects.add(Tty(MachineLimits.CONSOLE_INPUT_BYTES, MachineLimits.CONSOLE_OUTPUT_BYTES))
+        if (kernel.consoleTtyId == 0) kernel.consoleTtyId = kernel.objects.add(Tty(config.consoleInputBytes, config.consoleOutputBytes))
     }
 
     /** コンソールの `Tty`（なければ作る） */
@@ -2408,8 +2523,8 @@ public class Machine private constructor(
         if (interval < 0 || (interval in 1 until TimerLimits.MIN_INTERVAL_NANOS)) {
             fsError(Errno.INVAL, "繰り返しの間隔は 0 か ${TimerLimits.MIN_INTERVAL_NANOS} ns 以上（$interval）")
         }
-        if (!timers.isScheduled(timer.id) && timers.scheduledCount >= TimerLimits.MAX_ARMED_TIMERS) {
-            throw ResourceLimitException("動いているタイマーの数が上限（${TimerLimits.MAX_ARMED_TIMERS}）")
+        if (!timers.isScheduled(timer.id) && timers.scheduledCount >= config.maxArmedTimers) {
+            throw ResourceLimitException("動いているタイマーの数が上限（${config.maxArmedTimers}）")
         }
         timer.arm(deadline, interval)
         scheduleTimerLocked(timer)
@@ -3374,7 +3489,7 @@ public class Machine private constructor(
             rebootRequested = false
             return
         }
-        val step = scheduler.options.rebootBackoff.next(rebootDebtTicks, pendingRebootRanTicks.coerceAtLeast(0))
+        val step = (scheduler.options.rebootBackoff ?: scheduler.config.rebootBackoff).next(rebootDebtTicks, pendingRebootRanTicks.coerceAtLeast(0))
         rebootDebtTicks = step.debtTicks
         pendingRebootRanTicks = -1L
         initStartTick = -1L
@@ -3602,7 +3717,7 @@ public class Machine private constructor(
     /**
      * コンソールへ出力する（次の `tick()` 以降に [MachineHost.onConsoleOutput] に渡す。混んでいれば後の tick。#356）。どのスレッドから呼んでもよい。
      * TTY を通らないカーネルのメッセージ用（TTY の桁の数えには入らない）。TTY の出力とそろえて、LF を CR LF にする（#60）。
-     * 配っていない分（CR LF にした後のバイト数）が [MachineLimits.MAX_PENDING_CONSOLE_BYTES] を超えるなら、超える分を捨てて `false`。
+     * 配っていない分（CR LF にした後のバイト数）が [MachineConfig.maxPendingConsoleBytes] を超えるなら、超える分を捨てて `false`。
      * 書き手を待たせる流量の制御は、ABI 層が TTY（fd 1・2）で行う（#58・#60）。
      * TTY の出力との前後を保つため、カーネルロックの中で、その時点の TTY の出力の位置を目印に付けて積む（#381）
      */
@@ -3618,7 +3733,7 @@ public class Machine private constructor(
         var accepted: Int
         while (true) {
             val pending = pendingConsoleBytes.get()
-            accepted = (MachineLimits.MAX_PENDING_CONSOLE_BYTES - pending).coerceIn(0, length.toLong()).toInt()
+            accepted = (config.maxPendingConsoleBytes - pending).coerceIn(0, length.toLong()).toInt()
             if (accepted == 0 || pendingConsoleBytes.compareAndSet(pending, pending + accepted)) break
         }
         if (accepted < length) droppedConsoleBytes.addAndGet((length - accepted).toLong())
