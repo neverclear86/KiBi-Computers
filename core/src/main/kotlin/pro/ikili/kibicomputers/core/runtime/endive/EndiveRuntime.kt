@@ -198,7 +198,7 @@ public class EndiveRuntime internal constructor(
         val describe = { functions: Set<Int> -> describeFunctions(functions, functionNames(module)) }
         if (simd == null) {
             FALLBACK_LOG.report(CompileFallbackLog.Reason.V128_SIGNATURE) {
-                "${label()} の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
+                "${label()} の型（関数の型、struct のフィールド、array の要素）に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
             return null
         }
@@ -462,13 +462,27 @@ public class EndiveRuntime internal constructor(
         private const val LARGE_FUNCTION_INSTRUCTIONS: Int = 4096
 
         /**
-         * SIMD（v128）を使う関数の番号（import を含めた番号）。関数の型（引数・戻り値）に v128 があるなら `null`（#424）。
+         * SIMD（v128）を使う関数の番号（import を含めた番号）。関数の型（引数・戻り値）か、struct のフィールド・array の要素
+         * （GC の提案）に v128 があるなら `null`（#424、#891）。
          *
          * SIMD の命令（`0xFD` の接頭辞）、v128 の局所変数、v128 のグローバルの読み書きのどれかを含む関数を選ぶ。
-         * v128 の値は、これらと、型に v128 がある関数の呼び出し・ブロックからしか生まれないので、残りの関数は v128 を扱わない。
+         * v128 の値は、これらと、型に v128 がある関数の呼び出し・ブロック、v128 のフィールド・要素の読み出し（`struct.get`・`array.get`）
+         * からしか生まれない。後の 2 つは型で断るので、残りの関数は v128 を扱わない。
          */
         internal fun simdFunctions(module: EndiveModule): Set<Int>? {
-            if (module.typeSection().types().any { t -> t.params().any(::isV128) || t.returns().any(::isV128) }) return null
+            val types = module.typeSection()
+            for (i in 0 until types.subTypeCount()) {
+                // 型の番号は rec グループを平らにした番号。struct・array の型は funcType() が null（#891）
+                val comp = types.getSubType(i).compType()
+                val func = comp.funcType()
+                val v128 = when {
+                    func != null -> func.params().any(::isV128) || func.returns().any(::isV128)
+                    comp.structType() != null -> comp.structType().fieldTypes().any { isV128(it.storageType().valType()) }
+                    comp.arrayType() != null -> isV128(comp.arrayType().fieldType().storageType().valType())
+                    else -> false
+                }
+                if (v128) return null
+            }
             val imports = module.importSection()
             val v128Globals = HashSet<Int>()
             var globalIndex = 0
@@ -498,7 +512,7 @@ public class EndiveRuntime internal constructor(
             return result
         }
 
-        private fun isV128(type: ValType): Boolean = type == ValType.V128
+        private fun isV128(type: ValType?): Boolean = type == ValType.V128
 
         /**
          * 定数式で GC のオブジェクト（struct・array）を作る命令（`struct.new` など）を初期値に持つグローバル・要素セグメントがあれば、
@@ -1299,8 +1313,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
             globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
         }
         // GC のオブジェクト（struct・array）を初期値に持つグローバル・要素セグメントは、不変でも写せない。オブジェクトの中身（可変のフィールド）は
-        // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。今は、GC の型を持つモジュールは
-        // 製品の経路ではコンパイル（`simdFunctions`）で落ちるので、ここに届かない（#891）。コンパイルしないランタイムでは届く）
+        // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。製品の経路（コンパイルあり）でも届く。#891）
         EndiveRuntime.gcObjectInitializer(mod)?.let { throw WasmStateException("GC のオブジェクトを初期値に持つ$it") }
         // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1

@@ -110,8 +110,25 @@ class ForeignFuncRefTest {
         )
     }
 
-    /** GC の型を持つモジュールを、読み込みの経路（#891 で別の理由で断られうる）を通さずに、判定だけにかける */
+    /** GC の型を持つモジュールを、判定だけにかける（読み込みの経路で断ることは、struct.new の形で確かめる） */
     private fun gcDetect(wat: String): String? = EndiveRuntime.foreignFuncRefInitializer(Parser.parse(WitTool.wat(wat)))
+
+    @ParameterizedTest
+    @ValueSource(strings = ["plain", "shared"])
+    fun `GCのオブジェクトの中にimportしたfuncrefのグローバルを入れる定数式を、製品の読み込みの経路で断る`(form: String) {
+        // struct・array の型を持つモジュールも、製品の EndiveRuntime（コンパイルあり）の読み込みまで届く（#891）
+        assertRejected(
+            form,
+            """
+            (module
+              (type ${'$'}ft (func (result i32)))
+              (type ${'$'}S (struct (field (ref null ${'$'}ft))))
+              (import "env" "fr" (global ${'$'}fr (ref null ${'$'}ft)))
+              (global (ref ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))
+            """,
+            "グローバル 0",
+        )
+    }
 
     @org.junit.jupiter.api.Test
     fun `GCのオブジェクトの中に、importしたfuncrefのグローバルを入れる定数式を断る`() {
