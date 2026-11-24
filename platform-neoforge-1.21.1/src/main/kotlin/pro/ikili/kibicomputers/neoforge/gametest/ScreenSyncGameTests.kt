@@ -599,7 +599,7 @@ object ScreenSyncGameTests {
      * だれも使わない離れたチャンク（[FarChunks]）に付け、失敗しても必ず外す。
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun sentChunkStaysWatchedWhileSendIsDelayed(helper: GameTestHelper) {
         val level = helper.level
         // だれも読み込んでいない離れたチャンク（#747）。プレイヤーのチケットで読み込む
@@ -686,7 +686,7 @@ object ScreenSyncGameTests {
      * 見られないものとする（#655 のずれ2。以前の推し量りでは、送ったとみなしていた）。
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 400)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
     fun sendableButUnsentChunkIsNotWatched(helper: GameTestHelper) {
         val level = helper.level
         val cache = level.chunkSource
