@@ -134,12 +134,14 @@ internal object SaveCleanups {
         val s = server ?: return null
         // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
         if (running?.let { !it.finished || it.settling } == true || store == null) return null
-        val probe = ChunkReferenceProbe(s)
-        if (!probe.regionNamesTrusted) {
+        // 理由の一覧は掃除1回につき1回だけ調べ、問いの判定とログの両方に同じ結果を使う
+        val untrusted = ChunkReferenceProbe.untrustedRegionStorage(s)
+        val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty())
+        if (untrusted.isNotEmpty()) {
             // 掃除1回につき1行（問いごとには出さない）
             LOGGER.info(
                 "The chunk storage is modified or substituted ({}); the computer save cleanup keeps directories at positions without a region file",
-                ChunkReferenceProbe.untrustedRegionStorage(s).joinToString(),
+                untrusted.joinToString(),
             )
         }
         val cleanup = SaveCleanup(store, modules, probe, settings, dryRun, force)
