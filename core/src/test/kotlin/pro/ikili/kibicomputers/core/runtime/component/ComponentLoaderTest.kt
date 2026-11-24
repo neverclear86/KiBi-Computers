@@ -846,7 +846,7 @@ class ComponentLoaderTest {
         val e = estimateOf(small)
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
-        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 175 万。実際の検証は CPU 0.5 秒ほど）
+        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 172 万。実際の検証は CPU 0.5 秒ほど）
         val large = composedComponent(k = 20, n = 20)
         val l = estimateOf(large)
         assertTrue(l.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${l.checkCount} × ${l.maxTypeWeight} = ${l.cost}（写し直し ${l.remapCost}）" }
@@ -973,6 +973,122 @@ class ComponentLoaderTest {
                 assertMessage(e, "検証が重すぎる")
             }
         }
+    }
+
+    /** フィールド [fields] 個の record を [exports] 回 export するコンポーネント `$c` */
+    private fun recordExporter(fields: Int, exports: Int): String {
+        val record = (0 until fields).joinToString(" ") { """(field "f$it" u32)""" }
+        val ex = (0 until exports).joinToString(" ") { """(export "a$it" (type ${'$'}r))""" }
+        return "(component ${'$'}c (type ${'$'}r (record $record)) $ex)"
+    }
+
+    /** `$src` のコンポーネントをインスタンス化して、そのインスタンスを export するコンポーネント `$d` を [m] 回インスタンス化する */
+    private fun instantiateViaOuter(m: Int): String {
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        return """
+            (component ${'$'}d
+              (alias outer 1 ${'$'}src (component ${'$'}cc))
+              (instance ${'$'}x (instantiate ${'$'}cc))
+              (export "x" (instance ${'$'}x))
+            )
+            $instances
+        """
+    }
+
+    @Test
+    fun `export し直したコンポーネントやaliasで引いたコンポーネントのインスタンスも、exportの写し直しを数える`() {
+        // #751 のレビュー: export し直したコンポーネントや、インスタンスの export の alias で引いたコンポーネントを
+        // インスタンス化したインスタンスの型が引けず、その export の写し直しを小さく数えていた（検証に 8 秒以上かかる形を通していた）
+        val reexported = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (export ${'$'}src "c" (component ${'$'}c))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        val viaAlias = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (component ${'$'}w (alias outer 1 ${'$'}c (component ${'$'}cc)) (export "c" (component ${'$'}cc)))
+              (instance ${'$'}wi (instantiate ${'$'}w))
+              (alias export ${'$'}wi "c" (component ${'$'}src))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        // 比べる元: 同じコンポーネントを直接 outer alias する（前から断っていた）
+        val direct = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (alias outer 0 ${'$'}c (component ${'$'}src))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        val d = estimateOf(direct)
+        for (bytes in listOf(reexported, viaAlias)) {
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= 60L * 900 * 900 / 2) { "${e.remapCost}" }
+            assertTrue(e.cost >= d.cost) { "${e.cost} < ${d.cost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        rejectedBeforeValidation(direct)
+    }
+
+    @Test
+    fun `importしたコンポーネントのインスタンスの型はexportだけの大きさ`() {
+        // 大きな import（フィールド 100 個の record）と小さな export を持つコンポーネント型を import し、インスタンス化したものを引数に渡す。
+        // インスタンスの型は export だけ（型を引けずに、それまでの最大の大きさとはしない）
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}y (with \"j\" (instance ${'$'}x))))" }
+        val bytes = wat(
+            """
+            (component
+              (type ${'$'}ct (component (type ${'$'}rr (record $inner)) (import "i" (type (eq ${'$'}rr))) (export "e" (func))))
+              (import "k" (component ${'$'}k (type ${'$'}ct)))
+              (type ${'$'}big (record $inner))
+              (component ${'$'}y (import "j" (instance)))
+              (instance ${'$'}x (instantiate ${'$'}k (with "i" (type ${'$'}big))))
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(11L, e.checkCount)
+        // big を渡す 1 回（約 100）と、x を渡す 10 回（それぞれ数個）。x の型に k の import（約 100）を入れると 1,000 を超える
+        assertTrue(e.cost - e.remapCost in 101L..300L) { "${e.cost} - ${e.remapCost}" }
+    }
+
+    @Test
+    fun `型を付けたexportは付けた型で写し直しを数える`() {
+        // #751 のレビュー: 実物（同じ record を 900 回 export したインスタンス）ではなく、付けた型（`(type (eq ..))` を 900 回 export する
+        // インスタンス型。export ごとに別の型）を写し直す。実物で数えると、検証に 7 秒以上かかる形を通していた
+        val record = (0 until 900).joinToString(" ") { """(field "f$it" u32)""" }
+        val bag = (0 until 900).joinToString(" ") { """(export "a$it" (type ${'$'}r))""" }
+        val instances = (0 until 60).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        val bytes = wat(
+            """
+            (component
+              ${eqInstanceType(fields = 900, exports = 900)}
+              (component ${'$'}d
+                (alias outer 1 ${'$'}it (type ${'$'}t))
+                (type ${'$'}r (record $record))
+                (instance ${'$'}bag $bag)
+                (export "x" (instance ${'$'}bag) (instance (type ${'$'}t)))
+              )
+              $instances
+            )
+            """,
+        )
+        assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+        val e = estimateOf(bytes)
+        assertTrue(e.remapCost >= 60L * 900 * 900 / 2) { "${e.remapCost}" }
+        rejectedBeforeValidation(bytes)
     }
 
     @Test

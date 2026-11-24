@@ -24,7 +24,10 @@ import java.util.IdentityHashMap
  *   型を定義したときに断る）にならって、参照している型の大きさを足して数える。添字空間をなぞって参照を引き、
  *   引けないもの（入れ子のコンポーネントのインスタンスの export など）は、それまでに見た型の大きさの最大とする
  *   （参照できる型は、バイナリの中でそれより前に定義されているので、実際より小さくならない）。
- *   インスタンス化で作ったインスタンスの型は、そのコンポーネントの export だけ（import は引数で置き換わる。#751）
+ *   インスタンス化で作ったインスタンスの型は、そのコンポーネントの export だけ（import は引数で置き換わる。#751）。
+ *   export し直したもの・alias で引いたもの・import したもの（コンポーネント型）のコンポーネントも同じ
+ *   （export だけの型を引けないときは、import も含めたコンポーネントの型にする。大きい側）。
+ *   型を付けた export は、wasmparser にならって、付けた型（渡した実物ではなく）を、その export の型とする
  * - 写し直し: wasmparser はインスタンス化のたびに、そのコンポーネントの import と export の型を写し直す（resource の置き換え。
  *   import は、引数ごとに受ける側の import の型を写し直すのにも使う）。
  *   写し直しは1回のインスタンス化の中で型ごとに覚える（`Remapping` の `types`）ので、展開した大きさではなく、
@@ -140,7 +143,10 @@ internal object ComponentValidationCost {
 
         private fun add(a: Long, b: Long): Long = minOf(a + b, SATURATED)
 
-        /** インスタンス化での export の型の写し直しを数える（型の確認の回数には入れない）。[target] はコンポーネント */
+        /**
+         * インスタンス化での、コンポーネント [target] の import と export の型の写し直しを数える（型の確認の回数には入れない）。
+         * 引けなければ、それまでの最大
+         */
         private fun remap(target: Info?) {
             val n = if (target == null) maxSize else flatOf(target, 0)
             cost = add(cost, n)
@@ -170,9 +176,9 @@ internal object ComponentValidationCost {
         /** 引けない参照の代わり（それまでの最大の大きさの、中を持たない型） */
         private fun unknown(): Info = Info(maxSize)
 
-        /** wasmparser が [info] を写して新しく作る型 */
+        /** wasmparser が [info] を写して新しく作る型（コンポーネントは、インスタンス化でできるインスタンスの型も引き継ぐ） */
         private fun copied(info: Info?): Info? = info?.let {
-            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound)
+            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView)
         }
 
         /**
@@ -202,7 +208,10 @@ internal object ComponentValidationCost {
             return result
         }
 
-        /** コンポーネント [c] をなぞり、その情報を返す（大きさは import も含む。export だけの大きさは [Info.remapBound]） */
+        /**
+         * コンポーネント [c] をなぞり、その情報を返す。[Info.size] と [Info.remapBound] は import も含む。
+         * export だけの型（インスタンス化でできるインスタンスの型）は [Info.instanceView]
+         */
         fun component(c: ParsedComponent, parent: Scope?): Info {
             val s = Scope(parent)
             val exports = HashMap<String, Info>()
@@ -231,18 +240,26 @@ internal object ComponentValidationCost {
                                 val target = s.components.getOrNull(item.component)
                                 // 引数がなくても、インスタンス化のたびに export の型を写し直す（resource の置き換え）
                                 remap(target)
-                                // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）
-                                target?.instanceView?.let { Info(it.size, it.exports, content = it, remapBound = it.remapBound) }
+                                // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）。
+                                // export だけの型を引けないコンポーネントは、import も含めた型にする（大きい側）
+                                val view = target?.let { it.instanceView ?: it.content ?: it }
+                                view?.let { Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound) }
                             }
                             is InstanceExpr.FromExports -> fromExports(s, item.exports)
                         }
                     }
                     is ComponentSection.Exports -> for (item in section.items) {
                         val found = s.lookup(item.target)
-                        // 型を付けた export は、付けた型の部分型かを確かめる
-                        if (item.desc != null) check(found)
+                        // 型を付けた export は、付けた型の部分型かを確かめ、付けた型をその export の型にする（wasmparser と同じ）。
+                        // 実物は同じ宣言を共有していても、付けた型は `(type (eq ..))` ごとに別の型になることがあるので、実物では数えない
+                        val desc = item.desc
+                        if (desc != null) check(found)
                         // 関数のほかは、export するときに型を写して新しく作る
-                        val info = if (item.target.sort == Sort.FUNC) found else copied(found)
+                        val info = when {
+                            desc != null -> descInfo(s, desc)
+                            item.target.sort == Sort.FUNC -> found
+                            else -> copied(found)
+                        }
                         val ref = info ?: unknown()
                         if (info != null) exports[item.name] = info
                         refs += ref
@@ -292,7 +309,14 @@ internal object ComponentValidationCost {
 
         /** import・export の記述 [desc] の型の情報。[s] の添字空間に番号を足す */
         private fun extern(s: Scope, desc: ExternDesc): Info {
-            val info = when (desc) {
+            val info = descInfo(s, desc)
+            s.push(desc.sort, info)
+            return info
+        }
+
+        /** 記述 [desc] の型の情報（添字空間には足さない） */
+        private fun descInfo(s: Scope, desc: ExternDesc): Info =
+            when (desc) {
                 // `(sub resource)` は新しい resource（大きさ 1）。`(eq $t)` は、wasmparser が別の型の id を作る（同じ型を何度 eq で
                 // import・export しても、別々に写し直す）ので、同じ型への参照ではなく写して作った別の型として数える
                 is ExternDesc.Type -> if (desc.eqTypeIndex == null) Info(1) else copied(s.types.getOrNull(desc.eqTypeIndex))
@@ -302,16 +326,18 @@ internal object ComponentValidationCost {
                 is ExternDesc.Component -> copied(s.types.getOrNull(desc.typeIndex))
                 is ExternDesc.Module -> s.coreTypes.getOrNull(desc.coreTypeIndex)
             } ?: unknown()
-            s.push(desc.sort, info)
-            return info
-        }
 
-        /** インスタンス型・コンポーネント型。大きさは import・export の型の大きさの合計 */
-        private fun declType(decls: List<TypeDecl>, parent: Scope): Info {
+        /**
+         * インスタンス型・コンポーネント型。大きさは import・export の型の大きさの合計。
+         * コンポーネント型（[component]）は、インスタンス化でできるインスタンスの型（export だけ）も [Info.instanceView] に持つ
+         */
+        private fun declType(decls: List<TypeDecl>, parent: Scope, component: Boolean): Info {
             val s = Scope(parent)
             val exports = HashMap<String, Info>()
             val refs = ArrayList<Info>()
+            val exportRefs = ArrayList<Info>()
             var size = 1L
+            var exportSize = 1L
             for (d in decls) {
                 when (d) {
                     is TypeDecl.CoreType -> s.coreTypes += Info(coreType(d.type))
@@ -326,16 +352,19 @@ internal object ComponentValidationCost {
                         val info = extern(s, d.desc)
                         exports[d.name] = info
                         refs += info
+                        exportRefs += info
                         size = sum(size, 1 + info.size)
+                        exportSize = sum(exportSize, 1 + info.size)
                     }
                 }
             }
-            return Info(note(size), exports, local = 1L + refs.size, refs = refs)
+            val view = if (component) Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs) else null
+            return Info(note(size), exports, local = 1L + refs.size, refs = refs, instanceView = view)
         }
 
         private fun defType(def: DefType, s: Scope): Info = when (def) {
-            is InstanceTypeDef -> declType(def.decls, s)
-            is ComponentTypeDef -> declType(def.decls, s)
+            is InstanceTypeDef -> declType(def.decls, s, component = false)
+            is ComponentTypeDef -> declType(def.decls, s, component = true)
             else -> valueType(def, s)
         }
 
