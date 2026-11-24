@@ -38,6 +38,7 @@ import pro.ikili.kibicomputers.core.persist.SaveCleanupSettings
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.io.IOException
+import java.lang.reflect.Modifier
 import java.nio.file.DirectoryIteratorException
 import java.nio.file.Files
 import java.nio.file.Path
@@ -320,7 +321,8 @@ internal class ChunkReferenceProbe(
          * 既定の作りなら「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
          *
          * 2つを見る。
-         * - クラスの書き換え（[modifiedRegionStorage]）: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないか
+         * - クラスの書き換え（[modifiedRegionStorage]）: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないか。
+         *   `ChunkMap` は、`ChunkStorage` のメソッドを上書きする Mixin が当たっていないか
          * - 差し替え（[substitutedRegionStorage]）: 全ディメンションで、実際に使われている `ChunkMap`・`IOWorker`・`RegionFileStorage` のインスタンスがバニラのクラスそのものか。
          *   `IOWorker` は `final` でなく、コンストラクターは `protected`、`loadAsync`・`store` は上書きできるので、バイトコードを書き換えなくてもサブクラスが作れる。
          *   それを `ChunkStorage.worker`（`final`）に入れるのは、アクセサーの Mixin・リフレクション・AT で足りる（アクセサーの Mixin はクラスの書き換えとしては数えないので、こちらで見る）
@@ -340,10 +342,36 @@ internal class ChunkReferenceProbe(
          * 見えないもの: 合わせたメソッド・フィールドを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
          * `<clinit>` だけの Mixin。どちらも印が付かない）と、coremod・JVM エージェントの書き換え。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
          * 適用の記録が Mixin 自身のクラスの側にしか付かず、対象のクラスでは作りの上で常に空なので使わない。
-         * `ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので数えない（数えると、ほとんどの環境で
-         * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）
+         * `ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので、Mixin が当たったこと自体は数えない（数えると、ほとんどの環境で
+         * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。
+         * ただし、`ChunkStorage` のメソッド（`read`・`write` など）を `ChunkMap` で上書きする Mixin（Mixin のクラスが `ChunkStorage` を継承して override を足す形）は、
+         * チャンクの読み書きをすべて横取りできるので数える（[overridesWithMixin]）
          */
-        fun modifiedRegionStorage(): List<String> = REGION_STORAGE_CLASSES.filter { isMixinTarget(it) }.map { it.name }
+        fun modifiedRegionStorage(): List<String> =
+            REGION_STORAGE_CLASSES.filter { isMixinTarget(it) }.map { it.name } +
+                listOfNotNull(ChunkMap::class.java.name.takeIf { overridesWithMixin(ChunkMap::class.java, ChunkStorage::class.java) })
+
+        /**
+         * クラス [type] に、親のクラス [base] のメソッド（`static`・`private` でないもの。名前と引数の型が同じ）を上書きする、Mixin が合わせたメソッドがあるか
+         * （調べるのに失敗したら `true`）。印（[marker]。既定は `@MixinMerged`）の付いたメソッドだけを見るので、バニラ自身の上書き（`ChunkMap.close` など）は数えない。
+         * アクセサー・インボーカーだけの Mixin の印は数えない（[isAccessorMixin]。[isMixinTarget] と同じ）
+         */
+        fun overridesWithMixin(type: Class<*>, base: Class<*>, marker: String = MIXIN_MERGED): Boolean = try {
+            val loader = type.classLoader
+            val overridable = base.declaredMethods
+                .filter { !Modifier.isStatic(it.modifiers) && !Modifier.isPrivate(it.modifiers) }
+                .map { it.name to it.parameterTypes.toList() }
+                .toSet()
+            type.declaredMethods.any { method ->
+                !Modifier.isStatic(method.modifiers) &&
+                    (method.name to method.parameterTypes.toList()) in overridable &&
+                    method.declaredAnnotations.any { it.annotationClass.java.name == marker && !isAccessorMixin(loader, mergedMixin(it)) }
+            }
+        } catch (e: RuntimeException) {
+            true
+        } catch (e: LinkageError) {
+            true
+        }
 
         /**
          * 全ディメンションのうち、チャンクを読み書きするインスタンス（`ChunkMap`・その `IOWorker`・その `RegionFileStorage`）が、バニラのクラスそのものでないもの

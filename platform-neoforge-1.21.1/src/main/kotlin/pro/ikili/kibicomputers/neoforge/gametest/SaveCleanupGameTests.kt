@@ -11,6 +11,7 @@ import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
+import net.minecraft.server.level.ChunkMap
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
@@ -18,6 +19,7 @@ import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.chunk.storage.ChunkStorage
 import net.minecraft.world.level.dimension.DimensionType
 import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.gametest.GameTestHolder
@@ -577,7 +579,42 @@ object SaveCleanupGameTests {
         // Mixin のクラスファイルが読めない印、`mixin` が読めない印は数える（残す側）
         helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByUnreadable::class.java, merged), "a mark of an unreadable mixin should count")
         helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MarkedMember::class.java, TestMark::class.java.name), "a mark without the mixin name should count")
+        // ChunkMap 向け: 親のメソッドを上書きする、処理を書き換える Mixin の印だけを数える
+        val base = OverriddenBase::class.java
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(ChunkMap::class.java, ChunkStorage::class.java), "the real ChunkMap should not override ChunkStorage with a mixin")
+        helper.assertTrue(ChunkReferenceProbe.overridesWithMixin(OverrideByClassMixin::class.java, base, merged), "a mixin override of a parent method should count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(OverrideByAccessor::class.java, base, merged), "an accessor mark on an override should not count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(PlainOverride::class.java, base, merged), "an unmarked override should not count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(MergedNonOverride::class.java, base, merged), "a mixin method that overrides nothing should not count")
         helper.succeed()
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、`ChunkStorage` の代わりの親のクラス */
+    internal open class OverriddenBase {
+        open fun read(pos: Int): Int = pos
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin が親のメソッドを上書きしたクラス */
+    internal class OverrideByClassMixin : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの印の付いた上書きのクラス */
+    internal class OverrideByAccessor : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、印のない上書き（バニラ自身の上書きの代わり）のクラス */
+    internal class PlainOverride : OverriddenBase() {
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、親のメソッドを上書きしない、Mixin の合わせたメソッドのクラス */
+    internal class MergedNonOverride : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun other(pos: Int): Int = pos
     }
 
     /** `@MixinMerged` の `mixin`（合わせた Mixin のクラス名） */
