@@ -30,6 +30,9 @@ internal class LoadDeadline(
     /** 使った時間（ナノ秒） */
     val elapsedNanos: Long get() = clock() - start
 
+    /** 上限までの残り（ナノ秒。超えていれば負） */
+    val remainingNanos: Long get() = limitNanos - elapsedNanos
+
     /** 上限を超えていたら [WasmLoadException] を投げる。[phase] はメッセージに入れる、今していること */
     @Throws(WasmLoadException::class)
     fun check(phase: String) {
@@ -44,11 +47,11 @@ internal class LoadDeadline(
     fun exceeded(phase: String, elapsed: Long = elapsedNanos, cause: Throwable? = null): WasmLoadException =
         WasmLoadException("WASM の検証が時間の上限（${limitNanos / 1_000_000} ms）を超えた（$phase、${elapsed / 1_000_000} ms）", cause)
 
-    private companion object {
+    internal companion object {
         /** 経過時間の時計（[usesCpuTime] の見分けに使う） */
-        val WALL: () -> Long = System::nanoTime
+        private val WALL: () -> Long = System::nanoTime
 
-        /** このスレッドの CPU 時間を測る時計。測れなければ `null` */
+        /** 呼んだスレッドの CPU 時間を測る時計。測れなければ `null`（Endive のコンパイルのやり直しの時間にも使う） */
         fun cpuClock(): (() -> Long)? = try {
             val bean: ThreadMXBean = ManagementFactory.getThreadMXBean()
             if (bean.isCurrentThreadCpuTimeSupported && bean.isThreadCpuTimeEnabled) {

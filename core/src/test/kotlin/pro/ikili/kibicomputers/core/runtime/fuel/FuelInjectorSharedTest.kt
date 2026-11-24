@@ -59,9 +59,6 @@ class FuelInjectorSharedTest {
           (elem (global.get ${'$'}off) func ${'$'}f1)
           ;; 要素（flags 4: 式の列）。ref.func と、import したグローバルの global.get
           (elem (i32.const 4) funcref (ref.func ${'$'}f2) (global.get ${'$'}fr))
-          ;; 要素（flags 5: パッシブの式の列）。Endive が table.init でパッシブの式の global.get を正しく置かないので、動かさずに
-          ;; 挿入した後のバイト列を wasm-tools で読み戻して確かめる（挿入しないモジュールでも違う関数になる。#706）
-          (elem ${'$'}pe funcref (ref.func ${'$'}f0) (global.get ${'$'}fr))
           (export "gx" (global ${'$'}g))
           (export "kx" (global ${'$'}k))
           (func (export "g") (result i32) global.get ${'$'}g)
@@ -71,7 +68,20 @@ class FuelInjectorSharedTest {
           (func (export "m") (result i32) global.get ${'$'}m)
           (func (export "setm") (global.set ${'$'}m (i32.const 6)))
           (func (export "mem") (param i32) (result i32) (i32.load16_u (local.get 0)))
-          (func (export "ci") (param i32) (result i32) (call_indirect (type ${'$'}t) (local.get 0)))
+          (func (export "ci") (param i32) (result i32) (call_indirect (type ${'$'}t) (local.get 0))))
+    """
+
+    /**
+     * 要素（flags 5: パッシブの式の列）で、import したグローバルを指すもの。Endive が `table.init` でほかのインスタンスの関数の参照を
+     * 正しく置かず、ランタイムが読み込みで断る（#706）ので、動かさずに、挿入した後のバイト列を wasm-tools で読み戻して確かめる
+     */
+    private val passive = """
+        (module
+          (import "env" "base" (global ${'$'}base i32))
+          (import "env" "fr" (global ${'$'}fr funcref))
+          (table 8 funcref)
+          (func ${'$'}f0 (result i32) i32.const 10)
+          (elem ${'$'}pe funcref (ref.func ${'$'}f0) (global.get ${'$'}fr))
           (func (export "init") (table.init ${'$'}pe (i32.const 6) (i32.const 0) (i32.const 2)))
           (func (export "drop") (elem.drop ${'$'}pe)))
     """
@@ -146,12 +156,16 @@ class FuelInjectorSharedTest {
 
     @Test
     fun `パッシブの要素の式の番号を付け替える`() {
-        // 関数は燃料の import の分だけ +1（$f0 は 0 → 1）、import したグローバル $fr（2 番）はそのまま
-        val out = FuelInjector.inject(WitTool.wat(consumer), sharedGlobal = true).bytes
+        // 関数は燃料の import の分だけ +1（$f0 は 0 → 1）、import したグローバル $fr（1 番）はそのまま
+        val out = FuelInjector.inject(WitTool.wat(passive), sharedGlobal = true).bytes
+        assertNull(WitTool.validate(out), "挿入した後のバイト列が正しくない")
         val r = WitTool.run(listOf("print", "${WitTool.WORK}/m.wasm"), mapOf("m.wasm" to out))
         assertEquals(0, r.exitCode, r.stderr)
-        val passive = r.stdout.lines().filter { it.trim().startsWith("(elem") && "funcref (ref.func" in it && "i32.const" !in it }
-        assertEquals(listOf("(ref.func 1) (global.get 2))"), passive.map { it.substringAfter("funcref ").trim() }, r.stdout)
+        val elems = r.stdout.lines().filter { it.trim().startsWith("(elem") && "funcref (ref.func" in it && "i32.const" !in it }
+        assertEquals(listOf("(ref.func 1) (global.get 1))"), elems.map { it.substringAfter("funcref ").trim() }, r.stdout)
+        // Endive では動かさない（#706）
+        val e = assertThrows<WasmLoadException> { runtime.load(out) }
+        assertTrue(e.message!!.contains("#706"), e.message)
     }
 
     @Test

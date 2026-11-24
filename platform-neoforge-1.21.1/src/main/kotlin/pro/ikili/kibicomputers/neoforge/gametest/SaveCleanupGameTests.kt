@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.neoforge.gametest
 
 import com.mojang.brigadier.exceptions.CommandSyntaxException
 import net.minecraft.core.BlockPos
+import net.minecraft.core.MappedRegistry
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
 import net.minecraft.gametest.framework.GameTestInfo
@@ -10,6 +11,7 @@ import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
+import net.minecraft.server.level.ChunkMap
 import net.minecraft.server.level.FullChunkStatus
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
@@ -17,6 +19,7 @@ import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.level.chunk.storage.ChunkStorage
 import net.minecraft.world.level.dimension.DimensionType
 import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.gametest.GameTestHolder
@@ -186,6 +189,56 @@ object SaveCleanupGameTests {
                 helper.assertTrue(result == 1, "saves status should report the last cleanup")
             } finally {
                 deleteTree(root)
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * 本番の経路 [SaveCleanups.start] が、検出した理由（[ChunkReferenceProbe.untrustedRegionStorage]）を問い（[ChunkReferenceProbe.regionNamesTrusted]）に渡す（#899）。
+     * 保存先に別の座標のリージョンファイルだけがあり、台の位置のリージョンファイルがないとき、理由が空でなければ台のディレクトリは「判定できない」に数えられて残り、
+     * 空なら「ない」に数えられる。検出（[vanillaRegionStorageIsTrusted]）と問い（[regionlessPositionIsKeptWhenRegionStorageIsModified]）の間をつなぐ部分を確かめる。
+     * 共有の [SaveCleanups] を使うので、ほかの掃除のテスト（[dryRunCountsWithoutDeleting] など）と重ならないよう別の batch にする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 800, batch = "kibicomputers_save_cleanup_untrusted")
+    fun startPassesUntrustedReasonsToTheProbe(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        ensureVanillaRegion(helper)
+        val keptChunk = FarChunks.reserve(helper)
+        val absentChunk = FarChunks.reserve(helper)
+        val keptRoot = tempRoot(helper)
+        val absentRoot = tempRoot(helper)
+        val keptId = UUID.randomUUID()
+        val absentId = UUID.randomUUID()
+        previousDirectory(keptRoot, keptId, MachineOwner(dimension, keptChunk.minBlockX, 64, keptChunk.minBlockZ))
+        previousDirectory(absentRoot, absentId, MachineOwner(dimension, absentChunk.minBlockX, 64, absentChunk.minBlockZ))
+        val untrusted = SaveCleanups.start(
+            dryRun = true, force = false, store = MachineSaveStore(keptRoot, MachineIdIndex(), "test"), modules = null,
+            untrustedReasons = { listOf("test: mixin on the chunk storage") },
+        )
+        helper.assertTrue(untrusted != null, "the cleanup with untrusted reasons should start")
+        var trusted: SaveCleanup? = null
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(untrusted!!.finished, "the first cleanup should finish (${untrusted.phase})")
+        }.thenExecute {
+            val report = untrusted!!.report
+            helper.assertTrue(report.candidates == 1 && report.undetermined == 1 && report.unreferenced == 0, "untrusted reasons should keep the directory: $report")
+            trusted = SaveCleanups.start(
+                dryRun = true, force = false, store = MachineSaveStore(absentRoot, MachineIdIndex(), "test"), modules = null,
+                untrustedReasons = { emptyList() },
+            )
+            helper.assertTrue(trusted != null, "the cleanup without untrusted reasons should start")
+        }.thenWaitUntil {
+            helper.assertTrue(trusted!!.finished, "the second cleanup should finish (${trusted!!.phase})")
+        }.thenExecute {
+            try {
+                val report = trusted!!.report
+                helper.assertTrue(report.candidates == 1 && report.unreferenced == 1 && report.undetermined == 0, "no reasons should let the file names decide: $report")
+                helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, keptChunk)), "the cleanup should not create region files")
+            } finally {
+                deleteTree(keptRoot)
+                deleteTree(absentRoot)
             }
         }.thenSucceed()
     }
@@ -459,8 +512,233 @@ object SaveCleanupGameTests {
     }
 
     /**
-     * リージョンファイルがないときの答え（[ChunkReferenceProbe.regionAbsence]）は、ないと確かめられ、同じ保存先にバニラの名前のリージョンファイルが
-     * あるときだけ「ない」。保存先がない・バニラの名前のファイルがない（名前・形式を変える環境かもしれない）なら「判定できない」。ファイルがあれば読む（`null`）
+     * 保存先に別の座標のリージョンファイルだけがあり、台の位置のリージョンファイルがないとき、チャンクを読み書きする側が既定の作りと確かめられなければ
+     * （[ChunkReferenceProbe.regionNamesTrusted] が偽。リージョン形式を変える MOD への移行の後の混ざった状態など）、台のディレクトリは残り、
+     * 「判定できない」に数えられる（#899）。リージョンファイルも作らない。同じ位置は、既定の作りなら「ない」になる（別の座標のファイルが前提の対照）。
+     * 書き込み待ちのチャンク（リージョンにまだ出ていないかもしれない）のケースも「ない」にならない
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
+    fun regionlessPositionIsKeptWhenRegionStorageIsModified(helper: GameTestHelper) {
+        val level = helper.level
+        val server = level.server
+        val dimension = level.dimension().location().toString()
+        ensureVanillaRegion(helper)
+        val target = FarChunks.reserve(helper)
+        val targetRegion = ChunkReferenceProbe.regionFile(level, target)
+        helper.assertTrue(!Files.exists(targetRegion), "the region of the target chunk should not exist yet: $targetRegion")
+        val others = Files.newDirectoryStream(targetRegion.parent, "r.*.mca").use { dir -> dir.map { it.fileName.toString() } }
+        helper.assertTrue(others.isNotEmpty(), "the storage should have a region file of another position")
+        val pos = BlockPos(target.minBlockX + 2, 64, target.minBlockZ + 3)
+        val id = UUID.randomUUID()
+        val modified = ChunkReferenceProbe(server, regionNamesTrusted = false)
+        val untrusted = ask(modified, id, dimension, pos)
+        val trusted = ask(ChunkReferenceProbe(server, regionNamesTrusted = true), id, dimension, pos)
+        // 書き込み待ちのケース（ほかのテストが読まない別の離れたチャンク。リージョンファイルはまだない）
+        val pendingChunk = FarChunks.reserve(helper)
+        val pendingRegion = ChunkReferenceProbe.regionFile(level, pendingChunk)
+        val pendingPos = BlockPos(pendingChunk.minBlockX + 1, 70, pendingChunk.minBlockZ + 1)
+        val pendingId = UUID.randomUUID()
+        helper.assertTrue(!Files.exists(pendingRegion), "the region of the pending chunk should not exist yet: $pendingRegion")
+        val caseTag = CompoundTag().apply {
+            putString("id", BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString())
+            putInt("x", pendingPos.x)
+            putInt("y", pendingPos.y)
+            putInt("z", pendingPos.z)
+            putString(CaseBlockEntity.MACHINE_ID_TAG, pendingId.toString())
+        }
+        level.chunkSource.chunkMap.write(pendingChunk, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+        val pending = ask(modified, pendingId, dimension, pendingPos)
+        val root = tempRoot(helper)
+        previousDirectory(root, id, MachineOwner(dimension, pos.x, pos.y, pos.z))
+        val store = MachineSaveStore(root, MachineIdIndex(), "test")
+        val cleanup = SaveCleanup(store, null, modified, SaveCleanupSettings.DEFAULT)
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(untrusted.get() != null && trusted.get() != null && pending.get() != null, "the probes should answer")
+            cleanup.tick()
+            helper.assertTrue(cleanup.finished, "the cleanup should finish (${cleanup.phase})")
+        }.thenExecute {
+            try {
+                helper.assertTrue(untrusted.get() == MachineReference.UNKNOWN, "a regionless position with modified storage should be undetermined: ${untrusted.get()}")
+                helper.assertTrue(trusted.get() == MachineReference.ABSENT, "a regionless position with vanilla storage should be absent: ${trusted.get()}")
+                // IOWorker が先に書き出していれば読んで「ある」、まだなら「判定できない」。どちらでも消す側にはならない
+                val p = pending.get()
+                helper.assertTrue(p == MachineReference.PRESENT || p == MachineReference.UNKNOWN, "a pending case with modified storage should not be absent: $p")
+                val report = cleanup.report
+                helper.assertTrue(Files.isDirectory(root.resolve(id.toString())), "the directory should stay: $report")
+                helper.assertTrue(report.candidates == 1 && report.undetermined == 1 && report.deleted == 0 && report.unreferenced == 0, "counts: $report")
+                helper.assertTrue(!Files.exists(targetRegion), "the probes should not create the region file $targetRegion")
+            } finally {
+                deleteTree(root)
+            }
+        }.thenSucceed()
+    }
+
+    /**
+     * 実際のチャンクの読み書きの経路（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）は、GameTest のサーバー（と製品の jar のサーバー）では
+     * Mixin が当たっておらず（[ChunkReferenceProbe.modifiedRegionStorage] が空）、全ディメンションのインスタンスもバニラのクラスそのもので
+     * （[ChunkReferenceProbe.substitutedRegionStorage] が空）、既定の問いはファイル名で判定する。
+     * 合わせたメンバーの印（[ChunkReferenceProbe.hasMergedMembers]）は、印の付いたメソッドのあるクラスで見つかる（`@MixinMerged` はソースに書けないので、テスト用の実行時の注釈 [TestMark] で確かめる）。
+     * インスタンスの差し替え（サブクラス・ない）は [ChunkReferenceProbe.substitutedInstances] が見つける
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun vanillaRegionStorageIsTrusted(helper: GameTestHelper) {
+        val server = helper.level.server
+        val modified = ChunkReferenceProbe.modifiedRegionStorage()
+        helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
+        val substituted = ChunkReferenceProbe.substitutedRegionStorage(server)
+        helper.assertTrue(substituted.isEmpty(), "the chunk storage instances should be vanilla: $substituted")
+        helper.assertTrue(ChunkReferenceProbe.untrustedRegionStorage(server).isEmpty(), "the chunk storage should be trusted")
+        helper.assertTrue(ChunkReferenceProbe(server).regionNamesTrusted, "the default probe should trust the region names")
+        helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(MarkedMember::class.java, TestMark::class.java.name), "a marked method should be found")
+        helper.assertTrue(!ChunkReferenceProbe.hasMergedMembers(UnmarkedMember::class.java, TestMark::class.java.name), "an unmarked class should have no mark")
+        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(UnmarkedMember::class.java), "a plain class should not be a mixin target")
+        // インスタンスがクラスそのものなら差し替えでない。サブクラス・ないものは差し替え（ないものは確かめられない）
+        val same = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to BaseStorage()))
+        helper.assertTrue(same.isEmpty(), "an exact instance should not be substituted: $same")
+        val sub = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to SubStorage(), BaseStorage::class.java to null))
+        helper.assertTrue(sub == listOf(SubStorage::class.java.name, "null"), "a subclass and a missing instance should be substituted: $sub")
+        helper.succeed()
+    }
+
+    /**
+     * 本物の Mixin が当たったクラスでの検出。NeoForge 自身が `neoforge.mixins.json` で `BlockEntityType`・`MappedRegistry` にアクセサーの Mixin を当てているので、
+     * 本物の `@MixinMerged` が見つかること、その Mixin がインターフェース（アクセサーだけ）と判定されて数えられないこと（本物のクラスローダーでクラスファイルが読めること）を確かめる。
+     * 数える側（処理を書き換える Mixin の印、`mixin` が読めない印、クラスファイルが読めない Mixin の印）は、`@MixinMerged` と同じ形（`mixin` を持つ）のテスト用の印
+     * [TestMerged] を付けたクラスで、本番と同じ [ChunkReferenceProbe.isMixinTarget] の経路を通して確かめる（#899）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun mixinTargetIsDetectedOnRealMixins(helper: GameTestHelper) {
+        for (type in listOf(BlockEntityType::class.java, MappedRegistry::class.java)) {
+            val mixins = type.declaredMethods.flatMap { it.declaredAnnotations.toList() }.filter { it.annotationClass.java.name == MIXIN_MERGED }
+            helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(type), "the real mixin on ${type.name} should leave a merged mark")
+            helper.assertTrue(mixins.isNotEmpty(), "the merged mark should be readable on ${type.name}")
+            val loader = type.classLoader
+            val names = mixins.map { mergedName(it) }
+            helper.assertTrue(names.all { ChunkReferenceProbe.isAccessorMixin(loader, it) }, "the accessor mixins of ${type.name} should be interfaces: $names")
+            helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(type), "accessor-only mixins on ${type.name} should not count: $names")
+        }
+        val merged = TestMerged::class.java.name
+        // 処理を書き換える Mixin（インターフェースでないもの）の印なら数える。アクセサー（インターフェース）の印なら数えない
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByClassMixin::class.java, merged), "a mark of a non-accessor mixin should count")
+        helper.assertTrue(!ChunkReferenceProbe.isMixinTarget(MergedByAccessor::class.java, merged), "a mark of an accessor mixin should not count")
+        // アクセサーの印と、処理を書き換える Mixin の印が両方あれば数える
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByBoth::class.java, merged), "a non-accessor mark beside an accessor mark should count")
+        // Mixin のクラスファイルが読めない印、`mixin` が読めない印は数える（残す側）
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MergedByUnreadable::class.java, merged), "a mark of an unreadable mixin should count")
+        helper.assertTrue(ChunkReferenceProbe.isMixinTarget(MarkedMember::class.java, TestMark::class.java.name), "a mark without the mixin name should count")
+        // ChunkMap 向け: 親のメソッドを上書きする、処理を書き換える Mixin の印だけを数える
+        val base = OverriddenBase::class.java
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(ChunkMap::class.java, ChunkStorage::class.java), "the real ChunkMap should not override ChunkStorage with a mixin")
+        helper.assertTrue(ChunkReferenceProbe.overridesWithMixin(OverrideByClassMixin::class.java, base, merged), "a mixin override of a parent method should count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(OverrideByAccessor::class.java, base, merged), "an accessor mark on an override should not count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(PlainOverride::class.java, base, merged), "an unmarked override should not count")
+        helper.assertTrue(!ChunkReferenceProbe.overridesWithMixin(MergedNonOverride::class.java, base, merged), "a mixin method that overrides nothing should not count")
+        helper.succeed()
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、`ChunkStorage` の代わりの親のクラス */
+    internal open class OverriddenBase {
+        open fun read(pos: Int): Int = pos
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin が親のメソッドを上書きしたクラス */
+    internal class OverrideByClassMixin : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの印の付いた上書きのクラス */
+    internal class OverrideByAccessor : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、印のない上書き（バニラ自身の上書きの代わり）のクラス */
+    internal class PlainOverride : OverriddenBase() {
+        override fun read(pos: Int): Int = 0
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、親のメソッドを上書きしない、Mixin の合わせたメソッドのクラス */
+    internal class MergedNonOverride : OverriddenBase() {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun other(pos: Int): Int = pos
+    }
+
+    /** `@MixinMerged` の `mixin`（合わせた Mixin のクラス名） */
+    private fun mergedName(mark: Annotation): String = mark.annotationClass.java.getMethod("mixin").invoke(mark) as String
+
+    private const val MIXIN_MERGED = "org.spongepowered.asm.mixin.transformer.meta.MixinMerged"
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの Mixin の代わりのインターフェース */
+    internal interface AccessorLike
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin の代わりのクラス */
+    internal class ClassMixinLike
+
+    /**
+     * [mixinTargetIsDetectedOnRealMixins] の、`@MixinMerged` と同じ形の印（`mixin` に合わせた Mixin のクラス名）。
+     * 本番のコードがリフレクションで `mixin` を読むので、JVM の上で public にする（`internal`）
+     */
+    @Retention(AnnotationRetention.RUNTIME)
+    @Target(AnnotationTarget.FUNCTION)
+    internal annotation class TestMerged(val mixin: String)
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、処理を書き換える Mixin の印の付いたクラス */
+    internal class MergedByClassMixin {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの Mixin の印だけが付いたクラス */
+    internal class MergedByAccessor {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、アクセサーの印と処理を書き換える Mixin の印の両方が付いたクラス */
+    internal class MergedByBoth {
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$AccessorLike")
+        fun accessor(): Int = 1
+
+        @TestMerged("pro.ikili.kibicomputers.neoforge.gametest.SaveCleanupGameTests\$ClassMixinLike")
+        fun merged(): Int = 1
+    }
+
+    /** [mixinTargetIsDetectedOnRealMixins] の、クラスファイルが読めない Mixin の印の付いたクラス */
+    internal class MergedByUnreadable {
+        @TestMerged("no.such.Mixin")
+        fun merged(): Int = 1
+    }
+
+    /** [vanillaRegionStorageIsTrusted] の、`@MixinMerged` の代わりの印（`mixin` を持たない。実行時に見える注釈） */
+    @Retention(AnnotationRetention.RUNTIME)
+    @Target(AnnotationTarget.FUNCTION)
+    internal annotation class TestMark
+
+    /** [vanillaRegionStorageIsTrusted] の、差し替えの判定の期待するクラス */
+    internal open class BaseStorage
+
+    /** [vanillaRegionStorageIsTrusted] の、差し替えたサブクラス */
+    internal class SubStorage : BaseStorage()
+
+    /** [vanillaRegionStorageIsTrusted] の、印の付いたメソッドのあるクラス */
+    private class MarkedMember {
+        @TestMark
+        fun marked(): Int = 1
+    }
+
+    /** [vanillaRegionStorageIsTrusted] の、印のないクラス */
+    private class UnmarkedMember {
+        fun plain(): Int = 1
+    }
+
+    /**
+     * リージョンファイルがないときの答え（[ChunkReferenceProbe.regionAbsence]）は、ないと確かめられ、チャンクを読み書きする側が既定の作りで、
+     * 同じ保存先にバニラの名前のリージョンファイルがあるときだけ「ない」。保存先がない・バニラの名前のファイルがない（名前・形式を変える環境かもしれない）・
+     * 既定の作りと確かめられない（別の座標のファイルは証拠にならない。#899）なら「判定できない」。ファイルがあれば読む（`null`）
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
@@ -468,8 +746,8 @@ object SaveCleanupGameTests {
         val folder = tempRoot(helper).resolve("region")
         try {
             val target = folder.resolve("r.3.-4.mca")
-            fun check(expected: MachineReference?, what: String) {
-                val actual = ChunkReferenceProbe.regionAbsence(target, HashSet())
+            fun check(expected: MachineReference?, what: String, trusted: Boolean = true) {
+                val actual = ChunkReferenceProbe.regionAbsence(target, HashSet(), trusted)
                 helper.assertTrue(actual == expected, "$what should be $expected but was $actual")
             }
             check(MachineReference.UNKNOWN, "a missing folder")
@@ -481,8 +759,10 @@ object SaveCleanupGameTests {
             check(MachineReference.UNKNOWN, "a folder with only other region names")
             Files.write(folder.resolve("r.-1.2.mca"), ByteArray(0))
             check(MachineReference.ABSENT, "a folder with a vanilla region file")
+            check(MachineReference.UNKNOWN, "a folder with a vanilla region file of another position and modified storage", trusted = false)
             Files.write(target, ByteArray(0))
             check(null, "an existing region file")
+            check(null, "an existing region file with modified storage", trusted = false)
         } finally {
             deleteTree(folder)
         }
