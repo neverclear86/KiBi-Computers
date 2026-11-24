@@ -257,7 +257,7 @@ interface timers {
 - 同じアドレスの `device-attached` と `device-detached` は、起きた順に届きます。届いた時点で、`kibi:device` の一覧はもう新しくなっています。起動の前の接続は届かないので、起動したら一覧を読んでください
 - 保存から戻ったときは、`restored` の後に、戻った先でつなぎ直したすべてのデバイスの `device-attached` が届きます（保存の前につないでいた分と重なることがあり、消えた分の `device-detached` は出ません）。`restored` を受けたときと、`dropped` が 0 でないときは、一覧を読み直してください
 - `restored` は「保存から戻った」という意味だけです。画面の中身が残っているかは約束しません
-- `restored` の2つ目の値（ゲーム内時間の飛び）は、今は常に 0 です。接続層がまだゲーム内時間をマシンに渡していないためです（[#439](https://github.com/neverclear86/KiBi-Computers/issues/439)。`world-ticks` と同じ）
+- `restored` の2つ目の値（ゲーム内時間の飛び）は、保存から戻るまでに `world-ticks` が進んだ分です（[#439](https://github.com/neverclear86/KiBi-Computers/issues/439)）
 - **デバイスは、上の表にない独自の種類のイベントも出せます**（`source` はそのデバイスのアドレス）。種類と値の意味は、そのデバイスの説明を見てください。この表は閉じた一覧ではありません
 
 ### キーボードのイベント

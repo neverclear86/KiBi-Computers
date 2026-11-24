@@ -26,13 +26,30 @@ import java.util.UUID
 @PrefixGameTestTemplate(false)
 object ClaimIoGameTests {
     /**
-     * 待ちの確定を待つ上限（壁時計）。読みは書き込みのスレッドの列（全 ID で 1 本）の後ろに並び、前のバッチの書き込みが残っていると
-     * tick の数では足りないことがある（GameTest のサーバーは tick を詰めて回すことがある）
+     * 待ちの確定を待つ上限（壁時計。#881）。読みは列の外の読み手か、その ID の仕事が残っていれば書き込みのスレッドの列の後ろで行う
+     * （#877）。GameTest のサーバーは tick の間で待たず全速で回すので、tick の数では読みが終わるまでの時間を保証できない。そのため
+     * 待つ tick ごとに [DECIDE_STEP_MILLIS] まで眠り（[WallClockWait]）、壁時計で打ち切る。
+     * 置き場の待ちの上限 `claimWaitMillis`（既定 30 秒）より短く保つ（長いと、置き場が先に新しい ID にして、原因の分かりにくい失敗になる）
      */
-    private val DECIDE_LIMIT_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(20)
+    private const val DECIDE_LIMIT_MILLIS = 20_000
 
-    /** [DECIDE_LIMIT_NANOS] を待てる tick 数 */
-    private const val DECIDE_TIMEOUT_TICKS = 1_200
+    /** 確定を待つ tick に眠る上限（ミリ秒） */
+    private const val DECIDE_STEP_MILLIS = 50
+
+    /**
+     * GameTest の tick の上限。待つ tick は 1 回 [DECIDE_STEP_MILLIS] 以上かかるので、壁時計では [DECIDE_LIMIT_MILLIS] の 3 倍
+     * （60 秒）より前に来ない。壁時計の上限が必ず先に来て、診断の値つきで落ちる
+     */
+    private const val DECIDE_TIMEOUT_TICKS = DECIDE_LIMIT_MILLIS / DECIDE_STEP_MILLIS * 3
+
+    /** 確定の待ちを始める（待ちに入った tick に作る） */
+    private fun decideWait() = WallClockWait(DECIDE_LIMIT_MILLIS.toLong(), DECIDE_STEP_MILLIS.toLong())
+
+    /** 確定しなかったときの診断（遅れたのか止まったのかを 1 行で見分ける。#852） */
+    private fun decideDiagnostics(store: MachineSaveStore, wait: WallClockWait, cases: List<CaseBlockEntity>) =
+        "waited $wait; deferred in store=${cases.map { store.isClaimDeferred(it) }}, waitingClaims=${store.waitingClaims}, " +
+            "sideOwnerReadRequests=${store.sideOwnerReadRequests}, writerOwnerReadRequests=${store.writerOwnerReadRequests}, " +
+            "deferredClaimTimeouts=${store.deferredClaimTimeouts}, claimWaitMillis=${store.claimWaitMillis}"
 
     private val ORIGINAL = BlockPos(1, 1, 1)
     private val COPIES = listOf(BlockPos(0, 1, 0), BlockPos(1, 1, 0), BlockPos(2, 1, 0), BlockPos(0, 1, 1))
@@ -114,8 +131,8 @@ object ClaimIoGameTests {
         val knownId = UUID.randomUUID()
         val seeds = listOf(place(helper, COPIES[0], forgotten), place(helper, COPIES[1], removedId), place(helper, COPIES[2], knownId))
         val start = helper.tick
-        val startNanos = System.nanoTime()
         var phase = 0
+        var wait: WallClockWait? = null
         var reads = 0L
         var deferredBefore = 0L
         var placed: List<CaseBlockEntity> = emptyList()
@@ -154,12 +171,14 @@ object ClaimIoGameTests {
                     helper.assertTrue(known.lastClaim == ClaimResult.TAKEN_OVER && !known.isClaimDeferred, "a remembered id is decided at once: ${known.lastClaim}")
                     // 待っている間に外す
                     helper.setBlock(UNKNOWN[2], Blocks.AIR)
+                    wait = decideWait()
                     phase = 2
                 }
                 2 -> {
                     val (first, second, removed) = placed
                     if (first.isClaimDeferred || second.isClaimDeferred) {
-                        if (System.nanoTime() - startNanos > DECIDE_LIMIT_NANOS) helper.fail("the waiting claims should be decided")
+                        val w = wait!!
+                        if (!w.pace()) helper.fail("the waiting claims should be decided: ${decideDiagnostics(store, w, listOf(first, second))}")
                         return@onEachTick
                     }
                     phase = 3
@@ -286,9 +305,8 @@ object ClaimIoGameTests {
         val id = UUID.randomUUID()
         store.forgetOwnerForTest(id)
         val be = place(helper, ORIGINAL, null, poweredOn = true)
-        val start = helper.tick
-        val startNanos = System.nanoTime()
         var phase = 0
+        var wait: WallClockWait? = null
         helper.onEachTick {
             when (phase) {
                 0 -> {
@@ -298,11 +316,13 @@ object ClaimIoGameTests {
                     helper.assertTrue(be.isClaimDeferred, "the new id should need a read")
                     helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should leave the restore queue")
                     helper.assertTrue(be.computer.isRestorePending, "the restore wait should stay visible: ${be.computer}")
+                    wait = decideWait()
                     phase = 1
                 }
                 1 -> {
                     if (be.isClaimDeferred) {
-                        if (System.nanoTime() - startNanos > DECIDE_LIMIT_NANOS) helper.fail("the waiting claim should be decided")
+                        val w = wait!!
+                        if (!w.pace()) helper.fail("the waiting claim should be decided: ${decideDiagnostics(store, w, listOf(be))}")
                         return@onEachTick
                     }
                     helper.assertTrue(be.identity?.id == id, "the case should keep the merged id: ${be.identity}, ${be.lastClaim}")

@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.persist.snapshot
 import pro.ikili.kibicomputers.core.kernel.process.ModuleSource
 import pro.ikili.kibicomputers.core.persist.MachineSnapshot
 import pro.ikili.kibicomputers.core.persist.SnapshotFormatException
+import pro.ikili.kibicomputers.core.persist.SnapshotLimitException
 import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.persist.StoredSnapshot
 
@@ -120,7 +121,11 @@ internal object SnapshotDecoder {
         var count = 0
         for (section in snapshot.sections) {
             if (section.kind != SnapshotSection.PROCESS_ABI) continue
-            if (++count > limit) throw SnapshotFormatException("PROCESS_ABI 節が $limit 個より多い")
+            if (++count > limit) {
+                // 上限を下げる前に保存したもの（#719）か、壊れているか
+                if (count > KernelLimits.TABLE_PROCESS_CEILING) throw SnapshotFormatException("PROCESS_ABI 節が $limit 個より多い")
+                throw SnapshotLimitException("PROCESS_ABI 節が今の上限 $limit 個より多い")
+            }
             if (section.version != SnapshotSection.PROCESS_ABI_VERSION) {
                 throw SnapshotFormatException("PROCESS_ABI 節の版 ${section.version}")
             }

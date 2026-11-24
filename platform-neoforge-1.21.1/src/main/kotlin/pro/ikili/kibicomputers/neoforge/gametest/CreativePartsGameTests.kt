@@ -13,7 +13,10 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.PartKind
+import pro.ikili.kibicomputers.core.computer.MachineSpecs
 import pro.ikili.kibicomputers.core.computer.PartTier
+import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.computer.CaseParts
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
@@ -59,8 +62,10 @@ object CreativePartsGameTests {
 
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "case with creative parts should run but was ${be.computer}")
         val config = be.computer.machine!!.config
-        helper.assertTrue(config.fuelPerTick == PartTier.CREATIVE.cpuFuelPerTick, "fuel should come from the CPU but was ${config.fuelPerTick}")
-        helper.assertTrue(config.memoryBytes == PartTier.CREATIVE.memoryBytes * 2, "RAM should be the sum of two sticks but was ${config.memoryBytes}")
+        // 性能値はコンフィグ（#719）から。run の設定ファイルが既定とは限らないので、今の値と比べる
+        val spec = KiBiConfig.machineProfile(KiBiConfigs.server).spec(PartTier.CREATIVE)
+        helper.assertTrue(config.fuelPerTick == spec.cpuFuelPerTick, "fuel should come from the CPU but was ${config.fuelPerTick}")
+        helper.assertTrue(config.memoryBytes == spec.memoryBytes * 2, "RAM should be the sum of two sticks but was ${config.memoryBytes}")
         be.pressPowerButton()
         helper.succeed()
     }
@@ -86,7 +91,8 @@ object CreativePartsGameTests {
         }
         helper.assertTrue(be.pressPowerButton() == ComputerStatus.RUNNING, "creative case should run but was ${be.computer}")
         val ramSlots = be.tier.slotCount(PartKind.MEMORY)
-        helper.assertTrue(be.computer.machine!!.config.memoryBytes == PartTier.CREATIVE.memoryBytes * ramSlots, "RAM should fill every slot")
+        val ram = KiBiConfig.machineProfile(KiBiConfigs.server).spec(PartTier.CREATIVE).memoryBytes
+        helper.assertTrue(be.computer.machine!!.config.memoryBytes == minOf(ram * ramSlots, MachineSpecs.MAX_MEMORY_BYTES), "RAM should fill every slot")
         be.pressPowerButton()
         helper.succeed()
     }

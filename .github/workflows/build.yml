@@ -43,7 +43,10 @@ jobs:
           path: ~/.gradle/kibicomputers/downloads
           key: wasm-sources-${{ hashFiles('gradle/lua.properties') }}
 
+      # core のテストが固まったとき（デッドロック型の不安定さ）に、ジョブの上限（6 時間）でキャンセル扱いにならないよう上限を付ける。
+      # 段のタイムアウトは失敗扱いなので、下の upload の段が動く（ふだんは 20 分ほど）
       - name: Build and test
+        timeout-minutes: 60
         run: ./gradlew build --console=plain
 
       # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）。
@@ -65,6 +68,23 @@ jobs:
       - name: GameTest from the mod jar (Forge 1.20.1)
         timeout-minutes: 30
         run: ./gradlew :platform-forge-1.20.1:runJarGameTestServer --console=plain
+
+      # どこかの段が落ちたら、テスト結果の XML（テスト名・スタックトレース・system-out）と GameTest のサーバーのログを残す（#394）。
+      # 不安定なテストは再実行で通ると記録が消えるので、再実行の前に調べられるようにする。
+      # 名前に attempt を入れて、同じ run の再実行で名前がぶつからないようにする。
+      # cancelled() も入れて、手でキャンセルしたときやジョブの上限に当たったときも残す（failure() はキャンセルでは真にならない）。
+      # 何も拾えなかったときは warn で注記を出す（コンパイルで落ちたときなどは、まだ何もない）
+      - name: Upload test reports on failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-attempt-${{ github.run_attempt }}
+          path: |
+            **/build/test-results/**/*.xml
+            platform-*/run/logs/latest.log
+            platform-*/run/jar-gametest/logs/latest.log
+          if-no-files-found: warn
+          retention-days: 30
 
       - uses: actions/upload-artifact@v7
         with:

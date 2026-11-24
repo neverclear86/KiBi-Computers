@@ -178,12 +178,13 @@ class SnapshotDecoderModuleSourcesTest {
         val atLimit = c.snapshot.withSections(others + List(max) { one })
         assertEquals(max, SnapshotDecoder.moduleSources(atLimit, 1).size)
         val over = c.snapshot.withSections(others + List(max + 1) { one })
-        assertThrows<SnapshotFormatException> { SnapshotDecoder.moduleSources(over, 1) }
+        // 設定できる最大より少ない数なら、壊れているのでなく上限を下げたもの（#719）
+        assertThrows<pro.ikili.kibicomputers.core.persist.SnapshotLimitException> { SnapshotDecoder.moduleSources(over, 1) }
         // decode 側: PROCESS_ABI 節は pid が KERNEL 節の表にあり重ならないものしか受けないので、節の数は表のプロセスの数で縛られる。
         // その表の数を、同じ上限で断ることを確かめる（先読みと decode の上限がずれたら落ちる）
-        assertEquals("数 ${max + 1} が上限 $max を超える", decodeWithTableCount(c, max + 1).message)
+        assertEquals("数 ${max + 1} が今の上限 $max を超える", decodeWithTableCount(c, max + 1).message)
         // ちょうど上限なら数の上限では断らない（中身が足りないので、別の理由で断る）
-        assertNotEquals("数 $max が上限 $max を超える", decodeWithTableCount(c, max).message)
+        assertNotEquals("数 $max が今の上限 $max を超える", decodeWithTableCount(c, max).message)
     }
 
     /** KERNEL 節のプロセス表の数だけを [count] に書き換えて、maxProcesses = 1 で復号したときの例外 */

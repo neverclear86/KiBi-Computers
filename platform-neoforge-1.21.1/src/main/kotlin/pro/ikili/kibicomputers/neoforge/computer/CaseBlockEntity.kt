@@ -23,6 +23,8 @@ import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
 import pro.ikili.kibicomputers.core.computer.MachineSpecs
+import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.neoforge.config.KiBiConfigs
 import pro.ikili.kibicomputers.core.computer.PartKind
 import pro.ikili.kibicomputers.core.computer.PartTier
 import pro.ikili.kibicomputers.core.computer.RestoreReady
@@ -49,6 +51,7 @@ import pro.ikili.kibicomputers.core.persist.adoptsCompletion
 import pro.ikili.kibicomputers.neoforge.machine.MachineKey
 import pro.ikili.kibicomputers.neoforge.machine.WorldMachineSaves
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
+import pro.ikili.kibicomputers.neoforge.machine.WorldClocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import pro.ikili.kibicomputers.neoforge.registry.KiBiDataComponents
 import java.util.UUID
@@ -327,9 +330,9 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
      */
     internal var restorePreparationHook: Runnable? = null
 
-    /** 挿さっている部品から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
+    /** 挿さっている部品と今のコンフィグ（#719）から決めたマシンの設定（#347）。負荷試験の差し替え（[configOverride]）があれば通す */
     private fun machineConfig(): MachineConfig {
-        val config = MachineSpecs.configOf(tier, parts.tiers)
+        val config = MachineSpecs.configOf(tier, parts.tiers, KiBiConfig.machineProfile(KiBiConfigs.server))
         return configOverride?.apply(config) ?: config
     }
 
@@ -371,7 +374,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             restorePreparationHook?.run()
             val config = machineConfig()
             val disks = prepareDisks()
-            val environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).fairnessKey(ownerPlayerId).build()
+            val environment = machineEnvironment(level, disks.snapshot)
             // プレイヤーはいないので、前回の言語を使う。戻したマシンの再起動・冷えた起動もこの値を引き継ぐ（#661）
             val boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
             val store = WorldMachineSaves.current
@@ -630,12 +633,12 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
         val before = computer.machine
         // マシンの設定は挿さっている CPU・RAM から決める（#347。正式な式は #122・#123）
         val config = machineConfig()
-        var environment = MachineEnvironment.builder().access(accessPort).fairnessKey(ownerPlayerId).build()
+        var environment = machineEnvironment(level, null)
         var boot = ProvisionalBoot.bootConfig(emptyList(), fallbackBootDisk)
         if (computer.status != ComputerStatus.RUNNING) {
             updateBootLanguage(player)
             val disks = prepareDisks()
-            environment = MachineEnvironment.builder().disks(disks.snapshot).access(accessPort).fairnessKey(ownerPlayerId).build()
+            environment = machineEnvironment(level, disks.snapshot)
             boot = ProvisionalBoot.bootConfig(disks.bootOrder, fallbackBootDisk, bootLanguage)
         }
         val status = computer.pressPowerButton(
@@ -665,6 +668,16 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     /** 電源を入れる前のディスクの用意: 挿さっているディスクの写しと、起動の候補（ディスクのスロットの順） */
+    /**
+     * マシンの環境（起動・復元・電源ボタンの3か所で同じものを作る）。時計は [level] のもの（ゲーム内時間を見せる。#439）。
+     * [disks] が `null` なら挿さっているディスクを渡さない（動いているマシンを止めるときなど）
+     */
+    private fun machineEnvironment(level: ServerLevel, disks: DiskSnapshot?): MachineEnvironment {
+        val builder = MachineEnvironment.builder().access(accessPort).fairnessKey(ownerPlayerId).clock(WorldClocks.of(level))
+        if (disks != null) builder.disks(disks)
+        return builder.build()
+    }
+
     private class PreparedDisks(val snapshot: DiskSnapshot, val bootOrder: List<String>)
 
     /**
@@ -687,7 +700,7 @@ class CaseBlockEntity(pos: BlockPos, state: BlockState) :
             DiskItem.diskIdOf(stack)?.let { disks.putIfAbsent(it, item.tier) }
         }
         if (assigned) setChanged()
-        return PreparedDisks(store.snapshot(disks), disks.keys.toList())
+        return PreparedDisks(store.snapshot(disks, KiBiConfig.machineProfile(KiBiConfigs.server)), disks.keys.toList())
     }
 
     private fun onPartsChanged() {
