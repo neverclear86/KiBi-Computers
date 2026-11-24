@@ -66,6 +66,21 @@ jobs:
         timeout-minutes: 30
         run: ./gradlew :platform-forge-1.20.1:runJarGameTestServer --console=plain
 
+      # どこかの段が落ちたら、テスト結果の XML（テスト名・スタックトレース・system-out）と GameTest のサーバーのログを残す（#394）。
+      # 不安定なテストは再実行で通ると記録が消えるので、再実行の前に調べられるようにする。
+      # 名前に attempt を入れて、同じ run の再実行で名前がぶつからないようにする
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-attempt-${{ github.run_attempt }}
+          path: |
+            **/build/test-results/**/*.xml
+            platform-*/run/logs/latest.log
+            platform-*/run/jar-gametest/logs/latest.log
+          if-no-files-found: ignore
+          retention-days: 30
+
       - uses: actions/upload-artifact@v7
         with:
           name: kibicomputers-jars
