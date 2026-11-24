@@ -49,6 +49,17 @@ object SmokeGameTests {
     }
 
     /**
+     * コンパイルの失敗の例外から大きすぎる関数の番号を読む処理（#446）が使う ASM のクラスを、ゲームの実行環境（ローダーの ASM）から解決できる。
+     * この参照は SIMD を使うモジュールのコンパイルが失敗したときにしか解決されないので、ここで確かめる。
+     */
+    @JvmStatic
+    @GameTest(template = EMPTY)
+    fun tooLargeFunctionReadableOnServer(helper: GameTestHelper) {
+        helper.assertTrue(RuntimeSelfCheck.readsTooLargeFunction(), "the too-large function should be read from the ASM exception")
+        helper.succeed()
+    }
+
+    /**
      * コンポーネントの検証器（wasm-tools を WASM にしたもの）を、ゲームの実行環境で読み込んで動かせる（#262）。
      * 検証器の jar（`run.endive:wasi`・`wasm-tools`）の同梱と実行時クラスパスの配線が合っているかを確かめる。
      */

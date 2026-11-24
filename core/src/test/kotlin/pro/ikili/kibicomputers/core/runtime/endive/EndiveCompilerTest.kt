@@ -214,6 +214,323 @@ class EndiveCompilerTest {
         assertEquals(9L, module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("nine")[0] })
     }
 
+    /**
+     * i32 の局所変数 0 に、[value] を [groups] 回足して返す（`local.get 0; i32.const <値>; i32.add; local.set 0` の繰り返し）。
+     * JVM のバイトコードで1組あたり数バイトになる
+     */
+    private fun sumBody(groups: Int, value: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val add = WasmBinary.code(0x20, 0, 0x41, WasmBinary.sleb(value.toLong()), 0x6A, 0x21, 0)
+        repeat(groups) { out.write(add) }
+        out.write(WasmBinary.code(0x20, 0))
+        return out.toByteArray()
+    }
+
+    @Test
+    fun `SIMDの関数と大きすぎる関数がいくつもあるモジュールでも、大きすぎる関数だけをインタプリタに回す`() {
+        // #446: SIMD の関数があると Endive の自動の切り替えが使えない。失敗の例外から大きすぎる関数を読み取って足す。
+        // 大きすぎる関数（5 つ）は、命令の数がもっと多いがコンパイルできる関数（nop だけ）より下にある（命令の数の順では選ばれない）
+        val tooLarge = ArrayList<Int>()
+        val nops = ArrayList<Int>()
+        val bytes = WasmBinary().run {
+            exportFunc("seven", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 7), locals = listOf(0x7B)))
+            repeat(2) { i ->
+                val body = WasmBinary.code(ByteArray(TOO_LARGE_GROUPS * 5) { 0x01 }, 0x41, 40 + i)
+                nops += func(emptyList(), listOf(WasmBinary.I32), body).also { exportFunc("nops$i", it) }
+            }
+            exportFunc("small", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 8)))
+            repeat(5) { i ->
+                tooLarge += func(emptyList(), listOf(WasmBinary.I32), sumBody(TOO_LARGE_GROUPS, 100_003 + i), locals = listOf(WasmBinary.I32)).also { exportFunc("big$i", it) }
+            }
+            build()
+        }
+        val parsed = Parser.parse(bytes)
+        assertTrue(nops.all { parsed.codeSection().getFunctionBody(it).instructions().size > TOO_LARGE_GROUPS * 4 + 1 })
+        // 時計は止めておく（負荷しだいで時間の上限に掛かって不安定にならないように。上限の動きは compileWithFallback のテストで確かめる）
+        val module = EndiveRuntime(true) { 0L }.load(bytes)
+        assertTrue(isCompiled(module))
+        assertEquals(setOf(0) + tooLarge, interpretedFunctions(module))
+        val reference = EndiveRuntime(compile = false).load(bytes)
+        val names = listOf("seven", "small", "nops0", "nops1") + (0 until 5).map { "big$it" }
+        fun results(m: pro.ikili.kibicomputers.core.runtime.WasmModule) = m.instantiate(WasmInstanceConfig.EMPTY).use { i -> names.map { i.call(it)[0] } }
+        val expected = results(reference)
+        assertEquals(listOf(7L, 8L, 40L, 41L), expected.take(4))
+        assertEquals(expected, results(module))
+    }
+
+    @Test
+    fun `燃料の計測コードを挿入したモジュールでも、import を含めた番号で大きすぎる関数を読み取る`() {
+        // 製品の経路では、燃料の計測コードの挿入が関数の import を足す（定義した関数の番号が import の分ずれる）。
+        // Endive のメソッドの名前（func_<番号>）が import を含めた番号で、定義した関数の範囲（defined）と合っていることを、実物で確かめる
+        val tooLarge = ArrayList<Int>()
+        var simd = -1
+        val original = WasmBinary().run {
+            simd = func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 7), locals = listOf(0x7B)).also { exportFunc("seven", it) }
+            exportFunc("small", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 8)))
+            repeat(4) { i ->
+                tooLarge += func(emptyList(), listOf(WasmBinary.I32), sumBody(TOO_LARGE_GROUPS, 200_003 + i), locals = listOf(WasmBinary.I32)).also { exportFunc("big$i", it) }
+            }
+            build()
+        }
+        val injected = FuelInjector.inject(original)
+        val parsed = Parser.parse(injected.bytes)
+        val imported = parsed.importSection().count(run.endive.wasm.types.ExternalType.FUNCTION)
+        assertTrue(imported > 0, "燃料の計測コードの挿入が関数の import を足していない")
+        // 時計は止めておく（時間の上限に掛からないように）
+        val module = EndiveRuntime(true) { 0L }.load(injected.bytes)
+        assertTrue(isCompiled(module))
+        val interpreted = interpretedFunctions(module)
+        // import を含めた番号で、定義した関数の範囲に入っている
+        assertTrue(interpreted.all { it >= imported }, "$interpreted")
+        assertEquals(setOf(simd) + tooLarge, interpreted.map(injected::originalFunc).toSet())
+        val config = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
+        val names = listOf("seven", "small") + (0 until 4).map { "big$it" }
+        val expected = EndiveRuntime(compile = false).load(injected.bytes).instantiate(config).use { i -> names.map { i.call(it)[0] } }
+        assertEquals(listOf(7L, 8L), expected.take(2))
+        val config2 = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
+        assertEquals(expected, module.instantiate(config2).use { i -> names.map { i.call(it)[0] } })
+    }
+
+    @Test
+    fun `やり直しの時間の上限は、呼んだ側の残りの半分を超えない`() {
+        val second = 1_000_000_000L
+        // 残りが多ければ既定の 4 秒
+        assertEquals(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS, EndiveRuntime.retryBudget(Long.MAX_VALUE, 0))
+        assertEquals(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS, EndiveRuntime.retryBudget(10 * second, second))
+        // 残り 5 秒でパースに 0.5 秒使ったなら 2 秒。残りがなければ 0
+        assertEquals(2 * second, EndiveRuntime.retryBudget(5 * second, second / 2))
+        assertEquals(0L, EndiveRuntime.retryBudget(second, 2 * second))
+        assertEquals(0L, EndiveRuntime.retryBudget(-second, 0))
+    }
+
+    @Test
+    fun `呼んだ側の残りが少なければ、3回を超えるやり直しをその分で止める`() {
+        // #446 のレビュー: 1回 0.3 秒、大きすぎる関数が 12 個。時間の上限が 4 秒なら 12 回目まで（3.6 秒 + 0.3 秒）やり直すが、
+        // コンポーネントの core モジュールの1つ目で、残りの等分が 2.4 秒（上限 1.2 秒）なら、4 回のコンパイル（#446 の前と同じ）で止める
+        var now = 0L
+        var calls = 0
+        fun run(budget: Long): Any? {
+            now = 0L
+            calls = 0
+            return EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }, budgetNanos = budget) { set ->
+                calls++
+                now += 300_000_000L
+                if (set.size <= 12) throw tooLarge("func_${set.size}")
+                "ok"
+            }
+        }
+        assertEquals(null, run(EndiveRuntime.retryBudget(2_400_000_000L, 0)))
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+        // 上限が 0 でも、#446 の前から許していた 3 回のやり直しはする
+        assertEquals(null, run(0L))
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+        // 既定の 4 秒なら、13 回目のコンパイルで通る（3.6 秒 + 0.3 秒が 4 秒に収まる）
+        assertEquals("ok", (run(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS) as EndiveRuntime.Companion.Fallback<*>).value)
+        assertEquals(13, calls)
+    }
+
+    @Test
+    fun `大きすぎる関数を特定できないときは、命令の数の多い順に3回までやり直す`() {
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(setOf(0), true, 0..9, { listOf(5, 6, 7, 8) }) { set ->
+            calls += set
+            throw IllegalStateException("特定できない")
+        }
+        assertEquals(null, result)
+        assertEquals(listOf(setOf(0), setOf(0, 5), setOf(0, 5, 6), setOf(0, 5, 6, 7)), calls)
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls.size)
+    }
+
+    @Test
+    fun `大きすぎる関数を特定できたら、その関数を足してやり直す`() {
+        val calls = ArrayList<Set<Int>>()
+        // 4 つ大きすぎる関数があり、1回に1つずつ分かる。命令の数の順の候補には入っていない
+        val result = EndiveRuntime.compileWithFallback(setOf(1), true, 1..20, { listOf(2, 3) }) { set ->
+            calls += set
+            val next = listOf(11, 12, 13, 14).firstOrNull { it !in set } ?: return@compileWithFallback "ok"
+            throw tooLarge("func_$next")
+        }!!
+        assertEquals("ok", result.value)
+        assertEquals(setOf(1, 11, 12, 13, 14), result.interpreted)
+        assertEquals(5, calls.size)
+    }
+
+    @Test
+    fun `関数の本体でないメソッドや範囲の外の番号は、特定できない失敗として扱う`() {
+        val defined = 2..5
+        assertEquals(3, EndiveRuntime.tooLargeFunction(tooLarge("func_3"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(tooLarge("func_1"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(tooLarge("func_9"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(tooLarge("call_3"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(tooLarge("call_indirect_3"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(tooLarge("func_3x"), defined))
+        assertEquals(null, EndiveRuntime.tooLargeFunction(IllegalStateException("func_3"), defined))
+        // 包まれていてもたどる
+        assertEquals(4, EndiveRuntime.tooLargeFunction(RuntimeException(RuntimeException(org.objectweb.asm.MethodTooLargeException("C", "func_4", "()I", 70000))), defined))
+    }
+
+    @Test
+    fun `同じ関数でまた落ちたら、特定できない失敗の枠に回す`() {
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..9, { emptyList() }) { set ->
+            calls += set
+            throw tooLarge("func_4")
+        }
+        assertEquals(null, result)
+        // 1回目で 4 を足し、2回目も 4 で落ちたら、候補がないので諦める
+        assertEquals(listOf(emptySet(), setOf(4)), calls)
+    }
+
+    @Test
+    fun `特定できた関数でのやり直しは、回数に上限がある`() {
+        var calls = 0
+        val many = EndiveRuntime.compileWithFallback(setOf(0), true, 0..10_000, { emptyList() }, clock = { 0L }) { set ->
+            calls++
+            throw tooLarge("func_${set.size}")
+        }
+        assertEquals(null, many)
+        assertEquals(EndiveRuntime.MAX_IDENTIFIED_RETRIES + 1, calls)
+    }
+
+    @Test
+    fun `やり直しが3回までなら、1回が遅くても時間で諦めない`() {
+        // #446 の前は、時間を見ずに 3 回までやり直していた。1回に 2 秒かかっても、4 回目のコンパイルで通る
+        var now = 0L
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
+            calls += set
+            now += 2_000_000_000L
+            if (set.size < 4) throw tooLarge("func_${10 + set.size}")
+            "ok"
+        }!!
+        assertEquals(setOf(0, 11, 12, 13), result.interpreted)
+        assertEquals(4, calls.size)
+    }
+
+    @Test
+    fun `やり直しが3回を超えるときは、時間の上限を超えるならやめる`() {
+        // 1回に 1.5 秒: 3 回やり直した（4 回コンパイルした）後は、6 秒 + 1.5 秒が上限の 4 秒を超えるのでやめる
+        var now = 0L
+        var calls = 0
+        val slow = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
+            calls++
+            now += 1_500_000_000L
+            throw tooLarge("func_${set.size}")
+        }
+        assertEquals(null, slow)
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+
+        // 1回 0.5 秒なら、7 回目（3.5 秒 + 0.5 秒が 4 秒に収まる）までやり直せる。8 回目の後は 4 秒 + 0.5 秒で超える
+        now = 0L
+        calls = 0
+        val fast = EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }) { set ->
+            calls++
+            now += 500_000_000L
+            throw tooLarge("func_${set.size}")
+        }
+        assertEquals(null, fast)
+        assertEquals(8, calls)
+    }
+
+    @Test
+    fun `特定できない失敗の時間も、時間の上限に数える`() {
+        // 特定できない失敗 3 回（4.5 秒）の後に特定できた失敗が出ても、時間の上限（4 秒）を超えているのでやり直さない
+        var now = 0L
+        var calls = 0
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7) }, clock = { now }) {
+            calls++
+            now += 1_500_000_000L
+            throw if (calls <= 3) IllegalStateException("特定できない") else tooLarge("func_50")
+        }
+        assertEquals(null, result)
+        assertEquals(4, calls)
+    }
+
+    @Test
+    fun `特定できた失敗と特定できない失敗は別々に数え、特定できない分の枠は特定できた分で減らない`() {
+        // 特定できた 2 回の後に、特定できない 3 回が使える（時計は進めない）
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7, 8) }, clock = { 0L }) { set ->
+            calls += set
+            when (calls.size) {
+                1 -> throw tooLarge("func_11")
+                2 -> throw tooLarge("func_12")
+                3, 4, 5 -> throw IllegalStateException("特定できない")
+                else -> "ok"
+            }
+        }!!
+        assertEquals(setOf(11, 12, 5, 6, 7), result.interpreted)
+        assertEquals(6, calls.size)
+
+        // 特定できない失敗が 4 回続けば、特定できた分があっても諦める
+        calls.clear()
+        val giveUp = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6, 7, 8, 9) }, clock = { 0L }) { set ->
+            calls += set
+            if (calls.size == 1) throw tooLarge("func_11")
+            throw IllegalStateException("特定できない")
+        }
+        assertEquals(null, giveUp)
+        // 特定できた 1 回 + 特定できない 3 回のやり直し = 5 回のコンパイル
+        assertEquals(5, calls.size)
+    }
+
+    @Test
+    fun `特定できない失敗の後に特定できた失敗が出るモジュールは、両方の関数を足す`() {
+        // #37 の型の失敗で、命令の数の順に 1 つ足し、次に MethodTooLargeException で別の関数が特定できる（SIMD がなくても起きる経路）
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6) }) { set ->
+            calls += set
+            when {
+                calls.size == 1 -> throw IllegalStateException("特定できない")
+                11 !in set -> throw tooLarge("func_11")
+                else -> "ok"
+            }
+        }!!
+        assertEquals(setOf(5, 11), result.interpreted)
+        assertEquals(listOf(emptySet(), setOf(5), setOf(5, 11)), calls)
+    }
+
+    @Test
+    fun `命令の数の順の候補と特定した関数が重なったら、特定できない失敗として扱って次の候補を足す`() {
+        // 候補の 5 を足した後に、5 で落ちた（すでに回している）なら、特定できない失敗として次の 6 を足し、候補が尽きたら諦める
+        val calls = ArrayList<Set<Int>>()
+        val result = EndiveRuntime.compileWithFallback(emptySet(), true, 0..100, { listOf(5, 6) }) { set ->
+            calls += set
+            if (calls.size == 1) throw IllegalStateException("特定できない")
+            throw tooLarge("func_5")
+        }
+        assertEquals(null, result)
+        assertEquals(listOf(emptySet(), setOf(5), setOf(5, 6)), calls)
+    }
+
+    @Test
+    fun `時計を測れる JVM では、既定の時計はこのスレッドのCPU時間で測る`() {
+        val clock = EndiveRuntime.defaultCompileClock()
+        val a = clock()
+        // 待っても CPU 時間は進まない（経過時間なら 200 ms 以上進む）
+        Thread.sleep(200)
+        val waited = clock() - a
+        val bean = java.lang.management.ManagementFactory.getThreadMXBean()
+        if (bean.isCurrentThreadCpuTimeSupported && bean.isThreadCpuTimeEnabled) {
+            assertTrue(waited < 100_000_000L, "待っただけで ${waited / 1_000_000} ms 進んだ")
+        }
+    }
+
+    @Test
+    fun `例外処理を使うモジュールは、特定できてもやり直さない`() {
+        var calls = 0
+        val result = EndiveRuntime.compileWithFallback(emptySet(), false, 0..9, { listOf(3) }) {
+            calls++
+            throw tooLarge("func_3")
+        }
+        assertEquals(null, result)
+        assertEquals(1, calls)
+    }
+
+    /** Endive の FAIL の分岐と同じ形（ASM の例外を原因に持つ） */
+    private fun tooLarge(method: String): RuntimeException =
+        run.endive.wasm.WasmEngineException("too large", org.objectweb.asm.MethodTooLargeException("Machine", method, "()I", 70_000))
+
     /** export された関数の番号（import を含めた番号） */
     private fun exportIndex(bytes: ByteArray, name: String): Int {
         val exports = Parser.parse(bytes).exportSection()
@@ -225,5 +542,10 @@ class EndiveCompilerTest {
         val module = EndiveRuntime().load(resource("fib.wasm"))
         val results = (0 until 4).map { module.instantiate(WasmInstanceConfig.EMPTY) }.map { instance -> instance.use { it.call("fib", 10)[0] } }
         assertEquals(List(4) { 55L }, results)
+    }
+
+    private companion object {
+        /** JVM のメソッドの上限（64 KiB）を超える数の、[sumBody] の命令の組 */
+        const val TOO_LARGE_GROUPS: Int = 30_000
     }
 }
