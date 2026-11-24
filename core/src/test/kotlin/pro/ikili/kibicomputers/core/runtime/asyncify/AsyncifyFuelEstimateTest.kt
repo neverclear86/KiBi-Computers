@@ -21,6 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelSites
 import run.endive.wasm.Parser
+import run.endive.wasm.types.OpCode
 
 /** 変換が足すコードの分を、止まりうる関数の課金に見込む（#389。ADR 0329 の「#389: 変換が足すコードの見込み」） */
 class AsyncifyFuelEstimateTest {
@@ -28,20 +29,27 @@ class AsyncifyFuelEstimateTest {
 
     /**
      * `w.wait() -> i32` を呼んで、その値の回数だけ回る loop（止まりうる関数 `run` の中）と、
-     * 50 回まわる葉の関数 `leaf`（止まりうる関数を呼ばない）を通る `run() -> i32`。戻り値は 7（`AsyncifyTest` と同じ形）
+     * 50 回まわる葉の関数 `leaf`（止まりうる関数を呼ばない）を通る `run() -> i32`。戻り値は 7（`AsyncifyTest` と同じ形）。
+     *
+     * [pad] は、loop の中の分岐の後のセグメントに足す `i32.const 0; drop` の組の数（セグメントの課金を大きくする）。
+     * [tryTable] なら `run` の本体を catch のない `try_table` で包む（燃料をローカルに写さず、グローバルで数える形になる。ADR 0028）
      */
-    private fun loopModule(simd: Boolean = false): ByteArray {
+    private fun loopModule(simd: Boolean = false, pad: Int = 0, tryTable: Boolean = false): ByteArray {
         val b = WasmBinary()
         val wait = b.importFunc("w", "wait", emptyList(), listOf(i32))
         b.mutableI64Global(0)
         // [simd] なら loop の中に SIMD の命令を入れる（段1で loop の先頭が待ち点になり、型を追えずに断られる。段2では変換できる）
         val simdOp = if (simd) WasmBinary.code(0xFD, 0x0C, ByteArray(16), 0xFD, 0x1B, 0, 0x1A) else ByteArray(0)
-        val countDown = WasmBinary.code(0x02, 0x40, 0x03, 0x40, simdOp, 0x20, 0, 0x45, 0x0D, 1, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B)
+        val padding = ByteArray(pad * 3) { intArrayOf(0x41, 0, 0x1A)[it % 3].toByte() }
+        val countDown = WasmBinary.code(
+            0x02, 0x40, 0x03, 0x40, simdOp, 0x20, 0, 0x45, 0x0D, 1, padding, 0x20, 0, 0x41, 1, 0x6B, 0x21, 0, 0x0C, 0, 0x0B, 0x0B,
+        )
         val leaf = b.func(listOf(i32), listOf(i32), countDown + WasmBinary.code(0x41, 7))
+        val inner = WasmBinary.code(0x10, wait, 0x21, 0) + countDown + WasmBinary.code(0x41, 50, 0x10, leaf)
         val run = b.func(
             emptyList(),
             listOf(i32),
-            WasmBinary.code(0x10, wait, 0x21, 0) + countDown + WasmBinary.code(0x41, 50, 0x10, leaf),
+            if (tryTable) WasmBinary.code(0x1F, i32, 0, inner, 0x0B) else inner,
             locals = listOf(i32),
         )
         b.exportFunc("run", run)
@@ -60,13 +68,13 @@ class AsyncifyFuelEstimateTest {
 
     private val metered = FuelInjector.inject(loopModule())
 
-    /** 挿入した [metered] を、[weight] で見込んで変換する（[yield] なら燃料切れも待ち点にする段1） */
-    private fun transform(weight: AsyncifyFuelWeight?, yield: Boolean = true): ByteArray = Asyncify.transform(
-        metered.bytes,
+    /** 挿入した [m]（既定は [metered]）を、[weight] で見込んで変換する（[yield] なら燃料切れも待ち点にする段1） */
+    private fun transform(weight: AsyncifyFuelWeight?, yield: Boolean = true, m: FuelInjector.Result = metered): ByteArray = Asyncify.transform(
+        m.bytes,
         setOf("w.wait"),
         if (yield) Instrumentation.YIELD_IMPORT else null,
-        metered::originalFunc,
-        fuelSites = weight?.let { metered.sites.withWeight(it) },
+        m::originalFunc,
+        fuelSites = weight?.let { m.sites.withWeight(it) },
     ).bytes
 
     private val noExhaustion = object : WasmFuelHandler {
@@ -105,13 +113,13 @@ class AsyncifyFuelEstimateTest {
         assertArrayEquals(Instrumentation.apply(loopModule(), setOf("w.wait")), Instrumentation.apply(loopModule(), setOf("w.wait")))
     }
 
-    @Test
-    fun `止まりうる関数の課金だけを倍率どおりに増やし、葉の関数は変えない`() {
+    /** 挿入した [m] を段1・段2で変換し、止まりうる関数 `run` の loop の 1 回ごとの燃料がちょうど 2 倍になり、葉の関数は変わらないことを確かめる */
+    private fun assertDoublesOnlySuspending(m: FuelInjector.Result) {
         assertEquals(2, FuelCosts.ASYNCIFY_NUMERATOR / FuelCosts.ASYNCIFY_DENOMINATOR)
         for (yield in listOf(true, false)) {
             val stage = "段${if (yield) 1 else 2}"
-            val none = transform(AsyncifyFuelWeight.NONE, yield)
-            val def = transform(AsyncifyFuelWeight.DEFAULT, yield)
+            val none = transform(AsyncifyFuelWeight.NONE, yield, m)
+            val def = transform(AsyncifyFuelWeight.DEFAULT, yield, m)
             val base = listOf(0, 100, 200).map { used(none, it) }
             val extra = listOf(0, 100, 200).map { used(def, it) - used(none, it) }
             // 止まりうる関数 run の loop の 1 回ごとの燃料は、ちょうど 2 倍になる（増えた分 = 見込まないときの分）
@@ -124,7 +132,40 @@ class AsyncifyFuelEstimateTest {
             assertTrue(extra[0] in 1 until base[0], "$stage: $base $extra")
             // 葉の関数（定義済みの関数の 0 番）は変換しないので、命令も課金もそのまま
             assertEquals(instructions(none, 0), instructions(def, 0))
-            assertEquals(instructions(metered.bytes, 0).size, instructions(def, 0).size)
+            assertEquals(instructions(m.bytes, 0).size, instructions(def, 0).size)
+        }
+    }
+
+    /** [bytes] の、止まりうる関数 `run`（定義済みの関数の 1 番）の中の `i64.const` の値（課金の定数） */
+    private fun i64Consts(bytes: ByteArray): List<Long> =
+        instructions(bytes, 1).filter { it.first == OpCode.I64_CONST }.map { it.second[0] }
+
+    @Test
+    fun `止まりうる関数の課金だけを倍率どおりに増やし、葉の関数は変えない`() = assertDoublesOnlySuspending(metered)
+
+    @Test
+    fun `倍にして課金の定数が長くなっても（1 バイトから 2 バイト）、使う燃料はちょうど 2 倍になる`() {
+        // loop の分岐の後のセグメントの課金を 32〜63（sleb で 1 バイト）にして、倍の 64〜126 で 2 バイトになるようにする
+        val m = FuelInjector.inject(loopModule(pad = 20))
+        val before = i64Consts(m.bytes)
+        assertTrue(before.any { it in 32..63 }, "$before")
+        assertDoublesOnlySuspending(m)
+        // 変換の後の run には、2 バイトになった課金の定数がある（後ろの命令も正しく写せている）
+        for (yield in listOf(true, false)) {
+            val after = i64Consts(transform(AsyncifyFuelWeight.DEFAULT, yield, m))
+            assertTrue(after.any { it in 64..126 }, "$after")
+            assertEquals(before.filter { it > 0 }.map { it * 2 }.sorted(), after.filter { it > 0 }.sorted())
+        }
+    }
+
+    @Test
+    fun `try_table を含む止まりうる関数（燃料をグローバルで数える形）でも、課金を差し替えて倍にする`() {
+        for (pad in listOf(0, 20)) {
+            val m = FuelInjector.inject(loopModule(pad = pad, tryTable = true))
+            // 燃料をローカルに写さないので、run のローカルは元の 1 つのまま（写す形なら i64 のローカルが 1 つ増える）
+            assertEquals(1, Parser.parse(m.bytes).codeSection().getFunctionBody(1).localTypes().size)
+            assertTrue(m.sites.charges[1].isNotEmpty())
+            assertDoublesOnlySuspending(m)
         }
     }
 

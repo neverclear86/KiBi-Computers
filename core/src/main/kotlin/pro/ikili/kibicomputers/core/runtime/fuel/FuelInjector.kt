@@ -122,7 +122,9 @@ internal object FuelInjector {
      * @property bytes 挿入した後の WASM
      * @property checks 残りを確かめるところの数
      * @property charges 燃料を引くところの数
-     * @property maxUnchecked 残りを確かめる間に実行されうる命令数の最大（燃料の行き過ぎの上限の目安。長さに比例する分は含まない）
+     * @property maxUnchecked 残りを確かめる間に実行されうる命令数の最大（燃料の行き過ぎの上限の目安。長さに比例する分は含まない）。
+     *   命令の数で、燃料ではない: 待機点に変換した止まりうる関数の中では課金を [FuelCosts.ASYNCIFY_NUMERATOR] / [FuelCosts.ASYNCIFY_DENOMINATOR] 倍にする（#389）ので、
+     *   燃料で見た行き過ぎは、この値の最大でその倍率倍（今は 2 倍）になる
      * @property sizesBefore 定義済みの関数ごとの、挿入の前の本体の大きさ（バイト）
      * @property sizesAfter 同じく挿入の後
      * @property fuelFunc 足した [WasmFuel.IMPORT_NAME] の import の関数の番号（元の関数の import の数）。
