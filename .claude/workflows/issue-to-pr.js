@@ -688,7 +688,10 @@ ${gradleRules(info.number, `ci-fix${i}${note ? '-wait' : ''}`)}
 ${failureLog}`,
         { label: `ci-fix${note ? '-wait' : ''}:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
       ),
-      r => gradlePending(r, r?.summary, r?.pushed === false && r?.rerun !== true),
+      // 不安定なテストとして回し直した（pushed=false・rerun=true）ときは、コードを変えておらず、ビルドも確かめなくてよい。
+      // gradleStillRunning=true が一緒に返っても待つやり直しはしない（やり直しは手順の最初からなので、不安定なテストの Issue と run の回し直しがもう1回起きる）。
+      // 待つやり直しをするのは、push した（確かめていない変更がある）か、直せず回し直しもしない（理由の文が未完了を示す）ときだけ
+      r => (r?.rerun === true && r?.pushed !== true) ? null : gradlePending(r, r?.summary, r?.pushed === false && r?.rerun !== true),
     )
     if (fixed && stillPending) {
       // 直しのビルドを確かめていないので、直ったことにして先へ進めない。落ちたまま、理由を添えて返す

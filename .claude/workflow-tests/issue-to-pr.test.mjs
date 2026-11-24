@@ -213,6 +213,27 @@ test('CI の直し: 2 回とも未完了なら、直ったことにせず止ま�
   assert.match(r.issue.question, /2 回返した/)
 })
 
+test('CI の直し: 不安定なテストで回し直した（rerun=true）なら、gradleStillRunning=true が付いても待つやり直しはしない', async () => {
+  const r = await run({
+    ci: [FAILED_CI, OK_CI],
+    'ci-fix': [{ pushed: false, rerun: true, summary: 'flaky #1', ...PENDING }],
+    'ci-fix-wait': [{ pushed: false, rerun: true, summary: 'flaky #2', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.count('ci-fix'), 1)
+  assert.equal(r.count('ci-fix-wait'), 0)
+  assert.equal(r.count('ci'), 2)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('CI の直し: push した直しの gradleStillRunning=true は、rerun が偽なら待つやり直しになる', async () => {
+  const r = await run({
+    ci: [FAILED_CI, OK_CI],
+    'ci-fix': [{ pushed: true, rerun: false, summary: 'x', ...PENDING }],
+    'ci-fix-wait': [{ pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.equal(r.count('ci-fix-wait'), 1)
+})
+
 const FINDING = { file: 'a.kt', line: 1, severity: 'should', problem: 'p' }
 
 test('レビューの直し: 未完了ならやり直しで進む', async () => {
