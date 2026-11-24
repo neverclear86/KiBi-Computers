@@ -30,6 +30,9 @@ internal class LoadDeadline(
     /** 使った時間（ナノ秒） */
     val elapsedNanos: Long get() = clock() - start
 
+    /** 上限までの残り（ナノ秒。超えていれば負） */
+    val remainingNanos: Long get() = limitNanos - elapsedNanos
+
     /** 上限を超えていたら [WasmLoadException] を投げる。[phase] はメッセージに入れる、今していること */
     @Throws(WasmLoadException::class)
     fun check(phase: String) {

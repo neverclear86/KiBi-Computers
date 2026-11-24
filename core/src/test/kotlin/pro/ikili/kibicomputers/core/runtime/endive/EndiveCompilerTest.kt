@@ -259,6 +259,77 @@ class EndiveCompilerTest {
     }
 
     @Test
+    fun `燃料の計測コードを挿入したモジュールでも、import を含めた番号で大きすぎる関数を読み取る`() {
+        // 製品の経路では、燃料の計測コードの挿入が関数の import を足す（定義した関数の番号が import の分ずれる）。
+        // Endive のメソッドの名前（func_<番号>）が import を含めた番号で、定義した関数の範囲（defined）と合っていることを、実物で確かめる
+        val tooLarge = ArrayList<Int>()
+        var simd = -1
+        val original = WasmBinary().run {
+            simd = func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 7), locals = listOf(0x7B)).also { exportFunc("seven", it) }
+            exportFunc("small", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 8)))
+            repeat(4) { i ->
+                tooLarge += func(emptyList(), listOf(WasmBinary.I32), sumBody(TOO_LARGE_GROUPS, 200_003 + i), locals = listOf(WasmBinary.I32)).also { exportFunc("big$i", it) }
+            }
+            build()
+        }
+        val injected = FuelInjector.inject(original)
+        val parsed = Parser.parse(injected.bytes)
+        val imported = parsed.importSection().count(run.endive.wasm.types.ExternalType.FUNCTION)
+        assertTrue(imported > 0, "燃料の計測コードの挿入が関数の import を足していない")
+        // 時計は止めておく（時間の上限に掛からないように）
+        val module = EndiveRuntime(true) { 0L }.load(injected.bytes)
+        assertTrue(isCompiled(module))
+        val interpreted = interpretedFunctions(module)
+        // import を含めた番号で、定義した関数の範囲に入っている
+        assertTrue(interpreted.all { it >= imported }, "$interpreted")
+        assertEquals(setOf(simd) + tooLarge, interpreted.map(injected::originalFunc).toSet())
+        val config = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
+        val names = listOf("seven", "small") + (0 until 4).map { "big$it" }
+        val expected = EndiveRuntime(compile = false).load(injected.bytes).instantiate(config).use { i -> names.map { i.call(it)[0] } }
+        assertEquals(listOf(7L, 8L), expected.take(2))
+        val config2 = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
+        assertEquals(expected, module.instantiate(config2).use { i -> names.map { i.call(it)[0] } })
+    }
+
+    @Test
+    fun `やり直しの時間の上限は、呼んだ側の残りの半分を超えない`() {
+        val second = 1_000_000_000L
+        // 残りが多ければ既定の 4 秒
+        assertEquals(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS, EndiveRuntime.retryBudget(Long.MAX_VALUE, 0))
+        assertEquals(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS, EndiveRuntime.retryBudget(10 * second, second))
+        // 残り 5 秒でパースに 0.5 秒使ったなら 2 秒。残りがなければ 0
+        assertEquals(2 * second, EndiveRuntime.retryBudget(5 * second, second / 2))
+        assertEquals(0L, EndiveRuntime.retryBudget(second, 2 * second))
+        assertEquals(0L, EndiveRuntime.retryBudget(-second, 0))
+    }
+
+    @Test
+    fun `呼んだ側の残りが少なければ、3回を超えるやり直しをその分で止める`() {
+        // #446 のレビュー: 1回 0.3 秒、大きすぎる関数が 12 個。時間の上限が 4 秒なら 12 回目まで（3.6 秒 + 0.3 秒）やり直すが、
+        // コンポーネントの core モジュールの1つ目で、残りの等分が 2.4 秒（上限 1.2 秒）なら、4 回のコンパイル（#446 の前と同じ）で止める
+        var now = 0L
+        var calls = 0
+        fun run(budget: Long): Any? {
+            now = 0L
+            calls = 0
+            return EndiveRuntime.compileWithFallback(setOf(0), true, 0..100, { emptyList() }, clock = { now }, budgetNanos = budget) { set ->
+                calls++
+                now += 300_000_000L
+                if (set.size <= 12) throw tooLarge("func_${set.size}")
+                "ok"
+            }
+        }
+        assertEquals(null, run(EndiveRuntime.retryBudget(2_400_000_000L, 0)))
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+        // 上限が 0 でも、#446 の前から許していた 3 回のやり直しはする
+        assertEquals(null, run(0L))
+        assertEquals(EndiveRuntime.MAX_COMPILE_RETRIES + 1, calls)
+        // 既定の 4 秒なら、13 回目のコンパイルで通る（3.6 秒 + 0.3 秒が 4 秒に収まる）
+        assertEquals("ok", (run(EndiveRuntime.COMPILE_RETRY_BUDGET_NANOS) as EndiveRuntime.Companion.Fallback<*>).value)
+        assertEquals(13, calls)
+    }
+
+    @Test
     fun `大きすぎる関数を特定できないときは、命令の数の多い順に3回までやり直す`() {
         val calls = ArrayList<Set<Int>>()
         val result = EndiveRuntime.compileWithFallback(setOf(0), true, 0..9, { listOf(5, 6, 7, 8) }) { set ->

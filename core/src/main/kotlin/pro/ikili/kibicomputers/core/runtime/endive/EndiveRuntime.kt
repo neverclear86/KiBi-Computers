@@ -103,11 +103,20 @@ public class EndiveRuntime internal constructor(
     override val name: String get() = NAME
 
     @Throws(WasmLoadException::class)
-    override fun load(bytes: ByteArray): WasmModule {
+    override fun load(bytes: ByteArray): WasmModule = load(bytes, Long.MAX_VALUE)
+
+    /**
+     * [timeLeftNanos] は、呼んだ側の読み込みの時間の上限の残り。[MAX_COMPILE_RETRIES] 回を超えるコンパイルのやり直しを、
+     * その半分（から、このモジュールのパースと検証に使った時間を引いたもの）と [COMPILE_RETRY_BUDGET_NANOS] の小さい方に収める（[retryBudget]。#446）
+     */
+    @Throws(WasmLoadException::class)
+    override fun load(bytes: ByteArray, timeLeftNanos: Long): WasmModule {
+        val start = clock()
         val interpreted = parseModule(bytes)
         if (!compile) return interpreted
+        val budget = retryBudget(timeLeftNanos, clock() - start)
         // コンパイルできなければ、インタプリタで動かす（パースと検証は通っているので、動かせる WASM を断らない）
-        val compiled = compileOrNull(interpreted.module) ?: return interpreted
+        val compiled = compileOrNull(interpreted.module, budget) ?: return interpreted
         // パースした命令の列（module）はここで手放す。持つのは関数の本体を除いたモジュール（インタプリタで動かす関数の本体は残る）と
         // コンパイル結果だけ
         return EndiveWasmModule(compiled.module.wasmModule(), compiled.module, compiled.interpreted)
@@ -162,6 +171,7 @@ public class EndiveRuntime internal constructor(
      * インタプリタに回す関数がなければ、JVM のメソッドの上限を超える関数は、Endive がその関数だけインタプリタに回す
      * （[InterpreterFallback.WARN]）。回す関数を決めて渡すと、Endive の制約でこの自動の切り替えを使えない（[InterpreterFallback.FAIL]）ので、
      * 失敗の例外から大きすぎる関数を読み取って足し、やり直す（[compileWithFallback]。#446）。
+     * [budgetNanos] は、[MAX_COMPILE_RETRIES] 回を超えるやり直しに掛ける時間の上限（[retryBudget]）。
      *
      * ただし、例外処理（タグ）を使うモジュールでは、関数ごとにインタプリタとコンパイルしたコードを混ぜない
      * （混ぜると、Lua のコルーチンの戻り値が欠けるなど、結果が変わった。#341）。1つでもコンパイルできない関数があれば、
@@ -170,7 +180,7 @@ public class EndiveRuntime internal constructor(
      * 1回目に [InterpreterFallback.WARN] で Endive が自動で回した関数は、[Compilation.interpreted] に入らない
      * （Endive がコンパイルの結果に出さない）。
      */
-    private fun compileOrNull(module: EndiveModule): Compilation? {
+    private fun compileOrNull(module: EndiveModule, budgetNanos: Long): Compilation? {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
         val simd = simdFunctions(module)
         if (simd == null) {
@@ -183,7 +193,7 @@ public class EndiveRuntime internal constructor(
         }
         val imported = module.importSection().count(ExternalType.FUNCTION)
         val defined = imported until imported + module.codeSection().functionBodies().size
-        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }, clock) { interpreted ->
+        val result = compileWithFallback(simd, mixable, defined, { largeFunctions(module) }, clock, budgetNanos) { interpreted ->
             // メソッドの名前から関数の番号を読むので、名前の付け方を固定する（既定。func_<番号>）
             val builder = MachineFactoryCompiler.builder(module).withMethodPrefixer(MethodPrefixer.defaultPrefixer())
             when {
@@ -219,7 +229,8 @@ public class EndiveRuntime internal constructor(
         /**
          * [MAX_COMPILE_RETRIES] 回を超えるやり直しの前に見る、コンパイルに使う時間（ナノ秒）の上限（#446）。それまでの合計に、1回にかかった最大の時間を
          * 足して超えるなら、やり直さずにモジュール全体をインタプリタで動かす。読み込みの上限（CPU 時間で 8 秒。`LoadDeadline`）で
-         * 断られないよう、その半分にする。[MAX_COMPILE_RETRIES] 回までのやり直しには掛けない（#446 の前にコンパイルできたモジュールを、
+         * 断られないよう、その半分にする。呼んだ側が上限の残りを渡したときは、その半分の方が小さければそちらを使う（[retryBudget]。
+         * 構造の確認・燃料の挿入・待機点への変換に時間を使った後や、コンポーネントの2つ目以降の core モジュール）。[MAX_COMPILE_RETRIES] 回までのやり直しには掛けない（#446 の前にコンパイルできたモジュールを、
          * 時間のせいで全体インタプリタに落とさないため。そこまでは、#446 の前と同じ最大 4 回のコンパイル）。仮の値（#251）
          */
         internal const val COMPILE_RETRY_BUDGET_NANOS: Long = 4_000_000_000L
@@ -230,6 +241,14 @@ public class EndiveRuntime internal constructor(
          * （結果は `ProgramCache` で共有されて残る）、検証の時間の上限（`LoadDeadline`）と同じく CPU 時間で測る。
          */
         internal fun defaultCompileClock(): () -> Long = LoadDeadline.cpuClock() ?: System::nanoTime
+
+        /**
+         * [MAX_COMPILE_RETRIES] 回を超えるやり直しに掛ける時間の上限（ナノ秒）。呼んだ側の時間の上限の残り [timeLeftNanos] の半分から、
+         * このモジュールのパースと検証に使った時間 [used] を引いたものと、[COMPILE_RETRY_BUDGET_NANOS] の小さい方（負なら 0）。
+         * 半分にするのは、1回の最大で見積もった次のコンパイルの時間が外れても、呼んだ側の上限で断られないよう余らせるため
+         */
+        internal fun retryBudget(timeLeftNanos: Long, used: Long): Long =
+            minOf(COMPILE_RETRY_BUDGET_NANOS, timeLeftNanos / 2 - used.coerceAtLeast(0)).coerceAtLeast(0)
 
         /**
          * [compile] でコンパイルし、失敗したら関数をインタプリタに回してやり直す。結果か、諦めたら `null`（ログに出す）。
@@ -244,7 +263,7 @@ public class EndiveRuntime internal constructor(
          *
          * 特定できた分と特定できない分を合わせたやり直しが [MAX_COMPILE_RETRIES] 回に達するまでは、時間を見ずにやり直す
          * （#446 の前と同じ。コンパイルは最大 4 回）。それを超えるやり直しは、それまでのコンパイルの時間の合計（特定できない失敗の分も含む）に
-         * 1回の最大を足して [COMPILE_RETRY_BUDGET_NANOS] を超えないときだけ行う。特定できた分と特定できない分は別々に数える
+         * 1回の最大を足して [budgetNanos]（既定は [COMPILE_RETRY_BUDGET_NANOS]。[retryBudget]）を超えないときだけ行う。特定できた分と特定できない分は別々に数える
          * （特定できない分の枠は、特定できた分で減らない）。
          *
          * [defined] は定義した関数の番号の範囲（import を含めた番号）。[clock] はナノ秒の時刻（このスレッドで呼ぶ。既定は [defaultCompileClock]。
@@ -256,6 +275,7 @@ public class EndiveRuntime internal constructor(
             defined: IntRange,
             largeFunctions: () -> List<Int>,
             clock: () -> Long = defaultCompileClock(),
+            budgetNanos: Long = COMPILE_RETRY_BUDGET_NANOS,
             compile: (Set<Int>) -> T,
         ): Fallback<T>? {
             val interpreted = LinkedHashSet(simd)
@@ -286,7 +306,7 @@ public class EndiveRuntime internal constructor(
                 longest = maxOf(longest, took)
                 if (!mixable) return giveUp(failure, "")
                 // #446 の前から許していた回数までは、時間を見ない
-                val tooSlow = identified + unidentified >= MAX_COMPILE_RETRIES && spent + longest > COMPILE_RETRY_BUDGET_NANOS
+                val tooSlow = identified + unidentified >= MAX_COMPILE_RETRIES && spent + longest > budgetNanos
                 val id = tooLargeFunction(failure, defined)?.takeIf { it !in interpreted }
                 if (id != null) {
                     if (identified >= MAX_IDENTIFIED_RETRIES) return giveUp(failure, "（大きすぎる関数が多すぎる）")

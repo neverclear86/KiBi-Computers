@@ -198,7 +198,7 @@ internal class Program private constructor(
             val copy = bytes.copyOf()
             val deadline = limits?.let { LoadDeadline(it.timeLimitNanos) }
             if (limits != null) ModulePrescan.check(copy, limits, deadline)
-            val module = runtime.load(copy)
+            val module = runtime.load(copy, deadline?.remainingNanos ?: Long.MAX_VALUE)
             deadline?.check("パース・検証・コンパイル")
             val hash = ModuleHash.of(copy)
             return Program(hash, module, ModuleSource(hash.bytes(), false, emptyList(), 0, false), cacheWeight = copy.size.toLong())
@@ -230,7 +230,7 @@ internal class Program private constructor(
                 throw WasmLoadException("待機点に変換できない: ${e.message ?: "理由不明"}", e)
             }
             val injected = applied.bytes
-            val module = runtime.load(injected)
+            val module = runtime.load(injected, deadline?.remainingNanos ?: Long.MAX_VALUE)
             deadline?.check("パース・検証・コンパイル")
             val hash = ModuleHash.of(injected)
             applied.fuelYieldRejection?.let { FuelYieldRejectionLog.report(hash, it) }
