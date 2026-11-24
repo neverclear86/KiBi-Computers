@@ -242,6 +242,8 @@ const FIX_SCHEMA = {
   type: 'object',
   properties: {
     pushed: { type: 'boolean' },
+    // CI の直し（ci-fix）だけが使う。PR と関係のない不安定なテストと判断し、push せずに落ちたジョブを回し直した
+    rerun: { type: 'boolean' },
     summary: { type: 'string' },
   },
   required: ['pushed', 'summary'],
@@ -536,15 +538,19 @@ async function untilGreen(info, impl, tag) {
   for (let i = 1; ci && !ci.passed && ci.mergeable !== 'CONFLICTING' && !ci.noChecksOnly && i <= MAX_CI_FIXES; i++) {
     log(`PR #${impl.pr}: CI 失敗（${ci.failingChecks.join(', ')}）。修正 ${i}/${MAX_CI_FIXES}`)
     const fixed = await agent(
-      `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。worktree の中で原因を直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する。
+      `${REPO} の PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の CI が失敗した。原因を調べ、PR の変更が原因なら worktree の中で直し、\`./gradlew build\` と両バージョンの \`runGameTestServer\` を通してから、コミットして push する（不安定なテストのときの扱いは下に書く）。
 ${gradleRules(info.number, `ci-fix${i}`)}
 失敗したチェック: ${ci.failingChecks.join(', ')}
-再実行や修正に進む前に、落ちた run の artifact \`test-reports-attempt-<試行の番号>\`（テスト結果の XML と GameTest のログ。\`gh run download <run-id> -n <名前>\` で取る）を確かめる。不安定なテストが原因に見えるなら、落ちたテストの XML を PR に貼ってから直す（再実行で通るだけなら、この artifact を添えて新しい Issue で追う）。
+まず、落ちた run の artifact \`test-reports-attempt-<試行の番号>\`（テスト結果の XML と GameTest のログ。run の ID と試行の番号はログ抜粋の先頭にある）を、worktree の外に取る: \`gh run download <run-id> -n test-reports-attempt-<n> -D <ルート>/.worktrees/.logs/issue-${info.number}/ci-reports-<run-id>-<n>\`（中のパスは手元のビルド出力と同じなので、worktree の中に展開しない）。artifact が無いとき（コンパイルで落ちた、upload の段まで進まなかったなど）は、ログ抜粋と \`gh run view <run-id> --log-failed\` から原因を探す。そのうえで、次のどれかで返す。
+- PR の変更が原因なら、直して push し、pushed=true で返す。
+- PR の変更と関係のない不安定なテストと判断したとき（PR が触っていない所のテストで、手元で繰り返しても再現しない、main でも同じテストが落ちたことがある、など）は、コードを直さない。落ちたテストの \`<testcase>\` の抜粋（\`<failure>\` と関係する system-out。XML の全文は GitHub のコメントの上限 65,536 文字を超えることがあるので貼らない）と run の URL を添えて新しい Issue を作り（同じテストの Issue がもうあれば、そこにコメントする）、AGENTS.md の手順で適切な Epic のサブ Issue にする。PR にその Issue の番号をコメントしてから、\`gh run rerun <run-id> --failed\` で落ちたジョブを回し直し、\`gh run view <run-id> --json status\` で queued か in_progress になったのを確かめて、pushed=false・rerun=true で返す（summary に Issue の番号を書く）。
+- 直せず、回し直す理由もないときは、pushed=false・rerun=false で返し、summary に理由を書く。
 ログ抜粋:
 ${ci.failureLog}`,
       { label: `ci-fix:${tag}#${i}`, phase: 'CI', schema: FIX_SCHEMA, ...(i === 1 ? M.fixFirst : M.fixAgain) },
     )
-    if (!fixed || !fixed.pushed) break
+    // 不安定なテストで回し直したとき（rerun）も、push したときと同じく CI を待ち直す
+    if (!fixed || !(fixed.pushed || fixed.rerun)) break
     ci = await waitCiResolvingConflicts(info, impl, `ci:${tag}#${i}`, conflictState)
   }
   return ci
