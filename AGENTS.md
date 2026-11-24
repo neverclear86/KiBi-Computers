@@ -52,6 +52,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 - 起動ログは `platform-*/run/logs/latest.log`。起動すると `WASM runtime self-check passed` が出る。
 - CI（`.github/workflows/build.yml`）は `build` と、両バージョンの `runGameTestServer`・`runJarGameTestServer` を実行する。`runJarGameTestServer` は `run/jar-gametest/mods/` に今のビルドの jar（1.20.1 は reobf の前のもの）を置き、MOD のソースセットと Endive をクラスパスに載せずに起動する。Endive の依存を変えたら、こちらも通す。
+- CI のどこかの段が落ちる（またはキャンセルされる）と、テスト結果の XML（`**/build/test-results/**/*.xml`）と GameTest のサーバーのログ（`platform-*/run/logs/latest.log`、`platform-*/run/jar-gametest/logs/latest.log`）が artifact `test-reports-attempt-<run_attempt>` に残る（保持 30 日。#394。コンパイルで落ちたときなど、まだ何もなければ artifact はできない）。不安定なテストは再実行で通ると記録が消えるので、**再実行・修正の前に** `gh run download <run-id> -n test-reports-attempt-<n> -D <作業ツリーの外のディレクトリ>` で取る。中のパスはリポジトリのルートからの相対で手元のビルド出力と同じ場所なので、`-D` を付けずに作業ツリーで展開しない（既存のファイルに当たって失敗するか、手元の出力に混ざる）。Issue か PR には、落ちたテストの `<testcase>`（`<failure>` と関係する system-out）の抜粋と run の URL を貼る（XML の全文はコメントの上限 65,536 文字を超えることがある）。再実行で通ったときは、それを添えて新しい Issue で原因を追う。
 
 ## 完了の条件
 
