@@ -113,12 +113,13 @@
 
 ## 追記（#706）: ほかのインスタンスの関数の参照を置く定数式を断る
 
-Endive 1.2.0 は、import した funcref のグローバルの値（渡した側のインスタンスでの関数の番号）を、次の 2 つの定数式で、受け取った側の関数の番号として置いてしまう（インタプリタ・コンパイルとも。上流の main でも同じ）。別の関数が呼ばれるか、型が合わずにトラップする。
+Endive 1.2.0 は、import した funcref のグローバルの値（渡した側のインスタンスでの関数の番号）を、次の 3 つの定数式で、受け取った側の関数の番号として置いてしまう（インタプリタ・コンパイルとも。上流の main でも同じ）。別の関数が呼ばれるか、型が合わずにトラップする。
 
 - パッシブの要素の式（`table.init` で置く。`OpcodeImpl.TABLE_INIT` が、アクティブの要素と違って `ConstantEvaluators.computeConstantInstance` で持ち主を引かない）
 - 関数の参照の型の、定義したグローバルの初期値（`Instance.initialize` が持ち主を自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
+- GC のオブジェクトを作る定数式（`struct.new`・`array.new`・`array.new_fixed`。グローバルの初期値と、アクティブ・パッシブどちらの要素の式も）が、funcref・関数の型の参照の import したグローバルを `global.get` してフィールド・要素に入れる形（例: `(global (ref $S) (struct.new $S (global.get $fr)))`）。`ConstantEvaluators.computeConstant` が、funcref のフィールドを渡した側での番号のまま int で入れるので、`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる。ソースを読んだ限りで、動かして値を確かめてはいない（今は struct・array の型を持つモジュールが製品の経路で読めない（#891）ので、判定だけをテストで確かめる）
 
-直るまでは、`EndiveRuntime.parseModule` が `foreignFuncRefInitializer` で見つけて `WasmLoadException` で断る（対応しない作りとして扱う。`AsyncifyUnsupported` ではない）。対象は、番号（int）で持つ参照の型（funcref・関数の型の参照）が、import したグローバルを `global.get` する形だけ。externref・GC の参照は参照ごと置くので断らない。判定は読み込みのときに 1 回だけで、結果は `ProgramCache` が共有するので、実行中のコストはない。グローバルの import を持てるのは、計測しないモジュールと燃料を共有する形（コンポーネントの core モジュール）だけなので、p1 のプログラムには当たらない。
+直るまでは、`EndiveRuntime.parseModule` が `foreignFuncRefInitializer` で見つけて `WasmLoadException` で断る（対応しない作りとして扱う。`AsyncifyUnsupported` ではない）。最初の 2 つの対象は、番号（int）で持つ参照の型（funcref・関数の型の参照）が、import したグローバルを `global.get` する形だけ。externref・GC の参照そのもの（struct・array の参照）は参照ごと置くので断らない（3 つ目は、オブジェクトの中に入れる funcref だけが番号のままになる）。判定は読み込みのときに 1 回だけで、結果は `ProgramCache` が共有するので、実行中のコストはない。グローバルの import を持てるのは、計測しないモジュールと燃料を共有する形（コンポーネントの core モジュール）だけなので、p1 のプログラムには当たらない。
 
 比べた方式: 読み込みで動く形に書き換える（隠した表に入れて `table.init` を `table.copy` にするなど）は、`elem.drop` の後のトラップの条件・表の番号・RAM の数え方・状態保存の表の一覧・Asyncify の `sharedTables` に波及し、めったに当たらない形に対して重すぎる。Endive を差し替える（fork・shade）は、Jar-in-Jar とコンパイルしたコードの呼び出しを壊しやすい。funcref のグローバルの import を丸ごと断ると、正しく動くアクティブの要素まで断る。
 

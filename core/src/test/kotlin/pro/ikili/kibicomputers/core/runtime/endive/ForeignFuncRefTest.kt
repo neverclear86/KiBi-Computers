@@ -110,6 +110,54 @@ class ForeignFuncRefTest {
         )
     }
 
+    /** GC の型を持つモジュールを、読み込みの経路（#891 で別の理由で断られうる）を通さずに、判定だけにかける */
+    private fun gcDetect(wat: String): String? = EndiveRuntime.foreignFuncRefInitializer(Parser.parse(WitTool.wat(wat)))
+
+    @org.junit.jupiter.api.Test
+    fun `GCのオブジェクトの中に、importしたfuncrefのグローバルを入れる定数式を断る`() {
+        val head = """
+            (type ${'$'}ft (func (result i32)))
+            (type ${'$'}S (struct (field (ref null ${'$'}ft))))
+            (type ${'$'}A (array (mut (ref null ${'$'}ft))))
+            (import "env" "fr" (global ${'$'}fr (ref null ${'$'}ft)))
+        """
+        // struct.new
+        val s = gcDetect("(module $head (global (ref ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))")
+        assertTrue(s != null && s.contains("グローバル 0") && s.contains("GC のオブジェクト"), s)
+        // array.new_fixed・array.new
+        val a = gcDetect("(module $head (global (ref ${'$'}A) (array.new_fixed ${'$'}A 2 (global.get ${'$'}fr) (global.get ${'$'}fr))))")
+        assertTrue(a != null && a.contains("グローバル 0"), a)
+        val n = gcDetect("(module $head (global (ref ${'$'}A) (array.new ${'$'}A (global.get ${'$'}fr) (i32.const 2))))")
+        assertTrue(n != null && n.contains("グローバル 0"), n)
+        // GC の型のパッシブの要素の式
+        val e = gcDetect("(module $head (elem ${'$'}pe (ref ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))")
+        assertTrue(e != null && e.contains("要素セグメント 0"), e)
+        // アクティブの要素の式も、式の中でオブジェクトに入れるので同じ
+        val ae = gcDetect(
+            "(module $head (table ${'$'}t 1 (ref null ${'$'}S)) (elem (table ${'$'}t) (i32.const 0) (ref ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))",
+        )
+        assertTrue(ae != null && ae.contains("要素セグメント 0"), ae)
+    }
+
+    @org.junit.jupiter.api.Test
+    fun `GCのオブジェクトを作っても、importした関数の参照を入れなければ断らない`() {
+        val head = """
+            (type ${'$'}ft (func (result i32)))
+            (type ${'$'}S (struct (field (ref null ${'$'}ft)) (field i32)))
+            (type ${'$'}A (array (mut (ref null ${'$'}ft))))
+            (import "env" "fr" (global ${'$'}fr (ref null ${'$'}ft)))
+            (import "env" "n" (global ${'$'}n i32))
+            (func ${'$'}f (result i32) i32.const 1)
+            (elem declare func ${'$'}f)
+        """
+        // 自分の ref.func・import した i32・既定値の new は、番号を運ばない
+        assertNull(gcDetect("(module $head (global (ref ${'$'}S) (struct.new ${'$'}S (ref.func ${'$'}f) (global.get ${'$'}n))))"))
+        assertNull(gcDetect("(module $head (global (ref ${'$'}S) (struct.new_default ${'$'}S)))"))
+        assertNull(gcDetect("(module $head (global (ref ${'$'}A) (array.new_default ${'$'}A (i32.const 2))))"))
+        // import した funcref のグローバルがあっても、オブジェクトに入れなければ断らない
+        assertNull(gcDetect("(module $head (global ${'$'}g (ref null ${'$'}S) (ref.null ${'$'}S)))"))
+    }
+
     @ParameterizedTest
     @ValueSource(strings = ["plain", "shared"])
     fun `正しく動く形は断らない`(form: String) {
