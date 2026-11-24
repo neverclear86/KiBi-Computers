@@ -60,3 +60,31 @@ MOD を更新して初めてワールドを読み込むと、電源の入って�
 ## 1.20.1
 
 `platform-forge-1.20.1` には今、保存一式（`MachineSaveStore`）がない。移植するとき（#224 配下）に、`ModList` の版を同じように渡し、`ColdBootLog` も同じように使う。両方の接続層で版の文字列が同じなら、同じ core として戻る。違えば冷えた起動になり、安全側に倒れる。
+
+## 追記（#680）: Endive の実行時ログ
+
+#673 で `kibicomputers.*` のログは `latest.log` に流れるようになったが、Endive（WASM ランタイム）のログは対象の外だった。Endive 1.2.0 のソースを洗い出した結果、Issue の前提（Endive は `System.getLogger("endive")` で出す）は半分しか合っていなかった。
+
+### 洗い出し（Endive 1.2.0）
+
+| 出どころ | 出し方 | 本番で出るか | 運用者に要るか | 扱い |
+| --- | --- | --- | --- | --- |
+| `compiler` の `InterpreterFallback.WARN`（JVM のメソッドの上限を超えた関数をインタプリタに回した） | **`System.err.println` に直に**（`Warning: using interpreted mode for WASM function index: N`）。1.21.1 の GameTest のサーバーで確かめると、`latest.log` には出ず、プロセスの標準エラー（Gradle・サーバーのコンソールの出力）にだけ1回ごとに出た。バニラの `Bootstrap.wrapStreams` が `System.err` を log4j に流す環境なら、`[STDERR]` の INFO になる。どちらでも、運用者のログ（`latest.log`）の外か、1回ごとの行になる | 出る（大きな関数を持ち、例外処理を使わない WASM を、コンパイルするたび） | 要る（性能の苦情を調べる手がかり）。ただし1回ごとの行は要らない | `InterpreterFallback.SILENT` にし、`kibicomputers.wasm` に自分で出して間引く（下） |
+| `wasi` の `WasiPreview1`（`System.getLogger("endive")`。ほぼ `tracef`、`errorf` は `fd_fdstat_set_rights` の1つ） | `System.Logger` | 出ない（本番で作るのは `ComponentValidator` だけで、黙らせるロガーを渡している） | 要らない（trace） | `endive` の根にも経路を付ける（保険。下） |
+| `runtime` の `CompilerInterpreterMachine`（インタプリタの関数を呼ぶたび） | `System.err.println` | 出ない（システムプロパティ `endive.compiler.printUseOfInterpretedFunctions` のときだけ） | 要らない | そのまま |
+| runtime・wasm・codegen のほかの箇所 | ロガーも標準エラーも使わない | — | — | — |
+
+### 決めたこと
+
+- **大きすぎる関数の自動の切り替えは `InterpreterFallback.SILENT` にする**（`EndiveRuntime.compileOrNull`）。どの関数を回したかは Endive の公開の口に出ない（`CompilerResult` は `internal` パッケージ）ので、コンパイル後のモジュール（`CompiledModule.wasmModule()`）に本体が残った関数（`EndiveRuntime.retainedFunctions`）から読む。Endive はインタプリタで動かす関数と、そこから末尾呼び出しで届く関数の本体だけを残す（`WasmModule.stripped`）ので、本当の集合と同じか、それより広い。読んだ集合は `kibicomputers.wasm` のログと、テスト用の `interpretedFunctions` に使う（今までは自動で回した分が空だった）
+- **インタプリタに回したことのログは、理由ごとに最初の1回だけ WARNING、2回目からは DEBUG**（`CompileFallbackLog`。DEBUG には何回目かを添える）。理由は「関数の型に v128」「例外処理を使うモジュールの SIMD」「一部の関数だけ」「モジュール全体（コンパイルの失敗）」の4つ。#673 の前からあった `kibicomputers.wasm` の WARNING も同じく間引く。コンパイルは中身の SHA-256 ごとに1回（`ProgramCache`）だが、プレイヤーはバイト列を少し変えて exec し直せば何度でもコンパイルさせられるので、1回ごとの WARNING はこの節の方針（1台ごと・1件ごとの行でログを埋めない）に触れる
+  - 理由の数が決まっているので、覚える数の上限は要らない（ADR 0044・0065 の 64 個の上限は、キーの数が入力しだいのときのもの）
+  - JVM 全体で1つ（`EndiveRuntime` の companion）。サーバーの起動ごとには作り直さない。開発クライアントで統合サーバーを立て直すと、2回目のサーバーでは WARNING が出ず DEBUG だけになる。コンパイル結果のキャッシュも JVM 全体なので、それに合わせる
+  - 数え口（`Stats`）は足さない（理由ごとの回数は `CompileFallbackLog.count` に持つが、テスト用）
+- **`endive` の `System.Logger` にも経路を付ける**（`CoreLogRouting.install(sink, CoreLogRouting.ENDIVE_ROOT, …)`。両バージョンの `CoreLogBridge` が `kibicomputers` と並べて取り付ける）。今は出す元がないが、Endive を上げてロガーを使う箇所が増えたときに、標準エラー（JUL の root の `ConsoleHandler`）でなく `latest.log` に出るようにする。JUL 側の `endive` のレベルは log4j の設定（`endive` とその下の `LoggerConfig`）を写すので、既定（INFO）では `WasiPreview1` の `tracef` は書式を作る前に落ちる
+- `System.err` の差し替え、JUL の root の `ConsoleHandler` の付け替え、`System.LoggerFinder` の差し替え（#673 で採らないと決めた）はしない。どれもプロセス全体の状態で、MC やほかの MOD とぶつかる
+- `InterpreterFallback.FAIL` にそろえて自前のやり直しだけで回す案は採らない。大きすぎる関数が多いと、やり直しの上限でモジュール全体がインタプリタになる（測っていない速度の低下）
+
+### Endive を上げるとき
+
+Endive を上げたら、`System.err`・`System.out`・`run.endive.log`（`System.Logger`）を使う箇所を grep し直し、この表を直す（AGENTS.md の「つまずきやすい点」にも書いた）。今回の前提の食い違いは、これをしていなかったことから起きた。

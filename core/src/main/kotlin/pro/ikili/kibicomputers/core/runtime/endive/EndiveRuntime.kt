@@ -75,7 +75,8 @@ import run.endive.wasm.WasmModule as EndiveModule
  * Endive による [WasmRuntime]。
  *
  * [load] でパース・検証の後に、ランタイムコンパイラで JVM のバイトコードにコンパイルする（#29 の決定 B、#37）。
- * JVM のメソッドの上限を超える関数だけは、Endive がその関数をインタプリタで動かす（[InterpreterFallback.WARN]。ログに出る）。
+ * JVM のメソッドの上限を超える関数だけは、Endive がその関数をインタプリタで動かす（[InterpreterFallback.SILENT]。
+ * Endive の WARN は標準エラーに直に出すので使わず、`kibicomputers.wasm` に自分で出して間引く。[CompileFallbackLog]、#680）。
  * Endive のコンパイラは SIMD（v128）に対応していないので、SIMD を使う関数（[simdFunctions]）もその関数だけインタプリタで動かし、
  * ほかの関数はコンパイルする（#424）。そのときも、上限を超える関数は失敗の例外から読み取って、その関数だけインタプリタに回す（#446）。
  * コンパイルの後は、関数の本体を除いたモジュール（[CompiledModule.wasmModule]）だけを持ち、パースした命令の列は捨てる
@@ -169,7 +170,7 @@ public class EndiveRuntime internal constructor(
      * 関数の呼び出しの橋渡しをコンパイルできないので、モジュール全体をインタプリタで動かす。
      *
      * インタプリタに回す関数がなければ、JVM のメソッドの上限を超える関数は、Endive がその関数だけインタプリタに回す
-     * （[InterpreterFallback.WARN]）。回す関数を決めて渡すと、Endive の制約でこの自動の切り替えを使えない（[InterpreterFallback.FAIL]）ので、
+     * （[InterpreterFallback.SILENT]。#680）。回す関数を決めて渡すと、Endive の制約でこの自動の切り替えを使えない（[InterpreterFallback.FAIL]）ので、
      * 失敗の例外から大きすぎる関数を読み取って足し、やり直す（[compileWithFallback]。#446）。
      * [budgetNanos] は、[MAX_COMPILE_RETRIES] 回を超えるやり直しに掛ける時間の上限（[retryBudget]）。
      *
@@ -177,18 +178,22 @@ public class EndiveRuntime internal constructor(
      * （混ぜると、Lua のコルーチンの戻り値が欠けるなど、結果が変わった。#341）。1つでもコンパイルできない関数があれば、
      * モジュール全体をインタプリタで動かす。SIMD を使う関数があるときも同じ。
      *
-     * 1回目に [InterpreterFallback.WARN] で Endive が自動で回した関数は、[Compilation.interpreted] に入らない
-     * （Endive がコンパイルの結果に出さない）。
+     * 1回目に [InterpreterFallback.SILENT] で Endive が自動で回した関数は、Endive がコンパイルの結果の公開の口に出さないので、
+     * コンパイル後のモジュールに本体が残った関数（[retainedFunctions]）から読む（#680）。
      */
     private fun compileOrNull(module: EndiveModule, budgetNanos: Long): Compilation? {
         val mixable = module.tagSection().map { it.tagCount() == 0 }.orElse(true) && module.importSection().count(ExternalType.TAG) == 0
         val simd = simdFunctions(module)
         if (simd == null) {
-            LOG.log(System.Logger.Level.WARNING, "WASM の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす")
+            FALLBACK_LOG.report(CompileFallbackLog.Reason.V128_SIGNATURE) {
+                "WASM の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
+            }
             return null
         }
         if (simd.isNotEmpty() && !mixable) {
-            LOG.log(System.Logger.Level.WARNING, "例外処理を使う WASM の関数 $simd が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす")
+            FALLBACK_LOG.report(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS) {
+                "例外処理を使う WASM の関数 $simd が SIMD を使っていてコンパイルできないので、モジュール全体をインタプリタで動かす"
+            }
             return null
         }
         val imported = module.importSection().count(ExternalType.FUNCTION)
@@ -198,12 +203,23 @@ public class EndiveRuntime internal constructor(
             val builder = MachineFactoryCompiler.builder(module).withMethodPrefixer(MethodPrefixer.defaultPrefixer())
             when {
                 !mixable -> builder.withInterpreterFallback(InterpreterFallback.FAIL)
-                interpreted.isEmpty() -> builder.withInterpreterFallback(InterpreterFallback.WARN)
+                // WARN は Endive が標準エラーに直に出す（`latest.log` の外か、1回ごとの `[STDERR]` の行になる）ので使わない（#680）
+                interpreted.isEmpty() -> builder.withInterpreterFallback(InterpreterFallback.SILENT)
                 // 決めた関数をインタプリタに回すときは、ほかの関数の自動の切り替えは使えない（Endive の制約）
                 else -> builder.withInterpreterFallback(InterpreterFallback.FAIL).withInterpretedFunctions(interpreted)
             }
             builder.compileModule()
         } ?: return null
+        if (result.interpreted.isEmpty() && mixable) {
+            // Endive が自動で回した関数（SILENT）。ここで自分の言葉で出す
+            val auto = retainedFunctions(result.value.wasmModule())
+            if (auto.isNotEmpty()) {
+                FALLBACK_LOG.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) {
+                    "WASM の関数 $auto をインタプリタで動かす（JVM のメソッドの上限を超える）"
+                }
+            }
+            return Compilation(result.value, auto)
+        }
         return Compilation(result.value, result.interpreted)
     }
 
@@ -212,6 +228,22 @@ public class EndiveRuntime internal constructor(
         public const val NAME: String = "endive"
 
         private val LOG: System.Logger = System.getLogger("kibicomputers.wasm")
+
+        /** インタプリタに回したことのログ。JVM 全体で1つ（#680。[CompileFallbackLog]） */
+        internal val FALLBACK_LOG: CompileFallbackLog = CompileFallbackLog(LOG)
+
+        /**
+         * コンパイルした後のモジュール（[CompiledModule.wasmModule]）に本体が残っている関数の番号（import を含めた番号。#680）。
+         * Endive は、インタプリタで動かす関数と、そこから末尾呼び出しで届く関数の本体だけを残す（`WasmModule.stripped`）。
+         * なので、インタプリタに回した関数の集合と同じか、それより広い（間接の末尾呼び出しがあれば、定義した関数の全部になる）
+         */
+        internal fun retainedFunctions(stripped: EndiveModule): Set<Int> {
+            val imported = stripped.importSection().count(ExternalType.FUNCTION)
+            val bodies = stripped.codeSection().functionBodies()
+            val out = LinkedHashSet<Int>()
+            for (i in bodies.indices) if (bodies[i] != null) out += i + imported
+            return out
+        }
 
         /**
          * コンパイルに失敗し、失敗の例外から大きすぎる関数を特定できないとき、命令の数が多い関数をインタプリタに回してやり直す回数
@@ -290,7 +322,7 @@ public class EndiveRuntime internal constructor(
                     val value = compile(interpreted.toSet())
                     if (interpreted.isNotEmpty()) {
                         val retries = if (identified + unidentified > 0) "。やり直し: 特定した関数で $identified 回、特定できずに $unidentified 回" else ""
-                        LOG.log(System.Logger.Level.WARNING, "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない$retries）")
+                        FALLBACK_LOG.report(CompileFallbackLog.Reason.SOME_FUNCTIONS) { "WASM の関数 $interpreted をインタプリタで動かす（コンパイルできない$retries）" }
                     }
                     return Fallback(value, interpreted.toSet())
                 } catch (e: RuntimeException) {
@@ -324,7 +356,7 @@ public class EndiveRuntime internal constructor(
         }
 
         private fun giveUp(failure: Throwable, reason: String): Nothing? {
-            LOG.log(System.Logger.Level.WARNING, "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす$reason: $failure")
+            FALLBACK_LOG.report(CompileFallbackLog.Reason.WHOLE_MODULE) { "WASM をコンパイルできないので、モジュール全体をインタプリタで動かす$reason: $failure" }
             return null
         }
 
@@ -750,7 +782,10 @@ internal fun trapKind(message: String): WasmTrapKind {
 private class EndiveWasmModule(
     val module: EndiveModule,
     private val compiled: CompiledModule?,
-    /** コンパイルしたとき、インタプリタで動かす関数の番号（import を含めた番号。テスト用） */
+    /**
+     * コンパイルしたとき、インタプリタで動かす関数の番号（import を含めた番号。テスト用）。Endive が自動で回した分（#680）は、
+     * 本体が残った関数から読むので、そこから末尾呼び出しで届く関数も含みうる（[EndiveRuntime.retainedFunctions]）
+     */
     val interpretedFunctions: Set<Int> = emptySet(),
 ) : WasmModule {
     /** コンパイルしたコードで動かすなら `true`（テスト用） */

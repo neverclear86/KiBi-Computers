@@ -544,6 +544,58 @@ class EndiveCompilerTest {
         assertEquals(List(4) { 55L }, results)
     }
 
+    @Test
+    fun `大きすぎる関数だけのモジュールは、Endiveの自動の切り替えでその関数だけをインタプリタに回し、標準エラーに何も書かない`() {
+        // #680: SIMD の関数がないので、Endive の自動の切り替え（SILENT）の経路を通る。燃料の計測コードも挿入する（製品の経路と同じ）
+        val tooLarge = ArrayList<Int>()
+        val original = WasmBinary().run {
+            exportFunc("small", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 8)))
+            repeat(2) { i ->
+                tooLarge += func(emptyList(), listOf(WasmBinary.I32), sumBody(TOO_LARGE_GROUPS, 300_003 + i), locals = listOf(WasmBinary.I32)).also { exportFunc("big$i", it) }
+            }
+            build()
+        }
+        val injected = FuelInjector.inject(original)
+        val before = EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.SOME_FUNCTIONS)
+        // 標準エラーは JVM 全体の状態なので、読み込みの間だけ差し替えて、必ず戻す（core のテストは並列に動かさない）
+        val err = java.io.ByteArrayOutputStream()
+        val saved = System.err
+        val module = try {
+            System.setErr(java.io.PrintStream(err, true, Charsets.UTF_8))
+            EndiveRuntime(true) { 0L }.load(injected.bytes)
+        } finally {
+            System.setErr(saved)
+        }
+        assertEquals("", err.toString(Charsets.UTF_8))
+        assertTrue(isCompiled(module))
+        assertEquals(tooLarge.toSet(), interpretedFunctions(module).map(injected::originalFunc).toSet())
+        // 自分の言葉で1回報告した（WARNING か DEBUG かは、同じ JVM の前のテストしだい）
+        assertEquals(before + 1, EndiveRuntime.FALLBACK_LOG.count(CompileFallbackLog.Reason.SOME_FUNCTIONS))
+        val names = listOf("small", "big0", "big1")
+        fun run(m: pro.ikili.kibicomputers.core.runtime.WasmModule): Pair<List<Long>, Long> {
+            val config = WasmInstanceConfig.builder().fuel(1_000_000_000, null).build()
+            return m.instantiate(config).use { i -> names.map { i.call(it)[0] } to (config.initialFuel - i.fuel) }
+        }
+        val expected = run(EndiveRuntime(compile = false).load(injected.bytes))
+        assertEquals(8L, expected.first[0])
+        assertTrue(expected.second > 0)
+        // 結果も使う燃料もインタプリタと同じ
+        assertEquals(expected, run(module))
+    }
+
+    @Test
+    fun `コンパイルした後のモジュールに本体が残った関数を、importを含めた番号で返す`() {
+        val bytes = WasmBinary().run {
+            exportFunc("a", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 1)))
+            exportFunc("b", func(emptyList(), listOf(WasmBinary.I32), WasmBinary.code(0x41, 2)))
+            build()
+        }
+        val parsed = Parser.parse(bytes)
+        assertEquals(setOf(0, 1), EndiveRuntime.retainedFunctions(parsed))
+        assertEquals(setOf(1), EndiveRuntime.retainedFunctions(parsed.stripped(setOf(1))))
+        assertEquals(emptySet<Int>(), EndiveRuntime.retainedFunctions(parsed.stripped(emptySet())))
+    }
+
     private companion object {
         /** JVM のメソッドの上限（64 KiB）を超える数の、[sumBody] の命令の組 */
         const val TOO_LARGE_GROUPS: Int = 30_000
