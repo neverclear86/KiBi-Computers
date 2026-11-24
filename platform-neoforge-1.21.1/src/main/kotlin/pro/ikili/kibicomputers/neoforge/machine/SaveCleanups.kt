@@ -123,7 +123,8 @@ internal object SaveCleanups {
     }
 
     /**
-     * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules] はテストが差し替える（既定は今のサーバーのもの）
+     * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules]・[untrustedReasons] はテストが差し替える（既定は今のサーバーのもの）。
+     * [untrustedReasons] は、チャンクを読み書きする側が既定の作りでない理由の一覧を返す（空なら既定の作り。[ChunkReferenceProbe.untrustedRegionStorage]）
      */
     fun start(
         dryRun: Boolean,
@@ -131,12 +132,13 @@ internal object SaveCleanups {
         store: MachineSaveStore? = WorldMachineSaves.current,
         modules: FileModuleStore? = ServerMachines.moduleStore,
         settings: SaveCleanupSettings = SaveCleanupSettings.DEFAULT,
+        untrustedReasons: (MinecraftServer) -> List<String> = { ChunkReferenceProbe.untrustedRegionStorage(it) },
     ): SaveCleanup? {
         val s = server ?: return null
         // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
         if (running?.let { !it.finished || it.settling } == true || store == null) return null
         // 理由の一覧は掃除1回につき1回だけ調べ、問いの判定とログの両方に同じ結果を使う
-        val untrusted = ChunkReferenceProbe.untrustedRegionStorage(s)
+        val untrusted = untrustedReasons(s)
         val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty())
         if (untrusted.isNotEmpty()) {
             // 掃除1回につき1行（問いごとには出さない）
@@ -411,7 +413,8 @@ internal class ChunkReferenceProbe(
 
         /**
          * Mixin のクラス [mixin] が、アクセサー・インボーカーだけのもの（インターフェース）か。Mixin のインターフェースにはアクセサーとインボーカーしか書けない。
-         * Mixin のクラスは読み込めない（Mixin が弾く）ので、クラスファイルのアクセスフラグを読む。名前がない・読めないなら `false`（数える）
+         * 処理を書き換えるクラスの Mixin は Mixin が読み込みを弾く（`isLoadable()` が偽）が、アクセサーの Mixin は対象のクラスが実装するインターフェースとして読み込まれる。
+         * どちらも読み込まずに同じ方法で扱えるよう、クラスファイルのアクセスフラグを読む。名前がない・読めないなら `false`（数える）
          */
         fun isAccessorMixin(loader: ClassLoader?, mixin: String?): Boolean {
             if (mixin == null) return false

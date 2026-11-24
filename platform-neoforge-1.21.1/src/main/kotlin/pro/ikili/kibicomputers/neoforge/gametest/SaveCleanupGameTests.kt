@@ -194,6 +194,55 @@ object SaveCleanupGameTests {
     }
 
     /**
+     * 本番の経路 [SaveCleanups.start] が、検出した理由（[ChunkReferenceProbe.untrustedRegionStorage]）を問い（[ChunkReferenceProbe.regionNamesTrusted]）に渡す（#899）。
+     * 保存先に別の座標のリージョンファイルだけがあり、台の位置のリージョンファイルがないとき、理由が空でなければ台のディレクトリは「判定できない」に数えられて残り、
+     * 空なら「ない」に数えられる。検出（[vanillaRegionStorageIsTrusted]）と問い（[regionlessPositionIsKeptWhenRegionStorageIsModified]）の間をつなぐ部分を確かめる
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 800)
+    fun startPassesUntrustedReasonsToTheProbe(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        ensureVanillaRegion(helper)
+        val keptChunk = FarChunks.reserve(helper)
+        val absentChunk = FarChunks.reserve(helper)
+        val keptRoot = tempRoot(helper)
+        val absentRoot = tempRoot(helper)
+        val keptId = UUID.randomUUID()
+        val absentId = UUID.randomUUID()
+        previousDirectory(keptRoot, keptId, MachineOwner(dimension, keptChunk.minBlockX, 64, keptChunk.minBlockZ))
+        previousDirectory(absentRoot, absentId, MachineOwner(dimension, absentChunk.minBlockX, 64, absentChunk.minBlockZ))
+        val untrusted = SaveCleanups.start(
+            dryRun = true, force = false, store = MachineSaveStore(keptRoot, MachineIdIndex(), "test"), modules = null,
+            untrustedReasons = { listOf("test: mixin on the chunk storage") },
+        )
+        helper.assertTrue(untrusted != null, "the cleanup with untrusted reasons should start")
+        var trusted: SaveCleanup? = null
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(untrusted!!.finished, "the first cleanup should finish (${untrusted.phase})")
+        }.thenExecute {
+            val report = untrusted!!.report
+            helper.assertTrue(report.candidates == 1 && report.undetermined == 1 && report.unreferenced == 0, "untrusted reasons should keep the directory: $report")
+            trusted = SaveCleanups.start(
+                dryRun = true, force = false, store = MachineSaveStore(absentRoot, MachineIdIndex(), "test"), modules = null,
+                untrustedReasons = { emptyList() },
+            )
+            helper.assertTrue(trusted != null, "the cleanup without untrusted reasons should start")
+        }.thenWaitUntil {
+            helper.assertTrue(trusted!!.finished, "the second cleanup should finish (${trusted!!.phase})")
+        }.thenExecute {
+            try {
+                val report = trusted!!.report
+                helper.assertTrue(report.candidates == 1 && report.unreferenced == 1 && report.undetermined == 0, "no reasons should let the file names decide: $report")
+                helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, keptChunk)), "the cleanup should not create region files")
+            } finally {
+                deleteTree(keptRoot)
+                deleteTree(absentRoot)
+            }
+        }.thenSucceed()
+    }
+
+    /**
      * サーバーと同じ形の置き場（書き込みのスレッド [SaveWriter] で仕事を走らせる）とモジュールの置き場で掃除すると、指されていないディレクトリと、
      * 参照されていないモジュール・古い一時ファイルを、書き込みのスレッドの仕事（[MachineSaveStore.readModuleReferences]・[MachineSaveStore.runOnWriter]）で消す
      */
