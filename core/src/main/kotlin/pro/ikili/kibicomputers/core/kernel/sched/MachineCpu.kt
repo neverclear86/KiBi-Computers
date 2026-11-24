@@ -16,10 +16,13 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * 中のロックは末端のロックで、持ったまま他のロックを取らない（カーネルロックの中から呼んでよい）。
  * [onThreadlessGranted] はこのロックの中で呼ぶので、ブロックしてはいけない（許可の待ち行列に並べるだけ。#350）。
+ * 第2引数（strict）は、呼び手が巻き戻せる道（[enqueueThreadless] に `strict = true` を渡した spawn。#629）だけ `true` で、
+ * そのときだけ投げてよい（CPU は持ち主のまま残し、呼び手が [removeThreadless] で次へ渡す）。
+ * `false` のとき（CPU を次へ渡すとき・起こすときなど）は投げてはいけない（ワーカーに渡せなければ取り残しの列へ入れる。#875）。
  * [onThreadlessRevoked] は、渡した後でまだ動いていない待ち手を外すときに、同じくロックの中で呼ぶ（許可の待ち行列から外す）。
  */
 internal class MachineCpu(
-    private val onThreadlessGranted: (ProcessRuntime) -> Unit,
+    private val onThreadlessGranted: (ProcessRuntime, Boolean) -> Unit,
     private val onThreadlessRevoked: (ProcessRuntime) -> Unit = {},
 ) {
     private class Node(val rt: ProcessRuntime, val condition: Condition?) {
@@ -181,14 +184,18 @@ internal class MachineCpu(
     /** 予約があるか（テスト用） */
     fun hasReservation(rt: ProcessRuntime): Boolean = lock.withLockValue { reserved.containsKey(rt) }
 
-    /** スレッドを持たない待ち手として並ぶ。空いていればすぐ渡す */
-    fun enqueueThreadless(rt: ProcessRuntime) {
+    /**
+     * スレッドを持たない待ち手として並ぶ。空いていればすぐ渡す。
+     * [strict] なら、すぐ渡すときに [onThreadlessGranted] が投げてよく、その例外は呼び手に届く（CPU は [rt] が持ち主のまま。
+     * 呼び手が [removeThreadless] で巻き戻す。spawn の道だけ。#629）。並んだ後で渡すとき（[handOffLocked]）は、いつも投げない版にする（#875）
+     */
+    fun enqueueThreadless(rt: ProcessRuntime, strict: Boolean = false) {
         lock.lock()
         try {
             if (owner === rt || queue.any { it.rt === rt }) return
             if (owner == null && queue.isEmpty()) {
                 owner = rt
-                onThreadlessGranted(rt)
+                onThreadlessGranted(rt, strict)
             } else {
                 queue.addLast(Node(rt, null))
             }
@@ -219,7 +226,7 @@ internal class MachineCpu(
         }
         owner = next.rt
         next.granted = true
-        if (next.condition != null) next.condition.signal() else onThreadlessGranted(next.rt)
+        if (next.condition != null) next.condition.signal() else onThreadlessGranted(next.rt, false)
     }
 }
 
