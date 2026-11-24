@@ -269,6 +269,10 @@ class AsyncifyMultiValueTest {
      * - `else_both`: then と else の両方が止まる
      * - `else_only`: then は止まらず、else だけが止まる
      * - `empty_then`: then が空で、else だけが止まる（then の中身がないので、引数を積み直すだけになる）
+     * - `else_only_later`・`empty_then_later`: `else_only`・`empty_then` の `if` の後ろ（同じ繰り返しの中）にも待ち点を足したもの。
+     *   後ろの待ち点で止まった巻き直しは、条件が真の繰り返しでは、止まらない then の枝を REWINDING のまま通る
+     *   （`empty_then_later` は、中身が空の枝を包みのない `local.get` で積み直す道。`else_only_later` は、待ち点のない枝の最後のランを
+     *   `if (state == NORMAL)` で包む道）。`else_only`・`empty_then` の巻き直しは、止まった else の中へ入る道と燃料の確かめで NORMAL に戻る道だけ
      */
     private val elseWat = """
         (module
@@ -330,6 +334,55 @@ class AsyncifyMultiValueTest {
                 (else i32.add call ${'$'}wait i32.const 13 i32.mul))
               i32.const 5
               i32.mul
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 6
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "else_only_later") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32) (result i32 i32)
+                (then i32.const 7)
+                (else i32.const 100 i32.add call ${'$'}wait))
+              i32.const 11
+              i32.mul
+              i32.add
+              call ${'$'}wait
+              i32.add
+              local.set ${'$'}acc
+              local.get ${'$'}i
+              i32.const 1
+              i32.add
+              local.tee ${'$'}i
+              i32.const 5
+              i32.lt_u
+              br_if ${'$'}l)
+            local.get ${'$'}acc)
+          (func (export "empty_then_later") (result i32)
+            (local ${'$'}i i32) (local ${'$'}acc i32)
+            (loop ${'$'}l
+              local.get ${'$'}acc
+              local.get ${'$'}i
+              local.get ${'$'}i
+              i32.const 1
+              i32.and
+              (if (param i32 i32) (result i32 i32)
+                (then)
+                (else i32.add call ${'$'}wait i32.const 13 i32.mul))
+              i32.const 5
+              i32.mul
+              i32.add
+              call ${'$'}wait
               i32.add
               local.set ${'$'}acc
               local.get ${'$'}i
@@ -438,7 +491,7 @@ class AsyncifyMultiValueTest {
 
     @Test
     fun `引数付きのifでelseの側が止まっても、巻き直して結果が同じ`() {
-        checkAllWays(WitTool.wat(elseWat), listOf("else_both", "else_only", "empty_then"))
+        checkAllWays(WitTool.wat(elseWat), listOf("else_both", "else_only", "empty_then", "else_only_later", "empty_then_later"))
     }
 
     @Test
