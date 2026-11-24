@@ -108,7 +108,7 @@
 - `ToolchainComponentTest`: wasi-libc でビルドした p1 のプログラムを wasmtime のアダプター（`gradle/wasi-adapter.properties`）で p2 のコマンドにし、リンクして `wasi:cli/run` からホストの関数まで届き、標準入出力の own を受けた先まで進むことを確かめる（#265）。
 - `ComponentProcessTest`: カーネルの中で、インスタンスをまたぐ呼び出しと燃料切れでマシンを壊さない。読み込みの途中の失敗（#692）: 2 つ目の start 関数のトラップ（プロセスだけが `CRASHED`）、作る途中の燃料待ちでの kill と、インスタンスを作る間の kill（`KILLED`）。どれもマシンを壊さず、作った core インスタンスを閉じ、プロセスとマシンの RAM を返す。
 - `FuelInjectorSharedTest`: 燃料を共有する形の挿入（#692）。グローバルの import があるとき・ないときの、関数の本体・export・グローバルの初期値（import を指す形と、前に定義したグローバルを指す extended-const の形）・データと要素のオフセット・要素の式の番号の付け替えを、wasm-tools の検証、Endive の読み込み、実行の結果で確かめる。パッシブの要素の式は、Endive が `table.init` でほかのインスタンスの関数の参照を正しく置かず、ランタイムが読み込みで断る（#706）ので、wasm-tools で読み戻して確かめ、Endive の読み込みでは断ることを確かめる。共有しない形では、今までどおりグローバルの import を断る。
-- `ForeignFuncRefTest`: ほかのインスタンスの関数の参照を Endive が自分の番号として置いてしまう定数式を、計測なしと共有の燃料の形の両方で、読み込みで断る（#706。下の「追記（#706）」）。正しく動く形（アクティブの要素の import、パッシブの要素の `ref.func`、externref の要素）は断らず、動かして値を確かめる。
+- `ForeignFuncRefTest`: ほかのインスタンスの関数の参照を Endive が自分の番号として置いてしまう定数式を、計測なしと共有の燃料の形の両方で、読み込みで断る（#706。下の「追記（#706）」）。正しく動く形（アクティブの要素の import、表の初期値の import、パッシブの要素の `ref.func`、externref の要素、宣言の要素）は断らず、動かして値を確かめる。
 - GameTest `componentLinksOnServer`（両バージョン）。
 
 ## 追記（#706）: ほかのインスタンスの関数の参照を置く定数式を断る
@@ -117,7 +117,9 @@ Endive 1.2.0 は、import した funcref のグローバルの値（渡した側
 
 - パッシブの要素の式（`table.init` で置く。`OpcodeImpl.TABLE_INIT` が、アクティブの要素と違って `ConstantEvaluators.computeConstantInstance` で持ち主を引かない）
 - 関数の参照の型の、定義したグローバルの初期値（`Instance.initialize` が持ち主を自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
-- GC のオブジェクトを作る定数式（`struct.new`・`array.new`・`array.new_fixed`。グローバルの初期値と、アクティブ・パッシブどちらの要素の式も）が、funcref・関数の型の参照の import したグローバルを `global.get` してフィールド・要素に入れる形（例: `(global (ref $S) (struct.new $S (global.get $fr)))`）。`ConstantEvaluators.computeConstant` が、funcref のフィールドを渡した側での番号のまま int で入れるので、`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる。ソースを読んだ限りで、動かして値を確かめてはいない（今は struct・array の型を持つモジュールが製品の経路で読めない（#891）ので、判定だけをテストで確かめる）
+- GC のオブジェクトを作る定数式（`struct.new`・`array.new`・`array.new_fixed`。グローバルの初期値、アクティブ・パッシブどちらの要素の式、表の初期値の式（`(table 1 (ref null $S) (struct.new $S (global.get $fr)))`。`Instance` のコンストラクターが同じ `computeConstant` で作って `setObjRef` で置く）も）が、funcref・関数の型の参照の import したグローバルを `global.get` してフィールド・要素に入れる形（例: `(global (ref $S) (struct.new $S (global.get $fr)))`）。`ConstantEvaluators.computeConstant` が、funcref のフィールドを渡した側での番号のまま int で入れるので、`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる。ソースを読んだ限りで、動かして値を確かめてはいない（今は struct・array の型を持つモジュールが製品の経路で読めない（#891）ので、判定だけをテストで確かめる）
+
+import した funcref のグローバルを置ける定数式の場所のうち、次は正しく動くので断らない: アクティブの要素の式と、表の初期値の式（`(table 8 funcref (global.get $fr))`。`Instance` のコンストラクターが `computeConstantInstance` で持ち主を引いて `setRef` する）。宣言の要素（`(elem declare funcref (global.get $fr))`）は、`table.init` で使えず値が置かれないので見ない。どれも `ForeignFuncRefTest` で、断らないこと（表の初期値は、動かして渡した側の関数が呼ばれること。燃料を共有する形の挿入は、初期値の式を持つ表を別の理由で断るので、計測なしの形だけ）を確かめる。
 
 直るまでは、`EndiveRuntime.parseModule` が `foreignFuncRefInitializer` で見つけて `WasmLoadException` で断る（対応しない作りとして扱う。`AsyncifyUnsupported` ではない）。最初の 2 つの対象は、番号（int）で持つ参照の型（funcref・関数の型の参照）が、import したグローバルを `global.get` する形だけ。externref・GC の参照そのもの（struct・array の参照）は参照ごと置くので断らない（3 つ目は、オブジェクトの中に入れる funcref だけが番号のままになる）。判定は読み込みのときに 1 回だけで、結果は `ProgramCache` が共有するので、実行中のコストはない。グローバルの import を持てるのは、計測しないモジュールと燃料を共有する形（コンポーネントの core モジュール）だけなので、p1 のプログラムには当たらない。
 

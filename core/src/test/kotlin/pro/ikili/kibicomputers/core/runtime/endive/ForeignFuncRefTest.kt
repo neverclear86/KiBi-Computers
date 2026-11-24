@@ -137,6 +137,9 @@ class ForeignFuncRefTest {
             "(module $head (table ${'$'}t 1 (ref null ${'$'}S)) (elem (table ${'$'}t) (i32.const 0) (ref ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))",
         )
         assertTrue(ae != null && ae.contains("要素セグメント 0"), ae)
+        // 表の初期値の式も、Instance のコンストラクターが同じ computeConstant で作って置くので同じ
+        val t = gcDetect("(module $head (table 1 (ref null ${'$'}S) (struct.new ${'$'}S (global.get ${'$'}fr))))")
+        assertTrue(t != null && t.contains("表 0 の初期値"), t)
     }
 
     @org.junit.jupiter.api.Test
@@ -156,6 +159,42 @@ class ForeignFuncRefTest {
         assertNull(gcDetect("(module $head (global (ref ${'$'}A) (array.new_default ${'$'}A (i32.const 2))))"))
         // import した funcref のグローバルがあっても、オブジェクトに入れなければ断らない
         assertNull(gcDetect("(module $head (global ${'$'}g (ref null ${'$'}S) (ref.null ${'$'}S)))"))
+        // 表の初期値の式で、自分の ref.func を入れるオブジェクトも断らない
+        assertNull(gcDetect("(module $head (table 1 (ref null ${'$'}S) (struct.new ${'$'}S (ref.func ${'$'}f) (global.get ${'$'}n))))"))
+    }
+
+    @org.junit.jupiter.api.Test
+    fun `表の初期値の式が、importしたfuncrefのグローバルを指すのは断らない`() {
+        // 表の初期値は、アクティブの要素と同じく持ち主のインスタンスを引いて置く（Endive 1.2.0 の Instance のコンストラクター）。
+        // 燃料を共有する形の挿入は、初期値の式を持つ表をそもそも断るので、計測なしの形だけ（下で、断る理由が #706 でないことも確かめる）
+        val wat = """
+            (module
+              (import "env" "fr" (global ${'$'}fr funcref))
+              (table ${'$'}tb 2 funcref (global.get ${'$'}fr))
+              (type ${'$'}t (func (result i32)))
+              (func ${'$'}f0 (result i32) i32.const 10)
+              (func ${'$'}f1 (result i32) i32.const 11)
+              (func (export "ci") (param i32) (result i32) (call_indirect ${'$'}tb (type ${'$'}t) (local.get 0))))
+        """
+        val module = load("plain", wat)
+        val runtime = EndiveRuntime()
+        runtime.load(WitTool.wat(provider)).instantiate(WasmInstanceConfig.builder().build()).use { p ->
+            val b = WasmInstanceConfig.builder()
+            b.importExtern("env", "fr", requireNotNull(p.extern("fr")))
+            module.instantiate(b.build()).use { c ->
+                assertEquals(99, c.call("ci", 0).single())
+                assertEquals(99, c.call("ci", 1).single())
+            }
+        }
+        val e = assertThrows<WasmLoadException> { load("shared", wat) }
+        assertTrue(!e.message!!.contains("#706"), e.message)
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["plain", "shared"])
+    fun `宣言の要素の式が、importしたfuncrefのグローバルを指すのは断らない`(form: String) {
+        // 宣言の要素は table.init で使えないので、値が置かれることはない
+        load(form, consumer("(elem declare funcref (global.get ${'$'}fr))"))
     }
 
     @ParameterizedTest

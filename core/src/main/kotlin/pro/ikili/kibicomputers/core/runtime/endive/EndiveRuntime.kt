@@ -527,8 +527,12 @@ public class EndiveRuntime internal constructor(
          *   自分にする。そのグローバルを要素の式で使うと、アクティブ・パッシブのどちらも違う関数になる）
          * - 定数式の `struct.new`・`array.new`・`array.new_fixed` が、番号で持つ参照の型の import したグローバルを `global.get` して、
          *   フィールド・要素に入れる（Endive 1.2.0 の `ConstantEvaluators.computeConstant` は、funcref のフィールドを渡した側での番号のまま
-         *   int で入れる。`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる）。グローバルと、どの要素セグメントの式も見る
+         *   int で入れる。`struct.get` → `call_ref`・`table.set` で、受け取った側の同じ番号の関数になる）。グローバルの初期値、どの要素セグメントの式、
+         *   表の初期値の式（例: `(table 1 (ref null $S) (struct.new $S (global.get $fr)))`。`Instance` のコンストラクターが同じ
+         *   `computeConstant` で作って `setObjRef` で置く）を見る
          *
+         * 表の初期値の式が import したグローバルを直に `global.get` する形（`(table 8 funcref (global.get $fr))`）は、アクティブの要素と同じく
+         * `computeConstantInstance` で持ち主を引いて置くので正しく、断らない。
          * 最初の 2 つは、JVM で番号（int）として持つ参照の型（funcref・関数の型の参照。`isObjectRef` でないもの）だけ。externref・
          * GC の参照そのもの（struct・array の参照）は参照ごと置くので正しい。宣言の要素は `table.init` で使えないので見ない。
          * 関数の本体で値として運ぶ形（`global.get` → `table.set`・`call_ref`、import した表からの `table.get`）も同じく間違うが、
@@ -566,6 +570,13 @@ public class EndiveRuntime internal constructor(
                 }
                 if (el.initializers().any(::putsImportedFuncRefInObject)) {
                     return "要素セグメント $i の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
+                }
+            }
+            val tables = module.tableSection()
+            for (i in 0 until tables.tableCount()) {
+                val init: List<Instruction>? = tables.getTable(i).initialize()
+                if (init != null && putsImportedFuncRefInObject(init)) {
+                    return "表 $i の初期値の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
                 }
             }
             return null
