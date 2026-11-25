@@ -133,7 +133,8 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 何も変える前に [INSTANTIATE_FRAMES] 段を 1 回確かめる。`InstantiateStackExhaustionTest`（勘定の組と本物の Endive を直接組み、底に近い深さの
  * すべてで 5 つの型: 作り終える・要素の初期化で失敗・テーブルの上限で失敗・start が区画に書いてからトラップ・start の中で尽きる）と
  * `InstantiateStackExhaustionKernelTest`（本物のマシンで、ドライバーの本体とホストの関数の本体から。BLOCKING・WAIT_POINT）で、
- * 毎回の後に 3 段の勘定が戻ることを確かめた。確かめを外した（0 段の）手元の試験（JDK 17・JIT・Windows）では、どちらの試験でも、ずれは
+ * 毎回の後に 3 段の勘定が戻ることを確かめた（どちらの掃引も入口の確かめの有無・位置は見分けない。確かめを固定しているのは、
+ * `InstantiateStackExhaustionKernelTest` の、確かめが通らない深さで断ることを見る 2 本）。確かめを外した（0 段の）手元の試験（JDK 17・JIT・Windows）では、どちらの試験でも、ずれは
  * 1 回も出なかった（窓がないとは言えない）。尽きた位置は、数える前（`MEMORY_ACCOUNT_FRAMES` の確かめの中か、Endive の中）だった。
  * 返す `catch` は、数えた位置（`ensure(MEMORY_ACCOUNT_FRAMES)` を通った深さ）より浅いところで動くので、フレームの大きさが変わらなければ
  * 尽きないが、JIT の段階でフレームが変わる・ロックの取り合いで深い道に入る、ことまでは覆わない。そこで入口でまとめて払う。

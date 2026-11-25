@@ -24,7 +24,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * `writtenMemoryLimit`・`tableLimit` でその [ProcessMemory] に数える設定（`ProcessRunner.applyKernelLimits` と同じ）で、本物の Endive の
  * モジュールの `instantiate` を呼ぶ。256 KiB のスタックのスレッドで 1 段ずつ深くしながら、**底に近い深さのすべて**で 1 回ずつ呼ぶ
  * （[MemoryAccountStackExhaustionTest] と同じ形）。`ctx.instantiate` の入口の確かめ（[StackHeadroom.INSTANTIATE_FRAMES]）は、
- * 同じ段数の [lacks] で真似る。カーネルのプロセスを通した確かめは [InstantiateStackExhaustionKernelTest]。
+ * 同じ段数の [lacks] で真似る。そのため、この試験は `ProcessRunner` の入口の確かめの有無・位置を見ない（確かめを固定しているのは
+ * [InstantiateStackExhaustionKernelTest] の refusal の試験）。カーネルのプロセスを通した確かめも [InstantiateStackExhaustionKernelTest]。
  *
  * 作るのに失敗すると、Endive の `catch`（`EndiveWasmModule.instantiate`）が、作りかけのメモリ・テーブルの分を、失敗したのと同じ深さで
  * プロセス・マシン・サーバー全体に返す。返す側では確かめられないので、その途中でまた尽きると返らない。毎回の後に、浅いところで、

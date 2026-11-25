@@ -42,7 +42,13 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *
  * 毎回の後に、プロセスの終わり（`finishLocked`。作れた子のインスタンスも閉じる）でマシンとサーバー全体の勘定が始める前の値に戻ること、
  * マシンが CRASHED にならないこと、マシンのロックが取れること、同じ台と別の台のプロセスが進み続けることを確かめ、最後に止めて CPU と許可が
- * 戻ったことを確かめる。尽きる位置が入口の確かめを外しても窓に当たるとは限らない（#945）ので、窓の検知は [InstantiateStackExhaustionTest] が受け持つ
+ * 戻ったことを確かめる。
+ *
+ * この掃引も [InstantiateStackExhaustionTest] の掃引も、入口の確かめ（[StackHeadroom.INSTANTIATE_FRAMES]）の有無・位置は見分けない。
+ * 尽きる位置は、入口の確かめを外しても窓に当たるとは限らず（#945。確かめを外して測っても、ずれは出ていない）、単体の試験は既定では
+ * 確かめを試験の側の [lacks] で真似るので、確かめより底に近い深さでは作らせない。2 つの掃引が見るのは、確かめを通った後の深さで
+ * 尽きても勘定がずれないことだけ。入口の確かめ（`checkThread()` の直後、ロック・`rt.loading`・燃料より前）を固定しているのは、
+ * 下の [refusal] の 2 本
  */
 class InstantiateStackExhaustionKernelTest {
     private val limit = maxOf(Duration.ofSeconds(240), stackHeadroomTestLimit())
