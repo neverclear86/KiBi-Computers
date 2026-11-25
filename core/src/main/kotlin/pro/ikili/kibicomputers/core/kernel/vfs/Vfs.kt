@@ -446,7 +446,8 @@ internal class Vfs(
      * スタックが尽きても閉じ損ねが残らないよう、[OpenFile.retained] は [FileSystem.release] が戻ってから落とす（#901）。
      * `release` の途中で尽きたら `retained` は真のまま残り、呼び直せば閉じ直せる。`release` が戻った後は、volatile の代入だけで呼び出しを
      * 積まないので、ここで尽きて二重に閉じることはない。`DiskFileSystem.release` は入口の確かめ（[StackHeadroom.HOST_IO_FRAMES]）を
-     * 何も変える前に払い、ロックの中では尽きない前提に頼っている（途中で尽きて閉じ直すと、参照の数を二重に減らしうる）。
+     * 何も変える前に払い、ロックの中では尽きない前提に頼っている（途中で尽きて閉じ直すと、参照の数を二重に減らしうる）。この約束は
+     * [FileSystem.release] の契約で、`tracksOpenFiles` を返す実装は守る。
      *
      * 本番の呼び手は、どれも `close` が投げた後に呼び直さない（fd の表にも入っていないので、プロセスの終わりにも閉じられない）。そこで、
      * 呼び手が `open` と同じ深さから `close` を呼べば `release` の確かめが通るよう、[open] が [StackHeadroom.VFS_OPEN_FRAMES] を先に払う

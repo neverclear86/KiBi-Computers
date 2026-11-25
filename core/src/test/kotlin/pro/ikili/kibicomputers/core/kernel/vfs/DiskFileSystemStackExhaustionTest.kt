@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.fail
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.SoePositions
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.kernel.stackHeadroomRounds
 import java.nio.file.Files
 import java.nio.file.Path
@@ -388,7 +389,96 @@ class DiskFileSystemStackExhaustionTest {
     @Test
     fun `Vfsで開いて書いてfinallyで閉じる途中で尽きても、ホストのファイルは残らない`() = sweepVfs(VfsOp.OPEN_WRITE_CLOSE)
 
+    /** `StackHeadroom.VFS_OPEN_FRAMES` 段の確かめが通らなくなる最初の深さまで降りて、[body] を動かす（降りた段数を返す） */
+    private fun descendToOpenGate(n: Int, body: () -> Unit): Int {
+        if (!StackHeadroom.hasHeadroom(StackHeadroom.VFS_OPEN_FRAMES)) {
+            body()
+            return n
+        }
+        return descendToOpenGate(n + 1, body) + 1
+    }
+
+    /**
+     * 開く側の入口の確かめ（`Vfs.open` の `ensureCloseHeadroom`。[StackHeadroom.VFS_OPEN_FRAMES]）が通らない深さで、ディスクのファイルを開くと、
+     * **何も変えずに** `StackOverflowError` で断る（#901）。本番の呼び手（`readExecutable`・`path_open`・`open-at`）は閉じ直さないので、
+     * 断る・通すの境目が `open` の入口で決まらないと、続く `close` の `release` の確かめが通らない深さで開いてしまい、ホストのファイルが残る。
+     * 掃引（[sweepVfs]）は、窓が確かめの中に落ちるので、確かめを外しても落ちない。この試験は、確かめが通らない最初の深さで開き、
+     * 断られたことと、何も残っていないこと（作ったファイル・切り詰め・開いたままの枠・予約した枠）、浅いところで開き直せることを見る。
+     * 確かめを外す、`reserveOpen`・`createFile`・`opened` の後ろへ動かすと、落ちる
+     */
+    private fun refuseOpen(existing: Boolean, truncate: Boolean) {
+        val root = Files.createDirectories(dir.resolve("disk"))
+        val fs = DiskFileSystem.open(root, budget = HostFileBudget(64, 128, AtomicInteger()))
+        try {
+            val vfs = Vfs()
+            vfs.mount(VfsPath.ROOT, fs, readOnly = false, source = "disk")
+            fs.createDirectory(p("/w"))
+            val options = OpenOptions(read = true, write = true, create = true, truncate = truncate)
+            // 浅いところで、底で初めて触るクラスを読み込んでおく
+            vfs.close(vfs.open(p("/w/warm"), options))
+            fs.removeFile(p("/w/warm"))
+            var refused = 0
+            repeat(stackHeadroomRounds(ROUNDS)) { round ->
+                val path = p("/w/f$round")
+                if (existing) {
+                    val node = fs.createFile(path)
+                    fs.write(node, 0, payload, 0, payload.size)
+                }
+                var opened: OpenFile? = null
+                val error = runOnSmallStack(0) {
+                    descendToOpenGate(0) { opened = vfs.open(path, options) }
+                }
+                val what = "round $round（${if (existing) "ある" else "ない"}、truncate $truncate）"
+                if (error != null && error !is StackOverflowError) throw AssertionError("尽きる以外の失敗（$what）", error)
+                if (error is StackOverflowError) {
+                    refused++
+                    assertEquals(null, opened, "断ったのに開いたファイルを返した（$what）")
+                } else {
+                    // 通ったときは、閉じて、後始末が合うことを見る
+                    opened?.let { vfs.close(it) }
+                }
+                assertEquals(0, fs.openHandles, "開いたままのホストのファイルが残った（$what）")
+                assertEquals(emptyList<String>(), fs.consistencyProblemsForTest(), "断った後に枠・表がホストと食い違った（$what）")
+                if (error is StackOverflowError) {
+                    val stat = try {
+                        fs.stat(path)
+                    } catch (e: FsException) {
+                        if (e.errno != Errno.NOENT) throw e
+                        null
+                    }
+                    if (existing) {
+                        assertEquals(payload.size.toLong(), stat?.size, "断ったのに切り詰めた・消えた（$what）")
+                    } else {
+                        assertEquals(null, stat, "断ったのにファイルを作った（$what）")
+                    }
+                }
+                // 浅いところで開き直せる
+                val again = vfs.open(path, options)
+                assertEquals(1, fs.openHandles, "浅いところで開き直せない（$what）")
+                vfs.close(again)
+                assertEquals(0, fs.openHandles, "閉じても枠が返らない（$what）")
+                fs.removeFile(path)
+            }
+            assertTrue(refused > 0, "1 度も入口の確かめで断られなかった（確かめが効いていない）")
+            assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
+        } finally {
+            fs.retire()
+        }
+    }
+
+    @Test
+    fun `入口の確かめが通らない深さでディスクのファイルを作って開くと、何も残さずに断る`() = refuseOpen(existing = false, truncate = false)
+
+    @Test
+    fun `入口の確かめが通らない深さで既存のディスクのファイルを開くと、何も変えずに断る`() = refuseOpen(existing = true, truncate = false)
+
+    @Test
+    fun `入口の確かめが通らない深さで既存のディスクのファイルをtruncateで開くと、切り詰めずに断る`() = refuseOpen(existing = true, truncate = true)
+
     private companion object {
+        /** 入口の確かめの試験を繰り返す回数（JIT でフレームの大きさが変わっても、毎回、確かめが通らない最初の深さで開く） */
+        const val ROUNDS = 40
+
         const val DEEP = "/w/deep0/deep1/deep2/deep3/deep4/deep5/deep6/deep7"
 
         /** 境目を探す前に動かす回数 */
