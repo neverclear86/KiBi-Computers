@@ -13,15 +13,16 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.process.crashReason
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.code
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
+import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
-import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.time.Duration
@@ -191,10 +192,18 @@ class InstantiateStackExhaustionKernelTest {
                         assertEquals(ProcessState.CRASHED, rt.process.state, "$label: ${rt.lastError}")
                         assertEquals("call stack exhausted", crashReason(rt.lastError!!), "$label: ${rt.lastError}")
                         assertTrue(round.refused.get() > 0, "$label: スタック不足で断られた深さがない（試験の窓が底まで届かない）")
+                        // 型の期待と違う結果がないこと。失敗の後でプロセスの状態が壊れ、以後の ctx.instantiate が別の理由で失敗し続けても、
+                        // 浅い深さで作れた分で通ってしまわないように、数の食い違いも見る
                         when (k) {
-                            Kind.SUCCESS -> assertTrue(round.created.get() > 0, "$label: 底の近くで作れた深さがない（試験の窓が底から遠い）")
-                            Kind.START_RECURSION -> {}
-                            else -> assertTrue(round.failed.get() > 0, "$label: 底の近くで最後まで進んで失敗した深さがない（試験の窓が底から遠い）")
+                            Kind.SUCCESS -> {
+                                assertTrue(round.created.get() > 0, "$label: 底の近くで作れた深さがない（試験の窓が底から遠い）")
+                                assertEquals(0, round.failed.get(), "$label: 作れるはずの子が、スタックの不足以外で失敗した")
+                            }
+                            Kind.START_RECURSION -> assertEquals(0, round.created.get(), "$label: 終わらない start の子が作れた")
+                            else -> {
+                                assertTrue(round.failed.get() > 0, "$label: 底の近くで最後まで進んで失敗した深さがない（試験の窓が底から遠い）")
+                                assertEquals(0, round.created.get(), "$label: 失敗するはずの子が作れた")
+                            }
                         }
                         // プロセスの終わりで、作れた子も閉じて数えた分を返したので、マシン・サーバー全体の勘定は元に戻る
                         assertEquals(0L, processAfter, "$label: プロセスの勘定が残った")
@@ -216,6 +225,93 @@ class InstantiateStackExhaustionKernelTest {
             assertEquals(0L, m.memoryAccount.usedBytes, "止めた後にマシンの勘定が残った")
         }
     }
+
+    /** 入口の確かめ（[StackHeadroom.INSTANTIATE_FRAMES]）で断られた回の結果 */
+    private class GateOutcome {
+        var depth = -1
+        var refused: Throwable? = null
+        var returned: WasmInstance? = null
+        var failure: Throwable? = null
+    }
+
+    /** 確かめが通らなくなる最初の深さまで 1 段ずつ深くし、そこで `ctx.instantiate` を 1 回呼ぶ（断られたら [GateOutcome.refused] に残して戻る） */
+    private fun descendToGate(ctx: ProcessContext, child: WasmModule, out: GateOutcome, n: Int): Int {
+        if (lacks(StackHeadroom.INSTANTIATE_FRAMES)) {
+            out.depth = n
+            try {
+                out.returned = ctx.instantiate(child) { }
+            } catch (t: Throwable) {
+                out.refused = t
+            }
+            return n
+        }
+        return descendToGate(ctx, child, out, n + 1) + 1
+    }
+
+    /**
+     * 入口の確かめが通らない深さ（`lacks(INSTANTIATE_FRAMES)` が初めて真になる深さ）で `ctx.instantiate` を呼ぶと、**何も変えずに**
+     * `StackOverflowError` で断る。何も変えていないので、浅いところへ戻れば、同じプロセスで作り直せる（`rt.loading` が残っていれば
+     * 「入れ子で呼べない」で失敗し、勘定を動かした後に断っていれば、マシン・サーバー全体の勘定が戻らない）。
+     * 入口の確かめを外す・`rt.loading` の設定より後ろへ動かすと、この試験が落ちる（上の掃引は、窓が確かめの外に落ちないので見分けられない）
+     */
+    private fun refusal(kind: ProcessKind) = timeout(limit) {
+        val config = SchedulerConfig.builder().maxConcurrentMachines(1).maxBlockingProcesses(8).threadStackBytes(256L * 1024).build()
+        Harness(config, moduleLimits = ModuleLimits(maxTableElements = TABLE_LIMIT)).use { h ->
+            val m = h.machine(fuelPerTick = 50_000_000, fuelSlice = 10_000, memoryBytes = MACHINE_BYTES, maxProcessMemoryBytes = MACHINE_BYTES)
+            val wasm = WasmBinary().run {
+                memory(1)
+                table(1)
+                build()
+            }
+            val program = Program.load(EndiveRuntime(), wasm)
+            val child = EndiveRuntime().load(moduleBytes(Kind.SUCCESS))
+            val out = GateOutcome()
+            val machineBefore = m.memoryAccount.usedBytes
+            val serverBefore = h.scheduler.memoryAccount.usedBytes
+            val driver = TestDriver(kind) { ctx ->
+                try {
+                    // 浅いところで、底で初めて触るクラスを読み込んでおく
+                    ctx.instantiate(child) { }
+                    isStackExhaustion(WasmTrapException(WasmTrapKind.STACK_OVERFLOW, "warm-up"))
+                    descendToGate(ctx, child, out, 0)
+                    if (out.refused != null) {
+                        // 断られた後、浅いところで作り直せる（何も変えていなければ）
+                        out.returned = ctx.instantiate(child) { }
+                    }
+                } catch (t: Throwable) {
+                    out.failure = t
+                }
+                StepResult.Exit(0)
+            }
+            val rt = m.spawnRt(program, driver, SpawnOptions(allowUnmetered = true))
+            eventuallyDescribe(30_000, { "プロセスが終わらない: ${rt.process.state}" }) {
+                h.scheduler.tick()
+                rt.process.state.isTerminal || m.state == MachineState.CRASHED
+            }
+            assertTrue(m.lock.tryLock(5, TimeUnit.SECONDS), "マシンのロックが取れない: ${m.lock}")
+            try {
+                out.failure?.let { throw AssertionError("想定外の失敗（深さ ${out.depth}）", it) }
+                // 唯一のプロセスが正常に終わったので、マシンは止まる（壊れていないこと）
+                assertTrue(m.state != MachineState.CRASHED, "マシンが壊れた: ${rt.lastError}")
+                assertEquals(ProcessState.EXITED, rt.process.state, "プロセスが正常に終わらなかった: ${rt.lastError}")
+                assertTrue(out.depth > 0, "確かめが通らなくなる深さまで届かなかった")
+                assertTrue(out.refused?.let(::isStackExhaustion) == true, "深さ ${out.depth}: スタック不足で断られなかった: ${out.refused}")
+                assertTrue(out.returned != null, "断られた後に、浅いところで作り直せなかった")
+                // プロセスの終わりで、作れた子も閉じて数えた分を返したので、勘定は元に戻る
+                assertEquals(0L, rt.memory.usedBytes, "プロセスの勘定が残った")
+                assertEquals(machineBefore, m.memoryAccount.usedBytes, "マシンの勘定がずれた")
+                assertEquals(serverBefore, h.scheduler.memoryAccount.usedBytes, "サーバー全体の勘定がずれた")
+            } finally {
+                m.lock.unlock()
+            }
+        }
+    }
+
+    @Test
+    fun `BLOCKINGで入口の確かめが通らない深さのctx_instantiateは、何も変えずに断り、浅いところで作り直せる`() = refusal(ProcessKind.BLOCKING)
+
+    @Test
+    fun `WAIT_POINTで入口の確かめが通らない深さのctx_instantiateは、何も変えずに断り、浅いところで作り直せる`() = refusal(ProcessKind.WAIT_POINT)
 
     @Test
     fun `BLOCKINGでスタックの底の近くからctx_instantiateを呼んでも、勘定はずれずプロセスだけが終わる`() =

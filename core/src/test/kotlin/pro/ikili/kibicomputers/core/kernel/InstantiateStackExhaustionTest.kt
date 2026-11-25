@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
-import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.I32
 import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.code
 import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig

@@ -140,6 +140,14 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 段数を縮めた同じ単体の試験では、64 段以上で、入口を通った後に尽きた回が 0 になった（start の中で尽きる型を除く。32 段以下では
  * 入口を通った後に Endive の中で尽きる回があったが、ずれはなかった）。今の 128 段はその 2 倍。今は本番の呼び出し元がないので、費用は TPS に響かない
  *
+ * 冷えた道・`-Xint`・JDK 21 の結果（`-Pkibi.stackHeadroom=true` の `stackHeadroomColdTest`・`stackHeadroomXintTest`・`stackHeadroomJdk21Test` を、
+ * `InstantiateStackExhaustion*` だけに絞って回した。Windows。今の 128 段）: 単体 5 本・カーネル（BLOCKING・WAIT_POINT）とも、3 つの JVM のどれでも通過し、
+ * 勘定のずれは 1 回も出なかった。単体の試験で入口を通った後に尽きた回は、start の中で尽きる型を除いて 0（窓に入った深さは、冷えた道で約 618、`-Xint` で約 1608、
+ * JDK 21 で約 576〜658）。段数を縮めた測定（上の 64 段以上で 0）は、JIT の JVM でだけ行った。これらの JVM では 128 段で測り、
+ * 縮めた段数では測っていない（`kibi.test.instantiateGateFrames` は通常の `:core:test` にだけ渡る）。
+ * 確かめそのものは、`InstantiateStackExhaustionKernelTest` の「入口の確かめが通らない深さで呼ぶと、何も変えずに断り、浅いところで作り直せる」が固定する
+ * （確かめを外す、`rt.loading` の設定より後ろへ動かす、のどちらでも落ちる。掃引の試験は、窓が確かめの外に落ちないので見分けられない）
+ *
  * `/tmp`（`TmpFileSystem`。#883）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、上の入口で
  * 覆えない。変える操作（作る・消す・名前を変える・書く・追記・大きさを変える・`allocate`）は、勘定の 2 段に加えて、自分の `usedBytes` と木
  * （親から外す・`nodes` から消す・塊を足す・`size` を直す）を順に変えるので、途中で尽きると、勘定と `usedBytes` がずれる（外すときに返す量が
