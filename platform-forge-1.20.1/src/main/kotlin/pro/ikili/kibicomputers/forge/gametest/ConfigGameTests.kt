@@ -62,7 +62,7 @@ object ConfigGameTests {
         for (entry in KiBiConfig.entries(ConfigSide.SERVER).filterNot { it.ownerScoped }) {
             helper.assertTrue(KiBiConfigs.specValue(entry) != null, "$entry should be in the 1.20.1 config")
         }
-        val scheduler = KiBiConfig.schedulerConfig(KiBiConfigs.server, ModuleStore.NONE, KiBiConfigs.OWNER_GROUPS)
+        val scheduler = KiBiConfigs.schedulerConfig(ModuleStore.NONE)
         helper.assertTrue(scheduler.maxConcurrentMachinesPerGroup == 0, "no per-group permit limit")
         helper.assertTrue(scheduler.maxBlockingProcessesPerGroup == 0, "no per-group blocking limit")
         helper.assertTrue(scheduler.maxPendingLoadsPerGroup == 0, "no per-group load limit")
@@ -70,7 +70,7 @@ object ConfigGameTests {
             scheduler.maxBlockingProcesses == KiBiConfigs.server[KiBiConfig.MAX_BLOCKING_PROCESSES],
             "the server-wide blocking limit still applies",
         )
-        val traffic = KiBiConfig.screenSyncTraffic<Any>(KiBiConfigs.server, KiBiConfigs.OWNER_GROUPS)
+        val traffic = KiBiConfigs.screenSyncTraffic<Any>()
         helper.assertTrue(traffic.groupBytesPerSecond == 0, "no per-group screen traffic limit")
         helper.succeed()
     }

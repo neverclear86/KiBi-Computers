@@ -19,6 +19,9 @@ import pro.ikili.kibicomputers.core.config.DoubleEntry
 import pro.ikili.kibicomputers.core.config.IntEntry
 import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.config.LongEntry
+import pro.ikili.kibicomputers.core.display.ScreenSyncTraffic
+import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import java.util.EnumMap
 import java.util.IdentityHashMap
 
@@ -40,10 +43,19 @@ object KiBiConfigs {
      *
      * 1.20.1 はまだ持たないので false。全台が持ち主なしの1組（`FairShareGroup.NONE`）になり、持ち主ごとの上限が
      * サーバー全体の上限として効いてしまうため、持ち主ごとの項目をコンフィグに出さず、組み立てでも組ごとの上限を掛けない。
-     * #224 でマシンを移すときは、スケジューラ・画面の同期の組み立て（`KiBiConfig.schedulerConfig`・`KiBiConfig.screenSyncTraffic`）に
-     * この値を渡す。PlayerAccess とケースからの `fairnessKey` を移したら true にする
+     * #224 でマシンを移すときは、スケジューラ・画面の同期の組み立てに、core の `KiBiConfig.schedulerConfig`・
+     * `KiBiConfig.screenSyncTraffic` を直接呼ばず、下の [schedulerConfig]・[screenSyncTraffic] を使う（1.21.1 の呼び出しを
+     * そのまま写すと、この値が渡らず、組ごとの上限が全体の上限として効く）。PlayerAccess とケースからの `fairnessKey` を
+     * 移したら true にする
      */
     internal const val OWNER_GROUPS: Boolean = false
+
+    /** サーバーの設定の今の値からスケジューラの設定を作る。[OWNER_GROUPS] を渡す（#897）。#224 のスケジューラの組み立てはこれを使う */
+    fun schedulerConfig(moduleStore: ModuleStore): SchedulerConfig =
+        KiBiConfig.schedulerConfig(server, moduleStore, OWNER_GROUPS)
+
+    /** サーバーの設定の今の値から画面の同期の送信量の勘定を作る。[OWNER_GROUPS] を渡す（#897）。#224 の画面の組み立てはこれを使う */
+    fun <P : Any> screenSyncTraffic(): ScreenSyncTraffic<P> = KiBiConfig.screenSyncTraffic(server, OWNER_GROUPS)
 
     /** [side] のうち、この接続層のコンフィグに出す項目（spec の登録と値の写しの両方で使う） */
     private fun entries(side: ConfigSide): List<ConfigEntry<*>> = KiBiConfig.entries(side, OWNER_GROUPS)
