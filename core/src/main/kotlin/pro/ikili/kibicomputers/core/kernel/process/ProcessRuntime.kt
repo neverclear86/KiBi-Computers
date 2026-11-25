@@ -37,8 +37,31 @@ internal class ProcessRuntime(
     /** 止めたシグナル（`stop()` で止めたなら `null`。最初のものを残す。カーネルロックの中で書く。#46） */
     var killSignal: KillSignal? = null
 
-    /** 止まりうる関数でない関数の中で燃料が切れ、前借りして巻き戻せるところを探している（プロセスのスレッドだけが読み書きする。#477） */
+    /**
+     * 止まりうる関数でない関数の中で燃料が切れ、前借りして巻き戻せるところを探している（プロセスのスレッドだけが読み書きする。#477）。
+     * 下ろすと、前借りの速い道の控え（[fuelOverdraftInstance]）も消す（#887。古い控えで速い道を通らないため）
+     */
     var fuelOverdraft: Boolean = false
+        set(value) {
+            field = value
+            if (!value) fuelOverdraftInstance = null
+        }
+
+    /**
+     * 前借りの間の速い道（#887）の控え: 前借りを決めたとき（カーネルロックの中で照合した）インスタンス。燃料切れの処理を呼んだインスタンスが
+     * これと同じときだけ、ロックを取らずに負の残りを返す。[fuelOverdraft] が真の間だけ意味がある。実行時だけ（保存しない）。
+     * プロセスのスレッドだけが読み書きする
+     */
+    var fuelOverdraftInstance: WasmInstance? = null
+
+    /**
+     * 前借りの間の速い道（#887）を通れる残りの下限（この値より大きい間だけ）。届いたら、遅い道（カーネルロックの中の確かめ・その場で足すのを試す）を
+     * 1 回通って置き直す。[FUEL_OVERDRAFT_LIMIT] より小さくしない。[fuelOverdraft] が真の間だけ意味がある。プロセスのスレッドだけが読み書きする
+     */
+    var fuelOverdraftRecheckAt: Long = 0
+
+    /** 前借りの間に遅い道（カーネルロックの中の確かめ）で前借りを続けると決めた回数（#887。テスト・計測用。プロセスのスレッドだけが読み書きする） */
+    var fuelOverdraftSlowChecks: Long = 0
 
     /** マシンの CPU を持っている（プロセスのスレッドだけが読み書きする） */
     var holdsCpu: Boolean = false
