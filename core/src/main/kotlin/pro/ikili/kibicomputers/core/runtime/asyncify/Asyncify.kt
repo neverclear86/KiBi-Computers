@@ -1374,7 +1374,19 @@ private class Transformer(
                 }
                 0x1C -> {
                     st.pop(3)
-                    st.push(wasm[ins.address() + 2].toInt() and 0xFF)
+                    // 型付きの select の注釈は vec(valtype)（数は 1 なので 1 バイト）。(ref null <ヒープ型>)・(ref <ヒープ型>) は
+                    // 先頭のバイト（0x63・0x64）の後にヒープ型の sleb が続く。ref.null（0xD0）と同じく、抽象ヒープ型の
+                    // (ref null <抽象>) は略記のバイトにし、型の番号のものと null を許さないものは型を追えない参照（BOT）にする（#891）
+                    val r = Reader(wasm, ins.address() + 2, endOf[ins]!!)
+                    val t = r.u8()
+                    st.push(
+                        if (t == 0x63 || t == 0x64) {
+                            val heapType = r.sleb()
+                            if (t == 0x63 && heapType < 0) (heapType + 0x80).toInt() else BOT
+                        } else {
+                            t
+                        },
+                    )
                 }
                 0x20 -> st.push(localTypes[ins.operand(0).toInt()])
                 0x21 -> st.pop()

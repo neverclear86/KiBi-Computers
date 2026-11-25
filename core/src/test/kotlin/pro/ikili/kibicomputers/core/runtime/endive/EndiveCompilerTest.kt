@@ -14,6 +14,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.asyncify.Asyncify
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
+import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
 import run.endive.wasm.Parser
 
@@ -196,6 +197,53 @@ class EndiveCompilerTest {
             },
         ).build()
         assertEquals(1L * 100 * 99 / 2 + (100 + 101 + 102 + 103) * 3 + 55, module.instantiate(config).use { it.call("run", 100)[0] })
+    }
+
+    @Test
+    fun `struct・arrayの型を持つモジュールでも、SIMDを使う関数だけをインタプリタで動かし、GCの参照を引数・戻り値で受け渡せる`() {
+        // v128 のローカルを持つ関数（$mk・$bump・$id・$mkArr）はインタプリタ、ほかはコンパイル。GC の参照（structref・arrayref・
+        // (ref null $s)・eqref）が、コンパイルした関数とインタプリタの関数の間を引数・戻り値で行き来する（#891。前例 #341）
+        val bytes = WitTool.wat(
+            """
+            (module
+              (type ${'$'}s (struct (field (mut i32))))
+              (type ${'$'}a (array (mut i32)))
+              (func ${'$'}mk (param i32) (result structref) (local v128)
+                (struct.new ${'$'}s (local.get 0)))
+              (func ${'$'}bump (param (ref null ${'$'}s)) (param i32) (result (ref null ${'$'}s)) (local v128)
+                (if (i32.eqz (ref.is_null (local.get 0)))
+                  (then (struct.set ${'$'}s 0 (local.get 0) (i32.add (struct.get ${'$'}s 0 (local.get 0)) (local.get 1)))))
+                (local.get 0))
+              (func ${'$'}id (param eqref) (result eqref) (local v128) (local.get 0))
+              (func ${'$'}mkArr (param i32) (result arrayref) (local v128)
+                (array.new ${'$'}a (call ${'$'}get (call ${'$'}mk (local.get 0))) (i32.const 3)))
+              (func ${'$'}get (param structref) (result i32)
+                (struct.get ${'$'}s 0 (ref.cast (ref ${'$'}s) (local.get 0))))
+              (func ${'$'}sum (param arrayref) (result i32)
+                (i32.add
+                  (array.len (local.get 0))
+                  (array.get ${'$'}a (ref.cast (ref ${'$'}a) (local.get 0)) (i32.const 2))))
+              (func (export "run") (result i32) (local ${'$'}x (ref null ${'$'}s))
+                (local.set ${'$'}x (ref.cast (ref null ${'$'}s) (call ${'$'}mk (i32.const 5))))
+                (local.set ${'$'}x (call ${'$'}bump (local.get ${'$'}x) (i32.const 10)))
+                (i32.add
+                  (i32.add
+                    (call ${'$'}get (local.get ${'$'}x))
+                    (ref.eq (local.get ${'$'}x) (call ${'$'}id (local.get ${'$'}x))))
+                  (i32.add
+                    (call ${'$'}sum (call ${'$'}mkArr (i32.const 7)))
+                    (ref.is_null (call ${'$'}bump (ref.null ${'$'}s) (i32.const 0)))))))
+            """.trimIndent(),
+        )
+        val simd = EndiveRuntime.simdFunctions(Parser.parse(bytes))!!
+        assertEquals(setOf(0, 1, 2, 3), simd)
+        val module = EndiveRuntime().load(bytes)
+        assertTrue(isCompiled(module))
+        assertEquals(simd, interpretedFunctions(module))
+        // get(5 + 10) = 15、ref.eq = 1、sum = 3 + 7、ref.is_null = 1
+        val expected = 15L + 1 + 3 + 7 + 1
+        assertEquals(expected, EndiveRuntime(compile = false).load(bytes).instantiate(WasmInstanceConfig.EMPTY).use { it.call("run")[0] })
+        assertEquals(expected, module.instantiate(WasmInstanceConfig.EMPTY).use { it.call("run")[0] })
     }
 
     @Test

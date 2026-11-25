@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmStateException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
@@ -817,7 +818,8 @@ class ConstExprInstrumentationTest {
         assertNull(WitTool.validate(o.bytes))
         for (rt in listOf(runtime, EndiveRuntime(compile = false))) {
             val e = unwindOnce(rt.load(o.bytes))
-            assertTrue(e is WasmTrapException, "巻き戻しで止まらなかった: $e")
+            // 巻き戻しの null の検査の unreachable で止まる（struct.new などの別の理由のトラップではない）
+            assertEquals(WasmTrapKind.UNREACHABLE, (e as? WasmTrapException)?.kind, "巻き戻しの検査で止まらなかった: $e")
         }
     }
 
@@ -830,8 +832,10 @@ class ConstExprInstrumentationTest {
         assertEquals(4L to 0L, drive(runtime.load(r.bytes)))
         val o = Asyncify.transform(module("(block (result structref) (struct.new ${'$'}s (i32.const 1)))"), setOf("w.wait"))
         assertNull(WitTool.validate(o.bytes))
-        val e = unwindOnce(runtime.load(o.bytes))
-        assertTrue(e is WasmTrapException, "巻き戻しで止まらなかった: $e")
+        for (rt in listOf(runtime, EndiveRuntime(compile = false))) {
+            val e = unwindOnce(rt.load(o.bytes))
+            assertEquals(WasmTrapKind.UNREACHABLE, (e as? WasmTrapException)?.kind, "巻き戻しの検査で止まらなかった: $e")
+        }
     }
 
     @Test
@@ -855,6 +859,40 @@ class ConstExprInstrumentationTest {
         assertNull(WitTool.validate(u.bytes))
         // use(null, 5) = 6、+ 1 + 2
         assertEquals(9L to 0L, drive(runtime.load(u.bytes)))
+    }
+
+    @Test
+    fun `型付きのselectの型の番号・nullを許さない参照の値が待ち点をまたぐと、正しくないモジュールを出さずに断る`() {
+        // 待ち点を含むブロックの直下では struct.new を断るので、null でない値は入れ子のブロックで作り、ref.as_non_null で (ref struct) にする。
+        // (ref $s) は ref.as_non_null (ref.null $s) で作る（実行すると null でトラップするので、変換の結果の検証だけにする）
+        val made = "(ref.as_non_null (block (result structref) (struct.new \$s (i32.const 1))))"
+        val nonNullS = "(ref.as_non_null (ref.null \$s))"
+        for ((value, expected) in listOf(
+            // use(null, 5) + 1 + 2
+            "(select (result (ref null \$s)) (ref.null \$s) (ref.null \$s) (i32.const 0))" to 9L,
+            "(select (result (ref \$s)) $nonNullS $nonNullS (i32.const 0))" to null,
+            // use(struct, 5) + 1 + 2
+            "(select (result (ref struct)) $made $made (i32.const 0))" to 8L,
+        )) {
+            val crossing = gcSuspendModule("(i32.add (call \$use $value (call \$wait)) (call \$wait))")
+            val e = assertThrows<AsyncifyUnsupported>(value) { Asyncify.transform(crossing, setOf("w.wait")) }
+            assertTrue(e.message!!.contains("型付きの参照型"), e.message)
+            val loaded = assertThrows<WasmLoadException>(value) { Program.loadMetered(runtime, crossing, null, setOf("w.wait")) }
+            assertTrue(Program.unsuspendableReason(loaded)?.contains("型付きの参照型") == true, loaded.message)
+            // 待ち点をまたがなければ、そのまま写して動く
+            val used = gcSuspendModule("(i32.add (call \$use $value (i32.const 5)) (i32.add (call \$wait) (call \$wait)))")
+            val u = Asyncify.transform(used, setOf("w.wait"))
+            assertNull(WitTool.validate(u.bytes), value)
+            if (expected != null) assertEquals(expected to 0L, drive(runtime.load(u.bytes)), value)
+        }
+        // 抽象ヒープ型の (ref null struct) は structref と同じ型にして、待ち点をまたいで巻き直せる。use(null, 1) = 2、+ 2
+        val abstract = gcSuspendModule(
+            "(i32.add (call \$use (select (result (ref null struct)) (ref.null struct) (ref.null struct) (i32.const 0)) (call \$wait)) (call \$wait))",
+        )
+        val r = Asyncify.transform(abstract, setOf("w.wait"))
+        assertNull(WitTool.validate(r.bytes))
+        assertEquals(4L to 0L, drive(runtime.load(r.bytes)))
+        assertEquals(4L to 0L, drive(EndiveRuntime(compile = false).load(r.bytes)))
     }
 
     /** struct・array の型を持つ core モジュールを中に持つコンポーネントは、検証で断られる（ADR 0757。#891 で読めるようになったのは p1 の core モジュールだけ） */
