@@ -81,7 +81,8 @@ internal class OpenFile(
 
     /**
      * ファイルシステムに開いたことを知らせた（[FileSystem.retain]）。実行時だけの印で、保存しない
-     * （復元した開いたファイルは知らせないまま使う。[FileSystem.tracksOpenFiles]）
+     * （復元した開いたファイルは知らせないまま使う。[FileSystem.tracksOpenFiles]）。`Vfs.close` は、[FileSystem.release] が戻ってから
+     * 落とす（途中でスタックが尽きても真のまま残り、閉じ直せる。#901）
      */
     @Volatile
     internal var retained: Boolean = false

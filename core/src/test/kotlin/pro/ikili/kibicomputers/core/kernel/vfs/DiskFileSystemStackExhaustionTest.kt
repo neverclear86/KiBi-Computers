@@ -314,6 +314,80 @@ class DiskFileSystemStackExhaustionTest {
         }
     }
 
+    /** [Vfs] を通して開く・閉じる型（#901） */
+    private enum class VfsOp {
+        /** 浅いところで開いたファイルを、深いところで閉じる。尽きたら、浅いところで閉じ直す（やり直す呼び手の形） */
+        CLOSE,
+
+        /** 開いて書き、`finally` で閉じる（`Machine.readExecutable` と同じ本番の形）。閉じ直さない */
+        OPEN_WRITE_CLOSE,
+    }
+
+    /**
+     * [Vfs] を通して開く・閉じる操作の途中で尽きても、開いたままのホストのファイル（[DiskFileSystem.openHandles]）が残らないことを確かめる（#901）。
+     * `Vfs.close` は fd の表に入れていない開いたファイルを閉じるので、閉じ損ねるとマウントを外すまでホストのファイルが開いたままになる。
+     * 片付け（[scrub]）の前に、開いたままのファイルが 0 であることを見る（片付けは開いたままのものを強引に閉じるので、後では見えない）
+     */
+    private fun sweepVfs(op: VfsOp) {
+        val root = Files.createDirectories(dir.resolve("disk"))
+        val fs = DiskFileSystem.open(root, budget = HostFileBudget(64, 128, AtomicInteger()))
+        try {
+            val vfs = Vfs()
+            vfs.mount(VfsPath.ROOT, fs, readOnly = false, source = "disk")
+            fs.createDirectory(p("/w"))
+            val counter = AtomicInteger()
+            val tally = SoePositions()
+            var completed = 0
+            val options = OpenOptions(read = true, write = true, create = true)
+
+            fun attempt(pad: Int): Boolean {
+                val n = counter.incrementAndGet()
+                val path = p("/w/f$n")
+                val error = when (op) {
+                    VfsOp.CLOSE -> {
+                        val f = vfs.open(path, options)
+                        assertEquals(1, fs.openHandles, "開いたファイルの枠を数えていない")
+                        runOnSmallStack(pad) { vfs.close(f) }.also { if (it is StackOverflowError) vfs.close(f) }
+                    }
+                    VfsOp.OPEN_WRITE_CLOSE -> runOnSmallStack(pad) {
+                        val f = vfs.open(path, options)
+                        try {
+                            vfs.write(f, payload, 0, payload.size)
+                        } finally {
+                            vfs.close(f)
+                        }
+                    }
+                }
+                val soe = error as? StackOverflowError
+                if (error != null && soe == null) throw AssertionError("尽きる以外の失敗（$op、pad $pad）", error)
+                val what = "$op、pad $pad、${if (soe != null) "尽きた" else "終わりまで動いた"}"
+                if (fs.openHandles != 0) {
+                    fail("開いたままのホストのファイルが残った（$what）: ${fs.openHandles}\nSOE: ${soe?.stackTrace?.take(14)?.joinToString(" <- ")}")
+                }
+                verify(fs, what, soe)
+                if (soe != null) tally.record(soe) else completed++
+                scrub(fs, 0, listOf("/w/f$n"))
+                verify(fs, "$op、pad $pad、片付けた後", soe)
+                return soe != null
+            }
+
+            val edge = walkEdge(::attempt)
+            println("#901 vfs $op: 境目 $edge、${counter.get()} 回動かし、尽きなかった（終わりまで動いた）$completed 回、尽きた位置: ${tally.describe()}")
+            assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
+            assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
+            assertTrue(completed > 0, "1 度も終わりまで動かなかった")
+            assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
+        } finally {
+            fs.retire()
+        }
+    }
+
+    @Test
+    fun `Vfsで閉じる途中で尽きても、閉じ直せばホストのファイルは残らない`() = sweepVfs(VfsOp.CLOSE)
+
+    @Test
+    fun `Vfsで開いて書いてfinallyで閉じる途中で尽きても、ホストのファイルは残らない`() = sweepVfs(VfsOp.OPEN_WRITE_CLOSE)
+
     private companion object {
         const val DEEP = "/w/deep0/deep1/deep2/deep3/deep4/deep5/deep6/deep7"
 
