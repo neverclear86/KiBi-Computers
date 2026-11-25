@@ -40,7 +40,7 @@
 - `write` は塊ごとでなく入口の 1 回（塊ごとだと、塊を足した後・`size` を直す前の窓が残り、費用も塊の数だけかかる）。`append`・`allocate` は中身（`writeLocked`・`setSizeLocked`）を呼び、2 回払わない
 - 読むだけの操作と `setTimes` は確かめない（勘定にも木の形にも触らない）。`onUnmounted` は浅いところ（`unmountTmpLocked`・`MachineRestore.discard`）からだけ呼ばれ、ゲストの `unmount` は `/tmp` を `BUSY` で断る
 - `restore`（起動用のスレッドの浅いところ）は、数えた後に木を組む途中で失敗したら、同じ深さで数えた分を返して投げ直す（fs を呼び手に返せず、`onUnmounted` でも返らないため）
-- 確かめは `TmpFileSystemStackExhaustionTest`（底に近い深さのすべて）と `TmpFileSystemStackExhaustionKernelTest`（カーネルのプロセスを通す）。費用は 1 回約 0.2 µs（1 バイトの `write` が約 0.04 µs → 約 0.25 µs）。待っているだけの台には費用がない
+- 確かめは `TmpFileSystemStackExhaustionTest`（底に近い深さのすべて）と `TmpFileSystemStackExhaustionKernelTest`（カーネルのプロセスを通す）。JDK 17・JIT に加えて、`-Pkibi.stackHeadroom=true` の冷えた道（`probe` だけ JIT、`/tmp` の中身はインタプリタ）・`-Xint`・JDK 21（どれも Windows）でも、確かめが通らない深さで断られなかった回と食い違いは 0 だった（`StackHeadroom` の KDoc）。費用は 1 回約 0.2 µs（1 バイトの `write` が約 0.04 µs → 約 0.25 µs）。待っているだけの台には費用がない
 
 ## 時刻
 
