@@ -898,6 +898,8 @@ private class Transformer(
 
         private fun newLocal(t: Int): Int {
             if (t == V128) throw AsyncifyUnsupported("SIMD（v128）のローカル変数には対応していない")
+            // 型を追えない参照（BOT）は、宣言できる型がない。型の番号の `ref.null $s` などの値を待ち点をまたいで持つときに届く（#891）
+            if (t == BOT) throw AsyncifyUnsupported("型付きの参照型（GC・関数参照の提案の (ref <型>)）の値を持ったまま待つことには対応していない")
             newLocals += t
             localTypes += t
             return localTypes.size - 1
@@ -1424,7 +1426,12 @@ private class Transformer(
                 in 0xB7..0xBB, 0xBF -> un(st, F64)
                 0xC0, 0xC1 -> un(st, I32)
                 in 0xC2..0xC4 -> un(st, I64)
-                0xD0 -> st.push(wasm[ins.address() + 1].toInt() and 0xFF)
+                0xD0 -> {
+                    // ref.null のヒープ型は sleb。抽象ヒープ型（func・struct・any など）は 1 バイトの負の数で、略記のバイトと同じ番号になる。
+                    // 型の番号（0 以上。`ref.null $s`）は型を追えない参照（BOT）にして、値が待ち点をまたぐとき（一時ローカルに移すとき）に断る（#891）
+                    val heapType = Reader(wasm, ins.address() + 1, endOf[ins]!!).sleb()
+                    st.push(if (heapType >= 0) BOT else (heapType + 0x80).toInt())
+                }
                 0xD1 -> un(st, I32)
                 0xD2 -> st.push(0x70)
                 0xD3 -> bin(st, I32)

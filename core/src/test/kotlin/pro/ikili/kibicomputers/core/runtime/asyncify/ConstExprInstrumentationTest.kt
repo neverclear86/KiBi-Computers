@@ -16,7 +16,9 @@ import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.WasmStateException
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
@@ -720,6 +722,153 @@ class ConstExprInstrumentationTest {
         assertTrue(e.message!!.contains("型付きの参照型"), e.message)
         // 止まりうる関数がなければ、そのまま写す（#384）
         assertNull(WitTool.validate(Asyncify.transform(bytes, emptySet()).bytes))
+    }
+
+    // ---- 止まりうる関数の本体の GC の命令（#891） ----
+
+    /** `run` は止まりうる（`w.wait` を呼ぶ）。[body] は `run` の本体（結果は i32）。`lanes` は 0 */
+    private fun gcSuspendModule(body: String): ByteArray = WitTool.wat(
+        """
+        (module
+          (type ${'$'}s (struct (field i32)))
+          (type ${'$'}a (array i32))
+          (import "w" "wait" (func ${'$'}wait (result i32)))
+          (func ${'$'}use (param structref i32) (result i32) (i32.add (local.get 1) (ref.is_null (local.get 0))))
+          (func (export "lanes") (result i32) (i32.const 0))
+          (func (export "run") (result i32) $body))
+        """.trimIndent(),
+    )
+
+    @Test
+    fun `止まりうる関数の、待ち点を含むブロックの直下にGCの命令があると、対応していない命令として断る`() {
+        for (body in listOf(
+            // 待ち点の後
+            "(drop (call \$wait)) (struct.get \$s 0 (struct.new \$s (i32.const 1)))",
+            // 待ち点の前
+            "(drop (struct.new \$s (i32.const 1))) (call \$wait)",
+            // array の命令、待ち点を含む if の then の直下
+            "(if (result i32) (i32.const 1) (then (drop (call \$wait)) (array.len (array.new_default \$a (i32.const 2)))) (else (i32.const 0)))",
+        )) {
+            val bytes = gcSuspendModule(body)
+            val e = assertThrows<AsyncifyUnsupported>(body) { Asyncify.transform(bytes, setOf("w.wait")) }
+            assertTrue(e.message!!.contains("SIMD・アトミック・GC などの拡張"), e.message)
+            assertTrue(!e.message!!.contains("Exception"), e.message)
+            // 計測あり（挿入 → 変換）でも、変換できない作りとして断る（読み込みの検証の失敗にしない）
+            val loaded = assertThrows<WasmLoadException> { Program.loadMetered(runtime, bytes, null, setOf("w.wait")) }
+            val reason = Program.unsuspendableReason(loaded)
+            assertTrue(reason?.contains("GC などの拡張") == true, loaded.message)
+            assertTrue(!reason!!.contains("Exception"), reason)
+            // 止まりうる関数がなければ、そのまま写す（#384）
+            assertNull(WitTool.validate(Asyncify.transform(bytes, emptySet()).bytes))
+        }
+    }
+
+    @Test
+    fun `止まりうる関数の、待ち点を含まない入れ子のブロックの中のGCの命令は、そのまま写して巻き戻しと巻き直しで正しく動く`() {
+        val bytes = gcSuspendModule(
+            """
+            (i32.add
+              (i32.add
+                (i32.add (call ${'$'}wait) (block (result i32) (struct.get ${'$'}s 0 (struct.new ${'$'}s (i32.const 3)))))
+                (call ${'$'}wait))
+              (block (result i32) (array.len (array.new ${'$'}a (i32.const 0) (i32.const 4)))))
+            """.trimIndent(),
+        )
+        // 1 + 3 + 2 + 4
+        val r = Asyncify.transform(bytes, setOf("w.wait"))
+        assertEquals(1, r.instrumented)
+        assertNull(WitTool.validate(r.bytes))
+        assertEquals(10L to 0L, drive(runtime.load(r.bytes)), "コンパイルあり")
+        assertEquals(10L to 0L, drive(EndiveRuntime(compile = false).load(r.bytes)), "インタプリタだけ")
+        val applied = Instrumentation.apply(bytes, setOf("w.wait"))
+        assertNull(WitTool.validate(applied))
+        assertEquals(10L to 0L, drive(runtime.load(applied)), "計測あり")
+        assertEquals(10L to 0L, plain(runtime.load(bytes)))
+    }
+
+    /** `run` を 1 回呼んで、`w.wait` で巻き戻す。呼び出しが投げた例外（なければ `null`）を返す */
+    private fun unwindOnce(module: WasmModule): Throwable? {
+        val builder = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { instance, _ ->
+                instance.asyncState = WasmAsyncState.UNWINDING
+                longArrayOf(0)
+            }
+            .asyncStack(Stack())
+        if (module.isFuelMetered) builder.fuel(1L shl 40, null)
+        return module.instantiate(builder.build()).use { instance -> runCatching { instance.call("run") }.exceptionOrNull() }
+    }
+
+    @Test
+    fun `structrefのローカルが待ち点をまたぐとき、nullなら巻き戻して巻き直せ、nullでなければ巻き戻しで止まる`() {
+        fun module(init: String) = gcSuspendModule(
+            """
+            (local ${'$'}x structref)
+            (local.set ${'$'}x $init)
+            (i32.add (i32.add (call ${'$'}wait) (call ${'$'}wait)) (ref.is_null (local.get ${'$'}x)))
+            """.trimIndent(),
+        )
+        // null: 巻き戻しの検査を通る（null のまま戻す）ので、巻き直せる。1 + 2 + 1
+        val r = Asyncify.transform(module("(block (result structref) (ref.null struct))"), setOf("w.wait"))
+        assertNull(WitTool.validate(r.bytes))
+        assertEquals(4L to 0L, drive(runtime.load(r.bytes)))
+        assertEquals(4L to 0L, drive(EndiveRuntime(compile = false).load(r.bytes)))
+        // null でない: 参照は保存できないので、巻き戻しの中の unreachable で止まる
+        val o = Asyncify.transform(module("(block (result structref) (struct.new ${'$'}s (i32.const 1)))"), setOf("w.wait"))
+        assertNull(WitTool.validate(o.bytes))
+        for (rt in listOf(runtime, EndiveRuntime(compile = false))) {
+            val e = unwindOnce(rt.load(o.bytes))
+            assertTrue(e is WasmTrapException, "巻き戻しで止まらなかった: $e")
+        }
+    }
+
+    @Test
+    fun `structrefの値がオペランドスタックに載ったまま待つときも、nullなら巻き直せ、nullでなければ巻き戻しで止まる`() {
+        fun module(value: String) = gcSuspendModule("(i32.add (call ${'$'}use $value (call ${'$'}wait)) (call ${'$'}wait))")
+        // use(null, 1) = 1 + 1、+ 2
+        val r = Asyncify.transform(module("(block (result structref) (ref.null struct))"), setOf("w.wait"))
+        assertNull(WitTool.validate(r.bytes))
+        assertEquals(4L to 0L, drive(runtime.load(r.bytes)))
+        val o = Asyncify.transform(module("(block (result structref) (struct.new ${'$'}s (i32.const 1)))"), setOf("w.wait"))
+        assertNull(WitTool.validate(o.bytes))
+        val e = unwindOnce(runtime.load(o.bytes))
+        assertTrue(e is WasmTrapException, "巻き戻しで止まらなかった: $e")
+    }
+
+    @Test
+    fun `ref_nullの型の番号（struct・arrayの型）の値が待ち点をまたぐと、正しくないモジュールを出さずに断る`() {
+        // 型の番号の ref.null $s は、略記のバイトを持たないので一時ローカルの型にできない
+        val crossing = gcSuspendModule("(i32.add (call ${'$'}use (ref.null ${'$'}s) (call ${'$'}wait)) (call ${'$'}wait))")
+        val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(crossing, setOf("w.wait")) }
+        assertTrue(e.message!!.contains("型付きの参照型"), e.message)
+        assertTrue(!e.message!!.contains("Exception"), e.message)
+        val loaded = assertThrows<WasmLoadException> { Program.loadMetered(runtime, crossing, null, setOf("w.wait")) }
+        val reason = Program.unsuspendableReason(loaded)
+        assertTrue(reason?.contains("型付きの参照型") == true, loaded.message)
+        assertTrue(!reason!!.contains("Exception"), reason)
+        // 待ち点をまたがなければ（すぐ捨てる・待ち点の前に使い切る）、そのまま写して動く
+        val dropped = gcSuspendModule("(drop (ref.null ${'$'}s)) (i32.add (call ${'$'}wait) (call ${'$'}wait))")
+        val r = Asyncify.transform(dropped, setOf("w.wait"))
+        assertNull(WitTool.validate(r.bytes))
+        assertEquals(3L to 0L, drive(runtime.load(r.bytes)))
+        val used = gcSuspendModule("(i32.add (call ${'$'}use (ref.null ${'$'}s) (i32.const 5)) (i32.add (call ${'$'}wait) (call ${'$'}wait)))")
+        val u = Asyncify.transform(used, setOf("w.wait"))
+        assertNull(WitTool.validate(u.bytes))
+        // use(null, 5) = 6、+ 1 + 2
+        assertEquals(9L to 0L, drive(runtime.load(u.bytes)))
+    }
+
+    /** struct・array の型を持つ core モジュールを中に持つコンポーネントは、検証で断られる（ADR 0757。#891 で読めるようになったのは p1 の core モジュールだけ） */
+    @Test
+    fun `struct・arrayの型を持つcoreモジュールを中に持つコンポーネントは、検証で断られる`() {
+        val component = WitTool.wat("(component (core module" + gcWat.removePrefix("(module").removeSuffix(")") + "))")
+        assertTrue(Program.isComponent(component))
+        val e = assertThrows<WasmLoadException> {
+            Program.loadExecutable(runtime, component, null, true, emptySet(), ComponentHost.NONE)
+        }
+        assertNull(Program.unsuspendableReason(e), "待機点への変換の断りではなく、検証の断りのはず: ${e.message}")
+        // 同じ core モジュールは、p1 としては読める
+        val p1 = Program.loadExecutable(runtime, WitTool.wat(gcWat), null, true, emptySet(), ComponentHost.NONE)
+        assertTrue(p1.module.isFuelMetered)
     }
 
     // ---- 保存（captureState） ----
