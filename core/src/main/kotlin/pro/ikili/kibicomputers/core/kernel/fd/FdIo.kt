@@ -129,7 +129,8 @@ internal object FdIo {
     /**
      * 待たずに書く（カーネルロックは自分で取る）。コンソールの TTY に書けたら、たまった出力をこのスレッドで表示デバイスに書く
      * （[ProcessContext.flushConsole]。#355）。書くことは、書いたのと同じカーネルロックの中で予約する
-     * （[ProcessContext.reserveConsoleFlushLocked]。その間に、メインスレッドが書き手のいない出力として取り出さないように。#419）
+     * （[ProcessContext.reserveConsoleFlushLocked]。その間に、メインスレッドが書き手のいない出力として取り出さないように。#419。
+     * 流す前にスタックが尽きても、予約はプロセスの終わりに戻る。#890）
      */
     fun write(ctx: ProcessContext, fd: Int, src: ByteArray, off: Int, len: Int): IoResult =
         writeHandle(ctx, src, off, len) { kernel -> kernel.processes[ctx.pid]?.handles?.get(fd) }
