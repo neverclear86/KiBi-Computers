@@ -1534,6 +1534,9 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun instantiate(module: WasmModule, configurer: InstanceConfigurer): WasmInstance {
             checkThread()
+            // 作りかけのメモリ・テーブルの分を返す道（Endive の失敗の catch）と、作り終えた後に rt.instances へつなぐまでを、
+            // 何も変える前に確かめた余裕でまかなう（#884。返す側では確かめられず、同じ深さの catch はまた溢れる）
+            StackHeadroom.ensure(StackHeadroom.INSTANTIATE_FRAMES)
             lock.withLockValue {
                 check(rt.loading == null) { "作っている途中は instantiate を入れ子で呼べない" }
                 check(rt.program.component == null) { "コンポーネントのプロセスは instantiate を呼べない（core インスタンスはリンクの計画が作る）" }
