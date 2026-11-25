@@ -38,10 +38,13 @@ internal class ConsolePumpReservationTest {
 
     /**
      * テスト用の書く先。[armed] に入れたスレッドが次に [lock] の `lock()` を呼ぶと、1 回だけ `StackOverflowError` を投げる
-     * （ロックを取る途中で尽きたのと同じ。取る前に投げるので、ロックの状態は壊れない）。メインスレッドは `tryLock` で取るので投げない
+     * （ロックを取る途中で尽きたのと同じ。取る前に投げるので、ロックの状態は壊れない）。メインスレッドは `tryLock` で取るので投げない。
+     * [writeArmed] に入れたスレッドが次に [write] を呼ぶと、1 回だけ `StackOverflowError` を投げる
+     * （TTY から取り出して予約を戻した後、表示デバイスに書く途中で尽きたのと同じ。書いた数には入らない）
      */
     private class TestSink : ConsoleSink {
         val armed = AtomicReference<Thread?>()
+        val writeArmed = AtomicReference<Thread?>()
         val written = AtomicInteger()
 
         override val lock: ReentrantLock = object : ReentrantLock() {
@@ -52,6 +55,7 @@ internal class ConsolePumpReservationTest {
         }
 
         override fun write(bytes: ByteArray): Long {
+            if (writeArmed.compareAndSet(Thread.currentThread(), null)) throw StackOverflowError("テストで投げた")
             written.addAndGet(bytes.size)
             return bytes.size.toLong()
         }
@@ -76,11 +80,23 @@ internal class ConsolePumpReservationTest {
         }
         .build()
 
-    private class Rig(val h: Harness, val m: Machine, val sink: TestSink, val tty: Tty)
+    /** メインスレッドが配ったコンソールの出力（カーネルのメッセージと、書き手のいない TTY の出力）を記録する */
+    private class ConsoleRecorder : MachineHost {
+        val console = StringBuffer()
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+            console.append(String(bytes, Charsets.UTF_8))
+        }
+    }
+
+    private class Rig(val h: Harness, val m: Machine, val sink: TestSink, val tty: Tty, val host: ConsoleRecorder)
 
     private fun rig(block: (Rig) -> Unit) {
         Harness().use { h ->
-            val m = h.machine(fuelPerTick = 50_000_000)
+            val host = ConsoleRecorder()
+            val m = h.machine(fuelPerTick = 50_000_000, host = host)
             val sink = TestSink()
             m.consoleSink = sink
             val tty = m.lock.withLockValue { m.consoleTtyLocked() }
@@ -90,7 +106,7 @@ internal class ConsolePumpReservationTest {
                 h.scheduler.tick()
                 init.process.state != ProcessState.CREATED
             }
-            block(Rig(h, m, sink, tty))
+            block(Rig(h, m, sink, tty, host))
             m.stop()
             eventually(10_000, "マシンが止まらない") {
                 h.scheduler.tick()
@@ -111,7 +127,13 @@ internal class ConsolePumpReservationTest {
 
     private fun Rig.outputAvailable(): Int = m.lock.withLockValue { tty.outputAvailable }
 
-    /** 尽きて終わった後に、予約が 0 に戻り、TTY に残った出力をメインスレッドが配る（表示が止まらない） */
+    /**
+     * 尽きて終わった後に、予約が 0 に戻り、メインスレッドが TTY の出力を配る（表示が止まらない）。配るのは 2 つの道で確かめる:
+     * - 尽きる前に TTY に積んだ [payload]: プロセスが終わったときのカーネルのメッセージ（`kibi: ... crashed: ...`）の前に、
+     *   メインスレッドが目印までを取り出す（`drainTtyBefore`。予約を見ない）ので、予約が残っていても通る
+     * - 尽きて終わった後に TTY へ積んだ出力（キー入力のエコーなど、書き手のいない出力）: `drainStaleConsoleOutput` の道。
+     *   予約が残っていると、この道は TTY の出力を取り出さない（#419）ので、予約が戻ったかをここで見分けられる（#890 の症状）
+     */
     private fun Rig.assertCrashedAndDrained(rt: ProcessRuntime) {
         awaitEnd(rt)
         assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
@@ -123,6 +145,14 @@ internal class ConsolePumpReservationTest {
         }
         assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（窓を突けていない）")
         assertEquals(MachineState.RUNNING, m.state)
+        // 書き手のいない出力は、メインスレッドが drainStaleConsoleOutput で配る
+        val echo = "echo890"
+        assertEquals(echo.length, m.offerConsoleInput(echo.toByteArray()))
+        eventually(10_000, "書き手のいない出力をメインスレッドが配らない（${outputAvailable()} バイト、配った分: ${host.console}）") {
+            h.scheduler.tick()
+            outputAvailable() == 0 && host.console.contains(echo)
+        }
+        assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（窓を突けていない）")
     }
 
     @ParameterizedTest
@@ -147,6 +177,21 @@ internal class ConsolePumpReservationTest {
             r.assertCrashedAndDrained(rt)
             assertEquals(null, r.sink.armed.get(), "表示デバイスのロックを取りに行かなかった")
             // 表示デバイスのロックは壊れていない（取る前に投げた）
+            assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
+            r.sink.lock.unlock()
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `pumpConsoleが予約を戻した後に、表示デバイスに書く途中でスタックが尽きても、予約は負にならず0のまま`(kind: ProcessKind) = timeout(limit) {
+        rig { r ->
+            val rt = r.spawn(kind) { ctx -> writeConsole(ctx, r.tty) { r.sink.writeArmed.set(Thread.currentThread()) } }
+            r.assertCrashedAndDrained(rt)
+            assertEquals(null, r.sink.writeArmed.get(), "表示デバイスに書きに行かなかった")
+            // 予約は pumpConsole で戻った後に、終わりの片付けでもう一度は戻らない（負にならない）
+            assertEquals(0, r.m.consolePumpsReservedForTest)
+            // 表示デバイスのロックは放されている
             assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
             r.sink.lock.unlock()
         }

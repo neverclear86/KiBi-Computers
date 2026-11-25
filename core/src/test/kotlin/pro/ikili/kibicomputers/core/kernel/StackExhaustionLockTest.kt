@@ -444,6 +444,12 @@ class StackExhaustionLockTest {
                     assertTrue(round.ops.get() > 0, "ディスクの操作が 1 度も動かなかった（$where、$tag。本体 ${round.calls.get()} 回）")
                     diskOps.addAndGet(round.ops.get())
                 }
+                if (body == Body.CONSOLE) {
+                    // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている（#890。持ち主のプロセスが
+                    // 終わるときに戻す）。残ると、メインスレッドがその台の TTY の残り（キー入力のエコーなど）をずっと取り出さなくなる。
+                    // 確かめの段数を縮めて回したとき（尽きた位置がロックの中に落ちて下で落ちる回を含む）も、予約の残りを別に報告するため、先に見る
+                    assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った（$where、${position}）")
+                }
                 // 尽きた位置が、ロック（この MOD のもの、JDK のクラス経由の executor・列・NIO のもの）を取る・放す途中（AQS・`Unsafe` の CAS を含む）なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
                 // 失敗の説明は、落とすときだけ作る（成功する回で `state` を評価しない。中のロックは待ちの上限付きで取る）
                 if (position.isLock) {
@@ -467,11 +473,6 @@ class StackExhaustionLockTest {
                         assertTrue(problems.isEmpty(), "尽きた後にディスク $name の状態がホストと食い違った（$where、$tag）: $problems")
                         assertEquals(0, fs.openHandles, "開いたままのホストのファイルが残った（ディスク $name。$where、$tag）")
                     }
-                }
-                if (body == Body.CONSOLE) {
-                    // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている。残ると、
-                    // メインスレッドがその台の TTY の残り（キー入力のエコーなど）をずっと取り出さなくなる
-                    assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った（$where）")
                 }
                 // 同じ台と別の台のプロセスが進み続ける（CPU・許可が渡り続ける）
                 awaitProgress(ticker, "同じ台のプロセス（$where）", sameProgress, describe)
