@@ -515,23 +515,59 @@ class AsyncP1Test {
 
     @Test
     fun `定数式のv128グローバルを持つモジュールは待機点型で動き、保存の写しの中でだけ止める`() = timeout(limit) {
-        val program = Program.loadMetered(EndiveRuntime(), v128GlobalCommand, null, WasiP1.WAIT_IMPORTS)
+        killedOnlyInCopy(v128GlobalCommand)
+    }
+
+    /**
+     * struct の型と、`struct.new` で初期化した structref のグローバル（GC のオブジェクト）を持ち、標準入力から 1 バイト読んでから、
+     * そのオブジェクトのフィールド（7）で終わる p1 のコマンド（#891）。止まりうる `_start` は型付きの参照型を扱わず
+     * （扱うと型を追えないので変換が断る）、フィールドは止まらない関数 `${'$'}code` で読む
+     */
+    private val gcGlobalCommand by lazy {
+        pro.ikili.kibicomputers.core.wasi.kibi.WitTool.wat(
+            """
+            (module
+              (type ${'$'}s (struct (field (mut i32))))
+              (import "wasi_snapshot_preview1" "fd_read" (func ${'$'}fd_read (param i32 i32 i32 i32) (result i32)))
+              (import "wasi_snapshot_preview1" "proc_exit" (func ${'$'}exit (param i32)))
+              (memory (export "memory") 1)
+              (global ${'$'}g structref (struct.new ${'$'}s (i32.const 7)))
+              (func ${'$'}code (result i32) (struct.get ${'$'}s 0 (ref.cast (ref ${'$'}s) (global.get ${'$'}g))))
+              (func (export "_start")
+                (i32.store (i32.const 0) (i32.const 16))
+                (i32.store (i32.const 4) (i32.const 1))
+                (drop (call ${'$'}fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+                (call ${'$'}exit (call ${'$'}code))))
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun `GCのオブジェクトを初期値に持つグローバルのモジュールは待機点型で動き、保存の写しの中でだけ止める`() = timeout(limit) {
+        // GC のオブジェクトの中身は写さないので、captureState が断る（ADR 0329 の #851 の追記。インスタンスでの確かめは
+        // ConstExprInstrumentationTest）。写しの中でだけ殺す
+        killedOnlyInCopy(gcGlobalCommand)
+    }
+
+    /** [command] を `exec` で待機点型として動かし、入力を待つ間の保存の写しの中でだけ殺され、元のプロセスは 7 で終わること */
+    private fun killedOnlyInCopy(command: ByteArray) {
+        val program = Program.loadMetered(EndiveRuntime(), command, null, WasiP1.WAIT_IMPORTS)
         assertTrue(program.module.isAsyncified)
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val m = h.machine(fuelPerTick = 10_000_000)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
-            val f = m.vfs.open(VfsPath.parse("/v128"), OpenOptions(read = true, write = true, create = true, truncate = true))
-            m.vfs.write(f, v128GlobalCommand, 0, v128GlobalCommand.size)
+            val f = m.vfs.open(VfsPath.parse("/cmd"), OpenOptions(read = true, write = true, create = true, truncate = true))
+            m.vfs.write(f, command, 0, command.size)
             val input = m.lock.withLockValue { ByteStream(16).also { m.kernel.objects.add(it) }.id }
             val stdio = StdioSpec(StdioSource.Object(input, HandleRights.READ), StdioSource.Closed, StdioSource.Closed)
-            val pid = m.exec("/v128", KernelDrivers.DEFAULT, SpawnOptions(stdio = stdio))
+            val pid = m.exec("/cmd", KernelDrivers.DEFAULT, SpawnOptions(stdio = stdio))
             assertEquals(ProcessKind.WAIT_POINT, m.lock.withLockValue { m.kernel.processes[pid]!!.kind })
             eventually(30_000, "入力を待たない") {
                 h.scheduler.tick()
                 m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint
             }
             assertTrue(h.scheduler.dedicatedThreads.isEmpty(), "専用スレッドがある")
-            // 可変の v128 のグローバルは取り出せない（ADR 0082）。写しは取れ、その中でだけプロセスを殺す
+            // 可変の v128 のグローバル・GC のオブジェクトを初期値に持つグローバルは取り出せない（ADR 0082）。写しは取れ、その中でだけプロセスを殺す
             val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
             assertTrue(pid in copy.killedPids, "写しの中で殺していない")
             assertTrue(copy.abiCaptures[pid] == null, "殺したプロセスの ABI 層を写した")

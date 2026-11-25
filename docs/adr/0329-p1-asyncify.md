@@ -177,6 +177,20 @@ step の途中で燃料が尽きたときも、止まりうる関数の中なら
 - **不変の v128 のグローバルだけを持つプロセス**は、保存の写しの中で殺されず（`captureState` は不変のグローバルを写さず、戻すときにインスタンスを作り直す）、戻した後も `global.get` で初期値を読める（`MachineRestoreBranchesTest`）。
 - struct・array の型の定義を持つモジュールは、止まりうる関数がなくても、待機点への変換が別の理由で断る（型のセクションを関数の型として読むため）。#851 の範囲の外なので、別の Issue（#891）にした。`EndiveRuntime.load` も同じ原因で NPE になるので、#891 を直すときは両方を直す。
 
+### 追記（#891）: struct・array の型を持つモジュール
+
+上の #851 の追記の「今は、struct・array の型を持つモジュールが製品の経路の読み込みで落ちる」「型の番号を持つ命令は … 写しを直接呼ぶテストだけ」「struct・array の型の定義を持つモジュールは … 別の理由で断る」は、#891 で次のように変わった（#851 の追記の本文はそのまま残す）。
+
+- **`Asyncify` の型の表は、rec グループを平らにした番号で、すべての型を読む。** 今までは rec グループの数（`typeCount`）までを関数の型（`getType`）として読んでいたので、struct・array の型で NPE、rec グループの後ろの番号で IndexOutOfBounds になり、`guard` が `AsyncifyUnsupported` に包んでいた。今は `subTypeCount` まで読み、struct・array の型は「関数の型でない」（`null`）として持つ。型そのものでは断らない（止まりうる関数があっても）。関数の型として引いたとき（`call_indirect`・`call_ref`・ブロック型・import・タグの型）だけ「型 N は関数の型でない（GC の提案の struct・array の型）」で断るが、正しいモジュールでは起きない（最初の `Parser.parse` の検証が先に断る）。
+- **Issue の本文は「`untypedReason` と同じ扱い」としたが、struct・array の型だけでは `untypedReason` を立てない。** 立てると、止まりうる関数があるときに `struct.new` などを型を持たない参照（structref・anyref・arrayref・eqref）のグローバルに入れるモジュールまで断ってしまい、#891 で足すテスト（止まりうる関数があるときに型の番号を持つ定数式を写す）が書けないため。型付きの参照型（`(ref $s)` など）は今までどおり `untypedReason` で、止まりうる関数があるときだけ断る。
+- 出力は変わらない（型の表は解析と断りの判定にしか使わない）ので、`Instrumentation.VERSION` は上げない。ただし、今まで読まれていなかった rec グループの後ろの型も読むようになったので、型付きの参照型を引数に持つ関数の型を rec グループの後ろに持ち、止まりうる関数があるモジュールは、新しく `untypedReason` で断られる。そうしたモジュールは関数も型付きの参照型を使うのが普通で、今も断られていたはず。
+- **`EndiveRuntime.simdFunctions` も直す。** 型のセクションの `types()` は struct・array の型の位置が `null` なので NPE だった。平らにした番号で型を読み、関数の型の引数・結果に加えて、struct のフィールド・array の要素に v128 があっても `null`（モジュール全体をインタプリタ）を返す（`struct.get`・`array.get` は SIMD の命令なしに v128 を生むので、SIMD の関数だけを選ぶ前提が崩れる）。
+- これで、struct・array の型を持つモジュールが製品の経路（コンパイルあり）で読める。GC のオブジェクトを初期値に持つグローバル・要素セグメントの `captureState` の断りに、製品の経路から届く（そうしたプロセスは `exec` で待機点型で動き、保存の写しの中でだけ殺す。`AsyncP1Test`）。
+- **止まりうる関数の本体の GC の命令**: 待ち点を含むブロックの直下にある GC の命令（`struct.new`・`struct.get`・`array.*` など）は、型の追跡（`effect`）が対応していない命令として `AsyncifyUnsupported`（「命令 …（SIMD・アトミック・GC などの拡張）には対応していない」）で断る。待ち点を含まない入れ子のブロックの中の GC の命令は、`emitPlain` がそのまま写すので動く（`br_on_cast` などの分岐は断る）。structref・anyref などの値が待ち点をまたぐと、一時ローカルに移され、巻き戻しで null でなければ `unreachable` で止まる（参照は保存できない。null なら巻き直せる）。
+- **`ref.null` の型の番号**: `effect` は `ref.null` のヒープ型を、抽象ヒープ型（1 バイトの負の数。略記のバイトと同じ番号）なら型として積み、型の番号（`ref.null $s`）は型を追えない参照（`BOT`）として積む。後者の値が待ち点をまたぐ（一時ローカルに移す）と、`newLocal` が「型付きの参照型 … の値を持ったまま待つことには対応していない」で `AsyncifyUnsupported` にする。今までは型の番号の先頭のバイトをそのまま型として積んでいたので、型 0x00 のローカルを宣言した正しくない出力になり、読み込みの検証の失敗（`unsuspendableReason` が `null`）になっていた。関数の型の番号の `ref.null $f` では前からある形で、struct・array の型でも届くようになった。待ち点をまたがない `ref.null $s` は今までどおり動く。
+- **型付きの `select`（0x1C）の注釈**も `ref.null` と同じに扱う。注釈の型が `(ref null <抽象ヒープ型>)` なら略記のバイト（`(ref null struct)` は structref）にし、`(ref null $s)`・`(ref $s)`・`(ref struct)`（型の番号のもの、null を許さないもの）は `BOT` にして、待ち点をまたぐと同じ文言で `AsyncifyUnsupported` にする。今までは注釈の先頭のバイト（0x63・0x64）をそのまま型として積んでいたので、ヒープ型のない 0x63 のローカルを宣言した正しくない出力になっていた（`ref.null` と同じく読み込みの検証の失敗）。型付きの参照型は関数の型・グローバル・テーブルになくても本体の中で作れるので、`untypedReason` では届かない。出力が変わるのは今まで正しくない出力になっていた形だけなので、`Instrumentation.VERSION` は上げない（`ref.null` の直しと同じ）。
+- **GC のオブジェクトの確保は、RAM にも燃料にも数えない**。Endive 1.2.0 の `array.new`・`array.new_default` は長さそのままで JVM のヒープに確保し（`BudgetedMemory`・`BudgetedTable` を通らない）、`FuelInjector` の長さに比例する課金は `memory.*`・`table.*` だけで、`array.new*`・`array.fill`・`array.copy` は燃料 1。この変更で、p1 のプログラムがコンピューターの RAM の上限と無関係に JVM のヒープを取れるようになる（ソースを読んだもので、動かして測っていない）。別の Issue（#939）にした。
+
 ## #338 での改善
 
 #338（変換の速さの改善）は、Issue の 3 つの項目を別々の PR で入れ、それぞれで `Instrumentation.VERSION` を上げて、ここに測った表を足す。

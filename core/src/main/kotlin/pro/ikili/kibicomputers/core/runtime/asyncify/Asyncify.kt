@@ -23,6 +23,7 @@ import java.io.ByteArrayOutputStream
  * 止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。グローバル・要素セグメントの定数式の
  * `v128.const` と GC の提案の命令は、定数式としてそのまま写し、これでは断らない（#851）。ただし、止まりうる関数があるモジュールは、
  * 型付きの参照型（`(ref i31)` など）のグローバルや型を持てば、定数式の命令とは別に断る（型を追えない。#384）。
+ * struct・array の型の定義（rec グループの中のものも）は、それだけでは断らない（止まりうる関数があっても。#891）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -362,7 +363,17 @@ private class Transformer(
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
-    private val typeSigs = ArrayList<Sig>()
+    /**
+     * 型の番号（rec グループを平らにした番号）→ 関数の型。struct・array の型（GC の提案）は `null`（#891）。
+     * 型そのものでは断らない（止まりうる関数がなければ、型は使わない）。関数の型として引いたときだけ断る（[typeSig]）
+     */
+    private val typeSigs = ArrayList<Sig?>()
+
+    /** 関数の型として番号 [idx] の型を引く。関数の型でなければ断る（正しいモジュールでは起きない。検証が先に断る） */
+    private fun typeSig(idx: Int): Sig =
+        typeSigs.getOrNull(idx) ?: throw AsyncifyUnsupported(
+            if (idx in typeSigs.indices) "型 $idx は関数の型でない（GC の提案の struct・array の型）" else "型 $idx がない",
+        )
     private val globalTypes = ArrayList<Int>()
     private val tableTypes = ArrayList<Int>()
     private val tagSigs = ArrayList<Sig>()
@@ -405,9 +416,10 @@ private class Transformer(
 
     init {
         val types = module.typeSection()
-        for (i in 0 until types.typeCount()) {
-            val t = types.getType(i)
-            typeSigs += Sig(t.params().map(::codeOrBot), t.returns().map(::codeOrBot))
+        // 型の番号は rec グループを平らにした番号なので、rec グループの数（typeCount）ではなく、平らにした数まで読む（#891）
+        for (i in 0 until types.subTypeCount()) {
+            val t = types.getSubType(i).compType().funcType()
+            typeSigs += t?.let { Sig(it.params().map(::codeOrBot), it.returns().map(::codeOrBot)) }
         }
         val imports = module.importSection()
         var nf = 0
@@ -422,25 +434,25 @@ private class Transformer(
                     tableTypes += codeOrBot(imp.entryType())
                     sharedTables += true
                 }
-                is TagImport -> tagSigs += typeSigs[imp.tagType().typeIdx()]
+                is TagImport -> tagSigs += typeSig(imp.tagType().typeIdx())
             }
             if (imp !is FunctionImport) continue
             val full = "${imp.module()}.${imp.name()}"
             if (full in asyncImports) asyncFuncs += nf
             if (full == yieldImport) {
-                val s = typeSigs[imp.typeIndex()]
+                val s = typeSig(imp.typeIndex())
                 if (s.params != listOf(I64) || s.results != listOf(I64)) throw AsyncifyUnsupported("燃料切れの import $full の型が (i64) -> (i64) でない")
                 yf = nf
                 yt = imp.typeIndex()
             }
-            funcSigs += typeSigs[imp.typeIndex()]
+            funcSigs += typeSig(imp.typeIndex())
             nf++
         }
         importedFuncs = nf
         yieldFunc = if (yf in asyncFuncs) -1 else yf
         yieldType = yt
         val fs = module.functionSection()
-        for (i in 0 until fs.functionCount()) funcSigs += typeSigs[fs.getFunctionType(i)]
+        for (i in 0 until fs.functionCount()) funcSigs += typeSig(fs.getFunctionType(i))
         val gs = module.globalSection()
         for (i in 0 until gs.globalCount()) globalTypes += codeOrBot(gs.getGlobal(i).valueType())
         val ts = module.tableSection()
@@ -454,7 +466,7 @@ private class Transformer(
             val t = e.index()
             if (e.exportType() == ExternalType.TABLE && t < sharedTables.size) sharedTables[t] = true
         }
-        module.tagSection().ifPresent { tags -> tags.types().forEach { tagSigs += typeSigs[it.typeIdx()] } }
+        module.tagSection().ifPresent { tags -> tags.types().forEach { tagSigs += typeSig(it.typeIdx()) } }
         pushFunc = importedFuncs
         popFunc = importedFuncs + 1
         asyncFuelFunc = if (yieldFunc >= 0) importedFuncs + 2 else -1
@@ -466,7 +478,7 @@ private class Transformer(
     private val suspendTypes = HashSet<Pair<List<Int>, List<Int>>>()
 
     private fun indirectMaySuspend(ins: AnnotatedInstruction): Boolean {
-        val sig = typeSigs[ins.operand(0).toInt()]
+        val sig = typeSig(ins.operand(0).toInt())
         if (sig.params to sig.results in suspendTypes) return true
         if (externalSuspendTypes.isEmpty() || Asyncify.Signature(sig.params, sig.results) !in externalSuspendTypes) return false
         // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）。
@@ -886,6 +898,8 @@ private class Transformer(
 
         private fun newLocal(t: Int): Int {
             if (t == V128) throw AsyncifyUnsupported("SIMD（v128）のローカル変数には対応していない")
+            // 型を追えない参照（BOT）は、宣言できる型がない。型の番号の `ref.null $s` などの値を待ち点をまたいで持つときに届く（#891）
+            if (t == BOT) throw AsyncifyUnsupported("型付きの参照型（GC・関数参照の提案の (ref <型>)）の値を持ったまま待つことには対応していない")
             newLocals += t
             localTypes += t
             return localTypes.size - 1
@@ -1299,7 +1313,7 @@ private class Transformer(
                 }
                 else -> {
                     val idx = r.sleb().toInt()
-                    val s = typeSigs[idx]
+                    val s = typeSig(idx)
                     Triple(s.params, s.results, r.pos)
                 }
             }
@@ -1345,11 +1359,11 @@ private class Transformer(
                 0x10 -> call(st, funcSigs[ins.operand(0).toInt()])
                 0x11 -> {
                     st.pop()
-                    call(st, typeSigs[ins.operand(0).toInt()])
+                    call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x14 -> {
                     st.pop()
-                    call(st, typeSigs[ins.operand(0).toInt()])
+                    call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x1A -> st.pop()
                 0x1B -> {
@@ -1360,7 +1374,19 @@ private class Transformer(
                 }
                 0x1C -> {
                     st.pop(3)
-                    st.push(wasm[ins.address() + 2].toInt() and 0xFF)
+                    // 型付きの select の注釈は vec(valtype)（数は 1 なので 1 バイト）。(ref null <ヒープ型>)・(ref <ヒープ型>) は
+                    // 先頭のバイト（0x63・0x64）の後にヒープ型の sleb が続く。ref.null（0xD0）と同じく、抽象ヒープ型の
+                    // (ref null <抽象>) は略記のバイトにし、型の番号のものと null を許さないものは型を追えない参照（BOT）にする（#891）
+                    val r = Reader(wasm, ins.address() + 2, endOf[ins]!!)
+                    val t = r.u8()
+                    st.push(
+                        if (t == 0x63 || t == 0x64) {
+                            val heapType = r.sleb()
+                            if (t == 0x63 && heapType < 0) (heapType + 0x80).toInt() else BOT
+                        } else {
+                            t
+                        },
+                    )
                 }
                 0x20 -> st.push(localTypes[ins.operand(0).toInt()])
                 0x21 -> st.pop()
@@ -1412,7 +1438,12 @@ private class Transformer(
                 in 0xB7..0xBB, 0xBF -> un(st, F64)
                 0xC0, 0xC1 -> un(st, I32)
                 in 0xC2..0xC4 -> un(st, I64)
-                0xD0 -> st.push(wasm[ins.address() + 1].toInt() and 0xFF)
+                0xD0 -> {
+                    // ref.null のヒープ型は sleb。抽象ヒープ型（func・struct・any など）は 1 バイトの負の数で、略記のバイトと同じ番号になる。
+                    // 型の番号（0 以上。`ref.null $s`）は型を追えない参照（BOT）にして、値が待ち点をまたぐとき（一時ローカルに移すとき）に断る（#891）
+                    val heapType = Reader(wasm, ins.address() + 1, endOf[ins]!!).sleb()
+                    st.push(if (heapType >= 0) BOT else (heapType + 0x80).toInt())
+                }
                 0xD1 -> un(st, I32)
                 0xD2 -> st.push(0x70)
                 0xD3 -> bin(st, I32)
@@ -1495,7 +1526,7 @@ private class Transformer(
                     is Leaf -> {
                         callSig = when (node.ins.opcode()) {
                             OpCode.CALL -> funcSigs[node.ins.operand(0).toInt()]
-                            else -> typeSigs[node.ins.operand(0).toInt()]
+                            else -> typeSig(node.ins.operand(0).toInt())
                         }
                         consumed = callSig.params.size + if (node.ins.opcode() == OpCode.CALL) 0 else 1
                     }

@@ -156,7 +156,7 @@ internal class Program private constructor(
          *   下の待ち、resource の dtor の中の待ち）は、`BLOCKING` で動かさずに [WasmLoadException] で断る（#844。#801 の結論。p1 の [loadMetered] と同じく、
          *   原因は [AsyncifyUnsupported] で [unsuspendableReason] で取り出せる。失敗は `ProgramCache` が覚える）。断る判断はここで渡す
          *   `requireWaitPoints` で、中のコンパイルの前に止める。止まりうる関数がないものは、止まりうる関数の中の作り（v128 のローカルなど）では断らない（#384 と同じ）。
-         *   グローバル・要素セグメントの定数式の `v128.const` も断らない（p1 と同じ。#851）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
+         *   グローバル・要素セグメントの定数式の `v128.const` も断らない（p1 と同じ。#851）。struct・array の型（GC の提案）を持つ core モジュールは、コンポーネントでは検証（`ComponentValidator`。GC の機能を有効にしていない）が先に断る（p1 の core モジュールは #891 で読める。ADR 0757）。上限は [limits]（`null` なら [ModuleLimits.DEFAULT]）を
          *   中の core モジュールに当てる。上限を外す道は作らない（検証の時間の上限と見張りの前提。ADR 0666）
          * - core モジュール: [metered] なら [loadMetered]、でなければ [load]（今までどおり）
          *
