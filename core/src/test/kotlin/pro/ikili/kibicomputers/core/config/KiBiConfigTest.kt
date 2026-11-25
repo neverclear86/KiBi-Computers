@@ -70,6 +70,54 @@ class KiBiConfigTest {
     }
 
     @Test
+    fun withoutOwnerGroupsTheOwnerScopedEntriesAreLeftOut() {
+        // #897: 持ち主の仕組みを持たない接続層（1.20.1）には、持ち主ごとの上限と access の項目を出さない
+        val scoped = setOf<ConfigEntry<*>>(
+            KiBiConfig.MAX_CONCURRENT_MACHINES_PER_OWNER,
+            KiBiConfig.MAX_BLOCKING_PROCESSES_PER_OWNER,
+            KiBiConfig.MAX_PENDING_LOADS_PER_OWNER,
+            KiBiConfig.SCREEN_OWNER_BYTES_PER_SECOND,
+            KiBiConfig.ACCESS_OP_PERMISSION_LEVEL,
+            KiBiConfig.ACCESS_PENDING_INVITE_HOURS,
+            KiBiConfig.ACCESS_MAX_MEMBERS,
+            KiBiConfig.ACCESS_MAX_PENDING_INVITES,
+            KiBiConfig.ACCESS_REQUEST_TTL_SECONDS,
+            KiBiConfig.ACCESS_MAX_REQUESTS_PER_COMPUTER,
+        )
+        assertEquals(scoped, KiBiConfig.ENTRIES.filter { it.ownerScoped }.toSet())
+        for (side in ConfigSide.entries) {
+            val all = KiBiConfig.entries(side)
+            assertEquals(all, KiBiConfig.entries(side, ownerGroups = true))
+            assertEquals(all.filterNot { it in scoped }, KiBiConfig.entries(side, ownerGroups = false))
+        }
+        assertTrue(KiBiConfig.entries(ConfigSide.SERVER, ownerGroups = false).none { it.section == "access" })
+    }
+
+    @Test
+    fun withoutOwnerGroupsThereIsNoPerGroupLimit() {
+        // #897: 組ごとの項目に何が入っていても読まず、0（上限なし）にする。全体の上限はそのまま
+        val values = ConfigValues.resolve(
+            mapSource(
+                KiBiConfig.MAX_BLOCKING_PROCESSES to 100,
+                KiBiConfig.MAX_CONCURRENT_MACHINES_PER_OWNER to 3,
+                KiBiConfig.MAX_BLOCKING_PROCESSES_PER_OWNER to 5,
+                KiBiConfig.MAX_PENDING_LOADS_PER_OWNER to 7,
+                KiBiConfig.SCREEN_OWNER_BYTES_PER_SECOND to 11_000,
+            ),
+        )
+        for (v in listOf(values, ConfigValues.DEFAULTS)) {
+            val scheduler = KiBiConfig.schedulerConfig(v, ModuleStore.NONE, ownerGroups = false)
+            assertEquals(0, scheduler.maxConcurrentMachinesPerGroup)
+            assertEquals(0, scheduler.maxBlockingProcessesPerGroup)
+            assertEquals(0, scheduler.maxPendingLoadsPerGroup)
+            assertEquals(v[KiBiConfig.MAX_BLOCKING_PROCESSES], scheduler.maxBlockingProcesses)
+            val traffic = KiBiConfig.screenSyncTraffic<Any>(v, ownerGroups = false)
+            assertEquals(0, traffic.groupBytesPerSecond)
+            assertEquals(v[KiBiConfig.SCREEN_SERVER_BYTES_PER_SECOND], traffic.serverBytesPerSecond)
+        }
+    }
+
+    @Test
     fun autoSentinelLeavesMachineDependentDefaults() {
         val explicit = ConfigValues.resolve(
             mapSource(KiBiConfig.MAX_CONCURRENT_MACHINES to 3, KiBiConfig.TOTAL_MEMORY_MIB to 5),

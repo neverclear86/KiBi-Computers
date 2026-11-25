@@ -15,6 +15,7 @@ import pro.ikili.kibicomputers.core.KiBiComputers
 import pro.ikili.kibicomputers.core.config.ConfigSide
 import pro.ikili.kibicomputers.core.config.IntEntry
 import pro.ikili.kibicomputers.core.config.KiBiConfig
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.forge.config.KiBiConfigs
 import java.nio.file.Files
 
@@ -41,6 +42,36 @@ object ConfigGameTests {
         helper.assertTrue(values.rejected.isEmpty(), "no value should be rejected: ${values.rejected}")
         KiBiConfig.machineSaveConfig(values)
         KiBiConfig.screenSyncTraffic<Any>(values)
+        helper.succeed()
+    }
+
+    /**
+     * 持ち主の仕組みを持たない 1.20.1 では、持ち主ごとの項目（[pro.ikili.kibicomputers.core.config.ConfigEntry.ownerScoped]）を
+     * コンフィグに出さず、組み立てでも組ごとの上限を掛けない（#897）。全台が持ち主なしの1組になり、組の上限が全体の上限として効くため
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun ownerScopedEntriesAreNotExposed(helper: GameTestHelper) {
+        helper.assertTrue(!KiBiConfigs.OWNER_GROUPS, "1.20.1 has no owner groups until #224")
+        val scoped = KiBiConfig.ENTRIES.filter { it.ownerScoped }
+        helper.assertTrue(KiBiConfig.MAX_BLOCKING_PROCESSES_PER_OWNER in scoped, "the per-owner limits should be owner scoped")
+        for (entry in scoped) {
+            helper.assertTrue(KiBiConfigs.specValue(entry) == null, "$entry should not be in the 1.20.1 config")
+        }
+        // 持ち主に依らない項目は今までどおり出す
+        for (entry in KiBiConfig.entries(ConfigSide.SERVER).filterNot { it.ownerScoped }) {
+            helper.assertTrue(KiBiConfigs.specValue(entry) != null, "$entry should be in the 1.20.1 config")
+        }
+        val scheduler = KiBiConfig.schedulerConfig(KiBiConfigs.server, ModuleStore.NONE, KiBiConfigs.OWNER_GROUPS)
+        helper.assertTrue(scheduler.maxConcurrentMachinesPerGroup == 0, "no per-group permit limit")
+        helper.assertTrue(scheduler.maxBlockingProcessesPerGroup == 0, "no per-group blocking limit")
+        helper.assertTrue(scheduler.maxPendingLoadsPerGroup == 0, "no per-group load limit")
+        helper.assertTrue(
+            scheduler.maxBlockingProcesses == KiBiConfigs.server[KiBiConfig.MAX_BLOCKING_PROCESSES],
+            "the server-wide blocking limit still applies",
+        )
+        val traffic = KiBiConfig.screenSyncTraffic<Any>(KiBiConfigs.server, KiBiConfigs.OWNER_GROUPS)
+        helper.assertTrue(traffic.groupBytesPerSecond == 0, "no per-group screen traffic limit")
         helper.succeed()
     }
 

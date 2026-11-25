@@ -29,10 +29,24 @@ import java.util.IdentityHashMap
  * 読み直しのイベントは、ファイルの書き換え（ファイルを見張るスレッド）と、専用サーバーにつないだクライアントが同期された
  * サーバーの設定を受け取ったとき（ファイルを持たない設定。案内のログは出さない）に来る。どちらもメインスレッドとは限らない。ここでは写しを作って参照を差し替えるだけで、マシンの状態には触らない。
  * 使う側は、メインスレッドの tick で参照の変化を見て当てる（1.20.1 の使う側の移植は #224）。
- * 1.21.1（`platform-neoforge-1.21.1` の同名のクラス）と同じファイル名・同じキーの木にする。
+ * 1.21.1（`platform-neoforge-1.21.1` の同名のクラス）と同じファイル名・同じキーの木にする。ただし、持ち主の仕組みに依る項目
+ * （[ConfigEntry.ownerScoped]）は、[OWNER_GROUPS] が false の間は出さない（#897、ADR 0202 の例外）。
  */
 object KiBiConfigs {
     private val LOGGER = LogUtils.getLogger()
+
+    /**
+     * この接続層が持ち主の仕組み（PlayerAccess と、ケースから渡す公平の組の鍵 `fairnessKey`。#131・#738）を持つか（#897）。
+     *
+     * 1.20.1 はまだ持たないので false。全台が持ち主なしの1組（`FairShareGroup.NONE`）になり、持ち主ごとの上限が
+     * サーバー全体の上限として効いてしまうため、持ち主ごとの項目をコンフィグに出さず、組み立てでも組ごとの上限を掛けない。
+     * #224 でマシンを移すときは、スケジューラ・画面の同期の組み立て（`KiBiConfig.schedulerConfig`・`KiBiConfig.screenSyncTraffic`）に
+     * この値を渡す。PlayerAccess とケースからの `fairnessKey` を移したら true にする
+     */
+    internal const val OWNER_GROUPS: Boolean = false
+
+    /** [side] のうち、この接続層のコンフィグに出す項目（spec の登録と値の写しの両方で使う） */
+    private fun entries(side: ConfigSide): List<ConfigEntry<*>> = KiBiConfig.entries(side, OWNER_GROUPS)
 
     private class Registered(val spec: ForgeConfigSpec, val values: Map<ConfigEntry<*>, ForgeConfigSpec.ConfigValue<*>>)
 
@@ -76,7 +90,7 @@ object KiBiConfigs {
     /** 項目のある分類の spec を作って登録する。MOD の初期化で1回だけ呼ぶ */
     fun register(context: ModLoadingContext) {
         for (side in ConfigSide.entries) {
-            val entries = KiBiConfig.entries(side)
+            val entries = entries(side)
             if (entries.isEmpty()) continue
             val built = build(entries)
             registered[side] = built
@@ -150,7 +164,7 @@ object KiBiConfigs {
     private fun refresh(side: ConfigSide, reg: Registered, reload: Boolean, synced: Boolean = false) {
         // 1.20.1 の get() は読み直しでキャッシュを捨てる（worldRestart は印だけ）。読み込む前なら既定にする
         val source = ConfigSource { entry -> runCatching { reg.values[entry]?.get() }.getOrNull() }
-        val next = ConfigValues.resolve(source, KiBiConfig.entries(side))
+        val next = ConfigValues.resolve(source, entries(side))
         for (entry in next.rejected) LOGGER.warn("Ignoring an invalid value of {} in {}; using the default", entry.path, side.fileName)
         val changed = state(side).update(next)
         loaded += side
