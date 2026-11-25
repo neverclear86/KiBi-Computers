@@ -69,7 +69,8 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     開いたままの枠が 0 に戻り、ディスクの状態がホストと合うこと）。
  *     入口の確かめの `StackOverflowError` は、呼び手が飲まずに伝える（`Vfs.readDirectory` がマウントの根の `stat` の失敗を node 0 に
  *     するのは `Exception` だけで、`Error` は伝える）。
- *     `/tmp`（`TmpFileSystem`）の木の「外す → 付け替える」は、まだ確かめていない（#902）
+ *     `/tmp`（`TmpFileSystem`）の変える操作は、#883 で入口に [TMPFS_FRAMES] 段の確かめを足し、木と使用量の食い違いも
+ *     `TmpFileSystem.consistencyProblemsForTest` で見るようにした（下の「`/tmp`」）。木の食い違いの道全般の掃引は #902
  *   - `StackExhaustionLockTest` の `DISK_IO`: プロセスの中から、回ごとに 1 種類の操作（深いディレクトリの `stat`・別のディスクの `stat`・
  *     `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`）を、スタックの底に近いところのホストの関数で動かす
  *     （1 本に 40 回。底に近いところだけ本物の操作をするので、1 本が約 9 秒）。毎回の後に、ディスクの表・使用量・枠がホストと合うことと、
@@ -127,8 +128,31 @@ package pro.ikili.kibicomputers.core.kernel.process
  * （`memory.write*`・`commit`）から入り、プロセスだけが終わり、終わりの後にマシン・サーバー全体の勘定が戻り、ほかの台が動き続ける）。
  * `ctx.instantiate` の道（作るのに失敗したときに同じ深さで返す `catch` を含む）は、まだ確かめていない（#884）。
  *
- * `/tmp`（`TmpFileSystem`）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、この入口で
- * 覆えない。まだ確かめていない（#883）
+ * `/tmp`（`TmpFileSystem`。#883）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、上の入口で
+ * 覆えない。変える操作（作る・消す・名前を変える・書く・追記・大きさを変える・`allocate`）は、勘定の 2 段に加えて、自分の `usedBytes` と木
+ * （親から外す・`nodes` から消す・塊を足す・`size` を直す）を順に変えるので、途中で尽きると、勘定と `usedBytes` がずれる（外すときに返す量が
+ * 合わず、マシン・サーバー全体に残る）か、木が半端になる（`size` の外の塊・根から辿れない node は、次の保存の `TMPFS` 節が読めず冷えた起動になる）。
+ * 返す側（`releaseRam`）は返すことが飛ばされるので確かめられず、同じ深さの `catch` はまた溢れる。そこで、変える操作の入口で、モニターを取る前・
+ * 何も変える前に [TMPFS_FRAMES] 段を 1 回確かめる（`write` は塊ごとでなく入口の 1 回。`append`・`allocate` は中身を呼び、2 回払わない）。
+ * `TmpFileSystemStackExhaustionTest` は、`MemoryAccountStackExhaustionTest` と同じく底に近い深さのすべてで 13 の型（新しい塊・いくつもの塊・追記・
+ * 作る 2 つ・消す 2 つ・名前の変更 3 つ・縮める・`allocate`・VFS の `O_TRUNC`）を呼び、毎回の後に勘定 3 つが等しいこと、木から数え直した RAM・
+ * 塊が `size` の中・孤立した node がないこと、`TMPFS` 節に書いて読み直せること、外すと 0 に戻ること、断られた回は何も変わっていないことを見る。
+ * 確かめを外した手元の試験（JDK 17・JIT・Windows）では、確かめが通らない深さで操作が通り、13 の型のうち 9 つで食い違った: 書く・追記・
+ * いくつもの塊で `usedBytes` だけ 4 KiB〜8 KiB 多い（塊を数えた後に尽きる。追記・いくつもの塊では、足した塊が `size` の外に残り `TMPFS` 節が読めない）、
+ * 作る 2 つで `usedBytes` だけ 259 バイト多い（数えた後、木に入れる前）、消す 2 つで木から外したのに `usedBytes` が返らない
+ * （ファイルを消す回は `TMPFS` 節が読めない）、空のディレクトリの置き換えで、置き換えられた node が `nodes` から消えたまま木に残る
+ * （`TMPFS` 節が読めない）、`allocate` で大きさだけ変わって時刻が直らない。
+ * 勘定の段の間（マシンとサーバー全体の間、`usedBytes` と勘定の間）のずれは、この試験では観測されなかった（窓がないとは言えない）。
+ * 確かめを入れた後は、確かめが通らない深さで必ず断られ、食い違いは 1 回も出ず、断られた位置はほぼすべて確かめの中だった。
+ * 32 段の確かめは 1 回約 0.2 µs で、1 バイトの `write`（約 0.04 µs）は約 0.25 µs になる。ゲストからはホストの関数の包みと VFS・WASI の層を通った
+ * 後なので、システムコール 1 回に包みの確かめ 1 回分が足される程度。待っているだけの台と tick ごとの費用は増えない。
+ *
+ * 包みの 32 段との関係（#883）: `/tmp` の操作は自分の入口で自分の分を確かめるので、包みの [HOST_CALL_FRAMES] 段が覆う必要があるのは、カーネルロックの
+ * 区間（#858 で確かめ済み）と、VFS が `/tmp` を呼ぶまで（道の解決・`checkUnlocked`・`drainDeferred` の [hasHeadroom]）だけになる。そこで尽きても
+ * `/tmp` は何も変わっていない（`/tmp` は開いたままの枠を数えないので、`reserveOpen` の枠も残らない）。カーネルのプロセスを通した確かめは
+ * `TmpFileSystemStackExhaustionKernelTest`（ホストの関数の本体が `ctx.vfs` で `/tmp` を開く・切り詰める・書く・名前を変える・置き換える・消す。
+ * プロセスだけが `call stack exhausted` で終わり、マシンは動き続け、`/tmp` の木と勘定は食い違わず、止めるとマシンの勘定が 0、サーバー全体が元に戻る）。
+ * この試験は、確かめを外しても落ちなかった（尽きる位置が VFS・Endive の中に落ち、`/tmp` を変える途中に当たらなかった）ので、窓の検知は単体の試験が受け持つ
  */
 internal object StackHeadroom {
     /**
@@ -169,6 +193,13 @@ internal object StackHeadroom {
      * ここは [FUEL_YIELD_FRAMES] と同じ段数（約 0.9 µs）を払う
      */
     const val HOST_IO_FRAMES: Int = 128
+
+    /**
+     * `/tmp`（`TmpFileSystem`）の変える操作の入口で確かめる段数（#883）。ここから先は、自分のモニターの中のメモリの操作（`TreeMap`・
+     * `HashMap` の付け替え、4 KiB の塊の確保と写し、時計の読み取り、`fsError` の例外の生成）と、RAM の勘定（マシン → サーバー全体の 2 段の CAS）だけで、
+     * ロックを取る深い道もホストの I/O もない。書き込みのたびに通るので、ホストの関数の包みと同じ軽い段数にする
+     */
+    const val TMPFS_FRAMES: Int = 32
 
     /**
      * fd の表で最後の参照が外れたファイルを閉じる知らせ（`Vfs.drainDeferred` → `DiskFileSystem.release`・`retire`）を、列から取り出す前に
