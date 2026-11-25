@@ -327,6 +327,34 @@ class FairPermitPoolTest {
     }
 
     @Test
+    fun `submitの直接の道で失敗する間に組に待ち手が並んだら、返した組を巡回に戻してその待ち手へ渡す`() = timeout {
+        Fixture(2, perGroupLimit = 1).use { f ->
+            f.pool.acquire(b)
+            f.executor.failuresLeft.set(1)
+            val waitingDuringFailure = AtomicReference<Int>()
+            // 許可を取ってからワーカーへの execute が失敗するまでの間に、a に待ち手が並ぶ（a は上限なので巡回の外）
+            f.executor.onNextFailure {
+                f.pool.submit("a2", a, f.task("a2"))
+                waitingDuringFailure.set(f.pool.waiting)
+            }
+            assertThrows<OutOfMemoryError> { f.pool.submit("a1", a, f.task("a1")) }
+            assertEquals(1, waitingDuringFailure.get(), "失敗の間に a2 が並んだ")
+            // 返した a が巡回に戻って、同じ release の中で a2 に渡る
+            f.awaitRuns(1)
+            assertEquals(listOf("a2"), f.order)
+            assertEquals(0, f.pool.waiting)
+            assertEquals(0, f.pool.strandedTasks)
+            assertEquals(1, f.pool.heldBy(a), "a1 の許可は a2 に渡った")
+            assertEquals(1, f.pool.heldBy(b))
+            assertEquals(0, f.pool.availablePermits())
+            f.pool.release(a)
+            f.pool.release(b)
+            assertEquals(2, f.pool.availablePermits())
+            assertEquals(0, f.pool.groupCount)
+        }
+    }
+
+    @Test
     fun `acquireの待ちで渡された直後に割り込まれたら、借りた組から外して次へ渡す`() = timeout {
         Fixture(1, perGroupLimit = 1).use { f ->
             f.pool.acquire(b)
