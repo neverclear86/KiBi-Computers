@@ -41,7 +41,9 @@ object ConfigGameTests {
         val values = KiBiConfigs.server
         helper.assertTrue(values.rejected.isEmpty(), "no value should be rejected: ${values.rejected}")
         KiBiConfig.machineSaveConfig(values)
-        KiBiConfig.screenSyncTraffic<Any>(values)
+        // 組ごとの上限の有無を取り違えないよう、core の関数を直接呼ばず接続層の組み立てを使う（#897）
+        KiBiConfigs.screenSyncTraffic<Any>()
+        KiBiConfigs.schedulerConfig(ModuleStore.NONE)
         helper.succeed()
     }
 
