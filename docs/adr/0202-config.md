@@ -22,6 +22,7 @@
 
 - 分類は SERVER・CLIENT・COMMON の3つ。NeoForge にしかない `STARTUP` は使わない（1.20.1 と食い違うため）。項目のない分類は登録しない（今は SERVER だけ）。
 - ファイル名は両バージョンで同じ `kibicomputers-<server|client|common>.toml`、キーの木も同じにする。MOD パックを作る人が、バージョンをまたいで設定を流用できる。
+  - 例外（#897）: 持ち主の仕組み（`PlayerAccess` と公平の組の鍵）に依る項目（`ConfigEntry.ownerScoped`。`scheduler.*PerOwner` の3つ、`screenSync.ownerBytesPerSecond`、`access.*`）は、それを持たない接続層では出さない。持ち主の組がないと、全台が1組になって意味が変わる（組の上限が全体の上限になる）ため。1.20.1 は #224 で `PlayerAccess` を移すまで出さない（`KiBiConfigs.OWNER_GROUPS`）。項目を選ぶ規則は core（`KiBiConfig.entries(side, ownerGroups)`）に置き、接続層は選んだ一覧を写すだけにする。前に作られた 1.20.1 の TOML に残ったこれらのキーは、Forge が知らないキーとして消してファイルを書き直す（0.0.x で未リリースなので互換は問わない）。
 - SERVER のファイルの置き場はローダーに従う。NeoForge 21.1 は `config/kibicomputers-server.toml`（ワールドの `serverconfig/` に同じ名前のファイルがあればそちらが優先）。Forge 1.20.1 は `<world>/serverconfig/kibicomputers-server.toml`（なければ `defaultconfigs/` から写す）。
 - 今の区画: `scheduler`（スレッドとサーバー全体の上限）、`save`（待機点保存）、`screenSync`（画面の同期の送信量）、`keyboard`（キーボードの入力の量）。
 

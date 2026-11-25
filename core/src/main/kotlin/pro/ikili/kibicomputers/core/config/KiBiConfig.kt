@@ -55,7 +55,8 @@ public object KiBiConfig {
         en: String,
         ja: String,
         auto: Int? = null,
-    ): IntEntry = add(IntEntry(ConfigSide.SERVER, section, name, default, min, max, apply, en, ja, auto))
+        ownerScoped: Boolean = false,
+    ): IntEntry = add(IntEntry(ConfigSide.SERVER, section, name, default, min, max, apply, en, ja, auto, ownerScoped))
 
     // ---- scheduler: スレッドと全体の上限（ADR 0027・0029・0037・0362）。スケジューラを作るときに決まるので、次の起動で効く ----
 
@@ -90,6 +91,7 @@ public object KiBiConfig {
         "scheduler", "maxConcurrentMachinesPerOwner", 0, 0, 4096, ConfigApply.WORLD_RESTART,
         "Maximum number of one owner's computers running WebAssembly at the same time. 0 = no limit (owners still take turns).",
         "1人の持ち主のコンピューターが同時に WebAssembly を実行できる数の上限。0 は上限なし（持ち主の間の順番は回す）。",
+        ownerScoped = true,
     )
 
     /** 1人の持ち主（公平の組。#738）のブロッキング型プロセスの数の上限。0 は上限なし */
@@ -98,6 +100,7 @@ public object KiBiConfig {
         "scheduler", "maxBlockingProcessesPerOwner", 256, 0, 65536, ConfigApply.WORLD_RESTART,
         "Maximum number of blocking processes of one owner's computers. 0 = no limit.",
         "1人の持ち主のコンピューターのブロッキング型プロセスの数の上限。0 は上限なし。",
+        ownerScoped = true,
     )
 
     /** 1人の持ち主（公平の組。#738）の、読み込みを待つ実行ファイルの数の上限。0 は上限なし */
@@ -106,6 +109,7 @@ public object KiBiConfig {
         "scheduler", "maxPendingLoadsPerOwner", 64, 0, 65536, ConfigApply.WORLD_RESTART,
         "Maximum number of programs one owner's computers may have waiting to load. Startup and restore are not refused. 0 = no limit.",
         "1人の持ち主のコンピューターが読み込みを待たせられる実行ファイルの数の上限。起動と復元の読み込みは断らない。0 は上限なし。",
+        ownerScoped = true,
     )
 
     /** 実行ファイルを読み込む（計測コードの挿入・コンパイル）スレッドの数 */
@@ -469,6 +473,7 @@ public object KiBiConfig {
         ConfigApply.RELOAD,
         "Maximum screen update traffic from the screens of one owner's computers, in bytes per second. 0 = no limit.",
         "1人の持ち主のコンピューターの画面から送る、画面の同期の送信量の上限（バイト/秒）。0 は上限なし。",
+        ownerScoped = true,
     )
 
     // ---- keyboard: キーボードの入力の量（#142）。読み直した後に開いたキーボードから効く ----
@@ -499,6 +504,7 @@ public object KiBiConfig {
         "access", "opPermissionLevel", AccessRules.DEFAULT_OP_PERMISSION_LEVEL, 1, 4, ConfigApply.RELOAD,
         "Players with at least this permission level can use, break and manage computers owned by others.",
         "この権限レベル以上のプレイヤーは、ほかの人が持ち主のコンピューターも操作・破壊・管理できる。",
+        ownerScoped = true,
     )
 
     /** 保留の追加の期限（時間） */
@@ -507,6 +513,7 @@ public object KiBiConfig {
         "access", "pendingInviteHours", AccessRules.DEFAULT_PENDING_TTL_HOURS, 1, 720, ConfigApply.RELOAD,
         "Hours a member added by name waits for that player to use the computer before it expires.",
         "名前で足したメンバーが、そのプレイヤーがコンピューターを使うのを待つ時間（時間）。過ぎたら取り消す。",
+        ownerScoped = true,
     )
 
     /** 1台のメンバーの上限 */
@@ -515,6 +522,7 @@ public object KiBiConfig {
         "access", "maxMembers", AccessRules.DEFAULT_MAX_MEMBERS, 0, 256, ConfigApply.RELOAD,
         "Maximum number of members of one computer.",
         "1台のコンピューターのメンバーの数の上限。",
+        ownerScoped = true,
     )
 
     /** 1台の保留の上限 */
@@ -523,6 +531,7 @@ public object KiBiConfig {
         "access", "maxPendingInvites", AccessRules.DEFAULT_MAX_PENDING, 0, 64, ConfigApply.RELOAD,
         "Maximum number of members added by name that are still waiting, per computer.",
         "1台のコンピューターの、名前で足してまだ待っているメンバーの数の上限。",
+        ownerScoped = true,
     )
 
     /** OS からの依頼（#110）の期限（秒） */
@@ -531,6 +540,7 @@ public object KiBiConfig {
         "access", "requestTtlSeconds", AccessRequestRules.DEFAULT_TTL_SECONDS, 30, 86400, ConfigApply.RELOAD,
         "Seconds a change requested by a program on a computer waits for the owner or an operator to approve it.",
         "コンピューターのプログラムが出した変更の依頼が、持ち主か OP の承認を待つ時間（秒）。過ぎたら取り消す。",
+        ownerScoped = true,
     )
 
     /** 1台の承認待ちの依頼の上限（#110） */
@@ -539,15 +549,24 @@ public object KiBiConfig {
         "access", "maxRequestsPerComputer", AccessRequestRules.DEFAULT_MAX_OUTSTANDING, 1, 32, ConfigApply.RELOAD,
         "Maximum number of change requests from one computer that are waiting for approval.",
         "1台のコンピューターの、承認を待っている変更の依頼の数の上限。",
+        ownerScoped = true,
     )
 
     /** すべての項目（宣言の順） */
     @JvmField
     public val ENTRIES: List<ConfigEntry<*>> = entries.toList()
 
-    /** [side] の項目（宣言の順） */
+    /**
+     * [side] の項目（宣言の順）。
+     *
+     * [ownerGroups] が false なら、持ち主の仕組みに依る項目（[ConfigEntry.ownerScoped]）を除く（#897）。持ち主の仕組み
+     * （PlayerAccess と、ケースから渡す公平の組の鍵）を持たない接続層は、spec の登録と値の写しの両方にこの一覧を使い、
+     * 意味の違う項目をコンフィグに出さない。その接続層は、組み立て（[schedulerConfig]・[screenSyncTraffic]）にも同じ値を渡す
+     */
     @JvmStatic
-    public fun entries(side: ConfigSide): List<ConfigEntry<*>> = ENTRIES.filter { it.side == side }
+    @JvmOverloads
+    public fun entries(side: ConfigSide, ownerGroups: Boolean = true): List<ConfigEntry<*>> =
+        ENTRIES.filter { it.side == side && (ownerGroups || !it.ownerScoped) }
 
     /** 区画の説明（英語・日本語）。TOML の区画のコメントに出す */
     @JvmField
@@ -588,15 +607,23 @@ public object KiBiConfig {
 
     // ---- 値から core の設定を組み立てる ----
 
-    /** [values] からスケジューラの設定を作る。「自動」の項目は [SchedulerConfig] の既定に任せる */
+    /**
+     * [values] からスケジューラの設定を作る。「自動」の項目は [SchedulerConfig] の既定に任せる。
+     *
+     * [ownerGroups] が false なら、公平の組（#738）ごとの上限を掛けない（3つとも 0 = 上限なし。#897）。持ち主の仕組みを
+     * 持たない接続層では全台が `FairShareGroup.NONE` の1組になり、組ごとの上限がサーバー全体の上限として効いてしまうため。
+     * そのときは [values] の組ごとの項目を読まない（コンフィグに出していないので、読むと既定の 256・64 が入る）。
+     * 全体の上限（ブロッキング型・許可・読み込みの1台ごとの上限）はそのまま効く
+     */
     @JvmStatic
-    public fun schedulerConfig(values: ConfigValues, moduleStore: ModuleStore): SchedulerConfig {
+    @JvmOverloads
+    public fun schedulerConfig(values: ConfigValues, moduleStore: ModuleStore, ownerGroups: Boolean = true): SchedulerConfig {
         val builder = SchedulerConfig.builder()
             .threadStackBytes(values[THREAD_STACK_KIB] * KIB)
             .maxBlockingProcesses(values[MAX_BLOCKING_PROCESSES])
-            .maxConcurrentMachinesPerGroup(values[MAX_CONCURRENT_MACHINES_PER_OWNER])
-            .maxBlockingProcessesPerGroup(values[MAX_BLOCKING_PROCESSES_PER_OWNER])
-            .maxPendingLoadsPerGroup(values[MAX_PENDING_LOADS_PER_OWNER])
+            .maxConcurrentMachinesPerGroup(if (ownerGroups) values[MAX_CONCURRENT_MACHINES_PER_OWNER] else 0)
+            .maxBlockingProcessesPerGroup(if (ownerGroups) values[MAX_BLOCKING_PROCESSES_PER_OWNER] else 0)
+            .maxPendingLoadsPerGroup(if (ownerGroups) values[MAX_PENDING_LOADS_PER_OWNER] else 0)
             .compilerThreads(values[COMPILER_THREADS])
             .programCacheEntries(values[PROGRAM_CACHE_ENTRIES])
             .programCacheBytes(values[PROGRAM_CACHE_MIB] * MIB)
@@ -683,13 +710,18 @@ public object KiBiConfig {
         restoreWriteWaitMillis = values[RESTORE_WRITE_WAIT_MILLIS].toLong(),
     )
 
-    /** [values] から画面の同期の送信量の勘定を作る（作り直すと、プレイヤーごとの勘定は空に戻る） */
+    /**
+     * [values] から画面の同期の送信量の勘定を作る（作り直すと、プレイヤーごとの勘定は空に戻る）。
+     *
+     * [ownerGroups] が false なら、組ごとの上限を掛けない（0 = 上限なし。#897。理由は [schedulerConfig] と同じ）
+     */
     @JvmStatic
-    public fun <P : Any> screenSyncTraffic(values: ConfigValues): ScreenSyncTraffic<P> =
+    @JvmOverloads
+    public fun <P : Any> screenSyncTraffic(values: ConfigValues, ownerGroups: Boolean = true): ScreenSyncTraffic<P> =
         ScreenSyncTraffic(
             values[SCREEN_PLAYER_BYTES_PER_SECOND],
             values[SCREEN_SERVER_BYTES_PER_SECOND],
-            values[SCREEN_OWNER_BYTES_PER_SECOND],
+            if (ownerGroups) values[SCREEN_OWNER_BYTES_PER_SECOND] else 0,
         )
 
     /** [values] から、キーボード1つの入力の予算を作る */
