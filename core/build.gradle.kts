@@ -113,6 +113,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         "ComponentStackExhaustionLockTest",
         "P1StackExhaustionLockTest",
         "P1DiskCloseStackExhaustionTest",
+        "TmpFileSystemStackExhaustionKernelTest",
     )
     fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
         group = "verification"
@@ -123,6 +124,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         filter {
             headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
             includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
+            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemStackExhaustionTest")
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)

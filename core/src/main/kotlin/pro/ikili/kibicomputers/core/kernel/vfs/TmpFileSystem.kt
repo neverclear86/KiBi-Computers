@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.kernel.vfs
 
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
+import pro.ikili.kibicomputers.core.kernel.process.StackHeadroom
 import java.util.TreeMap
 
 /**
@@ -19,7 +20,19 @@ import java.util.TreeMap
  * - 時刻は [clock]（エポックからのナノ秒）。読んだ時刻（atime）は、作った時と [setTimes] だけで変える（読むたびには変えない）
  * - 動いている間の中身は、待機点保存と一緒に `TMPFS` 節に保存する（#82、ADR 0082。[snapshot]・[restore]）
  *
- * カーネルロックの外で、同じマシンのいくつものスレッドから同時に使う。中身は自分のモニター（`@Synchronized`）で守る（中は I/O のないメモリの操作だけ）。
+ * カーネルロックの外で、同じマシンのいくつものスレッドから同時に使う。中身は自分のモニター（`@Synchronized`・`synchronized(this)`）で守る（中は I/O のないメモリの操作だけ）。
+ *
+ * スタックの余裕（#883）: 変える操作（[createFile]・[createDirectory]・[removeFile]・[removeDirectory]・[rename]・[write]・[append]・
+ * [setSize]・[allocate]）は、ゲストのホストの関数の本体（VFS の操作）の深さから呼ばれる。中で RAM の勘定（マシン → サーバー全体の別々の CAS）と、
+ * 自分の [usedBytes]・木を順に変えるので、途中でスタックが尽きると、勘定と [usedBytes] がずれる（[onUnmounted] で返す量が合わず、
+ * マシン・サーバー全体に残る）か、木が半端になる（`size` の外の塊は、次の保存の `TMPFS` 節が読めなくなる）。返す側（[releaseRam]）で確かめると
+ * 返すこと自体が飛ばされ、同じ深さで `catch` して戻すとまた溢れる（ADR 0043）ので、操作の入口で 1 回、モニターを取る前・何も変える前に
+ * [StackHeadroom.TMPFS_FRAMES] 段を確かめる（ディスクの `io`・`release` と同じ形）。足りなければ何も変えずに `StackOverflowError` を投げる
+ * （呼び手は飲まずに伝え、プロセスだけが `call stack exhausted` で終わる）。中から同じクラスの操作を呼ぶ形（[append] → 書く、
+ * [allocate] → 大きさを変える）は、確かめを 2 回払わないよう、中身を `...Locked` に分けている。
+ * 読むだけの操作と [setTimes] は勘定に触らないので確かめない。[onUnmounted] は浅いところ（最後のプロセスの終わりの `finishLocked`・
+ * 主スレッド・起動用のスレッドの `stop` から `unmountTmpLocked`、`MachineRestore.discard`）からだけ呼ばれ、ゲストの `unmount` は `/tmp` を
+ * `BUSY` で断るので、ゲストの深さからは入らない
  */
 internal class TmpFileSystem(
     private val memory: MemoryAccount,
@@ -82,24 +95,20 @@ internal class TmpFileSystem(
     @Synchronized
     override fun statNode(node: Long): FileStat = node(node).stat()
 
-    @Synchronized
-    override fun createFile(path: VfsPath): Long = create(path, FileType.REGULAR_FILE).id
+    override fun createFile(path: VfsPath): Long = mutate { create(path, FileType.REGULAR_FILE).id }
 
-    @Synchronized
     override fun createDirectory(path: VfsPath) {
-        create(path, FileType.DIRECTORY)
+        mutate { create(path, FileType.DIRECTORY) }
     }
 
-    @Synchronized
-    override fun removeFile(path: VfsPath) {
+    override fun removeFile(path: VfsPath): Unit = mutate {
         val n = find(path)
         if (n.type == FileType.DIRECTORY) fsError(Errno.ISDIR)
         detach(path)
         free(n, path.name)
     }
 
-    @Synchronized
-    override fun removeDirectory(path: VfsPath) {
+    override fun removeDirectory(path: VfsPath): Unit = mutate {
         if (path.isRoot) fsError(Errno.BUSY)
         val n = find(path)
         if (n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
@@ -108,14 +117,13 @@ internal class TmpFileSystem(
         free(n, path.name)
     }
 
-    @Synchronized
-    override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean) {
+    override fun rename(from: VfsPath, to: VfsPath, requireDirectory: Boolean): Unit = mutate {
         if (from.isRoot || to.isRoot) fsError(Errno.BUSY)
         val n = find(from)
         if (requireDirectory && n.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
         val dst = directoryOf(to)
         val old = dst.children!![to.name]
-        if (old === n) return
+        if (old === n) return@mutate
         if (to.startsWith(from)) fsError(Errno.INVAL, "ディレクトリを自分の下へは移せない")
         if (old != null) {
             if (n.type == FileType.DIRECTORY && old.type != FileType.DIRECTORY) fsError(Errno.NOTDIR)
@@ -160,8 +168,10 @@ internal class TmpFileSystem(
         return count
     }
 
-    @Synchronized
-    override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int {
+    override fun write(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int = mutate { writeLocked(node, position, src, off, len) }
+
+    // 確かめは入口の 1 回だけ（塊ごとに確かめると、塊を足した後・`size` を直す前に尽きる窓が残り、大きな書き込みでは何回も払う）
+    private fun writeLocked(node: Long, position: Long, src: ByteArray, off: Int, len: Int): Int {
         val n = file(node)
         if (position < 0) fsError(Errno.INVAL)
         if (len <= 0) return 0
@@ -192,22 +202,21 @@ internal class TmpFileSystem(
         return done
     }
 
-    @Synchronized
-    override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written {
+    override fun append(node: Long, src: ByteArray, off: Int, len: Int): Written = mutate {
         val position = file(node).size
-        return Written(position, write(node, position, src, off, len))
+        Written(position, writeLocked(node, position, src, off, len))
     }
 
-    @Synchronized
-    override fun allocate(node: Long, size: Long) {
-        if (file(node).size < size) setSize(node, size)
+    override fun allocate(node: Long, size: Long): Unit = mutate {
+        if (file(node).size < size) setSizeLocked(node, size)
     }
 
     @Synchronized
     override fun sizeHint(node: Long): Long = if (revoked) 0 else nodes[node]?.takeIf { it.type == FileType.REGULAR_FILE }?.size ?: 0
 
-    @Synchronized
-    override fun setSize(node: Long, size: Long) {
+    override fun setSize(node: Long, size: Long): Unit = mutate { setSizeLocked(node, size) }
+
+    private fun setSizeLocked(node: Long, size: Long) {
         val n = file(node)
         if (size < 0) fsError(Errno.INVAL)
         if (size < n.size) {
@@ -249,6 +258,41 @@ internal class TmpFileSystem(
         releaseRam(usedBytes)
     }
 
+    /**
+     * 木と [usedBytes] の食い違いを確かめる（テスト用。スタックが尽きた後の状態を見る。#883・#902）。食い違いの説明の一覧（なければ空）。
+     * 根から辿った node が [nodes] とちょうど同じこと（孤立した node・2 回指される node がない）、普通のファイルの塊が `size` の中にあること
+     * （`TmpfsSectionCodec.read` が断る形でないこと）、木から数え直した RAM が [usedBytes] と合うこと。マシンの勘定は、ほかの使い手と分け合うので見ない
+     */
+    @Synchronized
+    internal fun consistencyProblemsForTest(): List<String> {
+        val problems = ArrayList<String>()
+        if (revoked) {
+            if (usedBytes != 0L) problems += "外した後に usedBytes $usedBytes が残った"
+            return problems
+        }
+        val seen = HashMap<Long, Node>()
+        var counted = 0L
+        val pending = ArrayDeque<Node>()
+        seen[root.id] = root
+        pending.addLast(root)
+        while (pending.isNotEmpty()) {
+            val n = pending.removeLast()
+            if (nodes[n.id] !== n) problems += "node ${n.id} が木にあるのに nodes にない（別の node が入っている）"
+            n.chunks?.let { chunks ->
+                counted += chunks.size.toLong() * CHUNK_BYTES
+                val last = chunks.lastEntry()
+                if (last != null && last.key * CHUNK_BYTES >= n.size) problems += "node ${n.id} の塊 ${last.key} が size ${n.size} の外にある"
+            }
+            n.children?.forEach { (name, child) ->
+                counted += NODE_COST + nameCost(name)
+                if (seen.put(child.id, child) != null) problems += "node ${child.id} が 2 回指されている（$name）" else pending.addLast(child)
+            }
+        }
+        for (id in nodes.keys) if (id !in seen) problems += "node $id が根から辿れない"
+        if (counted != usedBytes) problems += "木から数え直した RAM $counted が usedBytes $usedBytes と違う"
+        return problems
+    }
+
     // ---- 保存（#82） ----
 
     /**
@@ -284,6 +328,15 @@ internal class TmpFileSystem(
     }
 
     // ---- 中身 ----
+
+    /**
+     * 変える操作を、スタックの余裕を確かめてから自分のモニターの中で行う（#883）。確かめはモニターを取る前・何も変える前
+     * （足りなければ何も変えずに `StackOverflowError`）。中は I/O のないメモリの操作と勘定の 2 段の CAS だけで、深さに上限がある
+     */
+    private inline fun <T> mutate(block: () -> T): T {
+        StackHeadroom.ensure(StackHeadroom.TMPFS_FRAMES)
+        return synchronized(this, block)
+    }
 
     private fun node(id: Long): Node {
         live()
@@ -394,23 +447,30 @@ internal class TmpFileSystem(
             val fs = TmpFileSystem(memory, clock)
             val bytes = fs.countedBytes(snapshot)
             if (bytes > 0 && !memory.tryReserveBytes(bytes)) return null
-            synchronized(fs) {
-                fs.usedBytes = bytes
-                fs.nodes.clear()
-                val built = HashMap<Long, Node>()
-                for (t in snapshot.nodes) {
-                    val n = if (t.id == ROOT_NODE) fs.root else Node(t.id, t.type, 0)
-                    n.size = t.size
-                    n.accessedNanos = t.accessedNanos
-                    n.modifiedNanos = t.modifiedNanos
-                    n.changedNanos = t.changedNanos
-                    t.chunks?.forEach { (index, data) -> n.chunks!![index] = data.copyOf() }
-                    built[t.id] = n
+            // 数えた後、組む途中で失敗する（`copyOf` の `OutOfMemoryError` など）と、fs を呼び手に返せず [onUnmounted] でも返らないので、ここで返す
+            // （起動用のスレッドの浅いところからだけ呼ばれるので、同じ深さで戻してよい。#883）
+            try {
+                synchronized(fs) {
+                    fs.usedBytes = bytes
+                    fs.nodes.clear()
+                    val built = HashMap<Long, Node>()
+                    for (t in snapshot.nodes) {
+                        val n = if (t.id == ROOT_NODE) fs.root else Node(t.id, t.type, 0)
+                        n.size = t.size
+                        n.accessedNanos = t.accessedNanos
+                        n.modifiedNanos = t.modifiedNanos
+                        n.changedNanos = t.changedNanos
+                        t.chunks?.forEach { (index, data) -> n.chunks!![index] = data.copyOf() }
+                        built[t.id] = n
+                    }
+                    fs.root.children!!.clear()
+                    for (t in snapshot.nodes) t.children?.forEach { (name, child) -> built.getValue(t.id).children!![name] = built.getValue(child) }
+                    fs.nodes.putAll(built)
+                    fs.nextNode = snapshot.nextNode
                 }
-                fs.root.children!!.clear()
-                for (t in snapshot.nodes) t.children?.forEach { (name, child) -> built.getValue(t.id).children!![name] = built.getValue(child) }
-                fs.nodes.putAll(built)
-                fs.nextNode = snapshot.nextNode
+            } catch (t: Throwable) {
+                if (bytes > 0) memory.releaseBytes(bytes)
+                throw t
             }
             return fs
         }

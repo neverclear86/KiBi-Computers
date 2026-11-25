@@ -115,7 +115,8 @@ internal class MemoryAccount(
  * `StackOverflowError` になる深さがあるが、何も数える前に投げるので勘定はずれず、プロセスだけが終わる（ADR 0043）。
  * コンポーネントの core インスタンスの固定費（`ProcessRunner.reserveCoreInstanceOverhead`。カーネルロックの中）は、
  * プロセスの始まり（`load` → `loadComponent` の `configure`。step・専用スレッドの浅いところ）からだけ来て、ホストの関数の本体からは入らない。
- * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶ（まだ確かめていない。#883）
+ * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶので、自分の変える操作の入口で
+ * [StackHeadroom.TMPFS_FRAMES] 段を確かめる（#883。`StackHeadroom` の KDoc）
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {
     /** プロセスの上限（バイト） */
