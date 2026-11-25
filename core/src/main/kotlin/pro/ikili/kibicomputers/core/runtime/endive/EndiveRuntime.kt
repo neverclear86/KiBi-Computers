@@ -56,6 +56,7 @@ import run.endive.wasm.Parser
 import run.endive.wasm.UninstantiableException
 import run.endive.wasm.UnlinkableException
 import run.endive.wasm.WasmEngineException
+import run.endive.wasm.types.ActiveElement
 import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
@@ -67,6 +68,7 @@ import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
 import run.endive.wasm.types.Table
 import run.endive.wasm.types.TableLimits
+import run.endive.wasm.types.TypeSection
 import run.endive.wasm.types.ValType
 import run.endive.runtime.Memory as EndiveMemory
 import run.endive.runtime.WasmException as EndiveWasmException
@@ -152,6 +154,9 @@ public class EndiveRuntime internal constructor(
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
         return try {
+            // Endive の検証が確かめないパッシブ・宣言の要素の式を確かめる（#893）。正しくない WASM を「対応していない作り」と報告しないよう、
+            // #706 の判定より先に見る
+            invalidPassiveElementInitializer(module)?.let { throw WasmLoadException("WASM の検証に通らない: $it") }
             // Endive が違う関数を置いてしまう形は、動かす前に断る（#706。正しくない結果になるので、対応しない作りとして扱う）
             foreignFuncRefInitializer(module)?.let {
                 throw WasmLoadException("対応していない作り: $it（Endive が別の関数を置いてしまう。#706）")
@@ -593,6 +598,114 @@ public class EndiveRuntime internal constructor(
                     return "表 $i の初期値の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
                 }
             }
+            return null
+        }
+
+        /**
+         * パッシブ・宣言の要素セグメントの項目の式のうち、正しい定数式でないものがあれば、その場所と理由。なければ `null`（#893）。
+         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号
+         *
+         * Endive 1.2.0 の検証（`Validator.validateElements`）は、アクティブの要素の式しか定数式として確かめない。パッシブ（flag 1・5）・
+         * 宣言（flag 3・7）の要素の式は、定数式に使えない命令（`drop` など）・型の合わない値（funcref の要素の `v128.const` など）でも
+         * 通してしまい、`table.init`・`array.new_elem` で使うと、正しくない値が表・配列に入るか、JVM の例外で止まる。
+         * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
+         * もう断るので、ここに届くのは先頭でない `ref.func` だけ。Endive がアクティブの要素に使うのと同じ規則（`Validator.validateConstantExpression`）で確かめる:
+         * 定数式の命令だけで、スタックにちょうど 1 つの値が残り、その型が要素の型に合う（[ValType.matches]）。`global.get` は不変のグローバルだけ。
+         * 命令が取る値の型は、Endive と同じく数だけを確かめる（アクティブの要素・グローバルの初期値と同じ扱い）。
+         * Endive が直ったら、この判定を外す
+         */
+        internal fun invalidPassiveElementInitializer(module: EndiveModule): String? {
+            val elements = module.elementSection()
+            if (elements.elementCount() == 0) return null
+            val imports = module.importSection()
+            val funcTypes = ArrayList<Int>()
+            val globals = ArrayList<Pair<ValType, Boolean>>() // 型と、可変か
+            for (i in 0 until imports.importCount()) {
+                when (val imp = imports.getImport(i)) {
+                    is FunctionImport -> funcTypes += imp.typeIndex()
+                    is GlobalImport -> globals += imp.type() to (imp.mutabilityType() != MutabilityType.Const)
+                    else -> {}
+                }
+            }
+            val functions = module.functionSection()
+            for (i in 0 until functions.functionCount()) funcTypes += functions.getFunctionType(i)
+            for (g in module.globalSection().globals()) globals += g.valueType() to (g.mutabilityType() != MutabilityType.Const)
+            val types = module.typeSection()
+            for (i in 0 until elements.elementCount()) {
+                val el = elements.getElement(i)
+                if (el is ActiveElement) continue
+                val kind = if (el is PassiveElement) "パッシブ" else "宣言"
+                el.initializers().forEachIndexed { j, init ->
+                    constExprProblem(init, el.type(), funcTypes, globals, types)?.let {
+                        return "要素セグメント $i（$kind）の項目 $j: $it"
+                    }
+                }
+            }
+            return null
+        }
+
+        /** [expr] が [expected] の型の正しい定数式でなければ、その理由（[invalidPassiveElementInitializer]） */
+        private fun constExprProblem(
+            expr: List<Instruction>,
+            expected: ValType,
+            funcTypes: List<Int>,
+            globals: List<Pair<ValType, Boolean>>,
+            types: TypeSection,
+        ): String? {
+            val stack = ArrayList<ValType>()
+            fun ref(opcode: Int, typeIdx: Int) = ValType.builder().withOpcode(opcode).withTypeIdx(typeIdx).build().resolve(types)
+            fun subType(idx: Long) = if (idx in 0 until types.subTypeCount()) types.getSubType(idx.toInt()) else null
+            for (ins in expr) {
+                // 値を取る命令は、取る数だけ先に確かめる
+                val (pops, push) = when (ins.opcode()) {
+                    OpCode.END -> continue
+                    OpCode.I32_CONST -> 0 to ValType.I32
+                    OpCode.I64_CONST -> 0 to ValType.I64
+                    OpCode.F32_CONST -> 0 to ValType.F32
+                    OpCode.F64_CONST -> 0 to ValType.F64
+                    OpCode.V128_CONST -> 0 to ValType.V128
+                    OpCode.I32_ADD, OpCode.I32_SUB, OpCode.I32_MUL -> 2 to ValType.I32
+                    OpCode.I64_ADD, OpCode.I64_SUB, OpCode.I64_MUL -> 2 to ValType.I64
+                    OpCode.REF_NULL -> 0 to ref(ValType.ID.RefNull, ins.operand(0).toInt())
+                    OpCode.REF_FUNC -> {
+                        // 番号は u32 まで。Int にすると 2^31 以上が負になるので Long で比べる
+                        val idx = ins.operand(0)
+                        if (idx < 0 || idx >= funcTypes.size) return "関数 $idx がない"
+                        0 to ref(ValType.ID.Ref, funcTypes[idx.toInt()])
+                    }
+                    OpCode.GLOBAL_GET -> {
+                        val idx = ins.operand(0)
+                        if (idx < 0 || idx >= globals.size) return "グローバルがない"
+                        val (type, mutable) = globals[idx.toInt()]
+                        if (mutable) return "可変のグローバルは定数式で読めない"
+                        0 to type
+                    }
+                    OpCode.REF_I31 -> 1 to ValType.builder().withOpcode(ValType.ID.Ref).withTypeIdx(ValType.TypeIdxCode.I31.code()).build()
+                    OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> {
+                        val st = subType(ins.operand(0))?.compType()?.structType() ?: return "型 ${ins.operand(0)} が struct でない"
+                        (if (ins.opcode() == OpCode.STRUCT_NEW) st.fieldTypes().size else 0) to ref(ValType.ID.Ref, ins.operand(0).toInt())
+                    }
+                    OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_FIXED -> {
+                        subType(ins.operand(0))?.compType()?.arrayType() ?: return "型 ${ins.operand(0)} が array でない"
+                        val n = when (ins.opcode()) {
+                            OpCode.ARRAY_NEW -> 2L
+                            OpCode.ARRAY_NEW_DEFAULT -> 1L
+                            else -> ins.operand(1)
+                        }
+                        if (n > stack.size) return "スタックの値が足りない"
+                        n.toInt() to ref(ValType.ID.Ref, ins.operand(0).toInt())
+                    }
+                    OpCode.ANY_CONVERT_EXTERN -> 1 to ValType.AnyRef
+                    OpCode.EXTERN_CONVERT_ANY -> 1 to ValType.ExternRef
+                    else -> return "命令 ${ins.opcode()} は定数式に使えない"
+                }
+                if (pops > stack.size) return "スタックの値が足りない"
+                repeat(pops) { stack.removeAt(stack.size - 1) }
+                stack += push
+            }
+            if (stack.size != 1) return "定数式の値が ${stack.size} 個（1 個でない）"
+            val actual = stack[0]
+            if (!ValType.matches(actual, expected, types)) return "値の型（$actual）が要素の型（$expected）に合わない"
             return null
         }
 
