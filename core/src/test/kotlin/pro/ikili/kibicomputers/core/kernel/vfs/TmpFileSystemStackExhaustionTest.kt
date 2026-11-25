@@ -27,6 +27,10 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * - 断られた（`StackOverflowError`）深さでは、木も勘定も始める前のまま
  * - 入口の確かめがあること: 操作の前後とも [StackHeadroom.TMPFS_FRAMES] 段の確かめが通らない深さでは、必ず断られる
  *
+ * 組は 2 通り。上限が広い組（確保はいつも通る）と、**サーバー全体の残りを絞った組**（[Fixture.headroom]。マシンの CAS の後、サーバー全体の段で
+ * 断られて戻す枝と、`NOSPC`・書けた分だけの短い書き込みの枝を、底に近い深さで通す）。後者は、断られた操作（`NOSPC`）も何も変えていないこと、
+ * 短い書き込みの後も木と勘定が合うことを確かめる
+ *
  * ホストの関数の本体から入る道（[hostBody]）は、包みの確かめ（[StackHeadroom.HOST_CALL_FRAMES]）が通った後、本体が深くなってから操作に入る。
  * カーネルのプロセス（`ctx.vfs` で `/tmp` を開く・書く・名前を変える・消す）を通した確かめは `TmpFileSystemStackExhaustionKernelTest`
  */
@@ -71,8 +75,11 @@ class TmpFileSystemStackExhaustionTest {
     }
 
     /** 深さ 1 つ分の試験の組（浅いところで前もって作る） */
-    private class Fixture(op: Op) {
+    private class Fixture(op: Op, val headroom: Long? = null) {
         val server = MemoryAccount(Long.MAX_VALUE / 4)
+
+        /** [headroom] のときに、サーバー全体の残りを絞るためにあらかじめ確保した量（試験の対象の勘定ではない） */
+        var ballast = 0L
         val machine = MemoryAccount(1L shl 40, server)
         val fs = TmpFileSystem(machine) { CLOCK.realtimeNanos() }
         val vfs: Vfs? = if (op == Op.VFS_TRUNCATE) Vfs().also { it.mount(VfsPath.ROOT, fs, false, "tmp") } else null
@@ -88,7 +95,15 @@ class TmpFileSystemStackExhaustionTest {
             if (op == Op.RENAME_REPLACE_FILE) fs.createFile(F_OTHER).also { fs.write(it, 0, PAYLOAD, 0, 10) }
             if (op == Op.REMOVE_DIRECTORY || op == Op.RENAME_REPLACE_DIRECTORY) fs.createDirectory(D_ONE)
             if (op == Op.RENAME_REPLACE_DIRECTORY) fs.createDirectory(D_TWO)
+            if (headroom != null) {
+                // サーバー全体の残りを [headroom] バイトにする（マシンの上限は広いまま。マシンの CAS が通った後、サーバー全体の段で断られる）
+                ballast = server.limitBytes - server.usedBytes - headroom
+                check(server.tryReserveBytes(ballast))
+            }
         }
+
+        /** サーバー全体のうち、`/tmp` の分（[ballast] を除く） */
+        val serverUsed: Long get() = server.usedBytes - ballast
 
         val initialUsed = fs.usedBytes
         val initialPrint = fingerprint(fs)
@@ -142,10 +157,11 @@ class TmpFileSystemStackExhaustionTest {
         f.lackedBefore = lacks(StackHeadroom.TMPFS_FRAMES)
         try {
             val fs = f.fs
+            var shortWrite = false
             when (run.op) {
-                Op.WRITE -> fs.write(f.empty, 0, PAYLOAD, 0, 1)
-                Op.WRITE_MULTI -> fs.write(f.empty, 0, PAYLOAD, 0, 3 * TmpFileSystem.CHUNK_BYTES)
-                Op.APPEND -> fs.append(f.nearEdge, PAYLOAD, 0, 16)
+                Op.WRITE -> shortWrite = fs.write(f.empty, 0, PAYLOAD, 0, 1) < 1
+                Op.WRITE_MULTI -> shortWrite = fs.write(f.empty, 0, PAYLOAD, 0, 3 * TmpFileSystem.CHUNK_BYTES) < 3 * TmpFileSystem.CHUNK_BYTES
+                Op.APPEND -> shortWrite = fs.append(f.nearEdge, PAYLOAD, 0, 16).count < 16
                 Op.CREATE_FILE -> fs.createFile(F_NEW)
                 Op.CREATE_DIRECTORY -> fs.createDirectory(F_NEW)
                 Op.REMOVE_FILE -> fs.removeFile(F_DATA)
@@ -157,7 +173,11 @@ class TmpFileSystemStackExhaustionTest {
                 Op.ALLOCATE -> fs.allocate(f.empty, 3L * TmpFileSystem.CHUNK_BYTES)
                 Op.VFS_TRUNCATE -> f.vfs!!.open(F_DATA, TRUNCATE)
             }
-            f.status = COMPLETED
+            f.status = if (shortWrite) SHORT else COMPLETED
+        } catch (e: FsException) {
+            // 数えられずに断られた（サーバー全体の段で断られて、マシンの分を戻した後）。それ以外のエラーは試験の組み方の誤り
+            if (e.errno != Errno.NOSPC) throw e
+            f.status = NO_SPACE
         } catch (e: StackOverflowError) {
             f.status = REFUSED
             f.soe = e
@@ -168,6 +188,8 @@ class TmpFileSystemStackExhaustionTest {
     private class Result(val used: List<Fixture>, val drifts: List<String>) {
         val completed = used.count { it.status == COMPLETED }
         val refused = used.count { it.status == REFUSED }
+        val noSpace = used.count { it.status == NO_SPACE }
+        val short = used.count { it.status == SHORT }
         val refusedInProbe = used.count { it.status == REFUSED && it.inProbe }
 
         /** 操作の前後で確かめが通らなかった（フレームが変わっていない）深さと、そのうち断られなかった深さの数 */
@@ -178,9 +200,9 @@ class TmpFileSystemStackExhaustionTest {
     /** 深さ [i] の組の後の状態を確かめ、ずれの説明を [drifts] に足す。最後に外して 0 に戻ることも見る */
     private fun inspect(i: Int, f: Fixture, drifts: MutableList<String>) {
         val fs = f.fs
-        val where = "$i 番目（${if (f.status == REFUSED) "断られた" else "通った"}）"
-        if (fs.usedBytes != f.machine.usedBytes || fs.usedBytes != f.server.usedBytes) {
-            drifts += "$where: 勘定がずれた（/tmp ${fs.usedBytes}、マシン ${f.machine.usedBytes}、サーバー ${f.server.usedBytes}）"
+        val where = "$i 番目（${statusName(f.status)}）"
+        if (fs.usedBytes != f.machine.usedBytes || fs.usedBytes != f.serverUsed) {
+            drifts += "$where: 勘定がずれた（/tmp ${fs.usedBytes}、マシン ${f.machine.usedBytes}、サーバー ${f.serverUsed}）"
         }
         fs.consistencyProblemsForTest().forEach { drifts += "$where: $it" }
         try {
@@ -188,20 +210,27 @@ class TmpFileSystemStackExhaustionTest {
         } catch (e: Exception) {
             drifts += "$where: TMPFS 節を読み直せない（$e）"
         }
-        if (f.status == REFUSED && (fs.usedBytes != f.initialUsed || fingerprint(fs) != f.initialPrint)) {
+        if ((f.status == REFUSED || f.status == NO_SPACE) && (fs.usedBytes != f.initialUsed || fingerprint(fs) != f.initialPrint)) {
             drifts += "$where: 断られたのに変わった（usedBytes ${f.initialUsed} → ${fs.usedBytes}）"
         }
         fs.onUnmounted()
-        if (fs.usedBytes != 0L || f.machine.usedBytes != 0L || f.server.usedBytes != 0L) {
-            drifts += "$where: 外した後に残った（/tmp ${fs.usedBytes}、マシン ${f.machine.usedBytes}、サーバー ${f.server.usedBytes}）"
+        if (fs.usedBytes != 0L || f.machine.usedBytes != 0L || f.serverUsed != 0L) {
+            drifts += "$where: 外した後に残った（/tmp ${fs.usedBytes}、マシン ${f.machine.usedBytes}、サーバー ${f.serverUsed}）"
         }
     }
 
-    private fun sweep(op: Op, hostBody: Boolean): Result = timeout(Duration.ofSeconds(TIMEOUT_SECONDS)) {
-        val pool = Array(POOL_SIZE) { Fixture(op) }
+    private fun statusName(status: Int) = when (status) {
+        REFUSED -> "スタックで断られた"
+        NO_SPACE -> "NOSPC"
+        SHORT -> "短い書き込み"
+        else -> "通った"
+    }
+
+    private fun sweep(op: Op, hostBody: Boolean, headroom: Long? = null): Result = timeout(Duration.ofSeconds(TIMEOUT_SECONDS)) {
+        val pool = Array(POOL_SIZE) { Fixture(op, headroom) }
         // 浅いところで、底で初めて触るクラス（操作の中の例外・VFS の道）を読み込んでおく（クラスの初期化の途中で尽きると、試験と関係なく壊れる）
         run {
-            val warm = Fixture(op)
+            val warm = Fixture(op, headroom)
             operate(Run(op, false, emptyArray()), warm)
             inspect(0, warm, ArrayList())
         }
@@ -224,7 +253,8 @@ class TmpFileSystemStackExhaustionTest {
         for ((i, f) in used.withIndex()) inspect(i, f, drifts)
         val result = Result(used, drifts)
         println(
-            "#883 $op${if (hostBody) "（ホストの関数の本体）" else ""}: 深さ ${used.size}、通った ${result.completed}、断られた ${result.refused}" +
+            "#883 $op${if (hostBody) "（ホストの関数の本体）" else ""}${if (headroom != null) "（サーバー全体の残り $headroom）" else ""}: " +
+                "深さ ${used.size}、通った ${result.completed}、NOSPC ${result.noSpace}、短い書き込み ${result.short}、断られた ${result.refused}" +
                 "（うち確かめの中 ${result.refusedInProbe}）、確かめが通らない深さ ${result.lacking.size}、うち断られなかった ${result.lackingButCompleted}、" +
                 "ずれ ${drifts.size}",
         )
@@ -242,6 +272,58 @@ class TmpFileSystemStackExhaustionTest {
         // 入口の確かめがあるなら、通らない深さでは必ず断られる（なければ、通って数える）
         assertEquals(0, r.lackingButCompleted, "$op: 確かめが通らない深さで、操作が通った（入口の確かめがない）")
     }
+
+    /**
+     * サーバー全体の残りを絞った組で [op] を掃引する。確保がサーバー全体の段で断られる（マシンの分を戻す枝と、`NOSPC`・短い書き込みの枝）
+     * 深さが、底をまたいで通ること。[expectShort] なら書けた分だけの短い書き込み、そうでなければ `NOSPC`
+     */
+    private fun checkTight(op: Op, headroom: Long, expectShort: Boolean) {
+        val r = sweep(op, hostBody = false, headroom = headroom)
+        assertEquals(emptyList<String>(), r.drifts, "$op: 勘定・木がずれた（サーバー全体の残り $headroom）")
+        if (expectShort) {
+            assertTrue(r.short > 0, "$op: 短い書き込みになった深さがない")
+        } else {
+            assertTrue(r.noSpace > 0, "$op: NOSPC になった深さがない")
+        }
+        assertEquals(0, if (expectShort) r.noSpace else r.short, "$op: 組んだ枝と違う断られ方になった深さがある")
+        assertTrue(r.refused > 0, "$op: 操作が断られた深さがない（試験の窓が底まで届かない）")
+        assertTrue(r.lacking.isNotEmpty(), "$op: 確かめが通らない深さがない（試験の窓が底まで届かない）")
+        assertEquals(0, r.lackingButCompleted, "$op: 確かめが通らない深さで、操作が通った（入口の確かめがない）")
+    }
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、底に近い深さのすべてで、新しい塊の書き込みはNOSPCになり、勘定と木はずれない`() =
+        checkTight(Op.WRITE, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で1塊だけ通る組では、いくつもの塊の書き込みは書けた分だけで終わり、勘定と木はずれない`() =
+        checkTight(Op.WRITE_MULTI, TmpFileSystem.CHUNK_BYTES.toLong(), expectShort = true)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、いくつもの塊の書き込みは最初の塊でNOSPCになり、勘定と木はずれない`() =
+        checkTight(Op.WRITE_MULTI, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で断られる組では、追記は端の塊に入る分だけで終わり、勘定と木はずれない`() =
+        checkTight(Op.APPEND, 0, expectShort = true)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、ファイルの作成はNOSPCになり、勘定と木はずれない`() = checkTight(Op.CREATE_FILE, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、ディレクトリの作成はNOSPCになり、勘定と木はずれない`() =
+        checkTight(Op.CREATE_DIRECTORY, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、名前の変更は何も変えずにNOSPCになる`() = checkTight(Op.RENAME, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、ファイルの置き換えは何も変えずにNOSPCになる`() =
+        checkTight(Op.RENAME_REPLACE_FILE, 0, expectShort = false)
+
+    @Test
+    fun `サーバー全体の段で断られる組でも、ディレクトリの置き換えは何も変えずにNOSPCになる`() =
+        checkTight(Op.RENAME_REPLACE_DIRECTORY, 0, expectShort = false)
 
     @Test
     fun `底に近い深さのすべてで、新しい塊に書いても、勘定と木はずれない`() = check(Op.WRITE)
@@ -300,6 +382,12 @@ class TmpFileSystemStackExhaustionTest {
         const val NOT_RUN = 0
         const val COMPLETED = 1
         const val REFUSED = 2
+
+        /** 数えられずに `NOSPC`（サーバー全体の段で断られた。何も変えない） */
+        const val NO_SPACE = 3
+
+        /** 書けた分だけの短い書き込み（途中の塊でサーバー全体の段に断られた） */
+        const val SHORT = 4
 
         const val MOD_PACKAGE = "pro.ikili.kibicomputers."
 
