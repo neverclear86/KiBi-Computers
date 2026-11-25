@@ -76,7 +76,9 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     （1 本に 40 回。底に近いところだけ本物の操作をするので、1 本が約 9 秒）。毎回の後に、ディスクの表・使用量・枠がホストと合うことと、
  *     開いたままのホストのファイルが残っていないことも見る
  * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）。1 本で 60 回
- *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が 0 に戻ることも見る
+ *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`）が 0 に戻ることも見る。予約はロックでないので
+ *   安全網の対象外だが、持ち主のプロセスの終わり（`finishLocked`）が戻す（#890。尽きた位置に左右されない。窓を決まった形で突く
+ *   `ConsolePumpReservationTest`）
  * - canon の lift・lower（文字列の realloc、post-return、別のインスタンスが lower した関数を lift し直す `CoreRef.Lowered` の道。
  *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）。入口の `top` に止まりうるホストの関数を置くので、待機点型の回は
  *   待機点型に固有の燃料切れの道を通る: 深い `f`（ゲストからゲストへの呼び出しの下）の中の前借りと、`top` の loop の先頭の燃料切れの巻き戻し・巻き直し

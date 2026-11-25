@@ -2361,37 +2361,39 @@ public class Machine private constructor(
      * - 配っていないカーネルのメッセージがある（その前後の TTY の出力は、メインスレッドが目印で分けて配る。#381）
      * - メインスレッドがコンソールの出力を止めている（画面の処理が追いついていない。#357）
      *
-     * [reserved] なら、[reserveConsolePumpLocked] の予約を1つ消す（書いても書かなくても。#419）。予約は、TTY から取り出すのと
-     * 同じカーネルロックの中で消すので、書く先のロックを持つメインスレッドからは、予約が消えたときには TTY が空になっている
-     * （書かずに 0 を返したときは、残りをメインスレッドが配る）
+     * [reservedBy] なら、そのプロセスの [reserveConsolePumpLocked] の予約を消す（書いても書かなくても。#419）。予約は、TTY から
+     * 取り出すのと同じカーネルロックの中で消すので、書く先のロックを持つメインスレッドからは、予約が消えたときには TTY が空になっている
+     * （書かずに 0 を返したときは、残りをメインスレッドが配る）。
+     *
+     * ここで消すのは、例外でない道だけ（#890）。途中でスタックが尽きた（表示デバイスのロック・カーネルロックを取る途中など）ときは、
+     * 同じ深さの `finally` で取り戻そうとはせず（また溢れる。ADR 0043）、プロセスの終わり（`ProcessRunner.finishLocked`。スタックが
+     * 空いた浅いところ）が戻す。予約してからここに入るまでの間で尽きたときも同じ
      */
-    internal fun pumpConsole(reserved: Boolean = false): Long {
-        var unreserved = !reserved
+    internal fun pumpConsole(reservedBy: ProcessRuntime? = null): Long {
+        val sink = consoleSink
+        if (sink == null || lock.isHeldByCurrentThread) {
+            // 書かない。予約だけ消す（カーネルロックを持っているなら再入する）。残りはメインスレッドが配る
+            if (reservedBy != null) lock.withLockValue { releaseConsolePumpLocked(reservedBy) }
+            return 0
+        }
+        sink.lock.lock()
         try {
-            val sink = consoleSink ?: return 0
-            if (lock.isHeldByCurrentThread) return 0
-            sink.lock.lock()
-            try {
-                if (consoleSink !== sink) return 0
-                val bytes = lock.withLockValue {
-                    if (!unreserved) {
-                        consolePumpsReserved--
-                        unreserved = true
-                    }
-                    if (consoleHold != null || pendingConsoleBytes.get() > 0L) null else drainConsoleOutputLocked()
-                } ?: return 0
-                return sink.write(bytes)
-            } finally {
-                sink.lock.unlock()
-            }
+            val bytes = lock.withLockValue {
+                if (reservedBy != null) releaseConsolePumpLocked(reservedBy)
+                if (consoleSink !== sink || consoleHold != null || pendingConsoleBytes.get() > 0L) null else drainConsoleOutputLocked()
+            } ?: return 0
+            return sink.write(bytes)
         } finally {
-            if (!unreserved) lock.withLockValue { consolePumpsReserved-- }
+            sink.lock.unlock()
         }
     }
 
     /**
      * コンソールの TTY に書いて、まだ [pumpConsole] で書いていないプロセスの数（#419。カーネルロック）。
-     * 0 より大きい間は、TTY に残った出力を書き手がいないものとして、メインスレッドが取り出さない（[drainStaleConsoleOutput]）
+     * 0 より大きい間は、TTY に残った出力を書き手がいないものとして、メインスレッドが取り出さない（[drainStaleConsoleOutput]）。
+     * 予約の持ち主はプロセスで（[ProcessRuntime.consolePumpReserved]。1 つのプロセスが数えるのは 1 つまで）、[pumpConsole] か
+     * プロセスの終わり（`ProcessRunner.finishLocked`）の早い方で戻る（#890。スタックが尽きて [pumpConsole] に届かなくても残らない）。
+     * メインスレッドは tick ごとにこの数だけを読む（プロセスを数え直さない）
      */
     private var consolePumpsReserved = 0
 
@@ -2399,11 +2401,26 @@ public class Machine private constructor(
     internal val consolePumpsReservedForTest: Int get() = lock.withLockValue { consolePumpsReserved }
 
     /**
-     * コンソールの TTY に書いたプロセスが、この後に [pumpConsole]（`reserved = true`）で書くと予約する（#419）。
-     * TTY に書いたのと同じカーネルロックの中で呼ぶ
+     * コンソールの TTY に書いたプロセス [rt] が、この後に [pumpConsole]（`reservedBy = rt`）で書くと予約する（#419）。
+     * TTY に書いたのと同じカーネルロックの中で呼ぶ。もう予約していれば何もしない（#890）。
+     * 中では印と数のフィールドだけを読み書きし、ほかの関数を呼ばない（スタックが尽きうるのは、この関数の入口だけにする）
      */
-    internal fun reserveConsolePumpLocked() {
-        consolePumpsReserved++
+    internal fun reserveConsolePumpLocked(rt: ProcessRuntime) {
+        if (!rt.consolePumpReserved) {
+            rt.consolePumpReserved = true
+            consolePumpsReserved++
+        }
+    }
+
+    /**
+     * プロセス [rt] の [reserveConsolePumpLocked] の予約を消す（#890）。カーネルロックの中で呼ぶ。予約していなければ何もしない
+     * （[pumpConsole] とプロセスの終わりの両方から呼ばれても、1 回だけ戻る）。中では印と数のフィールドだけを読み書きする
+     */
+    internal fun releaseConsolePumpLocked(rt: ProcessRuntime) {
+        if (rt.consolePumpReserved) {
+            rt.consolePumpReserved = false
+            consolePumpsReserved--
+        }
     }
 
     /**
