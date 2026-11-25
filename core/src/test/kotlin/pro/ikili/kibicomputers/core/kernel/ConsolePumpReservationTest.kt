@@ -215,6 +215,84 @@ internal class ConsolePumpReservationTest {
         }
     }
 
+    /**
+     * `pumpConsole` が書かずに予約だけ消す道（書く先がない・カーネルロックを持っている）で、プロセスが生きている間に予約が 0 に戻る。
+     * プロセスが終われば `finishLocked` でも戻るので、書き手を [gate] で止めたまま確かめる。[before] は書き手を流す前に呼ぶ
+     */
+    private fun Rig.assertReleasedWhileAlive(underKernelLock: Boolean, before: () -> Unit = {}, whileAlive: () -> Unit) {
+        val flushed = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        try {
+            val rt = spawn(ProcessKind.BLOCKING) { ctx ->
+                if (underKernelLock) {
+                    // カーネルロックを持ったまま流す（pumpConsole は書かずに、再入して予約だけ消す）
+                    ctx.withKernelLock {
+                        tty.write(payload, 0, payload.size, ctx.wakeSink)
+                        ctx.reserveConsoleFlushLocked()
+                        ctx.flushConsole()
+                    }
+                } else {
+                    writeConsole(ctx, tty)
+                }
+                flushed.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+            before()
+            eventually(10_000, "書き手が流し終わらない") {
+                h.scheduler.tick()
+                flushed.count == 0L
+            }
+            assertTrue(!rt.process.state.isTerminal, "書き手が終わった（${rt.process.state}）")
+            assertEquals(0, m.consolePumpsReservedForTest, "書かずに戻った pumpConsole で予約が戻らない")
+            whileAlive()
+            assertTrue(!rt.process.state.isTerminal, "書き手が終わった（${rt.process.state}）")
+            assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（書かない道を通っていない）")
+            gate.countDown()
+            awaitEnd(rt)
+            assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+            assertEquals(0, m.consolePumpsReservedForTest)
+        } finally {
+            gate.countDown()
+        }
+    }
+
+    /** 書き手が生きている間に、メインスレッドが TTY の出力（[expected] を含む）を配りきる */
+    private fun Rig.assertMainThreadDrains(expected: String) {
+        eventually(10_000, "メインスレッドが TTY の出力を配らない（${outputAvailable()} バイト、配った分: ${host.console}）") {
+            h.scheduler.tick()
+            outputAvailable() == 0 && host.console.contains(expected)
+        }
+    }
+
+    @Test
+    fun `書く先がないときに書かずに戻っても、生きている間に予約は0に戻り、後から画面をつなぐと残りを配る`() = timeout(limit) {
+        rig { r ->
+            // 画面をつないでいない台は、いつも書かない道を通る
+            r.m.consoleSink = null
+            r.assertReleasedWhileAlive(underKernelLock = false) {
+                r.assertMainThreadDrains(String(payload, Charsets.UTF_8))
+                // 生きている間に画面をつなぐ。書き手のいない出力は drainStaleConsoleOutput が配る（予約が残っていると配らない）
+                r.m.consoleSink = r.sink
+                val echo = "echo890-nosink"
+                assertEquals(echo.length, r.m.offerConsoleInput(echo.toByteArray()))
+                r.assertMainThreadDrains(echo)
+            }
+        }
+    }
+
+    @Test
+    fun `カーネルロックを持ったまま流して書かずに戻っても、生きている間に予約は0に戻り、残りを配る`() = timeout(limit) {
+        rig { r ->
+            r.assertReleasedWhileAlive(underKernelLock = true) {
+                // 書く先があるので、メインスレッドは drainStaleConsoleOutput で取り出す（予約が残っていると取り出さない）
+                r.assertMainThreadDrains(String(payload, Charsets.UTF_8))
+                val echo = "echo890-locked"
+                assertEquals(echo.length, r.m.offerConsoleInput(echo.toByteArray()))
+                r.assertMainThreadDrains(echo)
+            }
+        }
+    }
+
     @Test
     fun `予約したまま止まっている書き手を止めても、予約は1回だけ戻る`() = timeout(limit) {
         rig { r ->
