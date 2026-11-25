@@ -77,6 +77,8 @@ tasks.test {
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // ctx.instantiate の入口の確かめを外した・縮めた結果を手元で測る（#884。`-Pkibi.test.instantiateGateFrames=<段数>`。ふつうは渡さない）
+    providers.gradleProperty("kibi.test.instantiateGateFrames").orNull?.let { systemProperty("kibi.test.instantiateGateFrames", it) }
     // 前借りの間の燃料切れの処理の費用を測る（#858。`-Pkibi.overdraftBenchmark=true`。ふつうは動かさない）
     if (providers.gradleProperty("kibi.overdraftBenchmark").orNull == "true") {
         systemProperty("kibi.overdraftBenchmark", "true")
@@ -114,6 +116,8 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         "P1StackExhaustionLockTest",
         "P1DiskCloseStackExhaustionTest",
         "TmpFileSystemStackExhaustionKernelTest",
+        "InstantiateStackExhaustionTest",
+        "InstantiateStackExhaustionKernelTest",
     )
     fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
         group = "verification"

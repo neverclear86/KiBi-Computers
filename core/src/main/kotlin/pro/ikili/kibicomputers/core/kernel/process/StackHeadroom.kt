@@ -126,7 +126,28 @@ package pro.ikili.kibicomputers.core.kernel.process
  * （`MemoryAccountStackExhaustionTest` の `hostBody`）。
  * カーネルのプロセスを通した確かめは `MemoryAccountStackExhaustionKernelTest`（本物のマシン・Endive で、ゲストの命令とホストの関数の本体
  * （`memory.write*`・`commit`）から入り、プロセスだけが終わり、終わりの後にマシン・サーバー全体の勘定が戻り、ほかの台が動き続ける）。
- * `ctx.instantiate` の道（作るのに失敗したときに同じ深さで返す `catch` を含む）は、まだ確かめていない（#884）。
+ *
+ * `ctx.instantiate` の道（#884）: 1 回で、メモリ（`createMemory` → `WrittenPagesMemory` の区画の表）とテーブル（`createTable`）を続けて
+ * 別々に数え、失敗すると `EndiveWasmModule.instantiate` の `catch` が、作りかけの分を全段に返す。作り終えたら `rt.instances` につなぐ
+ * （つなぐ前に尽きると、プロセスの終わりでも閉じられない）。どちらも返す・つなぐ途中で尽きると勘定がずれるので、`ctx.instantiate` の入口で、
+ * 何も変える前に [INSTANTIATE_FRAMES] 段を 1 回確かめる。`InstantiateStackExhaustionTest`（勘定の組と本物の Endive を直接組み、底に近い深さの
+ * すべてで 5 つの型: 作り終える・要素の初期化で失敗・テーブルの上限で失敗・start が区画に書いてからトラップ・start の中で尽きる）と
+ * `InstantiateStackExhaustionKernelTest`（本物のマシンで、ドライバーの本体とホストの関数の本体から。BLOCKING・WAIT_POINT）で、
+ * 毎回の後に 3 段の勘定が戻ることを確かめた（どちらの掃引も入口の確かめの有無・位置は見分けない。確かめを固定しているのは、
+ * `InstantiateStackExhaustionKernelTest` の、確かめが通らない深さで断ることを見る 2 本）。確かめを外した（0 段の）手元の試験（JDK 17・JIT・Windows）では、どちらの試験でも、ずれは
+ * 1 回も出なかった（窓がないとは言えない）。尽きた位置は、数える前（`MEMORY_ACCOUNT_FRAMES` の確かめの中か、Endive の中）だった。
+ * 返す `catch` は、数えた位置（`ensure(MEMORY_ACCOUNT_FRAMES)` を通った深さ）より浅いところで動くので、フレームの大きさが変わらなければ
+ * 尽きないが、JIT の段階でフレームが変わる・ロックの取り合いで深い道に入る、ことまでは覆わない。そこで入口でまとめて払う。
+ * 段数を縮めた同じ単体の試験では、64 段以上で、入口を通った後に尽きた回が 0 になった（start の中で尽きる型を除く。32 段以下では
+ * 入口を通った後に Endive の中で尽きる回があったが、ずれはなかった）。今の 128 段はその 2 倍。今は本番の呼び出し元がないので、費用は TPS に響かない
+ *
+ * 冷えた道・`-Xint`・JDK 21 の結果（`-Pkibi.stackHeadroom=true` の `stackHeadroomColdTest`・`stackHeadroomXintTest`・`stackHeadroomJdk21Test` を、
+ * `InstantiateStackExhaustion*` だけに絞って回した。Windows。今の 128 段）: 単体 5 本・カーネル（BLOCKING・WAIT_POINT）とも、3 つの JVM のどれでも通過し、
+ * 勘定のずれは 1 回も出なかった。単体の試験で入口を通った後に尽きた回は、start の中で尽きる型を除いて 0（窓に入った深さは、冷えた道で約 618、`-Xint` で約 1608、
+ * JDK 21 で約 576〜658）。段数を縮めた測定（上の 64 段以上で 0）は、JIT の JVM でだけ行った。これらの JVM では 128 段で測り、
+ * 縮めた段数では測っていない（`kibi.test.instantiateGateFrames` は通常の `:core:test` にだけ渡る）。
+ * 確かめそのものは、`InstantiateStackExhaustionKernelTest` の「入口の確かめが通らない深さで呼ぶと、何も変えずに断り、浅いところで作り直せる」が固定する
+ * （確かめを外す、`rt.loading` の設定より後ろへ動かす、のどちらでも落ちる。掃引の試験は、窓が確かめの外に落ちないので見分けられない）
  *
  * `/tmp`（`TmpFileSystem`。#883）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、上の入口で
  * 覆えない。変える操作（作る・消す・名前を変える・書く・追記・大きさを変える・`allocate`）は、勘定の 2 段に加えて、自分の `usedBytes` と木
@@ -205,6 +226,18 @@ internal object StackHeadroom {
      * ロックを取る深い道もホストの I/O もない。書き込みのたびに通るので、ホストの関数の包みと同じ軽い段数にする
      */
     const val TMPFS_FRAMES: Int = 32
+
+    /**
+     * `ctx.instantiate`（`ProcessRunner` の `ProcessContext.instantiate`）の入口で、何も変える前に確かめる段数（#884）。
+     * ここから先は、カーネルロックの区間（取り合いの待ちの道を含む）、Endive の `Instance.Builder.build`、作るのに失敗したときに
+     * 作りかけのメモリ・テーブルの分を全段に返す道（`EndiveWasmModule.instantiate` の `catch` → `releaseAll` → プロセス・マシン・
+     * サーバー全体の `releaseBytes`）と例外の作り直し、作り終えた後に `rt.instances` へつなぐまで（`attach`、ロックの区間、`ArrayList` の伸長）が続く。
+     * 返す側では確かめられない（投げると返すこと自体が飛ばされる）ので、入口でまとめて払う。`createMemory`・`createTable` の確保は
+     * 自分の [MEMORY_ACCOUNT_FRAMES] で確かめ、start 関数の中で尽きたときはこの深さの `catch` まで戻るので、その分は含めない。
+     * 呼ぶたびに CPU・許可を返して取り直す口ではないが、モジュールからインスタンスを作る（µs〜ms）口なので、
+     * [FUEL_YIELD_FRAMES] と同じ段数（約 0.9 µs）を払う。今は本番の呼び出し元がない（テストだけ）ので、将来の呼び出し元のための守り
+     */
+    const val INSTANTIATE_FRAMES: Int = 128
 
     /**
      * fd の表で最後の参照が外れたファイルを閉じる知らせ（`Vfs.drainDeferred` → `DiskFileSystem.release`・`retire`）を、列から取り出す前に
