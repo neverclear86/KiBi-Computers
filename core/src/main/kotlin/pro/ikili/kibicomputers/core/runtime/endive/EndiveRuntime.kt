@@ -66,6 +66,7 @@ import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.PassiveElement
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
+import run.endive.wasm.types.StorageType
 import run.endive.wasm.types.Table
 import run.endive.wasm.types.TableLimits
 import run.endive.wasm.types.TypeSection
@@ -611,7 +612,9 @@ public class EndiveRuntime internal constructor(
          * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
          * もう断るので、ここに届くのは先頭でない `ref.func` だけ。Endive がアクティブの要素に使うのと同じ規則（`Validator.validateConstantExpression`）で確かめる:
          * 定数式の命令だけで、スタックにちょうど 1 つの値が残り、その型が要素の型に合う（[ValType.matches]）。`global.get` は不変のグローバルだけ。
-         * 命令が取る値の型は、Endive と同じく数だけを確かめる（アクティブの要素・グローバルの初期値と同じ扱い）。
+         * Endive の `validateConstantExpression` は命令が取る値の型を確かめないが、ここでは確かめる。取る値の型が合わない式
+         * （`struct.new` のフィールドの型が違う値など）も、`table.init`・`struct.get` などを経て、正しくない値・JVM の例外に届くため。
+         * `any.convert_extern`・`extern.convert_any` の結果が null を持てるかは、取った値に従う。
          * Endive が直ったら、この判定を外す
          */
         internal fun invalidPassiveElementInitializer(module: EndiveModule): String? {
@@ -644,6 +647,9 @@ public class EndiveRuntime internal constructor(
             return null
         }
 
+        /** [constExprProblem] の途中で、正しくない理由が分かったときの中断 */
+        private class ConstExprProblem(message: String) : RuntimeException(message)
+
         /** [expr] が [expected] の型の正しい定数式でなければ、その理由（[invalidPassiveElementInitializer]） */
         private fun constExprProblem(
             expr: List<Instruction>,
@@ -653,59 +659,118 @@ public class EndiveRuntime internal constructor(
             types: TypeSection,
         ): String? {
             val stack = ArrayList<ValType>()
-            fun ref(opcode: Int, typeIdx: Int) = ValType.builder().withOpcode(opcode).withTypeIdx(typeIdx).build().resolve(types)
+            fun fail(reason: String): Nothing = throw ConstExprProblem(reason)
+            fun ref(opcode: Int, typeIdx: Int): ValType = ValType.builder().withOpcode(opcode).withTypeIdx(typeIdx).build()
             fun subType(idx: Long) = if (idx in 0 until types.subTypeCount()) types.getSubType(idx.toInt()) else null
-            for (ins in expr) {
-                // 値を取る命令は、取る数だけ先に確かめる
-                val (pops, push) = when (ins.opcode()) {
-                    OpCode.END -> continue
-                    OpCode.I32_CONST -> 0 to ValType.I32
-                    OpCode.I64_CONST -> 0 to ValType.I64
-                    OpCode.F32_CONST -> 0 to ValType.F32
-                    OpCode.F64_CONST -> 0 to ValType.F64
-                    OpCode.V128_CONST -> 0 to ValType.V128
-                    OpCode.I32_ADD, OpCode.I32_SUB, OpCode.I32_MUL -> 2 to ValType.I32
-                    OpCode.I64_ADD, OpCode.I64_SUB, OpCode.I64_MUL -> 2 to ValType.I64
-                    OpCode.REF_NULL -> 0 to ref(ValType.ID.RefNull, ins.operand(0).toInt())
-                    OpCode.REF_FUNC -> {
-                        // 番号は u32 まで。Int にすると 2^31 以上が負になるので Long で比べる
-                        val idx = ins.operand(0)
-                        if (idx < 0 || idx >= funcTypes.size) return "関数 $idx がない"
-                        0 to ref(ValType.ID.Ref, funcTypes[idx.toInt()])
-                    }
-                    OpCode.GLOBAL_GET -> {
-                        val idx = ins.operand(0)
-                        if (idx < 0 || idx >= globals.size) return "グローバルがない"
-                        val (type, mutable) = globals[idx.toInt()]
-                        if (mutable) return "可変のグローバルは定数式で読めない"
-                        0 to type
-                    }
-                    OpCode.REF_I31 -> 1 to ValType.builder().withOpcode(ValType.ID.Ref).withTypeIdx(ValType.TypeIdxCode.I31.code()).build()
-                    OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> {
-                        val st = subType(ins.operand(0))?.compType()?.structType() ?: return "型 ${ins.operand(0)} が struct でない"
-                        (if (ins.opcode() == OpCode.STRUCT_NEW) st.fieldTypes().size else 0) to ref(ValType.ID.Ref, ins.operand(0).toInt())
-                    }
-                    OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_FIXED -> {
-                        subType(ins.operand(0))?.compType()?.arrayType() ?: return "型 ${ins.operand(0)} が array でない"
-                        val n = when (ins.opcode()) {
-                            OpCode.ARRAY_NEW -> 2L
-                            OpCode.ARRAY_NEW_DEFAULT -> 1L
-                            else -> ins.operand(1)
-                        }
-                        if (n > stack.size) return "スタックの値が足りない"
-                        n.toInt() to ref(ValType.ID.Ref, ins.operand(0).toInt())
-                    }
-                    OpCode.ANY_CONVERT_EXTERN -> 1 to ValType.AnyRef
-                    OpCode.EXTERN_CONVERT_ANY -> 1 to ValType.ExternRef
-                    else -> return "命令 ${ins.opcode()} は定数式に使えない"
-                }
-                if (pops > stack.size) return "スタックの値が足りない"
-                repeat(pops) { stack.removeAt(stack.size - 1) }
-                stack += push
+            // 命令 [op] が値を 1 つ取る。型が [want] に合わなければ断る（値の型の検証は Endive にない。#893）。取った値の型を返す
+            fun pop(op: OpCode, want: ValType): ValType {
+                if (stack.isEmpty()) fail("スタックの値が足りない")
+                val actual = stack.removeAt(stack.size - 1)
+                if (!ValType.matches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
+                return actual
             }
-            if (stack.size != 1) return "定数式の値が ${stack.size} 個（1 個でない）"
-            val actual = stack[0]
-            if (!ValType.matches(actual, expected, types)) return "値の型（$actual）が要素の型（$expected）に合わない"
+            // struct のフィールド・array の要素の型を、スタックの値の型にしたもの（i8・i16 は i32）
+            fun unpacked(storage: StorageType): ValType = if (storage.packedType() != null) ValType.I32 else storage.valType()
+            // `*.new_default` で既定値が作れる型（数・v128・null を持てる参照）か
+            fun defaultable(storage: StorageType): Boolean =
+                storage.packedType() != null || !storage.valType().isReference || storage.valType().isNullable
+            try {
+                for (ins in expr) {
+                    val op = ins.opcode()
+                    val push: ValType = when (op) {
+                        OpCode.END -> continue
+                        OpCode.I32_CONST -> ValType.I32
+                        OpCode.I64_CONST -> ValType.I64
+                        OpCode.F32_CONST -> ValType.F32
+                        OpCode.F64_CONST -> ValType.F64
+                        OpCode.V128_CONST -> ValType.V128
+                        OpCode.I32_ADD, OpCode.I32_SUB, OpCode.I32_MUL -> {
+                            pop(op, ValType.I32)
+                            pop(op, ValType.I32)
+                            ValType.I32
+                        }
+                        OpCode.I64_ADD, OpCode.I64_SUB, OpCode.I64_MUL -> {
+                            pop(op, ValType.I64)
+                            pop(op, ValType.I64)
+                            ValType.I64
+                        }
+                        OpCode.REF_NULL -> {
+                            // ヒープ型は、型の番号（0 以上。範囲の中）か、抽象ヒープ型（負。funcref・externref など）。
+                            // 範囲の外の番号を型にすると、ValType の解決が InvalidException を投げて、場所のない文面になる
+                            val idx = ins.operand(0)
+                            val known = if (idx >= 0) {
+                                idx < types.subTypeCount()
+                            } else {
+                                ValType.TypeIdxCode.entries.any { it != ValType.TypeIdxCode.BOT && it.code().toLong() == idx }
+                            }
+                            if (!known) fail("ヒープ型 $idx がない")
+                            ref(ValType.ID.RefNull, idx.toInt())
+                        }
+                        OpCode.REF_FUNC -> {
+                            // 番号は u32 まで。Int にすると 2^31 以上が負になるので Long で比べる
+                            val idx = ins.operand(0)
+                            if (idx < 0 || idx >= funcTypes.size) fail("関数 $idx がない")
+                            ref(ValType.ID.Ref, funcTypes[idx.toInt()])
+                        }
+                        OpCode.GLOBAL_GET -> {
+                            val idx = ins.operand(0)
+                            if (idx < 0 || idx >= globals.size) fail("グローバルがない")
+                            val (type, mutable) = globals[idx.toInt()]
+                            if (mutable) fail("可変のグローバルは定数式で読めない")
+                            type
+                        }
+                        OpCode.REF_I31 -> {
+                            pop(op, ValType.I32)
+                            ref(ValType.ID.Ref, ValType.TypeIdxCode.I31.code())
+                        }
+                        OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> {
+                            val st = subType(ins.operand(0))?.compType()?.structType() ?: fail("型 ${ins.operand(0)} が struct でない")
+                            if (op == OpCode.STRUCT_NEW) {
+                                // 値は、最後のフィールドのものが上にある
+                                for (k in st.fieldTypes().indices.reversed()) pop(op, unpacked(st.fieldTypes()[k].storageType()))
+                            } else if (!st.fieldTypes().all { defaultable(it.storageType()) }) {
+                                fail("型 ${ins.operand(0)} に、null を持てない参照のフィールドがあるので、既定値で作れない")
+                            }
+                            ref(ValType.ID.Ref, ins.operand(0).toInt())
+                        }
+                        OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_FIXED -> {
+                            val arr = subType(ins.operand(0))?.compType()?.arrayType() ?: fail("型 ${ins.operand(0)} が array でない")
+                            val elem = arr.fieldType().storageType()
+                            when (op) {
+                                OpCode.ARRAY_NEW -> {
+                                    pop(op, ValType.I32) // 長さ（上）
+                                    pop(op, unpacked(elem))
+                                }
+                                OpCode.ARRAY_NEW_DEFAULT -> {
+                                    if (!defaultable(elem)) fail("型 ${ins.operand(0)} の要素が null を持てない参照なので、既定値で作れない")
+                                    pop(op, ValType.I32)
+                                }
+                                else -> {
+                                    // 個数は u32。スタックより多ければ、取る前に断る
+                                    val n = ins.operand(1)
+                                    if (n > stack.size) fail("スタックの値が足りない")
+                                    repeat(n.toInt()) { pop(op, unpacked(elem)) }
+                                }
+                            }
+                            ref(ValType.ID.Ref, ins.operand(0).toInt())
+                        }
+                        // 結果が null を持てるかは、取った値に従う（仕様。null を持てない値からは、null を持てない値になる）
+                        OpCode.ANY_CONVERT_EXTERN, OpCode.EXTERN_CONVERT_ANY -> {
+                            val toAny = op == OpCode.ANY_CONVERT_EXTERN
+                            val actual = pop(op, if (toAny) ValType.ExternRef else ValType.AnyRef)
+                            val heap = if (toAny) ValType.TypeIdxCode.ANY else ValType.TypeIdxCode.EXTERN
+                            ref(if (actual.isNullable) ValType.ID.RefNull else ValType.ID.Ref, heap.code())
+                        }
+                        else -> fail("命令 $op は定数式に使えない")
+                    }
+                    stack += push
+                }
+                if (stack.size != 1) fail("定数式の値が ${stack.size} 個（1 個でない）")
+                val actual = stack[0]
+                if (!ValType.matches(actual, expected, types)) fail("値の型（$actual）が要素の型（$expected）に合わない")
+            } catch (e: ConstExprProblem) {
+                return e.message
+            }
             return null
         }
 
