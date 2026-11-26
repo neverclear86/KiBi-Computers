@@ -441,3 +441,26 @@ test('プロンプト: マージは起動の失敗を自分で回し直さず、
   assert.match(impl, /2 回続いた/)
   assert.doesNotMatch(impl, /gradleStartupFailed=true/)
 })
+
+test('やり直しの回が未完了で、merge-restart-wait でマージできたら、理由に両方のやり直しが残る', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [fail('build', 'y', PENDING)], 'merge-restart-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-restart-wait'), 1)
+  assert.match(r.issue.mergeReason, /起動の失敗.*1 回だけやり直した/)
+  assert.match(r.issue.mergeReason, /やり直しの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('過負荷の回し直しが未完了で、merge-retry-wait でマージできたら、理由にそれが残る', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [fail('build', 'y', PENDING)], 'merge-retry-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-retry'), 1)
+  assert.equal(r.count('merge-retry-wait'), 1)
+  assert.match(r.issue.mergeReason, /過負荷/)
+  assert.match(r.issue.mergeReason, /回し直しの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('待つやり直しを通らなかったやり直しの回は、理由に待つやり直しを書かない', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] })
+  assert.doesNotMatch(r.issue.mergeReason, /それも 1 回だけやり直した/)
+})
