@@ -129,6 +129,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
             headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
             includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
             includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemStackExhaustionTest")
+            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemTreeStackExhaustionTest")
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)
