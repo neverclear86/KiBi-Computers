@@ -33,6 +33,23 @@ const MAX_CONFLICT_MERGES = 2
 const OVERLOAD_TICKS_BEHIND = 300
 const OVERLOAD_GAMETEST_SECONDS = 600
 
+// 待ち方（#962）。ワークフローの段階のエージェントは、ツールを呼ばない返事でターンを終えると、その場で返り値を求められて返ってしまう
+// （PR #951 の fix:951#2 は、Monitor を張って「通知を待つ」とターンを終え、起動から約 30 秒で gradleStillRunning=true を返した。
+// やり直しも同じ形で約 85 秒で返した）。返すとバックグラウンドのシェルが殺され、.exit は二度とできない（Gradle の java だけが孤児として走り切る）。
+// 待ちを通せた回は、前景の Bash で有限のループを繰り返していた。前景の Bash の上限は 600 秒なので、ループは 570 秒以内に必ず抜ける形にする
+const WAIT_LOOP_COUNT = 57
+const WAIT_LOOP_SECONDS = 10
+// 1 本の Gradle の起動から、終わりを待つ全体の上限（分）。build は 20〜25 分、-Pkibi.stackHeadroom の JVM は 45 分前後、
+// GameTest はロックの待ち（既定の上限 90 分）を含めると 90 分を超えることがある。これを過ぎても java が生きていれば gradleStillRunning=true で返す
+const GRADLE_WAIT_LIMIT_MINUTES = 150
+// 待ち方の決まり（Gradle を動かす段階と、片付けの段階で共有する）
+const WAIT_HOW = `**待っている間に、ツールを呼ばない返事（「通知を待つ」「Monitor が知らせる」など）でターンを終えない**（#962）。ワークフローの段階では、ターンを終えるとその場で返り値を求められて返ってしまい、バックグラウンドのシェルが殺されて \`.exit\` は二度とできない。Monitor の通知はターンを終えたあとには届かないので、待ちに Monitor を使わない。待つときは、前景の Bash（\`timeout: 600000\`）で、${WAIT_LOOP_SECONDS} 秒ごとに条件を確かめて ${WAIT_LOOP_COUNT * WAIT_LOOP_SECONDS} 秒以内に必ず抜けるループ（\`for i in $(seq 1 ${WAIT_LOOP_COUNT}); do <条件> && break; sleep ${WAIT_LOOP_SECONDS}; done\`）を実行し、条件が満たされるまで同じ呼び出しを何回でも繰り返す。先頭が \`sleep N\` のコマンドは止められるが、ループの中の \`sleep\` は動く。1 回ごとの出力は \`tail -n 1\` 程度に絞る。`
+// .exit を待つ前景のループ（#962）
+const EXIT_WAIT_LOOP = `e=<名前>.exit; for i in $(seq 1 ${WAIT_LOOP_COUNT}); do [ -e "$e" ] && break; sleep ${WAIT_LOOP_SECONDS}; done; [ -e "$e" ] && echo "exit=$(cat "$e")" || echo "running: $(tail -n 1 <名前>.log)"`
+// Gradle を起動する直前の作業ツリーの木の hash を <名前>.tree に書くコマンド（#962）。本物の index は汚さず、追跡外のファイルも含む。
+// 孤児のログの結果を採るとき、起動のあとにコードが変わっていないかをこれで確かめる
+const TREE_RECORD = `t=$(mktemp -u); GIT_INDEX_FILE=$t git read-tree HEAD && GIT_INDEX_FILE=$t git add -A && GIT_INDEX_FILE=$t git write-tree > <名前>.tree; rm -f $t`
+
 // Gradle を動かす段階に共通の決まり（#855）。ログは worktree の外（.worktrees/.logs/issue-<n>/）に残し、片付けで消えないようにする。
 // GameTest の同時実行は Gradle の側（build-logic の kibicomputers.gametest-lock）で止めるので、ここでは待ち方だけを書く。
 // startupRetry は Gradle の起動の失敗（#958）を誰が回し直すか。'self' はエージェントが段階の中で 1 回だけ回し直す。
@@ -43,11 +60,12 @@ function gradleRules(number, stage, { startupRetry = 'self' } = {}) {
   const startup = `**Gradle の起動の失敗**（#958。タスクが 1 つも動く前に、Gradle がロックの競合通知に使う UDP ソケットを bind できなかったもの）は、次をすべて満たすときだけに当てる: 終了コードが 0 以外、ログに \`FileLockContentionHandler\` と \`BindException: Address already in use\` の両方がある、見出しが \`Gradle could not start your build\` か \`Unable to start the daemon process\`（デーモンの起動の形。\`Could not parse daemon handshake response\` の下に同じ原因が出る）、ログに \`> Task :\` の行も \`BUILD FAILED in\` の行もない。タスクの中（テストや開発用の HTTP サーバーなど）の \`BindException\` は本物の失敗で、これに当たらない。`
   const startupRule = startupRetry === 'script'
     ? `- ${startup}この段階では、起動の失敗は**自分で回し直さず**、\`gradleStartupFailed=true\` で返す（回し直すかどうかはスクリプトが決める）。理由にはログの名前を書く。`
-    : `- ${startup}これも同じ内容で 1 回だけ回し直す。すぐ回すとまた落ちやすい（6 秒後・14 秒後の回し直しが続けて落ちた実例がある）ので、落ちた回の \`.exit\` の最終更新から 90 秒以上置いてから、新しい連番で起動する。前景の \`sleep\` は使えないので、Monitor で待つ（例: \`until [ $(( $(date +%s) - $(stat -c %Y <落ちた回の名前>.exit) )) -ge 90 ]; do sleep 5; done\`）。\`./gradlew --stop\` もプロセスの kill も OS の設定の変更もしない。2 回目も起動の失敗なら、それ以上は回さず、「Gradle の起動の失敗（BindException）が 2 回続いた」と理由に書いて、ビルドの失敗として返す。依存の取得の失敗とは別に数える（コマンドごとに、それぞれ 1 回まで）。`
+    : `- ${startup}これも同じ内容で 1 回だけ回し直す。すぐ回すとまた落ちやすい（6 秒後・14 秒後の回し直しが続けて落ちた実例がある）ので、落ちた回の \`.exit\` の最終更新から 90 秒以上置いてから、新しい連番で起動する。置く間は、前景の Bash で待つ（例: \`f=<落ちた回の名前>.exit; until [ $(( $(date +%s) - $(stat -c %Y "$f") )) -ge 90 ]; do sleep 5; done\`。Monitor は使わず、ターンも終えない）。\`./gradlew --stop\` もプロセスの kill も OS の設定の変更もしない。2 回目も起動の失敗なら、それ以上は回さず、「Gradle の起動の失敗（BindException）が 2 回続いた」と理由に書いて、ビルドの失敗として返す。依存の取得の失敗とは別に数える（コマンドごとに、それぞれ 1 回まで）。`
   return `Gradle（\`./gradlew\`）の動かし方（#855。必ず守る）:
 - \`./gradlew\` は Bash の \`run_in_background\` で起動する。出力はリポジトリのルートの \`${logs}/\`（worktree の外）に \`${stage}-<内容>-<連番>.log\` として書き、終わったら終了コードを同じ名前の \`.exit\` に書く。
-- **ログの名前は、毎回まだ使っていないものにする（例の \`-1\` をそのまま使わない）。** 同じ Issue の中では段階の名前が重なる（CI の直しや衝突の取り込みは呼ばれるたびに同じ名前で、確かめのあとの再実装や resume でも同じ段階をもう一度通る）。前の回の \`.exit\` が残っている名前を使うと、「\`.exit\` ができるまで待つ」が動いている最中にすぐ満たされ、古い終了コードを読んでしまう。起動の前に前景で、\`.log\`・\`.exit\` のどちらもない連番を選ぶ: \`d=<ルート>/${logs}; mkdir -p $d; n=1; while [ -e $d/${stage}-build-$n.log ] || [ -e $d/${stage}-build-$n.exit ]; do n=$((n+1)); done; echo $d/${stage}-build-$n\`。出た名前で起動する: \`cd <worktree> && (./gradlew build --console=plain > <名前>.log 2>&1; echo $? > <名前>.exit)\`
-- \`.exit\` ができるまで、Monitor などで待つ（前景の \`sleep\` は使えない）。**Gradle が終わって終了コードを読むまで、この段階を終えて返さない。** バックグラウンドで動かしたまま返さない。
+- **ログの名前は、毎回まだ使っていないものにする（例の \`-1\` をそのまま使わない）。** 同じ Issue の中では段階の名前が重なる（CI の直しや衝突の取り込みは呼ばれるたびに同じ名前で、確かめのあとの再実装や resume でも同じ段階をもう一度通る）。前の回の \`.exit\` が残っている名前を使うと、「\`.exit\` ができるまで待つ」が動いている最中にすぐ満たされ、古い終了コードを読んでしまう。起動の前に前景で、\`.log\`・\`.exit\`・\`.tree\` のどれもない連番を選ぶ: \`d=<ルート>/${logs}; mkdir -p $d; n=1; while [ -e $d/${stage}-build-$n.log ] || [ -e $d/${stage}-build-$n.exit ] || [ -e $d/${stage}-build-$n.tree ]; do n=$((n+1)); done; echo $d/${stage}-build-$n\`。起動の直前に、worktree の中で前景で、作業ツリーの木の hash を \`<名前>.tree\` に書く（#962。孤児のログの結果を採るときに使う）: \`cd <worktree> && ${TREE_RECORD}\`。出た名前で起動する: \`cd <worktree> && (./gradlew build --console=plain > <名前>.log 2>&1; echo $? > <名前>.exit)\`。1 本のサブシェルに複数の \`./gradlew\` をつながない（返す羽目になったとき、後ろは起動しないまま残る）。
+- **\`./gradlew\` は 10 分では終わらない。** \`build\` は 20〜25 分、\`-Pkibi.stackHeadroom\` の JVM は 45 分前後、GameTest はロックの待ちを含めると 90 分を超えることがある。\`--console=plain\` は \`> Task :core:test\` を出したあと 20 分ほど何も書かないことがあるが、止まってはいない。
+- \`.exit\` ができるまで待つ。${WAIT_HOW}\`.exit\` を待つループの例: \`${EXIT_WAIT_LOOP}\`。**Gradle が終わって終了コードを読むまで、この段階を終えて返さない。** バックグラウンドで動かしたまま返さない。\`.exit\` は自分で書かない（シェルが書いたものだけを終了コードとして読む）。起動から ${GRADLE_WAIT_LIMIT_MINUTES} 分たっても \`.exit\` がなく、worktree のパスを含む java が生きているときだけ、待つのをやめて下の \`gradleStillRunning=true\` で返してよい。
 - GameTest（\`runGameTestServer\`・\`runJarGameTestServer\`・\`runLoadTestServer\`）は、マシンの中で同時に 1 本だけ動く（Gradle がユーザーホームの \`kibicomputers/locks/gametest.lock\` を取る）。ほかが動いていれば「Waiting for the GameTest lock ... Held by: ...」を 30 秒ごとに出して待つので、止めずに待つ。待ちの時間は失敗ではない。
 - GameTest が落ちたら、\`<worktree>/platform-*/run/logs/latest.log\` を \`${logs}/${stage}-<内容>-<連番>-<バージョン>-latest.log\` に写す（worktree を片付けても調べられるように）。
 - \`./gradlew --stop\` は使わない（デーモンはほかの worktree と共有しているので、そちらのビルドまで止まる）。
@@ -90,8 +108,14 @@ const GRADLE_FAILURE_EVIDENCE = /Held by|Waiting for the GameTest lock|ロック
 // ほかの worktree のタスクが実行中だと別の一文で添えた回）。依存の取得の失敗（1 回目の失敗の記述）は当たらないよう、ロックに限る
 const GRADLE_LOCK_LIMIT_EVIDENCE = /Held by|Waiting for the GameTest lock|ロックの待ち|ロックを待/i
 
+// 孤児のログの結果を採った一文（#962。gradleWaitNote の手順 3 が決めた言い回し）。その孤児は終わっているので、
+// 同じ一文に「.exit がない」などが入っていても未完了の手がかりとは見ない（ほかの一文は今までどおり見る）
+const ORPHAN_ADOPTED = /孤児のログ[^。\n]*を採った/
+
 // 理由の文が、Gradle がまだ終わっていないことを示すか（#904）
 function textSaysGradleUnfinished(text) {
+  if (!text) return false
+  text = text.split(/(?<=[。\n])/).filter(s => !ORPHAN_ADOPTED.test(s)).join('')
   if (!text) return false
   if (GRADLE_UNFINISHED_STRONG.test(text)) return true
   if (GRADLE_LOCK_LIMIT_EVIDENCE.test(text)) return false
@@ -115,15 +139,17 @@ function worktreeJavaQuery(number) {
 
 // Gradle を待たずに返した段階を、もう 1 回だけ呼ぶときに付ける指示（#904）。
 // 返したときにバックグラウンドのシェルが止まり、前の回の .exit は二度とできないことがある（Gradle の java だけが孤児として最後まで走る）。
-// なので前の回の .exit は待たせず、孤児の Gradle が終わるのを待ってから、新しい連番で起動させる
-const ORPHAN_WAIT_MINUTES = 30
+// なので前の回の .exit は待たせず、孤児の Gradle が終わるのを待つ。終わった孤児のログは、条件を満たせばその結果を採る（#962）。
+// 待ちの上限は、build の残り（最大 25 分）と -Pkibi.stackHeadroom の JVM（45 分前後）を収める長さにする（30 分では足りなかった）
+const ORPHAN_WAIT_MINUTES = 60
 // 同じ worktree で前の回の Gradle（孤児）が終わるのを待つ手順（#904・#961）。gradleWaitNote の手順 2 と、
 // マージの段階の CI の回し直し（merge-rerun）の前置きの両方で使う
 function orphanWaitSteps(number, worktree) {
   const logs = `.worktrees/.logs/issue-${number}`
-  return `自分の \`./gradlew\` を起動する前に、前の回の Gradle が終わるのを最大 ${ORPHAN_WAIT_MINUTES} 分、Monitor などで待つ（前景の \`sleep\` は使えない）。終わったとみなすのは、次のどちらも満たすとき:
+  return `自分の \`./gradlew\` を起動する前に、前の回の Gradle が終わるのを最大 ${ORPHAN_WAIT_MINUTES} 分待つ。終わったとみなすのは、次のどちらも満たすとき（主に見るのは java のプロセス。\`--console=plain\` は 20 分ほど何も書かないことがあるので、ログの最終更新だけで決めない）:
    - コマンドラインに worktree のパス（${worktree ?? `.worktrees/issue-${number}`}）を含む java のプロセスがない（PowerShell の \`${worktreeJavaQuery(number)}\`）。
    - \`${logs}/\` の \`.exit\` のないログ（\`-latest.log\` で終わるものは除く）が、どれも最終更新から ${STALE_LOG_MINUTES} 分以上たっている（\`date +%s\` と \`stat -c %Y <ログ>\` で測る）。
+   待ち方: ${WAIT_HOW}java の有無は、前景の PowerShell（\`timeout: 600000\`）のループで確かめてよい（例: \`$q = { ${worktreeJavaQuery(number)} }; $end = (Get-Date).AddSeconds(${WAIT_LOOP_COUNT * WAIT_LOOP_SECONDS}); while ((Get-Date) -lt $end -and (& $q)) { Start-Sleep ${WAIT_LOOP_SECONDS} }; if (& $q) { 'running' } else { 'gone' }\`）。
    プロセスは殺さない。\`./gradlew --stop\` も使わない。同じ worktree で Gradle を 2 本動かすと、\`.gradle\` のロックや \`build/\`・\`run/\` の出力、GameTest のロックを取り合う。${ORPHAN_WAIT_MINUTES} 分たっても終わらなければ、自分の Gradle は起動せず、\`gradleStillRunning=true\` で返す。`
 }
 
@@ -131,7 +157,12 @@ function gradleWaitNote(number, worktree, pending) {
   return `**やり直し（#904）**: 前回のこの段階は、Gradle の終わり（\`.exit\`）を待たずに返した（動いていたログ: ${pending.logs.length ? pending.logs.join(', ') : '申告なし'}。前回の理由: ${pending.text || '-'}）。この段階を手順の最初からもう 1 回だけやり直す。次を守る:
 1. 前の回のログの \`.exit\` は待たない。返したときにバックグラウンドのシェルが止まるので、\`.exit\` は二度とできないことがある。
 2. ${orphanWaitSteps(number, worktree)}
-3. 前の回のログに結果（BUILD SUCCESSFUL など）が出ていても、それは参考にとどめる。新しい連番（\`.log\`・\`.exit\` のどちらもない名前）で、この段階の手順どおりに起動し直し、その \`.exit\` を読むまで返さない。
+3. 孤児のログ（前の回に起動して \`.exit\` を残さずに終わったもの）の扱い（#962）。前の回に起動したログの 1 本ずつについて決める:
+   - **成功を採ってよい**のは、次の 3 つをすべて満たすとき: (a) 手順 2 で、worktree のパスを含む java のプロセスがない、(b) ログの末尾 20 行に \`^BUILD SUCCESSFUL in \` の行がある、(c) 同じ名前の \`<名前>.tree\` があり、その中身が今の作業ツリーの木の hash（worktree の中で \`${TREE_RECORD.replace(' > <名前>.tree', '')}\` が出す値）と一致する。このときは、そのコマンドを新しい連番で回し直さず、そのログの結果をこの段階の結果として採る。
+   - 末尾に \`BUILD FAILED\` がある孤児（(a) と (c) を満たすもの）は、非 0 の \`.exit\` を読んだのと同じに扱う（本物の失敗なら直す。依存の取得の失敗や起動の失敗なら、それを 1 回目と数えて、決まりどおり新しい連番で 1 回だけ回し直す）。
+   - 末尾に BUILD の行がない、\`<名前>.tree\` がない（この決まりより前のログ）、hash が違う（起動のあとにコードが変わった）、のどれかなら、結果は採らず、新しい連番（\`.log\`・\`.exit\`・\`.tree\` のどれもない名前）で、この段階の手順どおりに起動し直し、その \`.exit\` を読むまで返さない。
+   - \`runningLogs\` にあって \`.log\` がないもの（1 本のシェルにつないだ後ろのコマンドなど）は、起動していないので、手順どおりに新しい連番で起動する。
+   - 採ったときは、\`.exit\` は書かない（\`.exit\` はシェルが書いたものだけにする）。代わりに \`<名前>.orphan\` に、採った結果と理由（例: \`BUILD SUCCESSFUL; no java; tree matches\`）を書く。summary・理由の文には「孤児のログ <名前> を採った（BUILD SUCCESSFUL）」の形で書き、同じ一文に「\`.exit\` がない」「終了コードを読めていない」とは書かない。採った分は Gradle が終わっているので、\`gradleStillRunning=false\` でよい。
 4. 前の回の作業の続き（コミット済みで push していない取り込みや修正）は、そのまま使う（reset・force push はしない）。\`git merge origin/main\` をもう一度実行して「Already up to date」になっても問題ない。
 5. 今回も Gradle を待たずに返すことになったら、\`gradleStillRunning=true\` で返す（このスクリプトはもうやり直さない。この段階は「確かめられなかった」失敗として扱われ、先へ進まずに止まって人に上がる。PR（まだなければ Issue）に確認のコメントと \`needs-human\` が付く）。`
 }
@@ -971,7 +1002,7 @@ async function mergeWithRetries(info, impl) {
     const logs = `.worktrees/.logs/issue-${info.number}`
     log(`PR #${impl.pr}: マージの段階の ${first.failedStep} が Gradle の起動の失敗（BindException）で落ちた。${STARTUP_RETRY_DELAY_SECONDS} 秒以上置いてから 1 回だけやり直す`)
     const note = `**起動の失敗のやり直し（#958）**: 前回のマージの段階では、${first.failedStep === 'build' ? '`./gradlew build`' : 'GameTest'} の Gradle が起動の失敗（\`FileLockContentionHandler\` の \`BindException: Address already in use\`。タスクは 1 つも動いていない）で落ちた（理由: ${first.reason ?? '-'}。ログ: ${first.logPath ?? logs}）。次を守って、手順 1 からもう 1 回だけやり直す:
-1. 自分の \`./gradlew\` を起動する前に、\`${logs}/\` のうち最も新しい \`.exit\` の最終更新から ${STARTUP_RETRY_DELAY_SECONDS} 秒以上置く。前景の \`sleep\` は使えないので、Monitor で待つ（例: \`f=$(ls -t <ルート>/${logs}/*.exit | head -1); until [ $(( $(date +%s) - $(stat -c %Y "$f") )) -ge ${STARTUP_RETRY_DELAY_SECONDS} ]; do sleep 5; done\`）。\`./gradlew --stop\` もプロセスの kill もしない。
+1. 自分の \`./gradlew\` を起動する前に、\`${logs}/\` のうち最も新しい \`.exit\` の最終更新から ${STARTUP_RETRY_DELAY_SECONDS} 秒以上置く。置く間は、前景の Bash で待つ（Monitor は使わず、ターンも終えない。例: \`f=$(ls -t <ルート>/${logs}/*.exit | head -1); until [ $(( $(date +%s) - $(stat -c %Y "$f") )) -ge ${STARTUP_RETRY_DELAY_SECONDS} ]; do sleep 5; done\`）。\`./gradlew --stop\` もプロセスの kill もしない。
 2. 取り込みは「Already up to date」でよい。build も GameTest も、新しい連番で起動し直す。
 3. **今回も起動の失敗なら、回し直さずに gradleStartupFailed=true・status=needs_human で返す。**`
     const restartRun = await mergeOnce(info, impl, note, 'merge-restart')
@@ -1041,7 +1072,7 @@ function cleanupWorktree(info, impl) {
   const logs = `.worktrees/.logs/issue-${info.number}`
   return agent(
     `${REPO} の PR #${impl.pr} はマージ済み。worktree ${impl.worktree} を片付ける。リポジトリのルートで作業する。
-1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分、Monitor などで待つ（前景の \`sleep\` は使えない）:
+1. その worktree の Gradle と GameTest のサーバーが終わっているのを確かめる。最大 15 分待つ。${WAIT_HOW}終わったとみなすのは、次をすべて満たすとき:
    - \`${logs}/\` の \`.log\` のうち、\`-latest.log\` で終わらないものすべてに、同じ名前の \`.exit\` がある（Gradle が終わった）。
    - コマンドラインに worktree のパス（\`.worktrees/issue-${info.number}\`）を含む java のプロセスがない。番号が前方一致する別の worktree（例: issue-${info.number}0 や issue-${info.number}4）のものを数えないよう、番号の後ろに数字が続かないものだけを数える（PowerShell の \`${worktreeJavaQuery(info.number)}\`。\`/\`・\`\\\` のどちらの書き方でも当たる）。
    - ただし \`.exit\` のない \`.log\` でも、上の java のプロセスがなく、そのログの最終更新から ${STALE_LOG_MINUTES} 分以上たっていれば、終わった（ジョブが殺されて \`.exit\` を書けなかった）とみなす。最終更新との差は \`date +%s\` と \`stat -c %Y <ログ>\` で測る。そうみなしたログの名前は note に書く。
