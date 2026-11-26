@@ -846,7 +846,7 @@ class ComponentLoaderTest {
         val e = estimateOf(small)
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
-        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 172 万。実際の検証は CPU 0.5 秒ほど）
+        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 173 万。実際の検証は CPU 0.5 秒ほど）
         val large = composedComponent(k = 20, n = 20)
         val l = estimateOf(large)
         assertTrue(l.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${l.checkCount} × ${l.maxTypeWeight} = ${l.cost}（写し直し ${l.remapCost}）" }
@@ -878,10 +878,11 @@ class ComponentLoaderTest {
     }
 
     /** フィールド [fields] 個の record を [exports] 回 `(export "aN" (type (eq ..)))` するインスタンス型 `$it` */
-    private fun eqInstanceType(fields: Int, exports: Int): String {
+    private fun eqInstanceType(fields: Int, exports: Int, resource: Boolean = false): String {
         val record = (0 until fields).joinToString(" ") { """(field "f$it" u32)""" }
         val eqs = (0 until exports).joinToString(" ") { """(export "a$it" (type (eq ${'$'}rr)))""" }
-        return "(type ${'$'}it (instance (type ${'$'}rr (record $record)) $eqs))"
+        val res = if (resource) """(export "res" (type (sub resource)))""" else ""
+        return "(type ${'$'}it (instance (type ${'$'}rr (record $record)) $eqs $res))"
     }
 
     /** 入れ子のコンポーネントが、[eqInstanceType] を import する。その入れ子のコンポーネントを export するコンポーネントを [m] 回インスタンス化する */
@@ -952,6 +953,36 @@ class ComponentLoaderTest {
         val q = estimateOf(eq)
         assertTrue(q.remapCost >= 60L * 900 * 900 / 2) { "${q.remapCost}" }
         rejectedBeforeValidation(eq)
+    }
+
+    @Test
+    fun `resource を定義する型は、import・exportの宣言のたびに写し直しを数える`() {
+        // #751 のレビュー: wasmparser は resource を定義するインスタンス型を import するたび・型宣言の中で export するたびに、
+        // その型の export を新しい Remapping で全部写し直す。インスタンス化がなくても、宣言の数に比例して検証が膨らむ
+        // （フィールド 900 個 × export 900 個の型を 20 か所で宣言して CPU 約 3 秒）
+        val n = 20
+        val withResource = eqInstanceType(fields = 900, exports = 900, resource = true)
+        // (1) 入れ子のコンポーネントが、それぞれ import する
+        val nested = (0 until n).joinToString(" ") { "(component (alias outer 1 ${'$'}it (type ${'$'}t)) (import \"i\" (instance (type ${'$'}t))))" }
+        // (2) コンポーネント型の中で import する
+        val inComponentType = (0 until n).joinToString(" ") {
+            "(type (component (alias outer 1 ${'$'}it (type ${'$'}t)) (import \"i\" (instance (type ${'$'}t)))))"
+        }
+        // (3) インスタンス型の中で export する
+        val inInstanceType = (0 until n).joinToString(" ") {
+            "(type (instance (alias outer 1 ${'$'}it (type ${'$'}t)) (export \"i\" (instance (type ${'$'}t)))))"
+        }
+        for (body in listOf(nested, inComponentType, inInstanceType)) {
+            val bytes = wat("(component $withResource $body)")
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= n * 900L * 900 / 2) { "${e.remapCost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        // resource がなければ、wasmparser は宣言では写し直さない（見積もりは 0 のまま）
+        val plain = eqInstanceType(fields = 900, exports = 900)
+        val noResource = wat("(component $plain $nested)")
+        assertEquals(0L, estimateOf(noResource).remapCost)
     }
 
     @Test
@@ -1091,16 +1122,25 @@ class ComponentLoaderTest {
         rejectedBeforeValidation(bytes)
     }
 
-    @Test
-    fun `入れ子が深すぎる型は展開した大きさで数え、小さくならない`() {
-        // t0 は export 1 個のインスタンス型、t(k+1) は t(k) のインスタンスを export する、を 100 段（MAX_FLAT_DEPTH の 64 を超える）
-        val depth = 100
-        val types = StringBuilder("(type ${'$'}t0 (instance (type ${'$'}r (record (field \"f\" u32))) (export \"x\" (type (eq ${'$'}r)))))\n")
+    /**
+     * t0 は export 1 個のインスタンス型、t(k+1) は t(k) のインスタンスを export する、を [depth] 段。
+     * 一番下の t0 は、宣言を共有して 2 倍ずつ膨らむ record（[levels] 段。展開すると約 2^[levels] 倍、宣言は [levels] 個）を export する。
+     * 最後の型を export するコンポーネントを 10 回インスタンス化する
+     */
+    private fun deepInstanceTypes(depth: Int, levels: Int): ByteArray {
+        val types = StringBuilder()
+        if (levels > 0) {
+            types.append("(type ${'$'}r0 (record (field \"f\" u32)))\n")
+            for (k in 1..levels) types.append("(type ${'$'}r$k (record (field \"a\" ${'$'}r${k - 1}) (field \"b\" ${'$'}r${k - 1})))\n")
+            types.append("(type ${'$'}t0 (instance (alias outer 1 ${'$'}r$levels (type ${'$'}r)) (export \"x\" (type (eq ${'$'}r)))))\n")
+        } else {
+            types.append("(type ${'$'}t0 (instance (type ${'$'}r (record (field \"f\" u32))) (export \"x\" (type (eq ${'$'}r)))))\n")
+        }
         for (k in 1..depth) {
             types.append("(type ${'$'}t$k (instance (alias outer 1 ${'$'}t${k - 1} (type ${'$'}p)) (export \"x\" (instance (type ${'$'}p)))))\n")
         }
         val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
-        val bytes = wat(
+        return wat(
             """
             (component
               $types
@@ -1109,11 +1149,30 @@ class ComponentLoaderTest {
             )
             """,
         )
-        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+    }
+
+    @Test
+    fun `入れ子が深すぎる型は展開した大きさで数え、小さくならない`() {
+        // 宣言を共有しない形（100 段。MAX_FLAT_DEPTH の 64 を超える）。写し直しの大きさは 1 回あたり 206（段ごとに宣言があり、
+        // 打ち切りの先も 0 にはならない）。打ち切りが 0 を返すと 1 回あたり約 130 に下がる
+        val root = ComponentParser.parse(deepInstanceTypes(depth = 100, levels = 0), ComponentLimits.DEFAULT, null)
         val e = ComponentValidationCost.estimate(root)
-        // 段ごとに宣言があるので、深さで打ち切っても、1 回あたり段数以上は数える
-        assertTrue(e.remapCost >= 10L * depth) { "${e.remapCost}" }
+        assertEquals(10L * 206, e.remapCost)
         assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+    }
+
+    @Test
+    fun `入れ子が深すぎると、たどった値ではなく展開した大きさに切り替える`() {
+        // 宣言を共有して 2 倍ずつ膨らむ record（17 段。宣言は 18 個、展開すると約 26 万）を一番下に持つ
+        // 浅い（10 段）うちは、たどった値（宣言の数ほど）。展開した大きさにはならない
+        val shallow = ComponentValidationCost.estimate(ComponentParser.parse(deepInstanceTypes(depth = 10, levels = 17), ComponentLimits.DEFAULT, null))
+        assertTrue(shallow.remapCost < 10L * 1_000) { "${shallow.remapCost}" }
+        // 深い（100 段。64 を超えるところから展開した大きさ）と、1 回あたり展開した大きさ（約 26 万）以上になる
+        val deepRoot = ComponentParser.parse(deepInstanceTypes(depth = 100, levels = 17), ComponentLimits.DEFAULT, null)
+        val deep = ComponentValidationCost.estimate(deepRoot)
+        assertTrue(deep.remapCost >= 10L * 200_000) { "${deep.remapCost}" }
+        val rejected = assertThrows<WasmLoadException> { ComponentValidationCost.check(deepRoot, ComponentLimits.DEFAULT) }
+        assertMessage(rejected, "検証が重すぎる")
     }
 
     @Test

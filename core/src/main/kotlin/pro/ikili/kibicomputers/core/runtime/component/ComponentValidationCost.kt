@@ -34,7 +34,9 @@ import java.util.IdentityHashMap
  *   import・export からたどれる、違う型の宣言の大きさ（[Info.local]）の合計で数える（#751）。wasmparser が型を新しく作り直す
  *   ところ（import・export したインスタンス・コンポーネント・型（`(type (eq ..))` を含む。型宣言の中のものも）、
  *   インスタンス化、インスタンスの export の alias）は、同じ宣言から来ても別の型として数える（[Info.content]。
- *   重なりを除かないので、実際より小さくならない）。展開した大きさは超えない
+ *   重なりを除かないので、実際より小さくならない）。展開した大きさは超えない。
+ *   resource を定義するインスタンス型・コンポーネント型は、import・export の宣言のたびにも（インスタンス化とは別に）その型の
+ *   export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、宣言ごとに 1 回数える
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * ほかの形の膨らみは、#666 で探して見つからなかった（core のインスタンス化の引数、resource と canon。入力の大きさに比例するだけ。
@@ -96,6 +98,8 @@ internal object ComponentValidationCost {
         val remapBound: Long = size,
         /** コンポーネントだけ: インスタンス化でできるインスタンスの型（export だけ。import は引数で置き換わる） */
         val instanceView: Info? = null,
+        /** resource を定義する宣言を含むか（`(sub resource)` を export・import するインスタンス型・コンポーネント型など） */
+        val res: Boolean = false,
     ) {
         /** 写し直しの大きさ（まだなら -1） */
         var flat = -1L
@@ -178,7 +182,7 @@ internal object ComponentValidationCost {
 
         /** wasmparser が [info] を写して新しく作る型（コンポーネントは、インスタンス化でできるインスタンスの型も引き継ぐ） */
         private fun copied(info: Info?): Info? = info?.let {
-            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView)
+            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView, res = it.res)
         }
 
         /**
@@ -243,7 +247,7 @@ internal object ComponentValidationCost {
                                 // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）。
                                 // export だけの型を引けないコンポーネントは、import も含めた型にする（大きい側）
                                 val view = target?.let { it.instanceView ?: it.content ?: it }
-                                view?.let { Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound) }
+                                view?.let { Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, res = it.res) }
                             }
                             is InstanceExpr.FromExports -> fromExports(s, item.exports)
                         }
@@ -279,8 +283,9 @@ internal object ComponentValidationCost {
                     -> Unit
                 }
             }
-            val view = Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs)
-            return Info(size, exports, local = 1L + refs.size, refs = refs, instanceView = view)
+            val res = refs.any { it.res }
+            val view = Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, res = exportRefs.any { it.res })
+            return Info(size, exports, local = 1L + refs.size, refs = refs, instanceView = view, res = res)
         }
 
         private fun fromExports(s: Scope, items: List<Pair<String, SortIdx>>): Info {
@@ -293,7 +298,7 @@ internal object ComponentValidationCost {
                 refs += info ?: unknown()
                 size = sum(size, 1 + sizeOf(info))
             }
-            return Info(size, exports, local = 1L + refs.size, refs = refs)
+            return Info(size, exports, local = 1L + refs.size, refs = refs, res = refs.any { it.res })
         }
 
         private fun alias(s: Scope, a: Alias) {
@@ -314,16 +319,23 @@ internal object ComponentValidationCost {
             return info
         }
 
+        /**
+         * import・export の宣言で、インスタンス型・コンポーネント型 [type] を写して作る。resource を定義する型は、wasmparser が
+         * 宣言のたびにその型の export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、
+         * その分を数える（型宣言の中の宣言も、コンポーネントのインスタンス化とは別に 1 回ずつ。resource がなければ写し直さない）
+         */
+        private fun declared(type: Info?): Info? = copied(type)?.also { if (it.res) remap(it) }
+
         /** 記述 [desc] の型の情報（添字空間には足さない） */
         private fun descInfo(s: Scope, desc: ExternDesc): Info =
             when (desc) {
                 // `(sub resource)` は新しい resource（大きさ 1）。`(eq $t)` は、wasmparser が別の型の id を作る（同じ型を何度 eq で
                 // import・export しても、別々に写し直す）ので、同じ型への参照ではなく写して作った別の型として数える
-                is ExternDesc.Type -> if (desc.eqTypeIndex == null) Info(1) else copied(s.types.getOrNull(desc.eqTypeIndex))
+                is ExternDesc.Type -> if (desc.eqTypeIndex == null) Info(1, res = true) else copied(s.types.getOrNull(desc.eqTypeIndex))
                 is ExternDesc.Func -> s.types.getOrNull(desc.typeIndex)
                 // インスタンス・コンポーネントは、import・export するときに型を写して新しく作る
-                is ExternDesc.Instance -> copied(s.types.getOrNull(desc.typeIndex))
-                is ExternDesc.Component -> copied(s.types.getOrNull(desc.typeIndex))
+                is ExternDesc.Instance -> declared(s.types.getOrNull(desc.typeIndex))
+                is ExternDesc.Component -> declared(s.types.getOrNull(desc.typeIndex))
                 is ExternDesc.Module -> s.coreTypes.getOrNull(desc.coreTypeIndex)
             } ?: unknown()
 
@@ -358,8 +370,12 @@ internal object ComponentValidationCost {
                     }
                 }
             }
-            val view = if (component) Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs) else null
-            return Info(note(size), exports, local = 1L + refs.size, refs = refs, instanceView = view)
+            val view = if (component) {
+                Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, res = exportRefs.any { it.res })
+            } else {
+                null
+            }
+            return Info(note(size), exports, local = 1L + refs.size, refs = refs, instanceView = view, res = refs.any { it.res })
         }
 
         private fun defType(def: DefType, s: Scope): Info = when (def) {
