@@ -593,12 +593,31 @@ class ComponentStackExhaustionLockTest {
             fun findWindow(): Triple<Int, Int, Int> {
                 // 両方の通りが同じ詰め物のときの境目（[edgeSweep] の境目）
                 val edge = search(-1) { run(it, 0) != null }
-                val start = maxOf(0, edge - REWIND_START_MARGIN)
-                // 1 回目の通りで尽きた回（境目は回ごとに数段揺れる）は、巻き直しの通りが尽きたことにしない
-                val kA = search(-1) { run(start, it).let { tag -> tag != null && tag != "最初の通り" } }
-                val kB = search(kA) { run(start, it) == "巻き直しの前" }
-                windows += "境目 $edge、1 回目 $start、kA $kA、kB $kB"
-                return Triple(start, kA, kB)
+                // 境目は回ごとに揺れ、探している間に JIT でフレームが大きく戻ると、境目の手前のつもりの 1 回目の通りが尽きる
+                // （どれだけ足しても「最初の通り」で、kA が見つからない）。そのときは 1 回目の詰め物を倍々で手前に下げて探し直す
+                var margin = REWIND_START_MARGIN
+                while (true) {
+                    val start = maxOf(0, edge - margin)
+                    // 1 回目の通りで尽きる詰め物では、巻き直しの通りまで届かない。足さなくても 1 回目の通りで尽きるなら下げる
+                    if (start > 0 && run(start, 0) == "最初の通り") {
+                        margin *= 2
+                        continue
+                    }
+                    // 1 回目の通りで尽きた回は、巻き直しの通りが尽きたことにしない
+                    var firstPassCrashed = false
+                    val kA = search(-1) {
+                        val tag = run(start, it)
+                        if (tag == "最初の通り") firstPassCrashed = true
+                        tag != null && tag != "最初の通り"
+                    }
+                    if (firstPassCrashed && start > 0) {
+                        margin *= 2
+                        continue
+                    }
+                    val kB = search(kA) { run(start, it) == "巻き直しの前" }
+                    windows += "境目 $edge、1 回目 $start、kA $kA、kB $kB"
+                    return Triple(start, kA, kB)
+                }
             }
 
             val count = stackHeadroomRounds(rounds)
