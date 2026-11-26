@@ -1,4 +1,5 @@
-// issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）の検査。
+// issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）、マージの段階の Gradle の起動の失敗のやり直し（#958）、
+// マージの段階の push の後の CI の、不安定なテストの回し直し（#961）の検査。
 // 偽の agent でスクリプト全体を流し、どの段階が何回呼ばれたか、最後の結果がどうなるかを見る。
 // 実行: node --test .claude/workflow-tests/
 import { test } from 'node:test'
@@ -463,4 +464,155 @@ test('過負荷の回し直しが未完了で、merge-retry-wait でマージで
 test('待つやり直しを通らなかったやり直しの回は、理由に待つやり直しを書かない', async () => {
   const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] })
   assert.doesNotMatch(r.issue.mergeReason, /それも 1 回だけやり直した/)
+})
+
+// ---- マージの段階の push の後の CI の、不安定なテストの回し直し（#961） ----
+
+const CI_FAIL = fail('ci', '先頭のコミットの CI が落ちた（sendableButUnsentChunkIsNotWatched）')
+const FLAKY = { outcome: 'rerun', runId: '123', headSha: 'abc', issue: 934, summary: '#934 に記録して回し直した', gradleStillRunning: false, runningLogs: [] }
+const NOT_FLAKY = { ...FLAKY, outcome: 'not_flaky', runId: null, issue: null, summary: 'PR の変更が原因' }
+
+test('push の後の CI が不安定なテストで落ちたら、merge-flaky で回し直し、merge-rerun でマージまで進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 1)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.equal(r.count('merge-flaky-wait'), 0)
+  assert.match(r.issue.mergeReason, /不安定なテスト（#934）/)
+  assert.match(r.issue.mergeReason, /run 123/)
+  assert.equal(r.count('cross-check'), 0)
+})
+
+test('回し直しのあとも CI が落ちたら、もう回し直さずに止まって人に上がる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('ci', '2 回目も落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.ok(r.issue.question)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /回し直しのあとの理由: 2 回目も落ちた/)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+})
+
+for (const [name, f] of [['not_flaky', NOT_FLAKY], ['結果なし', null]]) {
+  test(`確かめが ${name} なら、merge-rerun を呼ばずに止まる`, async () => {
+    const r = await run({ merge: [CI_FAIL], 'merge-flaky': [f] })
+    assert.notEqual(r.issue.status, 'merged')
+    assert.equal(r.count('merge-flaky'), 1)
+    assert.equal(r.count('merge-rerun'), 0)
+    assert.match(r.issue.mergeReason, /回し直していない/)
+  })
+}
+
+test('CI がまだ終わっていなかった（pending）なら、merge-rerun で待ち直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, outcome: 'pending', issue: null }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /まだ終わっていなかった/)
+  assert.doesNotMatch(r.promptOf('merge-rerun'), /不安定なテスト（Issue/)
+})
+
+for (const [name, m] of [
+  ['build', fail('build', ':core:test が落ちた')],
+  ['conflict', fail('conflict', '字面で解けない')],
+  ['merge', fail('merge', 'base branch policy')],
+  ['過負荷でない gametest', fail('gametest', '1 required tests failed', { gameTestFailedOnly: true })],
+]) {
+  test(`failedStep=${name} なら merge-flaky を呼ばない`, async () => {
+    const r = await run({ merge: [m] })
+    assert.equal(r.count('merge-flaky'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+  })
+}
+
+test('確かめが rerun で gradleStillRunning=true なら、merge-flaky-wait はせず、merge-rerun の指示に孤児の待ちが入る', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, ...PENDING }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky-wait'), 0)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.promptOf('merge-rerun'), /確かめの段階が残した Gradle を待つ/)
+  assert.match(r.promptOf('merge-rerun'), /Win32_Process/)
+})
+
+test('確かめが not_flaky で gradleStillRunning=true なら、merge-flaky-wait で待ってやり直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...NOT_FLAKY, ...PENDING }], 'merge-flaky-wait': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.count('merge-flaky-wait'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('確かめが 2 回とも Gradle を待たずに返したら、回し直さずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...NOT_FLAKY, ...PENDING }], 'merge-flaky-wait': [{ ...NOT_FLAKY, ...PENDING }] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun'), 0)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('過負荷の回し直しのあとで CI が落ちたら、不安定なテストの回し直しに進み、理由に両方が残る', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-retry'), 1)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /過負荷/)
+  assert.match(r.issue.mergeReason, /不安定なテスト/)
+})
+
+test('起動の失敗のやり直しのあとで CI が落ちたら、不安定なテストの回し直しに進む', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('merge-rerun が Gradle を待たずに返したら、merge-rerun-wait で進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('build', 'y', PENDING)], 'merge-rerun-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun-wait'), 1)
+  assert.match(r.issue.mergeReason, /回し直しのあとのマージの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('merge-rerun が 2 回とも Gradle を待たずに返したら止まり、もう確かめに回さない', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('ci', 'y', PENDING)], 'merge-rerun-wait': [fail('ci', 'z', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('merge-rerun の中の起動の失敗や過負荷は、もう回し直さない', async () => {
+  for (const m of [fail('build', 'x', STARTUP), fail('gametest', 'x', OVERLOAD)]) {
+    const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [m] })
+    assert.notEqual(r.issue.status, 'merged')
+    assert.equal(r.count('merge-restart'), 0)
+    assert.equal(r.count('merge-retry'), 0)
+  }
+})
+
+test('マージの段階が failedStep=ci のまま 2 回 Gradle を待たずに返したら、確かめに回さない', async () => {
+  const r = await run({ merge: [fail('ci', 'a', PENDING)], 'merge-wait': [fail('ci', 'b', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 0)
+})
+
+test('プロンプト: 確かめは CI の直しと同じ条件の文を使ってコードを直さず、merge-rerun は自分で回し直さず手順 2 を飛ばせる', async () => {
+  const r = await run({ ci: [FAILED_CI, OK_CI], 'ci-fix': [{ pushed: false, rerun: true, summary: 'flaky' }], merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  const flaky = r.promptOf('merge-flaky')
+  const ciFix = r.promptOf('ci-fix')
+  const criteria = 'PR が触っていない所のテストで、手元で繰り返しても再現しない、main でも同じテストが落ちたことがある'
+  assert.ok(flaky.includes(criteria))
+  assert.ok(ciFix.includes(criteria))
+  for (const p of [flaky, ciFix]) {
+    assert.match(p, /gh run rerun <run-id> --failed/)
+    assert.match(p, /test-reports-attempt-<n>/)
+    assert.match(p, /サブ Issue/)
+  }
+  assert.match(flaky, /コードは直さず、コミットも push もしない/)
+  assert.match(r.promptOf('merge'), /CI は自分で回し直さない/)
+  assert.match(flaky, /merge-flaky-build-\$n/)
+  assert.match(flaky, /headRefOid/)
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /merge-rerun-build-\$n/)
+  assert.match(rerun, /自分では `gh run rerun` しない/)
+  assert.match(rerun, /abc のままなら、手順 2（build と GameTest）は飛ばしてよい/)
+  assert.doesNotMatch(rerun, /確かめの段階が残した Gradle を待つ/)
 })
