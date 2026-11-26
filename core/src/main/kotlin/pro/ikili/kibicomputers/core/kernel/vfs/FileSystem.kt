@@ -197,7 +197,15 @@ internal interface FileSystem {
      */
     fun retain(node: Long, writable: Boolean, reserved: Boolean = false) {}
 
-    /** [retain] した [node] を閉じた（最後の参照が外れた）。カーネルロックの外で呼ばれる（I/O をしてよい） */
+    /**
+     * [retain] した [node] を閉じた（最後の参照が外れた）。カーネルロックの外で呼ばれる（I/O をしてよい）。
+     *
+     * **投げるなら、何も変える前に投げる**（#901）。`Vfs.close` は、`release` が戻ってから開いたファイルの `retained` を落とすので、
+     * `release` が投げる（スタックが尽きる）と、呼び手が同じ [node] の `release` をもう 1 回呼ぶことがある。
+     * 参照の数を減らした後・ホストのファイルを閉じた後に投げると、呼び直しで共有しているハンドルの参照を二重に減らす。
+     * 途中の変更を戻せないなら、変える前に確かめる（`DiskFileSystem.release` は入口で `StackHeadroom.HOST_IO_FRAMES` 段を確かめる）。
+     * 呼び直しは、`retain` した 1 回分に対する 1 回の効果にならなければならない（投げた呼び出しは、`retain` を 1 つも外さなかったことにする）
+     */
     fun release(node: Long) {}
 
     /**

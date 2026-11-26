@@ -175,7 +175,11 @@ class StackExhaustionLockTest {
         /** [Body.DISK_IO] で、ディスクの本物の操作まで動かした回数（スタックの底に近いときだけ動かす。[nearStackEnd]） */
         val ops = AtomicInteger()
 
-        /** [DiskOp.CREATE_WRITE_CLOSE] で開いて、まだ閉じていないファイル（尽きて閉じ損ねたものを、回の後に閉じる） */
+        /**
+         * [DiskOp.CREATE_WRITE_CLOSE] で開いて、まだ閉じていないファイル（尽きて閉じ損ねたものを、回の後に閉じる）。
+         * `Vfs.close` で閉じるファイルは fd の表に入っていないので、本番ではプロセスの終わりにも閉じられない。閉じ直しは、
+         * `close` の途中で尽きても [OpenFile.retained] が真のまま残り、閉じ直せること（#901）も兼ねて確かめる
+         */
         val openFile = AtomicReference<OpenFile?>()
     }
 
@@ -463,8 +467,8 @@ class StackExhaustionLockTest {
                     awaitLockAcquirable(ticker, "ほかのロックが取れる（$where）", l) { "$l、${describe()}" }
                 }
                 if (body == Body.DISK_IO) {
-                    // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイルは、本番では fd の表がプロセスの終わりに閉じる。ここでは
-                    // 閉じてから、node の表・使用量・開いたままの枠がホストと合い、開いたままのホストのファイルが残っていないことを見る
+                    // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイル（fd の表に入れていないので、本番ではプロセスの終わりにも
+                    // 閉じられない）を閉じ直してから（`Vfs.close` の途中で尽きても閉じ直せる。#901）、node の表・使用量・開いたままの枠がホストと合い、開いたままのホストのファイルが残っていないことを見る
                     // （マシンのロック・リースのロックが取れるだけでは、「ホストの移動の後の付け替え」「ファイルを閉じた後の枠の返却」の
                     // 途中で尽きた食い違いを見つけられない。`DiskFileSystemStackExhaustionTest` が全位置を見る）
                     round.openFile.getAndSet(null)?.let { m.vfs.close(it) }

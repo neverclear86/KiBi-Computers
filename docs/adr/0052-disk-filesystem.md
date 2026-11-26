@@ -46,6 +46,7 @@
 
 - `FileSystem.tracksOpenFiles` の FS（ディスク）は、普通のファイルを開いたら `retain(node, writable)`、最後の参照が外れたら `release(node)` で知らされる。外した・止めた後は `retire()` でホストの資源を閉じる
 - 最後の参照が外れるのはカーネルロックの中（`ObjectTable.release` → `OpenFile.onLastClose` → `WakeSink.fileClosed`）なので、`Vfs.releaseLater` で積み、ロックの外で行う。マシンは積まれたら起動用のスレッドに1つだけ仕事を積み（`Machine.scheduleVfsDrain`）、FS に届く操作の始めでも行う
+- fd の表に入れない開いたファイルは `Vfs.close` で閉じる。`retained` は `release` が戻ってから落とし、途中でスタックが尽きても閉じ直せるようにする。開く側（`Vfs.open`）は、続く `close` の分のスタックを先に確かめる（#901。ADR 0043）
 - 復元した開いたファイル（`OpenFile.retained` は実行時だけの印で保存しない）は知らせないまま使う。FS は、開いていない node の操作もその都度開いて受け付ける
 
 ## ディスク FS（`DiskFileSystem`）
