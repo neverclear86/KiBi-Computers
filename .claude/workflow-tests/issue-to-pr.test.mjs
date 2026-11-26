@@ -647,3 +647,26 @@ test('プロンプト: 確かめは CI の直しと同じ条件の文を使っ�
   assert.match(rerun, /abc のままなら、手順 2（build と GameTest）は飛ばしてよい/)
   assert.doesNotMatch(rerun, /確かめの段階が残した Gradle を待つ/)
 })
+
+test('プロンプト: 確かめが headSha=null を返したら、merge-rerun は手順 2 を飛ばさずに全部回す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, headSha: null }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /手順 2（build と GameTest）は、手順どおり全部回す/)
+  assert.doesNotMatch(rerun, /は飛ばしてよい/)
+})
+
+test('プロンプト: 確かめが pending なら、merge-rerun は「回し直してはいない」と書き、先頭のコミットが同じときだけ手順 2 を飛ばす', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING], 'merge-rerun': [MERGED] })
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /CI がまだ終わっていなかったと判断した（run 123。回し直してはいない）/)
+  assert.doesNotMatch(rerun, /落ちたジョブを回し直した/)
+  assert.match(rerun, /先頭のコミット（`git rev-parse HEAD`）が abc のままなら、手順 2（build と GameTest）は飛ばしてよい/)
+  assert.match(rerun, /先頭のコミットが変わった（main を取り込んだ）なら、手順 2 から全部回す/)
+})
+
+test('確かめが runId を数値で返しても、そのまま merge-rerun に進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, runId: 123456 }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.match(r.promptOf('merge-rerun'), /run 123456 の落ちたジョブを回し直した/)
+})

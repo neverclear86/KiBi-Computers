@@ -400,7 +400,7 @@ const FLAKY_SCHEMA = withGradlePending({
   type: 'object',
   properties: {
     outcome: { type: 'string', enum: ['rerun', 'pending', 'not_flaky'], description: 'rerun: 不安定なテストと判断し、Issue に記録して落ちたジョブを回し直した。pending: 先頭のコミットの CI がまだ終わっていなかった（回し直していない）。not_flaky: PR の変更が原因か、原因が分からない、main と衝突している、回し直す run がない、など' },
-    runId: { type: ['string', 'null'], description: '回し直した（pending なら、待っている）run の ID。なければ null' },
+    runId: { type: ['string', 'integer', 'null'], description: '回し直した（pending なら、待っている）run の ID（`gh run list` の databaseId。数値のままでも文字列でもよい）。なければ null' },
     headSha: { type: ['string', 'null'], description: '`gh pr view --json headRefOid` の先頭のコミット' },
     issue: { type: ['integer', 'null'], description: 'outcome=rerun のとき、不安定なテストを記録した Issue の番号' },
     summary: { type: 'string' },
