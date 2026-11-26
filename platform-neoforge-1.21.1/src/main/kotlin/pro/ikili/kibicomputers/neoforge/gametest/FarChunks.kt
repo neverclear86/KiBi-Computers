@@ -81,6 +81,25 @@ internal object FarChunks {
     }
 
     /**
+     * [chunk] を中心に、まわり [radius] チャンクまでを同期の読み込みで FULL まで生成する（#934）。
+     *
+     * チャンクが送れる状態（ブロックが tick する段）になるには、まわり 1 チャンク（3×3）が FULL になっている必要がある。
+     * 新しいチャンクの生成はワーカーのスレッドで実時間かかり、GameTest のサーバーは tick の間で待たない（メインスレッドが空いているほど
+     * tick が速く進む）ので、生成を tick の数で待つと、遅いマシンでは `timeoutTicks` を使い切って落ちる（#934）。
+     * #871 と同じく、生成は上限なしに同期で待ち、tick の待ちはその後の昇格（メインスレッドの数 tick）だけにする。
+     *
+     * メインスレッドを止めるので、読む範囲は送れる状態に要る分（[radius] = 1）に絞る。[reserve] の「まだ読み込まれていない」の
+     * 確かめの後で、読み込みを保つチケット（プレイヤー・リージョン）を付けてから呼ぶ（`getChunk` の一時のチケットは 1 tick で外れるため）
+     */
+    fun generate(level: ServerLevel, chunk: ChunkPos, radius: Int = 1) {
+        for (dx in -radius..radius) {
+            for (dz in -radius..radius) {
+                level.getChunk(chunk.x + dx, chunk.z + dz)
+            }
+        }
+    }
+
+    /**
      * slot を1つ払い出し、強制読み込みにして読み込む。[keeper] なら、+x に [KEEPER_DISTANCE] 離れたチャンクも強制読み込みにする
      * （ケースのチャンクより先に付ける）。テストが終わったときに両方を外す
      */

@@ -4,9 +4,13 @@ import io.netty.buffer.Unpooled
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
+import net.minecraft.gametest.framework.GameTestInfo
+import net.minecraft.gametest.framework.GameTestListener
+import net.minecraft.gametest.framework.GameTestRunner
 import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ChunkTrackingView
 import net.minecraft.server.level.ClientInformation
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.server.level.TicketType
 import net.minecraft.world.entity.Entity
@@ -151,6 +155,52 @@ object ScreenSyncGameTests {
         helper.level.server.playerList.remove(player)
     }
 
+    /**
+     * テストが終わったとき（成功・失敗・タイムアウト）に [block] を走らせる（#934）。シーケンスの中の後始末は、途中の段で
+     * タイムアウトすると走らず、偽物のプレイヤー・チケット・止めた送信が残って、同じバッチのほかのテストを巻き込む
+     */
+    private fun whenTestEnds(helper: GameTestHelper, block: () -> Unit) {
+        helper.testInfo.addListener(
+            object : GameTestListener {
+                override fun testStructureLoaded(info: GameTestInfo) {}
+
+                override fun testPassed(info: GameTestInfo, runner: GameTestRunner) = block()
+
+                override fun testFailed(info: GameTestInfo, runner: GameTestRunner) = block()
+
+                override fun testAddedForRerun(old: GameTestInfo, new: GameTestInfo, runner: GameTestRunner) {}
+            },
+        )
+    }
+
+    /**
+     * 離れたチャンク [far] が送れる状態にならないときの、原因を絞るための様子（#934）。holder の段階、送れる状態か、
+     * プレイヤーの順番待ち・追跡の範囲、サーバーの視距離、待ち始めてからの tick 数と壁時計の時間
+     */
+    private fun farChunkState(
+        level: ServerLevel,
+        far: ChunkPos,
+        player: ServerPlayer?,
+        startTick: Int,
+        startNanos: Long,
+    ): String {
+        val map = level.chunkSource.chunkMap
+        val holder = map.getVisibleChunkIfPresent(far.toLong())
+        val parts = mutableListOf(
+            "holder=${if (holder == null) "none" else holder.latestStatus?.toString() ?: "unloaded"}",
+            "sendable=${map.getChunkToSend(far.toLong()) != null}",
+        )
+        if (player != null) {
+            parts += "pending=${player.connection.chunkSender.isPending(far.toLong())}"
+            parts += "tracked=${player.chunkTrackingView.contains(far)}"
+            parts += "view=${player.chunkTrackingView}"
+        }
+        parts += "serverViewDistance=${level.server.playerList.viewDistance}"
+        parts += "ticks=${level.server.tickCount - startTick}"
+        parts += "ms=${(System.nanoTime() - startNanos) / 1_000_000}"
+        return parts.joinToString(", ")
+    }
+
     /** 近くにいるとサーバーが見ている人に入れてキーフレームを送り、以後の描画も届く。遠ざかると止まる。 */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY)
@@ -195,9 +245,14 @@ object ScreenSyncGameTests {
             .thenSucceed()
     }
 
-    /** 見はじめる距離とやめる距離の間では、見ていなければ見はじめず、見ていればやめない。遠い画面は送らない。 */
+    /**
+     * 見はじめる距離とやめる距離の間では、見ていなければ見はじめず、見ていればやめない。遠い画面は送らない。
+     *
+     * サーバーの視距離を広げると、同じバッチのすべての偽物のプレイヤーのチケットが広がり、チャンクの生成が詰まって
+     * ほかのテストの待ちを延ばす（#934）。別のバッチで動かし、視距離はテストが終わったとき（失敗・タイムアウトでも）に戻す。
+     */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200)
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 200, batch = "screen_sync_view_distance")
     fun farScreenIsNotSentAndWatchingHasHysteresis(helper: GameTestHelper) {
         helper.setBlock(POS, KiBiBlocks.SCREENS.getValue(ScreenTier.COLOR).get())
         val be = helper.getBlockEntity<ScreenBlockEntity>(POS)
@@ -205,6 +260,7 @@ object ScreenSyncGameTests {
         // GameTest のサーバーと偽物のプレイヤーは追跡するチャンクの範囲が狭い（2 チャンク）ので、見はじめる距離まで広げる
         val viewDistance = helper.level.server.playerList.viewDistance
         helper.level.chunkSource.setViewDistance(8)
+        whenTestEnds(helper) { helper.level.chunkSource.setViewDistance(viewDistance) }
         val between = (START + STOP) / 2
         val (player, client) = watcherAt(helper, ScreenTier.COLOR, between, viewDistance = 8)
         val scan = ScreenWatchers.DEFAULT_SCAN_INTERVAL_TICKS + 2
@@ -237,7 +293,6 @@ object ScreenSyncGameTests {
                 helper.assertTrue(!be.isWatchedBy(player), "the player should stop watching beyond the stop distance")
                 helper.assertTrue(client.keyframes == 1, "moving around should not resend the whole screen")
                 cleanUp(helper, player)
-                helper.level.chunkSource.setViewDistance(viewDistance)
             }
             .thenSucceed()
     }
@@ -592,11 +647,20 @@ object ScreenSyncGameTests {
         TicketType.create("kibicomputers_screen_send_test", Comparator.comparingLong(ChunkPos::toLong))
 
     /**
+     * [SEND_TEST_TICKET] の距離。段階は 33 − 距離なので、1 で中心がブロックの tick する段（32。送れる状態）になり、FULL になるのは
+     * まわりの 3×3 だけで済む（2 だと 5×5 を生成する）
+     */
+    private const val SEND_TEST_TICKET_DISTANCE = 1
+
+    /**
      * 届いた後のチャンクに、送る前の待ち（`ChunkMap.waitForLightBeforeSending` と同じ `addSendDependency`）が付いて
      * いま送れない状態（`getChunkToSend` が null）になっても、送った事実は変わらないので、見ている人から外れず、描画も届く（#655 のずれ1）。
      *
      * 待ちを、ほかのテストのプレイヤーが追跡しはじめるチャンクに付けると、その人には待ちが終わっても送られなくなる。
      * だれも使わない離れたチャンク（[FarChunks]）に付け、失敗しても必ず外す。
+     *
+     * 新しいチャンクの生成は実時間かかるので、tick の上限の中で待たず、先に同期で生成しておく（[FarChunks.generate]、#934）。
+     * 後始末は、タイムアウトのときも走るように、テストが終わったときに走らせる。
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
@@ -616,6 +680,7 @@ object ScreenSyncGameTests {
         var screen: ScreenBlockEntity? = null
         var sent = 0
         var cleaned = false
+        // 何度呼んでもよい（成功の段と、テストが終わったときの両方から呼ぶ）
         fun cleanUpAll() {
             if (cleaned) return
             cleaned = true
@@ -623,21 +688,18 @@ object ScreenSyncGameTests {
             if (screen != null) level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
             cleanUp(helper, player)
         }
-
-        // 待ちを付けた後の段で失敗したら、その場で外してから失敗させる
-        fun guarded(block: () -> Unit) {
-            try {
-                block()
-            } catch (e: Throwable) {
-                cleanUpAll()
-                throw e
-            }
-        }
+        whenTestEnds(helper) { cleanUpAll() }
+        // プレイヤーのチケットを付けた後に、送れる状態に要る 3×3 を生成しておく
+        FarChunks.generate(level, far)
+        val startTick = level.server.tickCount
+        val startNanos = System.nanoTime()
         helper.startSequence()
             // プレイヤーのチケットで読み込まれ、送れる状態になったら届ける
             .thenWaitUntil {
                 deliverChunks(player, farPos)
-                helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "the far chunk should be sent to the player")
+                if (!ScreenSync.isChunkSent(level, player, far)) {
+                    helper.fail("the far chunk should be sent to the player (${farChunkState(level, far, player, startTick, startNanos)})")
+                }
             }
             .thenExecute {
                 // 送った後のチャンクに画面を置く（いちばんよくある置き方）
@@ -651,31 +713,25 @@ object ScreenSyncGameTests {
                 helper.assertTrue(client.keyframes == 1, "the first keyframe should arrive")
             }
             .thenExecute {
-                guarded {
-                    val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(far.toLong())
-                    helper.assertTrue(holder != null, "the far chunk should have a holder")
-                    holder!!.addSendDependency(delay)
-                    // 以前の推し量り（#654）なら、ここで「送っていない」とみなして見ている人から外していた
-                    helper.assertTrue(
-                        level.chunkSource.chunkMap.getChunkToSend(far.toLong()) == null,
-                        "the far chunk should not be sendable now",
-                    )
-                    helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "a sent chunk should stay sent")
-                    sent = client.fragments
-                    screen!!.text.write(0, 1, "still watched", 0x00FF00, 0)
-                }
+                val holder = level.chunkSource.chunkMap.getVisibleChunkIfPresent(far.toLong())
+                helper.assertTrue(holder != null, "the far chunk should have a holder")
+                holder!!.addSendDependency(delay)
+                // 以前の推し量り（#654）なら、ここで「送っていない」とみなして見ている人から外していた
+                helper.assertTrue(
+                    level.chunkSource.chunkMap.getChunkToSend(far.toLong()) == null,
+                    "the far chunk should not be sendable now",
+                )
+                helper.assertTrue(ScreenSync.isChunkSent(level, player, far), "a sent chunk should stay sent")
+                sent = client.fragments
+                screen!!.text.write(0, 1, "still watched", 0x00FF00, 0)
             }
             .thenExecuteFor(5) {
-                guarded {
-                    helper.assertTrue(screen!!.isWatchedBy(player), "the player should keep watching while sending is delayed")
-                }
+                helper.assertTrue(screen!!.isWatchedBy(player), "the player should keep watching while sending is delayed")
             }
             .thenExecute {
-                guarded {
-                    helper.assertTrue(client.fragments > sent, "the drawing should be sent while sending is delayed")
-                    helper.assertTrue(client.keyframes == 1, "no keyframe should be resent: ${client.keyframes}")
-                    helper.assertTrue(client.matches(screen!!), "the client should match the server")
-                }
+                helper.assertTrue(client.fragments > sent, "the drawing should be sent while sending is delayed")
+                helper.assertTrue(client.keyframes == 1, "no keyframe should be resent: ${client.keyframes}")
+                helper.assertTrue(client.matches(screen!!), "the client should match the server")
                 cleanUpAll()
             }
             .thenSucceed()
@@ -684,6 +740,9 @@ object ScreenSyncGameTests {
     /**
      * 送れる状態（`getChunkToSend` が null でない）で、追跡の範囲に入っていて順番待ちでもないが、まだ送っていないチャンクの画面は、
      * 見られないものとする（#655 のずれ2。以前の推し量りでは、送ったとみなしていた）。
+     *
+     * 新しいチャンクの生成は実時間かかるので、tick の上限の中で待たず、先に同期で生成しておく（[FarChunks.generate]、#934）。
+     * 後始末は、タイムアウトのときも走るように、テストが終わったときに走らせる。
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200)
@@ -696,17 +755,28 @@ object ScreenSyncGameTests {
         ScreenSync.transport = CAPTURE
         val player = helper.makeMockServerPlayerInLevel()
         var placed = false
+        var cleaned = false
+        // 何度呼んでもよい（成功の段と、テストが終わったときの両方から呼ぶ）
         fun cleanUpAll() {
+            if (cleaned) return
+            cleaned = true
             if (placed) level.setBlock(farPos, Blocks.AIR.defaultBlockState(), 3)
-            cache.removeRegionTicket(SEND_TEST_TICKET, far, 2, far)
+            cache.removeRegionTicket(SEND_TEST_TICKET, far, SEND_TEST_TICKET_DISTANCE, far)
             cleanUp(helper, player)
         }
-        // 中心のチャンクがブロックの tick する段（送れる状態）になるチケット
-        cache.addRegionTicket(SEND_TEST_TICKET, far, 2, far)
+        // 中心のチャンクがブロックの tick する段（送れる状態）になるチケット。まわりの 3×3 が FULL になる
+        cache.addRegionTicket(SEND_TEST_TICKET, far, SEND_TEST_TICKET_DISTANCE, far)
+        whenTestEnds(helper) { cleanUpAll() }
+        // チケットを付けた後に、送れる状態に要る 3×3 を生成しておく
+        FarChunks.generate(level, far)
+        val startTick = level.server.tickCount
+        val startNanos = System.nanoTime()
         helper.startSequence()
             .thenWaitUntil {
                 cache.runDistanceManagerUpdates()
-                helper.assertTrue(cache.chunkMap.getChunkToSend(far.toLong()) != null, "the far chunk should become sendable")
+                if (cache.chunkMap.getChunkToSend(far.toLong()) == null) {
+                    helper.fail("the far chunk should become sendable (${farChunkState(level, far, null, startTick, startNanos)})")
+                }
             }
             .thenExecute {
                 try {
