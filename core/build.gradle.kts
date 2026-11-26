@@ -132,10 +132,12 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)
-        // インタプリタでは遅いので、1 本の時間の上限を延ばす
-        systemProperty("kibi.stackHeadroom.timeoutSeconds", "1800")
-        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）
-        if (args.isNotEmpty()) systemProperty("kibi.stackHeadroom.roundsScale", "0.25")
+        // インタプリタでは遅いので、1 本の時間の上限を延ばす（`-Pkibi.stackHeadroom.timeoutSeconds=<秒>` で変えられる。#903）
+        systemProperty("kibi.stackHeadroom.timeoutSeconds", providers.gradleProperty("kibi.stackHeadroom.timeoutSeconds").orNull ?: "1800")
+        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）。
+        // `-Pkibi.stackHeadroom.roundsScale=<割合>` で、どの JVM でも上書きできる（#903。1 にすると、ディスクの掃引の幅も 1 段ずつ全部に戻る）
+        val roundsScale = providers.gradleProperty("kibi.stackHeadroom.roundsScale").orNull ?: if (args.isNotEmpty()) "0.25" else null
+        roundsScale?.let { systemProperty("kibi.stackHeadroom.roundsScale", it) }
         testLogging.showStandardStreams = true
         outputs.upToDateWhen { false }
     }
