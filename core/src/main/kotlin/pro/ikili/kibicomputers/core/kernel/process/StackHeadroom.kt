@@ -66,6 +66,11 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     `release` の確かめで投げると知らせが捨てられるので、取り出す前に [DEFERRED_RELEASE_FRAMES] 段を投げずに確かめ（[hasHeadroom]）、
  *     足りなければ取り出さずに返す（`drainDeferred` は、ファイルシステムに届く操作からゲストのスレッドの深さでも走る）。
  *     同じテストの、fd の表から閉じる知らせの回が、知らせが行われたか列に残ったかのどちらかになることを見る。
+ *     fd の表に入れない開いたファイルを閉じる道（`Vfs.close` → `release`）は、`retained` を `release` が戻ってから落とす
+ *     （途中で尽きても閉じ直せる。#901）。本番の呼び手は閉じ直さないので、開く側（`Vfs.open`）が何も変える前に [VFS_OPEN_FRAMES] 段を払い、
+ *     同じ深さの `close` の確かめが通るようにする。同じテストの `Vfs` の回は、閉じる途中で尽きても閉じ直せば、また開いて書いて
+ *     `finally` で閉じる本番の形では閉じ直さなくても、開いたままのホストのファイルが残らないことを見る（閉じる途中で尽きる回は、
+ *     並べ替える前は閉じ直せずに落ちた。本番の形の回は、開く側の確かめがなくても手元では落ちなかった。`open` の中の確かめは `close` より数段深いため）。開く側の確かめそのものは、`refuseOpen` の 3 つの試験（作る・既存を開く・`O_TRUNC`）が、`VFS_OPEN_FRAMES` の確かめが通らない最初の深さで開き、何も変えずに断ること（作ったファイル・切り詰め・開いたままの枠・予約した枠が残らず、浅いところで開き直せる）を固定する。確かめを外す・`reserveOpen` の後ろへ動かすと落ちる。
  *     「深いスレッドが積んだ知らせを、起動用のスレッドが行う」道（`Machine.scheduleVfsDrain`）は、`P1DiskCloseStackExhaustionTest` が、
  *     本物の WASI p1 の `path_open`・`fd_close` をスタックの底に近いところで繰り返して、Machine ごと通す（毎回の後に、知らせが残らず、
  *     開いたままの枠が 0 に戻り、ディスクの状態がホストと合うこと）。
@@ -78,7 +83,10 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     （1 本に 40 回。底に近いところだけ本物の操作をするので、1 本が約 9 秒）。毎回の後に、ディスクの表・使用量・枠がホストと合うことと、
  *     開いたままのホストのファイルが残っていないことも見る
  * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）。1 本で 60 回
- *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が 0 に戻ることも見る
+ *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`）が 0 に戻ることも見る。予約はロックでないので
+ *   安全網の対象外だが、持ち主のプロセスの終わり（`finishLocked`）が戻す（#890。尽きた位置に左右されない。窓を決まった形で突く
+ *   `ConsolePumpReservationTest`）。確かめの段数を縮めて（包み・燃料切れの入口・深い道を 16・16・64 段、8・8・32 段）この回を回しても、
+ *   毎回の後に予約が 0 に戻った（JDK 17・Windows。尽きた位置はほとんど確かめの中で、予約の窓に落ちた回は少ない。窓は上のテストが見る）
  * - canon の lift・lower（文字列の realloc、post-return、別のインスタンスが lower した関数を lift し直す `CoreRef.Lowered` の道。
  *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）。入口の `top` に止まりうるホストの関数を置くので、待機点型の回は
  *   待機点型に固有の燃料切れの道を通る: 深い `f`（ゲストからゲストへの呼び出しの下）の中の前借りと、`top` の loop の先頭の燃料切れの巻き戻し・巻き直し
@@ -248,6 +256,16 @@ internal object StackHeadroom {
      * 返らない。取り出してから `release` の確かめまでの数段の分を、[HOST_IO_FRAMES] に足す
      */
     const val DEFERRED_RELEASE_FRAMES: Int = HOST_IO_FRAMES + 16
+
+    /**
+     * 開いたことを知らせるファイルシステム（ディスク）のファイルを `Vfs.open` で開くとき、何も変える前に確かめる段数（#901）。
+     * `Vfs.close` で閉じる開いたファイル（fd の表に入れていないもの）の呼び手は、どれも `open` と同じ深さから `close` を呼び、
+     * 投げた後に呼び直さない（`Machine.readExecutable`・`WasiP1Path` の `path_open`・`WasiP2Fs` の `open-at`）。`open` が通った深さでは、
+     * 続く `close` → `checkUnlocked` → `DiskFileSystem.release` の入口の確かめ（[HOST_IO_FRAMES]）が通るよう、その数段の分を足す
+     * （返す側の `close` では確かめない。確かめで投げると、閉じること自体が飛ばされる。ADR 0043）。開くのは µs〜ms のホストの I/O なので、
+     * 約 1 µs を足すだけ。`/tmp` やディレクトリ（数えないもの）は払わない
+     */
+    const val VFS_OPEN_FRAMES: Int = HOST_IO_FRAMES + 16
 
     /**
      * [frames] 段分のスタックが残っているか（[ensure] が通るか）。投げずに `false` を返す。

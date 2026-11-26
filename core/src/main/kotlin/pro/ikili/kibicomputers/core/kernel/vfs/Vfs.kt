@@ -166,6 +166,7 @@ internal class Vfs(
             if (options.directory || trailingSlash) fsError(Errno.NOTDIR, "$path はディレクトリではない")
             val loc = locate(path) ?: fsError(Errno.IO, "$path のマウントがない")
             if (options.write && loc.readOnly) fsError(Errno.ROFS)
+            ensureCloseHeadroom(loc)
             // 先に開いたことを知らせ（上限なら、切り詰める前に失敗する。#434）、それから切り詰める
             val file = try {
                 opened(loc, existing.node, existing.type, path, options, reserved = false)
@@ -191,6 +192,7 @@ internal class Vfs(
         val loc = locate(path)
         if (loc == null || parent.device == 0L) fsError(Errno.ROFS, "マウントの祖先のディレクトリには作れない")
         if (loc.readOnly) fsError(Errno.ROFS)
+        ensureCloseHeadroom(loc)
         // 開いたままにする枠を、作る前に取る（上限なら、何も作らずに失敗する。#434）
         val reserved = loc.fs.tracksOpenFiles
         if (reserved) loc.fs.reserveOpen()
@@ -206,6 +208,15 @@ internal class Vfs(
             throw e
         }
         return opened(loc, node, FileType.REGULAR_FILE, path, options, reserved)
+    }
+
+    /**
+     * 開いたことを知らせるファイルシステム（[FileSystem.tracksOpenFiles]）なら、何も変える前に [StackHeadroom.VFS_OPEN_FRAMES] 段を確かめる（#901）。
+     * 開いた呼び手は、同じ深さから [close] を呼ぶ（呼び直さない）ので、`open` が通った深さでは `close` の `release` の確かめも通るようにする。
+     * 足りなければ、何も変えずに `StackOverflowError` を投げる（予約した枠・作ったファイルも残らない）
+     */
+    private fun ensureCloseHeadroom(loc: Location) {
+        if (loc.fs.tracksOpenFiles) StackHeadroom.ensure(StackHeadroom.VFS_OPEN_FRAMES)
     }
 
     /**
@@ -430,14 +441,30 @@ internal class Vfs(
 
     /**
      * ほかのスレッドと分け合わない開いたファイル（fd の表に足さなかったもの）を閉じる。ファイルシステムに開いたことを知らせていれば、
-     * 閉じたことを知らせる（カーネルロックの外）
+     * 閉じたことを知らせる（カーネルロックの外）。
+     *
+     * スタックが尽きても閉じ損ねが残らないよう、[OpenFile.retained] は [FileSystem.release] が戻ってから落とす（#901）。
+     * `release` の途中で尽きたら `retained` は真のまま残り、呼び直せば閉じ直せる。`release` が戻った後は、フィールドへの
+     * volatile の代入（`putfield`。[OpenFile.retained] は `@JvmField` なので setter を呼ばない）だけで呼び出しを積まないので、ここで尽きて
+     * 二重に閉じることはない。`DiskFileSystem.release` は入口の確かめ（[StackHeadroom.HOST_IO_FRAMES]）を
+     * 何も変える前に払い、ロックの中では尽きない前提に頼っている（途中で尽きて閉じ直すと、参照の数を二重に減らしうる）。この約束は
+     * [FileSystem.release] の契約で、`tracksOpenFiles` を返す実装は守る。
+     *
+     * 本番の呼び手は、どれも `close` が投げた後に呼び直さない（fd の表にも入っていないので、プロセスの終わりにも閉じられない）。そこで、
+     * 呼び手が `open` と同じ深さから `close` を呼べば `release` の確かめが通るよう、[open] が [StackHeadroom.VFS_OPEN_FRAMES] を先に払う
      */
     fun close(file: OpenFile) {
         if (!file.retained) return
-        file.retained = false
-        val fs = view.fileSystems[file.mountId] ?: return
+        val fs = view.fileSystems[file.mountId]
+        if (fs == null) {
+            // マウントが外れていた。ホストのファイルは、外したファイルシステムの retire が閉じる
+            file.retained = false
+            return
+        }
         checkUnlocked()
         fs.release(file.node)
+        // release が戻ってから落とす（途中で尽きたら真のまま残り、呼び直せば閉じ直せる。#901）
+        file.retained = false
     }
 
     // ---- カーネルロックの中で呼んでよいもの ----

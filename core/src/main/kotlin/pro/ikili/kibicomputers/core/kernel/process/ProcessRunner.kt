@@ -1164,6 +1164,9 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
     fun finishLocked(rt: ProcessRuntime, state: ProcessState, exitCode: Int?) {
+        // コンソールの出力の予約を戻す（#890）。予約してから pumpConsole で消すまでの間にスタックが尽きても、ここ（浅いところ）で戻る。
+        // 戻した後に TTY に残った分は、書き手のいない出力としてメインスレッドが配る
+        machine.releaseConsolePumpLocked(rt)
         val process = rt.process
         if (process.state.isTerminal) return
         process.state = state
@@ -2081,11 +2084,11 @@ internal class ProcessRunner(private val machine: Machine) {
             }
         }
 
-        override fun reserveConsoleFlushLocked() = machine.reserveConsolePumpLocked()
+        override fun reserveConsoleFlushLocked() = machine.reserveConsolePumpLocked(rt)
 
         override fun flushConsole() {
             hooks.beforeConsoleFlush?.invoke(machine, rt.pid)
-            val cells = machine.pumpConsole(reserved = true)
+            val cells = machine.pumpConsole(reservedBy = rt)
             if (cells <= 0 || rt.process.unmetered) return
             // 書いた分は、手持ちがあれば払う（手持ちがない呼び出し元では払わない）
             lock.withLockValue { rt.currentHolder?.let { it.fuel -= cells * MachineLimits.CONSOLE_FUEL_PER_CELL } }

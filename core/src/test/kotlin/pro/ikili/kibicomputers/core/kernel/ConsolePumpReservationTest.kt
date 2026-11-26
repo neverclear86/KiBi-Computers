@@ -1,0 +1,333 @@
+package pro.ikili.kibicomputers.core.kernel
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.EnumSource
+import org.junit.jupiter.api.Test
+import pro.ikili.kibicomputers.core.kernel.process.ProcessContext
+import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
+import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
+import pro.ikili.kibicomputers.core.kernel.process.ProcessState
+import pro.ikili.kibicomputers.core.kernel.process.crashReason
+import pro.ikili.kibicomputers.core.kernel.tty.Tty
+import pro.ikili.kibicomputers.core.runtime.FakeModule
+import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
+import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+
+/**
+ * コンソールの出力の予約（`Machine.consolePumpsReserved`。#419）が、スタックが尽きても残らないことを確かめる（#890）。
+ *
+ * 予約の持ち主はプロセスで、`pumpConsole` の例外でない道か、プロセスの終わり（`finishLocked`）の早い方で 1 回だけ戻る。
+ * `StackExhaustionLockTest` の `CONSOLE` は尽きる位置を段数でずらすので、窓に落ちるかは環境に左右される。ここでは窓を決まった形で突く:
+ * - 予約してから `pumpConsole` に入るまで（`flushConsole` の先頭のフック `beforeConsoleFlush`）で `StackOverflowError` を投げる
+ * - `pumpConsole` の中で、表示デバイスのロックを取る途中（`ReentrantLock.lock`）で `StackOverflowError` を投げる
+ *
+ * どちらも、プロセスは `call stack exhausted` で終わり、予約は 0 に戻り、TTY に残った出力はメインスレッドが書き手のいないものとして配る
+ * （予約が残ると、その台のコンソールの表示が止まる）
+ */
+internal class ConsolePumpReservationTest {
+    private val limit = Duration.ofSeconds(60)
+
+    private val payload = "reservation #890".toByteArray()
+
+    /**
+     * テスト用の書く先。[armed] に入れたスレッドが次に [lock] の `lock()` を呼ぶと、1 回だけ `StackOverflowError` を投げる
+     * （ロックを取る途中で尽きたのと同じ。取る前に投げるので、ロックの状態は壊れない）。メインスレッドは `tryLock` で取るので投げない。
+     * [writeArmed] に入れたスレッドが次に [write] を呼ぶと、1 回だけ `StackOverflowError` を投げる
+     * （TTY から取り出して予約を戻した後、表示デバイスに書く途中で尽きたのと同じ。書いた数には入らない）
+     */
+    private class TestSink : ConsoleSink {
+        val armed = AtomicReference<Thread?>()
+        val writeArmed = AtomicReference<Thread?>()
+        val written = AtomicInteger()
+
+        override val lock: ReentrantLock = object : ReentrantLock() {
+            override fun lock() {
+                if (armed.compareAndSet(Thread.currentThread(), null)) throw StackOverflowError("テストで投げた")
+                super.lock()
+            }
+        }
+
+        override fun write(bytes: ByteArray): Long {
+            if (writeArmed.compareAndSet(Thread.currentThread(), null)) throw StackOverflowError("テストで投げた")
+            written.addAndGet(bytes.size)
+            return bytes.size.toLong()
+        }
+    }
+
+    /** ホストの関数 `env.h` の本体: TTY に [payload] を書いて予約し（[reserves] 回）、ロックの外で流す */
+    private fun writeConsole(ctx: ProcessContext, tty: Tty, reserves: Int = 1, before: () -> Unit = {}) {
+        ctx.withKernelLock {
+            tty.write(payload, 0, payload.size, ctx.wakeSink)
+            repeat(reserves) { ctx.reserveConsoleFlushLocked() }
+        }
+        before()
+        ctx.flushConsole()
+    }
+
+    private fun module(): FakeModule = FakeModule.builder()
+        .fuelMetered()
+        .import("env", "h", VOID)
+        .export("run", VOID) { ctx, _ ->
+            ctx.callImport("env", "h")
+            LongArray(0)
+        }
+        .build()
+
+    /** メインスレッドが配ったコンソールの出力（カーネルのメッセージと、書き手のいない TTY の出力）を記録する */
+    private class ConsoleRecorder : MachineHost {
+        val console = StringBuffer()
+
+        override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) {}
+
+        override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
+            console.append(String(bytes, Charsets.UTF_8))
+        }
+    }
+
+    private class Rig(val h: Harness, val m: Machine, val sink: TestSink, val tty: Tty, val host: ConsoleRecorder)
+
+    private fun rig(block: (Rig) -> Unit) {
+        Harness().use { h ->
+            val host = ConsoleRecorder()
+            val m = h.machine(fuelPerTick = 50_000_000, host = host)
+            val sink = TestSink()
+            m.consoleSink = sink
+            val tty = m.lock.withLockValue { m.consoleTtyLocked() }
+            // init は回り続けるもの（テストのプロセスが init だと、尽きて終わったときに台ごと止まる）
+            val init = m.spawnRt(h.program(spinForever()), runDriver())
+            eventually(10_000, "init が動かない") {
+                h.scheduler.tick()
+                init.process.state != ProcessState.CREATED
+            }
+            block(Rig(h, m, sink, tty, host))
+            m.stop()
+            eventually(10_000, "マシンが止まらない") {
+                h.scheduler.tick()
+                m.state == MachineState.STOPPED
+            }
+        }
+    }
+
+    private fun Rig.spawn(kind: ProcessKind, body: (ProcessContext) -> Unit): ProcessRuntime {
+        val driver = runDriver(kind) { ctx, b -> b.host(ctx) { c, _, _ -> body(c).let { LongArray(0) } } }
+        return m.spawnRt(h.program(module()), driver)
+    }
+
+    private fun Rig.awaitEnd(rt: ProcessRuntime) = eventually(10_000, "プロセスが終わらない: ${rt.process.state}") {
+        h.scheduler.tick()
+        rt.process.state.isTerminal
+    }
+
+    private fun Rig.outputAvailable(): Int = m.lock.withLockValue { tty.outputAvailable }
+
+    /**
+     * 尽きて終わった後に、予約が 0 に戻り、メインスレッドが TTY の出力を配る（表示が止まらない）。配るのは 2 つの道で確かめる:
+     * - 尽きる前に TTY に積んだ [payload]: プロセスが終わったときのカーネルのメッセージ（`kibi: ... crashed: ...`）の前に、
+     *   メインスレッドが目印までを取り出す（`drainTtyBefore`。予約を見ない）ので、予約が残っていても通る
+     * - 尽きて終わった後に TTY へ積んだ出力（キー入力のエコーなど、書き手のいない出力）: `drainStaleConsoleOutput` の道。
+     *   予約が残っていると、この道は TTY の出力を取り出さない（#419）ので、予約が戻ったかをここで見分けられる（#890 の症状）
+     */
+    private fun Rig.assertCrashedAndDrained(rt: ProcessRuntime) {
+        awaitEnd(rt)
+        assertEquals(ProcessState.CRASHED, rt.process.state, "${rt.lastError}")
+        assertEquals("call stack exhausted", crashReason(rt.lastError!!), "${rt.lastError}")
+        assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った")
+        eventually(10_000, "TTY に残った出力をメインスレッドが配らない（${outputAvailable()} バイト）") {
+            h.scheduler.tick()
+            outputAvailable() == 0
+        }
+        assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（窓を突けていない）")
+        assertEquals(MachineState.RUNNING, m.state)
+        // 書き手のいない出力は、メインスレッドが drainStaleConsoleOutput で配る
+        val echo = "echo890"
+        assertEquals(echo.length, m.offerConsoleInput(echo.toByteArray()))
+        eventually(10_000, "書き手のいない出力をメインスレッドが配らない（${outputAvailable()} バイト、配った分: ${host.console}）") {
+            h.scheduler.tick()
+            outputAvailable() == 0 && host.console.contains(echo)
+        }
+        assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（窓を突けていない）")
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `予約してからpumpConsoleに入るまでにスタックが尽きても、予約は残らない`(kind: ProcessKind) = timeout(limit) {
+        rig { r ->
+            r.h.scheduler.hooks.beforeConsoleFlush = { _, _ -> throw StackOverflowError("テストで投げた") }
+            try {
+                val rt = r.spawn(kind) { ctx -> writeConsole(ctx, r.tty) }
+                r.assertCrashedAndDrained(rt)
+            } finally {
+                r.h.scheduler.hooks.beforeConsoleFlush = null
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `pumpConsoleの中で表示デバイスのロックを取る途中でスタックが尽きても、予約は残らない`(kind: ProcessKind) = timeout(limit) {
+        rig { r ->
+            val rt = r.spawn(kind) { ctx -> writeConsole(ctx, r.tty) { r.sink.armed.set(Thread.currentThread()) } }
+            r.assertCrashedAndDrained(rt)
+            assertEquals(null, r.sink.armed.get(), "表示デバイスのロックを取りに行かなかった")
+            // 表示デバイスのロックは壊れていない（取る前に投げた）
+            assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
+            r.sink.lock.unlock()
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `pumpConsoleが予約を戻した後に、表示デバイスに書く途中でスタックが尽きても、予約は負にならず0のまま`(kind: ProcessKind) = timeout(limit) {
+        rig { r ->
+            val rt = r.spawn(kind) { ctx -> writeConsole(ctx, r.tty) { r.sink.writeArmed.set(Thread.currentThread()) } }
+            r.assertCrashedAndDrained(rt)
+            assertEquals(null, r.sink.writeArmed.get(), "表示デバイスに書きに行かなかった")
+            // 予約は pumpConsole で戻った後に、終わりの片付けでもう一度は戻らない（負にならない）
+            assertEquals(0, r.m.consolePumpsReservedForTest)
+            // 表示デバイスのロックは放されている
+            assertTrue(r.sink.lock.tryLock(5, TimeUnit.SECONDS))
+            r.sink.lock.unlock()
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProcessKind::class)
+    fun `ふつうに書いた後と、続けて予約した後も、予約は0に戻る`(kind: ProcessKind) = timeout(limit) {
+        rig { r ->
+            // 1 回のロックの区間で 2 回予約しても、1 つのプロセスが数えるのは 1 つまで（flushConsole 1 回で戻る）
+            val rt = r.spawn(kind) { ctx ->
+                writeConsole(ctx, r.tty)
+                writeConsole(ctx, r.tty, reserves = 2)
+            }
+            r.awaitEnd(rt)
+            assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+            assertEquals(0, r.m.consolePumpsReservedForTest)
+            // 書き手のスレッドが自分で書いた
+            assertEquals(payload.size * 2, r.sink.written.get())
+            assertEquals(0, r.outputAvailable())
+        }
+    }
+
+    /**
+     * `pumpConsole` が書かずに予約だけ消す道（書く先がない・カーネルロックを持っている）で、プロセスが生きている間に予約が 0 に戻る。
+     * プロセスが終われば `finishLocked` でも戻るので、書き手を [gate] で止めたまま確かめる。[before] は書き手を流す前に呼ぶ
+     */
+    private fun Rig.assertReleasedWhileAlive(underKernelLock: Boolean, before: () -> Unit = {}, whileAlive: () -> Unit) {
+        val flushed = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        try {
+            val rt = spawn(ProcessKind.BLOCKING) { ctx ->
+                if (underKernelLock) {
+                    // カーネルロックを持ったまま流す（pumpConsole は書かずに、再入して予約だけ消す）
+                    ctx.withKernelLock {
+                        tty.write(payload, 0, payload.size, ctx.wakeSink)
+                        ctx.reserveConsoleFlushLocked()
+                        ctx.flushConsole()
+                    }
+                } else {
+                    writeConsole(ctx, tty)
+                }
+                flushed.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+            before()
+            eventually(10_000, "書き手が流し終わらない") {
+                h.scheduler.tick()
+                flushed.count == 0L
+            }
+            assertTrue(!rt.process.state.isTerminal, "書き手が終わった（${rt.process.state}）")
+            assertEquals(0, m.consolePumpsReservedForTest, "書かずに戻った pumpConsole で予約が戻らない")
+            whileAlive()
+            assertTrue(!rt.process.state.isTerminal, "書き手が終わった（${rt.process.state}）")
+            assertEquals(0, sink.written.get(), "プロセスのスレッドが書いた（書かない道を通っていない）")
+            gate.countDown()
+            awaitEnd(rt)
+            assertEquals(ProcessState.EXITED, rt.process.state, "${rt.lastError}")
+            assertEquals(0, m.consolePumpsReservedForTest)
+        } finally {
+            gate.countDown()
+        }
+    }
+
+    /** 書き手が生きている間に、メインスレッドが TTY の出力（[expected] を含む）を配りきる */
+    private fun Rig.assertMainThreadDrains(expected: String) {
+        eventually(10_000, "メインスレッドが TTY の出力を配らない（${outputAvailable()} バイト、配った分: ${host.console}）") {
+            h.scheduler.tick()
+            outputAvailable() == 0 && host.console.contains(expected)
+        }
+    }
+
+    @Test
+    fun `書く先がないときに書かずに戻っても、生きている間に予約は0に戻り、後から画面をつなぐと残りを配る`() = timeout(limit) {
+        rig { r ->
+            // 画面をつないでいない台は、いつも書かない道を通る
+            r.m.consoleSink = null
+            r.assertReleasedWhileAlive(underKernelLock = false) {
+                r.assertMainThreadDrains(String(payload, Charsets.UTF_8))
+                // 生きている間に画面をつなぐ。書き手のいない出力は drainStaleConsoleOutput が配る（予約が残っていると配らない）
+                r.m.consoleSink = r.sink
+                val echo = "echo890-nosink"
+                assertEquals(echo.length, r.m.offerConsoleInput(echo.toByteArray()))
+                r.assertMainThreadDrains(echo)
+            }
+        }
+    }
+
+    @Test
+    fun `カーネルロックを持ったまま流して書かずに戻っても、生きている間に予約は0に戻り、残りを配る`() = timeout(limit) {
+        rig { r ->
+            r.assertReleasedWhileAlive(underKernelLock = true) {
+                // 書く先があるので、メインスレッドは drainStaleConsoleOutput で取り出す（予約が残っていると取り出さない）
+                r.assertMainThreadDrains(String(payload, Charsets.UTF_8))
+                val echo = "echo890-locked"
+                assertEquals(echo.length, r.m.offerConsoleInput(echo.toByteArray()))
+                r.assertMainThreadDrains(echo)
+            }
+        }
+    }
+
+    @Test
+    fun `予約したまま止まっている書き手を止めても、予約は1回だけ戻る`() = timeout(limit) {
+        rig { r ->
+            val atGate = CountDownLatch(1)
+            val gate = CountDownLatch(1)
+            r.h.scheduler.hooks.beforeConsoleFlush = { _, _ ->
+                atGate.countDown()
+                gate.awaitKeepingInterrupt()
+            }
+            try {
+                val rt = r.spawn(ProcessKind.BLOCKING) { ctx -> writeConsole(ctx, r.tty) }
+                eventually(10_000, "書き手が門に着かない") {
+                    r.h.scheduler.tick()
+                    atGate.count == 0L
+                }
+                assertEquals(1, r.m.consolePumpsReservedForTest)
+                // 書き手が予約している間は、メインスレッドは TTY の出力を取り出さない（#419）
+                repeat(5) { r.h.scheduler.tick() }
+                assertEquals(payload.size, r.outputAvailable())
+                // 止める（スレッドのあるプロセスには割り込むだけ。終わりの片付けは、門を開けた後に書き手のスレッドが行う）
+                r.m.stop()
+                assertEquals(1, r.m.consolePumpsReservedForTest)
+                r.h.scheduler.hooks.beforeConsoleFlush = null
+                gate.countDown()
+                eventually(10_000, "書き手が終わらない") {
+                    r.h.scheduler.tick()
+                    rt.process.state.isTerminal
+                }
+                // pumpConsole と終わりの片付けの両方を通っても、負にならない
+                assertEquals(0, r.m.consolePumpsReservedForTest)
+            } finally {
+                r.h.scheduler.hooks.beforeConsoleFlush = null
+                gate.countDown()
+            }
+        }
+    }
+}
+
