@@ -477,9 +477,11 @@ public class MachineSaveStore @JvmOverloads constructor(
                     while (sideQueue.isEmpty() && !sideQueueClosed) sideQueueReady.await()
                     val entries = sideQueue.entries.iterator()
                     if (entries.hasNext()) {
+                        // 外す前に読む（Map.Entry は、イテレーターが返した後に元の Map が変わると振る舞いが未定義）
                         val first = entries.next()
+                        val taken = first.key to first.value
                         entries.remove()
-                        first.key to first.value
+                        taken
                     } else {
                         null
                     }

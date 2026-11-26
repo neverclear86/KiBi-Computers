@@ -256,6 +256,55 @@ class MachineSideOwnerReadTest {
     }
 
     @Test
+    fun `closeのときに列に残っている頼みは、読んでから抜けて、読めなかったにはならない`() {
+        val blocker = UUID.randomUUID()
+        val queued = List(3) { UUID.randomUUID() }
+        writeOwner(blocker, OwnerRecord(0, at(0)))
+        for (id in queued) writeOwner(id, OwnerRecord(0, at(1)))
+        val manual = ManualSaveExecutor()
+        val store = store(manual)
+        val opened = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val reads = java.util.Collections.synchronizedList(ArrayList<UUID>())
+        store.sideOwnerReader = { path ->
+            val id = UUID.fromString(path.parent.fileName.toString())
+            reads += id
+            if (id == blocker) {
+                opened.countDown()
+                release.await()
+            }
+            OwnerRecord.read(path)
+        }
+        val blockerKey = Key("blocker")
+        assertEquals(null, store.claimOrDefer(blocker.toString(), 0, 0, at(0), blockerKey))
+        val queuedKeys = queued.map { Key(it.toString()) }
+        opened.await()
+        // 先頭の読みを止めたまま頼みを積み、その状態で close する
+        for ((i, id) in queued.withIndex()) assertEquals(null, store.claimOrDefer(id.toString(), 0, 0, at(1), queuedKeys[i]))
+        assertEquals(queued.size, store.sideReadQueueLength)
+        var closed: Boolean? = null
+        val closer = Thread { closed = store.close(NO_DEADLINE) }
+        closer.start()
+        try {
+            // close が止める印を立てて、読み手の join で待つところまで進むのを待つ（期限なし）
+            waitFor { closer.state == Thread.State.TIMED_WAITING || closer.state == Thread.State.WAITING || !closer.isAlive }
+            assertTrue(closer.isAlive, "先頭の読みが終わるまで close は抜けない")
+            assertEquals(queued.size, store.sideReadQueueLength, "止めても、頼まれていた分は列に残っている")
+        } finally {
+            release.countDown()
+        }
+        closer.join()
+        assertEquals(true, closed)
+        assertFalse(store.sideReaderAlive)
+        val done = pollUntil(store, 1 + queued.size)
+        assertEquals((listOf(blockerKey) + queuedKeys).toSet(), done.map { it.key }.toSet())
+        for (d in done) assertEquals(ClaimResult.KEPT, d.claim.result, "読めなかったにはならない")
+        assertEquals(0, store.deferredClaimTimeouts)
+        assertEquals((listOf(blocker) + queued).toSet(), reads.toSet(), "残っていた頼みも読んだ")
+        assertEquals(1 + queued.size, reads.size)
+    }
+
+    @Test
     fun `読み手の読みがErrorで落ちても、待ちは読めなかったとして決まり、読み手は動き続ける`() {
         val bad = UUID.randomUUID()
         val good = UUID.randomUUID()
