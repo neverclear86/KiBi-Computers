@@ -183,8 +183,13 @@ package pro.ikili.kibicomputers.core.kernel.process
  * エラーの枝（`INVAL`・`NOTEMPTY`・`ISDIR`・`NOTDIR`・`EXIST`・`NOENT`）・何もしない名前の変更を足した。`TmpFileSystemStackExhaustionTest` に
  * 9 つの型（底に近い深さのすべて）、`TmpFileSystemTreeStackExhaustionTest` に 29 の型（`DiskFileSystemStackExhaustionTest` と同じく、尽きる境目から
  * 詰め物を 1 段ずつずらす。毎回の後に、木・`usedBytes`・勘定 3 つ・`TMPFS` 節の読み直し、尽きた回とエラーの回は何も変わっていないこと、
- * 片付けた後に回の前へ戻ること）。32 段では、JDK 17・JIT、冷えた道・`-Xint`・JDK 21（Windows）のどれでも食い違いは 0 で、確かめが通らない
- * 深さで断られなかった回も 0。確かめを外した手元の試験（JDK 17・JIT・Windows）では、境目をずらす掃引で日本語の名前のファイルの作成
+ * 片付けた後に回の前へ戻ること）。32 段では、JDK 17・JIT（ふつうの `:core:test`）に加えて、`-Pkibi.stackHeadroom=true` の 3 つの JVM
+ * （冷えた道・`-Xint`・JDK 21。Windows。この 2 つの試験クラスに絞って回した）でも、両方の試験（`TmpFileSystemStackExhaustionTest` は足した
+ * 9 つを含む 22 の型の 32 本、`TmpFileSystemTreeStackExhaustionTest` は 29 本）が通り、食い違いは 0。底に近い深さのすべての掃引で、
+ * 確かめが通らない深さ（冷えた道で 1491、`-Xint` で 3650、JDK 21 で 1450）のうち断られなかった回は 0。断られた位置のうち確かめの中は、
+ * 冷えた道で約 95%（1515 回中 1442）、`-Xint` で約 98%（3675 回中 3604）、JDK 21 で約 91%（1537 回中 1395）。境目をずらす掃引の
+ * 「確かめが通らない深さ」は数えていない（詰め物の段数から深さを決めないため）ので、断られなかった回の検査は底に近い深さのすべての掃引が受け持つ。
+ * 確かめを外した手元の試験（JDK 17・JIT・Windows）では、境目をずらす掃引で日本語の名前のファイルの作成
  * （作った node が木に入らないまま `nodes` に残り `TMPFS` 節が読めない）、日本語の名前のディレクトリの削除（`nameCost` の `String.encodeUTF8` の中で
  * 尽き、木から外したのに `usedBytes` が返らない）、入れ子のいくつもの塊の書き込み（塊が `size` の外に残る）が食い違った（JIT が操作を畳むので、
  * 尽きうる位置は残った呼び出しだけになり、29 の型のうち 2〜3 つ）。底に近い深さのすべての掃引は、足した 9 つの型のどれでも、確かめが通らない深さで

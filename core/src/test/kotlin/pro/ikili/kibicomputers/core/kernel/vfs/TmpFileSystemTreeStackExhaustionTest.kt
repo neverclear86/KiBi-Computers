@@ -34,7 +34,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *
  * その後に回の分を片付け、片付けた後も同じことと、`usedBytes` が回の前（共有の部分だけ）に戻ることを見る。最後に外して 3 つとも 0 に戻ること、
  * 尽きた回・終わりまで動いた回の両方があること、1 段ずつの掃引（境目を探す途中の大きな詰め物は除く）で、尽きた位置が操作より浅いところ
- * （詰め物の再帰・テストのコード）まで届いたこと（幅が操作の深さを覆う）を確かめる。
+ * （詰め物の再帰・テストのコード）まで届いたこと（幅が操作の深さを覆う）と、最初の 1 段ずつの区間が境目をまたいだこと（境目の直後、
+ * 操作のいちばん深い所が尽きる範囲を 1 段ずつ動かした）を確かめる。
  * ロックの途中で尽きたかは見ない。`TmpFileSystem` が使うのは `synchronized` と `MemoryAccount` の CAS だけで、`SoePositions` が
  * ロックに数える `java.util.concurrent.locks.` のフレームがこの道には出ない（見ても常に 0 で、確かめにならない）。モニターは例外でも放され、
  * 尽きた後の木と勘定は毎回の後の確かめが見る
@@ -296,7 +297,8 @@ class TmpFileSystemTreeStackExhaustionTest {
     /**
      * 詰め物の段数を変えて [attempt]（尽きたら `true`）を動かす（`DiskFileSystemStackExhaustionTest.walkEdge` と同じ形）。JIT をかけてから、
      * 尽きる境目を探し、境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を [WIDTH] 段だけ 1 段ずつ動かす（`attempt` の
-     * `swept` は、この 1 段ずつの動かし方のとき `true`）。最後の境目を返す
+     * `swept` は、この 1 段ずつの動かし方のとき `true`）。最初の区間が境目をまたがなかった（全部尽きた、または尽きなかった回が [MAX_LEAD] 回より多い）ときは、
+     * 探し直した境目からその区間をやり直す（`DiskFileSystemStackExhaustionTest.walkEdge` にはこのやり直しがない）。最後の境目を返す
      */
     private fun walkEdge(attempt: (pad: Int, swept: Boolean) -> Boolean): Int {
         repeat(stackHeadroomRounds(WARMUP)) { attempt(0, false) }
@@ -319,14 +321,29 @@ class TmpFileSystemTreeStackExhaustionTest {
         val width = stackHeadroomRounds(WIDTH)
         var edge = findEdge()
         var done = 0
+        // 最初の区間（境目の直後。操作のいちばん深い所が尽きる範囲）を、境目をまたいで掃いたか（尽きなかった回が少なく、尽きた回もある）。慣らしは詰め物 0 だけなので、
+        // 最初の数回の境目は、詰め物の再帰が温まる前の古い値（低い）になることがある。そのときは区間の全部が尽きず、境目の直後を
+        // 1 段ずつ動かさないまま先へ進むので、探し直した境目からやり直す
+        var retries = 0
         while (done < width) {
             val batch = minOf(width - done, REFIND_EVERY)
-            for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k), true)
-            done += batch
+            var crashed = 0
+            for (k in 0 until batch) if (attempt(maxOf(0, edge - 8 + done + k), true)) crashed++
             edge = findEdge()
+            // 境目の手前（尽きない回）が [MAX_LEAD] 回より多いと、境目の直後を掃いた幅が足りない（区間の終わりの数段でだけ尽きた）
+            if (done == 0 && (crashed == 0 || crashed == batch || batch - crashed > MAX_LEAD)) {
+                retries++
+                check(retries <= EDGE_RETRIES) { "最初の 1 段ずつの区間が、境目をまたがない（$EDGE_RETRIES 回探し直しても。尽きた $crashed / $batch 回）" }
+                continue
+            }
+            if (done == 0) sweptAcrossEdge = true
+            done += batch
         }
         return edge
     }
+
+    /** 最初の 1 段ずつの区間が、尽きなかった回と尽きた回の両方を含んだ（境目の直後を掃いた）か。[walkEdge] が立てる */
+    private var sweptAcrossEdge = false
 
     private fun sweep(op: Op) = timeout(Duration.ofSeconds(TIMEOUT_SECONDS)) {
         val rig = Rig()
@@ -382,6 +399,8 @@ class TmpFileSystemTreeStackExhaustionTest {
         )
         assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
         assertTrue(completed + refused > 0, "1 度も終わりまで動かなかった")
+        // 深い側: 最初の 1 段ずつの区間が境目をまたいだ（操作のいちばん深い所が尽きる、境目の直後を 1 段ずつ動かした）
+        assertTrue(sweptAcrossEdge, "1 段ずつの掃引が、境目の直後を通っていない")
         // 幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
         assertTrue(
             swept.count(SoePositions.Position.OTHER) > 0,
@@ -493,6 +512,15 @@ class TmpFileSystemTreeStackExhaustionTest {
 
         /** 境目を探し直す間隔（回） */
         const val REFIND_EVERY = 120
+
+        /** 最初の 1 段ずつの区間が境目をまたがなかったときに、探し直してやり直す回数の上限 */
+        const val EDGE_RETRIES = 3
+
+        /**
+         * 最初の 1 段ずつの区間で、尽きない回（境目の手前）の上限。境目が合っていれば区間は境目の 8 段手前から始まるので 8 回前後。
+         * これより多いと、探した境目が古い（低い）ので、探し直してやり直す
+         */
+        const val MAX_LEAD = 40
 
         val TIMEOUT_SECONDS: Long = System.getProperty("kibi.stackHeadroom.timeoutSeconds")?.toLongOrNull() ?: 120
 
