@@ -34,13 +34,18 @@ import java.util.IdentityHashMap
  *   import・export からたどれる、違う型の宣言の大きさ（[Info.local]）の合計で数える（#751）。wasmparser が型を新しく作り直す
  *   ところ（import・export したインスタンス・コンポーネント・型（`(type (eq ..))` を含む。型宣言の中のものも）、
  *   インスタンス化、インスタンスの export の alias）は、同じ宣言から来ても別の型として数える（[Info.content]。
- *   重なりを除かないので、実際より小さくならない）。展開した大きさは超えない。
+ *   重なりを除かないので、実際より小さくならない）。展開した大きさ（[Info.remapBound]）は超えない。
+ *   この展開した大きさは 100 万で止めない。enum・flags の名前の数は wasmparser の型の大きさに入らない（見積もりは
+ *   1 + 名前の数で数える）ので、wasmparser が断らないまま、写し直す手間は 100 万を超えられる（名前 6,000 個の enum を
+ *   6,000 回 eq で export する 100 KB の型で CPU 約 7 秒。#935 のレビュー）
  *   resource を定義するインスタンス型・コンポーネント型は、import・export の宣言のたびにも（インスタンス化とは別に）その型の
  *   export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、宣言ごとに 1 回数える
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
- * ほかの形の膨らみは、#666 で探して見つからなかった（core のインスタンス化の引数、resource と canon。入力の大きさに比例するだけ。
- * ADR 0262）。見積もりにない形は、見張りが時間の上限で止める。
+ * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
+ * ただし、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型を入れ子のコンポーネントごとに import する形と、
+ * `alias outer` で何度も引く形は、見積もりが 0 のまま検証が秒単位になる（#935 のレビュー。#955 で扱う）。
+ * 見積もりにない形は、見張りが時間の上限で止める。
  */
 internal object ComponentValidationCost {
     /** 型の大きさの上限。wasmparser は、これ（`MAX_WASM_TYPE_SIZE`）を超える型を、型を定義したときに断る */
@@ -94,7 +99,10 @@ internal object ComponentValidationCost {
         val local: Long = size,
         val refs: List<Info> = emptyList(),
         val content: Info? = null,
-        /** 写し直しの大きさの上限（展開した大きさ。コンポーネントは import と export の両方） */
+        /**
+         * 写し直しの大きさの上限（展開した大きさ。コンポーネントは import と export の両方）。[size] と違い、100 万で止めない
+         * （enum・flags の名前の数は wasmparser の型の大きさに入らないので、wasmparser が断らないまま 100 万を超えられる。#935 のレビュー）
+         */
         val remapBound: Long = size,
         /** コンポーネントだけ: インスタンス化でできるインスタンスの型（export だけ。import は引数で置き換わる） */
         val instanceView: Info? = null,
@@ -152,7 +160,7 @@ internal object ComponentValidationCost {
          * 引けなければ、それまでの最大
          */
         private fun remap(target: Info?) {
-            val n = if (target == null) maxSize else flatOf(target, 0)
+            val n = if (target == null) maxFull else flatOf(target, 0)
             cost = add(cost, n)
             remapCost = add(remapCost, n)
         }
@@ -166,6 +174,11 @@ internal object ComponentValidationCost {
         /** それまでに見た型の大きさの最大 */
         var maxSize = 1L
 
+        /** それまでに見た型の、100 万で止めない展開した大きさの最大（引けない型の写し直しの上限） */
+        private var maxFull = 1L
+
+        private fun noteFull(full: Long): Long = full.also { if (it > maxFull) maxFull = it }
+
         /** 大きさを記録する（上限で止める） */
         private fun note(size: Long): Long {
             val s = minOf(size, MAX_TYPE_SIZE)
@@ -178,7 +191,7 @@ internal object ComponentValidationCost {
         private fun sum(a: Long, b: Long): Long = minOf(a + b, MAX_TYPE_SIZE)
 
         /** 引けない参照の代わり（それまでの最大の大きさの、中を持たない型） */
-        private fun unknown(): Info = Info(maxSize)
+        private fun unknown(): Info = Info(maxSize, remapBound = maxFull)
 
         /** wasmparser が [info] を写して新しく作る型（コンポーネントは、インスタンス化でできるインスタンスの型も引き継ぐ） */
         private fun copied(info: Info?): Info? = info?.let {
@@ -225,6 +238,9 @@ internal object ComponentValidationCost {
             val exportRefs = ArrayList<Info>()
             var size = 1L
             var exportSize = 1L
+            // 100 万で止めない展開した大きさ（写し直しの上限）
+            var full = 1L
+            var exportFull = 1L
             for (section in c.sections) {
                 when (section) {
                     is ComponentSection.Nested -> s.components += component(section.component, s)
@@ -235,6 +251,7 @@ internal object ComponentValidationCost {
                         val info = extern(s, item.desc)
                         refs += info
                         size = sum(size, 1 + info.size)
+                        full = add(full, 1 + info.remapBound)
                     }
                     is ComponentSection.Aliases -> for (item in section.items) alias(s, item)
                     is ComponentSection.Instances -> for (item in section.items) {
@@ -270,6 +287,8 @@ internal object ComponentValidationCost {
                         exportRefs += ref
                         size = sum(size, 1 + sizeOf(info))
                         exportSize = sum(exportSize, 1 + sizeOf(info))
+                        full = add(full, 1 + ref.remapBound)
+                        exportFull = add(exportFull, 1 + ref.remapBound)
                         // export も、その種類の添字空間に新しい番号を足す
                         s.push(item.target.sort, info)
                     }
@@ -284,21 +303,27 @@ internal object ComponentValidationCost {
                 }
             }
             val res = refs.any { it.res }
-            val view = Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, res = exportRefs.any { it.res })
-            return Info(size, exports, local = 1L + refs.size, refs = refs, instanceView = view, res = res)
+            val view = Info(
+                exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
+                res = exportRefs.any { it.res },
+            )
+            return Info(size, exports, local = 1L + refs.size, refs = refs, remapBound = full, instanceView = view, res = res)
         }
 
         private fun fromExports(s: Scope, items: List<Pair<String, SortIdx>>): Info {
             val exports = HashMap<String, Info>()
             val refs = ArrayList<Info>()
             var size = 1L
+            var full = 1L
             for ((name, idx) in items) {
                 val info = s.lookup(idx)
                 if (info != null) exports[name] = info
-                refs += info ?: unknown()
+                val ref = info ?: unknown()
+                refs += ref
                 size = sum(size, 1 + sizeOf(info))
+                full = add(full, 1 + ref.remapBound)
             }
-            return Info(size, exports, local = 1L + refs.size, refs = refs, res = refs.any { it.res })
+            return Info(size, exports, local = 1L + refs.size, refs = refs, remapBound = full, res = refs.any { it.res })
         }
 
         private fun alias(s: Scope, a: Alias) {
@@ -350,6 +375,8 @@ internal object ComponentValidationCost {
             val exportRefs = ArrayList<Info>()
             var size = 1L
             var exportSize = 1L
+            var full = 1L
+            var exportFull = 1L
             for (d in decls) {
                 when (d) {
                     is TypeDecl.CoreType -> s.coreTypes += Info(coreType(d.type))
@@ -359,6 +386,7 @@ internal object ComponentValidationCost {
                         val info = extern(s, d.desc)
                         refs += info
                         size = sum(size, 1 + info.size)
+                        full = add(full, 1 + info.remapBound)
                     }
                     is TypeDecl.Export -> {
                         val info = extern(s, d.desc)
@@ -367,15 +395,23 @@ internal object ComponentValidationCost {
                         exportRefs += info
                         size = sum(size, 1 + info.size)
                         exportSize = sum(exportSize, 1 + info.size)
+                        full = add(full, 1 + info.remapBound)
+                        exportFull = add(exportFull, 1 + info.remapBound)
                     }
                 }
             }
             val view = if (component) {
-                Info(exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, res = exportRefs.any { it.res })
+                Info(
+                    exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
+                    res = exportRefs.any { it.res },
+                )
             } else {
                 null
             }
-            return Info(note(size), exports, local = 1L + refs.size, refs = refs, instanceView = view, res = refs.any { it.res })
+            return Info(
+                note(size), exports, local = 1L + refs.size, refs = refs, remapBound = noteFull(full), instanceView = view,
+                res = refs.any { it.res },
+            )
         }
 
         private fun defType(def: DefType, s: Scope): Info = when (def) {
@@ -387,12 +423,18 @@ internal object ComponentValidationCost {
         /** 値の型・関数型・resource。大きさは参照している型の中まで数え、宣言そのものの大きさは参照を 1 と数える */
         private fun valueType(def: DefType, s: Scope): Info {
             val refs = ArrayList<Info>()
+            // 100 万で止めない展開した大きさ（写し直しの上限）。参照は、その先の展開した大きさを足す
+            var full = 1L
             fun v(t: ValType?): Long = when (t) {
                 null -> 0L
-                is ValType.Primitive -> 1L
+                is ValType.Primitive -> {
+                    full = add(full, 1)
+                    1L
+                }
                 is ValType.Ref -> {
                     val info = s.types.getOrNull(t.typeIndex) ?: unknown()
                     refs += info
+                    full = add(full, info.remapBound)
                     info.size
                 }
             }
@@ -400,10 +442,19 @@ internal object ComponentValidationCost {
             var local = 1L
             when (def) {
                 is DefValType.Record -> for (f in def.fields) n = sum(n, v(f.type))
-                is DefValType.Variant -> for (c in def.cases) n = sum(n, 1 + v(c.type))
+                is DefValType.Variant -> for (c in def.cases) {
+                    full = add(full, 1)
+                    n = sum(n, 1 + v(c.type))
+                }
                 is DefValType.Tuple -> for (t in def.types) n = sum(n, v(t))
-                is DefValType.Flags -> n = sum(n, def.names.size.toLong())
-                is DefValType.Enum -> n = sum(n, def.names.size.toLong())
+                is DefValType.Flags -> {
+                    full = add(full, def.names.size.toLong())
+                    n = sum(n, def.names.size.toLong())
+                }
+                is DefValType.Enum -> {
+                    full = add(full, def.names.size.toLong())
+                    n = sum(n, def.names.size.toLong())
+                }
                 is DefValType.ListOf -> n = sum(n, v(def.element))
                 is DefValType.MapOf -> n = sum(n, sum(v(def.key), v(def.value)))
                 is DefValType.Option -> n = sum(n, v(def.type))
@@ -429,7 +480,7 @@ internal object ComponentValidationCost {
                 else -> local += refs.size
             }
             val size = note(n)
-            return Info(size, local = minOf(local, size).coerceAtLeast(1), refs = refs)
+            return Info(size, local = minOf(local, full).coerceAtLeast(1), refs = refs, remapBound = noteFull(full))
         }
 
         /** core の型の大きさ（関数は引数と結果の数、モジュール型は宣言の数） */

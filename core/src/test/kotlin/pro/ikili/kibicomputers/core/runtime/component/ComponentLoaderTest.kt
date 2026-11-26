@@ -985,6 +985,39 @@ class ComponentLoaderTest {
         assertEquals(0L, estimateOf(noResource).remapCost)
     }
 
+    /** 名前 [names] 個の enum を [exports] 回 eq で export するインスタンス型 `$it`（[resource] なら resource も 1 つ export する） */
+    private fun enumInstanceType(names: Int, exports: Int, resource: Boolean = false): String {
+        val cases = (0 until names).joinToString(" ") { "\"e$it\"" }
+        val eqs = (0 until exports).joinToString(" ") { """(export "a$it" (type (eq ${'$'}en)))""" }
+        val res = if (resource) """(export "res" (type (sub resource)))""" else ""
+        return "(type ${'$'}it (instance (type ${'$'}en (enum $cases)) $eqs $res))"
+    }
+
+    @Test
+    fun `写し直しの大きさは、型の大きさの上限の100万で止めない`() {
+        // #935 のレビュー: enum の名前の数は wasmparser の型の大きさに入らないので、wasmparser は断らないまま、写し直しの手間が
+        // 100 万を超える。100 万で止めると、見積もりは上限の半分で止まり、検証が秒単位になる
+        // （名前 3,000 個 × eq 3,000 回で、import 1 回が CPU 1.75 秒、インスタンス化 1 回が 1.6 秒）
+        val n = 3_000
+        // (1) resource を定義する型を 1 回 import するだけ（インスタンス化なし）
+        val imported = wat("(component ${enumInstanceType(n, n, resource = true)} (import \"i\" (instance (type ${'$'}it))))")
+        // (2) その型（resource なし）を export するコンポーネントを 1 回インスタンス化する
+        val instantiated = wat(
+            "(component ${enumInstanceType(n, n)} (component ${'$'}c (alias outer 1 ${'$'}it (type ${'$'}it)) " +
+                "(export \"t\" (type ${'$'}it))) (instance (instantiate ${'$'}c)))",
+        )
+        for (bytes in listOf(imported, instantiated)) {
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= n.toLong() * n) { "${e.remapCost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        // 小さい enum なら今までどおり通る（展開した大きさを数えるだけ）
+        val small = wat("(component ${enumInstanceType(100, 100, resource = true)} (import \"i\" (instance (type ${'$'}it))))")
+        val s = estimateOf(small)
+        assertTrue(s.remapCost in 100L * 100..2L * 101 * 101) { "${s.remapCost}" }
+    }
+
     @Test
     fun `写し直しの見積もりは上限をまたいでも、断る側に外れない`() {
         // 見積もりが上限を超えたら、check は写し直しの大きさをたどらずに展開した大きさに切り替える。切り替えても、
