@@ -51,8 +51,8 @@ import java.util.IdentityHashMap
  * `alias outer` で何度も引く形は、見積もりが 0 のまま検証が秒単位になる（#935 のレビュー。#955 で扱う）。
  * 見積もりにない形は、見張りが時間の上限で止める。
  *
- * 見積もりそのものの手間も抑える。写し直しの大きさをたどる手数を数え、見積もりの上限と同じ値を超えたら、たどるのをやめて
- * 見積もりを上限を超えた値にして断る（[Walker.flatOf]。同じ宣言の連なりを参照する、写して作った型が多い形は、
+ * 見積もりそのものの手間も抑える。写し直しの大きさをたどる手数（積んだ参照の数）を数え、見積もりの上限の [WORK_FACTOR] 倍を
+ * 超えたら、たどるのをやめて断る（[Walker.flatOf]。同じ宣言の連なりを参照する、写して作った型が多い形は、
  * 型ごとにたどり直すので、見積もりを抑えないと入力の大きさの 2 乗の手間になる。N=C=49,000 の 1.29 MB で 270 秒。#935 のレビュー）。
  * 見積もりは見張りの外（`LoadDeadline` なし）で動くので、手数で決定的に止める。
  */
@@ -66,25 +66,42 @@ internal object ComponentValidationCost {
     private const val SATURATED = Long.MAX_VALUE / 2
 
     /**
+     * 写し直しの大きさをたどる手数の上限は、見積もりの上限のこの倍。手数は参照を 1 本ずつ積む数で、積むのは足した宣言の
+     * 大きさ（[Info.local]）の中の参照だけなので、ふつうは見積もりの写し直しの分に収まる。入れ子の写して作った型が、
+     * たどりの上限（展開した大きさ）をまたぐときだけ、その中をたどった分が見積もりに入りきらないので、余裕を持たせる
+     */
+    private const val WORK_FACTOR = 4L
+
+    /**
      * 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は見積もりの値（確かめる型の大きさと、
      * 写し直しの大きさの合計）、[remapCost] はそのうちの写し直しの分
      */
-    class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long, val remapCost: Long)
+    class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long, val remapCost: Long, val work: Long)
+
+    private fun maxWorkOf(budget: Long): Long = if (budget > SATURATED / WORK_FACTOR) SATURATED else budget * WORK_FACTOR
 
     /** [root]（入れ子を含む）の見積もり */
     fun estimate(root: ParsedComponent): Estimate = estimate(root, SATURATED)
 
     /** [budget] を超えたら、写し直しの大きさをたどるのをやめる（見積もりは [budget] を超えたままになる） */
     private fun estimate(root: ParsedComponent, budget: Long): Estimate {
-        val walker = Walker(budget)
+        val walker = Walker(budget, maxWorkOf(budget))
         walker.component(root, null)
-        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost)
+        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost, walker.work)
     }
 
     /** 見積もりが [limits] の上限を超えていたら [WasmLoadException] */
     @Throws(WasmLoadException::class)
     fun check(root: ParsedComponent, limits: ComponentLimits) {
         val e = estimate(root, limits.maxValidationCost)
+        val maxWork = maxWorkOf(limits.maxValidationCost)
+        if (e.work > maxWork) {
+            // 手数で止めたときは、見積もりの値は途中までのもの（上限を超えたかは分からない）なので、数字は手数を出す
+            throw WasmLoadException(
+                "コンポーネントの検証が重すぎる見込み（見積もりのために型をたどる手数が上限 $maxWork を超えた。" +
+                    "見積もりの上限 ${limits.maxValidationCost}）",
+            )
+        }
         if (e.cost > limits.maxValidationCost) {
             throw WasmLoadException(
                 "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさと写し直しの合計 ${e.cost}" +
@@ -153,7 +170,8 @@ internal object ComponentValidationCost {
         }
     }
 
-    private class Walker(private val budget: Long) {
+    /** [budget] は写し直しの大きさをたどるのをやめる見積もりの値、[maxWork] はたどる手数の上限 */
+    private class Walker(private val budget: Long, private val maxWork: Long) {
         var checks = 0L
 
         /** 見積もりの値（確かめる型の大きさと、写し直しの大きさの合計） */
@@ -190,10 +208,15 @@ internal object ComponentValidationCost {
 
         private fun noteFull(full: Long): Long = full.also { if (it > maxFull) maxFull = it }
 
-        /** 大きさを記録する（上限で止める） */
+        /**
+         * 大きさを記録する（上限で止める）。[maxFull] も [maxSize] を下回らないようにする（core の型（モジュール型など）は
+         * これだけを通るので、引けない引数（core モジュールの引数は、添字空間をなぞらないので必ず引けない）の確認が、
+         * それまでの型の大きさの最大より小さくならないように。#935 のレビュー）
+         */
         private fun note(size: Long): Long {
             val s = minOf(size, MAX_TYPE_SIZE)
             if (s > maxSize) maxSize = s
+            if (s > maxFull) maxFull = s
             return s
         }
 
@@ -223,15 +246,17 @@ internal object ComponentValidationCost {
             if (!spend(target.refs.size)) return target.remapBound
             val stack = ArrayList<Info>(target.refs)
             while (stack.isNotEmpty() && total < target.remapBound) {
+                // 積むときに数えたので、取り出すときは数えない（参照 1 本で 1 手）
                 val n = stack.removeAt(stack.size - 1)
-                if (!spend(1)) return target.remapBound
                 if (seen.put(n, Unit) != null) continue
                 if (n.content != null) {
                     total = add(total, flatOf(n, depth + 1))
                     // 中で手数が尽きたら、たどり直さずに止める
-                    if (cost > budget) return target.remapBound
+                    if (exhausted) return target.remapBound
                 } else {
                     total = add(total, n.local)
+                    // 上限に届いたら、その先は積まない（積んでも足さない）
+                    if (total >= target.remapBound) break
                     if (!spend(n.refs.size)) return target.remapBound
                     stack.addAll(n.refs)
                 }
@@ -241,19 +266,27 @@ internal object ComponentValidationCost {
             return result
         }
 
-        /** 写し直しの大きさをたどった手数（[Info.refs] の1つずつ） */
-        private var work = 0L
+        /** 写し直しの大きさをたどった手数（積んだ [Info.refs] の1つずつ） */
+        var work = 0L
+
+        /** 手数が上限 [maxWork] を超えたか */
+        private var exhausted = false
 
         /**
-         * 写し直しの大きさをたどる手数を [steps] 数える。見積もりそのものの手間を、見積もりの上限 [budget] と同じ大きさで抑える
-         * （写して作った型が多く、どれも同じ宣言の連なりを参照する形は、写して作った型ごとにその連なりをたどり直すので、
-         * 入力の大きさの 2 乗になる。#935 のレビュー）。手数が上限を超えたら、見積もりを上限を超えた値にして、これ以上たどらない
-         * （false）。たどる手数は、重なりを除いても、たどった型の大きさの合計に収まるので、通る形が手数で断られることは
-         * ほとんどない（断られる側にずれるだけで、検証には進まない）
+         * 写し直しの大きさをたどる手数を [steps] 数える。見積もりそのものの手間を、手数の上限 [maxWork]（見積もりの上限の
+         * [WORK_FACTOR] 倍）で抑える（写して作った型が多く、どれも同じ宣言の連なりを参照する形は、写して作った型ごとに
+         * その連なりをたどり直すので、入力の大きさの 2 乗になる。#935 のレビュー）。手数が上限を超えたら、これ以上たどらない
+         * （false。[check] は手数で断ったと分かるメッセージで断る）。
+         * 手数は積んだ参照の数で、積むのは足した宣言の [Info.local]（参照を 1 と数える）の中の参照だけ（たどりの上限に届いた
+         * 宣言の参照は積まない）なので、写し直しの見積もりにほぼ収まり、はみ出るのは入れ子の写して作った型がたどりの上限を
+         * またぐ分だけ。上限を見積もりの上限の数倍にしているので、見積もりが上限に収まる形を手数で断ることはまずない
+         * （同じ型への参照が多い宣言を、取り出すときにも数えていたときは、見積もりの約 2 倍になり、断っていた。#935 のレビュー）
          */
         private fun spend(steps: Int): Boolean {
             work += steps
-            if (work <= budget) return true
+            if (work <= maxWork) return true
+            exhausted = true
+            // これ以上たどらない（flatOf は cost > budget を見て、たどらずに展開した大きさを返す）
             cost = maxOf(cost, add(budget, 1))
             return false
         }

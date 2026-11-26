@@ -1058,6 +1058,8 @@ class ComponentLoaderTest {
         val e = assertThrows<WasmLoadException> { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
         val took = (System.nanoTime() - start) / 1_000_000
         assertMessage(e, "検証が重すぎる")
+        // 手数で断ったと分かる（見積もりの値は途中までのものなので出さない）
+        assertMessage(e, "手数")
         assertTrue(took < 3_000) { "$took ms" }
     }
 
@@ -1080,6 +1082,59 @@ class ComponentLoaderTest {
                 assertMessage(e, "検証が重すぎる")
             }
         }
+    }
+
+    @Test
+    fun `同じ型への参照が多い宣言の写し直しは、見積もりが上限に収まれば手数で断らない`() {
+        // #935 のレビュー: 手数を、参照を積むときと取り出すときの両方で数えていたので、同じ型への参照が多い宣言
+        // （`(list u32)` への参照 5,000 個の tuple）では、手数が写し直しの見積もりの約 2 倍になり、見積もり（約 125 万）が
+        // 上限（200 万）に収まるのに断っていた。wasm-tools の検証は通り、CPU 0.3 秒ほど
+        val refs = (0 until 5_000).joinToString(" ") { "${'$'}l" }
+        val records = (0 until 50).joinToString(" ") { """(type ${'$'}r$it (record (field "a" ${'$'}xx)))""" }
+        val eqs = (0 until 50).joinToString(" ") { """(export "e$it" (type (eq ${'$'}r$it)))""" }
+        val types = (0 until 5).joinToString(" ") {
+            """(type ${'$'}it$it (instance (alias outer 1 ${'$'}x (type ${'$'}xx)) $records $eqs (export "res" (type (sub resource)))))"""
+        }
+        val nested = (0 until 5).joinToString(" ") {
+            """(component (alias outer 1 ${'$'}it$it (type ${'$'}t)) (import "i" (instance (type ${'$'}t))))"""
+        }
+        val bytes = wat("(component (type ${'$'}l (list u32)) (type ${'$'}x (tuple $refs)) $types $nested)")
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        val e = ComponentValidationCost.estimate(root)
+        assertTrue(e.cost in ComponentLimits.DEFAULT.maxValidationCost / 2..ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
+        // 手数は写し直しの見積もりを超えない（参照 1 本で 1 手）
+        assertTrue(e.work <= e.remapCost) { "work ${e.work}, remap ${e.remapCost}" }
+        assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+        assertDoesNotThrow { ComponentLoader.load(bytes) }
+    }
+
+    @Test
+    fun `core モジュールを渡すインスタンス化の確認は、それまでの型の大きさの最大で数える`() {
+        // #935 のレビュー: core モジュールの引数（`(with "m" (core module $m))`）は添字空間をなぞらないので必ず引けず、
+        // それまでに見た型の大きさの最大で数える。最大が core の型（モジュール型）のとき、100 万で止めない展開した大きさの最大
+        // （値の型・インスタンス型などでしか更新していなかった）で数えて小さくなり、export 2,000 個のモジュール型を受ける引数
+        // 100 個 × 10 回（約 40 KB）を通していた。main と同じく検証の前に断る
+        val n = 2_000
+        val funcs = (0 until n).joinToString(" ") { """(func (export "f$it"))""" }
+        val decls = (0 until n).joinToString(" ") { """(export "f$it" (func))""" }
+        val imports = (0 until 100).joinToString(" ") { """(import "i$it" (core module (type ${'$'}mt)))""" }
+        val args = (0 until 100).joinToString(" ") { """(with "i$it" (core module ${'$'}m))""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c $args))" }
+        val bytes = wat(
+            """
+            (component
+              (core module ${'$'}m $funcs)
+              (component ${'$'}c (core type ${'$'}mt (module $decls)) $imports)
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(1_000L, e.checkCount)
+        assertTrue(e.maxTypeWeight > n) { "${e.maxTypeWeight}" }
+        // 確認ごとに、それまでの型の大きさの最大（モジュール型の大きさ）
+        assertTrue(e.cost - e.remapCost >= 1_000L * e.maxTypeWeight) { "cost ${e.cost}, remap ${e.remapCost}, max ${e.maxTypeWeight}" }
+        rejectedBeforeValidation(bytes)
     }
 
     /** フィールド [fields] 個の record を [exports] 回 export するコンポーネント `$c` */
