@@ -107,7 +107,7 @@ tasks.test {
 // 作る。build・CI には入れない）。結果は ADR 0043 と StackHeadroom の KDoc に書く。
 // - stackHeadroomColdTest: StackHeadroom.probe だけを JIT し、ほかはすべてインタプリタで動かす（確かめは小さいフレームで測り、守る道は
 //   大きいフレームで動く、いちばん悪い組み合わせ）
-// - stackHeadroomXintTest: 全部インタプリタ（比べるため）
+// - stackHeadroomXintTest: 全部インタプリタ（比べるため。回数 1/4 で、全体が十数分。#903）
 // - stackHeadroomJdk21Test: JDK 21（1.21.1 の本番の JDK。JDK 19 で ReentrantLock の中身（AQS）が書き直された）
 if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
     val headroomTests = listOf(
@@ -133,10 +133,12 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)
-        // インタプリタでは遅いので、1 本の時間の上限を延ばす
-        systemProperty("kibi.stackHeadroom.timeoutSeconds", "1800")
-        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）
-        if (args.isNotEmpty()) systemProperty("kibi.stackHeadroom.roundsScale", "0.25")
+        // インタプリタでは遅いので、1 本の時間の上限を延ばす（`-Pkibi.stackHeadroom.timeoutSeconds=<秒>` で変えられる。#903）
+        systemProperty("kibi.stackHeadroom.timeoutSeconds", providers.gradleProperty("kibi.stackHeadroom.timeoutSeconds").orNull ?: "1800")
+        // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）。
+        // `-Pkibi.stackHeadroom.roundsScale=<割合>` で、どの JVM でも上書きできる（#903。1 にすると、各テストの回数が全部に戻る。ディスクの掃引の幅は、割合では縮めない。割合が効くのは `WARMUP` と `refuseOpen` の `ROUNDS` など、回す回数だけ）
+        val roundsScale = providers.gradleProperty("kibi.stackHeadroom.roundsScale").orNull ?: if (args.isNotEmpty()) "0.25" else null
+        roundsScale?.let { systemProperty("kibi.stackHeadroom.roundsScale", it) }
         testLogging.showStandardStreams = true
         outputs.upToDateWhen { false }
     }

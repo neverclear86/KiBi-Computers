@@ -55,10 +55,15 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * そのものになり、入口の確かめが「ぎりぎり通る」深さで、その先の巻き戻し・巻き直しが収まるかを見る。巻き直した後の結果は、尽きなかった回でも
  * 期待値と合うことを確かめる。
  *
- * 確かめられたのは、「境目の近くで入口の確かめを通った回は、巻き戻して巻き直し、最後まで終わる（結果も合う）」まで。手元の結果
- * （JIT、Windows）では、尽きた回は確かめの中か詰め物の再帰そのもの（`wind` に入る前）・ランタイムの中で、巻き戻した後に尽きた回は、
- * 巻き直した後の入口の確かめの中（`PROBE`）だけだった。
- * 巻き戻し・巻き直しの最中に尽きた回は観測されていない（その位置に当てることは #903）
+ * [edgeSweep] で確かめられるのは、「境目の近くで入口の確かめを通った回は、巻き戻して巻き直し、最後まで終わる（結果も合う）」まで。
+ * 1 回目の通りと巻き直しの通りで詰め物が同じなので、どちらの通りでもいちばん深いのは入口の確かめで、巻き戻した後に尽きた回は、
+ * 巻き直した後の入口の確かめの中（`PROBE`）だけになる。
+ *
+ * 巻き直しの最中（#903）は、巻き直しの通りでだけ詰め物を足す [rewindSweep] が当てる。燃料待ちからの再開のとき、`LinkedComponent.call`
+ * に入ってから止まった `kibi.async_fuel` に着くまで（lift・`wind` の巻き直し・燃料切れの処理の入口の確かめ）で尽きた回が、どの JVM でも
+ * 出る（入口の確かめの外の、Endive・canon の中を含む）。どの回もロックの途中ではなく、プロセスだけが `call stack exhausted` で終わり、
+ * 退避した値は残らず、同じ台の次のプロセスは巻き戻し・巻き直しを経て期待値で終わる。
+ * 巻き戻しの最中（`requestUnwind` から、ドライバーが `WaitFuel` を返すまで）は、構造上当たらない（[rewindSweep] の KDoc）
  *
  * 毎回の待ちは、`StackExhaustionLockTest` と同じ見分け（[awaitOrClassify]。遅れか停止か）と上限付きの読み（[peek]）を使う
  */
@@ -239,24 +244,37 @@ class ComponentStackExhaustionLockTest {
         override val kind: ProcessKind,
         private val function: String,
         val result: AtomicLong,
-        private val pads: (() -> CanonValue?) -> CanonValue?,
+        /** 詰め物で包んで [function] を呼ぶ。1 つ目の引数は、燃料待ちからの再開（巻き直しの通り）か */
+        private val pads: (Boolean, () -> CanonValue?) -> CanonValue?,
     ) : ProcessDriver {
         /** 燃料切れで巻き戻した回数（巻き直しも同じ回数。再開のたびに巻き直す） */
         val unwinds = AtomicInteger()
 
+        /**
+         * 今の再開（巻き直しの通り）で、詰め物を積み終えて `LinkedComponent.call` を呼んだか（[rewindSweep] が、尽きた回が詰め物の中か
+         * 巻き直しの中かを分ける。スタックトレースは JVM が上から 1024 段で切るので、詰め物が深いと `call` のフレームが見えない）
+         */
+        @Volatile
+        var rewindCallEntered = false
+
         override fun configure(ctx: ProcessContext, builder: WasmInstanceConfig.Builder) = Unit
 
-        override fun start(ctx: ProcessContext): StepResult = run(ctx)
+        override fun start(ctx: ProcessContext): StepResult = run(ctx, resuming = false)
 
         override fun resume(ctx: ProcessContext, ready: List<WaitKey>): StepResult {
             check(ready.isEmpty()) { "ホストの関数は待たない。燃料の後の再開だけのはず: $ready" }
+            // 本番（`WasiP2Driver`）と同じく、巻き直しは詰め物の外（浅いところ）で始める
+            rewindCallEntered = false
             ctx.component.beginRewind()
-            return run(ctx)
+            return run(ctx, resuming = true)
         }
 
-        private fun run(ctx: ProcessContext): StepResult {
+        private fun run(ctx: ProcessContext, resuming: Boolean): StepResult {
             val component = ctx.component
-            val r = pads { component.call(function) }
+            val r = pads(resuming) {
+                if (resuming) rewindCallEntered = true
+                component.call(function)
+            }
             if (component.unwound) {
                 val suspend = (component.env as KernelLinkEnv).suspend
                 check(ctx.takeFuelUnwind()) { "燃料切れでないのに巻き戻した" }
@@ -269,8 +287,12 @@ class ComponentStackExhaustionLockTest {
         }
     }
 
-    private fun driver(kind: ProcessKind, function: String, pad: Int, result: AtomicLong = AtomicLong()): TopDriver =
-        TopDriver(kind, function, result) { body -> padThen(pad, body) }
+    /**
+     * [pad] 段の詰め物で [function] を呼ぶドライバー。[resumeExtra] は、燃料待ちからの再開（巻き直しの通り）でだけ足す詰め物の段数
+     * （[rewindSweep]。巻き直しの通りの残りのスタックを、1 回目の通りより少なくする）
+     */
+    private fun driver(kind: ProcessKind, function: String, pad: Int, result: AtomicLong = AtomicLong(), resumeExtra: Int = 0): TopDriver =
+        TopDriver(kind, function, result) { resuming, body -> padThen(if (resuming) pad + resumeExtra else pad, body) }
 
     /** `edge` の期待値: 150 回の（200 の和 20100 と、浅い `f(3)`）と、`f(0)`。`f(n)` は 100 + 21n（echo は 21 文字を返す） */
     private val expectedShallow = 150L * (20100 + 100 + 3 * 21) + 100
@@ -395,8 +417,8 @@ class ComponentStackExhaustionLockTest {
      * 境目の 16 段手前から [SPAN] 段先までを回数で等分した刻みで動かす（1 段ずつではない。96 回で約 3.3 段、冷えた道の 24 回で約 13 段）。
      * 境目を探す回も含めて毎回、終わった回（EXITED）は結果が期待値と合うこと、尽きた回はプロセスだけが `call stack exhausted` で終わり、
      * 尽きた位置がロックの途中でないこと、ロック・同じ台・別の台が動き続けることを確かめる。尽きる位置は、入口の確かめ・詰め物の再帰・
-     * `wind` の中（巻き戻し・巻き直し、ホストの関数・canon）のどこにもなりうるが、巻き戻し・巻き直しの最中に尽きた回は観測されていない
-     * （クラスの KDoc）。
+     * `wind` の中（巻き戻し・巻き直し、ホストの関数・canon）のどこにもなりうるが、両方の通りの詰め物が同じなので、巻き直した後に尽きるのは
+     * 入口の確かめの中になる（巻き直しの最中に当てるのは [rewindSweep]。クラスの KDoc）。
      *
      * `top`・`edge` を使わないのは、1 回の実行で一番深い道が `f` の連鎖の先（echo の包みの確かめ 32 段、realloc・post-return の中の
      * `ensure(128)`）になり、巻き戻しの道は、その分浅いところで動くので、境目の近くでも入口の確かめと同じ余裕が残るため
@@ -475,6 +497,171 @@ class ComponentStackExhaustionLockTest {
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
+    /**
+     * 燃料切れの巻き直しの通り（`TopDriver.resume` → `beginRewind` → `LinkedComponent.call` → lift → `wind` の巻き直し（`kibi.async_pop`）→
+     * 止まった `kibi.async_fuel` → 燃料切れの処理の入口の確かめ → `endFuelRewind`）だけ、残りのスタックを減らして尽きさせる（#903）。
+     *
+     * [edgeSweep] は 1 回目の通りと巻き直しの通りで詰め物が同じなので、両方の通りでいちばん深いのは入口の確かめになり、巻き直した後に
+     * 尽きた回は確かめの中（`PROBE`）だけだった。本番では、巻き直しの枝は滅多に通らず、JIT が外してインタプリタの大きいフレームで動き
+     * うるので、「巻き直しの通りの方が余裕が少ない」ことは起きうる。そこで、1 回目の通りは境目の [REWIND_START_MARGIN] 段手前
+     * （巻き戻しまで通る深さ）に置き、再開のときだけ詰め物を `k` 段足す。`beginRewind` は本番と同じく詰め物の外で呼ぶ。
+     * `k` は 2 つの境目を二分探索で探す: 巻き直しの通りが尽き始める `kA` と、尽きる位置が `LinkedComponent.call` より前（詰め物の再帰の中）に
+     * 出る `kB`。その間を、回数で等分した刻み（`i * 幅 / 回数`。上の端まで届く。幅が回数より狭ければ 1 段ずつ、繰り返して）で回す。
+     *
+     * 尽きた回は、スタックトレースの区画に加えて、プロセスの印で分けて数える:
+     * - 巻き直しの最中: `rewindingForFuel`（再開で立ち、止まった燃料切れの呼び出しに着いたときに下ろす）が立ったままで、ドライバーが
+     *   詰め物を積み終えて `LinkedComponent.call` を呼んだ後（`TopDriver.rewindCallEntered`。呼ぶ前なら、詰め物の再帰の中）
+     * - 巻き戻しの最中: `fuelUnwound`（`requestUnwind` の前に立ち、ドライバーが `takeFuelUnwind` で下ろす）が立ったまま
+     *
+     * 巻き直しの最中に尽きた回のうち、入口の確かめ（`PROBE`）の外（Endive の rethrow・canon の lift・`LinkedComponent.function` の
+     * 引き当てなど）で尽きた回が 1 度もなければ落とす（確かめの中で尽きる回は [edgeSweep] でも出るので、それだけでは新しい観測にならない）。
+     *
+     * 巻き戻しの最中は、構造上ここでも当たらない: 巻き戻しを求めるのは燃料切れの処理の入口の確かめ（`StackHeadroom.FUEL_HANDLER_FRAMES`）を
+     * 通った後で、その後の `requestUnwind`・ゲストの `kibi.async_push` は確かめより浅いところで動き、ドライバーが `WaitFuel` を返すのは
+     * 詰め物の外へ戻った後なので、1 回目の通りの詰め物を増やすと、先に確かめで尽きる。数えて 0 回であることを出す（落とさない）。
+     *
+     * 回ごとに、[edgeSweep] と同じ確かめ（終わった回は結果が期待値、尽きた回はプロセスだけが `call stack exhausted` で終わり、位置がロックの
+     * 途中でなく、ロック・同じ台・別の台が動き続ける）に加えて、尽きた回の後に退避した値（`asyncStack`）が残らないことを見る。
+     * [BATCH] 回ごとに、詰め物のない `wind` が巻き戻し・巻き直しを経て期待値で終わること（同じ台で次のプロセスが正しく動く）も見る
+     */
+    private fun rewindSweep(rounds: Int) {
+        val kind = ProcessKind.WAIT_POINT
+        val tally = SoePositions()
+        var exited = 0
+        var secondPass = 0
+        var inRewind = 0
+        var inRewindPastProbe = 0
+        var inUnwind = 0
+        var width = 0
+        var stride = 0
+        val windows = mutableListOf<String>()
+        overdraftsExpected = false
+        onMachines(kind, tally) { r ->
+            /** 1 回目の通りを [pad] 段、巻き直しの通りを [pad] + [extra] 段の詰め物で `wind` を動かし、尽きた区画（終わったら `null`）を返す */
+            fun run(pad: Int, extra: Int): String? {
+                val d = driver(kind, "wind", pad, resumeExtra = extra)
+                val rt = r.m.spawnRt(program, d)
+                awaitEnd(r, rt, "pad $pad + $extra")
+                var tag: String? = null
+                if (rt.process.state == ProcessState.EXITED) {
+                    exited++
+                    assertEquals(expectedWind, d.result.get(), "巻き直しの余裕を減らして終わった回の結果が違う（pad $pad + $extra、巻き戻し ${d.unwinds.get()} 回）")
+                } else {
+                    assertCrashedBySoe(rt, r.m, "pad $pad + $extra")
+                    val inCall = d.rewindCallEntered
+                    tag = when {
+                        rt.fuelUnwound -> "巻き戻しの最中"
+                        rt.rewindingForFuel && inCall -> "巻き直しの最中"
+                        rt.rewindingForFuel -> "巻き直しの前"
+                        d.unwinds.get() > 0 -> "巻き直した後"
+                        else -> "最初の通り"
+                    }
+                    val position = tally.record(rt, tag)
+                    if (d.unwinds.get() > 0) secondPass++
+                    if (tag == "巻き戻しの最中") inUnwind++
+                    if (tag == "巻き直しの最中") {
+                        inRewind++
+                        if (position != SoePositions.Position.PROBE) inRewindPastProbe++
+                    }
+                    if (position.isLock) throw AssertionError("スタックがロックを取る・放す途中で尽きた（pad $pad + $extra、$tag）: ${describe(r, rt)}")
+                    // 巻き戻し・巻き直しの途中で尽きても、退避した値はプロセスの終わりで捨てられる
+                    assertTrue(rt.process.asyncStack?.isEmpty != false, "尽きた後に退避した値が残った（pad $pad + $extra、$tag）")
+                }
+                checkAlive(r, "pad $pad + $extra", rt)
+                return tag
+            }
+            // 詰め物の再帰を JIT のコンパイルに乗せてから探す（[edgeSweep] と同じ）
+            val warmEnd = System.nanoTime() + 500_000_000L
+            while (System.nanoTime() < warmEnd) padThen(2000) { 0 }
+
+            /** [predicate] が真になる最小の値（[start] では偽とみなし、倍々で真を見つけて二分で縮める） */
+            fun search(start: Int, predicate: (Int) -> Boolean): Int {
+                var lo = start
+                var step = 64
+                var hi = start + step
+                while (!predicate(hi)) {
+                    lo = hi
+                    step *= 2
+                    hi = start + step
+                    check(step < (1 shl 20)) { "詰め物を増やしても尽きない" }
+                }
+                while (hi - lo > 1) {
+                    val mid = (lo + hi) / 2
+                    if (predicate(mid)) hi = mid else lo = mid
+                }
+                return hi
+            }
+
+            /** 1 回目の通りの詰め物と、`kA`・`kB` を探す */
+            fun findWindow(): Triple<Int, Int, Int> {
+                // 両方の通りが同じ詰め物のときの境目（[edgeSweep] の境目）
+                val edge = search(-1) { run(it, 0) != null }
+                // 境目は回ごとに揺れ、探している間に JIT でフレームが大きく戻ると、境目の手前のつもりの 1 回目の通りが尽きる
+                // （どれだけ足しても「最初の通り」で、kA が見つからない）。事前の確かめを通った後の kA・kB の探索の途中で起きることも
+                // あるので、探索の述語は 1 回目の通りで尽きた回で探索を打ち切り（真を返して倍々を止める）、1 回目の詰め物を倍々で手前に
+                // 下げて探し直す（打ち切らないと、尽き方が「毎回」になったとき、述語が真にならないまま倍々の上限に達して落ちる）
+                var margin = REWIND_START_MARGIN
+                while (true) {
+                    val start = maxOf(0, edge - margin)
+                    // 1 回目の通りで尽きる詰め物では、巻き直しの通りまで届かない。足さなくても 1 回目の通りで尽きるなら下げる
+                    if (start > 0 && run(start, 0) == "最初の通り") {
+                        margin *= 2
+                        continue
+                    }
+                    var firstPassCrashed = false
+
+                    /** 1 回目の通りで尽きた回は印を立てて探索を打ち切る。それ以外は [target] で決める */
+                    fun probe(extra: Int, target: (String?) -> Boolean): Boolean {
+                        val tag = run(start, extra)
+                        if (tag == "最初の通り") firstPassCrashed = true
+                        return firstPassCrashed || target(tag)
+                    }
+                    // 1 回目の通りで尽きた回は、巻き直しの通りが尽きたことにしない
+                    val kA = search(-1) { probe(it) { tag -> tag != null } }
+                    val kB = if (firstPassCrashed) kA else search(kA) { probe(it) { tag -> tag == "巻き直しの前" } }
+                    if (firstPassCrashed) {
+                        // 詰め物 0 段の 1 回目の通りは、BATCH 回ごとの確かめ（詰め物のない wind が終わる）と同じく尽きないはず
+                        check(start > 0) { "1 回目の通りを詰め物 0 段にしても、1 回目の通りで尽きた（境目 $edge）" }
+                        margin *= 2
+                        continue
+                    }
+                    windows += "境目 $edge、1 回目 $start、kA $kA、kB $kB"
+                    return Triple(start, kA, kB)
+                }
+            }
+
+            val count = stackHeadroomRounds(rounds)
+            var window = findWindow()
+            for (i in 0 until count) {
+                if (i > 0 && i % BATCH == 0) {
+                    // 同じ台の次のプロセスが、詰め物なしで巻き戻し・巻き直しを経て正しく終わる
+                    assertEquals(null, run(0, 0), "詰め物のない wind が尽きた")
+                    // 回すうちに JIT でフレームが小さくなると境目が動くので、探し直す
+                    window = findWindow()
+                }
+                val (start, kA, kB) = window
+                val lo = maxOf(0, kA - 4)
+                width = maxOf(1, kB + 4 - lo)
+                // 幅が回数より広いときは、先に掛けてから割る（`edgeSweep` と同じ）。先に刻みを切り捨てると、窓の上側（`kB` 側）に届かない
+                stride = maxOf(1, width / count)
+                val offset = if (width <= count) i % width else (i.toLong() * width / count).toInt()
+                run(start, lo + offset)
+            }
+        }
+        println(
+            "#903 component rewind: 終わった $exited 回、巻き直しの通りで尽きた $secondPass 回、うち巻き直しの最中 $inRewind 回" +
+                "（入口の確かめの外 $inRewindPastProbe 回）、巻き戻しの最中 $inUnwind 回、窓の幅 $width 段、刻み $stride 段、" +
+                "窓 [${windows.joinToString(" / ")}]、${tally.describe()}",
+        )
+        assertTrue(secondPass > 0, "巻き直しの通りで 1 度も尽きなかった")
+        assertTrue(inRewind > 0, "巻き直しの最中（`LinkedComponent.call` の中）で 1 度も尽きなかった")
+        // 巻き直しの最中のうち、止まった `kibi.async_fuel` に着いた後の入口の確かめ（PROBE）で尽きる回は edgeSweep でも出る。
+        // この掃引が当てたいのは、その外（Endive の rethrow・canon の lift・`LinkedComponent.function` の引き当てなど）で尽きる回なので、
+        // 窓の取り方や刻みが変わってそこへ届かなくなったら落とす
+        assertTrue(inRewindPastProbe > 0, "巻き直しの最中に、入口の確かめの外（Endive・canon の中）で 1 度も尽きなかった")
+        assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
+    }
+
     private fun soe(rt: ProcessRuntime): StackOverflowError? = SoePositions().soe(rt)
 
     private companion object {
@@ -483,6 +670,9 @@ class ComponentStackExhaustionLockTest {
 
         /** `edgeSweep` が、境目から先へ進む詰め物の段数（回数で等分する。1 段ずつではない。入口の確かめの 32 段分より広く取る） */
         const val SPAN = 320
+
+        /** [rewindSweep] が、1 回目の通りの詰め物を、両方の通りが同じ詰め物のときの境目から何段手前に置くか */
+        const val REWIND_START_MARGIN = 64
     }
 
     @Test
@@ -500,4 +690,8 @@ class ComponentStackExhaustionLockTest {
     @Test
     fun `WAIT_POINTのコンポーネントで尽きる境目の近くで燃料切れの巻き戻し・巻き直しをしても、ロック・CPU・許可は壊れず、結果は変わらない`() =
         edgeSweep(ProcessKind.WAIT_POINT, rounds = 96)
+
+    @Test
+    fun `WAIT_POINTのコンポーネントで燃料切れの巻き直しの通りだけ余裕を減らして尽きさせても、ロック・CPU・許可は壊れず、退避した値も残らない`() =
+        rewindSweep(rounds = 96)
 }
