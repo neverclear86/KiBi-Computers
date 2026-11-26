@@ -35,7 +35,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * その後に回の分を片付け、片付けた後も同じことと、`usedBytes` が回の前（共有の部分だけ）に戻ることを見る。最後に外して 3 つとも 0 に戻ること、
  * 尽きた回・終わりまで動いた回の両方があること、1 段ずつの掃引（境目を探す途中の大きな詰め物は除く）で、尽きた位置が操作より浅いところ
  * （詰め物の再帰・テストのコード）まで届いたこと（幅が操作の深さを覆う）と、最初の 1 段ずつの区間が境目をまたいだこと（境目の直後、
- * 操作のいちばん深い所が尽きる範囲を 1 段ずつ動かした）を確かめる。
+ * 操作のいちばん深い所が尽きる範囲から 1 段ずつ動かした。次の区間は、最初の区間が境目から先に動かした段の続きから始めるので、間を飛ばさない。
+ * ただし区間ごとに境目を探し直すので、境目が JIT で動いた分だけ区間の継ぎ目はずれうる）を確かめる。
  * ロックの途中で尽きたかは見ない。`TmpFileSystem` が使うのは `synchronized` と `MemoryAccount` の CAS だけで、`SoePositions` が
  * ロックに数える `java.util.concurrent.locks.` のフレームがこの道には出ない（見ても常に 0 で、確かめにならない）。モニターは例外でも放され、
  * 尽きた後の木と勘定は毎回の後の確かめが見る
@@ -300,7 +301,8 @@ class TmpFileSystemTreeStackExhaustionTest {
      * `swept` は、この 1 段ずつの動かし方のとき `true`）。最初の区間が境目をまたがなかった（全部尽きた、または尽きなかった回が [MAX_LEAD] 回より多い）ときは、
      * 探し直した境目からその区間をやり直す（`DiskFileSystemStackExhaustionTest.walkEdge` にはこのやり直しがない）。やり直す回数を使い切っても、
      * 区間が境目をまたいではいれば（尽きた回も尽きなかった回もある）、そのまま進む（尽きなかった回が多いだけ。またがないときだけ失敗する）。
-     * 区間ごとに、1 段ずつ動かして尽きた回を [commitSwept] に渡す（`true` は数える、`false` はやり直しで捨てた区間）。最後の境目を返す
+     * 最初の区間を採ったら、境目から先に動かした段（尽きた回の数）だけ進める（区間の全部を進めると、境目の手前で使った回の分を飛ばす）。
+     * 境目から先を [WIDTH] 段動かすまで続ける。区間ごとに、1 段ずつ動かして尽きた回を [commitSwept] に渡す（`true` は数える、`false` はやり直しで捨てた区間）。最後の境目を返す
      */
     private fun walkEdge(attempt: (pad: Int, swept: Boolean) -> Boolean, commitSwept: (keep: Boolean) -> Unit): Int {
         repeat(stackHeadroomRounds(WARMUP)) { attempt(0, false) }
@@ -321,8 +323,9 @@ class TmpFileSystemTreeStackExhaustionTest {
         }
 
         // 幅は回数の割合（`kibi.stackHeadroom.roundsScale`。インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903。`DiskFileSystemStackExhaustionTest.walkEdge` と
-        // 同じ）。縮めると「境目から先を 1 段ずつ全部」でなくなり、`-Xint` では入口の確かめ（`probe` もインタプリタの大きいフレーム）の幅より狭くなって、
-        // 尽きる位置が確かめの外（[SoePositions.Position.OTHER]）まで届かない。減らすのは JIT をかける回数（[WARMUP]）だけ
+        // 同じ）。1/4（150 段）に縮めた版も、手元の 3 つの JVM では 29 の型すべてで確かめの外（[SoePositions.Position.OTHER]）まで届いたが、
+        // `-Xint` の余りは 20〜36 回と小さい（`-Xint` では確かめの中だけで 110 回前後を使う）。確かめが 128 段の `HOST_IO_FRAMES` の
+        // `DiskFileSystemStackExhaustionTest` では、縮めると届かなかった。減らすのは JIT をかける回数（[WARMUP]）だけ
         val width = WIDTH
         var edge = findEdge()
         var done = 0
@@ -343,18 +346,19 @@ class TmpFileSystemTreeStackExhaustionTest {
                 commitSwept(false)
                 continue
             }
+            commitSwept(true)
             if (done == 0) {
                 check(straddled) { "最初の 1 段ずつの区間が、境目をまたがない（$EDGE_RETRIES 回探し直しても。尽きた $crashed / $batch 回）" }
-                sweptAcrossEdge = true
+                // 区間の初めの（batch − crashed）回は境目の手前で、1 段ずつ動かした境目から先は crashed 段だけ。区間の全部（batch）を進めると、
+                // 次の区間（探し直した境目の 8 段手前から）との間の段を飛ばすので、境目から先に動かした分（crashed）だけ進める
+                // （次の区間は、探し直した境目が本当の境目と同じなら、前の区間の終わりと 8 段重なる）
+                done += crashed
+            } else {
+                done += batch
             }
-            commitSwept(true)
-            done += batch
         }
         return edge
     }
-
-    /** 最初の 1 段ずつの区間が、尽きなかった回と尽きた回の両方を含んだ（境目の直後を掃いた）か。[walkEdge] が立てる */
-    private var sweptAcrossEdge = false
 
     private fun sweep(op: Op) = timeout(Duration.ofSeconds(TIMEOUT_SECONDS)) {
         val rig = Rig()
@@ -416,9 +420,7 @@ class TmpFileSystemTreeStackExhaustionTest {
         )
         assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
         assertTrue(completed + refused > 0, "1 度も終わりまで動かなかった")
-        // 深い側: 最初の 1 段ずつの区間が境目をまたいだ（操作のいちばん深い所が尽きる、境目の直後を 1 段ずつ動かした）
-        assertTrue(sweptAcrossEdge, "1 段ずつの掃引が、境目の直後を通っていない")
-        // 幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
+        // 深い側（最初の 1 段ずつの区間が境目をまたいだこと）は、[walkEdge] の中の `check` が確かめる。幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
         assertTrue(
             swept.count(SoePositions.Position.OTHER) > 0,
             "1 段ずつの掃引で、操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${swept.describe()}",
@@ -526,7 +528,7 @@ class TmpFileSystemTreeStackExhaustionTest {
 
         /**
          * 境目から、詰め物をずらして動かす幅（段数）。入口の確かめと操作が使うスタックの幅より広くする。回数の割合（`roundsScale`）では縮めない
-         * （`-Xint` では確かめの `probe` のフレームが大きく、縮めると確かめの外まで届かない）
+         * （1/4 の 150 段でも手元では確かめの外まで届いたが、`-Xint` では確かめの中だけで 110 回前後を使い、余りが 20 回ほどと小さい）
          */
         const val WIDTH = 600
 
