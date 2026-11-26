@@ -375,8 +375,9 @@ const CI_SCHEMA = {
     failingChecks: { type: 'array', items: { type: 'string' }, description: '終わって落ちたチェックの名前。省略は []' },
     failureLog: { type: 'string', description: '失敗の原因が分かるログの短い抜粋（2,000 文字まで。プレーンな文字列で、XML・タグを貼らない）。通ったら省略' },
     noChecks: { type: 'boolean', description: '待っても PR にチェックが 1 つも出なかったら true。省略は false' },
-    runId: { type: ['integer', 'null'], description: '落ちた run の ID（分かれば）' },
-    attempt: { type: ['integer', 'null'], description: '落ちた run の試行の番号（分かれば）' },
+    // 数でも文字列でも受ける（モデルは run の ID を文字列で返すことがある。断られる理由を増やさない）
+    runId: { type: ['integer', 'string', 'null'], description: '落ちた run の ID（分かれば）' },
+    attempt: { type: ['integer', 'string', 'null'], description: '落ちた run の試行の番号（分かれば）' },
   },
   required: ['passed', 'mergeable'],
 }
@@ -707,7 +708,7 @@ const CI_NET_FAILURES = 5
 const CI_NET_MINUTES = 15
 function ciWaitRules(pr, onGiveUp) {
   return `CI の待ちの上限（#953。必ず守る）:
-- この段階を始めたら、最初に \`date +%s\` で始めた時刻を記録する。CI を待つのは、この段階の中で合わせて最大 ${CI_WAIT_MINUTES} 分にする。超えたら、待つのをやめて${onGiveUp}
+- 上限を測り始めるのは、CI を待ち始める時点（\`gh pr checks ${pr}\` や \`gh pr view ${pr}\` で CI の状態を見るのを始める直前）からで、段階の開始からではない。その直前に \`date +%s\` で時刻を記録する。main の取り込み・build・GameTest・GameTest のロックの待ちなど、CI を待つ前の作業の時間は数えない。CI を待つのは、記録した時刻から合わせて最大 ${CI_WAIT_MINUTES} 分にする。超えたら、待つのをやめて${onGiveUp}
 - \`gh pr checks ${pr} --watch\` が終了コード 0 以外で終わったら、そのたびに \`gh pr checks ${pr} --json name,state,bucket\` を取り直して判断する（\`--watch\` は、チェックが落ちたときも、接続が切れたときも 0 以外で終わる）。
 - 接続の失敗（\`api.github.com\`・\`error connecting\`・\`dial tcp\`・\`connection\`・\`timeout\`・\`EOF\`・HTTP の 5xx など）なら、Monitor の until-loop などで 30 秒ほど間を空けてから回し直す（前景の \`sleep\` は使えない）。接続の失敗が続けて ${CI_NET_FAILURES} 回になるか、接続の失敗が続いている時間が ${CI_NET_MINUTES} 分を超えたら、あきらめて${onGiveUp}
 - 待ちをあきらめたときも、決まりに沿って結果を返す（返さずに止まらない）。`

@@ -48,7 +48,7 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const agent = async (prompt, opts) => {
     const kind = opts.label.split(':')[0].replace(/~\d+$/, '')
     calls.push(kind)
-    prompts.push({ kind, prompt })
+    prompts.push({ kind, prompt, opts })
     const q = queues[kind]
     const next = q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
     return typeof next === 'function' ? next() : next
@@ -58,7 +58,8 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const result = await fn(args, agent, parallel, m => logs.push(m), () => {})
   const count = k => calls.filter(c => c === k).length
   const promptOf = k => prompts.find(p => p.kind === k)?.prompt
-  return { result, calls, logs, count, promptOf, issue: result.results[0] }
+  const schemaOf = k => prompts.find(p => p.kind === k)?.opts.schema
+  return { result, calls, logs, count, promptOf, schemaOf, issue: result.results[0] }
 }
 
 test('既定の流れはマージまで進み、やり直しは呼ばれない', async () => {
@@ -768,4 +769,29 @@ test('プロンプト: CI 待ちとマージの段階に、待ちの上限と接
     assert.match(r.promptOf(k), /続けて 5 回/)
   }
   assert.match(r.promptOf('ci'), /unfinished=true/)
+})
+
+test('プロンプト: 待ちの上限は CI を待ち始めた時点から測り、段階の開始からではない（マージの段階の build・GameTest は数えない）', async () => {
+  const r = await run()
+  for (const k of ['ci', 'merge']) {
+    assert.match(r.promptOf(k), /CI を待ち始める時点/)
+    assert.match(r.promptOf(k), /段階の開始からではない/)
+    assert.match(r.promptOf(k), /GameTest のロックの待ちなど、CI を待つ前の作業の時間は数えない/)
+    assert.doesNotMatch(r.promptOf(k), /この段階を始めたら、最初に/)
+  }
+})
+
+test('CI 待ちのスキーマ: runId・attempt は数でも文字列でも null でも受ける（必須は passed と mergeable だけ）', async () => {
+  const r = await run()
+  const schema = r.schemaOf('ci')
+  assert.deepEqual(schema.required, ['passed', 'mergeable'])
+  for (const k of ['runId', 'attempt']) {
+    for (const t of ['integer', 'string', 'null']) assert.ok(schema.properties[k].type.includes(t), `${k} は ${t} を受ける`)
+  }
+})
+
+test('runId・attempt を文字列で返した CI 待ちの結果も、失敗の抜粋に run の ID と試行が入る', async () => {
+  const failed = { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], runId: '123', attempt: '2', failureLog: 'boom' }
+  const r = await run({ ci: [failed, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
+  assert.match(r.promptOf('ci-fix'), /run 123（試行 2）/)
 })
