@@ -25,9 +25,14 @@ const MERGED = {
 const fail = (failedStep, reason, extra = {}) => ({ ...MERGED, status: 'needs_human', failedStep, reason, ...extra })
 const PENDING = { gradleStillRunning: true, runningLogs: ['merge-build-2.log'] }
 
-// overrides: ラベルの種類（'merge' など。`:` より前）→ 呼ばれる順の応答（なければ既定）。関数なら呼んで使う
+// スタックでない PR の判定の結果（#936）
+const NO_STACK = { baseRef: 'main', stackNumber: null, members: [] }
+
+// overrides: ラベルの種類（'merge' など。`:` より前）→ 呼ばれる順の応答（なければ既定）。関数なら呼んで使う。
+// 配列でなく関数を渡したら、毎回 (prompt, label) で呼んで応答にする（複数の Issue を流すときに、プロンプトで答えを分ける）
 async function run(overrides = {}, args = { issues: [904] }) {
-  const queues = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [k, [...v]]))
+  const queues = Object.fromEntries(Object.entries(overrides).filter(([, v]) => Array.isArray(v)).map(([k, v]) => [k, [...v]]))
+  const responders = Object.fromEntries(Object.entries(overrides).filter(([, v]) => typeof v === 'function'))
   const calls = []
   const prompts = []
   const logs = []
@@ -44,13 +49,19 @@ async function run(overrides = {}, args = { issues: [904] }) {
     report: () => 'ok',
     ask: () => 'ok',
     'cross-check': prompt => ({ premiseSound: true, needsHuman: true, findings: prompt, question: 'q', guidance: null }),
+    // スタック（#936）。既定はスタックでない PR
+    'stack-detect': () => NO_STACK,
+    'stack-check': () => NO_STACK,
+    'stack-sync': () => ({ outcome: 'merged', pushed: true, headSha: 'abc', worktree: 'D:/w', summary: 'ok' }),
+    'stack-merge': () => ({ ...MERGED, stackMergeOutcome: 'merged' }),
+    'stack-note': () => 'ok',
   }
   const agent = async (prompt, opts) => {
     const kind = opts.label.split(':')[0].replace(/~\d+$/, '')
     calls.push(kind)
     prompts.push({ kind, prompt, opts })
     const q = queues[kind]
-    const next = q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
+    const next = responders[kind] ? responders[kind](prompt, opts.label) : q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
     return typeof next === 'function' ? next() : next
   }
   const parallel = fns => Promise.all(fns.map(f => f()))
@@ -58,8 +69,9 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const result = await fn(args, agent, parallel, m => logs.push(m), () => {})
   const count = k => calls.filter(c => c === k).length
   const promptOf = k => prompts.find(p => p.kind === k)?.prompt
+  const promptsOf = k => prompts.filter(p => p.kind === k)
   const schemaOf = k => prompts.find(p => p.kind === k)?.opts.schema
-  return { result, calls, logs, count, promptOf, schemaOf, issue: result.results[0] }
+  return { result, calls, logs, count, promptOf, promptsOf, prompts, schemaOf, issue: result.results[0] }
 }
 
 test('既定の流れはマージまで進み、やり直しは呼ばれない', async () => {
@@ -812,4 +824,281 @@ test('runId・attempt を文字列で返した CI 待ちの結果も、失敗の
   const failed = { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], runId: '123', attempt: '2', failureLog: 'boom' }
   const r = await run({ ci: [failed, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
   assert.match(r.promptOf('ci-fix'), /run 123（試行 2）/)
+})
+
+// ---- Stacked PRs（#936） ----
+// 下の段 PR #900（Issue #338。この実行にない）、上の段 PR #906（この実行の Issue #904）の 2 段のスタック
+const LOWER = { pr: 900, branch: 'issue-338-lower', baseRef: 'main', position: 1, state: 'OPEN', draft: false, needsHuman: false, headSha: 'l1' }
+const TOP = { pr: PR, branch: IMPL.branch, baseRef: LOWER.branch, position: 2, state: 'OPEN', draft: false, needsHuman: false, headSha: 't1' }
+const stackOf = (...members) => ({ baseRef: members.find(m => m.pr === PR)?.baseRef ?? 'main', stackNumber: 925, members })
+const STACK2 = stackOf(LOWER, TOP)
+const STACK_CMD = `gh stack merge ${PR} --yes --squash`
+const TWO_ISSUES = [
+  { number: 904, title: 'a', areas: ['a'], openDeps: [], blockedReason: null, needsPlan: false },
+  { number: 905, title: 'b', areas: ['b'], openDeps: [], blockedReason: null, needsPlan: false },
+]
+const UPPER_IMPL = { ...IMPL, pr: 907, branch: 'issue-905-y', worktree: 'D:/w/issue-905', baseRef: 'issue-904-x' }
+
+test('スタック: 上の段は、下の段から順に取り込み、一番上の木で 1 回だけ確かめて gh stack merge でマージする', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('stack-merge'), 1)
+  const syncs = r.promptsOf('stack-sync')
+  assert.deepEqual(syncs.map(p => p.opts.label), ['stack-sync:900', 'stack-sync:906'])
+  assert.match(syncs[0].prompt, /`origin\/main` を取り込んで/)
+  assert.match(syncs[1].prompt, /`origin\/issue-338-lower` を取り込んで/)
+  // 取り込みは通常の push だけ。force を使うコマンドは使わないと書く
+  for (const p of syncs) {
+    assert.match(p.prompt, /force push はしない/)
+    assert.match(p.prompt, /`gh stack sync`・`gh stack rebase`・`gh stack push`・`gh stack submit` は force-with-lease で push するので使わない/)
+    assert.match(p.prompt, /Gradle は動かさない/)
+  }
+  const m = r.promptOf('stack-merge')
+  assert.ok(m.includes(STACK_CMD))
+  assert.match(m, /#900・#906/)
+  assert.match(m, /`git merge origin\/issue-338-lower`/)
+  assert.doesNotMatch(m, /`gh pr merge \d+/)
+  assert.match(m, /runGameTestServer/)
+  // この実行にない下の段は、上の段の流れが片付けと報告をする
+  assert.equal(r.count('cleanup'), 2)
+  assert.ok(r.promptsOf('cleanup').some(p => p.prompt.includes('.worktrees/issue-338')))
+  assert.ok(r.promptsOf('stack-note').some(p => p.opts.label === 'stack-note:900'))
+  assert.equal(r.count('cross-check'), 0)
+  assert.deepEqual(r.issue.stack, { number: 925, prs: [900, 906], position: 2 })
+})
+
+test('スタック: gh stack merge が権限の判定で拒否されたら、確かめのあとで 1 回だけ聞き、下の段にはその PR を指す案内を付ける', async () => {
+  const denied = fail('merge', 'head t2。build と両 GameTest は通った。CI: #900 run 1 pass、#906 run 2 pass', { stackMergeOutcome: 'permission_denied' })
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-merge': [denied] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-merge'), 1)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+  assert.equal(r.result.questions.length, 1)
+  assert.equal(r.result.questions[0].pr, PR)
+  const check = r.promptOf('cross-check')
+  assert.match(check, /権限の判定で拒否された/)
+  assert.match(check, /回避の手段/)
+  assert.ok(check.includes(STACK_CMD))
+  assert.match(check, /スタックごとマージしてよいか/)
+  // 権限の拒否のあとで、ほかの口（gh pr merge・merge-async）を試す段階はない
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('merge-flaky'), 0)
+  const note = r.promptsOf('stack-note').find(p => p.opts.label === 'stack-note:900')
+  assert.ok(note)
+  assert.match(note.prompt, /論点は PR #906 で扱う/)
+  assert.match(note.prompt, /needs-human/)
+  assert.equal(r.issue.stackPointer, PR)
+})
+
+test('スタック: 下の段に needs-human があれば、取り込みも確かめもせず、新しく聞かずに下の段の論点を指す', async () => {
+  const waiting = stackOf({ ...LOWER, needsHuman: true }, TOP)
+  const r = await run({ 'stack-detect': [waiting], 'stack-check': [waiting] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.count('ask'), 0)
+  assert.equal(r.result.questions.length, 0)
+  const note = r.promptsOf('stack-note').find(p => p.opts.label === `stack-note:${PR}`)
+  assert.ok(note)
+  assert.match(note.prompt, /論点は PR #900 で扱う/)
+  assert.equal(r.issue.stackPointer, 900)
+})
+
+test('スタック: 下の段が MERGED（部分マージのあと）なら、取り込まずに 1 回だけ聞く', async () => {
+  const partial = stackOf({ ...LOWER, state: 'MERGED' }, TOP)
+  const r = await run({ 'stack-detect': [partial], 'stack-check': [partial] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.match(r.issue.mergeReason, /rebase（force push）が要る/)
+})
+
+test('スタック: マージの直前にスタックの形が変わっていたら、取り込まずに止まる', async () => {
+  const third = { ...TOP, pr: 999, branch: 'issue-999-x', baseRef: TOP.branch, position: 3 }
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [stackOf(LOWER, TOP, third)] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.match(r.issue.mergeReason, /形が変わっていた/)
+})
+
+test('スタック: 取り込みが字面で解けない衝突なら、上の段に進まず止まる', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-sync': [{ outcome: 'conflict', pushed: false, headSha: null, worktree: null, summary: 'Foo.kt' }] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('stack-sync'), 1)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.match(r.issue.mergeReason, /1 段目 PR #900 に main を取り込めなかった/)
+})
+
+test('スタック: 確かめの過負荷の GameTest の失敗は、ふつうのマージと同じく 1 回だけ回し直す', async () => {
+  const r = await run({
+    'stack-detect': [STACK2],
+    'stack-check': [STACK2],
+    'stack-merge': [fail('gametest', 'GameTest が落ちた', { gameTestFailedOnly: true, maxTicksBehind: 5000 })],
+    'stack-merge-retry': [{ ...MERGED, stackMergeOutcome: 'merged' }],
+  })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('stack-merge-retry'), 1)
+  assert.ok(r.promptOf('stack-merge-retry').includes(STACK_CMD))
+})
+
+test('スタック: 全段の CI が通らなければ、不安定なテストの回し直し（1 つの PR 用）には回さずに止まる', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2], 'stack-merge': [fail('ci', '#900 の build が落ちた')] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('merge-flaky'), 0)
+  assert.equal(r.count('cross-check'), 1)
+})
+
+test('スタック: base が main でなく、スタックにも属さない PR はマージせずに聞く', async () => {
+  const r = await run({ 'stack-detect': [{ baseRef: 'issue-338-lower', stackNumber: null, members: [] }] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 1)
+  assert.match(r.promptOf('cross-check'), /gh stack link/)
+})
+
+test('スタック: 下の段で、上の段がこの実行にないなら、この PR だけではマージせず、聞かない', async () => {
+  const lower = { ...LOWER, pr: PR, branch: IMPL.branch }
+  const upper = { ...TOP, pr: 950, branch: 'issue-950-up', baseRef: IMPL.branch }
+  const r = await run({ 'stack-detect': [{ baseRef: 'main', stackNumber: 925, members: [lower, upper] }] })
+  assert.equal(r.issue.status, 'ready')
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  assert.equal(r.count('cross-check'), 0)
+  assert.equal(r.issue.question, null)
+  assert.match(r.issue.mergeReason, /上の段 PR #950 と一緒に/)
+})
+
+test('スタック: ふつうのマージの手順は、gh pr merge の前にスタックになっていないかを確かめる', async () => {
+  const r = await run()
+  assert.equal(r.count('stack-detect'), 1)
+  assert.match(r.promptOf('merge'), /\.stack/)
+  assert.match(r.promptOf('merge'), /スタックの PR になっている/)
+})
+
+test('スタック: 実装の指示に、base を main 以外にしたら gh stack link で紐づけることが入る', async () => {
+  const r = await run()
+  assert.match(r.promptOf('implement'), /gh stack link <下の PR の番号> <この PR の番号>/)
+})
+
+test('スタック: CI の段階の衝突は、上の段では main ではなく base（下の段のブランチ）を取り込む', async () => {
+  const r = await run({
+    implement: [{ ...IMPL, baseRef: 'issue-338-lower' }],
+    ci: [CONFLICT, OK_CI],
+    conflict: [{ outcome: 'merged', pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+    'stack-detect': [STACK2],
+    'stack-check': [STACK2],
+  })
+  const p = r.promptOf('conflict')
+  assert.match(p, /`git merge origin\/issue-338-lower`/)
+  assert.doesNotMatch(p, /`git merge origin\/main`/)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('スタック: base が main の PR の衝突の取り込みは、今までどおり main を取り込む', async () => {
+  const r = await run({
+    ci: [CONFLICT, OK_CI],
+    conflict: [{ outcome: 'merged', pushed: true, summary: 'ok', gradleStillRunning: false, runningLogs: [] }],
+  })
+  assert.match(r.promptOf('conflict'), /`git merge origin\/main`/)
+})
+
+// 同じ実行の中で、Issue #904（PR #906。下の段）と Issue #905（PR #907。上の段）がスタックになる
+test('スタック: 同じ実行の 2 つの Issue が下と上の段なら、詰まらずに上の段の流れが 1 回でまとめてマージし、両方 merged になる', async () => {
+  const low = { ...LOWER, pr: 906, branch: 'issue-904-x' }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x' }
+  const members = [low, up]
+  const r = await run({
+    select: [{ issues: TWO_ISSUES }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    'stack-detect': prompt => ({ stackNumber: 925, members, baseRef: prompt.includes('PR #907') ? 'issue-904-x' : 'main' }),
+    'stack-check': () => ({ stackNumber: 925, members, baseRef: 'issue-904-x' }),
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'merged')
+  assert.equal(byIssue[905].status, 'merged')
+  assert.equal(r.count('stack-merge'), 1)
+  assert.equal(r.promptsOf('stack-merge')[0].opts.label, 'stack-merge:907')
+  assert.equal(r.count('merge'), 0)
+  assert.deepEqual(r.promptsOf('stack-sync').map(p => p.opts.label), ['stack-sync:906', 'stack-sync:907'])
+  // 下の段の worktree は、この実行の実装の結果のものを使う
+  assert.match(r.promptsOf('stack-sync')[0].prompt, /worktree D:\/w\/issue-904 で作業する/)
+  // 片付けは、それぞれの流れが自分の worktree に 1 回ずつ
+  assert.equal(r.count('cleanup'), 2)
+  assert.equal(r.count('cross-check'), 0)
+})
+
+test('スタック: 同じ実行の下の段がマージしてよいところまで進まなければ、上の段は確かめずに止まり、新しく聞かない', async () => {
+  const low = { ...LOWER, pr: 906, branch: 'issue-904-x' }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x' }
+  const r = await run({
+    select: [{ issues: TWO_ISSUES }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    // 下の段（PR #906）の CI だけが落ち続ける
+    ci: prompt => prompt.includes('PR #906') ? { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], failureLog: 'boom' } : OK_CI,
+    'ci-fix': () => ({ pushed: false, rerun: false, summary: '直せない', gradleStillRunning: false, runningLogs: [] }),
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'issue-904-x', members: [low, up] }),
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.equal(byIssue[905].stackPointer, 906)
+  assert.equal(r.count('stack-sync'), 0)
+  assert.equal(r.count('stack-merge'), 0)
+  // 人への質問は、下の段の自分の論点の 1 つだけ
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.result.questions.length, 1)
+  assert.equal(r.result.questions[0].pr, 906)
+  assert.ok(r.promptsOf('stack-note').some(p => p.opts.label === 'stack-note:907' && /論点は PR #906 で扱う/.test(p.prompt)))
+})
+
+test('スタック: 同じ実行の上の段が止まったら、下の段は上の段の論点を指し、新しく聞かない', async () => {
+  const low = { ...LOWER, pr: 906, branch: 'issue-904-x' }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: 'issue-904-x' }
+  const members = [low, up]
+  const denied = fail('merge', '拒否', { stackMergeOutcome: 'permission_denied' })
+  const r = await run({
+    select: [{ issues: TWO_ISSUES }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    'stack-detect': () => ({ stackNumber: 925, members, baseRef: 'main' }),
+    'stack-check': () => ({ stackNumber: 925, members, baseRef: 'issue-904-x' }),
+    'stack-merge': [denied],
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'needs_human')
+  assert.equal(byIssue[905].status, 'needs_human')
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.result.questions.length, 1)
+  assert.equal(r.result.questions[0].pr, 907)
+  assert.ok(r.promptsOf('stack-note').some(p => p.opts.label === 'stack-note:906' && /論点は PR #907 で扱う/.test(p.prompt)))
+})
+
+test('スタック: 同じ実行で上の段の Issue が下の段に依存していたら、互いに待たずに終わる', async () => {
+  const low = { ...LOWER, pr: PR, branch: IMPL.branch }
+  const up = { ...TOP, pr: 907, branch: 'issue-905-y', baseRef: IMPL.branch }
+  const r = await run({
+    select: [{ issues: [TWO_ISSUES[0], { ...TWO_ISSUES[1], openDeps: [904] }] }],
+    implement: prompt => prompt.includes('Issue #904') ? IMPL : UPPER_IMPL,
+    'stack-detect': () => ({ stackNumber: 925, baseRef: 'main', members: [low, up] }),
+  }, { issues: [904, 905] })
+  const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+  assert.equal(byIssue[904].status, 'ready')
+  assert.equal(byIssue[905].status, 'blocked')
+})
+
+test('スタック: どのプロンプトも、force を使う gh stack のコマンドや merge-async を実行させない', async () => {
+  const r = await run({ 'stack-detect': [STACK2], 'stack-check': [STACK2] })
+  const banned = '`gh stack sync`・`gh stack rebase`・`gh stack push`・`gh stack submit` は force-with-lease で push するので使わない'
+  for (const p of r.prompts) {
+    const text = p.prompt.split(banned).join('')
+    assert.doesNotMatch(text, /gh stack (sync|rebase|push|submit)\b/, p.opts.label)
+    assert.doesNotMatch(text, /git push[^`]*--force/, p.opts.label)
+  }
+  // merge-async は「別の口では試さない」の文の中にだけ出る
+  for (const p of r.promptsOf('stack-merge')) {
+    for (const line of p.prompt.split('\n').filter(l => l.includes('merge-async'))) assert.match(line, /試さない/)
+  }
 })
