@@ -722,6 +722,24 @@ test('CI 待ちが 3 回とも未完了（unfinished）で返ったら、ci-fix 
   assert.match(r.issue.question, /CI が終わらなかった/)
 })
 
+test('unfinished=true でも落ちたチェックの名前があれば、待ち直さず ci-fix に回り、名前が残る', async () => {
+  const u = { passed: false, mergeable: 'MERGEABLE', unfinished: true, failingChecks: ['build', 'gametest (in_progress)'], runId: 456, attempt: 2, failureLog: 'boom' }
+  const r = await run({ ci: [u, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
+  assert.equal(r.count('ci-fix'), 1)
+  assert.match(r.promptOf('ci-fix'), /build/)
+  assert.doesNotMatch(r.promptOf('ci-fix'), /CI が終わらなかった|gametest \(in_progress\)/)
+  assert.match(r.promptOf('ci-fix'), /run 456（試行 2）/)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('unfinished=true で終わっていないチェックの名前だけなら、今までどおり待ち直す', async () => {
+  const u = { passed: false, mergeable: 'MERGEABLE', unfinished: true, failingChecks: ['build (pending)'] }
+  const r = await run({ ci: [u, u, u] })
+  assert.equal(r.count('ci'), 3)
+  assert.equal(r.count('ci-fix'), 0)
+  assert.match(r.issue.question, /CI が終わらなかった/)
+})
+
 test('落ちたチェックの名前がない結果が 3 回続いても、ci-fix に回さない', async () => {
   const r = await run({ ci: [PR948_CI, PR948_CI, PR948_CI] })
   assert.equal(r.count('ci-fix'), 0)

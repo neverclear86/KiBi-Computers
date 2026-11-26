@@ -741,8 +741,12 @@ ${ciWaitRules(pr, 'passed=false・unfinished=true で返す（failingChecks に�
     }
     ci = normalizeCi(raw)
     if (ci.mergeable === 'CONFLICTING') return ci
-    const unfinished = ci.unfinished || ci.failingChecks.some(c => UNFINISHED_CHECK.test(c))
-    if (ci.passed || (ci.failingChecks.length && !unfinished)) return ci
+    // 終わっていないチェックの名前を除いた、本当に落ちたチェック。unfinished=true でも、名前があれば落ちたものとして扱う
+    // （プロンプトでは上限で返すとき入れないよう指示しているが、守られないことがある。捨てると本物の失敗が ci-fix に回らない。#953）
+    const failed = ci.failingChecks.filter(c => !UNFINISHED_CHECK.test(c))
+    if (ci.passed) return ci
+    if (failed.length) return { ...ci, failingChecks: failed }
+    const unfinished = ci.unfinished || ci.failingChecks.length > 0
     log(`PR #${pr}: ${ci.unfinished ? 'CI が終わる前に待ちの上限か接続の失敗で返した' : unfinished ? 'まだ終わっていないチェックを落ちたものとして返した' : ci.noChecks ? 'チェックが出ない（衝突はしていない）' : 'CI の結果に落ちたチェックの名前がない'}。待ち直す（${attempt + 1}/3）`)
   }
   // 衝突していないのに、待ち直してもチェックが出ないなら、コードで直せる失敗ではない（ci-fix に回さず、報告の段階で人に聞く。#855）
