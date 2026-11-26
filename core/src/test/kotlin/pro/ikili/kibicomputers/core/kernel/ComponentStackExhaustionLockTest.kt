@@ -513,6 +513,9 @@ class ComponentStackExhaustionLockTest {
      *   詰め物を積み終えて `LinkedComponent.call` を呼んだ後（`TopDriver.rewindCallEntered`。呼ぶ前なら、詰め物の再帰の中）
      * - 巻き戻しの最中: `fuelUnwound`（`requestUnwind` の前に立ち、ドライバーが `takeFuelUnwind` で下ろす）が立ったまま
      *
+     * 巻き直しの最中に尽きた回のうち、入口の確かめ（`PROBE`）の外（Endive の rethrow・canon の lift・`LinkedComponent.function` の
+     * 引き当てなど）で尽きた回が 1 度もなければ落とす（確かめの中で尽きる回は [edgeSweep] でも出るので、それだけでは新しい観測にならない）。
+     *
      * 巻き戻しの最中は、構造上ここでも当たらない: 巻き戻しを求めるのは燃料切れの処理の入口の確かめ（`StackHeadroom.FUEL_HANDLER_FRAMES`）を
      * 通った後で、その後の `requestUnwind`・ゲストの `kibi.async_push` は確かめより浅いところで動き、ドライバーが `WaitFuel` を返すのは
      * 詰め物の外へ戻った後なので、1 回目の通りの詰め物を増やすと、先に確かめで尽きる。数えて 0 回であることを出す（落とさない）。
@@ -594,7 +597,9 @@ class ComponentStackExhaustionLockTest {
                 // 両方の通りが同じ詰め物のときの境目（[edgeSweep] の境目）
                 val edge = search(-1) { run(it, 0) != null }
                 // 境目は回ごとに揺れ、探している間に JIT でフレームが大きく戻ると、境目の手前のつもりの 1 回目の通りが尽きる
-                // （どれだけ足しても「最初の通り」で、kA が見つからない）。そのときは 1 回目の詰め物を倍々で手前に下げて探し直す
+                // （どれだけ足しても「最初の通り」で、kA が見つからない）。事前の確かめを通った後の kA・kB の探索の途中で起きることも
+                // あるので、探索の述語は 1 回目の通りで尽きた回で探索を打ち切り（真を返して倍々を止める）、1 回目の詰め物を倍々で手前に
+                // 下げて探し直す（打ち切らないと、尽き方が「毎回」になったとき、述語が真にならないまま倍々の上限に達して落ちる）
                 var margin = REWIND_START_MARGIN
                 while (true) {
                     val start = maxOf(0, edge - margin)
@@ -603,18 +608,23 @@ class ComponentStackExhaustionLockTest {
                         margin *= 2
                         continue
                     }
-                    // 1 回目の通りで尽きた回は、巻き直しの通りが尽きたことにしない
                     var firstPassCrashed = false
-                    val kA = search(-1) {
-                        val tag = run(start, it)
+
+                    /** 1 回目の通りで尽きた回は印を立てて探索を打ち切る。それ以外は [target] で決める */
+                    fun probe(extra: Int, target: (String?) -> Boolean): Boolean {
+                        val tag = run(start, extra)
                         if (tag == "最初の通り") firstPassCrashed = true
-                        tag != null && tag != "最初の通り"
+                        return firstPassCrashed || target(tag)
                     }
-                    if (firstPassCrashed && start > 0) {
+                    // 1 回目の通りで尽きた回は、巻き直しの通りが尽きたことにしない
+                    val kA = search(-1) { probe(it) { tag -> tag != null } }
+                    val kB = if (firstPassCrashed) kA else search(kA) { probe(it) { tag -> tag == "巻き直しの前" } }
+                    if (firstPassCrashed) {
+                        // 詰め物 0 段の 1 回目の通りは、BATCH 回ごとの確かめ（詰め物のない wind が終わる）と同じく尽きないはず
+                        check(start > 0) { "1 回目の通りを詰め物 0 段にしても、1 回目の通りで尽きた（境目 $edge）" }
                         margin *= 2
                         continue
                     }
-                    val kB = search(kA) { run(start, it) == "巻き直しの前" }
                     windows += "境目 $edge、1 回目 $start、kA $kA、kB $kB"
                     return Triple(start, kA, kB)
                 }
@@ -645,6 +655,10 @@ class ComponentStackExhaustionLockTest {
         )
         assertTrue(secondPass > 0, "巻き直しの通りで 1 度も尽きなかった")
         assertTrue(inRewind > 0, "巻き直しの最中（`LinkedComponent.call` の中）で 1 度も尽きなかった")
+        // 巻き直しの最中のうち、止まった `kibi.async_fuel` に着いた後の入口の確かめ（PROBE）で尽きる回は edgeSweep でも出る。
+        // この掃引が当てたいのは、その外（Endive の rethrow・canon の lift・`LinkedComponent.function` の引き当てなど）で尽きる回なので、
+        // 窓の取り方や刻みが変わってそこへ届かなくなったら落とす
+        assertTrue(inRewindPastProbe > 0, "巻き直しの最中に、入口の確かめの外（Endive・canon の中）で 1 度も尽きなかった")
         assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
     }
 
