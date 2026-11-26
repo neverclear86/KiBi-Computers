@@ -260,9 +260,19 @@ object ScreenSyncGameTests {
         // GameTest のサーバーと偽物のプレイヤーは追跡するチャンクの範囲が狭い（2 チャンク）ので、見はじめる距離まで広げる
         val viewDistance = helper.level.server.playerList.viewDistance
         helper.level.chunkSource.setViewDistance(8)
-        whenTestEnds(helper) { helper.level.chunkSource.setViewDistance(viewDistance) }
+        var watcher: ServerPlayer? = null
+        var cleaned = false
+        // 何度呼んでもよい（成功の段と、テストが終わったときの両方から呼ぶ）。視距離と偽物のプレイヤーは、失敗・タイムアウトでも戻す
+        fun cleanUpAll() {
+            if (cleaned) return
+            cleaned = true
+            helper.level.chunkSource.setViewDistance(viewDistance)
+            watcher?.let { cleanUp(helper, it) }
+        }
+        whenTestEnds(helper) { cleanUpAll() }
         val between = (START + STOP) / 2
         val (player, client) = watcherAt(helper, ScreenTier.COLOR, between, viewDistance = 8)
+        watcher = player
         val scan = ScreenWatchers.DEFAULT_SCAN_INTERVAL_TICKS + 2
         helper.startSequence()
             .thenIdle(scan)
@@ -292,7 +302,7 @@ object ScreenSyncGameTests {
             .thenExecute {
                 helper.assertTrue(!be.isWatchedBy(player), "the player should stop watching beyond the stop distance")
                 helper.assertTrue(client.keyframes == 1, "moving around should not resend the whole screen")
-                cleanUp(helper, player)
+                cleanUpAll()
             }
             .thenSucceed()
     }
