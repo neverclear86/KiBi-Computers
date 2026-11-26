@@ -620,7 +620,7 @@ object SaveCleanupGameTests {
 
     private val AUDIT_LOGGER = System.getLogger("kibicomputers.gametest")
 
-    /** 変換の記録を見るクラス（[ChunkReferenceProbe.transformedRegionStorage] の既定と同じ5つ。ログに出す用） */
+    /** 変換の記録を見るクラス（[ChunkReferenceProbe.transformedRegionStorage] の既定と同じ5つ。ログに出し、既定の一覧の中身を [transformAuditCountsCoremods] で固定する） */
     private val AUDITED = listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java, ChunkMap::class.java)
 
     /** テスト用の coremod の変換の記録（FML の coremod は、サービス名 `fml` の TRANSFORMER として残る） */
@@ -660,6 +660,28 @@ object SaveCleanupGameTests {
         val audit = ChunkReferenceProbe.modLauncherAudit()
         helper.assertTrue(audit != null, "the transformer audit trail should be available")
         helper.assertTrue(ChunkReferenceProbe.transformedRegionStorage(audit, classes).isEmpty(), "the real RegionFileStorage should not count")
+        // 既定のクラスの一覧: 5クラスのどれに coremod が当たっても、そのクラスだけが数えられる（一覧からクラスを外すと落ちる）。
+        // 本物の記録に偽の TRANSFORMER を1つ足すだけで、クラスローダーの確かめは本物のまま
+        fun withCoremodOn(target: Class<*>) = TransformAudit { name ->
+            val activities = audit!!.activities(name)
+            if (name == target.name) activities.orEmpty() + COREMOD else activities
+        }
+        for (type in AUDITED) {
+            val counted = ChunkReferenceProbe.transformedRegionStorage(withCoremodOn(type))
+            helper.assertTrue(
+                counted.size == 1 && counted[0].startsWith("${type.name}: ") && "TRANSFORMER fml:kibicomputers_test_coremod" in counted[0],
+                "a coremod on ${type.name} should count with the default classes: $counted",
+            )
+        }
+        val everywhere = TransformAudit { name -> audit!!.activities(name).orEmpty() + COREMOD }
+        val all = ChunkReferenceProbe.transformedRegionStorage(everywhere).map { it.substringBefore(": ") }
+        helper.assertTrue(all == AUDITED.map { it.name }, "the default classes should be the five chunk storage classes: $all")
+        // ChunkMap の coremod は、Mixin を数えない方針の外で、既定の作りでない理由に数えられる
+        val chunkMap = ChunkReferenceProbe.untrustedRegionStorage(helper.level.server, withCoremodOn(ChunkMap::class.java))
+        helper.assertTrue(
+            chunkMap.size == 1 && chunkMap[0].startsWith("${ChunkMap::class.java.name}: "),
+            "a coremod on ChunkMap should make the chunk storage untrusted: $chunkMap",
+        )
         val entityType = ChunkReferenceProbe.transformedRegionStorage(audit, listOf(EntityType::class.java))
         helper.assertTrue(
             entityType.size == 1 && "TRANSFORMER fml" in entityType[0],
