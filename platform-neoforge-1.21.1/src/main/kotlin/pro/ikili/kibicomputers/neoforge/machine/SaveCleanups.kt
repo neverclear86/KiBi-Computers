@@ -1,6 +1,9 @@
 package pro.ikili.kibicomputers.neoforge.machine
 
 import com.mojang.logging.LogUtils
+import cpw.mods.modlauncher.Launcher
+import cpw.mods.modlauncher.TransformingClassLoader
+import cpw.mods.modlauncher.api.IEnvironment
 import net.minecraft.Util
 import net.minecraft.core.BlockPos
 import net.minecraft.core.registries.Registries
@@ -124,7 +127,8 @@ internal object SaveCleanups {
 
     /**
      * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules]・[untrustedReasons] はテストが差し替える（既定は今のサーバーのもの）。
-     * [untrustedReasons] は、チャンクを読み書きする側が既定の作りでない理由の一覧を返す（空なら既定の作り。[ChunkReferenceProbe.untrustedRegionStorage]）
+     * [untrustedReasons] は、チャンクを読み書きする側が既定の作りでない理由の一覧を返す（空なら既定の作り。[ChunkReferenceProbe.untrustedRegionStorage]）。
+     * [regionOf] は、チャンクのリージョンファイルの場所を返す（テストが、別の名前の保存先に移した環境を作るために差し替える）
      */
     fun start(
         dryRun: Boolean,
@@ -133,17 +137,18 @@ internal object SaveCleanups {
         modules: FileModuleStore? = ServerMachines.moduleStore,
         settings: SaveCleanupSettings = SaveCleanupSettings.DEFAULT,
         untrustedReasons: (MinecraftServer) -> List<String> = { ChunkReferenceProbe.untrustedRegionStorage(it) },
+        regionOf: (ServerLevel, ChunkPos) -> Path = { level, chunk -> ChunkReferenceProbe.regionFile(level, chunk) },
     ): SaveCleanup? {
         val s = server ?: return null
         // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
         if (running?.let { !it.finished || it.settling } == true || store == null) return null
         // 理由の一覧は掃除1回につき1回だけ調べ、問いの判定とログの両方に同じ結果を使う
         val untrusted = untrustedReasons(s)
-        val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty())
+        val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty(), regionOf = regionOf)
         if (untrusted.isNotEmpty()) {
             // 掃除1回につき1行（問いごとには出さない）
             LOGGER.info(
-                "The chunk storage is modified or substituted ({}); the computer save cleanup keeps directories at positions without a region file",
+                "The chunk storage is modified, substituted or transformed ({}); the computer save cleanup keeps directories at positions without a region file",
                 untrusted.joinToString(),
             )
         }
@@ -190,6 +195,27 @@ internal object SaveCleanups {
 }
 
 /**
+ * ModLauncher の変換の記録（`ITransformerActivity`）の1件を写したもの（[ChunkReferenceProbe.transformedRegionStorage]）。
+ * [type] は記録の種類の名前（[PLUGIN]・[TRANSFORMER]・[REASON]）、[context] はその中身（PLUGIN なら先頭が launch plugin の名前、
+ * TRANSFORMER なら先頭が変換のサービスの名前（FML の coremod は `fml`）で、続きが変換のラベル）
+ */
+internal data class TransformActivity(val type: String, val context: List<String>) {
+    /** ログ・理由に載せる形（「種類 中身:…」） */
+    fun describe(): String = "$type ${context.joinToString(":")}"
+
+    companion object {
+        const val PLUGIN: String = "PLUGIN"
+        const val TRANSFORMER: String = "TRANSFORMER"
+        const val REASON: String = "REASON"
+    }
+}
+
+/** クラス名の変換の記録を返す口（[ChunkReferenceProbe.modLauncherAudit]。テストは差し替える）。記録が引けなければ `null` */
+internal fun interface TransformAudit {
+    fun activities(className: String): List<TransformActivity>?
+}
+
+/**
  * `owner.bin` の位置のチャンクに、その ID のケースがあるかを答える（#564。[MachineReferenceProbe]）。メインスレッドで問われ、答えはどのスレッドからでも返る。
  *
  * - ディメンションが今のサーバーにない（MOD を外しただけかもしれない）: [MachineReference.UNKNOWN]
@@ -213,12 +239,14 @@ internal object SaveCleanups {
  * チャンクの NBT は覚えない（1,000 件分を持つと大きいため。同じチャンクを何度か読むことはある。問いの数は [SaveCleanupSettings.maxProbesInFlight] まで）
  *
  * [regionNamesTrusted] は、チャンクを読み書きする側（`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage`）に処理を書き換える Mixin が当たっておらず、
- * 実際に使われているインスタンスがバニラのクラスそのものか（[untrustedRegionStorage]）。
+ * 実際に使われているインスタンスがバニラのクラスそのもので、coremod などの変換も当たっていないか（`ChunkMap` も含む。[untrustedRegionStorage]）。
  * 作るときに1回だけ決める（メインスレッドで作る。問いごと・IO のスレッドでは調べない）。テストは差し替える
  */
 internal class ChunkReferenceProbe(
     private val server: MinecraftServer,
     val regionNamesTrusted: Boolean = untrustedRegionStorage(server).isEmpty(),
+    /** チャンクのリージョンファイルの場所を返す（既定は `ChunkMap` が実際に開く保存先。テストが差し替える） */
+    private val regionOf: (ServerLevel, ChunkPos) -> Path = { level, chunk -> regionFile(level, chunk) },
 ) : MachineReferenceProbe {
     override fun probe(id: UUID, owner: MachineOwner, answer: Consumer<MachineReference>) {
         val location = ResourceLocation.tryParse(owner.dimension)
@@ -236,7 +264,7 @@ internal class ChunkReferenceProbe(
         }
         // ここから先のディスクの確認（stat）と読みは、メインスレッドでしない（遅いディスクで tick を止めない）。IO のスレッドの仕事にする
         val region = try {
-            regionFile(level, chunk)
+            regionOf(level, chunk)
         } catch (e: RuntimeException) {
             // 保存先が分からない（ChunkMap の中身が想定と違う）なら、削除側には倒さない
             answer.accept(MachineReference.UNKNOWN)
@@ -322,16 +350,90 @@ internal class ChunkReferenceProbe(
          * サーバー [server] のチャンクを読み書きする側が、既定の作りと確かめられない理由（空なら既定の作り）。
          * 既定の作りなら「リージョンファイル `r.X.Z.mca` がない ⇒ そのチャンクはない」が成り立つ（外部のチャンクファイル `.mcc` はリージョンのヘッダーからしか指されない）。
          *
-         * 2つを見る。
+         * 3つを見る。
          * - クラスの書き換え（[modifiedRegionStorage]）: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないか。
          *   `ChunkMap` は、`ChunkStorage` のメソッドを上書きする Mixin が当たっていないか
          * - 差し替え（[substitutedRegionStorage]）: 全ディメンションで、実際に使われている `ChunkMap`・`IOWorker`・`RegionFileStorage` のインスタンスがバニラのクラスそのものか。
          *   `IOWorker` は `final` でなく、コンストラクターは `protected`、`loadAsync`・`store` は上書きできるので、バイトコードを書き換えなくてもサブクラスが作れる。
          *   それを `ChunkStorage.worker`（`final`）に入れるのは、アクセサーの Mixin・リフレクション・AT で足りる（アクセサーの Mixin はクラスの書き換えとしては数えないので、こちらで見る）
+         * - 変換の記録（[transformedRegionStorage]。#959）: 上の4クラスと `ChunkMap` に、coremod などの変換（ModLauncher の記録の TRANSFORMER、許可した名前でない PLUGIN）が当たっていないか。
+         *   coremod はメソッドの本体を書き換えても、Mixin の印にも実行時のクラスにも現れないので、ModLauncher の記録で見る。[audit] はテストが差し替える
          *
          * 調べるのに失敗したら、確かめられないとして理由に数える（残す側）。掃除1回につき1回、メインスレッドで呼ぶ（問いごと・IO のスレッドでは調べない）
          */
-        fun untrustedRegionStorage(server: MinecraftServer): List<String> = modifiedRegionStorage() + substitutedRegionStorage(server)
+        fun untrustedRegionStorage(server: MinecraftServer, audit: TransformAudit? = modLauncherAudit()): List<String> =
+            modifiedRegionStorage() + substitutedRegionStorage(server) + transformedRegionStorage(audit)
+
+        /** 変換の記録を見るクラス（[transformedRegionStorage]）。[REGION_STORAGE_CLASSES] に `ChunkMap` を足したもの */
+        private val AUDITED_CLASSES: List<Class<*>> = REGION_STORAGE_CLASSES + ChunkMap::class.java
+
+        /**
+         * 変換の記録の PLUGIN のうち、数えないもの（launch plugin の名前。前方一致でなく、名前がそのまま一致するものだけ）。
+         * - `accesstransformer`: アクセス修飾子だけを変える（製品の環境では、このプロジェクト自身の AT もこれで当たる）
+         * - `mixin`: Mixin は合わせたメンバーの印（[modifiedRegionStorage]）で細かく見ていて、`ChunkMap` の性能のための Mixin を数えない方針もそちらで保つ
+         * - `runtimedistcleaner`: 反対側（クライアント）だけのメンバーを消すだけで、処理を変えない
+         */
+        private val HARMLESS_PLUGINS: Set<String> = setOf("accesstransformer", "mixin", "runtimedistcleaner")
+
+        /** 理由に載せる記録の文字列の長さの上限（ログの1行を長くしすぎない） */
+        private const val MAX_ACTIVITY_LENGTH = 200
+
+        /**
+         * ModLauncher の変換の記録（`ITransformerAuditTrail`）を読む口。記録が引けない（ModLauncher で起動していない、`Launcher.INSTANCE` がない、
+         * ModLauncher のクラスが見えない）なら `null`（[transformedRegionStorage] は、確かめられないとして数える）。
+         * 返す関数は、クラス名の記録を写して返す（ModLauncher の記録の一覧は同期されない `ArrayList` の生のビューなので、すぐに写す。写すのに失敗したら例外）
+         */
+        fun modLauncherAudit(): TransformAudit? = try {
+            val trail = Launcher.INSTANCE?.environment()?.getProperty(IEnvironment.Keys.AUDITTRAIL.get())?.orElse(null)
+            trail?.let { t ->
+                TransformAudit { name ->
+                    ArrayList(t.getActivityFor(name)).map { activity ->
+                        TransformActivity(activity.type.name, activity.context.toList())
+                    }
+                }
+            }
+        } catch (e: RuntimeException) {
+            null
+        } catch (e: LinkageError) {
+            null
+        }
+
+        /**
+         * チャンクを読み書きする経路のクラス（[AUDITED_CLASSES]）のうち、coremod などの変換が当たったもの（「クラス名: 記録」。確かめられなければ「クラス名: 理由」）。
+         *
+         * ModLauncher の変換の記録で見る。FML の coremod（JS・Java の `ICoreMod`）とほかの `ITransformationService` の変換は TRANSFORMER として、
+         * 書き換えた launch plugin は PLUGIN として残る。TRANSFORMER は1つでもあれば数え、PLUGIN は [HARMLESS_PLUGINS] にない名前なら数える（REASON は数えない）。
+         * 記録が空であることは、変換されていないことの証拠にならない（変換も plugin もないクラスは、記録を残さずに読み込まれる）。そこで、
+         * クラスが ModLauncher の `TransformingClassLoader` で読み込まれていること（[transforming]。そうでなければ、記録の外で読み込まれた）も確かめる。
+         * 記録が引けない（[audit] が `null`）、読むのに失敗した、クラスローダーが違う、はどれも数える（残す側）。
+         *
+         * 見えないもの: JVM エージェント（`java.lang.instrument`）の書き換えと、記録の外での書き換え（[modifiedRegionStorage]）。入れ子のクラス
+         * （`IOWorker$PendingStore` など）は見ない。掃除1回につき1回、メインスレッドで呼ぶ（クラスの数だけ記録を写す。台の数によらない）
+         */
+        fun transformedRegionStorage(
+            audit: TransformAudit?,
+            classes: List<Class<*>> = AUDITED_CLASSES,
+            transforming: (Class<*>) -> Boolean = { it.classLoader is TransformingClassLoader },
+        ): List<String> = classes.mapNotNull { type ->
+            val name = type.name
+            if (audit == null) return@mapNotNull "$name: the transformer audit trail is unavailable"
+            try {
+                if (!transforming(type)) return@mapNotNull "$name: not loaded by the transforming class loader"
+                val activities = audit.activities(name) ?: return@mapNotNull "$name: the transformer audit trail is unavailable"
+                activities.firstOrNull { transformsCode(it) }?.let { "$name: ${it.describe().take(MAX_ACTIVITY_LENGTH)}" }
+            } catch (e: RuntimeException) {
+                "$name: the transformer audit trail is unreadable"
+            } catch (e: LinkageError) {
+                "$name: the transformer audit trail is unreadable"
+            }
+        }
+
+        /** 変換の記録 [activity] が、処理を書き換えうるものか（[transformedRegionStorage]）。知らない種類も数える */
+        private fun transformsCode(activity: TransformActivity): Boolean = when (activity.type) {
+            TransformActivity.REASON -> false
+            TransformActivity.PLUGIN -> activity.context.firstOrNull() !in HARMLESS_PLUGINS
+            else -> true
+        }
 
         /**
          * チャンクを読み書きする経路のクラス（[REGION_STORAGE_CLASSES]）のうち、処理を書き換える Mixin が当たったもの（の名前）。
@@ -342,7 +444,7 @@ internal class ChunkReferenceProbe(
          * 処理を書き換える Mixin は、形式を変えないもの（性能のためのもの）も区別できず数える。その環境では、リージョンファイルのない位置の残骸は回収されない（毎回「判定できない」）。
          *
          * 見えないもの: 合わせたメソッド・フィールドを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
-         * `<clinit>` だけの Mixin。どちらも印が付かない）と、coremod・JVM エージェントの書き換え。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
+         * `<clinit>` だけの Mixin。どちらも印が付かない）と、JVM エージェントの書き換え（coremod は [transformedRegionStorage] が変換の記録で見る）。当てたクラスの記録（`Mixins.getMixinsForClass`）は、
          * 適用の記録が Mixin 自身のクラスの側にしか付かず、対象のクラスでは作りの上で常に空なので使わない。
          * `ChunkMap` は多くの MOD パックで性能のための Mixin が当たるので、Mixin が当たったこと自体は数えない（数えると、ほとんどの環境で
          * リージョンのない位置の残骸を回収できなくなる。保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。

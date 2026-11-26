@@ -66,7 +66,7 @@
   - 別の座標のバニラの名前のファイルがあることは、対象のチャンクがないことの証拠にならない（#899）。形式を変える MOD への移行の後に古い `.mca` が一部残り、
     対象のチャンクは別の名前・別の形式で生きている、という混ざった状態がある。そこで、「`r.X.Z.mca` がない ⇒ チャンクはない」が成り立つ（既定の作り）と確かめたときだけ、ファイル名で判定する。
     既定の作りなら、外部のチャンクファイル（`.mcc`）もリージョンのヘッダーからしか指されないので成り立つ
-  - 既定の作りの確かめ: クラスの書き換えと、インスタンスの差し替えの両方を見る。どちらかに当たれば、または調べるのに失敗したら、既定の作りと見なさない（「判定できない」）。
+  - 既定の作りの確かめ: クラスの書き換え、インスタンスの差し替え、変換の記録（#959）の3つを見る。どれか1つにでも当たれば、または調べるのに失敗したら、既定の作りと見なさない（「判定できない」）。
     - クラスの書き換え: `RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` に、処理を書き換える Mixin が当たっていないことを、合わせたメンバーの印（実行時に見える注釈 `@MixinMerged`）で見る。
       アクセサー・インボーカーだけの Mixin（インターフェースの Mixin。処理を書き換えない。NeoForge 自身が `BlockEntityType`・`MappedRegistry` に当てている）は数えない。
       印の `mixin`（合わせた Mixin のクラス名）のクラスファイルを、クラスローダーのリソースとして読み、インターフェースかどうかで分ける
@@ -79,16 +79,35 @@
       バニラのクラスそのもの（サブクラスでない）かを見る。`RegionFileStorage` は `final` でコンストラクターはパッケージの中だけだが、`IOWorker` は `final` でなく、
       コンストラクターは `protected`、`loadAsync`・`store` は上書きできる。バイトコードを書き換えなくても読み書きを差し替えたサブクラスが作れ、
       それを `final` の `ChunkStorage.worker` に入れるのは、アクセサーの Mixin（上で数えないもの）・リフレクション・AT で足りる。そこで、クラスではなく使われているインスタンスを見る
+    - 変換の記録（#959。`transformedRegionStorage`）: coremod はメソッドの本体を書き換えても、Mixin の印にも実行時のクラスにも現れない。そこで ModLauncher の変換の記録
+      （`Launcher.INSTANCE` の環境の `ITransformerAuditTrail`）を、`RegionFileStorage`・`RegionFile`・`IOWorker`・`ChunkStorage` と `ChunkMap` について読む。
+      FML の coremod（JS・Java の `ICoreMod`）はサービス名 `fml` の TRANSFORMER として、ほかの `ITransformationService` も TRANSFORMER として、書き換えた launch plugin は PLUGIN として残る。
+      - TRANSFORMER は1つでもあれば数える（`fml` だからといって許さない。NeoForge 自身の coremod も `fml` で、区別できない）。
+      - PLUGIN は、名前がそのまま一致する許可の一覧（`accesstransformer`・`mixin`・`runtimedistcleaner`）にないものを数える（前方一致は使わない。知らない名前・名前のないものは数える）。
+        `accesstransformer` はアクセス修飾子だけを変える（製品の環境では、このプロジェクト自身の AT もこれで当たる。数えると製品でいつも回収が止まる）。
+        `mixin` は上のクラスの書き換えが印で細かく見ている（`ChunkMap` の性能のための Mixin を数えない方針も、そちらで保つ）。`runtimedistcleaner` は反対側だけのメンバーを消すだけ。
+        REASON（`classloading`・`computing_frames`）は数えない。知らない種類は数える
+      - 記録が空であることは、変換されていないことの証拠にならない（変換も plugin もないクラスは、記録を残さずに読み込まれる）。そこで、クラスが ModLauncher の
+        `TransformingClassLoader` で読み込まれていることも確かめる（そうでなければ、記録の外で読み込まれた）
+      - 記録が引けない（ModLauncher で起動していない・`Launcher.INSTANCE` がない・クラスが見えない）、読むのに失敗した（記録の一覧は同期されない `ArrayList` の生のビューで、
+        ほかのクラスのフレーム計算が同じキーに追記しうるので、すぐに写し、写すのに失敗したら）、は数える（「判定できない」）
+      - `ChunkMap` も対象にする。coremod は `@MixinMerged` を付けずに `read` などの上書きを足せる。性能のための書き換えはふつう Mixin（PLUGIN `mixin`。数えない）なので、
+        `ChunkMap` に coremod が当たる環境はまれで、数えて失うものは小さい
+      - Issue の「やること」の二択（リージョンがなければいつも「判定できない」にする / coremod の書き換えを見分ける）のうち、見分ける方を採る。いつも「判定できない」にすると、
+        バニラの環境でも、リージョンを削ったワールドの残骸（この経路が回収するもの）を永久に回収できず、再起動のたびに件数分の `owner.bin` の読みと問いを繰り返す。
+        記録は掃除1回につき5クラス分を読むだけで、台の数によらない。確かめられないときは「判定できない」に倒すので、いつも「判定できない」の形は、その失敗時の振る舞いとして入っている
   - 確かめは掃除1回につき1回、掃除を始めるとき（メインスレッド）にして、問いには真偽値で渡す（問いごと・IO のスレッドでは調べない）。既定の作りでないなら、その旨を掃除1回につき1行ログに出す
   - 限界: 処理を書き換える Mixin が4クラスのどれかに1つでも当たっていると、それが形式を変えないもの（性能のための Mixin）でも「既定の作りでない」と見なす（形式を変えるかどうかは Mixin の中身からは判定できない）。
     その環境では、リージョンファイルのない位置の残骸（ADR のこの経路が回収する、リージョンを削ったワールドの残骸）は回収されず、掃除のたびに「判定できない」に数えられる（INFO が1行）。
     チャンクの I/O を作り替える性能 MOD（どのクラスに当てているかは未確認）が入った環境で起こりうる。残す側に倒れるだけで、安全性の問題ではない。
     ほかの回収の経路（リージョンファイルがあるチャンクの NBT での判定）は、この影響を受けない。
-  - 限界: 印の付かない書き換えは見えない。合わせたメソッド・フィールドを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、
-    `<clinit>` だけの Mixin。Mixin は `<` で始まるメソッドを合わせず、印を付けない）、coremod、JVM エージェントがこれに当たる。
+  - 限界: 記録の外の書き換えは見えない。JVM エージェント（`java.lang.instrument`）と、ModLauncher の記録を通らない書き換えがこれに当たる。
     バニラのクラスのインスタンスのまま、その処理をこれらで書き換えた環境では、既定の作りと見なしてしまう（リージョンファイルのない位置を「ない」にする）。
-    当てたクラスの記録が対象のクラスから引けないので、Mixin の側はこれ以上見られない。そうした MOD は確認していない
-  - 限界: `ChunkMap` のクラスの書き換えは数えない（多くの MOD パックで性能のための Mixin が当たり、数えるとほとんどの環境でリージョンのない位置の残骸を回収できなくなる。
+    coremod（#959 で見えるようにした）と違い、そうした MOD は確認していない。`-javaagent` があることを数える形は、開発環境・認証用のエージェントで回収が止まるので採らない。
+    合わせたメンバーを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、`<clinit>` だけの Mixin）は印が付かないが、
+    当てたクラスの変換の記録に PLUGIN `mixin` として残り、許可の一覧で数えないので、やはり見えない（Mixin の記録から Mixin の名前を取って分けるのは #969）。
+    入れ子のクラス（`IOWorker$PendingStore`・`RegionFile` の内部クラスなど）は、Mixin の印も変換の記録も見ない（#969）
+  - 限界: `ChunkMap` への Mixin による書き換え（`@MixinMerged` の印と、変換の記録の PLUGIN `mixin`）は数えない。coremod の TRANSFORMER と、許可の一覧にない PLUGIN は、上の変換の記録で数える（多くの MOD パックで性能のための Mixin が当たり、数えるとほとんどの環境でリージョンのない位置の残骸を回収できなくなる。
     保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。ただし、`ChunkStorage` のメソッド（`read`・`write` など）を
     `ChunkMap` で上書きする Mixin（Mixin のクラスが `ChunkStorage` を継承して override を足す形。合わせたメソッドに `@MixinMerged` が付く）は、チャンクの読み書きをすべて
     横取りできるので数える。`ChunkMap` 自身のメソッド（`readChunk`・`save` など）の中身を書き換える Mixin は数えない。チャンクがないことを、ファイルがないときに `ChunkMap.read` で確かめる形は、
@@ -186,7 +205,12 @@
   holder があって FULL でないチャンク（keeper で INACCESSIBLE に降りた `LevelChunk`、続くアンロード待ち）はケースがなくても「判定できない」、
   リージョンファイルのない位置は、リージョンファイルを作らずに「ない」、リージョンファイルのある所の IOWorker の書き込み待ちのケースは「ある」（ID が違う・種類が違うものは「ない」）、
   保存先に別の座標のリージョンファイルだけがあり、読み書きする側が既定の作りと確かめられないとき、台のディレクトリは残り「判定できない」に数えられ、リージョンファイルも作らない（書き込み待ちのケースも「ない」にならない。#899）、
-  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）、
+  GameTest のサーバーのチャンクの読み書きの経路に Mixin が当たっておらず、数える変換の記録もなく、既定の問いがファイル名で判定する（製品の jar の GameTest でも同じ）、
+  変換の記録の判定（`transformAuditCountsCoremods`。#959）: 記録なし・許可した PLUGIN・REASON は数えず、TRANSFORMER・知らない PLUGIN（前方一致では許さない）・知らない種類・記録が引けない・読めない・
+  `TransformingClassLoader` で読み込まれていないクラスは数える。陽性の対照として、NeoForge 自身の coremod が当たる `EntityType` の本物の記録の TRANSFORMER `fml` を数える、
+  実行時のクラス・インスタンス・Mixin の印は本物のまま、記録の口にだけ `RegionFileStorage` の coremod の TRANSFORMER を足して `SaveCleanups.start` で本番の掃除を回すと、
+  台の位置のリージョンファイルがなく別の座標の `.mca` だけがある保存先で、猶予の外の台のディレクトリが残り（「判定できない」）、
+  `ChunkMap.read` から読めるチャンクのケースの台（リージョンファイルの場所の解決を、バニラの名前でないファイルに差し替えて、coremod が別の名前の保存先に移した環境を作る。問いの時点でバニラの名前のファイルは決定的にない）も残り、リージョンファイルも作らない。本物の記録なら同じ2台は「ない」（`regionlessPositionIsKeptWhenCoremodTransformsStorage`。#959）、
   本物の Mixin（NeoForge 自身の `BlockEntityType`・`MappedRegistry` のアクセサー）の印が見つかり、アクセサーだけなら数えない、
   `ChunkMap` 向けの判定（`overridesWithMixin`）: 本物の `ChunkMap` は数えない、`ChunkStorage` の親のメソッドを上書きする Mixin の印は数える、アクセサーの印・印のない上書き・何も上書きしない合わせたメソッドは数えない、
   `SaveCleanups.start` が検出した理由を問いに渡す（理由が空でなければ、台の位置のリージョンファイルがなく別の座標の `.mca` だけがある保存先で台のディレクトリが残り、空なら「ない」と判定されて数えられる）、
