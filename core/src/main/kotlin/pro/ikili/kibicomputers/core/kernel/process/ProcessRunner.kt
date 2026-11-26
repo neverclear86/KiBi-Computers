@@ -86,8 +86,9 @@ internal class ProcessRunner(private val machine: Machine) {
             // CPU・許可を返して取り直す道は、その手前（[onFuelExhausted]）でもっと大きく確かめる。
             // 前借り（#477）の間は、残りが負の間じゅう関数の入口・loop の先頭ごとに呼ばれる（1 回の前借りで約 1,000 回）ので、
             // 前借りを続けてよいと分かっている間は、スタックの確かめもカーネルロックも通らずに負の残りを返す（速い道。#887）。
-            // 速い道は、プロセスのスレッドの欄と volatile の killed を読むだけで、ロックにも共有の状態にも触らず、ほかの関数も呼ばない
-            // （ここで StackOverflowError が出ても壊れるものがない）
+            // 速い道は、条件の関数（[ProcessRuntime.canSkipOverdraftCheck]）を 1 段呼ぶだけ。その関数は、プロセスのスレッドの欄と
+            // volatile の killed を読むだけで、ロックにも共有の状態にも触らず、何も書き換えない（JIT がインライン化する前は、
+            // ここで 1 段フレームが増える。そこで StackOverflowError が出ても、何も変えていないので壊れるものがない）
             override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
                 if (rt.canSkipOverdraftCheck(instance, remaining)) return remaining
                 StackHeadroom.ensure(StackHeadroom.FUEL_HANDLER_FRAMES)
