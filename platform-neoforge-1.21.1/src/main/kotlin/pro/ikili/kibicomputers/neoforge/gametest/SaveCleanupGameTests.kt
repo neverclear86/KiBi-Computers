@@ -19,7 +19,11 @@ import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.entity.BlockEntityType
 import net.minecraft.world.level.chunk.LevelChunk
+import net.minecraft.world.entity.EntityType
 import net.minecraft.world.level.chunk.storage.ChunkStorage
+import net.minecraft.world.level.chunk.storage.IOWorker
+import net.minecraft.world.level.chunk.storage.RegionFile
+import net.minecraft.world.level.chunk.storage.RegionFileStorage
 import net.minecraft.world.level.dimension.DimensionType
 import net.minecraft.world.level.storage.LevelResource
 import net.neoforged.neoforge.gametest.GameTestHolder
@@ -43,6 +47,8 @@ import pro.ikili.kibicomputers.neoforge.computer.CaseBlockEntity
 import pro.ikili.kibicomputers.neoforge.machine.ChunkReferenceProbe
 import pro.ikili.kibicomputers.neoforge.machine.SaveCleanups
 import pro.ikili.kibicomputers.neoforge.machine.ServerMachines
+import pro.ikili.kibicomputers.neoforge.machine.TransformActivity
+import pro.ikili.kibicomputers.neoforge.machine.TransformAudit
 import pro.ikili.kibicomputers.neoforge.registry.KiBiBlocks
 import java.nio.file.Files
 import java.nio.file.Path
@@ -589,6 +595,14 @@ object SaveCleanupGameTests {
         helper.assertTrue(modified.isEmpty(), "the chunk storage classes should have no mixins: $modified")
         val substituted = ChunkReferenceProbe.substitutedRegionStorage(server)
         helper.assertTrue(substituted.isEmpty(), "the chunk storage instances should be vanilla: $substituted")
+        // 変換の記録（#959）: ModLauncher の記録が引け、読み書きの経路の5クラスに数える変換がない（製品の jar では AT が plugin として当たる）
+        val audit = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(audit != null, "the transformer audit trail should be available")
+        AUDIT_LOGGER.log(System.Logger.Level.INFO) {
+            "Transformer audit of the chunk storage: " + AUDITED.joinToString("; ") { type -> "${type.name}=${audit?.activities(type.name)?.map { it.describe() }}" }
+        }
+        val transformed = ChunkReferenceProbe.transformedRegionStorage(audit)
+        helper.assertTrue(transformed.isEmpty(), "the chunk storage classes should have no transformers: $transformed")
         helper.assertTrue(ChunkReferenceProbe.untrustedRegionStorage(server).isEmpty(), "the chunk storage should be trusted")
         helper.assertTrue(ChunkReferenceProbe(server).regionNamesTrusted, "the default probe should trust the region names")
         helper.assertTrue(ChunkReferenceProbe.hasMergedMembers(MarkedMember::class.java, TestMark::class.java.name), "a marked method should be found")
@@ -600,6 +614,131 @@ object SaveCleanupGameTests {
         val sub = ChunkReferenceProbe.substitutedInstances(listOf(BaseStorage::class.java to SubStorage(), BaseStorage::class.java to null))
         helper.assertTrue(sub == listOf(SubStorage::class.java.name, "null"), "a subclass and a missing instance should be substituted: $sub")
         helper.succeed()
+    }
+
+    private val AUDIT_LOGGER = System.getLogger("kibicomputers.gametest")
+
+    /** 変換の記録を見るクラス（[ChunkReferenceProbe.transformedRegionStorage] の既定と同じ5つ。ログに出す用） */
+    private val AUDITED = listOf(RegionFileStorage::class.java, RegionFile::class.java, IOWorker::class.java, ChunkStorage::class.java, ChunkMap::class.java)
+
+    /** テスト用の coremod の変換の記録（FML の coremod は、サービス名 `fml` の TRANSFORMER として残る） */
+    private val COREMOD = TransformActivity(TransformActivity.TRANSFORMER, listOf("fml", "kibicomputers_test_coremod"))
+
+    /**
+     * 変換の記録での判定（[ChunkReferenceProbe.transformedRegionStorage]。#959）。偽の記録で、数えないもの（記録なし、`accesstransformer`・`mixin`・`runtimedistcleaner` の PLUGIN、REASON）と、
+     * 数えるもの（TRANSFORMER、知らない PLUGIN、知らない種類、記録が引けない・読めない、`TransformingClassLoader` で読み込まれていない）を確かめる。
+     * 陽性の対照として、NeoForge 自身の coremod（`finalize_spawn_targets.json`）が当たる `EntityType` の本物の記録に TRANSFORMER `fml` があり、同じ判定で数えられることも見る
+     * （この環境の記録が生きていて、本物の coremod が見えること。対照は NeoForge の版に依存するので、本番の自己診断にはしない）
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY)
+    fun transformAuditCountsCoremods(helper: GameTestHelper) {
+        val classes = listOf(RegionFileStorage::class.java)
+        fun reasons(activities: List<TransformActivity>?, transforming: Boolean = true): List<String> =
+            ChunkReferenceProbe.transformedRegionStorage(TransformAudit { activities }, classes) { transforming }
+        fun plugin(name: String) = TransformActivity(TransformActivity.PLUGIN, listOf(name, "A"))
+        fun reason(name: String) = TransformActivity(TransformActivity.REASON, listOf(name))
+        helper.assertTrue(reasons(emptyList()).isEmpty(), "no activity should not count")
+        val harmless = listOf(reason("classloading"), plugin("accesstransformer"), plugin("mixin"), plugin("runtimedistcleaner"), reason("computing_frames"))
+        helper.assertTrue(reasons(harmless).isEmpty(), "harmless plugins and reasons should not count: ${reasons(harmless)}")
+        val coremod = reasons(harmless + COREMOD)
+        helper.assertTrue(coremod.size == 1 && "TRANSFORMER fml:kibicomputers_test_coremod" in coremod[0], "a coremod transformer should count: $coremod")
+        helper.assertTrue(reasons(listOf(plugin("slf4jfixer"))).size == 1, "an unknown plugin should count")
+        helper.assertTrue(reasons(listOf(TransformActivity(TransformActivity.PLUGIN, emptyList()))).size == 1, "a plugin without a name should count")
+        // 前方一致では許さない
+        helper.assertTrue(reasons(listOf(plugin("mixin_extras"))).size == 1, "a plugin that only starts with a harmless name should count")
+        helper.assertTrue(reasons(listOf(TransformActivity("OTHER", listOf("x")))).size == 1, "an unknown activity type should count")
+        helper.assertTrue(reasons(null).size == 1, "a missing trail for the class should count")
+        helper.assertTrue(reasons(emptyList(), transforming = false).size == 1, "a class outside the transforming class loader should count")
+        val none = ChunkReferenceProbe.transformedRegionStorage(null, classes) { true }
+        helper.assertTrue(none.size == 1, "an unavailable trail should count: $none")
+        val failing = ChunkReferenceProbe.transformedRegionStorage(TransformAudit { throw ConcurrentModificationException() }, classes) { true }
+        helper.assertTrue(failing.size == 1, "an unreadable trail should count: $failing")
+        // 本物の記録: 読み書きの経路のクラスは TransformingClassLoader で読み込まれ、NeoForge の coremod の当たるクラスは数えられる
+        val audit = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(audit != null, "the transformer audit trail should be available")
+        helper.assertTrue(ChunkReferenceProbe.transformedRegionStorage(audit, classes).isEmpty(), "the real RegionFileStorage should not count")
+        val entityType = ChunkReferenceProbe.transformedRegionStorage(audit, listOf(EntityType::class.java))
+        helper.assertTrue(
+            entityType.size == 1 && "TRANSFORMER fml" in entityType[0],
+            "the NeoForge coremod on EntityType should count: $entityType (${audit?.activities(EntityType::class.java.name)?.map { it.describe() }})",
+        )
+        helper.succeed()
+    }
+
+    /**
+     * Issue #959 の端から端まで: 実行時のクラス・インスタンス・Mixin の印は本物のままで、変換の記録の口にだけ「`RegionFileStorage` に coremod の TRANSFORMER がある」
+     * 偽の記録を渡し、[SaveCleanups.start] で本番の掃除（消す側。猶予の外の台）を回す。台の位置にはリージョンファイルがなく、別の座標の `.mca` だけがある。
+     * coremod が別の名前の保存先に読み書きを移した環境の代わりに、台の位置のチャンクにケースを書き込み待ちで入れる（`ChunkMap.read` からは読めるが、
+     * その位置の `r.X.Z.mca` はまだない）形も見る。どちらの台のディレクトリも残り（「判定できない」か「ある」）、消されない。
+     * 対照: 記録が本物なら、ケースのない位置は「ない」に数えられる（試しの実行）。共有の [SaveCleanups] を使うので、別の batch にする
+     */
+    @JvmStatic
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "kibicomputers_save_cleanup_coremod")
+    fun regionlessPositionIsKeptWhenCoremodTransformsStorage(helper: GameTestHelper) {
+        val level = helper.level
+        val dimension = level.dimension().location().toString()
+        ensureVanillaRegion(helper)
+        val target = FarChunks.reserve(helper)
+        val targetRegion = ChunkReferenceProbe.regionFile(level, target)
+        helper.assertTrue(!Files.exists(targetRegion), "the region of the target chunk should not exist yet: $targetRegion")
+        val pendingChunk = FarChunks.reserve(helper)
+        helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, pendingChunk)), "the region of the pending chunk should not exist yet")
+        val controlChunk = FarChunks.reserve(helper)
+        val root = tempRoot(helper)
+        val controlRoot = tempRoot(helper)
+        val id = UUID.randomUUID()
+        val pendingId = UUID.randomUUID()
+        val controlId = UUID.randomUUID()
+        previousDirectory(root, id, MachineOwner(dimension, target.minBlockX + 2, 64, target.minBlockZ + 3))
+        val pendingPos = BlockPos(pendingChunk.minBlockX + 1, 70, pendingChunk.minBlockZ + 1)
+        val caseTag = CompoundTag().apply {
+            putString("id", BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString())
+            putInt("x", pendingPos.x)
+            putInt("y", pendingPos.y)
+            putInt("z", pendingPos.z)
+            putString(CaseBlockEntity.MACHINE_ID_TAG, pendingId.toString())
+        }
+        level.chunkSource.chunkMap.write(pendingChunk, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+        previousDirectory(root, pendingId, MachineOwner(dimension, pendingPos.x, pendingPos.y, pendingPos.z))
+        previousDirectory(controlRoot, controlId, MachineOwner(dimension, controlChunk.minBlockX, 64, controlChunk.minBlockZ))
+        val real = ChunkReferenceProbe.modLauncherAudit()
+        helper.assertTrue(real != null, "the transformer audit trail should be available")
+        val fake = TransformAudit { name ->
+            val activities = real!!.activities(name)
+            if (name == RegionFileStorage::class.java.name) activities.orEmpty() + COREMOD else activities
+        }
+        var reasons: List<String> = emptyList()
+        val cleanup = SaveCleanups.start(
+            dryRun = false, force = false, store = MachineSaveStore(root, MachineIdIndex(), "test"), modules = null,
+            untrustedReasons = { server -> ChunkReferenceProbe.untrustedRegionStorage(server, fake).also { reasons = it } },
+        )
+        helper.assertTrue(cleanup != null, "the cleanup should start")
+        helper.assertTrue(reasons.size == 1 && reasons[0].startsWith(RegionFileStorage::class.java.name), "only the fake coremod should be a reason: $reasons")
+        var control: SaveCleanup? = null
+        helper.startSequence().thenWaitUntil {
+            helper.assertTrue(cleanup!!.finished && !cleanup.settling, "the cleanup should finish (${cleanup.phase})")
+        }.thenExecute {
+            val report = cleanup!!.report
+            helper.assertTrue(Files.isDirectory(root.resolve(id.toString())), "the directory at the regionless position should stay: $report")
+            helper.assertTrue(Files.isDirectory(root.resolve(pendingId.toString())), "the directory of the pending case should stay: $report")
+            helper.assertTrue(report.candidates == 2 && report.deleted == 0 && report.unreferenced == 0, "nothing should be deleted: $report")
+            helper.assertTrue(report.undetermined + report.present == 2 && report.undetermined >= 1, "the regionless position should be undetermined: $report")
+            helper.assertTrue(!Files.exists(targetRegion), "the cleanup should not create the region file $targetRegion")
+            control = SaveCleanups.start(dryRun = true, force = false, store = MachineSaveStore(controlRoot, MachineIdIndex(), "test"), modules = null)
+            helper.assertTrue(control != null, "the control cleanup should start")
+        }.thenWaitUntil {
+            helper.assertTrue(control!!.finished, "the control cleanup should finish (${control!!.phase})")
+        }.thenExecute {
+            try {
+                val report = control!!.report
+                helper.assertTrue(report.candidates == 1 && report.unreferenced == 1 && report.undetermined == 0, "the real trail should let the file names decide: $report")
+                helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, controlChunk)), "the control should not create region files")
+            } finally {
+                deleteTree(root)
+                deleteTree(controlRoot)
+            }
+        }.thenSucceed()
     }
 
     /**
