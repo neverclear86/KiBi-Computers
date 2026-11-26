@@ -797,7 +797,8 @@ function overloaded(m) {
 }
 
 // Gradle の起動の失敗（#958）で落ちた回か。回し直すかどうかはスクリプトが決める（マージの段階のエージェントは回し直さない）。
-// 申告（gradleStartupFailed）を主に見る。申告がなくても、理由の文が BindException と Gradle の起動の失敗を述べ、
+// 申告（gradleStartupFailed）がある（true・false どちらも）ときは、それに従う（false の申告を文で上書きしない）。
+// 申告の項目がないとき（古い返り値など）だけ、理由の文が BindException と Gradle の起動の失敗を述べ、
 // GameTest のサーバーが起動してテストが落ちた（gameTestFailedOnly）のでないなら、起動の失敗とみなす（PR #951 の文の形）。
 // build と gametest の手順だけに当てる（conflict・ci・merge は Gradle の起動と関係しない）
 const STARTUP_BIND = /BindException/i
@@ -805,7 +806,7 @@ const STARTUP_WHERE = /FileLockContentionHandler|could not start your build|Unab
 function gradleStartupFailed(m) {
   if (!m || m.status === 'merged') return false
   if (m.failedStep !== 'build' && m.failedStep !== 'gametest') return false
-  if (m.gradleStartupFailed === true) return true
+  if (typeof m.gradleStartupFailed === 'boolean') return m.gradleStartupFailed
   if (m.gameTestFailedOnly === true) return false
   return STARTUP_BIND.test(m.reason ?? '') && STARTUP_WHERE.test(m.reason ?? '')
 }

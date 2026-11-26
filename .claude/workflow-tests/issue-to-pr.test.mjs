@@ -355,6 +355,20 @@ test('項目がなく、理由の文も起動の失敗を述べない回は、�
   assert.notEqual(r.issue.status, 'merged')
 })
 
+test('項目がなく、failedStep=build の回も、文が BindException と Gradle の起動の失敗を述べるならやり直す', async () => {
+  const r = await run({ merge: [withoutFlag(fail('build', PR951_REASON))], 'merge-restart': [MERGED] })
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+for (const step of ['build', 'gametest']) {
+  test(`gradleStartupFailed=false と申告した回（${step}）は、文が BindException と Gradle の起動を述べてもやり直さない`, async () => {
+    const r = await run({ merge: [fail(step, 'Gradle が起動した GameTest サーバーの中で BindException が出て落ちた', { gradleStartupFailed: false })] })
+    assert.equal(r.count('merge-restart'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+  })
+}
+
 test('テストの中の BindException（サーバーが起動してテストが落ちた）は、文に BindException があってもやり直さない', async () => {
   const r = await run({ merge: [fail('gametest', 'DevDriverServer の起動で BindException が出て 1 required tests failed', { gameTestFailedOnly: true })] })
   assert.equal(r.count('merge-restart'), 0)
