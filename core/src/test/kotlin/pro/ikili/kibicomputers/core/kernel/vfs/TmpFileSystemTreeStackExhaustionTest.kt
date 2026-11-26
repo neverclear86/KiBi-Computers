@@ -15,7 +15,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 /**
  * `/tmp`（[TmpFileSystem]）の木を変える操作の途中でスタックが尽きても、木と RAM の勘定が食い違わないことを、木の道全般で確かめる（#902）。
  *
- * `TmpFileSystemStackExhaustionTest`（#883）は、底に近い深さのすべてで、根の直下の名前（ASCII）だけを使う 13 の型を 1 回ずつ呼ぶ。
+ * `TmpFileSystemStackExhaustionTest`（#883）は、底に近い深さのすべてで、型を 1 回ずつ呼ぶ（#883 の 13 の型は根の直下の ASCII の名前だけ。
+ * #902 で、入れ子・別のディレクトリ・日本語の名前・エラーの枝の 9 の型を足したので、今は 22 の型）。
  * こちらは `DiskFileSystemStackExhaustionTest`（#858）と同じ形で、1 つの `/tmp` に、回ごとに入れ子のディレクトリ（`/w/d<n>/...`）を組み、
  * スタックの小さい新しいスレッドで、詰め物の段数を変えて 1 つの操作を動かす（JIT をかけてから尽きる境目を探し、そこから先の幅を詰め物の
  * 1 段ずつ。境目は途中で探し直す）。型は、入れ子の作成・削除、いくつもの塊を持つファイルの削除、別のディレクトリへの名前の変更、
@@ -32,8 +33,11 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * - 尽きた回と、エラーで断られた回は、木（大きさ・時刻・塊の番号を含む）と `usedBytes` が始める前のまま
  *
  * その後に回の分を片付け、片付けた後も同じことと、`usedBytes` が回の前（共有の部分だけ）に戻ることを見る。最後に外して 3 つとも 0 に戻ること、
- * 尽きた回・終わりまで動いた回の両方があること、尽きた位置が操作より浅いところ（テストのコード）まで届いたこと（幅が操作の深さを覆う）、
- * ロックの途中で尽きた回がないことを確かめる。
+ * 尽きた回・終わりまで動いた回の両方があること、1 段ずつの掃引（境目を探す途中の大きな詰め物は除く）で、尽きた位置が操作より浅いところ
+ * （詰め物の再帰・テストのコード）まで届いたこと（幅が操作の深さを覆う）を確かめる。
+ * ロックの途中で尽きたかは見ない。`TmpFileSystem` が使うのは `synchronized` と `MemoryAccount` の CAS だけで、`SoePositions` が
+ * ロックに数える `java.util.concurrent.locks.` のフレームがこの道には出ない（見ても常に 0 で、確かめにならない）。モニターは例外でも放され、
+ * 尽きた後の木と勘定は毎回の後の確かめが見る
  *
  * 入口の確かめ（`StackHeadroom.TMPFS_FRAMES`）がある今は、尽きる位置はほぼすべて確かめの中か、操作に入る前に落ちる。試験が窓を見つけられることは、
  * 手元で確かめを外して確かめた（日本語の名前の作成・削除と、入れ子のいくつもの塊の書き込みで食い違った。`StackHeadroom` の KDoc・ADR 0053）。
@@ -291,22 +295,23 @@ class TmpFileSystemTreeStackExhaustionTest {
 
     /**
      * 詰め物の段数を変えて [attempt]（尽きたら `true`）を動かす（`DiskFileSystemStackExhaustionTest.walkEdge` と同じ形）。JIT をかけてから、
-     * 尽きる境目を探し、境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を [WIDTH] 段だけ 1 段ずつ動かす。最後の境目を返す
+     * 尽きる境目を探し、境目の少し手前から先（詰め物が多く、残りのスタックが少ない側）を [WIDTH] 段だけ 1 段ずつ動かす（`attempt` の
+     * `swept` は、この 1 段ずつの動かし方のとき `true`）。最後の境目を返す
      */
-    private fun walkEdge(attempt: (Int) -> Boolean): Int {
-        repeat(stackHeadroomRounds(WARMUP)) { attempt(0) }
+    private fun walkEdge(attempt: (pad: Int, swept: Boolean) -> Boolean): Int {
+        repeat(stackHeadroomRounds(WARMUP)) { attempt(0, false) }
 
         fun findEdge(): Int {
             var lo = 0
             var hi = 256
-            while (!attempt(hi)) {
+            while (!attempt(hi, false)) {
                 lo = hi
                 hi *= 2
                 check(hi < (1 shl 20)) { "詰め物を増やしても尽きない" }
             }
             while (hi - lo > 1) {
                 val mid = (lo + hi) / 2
-                if (attempt(mid)) hi = mid else lo = mid
+                if (attempt(mid, false)) hi = mid else lo = mid
             }
             return hi
         }
@@ -316,7 +321,7 @@ class TmpFileSystemTreeStackExhaustionTest {
         var done = 0
         while (done < width) {
             val batch = minOf(width - done, REFIND_EVERY)
-            for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k))
+            for (k in 0 until batch) attempt(maxOf(0, edge - 8 + done + k), true)
             done += batch
             edge = findEdge()
         }
@@ -332,12 +337,15 @@ class TmpFileSystemTreeStackExhaustionTest {
         fs.file("/w/日本語", 10)
         val baseline = fs.usedBytes
         val tally = SoePositions()
+
+        // 1 段ずつの掃引（境目から [WIDTH] 段）の分だけ。境目を探す途中の大きな詰め物は、境目を大きく越えて、いつも詰め物の中で尽きる
+        val swept = SoePositions()
         var counter = 0
         var completed = 0
         var refused = 0
 
         /** [pad] 段の詰め物で 1 回動かし、尽きたかを返す。毎回、状態を確かめて片付ける */
-        fun attempt(pad: Int): Boolean {
+        fun attempt(pad: Int, sweptStep: Boolean): Boolean {
             val n = ++counter
             val a = prepare(fs, op, n)
             val beforeUsed = fs.usedBytes
@@ -357,7 +365,10 @@ class TmpFileSystemTreeStackExhaustionTest {
                 found += "断られた（何もしない）のに変わった（usedBytes $beforeUsed → ${fs.usedBytes}）"
             }
             if (found.isNotEmpty()) fail("尽きた後に /tmp の木と勘定が食い違った（$what）: $found\nSOE: ${soe?.stackTrace?.take(14)?.joinToString(" <- ")}")
-            if (soe != null) tally.record(soe)
+            if (soe != null) {
+                tally.record(soe)
+                if (sweptStep) swept.record(soe)
+            }
             removeTree(fs, p("/w/d$n"))
             val after = problems(rig)
             if (after.isNotEmpty() || fs.usedBytes != baseline) fail("片付けた後に食い違った（$what）: $after、usedBytes ${fs.usedBytes}（回の前 $baseline）")
@@ -366,13 +377,16 @@ class TmpFileSystemTreeStackExhaustionTest {
 
         val edge = walkEdge(::attempt)
         println(
-            "#902 tmpfs $op: 境目 $edge、$counter 回動かし、終わりまで動いた $completed 回、エラーで断られた $refused 回、尽きた位置: ${tally.describe()}",
+            "#902 tmpfs $op: 境目 $edge、$counter 回動かし、終わりまで動いた $completed 回、エラーで断られた $refused 回、尽きた位置: ${tally.describe()}、" +
+                "1 段ずつの掃引: ${swept.describe()}",
         )
         assertTrue(tally.crashed.get() > 0, "1 度も尽きなかった")
         assertTrue(completed + refused > 0, "1 度も終わりまで動かなかった")
-        // 幅が操作の深さを覆う（尽きる位置が、操作より浅いテストのコードまで届いた）
-        assertTrue(tally.count(SoePositions.Position.OTHER) > 0, "操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${tally.describe()}")
-        assertEquals(0, tally.inLocks, "スタックがロックを取る・放す途中で尽きた")
+        // 幅が操作の深さを覆う（1 段ずつの掃引で、尽きる位置が、操作より浅いテストのコード（詰め物）まで届いた）
+        assertTrue(
+            swept.count(SoePositions.Position.OTHER) > 0,
+            "1 段ずつの掃引で、操作より浅い所まで尽きる位置が届いていない（幅が足りない）: ${swept.describe()}",
+        )
         fs.onUnmounted()
         assertEquals(emptyList<String>(), fs.consistencyProblemsForTest())
         assertEquals(0L, fs.usedBytes, "外した後に /tmp の使用量が残った")
