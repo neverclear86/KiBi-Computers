@@ -364,6 +364,13 @@ public class MachineSaveStore @JvmOverloads constructor(
     private var sideReading: UUID? = null
 
     /**
+     * 読み手が列から取り出して、まだ結果を [ownerReadResults] に入れていない頼み（読み手のスレッドが書く。#960）。
+     * 読み手が途中で死んだら（[recoverDeadSideReader]）、メインスレッドがこれを見て頼み直す
+     */
+    @Volatile
+    private var sideTaken: Pair<UUID, Long>? = null
+
+    /**
      * 読み手が `owner.bin` を開きうる（[awaitPrefetchRead] が錠を取る印）。スレッドの起動を試みる前に真にし、一度真にしたら戻さない
      * （起動に失敗したときは、書き込みのスレッドが余分に錠を取るだけ。#960）。スレッドが動いているかは [sideReaderThread] で見る
      */
@@ -374,7 +381,7 @@ public class MachineSaveStore @JvmOverloads constructor(
     @Volatile
     private var sideReaderClosed: Boolean = false
 
-    /** 読み手のスレッド（起動に成功してからだけ入れる。#960。メインスレッドだけが触る） */
+    /** 読み手のスレッド（起動に成功してからだけ入れ、止める前に死んだのを見たら外す。#960。メインスレッドだけが触る） */
     private var sideReaderThread: Thread? = null
 
     /** 読み手のスレッドの起動に最後に失敗した時刻（`System.nanoTime`。続けて失敗していなければ `null`。メインスレッドだけが触る。#960） */
@@ -409,6 +416,10 @@ public class MachineSaveStore @JvmOverloads constructor(
     public var sideOwnerReadRetries: Long = 0
         private set
 
+    /** 列の外の読み手のスレッドが、止める前に死んでいたのを見た回数（数え口・テスト用。#960） */
+    internal var sideReaderDeaths: Long = 0
+        private set
+
     /** 列の外の読み手のスレッドの起動に失敗した回数（数え口・テスト用。#960） */
     internal var sideReaderStartFailures: Long = 0
         private set
@@ -425,7 +436,12 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 最初の 1 回と、その後に始められたときだけ出す。失敗した [Thread] は使い回さず、試み直すときは新しく作る
      */
     private fun startSideReader(): Boolean {
-        if (sideReaderThread != null) return true
+        val running = sideReaderThread
+        if (running != null) {
+            if (running.isAlive) return true
+            // 止める前に死んでいた（#960）: 残った頼みを頼み直せるようにしてから、下で作り直す
+            recoverDeadSideReader()
+        }
         val now = System.nanoTime()
         val failedAt = sideReaderFailedAt
         if (failedAt != null && now - failedAt < sideReaderRetryNanos) return false
@@ -459,6 +475,34 @@ public class MachineSaveStore @JvmOverloads constructor(
         }
     }
 
+    /**
+     * 読み手のスレッドが、止める（[close]）前に死んでいたら（#960）、その頼みを頼み直せるようにする（メインスレッド。[pollDeferredClaims] の
+     * 初めと [startSideReader] が呼ぶ）。読みの `try` の外の Error（メモリ不足など）や割り込みで抜けると、読み手のいない列に頼みが残り、
+     * 取り出し済みの 1 件も結果を返さないまま、その台が待ちの上限で新しい UUID になるため。死んだスレッドの結果を先に受け取ってから、
+     * 列に残った頼みと取り出し済みの 1 件（[sideTaken]）のうち、まだ結果を待っているものを [requestedReads] から外す（次の [ensureOwnerRead] が、
+     * 新しい番号で読み手を作り直すか、書き込みの列に回す）。死んだのを見たときだけ warn を出す。動いている・止めた・始めていなければ何もしない
+     */
+    private fun recoverDeadSideReader() {
+        val thread = sideReaderThread ?: return
+        if (sideReaderClosed || thread.isAlive) return
+        // isAlive が偽を返した後は、死んだスレッドの書き込み（結果・sideTaken）がすべて見える
+        sideReaderThread = null
+        sideReaderDeaths++
+        LOG.log(System.Logger.Level.WARNING, "The owner reader of $root stopped unexpectedly; requesting its reads again")
+        drainOwnerReadResults()
+        val left = sideQueueLock.withLock { sideQueue.entries.map { it.key to it.value }.also { sideQueue.clear() } }
+        val taken = sideTaken
+        sideTaken = null
+        for ((id, seq) in left + listOfNotNull(taken)) {
+            if (requestedReads[id] == seq) requestedReads.remove(id)
+        }
+        // 読みの finally で外すので開いたまま死ぬことはないが、書き込みのスレッドを待たせ続けないように外しておく
+        prefetchLock.withLock {
+            sideReading = null
+            prefetchIdle.signalAll()
+        }
+    }
+
     /** 読み手の列から [id] の頼みを外す（O(1)。メインスレッド） */
     private fun dropSideRead(id: UUID) {
         sideQueueLock.withLock { sideQueue.remove(id) }
@@ -468,7 +512,8 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 読み手のスレッドの本体。頼まれた順に読み、結果を [ownerReadResults] に番号つきで入れる。列の先頭を錠の中で取り出して外し、錠を離してから、
      * 開く前に [prefetchLock] の中で、その ID の仕事が列に残っていないかを見る: 残っていれば読まず、「やり直し」（値が `null`）を返す
      * （メインスレッドが書き込みの列に回し直す。前の仕事の前のディスクを読まず、書き込みのスレッドの置き換えとも重ねない）。
-     * 読みが落ちても（Error も）「読めなかった」で返す。止められたら（[stopSideReader]）、それまでに頼まれていた分を読んでから抜ける
+     * 読みが落ちても（Error も）「読めなかった」で返す。止められたら（[stopSideReader]）、それまでに頼まれていた分を読んでから抜ける。
+     * 止める前に抜けたら（読みの `try` の外の Error・割り込み）、残った頼みと取り出し済みの 1 件は、メインスレッドが [recoverDeadSideReader] で頼み直す
      */
     private fun runSideReader() {
         while (true) {
@@ -481,6 +526,7 @@ public class MachineSaveStore @JvmOverloads constructor(
                         val first = entries.next()
                         val taken = first.key to first.value
                         entries.remove()
+                        sideTaken = taken
                         taken
                     } else {
                         null
@@ -494,6 +540,7 @@ public class MachineSaveStore @JvmOverloads constructor(
             }
             if (!open) {
                 ownerReadResults.add(OwnerRead(id, seq, null))
+                sideTaken = null
                 continue
             }
             val value = try {
@@ -508,8 +555,11 @@ public class MachineSaveStore @JvmOverloads constructor(
                 }
             }
             ownerReadResults.add(OwnerRead(id, seq, value))
+            sideTaken = null
         }
-        // 割り込みで抜けたときに残った頼みは、読めなかったとして返す（書き込みの口が閉じたときと同じ）
+        // 止める前に割り込みで抜けたときは、残った頼みを列に残す（メインスレッドが死んだのを見て頼み直す。#960）
+        if (!sideReaderClosed) return
+        // 止めた後に割り込みで抜けたときに残った頼みは、読めなかったとして返す（書き込みの口が閉じたときと同じ）
         val left = sideQueueLock.withLock { sideQueue.entries.map { it.key to it.value }.also { sideQueue.clear() } }
         for ((id, seq) in left) ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("the owner reader is closed")))
     }
@@ -767,6 +817,22 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** [key] の claim が待っているか（テスト用） */
     public fun isClaimDeferred(key: Any): Boolean = deferredByKey.containsKey(key)
 
+    /** 書き込みのスレッド・列の外の読み手の読みの結果を受け取る（古い番号の結果は捨てる。メインスレッド） */
+    private fun drainOwnerReadResults() {
+        while (true) {
+            val read = ownerReadResults.poll() ?: break
+            if (requestedReads[read.id] != read.seq) continue
+            requestedReads.remove(read.id)
+            val value = read.value
+            if (value == null) {
+                // やり直し: ensureOwnerRead が、その ID の仕事の後ろ（書き込みの列）に回し直す（#877）
+                sideOwnerReadRetries++
+                continue
+            }
+            ownerReads[read.id] = value
+        }
+    }
+
     /**
      * 待っている claim のうち、読みの結果がそろったものを確定して返す（#869。メインスレッドで毎 tick、[pollCompleted] の後に呼ぶ）。
      * 確定は ID ごとに来た順で、そのたびに [claim] と同じ判定（索引の重複・覚えている `owner.bin` を含む）をやり直す。
@@ -774,18 +840,9 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 返したものは待ちから外れている（索引にも入っている）ので、呼び手はその場で受け取る。待ちがなければ何もしない
      */
     public fun pollDeferredClaims(): List<DeferredClaim> {
-        while (true) {
-            val read = ownerReadResults.poll() ?: break
-            if (requestedReads[read.id] != read.seq) continue
-            requestedReads.remove(read.id)
-            val value = read.value
-            if (value == null) {
-                // やり直し: 下の ensureOwnerRead が、その ID の仕事の後ろ（書き込みの列）に回し直す（#877）
-                sideOwnerReadRetries++
-                continue
-            }
-            ownerReads[read.id] = value
-        }
+        // 読み手が止める前に死んでいたら、その頼みを下の ensureOwnerRead で頼み直す（#960）
+        if (sideReaderThread != null) recoverDeadSideReader()
+        drainOwnerReadResults()
         if (deferredById.isEmpty()) return emptyList()
         val out = ArrayList<DeferredClaim>()
         val start = System.nanoTime()
