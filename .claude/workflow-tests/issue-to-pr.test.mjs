@@ -764,3 +764,32 @@ test('「孤児のログを採ったかは分からない」のような文は�
   const same = await run({ merge: [fail('build', '孤児のログを採ったかは分からず、.exit がない')], 'merge-wait': [MERGED] })
   assert.equal(same.count('merge-wait'), 1)
 })
+
+test('孤児のログの名前が完全なパスやバッククォートで囲んだものでも、採った句として外す（#972 のレビュー）', async () => {
+  const names = [
+    'D:/Projects/KiBi-Computers/.worktrees/.logs/issue-962/merge-build-3',
+    String.raw`D:\Projects\KiBi-Computers\.worktrees\.logs\issue-962\merge-build-3`,
+    '`merge-build-3`',
+    '`merge-build-3` と `merge-gametest-neoforge-1.21.1-2`',
+    'merge-build-3、merge-gametest-2',
+  ]
+  for (const n of names) {
+    const r = await run({ merge: [fail('build', `孤児のログ ${n} を採った（BUILD SUCCESSFUL、.exit はない）。:core:test が落ちた`)] })
+    assert.equal(r.count('merge-wait'), 0, n)
+  }
+})
+
+test('「を採った」が続かない長い名前の文でも、すぐに判定が終わる（入れ子の量指定子のバックトラックがない。#972 のレビュー）', async () => {
+  const long = 'fix2-gametest-neoforge-1.21.1-3'.repeat(20)
+  const texts = [
+    `孤児のログ ${long} は採らなかった。.exit がなく、終了コードを読めていない`,
+    `孤児のログ ${'a、'.repeat(500)}b は採らなかった。.exit がない`,
+    `孤児のログ ${'a '.repeat(500)}は採らなかった。.exit がない`,
+  ]
+  for (const t of texts) {
+    const t0 = Date.now()
+    const r = await run({ merge: [fail('build', t)], 'merge-wait': [MERGED] })
+    assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`)
+    assert.equal(r.count('merge-wait'), 1)
+  }
+})
