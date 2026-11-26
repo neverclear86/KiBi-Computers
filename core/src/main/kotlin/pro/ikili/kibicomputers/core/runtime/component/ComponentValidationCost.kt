@@ -20,8 +20,12 @@ import java.util.IdentityHashMap
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
  *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
  *   wasmparser は型の確認を覚えない（同じ型の対でも、引数ごと・インスタンス化ごとに確かめ直す）ので、回数で掛ける
- * - 型の大きさ: wasmparser の `TypeInfo`（展開した大きさ。`MAX_WASM_TYPE_SIZE` = 100 万を超える型は、wasmparser が
- *   型を定義したときに断る）にならって、参照している型の大きさを足して数える。添字空間をなぞって参照を引き、
+ * - 型の大きさ: wasmparser の `TypeInfo`（展開した大きさ）にならって、参照している型の大きさを足して数える。
+ *   確かめる型の大きさには、100 万で止めない展開した大きさ（[Info.remapBound]）を使う。`MAX_WASM_TYPE_SIZE` = 100 万を超える型は
+ *   wasmparser が型を定義したときに断るが、enum・flags の名前の数は wasmparser の型の大きさに入らず、型の確認は名前を1つずつ比べる
+ *   （確認は覚えない）ので、名前の多い型を何段か入れ子にすると、wasmparser が断らないまま確認の手間が 100 万を超える
+ *   （名前 6,000 個の enum を 300 個ずつ 2 段の tuple にして、record で受ける型を1回インスタンス化する 71 KB で CPU 約 27 秒。#935 のレビュー）。
+ *   型の大きさの最大（[Estimate.maxTypeWeight]）は、今までどおり 100 万で止める。添字空間をなぞって参照を引き、
  *   引けないもの（入れ子のコンポーネントのインスタンスの export など）は、それまでに見た型の大きさの最大とする
  *   （参照できる型は、バイナリの中でそれより前に定義されているので、実際より小さくならない）。
  *   インスタンス化で作ったインスタンスの型は、そのコンポーネントの export だけ（import は引数で置き換わる。#751）。
@@ -46,6 +50,11 @@ import java.util.IdentityHashMap
  * ただし、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型を入れ子のコンポーネントごとに import する形と、
  * `alias outer` で何度も引く形は、見積もりが 0 のまま検証が秒単位になる（#935 のレビュー。#955 で扱う）。
  * 見積もりにない形は、見張りが時間の上限で止める。
+ *
+ * 見積もりそのものの手間も抑える。写し直しの大きさをたどる手数を数え、見積もりの上限と同じ値を超えたら、たどるのをやめて
+ * 見積もりを上限を超えた値にして断る（[Walker.flatOf]。同じ宣言の連なりを参照する、写して作った型が多い形は、
+ * 型ごとにたどり直すので、見積もりを抑えないと入力の大きさの 2 乗の手間になる。N=C=49,000 の 1.29 MB で 270 秒。#935 のレビュー）。
+ * 見積もりは見張りの外（`LoadDeadline` なし）で動くので、手数で決定的に止める。
  */
 internal object ComponentValidationCost {
     /** 型の大きさの上限。wasmparser は、これ（`MAX_WASM_TYPE_SIZE`）を超える型を、型を定義したときに断る */
@@ -168,7 +177,9 @@ internal object ComponentValidationCost {
         /** 型の確認を 1 回数える。確かめるのは [info] の型（引けなければ、それまでの最大） */
         private fun check(info: Info?) {
             checks++
-            cost = add(cost, sizeOf(info))
+            // 確かめる手間は、型を展開した大きさ。enum・flags の名前は wasmparser の型の大きさに入らない（確かめるときは
+            // 1 つずつ比べる）ので、100 万で止めた [Info.size] ではなく、止めていない [Info.remapBound] で数える（#935 のレビュー）
+            cost = add(cost, info?.remapBound ?: maxFull)
         }
 
         /** それまでに見た型の大きさの最大 */
@@ -209,20 +220,42 @@ internal object ComponentValidationCost {
             if (cost > budget || depth > MAX_FLAT_DEPTH) return target.remapBound
             var total = target.local
             val seen = IdentityHashMap<Info, Unit>()
+            if (!spend(target.refs.size)) return target.remapBound
             val stack = ArrayList<Info>(target.refs)
             while (stack.isNotEmpty() && total < target.remapBound) {
                 val n = stack.removeAt(stack.size - 1)
+                if (!spend(1)) return target.remapBound
                 if (seen.put(n, Unit) != null) continue
                 if (n.content != null) {
                     total = add(total, flatOf(n, depth + 1))
+                    // 中で手数が尽きたら、たどり直さずに止める
+                    if (cost > budget) return target.remapBound
                 } else {
                     total = add(total, n.local)
+                    if (!spend(n.refs.size)) return target.remapBound
                     stack.addAll(n.refs)
                 }
             }
             val result = minOf(total, target.remapBound)
             target.flat = result
             return result
+        }
+
+        /** 写し直しの大きさをたどった手数（[Info.refs] の1つずつ） */
+        private var work = 0L
+
+        /**
+         * 写し直しの大きさをたどる手数を [steps] 数える。見積もりそのものの手間を、見積もりの上限 [budget] と同じ大きさで抑える
+         * （写して作った型が多く、どれも同じ宣言の連なりを参照する形は、写して作った型ごとにその連なりをたどり直すので、
+         * 入力の大きさの 2 乗になる。#935 のレビュー）。手数が上限を超えたら、見積もりを上限を超えた値にして、これ以上たどらない
+         * （false）。たどる手数は、重なりを除いても、たどった型の大きさの合計に収まるので、通る形が手数で断られることは
+         * ほとんどない（断られる側にずれるだけで、検証には進まない）
+         */
+        private fun spend(steps: Int): Boolean {
+            work += steps
+            if (work <= budget) return true
+            cost = maxOf(cost, add(budget, 1))
+            return false
         }
 
         /**

@@ -1019,6 +1019,49 @@ class ComponentLoaderTest {
     }
 
     @Test
+    fun `型の確認の大きさも、enumの名前を数えて100万で止めない`() {
+        // #935 のレビュー: enum の名前の数は wasmparser の型の大きさに入らないが、型の確認は名前を1つずつ比べる（確認は覚えない）。
+        // 名前 6,000 個の enum を 150 個ずつ 2 段の tuple にして、record で型を付けた export の確認をさせる（約 80 KB）。
+        // 確認の大きさを 100 万で止めると、見積もりは 100 万のまま通り、検証が秒単位になる
+        val names = (0 until 6_000).joinToString(" ") { "\"e$it\"" }
+        fun record(p: String) =
+            "(type ${'$'}en$p (enum $names)) " +
+                "(type ${'$'}t1$p (tuple ${(0 until 150).joinToString(" ") { "${'$'}en$p" }})) " +
+                "(type ${'$'}t2$p (tuple ${(0 until 150).joinToString(" ") { "${'$'}t1$p" }})) " +
+                "(type ${'$'}b$p (record (field \"x\" ${'$'}t2$p)))"
+        val bytes = wat("(component ${record("0")} ${record("1")} (export \"b\" (type ${'$'}b0) (type (eq ${'$'}b1))))")
+        assertTrue(bytes.size < 200_000) { "${bytes.size}" }
+        val e = estimateOf(bytes)
+        assertEquals(1L, e.checkCount)
+        assertTrue(e.cost > 150L * 150 * 6_000 / 2) { "${e.cost}" }
+        // 型の大きさの最大は、今までどおり 100 万で止める
+        assertTrue(e.maxTypeWeight <= 1_000_000L) { "${e.maxTypeWeight}" }
+        rejectedBeforeValidation(bytes)
+    }
+
+    @Test
+    fun `写して作った型が多く、同じ宣言の連なりを参照する形の見積もりは、入力の大きさの2乗の手間にならない`() {
+        // #935 のレビュー: 写して作った型（export の `(type (eq ..))`）ごとに、参照先の宣言の連なりをたどり直すと、
+        // 型の数 C × 連なりの長さ N の手間になり、N = C = 20,000（約 500 KB）で 30 秒以上かかった。
+        // 見積もりは手数で抑え、上限を超えたら、すぐ断る
+        val n = 20_000
+        val chain = StringBuilder("(type \$r0 (record (field \"a\" u32))) ")
+        for (k in 1 until n) chain.append("(type \$r$k (record (field \"a\" \$r${k - 1}))) ")
+        val inner = StringBuilder("(alias outer 1 \$r${n - 1} (type \$x)) ")
+        for (k in 0 until n) inner.append("(type \$c$k (record (field \"a\" \$x))) ")
+        for (k in 0 until n) inner.append("(export \"e$k\" (type (eq \$c$k))) ")
+        inner.append("(export \"res\" (type (sub resource)))")
+        val bytes = wat("(component $chain (type \$it (instance $inner)) (import \"i\" (instance (type \$it))))")
+        assertTrue(bytes.size < 1_000_000) { "${bytes.size}" }
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        val start = System.nanoTime()
+        val e = assertThrows<WasmLoadException> { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+        val took = (System.nanoTime() - start) / 1_000_000
+        assertMessage(e, "検証が重すぎる")
+        assertTrue(took < 3_000) { "$took ms" }
+    }
+
+    @Test
     fun `写し直しの見積もりは上限をまたいでも、断る側に外れない`() {
         // 見積もりが上限を超えたら、check は写し直しの大きさをたどらずに展開した大きさに切り替える。切り替えても、
         // estimate（最後までたどる）が上限を超える形は、check でも断り、超えない形は通る
