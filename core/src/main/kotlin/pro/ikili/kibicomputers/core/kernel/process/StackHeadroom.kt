@@ -78,7 +78,7 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     入口の確かめの `StackOverflowError` は、呼び手が飲まずに伝える（`Vfs.readDirectory` がマウントの根の `stat` の失敗を node 0 に
  *     するのは `Exception` だけで、`Error` は伝える）。
  *     `/tmp`（`TmpFileSystem`）の変える操作は、#883 で入口に [TMPFS_FRAMES] 段の確かめを足し、木と使用量の食い違いも
- *     `TmpFileSystem.consistencyProblemsForTest` で見るようにした（下の「`/tmp`」）。木の食い違いの道全般の掃引は #902
+ *     `TmpFileSystem.consistencyProblemsForTest` で見るようにした（下の「`/tmp`」）。木の食い違いの道全般の掃引（#902）でも、32 段のまま食い違いは出ない
  *   - `StackExhaustionLockTest` の `DISK_IO`: プロセスの中から、回ごとに 1 種類の操作（深いディレクトリの `stat`・別のディスクの `stat`・
  *     `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`）を、スタックの底に近いところのホストの関数で動かす
  *     （1 本に 40 回。底に近いところだけ本物の操作をするので、1 本が約 9 秒）。毎回の後に、ディスクの表・使用量・枠がホストと合うことと、
@@ -191,6 +191,23 @@ package pro.ikili.kibicomputers.core.kernel.process
  * 断られなかった回は 0、`usedBytes`・勘定・木の食い違いは 0、カーネルの試験の `/tmp` とマシン・サーバー全体の勘定の食い違いも 0。
  * 単体の試験で断られた位置のうち確かめの中は、冷えた道で約 95%（1128 回中 1070）、`-Xint` で約 98%、JDK 21 で約 91%（残りは確かめの外で
  * 尽きた回で、どれも食い違いは出ていない）。
+ * 木の道全般（#902）: 上の 13 の型は根の直下の ASCII の名前だけなので、入れ子・別のディレクトリ・中身のあるディレクトリの名前の変更・
+ * 別のディレクトリの置き換え・日本語の名前（`nameCost` の `String.toByteArray` と `TreeMap` の比較が、ASCII と別の、深い道を通る）・
+ * エラーの枝（`INVAL`・`NOTEMPTY`・`ISDIR`・`NOTDIR`・`EXIST`・`NOENT`）・何もしない名前の変更を足した。`TmpFileSystemStackExhaustionTest` に
+ * 9 つの型（底に近い深さのすべて）、`TmpFileSystemTreeStackExhaustionTest` に 29 の型（`DiskFileSystemStackExhaustionTest` と同じく、尽きる境目から
+ * 詰め物を 1 段ずつずらす。毎回の後に、木・`usedBytes`・勘定 3 つ・`TMPFS` 節の読み直し、尽きた回とエラーの回は何も変わっていないこと、
+ * 片付けた後に回の前へ戻ること）。32 段では、JDK 17・JIT（ふつうの `:core:test`）に加えて、`-Pkibi.stackHeadroom=true` の 3 つの JVM
+ * （冷えた道・`-Xint`・JDK 21。Windows。この 2 つの試験クラスに絞って回した）でも、両方の試験（`TmpFileSystemStackExhaustionTest` は足した
+ * 9 つを含む 22 の型の 32 本、`TmpFileSystemTreeStackExhaustionTest` は 29 本）が通り、食い違いは 0。底に近い深さのすべての掃引で、
+ * 確かめが通らない深さ（冷えた道で 1491、`-Xint` で 3650、JDK 21 で 1450）のうち断られなかった回は 0。断られた位置のうち確かめの中は、
+ * 冷えた道で約 95%（1515 回中 1442）、`-Xint` で約 98%（3675 回中 3604）、JDK 21 で約 91%（1537 回中 1395）。境目をずらす掃引の
+ * 「確かめが通らない深さ」は数えていない（詰め物の段数から深さを決めないため）ので、断られなかった回の検査は底に近い深さのすべての掃引が受け持つ。
+ * 確かめを外した手元の試験（JDK 17・JIT・Windows）では、境目をずらす掃引で日本語の名前のファイルの作成
+ * （作った node が木に入らないまま `nodes` に残り `TMPFS` 節が読めない）、日本語の名前のディレクトリの削除（`nameCost` の `String.encodeUTF8` の中で
+ * 尽き、木から外したのに `usedBytes` が返らない）、入れ子のいくつもの塊の書き込み（塊が `size` の外に残る）が食い違った（JIT が操作を畳むので、
+ * 尽きうる位置は残った呼び出しだけになり、29 の型のうち 2〜3 つ）。底に近い深さのすべての掃引は、足した 9 つの型のどれでも、確かめが通らない深さで
+ * 操作が通った（エラーの型は、確かめなしで期待したエラーを返した）。段数を下げた手元の試験では、16 段で両方の掃引が通り、8 段で、
+ * サーバー全体の残りを絞った組のディレクトリの作成が、マシンとサーバー全体の段の間で尽きて勘定がずれた。今の 32 段（通った最小の 2 倍）のままにする。
  * 32 段の確かめは 1 回約 0.2 µs で、1 バイトの `write`（約 0.04 µs）は約 0.25 µs になる。ゲストからはホストの関数の包みと VFS・WASI の層を通った
  * 後なので、システムコール 1 回に包みの確かめ 1 回分が足される程度。待っているだけの台と tick ごとの費用は増えない。
  *

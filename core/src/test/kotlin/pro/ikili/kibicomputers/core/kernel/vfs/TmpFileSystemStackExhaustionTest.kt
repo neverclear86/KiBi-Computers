@@ -32,7 +32,11 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 短い書き込みの後も木と勘定が合うことを確かめる
  *
  * ホストの関数の本体から入る道（[hostBody]）は、包みの確かめ（[StackHeadroom.HOST_CALL_FRAMES]）が通った後、本体が深くなってから操作に入る。
- * カーネルのプロセス（`ctx.vfs` で `/tmp` を開く・書く・名前を変える・消す）を通した確かめは `TmpFileSystemStackExhaustionKernelTest`
+ * カーネルのプロセス（`ctx.vfs` で `/tmp` を開く・書く・名前を変える・消す）を通した確かめは `TmpFileSystemStackExhaustionKernelTest`。
+ *
+ * #902 で、木の道全般の型（日本語の名前の作成・入れ子の削除・別のディレクトリへの移動・中身のあるディレクトリの移動・別のディレクトリの置き換え）と、
+ * エラーの枝（`INVAL`・`NOTEMPTY`・`EXIST`。何も変えずに断られること）を足した。同じ型を含む、尽きる境目から詰め物を 1 段ずつずらす形の掃引は
+ * `TmpFileSystemTreeStackExhaustionTest`
  */
 class TmpFileSystemStackExhaustionTest {
     private val stackBytes = 256L * 1024
@@ -72,7 +76,45 @@ class TmpFileSystemStackExhaustionTest {
 
         /** VFS の `open` の `O_TRUNC` で、塊のあるファイルを切り詰める */
         VFS_TRUNCATE,
+
+        // ---- 木の道全般（#902）。入れ子・別のディレクトリ・日本語の名前（UTF-8 で何バイトにもなる）・エラーの枝 ----
+
+        /** 日本語の名前のファイルを、ASCII と日本語の名前が混ざったディレクトリに作る */
+        CREATE_FILE_UTF16,
+
+        /** 入れ子の、日本語の名前の、塊のあるファイルを消す */
+        REMOVE_FILE_NESTED_UTF16,
+
+        /** 入れ子の空のディレクトリを消す */
+        REMOVE_DIRECTORY_NESTED,
+
+        /** 塊のあるファイルを、別のディレクトリへ日本語の名前で移す */
+        RENAME_ACROSS,
+
+        /** 中身（塊のあるファイル）のあるディレクトリを、別のディレクトリの下へ移す */
+        RENAME_DIRECTORY_WITH_CONTENTS,
+
+        /** 日本語の名前の塊のあるファイルで、別のディレクトリにある日本語の名前の塊のあるファイルを置き換える */
+        RENAME_REPLACE_ACROSS_UTF16,
+
+        /** ディレクトリを自分の下へ移す（`INVAL`） */
+        RENAME_INTO_SELF,
+
+        /** 中身のあるディレクトリを消す（`NOTEMPTY`） */
+        REMOVE_NONEMPTY_DIRECTORY,
+
+        /** 既にある日本語の名前で作る（`EXIST`） */
+        CREATE_EXISTING_UTF16,
     }
+
+    /** エラーで断られる型の errno（通る型は `null`） */
+    private val Op.expected: Errno?
+        get() = when (this) {
+            Op.RENAME_INTO_SELF -> Errno.INVAL
+            Op.REMOVE_NONEMPTY_DIRECTORY -> Errno.NOTEMPTY
+            Op.CREATE_EXISTING_UTF16 -> Errno.EXIST
+            else -> null
+        }
 
     /** 深さ 1 つ分の試験の組（浅いところで前もって作る） */
     private class Fixture(op: Op, val headroom: Long? = null) {
@@ -95,6 +137,28 @@ class TmpFileSystemStackExhaustionTest {
             if (op == Op.RENAME_REPLACE_FILE) fs.createFile(F_OTHER).also { fs.write(it, 0, PAYLOAD, 0, 10) }
             if (op == Op.REMOVE_DIRECTORY || op == Op.RENAME_REPLACE_DIRECTORY) fs.createDirectory(D_ONE)
             if (op == Op.RENAME_REPLACE_DIRECTORY) fs.createDirectory(D_TWO)
+            if (op >= Op.CREATE_FILE_UTF16) {
+                // 木の道全般の型（#902）の共通の形: 2 つのディレクトリと、ASCII と日本語の名前が混ざった中身
+                fs.createDirectory(D_ONE)
+                fs.createDirectory(D_TWO)
+                fs.createFile(J_EXISTING)
+                fs.createFile(D_ONE.child("zz"))
+                fs.createFile(D_ONE.child("日本語"))
+            }
+            when (op) {
+                Op.REMOVE_FILE_NESTED_UTF16 -> fs.createFile(J_NESTED).also { fs.write(it, 0, PAYLOAD, 0, 10) }
+                Op.REMOVE_DIRECTORY_NESTED -> fs.createDirectory(D_SUB)
+                Op.RENAME_ACROSS -> fs.createFile(F_IN_ONE).also { fs.write(it, 0, PAYLOAD, 0, 10) }
+                Op.RENAME_DIRECTORY_WITH_CONTENTS -> {
+                    fs.createDirectory(D_SUB)
+                    fs.createFile(D_SUB.child("x")).also { fs.write(it, 0, PAYLOAD, 0, 10) }
+                }
+                Op.RENAME_REPLACE_ACROSS_UTF16 -> {
+                    fs.createFile(J_NESTED).also { fs.write(it, 0, PAYLOAD, 0, 10) }
+                    fs.createFile(J_IN_TWO).also { fs.write(it, 0, PAYLOAD, 0, 10) }
+                }
+                else -> {}
+            }
             if (headroom != null) {
                 // サーバー全体の残りを [headroom] バイトにする（マシンの上限は広いまま。マシンの CAS が通った後、サーバー全体の段で断られる）
                 ballast = server.limitBytes - server.usedBytes - headroom
@@ -172,12 +236,26 @@ class TmpFileSystemStackExhaustionTest {
                 Op.SHRINK -> fs.setSize(f.data, 100)
                 Op.ALLOCATE -> fs.allocate(f.empty, 3L * TmpFileSystem.CHUNK_BYTES)
                 Op.VFS_TRUNCATE -> f.vfs!!.open(F_DATA, TRUNCATE)
+                Op.CREATE_FILE_UTF16 -> fs.createFile(J_NEW)
+                Op.REMOVE_FILE_NESTED_UTF16 -> fs.removeFile(J_NESTED)
+                Op.REMOVE_DIRECTORY_NESTED -> fs.removeDirectory(D_SUB)
+                Op.RENAME_ACROSS -> fs.rename(F_IN_ONE, J_IN_TWO, false)
+                Op.RENAME_DIRECTORY_WITH_CONTENTS -> fs.rename(D_SUB, D_MOVED, true)
+                Op.RENAME_REPLACE_ACROSS_UTF16 -> fs.rename(J_NESTED, J_IN_TWO, false)
+                Op.RENAME_INTO_SELF -> fs.rename(D_ONE, D_INTO_SELF, true)
+                Op.REMOVE_NONEMPTY_DIRECTORY -> fs.removeDirectory(D_ONE)
+                Op.CREATE_EXISTING_UTF16 -> fs.createFile(J_EXISTING)
             }
-            f.status = if (shortWrite) SHORT else COMPLETED
+            // 期待したエラーで断られるはずの型が通ったら、試験の組み方の誤り（浅いところで投げる）
+            f.status = if (run.op.expected != null) UNEXPECTED_SUCCESS else if (shortWrite) SHORT else COMPLETED
         } catch (e: FsException) {
-            // 数えられずに断られた（サーバー全体の段で断られて、マシンの分を戻した後）。それ以外のエラーは試験の組み方の誤り
-            if (e.errno != Errno.NOSPC) throw e
-            f.status = NO_SPACE
+            // 型が期待する errno（何も変えずに断られる）か、数えられずに断られた（サーバー全体の段で断られて、マシンの分を戻した後）。
+            // それ以外のエラーは試験の組み方の誤り
+            f.status = when (e.errno) {
+                run.op.expected -> FAILED_AS_EXPECTED
+                Errno.NOSPC -> NO_SPACE
+                else -> throw e
+            }
         } catch (e: StackOverflowError) {
             f.status = REFUSED
             f.soe = e
@@ -190,6 +268,8 @@ class TmpFileSystemStackExhaustionTest {
         val refused = used.count { it.status == REFUSED }
         val noSpace = used.count { it.status == NO_SPACE }
         val short = used.count { it.status == SHORT }
+        val failedAsExpected = used.count { it.status == FAILED_AS_EXPECTED }
+        val unexpectedSuccess = used.count { it.status == UNEXPECTED_SUCCESS }
         val refusedInProbe = used.count { it.status == REFUSED && it.inProbe }
 
         /** 操作の前後で確かめが通らなかった（フレームが変わっていない）深さと、そのうち断られなかった深さの数 */
@@ -210,7 +290,7 @@ class TmpFileSystemStackExhaustionTest {
         } catch (e: Exception) {
             drifts += "$where: TMPFS 節を読み直せない（$e）"
         }
-        if ((f.status == REFUSED || f.status == NO_SPACE) && (fs.usedBytes != f.initialUsed || fingerprint(fs) != f.initialPrint)) {
+        if ((f.status == REFUSED || f.status == NO_SPACE || f.status == FAILED_AS_EXPECTED) && (fs.usedBytes != f.initialUsed || fingerprint(fs) != f.initialPrint)) {
             drifts += "$where: 断られたのに変わった（usedBytes ${f.initialUsed} → ${fs.usedBytes}）"
         }
         fs.onUnmounted()
@@ -222,6 +302,8 @@ class TmpFileSystemStackExhaustionTest {
     private fun statusName(status: Int) = when (status) {
         REFUSED -> "スタックで断られた"
         NO_SPACE -> "NOSPC"
+        FAILED_AS_EXPECTED -> "期待したエラー"
+        UNEXPECTED_SUCCESS -> "エラーのはずが通った"
         SHORT -> "短い書き込み"
         else -> "通った"
     }
@@ -254,7 +336,7 @@ class TmpFileSystemStackExhaustionTest {
         val result = Result(used, drifts)
         println(
             "#883 $op${if (hostBody) "（ホストの関数の本体）" else ""}${if (headroom != null) "（サーバー全体の残り $headroom）" else ""}: " +
-                "深さ ${used.size}、通った ${result.completed}、NOSPC ${result.noSpace}、短い書き込み ${result.short}、断られた ${result.refused}" +
+                "深さ ${used.size}、通った ${result.completed}、期待したエラー ${result.failedAsExpected}、NOSPC ${result.noSpace}、短い書き込み ${result.short}、断られた ${result.refused}" +
                 "（うち確かめの中 ${result.refusedInProbe}）、確かめが通らない深さ ${result.lacking.size}、うち断られなかった ${result.lackingButCompleted}、" +
                 "ずれ ${drifts.size}",
         )
@@ -265,8 +347,13 @@ class TmpFileSystemStackExhaustionTest {
     private fun check(op: Op) {
         val r = sweep(op, hostBody = false)
         assertEquals(emptyList<String>(), r.drifts, "$op: 勘定・木がずれた")
-        // 試験が底をまたいでいること（どちらかが 0 だと、確かめられていない）
-        assertTrue(r.completed > 0, "$op: 操作が通った深さがない（試験の窓が底から遠い）")
+        assertEquals(0, r.unexpectedSuccess, "$op: ${op.expected} で断られるはずが通った深さがある")
+        // 試験が底をまたいでいること（どちらかが 0 だと、確かめられていない）。エラーで断られる型は、期待したエラーで終わった深さ
+        if (op.expected == null) {
+            assertTrue(r.completed > 0, "$op: 操作が通った深さがない（試験の窓が底から遠い）")
+        } else {
+            assertTrue(r.failedAsExpected > 0, "$op: ${op.expected} で断られた深さがない（試験の窓が底から遠い）")
+        }
         assertTrue(r.refused > 0, "$op: 操作が断られた深さがない（試験の窓が底まで届かない）")
         assertTrue(r.lacking.isNotEmpty(), "$op: 確かめが通らない深さがない（試験の窓が底まで届かない）")
         // 入口の確かめがあるなら、通らない深さでは必ず断られる（なければ、通って数える）
@@ -364,6 +451,34 @@ class TmpFileSystemStackExhaustionTest {
     @Test
     fun `底に近い深さのすべてで、VFSのopenで切り詰めても、勘定と木はずれない`() = check(Op.VFS_TRUNCATE)
 
+    @Test
+    fun `底に近い深さのすべてで、日本語の名前のファイルを作っても、勘定と木はずれない`() = check(Op.CREATE_FILE_UTF16)
+
+    @Test
+    fun `底に近い深さのすべてで、入れ子の日本語の名前のファイルを消しても、勘定と木はずれない`() = check(Op.REMOVE_FILE_NESTED_UTF16)
+
+    @Test
+    fun `底に近い深さのすべてで、入れ子のディレクトリを消しても、勘定と木はずれない`() = check(Op.REMOVE_DIRECTORY_NESTED)
+
+    @Test
+    fun `底に近い深さのすべてで、別のディレクトリへ移しても、勘定と木はずれない`() = check(Op.RENAME_ACROSS)
+
+    @Test
+    fun `底に近い深さのすべてで、中身のあるディレクトリを移しても、勘定と木はずれない`() = check(Op.RENAME_DIRECTORY_WITH_CONTENTS)
+
+    @Test
+    fun `底に近い深さのすべてで、別のディレクトリの日本語の名前のファイルを置き換えても、勘定と木はずれない`() =
+        check(Op.RENAME_REPLACE_ACROSS_UTF16)
+
+    @Test
+    fun `底に近い深さのすべてで、ディレクトリを自分の下へ移すINVALでも、何も変わらない`() = check(Op.RENAME_INTO_SELF)
+
+    @Test
+    fun `底に近い深さのすべてで、中身のあるディレクトリを消すNOTEMPTYでも、何も変わらない`() = check(Op.REMOVE_NONEMPTY_DIRECTORY)
+
+    @Test
+    fun `底に近い深さのすべてで、既にある日本語の名前で作るEXISTでも、何も変わらない`() = check(Op.CREATE_EXISTING_UTF16)
+
     /**
      * ホストの関数の本体（包みの確かめを通った後）から `/tmp` を変える道のまね。包みは通ったのに本体の途中で断られる深さがあること
      * （ADR 0043）と、そこでも勘定と木がずれないことを確かめる
@@ -388,6 +503,12 @@ class TmpFileSystemStackExhaustionTest {
 
         /** 書けた分だけの短い書き込み（途中の塊でサーバー全体の段に断られた） */
         const val SHORT = 4
+
+        /** 型が期待する errno で断られた（何も変えない。#902） */
+        const val FAILED_AS_EXPECTED = 5
+
+        /** 期待した errno で断られるはずの型が通った（試験の組み方の誤り） */
+        const val UNEXPECTED_SUCCESS = 6
 
         const val MOD_PACKAGE = "pro.ikili.kibicomputers."
 
@@ -415,6 +536,14 @@ class TmpFileSystemStackExhaustionTest {
         val F_RENAMED: VfsPath = VfsPath.parse("/renamed-to-a-longer-name")
         val D_ONE: VfsPath = VfsPath.parse("/dir-one")
         val D_TWO: VfsPath = VfsPath.parse("/dir-two")
+        val D_SUB: VfsPath = VfsPath.parse("/dir-one/sub")
+        val D_MOVED: VfsPath = VfsPath.parse("/dir-two/moved")
+        val D_INTO_SELF: VfsPath = VfsPath.parse("/dir-one/inner")
+        val F_IN_ONE: VfsPath = VfsPath.parse("/dir-one/f")
+        val J_NEW: VfsPath = VfsPath.parse("/新しいファイル")
+        val J_EXISTING: VfsPath = VfsPath.parse("/既にあるファイル")
+        val J_NESTED: VfsPath = VfsPath.parse("/dir-one/日本語のファイル")
+        val J_IN_TWO: VfsPath = VfsPath.parse("/dir-two/移した先の名前")
 
         val TRUNCATE = OpenOptions(read = false, write = true, truncate = true)
 
