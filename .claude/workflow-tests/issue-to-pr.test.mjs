@@ -513,6 +513,37 @@ test('CI がまだ終わっていなかった（pending）なら、merge-rerun �
   assert.doesNotMatch(r.promptOf('merge-rerun'), /不安定なテスト（Issue/)
 })
 
+const FLAKY_PENDING = { ...FLAKY, outcome: 'pending', issue: null }
+
+test('待ったあと（pending → merge-rerun）に CI が不安定なテストで落ちたら、確かめ直して回し直し、もう 1 回呼び直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY], 'merge-rerun': [fail('ci', '待ったあとに落ちた'), MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 2)
+  assert.match(r.issue.mergeReason, /不安定なテスト（#934）/)
+})
+
+test('待ったあとの確かめが not_flaky なら、回し直さずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, NOT_FLAKY], 'merge-rerun': [fail('ci', '待ったあとに落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('待ったあとの確かめがまた pending なら、もう待たずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY_PENDING], 'merge-rerun': [fail('ci', '待ったあとに落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('待ったあとに 2 回目の回し直しまで落ちたら、それ以上は確かめない', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY, FLAKY], 'merge-rerun': [fail('ci', 'a'), fail('ci', 'b')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 2)
+})
+
 for (const [name, m] of [
   ['build', fail('build', ':core:test が落ちた')],
   ['conflict', fail('conflict', '字面で解けない')],

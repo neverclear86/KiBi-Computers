@@ -868,7 +868,8 @@ ${gradleRules(info.number, logStage, { startupRetry: 'script' })}
 
 // マージの段階。回し直す間も mergeLock を持ったままにする（main を動かさないため。ほかのマージは待つ）。
 // 回し直し・やり直しは、それぞれ最大 1 回: 待たずに返した回（#904）→ Gradle の起動の失敗（#958）→ 過負荷の GameTest（#855）の順に
-// mergeWithRetries が見る。その結果が push の後の CI の失敗（failedStep=ci）なら、最後に不安定なテストの回し直し（#961）を 1 回だけ見る。
+// mergeWithRetries が見る。その結果が push の後の CI の失敗（failedStep=ci）なら、最後に不安定なテストの回し直し（#961）を 1 回だけ見る
+// （CI がまだ終わっていなかった待ちのあとの CI の失敗だけ、確かめをもう 1 回する。回し直しは合わせて 1 回）。
 // 不安定なテストの回し直しのあと（merge-rerun）の結果には、もう回し直し・やり直しをしない（待つやり直しだけはする）
 async function mergePr(info, impl) {
   await mergeLock.acquire()
@@ -883,9 +884,21 @@ async function mergePr(info, impl) {
 
 // マージの段階の push の後の CI の失敗を、CI の直しの段と同じ条件で不安定なテストか確かめ、そうなら記録して 1 回だけ回し直す（#961）。
 // 回し直すかどうか・回数はスクリプトが決める（マージの段階のエージェントは回し直さない）。確かめの段階はコードを変えず、push しない
-// （ここで push すると、レビューを通っていないコードがそのままマージされる）。CI がまだ終わっていなかった（pending）ときも、
-// 待つために 1 回だけ呼び直す（同じ 1 回の枠に数える）。2 回目も CI が落ちたら、今までどおり needs_human・failedStep=ci で止まる
+// （ここで push すると、レビューを通っていないコードがそのままマージされる）。回し直し（rerun）は 1 回だけ。
+// CI がまだ終わっていなかった（pending）ときは、待つためにマージの段階を呼び直す。その待ちのあとに CI が落ちたら、
+// もう 1 回だけ確かめ直す（待ちは回し直しの回数に数えない。確かめも、マージの段階の呼び直しも、最大 2 回）。
+// 回し直したあとも CI が落ちたら、今までどおり needs_human・failedStep=ci で止まる
 async function rerunFlakyCi(info, impl, res) {
+  const first = await rerunFlakyOnce(info, impl, res, false)
+  if (!first.waitedForCi) return first.result
+  // 待ったあとの CI が落ちた（failedStep=ci のまま）。待ちの前には見られなかった落ち方なので、確かめ直す
+  log(`PR #${impl.pr}: CI の待ちのあとも CI が通らなかった。不安定なテストかを確かめ直す`)
+  return (await rerunFlakyOnce(info, impl, first.result, true)).result
+}
+
+// 確かめと呼び直しを 1 回。last=true の回は、pending でももう待たない。
+// waitedForCi: pending で待ち直した結果、また failedStep=ci で止まった（もう 1 回確かめてよい）とき true
+async function rerunFlakyOnce(info, impl, res, last) {
   log(`PR #${impl.pr}: マージの段階の push の後の CI が通らなかった。不安定なテストかを確かめる`)
   const { result: f, stillPending } = await withGradleWait(
     `PR #${impl.pr} の CI の不安定なテストの確かめ`, info.number, impl.worktree,
@@ -896,11 +909,12 @@ async function rerunFlakyCi(info, impl, res) {
     r => (r?.outcome === 'rerun' || r?.outcome === 'pending') ? null : gradlePending(r, r?.summary, false),
   )
   const before = res.reason ?? '-'
-  if (!f) return { ...res, reason: `${before}。不安定なテストかの確かめの段階が失敗した（CI は回し直していない）` }
-  if (stillPending) return { ...res, reason: `${before}。${pendingReason('不安定なテストかの確かめの段階', f)}（CI は回し直していない）` }
-  if (f.outcome !== 'rerun' && f.outcome !== 'pending') {
+  if (!f) return { result: { ...res, reason: `${before}。不安定なテストかの確かめの段階が失敗した（CI は回し直していない）` } }
+  if (stillPending) return { result: { ...res, reason: `${before}。${pendingReason('不安定なテストかの確かめの段階', f)}（CI は回し直していない）` } }
+  if (f.outcome !== 'rerun' && !(f.outcome === 'pending' && !last)) {
     log(`PR #${impl.pr}: 不安定なテストとは判断しなかった。回し直さない`)
-    return { ...res, reason: `${before}。不安定なテストとは判断しなかった（CI は回し直していない）: ${f.summary ?? '-'}` }
+    const why = f.outcome === 'pending' ? `待ったあとも CI が終わっていなかった（run ${f.runId ?? '-'}）` : `不安定なテストとは判断しなかった: ${f.summary ?? '-'}`
+    return { result: { ...res, reason: `${before}。${why}（CI は回し直していない）` } }
   }
   const what = f.outcome === 'rerun'
     ? `push の後の CI が PR と関係のない不安定なテスト${f.issue ? `（#${f.issue}）` : ''}で落ちたので、run ${f.runId ?? '-'} の落ちたジョブを 1 回だけ回し直した`
@@ -910,9 +924,11 @@ async function rerunFlakyCi(info, impl, res) {
   const run = await mergeOnce(info, impl, rerunNote(info, f, orphan, impl.worktree), 'merge-rerun')
   const r = run.result
   const prefix = `${before}。${what}${run.waited && r && !run.stillPending ? '。回し直しのあとのマージの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した' : ''}`
-  if (!r) return { ...res, retried: true, reason: `${prefix}。回し直しのあとのマージの段階が失敗した${run.retryFailed ? '（Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した）' : ''}` }
-  if (run.stillPending) return pendingMergeResult(r, prefix)
-  return { ...r, retried: true, reason: r.status === 'merged' ? prefix : `${prefix}。回し直しのあとの理由: ${r.reason ?? '-'}` }
+  if (!r) return { result: { ...res, retried: true, reason: `${prefix}。回し直しのあとのマージの段階が失敗した${run.retryFailed ? '（Gradle の終わりを待たずに返し、待つやり直しの段階も失敗した）' : ''}` } }
+  if (run.stillPending) return { result: pendingMergeResult(r, prefix) }
+  const result = { ...r, retried: true, reason: r.status === 'merged' ? prefix : `${prefix}。回し直しのあとの理由: ${r.reason ?? '-'}` }
+  const waitedForCi = f.outcome === 'pending' && r.status === 'needs_human' && r.failedStep === 'ci' && !r.gradlePendingStop
+  return { result, waitedForCi }
 }
 
 // 不安定なテストかを確かめる段階（merge-flaky）の指示（#961）。条件と記録・回し直しの手順は、CI の直しの段と同じ文（FLAKY_*）を使う
