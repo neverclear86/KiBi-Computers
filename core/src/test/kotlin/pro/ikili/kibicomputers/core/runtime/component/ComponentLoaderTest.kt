@@ -1054,13 +1054,11 @@ class ComponentLoaderTest {
         val bytes = wat("(component $chain (type \$it (instance $inner)) (import \"i\" (instance (type \$it))))")
         assertTrue(bytes.size < 1_000_000) { "${bytes.size}" }
         val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
-        val start = System.nanoTime()
         val e = assertThrows<WasmLoadException> { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
-        val took = (System.nanoTime() - start) / 1_000_000
         assertMessage(e, "検証が重すぎる")
-        // 手数で断ったと分かる（見積もりの値は途中までのものなので出さない）
+        // 手数で断ったと分かる（見積もりの値は途中までのものなので出さない）。実時間は見ない（共有のランナーで揺れる。
+        // 手数が上限で決定的に止まることが、この形が 2 乗にならない根拠）
         assertMessage(e, "手数")
-        assertTrue(took < 3_000) { "$took ms" }
     }
 
     @Test
