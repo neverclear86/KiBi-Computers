@@ -172,7 +172,10 @@ class DiskFileSystemStackExhaustionTest {
             return hi
         }
 
-        val width = stackHeadroomRounds(widthFrames)
+        // 幅は回数の割合（`kibi.stackHeadroom.roundsScale`。インタプリタで回す opt-in のタスクは 1/4）で縮めない（#903）。縮めると
+        // 「境目から先を 1 段ずつ全部」でなくなり、`-Xint` では確かめ（`probe` もインタプリタの大きいフレーム）の幅より狭くなって、
+        // [sweepVfs] の尽きる位置が確かめの外まで届かなかった。1 回は速い（インタプリタでも 1 本が数分）ので、減らすのは JIT をかける回数だけにする
+        val width = widthFrames
         var edge = findEdge()
         var done = 0
         // 境目から先（詰め物が多く、残りのスタックが少ない側）を、操作が使う分の幅だけ 1 段ずつ。境目は、操作のいちばん深い所が尽きる
