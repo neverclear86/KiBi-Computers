@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.assertTimeoutPreemptively
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -20,6 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
+import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -839,13 +841,537 @@ class ComponentLoaderTest {
 
     @Test
     fun `wacで合成した形の見積もりの余裕`() {
-        // 実物の確かめ（#666。ADR 0262 の「検証の時間の見積もり」）。見積もりは引数ごとに部品の型の大きさ（最大 3,620）を数えるので、
-        // 引数の総数に比例して大きくなる。インターフェース 4 個 × 4 段は上限の 1/6、10 個 × 10 段は上限の手前（約 1.9M）で、
-        // 実際の検証は 0.3 秒ほど。余裕は 10 倍を切る（ADR に書いた）
+        // 実物の確かめ（#666・#751。ADR 0262 の「検証の時間の見積もり」）。見積もりは引数ごとに部品のインターフェースの型の大きさ
+        // （最大 3,620）を数えるので、引数の総数に比例して大きくなる。インスタンス化で作ったインスタンスの型は export だけで、
+        // 写し直しは違う宣言ごとに数える（#751）。インターフェース 4 個 × 4 段は上限の 1/20 ほど
         val small = composedComponent(k = 4, n = 4)
         val e = estimateOf(small)
         assertTrue(e.cost * 4 < ComponentLimits.DEFAULT.maxValidationCost) { "${e.checkCount} × ${e.maxTypeWeight} = ${e.cost}" }
         assertDoesNotThrow { ComponentLoader.load(small, policy = ComponentImportPolicy { null }) }
+        // 20 個 × 20 段（518 KB。#751 の前は見積もり 745 万で断っていた）も、既定の上限で通る（約 173 万。実際の検証は CPU 0.5 秒ほど）
+        val large = composedComponent(k = 20, n = 20)
+        val l = estimateOf(large)
+        assertTrue(l.cost < ComponentLimits.DEFAULT.maxValidationCost) { "${l.checkCount} × ${l.maxTypeWeight} = ${l.cost}（写し直し ${l.remapCost}）" }
+        // 写し直しは、展開した大きさ（段ごとに export のインターフェース 20 個 × 3,620）ではなく、違う宣言の大きさで数える
+        assertTrue(l.remapCost * 5 < 20L * 20 * 3620) { "${l.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(large, policy = ComponentImportPolicy { null }) }
+    }
+
+    @Test
+    fun `写し直しは同じ宣言を1回のインスタンス化の中で1回だけ数える`() {
+        // フィールド 100 個の record を 100 個のフィールドに持つ record（展開すると約 1 万、宣言は 2 つで約 200）を export する
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val outer = (0 until 100).joinToString(" ") { """(field "g$it" ${'$'}r0)""" }
+        val c = """(component ${'$'}c (type ${'$'}r0x (record $inner)) (export ${'$'}r0 "r0" (type ${'$'}r0x)) (type ${'$'}r1 (record $outer)) (export "r" (type ${'$'}r1)))"""
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        val e = estimateOf(wat("(component $c $instances)"))
+        assertEquals(0L, e.checkCount)
+        // 1 回あたり約 300（export した r0 の 101 と、r1 の宣言 101 とその中の r0 の 101、コンポーネントの宣言）。展開した大きさ（約 1 万）ではない
+        assertTrue(e.remapCost in 10L * 202..10L * 400) { "${e.remapCost}" }
+        assertEquals(e.cost, e.remapCost)
+
+        // 別のインスタンス化で作ったインスタンスは、同じ宣言から来ても別の型（wasmparser が resource を置き換えて写し直す）なので、
+        // 重なりを除かない。c を 2 回インスタンス化して両方を export する d を、10 回インスタンス化する
+        val d = """(component ${'$'}d $c (instance ${'$'}x1 (instantiate ${'$'}c)) (instance ${'$'}x2 (instantiate ${'$'}c)) (export "a" (instance ${'$'}x1)) (export "b" (instance ${'$'}x2)))"""
+        val outerInstances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        val twice = estimateOf(wat("(component $d $outerInstances)"))
+        val perC = e.remapCost / 10
+        assertTrue(twice.remapCost >= 2 * perC + 10 * 2 * perC) { "${twice.remapCost} / $perC" }
+    }
+
+    /** フィールド [fields] 個の record を [exports] 回 `(export "aN" (type (eq ..)))` するインスタンス型 `$it` */
+    private fun eqInstanceType(fields: Int, exports: Int, resource: Boolean = false): String {
+        val record = (0 until fields).joinToString(" ") { """(field "f$it" u32)""" }
+        val eqs = (0 until exports).joinToString(" ") { """(export "a$it" (type (eq ${'$'}rr)))""" }
+        val res = if (resource) """(export "res" (type (sub resource)))""" else ""
+        return "(type ${'$'}it (instance (type ${'$'}rr (record $record)) $eqs $res))"
+    }
+
+    /** 入れ子のコンポーネントが、[eqInstanceType] を import する。その入れ子のコンポーネントを export するコンポーネントを [m] 回インスタンス化する */
+    private fun nestedComponentExport(fields: Int, exports: Int, m: Int): ByteArray {
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        return wat(
+            """
+            (component
+              ${eqInstanceType(fields, exports)}
+              (component ${'$'}c
+                (alias outer 1 ${'$'}it (type ${'$'}it))
+                (component ${'$'}n (alias outer 1 ${'$'}it (type ${'$'}it)) (import "i" (instance (type ${'$'}it))))
+                (export "n" (component ${'$'}n))
+              )
+              $instances
+            )
+            """,
+        )
+    }
+
+    /** [eqInstanceType] を import に持つコンポーネント型を import し、空のコンポーネントを渡して [m] 回インスタンス化する */
+    private fun componentTypeImport(fields: Int, exports: Int, m: Int): ByteArray {
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c (with \"k\" (component ${'$'}empty))))" }
+        return wat(
+            """
+            (component
+              ${eqInstanceType(fields, exports)}
+              (type ${'$'}ct (component (alias outer 1 ${'$'}it (type ${'$'}it)) (import "i" (instance (type ${'$'}it)))))
+              (component ${'$'}c (alias outer 1 ${'$'}ct (type ${'$'}ct)) (import "k" (component (type ${'$'}ct))))
+              (component ${'$'}empty)
+              $instances
+            )
+            """,
+        )
+    }
+
+    /** [eqInstanceType] を型として export するコンポーネントを（import はどこにもない）[m] 回インスタンス化する */
+    private fun eqTypeExport(fields: Int, exports: Int, m: Int): ByteArray {
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        return wat(
+            """
+            (component
+              ${eqInstanceType(fields, exports)}
+              (component ${'$'}c (alias outer 1 ${'$'}it (type ${'$'}it)) (export "t" (type ${'$'}it)))
+              $instances
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `写し直しで検証が膨らむ形は今までどおり検証の前に断る`() {
+        // どれも wasm-tools の検証に CPU で数秒かかる（#751 のレビューで実測。フィールド 900 個 × export 900 個を 60 回で 14 KB）
+        // 入れ子のコンポーネントを export する（wasmparser は import も写し直す）
+        val nested = nestedComponentExport(fields = 900, exports = 900, m = 60)
+        assertTrue(nested.size < 100_000) { "${nested.size}" }
+        val n = estimateOf(nested)
+        assertTrue(n.remapCost >= 60L * 900 * 900 / 2) { "${n.remapCost}" }
+        rejectedBeforeValidation(nested)
+        // コンポーネント型を import する（引数ごとに、受ける側の import の型を写し直す。渡すのは空のコンポーネント）
+        val componentType = componentTypeImport(fields = 900, exports = 900, m = 60)
+        val ct = estimateOf(componentType)
+        assertEquals(60L, ct.checkCount)
+        assertTrue(ct.remapCost >= 60L * 900 * 900 / 2) { "${ct.remapCost}" }
+        rejectedBeforeValidation(componentType)
+        // 同じ型を何度も eq で export するインスタンス型（eq は export ごとに別の id。1 回のインスタンス化の中でも別々に写し直す）
+        val eq = eqTypeExport(fields = 900, exports = 900, m = 60)
+        val q = estimateOf(eq)
+        assertTrue(q.remapCost >= 60L * 900 * 900 / 2) { "${q.remapCost}" }
+        rejectedBeforeValidation(eq)
+    }
+
+    @Test
+    fun `resource を定義する型は、import・exportの宣言のたびに写し直しを数える`() {
+        // #751 のレビュー: wasmparser は resource を定義するインスタンス型を import するたび・型宣言の中で export するたびに、
+        // その型の export を新しい Remapping で全部写し直す。インスタンス化がなくても、宣言の数に比例して検証が膨らむ
+        // （フィールド 900 個 × export 900 個の型を 20 か所で宣言して CPU 約 3 秒）
+        val n = 20
+        val withResource = eqInstanceType(fields = 900, exports = 900, resource = true)
+        // (1) 入れ子のコンポーネントが、それぞれ import する
+        val nested = (0 until n).joinToString(" ") { "(component (alias outer 1 ${'$'}it (type ${'$'}t)) (import \"i\" (instance (type ${'$'}t))))" }
+        // (2) コンポーネント型の中で import する
+        val inComponentType = (0 until n).joinToString(" ") {
+            "(type (component (alias outer 1 ${'$'}it (type ${'$'}t)) (import \"i\" (instance (type ${'$'}t)))))"
+        }
+        // (3) インスタンス型の中で export する
+        val inInstanceType = (0 until n).joinToString(" ") {
+            "(type (instance (alias outer 1 ${'$'}it (type ${'$'}t)) (export \"i\" (instance (type ${'$'}t)))))"
+        }
+        for (body in listOf(nested, inComponentType, inInstanceType)) {
+            val bytes = wat("(component $withResource $body)")
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= n * 900L * 900 / 2) { "${e.remapCost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        // resource がなければ、wasmparser は宣言では写し直さない（見積もりは 0 のまま）
+        val plain = eqInstanceType(fields = 900, exports = 900)
+        val noResource = wat("(component $plain $nested)")
+        assertEquals(0L, estimateOf(noResource).remapCost)
+    }
+
+    /** 名前 [names] 個の enum を [exports] 回 eq で export するインスタンス型 `$it`（[resource] なら resource も 1 つ export する） */
+    private fun enumInstanceType(names: Int, exports: Int, resource: Boolean = false): String {
+        val cases = (0 until names).joinToString(" ") { "\"e$it\"" }
+        val eqs = (0 until exports).joinToString(" ") { """(export "a$it" (type (eq ${'$'}en)))""" }
+        val res = if (resource) """(export "res" (type (sub resource)))""" else ""
+        return "(type ${'$'}it (instance (type ${'$'}en (enum $cases)) $eqs $res))"
+    }
+
+    @Test
+    fun `写し直しの大きさは、型の大きさの上限の100万で止めない`() {
+        // #935 のレビュー: enum の名前の数は wasmparser の型の大きさに入らないので、wasmparser は断らないまま、写し直しの手間が
+        // 100 万を超える。100 万で止めると、見積もりは上限の半分で止まり、検証が秒単位になる
+        // （名前 3,000 個 × eq 3,000 回で、import 1 回が CPU 1.75 秒、インスタンス化 1 回が 1.6 秒）
+        val n = 3_000
+        // (1) resource を定義する型を 1 回 import するだけ（インスタンス化なし）
+        val imported = wat("(component ${enumInstanceType(n, n, resource = true)} (import \"i\" (instance (type ${'$'}it))))")
+        // (2) その型（resource なし）を export するコンポーネントを 1 回インスタンス化する
+        val instantiated = wat(
+            "(component ${enumInstanceType(n, n)} (component ${'$'}c (alias outer 1 ${'$'}it (type ${'$'}it)) " +
+                "(export \"t\" (type ${'$'}it))) (instance (instantiate ${'$'}c)))",
+        )
+        for (bytes in listOf(imported, instantiated)) {
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= n.toLong() * n) { "${e.remapCost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        // 小さい enum なら今までどおり通る（展開した大きさを数えるだけ）
+        val small = wat("(component ${enumInstanceType(100, 100, resource = true)} (import \"i\" (instance (type ${'$'}it))))")
+        val s = estimateOf(small)
+        assertTrue(s.remapCost in 100L * 100..2L * 101 * 101) { "${s.remapCost}" }
+    }
+
+    @Test
+    fun `型の確認の大きさも、enumの名前を数えて100万で止めない`() {
+        // #935 のレビュー: enum の名前の数は wasmparser の型の大きさに入らないが、型の確認は名前を1つずつ比べる（確認は覚えない）。
+        // 名前 6,000 個の enum を 150 個ずつ 2 段の tuple にして、record で型を付けた export の確認をさせる（約 80 KB）。
+        // 確認の大きさを 100 万で止めると、見積もりは 100 万のまま通り、検証が秒単位になる
+        val names = (0 until 6_000).joinToString(" ") { "\"e$it\"" }
+        fun record(p: String) =
+            "(type ${'$'}en$p (enum $names)) " +
+                "(type ${'$'}t1$p (tuple ${(0 until 150).joinToString(" ") { "${'$'}en$p" }})) " +
+                "(type ${'$'}t2$p (tuple ${(0 until 150).joinToString(" ") { "${'$'}t1$p" }})) " +
+                "(type ${'$'}b$p (record (field \"x\" ${'$'}t2$p)))"
+        val bytes = wat("(component ${record("0")} ${record("1")} (export \"b\" (type ${'$'}b0) (type (eq ${'$'}b1))))")
+        assertTrue(bytes.size < 200_000) { "${bytes.size}" }
+        val e = estimateOf(bytes)
+        assertEquals(1L, e.checkCount)
+        assertTrue(e.cost > 150L * 150 * 6_000 / 2) { "${e.cost}" }
+        // 型の大きさの最大は、今までどおり 100 万で止める
+        assertTrue(e.maxTypeWeight <= 1_000_000L) { "${e.maxTypeWeight}" }
+        rejectedBeforeValidation(bytes)
+    }
+
+    @Test
+    fun `写して作った型が多く、同じ宣言の連なりを参照する形の見積もりは、入力の大きさの2乗の手間にならない`() {
+        // #935 のレビュー: 写して作った型（export の `(type (eq ..))`）ごとに、参照先の宣言の連なりをたどり直すと、
+        // 型の数 C × 連なりの長さ N の手間になり、N = C = 20,000（約 500 KB）で 30 秒以上かかった。
+        // 見積もりは手数で抑え、上限を超えたら、すぐ断る
+        val n = 20_000
+        val chain = StringBuilder("(type \$r0 (record (field \"a\" u32))) ")
+        for (k in 1 until n) chain.append("(type \$r$k (record (field \"a\" \$r${k - 1}))) ")
+        val inner = StringBuilder("(alias outer 1 \$r${n - 1} (type \$x)) ")
+        for (k in 0 until n) inner.append("(type \$c$k (record (field \"a\" \$x))) ")
+        for (k in 0 until n) inner.append("(export \"e$k\" (type (eq \$c$k))) ")
+        inner.append("(export \"res\" (type (sub resource)))")
+        val bytes = wat("(component $chain (type \$it (instance $inner)) (import \"i\" (instance (type \$it))))")
+        assertTrue(bytes.size < 1_000_000) { "${bytes.size}" }
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        val e = assertThrows<WasmLoadException> { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+        assertMessage(e, "検証が重すぎる")
+        // 手数で断ったと分かる（見積もりの値は途中までのものなので出さない）。実時間は見ない（共有のランナーで揺れる。
+        // 手数が上限で決定的に止まることが、この形が 2 乗にならない根拠）
+        assertMessage(e, "手数")
+    }
+
+    @Test
+    fun `写し直しの見積もりは上限をまたいでも、断る側に外れない`() {
+        // 見積もりが上限を超えたら、check は写し直しの大きさをたどらずに展開した大きさに切り替える。切り替えても、
+        // estimate（最後までたどる）が上限を超える形は、check でも断り、超えない形は通る
+        val shapes = listOf(
+            nestedComponentExport(fields = 30, exports = 30, m = 5),
+            componentTypeImport(fields = 30, exports = 30, m = 5),
+            eqTypeExport(fields = 30, exports = 30, m = 5),
+        )
+        for (bytes in shapes) {
+            val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+            val full = ComponentValidationCost.estimate(root).cost
+            assertTrue(full >= 5L * 30 * 30 / 2) { "$full" }
+            assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits(maxValidationCost = full)) }
+            for (limit in listOf(full - 1, full / 2, full / 100, 1L)) {
+                val e = assertThrows<WasmLoadException> { ComponentValidationCost.check(root, ComponentLimits(maxValidationCost = limit)) }
+                assertMessage(e, "検証が重すぎる")
+            }
+        }
+    }
+
+    @Test
+    fun `同じ型への参照が多い宣言の写し直しは、見積もりが上限に収まれば手数で断らない`() {
+        // #935 のレビュー: 手数を、参照を積むときと取り出すときの両方で数えていたので、同じ型への参照が多い宣言
+        // （`(list u32)` への参照 5,000 個の tuple）では、手数が写し直しの見積もりの約 2 倍になり、見積もり（約 125 万）が
+        // 上限（200 万）に収まるのに断っていた。wasm-tools の検証は通り、CPU 0.3 秒ほど
+        val refs = (0 until 5_000).joinToString(" ") { "${'$'}l" }
+        val records = (0 until 50).joinToString(" ") { """(type ${'$'}r$it (record (field "a" ${'$'}xx)))""" }
+        val eqs = (0 until 50).joinToString(" ") { """(export "e$it" (type (eq ${'$'}r$it)))""" }
+        val types = (0 until 5).joinToString(" ") {
+            """(type ${'$'}it$it (instance (alias outer 1 ${'$'}x (type ${'$'}xx)) $records $eqs (export "res" (type (sub resource)))))"""
+        }
+        val nested = (0 until 5).joinToString(" ") {
+            """(component (alias outer 1 ${'$'}it$it (type ${'$'}t)) (import "i" (instance (type ${'$'}t))))"""
+        }
+        val bytes = wat("(component (type ${'$'}l (list u32)) (type ${'$'}x (tuple $refs)) $types $nested)")
+        val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+        val e = ComponentValidationCost.estimate(root)
+        assertTrue(e.cost in ComponentLimits.DEFAULT.maxValidationCost / 2..ComponentLimits.DEFAULT.maxValidationCost) { "${e.cost}" }
+        // 手数は写し直しの見積もりを超えない（参照 1 本で 1 手）
+        assertTrue(e.work <= e.remapCost) { "work ${e.work}, remap ${e.remapCost}" }
+        assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+        assertDoesNotThrow { ComponentLoader.load(bytes) }
+    }
+
+    /** u32 の LEB128 */
+    private fun leb(v: Long): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var x = v
+        do {
+            var b = (x and 0x7f).toInt()
+            x = x ushr 7
+            if (x != 0L) b = b or 0x80
+            out.write(b)
+        } while (x != 0L)
+        return out.toByteArray()
+    }
+
+    /** id [id] の section */
+    private fun section(id: Int, body: ByteArray): ByteArray = byteArrayOf(id.toByte()) + leb(body.size.toLong()) + body
+
+    /** count = 0x7fffffff（入れ子の深さを超える）、type の `alias outer`（sort 0x03、outer 0x02、count、index 0） */
+    private val hugeOuterTypeAlias = byteArrayOf(0x03, 0x02) + leb(0x7fff_ffffL) + leb(0)
+
+    @Test
+    fun `深さを超える count の alias outer は、見積もりで count 回まわらない`() {
+        // #935 のレビュー: Scope.outer が、親が尽きて null になった後も count 回まわっていた。count は深さと比べずに
+        // index()（Int.MAX_VALUE まで）で読み、見積もりは wasm-tools の検証（count を断る）より前に見張りの外で動くので、
+        // count = 0x7fffffff の alias 200 個・1.6 KB で、見積もりだけで CPU 17 秒かかった（alias 1 個あたり約 87 ms）。
+        // 型宣言の中の alias（declType → alias）も同じ経路を通る
+        val n = 1_000
+        val aliases = (0 until n).fold(leb(n.toLong())) { acc, _ -> acc + hugeOuterTypeAlias }
+        val header = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00)
+        val topLevel = header + section(0x06, aliases)
+        // (type (instance (alias outer 0x7fffffff 0 (type)) ...))
+        val decls = (0 until n).fold(leb(n.toLong())) { acc, _ -> acc + byteArrayOf(0x02) + hugeOuterTypeAlias }
+        val inDeclType = header + section(0x07, leb(1) + byteArrayOf(0x42) + decls)
+        for (bytes in listOf(topLevel, inDeclType)) {
+            // 直す前は 1,000 個で 80 秒以上（count 回まわる）。直した後はミリ秒単位なので、上限は十分に大きくとる
+            assertTimeoutPreemptively(Duration.ofSeconds(30)) {
+                val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+                assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+                // 不正な count は wasm-tools の検証が断る（時間の上限に当たるのではなく）
+                val e = assertThrows<WasmLoadException> { ComponentLoader.load(bytes) }
+                assertTrue(!e.message!!.contains("時間の上限")) { "${e.message}" }
+            }
+        }
+    }
+
+    @Test
+    fun `core モジュールを渡すインスタンス化の確認は、それまでの型の大きさの最大で数える`() {
+        // #935 のレビュー: core モジュールの引数（`(with "m" (core module $m))`）は添字空間をなぞらないので必ず引けず、
+        // それまでに見た型の大きさの最大で数える。最大が core の型（モジュール型）のとき、100 万で止めない展開した大きさの最大
+        // （値の型・インスタンス型などでしか更新していなかった）で数えて小さくなり、export 2,000 個のモジュール型を受ける引数
+        // 100 個 × 10 回（約 40 KB）を通していた。main と同じく検証の前に断る
+        val n = 2_000
+        val funcs = (0 until n).joinToString(" ") { """(func (export "f$it"))""" }
+        val decls = (0 until n).joinToString(" ") { """(export "f$it" (func))""" }
+        val imports = (0 until 100).joinToString(" ") { """(import "i$it" (core module (type ${'$'}mt)))""" }
+        val args = (0 until 100).joinToString(" ") { """(with "i$it" (core module ${'$'}m))""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c $args))" }
+        val bytes = wat(
+            """
+            (component
+              (core module ${'$'}m $funcs)
+              (component ${'$'}c (core type ${'$'}mt (module $decls)) $imports)
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(1_000L, e.checkCount)
+        assertTrue(e.maxTypeWeight > n) { "${e.maxTypeWeight}" }
+        // 確認ごとに、それまでの型の大きさの最大（モジュール型の大きさ）
+        assertTrue(e.cost - e.remapCost >= 1_000L * e.maxTypeWeight) { "cost ${e.cost}, remap ${e.remapCost}, max ${e.maxTypeWeight}" }
+        rejectedBeforeValidation(bytes)
+    }
+
+    /** フィールド [fields] 個の record を [exports] 回 export するコンポーネント `$c` */
+    private fun recordExporter(fields: Int, exports: Int): String {
+        val record = (0 until fields).joinToString(" ") { """(field "f$it" u32)""" }
+        val ex = (0 until exports).joinToString(" ") { """(export "a$it" (type ${'$'}r))""" }
+        return "(component ${'$'}c (type ${'$'}r (record $record)) $ex)"
+    }
+
+    /** `$src` のコンポーネントをインスタンス化して、そのインスタンスを export するコンポーネント `$d` を [m] 回インスタンス化する */
+    private fun instantiateViaOuter(m: Int): String {
+        val instances = (0 until m).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        return """
+            (component ${'$'}d
+              (alias outer 1 ${'$'}src (component ${'$'}cc))
+              (instance ${'$'}x (instantiate ${'$'}cc))
+              (export "x" (instance ${'$'}x))
+            )
+            $instances
+        """
+    }
+
+    @Test
+    fun `export し直したコンポーネントやaliasで引いたコンポーネントのインスタンスも、exportの写し直しを数える`() {
+        // #751 のレビュー: export し直したコンポーネントや、インスタンスの export の alias で引いたコンポーネントを
+        // インスタンス化したインスタンスの型が引けず、その export の写し直しを小さく数えていた（検証に 8 秒以上かかる形を通していた）
+        val reexported = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (export ${'$'}src "c" (component ${'$'}c))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        val viaAlias = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (component ${'$'}w (alias outer 1 ${'$'}c (component ${'$'}cc)) (export "c" (component ${'$'}cc)))
+              (instance ${'$'}wi (instantiate ${'$'}w))
+              (alias export ${'$'}wi "c" (component ${'$'}src))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        // 比べる元: 同じコンポーネントを直接 outer alias する（前から断っていた）
+        val direct = wat(
+            """
+            (component
+              ${recordExporter(fields = 900, exports = 900)}
+              (alias outer 0 ${'$'}c (component ${'$'}src))
+              ${instantiateViaOuter(m = 60)}
+            )
+            """,
+        )
+        val d = estimateOf(direct)
+        for (bytes in listOf(reexported, viaAlias)) {
+            assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+            val e = estimateOf(bytes)
+            assertTrue(e.remapCost >= 60L * 900 * 900 / 2) { "${e.remapCost}" }
+            assertTrue(e.cost >= d.cost) { "${e.cost} < ${d.cost}" }
+            rejectedBeforeValidation(bytes)
+        }
+        rejectedBeforeValidation(direct)
+    }
+
+    @Test
+    fun `importしたコンポーネントのインスタンスの型はexportだけの大きさ`() {
+        // 大きな import（フィールド 100 個の record）と小さな export を持つコンポーネント型を import し、インスタンス化したものを引数に渡す。
+        // インスタンスの型は export だけ（型を引けずに、それまでの最大の大きさとはしない）
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}y (with \"j\" (instance ${'$'}x))))" }
+        val bytes = wat(
+            """
+            (component
+              (type ${'$'}ct (component (type ${'$'}rr (record $inner)) (import "i" (type (eq ${'$'}rr))) (export "e" (func))))
+              (import "k" (component ${'$'}k (type ${'$'}ct)))
+              (type ${'$'}big (record $inner))
+              (component ${'$'}y (import "j" (instance)))
+              (instance ${'$'}x (instantiate ${'$'}k (with "i" (type ${'$'}big))))
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(11L, e.checkCount)
+        // big を渡す 1 回（約 100）と、x を渡す 10 回（それぞれ数個）。x の型に k の import（約 100）を入れると 1,000 を超える
+        assertTrue(e.cost - e.remapCost in 101L..300L) { "${e.cost} - ${e.remapCost}" }
+    }
+
+    @Test
+    fun `型を付けたexportは付けた型で写し直しを数える`() {
+        // #751 のレビュー: 実物（同じ record を 900 回 export したインスタンス）ではなく、付けた型（`(type (eq ..))` を 900 回 export する
+        // インスタンス型。export ごとに別の型）を写し直す。実物で数えると、検証に 7 秒以上かかる形を通していた
+        val record = (0 until 900).joinToString(" ") { """(field "f$it" u32)""" }
+        val bag = (0 until 900).joinToString(" ") { """(export "a$it" (type ${'$'}r))""" }
+        val instances = (0 until 60).joinToString(" ") { "(instance (instantiate ${'$'}d))" }
+        val bytes = wat(
+            """
+            (component
+              ${eqInstanceType(fields = 900, exports = 900)}
+              (component ${'$'}d
+                (alias outer 1 ${'$'}it (type ${'$'}t))
+                (type ${'$'}r (record $record))
+                (instance ${'$'}bag $bag)
+                (export "x" (instance ${'$'}bag) (instance (type ${'$'}t)))
+              )
+              $instances
+            )
+            """,
+        )
+        assertTrue(bytes.size < 100_000) { "${bytes.size}" }
+        val e = estimateOf(bytes)
+        assertTrue(e.remapCost >= 60L * 900 * 900 / 2) { "${e.remapCost}" }
+        rejectedBeforeValidation(bytes)
+    }
+
+    /**
+     * t0 は export 1 個のインスタンス型、t(k+1) は t(k) のインスタンスを export する、を [depth] 段。
+     * 一番下の t0 は、宣言を共有して 2 倍ずつ膨らむ record（[levels] 段。展開すると約 2^[levels] 倍、宣言は [levels] 個）を export する。
+     * 最後の型を export するコンポーネントを 10 回インスタンス化する
+     */
+    private fun deepInstanceTypes(depth: Int, levels: Int): ByteArray {
+        val types = StringBuilder()
+        if (levels > 0) {
+            types.append("(type ${'$'}r0 (record (field \"f\" u32)))\n")
+            for (k in 1..levels) types.append("(type ${'$'}r$k (record (field \"a\" ${'$'}r${k - 1}) (field \"b\" ${'$'}r${k - 1})))\n")
+            types.append("(type ${'$'}t0 (instance (alias outer 1 ${'$'}r$levels (type ${'$'}r)) (export \"x\" (type (eq ${'$'}r)))))\n")
+        } else {
+            types.append("(type ${'$'}t0 (instance (type ${'$'}r (record (field \"f\" u32))) (export \"x\" (type (eq ${'$'}r)))))\n")
+        }
+        for (k in 1..depth) {
+            types.append("(type ${'$'}t$k (instance (alias outer 1 ${'$'}t${k - 1} (type ${'$'}p)) (export \"x\" (instance (type ${'$'}p)))))\n")
+        }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}c))" }
+        return wat(
+            """
+            (component
+              $types
+              (component ${'$'}c (alias outer 1 ${'$'}t$depth (type ${'$'}t)) (export "t" (type ${'$'}t)))
+              $instances
+            )
+            """,
+        )
+    }
+
+    @Test
+    fun `入れ子が深すぎる型は展開した大きさで数え、小さくならない`() {
+        // 宣言を共有しない形（100 段。MAX_FLAT_DEPTH の 64 を超える）。写し直しの大きさは 1 回あたり 206（段ごとに宣言があり、
+        // 打ち切りの先も 0 にはならない）。打ち切りが 0 を返すと 1 回あたり約 130 に下がる
+        val root = ComponentParser.parse(deepInstanceTypes(depth = 100, levels = 0), ComponentLimits.DEFAULT, null)
+        val e = ComponentValidationCost.estimate(root)
+        assertEquals(10L * 206, e.remapCost)
+        assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+    }
+
+    @Test
+    fun `入れ子が深すぎると、たどった値ではなく展開した大きさに切り替える`() {
+        // 宣言を共有して 2 倍ずつ膨らむ record（17 段。宣言は 18 個、展開すると約 26 万）を一番下に持つ
+        // 浅い（10 段）うちは、たどった値（宣言の数ほど）。展開した大きさにはならない
+        val shallow = ComponentValidationCost.estimate(ComponentParser.parse(deepInstanceTypes(depth = 10, levels = 17), ComponentLimits.DEFAULT, null))
+        assertTrue(shallow.remapCost < 10L * 1_000) { "${shallow.remapCost}" }
+        // 深い（100 段。64 を超えるところから展開した大きさ）と、1 回あたり展開した大きさ（約 26 万）以上になる
+        val deepRoot = ComponentParser.parse(deepInstanceTypes(depth = 100, levels = 17), ComponentLimits.DEFAULT, null)
+        val deep = ComponentValidationCost.estimate(deepRoot)
+        assertTrue(deep.remapCost >= 10L * 200_000) { "${deep.remapCost}" }
+        val rejected = assertThrows<WasmLoadException> { ComponentValidationCost.check(deepRoot, ComponentLimits.DEFAULT) }
+        assertMessage(rejected, "検証が重すぎる")
+    }
+
+    @Test
+    fun `インスタンス化で作ったインスタンスの型はexportだけの大きさ`() {
+        // c は大きなインスタンス型を import し、何も export しない。そのインスタンスを引数に渡す確認は、import の大きさを数えない
+        val inner = (0 until 100).joinToString(" ") { """(field "f$it" u32)""" }
+        val instances = (0 until 10).joinToString(" ") { "(instance (instantiate ${'$'}y (with \"j\" (instance ${'$'}x))))" }
+        val bytes = wat(
+            """
+            (component
+              (type ${'$'}t (instance (type ${'$'}rr (record $inner)) (export "r" (type (eq ${'$'}rr)))))
+              (import "wasi:a/b@0.2.0" (instance ${'$'}a (type ${'$'}t)))
+              (component ${'$'}c (alias outer 1 ${'$'}t (type ${'$'}t)) (import "i" (instance (type ${'$'}t))))
+              (component ${'$'}y (import "j" (instance)))
+              (instance ${'$'}x (instantiate ${'$'}c (with "i" (instance ${'$'}a))))
+              $instances
+            )
+            """,
+        )
+        val e = estimateOf(bytes)
+        assertEquals(11L, e.checkCount)
+        // a を渡す 1 回（約 100）と、x を渡す 10 回（それぞれ 1）。x の型に c の import（約 100）を入れると 1,000 を超える
+        assertTrue(e.cost - e.remapCost in 101L..200L) { "${e.cost} - ${e.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(bytes, policy = ComponentImportPolicy { null }) }
     }
 
     @Test
