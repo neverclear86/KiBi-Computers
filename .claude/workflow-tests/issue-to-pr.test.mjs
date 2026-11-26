@@ -18,7 +18,7 @@ const IMPL = {
 }
 const OK_CI = { passed: true, failingChecks: [], failureLog: '', mergeable: 'MERGEABLE', noChecks: false }
 const MERGED = {
-  status: 'merged', reason: null, failedStep: null, gameTestFailedOnly: false, gameTestSeconds: 100, maxTicksBehind: 0,
+  status: 'merged', reason: null, failedStep: null, gameTestFailedOnly: false, gradleStartupFailed: false, gameTestSeconds: 100, maxTicksBehind: 0,
   logPath: null, gradleStillRunning: false, runningLogs: [],
 }
 const fail = (failedStep, reason, extra = {}) => ({ ...MERGED, status: 'needs_human', failedStep, reason, ...extra })
@@ -28,6 +28,7 @@ const PENDING = { gradleStillRunning: true, runningLogs: ['merge-build-2.log'] }
 async function run(overrides = {}, args = { issues: [904] }) {
   const queues = Object.fromEntries(Object.entries(overrides).map(([k, v]) => [k, [...v]]))
   const calls = []
+  const prompts = []
   const logs = []
   const defaults = {
     select: () => ({ issues: [{ number: 904, title: 't', areas: ['tooling'], openDeps: [], blockedReason: null, needsPlan: false }] }),
@@ -43,6 +44,7 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const agent = async (prompt, opts) => {
     const kind = opts.label.split(':')[0].replace(/~\d+$/, '')
     calls.push(kind)
+    prompts.push({ kind, prompt })
     const q = queues[kind]
     const next = q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
     return typeof next === 'function' ? next() : next
@@ -51,7 +53,8 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', SOURCE)
   const result = await fn(args, agent, parallel, m => logs.push(m), () => {})
   const count = k => calls.filter(c => c === k).length
-  return { result, calls, logs, count, issue: result.results[0] }
+  const promptOf = k => prompts.find(p => p.kind === k)?.prompt
+  return { result, calls, logs, count, promptOf, issue: result.results[0] }
 }
 
 test('既定の流れはマージまで進み、やり直しは呼ばれない', async () => {
@@ -300,4 +303,164 @@ test('確認事項の反映: push しなくても、申告が false なら未完
   })
   assert.equal(r.count('resolve-wait'), 0)
   assert.equal(r.issue.status, 'merged')
+})
+
+// ---- Gradle の起動の失敗（BindException）のやり直し（#958） ----
+
+const STARTUP = { gradleStartupFailed: true }
+const OVERLOAD = { gameTestFailedOnly: true, maxTicksBehind: 5000 }
+// PR #951 のマージの段階が実際に返した理由の文（切らずにそのまま）。gradleStartupFailed の項目がまだない頃のもの
+const PR951_REASON = 'main は取り込み済み（衝突なし、既に最新）。build は 1 回目が Forge の maven への DNS 失敗で落ち、2 回目で通った。GameTest は Gradle の起動時に「java.net.BindException: Address already in use: bind」で起動できず、サーバーは動いていない（テストの失敗ではない）。回し直しはこの段階では行わない決まりで、自動の再実行も拒否されたため止めた。マージ、push、CI の待ちはしていない。'
+const withoutFlag = m => { const c = { ...m }; delete c.gradleStartupFailed; return c }
+
+for (const step of ['build', 'gametest']) {
+  test(`起動の失敗（${step}）は merge-restart を 1 回呼んでマージまで進み、理由に残る`, async () => {
+    const r = await run({ merge: [fail(step, 'Gradle could not start your build', STARTUP)], 'merge-restart': [MERGED] })
+    assert.equal(r.issue.status, 'merged')
+    assert.equal(r.count('merge-restart'), 1)
+    assert.equal(r.count('merge-wait'), 0)
+    assert.equal(r.count('merge-retry'), 0)
+    assert.match(r.issue.mergeReason, /起動の失敗.*1 回だけやり直した/)
+  })
+}
+
+test('起動の失敗が 2 回続いたら、やり直しは 1 回で止まり、人に上がる', async () => {
+  const r = await run({ merge: [fail('gametest', 'a', STARTUP)], 'merge-restart': [fail('gametest', 'b', STARTUP)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-retry'), 0)
+  assert.match(r.issue.mergeReason, /2 回続いた/)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+})
+
+test('#951 の実際の文（項目なし、failedStep=gametest）は、待つやり直しに入らず、起動の失敗のやり直しに進む', async () => {
+  const r = await run({ merge: [withoutFlag(fail('gametest', PR951_REASON))], 'merge-restart': [MERGED] })
+  assert.equal(r.count('merge-wait'), 0)
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+for (const step of ['conflict', 'ci', 'merge']) {
+  test(`gradleStartupFailed=true でも failedStep=${step} ならやり直さない`, async () => {
+    const r = await run({ merge: [fail(step, 'x', STARTUP)] })
+    assert.equal(r.count('merge-restart'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+  })
+}
+
+test('項目がなく、理由の文も起動の失敗を述べない回は、やり直さない', async () => {
+  const r = await run({ merge: [withoutFlag(fail('gametest', '2 required tests failed'))] })
+  assert.equal(r.count('merge-restart'), 0)
+  assert.notEqual(r.issue.status, 'merged')
+})
+
+test('項目がなく、failedStep=build の回も、文が BindException と Gradle の起動の失敗を述べるならやり直す', async () => {
+  const r = await run({ merge: [withoutFlag(fail('build', PR951_REASON))], 'merge-restart': [MERGED] })
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+for (const step of ['build', 'gametest']) {
+  test(`gradleStartupFailed=false と申告した回（${step}）は、文が BindException と Gradle の起動を述べてもやり直さない`, async () => {
+    const r = await run({ merge: [fail(step, 'Gradle が起動した GameTest サーバーの中で BindException が出て落ちた', { gradleStartupFailed: false })] })
+    assert.equal(r.count('merge-restart'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+  })
+}
+
+test('テストの中の BindException（サーバーが起動してテストが落ちた）は、文に BindException があってもやり直さない', async () => {
+  const r = await run({ merge: [fail('gametest', 'DevDriverServer の起動で BindException が出て 1 required tests failed', { gameTestFailedOnly: true })] })
+  assert.equal(r.count('merge-restart'), 0)
+  assert.notEqual(r.issue.status, 'merged')
+})
+
+test('過負荷の GameTest の失敗は、今までどおり merge-retry だけになる', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 0)
+  assert.equal(r.count('merge-retry'), 1)
+})
+
+test('やり直しの結果が過負荷の GameTest の失敗なら、merge-retry を 1 回呼んで進む', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [fail('gametest', 'y', OVERLOAD)], 'merge-retry': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-retry'), 1)
+  assert.match(r.issue.mergeReason, /起動の失敗/)
+  assert.match(r.issue.mergeReason, /過負荷/)
+})
+
+test('過負荷の回し直しの中で起動の失敗が出たら、もうやり直さずに止まる', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [fail('gametest', 'y', OVERLOAD)], 'merge-retry': [fail('gametest', 'z', STARTUP)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-retry'), 1)
+})
+
+test('merge-retry で起動の失敗が出ても、merge-restart は呼ばない', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [fail('gametest', 'z', STARTUP)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 0)
+  assert.equal(r.count('merge-retry'), 1)
+})
+
+test('未完了（gradleStillRunning=true）の回は、gradleStartupFailed が付いていても merge-wait が先に呼ばれる', async () => {
+  const r = await run({ merge: [fail('build', 'x', { ...STARTUP, ...PENDING })], 'merge-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-wait'), 1)
+  assert.equal(r.count('merge-restart'), 0)
+})
+
+test('やり直しの回が未完了なら merge-restart-wait で待ち、2 回とも未完了なら止まる', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [fail('build', 'y', PENDING)], 'merge-restart-wait': [fail('build', 'z', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart-wait'), 1)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('起動の失敗のやり直しの段階が結果を返さなかったら、段階の失敗として止まる', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [null] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.match(r.issue.mergeReason, /やり直しの段階が失敗した/)
+})
+
+test('プロンプト: マージは起動の失敗を自分で回し直さず、ほかの段階は 90 秒置いて 1 回回し直す', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] })
+  const merge = r.promptOf('merge')
+  assert.match(merge, /FileLockContentionHandler/)
+  assert.match(merge, /自分で回し直さず/)
+  assert.match(merge, /gradleStartupFailed=true/)
+  assert.match(merge, /merge-build-\$n/)
+  const restart = r.promptOf('merge-restart')
+  assert.match(restart, /merge-restart-build-\$n/)
+  assert.match(restart, /90 秒以上置く/)
+  const impl = r.promptOf('implement')
+  assert.match(impl, /Unable to start the daemon process/)
+  assert.match(impl, /90 秒以上置いてから/)
+  assert.match(impl, /2 回続いた/)
+  assert.doesNotMatch(impl, /gradleStartupFailed=true/)
+})
+
+test('やり直しの回が未完了で、merge-restart-wait でマージできたら、理由に両方のやり直しが残る', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [fail('build', 'y', PENDING)], 'merge-restart-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-restart-wait'), 1)
+  assert.match(r.issue.mergeReason, /起動の失敗.*1 回だけやり直した/)
+  assert.match(r.issue.mergeReason, /やり直しの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('過負荷の回し直しが未完了で、merge-retry-wait でマージできたら、理由にそれが残る', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [fail('build', 'y', PENDING)], 'merge-retry-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-retry'), 1)
+  assert.equal(r.count('merge-retry-wait'), 1)
+  assert.match(r.issue.mergeReason, /過負荷/)
+  assert.match(r.issue.mergeReason, /回し直しの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('待つやり直しを通らなかったやり直しの回は、理由に待つやり直しを書かない', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] })
+  assert.doesNotMatch(r.issue.mergeReason, /それも 1 回だけやり直した/)
 })
