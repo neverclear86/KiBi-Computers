@@ -13,6 +13,7 @@ import net.minecraft.nbt.ListTag
 import net.minecraft.nbt.Tag
 import net.minecraft.server.level.ChunkMap
 import net.minecraft.server.level.FullChunkStatus
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.block.Blocks
@@ -54,6 +55,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
 import java.util.Comparator
+import java.util.Optional
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
@@ -669,9 +671,11 @@ object SaveCleanupGameTests {
     /**
      * Issue #959 の端から端まで: 実行時のクラス・インスタンス・Mixin の印は本物のままで、変換の記録の口にだけ「`RegionFileStorage` に coremod の TRANSFORMER がある」
      * 偽の記録を渡し、[SaveCleanups.start] で本番の掃除（消す側。猶予の外の台）を回す。台の位置にはリージョンファイルがなく、別の座標の `.mca` だけがある。
-     * coremod が別の名前の保存先に読み書きを移した環境の代わりに、台の位置のチャンクにケースを書き込み待ちで入れる（`ChunkMap.read` からは読めるが、
-     * その位置の `r.X.Z.mca` はまだない）形も見る。どちらの台のディレクトリも残り（「判定できない」か「ある」）、消されない。
-     * 対照: 記録が本物なら、ケースのない位置は「ない」に数えられる（試しの実行）。共有の [SaveCleanups] を使うので、別の batch にする
+     * coremod が別の名前の保存先に読み書きを移した環境は、もう1台で作る。その台のチャンクにはケースが入っていて `ChunkMap.read` から読める（書き込み待ちでも
+     * リージョンに出ていても同じ）が、リージョンファイルの場所の解決（`regionOf`）を別の名前に差し替えるので、バニラの名前の `r.X.Z.mca` は、問いの時点では決定的にない。
+     * どちらの台のディレクトリも「判定できない」になって残り、消されない。
+     * 対照: 記録が本物なら、同じ2台（ケースのない位置と、別の名前の保存先に移したケースのある位置）が「ない」に数えられる（試しの実行。coremod の見落としがあれば、
+     * 生きているコンピューターの保存が消える形）。共有の [SaveCleanups] を使うので、別の batch にする
      */
     @JvmStatic
     @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 1200, batch = "kibicomputers_save_cleanup_coremod")
@@ -682,25 +686,33 @@ object SaveCleanupGameTests {
         val target = FarChunks.reserve(helper)
         val targetRegion = ChunkReferenceProbe.regionFile(level, target)
         helper.assertTrue(!Files.exists(targetRegion), "the region of the target chunk should not exist yet: $targetRegion")
-        val pendingChunk = FarChunks.reserve(helper)
-        helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, pendingChunk)), "the region of the pending chunk should not exist yet")
+        val aliasedChunk = FarChunks.reserve(helper)
         val controlChunk = FarChunks.reserve(helper)
         val root = tempRoot(helper)
         val controlRoot = tempRoot(helper)
         val id = UUID.randomUUID()
-        val pendingId = UUID.randomUUID()
+        val aliasedId = UUID.randomUUID()
         val controlId = UUID.randomUUID()
         previousDirectory(root, id, MachineOwner(dimension, target.minBlockX + 2, 64, target.minBlockZ + 3))
-        val pendingPos = BlockPos(pendingChunk.minBlockX + 1, 70, pendingChunk.minBlockZ + 1)
+        val aliasedPos = BlockPos(aliasedChunk.minBlockX + 1, 70, aliasedChunk.minBlockZ + 1)
         val caseTag = CompoundTag().apply {
             putString("id", BlockEntityType.getKey(KiBiBlocks.CASE_BLOCK_ENTITY.get()).toString())
-            putInt("x", pendingPos.x)
-            putInt("y", pendingPos.y)
-            putInt("z", pendingPos.z)
-            putString(CaseBlockEntity.MACHINE_ID_TAG, pendingId.toString())
+            putInt("x", aliasedPos.x)
+            putInt("y", aliasedPos.y)
+            putInt("z", aliasedPos.z)
+            putString(CaseBlockEntity.MACHINE_ID_TAG, aliasedId.toString())
         }
-        level.chunkSource.chunkMap.write(pendingChunk, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
-        previousDirectory(root, pendingId, MachineOwner(dimension, pendingPos.x, pendingPos.y, pendingPos.z))
+        level.chunkSource.chunkMap.write(aliasedChunk, CompoundTag().apply { put("block_entities", ListTag().apply { add(caseTag) }) })
+        // 前提: この位置のチャンクは ChunkMap.read から読める（書き込み待ちでもリージョンに出ていても、読みは新しい内容を返す）
+        val readable = level.chunkSource.chunkMap.read(aliasedChunk)
+        // coremod が読み書きを別の名前の保存先に移した環境の代わり: このチャンクのリージョンファイルの場所を、バニラの名前でないファイル（ない）に差し替える
+        val regionOf = { l: ServerLevel, c: ChunkPos ->
+            val region = ChunkReferenceProbe.regionFile(l, c)
+            if (c == aliasedChunk) region.resolveSibling("moved-${region.fileName}") else region
+        }
+        helper.assertTrue(!Files.exists(regionOf(level, aliasedChunk)), "the aliased region should not exist")
+        previousDirectory(root, aliasedId, MachineOwner(dimension, aliasedPos.x, aliasedPos.y, aliasedPos.z))
+        previousDirectory(controlRoot, aliasedId, MachineOwner(dimension, aliasedPos.x, aliasedPos.y, aliasedPos.z))
         previousDirectory(controlRoot, controlId, MachineOwner(dimension, controlChunk.minBlockX, 64, controlChunk.minBlockZ))
         val real = ChunkReferenceProbe.modLauncherAudit()
         helper.assertTrue(real != null, "the transformer audit trail should be available")
@@ -712,27 +724,34 @@ object SaveCleanupGameTests {
         val cleanup = SaveCleanups.start(
             dryRun = false, force = false, store = MachineSaveStore(root, MachineIdIndex(), "test"), modules = null,
             untrustedReasons = { server -> ChunkReferenceProbe.untrustedRegionStorage(server, fake).also { reasons = it } },
+            regionOf = regionOf,
         )
         helper.assertTrue(cleanup != null, "the cleanup should start")
         helper.assertTrue(reasons.size == 1 && reasons[0].startsWith(RegionFileStorage::class.java.name), "only the fake coremod should be a reason: $reasons")
         var control: SaveCleanup? = null
         helper.startSequence().thenWaitUntil {
-            helper.assertTrue(cleanup!!.finished && !cleanup.settling, "the cleanup should finish (${cleanup.phase})")
+            helper.assertTrue(cleanup!!.finished && !cleanup.settling && readable.isDone, "the cleanup should finish (${cleanup.phase})")
         }.thenExecute {
+            val chunk = readable.getNow(Optional.empty())
+            helper.assertTrue(
+                chunk.isPresent && chunk.get().getList("block_entities", Tag.TAG_COMPOUND.toInt()).size == 1,
+                "the aliased chunk should be readable through ChunkMap.read: $chunk",
+            )
             val report = cleanup!!.report
             helper.assertTrue(Files.isDirectory(root.resolve(id.toString())), "the directory at the regionless position should stay: $report")
-            helper.assertTrue(Files.isDirectory(root.resolve(pendingId.toString())), "the directory of the pending case should stay: $report")
+            helper.assertTrue(Files.isDirectory(root.resolve(aliasedId.toString())), "the directory of the case in the aliased storage should stay: $report")
             helper.assertTrue(report.candidates == 2 && report.deleted == 0 && report.unreferenced == 0, "nothing should be deleted: $report")
-            helper.assertTrue(report.undetermined + report.present == 2 && report.undetermined >= 1, "the regionless position should be undetermined: $report")
+            helper.assertTrue(report.undetermined == 2 && report.present == 0, "both positions without a region file should be undetermined: $report")
             helper.assertTrue(!Files.exists(targetRegion), "the cleanup should not create the region file $targetRegion")
-            control = SaveCleanups.start(dryRun = true, force = false, store = MachineSaveStore(controlRoot, MachineIdIndex(), "test"), modules = null)
+            helper.assertTrue(!Files.exists(regionOf(level, aliasedChunk)), "the cleanup should not create the aliased region file")
+            control = SaveCleanups.start(dryRun = true, force = false, store = MachineSaveStore(controlRoot, MachineIdIndex(), "test"), modules = null, regionOf = regionOf)
             helper.assertTrue(control != null, "the control cleanup should start")
         }.thenWaitUntil {
             helper.assertTrue(control!!.finished, "the control cleanup should finish (${control!!.phase})")
         }.thenExecute {
             try {
                 val report = control!!.report
-                helper.assertTrue(report.candidates == 1 && report.unreferenced == 1 && report.undetermined == 0, "the real trail should let the file names decide: $report")
+                helper.assertTrue(report.candidates == 2 && report.unreferenced == 2 && report.undetermined == 0, "the real trail should let the file names decide: $report")
                 helper.assertTrue(!Files.exists(ChunkReferenceProbe.regionFile(level, controlChunk)), "the control should not create region files")
             } finally {
                 deleteTree(root)

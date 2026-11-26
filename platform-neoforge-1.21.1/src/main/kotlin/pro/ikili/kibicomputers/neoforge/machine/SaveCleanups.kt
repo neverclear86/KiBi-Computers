@@ -127,7 +127,8 @@ internal object SaveCleanups {
 
     /**
      * 掃除を始める。走っている・置き場がないなら `null`。[store]・[modules]・[untrustedReasons] はテストが差し替える（既定は今のサーバーのもの）。
-     * [untrustedReasons] は、チャンクを読み書きする側が既定の作りでない理由の一覧を返す（空なら既定の作り。[ChunkReferenceProbe.untrustedRegionStorage]）
+     * [untrustedReasons] は、チャンクを読み書きする側が既定の作りでない理由の一覧を返す（空なら既定の作り。[ChunkReferenceProbe.untrustedRegionStorage]）。
+     * [regionOf] は、チャンクのリージョンファイルの場所を返す（テストが、別の名前の保存先に移した環境を作るために差し替える）
      */
     fun start(
         dryRun: Boolean,
@@ -136,13 +137,14 @@ internal object SaveCleanups {
         modules: FileModuleStore? = ServerMachines.moduleStore,
         settings: SaveCleanupSettings = SaveCleanupSettings.DEFAULT,
         untrustedReasons: (MinecraftServer) -> List<String> = { ChunkReferenceProbe.untrustedRegionStorage(it) },
+        regionOf: (ServerLevel, ChunkPos) -> Path = { level, chunk -> ChunkReferenceProbe.regionFile(level, chunk) },
     ): SaveCleanup? {
         val s = server ?: return null
         // 止めた掃除が、入れた削除の結果をまだ受け取っている間も、次を始めない
         if (running?.let { !it.finished || it.settling } == true || store == null) return null
         // 理由の一覧は掃除1回につき1回だけ調べ、問いの判定とログの両方に同じ結果を使う
         val untrusted = untrustedReasons(s)
-        val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty())
+        val probe = ChunkReferenceProbe(s, regionNamesTrusted = untrusted.isEmpty(), regionOf = regionOf)
         if (untrusted.isNotEmpty()) {
             // 掃除1回につき1行（問いごとには出さない）
             LOGGER.info(
@@ -243,6 +245,8 @@ internal fun interface TransformAudit {
 internal class ChunkReferenceProbe(
     private val server: MinecraftServer,
     val regionNamesTrusted: Boolean = untrustedRegionStorage(server).isEmpty(),
+    /** チャンクのリージョンファイルの場所を返す（既定は `ChunkMap` が実際に開く保存先。テストが差し替える） */
+    private val regionOf: (ServerLevel, ChunkPos) -> Path = { level, chunk -> regionFile(level, chunk) },
 ) : MachineReferenceProbe {
     override fun probe(id: UUID, owner: MachineOwner, answer: Consumer<MachineReference>) {
         val location = ResourceLocation.tryParse(owner.dimension)
@@ -260,7 +264,7 @@ internal class ChunkReferenceProbe(
         }
         // ここから先のディスクの確認（stat）と読みは、メインスレッドでしない（遅いディスクで tick を止めない）。IO のスレッドの仕事にする
         val region = try {
-            regionFile(level, chunk)
+            regionOf(level, chunk)
         } catch (e: RuntimeException) {
             // 保存先が分からない（ChunkMap の中身が想定と違う）なら、削除側には倒さない
             answer.accept(MachineReference.UNKNOWN)

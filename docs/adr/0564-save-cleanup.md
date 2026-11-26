@@ -105,8 +105,8 @@
     バニラのクラスのインスタンスのまま、その処理をこれらで書き換えた環境では、既定の作りと見なしてしまう（リージョンファイルのない位置を「ない」にする）。
     coremod（#959 で見えるようにした）と違い、そうした MOD は確認していない。`-javaagent` があることを数える形は、開発環境・認証用のエージェントで回収が止まるので採らない。
     合わせたメンバーを1つも持たない Mixin（`IMixinConfigPlugin` の `preApply`・`postApply` で ClassNode を直接書き換えるための空の Mixin、`<clinit>` だけの Mixin）は印が付かないが、
-    当てたクラスの変換の記録に PLUGIN `mixin` として残り、許可の一覧で数えないので、やはり見えない（Mixin の記録から Mixin の名前を取って分けるのは、別の Issue）。
-    入れ子のクラス（`IOWorker$PendingStore`・`RegionFile` の内部クラスなど）は、Mixin の印も変換の記録も見ない
+    当てたクラスの変換の記録に PLUGIN `mixin` として残り、許可の一覧で数えないので、やはり見えない（Mixin の記録から Mixin の名前を取って分けるのは #969）。
+    入れ子のクラス（`IOWorker$PendingStore`・`RegionFile` の内部クラスなど）は、Mixin の印も変換の記録も見ない（#969）
   - 限界: `ChunkMap` のクラスの書き換えは数えない（多くの MOD パックで性能のための Mixin が当たり、数えるとほとんどの環境でリージョンのない位置の残骸を回収できなくなる。
     保存先は `ChunkMap` が持つ `ChunkStorage` の `IOWorker` の `RegionFileStorage` から引いている）。ただし、`ChunkStorage` のメソッド（`read`・`write` など）を
     `ChunkMap` で上書きする Mixin（Mixin のクラスが `ChunkStorage` を継承して override を足す形。合わせたメソッドに `@MixinMerged` が付く）は、チャンクの読み書きをすべて
@@ -210,7 +210,7 @@
   `TransformingClassLoader` で読み込まれていないクラスは数える。陽性の対照として、NeoForge 自身の coremod が当たる `EntityType` の本物の記録の TRANSFORMER `fml` を数える、
   実行時のクラス・インスタンス・Mixin の印は本物のまま、記録の口にだけ `RegionFileStorage` の coremod の TRANSFORMER を足して `SaveCleanups.start` で本番の掃除を回すと、
   台の位置のリージョンファイルがなく別の座標の `.mca` だけがある保存先で、猶予の外の台のディレクトリが残り（「判定できない」）、
-  台の位置のチャンクに書き込み待ちで入れたケース（`ChunkMap.read` からは読めるが、その位置のリージョンファイルはまだない）の台も残り、リージョンファイルも作らない。本物の記録なら同じ形の位置は「ない」（`regionlessPositionIsKeptWhenCoremodTransformsStorage`。#959）、
+  `ChunkMap.read` から読めるチャンクのケースの台（リージョンファイルの場所の解決を、バニラの名前でないファイルに差し替えて、coremod が別の名前の保存先に移した環境を作る。問いの時点でバニラの名前のファイルは決定的にない）も残り、リージョンファイルも作らない。本物の記録なら同じ2台は「ない」（`regionlessPositionIsKeptWhenCoremodTransformsStorage`。#959）、
   本物の Mixin（NeoForge 自身の `BlockEntityType`・`MappedRegistry` のアクセサー）の印が見つかり、アクセサーだけなら数えない、
   `ChunkMap` 向けの判定（`overridesWithMixin`）: 本物の `ChunkMap` は数えない、`ChunkStorage` の親のメソッドを上書きする Mixin の印は数える、アクセサーの印・印のない上書き・何も上書きしない合わせたメソッドは数えない、
   `SaveCleanups.start` が検出した理由を問いに渡す（理由が空でなければ、台の位置のリージョンファイルがなく別の座標の `.mca` だけがある保存先で台のディレクトリが残り、空なら「ない」と判定されて数えられる）、
