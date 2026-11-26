@@ -107,7 +107,7 @@ tasks.test {
 // 作る。build・CI には入れない）。結果は ADR 0043 と StackHeadroom の KDoc に書く。
 // - stackHeadroomColdTest: StackHeadroom.probe だけを JIT し、ほかはすべてインタプリタで動かす（確かめは小さいフレームで測り、守る道は
 //   大きいフレームで動く、いちばん悪い組み合わせ）
-// - stackHeadroomXintTest: 全部インタプリタ（比べるため）
+// - stackHeadroomXintTest: 全部インタプリタ（比べるため。回数 1/4 で、全体が十数分。#903）
 // - stackHeadroomJdk21Test: JDK 21（1.21.1 の本番の JDK。JDK 19 で ReentrantLock の中身（AQS）が書き直された）
 if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
     val headroomTests = listOf(
