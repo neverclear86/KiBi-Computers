@@ -135,7 +135,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         // インタプリタでは遅いので、1 本の時間の上限を延ばす（`-Pkibi.stackHeadroom.timeoutSeconds=<秒>` で変えられる。#903）
         systemProperty("kibi.stackHeadroom.timeoutSeconds", providers.gradleProperty("kibi.stackHeadroom.timeoutSeconds").orNull ?: "1800")
         // インタプリタの道は 1 回が遅いので、回数を減らす（尽きる位置は、詰め物の段数を変えてずらすのは同じ）。
-        // `-Pkibi.stackHeadroom.roundsScale=<割合>` で、どの JVM でも上書きできる（#903。1 にすると、ディスクの掃引の幅も 1 段ずつ全部に戻る）
+        // `-Pkibi.stackHeadroom.roundsScale=<割合>` で、どの JVM でも上書きできる（#903。1 にすると、各テストの回数が全部に戻る。ディスクの掃引の幅は、割合では縮めない。割合が効くのは `WARMUP` と `refuseOpen` の `ROUNDS` など、回す回数だけ）
         val roundsScale = providers.gradleProperty("kibi.stackHeadroom.roundsScale").orNull ?: if (args.isNotEmpty()) "0.25" else null
         roundsScale?.let { systemProperty("kibi.stackHeadroom.roundsScale", it) }
         testLogging.showStandardStreams = true

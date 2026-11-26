@@ -506,7 +506,7 @@ class ComponentStackExhaustionLockTest {
      * うるので、「巻き直しの通りの方が余裕が少ない」ことは起きうる。そこで、1 回目の通りは境目の [REWIND_START_MARGIN] 段手前
      * （巻き戻しまで通る深さ）に置き、再開のときだけ詰め物を `k` 段足す。`beginRewind` は本番と同じく詰め物の外で呼ぶ。
      * `k` は 2 つの境目を二分探索で探す: 巻き直しの通りが尽き始める `kA` と、尽きる位置が `LinkedComponent.call` より前（詰め物の再帰の中）に
-     * 出る `kB`。その間を、回数で等分した刻み（幅が回数より狭ければ 1 段ずつ、繰り返して）で回す。
+     * 出る `kB`。その間を、回数で等分した刻み（`i * 幅 / 回数`。上の端まで届く。幅が回数より狭ければ 1 段ずつ、繰り返して）で回す。
      *
      * 尽きた回は、スタックトレースの区画に加えて、プロセスの印で分けて数える:
      * - 巻き直しの最中: `rewindingForFuel`（再開で立ち、止まった燃料切れの呼び出しに着いたときに下ろす）が立ったままで、ドライバーが
@@ -613,8 +613,10 @@ class ComponentStackExhaustionLockTest {
                 val (start, kA, kB) = window
                 val lo = maxOf(0, kA - 4)
                 width = maxOf(1, kB + 4 - lo)
+                // 幅が回数より広いときは、先に掛けてから割る（`edgeSweep` と同じ）。先に刻みを切り捨てると、窓の上側（`kB` 側）に届かない
                 stride = maxOf(1, width / count)
-                run(start, lo + (i * stride) % width)
+                val offset = if (width <= count) i % width else (i.toLong() * width / count).toInt()
+                run(start, lo + offset)
             }
         }
         println(
