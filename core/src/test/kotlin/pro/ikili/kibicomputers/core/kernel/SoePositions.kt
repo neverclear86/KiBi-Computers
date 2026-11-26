@@ -98,6 +98,10 @@ internal class SoePositions {
         return position
     }
 
+    /** [position] で尽きた回数（[record] の `tag` を問わず足す） */
+    fun count(position: Position): Int =
+        positions.entries.filter { it.key.substringAfterLast(':') == position.name }.sumOf { it.value.get() }
+
     fun describe(): String =
         "CRASHED ${crashed.get()} 回、位置: ${positions.entries.sortedBy { it.key }.joinToString { "${it.key}=${it.value.get()}" }}、" +
             "一番上: ${tops.entries.sortedByDescending { it.value.get() }.take(8).joinToString { "${it.key}=${it.value.get()}" }}"

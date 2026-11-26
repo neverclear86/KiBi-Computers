@@ -82,9 +82,12 @@ internal class OpenFile(
     /**
      * ファイルシステムに開いたことを知らせた（[FileSystem.retain]）。実行時だけの印で、保存しない
      * （復元した開いたファイルは知らせないまま使う。[FileSystem.tracksOpenFiles]）。`Vfs.close` は、[FileSystem.release] が戻ってから
-     * 落とす（途中でスタックが尽きても真のまま残り、閉じ直せる。#901）
+     * 落とす（途中でスタックが尽きても真のまま残り、閉じ直せる。#901）。`release` が戻ってから落とすまでの間に呼び出しを挟まないよう、
+     * setter を通さないフィールドにする（`@JvmField` がないと、別のクラスからの代入は setter の呼び出しになり、その入口で尽きうる。
+     * ADR 0043「尽きうるのは関数の入口だけ」。`ProcessRuntime.consolePumpReserved` と同じ）
      */
     @Volatile
+    @JvmField
     internal var retained: Boolean = false
 
     /** ディレクトリか */
