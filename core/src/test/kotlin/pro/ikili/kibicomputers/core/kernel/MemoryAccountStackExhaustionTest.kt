@@ -196,7 +196,7 @@ class MemoryAccountStackExhaustionTest {
 
     /**
      * ホストの関数の本体（包みの確かめを通った後）から入る道（`memory.write*` が新しい区画に書く、`ctx.instantiate` が作るメモリ・テーブルの最初の分）のまね。
-     * 包みは [lacks] で真似るだけで、カーネルのプロセスを通した確かめは [MemoryAccountStackExhaustionKernelTest]。
+     * 包みは [lacks] で真似るだけで、カーネルのプロセスを通した確かめは [MemoryAccountStackExhaustionKernelTest]（`ctx.instantiate` の道は [InstantiateStackExhaustionTest]・[InstantiateStackExhaustionKernelTest]。#884）。
      * 本体が深くなってから確保に入るので、包みの確かめは通ったのに、本体の途中で確保が断られる深さがある（ADR 0043）。
      * そこでは何も数えずに `StackOverflowError` になり、勘定はずれない（本体がその前に変えたカーネルの状態は、プロセスの終わりで片付く）
      */

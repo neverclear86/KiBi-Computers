@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicLongArray
 internal class CompileFallbackLog(private val log: System.Logger) {
     /** インタプリタで動かす理由 */
     internal enum class Reason {
-        /** 関数の型に v128 があって、モジュール全体をインタプリタで動かす */
+        /** 関数の型（または struct のフィールド・array の要素。#891）に v128 があって、モジュール全体をインタプリタで動かす */
         V128_SIGNATURE,
 
         /** 例外処理を使うモジュールの関数が SIMD を使っていて、モジュール全体をインタプリタで動かす */

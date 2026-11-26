@@ -12,6 +12,9 @@ import java.io.ByteArrayOutputStream
 /**
  * 燃料の仮の重み（ADR 0028。確定は #251）。燃料 1 は、おおよそ WASM の命令 1 つ。
  *
+ * ただし、待機点に変換した止まりうる関数（#329）では、セグメントの課金を [ASYNCIFY_NUMERATOR] / [ASYNCIFY_DENOMINATOR] 倍にする（今は 2 倍。#389）。
+ * 変換が足したコードの CPU 時間を見込むためで、そのときの燃料 1 は、元の命令 1 つのおおよそ半分になる。ここで重みを確定するときは、この倍率も見る。
+ *
  * 長さに比例する命令は、命令そのものの 1 に加えて、長さに応じた分を課す（1 命令で大量のメモリを動かせるため）。
  */
 internal object FuelCosts {
@@ -35,6 +38,55 @@ internal object FuelCosts {
      * 巻き戻した時点で、退避した値の数 × これを、マシンの燃料から引く
      */
     const val ASYNC_VALUE: Long = 2
+
+    /**
+     * 待機点への変換（#329）が足したコードの見込み（#389。ADR 0329 の「#389: 変換が足すコードの見込み」）。
+     * 変換は、止まりうる関数（変換した関数）のセグメントの課金を、[ASYNCIFY_NUMERATOR] / [ASYNCIFY_DENOMINATOR] 倍（切り上げ）にする。
+     * 変換したモジュールは、同じ燃料でも CPU 時間が長い（足したコードと、JVM のコンパイルの効きの差）ので、燃料で tick あたりの CPU を抑える前提をそろえる。
+     * 実行時の命令は増えない（課金の定数が大きくなるだけ）。葉の関数（止まりうる関数でない関数）は変えない。仮の値で、確定は #251
+     */
+    const val ASYNCIFY_NUMERATOR: Long = 2
+
+    /** [ASYNCIFY_NUMERATOR] の分母 */
+    const val ASYNCIFY_DENOMINATOR: Long = 1
+}
+
+/**
+ * 挿入した燃料の計測コードの位置（#389）。待機点への変換が、止まりうる関数の課金の定数を差し替えるのに使う。
+ *
+ * @property charges 定義済みの関数ごと（コードセクションの並び）の、セグメントの課金（`fuel -= n`）の `i64.const n` の位置。
+ *   関数の本体（ローカル変数の宣言を含む）の先頭からのバイトの位置で、小さい順
+ * @property weight 止まりうる関数の課金の倍率（既定は [AsyncifyFuelWeight.DEFAULT]）
+ */
+internal class FuelSites(
+    val charges: Array<IntArray>,
+    val weight: AsyncifyFuelWeight = AsyncifyFuelWeight.DEFAULT,
+) {
+    /** 倍率だけを変えたもの（測るため） */
+    fun withWeight(weight: AsyncifyFuelWeight): FuelSites = FuelSites(charges, weight)
+}
+
+/**
+ * 止まりうる関数の課金の倍率（#389）: 課金 n を `ceil(n × numerator / denominator)` にする。
+ * 整数だけで計算する（燃料の数がバイト列だけで決まるように）
+ */
+internal class AsyncifyFuelWeight(val numerator: Long, val denominator: Long) {
+    init {
+        require(denominator > 0 && numerator >= denominator) { "倍率は 1 以上: $numerator / $denominator" }
+    }
+
+    /** 課金 [cost] を見込んだ課金 */
+    fun apply(cost: Long): Long = (cost * numerator + denominator - 1) / denominator
+
+    override fun toString(): String = "$numerator/$denominator"
+
+    companion object {
+        /** 本番の倍率（[FuelCosts.ASYNCIFY_NUMERATOR]） */
+        val DEFAULT: AsyncifyFuelWeight = AsyncifyFuelWeight(FuelCosts.ASYNCIFY_NUMERATOR, FuelCosts.ASYNCIFY_DENOMINATOR)
+
+        /** 見込まない（#389 の前の形。測るため） */
+        val NONE: AsyncifyFuelWeight = AsyncifyFuelWeight(1, 1)
+    }
 }
 
 /**
@@ -70,11 +122,14 @@ internal object FuelInjector {
      * @property bytes 挿入した後の WASM
      * @property checks 残りを確かめるところの数
      * @property charges 燃料を引くところの数
-     * @property maxUnchecked 残りを確かめる間に実行されうる命令数の最大（燃料の行き過ぎの上限の目安。長さに比例する分は含まない）
+     * @property maxUnchecked 残りを確かめる間に実行されうる命令数の最大（燃料の行き過ぎの上限の目安。長さに比例する分は含まない）。
+     *   命令の数で、燃料ではない: 待機点に変換した止まりうる関数の中では課金を [FuelCosts.ASYNCIFY_NUMERATOR] / [FuelCosts.ASYNCIFY_DENOMINATOR] 倍にする（#389）ので、
+     *   燃料で見た行き過ぎは、この値の最大でその倍率倍（今は 2 倍）になる
      * @property sizesBefore 定義済みの関数ごとの、挿入の前の本体の大きさ（バイト）
      * @property sizesAfter 同じく挿入の後
      * @property fuelFunc 足した [WasmFuel.IMPORT_NAME] の import の関数の番号（元の関数の import の数）。
      *   これ以上の番号の定義済みの関数は、元のモジュールより1つ大きい
+     * @property sites 挿入した課金の位置（#389。待機点への変換に渡す）
      */
     class Result(
         val bytes: ByteArray,
@@ -84,6 +139,7 @@ internal object FuelInjector {
         val sizesBefore: IntArray,
         val sizesAfter: IntArray,
         val fuelFunc: Int,
+        val sites: FuelSites,
     ) {
         /** 挿入した後の関数の番号 [index] を、元のモジュールの番号に戻す（足した import そのものは -1） */
         fun originalFunc(index: Int): Int = when {
@@ -149,6 +205,7 @@ internal object FuelInjector {
         var maxUnchecked = 0L
         var sizesBefore = IntArray(0)
         var sizesAfter = IntArray(0)
+        var chargeSites = emptyArray<IntArray>()
         val out = Sink()
         out.bytes(wasm, 0, 8)
 
@@ -257,6 +314,7 @@ internal object FuelInjector {
                     val n = r.leb().toInt()
                     sizesBefore = IntArray(n)
                     sizesAfter = IntArray(n)
+                    chargeSites = Array(n) { IntArray(0) }
                     val body = Sink()
                     body.leb(n.toLong())
                     for (i in 0 until n) {
@@ -271,6 +329,7 @@ internal object FuelInjector {
                         checks += stats.checks
                         charges += stats.charges
                         maxUnchecked = maxOf(maxUnchecked, stats.maxUnchecked)
+                        chargeSites[i] = stats.chargeSites
                         sizesBefore[i] = size
                         sizesAfter[i] = fn.size()
                         body.leb(fn.size().toLong())
@@ -284,10 +343,10 @@ internal object FuelInjector {
             }
         }
         insertMissingBefore(Int.MAX_VALUE)
-        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter, fuelFunc)
+        return Result(out.toByteArray(), checks, charges, maxUnchecked, sizesBefore, sizesAfter, fuelFunc, FuelSites(chargeSites))
     }
 
-    private class BodyStats(val checks: Int, val charges: Int, val maxUnchecked: Long)
+    private class BodyStats(val checks: Int, val charges: Int, val maxUnchecked: Long, val chargeSites: IntArray)
 
     /** 分岐の出入りがあり、次の命令から新しいセグメントにする命令 */
     private val SEGMENT_END = setOf(
@@ -387,6 +446,7 @@ internal object FuelInjector {
         var charges = 0
         var maxUnchecked = 0L
         var sinceCheck = 0L
+        val chargeSites = IntArray(segStart.count { it })
         var depth = 0 // 開いているブロックの数（関数そのものは数えない）
         for (i in 0 until n) {
             val ins = instructions[i]
@@ -400,7 +460,7 @@ internal object FuelInjector {
                     if (j == n - 1 || segStart[j + 1]) break
                     j++
                 }
-                out.charge(ctx, cost)
+                chargeSites[charges] = out.charge(ctx, cost)
                 charges++
                 if (i == 0 || instructions[i - 1].opcode() == OpCode.LOOP) {
                     out.check(ctx)
@@ -456,7 +516,7 @@ internal object FuelInjector {
                 else -> Unit
             }
         }
-        return BodyStats(checks, charges, maxUnchecked)
+        return BodyStats(checks, charges, maxUnchecked, chargeSites)
     }
 
     /** データセグメントの初期値の式（オフセット）の番号を付け替える（#263。燃料を共有するとき） */
@@ -645,13 +705,15 @@ internal object FuelInjector {
         leb(ctx.global.toLong())
     }
 
-    /** `fuel -= cost` */
-    private fun Sink.charge(ctx: BodyContext, cost: Long) {
+    /** `fuel -= cost`。`i64.const` の位置を返す（[FuelSites.charges]） */
+    private fun Sink.charge(ctx: BodyContext, cost: Long): Int {
         get(ctx)
+        val at = size()
         u8(0x42) // i64.const
         sleb(cost)
         u8(0x7D) // i64.sub
         set(ctx)
+        return at
     }
 
     /** スタックの一番上の長さ（i32。そのまま残す）を [shift] で燃料にして引く（[chargeSaved]） */
@@ -816,7 +878,8 @@ internal object FuelInjector {
          * 「定数式に使えない」で断る分岐は、正しくない WASM として断る（原因なしの [WasmLoadException]。#851）。[inject] は最初に
          * Endive の `Parser.parse`（検証あり）を通すが、Endive 1.2.0 の検証は、グローバルの初期値と能動な要素セグメント（flag 0・2・4・6）の
          * 定数式しか確かめない。パッシブ・宣言の要素セグメント（flag 5・7）の初期値は検証されずにここへ届くので、この分岐は届く経路がある
-         * （`drop` などの命令で断る。型が合わないだけの `v128.const` は、命令としては定数式なので写す）
+         * （`drop` などの命令で断る。型が合わないだけの `v128.const` は、命令としては定数式なので写す。型の合わないものは、挿入の後の読み込みで
+         * `EndiveRuntime.parseModule` が断る。#893）
          */
         fun copyConstExpr(out: Sink, remap: (Long) -> Long, globalRemap: (Long) -> Long) {
             while (true) {

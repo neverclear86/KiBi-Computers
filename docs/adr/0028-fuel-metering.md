@@ -27,7 +27,7 @@
   - 残りの置き場所を2通り試した。グローバル: 引くたびにグローバルを読み書きする。ローカル: 関数の中ではローカル変数に写し、呼び出し・戻る・例外を投げる前に書き戻し、呼び出しの後で読み直す。`try_table` を含む関数だけは、ローカルに写さずグローバルで数える（下の実装の方針）
   - import を1つ足すので定義済みの関数の番号がずれる。`call`・`ref.func`・export・start・要素セグメント・グローバルの初期値を付け替え、名前のセクションは捨てる
 - B の実装: Endive で命令ごとに呼ばれる口は、インタプリタの `ExecutionListener`（実験的と明記されている）しかない。ランタイムコンパイラとビルド時AOT には、命令を数える口がない
-- 命令の重みはすべて 1（燃料 1 = 命令 1 つ）
+- 命令の重みはすべて 1（燃料 1 = 命令 1 つ）。ただし、待機点に変換した止まりうる関数では、セグメントの課金を 2 倍にする（#389。`FuelCosts.ASYNCIFY_NUMERATOR` / `ASYNCIFY_DENOMINATOR`。ADR 0329 の「#389: 変換が足すコードの見込み」）
 - 環境: Windows 10 / x86_64 / 32 スレッド、Java 21、G1、ヒープ 2 GB 固定
 
 ### 結果の抜粋
@@ -94,7 +94,7 @@ AGENTS.md の優先順位（TPS → 状態保存 → 単純さ → 速度）で�
 - 挿入は `core` の `pro.ikili.kibicomputers.core.runtime.fuel.FuelInjector`（内部のもの）。PoC の方式（ローカルに写す。`try_table` を含む関数はグローバル）をそのまま使う
 - `Machine.exec` が、VFS から読んだ実行ファイルに必ず挿入してから読み込む（同梱イメージの init も含む）。`kibi.fuel` を import する・`kibi_fuel` を export する WASM は `NOEXEC` で断る。ビルド時に挿入した同梱の WASM を通す口は、#36・#92 で足す
 - 挿入するコードを小さくする工夫: `block`・`try_table` に入るところは分岐の行き先にならないので、前のセグメントと引く処理をまとめる。lua.wasm のコードは 281,080 → 451,592 バイト（+61%。PoC は +67%）
-- 重み（仮。確定は #251）: 命令 1 つで 1。`memory.copy`・`memory.fill`・`memory.init` は 8 バイトごとに 1、`table.copy`・`table.fill`・`table.init`・`table.grow` は 1 要素ごとに 1、`memory.grow` は 1 ページごとに 8,192 を足す（`FuelCosts`）
+- 重み（仮。確定は #251）: 命令 1 つで 1（待機点に変換した止まりうる関数では、セグメントの課金が 2 倍になる。#389。`FuelCosts.ASYNCIFY_NUMERATOR` / `ASYNCIFY_DENOMINATOR`。#251 で値を確定するときは、この倍率も見る）。`memory.copy`・`memory.fill`・`memory.init` は 8 バイトごとに 1、`table.copy`・`table.fill`・`table.init`・`table.grow` は 1 要素ごとに 1、`memory.grow` は 1 ページごとに 8,192 を足す（`FuelCosts`）
 - `memory.grow`・`table.grow` は、命令の前に大きさ（`memory.size`・`table.size`）を控え、命令の後で実際に増えた分だけを引く（#335）。失敗して -1 を返したときは何も引かない。前に要求した分を引くと、失敗した grow（Lua の `pcall(string.rep, 'x', 2^31-100)` など）がマシンに数百 tick 分の借りを作り、`memory.grow(0xFFFFFFFF)` では実質ずっと止まるため
 - 長さに比例する分に、1 命令あたりの上限は設けない（#335 で決めた）。成功した命令の長さは RAM（既定 32 MiB）とテーブルの大きさで抑えられ、実際にした仕事の分なので、上限を設けるとその分を取り損ねる。範囲外でトラップする `memory.fill` などは、ローカルに写す関数ではグローバルに書き戻す前に止まるので、借りにならない。`try_table` を含む関数（グローバルを直接読み書きする）でだけ借りになるが、自分のマシンが止まるだけで、終わらないループと変わらない
 - テスト用の WASM（`core/src/test/wasm/fuel.c`）で、一括メモリ命令と末尾呼び出し（`return_call`）を確かめた。例外処理は lua.wasm の `pcall` で確かめた。GC の提案の分岐命令は、`FuelInjectorTest` の手で組んだ WASM で、関数のラベルへの `br_on_null` で抜けても燃料を書き戻すことを確かめた。`br_on_non_null`・`br_on_cast`・`br_on_cast_fail` は、使う WASM がまだないので確かめていない

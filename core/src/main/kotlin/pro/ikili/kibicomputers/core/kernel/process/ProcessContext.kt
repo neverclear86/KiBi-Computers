@@ -406,7 +406,8 @@ internal interface ProcessContext {
     /**
      * コンソールの TTY に書いたとき、そのカーネルロックの中で呼ぶ（#355・#419）。この後に [flushConsole] で書くと予約し、
      * それまでメインスレッドが TTY の出力を「書き手がいない」として取り出さないようにする。呼んだら、ロックを放した後に必ず
-     * [flushConsole] を1回呼ぶ
+     * [flushConsole] を1回呼ぶ。予約はプロセスごとに 1 つまで（続けて呼んでも増えない）で、[flushConsole] に届かずに
+     * プロセスが終わった（スタックが尽きたなど）ときは、プロセスの終わりの片付けが戻す（#890）
      */
     fun reserveConsoleFlushLocked() {}
 

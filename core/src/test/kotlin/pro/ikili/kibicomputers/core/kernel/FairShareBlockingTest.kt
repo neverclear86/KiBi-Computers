@@ -6,12 +6,17 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.config.ConfigEntry
+import pro.ikili.kibicomputers.core.config.ConfigSource
+import pro.ikili.kibicomputers.core.config.ConfigValues
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
 import pro.ikili.kibicomputers.core.kernel.wait.WaitCondition
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import java.time.Duration
 import java.util.UUID
 
@@ -83,6 +88,52 @@ class FairShareBlockingTest {
             }
             assertEquals(0, h.scheduler.blockingGroupCount, "0 になった組は消える")
         }
+    }
+
+    @Test
+    fun `持ち主の組を使わない組み立てでは、持ち主なしの台はブロッキング型の全体の上限まで取れる`() = timeout {
+        // #897: 1.20.1（持ち主の仕組みがない）は全台が NONE の1組。組ごとの項目が 1 でも、組の上限は掛けない
+        Harness(KiBiConfig.schedulerConfig(limits(), ModuleStore.NONE, ownerGroups = false)).use { h ->
+            val machines = List(5) { h.machine() }
+            val program = h.program(emptyModule())
+            for (m in machines.take(4)) m.spawn(program, m.waiter())
+            assertEquals(0, h.scheduler.blockingOf(FairShareGroup.NONE), "組の数は数えない")
+            // 全体の上限（4）は効く
+            val last = machines[4]
+            assertThrows<ResourceLimitException> { last.spawn(program, last.waiter()) }
+            for (m in machines) {
+                m.stop()
+                assertTrue(m.awaitTermination(5_000))
+            }
+        }
+    }
+
+    @Test
+    fun `持ち主の組を使う組み立てでは、持ち主なしの台も組の上限で断る`() = timeout {
+        // ADR 0738（1.21.1）: 自動設置・FakePlayer の台（持ち主なし）も1組として上限に当たる。#897 の切り替えが既定を変えていないこと
+        Harness(KiBiConfig.schedulerConfig(limits(), ModuleStore.NONE)).use { h ->
+            val m1 = h.machine()
+            val m2 = h.machine()
+            val program = h.program(emptyModule())
+            m1.spawn(program, m1.waiter())
+            assertEquals(1, h.scheduler.blockingOf(FairShareGroup.NONE))
+            assertThrows<ResourceLimitException> { m2.spawn(program, m2.waiter()) }
+            for (m in listOf(m1, m2)) {
+                m.stop()
+                assertTrue(m.awaitTermination(5_000))
+            }
+            assertEquals(0, h.scheduler.blockingGroupCount)
+        }
+    }
+
+    /** 全体のブロッキング型の上限 4、持ち主ごとの上限 1 のコンフィグ */
+    private fun limits(): ConfigValues {
+        val map = mapOf<ConfigEntry<*>, Any>(
+            KiBiConfig.MAX_CONCURRENT_MACHINES to 4,
+            KiBiConfig.MAX_BLOCKING_PROCESSES to 4,
+            KiBiConfig.MAX_BLOCKING_PROCESSES_PER_OWNER to 1,
+        )
+        return ConfigValues.resolve(ConfigSource { map[it] })
     }
 
     @Test

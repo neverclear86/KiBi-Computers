@@ -56,6 +56,7 @@ import run.endive.wasm.Parser
 import run.endive.wasm.UninstantiableException
 import run.endive.wasm.UnlinkableException
 import run.endive.wasm.WasmEngineException
+import run.endive.wasm.types.ActiveElement
 import run.endive.wasm.types.ExternalType
 import run.endive.wasm.types.FunctionImport
 import run.endive.wasm.types.FunctionType
@@ -65,8 +66,10 @@ import run.endive.wasm.types.OpCode
 import run.endive.wasm.types.PassiveElement
 import run.endive.wasm.types.MemoryLimits
 import run.endive.wasm.types.MutabilityType
+import run.endive.wasm.types.StorageType
 import run.endive.wasm.types.Table
 import run.endive.wasm.types.TableLimits
+import run.endive.wasm.types.TypeSection
 import run.endive.wasm.types.ValType
 import run.endive.runtime.Memory as EndiveMemory
 import run.endive.runtime.WasmException as EndiveWasmException
@@ -152,6 +155,9 @@ public class EndiveRuntime internal constructor(
             throw WasmLoadException("WASM を読み込めない: 入れ子が深すぎる", e)
         }
         return try {
+            // Endive の検証が確かめないパッシブ・宣言の要素の式を確かめる（#893）。正しくない WASM を「対応していない作り」と報告しないよう、
+            // #706 の判定より先に見る
+            invalidPassiveElementInitializer(module)?.let { throw WasmLoadException("WASM の検証に通らない: $it") }
             // Endive が違う関数を置いてしまう形は、動かす前に断る（#706。正しくない結果になるので、対応しない作りとして扱う）
             foreignFuncRefInitializer(module)?.let {
                 throw WasmLoadException("対応していない作り: $it（Endive が別の関数を置いてしまう。#706）")
@@ -198,7 +204,7 @@ public class EndiveRuntime internal constructor(
         val describe = { functions: Set<Int> -> describeFunctions(functions, functionNames(module)) }
         if (simd == null) {
             FALLBACK_LOG.report(CompileFallbackLog.Reason.V128_SIGNATURE) {
-                "${label()} の関数の型に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
+                "${label()} の型（関数の型、struct のフィールド、array の要素）に v128 があってコンパイルできないので、モジュール全体をインタプリタで動かす"
             }
             return null
         }
@@ -462,13 +468,27 @@ public class EndiveRuntime internal constructor(
         private const val LARGE_FUNCTION_INSTRUCTIONS: Int = 4096
 
         /**
-         * SIMD（v128）を使う関数の番号（import を含めた番号）。関数の型（引数・戻り値）に v128 があるなら `null`（#424）。
+         * SIMD（v128）を使う関数の番号（import を含めた番号）。関数の型（引数・戻り値）か、struct のフィールド・array の要素
+         * （GC の提案）に v128 があるなら `null`（#424、#891）。
          *
          * SIMD の命令（`0xFD` の接頭辞）、v128 の局所変数、v128 のグローバルの読み書きのどれかを含む関数を選ぶ。
-         * v128 の値は、これらと、型に v128 がある関数の呼び出し・ブロックからしか生まれないので、残りの関数は v128 を扱わない。
+         * v128 の値は、これらと、型に v128 がある関数の呼び出し・ブロック、v128 のフィールド・要素の読み出し（`struct.get`・`array.get`）
+         * からしか生まれない。後の 2 つは型で断るので、残りの関数は v128 を扱わない。
          */
         internal fun simdFunctions(module: EndiveModule): Set<Int>? {
-            if (module.typeSection().types().any { t -> t.params().any(::isV128) || t.returns().any(::isV128) }) return null
+            val types = module.typeSection()
+            for (i in 0 until types.subTypeCount()) {
+                // 型の番号は rec グループを平らにした番号。struct・array の型は funcType() が null（#891）
+                val comp = types.getSubType(i).compType()
+                val func = comp.funcType()
+                val v128 = when {
+                    func != null -> func.params().any(::isV128) || func.returns().any(::isV128)
+                    comp.structType() != null -> comp.structType().fieldTypes().any { isV128(it.storageType().valType()) }
+                    comp.arrayType() != null -> isV128(comp.arrayType().fieldType().storageType().valType())
+                    else -> false
+                }
+                if (v128) return null
+            }
             val imports = module.importSection()
             val v128Globals = HashSet<Int>()
             var globalIndex = 0
@@ -498,7 +518,7 @@ public class EndiveRuntime internal constructor(
             return result
         }
 
-        private fun isV128(type: ValType): Boolean = type == ValType.V128
+        private fun isV128(type: ValType?): Boolean = type == ValType.V128
 
         /**
          * 定数式で GC のオブジェクト（struct・array）を作る命令（`struct.new` など）を初期値に持つグローバル・要素セグメントがあれば、
@@ -578,6 +598,178 @@ public class EndiveRuntime internal constructor(
                 if (init != null && putsImportedFuncRefInObject(init)) {
                     return "表 $i の初期値の式が、GC のオブジェクトの中に import したグローバルの関数の参照を入れる"
                 }
+            }
+            return null
+        }
+
+        /**
+         * パッシブ・宣言の要素セグメントの項目の式のうち、正しい定数式でないものがあれば、その場所と理由。なければ `null`（#893）。
+         * 場所の番号は [gcObjectInitializer] と同じく、セクションの中の番号
+         *
+         * Endive 1.2.0 の検証（`Validator.validateElements`）は、アクティブの要素の式しか定数式として確かめない。パッシブ（flag 1・5）・
+         * 宣言（flag 3・7）の要素の式は、定数式に使えない命令（`drop` など）・型の合わない値（funcref の要素の `v128.const` など）でも
+         * 通してしまい、`table.init`・`array.new_elem` で使うと、正しくない値が表・配列に入るか、JVM の例外で止まる。
+         * 式の先頭の `ref.func` の範囲（flag 1・3 の番号の並びを含む）は、Endive の検証（`Validator` のコンストラクターの `declaredFunctions`）が
+         * もう断るので、ここに届くのは先頭でない `ref.func` だけ。Endive がアクティブの要素に使うのと同じ規則（`Validator.validateConstantExpression`）で確かめる:
+         * 定数式の命令だけで、スタックにちょうど 1 つの値が残り、その型が要素の型に合う（[ValType.matches]）。`global.get` は不変のグローバルだけ。
+         * Endive の `validateConstantExpression` は命令が取る値の型を確かめないが、ここでは確かめる。取る値の型が合わない式
+         * （`struct.new` のフィールドの型が違う値など）も、`table.init`・`struct.get` などを経て、正しくない値・JVM の例外に届くため。
+         * `any.convert_extern`・`extern.convert_any` の結果が null を持てるかは、取った値に従う。
+         * Endive が直ったら、この判定を外す
+         */
+        internal fun invalidPassiveElementInitializer(module: EndiveModule): String? {
+            val elements = module.elementSection()
+            if (elements.elementCount() == 0) return null
+            val imports = module.importSection()
+            val funcTypes = ArrayList<Int>()
+            val globals = ArrayList<Pair<ValType, Boolean>>() // 型と、可変か
+            for (i in 0 until imports.importCount()) {
+                when (val imp = imports.getImport(i)) {
+                    is FunctionImport -> funcTypes += imp.typeIndex()
+                    is GlobalImport -> globals += imp.type() to (imp.mutabilityType() != MutabilityType.Const)
+                    else -> {}
+                }
+            }
+            val functions = module.functionSection()
+            for (i in 0 until functions.functionCount()) funcTypes += functions.getFunctionType(i)
+            for (g in module.globalSection().globals()) globals += g.valueType() to (g.mutabilityType() != MutabilityType.Const)
+            val types = module.typeSection()
+            for (i in 0 until elements.elementCount()) {
+                val el = elements.getElement(i)
+                if (el is ActiveElement) continue
+                val kind = if (el is PassiveElement) "パッシブ" else "宣言"
+                el.initializers().forEachIndexed { j, init ->
+                    constExprProblem(init, el.type(), funcTypes, globals, types)?.let {
+                        return "要素セグメント $i（$kind）の項目 $j: $it"
+                    }
+                }
+            }
+            return null
+        }
+
+        /** [constExprProblem] の途中で、正しくない理由が分かったときの中断 */
+        private class ConstExprProblem(message: String) : RuntimeException(message)
+
+        /** [expr] が [expected] の型の正しい定数式でなければ、その理由（[invalidPassiveElementInitializer]） */
+        private fun constExprProblem(
+            expr: List<Instruction>,
+            expected: ValType,
+            funcTypes: List<Int>,
+            globals: List<Pair<ValType, Boolean>>,
+            types: TypeSection,
+        ): String? {
+            val stack = ArrayList<ValType>()
+            fun fail(reason: String): Nothing = throw ConstExprProblem(reason)
+            fun ref(opcode: Int, typeIdx: Int): ValType = ValType.builder().withOpcode(opcode).withTypeIdx(typeIdx).build()
+            fun subType(idx: Long) = if (idx in 0 until types.subTypeCount()) types.getSubType(idx.toInt()) else null
+            // 命令 [op] が値を 1 つ取る。型が [want] に合わなければ断る（値の型の検証は Endive にない。#893）。取った値の型を返す
+            fun pop(op: OpCode, want: ValType): ValType {
+                if (stack.isEmpty()) fail("スタックの値が足りない")
+                val actual = stack.removeAt(stack.size - 1)
+                if (!ValType.matches(actual, want, types)) fail("命令 $op が取る値の型（$actual）が期待する型（$want）に合わない")
+                return actual
+            }
+            // struct のフィールド・array の要素の型を、スタックの値の型にしたもの（i8・i16 は i32）
+            fun unpacked(storage: StorageType): ValType = if (storage.packedType() != null) ValType.I32 else storage.valType()
+            // `*.new_default` で既定値が作れる型（数・v128・null を持てる参照）か
+            fun defaultable(storage: StorageType): Boolean =
+                storage.packedType() != null || !storage.valType().isReference || storage.valType().isNullable
+            try {
+                for (ins in expr) {
+                    val op = ins.opcode()
+                    val push: ValType = when (op) {
+                        OpCode.END -> continue
+                        OpCode.I32_CONST -> ValType.I32
+                        OpCode.I64_CONST -> ValType.I64
+                        OpCode.F32_CONST -> ValType.F32
+                        OpCode.F64_CONST -> ValType.F64
+                        OpCode.V128_CONST -> ValType.V128
+                        OpCode.I32_ADD, OpCode.I32_SUB, OpCode.I32_MUL -> {
+                            pop(op, ValType.I32)
+                            pop(op, ValType.I32)
+                            ValType.I32
+                        }
+                        OpCode.I64_ADD, OpCode.I64_SUB, OpCode.I64_MUL -> {
+                            pop(op, ValType.I64)
+                            pop(op, ValType.I64)
+                            ValType.I64
+                        }
+                        OpCode.REF_NULL -> {
+                            // ヒープ型は、型の番号（0 以上。範囲の中）か、抽象ヒープ型（負。funcref・externref など）。
+                            // 範囲の外の番号を型にすると、ValType の解決が InvalidException を投げて、場所のない文面になる
+                            val idx = ins.operand(0)
+                            val known = if (idx >= 0) {
+                                idx < types.subTypeCount()
+                            } else {
+                                ValType.TypeIdxCode.entries.any { it != ValType.TypeIdxCode.BOT && it.code().toLong() == idx }
+                            }
+                            if (!known) fail("ヒープ型 $idx がない")
+                            ref(ValType.ID.RefNull, idx.toInt())
+                        }
+                        OpCode.REF_FUNC -> {
+                            // 番号は u32 まで。Int にすると 2^31 以上が負になるので Long で比べる
+                            val idx = ins.operand(0)
+                            if (idx < 0 || idx >= funcTypes.size) fail("関数 $idx がない")
+                            ref(ValType.ID.Ref, funcTypes[idx.toInt()])
+                        }
+                        OpCode.GLOBAL_GET -> {
+                            val idx = ins.operand(0)
+                            if (idx < 0 || idx >= globals.size) fail("グローバルがない")
+                            val (type, mutable) = globals[idx.toInt()]
+                            if (mutable) fail("可変のグローバルは定数式で読めない")
+                            type
+                        }
+                        OpCode.REF_I31 -> {
+                            pop(op, ValType.I32)
+                            ref(ValType.ID.Ref, ValType.TypeIdxCode.I31.code())
+                        }
+                        OpCode.STRUCT_NEW, OpCode.STRUCT_NEW_DEFAULT -> {
+                            val st = subType(ins.operand(0))?.compType()?.structType() ?: fail("型 ${ins.operand(0)} が struct でない")
+                            if (op == OpCode.STRUCT_NEW) {
+                                // 値は、最後のフィールドのものが上にある
+                                for (k in st.fieldTypes().indices.reversed()) pop(op, unpacked(st.fieldTypes()[k].storageType()))
+                            } else if (!st.fieldTypes().all { defaultable(it.storageType()) }) {
+                                fail("型 ${ins.operand(0)} に、null を持てない参照のフィールドがあるので、既定値で作れない")
+                            }
+                            ref(ValType.ID.Ref, ins.operand(0).toInt())
+                        }
+                        OpCode.ARRAY_NEW, OpCode.ARRAY_NEW_DEFAULT, OpCode.ARRAY_NEW_FIXED -> {
+                            val arr = subType(ins.operand(0))?.compType()?.arrayType() ?: fail("型 ${ins.operand(0)} が array でない")
+                            val elem = arr.fieldType().storageType()
+                            when (op) {
+                                OpCode.ARRAY_NEW -> {
+                                    pop(op, ValType.I32) // 長さ（上）
+                                    pop(op, unpacked(elem))
+                                }
+                                OpCode.ARRAY_NEW_DEFAULT -> {
+                                    if (!defaultable(elem)) fail("型 ${ins.operand(0)} の要素が null を持てない参照なので、既定値で作れない")
+                                    pop(op, ValType.I32)
+                                }
+                                else -> {
+                                    // 個数は u32。スタックより多ければ、取る前に断る
+                                    val n = ins.operand(1)
+                                    if (n > stack.size) fail("スタックの値が足りない")
+                                    repeat(n.toInt()) { pop(op, unpacked(elem)) }
+                                }
+                            }
+                            ref(ValType.ID.Ref, ins.operand(0).toInt())
+                        }
+                        // 結果が null を持てるかは、取った値に従う（仕様。null を持てない値からは、null を持てない値になる）
+                        OpCode.ANY_CONVERT_EXTERN, OpCode.EXTERN_CONVERT_ANY -> {
+                            val toAny = op == OpCode.ANY_CONVERT_EXTERN
+                            val actual = pop(op, if (toAny) ValType.ExternRef else ValType.AnyRef)
+                            val heap = if (toAny) ValType.TypeIdxCode.ANY else ValType.TypeIdxCode.EXTERN
+                            ref(if (actual.isNullable) ValType.ID.RefNull else ValType.ID.Ref, heap.code())
+                        }
+                        else -> fail("命令 $op は定数式に使えない")
+                    }
+                    stack += push
+                }
+                if (stack.size != 1) fail("定数式の値が ${stack.size} 個（1 個でない）")
+                val actual = stack[0]
+                if (!ValType.matches(actual, expected, types)) fail("値の型（$actual）が要素の型（$expected）に合わない")
+            } catch (e: ConstExprProblem) {
+                return e.message
             }
             return null
         }
@@ -1299,8 +1491,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
             globals += WasmInstanceState.GlobalValue(i, type, inst.global(i).getValueLow())
         }
         // GC のオブジェクト（struct・array）を初期値に持つグローバル・要素セグメントは、不変でも写せない。オブジェクトの中身（可変のフィールド）は
-        // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。今は、GC の型を持つモジュールは
-        // 製品の経路ではコンパイル（`simdFunctions`）で落ちるので、ここに届かない（#891）。コンパイルしないランタイムでは届く）
+        // 写さないので、戻すと `struct.set`・`array.set` で書いた値が初期値に戻ってしまう（#851。製品の経路（コンパイルあり）でも届く。#891）
         EndiveRuntime.gcObjectInitializer(mod)?.let { throw WasmStateException("GC のオブジェクトを初期値に持つ$it") }
         // 線形メモリ（0 番）: 書き換えた区画だけ（CHANGED なら、最後の FULL_AND_TRACK から変わった区画だけ。#83）
         var pages = -1

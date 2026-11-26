@@ -175,7 +175,11 @@ class StackExhaustionLockTest {
         /** [Body.DISK_IO] で、ディスクの本物の操作まで動かした回数（スタックの底に近いときだけ動かす。[nearStackEnd]） */
         val ops = AtomicInteger()
 
-        /** [DiskOp.CREATE_WRITE_CLOSE] で開いて、まだ閉じていないファイル（尽きて閉じ損ねたものを、回の後に閉じる） */
+        /**
+         * [DiskOp.CREATE_WRITE_CLOSE] で開いて、まだ閉じていないファイル（尽きて閉じ損ねたものを、回の後に閉じる）。
+         * `Vfs.close` で閉じるファイルは fd の表に入っていないので、本番ではプロセスの終わりにも閉じられない。閉じ直しは、
+         * `close` の途中で尽きても [OpenFile.retained] が真のまま残り、閉じ直せること（#901）も兼ねて確かめる
+         */
         val openFile = AtomicReference<OpenFile?>()
     }
 
@@ -444,6 +448,12 @@ class StackExhaustionLockTest {
                     assertTrue(round.ops.get() > 0, "ディスクの操作が 1 度も動かなかった（$where、$tag。本体 ${round.calls.get()} 回）")
                     diskOps.addAndGet(round.ops.get())
                 }
+                if (body == Body.CONSOLE) {
+                    // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている（#890。持ち主のプロセスが
+                    // 終わるときに戻す）。残ると、メインスレッドがその台の TTY の残り（キー入力のエコーなど）をずっと取り出さなくなる。
+                    // 確かめの段数を縮めて回したとき（尽きた位置がロックの中に落ちて下で落ちる回を含む）も、予約の残りを別に報告するため、先に見る
+                    assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った（$where、${position}）")
+                }
                 // 尽きた位置が、ロック（この MOD のもの、JDK のクラス経由の executor・列・NIO のもの）を取る・放す途中（AQS・`Unsafe` の CAS を含む）なら、その回で落とす（最後の集計を待たずに、回・pattern・pad を残す）。
                 // 失敗の説明は、落とすときだけ作る（成功する回で `state` を評価しない。中のロックは待ちの上限付きで取る）
                 if (position.isLock) {
@@ -457,8 +467,8 @@ class StackExhaustionLockTest {
                     awaitLockAcquirable(ticker, "ほかのロックが取れる（$where）", l) { "$l、${describe()}" }
                 }
                 if (body == Body.DISK_IO) {
-                    // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイルは、本番では fd の表がプロセスの終わりに閉じる。ここでは
-                    // 閉じてから、node の表・使用量・開いたままの枠がホストと合い、開いたままのホストのファイルが残っていないことを見る
+                    // 尽きたときのディスクの状態を読み直す: 開いて閉じ損ねたファイル（fd の表に入れていないので、本番ではプロセスの終わりにも
+                    // 閉じられない）を閉じ直してから（`Vfs.close` の途中で尽きても閉じ直せる。#901）、node の表・使用量・開いたままの枠がホストと合い、開いたままのホストのファイルが残っていないことを見る
                     // （マシンのロック・リースのロックが取れるだけでは、「ホストの移動の後の付け替え」「ファイルを閉じた後の枠の返却」の
                     // 途中で尽きた食い違いを見つけられない。`DiskFileSystemStackExhaustionTest` が全位置を見る）
                     round.openFile.getAndSet(null)?.let { m.vfs.close(it) }
@@ -467,11 +477,6 @@ class StackExhaustionLockTest {
                         assertTrue(problems.isEmpty(), "尽きた後にディスク $name の状態がホストと食い違った（$where、$tag）: $problems")
                         assertEquals(0, fs.openHandles, "開いたままのホストのファイルが残った（ディスク $name。$where、$tag）")
                     }
-                }
-                if (body == Body.CONSOLE) {
-                    // コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が戻っている。残ると、
-                    // メインスレッドがその台の TTY の残り（キー入力のエコーなど）をずっと取り出さなくなる
-                    assertEquals(0, m.consolePumpsReservedForTest, "コンソールの出力の予約が残った（$where）")
                 }
                 // 同じ台と別の台のプロセスが進み続ける（CPU・許可が渡り続ける）
                 awaitProgress(ticker, "同じ台のプロセス（$where）", sameProgress, describe)

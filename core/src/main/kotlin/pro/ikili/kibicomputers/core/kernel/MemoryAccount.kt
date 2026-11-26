@@ -113,9 +113,12 @@ internal class MemoryAccount(
  * `ctx.instantiate` が作るメモリ・テーブルの最初の分（`createMemory`・`createTable`）。どれもカーネルロックの外）では、
  * 包みの確かめを通った後の本体の深さから、ここでもう 1 回確かめる。本体の途中（カーネルの状態を変えた後）で
  * `StackOverflowError` になる深さがあるが、何も数える前に投げるので勘定はずれず、プロセスだけが終わる（ADR 0043）。
+ * `ctx.instantiate` は、作りかけの分を返す道（Endive の失敗の `catch`）と作り終えた後につなぐまでを、入口の
+ * [StackHeadroom.INSTANTIATE_FRAMES] 段の確かめでまかなう（#884）。
  * コンポーネントの core インスタンスの固定費（`ProcessRunner.reserveCoreInstanceOverhead`。カーネルロックの中）は、
  * プロセスの始まり（`load` → `loadComponent` の `configure`。step・専用スレッドの浅いところ）からだけ来て、ホストの関数の本体からは入らない。
- * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶ（まだ確かめていない。#883）
+ * `/tmp`（`TmpFileSystem`）はここを通らずに [MemoryAccount] を直接呼ぶので、自分の変える操作の入口で
+ * [StackHeadroom.TMPFS_FRAMES] 段を確かめる（#883。`StackHeadroom` の KDoc）
  */
 internal class ProcessMemory(private val machine: MemoryAccount, val limitPages: Int) : WasmMemoryBudget, WasmTableBudget {
     /** プロセスの上限（バイト） */

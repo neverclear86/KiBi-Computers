@@ -1146,6 +1146,9 @@ internal class ProcessRunner(private val machine: Machine) {
 
     /** プロセスを終える（待ちを外し、インスタンスを捨てる）。カーネルロックの中で呼ぶ */
     fun finishLocked(rt: ProcessRuntime, state: ProcessState, exitCode: Int?) {
+        // コンソールの出力の予約を戻す（#890）。予約してから pumpConsole で消すまでの間にスタックが尽きても、ここ（浅いところ）で戻る。
+        // 戻した後に TTY に残った分は、書き手のいない出力としてメインスレッドが配る
+        machine.releaseConsolePumpLocked(rt)
         val process = rt.process
         if (process.state.isTerminal) return
         process.state = state
@@ -1534,6 +1537,9 @@ internal class ProcessRunner(private val machine: Machine) {
 
         override fun instantiate(module: WasmModule, configurer: InstanceConfigurer): WasmInstance {
             checkThread()
+            // 作りかけのメモリ・テーブルの分を返す道（Endive の失敗の catch）と、作り終えた後に rt.instances へつなぐまでを、
+            // 何も変える前に確かめた余裕でまかなう（#884。返す側では確かめられず、同じ深さの catch はまた溢れる）
+            StackHeadroom.ensure(StackHeadroom.INSTANTIATE_FRAMES)
             lock.withLockValue {
                 check(rt.loading == null) { "作っている途中は instantiate を入れ子で呼べない" }
                 check(rt.program.component == null) { "コンポーネントのプロセスは instantiate を呼べない（core インスタンスはリンクの計画が作る）" }
@@ -2060,11 +2066,11 @@ internal class ProcessRunner(private val machine: Machine) {
             }
         }
 
-        override fun reserveConsoleFlushLocked() = machine.reserveConsolePumpLocked()
+        override fun reserveConsoleFlushLocked() = machine.reserveConsolePumpLocked(rt)
 
         override fun flushConsole() {
             hooks.beforeConsoleFlush?.invoke(machine, rt.pid)
-            val cells = machine.pumpConsole(reserved = true)
+            val cells = machine.pumpConsole(reservedBy = rt)
             if (cells <= 0 || rt.process.unmetered) return
             // 書いた分は、手持ちがあれば払う（手持ちがない呼び出し元では払わない）
             lock.withLockValue { rt.currentHolder?.let { it.fuel -= cells * MachineLimits.CONSOLE_FUEL_PER_CELL } }

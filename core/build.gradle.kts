@@ -77,12 +77,24 @@ tasks.test {
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // ctx.instantiate の入口の確かめを外した・縮めた結果を手元で測る（#884。`-Pkibi.test.instantiateGateFrames=<段数>`。ふつうは渡さない）
+    providers.gradleProperty("kibi.test.instantiateGateFrames").orNull?.let { systemProperty("kibi.test.instantiateGateFrames", it) }
     // 前借りの間の燃料切れの処理の費用を測る（#858。`-Pkibi.overdraftBenchmark=true`。ふつうは動かさない）
     if (providers.gradleProperty("kibi.overdraftBenchmark").orNull == "true") {
         systemProperty("kibi.overdraftBenchmark", "true")
         for (name in listOf("machines", "inner", "rounds")) {
             providers.gradleProperty("kibi.overdraftBenchmark.$name").orNull?.let { systemProperty("kibi.overdraftBenchmark.$name", it) }
         }
+    }
+    // 待機点への変換の速さを測る（#338。`-Pkibi.asyncifyBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.asyncifyBenchmark").orNull == "true") {
+        systemProperty("kibi.asyncifyBenchmark", "true")
+        providers.gradleProperty("kibi.asyncifyBenchmark.rounds").orNull?.let { systemProperty("kibi.asyncifyBenchmark.rounds", it) }
+    }
+    // 変換したモジュールの燃料 1 あたりの CPU 時間を測る（#389。`-Pkibi.asyncifyFuelBenchmark=true`。ふつうは動かさない）
+    if (providers.gradleProperty("kibi.asyncifyFuelBenchmark").orNull == "true") {
+        systemProperty("kibi.asyncifyFuelBenchmark", "true")
+        providers.gradleProperty("kibi.asyncifyFuelBenchmark.rounds").orNull?.let { systemProperty("kibi.asyncifyFuelBenchmark.rounds", it) }
     }
     // Lua の REPL を何台で測るか（#334。`-Pkibi.luaReplMachines=1000` で 1,000 台を測る）
     providers.gradleProperty("kibi.luaReplMachines").orNull?.let {
@@ -103,6 +115,9 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         "ComponentStackExhaustionLockTest",
         "P1StackExhaustionLockTest",
         "P1DiskCloseStackExhaustionTest",
+        "TmpFileSystemStackExhaustionKernelTest",
+        "InstantiateStackExhaustionTest",
+        "InstantiateStackExhaustionKernelTest",
     )
     fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
         group = "verification"
@@ -113,6 +128,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         filter {
             headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
             includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
+            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemStackExhaustionTest")
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)

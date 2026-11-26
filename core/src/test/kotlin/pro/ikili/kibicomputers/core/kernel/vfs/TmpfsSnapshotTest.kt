@@ -64,6 +64,39 @@ class TmpfsSnapshotTest {
     }
 
     @Test
+    fun `木を組む途中で失敗したら、数えたRAMを返して投げ直す`() {
+        val chunk = ByteArray(TmpFileSystem.CHUNK_BYTES) { 1 }
+        // 根の子が、ない node（99）を指す。数えた（RAM を確保した）後、木を組む途中で `NoSuchElementException` になる（読む側の確かめを通さずに渡す）
+        val broken = TmpFileSystem.TmpSnapshot(
+            3,
+            listOf(
+                TmpFileSystem.TmpNode(
+                    TmpFileSystem.ROOT_NODE, FileType.DIRECTORY, 0, 1, 1, 1,
+                    listOf("a" to 2L, "ghost" to 99L), null,
+                ),
+                TmpFileSystem.TmpNode(2, FileType.REGULAR_FILE, 10, 1, 1, 1, null, listOf(0L to chunk)),
+            ),
+        )
+        val server = MemoryAccount(1L shl 30)
+        val machine = MemoryAccount(1L shl 20, server)
+        assertThrows<NoSuchElementException> { TmpFileSystem.restore(machine, { now }, broken) }
+        assertEquals(0L, machine.usedBytes)
+        assertEquals(0L, server.usedBytes)
+
+        // 失敗の後も、同じ勘定で正しい写しを作り直せる（返し忘れで RAM が減っていない）
+        val fs = TmpFileSystem(MemoryAccount(64)) { now }
+        val a = fs.createFile(p("/a"))
+        fs.write(a, 0, chunk, 0, chunk.size)
+        val good = TmpfsSectionCodec.read(TmpfsSectionCodec.write(1, fs.snapshot()!!)).snapshot
+        val back = TmpFileSystem.restore(machine, { now }, good)!!
+        assertEquals(back.usedBytes, machine.usedBytes)
+        assertEquals(back.usedBytes, server.usedBytes)
+        back.onUnmounted()
+        assertEquals(0L, machine.usedBytes)
+        assertEquals(0L, server.usedBytes)
+    }
+
+    @Test
     fun `木の形が壊れていればSnapshotFormatException`() {
         val fs = TmpFileSystem(MemoryAccount(64)) { now }
         fs.createFile(p("/a"))

@@ -52,6 +52,14 @@ internal class ProcessRuntime(
     /** ブロッキング型の枠を予約した公平の組（終わりにこの組へ返す。#738。作るときにカーネルロックの中で書く） */
     var blockingGroup: FairShareGroup = FairShareGroup.NONE
 
+    /**
+     * コンソールの TTY に書いて、まだ `Machine.pumpConsole` で書いていない（`Machine.consolePumpsReserved` に 1 つ数えている。#419・#890）。
+     * カーネルロックの中で読み書きする。`Machine.reserveConsolePumpLocked` が立て、`Machine.releaseConsolePumpLocked`（`pumpConsole` と
+     * プロセスの終わりの [ProcessRunner.finishLocked]）が下ろす。数との間に呼び出しを挟まないよう、setter を通さないフィールドにする
+     */
+    @JvmField
+    var consolePumpReserved: Boolean = false
+
     /** 一時停止の数え（スケジューラの「実行中」）に入っている */
     var active: Boolean = false
 

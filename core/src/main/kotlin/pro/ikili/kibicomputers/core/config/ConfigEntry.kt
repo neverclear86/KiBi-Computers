@@ -52,6 +52,8 @@ public enum class ConfigApply {
  * @property apply いつ効くか
  * @property commentEn 説明（英語）。TOML のコメントと設定画面のツールチップに出す
  * @property commentJa 説明（日本語）
+ * @property ownerScoped 持ち主の仕組み（PlayerAccess と、ケースから渡す公平の組の鍵。#131・#738）に依る項目か（#897）。
+ *   持ち主の仕組みを持たない接続層は、この項目をコンフィグに出さない（[KiBiConfig.entries] の `ownerGroups = false`）
  */
 @ApiStatus.Internal
 public sealed class ConfigEntry<T : Any>(
@@ -62,6 +64,7 @@ public sealed class ConfigEntry<T : Any>(
     public val apply: ConfigApply,
     public val commentEn: String,
     public val commentJa: String,
+    public val ownerScoped: Boolean = false,
 ) {
     /** 区画とキーをつないだ名前（例: `scheduler.maxConcurrentMachines`）。分類の中で重ならない */
     public val path: String get() = "$section.$name"
@@ -101,7 +104,8 @@ public class IntEntry internal constructor(
     commentEn: String,
     commentJa: String,
     public val auto: Int? = null,
-) : ConfigEntry<Int>(side, section, name, default, apply, commentEn, commentJa) {
+    ownerScoped: Boolean = false,
+) : ConfigEntry<Int>(side, section, name, default, apply, commentEn, commentJa, ownerScoped) {
     init {
         require(min <= max) { "$name: min > max" }
         require(default in min..max) { "$name: default out of range" }

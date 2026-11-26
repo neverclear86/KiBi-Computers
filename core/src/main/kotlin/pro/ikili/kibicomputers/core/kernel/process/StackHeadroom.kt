@@ -64,18 +64,27 @@ package pro.ikili.kibicomputers.core.kernel.process
  *     `release` の確かめで投げると知らせが捨てられるので、取り出す前に [DEFERRED_RELEASE_FRAMES] 段を投げずに確かめ（[hasHeadroom]）、
  *     足りなければ取り出さずに返す（`drainDeferred` は、ファイルシステムに届く操作からゲストのスレッドの深さでも走る）。
  *     同じテストの、fd の表から閉じる知らせの回が、知らせが行われたか列に残ったかのどちらかになることを見る。
+ *     fd の表に入れない開いたファイルを閉じる道（`Vfs.close` → `release`）は、`retained` を `release` が戻ってから落とす
+ *     （途中で尽きても閉じ直せる。#901）。本番の呼び手は閉じ直さないので、開く側（`Vfs.open`）が何も変える前に [VFS_OPEN_FRAMES] 段を払い、
+ *     同じ深さの `close` の確かめが通るようにする。同じテストの `Vfs` の回は、閉じる途中で尽きても閉じ直せば、また開いて書いて
+ *     `finally` で閉じる本番の形では閉じ直さなくても、開いたままのホストのファイルが残らないことを見る（閉じる途中で尽きる回は、
+ *     並べ替える前は閉じ直せずに落ちた。本番の形の回は、開く側の確かめがなくても手元では落ちなかった。`open` の中の確かめは `close` より数段深いため）。開く側の確かめそのものは、`refuseOpen` の 3 つの試験（作る・既存を開く・`O_TRUNC`）が、`VFS_OPEN_FRAMES` の確かめが通らない最初の深さで開き、何も変えずに断ること（作ったファイル・切り詰め・開いたままの枠・予約した枠が残らず、浅いところで開き直せる）を固定する。確かめを外す・`reserveOpen` の後ろへ動かすと落ちる。
  *     「深いスレッドが積んだ知らせを、起動用のスレッドが行う」道（`Machine.scheduleVfsDrain`）は、`P1DiskCloseStackExhaustionTest` が、
  *     本物の WASI p1 の `path_open`・`fd_close` をスタックの底に近いところで繰り返して、Machine ごと通す（毎回の後に、知らせが残らず、
  *     開いたままの枠が 0 に戻り、ディスクの状態がホストと合うこと）。
  *     入口の確かめの `StackOverflowError` は、呼び手が飲まずに伝える（`Vfs.readDirectory` がマウントの根の `stat` の失敗を node 0 に
  *     するのは `Exception` だけで、`Error` は伝える）。
- *     `/tmp`（`TmpFileSystem`）の木の「外す → 付け替える」は、まだ確かめていない（#902）
+ *     `/tmp`（`TmpFileSystem`）の変える操作は、#883 で入口に [TMPFS_FRAMES] 段の確かめを足し、木と使用量の食い違いも
+ *     `TmpFileSystem.consistencyProblemsForTest` で見るようにした（下の「`/tmp`」）。木の食い違いの道全般の掃引は #902
  *   - `StackExhaustionLockTest` の `DISK_IO`: プロセスの中から、回ごとに 1 種類の操作（深いディレクトリの `stat`・別のディスクの `stat`・
  *     `open`（作る）・書く・閉じる・同じマウントの `rename`・マウントをまたぐ `rename`）を、スタックの底に近いところのホストの関数で動かす
  *     （1 本に 40 回。底に近いところだけ本物の操作をするので、1 本が約 9 秒）。毎回の後に、ディスクの表・使用量・枠がホストと合うことと、
  *     開いたままのホストのファイルが残っていないことも見る
  * - 端末への書き込みと、画面のデバイスのロックを取る出力の流し込み（`flushConsole` → `pumpConsole`。同じく `CONSOLE`）。1 本で 60 回
- *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`。ロックでないので安全網の対象外）が 0 に戻ることも見る
+ *   （冷えた道は 15 回）。毎回の後に、コンソールの出力の予約（`consolePumpsReserved`）が 0 に戻ることも見る。予約はロックでないので
+ *   安全網の対象外だが、持ち主のプロセスの終わり（`finishLocked`）が戻す（#890。尽きた位置に左右されない。窓を決まった形で突く
+ *   `ConsolePumpReservationTest`）。確かめの段数を縮めて（包み・燃料切れの入口・深い道を 16・16・64 段、8・8・32 段）この回を回しても、
+ *   毎回の後に予約が 0 に戻った（JDK 17・Windows。尽きた位置はほとんど確かめの中で、予約の窓に落ちた回は少ない。窓は上のテストが見る）
  * - canon の lift・lower（文字列の realloc、post-return、別のインスタンスが lower した関数を lift し直す `CoreRef.Lowered` の道。
  *   本物の Endive のコンポーネント。`ComponentStackExhaustionLockTest`）。入口の `top` に止まりうるホストの関数を置くので、待機点型の回は
  *   待機点型に固有の燃料切れの道を通る: 深い `f`（ゲストからゲストへの呼び出しの下）の中の前借りと、`top` の loop の先頭の燃料切れの巻き戻し・巻き直し
@@ -125,10 +134,59 @@ package pro.ikili.kibicomputers.core.kernel.process
  * （`MemoryAccountStackExhaustionTest` の `hostBody`）。
  * カーネルのプロセスを通した確かめは `MemoryAccountStackExhaustionKernelTest`（本物のマシン・Endive で、ゲストの命令とホストの関数の本体
  * （`memory.write*`・`commit`）から入り、プロセスだけが終わり、終わりの後にマシン・サーバー全体の勘定が戻り、ほかの台が動き続ける）。
- * `ctx.instantiate` の道（作るのに失敗したときに同じ深さで返す `catch` を含む）は、まだ確かめていない（#884）。
  *
- * `/tmp`（`TmpFileSystem`）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、この入口で
- * 覆えない。まだ確かめていない（#883）
+ * `ctx.instantiate` の道（#884）: 1 回で、メモリ（`createMemory` → `WrittenPagesMemory` の区画の表）とテーブル（`createTable`）を続けて
+ * 別々に数え、失敗すると `EndiveWasmModule.instantiate` の `catch` が、作りかけの分を全段に返す。作り終えたら `rt.instances` につなぐ
+ * （つなぐ前に尽きると、プロセスの終わりでも閉じられない）。どちらも返す・つなぐ途中で尽きると勘定がずれるので、`ctx.instantiate` の入口で、
+ * 何も変える前に [INSTANTIATE_FRAMES] 段を 1 回確かめる。`InstantiateStackExhaustionTest`（勘定の組と本物の Endive を直接組み、底に近い深さの
+ * すべてで 5 つの型: 作り終える・要素の初期化で失敗・テーブルの上限で失敗・start が区画に書いてからトラップ・start の中で尽きる）と
+ * `InstantiateStackExhaustionKernelTest`（本物のマシンで、ドライバーの本体とホストの関数の本体から。BLOCKING・WAIT_POINT）で、
+ * 毎回の後に 3 段の勘定が戻ることを確かめた（どちらの掃引も入口の確かめの有無・位置は見分けない。確かめを固定しているのは、
+ * `InstantiateStackExhaustionKernelTest` の、確かめが通らない深さで断ることを見る 2 本）。確かめを外した（0 段の）手元の試験（JDK 17・JIT・Windows）では、どちらの試験でも、ずれは
+ * 1 回も出なかった（窓がないとは言えない）。尽きた位置は、数える前（`MEMORY_ACCOUNT_FRAMES` の確かめの中か、Endive の中）だった。
+ * 返す `catch` は、数えた位置（`ensure(MEMORY_ACCOUNT_FRAMES)` を通った深さ）より浅いところで動くので、フレームの大きさが変わらなければ
+ * 尽きないが、JIT の段階でフレームが変わる・ロックの取り合いで深い道に入る、ことまでは覆わない。そこで入口でまとめて払う。
+ * 段数を縮めた同じ単体の試験では、64 段以上で、入口を通った後に尽きた回が 0 になった（start の中で尽きる型を除く。32 段以下では
+ * 入口を通った後に Endive の中で尽きる回があったが、ずれはなかった）。今の 128 段はその 2 倍。今は本番の呼び出し元がないので、費用は TPS に響かない
+ *
+ * 冷えた道・`-Xint`・JDK 21 の結果（`-Pkibi.stackHeadroom=true` の `stackHeadroomColdTest`・`stackHeadroomXintTest`・`stackHeadroomJdk21Test` を、
+ * `InstantiateStackExhaustion*` だけに絞って回した。Windows。今の 128 段）: 単体 5 本・カーネル（BLOCKING・WAIT_POINT）とも、3 つの JVM のどれでも通過し、
+ * 勘定のずれは 1 回も出なかった。単体の試験で入口を通った後に尽きた回は、start の中で尽きる型を除いて 0（窓に入った深さは、冷えた道で約 618、`-Xint` で約 1608、
+ * JDK 21 で約 576〜658）。段数を縮めた測定（上の 64 段以上で 0）は、JIT の JVM でだけ行った。これらの JVM では 128 段で測り、
+ * 縮めた段数では測っていない（`kibi.test.instantiateGateFrames` は通常の `:core:test` にだけ渡る）。
+ * 確かめそのものは、`InstantiateStackExhaustionKernelTest` の「入口の確かめが通らない深さで呼ぶと、何も変えずに断り、浅いところで作り直せる」が固定する
+ * （確かめを外す、`rt.loading` の設定より後ろへ動かす、のどちらでも落ちる。掃引の試験は、窓が確かめの外に落ちないので見分けられない）
+ *
+ * `/tmp`（`TmpFileSystem`。#883）は `ProcessMemory` を通らず、マシンの `MemoryAccount`（マシン → サーバー全体の 2 段）を直接呼ぶので、上の入口で
+ * 覆えない。変える操作（作る・消す・名前を変える・書く・追記・大きさを変える・`allocate`）は、勘定の 2 段に加えて、自分の `usedBytes` と木
+ * （親から外す・`nodes` から消す・塊を足す・`size` を直す）を順に変えるので、途中で尽きると、勘定と `usedBytes` がずれる（外すときに返す量が
+ * 合わず、マシン・サーバー全体に残る）か、木が半端になる（`size` の外の塊・根から辿れない node は、次の保存の `TMPFS` 節が読めず冷えた起動になる）。
+ * 返す側（`releaseRam`）は返すことが飛ばされるので確かめられず、同じ深さの `catch` はまた溢れる。そこで、変える操作の入口で、モニターを取る前・
+ * 何も変える前に [TMPFS_FRAMES] 段を 1 回確かめる（`write` は塊ごとでなく入口の 1 回。`append`・`allocate` は中身を呼び、2 回払わない）。
+ * `TmpFileSystemStackExhaustionTest` は、`MemoryAccountStackExhaustionTest` と同じく底に近い深さのすべてで 13 の型（新しい塊・いくつもの塊・追記・
+ * 作る 2 つ・消す 2 つ・名前の変更 3 つ・縮める・`allocate`・VFS の `O_TRUNC`）を呼び、毎回の後に勘定 3 つが等しいこと、木から数え直した RAM・
+ * 塊が `size` の中・孤立した node がないこと、`TMPFS` 節に書いて読み直せること、外すと 0 に戻ること、断られた回は何も変わっていないことを見る。
+ * 確かめを外した手元の試験（JDK 17・JIT・Windows）では、確かめが通らない深さで操作が通り、13 の型のうち 9 つで食い違った: 書く・追記・
+ * いくつもの塊で `usedBytes` だけ 4 KiB〜8 KiB 多い（塊を数えた後に尽きる。追記・いくつもの塊では、足した塊が `size` の外に残り `TMPFS` 節が読めない）、
+ * 作る 2 つで `usedBytes` だけ 259 バイト多い（数えた後、木に入れる前）、消す 2 つで木から外したのに `usedBytes` が返らない
+ * （ファイルを消す回は `TMPFS` 節が読めない）、空のディレクトリの置き換えで、置き換えられた node が `nodes` から消えたまま木に残る
+ * （`TMPFS` 節が読めない）、`allocate` で大きさだけ変わって時刻が直らない。
+ * 勘定の段の間（マシンとサーバー全体の間、`usedBytes` と勘定の間）のずれは、この試験では観測されなかった（窓がないとは言えない）。
+ * 確かめを入れた後は、確かめが通らない深さで必ず断られ、食い違いは 1 回も出ず、断られた位置はほぼすべて確かめの中だった。
+ * 32 段がいちばん悪い組み合わせで足りるかも、`-Pkibi.stackHeadroom=true` の 3 つの JVM（Windows）で確かめた（単体 23 本・カーネル 2 本。
+ * どれも通過）: 冷えた道（`probe` だけ JIT、`/tmp` の中身はインタプリタの大きいフレーム）・`-Xint`・JDK 21 のどれでも、確かめが通らない深さで
+ * 断られなかった回は 0、`usedBytes`・勘定・木の食い違いは 0、カーネルの試験の `/tmp` とマシン・サーバー全体の勘定の食い違いも 0。
+ * 単体の試験で断られた位置のうち確かめの中は、冷えた道で約 95%（1128 回中 1070）、`-Xint` で約 98%、JDK 21 で約 91%（残りは確かめの外で
+ * 尽きた回で、どれも食い違いは出ていない）。
+ * 32 段の確かめは 1 回約 0.2 µs で、1 バイトの `write`（約 0.04 µs）は約 0.25 µs になる。ゲストからはホストの関数の包みと VFS・WASI の層を通った
+ * 後なので、システムコール 1 回に包みの確かめ 1 回分が足される程度。待っているだけの台と tick ごとの費用は増えない。
+ *
+ * 包みの 32 段との関係（#883）: `/tmp` の操作は自分の入口で自分の分を確かめるので、包みの [HOST_CALL_FRAMES] 段が覆う必要があるのは、カーネルロックの
+ * 区間（#858 で確かめ済み）と、VFS が `/tmp` を呼ぶまで（道の解決・`checkUnlocked`・`drainDeferred` の [hasHeadroom]）だけになる。そこで尽きても
+ * `/tmp` は何も変わっていない（`/tmp` は開いたままの枠を数えないので、`reserveOpen` の枠も残らない）。カーネルのプロセスを通した確かめは
+ * `TmpFileSystemStackExhaustionKernelTest`（ホストの関数の本体が `ctx.vfs` で `/tmp` を開く・切り詰める・書く・名前を変える・置き換える・消す。
+ * プロセスだけが `call stack exhausted` で終わり、マシンは動き続け、`/tmp` の木と勘定は食い違わず、止めるとマシンの勘定が 0、サーバー全体が元に戻る）。
+ * この試験は、確かめを外しても落ちなかった（尽きる位置が VFS・Endive の中に落ち、`/tmp` を変える途中に当たらなかった）ので、窓の検知は単体の試験が受け持つ
  */
 internal object StackHeadroom {
     /**
@@ -171,11 +229,40 @@ internal object StackHeadroom {
     const val HOST_IO_FRAMES: Int = 128
 
     /**
+     * `/tmp`（`TmpFileSystem`）の変える操作の入口で確かめる段数（#883）。ここから先は、自分のモニターの中のメモリの操作（`TreeMap`・
+     * `HashMap` の付け替え、4 KiB の塊の確保と写し、時計の読み取り、`fsError` の例外の生成）と、RAM の勘定（マシン → サーバー全体の 2 段の CAS）だけで、
+     * ロックを取る深い道もホストの I/O もない。書き込みのたびに通るので、ホストの関数の包みと同じ軽い段数にする
+     */
+    const val TMPFS_FRAMES: Int = 32
+
+    /**
+     * `ctx.instantiate`（`ProcessRunner` の `ProcessContext.instantiate`）の入口で、何も変える前に確かめる段数（#884）。
+     * ここから先は、カーネルロックの区間（取り合いの待ちの道を含む）、Endive の `Instance.Builder.build`、作るのに失敗したときに
+     * 作りかけのメモリ・テーブルの分を全段に返す道（`EndiveWasmModule.instantiate` の `catch` → `releaseAll` → プロセス・マシン・
+     * サーバー全体の `releaseBytes`）と例外の作り直し、作り終えた後に `rt.instances` へつなぐまで（`attach`、ロックの区間、`ArrayList` の伸長）が続く。
+     * 返す側では確かめられない（投げると返すこと自体が飛ばされる）ので、入口でまとめて払う。`createMemory`・`createTable` の確保は
+     * 自分の [MEMORY_ACCOUNT_FRAMES] で確かめ、start 関数の中で尽きたときはこの深さの `catch` まで戻るので、その分は含めない。
+     * 呼ぶたびに CPU・許可を返して取り直す口ではないが、モジュールからインスタンスを作る（µs〜ms）口なので、
+     * [FUEL_YIELD_FRAMES] と同じ段数（約 0.9 µs）を払う。今は本番の呼び出し元がない（テストだけ）ので、将来の呼び出し元のための守り
+     */
+    const val INSTANTIATE_FRAMES: Int = 128
+
+    /**
      * fd の表で最後の参照が外れたファイルを閉じる知らせ（`Vfs.drainDeferred` → `DiskFileSystem.release`・`retire`）を、列から取り出す前に
      * 確かめる段数（#858）。取り出した後に [HOST_IO_FRAMES] の確かめで投げると、取り出した知らせが捨てられ、ホストのファイルと開いたままの枠が
      * 返らない。取り出してから `release` の確かめまでの数段の分を、[HOST_IO_FRAMES] に足す
      */
     const val DEFERRED_RELEASE_FRAMES: Int = HOST_IO_FRAMES + 16
+
+    /**
+     * 開いたことを知らせるファイルシステム（ディスク）のファイルを `Vfs.open` で開くとき、何も変える前に確かめる段数（#901）。
+     * `Vfs.close` で閉じる開いたファイル（fd の表に入れていないもの）の呼び手は、どれも `open` と同じ深さから `close` を呼び、
+     * 投げた後に呼び直さない（`Machine.readExecutable`・`WasiP1Path` の `path_open`・`WasiP2Fs` の `open-at`）。`open` が通った深さでは、
+     * 続く `close` → `checkUnlocked` → `DiskFileSystem.release` の入口の確かめ（[HOST_IO_FRAMES]）が通るよう、その数段の分を足す
+     * （返す側の `close` では確かめない。確かめで投げると、閉じること自体が飛ばされる。ADR 0043）。開くのは µs〜ms のホストの I/O なので、
+     * 約 1 µs を足すだけ。`/tmp` やディレクトリ（数えないもの）は払わない
+     */
+    const val VFS_OPEN_FRAMES: Int = HOST_IO_FRAMES + 16
 
     /**
      * [frames] 段分のスタックが残っているか（[ensure] が通るか）。投げずに `false` を返す。

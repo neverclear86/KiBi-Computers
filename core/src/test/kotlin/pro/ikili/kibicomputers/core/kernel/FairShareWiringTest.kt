@@ -5,10 +5,15 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.config.ConfigEntry
+import pro.ikili.kibicomputers.core.config.ConfigSource
+import pro.ikili.kibicomputers.core.config.ConfigValues
+import pro.ikili.kibicomputers.core.config.KiBiConfig
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProgramLoadBusyException
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
+import pro.ikili.kibicomputers.core.persist.ModuleStore
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import java.time.Duration
@@ -159,6 +164,36 @@ class FairShareWiringTest {
                 }
                 eventually(10_000, "上限 $limit: 仕事が全部動かない") { ran.get() == 4 }
                 h.scheduler.assertPermitsSettled(4)
+            }
+        }
+    }
+
+    @Test
+    fun `持ち主の組を使わない組み立てでは、持ち主なしの台の読み込みは組の上限で断らない`() = timeout {
+        // #897: 1.20.1 は全台が NONE の1組。組ごとの項目が 3 でも、残るのは1台ごとの上限（8）だけ
+        val map = mapOf<ConfigEntry<*>, Any>(
+            KiBiConfig.MAX_CONCURRENT_MACHINES to 2,
+            KiBiConfig.MAX_PENDING_LOADS_PER_OWNER to 3,
+        )
+        val values = ConfigValues.resolve(ConfigSource { map[it] })
+        for ((ownerGroups, accepted) in listOf(false to 20, true to 3)) {
+            Harness(KiBiConfig.schedulerConfig(values, ModuleStore.NONE, ownerGroups)).use { h ->
+                val programs = h.scheduler.programs
+                val gate = CountDownLatch(1)
+                try {
+                    // 台ごとの上限（8）に当たらないように、台を分けて頼む
+                    val futures: List<CompletableFuture<*>> = (0 until 20).map { i ->
+                        programs.load(i.toLong(), FairShareGroup.NONE, true, "none-$i".toByteArray(), true, emptySet()) {
+                            gate.await()
+                            throw WasmLoadException("held")
+                        }
+                    }
+                    val busy = futures.count { f -> f.isCompletedExceptionally && runCatching { f.get() }.exceptionOrNull()?.cause is ProgramLoadBusyException }
+                    assertEquals(20 - accepted, busy, "ownerGroups=$ownerGroups")
+                } finally {
+                    gate.countDown()
+                }
+                eventually(10_000, "ownerGroups=$ownerGroups: 読み込みが終わらない") { programs.pendingGroupCount == 0 }
             }
         }
     }
