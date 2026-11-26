@@ -1,4 +1,5 @@
-// issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）の検査。
+// issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）、マージの段階の Gradle の起動の失敗のやり直し（#958）、
+// マージの段階の push の後の CI の、不安定なテストの回し直し（#961）、結果を返さなかった段階の呼び直しと記録（#953）の検査。
 // 偽の agent でスクリプト全体を流し、どの段階が何回呼ばれたか、最後の結果がどうなるかを見る。
 // 実行: node --test .claude/workflow-tests/
 import { test } from 'node:test'
@@ -39,12 +40,15 @@ async function run(overrides = {}, args = { issues: [904] }) {
     verify: () => ({ confirmed: [], notes: '' }),
     merge: () => MERGED,
     cleanup: () => ({ removed: true, note: '' }),
+    // 報告と質問の投稿は文を返す（null なら 1 回だけ呼び直すので、既定で何か返す。#953）
+    report: () => 'ok',
+    ask: () => 'ok',
     'cross-check': prompt => ({ premiseSound: true, needsHuman: true, findings: prompt, question: 'q', guidance: null }),
   }
   const agent = async (prompt, opts) => {
     const kind = opts.label.split(':')[0].replace(/~\d+$/, '')
     calls.push(kind)
-    prompts.push({ kind, prompt })
+    prompts.push({ kind, prompt, opts })
     const q = queues[kind]
     const next = q && q.length ? q.shift() : (defaults[kind] ?? (() => undefined))(prompt)
     return typeof next === 'function' ? next() : next
@@ -54,7 +58,8 @@ async function run(overrides = {}, args = { issues: [904] }) {
   const result = await fn(args, agent, parallel, m => logs.push(m), () => {})
   const count = k => calls.filter(c => c === k).length
   const promptOf = k => prompts.find(p => p.kind === k)?.prompt
-  return { result, calls, logs, count, promptOf, issue: result.results[0] }
+  const schemaOf = k => prompts.find(p => p.kind === k)?.opts.schema
+  return { result, calls, logs, count, promptOf, schemaOf, issue: result.results[0] }
 }
 
 test('既定の流れはマージまで進み、やり直しは呼ばれない', async () => {
@@ -463,4 +468,348 @@ test('過負荷の回し直しが未完了で、merge-retry-wait でマージで
 test('待つやり直しを通らなかったやり直しの回は、理由に待つやり直しを書かない', async () => {
   const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [MERGED] })
   assert.doesNotMatch(r.issue.mergeReason, /それも 1 回だけやり直した/)
+})
+
+// ---- マージの段階の push の後の CI の、不安定なテストの回し直し（#961） ----
+
+const CI_FAIL = fail('ci', '先頭のコミットの CI が落ちた（sendableButUnsentChunkIsNotWatched）')
+const FLAKY = { outcome: 'rerun', runId: '123', headSha: 'abc', issue: 934, summary: '#934 に記録して回し直した', gradleStillRunning: false, runningLogs: [] }
+const NOT_FLAKY = { ...FLAKY, outcome: 'not_flaky', runId: null, issue: null, summary: 'PR の変更が原因' }
+
+test('push の後の CI が不安定なテストで落ちたら、merge-flaky で回し直し、merge-rerun でマージまで進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 1)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.equal(r.count('merge-flaky-wait'), 0)
+  assert.match(r.issue.mergeReason, /不安定なテスト（#934）/)
+  assert.match(r.issue.mergeReason, /run 123/)
+  assert.equal(r.count('cross-check'), 0)
+})
+
+test('回し直しのあとも CI が落ちたら、もう回し直さずに止まって人に上がる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('ci', '2 回目も落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.ok(r.issue.question)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /回し直しのあとの理由: 2 回目も落ちた/)
+  assert.equal(r.count('cross-check'), 1)
+  assert.equal(r.count('ask'), 1)
+})
+
+for (const [name, f] of [['not_flaky', NOT_FLAKY], ['結果なし', null]]) {
+  test(`確かめが ${name} なら、merge-rerun を呼ばずに止まる`, async () => {
+    const r = await run({ merge: [CI_FAIL], 'merge-flaky': [f] })
+    assert.notEqual(r.issue.status, 'merged')
+    assert.equal(r.count('merge-flaky'), 1)
+    assert.equal(r.count('merge-rerun'), 0)
+    assert.match(r.issue.mergeReason, /回し直していない/)
+  })
+}
+
+test('CI がまだ終わっていなかった（pending）なら、merge-rerun で待ち直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, outcome: 'pending', issue: null }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /まだ終わっていなかった/)
+  assert.doesNotMatch(r.promptOf('merge-rerun'), /不安定なテスト（Issue/)
+})
+
+const FLAKY_PENDING = { ...FLAKY, outcome: 'pending', issue: null }
+
+test('待ったあと（pending → merge-rerun）に CI が不安定なテストで落ちたら、確かめ直して回し直し、もう 1 回呼び直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY], 'merge-rerun': [fail('ci', '待ったあとに落ちた'), MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 2)
+  assert.match(r.issue.mergeReason, /不安定なテスト（#934）/)
+})
+
+test('待ったあとの確かめが not_flaky なら、回し直さずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, NOT_FLAKY], 'merge-rerun': [fail('ci', '待ったあとに落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('待ったあとの確かめがまた pending なら、もう待たずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY_PENDING], 'merge-rerun': [fail('ci', '待ったあとに落ちた')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('待ったあとに 2 回目の回し直しまで落ちたら、それ以上は確かめない', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING, FLAKY, FLAKY], 'merge-rerun': [fail('ci', 'a'), fail('ci', 'b')] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 2)
+  assert.equal(r.count('merge-rerun'), 2)
+})
+
+for (const [name, m] of [
+  ['build', fail('build', ':core:test が落ちた')],
+  ['conflict', fail('conflict', '字面で解けない')],
+  ['merge', fail('merge', 'base branch policy')],
+  ['過負荷でない gametest', fail('gametest', '1 required tests failed', { gameTestFailedOnly: true })],
+]) {
+  test(`failedStep=${name} なら merge-flaky を呼ばない`, async () => {
+    const r = await run({ merge: [m] })
+    assert.equal(r.count('merge-flaky'), 0)
+    assert.notEqual(r.issue.status, 'merged')
+  })
+}
+
+test('確かめが rerun で gradleStillRunning=true なら、merge-flaky-wait はせず、merge-rerun の指示に孤児の待ちが入る', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, ...PENDING }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky-wait'), 0)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.promptOf('merge-rerun'), /確かめの段階が残した Gradle を待つ/)
+  assert.match(r.promptOf('merge-rerun'), /Win32_Process/)
+})
+
+test('確かめが not_flaky で gradleStillRunning=true なら、merge-flaky-wait で待ってやり直す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...NOT_FLAKY, ...PENDING }], 'merge-flaky-wait': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.count('merge-flaky-wait'), 1)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('確かめが 2 回とも Gradle を待たずに返したら、回し直さずに止まる', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...NOT_FLAKY, ...PENDING }], 'merge-flaky-wait': [{ ...NOT_FLAKY, ...PENDING }] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun'), 0)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('過負荷の回し直しのあとで CI が落ちたら、不安定なテストの回し直しに進み、理由に両方が残る', async () => {
+  const r = await run({ merge: [fail('gametest', 'x', OVERLOAD)], 'merge-retry': [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-retry'), 1)
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+  assert.match(r.issue.mergeReason, /過負荷/)
+  assert.match(r.issue.mergeReason, /不安定なテスト/)
+})
+
+test('起動の失敗のやり直しのあとで CI が落ちたら、不安定なテストの回し直しに進む', async () => {
+  const r = await run({ merge: [fail('build', 'x', STARTUP)], 'merge-restart': [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-restart'), 1)
+  assert.equal(r.count('merge-rerun'), 1)
+})
+
+test('merge-rerun が Gradle を待たずに返したら、merge-rerun-wait で進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('build', 'y', PENDING)], 'merge-rerun-wait': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('merge-rerun-wait'), 1)
+  assert.match(r.issue.mergeReason, /回し直しのあとのマージの段階が Gradle の終わりを待たずに返したので、それも 1 回だけやり直した/)
+})
+
+test('merge-rerun が 2 回とも Gradle を待たずに返したら止まり、もう確かめに回さない', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [fail('ci', 'y', PENDING)], 'merge-rerun-wait': [fail('ci', 'z', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 1)
+  assert.match(r.issue.mergeReason, /2 回返した/)
+})
+
+test('merge-rerun の中の起動の失敗や過負荷は、もう回し直さない', async () => {
+  for (const m of [fail('build', 'x', STARTUP), fail('gametest', 'x', OVERLOAD)]) {
+    const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [m] })
+    assert.notEqual(r.issue.status, 'merged')
+    assert.equal(r.count('merge-restart'), 0)
+    assert.equal(r.count('merge-retry'), 0)
+  }
+})
+
+test('マージの段階が failedStep=ci のまま 2 回 Gradle を待たずに返したら、確かめに回さない', async () => {
+  const r = await run({ merge: [fail('ci', 'a', PENDING)], 'merge-wait': [fail('ci', 'b', PENDING)] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge-flaky'), 0)
+})
+
+test('プロンプト: 確かめは CI の直しと同じ条件の文を使ってコードを直さず、merge-rerun は自分で回し直さず手順 2 を飛ばせる', async () => {
+  const r = await run({ ci: [FAILED_CI, OK_CI], 'ci-fix': [{ pushed: false, rerun: true, summary: 'flaky' }], merge: [CI_FAIL], 'merge-flaky': [FLAKY], 'merge-rerun': [MERGED] })
+  const flaky = r.promptOf('merge-flaky')
+  const ciFix = r.promptOf('ci-fix')
+  const criteria = 'PR が触っていない所のテストで、手元で繰り返しても再現しない、main でも同じテストが落ちたことがある'
+  assert.ok(flaky.includes(criteria))
+  assert.ok(ciFix.includes(criteria))
+  for (const p of [flaky, ciFix]) {
+    assert.match(p, /gh run rerun <run-id> --failed/)
+    assert.match(p, /test-reports-attempt-<n>/)
+    assert.match(p, /サブ Issue/)
+  }
+  assert.match(flaky, /コードは直さず、コミットも push もしない/)
+  assert.match(r.promptOf('merge'), /CI は自分で回し直さない/)
+  assert.match(flaky, /merge-flaky-build-\$n/)
+  assert.match(flaky, /headRefOid/)
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /merge-rerun-build-\$n/)
+  assert.match(rerun, /自分では `gh run rerun` しない/)
+  assert.match(rerun, /abc のままなら、手順 2（build と GameTest）は飛ばしてよい/)
+  assert.doesNotMatch(rerun, /確かめの段階が残した Gradle を待つ/)
+})
+
+test('プロンプト: 確かめが headSha=null を返したら、merge-rerun は手順 2 を飛ばさずに全部回す', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, headSha: null }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /手順 2（build と GameTest）は、手順どおり全部回す/)
+  assert.doesNotMatch(rerun, /は飛ばしてよい/)
+})
+
+test('プロンプト: 確かめが pending なら、merge-rerun は「回し直してはいない」と書き、先頭のコミットが同じときだけ手順 2 を飛ばす', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [FLAKY_PENDING], 'merge-rerun': [MERGED] })
+  const rerun = r.promptOf('merge-rerun')
+  assert.match(rerun, /CI がまだ終わっていなかったと判断した（run 123。回し直してはいない）/)
+  assert.doesNotMatch(rerun, /落ちたジョブを回し直した/)
+  assert.match(rerun, /先頭のコミット（`git rev-parse HEAD`）が abc のままなら、手順 2（build と GameTest）は飛ばしてよい/)
+  assert.match(rerun, /先頭のコミットが変わった（main を取り込んだ）なら、手順 2 から全部回す/)
+})
+
+test('確かめが runId を数値で返しても、そのまま merge-rerun に進む', async () => {
+  const r = await run({ merge: [CI_FAIL], 'merge-flaky': [{ ...FLAKY, runId: 123456 }], 'merge-rerun': [MERGED] })
+  assert.equal(r.issue.status, 'merged')
+  assert.match(r.promptOf('merge-rerun'), /run 123456 の落ちたジョブを回し直した/)
+})
+
+// ---- 結果を返さなかった段階（#953） ----
+
+test('CI 待ちが 1 回結果を返さなければ、1 回だけ呼び直して進み、stalled に回復として載る', async () => {
+  const r = await run({ ci: [null, OK_CI] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('ci'), 2)
+  assert.equal(r.result.stalled.length, 1)
+  assert.deepEqual(
+    { stage: r.result.stalled[0].stage, issue: r.result.stalled[0].issue, retried: r.result.stalled[0].retried, recovered: r.result.stalled[0].recovered },
+    { stage: 'ci', issue: 904, retried: true, recovered: true },
+  )
+  assert.equal(r.issue.stalledStages.length, 1)
+  assert.match(r.promptOf('report'), /結果を返さなかった段階.*ci:#904/)
+})
+
+test('CI 待ちが 2 回とも結果を返さなければ、ci-fix にもマージにも進まず人に上がり、stalled に未回復として載る', async () => {
+  const r = await run({ ci: [null, null] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('ci'), 2)
+  assert.equal(r.count('ci-fix'), 0)
+  assert.equal(r.count('merge'), 0)
+  assert.equal(r.count('ask'), 1)
+  assert.match(r.issue.question, /結果を返さなかった/)
+  assert.equal(r.result.stalled.length, 1)
+  assert.equal(r.result.stalled[0].retried, true)
+  assert.equal(r.result.stalled[0].recovered, false)
+})
+
+// #887（PR #948）の CI 待ちが返そうとした形。noChecks が failureLog の文字列に紛れ込んで欠けていた
+const PR948_CI = { mergeable: 'MERGEABLE', passed: false, failingChecks: [], failureLog: 'まだ終わっていない（state IN_PROGRESS, bucket pending）。接続エラーで途中終了を繰り返し</failureLog>\n<parameter name="noChecks">false' }
+
+test('必須でない欄を欠いた CI の結果でも例外にならず、待ち直して進む', async () => {
+  const r = await run({ ci: [PR948_CI, { passed: true, mergeable: 'MERGEABLE' }] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('ci'), 2)
+  assert.equal(r.count('ci-fix'), 0)
+})
+
+test('CI 待ちが 3 回とも未完了（unfinished）で返ったら、ci-fix に回さず人に上がる', async () => {
+  const u = { passed: false, mergeable: 'MERGEABLE', unfinished: true }
+  const r = await run({ ci: [u, u, u] })
+  assert.equal(r.issue.status, 'needs_human')
+  assert.equal(r.count('ci'), 3)
+  assert.equal(r.count('ci-fix'), 0)
+  assert.match(r.issue.question, /CI が終わらなかった/)
+})
+
+test('unfinished=true でも落ちたチェックの名前があれば、待ち直さず ci-fix に回り、名前が残る', async () => {
+  const u = { passed: false, mergeable: 'MERGEABLE', unfinished: true, failingChecks: ['build', 'gametest (in_progress)'], runId: 456, attempt: 2, failureLog: 'boom' }
+  const r = await run({ ci: [u, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
+  assert.equal(r.count('ci-fix'), 1)
+  assert.match(r.promptOf('ci-fix'), /build/)
+  assert.doesNotMatch(r.promptOf('ci-fix'), /CI が終わらなかった|gametest \(in_progress\)/)
+  assert.match(r.promptOf('ci-fix'), /run 456（試行 2）/)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('unfinished=true で終わっていないチェックの名前だけなら、今までどおり待ち直す', async () => {
+  const u = { passed: false, mergeable: 'MERGEABLE', unfinished: true, failingChecks: ['build (pending)'] }
+  const r = await run({ ci: [u, u, u] })
+  assert.equal(r.count('ci'), 3)
+  assert.equal(r.count('ci-fix'), 0)
+  assert.match(r.issue.question, /CI が終わらなかった/)
+})
+
+test('落ちたチェックの名前がない結果が 3 回続いても、ci-fix に回さない', async () => {
+  const r = await run({ ci: [PR948_CI, PR948_CI, PR948_CI] })
+  assert.equal(r.count('ci-fix'), 0)
+  assert.equal(r.issue.status, 'needs_human')
+})
+
+test('未完了のあとに本物の失敗が返れば、今までどおり ci-fix に回る', async () => {
+  const failed = { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], runId: 123, attempt: 1, failureLog: 'boom' }
+  const r = await run({ ci: [{ passed: false, mergeable: 'MERGEABLE', unfinished: true }, failed, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
+  assert.equal(r.count('ci-fix'), 1)
+  assert.match(r.promptOf('ci-fix'), /run 123（試行 1）/)
+  assert.equal(r.issue.status, 'merged')
+})
+
+test('報告の投稿が 1 回結果を返さなければ、重複を避ける指示を付けて 1 回だけ呼び直す', async () => {
+  const r = await run({ report: [null, 'ok'] })
+  assert.equal(r.issue.status, 'merged')
+  assert.equal(r.count('report'), 2)
+  assert.equal(r.result.stalled[0].stage, 'report')
+  assert.equal(r.result.stalled[0].recovered, true)
+})
+
+test('質問の投稿が 1 回結果を返さなければ、1 回だけ呼び直す', async () => {
+  const r = await run({ ci: [null, null], ask: [null, 'ok'] })
+  assert.equal(r.count('ask'), 2)
+  assert.ok(r.result.stalled.some(x => x.stage === 'ask' && x.retried && x.recovered))
+})
+
+test('Gradle を動かす段階（マージ）が結果を返さなくても呼び直さず、stalled に呼び直していないとして載る', async () => {
+  const r = await run({ merge: [null] })
+  assert.notEqual(r.issue.status, 'merged')
+  assert.equal(r.count('merge'), 1)
+  const s = r.result.stalled.find(x => x.stage === 'merge')
+  assert.ok(s)
+  assert.equal(s.retried, false)
+  assert.equal(s.pr, PR)
+  assert.equal(s.issue, 904)
+})
+
+test('プロンプト: CI 待ちとマージの段階に、待ちの上限と接続の失敗の扱いが入る', async () => {
+  const r = await run()
+  for (const k of ['ci', 'merge']) {
+    assert.match(r.promptOf(k), /date \+%s/)
+    assert.match(r.promptOf(k), /最大 60 分/)
+    assert.match(r.promptOf(k), /続けて 5 回/)
+  }
+  assert.match(r.promptOf('ci'), /unfinished=true/)
+})
+
+test('プロンプト: 待ちの上限は CI を待ち始めた時点から測り、段階の開始からではない（マージの段階の build・GameTest は数えない）', async () => {
+  const r = await run()
+  for (const k of ['ci', 'merge']) {
+    assert.match(r.promptOf(k), /CI を待ち始める時点/)
+    assert.match(r.promptOf(k), /段階の開始からではない/)
+    assert.match(r.promptOf(k), /GameTest のロックの待ちなど、CI を待つ前の作業の時間は数えない/)
+    assert.doesNotMatch(r.promptOf(k), /この段階を始めたら、最初に/)
+  }
+})
+
+test('CI 待ちのスキーマ: runId・attempt は数でも文字列でも null でも受ける（必須は passed と mergeable だけ）', async () => {
+  const r = await run()
+  const schema = r.schemaOf('ci')
+  assert.deepEqual(schema.required, ['passed', 'mergeable'])
+  for (const k of ['runId', 'attempt']) {
+    for (const t of ['integer', 'string', 'null']) assert.ok(schema.properties[k].type.includes(t), `${k} は ${t} を受ける`)
+  }
+})
+
+test('runId・attempt を文字列で返した CI 待ちの結果も、失敗の抜粋に run の ID と試行が入る', async () => {
+  const failed = { passed: false, mergeable: 'MERGEABLE', failingChecks: ['build'], runId: '123', attempt: '2', failureLog: 'boom' }
+  const r = await run({ ci: [failed, OK_CI], 'ci-fix': [{ pushed: true, rerun: false, summary: 'fixed', gradleStillRunning: false, runningLogs: [] }] })
+  assert.match(r.promptOf('ci-fix'), /run 123（試行 2）/)
 })
