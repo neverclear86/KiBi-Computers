@@ -29,7 +29,8 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
  * 待機点型の `fuel-spin-wasi`（`leaf`。葉の関数の中のループで計算し続ける）を 1 台に 2 本置き（前借りは譲る相手がいるときだけ起きる）、
  * 燃料切れの処理を数える包みに替えて（プロセスを作った直後、最初の step の前に `ProcessRuntime.fuelHandler` を替える。本番の道には何も足さない）、
  * 次を出す:
- * - 前借りの回数（スケジューラの数え口）と、前借りの間（処理が負の残りを返した）の呼び出しの回数・時間
+ * - 前借りの回数・その場で足した回数・譲った回数・スレッドを持って待った回数（スケジューラの数え口。#887）と、tick の数と実時間
+ * - 前借りの間（処理が負の残りを返した）の呼び出しの回数・時間
  * - 入口の確かめ 1 回（`ensure(32)`）の時間（同じ JVM で別に測る）
  */
 @EnabledIfSystemProperty(named = "kibi.overdraftBenchmark", matches = "true")
@@ -106,6 +107,8 @@ class OverdraftCostBenchmarkTest {
             }
             val overdrafts0 = h.scheduler.fuelOverdrafts.get()
             val blocking0 = h.scheduler.fuelBlockingWaits.get()
+            val renewals0 = h.scheduler.fuelSliceRenewals.get()
+            val yields0 = h.scheduler.fuelYields.get()
             var ticks = 0L
             val t0 = System.nanoTime()
             eventually(600_000, "終わらない") {
@@ -117,6 +120,8 @@ class OverdraftCostBenchmarkTest {
             for ((m, pid) in pids) assertEquals(ProcessState.EXITED, m.stateOf(pid), "${m.rt(pid).lastError}")
             val overdrafts = h.scheduler.fuelOverdrafts.get() - overdrafts0
             val blocking = h.scheduler.fuelBlockingWaits.get() - blocking0
+            val renewals = h.scheduler.fuelSliceRenewals.get() - renewals0
+            val yields = h.scheduler.fuelYields.get() - yields0
             val calls = counters.sumOf { it.calls }
             val overdraftCalls = counters.sumOf { it.overdraftCalls }
             val overdraftNanos = counters.sumOf { it.overdraftNanos }
@@ -131,6 +136,7 @@ class OverdraftCostBenchmarkTest {
                   ${Runtime.getRuntime().availableProcessors()} スレッド、$machines 台 x 2 本、leaf $rounds x $inner、fuelPerTick 400000、fuelSlice 40000）
                   tick: $ticks 回、実時間 ${wall / 1_000_000} ms
                   前借り: $overdrafts 回、上限に届いてスレッドを持って待った: $blocking 回
+                  その場で足した: $renewals 回、燃料が残っているのに譲った: $yields 回
                   燃料切れの処理の呼び出し: $calls 回（うち前借りの間 $overdraftCalls 回、1 回の前借りあたり ${"%.0f".format(perOverdraft)} 回）
                   前借りの間の 1 回: ${"%.3f".format(perCall / 1000)} µs（計時の nanoTime 2 回を含む）、1 回の前借りあたり ${"%.1f".format(perOverdraft * perCall / 1000)} µs
                   前借りの間の合計: ${overdraftNanos / 1_000_000} ms、それ以外の呼び出し（譲る・待つ道を含む）: ${otherNanos / 1_000_000} ms

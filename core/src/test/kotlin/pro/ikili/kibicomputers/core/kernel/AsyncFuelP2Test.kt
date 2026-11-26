@@ -13,6 +13,7 @@ import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
 import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_LIMIT
+import pro.ikili.kibicomputers.core.kernel.process.FUEL_OVERDRAFT_RECHECK
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.KillSignal
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -22,6 +23,8 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.persist.CapturePolicy
+import pro.ikili.kibicomputers.core.runtime.WasmFuelHandler
+import pro.ikili.kibicomputers.core.runtime.WasmInstance
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.fuel.FuelCosts
@@ -461,6 +464,59 @@ class AsyncFuelP2Test {
             assertTrue(h.scheduler.fuelBlockingWaits.get() > blocking0)
             assertEquals(overdrafts0, h.scheduler.fuelOverdrafts.get(), "ホストの関数が呼んだゲストの中で前借りした")
             assertEquals(0, h.scheduler.blockingProcesses, "ブロッキング型の枠を使っている")
+        }
+    }
+
+    /**
+     * 止まりうる関数が、ホストの関数の中からのゲストの呼び出し（`guestCallDepth > 0`）で燃料切れの確かめ（`kibi.async_fuel`）に当たると、
+     * 巻き戻せないので `onFuelExhausted`（スレッドを持って待つ）に落ちる。前借りの印・速い道の控えが残っていると、戻った後の止まりうる関数でない
+     * 関数の燃料切れが、古い控えで速い道を通る（#887）ので、待った後の手持ちを渡すときに印と控えを消す。
+     * 呼ぶ前に印と控えを置いて（前借りの最中に入口が来た形）、戻ったときに消えていることを確かめる
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource("realloc", "post-return")
+    fun `ホストの関数が呼んだゲストの中の止まりうる関数の燃料切れは、前借りの印と速い道の控えを残さない`(place: String) = timeout(limit) {
+        Harness(execRuntime = EndiveRuntime()).use { h ->
+            val m = h.machine(fuelPerTick = 5_000)
+            val bytes = if (place == "realloc") {
+                guestCallSpin(reallocSpin = 20_000, postSpin = 0, mayBlock = true)
+            } else {
+                guestCallSpin(reallocSpin = 0, postSpin = 40_000, mayBlock = true)
+            }
+            val s = Spin(h, m, emptyList(), bytes)
+            val rt = s.rt
+            class Stale(private val inner: WasmFuelHandler) : WasmFuelHandler {
+                @Volatile var calls = 0
+
+                @Volatile var left = 0
+
+                override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long = inner.onFuelExhausted(instance, remaining)
+
+                override fun onFuelExhaustedUnwindable(instance: WasmInstance, remaining: Long): Long {
+                    val inGuestCall = rt.guestCallDepth > 0
+                    if (inGuestCall) {
+                        rt.fuelOverdraft = true
+                        rt.fuelOverdraftInstance = instance
+                        rt.fuelOverdraftRecheckAt = -FUEL_OVERDRAFT_RECHECK
+                    }
+                    val out = inner.onFuelExhaustedUnwindable(instance, remaining)
+                    if (inGuestCall) {
+                        calls++
+                        if (rt.fuelOverdraft || rt.fuelOverdraftInstance != null) left++
+                    }
+                    return out
+                }
+            }
+            val stale = Stale(rt.fuelHandler)
+            rt.fuelHandler = stale
+            eventually(60_000, "終わらない") {
+                h.scheduler.tick()
+                Thread.sleep(2)
+                m.stateOf(s.pid).isTerminal
+            }
+            assertEquals(ProcessState.EXITED, m.stateOf(s.pid), "${rt.lastError}")
+            assertTrue(stale.calls > 0, "$place の中の止まりうる関数の燃料切れを通っていない")
+            assertEquals(0, stale.left, "$place の中の燃料切れの後も、前借りの印か速い道の控えが残っている")
         }
     }
 

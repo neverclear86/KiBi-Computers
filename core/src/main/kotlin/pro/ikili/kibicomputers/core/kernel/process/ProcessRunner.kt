@@ -83,9 +83,14 @@ internal class ProcessRunner(private val machine: Machine) {
     fun initRuntime(rt: ProcessRuntime) {
         rt.fuelHandler = object : WasmFuelHandler {
             // ゲストのどの深さからでも呼ばれ、カーネルロックを取るので、先にスタックの余裕を確かめる（#828）。
-            // CPU・許可を返して取り直す道は、その手前（[onFuelExhausted]）でもっと大きく確かめる。前借り（#477）の間は、
-            // 残りが負の間じゅう関数の入口・loop の先頭ごとに呼ばれるので、この入口は軽く（ロックの区間の分だけ）する
+            // CPU・許可を返して取り直す道は、その手前（[onFuelExhausted]）でもっと大きく確かめる。
+            // 前借り（#477）の間は、残りが負の間じゅう関数の入口・loop の先頭ごとに呼ばれる（1 回の前借りで約 1,000 回）ので、
+            // 前借りを続けてよいと分かっている間は、スタックの確かめもカーネルロックも通らずに負の残りを返す（速い道。#887）。
+            // 速い道は、条件の関数（[ProcessRuntime.canSkipOverdraftCheck]）を 1 段呼ぶだけ。その関数は、プロセスのスレッドの欄と
+            // volatile の killed を読むだけで、ロックにも共有の状態にも触らず、何も書き換えない（JIT がインライン化する前は、
+            // ここで 1 段フレームが増える。そこで StackOverflowError が出ても、何も変えていないので壊れるものがない）
             override fun onFuelExhausted(instance: WasmInstance, remaining: Long): Long {
+                if (rt.canSkipOverdraftCheck(instance, remaining)) return remaining
                 StackHeadroom.ensure(StackHeadroom.FUEL_HANDLER_FRAMES)
                 return onFuelExhaustedPlain(rt, instance, remaining)
             }
@@ -669,7 +674,9 @@ internal class ProcessRunner(private val machine: Machine) {
     private fun yieldingLocked(remaining: Long): Boolean =
         !scheduler.isPausedFor(machine) && machine.fuelAccount.afterGiveBack(now, remaining) > 0
 
-    private fun setHolderFuelLocked(rt: ProcessRuntime, grant: Long) {
+    internal fun setHolderFuelLocked(rt: ProcessRuntime, grant: Long) {
+        // 新しい手持ちを渡した: 前借りは終わっている（前借りの速い道の控えを残さない。#887）
+        rt.fuelOverdraft = false
         if (rt.process.unmetered) return
         val holder = rt.currentHolder ?: throw IllegalStateException("手持ちを持つインスタンスがない")
         holder.fuel = grant
@@ -684,7 +691,11 @@ internal class ProcessRunner(private val machine: Machine) {
      * 前借りが [FUEL_OVERDRAFT_LIMIT] に届いたら（止まりうる関数に戻らずに計算し続けている）、前と同じくスレッドを持ったまま待つ。
      * コンポーネント（#803）では、ゲストからゲストへの呼び出しの下の callee の中でも前借りする（callee から戻れば、外からの call の
      * 1 段目の止まりうる関数で巻き戻せる）。
-     * 前借りした分は残り（負）として書き戻すので、マシンの燃料の借りになり、後の補充で返す
+     * 前借りした分は残り（負）として書き戻すので、マシンの燃料の借りになり、後の補充で返す。
+     *
+     * 前借りを続けると決めたら、確かめたインスタンスと、次にここ（遅い道）を通る残り（[FUEL_OVERDRAFT_RECHECK] 先。上限は越えない）を控える。
+     * それまでの呼び出しは、入口の速い道（[initRuntime]）がロックを取らずに負の残りを返す（#887）。kill・作っている途中・
+     * ホストの関数の中からのゲストの呼び出し（[unwindableLocked] の中身）・別のインスタンスからの呼び出しは、速い道が見分けてここへ回す
      */
     private fun onFuelExhaustedPlain(rt: ProcessRuntime, instance: WasmInstance, remaining: Long): Long {
         if (remaining > -FUEL_OVERDRAFT_LIMIT && rt.program.fuelYield) {
@@ -704,6 +715,10 @@ internal class ProcessRunner(private val machine: Machine) {
                     rt.fuelOverdraft = true
                     scheduler.fuelOverdrafts.incrementAndGet()
                 }
+                // 速い道の控え（プロセスのスレッドの欄なので、ロックの外でよい）。次に遅い道を通るのは、FUEL_OVERDRAFT_RECHECK 先か上限
+                rt.fuelOverdraftInstance = instance
+                rt.fuelOverdraftRecheckAt = maxOf(remaining - FUEL_OVERDRAFT_RECHECK, -FUEL_OVERDRAFT_LIMIT)
+                rt.fuelOverdraftSlowChecks++
                 return remaining
             }
         }
@@ -725,6 +740,9 @@ internal class ProcessRunner(private val machine: Machine) {
         val previous = lock.withLockValue {
             verifyInstanceLocked(rt, instance)
             if (rt.killed) throw ProcessKilledException()
+            // 前借りの途中でここに落ちてくる道もある（止まりうる関数の入口の kibi.async_fuel が、ホストの関数の中からのゲストの呼び出しで
+            // 巻き戻せないとき）。待った後は正の手持ちを返すので、前借りは終わりにする（古い控えで速い道を通らないため。#887）
+            rt.fuelOverdraft = false
             renewSliceLocked(rt, remaining)?.let { return it }
             // 譲る・待つ道（CPU・許可を返して取り直す。深い）に入る前に、状態を何も変えないうちに確かめる（#828）。
             // ここまでの入口の確かめで、このロックの区間を放すだけの余裕はあるので、尽きたらロックを放して StackOverflowError が上がる
@@ -2111,3 +2129,12 @@ internal const val CORE_INSTANCE_OVERHEAD_BYTES: Long = 4096
  * 届いたら、スレッドを持ったまま燃料を待つ。前借りの間は燃料を確かめるたびにホスト関数を呼ぶので、大きくしすぎない
  */
 internal const val FUEL_OVERDRAFT_LIMIT: Long = 50_000
+
+/**
+ * 前借りの間（#477）、燃料切れの処理が遅い道（スタックの確かめ・カーネルロックの中の確かめ・その場で足すのを試す）を通る間隔（燃料。#887）。
+ * その間の呼び出しは、入口の速い道がロックを取らずに負の残りを返す。前借りの始まりではいつも遅い道を通る（ADR 0047 の「前借りより、
+ * その場で足すのを先に試す」はそのまま）。間隔は、前借りの途中で譲る相手がいなくなったときに、その場で足すまでの遅れ（借りの増え方）の上限になる。
+ * [FUEL_OVERDRAFT_LIMIT] の 1/8 なので、1 回の前借りで、前借りを続けると決める遅い道は最大 8 回（[ProcessRuntime.fuelOverdraftSlowChecks] が数えるのはこれ）。
+ * その後に上限に届いてスレッドを持って待つ回を入れると、遅い道に入るのは最大 9 回。バランスの値でないので、コンフィグにしない
+ */
+internal const val FUEL_OVERDRAFT_RECHECK: Long = FUEL_OVERDRAFT_LIMIT / 8
