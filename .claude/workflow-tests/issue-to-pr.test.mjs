@@ -748,3 +748,19 @@ test('孤児のログを採った文と一緒でも、別の一文が未完了�
   assert.equal(r.count('merge-wait'), 1)
   assert.equal(r.issue.status, 'merged')
 })
+
+test('孤児のログを採った句と、別のログの未完了が同じ一文に入っていても、待つやり直しに入る（#962）', async () => {
+  const mixed = '孤児のログ merge-build-3 を採ったが（BUILD SUCCESSFUL）、merge-build-4 は .exit がなく終了コードを読めていない'
+  const r = await run({ merge: [fail('build', mixed)], 'merge-wait': [MERGED] })
+  assert.equal(r.count('merge-wait'), 1)
+  assert.equal(r.issue.status, 'merged')
+  const paren = await run({ merge: [fail('build', `${ORPHAN_SUCCESS}、merge-build-4 は終了コードを読めていない`)], 'merge-wait': [MERGED] })
+  assert.equal(paren.count('merge-wait'), 1)
+})
+
+test('「孤児のログを採ったかは分からない」のような文は、採った句ではないので、未完了の手がかりを外さない（#962）', async () => {
+  const r = await run({ merge: [fail('build', '孤児のログを採ったかは分からない。.exit がなく、終了コードを読めていない')], 'merge-wait': [MERGED] })
+  assert.equal(r.count('merge-wait'), 1)
+  const same = await run({ merge: [fail('build', '孤児のログを採ったかは分からず、.exit がない')], 'merge-wait': [MERGED] })
+  assert.equal(same.count('merge-wait'), 1)
+})

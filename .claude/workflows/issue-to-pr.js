@@ -108,15 +108,17 @@ const GRADLE_FAILURE_EVIDENCE = /Held by|Waiting for the GameTest lock|ロック
 // ほかの worktree のタスクが実行中だと別の一文で添えた回）。依存の取得の失敗（1 回目の失敗の記述）は当たらないよう、ロックに限る
 const GRADLE_LOCK_LIMIT_EVIDENCE = /Held by|Waiting for the GameTest lock|ロックの待ち|ロックを待/i
 
-// 孤児のログの結果を採った一文（#962。gradleWaitNote の手順 3 が決めた言い回し）。その孤児は終わっているので、
-// 同じ一文に「.exit がない」などが入っていても未完了の手がかりとは見ない（ほかの一文は今までどおり見る）
-const ORPHAN_ADOPTED = /孤児のログ[^。\n]*を採った/
+// 孤児のログの結果を採った句（#962。gradleWaitNote の手順 3 が決めた言い回し「孤児のログ <名前> を採った（BUILD SUCCESSFUL）」）。
+// その孤児は終わっているので、この句（と直後のかっこ）の中の「.exit がない」などは未完了の手がかりとは見ない。
+// 外すのはこの句だけで、一文まるごとは外さない（同じ一文に別のログの未完了が書かれていれば、それは今までどおり見る）。
+// 名前のない「孤児のログを採ったかは分からない」のような文は採った句ではないので外さない（「を採った」の直後が「か」のものは当てない）
+const ORPHAN_ADOPTED = /孤児のログ\s*(?:[\w.-]+\s*(?:[、,，]|と)?\s*)*を採った(?!か)(?:（[^）\n]*）|\([^)\n]*\))?/g
 
 // 理由の文が、Gradle がまだ終わっていないことを示すか（#904）
 function textSaysGradleUnfinished(text) {
   if (!text) return false
-  text = text.split(/(?<=[。\n])/).filter(s => !ORPHAN_ADOPTED.test(s)).join('')
-  if (!text) return false
+  text = text.replace(ORPHAN_ADOPTED, '')
+  if (!text.trim()) return false
   if (GRADLE_UNFINISHED_STRONG.test(text)) return true
   if (GRADLE_LOCK_LIMIT_EVIDENCE.test(text)) return false
   return text.split(/[。\n]/).some(s => GRADLE_UNFINISHED_WEAK.test(s) && !GRADLE_FAILURE_EVIDENCE.test(s))
