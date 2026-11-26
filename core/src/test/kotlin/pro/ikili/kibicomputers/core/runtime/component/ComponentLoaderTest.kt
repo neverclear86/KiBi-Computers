@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.assertTimeoutPreemptively
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -20,6 +21,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
+import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -1104,6 +1106,50 @@ class ComponentLoaderTest {
         assertTrue(e.work <= e.remapCost) { "work ${e.work}, remap ${e.remapCost}" }
         assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
         assertDoesNotThrow { ComponentLoader.load(bytes) }
+    }
+
+    /** u32 の LEB128 */
+    private fun leb(v: Long): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        var x = v
+        do {
+            var b = (x and 0x7f).toInt()
+            x = x ushr 7
+            if (x != 0L) b = b or 0x80
+            out.write(b)
+        } while (x != 0L)
+        return out.toByteArray()
+    }
+
+    /** id [id] の section */
+    private fun section(id: Int, body: ByteArray): ByteArray = byteArrayOf(id.toByte()) + leb(body.size.toLong()) + body
+
+    /** count = 0x7fffffff（入れ子の深さを超える）、type の `alias outer`（sort 0x03、outer 0x02、count、index 0） */
+    private val hugeOuterTypeAlias = byteArrayOf(0x03, 0x02) + leb(0x7fff_ffffL) + leb(0)
+
+    @Test
+    fun `深さを超える count の alias outer は、見積もりで count 回まわらない`() {
+        // #935 のレビュー: Scope.outer が、親が尽きて null になった後も count 回まわっていた。count は深さと比べずに
+        // index()（Int.MAX_VALUE まで）で読み、見積もりは wasm-tools の検証（count を断る）より前に見張りの外で動くので、
+        // count = 0x7fffffff の alias 200 個・1.6 KB で、見積もりだけで CPU 17 秒かかった（alias 1 個あたり約 87 ms）。
+        // 型宣言の中の alias（declType → alias）も同じ経路を通る
+        val n = 1_000
+        val aliases = (0 until n).fold(leb(n.toLong())) { acc, _ -> acc + hugeOuterTypeAlias }
+        val header = byteArrayOf(0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00)
+        val topLevel = header + section(0x06, aliases)
+        // (type (instance (alias outer 0x7fffffff 0 (type)) ...))
+        val decls = (0 until n).fold(leb(n.toLong())) { acc, _ -> acc + byteArrayOf(0x02) + hugeOuterTypeAlias }
+        val inDeclType = header + section(0x07, leb(1) + byteArrayOf(0x42) + decls)
+        for (bytes in listOf(topLevel, inDeclType)) {
+            // 直す前は 1,000 個で 80 秒以上（count 回まわる）。直した後はミリ秒単位なので、上限は十分に大きくとる
+            assertTimeoutPreemptively(Duration.ofSeconds(30)) {
+                val root = ComponentParser.parse(bytes, ComponentLimits.DEFAULT, null)
+                assertDoesNotThrow { ComponentValidationCost.check(root, ComponentLimits.DEFAULT) }
+                // 不正な count は wasm-tools の検証が断る（時間の上限に当たるのではなく）
+                val e = assertThrows<WasmLoadException> { ComponentLoader.load(bytes) }
+                assertTrue(!e.message!!.contains("時間の上限")) { "${e.message}" }
+            }
+        }
     }
 
     @Test

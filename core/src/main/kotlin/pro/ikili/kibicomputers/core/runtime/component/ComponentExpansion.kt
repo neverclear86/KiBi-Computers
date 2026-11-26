@@ -54,9 +54,14 @@ internal object ComponentExpansion {
         val components = ArrayList<ComponentValue?>()
         val instances = ArrayList<InstanceValue?>()
 
+        /** [count] 段外側の添字空間（なければ `null`）。count は深さと比べずに読んだ値なので、親が尽きたらすぐやめる */
         fun outer(count: Int): Env? {
             var e: Env? = this
-            repeat(count) { e = e?.parent }
+            var i = 0
+            while (i < count && e != null) {
+                e = e.parent
+                i++
+            }
             return e
         }
 

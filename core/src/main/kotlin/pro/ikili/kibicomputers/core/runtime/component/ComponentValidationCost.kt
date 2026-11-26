@@ -49,6 +49,9 @@ import java.util.IdentityHashMap
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
  * ただし、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型を入れ子のコンポーネントごとに import する形と、
  * `alias outer` で何度も引く形は、見積もりが 0 のまま検証が秒単位になる（#935 のレビュー。#955 で扱う）。
+ * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
+ * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
+ * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
  * 型を付けた export（`(export "x" (component $c) (component (type $ct)))`）の確認も、渡す側の大きさしか数えない
  * （コンポーネントの部分型は import が反変で、確認の手間は受ける側の import の数に比例する）ので、見積もりが
  * 小さいまま検証が時間の上限に届く（受ける側の import 4,000 個 × 型を付けた export 5,000 個。#935 のレビュー。#963 で扱う）。
@@ -58,6 +61,7 @@ import java.util.IdentityHashMap
  * 超えたら、たどるのをやめて断る（[Walker.flatOf]。同じ宣言の連なりを参照する、写して作った型が多い形は、
  * 型ごとにたどり直すので、見積もりを抑えないと入力の大きさの 2 乗の手間になる。N=C=49,000 の 1.29 MB で 270 秒。#935 のレビュー）。
  * 見積もりは見張りの外（`LoadDeadline` なし）で動くので、手数で決定的に止める。
+ * `alias outer` の count は、入れ子の深さと比べずに読んだ値なので、添字空間を外にたどるのは入れ子の深さまでにする（[Scope.outer]）。
  */
 internal object ComponentValidationCost {
     /** 型の大きさの上限。wasmparser は、これ（`MAX_WASM_TYPE_SIZE`）を超える型を、型を定義したときに断る */
@@ -77,7 +81,9 @@ internal object ComponentValidationCost {
 
     /**
      * 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は見積もりの値（確かめる型の大きさと、
-     * 写し直しの大きさの合計）、[remapCost] はそのうちの写し直しの分
+     * 写し直しの大きさの合計）、[remapCost] はそのうちの写し直しの分。
+     * [work] は、写し直しの大きさをたどった手数（積んだ参照の数。見積もりそのものの手間）。[check] は、これが見積もりの上限の
+     * [WORK_FACTOR] 倍を超えたら、[cost] によらず手数で断る（そのときの [cost] は途中までの値）
      */
     class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long, val remapCost: Long, val work: Long)
 
@@ -150,9 +156,19 @@ internal object ComponentValidationCost {
         val components = ArrayList<Info?>()
         val coreTypes = ArrayList<Info?>()
 
+        /**
+         * [count] 段外側の添字空間（なければ `null`）。count は入れ子の深さと比べずに読んだ値（Int.MAX_VALUE まで）で、
+         * 見積もりは wasm-tools の検証（深さを超える count を断る）より前に見張りの外で動くので、親が尽きたらすぐやめる
+         * （入れ子の深さまでしかたどらない。count のまま回すと、count = 0x7fffffff の `alias outer` 1 つで約 90 ms、
+         * 200 個・1.6 KB で 17 秒かかった。#935 のレビュー）
+         */
         fun outer(count: Int): Scope? {
             var s: Scope? = this
-            repeat(count) { s = s?.parent }
+            var i = 0
+            while (i < count && s != null) {
+                s = s.parent
+                i++
+            }
             return s
         }
 
