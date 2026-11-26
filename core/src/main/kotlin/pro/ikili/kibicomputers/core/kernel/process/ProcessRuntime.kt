@@ -63,6 +63,15 @@ internal class ProcessRuntime(
     /** 前借りの間に遅い道（カーネルロックの中の確かめ）で前借りを続けると決めた回数（#887。テスト・計測用。プロセスのスレッドだけが読み書きする） */
     var fuelOverdraftSlowChecks: Long = 0
 
+    /**
+     * 前借りの間の燃料切れの処理が、スタックの確かめもカーネルロックも通らずに負の残りを返してよいか（速い道。#887）。プロセスのスレッドだけが呼ぶ。
+     * 前借りの最中（[fuelOverdraft]）で、呼んだインスタンスが控え（[fuelOverdraftInstance]）と同じ、次に遅い道を通る残り（[fuelOverdraftRecheckAt]）に
+     * 届いておらず、kill されておらず、作っている途中でなく、ホストの関数の中からのゲストの呼び出しでもないときだけ真
+     */
+    fun canSkipOverdraftCheck(instance: WasmInstance, remaining: Long): Boolean =
+        fuelOverdraft && remaining > fuelOverdraftRecheckAt && instance === fuelOverdraftInstance &&
+            !killed && loading == null && guestCallDepth == 0
+
     /** マシンの CPU を持っている（プロセスのスレッドだけが読み書きする） */
     var holdsCpu: Boolean = false
 
