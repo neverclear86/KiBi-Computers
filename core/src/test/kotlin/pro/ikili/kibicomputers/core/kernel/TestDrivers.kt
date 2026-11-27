@@ -25,6 +25,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import pro.ikili.kibicomputers.core.runtime.validation.ValidationWatchdog
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
@@ -265,13 +266,29 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
     repeat(3) { scheduler.tick() }
 }
 
-/** 名前が `KiBi-` で始まるスレッドが残っていない */
+/**
+ * カーネルのスレッドの残りとして数えない、JVM に 1 本のスレッドの名前（#990）。
+ *
+ * コンポーネントの検証の見張り（[ValidationWatchdog.THREAD_NAME]）は、スケジューラのものではなく JVM で共有する 1 本で、
+ * 仕事がなくなってから 1 秒で終わる（ADR 0666）。数えると、コンポーネントを読み込んだテストが終わるたびに約 1 秒待つ。
+ * 仕事がなければ終わることは `ValidationWatchdogTest` が受け持ち、`Watch.finish` の呼び忘れ（予定が残ってスレッドが生き続ける）は
+ * [assertNoKernelThreads] が予定の数で見る。名前の完全一致で除く（接頭辞で除くと `KiBi-wasm-compiler-N` の残りまで見えなくなる）
+ */
+private val JVM_WIDE_THREAD_NAMES: Set<String> = setOf(ValidationWatchdog.THREAD_NAME)
+
+/** 名前が `KiBi-` で始まるスレッド（[JVM_WIDE_THREAD_NAMES] を除く）が残っておらず、共有の見張りの予定も残っていない */
 internal fun assertNoKernelThreads() {
-    eventually(5_000, "カーネルのスレッドが残っている: ${kernelThreadNames()}") { kernelThreadNames().isEmpty() }
+    eventuallyDescribe(5_000, {
+        "カーネルのスレッドか見張りの予定が残っている: threads=${kernelThreadNames()}, " +
+            "watchdogPending=${ValidationWatchdog.sharedPendingCount()}"
+    }) { kernelThreadNames().isEmpty() && ValidationWatchdog.sharedPendingCount() == 0 }
 }
 
+/** 名前が [prefix] で始まる、生きているスレッドの名前（[JVM_WIDE_THREAD_NAMES] を除く） */
 internal fun kernelThreadNames(prefix: String = "KiBi-"): List<String> =
-    Thread.getAllStackTraces().keys.filter { it.isAlive && it.name.startsWith(prefix) }.map { it.name }
+    Thread.getAllStackTraces().keys
+        .filter { it.isAlive && it.name.startsWith(prefix) && it.name !in JVM_WIDE_THREAD_NAMES }
+        .map { it.name }
 
 /** 終わらない計算（1 ずつ燃料を使い、[progress] を数える） */
 internal fun spinForever(progress: AtomicInteger? = null, sleepMillis: Long = 0): FakeModule = FakeModule.builder()

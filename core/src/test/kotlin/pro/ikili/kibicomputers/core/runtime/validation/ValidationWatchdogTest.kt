@@ -153,7 +153,7 @@ class ValidationWatchdogTest {
             caller.join()
             assertTrue(ran.await(10, TimeUnit.SECONDS))
             val t = worker.get()
-            assertEquals("KiBi-wasm-watchdog", t.name)
+            assertEquals(ValidationWatchdog.THREAD_NAME, t.name)
             assertEquals(Thread.NORM_PRIORITY, t.priority)
             assertTrue(t.isDaemon)
             // 仕事がなければスレッドが終わる（ワールドを出入りしても溜まらない）
@@ -162,6 +162,55 @@ class ValidationWatchdogTest {
         } finally {
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun `見張りを終えた後は長い予定が残らずタイマーのスレッドが終わる`() {
+        // 本番の使い方（watch → finish）で、取り消した予定が待ち行列に残らず、スレッドが仕事の後に終わる
+        // （#990。Harness.close はこのスレッドを数えず、予定の数で finish の呼び忘れを見る）
+        val executor = ValidationWatchdog.newExecutor(idleMillis = 50)
+        try {
+            val watchdog = ValidationWatchdog(timer = { delay, task -> executor.schedule(task, delay, TimeUnit.NANOSECONDS) })
+            // 先に長い予定を入れてスレッドを立て（予定が残っている間、スレッドは終わらない）、そのスレッドを捕まえる。
+            // 捕まえるのを watch の前にすると、idleMillis の間に終わった別のスレッドを捕まえて、確認が空振りで通りうる
+            val w = watchdog.watch(LoadDeadline(3_600 * second))
+            val worker = AtomicReference<Thread>()
+            val ran = CountDownLatch(1)
+            executor.schedule(
+                {
+                    worker.set(Thread.currentThread())
+                    ran.countDown()
+                },
+                0,
+                TimeUnit.MILLISECONDS,
+            )
+            assertTrue(ran.await(10, TimeUnit.SECONDS))
+            val t = worker.get()
+            assertEquals(1, executor.queue.size)
+            // 長い予定が残っている間は、idleMillis（50 ms）を過ぎてもスレッドは終わらない
+            t.join(300)
+            assertTrue(t.isAlive) { "予定が残っているのにタイマーのスレッドが終わった" }
+            assertFalse(w.finish())
+            assertEquals(0, executor.queue.size)
+            t.join(10_000)
+            assertFalse(t.isAlive) { "見張りを終えた後もタイマーのスレッドが終わらない" }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `共有の見張りは見張っている間だけ予定を持ち終えると元の数に戻る`() {
+        // Harness.close（assertNoKernelThreads）が finish の呼び忘れを見つけるのに使う sharedPendingCount の確認（#990）。
+        // 同じ JVM の別のテストの残りに左右されないよう、差で見る
+        val before = ValidationWatchdog.sharedPendingCount()
+        val w = ValidationWatchdog.shared.watch(LoadDeadline(3_600 * second))
+        try {
+            assertEquals(before + 1, ValidationWatchdog.sharedPendingCount())
+        } finally {
+            assertFalse(w.finish())
+        }
+        assertEquals(before, ValidationWatchdog.sharedPendingCount())
     }
 
     @Test
