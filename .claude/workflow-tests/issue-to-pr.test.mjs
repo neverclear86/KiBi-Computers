@@ -1654,7 +1654,7 @@ test('スタック: 3 段のスタックは、下の段から順に一つ下の�
 
 // ---- area のロック（#986）: 同じ area は同時に 2 件まで。area のロックを取ってから slots を取る ----
 // 実装の段階で同時に動いた数を数える。area は重い area（HEAVY_AREAS。Fable のレビューに回る）を避ける。Issue ごとに PR・ブランチ・worktree を分ける（PR の番号が重なると prIssue が壊れる）
-async function runAreas(issues, window, extraArgs = {}) {
+async function runAreas(issues, window, extraArgs = {}, overrides = {}) {
   let active = 0
   let max = 0
   const enter = []
@@ -1667,7 +1667,7 @@ async function runAreas(issues, window, extraArgs = {}) {
     active--
     return { ...IMPL, pr: 2000 + n, branch: `issue-${n}-x`, worktree: `D:/w/issue-${n}` }
   }
-  const r = await run({ select: [{ issues }], implement }, { issues: issues.map(i => i.number), window, ...extraArgs })
+  const r = await run({ select: [{ issues }], implement, ...overrides }, { issues: issues.map(i => i.number), window, ...extraArgs })
   return { ...r, max: () => max, enter }
 }
 const areaIssue = (number, areas) => ({ number, title: 't', areas, openDeps: [], blockedReason: null, needsPlan: false })
@@ -1726,3 +1726,24 @@ for (const [name, order] of [['下の段が先', [904, 905]], ['上の段が先'
     assert.equal(r.count('cleanup'), 2)
   })
 }
+
+// 重い PR の判定（HEAVY_AREAS）も、ロックと同じそろえ方（lockAreas）で見る（#986）。重い area の表記ゆれでも Fable のレビューに回る
+for (const [name, areas] of [
+  ['`area: ` の接頭辞', ['area: runtime']],
+  ['大文字', ['Runtime']],
+  ['前後の空白', [' kernel ']],
+]) {
+  test(`重い PR の判定: 重い area の表記ゆれ（${name}）でも Fable のレビューに回り、Opus のレビューは呼ばれない`, async () => {
+    const r = await runAreas([areaIssue(911, areas)], 1, {}, { 'review-fable': () => ({ findings: [] }) })
+    assert.ok(allMerged(r))
+    assert.ok(r.count('review-fable') >= 1)
+    assert.equal(r.count('review'), 0)
+  })
+}
+
+test('重い PR の判定: 重くない area は Opus のレビューだけが呼ばれる（Fable は呼ばれない）', async () => {
+  const r = await runAreas([areaIssue(911, ['GUI'])], 1)
+  assert.ok(allMerged(r))
+  assert.ok(r.count('review') >= 1)
+  assert.equal(r.count('review-fable'), 0)
+})
