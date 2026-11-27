@@ -17,6 +17,7 @@ import pro.ikili.kibicomputers.core.persist.SnapshotSection
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
 import pro.ikili.kibicomputers.core.kernel.wait.WaitKey
+import pro.ikili.kibicomputers.core.machine.MachineManager
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.FakeWasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
@@ -201,15 +202,37 @@ internal class Harness(
 
     fun module(program: Program): WasmModule = program.module
 
-    /** このスケジューラのスレッド（マシンのプロセスの専用スレッドとディスパッチャー）のうち、まだ生きているもの */
+    /**
+     * このスケジューラの起動用（`KiBi-boot-*`）・ワーカー（`KiBi-worker-*`）のプールが作ったスレッド（#916）。
+     * プールの [java.util.concurrent.ThreadFactory] を包んで記録する（プールは作ったスレッドを外に見せないため）。
+     * 名前の連番はスケジューラごとなので、名前では選ばない
+     */
+    private val poolThreads: MutableSet<Thread> = java.util.Collections.newSetFromMap(ConcurrentHashMap())
+
+    /** ワーカーのプールの executor（差し替えたときはそれ）。本番の [pro.ikili.kibicomputers.core.kernel.sched.WorkerPool] にテスト用の口を足さないように、反射で読む */
+    private val workerExecutor: ExecutorService = workerPoolField("executor") as ExecutorService
+
+    init {
+        // 起動用・ワーカーのスレッドは、使われたときに初めてできる（プールはコア 0 か、コアのスレッドを先に作らない）ので、ここで包めば取り逃さない
+        val workerPool = workerPoolField("pool") as java.util.concurrent.ThreadPoolExecutor?
+        for (pool in listOfNotNull(scheduler.bootExecutor, workerPool)) {
+            val inner = pool.threadFactory
+            pool.threadFactory = java.util.concurrent.ThreadFactory { r -> inner.newThread(r)?.also { poolThreads += it } }
+        }
+    }
+
+    private fun workerPoolField(name: String): Any? =
+        scheduler.workers.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(scheduler.workers)
+
+    /** このスケジューラのスレッド（マシンのプロセスの専用スレッド、ディスパッチャー、起動用・ワーカーのプールのスレッド）のうち、まだ生きているもの */
     private fun ownKernelThreads(): List<Thread> =
-        (ArrayList(scheduler.dedicatedThreads) + scheduler.dispatcher.thread).filter { it.isAlive }
+        (ArrayList(scheduler.dedicatedThreads) + scheduler.dispatcher.thread + poolThreads).distinct().filter { it.isAlive }
 
     /** [own] と、このスケジューラの起動用・ワーカーのプールのスレッド（`shutdownNow` が割り込む）に割り込む。ほかのスケジューラ・テストのスレッドには触れない */
     private fun interruptOwnThreads(own: List<Thread>) {
         own.forEach { it.interrupt() }
         scheduler.bootExecutor.shutdownNow()
-        scheduler.workers.shutdownNow()
+        workerExecutor.shutdownNow()
     }
 
     override fun close() {
@@ -345,6 +368,21 @@ internal fun cleanupWaitIfInterrupted(describe: () -> String, graceMillis: Long 
 
 /** [cleanupWaitIfInterrupted] が待つ上限 */
 internal const val CLEANUP_WAIT_MILLIS = 10_000L
+
+/**
+ * `finally` の後始末の、期限つきの待ち（[timedWait] は待つ上限のミリ秒を受け取り、終わったら `true`）を、最大 [timeoutMillis] 待つ（#916）。
+ *
+ * 割り込みのフラグが立っていれば（保険のタイムアウトで落ちている途中。[failOnInterrupt] がフラグを立て直している）、
+ * [cleanupWaitIfInterrupted] でフラグを下ろして待ち、`true` を返す（待ち切れなくても投げず、元の失敗の説明を置き換えない。
+ * 立ったまま待つと、その場で `InterruptedException` を投げ、何も待たずに元の失敗を置き換える）。
+ * フラグがなければ、そのまま待って結果を返す
+ */
+internal fun awaitInCleanup(describe: () -> String, timeoutMillis: Long, timedWait: (Long) -> Boolean): Boolean =
+    cleanupWaitIfInterrupted(describe, timeoutMillis, timedWait) || timedWait(timeoutMillis)
+
+/** `finally` の後始末で [MachineManager.shutdown] する（#916。割り込まれた後の扱いは [awaitInCleanup]） */
+internal fun MachineManager<*>.shutdownInCleanup(timeoutMillis: Long = 10_000): Boolean =
+    awaitInCleanup({ "MachineManager が止まらない: $this" }, timeoutMillis) { shutdown(it) }
 
 /**
  * 期限なしで [CountDownLatch.await] する（#916）。割り込まれたら [message] を付けて落ちる。

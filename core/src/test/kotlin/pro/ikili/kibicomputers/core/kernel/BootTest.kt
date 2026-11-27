@@ -1185,7 +1185,7 @@ class BootTest {
         } finally {
             aRelease.countDown()
             b.stop()
-            assertTrue(b.awaitTermination(5_000))
+            assertTrue(awaitInCleanup({ "マシン b が止まらない" }, 5_000) { b.awaitTermination(it) })
         }
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
     }
@@ -1234,7 +1234,7 @@ class BootTest {
         } finally {
             aRelease.countDown()
             b.stop()
-            assertTrue(b.awaitTermination(5_000))
+            assertTrue(awaitInCleanup({ "マシン b が止まらない" }, 5_000) { b.awaitTermination(it) })
         }
         tickUntil("止めたディスクを閉じない") { HostDiskLeases.size == leases }
     }

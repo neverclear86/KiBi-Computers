@@ -18,6 +18,7 @@ import pro.ikili.kibicomputers.core.kernel.MachineState
 import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
 import pro.ikili.kibicomputers.core.kernel.joinOrFail
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -62,7 +63,7 @@ class ScreenDeviceBudgetTest {
             block(booted)
             case.turnOff()
         } finally {
-            assertTrue(manager.shutdown(10_000))
+            assertTrue(manager.shutdownInCleanup())
         }
     }
 

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import java.nio.file.Path
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -143,7 +144,7 @@ class MachineSideOwnerReadTest {
         } finally {
             // 途中で落ちても、止めた読み手を放し、書き込みのスレッドが終わるのを待つ（@TempDir の掃除と重ならないように）
             release.countDown()
-            writer?.join()
+            writer?.joinOrFail()
         }
         assertEquals(OwnerRecord(1, at(1)), OwnerRecord.read(ownerFile(id)))
         // 待っていた写しは、引き取った台が索引にいるので重複になる（覚えている owner.bin で判定し直す）

@@ -50,7 +50,10 @@ class UnboundedWaitTest {
         }
     }
 
-    /** 標準出力に出た行（[block] の間） */
+    /**
+     * 標準出力に出た行（[block] の間）。[failOnInterrupt]・[Harness.close] の報告（[SLOW_WAIT_MARKER] の行）をわざと出すテストは、
+     * これで捕まえる（通った回にも core の `test` タスクがその行をコンソールに写し、本当の遅れ・止まりの印を埋もれさせるため）
+     */
     private fun capturedLines(block: () -> Unit): List<String> {
         val out = ByteArrayOutputStream()
         val old = System.out
@@ -73,31 +76,36 @@ class UnboundedWaitTest {
 
     @Test
     fun `eventuallyは割り込まれたら説明を付けて落ち、割り込みのフラグを立て直す`() {
-        try {
-            val e = assertThrows<AssertionError> { interruptedWhileWaiting { eventually(60_000, "そろわない") { false } } }
-            assertTrue(e.message!!.endsWith("そろわない"), e.message)
-            assertTrue(e.cause is InterruptedException)
-            assertTrue(Thread.currentThread().isInterrupted, "フラグを立て直す")
-        } finally {
-            Thread.interrupted()
+        val lines = capturedLines {
+            try {
+                val e = assertThrows<AssertionError> { interruptedWhileWaiting { eventually(60_000, "そろわない") { false } } }
+                assertTrue(e.message!!.endsWith("そろわない"), e.message)
+                assertTrue(e.cause is InterruptedException)
+                assertTrue(Thread.currentThread().isInterrupted, "フラグを立て直す")
+            } finally {
+                Thread.interrupted()
+            }
         }
+        assertTrue(lines.any { it.contains("そろわない") }, lines.toString())
     }
 
     @Test
     fun `failOnInterruptは値を返し、割り込まれたらフラグを立て直して説明を付けて落ちる`() {
         assertEquals("ok", failOnInterrupt({ "使わない" }) { "ok" })
-        try {
-            val e = assertThrows<AssertionError> {
-                failOnInterrupt({ "眠り" }) {
-                    Thread.currentThread().interrupt()
-                    Thread.sleep(60_000)
+        capturedLines {
+            try {
+                val e = assertThrows<AssertionError> {
+                    failOnInterrupt({ "眠り" }) {
+                        Thread.currentThread().interrupt()
+                        Thread.sleep(60_000)
+                    }
                 }
+                assertTrue(e.message!!.endsWith("眠り"), e.message)
+                assertTrue(e.cause is InterruptedException)
+                assertTrue(Thread.currentThread().isInterrupted, "フラグを立て直す")
+            } finally {
+                Thread.interrupted()
             }
-            assertTrue(e.message!!.endsWith("眠り"), e.message)
-            assertTrue(e.cause is InterruptedException)
-            assertTrue(Thread.currentThread().isInterrupted, "フラグを立て直す")
-        } finally {
-            Thread.interrupted()
         }
     }
 
@@ -118,22 +126,24 @@ class UnboundedWaitTest {
                 "結果" to { CompletableFuture<Unit>().getOrFail("結果") },
                 "プール" to { pool.awaitTerminationOrFail("プール") },
             )
-            for ((message, wait) in cases) {
+            capturedLines {
+                for ((message, wait) in cases) {
+                    try {
+                        val e = assertThrows<AssertionError> { interruptedWhileWaiting { wait() } }
+                        assertTrue(e.message!!.contains(message), e.message)
+                        assertTrue(e.cause is InterruptedException, message)
+                        assertTrue(Thread.currentThread().isInterrupted, "$message: フラグを立て直す")
+                    } finally {
+                        Thread.interrupted()
+                    }
+                }
+                // joinOrFail は、相手のスレッドの名前とスタックを付ける
                 try {
-                    val e = assertThrows<AssertionError> { interruptedWhileWaiting { wait() } }
-                    assertTrue(e.message!!.contains(message), e.message)
-                    assertTrue(e.cause is InterruptedException, message)
-                    assertTrue(Thread.currentThread().isInterrupted, "$message: フラグを立て直す")
+                    val e = assertThrows<AssertionError> { interruptedWhileWaiting { other.joinOrFail() } }
+                    assertTrue(e.message!!.contains("UnboundedWaitTest-other") && e.message!!.contains("at "), e.message)
                 } finally {
                     Thread.interrupted()
                 }
-            }
-            // joinOrFail は、相手のスレッドの名前とスタックを付ける
-            try {
-                val e = assertThrows<AssertionError> { interruptedWhileWaiting { other.joinOrFail() } }
-                assertTrue(e.message!!.contains("UnboundedWaitTest-other") && e.message!!.contains("at "), e.message)
-            } finally {
-                Thread.interrupted()
             }
             // 開いていれば、そのまま返る
             latch.countDown()
@@ -261,15 +271,23 @@ class UnboundedWaitTest {
     fun `Harnessのcloseは、終わらなければKiBiのスレッドに割り込んで放し、失敗は残す`() {
         for (interruptedBefore in listOf(false, true)) {
             val g = GatedBoot(firstCloseWaitMillis = 200)
-            try {
-                if (interruptedBefore) Thread.currentThread().interrupt()
-                val e = assertThrows<AssertionError> { g.h.close() }
-                assertTrue(e.message!!.contains("スケジューラが終わらない"), "割り込みで待ちを飛ばさない（$interruptedBefore）: $e")
-                assertTrue(Thread.currentThread().isInterrupted == interruptedBefore, "フラグを元に戻す（$interruptedBefore）")
-            } finally {
-                Thread.interrupted()
-                g.release.countDown()
+            var failure: AssertionError? = null
+            val lines = capturedLines {
+                try {
+                    if (interruptedBefore) Thread.currentThread().interrupt()
+                    val e = assertThrows<AssertionError> { g.h.close() }
+                    failure = e
+                    assertTrue(e.message!!.contains("スケジューラが終わらない"), "割り込みで待ちを飛ばさない（$interruptedBefore）: $e")
+                    assertTrue(Thread.currentThread().isInterrupted == interruptedBefore, "フラグを元に戻す（$interruptedBefore）")
+                } finally {
+                    Thread.interrupted()
+                    g.release.countDown()
+                }
             }
+            // 門で止まった起動用のスレッド（KiBi-boot-*。プールのスレッド）を、報告と失敗の本文の「残ったスレッド」に名前とスタックで載せる
+            val message = failure!!.message!!
+            assertTrue(lines.any { it.contains("KiBi-boot-") }, "報告に残ったスレッドを載せる（$interruptedBefore）: $lines")
+            assertTrue(message.contains("KiBi-boot-") && message.contains("at "), "失敗の本文に残ったスレッドを載せる（$interruptedBefore）: $message")
             assertTrue(g.interrupted.get(), "門で止まったスレッドに割り込む（$interruptedBefore）")
             assertNoKernelThreads()
         }
@@ -290,7 +308,7 @@ class UnboundedWaitTest {
         unrelated.start()
         val g = GatedBoot(firstCloseWaitMillis = 200)
         try {
-            assertThrows<AssertionError> { g.h.close() }
+            capturedLines { assertThrows<AssertionError> { g.h.close() } }
             assertTrue(g.interrupted.get(), "自分のスケジューラのスレッドには割り込む")
             // 割り込みはその場で届くので、少し待っても何も起きないことを見る（待ちは否定の確認のためだけ）
             Thread.sleep(200)

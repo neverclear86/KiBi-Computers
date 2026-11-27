@@ -498,8 +498,8 @@ class StackExhaustionLockTest {
             awaitLockReleased(ticker, "マシンのロックが放される", m.lock) { "${m.lock}、${stopping()}" }
         } finally {
             stopWaker.set(true)
-            waker?.join(5_000)
-            contenderThread?.join(5_000)
+            waker?.let { t -> awaitInCleanup({ "起こし役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
+            contenderThread?.let { t -> awaitInCleanup({ "取り合い役が終わらない" }, 5_000) { t.join(it); !t.isAlive } }
             ticker.close()
             println("#858 $kind $body $patterns: ${tally.describe()}、本体を呼んだ回数 ${bodyCalls.get()}、ディスクの操作 ${diskOps.get()} 回")
             h.close()

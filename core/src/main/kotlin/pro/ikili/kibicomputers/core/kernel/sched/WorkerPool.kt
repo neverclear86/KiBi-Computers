@@ -138,9 +138,6 @@ internal class WorkerPool(stackBytes: Long, idleMillis: Long, override: Executor
 
     fun shutdown() = executor.shutdown()
 
-    /** 動いているワーカーにも割り込んで止める（テストの [shutdown] で終わらないときの後始末用） */
-    fun shutdownNow(): List<Runnable> = executor.shutdownNow()
-
     @Throws(InterruptedException::class)
     fun awaitTermination(timeoutMillis: Long): Boolean = executor.awaitTermination(timeoutMillis.coerceAtLeast(0), TimeUnit.MILLISECONDS)
 }

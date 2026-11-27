@@ -35,6 +35,7 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.shutdownInCleanup
 import pro.ikili.kibicomputers.core.kernel.stateOf
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
@@ -189,7 +190,7 @@ class ComputerCaseRestoreStepsTest {
                 case.turnOff()
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -218,7 +219,7 @@ class ComputerCaseRestoreStepsTest {
                 case.turnOff()
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -249,7 +250,7 @@ class ComputerCaseRestoreStepsTest {
             assertFalse(machine.isRestoring, "復元の印は Machine が閉じる")
             case.turnOff()
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -274,7 +275,7 @@ class ComputerCaseRestoreStepsTest {
             assertFalse(case.isRestorePending)
             case.turnOff()
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 
@@ -428,7 +429,7 @@ class ComputerCaseRestoreStepsTest {
                 assertTrue(logs.restoreListenerWarnings(machine).isEmpty(), "投げていないので出さない")
             }
         } finally {
-            manager.shutdown(10_000)
+            manager.shutdownInCleanup()
         }
     }
 }
