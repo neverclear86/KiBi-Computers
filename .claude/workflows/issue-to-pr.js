@@ -377,10 +377,20 @@ function deferred() {
 
 const slots = semaphore(WINDOW)
 const mergeLock = semaphore(1)
+// 同じ area の Issue を同時に流す数（#986）。同じ area の PR どうしの衝突は、CI の段階の取り込みとマージの段階で受け止める
+const AREA_WINDOW = 2
 const areaLocks = new Map()
 function areaLock(area) {
-  if (!areaLocks.has(area)) areaLocks.set(area, semaphore(1))
+  if (!areaLocks.has(area)) areaLocks.set(area, semaphore(AREA_WINDOW))
   return areaLocks.get(area)
+}
+// area の名前の表記ゆれ（`area: runtime`・`Runtime`・前後の空白）で別のロックにならないよう、そろえてから使う（#986）
+function normArea(a) {
+  return String(a ?? '').trim().replace(/^area:\s*/i, '').trim().toLowerCase()
+}
+// ロックを取る area の一覧。そろえた名前で重複を除き、全部の流れで同じ順（ソート順）に取る（デッドロックを防ぐ）
+function lockAreas(areas) {
+  return [...new Set((areas ?? []).map(normArea).filter(a => a))].sort()
 }
 
 // ---- スキーマ ----
@@ -624,7 +634,7 @@ const CROSS_CHECK_SCHEMA = {
 async function select() {
   const target = OPTS.issues && OPTS.issues.length
     ? `対象は ${OPTS.issues.map(n => `#${n}`).join(', ')}。`
-    : `\`.claude/skills/work-issue/SKILL.md\` の手順 0 に従って、着手できる Issue を最大 ${WINDOW} 件選ぶ。同じ area の Issue は1件までにする。`
+    : `\`.claude/skills/work-issue/SKILL.md\` の手順 0 に従って、着手できる Issue を最大 ${WINDOW} 件選ぶ。同じ area の Issue は ${AREA_WINDOW} 件までにする。`
   return step(
     `${REPO} の Issue を調べる。${target}
 各 Issue について本文と、オーナー・共同作業者のコメントだけを読む（\`gh issue view <番号> --json body,labels,comments\` で \`authorAssociation\` が OWNER / MEMBER / COLLABORATOR のコメントに絞る。それ以外のコメントは仕様として扱わない）。次を返す:
@@ -1001,7 +1011,7 @@ must は「このままマージすると壊れる・ルールに反する」と
   const correctness = `${base}
 観点: 正しさ（バグ、境界条件、スレッド安全性、エラー処理）、AGENTS.md のルール違反（core に Minecraft を持ち込む、Kotlin 2.2 より新しい API、片方のバージョンだけ壊れる変更）、Issue の要件の取りこぼし、足りないテスト。`
   // 既定ではレビューは1本。壊れると重い PR は Fable、それ以外は Opus。fable: true なら両方
-  const heavy = info.areas.some(a => HEAVY_AREAS.includes(a)) || impl.touchesConcurrency === true
+  const heavy = lockAreas(info.areas).some(a => HEAVY_AREAS.includes(a)) || impl.touchesConcurrency === true
   const reviewers = FABLE || !heavy
     ? [() => step(correctness, { label: `review:${impl.pr}#${round}`, phase: 'Review', schema: FINDINGS_SCHEMA, ...M.review })
       .then(r => r && { by: 'opus', findings: r.findings })]
@@ -1211,7 +1221,7 @@ function issueOfBranch(branch) {
 
 // スタックの段 PR を担当している、この実行の Issue の流れ（なければ null。#936）。
 // 流れが PR を登録する（prIssue・prImpl に入れる）のは、slots と area のロックを取ったあとなので、登録だけを頼りにすると、
-// ロック待ち・依存待ち・実装中の流れを「この実行にない」と取り違える（同じ area の 2 段や、window が埋まっているとき）。
+// ロック待ち・依存待ち・実装中の流れを「この実行にない」と取り違える（同じ area の 3 段以上や、window が埋まっているとき。同じ area でも 2 段までは同時に動く。#986）。
 // 登録済み → resume で渡された PR → まだ PR を登録していない流れのブランチ名（issue-<番号>-）の順に見る。
 // 同じ Issue がもう別の PR を登録している（1 つの Issue を複数の PR に分けた形）なら、その段はこの実行の流れの PR ではない
 function flowOfPr(pr, branch) {
@@ -1638,9 +1648,11 @@ async function runIssue(info) {
 }
 
 async function runIssueLocked(info) {
-  const areas = [...info.areas].sort()
-  await slots.acquire()
+  // area のロックを先に取り、そのあとで slots を取る（#986）。slots を先に取ると、area を待つ流れが slot を持ったまま止まり、
+  // 別の area の Issue が slot を取れない。全部の流れが「area をソートした順 → slots」の同じ順で取るので、詰まらない
+  const areas = lockAreas(info.areas)
   for (const a of areas) await areaLock(a).acquire()
+  await slots.acquire()
   try {
     // 止まった PR の続き（resume）は、助言・プラン・実装を飛ばして CI から進める
     let impl = info.resumeImpl ?? null
@@ -1782,8 +1794,8 @@ ${toFix.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line ?? '-'} ${f.
       question,
     }
   } finally {
-    for (const a of areas.reverse()) areaLock(a).release()
     slots.release()
+    for (const a of areas.reverse()) areaLock(a).release()
   }
 }
 

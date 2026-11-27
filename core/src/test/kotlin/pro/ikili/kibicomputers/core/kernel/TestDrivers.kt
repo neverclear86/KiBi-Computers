@@ -26,6 +26,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmModule
 import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
+import pro.ikili.kibicomputers.core.runtime.validation.ValidationWatchdog
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -461,7 +462,18 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
 }
 
 /**
- * 名前が `KiBi-` で始まるスレッドが残っていない。
+/**
+ * カーネルのスレッドの残りとして数えない、JVM に 1 本のスレッドの名前（#990）。
+ *
+ * コンポーネントの検証の見張り（[ValidationWatchdog.THREAD_NAME]）は、スケジューラのものではなく JVM で共有する 1 本で、
+ * 仕事がなくなってから 1 秒で終わる（ADR 0666）。数えると、コンポーネントを読み込んだテストが終わるたびに約 1 秒待つ。
+ * 仕事がなければ終わることは `ValidationWatchdogTest` が受け持ち、`Watch.finish` の呼び忘れ（予定が残ってスレッドが生き続ける）は
+ * [assertNoKernelThreads] が予定の数で見る。名前の完全一致で除く（接頭辞で除くと `KiBi-wasm-compiler-N` の残りまで見えなくなる）
+ */
+private val JVM_WIDE_THREAD_NAMES: Set<String> = setOf(ValidationWatchdog.THREAD_NAME)
+
+/**
+ * 名前が `KiBi-` で始まるスレッド（[JVM_WIDE_THREAD_NAMES] を除く）が残っておらず、共有の見張りの予定も残っていない。
  *
  * [eventually] と違い、期限で落とす（#916）。JVM 全体のスレッドを見るので、前のテストが漏らしたスレッドがあると、後に続く
  * [Harness] のテストがすべてここで止まり、保険のタイムアウト（10 分）が 1 本ずつ積み重なって CI の段の上限を超えるため。
@@ -469,17 +481,23 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
  */
 internal fun assertNoKernelThreads(timeoutMillis: Long = KERNEL_THREADS_EXIT_MILLIS, prefix: String = "KiBi-") {
     val deadline = System.nanoTime() + timeoutMillis * 1_000_000
-    while (kernelThreadNames(prefix).isNotEmpty()) {
-        if (System.nanoTime() > deadline) fail("カーネルのスレッドが残っている: ${kernelThreadNames(prefix)}")
-        failOnInterrupt({ "カーネルのスレッドが残っている: ${kernelThreadNames(prefix)}" }) { Thread.sleep(1) }
+    fun leftover(): String =
+        "カーネルのスレッドか見張りの予定が残っている: threads=${kernelThreadNames(prefix)}, " +
+            "watchdogPending=${ValidationWatchdog.sharedPendingCount()}"
+    while (kernelThreadNames(prefix).isNotEmpty() || ValidationWatchdog.sharedPendingCount() != 0) {
+        if (System.nanoTime() > deadline) fail(leftover())
+        failOnInterrupt({ leftover() }) { Thread.sleep(1) }
     }
 }
 
 /** [assertNoKernelThreads] が、スレッドが終わるのを待つ上限 */
 private const val KERNEL_THREADS_EXIT_MILLIS = 30_000L
 
+/** 名前が [prefix] で始まる、生きているスレッドの名前（[JVM_WIDE_THREAD_NAMES] を除く） */
 internal fun kernelThreadNames(prefix: String = "KiBi-"): List<String> =
-    Thread.getAllStackTraces().keys.filter { it.isAlive && it.name.startsWith(prefix) }.map { it.name }
+    Thread.getAllStackTraces().keys
+        .filter { it.isAlive && it.name.startsWith(prefix) && it.name !in JVM_WIDE_THREAD_NAMES }
+        .map { it.name }
 
 /** 終わらない計算（1 ずつ燃料を使い、[progress] を数える） */
 internal fun spinForever(progress: AtomicInteger? = null, sleepMillis: Long = 0): FakeModule = FakeModule.builder()
