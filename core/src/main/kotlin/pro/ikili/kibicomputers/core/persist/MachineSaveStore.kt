@@ -385,7 +385,10 @@ public class MachineSaveStore @JvmOverloads constructor(
     /** 読み手のスレッド（起動に成功してからだけ入れ、止める前に死んだのを見たら外す。#960。メインスレッドだけが触る） */
     private var sideReaderThread: Thread? = null
 
-    /** 読み手のスレッドの起動に最後に失敗した時刻（`System.nanoTime`。続けて失敗していなければ `null`。メインスレッドだけが触る。#960） */
+    /**
+     * 読み手のスレッドの起動に最後に失敗した時刻か、止める前に死んだのを最後に見た時刻（`System.nanoTime`。#960）。
+     * 続けて失敗していなければ `null`。メインスレッドだけが触る
+     */
     private var sideReaderFailedAt: Long? = null
 
     /**
@@ -400,8 +403,9 @@ public class MachineSaveStore @JvmOverloads constructor(
     }
 
     /**
-     * 読み手のスレッドの起動に失敗してから、次に試みるまでの間（ナノ秒。#960。仮の内部の値）。資源が戻らないままチャンクの読み込みで
-     * 多数の台が来ても、台ごとにスレッドの生成を試みない（その間の読みは書き込みの列に回す）。テストは 0 にする
+     * 読み手のスレッドの起動に失敗してから、または止める前に死んだのを見てから、次に起動を試みるまでの間（ナノ秒。#960。仮の内部の値）。
+     * 資源が戻らないままチャンクの読み込みで多数の台が来ても、作ったスレッドが続けてすぐ死んでも、台ごとにスレッドの生成を試みない
+     * （その間の読みは書き込みの列に回す）。テストは 0 にする
      */
     internal var sideReaderRetryNanos: Long = TimeUnit.SECONDS.toNanos(1)
 
@@ -433,8 +437,9 @@ public class MachineSaveStore @JvmOverloads constructor(
 
     /**
      * 読み手のスレッドを始める（最初の頼みのとき。置き場に 1 本で、台数によらない）。動いている（始められた）なら `true`。
-     * 起動に失敗したら（#960）`false` を返し、[sideReaderRetryNanos] の間は試み直さない（`false` のまま）。warn は、続けて失敗したうちの
-     * 最初の 1 回と、その後に始められたときだけ出す。失敗した [Thread] は使い回さず、試み直すときは新しく作る
+     * 起動に失敗したら（#960）`false` を返し、[sideReaderRetryNanos] の間は試み直さない（`false` のまま）。止める前に死んだのを見たとき
+     * （[recoverDeadSideReader]）も同じ間を置く。warn は、続けて失敗したうちの最初の 1 回と、その後に始められたときだけ出す
+     * （死んだのを見たときは、その warn が最初の 1 回になる）。失敗した・死んだ [Thread] は使い回さず、試み直すときは新しく作る
      */
     private fun startSideReader(): Boolean {
         val running = sideReaderThread
@@ -460,7 +465,7 @@ public class MachineSaveStore @JvmOverloads constructor(
             return false
         }
         if (failedAt != null) {
-            LOG.log(System.Logger.Level.WARNING, "Started the owner reader of $root after $sideReaderStartFailures failed attempts")
+            LOG.log(System.Logger.Level.WARNING, "Started the owner reader of $root again (failed starts so far: $sideReaderStartFailures, unexpected stops so far: $sideReaderDeaths)")
         }
         sideReaderFailedAt = null
         sideReaderThread = thread
@@ -481,7 +486,9 @@ public class MachineSaveStore @JvmOverloads constructor(
      * 初めと [startSideReader] が呼ぶ）。読みの `try` の外の Error（メモリ不足など）や割り込みで抜けると、読み手のいない列に頼みが残り、
      * 取り出し済みの 1 件も結果を返さないまま、その台が待ちの上限で新しい UUID になるため。死んだスレッドの結果を先に受け取ってから、
      * 列に残った頼みと取り出し済みの 1 件（[sideTaken]）のうち、まだ結果を待っているものを [requestedReads] から外す（次の [ensureOwnerRead] が、
-     * 新しい番号で読み手を作り直すか、書き込みの列に回す）。死んだのを見たときだけ warn を出す。動いている・止めた・始めていなければ何もしない
+     * 新しい番号で読み手を作り直すか、書き込みの列に回す）。死んだのを見たら、起動の失敗と同じく [sideReaderRetryNanos] の間は作り直さない
+     * （続けてすぐ死ぬとき、待ちの ID ごとにスレッドの生成と warn を繰り返さず、その間の頼みは書き込みの列で読む）。warn は、続けた失敗・死の
+     * 最初の 1 回だけ出す。動いている・止めた・始めていなければ何もしない
      */
     private fun recoverDeadSideReader() {
         val thread = sideReaderThread ?: return
@@ -489,7 +496,10 @@ public class MachineSaveStore @JvmOverloads constructor(
         // isAlive が偽を返した後は、死んだスレッドの書き込み（結果・sideTaken）がすべて見える
         sideReaderThread = null
         sideReaderDeaths++
-        LOG.log(System.Logger.Level.WARNING, "The owner reader of $root stopped unexpectedly; requesting its reads again")
+        if (sideReaderFailedAt == null) {
+            LOG.log(System.Logger.Level.WARNING, "The owner reader of $root stopped unexpectedly; requesting its reads again")
+        }
+        sideReaderFailedAt = System.nanoTime()
         drainOwnerReadResults()
         val left = sideQueueLock.withLock { sideQueue.entries.map { it.key to it.value }.also { sideQueue.clear() } }
         val taken = sideTaken
@@ -515,6 +525,7 @@ public class MachineSaveStore @JvmOverloads constructor(
      * （メインスレッドが書き込みの列に回し直す。前の仕事の前のディスクを読まず、書き込みのスレッドの置き換えとも重ねない）。
      * 読みが落ちても（Error も）「読めなかった」で返す。止められたら（[stopSideReader]）、それまでに頼まれていた分を読んでから抜ける。
      * 止める前に抜けたら（読みの `try` の外の Error・割り込み）、残った頼みと取り出し済みの 1 件は、メインスレッドが [recoverDeadSideReader] で頼み直す
+     * （メインスレッドが気づく前に止めたときは、[stopSideReader] が読めなかったとして返す）
      */
     private fun runSideReader() {
         while (true) {
@@ -558,14 +569,18 @@ public class MachineSaveStore @JvmOverloads constructor(
             ownerReadResults.add(OwnerRead(id, seq, value))
             sideTaken = null
         }
-        // 止める前に割り込みで抜けたときは、残った頼みを列に残す（メインスレッドが死んだのを見て頼み直す。#960）
+        // 止める前に割り込みで抜けたときは、残った頼みを列に残す（メインスレッドが死んだのを見て頼み直す。気づく前に止めたら stopSideReader が返す。#960）
         if (!sideReaderClosed) return
         // 止めた後に割り込みで抜けたときに残った頼みは、読めなかったとして返す（書き込みの口が閉じたときと同じ）
         val left = sideQueueLock.withLock { sideQueue.entries.map { it.key to it.value }.also { sideQueue.clear() } }
         for ((id, seq) in left) ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("the owner reader is closed")))
     }
 
-    /** 読み手を止めて join する（[close]）。止まれば（始めていなければ）`true` */
+    /**
+     * 読み手を止めて join する（[close]）。止まれば（始めていなければ）`true`。止まった後に、列に残った頼みと取り出し済みの 1 件（[sideTaken]）が
+     * あれば（止める前に死んでいて、メインスレッドがまだ気づいていなかった。#960）、読めなかったとして返す（止めた後は [recoverDeadSideReader] が
+     * 頼み直さないので、返さないとその ID の待ちが上限まで残る）
+     */
     private fun stopSideReader(timeoutMillis: Long): Boolean {
         sideReaderClosed = true
         val thread = sideReaderThread ?: return true
@@ -578,7 +593,17 @@ public class MachineSaveStore @JvmOverloads constructor(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        return !thread.isAlive
+        if (thread.isAlive) return false
+        // isAlive が偽を返した後は、読み手の書き込み（結果・sideTaken）がすべて見える。ふつうに抜けたなら、列は空で取り出し済みもない
+        val left = sideQueueLock.withLock { sideQueue.entries.map { it.key to it.value }.also { sideQueue.clear() } }
+        val taken = sideTaken
+        sideTaken = null
+        val unread = left + listOfNotNull(taken)
+        if (unread.isNotEmpty()) {
+            LOG.log(System.Logger.Level.WARNING, "The owner reader of $root had stopped before close; ${unread.size} reads are returned as unreadable")
+            for ((id, seq) in unread) ownerReadResults.add(OwnerRead(id, seq, Prefetched.Unreadable("the owner reader is closed")))
+        }
+        return true
     }
 
     /**
