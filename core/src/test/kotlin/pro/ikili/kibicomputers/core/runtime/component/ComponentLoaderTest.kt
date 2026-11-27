@@ -6,9 +6,12 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.assertTimeoutPreemptively
+import pro.ikili.kibicomputers.core.kernel.getOrFail
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import pro.ikili.kibicomputers.core.runtime.TestModules
 import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
@@ -25,9 +28,6 @@ import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.Timeout
-import pro.ikili.kibicomputers.core.kernel.joinOrFail
-import pro.ikili.kibicomputers.core.kernel.getOrFail
 
 /** コンポーネントのバイナリの読み込みと検証（#262） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）

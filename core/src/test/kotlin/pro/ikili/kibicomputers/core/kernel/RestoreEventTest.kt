@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.kernel
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
@@ -39,7 +40,6 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
 
 /**
  * 復元のイベント `restored`（#87、ADR 0087）: 成功した復元で、戻したキューに1件ずつ届き、値は実時間・ゲーム内時間の飛び。

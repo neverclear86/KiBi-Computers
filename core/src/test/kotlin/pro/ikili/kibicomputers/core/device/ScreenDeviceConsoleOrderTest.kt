@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.device
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -10,15 +11,14 @@ import pro.ikili.kibicomputers.core.display.TextBuffer
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
-import pro.ikili.kibicomputers.core.kernel.joinOrFail
-import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 
 /**
  * TTY の出力の後に書いたカーネルのメッセージが、TTY の出力より後に出ること（#435、#381）。

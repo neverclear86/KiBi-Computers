@@ -3,7 +3,9 @@ package pro.ikili.kibicomputers.core.runtime.endive
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import pro.ikili.kibicomputers.core.runtime.WasmBinary
 import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.I32
 import pro.ikili.kibicomputers.core.runtime.WasmBinary.Companion.I64
@@ -16,9 +18,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmRuntimeContractTest
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
-import org.junit.jupiter.api.Timeout
 import java.util.concurrent.TimeUnit
-import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class EndiveRuntimeTest : WasmRuntimeContractTest() {

@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.kernel
 
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.event.EventValue
 import pro.ikili.kibicomputers.core.kernel.event.EventQueue
 import pro.ikili.kibicomputers.core.kernel.event.EventFilter
@@ -69,7 +70,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
 
 /**
  * 復元（#85、ADR 0085）の主な分岐（#578、#590）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・

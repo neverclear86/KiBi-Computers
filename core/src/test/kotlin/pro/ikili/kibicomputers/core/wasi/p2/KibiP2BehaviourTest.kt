@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.wasi.p2
 
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.access.AccessPort
 import pro.ikili.kibicomputers.core.access.AccessRequest
 import pro.ikili.kibicomputers.core.access.AccessRequestLimiter
@@ -60,7 +61,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
 
 /**
  * `kibi:*` の p2 の振る舞い（#685。ADR 0685）。コンポーネントのプロセスの中から、ホストの関数の本体を直接呼んで確かめる

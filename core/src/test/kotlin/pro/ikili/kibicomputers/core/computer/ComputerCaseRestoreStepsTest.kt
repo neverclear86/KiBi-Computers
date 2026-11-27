@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import pro.ikili.kibicomputers.api.device.Device
@@ -26,6 +27,7 @@ import pro.ikili.kibicomputers.core.kernel.SchedulerConfig
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolume
 import pro.ikili.kibicomputers.core.kernel.boot.BootVolumeOpener
 import pro.ikili.kibicomputers.core.kernel.eventually
+import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
 import pro.ikili.kibicomputers.core.kernel.io.ByteStream
@@ -52,6 +54,7 @@ import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.logging.Handler
 import java.util.logging.Level
@@ -59,9 +62,6 @@ import java.util.logging.LogRecord
 import java.util.logging.Logger
 import kotlin.concurrent.withLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
-import java.util.concurrent.TimeUnit
-import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 
 /**
  * [ComputerCase.startRestore] の [RestoreReady]（接続層のデバイスのつなぎ）が投げても、後の手順（配り直し・冷えた起動・`finished`・

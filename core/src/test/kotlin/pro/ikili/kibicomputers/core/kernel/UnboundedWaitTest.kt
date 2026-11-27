@@ -6,9 +6,12 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
+import org.junit.jupiter.api.assertTimeoutPreemptively
+import org.opentest4j.AssertionFailedError
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
+import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -270,5 +273,69 @@ class UnboundedWaitTest {
             assertTrue(g.interrupted.get(), "門で止まったスレッドに割り込む（$interruptedBefore）")
             assertNoKernelThreads()
         }
+    }
+
+    @Test
+    fun `Harnessのcloseの割り込みは、自分のスケジューラのスレッドだけに及ぶ`() {
+        val unrelatedInterrupted = AtomicBoolean()
+        val stop = CountDownLatch(1)
+        val unrelated = Thread({
+            try {
+                stop.await()
+            } catch (e: InterruptedException) {
+                unrelatedInterrupted.set(true)
+            }
+        }, "KiBi-unrelated")
+        unrelated.isDaemon = true
+        unrelated.start()
+        val g = GatedBoot(firstCloseWaitMillis = 200)
+        try {
+            assertThrows<AssertionError> { g.h.close() }
+            assertTrue(g.interrupted.get(), "自分のスケジューラのスレッドには割り込む")
+            // 割り込みはその場で届くので、少し待っても何も起きないことを見る（待ちは否定の確認のためだけ）
+            Thread.sleep(200)
+            assertTrue(unrelated.isAlive && !unrelatedInterrupted.get(), "名前が KiBi- で始まるだけの無関係なスレッドには割り込まない")
+        } finally {
+            g.release.countDown()
+            stop.countDown()
+            unrelated.joinOrFail()
+        }
+        assertNoKernelThreads()
+    }
+
+    @Test
+    fun `failOnInterruptは、割り込まれたときに説明を標準出力にも出す`() {
+        try {
+            val lines = capturedLines {
+                assertThrows<AssertionError> {
+                    failOnInterrupt({ "出る説明" }) {
+                        Thread.currentThread().interrupt()
+                        Thread.sleep(60_000)
+                    }
+                }
+            }
+            assertTrue(lines.isNotEmpty() && lines.all { it.startsWith("$SLOW_WAIT_MARKER: ") }, lines.toString())
+            assertTrue(lines.any { it.contains("出る説明") }, lines.toString())
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
+    fun `assertTimeoutPreemptivelyが先に切れても、止まった待ちの説明は標準出力に残る`() {
+        val out = ByteArrayOutputStream()
+        val old = System.out
+        System.setOut(PrintStream(out, true, "UTF-8"))
+        try {
+            assertThrows<AssertionFailedError> {
+                assertTimeoutPreemptively(Duration.ofMillis(100)) { eventually(60_000, "先に切れた待ち") { false } }
+            }
+            // 捨てられた実行スレッドが、割り込みを受けて説明を出すのを待つ
+            eventually { out.toString("UTF-8").contains("先に切れた待ち") }
+        } finally {
+            System.setOut(old)
+        }
+        val lines = out.toString("UTF-8").lines().filter { it.startsWith("$SLOW_WAIT_MARKER: ") }
+        assertTrue(lines.any { it.contains("先に切れた待ち") }, lines.toString())
     }
 }

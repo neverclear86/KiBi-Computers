@@ -6,11 +6,11 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import pro.ikili.kibicomputers.core.kernel.MemoryAccount
-import pro.ikili.kibicomputers.core.runtime.WasmMemory
 import org.junit.jupiter.api.Timeout
-import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.MemoryAccount
 import pro.ikili.kibicomputers.core.kernel.joinOrFail
+import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import java.util.concurrent.TimeUnit
 
 /** メモリ上のファイルシステム（`/tmp`。#53） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）

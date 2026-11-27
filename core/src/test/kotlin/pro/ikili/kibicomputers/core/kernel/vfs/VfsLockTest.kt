@@ -4,13 +4,13 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
+import pro.ikili.kibicomputers.core.kernel.getOrFail
 import java.util.concurrent.Executors
 import java.util.concurrent.Phaser
 import java.util.concurrent.TimeUnit
-import org.junit.jupiter.api.Timeout
-import pro.ikili.kibicomputers.core.kernel.getOrFail
 
 /** VFS をカーネルロックの外で、いくつものスレッドから使う（#52。ADR 0052） */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）

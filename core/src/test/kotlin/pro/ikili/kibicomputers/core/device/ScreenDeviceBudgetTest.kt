@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.device
 
+import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.computer.CaseTier
 import pro.ikili.kibicomputers.core.computer.ComputerCase
 import pro.ikili.kibicomputers.core.computer.ComputerStatus
@@ -14,7 +15,9 @@ import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineConfig
 import pro.ikili.kibicomputers.core.kernel.MachineHost
 import pro.ikili.kibicomputers.core.kernel.MachineState
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 import pro.ikili.kibicomputers.core.kernel.eventuallyDescribe
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 import pro.ikili.kibicomputers.core.machine.MachineManager
 import java.time.Duration
 import java.util.concurrent.CountDownLatch
@@ -22,9 +25,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
-import org.junit.jupiter.api.Timeout
-import pro.ikili.kibicomputers.core.kernel.awaitOrFail
-import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** 1台・1 tick の、メインスレッドでの端末の処理量（#357・#355）。同梱イメージ testboot（Lua の REPL）で、実際の出力を流す */
 @Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
