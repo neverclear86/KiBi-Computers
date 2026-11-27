@@ -188,6 +188,26 @@ class RestoreModuleWaitTest {
         scheduler.programs.loadingCount == loading && scheduler.bootExecutor.activeCount == 0 && scheduler.bootExecutor.queue.isEmpty()
 
     @Test
+    fun `復元のモジュールの読み込みも、JVMの中の共有の表を通る（#991）`() = timeout(limit) {
+        val store = MachineSaveStore(dir, MachineIdIndex(), "test")
+        val modules = MemoryModuleStore()
+        // 保存する側が exec で読み込んだ prompt が、共有の表に入る
+        val saved = save(store, modules).single()
+        // 共有する（既定の）スケジューラで復元する。ProgramCache は新しいので、復元の読み込みは差し込み口まで届く
+        Harness(execRuntime = EndiveRuntime(), moduleStore = modules).use { h ->
+            volumes(h)
+            val table = SharedPrograms.table
+            val hits = table.hits.get()
+            val misses = table.misses.get()
+            val (m, result) = restoreAndAwait(h, saved, store)
+            assertEquals(RestoreOutcome.RESTORED, result.second, result.toString())
+            assertEquals(1L, table.hits.get() - hits, "復元の読み込みが共有の表を通らない")
+            assertEquals(misses, table.misses.get(), "共有の表にあるものを読み込み直している")
+            m.close()
+        }
+    }
+
+    @Test
     fun `起動用のスレッドが1本でも、読み込みを待つ復元の間に別の台の冷えた起動が進む`() = timeout(limit) {
         val store = MachineSaveStore(dir, MachineIdIndex(), "test")
         val modules = MemoryModuleStore()

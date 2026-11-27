@@ -638,10 +638,10 @@ class DiskHotplugTest {
     }
 
     /** kibi-fs-wasi（p1 の `kibi:fs/mounts`）を [args] で動かし、出力を返す */
-    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String = runKibiFsCounting(h, m, *args).first
+    private fun runKibiFs(h: Harness, m: Machine, vararg args: String): String = runKibiFsMeasuring(h, m, *args).first
 
-    /** [runKibiFs] と、終わるまでに回した tick の数 */
-    private fun runKibiFsCounting(h: Harness, m: Machine, vararg args: String, metered: Boolean = false): Pair<String, Int> {
+    /** [runKibiFs] と、終わるまでにスケジューラが数えた燃料の使用量（[MachineScheduler.fuelConsumedTotal]。壁時計に左右されない） */
+    private fun runKibiFsMeasuring(h: Harness, m: Machine, vararg args: String, metered: Boolean = false): Pair<String, Long> {
         val output = m.lock.withLockValue { m.kernel.objects.add(ByteStream(64 * 1024)) }
         val options = SpawnOptions(
             allowUnmetered = !metered,
@@ -649,6 +649,7 @@ class DiskHotplugTest {
             args = listOf("kibi-fs") + args,
             stdio = StdioSpec(StdioSource.Console, StdioSource.Object(output, HandleRights.WRITE), StdioSource.Console),
         )
+        val fuelBefore = h.scheduler.fuelConsumedTotal
         val pid = if (metered) {
             // 燃料を計測するモジュールとして、ディスクの /bin/kibi-fs を exec する
             m.exec("/bin/kibi-fs", KernelDrivers.DEFAULT, options)
@@ -656,10 +657,8 @@ class DiskHotplugTest {
             val program = Program.load(EndiveRuntime(), resource("kibi-fs-wasi.wasm"))
             m.spawn(program, WasiP1Driver(program.module), options)
         }
-        var ticks = 0
         eventually(60_000, "終わらない") {
             h.scheduler.tick()
-            ticks++
             m.stateOf(pid).isTerminal
         }
         val text = m.lock.withLockValue {
@@ -668,7 +667,7 @@ class DiskHotplugTest {
             if (buf.isNotEmpty()) s.read(buf, 0, buf.size, m.wakeSink)
             String(buf, Charsets.UTF_8)
         }
-        return text to ticks
+        return text to (h.scheduler.fuelConsumedTotal - fuelBefore)
     }
 
     @Test
@@ -874,9 +873,9 @@ class DiskHotplugTest {
 
     @Test
     fun `mountは固定の燃料を払うので、mountとunmountを繰り返すゲストは少ない燃料では進めない`() = timeout(limit) {
-        // tick の数は、プロセスが終わるまで tick を回した回数（壁時計に左右される）で、1 回目の exec の読み込みを待つ間の tick も入る。
-        // 2 回の比べの余裕がその分に頼っているので、JVM の中の共有の表（#991）で 1 回目の読み込みを飛ばさない
-        Harness(execRuntime = EndiveRuntime(), sharePrograms = false).use { h ->
+        // 比べるのは、スケジューラが数えた燃料の使用量（fuelConsumedTotal）。tick を回した回数は、待っている間の空回りで壁時計に
+        // 左右されるので使わない。燃料の計測は命令の数で決まるので、JVM の中の共有の表（#991）で読み込みを飛ばしても結果は変わらない
+        Harness(execRuntime = EndiveRuntime()).use { h ->
             // 1 tick の燃料を、mount 1回の固定分（MOUNT_FUEL = 50,000）の 2 倍にする
             val root = rootFs()
             root.createDirectory(VfsPath.parse("/bin"))
@@ -887,14 +886,15 @@ class DiskHotplugTest {
             m.unmountAt(VfsPath.parse("/mnt/d1"))
             val cycles = 20
             val mountArgs = (1..cycles).flatMap { listOf("mount", "disk:d1", "/x", "0", "unmount", "/x") }.toTypedArray()
-            val (out, mountTicks) = runKibiFsCounting(h, m, *mountArgs, metered = true)
+            val (out, mountFuel) = runKibiFsMeasuring(h, m, *mountArgs, metered = true)
             assertEquals(cycles * 2, out.lines().count { it == "mount 0" || it == "unmount 0" })
             // 同じ数の呼び出しでも、mount でない unmount（失敗）なら燃料は 100 ずつ
             val cheapArgs = (1..cycles).flatMap { listOf("unmount", "/nowhere", "unmount", "/nowhere") }.toTypedArray()
-            val (_, cheapTicks) = runKibiFsCounting(h, m, *cheapArgs, metered = true)
-            // 20 回の mount は 1,000,000 以上の燃料 = 100,000 ずつの tick で 9 回以上は待つ
-            assertTrue(mountTicks >= 10, "mount の燃料が払われていない: $mountTicks tick（unmount だけは $cheapTicks tick）")
-            assertTrue(mountTicks > cheapTicks + 5, "mount: $mountTicks tick、unmount だけ: $cheapTicks tick")
+            val (_, cheapFuel) = runKibiFsMeasuring(h, m, *cheapArgs, metered = true)
+            // 20 回の mount の固定分（50,000 ずつで 1,000,000）が、使った燃料に入っている
+            val fixed = cycles * MachineLimits.MOUNT_FUEL
+            assertTrue(mountFuel >= fixed, "mount の燃料が払われていない: mount $mountFuel、unmount だけ $cheapFuel")
+            assertTrue(mountFuel - cheapFuel >= fixed / 2, "mount: $mountFuel、unmount だけ: $cheapFuel")
             m.close()
         }
     }

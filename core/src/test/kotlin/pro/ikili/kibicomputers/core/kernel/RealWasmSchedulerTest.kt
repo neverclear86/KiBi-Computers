@@ -9,7 +9,6 @@ import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.StepResult
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
@@ -20,7 +19,7 @@ class RealWasmSchedulerTest {
     private val fib: Program by lazy {
         val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/fib.wasm")?.use { it.readBytes() }
         assertNotNull(bytes, "fib.wasm がリソースにない")
-        Program.load(EndiveRuntime(), bytes!!)
+        SharedPrograms.load(bytes!!)
     }
 
     private fun fibDriver(n: Int, result: AtomicLong) = TestDriver(ProcessKind.BLOCKING) { ctx ->

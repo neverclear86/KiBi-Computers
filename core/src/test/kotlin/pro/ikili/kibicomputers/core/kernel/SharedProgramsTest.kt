@@ -14,9 +14,12 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentProgram
+import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import pro.ikili.kibicomputers.core.wasi.p1.WasiP1
+import pro.ikili.kibicomputers.core.wasi.p2.P2Testing
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -116,5 +119,62 @@ class SharedProgramsTest {
         table.getOrLoad<String>("huge", { 100 }) { "huge" }
         assertEquals(1, table.size, "上限より重い 1 件は残す")
         assertEquals("huge", table.getOrLoad<String>("huge", { 100 }) { "huge2" })
+    }
+
+    @Test
+    fun `loadとloadMeteredは、同じバイト列・同じ引数なら同じProgramを返す`() = timeout(Duration.ofSeconds(120)) {
+        assertSame(SharedPrograms.load(prompt), SharedPrograms.load(prompt))
+        assertSame(SharedPrograms.loadMetered(prompt, waits), SharedPrograms.loadMetered(prompt, waits))
+        assertNotSame(SharedPrograms.load(prompt), SharedPrograms.loadMetered(prompt, waits), "計測するかどうかで別")
+        assertNotSame(SharedPrograms.loadMetered(prompt, waits), SharedPrograms.loadMetered(prompt, emptySet()), "待機の import が違えば別")
+    }
+
+    @Test
+    fun `componentは、既定のランタイムなら同じものを返し、kindと計測の有無とホストが違えば別に読み込む`() = timeout(Duration.ofSeconds(120)) {
+        val bytes = LinkTesting.wat("(component)")
+        var loads = 0
+        fun load(kind: String, runtime: EndiveRuntime, metered: Boolean = true, host: ComponentHost = ComponentHost.NONE): ComponentProgram =
+            SharedPrograms.component(kind, runtime, bytes, host, metered) {
+                loads++
+                ComponentProgram.load(runtime, bytes, host, metered, policy = LinkTesting.ANY_IMPORT)
+            }
+
+        val runtime = EndiveRuntime()
+        val base = load("a", runtime)
+        assertSame(base, load("a", runtime))
+        assertSame(base, load("a", EndiveRuntime()), "ランタイムのインスタンスが違っても、既定のものなら共有する")
+        assertEquals(1, loads)
+        assertNotSame(base, load("b", runtime), "kind が違う")
+        assertNotSame(base, load("a", runtime, metered = false), "計測の有無が違う")
+        assertNotSame(base, load("a", runtime, host = ComponentHost { null }), "ホストが違う")
+        assertEquals(4, loads)
+        val interpreted = EndiveRuntime(compile = false)
+        assertNotSame(load("a", interpreted), load("a", interpreted), "インタプリタだけのランタイムは共有しない")
+    }
+
+    @Test
+    fun `LinkTestingのloadは、状態を持たないホストで検証の差し込みがないときだけ共有する`() = timeout(Duration.ofSeconds(120)) {
+        val text = "(component)"
+        val shared = LinkTesting.load(text)
+        assertSame(shared, LinkTesting.load(text))
+        assertNotSame(shared, LinkTesting.load(text, metered = true))
+        var validated = 0
+        val first = LinkTesting.load(text, validate = { validated++ })
+        val second = LinkTesting.load(text, validate = { validated++ })
+        assertNotSame(first, second, "validate 付きは共有しない")
+        assertNotSame(shared, first)
+        assertEquals(2, validated, "validate は読み込みごとに呼ばれる")
+        val host = ComponentHost { null }
+        assertNotSame(LinkTesting.load(text, host), LinkTesting.load(text, host), "ホストが NONE でなければ共有しない")
+        val interpreted = EndiveRuntime(compile = false)
+        assertNotSame(LinkTesting.load(text, runtime = interpreted), LinkTesting.load(text, runtime = interpreted), "インタプリタだけのランタイムは共有しない")
+    }
+
+    @Test
+    fun `P2Testingのloadは、同じバイト列・同じ計測の有無なら共有する`() = timeout(Duration.ofSeconds(120)) {
+        val bytes = LinkTesting.wat("(component)")
+        val metered = P2Testing.load(bytes)
+        assertSame(metered, P2Testing.load(bytes))
+        assertNotSame(metered, P2Testing.load(bytes, metered = false))
     }
 }
