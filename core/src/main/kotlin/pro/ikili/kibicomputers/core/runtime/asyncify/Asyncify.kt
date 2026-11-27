@@ -336,14 +336,13 @@ private fun hierarchy(t: Int): Int = when (t) {
 
 private fun Pair<List<Int>, List<Int>>.hasWild() = WILD_REF in first || WILD_REF in second
 
-/** [hierarchy] の鍵どうしが合いうるか。[WILD_REF] は参照の位置にだけ合う（[WILD_REF] は数値にならない） */
-private fun sigMatches(a: Pair<List<Int>, List<Int>>, b: Pair<List<Int>, List<Int>>): Boolean {
-    fun same(x: List<Int>, y: List<Int>) = x.size == y.size && x.indices.all { i ->
-        val p = x[i]
-        val q = y[i]
-        p == q || ((p == WILD_REF || q == WILD_REF) && isRefKey(p) && isRefKey(q))
-    }
-    return same(a.first, b.first) && same(a.second, b.second)
+/**
+ * [hierarchy] の鍵の形。参照の位置（階層と [WILD_REF]）をすべて [WILD_REF] にまとめ、引数・結果の数と数値の位置だけを残す。
+ * [WILD_REF] は参照の位置にだけ合うので、形が同じことは、片方が [WILD_REF] を持つ鍵どうしが合いうるための必要条件になる
+ */
+private fun shape(k: Pair<List<Int>, List<Int>>): Pair<List<Int>, List<Int>> {
+    fun refs(x: List<Int>) = x.map { if (isRefKey(it)) WILD_REF else it }
+    return refs(k.first) to refs(k.second)
 }
 
 private fun isRefKey(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128
@@ -549,13 +548,21 @@ private class Transformer(
      * 参照の位置は部分型で比べる。`sub` の宣言は要らない）。ここでは保守的に、引数・結果の数が同じで、数値の位置は同じ型、
      * 参照の位置は同じ階層（any・func・extern・exn）なら合いうるとみなす（[hierarchy]）。追えない参照型（[BOT]）と知らない参照型は、
      * どの参照の位置にも合う。外の型は解析の間に変わらないので、最初に引いたときに 1 回だけ作る
+     *
+     * 照合は、型ごとに集合を 1、2 回引くだけにする（型の数 + 外の型の数に比例。型の数の上限はモジュールごとに 100,000）。
+     * 追えない参照型を、呼び出し側か外の型のどちらかが持つときは、階層を比べずに形（[shape]。数と数値の位置）だけで合いうるとみなす。
+     * 階層まで比べると、追えない側の型の 1 つごとに相手をすべてなめることになり、最悪で両者の数の積になるため。
+     * 形だけの照合は階層の照合より粗いので、安全側（止まりうる側）に含まれる
      */
     private val externalMatch: BooleanArray by lazy {
         val exact = HashSet<Pair<List<Int>, List<Int>>>()
-        val wild = ArrayList<Pair<List<Int>, List<Int>>>()
+        // 外の型の形。追えない参照型を含むものと、すべての外の型
+        val wildShapes = HashSet<Pair<List<Int>, List<Int>>>()
+        val allShapes = HashSet<Pair<List<Int>, List<Int>>>()
         for (s in externalSuspendTypes) {
             val k = s.params.map(::hierarchy) to s.results.map(::hierarchy)
-            if (k.hasWild()) wild += k else exact += k
+            if (k.hasWild()) wildShapes += shape(k) else exact += k
+            allShapes += shape(k)
         }
         BooleanArray(typeSigs.size) { i ->
             val t = typeSigs[i]
@@ -563,11 +570,7 @@ private class Transformer(
                 false
             } else {
                 val k = t.params.map(::hierarchy) to t.results.map(::hierarchy)
-                if (k.hasWild()) {
-                    exact.any { sigMatches(k, it) } || wild.any { sigMatches(k, it) }
-                } else {
-                    k in exact || wild.any { sigMatches(k, it) }
-                }
+                if (k.hasWild()) shape(k) in allShapes else k in exact || shape(k) in wildShapes
             }
         }
     }

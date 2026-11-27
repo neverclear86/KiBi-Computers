@@ -11,6 +11,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmFunctionType
 import pro.ikili.kibicomputers.core.runtime.WasmInstanceConfig
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
+import pro.ikili.kibicomputers.core.runtime.endive.interpretedFunctions
+import pro.ikili.kibicomputers.core.runtime.endive.isCompiled
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
 
 /**
@@ -30,13 +32,28 @@ class AsyncifySubtypeTest {
     }
 
     /**
-     * `w.wait`（`() -> i32`。1 回目は巻き戻し、巻き直しと 2 回目からは 41 を返す）を付けて、変換した `run` を呼び、巻き直して結果を返す。
-     * 変換の出力は `wasm-tools validate` に通ること
+     * 変換した [wasm] を、本番の既定のランタイムコンパイラ（`call_indirect` は `Compiler.compileCallIndirect` の照合）と、
+     * インタプリタ（`call_indirect` は別の実装）の両方で動かし（[runWithWait]）、どちらも [expected] になること
      */
-    private fun runWithWait(wasm: ByteArray, debug: AsyncifyDebug): Long {
+    private fun assertRunsOnBoth(wasm: ByteArray, expected: Long) {
+        for (debug in AsyncifyDebug.entries) {
+            assertEquals(expected, runWithWait(wasm, debug, compile = true), "$debug コンパイルあり")
+            assertEquals(expected, runWithWait(wasm, debug, compile = false), "$debug インタプリタだけ")
+        }
+    }
+
+    /**
+     * `w.wait`（`() -> i32`。1 回目は巻き戻し、巻き直しと 2 回目からは 41 を返す）を付けて、変換した `run` を呼び、巻き直して結果を返す。
+     * 変換の出力は `wasm-tools validate` に通ること。[compile] なら、どの関数もインタプリタに回っていない（全部コンパイルした）ことも確かめる
+     */
+    private fun runWithWait(wasm: ByteArray, debug: AsyncifyDebug, compile: Boolean): Long {
         val bytes = Asyncify.transform(wasm, setOf("w.wait"), debug = debug).bytes
         assertNull(WitTool.validate(bytes))
-        val module = EndiveRuntime(compile = false).load(bytes)
+        val module = (if (compile) EndiveRuntime() else EndiveRuntime(compile = false)).load(bytes)
+        if (compile) {
+            assertTrue(isCompiled(module), "コンパイルできずにインタプリタに回った")
+            assertEquals(emptySet<Int>(), interpretedFunctions(module))
+        }
         val stack = Stack()
         var unwound = false
         val config = WasmInstanceConfig.builder()
@@ -91,7 +108,7 @@ class AsyncifySubtypeTest {
             """.trimIndent(),
         )
         assertEquals(setOf("run"), exports(wasm, setOf("w.wait")))
-        for (debug in AsyncifyDebug.entries) assertEquals(142L, runWithWait(wasm, debug), "$debug")
+        assertRunsOnBoth(wasm, 142L)
     }
 
     /** 上位の型が 2 段（`$u <: $s <: $t`）で、結果も共変（`$t (result anyref)`、`$u (result i31ref)`）のもの */
@@ -118,7 +135,7 @@ class AsyncifySubtypeTest {
             """.trimIndent(),
         )
         assertEquals(setOf("run"), exports(wasm, setOf("w.wait")))
-        for (debug in AsyncifyDebug.entries) assertEquals(142L, runWithWait(wasm, debug), "$debug")
+        assertRunsOnBoth(wasm, 142L)
     }
 
     /**
@@ -156,6 +173,37 @@ class AsyncifySubtypeTest {
         assertEquals(setOf("run"), exports(viaRef, setOf("w.wait")))
     }
 
+    /**
+     * rec グループをまたいだ正規の同値（`TypeSection.canonicallyEquivalent`）。`$t2` は `$t` と同じ形で宣言した別の番号の型（それぞれ 1 つだけの
+     * rec グループなので、正規に同値）。Endive の `heapTypeSubtype` は、`$s` の上位の型をたどった段（`$t`）で `$t2` と同値とみなすので、
+     * `call_indirect (type $t2)` も `$f` を呼ぶ。照合は型の番号でなく並び（`suspendTypes`）で行うので、`$t2` も止まりうる。
+     * 照合を型の番号（`suspendTypeIdx`）の比較に変えると、このテストが落ちる
+     */
+    @Test
+    fun `上位の型と正規に同値な別の番号の型のcall_indirectも、止まりうるとみなして巻き戻せる`() {
+        val wasm = WitTool.wat(
+            """
+            (module
+              (type ${'$'}t (sub (func (param eqref) (result i32))))
+              (type ${'$'}s (sub ${'$'}t (func (param anyref) (result i32))))
+              (type ${'$'}t2 (sub (func (param eqref) (result i32))))
+              (import "w" "wait" (func ${'$'}wait (result i32)))
+              (global ${'$'}g (mut i32) (i32.const 0))
+              (table 1 funcref)
+              (elem (i32.const 0) ${'$'}f)
+              (func ${'$'}f (type ${'$'}s)
+                (i32.add (call ${'$'}wait) (i32.const 1)))
+              (func (export "run") (result i32)
+                (global.set ${'$'}g (i32.add (global.get ${'$'}g) (i32.const 100)))
+                (i32.add
+                  (call_indirect (type ${'$'}t2) (ref.null eq) (i32.const 0))
+                  (global.get ${'$'}g))))
+            """.trimIndent(),
+        )
+        assertEquals(setOf("run"), exports(wasm, setOf("w.wait")))
+        assertRunsOnBoth(wasm, 142L)
+    }
+
     /** 止まりうる関数への末尾呼び出しは断る（ADR 0329）。上位の型の `return_call_indirect` も、止まりうる関数への末尾呼び出しになる */
     @Test
     fun `上位の型のreturn_call_indirectは、止まりうる関数への末尾呼び出しとして断る`() {
@@ -172,7 +220,32 @@ class AsyncifySubtypeTest {
                 (return_call_indirect (type ${'$'}t) (ref.null eq) (i32.const 0))))
             """.trimIndent(),
         )
-        assertThrows<AsyncifyUnsupported> { Asyncify.transform(wasm, setOf("w.wait")) }
+        assertTailCallRejected(wasm, "RETURN_CALL_INDIRECT")
+    }
+
+    /** 上位の型の `return_call_ref`（参照の静的な型の部分型の関数を末尾で呼ぶ）も、止まりうる関数への末尾呼び出しとして断る（ADR 0329 の追記） */
+    @Test
+    fun `上位の型のreturn_call_refは、止まりうる関数への末尾呼び出しとして断る`() {
+        val wasm = WitTool.wat(
+            """
+            (module
+              (type ${'$'}t (sub (func (param eqref) (result i32))))
+              (type ${'$'}s (sub ${'$'}t (func (param anyref) (result i32))))
+              (import "w" "wait" (func ${'$'}wait (result i32)))
+              (elem declare func ${'$'}f)
+              (func ${'$'}f (type ${'$'}s) (call ${'$'}wait))
+              (func (export "run") (result i32)
+                (return_call_ref ${'$'}t (ref.null eq) (ref.func ${'$'}f))))
+            """.trimIndent(),
+        )
+        assertTailCallRejected(wasm, "RETURN_CALL_REF")
+    }
+
+    /** 変換が、[opcode] の止まりうる関数への末尾呼び出しとして断ること（ほかの理由で断ったのではないこと） */
+    private fun assertTailCallRejected(wasm: ByteArray, opcode: String) {
+        val e = assertThrows<AsyncifyUnsupported> { Asyncify.transform(wasm, setOf("w.wait")) }
+        val message = e.message.orEmpty()
+        assertTrue("止まりうる関数への末尾呼び出し" in message && opcode in message, message)
     }
 
     /**
@@ -285,6 +358,16 @@ class AsyncifySubtypeTest {
         val mixed = callerModule("(param i32 (ref null 0))", "(result i32)", "(i32.const 1) (ref.null 0)")
         assertEquals(setOf("run"), exports(mixed, emptySet(), sigs(listOf(0x7F, 0x6F), listOf(0x7F))))
         assertEquals(emptySet<String>(), exports(mixed, emptySet(), sigs(listOf(0x7E, 0x6F), listOf(0x7F))))
+        // 追えない参照型を含む型は、形（数と数値の位置）だけで照合する（型の数と外の型の数の積にしないため）。
+        // ほかの参照の位置の階層が違っても合いうるとみなす（安全側）。外の型の側が追えない参照型を含むときも同じ
+        val twoRefs = callerModule("(param (ref null 0) anyref)", "(result i32)", "(ref.null 0) (ref.null any)")
+        assertEquals(setOf("run"), exports(twoRefs, emptySet(), sigs(listOf(0x70, 0x70), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(twoRefs, emptySet(), sigs(listOf(0x70, 0x7F), listOf(0x7F))))
+        val known = callerModule("(param funcref anyref)", "(result i32)", "(ref.null func) (ref.null any)")
+        assertEquals(setOf("run"), exports(known, emptySet(), sigs(listOf(-1, 0x6F), listOf(0x7F))))
+        assertEquals(emptySet<String>(), exports(known, emptySet(), sigs(listOf(-1, 0x7F), listOf(0x7F))))
+        // 追えない参照型のない型どうしは、今までどおり階層で照合する
+        assertEquals(emptySet<String>(), exports(known, emptySet(), sigs(listOf(0x70, 0x6F), listOf(0x7F))))
     }
 
     /** 結果の位置も、引数と同じように階層で照合する（引数だけを見ていない）。exn の階層（exn・noexn）も同じ */
