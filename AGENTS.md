@@ -41,7 +41,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | 目的 | コマンド |
 | --- | --- |
 | ビルドと単体テスト | `./gradlew build` |
-| core の単体テストだけ | `./gradlew :core:test` |
+| core の単体テストだけ（直列の組の `:core:testSerial` も後に回る。#984） | `./gradlew :core:test` |
 | ゲーム内テスト（GameTest、ヘッドレス。失敗すると終了コードが非0） | `./gradlew :platform-neoforge-1.21.1:runGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runGameTestServer` |
 | 製品の jar（Jar-in-Jar で同梱したもの）を読んで GameTest（#775） | `./gradlew :platform-neoforge-1.21.1:runJarGameTestServer`<br>`./gradlew :platform-forge-1.20.1:runJarGameTestServer` |
 | 公開 API のダンプを今のコードに合わせて作り直す（#845） | `./gradlew updateKotlinAbi` |
@@ -50,9 +50,10 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 | 開発クライアント起動 | `./gradlew :platform-neoforge-1.21.1:runClient` |
 | データ生成（`src/generated/resources/` に出力） | `./gradlew :platform-neoforge-1.21.1:runData` |
 
+- core のテスト（#984）: `:core:test` は、負荷に弱いクラス（`core/build.gradle.kts` の `serialTestClasses`）を除いたクラスを、`-Pkibi.test.forks=<数>`（既定は論理 CPU 5 個につき 1 本、最大 6）本の JVM で並列に回し、その後に `:core:testSerial` が負荷に弱いクラスを JVM 1 本で単独で回す（`build`・`check` にも入る）。`--tests` を付けると、`:core:test` が直列の組のクラスも含めて絞り込みどおりに回し、`:core:testSerial` は回さない。`-Pkibi.test.shard=k/N` は、両方を N 組の k 組目だけに絞る（CI の組。どのクラスもちょうど 1 組に入る）。`--rerun` で回し直すときは `:core:test --rerun :core:testSerial --rerun` のように両方に付ける。
 - 起動ログは `platform-*/run/logs/latest.log`。起動すると `WASM runtime self-check passed` が出る。
-- CI（`.github/workflows/build.yml`）は `build` と、両バージョンの `runGameTestServer`・`runJarGameTestServer` を実行する。`runJarGameTestServer` は `run/jar-gametest/mods/` に今のビルドの jar（1.20.1 は reobf の前のもの）を置き、MOD のソースセットと Endive をクラスパスに載せずに起動する。Endive の依存を変えたら、こちらも通す。
-- CI のどこかの段が落ちる（またはキャンセルされる）と、テスト結果の XML（`**/build/test-results/**/*.xml`）と GameTest のサーバーのログ（`platform-*/run/logs/latest.log`、`platform-*/run/jar-gametest/logs/latest.log`）が artifact `test-reports-attempt-<run_attempt>` に残る（保持 30 日。#394。コンパイルで落ちたときなど、まだ何もなければ artifact はできない）。不安定なテストは再実行で通ると記録が消えるので、**再実行・修正の前に** `gh run download <run-id> -n test-reports-attempt-<n> -D <作業ツリーの外のディレクトリ>` で取る。中のパスはリポジトリのルートからの相対で手元のビルド出力と同じ場所なので、`-D` を付けずに作業ツリーで展開しない（既存のファイルに当たって失敗するか、手元の出力に混ざる）。Issue か PR には、落ちたテストの `<testcase>`（`<failure>` と関係する system-out）の抜粋と run の URL を貼る（XML の全文はコメントの上限 65,536 文字を超えることがある）。再実行で通ったときは、それを添えて新しい Issue で原因を追う。
+- CI（`.github/workflows/build.yml`）は 3 つのジョブに分かれる（#984）: `assemble`（core のテストを抜いた `build` と、両バージョンの `runGameTestServer`・`runJarGameTestServer`）、`core-test`（matrix の 4 組。`:core:test -Pkibi.test.shard=<k>/4 -Pkibi.test.forks=1`）、`build`（全部を `needs` する集約のジョブ。ブランチ保護の必須チェックはこの名前。どれかが落ちる・キャンセルされると落ちる）。`runJarGameTestServer` は `run/jar-gametest/mods/` に今のビルドの jar（1.20.1 は reobf の前のもの）を置き、MOD のソースセットと Endive をクラスパスに載せずに起動する。Endive の依存を変えたら、こちらも通す。
+- CI のどこかの段が落ちる（またはキャンセルされる）と、テスト結果の XML（`**/build/test-results/**/*.xml`）と GameTest のサーバーのログ（`platform-*/run/logs/latest.log`、`platform-*/run/jar-gametest/logs/latest.log`）が artifact `test-reports-attempt-<run_attempt>` に残る（保持 30 日。#394。ジョブごとの `test-reports-<assemble か core-<組>>-attempt-<n>` を集約の `build` のジョブが 1 つにまとめたもの。#984。コンパイルで落ちたときなど、まだ何もなければ artifact はできない）。不安定なテストは再実行で通ると記録が消えるので、**再実行・修正の前に** `gh run download <run-id> -n test-reports-attempt-<n> -D <作業ツリーの外のディレクトリ>` で取る。中のパスはリポジトリのルートからの相対で手元のビルド出力と同じ場所なので、`-D` を付けずに作業ツリーで展開しない（既存のファイルに当たって失敗するか、手元の出力に混ざる）。Issue か PR には、落ちたテストの `<testcase>`（`<failure>` と関係する system-out）の抜粋と run の URL を貼る（XML の全文はコメントの上限 65,536 文字を超えることがある）。再実行で通ったときは、それを添えて新しい Issue で原因を追う。
 
 ## 完了の条件
 
@@ -176,4 +177,5 @@ Gradle を動かす段階は、`./gradlew` をバックグラウンドで動か�
 - Endive の `System.Logger`（名前 `endive`）も同じ経路で流す（#680）。Endive は標準エラーに直に書く箇所がある（GameTest のサーバーでは `latest.log` に出ず、プロセスの標準エラーにだけ出る）ので、**Endive を上げたら `System.err`・`System.out`・`run.endive.log` を使う箇所を grep し直し、ADR 0088 の「追記（#680）」の表を直す。**
 - GameTest の run のワールドは `run/gametest-world`（負荷試験は `run/loadtest-world`、jar の GameTest は `run/jar-gametest/world`）で、Gradle が起動の前に消す（#792。残すときは `-PkeepGameTestWorld=true`）。消せないときは前の GameTest サーバーのプロセスが残っている。`run/world` は `runServer` のもので、GameTest は使わない。IDE の起動設定から動かすと消されない。
 - **GameTest のサーバー（`runGameTestServer`・`runJarGameTestServer`・`runLoadTestServer`）は、マシンの中で同時に 1 本だけ動く**（#855。ルートに適用した build-logic の `kibicomputers.gametest-lock`）。同じ起動の中では両バージョンが直列になり、worktree・起動をまたぐ分は Gradle のユーザーホームの `kibicomputers/locks/gametest.lock`（OS のロック。プロセスが死ねば外れる）で待つ。待つ間は 30 秒ごとに `Waiting for the GameTest lock ... Held by: <タスク> in <worktree> (Gradle pid ..., since ...)` を出す。持ち主は同じ場所の `gametest.owner` で分かる。終わると `GameTest lock released by <タスク> after holding it for N s` を出す。待ちの上限は既定 90 分（`-PgameTestLockTimeoutMinutes=<分>`）、`-PgameTestLock=false` でロックを使わない。デーモンは worktree をまたいで共有しているので、片付けに `./gradlew --stop` を使わない。
+- 並列の JVM と CPU を取り合うと落ちやすい core のテスト（壁時計の期限・スタックの余裕・公平さを測るもの）を足したら、`core/build.gradle.kts` の `serialTestClasses` に入れる（#984）。
 - GameTest はクラスに `@GameTestHolder(KiBiComputers.MOD_ID)` と `@PrefixGameTestTemplate(false)`、メソッドに `@JvmStatic` と `@GameTest(template = "empty")` を付ける。`empty` は `data/kibicomputers/structure/empty.nbt`（空の 3x3x3）。例: `platform-neoforge-1.21.1/src/main/kotlin/pro/ikili/kibicomputers/neoforge/gametest/SmokeGameTests.kt`。
