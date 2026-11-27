@@ -15,7 +15,7 @@
 - **止まりうる import はコンポーネント全体で決める**（`ComponentAsyncify`）。モジュールの import は、次のどれかなら止まりうる。
   - ホストの関数を lower したもので、その関数の待ち方（`HostWait`）が `NONE` でない
   - ほかのモジュールの、止まりうる export
-  不動点まで回す。wit-component のアダプターの shim（自分の表を `call_indirect` で呼び、表は fixup が lower した import で埋める）のように、待ちが表を通るものがあるので、**import・export した表に対する `call_indirect` と `call_ref` は、その型が、コンポーネントのどこかの止まりうる関数の型と同じなら止まりうるとみなす**（`Asyncify.Prepared.analyze` の `externalSuspendTypes`）。ほかのモジュールの関数の参照は、import も export もしていない表にも入れられる（funcref のグローバルの import・export、funcref を引数・結果に持つ import・export した関数、funcref を運ぶタグ、import・export した表からの `table.get`・`table.copy`）ので、**そのどれかがあるモジュールでは、どの表への `call_indirect` にも外の型を当てる**（`Transformer.foreignFuncRefs`）。参照が入りうるかだけを見て、表への命令の流れは追わない（止まりうるとみなす関数が増えうるだけで、変換は正しい）。
+  不動点まで回す。wit-component のアダプターの shim（自分の表を `call_indirect` で呼び、表は fixup が lower した import で埋める）のように、待ちが表を通るものがあるので、**import・export した表に対する `call_indirect` と `call_ref` は、その型が、コンポーネントのどこかの止まりうる関数の型と構造で合いうるなら止まりうるとみなす**（`Asyncify.Prepared.analyze` の `externalSuspendTypes`。#937 で、完全一致から、引数・結果の数が同じで参照の位置は同じ階層のものに広げた。ADR 0329 の「追記（#937）」）。ほかのモジュールの関数の参照は、import も export もしていない表にも入れられる（funcref のグローバルの import・export、funcref を引数・結果に持つ import・export した関数、funcref を運ぶタグ、import・export した表からの `table.get`・`table.copy`）ので、**そのどれかがあるモジュールでは、どの表への `call_indirect` にも外の型を当てる**（`Transformer.foreignFuncRefs`）。参照が入りうるかだけを見て、表への命令の流れは追わない（止まりうるとみなす関数が増えうるだけで、変換は正しい）。
 - 変換しないもの（#757 では `BLOCKING` に落とした。#844 から `exec` では `NOEXEC` で断り、直接の `ComponentProgram.load` とテストの `asyncify = false` だけ `BLOCKING`）:
   - `HostWait.BLOCK` のホストの関数を lower している
   - 待ちが、ゲストからゲストへの呼び出し（lift した関数を lower した import）の下にある（中の lift を巻き戻すと、結果の lower・post-return の途中を残すため）
