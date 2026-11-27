@@ -24,6 +24,9 @@ import java.io.ByteArrayOutputStream
  * `v128.const` と GC の提案の命令は、定数式としてそのまま写し、これでは断らない（#851）。ただし、止まりうる関数があるモジュールは、
  * 型付きの参照型（`(ref i31)` など）のグローバルや型を持てば、定数式の命令とは別に断る（型を追えない。#384）。
  * struct・array の型の定義（rec グループの中のものも）は、それだけでは断らない（止まりうる関数があっても。#891）。
+ * 止まりうる関数の中の、止まりうる `call_ref`（外の型に当たるものも。到達できないところのものも）と、待ち点をまたいだ関数の参照を渡す
+ * `call_ref`・`return_call_ref`・結果が funcref でない型付きの `select` は断る
+ * （参照は待ち点をまたいで退避できず、一時ローカルに移すと型が funcref になる。#923）。
  */
 internal class AsyncifyUnsupported(message: String) : RuntimeException(message)
 
@@ -50,7 +53,7 @@ internal enum class AsyncifyDebug {
  * ほかのコードを飛ばして進む。止まりうる import に着いたら、ホストが状態を `NORMAL` に戻して、その呼び出しをやり直す。
  *
  * binaryen はコードを平らにして（Flatten）からこれを行う。ここでは平らにせず、次の形にする:
- * - 止まりうる呼び出し（止まりうる import・止まりうる関数・`call_indirect`・`call_ref`）と、それを含む構造（block・loop・if・try_table）を
+ * - 止まりうる呼び出し（止まりうる import・止まりうる関数・`call_indirect`）と、それを含む構造（block・loop・if・try_table）を
  *   「待ち点」とする。待ち点の直前で、オペランドスタックに積まれている値をすべて一時ローカルに移し（スタックを空にする）、直後に戻す
  * - 待ち点の間の命令の並び（ラン）は `if (state == NORMAL)` で包む。巻き直し中は飛ばされる。ランの中の分岐は、包んだ分だけ深さを足す
  * - 呼び出しは `if (state == NORMAL || k == K)` で包む（K はその関数の中の呼び出しの番号）
@@ -158,7 +161,7 @@ internal object Asyncify {
      * セグメントの課金を `FuelSites.weight` 倍にして、変換が足したコードの分を見込む。`null` なら課金は変えない（#389 の前と同じ出力）。
      *
      * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（その関数の中の SIMD（v128）のローカル変数や命令、
-     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出しなど）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
+     *   型付きの参照型（GC・関数参照）、止まりうる関数への末尾呼び出し、止まりうる `call_ref`（#923）など）。メッセージに、どの関数の、どの機能かを書く。`Program.loadMetered` は、これで読み込みを断る（#367）。
      *   止まりうる関数がないモジュールは、止まりうる関数の中の作りでは断らない（#384）。定数式の `v128.const`（グローバル・要素セグメント）は断らない（#851）
      * @throws WasmLoadException WASM として読めない（定数式に使えない命令を含む。グローバル・能動な要素セグメントのものは Endive の検証が、
      *   パッシブ・宣言の要素セグメントのものは定数式の写しが断る。#851）、予約した名前（[WasmAsync]）をすでに使っている、時間の上限を超えた。読み込み自体を断る
@@ -210,8 +213,9 @@ internal object Asyncify {
 
         /**
          * 変換する（[Asyncify.transform] と同じ）。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（#757）。
-         * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかでも止まりうるとみなす
-         * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。空なら今までと同じ出力になる
+         * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかと構造で合いうる（引数・結果の数が同じで、参照の位置は同じ階層。#937）なら止まりうるとみなす
+         * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。止まりうる関数の中の、そうして止まりうるとみなした
+         * `call_ref` は断る（#923）。空なら今までと同じ出力になる
          *
          * @throws AsyncifyUnsupported 止まりうる関数を変換できない作り（[Asyncify.transform]）
          * @throws WasmLoadException 時間の上限を超えた
@@ -302,6 +306,14 @@ private const val BOT = -1
 /** funcref（略記の `(ref null func)` も同じ番号になる。[code]） */
 private const val FUNCREF = 0x70
 
+/**
+ * 型の追跡だけで使う印: `ref.func` が積んだ、型付きの関数の参照（`(ref $t)`。#923）。値の型としては [FUNCREF] と同じに扱い、
+ * 一時ローカルに移すと [FUNCREF] になる（`FunctionRewriter` の `alloc`。宣言する型は今までと同じ）。
+ * 待ち点をまたいで型を失った（[FUNCREF] になった）参照を `call_ref`・`return_call_ref`・結果が funcref でない型付きの `select` に渡すと、
+ * 出力が検証に通らないので断る
+ */
+private const val REF_FUNC = 0x170
+
 private fun isRef(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128 && t != BOT
 
 private fun code(v: ValType): Int {
@@ -313,6 +325,39 @@ private fun code(v: ValType): Int {
 }
 
 private class Sig(val params: List<Int>, val results: List<Int>)
+
+/** [hierarchy] で、どの参照の位置にも合うことを表す印（追えない参照型 [BOT] と、知らない参照型） */
+private const val WILD_REF = -2
+
+/**
+ * 値の型を、構造の照合（#937。`Transformer.externalMatch`）の鍵にする。数値はそのまま、参照は階層の先頭
+ * （anyref・funcref・externref・exnref）にまとめる。部分型は同じ階層の中にしかない（`ValType.heapTypeSubtype`）
+ */
+private fun hierarchy(t: Int): Int = when (t) {
+    I32, I64, F32, F64, V128 -> t
+    // any・eq・i31・struct・array・none
+    0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x71 -> 0x6E
+    // func・nofunc
+    0x70, 0x73 -> 0x70
+    // extern・noextern
+    0x6F, 0x72 -> 0x6F
+    // exn・noexn
+    0x69, 0x74 -> 0x69
+    else -> WILD_REF
+}
+
+private fun Pair<List<Int>, List<Int>>.hasWild() = WILD_REF in first || WILD_REF in second
+
+/**
+ * [hierarchy] の鍵の形。参照の位置（階層と [WILD_REF]）をすべて [WILD_REF] にまとめ、引数・結果の数と数値の位置だけを残す。
+ * [WILD_REF] は参照の位置にだけ合うので、形が同じことは、片方が [WILD_REF] を持つ鍵どうしが合いうるための必要条件になる
+ */
+private fun shape(k: Pair<List<Int>, List<Int>>): Pair<List<Int>, List<Int>> {
+    fun refs(x: List<Int>) = x.map { if (isRefKey(it)) WILD_REF else it }
+    return refs(k.first) to refs(k.second)
+}
+
+private fun isRefKey(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128
 
 /** 関数の本体の木。葉は命令、枝は block・loop・if・try_table */
 private sealed class Node
@@ -363,6 +408,9 @@ private class Transformer(
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
+
+    /** 関数の番号 → その型の番号（import は宣言した型。#937。宣言した上位の型をたどるのに使う） */
+    private val funcTypeIdx = ArrayList<Int>()
     /**
      * 型の番号（rec グループを平らにした番号）→ 関数の型。struct・array の型（GC の提案）は `null`（#891）。
      * 型そのものでは断らない（止まりうる関数がなければ、型は使わない）。関数の型として引いたときだけ断る（[typeSig]）
@@ -446,13 +494,17 @@ private class Transformer(
                 yt = imp.typeIndex()
             }
             funcSigs += typeSig(imp.typeIndex())
+            funcTypeIdx += imp.typeIndex()
             nf++
         }
         importedFuncs = nf
         yieldFunc = if (yf in asyncFuncs) -1 else yf
         yieldType = yt
         val fs = module.functionSection()
-        for (i in 0 until fs.functionCount()) funcSigs += typeSig(fs.getFunctionType(i))
+        for (i in 0 until fs.functionCount()) {
+            funcSigs += typeSig(fs.getFunctionType(i))
+            funcTypeIdx += fs.getFunctionType(i)
+        }
         val gs = module.globalSection()
         for (i in 0 until gs.globalCount()) globalTypes += codeOrBot(gs.getGlobal(i).valueType())
         val ts = module.tableSection()
@@ -474,13 +526,72 @@ private class Transformer(
         stateGlobal = globalTypes.size
     }
 
-    /** 止まりうる関数の型（引数と結果の並び）。間接呼び出しは、型が同じ関数しか呼べないので、この型のときだけ止まりうる */
+    /**
+     * 止まりうる関数の型（引数と結果の並び）と、その型が宣言した上位の型（`sub`）を推移的にたどった型の並び（#937）。
+     * Endive の `call_indirect` は、表の関数が同じインスタンスのものなら、関数の型が呼び出しの型と同じか、宣言した部分型
+     * （上位の型をたどる各段で、rec グループをまたいだ構造の同値も含む）のときに呼ぶ（`ValType.heapTypeSubtype`）。
+     * `call_ref` の参照も、静的な型の部分型の関数を指す。そのため、呼び出しの型が、止まりうる関数の型か、その上位の型の
+     * どれかと並びが同じなら止まりうるとみなす（並びの一致は構造の同値より粗いので、安全側に含まれる）。
+     * import した関数も、表には自分のインスタンスの関数として入り、宣言した import の型で照合されるので、同じ扱いにする
+     */
     private val suspendTypes = HashSet<Pair<List<Int>, List<Int>>>()
 
+    /** [suspendTypes] に入れた型の番号（同じ型と上位の型を何度もたどらない） */
+    private val suspendTypeIdx = HashSet<Int>()
+
+    /** 型の番号 [idx] と、その宣言した上位の型をすべて [suspendTypes] に入れる（#937） */
+    private fun addSuspendType(idx: Int) {
+        val types = module.typeSection()
+        val pending = ArrayList<Int>()
+        pending += idx
+        while (pending.isNotEmpty()) {
+            val i = pending.removeAt(pending.size - 1)
+            // 検証が上位の型の非循環を保証するが、同じ型を 2 度たどらないための集合で守る
+            if (!suspendTypeIdx.add(i)) continue
+            // 関数の型の上位は関数の型（検証が保証する）。struct・array（null）は飛ばす
+            typeSigs.getOrNull(i)?.let { suspendTypes += it.params to it.results }
+            if (i in 0 until types.subTypeCount()) types.getSubType(i).typeIdx().forEach { pending += it }
+        }
+    }
+
+    /**
+     * 型の番号 → 外の型（[externalSuspendTypes]）のどれかと構造で合いうるか（#937）。
+     * 表の関数がほかのインスタンスのものなら、Endive は構造で照合する（`FunctionType.matches`。引数は反変、結果は共変で、
+     * 参照の位置は部分型で比べる。`sub` の宣言は要らない）。ここでは保守的に、引数・結果の数が同じで、数値の位置は同じ型、
+     * 参照の位置は同じ階層（any・func・extern・exn）なら合いうるとみなす（[hierarchy]）。追えない参照型（[BOT]）と知らない参照型は、
+     * どの参照の位置にも合う。外の型は解析の間に変わらないので、最初に引いたときに 1 回だけ作る
+     *
+     * 照合は、型ごとに集合を 1、2 回引くだけにする（型の数 + 外の型の数に比例。型の数の上限はモジュールごとに 100,000）。
+     * 追えない参照型を、呼び出し側か外の型のどちらかが持つときは、階層を比べずに形（[shape]。数と数値の位置）だけで合いうるとみなす。
+     * 階層まで比べると、追えない側の型の 1 つごとに相手をすべてなめることになり、最悪で両者の数の積になるため。
+     * 形だけの照合は階層の照合より粗いので、安全側（止まりうる側）に含まれる
+     */
+    private val externalMatch: BooleanArray by lazy {
+        val exact = HashSet<Pair<List<Int>, List<Int>>>()
+        // 外の型の形。追えない参照型を含むものと、すべての外の型
+        val wildShapes = HashSet<Pair<List<Int>, List<Int>>>()
+        val allShapes = HashSet<Pair<List<Int>, List<Int>>>()
+        for (s in externalSuspendTypes) {
+            val k = s.params.map(::hierarchy) to s.results.map(::hierarchy)
+            if (k.hasWild()) wildShapes += shape(k) else exact += k
+            allShapes += shape(k)
+        }
+        BooleanArray(typeSigs.size) { i ->
+            val t = typeSigs[i]
+            if (t == null) {
+                false
+            } else {
+                val k = t.params.map(::hierarchy) to t.results.map(::hierarchy)
+                if (k.hasWild()) shape(k) in allShapes else k in exact || shape(k) in wildShapes
+            }
+        }
+    }
+
     private fun indirectMaySuspend(ins: AnnotatedInstruction): Boolean {
-        val sig = typeSig(ins.operand(0).toInt())
+        val idx = ins.operand(0).toInt()
+        val sig = typeSig(idx)
         if (sig.params to sig.results in suspendTypes) return true
-        if (externalSuspendTypes.isEmpty() || Asyncify.Signature(sig.params, sig.results) !in externalSuspendTypes) return false
+        if (externalSuspendTypes.isEmpty() || !externalMatch[idx]) return false
         // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）。
         // ほかのモジュールの関数の参照が入りうる形のモジュールでは、import も export もしていないテーブルにも入れられる
         // （[foreignFuncRefs]）ので、どのテーブルにも当てる
@@ -545,7 +656,7 @@ private class Transformer(
         var changed = true
         while (changed) {
             changed = false
-            for (f in suspendable) suspendTypes += funcSigs[f].params to funcSigs[f].results
+            for (f in suspendable) addSuspendType(funcTypeIdx[f])
             for ((i, body) in bodies.withIndex()) {
                 val f = importedFuncs + i
                 if (f in suspendable) continue
@@ -905,7 +1016,11 @@ private class Transformer(
             return localTypes.size - 1
         }
 
-        private fun alloc(t: Int): Int = free[t]?.removeFirstOrNull() ?: newLocal(t)
+        private fun alloc(type: Int): Int {
+            // 型付きの関数の参照（[REF_FUNC]）は、funcref の一時ローカルに移す（#923。宣言する型は #923 の前と同じ）
+            val t = if (type == REF_FUNC) FUNCREF else type
+            return free[t]?.removeFirstOrNull() ?: newLocal(t)
+        }
 
         /** 共有しない一時ローカル（構造の結果） */
         private val dedicated = HashSet<Int>()
@@ -918,7 +1033,8 @@ private class Transformer(
         /**
          * 巻き戻しで退避する一時ローカル（#338）。待ち点の直前でオペランドスタックを移した一時ローカル（`keep`）、
          * 待ち点の構造の引数（`if` の条件を含む。巻き直しで構造に入る直前に積み直す）、巻き直しで同じ呼び出しをやり直すのに要る
-         * 呼び出しの引数（止まりうる import は最初からやり直す。`call_indirect` の表の番号・`call_ref` の参照は同じ関数を呼ぶのに要る）。
+         * 呼び出しの引数（止まりうる import は最初からやり直す。`call_indirect` の表の番号は同じ関数を呼ぶのに要る。
+         * 止まりうる `call_ref` は断る（#923）ので、`call_ref` の参照は退避しない）。
          * 定義済みの関数への直接の `call` の引数（呼ばれた側が自分の生きているローカルを戻す）と、燃料切れの呼び出しの引数（巻き直しでは使わない）は退避しない。
          * 一時ローカルは使い回すので、どこかの待ち点でこれに当たったものの和を取る
          */
@@ -926,6 +1042,7 @@ private class Transformer(
 
         /** (呼び出しの数, 退避するローカルの数) */
         fun rewrite(out: Sink): Pair<Int, Int> {
+            rejectSuspendingCallRef()
             val (nodes, _) = buildTree(0)
             val body = Sink()
             emitSuspendBody(body, nodes, sig.results, 0)
@@ -1231,6 +1348,18 @@ private class Transformer(
             else -> null
         }
 
+        /**
+         * 止まりうる型の `call_ref` は、どこにあっても断る（#923）。到達できないところのものも、デバッグの切り替え（[AsyncifyDebug]）・
+         * 引数やローカルの数にかかわらず断る（呼ばれる経路ごとに断るかどうかがばらつかないように、変換の最初に命令を全部見る）
+         */
+        private fun rejectSuspendingCallRef() {
+            for (ins in list) {
+                if (ins.opcode() == OpCode.CALL_REF && indirectMaySuspend(ins)) {
+                    throw AsyncifyUnsupported("止まりうる call_ref（関数の参照の提案）には対応していない（参照は待ち点をまたいで退避できない）")
+                }
+            }
+        }
+
         /** 待ち点になりうる呼び出し（[isSuspendCall]。末尾呼び出しは除く。到達できないところのものも含む） */
         private fun isWaitInstruction(op: OpCode, i: Int): Boolean =
             (op == OpCode.CALL || op == OpCode.CALL_INDIRECT || op == OpCode.CALL_REF) && isSuspendCall(list[i])
@@ -1268,7 +1397,9 @@ private class Transformer(
 
         private fun isSuspendCall(ins: AnnotatedInstruction): Boolean = when (ins.opcode()) {
             OpCode.CALL -> ins.operand(0).toInt() in suspendable || isYieldCall(ins)
-            OpCode.CALL_INDIRECT, OpCode.CALL_REF -> indirectMaySuspend(ins)
+            OpCode.CALL_INDIRECT -> indirectMaySuspend(ins)
+            // 止まりうる型の call_ref は、変換の最初に断る（[rejectSuspendingCallRef]）ので、ここに届く call_ref は待ち点でない（#923）
+            OpCode.CALL_REF -> false
             OpCode.RETURN_CALL -> if (ins.operand(0).toInt() in suspendable) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
             OpCode.RETURN_CALL_INDIRECT, OpCode.RETURN_CALL_REF ->
                 if (indirectMaySuspend(ins)) throw AsyncifyUnsupported("止まりうる関数への末尾呼び出し（${ins.opcode()}。末尾呼び出しの提案）には対応していない") else false
@@ -1342,10 +1473,19 @@ private class Transformer(
 
         // --- 型の追跡 ---
 
+        /** `call_ref`・`return_call_ref` が取り出した参照が [FUNCREF] なら断る（待ち点をまたいだ参照。#923） */
+        private fun rejectFuncrefOperand(t: Int, op: String) {
+            if (t == FUNCREF) throw AsyncifyUnsupported("関数の参照を持ったまま待ってから $op で呼ぶことには対応していない（待ち点をまたぐと参照の型が funcref になる）")
+        }
+
         private fun effect(ins: AnnotatedInstruction, st: TypeStack) {
             val op = ins.opcode().opcode()
             when (op) {
-                0x00, 0x0C, 0x0E, 0x0F, 0x12, 0x13, 0x15 -> st.kill()
+                0x00, 0x0C, 0x0E, 0x0F, 0x12, 0x13 -> st.kill()
+                0x15 -> {
+                    rejectFuncrefOperand(st.pop(), "return_call_ref")
+                    st.kill()
+                }
                 0x01 -> Unit
                 0x08 -> {
                     st.pop(tagSigs[ins.operand(0).toInt()].params.size)
@@ -1362,7 +1502,9 @@ private class Transformer(
                     call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x14 -> {
-                    st.pop()
+                    // 型付きの参照は [REF_FUNC]（待ち点をまたいでいない ref.func）か [BOT]。funcref は、待ち点をまたいで
+                    // funcref の一時ローカルに移した参照（正しいモジュールでは、ほかに call_ref に funcref は届かない）。出力が検証に通らないので断る（#923）
+                    rejectFuncrefOperand(st.pop(), "call_ref")
                     call(st, typeSig(ins.operand(0).toInt()))
                 }
                 0x1A -> st.pop()
@@ -1373,20 +1515,26 @@ private class Transformer(
                     st.push(if (a == BOT) b else a)
                 }
                 0x1C -> {
-                    st.pop(3)
+                    st.pop()
+                    val a = st.pop()
+                    val b = st.pop()
                     // 型付きの select の注釈は vec(valtype)（数は 1 なので 1 バイト）。(ref null <ヒープ型>)・(ref <ヒープ型>) は
                     // 先頭のバイト（0x63・0x64）の後にヒープ型の sleb が続く。ref.null（0xD0）と同じく、抽象ヒープ型の
                     // (ref null <抽象>) は略記のバイトにし、型の番号のものと null を許さないものは型を追えない参照（BOT）にする（#891）
                     val r = Reader(wasm, ins.address() + 2, endOf[ins]!!)
                     val t = r.u8()
-                    st.push(
-                        if (t == 0x63 || t == 0x64) {
-                            val heapType = r.sleb()
-                            if (t == 0x63 && heapType < 0) (heapType + 0x80).toInt() else BOT
-                        } else {
-                            t
-                        },
-                    )
+                    val result = if (t == 0x63 || t == 0x64) {
+                        val heapType = r.sleb()
+                        if (t == 0x63 && heapType < 0) (heapType + 0x80).toInt() else BOT
+                    } else {
+                        t
+                    }
+                    // 待ち点をまたいで funcref の一時ローカルに移した参照は、結果が funcref でない select（型の番号の (ref null $t) など）に
+                    // 渡すと検証に通らない出力になるので断る（#923。call_ref に届く前に型を失うので、ここで見つける）
+                    if ((a == FUNCREF || b == FUNCREF) && result != FUNCREF) {
+                        throw AsyncifyUnsupported("関数の参照を持ったまま待ってから型付きの select に渡すことには対応していない（待ち点をまたぐと参照の型が funcref になる）")
+                    }
+                    st.push(result)
                 }
                 0x20 -> st.push(localTypes[ins.operand(0).toInt()])
                 0x21 -> st.pop()
@@ -1445,7 +1593,7 @@ private class Transformer(
                     st.push(if (heapType >= 0) BOT else (heapType + 0x80).toInt())
                 }
                 0xD1 -> un(st, I32)
-                0xD2 -> st.push(0x70)
+                0xD2 -> st.push(REF_FUNC)
                 0xD3 -> bin(st, I32)
                 0xD4 -> {
                     val t = st.pop()

@@ -59,7 +59,116 @@ dependencies {
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 
-tasks.test {
+// ---- core のテストの分け方（#984） ----
+// - :core:test は、直列の組（serialTestClasses）を除いたクラスを、`maxParallelForks`（-Pkibi.test.forks。既定は CPU 数から決める）本の
+//   JVM で並列に回す。直列の組は :core:testSerial（JVM 1 本）が、:core:test の後に単独で回す（test の finalizedBy。check にも入れる）。
+//   `./gradlew :core:test` の意味は「core の全テスト」のまま。
+// - `--tests` を付けた起動では、:core:test は直列の組も含めて絞り込みどおりに回し、:core:testSerial は回さない
+//   （`:core:test --tests '*StackExhaustionLockTest*'` も見つかる）。
+// - `-Pkibi.test.shard=k/N` で、両方のタスクを N 組の k 組目のクラスだけに絞る（CI の matrix。build.yml）。どのクラスもちょうど 1 組に入る:
+//   時間のかかるクラス（heavyTestClassSeconds）は測った時間で組に配り（LPT）、残りはトップレベルの FQCN の String.hashCode で配る。
+
+// 並列で回すと、ほかの JVM と CPU を取り合って落ちやすい（壁時計の期限・スタックの余裕・公平さを測る）クラス。直列の組で回す。
+// 負荷に弱いクラスを足したら、ここに入れる。
+val stackHeadroomTestClasses = listOf(
+    "pro.ikili.kibicomputers.core.kernel.StackExhaustionLockTest",
+    "pro.ikili.kibicomputers.core.kernel.ComponentStackExhaustionLockTest",
+    "pro.ikili.kibicomputers.core.kernel.P1StackExhaustionLockTest",
+    "pro.ikili.kibicomputers.core.kernel.P1DiskCloseStackExhaustionTest",
+    "pro.ikili.kibicomputers.core.kernel.TmpFileSystemStackExhaustionKernelTest",
+    "pro.ikili.kibicomputers.core.kernel.InstantiateStackExhaustionTest",
+    "pro.ikili.kibicomputers.core.kernel.InstantiateStackExhaustionKernelTest",
+    "pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest",
+    "pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemStackExhaustionTest",
+    "pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemTreeStackExhaustionTest",
+)
+val serialTestClasses: Set<String> = (
+    stackHeadroomTestClasses + listOf(
+        "pro.ikili.kibicomputers.core.kernel.MemoryAccountStackExhaustionTest",
+        "pro.ikili.kibicomputers.core.kernel.MemoryAccountStackExhaustionKernelTest",
+        "pro.ikili.kibicomputers.core.kernel.process.StackHeadroomTest",
+        "pro.ikili.kibicomputers.core.kernel.AsyncFuelTest",
+        "pro.ikili.kibicomputers.core.kernel.AsyncFuelP2Test",
+        "pro.ikili.kibicomputers.core.kernel.ProgramCacheFairnessTest",
+        "pro.ikili.kibicomputers.core.kernel.ProgramCacheTimeFairnessTest",
+        "pro.ikili.kibicomputers.core.display.ScreenSyncTrafficFairnessTest",
+        "pro.ikili.kibicomputers.core.kernel.ScaleTest",
+        "pro.ikili.kibicomputers.core.kernel.LuaParallelScaleTest",
+        // 2^31 回の計算が stop より先に終わると落ちる（並列の 4 本で 1 回落ちた。#984 の測定。直すのは #994）
+        "pro.ikili.kibicomputers.core.kernel.RealWasmSchedulerTest",
+    )
+    ).toSet()
+
+// 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の直列の回の XML から。目安なので、ずれても組の漏れは起きない）
+val heavyTestClassSeconds = mapOf(
+    "kernel.LuaKibiApiTest" to 169,
+    "kernel.StackExhaustionLockTest" to 127,
+    "kernel.LuaShrinkReallocTest" to 122,
+    "kernel.ShellTest" to 100,
+    "kernel.vfs.DiskFileSystemStackExhaustionTest" to 79,
+    "kernel.LuaMemoryLimitTest" to 74,
+    "kernel.LuaTermFsKeysTest" to 59,
+    "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 47,
+    "kernel.ComponentProcessTest" to 44,
+    "kernel.ShellLineEditTest" to 41,
+    "kernel.LuaCoroutineRestoreTest" to 38,
+    "kernel.AsyncFuelP2Test" to 26,
+    "kernel.BasicCommandsTest" to 23,
+    "wasi.p2.WasiP2StreamTest" to 20,
+    "runtime.component.ComponentLoaderTest" to 19,
+    "kernel.AsyncP2Test" to 17,
+    "kernel.AsyncFuelTest" to 17,
+    "kernel.ComponentStackExhaustionLockTest" to 16,
+    "wasi.p2.KibiP2BehaviourTest" to 16,
+    "kernel.LuaKibiApiRestoreTest" to 16,
+).mapKeys { "pro.ikili.kibicomputers.core.${it.key}" }
+
+// -Pkibi.test.shard=k/N（1 ≤ k ≤ N）。書式の誤りは構成の段階で落とす（黙って全部や 0 件を回さない）
+val testShardSpec: String? = providers.gradleProperty("kibi.test.shard").orNull
+val testShard: Pair<Int, Int>? = testShardSpec?.let { spec ->
+    val m = Regex("""(\d+)/(\d+)""").matchEntire(spec.trim())
+        ?: throw GradleException("kibi.test.shard は k/N の形で渡す（例: 1/4）: '$spec'")
+    val k = m.groupValues[1].toInt()
+    val n = m.groupValues[2].toInt()
+    if (n < 1 || k !in 1..n) throw GradleException("kibi.test.shard は 1 ≤ k ≤ N にする: '$spec'")
+    k to n
+}
+// 時間のかかるクラスの組（0 始まり）。重い順に、いちばん軽い組へ入れる（同じ重さなら名前順・組の番号の小さい順で、毎回同じ結果になる）
+val heavyShardOf: Map<String, Int> = testShard?.let { (_, n) ->
+    val loads = IntArray(n)
+    heavyTestClassSeconds.entries.sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key }).associate { (name, seconds) ->
+        val shard = loads.indices.minBy { loads[it] }
+        loads[shard] += seconds
+        name to shard
+    }
+} ?: emptyMap()
+fun shardOfClass(className: String, n: Int): Int = heavyShardOf[className] ?: Math.floorMod(className.hashCode(), n)
+
+// テストのクラスファイルから、トップレベルのクラスの FQCN を出す（`FooTest$1.class` などの内部クラスは、外側のクラスと同じ組にする）
+fun topLevelClassName(element: FileTreeElement): String =
+    element.relativePath.pathString.removeSuffix(".class").substringBefore('$').replace('/', '.')
+fun inThisShard(element: FileTreeElement): Boolean {
+    val (k, n) = testShard ?: return true
+    return element.isDirectory || shardOfClass(topLevelClassName(element), n) == k - 1
+}
+fun isSerialClass(element: FileTreeElement): Boolean = !element.isDirectory && topLevelClassName(element) in serialTestClasses
+
+// `--tests` で絞り込んだ起動か（そのときは直列の組を :core:test から除かず、:core:testSerial を回さない）
+val testFilterGiven = gradle.startParameter.taskRequests.any { request -> request.args.any { it == "--tests" || it.startsWith("--tests=") } }
+
+// ベンチマークの起動（ほかのクラスと CPU を取り合うと測定が歪むので、fork を 1 にする）
+val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark").any { providers.gradleProperty(it).orNull == "true" } ||
+    providers.gradleProperty("kibi.luaReplMachines").orNull != null
+// :core:test の JVM の数（-Pkibi.test.forks=<数>。CI は組ごとのマシンが 4 vCPU なので 1 を渡す）。
+// 既定は論理 CPU 5 個につき 1 本（最大 6。手元の 32 コアで 6。#984 の測定で、4 本より並列の部分が 500 秒から 283 秒に縮んだ）。1 つの JVM の中でも MachineScheduler が CPU 数の半分のスレッドを使い、
+// issue-to-pr は最大 3 つの worktree で build を重ねるので、増やしすぎない
+val testForks: Int = providers.gradleProperty("kibi.test.forks").orNull?.let {
+    it.toIntOrNull()?.takeIf { n -> n >= 1 } ?: throw GradleException("kibi.test.forks は 1 以上の整数にする: '$it'")
+} ?: if (benchmarkOn) 1 else (Runtime.getRuntime().availableProcessors() / 5).coerceIn(1, 6)
+
+// :core:test と :core:testSerial に共通の設定。StackHeadroom のタスク（下）には付けない。
+// classFilter は組の絞り込みと AND でかける（include(Spec) を 2 回呼ぶと OR になるので、include はここで 1 回だけ呼ぶ）
+fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) {
     useJUnitPlatform()
     // 失敗の本文（assert の説明。StackExhaustionLockTest の「停止: ...」の様子など）を、コンソールと CI のログに出す（#868。
     // 既定は例外の型と行番号だけで、本文はテストレポートを開かないと見えない）
@@ -85,6 +194,10 @@ tasks.test {
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // 組の絞り込み（#984）。クラスファイルの集合も入力になるが、キャッシュのキーをはっきり分けるために値も入力にする
+    inputs.property("kibi.test.shard", testShardSpec ?: "all")
+    inputs.property("kibi.test.serialClasses", serialTestClasses.sorted())
+    include(Spec<FileTreeElement> { it.isDirectory || (inThisShard(it) && classFilter(it)) })
     // ctx.instantiate の入口の確かめを外した・縮めた結果を手元で測る（#884。`-Pkibi.test.instantiateGateFrames=<段数>`。ふつうは渡さない）
     providers.gradleProperty("kibi.test.instantiateGateFrames").orNull?.let { systemProperty("kibi.test.instantiateGateFrames", it) }
     // 前借りの間の燃料切れの処理の費用を測る（#858。`-Pkibi.overdraftBenchmark=true`。ふつうは動かさない）
@@ -111,6 +224,25 @@ tasks.test {
     }
 }
 
+val testSerial = tasks.register<Test>("testSerial") {
+    group = "verification"
+    description = "負荷に弱い core のテスト（直列の組）を、JVM 1 本で単独で回す（#984。:core:test の後に回る）"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    coreTestDefaults { isSerialClass(it) }
+    maxParallelForks = 1
+    shouldRunAfter(tasks.test)
+    // `--tests` の起動では、絞り込みは :core:test が受け持つ（直列の組も含めて回す）
+    onlyIf("--tests を付けた起動では :core:test が直列の組も回す") { !testFilterGiven }
+}
+
+tasks.test {
+    coreTestDefaults { testFilterGiven || !isSerialClass(it) }
+    maxParallelForks = testForks
+    finalizedBy(testSerial)
+}
+tasks.check { dependsOn(testSerial) }
+
 // スタックの余裕の確かめ（StackHeadroom。#828・#858）のテストを、ふつうの :core:test と違う JVM で回す（-Pkibi.stackHeadroom=true のときだけ
 // 作る。build・CI には入れない）。結果は ADR 0043 と StackHeadroom の KDoc に書く。
 // - stackHeadroomColdTest: StackHeadroom.probe だけを JIT し、ほかはすべてインタプリタで動かす（確かめは小さいフレームで測り、守る道は
@@ -118,15 +250,6 @@ tasks.test {
 // - stackHeadroomXintTest: 全部インタプリタ（比べるため。回数 1/4 で、全体が十数分。#903）
 // - stackHeadroomJdk21Test: JDK 21（1.21.1 の本番の JDK。JDK 19 で ReentrantLock の中身（AQS）が書き直された）
 if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
-    val headroomTests = listOf(
-        "StackExhaustionLockTest",
-        "ComponentStackExhaustionLockTest",
-        "P1StackExhaustionLockTest",
-        "P1DiskCloseStackExhaustionTest",
-        "TmpFileSystemStackExhaustionKernelTest",
-        "InstantiateStackExhaustionTest",
-        "InstantiateStackExhaustionKernelTest",
-    )
     fun registerHeadroomTest(name: String, java: Int, args: List<String>) = tasks.register<Test>(name) {
         group = "verification"
         description = "StackHeadroom の確かめを、JDK $java・$args で回す（#858）"
@@ -134,10 +257,7 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         classpath = sourceSets.test.get().runtimeClasspath
         useJUnitPlatform()
         filter {
-            headroomTests.forEach { includeTestsMatching("pro.ikili.kibicomputers.core.kernel.$it") }
-            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.DiskFileSystemStackExhaustionTest")
-            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemStackExhaustionTest")
-            includeTestsMatching("pro.ikili.kibicomputers.core.kernel.vfs.TmpFileSystemTreeStackExhaustionTest")
+            stackHeadroomTestClasses.forEach { includeTestsMatching(it) }
         }
         javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(java) }
         jvmArgs(args)

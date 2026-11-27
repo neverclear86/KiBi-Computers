@@ -232,15 +232,26 @@ object MachineRestoreGameTests {
     /**
      * claim が `owner.bin` の読みを待った台（#869。覚えていない ID。再起動の後と同じ）も、確定した後に復元の順番待ちに入り、
      * 保存した世代から戻る（ID のないまま順番が来て冷えた起動にならない。#653 と同じ不具合）。待つ間は FULL に戻った経路
-     * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない
+     * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない。
+     * 確定の待ちは壁時計で打ち切る（[claimDecideWait]。#912）ので、tick の上限には、起動の分（[BOOT_TIMEOUT_TICKS]）に確定の待ちの分
+     * （[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足す。
+     * 壁時計の待ち（[WallClockWait.pace]）はメインスレッドを 1 tick あたり最大 50 ms 眠らせ、同じバッチで並ぶテストの tick まで遅らせるので、
+     * ほかの `WallClockWait` のテストと同じく専用のバッチにする（既定のバッチの復元・起動のテストを巻き込まない）
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS)
+    @GameTest(
+        template = SmokeGameTests.EMPTY,
+        timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS,
+        batch = "claim_waited_restore",
+    )
     fun restoresACaseWhoseClaimWaitedForARead(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
         var sawWaiting = false
         var reads = 0L
+        var wait: WallClockWait? = null
+        // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
+        var expired: String? = null
         helper.startSequence().thenWaitUntil { assertPrompt(helper, first) }.thenExecute {
             val tag = saveAndTag(helper, first)
             val id = first.identity!!.id
@@ -258,10 +269,19 @@ object MachineRestoreGameTests {
                 helper.assertTrue(be.lastClaim == null && be.currentIdentity == null, "a waiting case has no id yet")
                 // FULL に戻った経路が来ても、ID のないまま順番待ちに入れない（入れると冷えた起動になり、下の確かめが落ちる）
                 ServerMachines.restorePromotedCase(be)
+                // 確定は壁時計で待つ（#912。専用のバッチなので待つ間に動いているマシンがなく tick が全速で進み、tick の数では読みが
+                // 終わる前に尽きうる）。
+                // 上限を過ぎたら、診断を覚えて待ちを終える（次の thenExecute が落とす）
+                val w = wait ?: claimDecideWait().also { wait = it }
+                if (!w.pace()) {
+                    expired = claimDecideDiagnostics(WorldMachineSaves.current!!, w, listOf(be), helper)
+                    return@thenWaitUntil
+                }
                 helper.fail("waiting for the claim")
             }
             assertRestored(helper, be)
         }.thenExecute {
+            expired?.let { helper.fail("the waiting claim should be decided: $it") }
             val be = copy!!
             helper.assertTrue(sawWaiting, "the claim should have waited for owner.bin")
             helper.assertTrue(be.lastClaim == ClaimResult.KEPT, "the case should keep its id but was ${be.lastClaim}")
@@ -340,10 +360,16 @@ object MachineRestoreGameTests {
      * FULL でないまま確定すると、順番待ちには入れない（`offerRestoreAfterClaim` の `hasChunkAt`）。FULL に戻ったときに
      * `restorePromotedCase` が入れ、保存した世代から戻る（`/tmp` の印が残る）。待つ間のケースの NBT（チャンクの保存が書くもの）は
      * 生の値（MachineId・SaveGeneration・OwnerEpoch）のままで、次の読み込みは同じ値で同じ判定をする。
-     * 書き込みのスレッドを tick をまたいで止める（読みを待たせる）ので、専用のバッチにする
+     * 書き込みのスレッドを tick をまたいで止める（読みを待たせる）ので、専用のバッチにする。
+     * ゲートを放した後の確定は壁時計で待つ（[claimDecideWait]。#912）。tick の上限は、前の段（起動・降格の待ち）が使う
+     * [BOOT_TIMEOUT_TICKS] に、確定の待ちの分（[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足して、壁時計の上限が必ず先に来るようにする
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "deferred_claim_demotion")
+    @GameTest(
+        template = SmokeGameTests.EMPTY,
+        timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS,
+        batch = "deferred_claim_demotion",
+    )
     fun deferredClaimWhileTheChunkLeavesFull(helper: GameTestHelper) {
         val far = FarComputer(helper)
         val level = helper.level
@@ -355,6 +381,9 @@ object MachineRestoreGameTests {
         var gate: WriterGate? = null
         var sideGate: SideReaderGate? = null
         var reads = 0L
+        var wait: WallClockWait? = null
+        // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
+        var expired: String? = null
 
         fun assertRawTag(be: CaseBlockEntity, what: String) {
             val id = saved!!
@@ -417,9 +446,19 @@ object MachineRestoreGameTests {
             gate = null
             sideGate!!.close()
             sideGate = null
+            wait = claimDecideWait()
         }.thenWaitUntil {
-            helper.assertTrue(!copy!!.isClaimDeferred, "the waiting claim should be decided")
+            val be = copy!!
+            if (!be.isClaimDeferred) return@thenWaitUntil
+            // 上限を過ぎたら、診断を覚えて待ちを終える（次の thenExecute が落とす）
+            val w = wait!!
+            if (!w.pace()) {
+                expired = claimDecideDiagnostics(store, w, listOf(be), helper)
+                return@thenWaitUntil
+            }
+            helper.fail("the waiting claim should be decided")
         }.thenExecute {
+            expired?.let { helper.fail("the waiting claim should be decided: $it") }
             val be = copy!!
             val id = saved!!
             helper.assertTrue(be.lastClaim == ClaimResult.KEPT && be.identity == id, "the case should keep $id: ${be.lastClaim}, ${be.identity}")
