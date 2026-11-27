@@ -94,7 +94,7 @@ val serialTestClasses: Set<String> = (
         "pro.ikili.kibicomputers.core.display.ScreenSyncTrafficFairnessTest",
         "pro.ikili.kibicomputers.core.kernel.ScaleTest",
         "pro.ikili.kibicomputers.core.kernel.LuaParallelScaleTest",
-        // 2^31 回の計算が stop より先に終わると落ちる（並列の 4 本で 1 回落ちた。#984 の測定）
+        // 2^31 回の計算が stop より先に終わると落ちる（並列の 4 本で 1 回落ちた。#984 の測定。直すのは #994）
         "pro.ikili.kibicomputers.core.kernel.RealWasmSchedulerTest",
     )
     ).toSet()
