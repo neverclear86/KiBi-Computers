@@ -105,9 +105,40 @@ class ConstExprValidationTest {
         val bytes = module("(global \$gd funcref (ref.func \$f)) (table 1 funcref (global.get \$gd))")
         assertRejectedEverywhere("定義したグローバル", bytes, "表 2 の初期値: ")
         assertEquals(
-            "WASM の検証に通らない: 表 2 の初期値: グローバル 0 はここでは読めない（import したものだけ）",
+            "WASM の検証に通らない: 表 2 の初期値: global.get が読むグローバル 0（import を数えた番号）はここでは読めない（import したものだけ）",
             assertThrows<WasmLoadException> { EndiveRuntime().load(bytes) }.message,
         )
+    }
+
+    @Test
+    fun `グローバルを import していると、読めない理由の番号は import を数えた番号になる`() {
+        // import が 2 つあるので、定義した 0 番のグローバルは global.get では 2 番。場所（表 0 の初期値）の番号とは別に書く
+        val bytes = WitTool.wat(
+            """
+            (module
+              (import "m" "a" (global i32))
+              (import "m" "b" (global funcref))
+              (func ${'$'}f)
+              (global ${'$'}gd funcref (ref.func ${'$'}f))
+              (table 1 funcref (global.get ${'$'}gd)))
+            """,
+        )
+        assertRejectedEverywhere("import のあるモジュール", bytes, "表 0 の初期値: ")
+        assertEquals(
+            "WASM の検証に通らない: 表 0 の初期値: global.get が読むグローバル 2（import を数えた番号）はここでは読めない（import したものだけ）",
+            assertThrows<WasmLoadException> { EndiveRuntime().load(bytes) }.message,
+        )
+    }
+
+    @Test
+    fun `アクティブの要素の項目は表の型でなく要素の型で確かめる`() {
+        // 項目の型（null を持てる funcref）は表の型（funcref）に合うので Endive の検証を通るが、要素の型（null を持てない func 参照）には合わない
+        val bytes = module("(elem (table \$tb) (i32.const 0) (ref func) (ref.null func))")
+        assertRejectedEverywhere("表の型には合うが要素の型には合わない", bytes, "要素セグメント 0（アクティブ）の項目 0: ")
+        val e = assertThrows<WasmLoadException> { EndiveRuntime().load(bytes) }
+        assertTrue(e.message!!.contains("が要素の型（"), e.message)
+        // 要素の型が合えば通る
+        EndiveRuntime(false).load(module("(elem (table \$tb) (i32.const 0) funcref (ref.null func))"))
     }
 
     @Test
@@ -149,7 +180,9 @@ class ConstExprValidationTest {
     }
 
     @Test
-    fun `文面に場所と期待する型の呼び名を出す`() {
+    fun `文面に場所と理由を出す`() {
+        // グローバル・表・オフセットの結果の型の呼び名（グローバルの型・表の要素の型・オフセットの型）は、Endive が先に同じ型の違いを断るので、
+        // load からは届かない。読み込みから見える文面は、場所と、命令が取る値の型などの理由
         val e = assertThrows<WasmLoadException> { EndiveRuntime().load(module("(global i32 (i32.add (i64.const 1) (i64.const 2)))")) }
         assertTrue(e.message!!.startsWith("WASM の検証に通らない: グローバル 0 の初期値: 命令 I32_ADD が取る値の型"), e.message)
         // パッシブの要素の文面（#893）は変えない

@@ -756,7 +756,8 @@ public class EndiveRuntime internal constructor(
                         OpCode.GLOBAL_GET -> {
                             val idx = ins.operand(0)
                             if (idx < 0 || idx >= globals.size) fail("グローバルがない")
-                            if (idx >= globalLimit) fail("グローバル $idx はここでは読めない（$scope）")
+                            // 番号は global.get の番号（import を数える）。場所の番号（セクションの中の番号。import を数えない）と区別して書く
+                            if (idx >= globalLimit) fail("global.get が読むグローバル $idx（import を数えた番号）はここでは読めない（$scope）")
                             val (type, mutable) = globals[idx.toInt()]
                             if (mutable) fail("可変のグローバルは定数式で読めない")
                             type
