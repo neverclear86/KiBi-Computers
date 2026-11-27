@@ -1314,6 +1314,7 @@ class ComponentLoaderTest {
               (alias outer 1 ${'$'}ct (type ${'$'}ct))
               (alias outer 1 ${'$'}it (type ${'$'}it))
               (component ${'$'}empty)
+              (type ${'$'}x (component))
               (instance ${'$'}i (export "c" (component ${'$'}empty)))
               $exports
             )
@@ -1353,6 +1354,16 @@ class ComponentLoaderTest {
         assertTrue(w.cost - w.remapCost >= 1_000L * 4_000) { "${w.cost} - ${w.remapCost}" }
         rejectedBeforeValidation(wrapped)
 
+        // `(type (eq ..))` で付けた型（空のコンポーネント型 `$x` を、import の多い `$ct` と等しいものとして export する）も、同じく数える
+        val eq = ascribedExports(imports = 4000, nested = 10, perNested = 100) {
+            """(export "t$it" (type ${'$'}x) (type (eq ${'$'}ct)))"""
+        }
+        assertTrue(eq.size < 100_000) { "${eq.size}" }
+        val q = estimateOf(eq)
+        assertEquals(1_000L, q.checkCount)
+        assertTrue(q.cost - q.remapCost >= 1_000L * 4_000) { "${q.cost} - ${q.remapCost}" }
+        rejectedBeforeValidation(eq)
+
         // 付けた型が小さければ通る（確認ごとに、渡す側と付けた型の大きさを足す）
         val small = ascribedExports(imports = 3, nested = 2, perNested = 5) {
             """(export "e$it" (component ${'$'}empty) (component (type ${'$'}ct)))"""
@@ -1361,6 +1372,20 @@ class ComponentLoaderTest {
         assertEquals(10L, s.checkCount)
         assertTrue(s.cost - s.remapCost >= 10L * 4) { "${s.cost} - ${s.remapCost}" }
         assertDoesNotThrow { ComponentLoader.load(small) }
+
+        // インスタンス型で包んだ形・`(type (eq ..))` の形も、付けた型が小さければ実際の検証を通る（正しいコンポーネントである）
+        val smallWrapped = ascribedExports(imports = 3, nested = 2, perNested = 5) {
+            """(export "x$it" (instance ${'$'}i) (instance (type ${'$'}it)))"""
+        }
+        assertEquals(10L, estimateOf(smallWrapped).checkCount)
+        assertDoesNotThrow { ComponentLoader.load(smallWrapped) }
+        val smallEq = ascribedExports(imports = 3, nested = 2, perNested = 5) {
+            """(export "t$it" (type ${'$'}x) (type (eq ${'$'}ct)))"""
+        }
+        val se = estimateOf(smallEq)
+        assertEquals(10L, se.checkCount)
+        assertTrue(se.cost - se.remapCost >= 10L * 3) { "${se.cost} - ${se.remapCost}" }
+        assertDoesNotThrow { ComponentLoader.load(smallEq) }
     }
 
     @Test
