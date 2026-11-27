@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime.component.link
 
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmSharedFuel
 import pro.ikili.kibicomputers.core.runtime.component.ComponentImportPolicy
@@ -27,7 +28,13 @@ internal object LinkTesting {
         metered: Boolean = false,
         runtime: WasmRuntime = this.runtime,
         validate: ((ByteArray) -> Unit)? = null,
-    ): ComponentProgram = ComponentProgram.load(runtime, wat(text), host, metered, policy = ANY_IMPORT, validate = validate)
+    ): ComponentProgram {
+        val bytes = wat(text)
+        val load = { ComponentProgram.load(runtime, bytes, host, metered, policy = ANY_IMPORT, validate = validate) }
+        // JVM の中の共有の表で覚えるのは、状態を持たないホストで、検証の差し込み（呼ばれること自体を確かめるテストがある）が
+        // ないときだけ（#991）。テストのホストは、その回の状態（数えなど）を握っていることがある
+        return if (host === ComponentHost.NONE && validate == null) SharedPrograms.component("link-any", runtime, bytes, host, metered, load) else load()
+    }
 
     fun instantiate(program: ComponentProgram, env: LinkEnv = LinkEnv.NONE, fuel: Long = DEFAULT_FUEL): LinkedComponent =
         LinkedComponent.instantiate(program.plan, env, if (program.metered) WasmSharedFuel(fuel) else null)

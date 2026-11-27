@@ -102,28 +102,30 @@ val serialTestClasses: Set<String> = (
     )
     ).toSet()
 
-// 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の直列の回の XML から。目安なので、ずれても組の漏れは起きない）
+// 組の釣り合いのために、時間のかかるクラスの時間（秒。2026-11-27 の手元の :core:test・:core:testSerial の XML から。#991 で読み込んだ
+// WASM をテストの JVM の中で使い回すようにした後の値。並列の fork の回の値なので、直列の組のクラスと比べると少し大きめに出る。
+// 目安なので、ずれても組の漏れは起きない）
 val heavyTestClassSeconds = mapOf(
-    "kernel.LuaKibiApiTest" to 169,
-    "kernel.StackExhaustionLockTest" to 127,
-    "kernel.LuaShrinkReallocTest" to 122,
-    "kernel.ShellTest" to 100,
-    "kernel.vfs.DiskFileSystemStackExhaustionTest" to 79,
-    "kernel.LuaMemoryLimitTest" to 74,
-    "kernel.LuaTermFsKeysTest" to 59,
-    "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 47,
-    "kernel.ComponentProcessTest" to 44,
-    "kernel.ShellLineEditTest" to 41,
-    "kernel.LuaCoroutineRestoreTest" to 38,
-    "kernel.AsyncFuelP2Test" to 26,
-    "kernel.BasicCommandsTest" to 23,
-    "wasi.p2.WasiP2StreamTest" to 20,
+    "kernel.StackExhaustionLockTest" to 157,
+    "kernel.vfs.DiskFileSystemStackExhaustionTest" to 92,
+    "kernel.LuaKibiApiTest" to 84,
+    "kernel.LuaShrinkReallocTest" to 59,
+    "kernel.vfs.TmpFileSystemTreeStackExhaustionTest" to 49,
+    "kernel.LuaCoroutineRestoreTest" to 33,
+    "kernel.ComponentProcessTest" to 31,
+    "kernel.ShellLineEditTest" to 30,
+    "kernel.AsyncFuelP2Test" to 22,
     "runtime.component.ComponentLoaderTest" to 19,
-    "kernel.AsyncP2Test" to 17,
-    "kernel.AsyncFuelTest" to 17,
-    "kernel.ComponentStackExhaustionLockTest" to 16,
-    "wasi.p2.KibiP2BehaviourTest" to 16,
-    "kernel.LuaKibiApiRestoreTest" to 16,
+    "kernel.BasicCommandsTest" to 17,
+    "kernel.ShellTest" to 17,
+    "kernel.AsyncFuelTest" to 16,
+    "device.ScreenDeviceBudgetTest" to 16,
+    "runtime.asyncify.AsyncifyLivenessTest" to 15,
+    "kernel.ComponentStackExhaustionLockTest" to 14,
+    "kernel.LuaTermFsKeysTest" to 12,
+    "kernel.ComponentExecTest" to 11,
+    "kernel.InstantiateStackExhaustionKernelTest" to 10,
+    "kernel.LuaKibiApiRestoreTest" to 9,
 ).mapKeys { "pro.ikili.kibicomputers.core.${it.key}" }
 
 // -Pkibi.test.shard=k/N（1 ≤ k ≤ N）。書式の誤りは構成の段階で落とす（黙って全部や 0 件を回さない）

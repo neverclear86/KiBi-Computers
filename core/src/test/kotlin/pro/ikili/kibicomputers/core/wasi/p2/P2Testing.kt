@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.wasi.p2
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import pro.ikili.kibicomputers.core.kernel.Harness
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.eventually
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
@@ -37,9 +38,11 @@ internal object P2Testing {
         r.outputs.getValue("c.wasm")
     }
 
-    /** 実物のホスト・既定の判定で読み込む */
+    /** 実物のホスト・既定の判定で読み込む（JVM の中の共有の表で覚える。#991） */
     fun load(bytes: ByteArray, metered: Boolean = true): ComponentProgram =
-        ComponentProgram.load(LinkTesting.runtime, bytes, WasiP2Host, metered = metered)
+        SharedPrograms.component("p2", LinkTesting.runtime, bytes, WasiP2Host, metered) {
+            ComponentProgram.load(LinkTesting.runtime, bytes, WasiP2Host, metered = metered)
+        }
 
     /** WAT のコンポーネントを、実物のホスト・既定の判定で読み込む */
     fun loadWat(text: String): ComponentProgram = load(WitTool.wat(text))

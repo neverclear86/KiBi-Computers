@@ -56,7 +56,8 @@ class LuaReplMemoryTest {
     fun `入力を待っているLuaのREPLは、宣言したメモリの一部だけをJVMのヒープに確保する`() = timeout(Duration.ofSeconds(60L + machines)) {
         val lua = requireNotNull(javaClass.getResourceAsStream("/kibicomputers/wasm/lua.wasm")) { "lua.wasm がない" }.use { it.readBytes() }
         val schedulerConfig = SchedulerConfig.builder().maxConcurrentMachines(8).maxBlockingProcesses(machines + 16).build()
-        Harness(schedulerConfig, execRuntime = EndiveRuntime()).use { h ->
+        // System.gc() の前後のヒープの差を測るので、JVM の中の共有の表（#991）が測る間に増えないよう切る
+        Harness(schedulerConfig, execRuntime = EndiveRuntime(), sharePrograms = false).use { h ->
             // 読み込んだモジュール（命令の列）は全台で共有する。台ごとに読み込むと、モジュールが 1 台あたり約 16 MiB を使う
             // （読み込みの共有は #37 の範囲）。ここでは、インスタンスごとに増える分を測る
             val program = Program.loadMetered(EndiveRuntime(), lua, ModuleLimits.DEFAULT)

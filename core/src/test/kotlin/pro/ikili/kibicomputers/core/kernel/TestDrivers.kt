@@ -144,13 +144,31 @@ internal class Harness(
      * 実際の時間の予算が効いて通知が次の tick に回り、テストが不安定にならないように）。予算を確かめるテストは手で進める時計を渡す
      */
     nanoTime: () -> Long = { 0L },
+    /**
+     * 読み込んだ実行ファイルを、JVM の中の共有の表（[SharedPrograms]）で使い回す（#991）。共有するのは、[execRuntime] が引数なしで作った
+     * `EndiveRuntime` で、[moduleLimits] が [ModuleLimits.DEFAULT] のときだけ（それ以外はいつも読み込む）。読み込みの副作用
+     * （回数・時間・読み込み時のログ）に頼るテストは `false` にし、理由をコメントに書く
+     */
+    sharePrograms: Boolean = true,
     /** [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916） */
     private val firstCloseWaitMillis: Long = 10_000,
 ) : AutoCloseable {
     val runtime = FakeWasmRuntime()
     val scheduler = MachineScheduler.create(
         schedulerConfig,
-        SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff, nanoTime = nanoTime),
+        SchedulerInternals(
+            executor,
+            workerIdleMillis,
+            execRuntime ?: runtime,
+            meterExecutables = execRuntime != null,
+            moduleLimits = moduleLimits,
+            timers = timers,
+            asyncifyExecutables = asyncify,
+            moduleStore = moduleStore,
+            rebootBackoff = rebootBackoff,
+            nanoTime = nanoTime,
+            programLoader = if (sharePrograms) SharedPrograms.executableLoader else null,
+        ),
     )
     private var counter = 0
     private val closeActions = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()

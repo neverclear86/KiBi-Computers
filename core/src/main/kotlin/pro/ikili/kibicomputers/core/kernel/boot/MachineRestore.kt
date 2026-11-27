@@ -2,6 +2,7 @@ package pro.ikili.kibicomputers.core.kernel.boot
 
 import pro.ikili.kibicomputers.core.kernel.Machine
 import pro.ikili.kibicomputers.core.kernel.MachineLimits
+import pro.ikili.kibicomputers.core.kernel.ProgramLoader
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ModuleSource
 import pro.ikili.kibicomputers.core.kernel.process.ProcessKind
@@ -325,8 +326,9 @@ internal class MachineRestore(private val machine: Machine, private val request:
         val waitImports = Program.cacheWaitImports(bytes, source.waitImports.toSet())
         val host = KernelDrivers.COMPONENT_HOST
         // 復元は公平の組の読み込みの上限では断らない（断ると冷えた起動になり、動いていた状態を失う。#738）
+        val loader = machine.scheduler.options.programLoader ?: ProgramLoader(Program::loadExecutable)
         return machine.scheduler.programs.load(machine.id, machine.fairShareGroup, false, bytes, source.metered, waitImports) { b ->
-            Program.loadExecutable(runtime, b, limits, source.metered, waitImports, host)
+            loader.load(runtime, b, limits, source.metered, waitImports, host)
         }
     }
 

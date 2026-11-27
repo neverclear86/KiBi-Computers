@@ -874,7 +874,9 @@ class DiskHotplugTest {
 
     @Test
     fun `mountは固定の燃料を払うので、mountとunmountを繰り返すゲストは少ない燃料では進めない`() = timeout(limit) {
-        Harness(execRuntime = EndiveRuntime()).use { h ->
+        // tick の数は、プロセスが終わるまで tick を回した回数（壁時計に左右される）で、1 回目の exec の読み込みを待つ間の tick も入る。
+        // 2 回の比べの余裕がその分に頼っているので、JVM の中の共有の表（#991）で 1 回目の読み込みを飛ばさない
+        Harness(execRuntime = EndiveRuntime(), sharePrograms = false).use { h ->
             // 1 tick の燃料を、mount 1回の固定分（MOUNT_FUEL = 50,000）の 2 倍にする
             val root = rootFs()
             root.createDirectory(VfsPath.parse("/bin"))

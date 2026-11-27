@@ -4,6 +4,7 @@ import org.jetbrains.annotations.ApiStatus
 import pro.ikili.kibicomputers.core.device.DeviceFailureLog
 import pro.ikili.kibicomputers.core.kernel.process.ProcessRuntime
 import pro.ikili.kibicomputers.core.persist.ModuleStore
+import pro.ikili.kibicomputers.core.kernel.process.Program
 import pro.ikili.kibicomputers.core.kernel.process.ProgramCache
 import pro.ikili.kibicomputers.core.kernel.sched.Dispatcher
 import pro.ikili.kibicomputers.core.kernel.sched.FairShareGroup
@@ -12,7 +13,10 @@ import pro.ikili.kibicomputers.core.kernel.sched.PermitPool
 import pro.ikili.kibicomputers.core.kernel.sched.WorkerPool
 import pro.ikili.kibicomputers.core.kernel.time.ExecutorTimerService
 import pro.ikili.kibicomputers.core.kernel.time.TimerService
+import pro.ikili.kibicomputers.core.runtime.WasmLoadException
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
+import pro.ikili.kibicomputers.core.runtime.WasmTrapException
+import pro.ikili.kibicomputers.core.runtime.component.link.ComponentHost
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.Collections
@@ -703,7 +707,28 @@ internal class SchedulerInternals(
     val rebootBackoff: RebootBackoff? = null,
     /** tick ごとの予算（#356）を測る時計（ナノ秒。テストで手で進めるものにする） */
     val nanoTime: () -> Long = System::nanoTime,
+    /**
+     * 実行ファイルの読み込み方の差し替え（#991。テストで、読み込んだ [Program] をスケジューラをまたいで使い回す）。
+     * `null` なら [Program.loadExecutable]（本番はいつも `null`）
+     */
+    val programLoader: ProgramLoader? = null,
 )
+
+/**
+ * 実行ファイルの読み込み方（#991。[SchedulerInternals.programLoader]）。引数は [Program.loadExecutable] と同じで、
+ * 例外も包まずにそのまま投げる（[ProgramCache] と `Machine.loadedProgram` が型で見分けるため）
+ */
+internal fun interface ProgramLoader {
+    @Throws(WasmLoadException::class, WasmTrapException::class)
+    fun load(
+        runtime: WasmRuntime,
+        bytes: ByteArray,
+        limits: ModuleLimits?,
+        metered: Boolean,
+        waitImports: Set<String>,
+        host: ComponentHost,
+    ): Program
+}
 
 /**
  * 1回の `tick()` の中の、メインスレッドの時間の予算（#356）。[limitNanos] は tick の頭からの上限。

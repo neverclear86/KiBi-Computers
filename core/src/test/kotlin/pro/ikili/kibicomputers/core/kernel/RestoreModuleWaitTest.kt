@@ -82,6 +82,8 @@ class RestoreModuleWaitTest {
         execRuntime = EndiveRuntime(),
         moduleLimits = moduleLimits,
         moduleStore = modules,
+        // 読み込みに時間がかかる間に stop や混雑を起こすテストなので、JVM の中の共有の表（#991）で読み込みを飛ばさない
+        sharePrograms = false,
     )
 
     /**
