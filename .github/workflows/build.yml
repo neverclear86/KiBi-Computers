@@ -139,10 +139,15 @@ jobs:
 
       # core のテストが固まったとき（デッドロック型の不安定さ）に、ジョブの上限（6 時間）でキャンセル扱いにならないよう上限を付ける。
       # 段のタイムアウトは失敗扱いなので、下の upload の段が動く。
-      # ランナーは 4 vCPU なので、組の中は JVM 1 本で回す（組どうしは別のマシンで干渉しない）
+      # ランナーは 4 vCPU なので、組の中は JVM 1 本で回す（組どうしは別のマシンで干渉しない）。
+      # 50 分たっても終わらなければ、段の上限で殺される前に、全 JVM のスレッドダンプ（jcmd Thread.print -l）を
+      # core/build/thread-dumps/jcmd/ とログに残す（#927。ふだんの組は 5〜8 分。テストの中の止まりは ThreadDumpOnTimeout が
+      # core/build/thread-dumps/<タスク>-shard-<k>of<N>/ に残す）
       - name: Core tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
         timeout-minutes: 60
-        run: ./gradlew :core:test -Pkibi.test.shard=${{ matrix.shard }}/${{ strategy.job-total }} -Pkibi.test.forks=1 --console=plain
+        run: >-
+          bash .github/scripts/with-thread-dump-watchdog.sh 3000 core/build/thread-dumps/jcmd shard-${{ matrix.shard }} --
+          ./gradlew :core:test -Pkibi.test.shard=${{ matrix.shard }}/${{ strategy.job-total }} -Pkibi.test.forks=1 --console=plain
 
       # 組のテストの数を出す。0 件なら落とす（組の振り分けの誤りで、テストが黙って走らなくなるのを防ぐ）。
       # 組に直列の組（または並列の組）のクラスが 1 つもないと、そのタスクは NO-SOURCE で結果のディレクトリができない（#996）。
@@ -174,6 +179,7 @@ jobs:
           path: |
             test-reports-core-${{ matrix.shard }}.txt
             **/build/test-results/**/*.xml
+            core/build/thread-dumps/**
           if-no-files-found: warn
           retention-days: 30
 
