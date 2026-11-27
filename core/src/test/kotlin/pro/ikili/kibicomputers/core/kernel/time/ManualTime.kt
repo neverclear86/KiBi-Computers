@@ -54,6 +54,22 @@ internal class ManualTimerService(val clock: ManualClock) : TimerService {
         runDue()
     }
 
+    /** 取り消されていない予定のうち、いちばん近い期限までの ns（過ぎていれば 0）。予定がなければ `null`（#992） */
+    fun nanosToNextDue(): Long? = synchronized(entries) {
+        val now = clock.monotonic.get()
+        entries.filter { !it.cancelled }.minOfOrNull { it.due }?.let { (it - now).coerceAtLeast(0) }
+    }
+
+    /**
+     * いちばん近い期限ちょうどまで時計を進め、期限の来た仕事を実行する（#992）。予定がなければ何もせず `false` を返す。
+     * 期限ちょうどまで進めるので、`due <= now` で明けるタイマーと、Lua の `os.sleep` の「期限より前なら待ち直す」の両方が明ける
+     */
+    fun advanceToNextDue(): Boolean {
+        val nanos = nanosToNextDue() ?: return false
+        advance(nanos)
+        return true
+    }
+
     /** 期限の来た仕事を実行する */
     fun runDue() {
         while (true) {

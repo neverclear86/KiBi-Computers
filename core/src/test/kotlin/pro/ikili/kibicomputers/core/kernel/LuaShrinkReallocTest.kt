@@ -9,6 +9,8 @@ import org.junit.jupiter.params.provider.MethodSource
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.time.ManualClock
+import pro.ikili.kibicomputers.core.kernel.time.ManualTimerService
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -22,7 +24,8 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *
  * Zig の libc の malloc（BrkAllocator）の realloc は、縮めでも区画の大きさ（2 のべき乗）が変わると、新しい区画を取って写す。
  * 新しい区画への写しと頭は、アロケーターの包み（kibi_wasi.c）が数えないまま書くと、上限の近くでトラップになる。
- * Lua が os.sleep で待つ間に、テストの側で RAM の残りをちょうど決まった値にしてから、縮めを起こす
+ * Lua が os.sleep で待つ間に、テストの側で RAM の残りをちょうど決まった値にしてから、縮めを起こす。
+ * os.sleep の時計は手で進める（#992。予約を済ませてから期限まで進めるので、実時間の 1 秒を待たない）
  */
 class LuaShrinkReallocTest {
     private val limit = Duration.ofSeconds(90)
@@ -45,11 +48,20 @@ class LuaShrinkReallocTest {
     /**
      * RAM [ramBytes] のマシンで `lua -e <script>` を動かす。スクリプトが初めて os.sleep で待ったときに、RAM の残りがちょうど
      * [remaining] バイトになるように予約し、終わるまで待つ。終わったときの状態とコンソールと、予約してから終わるまでに RAM の勘定が
-     * 確保を断った回数（kibi_wasi.c の counted_alloc が失敗した回数の目安）を返す
+     * 確保を断った回数（kibi_wasi.c の counted_alloc が失敗した回数の目安）を返す。
+     *
+     * 時計は手で進める（#992）。マシンの時計とスケジューラのタイマーを同じ [ManualClock] で組にし（片方だけだと、Lua が読む時刻と
+     * タイマーの期限が食い違う）、予約と断りの数を読んだ後に、os.sleep の期限ちょうどまで進めて起こす
      */
-    private fun runSqueezed(script: String, ramBytes: Long, remaining: Long): Squeezed = Harness(execRuntime = EndiveRuntime()).use { h ->
+    private fun runSqueezed(script: String, ramBytes: Long, remaining: Long): Squeezed {
+        val timers = ManualTimerService(ManualClock())
+        return Harness(execRuntime = EndiveRuntime(), timers = timers).use { h -> runSqueezed(h, timers, script, ramBytes, remaining) }
+    }
+
+    private fun runSqueezed(h: Harness, timers: ManualTimerService, script: String, ramBytes: Long, remaining: Long): Squeezed {
         val host = ConsoleHost()
-        val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes)
+        val env = MachineEnvironment.builder().clock(timers.clock).build()
+        val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = ramBytes, environment = env)
         run {
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             m.vfs.createDirectory(VfsPath.parse("/bin"))
@@ -58,16 +70,19 @@ class LuaShrinkReallocTest {
             m.vfs.write(f, bytes, 0, bytes.size)
         }
         val pid = m.exec("/bin/lua", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("lua", "-e", script)))
+        // os.sleep(1) の待ち（予定が入り、待機点に着いた）を見る。ここでは時計を進めない
         eventually(60_000, "待たない: ${m.stateOf(pid)} ${host.text()}") {
             h.scheduler.tick()
             Thread.sleep(1)
-            m.stateOf(pid) == ProcessState.WAITING_EVENT || m.stateOf(pid).isTerminal
+            m.stateOf(pid).isTerminal || (m.stateOf(pid) == ProcessState.WAITING_EVENT && m.isAtWaitPoint && timers.pending > 0)
         }
         val rt = requireNotNull(m.runtime(pid)) { "プロセスの状態がない" }
         val account = m.memoryAccount
         val held = account.limitBytes - account.usedBytes - remaining
         assertTrue(held >= 0 && account.tryReserveBytes(held), "残りを $remaining にできない: ${account.usedBytes} ${m.stateOf(pid)} ${host.text()}")
         val refusalsBefore = m.lock.withLockValue { rt.memory.refusalCount }
+        // 予約の後に、os.sleep の期限ちょうどまで時計を進めて起こす（m.lock の外から。期限の仕事が中でロックを取る）
+        timers.advanceToNextDue()
         eventually(60_000, "終わらない: ${host.text()}") {
             h.scheduler.tick()
             Thread.sleep(1)
@@ -81,7 +96,7 @@ class LuaShrinkReallocTest {
             account.usedBytes == 0L
         }
         h.scheduler.tick()
-        Squeezed(state, host.text(), refusals)
+        return Squeezed(state, host.text(), refusals)
     }
 
     @Test
