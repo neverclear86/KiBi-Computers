@@ -61,7 +61,7 @@ git switch -c issue-<番号>-<短い英語名>
 
 - コミットメッセージは英語の命令形。
 - Issue のチェックリストのうち済んだ項目を `gh issue edit <番号> --body-file` で更新する。
-- 開いている別の PR に依存する、または1つの Issue を複数の PR に分けるときは、AGENTS.md の「Stacked PRs」の手順で積む（`gh stack init` / `add` / `submit`、既存の PR は `gh stack link`）。
+- 開いている別の PR に依存する、または1つの Issue を複数の PR に分けるときは、AGENTS.md の「Stacked PRs」の手順で積む（`gh pr create --base <下のブランチ>` で PR を作り、`gh stack link <下のPR> <上のPR>` で紐づける。`gh stack submit`・`sync`・`rebase`・`push` は force-with-lease で push するので使わない。#936）。
 - PR を作る:
   ```bash
   git push -u origin HEAD
