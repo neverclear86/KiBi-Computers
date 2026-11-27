@@ -203,13 +203,35 @@ step の途中で燃料が尽きたときも、止まりうる関数の中なら
 
 Endive 1.2.0 の `Validator.validateElements` は、アクティブの要素の式しか `validateConstantExpression` に通さない（上流の main も同じ）。パッシブ・宣言の要素セグメントの式は、定数式に使えない命令・型の合わない値でも検証を通っていた。#893 で次のようにした。
 
-- **判定の場所**: `EndiveRuntime.parseModule` の、`Parser.parse` の直後で、#706 の判定（`foreignFuncRefInitializer`）より先（`invalidPassiveElementInitializer`）。`load`・`describe`・`Program.load`・`Program.loadMetered`（挿入・変換の後の読み込み）は、どれもここを通る。#706 より先に置くのは、正しくない WASM を「対応していない作り」と報告しないため。
+- **判定の場所**: `EndiveRuntime.parseModule` の、`Parser.parse` の直後で、#706 の判定（`foreignFuncRefInitializer`）より先（`invalidPassiveElementInitializer`。#942 で `invalidConstExpr` に広げた）。`load`・`describe`・`Program.load`・`Program.loadMetered`（挿入・変換の後の読み込み）は、どれもここを通る。#706 より先に置くのは、正しくない WASM を「対応していない作り」と報告しないため。
 - **規則**: 定数式の命令だけで、スタックにちょうど 1 つの値が残り、その型が要素の型に合う（`ValType.matches`）。`global.get` は不変のグローバルだけ、`ref.func` は関数の総数の範囲、`ref.null` のヒープ型は型の番号の範囲か抽象ヒープ型（範囲の外は `ValType` の解決が場所のない `InvalidException` を投げるので、先に見て場所を付けて断る）。**命令が取る値の型も確かめる**（Endive はアクティブの要素・グローバルの式でも、取る値の型を確かめない）: 算術は同じ型の数、`ref.i31` は i32、`struct.new` はフィールドの型（i8・i16 は i32）、`array.new`・`array.new_fixed` は要素の型と長さ（i32）、`*.new_default` は既定値が作れる型（null を持てない参照のフィールド・要素は断る）、変換は externref・anyref。最初の版は数だけを確かめたが、`(elem (ref null $SF) (struct.new $SF (i32.const -5)))`（`$SF` は funcref のフィールド 1 つの struct）が通り、`table.init` → `struct.get` → `table.set` → `call_indirect` で、インタプリタでは `ArrayIndexOutOfBoundsException` がそのまま漏れ、コンパイルありでは関数 0 が呼べる値（`(i32.const 0)`）まで作れたので、取る値の型も確かめることにした。`any.convert_extern`・`extern.convert_any` の結果が null を持てるかは、取った値に従う（仕様）。最初の版は常に null を持てる型で積んで、正しい WASM（`(elem (ref extern) (extern.convert_any (ref.i31 (i32.const 0))))` など）を断っていた。
 - **文面**: `WASM の検証に通らない: 要素セグメント i（パッシブ|宣言）の項目 j: …`（番号はセクションの中の番号）。原因なしの `WasmLoadException` で、`AsyncifyUnsupported` にはしない。
 - **Endive がもう断っている形**: 式の先頭の `ref.func` の範囲（flag 1・3 の関数の番号の並びを含む）は、`Validator` のコンストラクター（`declaredFunctions`）が `InvalidException` で断る。この判定に届くのは先頭でない `ref.func` だけ。
 - **probe の結果**（修正の前。funcref の表に `table.init` で置いて `call_indirect`）: `v128.const` の下位 32 ビットが関数の番号として表に入る。0 なら関数 0 が呼べ、関数の数ちょうどならインタプリタで「unknown function」のトラップ、-5 ならインタプリタで `ArrayIndexOutOfBoundsException` がそのまま漏れた（コンパイルありでは「indirect call type mismatch」のトラップ）。`ref.null extern` は null として入った。`drop` の項目は `table.init`・`array.new_elem` で `MalformedException` のトラップになった。
-- **残っていること（#893 の範囲の外）**: グローバルの初期値とアクティブの要素の式は、Endive が式の結果の型だけを確かめ、命令が取る値の型を確かめない。同じ形（`(global (ref $SF) (struct.new $SF (i32.const -5)))`）で、正しくない値・JVM の例外に届く。上の判定を、グローバル・アクティブの要素にも使う別の Issue（#942）にした。Endive のアクティブの要素・表の初期値の型の規則は、`any.convert_extern`・`extern.convert_any` の結果の null の可否が違うので、正しい WASM を断る（上流への報告は #940）。
+- **残っていたこと（#893 の範囲の外）**: グローバルの初期値とアクティブの要素の式は、Endive が式の結果の型だけを確かめ、命令が取る値の型を確かめない。同じ形（`(global (ref $SF) (struct.new $SF (i32.const -5)))`）で、正しくない値・JVM の例外に届く。#942 で、上の判定をグローバル・表の初期値・アクティブの要素・データのオフセットにも使うようにした（下の「追記（#942）」）。Endive のアクティブの要素・表の初期値の型の規則は、`any.convert_extern`・`extern.convert_any` の結果の null の可否が違うので、正しい WASM を断る（上流への報告は #940）。
 - Endive が直ったら、この判定とテスト（`PassiveElementValidationTest`）を外す。
+
+### 追記（#942）: グローバル・表・アクティブの要素・データの定数式の検証
+
+#893 の判定（`EndiveRuntime.invalidPassiveElementInitializer`）を `EndiveRuntime.invalidConstExpr` に広げ、Endive 1.2.0 が命令が取る値の型を確かめない（`Validator.validateConstantExpression` は `pop()` するだけ）残りの場所の定数式も、同じ規則で確かめるようにした。判定の場所（`parseModule` の `Parser.parse` の直後、#706 より先）、文面の形（`WASM の検証に通らない: <場所>: <理由>`。原因なしの `WasmLoadException`）、場所の番号（セクションの中の番号。グローバルは import を数えない）は #893 と同じ。
+
+| 場所 | 期待する型 | `global.get` で読めるグローバル | 文面の場所 |
+| --- | --- | --- | --- |
+| グローバルの初期値 | グローバルの型 | import したものと、自分より前のグローバル | `グローバル i の初期値` |
+| 表の初期値 | 表の要素の型 | import したものだけ | `表 i の初期値` |
+| 要素セグメントのオフセット（アクティブ） | i32 | 全グローバル | `要素セグメント i（アクティブ）のオフセット` |
+| 要素セグメントの項目（アクティブ・パッシブ・宣言） | 要素の型 | 全グローバル | `要素セグメント i（<種類>）の項目 j` |
+| データセグメントのオフセット（アクティブ） | i32 | 全グローバル | `データセグメント i のオフセット` |
+
+- **表の初期値は import したグローバルだけ**: Issue の本文は「要素・表の初期値は全グローバル」としていたが、仕様では表のセクションはグローバルのセクションより前にあり、表の初期値から見えるのは import したグローバルだけ。`wasm-tools validate` も `(global $gd funcref (ref.func $f)) (table 1 funcref (global.get $gd))` を断る（`ConstExprValidationTest` で確かめている）。Endive の検証は全グローバルで通すが、インスタンスを作るときに表の初期値をグローバルの初期化より前に評価する（`Instance` のコンストラクター）ので、定義したグローバルを読む形は動かない。仕様どおり import したものだけにした。文面は `グローバル n はここでは読めない（import したものだけ）`。
+- **データのオフセットも含めた**: Issue のチェックリストにはなかったが、Endive の `validateData` も同じ `validateConstantExpression` を使うので、`(data (i32.add (i64.const 0) (i64.const 0)) "a")` が通っていた。同じ関数・同じ場所で直せるので含めた。
+- **オフセットは i32 に固定**（Endive と同じ。table64・memory64 は Endive がもう i32 として確かめる）。アクティブの要素の項目の期待する型は要素の型（要素の型が表の型に合うことは Endive が確かめる）。
+- **文面の期待する型の呼び名**: 結果の型が合わないときの文面を、場所ごとに `要素の型`・`グローバルの型`・`表の要素の型`・`オフセットの型` にした（パッシブ・宣言の要素の文面は変わらない）。
+- **Endive が先に断る形には届かない**: 後ろのグローバルを読む初期値、スタックが足りない式、結果の型が合わない式は、Endive の `Parser.parse` が断る。正しい WASM のうち、`(global (ref any) (any.convert_extern <null を持てない extern>))` のように Endive の規則で断られるもの（#940）は、こちらでは直せない。
+- **計測ありの経路**: `Program.loadMetered` では、正しくない式が挿入・変換を通ってから、最後の `runtime.load` でこの判定に断られる（`FuelInjector`・`Asyncify` の定数式の写しには型の検査を足さない。#893 と同じ理由）。初期値の式を持つ表は、`FuelInjector` が「初期値の式を持つテーブルには対応していない」で先に断る（前からの制約）。
+- **`Instrumentation.VERSION` は上げない**: 挿入・変換の出力は変わらず、断るものが増えるだけ（#851・#893 と同じ）。保存形式も変えない。今まで読み込めた正しくない WASM を保存したプロセスは、復元のときに `WasmLoadException` で失敗するようになるが、対象は正しくない WASM だけなので許容する。
+- **負荷**: 判定は読み込みのときに 1 回だけで、式の長さの和に比例する（関数の型とグローバルの一覧は 1 回だけ作り、場所ごとには読める数の上限だけを変える）。共有の状態を持たない。
+- Endive が直ったら、この判定とテスト（`ConstExprValidationTest`・`PassiveElementValidationTest`）を外す。
 
 ### 追記（#937）: 関数の型の部分型を使う間接呼び出し
 

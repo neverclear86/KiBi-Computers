@@ -1977,7 +1977,7 @@ internal class Reader(val buf: ByteArray, var pos: Int, val end: Int) {
                 // 受け付ける命令は `FuelInjector` の定数式と同じ（#851）。以下の「定数式に使えない」で断る分岐は、変換できない作りではなく、
                 // WASM として正しくないものとして断る（原因なしの WasmLoadException）。`prepare` は最初に Endive の `Parser.parse`（検証あり）を通すが、
                 // Endive 1.2.0 の検証はパッシブ・宣言の要素セグメント（flag 5・7）の初期値を確かめないので、その形ではここに届く
-                // （型の合わないものは、変換の後の読み込みで EndiveRuntime.parseModule が断る。#893）
+                // （型の合わないものは、変換の後の読み込みで EndiveRuntime.parseModule が断る。#893。命令が取る値の型も同じ。#942）
                 0xFD -> { // v128.const
                     val sub = leb()
                     if (sub != 12L) throw WasmLoadException("定数式の命令 0xFD %d は定数式に使えない".format(sub))

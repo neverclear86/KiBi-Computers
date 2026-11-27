@@ -45,7 +45,7 @@ class PassiveElementValidationTest {
         assertTrue(WitTool.validate(bytes) != null, "テストの入力が正しくない WASM になっている（$name）")
         // Endive の検証は通す（Endive の穴。直ったらここが落ちるので、判定を外す）
         Parser.parse(bytes)
-        assertTrue(EndiveRuntime.invalidPassiveElementInitializer(Parser.parse(bytes)) != null, name)
+        assertTrue(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)) != null, name)
         for (runtime in listOf(EndiveRuntime(false), EndiveRuntime())) {
             for ((path, load) in listOf<Pair<String, () -> Any>>(
                 "load" to { runtime.load(bytes) },
@@ -66,7 +66,7 @@ class PassiveElementValidationTest {
 
     /**
      * Endive 自身が断る形（式の先頭の `ref.func` の範囲。Endive の `Validator` のコンストラクターが確かめる）。
-     * Endive の `Parser.parse` が断るので、[EndiveRuntime.invalidPassiveElementInitializer] には届かない
+     * Endive の `Parser.parse` が断るので、[EndiveRuntime.invalidConstExpr] には届かない
      */
     private fun assertRejectedByEndive(name: String, bytes: ByteArray) {
         assertTrue(WitTool.validate(bytes) != null, "テストの入力が正しくない WASM になっている（$name）")
@@ -216,7 +216,7 @@ class PassiveElementValidationTest {
         for (elem in accepted) {
             val bytes = moduleWithImports(elem)
             assertEquals(null, WitTool.validate(bytes), elem)
-            assertNull(EndiveRuntime.invalidPassiveElementInitializer(Parser.parse(bytes)), elem)
+            assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)), elem)
             EndiveRuntime(false).load(bytes)
             EndiveRuntime().load(bytes)
         }
@@ -264,7 +264,7 @@ class PassiveElementValidationTest {
         for (elem in elems) {
             val bytes = module(elem)
             assertEquals(null, WitTool.validate(bytes), elem)
-            assertNull(EndiveRuntime.invalidPassiveElementInitializer(Parser.parse(bytes)), elem)
+            assertNull(EndiveRuntime.invalidConstExpr(Parser.parse(bytes)), elem)
             EndiveRuntime(false).load(bytes)
             EndiveRuntime().load(bytes)
         }

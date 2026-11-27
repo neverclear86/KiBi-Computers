@@ -135,7 +135,8 @@ internal object GcCosts {
 
     /**
      * 定数式 [expr] を評価して、作るオブジェクトのバイト数と、結果の整数の値（分かれば）を返す。配列の長さが分からなければ `null`。
-     * 式そのものの正しさは Endive の検証と `invalidPassiveElementInitializer`（#893）が確かめるので、ここでは値の数と長さだけを追う
+     * 式そのものの正しさ（命令が取る値の型など）は Endive の検証と `EndiveRuntime.invalidConstExpr`（#893・#942。計測ありでは挿入の後の読み込み）が
+     * 確かめるので、ここでは値の数と長さだけを追う
      */
     private fun evaluate(expr: List<Instruction>, types: TypeSection, globals: List<Long?>): Evaluated? {
         if (expr.none { isConstAllocation(it.opcode()) || it.opcode() == OpCode.REF_I31 }) {
