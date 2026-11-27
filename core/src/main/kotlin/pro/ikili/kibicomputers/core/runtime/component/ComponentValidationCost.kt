@@ -84,7 +84,10 @@ import java.util.IdentityHashMap
  *   （n = 2,000・d = 64 の型を持つ import を 300 個並べた 70 KB で、見積もり約 195 万のまま検証が CPU 14.7 秒）。写し直しの大きさ（[Info.local]）の
  *   たどりと同じ道で、たどれるインスタンス型（インスタンス）の [Info.explicitSelf] を足して数える（上限は [Info.explicitBound]。
  *   [Info.remapBound] では抑えない。重なりは同じ写し直しの中で 1 回だけ。インスタンス化でできるインスタンスの型も同じ）。
- *   resource を定義しない型の宣言は、写し直しもこの分も数えない
+ *   resource を定義しない型の宣言は、写し直しもこの分も数えない。型を付けたコンポーネントの export
+ *   （`(export "x" (component $c) (component (type $ct)))`）の部分型の確認も、確かめるたびに両方のコンポーネント型の
+ *   import・export のインスタンス型を同じく写し直す（`SubtypeCx::component_type` → `open_instance_type`）ので、
+ *   渡す側と付けた型の両方の表の件数を数える（[Walker.remapExplicit]。resource を定義しない型でも数える）
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
@@ -419,6 +422,23 @@ internal object ComponentValidationCost {
             remapCost = add(remapCost, n)
         }
 
+        /**
+         * 型を付けたコンポーネントの export の確認での、[target] のたどれるインスタンス型の explicit な resource の表の写しを数える（#964 のレビュー）。
+         * wasmparser のコンポーネントの部分型の確認（`SubtypeCx::component_type`）は、確かめるたびに import・export の
+         * インスタンス型を `remap_component_instance_type_id` で写し直す（表を丸ごと写す）。写し直しの大きさ（[Info.local]）は
+         * 型の確認の大きさ（[check]）に入っているので、表の件数だけを足す。引けなければ、それまでの最大
+         */
+        private fun remapExplicit(target: Info?) {
+            val n = if (target == null) {
+                maxExplicit
+            } else {
+                flatOf(target, 0)
+                explicitOf(target)
+            }
+            cost = add(cost, n)
+            remapCost = add(remapCost, n)
+        }
+
         /** [flatOf] で数えた、[info] の explicit な resource の表を写す件数（たどらなかったときは上限） */
         private fun explicitOf(info: Info): Long {
             val target = info.content ?: info
@@ -639,6 +659,13 @@ internal object ComponentValidationCost {
                             desc != null -> descInfo(s, desc)
                             item.target.sort == Sort.FUNC -> found
                             else -> copied(found)
+                        }
+                        // コンポーネントの部分型の確認は、確かめるたびにコンポーネント型のインスタンスの import・export を写し直す
+                        // （`SubtypeCx::component_type` → `open_instance_type`）ので、explicit な resource の表の写しを数える
+                        // （#964 のレビュー。渡す側と付けた型の両方。大きい側）
+                        if (desc is ExternDesc.Component) {
+                            remapExplicit(found)
+                            remapExplicit(info)
                         }
                         val ref = info ?: unknown()
                         // インスタンスの export は、その explicit な resource をこのコンポーネントの表に写す（#964）
