@@ -144,7 +144,7 @@ Windows では Git Bash から `./gradlew`、PowerShell から `.\gradlew.bat` �
 
 保存済みの Claude Code Workflow `issue-to-pr`（`.claude/workflows/issue-to-pr.js`）で回す。
 
-1. 選択: 「依存: #n」が閉じていて、未決の `decision` に左右されず、`needs-human` と `human-task` が付いていない Issue を選ぶ。同時に最大3件（`window`）、同じ area は同時に1件まで。
+1. 選択: 「依存: #n」が閉じていて、未決の `decision` に左右されず、`needs-human` と `human-task` が付いていない Issue を選ぶ。同時に最大3件（`window`）、同じ area は同時に2件まで（#986。同じ area の PR どうしの衝突は、CI の段階の取り込みとマージの段階で受け止める）。
 2. プラン（システムコールの ABI、保存形式、公開 API に関わる Issue だけ）: プランを Issue に投稿し、レビューを受ける。プランがこの3つについて、決まっていない選択を含むなら、人の判断を求めて止まる。
 3. 実装ループ: 着手前に設計の助言（Opus）を書かせてから、`.worktrees/issue-<番号>` の worktree で、`build` と両バージョンの GameTest が通るまで直し、PR を作る（ビルドに入らないファイルだけの差分なら、Gradle を回さず `node --test .claude/workflow-tests/` だけ。#985）。実装のエージェントが PR に確認事項を残したら、CI とレビューの前に、人に聞く前の確かめ（Fable）に回す。人の判断が要るなら、マージせずに止まる。
 4. CI: 落ちたら最大2回直す。直しの段階（CI の直し・レビューの直し・確認事項の反映）の手元の確認は、コンパイルと触ったクラスのテスト、接続層を触ったときだけそのバージョンの GameTest で、通しの確認は push の後の CI に任せる（#985）。
