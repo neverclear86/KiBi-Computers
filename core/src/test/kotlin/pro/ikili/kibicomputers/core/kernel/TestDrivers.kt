@@ -146,8 +146,9 @@ internal class Harness(
     nanoTime: () -> Long = { 0L },
     /**
      * 読み込んだ実行ファイルを、JVM の中の共有の表（[SharedPrograms]）で使い回す（#991）。共有するのは、[execRuntime] が引数なしで作った
-     * `EndiveRuntime` で、[moduleLimits] が [ModuleLimits.DEFAULT] のときだけ（それ以外はいつも読み込む）。読み込みの副作用
-     * （回数・時間・読み込み時のログ）に頼るテストは `false` にし、理由をコメントに書く
+     * `EndiveRuntime` で、[moduleLimits] が [ModuleLimits.DEFAULT] で、[schedulerConfig] のスレッドのスタックが既定より小さくないときだけ
+     * （それ以外はいつも読み込む。[SharedPrograms.shareable]）。読み込みの副作用（回数・時間・読み込み時のログ）に頼るテストは `false` にし、
+     * 理由をコメントに書く
      */
     sharePrograms: Boolean = true,
     /** [close] が、スケジューラの終わりを 1 回目に待つ長さ（過ぎたら残った `KiBi-` スレッドに割り込んでもう 1 回待つ。#916） */
@@ -167,7 +168,7 @@ internal class Harness(
             moduleStore = moduleStore,
             rebootBackoff = rebootBackoff,
             nanoTime = nanoTime,
-            programLoader = if (sharePrograms) SharedPrograms.executableLoader else null,
+            programLoader = if (sharePrograms && SharedPrograms.shareable(schedulerConfig)) SharedPrograms.executableLoader else null,
         ),
     )
     private var counter = 0

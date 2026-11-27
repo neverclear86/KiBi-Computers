@@ -20,6 +20,10 @@ import java.util.concurrent.atomic.AtomicLong
  * - 共有するのは、結果が入力だけで決まるときだけ: ランタイムが引数なしで作った [EndiveRuntime]（[EndiveRuntime.defaultConfiguration]。
  *   包んだもの・インタプリタだけのもの・時計を差し替えたものは共有しない）、上限が [ModuleLimits.DEFAULT] そのもの（`ModuleLimits` は
  *   同一性で比べるので、縮めた上限で断らせるテストが覚えた成功で検査を飛ばさないように）、ホストが状態を持たない単一のもの。
+ * - [Harness] のスケジューラは、スレッドのスタック（`SchedulerConfig.threadStackBytes`）が既定より小さくないときだけ表を使う
+ *   （[shareable]）。コンパイルはスケジューラのコンパイル用のスレッド（そのスタックの大きさ）で動き、`EndiveRuntime.load` は
+ *   コンパイル中の `StackOverflowError` などを失敗にせず、インタプリタに落とした [Program] を成功として返す。小さいスタックで
+ *   落ちた結果を覚えると、同じ JVM の後続のテストが黙ってインタプリタの [Program] を受け取るので、結果が入力だけで決まらない。
  * - キーのハッシュは、渡されたバイト列から計算する（置き場で期待していたハッシュは使わない。中身だけを差し替えて照合の失敗を
  *   確かめるテストがある）。
  * - 覚えるのは成功だけ。例外（`Error` も）は覚えずにそのまま投げる（失敗を覚えるのは今までどおり `ProgramCache` の役目）。
@@ -109,6 +113,15 @@ internal object SharedPrograms {
 
     /** 読み込んだ結果を、ランタイムのインスタンスをまたいで使い回してよいランタイム */
     fun shareable(runtime: WasmRuntime): Boolean = (runtime as? EndiveRuntime)?.defaultConfiguration == true
+
+    /** 既定のスレッドのスタックの大きさ（`SchedulerConfig` の既定） */
+    val DEFAULT_THREAD_STACK_BYTES: Long = SchedulerConfig.builder().build().threadStackBytes
+
+    /**
+     * [config] のスケジューラで読み込んだ結果を表に入れてよいか: スレッドのスタックが既定より小さくないとき。
+     * 小さいとコンパイルが `StackOverflowError` でインタプリタに落ちうる（落ちても読み込みは成功になる）ので、共有しない
+     */
+    fun shareable(config: SchedulerConfig): Boolean = config.threadStackBytes >= DEFAULT_THREAD_STACK_BYTES
 
     /** `Machine.exec` と復元の読み込み（[SchedulerInternals.programLoader]）。共有しない条件なら [Program.loadExecutable] をそのまま呼ぶ */
     val executableLoader: ProgramLoader = ProgramLoader { runtime, bytes, limits, metered, waitImports, host ->
