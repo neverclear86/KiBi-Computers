@@ -3,6 +3,7 @@ package pro.ikili.kibicomputers.core.runtime.endive
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -19,6 +20,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import run.endive.runtime.ByteBufferMemory
 import run.endive.runtime.WasmRuntimeException
 import run.endive.wasm.types.MemoryLimits
+import java.nio.ByteBuffer
+import java.util.function.IntFunction
 import kotlin.random.Random
 
 /** 初めて書き込んだ 4 KiB の区画の数で RAM を数える線形メモリ（#407） */
@@ -421,6 +424,71 @@ class WrittenPagesMemoryTest {
         assertEquals(0L, budget.used)
         // budget がなければ数えない
         assertEquals(0L, WrittenPagesMemory(MemoryLimits(2, 4), null).tableBytes)
+    }
+
+    /**
+     * [block] が投げた [OutOfMemoryError] を返す。JUnit の assertThrows は OutOfMemoryError を回復できない例外として
+     * 投げ直すので、自分で捕まえる（#946）
+     */
+    private fun catchOutOfMemory(block: () -> Unit): OutOfMemoryError {
+        try {
+            block()
+        } catch (e: OutOfMemoryError) {
+            return e
+        }
+        throw AssertionError("OutOfMemoryError が出なかった")
+    }
+
+    /** 区画の表の確保で [failure] を投げる口（#946）。呼ばれた大きさを [sizes] に残す */
+    private class FailingTable(val failure: Throwable) : IntFunction<Array<ByteBuffer?>> {
+        val sizes = ArrayList<Int>()
+
+        override fun apply(value: Int): Array<ByteBuffer?> {
+            sizes += value
+            throw failure
+        }
+    }
+
+    @Test
+    fun `数えた後に区画の表の確保がOutOfMemoryErrorで落ちたら、数えた分を返して同じ例外を投げる`() {
+        val budget = Budget(Long.MAX_VALUE)
+        val failure = OutOfMemoryError("区画の表")
+        val factory = FailingTable(failure)
+        val e = catchOutOfMemory { WrittenPagesMemory(MemoryLimits(3, 8), budget, tableFactory = factory) }
+        assertSame(failure, e, "包まずに投げ直す")
+        assertEquals(listOf(3 * 16), factory.sizes, "最初のページ数 × 16 の表を作ろうとした")
+        assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `数えた後に区画の表の確保がほかの例外で落ちても、数えた分を返す`() {
+        val budget = Budget(Long.MAX_VALUE)
+        val failure = IllegalStateException("差し込んだ失敗")
+        val e = assertThrows<IllegalStateException> {
+            WrittenPagesMemory(MemoryLimits(2, 4), budget, tableFactory = FailingTable(failure))
+        }
+        assertSame(failure, e)
+        assertEquals(0L, budget.used)
+    }
+
+    @Test
+    fun `数えていないとき（budgetがない・最初のページが0）は、表の確保の失敗で何も返さない`() {
+        val noBudget = FailingTable(OutOfMemoryError())
+        catchOutOfMemory { WrittenPagesMemory(MemoryLimits(2, 4), null, tableFactory = noBudget) }
+        assertEquals(listOf(2 * 16), noBudget.sizes)
+        // 最初のページが 0 なら数えないので、返しもしない（返すと Budget の check が落ちる）
+        val empty = Budget(Long.MAX_VALUE)
+        catchOutOfMemory { WrittenPagesMemory(MemoryLimits(0, 1), empty, tableFactory = FailingTable(OutOfMemoryError())) }
+        assertEquals(0L, empty.used)
+    }
+
+    @Test
+    fun `表の確保の口を渡しても、断られたときは呼ばずにPageTableRefused`() {
+        val budget = Budget(2 * table - 1)
+        val factory = FailingTable(OutOfMemoryError())
+        assertThrows<PageTableRefused> { WrittenPagesMemory(MemoryLimits(2, 4), budget, tableFactory = factory) }
+        assertTrue(factory.sizes.isEmpty(), "断られたら表を作らない")
+        assertEquals(0L, budget.used)
     }
 
     @Test
