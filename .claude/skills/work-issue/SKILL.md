@@ -55,6 +55,7 @@ git switch -c issue-<番号>-<短い英語名>
   ./gradlew :platform-neoforge-1.21.1:runGameTestServer   # platform-* か core を触ったとき
   ./gradlew :platform-forge-1.20.1:runGameTestServer      # core か 1.20.1 を触ったとき
   ```
+  差分がビルドに入らないファイル（`.claude/**`、`docs/**`（`docs/syscalls/**` を除く）、どの `src/` の下でもない `*.md`）だけなら、Gradle は回さず `node --test .claude/workflow-tests/` だけを回す（#985。`.github/**` を含むときは PR の CI で確かめる）。ワークフロー（`.claude/workflows/`・`.claude/workflow-tests/`）を変えたら、ビルドに入るファイルと一緒でも `node --test .claude/workflow-tests/` を回す。
 - GUI や描画を変えたら `run-minecraft` スキルで開発クライアントを起動し、スクリーンショットで確認する。
 
 ## 4. コミットと PR
