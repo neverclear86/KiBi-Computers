@@ -89,6 +89,12 @@ public interface WasmModule : WasmModuleShape {
     public val sharesFuel: Boolean get() = false
 
     /**
+     * コンパイルしきれず、インタプリタで動くコードを持つなら、その理由と数（#931。読み込みのときに決めた、変わらない値。読むのは O(1)）。
+     * 全部コンパイルした・インタプリタだけで動かす設定のランタイム・コンパイルしないランタイムでは `null`（既定）
+     */
+    public val interpreterUse: InterpreterUse? get() = null
+
+    /**
      * インスタンスを作る。モジュールに start 関数があれば、燃料を設定した後に実行する。
      *
      * @throws WasmLinkException import が足りない、型が合わない、またはデータ・要素のセグメントが範囲に収まらない

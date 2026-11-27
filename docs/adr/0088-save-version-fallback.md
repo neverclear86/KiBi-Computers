@@ -76,12 +76,12 @@ MOD を更新して初めてワールドを読み込むと、電源の入って�
 
 ### 決めたこと
 
-- **大きすぎる関数の自動の切り替えは `InterpreterFallback.SILENT` にする**（`EndiveRuntime.compileOrNull`）。どの関数を回したかは Endive の公開の口に出ない（`CompilerResult` は `internal` パッケージ）ので、コンパイル後のモジュール（`CompiledModule.wasmModule()`）に本体が残った関数（`EndiveRuntime.retainedFunctions`）から読む。Endive はインタプリタで動かす関数と、そこから末尾呼び出しで届く関数の本体だけを残す（`WasmModule.stripped`）ので、本当の集合と同じか、それより広い。読んだ集合は `kibicomputers.wasm` のログと、テスト用の `interpretedFunctions` に使う（今までは自動で回した分が空だった）。広がる場合（間接の末尾呼び出しがあれば、定義した関数の全部。`ModuleLimits.maxFunctions` は 100,000）があるので、ログには先頭の 16 個だけ並べて残りは個数にし（`EndiveRuntime.describeFunctions`）、理由の文言も「上限を超える関数と、そこから末尾呼び出しで届く関数」にする。インタプリタに回したことのログで関数を並べる箇所（SIMD を使う関数、やり直しで足した関数、例外処理を使うモジュールの SIMD の関数も）は、すべてこれを通すので、2回目からの DEBUG の行（`<Root level="all">` の既定では書かれる）も同じ大きさに収まる
-- **ログの行でモジュールと関数を見分けられるようにする**。行の頭に、ランタイムに渡したバイト列（燃料の計測コードの挿入などの後）の SHA-256 の先頭 16 桁（`EndiveRuntime.moduleLabel`。`ProgramCache` のキーは変換の前のバイト列なので別の値だが、同じプログラムなら同じになる）を付け、関数の番号には name セクションの名前を `番号(名前)` の形で添える（Endive の `WARN` の行にあった手がかりの代わり。名前はプレイヤーが決めるので、48 文字で切り、制御文字は `?` にする）。どの台のものかは、コンパイルが中身ごとに1回で台をまたいで共有される（`ProgramCache`）ので、ランタイムの層では決まらない（#931 で扱う）
+- **大きすぎる関数の自動の切り替えは `InterpreterFallback.SILENT` にする**（`EndiveRuntime.compileModule`。#931 の前の名前は `compileOrNull`）。どの関数を回したかは Endive の公開の口に出ない（`CompilerResult` は `internal` パッケージ）ので、コンパイル後のモジュール（`CompiledModule.wasmModule()`）に本体が残った関数（`EndiveRuntime.retainedFunctions`）から読む。Endive はインタプリタで動かす関数と、そこから末尾呼び出しで届く関数の本体だけを残す（`WasmModule.stripped`）ので、本当の集合と同じか、それより広い。読んだ集合は `kibicomputers.wasm` のログと、テスト用の `interpretedFunctions` に使う（今までは自動で回した分が空だった）。広がる場合（間接の末尾呼び出しがあれば、定義した関数の全部。`ModuleLimits.maxFunctions` は 100,000）があるので、ログには先頭の 16 個だけ並べて残りは個数にし（`EndiveRuntime.describeFunctions`）、理由の文言も「上限を超える関数と、そこから末尾呼び出しで届く関数」にする。インタプリタに回したことのログで関数を並べる箇所（SIMD を使う関数、やり直しで足した関数、例外処理を使うモジュールの SIMD の関数も）は、すべてこれを通すので、2回目からの DEBUG の行（`<Root level="all">` の既定では書かれる）も同じ大きさに収まる
+- **ログの行でモジュールと関数を見分けられるようにする**。行の頭に、ランタイムに渡したバイト列（燃料の計測コードの挿入などの後）の SHA-256 の先頭 16 桁（`EndiveRuntime.moduleLabel`。`ProgramCache` のキーは変換の前のバイト列なので別の値だが、同じプログラムなら同じになる）を付け、関数の番号には name セクションの名前を `番号(名前)` の形で添える（Endive の `WARN` の行にあった手がかりの代わり。名前はプレイヤーが決めるので、48 文字で切り、制御文字は `?` にする）。どの台のものかは、コンパイルが中身ごとに1回で台をまたいで共有される（`ProgramCache`）ので、ランタイムの層では決まらない（exec の側で数える。下の「追記（#931）」）
 - **インタプリタに回したことのログは、理由ごとに最初の1回だけ WARNING、2回目からは DEBUG**（`CompileFallbackLog`。DEBUG には何回目かを添える）。理由は「関数の型に v128」「例外処理を使うモジュールの SIMD」「SIMD を使う関数だけ」「大きすぎる関数（やり直しで足した関数・Endive が自動で回した関数）」「モジュール全体（コンパイルの失敗）」の5つ。SIMD を使う関数だけの切り替え（#424）は SIMD を使うモジュールなら毎回起きる普通の経路なので、大きすぎる関数（上の表で「運用者に要る」としたもの）とは分ける（1つにまとめると、状態が JVM 全体で1つなので、先に SIMD のモジュールが読まれたサーバーでは、大きすぎる関数の切り替えがずっと WARNING にならない）。#673 の前からあった `kibicomputers.wasm` の WARNING も同じく間引く。コンパイルは中身の SHA-256 ごとに1回（`ProgramCache`）だが、プレイヤーはバイト列を少し変えて exec し直せば何度でもコンパイルさせられるので、1回ごとの WARNING はこの節の方針（1台ごと・1件ごとの行でログを埋めない）に触れる
   - 理由の数が決まっているので、覚える数の上限は要らない（ADR 0044・0065 の 64 個の上限は、キーの数が入力しだいのときのもの）
   - JVM 全体で1つ（`EndiveRuntime` の companion）。サーバーの起動ごとには作り直さない。開発クライアントで統合サーバーを立て直すと、2回目のサーバーでは WARNING が出ず DEBUG だけになる。コンパイル結果のキャッシュも JVM 全体なので、それに合わせる
-  - 数え口（`Stats`）はここでは足さない（理由ごとの回数は `CompileFallbackLog.count` に持つが、テスト用）。最初の1回の後に運用者が気づく手がかり（数え口、どの台のものか）は #931 で扱う
+  - 数え口（`Stats`）はここでは足さない。最初の1回の後に運用者が気づく手がかり（理由ごとの回数を見る口、どの台のものか）は、下の「追記（#931）」
 - **`endive` の `System.Logger` にも経路を付ける**（`CoreLogRouting.install(sink, CoreLogRouting.ENDIVE_ROOT, …)`。両バージョンの `CoreLogBridge` が `kibicomputers` と並べて取り付ける）。今は出す元がないが、Endive を上げてロガーを使う箇所が増えたときに、標準エラー（JUL の root の `ConsoleHandler`）でなく `latest.log` に出るようにする。JUL 側の `endive` のレベルは log4j の設定（`endive` とその下の `LoggerConfig`）を写す。ローダー同梱の log4j2.xml（NeoForge の fancymodloader loader 4.0.45、Forge の fmlloader 1.20.1-47.4.28）は `<Root level="all">` で `endive` 用の `LoggerConfig` がないので、既定では JUL の `endive` も `Level.ALL` になり、`isLoggable(TRACE)` は真になる。Endive が `System.Logger` を使う箇所が増えれば、TRACE の書式も作って SLF4J まで渡し、DEBUG の行は `debug.log` に出る（今は本番で出す元がないので実害はない。ログを黙らせたい箇所は、`ComponentValidator` のように `isLoggable` を false にしたロガーを渡す）。GameTest `endiveSystemLoggerReachesLog4j` は JUL と log4j の判定が一致することを見る
 - `System.err` の差し替え、JUL の root の `ConsoleHandler` の付け替え、`System.LoggerFinder` の差し替え（#673 で採らないと決めた）はしない。どれもプロセス全体の状態で、MC やほかの MOD とぶつかる
 - `InterpreterFallback.FAIL` にそろえて自前のやり直しだけで回す案は採らない。大きすぎる関数が多いと、やり直しの上限でモジュール全体がインタプリタになる（測っていない速度の低下）
@@ -89,3 +89,23 @@ MOD を更新して初めてワールドを読み込むと、電源の入って�
 ### Endive を上げるとき
 
 Endive を上げたら、`System.err`・`System.out`・`run.endive.log`（`System.Logger`）を使う箇所を grep し直し、この表を直す（AGENTS.md の「つまずきやすい点」にも書いた）。今回の前提の食い違いは、これをしていなかったことから起きた。
+
+## 追記（#931）: インタプリタに回したことの数え口と、どの台のものか
+
+#680 の後、最初の1回の WARNING を過ぎると、運用者の手がかりは `debug.log` の行だけになり、どの台のプログラムかも分からなかった。
+
+### 決めたこと
+
+- **理由は1つの enum にする**（`core.runtime.InterpreterReason`。#680 の `CompileFallbackLog.Reason` を移したもの。5つは同じ）。読み込みのログと、下の数え口で同じものを使う
+- **インタプリタで動くコードを持つことを、読み込んだモジュールに残す**（`WasmModule.interpreterUse`。理由の集合・全体をインタプリタで動かす core モジュールの数・インタプリタで動かす関数の数）。読み込みのとき（コンパイル用のスレッド）に1回だけ決める変わらない値で、プロセスを作るたびに O(1) で読む（`retainedFunctions` は間接の末尾呼び出しがあると 100,000 個になりうるので、exec のたびには数え直さない）。モジュール全体をインタプリタにした3通り（v128 の型・例外処理と SIMD・コンパイルの失敗）も理由を残す（`compileModule` が理由を返す）。コンパイルしない設定のランタイム（テスト用）は「回した」のではないので持たない。コンポーネントは、中の core モジュールの和を `ComponentProgram` を作るときに1回だけ集める（`Program.interpreterUse`）
+- **数え口は2つで、意味が違う**（`core.kernel.InterpreterCounts`）
+  - **コンパイルの回数**（`CompileFallbackLog.count`。JVM 全体の累計）。プログラムの数ではない: 燃料の計測の有無・止まりうる import が違う読み込み、`ProgramCache` から外れた後の読み込み直し、復元のための読み込みは、同じプログラムでも別に数える。コンポーネントは中の core モジュールごとに数える。GameTest の起動の自己診断（`RuntimeSelfCheck.compilesTooLargeFunction`）も `TOO_LARGE_FUNCTIONS` を1つ増やす
+  - **プロセスの数**（`MachineScheduler.interpretedProcessCount`。スケジューラ（サーバー）の累計）。インタプリタで動くコードを持つプログラムでプロセスを作った回数。理由が複数あるプログラム（コンポーネント）は理由ごとに数え、合計（`interpretedProcessTotal`）では1つ
+  - どちらも reset しない（燃料の数え口と同じく、読む側が差を取る）。`CompileFallbackLog` は #680 のまま JVM 全体で1つで、サーバーの起動ごとに作り直さない
+- **どの台かは exec の側で数える**。コンパイルは台をまたいで共有されるので、`ProgramCache` の最初に頼んだ台を使うと、相乗りした台とキャッシュに当たった台が漏れる。`Machine.spawnInternal` の引き返せない点の後（カーネルロックの中。プロセスの数の上限・MFILE などで断った spawn は数えない）と、保存からの復元を表に入れた後（`completeRestore`。exec を通らないので、ここで数えないと、サーバーを立て直した後は手がかりが 0 のままになる）で、台ごとに回数・理由の和・最後のプログラムの名前（`Program.label`。`Program.hash` の16進の先頭16桁。core モジュールなら、読み込みのログの `EndiveRuntime.moduleLabel` の先頭と同じ値になる。コンポーネントは元のバイト列の SHA-256 で、中の core モジュールのログの名前とは別）を持つ（`Machine.interpretedProcessCount`・`interpretedReasons`・`lastInterpretedProgram`）
+- **台ごとの数は実行時だけで、保存しない**（保存形式を変えない。`fuelUnwindsDone`・`hostFailuresLogged` と同じ）。サーバーを立て直す・チャンクを読み直すと 0 から数え直す（復元したプロセスはまた数える）
+- **台ごとのログは DEBUG だけで、1台・1理由につき最初の1回**（`Machine.noteProcessProgramLocked`。この節の方針どおり、WARNING・INFO は台ごとに出さない）。シェルの `while` で外部コマンドを回しても `debug.log` は埋まらない。文には `Machine.id` とプログラムの名前を入れる。標準 OS や `lua.wasm` がインタプリタに落ちて全台が当たっても、行は台数 × 理由の数まで
+- **運用者の口は OP のコマンド**（`/kibicomputers runtime interpreter`。1.21.1 の `KiBiCommands`。`saves` と同じく `opPermissionLevel` とコンソールだけ）。出すのは、理由ごとのコンパイルの回数、理由ごとのプロセスの数、プロセスの数の多い上位 10 台（`InterpreterRanking.DEFAULT_LIMIT`。仮の値）と残りの台数。台の行には `Machine.id`・位置（ディメンションと座標）・ID（`currentIdentity`）を並べる。`Machine.id` は作るたびに振る実行時の番号で、ほかのログ（接続層は位置と ID で書く）に出ないので、DEBUG の行の「マシン N」はこのコマンドの出力で位置に結ぶ。全台をなめるのはコマンドを打ったときだけで、tick ごとには見ない。集計と選び方、要約の文は core（`InterpreterCounts`・`InterpreterRanking`）、接続層は台と位置の対応だけ
+- **負荷試験の出力**に、段階ごとの増分（段階に入ってから終わりまで。起動の段階のコンパイルも入るよう、測る区間ではなく段階の全体）を足した（`docs/load-test.md`）
+- 台のコンソール（ゲストの TTY）には書かない。プレイヤーの画面と出力を比べるテストを変え、運用者の手がかりにもならない。ゲストから見える一覧（`kibi:process`）・WIT・公開 API（`pro.ikili.kibicomputers.api`）・コンフィグの項目も足さない
+- 1.20.1（Forge）にはまだマシンもコマンドもないので、口は 1.21.1 だけ。移植（#224 配下）で同じ core の型を使う

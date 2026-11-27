@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.joinOrFail
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -51,18 +52,18 @@ class CompileFallbackLogTest {
     fun `理由ごとに最初の1回だけWARNINGで、2回目からはDEBUGに何回目かを添えて出す`() {
         val rec = Recorder(debug = true)
         val log = CompileFallbackLog(rec.logger)
-        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [3]" }
-        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [4]" }
-        log.report(CompileFallbackLog.Reason.WHOLE_MODULE) { "全体" }
-        log.report(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS) { "関数 [5]" }
+        log.report(InterpreterReason.TOO_LARGE_FUNCTIONS) { "関数 [3]" }
+        log.report(InterpreterReason.TOO_LARGE_FUNCTIONS) { "関数 [4]" }
+        log.report(InterpreterReason.WHOLE_MODULE) { "全体" }
+        log.report(InterpreterReason.TOO_LARGE_FUNCTIONS) { "関数 [5]" }
         val warn = rec.of(Level.WARNING)
         assertEquals(2, warn.size, "$warn")
         assertTrue(warn[0].startsWith("関数 [3]"), warn[0])
         assertTrue(warn[1].startsWith("全体"), warn[1])
         assertEquals(listOf("関数 [4]（同じ理由で 2 回目）", "関数 [5]（同じ理由で 3 回目）"), rec.of(Level.FINE))
-        assertEquals(3L, log.count(CompileFallbackLog.Reason.TOO_LARGE_FUNCTIONS))
-        assertEquals(1L, log.count(CompileFallbackLog.Reason.WHOLE_MODULE))
-        assertEquals(0L, log.count(CompileFallbackLog.Reason.V128_SIGNATURE))
+        assertEquals(3L, log.count(InterpreterReason.TOO_LARGE_FUNCTIONS))
+        assertEquals(1L, log.count(InterpreterReason.WHOLE_MODULE))
+        assertEquals(0L, log.count(InterpreterReason.V128_SIGNATURE))
     }
 
     @Test
@@ -70,10 +71,10 @@ class CompileFallbackLogTest {
         val rec = Recorder(debug = false)
         val log = CompileFallbackLog(rec.logger)
         var built = 0
-        repeat(5) { log.report(CompileFallbackLog.Reason.V128_SIGNATURE) { built++; "v128" } }
+        repeat(5) { log.report(InterpreterReason.V128_SIGNATURE) { built++; "v128" } }
         assertEquals(1, built)
         assertEquals(1, rec.lines.size)
-        assertEquals(5L, log.count(CompileFallbackLog.Reason.V128_SIGNATURE))
+        assertEquals(5L, log.count(InterpreterReason.V128_SIGNATURE))
     }
 
     @Test
@@ -85,12 +86,12 @@ class CompileFallbackLogTest {
         val workers = (0 until threads).map {
             Thread {
                 start.await()
-                repeat(100) { log.report(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS) { "simd" } }
+                repeat(100) { log.report(InterpreterReason.SIMD_WITH_EXCEPTIONS) { "simd" } }
             }.also(Thread::start)
         }
         start.countDown()
         workers.forEach { it.joinOrFail("報告するスレッドが終わらない") }
         assertEquals(1, rec.of(Level.WARNING).size)
-        assertEquals(threads * 100L, log.count(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS))
+        assertEquals(threads * 100L, log.count(InterpreterReason.SIMD_WITH_EXCEPTIONS))
     }
 }
