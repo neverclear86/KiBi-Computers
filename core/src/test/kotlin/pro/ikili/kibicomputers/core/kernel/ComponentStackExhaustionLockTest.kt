@@ -23,6 +23,7 @@ import pro.ikili.kibicomputers.core.runtime.component.link.HostFunction
 import pro.ikili.kibicomputers.core.runtime.component.link.HostWait
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting
 import pro.ikili.kibicomputers.core.runtime.component.link.LinkTesting.call
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
@@ -564,8 +565,23 @@ class ComponentStackExhaustionLockTest {
                         if (position != SoePositions.Position.PROBE) inRewindPastProbe++
                     }
                     if (position.isLock) throw AssertionError("スタックがロックを取る・放す途中で尽きた（pad $pad + $extra、$tag）: ${describe(r, rt)}")
-                    // 巻き戻し・巻き直しの途中で尽きても、退避した値はプロセスの終わりで捨てられる
-                    assertTrue(rt.process.asyncStack?.isEmpty != false, "尽きた後に退避した値が残った（pad $pad + $extra、$tag）")
+                    // 巻き戻し・巻き直しの途中で尽きても、退避した値はプロセスの終わりで捨てられる。
+                    // finishLocked はロックの中で状態を終わりにしてから、同じロックのまま退避した値を捨てるので、状態が終わりに見えた
+                    // 直後は捨てる前のことがある（冷えた JIT では幅が広い。#984 の直列の組で 2 回続けて当たった）。ロックを取ってから見る
+                    // （テストのスレッドが待ち行列に入らないよう、checkAlive と同じく tryLock で取る）
+                    var asyncLeft = false
+                    awaitOrClassify(r.ticker, "退避した値を見るロックが取れる（pad $pad + $extra）", { describe(r, rt) }) {
+                        r.m.lock.tryLock(HEADROOM_LOCK_PROBE_MILLIS, TimeUnit.MILLISECONDS).also { locked ->
+                            if (locked) {
+                                try {
+                                    asyncLeft = rt.process.asyncStack?.isEmpty == false
+                                } finally {
+                                    r.m.lock.unlock()
+                                }
+                            }
+                        }
+                    }
+                    assertTrue(!asyncLeft, "尽きた後に退避した値が残った（pad $pad + $extra、$tag）")
                 }
                 checkAlive(r, "pad $pad + $extra", rt)
                 return tag
