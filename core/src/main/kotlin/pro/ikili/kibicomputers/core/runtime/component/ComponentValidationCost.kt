@@ -15,7 +15,8 @@ import java.util.IdentityHashMap
  * 抑えられない（例: export が 2,000 個のインスタンス型を受ける引数 100 個 × インスタンス化 100 回の 98 KB で CPU 約 22 秒、
  * フィールド 4,000 個の record を `(type (eq ..))` で受ける引数 100 個 × 100 回で約 13 秒）。そこで、ここで別に抑える。
  *
- * 見積もりは、型の確認ごとの、確かめる型の大きさの合計と、インスタンス化ごとの型の写し直しの大きさの合計。
+ * 見積もりは、型の確認ごとの、確かめる型の大きさの合計と、インスタンス化ごとの型の写し直しの大きさの合計と、
+ * 覚えない型のたどり（自由変数と名前の確かめ）の大きさの合計（#955。[Info.scan]）。
  *
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
  *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
@@ -45,10 +46,31 @@ import java.util.IdentityHashMap
  *   resource を定義するインスタンス型・コンポーネント型は、import・export の宣言のたびにも（インスタンス化とは別に）その型の
  *   export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、宣言ごとに 1 回数える
  *
+ * - 型のたどり（#955）: wasmparser は、次の 3 か所で、型を覚えずに（同じ宣言を共有していても、展開した大きさの分）たどる。
+ *   どれも、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型（`(tuple $t(k-1) $t(k-1))` を 17 段。展開すると
+ *   約 52 万、宣言は 18 個）で検証を秒単位にできた（入れ子のコンポーネントごとに、その tuple を引数に持つ関数を import する
+ *   120 個・6 KB で CPU 3.9 秒、入れ子のコンポーネントから `alias outer` で 480 回引く 2 KB で 2.8 秒。#935 のレビュー）。
+ *   - コンポーネントの境界をまたぐ型の `alias outer`（`alias_type`）は、引いた型の自由変数（resource）をたどる
+ *     （`free_variables_any_type_id`）。境界をまたぐのは、count 段外側の 1 つ内側がコンポーネントのとき（[Walker.aliasScan]）
+ *   - コンポーネントとコンポーネント型の import・export は、宣言ごとに名前の確かめ（`validate_and_register_named_types`）と、
+ *     終わりの自由変数のたどり（`finish`）で 2 回たどる（インスタンス型の中の export はどちらもしない。[Walker.externScan]）
+ *   - canon は、型を覚えずにたどる（[Walker.canonScan]。canon の宣言ごとに、関数・値の型のたどる大きさを上限として数える）。
+ *     lift・lower は core の関数の型を作るとき（`push_wasm_types`）に、variant・option・result の型のある case を case ごとに
+ *     覚えずにたどる（型のある case を共有して入れ子にした variant は、flat の数がほとんど増えないまま展開した大きさの分。
+ *     `realloc`・`memory` の指定によらない）。`realloc` がなければ、さらに ptr を含むか（`contains_ptr`）を、lift は引数で、
+ *     lower は結果で、tuple・record・variant を `any` でたどって確かめる（中が全部 u32 でも打ち切られない）。
+ *     `task.return`（結果の型。`memory` がなければ `contains_ptr` も）、`stream.read`・`future.read`（`realloc` がなければ要素の型）、
+ *     `stream.write`・`future.write`（`memory` がなければ。確かめていない、大きい側）も数える
+ *
+ *   たどる大きさ [Info.scan] は展開した大きさだが、enum・flags の名前を数えない（wasmparser のたどりも名前を見ない）。
+ *   variant は全 case を回るので、型を持たない case も 1 と数える（型の大きさ（`TypeInfo`）には入らないので、100 万の上限は抑えない）。
+ *   インスタンス型・インスタンスは export だけ、コンポーネント型・コンポーネントは import と export をたどる。
+ *   1 ノードの手間は、見積もりの単位（写し直し・型の確認）よりずっと小さいので、[SCAN_NODES_PER_UNIT] ノードを 1 と数える
+ *   （切り上げ。ADR 0262 の「検証の時間の見積もり」の測定）
+ *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
- * ただし、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型を入れ子のコンポーネントごとに import する形と、
- * `alias outer` で何度も引く形は、見積もりが 0 のまま検証が秒単位になる（#935 のレビュー。#955 で扱う）。
+ * ただし canon は、型を共有して膨らむ型をたどる（lift・lower・`task.return`・stream・future の read・write）ので、上の 3 つ目として数える。
  * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
  * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
  * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
@@ -80,12 +102,25 @@ internal object ComponentValidationCost {
     private const val WORK_FACTOR = 4L
 
     /**
+     * 型のたどり（[Info.scan]）の、見積もりの 1 にあたるノードの数（#955）。wasmparser の自由変数・名前のたどりは 1 ノードが
+     * 見積もりの単位（写し直し・型の確認）の十数分の 1 ほどの手間なので、この数のノードを 1 とする（ADR 0262 の測定）
+     */
+    private const val SCAN_NODES_PER_UNIT = 16L
+
+    /**
      * 見積もり。[checkCount] は型の確認の回数、[maxTypeWeight] は型の大きさの最大、[cost] は見積もりの値（確かめる型の大きさと、
-     * 写し直しの大きさの合計）、[remapCost] はそのうちの写し直しの分。
+     * 写し直しの大きさと、型のたどりの合計）、[remapCost] はそのうちの写し直しの分、[scanCost] は型のたどりの分（#955）。
      * [work] は、写し直しの大きさをたどった手数（積んだ参照の数。見積もりそのものの手間）。[check] は、これが見積もりの上限の
      * [WORK_FACTOR] 倍を超えたら、[cost] によらず手数で断る（そのときの [cost] は途中までの値）
      */
-    class Estimate(val checkCount: Long, val maxTypeWeight: Long, val cost: Long, val remapCost: Long, val work: Long)
+    class Estimate(
+        val checkCount: Long,
+        val maxTypeWeight: Long,
+        val cost: Long,
+        val remapCost: Long,
+        val work: Long,
+        val scanCost: Long,
+    )
 
     private fun maxWorkOf(budget: Long): Long = if (budget > SATURATED / WORK_FACTOR) SATURATED else budget * WORK_FACTOR
 
@@ -96,7 +131,7 @@ internal object ComponentValidationCost {
     private fun estimate(root: ParsedComponent, budget: Long): Estimate {
         val walker = Walker(budget, maxWorkOf(budget))
         walker.component(root, null)
-        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost, walker.work)
+        return Estimate(walker.checks, walker.maxSize, walker.cost, walker.remapCost, walker.work, walker.scanCost)
     }
 
     /** 見積もりが [limits] の上限を超えていたら [WasmLoadException] */
@@ -113,8 +148,9 @@ internal object ComponentValidationCost {
         }
         if (e.cost > limits.maxValidationCost) {
             throw WasmLoadException(
-                "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさと写し直しの合計 ${e.cost}" +
-                    "（型の大きさの最大 ${e.maxTypeWeight}、写し直し ${e.remapCost}）。上限 ${limits.maxValidationCost}）",
+                "コンポーネントの検証が重すぎる見込み（型の確認 ${e.checkCount} 回、確かめる型の大きさと写し直しと型のたどりの合計 " +
+                    "${e.cost}（型の大きさの最大 ${e.maxTypeWeight}、写し直し ${e.remapCost}、型のたどり ${e.scanCost}）。" +
+                    "上限 ${limits.maxValidationCost}）",
             )
         }
     }
@@ -143,13 +179,21 @@ internal object ComponentValidationCost {
         val instanceView: Info? = null,
         /** resource を定義する宣言を含むか（`(sub resource)` を export・import するインスタンス型・コンポーネント型など） */
         val res: Boolean = false,
+        /**
+         * wasmparser が覚えずにたどる大きさ（#955）。展開した大きさだが、enum・flags の名前は数えない。インスタンス型・インスタンスは
+         * export だけ、コンポーネント型・コンポーネントは import と export の合計。100 万で止めない
+         */
+        val scan: Long = 1,
     ) {
         /** 写し直しの大きさ（まだなら -1） */
         var flat = -1L
     }
 
+    /** 添字空間の持ち主の種類（wasmparser の `ComponentKind`） */
+    private enum class ScopeKind { COMPONENT, COMPONENT_TYPE, INSTANCE_TYPE }
+
     /** 添字空間（型・関数・インスタンス・コンポーネント・core の型だけ。関数は、その型の情報）。引けないものは `null` */
-    private class Scope(val parent: Scope?) {
+    private class Scope(val parent: Scope?, val kind: ScopeKind) {
         val types = ArrayList<Info?>()
         val funcs = ArrayList<Info?>()
         val instances = ArrayList<Info?>()
@@ -199,6 +243,86 @@ internal object ComponentValidationCost {
         /** そのうちの写し直しの分 */
         var remapCost = 0L
 
+        /** そのうちの型のたどりの分（[scanNodes] を [SCAN_NODES_PER_UNIT] で割って切り上げたもの。#955） */
+        var scanCost = 0L
+
+        /** 型のたどりのノードの数の合計 */
+        private var scanNodes = 0L
+
+        /** それまでに見た型の、たどる大きさの最大（引けない型の代わり） */
+        private var maxScan = 1L
+
+        private fun noteScan(n: Long): Long = n.also { if (it > maxScan) maxScan = it }
+
+        /** wasmparser が覚えずにたどるノードを [nodes] 数える（[cost] には、[SCAN_NODES_PER_UNIT] で割って切り上げた分が入る） */
+        private fun scanned(nodes: Long) {
+            scanNodes = add(scanNodes, nodes)
+            val units = (scanNodes + SCAN_NODES_PER_UNIT - 1) / SCAN_NODES_PER_UNIT
+            if (units > scanCost) {
+                cost = add(cost, units - scanCost)
+                scanCost = units
+            }
+        }
+
+        /**
+         * コンポーネント・コンポーネント型の import・export の宣言 1 つ（型 [info]）。wasmparser は名前の確かめ
+         * （`validate_and_register_named_types`。名前のない型だけ）と、終わりの自由変数のたどり（`finish`。全部）で、その型を
+         * 2 回たどる。上限として 2 × [Info.scan] で数える。インスタンス型の中の export は、どちらもしない
+         */
+        fun externScan(s: Scope, info: Info) {
+            if (s.kind != ScopeKind.INSTANCE_TYPE) scanned(add(info.scan, info.scan))
+        }
+
+        /**
+         * 型の `alias outer` [a] で引いた型 [info]。count 段外側の 1 つ内側がコンポーネントなら（コンポーネントの境界をまたぐ）、
+         * wasmparser は引いた型の自由変数をたどる（`alias_type`）。count = 0 と、型宣言から包んでいるものを引くとき
+         * （1 つ内側が型宣言）はたどらない。深さを超える count は wasm-tools の検証が断るので数えない
+         */
+        fun aliasScan(s: Scope, a: Alias.Outer, info: Info?) {
+            if (a.sort != Sort.TYPE || a.count < 1) return
+            val inner = s.outer(a.count - 1) ?: return
+            if (inner.kind != ScopeKind.COMPONENT || inner.parent == null) return
+            scanned(info?.scan ?: maxScan)
+        }
+
+        /**
+         * canon の定義 [item] で、wasmparser が覚えずにたどる型を数える（#955）。どれも、関数・値の型のたどる大きさ（[Info.scan]）を
+         * 上限として、canon ごとに数える（引けない型は、それまでの最大）。
+         * - lift・lower は、core の関数の型を作るとき（`ComponentFuncType::lower` の `push_wasm_types`）に、引数と結果の型をたどる。
+         *   variant・option・result は、型のある case を case ごとに新しい `LoweredTypes` で覚えずにたどるので、型のある case を共有して
+         *   入れ子にした variant は、flat の数がほとんど増えないまま展開した大きさの分たどる。`realloc`・`memory` の指定によらないので、
+         *   いつも 1 回数える（tuple・record は flat の数の上限で打ち切られるが、ここでは区別しない。大きい側）
+         * - そのうえ `realloc` がなければ、ptr を含むか（`contains_ptr`）を、lift は引数ごとに、lower は結果で、覚えずにたどって
+         *   確かめる（variant は型のない case も全部回り、中が全部 u32 でも打ち切られない）。もう 1 回数える
+         * - `task.return` は、結果の型で core の関数の型を作り（1 回）、`memory` がなければ `contains_ptr` でもたどる（もう 1 回）
+         * - `stream.read`・`future.read` は、`realloc` がなければ要素の型を `contains_ptr` でたどる（stream・future の型で数える）。
+         *   `stream.write`・`future.write` は wasmparser を読んで確かめていないが、`memory` がなければ同じ形の確かめがありうるので、
+         *   同じに数える（大きい側）
+         */
+        private fun canonScan(s: Scope, item: Canon) {
+            fun scanOf(info: Info?): Long = info?.scan ?: maxScan
+            fun List<CanonOption>.noRealloc() = none { it is CanonOption.Realloc }
+            fun List<CanonOption>.noMemory() = none { it is CanonOption.Memory }
+            fun lowered(scan: Long, twice: Boolean) = scanned(if (twice) add(scan, scan) else scan)
+            when (item) {
+                is Canon.Lift -> lowered(scanOf(s.types.getOrNull(item.typeIndex)), item.options.noRealloc())
+                is Canon.Lower -> lowered(scanOf(s.funcs.getOrNull(item.func)), item.options.noRealloc())
+                is Canon.Builtin -> when (item.op) {
+                    CanonBuiltin.TASK_RETURN -> when (val r = item.result) {
+                        null -> Unit
+                        is ValType.Primitive -> lowered(1, item.options.noMemory())
+                        is ValType.Ref -> lowered(scanOf(s.types.getOrNull(r.typeIndex)), item.options.noMemory())
+                    }
+                    CanonBuiltin.STREAM_READ, CanonBuiltin.FUTURE_READ ->
+                        if (item.options.noRealloc()) scanned(scanOf(item.typeIndex?.let { s.types.getOrNull(it) }))
+                    CanonBuiltin.STREAM_WRITE, CanonBuiltin.FUTURE_WRITE ->
+                        if (item.options.noMemory()) scanned(scanOf(item.typeIndex?.let { s.types.getOrNull(it) }))
+                    else -> Unit
+                }
+                is Canon.ResourceNew, is Canon.ResourceDrop, is Canon.ResourceRep -> Unit
+            }
+        }
+
         private fun add(a: Long, b: Long): Long = minOf(a + b, SATURATED)
 
         /**
@@ -244,11 +368,14 @@ internal object ComponentValidationCost {
         private fun sum(a: Long, b: Long): Long = minOf(a + b, MAX_TYPE_SIZE)
 
         /** 引けない参照の代わり（それまでの最大の大きさの、中を持たない型） */
-        private fun unknown(): Info = Info(maxSize, remapBound = maxFull)
+        private fun unknown(): Info = Info(maxSize, remapBound = maxFull, scan = maxScan)
 
         /** wasmparser が [info] を写して新しく作る型（コンポーネントは、インスタンス化でできるインスタンスの型も引き継ぐ） */
         private fun copied(info: Info?): Info? = info?.let {
-            Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView, res = it.res)
+            Info(
+                it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, instanceView = it.instanceView, res = it.res,
+                scan = it.scan,
+            )
         }
 
         /**
@@ -315,7 +442,7 @@ internal object ComponentValidationCost {
          * export だけの型（インスタンス化でできるインスタンスの型）は [Info.instanceView]
          */
         fun component(c: ParsedComponent, parent: Scope?): Info {
-            val s = Scope(parent)
+            val s = Scope(parent, ScopeKind.COMPONENT)
             val exports = HashMap<String, Info>()
             // import と export の両方（コンポーネントを export・インスタンス化すると、wasmparser は import の型も写し直す）
             val refs = ArrayList<Info>()
@@ -326,6 +453,9 @@ internal object ComponentValidationCost {
             // 100 万で止めない展開した大きさ（写し直しの上限）
             var full = 1L
             var exportFull = 1L
+            // たどる大きさ（#955）
+            var scan = 1L
+            var exportScan = 1L
             for (section in c.sections) {
                 when (section) {
                     is ComponentSection.Nested -> s.components += component(section.component, s)
@@ -337,6 +467,8 @@ internal object ComponentValidationCost {
                         refs += info
                         size = sum(size, 1 + info.size)
                         full = add(full, 1 + info.remapBound)
+                        scan = add(scan, info.scan)
+                        externScan(s, info)
                     }
                     is ComponentSection.Aliases -> for (item in section.items) alias(s, item)
                     is ComponentSection.Instances -> for (item in section.items) {
@@ -349,7 +481,12 @@ internal object ComponentValidationCost {
                                 // できるインスタンスの型は、そのコンポーネントの export だけ（写して新しく作る）。
                                 // export だけの型を引けないコンポーネントは、import も含めた型にする（大きい側）
                                 val view = target?.let { it.instanceView ?: it.content ?: it }
-                                view?.let { Info(it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, res = it.res) }
+                                view?.let {
+                                    Info(
+                                        it.size, it.exports, content = it.content ?: it, remapBound = it.remapBound, res = it.res,
+                                        scan = it.scan,
+                                    )
+                                }
                             }
                             is InstanceExpr.FromExports -> fromExports(s, item.exports)
                         }
@@ -374,11 +511,17 @@ internal object ComponentValidationCost {
                         exportSize = sum(exportSize, 1 + sizeOf(info))
                         full = add(full, 1 + ref.remapBound)
                         exportFull = add(exportFull, 1 + ref.remapBound)
+                        scan = add(scan, ref.scan)
+                        exportScan = add(exportScan, ref.scan)
+                        // 型を付けた export は、付けた型（wasmparser が entity にするもの）をたどる
+                        externScan(s, ref)
                         // export も、その種類の添字空間に新しい番号を足す
                         s.push(item.target.sort, info)
                     }
                     // canon lift は関数を足す（その型）。ほかの canon は core の関数を足す
                     is ComponentSection.Canons -> for (item in section.items) {
+                        // wasmparser が canon ごとに覚えずにたどる型を数える（#955。[canonScan]）
+                        canonScan(s, item)
                         if (item is Canon.Lift) s.funcs += s.types.getOrNull(item.typeIndex)
                     }
                     // core のインスタンスとモジュールは、型の確認の見積もりには使わない
@@ -390,9 +533,12 @@ internal object ComponentValidationCost {
             val res = refs.any { it.res }
             val view = Info(
                 exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
-                res = exportRefs.any { it.res },
+                res = exportRefs.any { it.res }, scan = exportScan,
             )
-            return Info(size, exports, local = 1L + refs.size, refs = refs, remapBound = full, instanceView = view, res = res)
+            return Info(
+                size, exports, local = 1L + refs.size, refs = refs, remapBound = full, instanceView = view, res = res,
+                scan = noteScan(scan),
+            )
         }
 
         private fun fromExports(s: Scope, items: List<Pair<String, SortIdx>>): Info {
@@ -400,6 +546,7 @@ internal object ComponentValidationCost {
             val refs = ArrayList<Info>()
             var size = 1L
             var full = 1L
+            var scan = 1L
             for ((name, idx) in items) {
                 val info = s.lookup(idx)
                 if (info != null) exports[name] = info
@@ -407,15 +554,18 @@ internal object ComponentValidationCost {
                 refs += ref
                 size = sum(size, 1 + sizeOf(info))
                 full = add(full, 1 + ref.remapBound)
+                scan = add(scan, ref.scan)
             }
-            return Info(size, exports, local = 1L + refs.size, refs = refs, remapBound = full, res = refs.any { it.res })
+            return Info(
+                size, exports, local = 1L + refs.size, refs = refs, remapBound = full, res = refs.any { it.res }, scan = noteScan(scan),
+            )
         }
 
         private fun alias(s: Scope, a: Alias) {
             val info = when (a) {
                 // インスタンスの export は、インスタンスごとに写した型なので、別の型として数える
                 is Alias.InstanceExport -> copied(s.instances.getOrNull(a.instance)?.exports?.get(a.name))
-                is Alias.Outer -> s.outer(a.count)?.lookup(SortIdx(a.sort, a.index))
+                is Alias.Outer -> s.outer(a.count)?.lookup(SortIdx(a.sort, a.index)).also { aliasScan(s, a, it) }
                 is Alias.CoreInstanceExport -> null
             }
             // 引けない型は、それまでの最大とする
@@ -454,7 +604,7 @@ internal object ComponentValidationCost {
          * コンポーネント型（[component]）は、インスタンス化でできるインスタンスの型（export だけ）も [Info.instanceView] に持つ
          */
         private fun declType(decls: List<TypeDecl>, parent: Scope, component: Boolean): Info {
-            val s = Scope(parent)
+            val s = Scope(parent, if (component) ScopeKind.COMPONENT_TYPE else ScopeKind.INSTANCE_TYPE)
             val exports = HashMap<String, Info>()
             val refs = ArrayList<Info>()
             val exportRefs = ArrayList<Info>()
@@ -462,6 +612,8 @@ internal object ComponentValidationCost {
             var exportSize = 1L
             var full = 1L
             var exportFull = 1L
+            var scan = 1L
+            var exportScan = 1L
             for (d in decls) {
                 when (d) {
                     is TypeDecl.CoreType -> s.coreTypes += Info(coreType(d.type))
@@ -472,6 +624,8 @@ internal object ComponentValidationCost {
                         refs += info
                         size = sum(size, 1 + info.size)
                         full = add(full, 1 + info.remapBound)
+                        scan = add(scan, info.scan)
+                        externScan(s, info)
                     }
                     is TypeDecl.Export -> {
                         val info = extern(s, d.desc)
@@ -482,13 +636,16 @@ internal object ComponentValidationCost {
                         exportSize = sum(exportSize, 1 + info.size)
                         full = add(full, 1 + info.remapBound)
                         exportFull = add(exportFull, 1 + info.remapBound)
+                        scan = add(scan, info.scan)
+                        exportScan = add(exportScan, info.scan)
+                        externScan(s, info)
                     }
                 }
             }
             val view = if (component) {
                 Info(
                     exportSize, exports, local = 1L + exportRefs.size, refs = exportRefs, remapBound = exportFull,
-                    res = exportRefs.any { it.res },
+                    res = exportRefs.any { it.res }, scan = exportScan,
                 )
             } else {
                 null
@@ -496,6 +653,8 @@ internal object ComponentValidationCost {
             return Info(
                 note(size), exports, local = 1L + refs.size, refs = refs, remapBound = noteFull(full), instanceView = view,
                 res = refs.any { it.res },
+                // インスタンス型は export だけ（import はない）、コンポーネント型は import と export
+                scan = noteScan(scan),
             )
         }
 
@@ -510,16 +669,20 @@ internal object ComponentValidationCost {
             val refs = ArrayList<Info>()
             // 100 万で止めない展開した大きさ（写し直しの上限）。参照は、その先の展開した大きさを足す
             var full = 1L
+            // たどる大きさ（#955）。enum・flags の名前は数えない
+            var scan = 1L
             fun v(t: ValType?): Long = when (t) {
                 null -> 0L
                 is ValType.Primitive -> {
                     full = add(full, 1)
+                    scan = add(scan, 1)
                     1L
                 }
                 is ValType.Ref -> {
                     val info = s.types.getOrNull(t.typeIndex) ?: unknown()
                     refs += info
                     full = add(full, info.remapBound)
+                    scan = add(scan, info.scan)
                     info.size
                 }
             }
@@ -529,6 +692,8 @@ internal object ComponentValidationCost {
                 is DefValType.Record -> for (f in def.fields) n = sum(n, v(f.type))
                 is DefValType.Variant -> for (c in def.cases) {
                     full = add(full, 1)
+                    // wasmparser のたどりは全 case を回す。型を持たない case も 1 と数える（型の大きさ（`TypeInfo`）には入らない）
+                    scan = add(scan, 1)
                     n = sum(n, 1 + v(c.type))
                 }
                 is DefValType.Tuple -> for (t in def.types) n = sum(n, v(t))
@@ -565,7 +730,7 @@ internal object ComponentValidationCost {
                 else -> local += refs.size
             }
             val size = note(n)
-            return Info(size, local = minOf(local, full).coerceAtLeast(1), refs = refs, remapBound = noteFull(full))
+            return Info(size, local = minOf(local, full).coerceAtLeast(1), refs = refs, remapBound = noteFull(full), scan = noteScan(scan))
         }
 
         /** core の型の大きさ（関数は引数と結果の数、モジュール型は宣言の数） */
