@@ -70,14 +70,18 @@ function nonBuildRule(diffHow) {
 // 通しの build と両 GameTest は push の後の CI（build・両 GameTest・両 jar GameTest の上位集合）に任せ、手元は触ったものだけを確かめる。
 // 実装の段階の通しの確認は残す（変えない）
 const FIX_BASE_DIFF = '段階の始めに worktree で `git rev-parse HEAD` を記録し、そのコミットから今の作業ツリーまでの自分の変更（`git diff --name-only <記録したコミット>` と `git status --porcelain`）で決める。PR 全体の差分では決めない'
+// 接続層のコンパイル（両バージョン）。main だけでなく dev のソースセット（src/dev/。dev-driver を devCompileOnly で使い、
+// associateWith で接続層の internal な型も使う）も入れる。core や dev-driver だけの直しでは GameTest も回らないので、
+// compileDevKotlin を入れないと、src/dev/ の壊れが push の後の CI まで分からない
+const PLATFORM_COMPILE_BOTH = '`:platform-neoforge-1.21.1:compileKotlin :platform-neoforge-1.21.1:compileDevKotlin :platform-forge-1.20.1:compileKotlin :platform-forge-1.20.1:compileDevKotlin`（main と、`src/dev/` の dev のソースセット）'
 const FIX_LOCAL_CHECKS = `手元の確認（#985。通しの \`./gradlew build\` と両バージョンの \`runGameTestServer\` は、ここでは回さない。push の後の CI が確かめる）:
 - 差分の取り方: ${FIX_BASE_DIFF}。
 - 触ったファイルに合わせて、次のタスクを 1 本の \`./gradlew\` にまとめて回す（下の Gradle の決まりに従う）:
-  - \`core/\` を触ったら \`:core:testClasses\`（\`:core:compileKotlin\` では足りない。processTestResources が \`core/src/test/wasm\` の C と同梱の OS イメージをビルドする）と、触ったクラスのテスト（\`:core:test --tests '<クラスの完全名か *クラス名>'\`）。\`core/src/main/\` を触ったら、接続層は core の内部の型を使うので、\`:platform-neoforge-1.21.1:compileKotlin :platform-forge-1.20.1:compileKotlin\` も回す。
+  - \`core/\` を触ったら \`:core:testClasses\`（\`:core:compileKotlin\` では足りない。processTestResources が \`core/src/test/wasm\` の C と同梱の OS イメージをビルドする）と、触ったクラスのテスト（\`:core:test --tests '<クラスの完全名か *クラス名>'\`）。\`core/src/main/\` を触ったら、接続層は core の内部の型を使うので、${PLATFORM_COMPILE_BOTH} も回す。
   - core にトップレベルの public な宣言を足した・変えたら \`:core:test --tests '*InternalMarkerTest'\`。WIT（\`*.wit\`）・\`WasiP1Kibi\`・\`docs/syscalls/**\` を触ったら \`:core:test --tests '*SyscallDocTest'\`。
   - 公開 API（\`pro.ikili.kibicomputers.api\`、接続層の \`...api\`）か、そのダンプ（\`core/api/*.api\`・\`platform-*/api/*.api\`）を触ったら \`checkKotlinAbi\`（ダンプを直すなら \`updateKotlinAbi\` で作り直してコミットする。ダンプは手で直さない）。
-  - \`dev-driver/\` を触ったら \`:dev-driver:compileKotlin\`（テストがあれば \`:dev-driver:test\` も）。\`dev-driver\` は各接続層の \`src/dev/\` から使われるので、公開の宣言を変えたら、接続層の \`compileKotlin\`（両バージョン）も回す。
-  - \`platform-<ローダー>-<MC>/\` を触ったら、そのバージョンの \`:platform-<ローダー>-<MC>:compileKotlin\` と、別の \`./gradlew\` で、そのバージョンの \`runGameTestServer\` だけを回す（触っていないバージョンの GameTest は回さない）。
+  - \`dev-driver/\` を触ったら \`:dev-driver:compileKotlin\`（テストがあれば \`:dev-driver:test\` も）。\`dev-driver\` は各接続層の \`src/dev/\` から使われるので、公開の宣言を変えたら、${PLATFORM_COMPILE_BOTH} も回す。
+  - \`platform-<ローダー>-<MC>/\` を触ったら、そのバージョンの \`:platform-<ローダー>-<MC>:compileKotlin :platform-<ローダー>-<MC>:compileDevKotlin\` と、別の \`./gradlew\` で、そのバージョンの \`runGameTestServer\` だけを回す（触っていないバージョンの GameTest は回さない）。
   - \`os/\`・\`build-logic/\`・\`gradle/\`・\`*.gradle.kts\` を触ったら、影響の範囲が読みにくいので、通しの \`./gradlew build\` を回す。
   - **上のどの決まりにも当たらない、ビルドに入るファイル**（ルートの \`gradlew\`・\`gradlew.bat\`・\`.editorconfig\`・\`gradle.properties\`、\`poc/\`、そのほか上に挙げていない置き場所、など）を 1 つでも触ったら、手元で何も回さずに push してはいけない。影響の範囲が読めないので、通しの \`./gradlew build\` を回す（ビルドに入らないファイルだけの差分は、下の決まりに従う）。
   - \`--tests\` が 1 件にも当たらないと「No tests found for given includes」で落ちる。これはコードの失敗ではない（名前を直して回し直す）。
@@ -1059,8 +1063,10 @@ ${listed}`
 
 // マージの段階で手元で確かめるのは、ワークフローの検査（node --test。1 秒かからない）だけ（#985）。CI は node --test を回さないので、
 // 両側が issue-to-pr.js を直した組み合わせの壊れを、main に入れる前にここで止める。ふつうのマージとスタックのマージで同じ文を使う
-function mergeNodeTestStep(ref) {
-  return `取り込みの結果によらず（Already up to date で新しいコミットができなかったときも）、この PR の差分（\`git diff --name-only origin/${ref}...HEAD\`）に \`.claude/workflows/\` か \`.claude/workflow-tests/\` のファイルがあるときは、worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない）。落ちたら push もマージもせず status=needs_human・failedStep=test で、落ちたテストの名前を理由に書く。差分にワークフローがなければ回さない。**\`./gradlew\` は起動しない**（build・GameTest は手元では回さない。先頭のコミットの CI が確かめる。#985）。`
+// スタックでは、一番上の段の木と main の差分（全段の変更）で決める。一つ下の段との差分だと、下の段だけがワークフローを変えた組み合わせで
+// 一度も node --test が回らない（stack-sync は node も Gradle も動かさない）
+function mergeNodeTestStep(ref, scope = 'この PR') {
+  return `取り込みの結果によらず（Already up to date で新しいコミットができなかったときも）、${scope}の差分（\`git diff --name-only origin/${ref}...HEAD\`）に \`.claude/workflows/\` か \`.claude/workflow-tests/\` のファイルがあるときは、worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない）。落ちたら push もマージもせず status=needs_human・failedStep=test で、落ちたテストの名前を理由に書く。差分にワークフローがなければ回さない。**\`./gradlew\` は起動しない**（build・GameTest は手元では回さない。先頭のコミットの CI が確かめる。#985）。`
 }
 
 // 先頭のコミット（HEAD）を PR に載せる手順（#985）。Already up to date でも、push していないコミットが残っていることがある（前の回の続きなど）
@@ -1315,7 +1321,7 @@ function stackMergePrompt(info, impl, note, plan) {
   const prs = plan.members.map(m => `#${m.pr}`).join('・')
   const cmd = `gh stack merge ${impl.pr} --yes --squash`
   return `${REPO} の${stackLabel(plan)}を、一番上の段 PR #${impl.pr}（ブランチ ${impl.branch}、worktree ${impl.worktree}）の木で取り込みを確かめ、全段の CI を待ってから、スタックごとマージする（#936）。他の PR のマージとは直列に行っている。下の段から順の取り込み（一番下の段は main、上の段は一つ下の段のブランチ）は、この段階の前に済ませて push してある。${note ? `\n${note}` : ''}
-1. worktree で \`git fetch origin\` し、\`git merge origin/${belowRef}\` する（ふつうは Already up to date）。${belowRef === 'main' ? '' : 'main は直接取り込まない（下の段を通して入っている）。'}rebase と force push はしない。\`gh stack sync\`・\`gh stack rebase\`・\`gh stack push\`・\`gh stack submit\` は force-with-lease で push するので使わない。衝突が字面の解消で済まないなら、\`git merge --abort\` で戻し、マージせず status=needs_human・failedStep=conflict で理由を返す。${mergeNodeTestStep(belowRef)}
+1. worktree で \`git fetch origin\` し、\`git merge origin/${belowRef}\` する（ふつうは Already up to date）。${belowRef === 'main' ? '' : 'main は直接取り込まない（下の段を通して入っている）。'}rebase と force push はしない。\`gh stack sync\`・\`gh stack rebase\`・\`gh stack push\`・\`gh stack submit\` は force-with-lease で push するので使わない。衝突が字面の解消で済まないなら、\`git merge --abort\` で戻し、マージせず status=needs_human・failedStep=conflict で理由を返す。${mergeNodeTestStep('main', 'スタック全体')}
 2. ${mergePushStep(impl.pr, impl.branch)}
 3. 全段の PR（${prs}）について、それぞれ \`gh pr checks <n> --watch --interval 30\` で、先頭のコミットの CI がすべて終わって通るのを待つ（下の段に push すると下の段の CI、上の段に push すると上の段の CI が走る。どの段も、pending が残っている間はマージしない。「通った」は、\`gh pr checks <n> --json name,state,bucket\` の全チェックが pass か skipping のとき）。もう通っている段は待たなくてよい。どれかが通らなければ status=needs_human・failedStep=ci で、PR の番号・落ちたチェック・run の ID を理由に書く。**CI は自分で回し直さない**（\`gh run rerun\` はしない）。
    CI の待ちには、下の「CI の待ちの上限」を当てる（\`<n>\` は各段の PR の番号。上限は全段を合わせて測る）。待ちをあきらめたら、マージせず status=needs_human・failedStep=ci で、理由に「CI が終わる前に待ちの上限（または接続の失敗）で待つのをやめた」と、まだ終わっていない PR・チェック・run の ID を書く。

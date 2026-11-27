@@ -592,7 +592,10 @@ test('プロンプト: 実装の段階は通しの build と両 GameTest を残�
     assert.match(p, /手元の確認（#985。通しの `\.\/gradlew build` と両バージョンの `runGameTestServer` は、ここでは回さない/, k)
     assert.doesNotMatch(p, /`\.\/gradlew build` と両バージョンの `runGameTestServer` を通してから/, k)
     assert.match(p, /:core:testClasses/, k)
-    assert.match(p, /:platform-neoforge-1\.21\.1:compileKotlin :platform-forge-1\.20\.1:compileKotlin/, k)
+    // 接続層は main と dev のソースセット（src/dev/）の両方をコンパイルする。core や dev-driver だけの直しでも src/dev/ の壊れを手元で見つける
+    assert.match(p, /:platform-neoforge-1\.21\.1:compileKotlin :platform-neoforge-1\.21\.1:compileDevKotlin :platform-forge-1\.20\.1:compileKotlin :platform-forge-1\.20\.1:compileDevKotlin/, k)
+    assert.match(p, /:platform-<ローダー>-<MC>:compileKotlin :platform-<ローダー>-<MC>:compileDevKotlin/, k)
+    assert.doesNotMatch(p, /接続層の `compileKotlin`（両バージョン）/, k)
     assert.match(p, /\*InternalMarkerTest/, k)
     assert.match(p, /\*SyscallDocTest/, k)
     assert.match(p, /checkKotlinAbi/, k)
@@ -934,6 +937,9 @@ test('スタック: 上の段は、下の段から順に取り込み、手元で
   assert.ok(m.includes(STACK_CMD))
   assert.match(m, /#900・#906/)
   assert.match(m, /`git merge origin\/issue-338-lower`/)
+  // node --test を回すかは、一つ下の段との差分でなく、スタック全体（main との差分）で決める。下の段だけがワークフローを変えた組み合わせも拾う
+  assert.match(m, /スタック全体の差分（`git diff --name-only origin\/main\.\.\.HEAD`）/)
+  assert.doesNotMatch(m, /git diff --name-only origin\/issue-338-lower/)
   assert.doesNotMatch(m, /`gh pr merge \d+/)
   // 手元の build と GameTest はやめた（#985）。push してから全段の先頭のコミットの CI を待つ
   assert.doesNotMatch(m, /\.\/gradlew (build|:)|runGameTestServer/)
