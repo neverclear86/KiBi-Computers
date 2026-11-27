@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.BootConfig
 import pro.ikili.kibicomputers.core.kernel.Harness
 import pro.ikili.kibicomputers.core.kernel.Machine
@@ -34,7 +35,6 @@ import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
 import pro.ikili.kibicomputers.core.runtime.FakeModule
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.KibiErrors
 import java.time.Duration
 import java.util.Collections
@@ -56,8 +56,8 @@ class WasiP1PowerTest {
     /** 待ち方: 待機点型（巻き戻し）・ブロッキング型 */
     enum class Mode { UNWIND, BLOCK }
 
-    private val asyncProgram: Program by lazy { Program.loadMetered(EndiveRuntime(), bytes, null, WasiP1.WAIT_IMPORTS) }
-    private val plainProgram: Program by lazy { Program.load(EndiveRuntime(), bytes) }
+    private val asyncProgram: Program by lazy { SharedPrograms.loadMetered(bytes, WasiP1.WAIT_IMPORTS) }
+    private val plainProgram: Program by lazy { SharedPrograms.load(bytes) }
 
     private fun program(mode: Mode): Program = if (mode == Mode.UNWIND) asyncProgram else plainProgram
 

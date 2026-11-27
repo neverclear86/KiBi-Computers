@@ -32,7 +32,8 @@ class ProgramSharingTest {
 
     @Test
     fun `別々のマシンで同じWASMを動かしても、読み込みとコンパイルは1回だけ`() = timeout(Duration.ofSeconds(60)) {
-        Harness(execRuntime = EndiveRuntime()).use { h ->
+        // スケジューラの中の共有（ProgramCache）と読み込みの回数を確かめるので、JVM の中の共有の表（#991）は切る
+        Harness(execRuntime = EndiveRuntime(), sharePrograms = false).use { h ->
             val machines = (0 until 4).map { h.luaMachine() }
             val options = SpawnOptions(args = listOf("lua", "-e", "print(6 * 7)"), stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed))
             val pids = machines.map { it.exec("/bin/lua", KernelDrivers.DEFAULT, options) }

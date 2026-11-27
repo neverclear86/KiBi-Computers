@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.Harness
+import pro.ikili.kibicomputers.core.kernel.SharedPrograms
 import pro.ikili.kibicomputers.core.kernel.eventually
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSource
 import pro.ikili.kibicomputers.core.kernel.fd.StdioSpec
@@ -18,7 +19,6 @@ import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
 import pro.ikili.kibicomputers.core.kernel.withLockValue
-import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import java.time.Duration
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
 
@@ -27,7 +27,7 @@ class WasiP1FdProgramTest {
     private val program: Program by lazy {
         val bytes = javaClass.getResourceAsStream("/kibicomputers/wasm/fd-wasi.wasm")?.use { it.readBytes() }
         assertNotNull(bytes, "fd-wasi.wasm がリソースにない")
-        Program.load(EndiveRuntime(), bytes!!)
+        SharedPrograms.load(bytes!!)
     }
 
     @Test

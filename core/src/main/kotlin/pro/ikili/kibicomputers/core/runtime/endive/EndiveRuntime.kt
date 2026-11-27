@@ -105,7 +105,16 @@ public class EndiveRuntime internal constructor(
     private val clock: () -> Long = defaultCompileClock(),
 ) : WasmRuntime {
     /** ランタイムコンパイラで動かすランタイムを作る */
-    public constructor() : this(true)
+    public constructor() : this(true) {
+        defaultConfiguration = true
+    }
+
+    /**
+     * 引数なしのコンストラクターで作った（コンパイルし、時計も既定）。テストで、読み込んだ結果をランタイムのインスタンスをまたいで
+     * 使い回してよいかの判定に使う（#991。インタプリタだけのものや時計を差し替えたものとは共有しない）
+     */
+    internal var defaultConfiguration: Boolean = false
+        private set
 
     override val name: String get() = NAME
 
