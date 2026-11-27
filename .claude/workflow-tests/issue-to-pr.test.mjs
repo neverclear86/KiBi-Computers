@@ -1,5 +1,6 @@
 // issue-to-pr.js（保存済みの Workflow）の、Gradle を待たずに返した段階のやり直し（#904）、マージの段階が手元で Gradle を動かさないこと（#985）、
-// マージの段階の push の後の CI の、不安定なテストの回し直し（#961）、結果を返さなかった段階の呼び直しと記録（#953）の検査。
+// マージの段階の push の後の CI の、不安定なテストの回し直し（#961）、結果を返さなかった段階の呼び直しと記録（#953）、
+// 同じ area を同時に 2 件まで流す area のロック（#986）の検査。
 // 偽の agent でスクリプト全体を流し、どの段階が何回呼ばれたか、最後の結果がどうなるかを見る。
 // 実行: node --test .claude/workflow-tests/
 import { test } from 'node:test'
@@ -1649,4 +1650,100 @@ test('スタック: 3 段のスタックは、下の段から順に一つ下の�
   assert.match(m, /`git merge origin\/issue-339-mid`/)
   assert.match(m, /#900・#901・#906/)
   assert.ok(r.promptsOf('stack-note').some(p => p.opts.label === 'stack-note:901'))
+})
+
+// ---- area のロック（#986）: 同じ area は同時に 2 件まで。area のロックを取ってから slots を取る ----
+// 実装の段階で同時に動いた数を数える。area は重い area（HEAVY_AREAS。Fable のレビューに回る）を避ける。Issue ごとに PR・ブランチ・worktree を分ける（PR の番号が重なると prIssue が壊れる）
+async function runAreas(issues, window, extraArgs = {}, overrides = {}) {
+  let active = 0
+  let max = 0
+  const enter = []
+  const implement = async prompt => {
+    const n = issues.find(i => prompt.includes(`Issue #${i.number}`)).number
+    active++
+    max = Math.max(max, active)
+    enter.push({ n, activeOnEnter: active })
+    await new Promise(r => setTimeout(r, 10))
+    active--
+    return { ...IMPL, pr: 2000 + n, branch: `issue-${n}-x`, worktree: `D:/w/issue-${n}` }
+  }
+  const r = await run({ select: [{ issues }], implement, ...overrides }, { issues: issues.map(i => i.number), window, ...extraArgs })
+  return { ...r, max: () => max, enter }
+}
+const areaIssue = (number, areas) => ({ number, title: 't', areas, openDeps: [], blockedReason: null, needsPlan: false })
+const allMerged = r => r.result.results.every(x => x.status === 'merged')
+
+test('area のロック: window 3 で同じ area の 3 件は、同時に 2 件まで動く', async () => {
+  const r = await runAreas([areaIssue(911, ['gui']), areaIssue(912, ['gui']), areaIssue(913, ['gui'])], 3)
+  assert.equal(r.max(), 2)
+  assert.ok(allMerged(r))
+  assert.equal(r.count('merge'), 3)
+})
+
+test('area のロック: window 3 で area が別の 3 件は、3 件とも同時に動く', async () => {
+  const r = await runAreas([areaIssue(911, ['gui']), areaIssue(912, ['network']), areaIssue(913, ['tooling'])], 3)
+  assert.equal(r.max(), 3)
+  assert.ok(allMerged(r))
+})
+
+test('area のロック: 複数の area を持つ Issue（[a,b]・[a]・[b]・[b,a]）が混ざっても、詰まらずに全部マージまで進む', async () => {
+  const r = await runAreas([areaIssue(911, ['network', 'gui']), areaIssue(912, ['network']), areaIssue(913, ['gui']), areaIssue(914, ['gui', 'network']), areaIssue(915, ['gui'])], 3)
+  assert.ok(allMerged(r))
+  assert.equal(r.result.results.length, 5)
+  assert.ok(r.max() <= 3)
+})
+
+test('area のロック: 同じ area の 3 件が先に並んでも、別の area の Issue は slot を取って 3 件目より先に進む', async () => {
+  const r = await runAreas([areaIssue(911, ['gui']), areaIssue(912, ['gui']), areaIssue(913, ['gui']), areaIssue(914, ['tooling'])], 3)
+  assert.equal(r.max(), 3)
+  const order = r.enter.map(e => e.n)
+  assert.ok(order.indexOf(914) < order.indexOf(913), `実装に入った順: ${order.join(', ')}`)
+  assert.ok(allMerged(r))
+})
+
+test('area のロック: 表記ゆれ（`area: ` の接頭辞・大文字・空白）は同じ area として数え、1 件の中の重複で 2 つ取らない', async () => {
+  const r = await runAreas([areaIssue(911, ['GUI', 'gui']), areaIssue(912, ['area: gui ']), areaIssue(913, [' Gui'])], 3)
+  assert.equal(r.max(), 2)
+  assert.ok(allMerged(r))
+})
+
+test('area のロック: 対象を指定しない選択のプロンプトは、同じ area を 2 件までと指示する', async () => {
+  const r = await run({}, { issues: [] })
+  assert.match(r.promptOf('select'), /同じ area の Issue は 2 件までにする/)
+  assert.doesNotMatch(r.promptOf('select'), /1件まで/)
+})
+
+for (const [name, order] of [['下の段が先', [904, 905]], ['上の段が先', [905, 904]]]) {
+  test(`スタック: 同じ area・window: 2 で 2 段が同時に動いても（${name}）、上の段がスタックごとマージして両方 merged になる`, async () => {
+    const sel = order.map(n => SAME_AREA.find(i => i.number === n))
+    const r = await run({ ...SAME_AREA_BASE, select: [{ issues: sel }] }, { issues: order, window: 2 })
+    const byIssue = Object.fromEntries(r.result.results.map(x => [x.issue, x]))
+    assert.equal(byIssue[904].status, 'merged')
+    assert.equal(byIssue[905].status, 'merged')
+    assert.equal(r.count('stack-merge'), 1)
+    assert.equal(r.promptsOf('stack-merge')[0].opts.label, 'stack-merge:907')
+    assert.equal(r.count('merge'), 0)
+    assert.equal(r.count('cleanup'), 2)
+  })
+}
+
+// 重い PR の判定（HEAVY_AREAS）も、ロックと同じそろえ方（lockAreas）で見る（#986）。重い area の表記ゆれでも Fable のレビューに回る
+for (const [name, areas] of [
+  ['`area: ` の接頭辞', ['area: runtime']],
+  ['大文字', ['Runtime']],
+  ['前後の空白', [' kernel ']],
+]) {
+  test(`重い PR の判定: 重い area の表記ゆれ（${name}）でも Fable のレビューに回り、Opus のレビューは呼ばれない`, async () => {
+    const r = await runAreas([areaIssue(911, areas)], 1, {}, { 'review-fable': () => ({ findings: [] }) })
+    assert.ok(allMerged(r))
+    assert.ok(r.count('review-fable') >= 1)
+    assert.equal(r.count('review'), 0)
+  })
+}
+
+test('重い PR の判定: 重くない area は Opus のレビューだけが呼ばれる（Fable は呼ばれない）', async () => {
+  const r = await runAreas([areaIssue(911, ['GUI'])], 1)
+  assert.ok(allMerged(r))
+  assert.ok(r.count('review') >= 1)
+  assert.equal(r.count('review-fable'), 0)
 })

@@ -213,7 +213,7 @@ internal object Asyncify {
 
         /**
          * 変換する（[Asyncify.transform] と同じ）。[externalSuspendTypes] は、モジュールの外から止まりうるとみなす関数の型（#757）。
-         * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかでも止まりうるとみなす
+         * import・export したテーブルへの `call_indirect` と `call_ref` は、型がこのどれかと構造で合いうる（引数・結果の数が同じで、参照の位置は同じ階層。#937）なら止まりうるとみなす
          * （テーブルの中身や関数の参照は、ほかのモジュールが入れられるため）。止まりうる関数の中の、そうして止まりうるとみなした
          * `call_ref` は断る（#923）。空なら今までと同じ出力になる
          *
@@ -326,6 +326,39 @@ private fun code(v: ValType): Int {
 
 private class Sig(val params: List<Int>, val results: List<Int>)
 
+/** [hierarchy] で、どの参照の位置にも合うことを表す印（追えない参照型 [BOT] と、知らない参照型） */
+private const val WILD_REF = -2
+
+/**
+ * 値の型を、構造の照合（#937。`Transformer.externalMatch`）の鍵にする。数値はそのまま、参照は階層の先頭
+ * （anyref・funcref・externref・exnref）にまとめる。部分型は同じ階層の中にしかない（`ValType.heapTypeSubtype`）
+ */
+private fun hierarchy(t: Int): Int = when (t) {
+    I32, I64, F32, F64, V128 -> t
+    // any・eq・i31・struct・array・none
+    0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x71 -> 0x6E
+    // func・nofunc
+    0x70, 0x73 -> 0x70
+    // extern・noextern
+    0x6F, 0x72 -> 0x6F
+    // exn・noexn
+    0x69, 0x74 -> 0x69
+    else -> WILD_REF
+}
+
+private fun Pair<List<Int>, List<Int>>.hasWild() = WILD_REF in first || WILD_REF in second
+
+/**
+ * [hierarchy] の鍵の形。参照の位置（階層と [WILD_REF]）をすべて [WILD_REF] にまとめ、引数・結果の数と数値の位置だけを残す。
+ * [WILD_REF] は参照の位置にだけ合うので、形が同じことは、片方が [WILD_REF] を持つ鍵どうしが合いうるための必要条件になる
+ */
+private fun shape(k: Pair<List<Int>, List<Int>>): Pair<List<Int>, List<Int>> {
+    fun refs(x: List<Int>) = x.map { if (isRefKey(it)) WILD_REF else it }
+    return refs(k.first) to refs(k.second)
+}
+
+private fun isRefKey(t: Int) = t != I32 && t != I64 && t != F32 && t != F64 && t != V128
+
 /** 関数の本体の木。葉は命令、枝は block・loop・if・try_table */
 private sealed class Node
 
@@ -375,6 +408,9 @@ private class Transformer(
 ) {
     private val importedFuncs: Int
     private val funcSigs = ArrayList<Sig>()
+
+    /** 関数の番号 → その型の番号（import は宣言した型。#937。宣言した上位の型をたどるのに使う） */
+    private val funcTypeIdx = ArrayList<Int>()
     /**
      * 型の番号（rec グループを平らにした番号）→ 関数の型。struct・array の型（GC の提案）は `null`（#891）。
      * 型そのものでは断らない（止まりうる関数がなければ、型は使わない）。関数の型として引いたときだけ断る（[typeSig]）
@@ -458,13 +494,17 @@ private class Transformer(
                 yt = imp.typeIndex()
             }
             funcSigs += typeSig(imp.typeIndex())
+            funcTypeIdx += imp.typeIndex()
             nf++
         }
         importedFuncs = nf
         yieldFunc = if (yf in asyncFuncs) -1 else yf
         yieldType = yt
         val fs = module.functionSection()
-        for (i in 0 until fs.functionCount()) funcSigs += typeSig(fs.getFunctionType(i))
+        for (i in 0 until fs.functionCount()) {
+            funcSigs += typeSig(fs.getFunctionType(i))
+            funcTypeIdx += fs.getFunctionType(i)
+        }
         val gs = module.globalSection()
         for (i in 0 until gs.globalCount()) globalTypes += codeOrBot(gs.getGlobal(i).valueType())
         val ts = module.tableSection()
@@ -486,13 +526,72 @@ private class Transformer(
         stateGlobal = globalTypes.size
     }
 
-    /** 止まりうる関数の型（引数と結果の並び）。間接呼び出しは、型が同じ関数しか呼べないので、この型のときだけ止まりうる */
+    /**
+     * 止まりうる関数の型（引数と結果の並び）と、その型が宣言した上位の型（`sub`）を推移的にたどった型の並び（#937）。
+     * Endive の `call_indirect` は、表の関数が同じインスタンスのものなら、関数の型が呼び出しの型と同じか、宣言した部分型
+     * （上位の型をたどる各段で、rec グループをまたいだ構造の同値も含む）のときに呼ぶ（`ValType.heapTypeSubtype`）。
+     * `call_ref` の参照も、静的な型の部分型の関数を指す。そのため、呼び出しの型が、止まりうる関数の型か、その上位の型の
+     * どれかと並びが同じなら止まりうるとみなす（並びの一致は構造の同値より粗いので、安全側に含まれる）。
+     * import した関数も、表には自分のインスタンスの関数として入り、宣言した import の型で照合されるので、同じ扱いにする
+     */
     private val suspendTypes = HashSet<Pair<List<Int>, List<Int>>>()
 
+    /** [suspendTypes] に入れた型の番号（同じ型と上位の型を何度もたどらない） */
+    private val suspendTypeIdx = HashSet<Int>()
+
+    /** 型の番号 [idx] と、その宣言した上位の型をすべて [suspendTypes] に入れる（#937） */
+    private fun addSuspendType(idx: Int) {
+        val types = module.typeSection()
+        val pending = ArrayList<Int>()
+        pending += idx
+        while (pending.isNotEmpty()) {
+            val i = pending.removeAt(pending.size - 1)
+            // 検証が上位の型の非循環を保証するが、同じ型を 2 度たどらないための集合で守る
+            if (!suspendTypeIdx.add(i)) continue
+            // 関数の型の上位は関数の型（検証が保証する）。struct・array（null）は飛ばす
+            typeSigs.getOrNull(i)?.let { suspendTypes += it.params to it.results }
+            if (i in 0 until types.subTypeCount()) types.getSubType(i).typeIdx().forEach { pending += it }
+        }
+    }
+
+    /**
+     * 型の番号 → 外の型（[externalSuspendTypes]）のどれかと構造で合いうるか（#937）。
+     * 表の関数がほかのインスタンスのものなら、Endive は構造で照合する（`FunctionType.matches`。引数は反変、結果は共変で、
+     * 参照の位置は部分型で比べる。`sub` の宣言は要らない）。ここでは保守的に、引数・結果の数が同じで、数値の位置は同じ型、
+     * 参照の位置は同じ階層（any・func・extern・exn）なら合いうるとみなす（[hierarchy]）。追えない参照型（[BOT]）と知らない参照型は、
+     * どの参照の位置にも合う。外の型は解析の間に変わらないので、最初に引いたときに 1 回だけ作る
+     *
+     * 照合は、型ごとに集合を 1、2 回引くだけにする（型の数 + 外の型の数に比例。型の数の上限はモジュールごとに 100,000）。
+     * 追えない参照型を、呼び出し側か外の型のどちらかが持つときは、階層を比べずに形（[shape]。数と数値の位置）だけで合いうるとみなす。
+     * 階層まで比べると、追えない側の型の 1 つごとに相手をすべてなめることになり、最悪で両者の数の積になるため。
+     * 形だけの照合は階層の照合より粗いので、安全側（止まりうる側）に含まれる
+     */
+    private val externalMatch: BooleanArray by lazy {
+        val exact = HashSet<Pair<List<Int>, List<Int>>>()
+        // 外の型の形。追えない参照型を含むものと、すべての外の型
+        val wildShapes = HashSet<Pair<List<Int>, List<Int>>>()
+        val allShapes = HashSet<Pair<List<Int>, List<Int>>>()
+        for (s in externalSuspendTypes) {
+            val k = s.params.map(::hierarchy) to s.results.map(::hierarchy)
+            if (k.hasWild()) wildShapes += shape(k) else exact += k
+            allShapes += shape(k)
+        }
+        BooleanArray(typeSigs.size) { i ->
+            val t = typeSigs[i]
+            if (t == null) {
+                false
+            } else {
+                val k = t.params.map(::hierarchy) to t.results.map(::hierarchy)
+                if (k.hasWild()) shape(k) in allShapes else k in exact || shape(k) in wildShapes
+            }
+        }
+    }
+
     private fun indirectMaySuspend(ins: AnnotatedInstruction): Boolean {
-        val sig = typeSig(ins.operand(0).toInt())
+        val idx = ins.operand(0).toInt()
+        val sig = typeSig(idx)
         if (sig.params to sig.results in suspendTypes) return true
-        if (externalSuspendTypes.isEmpty() || Asyncify.Signature(sig.params, sig.results) !in externalSuspendTypes) return false
+        if (externalSuspendTypes.isEmpty() || !externalMatch[idx]) return false
         // 外の型は、中身をほかのモジュールが入れられるもの（import・export したテーブル、関数の参照）にだけ当てる（#757）。
         // ほかのモジュールの関数の参照が入りうる形のモジュールでは、import も export もしていないテーブルにも入れられる
         // （[foreignFuncRefs]）ので、どのテーブルにも当てる
@@ -557,7 +656,7 @@ private class Transformer(
         var changed = true
         while (changed) {
             changed = false
-            for (f in suspendable) suspendTypes += funcSigs[f].params to funcSigs[f].results
+            for (f in suspendable) addSuspendType(funcTypeIdx[f])
             for ((i, body) in bodies.withIndex()) {
                 val f = importedFuncs + i
                 if (f in suspendable) continue
