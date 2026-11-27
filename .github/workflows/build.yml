@@ -9,8 +9,12 @@ on:
 permissions:
   contents: read
 
+# ジョブの構成（#984）:
+# - assemble: core のテストを抜いた build（接続層・build-logic のテスト・ABI の検査など）と GameTest の 4 段
+# - core-test: core のテスト（:core:test と直列の組の :core:testSerial）を、matrix で組に分けて別々のマシンで回す
+# - build: 上の全部を needs する集約のジョブ。ブランチ保護の必須チェック名 `build` はこのジョブ（名前を変えない）
 jobs:
-  build:
+  assemble:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -43,11 +47,10 @@ jobs:
           path: ~/.gradle/kibicomputers/downloads
           key: wasm-sources-${{ hashFiles('gradle/lua.properties') }}
 
-      # core のテストが固まったとき（デッドロック型の不安定さ）に、ジョブの上限（6 時間）でキャンセル扱いにならないよう上限を付ける。
-      # 段のタイムアウトは失敗扱いなので、下の upload の段が動く（ふだんは 20 分ほど）
-      - name: Build and test
+      # core のテストは core-test のジョブが回す（#984）。ここでは除く
+      - name: Build (without core tests)
         timeout-minutes: 60
-        run: ./gradlew build --console=plain
+        run: ./gradlew build -x :core:test -x :core:testSerial --console=plain
 
       # 開発環境のゲームサーバーで MOD を読み込み、GameTest を実行する（失敗すると終了コードが非0）。
       # サーバーの停止が終わらないとき（#540）に、ジョブの上限（6 時間）まで待たないよう、段ごとに上限を付ける
@@ -71,15 +74,20 @@ jobs:
 
       # どこかの段が落ちたら、テスト結果の XML（テスト名・スタックトレース・system-out）と GameTest のサーバーのログを残す（#394）。
       # 不安定なテストは再実行で通ると記録が消えるので、再実行の前に調べられるようにする。
-      # 名前に attempt を入れて、同じ run の再実行で名前がぶつからないようにする。
+      # ジョブごとの artifact は、集約の build のジョブが test-reports-attempt-<n> に 1 つにまとめる（#984）。
       # cancelled() も入れて、手でキャンセルしたときやジョブの上限に当たったときも残す（failure() はキャンセルでは真にならない）。
-      # 何も拾えなかったときは warn で注記を出す（コンパイルで落ちたときなどは、まだ何もない）
-      - name: Upload test reports on failure
+      # 中のパスをリポジトリのルートからの相対にするため、ルートに目印のファイルを置いて一緒に上げる
+      # （upload-artifact は、上げるファイルに共通の親ディレクトリを根にする）
+      - name: Mark the root of test reports
         if: failure() || cancelled()
+        run: echo "job=assemble run=${{ github.run_id }} attempt=${{ github.run_attempt }} sha=${{ github.sha }}" > test-reports-assemble.txt
+
+      - if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: test-reports-attempt-${{ github.run_attempt }}
+          name: test-reports-assemble-attempt-${{ github.run_attempt }}
           path: |
+            test-reports-assemble.txt
             **/build/test-results/**/*.xml
             platform-*/run/logs/latest.log
             platform-*/run/jar-gametest/logs/latest.log
@@ -91,3 +99,98 @@ jobs:
           name: kibicomputers-jars
           path: platform-*/build/libs/*.jar
           if-no-files-found: error
+
+  core-test:
+    runs-on: ubuntu-latest
+    strategy:
+      # 1 組が落ちてもほかの組を止めない（全部の失敗を 1 回の run で見られるようにする）
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      # Gradle のユーザーホームのキャッシュは 1 組目だけが書く（組の数だけ項目が増えて、ほかのキャッシュが追い出されないように）
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: ${{ matrix.shard != 1 }}
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/zig.properties') }}
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/wasi-sdk
+          key: wasi-sdk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/wasi-sdk.properties') }}
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.gradle/kibicomputers/downloads
+          key: wasm-sources-${{ hashFiles('gradle/lua.properties') }}
+
+      # core のテストが固まったとき（デッドロック型の不安定さ）に、ジョブの上限（6 時間）でキャンセル扱いにならないよう上限を付ける。
+      # 段のタイムアウトは失敗扱いなので、下の upload の段が動く。
+      # ランナーは 4 vCPU なので、組の中は JVM 1 本で回す（組どうしは別のマシンで干渉しない）
+      - name: Core tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+        timeout-minutes: 60
+        run: ./gradlew :core:test -Pkibi.test.shard=${{ matrix.shard }}/${{ strategy.job-total }} -Pkibi.test.forks=1 --console=plain
+
+      # 組のテストの数を出す。0 件なら落とす（組の振り分けの誤りで、テストが黙って走らなくなるのを防ぐ）
+      - name: Count tests
+        run: |
+          set -euo pipefail
+          count=$(cat core/build/test-results/test/*.xml core/build/test-results/testSerial/*.xml 2>/dev/null \
+            | grep -o '<testsuite [^>]*' | sed -n 's/.* tests="\([0-9]*\)".*/\1/p' | awk '{s+=$1} END {print s+0}')
+          echo "core のテスト（組 ${{ matrix.shard }}/${{ strategy.job-total }}）: ${count} 件" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$count" -gt 0
+
+      - name: Mark the root of test reports
+        if: failure() || cancelled()
+        run: echo "job=core-test shard=${{ matrix.shard }}/${{ strategy.job-total }} run=${{ github.run_id }} attempt=${{ github.run_attempt }} sha=${{ github.sha }}" > test-reports-core-${{ matrix.shard }}.txt
+
+      - if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports-core-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            test-reports-core-${{ matrix.shard }}.txt
+            **/build/test-results/**/*.xml
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ブランチ保護の必須チェック `build`。全部のジョブが success のときだけ通す。
+  # if: always() がないと、ほかのジョブが落ちたときにこのジョブが skipped になり、必須チェックが通った扱いになる
+  build:
+    if: always()
+    needs: [assemble, core-test]
+    runs-on: ubuntu-latest
+    steps:
+      # どこかのジョブが落ちたかキャンセルされたら、ジョブごとの artifact を test-reports-attempt-<n> に 1 つにまとめる（#394・#984）。
+      # 中のパスはリポジトリのルートからの相対のまま（組がクラス単位で分かれているので、XML のパスは重ならない）。
+      # まとめる元が 1 つもない（コンパイルで落ちたなど）と失敗するので、この段の失敗はジョブの結果に入れない
+      - name: Merge test reports
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        continue-on-error: true
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: test-reports-attempt-${{ github.run_attempt }}
+          pattern: test-reports-*-attempt-${{ github.run_attempt }}
+          separate-directories: false
+          retention-days: 30
+
+      - name: Check results
+        env:
+          ASSEMBLE: ${{ needs.assemble.result }}
+          CORE_TEST: ${{ needs.core-test.result }}
+        run: |
+          echo "assemble: $ASSEMBLE, core-test: $CORE_TEST"
+          test "$ASSEMBLE" = success && test "$CORE_TEST" = success
