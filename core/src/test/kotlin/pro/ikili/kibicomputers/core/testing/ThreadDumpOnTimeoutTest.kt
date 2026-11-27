@@ -1,6 +1,7 @@
 package pro.ikili.kibicomputers.core.testing
 
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -74,6 +75,22 @@ class ThreadDumpOnTimeoutTest {
     }
 
     @Test
+    fun `ファイル名にはメソッド名の日本語を残し、長い名前は UTF-8 のバイト数で切る`() {
+        val japanese = ThreadDumps.sanitize("a.b.ShellTest#ダンプの全文に、ロックの持ち主が載る")
+        assertEquals("ShellTest-ダンプの全文に_ロックの持ち主が載る", japanese)
+
+        val longName = "a.b." + "C".repeat(200) + "#" + "あ".repeat(200)
+        val sanitized = ThreadDumps.sanitize(longName)
+        assertTrue(sanitized.toByteArray(Charsets.UTF_8).size <= 151, sanitized)
+        assertTrue(sanitized.contains("-あ"), sanitized)
+        assertEquals("ShellTest", ThreadDumps.sanitize("a.b.ShellTest"))
+
+        val out = PrintStream(ByteArrayOutputStream(), true, "UTF-8")
+        val file = ThreadDumps.dump(dir, longName, "試し", null, out)
+        assertTrue(file.fileName.toString().toByteArray(Charsets.UTF_8).size <= 255, file.fileName.toString())
+    }
+
+    @Test
     fun `assertTimeoutPreemptively の時間切れを見分ける`() {
         val failure = runCatching { assertTimeoutPreemptively(Duration.ofMillis(50)) { Thread.sleep(10_000) } }.exceptionOrNull()!!
         assertTrue(ThreadDumpOnTimeout.isPreemptiveTimeout(failure), failure.toString())
@@ -135,7 +152,10 @@ class ThreadDumpOnTimeoutTest {
             holder?.join(60_000)
         }
 
-        private fun holdLock() {
+        // 持ち主の起動と待ち合わせは @Timeout の対象（テストのメソッド）に入れない。負荷の下で 300 ms を食うと、
+        // 割り込む直前のダンプが「ロック待ち」になる前の状態で撮れ、持ち主の行の確かめが落ちるため（#916 でなくした形の不安定さ）
+        @BeforeEach
+        fun holdLock() {
             val held = CountDownLatch(1)
             val t = Thread({
                 lock.lock()
@@ -155,13 +175,11 @@ class ThreadDumpOnTimeoutTest {
         @Test
         @Timeout(value = 300, unit = TimeUnit.MILLISECONDS)
         fun stuckUntilInterrupted() {
-            holdLock()
             lock.lockInterruptibly()
         }
 
         @Test
         fun stuckInPreemptive() {
-            holdLock()
             assertTimeoutPreemptively(Duration.ofMillis(300)) { lock.lockInterruptibly() }
         }
     }

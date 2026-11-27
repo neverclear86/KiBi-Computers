@@ -34,7 +34,7 @@ import java.time.format.DateTimeFormatter
  * 撮れないとき（書き出しの失敗など）は標準エラーに 1 行出して続ける。
  *
  * `@TestFactory` の動的テスト・クラスの初期化・Gradle の worker そのものの止まりは JUnit から拾えないので、CI の側で `jcmd` の
- * 見張り（`.github/scripts/thread-dump-watchdog.sh`）が受け持つ。
+ * 見張り（`.github/scripts/with-thread-dump-watchdog.sh`）が受け持つ。
  */
 class ThreadDumpOnTimeout : PreInterruptCallback, AfterTestExecutionCallback {
     override fun beforeThreadInterrupt(preInterruptContext: PreInterruptContext, extensionContext: ExtensionContext) {
@@ -172,9 +172,36 @@ internal object ThreadDumps {
         }
     }
 
-    /** ファイル名に使えない文字を置き換え、長さを抑える（Windows の 260 文字の制限に掛からないように） */
-    private fun sanitize(label: String): String {
+    /** ファイル名のクラス名の部分の長さの上限（UTF-8 のバイト数） */
+    private const val CLASS_NAME_BYTES = 60
+
+    /** ファイル名のメソッド名の部分の長さの上限（UTF-8 のバイト数。日本語は 1 文字 3 バイトなので、30 文字ほど） */
+    private const val METHOD_NAME_BYTES = 90
+
+    /**
+     * ファイル名に使えない文字を置き換え、長さを抑える（Linux の 1 要素 255 バイト・Windows の 260 文字の制限に掛からないように）。
+     * 文字と数字は日本語も残す（core のテストのメソッド名は大半が日本語で、`_` に潰すとどのメソッドか分からなくなる）。
+     * 長さはクラス名とメソッド名を別々に UTF-8 のバイト数で切る（長いクラス名でメソッド名が消えないように）
+     */
+    internal fun sanitize(label: String): String {
         val simple = label.substringAfterLast('.')
-        return simple.replace(Regex("[^A-Za-z0-9_#-]"), "_").replace('#', '-').take(120)
+        val replaced = Regex("[^\\p{L}\\p{N}_#-]").replace(simple, "_")
+        val clazz = replaced.substringBefore('#')
+        if (!replaced.contains('#')) return truncateUtf8(clazz, CLASS_NAME_BYTES + METHOD_NAME_BYTES)
+        return truncateUtf8(clazz, CLASS_NAME_BYTES) + "-" + truncateUtf8(replaced.substringAfter('#').replace('#', '-'), METHOD_NAME_BYTES)
+    }
+
+    /** UTF-8 で [maxBytes] バイト以内になるよう、文字（サロゲートペアを割らない）の単位で先頭から切る */
+    private fun truncateUtf8(s: String, maxBytes: Int): String {
+        var bytes = 0
+        var end = 0
+        while (end < s.length) {
+            val cp = s.codePointAt(end)
+            val n = String(Character.toChars(cp)).toByteArray(Charsets.UTF_8).size
+            if (bytes + n > maxBytes) break
+            bytes += n
+            end += Character.charCount(cp)
+        }
+        return s.substring(0, end)
     }
 }
