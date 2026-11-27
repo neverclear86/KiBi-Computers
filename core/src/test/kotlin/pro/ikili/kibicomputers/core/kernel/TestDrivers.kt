@@ -462,7 +462,6 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
 }
 
 /**
-/**
  * カーネルのスレッドの残りとして数えない、JVM に 1 本のスレッドの名前（#990）。
  *
  * コンポーネントの検証の見張り（[ValidationWatchdog.THREAD_NAME]）は、スケジューラのものではなく JVM で共有する 1 本で、
