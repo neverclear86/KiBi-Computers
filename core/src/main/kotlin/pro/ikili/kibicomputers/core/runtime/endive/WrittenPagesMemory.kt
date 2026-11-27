@@ -15,6 +15,7 @@ import java.nio.BufferUnderflowException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.ReadOnlyBufferException
+import java.util.function.IntFunction
 import run.endive.runtime.Memory as EndiveMemory
 
 /**
@@ -38,7 +39,8 @@ import run.endive.runtime.Memory as EndiveMemory
  *
  * 区画の表そのもの（#753）: 1 ページあたり [TABLE_BYTES_PER_PAGE] を、作るとき（最初のページ数の分）・`memory.grow`（増やした分。端の区画と
  * 1 回で数える）・[restorePages]（増やした分）に [budget] で数える。数えた分は [tableBytes] に持ち、[releaseAll] で区画の分と一緒に返す。
- * 最初の分を数えられなければ、作らずに [PageTableRefused] を投げる。宣言しただけの大きさの区画（4 KiB）は今までどおり数えない
+ * 最初の分を数えられなければ、作らずに [PageTableRefused] を投げる。数えた後に表の確保が失敗したら（[OutOfMemoryError] など）、数えた分を
+ * 返してから同じ例外を投げ直す（#946。`tableFactory` はその失敗をテストで差し込む口で、ふつうは渡さない）。宣言しただけの大きさの区画（4 KiB）は今までどおり数えない
  * （表は区画の 1/512 なので、小さい RAM でも起動を妨げない）。数えないもの: [parked]（保存の待機点で作るので断れない。保存できるのは p1 だけ）と、
  * grow のときに古い表と新しい表が一瞬並ぶ分（一時的なもの）
  *
@@ -49,6 +51,7 @@ import run.endive.runtime.Memory as EndiveMemory
 internal class WrittenPagesMemory(
     private val limits: MemoryLimits,
     private val budget: WasmTableBudget?,
+    tableFactory: IntFunction<Array<ByteBuffer?>>? = null,
     private val onGrowRefused: Runnable? = null,
 ) : EndiveMemory {
     init {
@@ -62,17 +65,27 @@ internal class WrittenPagesMemory(
     var tableBytes: Long = 0
         private set
 
-    init {
-        val initialTable = tableBytesOf(limits.initialPages())
-        if (budget != null && initialTable > 0) {
-            if (!budget.tryReserveBytes(initialTable)) throw PageTableRefused(limits.initialPages())
-            tableBytes = initialTable
-        }
-    }
-
     /** 4 KiB の区画の表。範囲内でまだ書いていない区画は [ZERO_CHUNK]、範囲外は表の外 */
     @Volatile
-    private var chunks: Array<ByteBuffer?> = Array(limits.initialPages() * CHUNKS_PER_PAGE) { ZERO_CHUNK }
+    private var chunks: Array<ByteBuffer?>
+
+    init {
+        // 先に数え、断られたら何も確保しない（#753）。数えた後の表の確保が失敗したら、数えた分を返してから同じ例外を
+        // 投げ直す（#946。作り途中なので releaseAll は使わない）。tableBytes には確保できてから入れる
+        val pages = limits.initialPages()
+        val initialTable = tableBytesOf(pages)
+        val reserved = budget != null && initialTable > 0
+        if (reserved && !budget!!.tryReserveBytes(initialTable)) throw PageTableRefused(pages)
+        chunks = try {
+            val size = pages * CHUNKS_PER_PAGE
+            tableFactory?.apply(size) ?: Array(size) { ZERO_CHUNK }
+        } catch (t: Throwable) {
+            if (reserved) budget!!.releaseBytes(initialTable)
+            throw t
+        }
+        if (reserved) tableBytes = initialTable
+        // ここより後のプロパティの初期化子で確保をしない（数えた分を返せない窓になる）
+    }
 
     /** 今の大きさ（64 KiB のページ数） */
     @Volatile

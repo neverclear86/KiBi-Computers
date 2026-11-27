@@ -447,12 +447,20 @@ class ComponentProcessTest {
 
     /**
      * 浅い再帰が最後まで進み、深い再帰がそのプロセスだけスタック切れで CRASHED になり、ほかのプロセスが動き続けることを確かめる。
-     * 深い再帰の step を動かしたスレッドを返す
+     * 深い再帰の step を動かしたスレッドを返す。
+     *
+     * [spin] を渡したときは、その spin を「ほかのプロセス」に使い、新しく作らない（繰り返すテストで、終わらない spin が
+     * 台にたまって犠牲のプロセスに CPU が回るのが遅くならないように。#993）
      */
-    private fun Harness.deepRecursionCrashesOnlyItself(m: Machine, kind: ProcessKind): Thread {
-        val progress = AtomicInteger()
-        m.spawnTest(program(spinForever(progress)), runDriver())
-        tickUntilTrue("spin が動かない") { progress.get() > 0 }
+    private fun Harness.deepRecursionCrashesOnlyItself(
+        m: Machine,
+        kind: ProcessKind,
+        spin: AtomicInteger? = null,
+    ): Thread {
+        val progress = spin ?: AtomicInteger().also { p ->
+            m.spawnTest(program(spinForever(p)), runDriver())
+            tickUntilTrue("spin が動かない") { p.get() > 0 }
+        }
 
         val shallow = AtomicInteger(-1)
         val (shallowProgram, shallowDriver) = recursing(50, shallow, kind)
@@ -535,8 +543,13 @@ class ComponentProcessTest {
         // 尽きる位置は実行ごと・JIT の前後で変わるので、何度も繰り返す（#828）。毎回の後に、テストのスレッドからマシンのロックが取れる
         Harness().use { h ->
             val m = h.machine(fuelPerTick = 50_000_000)
+            // spin は 1 つだけ作って使い回す（#993）。毎回作ると終わらない spin が 12 個たまり、i 回目の犠牲のプロセスが
+            // i 個の spin のスライスの後ろで待つので、合計が回数の 2 乗で延びていた
+            val spin = AtomicInteger()
+            m.spawnTest(h.program(spinForever(spin)), runDriver())
+            h.tickUntilTrue("spin が動かない") { spin.get() > 0 }
             for (i in 0 until 12) {
-                h.deepRecursionCrashesOnlyItself(m, if (i % 2 == 0) ProcessKind.BLOCKING else ProcessKind.WAIT_POINT)
+                h.deepRecursionCrashesOnlyItself(m, if (i % 2 == 0) ProcessKind.BLOCKING else ProcessKind.WAIT_POINT, spin)
                 assertTrue(m.lock.tryLock(5, java.util.concurrent.TimeUnit.SECONDS), "$i 回目の後にマシンのロックが取れない: ${m.lock}")
                 m.lock.unlock()
             }
