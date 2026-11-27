@@ -30,13 +30,28 @@ class ShellLineEditTest {
         private val out = ByteArrayOutputStream()
         val terminal = AnsiTerminal(TextBuffer(columns, rows), 256)
 
+        /** 書かれたバイト数と、末尾の 2 バイト（プロンプトを見分けるため。tick ごとに出力の全体を文字列にしないように。#993） */
+        private var size = 0L
+        private var last1 = -1
+        private var last2 = -1
+
         override fun onStateChanged(machine: Machine, state: MachineState, cause: Throwable?) = Unit
 
         override fun onConsoleOutput(machine: Machine, bytes: ByteArray) {
             synchronized(this) {
                 out.write(bytes, 0, bytes.size)
                 terminal.write(bytes)
+                for (b in bytes) {
+                    last2 = last1
+                    last1 = b.toInt() and 0xff
+                }
+                size += bytes.size
             }
+        }
+
+        /** 出力の後ろがプロンプト（`$ `・`> `）なら、そこまでに書かれたバイト数。そうでなければ -1 */
+        fun promptEnd(): Long = synchronized(this) {
+            if (last1 == ' '.code && (last2 == '$'.code || last2 == '>'.code)) size else -1L
         }
 
         fun text(): String = synchronized(this) { out.toString(Charsets.UTF_8).replace("\r\n", "\n") }
@@ -59,7 +74,8 @@ class ShellLineEditTest {
         fun cursor(): Pair<Int, Int> = synchronized(this) { terminal.cursorX to terminal.cursorY }
     }
 
-    private class Session(val host: ScreenHost, val exitCode: Int?, val files: Map<String, String>) {
+    /** [promptFuel] は、[session] の steps を 1 つ打つたびの、打つ直前（プロンプトが出た時点）のスケジューラの燃料の使用量 */
+    private class Session(val host: ScreenHost, val exitCode: Int?, val files: Map<String, String>, val promptFuel: List<Long>) {
         val text: String get() = host.text()
     }
 
@@ -101,7 +117,8 @@ class ShellLineEditTest {
      * 打ち終えたら、[exit] なら終わるまで、そうでなければ [settled] が真になるまで待つ。
      * [steps] は [charset] でバイトにする（ISO-8859-1 なら、不正な UTF-8 のバイトをそのまま打てる）。
      * [splittable] なら貼り付けと同じく分けて入れてよい入力として渡す（raw の TTY の 4 KiB を超える行を打つため。#609）。
-     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる
+     * どちらでも、TTY が 1 バイトも捨てずに受け付けたことを確かめる。
+     * カーネルの TTY の幅は、はじめは [consoleColumns]（画面の幅とは別にできる）で、[beforeStep] が i 番目の step を打つ直前に呼ばれる
      */
     private fun session(
         steps: List<String>,
@@ -109,6 +126,8 @@ class ShellLineEditTest {
         env: Map<String, String> = emptyMap(),
         columns: Int = 80,
         rows: Int = 25,
+        consoleColumns: Int = columns,
+        beforeStep: (Int, Machine) -> Unit = { _, _ -> },
         exit: Boolean = true,
         read: List<String> = emptyList(),
         charset: Charset = Charsets.UTF_8,
@@ -118,7 +137,7 @@ class ShellLineEditTest {
         Harness(execRuntime = EndiveRuntime()).use { h ->
             val host = ScreenHost(columns, rows)
             val m = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = 16L * 1024 * 1024)
-            if (columns != 80 || rows != 25) m.resizeConsole(columns, rows)
+            if (consoleColumns != 80 || rows != 25) m.resizeConsole(consoleColumns, rows)
             m.vfs.mount(VfsPath.ROOT, TestMemoryFileSystem(), readOnly = false, source = "test:root")
             for (d in listOf("/bin", "/tmp", "/home")) m.vfs.createDirectory(VfsPath.parse(d))
             for (name in listOf("sh", "echo", "true", "false")) m.put("/bin/$name", imageFile("/bin/$name"))
@@ -129,12 +148,17 @@ class ShellLineEditTest {
             val fullEnv = mapOf("PATH" to "/bin", "HOME" to "/home") + env
             val pid = m.exec("/bin/sh", KernelDrivers.DEFAULT, SpawnOptions(args = listOf("sh"), env = fullEnv, cwd = "/", fds = SpawnOptions.ROOT_PREOPEN))
             var next = 0
-            var seen = 0
+            var seen = 0L
+            val promptFuel = ArrayList<Long>()
             eventuallyDescribe(150_000, { "終わらない: ${host.text()}\n${host.rows().joinToString("\n")}" }) {
                 h.scheduler.tick()
-                val text = host.text()
-                if (next < steps.size && text.length > seen && (text.endsWith("$ ") || text.endsWith("> "))) {
-                    seen = text.length
+                val end = host.promptEnd()
+                // プロンプトが見えただけでは、sh はまだ CPU を持っているかもしれない（書いてから poll で待つまでの間は、渡されたスライスの
+                // 未返却の分だけ燃料の使用量が多く出る）。入力を待って CPU を返した（WAITING_EVENT）のを確かめてから、燃料を読んで打つ
+                if (next < steps.size && end > seen && m.stateOf(pid) == ProcessState.WAITING_EVENT) {
+                    seen = end
+                    promptFuel += h.scheduler.fuelConsumedTotal
+                    beforeStep(next, m)
                     val bytes = steps[next++].toByteArray(charset)
                     assertEquals(bytes.size, m.offerConsoleInput(bytes, splittable = splittable), "TTY が入力を捨てた")
                 }
@@ -148,7 +172,7 @@ class ShellLineEditTest {
                 null
             }
             repeat(5) { h.scheduler.tick() }
-            Session(host, exitCode, read.associateWith { m.readText(it) ?: "<none>" })
+            Session(host, exitCode, read.associateWith { m.readText(it) ?: "<none>" }, promptFuel)
         }
     }
 
@@ -625,6 +649,104 @@ class ShellLineEditTest {
         )
         assertEquals(listOf(space, "$quote\"", dir, "exit").joinToString("\n", postfix = "\n"), s.files["/home/.sh_history"])
         assertEquals(3, s.text.count { it == '\u0007' }, s.text.takeLast(500))
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `長い行の貼り付けと、末尾のBackspaceの燃料は、行の長さにほぼ比例する`() {
+        // 1 文字ごとに行の頭から数え直したり、折り返し・Backspace のたびに行の全体を描き直したりすると、手間が行の長さの
+        // 2 乗になる（#993。直す前は、4 倍の長さの貼り付けで約 16 倍、末尾の位置を覚えるだけで約 12 倍の燃料だった）。
+        // 燃料の絶対値は sh のほかの変更で動くので、長さの違う行の比だけを見る（直した後は約 4 倍）
+        val steps = listOf(
+            ": " + "a".repeat(1000) + "\r",
+            ": " + "a".repeat(4000) + "\r",
+            ": " + "a".repeat(1000) + "\u007f".repeat(500) + "\r",
+            ": " + "a".repeat(4000) + "\u007f".repeat(2000) + "\r",
+            "exit\r",
+        )
+        val s = session(steps, splittable = true)
+        assertEquals(0, s.exitCode)
+        // steps を打つ直前ごとの燃料の差が、その行の燃料（プロンプトで待つ間は燃料を使わない）
+        val perLine = s.promptFuel.zipWithNext { a, b -> b - a }
+        assertEquals(4, perLine.size, "$perLine")
+        val (paste1, paste4, back1, back4) = perLine
+        assertTrue(paste4 < 6 * paste1, "貼り付けの燃料が長さに比例しない: $perLine")
+        assertTrue(back4 < 6 * back1, "末尾の Backspace の燃料が長さに比例しない: $perLine")
+    }
+
+    @Test
+    fun `行の末尾に足して右端で折り返す文字と、末尾のBackspaceは、描き直さなくても画面が崩れない`() {
+        val s = session(
+            listOf(
+                // 3 行に折り返した後、Backspace で行をまたいで 1 行目まで戻り、打ち足す
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(24) + "XY\r",
+                // 全角がちょうど右端の 2 セルに入る（保留の後の次の行の頭に、次の文字を足す）
+                "echo 01234567890あい\r",
+                // 全角が右端の 1 セルに入らず、次の行へ送られる
+                "echo 012345678901あ\r",
+                "exit\r",
+            ),
+            columns = 20,
+            rows = 25,
+        )
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789abX")
+        assertTrue(i >= 0, shown)
+        assertEquals(listOf("Y", "0123456789abXY"), rows.subList(i + 1, i + 3), shown)
+        assertEquals(listOf("$ echo 01234567890あ", "い", "01234567890あい"), rows.subList(i + 3, i + 6), shown)
+        assertEquals(listOf("$ echo 012345678901", "あ", "012345678901あ"), rows.subList(i + 6, i + 9), shown)
+        assertTrue(rows[i + 9].startsWith("$ exit"), shown)
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `行をまたぐ末尾のBackspaceの後に描き直しても、画面が崩れない`() {
+        // 描き直さない Backspace が、カーソルの行（描き直すときにプロンプトの頭へ戻る数）を正しく保つか（#993）。
+        // Backspace の後に ← と途中への挿入で描き直す。カーソルの行がずれていると、プロンプトの頭でない行から描き直して画面が崩れる
+        val s = session(
+            listOf(
+                // 3 行から 1 行目の右端の手前まで戻る（画面の行の頭の文字・保留の文字・同じ行の文字を消す）
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(24) + left + "Z\r",
+                // 1 行目の右端の保留（カーソルは 2 行目の頭）で止める
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(23) + left + "Z\r",
+                "exit\r",
+            ),
+            columns = 20,
+            rows = 25,
+        )
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789aZb")
+        assertTrue(i >= 0, shown)
+        assertEquals(
+            listOf("0123456789aZb", "$ echo 0123456789abZ", "c", "0123456789abZc"),
+            rows.subList(i + 1, i + 5),
+            shown,
+        )
+        assertTrue(rows[i + 5].startsWith("$ exit"), shown)
+        assertEquals(0, s.exitCode)
+    }
+
+    @Test
+    fun `プロンプトを出した後に画面の幅が変わっても、末尾に足す文字とBackspaceは新しい幅で書く`() {
+        // プロンプトは幅 80 で描き、打つ前に幅を 20 にする。描き直さない末尾への追加と Backspace も、書く前に幅を読み直す（#993）
+        val s = session(
+            listOf(
+                "echo 0123456789abcdefghijklmnopqrstuvwxyz" + "\u007f".repeat(24) + "XY\r",
+                "exit\r",
+            ),
+            columns = 20,
+            rows = 25,
+            consoleColumns = 80,
+            beforeStep = { i, m -> if (i == 0) m.resizeConsole(20, 25) },
+        )
+        val rows = s.host.rows()
+        val shown = rows.joinToString("\n")
+        val i = rows.indexOf("$ echo 0123456789abX")
+        assertTrue(i >= 0, shown)
+        assertEquals(listOf("Y", "0123456789abXY"), rows.subList(i + 1, i + 3), shown)
+        assertTrue(rows[i + 3].startsWith("$ exit"), shown)
         assertEquals(0, s.exitCode)
     }
 
