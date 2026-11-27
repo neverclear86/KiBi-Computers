@@ -234,10 +234,16 @@ object MachineRestoreGameTests {
      * 保存した世代から戻る（ID のないまま順番が来て冷えた起動にならない。#653 と同じ不具合）。待つ間は FULL に戻った経路
      * （`restorePromotedCase`）でも順番待ちに入らず、メインスレッドで `owner.bin` を読まない。
      * 確定の待ちは壁時計で打ち切る（[claimDecideWait]。#912）ので、tick の上限には、起動の分（[BOOT_TIMEOUT_TICKS]）に確定の待ちの分
-     * （[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足す
+     * （[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足す。
+     * 壁時計の待ち（[WallClockWait.pace]）はメインスレッドを 1 tick あたり最大 50 ms 眠らせ、同じバッチで並ぶテストの tick まで遅らせるので、
+     * ほかの `WallClockWait` のテストと同じく専用のバッチにする（既定のバッチの復元・起動のテストを巻き込まない）
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS)
+    @GameTest(
+        template = SmokeGameTests.EMPTY,
+        timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS,
+        batch = "claim_waited_restore",
+    )
     fun restoresACaseWhoseClaimWaitedForARead(helper: GameTestHelper) {
         val first = placeComputer(helper)
         var copy: CaseBlockEntity? = null
@@ -263,7 +269,8 @@ object MachineRestoreGameTests {
                 helper.assertTrue(be.lastClaim == null && be.currentIdentity == null, "a waiting case has no id yet")
                 // FULL に戻った経路が来ても、ID のないまま順番待ちに入れない（入れると冷えた起動になり、下の確かめが落ちる）
                 ServerMachines.restorePromotedCase(be)
-                // 確定は壁時計で待つ（#912。待つ間は動いているマシンがなく tick が全速で進むので、tick の数では読みが終わる前に尽きうる）。
+                // 確定は壁時計で待つ（#912。専用のバッチなので待つ間に動いているマシンがなく tick が全速で進み、tick の数では読みが
+                // 終わる前に尽きうる）。
                 // 上限を過ぎたら、診断を覚えて待ちを終える（次の thenExecute が落とす）
                 val w = wait ?: claimDecideWait().also { wait = it }
                 if (!w.pace()) {
@@ -276,7 +283,7 @@ object MachineRestoreGameTests {
         }.thenExecute {
             expired?.let { helper.fail("the waiting claim should be decided: $it") }
             val be = copy!!
-            helper.assertTrue(sawWaiting,"the claim should have waited for owner.bin")
+            helper.assertTrue(sawWaiting, "the claim should have waited for owner.bin")
             helper.assertTrue(be.lastClaim == ClaimResult.KEPT, "the case should keep its id but was ${be.lastClaim}")
             helper.assertTrue(WorldMachineSaves.current!!.mainOwnerReads == reads, "claim should not read owner.bin on the main thread")
             helper.assertTrue(

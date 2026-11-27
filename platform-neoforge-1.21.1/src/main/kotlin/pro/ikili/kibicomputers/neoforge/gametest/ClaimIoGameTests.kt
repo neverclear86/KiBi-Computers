@@ -238,7 +238,7 @@ object ClaimIoGameTests {
                     helper.assertTrue(c.isClaimDeferred, "the control claim should wait for owner.bin")
                     helper.assertTrue(
                         store.sideOwnerReadRequests - sideBefore == 2L,
-                        "both reads (and only those) should go to the side reader:${store.sideOwnerReadRequests - sideBefore}",
+                        "both reads (and only those) should go to the side reader: ${store.sideOwnerReadRequests - sideBefore}",
                     )
                     wait = claimDecideWait()
                     phase = 2
