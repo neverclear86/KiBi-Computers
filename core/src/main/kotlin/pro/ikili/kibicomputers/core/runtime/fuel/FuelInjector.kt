@@ -527,9 +527,9 @@ internal object FuelInjector {
                 // 長さを控えてから、GC のオブジェクトの RAM（#939）→ 燃料 → 元の命令の順。RAM で断ったら燃料は引かない
                 out.saveLength(ctx)
                 ctx.gc.dynamicBytes(ins)?.let { (perElement, fixed) -> out.gcAllocDynamic(ctx, perElement, fixed) }
-                // 要素セグメントの式が長いときは、要素 1 つの重みを掛ける（Endive は要素ごとに式を全部評価し直す）
-                val perElement = ctx.gc.elementFuel(ins)
-                if (perElement != null) out.chargeSavedTimes(ctx, perElement) else out.chargeSaved(ctx, shift)
+                out.chargeSaved(ctx, shift)
+                // 要素セグメントの式が長いときは、要素 1 つごとに長い分を足して引く（Endive は要素ごとに式を全部評価し直す）
+                ctx.gc.elementFuel(ins)?.let { extra -> out.chargeSavedTimes(ctx, extra) }
             }
             ctx.gc.staticBytes(ins)?.let { bytes -> out.gcAllocStatic(ctx, bytes) }
             if (op in GROW) out.saveSize(ctx, op, ins.operand(0))

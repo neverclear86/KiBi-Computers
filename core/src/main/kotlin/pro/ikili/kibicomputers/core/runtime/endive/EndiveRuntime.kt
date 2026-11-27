@@ -969,8 +969,10 @@ private class GcAllocations(private val budget: WasmTableBudget?) {
 /**
  * テーブルの要素1つが使う JVM のメモリ（バイト。#361）の見積もり。Endive は要素ごとに `int`（4）と
  * インスタンスへの参照（圧縮しない参照で 8）を持ち、GC の参照のテーブルはさらに値の参照（8）を持つ。
+ * i31ref を入れられるテーブル（anyref・eqref・i31ref・externref）は、要素ごとに `WasmI31Ref` 1 つ分（[GcCosts.I31_BYTES]。#939）を足す。
  */
-private fun tableElementBytes(table: Table): Long = if (table.elementType().isObjectRef()) 20L else 12L
+private fun tableElementBytes(table: Table): Long =
+    (if (table.elementType().isObjectRef()) 20L else 12L) + if (GcCosts.mayHoldI31(table.elementType())) GcCosts.I31_BYTES else 0L
 
 /**
  * [config] の上限で Endive のテーブルを作る（#361）。数えるテーブルは [created] に足す。

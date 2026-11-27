@@ -24,6 +24,8 @@ import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import pro.ikili.kibicomputers.core.runtime.endive.EndiveRuntime
 import pro.ikili.kibicomputers.core.wasi.kibi.WitTool
+import run.endive.wasm.Parser
+import run.endive.wasm.types.OpCode
 
 /**
  * GC のオブジェクト（struct・array）の確保を RAM と燃料に数える（#939。ADR 0048 の「GC のオブジェクト」、ADR 0028）。
@@ -68,7 +70,7 @@ class GcAllocationTest {
             for (export in listOf("bytes", "refs")) {
                 val memory = budget()
                 module.instantiate(config(memory)).use { inst ->
-                    // 8 バイト × 1,000,000（refs は 16 バイト）は 1 MiB を超える
+                    // 16 バイト × 1,000,000（refs は i31ref の分を足して 32 バイト）は 1 MiB を超える
                     val e = assertThrows<WasmTrapException>("$name $export") { inst.call(export, 1_000_000) }
                     assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name $export: ${e.message}")
                     assertEquals(0L, memory.usedBytes, "$name $export")
@@ -86,14 +88,14 @@ class GcAllocationTest {
             val memory = budget()
             module.instantiate(config(memory)).use { inst ->
                 assertEquals(1000L, inst.call("bytes", 1000).single(), name)
-                // 64 + 8 × 1,000 バイトを、64 KiB の前借りで数える
+                // 64 + 16 × 1,000 バイトを、64 KiB の前借りで数える
                 assertEquals(64L * 1024, memory.usedBytes, name)
                 // 前借りの残りで足りる間は増えない
                 assertEquals(10L, inst.call("refs", 10).single(), name)
                 assertEquals(64L * 1024, memory.usedBytes, name)
                 // 前借りの残りより大きい確保は、要る分を足す
-                assertEquals(100_000L, inst.call("bytes", 100_000).single(), name)
-                assertTrue(memory.usedBytes >= 64L + 8 * 1000 + 64 + 16 * 10 + 64 + 8 * 100_000, "$name ${memory.usedBytes}")
+                assertEquals(50_000L, inst.call("bytes", 50_000).single(), name)
+                assertTrue(memory.usedBytes >= 64L + 16 * 1000 + 64 + 32 * 10 + 64 + 16 * 50_000, "$name ${memory.usedBytes}")
                 assertNull(memory.lastRefusal, name)
             }
             assertEquals(0L, memory.usedBytes, name)
@@ -135,7 +137,8 @@ class GcAllocationTest {
                 val e = assertThrows<WasmTrapException>(name) { inst.call("f") }
                 assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
                 assertTrue(memory.usedBytes <= memory.limitBytes, name)
-                assertTrue(memory.usedBytes > memory.limitBytes - 64 * 1024 - 96, "$name ${memory.usedBytes}")
+                // struct 1 つは 64 + 16（i32）+ 32（anyref。i31ref の分を足す）= 112 バイト
+                assertTrue(memory.usedBytes > memory.limitBytes - 64 * 1024 - 112, "$name ${memory.usedBytes}")
             }
             assertEquals(0L, memory.usedBytes, name)
         }
@@ -355,11 +358,11 @@ class GcAllocationTest {
             val s5 = measure(module, tight(), "s5")
             val f3 = measure(module, tight(), "f3")
             val f5 = measure(module, tight(), "f5")
-            // 64 + 16 × フィールド、64 + 8 × 要素（i32 の配列）
+            // 64 + 16 × フィールド、64 + 16 × 要素（i32 の配列も、array.copy で後から Object[] が付きうるので 16）
             assertEquals(64L + 16 * 2, s2.first, "$name s2")
             assertEquals(64L + 16 * 5, s5.first, "$name s5")
-            assertEquals(64L + 8 * 3, f3.first, "$name f3")
-            assertEquals(64L + 8 * 5, f5.first, "$name f5")
+            assertEquals(64L + 16 * 3, f3.first, "$name f3")
+            assertEquals(64L + 16 * 5, f5.first, "$name f5")
             // フィールドが 3 つ増えると 3
             assertEquals(3L, s5.second - s2.second, name)
             // 要素が 2 つ増えると、i32.const が 2、array.new_fixed の要素の数の分が 2
@@ -383,7 +386,7 @@ class GcAllocationTest {
         forEachRuntime(bytes) { name, module ->
             val ten = measure(module, tight(), "d", 10)
             val five = measure(module, tight(), "d", 5)
-            assertEquals(64L + 8 * 10, ten.first, name)
+            assertEquals(64L + 16 * 10, ten.first, name)
             assertEquals(5L, ten.second - five.second, name)
             // データの範囲を超える長さでも、RAM を先に断る（Endive に大きな配列を作らせない）
             val memory = budget()
@@ -582,9 +585,9 @@ class GcAllocationTest {
         forEachRuntime(bytes) { name, module ->
             val memory = tight()
             module.instantiate(config(memory)).use { inst ->
-                // 64 KiB の前借りはマシンの RAM（5,000 バイト）を超えるので断られるが、64 + 8 × 100 は数えられる
+                // 64 KiB の前借りはマシンの RAM（5,000 バイト）を超えるので断られるが、64 + 16 × 100 は数えられる
                 assertEquals(100L, inst.call("bytes", 100).single(), name)
-                assertEquals(64L + 8 * 100, memory.usedBytes, name)
+                assertEquals(64L + 16 * 100, memory.usedBytes, name)
                 assertNull(memory.lastRefusal, name)
                 assertEquals(0, memory.refusalCount, name)
                 // 残りで足りないものは、前借りでなく本当の確保が断られたので記録する
@@ -592,7 +595,7 @@ class GcAllocationTest {
                 assertEquals(WasmTrapKind.OUT_OF_MEMORY, e.kind, "$name: ${e.message}")
                 assertEquals(MemoryRefusal.MACHINE, memory.lastRefusal, name)
                 assertEquals(1, memory.refusalCount, name)
-                assertEquals(64L + 8 * 100, memory.usedBytes, name)
+                assertEquals(64L + 16 * 100, memory.usedBytes, name)
             }
             assertEquals(0L, memory.usedBytes, name)
         }
@@ -688,5 +691,110 @@ class GcAllocationTest {
         )
         val e2 = assertThrows<WasmLoadException> { FuelInjector.inject(WitTool.wat(element), sharedGlobal = true) }
         assertTrue(e2.message!!.contains("要素セグメント"), e2.message)
+    }
+
+    @Test
+    fun `参照でない要素の配列も1要素16バイトで数え、定数式の配列からのarray_copyで後から付くObject配列の分を見込む`() {
+        // 定数式で作った配列は long[] と Object[] の両方を持つ。それを元にした array.copy は、コンパイルありの経路で
+        // コピー先（関数の本体で作った i32 の配列）にも全長の Object[] を作る
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %a (array (mut i32)))
+                  (global %src (ref %a) (array.new_fixed %a 2 (i32.const 7) (i32.const 8)))
+                  (func (export "copy") (param i32) (result i32)
+                    (local %d (ref null %a))
+                    (local.set %d (array.new_default %a (local.get 0)))
+                    (array.copy %a %a (local.get %d) (i32.const 0) (global.get %src) (i32.const 0) (i32.const 1))
+                    (array.get %a (local.get %d) (i32.const 0))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            val memory = tight(20_000)
+            module.instantiate(config(memory)).use { inst ->
+                // グローバルの配列は 64 + 16 × 2
+                assertEquals(64L + 16 * 2, memory.usedBytes, name)
+                assertEquals(7L, inst.call("copy", 100).single(), name)
+                // コピー先は 64 + 16 × 100（long[] と、後から付く Object[]）
+                assertEquals(64L + 16 * 2 + 64 + 16 * 100, memory.usedBytes, name)
+            }
+        }
+    }
+
+    @Test
+    fun `i31refを入れられるフィールド・要素・テーブルの要素は、WasmI31Refの分を足して数え、定数式のref_i31はその場で数える`() {
+        val bytes = metered(
+            w(
+                """
+                (module
+                  (type %any (struct (field anyref)))
+                  (type %eq (struct (field (ref null eq))))
+                  (type %con (struct (field (ref null %any))))
+                  (type %ia (array (mut i31ref)))
+                  (type %ea (array (mut externref)))
+                  (func (export "any") (drop (struct.new_default %any)))
+                  (func (export "eq") (drop (struct.new_default %eq)))
+                  (func (export "con") (drop (struct.new_default %con)))
+                  (func (export "i31s") (param i32) (drop (array.new_default %ia (local.get 0))))
+                  (func (export "externs") (param i32) (drop (array.new_default %ea (local.get 0)))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(bytes) { name, module ->
+            assertEquals(64L + 32, measure(module, tight(), "any").first, "$name any")
+            assertEquals(64L + 32, measure(module, tight(), "eq").first, "$name eq")
+            // 具体的な型の参照には i31ref を入れられない
+            assertEquals(64L + 16, measure(module, tight(), "con").first, "$name con")
+            assertEquals(64L + 32 * 10, measure(module, tight(), "i31s", 10).first, "$name i31s")
+            // extern.convert_any は i31ref をそのまま渡すので、externref にも入る
+            assertEquals(64L + 32 * 10, measure(module, tight(), "externs", 10).first, "$name externs")
+        }
+        // 定数式の ref.i31 と、anyref・funcref のテーブルの要素
+        val consts = metered(
+            w(
+                """
+                (module
+                  (table %ta 2 anyref)
+                  (table %tf 2 funcref)
+                  (global %g i31ref (ref.i31 (i32.const 5))))
+                """.trimIndent(),
+            ),
+        )
+        forEachRuntime(consts) { name, module ->
+            val memory = tight()
+            module.instantiate(config(memory)).use {
+                // ref.i31 が 16、anyref のテーブルの要素が (20 + 16) × 2、funcref のテーブルの要素が 12 × 2
+                assertEquals(16L + 36 * 2 + 12 * 2, memory.usedBytes, name)
+            }
+        }
+    }
+
+    @Test
+    fun `項目の式が長い要素セグメントの燃料は、基本の重みと別に、長い分だけを要素ごとの燃料にする`() {
+        val module = WitTool.wat(
+            w(
+                """
+                (module
+                  (type %ia (array (mut i31ref)))
+                  (table %t 4 i31ref)
+                  (elem %short i31ref (item (ref.null i31)))
+                  (elem %long i31ref ${longItem(5)})
+                  (func (export "f")
+                    (drop (array.new_elem %ia %long (i32.const 0) (i32.const 1)))
+                    (drop (array.new_elem %ia %short (i32.const 0) (i32.const 1)))
+                    (table.init %t %long (i32.const 0) (i32.const 0) (i32.const 1))))
+                """.trimIndent(),
+            ),
+        )
+        val plan = GcPlan(Parser.parse(module))
+        val body = Parser.parse(module).codeSection().functionBodies().single().instructions()
+        val newElems = body.filter { it.opcode() == OpCode.ARRAY_NEW_ELEM }
+        val tableInit = body.single { it.opcode() == OpCode.TABLE_INIT }
+        // 式は 12 命令（end を除く）。基本の重み（シフトの分）は含めず、長さ 1 を超える 11 だけ
+        assertEquals(11L, plan.elementFuel(newElems[0]))
+        assertNull(plan.elementFuel(newElems[1]))
+        assertEquals(11L, plan.elementFuel(tableInit))
     }
 }
