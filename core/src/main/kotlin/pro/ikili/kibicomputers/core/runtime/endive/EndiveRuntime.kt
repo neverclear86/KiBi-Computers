@@ -30,6 +30,7 @@ import pro.ikili.kibicomputers.core.runtime.WasmTableBudget
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
 import pro.ikili.kibicomputers.core.runtime.WasmValueType
+import pro.ikili.kibicomputers.core.runtime.fuel.GcCosts
 import pro.ikili.kibicomputers.core.runtime.validation.LoadDeadline
 import run.endive.compiler.InterpreterFallback
 import run.endive.compiler.MachineFactoryCompiler
@@ -94,6 +95,7 @@ import run.endive.wasm.WasmModule as EndiveModule
  *
  * テーブル（#361）も同じように、作るときに要素数の上限を縮め（[WasmInstanceConfig.maxTableElements]）、
  * [WasmInstanceConfig.tableBudget] があれば、要素数 × 要素1つのバイト数を数える（[BudgetedTable]）。
+ * GC のオブジェクト（struct・array）も、作る前に [WasmInstanceConfig.tableBudget] に数える（#939。[GcAllocations]）。
  */
 @ApiStatus.Internal
 public class EndiveRuntime internal constructor(
@@ -904,10 +906,73 @@ private class BudgetedTable(
 }
 
 /**
+ * インスタンスが作った GC のオブジェクト（struct・array）の RAM の勘定（#939。ADR 0048 の「GC のオブジェクト」）。
+ *
+ * 計測コードが、オブジェクトを作る命令の前に `kibi.gc_alloc` でバイト数（[GcCosts] の見積もり）を渡し、ここで [budget] に数える。
+ * 断られたら、Endive に作らせずにトラップで止める（失敗した確保は数えない。#335 と同じ）。インスタンスを作るときの定数式の分も、作る前にここで数える。
+ *
+ * 数えた分は、オブジェクトが要らなくなっても返さず、インスタンスを閉じたとき（作るのに失敗したときも）に [releaseAll] でまとめて返す
+ * （ADR 0048 の「解放しても減らさない」と同じ。GC のオブジェクトは状態の保存をまたがないので、作り直したインスタンスは 0 から数え直す）。
+ *
+ * 確保のたびにプロセス → マシン → サーバー全体の 3 段の CAS を回さないよう、足りなくなったら [PREFETCH_BYTES] ずつ前借りし（断られても
+ * 断った記録を残さない [WasmTableBudget.tryPrefetchBytes]）、前借りできなければ要る分だけを数える。前借りの残りはホストの側に持ち、
+ * WASM のグローバルには置かない（状態の保存が可変のグローバルを写すため）。
+ *
+ * [budget] が `null`（テスト）なら数えないが、[UNBUDGETED_MAX_BYTES] 以上の 1 回の確保は断る（Endive に負の長さを渡さない）。
+ * `close()` と確保は別のスレッドから重なりうる（kill など）ので、どちらも同期し、閉じた後の確保は断る（数えると二度と返らない）
+ */
+private class GcAllocations(private val budget: WasmTableBudget?) {
+    /** [budget] から数えたバイト数（前借りの残りを含む）。閉じたら -1 */
+    private var reserved = 0L
+
+    /** 前借りの残り */
+    private var credit = 0L
+
+    /** [bytes] バイトを数えられれば `true`。断られたら、閉じた後なら、または負なら何も数えずに `false` */
+    @Synchronized
+    fun allocate(bytes: Long): Boolean {
+        if (bytes < 0 || reserved < 0) return false
+        if (budget == null) return bytes < UNBUDGETED_MAX_BYTES
+        if (bytes <= credit) {
+            credit -= bytes
+            return true
+        }
+        val need = bytes - credit
+        if (need < PREFETCH_BYTES && budget.tryPrefetchBytes(PREFETCH_BYTES)) {
+            reserved += PREFETCH_BYTES
+            credit = PREFETCH_BYTES - need
+            return true
+        }
+        if (!budget.tryReserveBytes(need)) return false
+        reserved += need
+        credit = 0
+        return true
+    }
+
+    /** 数えた分をすべて返す。以後の確保は断る。2回呼んでもよい */
+    @Synchronized
+    fun releaseAll() {
+        if (reserved > 0) budget?.releaseBytes(reserved)
+        reserved = -1
+        credit = 0
+    }
+
+    companion object {
+        /** 前借りの単位（64 KiB） */
+        const val PREFETCH_BYTES: Long = 64L * 1024
+
+        /** 数えないとき（テスト）に断る 1 回の確保の大きさ（16 GiB。長さ 2^31 以上の配列は必ずこれを超える） */
+        const val UNBUDGETED_MAX_BYTES: Long = 1L shl 34
+    }
+}
+
+/**
  * テーブルの要素1つが使う JVM のメモリ（バイト。#361）の見積もり。Endive は要素ごとに `int`（4）と
  * インスタンスへの参照（圧縮しない参照で 8）を持ち、GC の参照のテーブルはさらに値の参照（8）を持つ。
+ * i31ref を入れられるテーブル（anyref・eqref・i31ref・externref）は、要素ごとに `WasmI31Ref` 1 つ分（[GcCosts.I31_BYTES]。#939）を足す。
  */
-private fun tableElementBytes(table: Table): Long = if (table.elementType().isObjectRef()) 20L else 12L
+private fun tableElementBytes(table: Table): Long =
+    (if (table.elementType().isObjectRef()) 20L else 12L) + if (GcCosts.mayHoldI31(table.elementType())) GcCosts.I31_BYTES else 0L
 
 /**
  * [config] の上限で Endive のテーブルを作る（#361）。数えるテーブルは [created] に足す。
@@ -1086,6 +1151,13 @@ private fun rethrow(e: Throwable): Nothing {
 /** RAM の上限を超えた書き込み（[RamExhausted]）のトラップ（#407） */
 private fun outOfMemory(e: RamExhausted): WasmTrapException = WasmTrapException(WasmTrapKind.OUT_OF_MEMORY, e.message ?: "out of memory", e)
 
+/** GC のオブジェクト（[bytes] バイト）を RAM に数えられなかったトラップ（#939） */
+private fun gcOutOfMemory(bytes: Long): WasmTrapException =
+    WasmTrapException(WasmTrapKind.OUT_OF_MEMORY, "out of memory: RAM の上限を超えて GC のオブジェクト（${bytes.toULong()} バイト）を作ろうとした")
+
+/** `kibi.gc_alloc` の戻り値（使わない。#939） */
+private val GC_ALLOC_RESULT = longArrayOf(0)
+
 /** Endive のトラップのメッセージから種類を決める。詳しい扱いは #41。 */
 internal fun trapKind(message: String): WasmTrapKind {
     val m = message.lowercase()
@@ -1133,6 +1205,16 @@ private class EndiveWasmModule(
     private val fuelGlobalIndex: Int
 
     override val isAsyncified: Boolean
+
+    /** GC のオブジェクトを作る前に RAM に数える import（[WasmFuel.GC_ALLOC_NAME]。#939）を持つか */
+    private val countsGcAllocations: Boolean
+
+    /**
+     * インスタンスを作るときに定数式（グローバルの初期値・アクティブの要素の式）が作る GC のオブジェクトのバイト数（#939。[GcCosts.estimate]）。
+     * 作る前に数える。燃料を計測しないモジュール（テスト）は数えない（0）
+     */
+    private val instantiateGcBytes: Long
+
     override val imports: List<WasmImportDescriptor>
     override val exports: List<WasmExportDescriptor>
 
@@ -1202,7 +1284,16 @@ private class EndiveWasmModule(
             if (!isAsyncified || !isFuelMetered) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} は燃料を計測し、待機点に変換したモジュールだけが持てる")
             if (asyncFuelImport.functionType != WasmAsync.FUEL_TYPE) throw WasmLoadException("${WasmAsync.IMPORT_MODULE}.${WasmAsync.FUEL} の型が違う")
         }
-        val hidden = listOfNotNull(fuelImport, fuelExport, fuelGlobalImport, pushImport, popImport, stateExport, asyncFuelImport)
+        // GC のオブジェクトの確保（#939）: 燃料を計測するモジュールだけが持てる（計測コードの挿入が足す）
+        val gcImport = rawImports.firstOrNull { it.module == WasmFuel.IMPORT_MODULE && it.name == WasmFuel.GC_ALLOC_NAME }
+        if (gcImport != null) {
+            if (!isFuelMetered) throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.GC_ALLOC_NAME} は燃料を計測するモジュールだけが持てる")
+            if (gcImport.functionType != WasmFuel.IMPORT_TYPE) throw WasmLoadException("${WasmFuel.IMPORT_MODULE}.${WasmFuel.GC_ALLOC_NAME} の型が違う")
+        }
+        countsGcAllocations = gcImport != null
+        // 大きさを決められない定数式は、計測コードの挿入がもう断っている（ここでも同じ理由で断る）
+        instantiateGcBytes = if (isFuelMetered) GcCosts.estimate(module).instantiateBytes else 0L
+        val hidden = listOfNotNull(fuelImport, fuelExport, fuelGlobalImport, pushImport, popImport, stateExport, asyncFuelImport, gcImport)
         imports = rawImports.filter { imp -> hidden.none { it === imp } }
         exports = rawExports.filter { exp -> hidden.none { it === exp } }
     }
@@ -1241,6 +1332,10 @@ private class EndiveWasmModule(
                 values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> longArrayOf(wrapper.fuelExhausted(args[0])) })
                 continue
             }
+            if (countsGcAllocations && imp.module == WasmFuel.IMPORT_MODULE && imp.name == WasmFuel.GC_ALLOC_NAME) {
+                values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> wrapper.gcAllocate(args[0]); GC_ALLOC_RESULT })
+                continue
+            }
             if (isAsyncified && imp.module == WasmAsync.IMPORT_MODULE && imp.name == WasmAsync.FUEL) {
                 values.addFunction(hostFunction(imp.module, imp.name, type, wrapper) { args -> longArrayOf(wrapper.fuelExhaustedUnwindable(args[0])) })
                 continue
@@ -1269,6 +1364,13 @@ private class EndiveWasmModule(
             val value = if (globalIndex++ == fuelIndex) config.initialFuel else low
             GlobalInstance(value, high, type, mutability)
         }
+        // GC のオブジェクト（#939）: 定数式が作る分を、Endive に作らせる前に数える（作るのに失敗したら、数えた分を返す）
+        val gc = GcAllocations(config.tableBudget)
+        wrapper.gcAllocations = gc
+        if (instantiateGcBytes > 0 && !gc.allocate(instantiateGcBytes)) {
+            gc.releaseAll()
+            throw WasmLinkException("インスタンスを作れない: 初期値の GC のオブジェクトの ${instantiateGcBytes.toULong()} バイトを確保できない（RAM が足りない）")
+        }
         // 数えるメモリ（作るのに失敗したら、確保した分を返す）
         val memories = ArrayList<ReleasableMemory>(1)
         wrapper.budgetedMemories = memories
@@ -1287,6 +1389,7 @@ private class EndiveWasmModule(
         } catch (e: Throwable) {
             memories.forEach { it.releaseAll() }
             tables.forEach { it.releaseAll() }
+            gc.releaseAll()
             translateInstantiateFailure(e)
         }
         wrapper.attach(instance)
@@ -1382,6 +1485,15 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
 
     /** 数えるテーブル（#361。閉じたときに確保した分を返す） */
     var budgetedTables: List<BudgetedTable> = emptyList()
+
+    /** GC のオブジェクトの勘定（#939。閉じたときに数えた分を返す） */
+    var gcAllocations: GcAllocations? = null
+
+    /** GC のオブジェクトを作る前に、[bytes] バイトを RAM に数える（`kibi.gc_alloc`。#939）。数えられなければ [WasmTrapKind.OUT_OF_MEMORY] のトラップ */
+    fun gcAllocate(bytes: Long) {
+        val gc = checkNotNull(gcAllocations) { "GC のオブジェクトの勘定がない" }
+        if (!gc.allocate(bytes)) throw gcOutOfMemory(bytes)
+    }
 
     /** export の関数（名前ごとに1回だけ引く） */
     private val exportFunctions = HashMap<String, ExportFunction>()
@@ -1614,6 +1726,7 @@ private class EndiveWasmInstance(override val module: EndiveWasmModule, private 
         } finally {
             budgetedMemories.forEach { it.releaseAll() }
             budgetedTables.forEach { it.releaseAll() }
+            gcAllocations?.releaseAll()
         }
     }
 }

@@ -189,7 +189,15 @@ step の途中で燃料が尽きたときも、止まりうる関数の中なら
 - **止まりうる関数の本体の GC の命令**: 待ち点を含むブロックの直下にある GC の命令（`struct.new`・`struct.get`・`array.*` など）は、型の追跡（`effect`）が対応していない命令として `AsyncifyUnsupported`（「命令 …（SIMD・アトミック・GC などの拡張）には対応していない」）で断る。待ち点を含まない入れ子のブロックの中の GC の命令は、`emitPlain` がそのまま写すので動く（`br_on_cast` などの分岐は断る）。structref・anyref などの値が待ち点をまたぐと、一時ローカルに移され、巻き戻しで null でなければ `unreachable` で止まる（参照は保存できない。null なら巻き直せる）。
 - **`ref.null` の型の番号**: `effect` は `ref.null` のヒープ型を、抽象ヒープ型（1 バイトの負の数。略記のバイトと同じ番号）なら型として積み、型の番号（`ref.null $s`）は型を追えない参照（`BOT`）として積む。後者の値が待ち点をまたぐ（一時ローカルに移す）と、`newLocal` が「型付きの参照型 … の値を持ったまま待つことには対応していない」で `AsyncifyUnsupported` にする。今までは型の番号の先頭のバイトをそのまま型として積んでいたので、型 0x00 のローカルを宣言した正しくない出力になり、読み込みの検証の失敗（`unsuspendableReason` が `null`）になっていた。関数の型の番号の `ref.null $f` では前からある形で、struct・array の型でも届くようになった。待ち点をまたがない `ref.null $s` は今までどおり動く。
 - **型付きの `select`（0x1C）の注釈**も `ref.null` と同じに扱う。注釈の型が `(ref null <抽象ヒープ型>)` なら略記のバイト（`(ref null struct)` は structref）にし、`(ref null $s)`・`(ref $s)`・`(ref struct)`（型の番号のもの、null を許さないもの）は `BOT` にして、待ち点をまたぐと同じ文言で `AsyncifyUnsupported` にする。今までは注釈の先頭のバイト（0x63・0x64）をそのまま型として積んでいたので、ヒープ型のない 0x63 のローカルを宣言した正しくない出力になっていた（`ref.null` と同じく読み込みの検証の失敗）。型付きの参照型は関数の型・グローバル・テーブルになくても本体の中で作れるので、`untypedReason` では届かない。出力が変わるのは今まで正しくない出力になっていた形だけなので、`Instrumentation.VERSION` は上げない（`ref.null` の直しと同じ）。
-- **GC のオブジェクトの確保は、RAM にも燃料にも数えない**。Endive 1.2.0 の `array.new`・`array.new_default` は長さそのままで JVM のヒープに確保し（`BudgetedMemory`・`BudgetedTable` を通らない）、`FuelInjector` の長さに比例する課金は `memory.*`・`table.*` だけで、`array.new*`・`array.fill`・`array.copy` は燃料 1。この変更で、p1 のプログラムがコンピューターの RAM の上限と無関係に JVM のヒープを取れるようになる（ソースを読んだもので、動かして測っていない）。別の Issue（#939）にした。
+- **GC のオブジェクトの確保は、RAM にも燃料にも数えない**（#939 で数えるようにした。下の「追記（#939）」）。Endive 1.2.0 の `array.new`・`array.new_default` は長さそのままで JVM のヒープに確保し（`BudgetedMemory`・`BudgetedTable` を通らない）、`FuelInjector` の長さに比例する課金は `memory.*`・`table.*` だけで、`array.new*`・`array.fill`・`array.copy` は燃料 1。この変更で、p1 のプログラムがコンピューターの RAM の上限と無関係に JVM のヒープを取れるようになる（ソースを読んだもので、動かして測っていない）。別の Issue（#939）にした。
+
+### 追記（#939）: GC のオブジェクトの確保を RAM と燃料に数える
+
+上の #891 の追記の最後の項目（「GC のオブジェクトの確保は、RAM にも燃料にも数えない」）は、#939 で次のように変わった（方式の一次情報は ADR 0048 の「GC のオブジェクト」と ADR 0028 の「実装（#38）」の重み）。
+
+- `FuelInjector` が、GC のオブジェクトを作る命令の前に、隠した import `kibi.gc_alloc` でバイト数を RAM に数える呼び出しを足し、`array.new*`・`array.fill`・`array.copy`・`array.init_data`・`array.init_elem` の燃料を長さに比例させる。作る命令を持つモジュールだけ import が 2 つ（`kibi.fuel`・`kibi.gc_alloc`）になり、定義済みの関数の番号が 2 つずれる（`FuelInjector.Result.originalFunc` が戻す）。待機点への変換は、`kibi.gc_alloc` を止まらない import として扱う（待つ import の集合に入れない）。足すコードは MVP の命令（`local.tee`・`i64.*`・`call`・`drop`）だけなので、止まりうる関数の断りの条件は変わらない。待ち点を含まない入れ子のブロックで作るオブジェクトが、巻き戻しと巻き直しで正しく動くことを確かめた（`GcAllocationTest`）
+- 出力が変わる（GC のオブジェクトを作る命令を持つモジュールだけ）ので、`Instrumentation.VERSION` を 4 → 5 にした。保存済みの計測ありのプロセスは一度だけ `MODULE_MISMATCH` の冷えた起動になる（保存形式は変えない。#924 と同じ手順）
+- 確保した分は、インスタンスを閉じるまで返さない。GC のオブジェクトは待ち点の保存をまたがない（上の #851・#891 の追記の `captureState` の断り）ので、作り直したインスタンスは 0 から数え直す
 
 ### 追記（#893）: パッシブ・宣言の要素セグメントの式の検証
 
