@@ -1,5 +1,6 @@
 package pro.ikili.kibicomputers.core.runtime.endive
 
+import pro.ikili.kibicomputers.core.runtime.InterpreterReason
 import java.util.concurrent.atomic.AtomicLongArray
 
 /**
@@ -8,39 +9,18 @@ import java.util.concurrent.atomic.AtomicLongArray
  * コンパイルは中身の SHA-256 ごとに1回（`ProgramCache`）だが、プレイヤーはバイト列を少し変えて exec し直せば、何度でもコンパイルさせられる。
  * 1回ごとに WARNING を出すとログが埋まるので（ADR 0088 の「ログと数え口」、ADR 0044・0065 と同じ方針）:
  *
- * - 理由（[Reason]）ごとに、最初の1回だけ WARNING。2回目からは DEBUG に出す（何回目かを添える）
- * - 理由は決まった数しかないので、覚える数の上限は要らない（[Reason] の数だけ）
+ * - 理由（[InterpreterReason]）ごとに、最初の1回だけ WARNING。2回目からは DEBUG に出す（何回目かを添える）
+ * - 理由は決まった数しかないので、覚える数の上限は要らない（[InterpreterReason] の数だけ）
  * - JVM 全体で1つ（[EndiveRuntime] の companion が持つ）。サーバーの起動ごとには作り直さない（開発クライアントで統合サーバーを
  *   立て直しても、2回目のサーバーでは WARNING が出ない。DEBUG には出る）
  *
  * どのスレッドから呼んでもよい（コンパイル用のスレッド・MOD の初期化・テスト）。
  */
 internal class CompileFallbackLog(private val log: System.Logger) {
-    /** インタプリタで動かす理由 */
-    internal enum class Reason {
-        /** 関数の型（または struct のフィールド・array の要素。#891）に v128 があって、モジュール全体をインタプリタで動かす */
-        V128_SIGNATURE,
-
-        /** 例外処理を使うモジュールの関数が SIMD を使っていて、モジュール全体をインタプリタで動かす */
-        SIMD_WITH_EXCEPTIONS,
-
-        /** SIMD を使う関数だけをインタプリタで動かす（#424。SIMD を使うモジュールなら毎回起きる普通の経路） */
-        SIMD_FUNCTIONS,
-
-        /**
-         * JVM のメソッドの上限を超える関数（とそこから末尾呼び出しで届く関数、SIMD を使う関数）をインタプリタで動かす（#446・#680）。
-         * 性能の苦情を調べる手がかりなので、[SIMD_FUNCTIONS] とは分けて数える（SIMD のモジュールが先に読まれても、この最初の1回は WARNING になる）
-         */
-        TOO_LARGE_FUNCTIONS,
-
-        /** コンパイルに失敗して、モジュール全体をインタプリタで動かす */
-        WHOLE_MODULE,
-    }
-
-    private val counts = AtomicLongArray(Reason.entries.size)
+    private val counts = AtomicLongArray(InterpreterReason.entries.size)
 
     /** [reason] でインタプリタに回した。[message] は、出すときだけ作る */
-    fun report(reason: Reason, message: () -> String) {
+    fun report(reason: InterpreterReason, message: () -> String) {
         val n = counts.incrementAndGet(reason.ordinal)
         if (n == 1L) {
             log.log(System.Logger.Level.WARNING, message() + "。同じ理由の2回目からは DEBUG に出す")
@@ -49,6 +29,10 @@ internal class CompileFallbackLog(private val log: System.Logger) {
         }
     }
 
-    /** [reason] で報告した回数（テスト用） */
-    fun count(reason: Reason): Long = counts.get(reason.ordinal)
+    /**
+     * [reason] で報告した回数（#931。運用者の数え口 `InterpreterCounts` が読む）。JVM 全体の累計で、reset しない（読む側が差を取る）。
+     * 数えるのはコンパイルした回数で、プログラムの数ではない（燃料の計測の有無・止まりうる import が違う読み込み、キャッシュから外れた後の
+     * 読み込み直し、復元のための読み込みは、同じプログラムでも別に数える。コンポーネントは中の core モジュールごとに数える）
+     */
+    fun count(reason: InterpreterReason): Long = counts.get(reason.ordinal)
 }
