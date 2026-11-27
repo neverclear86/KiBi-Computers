@@ -19,6 +19,8 @@ import pro.ikili.kibicomputers.core.kernel.obj.HandleRights
 import pro.ikili.kibicomputers.core.kernel.process.KernelDrivers
 import pro.ikili.kibicomputers.core.kernel.process.ProcessState
 import pro.ikili.kibicomputers.core.kernel.process.SpawnOptions
+import pro.ikili.kibicomputers.core.kernel.time.ManualClock
+import pro.ikili.kibicomputers.core.kernel.time.ManualTimerService
 import pro.ikili.kibicomputers.core.kernel.vfs.OpenOptions
 import pro.ikili.kibicomputers.core.kernel.vfs.TestMemoryFileSystem
 import pro.ikili.kibicomputers.core.kernel.vfs.VfsPath
@@ -36,6 +38,12 @@ class LuaKibiApiTest {
     private val limit = Duration.ofSeconds(120)
 
     private companion object {
+        /** 手で進める時計を、待っている間に 1 回に進める長さ（#992）。`os.sleep(0.3)` の間にも tick が何回も回るように、Lua の最短の待ち（50 ms）にそろえる */
+        const val CLOCK_STEP_NANOS = 50_000_000L
+
+        /** [Run.squeeze] が、目的の sleep で待っているとみなす、次の期限までの長さの下限（#992） */
+        const val SQUEEZE_MIN_SLEEP_NANOS = 1_000_000_000L
+
         const val ADDRESS = "00000000-0000-4000-8000-0000000000a1"
         const val OTHER = "00000000-0000-4000-8000-0000000000a2"
     }
@@ -114,7 +122,6 @@ class LuaKibiApiTest {
 
     private inner class Run(
         script: String,
-        val h: Harness = Harness(execRuntime = EndiveRuntime()),
         memoryBytes: Long? = null,
         environment: MachineEnvironment = MachineEnvironment.DEFAULT,
         maxHostCallsPerTick: Int = 64,
@@ -129,12 +136,30 @@ class LuaKibiApiTest {
         private val tickOnlyWhileWaiting: Boolean = false,
         /** マシンのコンソール出力（プロセスが終わるときの注記など）を受けたいときに渡す */
         host: MachineHost? = null,
+        /**
+         * true なら、本物のタイマーのスレッドの代わりに手で進める時計（[ManualClock]・[ManualTimerService]）を使う（#992）。
+         * マシンの時計（[MachineEnvironment.clock]）とスケジューラのタイマーを同じ時計で組にする（片方だけだと、Lua が読む時刻と
+         * タイマーの期限が食い違って待ち直し続ける）。時計は [waitUntil]・[waitFor]・[finish] が、プロセスがイベントを待つ待機点にいる
+         * 間だけ [CLOCK_STEP_NANOS] ずつ（期限が近ければ期限ちょうどまで）進める。[squeeze] は進めない（予約の窓を飛ばさない）。
+         * 本物の時間が流れることに頼るテストでは使わない。[environment] とは組にできない
+         */
+        manualTime: Boolean = false,
     ) : AutoCloseable {
         init {
             require(!tickOnlyWhileWaiting || maxHostCallsPerTick == 1) { "tickOnlyWhileWaiting は maxHostCallsPerTick = 1 と組にする" }
+            require(!manualTime || environment === MachineEnvironment.DEFAULT) { "manualTime は environment の時計と組にできない" }
         }
 
-        val m: Machine = h.machine(fuelPerTick = 10_000_000, host = host, memoryBytes = memoryBytes, environment = environment, maxHostCallsPerTick = maxHostCallsPerTick)
+        /** 手で進めるタイマー（[manualTime] のときだけ） */
+        val timers: ManualTimerService? = if (manualTime) ManualTimerService(ManualClock()) else null
+        val h: Harness = Harness(execRuntime = EndiveRuntime(), timers = timers)
+        val m: Machine = h.machine(
+            fuelPerTick = 10_000_000,
+            host = host,
+            memoryBytes = memoryBytes,
+            environment = timers?.let { MachineEnvironment.builder().clock(it.clock).build() } ?: environment,
+            maxHostCallsPerTick = maxHostCallsPerTick,
+        )
         val dev = TestDev()
         private val output: Int
         private val text = StringBuilder()
@@ -172,11 +197,25 @@ class LuaKibiApiTest {
                 m.fuelWaiterCount > 0
         }
 
-        fun waitUntil(message: String, condition: () -> Boolean) = eventually(60_000, message) {
+        /**
+         * [condition] がそろうまで tick を進めて待つ。[manualTime] のときは、そろわないまま、プロセスがイベントを待つ待機点にいれば
+         * 時計を 1 歩進める（[advanceClock] が false なら進めない）。条件を見てから進めるので、待ちの前に出した行を見る前に進むのは、
+         * 行を書いてから次の drain までの 1 歩（[CLOCK_STEP_NANOS]）だけ
+         */
+        fun waitUntil(message: String, advanceClock: Boolean = true, condition: () -> Boolean) = eventually(60_000, message) {
             if (shouldTick()) h.scheduler.tick()
             Thread.sleep(1)
             drain()
-            condition()
+            condition().also { if (!it && advanceClock) stepClockWhileWaiting() }
+        }
+
+        /** [manualTime] のとき、プロセスがイベントを待つ待機点にいて、タイマーの予定があれば、時計を 1 歩進める（#992） */
+        private fun stepClockWhileWaiting() {
+            val t = timers ?: return
+            if (m.stateOf(pid) != ProcessState.WAITING_EVENT || !m.isAtWaitPoint) return
+            val next = t.nanosToNextDue() ?: return
+            // m.lock の外から呼ぶ（期限の仕事 onTimerDue が中でロックを取る）
+            t.advance(minOf(next, CLOCK_STEP_NANOS))
         }
 
         /** このプロセスが持つ device・pending-call の fd の数 */
@@ -230,7 +269,12 @@ class LuaKibiApiTest {
          * 予約したバイト数を返す（[release] で戻す）。待っている間は Lua が書かないので、起きた後の残りが決まる
          */
         fun squeeze(remaining: Long): Long {
-            waitUntil("待たない: $text") { m.stateOf(pid) == ProcessState.WAITING_EVENT }
+            // 手で進める時計では、目的の長い os.sleep（期限が 1 秒以上先）で待っていることも見る（それより前の短い待ちで予約しない）。
+            // ここでは時計を進めない（予約の前に sleep が明けると、残りを決める前に Lua が動く）
+            waitUntil("待たない: $text（${m.stateOf(pid)}）", advanceClock = false) {
+                m.stateOf(pid) == ProcessState.WAITING_EVENT &&
+                    (timers == null || (m.isAtWaitPoint && (timers.nanosToNextDue() ?: 0) >= SQUEEZE_MIN_SLEEP_NANOS))
+            }
             val account = m.memoryAccount
             val bytes = account.limitBytes - account.usedBytes - remaining
             assertTrue(bytes >= 0 && account.tryReserveBytes(bytes), "残りを $remaining にできない: ${account.usedBytes}")
@@ -726,9 +770,10 @@ class LuaKibiApiTest {
 
     @Test
     fun `コルーチンの中のsleepはtimerをyieldし、idが合うまで待つ`() = timeout(limit) {
+        // 待ちは本物のタイマーで短く（0.05 秒）する。偽の timer で resume するのは同期で済み、id の照合は待ちの長さによらない（#992）
         val out = run(
             """
-            local co = coroutine.create(function() os.sleep(1); return "woke" end)
+            local co = coroutine.create(function() os.sleep(0.05); return "woke" end)
             local ok, f = coroutine.resume(co)
             print(ok, f)
             print(coroutine.resume(co, "timer", 12345))
@@ -745,9 +790,10 @@ class LuaKibiApiTest {
 
     @Test
     fun `コルーチンの中のsleepはtimerのidがfloatで来ても合う`() = timeout(limit) {
+        // 待ちは本物のタイマーで短く（0.05 秒）する（#992）
         val out = run(
             """
-            local co = coroutine.create(function() os.sleep(1); return "woke" end)
+            local co = coroutine.create(function() os.sleep(0.05); return "woke" end)
             coroutine.resume(co)
             local _, id = os.pullEvent("timer")
             print(math.type(id), math.type(id + 0.0))
@@ -932,6 +978,7 @@ class LuaKibiApiTest {
             os.sleep(2)
             """.trimIndent(),
             memoryBytes = 512 * 1024L,
+            manualTime = true,
         ).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(76 * 1024)
@@ -974,6 +1021,7 @@ class LuaKibiApiTest {
             os.sleep(2)
             """.trimIndent(),
             memoryBytes = 512 * 1024L,
+            manualTime = true,
         ).use { r ->
             r.waitFor("started\n")
             r.waitUntil("2つの呼び出しが来ない") { r.dev.gates.size == 2 }
@@ -1044,7 +1092,7 @@ class LuaKibiApiTest {
             collectgarbage()
             print("done")
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
             // CRASHED にならず、Lua として終わる。ループの回数と、pullEventRaw が1回でも通ったかを見る
@@ -1074,7 +1122,7 @@ class LuaKibiApiTest {
                 pc(pe)
             end
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
             // finish は EXITED でなければ落ちる（Lua のエラーで終わっても EXITED）
@@ -1115,7 +1163,7 @@ class LuaKibiApiTest {
                 synchronized(console) { console.append(String(bytes, Charsets.UTF_8)) }
             }
         }
-        Run(script, memoryBytes = 512 * 1024L, host = host).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, host = host, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
             val out = r.finish()
@@ -1161,7 +1209,7 @@ class LuaKibiApiTest {
             io.stdout:write(hole and "hole-reused\n" or "hole-refused\n")
             io.stdout:flush()
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
             val out = r.finish()
@@ -1197,7 +1245,7 @@ class LuaKibiApiTest {
             for i = 1, 3 do pc(deep, 20) end
             print("done")
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(remainingKib * 1024)
             val out = r.finish()
@@ -1269,7 +1317,7 @@ class LuaKibiApiTest {
             end
             print(ok, err, big, dropped)
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val text = DeviceValue.of("e".repeat(4000))
             repeat(40) { assertTrue(r.dev.context!!.postEvent("big", text)) }
@@ -1604,7 +1652,7 @@ class LuaKibiApiTest {
             local ok, v = pc(call, addr, echo, 7)
             print(refused, ok, v)
         """.trimIndent()
-        Run(script, memoryBytes = 512 * 1024L).use { r ->
+        Run(script, memoryBytes = 512 * 1024L, manualTime = true).use { r ->
             r.waitFor("ready\n")
             val held = r.squeeze(40 * 1024)
             val out = r.finish()
