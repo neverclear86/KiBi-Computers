@@ -1579,14 +1579,106 @@ class ComponentLoaderTest {
             (alias core export ${'$'}mi "r" (core func ${'$'}r))
         """.trimIndent()
         fun lowers(n: Int, options: String) = (0 until n).joinToString(" ") { "(core func (canon lower (func ${'$'}f) (memory ${'$'}mem)$options))" }
-        // 関数の型は 1 + 結果の tuple（52 万ノード）。1 回 32,768 単位
-        assertEquals(32_768L, scanDelta(prelude, lowers(1, "")))
-        assertEquals(10 * 32_768L, scanDelta(prelude, lowers(10, "")))
-        // realloc があれば、wasmparser は結果の型を確かめない
-        assertEquals(0L, scanDelta(prelude, lowers(10, " (realloc ${'$'}r)")))
+        // 関数の型は 1 + 結果の tuple（52 万ノード）。core の関数の型を作るたどり（push_wasm_types）と contains_ptr の 2 回で、
+        // 1 回 65,536 単位
+        assertEquals(65_536L, scanDelta(prelude, lowers(1, "")))
+        assertEquals(10 * 65_536L, scanDelta(prelude, lowers(10, "")))
+        // realloc があれば、contains_ptr では確かめない（core の関数の型を作るたどりの 1 回だけ）
+        assertEquals(10 * 32_768L, scanDelta(prelude, lowers(10, " (realloc ${'$'}r)")))
         // canon の上限（10 万個）には届かない数でも、断る（1 万個で約 52 億ノード）
         val bomb = wat("(component $prelude ${lowers(100, "")})")
         assertEquals(0L, estimateOf(bomb).remapCost)
+        rejectedBeforeValidation(bomb)
+    }
+
+    /** 型を持たない case 1,000 個の variant `$v0` を、case 1,000 個に持つ variant `$v1`（flat 2、たどる大きさ約 100 万。#955 のレビュー） */
+    private val wideVariants: String = run {
+        val plain = (0 until 1_000).joinToString(" ") { "(case \"c$it\")" }
+        val typed = (0 until 1_000).joinToString(" ") { "(case \"d$it\" ${'$'}v0)" }
+        "(type ${'$'}v0 (variant $plain)) (type ${'$'}v1 (variant $typed))"
+    }
+
+    /** [n] 個の `canon lift`（引数の型 [param]、core の関数の引数 [coreParams] 個の i32、option [options]）を並べたコンポーネント */
+    private fun lifts(prelude: String, param: String, coreParams: Int, n: Int, options: String): ByteArray {
+        val ps = " i32".repeat(coreParams)
+        val core = """
+            (core module ${'$'}m (memory (export "m") 1) (func (export "r") (param i32 i32 i32 i32) (result i32) unreachable)
+              (func (export "f") (param$ps)))
+            (core instance ${'$'}mi (instantiate ${'$'}m))
+            (alias core export ${'$'}mi "m" (core memory ${'$'}mem))
+            (alias core export ${'$'}mi "r" (core func ${'$'}r))
+            (alias core export ${'$'}mi "f" (core func ${'$'}cf))
+            (type ${'$'}ft (func (param "p" $param)))
+        """.trimIndent()
+        val items = (0 until n).joinToString(" ") { "(func (type ${'$'}ft) (canon lift (core func ${'$'}cf)$options))" }
+        return wat("(component $prelude $core $items)")
+    }
+
+    private fun nearly(expected: Long, actual: Long) = assertTrue(actual in expected - 1..expected + 1) { "$expected ± 1 のはずが $actual" }
+
+    @Test
+    fun `reallocのないcanon liftは引数の型のたどりを数える`() {
+        // #955 のレビュー: realloc のない canon lift は、引数ごとに contains_ptr で型を覚えずにたどる。variant は型のない case も
+        // 全部回るので、flat は 2 のまま（flat 16 の上限にかからない）約 100 万ノードたどる
+        val nodes = scanOf("$wideVariants (type ${'$'}x (func (param \"p\" ${'$'}v1)))")
+        assertTrue(nodes > 1_000_000L) { "$nodes" }
+        fun delta(n: Int, options: String) =
+            estimateOf(lifts(wideVariants, "${'$'}v1", 2, n, options)).scanCost - estimateOf(lifts(wideVariants, "${'$'}v1", 2, 0, options)).scanCost
+        // core の関数の型を作るたどり（push_wasm_types）と、contains_ptr の 2 回
+        nearly(2 * nodes / 16, delta(1, ""))
+        // realloc があれば、core の関数の型を作るたどりの 1 回だけ
+        nearly(nodes / 16, delta(1, " (memory ${'$'}mem) (realloc ${'$'}r)"))
+        val bomb = lifts(wideVariants, "${'$'}v1", 2, 20, "")
+        assertEquals(0L, estimateOf(bomb).remapCost)
+        rejectedBeforeValidation(bomb)
+        // 1 個なら上限の内側で、検証も通る
+        val one = lifts(wideVariants, "${'$'}v1", 2, 1, "")
+        assertTrue(estimateOf(one).cost * 10 < ComponentLimits.DEFAULT.maxValidationCost) { "${estimateOf(one).cost}" }
+        assertDoesNotThrow { ComponentLoader.load(one) }
+    }
+
+    @Test
+    fun `型のあるcaseを共有して入れ子にしたvariantはreallocがあってもcanon liftで数える`() {
+        // #955 のレビュー: core の関数の型を作るたどり（push_wasm_types）は、variant の型のある case を case ごとに新しい
+        // LoweredTypes で覚えずにたどる。型のある case 4 つが同じ型を共有する variant を 8 段にすると、flat は 10 のまま、
+        // 展開した大きさの分たどる。realloc・memory の指定によらない
+        val shared = buildString {
+            append("(type ${'$'}w0 (variant (case \"a\" u32) (case \"b\" u32) (case \"c\" u32) (case \"d\" u32))) ")
+            for (k in 1..8) {
+                val c = "${'$'}w${k - 1}"
+                append("(type ${'$'}w$k (variant (case \"a\" $c) (case \"b\" $c) (case \"c\" $c) (case \"d\" $c))) ")
+            }
+        }
+        val nodes = scanOf("$shared (type ${'$'}x (func (param \"p\" ${'$'}w8)))")
+        assertTrue(nodes > 500_000L) { "$nodes" }
+        val options = " (memory ${'$'}mem) (realloc ${'$'}r)"
+        val bomb = lifts(shared, "${'$'}w8", 10, 60, options)
+        assertTrue(estimateOf(bomb).scanCost >= 60 * (nodes / 16)) { "${estimateOf(bomb).scanCost}" }
+        rejectedBeforeValidation(bomb)
+        assertDoesNotThrow { ComponentLoader.load(lifts(shared, "${'$'}w8", 10, 1, options)) }
+    }
+
+    @Test
+    fun `非同期のcanonは結果と要素の型のたどりを数える`() {
+        // #955 のレビュー: task.return は結果の型で core の関数の型を作り（1 回）、memory がなければ contains_ptr でもたどる（もう 1 回）。
+        // stream.read・future.read は、realloc がなければ要素の型を contains_ptr でたどる
+        val nodes = scanOf("$wideVariants (type ${'$'}x (stream ${'$'}v1))")
+        val prelude = """
+            $wideVariants
+            (type ${'$'}s (stream ${'$'}v1))
+            (type ${'$'}fu (future ${'$'}v1))
+            (core module ${'$'}m (memory (export "m") 1) (func (export "r") (param i32 i32 i32 i32) (result i32) unreachable))
+            (core instance ${'$'}mi (instantiate ${'$'}m))
+            (alias core export ${'$'}mi "m" (core memory ${'$'}mem))
+            (alias core export ${'$'}mi "r" (core func ${'$'}r))
+        """.trimIndent()
+        val v1 = nodes - 1
+        nearly(2 * v1 / 16, scanDelta(prelude, "(core func (canon task.return (result ${'$'}v1)))"))
+        nearly(v1 / 16, scanDelta(prelude, "(core func (canon task.return (result ${'$'}v1) (memory ${'$'}mem)))"))
+        nearly(nodes / 16, scanDelta(prelude, "(core func (canon stream.read ${'$'}s (memory ${'$'}mem)))"))
+        nearly(nodes / 16, scanDelta(prelude, "(core func (canon future.read ${'$'}fu (memory ${'$'}mem)))"))
+        assertTrue(scanDelta(prelude, "(core func (canon stream.read ${'$'}s (memory ${'$'}mem) (realloc ${'$'}r)))") <= 1)
+        val bomb = wat("(component $prelude ${(0 until 40).joinToString(" ") { "(core func (canon stream.read ${'$'}s (memory ${'$'}mem)))" }})")
         rejectedBeforeValidation(bomb)
     }
 

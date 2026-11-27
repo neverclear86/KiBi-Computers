@@ -54,9 +54,13 @@ import java.util.IdentityHashMap
  *     （`free_variables_any_type_id`）。境界をまたぐのは、count 段外側の 1 つ内側がコンポーネントのとき（[Walker.aliasScan]）
  *   - コンポーネントとコンポーネント型の import・export は、宣言ごとに名前の確かめ（`validate_and_register_named_types`）と、
  *     終わりの自由変数のたどり（`finish`）で 2 回たどる（インスタンス型の中の export はどちらもしない。[Walker.externScan]）
- *   - `realloc` を指定しない `canon lower` は、結果の型が ptr を含むか（`ComponentFuncType::lower` の `contains_ptr`）を、
- *     tuple・record・variant を `any` で、覚えずにたどって確かめる（中が全部 u32 でも打ち切られない）。関数の型のたどる大きさを
- *     上限として数える（`canon` の宣言ごとに 1 回。指定があれば確かめない。[Walker.component] の `Canons`）
+ *   - canon は、型を覚えずにたどる（[Walker.canonScan]。canon の宣言ごとに、関数・値の型のたどる大きさを上限として数える）。
+ *     lift・lower は core の関数の型を作るとき（`push_wasm_types`）に、variant・option・result の型のある case を case ごとに
+ *     覚えずにたどる（型のある case を共有して入れ子にした variant は、flat の数がほとんど増えないまま展開した大きさの分。
+ *     `realloc`・`memory` の指定によらない）。`realloc` がなければ、さらに ptr を含むか（`contains_ptr`）を、lift は引数で、
+ *     lower は結果で、tuple・record・variant を `any` でたどって確かめる（中が全部 u32 でも打ち切られない）。
+ *     `task.return`（結果の型。`memory` がなければ `contains_ptr` も）、`stream.read`・`future.read`（`realloc` がなければ要素の型）、
+ *     `stream.write`・`future.write`（`memory` がなければ。確かめていない、大きい側）も数える
  *
  *   たどる大きさ [Info.scan] は展開した大きさだが、enum・flags の名前を数えない（wasmparser のたどりも名前を見ない）。
  *   variant は全 case を回るので、型を持たない case も 1 と数える（型の大きさ（`TypeInfo`）には入らないので、100 万の上限は抑えない）。
@@ -66,7 +70,7 @@ import java.util.IdentityHashMap
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
- * ただし canon のうち、`realloc` を指定しない lower だけは、型を共有して膨らむ結果の型をたどるので、上の 3 つ目として数える。
+ * ただし canon は、型を共有して膨らむ型をたどる（lift・lower・`task.return`・stream・future の read・write）ので、上の 3 つ目として数える。
  * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
  * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
  * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
@@ -281,6 +285,44 @@ internal object ComponentValidationCost {
             scanned(info?.scan ?: maxScan)
         }
 
+        /**
+         * canon の定義 [item] で、wasmparser が覚えずにたどる型を数える（#955）。どれも、関数・値の型のたどる大きさ（[Info.scan]）を
+         * 上限として、canon ごとに数える（引けない型は、それまでの最大）。
+         * - lift・lower は、core の関数の型を作るとき（`ComponentFuncType::lower` の `push_wasm_types`）に、引数と結果の型をたどる。
+         *   variant・option・result は、型のある case を case ごとに新しい `LoweredTypes` で覚えずにたどるので、型のある case を共有して
+         *   入れ子にした variant は、flat の数がほとんど増えないまま展開した大きさの分たどる。`realloc`・`memory` の指定によらないので、
+         *   いつも 1 回数える（tuple・record は flat の数の上限で打ち切られるが、ここでは区別しない。大きい側）
+         * - そのうえ `realloc` がなければ、ptr を含むか（`contains_ptr`）を、lift は引数ごとに、lower は結果で、覚えずにたどって
+         *   確かめる（variant は型のない case も全部回り、中が全部 u32 でも打ち切られない）。もう 1 回数える
+         * - `task.return` は、結果の型で core の関数の型を作り（1 回）、`memory` がなければ `contains_ptr` でもたどる（もう 1 回）
+         * - `stream.read`・`future.read` は、`realloc` がなければ要素の型を `contains_ptr` でたどる（stream・future の型で数える）。
+         *   `stream.write`・`future.write` は wasmparser を読んで確かめていないが、`memory` がなければ同じ形の確かめがありうるので、
+         *   同じに数える（大きい側）
+         */
+        private fun canonScan(s: Scope, item: Canon) {
+            fun scanOf(info: Info?): Long = info?.scan ?: maxScan
+            fun List<CanonOption>.noRealloc() = none { it is CanonOption.Realloc }
+            fun List<CanonOption>.noMemory() = none { it is CanonOption.Memory }
+            fun lowered(scan: Long, twice: Boolean) = scanned(if (twice) add(scan, scan) else scan)
+            when (item) {
+                is Canon.Lift -> lowered(scanOf(s.types.getOrNull(item.typeIndex)), item.options.noRealloc())
+                is Canon.Lower -> lowered(scanOf(s.funcs.getOrNull(item.func)), item.options.noRealloc())
+                is Canon.Builtin -> when (item.op) {
+                    CanonBuiltin.TASK_RETURN -> when (val r = item.result) {
+                        null -> Unit
+                        is ValType.Primitive -> lowered(1, item.options.noMemory())
+                        is ValType.Ref -> lowered(scanOf(s.types.getOrNull(r.typeIndex)), item.options.noMemory())
+                    }
+                    CanonBuiltin.STREAM_READ, CanonBuiltin.FUTURE_READ ->
+                        if (item.options.noRealloc()) scanned(scanOf(item.typeIndex?.let { s.types.getOrNull(it) }))
+                    CanonBuiltin.STREAM_WRITE, CanonBuiltin.FUTURE_WRITE ->
+                        if (item.options.noMemory()) scanned(scanOf(item.typeIndex?.let { s.types.getOrNull(it) }))
+                    else -> Unit
+                }
+                is Canon.ResourceNew, is Canon.ResourceDrop, is Canon.ResourceRep -> Unit
+            }
+        }
+
         private fun add(a: Long, b: Long): Long = minOf(a + b, SATURATED)
 
         /**
@@ -478,12 +520,9 @@ internal object ComponentValidationCost {
                     }
                     // canon lift は関数を足す（その型）。ほかの canon は core の関数を足す
                     is ComponentSection.Canons -> for (item in section.items) {
+                        // wasmparser が canon ごとに覚えずにたどる型を数える（#955。[canonScan]）
+                        canonScan(s, item)
                         if (item is Canon.Lift) s.funcs += s.types.getOrNull(item.typeIndex)
-                        // realloc のない canon lower は、wasmparser が結果の型に ptr を含むか（`contains_ptr`）を、覚えずにたどって確かめる
-                        // （tuple・record・variant を、中が全部 u32 でも打ち切らずに、展開した大きさの分）。関数の型のたどる大きさで数える（上限）
-                        if (item is Canon.Lower && item.options.none { it is CanonOption.Realloc }) {
-                            scanned(s.funcs.getOrNull(item.func)?.scan ?: maxScan)
-                        }
                     }
                     // core のインスタンスとモジュールは、型の確認の見積もりには使わない
                     is ComponentSection.CoreInstances,
