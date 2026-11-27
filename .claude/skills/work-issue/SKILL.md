@@ -55,13 +55,14 @@ git switch -c issue-<番号>-<短い英語名>
   ./gradlew :platform-neoforge-1.21.1:runGameTestServer   # platform-* か core を触ったとき
   ./gradlew :platform-forge-1.20.1:runGameTestServer      # core か 1.20.1 を触ったとき
   ```
+  差分がビルドに入らないファイル（`.claude/**`、`docs/**`（`docs/syscalls/**` を除く）、どの `src/` の下でもない `*.md`）だけなら、Gradle は回さず `node --test .claude/workflow-tests/` だけを回す（#985。`.github/**` を含むときは PR の CI で確かめる）。ワークフロー（`.claude/workflows/`・`.claude/workflow-tests/`）を変えたら、ビルドに入るファイルと一緒でも `node --test .claude/workflow-tests/` を回す。
 - GUI や描画を変えたら `run-minecraft` スキルで開発クライアントを起動し、スクリーンショットで確認する。
 
 ## 4. コミットと PR
 
 - コミットメッセージは英語の命令形。
 - Issue のチェックリストのうち済んだ項目を `gh issue edit <番号> --body-file` で更新する。
-- 開いている別の PR に依存する、または1つの Issue を複数の PR に分けるときは、AGENTS.md の「Stacked PRs」の手順で積む（`gh stack init` / `add` / `submit`、既存の PR は `gh stack link`）。
+- 開いている別の PR に依存する、または1つの Issue を複数の PR に分けるときは、AGENTS.md の「Stacked PRs」の手順で積む（`gh pr create --base <下のブランチ>` で PR を作り、`gh stack link <下のPR> <上のPR>` で紐づける。`gh stack submit`・`sync`・`rebase`・`push` は force-with-lease で push するので使わない。#936）。
 - PR を作る:
   ```bash
   git push -u origin HEAD
