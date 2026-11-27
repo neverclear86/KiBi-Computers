@@ -340,10 +340,16 @@ object MachineRestoreGameTests {
      * FULL でないまま確定すると、順番待ちには入れない（`offerRestoreAfterClaim` の `hasChunkAt`）。FULL に戻ったときに
      * `restorePromotedCase` が入れ、保存した世代から戻る（`/tmp` の印が残る）。待つ間のケースの NBT（チャンクの保存が書くもの）は
      * 生の値（MachineId・SaveGeneration・OwnerEpoch）のままで、次の読み込みは同じ値で同じ判定をする。
-     * 書き込みのスレッドを tick をまたいで止める（読みを待たせる）ので、専用のバッチにする
+     * 書き込みのスレッドを tick をまたいで止める（読みを待たせる）ので、専用のバッチにする。
+     * ゲートを放した後の確定は壁時計で待つ（[claimDecideWait]。#912）。tick の上限は、前の段（起動・降格の待ち）が使う
+     * [BOOT_TIMEOUT_TICKS] に、確定の待ちの分（[CLAIM_DECIDE_TIMEOUT_TICKS]）を別に足して、壁時計の上限が必ず先に来るようにする
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = BOOT_TIMEOUT_TICKS, batch = "deferred_claim_demotion")
+    @GameTest(
+        template = SmokeGameTests.EMPTY,
+        timeoutTicks = BOOT_TIMEOUT_TICKS + CLAIM_DECIDE_TIMEOUT_TICKS,
+        batch = "deferred_claim_demotion",
+    )
     fun deferredClaimWhileTheChunkLeavesFull(helper: GameTestHelper) {
         val far = FarComputer(helper)
         val level = helper.level
@@ -355,6 +361,9 @@ object MachineRestoreGameTests {
         var gate: WriterGate? = null
         var sideGate: SideReaderGate? = null
         var reads = 0L
+        var wait: WallClockWait? = null
+        // 壁時計の上限で落ちたときの診断（thenWaitUntil の中の失敗は tick の上限まで握りつぶされるので、次の thenExecute で落とす）
+        var expired: String? = null
 
         fun assertRawTag(be: CaseBlockEntity, what: String) {
             val id = saved!!
@@ -417,9 +426,19 @@ object MachineRestoreGameTests {
             gate = null
             sideGate!!.close()
             sideGate = null
+            wait = claimDecideWait()
         }.thenWaitUntil {
-            helper.assertTrue(!copy!!.isClaimDeferred, "the waiting claim should be decided")
+            val be = copy!!
+            if (!be.isClaimDeferred) return@thenWaitUntil
+            // 上限を過ぎたら、診断を覚えて待ちを終える（次の thenExecute が落とす）
+            val w = wait!!
+            if (!w.pace()) {
+                expired = claimDecideDiagnostics(store, w, listOf(be), helper)
+                return@thenWaitUntil
+            }
+            helper.fail("the waiting claim should be decided")
         }.thenExecute {
+            expired?.let { helper.fail("the waiting claim should be decided: $it") }
             val be = copy!!
             val id = saved!!
             helper.assertTrue(be.lastClaim == ClaimResult.KEPT && be.identity == id, "the case should keep $id: ${be.lastClaim}, ${be.identity}")
