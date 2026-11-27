@@ -56,7 +56,8 @@ dependencies {
     testImplementation(libs.zerofs)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
-    testRuntimeOnly(libs.junit.platform.launcher)
+    // ThreadDumpOnTimeoutTest が、入れ子の JUnit をこの Launcher で回す（#927）
+    testImplementation(libs.junit.platform.launcher)
 }
 
 // ---- core のテストの分け方（#984） ----
@@ -99,6 +100,8 @@ val serialTestClasses: Set<String> = (
         "pro.ikili.kibicomputers.core.kernel.LuaParallelScaleTest",
         // 2^31 回の計算が stop より先に終わると落ちる（並列の 4 本で 1 回落ちた。#984 の測定。直すのは #994）
         "pro.ikili.kibicomputers.core.kernel.RealWasmSchedulerTest",
+        // 入れ子の JUnit の @Timeout(300 ms) の中で、持ち主のロックを待つスレッドが park してからダンプを撮るのを確かめる（#927）
+        "pro.ikili.kibicomputers.core.testing.ThreadDumpOnTimeoutTest",
     )
     ).toSet()
 
@@ -193,14 +196,26 @@ fun Test.coreTestDefaults(classFilter: (FileTreeElement) -> Boolean = { true }) 
         ?.let { systemProperty("junit.jupiter.execution.timeout.default", it) }
     // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
     // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
+    // 止まったテストのスレッドダンプの要約（ThreadDumpOnTimeout が「#927 ダンプ」で始まる行を出す）も写す（#927）
     val testLogger = logger
+    val copiedPrefixes = listOf("#868 遅れ", "#916 遅れ", "#927 ダンプ")
     addTestOutputListener { descriptor, event ->
-        if (event.message.startsWith("#868 遅れ") || event.message.startsWith("#916 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+        if (copiedPrefixes.any { event.message.startsWith(it) }) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
     }
+    // スレッドダンプの全文の置き場所（#927。ThreadDumpOnTimeout）。作業ディレクトリ（core/）からの相対で渡す（絶対パスはタスクの入力になり、
+    // worktree・CI ごとにキャッシュのキーが変わるため）。CI の組どうしで名前が重ならないよう、組をディレクトリに入れる。
+    // CI は core/build/thread-dumps/** を artifact に載せる。前の起動のダンプが残らないよう、走る前に消す（出力には宣言しない）
+    val threadDumpDir = "build/thread-dumps/$name" + (testShard?.let { "-shard-${it.first}of${it.second}" } ?: "")
+    systemProperty("kibi.test.threadDumpDir", threadDumpDir)
+    val threadDumpDirFile = layout.projectDirectory.dir(threadDumpDir).asFile
+    doFirst { threadDumpDirFile.deleteRecursively() }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない
     inputs.dir(rootProject.layout.projectDirectory.dir("docs/syscalls")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("syscallDocs")
     inputs.dir(layout.projectDirectory.dir("src/main/wit")).withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("witSources")
+    // ThreadDumpWatchdogScriptTest が回す CI の見張りのスクリプト（#927）。同じ理由で入力に宣言する（スクリプトだけの変更でもテストが走るように）
+    inputs.file(rootProject.layout.projectDirectory.file(".github/scripts/with-thread-dump-watchdog.sh"))
+        .withPathSensitivity(PathSensitivity.RELATIVE).withPropertyName("threadDumpWatchdogScript")
     // 組の絞り込み（#984）。クラスファイルの集合も入力になるが、キャッシュのキーをはっきり分けるために値も入力にする
     inputs.property("kibi.test.shard", testShardSpec ?: "all")
     inputs.property("kibi.test.serialClasses", serialTestClasses.sorted())
