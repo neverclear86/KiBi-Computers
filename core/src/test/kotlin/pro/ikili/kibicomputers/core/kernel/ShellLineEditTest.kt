@@ -150,7 +150,9 @@ class ShellLineEditTest {
             eventuallyDescribe(150_000, { "終わらない: ${host.text()}\n${host.rows().joinToString("\n")}" }) {
                 h.scheduler.tick()
                 val end = host.promptEnd()
-                if (next < steps.size && end > seen) {
+                // プロンプトが見えただけでは、sh はまだ CPU を持っているかもしれない（書いてから poll で待つまでの間は、渡されたスライスの
+                // 未返却の分だけ燃料の使用量が多く出る）。入力を待って CPU を返した（WAITING_EVENT）のを確かめてから、燃料を読んで打つ
+                if (next < steps.size && end > seen && m.stateOf(pid) == ProcessState.WAITING_EVENT) {
                     seen = end
                     promptFuel += h.scheduler.fuelConsumedTotal
                     val bytes = steps[next++].toByteArray(charset)
