@@ -25,32 +25,6 @@ import java.util.UUID
 @GameTestHolder(KiBiComputers.MOD_ID)
 @PrefixGameTestTemplate(false)
 object ClaimIoGameTests {
-    /**
-     * 待ちの確定を待つ上限（壁時計。#881）。読みは列の外の読み手か、その ID の仕事が残っていれば書き込みのスレッドの列の後ろで行う
-     * （#877）。GameTest のサーバーは tick の間で待たず全速で回すので、tick の数では読みが終わるまでの時間を保証できない。そのため
-     * 待つ tick ごとに [DECIDE_STEP_MILLIS] まで眠り（[WallClockWait]）、壁時計で打ち切る。
-     * 置き場の待ちの上限 `claimWaitMillis`（既定 30 秒）より短く保つ（長いと、置き場が先に新しい ID にして、原因の分かりにくい失敗になる）
-     */
-    private const val DECIDE_LIMIT_MILLIS = 20_000
-
-    /** 確定を待つ tick に眠る上限（ミリ秒） */
-    private const val DECIDE_STEP_MILLIS = 50
-
-    /**
-     * GameTest の tick の上限。待つ tick は 1 回 [DECIDE_STEP_MILLIS] 以上かかるので、壁時計では [DECIDE_LIMIT_MILLIS] の 3 倍
-     * （60 秒）より前に来ない。壁時計の上限が必ず先に来て、診断の値つきで落ちる
-     */
-    private const val DECIDE_TIMEOUT_TICKS = DECIDE_LIMIT_MILLIS / DECIDE_STEP_MILLIS * 3
-
-    /** 確定の待ちを始める（待ちに入った tick に作る） */
-    private fun decideWait() = WallClockWait(DECIDE_LIMIT_MILLIS.toLong(), DECIDE_STEP_MILLIS.toLong())
-
-    /** 確定しなかったときの診断（遅れたのか止まったのかを 1 行で見分ける。#852） */
-    private fun decideDiagnostics(store: MachineSaveStore, wait: WallClockWait, cases: List<CaseBlockEntity>) =
-        "waited $wait; deferred in store=${cases.map { store.isClaimDeferred(it) }}, waitingClaims=${store.waitingClaims}, " +
-            "sideOwnerReadRequests=${store.sideOwnerReadRequests}, writerOwnerReadRequests=${store.writerOwnerReadRequests}, " +
-            "deferredClaimTimeouts=${store.deferredClaimTimeouts}, claimWaitMillis=${store.claimWaitMillis}"
-
     private val ORIGINAL = BlockPos(1, 1, 1)
     private val COPIES = listOf(BlockPos(0, 1, 0), BlockPos(1, 1, 0), BlockPos(2, 1, 0), BlockPos(0, 1, 1))
     private val UNKNOWN = listOf(BlockPos(2, 1, 1), BlockPos(0, 1, 2), BlockPos(1, 1, 2), BlockPos(2, 1, 2))
@@ -120,7 +94,7 @@ object ClaimIoGameTests {
      * 待っている間に外した台は索引に残らない。覚えている ID の台は、同じ tick でもその場で決まる（動かした先なので引き取る）
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = CLAIM_DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
     fun claimsThatNeedAReadWaitOffTheMainThread(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -171,14 +145,14 @@ object ClaimIoGameTests {
                     helper.assertTrue(known.lastClaim == ClaimResult.TAKEN_OVER && !known.isClaimDeferred, "a remembered id is decided at once: ${known.lastClaim}")
                     // 待っている間に外す
                     helper.setBlock(UNKNOWN[2], Blocks.AIR)
-                    wait = decideWait()
+                    wait = claimDecideWait()
                     phase = 2
                 }
                 2 -> {
                     val (first, second, removed) = placed
                     if (first.isClaimDeferred || second.isClaimDeferred) {
                         val w = wait!!
-                        if (!w.pace()) helper.fail("the waiting claims should be decided: ${decideDiagnostics(store, w, listOf(first, second))}")
+                        if (!w.pace()) helper.fail("the waiting claims should be decided: ${claimDecideDiagnostics(store, w, listOf(first, second))}")
                         return@onEachTick
                     }
                     phase = 3
@@ -200,10 +174,21 @@ object ClaimIoGameTests {
 
     /**
      * 待つ間の台（#869）: 取り出さず（`captureAndSubmit` が `null`）、電源ボタンも効かない（状態が変わらない）。アンロード
-     * （`onChunkUnloaded`）で待ちを取り消し、後の tick に確定しない（索引に入らない・ID がつかない・順番待ちに入らない）
+     * （`onChunkUnloaded`）で待ちを取り消し、読みが終わっても確定しない（索引に入らない・ID がつかない・順番待ちに入らない）。
+     *
+     * 「読みが終わった」は tick の数ではなく、取り消した後に置いた対照の台の確定で見る（#912）。GameTest のサーバーは全速で tick を回すので、
+     * 数 tick 待つだけでは読みが終わる前に確かめてしまう。取り消した読みは、読み手が開く前に飛ばす（`sideWanted`）ことがあって読み手の口を
+     * 呼ばないので、「口が呼ばれた」も終わりの印にできない。そこで、取り消した台の読みが列の外の読み手に回ったことを数え口
+     * （`sideOwnerReadRequests`）で見てから、仕事のない別の ID（対照の台）の読みを同じ読み手に頼む。読み手は置き場に 1 本で、頼みも結果も
+     * 来た順に流す（FIFO）ので、対照の台が確定した tick には、取り消した読みは読み手を過ぎていて、結果があれば同じかそれより前の
+     * `pollDeferredClaims` で捨てられている。その tick に「確定しない」を確かめる。
+     *
+     * この論拠（取り消した読みと対照の読みが同じ 1 本の読み手を通る）を数え口で確かめるには、ほかのテストの読みが数え口に混ざらないことが
+     * 要る（数え口は置き場で共有）。そこで専用のバッチにして（同じバッチのテストは同時に走るが、別のバッチは直列）、増えた数を
+     * ちょうど 1（取り消す台）・2（対照の台を足した後）で見る。対照の読みが書き込みのスレッドの列に回ると数え口は増えないので落ちる
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = 100, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = CLAIM_DECIDE_TIMEOUT_TICKS, batch = "claim_io_cancel")
     fun deferredClaimCaseIsInertAndUnloadCancelsIt(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -211,14 +196,22 @@ object ClaimIoGameTests {
         }
         val id = UUID.randomUUID()
         store.forgetOwnerForTest(id)
+        val sideBefore = store.sideOwnerReadRequests
         val be = place(helper, ORIGINAL, id, poweredOn = true)
-        val start = helper.tick
+        val controlId = UUID.randomUUID()
+        var control: CaseBlockEntity? = null
+        var wait: WallClockWait? = null
         var phase = 0
         helper.onEachTick {
             when (phase) {
                 0 -> {
                     if (!be.isLoadedOnServer) return@onEachTick
                     helper.assertTrue(be.isClaimDeferred, "the claim should wait for owner.bin")
+                    // 仕事のない ID なので、読みは列の外の読み手に回る（専用のバッチなので、数え口の増えはこの台の 1 件だけ）
+                    helper.assertTrue(
+                        store.sideOwnerReadRequests - sideBefore == 1L,
+                        "the read should go to the side reader: ${store.sideOwnerReadRequests - sideBefore}",
+                    )
                     helper.assertTrue(be.computer.isRestorePending, "a powered-on case shows the restore wait: ${be.computer}")
                     helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should not be offered to the restore queue")
                     val status = be.computer.status
@@ -234,15 +227,41 @@ object ClaimIoGameTests {
                     // チャンクのアンロード
                     be.onChunkUnloaded()
                     helper.assertTrue(!be.isClaimDeferred && !store.isClaimDeferred(be), "unloading should cancel the waiting claim")
+                    // 対照の台: 取り消した読みより後に、同じ読み手に読みを頼む（onLoad は取り消しより後に来る）
+                    store.forgetOwnerForTest(controlId)
+                    control = place(helper, COPIES[0], controlId)
                     phase = 1
                 }
                 1 -> {
+                    val c = control!!
+                    if (!c.isLoadedOnServer) return@onEachTick
+                    helper.assertTrue(c.isClaimDeferred, "the control claim should wait for owner.bin")
+                    helper.assertTrue(
+                        store.sideOwnerReadRequests - sideBefore == 2L,
+                        "both reads (and only those) should go to the side reader: ${store.sideOwnerReadRequests - sideBefore}",
+                    )
+                    wait = claimDecideWait()
+                    phase = 2
+                }
+                2 -> {
+                    val c = control!!
+                    if (c.isClaimDeferred) {
+                        val w = wait!!
+                        if (!w.pace()) helper.fail("the control claim should be decided: ${claimDecideDiagnostics(store, w, listOf(c), helper)}")
+                        return@onEachTick
+                    }
+                    phase = 3
+                    helper.assertTrue(
+                        c.lastClaim == ClaimResult.KEPT && c.identity?.id == controlId,
+                        "the control should keep its id: ${c.lastClaim}, ${c.identity}",
+                    )
                     // 取り消した待ちは、読みが終わっても確定しない
-                    if (helper.tick < start + 30) return@onEachTick
                     helper.assertTrue(be.identity == null && be.lastClaim == null, "a cancelled claim should not be decided: ${be.identity}, ${be.lastClaim}")
                     helper.assertTrue(store.index.ownerOf(id) == null, "a cancelled claim should not be indexed")
+                    helper.assertTrue(!store.isClaimDeferred(be), "a cancelled claim should not wait again")
                     helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a cancelled claim should not join the restore queue")
                     helper.setBlock(ORIGINAL, Blocks.AIR)
+                    helper.setBlock(COPIES[0], Blocks.AIR)
                     helper.succeed()
                 }
             }
@@ -296,7 +315,7 @@ object ClaimIoGameTests {
      * （ID のないまま順番が来ると冷えた起動になる）。確定したら、その ID で順番待ちに入り直す
      */
     @JvmStatic
-    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
+    @GameTest(template = SmokeGameTests.EMPTY, timeoutTicks = CLAIM_DECIDE_TIMEOUT_TICKS, batch = "kibicomputers_claim_io")
     fun claimDeferredWhileQueuedLeavesTheRestoreQueue(helper: GameTestHelper) {
         val store: MachineSaveStore = WorldMachineSaves.current ?: run {
             helper.fail("no machine save store")
@@ -316,13 +335,13 @@ object ClaimIoGameTests {
                     helper.assertTrue(be.isClaimDeferred, "the new id should need a read")
                     helper.assertTrue(!ServerMachines.isRestoreQueued(be), "a waiting case should leave the restore queue")
                     helper.assertTrue(be.computer.isRestorePending, "the restore wait should stay visible: ${be.computer}")
-                    wait = decideWait()
+                    wait = claimDecideWait()
                     phase = 1
                 }
                 1 -> {
                     if (be.isClaimDeferred) {
                         val w = wait!!
-                        if (!w.pace()) helper.fail("the waiting claim should be decided: ${decideDiagnostics(store, w, listOf(be))}")
+                        if (!w.pace()) helper.fail("the waiting claim should be decided: ${claimDecideDiagnostics(store, w, listOf(be))}")
                         return@onEachTick
                     }
                     helper.assertTrue(be.identity?.id == id, "the case should keep the merged id: ${be.identity}, ${be.lastClaim}")
