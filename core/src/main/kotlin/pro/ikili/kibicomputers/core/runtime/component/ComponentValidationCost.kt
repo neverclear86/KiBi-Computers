@@ -18,7 +18,12 @@ import java.util.IdentityHashMap
  * 見積もりは、型の確認ごとの、確かめる型の大きさの合計と、インスタンス化ごとの型の写し直しの大きさの合計。
  *
  * - 型の確認: コンポーネントのインスタンス化の引数（種類を問わない）と、型を付けた export（`(export "x" (func $f) (func (type $t)))`）。
- *   それぞれ、渡すもの（export するもの）の型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
+ *   インスタンス化の引数は、渡すものの型の大きさを足す（受ける側の型に合うなら、確認はその大きさまでで終わる）。
+ *   型を付けた export は、渡すもの（export するもの）と付けた型の両方の大きさを足す。コンポーネント型の部分型は import が反変で、
+ *   wasmparser の `component_type` は、渡す側の import が空でも受ける側（付けた型）の import を全部写して集めるので、確認の手間は
+ *   付けた型の大きさにも比例する（コンポーネント型がインスタンス型の export や `(type (eq ..))` の中にあっても同じなので、種類で
+ *   分けない。#963）。インスタンス化の引数の受ける側の import は、インスタンス化ごとの写し直し（受ける側のコンポーネントの import の
+ *   型を宣言ごとに数える）が覆うので、確認には足さない（足すと wac で合成した形の見積もりがほぼ倍になる）。
  *   wasmparser は型の確認を覚えない（同じ型の対でも、引数ごと・インスタンス化ごとに確かめ直す）ので、回数で掛ける
  * - 型の大きさ: wasmparser の `TypeInfo`（展開した大きさ）にならって、参照している型の大きさを足して数える。
  *   確かめる型の大きさには、100 万で止めない展開した大きさ（[Info.remapBound]）を使う。`MAX_WASM_TYPE_SIZE` = 100 万を超える型は
@@ -52,9 +57,6 @@ import java.util.IdentityHashMap
  * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
  * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
  * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
- * 型を付けた export（`(export "x" (component $c) (component (type $ct)))`）の確認も、渡す側の大きさしか数えない
- * （コンポーネントの部分型は import が反変で、確認の手間は受ける側の import の数に比例する）ので、見積もりが
- * 小さいまま検証が時間の上限に届く（受ける側の import 4,000 個 × 型を付けた export 5,000 個。#935 のレビュー。#963 で扱う）。
  * 見積もりにない形は、見張りが時間の上限で止める。
  *
  * 見積もりそのものの手間も抑える。写し直しの大きさをたどる手数（積んだ参照の数）を数え、見積もりの上限の [WORK_FACTOR] 倍を
@@ -219,6 +221,17 @@ internal object ComponentValidationCost {
             cost = add(cost, info?.remapBound ?: maxFull)
         }
 
+        /**
+         * 型を付けた export の型の確認を 1 回数える。確かめる手間は、渡すもの [found] の型と、付けた型 [ascribed] の両方の大きさ
+         * （引けなければ、それまでの最大）。コンポーネント型の部分型は import が反変で、wasmparser の `component_type` は
+         * 渡す側の import が空でも、受ける側（付けた型）の import を全部写して集めてから比べるので、付けた型の大きさに比例する
+         * （コンポーネント型がインスタンス型の export や `(type (eq ..))` の中にあっても同じ経路になるので、種類で分けずに足す。#963）
+         */
+        private fun checkAscribed(found: Info?, ascribed: Info?) {
+            checks++
+            cost = add(cost, add(found?.remapBound ?: maxFull, ascribed?.remapBound ?: maxFull))
+        }
+
         /** それまでに見た型の大きさの最大 */
         var maxSize = 1L
 
@@ -359,13 +372,13 @@ internal object ComponentValidationCost {
                         // 型を付けた export は、付けた型の部分型かを確かめ、付けた型をその export の型にする（wasmparser と同じ）。
                         // 実物は同じ宣言を共有していても、付けた型は `(type (eq ..))` ごとに別の型になることがあるので、実物では数えない
                         val desc = item.desc
-                        if (desc != null) check(found)
                         // 関数のほかは、export するときに型を写して新しく作る
                         val info = when {
                             desc != null -> descInfo(s, desc)
                             item.target.sort == Sort.FUNC -> found
                             else -> copied(found)
                         }
+                        if (desc != null) checkAscribed(found, info)
                         val ref = info ?: unknown()
                         if (info != null) exports[item.name] = info
                         refs += ref
