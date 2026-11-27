@@ -607,6 +607,38 @@ test('プロンプト: 実装の段階は通しの build と両 GameTest を残�
   assert.match(prompts.conflict, /取り込んだ結果で `\.\/gradlew build` を通す/)
 })
 
+test('プロンプト: 直しの段階の手元の確認は、どの決まりにも当たらないビルド入力（dev-driver・ルートの gradlew・api のダンプ）を素通りさせない（#985）', async () => {
+  const prompts = await gradleStagePrompts()
+  for (const k of ['fix', 'resolve', 'ci-fix']) {
+    const p = prompts[k]
+    assert.match(p, /:dev-driver:compileKotlin/, k)
+    assert.match(p, /core\/api\/\*\.api/, k)
+    assert.match(p, /platform-\*\/api\/\*\.api/, k)
+    assert.match(p, /上のどの決まりにも当たらない、ビルドに入るファイル/, k)
+    assert.match(p, /gradlew/, k)
+    assert.match(p, /\.editorconfig/, k)
+    assert.match(p, /手元で何も回さずに push してはいけない/, k)
+  }
+})
+
+test('プロンプト: ワークフローを変えた差分は、ビルドに入るファイルと一緒でも、実装・衝突の取り込み・直しの段階で node --test を回す（#985）', async () => {
+  const prompts = await gradleStagePrompts()
+  for (const k of ['implement', 'conflict', 'ci-fix', 'fix', 'resolve']) {
+    const p = prompts[k]
+    assert.match(p, /ワークフローを変えた差分（\`\.claude\/workflows\/\` か \`\.claude\/workflow-tests\/\` のファイルを 1 つでも含む）は、ビルドに入るファイルと一緒でも/, k)
+    assert.match(p, /Gradle を回す前に worktree の中で \`node --test \.claude\/workflow-tests\/\` を前景で回す/, k)
+  }
+})
+
+test('プロンプト: マージの段階の node --test は、Already up to date で新しいコミットができなくても、差分にワークフローがあれば回す（#985）', async () => {
+  const prompts = await gradleStagePrompts()
+  for (const k of ['merge', 'merge-rerun']) {
+    assert.match(prompts[k], /取り込みの結果によらず（Already up to date で新しいコミットができなかったときも）/, k)
+    assert.match(prompts[k], /git diff --name-only origin\/main\.\.\.HEAD/, k)
+    assert.doesNotMatch(prompts[k], /取り込みで新しいコミットができ、/, k)
+  }
+})
+
 test('プロンプト: 全段階に、ビルドに入らないファイルだけの差分の決まり（docs/syscalls と src の下の .md を除く）がある（#985）', async () => {
   const prompts = await gradleStagePrompts()
   for (const k of ['implement', 'conflict', 'ci-fix', 'fix', 'resolve']) {

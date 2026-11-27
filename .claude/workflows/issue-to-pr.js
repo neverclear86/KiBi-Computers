@@ -62,7 +62,8 @@ function nonBuildRule(diffHow) {
 - 差分の取り方: ${diffHow}
 - 差分のファイルが ${NON_BUILD_FILES} と \`.github/**\` だけなら、\`./gradlew\` は起動しない（build も GameTest も回さない。CI の \`build\` が確かめる）。\`docs/syscalls/**\` や \`src/\` の下の \`*.md\`、\`os/man/**\` はビルドに入るので、ほかのファイルと同じに扱う。
 - そのときは、worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない）。落ちたら直す。\`.github/**\` を含むときは、手元では確かめられないので、push の後の PR の CI の結果で確かめる（pull_request の run は PR 側の \`.github/workflows/build.yml\` で走る）。
-- 返す値は \`gradleStillRunning=false\`・\`runningLogs=[]\`。summary には「Gradle は起動していない（差分が <ファイル> だけ）。node --test は N 件通った」の形で書く（Gradle について「実行中」「動いている」「終わっていない」のような言い回しは使わない）。`
+- 返す値は \`gradleStillRunning=false\`・\`runningLogs=[]\`。summary には「Gradle は起動していない（差分が <ファイル> だけ）。node --test は N 件通った」の形で書く（Gradle について「実行中」「動いている」「終わっていない」のような言い回しは使わない）。
+- ワークフローを変えた差分（\`.claude/workflows/\` か \`.claude/workflow-tests/\` のファイルを 1 つでも含む）は、ビルドに入るファイルと一緒でも、Gradle を回す前に worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない。CI は回さない）。落ちたら直す。summary に、node --test を回したことと件数を書く`
 }
 
 // 直しの段階（レビューの直し fix・確認事項の反映 resolve・CI の直し ci-fix）の手元の確認（#985）。
@@ -74,9 +75,11 @@ const FIX_LOCAL_CHECKS = `手元の確認（#985。通しの \`./gradlew build\`
 - 触ったファイルに合わせて、次のタスクを 1 本の \`./gradlew\` にまとめて回す（下の Gradle の決まりに従う）:
   - \`core/\` を触ったら \`:core:testClasses\`（\`:core:compileKotlin\` では足りない。processTestResources が \`core/src/test/wasm\` の C と同梱の OS イメージをビルドする）と、触ったクラスのテスト（\`:core:test --tests '<クラスの完全名か *クラス名>'\`）。\`core/src/main/\` を触ったら、接続層は core の内部の型を使うので、\`:platform-neoforge-1.21.1:compileKotlin :platform-forge-1.20.1:compileKotlin\` も回す。
   - core にトップレベルの public な宣言を足した・変えたら \`:core:test --tests '*InternalMarkerTest'\`。WIT（\`*.wit\`）・\`WasiP1Kibi\`・\`docs/syscalls/**\` を触ったら \`:core:test --tests '*SyscallDocTest'\`。
-  - 公開 API（\`pro.ikili.kibicomputers.api\`、接続層の \`...api\`）を触ったら \`checkKotlinAbi\`（ダンプを直すなら \`updateKotlinAbi\` で作り直してコミットする）。
+  - 公開 API（\`pro.ikili.kibicomputers.api\`、接続層の \`...api\`）か、そのダンプ（\`core/api/*.api\`・\`platform-*/api/*.api\`）を触ったら \`checkKotlinAbi\`（ダンプを直すなら \`updateKotlinAbi\` で作り直してコミットする。ダンプは手で直さない）。
+  - \`dev-driver/\` を触ったら \`:dev-driver:compileKotlin\`（テストがあれば \`:dev-driver:test\` も）。\`dev-driver\` は各接続層の \`src/dev/\` から使われるので、公開の宣言を変えたら、接続層の \`compileKotlin\`（両バージョン）も回す。
   - \`platform-<ローダー>-<MC>/\` を触ったら、そのバージョンの \`:platform-<ローダー>-<MC>:compileKotlin\` と、別の \`./gradlew\` で、そのバージョンの \`runGameTestServer\` だけを回す（触っていないバージョンの GameTest は回さない）。
   - \`os/\`・\`build-logic/\`・\`gradle/\`・\`*.gradle.kts\` を触ったら、影響の範囲が読みにくいので、通しの \`./gradlew build\` を回す。
+  - **上のどの決まりにも当たらない、ビルドに入るファイル**（ルートの \`gradlew\`・\`gradlew.bat\`・\`.editorconfig\`・\`gradle.properties\`、\`poc/\`、そのほか上に挙げていない置き場所、など）を 1 つでも触ったら、手元で何も回さずに push してはいけない。影響の範囲が読めないので、通しの \`./gradlew build\` を回す（ビルドに入らないファイルだけの差分は、下の決まりに従う）。
   - \`--tests\` が 1 件にも当たらないと「No tests found for given includes」で落ちる。これはコードの失敗ではない（名前を直して回し直す）。
 - summary には、手元で回したコマンド（\`./gradlew\` のタスクの一覧か「Gradle は起動していない」）を書く（報告とレビューで見えるように）。
 ${nonBuildRule(`${FIX_BASE_DIFF}。`)}`
@@ -1057,7 +1060,7 @@ ${listed}`
 // マージの段階で手元で確かめるのは、ワークフローの検査（node --test。1 秒かからない）だけ（#985）。CI は node --test を回さないので、
 // 両側が issue-to-pr.js を直した組み合わせの壊れを、main に入れる前にここで止める。ふつうのマージとスタックのマージで同じ文を使う
 function mergeNodeTestStep(ref) {
-  return `取り込みで新しいコミットができ、取り込んだあとの差分（\`git diff --name-only origin/${ref}...HEAD\`）に \`.claude/workflows/\` か \`.claude/workflow-tests/\` があるときだけ、worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない）。落ちたら push もマージもせず status=needs_human・failedStep=test で、落ちたテストの名前を理由に書く。**\`./gradlew\` は起動しない**（build・GameTest は手元では回さない。先頭のコミットの CI が確かめる。#985）。`
+  return `取り込みの結果によらず（Already up to date で新しいコミットができなかったときも）、この PR の差分（\`git diff --name-only origin/${ref}...HEAD\`）に \`.claude/workflows/\` か \`.claude/workflow-tests/\` のファイルがあるときは、worktree の中で \`node --test .claude/workflow-tests/\` を前景で回す（1 秒かからない）。落ちたら push もマージもせず status=needs_human・failedStep=test で、落ちたテストの名前を理由に書く。差分にワークフローがなければ回さない。**\`./gradlew\` は起動しない**（build・GameTest は手元では回さない。先頭のコミットの CI が確かめる。#985）。`
 }
 
 // 先頭のコミット（HEAD）を PR に載せる手順（#985）。Already up to date でも、push していないコミットが残っていることがある（前の回の続きなど）
