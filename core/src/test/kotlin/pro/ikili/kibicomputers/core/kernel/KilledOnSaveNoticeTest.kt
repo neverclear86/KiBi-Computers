@@ -284,6 +284,7 @@ class KilledOnSaveNoticeTest {
         h.scheduler.hooks.bootVolumes = BootVolumeOpener { id -> if (id == "d") BootVolume(fs, readOnly = false) else null }
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()

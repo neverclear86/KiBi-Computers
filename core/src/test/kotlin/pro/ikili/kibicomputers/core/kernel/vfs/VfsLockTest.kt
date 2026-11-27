@@ -6,8 +6,8 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
-import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executors
+import java.util.concurrent.Phaser
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.Timeout
 import pro.ikili.kibicomputers.core.kernel.getOrFail
@@ -46,15 +46,27 @@ class VfsLockTest {
         assertEquals(Errno.NOTDIR, e.errno)
     }
 
+    /**
+     * [body] を [threads] 本のスレッドで、毎回そろえてから [rounds] 回ずつ動かす。
+     *
+     * そろえるのに期限は使わない（#916）。どれかの [body] が例外を投げたら、[Phaser.forceTermination] で残りのスレッドの待ちを解いて
+     * 終わらせる（待ち続けると、元の例外が出ないまま保険のタイムアウトまで止まる）。落ちたスレッドの例外が [getOrFail] から出る
+     */
     private fun concurrently(threads: Int, rounds: Int, body: (Int, Int) -> Unit) {
         val pool = Executors.newFixedThreadPool(threads)
-        val barrier = CyclicBarrier(threads)
+        val phaser = Phaser(threads)
         try {
             val futures = (0 until threads).map { t ->
                 pool.submit {
-                    for (r in 0 until rounds) {
-                        barrier.await()
-                        body(t, r)
+                    try {
+                        for (r in 0 until rounds) {
+                            val phase = phaser.arrive()
+                            if (phase < 0 || phaser.awaitAdvanceInterruptibly(phase) < 0) break
+                            body(t, r)
+                        }
+                    } catch (e: Throwable) {
+                        phaser.forceTermination()
+                        throw e
                     }
                 }
             }

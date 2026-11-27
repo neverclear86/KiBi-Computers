@@ -406,6 +406,7 @@ class SchedulerTest {
             eventually { m.stateOf(p) == ProcessState.WAITING_EVENT }
             eventually { h.scheduler.workers.activeSteps.get() == 0 }
             val gate = CountDownLatch(1)
+            h.releaseOnClose { gate.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
             val atGate = CountDownLatch(1)
             h.scheduler.hooks.afterStepPermit = { _, pid ->
                 if (pid == p) {

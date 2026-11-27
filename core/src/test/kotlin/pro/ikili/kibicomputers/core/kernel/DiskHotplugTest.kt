@@ -91,7 +91,10 @@ class DiskHotplugTest {
     ) : BootVolumeOpener {
         val fs = ConcurrentHashMap<String, CountingDisk>()
         val opens = ConcurrentHashMap<String, AtomicInteger>()
-        val gates = ConcurrentHashMap<String, Gate>()
+        val gates = GateMap()
+
+        /** [gates] に差した門を、置き換えで表から消えたものも含めて全部開ける（#916。期限なしの `release.await()` で止まったスレッドを、テストが落ちても放す） */
+        fun releaseAllGates() = gates.everPut.forEach { it.release.countDown() }
 
         /** 識別子 → 開くときに返すファイルシステム（本物の `DiskFileSystem` などに差し替える。#453） */
         val overrides = ConcurrentHashMap<String, FileSystem>()
@@ -99,6 +102,16 @@ class DiskHotplugTest {
         class Gate {
             val entered = CountDownLatch(1)
             val release = CountDownLatch(1)
+        }
+
+        /** 差した門を、置き換えられても覚えておく表 */
+        class GateMap : ConcurrentHashMap<String, Gate>() {
+            val everPut = java.util.concurrent.CopyOnWriteArrayList<Gate>()
+
+            override fun put(key: String, value: Gate): Gate? {
+                everPut += value
+                return super.put(key, value)
+            }
         }
 
         fun disk(id: String): CountingDisk = fs.computeIfAbsent(id) { CountingDisk() }
@@ -133,7 +146,7 @@ class DiskHotplugTest {
         config: BootConfig = BootConfig.builder().addBootDisk("root").build(),
     ): Booted {
         h.scheduler.hooks.bootVolumes = disks
-        h.releaseOnClose { disks.gates.values.forEach { it.release.countDown() } }
+        h.releaseOnClose { disks.releaseAllGates() }
         val m = h.machine(fuelPerTick = fuel, environment = MachineEnvironment.builder().disks(snapshot(*ids)).build())
         assertTrue(m.boot(config))
         if (wait) awaitRunning(h, m)

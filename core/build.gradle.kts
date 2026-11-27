@@ -68,12 +68,12 @@ tasks.test {
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
     // 止まったときの保険（#916）。実スレッドの完了は期限なしで待つ（eventually・awaitOrFail など。TestDrivers.kt）ので、止まったテストを
-    // 1 本 10 分で落とす（合否の基準ではない）。既定のタイムアウトは、テストのメソッドに加えて @BeforeEach などにも効く。
-    // :core:test だけに入れる（stackHeadroom の起動は -Xint で 1 本が長いので入れない）。ベンチマーク（下の kibi.*Benchmark・
-    // kibi.luaReplMachines）を回すときは入れない。`-Pkibi.test.timeoutDefault=<JUnit の書式。例: 30 m>` で変えられる
-    val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark", "kibi.luaReplMachines")
-        .any { providers.gradleProperty(it).orNull != null }
-    (providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: if (benchmarkOn) null else "10 m")
+    // 1 本 10 分で落とす（合否の基準ではない）。既定は src/test/resources/junit-platform.properties にあり、IDE の JUnit ランナーで
+    // 直に回すときにも効く。ここでは、長くかかる起動（ベンチマーク。下の kibi.*Benchmark・kibi.luaReplMachines）でだけ延ばす
+    // （`-Pkibi.test.timeoutDefault=<JUnit の書式。例: 30 m>` で、どの起動でも変えられる）
+    val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark").any { providers.gradleProperty(it).orNull == "true" } ||
+        providers.gradleProperty("kibi.luaReplMachines").orNull != null
+    (providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: if (benchmarkOn) "2 h" else null)
         ?.let { systemProperty("junit.jupiter.execution.timeout.default", it) }
     // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
     // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
@@ -149,6 +149,8 @@ if (providers.gradleProperty("kibi.stackHeadroom").orNull == "true") {
         roundsScale?.let { systemProperty("kibi.stackHeadroom.roundsScale", it) }
         testLogging.showStandardStreams = true
         outputs.upToDateWhen { false }
+        // 保険の既定のタイムアウト（junit-platform.properties の 10 分）は、インタプリタの 1 本には短いので延ばす（#916）
+        systemProperty("junit.jupiter.execution.timeout.default", providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: "3 h")
     }
     registerHeadroomTest(
         "stackHeadroomColdTest",

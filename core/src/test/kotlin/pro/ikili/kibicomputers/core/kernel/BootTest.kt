@@ -58,7 +58,12 @@ class BootTest {
     private val limit = Duration.ofSeconds(30)
 
     private companion object {
-        /** ロックなしの読み手が終わるのを待つ上限。普通はすぐ終わるので、混んだ CI でも足りる長さにする */
+        /**
+         * ロックなしの読み手が終わるのを待つ上限。普通はすぐ終わるので、混んだ CI でも足りる長さにする。
+         *
+         * これは期限なしにしない（#916）。待ちの上限が合否そのもの（読み手がカーネルロックを待っていたら、終わらない＝落ちる）で、
+         * しかもテストのスレッドがそのロックを持ったまま待つ箇所がある。期限なしにすると、落ちるべきときに保険のタイムアウトまで固まる
+         */
         const val READER_WAIT_MILLIS = 10_000L
     }
 
@@ -368,6 +373,7 @@ class BootTest {
     fun `プログラムだけの起動の途中のstopではinitを作らず、マウントを残さない`() = env {
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
@@ -758,6 +764,7 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
@@ -782,6 +789,7 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
@@ -803,6 +811,7 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             h.scheduler.hooks.beforeInitExec = null
             reached.countDown()
@@ -1140,6 +1149,7 @@ class BootTest {
         val real = BootVolumeOpener.forDisks({ id -> if (id == "d1") ResolvedDisk(diskDir, 1L shl 20, 1024) else null }, m.hostFiles)
         val aEntered = CountDownLatch(1)
         val aRelease = CountDownLatch(1)
+        h.releaseOnClose { aRelease.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         val calls = AtomicInteger()
         h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
             override fun open(diskId: String): BootVolume? = open(diskId) { false }
@@ -1190,6 +1200,7 @@ class BootTest {
         val real = BootVolumeOpener.forDisks({ id -> if (id == "h") ResolvedDisk(homeDir, 1L shl 20, 1024) else null }, m.hostFiles)
         val aEntered = CountDownLatch(1)
         val aRelease = CountDownLatch(1)
+        h.releaseOnClose { aRelease.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         val homeCalls = AtomicInteger()
         h.scheduler.hooks.bootVolumes = object : BootVolumeOpener {
             override fun open(diskId: String): BootVolume? = open(diskId) { false }
@@ -1259,6 +1270,7 @@ class BootTest {
         assertEquals(0, initPid())
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()
@@ -1284,6 +1296,7 @@ class BootTest {
         disks.withInit("d", exe(foreverInit()))
         val reached = CountDownLatch(1)
         val release = CountDownLatch(1)
+        h.releaseOnClose { release.countDown() } // 途中で落ちても止めたスレッドを放す（#916）
         h.scheduler.hooks.beforeInitExec = { _ ->
             reached.countDown()
             release.await()

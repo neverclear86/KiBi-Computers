@@ -202,7 +202,15 @@ internal class Harness(
     override fun close() {
         closeActions.forEach { it() }
         scheduler.close()
-        assertTrue(scheduler.awaitTermination(10_000), "スケジューラが終わらない")
+        // 期限なしの門（フックの中の `release.await()` など）で止まったスレッドが残っていたら、割り込んで放す（#916。テストが門を開ける前に落ちた
+        // ときも、スレッドを JVM に残さない。残すと、後に続く Harness のテストがすべて assertNoKernelThreads で落ちる）。
+        // 放しても、スケジューラが 1 回目の待ちで終わらなかったことは失敗として残す
+        val ended = scheduler.awaitTermination(10_000)
+        if (!ended) {
+            Thread.getAllStackTraces().keys.filter { it.isAlive && it.name.startsWith("KiBi-") }.forEach { it.interrupt() }
+            scheduler.awaitTermination(10_000)
+        }
+        assertTrue(ended, "スケジューラが終わらない")
         assertNoKernelThreads()
     }
 }
