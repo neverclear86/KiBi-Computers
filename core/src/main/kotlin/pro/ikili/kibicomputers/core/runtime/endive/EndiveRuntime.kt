@@ -855,7 +855,7 @@ private class BudgetedMemory(
 }
 
 /** インスタンスを閉じたとき（作るのに失敗したときも）に、数えた分を返すメモリ */
-private interface ReleasableMemory {
+internal interface ReleasableMemory {
     /** 数えた分をすべて返す。2回呼んでもよい */
     fun releaseAll()
 }
@@ -872,7 +872,7 @@ private class WrittenRelease(val memory: WrittenPagesMemory) : ReleasableMemory 
  * 断られたら Endive に渡さずに -1 を返す（失敗した grow は数えない。#335 と同じ）。
  * [reserved] は [budget] から確保したバイト数。インスタンスを閉じたときに [releaseAll] で返す。
  */
-private class BudgetedTable(
+internal class BudgetedTable(
     table: Table,
     initValue: Int,
     private val budget: WasmTableBudget?,
@@ -990,7 +990,7 @@ private fun tableElementBytes(table: Table): Long =
  * ほかのインスタンスに響かないように、インスタンスごとに [Table] を作り直し、そのときに上限を縮める。
  * 最初の要素数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig, created: MutableList<BudgetedTable>): TableInstance {
+internal fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig, created: MutableList<BudgetedTable>): TableInstance {
     val limits = table.limits()
     val initial = limits.min()
     val max = minOf(limits.max(), config.maxTableElements.toLong())
@@ -1026,7 +1026,7 @@ private fun createTable(table: Table, initValue: Int, config: WasmInstanceConfig
  *
  * 最初のページ数が上限を超える、または確保を断られたら [MemoryLimitFailure] を投げる。
  */
-private fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
+internal fun createMemory(limits: MemoryLimits, config: WasmInstanceConfig, created: MutableList<ReleasableMemory>): EndiveMemory {
     val initial = limits.initialPages()
     val max = minOf(limits.maximumPages(), config.maxMemoryPages)
     if (initial > max) {

@@ -45,6 +45,8 @@ class WrittenPagesMemoryTest {
         }
 
         override fun releaseBytes(bytes: Long) {
+            // 本物（ProcessMemory.releaseBytes）と同じ約束: 返せるのは正のバイト数だけ。0 を返すと IllegalArgumentException（#946）
+            require(bytes > 0) { "バイト数は正: $bytes" }
             used -= bytes
             check(used >= 0)
         }
@@ -476,7 +478,8 @@ class WrittenPagesMemoryTest {
         val noBudget = FailingTable(OutOfMemoryError())
         catchOutOfMemory { WrittenPagesMemory(MemoryLimits(2, 4), null, tableFactory = noBudget) }
         assertEquals(listOf(2 * 16), noBudget.sizes)
-        // 最初のページが 0 なら数えないので、返しもしない（返すと Budget の check が落ちる）
+        // 最初のページが 0 なら数えないので、返しもしない（返すと Budget の releaseBytes の require(bytes > 0) が落ちて、
+        // 元の OutOfMemoryError を隠す。本物の ProcessMemory.releaseBytes と同じ約束）
         val empty = Budget(Long.MAX_VALUE)
         catchOutOfMemory { WrittenPagesMemory(MemoryLimits(0, 1), empty, tableFactory = FailingTable(OutOfMemoryError())) }
         assertEquals(0L, empty.used)
