@@ -46,22 +46,27 @@ import java.util.IdentityHashMap
  *   resource を定義するインスタンス型・コンポーネント型は、import・export の宣言のたびにも（インスタンス化とは別に）その型の
  *   export を新しい `Remapping` で全部写し直す（`prepare_instance_import`・`prepare_instance_export`）ので、宣言ごとに 1 回数える
  *
- * - 型のたどり（#955）: wasmparser は、次の 2 か所で、型を覚えずに（同じ宣言を共有していても、展開した大きさの分）たどる。
- *   どちらも、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型（`(tuple $t(k-1) $t(k-1))` を 17 段。展開すると
+ * - 型のたどり（#955）: wasmparser は、次の 3 か所で、型を覚えずに（同じ宣言を共有していても、展開した大きさの分）たどる。
+ *   どれも、インスタンス化も型の確認もないまま、宣言を共有して膨らむ型（`(tuple $t(k-1) $t(k-1))` を 17 段。展開すると
  *   約 52 万、宣言は 18 個）で検証を秒単位にできた（入れ子のコンポーネントごとに、その tuple を引数に持つ関数を import する
  *   120 個・6 KB で CPU 3.9 秒、入れ子のコンポーネントから `alias outer` で 480 回引く 2 KB で 2.8 秒。#935 のレビュー）。
  *   - コンポーネントの境界をまたぐ型の `alias outer`（`alias_type`）は、引いた型の自由変数（resource）をたどる
  *     （`free_variables_any_type_id`）。境界をまたぐのは、count 段外側の 1 つ内側がコンポーネントのとき（[Walker.aliasScan]）
  *   - コンポーネントとコンポーネント型の import・export は、宣言ごとに名前の確かめ（`validate_and_register_named_types`）と、
  *     終わりの自由変数のたどり（`finish`）で 2 回たどる（インスタンス型の中の export はどちらもしない。[Walker.externScan]）
+ *   - `realloc` を指定しない `canon lower` は、結果の型が ptr を含むか（`ComponentFuncType::lower` の `contains_ptr`）を、
+ *     tuple・record・variant を `any` で、覚えずにたどって確かめる（中が全部 u32 でも打ち切られない）。関数の型のたどる大きさを
+ *     上限として数える（`canon` の宣言ごとに 1 回。指定があれば確かめない。[Walker.component] の `Canons`）
  *
  *   たどる大きさ [Info.scan] は展開した大きさだが、enum・flags の名前を数えない（wasmparser のたどりも名前を見ない）。
+ *   variant は全 case を回るので、型を持たない case も 1 と数える（型の大きさ（`TypeInfo`）には入らないので、100 万の上限は抑えない）。
  *   インスタンス型・インスタンスは export だけ、コンポーネント型・コンポーネントは import と export をたどる。
  *   1 ノードの手間は、見積もりの単位（写し直し・型の確認）よりずっと小さいので、[SCAN_NODES_PER_UNIT] ノードを 1 と数える
  *   （切り上げ。ADR 0262 の「検証の時間の見積もり」の測定）
  *
  * 引けない型を最大とするので、実際より大きい側にずれる。
  * #666 で探した形（core のインスタンス化の引数、resource と canon）は、入力の大きさに比例するだけだった（ADR 0262）。
+ * ただし canon のうち、`realloc` を指定しない lower だけは、型を共有して膨らむ結果の型をたどるので、上の 3 つ目として数える。
  * resource を多く export するインスタンスを、export の並びで作るインスタンス（[InstanceExpr.FromExports]）で何度も
  * export する形も、型の確認もインスタンス化もないので、見積もりがほぼ 0 のまま検証が時間の上限に届く
  * （`(sub resource)` 2,000 個のインスタンスを 499 回 export する並び 40 個・174 KB。#935 のレビュー。#964 で扱う）。
@@ -474,6 +479,11 @@ internal object ComponentValidationCost {
                     // canon lift は関数を足す（その型）。ほかの canon は core の関数を足す
                     is ComponentSection.Canons -> for (item in section.items) {
                         if (item is Canon.Lift) s.funcs += s.types.getOrNull(item.typeIndex)
+                        // realloc のない canon lower は、wasmparser が結果の型に ptr を含むか（`contains_ptr`）を、覚えずにたどって確かめる
+                        // （tuple・record・variant を、中が全部 u32 でも打ち切らずに、展開した大きさの分）。関数の型のたどる大きさで数える（上限）
+                        if (item is Canon.Lower && item.options.none { it is CanonOption.Realloc }) {
+                            scanned(s.funcs.getOrNull(item.func)?.scan ?: maxScan)
+                        }
                     }
                     // core のインスタンスとモジュールは、型の確認の見積もりには使わない
                     is ComponentSection.CoreInstances,
@@ -643,6 +653,8 @@ internal object ComponentValidationCost {
                 is DefValType.Record -> for (f in def.fields) n = sum(n, v(f.type))
                 is DefValType.Variant -> for (c in def.cases) {
                     full = add(full, 1)
+                    // wasmparser のたどりは全 case を回す。型を持たない case も 1 と数える（型の大きさ（`TypeInfo`）には入らない）
+                    scan = add(scan, 1)
                     n = sum(n, 1 + v(c.type))
                 }
                 is DefValType.Tuple -> for (t in def.types) n = sum(n, v(t))

@@ -1481,6 +1481,115 @@ class ComponentLoaderTest {
         assertTrue(inComponent.scanCost >= 2 * sharedTupleScan / 16) { "${inComponent.scanCost}" }
     }
 
+    /**
+     * [prelude]（コンポーネントの中身）で定義した型 `$x` の、見積もりが持つ「たどる大きさ」（#955）。入れ子のコンポーネントから
+     * `alias outer 1` を 16 回引いた分の差で測る（16 ノードを 1 と数えるので、16 回なら 1 回 1 ノードの誤差もなく大きさそのもの）
+     */
+    private fun scanOf(prelude: String): Long {
+        val aliases = (0 until 16).joinToString(" ") { "(alias outer 1 ${'$'}x (type))" }
+        val with = estimateOf(wat("(component $prelude (component $aliases))")).scanCost
+        val base = estimateOf(wat("(component $prelude (component))")).scanCost
+        return with - base
+    }
+
+    /** [prelude] のコンポーネントに [extra] を足したときに増える、型のたどりの分（見積もりの単位。16 ノードで 1） */
+    private fun scanDelta(prelude: String, extra: String): Long =
+        estimateOf(wat("(component $prelude $extra)")).scanCost - estimateOf(wat("(component $prelude)")).scanCost
+
+    @Test
+    fun `型のたどる大きさは種類ごとに積み上がる`() {
+        // variant は、型を持たない case も 1 と数える（wasmparser のたどりは全 case を回す）。enum・flags の名前は数えない
+        assertEquals(4L, scanOf("""(type ${'$'}x (variant (case "a") (case "b") (case "c")))"""))
+        assertEquals(4L, scanOf("""(type ${'$'}x (variant (case "a" u32) (case "b")))"""))
+        assertEquals(1L, scanOf("""(type ${'$'}x (enum "a" "b" "c"))"""))
+        assertEquals(1L, scanOf("""(type ${'$'}x (flags "a" "b" "c"))"""))
+        assertEquals(3L, scanOf("""(type ${'$'}x (record (field "a" u32) (field "b" u32)))"""))
+        // 参照は、参照先のたどる大きさを足す
+        assertEquals(sharedTupleScan, scanOf("$sharedTuples (type ${'$'}x (tuple ${'$'}t16 ${'$'}t16))"))
+        val f = "(type ${'$'}f (func (param \"p\" ${'$'}t17)))"
+        assertEquals(sharedTupleScan + 1, scanOf("$sharedTuples (type ${'$'}x (func (param \"p\" ${'$'}t17)))"))
+        // インスタンス型は export だけ、コンポーネント型は import と export の合計
+        val inst = "(type ${'$'}x (instance (alias outer 1 ${'$'}f (type ${'$'}g)) (export \"e\" (func (type ${'$'}g)))))"
+        assertEquals(sharedTupleScan + 2, scanOf("$sharedTuples $f $inst"))
+        val export = "(type ${'$'}x (component (alias outer 1 ${'$'}f (type ${'$'}g)) (export \"e\" (func (type ${'$'}g)))))"
+        assertEquals(sharedTupleScan + 2, scanOf("$sharedTuples $f $export"))
+        val both = "(type ${'$'}x (component (alias outer 1 ${'$'}f (type ${'$'}g)) (import \"i\" (func (type ${'$'}g))) (export \"e\" (func (type ${'$'}g)))))"
+        assertEquals(2 * sharedTupleScan + 3, scanOf("$sharedTuples $f $both"))
+        // import した型（`(type (eq ..))`）は、写して作った型でも、元のたどる大きさを持つ
+        assertEquals(sharedTupleScan, scanOf("$sharedTuples (import \"t\" (type ${'$'}x (eq ${'$'}t17)))"))
+    }
+
+    @Test
+    fun `型を持たないcaseの多いvariantを入れ子にして引く形は検証の前に断る`() {
+        // #955 のレビュー: variant の型を持たない case は、型の大きさ（TypeInfo）に入らないので wasmparser の 100 万の上限が抑えないが、
+        // 自由変数のたどりは全 case を回る。case 1,000 個の variant を 1,000 個並べた tuple を、入れ子から引く
+        val cases = (0 until 1_000).joinToString(" ") { "(case \"c$it\")" }
+        val prelude = "(type ${'$'}v (variant $cases)) (type ${'$'}x (tuple ${"${'$'}v ".repeat(1_000)}))"
+        assertEquals(1_001_001L, scanOf(prelude))
+        fun aliased(n: Int) =
+            wat("(component $prelude (component ${(0 until n).joinToString(" ") { "(alias outer 1 ${'$'}x (type))" }}))")
+        val bomb = aliased(40)
+        assertEquals(0L, estimateOf(bomb).remapCost)
+        rejectedBeforeValidation(bomb)
+        // 1 回なら上限の十分内側で、検証も通る
+        assertTrue(estimateOf(aliased(1)).cost * 20 < ComponentLimits.DEFAULT.maxValidationCost)
+        assertDoesNotThrow { ComponentLoader.load(aliased(1)) }
+    }
+
+    @Test
+    fun `インスタンス化・export・exportの並びで作った型のたどりは export したときに数える`() {
+        val tuple = "(alias outer 1 ${'$'}t17 (type ${'$'}a))"
+        val export2 = 2 * (sharedTupleScan + 1) / 16
+        fun nearly(expected: Long, actual: Long) = assertTrue(actual in expected - 1..expected + 1) { "$expected ± 1 のはずが $actual" }
+        // インスタンス化でできるインスタンス（そのコンポーネントの export の分。import は引数で置き換わる）
+        val c = "(component ${'$'}c $tuple (export \"t\" (type ${'$'}a)))"
+        nearly(export2, scanDelta("$sharedTuples $c", "(instance ${'$'}i (instantiate ${'$'}c)) (export \"i\" (instance ${'$'}i))"))
+        // コンポーネントは import と export の両方（export だけの分ではない）
+        val c2 = "(component ${'$'}c $tuple (type ${'$'}f (func (param \"p\" ${'$'}a))) (import \"p\" (func (type ${'$'}f))) (export \"t\" (type ${'$'}a)))"
+        nearly(2 * (2 * sharedTupleScan + 2) / 16, scanDelta("$sharedTuples $c2", "(export \"c\" (component ${'$'}c))"))
+        // export の並びで作るインスタンス
+        nearly(export2, scanDelta(sharedTuples, "(instance ${'$'}j (export \"t\" (type ${'$'}t17))) (export \"j\" (instance ${'$'}j))"))
+        // 型の export
+        nearly(2 * sharedTupleScan / 16, scanDelta(sharedTuples, "(export \"x\" (type ${'$'}t17))"))
+        // 関数の export は、渡した関数の型で数える
+        val big = "(type ${'$'}g (func (param \"p\" ${'$'}t17)))"
+        nearly(export2, scanDelta("$sharedTuples $big (import \"f\" (func ${'$'}f (type ${'$'}g)))", "(export \"g\" (func ${'$'}f))"))
+        // 型を付けた export は、付けた型で数える（渡した関数が小さくても、付けた型が大きければ大きい）
+        val small = "(type ${'$'}small (func))"
+        nearly(export2, scanDelta("$sharedTuples $big $small (import \"f\" (func ${'$'}f (type ${'$'}small)))", "(export \"g\" (func ${'$'}f) (func (type ${'$'}g)))"))
+        // 付けた型が小さければ、渡した関数が大きくても小さい
+        assertTrue(scanDelta("$sharedTuples $big $small (import \"f\" (func ${'$'}f (type ${'$'}g)))", "(export \"g\" (func ${'$'}f) (func (type ${'$'}small)))") <= 1)
+    }
+
+    @Test
+    fun `引けない型のalias outerは、それまでのたどる大きさの最大で数える`() {
+        fun aliased(n: Int) = wat("(component $sharedTuples (component ${(0 until n).joinToString(" ") { "(alias outer 1 999 (type))" }}))")
+        assertEquals(sharedTupleScan, estimateOf(aliased(16)).scanCost - estimateOf(aliased(0)).scanCost)
+    }
+
+    @Test
+    fun `reallocのないcanon lowerは結果の型のたどりを数える`() {
+        val prelude = """
+            $sharedTuples
+            (type ${'$'}ft (func (result ${'$'}t17)))
+            (import "f" (func ${'$'}f (type ${'$'}ft)))
+            (core module ${'$'}m (memory (export "m") 1) (func (export "r") (param i32 i32 i32 i32) (result i32) unreachable))
+            (core instance ${'$'}mi (instantiate ${'$'}m))
+            (alias core export ${'$'}mi "m" (core memory ${'$'}mem))
+            (alias core export ${'$'}mi "r" (core func ${'$'}r))
+        """.trimIndent()
+        fun lowers(n: Int, options: String) = (0 until n).joinToString(" ") { "(core func (canon lower (func ${'$'}f) (memory ${'$'}mem)$options))" }
+        // 関数の型は 1 + 結果の tuple（52 万ノード）。1 回 32,768 単位
+        assertEquals(32_768L, scanDelta(prelude, lowers(1, "")))
+        assertEquals(10 * 32_768L, scanDelta(prelude, lowers(10, "")))
+        // realloc があれば、wasmparser は結果の型を確かめない
+        assertEquals(0L, scanDelta(prelude, lowers(10, " (realloc ${'$'}r)")))
+        // canon の上限（10 万個）には届かない数でも、断る（1 万個で約 52 億ノード）
+        val bomb = wat("(component $prelude ${lowers(100, "")})")
+        assertEquals(0L, estimateOf(bomb).remapCost)
+        rejectedBeforeValidation(bomb)
+    }
+
     @Test
     fun `検証中にスレッドが割り込まれたらloadは内容の失敗にしない`() {
         ComponentValidator.warmUp()
