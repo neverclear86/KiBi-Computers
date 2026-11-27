@@ -205,6 +205,30 @@ class AsyncifyLivenessTest {
         }
     }
 
+    /**
+     * [Program.loadMetered] で読み込んだ `run` を、燃料を少しずつ渡して切れるたびに巻き戻しながら動かし、(結果, 燃料切れで巻き戻した回数) を返す。
+     * `w.wait` は巻き戻さずに 41 を返す
+     */
+    private fun runMetered(module: WasmModule): Pair<Long, Int> {
+        val stack = Stack()
+        val handler = Unwinder(grant = 1)
+        val config = WasmInstanceConfig.builder()
+            .hostFunction("w", "wait", WasmFunctionType.of(emptyList(), listOf(WasmValueType.I32))) { _, _ -> longArrayOf(41) }
+            .asyncStack(stack)
+            .fuel(0, handler)
+            .build()
+        return module.instantiate(config).use { instance ->
+            var result = instance.call("run")
+            while (instance.asyncState == WasmAsyncState.UNWINDING) {
+                instance.asyncState = WasmAsyncState.REWINDING
+                instance.fuel = 1
+                result = instance.call("run")
+            }
+            assertTrue(stack.values.isEmpty())
+            result[0] to handler.unwinds
+        }
+    }
+
     @Test
     fun `catchの先でだけ読むローカルも退避する`() {
         // local 0 = 42; block (try_table (catch 0 0) call wait; drop; throw 0 end; i32.const 0; return) end; local.get 0
@@ -514,6 +538,42 @@ class AsyncifyLivenessTest {
         )
         assertTrue(EndiveRuntime().load(Asyncify.transform(wasm, setOf("w.wait")).bytes).isAsyncified)
         for (debug in AsyncifyDebug.entries) assertEquals(48L, runWithWait(wasm, debug), "$debug")
+        // exec の経路（燃料の計測コードの挿入 → 変換）でも、段1で変換でき、燃料切れで巻き戻しても動く
+        val program = Program.loadMetered(EndiveRuntime(), wasm, null, setOf("w.wait"))
+        assertTrue(program.fuelYield)
+        assertNull(program.fuelYieldRejection)
+        val (result, unwinds) = runMetered(program.module)
+        assertEquals(48L, result)
+        assertTrue(unwinds > 0, "燃料切れで巻き戻していない")
+    }
+
+    @Test
+    fun `燃料の確かめを入れたloopをまたいでcall_refで呼ぶ形は、段1だけ断られて段2で読み込める`() {
+        // ref.func → 止まらない loop → call_ref $v_l。燃料の挿入は loop の先頭に燃料の確かめを入れるので、段1では loop が待ち点の構造になり、参照がまたぐ
+        val wasm = callRefModule(
+            """
+            (func (export "run") (result i32)
+              (call ${'$'}wait)
+              (ref.func ${'$'}seven)
+              (loop)
+              (call_ref ${'$'}v_l)
+              i32.wrap_i64
+              i32.add)
+            """.trimIndent(),
+        )
+        EndiveRuntime().load(wasm)
+        // 燃料の確かめがなければ、待ち点をまたがないので変換できる
+        assertEquals(48L, runWithWait(wasm, AsyncifyDebug.NONE))
+        val metered = FuelInjector.inject(wasm)
+        val e = assertThrows<AsyncifyUnsupported> {
+            Asyncify.transform(metered.bytes, setOf("w.wait"), Instrumentation.YIELD_IMPORT, metered::originalFunc, fuelSites = metered.sites)
+        }
+        assertTrue(e.message!!.contains("call_ref で呼ぶこと"), e.message)
+        // 読み込みは段2（燃料切れを待ち点にしない）に落ちて、理由を持つ。巻き戻しは入力待ちでだけ起きる
+        val program = Program.loadMetered(EndiveRuntime(), wasm, null, setOf("w.wait"))
+        assertEquals(false, program.fuelYield)
+        assertTrue(program.fuelYieldRejection?.contains("call_ref で呼ぶこと") == true, program.fuelYieldRejection)
+        assertEquals(48L, runMetered(program.module).first)
     }
 
     @Test
