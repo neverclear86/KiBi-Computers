@@ -845,20 +845,26 @@ class StackExhaustionLockTest {
             h.scheduler.hooks.afterUnregister = { mm, _ ->
                 if (mm === m && firstWorker.compareAndSet(null, Thread.currentThread())) {
                     atFirst.countDown()
-                    releaseFirst.await(20, TimeUnit.SECONDS)
+                    releaseFirst.await()
                 }
             }
             h.scheduler.hooks.afterFinish = { mm, _ ->
                 if (mm === m) {
                     atFinish.countDown()
-                    releaseFinish.await(20, TimeUnit.SECONDS)
+                    releaseFinish.await()
                 }
             }
+            // 期限なしの門（#916）。落ちたときは、close の前に開けてワーカーを残さない
+            h.releaseOnClose {
+                releaseFirst.countDown()
+                releaseFinish.countDown()
+            }
             val rt = m.spawnRt(h.program(emptyModule()), driver)
-            assertTrue(atFirst.await(10, TimeUnit.SECONDS), "最初の step が終わらない")
+            // 期限なしで待つ（#916。止まったときは、外側の assertTimeoutPreemptively の 30 秒で落ちる）
+            atFirst.awaitOrFail("最初の step が終わらない")
             // 起こすと、次の step が別のワーカーで始まり、終わって（EXITED）CPU を返す前で止まる
             m.lock.withLockValue { stream.write(ByteArray(1), 0, 1, m.wakeSink) }
-            assertTrue(atFinish.await(10, TimeUnit.SECONDS), "次の step が終わらない")
+            atFinish.awaitOrFail("次の step が終わらない")
             assertEquals(ProcessState.EXITED, rt.process.state)
             assertTrue(m.cpu.currentOwner === rt, "終わったプロセスが CPU の持ち主のはず")
             // 前の step のワーカーが安全網を通る

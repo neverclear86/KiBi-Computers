@@ -50,8 +50,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /** 起動シーケンス（/sbin/init）と停止・再起動（#49） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class BootTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -371,7 +373,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(BootConfig.builder().firmwareProgram(exe(foreverInit())).build()))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         m.stop()
         release.countDown()
         eventually { !m.isBooting }
@@ -542,7 +544,7 @@ class BootTest {
             assertTrue(m.reboot())
             assertFalse(m.isRunningOrBooting, "isRunningOrBooting は再起動の途中を含まない")
             assertTrue(m.isRunningBootingOrRebooting, "reboot を受け付けた直後")
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             h.scheduler.hooks.beforeUnregister = null
             tickFor(50)
             assertEquals(MachineState.STOPPED, m.state)
@@ -761,7 +763,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.isBooting)
         assertFalse(m.boot(bootDisks("d")), "起動の途中は受け付けない")
         m.stop()
@@ -786,7 +788,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.reboot())
         release.countDown()
         tickUntil { host.reboots.get() == 1 && host.states().isNotEmpty() }
@@ -807,7 +809,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertTrue(m.isBooting)
         assertTrue(m.reboot())
         assertTrue(m.isBooting, "起動の手順はまだ終わっていない")
@@ -1151,7 +1153,7 @@ class BootTest {
             }
         }
         assertTrue(m.boot(bootDisks("d1")))
-        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        aEntered.awaitOrFail()
         m.stop()
         val bHost = Recorder()
         val b = h.machine(host = bHost)
@@ -1202,7 +1204,7 @@ class BootTest {
             }
         }
         assertTrue(m.boot(withHome("h", "ro")))
-        assertTrue(aEntered.await(5, TimeUnit.SECONDS))
+        aEntered.awaitOrFail()
         m.stop()
         val bHost = Recorder()
         val b = h.machine(host = bHost)
@@ -1262,7 +1264,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         // プロセスは0個で、マウントの途中だが、待機点ではない
         assertEquals(emptyList<Int>(), pids())
         assertFalse(m.isAtWaitPoint, "起動の途中は待機点にしない")
@@ -1287,7 +1289,7 @@ class BootTest {
             release.await()
         }
         assertTrue(m.boot(bootDisks("d")))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         assertEquals(pro.ikili.kibicomputers.core.persist.SaveReadiness.TRANSIENT, m.saveReadiness())
         assertNull(m.captureSnapshot(pro.ikili.kibicomputers.core.persist.CapturePolicy.SKIP_IF_TRANSIENT))
         val copy = m.captureCopy(pro.ikili.kibicomputers.core.persist.CapturePolicy.KILL_TRANSIENT)!!
@@ -1383,7 +1385,7 @@ class BootTest {
         }
         try {
             assertTrue(m.reboot())
-            assertTrue(atGate.await(5, TimeUnit.SECONDS), "init のスレッドが登録を外す前に来ない")
+            atGate.awaitOrFail("init のスレッドが登録を外す前に来ない")
             h.scheduler.hooks.beforeUnregister = null
             tickFor(50)
             m.lock.withLockValue {

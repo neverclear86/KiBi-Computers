@@ -21,7 +21,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class StopTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -290,7 +292,7 @@ class StopTest {
                 }
             }
             val p = race.a.spawnTest(h.program(emptyModule()), race.waitDriver)
-            assertTrue(atGate.await(5, TimeUnit.SECONDS))
+            atGate.awaitOrFail()
             val sent = h.scheduler.interruptsSent.get()
             race.a.stop()
             assertEquals(sent + 1, h.scheduler.interruptsSent.get(), "登録されているので送る")
@@ -316,7 +318,7 @@ class StopTest {
                 }
             }
             val p = race.a.spawnTest(h.program(emptyModule()), race.waitDriver)
-            assertTrue(atGate.await(5, TimeUnit.SECONDS))
+            atGate.awaitOrFail()
             val sent = h.scheduler.interruptsSent.get()
             race.a.stop()
             assertEquals(sent, h.scheduler.interruptsSent.get(), "登録がないので送らない")
@@ -349,10 +351,10 @@ class StopTest {
                 }
             }
             val p = race.a.spawnTest(h.program(emptyModule()), race.waitDriver)
-            assertTrue(stepAtGate.await(5, TimeUnit.SECONDS))
+            stepAtGate.awaitOrFail()
             val rtP = race.a.rt(p)
             val stopper = Thread { race.a.stop() }.apply { start() }
-            assertTrue(stopAtGate.await(5, TimeUnit.SECONDS))
+            stopAtGate.awaitOrFail()
             h.scheduler.hooks.beforeUnregister = null
             stepGate.countDown()
             Thread.sleep(50)
@@ -360,7 +362,7 @@ class StopTest {
             assertTrue(rtP.thread != null)
             h.scheduler.hooks.stopBeforeInterrupt = null
             stopGate.countDown()
-            stopper.join(5_000)
+            stopper.joinOrFail("stop が返らない")
             eventually { race.a.stateOf(p).isTerminal }
             assertState(ProcessState.KILLED, race.a, p)
             finishWithB(h, race)

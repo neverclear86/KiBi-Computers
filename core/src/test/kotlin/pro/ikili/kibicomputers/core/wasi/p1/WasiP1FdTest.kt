@@ -32,8 +32,12 @@ import pro.ikili.kibicomputers.core.runtime.WasmValueType
 import java.time.Duration
 import java.util.Collections
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** WASI p1 の fd_*（#70）。ダミーのモジュールから import を直接呼び、メモリの中身で確かめる */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class WasiP1FdTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -208,7 +212,7 @@ class WasiP1FdTest {
                 assertEquals(0, call("fd_write", 1, 100, 1, 300))
                 assertEquals(10, mem.readI32(300))
             }
-            reader.join(5_000)
+            reader.joinOrFail("読み手が 10 バイトを受け取らない")
             assertEquals("0123456789", synchronized(received) { received.toString(Charsets.UTF_8) })
         }
     }

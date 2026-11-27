@@ -13,11 +13,13 @@ import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * [MachineCpu] の予約（[MachineCpu.reserve]・[MachineCpu.acquire]・[MachineCpu.cancelReservation]）を直接確かめる（#742、#737）。
  * CPU の持ち主・待ち手には、燃料待ちのまま動かないプロセスの [ProcessRuntime] を使う（tick を進めないので、マシン自身の CPU は使わない）。
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class MachineCpuTest {
     private val limit = Duration.ofSeconds(60)
 
@@ -198,10 +200,10 @@ class MachineCpuTest {
                 }
             }
             t.start()
-            assertTrue(started.await(10, TimeUnit.SECONDS))
+            started.awaitOrFail()
             eventually(10_000) { !f.cpu.hasReservation(f.b) }
             t.interrupt()
-            t.join(10_000)
+            t.joinOrFail("割り込まれた待ち手が抜けない")
             assertTrue(thrown is InterruptedException, "割り込まれていない: $thrown")
             assertEquals(1, f.cpu.waiting, "割り込まれた待ち手が待ち行列に残っている")
             f.cpu.release(f.a)

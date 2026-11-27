@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
+import org.junit.jupiter.api.Timeout
 
 /** 「tick ごとに配る」素直な実装（参照の実装） */
 private class ReferenceFuel(val perTick: Long) {
@@ -42,6 +43,7 @@ private class ReferenceFuel(val perTick: Long) {
     }
 }
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class FuelAccountTest {
     private val perTick = 100L
 
@@ -359,7 +361,7 @@ class FuelAccountTest {
                     }
                 }),
             )
-            assertTrue(inHost.await(5, TimeUnit.SECONDS))
+            inHost.awaitOrFail()
             m.lock.withLockValue {
                 assertEquals(0, m.kernel.fuel)
                 assertEquals(t, m.fuelAccount.lastRefillTick)

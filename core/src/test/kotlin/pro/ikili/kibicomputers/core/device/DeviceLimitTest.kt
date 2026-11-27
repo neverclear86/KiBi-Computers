@@ -36,8 +36,12 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** 接続数の上限と、開いたデバイス（fd）からの info・methods・invoke・start（#66、ADR 0066） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class DeviceLimitTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -346,7 +350,7 @@ class DeviceLimitTest {
                 val seen = AtomicReference<List<Any?>>()
                 val t = Thread { seen.set(listOf(c.deviceInfo(fd), c.deviceMethods(fd))) }
                 t.start()
-                t.join(5_000)
+                t.joinOrFail("プロセスのスレッドの外から info・methods を呼べない")
                 got.set(seen.get())
             }
             assertEquals(listOf(DeviceInfo(a, "test:device"), listOf(MethodInfo("d", false), MethodInfo("w", true))), got.get())

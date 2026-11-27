@@ -25,8 +25,12 @@ import java.time.Duration
 import java.util.Collections
 import kotlin.concurrent.withLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** マシンにつなぐデバイスの表（#65、ADR 0065） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class DeviceBusTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -144,7 +148,7 @@ class DeviceBusTest {
                 val seen = arrayOfNulls<List<DeviceInfo>>(1)
                 val t = Thread { seen[0] = m.devices.list() }
                 t.start()
-                t.join(5_000)
+                t.joinOrFail("カーネルロックを持たれている間に一覧を読めない")
                 assertEquals(listOf(DeviceInfo(a, "test:recording")), seen[0])
             }
         }

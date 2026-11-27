@@ -44,6 +44,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * 写しの中で殺したプロセスの、復元の後の知らせ（#86、ADR 0086）。
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 戻した表では子が KILLED・`SIGKILL` のゾンビで、親に `CHILD_EXITED` が数えてあり、コンソールには受け手（画面をつなぐ）の後に
  * 1行ずつ知らせが出る。init を殺した写しは冷えた起動の前に1行出す
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class KilledOnSaveNoticeTest {
     @TempDir
     lateinit var dir: Path
@@ -288,7 +290,7 @@ class KilledOnSaveNoticeTest {
         }
         val m = h.machine()
         assertTrue(m.boot(BootConfig.builder().addBootDisk("d").build()))
-        assertTrue(reached.await(5, TimeUnit.SECONDS))
+        reached.awaitOrFail()
         if (reboot) assertTrue(m.reboot())
         val source = requireNotNull(m.captureSnapshot(CapturePolicy.KILL_TRANSIENT, null, FullSaveRule(1.0))) { "写しが取れない" }
         val identity = store.write(store.assignNewId(owner)!!, owner, source).identity

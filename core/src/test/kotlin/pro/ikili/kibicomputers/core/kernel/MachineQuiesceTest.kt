@@ -16,8 +16,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /** マシン1台だけを止める口（`Machine.quiesce`）と、保存できるかの判定（`Machine.saveReadiness`）のテスト（#81） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class MachineQuiesceTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -89,12 +91,13 @@ class MachineQuiesceTest {
                 h.program(emptyModule()),
                 TestDriver(ProcessKind.WAIT_POINT, onResume = { _, _ -> StepResult.Exit(0) }) {
                     entered.countDown()
-                    release.await(10, TimeUnit.SECONDS)
+                    release.await()
                     StepResult.Wait(listOf(gate.key))
                 },
             )
+            h.releaseOnClose { release.countDown() }
             h.scheduler.tick()
-            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            entered.awaitOrFail()
             assertEquals(SaveReadiness.TRANSIENT, m.saveReadiness())
             assertNull(m.captureSnapshot(CapturePolicy.SKIP_IF_TRANSIENT))
             val copy = m.captureCopy(CapturePolicy.KILL_TRANSIENT)!!

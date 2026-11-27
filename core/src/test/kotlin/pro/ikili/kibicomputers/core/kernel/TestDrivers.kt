@@ -26,7 +26,10 @@ import pro.ikili.kibicomputers.core.runtime.StateCaptureMode
 import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.validation.ModuleLimits
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.withLock
 
@@ -146,6 +149,16 @@ internal class Harness(
         SchedulerInternals(executor, workerIdleMillis, execRuntime ?: runtime, meterExecutables = execRuntime != null, moduleLimits = moduleLimits, timers = timers, asyncifyExecutables = asyncify, moduleStore = moduleStore, rebootBackoff = rebootBackoff, nanoTime = nanoTime),
     )
     private var counter = 0
+    private val closeActions = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /**
+     * [close] の最初（スケジューラを止める前）に [action] を呼ぶ（#916）。期限なしの門（フックの中の `release.await()` など）で止めた
+     * スレッドを、テストが門を開ける前に落ちても放してから止めるために使う（放さないと、close がスレッドの終わりを待って落ち、
+     * 残ったスレッドが後に続くテストの [assertNoKernelThreads] も落とす）。通った回は門がもう開いているので、何もしない
+     */
+    fun releaseOnClose(action: () -> Unit) {
+        closeActions += action
+    }
 
     /** 通知の記録（tick() の中で配られたもの） */
     val events: MutableList<Pair<Long, MachineState>> = java.util.Collections.synchronizedList(ArrayList())
@@ -187,6 +200,7 @@ internal class Harness(
     fun module(program: Program): WasmModule = program.module
 
     override fun close() {
+        closeActions.forEach { it() }
         scheduler.close()
         assertTrue(scheduler.awaitTermination(10_000), "スケジューラが終わらない")
         assertNoKernelThreads()
@@ -208,18 +222,69 @@ internal fun Machine.spawnRt(program: Program, driver: ProcessDriver, options: S
 
 internal fun Machine.stateOf(pid: Int): ProcessState = processState(pid)!!
 
-/** [condition] が true になるまで待つ（最大 [timeoutMillis]） */
+/**
+ * [condition] が true になるまで待つ。
+ *
+ * 期限は合否に使わない（#916）。実スレッドの完了を壁時計の短い期限で待つと、負荷の高い CI で正しく動いていても落ちるため。
+ * [timeoutMillis] は遅れを報告する閾値で、過ぎたら [message] を [SLOW_WAIT_MARKER] で始まる行として標準出力に出し（core の `test`
+ * タスクが Gradle のコンソールに写す）、そのまま待ち続ける。止まったときは、保険のタイムアウト（`:core:test` の既定のタイムアウトか、
+ * クラス・メソッドの `@Timeout`）がテストのスレッドに割り込み、[message] を付けて落ちる
+ */
 internal fun eventually(timeoutMillis: Long = 5_000, message: String = "条件がそろわない", condition: () -> Boolean) =
     eventuallyDescribe(timeoutMillis, { message }, condition)
 
-/** [eventually] の、失敗したときの説明を後で作る形 */
+/** [eventually] の、遅れの報告と失敗の説明を後で作る形（期限は合否に使わない。#916） */
 internal fun eventuallyDescribe(timeoutMillis: Long = 5_000, describe: () -> String, condition: () -> Boolean) {
-    val deadline = System.currentTimeMillis() + timeoutMillis
+    val start = System.nanoTime()
+    var reported = false
     while (!condition()) {
-        if (System.currentTimeMillis() > deadline) fail(describe())
-        Thread.sleep(1)
+        if (!reported && System.nanoTime() - start > timeoutMillis * 1_000_000) {
+            reported = true
+            reportSlowWait("${(System.nanoTime() - start) / 1_000_000} ms を超えた: ${describe()}")
+        }
+        failOnInterrupt(describe) { Thread.sleep(1) }
     }
 }
+
+/** 待ちが遅れたことを報告する行の頭（#916）。core の `test` タスクが、この頭の行を Gradle のコンソール（CI のログ）に写す */
+internal const val SLOW_WAIT_MARKER = "#916 遅れ"
+
+/** [text] を、行ごとに [SLOW_WAIT_MARKER] を付けて標準出力に出す（Gradle は標準出力を行ごとに受け取り、頭の付いた行だけを写すため） */
+internal fun reportSlowWait(text: String) {
+    println(text.lines().joinToString("\n") { "$SLOW_WAIT_MARKER: $it" })
+}
+
+/**
+ * [block] が割り込まれたら、割り込みのフラグを立て直してから、[describe] の説明を付けて落とす（#916）。
+ *
+ * 期限なしの待ちを抜けるのは、保険のタイムアウトの割り込みだけ。フラグを立て直さないと、後始末（`finally` の `join()` など）が
+ * 2 回目の割り込みを待って止まり続ける（JUnit は 1 回しか割り込まない）
+ */
+internal inline fun <T> failOnInterrupt(describe: () -> String, block: () -> T): T =
+    try {
+        block()
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        throw AssertionError("待っている間に割り込まれた（止まったときの保険のタイムアウト。#916）: ${describe()}", e)
+    }
+
+/** 期限なしで [CountDownLatch.await] する（#916）。割り込まれたら [message] を付けて落ちる */
+internal fun CountDownLatch.awaitOrFail(message: String = "ラッチが開かない") {
+    failOnInterrupt({ "$message（残り $count）" }) { await() }
+}
+
+/** 期限なしで [Thread.join] する（#916）。割り込まれたら [message] と、相手のスレッドのスタックを付けて落ちる */
+internal fun Thread.joinOrFail(message: String = "スレッドが終わらない") {
+    failOnInterrupt({ "$message: $name\n${stackTrace.joinToString("\n") { "    at $it" }}" }) { join() }
+}
+
+/** 期限なしで [ExecutorService.awaitTermination] する（#916。テストが作ったプールに使う）。割り込まれたら [message] を付けて落ちる */
+internal fun ExecutorService.awaitTerminationOrFail(message: String = "プールのスレッドが終わらない") {
+    failOnInterrupt({ message }) { while (!awaitTermination(1, TimeUnit.DAYS)) Unit }
+}
+
+/** 期限なしで [Future.get] する（#916）。割り込まれたら [message] を付けて落ちる */
+internal fun <T> Future<T>.getOrFail(message: String = "結果が届かない"): T = failOnInterrupt({ message }) { get() }
 
 /**
  * init が CPU を取って動き出し、専用スレッドの登録を済ませた（`register()` の後・`unregister()` の前）か。
@@ -265,10 +330,23 @@ internal fun Harness.awaitRestoreCleanup(m: Machine) {
     repeat(3) { scheduler.tick() }
 }
 
-/** 名前が `KiBi-` で始まるスレッドが残っていない */
+/**
+ * 名前が `KiBi-` で始まるスレッドが残っていない。
+ *
+ * [eventually] と違い、期限で落とす（#916）。JVM 全体のスレッドを見るので、前のテストが漏らしたスレッドがあると、後に続く
+ * [Harness] のテストがすべてここで止まり、保険のタイムアウト（10 分）が 1 本ずつ積み重なって CI の段の上限を超えるため。
+ * 期限は、負荷の高い CI でスレッドが終わるのに十分な長さにする
+ */
 internal fun assertNoKernelThreads() {
-    eventually(5_000, "カーネルのスレッドが残っている: ${kernelThreadNames()}") { kernelThreadNames().isEmpty() }
+    val deadline = System.nanoTime() + KERNEL_THREADS_EXIT_MILLIS * 1_000_000
+    while (kernelThreadNames().isNotEmpty()) {
+        if (System.nanoTime() > deadline) fail("カーネルのスレッドが残っている: ${kernelThreadNames()}")
+        failOnInterrupt({ "カーネルのスレッドが残っている: ${kernelThreadNames()}" }) { Thread.sleep(1) }
+    }
 }
+
+/** [assertNoKernelThreads] が、スレッドが終わるのを待つ上限 */
+private const val KERNEL_THREADS_EXIT_MILLIS = 30_000L
 
 internal fun kernelThreadNames(prefix: String = "KiBi-"): List<String> =
     Thread.getAllStackTraces().keys.filter { it.isAlive && it.name.startsWith(prefix) }.map { it.name }

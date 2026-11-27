@@ -22,8 +22,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
+import pro.ikili.kibicomputers.core.kernel.awaitOrFail
 
 /** 1台・1 tick の、メインスレッドでの端末の処理量（#357・#355）。同梱イメージ testboot（Lua の REPL）で、実際の出力を流す */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ScreenDeviceBudgetTest {
     private val limit = Duration.ofSeconds(90)
     private val testBootDisk = BootConfig.IMAGE_DISK_PREFIX + "testboot"
@@ -122,7 +125,7 @@ class ScreenDeviceBudgetTest {
             b.machine.scheduler.hooks.beforeConsoleFlush = { _, _ ->
                 if (armed.compareAndSet(true, false)) {
                     reached.countDown()
-                    go.await(30, TimeUnit.SECONDS)
+                    go.await()
                 }
             }
             b.keyboard.input(KeyboardEvent.Paste("while true do io.write((\"\\27[Sx\"):rep(5000)) end\n"))
@@ -162,14 +165,14 @@ class ScreenDeviceBudgetTest {
                 b.console.display.lock.lock()
                 try {
                     holding.countDown()
-                    release.await(30, TimeUnit.SECONDS)
+                    release.await()
                 } finally {
                     b.console.display.lock.unlock()
                 }
             }
             holder.start()
             try {
-                assertTrue(holding.await(10, TimeUnit.SECONDS))
+                holding.awaitOrFail("表示デバイスのロックを持てない")
                 // その間も、Lua は TTY に書き、TTY の印を積む（表示デバイスに書けずに待つ）
                 repeat(20) {
                     val start = System.nanoTime()

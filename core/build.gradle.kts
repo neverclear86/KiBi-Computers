@@ -67,11 +67,19 @@ tasks.test {
         events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
-    // 負荷の下で 10 秒を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で始まる行を標準出力に出す）は、
-    // 通った回もコンソールと CI のログに写す（#868。標準出力のすべては写さない）
+    // 止まったときの保険（#916）。実スレッドの完了は期限なしで待つ（eventually・awaitOrFail など。TestDrivers.kt）ので、止まったテストを
+    // 1 本 10 分で落とす（合否の基準ではない）。既定のタイムアウトは、テストのメソッドに加えて @BeforeEach などにも効く。
+    // :core:test だけに入れる（stackHeadroom の起動は -Xint で 1 本が長いので入れない）。ベンチマーク（下の kibi.*Benchmark・
+    // kibi.luaReplMachines）を回すときは入れない。`-Pkibi.test.timeoutDefault=<JUnit の書式。例: 30 m>` で変えられる
+    val benchmarkOn = listOf("kibi.overdraftBenchmark", "kibi.asyncifyBenchmark", "kibi.asyncifyFuelBenchmark", "kibi.luaReplMachines")
+        .any { providers.gradleProperty(it).orNull != null }
+    (providers.gradleProperty("kibi.test.timeoutDefault").orNull ?: if (benchmarkOn) null else "10 m")
+        ?.let { systemProperty("junit.jupiter.execution.timeout.default", it) }
+    // 負荷の下で閾値を超えてからそろった遅れ（StackExhaustionLockTest が「#868 遅れ」で、TestDrivers.kt の eventually が「#916 遅れ」で
+    // 始まる行を標準出力に出す）は、通った回もコンソールと CI のログに写す（#868・#916。標準出力のすべては写さない）
     val testLogger = logger
     addTestOutputListener { descriptor, event ->
-        if (event.message.startsWith("#868 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
+        if (event.message.startsWith("#868 遅れ") || event.message.startsWith("#916 遅れ")) testLogger.lifecycle("${descriptor.className} > ${descriptor.name}: ${event.message.trimEnd()}")
     }
     // システムコール仕様書（#79）が実装と WIT からずれていないことを確かめる SyscallDocTest が読むファイル。
     // 入力に宣言しないと、文書だけを変えた変更では :core:test が UP-TO-DATE かビルドキャッシュからの復元になり、テストが走らない

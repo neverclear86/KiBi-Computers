@@ -59,11 +59,15 @@ import java.util.logging.LogRecord
 import java.util.logging.Logger
 import kotlin.concurrent.withLock
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.failOnInterrupt
 
 /**
  * [ComputerCase.startRestore] の [RestoreReady]（接続層のデバイスのつなぎ）が投げても、後の手順（配り直し・冷えた起動・`finished`・
  * 同期の起動）が走り、例外は [Machine] が「復元の受け手」として1回だけログに出すこと（#677）
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ComputerCaseRestoreStepsTest {
     @TempDir
     lateinit var dir: Path
@@ -112,13 +116,11 @@ class ComputerCaseRestoreStepsTest {
         }
     }
 
-    /** [manager] を tick して [condition] を待つ */
+    /** [manager] を tick して [condition] を待つ（期限なし。止まったときはクラスの @Timeout が割り込む。#916） */
     private fun tickUntil(manager: MachineManager<String>, message: String, condition: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 10_000
         while (!condition()) {
-            if (System.currentTimeMillis() > deadline) throw AssertionError(message)
             manager.tick()
-            Thread.sleep(1)
+            failOnInterrupt({ message }) { Thread.sleep(1) }
         }
     }
 
@@ -233,15 +235,13 @@ class ComputerCaseRestoreStepsTest {
             )
             // tickUntil は条件が偽のたびに囲まずに tick するので、ここでは使わない（知らせがその tick から出ると catch を抜ける）
             var thrown: Throwable? = null
-            val deadline = System.currentTimeMillis() + 10_000
             while (thrown == null) {
-                if (System.currentTimeMillis() > deadline) throw AssertionError("致命的なエラーが tick の外へ届かない")
                 try {
                     manager.tick()
                 } catch (e: OutOfMemoryError) {
                     thrown = e
                 }
-                Thread.sleep(1)
+                failOnInterrupt({ "致命的なエラーが tick の外へ届かない" }) { Thread.sleep(1) }
             }
             assertEquals("つなぎ", thrown.message)
             assertTrue(finished.isEmpty(), "finished は呼ばない")

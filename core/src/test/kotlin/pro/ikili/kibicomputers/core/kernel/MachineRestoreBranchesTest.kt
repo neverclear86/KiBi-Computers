@@ -69,6 +69,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * 復元（#85、ADR 0085）の主な分岐（#578、#590）: 差分の世代から戻す、RUNNABLE のプロセス（燃料待ち・イベントで起きたが燃料がない・
@@ -79,6 +80,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  * 戻す前に書いた世代そのもの（状態・待ち・差分か）を確かめてから戻す（「戻って動いた」だけでは、思った形で保存していなくても通るため）。
  * [savePrompt] を使うもの（MODULE_MISMATCH の 2 件・MOUNT）は、落ちる原因がモジュール・ディスクの側にあるので、世代の中身は確かめない
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class MachineRestoreBranchesTest {
     @TempDir
     lateinit var dir: Path
@@ -907,7 +909,7 @@ class MachineRestoreBranchesTest {
                 try {
                     assertEquals(listOf(RestoreOutcome.RESTORED to null), finished.outcomes.toList())
                     aRelease.countDown()
-                    assertTrue(aDone.await(10, TimeUnit.SECONDS))
+                    aDone.awaitOrFail()
                     assertNull(aOpened.get(), "取り消された前段はディスクを開かない")
                     // aDone は opener の中で下りるので、A の前段の段が終わる（起動用のスレッドが空く）まで待ってから見る
                     eventually(10_000, "A の前段の段が終わらない") { h.scheduler.bootExecutor.activeCount == 0 && h.scheduler.bootExecutor.queue.isEmpty() }
@@ -1315,7 +1317,8 @@ class MachineRestoreBranchesTest {
             opens.computeIfAbsent(diskId) { AtomicInteger() }.incrementAndGet()
             if (diskId in gated) {
                 entered.getValue(diskId).countDown()
-                release.await(15, TimeUnit.SECONDS)
+                // 期限なし（#916）。テストが落ちたときは、Harness の close の前に開ける（各テストの releaseOnClose）
+                release.await()
             }
             return BootVolume(TestMemoryFileSystem(), readOnly = false)
         }
@@ -1333,11 +1336,12 @@ class MachineRestoreBranchesTest {
             val identity = saveWithData(h, store)
             val opener = GatedOpener(setOf("data"))
             h.scheduler.hooks.bootVolumes = opener
+            h.releaseOnClose { opener.release.countDown() }
             val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "data"))
             val finished = Finished()
             assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
             // data の予約を取って開いている途中
-            assertTrue(opener.entered.getValue("data").await(60, TimeUnit.SECONDS))
+            opener.entered.getValue("data").awaitOrFail()
             assertTrue(m.diskClaimCount >= 1, "data の予約を取っている")
             assertTrue(m.isRestoring)
             assertTrue(m.disksChanged(DiskSnapshot.of(mapOf("root" to ResolvedDisk(Path.of("unused", "root"), 1L shl 20, 64)))), "復元が頼るディスクが抜けたら止める")
@@ -1365,10 +1369,11 @@ class MachineRestoreBranchesTest {
             // 根を開いている途中（data はまだ予約していない）で data を抜く
             val opener = GatedOpener(setOf("root"))
             h.scheduler.hooks.bootVolumes = opener
+            h.releaseOnClose { opener.release.countDown() }
             val m = h.machine(fuelPerTick = 10_000_000, environment = insertedDisks("root", "data"))
             val finished = Finished()
             assertTrue(m.restore(RestoreRequest(RestoreSource(store, identity.id, identity.generation), bootConfig(), finished.listener)))
-            assertTrue(opener.entered.getValue("root").await(60, TimeUnit.SECONDS))
+            opener.entered.getValue("root").awaitOrFail()
             assertTrue(m.disksChanged(DiskSnapshot.of(mapOf("root" to ResolvedDisk(Path.of("unused", "root"), 1L shl 20, 64)))), "復元が頼るディスクが抜けたら止める")
             m.stop()
             opener.release.countDown()

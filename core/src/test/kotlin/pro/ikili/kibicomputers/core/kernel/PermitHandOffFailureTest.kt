@@ -22,8 +22,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /** 許可を次へ渡した後に、ワーカーへ渡せなかったとき（#870）。許可は取り残しの列で持ったまま、後で渡し直す */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 internal class PermitHandOffFailureTest {
     /** 出したものを拾う [System.Logger] */
     private class RecordingLogger : System.Logger {
@@ -76,7 +78,15 @@ internal class PermitHandOffFailureTest {
             done.countDown()
         }
 
+        private val closeActions = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+        /** [close] の最初に [action] を呼ぶ（#916。期限なしの門で止めた仕事を、テストが落ちても放してから止める。[Harness.releaseOnClose] と同じ） */
+        fun releaseOnClose(action: () -> Unit) {
+            closeActions += action
+        }
+
         override fun close() {
+            closeActions.forEach { it() }
             executor.alwaysFail = false
             workers.shutdown()
             workers.awaitTermination(5_000)
@@ -101,7 +111,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(1, f.pool.waiting)
             assertEquals(1L, f.pool.handOffFailures.get())
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS), "後ろの仕事が進まない")
+            done.awaitOrFail("後ろの仕事が進まない")
             assertEquals(listOf("a", "b"), f.order.toList(), "順番を保つ")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.waiting)
@@ -121,7 +131,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(1, f.pool.strandedTasks, "渡せなければ戻す")
             assertEquals(2L, f.pool.handOffFailures.get())
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS))
+            done.awaitOrFail()
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.strandedTasks)
         }
@@ -139,7 +149,7 @@ internal class PermitHandOffFailureTest {
             assertTrue(f.pool.abandonWaiter(gone))
             assertEquals(1, f.pool.strandedTasks)
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS), "後ろの仕事が進まない")
+            done.awaitOrFail("後ろの仕事が進まない")
             assertEquals(listOf("a", "b"), f.order.toList())
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.waiting)
@@ -173,11 +183,11 @@ internal class PermitHandOffFailureTest {
                 waitUntil("待ち手がロックを待たない") { f.pool.hasQueuedThreadForTest(waiter) }
                 f.pool.release()
             }
-            waiter.join(5_000)
+            waiter.joinOrFail("待ち手が抜けない")
             assertTrue(thrown.get() is InterruptedException, "${thrown.get()}")
             assertEquals(1, f.pool.strandedTasks, "次の仕事は許可を持ったまま取り残しの列に入る")
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS), "後ろの仕事が進まない")
+            done.awaitOrFail("後ろの仕事が進まない")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.waiting)
             assertEquals(0, f.pool.strandedTasks)
@@ -193,7 +203,7 @@ internal class PermitHandOffFailureTest {
             // （先に a が抜けて b を取り残しの列に入れると、その retryStranded が b を渡し直してしまう）
             val submitted = CountDownLatch(1)
             f.pool.submit("a") {
-                check(submitted.await(5, TimeUnit.SECONDS))
+                submitted.await()
                 f.pool.submit("b", f.task("b", done))
                 // b を今のワーカーの続きにしてから、例外で抜ける。続きを渡し直すところで失敗させる
                 f.pool.release(inline = true)
@@ -202,11 +212,11 @@ internal class PermitHandOffFailureTest {
                 throw IllegalStateException("テストの失敗")
             }
             submitted.countDown()
-            assertTrue(ranA.await(5, TimeUnit.SECONDS))
+            ranA.awaitOrFail()
             waitUntil("続きが取り残しの列に入らない") { f.pool.strandedTasks == 1 }
             assertEquals(0, f.pool.availablePermits())
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
+            done.awaitOrFail("続きが進まない")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.strandedTasks)
             // a と b の2つ。続きとして置いた時と、渡し直せた時で、b を二重に数えない
@@ -225,7 +235,7 @@ internal class PermitHandOffFailureTest {
                 f.pool.release(inline = true)
                 throw IllegalStateException("テストの失敗")
             }
-            assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
+            done.awaitOrFail("続きが進まない")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             waitUntil("数えない") { f.workers.submitted.get() >= 2L }
             Thread.sleep(50)
@@ -241,7 +251,7 @@ internal class PermitHandOffFailureTest {
                 f.pool.submit("b", f.task("b", done))
                 f.pool.release(inline = true)
             }
-            assertTrue(done.await(5, TimeUnit.SECONDS), "続きが進まない")
+            done.awaitOrFail("続きが進まない")
             assertEquals(2L, f.workers.submitted.get(), "a と b を1回ずつ")
         }
     }
@@ -257,7 +267,7 @@ internal class PermitHandOffFailureTest {
             f.pool.release()
             assertEquals(before, f.workers.submitted.get(), "渡せなかったものは数えない")
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS))
+            done.awaitOrFail()
             assertEquals(before + 1, f.workers.submitted.get(), "渡し直しで1回だけ数える")
         }
     }
@@ -275,7 +285,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(1, f.pool.strandedTasks, "a は取り残される")
             // b は渡せる。そのときに a も渡し直される（retryStranded も tick も呼ばない）
             f.pool.release()
-            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            done.awaitOrFail("取り残しが渡し直されない")
             assertEquals(0, f.pool.strandedTasks)
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 2 }
         }
@@ -303,12 +313,13 @@ internal class PermitHandOffFailureTest {
             // 空いた許可で直接渡す。渡せたら a も渡し直される（retryStranded も tick も呼ばない）
             // b は許可を持ったまま止める（b が許可を返す release が渡し直すのではなく、submit が渡し直すことを確かめる）
             val gate = CountDownLatch(1)
+            f.releaseOnClose { gate.countDown() }
             f.pool.submit("b") {
                 f.order += "b"
-                gate.await(10, TimeUnit.SECONDS)
+                gate.await()
                 f.pool.release()
             }
-            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            done.awaitOrFail("取り残しが渡し直されない")
             assertEquals(0, f.pool.strandedTasks)
             assertEquals(1, f.order.count { it == "a" })
             gate.countDown()
@@ -337,7 +348,7 @@ internal class PermitHandOffFailureTest {
             assertTrue(f.order.isEmpty(), "失敗の直後には渡し直さない")
             // tick で渡し直すと動き、借りた組に許可が戻る
             f.pool.tick(1)
-            assertTrue(done.await(5, TimeUnit.SECONDS), "tick で渡し直されない")
+            done.awaitOrFail("tick で渡し直されない")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 1 }
             assertEquals(0, f.pool.heldBy(group))
             assertEquals(0, f.pool.strandedTasks)
@@ -363,12 +374,13 @@ internal class PermitHandOffFailureTest {
             // 空いた許可で直接渡す。渡せたら a も渡し直される（retryStranded も tick も呼ばない）
             // b は許可を持ったまま止める（b が許可を返す release ではなく、submitOrStrand が渡し直すことを確かめる）
             val gate = CountDownLatch(1)
+            f.releaseOnClose { gate.countDown() }
             f.pool.submitOrStrand("b", FairShareGroup.NONE) {
                 f.order += "b"
-                gate.await(10, TimeUnit.SECONDS)
+                gate.await()
                 f.pool.release()
             }
-            assertTrue(done.await(5, TimeUnit.SECONDS), "取り残しが渡し直されない")
+            done.awaitOrFail("取り残しが渡し直されない")
             assertEquals(0, f.pool.strandedTasks)
             assertEquals(1, f.order.count { it == "a" })
             gate.countDown()
@@ -398,7 +410,7 @@ internal class PermitHandOffFailureTest {
             // 1回の呼び出しで、残りを前から渡し切る
             f.pool.retryStranded()
             assertEquals(0, f.pool.strandedTasks)
-            assertTrue(done.await(5, TimeUnit.SECONDS), "全部進まない")
+            done.awaitOrFail("全部進まない")
             assertEquals(listOf("a", "b", "c"), f.order.toList(), "先に取り残したものが先に動く")
             waitUntil("許可が戻らない") { f.pool.availablePermits() == 3 }
         }
@@ -449,7 +461,7 @@ internal class PermitHandOffFailureTest {
             assertEquals(3, again.size, "再発はもう一度スタックトレース付きで出す")
             assertTrue(again[2].thrown is OutOfMemoryError)
             f.pool.retryStranded()
-            assertTrue(done.await(5, TimeUnit.SECONDS))
+            done.awaitOrFail()
         }
     }
 
@@ -467,12 +479,13 @@ internal class PermitHandOffFailureTest {
             val program = h.program(emptyModule())
             val entered = CountDownLatch(1)
             val hold = CountDownLatch(1)
+            h.releaseOnClose { hold.countDown() }
             // 専用スレッドで許可を持って止まる（返すときは、ワーカーの続きにできないので execute で渡す）
             val holder = m1.spawnTest(
                 program,
                 doing {
                     entered.countDown()
-                    check(hold.await(10, TimeUnit.SECONDS))
+                    hold.await()
                 },
             )
             h.tickUntilTrue("許可を持たない") { entered.count == 0L && permits.availablePermits() == 0 }
@@ -501,11 +514,12 @@ internal class PermitHandOffFailureTest {
             val program = h.program(emptyModule())
             val entered = CountDownLatch(1)
             val hold = CountDownLatch(1)
+            h.releaseOnClose { hold.countDown() }
             val holder = m1.spawnTest(
                 program,
                 doing {
                     entered.countDown()
-                    check(hold.await(10, TimeUnit.SECONDS))
+                    hold.await()
                 },
             )
             h.tickUntilTrue("許可を持たない") { entered.count == 0L && permits.availablePermits() == 0 }
@@ -539,13 +553,13 @@ internal class PermitHandOffFailureTest {
     private class CpuHandOff(h: Harness) {
         val m = h.machine()
         val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
+        val release = CountDownLatch(1).also { latch -> h.releaseOnClose { latch.countDown() } }
         val program = h.program(emptyModule())
         val a = m.spawnTest(
             program,
             TestDriver(ProcessKind.WAIT_POINT) {
                 entered.countDown()
-                check(release.await(10, TimeUnit.SECONDS))
+                release.await()
                 StepResult.Exit(0)
             },
         )

@@ -60,11 +60,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * `kibi:*` の p2 の振る舞い（#685。ADR 0685）。コンポーネントのプロセスの中から、ホストの関数の本体を直接呼んで確かめる
  * （[WasiP2StreamTest] と同じ形）
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class KibiP2BehaviourTest {
     private val limit = Duration.ofSeconds(120)
 
@@ -584,7 +586,7 @@ class KibiP2BehaviourTest {
                     ctx.waitChild(p)
                     childObj.set(childObject(ctx, p))
                     ready.countDown()
-                    check(release.await(60, TimeUnit.SECONDS)) { "放されない" }
+                    release.await()
                     ctx.drop(p)
                 } catch (t: Throwable) {
                     failure.set(t)
@@ -592,6 +594,7 @@ class KibiP2BehaviourTest {
                 StepResult.Exit(0)
             }
             val options = SpawnOptions(stdio = StdioSpec(StdioSource.Closed, StdioSource.Closed, StdioSource.Closed), fds = SpawnOptions.ROOT_PREOPEN)
+            h.releaseOnClose { release.countDown() }
             val pid = m.spawn(empty, driver, options, 0)
             eventually(60_000, "子を作らない") {
                 h.scheduler.tick()

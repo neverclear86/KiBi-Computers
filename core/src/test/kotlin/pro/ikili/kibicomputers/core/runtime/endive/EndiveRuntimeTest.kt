@@ -16,7 +16,11 @@ import pro.ikili.kibicomputers.core.runtime.WasmRuntime
 import pro.ikili.kibicomputers.core.runtime.WasmRuntimeContractTest
 import pro.ikili.kibicomputers.core.runtime.WasmTrapException
 import pro.ikili.kibicomputers.core.runtime.WasmTrapKind
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class EndiveRuntimeTest : WasmRuntimeContractTest() {
     override val runtime: WasmRuntime = EndiveRuntime()
 
@@ -34,11 +38,13 @@ class EndiveRuntimeTest : WasmRuntimeContractTest() {
                 error.set(t)
             }
         }
+        // 割り込みが効かない退行では回り続けるので、JVM の終わりを止めないようにする（保険の @Timeout で落ちた後も残る）
+        thread.isDaemon = true
         thread.start()
         started.await()
         Thread.sleep(50)
         thread.interrupt()
-        thread.join(10_000)
+        thread.joinOrFail("割り込んでも止まらない")
         val e = error.get()
         assertTrue(e is WasmTrapException && e.kind == WasmTrapKind.INTERRUPTED, "$e")
     }

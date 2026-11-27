@@ -20,8 +20,10 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import org.junit.jupiter.api.Timeout
 
 /** 読み込んだ実行ファイルの共有（#37） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class ProgramCacheTest {
     private val runtime = EndiveRuntime()
     private val direct = Executor { it.run() }
@@ -56,7 +58,7 @@ class ProgramCacheTest {
             val futures = (0 until 8).map { cache.load(1, bytes(1), true, emptySet(), slow) }
             assertTrue(futures.none { it.isDone })
             gate.countDown()
-            val programs = futures.map { it.get(10, TimeUnit.SECONDS) }
+            val programs = futures.map { it.getOrFail() }
             assertTrue(programs.all { it === programs[0] })
             assertEquals(1, cache.loads.get())
         } finally {
@@ -123,9 +125,9 @@ class ProgramCacheTest {
             val light2 = cache.load(2, bytes(100), true, emptySet(), tracking(100))
             val light3 = cache.load(3, bytes(200), true, emptySet(), tracking(200))
             gate.countDown()
-            light2.get(10, TimeUnit.SECONDS)
-            light3.get(10, TimeUnit.SECONDS)
-            heavy.forEach { it.get(10, TimeUnit.SECONDS) }
+            light2.getOrFail()
+            light3.getOrFail()
+            heavy.forEach { it.getOrFail() }
             // 台 1 の読み込み中のもの（0）の次は、台 1 の残りより先に台 2・台 3
             assertEquals(0, order[0])
             assertEquals(setOf(100, 200), order.subList(1, 4).filter { it >= 100 }.toSet(), order.toString())
@@ -150,10 +152,10 @@ class ProgramCacheTest {
             val other = cache.load(2, bytes(3), true, emptySet(), slow)
             val shared = cache.load(1, bytes(3), true, emptySet(), slow)
             gate.countDown()
-            listOf(a, b, other, shared).forEach { it.get(10, TimeUnit.SECONDS) }
+            listOf(a, b, other, shared).forEach { it.getOrFail() }
             assertSame(other.get(), shared.get())
             // 終われば、また受け付ける
-            cache.load(1, bytes(4), true, emptySet(), slow).get(10, TimeUnit.SECONDS)
+            cache.load(1, bytes(4), true, emptySet(), slow).getOrFail()
         } finally {
             pool.shutdownNow()
         }
@@ -219,8 +221,8 @@ class ProgramCacheTest {
             val fresh = (4..5).map { cache.load(1, bytes(it), true, emptySet(), tracking(it)) }
             assertEquals(2, cache.pendingOf(1))
             gate.countDown()
-            listOf(running2, own2, queued2).forEach { it.get(10, TimeUnit.SECONDS) }
-            fresh.forEach { it.get(10, TimeUnit.SECONDS) }
+            listOf(running2, own2, queued2).forEach { it.getOrFail() }
+            fresh.forEach { it.getOrFail() }
             // 移した 2 は台 2 の列の末尾（3 の後）。台 1 と台 2 を巡回する
             assertEquals(listOf(1, 3, 4, 2, 5), order.toList())
             assertEquals(0, cache.pendingOf(1))

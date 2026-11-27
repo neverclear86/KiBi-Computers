@@ -19,11 +19,13 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * 許可を待つ間はスレッドを持たない（#350）。同時に動ける台が許可の数より多くても、ワーカーのスレッドは許可の数＋定数に収まる。
  * ワーカーは仕事がなくても [Harness] の既定（30 秒）まで残るので、プールの大きさはそれまでの最大の本数になる。
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class WorkerThreadsTest {
     private val permits = 2
 
@@ -147,7 +149,7 @@ class WorkerThreadsTest {
             pool.submit("removed") { order += "removed" }
             assertTrue(pool.remove("removed"))
             pool.release()
-            assertTrue(done.await(5, TimeUnit.SECONDS))
+            done.awaitOrFail()
             waiter.join()
             assertEquals(listOf("a", "thread"), order)
             assertEquals(1, pool.availablePermits())

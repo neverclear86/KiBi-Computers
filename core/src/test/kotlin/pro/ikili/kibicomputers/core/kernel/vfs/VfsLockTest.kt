@@ -9,8 +9,11 @@ import pro.ikili.kibicomputers.core.kernel.MemoryAccount
 import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import org.junit.jupiter.api.Timeout
+import pro.ikili.kibicomputers.core.kernel.getOrFail
 
 /** VFS をカーネルロックの外で、いくつものスレッドから使う（#52。ADR 0052） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class VfsLockTest {
     private fun p(s: String) = VfsPath.parse(s)
 
@@ -50,12 +53,12 @@ class VfsLockTest {
             val futures = (0 until threads).map { t ->
                 pool.submit {
                     for (r in 0 until rounds) {
-                        barrier.await(10, TimeUnit.SECONDS)
+                        barrier.await()
                         body(t, r)
                     }
                 }
             }
-            for (f in futures) f.get(30, TimeUnit.SECONDS)
+            for (f in futures) f.getOrFail()
         } finally {
             pool.shutdownNow()
         }

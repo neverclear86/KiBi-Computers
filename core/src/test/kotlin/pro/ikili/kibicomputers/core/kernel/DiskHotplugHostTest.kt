@@ -28,6 +28,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * ディスクの挿し抜きとマウントを、本番と同じ経路で確かめる（#56、ADR 0056）。[DiskHotplugTest] は開き方をテストのフック
@@ -39,6 +40,7 @@ import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
  *
  * init は kibi-power-wasi の `hold`（止められるまで眠る）。根のディスクもホストのディレクトリ
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class DiskHotplugHostTest {
     @TempDir
     lateinit var dir: Path
@@ -230,7 +232,8 @@ class DiskHotplugHostTest {
         override fun open(diskId: String, cancelled: () -> Boolean): BootVolume? {
             if (diskId == "d1" && gated.compareAndSet(true, false)) {
                 entered.countDown()
-                check(release.await(15, TimeUnit.SECONDS)) { "門が開かない" }
+                // 期限なし（#916）。テストが落ちたときは、Harness の close の前に開ける（bootGated の releaseOnClose）
+                release.await()
             }
             return real.open(diskId, cancelled)
         }
@@ -240,6 +243,7 @@ class DiskHotplugHostTest {
     private fun bootGated(h: Harness, opener: GatedRealOpener, vararg ids: String): Machine {
         Files.createDirectories(diskDir("d1"))
         h.scheduler.hooks.bootVolumes = opener
+        h.releaseOnClose { opener.release.countDown() }
         return boot(h, *ids)
     }
 
@@ -274,12 +278,12 @@ class DiskHotplugHostTest {
             m.unmountAt(VfsPath.parse("/mnt/d1"))
             opener.gated.set(true)
             val result = mountInBackground(m)
-            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            opener.entered.awaitOrFail()
             // 抜いて、別の台（ここでは本番の開き手を直に）が同じディスクを開く
             assertFalse(m.disksChanged(snapshot("root")))
             val newer = checkNotNull(opener.real.open("d1"))
             opener.release.countDown()
-            assertEquals(Errno.IO, result.get(10, TimeUnit.SECONDS))
+            assertEquals(Errno.IO, result.getOrFail())
             assertNull(m.mountAt("/x"))
             assertStillWritable(newer, "after-mount")
             assertEquals(0, m.diskClaimCount)
@@ -296,11 +300,11 @@ class DiskHotplugHostTest {
             m.unmountAt(VfsPath.parse("/mnt/d1"))
             opener.gated.set(true)
             val result = mountInBackground(m)
-            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            opener.entered.awaitOrFail()
             m.stop()
             val newer = checkNotNull(opener.real.open("d1"))
             opener.release.countDown()
-            assertEquals(Errno.IO, result.get(10, TimeUnit.SECONDS))
+            assertEquals(Errno.IO, result.getOrFail())
             assertStillWritable(newer, "after-stop")
             assertEquals(0, m.diskClaimCount)
             newer.fs.retire()
@@ -315,7 +319,7 @@ class DiskHotplugHostTest {
             val m = bootGated(h, opener, "root")
             opener.gated.set(true)
             assertFalse(m.disksChanged(snapshot("root", "d1")))
-            assertTrue(opener.entered.await(10, TimeUnit.SECONDS))
+            opener.entered.awaitOrFail()
             assertFalse(m.disksChanged(snapshot("root")))
             val newer = checkNotNull(opener.real.open("d1"))
             opener.release.countDown()

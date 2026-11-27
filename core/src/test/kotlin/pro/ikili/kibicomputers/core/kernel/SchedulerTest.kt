@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /** 同時に実行している数を数える */
 internal class ConcurrencyMeter {
@@ -53,6 +54,7 @@ internal fun meteredSpin(meter: ConcurrencyMeter, progress: AtomicInteger, asSta
     return if (asStart) b.start { ctx, _ -> body(ctx) }.build() else b.export("run", VOID) { ctx, _ -> body(ctx) }.build()
 }
 
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class SchedulerTest {
     private val limit = Duration.ofSeconds(30)
 
@@ -269,7 +271,7 @@ class SchedulerTest {
                 }),
             )
             h.scheduler.tick()
-            assertTrue(inHost.await(5, TimeUnit.SECONDS))
+            inHost.awaitOrFail()
             m.stop()
             assertEquals(MachineState.STOPPING, m.state)
             assertThrows<IllegalStateException> { m.spawnTest(h.program(emptyModule()), runDriver()) }
@@ -414,7 +416,7 @@ class SchedulerTest {
             val before = h.scheduler.permits.availablePermits()
             val fuel = m.lock.withLockValue { m.kernel.fuel }
             m.lock.withLockValue { s.write(byteArrayOf(1), 0, 1, m.registry) }
-            assertTrue(atGate.await(5, TimeUnit.SECONDS))
+            atGate.awaitOrFail()
             m.lock.withLockValue { s.read(ByteArray(1), 0, 1, m.registry) }
             h.scheduler.hooks.afterStepPermit = null
             gate.countDown()

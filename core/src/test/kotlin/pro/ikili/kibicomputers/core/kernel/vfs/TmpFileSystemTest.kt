@@ -8,8 +8,12 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import pro.ikili.kibicomputers.core.kernel.MemoryAccount
 import pro.ikili.kibicomputers.core.runtime.WasmMemory
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** メモリ上のファイルシステム（`/tmp`。#53） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class TmpFileSystemTest {
     private fun p(text: String) = VfsPath.parse(text)
 
@@ -259,8 +263,7 @@ class TmpFileSystemTest {
             start.countDown()
             Thread.yield()
             vfs.unmount(mount.id)
-            writer.join(10_000)
-            assertFalse(writer.isAlive)
+            writer.joinOrFail("書き手が終わらない")
             assertEquals(0L, account.usedBytes, "外した後に確保した RAM が残っている")
         }
     }

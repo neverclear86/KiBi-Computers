@@ -17,8 +17,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import org.junit.jupiter.api.Timeout
 
 /** 許可を公平の組（持ち主）ごとに公平に渡す（#738、ADR 0738） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class FairPermitPoolTest {
     private val a = FairShareGroup.of(UUID(0, 1))
     private val b = FairShareGroup.of(UUID(0, 2))
@@ -50,7 +52,7 @@ class FairPermitPoolTest {
             ran.release()
         }
 
-        fun awaitRuns(n: Int) = assertTrue(ran.tryAcquire(n, 5, TimeUnit.SECONDS), "仕事が動かない: $order")
+        fun awaitRuns(n: Int) = failOnInterrupt({ "仕事が動かない: $order" }) { ran.acquire(n) }
 
         override fun close() {
             executor.alwaysFail = false
@@ -208,9 +210,9 @@ class FairPermitPoolTest {
             f.awaitRuns(1)
             assertEquals(listOf("a1"), f.order)
             f.pool.release(a)
-            assertTrue(got.tryAcquire(5, TimeUnit.SECONDS))
+            failOnInterrupt({ "b のスレッドが許可を取らない" }) { got.acquire() }
             assertEquals(listOf("a1", "b-thread"), f.order)
-            waiter.join(5_000)
+            waiter.joinOrFail("b のスレッドが終わらない")
             f.pool.release(b)
             assertEquals(1, f.pool.availablePermits())
         }
@@ -381,8 +383,7 @@ class FairPermitPoolTest {
                 eventually(5_000, "待ち手がロックを待たない") { f.pool.hasQueuedThreadForTest(waiter) }
                 f.pool.release(b)
             }
-            waiter.join(5_000)
-            assertFalse(waiter.isAlive)
+            waiter.joinOrFail("割り込まれた待ち手が抜けない")
             assertTrue(thrown.get() is InterruptedException, "${thrown.get()}")
             // 渡された許可は a から外して次へ。巡回の順は b（release で戻った）→ a（割り込みで戻った）
             f.awaitRuns(1)
@@ -421,8 +422,7 @@ class FairPermitPoolTest {
             f.pool.submit("a2", a, f.task("a2"))
             assertEquals(2, f.pool.waiting)
             waiter.interrupt()
-            waiter.join(5_000)
-            assertFalse(waiter.isAlive)
+            waiter.joinOrFail("割り込まれた待ち手が抜けない")
             assertTrue(thrown.get() is InterruptedException, "${thrown.get()}")
             assertEquals(1, f.pool.waiting, "スレッドだけが外れる")
             assertEquals(0, f.pool.heldBy(a))

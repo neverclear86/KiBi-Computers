@@ -19,11 +19,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.assertTimeoutPreemptively as timeout
+import org.junit.jupiter.api.Timeout
 
 /**
  * マシンの中の燃料の配り方（#47、ADR 0047）: 1回に渡すのはスライスまでで、使い切ったら CPU を待つプロセスに譲り、
  * 待つ者がいなければその場で次を足す。
  */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class FuelSliceTest {
     private val limit = Duration.ofSeconds(60)
 
@@ -226,7 +228,7 @@ class FuelSliceTest {
             val b = m.spawnTest(h.program(spinForever()), runDriver())
             eventually(10_000) { m.fuelWaiterCount == 2 }
             h.scheduler.tick()
-            assertTrue(parked.await(10, TimeUnit.SECONDS), "B が起こされない")
+            parked.awaitOrFail("B が起こされない")
             // A がその tick を使い切り、B の予約の後ろで CPU を待つか、燃料待ちに戻るまで待ってから止める
             eventually(10_000) { m.fuelWaiterCount == 1 || m.cpu.waiting >= 1 }
             val bRt = m.rt(b)
@@ -282,8 +284,8 @@ class FuelSliceTest {
             eventually(10_000) { m.fuelWaiterCount == 2 }
             // 起こす順は C、B。C は渡され、B は C の後ろに予約が入る
             h.scheduler.tick()
-            assertTrue(entered.await(10, TimeUnit.SECONDS), "C が動かない")
-            assertTrue(parked.await(10, TimeUnit.SECONDS), "B が起こされない")
+            entered.awaitOrFail("C が動かない")
+            parked.awaitOrFail("B が起こされない")
             val bRt = m.rt(b)
             assertTrue(m.cpu.hasReservation(bRt))
             assertEquals(1, m.cpu.waiting)
@@ -338,7 +340,7 @@ class FuelSliceTest {
             eventually(10_000) { m.fuelWaiterCount == 2 }
             val aRt = m.rt(a)
             m.lock.withLockValue { m.killLocked(a, KillSignal.KILL) }
-            assertTrue(caught.await(10, TimeUnit.SECONDS), "A が止められた例外を受けない")
+            caught.awaitOrFail("A が止められた例外を受けない")
             assertFalse(m.stateOf(a).isTerminal, "A がもう終わっている（競争の窓を作れない）")
             val b0 = pb.get()
             h.scheduler.tick()
@@ -413,7 +415,7 @@ class FuelSliceTest {
                 }),
             )
             h.scheduler.tick()
-            assertTrue(waiterReady.await(10, TimeUnit.SECONDS))
+            waiterReady.awaitOrFail()
             val spins = List(3) { AtomicInteger() }
             spins.forEach { m.spawnTest(h.program(slowSpin(it, micros = 50)), runDriver()) }
             h.scheduler.tick()
@@ -421,7 +423,7 @@ class FuelSliceTest {
             val total = spins.sumOf { it.get() }
             m.lock.withLockValue { s.write(byteArrayOf(1), 0, 1, m.registry) }
             // tick を進めずに動く（スライスを使い切るたびに、CPU の待ち行列の後ろへ回る）
-            assertTrue(woke.await(10, TimeUnit.SECONDS), "起こされたプロセスが同じ tick の中で動かない")
+            woke.awaitOrFail("起こされたプロセスが同じ tick の中で動かない")
             val after = spins.sumOf { it.get() }
             assertTrue(after - total < 100_000, "1 tick の燃料のほとんどを使い切ってから動いた: ${after - total}")
             m.stop()
@@ -472,7 +474,7 @@ class FuelSliceTest {
             val pausing = CompletableFuture.supplyAsync { h.scheduler.pauseAll(5_000) }
             eventually(10_000, "一時停止の印が立たない") { h.scheduler.isPaused }
             val start = progress.get()
-            pausing.get(10, TimeUnit.SECONDS).use {
+            pausing.getOrFail().use {
                 assertTrue(progress.get() - start <= 20 + 1, "止まるまでに渡した燃料はスライスまで: ${progress.get() - start}")
                 assertEquals(0, h.scheduler.activeProcesses)
             }

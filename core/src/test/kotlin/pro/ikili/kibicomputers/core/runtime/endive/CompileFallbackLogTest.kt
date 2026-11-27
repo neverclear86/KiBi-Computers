@@ -10,8 +10,12 @@ import java.util.logging.Handler
 import java.util.logging.Level
 import java.util.logging.LogRecord
 import java.util.logging.Logger
+import org.junit.jupiter.api.Timeout
+import java.util.concurrent.TimeUnit
+import pro.ikili.kibicomputers.core.kernel.joinOrFail
 
 /** インタプリタに回したことのログを、理由ごとに最初の1回だけ WARNING にする（#680、ADR 0088 の「追記（#680）」） */
+@Timeout(10, unit = TimeUnit.MINUTES) // 止まったときの保険（合否の基準ではない。#916）
 class CompileFallbackLogTest {
     /** 出したものを拾う [System.Logger]（テストごとに別の名前の JUL のロガーに流す。DEBUG は FINE） */
     private class Recorder(debug: Boolean) {
@@ -85,7 +89,7 @@ class CompileFallbackLogTest {
             }.also(Thread::start)
         }
         start.countDown()
-        workers.forEach { it.join(30_000) }
+        workers.forEach { it.joinOrFail("報告するスレッドが終わらない") }
         assertEquals(1, rec.of(Level.WARNING).size)
         assertEquals(threads * 100L, log.count(CompileFallbackLog.Reason.SIMD_WITH_EXCEPTIONS))
     }
